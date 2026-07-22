@@ -117,7 +117,9 @@ export function CredentialCard({ cred }: { cred: Credential }) {
                 <Pencil className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100" />
               </button>
               {cred.tier && (
-                <Badge variant="default" className="shrink-0 font-medium">{cred.tier}</Badge>
+                <Badge variant="outline" className={cn('shrink-0 font-medium', tierBadgeClass(cred.tier))}>
+                  {cred.tier}
+                </Badge>
               )}
               <ExpiryBadge cred={cred} />
               {nearLimit && (
@@ -304,6 +306,22 @@ function QuotaBar({
       </div>
     </div>
   )
+}
+
+/** 账号档位徽章配色：Max 20x/5x/Max/Pro/Free 用冷色系区分（避开到期徽章的绿/橙/红）。 */
+function tierBadgeClass(tier: string): string {
+  const t = tier.toLowerCase()
+  if (t.includes('20x'))
+    return 'border-violet-200 bg-violet-100 text-violet-700 dark:border-violet-500/30 dark:bg-violet-500/15 dark:text-violet-300'
+  if (t.includes('5x'))
+    return 'border-indigo-200 bg-indigo-100 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300'
+  if (t.includes('max'))
+    return 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-500/30 dark:bg-blue-500/15 dark:text-blue-300'
+  if (t.includes('pro'))
+    return 'border-sky-200 bg-sky-100 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300'
+  if (t.includes('free'))
+    return 'border-border bg-muted text-muted-foreground'
+  return 'border-border bg-secondary text-secondary-foreground'
 }
 
 function ExpiryBadge({ cred }: { cred: Credential }) {
