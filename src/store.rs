@@ -178,7 +178,39 @@ impl CredentialStore {
         let n = conn.execute(sql, p)?;
         Ok(n > 0)
     }
+
+    /// 读取设置项；不存在返回 None。
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// 写入设置项（upsert）。
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// 删除设置项。
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
+
+/// 接入用 client api key 的 settings 键名。
+pub const CLIENT_API_KEY: &str = "client_api_key";
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -198,7 +230,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_token
             ON credentials(refresh_token);
         CREATE INDEX IF NOT EXISTS idx_credentials_priority
-            ON credentials(priority, id);",
+            ON credentials(priority, id);
+
+        -- 键值设置表（如接入用的 client api key）。
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) STRICT;",
     )
     .context("初始化凭证库 schema 失败")?;
 
@@ -222,11 +260,10 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     })
 }
 
-/// 供后续代理使用：选出可用凭证并返回其 access_token（必要时刷新）。
+/// 代理转发使用：选出可用凭证并返回其 access_token（必要时刷新）。
 ///
 /// 选择规则：启用的凭证里按 (priority, id) 取第一条。若命中的凭证进入刷新窗口，
 /// 则调用 OAuth 刷新并回写。注意刷新是异步 IO，不持有 DB 锁。
-#[allow(dead_code)]
 pub async fn valid_access_token(
     store: &CredentialStore,
     http: &reqwest::Client,

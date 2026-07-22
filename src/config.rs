@@ -24,8 +24,7 @@ pub const SCOPES: &str = "user:profile user:inference user:sessions:claude_code 
 /// 用 OAuth access token 调用 Anthropic API 时必须携带的 beta 头。
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
-/// 官方上游 API base（后续代理转发用）。
-#[allow(dead_code)]
+/// 官方上游 API base（代理转发目标）。
 pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
 
 /// 距离过期不足该秒数时视为需要刷新。

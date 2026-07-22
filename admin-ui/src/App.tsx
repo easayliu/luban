@@ -1,14 +1,16 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Plus, Users } from 'lucide-react'
+import { Plus, Users, Settings2 } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { CredentialCard } from '@/components/credential-card'
 import { AddAccount } from '@/components/add-account'
+import { AccessSettings } from '@/components/access-settings'
 import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
 
 function App() {
   const [adding, setAdding] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const { data: creds, isLoading } = useQuery({
     queryKey: ['credentials'],
     queryFn: listCredentials,
@@ -32,13 +34,26 @@ function App() {
               <div className="label-eyebrow mt-1">Claude Code 授权代理</div>
             </div>
           </div>
-          {!adding && (
-            <Button size="sm" onClick={() => setAdding(true)}>
-              <Plus />
-              添加账号
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant={showSettings ? 'secondary' : 'outline'}
+              onClick={() => setShowSettings((s) => !s)}
+              title="接入设置"
+            >
+              <Settings2 />
+              接入设置
             </Button>
-          )}
+            {!adding && (
+              <Button size="sm" onClick={() => setAdding(true)}>
+                <Plus />
+                添加账号
+              </Button>
+            )}
+          </div>
         </header>
+
+        {showSettings && <AccessSettings />}
 
         {/* 概览 */}
         {count > 0 && (

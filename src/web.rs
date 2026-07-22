@@ -7,33 +7,44 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
+use crate::proxy;
 use crate::store::CredentialStore;
 
 /// 服务共享状态。
 #[derive(Clone)]
-struct AppState {
-    http: reqwest::Client,
+pub struct AppState {
+    pub http: reqwest::Client,
     /// 当前登录尝试的 PKCE 上下文。
     pkce: Arc<Mutex<Option<PkceChallenge>>>,
     /// 凭证存储。
-    store: Arc<CredentialStore>,
+    pub store: Arc<CredentialStore>,
+    /// 接入用的 API Key（None 表示不校验来访身份）。
+    pub client_key: Option<Arc<String>>,
 }
 
 type ApiError = (StatusCode, String);
 
-/// 启动网页服务，绑定 `host:port`，可选自动打开浏览器。
-pub async fn run(host: &str, port: u16, open_browser: bool, store: Arc<CredentialStore>) -> Result<()> {
+/// 启动网页服务 + 转发代理，绑定 `host:port`，可选自动打开浏览器。
+pub async fn run(
+    host: &str,
+    port: u16,
+    open_browser: bool,
+    store: Arc<CredentialStore>,
+    api_key: Option<String>,
+) -> Result<()> {
+    let client_key = api_key.map(Arc::new);
     let state = AppState {
         http: reqwest::Client::new(),
         pkce: Arc::new(Mutex::new(None)),
         store,
+        client_key: client_key.clone(),
     };
 
     let api = Router::new()
@@ -45,10 +56,15 @@ pub async fn run(host: &str, port: u16, open_browser: bool, store: Arc<Credentia
         .route("/credentials/{id}/priority", post(set_priority))
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/refresh", post(refresh_credential))
-        .with_state(state);
+        .route("/settings", get(get_settings))
+        .route("/settings/api-key", post(set_api_key));
 
-    // `/api/*` 走 JSON 接口，其余路径由内嵌前端 SPA 兜底。
-    let app = Router::new().nest("/api", api).fallback(admin_ui::fallback);
+    // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
+    let app = Router::new()
+        .nest("/api", api)
+        .route("/v1/{*path}", any(proxy::handle))
+        .fallback(admin_ui::fallback)
+        .with_state(state);
 
     let bind = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -58,6 +74,12 @@ pub async fn run(host: &str, port: u16, open_browser: bool, store: Arc<Credentia
     let shown = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
     let url = format!("http://{shown}:{port}/");
     println!("luban 已启动：{}", url);
+    println!("Claude Code 接入：");
+    println!("  export ANTHROPIC_BASE_URL={}", url.trim_end_matches('/'));
+    match &client_key {
+        Some(_) => println!("  export ANTHROPIC_AUTH_TOKEN=<你设置的 --api-key>"),
+        None => println!("  （未设置 --api-key，代理不校验来访身份，请仅在本机使用）"),
+    }
     if open_browser {
         open_in_browser(&url);
         println!("已尝试自动打开浏览器；若未弹出，请手动访问上面的地址。");
@@ -245,6 +267,57 @@ async fn refresh_credential(
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(CredentialView::from(&cred)))
+}
+
+// ---------- 接入设置 ----------
+
+#[derive(Serialize)]
+struct SettingsResp {
+    /// 当前接入 key（可能为空 = 不校验）。
+    api_key: Option<String>,
+    /// 是否由环境变量/启动参数接管（true 时网页只读）。
+    env_managed: bool,
+}
+
+fn settings_resp(state: &AppState) -> SettingsResp {
+    if let Some(k) = &state.client_key {
+        return SettingsResp { api_key: Some(k.to_string()), env_managed: true };
+    }
+    let api_key = state
+        .store
+        .get_setting(crate::store::CLIENT_API_KEY)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    SettingsResp { api_key, env_managed: false }
+}
+
+/// 读取接入设置。
+async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
+    Json(settings_resp(&state))
+}
+
+#[derive(Deserialize)]
+struct SetApiKeyReq {
+    /// 新 key；空串表示清除（关闭鉴权）。
+    api_key: String,
+}
+
+/// 设置/清除接入 key（环境接管时禁止）。
+async fn set_api_key(
+    State(state): State<AppState>,
+    Json(req): Json<SetApiKeyReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    if state.client_key.is_some() {
+        return Err(bad_request("接入 Key 已由环境变量 LUBAN_API_KEY 接管，无法在网页修改"));
+    }
+    let key = req.api_key.trim();
+    if key.is_empty() {
+        state.store.delete_setting(crate::store::CLIENT_API_KEY).map_err(internal)?;
+    } else {
+        state.store.set_setting(crate::store::CLIENT_API_KEY, key).map_err(internal)?;
+    }
+    Ok(Json(settings_resp(&state)))
 }
 
 // ---------- 视图与错误 ----------

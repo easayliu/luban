@@ -7,6 +7,7 @@ mod admin_ui;
 mod config;
 mod credentials;
 mod oauth;
+mod proxy;
 mod store;
 mod web;
 
@@ -26,6 +27,10 @@ struct Cli {
     /// 网页服务监听端口（默认命令时生效）
     #[arg(long, default_value_t = 4600)]
     port: u16,
+    /// 接入用的 API Key（Claude Code 侧填此值）；也可用环境变量 LUBAN_API_KEY。
+    /// 不设置则代理不校验来访身份（请仅本机使用）。
+    #[arg(long, env = "LUBAN_API_KEY")]
+    api_key: Option<String>,
     /// 不自动打开浏览器
     #[arg(long)]
     no_open: bool,
@@ -47,8 +52,11 @@ async fn main() -> Result<()> {
     let store = Arc::new(CredentialStore::open_default()?);
 
     match cli.command {
-        // 不带子命令：直接启动网页服务。
-        None => web::run(&cli.host, cli.port, !cli.no_open, store).await,
+        // 不带子命令：直接启动网页服务 + 转发代理。
+        None => {
+            let api_key = cli.api_key.filter(|k| !k.trim().is_empty());
+            web::run(&cli.host, cli.port, !cli.no_open, store, api_key).await
+        }
         Some(Command::Status) => status(&store),
         Some(Command::Logout) => logout(&store),
     }
