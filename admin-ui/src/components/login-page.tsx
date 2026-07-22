@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { Lock, ArrowRight, Loader2, Eye, EyeOff } from 'lucide-react'
+import {
+  LockClosedIcon, ArrowRightIcon, ArrowPathIcon, EyeIcon, EyeSlashIcon,
+} from '@heroicons/react/24/outline'
 import { login } from '@/api/auth'
 import { setPw } from '@/api/client'
 import { extractError } from '@/lib/utils'
@@ -34,7 +36,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
         </div>
 
         <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-          <Lock className="size-5" />
+          <LockClosedIcon className="size-5" />
           登录
         </h1>
         <p className="mt-1.5 text-sm text-muted-foreground">输入管理密码以进入控制台。</p>
@@ -52,14 +54,14 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
               autoFocus
             />
             <Button type="button" size="icon" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => setShow((s) => !s)}>
-              {show ? <EyeOff /> : <Eye />}
+              {show ? <EyeSlashIcon /> : <EyeIcon />}
             </Button>
           </div>
           {doLogin.isError && (
             <p className="text-sm text-bad">{extractError(doLogin.error)}</p>
           )}
           <Button type="submit" className="w-full" disabled={doLogin.isPending || !password}>
-            {doLogin.isPending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
+            {doLogin.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowRightIcon />}
             登录
           </Button>
         </form>

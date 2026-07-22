@@ -22,6 +22,9 @@ pub struct Credential {
     pub disabled: bool,
     /// 允许绑定的设备数上限；`<= 0` 表示不限。见 [`crate::store`] 的粘性绑定选择。
     pub device_limit: i64,
+    /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用
+    /// （手动停用或未停用皆为 `None`）。见 [`crate::store::CredentialStore::mark_banned`]。
+    pub ban_reason: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }

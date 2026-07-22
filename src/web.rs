@@ -445,6 +445,8 @@ struct CredentialView {
     device_limit: i64,
     /// 当前已绑定的设备数。
     device_count: i64,
+    /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用。
+    ban_reason: Option<String>,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
     /// 最新一次的订阅额度快照（无请求记录时为 None）。
@@ -471,6 +473,7 @@ impl CredentialView {
             updated_at: c.updated_at,
             device_limit: c.device_limit,
             device_count,
+            ban_reason: c.ban_reason.clone(),
             token_hint: mask_token(&c.refresh_token),
             quota: None,
             last_used: None,

@@ -30,6 +30,8 @@ export interface Credential {
   device_limit: number
   /** 当前已绑定的设备数。 */
   device_count: number
+  /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
+  ban_reason: string | null
   token_hint: string
   /** 最新一次的订阅额度快照；无请求记录时为 null。 */
   quota: Quota | null

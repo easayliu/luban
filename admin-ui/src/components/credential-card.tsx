@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  RefreshCw, Trash2, Pencil, Check, X, Loader2, MoreHorizontal, ChevronUp, ChevronDown,
-  Smartphone, AlertTriangle,
-} from 'lucide-react'
+  ArrowPathIcon, TrashIcon, PencilIcon, CheckIcon, XMarkIcon, EllipsisHorizontalIcon,
+  ChevronUpIcon, ChevronDownIcon, DevicePhoneMobileIcon, ExclamationTriangleIcon,
+  CalendarDaysIcon, ClockIcon, WalletIcon,
+} from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
   deleteCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel, setPriority,
@@ -67,11 +68,14 @@ export function CredentialCard({ cred }: { cred: Credential }) {
   )
   const nearLimit = !cred.disabled && quotaMax >= 0.9
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
+  const has5h = cred.quota?.rl_5h_utilization != null
+  const has7d = cred.quota?.rl_7d_utilization != null
+  const expiry = expiryMeta(cred)
 
   return (
     <Card
       className={cn(
-        'group/card overflow-hidden rounded-2xl border-border/70 p-5 shadow-card transition-all',
+        '@container/card group/card overflow-hidden rounded-2xl border-border/70 p-5 shadow-card transition-all',
         'hover:border-border hover:shadow-elev',
         cred.disabled && 'opacity-60',
         nearLimit && 'border-bad/40 ring-1 ring-bad/25',
@@ -99,11 +103,11 @@ export function CredentialCard({ cred }: { cred: Credential }) {
             >
               <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-8 w-56" />
               <Button type="submit" size="icon" variant="ghost" className="h-8 w-8" disabled={rename.isPending}>
-                {rename.isPending ? <Loader2 className="animate-spin" /> : <Check />}
+                {rename.isPending ? <ArrowPathIcon className="animate-spin" /> : <CheckIcon />}
               </Button>
               <Button type="button" size="icon" variant="ghost" className="h-8 w-8"
                 onClick={() => { setEditing(false); setName(cred.label) }}>
-                <X />
+                <XMarkIcon />
               </Button>
             </form>
           ) : (
@@ -114,35 +118,37 @@ export function CredentialCard({ cred }: { cred: Credential }) {
                 title="点击重命名"
               >
                 <span className="truncate text-sm font-semibold tracking-tight">{cred.label}</span>
-                <Pencil className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100" />
+                <PencilIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100" />
               </button>
-              {cred.tier && (
-                <Badge variant="outline" className={cn('shrink-0 font-medium', tierBadgeClass(cred.tier))}>
-                  {cred.tier}
-                </Badge>
-              )}
-              <ExpiryBadge cred={cred} />
               {nearLimit && (
                 <Badge variant="bad" className="shrink-0">
-                  <AlertTriangle className="size-3" />
+                  <ExclamationTriangleIcon className="size-3" />
                   额度将满 {Math.round(quotaMax * 100)}%
                 </Badge>
               )}
             </div>
           )}
 
-          {/* 名称下方：轻量标识 */}
-          <div className="mt-1 flex flex-wrap items-center gap-x-2 font-mono text-2xs text-muted-foreground">
-            <span className="tnum">#{cred.id}</span>
-            <Dot />
-            <span className="truncate">{cred.token_hint}</span>
-            <Dot />
-            <span className="whitespace-nowrap">
-              {cred.last_used != null ? `最近使用 ${relativeTime(cred.last_used)}` : '尚未使用'}
+          {/* 元信息行：套餐 · 凭证剩余 · 标识 */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-2xs text-muted-foreground">
+            {cred.tier && (
+              <Badge
+                variant="outline"
+                className={cn('h-5 gap-1 px-2 py-0 text-2xs font-medium', tierBadgeClass(cred.tier))}
+              >
+                {cred.tier}
+              </Badge>
+            )}
+            <span className={cn('inline-flex items-center gap-1', expiry.className)}>
+              <ClockIcon className="size-3 shrink-0" />
+              {expiry.text}
             </span>
-            <Dot />
-            <span className="whitespace-nowrap" title="该账号历史累计等价 API 费用（按官方定价估算）">
-              累计花费 {formatUsd(cred.cost_total)}
+            <span className="inline-flex items-center gap-1 font-mono">
+              <span className="tnum">#{cred.id}</span>
+              <Dot />
+              <span className="max-w-[9rem] truncate" title="refresh_token（脱敏）">
+                {cred.token_hint}
+              </span>
             </span>
           </div>
         </div>
@@ -158,16 +164,16 @@ export function CredentialCard({ cred }: { cred: Credential }) {
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button size="icon" variant="ghost" className="size-8 text-muted-foreground">
-                <MoreHorizontal />
+                <EllipsisHorizontalIcon />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
-                {refresh.isPending ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                {refresh.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowPathIcon />}
                 刷新 token
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setEditing(true)}>
-                <Pencil />
+                <PencilIcon />
                 重命名
               </DropdownMenuItem>
               <DropdownMenuSeparator />
@@ -175,7 +181,7 @@ export function CredentialCard({ cred }: { cred: Credential }) {
                 className="text-bad focus:bg-bad-soft"
                 onClick={() => { if (confirm(`确定删除「${cred.label}」？`)) remove.mutate() }}
               >
-                <Trash2 />
+                <TrashIcon />
                 删除
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -183,26 +189,54 @@ export function CredentialCard({ cred }: { cred: Credential }) {
         </div>
       </div>
 
-      {/* 额度区：5h / 7d 订阅额度 */}
-      {cred.quota && (
-        <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
-          <QuotaBar
-            label="5 小时额度"
-            util={cred.quota.rl_5h_utilization}
-            reset={cred.quota.rl_5h_reset}
-            cost={cred.quota.cost_5h}
-          />
-          <QuotaBar
-            label="7 天额度"
-            util={cred.quota.rl_7d_utilization}
-            reset={cred.quota.rl_7d_reset}
-            cost={cred.quota.cost_7d}
-          />
+      {/* 额度区：5h / 7d 订阅额度（缺失窗口不占位，仅一个时占满整行） */}
+      {cred.quota && (has5h || has7d) && (
+        <div className={cn('mt-4 grid gap-2.5', has5h && has7d && '@sm/card:grid-cols-2')}>
+          {has5h && (
+            <QuotaBar
+              label="5 小时额度"
+              util={cred.quota.rl_5h_utilization}
+              reset={cred.quota.rl_5h_reset}
+              cost={cred.quota.cost_5h}
+            />
+          )}
+          {has7d && (
+            <QuotaBar
+              label="7 天额度"
+              util={cred.quota.rl_7d_utilization}
+              reset={cred.quota.rl_7d_reset}
+              cost={cred.quota.cost_7d}
+            />
+          )}
         </div>
       )}
 
-      {/* 底部：设备上限 + 优先级 */}
-      <div className="mt-4 flex items-center justify-between gap-3 border-t border-border/60 pt-3">
+      {/* 底部：统计 + 控制 */}
+      <div className="mt-4 space-y-2.5 border-t border-border/60 pt-3">
+        {/* 统计：添加 / 最近使用 / 累计花费 */}
+        <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1 text-2xs text-muted-foreground">
+          <span
+            className="inline-flex items-center gap-1"
+            title={`添加于 ${new Date(cred.created_at * 1000).toLocaleString()}`}
+          >
+            <CalendarDaysIcon className="size-3 shrink-0 opacity-70" />
+            {relativeTime(cred.created_at)}
+          </span>
+          <span className="inline-flex items-center gap-1" title="最近一次转发使用">
+            <ClockIcon className="size-3 shrink-0 opacity-70" />
+            {cred.last_used != null ? relativeTime(cred.last_used) : '未使用'}
+          </span>
+          <span
+            className="inline-flex items-center gap-1"
+            title="该账号历史累计等价 API 费用（按官方定价估算）"
+          >
+            <WalletIcon className="size-3 shrink-0 opacity-70" />
+            <span className="tnum">{formatUsd(cred.cost_total)}</span>
+          </span>
+        </div>
+
+        {/* 控制：设备上限 + 优先级 */}
+        <div className="flex items-center justify-between gap-3">
         {editingLimit ? (
           <form
             className="inline-flex items-center gap-1.5 text-xs"
@@ -211,7 +245,7 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               limit.mutate(Math.max(0, Math.floor(Number(limitVal) || 0)))
             }}
           >
-            <Smartphone className="size-3.5 text-muted-foreground" />
+            <DevicePhoneMobileIcon className="size-3.5 text-muted-foreground" />
             <Input
               type="number"
               min={0}
@@ -222,11 +256,11 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               title="设备数上限；0 表示不限"
             />
             <Button type="submit" size="icon" variant="ghost" className="size-7" disabled={limit.isPending}>
-              {limit.isPending ? <Loader2 className="animate-spin" /> : <Check className="size-3.5" />}
+              {limit.isPending ? <ArrowPathIcon className="animate-spin" /> : <CheckIcon className="size-3.5" />}
             </Button>
             <Button type="button" size="icon" variant="ghost" className="size-7"
               onClick={() => { setEditingLimit(false); setLimitVal(String(cred.device_limit)) }}>
-              <X className="size-3.5" />
+              <XMarkIcon className="size-3.5" />
             </Button>
           </form>
         ) : (
@@ -235,11 +269,11 @@ export function CredentialCard({ cred }: { cred: Credential }) {
             className="group/limit inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
             title="点击设置设备数上限（0 表示不限）"
           >
-            <Smartphone className="size-3.5 shrink-0" />
+            <DevicePhoneMobileIcon className="size-3.5 shrink-0" />
             <span className="tnum">
               设备 {cred.device_count}/{cred.device_limit > 0 ? cred.device_limit : '∞'}
             </span>
-            <Pencil className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover/limit:opacity-100" />
+            <PencilIcon className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover/limit:opacity-100" />
           </button>
         )}
 
@@ -252,7 +286,7 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               disabled={busy}
               aria-label="提升优先级"
             >
-              <ChevronUp className="size-4" />
+              <ChevronUpIcon className="size-4" />
             </button>
             <span className="w-8 border-x border-border text-center text-xs tnum leading-7">
               {cred.priority}
@@ -263,9 +297,10 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               disabled={busy}
               aria-label="降低优先级"
             >
-              <ChevronDown className="size-4" />
+              <ChevronDownIcon className="size-4" />
             </button>
           </div>
+        </div>
         </div>
       </div>
     </Card>
@@ -324,11 +359,13 @@ function tierBadgeClass(tier: string): string {
   return 'border-border bg-secondary text-secondary-foreground'
 }
 
-function ExpiryBadge({ cred }: { cred: Credential }) {
-  if (cred.disabled) return <Badge variant="outline" className="shrink-0">已停用</Badge>
-  if (cred.expired) return <Badge variant="bad" className="shrink-0">已过期</Badge>
-  if (cred.expires_in <= 300) return <Badge variant="warn" className="shrink-0">即将过期</Badge>
-  return <Badge variant="ok" className="shrink-0">剩余 {formatDuration(cred.expires_in)}</Badge>
+/** 凭证状态/有效期 → 元信息行的文案与配色。异常态着色，正常「剩余」保持中性。 */
+function expiryMeta(cred: Credential): { text: string; className: string } {
+  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad' }
+  if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
+  if (cred.expired) return { text: '已过期', className: 'font-medium text-bad' }
+  if (cred.expires_in <= 300) return { text: '即将过期', className: 'font-medium text-warn' }
+  return { text: `剩余 ${formatDuration(cred.expires_in)}`, className: 'text-muted-foreground' }
 }
 
 function Dot() {

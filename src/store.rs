@@ -15,7 +15,7 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit";
+     created_at, updated_at, device_limit, ban_reason";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -141,12 +141,40 @@ impl CredentialStore {
         Ok(conn.execute("DELETE FROM credentials", [])?)
     }
 
-    /// 设置停用状态。
+    /// 设置停用状态（管理员手动开关）。
+    ///
+    /// 停用时立即清空其设备绑定，让已绑定设备的下一次请求马上改选其它凭证，
+    /// 而不必等绑定 TTL 惰性过期；重新启用时清除 `ban_reason`（若之前是被自动停用）。
     pub fn set_disabled(&self, id: i64, disabled: bool) -> Result<bool> {
-        self.update_one(
-            "UPDATE credentials SET disabled = ?2, updated_at = unixepoch() WHERE id = ?1",
-            params![id, disabled as i64],
-        )
+        let conn = self.conn.lock();
+        if disabled {
+            conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+            Ok(conn.execute(
+                "UPDATE credentials SET disabled = 1, updated_at = unixepoch() WHERE id = ?1",
+                [id],
+            )? > 0)
+        } else {
+            Ok(conn.execute(
+                "UPDATE credentials SET disabled = 0, ban_reason = NULL, updated_at = unixepoch() \
+                 WHERE id = ?1",
+                [id],
+            )? > 0)
+        }
+    }
+
+    /// 自动检测到上游账号级错误（如封号）时调用：停用凭证并记录原因，
+    /// 同时清空其设备绑定，使下一次请求立即改选其它凭证。
+    ///
+    /// 与 [`Self::set_disabled`] 的区别在于会写入 `ban_reason`，供后台 UI 区分
+    /// 「管理员手动停用」与「上游自动判定停用」。
+    pub fn mark_banned(&self, id: i64, reason: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        Ok(conn.execute(
+            "UPDATE credentials SET disabled = 1, ban_reason = ?2, updated_at = unixepoch() \
+             WHERE id = ?1",
+            params![id, reason],
+        )? > 0)
     }
 
     /// 设置优先级。
@@ -649,6 +677,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
+    // 与管理员手动停用（disabled=1 且本字段为空）区分开。见 `mark_banned`。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN ban_reason TEXT", []);
     Ok(())
 }
 
@@ -665,6 +696,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         created_at: row.get::<_, i64>(8)? as u64,
         updated_at: row.get::<_, i64>(9)? as u64,
         device_limit: row.get(10)?,
+        ban_reason: row.get(11)?,
     })
 }
 

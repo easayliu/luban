@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, ArrowRight, Loader2, X } from 'lucide-react'
+import {
+  ArrowTopRightOnSquareIcon, ArrowRightIcon, ArrowPathIcon, XMarkIcon,
+} from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { extractError } from '@/lib/utils'
@@ -37,14 +39,14 @@ export function AddAccount({ onClose }: { onClose: () => void }) {
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
         <CardTitle>添加 Claude 账号</CardTitle>
         <Button size="icon" variant="ghost" className="h-8 w-8" onClick={onClose} title="收起">
-          <X />
+          <XMarkIcon />
         </Button>
       </CardHeader>
       <CardContent className="space-y-5">
         <div className="space-y-2.5">
           <Step n={1} text="打开 Claude 授权页" />
           <Button onClick={() => authorize.mutate()} disabled={authorize.isPending}>
-            {authorize.isPending ? <Loader2 className="animate-spin" /> : <ExternalLink />}
+            {authorize.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowTopRightOnSquareIcon />}
             生成授权链接并打开
           </Button>
           {authUrl && (
@@ -65,7 +67,7 @@ export function AddAccount({ onClose }: { onClose: () => void }) {
           <Textarea value={code} onChange={(e) => setCode(e.target.value)} placeholder="在此粘贴 code#state" />
           <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="账号备注（可选，留空则用账号邮箱自动命名）" />
           <Button onClick={() => exchange.mutate()} disabled={exchange.isPending || !code.trim()}>
-            {exchange.isPending ? <Loader2 className="animate-spin" /> : <ArrowRight />}
+            {exchange.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowRightIcon />}
             完成添加
           </Button>
         </div>

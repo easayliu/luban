@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Settings2, Eye, EyeOff, Copy, Check, Dices, Save, Trash2, Loader2, Lock, KeyRound,
-} from 'lucide-react'
+  Cog6ToothIcon, EyeIcon, EyeSlashIcon, ClipboardDocumentIcon, CheckIcon, SparklesIcon,
+  ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, LockClosedIcon, KeyIcon,
+} from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import { getSettings, setApiKey, setDeviceTtl, type Settings } from '@/api/settings'
 import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
@@ -50,10 +51,10 @@ export function AccessSettings() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Settings2 className="size-4" />
+          <Cog6ToothIcon className="size-4" />
           接入设置
           {envManaged && (
-            <Badge variant="outline" className="gap-1"><Lock className="size-3" />环境接管</Badge>
+            <Badge variant="outline" className="gap-1"><LockClosedIcon className="size-3" />环境接管</Badge>
           )}
         </CardTitle>
         <CardDescription>Claude Code 用下面的地址与 Key 接入 luban。</CardDescription>
@@ -80,20 +81,20 @@ export function AccessSettings() {
                 className="font-mono"
               />
               <Button size="icon" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => setShow((s) => !s)}>
-                {show ? <EyeOff /> : <Eye />}
+                {show ? <EyeSlashIcon /> : <EyeIcon />}
               </Button>
               <CopyBtn text={draft} />
             </div>
             {!envManaged && (
               <div className="flex items-center gap-2">
-                <Button size="sm" variant="outline" onClick={generate}><Dices />生成</Button>
+                <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
                 <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
-                  {save.isPending ? <Loader2 className="animate-spin" /> : <Save />}保存
+                  {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
                 </Button>
                 {currentKey && (
                   <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
                     onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
-                    <Trash2 />清空
+                    <TrashIcon />清空
                   </Button>
                 )}
               </div>
@@ -162,7 +163,7 @@ function DeviceBindingTtl() {
           className="w-40 font-mono"
         />
         <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
-          {save.isPending ? <Loader2 className="animate-spin" /> : <Save />}保存
+          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
         </Button>
         <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
@@ -211,14 +212,14 @@ function AdminPassword() {
               className="min-w-0 flex-1"
             />
             <Button size="sm" onClick={() => save.mutate(pw.trim())} disabled={save.isPending || pw.trim().length < 4}>
-              {save.isPending ? <Loader2 className="animate-spin" /> : <KeyRound />}
+              {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <KeyIcon />}
               {configured ? '修改' : '设置'}
             </Button>
             {configured && (
               <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
                 onClick={() => { if (confirm('清除后网页将不再需要登录，确定？')) save.mutate('') }}
                 disabled={save.isPending}>
-                <Trash2 />清除
+                <TrashIcon />清除
               </Button>
             )}
           </div>
@@ -260,7 +261,7 @@ function CopyBtn({ text }: { text: string }) {
         }
       }}
     >
-      {ok ? <Check /> : <Copy />}
+      {ok ? <CheckIcon /> : <ClipboardDocumentIcon />}
     </Button>
   )
 }

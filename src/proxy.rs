@@ -100,7 +100,7 @@ pub async fn handle(
                 .unwrap_or(false);
             // 解析并打印上游限流头（订阅账号 5h/7d 额度体现在此），随后随日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
-            tracing::debug!(
+            tracing::info!(
                 cred = format!("#{} {}", cred.id, cred.label),
                 rep = %ratelimit.representative.as_deref().unwrap_or("-"),
                 u5h = %opt_str(ratelimit.five_h_utilization),
@@ -131,6 +131,38 @@ pub async fn handle(
                 ratelimit,
                 store: state.store.clone(),
             };
+
+            // 401/403：先缓冲响应体检测账号级错误（封号/停用等），命中则自动停用该
+            // 凭证并清空其设备绑定，让下一次请求立即改选其它凭证；命中与否响应体都原样透传。
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return match up.bytes().await {
+                    Ok(bytes) => {
+                        rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+                        rl.sniffer.feed(&bytes);
+                        if let Some(reason) = detect_account_ban(&bytes) {
+                            tracing::warn!(
+                                cred = format!("#{} {}", cred.id, cred.label),
+                                status = status.as_u16(),
+                                reason = %reason,
+                                "检测到账号级错误，自动停用该凭证"
+                            );
+                            if let Err(e) = state.store.mark_banned(cred.id, &reason) {
+                                tracing::warn!(error = %e, "自动停用凭证失败");
+                            }
+                        }
+                        builder
+                            .body(Body::from(bytes))
+                            .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "读取上游错误响应体失败");
+                        builder
+                            .body(Body::empty())
+                            .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+                    }
+                };
+            }
+
             let stream = up.bytes_stream().map(move |chunk| {
                 if rl.ttft_ms.is_none() {
                     rl.ttft_ms = Some(rl.started.elapsed().as_millis());
@@ -408,6 +440,27 @@ fn extract_device_id(body: &Bytes) -> Option<String> {
     let inner: serde_json::Value = serde_json::from_str(user_id).ok()?;
     let dev = inner.get("device_id")?.as_str()?;
     (!dev.is_empty()).then(|| dev.to_string())
+}
+
+/// 账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用」，而非常规的
+/// 鉴权失败（如 invalid_api_key、单次 token 失效）——避免把可自愈的临时 401
+/// 也误判成永久性封号。命中后原文（截断）存作 `ban_reason`，供人工核实。
+const BAN_KEYWORDS: &[&str] =
+    &["disabled", "suspended", "banned", "terminated", "deactivated", "violat"];
+
+/// 从 401/403 响应体里判断是否为账号级封禁错误，命中则返回上游原始错误消息
+/// （截断至 200 字符）。优先取 `error.message`，解析失败则退化为对整段原文做关键词匹配。
+fn detect_account_ban(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let message = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| text.to_string());
+    let lower = message.to_lowercase();
+    BAN_KEYWORDS
+        .iter()
+        .any(|k| lower.contains(k))
+        .then(|| message.chars().take(200).collect())
 }
 
 /// 生效的接入 key：启动时 `--api-key`/env 覆盖优先，否则用库中网页配置的值。
