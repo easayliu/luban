@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: Linux x86_64 二进制
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile && pnpm build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cmake (aws-lc 需要)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luban-linux-x64
+          path: target/release/luban
+          if-no-files-found: error
