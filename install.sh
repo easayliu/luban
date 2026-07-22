@@ -64,6 +64,7 @@ services:
   luban:
     image: ${IMAGE_REG}/${IMAGE_OWNER}/luban:${IMAGE_TAG}
     container_name: luban
+    init: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

@@ -3,6 +3,8 @@ services:
     # 国内镜像可用：ghcr.nju.edu.cn/${IMAGE_OWNER:-easayliu}/luban:${IMAGE_TAG:-latest}
     image: ghcr.io/${IMAGE_OWNER:-easayliu}/luban:${IMAGE_TAG:-latest}
     container_name: luban
+    # 用 tini 当 PID 1：转发信号并回收僵尸进程，配合应用内优雅关闭让重启秒停。
+    init: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

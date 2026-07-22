@@ -109,8 +109,42 @@ pub async fn run(
         tracing::info!("已尝试打开浏览器；若未弹出请手动访问 {url}");
     }
 
-    axum::serve(listener, app).await.context("web 服务异常退出")?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("web 服务异常退出")?;
     Ok(())
+}
+
+/// 等待关闭信号：Ctrl-C 或（Unix 下）SIGTERM，收到后让 axum 排空在途请求再退出。
+///
+/// 容器内 luban 常以 PID 1 运行，内核对 PID 1 不套用信号默认动作——若不显式
+/// 处理 SIGTERM，`docker stop`/`restart` 会因信号被忽略而空等 10 秒宽限期才 SIGKILL
+/// 强杀，表现为「重启很久」。这里注册处理器即可让重启秒停，且不切断流式响应。
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("安装 Ctrl-C 处理器失败");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("安装 SIGTERM 处理器失败")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("收到关闭信号，正在优雅关闭 ...");
 }
 
 // ---------- 授权 ----------
