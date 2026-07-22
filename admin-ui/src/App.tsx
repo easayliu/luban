@@ -6,7 +6,7 @@ import {
 import { listCredentials, type Credential } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
-import { cn, formatUsd } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import { CredentialCard } from '@/components/credential-card'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
@@ -82,15 +82,6 @@ function App() {
   }
 
   const count = creds?.length ?? 0
-  const active = creds?.filter((c) => !c.disabled).length ?? 0
-  const costTotal = creds?.reduce((s, c) => s + (c.cost_total ?? 0), 0) ?? 0
-  const cost5hTotal = creds?.reduce((s, c) => s + (c.quota?.cost_5h ?? 0), 0) ?? 0
-  const nearLimitCount =
-    creds?.filter(
-      (c) =>
-        !c.disabled &&
-        Math.max(c.quota?.rl_5h_utilization ?? 0, c.quota?.rl_7d_utilization ?? 0) >= 0.9,
-    ).length ?? 0
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -137,21 +128,6 @@ function App() {
         {adding && <AddAccount onClose={() => setAdding(false)} />}
         {showSettings && <AccessSettings />}
 
-        {/* KPI 概览 */}
-        {count > 0 && (
-          <div className="grid grid-cols-2 gap-3 @xl:grid-cols-4">
-            <StatCard label="账号" value={count} sub={`${active} 个启用`} />
-            <StatCard label="累计花费" value={formatUsd(costTotal)} sub="等价 API 费用" />
-            <StatCard label="近 5 小时花费" value={formatUsd(cost5hTotal)} sub="当前额度周期" />
-            <StatCard
-              label="额度告警"
-              value={nearLimitCount}
-              sub="使用率 ≥ 90%"
-              tone={nearLimitCount > 0 ? 'bad' : undefined}
-            />
-          </div>
-        )}
-
         {/* 工具栏 */}
         {count > 0 && (
           <div className="flex items-center justify-between gap-2">
@@ -190,26 +166,6 @@ function App() {
         )}
       </main>
       <Toaster position="top-right" />
-    </div>
-  )
-}
-
-/** dashboard 概览的小指标卡。 */
-function StatCard({
-  label, value, sub, tone,
-}: {
-  label: string
-  value: string | number
-  sub?: string
-  tone?: 'bad'
-}) {
-  return (
-    <div className="rounded-xl border border-border/70 bg-card p-4 shadow-card">
-      <div className="label-eyebrow">{label}</div>
-      <div className={cn('mt-1.5 text-xl font-semibold tracking-tight tabular-nums', tone === 'bad' && 'text-bad')}>
-        {value}
-      </div>
-      {sub && <div className="mt-0.5 text-2xs text-muted-foreground">{sub}</div>}
     </div>
   )
 }

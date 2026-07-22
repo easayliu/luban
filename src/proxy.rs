@@ -132,14 +132,17 @@ pub async fn handle(
                 store: state.store.clone(),
             };
 
-            // 401/403：先缓冲响应体检测账号级错误（封号/停用等），命中则自动停用该
-            // 凭证并清空其设备绑定，让下一次请求立即改选其它凭证；命中与否响应体都原样透传。
-            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            // 400/401/403：先缓冲响应体做账号级错误判定，命中则自动停用该凭证并清空其
+            // 设备绑定，让下一次请求立即改选其它凭证；命中与否响应体都原样透传。
+            if matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
                         rl.sniffer.feed(&bytes);
-                        if let Some(reason) = detect_account_ban(&bytes) {
+                        if let Some(reason) = detect_account_ban(status, &bytes) {
                             tracing::warn!(
                                 cred = format!("#{} {}", cred.id, cred.label),
                                 status = status.as_u16(),
@@ -442,25 +445,47 @@ fn extract_device_id(body: &Bytes) -> Option<String> {
     (!dev.is_empty()).then(|| dev.to_string())
 }
 
-/// 账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用」，而非常规的
-/// 鉴权失败（如 invalid_api_key、单次 token 失效）——避免把可自愈的临时 401
-/// 也误判成永久性封号。命中后原文（截断）存作 `ban_reason`，供人工核实。
-const BAN_KEYWORDS: &[&str] =
-    &["disabled", "suspended", "banned", "terminated", "deactivated", "violat"];
+/// 400 场景下的账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用/授权失效」，
+/// 以区别于常规的客户端请求错误（invalid_request_error，如模型名错、body 超长）——避免
+/// 客户端一条坏请求重试时把所有账号逐个误禁。命中后原文（截断）存作 `ban_reason`。
+const BAN_KEYWORDS: &[&str] = &[
+    "disabled", "suspended", "banned", "terminated", "deactivated", "violat", "invalid_grant",
+    "oauth",
+];
 
-/// 从 401/403 响应体里判断是否为账号级封禁错误，命中则返回上游原始错误消息
-/// （截断至 200 字符）。优先取 `error.message`，解析失败则退化为对整段原文做关键词匹配。
-fn detect_account_ban(body: &[u8]) -> Option<String> {
+/// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
+fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     let text = String::from_utf8_lossy(body);
-    let message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("error")?.get("message")?.as_str().map(str::to_string))
-        .unwrap_or_else(|| text.to_string());
-    let lower = message.to_lowercase();
-    BAN_KEYWORDS
-        .iter()
-        .any(|k| lower.contains(k))
-        .then(|| message.chars().take(200).collect())
+    let v = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let field = |name: &str| {
+        v.as_ref()
+            .and_then(|v| v.get("error")?.get(name)?.as_str().map(str::to_string))
+    };
+    (field("type"), field("message").unwrap_or_else(|| text.to_string()))
+}
+
+/// 依据状态码与响应体判定是否应自动停用该凭证，命中则返回写入 `ban_reason` 的原因
+/// （`[状态码] 类型: 消息`，截断至 200 字符）。
+/// - 401 authentication_error / 403 permission_error：账号级鉴权/权限失效，一律停用。
+/// - 400：仅当错误类型/消息指向账号级问题（命中 [`BAN_KEYWORDS`]）时停用；
+///   普通 invalid_request_error（客户端请求错误）不停用，原样透传。
+fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
+    let (etype, message) = parse_upstream_error(body);
+    let reason = || {
+        let head = match &etype {
+            Some(t) => format!("[{}] {t}: {message}", status.as_u16()),
+            None => format!("[{}] {message}", status.as_u16()),
+        };
+        head.chars().take(200).collect::<String>()
+    };
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(reason()),
+        StatusCode::BAD_REQUEST => {
+            let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
+            BAN_KEYWORDS.iter().any(|k| hay.contains(k)).then(reason)
+        }
+        _ => None,
+    }
 }
 
 /// 生效的接入 key：启动时 `--api-key`/env 覆盖优先，否则用库中网页配置的值。

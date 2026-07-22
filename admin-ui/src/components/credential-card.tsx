@@ -139,7 +139,10 @@ export function CredentialCard({ cred }: { cred: Credential }) {
                 {cred.tier}
               </Badge>
             )}
-            <span className={cn('inline-flex items-center gap-1', expiry.className)}>
+            <span
+              className={cn('inline-flex items-center gap-1', expiry.className)}
+              title={cred.ban_reason ?? undefined}
+            >
               <ClockIcon className="size-3 shrink-0" />
               {expiry.text}
             </span>
