@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     middleware,
     routing::{any, delete, get, post},
@@ -17,7 +17,7 @@ use crate::auth;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
-use crate::store::CredentialStore;
+use crate::store::{self, CredentialStore};
 
 /// 服务共享状态。
 #[derive(Clone)]
@@ -70,6 +70,7 @@ pub async fn run(
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/refresh", post(refresh_credential))
+        .route("/usage", get(list_usage))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
@@ -189,15 +190,43 @@ async fn exchange(
     Ok(Json(CredentialView::new(&cred, 0)))
 }
 
+// ---------- 用量日志 ----------
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    /// 返回条数上限（默认 100，最多 1000）。
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 列出最近的用量日志（按时间倒序）。
+async fn list_usage(
+    State(state): State<AppState>,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let logs = state.store.list_usage_logs(limit).map_err(internal)?;
+    Ok(Json(logs))
+}
+
 // ---------- 凭证管理 ----------
 
 /// 列出全部凭证（token 已脱敏）。
 async fn list_credentials(State(state): State<AppState>) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
     let counts = state.store.device_counts().map_err(internal)?;
+    let quotas = state.store.latest_quotas().map_err(internal)?;
+    let last_used = state.store.last_used().map_err(internal)?;
+    let costs = state.store.cost_by_cred().map_err(internal)?;
     let views = list
         .iter()
-        .map(|c| CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0)))
+        .map(|c| {
+            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0)).with_stats(
+                quotas.get(&c.id).cloned(),
+                last_used.get(&c.id).copied(),
+                costs.get(&c.id).copied().unwrap_or(0.0),
+            )
+        })
         .collect();
     Ok(Json(views))
 }
@@ -315,7 +344,10 @@ async fn refresh_credential(
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     let count = state.store.device_count(id).map_err(internal)?;
-    Ok(Json(CredentialView::new(&cred, count)))
+    let quota = state.store.latest_quotas().map_err(internal)?.remove(&id);
+    let last_used = state.store.last_used().map_err(internal)?.remove(&id);
+    let cost_total = state.store.cost_by_cred().map_err(internal)?.remove(&id).unwrap_or(0.0);
+    Ok(Json(CredentialView::new(&cred, count).with_stats(quota, last_used, cost_total)))
 }
 
 // ---------- 接入设置 ----------
@@ -415,6 +447,12 @@ struct CredentialView {
     device_count: i64,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
+    /// 最新一次的订阅额度快照（无请求记录时为 None）。
+    quota: Option<store::QuotaSnapshot>,
+    /// 最近一次被使用（转发请求）的时间戳（Unix 秒）；从未使用为 None。
+    last_used: Option<i64>,
+    /// 累计等价 API 费用（USD）。
+    cost_total: f64,
 }
 
 impl CredentialView {
@@ -434,7 +472,23 @@ impl CredentialView {
             device_limit: c.device_limit,
             device_count,
             token_hint: mask_token(&c.refresh_token),
+            quota: None,
+            last_used: None,
+            cost_total: 0.0,
         }
+    }
+
+    /// 链式附加额度快照、最近使用时间与累计费用。
+    fn with_stats(
+        mut self,
+        quota: Option<store::QuotaSnapshot>,
+        last_used: Option<i64>,
+        cost_total: f64,
+    ) -> Self {
+        self.quota = quota;
+        self.last_used = last_used;
+        self.cost_total = cost_total;
+        self
     }
 }
 

@@ -1,5 +1,17 @@
 import { api } from './client'
 
+/** 订阅账号最新额度快照（来自上游 anthropic-ratelimit-unified-* 头）。 */
+export interface Quota {
+  /** 快照对应请求时间（Unix 秒）。 */
+  ts: number
+  unified_status: string | null
+  rl_5h_utilization: number | null
+  rl_5h_reset: number | null
+  rl_7d_utilization: number | null
+  rl_7d_reset: number | null
+  rl_representative: string | null
+}
+
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */
 export interface Credential {
   id: number
@@ -16,6 +28,12 @@ export interface Credential {
   /** 当前已绑定的设备数。 */
   device_count: number
   token_hint: string
+  /** 最新一次的订阅额度快照；无请求记录时为 null。 */
+  quota: Quota | null
+  /** 最近一次被使用（转发请求）的时间戳（Unix 秒）；从未使用为 null。 */
+  last_used: number | null
+  /** 累计等价 API 费用（USD）。 */
+  cost_total: number
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */

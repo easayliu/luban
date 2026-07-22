@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod credentials;
 mod oauth;
+mod pricing;
 mod proxy;
 mod store;
 mod web;
@@ -36,9 +37,9 @@ struct Cli {
     /// 设置后（含网页设置）管理接口需鉴权；此参数会接管、网页只读。
     #[arg(long, env = "LUBAN_ADMIN_PASSWORD")]
     admin_password: Option<String>,
-    /// 不自动打开浏览器
+    /// 启动后自动打开浏览器（默认不打开）
     #[arg(long)]
-    no_open: bool,
+    open: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
         None => {
             let api_key = cli.api_key.filter(|k| !k.trim().is_empty());
             let admin_password = cli.admin_password.filter(|k| !k.trim().is_empty());
-            web::run(&cli.host, cli.port, !cli.no_open, store, api_key, admin_password).await
+            web::run(&cli.host, cli.port, cli.open, store, api_key, admin_password).await
         }
         Some(Command::Status) => status(&store),
         Some(Command::Logout) => logout(&store),

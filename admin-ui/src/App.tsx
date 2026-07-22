@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Plus, Users, Settings2, LogOut } from 'lucide-react'
+import { Plus, Users, Settings2, LogOut, Activity } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
+import { formatUsd } from '@/lib/utils'
 import { CredentialCard } from '@/components/credential-card'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
+import { UsagePanel } from '@/components/usage-panel'
 import { LoginPage } from '@/components/login-page'
 import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
@@ -14,6 +16,7 @@ import { Toaster } from '@/components/ui/sonner'
 function App() {
   const [adding, setAdding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [showUsage, setShowUsage] = useState(false)
   const [pw, setPwState] = useState<string | null>(getPw())
 
   const { data: authState, isLoading: authLoading } = useQuery({
@@ -45,10 +48,11 @@ function App() {
 
   const count = creds?.length ?? 0
   const active = creds?.filter((c) => !c.disabled).length ?? 0
+  const costTotal = creds?.reduce((s, c) => s + (c.cost_total ?? 0), 0) ?? 0
 
   return (
     <div className="min-h-screen bg-background px-5 py-10 text-foreground sm:py-14">
-      <div className="mx-auto w-full max-w-2xl space-y-5">
+      <div className="mx-auto w-full max-w-3xl space-y-6">
         {/* 品牌 + 操作 */}
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -61,6 +65,15 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant={showUsage ? 'secondary' : 'outline'}
+              onClick={() => setShowUsage((s) => !s)}
+              title="用量与额度"
+            >
+              <Activity />
+              用量
+            </Button>
             <Button
               size="sm"
               variant={showSettings ? 'secondary' : 'outline'}
@@ -85,18 +98,23 @@ function App() {
           </div>
         </header>
 
+        {showUsage && <UsagePanel />}
         {showSettings && <AccessSettings />}
-
-        {/* 概览 */}
-        {count > 0 && (
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Users className="size-3.5" />
-            共 {count} 个账号，{active} 个启用
-          </div>
-        )}
 
         {/* 添加面板 */}
         {adding && <AddAccount onClose={() => setAdding(false)} />}
+
+        {/* 概览 */}
+        {count > 0 && (
+          <div className="flex items-center gap-2 px-0.5 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <Users className="size-3.5" />
+              共 {count} 个账号，{active} 个启用
+            </span>
+            <span className="opacity-40">·</span>
+            <span title="所有账号累计等价 API 费用">累计费用 {formatUsd(costTotal)}</span>
+          </div>
+        )}
 
         {/* 列表 */}
         {isLoading ? (
@@ -104,7 +122,7 @@ function App() {
         ) : count === 0 && !adding ? (
           <EmptyState onAdd={() => setAdding(true)} />
         ) : (
-          <div className="space-y-3">
+          <div className="space-y-4">
             {creds!.map((c) => (
               <CredentialCard key={c.id} cred={c} />
             ))}

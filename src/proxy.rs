@@ -91,6 +91,24 @@ pub async fn handle(
     match resp {
         Ok(up) => {
             let status = up.status();
+            // 判断响应是否为 SSE 流（决定用量嗅探采用逐行还是整段 JSON 模式）。
+            let is_stream = up
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("text/event-stream"))
+                .unwrap_or(false);
+            // 解析并打印上游限流头（订阅账号 5h/7d 额度体现在此），随后随日志入库。
+            let ratelimit = RateLimitInfo::from_headers(up.headers());
+            tracing::info!(
+                cred = format!("#{} {}", cred.id, cred.label),
+                rep = %ratelimit.representative.as_deref().unwrap_or("-"),
+                u5h = %opt_str(ratelimit.five_h_utilization),
+                u7d = %opt_str(ratelimit.seven_d_utilization),
+                headers = %ratelimit.raw,
+                "上游限流头"
+            );
+
             let mut builder = Response::builder().status(status);
             for (k, v) in up.headers().iter() {
                 if is_resp_forwardable(k) {
@@ -98,19 +116,27 @@ pub async fn handle(
                 }
             }
 
-            // 包裹响应流：首块到达记 TTFT，流结束(或断开)时在 Drop 里记 total 并输出一条日志。
+            // 包裹响应流：首块到达记 TTFT，边转发边嗅探用量；
+            // 流结束(或断开)时在 Drop 里记 total、输出一条日志并落库。
             let mut rl = ReqLog {
                 started,
                 ttft_ms: None,
                 method: method.to_string(),
                 path: path_and_query,
-                cred: format!("#{} {}", cred.id, cred.label),
-                device: device_id.map(|d| d.chars().take(8).collect()),
+                cred_id: cred.id,
+                cred_label: cred.label.clone(),
+                device_id,
                 status: status.as_u16(),
+                sniffer: UsageSniffer::new(is_stream),
+                ratelimit,
+                store: state.store.clone(),
             };
             let stream = up.bytes_stream().map(move |chunk| {
                 if rl.ttft_ms.is_none() {
                     rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+                }
+                if let Ok(bytes) = &chunk {
+                    rl.sniffer.feed(bytes);
                 }
                 chunk
             });
@@ -126,30 +152,209 @@ pub async fn handle(
     }
 }
 
-/// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT 与总耗时）。
+/// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT、总耗时与用量）并落库。
 struct ReqLog {
     started: std::time::Instant,
     ttft_ms: Option<u128>,
     method: String,
     path: String,
-    cred: String,
-    /// device_id 前 8 位（脱敏），便于观察粘性绑定命中情况。
-    device: Option<String>,
+    cred_id: i64,
+    cred_label: String,
+    /// 完整 device_id；日志里只展示前 8 位（脱敏）。
+    device_id: Option<String>,
     status: u16,
+    /// 增量嗅探到的响应用量。
+    sniffer: UsageSniffer,
+    /// 上游返回的订阅账号限流快照。
+    ratelimit: RateLimitInfo,
+    store: std::sync::Arc<store::CredentialStore>,
 }
 
 impl Drop for ReqLog {
     fn drop(&mut self) {
+        self.sniffer.finish();
+        let has_usage = self.sniffer.has_usage();
+        let cost_usd = crate::pricing::estimate_usd(
+            self.sniffer.model.as_deref(),
+            self.sniffer.input_tokens,
+            self.sniffer.output_tokens,
+            self.sniffer.cache_creation_tokens,
+            self.sniffer.cache_creation_5m,
+            self.sniffer.cache_creation_1h,
+            self.sniffer.cache_read_tokens,
+        );
+        let total_ms = self.started.elapsed().as_millis();
+        let device_short: String = self
+            .device_id
+            .as_ref()
+            .map(|d| d.chars().take(8).collect())
+            .unwrap_or_else(|| "-".into());
+        let ttft = self.ttft_ms.map(|v| v as i64);
+        let total = i64::try_from(total_ms).ok();
+
         tracing::info!(
             method = %self.method,
             path = %self.path,
-            cred = %self.cred,
-            device = ?self.device,
+            cred = format!("#{} {}", self.cred_id, self.cred_label),
+            device = %device_short,
             status = self.status,
-            ttft_ms = ?self.ttft_ms,
-            total_ms = self.started.elapsed().as_millis(),
+            model = %self.sniffer.model.as_deref().unwrap_or("-"),
+            has_usage,
+            input_tokens = self.sniffer.input_tokens.unwrap_or(0),
+            output_tokens = self.sniffer.output_tokens.unwrap_or(0),
+            cache_creation_tokens = self.sniffer.cache_creation_tokens.unwrap_or(0),
+            cache_read_tokens = self.sniffer.cache_read_tokens.unwrap_or(0),
+            ttft_ms = self.ttft_ms.map(|v| v as u64).unwrap_or(0),
+            total_ms,
+            cost_usd = cost_usd.map(|c| format!("{c:.5}")).unwrap_or_else(|| "-".into()),
             "转发"
         );
+
+        let rec = store::UsageRecord {
+            cred_id: Some(self.cred_id),
+            cred_label: self.cred_label.clone(),
+            device_id: self.device_id.clone(),
+            model: self.sniffer.model.clone(),
+            path: self.path.clone(),
+            status: self.status,
+            has_usage,
+            input_tokens: self.sniffer.input_tokens,
+            output_tokens: self.sniffer.output_tokens,
+            cache_creation_tokens: self.sniffer.cache_creation_tokens,
+            cache_5m_tokens: self.sniffer.cache_creation_5m,
+            cache_1h_tokens: self.sniffer.cache_creation_1h,
+            cache_read_tokens: self.sniffer.cache_read_tokens,
+            ttft_ms: ttft,
+            total_ms: total,
+            unified_status: self.ratelimit.unified_status.clone(),
+            rl_5h_status: self.ratelimit.five_h_status.clone(),
+            rl_5h_reset: self.ratelimit.five_h_reset,
+            rl_5h_utilization: self.ratelimit.five_h_utilization,
+            rl_7d_status: self.ratelimit.seven_d_status.clone(),
+            rl_7d_reset: self.ratelimit.seven_d_reset,
+            rl_7d_utilization: self.ratelimit.seven_d_utilization,
+            rl_representative: self.ratelimit.representative.clone(),
+            ratelimit_raw: (!self.ratelimit.raw.is_empty()).then(|| self.ratelimit.raw.clone()),
+            cost_usd,
+        };
+        if let Err(e) = self.store.insert_usage_log(&rec) {
+            tracing::warn!(error = %e, "写入用量日志失败");
+        }
+    }
+}
+
+/// 从上游响应中增量嗅探 token 用量。
+///
+/// - SSE 流：逐行解析 `data:` 事件——`message_start` 带 input/cache 与 model，
+///   `message_delta` 带最终 output_tokens。后见到的非空值覆盖旧值。
+/// - 非流式 JSON：累积整段响应体，在 [`Self::finish`] 时解析顶层 `usage`。
+#[derive(Default)]
+struct UsageSniffer {
+    is_stream: bool,
+    /// SSE 模式下未处理完的行尾；非流式模式下累积的整段响应体。
+    buf: Vec<u8>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    /// 缓存写细分：5 分钟 / 1 小时档（上游 `usage.cache_creation` 下）。
+    cache_creation_5m: Option<i64>,
+    cache_creation_1h: Option<i64>,
+    cache_read_tokens: Option<i64>,
+}
+
+impl UsageSniffer {
+    fn new(is_stream: bool) -> Self {
+        Self {
+            is_stream,
+            ..Default::default()
+        }
+    }
+
+    /// 喂入一块响应字节。
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.is_stream {
+            self.buf.extend_from_slice(chunk);
+            // 逐个完整行处理，保留最后不完整的一段在 buf 里。
+            while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                self.parse_line(&line[..line.len() - 1]);
+            }
+            // 防御：异常超长行避免无界增长。
+            if self.buf.len() > 1_000_000 {
+                self.buf.clear();
+            }
+        } else if self.buf.len() < 1_000_000 {
+            // 非流式：累积整段响应体（JSON 消息响应通常很小）。
+            self.buf.extend_from_slice(chunk);
+        }
+    }
+
+    /// 解析一行 SSE 数据行（`data: {...}`）或裸 JSON 行。
+    fn parse_line(&mut self, line: &[u8]) {
+        let s = match std::str::from_utf8(line) {
+            Ok(s) => s.trim(),
+            Err(_) => return,
+        };
+        let json_str = s.strip_prefix("data:").map(str::trim).unwrap_or(s);
+        if !json_str.starts_with('{') {
+            return;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            self.merge(&v);
+        }
+    }
+
+    /// 合并一段 JSON 里的用量字段（顶层或 `message.` 下）。
+    fn merge(&mut self, v: &serde_json::Value) {
+        if let Some(m) = v
+            .get("model")
+            .and_then(|m| m.as_str())
+            .or_else(|| v.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str()))
+        {
+            self.model = Some(m.to_string());
+        }
+        let usage = v.get("usage").or_else(|| v.get("message").and_then(|m| m.get("usage")));
+        if let Some(u) = usage {
+            if let Some(x) = u.get("input_tokens").and_then(|x| x.as_i64()) {
+                self.input_tokens = Some(x);
+            }
+            if let Some(x) = u.get("output_tokens").and_then(|x| x.as_i64()) {
+                self.output_tokens = Some(x);
+            }
+            if let Some(x) = u.get("cache_creation_input_tokens").and_then(|x| x.as_i64()) {
+                self.cache_creation_tokens = Some(x);
+            }
+            if let Some(x) = u.get("cache_read_input_tokens").and_then(|x| x.as_i64()) {
+                self.cache_read_tokens = Some(x);
+            }
+            // 缓存写细分（5m / 1h）：`usage.cache_creation.ephemeral_*_input_tokens`。
+            if let Some(cc) = u.get("cache_creation") {
+                if let Some(x) = cc.get("ephemeral_5m_input_tokens").and_then(|x| x.as_i64()) {
+                    self.cache_creation_5m = Some(x);
+                }
+                if let Some(x) = cc.get("ephemeral_1h_input_tokens").and_then(|x| x.as_i64()) {
+                    self.cache_creation_1h = Some(x);
+                }
+            }
+        }
+    }
+
+    /// 收尾：非流式模式在此解析累积的整段 JSON。
+    fn finish(&mut self) {
+        if !self.is_stream && !self.buf.is_empty() {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
+                self.merge(&v);
+            }
+        }
+    }
+
+    /// 是否解析到任一用量字段。
+    fn has_usage(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.cache_read_tokens.is_some()
     }
 }
 
@@ -201,6 +406,64 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
         parts.push(config::OAUTH_BETA_HEADER.to_string());
     }
     parts.join(",")
+}
+
+/// 把 `Option<f64>` 渲染成日志友好字符串（None → `-`）。
+fn opt_str(v: Option<f64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+}
+
+/// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
+///
+/// 5h/7d 两个窗口各有 status/reset(unix 秒)/utilization(0~1)；`representative` 指明
+/// 当前起约束作用的窗口（如 `five_hour`）。`raw` 保留全部匹配头，字段变化时兜底回看。
+#[derive(Default, Clone)]
+struct RateLimitInfo {
+    unified_status: Option<String>,
+    five_h_status: Option<String>,
+    five_h_reset: Option<i64>,
+    five_h_utilization: Option<f64>,
+    seven_d_status: Option<String>,
+    seven_d_reset: Option<i64>,
+    seven_d_utilization: Option<f64>,
+    representative: Option<String>,
+    /// 全部匹配到的限流/anthropic- 头，`k=v` 以 `, ` 连接。
+    raw: String,
+}
+
+impl RateLimitInfo {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let mut info = RateLimitInfo::default();
+        let mut pairs: Vec<String> = Vec::new();
+        for (k, v) in headers.iter() {
+            let name = k.as_str().to_ascii_lowercase();
+            if !(name.contains("ratelimit") || name == "retry-after" || name.starts_with("anthropic-"))
+            {
+                continue;
+            }
+            let val = v.to_str().unwrap_or("<non-utf8>");
+            pairs.push(format!("{name}={val}"));
+            match name.as_str() {
+                "anthropic-ratelimit-unified-status" => info.unified_status = Some(val.to_string()),
+                "anthropic-ratelimit-unified-5h-status" => info.five_h_status = Some(val.to_string()),
+                "anthropic-ratelimit-unified-5h-reset" => info.five_h_reset = val.parse().ok(),
+                "anthropic-ratelimit-unified-5h-utilization" => {
+                    info.five_h_utilization = val.parse().ok()
+                }
+                "anthropic-ratelimit-unified-7d-status" => info.seven_d_status = Some(val.to_string()),
+                "anthropic-ratelimit-unified-7d-reset" => info.seven_d_reset = val.parse().ok(),
+                "anthropic-ratelimit-unified-7d-utilization" => {
+                    info.seven_d_utilization = val.parse().ok()
+                }
+                "anthropic-ratelimit-unified-representative-claim" => {
+                    info.representative = Some(val.to_string())
+                }
+                _ => {}
+            }
+        }
+        info.raw = pairs.join(", ");
+        info
+    }
 }
 
 /// 请求头是否可转发：跳过鉴权、Host、逐跳头、以及我们显式设置的头。

@@ -58,6 +58,14 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
+export function formatUsd(v: number): string {
+  if (!v || v <= 0) return '$0.00'
+  if (v < 0.01) return `$${v.toFixed(4)}`
+  if (v < 1) return `$${v.toFixed(3)}`
+  return `$${v.toFixed(2)}`
+}
+
 /** Unix 秒时间戳 → 相对当前的「x 前」。 */
 export function relativeTime(unixSecs: number): string {
   const diff = Math.floor(Date.now() / 1000) - unixSecs

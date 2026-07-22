@@ -278,6 +278,248 @@ pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";
 /// 设备绑定有效期默认值：1 小时。
 pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
 
+/// 待写入的一条用量日志（代理层组装后交给 [`CredentialStore::insert_usage_log`]）。
+#[derive(Debug, Default)]
+pub struct UsageRecord {
+    pub cred_id: Option<i64>,
+    pub cred_label: String,
+    /// 完整 device_id（供本地分析；对外展示可自行截断）。
+    pub device_id: Option<String>,
+    pub model: Option<String>,
+    pub path: String,
+    pub status: u16,
+    /// 是否从响应中解析到用量。
+    pub has_usage: bool,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    /// 缓存写细分：5 分钟 / 1 小时档。
+    pub cache_5m_tokens: Option<i64>,
+    pub cache_1h_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub total_ms: Option<i64>,
+    pub unified_status: Option<String>,
+    pub rl_5h_status: Option<String>,
+    pub rl_5h_reset: Option<i64>,
+    pub rl_5h_utilization: Option<f64>,
+    pub rl_7d_status: Option<String>,
+    pub rl_7d_reset: Option<i64>,
+    pub rl_7d_utilization: Option<f64>,
+    pub rl_representative: Option<String>,
+    pub ratelimit_raw: Option<String>,
+    /// 等价 API 费用（USD）。
+    pub cost_usd: Option<f64>,
+}
+
+/// 一条落库后的用量日志（读取用）。
+#[derive(Debug, serde::Serialize)]
+pub struct UsageLog {
+    pub id: i64,
+    pub ts: i64,
+    pub cred_id: Option<i64>,
+    pub cred_label: String,
+    pub device_id: Option<String>,
+    pub model: Option<String>,
+    pub path: String,
+    pub status: u16,
+    pub has_usage: bool,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_5m_tokens: Option<i64>,
+    pub cache_1h_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub total_ms: Option<i64>,
+    pub unified_status: Option<String>,
+    pub rl_5h_status: Option<String>,
+    pub rl_5h_reset: Option<i64>,
+    pub rl_5h_utilization: Option<f64>,
+    pub rl_7d_status: Option<String>,
+    pub rl_7d_reset: Option<i64>,
+    pub rl_7d_utilization: Option<f64>,
+    pub rl_representative: Option<String>,
+    pub ratelimit_raw: Option<String>,
+    pub cost_usd: Option<f64>,
+}
+
+/// 单个凭证最新一次的额度快照（用于凭证卡片展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuotaSnapshot {
+    /// 该快照对应的请求时间（Unix 秒）。
+    pub ts: i64,
+    pub unified_status: Option<String>,
+    pub rl_5h_utilization: Option<f64>,
+    pub rl_5h_reset: Option<i64>,
+    pub rl_7d_utilization: Option<f64>,
+    pub rl_7d_reset: Option<i64>,
+    pub rl_representative: Option<String>,
+}
+
+impl CredentialStore {
+    /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照）。
+    ///
+    /// 借助 SQLite 的特性：`MAX(ts)` 存在时，同 SELECT 里的裸列取自该最大行。
+    pub fn latest_quotas(&self) -> Result<HashMap<i64, QuotaSnapshot>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, MAX(ts), unified_status,
+                    rl_5h_utilization, rl_5h_reset, rl_7d_utilization, rl_7d_reset, rl_representative
+               FROM usage_logs
+              WHERE cred_id IS NOT NULL
+                AND (rl_5h_utilization IS NOT NULL OR rl_7d_utilization IS NOT NULL)
+              GROUP BY cred_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                QuotaSnapshot {
+                    ts: r.get(1)?,
+                    unified_status: r.get(2)?,
+                    rl_5h_utilization: r.get(3)?,
+                    rl_5h_reset: r.get(4)?,
+                    rl_7d_utilization: r.get(5)?,
+                    rl_7d_reset: r.get(6)?,
+                    rl_representative: r.get(7)?,
+                },
+            ))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, q) = row?;
+            out.insert(cid, q);
+        }
+        Ok(out)
+    }
+
+    /// 每个凭证最近一次被使用（有转发记录）的时间（cred_id → Unix 秒）。
+    pub fn last_used(&self) -> Result<HashMap<i64, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, MAX(ts) FROM usage_logs
+              WHERE cred_id IS NOT NULL GROUP BY cred_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, ts) = row?;
+            out.insert(cid, ts);
+        }
+        Ok(out)
+    }
+
+    /// 每个凭证累计的等价 API 费用（cred_id → USD 合计）。
+    pub fn cost_by_cred(&self) -> Result<HashMap<i64, f64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, COALESCE(SUM(cost_usd), 0) FROM usage_logs
+              WHERE cred_id IS NOT NULL GROUP BY cred_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, sum) = row?;
+            out.insert(cid, sum);
+        }
+        Ok(out)
+    }
+
+    /// 写入一条用量日志。
+    pub fn insert_usage_log(&self, rec: &UsageRecord) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO usage_logs
+                (cred_id, cred_label, device_id, model, path, status, has_usage,
+                 input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
+                 cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
+                 unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
+                 rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
+                 cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+            params![
+                rec.cred_id,
+                rec.cred_label,
+                rec.device_id,
+                rec.model,
+                rec.path,
+                rec.status as i64,
+                rec.has_usage as i64,
+                rec.input_tokens,
+                rec.output_tokens,
+                rec.cache_creation_tokens,
+                rec.cache_5m_tokens,
+                rec.cache_1h_tokens,
+                rec.cache_read_tokens,
+                rec.ttft_ms,
+                rec.total_ms,
+                rec.unified_status,
+                rec.rl_5h_status,
+                rec.rl_5h_reset,
+                rec.rl_5h_utilization,
+                rec.rl_7d_status,
+                rec.rl_7d_reset,
+                rec.rl_7d_utilization,
+                rec.rl_representative,
+                rec.ratelimit_raw,
+                rec.cost_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 最近的用量日志，按时间倒序，最多 `limit` 条。
+    pub fn list_usage_logs(&self, limit: i64) -> Result<Vec<UsageLog>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, cred_id, cred_label, device_id, model, path, status, has_usage,
+                    input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
+                    cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
+                    unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
+                    rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
+                    cost_usd
+               FROM usage_logs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(UsageLog {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                cred_id: r.get(2)?,
+                cred_label: r.get(3)?,
+                device_id: r.get(4)?,
+                model: r.get(5)?,
+                path: r.get(6)?,
+                status: r.get::<_, i64>(7)? as u16,
+                has_usage: r.get::<_, i64>(8)? != 0,
+                input_tokens: r.get(9)?,
+                output_tokens: r.get(10)?,
+                cache_creation_tokens: r.get(11)?,
+                cache_5m_tokens: r.get(12)?,
+                cache_1h_tokens: r.get(13)?,
+                cache_read_tokens: r.get(14)?,
+                ttft_ms: r.get(15)?,
+                total_ms: r.get(16)?,
+                unified_status: r.get(17)?,
+                rl_5h_status: r.get(18)?,
+                rl_5h_reset: r.get(19)?,
+                rl_5h_utilization: r.get(20)?,
+                rl_7d_status: r.get(21)?,
+                rl_7d_reset: r.get(22)?,
+                rl_7d_utilization: r.get(23)?,
+                rl_representative: r.get(24)?,
+                ratelimit_raw: r.get(25)?,
+                cost_usd: r.get(26)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS credentials (
@@ -313,9 +555,64 @@ fn init_schema(conn: &Connection) -> Result<()> {
             last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_device_bindings_cred
-            ON device_bindings(cred_id);",
+            ON device_bindings(cred_id);
+
+        -- 每次转发的用量日志：从上游响应里嗅探到的 token 用量（若响应带了 usage）。
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            id             INTEGER PRIMARY KEY,
+            ts             INTEGER NOT NULL DEFAULT (unixepoch()),
+            cred_id        INTEGER,
+            cred_label     TEXT    NOT NULL DEFAULT '',
+            device_id      TEXT,
+            model          TEXT,
+            path           TEXT    NOT NULL DEFAULT '',
+            status         INTEGER NOT NULL DEFAULT 0,
+            -- 是否从响应中解析到用量（1/0）；未解析到时下面各 token 列为空。
+            has_usage      INTEGER NOT NULL DEFAULT 0 CHECK (has_usage IN (0,1)),
+            input_tokens          INTEGER,
+            output_tokens         INTEGER,
+            cache_creation_tokens INTEGER,
+            cache_5m_tokens       INTEGER,
+            cache_1h_tokens       INTEGER,
+            cache_read_tokens     INTEGER,
+            ttft_ms        INTEGER,
+            total_ms       INTEGER,
+            -- 订阅账号限流（anthropic-ratelimit-unified-*）：状态/额度重置时刻/使用率。
+            unified_status     TEXT,
+            rl_5h_status       TEXT,
+            rl_5h_reset        INTEGER,
+            rl_5h_utilization  REAL,
+            rl_7d_status       TEXT,
+            rl_7d_reset        INTEGER,
+            rl_7d_utilization  REAL,
+            rl_representative  TEXT,
+            -- 原始限流头（兜底：字段变化时仍可回看）。
+            ratelimit_raw      TEXT,
+            -- 按官方定价估算的等价 API 费用（USD）；模型未知时为空。
+            cost_usd           REAL
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_ts   ON usage_logs(ts);
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred ON usage_logs(cred_id);",
     )
     .context("初始化凭证库 schema 失败")?;
+
+    // 兼容旧 usage_logs：逐列幂等新增（已存在则忽略 duplicate column）。
+    for col in [
+        "unified_status TEXT",
+        "rl_5h_status TEXT",
+        "rl_5h_reset INTEGER",
+        "rl_5h_utilization REAL",
+        "rl_7d_status TEXT",
+        "rl_7d_reset INTEGER",
+        "rl_7d_utilization REAL",
+        "rl_representative TEXT",
+        "ratelimit_raw TEXT",
+        "cost_usd REAL",
+        "cache_5m_tokens INTEGER",
+        "cache_1h_tokens INTEGER",
+    ] {
+        let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
+    }
 
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
