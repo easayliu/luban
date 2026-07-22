@@ -139,8 +139,8 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               {cred.last_used != null ? `最近使用 ${relativeTime(cred.last_used)}` : '尚未使用'}
             </span>
             <Dot />
-            <span className="whitespace-nowrap" title="按官方定价估算的累计等价 API 费用">
-              累计 {formatUsd(cred.cost_total)}
+            <span className="whitespace-nowrap" title="该账号历史累计等价 API 费用（按官方定价估算）">
+              累计花费 {formatUsd(cred.cost_total)}
             </span>
           </div>
         </div>
@@ -184,8 +184,18 @@ export function CredentialCard({ cred }: { cred: Credential }) {
       {/* 额度区：5h / 7d 订阅额度 */}
       {cred.quota && (
         <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
-          <QuotaBar label="5 小时" util={cred.quota.rl_5h_utilization} reset={cred.quota.rl_5h_reset} />
-          <QuotaBar label="7 天" util={cred.quota.rl_7d_utilization} reset={cred.quota.rl_7d_reset} />
+          <QuotaBar
+            label="5 小时额度"
+            util={cred.quota.rl_5h_utilization}
+            reset={cred.quota.rl_5h_reset}
+            cost={cred.quota.cost_5h}
+          />
+          <QuotaBar
+            label="7 天额度"
+            util={cred.quota.rl_7d_utilization}
+            reset={cred.quota.rl_7d_reset}
+            cost={cred.quota.cost_7d}
+          />
         </div>
       )}
 
@@ -260,12 +270,19 @@ export function CredentialCard({ cred }: { cred: Credential }) {
   )
 }
 
-/** 单个额度窗口条：标签 + 百分比 + 进度条 + 重置倒计时。util 为空显示「未返回」。 */
-function QuotaBar({ label, util, reset }: { label: string; util: number | null; reset: number | null }) {
+/** 单个额度窗口条：标签 + 百分比 + 进度条 + 重置倒计时 + 本档已用金额。util 为空显示「未返回」。 */
+function QuotaBar({
+  label, util, reset, cost,
+}: {
+  label: string
+  util: number | null
+  reset: number | null
+  cost: number | null
+}) {
   if (util == null) {
     return (
       <div className="rounded-xl border border-dashed border-border/70 px-3 py-2.5 text-2xs text-muted-foreground">
-        {label} · 本次响应未返回
+        {label} · 暂无数据
       </div>
     )
   }
@@ -276,14 +293,15 @@ function QuotaBar({ label, util, reset }: { label: string; util: number | null; 
     <div className="rounded-xl border border-border/60 bg-surface-2/40 px-3 py-2.5">
       <div className="flex items-baseline justify-between">
         <span className="text-2xs font-medium text-muted-foreground">{label}</span>
-        <span className="text-xs font-semibold tnum">{pct}%</span>
+        <span className="text-xs font-semibold tnum" title="额度使用率">{pct}%</span>
       </div>
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-border">
         <div className={cn('h-full rounded-full transition-all', barColor)} style={{ width: `${pct}%` }} />
       </div>
-      {remain != null && remain > 0 && (
-        <div className="mt-1.5 text-2xs text-muted-foreground">{formatDuration(remain)}后重置</div>
-      )}
+      <div className="mt-1.5 flex items-baseline justify-between gap-2 text-2xs text-muted-foreground">
+        <span title="本周期内已消耗的等价 API 费用">本周期花费 {formatUsd(cost ?? 0)}</span>
+        {remain != null && remain > 0 && <span title="额度重置倒计时">{formatDuration(remain)}后重置</span>}
+      </div>
     </div>
   )
 }

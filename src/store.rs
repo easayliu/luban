@@ -355,10 +355,19 @@ pub struct QuotaSnapshot {
     pub rl_7d_utilization: Option<f64>,
     pub rl_7d_reset: Option<i64>,
     pub rl_representative: Option<String>,
+    /// 当前 5h / 7d 窗口内该凭证已用的等价费用（USD）。窗口起点由对应 reset 反推。
+    pub cost_5h: Option<f64>,
+    pub cost_7d: Option<f64>,
 }
 
+/// 5 小时窗口秒数。
+const WINDOW_5H_SECS: i64 = 5 * 3600;
+/// 7 天窗口秒数。
+const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
+
 impl CredentialStore {
-    /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照）。
+    /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
+    /// 并附带当前 5h / 7d 窗口内的累计费用。
     ///
     /// 借助 SQLite 的特性：`MAX(ts)` 存在时，同 SELECT 里的裸列取自该最大行。
     pub fn latest_quotas(&self) -> Result<HashMap<i64, QuotaSnapshot>> {
@@ -382,12 +391,32 @@ impl CredentialStore {
                     rl_7d_utilization: r.get(5)?,
                     rl_7d_reset: r.get(6)?,
                     rl_representative: r.get(7)?,
+                    cost_5h: None,
+                    cost_7d: None,
                 },
             ))
         })?;
-        let mut out = HashMap::new();
+        let mut list: Vec<(i64, QuotaSnapshot)> = Vec::new();
         for row in rows {
-            let (cid, q) = row?;
+            list.push(row?);
+        }
+        drop(stmt);
+
+        // 逐凭证累加各窗口起点(reset - 窗口时长)以来的费用。
+        let mut cost_stmt = conn.prepare(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_logs
+              WHERE cred_id = ?1 AND ts >= ?2",
+        )?;
+        let mut out = HashMap::new();
+        for (cid, mut q) in list {
+            if let Some(reset) = q.rl_5h_reset {
+                q.cost_5h =
+                    Some(cost_stmt.query_row(params![cid, reset - WINDOW_5H_SECS], |r| r.get(0))?);
+            }
+            if let Some(reset) = q.rl_7d_reset {
+                q.cost_7d =
+                    Some(cost_stmt.query_row(params![cid, reset - WINDOW_7D_SECS], |r| r.get(0))?);
+            }
             out.insert(cid, q);
         }
         Ok(out)

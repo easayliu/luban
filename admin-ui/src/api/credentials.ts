@@ -10,6 +10,9 @@ export interface Quota {
   rl_7d_utilization: number | null
   rl_7d_reset: number | null
   rl_representative: string | null
+  /** 当前 5h / 7d 窗口内已用的等价费用（USD）。 */
+  cost_5h: number | null
+  cost_7d: number | null
 }
 
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */

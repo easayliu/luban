@@ -100,7 +100,7 @@ pub async fn handle(
                 .unwrap_or(false);
             // 解析并打印上游限流头（订阅账号 5h/7d 额度体现在此），随后随日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
-            tracing::info!(
+            tracing::debug!(
                 cred = format!("#{} {}", cred.id, cred.label),
                 rep = %ratelimit.representative.as_deref().unwrap_or("-"),
                 u5h = %opt_str(ratelimit.five_h_utilization),
@@ -146,9 +146,51 @@ pub async fn handle(
                 .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
         }
         Err(e) => {
-            tracing::error!(%method, path = %path_and_query, error = %e, "上游请求失败");
-            (StatusCode::BAD_GATEWAY, format!("上游请求失败: {}", e)).into_response()
+            // reqwest 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
+            let detail = error_chain(&e);
+            let kind = reqwest_error_kind(&e);
+            tracing::error!(
+                %method,
+                path = %path_and_query,
+                kind,
+                error = %detail,
+                "上游请求失败"
+            );
+            (StatusCode::BAD_GATEWAY, format!("上游请求失败[{kind}]: {detail}")).into_response()
         }
+    }
+}
+
+/// 展开 error 的 source 链，拼成「顶层 -> 次层 -> …」，暴露底层真实原因。
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        let msg = inner.to_string();
+        // 避免与上层完全重复的冗余拼接。
+        if !s.ends_with(&msg) {
+            s.push_str(" -> ");
+            s.push_str(&msg);
+        }
+        src = inner.source();
+    }
+    s
+}
+
+/// 粗分 reqwest 错误类别，便于一眼定位（超时 / 连接 / DNS-TLS 等）。
+fn reqwest_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "other"
     }
 }
 

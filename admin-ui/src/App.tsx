@@ -112,7 +112,9 @@ function App() {
               共 {count} 个账号，{active} 个启用
             </span>
             <span className="opacity-40">·</span>
-            <span title="所有账号累计等价 API 费用">累计费用 {formatUsd(costTotal)}</span>
+            <span title="所有账号历史累计等价 API 费用（按官方定价估算，仅供参考）">
+              总花费 {formatUsd(costTotal)}
+            </span>
           </div>
         )}
 
