@@ -32,5 +32,5 @@ ENV LUBAN_HOME=/app/config
 VOLUME ["/app/config"]
 
 EXPOSE 4600
-# 容器内绑 0.0.0.0，禁用自动开浏览器
-CMD ["luban", "--host", "0.0.0.0", "--port", "4600", "--no-open"]
+# 容器内绑 0.0.0.0；默认即不自动开浏览器
+CMD ["luban", "--host", "0.0.0.0", "--port", "4600"]
