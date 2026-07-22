@@ -1,0 +1,12 @@
+services:
+  luban:
+    # 优先用预构建镜像（CI 推送）；未设置时用本地构建。
+    image: ${LUBAN_IMAGE:-luban:latest}
+    build: .
+    container_name: luban
+    ports:
+      - "${PORT:-4600}:4600"
+    volumes:
+      # 凭证持久化到宿主机 ./config（对应容器内 LUBAN_HOME=/app/config）
+      - ./config/:/app/config/
+    restart: unless-stopped

@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* 黑白科技风亮色（zinc 色阶，WCAG AA 校准），沿用 kiro.rs 设计令牌 */
+    --background: 240 5% 96.5%;
+    --surface: 0 0% 100%;
+    --surface-2: 240 5% 95%;
+    --foreground: 240 10% 4%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 4%;
+
+    --primary: 240 6% 10%;
+    --primary-foreground: 0 0% 100%;
+    --primary-soft: 240 5% 96%;
+
+    --secondary: 240 5% 96%;
+    --secondary-foreground: 240 6% 10%;
+
+    --muted: 240 5% 96%;
+    --muted-foreground: 240 4% 40%;
+
+    --accent: 240 5% 96%;
+    --accent-foreground: 240 6% 10%;
+
+    --destructive: 347 77% 42%;
+    --destructive-foreground: 0 0% 100%;
+
+    --ok: 160 84% 27%;
+    --ok-foreground: 0 0% 100%;
+    --ok-soft: 160 45% 95%;
+
+    --warn: 30 90% 33%;
+    --warn-foreground: 0 0% 100%;
+    --warn-soft: 38 85% 94%;
+
+    --bad: 347 78% 42%;
+    --bad-foreground: 0 0% 100%;
+    --bad-soft: 347 80% 97%;
+
+    --border: 240 6% 90%;
+    --input: 240 6% 90%;
+    --ring: 240 6% 10%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --surface: 240 6% 10%;
+    --surface-2: 240 5% 15%;
+    --foreground: 0 0% 98%;
+
+    --card: 240 6% 10%;
+    --card-foreground: 0 0% 98%;
+
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 6% 10%;
+    --primary-soft: 240 5% 20%;
+
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 240 4% 16%;
+    --muted-foreground: 240 5% 65%;
+
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 98%;
+
+    --destructive: 347 60% 33%;
+    --destructive-foreground: 0 0% 98%;
+
+    --ok: 160 84% 45%;
+    --ok-foreground: 240 6% 10%;
+    --ok-soft: 160 40% 13%;
+
+    --warn: 43 96% 56%;
+    --warn-foreground: 240 6% 10%;
+    --warn-soft: 40 50% 15%;
+
+    --bad: 349 90% 72%;
+    --bad-foreground: 240 6% 10%;
+    --bad-soft: 347 45% 16%;
+
+    --border: 240 5% 22%;
+    --input: 240 5% 22%;
+    --ring: 0 0% 98%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+    }
+  }
+}
+
+@layer components {
+  .label-eyebrow {
+    @apply font-mono text-2xs font-medium uppercase text-muted-foreground;
+    letter-spacing: 0.08em;
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums slashed-zero;
+  }
+}

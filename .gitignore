@@ -1,28 +1,18 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Rust build artifacts
+/target
 
-# Test binary, built with `go test -c`
-*.test
+# Backtrace/debug symbols
+*.pdb
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
+# 前端依赖与构建产物（构建前需在 admin-ui 执行 pnpm install && pnpm build）
+/admin-ui/node_modules
+/admin-ui/dist
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
-go.work
-go.work.sum
+# SQLite 凭证库（含 WAL/SHM）
+*.db
+*.db-wal
+*.db-shm
+/config/
 
 # env file
 .env
@@ -30,3 +20,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# TS 增量构建缓存
+/admin-ui/tsconfig.tsbuildinfo
