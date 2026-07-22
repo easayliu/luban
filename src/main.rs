@@ -21,8 +21,8 @@ use store::CredentialStore;
 #[derive(Parser)]
 #[command(name = "luban", version, about = "Claude Code 授权代理")]
 struct Cli {
-    /// 网页服务监听地址（容器内用 0.0.0.0）
-    #[arg(long, default_value = "127.0.0.1")]
+    /// 网页服务监听地址（默认 0.0.0.0 对外可达；仅本机可设 127.0.0.1）
+    #[arg(long, default_value = "0.0.0.0")]
     host: String,
     /// 网页服务监听端口（默认命令时生效）
     #[arg(long, default_value_t = 4600)]
