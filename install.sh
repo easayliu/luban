@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 #
-# luban 一键部署脚本（Docker 版）
+# luban 一键安装脚本（Docker 版）
 #
 # 用法：
-#   bash install.sh                      # 在克隆好的仓库里：本地构建镜像并启动
-#   LUBAN_IMAGE=registry.example.com/you/luban:latest bash install.sh   # 用预构建镜像
+#   curl -fsSL https://raw.githubusercontent.com/easayliu/luban/main/install.sh | bash
+#   bash install.sh
 #
 # 环境变量：
 #   INSTALL_DIR   安装目录，默认 ~/luban
-#   LUBAN_IMAGE   预构建镜像地址；未设置时用当前仓库的 Dockerfile 本地构建
+#   IMAGE_OWNER   镜像 owner，默认 easayliu
+#   IMAGE_TAG     镜像 tag，默认 latest（由 tag 触发的 CI 构建产出）
+#   IMAGE_REG     镜像 registry，默认 ghcr.io；国内可用 ghcr.nju.edu.cn
 #   PORT          宿主机监听端口，默认 4600
+#   LUBAN_API_KEY 接入用 API Key，默认留空（改由网页「接入设置」管理）
 #   AUTO_START    安装后是否立即启动，默认 yes
 #
 
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/luban}"
-LUBAN_IMAGE="${LUBAN_IMAGE:-}"
+IMAGE_OWNER="${IMAGE_OWNER:-easayliu}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+IMAGE_REG="${IMAGE_REG:-ghcr.io}"
 PORT="${PORT:-4600}"
+LUBAN_API_KEY="${LUBAN_API_KEY:-}"
 AUTO_START="${AUTO_START:-yes}"
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
@@ -48,51 +54,26 @@ main() {
   COMPOSE="$(detect_compose)"
   ok "docker 就绪；compose 命令：$COMPOSE"
 
-  # 判定构建方式：有 LUBAN_IMAGE 用预构建镜像，否则要求在仓库内本地构建。
-  local REPO_ROOT=""
-  if [[ -z "$LUBAN_IMAGE" ]]; then
-    local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [[ -f "$here/Dockerfile" ]]; then
-      REPO_ROOT="$here"
-      info "未指定 LUBAN_IMAGE，将用仓库 Dockerfile 本地构建：$REPO_ROOT"
-    else
-      error "未指定 LUBAN_IMAGE，且当前目录没有 Dockerfile。"
-      error "请在克隆好的 luban 仓库内运行，或设置 LUBAN_IMAGE 指向预构建镜像。"
-      exit 1
-    fi
-  fi
-
   mkdir -p "$INSTALL_DIR/config"
   info "安装目录：$INSTALL_DIR"
 
   # ---------- docker-compose.yml ----------
   local COMPOSE_PATH="$INSTALL_DIR/docker-compose.yml"
-  if [[ -n "$LUBAN_IMAGE" ]]; then
-    cat > "$COMPOSE_PATH" <<EOF
+  cat > "$COMPOSE_PATH" <<EOF
 services:
   luban:
-    image: ${LUBAN_IMAGE}
+    image: ${IMAGE_REG}/${IMAGE_OWNER}/luban:${IMAGE_TAG}
     container_name: luban
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${PORT}:4600"
+    environment:
+      - LUBAN_API_KEY=${LUBAN_API_KEY}
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
 EOF
-  else
-    cat > "$COMPOSE_PATH" <<EOF
-services:
-  luban:
-    build: ${REPO_ROOT}
-    image: luban:latest
-    container_name: luban
-    ports:
-      - "${PORT}:4600"
-    volumes:
-      - ./config/:/app/config/
-    restart: unless-stopped
-EOF
-  fi
   ok "已写入 $COMPOSE_PATH"
 
   if [[ "$AUTO_START" != "yes" ]]; then
@@ -103,13 +84,8 @@ EOF
 
   (
     cd "$INSTALL_DIR"
-    if [[ -n "$LUBAN_IMAGE" ]]; then
-      info "拉取镜像 ${LUBAN_IMAGE} ..."
-      $COMPOSE pull
-    else
-      info "本地构建镜像（首次较慢）..."
-      $COMPOSE build
-    fi
+    info "拉取镜像 ${IMAGE_REG}/${IMAGE_OWNER}/luban:${IMAGE_TAG} ..."
+    $COMPOSE pull
     info "启动容器 ..."
     $COMPOSE up -d
   )
@@ -121,21 +97,26 @@ EOF
 print_summary() {
   cat <<EOF
 
-${BOLD}${GREEN}✓ luban 部署完成${RESET}
+${BOLD}${GREEN}✓ luban 安装完成${RESET}
 
   目录:      ${INSTALL_DIR}
-  登录页:    http://127.0.0.1:${PORT}/
+  网页:      http://127.0.0.1:${PORT}/
+
+后续步骤（浏览器打开上面的网页）:
+  1. 「添加账号」用 Claude 订阅账号授权登录（可加多个）
+  2. 「接入设置」生成/填写接入 Key（或用 LUBAN_API_KEY 环境变量）
+
+Claude Code 接入:
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:${PORT}
+  export ANTHROPIC_AUTH_TOKEN=<接入设置里的 Key>
 
 常用命令（在 ${INSTALL_DIR} 目录下执行）:
   查看日志   ${BOLD}docker compose logs -f${RESET}
   停止       ${BOLD}docker compose down${RESET}
-  升级       ${BOLD}docker compose pull && docker compose up -d${RESET}  （预构建镜像）
-             ${BOLD}docker compose up -d --build${RESET}                 （本地构建）
+  升级       ${BOLD}docker compose pull && docker compose up -d${RESET}
 
-登录说明:
-  luban 登录需要浏览器授权 + 粘贴。远程服务器上可用 SSH 端口转发到本机：
-  ${BOLD}ssh -L ${PORT}:127.0.0.1:${PORT} <user>@<server>${RESET}
-  然后本机访问 http://127.0.0.1:${PORT}/ 完成登录；凭证持久化在 ${INSTALL_DIR}/config/。
+  凭证库持久化在 ${INSTALL_DIR}/config/（重启不丢）。
+  远程服务器登录：本机 ${BOLD}ssh -L ${PORT}:127.0.0.1:${PORT} <user>@<server>${RESET} 后访问上面的网页。
 
 EOF
 }
