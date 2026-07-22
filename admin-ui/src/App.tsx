@@ -1,21 +1,47 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Plus, Users, Settings2 } from 'lucide-react'
+import { Plus, Users, Settings2, LogOut } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
+import { getAuthState } from '@/api/auth'
+import { getPw, setPw, clearPw } from '@/api/client'
 import { CredentialCard } from '@/components/credential-card'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
+import { LoginPage } from '@/components/login-page'
 import { Button } from '@/components/ui/button'
 import { Toaster } from '@/components/ui/sonner'
 
 function App() {
   const [adding, setAdding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [pw, setPwState] = useState<string | null>(getPw())
+
+  const { data: authState, isLoading: authLoading } = useQuery({
+    queryKey: ['auth-state'],
+    queryFn: getAuthState,
+  })
+
+  const needLogin = authState?.configured && !pw
+
   const { data: creds, isLoading } = useQuery({
     queryKey: ['credentials'],
     queryFn: listCredentials,
     refetchInterval: 30_000,
+    enabled: !needLogin && !authLoading, // 未登录时不请求受保护接口
   })
+
+  if (authLoading || !authState) {
+    return <div className="grid min-h-screen place-items-center text-sm text-muted-foreground">加载中…</div>
+  }
+
+  if (needLogin) {
+    return (
+      <>
+        <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
+        <Toaster position="top-right" />
+      </>
+    )
+  }
 
   const count = creds?.length ?? 0
   const active = creds?.filter((c) => !c.disabled).length ?? 0
@@ -48,6 +74,12 @@ function App() {
               <Button size="sm" onClick={() => setAdding(true)}>
                 <Plus />
                 添加账号
+              </Button>
+            )}
+            {authState.configured && pw && (
+              <Button size="sm" variant="ghost" title="退出登录"
+                onClick={() => { clearPw(); setPwState(null) }}>
+                <LogOut />
               </Button>
             )}
           </div>

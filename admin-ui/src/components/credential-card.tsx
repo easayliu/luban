@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   RefreshCw, Trash2, Pencil, Check, X, Loader2, MoreHorizontal, ChevronUp, ChevronDown,
+  Smartphone,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
-  deleteCredential, refreshCredential, setDisabled, setLabel, setPriority,
+  deleteCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel, setPriority,
   type Credential,
 } from '@/api/credentials'
 import { cn, extractError, formatDuration, relativeTime } from '@/lib/utils'
@@ -23,6 +24,8 @@ export function CredentialCard({ cred }: { cred: Credential }) {
   const invalidate = () => qc.invalidateQueries({ queryKey: ['credentials'] })
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
+  const [editingLimit, setEditingLimit] = useState(false)
+  const [limitVal, setLimitVal] = useState(String(cred.device_limit))
 
   const rename = useMutation({
     mutationFn: (label: string) => setLabel(cred.id, label),
@@ -38,6 +41,11 @@ export function CredentialCard({ cred }: { cred: Credential }) {
     mutationFn: (p: number) => setPriority(cred.id, p),
     onSuccess: invalidate,
     onError: (e) => toast.error('设置优先级失败', { description: extractError(e) }),
+  })
+  const limit = useMutation({
+    mutationFn: (n: number) => setDeviceLimit(cred.id, n),
+    onSuccess: () => { setEditingLimit(false); invalidate() },
+    onError: (e) => toast.error('设置设备上限失败', { description: extractError(e) }),
   })
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
@@ -89,10 +97,51 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               </>
             )}
           </div>
-          <div className="mt-1.5 flex items-center gap-2 font-mono text-2xs text-muted-foreground">
+          <div className="mt-1.5 flex flex-wrap items-center gap-2 font-mono text-2xs text-muted-foreground">
             <span className="tnum">#{cred.id}</span>
             <Dot />
             <span className="truncate">{cred.token_hint}</span>
+            <Dot />
+            {editingLimit ? (
+              <form
+                className="inline-flex items-center gap-1"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  const n = Math.max(0, Math.floor(Number(limitVal) || 0))
+                  limit.mutate(n)
+                }}
+              >
+                <Smartphone className="size-3 shrink-0" />
+                <Input
+                  type="number"
+                  min={0}
+                  value={limitVal}
+                  onChange={(e) => setLimitVal(e.target.value)}
+                  autoFocus
+                  className="h-6 w-16 px-1.5 text-2xs"
+                  title="设备数上限；0 表示不限"
+                />
+                <Button type="submit" size="icon" variant="ghost" className="h-6 w-6" disabled={limit.isPending}>
+                  {limit.isPending ? <Loader2 className="animate-spin" /> : <Check className="size-3" />}
+                </Button>
+                <Button type="button" size="icon" variant="ghost" className="h-6 w-6"
+                  onClick={() => { setEditingLimit(false); setLimitVal(String(cred.device_limit)) }}>
+                  <X className="size-3" />
+                </Button>
+              </form>
+            ) : (
+              <button
+                onClick={() => { setLimitVal(String(cred.device_limit)); setEditingLimit(true) }}
+                className="group inline-flex items-center gap-1 whitespace-nowrap hover:text-foreground"
+                title="点击设置设备数上限（0 表示不限）"
+              >
+                <Smartphone className="size-3 shrink-0" />
+                <span className="tnum">
+                  设备 {cred.device_count}/{cred.device_limit > 0 ? cred.device_limit : '∞'}
+                </span>
+                <Pencil className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+              </button>
+            )}
             <Dot />
             <span className="whitespace-nowrap">更新于 {relativeTime(cred.updated_at)}</span>
           </div>

@@ -30,6 +30,34 @@ export function formatDuration(secs: number): string {
   return rem ? `${hours} 小时 ${rem} 分钟` : `${hours} 小时`
 }
 
+/** 复制文本到剪贴板：安全上下文用现代 API，否则回退 execCommand（http/局域网可用）。 */
+export async function copyText(text: string): Promise<boolean> {
+  if (!text) return false
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 继续走回退
+    }
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, text.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 /** Unix 秒时间戳 → 相对当前的「x 前」。 */
 export function relativeTime(unixSecs: number): string {
   const diff = Math.floor(Date.now() / 1000) - unixSecs

@@ -3,23 +3,38 @@
 //! 单连接 + `parking_lot::Mutex` 串行化；WAL + `synchronous=NORMAL`；STRICT 表 +
 //! `CHECK`/`UNIQUE` 约束。token 轮换走单行 `UPDATE`，不重写整库。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
-const COLS: &str =
-    "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, created_at, updated_at";
+const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
+     created_at, updated_at, device_limit";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
     conn: Mutex<Connection>,
 }
+
+/// 硬性设备上限触发：所有启用凭证的设备名额均已占满。
+///
+/// 通过 `anyhow` 向上传递，代理层 `downcast` 后映射为 HTTP 429。
+#[derive(Debug)]
+pub struct DeviceLimitReached;
+
+impl std::fmt::Display for DeviceLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "所有凭证的设备数均已达上限，暂无可用名额")
+    }
+}
+
+impl std::error::Error for DeviceLimitReached {}
 
 impl CredentialStore {
     /// 数据库文件路径。默认 `~/.luban/luban.db`；`LUBAN_HOME` 可覆盖基目录。
@@ -112,9 +127,10 @@ impl CredentialStore {
         })
     }
 
-    /// 删除一条，返回是否确有删除。
+    /// 删除一条，返回是否确有删除。连带清除其设备绑定。
     pub fn delete(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock();
+        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
         let n = conn.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
@@ -139,6 +155,38 @@ impl CredentialStore {
             "UPDATE credentials SET priority = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, priority],
         )
+    }
+
+    /// 设置设备数上限（`<= 0` 表示不限）。
+    pub fn set_device_limit(&self, id: i64, limit: i64) -> Result<bool> {
+        self.update_one(
+            "UPDATE credentials SET device_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, limit],
+        )
+    }
+
+    /// 单条凭证当前已绑定的设备数。
+    pub fn device_count(&self, cred_id: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM device_bindings WHERE cred_id = ?1",
+            [cred_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// 所有凭证的已绑定设备数（cred_id → count）。
+    pub fn device_counts(&self) -> Result<HashMap<i64, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT cred_id, COUNT(*) FROM device_bindings GROUP BY cred_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, n) = row?;
+            out.insert(cid, n);
+        }
+        Ok(out)
     }
 
     /// 更新账号等级。
@@ -201,6 +249,15 @@ impl CredentialStore {
         Ok(())
     }
 
+    /// 设备绑定有效期（秒）；未设置或解析失败时用默认值。`<= 0` 表示永不过期。
+    pub fn device_binding_ttl(&self) -> i64 {
+        self.get_setting(DEVICE_BINDING_TTL)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_DEVICE_BINDING_TTL_SECS)
+    }
+
     /// 删除设置项。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         let conn = self.conn.lock();
@@ -211,6 +268,15 @@ impl CredentialStore {
 
 /// 接入用 client api key 的 settings 键名。
 pub const CLIENT_API_KEY: &str = "client_api_key";
+
+/// 管理密码（sha256 hex）的 settings 键名。
+pub const ADMIN_PASSWORD: &str = "admin_password_sha256";
+
+/// 设备绑定有效期（秒）的 settings 键名；`<= 0` 表示永不过期。
+pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";
+
+/// 设备绑定有效期默认值：1 小时。
+pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -236,12 +302,27 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        ) STRICT;",
+        ) STRICT;
+
+        -- 设备→凭证的粘性绑定：同一 device_id 始终命中同一凭证。
+        CREATE TABLE IF NOT EXISTS device_bindings (
+            device_id     TEXT    PRIMARY KEY,
+            cred_id       INTEGER NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_device_bindings_cred
+            ON device_bindings(cred_id);",
     )
     .context("初始化凭证库 schema 失败")?;
 
-    // 兼容旧库：tier 列后加；已存在时报 duplicate column，忽略即可（幂等）。
+    // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -257,24 +338,130 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         disabled: row.get::<_, i64>(7)? != 0,
         created_at: row.get::<_, i64>(8)? as u64,
         updated_at: row.get::<_, i64>(9)? as u64,
+        device_limit: row.get(10)?,
     })
 }
 
-/// 代理转发使用：选出可用凭证并返回其 access_token（必要时刷新）。
+impl CredentialStore {
+    /// 按 device_id 做粘性选择，返回选中的凭证（刷新在锁外由调用方处理）。
+    ///
+    /// 规则：
+    /// 1. 已有绑定且该凭证仍启用 → 复用（更新 last_seen / request_count），已绑定设备不受限。
+    /// 2. 绑定的凭证已停用或删除 → 清除陈旧绑定，作为新设备重新选择。
+    /// 3. 新设备 → 在仍有名额的启用凭证中做负载均衡：选“当前设备数最少”者并绑定；
+    ///    同数时按 (priority, id) 决定，保持确定性。
+    /// 4. 所有启用凭证均达设备上限 → 硬性拒绝，返回 [`DeviceLimitReached`]（代理映射为 429）。
+    ///
+    /// `device_id` 为 `None`（请求未带 metadata）时无从绑定/计数：退化为负载均衡挑选，
+    /// 不写绑定、也不受硬上限约束。
+    /// `ttl_secs > 0` 时先清除超时未活跃的绑定（惰性过期）；`<= 0` 表示永不过期。
+    /// 全部操作在单次持锁内完成，避免与其它写入竞态。
+    pub fn select_for_device(&self, device_id: Option<&str>, ttl_secs: i64) -> Result<Credential> {
+        let conn = self.conn.lock();
+
+        // 惰性过期：清掉超过 TTL 未活跃的绑定，释放其占用的设备名额。
+        if ttl_secs > 0 {
+            conn.execute(
+                "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
+                [ttl_secs],
+            )?;
+        }
+
+        // 启用凭证，按 (priority, id) 升序。
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLS} FROM credentials WHERE disabled = 0 ORDER BY priority ASC, id ASC"
+        ))?;
+        let creds: Vec<Credential> =
+            stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        if creds.is_empty() {
+            anyhow::bail!("没有可用凭证，请先登录");
+        }
+
+        // 1/2) 命中既有绑定。
+        if let Some(did) = device_id {
+            let bound: Option<i64> = conn
+                .query_row(
+                    "SELECT cred_id FROM device_bindings WHERE device_id = ?1",
+                    [did],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(cid) = bound {
+                if let Some(c) = creds.iter().find(|c| c.id == cid) {
+                    conn.execute(
+                        "UPDATE device_bindings
+                            SET last_seen_at = unixepoch(), request_count = request_count + 1
+                          WHERE device_id = ?1",
+                        [did],
+                    )?;
+                    return Ok(c.clone());
+                }
+                // 绑定的凭证已停用/删除：清除后重新选择。
+                conn.execute("DELETE FROM device_bindings WHERE device_id = ?1", [did])?;
+            }
+        }
+
+        // 各凭证当前设备数。
+        let mut counts: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut cstmt =
+                conn.prepare("SELECT cred_id, COUNT(*) FROM device_bindings GROUP BY cred_id")?;
+            let rows = cstmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (cid, n) = row?;
+                counts.insert(cid, n);
+            }
+        }
+
+        // 当前设备数（惰性过期后已排除超时项）。
+        let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
+
+        // 3/4) 负载均衡：在候选中选“当前设备数最少”者；同数按 (priority, id) 决定。
+        let chosen = if device_id.is_some() {
+            // 硬限制：仅在仍有名额者（limit<=0 不限，或 used<limit）中选；全满则拒绝。
+            match creds
+                .iter()
+                .filter(|c| c.device_limit <= 0 || used(c) < c.device_limit)
+                .min_by_key(|c| (used(c), c.priority, c.id))
+            {
+                Some(c) => c,
+                None => return Err(DeviceLimitReached.into()),
+            }
+        } else {
+            // 无 device_id：不占名额、不受限，纯负载均衡挑一个（creds 已保证非空）。
+            creds
+                .iter()
+                .min_by_key(|c| (used(c), c.priority, c.id))
+                .expect("启用凭证列表非空")
+        };
+
+        if let Some(did) = device_id {
+            conn.execute(
+                "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
+                 ON CONFLICT(device_id) DO UPDATE
+                    SET cred_id = ?2, last_seen_at = unixepoch(), request_count = request_count + 1",
+                params![did, chosen.id],
+            )?;
+        }
+        Ok(chosen.clone())
+    }
+}
+
+/// 代理转发使用：按 device_id 粘性选出凭证并返回 (access_token, 该凭证)（必要时刷新）。
 ///
-/// 选择规则：启用的凭证里按 (priority, id) 取第一条。若命中的凭证进入刷新窗口，
+/// 选择见 [`CredentialStore::select_for_device`]。若命中的凭证进入刷新窗口，
 /// 则调用 OAuth 刷新并回写。注意刷新是异步 IO，不持有 DB 锁。
-pub async fn valid_access_token(
+pub async fn valid_access_token_for_device(
     store: &CredentialStore,
     http: &reqwest::Client,
-) -> Result<String> {
-    let cred = store
-        .list()?
-        .into_iter()
-        .find(|c| !c.disabled)
-        .context("没有可用凭证，请先登录")?;
+    device_id: Option<&str>,
+) -> Result<(String, Credential)> {
+    let ttl = store.device_binding_ttl();
+    let cred = store.select_for_device(device_id, ttl)?;
 
     if cred.needs_refresh() {
+        tracing::info!(id = cred.id, label = %cred.label, "凭证进入刷新窗口，刷新 token");
         let tokens = crate::oauth::refresh(http, &cred.refresh_token).await?;
         store.update_tokens(
             cred.id,
@@ -282,8 +469,9 @@ pub async fn valid_access_token(
             &tokens.refresh_token,
             tokens.expires_at,
         )?;
-        Ok(tokens.access_token)
+        Ok((tokens.access_token, cred))
     } else {
-        Ok(cred.access_token)
+        let token = cred.access_token.clone();
+        Ok((token, cred))
     }
 }

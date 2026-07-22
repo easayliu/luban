@@ -7,11 +7,13 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    middleware,
     routing::{any, delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
+use crate::auth;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
@@ -27,6 +29,8 @@ pub struct AppState {
     pub store: Arc<CredentialStore>,
     /// 接入用的 API Key（None 表示不校验来访身份）。
     pub client_key: Option<Arc<String>>,
+    /// 管理密码（环境接管，明文；None 表示未由环境设置）。
+    pub admin_env: Option<Arc<String>>,
 }
 
 type ApiError = (StatusCode, String);
@@ -38,6 +42,7 @@ pub async fn run(
     open_browser: bool,
     store: Arc<CredentialStore>,
     api_key: Option<String>,
+    admin_password: Option<String>,
 ) -> Result<()> {
     let client_key = api_key.map(Arc::new);
     let state = AppState {
@@ -45,9 +50,17 @@ pub async fn run(
         pkce: Arc::new(Mutex::new(None)),
         store,
         client_key: client_key.clone(),
+        admin_env: admin_password.map(Arc::new),
     };
 
-    let api = Router::new()
+    // 公开鉴权接口（无需登录）。
+    let public = Router::new()
+        .route("/auth/state", get(auth::state))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/setup", post(auth::setup));
+
+    // 需管理鉴权的接口（未设密码时中间件放行）。
+    let protected = Router::new()
         .route("/authorize", get(authorize))
         .route("/exchange", post(exchange))
         .route("/credentials", get(list_credentials))
@@ -55,9 +68,15 @@ pub async fn run(
         .route("/credentials/{id}/disabled", post(set_disabled))
         .route("/credentials/{id}/priority", post(set_priority))
         .route("/credentials/{id}/label", post(set_label))
+        .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/settings", get(get_settings))
-        .route("/settings/api-key", post(set_api_key));
+        .route("/settings/api-key", post(set_api_key))
+        .route("/settings/device-ttl", post(set_device_ttl))
+        .route("/auth/password", post(auth::change_password))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
+
+    let api = public.merge(protected);
 
     // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
     let app = Router::new()
@@ -73,18 +92,21 @@ pub async fn run(
 
     let shown = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
     let url = format!("http://{shown}:{port}/");
-    println!("luban 已启动：{}", url);
-    println!("Claude Code 接入：");
-    println!("  export ANTHROPIC_BASE_URL={}", url.trim_end_matches('/'));
+    let base = url.trim_end_matches('/');
+
+    tracing::info!(addr = %bind, url = %url, "luban 已启动");
     match &client_key {
-        Some(_) => println!("  export ANTHROPIC_AUTH_TOKEN=<你设置的 --api-key>"),
-        None => println!("  （未设置 --api-key，代理不校验来访身份，请仅在本机使用）"),
+        Some(_) => tracing::info!(
+            "Claude Code 接入：ANTHROPIC_BASE_URL={base}，ANTHROPIC_AUTH_TOKEN=<--api-key>"
+        ),
+        None => tracing::info!(
+            "Claude Code 接入：ANTHROPIC_BASE_URL={base}（未设 --api-key，代理不校验来访，请仅本机使用）"
+        ),
     }
     if open_browser {
         open_in_browser(&url);
-        println!("已尝试自动打开浏览器；若未弹出，请手动访问上面的地址。");
+        tracing::info!("已尝试打开浏览器；若未弹出请手动访问 {url}");
     }
-    println!("按 Ctrl+C 结束。");
 
     axum::serve(listener, app).await.context("web 服务异常退出")?;
     Ok(())
@@ -163,7 +185,8 @@ async fn exchange(
     // 成功后清空 PKCE，避免重复使用。
     *state.pkce.lock().unwrap() = None;
 
-    Ok(Json(CredentialView::from(&cred)))
+    tracing::info!(id = cred.id, label = %cred.label, tier = ?cred.tier, "新增凭证");
+    Ok(Json(CredentialView::new(&cred, 0)))
 }
 
 // ---------- 凭证管理 ----------
@@ -171,7 +194,12 @@ async fn exchange(
 /// 列出全部凭证（token 已脱敏）。
 async fn list_credentials(State(state): State<AppState>) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
-    Ok(Json(list.iter().map(CredentialView::from).collect()))
+    let counts = state.store.device_counts().map_err(internal)?;
+    let views = list
+        .iter()
+        .map(|c| CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0)))
+        .collect();
+    Ok(Json(views))
 }
 
 /// 删除一条凭证。
@@ -183,6 +211,7 @@ async fn delete_credential(
     if !removed {
         return Err(not_found());
     }
+    tracing::info!(id, "删除凭证");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -241,6 +270,25 @@ async fn set_label(
     view_of(&state, id)
 }
 
+#[derive(Deserialize)]
+struct SetDeviceLimitReq {
+    /// 设备数上限；0（或负数）表示不限。
+    device_limit: i64,
+}
+
+/// 设置设备数上限。
+async fn set_device_limit(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetDeviceLimitReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    let limit = req.device_limit.max(0);
+    if !state.store.set_device_limit(id, limit).map_err(internal)? {
+        return Err(not_found());
+    }
+    view_of(&state, id)
+}
+
 /// 手动刷新一条凭证的 token。
 async fn refresh_credential(
     State(state): State<AppState>,
@@ -263,10 +311,11 @@ async fn refresh_credential(
     view_of(&state, id)
 }
 
-/// 读取单条并转为脱敏视图。
+/// 读取单条并转为脱敏视图（含已绑定设备数）。
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
-    Ok(Json(CredentialView::from(&cred)))
+    let count = state.store.device_count(id).map_err(internal)?;
+    Ok(Json(CredentialView::new(&cred, count)))
 }
 
 // ---------- 接入设置 ----------
@@ -277,11 +326,18 @@ struct SettingsResp {
     api_key: Option<String>,
     /// 是否由环境变量/启动参数接管（true 时网页只读）。
     env_managed: bool,
+    /// 设备绑定有效期（秒）；0 表示永不过期。
+    device_binding_ttl_secs: i64,
 }
 
 fn settings_resp(state: &AppState) -> SettingsResp {
+    let device_binding_ttl_secs = state.store.device_binding_ttl();
     if let Some(k) = &state.client_key {
-        return SettingsResp { api_key: Some(k.to_string()), env_managed: true };
+        return SettingsResp {
+            api_key: Some(k.to_string()),
+            env_managed: true,
+            device_binding_ttl_secs,
+        };
     }
     let api_key = state
         .store
@@ -289,7 +345,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    SettingsResp { api_key, env_managed: false }
+    SettingsResp { api_key, env_managed: false, device_binding_ttl_secs }
 }
 
 /// 读取接入设置。
@@ -320,6 +376,25 @@ async fn set_api_key(
     Ok(Json(settings_resp(&state)))
 }
 
+#[derive(Deserialize)]
+struct SetDeviceTtlReq {
+    /// 设备绑定有效期（秒）；0（或负数）表示永不过期。
+    device_binding_ttl_secs: i64,
+}
+
+/// 设置设备绑定有效期（秒）。
+async fn set_device_ttl(
+    State(state): State<AppState>,
+    Json(req): Json<SetDeviceTtlReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let ttl = req.device_binding_ttl_secs.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEVICE_BINDING_TTL, &ttl.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
 // ---------- 视图与错误 ----------
 
 /// 对外暴露的凭证视图（不返回明文 token）。
@@ -334,12 +409,17 @@ struct CredentialView {
     expired: bool,
     created_at: u64,
     updated_at: u64,
+    /// 允许绑定的设备数上限；0 表示不限。
+    device_limit: i64,
+    /// 当前已绑定的设备数。
+    device_count: i64,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
 }
 
-impl From<&Credential> for CredentialView {
-    fn from(c: &Credential) -> Self {
+impl CredentialView {
+    /// 由凭证 + 已绑定设备数构造视图。
+    fn new(c: &Credential, device_count: i64) -> Self {
         let secs = c.expires_in_secs();
         Self {
             id: c.id,
@@ -351,6 +431,8 @@ impl From<&Credential> for CredentialView {
             expired: secs == 0,
             created_at: c.created_at,
             updated_at: c.updated_at,
+            device_limit: c.device_limit,
+            device_count,
             token_hint: mask_token(&c.refresh_token),
         }
     }

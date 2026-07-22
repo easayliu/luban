@@ -1,9 +1,4 @@
-import axios from 'axios'
-
-const api = axios.create({
-  baseURL: '/api',
-  headers: { 'Content-Type': 'application/json' },
-})
+import { api } from './client'
 
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */
 export interface Credential {
@@ -16,6 +11,10 @@ export interface Credential {
   expired: boolean
   created_at: number
   updated_at: number
+  /** 允许绑定的设备数上限；0 表示不限。 */
+  device_limit: number
+  /** 当前已绑定的设备数。 */
+  device_count: number
   token_hint: string
 }
 
@@ -57,6 +56,14 @@ export async function setPriority(id: number, priority: number): Promise<Credent
 /** 重命名。 */
 export async function setLabel(id: number, label: string): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/label`, { label })
+  return data
+}
+
+/** 设置设备数上限（0 表示不限）。 */
+export async function setDeviceLimit(id: number, deviceLimit: number): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/device-limit`, {
+    device_limit: deviceLimit,
+  })
   return data
 }
 

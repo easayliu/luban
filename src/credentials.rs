@@ -20,6 +20,8 @@ pub struct Credential {
     pub priority: i64,
     /// 是否停用（停用的凭证不参与转发）。
     pub disabled: bool,
+    /// 允许绑定的设备数上限；`<= 0` 表示不限。见 [`crate::store`] 的粘性绑定选择。
+    pub device_limit: i64,
     pub created_at: u64,
     pub updated_at: u64,
 }
