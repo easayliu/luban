@@ -20,12 +20,14 @@ pub struct TokenSet {
     pub account: Option<String>,
 }
 
-/// 账号 profile：邮箱、姓名、订阅等级（来自 `/api/oauth/profile`）。
+/// 账号 profile：邮箱、姓名、订阅等级、账号 UUID（来自 `/api/oauth/profile`）。
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
     pub email: Option<String>,
     pub name: Option<String>,
     pub tier: Option<String>,
+    /// 账号唯一标识（`account.uuid`）；用于转发时的身份伪装。
+    pub account_uuid: Option<String>,
 }
 
 /// 一次登录尝试的 PKCE 上下文，需在交换 token 时回传。
@@ -111,6 +113,8 @@ struct ProfileResponse {
 #[derive(Debug, Deserialize)]
 struct ProfileAccount {
     #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
     email: Option<String>,
     #[serde(default)]
     full_name: Option<String>,
@@ -165,8 +169,13 @@ pub async fn fetch_profile(client: &reqwest::Client, access_token: &str) -> Resu
             .or_else(|| a.display_name.clone())
             .filter(|s| !s.trim().is_empty())
     });
+    let account_uuid = p
+        .account
+        .as_ref()
+        .and_then(|a| a.uuid.clone())
+        .filter(|s| !s.trim().is_empty());
 
-    Ok(Profile { email, name, tier })
+    Ok(Profile { email, name, tier, account_uuid })
 }
 
 /// 由订阅标志推导账号等级：Max > Pro > Free；Max 附带倍数档（如 `Max 5x`）。

@@ -79,8 +79,11 @@ pub async fn handle(
         out.insert(header::AUTHORIZATION, v);
     }
 
-    // 6) 转发前改写 body 的缓存策略，对齐订阅客户端（5m→1h、最大 system 块 global）。
-    let body = rewrite_cache_control(&body);
+    // 6) 转发前改写 body：缓存策略对齐订阅（5m→1h、最大 system 块 global）+ 身份伪装
+    //    （metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份）。
+    //    设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
+    let device_fp = device_fingerprint(device_id.as_deref(), &headers);
+    let body = rewrite_body(&body, &cred, &device_fp);
 
     // 7) 发起上游请求并流式回传。
     let resp = state
@@ -534,13 +537,16 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     parts.join(",")
 }
 
-/// 转发前改写请求体的 `cache_control`，对齐官方订阅客户端的缓存策略：
-/// - 所有 ephemeral 断点（`system`/`tools`/`messages[].content`）的 TTL 补成 `1h`；
-///   客户端已显式设置的 `ttl` 不覆盖。
-/// - `system` 数组里文本最长的静态块额外标记 `scope: "global"`，提升跨会话缓存复用。
+/// 转发前改写请求体，两件事：
+///
+/// 1. **缓存策略对齐订阅**：所有 ephemeral 断点（`system`/`tools`/`messages[].content`）
+///    的 TTL 补成 `1h`（客户端已显式设置的不覆盖）；`system` 里文本最长的静态块额外
+///    标记 `scope: "global"`，提升跨会话缓存复用。
+/// 2. **身份伪装**：把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成该凭证自洽的
+///    身份（真实 account_uuid + 由其稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
-fn rewrite_cache_control(body: &Bytes) -> Bytes {
+fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: &str) -> Bytes {
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
@@ -554,18 +560,69 @@ fn rewrite_cache_control(body: &Bytes) -> Bytes {
         }
     }
     let global_idx = mark_largest_system_global(&mut v);
-    // 临时校验：打印本次改写结果（确认后可移除）。
-    tracing::info!(
-        ttl_upgrades,
-        scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
-        "改写 cache_control"
-    );
-    if ttl_upgrades == 0 && global_idx.is_none() {
+    let spoofed = spoof_identity(&mut v, cred, device_fp);
+    if ttl_upgrades == 0 && global_idx.is_none() && !spoofed {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
         Ok(bytes) => Bytes::from(bytes),
         Err(_) => body.clone(),
+    }
+}
+
+/// 构造设备指纹：客户端原始 `device_id` + 平台 `arch`/`os`，用于派生每设备唯一的伪装
+/// device_id。刻意只取**稳定的硬件/系统身份**，排除会随客户端升级变动的字段
+/// （runtime 版本、UA 版本号），以免每次升级都刷新 device_id。
+fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> String {
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
+    format!(
+        "{}|{}|{}",
+        client_device_id.unwrap_or(""),
+        h("x-stainless-arch"),
+        h("x-stainless-os"),
+    )
+}
+
+/// 把 `metadata.user_id`（一段内嵌 JSON 字符串）里的 `account_uuid`/`device_id` 换成
+/// 凭证自洽身份。凭证无 `account_uuid`（如旧库未回填）或结构异常时不改动，返回 `false`。
+fn spoof_identity(
+    v: &mut serde_json::Value,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+) -> bool {
+    let account_uuid = match cred.account_uuid.as_deref() {
+        Some(u) if !u.trim().is_empty() => u,
+        _ => return false,
+    };
+    let device_id = match cred.spoof_device_id(device_fp) {
+        Some(d) => d,
+        None => return false,
+    };
+    let user_id = match v.get_mut("metadata").and_then(|m| m.get_mut("user_id")) {
+        Some(u) => u,
+        None => return false,
+    };
+    // user_id 是一段 JSON 字符串；解析→改字段→回写为字符串。
+    let inner_str = match user_id.as_str() {
+        Some(s) => s,
+        None => return false,
+    };
+    let mut inner: serde_json::Value = match serde_json::from_str(inner_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let obj = match inner.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+    obj.insert("account_uuid".into(), serde_json::Value::String(account_uuid.to_string()));
+    obj.insert("device_id".into(), serde_json::Value::String(device_id));
+    match serde_json::to_string(&inner) {
+        Ok(s) => {
+            *user_id = serde_json::Value::String(s);
+            true
+        }
+        Err(_) => false,
     }
 }
 

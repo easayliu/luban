@@ -214,6 +214,7 @@ async fn exchange(
             &tokens.access_token,
             &tokens.refresh_token,
             tokens.expires_at,
+            profile.account_uuid.as_deref(),
         )
         .map_err(internal)?;
 
@@ -365,10 +366,13 @@ async fn refresh_credential(
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
         .map_err(internal)?;
-    // 顺带刷新账号等级（失败忽略，不影响 token 刷新结果）。
+    // 顺带刷新账号等级、回填账号 UUID（失败忽略，不影响 token 刷新结果）。
     if let Ok(profile) = oauth::fetch_profile(&state.http, &tokens.access_token).await {
         if profile.tier.is_some() {
             let _ = state.store.set_tier(id, profile.tier.as_deref());
+        }
+        if let Some(uuid) = profile.account_uuid.as_deref() {
+            let _ = state.store.set_account_uuid(id, uuid);
         }
     }
     view_of(&state, id)

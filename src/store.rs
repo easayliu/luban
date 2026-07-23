@@ -15,7 +15,7 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit, ban_reason";
+     created_at, updated_at, device_limit, ban_reason, account_uuid";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -74,6 +74,7 @@ impl CredentialStore {
         access_token: &str,
         refresh_token: &str,
         expires_at: u64,
+        account_uuid: Option<&str>,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
         // 瀑布调度：新凭证默认排到末尾（现有最大 +1），使其独占一档。
@@ -86,9 +87,18 @@ impl CredentialStore {
             )
             .unwrap_or(0);
         conn.execute(
-            "INSERT INTO credentials (label, tier, access_token, refresh_token, expires_at, priority)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![label, tier, access_token, refresh_token, expires_at as i64, next_priority],
+            "INSERT INTO credentials
+                 (label, tier, access_token, refresh_token, expires_at, priority, account_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                label,
+                tier,
+                access_token,
+                refresh_token,
+                expires_at as i64,
+                next_priority,
+                account_uuid
+            ],
         )
         .context("插入凭证失败（refresh_token 可能已存在）")?;
         let id = conn.last_insert_rowid();
@@ -223,6 +233,14 @@ impl CredentialStore {
         self.update_one(
             "UPDATE credentials SET tier = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, tier],
+        )
+    }
+
+    /// 回填账号 UUID（旧库凭证登录时未存、刷新 token 时补上）。仅在非空时覆盖。
+    pub fn set_account_uuid(&self, id: i64, account_uuid: &str) -> Result<bool> {
+        self.update_one(
+            "UPDATE credentials SET account_uuid = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, account_uuid],
         )
     }
 
@@ -681,6 +699,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
     // 与管理员手动停用（disabled=1 且本字段为空）区分开。见 `mark_banned`。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN ban_reason TEXT", []);
+    // 账号 UUID（profile.account.uuid）；转发身份伪装用。旧库为空，刷新 token 时回填。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN account_uuid TEXT", []);
     Ok(())
 }
 
@@ -698,6 +718,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         updated_at: row.get::<_, i64>(9)? as u64,
         device_limit: row.get(10)?,
         ban_reason: row.get(11)?,
+        account_uuid: row.get(12)?,
     })
 }
 
