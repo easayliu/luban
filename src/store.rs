@@ -76,18 +76,12 @@ impl CredentialStore {
         expires_at: u64,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
-        // 新凭证优先级默认排到末尾（现有最大 +1）。
-        let next_priority: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(priority), -1) + 1 FROM credentials",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // 优先级是手动指定的调度权重（数值小者优先），不随入库顺序自增；
+        // 新凭证默认平权，走建表默认值 0，由用户按需手动调整。
         conn.execute(
-            "INSERT INTO credentials (label, tier, access_token, refresh_token, expires_at, priority)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![label, tier, access_token, refresh_token, expires_at as i64, next_priority],
+            "INSERT INTO credentials (label, tier, access_token, refresh_token, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![label, tier, access_token, refresh_token, expires_at as i64],
         )
         .context("插入凭证失败（refresh_token 可能已存在）")?;
         let id = conn.last_insert_rowid();
