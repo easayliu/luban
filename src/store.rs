@@ -76,12 +76,19 @@ impl CredentialStore {
         expires_at: u64,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
-        // 优先级是手动指定的调度权重（数值小者优先），不随入库顺序自增；
-        // 新凭证默认平权，走建表默认值 0，由用户按需手动调整。
+        // 瀑布调度：新凭证默认排到末尾（现有最大 +1），使其独占一档。
+        // 配合优先级为主键的分档调度，账号被逐个榨干（前一个满/不可用才用下一个）。
+        let next_priority: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(priority), -1) + 1 FROM credentials",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         conn.execute(
-            "INSERT INTO credentials (label, tier, access_token, refresh_token, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![label, tier, access_token, refresh_token, expires_at as i64],
+            "INSERT INTO credentials (label, tier, access_token, refresh_token, expires_at, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![label, tier, access_token, refresh_token, expires_at as i64, next_priority],
         )
         .context("插入凭证失败（refresh_token 可能已存在）")?;
         let id = conn.last_insert_rowid();
@@ -769,22 +776,24 @@ impl CredentialStore {
         // 当前设备数（惰性过期后已排除超时项）。
         let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
 
-        // 3/4) 负载均衡：在候选中选“当前设备数最少”者；同数按 (priority, id) 决定。
+        // 3/4) 优先级分档调度：优先级为主键（数值小者优先），同一档内再按设备数
+        //      负载均衡，最后 id 兜底。低优先级档仅在高优先级档全部占满/不可用后才触及。
         let chosen = if device_id.is_some() {
-            // 硬限制：仅在仍有名额者（limit<=0 不限，或 used<limit）中选；全满则拒绝。
+            // 硬限制：仅在仍有名额者（limit<=0 不限，或 used<limit）中选；
+            // 当前优先级档全满时其成员被过滤掉，min 自然溢出到下一档；全部满则拒绝。
             match creds
                 .iter()
                 .filter(|c| c.device_limit <= 0 || used(c) < c.device_limit)
-                .min_by_key(|c| (used(c), c.priority, c.id))
+                .min_by_key(|c| (c.priority, used(c), c.id))
             {
                 Some(c) => c,
                 None => return Err(DeviceLimitReached.into()),
             }
         } else {
-            // 无 device_id：不占名额、不受限，纯负载均衡挑一个（creds 已保证非空）。
+            // 无 device_id：不占名额、不受限，按优先级档 + 档内负载均衡挑一个（creds 已保证非空）。
             creds
                 .iter()
-                .min_by_key(|c| (used(c), c.priority, c.id))
+                .min_by_key(|c| (c.priority, used(c), c.id))
                 .expect("启用凭证列表非空")
         };
 
