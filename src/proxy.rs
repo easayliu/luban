@@ -104,16 +104,8 @@ pub async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
                 .unwrap_or(false);
-            // 解析并打印上游限流头（订阅账号 5h/7d 额度体现在此），随后随日志入库。
+            // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
-            tracing::info!(
-                cred = format!("#{} {}", cred.id, cred.label),
-                rep = %ratelimit.representative.as_deref().unwrap_or("-"),
-                u5h = %opt_str(ratelimit.five_h_utilization),
-                u7d = %opt_str(ratelimit.seven_d_utilization),
-                headers = %ratelimit.raw,
-                "上游限流头"
-            );
 
             let mut builder = Response::builder().status(status);
             for (k, v) in up.headers().iter() {
@@ -561,6 +553,15 @@ fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: 
     }
     let global_idx = mark_largest_system_global(&mut v);
     let spoofed = spoof_identity(&mut v, cred, device_fp);
+    // 临时校验：打印本次改写结果（确认后可移除）。
+    tracing::info!(
+        ttl_upgrades,
+        scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
+        spoofed,
+        device_fp = %device_fp,
+        spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
+        "改写 body"
+    );
     if ttl_upgrades == 0 && global_idx.is_none() && !spoofed {
         return body.clone();
     }
@@ -670,11 +671,6 @@ fn mark_largest_system_global(v: &mut serde_json::Value) -> Option<usize> {
     }
     cc.insert("scope".into(), serde_json::Value::String("global".into()));
     Some(idx)
-}
-
-/// 把 `Option<f64>` 渲染成日志友好字符串（None → `-`）。
-fn opt_str(v: Option<f64>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
