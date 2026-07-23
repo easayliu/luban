@@ -79,7 +79,10 @@ pub async fn handle(
         out.insert(header::AUTHORIZATION, v);
     }
 
-    // 6) 发起上游请求并流式回传。
+    // 6) 转发前改写 body 的缓存策略，对齐订阅客户端（5m→1h、最大 system 块 global）。
+    let body = rewrite_cache_control(&body);
+
+    // 7) 发起上游请求并流式回传。
     let resp = state
         .http
         .request(method.clone(), &url)
@@ -516,16 +519,100 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
     false
 }
 
-/// 合并来访的 anthropic-beta 值，保证含 `oauth-2025-04-20`。
+/// 合并来访的 anthropic-beta 值，补齐 [`config::INJECT_BETAS`]（对齐官方订阅客户端）。
+/// 保留来访已带的其它 beta，仅追加缺失项，不改变原有顺序。
 fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     let mut parts: Vec<String> = incoming
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    if !parts.iter().any(|p| p == config::OAUTH_BETA_HEADER) {
-        parts.push(config::OAUTH_BETA_HEADER.to_string());
+    for beta in config::INJECT_BETAS {
+        if !parts.iter().any(|p| p == beta) {
+            parts.push((*beta).to_string());
+        }
     }
     parts.join(",")
+}
+
+/// 转发前改写请求体的 `cache_control`，对齐官方订阅客户端的缓存策略：
+/// - 所有 ephemeral 断点（`system`/`tools`/`messages[].content`）的 TTL 补成 `1h`；
+///   客户端已显式设置的 `ttl` 不覆盖。
+/// - `system` 数组里文本最长的静态块额外标记 `scope: "global"`，提升跨会话缓存复用。
+///
+/// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
+fn rewrite_cache_control(body: &Bytes) -> Bytes {
+    let mut v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.clone(),
+    };
+    let mut ttl_upgrades = 0usize;
+    upgrade_array_ttl(v.get_mut("system"), &mut ttl_upgrades);
+    upgrade_array_ttl(v.get_mut("tools"), &mut ttl_upgrades);
+    if let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in msgs.iter_mut() {
+            upgrade_array_ttl(m.get_mut("content"), &mut ttl_upgrades);
+        }
+    }
+    let global_idx = mark_largest_system_global(&mut v);
+    // 临时校验：打印本次改写结果（确认后可移除）。
+    tracing::info!(
+        ttl_upgrades,
+        scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
+        "改写 cache_control"
+    );
+    if ttl_upgrades == 0 && global_idx.is_none() {
+        return body.clone();
+    }
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => body.clone(),
+    }
+}
+
+/// 对一个 content-block 数组里每个块的 `cache_control` 做 TTL 升级，累加升级计数。
+fn upgrade_array_ttl(arr: Option<&mut serde_json::Value>, count: &mut usize) {
+    if let Some(arr) = arr.and_then(|a| a.as_array_mut()) {
+        for blk in arr.iter_mut() {
+            upgrade_cc_ttl(blk, count);
+        }
+    }
+}
+
+/// 若块带 `cache_control: {type: "ephemeral"}` 且未设 `ttl`，补 `ttl: "1h"` 并计数。
+fn upgrade_cc_ttl(blk: &mut serde_json::Value, count: &mut usize) {
+    let cc = match blk.get_mut("cache_control").and_then(|c| c.as_object_mut()) {
+        Some(cc) => cc,
+        None => return,
+    };
+    if cc.get("type").and_then(|t| t.as_str()) != Some("ephemeral") || cc.contains_key("ttl") {
+        return;
+    }
+    cc.insert("ttl".into(), serde_json::Value::String("1h".into()));
+    *count += 1;
+}
+
+/// 给 `system` 数组里「带 cache_control 且 text 最长」的块补 `scope: "global"`。
+/// 对应订阅客户端把体积最大的静态系统提示词标为全局缓存的做法。
+/// 返回被标记的块下标；无可标记或已是 global 时返回 `None`。
+fn mark_largest_system_global(v: &mut serde_json::Value) -> Option<usize> {
+    let sys = v.get_mut("system").and_then(|s| s.as_array_mut())?;
+    let mut best: Option<(usize, usize)> = None; // (下标, text 长度)
+    for (i, blk) in sys.iter().enumerate() {
+        if blk.get("cache_control").is_none() {
+            continue;
+        }
+        let len = blk.get("text").and_then(|t| t.as_str()).map(str::len).unwrap_or(0);
+        if best.map_or(true, |(_, bl)| len > bl) {
+            best = Some((i, len));
+        }
+    }
+    let (idx, _) = best?;
+    let cc = sys[idx].get_mut("cache_control").and_then(|c| c.as_object_mut())?;
+    if cc.get("scope").and_then(|s| s.as_str()) == Some("global") {
+        return None;
+    }
+    cc.insert("scope".into(), serde_json::Value::String("global".into()));
+    Some(idx)
 }
 
 /// 把 `Option<f64>` 渲染成日志友好字符串（None → `-`）。

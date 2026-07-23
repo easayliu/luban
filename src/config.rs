@@ -24,6 +24,19 @@ pub const SCOPES: &str = "user:profile user:inference user:sessions:claude_code 
 /// 用 OAuth access token 调用 Anthropic API 时必须携带的 beta 头。
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
+/// 转发时确保携带的 beta 组：对齐官方订阅客户端的 `anthropic-beta`。
+/// API 模式的 Claude Code 不会自带这些，缺失会导致缓存 TTL 退化与部分工具能力关闭。
+/// - `oauth-2025-04-20`：OAuth 鉴权必需。
+/// - `extended-cache-ttl-2025-04-11`：启用 1h 提示缓存（否则只有 5m）。
+/// - `advanced-tool-use-2025-11-20`：对齐订阅端工具能力。
+/// - `prompt-caching-scope-2026-01-05`：允许 `cache_control.scope: "global"`（body 改写依赖）。
+pub const INJECT_BETAS: &[&str] = &[
+    OAUTH_BETA_HEADER,
+    "extended-cache-ttl-2025-04-11",
+    "advanced-tool-use-2025-11-20",
+    "prompt-caching-scope-2026-01-05",
+];
+
 /// 官方上游 API base（代理转发目标）。
 pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
 
