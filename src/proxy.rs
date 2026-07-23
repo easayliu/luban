@@ -83,6 +83,19 @@ pub async fn handle(
     //    （metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份）。
     //    设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
     let device_fp = device_fingerprint(device_id.as_deref(), &headers);
+    // 临时排查：打印客户端识别头（确认客户端类型后可移除）。
+    {
+        let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        tracing::info!(
+            ua = %h("user-agent"),
+            x_app = %h("x-app"),
+            arch = %h("x-stainless-arch"),
+            os = %h("x-stainless-os"),
+            runtime = %h("x-stainless-runtime"),
+            pkg = %h("x-stainless-package-version"),
+            "客户端识别头"
+        );
+    }
     let body = rewrite_body(&body, &cred, &device_fp);
 
     // 7) 发起上游请求并流式回传。
@@ -433,14 +446,45 @@ impl UsageSniffer {
     }
 }
 
-/// 从请求体提取 device_id：`metadata.user_id` 是一段 JSON 字符串，内含 `device_id`。
-/// 解析失败或字段缺失/为空时返回 `None`（退化为纯优先级选择、不做粘性绑定）。
+/// 从请求体提取「客户端设备标识」，用于粘性选择与设备指纹派生。
+/// 兼容两种 `metadata.user_id` 格式：
+/// - CC 内嵌 JSON（`{"device_id":...}`）：取 `device_id`。
+/// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows 客户端）：取 `<hash>`。
+///
+/// 解析失败或标识为空时返回 `None`（退化为纯优先级选择、不做粘性绑定）。
 fn extract_device_id(body: &Bytes) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
     let user_id = json.get("metadata")?.get("user_id")?.as_str()?;
-    let inner: serde_json::Value = serde_json::from_str(user_id).ok()?;
-    let dev = inner.get("device_id")?.as_str()?;
-    (!dev.is_empty()).then(|| dev.to_string())
+    // CC 内嵌 JSON 优先。
+    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id) {
+        if let Some(dev) = inner.get("device_id").and_then(|d| d.as_str()) {
+            if !dev.is_empty() {
+                return Some(dev.to_string());
+            }
+        }
+    }
+    // 退化：扁平串格式，取 device 段。
+    let flat = parse_flat_user_id(user_id)?;
+    (!flat.device.is_empty()).then_some(flat.device)
+}
+
+/// 扁平 `metadata.user_id` 中我们需要的两段：`user_<device>_account_<..>_session_<session>`。
+/// account 段被凭证真实值覆盖，故不保留。
+struct FlatUserId {
+    device: String,
+    session: String,
+}
+
+/// 解析扁平 user_id；不匹配该形态时返回 `None`。
+/// 按标记切分，允许 account 段为空（`account__session`）。
+fn parse_flat_user_id(s: &str) -> Option<FlatUserId> {
+    let rest = s.strip_prefix("user_")?;
+    let (device, rest) = rest.split_once("_account_")?;
+    let (_account, session) = rest.split_once("_session_")?;
+    Some(FlatUserId {
+        device: device.to_string(),
+        session: session.to_string(),
+    })
 }
 
 /// 400 场景下的账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用/授权失效」，
@@ -552,7 +596,7 @@ fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: 
         }
     }
     let global_idx = mark_largest_system_global(&mut v);
-    // 临时排查：打印入站原始 metadata（确认后可移除）。
+    // 临时排查：打印入站 metadata（确认后可移除）。UA 由调用方在 handle 里另打。
     tracing::info!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
@@ -589,8 +633,12 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
     )
 }
 
-/// 把 `metadata.user_id`（一段内嵌 JSON 字符串）里的 `account_uuid`/`device_id` 换成
-/// 凭证自洽身份。凭证无 `account_uuid`（如旧库未回填）或结构异常时不改动，返回 `false`。
+/// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
+/// - CC 内嵌 JSON：改 `device_id`/`account_uuid` 字段，保留 `session_id` 等其余字段。
+/// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows）：换掉 device 段与
+///   account 段，保留 session 段，仍以扁平串回写——不把 Windows 请求伪装成 CC 的 JSON 形态。
+///
+/// 凭证无 `account_uuid`（如旧库未回填）或 user_id 结构无法识别时不改动，返回 `false`。
 fn spoof_identity(
     v: &mut serde_json::Value,
     cred: &crate::credentials::Credential,
@@ -608,28 +656,33 @@ fn spoof_identity(
         Some(u) => u,
         None => return false,
     };
-    // user_id 是一段 JSON 字符串；解析→改字段→回写为字符串。
     let inner_str = match user_id.as_str() {
-        Some(s) => s,
+        Some(s) => s.to_string(),
         None => return false,
     };
-    let mut inner: serde_json::Value = match serde_json::from_str(inner_str) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let obj = match inner.as_object_mut() {
-        Some(o) => o,
-        None => return false,
-    };
-    obj.insert("account_uuid".into(), serde_json::Value::String(account_uuid.to_string()));
-    obj.insert("device_id".into(), serde_json::Value::String(device_id));
-    match serde_json::to_string(&inner) {
-        Ok(s) => {
-            *user_id = serde_json::Value::String(s);
-            true
+
+    // 格式一：CC 内嵌 JSON——改字段、保留其余。
+    if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(&inner_str) {
+        if let Some(obj) = inner.as_object_mut() {
+            obj.insert("account_uuid".into(), serde_json::Value::String(account_uuid.to_string()));
+            obj.insert("device_id".into(), serde_json::Value::String(device_id));
+            if let Ok(s) = serde_json::to_string(&inner) {
+                *user_id = serde_json::Value::String(s);
+                return true;
+            }
         }
-        Err(_) => false,
+        return false;
     }
+
+    // 格式二：扁平串——保持格式，只换 device 与 account，保留 session。
+    if let Some(flat) = parse_flat_user_id(&inner_str) {
+        let rebuilt =
+            format!("user_{}_account_{}_session_{}", device_id, account_uuid, flat.session);
+        *user_id = serde_json::Value::String(rebuilt);
+        return true;
+    }
+
+    false
 }
 
 /// 对一个 content-block 数组里每个块的 `cache_control` 做 TTL 升级，累加升级计数。
