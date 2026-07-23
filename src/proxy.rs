@@ -552,6 +552,11 @@ fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: 
         }
     }
     let global_idx = mark_largest_system_global(&mut v);
+    // 临时排查：打印入站原始 metadata（确认后可移除）。
+    tracing::info!(
+        metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
+        "入站 metadata"
+    );
     let spoofed = spoof_identity(&mut v, cred, device_fp);
     // 临时校验：打印本次改写结果（确认后可移除）。
     tracing::info!(
