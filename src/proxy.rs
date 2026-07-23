@@ -34,8 +34,15 @@ pub async fn handle(
         }
     }
 
-    // 2) 提取 device_id（在请求体 metadata.user_id 里，值本身是一段 JSON 字符串）。
+    // 2) 提取 device_id（在请求体 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(&body);
+
+    // 2.1) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 直接拒绝。
+    //      这类请求既无法做身份伪装、也无从计入设备上限（会绕过 device_limit），一律挡在门外。
+    if device_id.is_none() {
+        tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
+        return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）").into_response();
+    }
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
     let (token, cred) =
