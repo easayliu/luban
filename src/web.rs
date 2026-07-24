@@ -74,6 +74,7 @@ pub async fn run(
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
+        .route("/settings/spoof-identity", post(set_spoof_identity))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -398,15 +399,19 @@ struct SettingsResp {
     env_managed: bool,
     /// 设备绑定有效期（秒）；0 表示永不过期。
     device_binding_ttl_secs: i64,
+    /// 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。
+    spoof_identity_enabled: bool,
 }
 
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
+    let spoof_identity_enabled = state.store.spoof_identity_enabled();
     if let Some(k) = &state.client_key {
         return SettingsResp {
             api_key: Some(k.to_string()),
             env_managed: true,
             device_binding_ttl_secs,
+            spoof_identity_enabled,
         };
     }
     let api_key = state
@@ -415,7 +420,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    SettingsResp { api_key, env_managed: false, device_binding_ttl_secs }
+    SettingsResp { api_key, env_managed: false, device_binding_ttl_secs, spoof_identity_enabled }
 }
 
 /// 读取接入设置。
@@ -461,6 +466,25 @@ async fn set_device_ttl(
     state
         .store
         .set_setting(crate::store::DEVICE_BINDING_TTL, &ttl.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetSpoofIdentityReq {
+    /// 是否启用身份伪装。
+    enabled: bool,
+}
+
+/// 开关身份伪装。
+async fn set_spoof_identity(
+    State(state): State<AppState>,
+    Json(req): Json<SetSpoofIdentityReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let value = if req.enabled { "true" } else { "false" };
+    state
+        .store
+        .set_setting(crate::store::SPOOF_IDENTITY_ENABLED, value)
         .map_err(internal)?;
     Ok(Json(settings_resp(&state)))
 }

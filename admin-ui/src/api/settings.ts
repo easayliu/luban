@@ -7,6 +7,8 @@ export interface Settings {
   env_managed: boolean
   /** 设备绑定有效期（秒）；0 表示永不过期。 */
   device_binding_ttl_secs: number
+  /** 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。 */
+  spoof_identity_enabled: boolean
 }
 
 /** 读取接入设置。 */
@@ -26,5 +28,11 @@ export async function setDeviceTtl(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/device-ttl', {
     device_binding_ttl_secs: secs,
   })
+  return data
+}
+
+/** 开关身份伪装。 */
+export async function setSpoofIdentity(enabled: boolean): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/spoof-identity', { enabled })
   return data
 }

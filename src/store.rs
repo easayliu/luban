@@ -305,6 +305,15 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_DEVICE_BINDING_TTL_SECS)
     }
 
+    /// 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）；
+    /// 未设置时默认开启。仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭。
+    pub fn spoof_identity_enabled(&self) -> bool {
+        match self.get_setting(SPOOF_IDENTITY_ENABLED).ok().flatten() {
+            Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
+            None => true,
+        }
+    }
+
     /// 删除设置项。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         let conn = self.conn.lock();
@@ -324,6 +333,9 @@ pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";
 
 /// 设备绑定有效期默认值：1 小时。
 pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
+
+/// 是否启用身份伪装的 settings 键名；`"0"`/`"false"` 关闭，缺省或其它值视为开启。
+pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
 
 /// 待写入的一条用量日志（代理层组装后交给 [`CredentialStore::insert_usage_log`]）。
 #[derive(Debug, Default)]

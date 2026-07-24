@@ -5,7 +5,7 @@ import {
   ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, LockClosedIcon, KeyIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
-import { getSettings, setApiKey, setDeviceTtl, type Settings } from '@/api/settings'
+import { getSettings, setApiKey, setDeviceTtl, setSpoofIdentity, type Settings } from '@/api/settings'
 import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
 import { setPw, clearPw } from '@/api/client'
 import { cn, copyText, extractError, formatDuration } from '@/lib/utils'
@@ -13,6 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
 
 export function AccessSettings() {
   const qc = useQueryClient()
@@ -120,6 +121,11 @@ export function AccessSettings() {
           <DeviceBindingTtl />
         </div>
 
+        {/* 身份伪装 */}
+        <div className="border-t border-border pt-4">
+          <SpoofIdentityToggle />
+        </div>
+
         {/* 管理密码 */}
         <div className="border-t border-border pt-4">
           <AdminPassword />
@@ -169,6 +175,41 @@ function DeviceBindingTtl() {
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
         设备超过该时长无请求，绑定自动释放、腾出凭证设备名额；期间同一设备始终命中同一凭证。0 表示永不过期。
+      </p>
+    </Field>
+  )
+}
+
+/** 身份伪装开关：把转发请求 metadata.user_id 里的 account_uuid/device_id 改写成凭证自洽身份。 */
+function SpoofIdentityToggle() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const enabled = data?.spoof_identity_enabled ?? true
+
+  const save = useMutation({
+    mutationFn: (next: boolean) => setSpoofIdentity(next),
+    onSuccess: (s: Settings) => {
+      toast.success(s.spoof_identity_enabled ? '已启用身份伪装' : '已关闭身份伪装')
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+  })
+
+  return (
+    <Field label="身份伪装">
+      <div className="flex items-center gap-3">
+        <Switch
+          variant="success"
+          checked={enabled}
+          disabled={save.isPending}
+          onCheckedChange={(next) => save.mutate(next)}
+        />
+        <span className="text-sm">{enabled ? '已启用' : '已关闭'}</span>
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        开启后转发时把请求 <code className="font-mono">metadata.user_id</code> 里的{' '}
+        <code className="font-mono">account_uuid</code> 与 <code className="font-mono">device_id</code>{' '}
+        改写成所用凭证的自洽身份（真实账号 + 按设备指纹稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾。关闭则原样透传客户端身份。
       </p>
     </Field>
   )

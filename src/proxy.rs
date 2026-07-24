@@ -103,7 +103,7 @@ pub async fn handle(
             "客户端识别头"
         );
     }
-    let body = rewrite_body(&body, &cred, &device_fp);
+    let body = rewrite_body(&body, &cred, &device_fp, state.store.spoof_identity_enabled());
 
     // 7) 发起上游请求并流式回传。
     let resp = state
@@ -589,7 +589,12 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
 ///    身份（真实 account_uuid + 由其稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
-fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: &str) -> Bytes {
+fn rewrite_body(
+    body: &Bytes,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    spoof_enabled: bool,
+) -> Bytes {
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
@@ -608,7 +613,7 @@ fn rewrite_body(body: &Bytes, cred: &crate::credentials::Credential, device_fp: 
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
     );
-    let spoofed = spoof_identity(&mut v, cred, device_fp);
+    let spoofed = spoof_enabled && spoof_identity(&mut v, cred, device_fp);
     // 临时校验：打印本次改写结果（确认后可移除）。
     tracing::info!(
         ttl_upgrades,
@@ -641,7 +646,10 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
 }
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
-/// - CC 内嵌 JSON：改 `device_id`/`account_uuid` 字段，保留 `session_id` 等其余字段。
+/// - CC 内嵌 JSON：**字符串级定点替换**这两个字段的值，字段顺序与其余内容原样不动。
+///   真实 CC 发的是紧凑 JSON `{"device_id":..,"account_uuid":..,"session_id":..}`；若解析成
+///   `serde_json::Value` 再序列化，未开 `preserve_order` 的 serde 会按字母序重排字段，
+///   与真实客户端顺序不符，构成指纹 tell——故这里绕开 serde，只替换值。
 /// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows）：换掉 device 段与
 ///   account 段，保留 session 段，仍以扁平串回写——不把 Windows 请求伪装成 CC 的 JSON 形态。
 ///
@@ -668,17 +676,28 @@ fn spoof_identity(
         None => return false,
     };
 
-    // 格式一：CC 内嵌 JSON——改字段、保留其余。
-    if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(&inner_str) {
-        if let Some(obj) = inner.as_object_mut() {
-            obj.insert("account_uuid".into(), serde_json::Value::String(account_uuid.to_string()));
-            obj.insert("device_id".into(), serde_json::Value::String(device_id));
-            if let Ok(s) = serde_json::to_string(&inner) {
-                *user_id = serde_json::Value::String(s);
-                return true;
-            }
+    // 格式一：CC 内嵌 JSON——先确认是 JSON 对象，再对原始字符串做定点值替换，
+    // 保持字段顺序与其余内容（session_id 等）逐字节不变。
+    if serde_json::from_str::<serde_json::Value>(&inner_str)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .is_some()
+    {
+        let mut s = inner_str;
+        let mut changed = false;
+        if let Some(next) = replace_json_str_field(&s, "account_uuid", account_uuid) {
+            s = next;
+            changed = true;
         }
-        return false;
+        if let Some(next) = replace_json_str_field(&s, "device_id", &device_id) {
+            s = next;
+            changed = true;
+        }
+        if changed {
+            *user_id = serde_json::Value::String(s);
+        }
+        return changed;
     }
 
     // 格式二：扁平串——保持格式，只换 device 与 account，保留 session。
@@ -690,6 +709,22 @@ fn spoof_identity(
     }
 
     false
+}
+
+/// 在紧凑 JSON 字符串里，把 `"key":"<旧值>"` 的值原地替换成 `new_val`，字段位置与其余
+/// 内容逐字节不变。仅处理**字符串型且值内无转义引号**的字段——`device_id`(hex)、
+/// `account_uuid`(UUID，可能为空串)均满足，`new_val` 同为 hex/UUID，无需 JSON 转义。
+/// 找不到该字段（或其不是 `"key":"` 形态）时返回 `None`，**不新增字段**，以免改变结构。
+fn replace_json_str_field(s: &str, key: &str, new_val: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let val_start = s.find(&needle)? + needle.len();
+    // 值到下一个引号为止（值内无转义引号，故直接找 '"'）。
+    let val_end = val_start + s[val_start..].find('"')?;
+    let mut out = String::with_capacity(s.len() - (val_end - val_start) + new_val.len());
+    out.push_str(&s[..val_start]);
+    out.push_str(new_val);
+    out.push_str(&s[val_end..]);
+    Some(out)
 }
 
 /// 对一个 content-block 数组里每个块的 `cache_control` 做 TTL 升级，累加升级计数。
@@ -819,4 +854,37 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
         n.as_str(),
         "content-length" | "transfer-encoding" | "connection" | "content-encoding"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_json_str_field;
+
+    // 真实 CC 抓包形态：字段顺序 device_id → account_uuid → session_id。
+    const CC: &str = r#"{"device_id":"dddd","account_uuid":"aaaa","session_id":"ssss"}"#;
+
+    #[test]
+    fn replaces_value_and_preserves_order() {
+        let s = replace_json_str_field(CC, "account_uuid", "NEW").unwrap();
+        let s = replace_json_str_field(&s, "device_id", "DEV").unwrap();
+        assert_eq!(
+            s,
+            r#"{"device_id":"DEV","account_uuid":"NEW","session_id":"ssss"}"#
+        );
+    }
+
+    #[test]
+    fn fills_empty_account_uuid() {
+        let empty = r#"{"device_id":"dddd","account_uuid":"","session_id":"ssss"}"#;
+        let s = replace_json_str_field(empty, "account_uuid", "FILLED").unwrap();
+        assert_eq!(
+            s,
+            r#"{"device_id":"dddd","account_uuid":"FILLED","session_id":"ssss"}"#
+        );
+    }
+
+    #[test]
+    fn missing_field_returns_none_no_insert() {
+        assert!(replace_json_str_field(CC, "not_here", "X").is_none());
+    }
 }
