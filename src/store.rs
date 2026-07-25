@@ -204,22 +204,40 @@ impl CredentialStore {
         )
     }
 
-    /// 单条凭证当前已绑定的设备数。
+    /// 单条凭证当前**有效**绑定的设备数：已排除超过 TTL 未活跃的绑定（与选路时的惰性
+    /// 过期口径一致），故后台显示会随时间自然回落，不必等下一次请求触发 sweep。
+    /// TTL `<= 0`（永不过期）时按全量计。
     pub fn device_count(&self, cred_id: i64) -> Result<i64> {
+        let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM device_bindings WHERE cred_id = ?1",
-            [cred_id],
-            |r| r.get(0),
-        )?)
+        let n = if ttl > 0 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM device_bindings \
+                 WHERE cred_id = ?1 AND last_seen_at >= unixepoch() - ?2",
+                params![cred_id, ttl],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM device_bindings WHERE cred_id = ?1",
+                [cred_id],
+                |r| r.get(0),
+            )?
+        };
+        Ok(n)
     }
 
-    /// 所有凭证的已绑定设备数（cred_id → count）。
+    /// 所有凭证当前**有效**绑定的设备数（cred_id → count）；口径同 [`Self::device_count`]，
+    /// 排除超过 TTL 未活跃的绑定。TTL `<= 0` 时按全量计。
     pub fn device_counts(&self) -> Result<HashMap<i64, i64>> {
+        let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT cred_id, COUNT(*) FROM device_bindings GROUP BY cred_id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
+        let sql =
+            format!("SELECT cred_id, COUNT(*) FROM device_bindings {where_clause} GROUP BY cred_id");
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
+        let rows = if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
         let mut out = HashMap::new();
         for row in rows {
             let (cid, n) = row?;
@@ -611,7 +629,7 @@ impl CredentialStore {
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS credentials (
-            id            INTEGER PRIMARY KEY,
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
             label         TEXT    NOT NULL DEFAULT '',
             tier          TEXT,
             access_token  TEXT    NOT NULL,
@@ -713,6 +731,58 @@ fn init_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN ban_reason TEXT", []);
     // 账号 UUID（profile.account.uuid）；转发身份伪装用。旧库为空，刷新 token 时回填。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN account_uuid TEXT", []);
+
+    // 迁移：credentials.id 改为 AUTOINCREMENT。旧表（无 AUTOINCREMENT）删掉最大 id 的行后
+    // 会回收复用该 id，令新账号错误继承被删账号的历史用量（usage_logs 按 cred_id 关联、
+    // 删号时不清理）。此处须在上面所有 ADD COLUMN 之后执行，确保重建时列已齐全。
+    migrate_credentials_autoincrement(conn)?;
+    Ok(())
+}
+
+/// 若 `credentials` 仍是非 AUTOINCREMENT 的旧表，则原地重建为 AUTOINCREMENT 主键。
+/// 幂等：DDL 已含 AUTOINCREMENT 时直接返回。保留所有既有行与其 id——AUTOINCREMENT 会据
+/// 当前 `MAX(id)` 播种 `sqlite_sequence`，此后新 id 严格递增、永不回收，杜绝历史错配。
+fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
+    let ddl: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'credentials'",
+        [],
+        |r| r.get(0),
+    )?;
+    if ddl.contains("AUTOINCREMENT") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE credentials_new (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            label         TEXT    NOT NULL DEFAULT '',
+            tier          TEXT,
+            access_token  TEXT    NOT NULL,
+            refresh_token TEXT    NOT NULL,
+            expires_at    INTEGER NOT NULL,
+            priority      INTEGER NOT NULL DEFAULT 0,
+            disabled      INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
+            created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+            device_limit  INTEGER NOT NULL DEFAULT 0,
+            ban_reason    TEXT,
+            account_uuid  TEXT
+         ) STRICT;
+         INSERT INTO credentials_new
+             (id, label, tier, access_token, refresh_token, expires_at, priority,
+              disabled, created_at, updated_at, device_limit, ban_reason, account_uuid)
+         SELECT id, label, tier, access_token, refresh_token, expires_at, priority,
+              disabled, created_at, updated_at, device_limit, ban_reason, account_uuid
+         FROM credentials;
+         DROP TABLE credentials;
+         ALTER TABLE credentials_new RENAME TO credentials;
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_token
+             ON credentials(refresh_token);
+         CREATE INDEX IF NOT EXISTS idx_credentials_priority
+             ON credentials(priority, id);
+         COMMIT;",
+    )
+    .context("迁移 credentials 为 AUTOINCREMENT 失败")?;
     Ok(())
 }
 
@@ -867,5 +937,78 @@ pub async fn valid_access_token_for_device(
     } else {
         let token = cred.access_token.clone();
         Ok((token, cred))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧库（无 AUTOINCREMENT）经 init_schema 迁移后，删号腾出的 id 不再被复用。
+    #[test]
+    fn migrates_and_stops_id_reuse() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 造一张旧表：非 AUTOINCREMENT，且只含早期列（模拟老库，后续列靠 ALTER 补）。
+        conn.execute_batch(
+            "CREATE TABLE credentials (
+                id INTEGER PRIMARY KEY,
+                label TEXT NOT NULL DEFAULT '',
+                tier TEXT,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .unwrap();
+        for (id, tok) in [(1, "a"), (2, "b"), (3, "c")] {
+            conn.execute(
+                "INSERT INTO credentials (id, access_token, refresh_token, expires_at) \
+                 VALUES (?1, ?2, ?3, 0)",
+                params![id, tok, format!("r{tok}")],
+            )
+            .unwrap();
+        }
+
+        init_schema(&conn).unwrap();
+
+        let ddl: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'credentials'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ddl.contains("AUTOINCREMENT"), "迁移后应为 AUTOINCREMENT");
+
+        // 既有行与其 id 全部保留（迁移把 sqlite_sequence 播种为 MAX(id)=3）。
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
+        assert_eq!(cnt, 3);
+
+        // 迁移后删掉最大 id，新插入应得 4，而非复用被删的 3。
+        conn.execute("DELETE FROM credentials WHERE id = 3", []).unwrap();
+        conn.execute(
+            "INSERT INTO credentials (access_token, refresh_token, expires_at) VALUES ('d','rd',0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(conn.last_insert_rowid(), 4, "AUTOINCREMENT 不应复用被删的 id=3");
+
+        // 迁移后再次 init_schema 必须是无副作用的 no-op（RENAME 后 DDL 仍含 AUTOINCREMENT，
+        // 不应二次重建而丢数据）。
+        init_schema(&conn).unwrap();
+        let after: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 3, "二次 init_schema 不应改动数据");
+    }
+
+    /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。
+    #[test]
+    fn migration_is_idempotent_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap(); // 全新库：基表已带 AUTOINCREMENT。
+        init_schema(&conn).unwrap(); // 再来一次应无副作用。
+        let ddl: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'credentials'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ddl.contains("AUTOINCREMENT"));
     }
 }
