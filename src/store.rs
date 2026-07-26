@@ -20,6 +20,10 @@ const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, pr
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
     conn: Mutex<Connection>,
+    /// 每凭证一把刷新锁，串行化 token 刷新，见 [`valid_access_token_for_device`]。
+    /// 上游刷新会**轮换 refresh_token**：并发刷新时后完成的那次会把已被作废的 token 写回库，
+    /// 该凭证之后所有刷新都 `invalid_grant`，等于账号被自己废掉。
+    refresh_locks: Mutex<HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// 硬性设备上限触发：所有启用凭证的设备名额均已占满。
@@ -61,9 +65,20 @@ impl CredentialStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         init_schema(&conn)?;
-        Ok(Self {
+        Ok(Self::with_conn(conn))
+    }
+
+    /// 由已初始化的连接构造（`open_default` 与测试共用）。
+    fn with_conn(conn: Connection) -> Self {
+        Self {
             conn: Mutex::new(conn),
-        })
+            refresh_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 取该凭证的刷新锁（不存在则创建）。
+    fn refresh_lock(&self, cred_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.refresh_locks.lock().entry(cred_id).or_default().clone()
     }
 
     /// 插入一条新凭证，返回带 id 的完整记录。
@@ -429,8 +444,10 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_DEVICE_BINDING_TTL_SECS)
     }
 
-    /// 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）；
-    /// 未设置时默认开启。仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭。
+    /// 是否对转发请求做身份伪装：改写 `metadata.user_id` 的 account_uuid/device_id，
+    /// 并给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
+    /// 未设置时默认开启；仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭——关掉即完全
+    /// 不动这两处，用于排查「是否因伪装本身被识别」。
     pub fn spoof_identity_enabled(&self) -> bool {
         match self.get_setting(SPOOF_IDENTITY_ENABLED).ok().flatten() {
             Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
@@ -1086,6 +1103,10 @@ impl CredentialStore {
 ///
 /// 选择见 [`CredentialStore::select_for_device`]。若命中的凭证进入刷新窗口，
 /// 则调用 OAuth 刷新并回写。注意刷新是异步 IO，不持有 DB 锁。
+///
+/// 刷新走该凭证的专属锁 + 双重检查：上游刷新会轮换 refresh_token，并发刷新中后完成的那次
+/// 会把已作废的 token 写回库，导致该凭证之后所有刷新都 `invalid_grant`（账号被自己废掉）。
+/// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
     http: &reqwest::Client,
@@ -1094,20 +1115,25 @@ pub async fn valid_access_token_for_device(
     let ttl = store.device_binding_ttl();
     let cred = store.select_for_device(device_id, ttl)?;
 
-    if cred.needs_refresh() {
-        tracing::info!(id = cred.id, label = %cred.label, "凭证进入刷新窗口，刷新 token");
-        let tokens = crate::oauth::refresh(http, &cred.refresh_token).await?;
-        store.update_tokens(
-            cred.id,
-            &tokens.access_token,
-            &tokens.refresh_token,
-            tokens.expires_at,
-        )?;
-        Ok((tokens.access_token, cred))
-    } else {
+    if !cred.needs_refresh() {
         let token = cred.access_token.clone();
-        Ok((token, cred))
+        return Ok((token, cred));
     }
+
+    let lock = store.refresh_lock(cred.id);
+    let _guard = lock.lock().await;
+    // 双重检查：等锁期间可能已被其它请求刷新过。
+    let cred = store.get(cred.id)?.unwrap_or(cred);
+    if !cred.needs_refresh() {
+        tracing::debug!(id = cred.id, "等锁期间该凭证已被刷新，复用新 token");
+        let token = cred.access_token.clone();
+        return Ok((token, cred));
+    }
+
+    tracing::info!(id = cred.id, label = %cred.label, "凭证进入刷新窗口，刷新 token");
+    let tokens = crate::oauth::refresh(http, &cred.refresh_token).await?;
+    store.update_tokens(cred.id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)?;
+    Ok((tokens.access_token, cred))
 }
 
 #[cfg(test)]
@@ -1219,7 +1245,7 @@ mod tests {
     fn delete_cascades_usage_logs() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let store = CredentialStore { conn: Mutex::new(conn) };
+        let store = CredentialStore::with_conn(conn);
         let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
         let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
         {
@@ -1264,7 +1290,7 @@ mod tests {
     fn insert_defaults_to_p0_and_batch_priority() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let store = CredentialStore { conn: Mutex::new(conn) };
+        let store = CredentialStore::with_conn(conn);
         let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
         let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
         let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();
@@ -1284,7 +1310,7 @@ mod tests {
     fn batch_ops_only_touch_selected() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let store = CredentialStore { conn: Mutex::new(conn) };
+        let store = CredentialStore::with_conn(conn);
         let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
         let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
         let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();

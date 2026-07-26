@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::auth;
+use crate::config;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
@@ -45,8 +46,19 @@ pub async fn run(
     admin_password: Option<String>,
 ) -> Result<()> {
     let client_key = api_key.map(Arc::new);
+    // 上游客户端刻意贴近官方客户端的传输形态：
+    // - `http1_only`：官方客户端是 node/undici，走 HTTP/1.1（抓包里有 `Connection`/`Host`，
+    //   h2 不会有这两个头）。reqwest 默认经 ALPN 协商 h2，会留下 h2 的 SETTINGS/伪头指纹。
+    // - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
+    //   时来访客户端自己的 UA 会覆盖它。
+    // 注：TLS 层的 ClientHello 指纹（rustls ≠ node BoringSSL）无法在这里对齐。
+    let http = reqwest::Client::builder()
+        .http1_only()
+        .user_agent(config::CC_USER_AGENT)
+        .build()
+        .context("构造上游 HTTP 客户端失败")?;
     let state = AppState {
-        http: reqwest::Client::new(),
+        http,
         pkce: Arc::new(Mutex::new(None)),
         store,
         client_key: client_key.clone(),

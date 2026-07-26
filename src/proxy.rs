@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use rand::RngExt;
 
 use crate::config;
 use crate::store;
@@ -80,24 +81,36 @@ pub async fn handle(
     if !out.contains_key("anthropic-version") {
         out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
-    // anthropic-beta 合并，确保带上 oauth。
+    // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
     let beta = merge_beta(headers.get("anthropic-beta"));
     if let Ok(v) = HeaderValue::from_str(&beta) {
         out.insert("anthropic-beta", v);
+    }
+    // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
+    if !out.contains_key(header::ACCEPT_ENCODING) {
+        out.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static(config::CC_ACCEPT_ENCODING),
+        );
+    }
+    // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
+    if !out.contains_key("x-client-request-id")
+        && let Ok(v) = HeaderValue::from_str(&uuid_v4())
+    {
+        out.insert("x-client-request-id", v);
     }
     // 注入 OAuth 鉴权（覆盖来访的任何鉴权头）。
     if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", token)) {
         out.insert(header::AUTHORIZATION, v);
     }
 
-    // 6) 转发前改写 body：缓存策略对齐订阅（5m→1h、最大 system 块 global）+ 身份伪装
-    //    （metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份）。
+    // 6) 转发前改写 body：最大 system 块标 scope=global + 身份伪装（metadata.user_id 的
+    //    account_uuid/device_id 换成该凭证自洽身份、billing header 补 cch）。缓存 TTL 不动。
     //    设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
     let device_fp = device_fingerprint(device_id.as_deref(), &headers);
-    // 临时排查：打印客户端识别头（确认客户端类型后可移除）。
     {
         let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("-");
-        tracing::info!(
+        tracing::debug!(
             ua = %h("user-agent"),
             x_app = %h("x-app"),
             arch = %h("x-stainless-arch"),
@@ -131,6 +144,24 @@ pub async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
                 .unwrap_or(false);
+            // 响应带非 identity 的 `content-encoding` 时我们不解压、原样透传给客户端解码，
+            // 因此跳过用量嗅探与错误体判定。上游对 `text/event-stream` 实测不压缩，故这条
+            // 路径只可能出现在非流式响应上。
+            let compressed = up
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    let v = v.trim();
+                    !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+                })
+                .unwrap_or(false);
+            if compressed && status.is_client_error() {
+                tracing::warn!(
+                    status = status.as_u16(),
+                    "上游错误响应被压缩，无法判定是否为账号级错误（不会自动停用凭证）"
+                );
+            }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
 
@@ -152,7 +183,7 @@ pub async fn handle(
                 cred_label: cred.label.clone(),
                 device_id,
                 status: status.as_u16(),
-                sniffer: UsageSniffer::new(is_stream),
+                sniffer: UsageSniffer::new(is_stream, compressed),
                 req_speed,
                 ratelimit,
                 store: state.store.clone(),
@@ -168,7 +199,10 @@ pub async fn handle(
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
                         rl.sniffer.feed(&bytes);
-                        if let Some(reason) = detect_account_ban(status, &bytes) {
+                        // 压缩体读不出内容，宁可漏判也不误判（乱码可能碰巧命中特征词）。
+                        if let Some(reason) =
+                            (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
+                        {
                             tracing::warn!(
                                 cred = format!("#{} {}", cred.id, cred.label),
                                 status = status.as_u16(),
@@ -360,6 +394,8 @@ impl Drop for ReqLog {
 #[derive(Default)]
 struct UsageSniffer {
     is_stream: bool,
+    /// 响应体被压缩：我们不解压，故一律不解析（`feed` 直接丢弃）。
+    opaque: bool,
     /// SSE 模式下未处理完的行尾；非流式模式下累积的整段响应体。
     buf: Vec<u8>,
     model: Option<String>,
@@ -376,15 +412,19 @@ struct UsageSniffer {
 }
 
 impl UsageSniffer {
-    fn new(is_stream: bool) -> Self {
+    fn new(is_stream: bool, opaque: bool) -> Self {
         Self {
             is_stream,
+            opaque,
             ..Default::default()
         }
     }
 
     /// 喂入一块响应字节。
     fn feed(&mut self, chunk: &[u8]) {
+        if self.opaque {
+            return;
+        }
         if self.is_stream {
             self.buf.extend_from_slice(chunk);
             // 逐个完整行处理，保留最后不完整的一段在 buf 里。
@@ -522,6 +562,11 @@ const BAN_KEYWORDS: &[&str] = &[
     "oauth",
 ];
 
+/// 反向豁免：命中其一则**一定不是**账号级问题，无论状态码与特征词如何都不停用。
+/// 用于挡住「特征词碰巧出现在非账号报错里」的误杀，见 [`detect_account_ban`]。
+const NOT_ACCOUNT_PHRASES: &[&str] =
+    &["not supported for this endpoint", "does not support", "unsupported model"];
+
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
 fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     let text = String::from_utf8_lossy(body);
@@ -535,9 +580,13 @@ fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
 
 /// 依据状态码与响应体判定是否应自动停用该凭证，命中则返回写入 `ban_reason` 的原因
 /// （`[状态码] 类型: 消息`，截断至 200 字符）。
-/// - 401 authentication_error / 403 permission_error：账号级鉴权/权限失效，一律停用。
-/// - 400：仅当错误类型/消息指向账号级问题（命中 [`BAN_KEYWORDS`]）时停用；
-///   普通 invalid_request_error（客户端请求错误）不停用，原样透传。
+///
+/// 三档都要求响应体确实是 Anthropic 的错误 JSON（能取到 `error.type`）或命中
+/// [`BAN_KEYWORDS`]，避免把「非账号问题的 4xx」当成封号，把健康账号打成停用：
+/// - 401：`authentication_error` 才停用。裸 401（CDN/网关拦截，无 `error.type`）不停用。
+/// - 403：**仅**命中 [`BAN_KEYWORDS`] 时停用。普通 `permission_error`（如 Pro 账号请求
+///   Opus、beta 未开通、区域限制）是能力/权限问题而非封号，原样透传即可。
+/// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。
 fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
     let (etype, message) = parse_upstream_error(body);
     let reason = || {
@@ -547,12 +596,19 @@ fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
         };
         head.chars().take(200).collect::<String>()
     };
+    let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
+    // 先排除「端点/能力不支持」这类与账号状态无关的报错——它们可能带上 oauth 等特征词
+    // （如 401 `OAuth authentication is currently not supported for this endpoint`），
+    // 但账号本身是好的，停用了反而白扣一个号。
+    if NOT_ACCOUNT_PHRASES.iter().any(|p| hay.contains(p)) {
+        return None;
+    }
+    let hits_keyword = || BAN_KEYWORDS.iter().any(|k| hay.contains(k));
     match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(reason()),
-        StatusCode::BAD_REQUEST => {
-            let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
-            BAN_KEYWORDS.iter().any(|k| hay.contains(k)).then(reason)
+        StatusCode::UNAUTHORIZED => {
+            (etype.as_deref() == Some("authentication_error") || hits_keyword()).then(reason)
         }
+        StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST => hits_keyword().then(reason),
         _ => None,
     }
 }
@@ -585,8 +641,11 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
     false
 }
 
-/// 合并来访的 anthropic-beta 值，补齐 [`config::INJECT_BETAS`]（对齐官方订阅客户端）。
-/// 保留来访已带的其它 beta，仅追加缺失项，不改变原有顺序。
+/// 合并来访的 anthropic-beta 值，补齐 [`config::INJECT_BETAS`]（对齐官方订阅客户端），
+/// 并按 [`config::CC_BETA_ORDER`] 重排。
+///
+/// 只追加不重排会得到官方客户端不会产生的排列（缺失项全堆在末尾），集合对了顺序错，
+/// 一次精确字符串匹配即可判定中间有代理。表外的未知 beta 保持相对顺序附在末尾。
 fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     let mut parts: Vec<String> = incoming
         .and_then(|v| v.to_str().ok())
@@ -597,7 +656,31 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
             parts.push((*beta).to_string());
         }
     }
+    // 稳定排序：已知 beta 按官方位次，未知的排在最后并保留原有相对顺序。
+    let rank = |p: &String| {
+        config::CC_BETA_ORDER
+            .iter()
+            .position(|k| k == p)
+            .unwrap_or(config::CC_BETA_ORDER.len())
+    };
+    parts.sort_by_key(rank);
     parts.join(",")
+}
+
+/// 生成一个随机 uuid v4（小写带连字符），用于补齐 `x-client-request-id`。
+fn uuid_v4() -> String {
+    let mut b: [u8; 16] = rand::rng().random();
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+    let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&b[0..4]),
+        h(&b[4..6]),
+        h(&b[6..8]),
+        h(&b[8..10]),
+        h(&b[10..16])
+    )
 }
 
 /// 读取请求体里声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
@@ -610,13 +693,15 @@ fn request_speed(body: &Bytes) -> Option<String> {
     Some(v.get("speed")?.as_str()?.to_string())
 }
 
-/// 转发前改写请求体，两件事：
+/// 转发前改写请求体：
 ///
-/// 1. **缓存策略对齐订阅**：所有 ephemeral 断点（`system`/`tools`/`messages[].content`）
-///    的 TTL 补成 `1h`（客户端已显式设置的不覆盖）；`system` 里文本最长的静态块额外
-///    标记 `scope: "global"`，提升跨会话缓存复用。
+/// 1. **缓存 scope**：`system` 里文本最长的静态块标记 `scope: "global"`，提升跨会话缓存复用。
 /// 2. **身份伪装**：把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成该凭证自洽的
-///    身份（真实 account_uuid + 由其稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾。
+///    身份（真实 account_uuid + 由其稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾；
+///    并给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
+///
+/// **不动缓存 TTL**：客户端声明 5m 就按 5m 转发。曾把所有 ephemeral 断点无条件升成 1h，
+/// 但 1h 缓存写单价是 2 倍、且会让上游看到「1h 缓存写占比异常」，收益不值这个代价。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
 fn rewrite_body(
@@ -629,31 +714,22 @@ fn rewrite_body(
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
-    let mut ttl_upgrades = 0usize;
-    upgrade_array_ttl(v.get_mut("system"), &mut ttl_upgrades);
-    upgrade_array_ttl(v.get_mut("tools"), &mut ttl_upgrades);
-    if let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for m in msgs.iter_mut() {
-            upgrade_array_ttl(m.get_mut("content"), &mut ttl_upgrades);
-        }
-    }
     let global_idx = mark_largest_system_global(&mut v);
-    // 临时排查：打印入站 metadata（确认后可移除）。UA 由调用方在 handle 里另打。
-    tracing::info!(
+    let cch_added = spoof_enabled && ensure_billing_cch(&mut v);
+    tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
     );
     let spoofed = spoof_enabled && spoof_identity(&mut v, cred, device_fp);
-    // 临时校验：打印本次改写结果（确认后可移除）。
-    tracing::info!(
-        ttl_upgrades,
+    tracing::debug!(
         scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
         spoofed,
+        cch_added,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if ttl_upgrades == 0 && global_idx.is_none() && !spoofed {
+    if global_idx.is_none() && !spoofed && !cch_added {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
@@ -757,26 +833,53 @@ fn replace_json_str_field(s: &str, key: &str, new_val: &str) -> Option<String> {
     Some(out)
 }
 
-/// 对一个 content-block 数组里每个块的 `cache_control` 做 TTL 升级，累加升级计数。
-fn upgrade_array_ttl(arr: Option<&mut serde_json::Value>, count: &mut usize) {
-    if let Some(arr) = arr.and_then(|a| a.as_array_mut()) {
-        for blk in arr.iter_mut() {
-            upgrade_cc_ttl(blk, count);
+/// 给 `system[0]` 的 `x-anthropic-billing-header` 补上 `cch=<值>`，对齐订阅客户端。
+///
+/// 官方客户端只在订阅(OAuth)模式下发这个字段，API-key 模式（接入 luban 的形态）不发，
+/// 于是「OAuth token + 无 cch」是个确定性判据。抓包实测补齐后与真实客户端形态一致：
+/// `…cc_version=2.1.218.0b9; cc_entrypoint=cli; cch=00000;`
+///
+/// 只在该块确实是 billing header、且尚无 `cch=` 时改写；其余情况返回 `false` 不动结构。
+///
+/// 注意：`system[0]` 位于第一个缓存断点之前，属于被缓存的前缀——改写它会让**部署后的第一次
+/// 请求**缓存未命中一次。因此 `cch` 的取值必须对同一前缀保持稳定，见 [`cch_value`]。
+fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
+    let blk = match v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut()) {
+        Some(b) => b,
+        None => return false,
+    };
+    let text = match blk.get("text").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => return false,
+    };
+    if !text.starts_with("x-anthropic-billing-header:") || text.contains("cch=") {
+        return false;
+    }
+    let mut s = text.trim_end().to_string();
+    if !s.ends_with(';') {
+        s.push(';');
+    }
+    s.push_str(&format!(" cch={};", cch_value()));
+    match blk.get_mut("text") {
+        Some(t) => {
+            *t = serde_json::Value::String(s);
+            true
         }
+        None => false,
     }
 }
 
-/// 若块带 `cache_control: {type: "ephemeral"}` 且未设 `ttl`，补 `ttl: "1h"` 并计数。
-fn upgrade_cc_ttl(blk: &mut serde_json::Value, count: &mut usize) {
-    let cc = match blk.get_mut("cache_control").and_then(|c| c.as_object_mut()) {
-        Some(cc) => cc,
-        None => return,
-    };
-    if cc.get("type").and_then(|t| t.as_str()) != Some("ephemeral") || cc.contains_key("ttl") {
-        return;
-    }
-    cc.insert("ttl".into(), serde_json::Value::String("1h".into()));
-    *count += 1;
+/// `cch` 的取值。当前是常量 [`config::BILLING_CCH`]。
+///
+/// 真实算法无法从抓包反推，所以这里只能给占位值。**代价**：它跨账号恒定，所有经由 luban
+/// 的请求都带同一个真实客户端从不产生的 `cch`，上游一按此聚类就把所有账号串成一串。
+///
+/// 想改成每账号不同，把本函数换成从「已在缓存前缀内的内容」派生即可，例如
+/// `sha256(account_uuid ‖ system[1..] 文本)` 取前 5 位小写 hex：前缀不变则取值不变，
+/// 不会打爆 prompt cache，同时每个账号各自不同。（若上游会校验 cch 与内容的对应关系，
+/// 两种做法都是错值——那种情况下正确的选择是根本不补，见 config 里的说明。）
+fn cch_value() -> &'static str {
+    config::BILLING_CCH
 }
 
 /// 给 `system` 数组里「带 cache_control 且 text 最长」的块补 `scope: "global"`。
@@ -857,6 +960,10 @@ impl RateLimitInfo {
 }
 
 /// 请求头是否可转发：跳过鉴权、Host、逐跳头、以及我们显式设置的头。
+///
+/// `accept-encoding` 刻意**保留转发**：官方客户端必带 `gzip, deflate, br, zstd`，剥掉它等于
+/// 发出一个「自称 claude-cli 却不声明压缩支持」的请求。我们不解压，响应侧连同
+/// `content-encoding` 原样透传给客户端解码（见 [`is_resp_forwardable`]）。
 fn is_forwardable(name: &HeaderName) -> bool {
     let n = name.as_str().to_ascii_lowercase();
     !matches!(
@@ -865,7 +972,6 @@ fn is_forwardable(name: &HeaderName) -> bool {
             | "authorization"
             | "x-api-key"
             | "content-length"
-            | "accept-encoding"
             | "connection"
             | "proxy-connection"
             | "te"
@@ -878,17 +984,199 @@ fn is_forwardable(name: &HeaderName) -> bool {
 }
 
 /// 响应头是否可回传：跳过由框架管理的分帧类头。
+///
+/// `content-encoding` 必须保留：我们向上游声明了 `accept-encoding` 且不做解压，压缩体是
+/// 原样透传的，去掉这个头客户端就会把压缩字节当明文解析。
 fn is_resp_forwardable(name: &HeaderName) -> bool {
     let n = name.as_str().to_ascii_lowercase();
-    !matches!(
-        n.as_str(),
-        "content-length" | "transfer-encoding" | "connection" | "content-encoding"
-    )
+    !matches!(n.as_str(), "content-length" | "transfer-encoding" | "connection")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Bytes, UsageSniffer, replace_json_str_field, request_speed};
+    use super::{
+        Bytes, HeaderValue, StatusCode, UsageSniffer, detect_account_ban, ensure_billing_cch,
+        merge_beta, replace_json_str_field, request_speed, uuid_v4,
+    };
+
+    /// API-key 模式的 CC 实际发出的 beta 串（抓包 041，经 luban 转发那一条）。
+    const CLIENT_BETA: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+        redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+        prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24";
+
+    /// 官方订阅客户端直连 API 时的 beta 串（抓包 040，同一台机器同一版本）。
+    const OFFICIAL_BETA: &str = "claude-code-20250219,oauth-2025-04-20,\
+        interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+        thinking-token-count-2026-05-13,context-management-2025-06-27,\
+        prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+        advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+
+    /// 补齐 + 重排后应与官方客户端的 beta 串**逐字节一致**，而不是把缺失项堆在末尾。
+    #[test]
+    fn merged_beta_matches_official_order() {
+        let v = HeaderValue::from_static(CLIENT_BETA);
+        assert_eq!(merge_beta(Some(&v)), OFFICIAL_BETA);
+    }
+
+    /// 表外的未知 beta 保留在末尾，不因排序被丢弃或插到中间。
+    #[test]
+    fn merged_beta_keeps_unknown_betas_last() {
+        let raw = format!("{CLIENT_BETA},some-future-beta-2027-01-01");
+        let v = HeaderValue::from_str(&raw).unwrap();
+        let out = merge_beta(Some(&v));
+        assert_eq!(out, format!("{OFFICIAL_BETA},some-future-beta-2027-01-01"));
+    }
+
+    /// 无来访 beta 时也要输出官方位次（oauth 在最前档、extended-cache-ttl 最后）。
+    #[test]
+    fn merged_beta_from_empty_is_ordered() {
+        assert_eq!(
+            merge_beta(None),
+            "oauth-2025-04-20,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,\
+             extended-cache-ttl-2025-04-11"
+        );
+    }
+
+    fn test_cred() -> crate::credentials::Credential {
+        crate::credentials::Credential {
+            id: 1,
+            label: "t".into(),
+            tier: None,
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_at: u64::MAX,
+            priority: 0,
+            disabled: false,
+            device_limit: 0,
+            ban_reason: None,
+            account_uuid: Some("27aa7c53-0d20-42d2-806a-60c710529405".into()),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 转发时**不得**改写缓存 TTL：客户端声明 5m（不带 ttl）就按原样发。
+    /// 曾无条件升成 1h，代价是 2 倍缓存写单价 + 上游可见的「1h 写占比异常」，已去掉。
+    #[test]
+    fn does_not_rewrite_cache_ttl() {
+        let raw = Bytes::from(
+            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},
+                          {"type":"text","text":"big","cache_control":{"type":"ephemeral"}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"hi",
+                          "cache_control":{"type":"ephemeral"}}]}]}"#,
+        );
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", true);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains("\"ttl\""), "不应注入 ttl: {s}");
+        // 同时确认另外两项改写仍生效（否则这个测试会因为整体没改写而空过）。
+        assert!(s.contains("cch=00000"), "应补 cch: {s}");
+        assert!(s.contains("\"scope\":\"global\""), "应标 scope: {s}");
+    }
+
+    fn body_with_system0(text: &str) -> serde_json::Value {
+        serde_json::json!({"system": [{"type": "text", "text": text}]})
+    }
+
+    /// 补出的 billing header 与订阅模式的真实形态一致（抓包 040 的 `; cch=…;` 形态）。
+    #[test]
+    fn adds_cch_in_official_shape() {
+        let mut v =
+            body_with_system0("x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;");
+        assert!(ensure_billing_cch(&mut v));
+        assert_eq!(
+            v["system"][0]["text"],
+            serde_json::json!(
+                "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli; cch=00000;"
+            )
+        );
+    }
+
+    /// 已带 cch（订阅模式客户端）不重复追加；非 billing 块不动。
+    #[test]
+    fn cch_is_idempotent_and_scoped() {
+        let mut has = body_with_system0(
+            "x-anthropic-billing-header: cc_version=2.1.218.2d7; cc_entrypoint=cli; cch=0848d;",
+        );
+        assert!(!ensure_billing_cch(&mut has));
+
+        let mut other = body_with_system0("You are Claude Code, Anthropic's official CLI for Claude.");
+        assert!(!ensure_billing_cch(&mut other));
+
+        let mut empty = serde_json::json!({"messages": []});
+        assert!(!ensure_billing_cch(&mut empty));
+    }
+
+    fn err_body(etype: &str, msg: &str) -> Vec<u8> {
+        serde_json::json!({"type": "error", "error": {"type": etype, "message": msg}})
+            .to_string()
+            .into_bytes()
+    }
+
+    /// 账号级错误照旧停用。
+    #[test]
+    fn bans_on_real_account_errors() {
+        let cases = [
+            (StatusCode::UNAUTHORIZED, err_body("authentication_error", "invalid bearer token")),
+            (StatusCode::FORBIDDEN, err_body("permission_error", "This account has been disabled")),
+            (
+                StatusCode::BAD_REQUEST,
+                err_body("invalid_request_error", "Your account was suspended"),
+            ),
+        ];
+        for (status, body) in cases {
+            assert!(
+                detect_account_ban(status, &body).is_some(),
+                "应判定为账号级错误: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    /// 非账号问题的 4xx 不得停用——这类误杀会把健康账号一个个扣掉。
+    #[test]
+    fn does_not_ban_on_non_account_errors() {
+        let cases = [
+            // Pro 账号请求 Opus / beta 未开通：能力问题，不是封号。
+            (
+                StatusCode::FORBIDDEN,
+                err_body("permission_error", "Your account does not have access to claude-opus-5"),
+            ),
+            // 裸 401（CDN/网关拦截，非 Anthropic 错误 JSON）。
+            (StatusCode::UNAUTHORIZED, b"<html>401 Unauthorized</html>".to_vec()),
+            // 客户端请求错误。
+            (
+                StatusCode::BAD_REQUEST,
+                err_body("invalid_request_error", "max_tokens: must be <= 64000"),
+            ),
+            // 特征词碰巧出现在「端点不支持」里：账号是好的。
+            (
+                StatusCode::UNAUTHORIZED,
+                err_body(
+                    "authentication_error",
+                    "OAuth authentication is currently not supported for this endpoint",
+                ),
+            ),
+        ];
+        for (status, body) in cases {
+            assert!(
+                detect_account_ban(status, &body).is_none(),
+                "不应停用: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    /// 补齐的 x-client-request-id 是标准 uuid v4 形态。
+    #[test]
+    fn generates_uuid_v4() {
+        let u = uuid_v4();
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert!(u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "非法字符: {u}");
+        assert_eq!(parts[2].as_bytes()[0], b'4', "version 位应为 4: {u}");
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'), "variant 位不对: {u}");
+        assert_ne!(u, uuid_v4(), "每请求应不同");
+    }
 
     // 真实 CC 抓包形态：字段顺序 device_id → account_uuid → session_id。
     const CC: &str = r#"{"device_id":"dddd","account_uuid":"aaaa","session_id":"ssss"}"#;
@@ -931,7 +1219,7 @@ mod tests {
     /// 上游 SSE 的 `usage.speed` 会被嗅探到——这是计费的权威来源（fast 被限流会回落）。
     #[test]
     fn sniffs_speed_from_response_usage() {
-        let mut s = UsageSniffer::new(true);
+        let mut s = UsageSniffer::new(true, false);
         s.feed(
             b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\
               \"usage\":{\"input_tokens\":10,\"speed\":\"fast\"}}}\n",
@@ -942,7 +1230,7 @@ mod tests {
         assert_eq!(s.input_tokens, Some(10));
 
         // 非流式 JSON 响应同样能取到。
-        let mut s2 = UsageSniffer::new(false);
+        let mut s2 = UsageSniffer::new(false, false);
         s2.feed(br#"{"model":"claude-opus-5","usage":{"output_tokens":5,"speed":"standard"}}"#);
         s2.finish();
         assert_eq!(s2.speed.as_deref(), Some("standard"));

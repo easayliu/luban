@@ -27,7 +27,8 @@ pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 /// 转发时确保携带的 beta 组：对齐官方订阅客户端的 `anthropic-beta`。
 /// API 模式的 Claude Code 不会自带这些，缺失会导致缓存 TTL 退化与部分工具能力关闭。
 /// - `oauth-2025-04-20`：OAuth 鉴权必需。
-/// - `extended-cache-ttl-2025-04-11`：启用 1h 提示缓存（否则只有 5m）。
+/// - `extended-cache-ttl-2025-04-11`：官方订阅客户端固定携带。我们**不**改写缓存 TTL
+///   （客户端声明 5m 就按 5m 发），保留它只为让 `anthropic-beta` 与官方客户端逐字节一致。
 /// - `advanced-tool-use-2025-11-20`：对齐订阅端工具能力。
 /// - `prompt-caching-scope-2026-01-05`：允许 `cache_control.scope: "global"`（body 改写依赖）。
 pub const INJECT_BETAS: &[&str] = &[
@@ -36,6 +37,50 @@ pub const INJECT_BETAS: &[&str] = &[
     "advanced-tool-use-2025-11-20",
     "prompt-caching-scope-2026-01-05",
 ];
+
+/// 官方订阅客户端 `anthropic-beta` 的**排列顺序**（抓包 claude-cli/2.1.218 直连 API 得到，
+/// 两次抓包顺序一致，仅 `context-1m` 视会话有无）。
+///
+/// 只补齐 [`INJECT_BETAS`] 会把缺失项追加到末尾，得到 `…,effort,oauth,extended-cache-ttl,
+/// advanced-tool-use` 这种官方客户端不会产生的排列——集合对了顺序错，一次精确匹配即可判定
+/// 中间有代理。故转发前按本表重排；表外的未知 beta 保持相对顺序放在末尾。
+pub const CC_BETA_ORDER: &[&str] = &[
+    "claude-code-20250219",
+    OAUTH_BETA_HEADER,
+    "context-1m-2025-08-07",
+    "interleaved-thinking-2025-05-14",
+    "redact-thinking-2026-02-12",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+    "extended-cache-ttl-2025-04-11",
+];
+
+/// 官方客户端的 `User-Agent`。用于 luban 自身发起的账号级请求（token 刷新、profile），
+/// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
+/// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.218 (external, cli)";
+
+/// `Accept-Encoding`：与官方客户端逐字节一致。
+///
+/// 原先该头被剥离且 reqwest 未开压缩 feature，上游收到的是「自称 claude-cli 却完全不声明
+/// 压缩支持」的请求。上游对 `text/event-stream` 实测不压缩，故声明后流式响应仍是 identity，
+/// 用量嗅探不受影响；非流式响应可能带 `content-encoding`，原样透传给客户端解码。
+pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
+/// 注入到 `x-anthropic-billing-header` 的 `cch` 值。
+///
+/// 官方客户端仅在**订阅(OAuth)模式**下发送 `cch=<5 位小写 hex>`；API-key 模式（即接入
+/// luban 的形态）不发。于是「OAuth token + 无 cch」成为一个确定性判据。真实算法无法从抓包
+/// 反推（同账号内逐请求变化，18 组候选输入 × 6 种摘要均未命中），故只能填一个占位值。
+///
+/// 注意这是个**跨账号恒定**的值：所有经由 luban 的请求都带同一个真实客户端从不产生的
+/// `cch`，一旦上游按此聚类，等于把所有账号串成一串。要改成每账号不同又不打爆 prompt cache，
+/// 把 [`crate::proxy::cch_value`] 换成从「已在缓存前缀内的内容」派生即可（见该函数注释）。
+pub const BILLING_CCH: &str = "00000";
 
 /// 官方上游 API base（代理转发目标）。
 pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
