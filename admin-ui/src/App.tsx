@@ -3,13 +3,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   PlusIcon, Cog6ToothIcon, ArrowRightStartOnRectangleIcon, ArrowsUpDownIcon, CheckIcon,
   QueueListIcon, ArrowPathIcon, XMarkIcon, ChevronLeftIcon, ChevronRightIcon,
+  MagnifyingGlassIcon, FunnelIcon, Squares2X2Icon, Bars3Icon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import { listCredentials, setPriorities, type Credential } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
 import { cn, extractError } from '@/lib/utils'
+import { isAbnormal, isNearLimit } from '@/components/credential-shared'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
 import { LoginPage } from '@/components/login-page'
@@ -21,9 +24,22 @@ import {
 } from '@/components/ui/dropdown-menu'
 
 type SortKey = 'priority' | 'usage5h' | 'cost' | 'recent' | 'created'
+type FilterKey = 'all' | 'enabled' | 'disabled' | 'abnormal' | 'nearLimit'
+type ViewMode = 'card' | 'list'
 
 /** 每页账号数可选档位；账号少时分页条自动隐藏。 */
 const PAGE_SIZES = [12, 24, 48] as const
+
+/** 视图偏好存 localStorage，刷新后保持上次选择。 */
+const VIEW_KEY = 'luban.view'
+
+const FILTERS: { key: FilterKey; label: string; match: (c: Credential) => boolean }[] = [
+  { key: 'all', label: '全部', match: () => true },
+  { key: 'enabled', label: '启用', match: (c) => !c.disabled },
+  { key: 'disabled', label: '停用', match: (c) => c.disabled },
+  { key: 'abnormal', label: '异常（封禁/过期）', match: isAbnormal },
+  { key: 'nearLimit', label: '额度将满', match: isNearLimit },
+]
 
 const SORTS: { key: SortKey; label: string }[] = [
   { key: 'priority', label: '优先级' },
@@ -32,6 +48,13 @@ const SORTS: { key: SortKey; label: string }[] = [
   { key: 'recent', label: '最近使用' },
   { key: 'created', label: '添加时间' },
 ]
+
+/** 关键字匹配：名称（忽略大小写）或 `#id`。 */
+function matchQuery(c: Credential, q: string): boolean {
+  const t = q.trim().toLowerCase()
+  if (!t) return true
+  return c.label.toLowerCase().includes(t) || `#${c.id}`.includes(t) || String(c.id) === t
+}
 
 /** 按所选维度排序（不改原数组）。除优先级升序外，其余均降序、缺失值垫底。 */
 function sortCreds(list: Credential[], key: SortKey): Credential[] {
@@ -62,6 +85,22 @@ function App() {
   // 分页（纯前端切片：列表接口一次返回全部账号）。
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
+  // 筛选 / 搜索 / 视图。
+  const [filter, setFilter] = useState<FilterKey>('all')
+  const [query, setQuery] = useState('')
+  const [view, setView] = useState<ViewMode>(
+    () => (localStorage.getItem(VIEW_KEY) === 'list' ? 'list' : 'card'),
+  )
+  const switchView = (v: ViewMode) => { setView(v); localStorage.setItem(VIEW_KEY, v) }
+  // 条件变化后停留在旧页码可能整页为空，统一回到第一页。
+  const resetPage = <T,>(set: (v: T) => void) => (v: T) => { set(v); setPage(1) }
+  const toggleSelected = (id: number, on: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (on) next.add(id)
+      else next.delete(id)
+      return next
+    })
 
   const { data: authState, isLoading: authLoading } = useQuery({
     queryKey: ['auth-state'],
@@ -78,7 +117,12 @@ function App() {
   })
 
   // 注意：Hook 必须在任何提前 return 之前调用，避免渲染间 Hook 数量变化（React #310）。
-  const sorted = useMemo(() => sortCreds(creds ?? [], sort), [creds, sort])
+  // 顺序：筛选 → 搜索 → 排序 → 分页切片。
+  const sorted = useMemo(() => {
+    const match = FILTERS.find((f) => f.key === filter)?.match ?? (() => true)
+    const list = (creds ?? []).filter((c) => match(c) && matchQuery(c, query))
+    return sortCreds(list, sort)
+  }, [creds, sort, filter, query])
   const total = sorted.length
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   // 删账号/改每页条数可能让当前页越界，取值时夹紧（不写回 state，避免多余渲染）。
@@ -102,7 +146,8 @@ function App() {
   }
 
   const count = creds?.length ?? 0
-  const enabledCount = sorted.filter((c) => !c.disabled).length
+  const enabledCount = (creds ?? []).filter((c) => !c.disabled).length
+  const filtering = filter !== 'all' || query.trim() !== ''
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -142,17 +187,97 @@ function App() {
         <AddAccount open={adding} onOpenChange={setAdding} />
         <AccessSettings open={showSettings} onOpenChange={setShowSettings} />
 
-        {/* 工具栏 */}
+        {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
         {count > 0 && (
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="flex items-baseline gap-2 text-sm font-semibold tracking-tight">
               账号列表
               <span className="text-xs font-normal text-muted-foreground">
-                共 <span className="tnum font-medium text-foreground">{total}</span> 个
-                {enabledCount < total && `（启用 ${enabledCount}）`}
+                {filtering ? (
+                  <>
+                    筛选出 <span className="tnum font-medium text-foreground">{total}</span> / 共{' '}
+                    <span className="tnum">{count}</span> 个
+                  </>
+                ) : (
+                  <>
+                    共 <span className="tnum font-medium text-foreground">{count}</span> 个
+                    {enabledCount < count && `（启用 ${enabledCount}）`}
+                  </>
+                )}
               </span>
             </h2>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {/* 搜索：名称或 #id */}
+              <div className="relative">
+                <MagnifyingGlassIcon className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={query}
+                  onChange={(e) => resetPage(setQuery)(e.target.value)}
+                  placeholder="搜索名称或 #id"
+                  className="h-8 w-40 pl-7 pr-7 text-xs"
+                />
+                {query && (
+                  <button
+                    className="absolute right-1.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                    onClick={() => resetPage(setQuery)('')}
+                    title="清除搜索"
+                  >
+                    <XMarkIcon className="size-3" />
+                  </button>
+                )}
+              </div>
+
+              {/* 状态筛选 */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant={filter === 'all' ? 'outline' : 'secondary'}
+                    className="h-8 gap-1.5 px-2.5 text-xs"
+                  >
+                    <FunnelIcon className="size-3.5" />
+                    {FILTERS.find((f) => f.key === filter)!.label}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {FILTERS.map((f) => (
+                    <DropdownMenuItem key={f.key} onClick={() => resetPage(setFilter)(f.key)}>
+                      <CheckIcon className={cn('size-3.5', filter === f.key ? 'opacity-100' : 'opacity-0')} />
+                      {f.label}
+                      <span className="ml-auto pl-3 tnum text-2xs text-muted-foreground">
+                        {(creds ?? []).filter(f.match).length}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* 视图切换：卡片 / 紧凑列表 */}
+              <div className="flex items-center overflow-hidden rounded-xl border border-border">
+                <button
+                  className={cn(
+                    'grid h-8 w-8 place-items-center transition-colors',
+                    view === 'card' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60',
+                  )}
+                  onClick={() => switchView('card')}
+                  title="卡片视图"
+                  aria-pressed={view === 'card'}
+                >
+                  <Squares2X2Icon className="size-4" />
+                </button>
+                <button
+                  className={cn(
+                    'grid h-8 w-8 place-items-center border-l border-border transition-colors',
+                    view === 'list' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60',
+                  )}
+                  onClick={() => switchView('list')}
+                  title="紧凑列表视图"
+                  aria-pressed={view === 'list'}
+                >
+                  <Bars3Icon className="size-4" />
+                </button>
+              </div>
+
               <Button
                 size="sm"
                 variant={batch ? 'secondary' : 'outline'}
@@ -161,7 +286,7 @@ function App() {
                 title="批量调整优先级"
               >
                 <QueueListIcon className="size-3.5" />
-                批量优先级
+                批量
               </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -198,23 +323,40 @@ function App() {
           <div className="py-16 text-center text-sm text-muted-foreground">加载中…</div>
         ) : count === 0 ? (
           <EmptyState onAdd={() => setAdding(true)} />
+        ) : total === 0 ? (
+          <div className="rounded-2xl border border-dashed border-border py-14 text-center">
+            <p className="text-sm text-muted-foreground">没有符合条件的账号</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3"
+              onClick={() => { resetPage(setFilter)('all'); setQuery('') }}
+            >
+              清除筛选与搜索
+            </Button>
+          </div>
+        ) : view === 'list' ? (
+          <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-card">
+            {pageItems.map((c) => (
+              <CredentialRow
+                key={c.id}
+                cred={c}
+                selectable={batch}
+                selected={selected.has(c.id)}
+                onSelectedChange={(on) => toggleSelected(c.id, on)}
+              />
+            ))}
+          </div>
         ) : (
           // 单账号：单列自适应铺满内容宽度（与上方 KPI 行对齐）；多账号：容器查询两列。
-          <div className={cn('grid grid-cols-1 gap-4', count > 1 && '@4xl:grid-cols-2')}>
+          <div className={cn('grid grid-cols-1 gap-4', total > 1 && '@4xl:grid-cols-2')}>
             {pageItems.map((c) => (
               <CredentialCard
                 key={c.id}
                 cred={c}
                 selectable={batch}
                 selected={selected.has(c.id)}
-                onSelectedChange={(on) =>
-                  setSelected((prev) => {
-                    const next = new Set(prev)
-                    if (on) next.add(c.id)
-                    else next.delete(c.id)
-                    return next
-                  })
-                }
+                onSelectedChange={(on) => toggleSelected(c.id, on)}
               />
             ))}
           </div>
@@ -333,7 +475,7 @@ function BatchPriorityBar({
         size="sm"
         variant="ghost"
         className="h-7 px-2 text-xs"
-        title="选择全部账号（跨页，勾选状态在翻页后保留）"
+        title="选中当前筛选结果里的全部账号（跨页，勾选状态在翻页后保留）"
         onClick={() => onSelectedChange(allSelected ? new Set() : new Set(all.map((c) => c.id)))}
       >
         {allSelected ? '取消全选' : `全选 ${all.length} 个`}
