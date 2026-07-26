@@ -215,6 +215,82 @@ impl CredentialStore {
         Ok(n)
     }
 
+    /// 批量删除：连带清掉这些账号的用量日志与设备绑定（口径同 [`Self::delete`]），
+    /// 返回实际删除的条数。单事务内完成，避免删到一半留下无主的日志/绑定。
+    pub fn delete_many(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut logs = tx.prepare("DELETE FROM usage_logs WHERE cred_id = ?1")?;
+            let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+            let mut cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
+            for id in ids {
+                logs.execute([id])?;
+                binds.execute([id])?;
+                n += cred.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 批量启停：语义与 [`Self::set_disabled`] 一致（停用时清设备绑定使其立即改选其它
+    /// 凭证；启用时清 `ban_reason`），返回实际更新的条数。单事务内完成。
+    pub fn set_disabled_many(&self, ids: &[i64], disabled: bool) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            if disabled {
+                let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+                let mut stmt = tx.prepare(
+                    "UPDATE credentials SET disabled = 1, updated_at = unixepoch() WHERE id = ?1",
+                )?;
+                for id in ids {
+                    binds.execute([id])?;
+                    n += stmt.execute([id])?;
+                }
+            } else {
+                let mut stmt = tx.prepare(
+                    "UPDATE credentials SET disabled = 0, ban_reason = NULL, \
+                     updated_at = unixepoch() WHERE id = ?1",
+                )?;
+                for id in ids {
+                    n += stmt.execute([id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 批量设置设备数上限（三态语义同 [`Self::set_device_limit`]），返回实际更新的条数。
+    pub fn set_device_limits(&self, ids: &[i64], limit: i64) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET device_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, limit])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// 设置该账号的设备数上限。三态：`> 0` 本账号独立上限；`0` 跟随全局默认
     /// （见 [`DEFAULT_DEVICE_LIMIT`]）；`< 0` 本账号明确不限（不受全局默认约束）。
     pub fn set_device_limit(&self, id: i64, limit: i64) -> Result<bool> {
@@ -1201,6 +1277,79 @@ mod tests {
         assert_eq!(by_id[&c.id], 2);
         assert_eq!(by_id[&b.id], 0, "未选中的账号不应被改动");
         assert_eq!(store.set_priorities(&[], 9).unwrap(), 0, "空列表为 no-op");
+    }
+
+    /// 批量启停 / 设备上限 / 删除：只作用于选中的 id，且各自保持单账号接口的语义。
+    #[test]
+    fn batch_ops_only_touch_selected() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore { conn: Mutex::new(conn) };
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();
+        // 给 a、b 各造一条设备绑定与用量日志，验证连带清理。
+        {
+            let conn = store.conn.lock();
+            for (did, cid) in [("d1", a.id), ("d2", b.id)] {
+                conn.execute(
+                    "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)",
+                    params![did, cid],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO usage_logs (cred_id) VALUES (?1)", [cid]).unwrap();
+            }
+        }
+
+        // 批量停用 a、b：c 不受影响；停用会清掉被选中账号的设备绑定。
+        assert_eq!(store.set_disabled_many(&[a.id, b.id], true).unwrap(), 2);
+        let by_id = |s: &CredentialStore| -> HashMap<i64, Credential> {
+            s.list().unwrap().into_iter().map(|x| (x.id, x)).collect()
+        };
+        let m = by_id(&store);
+        assert!(m[&a.id].disabled && m[&b.id].disabled);
+        assert!(!m[&c.id].disabled, "未选中的账号不应被停用");
+        {
+            let conn = store.conn.lock();
+            let n: i64 =
+                conn.query_row("SELECT COUNT(*) FROM device_bindings", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "停用应清掉这两个账号的设备绑定");
+        }
+
+        // 批量启用要清 ban_reason（模拟先被自动封禁）。
+        store.mark_banned(a.id, "banned").unwrap();
+        assert!(by_id(&store)[&a.id].ban_reason.is_some());
+        assert_eq!(store.set_disabled_many(&[a.id], false).unwrap(), 1);
+        let m = by_id(&store);
+        assert!(!m[&a.id].disabled && m[&a.id].ban_reason.is_none(), "启用应清除封禁原因");
+
+        // 批量设备上限：负值由 web 层收敛，这里验证按传入值原样落库。
+        assert_eq!(store.set_device_limits(&[a.id, c.id], 5).unwrap(), 2);
+        let m = by_id(&store);
+        assert_eq!((m[&a.id].device_limit, m[&c.id].device_limit), (5, 5));
+        assert_eq!(m[&b.id].device_limit, 0, "未选中的账号不应被改动");
+
+        // 批量删除：连带清用量日志，未选中的账号及其日志保留。
+        assert_eq!(store.delete_many(&[a.id]).unwrap(), 1);
+        let m = by_id(&store);
+        assert!(!m.contains_key(&a.id) && m.contains_key(&b.id) && m.contains_key(&c.id));
+        {
+            let conn = store.conn.lock();
+            let logs: Vec<i64> = conn
+                .prepare("SELECT cred_id FROM usage_logs")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(logs, vec![b.id], "只应清掉被删账号的用量日志");
+        }
+
+        // 空列表一律 no-op，不误伤全表。
+        assert_eq!(store.delete_many(&[]).unwrap(), 0);
+        assert_eq!(store.set_disabled_many(&[], true).unwrap(), 0);
+        assert_eq!(store.set_device_limits(&[], 9).unwrap(), 0);
+        assert_eq!(store.list().unwrap().len(), 2, "空列表操作不应改动任何账号");
     }
 
     /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。

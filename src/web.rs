@@ -65,6 +65,9 @@ pub async fn run(
         .route("/exchange", post(exchange))
         .route("/credentials", get(list_credentials))
         .route("/credentials/priority", post(set_priorities))
+        .route("/credentials/device-limit", post(set_device_limits))
+        .route("/credentials/disabled", post(set_disabled_many))
+        .route("/credentials/delete", post(delete_credentials))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_disabled))
         .route("/credentials/{id}/priority", post(set_priority))
@@ -332,11 +335,73 @@ async fn set_priorities(
     State(state): State<AppState>,
     Json(req): Json<SetPrioritiesReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    if req.ids.is_empty() {
-        return Err(bad_request("请至少选择一个账号"));
-    }
+    check_ids(&req.ids)?;
     let n = state.store.set_priorities(&req.ids, req.priority).map_err(internal)?;
     tracing::info!(count = n, priority = req.priority, "批量设置优先级");
+    list_credentials(State(state)).await
+}
+
+/// 批量操作的公共入参：待处理的账号 id 列表。
+#[derive(Deserialize)]
+struct IdsReq {
+    ids: Vec<i64>,
+}
+
+/// 校验批量入参并返回 id 列表；空列表视为客户端错误而非静默 no-op。
+fn check_ids(ids: &[i64]) -> Result<(), ApiError> {
+    if ids.is_empty() {
+        return Err(bad_request("请至少选择一个账号"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SetDeviceLimitsReq {
+    ids: Vec<i64>,
+    /// 三态同单账号接口：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    device_limit: i64,
+}
+
+/// 批量设置设备数上限，返回更新后的整份列表。
+async fn set_device_limits(
+    State(state): State<AppState>,
+    Json(req): Json<SetDeviceLimitsReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    // 负值统一收敛为 -1，与单账号接口保持一致。
+    let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
+    let n = state.store.set_device_limits(&req.ids, limit).map_err(internal)?;
+    tracing::info!(count = n, device_limit = limit, "批量设置设备上限");
+    list_credentials(State(state)).await
+}
+
+#[derive(Deserialize)]
+struct SetDisabledManyReq {
+    ids: Vec<i64>,
+    disabled: bool,
+}
+
+/// 批量启用/停用，返回更新后的整份列表。
+async fn set_disabled_many(
+    State(state): State<AppState>,
+    Json(req): Json<SetDisabledManyReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let n = state.store.set_disabled_many(&req.ids, req.disabled).map_err(internal)?;
+    tracing::info!(count = n, disabled = req.disabled, "批量启停");
+    list_credentials(State(state)).await
+}
+
+/// 批量删除（连带清历史用量与设备绑定），返回删除后的整份列表。
+///
+/// 用 POST 而非 DELETE：带请求体的 DELETE 在部分代理/客户端上会被丢掉 body。
+async fn delete_credentials(
+    State(state): State<AppState>,
+    Json(req): Json<IdsReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let n = state.store.delete_many(&req.ids).map_err(internal)?;
+    tracing::info!(count = n, "批量删除凭证");
     list_credentials(State(state)).await
 }
 

@@ -84,6 +84,30 @@ export async function setPriorities(ids: number[], priority: number): Promise<Cr
   return data
 }
 
+/** 批量设置设备数上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
+export async function setDeviceLimits(
+  ids: number[],
+  deviceLimit: number,
+): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/device-limit', {
+    ids,
+    device_limit: deviceLimit,
+  })
+  return data
+}
+
+/** 批量启用/停用。 */
+export async function setDisabledMany(ids: number[], disabled: boolean): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/disabled', { ids, disabled })
+  return data
+}
+
+/** 批量删除（连带清历史用量与设备绑定）。用 POST 是因为带 body 的 DELETE 会被部分代理丢掉。 */
+export async function deleteCredentials(ids: number[]): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/delete', { ids })
+  return data
+}
+
 /** 重命名。 */
 export async function setLabel(id: number, label: string): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/label`, { label })

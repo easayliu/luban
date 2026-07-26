@@ -37,6 +37,106 @@ export function isAbnormal(cred: Credential): boolean {
   return !!cred.ban_reason || cred.expired
 }
 
+// ---------- 排序 ----------
+//
+// 排序模型放这里，列表表头与工具栏下拉共用同一份定义，避免两处各写一套导致
+// 「表头能排的维度和下拉里的对不上」。
+
+export type SortKey =
+  | 'priority' | 'status' | 'name' | 'tier'
+  | 'usage5h' | 'devices' | 'cost' | 'recent' | 'created'
+
+export type SortDir = 'asc' | 'desc'
+
+/** 全部可排序维度（下拉菜单按此顺序渲染；表头列是其中的子集）。 */
+export const SORTS: { key: SortKey; label: string }[] = [
+  { key: 'priority', label: '优先级' },
+  { key: 'status', label: '状态' },
+  { key: 'name', label: '名称' },
+  { key: 'tier', label: '套餐' },
+  { key: 'usage5h', label: '5h 使用率' },
+  { key: 'devices', label: '设备数' },
+  { key: 'cost', label: '累计花费' },
+  { key: 'recent', label: '最近使用' },
+  { key: 'created', label: '添加时间' },
+]
+
+export const SORT_KEYS = SORTS.map((s) => s.key)
+
+/**
+ * 各维度首次选中时的默认方向——按「用户多半想先看什么」定：
+ * 优先级/名称是升序（P0 在前、A→Z），其余都是降序（最严重、用得最多、最贵、最近的排前面）。
+ * 再次点击同一维度会翻转方向，此处只决定初值。
+ */
+export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
+  priority: 'asc',
+  name: 'asc',
+  status: 'desc',
+  tier: 'desc',
+  usage5h: 'desc',
+  devices: 'desc',
+  cost: 'desc',
+  recent: 'desc',
+  created: 'desc',
+}
+
+/** 套餐档位 → 序号（越大越高档）。按容量排而非字母序，`max_20x` 才会排在 `pro` 前面。 */
+function tierRank(tier: string | null): number {
+  const t = (tier ?? '').toLowerCase()
+  if (t.includes('20x')) return 5
+  if (t.includes('5x')) return 4
+  if (t.includes('max')) return 3
+  if (t.includes('pro')) return 2
+  if (t.includes('free')) return 1
+  return 0
+}
+
+/** 状态 → 严重度（越大越需要关注）；降序即「先看有问题的」。 */
+function statusRank(c: Credential): number {
+  if (c.ban_reason) return 4
+  if (c.expired) return 3
+  if (isNearLimit(c)) return 2
+  if (c.disabled) return 1
+  return 0
+}
+
+/** 单维度的升序比较；方向由 [`sortCreds`] 统一套用，避免每个 case 都写两遍。 */
+function compareBy(key: SortKey, a: Credential, b: Credential): number {
+  switch (key) {
+    case 'status':
+      return statusRank(a) - statusRank(b)
+    case 'name':
+      return a.label.localeCompare(b.label, 'zh-CN')
+    case 'tier':
+      return tierRank(a.tier) - tierRank(b.tier)
+    case 'usage5h':
+      // 无额度数据的垫底：升序时排最前、降序时排最后，不会混在真实数值中间。
+      return (a.quota?.rl_5h_utilization ?? -1) - (b.quota?.rl_5h_utilization ?? -1)
+    case 'devices':
+      return a.device_count - b.device_count
+    case 'cost':
+      return (a.cost_total ?? 0) - (b.cost_total ?? 0)
+    case 'recent':
+      return (a.last_used ?? 0) - (b.last_used ?? 0)
+    case 'created':
+      return a.created_at - b.created_at
+    case 'priority':
+    default:
+      return a.priority - b.priority
+  }
+}
+
+/**
+ * 按维度 + 方向排序（不改原数组）。
+ *
+ * 同值时一律按 id 升序兜底，保证顺序稳定——否则相同优先级的账号会在每次
+ * 重新渲染时互相换位。
+ */
+export function sortCreds(list: Credential[], key: SortKey, dir: SortDir): Credential[] {
+  const sign = dir === 'asc' ? 1 : -1
+  return [...list].sort((a, b) => sign * compareBy(key, a, b) || a.id - b.id)
+}
+
 /**
  * 卡片视图与列表视图共用的写操作。各视图自行管理编辑态（重命名、设备上限输入框），
  * 这里只封装请求与失败提示，避免两处重复维护同一套 mutation。
