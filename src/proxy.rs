@@ -107,6 +107,9 @@ pub async fn handle(
             "客户端识别头"
         );
     }
+    // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
+    // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
+    let req_speed = request_speed(&body);
     let body = rewrite_body(&body, &cred, &device_fp, state.store.spoof_identity_enabled());
 
     // 7) 发起上游请求并流式回传。
@@ -150,6 +153,7 @@ pub async fn handle(
                 device_id,
                 status: status.as_u16(),
                 sniffer: UsageSniffer::new(is_stream),
+                req_speed,
                 ratelimit,
                 store: state.store.clone(),
             };
@@ -264,6 +268,8 @@ struct ReqLog {
     status: u16,
     /// 增量嗅探到的响应用量。
     sniffer: UsageSniffer,
+    /// 请求体里声明的速度档；仅在响应未回报 `usage.speed` 时兜底。
+    req_speed: Option<String>,
     /// 上游返回的订阅账号限流快照。
     ratelimit: RateLimitInfo,
     store: std::sync::Arc<store::CredentialStore>,
@@ -273,15 +279,18 @@ impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
         let has_usage = self.sniffer.has_usage();
-        let cost_usd = crate::pricing::estimate_usd(
-            self.sniffer.model.as_deref(),
-            self.sniffer.input_tokens,
-            self.sniffer.output_tokens,
-            self.sniffer.cache_creation_tokens,
-            self.sniffer.cache_creation_5m,
-            self.sniffer.cache_creation_1h,
-            self.sniffer.cache_read_tokens,
-        );
+        // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
+        let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
+        let cost_usd = crate::pricing::estimate_usd(crate::pricing::Usage {
+            model: self.sniffer.model.as_deref(),
+            speed: speed.as_deref(),
+            input_tokens: self.sniffer.input_tokens,
+            output_tokens: self.sniffer.output_tokens,
+            cache_creation_total: self.sniffer.cache_creation_tokens,
+            cache_5m_tokens: self.sniffer.cache_creation_5m,
+            cache_1h_tokens: self.sniffer.cache_creation_1h,
+            cache_read_tokens: self.sniffer.cache_read_tokens,
+        });
         let total_ms = self.started.elapsed().as_millis();
         let device_short: String = self
             .device_id
@@ -298,6 +307,7 @@ impl Drop for ReqLog {
             device = %device_short,
             status = self.status,
             model = %self.sniffer.model.as_deref().unwrap_or("-"),
+            speed = %speed.as_deref().unwrap_or("-"),
             has_usage,
             input_tokens = self.sniffer.input_tokens.unwrap_or(0),
             output_tokens = self.sniffer.output_tokens.unwrap_or(0),
@@ -360,6 +370,9 @@ struct UsageSniffer {
     cache_creation_5m: Option<i64>,
     cache_creation_1h: Option<i64>,
     cache_read_tokens: Option<i64>,
+    /// 上游回报的实际速度档（`usage.speed`，如 `"fast"`）。fast 有独立限流，
+    /// 被限流时会回落到标准档，故以响应为准、请求体只作兜底。
+    speed: Option<String>,
 }
 
 impl UsageSniffer {
@@ -426,6 +439,9 @@ impl UsageSniffer {
             }
             if let Some(x) = u.get("cache_read_input_tokens").and_then(|x| x.as_i64()) {
                 self.cache_read_tokens = Some(x);
+            }
+            if let Some(s) = u.get("speed").and_then(|s| s.as_str()) {
+                self.speed = Some(s.to_string());
             }
             // 缓存写细分（5m / 1h）：`usage.cache_creation.ephemeral_*_input_tokens`。
             if let Some(cc) = u.get("cache_creation") {
@@ -582,6 +598,16 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
         }
     }
     parts.join(",")
+}
+
+/// 读取请求体里声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
+/// `anthropic-beta: fast-mode-*`）。解析失败或没有该字段时返回 `None`。
+///
+/// 仅作兜底：fast 有独立于标准档的限流，被限流时上游会回落到标准速度，
+/// 只看请求会把这类流量按 fast 价（两倍）高估——以响应 `usage.speed` 为准。
+fn request_speed(body: &Bytes) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    Some(v.get("speed")?.as_str()?.to_string())
 }
 
 /// 转发前改写请求体，两件事：
@@ -862,7 +888,7 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_json_str_field;
+    use super::{Bytes, UsageSniffer, replace_json_str_field, request_speed};
 
     // 真实 CC 抓包形态：字段顺序 device_id → account_uuid → session_id。
     const CC: &str = r#"{"device_id":"dddd","account_uuid":"aaaa","session_id":"ssss"}"#;
@@ -890,5 +916,35 @@ mod tests {
     #[test]
     fn missing_field_returns_none_no_insert() {
         assert!(replace_json_str_field(CC, "not_here", "X").is_none());
+    }
+
+    /// 请求体顶层 `speed` 字段能被读出；缺字段/非法 JSON 返回 None（不阻断转发）。
+    #[test]
+    fn reads_speed_from_request_body() {
+        let with = Bytes::from(r#"{"model":"claude-opus-5","speed":"fast","messages":[]}"#);
+        assert_eq!(request_speed(&with).as_deref(), Some("fast"));
+        let without = Bytes::from(r#"{"model":"claude-opus-5","messages":[]}"#);
+        assert_eq!(request_speed(&without), None);
+        assert_eq!(request_speed(&Bytes::from("not json")), None);
+    }
+
+    /// 上游 SSE 的 `usage.speed` 会被嗅探到——这是计费的权威来源（fast 被限流会回落）。
+    #[test]
+    fn sniffs_speed_from_response_usage() {
+        let mut s = UsageSniffer::new(true);
+        s.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\
+              \"usage\":{\"input_tokens\":10,\"speed\":\"fast\"}}}\n",
+        );
+        s.finish();
+        assert_eq!(s.speed.as_deref(), Some("fast"));
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(s.input_tokens, Some(10));
+
+        // 非流式 JSON 响应同样能取到。
+        let mut s2 = UsageSniffer::new(false);
+        s2.feed(br#"{"model":"claude-opus-5","usage":{"output_tokens":5,"speed":"standard"}}"#);
+        s2.finish();
+        assert_eq!(s2.speed.as_deref(), Some("standard"));
     }
 }
