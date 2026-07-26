@@ -77,28 +77,13 @@ impl CredentialStore {
         account_uuid: Option<&str>,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
-        // 瀑布调度：新凭证默认排到末尾（现有最大 +1），使其独占一档。
-        // 配合优先级为主键的分档调度，账号被逐个榨干（前一个满/不可用才用下一个）。
-        let next_priority: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(priority), -1) + 1 FROM credentials",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // 新凭证一律落在默认档 P0：同档内按设备数负载均衡，新账号立刻参与分摊。
+        // 需要瀑布式（榨干一个再用下一个）时，手动/批量把账号调到不同优先级即可。
         conn.execute(
             "INSERT INTO credentials
-                 (label, tier, access_token, refresh_token, expires_at, priority, account_uuid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                label,
-                tier,
-                access_token,
-                refresh_token,
-                expires_at as i64,
-                next_priority,
-                account_uuid
-            ],
+                 (label, tier, access_token, refresh_token, expires_at, account_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![label, tier, access_token, refresh_token, expires_at as i64, account_uuid],
         )
         .context("插入凭证失败（refresh_token 可能已存在）")?;
         let id = conn.last_insert_rowid();
@@ -138,18 +123,31 @@ impl CredentialStore {
         })
     }
 
-    /// 删除一条，返回是否确有删除。连带清除其设备绑定。
+    /// 删除一条，返回是否确有删除。连带清除其设备绑定与历史用量日志。
+    ///
+    /// 用量日志一并清掉：账号已不存在，其历史记录既无处归属（后台按 cred_id 关联展示
+    /// 费用/额度/最近使用），留着只会在请求日志里堆积无主行、并让费用统计包含已删账号。
+    /// 三张表在同一事务内删除，避免中途失败留下半清理状态。
     pub fn delete(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
-        let n = conn.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM usage_logs WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        let n = tx.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
-    /// 清空所有凭证，返回删除条数。
+    /// 清空所有凭证，返回删除条数。连带清空设备绑定与全部用量日志（口径同
+    /// [`Self::delete`]：账号没了，历史用量不再保留）。
     pub fn clear(&self) -> Result<usize> {
         let conn = self.conn.lock();
-        Ok(conn.execute("DELETE FROM credentials", [])?)
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM usage_logs", [])?;
+        tx.execute("DELETE FROM device_bindings", [])?;
+        let n = tx.execute("DELETE FROM credentials", [])?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// 设置停用状态（管理员手动开关）。
@@ -196,12 +194,44 @@ impl CredentialStore {
         )
     }
 
-    /// 设置设备数上限（`<= 0` 表示不限）。
+    /// 批量设置优先级：把 `ids` 里的账号统一改到 `priority`，返回实际更新的条数。
+    /// 单事务内完成，避免中途失败留下一半新一半旧的调度档位。`ids` 为空时直接返回 0。
+    pub fn set_priorities(&self, ids: &[i64], priority: i64) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET priority = ?2, updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, priority])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 设置该账号的设备数上限。三态：`> 0` 本账号独立上限；`0` 跟随全局默认
+    /// （见 [`DEFAULT_DEVICE_LIMIT`]）；`< 0` 本账号明确不限（不受全局默认约束）。
     pub fn set_device_limit(&self, id: i64, limit: i64) -> Result<bool> {
         self.update_one(
             "UPDATE credentials SET device_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, limit],
         )
+    }
+
+    /// 全局默认设备数上限：`<= 0` 表示默认不限。未设置或解析失败时按 0（不限）。
+    pub fn default_device_limit(&self) -> i64 {
+        self.get_setting(DEFAULT_DEVICE_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
     }
 
     /// 单条凭证当前**有效**绑定的设备数：已排除超过 TTL 未活跃的绑定（与选路时的惰性
@@ -332,6 +362,15 @@ impl CredentialStore {
         }
     }
 
+    /// 是否要求请求携带有效设备身份（`metadata.user_id`）；未设置时默认要求（保持严格）。
+    /// 仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭。
+    pub fn require_device_id(&self) -> bool {
+        match self.get_setting(REQUIRE_DEVICE_ID).ok().flatten() {
+            Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
+            None => true,
+        }
+    }
+
     /// 删除设置项。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         let conn = self.conn.lock();
@@ -354,6 +393,27 @@ pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
 
 /// 是否启用身份伪装的 settings 键名；`"0"`/`"false"` 关闭，缺省或其它值视为开启。
 pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
+
+/// 是否要求请求携带有效设备身份的 settings 键名；`"0"`/`"false"` 关闭（放行裸请求），
+/// 缺省或其它值视为要求（无有效 `metadata.user_id` 的请求直接 403）。
+pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
+
+/// 全局默认设备数上限的 settings 键名；`<= 0` 表示默认不限。
+/// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
+pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
+
+/// 账号实际生效的设备数上限：返回 `0` 表示不限。
+///
+/// `cred_limit` 三态——`> 0` 账号独立上限（覆盖全局）；`0` 跟随全局默认 `default_limit`；
+/// `< 0` 账号明确不限（即便全局有默认值也不限）。旧库所有账号都是 0，全局默认亦为 0
+/// （不限），故行为与加入本机制前一致。
+pub fn effective_device_limit(cred_limit: i64, default_limit: i64) -> i64 {
+    match cred_limit {
+        n if n > 0 => n,
+        0 => default_limit.max(0),
+        _ => 0,
+    }
+}
 
 /// 待写入的一条用量日志（代理层组装后交给 [`CredentialStore::insert_usage_log`]）。
 #[derive(Debug, Default)]
@@ -736,6 +796,36 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 会回收复用该 id，令新账号错误继承被删账号的历史用量（usage_logs 按 cred_id 关联、
     // 删号时不清理）。此处须在上面所有 ADD COLUMN 之后执行，确保重建时列已齐全。
     migrate_credentials_autoincrement(conn)?;
+
+    // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
+    purge_orphan_rows(conn)?;
+    Ok(())
+}
+
+/// 清扫 cred_id 已指向不存在账号的行（用量日志 + 设备绑定）。
+///
+/// 旧版删号不清 `usage_logs`，被删账号的历史记录会一直留在库里：后台请求日志里显示为
+/// 无主行、费用/额度统计也仍会按 cred_id 聚合到它们。开机时做一次清扫补上这段历史欠账；
+/// 删号路径（[`CredentialStore::delete`]）已同步清理，故对新库是 no-op。
+///
+/// `cred_id IS NULL` 的日志（尚未选到凭证就失败的请求）不属于任何账号，保留。
+fn purge_orphan_rows(conn: &Connection) -> Result<()> {
+    let logs = conn
+        .execute(
+            "DELETE FROM usage_logs
+              WHERE cred_id IS NOT NULL AND cred_id NOT IN (SELECT id FROM credentials)",
+            [],
+        )
+        .context("清理无主用量日志失败")?;
+    let binds = conn
+        .execute(
+            "DELETE FROM device_bindings WHERE cred_id NOT IN (SELECT id FROM credentials)",
+            [],
+        )
+        .context("清理无主设备绑定失败")?;
+    if logs > 0 || binds > 0 {
+        tracing::info!(usage_logs = logs, device_bindings = binds, "已清理被删账号遗留的历史数据");
+    }
     Ok(())
 }
 
@@ -819,6 +909,8 @@ impl CredentialStore {
     /// `ttl_secs > 0` 时先清除超时未活跃的绑定（惰性过期）；`<= 0` 表示永不过期。
     /// 全部操作在单次持锁内完成，避免与其它写入竞态。
     pub fn select_for_device(&self, device_id: Option<&str>, ttl_secs: i64) -> Result<Credential> {
+        // 全局默认上限须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
+        let default_limit = self.default_device_limit();
         let conn = self.conn.lock();
 
         // 惰性过期：清掉超过 TTL 未活跃的绑定，释放其占用的设备名额。
@@ -878,15 +970,17 @@ impl CredentialStore {
 
         // 当前设备数（惰性过期后已排除超时项）。
         let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
+        // 生效上限：账号未单独配置（device_limit == 0）时套用全局默认。
+        let limit_of = |c: &Credential| effective_device_limit(c.device_limit, default_limit);
 
         // 3/4) 优先级分档调度：优先级为主键（数值小者优先），同一档内再按设备数
         //      负载均衡，最后 id 兜底。低优先级档仅在高优先级档全部占满/不可用后才触及。
         let chosen = if device_id.is_some() {
-            // 硬限制：仅在仍有名额者（limit<=0 不限，或 used<limit）中选；
+            // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
             // 当前优先级档全满时其成员被过滤掉，min 自然溢出到下一档；全部满则拒绝。
             match creds
                 .iter()
-                .filter(|c| c.device_limit <= 0 || used(c) < c.device_limit)
+                .filter(|c| limit_of(c) <= 0 || used(c) < limit_of(c))
                 .min_by_key(|c| (c.priority, used(c), c.id))
             {
                 Some(c) => c,
@@ -998,6 +1092,115 @@ mod tests {
         init_schema(&conn).unwrap();
         let after: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
         assert_eq!(after, 3, "二次 init_schema 不应改动数据");
+    }
+
+    /// 开机清扫：被删账号遗留的用量日志/设备绑定被清掉，在册账号与无主(NULL)日志保留。
+    #[test]
+    fn purges_history_of_deleted_credentials() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO credentials (id, access_token, refresh_token, expires_at) \
+             VALUES (1, 'a', 'ra', 0)",
+            [],
+        )
+        .unwrap();
+        // 账号 2 已被（旧版逻辑）删掉，但历史数据还在。
+        for cid in ["1", "2", "NULL"] {
+            conn.execute(&format!("INSERT INTO usage_logs (cred_id) VALUES ({cid})"), [])
+                .unwrap();
+        }
+        for (did, cid) in [("d1", 1), ("d2", 2)] {
+            conn.execute(
+                "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)",
+                params![did, cid],
+            )
+            .unwrap();
+        }
+
+        purge_orphan_rows(&conn).unwrap();
+
+        let logs: Vec<Option<i64>> = conn
+            .prepare("SELECT cred_id FROM usage_logs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(logs, vec![Some(1), None], "只应清掉已删账号(2)的日志");
+        let binds: Vec<i64> = conn
+            .prepare("SELECT cred_id FROM device_bindings")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(binds, vec![1]);
+    }
+
+    /// 删号连带清掉该账号的用量日志与设备绑定，其它账号的历史不受影响。
+    #[test]
+    fn delete_cascades_usage_logs() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore { conn: Mutex::new(conn) };
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+        {
+            let conn = store.conn.lock();
+            for cid in [a.id, b.id] {
+                conn.execute("INSERT INTO usage_logs (cred_id) VALUES (?1)", [cid]).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO device_bindings (device_id, cred_id) VALUES ('d1', ?1)",
+                [a.id],
+            )
+            .unwrap();
+        }
+
+        assert!(store.delete(a.id).unwrap());
+
+        let conn = store.conn.lock();
+        let logs: Vec<i64> = conn
+            .prepare("SELECT cred_id FROM usage_logs")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(logs, vec![b.id], "被删账号的用量日志应一并清掉");
+        let binds: i64 =
+            conn.query_row("SELECT COUNT(*) FROM device_bindings", [], |r| r.get(0)).unwrap();
+        assert_eq!(binds, 0);
+    }
+
+    /// 设备上限三态：账号独立值覆盖全局，0 跟随全局，负值明确不限。
+    #[test]
+    fn effective_device_limit_tri_state() {
+        assert_eq!(effective_device_limit(3, 5), 3, "账号独立上限覆盖全局");
+        assert_eq!(effective_device_limit(0, 5), 5, "未配置则跟随全局默认");
+        assert_eq!(effective_device_limit(0, 0), 0, "全局也不限时不限");
+        assert_eq!(effective_device_limit(-1, 5), 0, "账号明确不限，忽略全局默认");
+    }
+
+    /// 新增账号一律落在 P0；批量改优先级把选中的账号统一调档、其余不动。
+    #[test]
+    fn insert_defaults_to_p0_and_batch_priority() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore { conn: Mutex::new(conn) };
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();
+        assert_eq!((a.priority, b.priority, c.priority), (0, 0, 0), "新账号都应是 P0");
+
+        assert_eq!(store.set_priorities(&[a.id, c.id], 2).unwrap(), 2);
+        let by_id: HashMap<i64, i64> =
+            store.list().unwrap().into_iter().map(|x| (x.id, x.priority)).collect();
+        assert_eq!(by_id[&a.id], 2);
+        assert_eq!(by_id[&c.id], 2);
+        assert_eq!(by_id[&b.id], 0, "未选中的账号不应被改动");
+        assert_eq!(store.set_priorities(&[], 9).unwrap(), 0, "空列表为 no-op");
     }
 
     /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。

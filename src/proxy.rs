@@ -37,11 +37,15 @@ pub async fn handle(
     // 2) 提取 device_id（在请求体 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(&body);
 
-    // 2.1) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 直接拒绝。
-    //      这类请求既无法做身份伪装、也无从计入设备上限（会绕过 device_limit），一律挡在门外。
+    // 2.1) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 默认直接拒绝：
+    //      这类请求既无法做身份伪装、也无从计入设备上限（会绕过 device_limit）。
+    //      网页可关掉该校验（放行裸客户端），此时它们退化为不绑定、不占名额的负载均衡挑选。
     if device_id.is_none() {
-        tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
-        return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）").into_response();
+        if state.store.require_device_id() {
+            tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
+            return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）").into_response();
+        }
+        tracing::debug!(%method, path = %path_and_query, "放行无设备身份的请求（设备身份校验已关闭）");
     }
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。

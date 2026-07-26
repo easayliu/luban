@@ -9,6 +9,10 @@ export interface Settings {
   device_binding_ttl_secs: number
   /** 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。 */
   spoof_identity_enabled: boolean
+  /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
+  default_device_limit: number
+  /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
+  require_device_id: boolean
 }
 
 /** 读取接入设置。 */
@@ -28,6 +32,20 @@ export async function setDeviceTtl(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/device-ttl', {
     device_binding_ttl_secs: secs,
   })
+  return data
+}
+
+/** 设置全局默认设备数上限（0 表示默认不限）。 */
+export async function setDefaultDeviceLimit(limit: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/default-device-limit', {
+    default_device_limit: limit,
+  })
+  return data
+}
+
+/** 开关设备身份校验（关闭后放行无 metadata.user_id 的请求）。 */
+export async function setRequireDeviceId(required: boolean): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/require-device-id', { required })
   return data
 }
 

@@ -26,8 +26,10 @@ export interface Credential {
   expired: boolean
   created_at: number
   updated_at: number
-  /** 允许绑定的设备数上限；0 表示不限。 */
+  /** 账号自身的设备上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。 */
   device_limit: number
+  /** 实际生效的设备上限（已套用全局默认）；0 表示不限。 */
+  device_limit_effective: number
   /** 当前已绑定的设备数。 */
   device_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
@@ -76,13 +78,19 @@ export async function setPriority(id: number, priority: number): Promise<Credent
   return data
 }
 
+/** 批量把多个账号统一设为同一优先级，返回更新后的整份列表。 */
+export async function setPriorities(ids: number[], priority: number): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/priority', { ids, priority })
+  return data
+}
+
 /** 重命名。 */
 export async function setLabel(id: number, label: string): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/label`, { label })
   return data
 }
 
-/** 设置设备数上限（0 表示不限）。 */
+/** 设置设备数上限：>0 独立上限；0 跟随全局默认；-1 明确不限。 */
 export async function setDeviceLimit(id: number, deviceLimit: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/device-limit`, {
     device_limit: deviceLimit,

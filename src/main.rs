@@ -110,7 +110,7 @@ fn status(store: &CredentialStore) -> Result<()> {
 fn logout(store: &CredentialStore) -> Result<()> {
     let n = store.clear()?;
     if n > 0 {
-        println!("已清空 {} 个凭证。", n);
+        println!("已清空 {} 个凭证（含其设备绑定与历史用量日志）。", n);
     } else {
         println!("当前没有凭证，无需操作。");
     }

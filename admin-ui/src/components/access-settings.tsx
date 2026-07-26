@@ -5,17 +5,27 @@ import {
   ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, LockClosedIcon, KeyIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
-import { getSettings, setApiKey, setDeviceTtl, setSpoofIdentity, type Settings } from '@/api/settings'
+import {
+  getSettings, setApiKey, setDefaultDeviceLimit, setDeviceTtl, setRequireDeviceId,
+  setSpoofIdentity, type Settings,
+} from '@/api/settings'
 import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
 import { setPw, clearPw } from '@/api/client'
 import { cn, copyText, extractError, formatDuration } from '@/lib/utils'
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import {
+  Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle, DialogDescription,
+} from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 
-export function AccessSettings() {
+export function AccessSettings({
+  open, onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
 
@@ -49,89 +59,101 @@ export function AccessSettings() {
     (currentKey ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}` : '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN')
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Cog6ToothIcon className="size-4" />
-          接入设置
-          {envManaged && (
-            <Badge variant="outline" className="gap-1"><LockClosedIcon className="size-3" />环境接管</Badge>
-          )}
-        </CardTitle>
-        <CardDescription>Claude Code 用下面的地址与 Key 接入 luban。</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {/* 接入地址 */}
-        <Field label="接入地址（ANTHROPIC_BASE_URL）">
-          <div className="flex items-center gap-2">
-            <Input readOnly value={baseUrl} className="font-mono" />
-            <CopyBtn text={baseUrl} />
-          </div>
-        </Field>
-
-        {/* API Key */}
-        <Field label="接入 Key（ANTHROPIC_AUTH_TOKEN）">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <Input
-                type={show ? 'text' : 'password'}
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                readOnly={envManaged}
-                placeholder={envManaged ? '' : '留空则不校验来访（仅本机）'}
-                className="font-mono"
-              />
-              <Button size="icon" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => setShow((s) => !s)}>
-                {show ? <EyeSlashIcon /> : <EyeIcon />}
-              </Button>
-              <CopyBtn text={draft} />
-            </div>
-            {!envManaged && (
-              <div className="flex items-center gap-2">
-                <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
-                <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
-                  {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
-                </Button>
-                {currentKey && (
-                  <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
-                    onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
-                    <TrashIcon />清空
-                  </Button>
-                )}
-              </div>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>
+            <Cog6ToothIcon className="size-4" />
+            接入设置
+            {envManaged && (
+              <Badge variant="outline" className="gap-1"><LockClosedIcon className="size-3" />环境接管</Badge>
             )}
+          </DialogTitle>
+          <DialogDescription>Claude Code 用下面的地址与 Key 接入 luban。</DialogDescription>
+        </DialogHeader>
+        <DialogBody className="space-y-4">
+          {/* 接入地址 */}
+          <Field label="接入地址（ANTHROPIC_BASE_URL）">
+            <div className="flex items-center gap-2">
+              <Input readOnly value={baseUrl} className="font-mono" />
+              <CopyBtn text={baseUrl} />
+            </div>
+          </Field>
+
+          {/* API Key */}
+          <Field label="接入 Key（ANTHROPIC_AUTH_TOKEN）">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <Input
+                  type={show ? 'text' : 'password'}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  readOnly={envManaged}
+                  placeholder={envManaged ? '' : '留空则不校验来访（仅本机）'}
+                  className="font-mono"
+                />
+                <Button size="icon" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => setShow((s) => !s)}>
+                  {show ? <EyeSlashIcon /> : <EyeIcon />}
+                </Button>
+                <CopyBtn text={draft} />
+              </div>
+              {!envManaged && (
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
+                  <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
+                    {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+                  </Button>
+                  {currentKey && (
+                    <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
+                      onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
+                      <TrashIcon />清空
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+            {envManaged && (
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
+              </p>
+            )}
+          </Field>
+
+          {/* 一键接入片段 */}
+          <Field label="Claude Code 接入片段">
+            <div className="relative">
+              <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 pr-11 font-mono text-2xs leading-5">{snippet}</pre>
+              <div className="absolute right-2 top-2"><CopyBtn text={snippet} /></div>
+            </div>
+          </Field>
+
+          {/* 设备绑定有效期 */}
+          <div className="border-t border-border pt-4">
+            <DeviceBindingTtl />
           </div>
-          {envManaged && (
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
-            </p>
-          )}
-        </Field>
 
-        {/* 一键接入片段 */}
-        <Field label="Claude Code 接入片段">
-          <div className="relative">
-            <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 pr-11 font-mono text-2xs leading-5">{snippet}</pre>
-            <div className="absolute right-2 top-2"><CopyBtn text={snippet} /></div>
+          {/* 全局默认设备上限 */}
+          <div className="border-t border-border pt-4">
+            <DefaultDeviceLimit />
           </div>
-        </Field>
 
-        {/* 设备绑定有效期 */}
-        <div className="border-t border-border pt-4">
-          <DeviceBindingTtl />
-        </div>
+          {/* 设备身份校验 */}
+          <div className="border-t border-border pt-4">
+            <RequireDeviceIdToggle />
+          </div>
 
-        {/* 身份伪装 */}
-        <div className="border-t border-border pt-4">
-          <SpoofIdentityToggle />
-        </div>
+          {/* 身份伪装 */}
+          <div className="border-t border-border pt-4">
+            <SpoofIdentityToggle />
+          </div>
 
-        {/* 管理密码 */}
-        <div className="border-t border-border pt-4">
-          <AdminPassword />
-        </div>
-      </CardContent>
-    </Card>
+          {/* 管理密码 */}
+          <div className="border-t border-border pt-4">
+            <AdminPassword />
+          </div>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -175,6 +197,95 @@ function DeviceBindingTtl() {
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
         设备超过该时长无请求，绑定自动释放、腾出凭证设备名额；期间同一设备始终命中同一凭证。0 表示永不过期。
+      </p>
+    </Field>
+  )
+}
+
+/** 全局默认设备上限：账号未单独配置（卡片上显示「默认」）时套用，免去逐个账号设置。 */
+function DefaultDeviceLimit() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+  useEffect(() => {
+    if (data) setDraft(String(data.default_device_limit))
+  }, [data?.default_device_limit])
+
+  const save = useMutation({
+    mutationFn: (n: number) => setDefaultDeviceLimit(n),
+    onSuccess: (s: Settings) => {
+      toast.success(s.default_device_limit > 0
+        ? `默认设备上限已设为 ${s.default_device_limit}`
+        : '默认设备上限已取消（默认不限）')
+      qc.invalidateQueries({ queryKey: ['settings'] })
+      // 生效上限随之变化，账号卡片上的「设备 x/y」需要重取。
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+  })
+
+  const current = data?.default_device_limit ?? 0
+  const parsed = Math.max(0, Math.floor(Number(draft) || 0))
+
+  return (
+    <Field label="默认设备上限（每个账号）">
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type="number"
+          min={0}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="w-40 font-mono"
+        />
+        <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
+          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          {parsed > 0 ? `每个账号最多 ${parsed} 台设备` : '不限（不设默认上限）'}
+        </span>
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        新增/未单独配置的账号一律套用这个上限，无需逐个设置；卡片上标着「默认」的即跟随此值。
+        某个账号需要例外时，在其卡片上单独设置即可覆盖（填 0 表示该账号不限）。
+      </p>
+    </Field>
+  )
+}
+
+/** 设备身份校验开关：关掉后放行无 metadata.user_id 的裸请求（它们不占设备名额、不受上限约束）。 */
+function RequireDeviceIdToggle() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const required = data?.require_device_id ?? true
+
+  const save = useMutation({
+    mutationFn: (next: boolean) => setRequireDeviceId(next),
+    onSuccess: (s: Settings) => {
+      toast.success(s.require_device_id ? '已开启设备身份校验' : '已关闭，无设备身份的请求将被放行')
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+  })
+
+  return (
+    <Field label="设备身份校验">
+      <div className="flex items-center gap-3">
+        <Switch
+          variant="success"
+          checked={required}
+          disabled={save.isPending}
+          onCheckedChange={(next) => save.mutate(next)}
+        />
+        <span className="text-sm">{required ? '已开启（拒绝无设备身份的请求）' : '已关闭（放行）'}</span>
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        开启后，请求体里没有可识别 <code className="font-mono">metadata.user_id</code> 的一律返回 403。
+        这类「裸请求」无从计入设备数，也无法做身份伪装。
+        {!required && (
+          <span className="text-warn">
+            {' '}当前已关闭：这类请求会被转发，但不绑定账号、不占设备名额，因而绕过设备上限。
+          </span>
+        )}
       </p>
     </Field>
   )

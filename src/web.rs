@@ -64,6 +64,7 @@ pub async fn run(
         .route("/authorize", get(authorize))
         .route("/exchange", post(exchange))
         .route("/credentials", get(list_credentials))
+        .route("/credentials/priority", post(set_priorities))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_disabled))
         .route("/credentials/{id}/priority", post(set_priority))
@@ -74,6 +75,8 @@ pub async fn run(
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
+        .route("/settings/default-device-limit", post(set_default_device_limit))
+        .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/spoof-identity", post(set_spoof_identity))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
@@ -223,7 +226,7 @@ async fn exchange(
     *state.pkce.lock().unwrap() = None;
 
     tracing::info!(id = cred.id, label = %cred.label, tier = ?cred.tier, "新增凭证");
-    Ok(Json(CredentialView::new(&cred, 0)))
+    Ok(Json(CredentialView::new(&cred, 0, state.store.default_device_limit())))
 }
 
 // ---------- 用量日志 ----------
@@ -254,14 +257,16 @@ async fn list_credentials(State(state): State<AppState>) -> Result<Json<Vec<Cred
     let quotas = state.store.latest_quotas().map_err(internal)?;
     let last_used = state.store.last_used().map_err(internal)?;
     let costs = state.store.cost_by_cred().map_err(internal)?;
+    let default_limit = state.store.default_device_limit();
     let views = list
         .iter()
         .map(|c| {
-            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0)).with_stats(
-                quotas.get(&c.id).cloned(),
-                last_used.get(&c.id).copied(),
-                costs.get(&c.id).copied().unwrap_or(0.0),
-            )
+            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), default_limit)
+                .with_stats(
+                    quotas.get(&c.id).cloned(),
+                    last_used.get(&c.id).copied(),
+                    costs.get(&c.id).copied().unwrap_or(0.0),
+                )
         })
         .collect();
     Ok(Json(views))
@@ -315,6 +320,27 @@ async fn set_priority(
 }
 
 #[derive(Deserialize)]
+struct SetPrioritiesReq {
+    /// 待调整的账号 id 列表。
+    ids: Vec<i64>,
+    /// 统一设置的优先级（数值小者优先）。
+    priority: i64,
+}
+
+/// 批量设置优先级：把选中的账号统一调到同一档，返回更新后的整份列表。
+async fn set_priorities(
+    State(state): State<AppState>,
+    Json(req): Json<SetPrioritiesReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(bad_request("请至少选择一个账号"));
+    }
+    let n = state.store.set_priorities(&req.ids, req.priority).map_err(internal)?;
+    tracing::info!(count = n, priority = req.priority, "批量设置优先级");
+    list_credentials(State(state)).await
+}
+
+#[derive(Deserialize)]
 struct SetLabelReq {
     label: String,
 }
@@ -337,7 +363,7 @@ async fn set_label(
 
 #[derive(Deserialize)]
 struct SetDeviceLimitReq {
-    /// 设备数上限；0（或负数）表示不限。
+    /// 设备数上限三态：`> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
     device_limit: i64,
 }
 
@@ -347,7 +373,8 @@ async fn set_device_limit(
     Path(id): Path<i64>,
     Json(req): Json<SetDeviceLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    let limit = req.device_limit.max(0);
+    // 负值统一收敛为 -1，避免库里出现各式各样的“不限”取值。
+    let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
     if !state.store.set_device_limit(id, limit).map_err(internal)? {
         return Err(not_found());
     }
@@ -386,7 +413,11 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let quota = state.store.latest_quotas().map_err(internal)?.remove(&id);
     let last_used = state.store.last_used().map_err(internal)?.remove(&id);
     let cost_total = state.store.cost_by_cred().map_err(internal)?.remove(&id).unwrap_or(0.0);
-    Ok(Json(CredentialView::new(&cred, count).with_stats(quota, last_used, cost_total)))
+    let default_limit = state.store.default_device_limit();
+    Ok(Json(
+        CredentialView::new(&cred, count, default_limit)
+            .with_stats(quota, last_used, cost_total),
+    ))
 }
 
 // ---------- 接入设置 ----------
@@ -401,17 +432,25 @@ struct SettingsResp {
     device_binding_ttl_secs: i64,
     /// 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。
     spoof_identity_enabled: bool,
+    /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
+    default_device_limit: i64,
+    /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
+    require_device_id: bool,
 }
 
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let spoof_identity_enabled = state.store.spoof_identity_enabled();
+    let default_device_limit = state.store.default_device_limit();
+    let require_device_id = state.store.require_device_id();
     if let Some(k) = &state.client_key {
         return SettingsResp {
             api_key: Some(k.to_string()),
             env_managed: true,
             device_binding_ttl_secs,
             spoof_identity_enabled,
+            default_device_limit,
+            require_device_id,
         };
     }
     let api_key = state
@@ -420,7 +459,14 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    SettingsResp { api_key, env_managed: false, device_binding_ttl_secs, spoof_identity_enabled }
+    SettingsResp {
+        api_key,
+        env_managed: false,
+        device_binding_ttl_secs,
+        spoof_identity_enabled,
+        default_device_limit,
+        require_device_id,
+    }
 }
 
 /// 读取接入设置。
@@ -471,6 +517,46 @@ async fn set_device_ttl(
 }
 
 #[derive(Deserialize)]
+struct SetDefaultDeviceLimitReq {
+    /// 全局默认设备数上限；0（或负数）表示默认不限。
+    default_device_limit: i64,
+}
+
+/// 设置全局默认设备数上限（账号自身未单独配置时生效）。
+async fn set_default_device_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetDefaultDeviceLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.default_device_limit.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEFAULT_DEVICE_LIMIT, &limit.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetRequireDeviceIdReq {
+    /// 是否要求请求携带有效设备身份。
+    required: bool,
+}
+
+/// 开关设备身份校验：关闭后，无 `metadata.user_id` 的请求不再 403，而是以
+/// 「不绑定、不占设备名额」的方式转发（也无法被身份伪装）。
+async fn set_require_device_id(
+    State(state): State<AppState>,
+    Json(req): Json<SetRequireDeviceIdReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let value = if req.required { "true" } else { "false" };
+    state
+        .store
+        .set_setting(crate::store::REQUIRE_DEVICE_ID, value)
+        .map_err(internal)?;
+    tracing::info!(required = req.required, "设备身份校验开关变更");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
 struct SetSpoofIdentityReq {
     /// 是否启用身份伪装。
     enabled: bool,
@@ -503,8 +589,10 @@ struct CredentialView {
     expired: bool,
     created_at: u64,
     updated_at: u64,
-    /// 允许绑定的设备数上限；0 表示不限。
+    /// 账号自身的设备上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
     device_limit: i64,
+    /// 实际生效的设备上限（已套用全局默认）；0 表示不限。
+    device_limit_effective: i64,
     /// 当前已绑定的设备数。
     device_count: i64,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用。
@@ -520,8 +608,8 @@ struct CredentialView {
 }
 
 impl CredentialView {
-    /// 由凭证 + 已绑定设备数构造视图。
-    fn new(c: &Credential, device_count: i64) -> Self {
+    /// 由凭证 + 已绑定设备数 + 全局默认设备上限构造视图。
+    fn new(c: &Credential, device_count: i64, default_device_limit: i64) -> Self {
         let secs = c.expires_in_secs();
         Self {
             id: c.id,
@@ -534,6 +622,10 @@ impl CredentialView {
             created_at: c.created_at,
             updated_at: c.updated_at,
             device_limit: c.device_limit,
+            device_limit_effective: store::effective_device_limit(
+                c.device_limit,
+                default_device_limit,
+            ),
             device_count,
             ban_reason: c.ban_reason.clone(),
             token_hint: mask_token(&c.refresh_token),

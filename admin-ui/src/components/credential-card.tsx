@@ -20,13 +20,35 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 
-export function CredentialCard({ cred }: { cred: Credential }) {
+/** 设备上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
+function limitToInput(deviceLimit: number): string {
+  if (deviceLimit === 0) return ''
+  return deviceLimit < 0 ? '0' : String(deviceLimit)
+}
+
+/** 输入框内容 → 后端三态值：空=跟随全局默认(0)；0/负=该账号不限(-1)；正数=独立上限。 */
+function inputToLimit(v: string): number {
+  const t = v.trim()
+  if (t === '') return 0
+  const n = Math.floor(Number(t))
+  return Number.isFinite(n) && n > 0 ? n : -1
+}
+
+export function CredentialCard({
+  cred, selectable = false, selected = false, onSelectedChange,
+}: {
+  cred: Credential
+  /** 批量模式：卡片显示勾选框。 */
+  selectable?: boolean
+  selected?: boolean
+  onSelectedChange?: (next: boolean) => void
+}) {
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['credentials'] })
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
   const [editingLimit, setEditingLimit] = useState(false)
-  const [limitVal, setLimitVal] = useState(String(cred.device_limit))
+  const [limitVal, setLimitVal] = useState(limitToInput(cred.device_limit))
 
   const rename = useMutation({
     mutationFn: (label: string) => setLabel(cred.id, label),
@@ -88,6 +110,15 @@ export function CredentialCard({ cred }: { cred: Credential }) {
     >
       {/* 头部：头像 + 名称/徽章 + 开关/菜单 */}
       <div className="flex items-start gap-3.5">
+        {selectable && (
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={(e) => onSelectedChange?.(e.target.checked)}
+            className="mt-3 size-4 shrink-0 accent-primary"
+            aria-label={`选择 ${cred.label}`}
+          />
+        )}
         <div className="relative shrink-0">
           <div
             className={cn(
@@ -251,7 +282,10 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 className="text-bad focus:bg-bad-soft"
-                onClick={() => { if (confirm(`确定删除「${cred.label}」？`)) remove.mutate() }}
+                onClick={() => {
+                  // 删号会连带清掉该账号的用量日志与设备绑定，明确告知不可恢复。
+                  if (confirm(`确定删除「${cred.label}」？其历史用量记录与设备绑定将一并清除，不可恢复。`)) remove.mutate()
+                }}
               >
                 <TrashIcon />
                 删除
@@ -304,14 +338,12 @@ export function CredentialCard({ cred }: { cred: Credential }) {
           <span className="tnum">{formatUsd(cred.cost_total)}</span>
         </span>
 
-        {/* 设备：非编辑态作为统计项，点击展开为上限输入框（0 表示不限）。 */}
+        {/* 设备：非编辑态作为统计项，点击展开为上限输入框。
+            上限三态——留空跟随全局默认（显示「默认」角标）、0 表示该账号不限、正数为独立上限。 */}
         {editingLimit ? (
           <form
             className="ml-auto inline-flex items-center gap-1.5"
-            onSubmit={(e) => {
-              e.preventDefault()
-              limit.mutate(Math.max(0, Math.floor(Number(limitVal) || 0)))
-            }}
+            onSubmit={(e) => { e.preventDefault(); limit.mutate(inputToLimit(limitVal)) }}
           >
             <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
             <Input
@@ -320,27 +352,38 @@ export function CredentialCard({ cred }: { cred: Credential }) {
               value={limitVal}
               onChange={(e) => setLimitVal(e.target.value)}
               autoFocus
+              placeholder="默认"
               className="h-6 w-14 px-1.5 text-2xs"
-              title="设备数上限；0 表示不限"
+              title="留空 = 跟随全局默认上限；0 = 该账号不限；正数 = 该账号独立上限"
             />
             <Button type="submit" size="icon" variant="ghost" className="size-6" disabled={limit.isPending}>
               {limit.isPending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
             </Button>
             <Button type="button" size="icon" variant="ghost" className="size-6"
-              onClick={() => { setEditingLimit(false); setLimitVal(String(cred.device_limit)) }}>
+              onClick={() => { setEditingLimit(false); setLimitVal(limitToInput(cred.device_limit)) }}>
               <XMarkIcon className="size-3" />
             </Button>
           </form>
         ) : (
           <button
-            onClick={() => { setLimitVal(String(cred.device_limit)); setEditingLimit(true) }}
+            onClick={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
             className="group/limit ml-auto inline-flex items-center gap-1 transition-colors hover:text-foreground"
-            title="点击设置设备数上限（0 表示不限）"
+            title={
+              cred.device_limit === 0
+                ? '跟随全局默认上限（在接入设置里改）；点击可为该账号单独设置'
+                : '点击调整该账号的设备数上限（留空可改回跟随默认）'
+            }
           >
             <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
             <span className="tnum">
-              设备 {cred.device_count}/{cred.device_limit > 0 ? cred.device_limit : '∞'}
+              设备 {cred.device_count}/
+              {cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'}
             </span>
+            {cred.device_limit === 0 && (
+              <span className="rounded bg-muted px-1 text-[0.625rem] leading-4 text-muted-foreground">
+                默认
+              </span>
+            )}
             <PencilIcon className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover/limit:opacity-100" />
           </button>
         )}
