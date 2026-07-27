@@ -104,6 +104,7 @@ pub async fn run(
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/devices", get(list_credential_devices))
+        .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/usage", get(list_usage))
         .route("/settings", get(get_settings))
@@ -318,6 +319,27 @@ async fn list_credential_devices(
         return Err(not_found());
     }
     Ok(Json(state.store.list_devices(id).map_err(internal)?))
+}
+
+/// 手动解除某设备与该凭证的绑定，立即腾出一个设备名额。
+///
+/// 「解绑」不等于「拉黑」：该设备的下一次请求会重新走选号，名额没满时完全可能又落回同一个
+/// 账号。要把设备挡在外面得靠设备上限，不是这个接口。
+///
+/// 绑定不存在同样给 404（而非静默 ok）：明细是前端缓存的，设备可能已被 TTL 回收或已换到别的
+/// 账号，静默成功会让人以为解绑生效、实际点了个空。
+async fn unbind_credential_device(
+    State(state): State<AppState>,
+    Path((id, device_id)): Path<(i64, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    if !state.store.unbind_device(id, &device_id).map_err(internal)? {
+        return Err((StatusCode::NOT_FOUND, "设备绑定不存在（可能已过期或已换到其它账号）".into()));
+    }
+    tracing::info!(cred_id = id, device_id = %device_id, "手动解除设备绑定");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 删除一条凭证。

@@ -53,6 +53,15 @@ export interface DeviceBinding {
   created_at: number
   /** 最近一次活跃时间（Unix 秒）。 */
   last_seen_at: number
+  /**
+   * 该设备经**本账号**花掉的等价 API 费用（USD 合计）。
+   *
+   * 与 request_count 不同源：请求数随绑定行走（解绑/停用后从零重数），费用来自用量日志、
+   * 一直累计，所以它覆盖的时间范围可能比请求数更长。
+   */
+  cost_usd: number
+  /** 该设备在**所有账号**上的累计费用（USD）；用于识别换号后仍在烧钱的同一台设备。 */
+  cost_usd_all: number
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */
@@ -77,6 +86,16 @@ export async function listCredentials(): Promise<Credential[]> {
 export async function listCredentialDevices(id: number): Promise<DeviceBinding[]> {
   const { data } = await api.get<DeviceBinding[]>(`/credentials/${id}/devices`)
   return data
+}
+
+/**
+ * 解除某设备与该账号的绑定，立即腾出一个设备名额。
+ *
+ * 解绑不是拉黑：该设备下次请求会重新选号，名额没满时可能又落回同一个账号。
+ * device_id 来自客户端，编码后再拼进路径。
+ */
+export async function unbindCredentialDevice(id: number, deviceId: string): Promise<void> {
+  await api.delete(`/credentials/${id}/devices/${encodeURIComponent(deviceId)}`)
 }
 
 /** 删除一条凭证。 */

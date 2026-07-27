@@ -1,11 +1,12 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import {
   ArrowPathIcon, PencilIcon, CheckIcon, XMarkIcon, EllipsisHorizontalIcon,
   DevicePhoneMobileIcon, ExclamationTriangleIcon, ChevronDownIcon,
   CalendarDaysIcon, ClockIcon, WalletIcon,
 } from '@heroicons/react/24/outline'
-import { listCredentialDevices, type Credential } from '@/api/credentials'
+import { listCredentialDevices, unbindCredentialDevice, type Credential } from '@/api/credentials'
 import { cn, extractError, formatDuration, formatUsd, relativeTime } from '@/lib/utils'
 import {
   CredentialMenuContent, expiryMeta, inputToLimit, isAbnormal, isNearLimit, limitToInput,
@@ -324,9 +325,21 @@ export function CredentialCard({
  * 超时未活跃的绑定既不占名额也不在这里出现。
  */
 function DeviceList({ credId }: { credId: number }) {
+  const qc = useQueryClient()
   const { data, isPending, error } = useQuery({
     queryKey: ['credential-devices', credId],
     queryFn: () => listCredentialDevices(credId),
+  })
+
+  // 手动解绑：连带刷新账号列表，卡片上的「设备 x/y」要立刻跟着掉一台。
+  const unbind = useMutation({
+    mutationFn: (deviceId: string) => unbindCredentialDevice(credId, deviceId),
+    onSuccess: () => {
+      toast.success('已解绑')
+      qc.invalidateQueries({ queryKey: ['credential-devices', credId] })
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (e) => toast.error('解绑失败', { description: extractError(e) }),
   })
 
   return (
@@ -353,12 +366,44 @@ function DeviceList({ credId }: { credId: number }) {
               >
                 {d.request_count} 次
               </span>
+              {/* 本账号花费。跨账号合计放 title：换过号的设备两个数会不一样，
+                  行里塞两个金额只会看花眼。 */}
+              <span
+                className={cn(
+                  'w-14 shrink-0 text-right tnum',
+                  d.cost_usd > 0 ? 'text-foreground/80' : 'text-muted-foreground',
+                )}
+                title={
+                  `该设备在本账号的累计花费 ${formatUsd(d.cost_usd)}` +
+                  (d.cost_usd_all > d.cost_usd
+                    ? `；含其它账号共 ${formatUsd(d.cost_usd_all)}（该设备曾绑到别的账号）`
+                    : '') +
+                  '。按用量日志统计，解绑重绑不会清零，故可能早于本次绑定'
+                }
+              >
+                {formatUsd(d.cost_usd)}
+              </span>
               <span
                 className="w-14 shrink-0 text-right tnum text-muted-foreground"
                 title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
               >
                 {relativeTime(d.last_seen_at)}
               </span>
+              {/* 解绑：只是放掉这台设备占的名额，它下次请求会重新选号（名额没满时可能又回来），
+                  所以不做二次确认；误点的代价仅是丢一次粘性。 */}
+              <button
+                onClick={() => unbind.mutate(d.device_id)}
+                disabled={unbind.isPending}
+                className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-all hover:bg-bad-soft hover:text-bad focus-visible:opacity-100 disabled:opacity-40 group-hover/card:opacity-100"
+                title="解除该设备的绑定（腾出一个设备名额；该设备下次请求会重新选号）"
+                aria-label={`解绑设备 ${d.device_id}`}
+              >
+                {unbind.isPending && unbind.variables === d.device_id ? (
+                  <ArrowPathIcon className="size-3 animate-spin" />
+                ) : (
+                  <XMarkIcon className="size-3" />
+                )}
+              </button>
             </li>
           ))}
         </ul>

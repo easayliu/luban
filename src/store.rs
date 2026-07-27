@@ -348,17 +348,27 @@ impl CredentialStore {
         Ok(n)
     }
 
-    /// 单条凭证当前**有效**绑定的设备明细，按最近活跃倒序。
+    /// 单条凭证当前**有效**绑定的设备明细（含费用），按最近活跃倒序。
     ///
     /// 过滤口径与 [`Self::device_count`] 完全一致（同一个 TTL），否则后台会出现「设备数写着
     /// 2、展开却列出 5 条」这种自相矛盾的展示。
+    ///
+    /// 费用来自 `usage_logs`（按 device_id 汇总），与绑定表是两套账，刻意不合并：
+    /// 绑定行会被解绑/停用/TTL 清掉并从零重新计数，用量日志则一直留着。所以「本账号费用」
+    /// 覆盖的时间范围可能比 `request_count` 长——它统计的是这台设备历史上经本账号花掉的钱，
+    /// 而不是「本次绑定期间」。同时给出跨账号合计，便于识别换号仍在持续烧钱的同一台设备。
     pub fn list_devices(&self, cred_id: i64) -> Result<Vec<DeviceBinding>> {
         let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
-        let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
+        let ttl_clause = if ttl > 0 { "AND b.last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
-            "SELECT device_id, request_count, created_at, last_seen_at FROM device_bindings \
-             WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, device_id ASC"
+            "SELECT b.device_id, b.request_count, b.created_at, b.last_seen_at, \
+                    COALESCE((SELECT SUM(u.cost_usd) FROM usage_logs u \
+                               WHERE u.cred_id = b.cred_id AND u.device_id = b.device_id), 0), \
+                    COALESCE((SELECT SUM(u.cost_usd) FROM usage_logs u \
+                               WHERE u.device_id = b.device_id), 0) \
+               FROM device_bindings b \
+              WHERE b.cred_id = ?1 {ttl_clause} ORDER BY b.last_seen_at DESC, b.device_id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &Row| {
@@ -367,6 +377,8 @@ impl CredentialStore {
                 request_count: r.get(1)?,
                 created_at: r.get(2)?,
                 last_seen_at: r.get(3)?,
+                cost_usd: r.get(4)?,
+                cost_usd_all: r.get(5)?,
             })
         };
         let rows: Vec<DeviceBinding> = if ttl > 0 {
@@ -375,6 +387,22 @@ impl CredentialStore {
             stmt.query_map([cred_id], map_row)?.collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
+    }
+
+    /// 手动解除一条设备绑定，返回是否确有删除。
+    ///
+    /// 按 `(cred_id, device_id)` 双条件删除，而不是只按 `device_id`：后台拿到的设备列表可能
+    /// 已经过期（设备刚被换到别的号上），只按 device_id 删会把它从**当前**所在账号上摘掉。
+    ///
+    /// 不受绑定 TTL 影响：TTL 外的残行本就不占名额，顺手删掉也无害；而明细按 TTL 过滤，
+    /// 后台能点到的必然是有效绑定。
+    pub fn unbind_device(&self, cred_id: i64, device_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM device_bindings WHERE cred_id = ?1 AND device_id = ?2",
+            params![cred_id, device_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// 所有凭证当前**有效**绑定的设备数（cred_id → count）；口径同 [`Self::device_count`]，
@@ -630,6 +658,13 @@ pub struct DeviceBinding {
     pub created_at: i64,
     /// 最近一次活跃时间（Unix 秒）；TTL 就是按它算的。
     pub last_seen_at: i64,
+    /// 该设备经**本凭证**花掉的等价 API 费用（USD 合计，来自 `usage_logs`）。
+    ///
+    /// 与 `request_count` 不同源：绑定行会被解绑/停用清掉并从零重数，用量日志不会，
+    /// 所以这个数覆盖的时间范围可能比 `request_count` 更长。
+    pub cost_usd: f64,
+    /// 该设备在**所有凭证**上的累计费用（USD）；用来看清换号后仍在烧钱的同一台设备。
+    pub cost_usd_all: f64,
 }
 
 /// 5 小时窗口秒数。
@@ -893,7 +928,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             cost_usd           REAL
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts   ON usage_logs(ts);
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred ON usage_logs(cred_id);",
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred ON usage_logs(cred_id);
+        -- 设备明细要按 device_id 汇总费用（含跨账号合计）；日志表只会越攒越多，
+        -- 没这条索引时展开一次卡片就是一次全表扫描。
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_device ON usage_logs(device_id, cred_id);",
     )
     .context("初始化凭证库 schema 失败")?;
 
@@ -1579,6 +1617,79 @@ mod tests {
             .unwrap();
         assert_eq!(store.device_count(a).unwrap(), 0);
         assert!(store.list_devices(a).unwrap().is_empty(), "超时绑定不应出现在明细里");
+    }
+
+    /// 设备明细里的费用：本账号一列只算本账号花的，跨账号合计要把换号前的也算进去，
+    /// 且不因解绑/重绑而归零（用量日志与绑定行是两套账）。
+    #[test]
+    fn list_devices_sums_cost_per_device() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+
+        // dev-1 在 a 上花了 0.5+0.25，换号后在 b 上又花了 1.0；dev-2 只在 b 上花了 0.125。
+        log_cost(&store, a, "dev-1", Some(0.5));
+        log_cost(&store, a, "dev-1", Some(0.25));
+        log_cost(&store, b, "dev-1", Some(1.0));
+        log_cost(&store, b, "dev-2", Some(0.125));
+        // 模型未知的请求 cost_usd 为空，SUM 要能跳过而不是把整行算成 NULL。
+        log_cost(&store, a, "dev-1", None);
+
+        let d = &store.list_devices(a).unwrap()[0];
+        assert_eq!(d.device_id, "dev-1");
+        assert!((d.cost_usd - 0.75).abs() < 1e-9, "本账号只算 a 上的花费：{}", d.cost_usd);
+        assert!((d.cost_usd_all - 1.75).abs() < 1e-9, "合计要含 b 上的：{}", d.cost_usd_all);
+
+        // 没有任何用量日志的设备给 0，而不是 NULL 取值失败。
+        assert_eq!(store.list_devices(b).unwrap().iter().find(|x| x.device_id == "dev-2").unwrap().cost_usd, 0.125);
+
+        // 解绑再重绑：请求数从零重数，费用是历史累计，不受影响。
+        assert!(store.unbind_device(a, "dev-1").unwrap());
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        let d = &store.list_devices(a).unwrap()[0];
+        assert_eq!(d.request_count, 0, "重绑后是新的一条绑定");
+        assert!((d.cost_usd - 0.75).abs() < 1e-9, "费用不该被解绑清掉");
+    }
+
+    /// 直接落一条用量日志（只填与费用统计相关的列）。
+    fn log_cost(store: &CredentialStore, cred_id: i64, device_id: &str, cost: Option<f64>) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO usage_logs (cred_id, device_id, path, status, has_usage, cost_usd) \
+                 VALUES (?1, ?2, '/v1/messages', 200, 1, ?3)",
+                params![cred_id, device_id, cost],
+            )
+            .unwrap();
+    }
+
+    /// 手动解绑：立刻腾出名额（计数与明细同步减一）、只动本凭证名下的那条绑定、
+    /// 重复解绑返回 false（后台据此给 404，而不是静默成功）。
+    #[test]
+    fn unbind_device_frees_slot_and_is_scoped_to_credential() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+
+        // 拿 b 的 id 去解 dev-1（模拟后台列表已过期、设备其实绑在 a 上）：不能误伤 a 的绑定。
+        assert!(!store.unbind_device(b, "dev-1").unwrap(), "跨凭证解绑应无效");
+        assert_eq!(store.device_count(a).unwrap(), 1, "误删他号绑定会让名额凭空消失");
+
+        assert!(store.unbind_device(a, "dev-1").unwrap());
+        assert_eq!(store.device_count(a).unwrap(), 0, "解绑后名额应立刻释放");
+        assert!(store.list_devices(a).unwrap().is_empty());
+        assert_eq!(store.device_count(b).unwrap(), 1, "不应波及其它账号");
+
+        // 已经没有这条绑定了：再解一次要报「没删到」。
+        assert!(!store.unbind_device(a, "dev-1").unwrap());
+
+        // 解绑不是拉黑：设备下次请求重新走选号，仍可能落回同一个账号。
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(store.device_count(a).unwrap(), 1);
     }
 
     fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {
