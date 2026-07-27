@@ -71,38 +71,7 @@ pub async fn handle(
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
 
     // 5) 组装转发头：复制安全头，注入鉴权与 beta。
-    let mut out = HeaderMap::new();
-    for (k, v) in headers.iter() {
-        if is_forwardable(k) {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    // anthropic-version 缺省补齐。
-    if !out.contains_key("anthropic-version") {
-        out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-    }
-    // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
-    let beta = merge_beta(headers.get("anthropic-beta"));
-    if let Ok(v) = HeaderValue::from_str(&beta) {
-        out.insert("anthropic-beta", v);
-    }
-    // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
-    if !out.contains_key(header::ACCEPT_ENCODING) {
-        out.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static(config::CC_ACCEPT_ENCODING),
-        );
-    }
-    // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
-    if !out.contains_key("x-client-request-id")
-        && let Ok(v) = HeaderValue::from_str(&uuid_v4())
-    {
-        out.insert("x-client-request-id", v);
-    }
-    // 注入 OAuth 鉴权（覆盖来访的任何鉴权头）。
-    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", token)) {
-        out.insert(header::AUTHORIZATION, v);
-    }
+    let out = build_forward_headers(&headers, &token);
 
     // 6) 转发前改写 body：最大 system 块标 scope=global + 身份伪装（metadata.user_id 的
     //    account_uuid/device_id 换成该凭证自洽身份、billing header 补 cch）。缓存 TTL 不动。
@@ -667,6 +636,67 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     parts.join(",")
 }
 
+/// 组装发往上游的请求头：原样转发可转发头，再对需要 luban 决定取值的头**原位覆盖**。
+///
+/// **头序**：`HeaderMap` 按插入序迭代，hyper 也按这个顺序写到线上，所以来访客户端的头序
+/// 默认是保住的。但「先在 [`is_forwardable`] 里剥离、之后再 `insert`」会把那些头从原位摘走、
+/// 追加到队尾（`anthropic-beta`/`anthropic-version`/`authorization` 都是），得到官方客户端
+/// 不会产生的排列——和 [`merge_beta`] 要解决的问题同类，只是从「值内顺序」变成「头之间顺序」。
+/// 故这里让它们照常转发，再用 `insert` 覆盖：`insert` 命中已有 key 时原位替换值，位置不动。
+///
+/// 只在客户端没带时才补的头（`accept-encoding`、`x-client-request-id`）没有原位可循，
+/// 追加在末尾；官方客户端这两个头都带，走的是原位覆盖那条路。
+///
+/// 无法对齐的部分（头名大小写、hyper 自己追加的 `user-agent`/`host`/`content-length`）
+/// 见 [`crate::config::known_fingerprint_gaps`]。
+fn build_forward_headers(headers: &HeaderMap, token: &str) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    // `append` 而非 `insert`：同名多值头要全部保留，`insert` 会只剩最后一个。
+    for (k, v) in headers.iter() {
+        if is_forwardable(k, v) {
+            out.append(k.clone(), v.clone());
+        }
+    }
+    // anthropic-version 缺省补齐。
+    if !out.contains_key("anthropic-version") {
+        out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+    // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
+    match HeaderValue::from_str(&merge_beta(headers.get("anthropic-beta"))) {
+        Ok(v) => {
+            out.insert("anthropic-beta", v);
+        }
+        // merge_beta 只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
+        Err(e) => tracing::warn!(error = %e, "构造 anthropic-beta 失败，保留来访原值"),
+    }
+    // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
+    if !out.contains_key(header::ACCEPT_ENCODING) {
+        out.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static(config::CC_ACCEPT_ENCODING),
+        );
+    }
+    // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
+    if !out.contains_key("x-client-request-id")
+        && let Ok(v) = HeaderValue::from_str(&uuid_v4())
+    {
+        out.insert("x-client-request-id", v);
+    }
+    // 注入 OAuth 鉴权，原位覆盖来访的任何鉴权头。
+    match HeaderValue::from_str(&format!("Bearer {token}")) {
+        Ok(v) => {
+            out.insert(header::AUTHORIZATION, v);
+        }
+        // 这个头现在是**照常转发再覆盖**的，覆盖失败就必须摘掉：
+        // 留在原地等于把来访者的接入 key 漏给上游。
+        Err(e) => {
+            tracing::error!(error = %e, "构造 Authorization 失败，移除该头避免泄漏接入 key");
+            out.remove(header::AUTHORIZATION);
+        }
+    }
+    out
+}
+
 /// 生成一个随机 uuid v4（小写带连字符），用于补齐 `x-client-request-id`。
 fn uuid_v4() -> String {
     let mut b: [u8; 16] = rand::rng().random();
@@ -702,6 +732,12 @@ fn request_speed(body: &Bytes) -> Option<String> {
 ///
 /// **不动缓存 TTL**：客户端声明 5m 就按 5m 转发。曾把所有 ephemeral 断点无条件升成 1h，
 /// 但 1h 缓存写单价是 2 倍、且会让上游看到「1h 缓存写占比异常」，收益不值这个代价。
+///
+/// **key 顺序**：改写要把 body 重新序列化，serde_json 默认的 `Map = BTreeMap` 会把**整个
+/// body**（含 tools/messages/content/cache_control 里每一个对象）的 key 按字母序重排，得到
+/// 官方客户端不会产生的排列——集合对了顺序错，一次精确比对即可判定中间有代理。故本 crate
+/// 开了 serde_json 的 `preserve_order`（见 Cargo.toml），解析出的顺序原样写回，
+/// 新增字段追加在末尾。回归测试见 [`tests::preserves_key_order`]。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
 fn rewrite_body(
@@ -753,9 +789,9 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
 /// - CC 内嵌 JSON：**字符串级定点替换**这两个字段的值，字段顺序与其余内容原样不动。
-///   真实 CC 发的是紧凑 JSON `{"device_id":..,"account_uuid":..,"session_id":..}`；若解析成
-///   `serde_json::Value` 再序列化，未开 `preserve_order` 的 serde 会按字母序重排字段，
-///   与真实客户端顺序不符，构成指纹 tell——故这里绕开 serde，只替换值。
+///   真实 CC 发的是紧凑 JSON `{"device_id":..,"account_uuid":..,"session_id":..}`。外层 body
+///   已靠 serde_json 的 `preserve_order` 保住顺序，但这层仍绕开 serde：内层是**字符串里的
+///   JSON**，重新序列化会连空白、转义写法一起归一化，只有定点替换才逐字节不变。
 /// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows）：换掉 device 段与
 ///   account 段，保留 session 段，仍以扁平串回写——不把 Windows 请求伪装成 CC 的 JSON 形态。
 ///
@@ -959,27 +995,37 @@ impl RateLimitInfo {
     }
 }
 
-/// 请求头是否可转发：跳过鉴权、Host、逐跳头、以及我们显式设置的头。
+/// 请求头是否可转发：跳过接入 key、Host、逐跳头。
 ///
 /// `accept-encoding` 刻意**保留转发**：官方客户端必带 `gzip, deflate, br, zstd`，剥掉它等于
 /// 发出一个「自称 claude-cli 却不声明压缩支持」的请求。我们不解压，响应侧连同
 /// `content-encoding` 原样透传给客户端解码（见 [`is_resp_forwardable`]）。
-fn is_forwardable(name: &HeaderName) -> bool {
-    let n = name.as_str().to_ascii_lowercase();
+///
+/// `authorization`/`anthropic-beta`/`anthropic-version` 也**保留转发**——它们的值随后会被
+/// [`build_forward_headers`] 原位覆盖。在这里剥离会让它们被追加到头列表末尾，破坏来访头序。
+///
+/// `connection` 只在值为 `keep-alive` 时转发：官方客户端显式发这个头（抓包 040 可见），
+/// 而 hyper 认为 HTTP/1.1 隐含 keep-alive、默认不发，剥掉就是个稳定差异。其余取值
+/// （`close` 会打掉连接池、`upgrade` 更不能转）照旧当逐跳头丢弃。
+fn is_forwardable(name: &HeaderName, value: &HeaderValue) -> bool {
+    // HeaderName 构造时即归一化为小写，无需再转。
+    let n = name.as_str();
+    if n == "connection" {
+        return value.as_bytes().eq_ignore_ascii_case(b"keep-alive");
+    }
     !matches!(
-        n.as_str(),
+        n,
         "host"
-            | "authorization"
             | "x-api-key"
             | "content-length"
-            | "connection"
+            | "expect"
+            | "keep-alive"
+            | "proxy-authorization"
             | "proxy-connection"
             | "te"
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "anthropic-version"
-            | "anthropic-beta"
     )
 }
 
@@ -995,8 +1041,9 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bytes, HeaderValue, StatusCode, UsageSniffer, detect_account_ban, ensure_billing_cch,
-        merge_beta, replace_json_str_field, request_speed, uuid_v4,
+        Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
+        detect_account_ban, ensure_billing_cch, merge_beta, replace_json_str_field, request_speed,
+        uuid_v4,
     };
 
     /// API-key 模式的 CC 实际发出的 beta 串（抓包 041，经 luban 转发那一条）。
@@ -1037,6 +1084,171 @@ mod tests {
         );
     }
 
+    /// 抓包 040 里的真实 account_uuid。
+    const ACCOUNT_UUID: &str = "27aa7c53-0d20-42d2-806a-60c710529405";
+
+    /// 来访客户端的头（API-key 模式的 CC，取自抓包 041）。构造成 `HeaderMap` 时保持插入序，
+    /// 与 axum 从线上解析出来的顺序一致。
+    fn incoming_headers() -> super::HeaderMap {
+        let mut h = super::HeaderMap::new();
+        for (k, v) in [
+            ("accept", "application/json"),
+            ("accept-encoding", "gzip, deflate, br, zstd"),
+            ("authorization", "Bearer luban-CLIENT-KEY"),
+            ("connection", "keep-alive"),
+            ("content-type", "application/json"),
+            ("proxy-connection", "Keep-Alive"),
+            ("x-claude-code-session-id", "6eb83bfc-fdf8-4c43-ba4a-6ff95c60a0de"),
+            ("x-stainless-arch", "arm64"),
+            ("x-stainless-os", "MacOS"),
+            ("anthropic-beta", "claude-code-20250219,effort-2025-11-24"),
+            ("anthropic-dangerous-direct-browser-access", "true"),
+            ("anthropic-version", "2023-06-01"),
+            ("x-app", "cli"),
+        ] {
+            h.insert(
+                super::HeaderName::from_static(k),
+                HeaderValue::from_static(v),
+            );
+        }
+        h
+    }
+
+    /// 按顺序取出 `HeaderMap` 里的头名。
+    fn names(h: &super::HeaderMap) -> Vec<String> {
+        h.iter().map(|(k, _)| k.as_str().to_string()).collect()
+    }
+
+    /// 需要 luban 改写取值的头必须**留在来访客户端给它们的位置上**。
+    ///
+    /// 剥离后再 `insert` 会把它们追加到队尾，得到官方客户端不会产生的头序——和 `merge_beta`
+    /// 处理的是同一类问题（那个管值内顺序，这个管头之间的顺序）。
+    #[test]
+    fn forward_headers_keep_client_order() {
+        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL");
+
+        assert_eq!(
+            names(&out),
+            vec![
+                "accept",
+                "accept-encoding",
+                "authorization",  // 原位，值被换成 OAuth token
+                "connection",     // keep-alive 保留转发
+                "content-type",
+                // proxy-connection 被剥离
+                "x-claude-code-session-id",
+                "x-stainless-arch",
+                "x-stainless-os",
+                "anthropic-beta", // 原位，值被合并重排
+                "anthropic-dangerous-direct-browser-access",
+                "anthropic-version", // 原位
+                "x-app",
+                "x-client-request-id", // 客户端没带，无原位可循，追加末尾
+            ],
+            "转发头序被打乱"
+        );
+
+        // 值确实被覆盖了，不是原样透传。
+        assert_eq!(out["authorization"], "Bearer sk-ant-oat01-REAL");
+        assert!(
+            out["anthropic-beta"].to_str().unwrap().contains(config::OAUTH_BETA_HEADER),
+            "anthropic-beta 未合并 oauth"
+        );
+    }
+
+    /// 覆盖失败时必须把 `authorization` 摘掉，不能把来访者的接入 key 漏给上游。
+    /// （这条只有在「照常转发再覆盖」的写法下才存在，剥离式写法天然没有这个洞。）
+    #[test]
+    fn never_leaks_client_key_upstream() {
+        // token 里塞进换行——`HeaderValue::from_str` 会拒绝，走到移除分支。
+        let out = build_forward_headers(&incoming_headers(), "bad\ntoken");
+        assert!(!out.contains_key("authorization"), "构造失败时应移除该头: {out:?}");
+        // 任何路径下都不得把接入 key 转发出去。
+        for (_, v) in out.iter() {
+            assert!(
+                !v.to_str().unwrap_or("").contains("luban-CLIENT-KEY"),
+                "接入 key 泄漏到上游: {out:?}"
+            );
+        }
+        assert!(!out.contains_key("x-api-key"), "x-api-key 不应转发");
+    }
+
+    /// 线上字节的看门狗：`HeaderMap` 的顺序要真的落到线上，且 hyper 要肯发
+    /// 显式的 `Connection: keep-alive`（它默认认为 HTTP/1.1 隐含 keep-alive、不发这个头）。
+    ///
+    /// 用的是 [`crate::web::upstream_client`] 那份**真配置**，不是测试里另抄一份。
+    #[tokio::test]
+    async fn wire_bytes_preserve_header_order() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(&stream);
+            let mut raw = String::new();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let end = line == "\r\n";
+                raw.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            (&stream).write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").unwrap();
+            raw
+        });
+
+        let _ = crate::web::upstream_client()
+            .unwrap()
+            .post(format!("http://{addr}/v1/messages?beta=true"))
+            .headers(build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL"))
+            .body(r#"{"model":"claude-sonnet-5"}"#)
+            .send()
+            .await;
+
+        let raw = server.join().unwrap();
+        let wire: Vec<&str> = raw
+            .lines()
+            .skip(1) // 请求行
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split(':').next().unwrap())
+            .collect();
+
+        // 来访头序原样落到线上（hyper 追加的三个在末尾，见 known_fingerprint_gaps）。
+        let tail = wire.len() - 3;
+        assert_eq!(
+            &wire[..tail],
+            &[
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "connection",
+                "content-type",
+                "x-claude-code-session-id",
+                "x-stainless-arch",
+                "x-stainless-os",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "anthropic-version",
+                "x-app",
+                "x-client-request-id",
+            ],
+            "线上头序与来访不符:\n{raw}"
+        );
+        assert!(
+            raw.contains("connection: keep-alive"),
+            "hyper 吞掉了显式的 Connection 头:\n{raw}"
+        );
+        // hyper 自己追加的三个：位置无法控制，只断言它们确实在末尾，别的没变。
+        let mut appended = wire[tail..].to_vec();
+        appended.sort_unstable();
+        assert_eq!(appended, ["content-length", "host", "user-agent"], "\n{raw}");
+    }
+
     fn test_cred() -> crate::credentials::Credential {
         crate::credentials::Credential {
             id: 1,
@@ -1049,7 +1261,7 @@ mod tests {
             disabled: false,
             device_limit: 0,
             ban_reason: None,
-            account_uuid: Some("27aa7c53-0d20-42d2-806a-60c710529405".into()),
+            account_uuid: Some(ACCOUNT_UUID.into()),
             created_at: 0,
             updated_at: 0,
         }
@@ -1071,6 +1283,50 @@ mod tests {
         // 同时确认另外两项改写仍生效（否则这个测试会因为整体没改写而空过）。
         assert!(s.contains("cch=00000"), "应补 cch: {s}");
         assert!(s.contains("\"scope\":\"global\""), "应标 scope: {s}");
+    }
+
+    /// 改写后 body 的 key 顺序必须与入站逐字节一致，只允许新增字段追加在末尾。
+    ///
+    /// serde_json 默认 `Map = BTreeMap`，会把整个 body（含嵌套对象）的 key 按字母序重排，
+    /// 得到官方客户端不会产生的排列。靠 `preserve_order` feature 兜住，本测试是它的看门狗：
+    /// 一旦该 feature 被摘掉，这里立刻失败。
+    #[test]
+    fn preserves_key_order() {
+        // 抓包 040/041 的真实字段次序：model 在 max_tokens 前、system 块是 type→text、
+        // metadata.user_id 内层是 device_id→account_uuid→session_id。字母序全都不是这样。
+        let raw = concat!(
+            r#"{"model":"claude-sonnet-5","max_tokens":64000,"#,
+            r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
+            r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},"#,
+            r#"{"type":"text","text":"big","cache_control":{"type":"ephemeral"}}],"#,
+            r#""stream":true,"tools":[]}"#
+        );
+        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", true);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+
+        // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
+        assert!(s.contains("cch=00000"), "应补 cch: {s}");
+        assert!(s.contains(r#""scope":"global""#), "应标 scope: {s}");
+        assert!(s.contains(&format!(r#"\"account_uuid\":\"{}\""#, ACCOUNT_UUID)), "应填 uuid: {s}");
+
+        // 顶层顺序不变，未被字母序重排（重排后 max_tokens 会跑到 model 前）。
+        let mut at = 0;
+        for k in ["model", "max_tokens", "metadata", "system", "stream", "tools"] {
+            let needle = format!("\"{k}\":");
+            let pos = s[at..].find(&needle).unwrap_or_else(|| panic!("顶层 key {k} 顺序错乱: {s}"));
+            at += pos + needle.len();
+        }
+
+        // 嵌套对象同样不重排：system 块是 type→text（字母序会变成 text→type），
+        // cache_control 新增的 scope 追加在 type 之后。
+        assert!(s.contains(r#"{"type":"text","text":"big""#), "system 块 key 被重排: {s}");
+        assert!(s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#), "cache_control key 被重排: {s}");
+
+        // 内层 user_id 仍走定点替换，device_id→account_uuid→session_id 原序。
+        assert!(
+            s.contains(r#"\"device_id\":\""#) && s.find(r#"\"device_id\":\""#) < s.find(r#"\"account_uuid\":\""#),
+            "内层 user_id key 被重排: {s}"
+        );
     }
 
     fn body_with_system0(text: &str) -> serde_json::Value {

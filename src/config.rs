@@ -82,6 +82,34 @@ pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 /// 把 [`crate::proxy::cch_value`] 换成从「已在缓存前缀内的内容」派生即可（见该函数注释）。
 pub const BILLING_CCH: &str = "00000";
 
+/// **已知无法对齐的形态差异**（记录在案，别再重复排查）。
+///
+/// 1. **header 名大小写**。hyper 把 `HeaderName` 一律存成并发出小写；官方客户端（node/undici）
+///    发的是分裂形态——undici 托管的标准头首字母大写、SDK 自定义头全小写：
+///    ```text
+///    Accept / Accept-Encoding / Authorization / Connection / Content-Type / Host /
+///    User-Agent / X-Claude-Code-Session-Id / X-Stainless-*        ← 首字母大写
+///    anthropic-beta / anthropic-version / x-app / x-client-request-id /
+///    anthropic-dangerous-direct-browser-access                    ← 全小写
+///    ```
+///    reqwest 有 `http1_title_case_headers()`，但那是**全部**首字母大写，会把 `anthropic-beta`
+///    写成 `Anthropic-Beta`，同样对不上，只是换了个错法。逐头指定大小写 hyper 没有 API，
+///    要修得换掉整个 HTTP 栈。
+///
+/// 2. **`user-agent` / `host` / `content-length` 的位置**。这三个由 hyper 自己追加在头列表
+///    末尾，无法插到来访客户端原本的位置。其余转发头的顺序是保住的，见
+///    [`crate::proxy::build_forward_headers`]。
+///
+/// 3. **TLS ClientHello 指纹**。rustls 的扩展顺序/密码套件与 node 的 BoringSSL 不同。
+///
+/// 4. **`cc_version` 的构建后缀**。抓包显示订阅模式是 `2.1.218.2d7`、API-key 模式是
+///    `2.1.218.0b9`（同机同版本同时段）。这个后缀随鉴权模式变化，luban 原样转发，
+///    等于补了 [`BILLING_CCH`] 却留着另一个更直接的判据。成因未知，待查。
+///
+/// 比对基准只能用**HTTPS CONNECT 隧道**里抓到的 flow（保留原始字节）；明文 HTTP 到 luban
+/// 那几个 flow 的头名会被 mitmproxy 机械 title-case（21 个头无一例外），大小写与顺序都不可信。
+pub mod known_fingerprint_gaps {}
+
 /// 官方上游 API base（代理转发目标）。
 pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
 

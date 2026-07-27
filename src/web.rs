@@ -36,6 +36,22 @@ pub struct AppState {
 
 type ApiError = (StatusCode, String);
 
+/// 构造发往上游的 HTTP 客户端，刻意贴近官方客户端的传输形态：
+/// - `http1_only`：官方客户端是 node/undici，走 HTTP/1.1（抓包里有 `Connection`/`Host`，
+///   h2 不会有这两个头）。reqwest 默认经 ALPN 协商 h2，会留下 h2 的 SETTINGS/伪头指纹。
+/// - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
+///   时来访客户端自己的 UA 会覆盖它。
+///
+/// 抽成函数是为了让 [`crate::proxy`] 的线上字节回归测试用到的是**这一份真配置**，
+/// 而不是测试里另抄一份。无法对齐的部分见 [`config::known_fingerprint_gaps`]。
+pub fn upstream_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .http1_only()
+        .user_agent(config::CC_USER_AGENT)
+        .build()
+        .context("构造上游 HTTP 客户端失败")
+}
+
 /// 启动网页服务 + 转发代理，绑定 `host:port`，可选自动打开浏览器。
 pub async fn run(
     host: &str,
@@ -46,17 +62,7 @@ pub async fn run(
     admin_password: Option<String>,
 ) -> Result<()> {
     let client_key = api_key.map(Arc::new);
-    // 上游客户端刻意贴近官方客户端的传输形态：
-    // - `http1_only`：官方客户端是 node/undici，走 HTTP/1.1（抓包里有 `Connection`/`Host`，
-    //   h2 不会有这两个头）。reqwest 默认经 ALPN 协商 h2，会留下 h2 的 SETTINGS/伪头指纹。
-    // - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
-    //   时来访客户端自己的 UA 会覆盖它。
-    // 注：TLS 层的 ClientHello 指纹（rustls ≠ node BoringSSL）无法在这里对齐。
-    let http = reqwest::Client::builder()
-        .http1_only()
-        .user_agent(config::CC_USER_AGENT)
-        .build()
-        .context("构造上游 HTTP 客户端失败")?;
+    let http = upstream_client()?;
     let state = AppState {
         http,
         pkce: Arc::new(Mutex::new(None)),
