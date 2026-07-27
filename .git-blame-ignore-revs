@@ -1,0 +1,11 @@
+# 只放「纯排版、无语义」的提交，让 git blame 穿透它们指向真正改代码的那次。
+#
+# 本地启用（clone 后执行一次）：
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub 的网页 blame 会自动读取本文件，无需配置。
+#
+# 注意：这里记的是完整 SHA，若对应提交被 rebase/squash 重写过，条目就失效了（git blame 会
+# 报「无法找到该 rev」）。合并到 main 请用 fast-forward，别 squash。
+
+# style: 全量 rustfmt 并加 rustfmt.toml
+cdf620a5615b8938a7ef4e2a119dfc4dd1797cd6

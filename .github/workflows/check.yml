@@ -1,0 +1,30 @@
+# 排版门禁：挡住风格漂移，防止仓库再次退回「两种排版并存」的状态。
+#
+# 刻意只跑 cargo fmt --check：它不需要编译，也就不需要 admin-ui/dist
+#（rust-embed 在编译期读取该目录，没有它连 cargo check 都过不去），
+# 十几秒即可完成。构建仍由 build.yml 在打 tag 时负责。
+name: Check
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: 排版检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # 排版规则由 rustfmt.toml 的 style_edition 冻结，故不必 pin toolchain 版本。
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
