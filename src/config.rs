@@ -66,9 +66,18 @@ pub const CC_USER_AGENT: &str = "claude-cli/2.1.218 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
-/// 原先该头被剥离且 reqwest 未开压缩 feature，上游收到的是「自称 claude-cli 却完全不声明
-/// 压缩支持」的请求。上游对 `text/event-stream` 实测不压缩，故声明后流式响应仍是 identity，
-/// 用量嗅探不受影响；非流式响应可能带 `content-encoding`，原样透传给客户端解码。
+/// 原先该头被剥离，上游收到的是「自称 claude-cli 却完全不声明压缩支持」的请求。
+///
+/// **声明了就一定会被压。** 上游（Cloudflare）连 140 字节的 401 错误体都压，`text/event-stream`
+/// 也不例外——v0.2.12 只恢复了这个头却没开 reqwest 的解压 feature，导致所有响应体都是我们
+/// 读不懂的字节，用量统计、计价、账号级错误判定整片失效。教训：**这个常量和 reqwest 的
+/// gzip/brotli/zstd/deflate feature 是一套的，动其一必须动其二。**
+///
+/// 当时误判的根源是拿抓包当证据——那份抓包的 SSE 响应体是空的（导出没存流式 body），
+/// 只凭「没看到 `content-encoding`」就断定上游不压 SSE，属于把证据缺失当证据。
+///
+/// 该头也被钉进 [`crate::web::upstream_client`] 的 `default_headers`，
+/// 免得 luban 自身的刷新/profile 请求被解压中间件补上一个非官方取值。
 pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
 /// 注入到 `x-anthropic-billing-header` 的 `cch` 值。

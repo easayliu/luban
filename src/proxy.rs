@@ -113,22 +113,28 @@ pub async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
                 .unwrap_or(false);
-            // 响应带非 identity 的 `content-encoding` 时我们不解压、原样透传给客户端解码，
-            // 因此跳过用量嗅探与错误体判定。上游对 `text/event-stream` 实测不压缩，故这条
-            // 路径只可能出现在非流式响应上。
-            let compressed = up
+            // 正常情况下这里恒为 false：上游客户端开了 gzip/br/zstd/deflate 解压，reqwest
+            // 收到时已解码，并把 `content-encoding`/`content-length` 一并摘掉。
+            // 留着这个判断是兜底——若上游哪天用了我们没开的编码，tower-http 会原样放行并保留
+            // 该头，那时响应体是我们读不懂的字节，嗅探与账号级错误判定都只能跳过。
+            //
+            // 曾经这是常态：v0.2.12 恢复转发 `accept-encoding` 却没开解压 feature，于是
+            // **所有**响应（含 SSE）都成了压缩字节，用量/计价/封号判定整片失效。当时的 warn
+            // 只在 4xx 上打，200 这条路径完全静默，症状是「统计悄悄归零且日志上看不出原因」。
+            // 现在改成任何状态码都告警。
+            let content_encoding = up
                 .headers()
                 .get(header::CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| {
-                    let v = v.trim();
-                    !v.is_empty() && !v.eq_ignore_ascii_case("identity")
-                })
-                .unwrap_or(false);
-            if compressed && status.is_client_error() {
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("identity"))
+                .map(str::to_string);
+            let compressed = content_encoding.is_some();
+            if let Some(enc) = &content_encoding {
                 tracing::warn!(
                     status = status.as_u16(),
-                    "上游错误响应被压缩，无法判定是否为账号级错误（不会自动停用凭证）"
+                    encoding = %enc,
+                    "上游响应带无法解码的 content-encoding：用量嗅探与账号级错误判定都会被跳过（该编码需在 reqwest feature 里开启）"
                 );
             }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
@@ -363,7 +369,8 @@ impl Drop for ReqLog {
 #[derive(Default)]
 struct UsageSniffer {
     is_stream: bool,
-    /// 响应体被压缩：我们不解压，故一律不解析（`feed` 直接丢弃）。
+    /// 响应体带我们解不开的 `content-encoding`，只能一律不解析（`feed` 直接丢弃）。
+    /// 正常路径下恒为 false——reqwest 已解码，见 [`handle`] 里 `compressed` 的说明。
     opaque: bool,
     /// SSE 模式下未处理完的行尾；非流式模式下累积的整段响应体。
     buf: Vec<u8>,
@@ -998,8 +1005,9 @@ impl RateLimitInfo {
 /// 请求头是否可转发：跳过接入 key、Host、逐跳头。
 ///
 /// `accept-encoding` 刻意**保留转发**：官方客户端必带 `gzip, deflate, br, zstd`，剥掉它等于
-/// 发出一个「自称 claude-cli 却不声明压缩支持」的请求。我们不解压，响应侧连同
-/// `content-encoding` 原样透传给客户端解码（见 [`is_resp_forwardable`]）。
+/// 发出一个「自称 claude-cli 却不声明压缩支持」的请求。上游会照单压缩（连 140 字节的错误体
+/// 都压，SSE 也不例外），故上游客户端开了对应的解压 feature，reqwest 收到时已解码；
+/// 回给客户端的是未压缩内容（见 [`is_resp_forwardable`]）。
 ///
 /// `authorization`/`anthropic-beta`/`anthropic-version` 也**保留转发**——它们的值随后会被
 /// [`build_forward_headers`] 原位覆盖。在这里剥离会让它们被追加到头列表末尾，破坏来访头序。
@@ -1031,8 +1039,12 @@ fn is_forwardable(name: &HeaderName, value: &HeaderValue) -> bool {
 
 /// 响应头是否可回传：跳过由框架管理的分帧类头。
 ///
-/// `content-encoding` 必须保留：我们向上游声明了 `accept-encoding` 且不做解压，压缩体是
-/// 原样透传的，去掉这个头客户端就会把压缩字节当明文解析。
+/// `content-encoding` 保留转发，但正常情况下它**根本不会出现**——reqwest 解码后会把它连同
+/// `content-length` 一起摘掉，我们回给客户端的是未压缩内容。只有上游用了我们没开的编码时
+/// 它才会残留，那时压缩体确实是原样透传的，这个头必须跟着走，否则客户端会把压缩字节当明文解析。
+///
+/// 客户端向 luban 声明了 `accept-encoding` 却收到未压缩内容，这在 HTTP 里完全合法
+/// （accept-encoding 是偏好不是要求）。代价是 luban→客户端这一腿不再压缩。
 fn is_resp_forwardable(name: &HeaderName) -> bool {
     let n = name.as_str().to_ascii_lowercase();
     !matches!(n.as_str(), "content-length" | "transfer-encoding" | "connection")
@@ -1042,8 +1054,8 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
 mod tests {
     use super::{
         Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
-        detect_account_ban, ensure_billing_cch, merge_beta, replace_json_str_field, request_speed,
-        uuid_v4,
+        detect_account_ban, ensure_billing_cch, header, merge_beta, replace_json_str_field,
+        request_speed, uuid_v4,
     };
 
     /// API-key 模式的 CC 实际发出的 beta 串（抓包 041，经 luban 转发那一条）。
@@ -1171,6 +1183,106 @@ mod tests {
             );
         }
         assert!(!out.contains_key("x-api-key"), "x-api-key 不应转发");
+    }
+
+    /// 起一个本地 HTTP 服务，用给定的响应字节应答，并把收到的请求头原样返回。
+    fn serve_once(response: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(&stream);
+            let mut raw = String::new();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let end = line == "\r\n";
+                raw.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            (&stream).write_all(&response).unwrap();
+            raw
+        });
+        (addr, h)
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// 上游客户端必须**透明解压**，否则用量嗅探拿到的是压缩字节、什么都解析不出来。
+    ///
+    /// 这正是线上花费统计消失的成因：v0.2.12 恢复转发 `accept-encoding` 让上游开始压缩响应，
+    /// 但 reqwest 没开解压 feature，于是 `UsageSniffer` 被整个跳过——model、token、cost 全空。
+    /// 本测试同时盯住两件事：解压 feature 在不在，以及请求侧声明的取值是否仍是官方那个。
+    #[tokio::test]
+    async fn upstream_client_decodes_gzip_and_keeps_official_accept_encoding() {
+        // 一段真实形态的 SSE，压成 gzip 后由服务端返回。
+        const SSE: &str = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\
+            \"usage\":{\"input_tokens\":123,\"cache_read_input_tokens\":456}}}\n\n";
+        let body = gzip(SSE.as_bytes());
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             content-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+
+        let (addr, server) = serve_once(resp);
+        let up = crate::web::upstream_client()
+            .unwrap()
+            .post(format!("http://{addr}/v1/messages"))
+            .send()
+            .await
+            .unwrap();
+
+        // reqwest 解码后会把 content-encoding / content-length 一并摘掉。
+        assert!(
+            up.headers().get(header::CONTENT_ENCODING).is_none(),
+            "解码后不该再有 content-encoding：{:?}",
+            up.headers()
+        );
+        let bytes = up.bytes().await.unwrap();
+        assert_eq!(&bytes[..], SSE.as_bytes(), "响应体应已是明文");
+
+        // 明文喂给嗅探器就能拿到 model 与用量——这是花费统计的全部输入。
+        let mut sniffer = UsageSniffer::new(true, false);
+        sniffer.feed(&bytes);
+        sniffer.finish();
+        assert_eq!(sniffer.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(sniffer.input_tokens, Some(123));
+        assert_eq!(sniffer.cache_read_tokens, Some(456));
+        assert!(sniffer.has_usage());
+
+        // 请求侧仍是官方取值，不是解压中间件那个 `zstd,gzip,deflate,br`。
+        // 这条请求没经过 build_forward_headers，走的正是 default_headers 兜底那条路
+        // ——和 luban 自身的刷新/profile 请求同一条。
+        let raw = server.join().unwrap().to_ascii_lowercase();
+        assert!(
+            raw.contains(&format!("accept-encoding: {}\r\n", config::CC_ACCEPT_ENCODING)),
+            "accept-encoding 应为官方取值:\n{raw}"
+        );
+    }
+
+    /// 上游用了我们没开的编码时，只能跳过嗅探——但不得崩、不得把压缩字节当明文解析。
+    #[test]
+    fn unknown_encoding_is_skipped_not_misparsed() {
+        let mut s = UsageSniffer::new(true, true);
+        s.feed(&gzip(b"data: {\"usage\":{\"input_tokens\":999}}\n"));
+        s.finish();
+        assert!(!s.has_usage(), "解不开的响应体不应被当明文解析出用量");
+        assert_eq!(s.model, None);
     }
 
     /// 线上字节的看门狗：`HeaderMap` 的顺序要真的落到线上，且 hyper 要肯发

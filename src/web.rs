@@ -41,13 +41,25 @@ type ApiError = (StatusCode, String);
 ///   h2 不会有这两个头）。reqwest 默认经 ALPN 协商 h2，会留下 h2 的 SETTINGS/伪头指纹。
 /// - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
 ///   时来访客户端自己的 UA 会覆盖它。
+/// - `default_headers` 里的 `accept-encoding`：**必须显式钉住**。开了解压 feature 后，
+///   tower-http 的解压中间件会给「没带这个头」的请求补一个它自己的取值
+///   `zstd,gzip,deflate,br`（顺序与写法都不是官方客户端会产生的）。转发 `/v1/*` 有
+///   [`proxy::build_forward_headers`] 保证该头一定存在、轮不到它插手，但 luban 自身发起的
+///   刷新/profile 请求不设这个头，就会被它补上一个非官方取值。钉成官方值即可堵死：
+///   reqwest 与 tower-http 都只填「缺失」的头，不覆盖已有的。
 ///
 /// 抽成函数是为了让 [`crate::proxy`] 的线上字节回归测试用到的是**这一份真配置**，
 /// 而不是测试里另抄一份。无法对齐的部分见 [`config::known_fingerprint_gaps`]。
 pub fn upstream_client() -> Result<reqwest::Client> {
+    use axum::http::{HeaderMap, HeaderValue, header::ACCEPT_ENCODING};
+
+    let mut defaults = HeaderMap::new();
+    defaults.insert(ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
+
     reqwest::Client::builder()
         .http1_only()
         .user_agent(config::CC_USER_AGENT)
+        .default_headers(defaults)
         .build()
         .context("构造上游 HTTP 客户端失败")
 }
@@ -91,6 +103,7 @@ pub async fn run(
         .route("/credentials/{id}/priority", post(set_priority))
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
+        .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/usage", get(list_usage))
         .route("/settings", get(get_settings))
@@ -291,6 +304,20 @@ async fn list_credentials(State(state): State<AppState>) -> Result<Json<Vec<Cred
         })
         .collect();
     Ok(Json(views))
+}
+
+/// 列出某凭证当前绑定的设备明细（按最近活跃倒序）。
+///
+/// 口径与卡片上的「设备 x/y」一致：只含 TTL 内仍活跃的绑定，所以条数必然等于 x。
+async fn list_credential_devices(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<store::DeviceBinding>>, ApiError> {
+    // 凭证不存在时给 404：否则前端会把「账号已被删掉」显示成「该账号没有设备」。
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    Ok(Json(state.store.list_devices(id).map_err(internal)?))
 }
 
 /// 删除一条凭证。

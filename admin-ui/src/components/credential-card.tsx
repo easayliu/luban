@@ -1,11 +1,12 @@
 import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   ArrowPathIcon, PencilIcon, CheckIcon, XMarkIcon, EllipsisHorizontalIcon,
-  DevicePhoneMobileIcon, ExclamationTriangleIcon,
+  DevicePhoneMobileIcon, ExclamationTriangleIcon, ChevronDownIcon,
   CalendarDaysIcon, ClockIcon, WalletIcon,
 } from '@heroicons/react/24/outline'
-import { type Credential } from '@/api/credentials'
-import { cn, formatDuration, formatUsd, relativeTime } from '@/lib/utils'
+import { listCredentialDevices, type Credential } from '@/api/credentials'
+import { cn, extractError, formatDuration, formatUsd, relativeTime } from '@/lib/utils'
 import {
   CredentialMenuContent, expiryMeta, inputToLimit, isAbnormal, isNearLimit, limitToInput,
   statusMeta, switchTitle, tierBadgeClass, useCredentialActions,
@@ -30,6 +31,8 @@ export function CredentialCard({
   const [name, setName] = useState(cred.label)
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitVal, setLimitVal] = useState(limitToInput(cred.device_limit))
+  // 已绑定设备明细：默认收起，展开时才挂载 DeviceList（也才发请求）。
+  const [showDevices, setShowDevices] = useState(false)
 
   const actions = useCredentialActions(
     cred,
@@ -293,8 +296,74 @@ export function CredentialCard({
             <PencilIcon className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover/limit:opacity-100" />
           </button>
         )}
+
+        {/* 展开「已绑定设备」：上面的数字只说有几台，这里能看到具体是哪几台。
+            单独一个箭头按钮，因为设备统计项本身的点击已经被「改上限」占用了。 */}
+        <button
+          onClick={() => setShowDevices((v) => !v)}
+          className="inline-flex items-center transition-colors hover:text-foreground"
+          title={showDevices ? '收起已绑定设备' : '查看已绑定的设备'}
+          aria-expanded={showDevices}
+          aria-label="已绑定设备"
+        >
+          <ChevronDownIcon
+            className={cn('size-3 transition-transform', showDevices && 'rotate-180')}
+          />
+        </button>
       </div>
+
+      {showDevices && <DeviceList credId={cred.id} />}
     </Card>
+  )
+}
+
+/**
+ * 某账号当前绑定的设备明细。只在展开时挂载，故列表是按需拉取的。
+ *
+ * 口径与上方「设备 x/y」的 x 完全一致（后端按同一个绑定 TTL 过滤），条数必然对得上；
+ * 超时未活跃的绑定既不占名额也不在这里出现。
+ */
+function DeviceList({ credId }: { credId: number }) {
+  const { data, isPending, error } = useQuery({
+    queryKey: ['credential-devices', credId],
+    queryFn: () => listCredentialDevices(credId),
+  })
+
+  return (
+    <div className="mt-2.5 rounded-xl border border-border/60 bg-surface-2/40 px-3 py-2.5 text-2xs">
+      {isPending ? (
+        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+          <ArrowPathIcon className="size-3 animate-spin" />读取设备列表…
+        </span>
+      ) : error ? (
+        <span className="text-bad">{extractError(error)}</span>
+      ) : data.length === 0 ? (
+        <span className="text-muted-foreground">暂无活跃设备（绑定超时未活跃即自动释放名额）</span>
+      ) : (
+        <ul className="divide-y divide-border/50">
+          {data.map((d) => (
+            <li key={d.device_id} className="flex items-center gap-2 py-1 first:pt-0 last:pb-0">
+              <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-60" />
+              <span className="min-w-0 truncate font-mono" title={d.device_id}>
+                {d.device_id.slice(0, 12)}…
+              </span>
+              <span
+                className="ml-auto shrink-0 tnum text-muted-foreground"
+                title="该设备经此账号转发的累计请求数"
+              >
+                {d.request_count} 次
+              </span>
+              <span
+                className="w-14 shrink-0 text-right tnum text-muted-foreground"
+                title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
+              >
+                {relativeTime(d.last_seen_at)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   )
 }
 

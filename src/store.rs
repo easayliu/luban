@@ -348,6 +348,35 @@ impl CredentialStore {
         Ok(n)
     }
 
+    /// 单条凭证当前**有效**绑定的设备明细，按最近活跃倒序。
+    ///
+    /// 过滤口径与 [`Self::device_count`] 完全一致（同一个 TTL），否则后台会出现「设备数写着
+    /// 2、展开却列出 5 条」这种自相矛盾的展示。
+    pub fn list_devices(&self, cred_id: i64) -> Result<Vec<DeviceBinding>> {
+        let ttl = self.device_binding_ttl();
+        let conn = self.conn.lock();
+        let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
+        let sql = format!(
+            "SELECT device_id, request_count, created_at, last_seen_at FROM device_bindings \
+             WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, device_id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &Row| {
+            Ok(DeviceBinding {
+                device_id: r.get(0)?,
+                request_count: r.get(1)?,
+                created_at: r.get(2)?,
+                last_seen_at: r.get(3)?,
+            })
+        };
+        let rows: Vec<DeviceBinding> = if ttl > 0 {
+            stmt.query_map(params![cred_id, ttl], map_row)?.collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map([cred_id], map_row)?.collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
     /// 所有凭证当前**有效**绑定的设备数（cred_id → count）；口径同 [`Self::device_count`]，
     /// 排除超过 TTL 未活跃的绑定。TTL `<= 0` 时按全量计。
     pub fn device_counts(&self) -> Result<HashMap<i64, i64>> {
@@ -588,6 +617,19 @@ pub struct QuotaSnapshot {
     /// 当前 5h / 7d 窗口内该凭证已用的等价费用（USD）。窗口起点由对应 reset 反推。
     pub cost_5h: Option<f64>,
     pub cost_7d: Option<f64>,
+}
+
+/// 一条设备绑定明细（凭证卡片展开「已绑定设备」时展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceBinding {
+    /// 客户端 `metadata.user_id` 里的原始 device_id（非伪装后的那个）。
+    pub device_id: String,
+    /// 该设备经此凭证转发过的累计请求数。
+    pub request_count: i64,
+    /// 首次绑定到该凭证的时间（Unix 秒）。
+    pub created_at: i64,
+    /// 最近一次活跃时间（Unix 秒）；TTL 就是按它算的。
+    pub last_seen_at: i64,
 }
 
 /// 5 小时窗口秒数。
@@ -1099,41 +1141,132 @@ impl CredentialStore {
     }
 }
 
+/// 刷新失败后最多改选几个凭证。
+///
+/// 每失败一轮就停用一个凭证（可用池严格变小），循环必然收敛；这个上限只是防御性兜底，
+/// 免得停用没生效时打成死循环。也顺带给单次请求的耗时封了顶——每一轮都是一次上游往返。
+const MAX_REFRESH_FAILOVER: usize = 5;
+
+/// 一次「拿到该凭证可用 access_token」的尝试结果。可重试的错误（网络抖动、5xx、限流）
+/// 走 `Err` 直接冒泡，不在这里表达。
+enum TokenAttempt {
+    /// 拿到可用 access_token。
+    Ready(String),
+    /// 该凭证的 refresh_token 已被上游永久作废，重试没有意义——外层会停用它并改选其它号。
+    /// 携带写入 `ban_reason` 的原因。
+    Revoked(String),
+}
+
 /// 代理转发使用：按 device_id 粘性选出凭证并返回 (access_token, 该凭证)（必要时刷新）。
 ///
 /// 选择见 [`CredentialStore::select_for_device`]。若命中的凭证进入刷新窗口，
 /// 则调用 OAuth 刷新并回写。注意刷新是异步 IO，不持有 DB 锁。
 ///
-/// 刷新走该凭证的专属锁 + 双重检查：上游刷新会轮换 refresh_token，并发刷新中后完成的那次
-/// 会把已作废的 token 写回库，导致该凭证之后所有刷新都 `invalid_grant`（账号被自己废掉）。
-/// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
+/// **刷新失败要自动换号**：`select_for_device` 在返回前就写好了设备绑定，之后才轮到刷新。
+/// 若刷新失败直接把错误抛出去，这个设备就被钉死在坏号上——绑定还在，下一次请求照样选中它，
+/// 永远 503 直到人工介入。故这里在「refresh_token 已被作废」时停用该凭证
+/// （[`CredentialStore::mark_banned`] 会连带清掉它的设备绑定），再重选一个号继续。
+/// 网络抖动/5xx 这类可重试错误**不**停用，原样抛出，让客户端重试时还落回同一个号。
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
     http: &reqwest::Client,
     device_id: Option<&str>,
 ) -> Result<(String, Credential)> {
-    let ttl = store.device_binding_ttl();
-    let cred = store.select_for_device(device_id, ttl)?;
+    select_with_refresh_failover(store, device_id, |cred| {
+        Box::pin(async move { ensure_fresh_token(store, http, &cred).await })
+    })
+    .await
+}
 
+/// [`select_with_refresh_failover`] 注入的「取一次 token」返回的 future。
+///
+/// 写成显式 boxed future 而不是 `impl AsyncFn`：后者的 `CallRefFuture` 带高阶生命周期，
+/// 会让捕获了 `&CredentialStore`/`&reqwest::Client` 的闭包推不出 `Send`
+/// （报 `implementation of Send is not general enough`），而这条链最终要塞进 axum handler。
+/// 固定成单个 `'a` 就没有这个问题；代价是每轮一次 Box 分配，紧挨着一次上游往返，可忽略。
+type AttemptFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<TokenAttempt>> + Send + 'a>>;
+
+/// [`valid_access_token_for_device`] 的重选循环本体。把「取 token」这一步抽成参数注入，
+/// 是为了让换号逻辑本身能脱离网络被测到——这段逻辑此前不存在（刷新失败直接抛错），
+/// 设备会被钉死在坏号上，属于只在生产才暴露的那类 bug，必须有回归测试盯着。
+///
+/// `attempt` 收 `Credential` 而非 `&Credential`：按值传就不会让返回的 future 借用参数，
+/// `AttemptFut<'a>` 里那个 `'a` 才能是固定的。
+async fn select_with_refresh_failover<'a>(
+    store: &CredentialStore,
+    device_id: Option<&str>,
+    attempt: impl Fn(Credential) -> AttemptFut<'a>,
+) -> Result<(String, Credential)> {
+    let ttl = store.device_binding_ttl();
+
+    for round in 0..MAX_REFRESH_FAILOVER {
+        // 每轮都重新选：上一轮停用的那个已被排除，且它的设备绑定已清，这里才会换到新号。
+        let cred = store.select_for_device(device_id, ttl)?;
+        match attempt(cred.clone()).await? {
+            TokenAttempt::Ready(token) => return Ok((token, cred)),
+            TokenAttempt::Revoked(reason) => {
+                tracing::warn!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    round,
+                    reason = %reason,
+                    "refresh_token 已被上游作废，停用该凭证并改选其它账号"
+                );
+                // 停用没生效就必须中止：否则下一轮还会选中同一个号，白转满 MAX_REFRESH_FAILOVER 圈。
+                if !store.mark_banned(cred.id, &reason)? {
+                    anyhow::bail!("凭证 #{} 刷新失败且停用未生效：{reason}", cred.id);
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("连续 {MAX_REFRESH_FAILOVER} 个凭证刷新失败，暂无可用账号")
+}
+
+/// 取该凭证的可用 access_token，未进入刷新窗口就直接复用，否则刷新并回写。
+///
+/// 刷新走该凭证的专属锁 + 双重检查：上游刷新会轮换 refresh_token，并发刷新中后完成的那次
+/// 会把已作废的 token 写回库，导致该凭证之后所有刷新都 `invalid_grant`（账号被自己废掉）。
+/// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
+async fn ensure_fresh_token(
+    store: &CredentialStore,
+    http: &reqwest::Client,
+    cred: &Credential,
+) -> Result<TokenAttempt> {
     if !cred.needs_refresh() {
-        let token = cred.access_token.clone();
-        return Ok((token, cred));
+        return Ok(TokenAttempt::Ready(cred.access_token.clone()));
     }
 
     let lock = store.refresh_lock(cred.id);
     let _guard = lock.lock().await;
     // 双重检查：等锁期间可能已被其它请求刷新过。
-    let cred = store.get(cred.id)?.unwrap_or(cred);
+    let cred = store.get(cred.id)?.unwrap_or_else(|| cred.clone());
     if !cred.needs_refresh() {
         tracing::debug!(id = cred.id, "等锁期间该凭证已被刷新，复用新 token");
-        let token = cred.access_token.clone();
-        return Ok((token, cred));
+        return Ok(TokenAttempt::Ready(cred.access_token));
     }
 
     tracing::info!(id = cred.id, label = %cred.label, "凭证进入刷新窗口，刷新 token");
-    let tokens = crate::oauth::refresh(http, &cred.refresh_token).await?;
-    store.update_tokens(cred.id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)?;
-    Ok((tokens.access_token, cred))
+    let err = match crate::oauth::refresh(http, &cred.refresh_token).await {
+        Ok(tokens) => {
+            store.update_tokens(
+                cred.id,
+                &tokens.access_token,
+                &tokens.refresh_token,
+                tokens.expires_at,
+            )?;
+            return Ok(TokenAttempt::Ready(tokens.access_token));
+        }
+        Err(e) => e,
+    };
+
+    // 无论是否判定为永久失效，都把失败原文打出来：这个端点的失败响应形态我们没有实测样本，
+    // 线上真出现一次就能据此收紧 `is_grant_revoked`。
+    tracing::warn!(id = cred.id, label = %cred.label, error = %err, "刷新 token 失败");
+    match err.downcast_ref::<crate::oauth::TokenEndpointError>() {
+        Some(te) if te.is_grant_revoked() => Ok(TokenAttempt::Revoked(te.ban_reason())),
+        // 网络抖动 / 5xx / 限流 / 非 invalid_grant 的 4xx：凭证本身可能是好的，不停用。
+        _ => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -1376,6 +1509,171 @@ mod tests {
         assert_eq!(store.set_disabled_many(&[], true).unwrap(), 0);
         assert_eq!(store.set_device_limits(&[], 9).unwrap(), 0);
         assert_eq!(store.list().unwrap().len(), 2, "空列表操作不应改动任何账号");
+    }
+
+    /// 刷新失败自动换号所依赖的那一步：停用坏号后，原本绑在它上面的设备必须能改选到别的号。
+    ///
+    /// `select_for_device` 会优先命中既有绑定，所以只是「不再选中被停用的号」还不够——
+    /// `mark_banned` 必须把它的 device_bindings 一并清掉，否则设备被钉死在坏号上，
+    /// [`valid_access_token_for_device`] 的重选循环会一直选回同一个，白转满上限。
+    #[test]
+    fn banned_credential_releases_its_devices() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+
+        // 先把设备粘到 a 上（a 是 id 更小的那个，同优先级下会被先选中）。
+        let first = store.select_for_device(Some("dev-1"), 0).unwrap();
+        assert_eq!(first.id, a.id);
+        // 再选一次仍命中既有绑定，确认粘性生效——这正是坏号会把设备钉死的原因。
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a.id);
+
+        // 模拟「a 的 refresh_token 被作废」后的停用。
+        assert!(store.mark_banned(a.id, "[refresh 400] invalid_grant").unwrap());
+
+        // 重选必须换到 b，而不是继续返回 a 或直接报错。
+        let after = store.select_for_device(Some("dev-1"), 0).unwrap();
+        assert_eq!(after.id, b.id, "停用坏号后设备应改选到其它账号");
+
+        // a 确实被停用并记了原因。
+        let a2 = store.get(a.id).unwrap().unwrap();
+        assert!(a2.disabled);
+        assert_eq!(a2.ban_reason.as_deref(), Some("[refresh 400] invalid_grant"));
+
+        // 池子空了要报错，而不是把停用的号又选回来。
+        assert!(store.mark_banned(b.id, "[refresh 400] invalid_grant").unwrap());
+        assert!(store.select_for_device(Some("dev-1"), 0).is_err(), "无可用凭证时应报错");
+    }
+
+    /// 设备明细必须与设备数同口径：条数等于 `device_count`、只含本凭证的绑定、
+    /// 超过 TTL 未活跃的不出现。否则后台会显示「设备 1/3，展开却列出 2 台」。
+    #[test]
+    fn list_devices_matches_device_count() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+
+        // dev-1 粘到 a（同优先级下 id 小者先中），再来一次命中既有绑定、请求数 +1。
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        // dev-2 是新设备：a 已有 1 台、b 还是 0 台，负载均衡会把它分给 b。
+        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+
+        let a_devs = store.list_devices(a).unwrap();
+        assert_eq!(a_devs.len() as i64, store.device_count(a).unwrap(), "条数应等于设备数");
+        assert_eq!(a_devs.len(), 1, "只应列出绑到 a 的设备");
+        assert_eq!(a_devs[0].device_id, "dev-1");
+        assert_eq!(a_devs[0].request_count, 1, "第二次命中既有绑定应计数");
+        assert_eq!(store.list_devices(b).unwrap()[0].device_id, "dev-2");
+
+        // 把 dev-1 的活跃时间推到 TTL 之外：明细与计数应同步把它排除。
+        store.set_setting(DEVICE_BINDING_TTL, "60").unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE device_bindings SET last_seen_at = unixepoch() - 600 WHERE device_id = ?1",
+                ["dev-1"],
+            )
+            .unwrap();
+        assert_eq!(store.device_count(a).unwrap(), 0);
+        assert!(store.list_devices(a).unwrap().is_empty(), "超时绑定不应出现在明细里");
+    }
+
+    fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let ids = labels
+            .iter()
+            // refresh_token 有 UNIQUE 约束，按 label 取值保证互不相同。
+            .map(|l| store.insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None).unwrap().id)
+            .collect();
+        (store, ids)
+    }
+
+    const REVOKED: &str = "[refresh 400] invalid_grant";
+
+    /// 刷新失败要自动换号：坏号被停用、设备改绑到下一个可用号，请求正常拿到 token。
+    ///
+    /// 这是本次修复的核心——此前刷新失败直接抛错，而设备绑定在选号时就已写库，
+    /// 导致该设备永远选回同一个坏号、永远 503。
+    #[tokio::test]
+    async fn refresh_failure_fails_over_to_next_credential() {
+        let (store, ids) = store_with(&["a", "b", "c"]);
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        // a、b 的 refresh_token 已作废，c 正常。
+        let (token, cred) = select_with_refresh_failover(&store, Some("dev-1"), |c| {
+            tried.borrow_mut().push(c.id);
+            Box::pin(async move {
+                Ok(if c.label == "c" {
+                    TokenAttempt::Ready("good-token".into())
+                } else {
+                    TokenAttempt::Revoked(REVOKED.into())
+                })
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token, "good-token");
+        assert_eq!(cred.id, ids[2], "应换到第一个刷新得动的号");
+        assert_eq!(*tried.borrow(), ids, "应按优先级依次试过 a、b、c");
+
+        // a、b 被停用并记了原因；c 不受影响。
+        for id in &ids[..2] {
+            let c = store.get(*id).unwrap().unwrap();
+            assert!(c.disabled, "作废的号应被停用");
+            assert_eq!(c.ban_reason.as_deref(), Some(REVOKED));
+        }
+        assert!(!store.get(ids[2]).unwrap().unwrap().disabled);
+
+        // 设备最终绑在 c 上，后续请求直接命中它，不再重走换号。
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, ids[2]);
+    }
+
+    /// 可重试错误（网络抖动、5xx、限流）**不得**停用凭证——误停一个健康账号的代价，
+    /// 远高于让客户端重试一次。
+    #[tokio::test]
+    async fn transient_refresh_error_does_not_disable() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let calls = std::cell::Cell::new(0);
+
+        let e = select_with_refresh_failover(&store, Some("dev-1"), |_| {
+            calls.set(calls.get() + 1);
+            Box::pin(async { anyhow::bail!("请求 token 端点失败: connection reset") })
+        })
+        .await
+        .unwrap_err();
+
+        assert!(e.to_string().contains("connection reset"), "应原样抛出底层错误: {e}");
+        assert_eq!(calls.get(), 1, "可重试错误应立即返回，不该继续换号");
+        for id in &ids {
+            assert!(!store.get(*id).unwrap().unwrap().disabled, "可重试错误不得停用凭证");
+        }
+        // 绑定保留，客户端重试时仍落回同一个号。
+        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, ids[0]);
+    }
+
+    /// 所有号的 refresh_token 都作废时要报错收场，不能死循环、也不能返回停用的号。
+    #[tokio::test]
+    async fn all_credentials_revoked_gives_up() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        let e = select_with_refresh_failover(&store, Some("dev-1"), |c| {
+            tried.borrow_mut().push(c.id);
+            Box::pin(async { Ok(TokenAttempt::Revoked(REVOKED.into())) })
+        })
+        .await
+        .unwrap_err();
+
+        // 号用完后是 select_for_device 先报「没有可用凭证」，而不是转满 MAX_REFRESH_FAILOVER 圈。
+        assert!(e.to_string().contains("没有可用凭证"), "错误信息应指向根因: {e}");
+        assert_eq!(*tried.borrow(), ids, "每个号都应被试过一次，且只试一次");
+        assert!(store.list().unwrap().iter().all(|c| c.disabled));
     }
 
     /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。

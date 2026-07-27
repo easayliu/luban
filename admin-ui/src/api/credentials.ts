@@ -43,6 +43,18 @@ export interface Credential {
   cost_total: number
 }
 
+/** 一条设备绑定明细；口径同 `device_count`：只含 TTL 内仍活跃的绑定。 */
+export interface DeviceBinding {
+  /** 客户端 metadata 里的原始 device_id。 */
+  device_id: string
+  /** 该设备经此账号转发过的累计请求数。 */
+  request_count: number
+  /** 首次绑定时间（Unix 秒）。 */
+  created_at: number
+  /** 最近一次活跃时间（Unix 秒）。 */
+  last_seen_at: number
+}
+
 /** 生成授权链接（后端暂存 PKCE）。 */
 export async function getAuthorizeUrl(): Promise<{ url: string }> {
   const { data } = await api.get<{ url: string }>('/authorize')
@@ -58,6 +70,12 @@ export async function exchangeCode(code: string, label?: string): Promise<Creden
 /** 列出全部凭证。 */
 export async function listCredentials(): Promise<Credential[]> {
   const { data } = await api.get<Credential[]>('/credentials')
+  return data
+}
+
+/** 列出某账号当前绑定的设备（按最近活跃倒序）。 */
+export async function listCredentialDevices(id: number): Promise<DeviceBinding[]> {
+  const { data } = await api.get<DeviceBinding[]>(`/credentials/${id}/devices`)
   return data
 }
 

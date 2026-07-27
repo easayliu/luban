@@ -13,7 +13,12 @@ futures-util = { version = "0.3.31", default-features = false, features = ["std"
 mime_guess = "2"
 parking_lot = "0.12.5"
 rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "stream"] }
+# gzip/brotli/zstd/deflate：转发时我们按官方客户端形态声明 `accept-encoding: gzip, deflate,
+# br, zstd`，上游（Cloudflare）就真的会压——连 140 字节的错误体都压，SSE 也不例外。
+# 不开这几个 feature 的话响应体是压缩字节，用量嗅探与账号级错误判定全部拿不到数据。
+# 四个必须都开：声明了哪几种，上游就可能挑其中任意一种。
+# 解压只发生在收到字节之后，发给上游的请求逐字节不变（见 web::upstream_client）。
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "stream", "gzip", "brotli", "zstd", "deflate"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -25,3 +30,7 @@ sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
+
+[dev-dependencies]
+# 仅测试用：构造 gzip 响应，验证上游客户端确实会透明解码（见 proxy 的 decodes_gzip_* 测试）。
+flate2 = "1"

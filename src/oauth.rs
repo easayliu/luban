@@ -253,6 +253,49 @@ pub async fn exchange_code(
     post_token(client, body).await
 }
 
+/// token 端点返回的非 2xx 响应。作为 typed error 抛出（而不是拍平成字符串），
+/// 让调用方能区分「refresh_token 已被上游作废」与「网络/服务端抖动」——前者只能换号，
+/// 后者重试即可。见 [`Self::is_grant_revoked`] 与
+/// [`crate::store::valid_access_token_for_device`]。
+#[derive(Debug)]
+pub struct TokenEndpointError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for TokenEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "token 端点返回 {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for TokenEndpointError {}
+
+impl TokenEndpointError {
+    /// 该 refresh_token 是否已被上游**永久**作废（重试没有意义，只能停用换号）。
+    ///
+    /// 判据取 OAuth 2.0 的 `invalid_grant`——refresh_token 被吊销/过期/已轮换作废时的标准
+    /// 错误码。刻意**只**认这一个、且只在 400/401 上认：误判会把健康账号停用掉，
+    /// 和 [`crate::proxy::detect_account_ban`] 收紧时是同一个教训。403/429/5xx 以及所有
+    /// 网络层错误一律当可重试，不停用。
+    ///
+    /// 注意：这个端点真实的失败响应形态我们**没有实测样本**，故这里只做保守的字面量匹配，
+    /// 而不去猜它的 JSON 结构。刷新失败时无论是否命中都会把响应体原样打进日志
+    /// （见 [`crate::store::valid_access_token_for_device`]），线上真出现一次即可据此收紧。
+    pub fn is_grant_revoked(&self) -> bool {
+        matches!(self.status.as_u16(), 400 | 401)
+            && self.body.to_ascii_lowercase().contains("invalid_grant")
+    }
+
+    /// 写入 `ban_reason` 的原因（截断至 200 字符，与 `detect_account_ban` 的口径一致）。
+    pub fn ban_reason(&self) -> String {
+        format!("[refresh {}] {}", self.status.as_u16(), self.body.trim())
+            .chars()
+            .take(200)
+            .collect()
+    }
+}
+
 /// 用 refresh_token 刷新出新的 access_token。
 pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<TokenSet> {
     let body = serde_json::json!({
@@ -276,7 +319,7 @@ async fn post_token(client: &reqwest::Client, body: serde_json::Value) -> Result
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("token 端点返回 {}: {}", status, text);
+        return Err(TokenEndpointError { status, body: text }.into());
     }
 
     let token: TokenResponse =
@@ -327,4 +370,65 @@ fn urlencode(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenEndpointError;
+    use reqwest::StatusCode;
+
+    fn err(status: StatusCode, body: &str) -> TokenEndpointError {
+        TokenEndpointError { status, body: body.into() }
+    }
+
+    /// refresh_token 被吊销/轮换作废：判定为永久失效，触发停用并换号。
+    #[test]
+    fn detects_revoked_grant() {
+        let cases = [
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","error_description":"Refresh token not found"}"#,
+            ),
+            (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_grant"}"#),
+            // 大小写不敏感。
+            (StatusCode::BAD_REQUEST, r#"{"error":"INVALID_GRANT"}"#),
+        ];
+        for (status, body) in cases {
+            assert!(err(status, body).is_grant_revoked(), "应判定为永久失效: {status} {body}");
+        }
+    }
+
+    /// 其余一律当可重试——误判会把健康账号停用掉，宁可多 503 一次也不停错号。
+    #[test]
+    fn does_not_revoke_on_retryable_errors() {
+        let cases = [
+            // 服务端抖动。
+            (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"server_error"}"#),
+            (StatusCode::BAD_GATEWAY, "<html>502</html>"),
+            // 限流：等一会儿就好，账号是好的。
+            (StatusCode::TOO_MANY_REQUESTS, r#"{"error":"rate_limited"}"#),
+            // 非 invalid_grant 的 4xx：多半是我们自己请求构造错了，不该记到账号头上。
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_request"}"#),
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#),
+            (StatusCode::FORBIDDEN, r#"{"error":"access_denied"}"#),
+            // 状态码对但内容无关：不认。
+            (StatusCode::BAD_REQUEST, "Bad Request"),
+            // 内容命中但状态码不对：同样不认，两个条件都要满足。
+            (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"invalid_grant"}"#),
+        ];
+        for (status, body) in cases {
+            assert!(!err(status, body).is_grant_revoked(), "不应停用: {status} {body}");
+        }
+    }
+
+    /// ban_reason 带上状态码、去掉首尾空白、截断至 200 字符。
+    #[test]
+    fn ban_reason_is_bounded() {
+        let e = err(StatusCode::BAD_REQUEST, "  {\"error\":\"invalid_grant\"}  ");
+        assert_eq!(e.ban_reason(), r#"[refresh 400] {"error":"invalid_grant"}"#);
+
+        let long = err(StatusCode::BAD_REQUEST, &"x".repeat(500));
+        assert_eq!(long.ban_reason().chars().count(), 200);
+    }
 }
