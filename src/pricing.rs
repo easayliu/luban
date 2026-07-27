@@ -102,7 +102,8 @@ pub struct Usage<'a> {
 pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
     let model = u.model?;
     // fast 档只对支持的模型生效；不支持时回落标准价，避免凭请求字段虚高。
-    let rate = match is_fast(u.speed).then(|| fast_rate_for(&model.to_ascii_lowercase())).flatten() {
+    let rate = match is_fast(u.speed).then(|| fast_rate_for(&model.to_ascii_lowercase())).flatten()
+    {
         Some(r) => r,
         None => rate_for(model)?,
     };
@@ -224,9 +225,7 @@ mod tests {
         assert_eq!(rate("claude-opus-4-8"), (5.0, 25.0), "不带 speed 时仍是标准价");
 
         // 显式 standard、大小写变体、以及不支持 fast 的模型都走标准价。
-        let inp = |m, s| {
-            estimate_usd(Usage { input_tokens: Some(1_000_000), ..usage(m, s) })
-        };
+        let inp = |m, s| estimate_usd(Usage { input_tokens: Some(1_000_000), ..usage(m, s) });
         assert_eq!(inp("claude-opus-5", Some("standard")), Some(5.0));
         assert_eq!(inp("claude-opus-5", Some("FAST")), Some(10.0), "speed 匹配应忽略大小写");
         assert_eq!(

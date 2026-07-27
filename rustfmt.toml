@@ -1,0 +1,9 @@
+# 排版对齐仓库既有的宽风格：默认配置会把单行 if-else、结构体字面量、链式调用统统拆成
+# 多行（默认阈值 50/18/60 字符），与本仓库贴近 100 列的紧凑写法冲突，全量格式化一次会重排
+# 全部源码。`Max` 把这些阈值放宽到 max_width，改动最小。
+max_width = 100
+use_small_heuristics = "Max"
+
+# 冻结排版规则的版本。不写这行时 rustfmt 跟随 crate 的 edition 走，将来 Rust 换了默认风格
+# 就会莫名其妙重排全仓；写死之后升级 toolchain 也不会动排版，无需为此再 pin 整条工具链。
+style_edition = "2024"

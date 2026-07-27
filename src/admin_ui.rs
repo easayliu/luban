@@ -27,9 +27,7 @@ pub async fn fallback(uri: Uri) -> impl IntoResponse {
     }
 
     if let Some(content) = Asset::get(path) {
-        let mime = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
+        let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime)
@@ -59,9 +57,7 @@ fn serve_index() -> Response<Body> {
             .expect("build response"),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(
-                "前端尚未构建。请在 admin-ui 目录执行 `pnpm build`。",
-            ))
+            .body(Body::from("前端尚未构建。请在 admin-ui 目录执行 `pnpm build`。"))
             .expect("build response"),
     }
 }
@@ -77,8 +73,5 @@ fn cache_control(path: &str) -> &'static str {
 }
 
 fn is_asset_path(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .map(|f| f.contains('.'))
-        .unwrap_or(false)
+    path.rsplit('/').next().map(|f| f.contains('.')).unwrap_or(false)
 }

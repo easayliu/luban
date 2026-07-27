@@ -45,9 +45,7 @@ impl CredentialStore {
     pub fn db_path() -> Result<PathBuf> {
         let base = match std::env::var_os("LUBAN_HOME") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::home_dir()
-                .context("无法定位用户主目录")?
-                .join(".luban"),
+            None => dirs::home_dir().context("无法定位用户主目录")?.join(".luban"),
         };
         Ok(base.join("luban.db"))
     }
@@ -59,8 +57,8 @@ impl CredentialStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建目录失败: {}", parent.display()))?;
         }
-        let conn =
-            Connection::open(&path).with_context(|| format!("打开凭证库失败: {}", path.display()))?;
+        let conn = Connection::open(&path)
+            .with_context(|| format!("打开凭证库失败: {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -70,10 +68,7 @@ impl CredentialStore {
 
     /// 由已初始化的连接构造（`open_default` 与测试共用）。
     fn with_conn(conn: Connection) -> Self {
-        Self {
-            conn: Mutex::new(conn),
-            refresh_locks: Mutex::new(HashMap::new()),
-        }
+        Self { conn: Mutex::new(conn), refresh_locks: Mutex::new(HashMap::new()) }
     }
 
     /// 取该凭证的刷新锁（不存在则创建）。
@@ -102,12 +97,8 @@ impl CredentialStore {
         )
         .context("插入凭证失败（refresh_token 可能已存在）")?;
         let id = conn.last_insert_rowid();
-        conn.query_row(
-            &format!("SELECT {COLS} FROM credentials WHERE id = ?1"),
-            [id],
-            row_to_cred,
-        )
-        .context("读取新插入凭证失败")
+        conn.query_row(&format!("SELECT {COLS} FROM credentials WHERE id = ?1"), [id], row_to_cred)
+            .context("读取新插入凭证失败")
     }
 
     /// 列出全部凭证，按 (priority, id) 升序。
@@ -126,16 +117,12 @@ impl CredentialStore {
     /// 按 id 读取单条。
     pub fn get(&self, id: i64) -> Result<Option<Credential>> {
         let conn = self.conn.lock();
-        conn.query_row(
-            &format!("SELECT {COLS} FROM credentials WHERE id = ?1"),
-            [id],
-            row_to_cred,
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other.into()),
-        })
+        conn.query_row(&format!("SELECT {COLS} FROM credentials WHERE id = ?1"), [id], row_to_cred)
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
     }
 
     /// 删除一条，返回是否确有删除。连带清除其设备绑定与历史用量日志。
@@ -411,11 +398,13 @@ impl CredentialStore {
         let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
         let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
-        let sql =
-            format!("SELECT cred_id, COUNT(*) FROM device_bindings {where_clause} GROUP BY cred_id");
+        let sql = format!(
+            "SELECT cred_id, COUNT(*) FROM device_bindings {where_clause} GROUP BY cred_id"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
-        let rows = if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
+        let rows =
+            if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
         let mut out = HashMap::new();
         for row in rows {
             let (cid, n) = row?;
@@ -955,10 +944,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
-    let _ = conn.execute(
-        "ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
+    let _ = conn
+        .execute("ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0", []);
     // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
     // 与管理员手动停用（disabled=1 且本字段为空）区分开。见 `mark_banned`。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN ban_reason TEXT", []);
@@ -1108,11 +1095,9 @@ impl CredentialStore {
         // 1/2) 命中既有绑定。
         if let Some(did) = device_id {
             let bound: Option<i64> = conn
-                .query_row(
-                    "SELECT cred_id FROM device_bindings WHERE device_id = ?1",
-                    [did],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT cred_id FROM device_bindings WHERE device_id = ?1", [did], |r| {
+                    r.get(0)
+                })
                 .optional()?;
             if let Some(cid) = bound {
                 if let Some(c) = creds.iter().find(|c| c.id == cid) {
@@ -1161,10 +1146,7 @@ impl CredentialStore {
             }
         } else {
             // 无 device_id：不占名额、不受限，按优先级档 + 档内负载均衡挑一个（creds 已保证非空）。
-            creds
-                .iter()
-                .min_by_key(|c| (c.priority, used(c), c.id))
-                .expect("启用凭证列表非空")
+            creds.iter().min_by_key(|c| (c.priority, used(c), c.id)).expect("启用凭证列表非空")
         };
 
         if let Some(did) = device_id {
@@ -1222,7 +1204,8 @@ pub async fn valid_access_token_for_device(
 /// 会让捕获了 `&CredentialStore`/`&reqwest::Client` 的闭包推不出 `Send`
 /// （报 `implementation of Send is not general enough`），而这条链最终要塞进 axum handler。
 /// 固定成单个 `'a` 就没有这个问题；代价是每轮一次 Box 分配，紧挨着一次上游往返，可忽略。
-type AttemptFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<TokenAttempt>> + Send + 'a>>;
+type AttemptFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<TokenAttempt>> + Send + 'a>>;
 
 /// [`valid_access_token_for_device`] 的重选循环本体。把「取 token」这一步抽成参数注入，
 /// 是为了让换号逻辑本身能脱离网络被测到——这段逻辑此前不存在（刷新失败直接抛错），
@@ -1348,7 +1331,8 @@ mod tests {
         assert!(ddl.contains("AUTOINCREMENT"), "迁移后应为 AUTOINCREMENT");
 
         // 既有行与其 id 全部保留（迁移把 sqlite_sequence 播种为 MAX(id)=3）。
-        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
+        let cnt: i64 =
+            conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
         assert_eq!(cnt, 3);
 
         // 迁移后删掉最大 id，新插入应得 4，而非复用被删的 3。
@@ -1363,7 +1347,8 @@ mod tests {
         // 迁移后再次 init_schema 必须是无副作用的 no-op（RENAME 后 DDL 仍含 AUTOINCREMENT，
         // 不应二次重建而丢数据）。
         init_schema(&conn).unwrap();
-        let after: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
+        let after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
         assert_eq!(after, 3, "二次 init_schema 不应改动数据");
     }
 
@@ -1380,8 +1365,7 @@ mod tests {
         .unwrap();
         // 账号 2 已被（旧版逻辑）删掉，但历史数据还在。
         for cid in ["1", "2", "NULL"] {
-            conn.execute(&format!("INSERT INTO usage_logs (cred_id) VALUES ({cid})"), [])
-                .unwrap();
+            conn.execute(&format!("INSERT INTO usage_logs (cred_id) VALUES ({cid})"), []).unwrap();
         }
         for (did, cid) in [("d1", 1), ("d2", 2)] {
             conn.execute(
@@ -1642,7 +1626,16 @@ mod tests {
         assert!((d.cost_usd_all - 1.75).abs() < 1e-9, "合计要含 b 上的：{}", d.cost_usd_all);
 
         // 没有任何用量日志的设备给 0，而不是 NULL 取值失败。
-        assert_eq!(store.list_devices(b).unwrap().iter().find(|x| x.device_id == "dev-2").unwrap().cost_usd, 0.125);
+        assert_eq!(
+            store
+                .list_devices(b)
+                .unwrap()
+                .iter()
+                .find(|x| x.device_id == "dev-2")
+                .unwrap()
+                .cost_usd,
+            0.125
+        );
 
         // 解绑再重绑：请求数从零重数，费用是历史累计，不受影响。
         assert!(store.unbind_device(a, "dev-1").unwrap());
@@ -1699,7 +1692,12 @@ mod tests {
         let ids = labels
             .iter()
             // refresh_token 有 UNIQUE 约束，按 label 取值保证互不相同。
-            .map(|l| store.insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None).unwrap().id)
+            .map(|l| {
+                store
+                    .insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None)
+                    .unwrap()
+                    .id
+            })
             .collect();
         (store, ids)
     }

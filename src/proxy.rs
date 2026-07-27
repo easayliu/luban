@@ -25,7 +25,8 @@ pub async fn handle(
     body: Bytes,
 ) -> Response {
     let started = std::time::Instant::now();
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
+    let path_and_query =
+        uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
 
     // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
     if let Some(expected) = effective_client_key(&state) {
@@ -44,7 +45,8 @@ pub async fn handle(
     if device_id.is_none() {
         if state.store.require_device_id() {
             tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
-            return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）").into_response();
+            return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）")
+                .into_response();
         }
         tracing::debug!(%method, path = %path_and_query, "放行无设备身份的请求（设备身份校验已关闭）");
     }
@@ -95,13 +97,7 @@ pub async fn handle(
     let body = rewrite_body(&body, &cred, &device_fp, state.store.spoof_identity_enabled());
 
     // 7) 发起上游请求并流式回传。
-    let resp = state
-        .http
-        .request(method.clone(), &url)
-        .headers(out)
-        .body(body)
-        .send()
-        .await;
+    let resp = state.http.request(method.clone(), &url).headers(out).body(body).send().await;
 
     match resp {
         Ok(up) => {
@@ -188,15 +184,15 @@ pub async fn handle(
                                 tracing::warn!(error = %e, "自动停用凭证失败");
                             }
                         }
-                        builder
-                            .body(Body::from(bytes))
-                            .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+                        builder.body(Body::from(bytes)).unwrap_or_else(|e| {
+                            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                        })
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "读取上游错误响应体失败");
-                        builder
-                            .body(Body::empty())
-                            .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+                        builder.body(Body::empty()).unwrap_or_else(|e| {
+                            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                        })
                     }
                 };
             }
@@ -389,11 +385,7 @@ struct UsageSniffer {
 
 impl UsageSniffer {
     fn new(is_stream: bool, opaque: bool) -> Self {
-        Self {
-            is_stream,
-            opaque,
-            ..Default::default()
-        }
+        Self { is_stream, opaque, ..Default::default() }
     }
 
     /// 喂入一块响应字节。
@@ -524,17 +516,20 @@ fn parse_flat_user_id(s: &str) -> Option<FlatUserId> {
     let rest = s.strip_prefix("user_")?;
     let (device, rest) = rest.split_once("_account_")?;
     let (_account, session) = rest.split_once("_session_")?;
-    Some(FlatUserId {
-        device: device.to_string(),
-        session: session.to_string(),
-    })
+    Some(FlatUserId { device: device.to_string(), session: session.to_string() })
 }
 
 /// 400 场景下的账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用/授权失效」，
 /// 以区别于常规的客户端请求错误（invalid_request_error，如模型名错、body 超长）——避免
 /// 客户端一条坏请求重试时把所有账号逐个误禁。命中后原文（截断）存作 `ban_reason`。
 const BAN_KEYWORDS: &[&str] = &[
-    "disabled", "suspended", "banned", "terminated", "deactivated", "violat", "invalid_grant",
+    "disabled",
+    "suspended",
+    "banned",
+    "terminated",
+    "deactivated",
+    "violat",
+    "invalid_grant",
     "oauth",
 ];
 
@@ -548,8 +543,7 @@ fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     let text = String::from_utf8_lossy(body);
     let v = serde_json::from_slice::<serde_json::Value>(body).ok();
     let field = |name: &str| {
-        v.as_ref()
-            .and_then(|v| v.get("error")?.get(name)?.as_str().map(str::to_string))
+        v.as_ref().and_then(|v| v.get("error")?.get(name)?.as_str().map(str::to_string))
     };
     (field("type"), field("message").unwrap_or_else(|| text.to_string()))
 }
@@ -594,12 +588,7 @@ fn effective_client_key(state: &AppState) -> Option<String> {
     if let Some(k) = &state.client_key {
         return Some(k.to_string());
     }
-    state
-        .store
-        .get_setting(store::CLIENT_API_KEY)
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
+    state.store.get_setting(store::CLIENT_API_KEY).ok().flatten().filter(|s| !s.trim().is_empty())
 }
 
 /// 校验来访身份：`x-api-key: <key>` 或 `Authorization: Bearer <key>`。
@@ -634,10 +623,7 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     }
     // 稳定排序：已知 beta 按官方位次，未知的排在最后并保留原有相对顺序。
     let rank = |p: &String| {
-        config::CC_BETA_ORDER
-            .iter()
-            .position(|k| k == p)
-            .unwrap_or(config::CC_BETA_ORDER.len())
+        config::CC_BETA_ORDER.iter().position(|k| k == p).unwrap_or(config::CC_BETA_ORDER.len())
     };
     parts.sort_by_key(rank);
     parts.join(",")
@@ -678,10 +664,7 @@ fn build_forward_headers(headers: &HeaderMap, token: &str) -> HeaderMap {
     }
     // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
     if !out.contains_key(header::ACCEPT_ENCODING) {
-        out.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static(config::CC_ACCEPT_ENCODING),
-        );
+        out.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
     }
     // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
     if !out.contains_key("x-client-request-id")
@@ -710,14 +693,7 @@ fn uuid_v4() -> String {
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10
     let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        h(&b[0..4]),
-        h(&b[4..6]),
-        h(&b[6..8]),
-        h(&b[8..10]),
-        h(&b[10..16])
-    )
+    format!("{}-{}-{}-{}-{}", h(&b[0..4]), h(&b[4..6]), h(&b[6..8]), h(&b[8..10]), h(&b[10..16]))
 }
 
 /// 读取请求体里声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
@@ -786,12 +762,7 @@ fn rewrite_body(
 /// （runtime 版本、UA 版本号），以免每次升级都刷新 device_id。
 fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> String {
     let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
-    format!(
-        "{}|{}|{}",
-        client_device_id.unwrap_or(""),
-        h("x-stainless-arch"),
-        h("x-stainless-os"),
-    )
+    format!("{}|{}|{}", client_device_id.unwrap_or(""), h("x-stainless-arch"), h("x-stainless-os"),)
 }
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
@@ -973,7 +944,9 @@ impl RateLimitInfo {
         let mut pairs: Vec<String> = Vec::new();
         for (k, v) in headers.iter() {
             let name = k.as_str().to_ascii_lowercase();
-            if !(name.contains("ratelimit") || name == "retry-after" || name.starts_with("anthropic-"))
+            if !(name.contains("ratelimit")
+                || name == "retry-after"
+                || name.starts_with("anthropic-"))
             {
                 continue;
             }
@@ -981,12 +954,16 @@ impl RateLimitInfo {
             pairs.push(format!("{name}={val}"));
             match name.as_str() {
                 "anthropic-ratelimit-unified-status" => info.unified_status = Some(val.to_string()),
-                "anthropic-ratelimit-unified-5h-status" => info.five_h_status = Some(val.to_string()),
+                "anthropic-ratelimit-unified-5h-status" => {
+                    info.five_h_status = Some(val.to_string())
+                }
                 "anthropic-ratelimit-unified-5h-reset" => info.five_h_reset = val.parse().ok(),
                 "anthropic-ratelimit-unified-5h-utilization" => {
                     info.five_h_utilization = val.parse().ok()
                 }
-                "anthropic-ratelimit-unified-7d-status" => info.seven_d_status = Some(val.to_string()),
+                "anthropic-ratelimit-unified-7d-status" => {
+                    info.seven_d_status = Some(val.to_string())
+                }
                 "anthropic-ratelimit-unified-7d-reset" => info.seven_d_reset = val.parse().ok(),
                 "anthropic-ratelimit-unified-7d-utilization" => {
                     info.seven_d_utilization = val.parse().ok()
@@ -1118,10 +1095,7 @@ mod tests {
             ("anthropic-version", "2023-06-01"),
             ("x-app", "cli"),
         ] {
-            h.insert(
-                super::HeaderName::from_static(k),
-                HeaderValue::from_static(v),
-            );
+            h.insert(super::HeaderName::from_static(k), HeaderValue::from_static(v));
         }
         h
     }
@@ -1144,8 +1118,8 @@ mod tests {
             vec![
                 "accept",
                 "accept-encoding",
-                "authorization",  // 原位，值被换成 OAuth token
-                "connection",     // keep-alive 保留转发
+                "authorization", // 原位，值被换成 OAuth token
+                "connection",    // keep-alive 保留转发
                 "content-type",
                 // proxy-connection 被剥离
                 "x-claude-code-session-id",
@@ -1351,10 +1325,7 @@ mod tests {
             ],
             "线上头序与来访不符:\n{raw}"
         );
-        assert!(
-            raw.contains("connection: keep-alive"),
-            "hyper 吞掉了显式的 Connection 头:\n{raw}"
-        );
+        assert!(raw.contains("connection: keep-alive"), "hyper 吞掉了显式的 Connection 头:\n{raw}");
         // hyper 自己追加的三个：位置无法控制，只断言它们确实在末尾，别的没变。
         let mut appended = wire[tail..].to_vec();
         appended.sort_unstable();
@@ -1432,11 +1403,15 @@ mod tests {
         // 嵌套对象同样不重排：system 块是 type→text（字母序会变成 text→type），
         // cache_control 新增的 scope 追加在 type 之后。
         assert!(s.contains(r#"{"type":"text","text":"big""#), "system 块 key 被重排: {s}");
-        assert!(s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#), "cache_control key 被重排: {s}");
+        assert!(
+            s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#),
+            "cache_control key 被重排: {s}"
+        );
 
         // 内层 user_id 仍走定点替换，device_id→account_uuid→session_id 原序。
         assert!(
-            s.contains(r#"\"device_id\":\""#) && s.find(r#"\"device_id\":\""#) < s.find(r#"\"account_uuid\":\""#),
+            s.contains(r#"\"device_id\":\""#)
+                && s.find(r#"\"device_id\":\""#) < s.find(r#"\"account_uuid\":\""#),
             "内层 user_id key 被重排: {s}"
         );
     }
@@ -1448,8 +1423,9 @@ mod tests {
     /// 补出的 billing header 与订阅模式的真实形态一致（抓包 040 的 `; cch=…;` 形态）。
     #[test]
     fn adds_cch_in_official_shape() {
-        let mut v =
-            body_with_system0("x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;");
+        let mut v = body_with_system0(
+            "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;",
+        );
         assert!(ensure_billing_cch(&mut v));
         assert_eq!(
             v["system"][0]["text"],
@@ -1467,7 +1443,8 @@ mod tests {
         );
         assert!(!ensure_billing_cch(&mut has));
 
-        let mut other = body_with_system0("You are Claude Code, Anthropic's official CLI for Claude.");
+        let mut other =
+            body_with_system0("You are Claude Code, Anthropic's official CLI for Claude.");
         assert!(!ensure_billing_cch(&mut other));
 
         let mut empty = serde_json::json!({"messages": []});
@@ -1553,20 +1530,14 @@ mod tests {
     fn replaces_value_and_preserves_order() {
         let s = replace_json_str_field(CC, "account_uuid", "NEW").unwrap();
         let s = replace_json_str_field(&s, "device_id", "DEV").unwrap();
-        assert_eq!(
-            s,
-            r#"{"device_id":"DEV","account_uuid":"NEW","session_id":"ssss"}"#
-        );
+        assert_eq!(s, r#"{"device_id":"DEV","account_uuid":"NEW","session_id":"ssss"}"#);
     }
 
     #[test]
     fn fills_empty_account_uuid() {
         let empty = r#"{"device_id":"dddd","account_uuid":"","session_id":"ssss"}"#;
         let s = replace_json_str_field(empty, "account_uuid", "FILLED").unwrap();
-        assert_eq!(
-            s,
-            r#"{"device_id":"dddd","account_uuid":"FILLED","session_id":"ssss"}"#
-        );
+        assert_eq!(s, r#"{"device_id":"dddd","account_uuid":"FILLED","session_id":"ssss"}"#);
     }
 
     #[test]

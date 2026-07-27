@@ -227,9 +227,7 @@ async fn exchange(
         .map_err(|e| bad_request(e.to_string()))?;
 
     // 拉取账号 profile 拿邮箱/姓名/等级（失败不阻断，用兜底）。
-    let profile = oauth::fetch_profile(&state.http, &tokens.access_token)
-        .await
-        .unwrap_or_default();
+    let profile = oauth::fetch_profile(&state.http, &tokens.access_token).await.unwrap_or_default();
 
     // 显示名优先级：用户填写 > profile 邮箱 > profile 姓名 > 交换响应邮箱 > 「账号 N」。
     let label = match req.label.map(|s| s.trim().to_string()) {
@@ -286,7 +284,9 @@ async fn list_usage(
 // ---------- 凭证管理 ----------
 
 /// 列出全部凭证（token 已脱敏）。
-async fn list_credentials(State(state): State<AppState>) -> Result<Json<Vec<CredentialView>>, ApiError> {
+async fn list_credentials(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
     let counts = state.store.device_counts().map_err(internal)?;
     let quotas = state.store.latest_quotas().map_err(internal)?;
@@ -547,8 +547,7 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let cost_total = state.store.cost_by_cred().map_err(internal)?.remove(&id).unwrap_or(0.0);
     let default_limit = state.store.default_device_limit();
     Ok(Json(
-        CredentialView::new(&cred, count, default_limit)
-            .with_stats(quota, last_used, cost_total),
+        CredentialView::new(&cred, count, default_limit).with_stats(quota, last_used, cost_total),
     ))
 }
 
@@ -680,10 +679,7 @@ async fn set_require_device_id(
     Json(req): Json<SetRequireDeviceIdReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let value = if req.required { "true" } else { "false" };
-    state
-        .store
-        .set_setting(crate::store::REQUIRE_DEVICE_ID, value)
-        .map_err(internal)?;
+    state.store.set_setting(crate::store::REQUIRE_DEVICE_ID, value).map_err(internal)?;
     tracing::info!(required = req.required, "设备身份校验开关变更");
     Ok(Json(settings_resp(&state)))
 }
@@ -700,10 +696,7 @@ async fn set_spoof_identity(
     Json(req): Json<SetSpoofIdentityReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let value = if req.enabled { "true" } else { "false" };
-    state
-        .store
-        .set_setting(crate::store::SPOOF_IDENTITY_ENABLED, value)
-        .map_err(internal)?;
+    state.store.set_setting(crate::store::SPOOF_IDENTITY_ENABLED, value).map_err(internal)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -785,11 +778,7 @@ impl CredentialView {
 fn mask_token(token: &str) -> String {
     let tail: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
     let prefix: String = token.splitn(4, '-').take(3).collect::<Vec<_>>().join("-");
-    if prefix.is_empty() {
-        format!("…{}", tail)
-    } else {
-        format!("{}-…{}", prefix, tail)
-    }
+    if prefix.is_empty() { format!("…{}", tail) } else { format!("{}-…{}", prefix, tail) }
 }
 
 fn bad_request(msg: impl Into<String>) -> ApiError {
@@ -811,9 +800,7 @@ fn open_in_browser(url: &str) {
 
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
     }
     #[cfg(not(target_os = "windows"))]
     {

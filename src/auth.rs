@@ -31,12 +31,7 @@ fn admin_hash(state: &AppState) -> Option<String> {
     if let Some(pw) = &state.admin_env {
         return Some(sha256_hex(pw));
     }
-    state
-        .store
-        .get_setting(store::ADMIN_PASSWORD)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
+    state.store.get_setting(store::ADMIN_PASSWORD).ok().flatten().filter(|s| !s.is_empty())
 }
 
 /// 中间件：未设密码放行；已设则校验 `Authorization: Bearer <password>`。
@@ -116,10 +111,7 @@ pub async fn setup(
     if pw.len() < 4 {
         return Err((StatusCode::BAD_REQUEST, "密码至少 4 位".into()));
     }
-    state
-        .store
-        .set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw))
-        .map_err(internal)?;
+    state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
     Ok(ok_json())
 }
 
@@ -138,10 +130,7 @@ pub async fn change_password(
         if pw.len() < 4 {
             return Err((StatusCode::BAD_REQUEST, "密码至少 4 位".into()));
         }
-        state
-            .store
-            .set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw))
-            .map_err(internal)?;
+        state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
     }
     Ok(ok_json())
 }

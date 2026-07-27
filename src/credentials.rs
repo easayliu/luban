@@ -80,8 +80,5 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// 当前 Unix 时间戳（秒）。
 pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }

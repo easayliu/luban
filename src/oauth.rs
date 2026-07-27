@@ -48,11 +48,7 @@ impl PkceChallenge {
         hasher.update(verifier.as_bytes());
         let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
-        Self {
-            verifier,
-            challenge,
-            state,
-        }
+        Self { verifier, challenge, state }
     }
 
     /// 构造用户需要在浏览器打开的授权 URL。
@@ -67,10 +63,8 @@ impl PkceChallenge {
             ("code_challenge_method", "S256"),
             ("state", &self.state),
         ];
-        let query: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencode(v)))
-            .collect();
+        let query: Vec<String> =
+            params.iter().map(|(k, v)| format!("{}={}", k, urlencode(v))).collect();
         format!("{}?{}", config::AUTHORIZE_URL, query.join("&"))
     }
 }
@@ -164,16 +158,10 @@ pub async fn fetch_profile(client: &reqwest::Client, access_token: &str) -> Resu
     );
     let email = p.account.as_ref().and_then(|a| a.email.clone());
     let name = p.account.as_ref().and_then(|a| {
-        a.full_name
-            .clone()
-            .or_else(|| a.display_name.clone())
-            .filter(|s| !s.trim().is_empty())
+        a.full_name.clone().or_else(|| a.display_name.clone()).filter(|s| !s.trim().is_empty())
     });
-    let account_uuid = p
-        .account
-        .as_ref()
-        .and_then(|a| a.uuid.clone())
-        .filter(|s| !s.trim().is_empty());
+    let account_uuid =
+        p.account.as_ref().and_then(|a| a.uuid.clone()).filter(|s| !s.trim().is_empty());
 
     Ok(Profile { email, name, tier, account_uuid })
 }
@@ -309,12 +297,8 @@ pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<To
 
 /// 向 token 端点 POST，并把响应转换为带过期时间戳的 `TokenSet`。
 async fn post_token(client: &reqwest::Client, body: serde_json::Value) -> Result<TokenSet> {
-    let resp = client
-        .post(config::TOKEN_URL)
-        .json(&body)
-        .send()
-        .await
-        .context("请求 token 端点失败")?;
+    let resp =
+        client.post(config::TOKEN_URL).json(&body).send().await.context("请求 token 端点失败")?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
