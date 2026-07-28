@@ -1,7 +1,13 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  ShieldCheckIcon, ExclamationTriangleIcon, SignalIcon, DevicePhoneMobileIcon,
+  MagnifyingGlassIcon, PlusIcon, Cog6ToothIcon, FunnelIcon, Squares2X2Icon,
+  Bars3Icon, QueueListIcon, ArrowsUpDownIcon,
+} from '@heroicons/react/24/outline'
 import { CredentialCard } from '@/components/credential-card'
+import { Button } from '@/components/ui/button'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
@@ -86,13 +92,98 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <main className="@container mx-auto w-full max-w-5xl space-y-6 px-5 py-8">
-        <h2 className="text-sm font-semibold tracking-tight">账号列表（离线预览）</h2>
-        <div className="grid grid-cols-1 gap-4 @4xl:grid-cols-2">
-          <CredentialCard cred={banned} />
-          <CredentialCard cred={normal} />
-        </div>
-      </main>
+      <div className="app-shell min-h-screen bg-background text-foreground">
+        <header className="border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5 sm:py-3.5">
+            <div className="flex items-center gap-2.5 sm:gap-3">
+              <div className="brand-mark flex size-9 items-center justify-center rounded-xl text-white shadow-brand sm:size-10">
+                <span className="relative font-mono text-sm font-bold">鲁</span>
+              </div>
+              <div>
+                <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
+                <div className="label-eyebrow mt-1.5 hidden whitespace-nowrap sm:block">Claude Code Gateway</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="mr-1 hidden items-center gap-2 rounded-full border border-ok/15 bg-ok-soft px-3 py-1.5 text-2xs font-medium text-ok md:flex">
+                <span className="size-2 rounded-full bg-ok" />控制台在线
+              </div>
+              <Button size="sm" variant="outline"><Cog6ToothIcon /><span className="hidden sm:inline">接入设置</span></Button>
+              <Button size="sm"><PlusIcon /><span className="hidden sm:inline">添加账号</span></Button>
+            </div>
+          </div>
+        </header>
+
+        <main className="@container mx-auto w-full max-w-6xl space-y-5 px-4 py-6 sm:space-y-7 sm:px-5 sm:py-10">
+          <section className="space-y-3 sm:space-y-4">
+            <div className="flex items-center justify-between">
+              <h1 className="text-xl font-semibold tracking-[-0.035em] sm:text-2xl">账号概览</h1>
+              <span className="text-2xs text-muted-foreground">每 30 秒自动刷新</span>
+            </div>
+            <div className="grid grid-cols-2 overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-card @3xl:grid-cols-4">
+              <PreviewMetric label="账号总数" value="2" status="2 已启用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r @3xl:border-b-0" />
+              <PreviewMetric label="异常账号" value="1" status="需处理" icon={ExclamationTriangleIcon} tone="bad" className="border-b @3xl:border-b-0 @3xl:border-r" />
+              <PreviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r" />
+              <PreviewMetric label="活跃设备" value="2" status="有效绑定" icon={DevicePhoneMobileIcon} tone="neutral" />
+            </div>
+          </section>
+
+          <div className="grid gap-3 rounded-2xl border border-border/70 bg-surface/80 p-3 shadow-card sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
+            <div className="flex items-baseline gap-2">
+              <div className="text-sm font-semibold">账号列表</div>
+              <div className="text-xs text-muted-foreground">共 2 个</div>
+            </div>
+            <div className="min-w-0 space-y-2 @4xl:flex @4xl:items-center @4xl:justify-end @4xl:space-y-0">
+              <div className="flex h-9 w-full items-center gap-2 rounded-lg border border-border bg-background/70 px-2.5 text-xs text-muted-foreground shadow-sm @4xl:mr-2 @4xl:h-8 @4xl:w-48">
+                <MagnifyingGlassIcon className="size-3.5" />搜索名称或 #id
+              </div>
+              <div className="scrollbar-none -mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 @4xl:mx-0 @4xl:overflow-visible @4xl:px-0 @4xl:pb-0">
+                <Button size="sm" variant="outline" className="h-8 text-xs"><FunnelIcon />全部</Button>
+                <div className="flex shrink-0 overflow-hidden rounded-xl border border-border">
+                  <button className="grid size-8 place-items-center bg-muted"><Squares2X2Icon className="size-4" /></button>
+                  <button className="grid size-8 place-items-center border-l border-border text-muted-foreground"><Bars3Icon className="size-4" /></button>
+                </div>
+                <Button size="sm" variant="outline" className="h-8 text-xs"><QueueListIcon />批量</Button>
+                <Button size="sm" variant="outline" className="h-8 text-xs"><ArrowsUpDownIcon />优先级↑</Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4">
+            <CredentialCard cred={banned} />
+            <CredentialCard cred={normal} />
+          </div>
+        </main>
+      </div>
     </QueryClientProvider>
   </React.StrictMode>,
 )
+
+function PreviewMetric({ label, value, status, icon: Icon, tone, className }: {
+  label: string
+  value: string
+  status: string
+  icon: typeof ShieldCheckIcon
+  tone: 'ok' | 'bad' | 'neutral'
+  className?: string
+}) {
+  const colors = {
+    ok: 'bg-ok-soft text-ok',
+    bad: 'bg-bad-soft text-bad',
+    neutral: 'bg-muted text-muted-foreground',
+  }[tone]
+  return (
+    <div className={`min-w-0 p-3.5 sm:p-5 ${className ?? ''}`}>
+      <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+        <Icon className="size-4" />
+        {label}
+      </div>
+      <div className="mt-2.5 flex items-end justify-between gap-2 sm:mt-3">
+        <span className="text-2xl font-semibold leading-none tnum sm:text-3xl">{value}</span>
+        <span className={`rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs ${colors}`}>
+          {status}
+        </span>
+      </div>
+    </div>
+  )
+}

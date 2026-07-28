@@ -7,7 +7,7 @@ import {
 import { toast } from 'sonner'
 import {
   getSettings, setApiKey, setDefaultDeviceLimit, setDeviceTtl, setRequireDeviceId,
-  setSpoofIdentity, type Settings,
+  type Settings,
 } from '@/api/settings'
 import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
 import { setPw, clearPw } from '@/api/client'
@@ -140,11 +140,6 @@ export function AccessSettings({
           {/* 设备身份校验 */}
           <div className="border-t border-border pt-4">
             <RequireDeviceIdToggle />
-          </div>
-
-          {/* 身份伪装 */}
-          <div className="border-t border-border pt-4">
-            <SpoofIdentityToggle />
           </div>
 
           {/* 管理密码 */}
@@ -286,41 +281,6 @@ function RequireDeviceIdToggle() {
             {' '}当前已关闭：这类请求会被转发，但不绑定账号、不占设备名额，因而绕过设备上限。
           </span>
         )}
-      </p>
-    </Field>
-  )
-}
-
-/** 身份伪装开关：把转发请求 metadata.user_id 里的 account_uuid/device_id 改写成凭证自洽身份。 */
-function SpoofIdentityToggle() {
-  const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const enabled = data?.spoof_identity_enabled ?? true
-
-  const save = useMutation({
-    mutationFn: (next: boolean) => setSpoofIdentity(next),
-    onSuccess: (s: Settings) => {
-      toast.success(s.spoof_identity_enabled ? '已启用身份伪装' : '已关闭身份伪装')
-      qc.invalidateQueries({ queryKey: ['settings'] })
-    },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
-  })
-
-  return (
-    <Field label="身份伪装">
-      <div className="flex items-center gap-3">
-        <Switch
-          variant="success"
-          checked={enabled}
-          disabled={save.isPending}
-          onCheckedChange={(next) => save.mutate(next)}
-        />
-        <span className="text-sm">{enabled ? '已启用' : '已关闭'}</span>
-      </div>
-      <p className="mt-1.5 text-xs text-muted-foreground">
-        开启后转发时把请求 <code className="font-mono">metadata.user_id</code> 里的{' '}
-        <code className="font-mono">account_uuid</code> 与 <code className="font-mono">device_id</code>{' '}
-        改写成所用凭证的自洽身份（真实账号 + 按设备指纹稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾。关闭则原样透传客户端身份。
       </p>
     </Field>
   )

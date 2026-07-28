@@ -490,22 +490,50 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_DEVICE_BINDING_TTL_SECS)
     }
 
-    /// 是否对转发请求做身份伪装：改写 `metadata.user_id` 的 account_uuid/device_id，
-    /// 并给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
-    /// 未设置时默认开启；仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭——关掉即完全
-    /// 不动这两处，用于排查「是否因伪装本身被识别」。
-    pub fn spoof_identity_enabled(&self) -> bool {
-        match self.get_setting(SPOOF_IDENTITY_ENABLED).ok().flatten() {
-            Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
-            None => true,
+    /// 一次读齐全部转发形态开关（[`ForwardFlags`]）。
+    ///
+    /// **一条 SQL**：这几个开关每个转发请求都要读，逐个 [`Self::get_setting`] 就是每请求 5 次
+    /// 查询。任何读不出来的键都退回默认值（= 开启），故连表都没有时也不会挡住转发。
+    pub fn forward_flags(&self) -> ForwardFlags {
+        let mut flags = ForwardFlags::default();
+        let conn = self.conn.lock();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6)")
+        else {
+            return flags;
+        };
+        let rows = stmt.query_map(
+            params![
+                SPOOF_IDENTITY_ENABLED,
+                SPOOF_BILLING_CCH,
+                FILL_CLIENT_HEADERS,
+                MERGE_BETA,
+                CACHE_SCOPE_GLOBAL,
+                ORIG_HEADER_CASE,
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        );
+        let Ok(rows) = rows else { return flags };
+        for (key, value) in rows.flatten() {
+            let on = setting_is_on(&value);
+            match key.as_str() {
+                SPOOF_IDENTITY_ENABLED => flags.spoof_identity = on,
+                SPOOF_BILLING_CCH => flags.billing_cch = on,
+                FILL_CLIENT_HEADERS => flags.fill_client_headers = on,
+                MERGE_BETA => flags.merge_beta = on,
+                CACHE_SCOPE_GLOBAL => flags.cache_scope_global = on,
+                ORIG_HEADER_CASE => flags.orig_header_case = on,
+                _ => {}
+            }
         }
+        flags
     }
 
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；未设置时默认要求（保持严格）。
     /// 仅 `"0"`/`"false"`（忽略大小写与首尾空白）视为关闭。
     pub fn require_device_id(&self) -> bool {
         match self.get_setting(REQUIRE_DEVICE_ID).ok().flatten() {
-            Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
+            Some(v) => setting_is_on(&v),
             None => true,
         }
     }
@@ -530,8 +558,62 @@ pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";
 /// 设备绑定有效期默认值：1 小时。
 pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
 
-/// 是否启用身份伪装的 settings 键名；`"0"`/`"false"` 关闭，缺省或其它值视为开启。
+/// 是否改写 `metadata.user_id` 的 account_uuid/device_id；`"0"`/`"false"` 关闭，缺省视为开启。
 pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
+
+/// 是否给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
+pub const SPOOF_BILLING_CCH: &str = "spoof_billing_cch";
+
+/// 是否替客户端补齐它没带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
+pub const FILL_CLIENT_HEADERS: &str = "fill_client_headers";
+
+/// 是否合并/重排 `anthropic-beta` 并塞入 `oauth-2025-04-20`；关闭则原样转发客户端那串。
+pub const MERGE_BETA: &str = "merge_beta";
+
+/// 是否给最大的静态 system 块标 `cache_control.scope = "global"`。
+pub const CACHE_SCOPE_GLOBAL: &str = "cache_scope_global";
+
+/// 是否按官方拼写与顺序发出头名（`wreq` 的 `OrigHeaderMap`）；关闭则退回全小写 + 队尾追加。
+pub const ORIG_HEADER_CASE: &str = "orig_header_case";
+
+/// 转发形态开关的集合。**默认全开**，等于加入开关机制之前的既有行为。
+///
+/// 上游实测（8 发对照，见 [`crate::config::known_fingerprint_gaps`]）：这些全关掉也照样
+/// 200，唯一被强制的是 `system` 里那句 `You are Claude Code, …`，而它由客户端自己发。
+/// 所以这些开关都是「形态对齐」而非「能不能用」，可以按需一项项关掉做排查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardFlags {
+    /// 改写 `metadata.user_id` 里的 account_uuid/device_id 为凭证自洽身份。
+    pub spoof_identity: bool,
+    /// 给 `x-anthropic-billing-header` 补 `cch`。
+    pub billing_cch: bool,
+    /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
+    pub fill_client_headers: bool,
+    /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
+    pub merge_beta: bool,
+    /// 给最大的静态 system 块标 `scope: "global"`（跨会话缓存复用）。
+    pub cache_scope_global: bool,
+    /// 按官方拼写与顺序发出头名（见 [`crate::config::CC_HEADER_ORDER`]）。
+    pub orig_header_case: bool,
+}
+
+impl Default for ForwardFlags {
+    fn default() -> Self {
+        Self {
+            spoof_identity: true,
+            billing_cch: true,
+            fill_client_headers: true,
+            merge_beta: true,
+            cache_scope_global: true,
+            orig_header_case: true,
+        }
+    }
+}
+
+/// 布尔型设置的统一口径：仅 `"0"`/`"false"`（忽略大小写与首尾空白）为关，其余为开。
+fn setting_is_on(value: &str) -> bool {
+    !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false")
+}
 
 /// 是否要求请求携带有效设备身份的 settings 键名；`"0"`/`"false"` 关闭（放行裸请求），
 /// 缺省或其它值视为要求（无有效 `metadata.user_id` 的请求直接 403）。
@@ -1227,7 +1309,7 @@ enum TokenAttempt {
 /// 网络抖动/5xx 这类可重试错误**不**停用，原样抛出，让客户端重试时还落回同一个号。
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
-    http: &reqwest::Client,
+    http: &wreq::Client,
     device_id: Option<&str>,
 ) -> Result<(String, Credential)> {
     select_with_refresh_failover(store, device_id, |cred| {
@@ -1239,7 +1321,7 @@ pub async fn valid_access_token_for_device(
 /// [`select_with_refresh_failover`] 注入的「取一次 token」返回的 future。
 ///
 /// 写成显式 boxed future 而不是 `impl AsyncFn`：后者的 `CallRefFuture` 带高阶生命周期，
-/// 会让捕获了 `&CredentialStore`/`&reqwest::Client` 的闭包推不出 `Send`
+/// 会让捕获了 `&CredentialStore`/`&wreq::Client` 的闭包推不出 `Send`
 /// （报 `implementation of Send is not general enough`），而这条链最终要塞进 axum handler。
 /// 固定成单个 `'a` 就没有这个问题；代价是每轮一次 Box 分配，紧挨着一次上游往返，可忽略。
 type AttemptFut<'a> =
@@ -1288,7 +1370,7 @@ async fn select_with_refresh_failover<'a>(
 /// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
 async fn ensure_fresh_token(
     store: &CredentialStore,
-    http: &reqwest::Client,
+    http: &wreq::Client,
     cred: &Credential,
 ) -> Result<TokenAttempt> {
     if !cred.needs_refresh() {
@@ -1919,6 +2001,54 @@ mod tests {
         assert_eq!(store.cost_of(a).unwrap(), 4.0);
         assert_eq!(store.last_used_at(c).unwrap(), None, "无日志时是 None 而非 0");
         assert_eq!(store.cost_of(c).unwrap(), 0.0);
+    }
+
+    /// 转发形态开关：**未设置时必须全开**——否则升级到带开关的版本会让既有部署的转发形态
+    /// 悄悄变样。只有 `"0"`/`"false"`（忽略大小写与首尾空白）算关，其余取值一律视为开。
+    #[test]
+    fn forward_flags_default_on_and_parse_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        assert_eq!(store.forward_flags(), ForwardFlags::default(), "空库应等于默认值");
+        assert!(ForwardFlags::default().spoof_identity, "默认必须是开");
+        assert!(ForwardFlags::default().cache_scope_global);
+
+        // 五个键各用一种「关」的写法，确认逐项独立且解析口径一致。
+        for (key, off) in [
+            (SPOOF_IDENTITY_ENABLED, "0"),
+            (SPOOF_BILLING_CCH, "false"),
+            (FILL_CLIENT_HEADERS, " FALSE "),
+            (MERGE_BETA, "False"),
+            (CACHE_SCOPE_GLOBAL, "0"),
+            (ORIG_HEADER_CASE, "0"),
+        ] {
+            store.set_setting(key, off).unwrap();
+        }
+        let f = store.forward_flags();
+        assert_eq!(
+            f,
+            ForwardFlags {
+                spoof_identity: false,
+                billing_cch: false,
+                fill_client_headers: false,
+                merge_beta: false,
+                cache_scope_global: false,
+                orig_header_case: false,
+            }
+        );
+
+        // 只开回一项，其余保持关闭：开关之间不得互相影响。
+        store.set_setting(MERGE_BETA, "true").unwrap();
+        let f = store.forward_flags();
+        assert!(f.merge_beta);
+        assert!(!f.spoof_identity && !f.billing_cch && !f.fill_client_headers);
+        assert!(!f.orig_header_case);
+
+        // 无法识别的取值算「开」，不能因为写错字把形态悄悄关掉。
+        store.set_setting(SPOOF_IDENTITY_ENABLED, "yes").unwrap();
+        assert!(store.forward_flags().spoof_identity);
     }
 
     /// 旧库上的单列 idx_usage_logs_cred 会被换成 (cred_id, ts) 复合索引：前缀相同，

@@ -35,7 +35,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cmake (aws-lc 需要)
+      - name: Install cmake (BoringSSL 需要)
+        # wreq 走 BoringSSL(btls-sys)，源码编译需要 cmake；g++/perl runner 自带。
         run: sudo apt-get update && sudo apt-get install -y cmake
 
       - name: Build release

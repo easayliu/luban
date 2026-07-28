@@ -131,7 +131,7 @@ struct ProfileOrg {
 }
 
 /// 用 access_token 获取账号 profile（邮箱、姓名、订阅等级）。
-pub async fn fetch_profile(client: &reqwest::Client, access_token: &str) -> Result<Profile> {
+pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<Profile> {
     let resp = client
         .get(config::PROFILE_URL)
         .header("Authorization", format!("Bearer {}", access_token))
@@ -220,7 +220,7 @@ fn humanize_tier(raw: &str) -> String {
 
 /// 用授权码换取 token。`pasted` 是用户从回调页粘贴的 `code#state`。
 pub async fn exchange_code(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     pkce: &PkceChallenge,
     pasted: &str,
 ) -> Result<TokenSet> {
@@ -247,7 +247,7 @@ pub async fn exchange_code(
 /// [`crate::store::valid_access_token_for_device`]。
 #[derive(Debug)]
 pub struct TokenEndpointError {
-    pub status: reqwest::StatusCode,
+    pub status: wreq::StatusCode,
     pub body: String,
 }
 
@@ -285,7 +285,7 @@ impl TokenEndpointError {
 }
 
 /// 用 refresh_token 刷新出新的 access_token。
-pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<TokenSet> {
+pub async fn refresh(client: &wreq::Client, refresh_token: &str) -> Result<TokenSet> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -296,7 +296,7 @@ pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<To
 }
 
 /// 向 token 端点 POST，并把响应转换为带过期时间戳的 `TokenSet`。
-async fn post_token(client: &reqwest::Client, body: serde_json::Value) -> Result<TokenSet> {
+async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<TokenSet> {
     let resp =
         client.post(config::TOKEN_URL).json(&body).send().await.context("请求 token 端点失败")?;
 
@@ -359,7 +359,7 @@ fn urlencode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::TokenEndpointError;
-    use reqwest::StatusCode;
+    use wreq::StatusCode;
 
     fn err(status: StatusCode, body: &str) -> TokenEndpointError {
         TokenEndpointError { status, body: body.into() }

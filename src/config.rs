@@ -91,25 +91,70 @@ pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 /// 把 [`crate::proxy::cch_value`] 换成从「已在缓存前缀内的内容」派生即可（见该函数注释）。
 pub const BILLING_CCH: &str = "00000";
 
+/// 官方客户端请求头的**拼写与顺序**，逐字节取自抓包 040（HTTPS 隧道内的原始字节，是唯一
+/// 可信的基准；明文到 luban 的那几个 flow 会被 mitmproxy 机械 title-case）。
+///
+/// 一张表兼两用，喂给 `wreq` 的 `OrigHeaderMap`：
+/// - **拼写**：注意这不是「全部首字母大写」——`anthropic-*`/`x-app`/`x-client-request-id`
+///   本来就是全小写（Stainless SDK 自己拼的），而 `X-Stainless-OS` 的 `OS` 是全大写，
+///   机械 title-case 会写成 `X-Stainless-Os`。所以只能逐头列表，没有规则可套。
+/// - **顺序**：`OrigHeaderMap` 同时决定线上头序，故 `Content-Length`/`Host`/`User-Agent`
+///   （由 HTTP 客户端自己追加、原先只能待在队尾）也列在此处的官方位置上。
+///
+/// 实测语义（预检验证，见 [`known_fingerprint_gaps`]）：表里有、本次请求没带的头**不会**
+/// 凭空发出；反之表外的头照发，但一律小写并排在所有表内头之后。
+pub const CC_HEADER_ORDER: &[&str] = &[
+    "Accept",
+    "Accept-Encoding",
+    "Authorization",
+    "Connection",
+    "Content-Length",
+    "Content-Type",
+    "Host",
+    "User-Agent",
+    "X-Claude-Code-Session-Id",
+    "X-Stainless-Arch",
+    "X-Stainless-Lang",
+    "X-Stainless-OS",
+    "X-Stainless-Package-Version",
+    "X-Stainless-Retry-Count",
+    "X-Stainless-Runtime",
+    "X-Stainless-Runtime-Version",
+    "X-Stainless-Timeout",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "x-app",
+    "x-client-request-id",
+];
+
 /// **已知无法对齐的形态差异**（记录在案，别再重复排查）。
 ///
-/// 1. **header 名大小写**。hyper 把 `HeaderName` 一律存成并发出小写；官方客户端（node/undici）
-///    发的是分裂形态——undici 托管的标准头首字母大写、SDK 自定义头全小写：
-///    ```text
-///    Accept / Accept-Encoding / Authorization / Connection / Content-Type / Host /
-///    User-Agent / X-Claude-Code-Session-Id / X-Stainless-*        ← 首字母大写
-///    anthropic-beta / anthropic-version / x-app / x-client-request-id /
-///    anthropic-dangerous-direct-browser-access                    ← 全小写
-///    ```
-///    reqwest 有 `http1_title_case_headers()`，但那是**全部**首字母大写，会把 `anthropic-beta`
-///    写成 `Anthropic-Beta`，同样对不上，只是换了个错法。逐头指定大小写 hyper 没有 API，
-///    要修得换掉整个 HTTP 栈。
+/// **官方客户端的运行时是 Bun，不是 node。** 2.1.218 与 2.1.220 的可执行文件都是 Bun v1.4.0
+/// 打出的单文件（255 MB Mach-O，`strings` 里有 `Bun v1.4.0`/`BoringSSL`/`versions.bun`，
+/// 且**没有任何 `OpenSSL x.y.z` 版本串**）。抓包里的 `X-Stainless-Runtime: node` /
+/// `X-Stainless-Runtime-Version: v26.3.0` 是误报——Bun 的 node 兼容层设了
+/// `process.versions.node`，Stainless SDK 照着认。据此：头的形态出自 Bun 自己的 HTTP
+/// 客户端（不是 undici），TLS 出自 BoringSSL（不是 OpenSSL）。
 ///
-/// 2. **`user-agent` / `host` / `content-length` 的位置**。这三个由 hyper 自己追加在头列表
-///    末尾，无法插到来访客户端原本的位置。其余转发头的顺序是保住的，见
-///    [`crate::proxy::build_forward_headers`]。
+/// ~~1. header 名大小写~~ / ~~2. `user-agent`/`host`/`content-length` 的位置~~ —— **已解决**，
+///    换到 `wreq` 的 `OrigHeaderMap`（见 [`CC_HEADER_ORDER`] 与
+///    [`crate::proxy::orig_header_case`]）。留在这里是为了记住此路不通的那些尝试：
+///    `HeaderName` 构造即归一化成小写，来访侧的原始拼写在进到
+///    [`crate::proxy::build_forward_headers`] 之前就没了（也不需要——要装的是官方客户端，
+///    照固定表在出站侧重建即可）；reqwest 的 `http1_title_case_headers()` 是**全部**首字母
+///    大写，会把 `anthropic-beta` 写成 `Anthropic-Beta`、`X-Stainless-OS` 写成
+///    `X-Stainless-Os`，22 个头里错 6 个，只是换了个错法；hyper 1.x 的 `ext::HeaderCaseMap`
+///    与 reqwest 的 `Request::extensions_mut` 都是 `pub(crate)`，两半都够不着。
 ///
-/// 3. **TLS ClientHello 指纹**。rustls 的扩展顺序/密码套件与 node 的 BoringSSL 不同。
+/// 3. **TLS ClientHello 指纹**。换到 wreq 后 TLS 从 rustls(aws-lc-rs) 变成 BoringSSL，与
+///    Bun 的 BoringSSL **同族**（rustls 才是那个异类），且 wreq 把 cipher/curves/sigalgs/
+///    扩展顺序/GREASE 都做成了公开旋钮（`wreq::tls::TlsOptions`）——但**同族不等于同指纹**，
+///    Bun 的 BoringSSL 版本、编译选项与它那个 Zig HTTP 客户端设的参数都得对上。
+///    **在有基准之前不要调**：cap/ 里只有 HTTP 层，没有 ClientHello 字节，得先抓一次真客户端
+///    的 JA3/JA4，否则就是又一次拿证据缺失当证据（见 [`CC_ACCEPT_ENCODING`]）。
+///    注意 `native-tls` 不是解法：它按平台分裂（macOS 走 Security.framework、Windows 走
+///    SChannel、Linux 才是 OpenSSL），而官方客户端三个平台统一是 BoringSSL。
 ///
 /// 4. **`cc_version` 的构建后缀**。抓包显示订阅模式是 `2.1.218.2d7`、API-key 模式是
 ///    `2.1.218.0b9`（同机同版本同时段）。这个后缀随鉴权模式变化，luban 原样转发，

@@ -72,8 +72,10 @@ pub async fn handle(
     // 4) 目标 URL：上游 base + 原路径与查询串。
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
 
-    // 5) 组装转发头：复制安全头，注入鉴权与 beta。
-    let out = build_forward_headers(&headers, &token);
+    // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制，
+    //    一条 SQL 读齐（默认全开 = 加入开关前的既有行为）。
+    let flags = state.store.forward_flags();
+    let out = build_forward_headers(&headers, &token, flags);
 
     // 6) 转发前改写 body：最大 system 块标 scope=global + 身份伪装（metadata.user_id 的
     //    account_uuid/device_id 换成该凭证自洽身份、billing header 补 cch）。缓存 TTL 不动。
@@ -94,10 +96,13 @@ pub async fn handle(
     // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
     // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
     let req_speed = request_speed(&body);
-    let body = rewrite_body(&body, &cred, &device_fp, state.store.spoof_identity_enabled());
+    let body = rewrite_body(&body, &cred, &device_fp, flags);
 
-    // 7) 发起上游请求并流式回传。
-    let resp = state.http.request(method.clone(), &url).headers(out).body(body).send().await;
+    // 7) 发起上游请求并流式回传。头名的拼写与顺序由 orig_header_case 决定（关掉即退回
+    //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
+    let req = state.http.request(method.clone(), &url).headers(out).body(body);
+    let req = if flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
+    let resp = req.send().await;
 
     match resp {
         Ok(up) => {
@@ -109,7 +114,7 @@ pub async fn handle(
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.contains("text/event-stream"))
                 .unwrap_or(false);
-            // 正常情况下这里恒为 false：上游客户端开了 gzip/br/zstd/deflate 解压，reqwest
+            // 正常情况下这里恒为 false：上游客户端开了 gzip/br/zstd/deflate 解压，wreq
             // 收到时已解码，并把 `content-encoding`/`content-length` 一并摘掉。
             // 留着这个判断是兜底——若上游哪天用了我们没开的编码，tower-http 会原样放行并保留
             // 该头，那时响应体是我们读不懂的字节，嗅探与账号级错误判定都只能跳过。
@@ -130,7 +135,7 @@ pub async fn handle(
                 tracing::warn!(
                     status = status.as_u16(),
                     encoding = %enc,
-                    "上游响应带无法解码的 content-encoding：用量嗅探与账号级错误判定都会被跳过（该编码需在 reqwest feature 里开启）"
+                    "上游响应带无法解码的 content-encoding：用量嗅探与账号级错误判定都会被跳过（该编码需在 wreq feature 里开启）"
                 );
             }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
@@ -212,9 +217,9 @@ pub async fn handle(
                 .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
         }
         Err(e) => {
-            // reqwest 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
+            // wreq 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
             let detail = error_chain(&e);
-            let kind = reqwest_error_kind(&e);
+            let kind = upstream_error_kind(&e);
             tracing::error!(
                 %method,
                 path = %path_and_query,
@@ -243,8 +248,8 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     s
 }
 
-/// 粗分 reqwest 错误类别，便于一眼定位（超时 / 连接 / DNS-TLS 等）。
-fn reqwest_error_kind(e: &reqwest::Error) -> &'static str {
+/// 粗分上游 HTTP 客户端的错误类别，便于一眼定位（超时 / 连接 / DNS-TLS 等）。
+fn upstream_error_kind(e: &wreq::Error) -> &'static str {
     if e.is_timeout() {
         "timeout"
     } else if e.is_connect() {
@@ -366,7 +371,7 @@ impl Drop for ReqLog {
 struct UsageSniffer {
     is_stream: bool,
     /// 响应体带我们解不开的 `content-encoding`，只能一律不解析（`feed` 直接丢弃）。
-    /// 正常路径下恒为 false——reqwest 已解码，见 [`handle`] 里 `compressed` 的说明。
+    /// 正常路径下恒为 false——wreq 已解码，见 [`handle`] 里 `compressed` 的说明。
     opaque: bool,
     /// SSE 模式下未处理完的行尾；非流式模式下累积的整段响应体。
     buf: Vec<u8>,
@@ -640,9 +645,21 @@ fn merge_beta(incoming: Option<&HeaderValue>) -> String {
 /// 只在客户端没带时才补的头（`accept-encoding`、`x-client-request-id`）没有原位可循，
 /// 追加在末尾；官方客户端这两个头都带，走的是原位覆盖那条路。
 ///
+/// **开关**（[`store::ForwardFlags`]，默认全开）：`merge_beta` 关掉即原样转发客户端那串
+/// `anthropic-beta`（含不再塞 `oauth-2025-04-20`）；`fill_client_headers` 关掉即不补任何
+/// 客户端没带的头。唯一无条件执行的是注入 `Authorization`——实测那是上游唯一必需的改动。
+///
+/// 注意 `fill_client_headers` 关掉后，若客户端自己也没带 `accept-encoding`，兜底会落到
+/// [`crate::web::upstream_client`] 的 `default_headers`（同为官方取值），不会退化成
+/// tower-http 那个非官方的 `zstd,gzip,deflate,br`。
+///
 /// 无法对齐的部分（头名大小写、hyper 自己追加的 `user-agent`/`host`/`content-length`）
 /// 见 [`crate::config::known_fingerprint_gaps`]。
-fn build_forward_headers(headers: &HeaderMap, token: &str) -> HeaderMap {
+fn build_forward_headers(
+    headers: &HeaderMap,
+    token: &str,
+    flags: store::ForwardFlags,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
     // `append` 而非 `insert`：同名多值头要全部保留，`insert` 会只剩最后一个。
     for (k, v) in headers.iter() {
@@ -651,26 +668,33 @@ fn build_forward_headers(headers: &HeaderMap, token: &str) -> HeaderMap {
         }
     }
     // anthropic-version 缺省补齐。
-    if !out.contains_key("anthropic-version") {
+    if flags.fill_client_headers && !out.contains_key("anthropic-version") {
         out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
     // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
-    match HeaderValue::from_str(&merge_beta(headers.get("anthropic-beta"))) {
-        Ok(v) => {
-            out.insert("anthropic-beta", v);
+    if flags.merge_beta {
+        match HeaderValue::from_str(&merge_beta(headers.get("anthropic-beta"))) {
+            Ok(v) => {
+                out.insert("anthropic-beta", v);
+            }
+            // merge_beta 只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
+            Err(e) => tracing::warn!(error = %e, "构造 anthropic-beta 失败，保留来访原值"),
         }
-        // merge_beta 只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
-        Err(e) => tracing::warn!(error = %e, "构造 anthropic-beta 失败，保留来访原值"),
     }
-    // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
-    if !out.contains_key(header::ACCEPT_ENCODING) {
-        out.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
-    }
-    // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
-    if !out.contains_key("x-client-request-id")
-        && let Ok(v) = HeaderValue::from_str(&uuid_v4())
-    {
-        out.insert("x-client-request-id", v);
+    if flags.fill_client_headers {
+        // accept-encoding：客户端没带时补上官方客户端的取值（缺失本身就是特征）。
+        if !out.contains_key(header::ACCEPT_ENCODING) {
+            out.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static(config::CC_ACCEPT_ENCODING),
+            );
+        }
+        // x-client-request-id：官方客户端每请求一个 uuid v4；API-key 模式的 CC 不发，补齐。
+        if !out.contains_key("x-client-request-id")
+            && let Ok(v) = HeaderValue::from_str(&uuid_v4())
+        {
+            out.insert("x-client-request-id", v);
+        }
     }
     // 注入 OAuth 鉴权，原位覆盖来访的任何鉴权头。
     match HeaderValue::from_str(&format!("Bearer {token}")) {
@@ -685,6 +709,23 @@ fn build_forward_headers(headers: &HeaderMap, token: &str) -> HeaderMap {
         }
     }
     out
+}
+
+/// 按官方拼写与顺序构造 `OrigHeaderMap`（`wreq` 据它决定线上头名的大小写**与顺序**）。
+///
+/// 整张 [`config::CC_HEADER_ORDER`] 无条件塞进去，不按本次请求裁剪——预检实测：表里有、
+/// 本次没带的头**不会**凭空发出。反之表外的头照发，但一律小写且排在所有表内头之后，
+/// 所以自定义头不会因缺表项而丢失，只是拿不到官方位置。
+///
+/// 这也是 `Host`/`User-Agent`/`Content-Length` 唯一的归位途径：它们由 HTTP 客户端自己追加，
+/// 不在我们的 `HeaderMap` 里，但只要列进这张表就会落到官方位置，而不是被钉在队尾。
+pub(crate) fn orig_header_case() -> wreq::header::OrigHeaderMap {
+    let mut orig = wreq::header::OrigHeaderMap::new();
+    for name in config::CC_HEADER_ORDER {
+        // 返回值是 `HeaderMap::append` 的语义（false = 新键），不是成功与否，别拿来判错。
+        orig.insert(*name);
+    }
+    orig
 }
 
 /// 生成一个随机 uuid v4（小写带连字符），用于补齐 `x-client-request-id`。
@@ -706,12 +747,16 @@ fn request_speed(body: &Bytes) -> Option<String> {
     Some(v.get("speed")?.as_str()?.to_string())
 }
 
-/// 转发前改写请求体：
+/// 转发前改写请求体，三项各自受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
+/// 请求体逐字节原样转发）：
 ///
-/// 1. **缓存 scope**：`system` 里文本最长的静态块标记 `scope: "global"`，提升跨会话缓存复用。
-/// 2. **身份伪装**：把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成该凭证自洽的
-///    身份（真实 account_uuid + 由其稳定派生的 device_id），避免「真账号 + 陌生设备」的矛盾；
-///    并给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
+/// 1. **缓存 scope**（`cache_scope_global`）：`system` 里文本最长的静态块标记
+///    `scope: "global"`，提升跨会话缓存复用。抓包 040 显示官方订阅模式自己就带这个标记，
+///    API-key 模式不带，故它既贴形态也真省钱——想恢复「零改写」才需要关掉。
+/// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
+///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
+///    「真账号 + 陌生设备」的矛盾。
+/// 3. **cch**（`billing_cch`）：给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
 ///
 /// **不动缓存 TTL**：客户端声明 5m 就按 5m 转发。曾把所有 ephemeral 断点无条件升成 1h，
 /// 但 1h 缓存写单价是 2 倍、且会让上游看到「1h 缓存写占比异常」，收益不值这个代价。
@@ -727,19 +772,23 @@ fn rewrite_body(
     body: &Bytes,
     cred: &crate::credentials::Credential,
     device_fp: &str,
-    spoof_enabled: bool,
+    flags: store::ForwardFlags,
 ) -> Bytes {
+    // 三项全关：连解析都不必做，原样返回。
+    if !flags.cache_scope_global && !flags.spoof_identity && !flags.billing_cch {
+        return body.clone();
+    }
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
-    let global_idx = mark_largest_system_global(&mut v);
-    let cch_added = spoof_enabled && ensure_billing_cch(&mut v);
+    let global_idx = flags.cache_scope_global.then(|| mark_largest_system_global(&mut v)).flatten();
+    let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
     );
-    let spoofed = spoof_enabled && spoof_identity(&mut v, cred, device_fp);
+    let spoofed = flags.spoof_identity && spoof_identity(&mut v, cred, device_fp);
     tracing::debug!(
         scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
         spoofed,
@@ -983,7 +1032,7 @@ impl RateLimitInfo {
 ///
 /// `accept-encoding` 刻意**保留转发**：官方客户端必带 `gzip, deflate, br, zstd`，剥掉它等于
 /// 发出一个「自称 claude-cli 却不声明压缩支持」的请求。上游会照单压缩（连 140 字节的错误体
-/// 都压，SSE 也不例外），故上游客户端开了对应的解压 feature，reqwest 收到时已解码；
+/// 都压，SSE 也不例外），故上游客户端开了对应的解压 feature，wreq 收到时已解码；
 /// 回给客户端的是未压缩内容（见 [`is_resp_forwardable`]）。
 ///
 /// `authorization`/`anthropic-beta`/`anthropic-version` 也**保留转发**——它们的值随后会被
@@ -1016,7 +1065,7 @@ fn is_forwardable(name: &HeaderName, value: &HeaderValue) -> bool {
 
 /// 响应头是否可回传：跳过由框架管理的分帧类头。
 ///
-/// `content-encoding` 保留转发，但正常情况下它**根本不会出现**——reqwest 解码后会把它连同
+/// `content-encoding` 保留转发，但正常情况下它**根本不会出现**——wreq 解码后会把它连同
 /// `content-length` 一起摘掉，我们回给客户端的是未压缩内容。只有上游用了我们没开的编码时
 /// 它才会残留，那时压缩体确实是原样透传的，这个头必须跟着走，否则客户端会把压缩字节当明文解析。
 ///
@@ -1032,8 +1081,13 @@ mod tests {
     use super::{
         Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
         detect_account_ban, ensure_billing_cch, header, merge_beta, replace_json_str_field,
-        request_speed, uuid_v4,
+        request_speed, store, uuid_v4,
     };
+
+    /// 形态开关全开（= 默认，也是加入开关机制之前的既有行为）。
+    fn all_on() -> store::ForwardFlags {
+        store::ForwardFlags::default()
+    }
 
     /// API-key 模式的 CC 实际发出的 beta 串（抓包 041，经 luban 转发那一条）。
     const CLIENT_BETA: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
@@ -1111,7 +1165,7 @@ mod tests {
     /// 处理的是同一类问题（那个管值内顺序，这个管头之间的顺序）。
     #[test]
     fn forward_headers_keep_client_order() {
-        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL");
+        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on());
 
         assert_eq!(
             names(&out),
@@ -1142,12 +1196,91 @@ mod tests {
         );
     }
 
+    /// 形态开关全关 = 只注入鉴权，其余头逐项原样：beta 不重排、不塞 oauth，
+    /// 也不补任何客户端没带的头。实测上游只强制 `Authorization`，故这条路径必须真能走通。
+    #[test]
+    fn all_flags_off_only_injects_auth() {
+        let flags = store::ForwardFlags {
+            spoof_identity: false,
+            billing_cch: false,
+            fill_client_headers: false,
+            merge_beta: false,
+            cache_scope_global: false,
+            orig_header_case: false,
+        };
+        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags);
+
+        // 头序与来访一致，且末尾不再追加 x-client-request-id。
+        assert_eq!(
+            names(&out),
+            vec![
+                "accept",
+                "accept-encoding",
+                "authorization",
+                "connection",
+                "content-type",
+                "x-claude-code-session-id",
+                "x-stainless-arch",
+                "x-stainless-os",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "anthropic-version",
+                "x-app",
+            ],
+            "全关时不应补头"
+        );
+        // 唯一必需的改动仍然生效。
+        assert_eq!(out["authorization"], "Bearer sk-ant-oat01-REAL");
+        // beta 原样转发：既不重排也不塞 oauth。
+        assert_eq!(out["anthropic-beta"], "claude-code-20250219,effort-2025-11-24");
+        assert!(
+            !out["anthropic-beta"].to_str().unwrap().contains(config::OAUTH_BETA_HEADER),
+            "merge_beta 关闭后不应塞 oauth beta"
+        );
+    }
+
+    /// 客户端什么都没带时，`fill_client_headers` 决定补不补——关掉就真的一个都不补，
+    /// 只留鉴权（`accept-encoding` 由上游 client 的 default_headers 兜底，不在这一层）。
+    #[test]
+    fn fill_off_adds_nothing_for_bare_client() {
+        let mut bare = super::HeaderMap::new();
+        bare.insert(
+            super::HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+
+        let on = build_forward_headers(&bare, "tok", all_on());
+        assert_eq!(
+            names(&on),
+            vec![
+                "content-type",
+                "anthropic-version",
+                "anthropic-beta",
+                "accept-encoding",
+                "x-client-request-id",
+                "authorization"
+            ],
+            "开启时应补齐这四个头"
+        );
+
+        let flags = store::ForwardFlags { fill_client_headers: false, ..all_on() };
+        let off = build_forward_headers(&bare, "tok", flags);
+        assert_eq!(
+            names(&off),
+            vec!["content-type", "anthropic-beta", "authorization"],
+            "关闭后只该有客户端原有的头 + beta + 鉴权"
+        );
+        assert!(!off.contains_key("x-client-request-id"));
+        assert!(!off.contains_key(header::ACCEPT_ENCODING));
+        assert!(!off.contains_key("anthropic-version"));
+    }
+
     /// 覆盖失败时必须把 `authorization` 摘掉，不能把来访者的接入 key 漏给上游。
     /// （这条只有在「照常转发再覆盖」的写法下才存在，剥离式写法天然没有这个洞。）
     #[test]
     fn never_leaks_client_key_upstream() {
         // token 里塞进换行——`HeaderValue::from_str` 会拒绝，走到移除分支。
-        let out = build_forward_headers(&incoming_headers(), "bad\ntoken");
+        let out = build_forward_headers(&incoming_headers(), "bad\ntoken", all_on());
         assert!(!out.contains_key("authorization"), "构造失败时应移除该头: {out:?}");
         // 任何路径下都不得把接入 key 转发出去。
         for (_, v) in out.iter() {
@@ -1221,7 +1354,7 @@ mod tests {
             .await
             .unwrap();
 
-        // reqwest 解码后会把 content-encoding / content-length 一并摘掉。
+        // wreq 解码后会把 content-encoding / content-length 一并摘掉。
         assert!(
             up.headers().get(header::CONTENT_ENCODING).is_none(),
             "解码后不该再有 content-encoding：{:?}",
@@ -1259,12 +1392,9 @@ mod tests {
         assert_eq!(s.model, None);
     }
 
-    /// 线上字节的看门狗：`HeaderMap` 的顺序要真的落到线上，且 hyper 要肯发
-    /// 显式的 `Connection: keep-alive`（它默认认为 HTTP/1.1 隐含 keep-alive、不发这个头）。
-    ///
-    /// 用的是 [`crate::web::upstream_client`] 那份**真配置**，不是测试里另抄一份。
-    #[tokio::test]
-    async fn wire_bytes_preserve_header_order() {
+    /// 起个裸 TCP「上游」，用 [`crate::web::upstream_client`] 那份**真配置**打一发，
+    /// 返回请求的原始字节（不做大小写归一化——这里正是要看拼写的）。
+    async fn capture_wire(orig_case: bool) -> String {
         use std::io::{BufRead, BufReader, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1288,29 +1418,84 @@ mod tests {
             raw
         });
 
-        let _ = crate::web::upstream_client()
+        let req = crate::web::upstream_client()
             .unwrap()
             .post(format!("http://{addr}/v1/messages?beta=true"))
-            .headers(build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL"))
-            .body(r#"{"model":"claude-sonnet-5"}"#)
-            .send()
-            .await;
+            .headers(build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on()))
+            .body(r#"{"model":"claude-sonnet-5"}"#);
+        let req = if orig_case { req.orig_headers(super::orig_header_case()) } else { req };
+        let _ = req.send().await;
 
-        let raw = server.join().unwrap();
-        let wire: Vec<&str> = raw
-            .lines()
+        server.join().unwrap()
+    }
+
+    /// 取出线上的头名，保留原始拼写与顺序。
+    fn wire_names(raw: &str) -> Vec<&str> {
+        raw.lines()
             .skip(1) // 请求行
             .filter(|l| !l.is_empty())
             .map(|l| l.split(':').next().unwrap())
-            .collect();
+            .collect()
+    }
 
-        // 来访头序原样落到线上（hyper 追加的三个在末尾，见 known_fingerprint_gaps）。
-        let tail = wire.len() - 3;
+    /// 线上字节的看门狗：头名的**拼写与顺序**都要与官方客户端一致（抓包 040）。
+    ///
+    /// 这条同时钉住三件事，任一退化都会失败：
+    /// 1. 分裂大小写——标准头首字母大写、`anthropic-*`/`x-app`/`x-client-request-id` 全小写、
+    ///    `X-Stainless-OS` 的 `OS` 全大写（机械 title-case 会写成 `X-Stainless-Os`）。
+    /// 2. `Content-Length`/`Host`/`User-Agent` 落在官方位置，而不是被追加到队尾。
+    /// 3. 显式的 `Connection: keep-alive` 确实发出（客户端库默认认为 HTTP/1.1 隐含、不发）。
+    #[tokio::test]
+    async fn wire_bytes_match_official_header_form() {
+        let raw = capture_wire(true).await;
+        assert_eq!(
+            wire_names(&raw),
+            &[
+                "Accept",
+                "Accept-Encoding",
+                "Authorization",
+                "Connection",
+                "Content-Length", // 客户端库自己追加，靠 CC_HEADER_ORDER 归位
+                "Content-Type",
+                "Host",       // 同上
+                "User-Agent", // 同上（来访没带，由 upstream_client 兜底）
+                "X-Claude-Code-Session-Id",
+                "X-Stainless-Arch",
+                "X-Stainless-OS",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "anthropic-version",
+                "x-app",
+                "x-client-request-id",
+            ],
+            "线上头名的拼写或顺序与官方形态不符:\n{raw}"
+        );
+        assert!(raw.contains("Connection: keep-alive"), "显式的 Connection 头被吞掉了:\n{raw}");
+    }
+
+    /// `orig_header_case` 关掉后的形态。**注意它并不等于换 wreq 之前那份**：
+    ///
+    /// - 头名退回全小写（这点与 reqwest 时代一致）；
+    /// - 但 `default_headers` 里的 `user-agent`/`accept-encoding` 被**前置到队首**，
+    ///   来访客户端的头序因此被打散（reqwest 是把它们并进原位/队尾的）；
+    /// - `host`/`content-length` 仍在队尾。
+    ///
+    /// 也就是说这条 off 路径比开着**更不像**官方客户端，它的用途只是出问题时能二分
+    /// （「是 OrigHeaderMap 引入的问题，还是别处」），不是一个可用的形态选择。
+    #[tokio::test]
+    async fn wire_bytes_fall_back_to_lowercase_when_off() {
+        let raw = capture_wire(false).await;
+        let wire = wire_names(&raw);
+
+        let tail = wire.len() - 2;
         assert_eq!(
             &wire[..tail],
             &[
-                "accept",
+                // default_headers 被前置，不在来访客户端给它们的位置上
+                "user-agent",
                 "accept-encoding",
+                // 以下按来访头序
+                "accept",
                 "authorization",
                 "connection",
                 "content-type",
@@ -1323,13 +1508,12 @@ mod tests {
                 "x-app",
                 "x-client-request-id",
             ],
-            "线上头序与来访不符:\n{raw}"
+            "关掉开关后的形态与实测不符:\n{raw}"
         );
-        assert!(raw.contains("connection: keep-alive"), "hyper 吞掉了显式的 Connection 头:\n{raw}");
-        // hyper 自己追加的三个：位置无法控制，只断言它们确实在末尾，别的没变。
+        // 位置不可控，只断言这两个确实在末尾。
         let mut appended = wire[tail..].to_vec();
         appended.sort_unstable();
-        assert_eq!(appended, ["content-length", "host", "user-agent"], "\n{raw}");
+        assert_eq!(appended, ["content-length", "host"], "\n{raw}");
     }
 
     fn test_cred() -> crate::credentials::Credential {
@@ -1360,12 +1544,50 @@ mod tests {
                 "messages":[{"role":"user","content":[{"type":"text","text":"hi",
                           "cache_control":{"type":"ephemeral"}}]}]}"#,
         );
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", true);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(!s.contains("\"ttl\""), "不应注入 ttl: {s}");
         // 同时确认另外两项改写仍生效（否则这个测试会因为整体没改写而空过）。
         assert!(s.contains("cch=00000"), "应补 cch: {s}");
         assert!(s.contains("\"scope\":\"global\""), "应标 scope: {s}");
+    }
+
+    /// 三项 body 改写全关 = **逐字节原样透传**：不重新序列化，故连缩进、换行、转义写法
+    /// 这些 serde 会归一化掉的细节都保持不变（重新序列化本身就是个形态 tell）。
+    #[test]
+    fn body_flags_off_passes_through_byte_for_byte() {
+        // 刻意带上多余空白与换行：一旦走了 serde 往返，这些都会被抹平。
+        let raw = Bytes::from(
+            r#"{ "model" : "claude-sonnet-5",
+   "metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},
+   "system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},
+             {"type":"text","text":"big","cache_control":{"type":"ephemeral"}}]}"#,
+        );
+        let flags = store::ForwardFlags {
+            spoof_identity: false,
+            billing_cch: false,
+            fill_client_headers: false,
+            merge_beta: false,
+            cache_scope_global: false,
+            orig_header_case: false,
+        };
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags);
+        assert_eq!(out, raw, "全关时必须原样返回");
+
+        // 逐项开一个，就只有那一项生效，其余仍不动。
+        let only_cch = store::ForwardFlags { billing_cch: true, ..flags };
+        let s = String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", only_cch).to_vec())
+            .unwrap();
+        assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
+        assert!(!s.contains(r#""scope":"global""#), "cache_scope_global 关着不应标 scope: {s}");
+        assert!(s.contains(r#"\"account_uuid\":\"\""#), "spoof 关着应保留空 uuid: {s}");
+
+        let only_scope = store::ForwardFlags { cache_scope_global: true, ..flags };
+        let s =
+            String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", only_scope).to_vec())
+                .unwrap();
+        assert!(s.contains(r#""scope":"global""#), "只开 scope 时应标 scope: {s}");
+        assert!(!s.contains("cch="), "billing_cch 关着不应补 cch: {s}");
     }
 
     /// 改写后 body 的 key 顺序必须与入站逐字节一致，只允许新增字段追加在末尾。
@@ -1384,7 +1606,7 @@ mod tests {
             r#"{"type":"text","text":"big","cache_control":{"type":"ephemeral"}}],"#,
             r#""stream":true,"tools":[]}"#
         );
-        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", true);
+        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on());
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。

@@ -7,13 +7,32 @@ export interface Settings {
   env_managed: boolean
   /** 设备绑定有效期（秒）；0 表示永不过期。 */
   device_binding_ttl_secs: number
-  /** 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。 */
-  spoof_identity_enabled: boolean
   /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
   default_device_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
+  /** 改写 metadata.user_id 里的 account_uuid/device_id 为凭证自洽身份。 */
+  spoof_identity: boolean
+  /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
+  billing_cch: boolean
+  /** 补齐客户端未携带的 accept-encoding / anthropic-version / x-client-request-id。 */
+  fill_client_headers: boolean
+  /** 合并并按官方顺序重排 anthropic-beta（含塞入 oauth-2025-04-20）。 */
+  merge_beta: boolean
+  /** 给最大的静态 system 块标 cache_control.scope = "global"。 */
+  cache_scope_global: boolean
+  /** 按官方拼写与顺序发出头名（Accept-Encoding 大写、anthropic-beta 小写…）。 */
+  orig_header_case: boolean
 }
+
+/** 转发形态开关的键（与后端 ForwardFlags 字段同名）。 */
+export type ForwardingKey =
+  | 'spoof_identity'
+  | 'billing_cch'
+  | 'fill_client_headers'
+  | 'merge_beta'
+  | 'cache_scope_global'
+  | 'orig_header_case'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {
@@ -49,8 +68,10 @@ export async function setRequireDeviceId(required: boolean): Promise<Settings> {
   return data
 }
 
-/** 开关身份伪装。 */
-export async function setSpoofIdentity(enabled: boolean): Promise<Settings> {
-  const { data } = await api.post<Settings>('/settings/spoof-identity', { enabled })
+/**
+ * 改一个转发形态开关。只发生变化的那一项，后端不会动其余开关。
+ */
+export async function setForwarding(key: ForwardingKey, enabled: boolean): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/forwarding', { [key]: enabled })
   return data
 }

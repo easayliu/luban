@@ -169,36 +169,42 @@
   --color-bad-foreground: hsl(var(--bad-foreground));
   --color-bad-soft: hsl(var(--bad-soft));
 
+  --color-brand: hsl(var(--brand));
+  --color-brand-foreground: hsl(var(--brand-foreground));
+  --color-brand-soft: hsl(var(--brand-soft));
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
 
-  --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.04);
-  --shadow-elev: 0 1px 3px 0 rgb(0 0 0 / 0.08), 0 1px 2px -1px rgb(0 0 0 / 0.06);
+  --shadow-card: 0 1px 2px rgb(20 16 10 / 0.035), 0 6px 18px -16px rgb(20 16 10 / 0.22);
+  --shadow-elev: 0 12px 32px -20px rgb(36 24 8 / 0.28), 0 3px 10px -6px rgb(36 24 8 / 0.14);
+  --shadow-panel: 0 18px 48px -32px rgb(36 24 8 / 0.32), 0 2px 8px -5px rgb(36 24 8 / 0.12);
+  --shadow-brand: 0 8px 18px -8px hsl(var(--brand) / 0.55);
   --shadow-stripe: 0 0 0 1px rgb(50 50 93 / 0.1), 0 2px 5px 0 rgb(50 50 93 / 0.08),
     0 1px 1.5px 0 rgb(0 0 0 / 0.07);
 }
 
 @layer base {
   :root {
-    /* 黑白科技风亮色（zinc 色阶，WCAG AA 校准），沿用 kiro.rs 设计令牌 */
-    --background: 240 5% 96.5%;
-    --surface: 0 0% 100%;
-    --surface-2: 240 5% 95%;
-    --foreground: 240 10% 4%;
+    /* 暖灰 + 工业橙的控制台配色，状态色保持独立语义。 */
+    --background: 42 30% 97%;
+    --surface: 45 33% 99%;
+    --surface-2: 40 24% 95%;
+    --foreground: 28 18% 9%;
 
-    --card: 0 0% 100%;
-    --card-foreground: 240 10% 4%;
+    --card: 45 33% 99%;
+    --card-foreground: 28 18% 9%;
 
-    --primary: 240 6% 10%;
+    --primary: 28 18% 9%;
     --primary-foreground: 0 0% 100%;
-    --primary-soft: 240 5% 96%;
+    --primary-soft: 38 25% 94%;
 
     --secondary: 240 5% 96%;
     --secondary-foreground: 240 6% 10%;
 
-    --muted: 240 5% 96%;
-    --muted-foreground: 240 4% 40%;
+    --muted: 40 22% 94%;
+    --muted-foreground: 30 8% 42%;
 
     --accent: 240 5% 96%;
     --accent-foreground: 240 6% 10%;
@@ -218,10 +224,14 @@
     --bad-foreground: 0 0% 100%;
     --bad-soft: 347 80% 97%;
 
-    --border: 240 6% 90%;
-    --input: 240 6% 90%;
-    --ring: 240 6% 10%;
-    --radius: 0.5rem;
+    --brand: 27 91% 44%;
+    --brand-foreground: 0 0% 100%;
+    --brand-soft: 31 95% 94%;
+
+    --border: 35 16% 87%;
+    --input: 35 16% 84%;
+    --ring: 27 91% 44%;
+    --radius: 0.625rem;
   }
 
   .dark {
@@ -261,6 +271,10 @@
     --bad-foreground: 240 6% 10%;
     --bad-soft: 347 45% 16%;
 
+    --brand: 31 92% 58%;
+    --brand-foreground: 28 18% 9%;
+    --brand-soft: 30 45% 14%;
+
     --border: 240 5% 22%;
     --input: 240 5% 22%;
     --ring: 0 0% 98%;
@@ -289,6 +303,33 @@
   }
 }
 
+@layer components {
+  .app-shell {
+    background-image:
+      radial-gradient(circle at 12% 0%, hsl(var(--brand) / 0.075), transparent 28rem),
+      radial-gradient(circle at 92% 18%, hsl(var(--ok) / 0.045), transparent 24rem),
+      linear-gradient(hsl(var(--border) / 0.22) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--border) / 0.22) 1px, transparent 1px);
+    background-size: auto, auto, 32px 32px, 32px 32px;
+    background-position: center top;
+  }
+
+  .brand-mark {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(145deg, hsl(var(--brand)), hsl(18 86% 38%));
+  }
+
+  .brand-mark::after {
+    position: absolute;
+    inset: -40% auto -40% 52%;
+    width: 1px;
+    content: "";
+    background: rgb(255 255 255 / 0.38);
+    transform: rotate(28deg);
+  }
+}
+
 @utility label-eyebrow {
   @apply font-mono text-2xs font-medium uppercase text-muted-foreground;
   letter-spacing: 0.08em;
@@ -296,4 +337,12 @@
 
 @utility tnum {
   font-variant-numeric: tabular-nums slashed-zero;
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }

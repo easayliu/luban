@@ -62,9 +62,10 @@ export function CredentialCard({
   return (
     <Card
       className={cn(
-        '@container/card group/card relative overflow-hidden rounded-2xl border-border/70 p-5 pl-[calc(1.25rem-3px)] shadow-card transition-all',
+        '@container/card group/card relative overflow-hidden rounded-2xl border-border/70 bg-card/95 p-4 pl-[calc(1rem-3px)] shadow-card transition-all duration-300 sm:p-5 sm:pl-[calc(1.25rem-3px)]',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:transition-colors',
-        'hover:border-border hover:shadow-elev',
+        'after:pointer-events-none after:absolute after:inset-x-0 after:top-0 after:h-px after:bg-gradient-to-r after:from-transparent after:via-white/80 after:to-transparent',
+        'hover:-translate-y-0.5 hover:border-brand/20 hover:shadow-elev',
         cred.disabled && 'opacity-60',
         // 左侧状态轨：一眼分诊。正常态透明，异常态着色。
         status.rail,
@@ -72,7 +73,7 @@ export function CredentialCard({
       )}
     >
       {/* 头部：头像 + 名称/徽章 + 开关/菜单 */}
-      <div className="flex items-start gap-3.5">
+      <div className="flex items-start gap-2.5 sm:gap-3.5">
         {selectable && (
           <input
             type="checkbox"
@@ -85,10 +86,10 @@ export function CredentialCard({
         <div className="relative shrink-0">
           <div
             className={cn(
-              'grid size-10 place-items-center rounded-xl text-sm font-semibold',
+              'grid size-9 place-items-center rounded-xl text-xs font-semibold sm:size-10 sm:text-sm',
               cred.disabled
                 ? 'bg-muted text-muted-foreground'
-                : 'bg-primary text-primary-foreground',
+                : 'bg-gradient-to-br from-foreground to-foreground/75 text-primary-foreground shadow-sm',
             )}
             aria-hidden
           >
@@ -127,14 +128,14 @@ export function CredentialCard({
                 className="group/name inline-flex min-w-0 items-center gap-1.5"
                 title="点击重命名"
               >
-                <span className="truncate text-sm font-semibold tracking-tight">{cred.label}</span>
+                <span className="truncate text-[0.8125rem] font-semibold tracking-tight sm:text-sm">{cred.label}</span>
                 {/* pointer-fine 才隐藏：触屏没有 hover 态，藏起来等于这个入口不存在。 */}
                 <PencilIcon className="size-3 shrink-0 text-muted-foreground transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/name:opacity-100" />
               </button>
               {nearLimit && (
                 <Badge variant="bad" className="shrink-0">
                   <ExclamationTriangleIcon className="size-3" />
-                  额度将满 {Math.round(quotaMax * 100)}%
+                  额度 {Math.round(quotaMax * 100)}%
                 </Badge>
               )}
             </div>
@@ -143,7 +144,7 @@ export function CredentialCard({
           {/* 元信息：固定两行，封禁/正常态布局一致。
               第一行 套餐 + 状态/有效期；第二行 #id · token。 */}
           <div className="mt-1.5 space-y-1.5 text-2xs text-muted-foreground">
-            <div className="flex items-center gap-x-3 gap-y-1.5">
+            <div className="flex items-center gap-x-2 gap-y-1.5 sm:gap-x-3">
               {cred.tier && (
                 <Badge
                   variant="outline"
@@ -179,7 +180,7 @@ export function CredentialCard({
         </div>
 
         {/* 右上控制：启用开关 + 溢出菜单 */}
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-0.5 sm:gap-1.5">
           {/* 启用开关：健康态开=绿；封禁/过期等异常态转中性灰（避免绿开关与红状态灯语义冲突）。
               切换中显示加载圈占位，避免布局跳动。 */}
           <span className="relative inline-flex items-center">
@@ -217,7 +218,7 @@ export function CredentialCard({
 
       {/* 额度区：5h / 7d 订阅额度（缺失窗口不占位，仅一个时占满整行） */}
       {cred.quota && (has5h || has7d) && (
-        <div className={cn('mt-4 grid gap-2.5', has5h && has7d && '@sm/card:grid-cols-2')}>
+        <div className={cn('mt-3 grid gap-2.5 sm:mt-4', has5h && has7d && '@sm/card:grid-cols-2')}>
           {has5h && (
             <QuotaBar
               label="5 小时额度"
@@ -240,9 +241,9 @@ export function CredentialCard({
       )}
 
       {/* 底部：统计信息合并为一行（添加 / 最近使用 / 累计花费 / 设备）。设备可点击编辑上限。 */}
-      <div className="mt-4 flex flex-wrap items-center gap-x-3.5 gap-y-1.5 border-t border-border/60 pt-3 text-2xs text-muted-foreground">
+      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border/60 pt-3 text-2xs text-muted-foreground sm:mt-4 sm:gap-x-3.5">
         <span
-          className="inline-flex items-center gap-1"
+          className="hidden items-center gap-1 sm:inline-flex"
           title={`添加于 ${new Date(cred.created_at * 1000).toLocaleString()}`}
         >
           <CalendarDaysIcon className="size-3 shrink-0 opacity-70" />
@@ -480,7 +481,7 @@ function QuotaBar({
   const barColor = critical ? 'bg-bad' : util >= 0.7 ? 'bg-warn' : 'bg-ok'
   const pctColor = critical ? 'text-bad' : util >= 0.7 ? 'text-warn' : 'text-foreground'
   return (
-    <div className="rounded-xl border border-border/60 bg-surface-2/40 px-3 py-2.5">
+    <div className="rounded-xl border border-border/60 bg-surface-2/55 px-3 py-2.5 shadow-[inset_0_1px_0_rgb(255_255_255/0.5)]">
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-2xs font-medium text-muted-foreground">{label}</span>
         {/* 百分比只在有请求经过时才刷新，标注快照时间，免得把很旧的数当成实时值。 */}

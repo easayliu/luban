@@ -7,8 +7,9 @@ COPY admin-ui ./
 RUN pnpm build
 
 # ---------- Rust 构建 ----------
-# 用 Debian glibc：reqwest 走 rustls(aws-lc-rs)，需要 cmake + C 工具链，
-# 在 musl/alpine 上编译 aws-lc-sys 很麻烦，glibc 直接可用。
+# 用 Debian glibc：wreq 走 BoringSSL(btls-sys)，源码编译需要 cmake + C/C++ 工具链，
+# 在 musl/alpine 上折腾这类 -sys crate 很麻烦，glibc 直接可用。
+# （build-essential 里的 g++ 是 BoringSSL 必需的，它有 .cc 源文件；perl 供其汇编生成用。）
 FROM rust:1-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake build-essential perl pkg-config \

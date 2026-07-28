@@ -23,7 +23,7 @@ use crate::store::{self, CredentialStore};
 /// 服务共享状态。
 #[derive(Clone)]
 pub struct AppState {
-    pub http: reqwest::Client,
+    pub http: wreq::Client,
     /// 当前登录尝试的 PKCE 上下文。
     pkce: Arc<Mutex<Option<PkceChallenge>>>,
     /// 凭证存储。
@@ -37,26 +37,27 @@ pub struct AppState {
 type ApiError = (StatusCode, String);
 
 /// 构造发往上游的 HTTP 客户端，刻意贴近官方客户端的传输形态：
-/// - `http1_only`：官方客户端是 node/undici，走 HTTP/1.1（抓包里有 `Connection`/`Host`，
-///   h2 不会有这两个头）。reqwest 默认经 ALPN 协商 h2，会留下 h2 的 SETTINGS/伪头指纹。
+/// - `http1_only`：官方客户端（Bun 自带的 HTTP 客户端）走 HTTP/1.1（抓包里有
+///   `Connection`/`Host`，h2 不会有这两个头）。默认会经 ALPN 协商 h2，留下 h2 的
+///   SETTINGS/伪头指纹；h2 还强制头名小写，逐头大小写也就无从谈起。
 /// - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
 ///   时来访客户端自己的 UA 会覆盖它。
 /// - `default_headers` 里的 `accept-encoding`：**必须显式钉住**。开了解压 feature 后，
 ///   tower-http 的解压中间件会给「没带这个头」的请求补一个它自己的取值
-///   `zstd,gzip,deflate,br`（顺序与写法都不是官方客户端会产生的）。转发 `/v1/*` 有
-///   [`proxy::build_forward_headers`] 保证该头一定存在、轮不到它插手，但 luban 自身发起的
-///   刷新/profile 请求不设这个头，就会被它补上一个非官方取值。钉成官方值即可堵死：
-///   reqwest 与 tower-http 都只填「缺失」的头，不覆盖已有的。
+///   `zstd,gzip,deflate,br`（顺序与写法都不是官方客户端会产生的；换到 wreq 后这个行为照旧，
+///   预检里复现过）。转发 `/v1/*` 时 [`proxy::build_forward_headers`] 通常已保证该头存在，
+///   但 `fill_client_headers` 开关关掉、且来访客户端自己也没带时就轮到这里兜底；luban 自身
+///   发起的刷新/profile 请求同理。钉成官方值即可堵死：wreq 与 tower-http 都只填「缺失」的头。
 ///
 /// 抽成函数是为了让 [`crate::proxy`] 的线上字节回归测试用到的是**这一份真配置**，
 /// 而不是测试里另抄一份。无法对齐的部分见 [`config::known_fingerprint_gaps`]。
-pub fn upstream_client() -> Result<reqwest::Client> {
+pub fn upstream_client() -> Result<wreq::Client> {
     use axum::http::{HeaderMap, HeaderValue, header::ACCEPT_ENCODING};
 
     let mut defaults = HeaderMap::new();
     defaults.insert(ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
 
-    reqwest::Client::builder()
+    wreq::Client::builder()
         .http1_only()
         .user_agent(config::CC_USER_AGENT)
         .default_headers(defaults)
@@ -112,7 +113,7 @@ pub async fn run(
         .route("/settings/device-ttl", post(set_device_ttl))
         .route("/settings/default-device-limit", post(set_default_device_limit))
         .route("/settings/require-device-id", post(set_require_device_id))
-        .route("/settings/spoof-identity", post(set_spoof_identity))
+        .route("/settings/forwarding", post(set_forwarding))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
@@ -563,27 +564,58 @@ struct SettingsResp {
     env_managed: bool,
     /// 设备绑定有效期（秒）；0 表示永不过期。
     device_binding_ttl_secs: i64,
-    /// 是否对转发请求做身份伪装（改写 metadata.user_id 的 account_uuid/device_id）。
-    spoof_identity_enabled: bool,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
+    /// 转发形态开关（默认全开）。
+    #[serde(flatten)]
+    forwarding: ForwardingResp,
+}
+
+/// 转发形态开关的对外形态；字段名与 [`crate::store::ForwardFlags`] 一一对应。
+#[derive(Serialize)]
+struct ForwardingResp {
+    /// 改写 `metadata.user_id` 的 account_uuid/device_id。
+    spoof_identity: bool,
+    /// 给 `x-anthropic-billing-header` 补 `cch`。
+    billing_cch: bool,
+    /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
+    fill_client_headers: bool,
+    /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
+    merge_beta: bool,
+    /// 给最大的静态 system 块标 `scope: "global"`。
+    cache_scope_global: bool,
+    /// 按官方拼写与顺序发出头名。
+    orig_header_case: bool,
+}
+
+impl From<crate::store::ForwardFlags> for ForwardingResp {
+    fn from(f: crate::store::ForwardFlags) -> Self {
+        Self {
+            spoof_identity: f.spoof_identity,
+            billing_cch: f.billing_cch,
+            fill_client_headers: f.fill_client_headers,
+            merge_beta: f.merge_beta,
+            cache_scope_global: f.cache_scope_global,
+            orig_header_case: f.orig_header_case,
+        }
+    }
 }
 
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
-    let spoof_identity_enabled = state.store.spoof_identity_enabled();
     let default_device_limit = state.store.default_device_limit();
     let require_device_id = state.store.require_device_id();
+    let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
             api_key: Some(k.to_string()),
             env_managed: true,
             device_binding_ttl_secs,
-            spoof_identity_enabled,
             default_device_limit,
             require_device_id,
+            forwarding,
         };
     }
     let api_key = state
@@ -596,9 +628,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         api_key,
         env_managed: false,
         device_binding_ttl_secs,
-        spoof_identity_enabled,
         default_device_limit,
         require_device_id,
+        forwarding,
     }
 }
 
@@ -686,19 +718,41 @@ async fn set_require_device_id(
     Ok(Json(settings_resp(&state)))
 }
 
+/// 转发形态开关的改动请求：**只有出现的字段会被写入**，其余保持原值。
+/// 前端每次拨一个开关就只带那一个字段，不必回传全量、也不会互相覆盖。
 #[derive(Deserialize)]
-struct SetSpoofIdentityReq {
-    /// 是否启用身份伪装。
-    enabled: bool,
+struct SetForwardingReq {
+    spoof_identity: Option<bool>,
+    billing_cch: Option<bool>,
+    fill_client_headers: Option<bool>,
+    merge_beta: Option<bool>,
+    cache_scope_global: Option<bool>,
+    orig_header_case: Option<bool>,
 }
 
-/// 开关身份伪装。
-async fn set_spoof_identity(
+/// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
+/// `Authorization`，这些开关都只影响与官方客户端的形态贴合度，见
+/// [`crate::store::ForwardFlags`]。
+async fn set_forwarding(
     State(state): State<AppState>,
-    Json(req): Json<SetSpoofIdentityReq>,
+    Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let value = if req.enabled { "true" } else { "false" };
-    state.store.set_setting(crate::store::SPOOF_IDENTITY_ENABLED, value).map_err(internal)?;
+    use crate::store::{
+        CACHE_SCOPE_GLOBAL, FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, SPOOF_BILLING_CCH,
+        SPOOF_IDENTITY_ENABLED,
+    };
+    let items = [
+        (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
+        (SPOOF_BILLING_CCH, req.billing_cch),
+        (FILL_CLIENT_HEADERS, req.fill_client_headers),
+        (MERGE_BETA, req.merge_beta),
+        (CACHE_SCOPE_GLOBAL, req.cache_scope_global),
+        (ORIG_HEADER_CASE, req.orig_header_case),
+    ];
+    for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
+        state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
+        tracing::info!(key, enabled = value, "转发形态开关变更");
+    }
     Ok(Json(settings_resp(&state)))
 }
 

@@ -5,6 +5,8 @@ import {
   QueueListIcon, ArrowPathIcon, XMarkIcon, ChevronLeftIcon, ChevronRightIcon,
   MagnifyingGlassIcon, FunnelIcon, Squares2X2Icon, Bars3Icon,
   PlayIcon, PauseIcon, TrashIcon,
+  SignalIcon, ShieldCheckIcon, ExclamationTriangleIcon, DevicePhoneMobileIcon,
+  AdjustmentsHorizontalIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
@@ -24,6 +26,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
+import { ForwardingSettings } from '@/components/forwarding-settings'
 import { LoginPage } from '@/components/login-page'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -62,6 +65,7 @@ function matchQuery(c: Credential, q: string): boolean {
 function App() {
   const [adding, setAdding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [showForwarding, setShowForwarding] = useState(false)
   const [pw, setPwState] = useState<string | null>(getPw())
   // 批量模式：卡片出现勾选框，工具栏变成批量操作条。
   const [batch, setBatch] = useState(false)
@@ -144,24 +148,38 @@ function App() {
 
   const count = creds?.length ?? 0
   const enabledCount = (creds ?? []).filter((c) => !c.disabled).length
+  const abnormalCount = (creds ?? []).filter(isAbnormal).length
+  const nearLimitCount = (creds ?? []).filter(isNearLimit).length
+  const deviceCount = (creds ?? []).reduce((sum, c) => sum + c.device_count, 0)
   // 跟 total 同源用延迟值，否则敲键的那一瞬文案先切成「筛选出 N / 共 M」而 N 还是旧的。
   const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
+    <div className="app-shell min-h-screen bg-background text-foreground">
       {/* 置顶操作栏 */}
-      <header className="sticky top-0 z-20 border-b border-border/60 bg-background/80 backdrop-blur-sm">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-5 py-3">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-9 items-center justify-center rounded-md bg-foreground text-background">
-              <span className="font-mono text-sm font-bold">鲁</span>
+      <header className="sticky top-0 z-20 border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5 sm:py-3.5">
+          <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+            <div className="brand-mark flex size-9 shrink-0 items-center justify-center rounded-xl text-white shadow-brand sm:size-10">
+              <span className="relative font-mono text-sm font-bold">鲁</span>
             </div>
-            <div>
-              <div className="text-sm font-semibold leading-none tracking-tight">luban</div>
-              <div className="label-eyebrow mt-1">Claude Code 授权代理</div>
+            <div className="min-w-0">
+              <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
+              <div className="label-eyebrow mt-1.5 hidden whitespace-nowrap sm:block">Claude Code Gateway</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <div className="mr-1 hidden items-center gap-2 rounded-full border border-ok/15 bg-ok-soft px-3 py-1.5 text-2xs font-medium text-ok md:flex">
+              <span className="relative flex size-2">
+                <span className="absolute inline-flex size-full animate-ping rounded-full bg-ok opacity-40" />
+                <span className="relative inline-flex size-2 rounded-full bg-ok" />
+              </span>
+              控制台在线
+            </div>
+            <Button size="sm" variant="outline" onClick={() => setShowForwarding(true)} title="转发形态">
+              <AdjustmentsHorizontalIcon />
+              <span className="hidden sm:inline">转发形态</span>
+            </Button>
             <Button size="sm" variant="outline" onClick={() => setShowSettings(true)} title="接入设置">
               <Cog6ToothIcon />
               <span className="hidden sm:inline">接入设置</span>
@@ -180,14 +198,62 @@ function App() {
         </div>
       </header>
 
-      <main className="@container mx-auto w-full max-w-5xl space-y-6 px-5 py-8">
+      <main className="@container relative mx-auto w-full max-w-6xl space-y-5 px-4 py-6 sm:space-y-7 sm:px-5 sm:py-10">
         {/* 弹窗：添加账号 / 接入设置 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
         <AccessSettings open={showSettings} onOpenChange={setShowSettings} />
+        <ForwardingSettings open={showForwarding} onOpenChange={setShowForwarding} />
+
+        <section className="space-y-3 sm:space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <h1 className="text-xl font-semibold tracking-[-0.035em] sm:text-2xl">账号概览</h1>
+            <div className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground">
+              <ArrowPathIcon className="size-3.5" />
+              <span className="hidden sm:inline">每 30 秒自动刷新</span>
+              <span className="sm:hidden">自动刷新</span>
+            </div>
+          </div>
+
+          {count > 0 && (
+            <div className="grid grid-cols-2 overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-card @3xl:grid-cols-4">
+              <OverviewMetric
+                label="账号总数"
+                value={count}
+                status={`${enabledCount} 已启用`}
+                icon={ShieldCheckIcon}
+                tone={enabledCount === count ? 'ok' : 'neutral'}
+                className="border-b border-r @3xl:border-b-0"
+              />
+              <OverviewMetric
+                label="异常账号"
+                value={abnormalCount}
+                status={abnormalCount > 0 ? '需处理' : '正常'}
+                icon={ExclamationTriangleIcon}
+                tone={abnormalCount > 0 ? 'bad' : 'neutral'}
+                className="border-b @3xl:border-b-0 @3xl:border-r"
+              />
+              <OverviewMetric
+                label="额度预警"
+                value={nearLimitCount}
+                status={nearLimitCount > 0 ? '已达 90%' : '无预警'}
+                icon={SignalIcon}
+                tone={nearLimitCount > 0 ? 'warn' : 'neutral'}
+                className="border-r"
+              />
+              <OverviewMetric
+                label="活跃设备"
+                value={deviceCount}
+                status="有效绑定"
+                icon={DevicePhoneMobileIcon}
+                tone="neutral"
+              />
+            </div>
+          )}
+        </section>
 
         {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
         {count > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="grid gap-3 rounded-2xl border border-border/70 bg-surface/80 p-3 shadow-card backdrop-blur-sm sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
             <h2 className="flex items-baseline gap-2 text-sm font-semibold tracking-tight">
               账号列表
               <span className="text-xs font-normal text-muted-foreground">
@@ -204,15 +270,15 @@ function App() {
                 )}
               </span>
             </h2>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="min-w-0 space-y-2 @4xl:flex @4xl:items-center @4xl:justify-end @4xl:space-y-0">
               {/* 搜索：名称或 #id */}
-              <div className="relative">
+              <div className="relative @4xl:mr-2">
                 <MagnifyingGlassIcon className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   value={query}
                   onChange={(e) => resetPage(setQuery)(e.target.value)}
                   placeholder="搜索名称或 #id"
-                  className="h-8 w-40 pl-7 pr-7 text-xs"
+                  className="h-9 w-full bg-background/70 pl-8 pr-8 text-xs @4xl:h-8 @4xl:w-48"
                 />
                 {query && (
                   <button
@@ -225,8 +291,9 @@ function App() {
                 )}
               </div>
 
-              {/* 状态筛选 */}
-              <DropdownMenu>
+              <div className="scrollbar-none -mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 @4xl:mx-0 @4xl:overflow-visible @4xl:px-0 @4xl:pb-0">
+                {/* 状态筛选 */}
+                <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
                     size="sm"
@@ -248,10 +315,10 @@ function App() {
                     </DropdownMenuItem>
                   ))}
                 </DropdownMenuContent>
-              </DropdownMenu>
+                </DropdownMenu>
 
-              {/* 视图切换：卡片 / 紧凑列表 */}
-              <div className="flex items-center overflow-hidden rounded-xl border border-border">
+                {/* 视图切换：卡片 / 紧凑列表 */}
+                <div className="flex shrink-0 items-center overflow-hidden rounded-xl border border-border">
                 <button
                   className={cn(
                     'grid h-8 w-8 place-items-center transition-colors',
@@ -274,9 +341,9 @@ function App() {
                 >
                   <Bars3Icon className="size-4" />
                 </button>
-              </div>
+                </div>
 
-              <Button
+                <Button
                 size="sm"
                 variant={batch ? 'secondary' : 'outline'}
                 className="h-8 gap-1.5 px-2.5 text-xs"
@@ -285,8 +352,8 @@ function App() {
               >
                 <QueueListIcon className="size-3.5" />
                 批量
-              </Button>
-              <DropdownMenu>
+                </Button>
+                <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button size="sm" variant="outline" className="h-8 gap-1.5 px-2.5 text-xs">
                     <ArrowsUpDownIcon className="size-3.5" />
@@ -308,7 +375,8 @@ function App() {
                     </DropdownMenuItem>
                   ))}
                 </DropdownMenuContent>
-              </DropdownMenu>
+                </DropdownMenu>
+              </div>
             </div>
           </div>
         )}
@@ -342,7 +410,7 @@ function App() {
           </div>
         ) : view === 'list' ? (
           // Table 自带横向滚动容器；外层这层只负责圆角描边（overflow-hidden 裁掉溢出的直角）。
-          <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-card">
+          <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-panel">
             <Table>
               {/* 组件默认可见（mt-4 的说明文字），这里只给读屏用 */}
               <TableCaption className="sr-only">账号列表</TableCaption>
@@ -463,6 +531,41 @@ function Pagination({
         >
           <ChevronRightIcon className="size-3.5" />
         </Button>
+      </div>
+    </div>
+  )
+}
+
+function OverviewMetric({
+  label, value, status, icon: Icon, tone, className,
+}: {
+  label: string
+  value: number
+  status: string
+  icon: typeof ShieldCheckIcon
+  tone: 'ok' | 'bad' | 'warn' | 'neutral'
+  className?: string
+}) {
+  const toneClass = {
+    ok: 'bg-ok-soft text-ok',
+    bad: 'bg-bad-soft text-bad',
+    warn: 'bg-warn-soft text-warn',
+    neutral: 'bg-muted text-muted-foreground',
+  }[tone]
+
+  return (
+    <div className={cn('min-w-0 p-3.5 sm:p-5', className)}>
+      <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+        <Icon className={cn('size-4 shrink-0', tone !== 'neutral' && toneClass.split(' ')[1])} />
+        <span>{label}</span>
+      </div>
+      <div className="mt-2.5 flex items-end justify-between gap-2 sm:mt-3">
+        <span className="text-2xl font-semibold leading-none tracking-[-0.04em] tnum sm:text-3xl">
+          {value}
+        </span>
+        <span className={cn('shrink-0 rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs', toneClass)}>
+          {status}
+        </span>
       </div>
     </div>
   )
