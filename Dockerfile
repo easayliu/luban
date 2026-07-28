@@ -24,11 +24,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake build-essential perl pkg-config git clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+# ---- 依赖预编译层 ----
+# 只拷清单、用一个空 main 先把**依赖**编出来。这一层的失效条件仅是 Cargo.toml/Cargo.lock
+# 变化，改业务代码不会动它，于是 BoringSSL 那几分钟只在换依赖时才付一次。
+# 没有这一层的话，`COPY src` 在 `cargo build` 之前，任何一行代码改动都会让整层失效、
+# 把全部依赖连同 BoringSSL 重编一遍——换 wreq 之后这个代价明显变大，故补上。
+#
+# 空 main 编译不需要 admin-ui/dist：rust-embed 的宏在**我们自己的 crate** 里才展开，
+# 这一层还没有真实的 src，轮不到它读目录。
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
+
+# ---- 真实构建 ----
 COPY src ./src
 # rust-embed 在编译期读取 admin-ui/dist（相对 crate 根 /app）。
 COPY --from=frontend /app/admin-ui/dist ./admin-ui/dist
-RUN cargo build --release
+# 先删掉空 main 留下的产物：crate 名没变，不删的话有让 cargo 误判为「已是最新」的余地，
+# 那会把一个空壳二进制打进镜像（起来就是 CMD 立刻退出，且不报错）。依赖的产物不动，
+# 所以这一步只重编 luban 自己。
+RUN rm -f target/release/luban target/release/deps/luban-* \
+    && cargo build --release
 
 # ---------- 运行时 ----------
 FROM debian:bookworm-slim
