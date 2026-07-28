@@ -11,14 +11,17 @@ RUN pnpm build
 # 在 musl/alpine 上折腾这类 -sys crate 很麻烦，glibc 直接可用。
 # （build-essential 里的 g++ 是 BoringSSL 必需的，它有 .cc 源文件；perl 供其汇编生成用。）
 #
-# **git 是必需的**：btls-sys 的构建脚本会在解压出来的 BoringSSL 源码树里跑 `git init`
-# 再 apply 它自带的那组补丁，没有 git 就直接 `boring-sys failed: can't run git`。
-# 这个坑在 GitHub runner 上看不出来（自带 git），只有这个 slim 镜像会踩。
-# btls-sys 用到的外部命令就这些：git、cmake、xcrun(仅 macOS)；objcopy/nm 挂在
+# btls-sys 在这个 slim 镜像上比在 CI runner / 开发机上多要两样东西——两者都因为
+# runner 与 macOS 自带而长期看不见，只有这里会踩：
+#   - **git**：构建脚本在解压出的 BoringSSL 源码树里跑 `git init` 再 apply 自带的补丁，
+#     缺了就是 `boring-sys failed: can't run git`。
+#   - **libclang**：BoringSSL 编完后要用 bindgen 生成绑定，缺了就是
+#     `Unable to find libclang`。libclang-dev 提供不带版本号的 libclang.so。
+# 除此之外它只调 cmake(走 cmake crate)与 xcrun(仅 macOS)；objcopy/nm 挂在
 # prefix-symbols feature 下、我们没开；**不需要 Go**。
 FROM rust:1-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake build-essential perl pkg-config git \
+      cmake build-essential perl pkg-config git clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -29,7 +32,10 @@ RUN cargo build --release
 
 # ---------- 运行时 ----------
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# libstdc++6：BoringSSL 是 C++ 的，btls-sys 发的是 `cargo:rustc-link-lib=stdc++`
+# （动态，不是 static），所以二进制运行时需要 libstdc++.so.6。换 wreq 之前用的
+# aws-lc-rs 是纯 C，从来不需要它——漏了的话表现是容器起不来而不是构建失败。
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/luban /usr/local/bin/luban
