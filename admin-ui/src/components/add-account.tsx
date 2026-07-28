@@ -50,50 +50,66 @@ export function AddAccount({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>添加 Claude 账号</DialogTitle>
-          <DialogDescription>用 Claude 订阅账号完成 OAuth 授权，新账号默认优先级 P0。</DialogDescription>
+          <DialogDescription>完成 OAuth 授权后，账号会加入当前调度池。</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-5">
-          <div className="space-y-2.5">
-            <Step n={1} text="打开 Claude 授权页" />
-            <Button onClick={() => authorize.mutate()} disabled={authorize.isPending}>
+        <DialogBody className="space-y-3">
+          <Step n={1} title="打开授权页面">
+            <p className="text-xs leading-5 text-muted-foreground">使用需要接入的 Claude 订阅账号完成授权。</p>
+            <Button className="w-full sm:w-auto" onClick={() => authorize.mutate()} disabled={authorize.isPending}>
               {authorize.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowTopRightOnSquareIcon />}
-              生成授权链接并打开
+              打开 Claude 授权页
             </Button>
             {authUrl && (
-              <p className="text-xs text-muted-foreground">
-                没弹出新标签页？手动点击：{' '}
-                <a href={authUrl} target="_blank" rel="noopener" className="break-all text-primary underline-offset-2 hover:underline">
-                  {authUrl}
+              <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                新标签页未打开时，可{' '}
+                <a href={authUrl} target="_blank" rel="noopener" className="font-medium text-foreground underline underline-offset-2">
+                  手动打开授权页面
                 </a>
-              </p>
+              </div>
             )}
-          </div>
+          </Step>
 
-          <div className="space-y-2.5">
-            <Step n={2} text="粘贴授权结果" />
-            <p className="text-xs text-muted-foreground">
-              授权后页面会显示形如 <code className="font-mono">code#state</code> 的文本，整段粘贴到下面。
-            </p>
-            <Textarea value={code} onChange={(e) => setCode(e.target.value)} placeholder="在此粘贴 code#state" />
-            <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="账号备注（可选，留空则用账号邮箱自动命名）" />
-            <Button onClick={() => exchange.mutate()} disabled={exchange.isPending || !code.trim()}>
-              {exchange.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowRightIcon />}
-              完成添加
-            </Button>
-          </div>
+          <Step n={2} title="提交授权结果">
+            <label className="block space-y-1.5 text-sm font-medium" htmlFor="oauth-result">
+              <span>授权结果</span>
+              <Textarea
+                id="oauth-result"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                placeholder="粘贴完整的 code#state"
+                className="min-h-24"
+              />
+            </label>
+            <label className="block space-y-1.5 text-sm font-medium" htmlFor="account-label">
+              <span>账号备注 <span className="font-normal text-muted-foreground">（可选）</span></span>
+              <Input
+                id="account-label"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                placeholder="留空时使用账号邮箱"
+              />
+            </label>
+            <div className="flex justify-end">
+              <Button className="w-full sm:w-auto" onClick={() => exchange.mutate()} disabled={exchange.isPending || !code.trim()}>
+                {exchange.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowRightIcon />}
+                添加账号
+              </Button>
+            </div>
+          </Step>
         </DialogBody>
       </DialogContent>
     </Dialog>
   )
 }
 
-function Step({ n, text }: { n: number; text: string }) {
+function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2">
-      <span className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-semibold text-foreground">
-        {n}
-      </span>
-      <span className="text-sm font-medium">{text}</span>
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="mb-3 flex items-center gap-2.5">
+        <span className="flex size-6 items-center justify-center rounded-md bg-primary text-xs font-semibold text-primary-foreground">{n}</span>
+        <span className="text-sm font-semibold">{title}</span>
+      </div>
+      <div className="space-y-3 pl-0 sm:pl-8">{children}</div>
     </div>
   )
 }

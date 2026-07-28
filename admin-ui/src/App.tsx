@@ -158,7 +158,7 @@ function App() {
     <div className="app-shell min-h-screen bg-background text-foreground">
       {/* 置顶操作栏 */}
       <header className="sticky top-0 z-20 border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5 sm:py-3.5">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-3 lg:px-6">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
             <div className="brand-mark flex size-9 shrink-0 items-center justify-center rounded-xl text-white shadow-brand sm:size-10">
               <span className="relative font-mono text-sm font-bold">鲁</span>
@@ -169,13 +169,6 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <div className="mr-1 hidden items-center gap-2 rounded-full border border-ok/15 bg-ok-soft px-3 py-1.5 text-2xs font-medium text-ok md:flex">
-              <span className="relative flex size-2">
-                <span className="absolute inline-flex size-full animate-ping rounded-full bg-ok opacity-40" />
-                <span className="relative inline-flex size-2 rounded-full bg-ok" />
-              </span>
-              控制台在线
-            </div>
             <Button size="sm" variant="outline" onClick={() => setShowForwarding(true)} title="转发形态">
               <AdjustmentsHorizontalIcon />
               <span className="hidden sm:inline">转发形态</span>
@@ -198,7 +191,7 @@ function App() {
         </div>
       </header>
 
-      <main className="@container relative mx-auto w-full max-w-6xl space-y-5 px-4 py-6 sm:space-y-7 sm:px-5 sm:py-10">
+      <main className="@container relative mx-auto w-full max-w-7xl space-y-4 px-4 py-4 md:space-y-6 md:py-6 lg:px-6">
         {/* 弹窗：添加账号 / 接入设置 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
         <AccessSettings open={showSettings} onOpenChange={setShowSettings} />
@@ -215,7 +208,7 @@ function App() {
           </div>
 
           {count > 0 && (
-            <div className="grid grid-cols-2 overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-card @3xl:grid-cols-4">
+            <div className="grid grid-cols-2 overflow-hidden rounded-xl border border-border bg-card shadow-card @3xl:grid-cols-4">
               <OverviewMetric
                 label="账号总数"
                 value={count}
@@ -243,7 +236,6 @@ function App() {
               <OverviewMetric
                 label="活跃设备"
                 value={deviceCount}
-                status="有效绑定"
                 icon={DevicePhoneMobileIcon}
                 tone="neutral"
               />
@@ -253,7 +245,7 @@ function App() {
 
         {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
         {count > 0 && (
-          <div className="grid gap-3 rounded-2xl border border-border/70 bg-surface/80 p-3 shadow-card backdrop-blur-sm sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
+          <div className="grid gap-3 rounded-xl border border-border bg-card p-3 shadow-card sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
             <h2 className="flex items-baseline gap-2 text-sm font-semibold tracking-tight">
               账号列表
               <span className="text-xs font-normal text-muted-foreground">
@@ -318,7 +310,7 @@ function App() {
                 </DropdownMenu>
 
                 {/* 视图切换：卡片 / 紧凑列表 */}
-                <div className="flex shrink-0 items-center overflow-hidden rounded-xl border border-border">
+              <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-border">
                 <button
                   className={cn(
                     'grid h-8 w-8 place-items-center transition-colors',
@@ -397,7 +389,7 @@ function App() {
         ) : count === 0 ? (
           <EmptyState onAdd={() => setAdding(true)} />
         ) : total === 0 ? (
-          <div className="rounded-2xl border border-dashed border-border py-14 text-center">
+          <div className="rounded-xl border border-dashed border-border bg-card py-14 text-center">
             <p className="text-sm text-muted-foreground">没有符合条件的账号</p>
             <Button
               variant="outline"
@@ -410,7 +402,7 @@ function App() {
           </div>
         ) : view === 'list' ? (
           // Table 自带横向滚动容器；外层这层只负责圆角描边（overflow-hidden 裁掉溢出的直角）。
-          <div className="overflow-hidden rounded-2xl border border-border/70 bg-card shadow-panel">
+          <div className="overflow-hidden rounded-xl border border-border bg-card shadow-card">
             <Table>
               {/* 组件默认可见（mt-4 的说明文字），这里只给读屏用 */}
               <TableCaption className="sr-only">账号列表</TableCaption>
@@ -541,7 +533,7 @@ function OverviewMetric({
 }: {
   label: string
   value: number
-  status: string
+  status?: string
   icon: typeof ShieldCheckIcon
   tone: 'ok' | 'bad' | 'warn' | 'neutral'
   className?: string
@@ -563,9 +555,11 @@ function OverviewMetric({
         <span className="text-2xl font-semibold leading-none tracking-[-0.04em] tnum sm:text-3xl">
           {value}
         </span>
-        <span className={cn('shrink-0 rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs', toneClass)}>
-          {status}
-        </span>
+        {status && (
+          <span className={cn('shrink-0 rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs', toneClass)}>
+            {status}
+          </span>
+        )}
       </div>
     </div>
   )
@@ -633,9 +627,8 @@ function BatchActionsBar({
   const allSelected = all.length > 0 && n === all.length
 
   return (
-    <div className="space-y-2 rounded-xl border border-border bg-surface-2/40 px-3 py-2.5 text-xs">
-      {/* 第一行：选择状态 + 无需填值的操作（启停 / 删除） */}
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="rounded-xl border border-border bg-card p-3 text-xs shadow-card">
+      <div className="flex items-center gap-2">
         <Button
           size="sm"
           variant="ghost"
@@ -643,29 +636,33 @@ function BatchActionsBar({
           title="选中当前筛选结果里的全部账号（跨页，勾选状态在翻页后保留）"
           onClick={() => onSelectedChange(allSelected ? new Set() : new Set(all.map((c) => c.id)))}
         >
-          {allSelected ? '取消全选' : `全选 ${all.length} 个`}
+          {allSelected ? '取消全选' : '全选'}
         </Button>
         <span className="text-muted-foreground">
-          已选 <span className="tnum font-medium text-foreground">{n}</span> 个
+          已选 <span className="tnum font-semibold text-foreground">{n}</span> / {all.length}
         </span>
+        <Button size="icon" variant="ghost" className="ml-auto size-7" onClick={onClose} title="退出批量模式">
+          <XMarkIcon className="size-3.5" />
+        </Button>
+      </div>
 
-        <div className="ml-auto flex items-center gap-1.5">
+      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border pt-3 sm:flex">
           <Button
-            size="sm" variant="outline" className="h-7 px-2.5 text-xs"
+            size="sm" variant="outline" className="w-full text-xs sm:w-auto"
             disabled={none || busy}
             onClick={() => applyDisabled.mutate(false)}
           >
             <PlayIcon className="size-3.5" />启用
           </Button>
           <Button
-            size="sm" variant="outline" className="h-7 px-2.5 text-xs"
+            size="sm" variant="outline" className="w-full text-xs sm:w-auto"
             disabled={none || busy}
             onClick={() => applyDisabled.mutate(true)}
           >
             <PauseIcon className="size-3.5" />停用
           </Button>
           <Button
-            size="sm" variant="ghost" className="h-7 px-2.5 text-xs text-bad hover:text-bad"
+            size="sm" variant="outline" className="w-full text-xs text-bad hover:text-bad sm:w-auto"
             disabled={none || busy}
             onClick={() => setConfirmDelete(true)}
           >
@@ -686,66 +683,60 @@ function BatchActionsBar({
               </>
             }
           />
-          <span className="mx-0.5 h-4 w-px bg-border" />
-          <Button size="icon" variant="ghost" className="size-7" onClick={onClose} title="退出批量模式">
-            <XMarkIcon className="size-3.5" />
-          </Button>
-        </div>
       </div>
 
-      {/* 第二行：需要填值的操作（优先级 / 设备上限） */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-2">
-        <div className="flex items-center gap-1.5">
-          <span className="text-muted-foreground">优先级</span>
-          <Input
-            type="number"
-            value={priority}
-            onChange={(e) => setPriority(e.target.value)}
-            className="h-7 w-20 font-mono text-xs"
-            title="数值小者优先被调度；同一档内按设备数负载均衡"
-          />
-          <Button
-            size="sm" className="h-7 px-2.5 text-xs"
-            disabled={none || busy}
-            onClick={() => applyPriority.mutate(Math.floor(Number(priority) || 0))}
-          >
-            {applyPriority.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
-            应用
-          </Button>
+      <div className="mt-3 grid gap-2 border-t border-border pt-3 sm:grid-cols-2">
+        <div className="rounded-md border border-border bg-muted/30 p-2.5">
+          <div className="mb-2 text-2xs font-medium text-muted-foreground">设置优先级</div>
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              value={priority}
+              onChange={(e) => setPriority(e.target.value)}
+              className="h-8 min-w-0 flex-1 font-mono text-xs"
+              title="数值小者优先被调度；同一档内按设备数负载均衡"
+            />
+            <Button
+              size="sm" className="shrink-0 text-xs"
+              disabled={none || busy}
+              onClick={() => applyPriority.mutate(Math.floor(Number(priority) || 0))}
+            >
+              {applyPriority.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+              应用
+            </Button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
-          <span className="text-muted-foreground">设备上限</span>
-          <Input
-            type="number"
-            min={0}
-            value={limit}
-            onChange={(e) => setLimit(e.target.value)}
-            placeholder="默认"
-            className="h-7 w-20 font-mono text-xs"
-            title="留空 = 跟随全局默认；0 = 不限；正数 = 独立上限"
-          />
-          <Button
-            size="sm" className="h-7 px-2.5 text-xs"
-            disabled={none || busy}
-            onClick={() => applyLimit.mutate(inputToLimit(limit))}
-          >
-            {applyLimit.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
-            应用
-          </Button>
+        <div className="rounded-md border border-border bg-muted/30 p-2.5">
+          <div className="mb-2 text-2xs font-medium text-muted-foreground">设置设备上限</div>
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              value={limit}
+              onChange={(e) => setLimit(e.target.value)}
+              placeholder="默认"
+              className="h-8 min-w-0 flex-1 font-mono text-xs"
+              title="留空 = 跟随全局默认；0 = 不限；正数 = 独立上限"
+            />
+            <Button
+              size="sm" className="shrink-0 text-xs"
+              disabled={none || busy}
+              onClick={() => applyLimit.mutate(inputToLimit(limit))}
+            >
+              {applyLimit.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+              应用
+            </Button>
+          </div>
         </div>
       </div>
-
-      <p className="text-2xs text-muted-foreground">
-        优先级数值小者优先调度，同档内按设备数负载均衡；设备上限留空表示跟随接入设置里的全局默认，填 0 表示不限。
-      </p>
     </div>
   )
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   return (
-    <div className="rounded-2xl border border-dashed border-border py-16 text-center">
+    <div className="rounded-xl border border-dashed border-border bg-card py-16 text-center">
       <p className="text-sm text-muted-foreground">还没有账号</p>
       <Button className="mt-4" onClick={onAdd}>
         <PlusIcon />

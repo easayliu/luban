@@ -27,7 +27,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
       <div className="w-full max-w-sm">
         {/* 品牌标识 */}
         <div className="mb-6 flex flex-col items-center text-center">
-          <div className="brand-mark flex size-12 items-center justify-center rounded-2xl text-white shadow-brand">
+          <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-white shadow-brand">
             <span className="font-mono text-lg font-bold">鲁</span>
           </div>
           <div className="mt-4 text-lg font-semibold leading-none tracking-tight">Luban</div>
@@ -35,15 +35,14 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
         </div>
 
         {/* 登录卡片 */}
-        <div className="rounded-2xl border border-border/70 bg-card/90 p-6 shadow-panel backdrop-blur-sm sm:p-7">
+        <div className="rounded-xl border border-border bg-card p-6 shadow-card sm:p-7">
           <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
             <LockClosedIcon className="size-5 text-muted-foreground" />
             管理登录
           </h1>
-          <p className="mt-1.5 text-sm leading-6 text-muted-foreground">输入管理密码以进入账号调度中心。</p>
 
           <form
-            className="mt-6 space-y-3"
+            className="mt-5 space-y-3"
             onSubmit={(e) => { e.preventDefault(); if (password) doLogin.mutate() }}
           >
             <div className="relative">

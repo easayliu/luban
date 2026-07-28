@@ -69,83 +69,72 @@ export function AccessSettings({
               <Badge variant="outline" className="gap-1"><LockClosedIcon className="size-3" />环境接管</Badge>
             )}
           </DialogTitle>
-          <DialogDescription>Claude Code 用下面的地址与 Key 接入 luban。</DialogDescription>
+          <DialogDescription>管理客户端接入、设备策略和控制台安全。</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-4">
-          {/* 接入地址 */}
-          <Field label="接入地址（ANTHROPIC_BASE_URL）">
-            <div className="flex items-center gap-2">
-              <Input readOnly value={baseUrl} className="font-mono" />
-              <CopyBtn text={baseUrl} />
-            </div>
-          </Field>
-
-          {/* API Key */}
-          <Field label="接入 Key（ANTHROPIC_AUTH_TOKEN）">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex min-w-0 flex-1 items-center gap-2">
-                <Input
-                  type={show ? 'text' : 'password'}
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  readOnly={envManaged}
-                  placeholder={envManaged ? '' : '留空则不校验来访（仅本机）'}
-                  className="font-mono"
-                />
-                <Button size="icon" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => setShow((s) => !s)}>
-                  {show ? <EyeSlashIcon /> : <EyeIcon />}
-                </Button>
-                <CopyBtn text={draft} />
+        <DialogBody className="space-y-3 bg-muted/20">
+          <SettingsSection title="客户端接入">
+            <Field label="接入地址" code="ANTHROPIC_BASE_URL">
+              <div className="flex items-center gap-2">
+                <Input readOnly value={baseUrl} className="font-mono" />
+                <CopyBtn text={baseUrl} />
               </div>
-              {!envManaged && (
-                <div className="flex items-center gap-2">
-                  <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
-                  <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
-                    {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+            </Field>
+
+            <Field label="接入 Key" code="ANTHROPIC_AUTH_TOKEN">
+              <div className="space-y-2">
+                <div className="flex min-w-0 items-center gap-1">
+                  <Input
+                    type={show ? 'text' : 'password'}
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    readOnly={envManaged}
+                    placeholder={envManaged ? '' : '留空则不校验来访'}
+                    className="font-mono"
+                  />
+                  <Button size="icon" variant="ghost" className="shrink-0" onClick={() => setShow((s) => !s)} title={show ? '隐藏' : '显示'}>
+                    {show ? <EyeSlashIcon /> : <EyeIcon />}
                   </Button>
-                  {currentKey && (
-                    <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
-                      onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
-                      <TrashIcon />清空
-                    </Button>
-                  )}
+                  <CopyBtn text={draft} />
                 </div>
+                {!envManaged && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
+                    <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
+                      {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+                    </Button>
+                    {currentKey && (
+                      <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
+                        onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
+                        <TrashIcon />清空
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+              {envManaged && (
+                <p className="text-xs text-muted-foreground">
+                  由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
+                </p>
               )}
-            </div>
-            {envManaged && (
-              <p className="mt-1.5 text-xs text-muted-foreground">
-                由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
-              </p>
-            )}
-          </Field>
+            </Field>
 
-          {/* 一键接入片段 */}
-          <Field label="Claude Code 接入片段">
-            <div className="relative">
-              <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 pr-11 font-mono text-2xs leading-5">{snippet}</pre>
-              <div className="absolute right-2 top-2"><CopyBtn text={snippet} /></div>
-            </div>
-          </Field>
+            <Field label="Claude Code 接入片段">
+              <div className="relative">
+                <pre className="scrollbar-dialog overflow-x-auto rounded-md border border-border bg-muted/40 p-3 pr-11 font-mono text-2xs leading-5">{snippet}</pre>
+                <div className="absolute right-1.5 top-1.5"><CopyBtn text={snippet} /></div>
+              </div>
+            </Field>
+          </SettingsSection>
 
-          {/* 设备绑定有效期 */}
-          <div className="border-t border-border pt-4">
+          <SettingsSection title="设备策略">
             <DeviceBindingTtl />
-          </div>
-
-          {/* 全局默认设备上限 */}
-          <div className="border-t border-border pt-4">
             <DefaultDeviceLimit />
-          </div>
-
-          {/* 设备身份校验 */}
-          <div className="border-t border-border pt-4">
             <RequireDeviceIdToggle />
-          </div>
+          </SettingsSection>
 
-          {/* 管理密码 */}
-          <div className="border-t border-border pt-4">
+          <SettingsSection title="控制台安全">
             <AdminPassword />
-          </div>
+          </SettingsSection>
         </DialogBody>
       </DialogContent>
     </Dialog>
@@ -183,15 +172,15 @@ function DeviceBindingTtl() {
           min={0}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          className="w-40 font-mono"
+          className="w-full font-mono sm:w-40"
         />
         <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
           {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
         </Button>
         <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
-      <p className="mt-1.5 text-xs text-muted-foreground">
-        设备超过该时长无请求，绑定自动释放、腾出凭证设备名额；期间同一设备始终命中同一凭证。0 表示永不过期。
+      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+        超时无请求的设备会自动释放绑定；填 0 表示永不过期。
       </p>
     </Field>
   )
@@ -230,7 +219,7 @@ function DefaultDeviceLimit() {
           min={0}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          className="w-40 font-mono"
+          className="w-full font-mono sm:w-40"
         />
         <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
           {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
@@ -239,9 +228,8 @@ function DefaultDeviceLimit() {
           {parsed > 0 ? `每个账号最多 ${parsed} 台设备` : '不限（不设默认上限）'}
         </span>
       </div>
-      <p className="mt-1.5 text-xs text-muted-foreground">
-        新增/未单独配置的账号一律套用这个上限，无需逐个设置；卡片上标着「默认」的即跟随此值。
-        某个账号需要例外时，在其卡片上单独设置即可覆盖（填 0 表示该账号不限）。
+      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+        未单独配置的账号跟随此值；账号卡片中的独立设置会覆盖它。
       </p>
     </Field>
   )
@@ -264,18 +252,17 @@ function RequireDeviceIdToggle() {
 
   return (
     <Field label="设备身份校验">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
+        <span className="text-sm">{required ? '已开启' : '已关闭'}</span>
         <Switch
           variant="success"
           checked={required}
           disabled={save.isPending}
           onCheckedChange={(next) => save.mutate(next)}
         />
-        <span className="text-sm">{required ? '已开启（拒绝无设备身份的请求）' : '已关闭（放行）'}</span>
       </div>
-      <p className="mt-1.5 text-xs text-muted-foreground">
-        开启后，请求体里没有可识别 <code className="font-mono">metadata.user_id</code> 的一律返回 403。
-        这类「裸请求」无从计入设备数，也无法做身份伪装。
+      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+        开启后，缺少 <code className="font-mono">metadata.user_id</code> 的请求会返回 403。
         {!required && (
           <span className="text-warn">
             {' '}当前已关闭：这类请求会被转发，但不绑定账号、不占设备名额，因而绕过设备上限。
@@ -315,7 +302,7 @@ function AdminPassword() {
         </p>
       ) : (
         <>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="grid gap-2 sm:flex sm:items-center">
             <Input
               type="password"
               value={pw}
@@ -323,12 +310,12 @@ function AdminPassword() {
               placeholder={configured ? '输入新密码以修改' : '设置密码（至少 4 位，之后登录需要）'}
               className="min-w-0 flex-1"
             />
-            <Button size="sm" onClick={() => save.mutate(pw.trim())} disabled={save.isPending || pw.trim().length < 4}>
+            <Button size="sm" className="w-full sm:w-auto" onClick={() => save.mutate(pw.trim())} disabled={save.isPending || pw.trim().length < 4}>
               {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <KeyIcon />}
               {configured ? '修改' : '设置'}
             </Button>
             {configured && (
-              <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
+              <Button size="sm" variant="ghost" className="w-full text-bad hover:text-bad sm:w-auto"
                 onClick={() => { if (confirm('清除后网页将不再需要登录，确定？')) save.mutate('') }}
                 disabled={save.isPending}>
                 <TrashIcon />清除
@@ -346,11 +333,23 @@ function AdminPassword() {
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function SettingsSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div>
-      <div className="label-eyebrow mb-1.5">{label}</div>
-      {children}
+    <section className="overflow-hidden rounded-lg border border-border bg-card">
+      <h3 className="border-b border-border bg-muted/30 px-4 py-3 text-sm font-semibold">{title}</h3>
+      <div className="divide-y divide-border px-4 [&>*]:py-4 [&>*:first-child]:pt-4 [&>*:last-child]:pb-4">{children}</div>
+    </section>
+  )
+}
+
+function Field({ label, code, children }: { label: string; code?: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-baseline gap-1.5 text-sm font-medium">
+        <span>{label}</span>
+        {code && <code className="font-mono text-2xs font-normal text-muted-foreground">{code}</code>}
+      </div>
+      <div>{children}</div>
     </div>
   )
 }

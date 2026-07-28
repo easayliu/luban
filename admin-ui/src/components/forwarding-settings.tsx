@@ -37,26 +37,21 @@ export function ForwardingSettings({
             转发形态
             {allOff && <Badge variant="outline">零改写</Badge>}
           </DialogTitle>
-          <DialogDescription>
-            逐项控制 luban 在转发时对请求做的形态对齐。全部关掉即除注入鉴权外原样透传。
-          </DialogDescription>
+          <DialogDescription>控制请求转发时的兼容性处理。</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-4">
-          <div className="flex gap-2.5 rounded-lg border border-border bg-surface-2 p-3 text-xs leading-5 text-muted-foreground">
+        <DialogBody className="space-y-3 bg-muted/20">
+          <div className="flex gap-2.5 rounded-lg border border-border bg-card p-3 text-xs leading-5 text-muted-foreground">
             <BeakerIcon className="mt-0.5 size-4 shrink-0" />
             <div>
-              实测结论：这些项<strong className="font-medium text-foreground">全关也照样 200</strong>。上游唯一强制的是{' '}
-              <code className="font-mono">system</code> 里那句{' '}
-              <code className="font-mono">You are Claude Code, …</code>（由客户端自己发，缺了会收到
-              伪装成限流的 <code className="font-mono">429 rate_limit_error</code>）；luban 侧唯一
-              必需的改动是注入 <code className="font-mono">Authorization</code>。
-              所以这里关掉任何一项都不影响可用性，只影响与官方客户端的形态贴合度。
+              这些开关用于兼容性排查。全部关闭后，luban 仍会保留必要的{' '}
+              <code className="font-mono">Authorization</code> 注入。
             </div>
           </div>
 
           <Toggle
             k="spoof_identity"
             label="身份伪装（metadata.user_id）"
+            summary="让账号身份与设备指纹保持一致。"
             desc={
               <>
                 把请求 <code className="font-mono">metadata.user_id</code> 里的{' '}
@@ -72,6 +67,7 @@ export function ForwardingSettings({
           <Toggle
             k="billing_cch"
             label="补 cch（x-anthropic-billing-header）"
+            summary="补齐订阅客户端使用的 billing header。"
             desc={
               <>
                 官方客户端只在订阅模式下发 <code className="font-mono">cch=&lt;5 位 hex&gt;</code>，
@@ -84,6 +80,7 @@ export function ForwardingSettings({
           <Toggle
             k="merge_beta"
             label="合并重排 anthropic-beta"
+            summary="按官方顺序合并并补齐 beta 标记。"
             desc={
               <>
                 把客户端的 beta 串按官方顺序重排并塞入{' '}
@@ -96,6 +93,7 @@ export function ForwardingSettings({
           <Toggle
             k="fill_client_headers"
             label="补齐缺失的客户端头"
+            summary="补齐客户端未发送的标准请求头。"
             desc={
               <>
                 客户端没带时补上 <code className="font-mono">accept-encoding</code>（官方取值）、
@@ -109,6 +107,7 @@ export function ForwardingSettings({
           <Toggle
             k="orig_header_case"
             label="头名大小写与顺序"
+            summary="按官方客户端还原头名拼写与顺序。"
             desc={
               <>
                 按官方客户端的原始拼写与顺序发出头名：标准头首字母大写（
@@ -130,6 +129,7 @@ export function ForwardingSettings({
           <Toggle
             k="cache_scope_global"
             label="缓存 scope=global"
+            summary="提升静态 system 块的跨会话缓存命中。"
             desc={
               <>
                 给最长的静态 <code className="font-mono">system</code> 块标{' '}
@@ -148,10 +148,11 @@ export function ForwardingSettings({
 
 /** 单个开关：读写都走 ['settings']，改完让账号列表也失效（形态影响缓存命中与计费）。 */
 function Toggle({
-  k, label, desc,
+  k, label, summary, desc,
 }: {
   k: ForwardingKey
   label: string
+  summary: string
   desc: React.ReactNode
 }) {
   const qc = useQueryClient()
@@ -168,18 +169,24 @@ function Toggle({
   })
 
   return (
-    <div className="border-t border-border pt-4">
-      <div className="label-eyebrow mb-1.5">{label}</div>
-      <div className="flex items-center gap-3">
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold">{label}</div>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">{summary}</p>
+        </div>
         <Switch
+          className="mt-0.5 shrink-0"
           variant="success"
           checked={enabled}
           disabled={save.isPending}
           onCheckedChange={(next) => save.mutate(next)}
         />
-        <span className="text-sm">{enabled ? '已开启' : '已关闭（原样透传）'}</span>
       </div>
-      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{desc}</p>
+      <details className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">
+        <summary className="cursor-pointer select-none font-medium text-foreground/80">技术说明</summary>
+        <div className="mt-2 leading-5">{desc}</div>
+      </details>
     </div>
   )
 }

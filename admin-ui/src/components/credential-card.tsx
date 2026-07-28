@@ -62,10 +62,9 @@ export function CredentialCard({
   return (
     <Card
       className={cn(
-        '@container/card group/card relative overflow-hidden rounded-2xl border-border/70 bg-card/95 p-4 pl-[calc(1rem-3px)] shadow-card transition-all duration-300 sm:p-5 sm:pl-[calc(1.25rem-3px)]',
+        '@container/card group/card relative overflow-hidden rounded-xl border-border bg-card p-4 pl-[calc(1rem-3px)] shadow-card transition-colors sm:p-5 sm:pl-[calc(1.25rem-3px)]',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:transition-colors',
-        'after:pointer-events-none after:absolute after:inset-x-0 after:top-0 after:h-px after:bg-gradient-to-r after:from-transparent after:via-white/80 after:to-transparent',
-        'hover:-translate-y-0.5 hover:border-brand/20 hover:shadow-elev',
+        'hover:border-foreground/15',
         cred.disabled && 'opacity-60',
         // 左侧状态轨：一眼分诊。正常态透明，异常态着色。
         status.rail,
@@ -363,85 +362,71 @@ function DeviceList({ credId }: { credId: number }) {
   })
 
   return (
-    <div className="mt-2.5 rounded-xl border border-border/60 bg-surface-2/40 px-3 py-2.5 text-2xs">
+    <div className="mt-3 overflow-hidden rounded-lg border border-border bg-muted/20 text-xs">
       {isPending ? (
-        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5 p-3 text-muted-foreground">
           <ArrowPathIcon className="size-3 animate-spin" />读取设备列表…
         </span>
       ) : error ? (
-        <span className="text-bad">{extractError(error)}</span>
+        <span className="block p-3 text-bad">{extractError(error)}</span>
       ) : data.length === 0 ? (
-        <span className="text-muted-foreground">暂无活跃设备（绑定超时未活跃即自动释放名额）</span>
+        <span className="block p-3 text-muted-foreground">暂无活跃设备</span>
       ) : (
-        <ul className="divide-y divide-border/50">
+        <ul className="divide-y divide-border">
           {data.map((d) => (
-            <li key={d.device_id} className="flex items-center gap-2 py-1 first:pt-0 last:pb-0">
-              <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-60" />
-              {/* 完整 device_id 太长塞不下，做成点击复制——只放 title 的话触屏永远拿不到。 */}
-              <button
-                className="min-w-0 truncate font-mono transition-colors hover:text-foreground"
-                title={`${d.device_id}（点击复制）`}
-                onClick={async () => {
-                  const ok = await copyText(d.device_id)
-                  if (ok) toast.success('已复制 device_id')
-                  else toast.error('复制失败', { description: d.device_id })
-                }}
-              >
-                {d.device_id.slice(0, 12)}…
-              </button>
-              <span
-                className="ml-auto shrink-0 tnum text-muted-foreground"
-                title="该设备经此账号转发的累计请求数"
-              >
-                {d.request_count} 次
-              </span>
-              {/* 本账号花费。跨账号合计只在**确实换过号**时才内联多显示一个数——
-                  原先它只在 title 里，触屏上完全看不到，而「这台设备在别处也在烧钱」
-                  恰恰是最该被看见的一条。两数相同时不显示，免得每行都挂个重复数字。 */}
-              <span
-                className={cn(
-                  'shrink-0 text-right tnum',
-                  d.cost_usd > 0 ? 'text-foreground/80' : 'text-muted-foreground',
-                )}
-                title={
-                  `该设备在本账号的累计花费 ${formatUsd(d.cost_usd)}` +
-                  (d.cost_usd_all > d.cost_usd
-                    ? `；在所有账号上合计 ${formatUsd(d.cost_usd_all)}（该设备曾绑到别的账号）`
-                    : '') +
-                  '。按用量日志统计，解绑重绑不会清零，故可能早于本次绑定'
-                }
-              >
-                {formatUsd(d.cost_usd)}
+            <li key={d.device_id} className="bg-card p-3">
+              <div className="flex items-center gap-2">
+                <DevicePhoneMobileIcon className="size-4 shrink-0 text-muted-foreground" />
+                <button
+                  className="min-w-0 truncate font-mono text-xs font-medium transition-colors hover:text-foreground"
+                  title={`${d.device_id}（点击复制）`}
+                  onClick={async () => {
+                    const ok = await copyText(d.device_id)
+                    if (ok) toast.success('已复制 device_id')
+                    else toast.error('复制失败', { description: d.device_id })
+                  }}
+                >
+                  {d.device_id.slice(0, 16)}…
+                </button>
+                <span
+                  className="ml-auto shrink-0 tnum text-2xs text-muted-foreground"
+                  title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
+                >
+                  {relativeTime(d.last_seen_at)}
+                </span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 shrink-0 px-2 text-2xs text-bad hover:text-bad"
+                  onClick={() => unbind.mutate(d.device_id)}
+                  disabled={unbind.isPending}
+                >
+                  {unbind.isPending && unbind.variables === d.device_id
+                    ? <ArrowPathIcon className="size-3 animate-spin" />
+                    : <XMarkIcon className="size-3" />}
+                  解绑
+                </Button>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+                <DeviceStat label="请求" value={`${d.request_count} 次`} />
+                <DeviceStat label="本账号花费" value={formatUsd(d.cost_usd)} />
                 {d.cost_usd_all > d.cost_usd && (
-                  <span className="text-muted-foreground"> / 全部 {formatUsd(d.cost_usd_all)}</span>
+                  <DeviceStat label="全部账号花费" value={formatUsd(d.cost_usd_all)} />
                 )}
-              </span>
-              <span
-                className="w-14 shrink-0 text-right tnum text-muted-foreground"
-                title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
-              >
-                {relativeTime(d.last_seen_at)}
-              </span>
-              {/* 解绑：只是放掉这台设备占的名额，它下次请求会重新选号（名额没满时可能又回来），
-                  所以不做二次确认；误点的代价仅是丢一次粘性。 */}
-              <button
-                onClick={() => unbind.mutate(d.device_id)}
-                disabled={unbind.isPending}
-                // 触屏上必须常显：设备明细里没有第二个解绑入口，藏在 hover 后面等于没有。
-                className="shrink-0 rounded p-0.5 text-muted-foreground transition-all hover:bg-bad-soft hover:text-bad focus-visible:opacity-100 disabled:opacity-40 pointer-fine:opacity-0 pointer-fine:group-hover/card:opacity-100"
-                title="解除该设备的绑定（腾出一个设备名额；该设备下次请求会重新选号）"
-                aria-label={`解绑设备 ${d.device_id}`}
-              >
-                {unbind.isPending && unbind.variables === d.device_id ? (
-                  <ArrowPathIcon className="size-3 animate-spin" />
-                ) : (
-                  <XMarkIcon className="size-3" />
-                )}
-              </button>
+              </div>
             </li>
           ))}
         </ul>
       )}
+    </div>
+  )
+}
+
+function DeviceStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md bg-muted/60 px-2.5 py-2">
+      <div className="text-2xs text-muted-foreground">{label}</div>
+      <div className="mt-0.5 font-medium tnum text-foreground">{value}</div>
     </div>
   )
 }

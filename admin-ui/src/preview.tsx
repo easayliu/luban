@@ -7,6 +7,9 @@ import {
   Bars3Icon, QueueListIcon, ArrowsUpDownIcon,
 } from '@heroicons/react/24/outline'
 import { CredentialCard } from '@/components/credential-card'
+import { AddAccount } from '@/components/add-account'
+import { AccessSettings } from '@/components/access-settings'
+import { ForwardingSettings } from '@/components/forwarding-settings'
 import { Button } from '@/components/ui/button'
 import type { Credential } from '@/api/credentials'
 import './index.css'
@@ -88,13 +91,29 @@ const normal: Credential = {
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 5000, refetchOnWindowFocus: false } },
 })
+const previewDialog = new URLSearchParams(window.location.search).get('dialog')
+
+queryClient.setQueryData(['settings'], {
+  api_key: 'luban-preview-key',
+  env_managed: false,
+  device_binding_ttl_secs: 86400,
+  default_device_limit: 3,
+  require_device_id: true,
+  spoof_identity: true,
+  billing_cch: true,
+  fill_client_headers: true,
+  merge_beta: true,
+  cache_scope_global: true,
+  orig_header_case: true,
+})
+queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <div className="app-shell min-h-screen bg-background text-foreground">
         <header className="border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
-          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-5 sm:py-3.5">
+          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-3 lg:px-6">
             <div className="flex items-center gap-2.5 sm:gap-3">
               <div className="brand-mark flex size-9 items-center justify-center rounded-xl text-white shadow-brand sm:size-10">
                 <span className="relative font-mono text-sm font-bold">鲁</span>
@@ -105,30 +124,27 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <div className="mr-1 hidden items-center gap-2 rounded-full border border-ok/15 bg-ok-soft px-3 py-1.5 text-2xs font-medium text-ok md:flex">
-                <span className="size-2 rounded-full bg-ok" />控制台在线
-              </div>
               <Button size="sm" variant="outline"><Cog6ToothIcon /><span className="hidden sm:inline">接入设置</span></Button>
               <Button size="sm"><PlusIcon /><span className="hidden sm:inline">添加账号</span></Button>
             </div>
           </div>
         </header>
 
-        <main className="@container mx-auto w-full max-w-6xl space-y-5 px-4 py-6 sm:space-y-7 sm:px-5 sm:py-10">
+        <main className="@container mx-auto w-full max-w-7xl space-y-4 px-4 py-4 md:space-y-6 md:py-6 lg:px-6">
           <section className="space-y-3 sm:space-y-4">
             <div className="flex items-center justify-between">
               <h1 className="text-xl font-semibold tracking-[-0.035em] sm:text-2xl">账号概览</h1>
               <span className="text-2xs text-muted-foreground">每 30 秒自动刷新</span>
             </div>
-            <div className="grid grid-cols-2 overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-card @3xl:grid-cols-4">
+            <div className="grid grid-cols-2 overflow-hidden rounded-xl border border-border bg-card shadow-card @3xl:grid-cols-4">
               <PreviewMetric label="账号总数" value="2" status="2 已启用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r @3xl:border-b-0" />
               <PreviewMetric label="异常账号" value="1" status="需处理" icon={ExclamationTriangleIcon} tone="bad" className="border-b @3xl:border-b-0 @3xl:border-r" />
               <PreviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r" />
-              <PreviewMetric label="活跃设备" value="2" status="有效绑定" icon={DevicePhoneMobileIcon} tone="neutral" />
+              <PreviewMetric label="活跃设备" value="2" icon={DevicePhoneMobileIcon} tone="neutral" />
             </div>
           </section>
 
-          <div className="grid gap-3 rounded-2xl border border-border/70 bg-surface/80 p-3 shadow-card sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
+          <div className="grid gap-3 rounded-xl border border-border bg-card p-3 shadow-card sm:p-4 @4xl:grid-cols-[auto_minmax(0,1fr)] @4xl:items-center">
             <div className="flex items-baseline gap-2">
               <div className="text-sm font-semibold">账号列表</div>
               <div className="text-xs text-muted-foreground">共 2 个</div>
@@ -139,7 +155,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </div>
               <div className="scrollbar-none -mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 @4xl:mx-0 @4xl:overflow-visible @4xl:px-0 @4xl:pb-0">
                 <Button size="sm" variant="outline" className="h-8 text-xs"><FunnelIcon />全部</Button>
-                <div className="flex shrink-0 overflow-hidden rounded-xl border border-border">
+                <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
                   <button className="grid size-8 place-items-center bg-muted"><Squares2X2Icon className="size-4" /></button>
                   <button className="grid size-8 place-items-center border-l border-border text-muted-foreground"><Bars3Icon className="size-4" /></button>
                 </div>
@@ -155,6 +171,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </div>
         </main>
       </div>
+      <AddAccount open={previewDialog === 'add'} onOpenChange={() => undefined} />
+      <AccessSettings open={previewDialog === 'access'} onOpenChange={() => undefined} />
+      <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={() => undefined} />
     </QueryClientProvider>
   </React.StrictMode>,
 )
@@ -162,7 +181,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 function PreviewMetric({ label, value, status, icon: Icon, tone, className }: {
   label: string
   value: string
-  status: string
+  status?: string
   icon: typeof ShieldCheckIcon
   tone: 'ok' | 'bad' | 'neutral'
   className?: string
@@ -180,9 +199,11 @@ function PreviewMetric({ label, value, status, icon: Icon, tone, className }: {
       </div>
       <div className="mt-2.5 flex items-end justify-between gap-2 sm:mt-3">
         <span className="text-2xl font-semibold leading-none tnum sm:text-3xl">{value}</span>
-        <span className={`rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs ${colors}`}>
-          {status}
-        </span>
+        {status && (
+          <span className={`rounded-full px-2 py-1 text-[0.625rem] font-medium leading-none sm:text-2xs ${colors}`}>
+            {status}
+          </span>
+        )}
       </div>
     </div>
   )
