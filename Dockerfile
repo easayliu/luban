@@ -10,9 +10,15 @@ RUN pnpm build
 # 用 Debian glibc：wreq 走 BoringSSL(btls-sys)，源码编译需要 cmake + C/C++ 工具链，
 # 在 musl/alpine 上折腾这类 -sys crate 很麻烦，glibc 直接可用。
 # （build-essential 里的 g++ 是 BoringSSL 必需的，它有 .cc 源文件；perl 供其汇编生成用。）
+#
+# **git 是必需的**：btls-sys 的构建脚本会在解压出来的 BoringSSL 源码树里跑 `git init`
+# 再 apply 它自带的那组补丁，没有 git 就直接 `boring-sys failed: can't run git`。
+# 这个坑在 GitHub runner 上看不出来（自带 git），只有这个 slim 镜像会踩。
+# btls-sys 用到的外部命令就这些：git、cmake、xcrun(仅 macOS)；objcopy/nm 挂在
+# prefix-symbols feature 下、我们没开；**不需要 Go**。
 FROM rust:1-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake build-essential perl pkg-config \
+      cmake build-essential perl pkg-config git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
