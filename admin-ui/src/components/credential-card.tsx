@@ -7,10 +7,13 @@ import {
   CalendarDaysIcon, ClockIcon, WalletIcon,
 } from '@heroicons/react/24/outline'
 import { listCredentialDevices, unbindCredentialDevice, type Credential } from '@/api/credentials'
-import { cn, extractError, formatDuration, formatUsd, relativeTime } from '@/lib/utils'
 import {
-  CredentialMenuContent, expiryMeta, inputToLimit, isAbnormal, isNearLimit, limitToInput,
-  statusMeta, switchTitle, tierBadgeClass, useCredentialActions,
+  cn, copyText, extractError, formatClockTime, formatFullTime, formatUsd, relativeTime,
+} from '@/lib/utils'
+import {
+  CredentialMenuContent, DeleteCredentialDialog, expiryMeta, inputToLimit, isAbnormal,
+  isNearLimit, limitToInput, liveQuota, statusMeta, switchTitle, tierBadgeClass,
+  useCredentialActions,
 } from '@/components/credential-shared'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -34,6 +37,7 @@ export function CredentialCard({
   const [limitVal, setLimitVal] = useState(limitToInput(cred.device_limit))
   // 已绑定设备明细：默认收起，展开时才挂载 DeviceList（也才发请求）。
   const [showDevices, setShowDevices] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   const actions = useCredentialActions(
     cred,
@@ -43,12 +47,12 @@ export function CredentialCard({
   const { rename, toggle, limit } = actions
 
   // 额度接近上限（5h / 7d 任一 ≥90%）：卡片描边 + 角标提示。
-  const quotaMax = Math.max(
-    cred.quota?.rl_5h_utilization ?? 0,
-    cred.quota?.rl_7d_utilization ?? 0,
-  )
+  // 用 liveQuota 而非原始快照——窗口已重置的百分比是上个周期的，不该再触发告警。
+  const { u5h, u7d } = liveQuota(cred)
+  const quotaMax = Math.max(u5h ?? 0, u7d ?? 0)
   const nearLimit = isNearLimit(cred)
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
+  // 窗口已重置的仍然渲染额度条（由 QuotaBar 显示成「已重置」），只是不参与告警。
   const has5h = cred.quota?.rl_5h_utilization != null
   const has7d = cred.quota?.rl_7d_utilization != null
   const expiry = expiryMeta(cred)
@@ -124,7 +128,8 @@ export function CredentialCard({
                 title="点击重命名"
               >
                 <span className="truncate text-sm font-semibold tracking-tight">{cred.label}</span>
-                <PencilIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100" />
+                {/* pointer-fine 才隐藏：触屏没有 hover 态，藏起来等于这个入口不存在。 */}
+                <PencilIcon className="size-3 shrink-0 text-muted-foreground transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/name:opacity-100" />
               </button>
               {nearLimit && (
                 <Badge variant="bad" className="shrink-0">
@@ -157,7 +162,7 @@ export function CredentialCard({
               </Badge>
               <span
                 className={cn('inline-flex min-w-0 items-center gap-1', expiry.className)}
-                title={cred.ban_reason ?? undefined}
+                title={expiry.title}
               >
                 <ClockIcon className="size-3 shrink-0" />
                 <span className="truncate">{expiry.text}</span>
@@ -200,7 +205,12 @@ export function CredentialCard({
                 <EllipsisHorizontalIcon />
               </Button>
             </DropdownMenuTrigger>
-            <CredentialMenuContent cred={cred} actions={actions} onRename={() => setEditing(true)} />
+            <CredentialMenuContent
+              cred={cred}
+              actions={actions}
+              onRename={() => setEditing(true)}
+              onRequestDelete={() => setConfirmDelete(true)}
+            />
           </DropdownMenu>
         </div>
       </div>
@@ -211,17 +221,19 @@ export function CredentialCard({
           {has5h && (
             <QuotaBar
               label="5 小时额度"
-              util={cred.quota.rl_5h_utilization}
+              util={u5h}
               reset={cred.quota.rl_5h_reset}
               cost={cred.quota.cost_5h}
+              snapshotTs={cred.quota.ts}
             />
           )}
           {has7d && (
             <QuotaBar
               label="7 天额度"
-              util={cred.quota.rl_7d_utilization}
+              util={u7d}
               reset={cred.quota.rl_7d_reset}
               cost={cred.quota.cost_7d}
+              snapshotTs={cred.quota.ts}
             />
           )}
         </div>
@@ -294,7 +306,7 @@ export function CredentialCard({
                 默认
               </span>
             )}
-            <PencilIcon className="size-2.5 shrink-0 opacity-0 transition-opacity group-hover/limit:opacity-100" />
+            <PencilIcon className="size-2.5 shrink-0 transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/limit:opacity-100" />
           </button>
         )}
 
@@ -314,6 +326,13 @@ export function CredentialCard({
       </div>
 
       {showDevices && <DeviceList credId={cred.id} />}
+
+      <DeleteCredentialDialog
+        cred={cred}
+        actions={actions}
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+      />
     </Card>
   )
 }
@@ -357,31 +376,44 @@ function DeviceList({ credId }: { credId: number }) {
           {data.map((d) => (
             <li key={d.device_id} className="flex items-center gap-2 py-1 first:pt-0 last:pb-0">
               <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-60" />
-              <span className="min-w-0 truncate font-mono" title={d.device_id}>
+              {/* 完整 device_id 太长塞不下，做成点击复制——只放 title 的话触屏永远拿不到。 */}
+              <button
+                className="min-w-0 truncate font-mono transition-colors hover:text-foreground"
+                title={`${d.device_id}（点击复制）`}
+                onClick={async () => {
+                  const ok = await copyText(d.device_id)
+                  if (ok) toast.success('已复制 device_id')
+                  else toast.error('复制失败', { description: d.device_id })
+                }}
+              >
                 {d.device_id.slice(0, 12)}…
-              </span>
+              </button>
               <span
                 className="ml-auto shrink-0 tnum text-muted-foreground"
                 title="该设备经此账号转发的累计请求数"
               >
                 {d.request_count} 次
               </span>
-              {/* 本账号花费。跨账号合计放 title：换过号的设备两个数会不一样，
-                  行里塞两个金额只会看花眼。 */}
+              {/* 本账号花费。跨账号合计只在**确实换过号**时才内联多显示一个数——
+                  原先它只在 title 里，触屏上完全看不到，而「这台设备在别处也在烧钱」
+                  恰恰是最该被看见的一条。两数相同时不显示，免得每行都挂个重复数字。 */}
               <span
                 className={cn(
-                  'w-14 shrink-0 text-right tnum',
+                  'shrink-0 text-right tnum',
                   d.cost_usd > 0 ? 'text-foreground/80' : 'text-muted-foreground',
                 )}
                 title={
                   `该设备在本账号的累计花费 ${formatUsd(d.cost_usd)}` +
                   (d.cost_usd_all > d.cost_usd
-                    ? `；含其它账号共 ${formatUsd(d.cost_usd_all)}（该设备曾绑到别的账号）`
+                    ? `；在所有账号上合计 ${formatUsd(d.cost_usd_all)}（该设备曾绑到别的账号）`
                     : '') +
                   '。按用量日志统计，解绑重绑不会清零，故可能早于本次绑定'
                 }
               >
                 {formatUsd(d.cost_usd)}
+                {d.cost_usd_all > d.cost_usd && (
+                  <span className="text-muted-foreground"> / 全部 {formatUsd(d.cost_usd_all)}</span>
+                )}
               </span>
               <span
                 className="w-14 shrink-0 text-right tnum text-muted-foreground"
@@ -394,7 +426,8 @@ function DeviceList({ credId }: { credId: number }) {
               <button
                 onClick={() => unbind.mutate(d.device_id)}
                 disabled={unbind.isPending}
-                className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-all hover:bg-bad-soft hover:text-bad focus-visible:opacity-100 disabled:opacity-40 group-hover/card:opacity-100"
+                // 触屏上必须常显：设备明细里没有第二个解绑入口，藏在 hover 后面等于没有。
+                className="shrink-0 rounded p-0.5 text-muted-foreground transition-all hover:bg-bad-soft hover:text-bad focus-visible:opacity-100 disabled:opacity-40 pointer-fine:opacity-0 pointer-fine:group-hover/card:opacity-100"
                 title="解除该设备的绑定（腾出一个设备名额；该设备下次请求会重新选号）"
                 aria-label={`解绑设备 ${d.device_id}`}
               >
@@ -412,19 +445,33 @@ function DeviceList({ credId }: { credId: number }) {
   )
 }
 
-/** 单个额度窗口条：标签 + 百分比 + 进度条 + 重置倒计时 + 本档已用金额。util 为空显示「未返回」。 */
+/**
+ * 单个额度窗口条：标签 + 百分比 + 进度条 + 重置时刻 + 本档已用金额。
+ *
+ * `util` 传的是 [`liveQuota`] 的结果而非原始快照：窗口过了重置时刻就置空，这里退化成
+ * 一行说明。此时进度条上的旧百分比、以及按旧窗口起点累加出来的花费，都已经不成立了，
+ * 与其画一根 95% 的红条再在旁边写「已重置」，不如干脆不画。
+ */
 function QuotaBar({
-  label, util, reset, cost,
+  label, util, reset, cost, snapshotTs,
 }: {
   label: string
   util: number | null
   reset: number | null
   cost: number | null
+  /** 快照对应的请求时间（Unix 秒），用于说明这份数据有多旧。 */
+  snapshotTs: number
 }) {
   if (util == null) {
+    const reason = reset != null
+      ? `窗口已在 ${formatFullTime(reset)} 重置，之后该账号没有新请求，因此没有新数据`
+      : '上游未返回该窗口的额度信息'
     return (
-      <div className="rounded-xl border border-dashed border-border/70 px-3 py-2.5 text-2xs text-muted-foreground">
-        {label} · 暂无数据
+      <div
+        className="rounded-xl border border-dashed border-border/70 px-3 py-2.5 text-2xs text-muted-foreground"
+        title={`${reason}。最后一次快照：${formatFullTime(snapshotTs)}`}
+      >
+        {label} · {reset != null ? '已重置，暂无新用量' : '暂无数据'}
       </div>
     )
   }
@@ -432,12 +479,15 @@ function QuotaBar({
   const critical = util >= 0.9
   const barColor = critical ? 'bg-bad' : util >= 0.7 ? 'bg-warn' : 'bg-ok'
   const pctColor = critical ? 'text-bad' : util >= 0.7 ? 'text-warn' : 'text-foreground'
-  const remain = reset != null ? reset - Math.floor(Date.now() / 1000) : null
   return (
     <div className="rounded-xl border border-border/60 bg-surface-2/40 px-3 py-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-2xs font-medium text-muted-foreground">{label}</span>
-        <span className={cn('text-sm font-semibold tnum leading-none', pctColor)} title="额度使用率">
+        {/* 百分比只在有请求经过时才刷新，标注快照时间，免得把很旧的数当成实时值。 */}
+        <span
+          className={cn('text-sm font-semibold tnum leading-none', pctColor)}
+          title={`额度使用率 · 快照于 ${relativeTime(snapshotTs)}（${formatFullTime(snapshotTs)}）`}
+        >
           {pct}
           <span className="ml-px text-2xs font-medium text-muted-foreground">%</span>
         </span>
@@ -464,8 +514,10 @@ function QuotaBar({
         <span title="本周期内已消耗的等价 API 费用">
           花费 <span className="tnum font-medium text-foreground/80">{formatUsd(cost ?? 0)}</span>
         </span>
-        {remain != null && remain > 0 && (
-          <span className="tnum" title="额度重置倒计时">{formatDuration(remain)}后重置</span>
+        {reset != null && (
+          <span className="whitespace-nowrap tnum" title={`${formatFullTime(reset)} 重置`}>
+            {formatClockTime(reset)} 重置
+          </span>
         )}
       </div>
     </div>

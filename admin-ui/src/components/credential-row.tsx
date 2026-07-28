@@ -6,8 +6,9 @@ import {
 import { type Credential } from '@/api/credentials'
 import { cn, formatUsd, relativeTime } from '@/lib/utils'
 import {
-  CredentialMenuContent, expiryMeta, isAbnormal, isNearLimit, statusMeta, switchTitle,
-  tierBadgeClass, useCredentialActions, type SortDir, type SortKey,
+  CredentialMenuContent, DeleteCredentialDialog, expiryMeta, isAbnormal, isNearLimit,
+  liveQuota, statusMeta, switchTitle, tierBadgeClass, useCredentialActions,
+  type SortDir, type SortKey,
 } from '@/components/credential-shared'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -145,13 +146,14 @@ export function CredentialRow({
 }) {
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
+  const [confirmDelete, setConfirmDelete] = useState(false)
   const actions = useCredentialActions(cred, () => setEditing(false))
   const { rename, toggle } = actions
 
   const nearLimit = isNearLimit(cred)
   const status = statusMeta(cred, nearLimit)
   const expiry = expiryMeta(cred)
-  const util = cred.quota?.rl_5h_utilization ?? null
+  const util = liveQuota(cred).u5h
 
   return (
     <TableRow className={cn('text-xs', cred.disabled && 'opacity-60')}>
@@ -176,9 +178,9 @@ export function CredentialRow({
         )}
       </TableCell>
 
-      {/* 状态：灯 + 文案（封禁/停用/过期/将满/剩余有效期）。窄容器下只留灯。 */}
+      {/* 状态：灯 + 文案（封禁/停用/过期/将满/过期时刻）。窄容器下只留灯。 */}
       <TableCell className={COL.status}>
-        <span className="flex items-center gap-1.5" title={cred.ban_reason ?? status.label}>
+        <span className="flex items-center gap-1.5" title={expiry.title ?? status.label}>
           <span
             className={cn('size-2 shrink-0 rounded-full', status.dot)}
             aria-label={status.label}
@@ -240,8 +242,17 @@ export function CredentialRow({
         P{cred.priority}
       </TableCell>
 
-      {/* 5h 额度条 */}
-      <TableCell className={COL.quota} title="5 小时额度使用率">
+      {/* 5h 额度条。窗口过了重置时刻就显示「已重置」——旧百分比跟当前无关（见 liveQuota）。 */}
+      <TableCell
+        className={COL.quota}
+        title={
+          util != null
+            ? `5 小时额度使用率 · 快照于 ${relativeTime(cred.quota!.ts)}`
+            : cred.quota?.rl_5h_reset != null
+              ? '窗口已重置，之后该账号没有新请求'
+              : '5 小时额度使用率'
+        }
+      >
         {util != null ? (
           <div className="flex items-center gap-1.5">
             <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-border/80">
@@ -258,7 +269,9 @@ export function CredentialRow({
             </span>
           </div>
         ) : (
-          <span className="text-2xs text-muted-foreground">未知</span>
+          <span className="text-2xs text-muted-foreground">
+            {cred.quota?.rl_5h_reset != null ? '已重置' : '未知'}
+          </span>
         )}
       </TableCell>
 
@@ -302,8 +315,20 @@ export function CredentialRow({
                 <EllipsisHorizontalIcon className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <CredentialMenuContent cred={cred} actions={actions} onRename={() => setEditing(true)} />
+            <CredentialMenuContent
+              cred={cred}
+              actions={actions}
+              onRename={() => setEditing(true)}
+              onRequestDelete={() => setConfirmDelete(true)}
+            />
           </DropdownMenu>
+          {/* 弹窗用 Portal 渲染到 body，挂在 <td> 里不会破坏表格结构。 */}
+          <DeleteCredentialDialog
+            cred={cred}
+            actions={actions}
+            open={confirmDelete}
+            onOpenChange={setConfirmDelete}
+          />
         </div>
       </TableCell>
     </TableRow>

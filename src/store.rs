@@ -664,19 +664,49 @@ const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
 impl CredentialStore {
     /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
     /// 并附带当前 5h / 7d 窗口内的累计费用。
-    ///
-    /// 借助 SQLite 的特性：`MAX(ts)` 存在时，同 SELECT 里的裸列取自该最大行。
     pub fn latest_quotas(&self) -> Result<HashMap<i64, QuotaSnapshot>> {
+        self.quota_snapshots(None)
+    }
+
+    /// 单个凭证的额度快照；口径与 [`Self::latest_quotas`] 完全一致（同一条 SQL）。
+    pub fn latest_quota(&self, cred_id: i64) -> Result<Option<QuotaSnapshot>> {
+        Ok(self.quota_snapshots(Some(cred_id))?.remove(&cred_id))
+    }
+
+    /// 额度快照 + 窗口费用，一条 SQL 出全部结果。`only` 为 `Some(id)` 时只算该凭证。
+    ///
+    /// 快照本身借助 SQLite 的特性：`MAX(ts)` 存在时，同 SELECT 里的裸列取自该最大行。
+    /// 窗口费用（起点 = 该行的 reset 反推一个窗口时长）走 `CASE WHEN` 条件求和，与快照在同一次
+    /// 扫描里算完——此前是逐凭证再补两条 `SUM(...) WHERE cred_id=? AND ts>=?`，N 个账号就是
+    /// 2N 条额外查询，账号列表每 30 秒轮询一次，日志表越攒越大时这段开销是线性叠加的。
+    fn quota_snapshots(&self, only: Option<i64>) -> Result<HashMap<i64, QuotaSnapshot>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT cred_id, MAX(ts), unified_status,
-                    rl_5h_utilization, rl_5h_reset, rl_7d_utilization, rl_7d_reset, rl_representative
-               FROM usage_logs
-              WHERE cred_id IS NOT NULL
-                AND (rl_5h_utilization IS NOT NULL OR rl_7d_utilization IS NOT NULL)
-              GROUP BY cred_id",
+            "WITH latest AS (
+                 SELECT cred_id, MAX(ts) AS ts, unified_status,
+                        rl_5h_utilization, rl_5h_reset,
+                        rl_7d_utilization, rl_7d_reset, rl_representative
+                   FROM usage_logs
+                  WHERE cred_id IS NOT NULL
+                    AND (?3 IS NULL OR cred_id = ?3)
+                    AND (rl_5h_utilization IS NOT NULL OR rl_7d_utilization IS NOT NULL)
+                  GROUP BY cred_id
+             )
+             SELECT l.cred_id, l.ts, l.unified_status,
+                    l.rl_5h_utilization, l.rl_5h_reset,
+                    l.rl_7d_utilization, l.rl_7d_reset, l.rl_representative,
+                    CASE WHEN l.rl_5h_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= l.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
+                    END,
+                    CASE WHEN l.rl_7d_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= l.rl_7d_reset - ?2 THEN u.cost_usd END), 0)
+                    END
+               FROM latest l
+               JOIN usage_logs u ON u.cred_id = l.cred_id
+              GROUP BY l.cred_id",
         )?;
-        let rows = stmt.query_map([], |r| {
+        // JOIN 而非 LEFT JOIN：latest 本就取自 usage_logs，每个 cred_id 至少有一行能配上。
+        let rows = stmt.query_map(params![WINDOW_5H_SECS, WINDOW_7D_SECS, only], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 QuotaSnapshot {
@@ -687,32 +717,14 @@ impl CredentialStore {
                     rl_7d_utilization: r.get(5)?,
                     rl_7d_reset: r.get(6)?,
                     rl_representative: r.get(7)?,
-                    cost_5h: None,
-                    cost_7d: None,
+                    cost_5h: r.get(8)?,
+                    cost_7d: r.get(9)?,
                 },
             ))
         })?;
-        let mut list: Vec<(i64, QuotaSnapshot)> = Vec::new();
-        for row in rows {
-            list.push(row?);
-        }
-        drop(stmt);
-
-        // 逐凭证累加各窗口起点(reset - 窗口时长)以来的费用。
-        let mut cost_stmt = conn.prepare(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_logs
-              WHERE cred_id = ?1 AND ts >= ?2",
-        )?;
         let mut out = HashMap::new();
-        for (cid, mut q) in list {
-            if let Some(reset) = q.rl_5h_reset {
-                q.cost_5h =
-                    Some(cost_stmt.query_row(params![cid, reset - WINDOW_5H_SECS], |r| r.get(0))?);
-            }
-            if let Some(reset) = q.rl_7d_reset {
-                q.cost_7d =
-                    Some(cost_stmt.query_row(params![cid, reset - WINDOW_7D_SECS], |r| r.get(0))?);
-            }
+        for row in rows {
+            let (cid, q) = row?;
             out.insert(cid, q);
         }
         Ok(out)
@@ -734,6 +746,17 @@ impl CredentialStore {
         Ok(out)
     }
 
+    /// 单个凭证最近一次被使用的时间；无记录时为 `None`。口径同 [`Self::last_used`]。
+    pub fn last_used_at(&self, cred_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock();
+        // 空集时 MAX 仍返回一行 NULL，故取 Option 而非 QueryReturnedNoRows。
+        let ts =
+            conn.query_row("SELECT MAX(ts) FROM usage_logs WHERE cred_id = ?1", [cred_id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?;
+        Ok(ts)
+    }
+
     /// 每个凭证累计的等价 API 费用（cred_id → USD 合计）。
     pub fn cost_by_cred(&self) -> Result<HashMap<i64, f64>> {
         let conn = self.conn.lock();
@@ -748,6 +771,17 @@ impl CredentialStore {
             out.insert(cid, sum);
         }
         Ok(out)
+    }
+
+    /// 单个凭证累计的等价 API 费用（USD）；无记录时为 0。口径同 [`Self::cost_by_cred`]。
+    pub fn cost_of(&self, cred_id: i64) -> Result<f64> {
+        let conn = self.conn.lock();
+        let sum = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_logs WHERE cred_id = ?1",
+            [cred_id],
+            |r| r.get(0),
+        )?;
+        Ok(sum)
     }
 
     /// 写入一条用量日志。
@@ -917,7 +951,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             cost_usd           REAL
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts   ON usage_logs(ts);
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred ON usage_logs(cred_id);
+        -- 账号列表的每一项统计（最近使用 MAX(ts)、累计费用、额度窗口内费用）都是
+        -- 「按 cred_id 分组、按 ts 卡窗口」。带上 ts 后这些聚合只扫索引，不必回表逐行看时间；
+        -- 旧的单列 idx_usage_logs_cred 是它的前缀，留着只是白占写入开销，随迁移删掉。
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_ts ON usage_logs(cred_id, ts);
+        DROP INDEX IF EXISTS idx_usage_logs_cred;
         -- 设备明细要按 device_id 汇总费用（含跨账号合计）；日志表只会越攒越多，
         -- 没这条索引时展开一次卡片就是一次全表扫描。
         CREATE INDEX IF NOT EXISTS idx_usage_logs_device ON usage_logs(device_id, cred_id);",
@@ -1783,6 +1821,126 @@ mod tests {
         assert!(e.to_string().contains("没有可用凭证"), "错误信息应指向根因: {e}");
         assert_eq!(*tried.borrow(), ids, "每个号都应被试过一次，且只试一次");
         assert!(store.list().unwrap().iter().all(|c| c.disabled));
+    }
+
+    /// 往 usage_logs 塞一条带限流头的日志（ts / 费用 / 两个 reset 由调用方指定）。
+    fn log_row(
+        store: &CredentialStore,
+        cred_id: i64,
+        ts: i64,
+        cost: f64,
+        r5: Option<i64>,
+        r7: Option<i64>,
+    ) {
+        let conn = store.conn.lock();
+        conn.execute(
+            "INSERT INTO usage_logs (cred_id, ts, cost_usd, rl_5h_utilization, rl_5h_reset, \
+                                     rl_7d_utilization, rl_7d_reset) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![cred_id, ts, cost, r5.map(|_| 0.5), r5, r7.map(|_| 0.25), r7],
+        )
+        .unwrap();
+    }
+
+    /// 额度快照取「最新一条带限流信息的行」，窗口费用只算 `reset - 窗口` 之后的日志，
+    /// 且不串号。这条 SQL 从 1+2N 条查询合成了一条，口径必须逐项对上。
+    #[test]
+    fn latest_quotas_sums_only_current_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+
+        // 账号 a：reset=100_000，故 5h 窗口起点 82_000、7d 窗口起点 -504_800（含全部行）。
+        let r5 = 100_000;
+        log_row(&store, a, 10_000, 1.0, Some(r5), Some(r5)); // 5h 窗口外
+        log_row(&store, a, 90_000, 2.0, Some(r5), Some(r5)); // 窗口内
+        log_row(&store, a, 95_000, 4.0, Some(r5), Some(r5)); // 窗口内，且是最新快照行
+        // 更晚但不带限流头的行：不该被选作快照，费用仍要计入窗口。
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO usage_logs (cred_id, ts, cost_usd) VALUES (?1, 99000, 8.0)",
+                [a],
+            )
+            .unwrap();
+        }
+        log_row(&store, b, 95_000, 16.0, Some(r5), Some(r5)); // 他号，不得混入
+
+        let q = store.latest_quotas().unwrap();
+        let qa = q.get(&a).expect("a 应有快照");
+        assert_eq!(qa.ts, 95_000, "快照应取最新一条带限流信息的行");
+        assert_eq!(qa.cost_5h, Some(14.0), "只应含 ts >= reset-5h 的 2+4+8");
+        assert_eq!(qa.cost_7d, Some(15.0), "7d 窗口覆盖全部 1+2+4+8");
+        assert_eq!(q.get(&b).unwrap().cost_5h, Some(16.0), "费用不得跨账号串");
+
+        // 单账号入口与批量入口必须给出同一份结果。
+        assert_eq!(store.latest_quota(a).unwrap().unwrap().cost_5h, qa.cost_5h);
+        assert_eq!(store.latest_quota(a).unwrap().unwrap().ts, qa.ts);
+        assert!(store.latest_quota(999).unwrap().is_none(), "不存在的账号应为 None");
+    }
+
+    /// reset 为空时对应窗口的费用留空（而非 0）：分不清「没花钱」和「不知道窗口起点」会让
+    /// 卡片把未知显示成已用 0。
+    #[test]
+    fn latest_quotas_leaves_cost_none_without_reset() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        log_row(&store, a, 40_000, 3.0, Some(50_000), None); // 在 5h 窗口(32_000 起)内
+
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(q.cost_5h, Some(3.0));
+        assert_eq!(q.cost_7d, None, "无 7d reset 时不应给出 0");
+    }
+
+    /// 单账号的「最近使用 / 累计费用」与全量聚合同口径，无日志时分别是 None 与 0。
+    #[test]
+    fn single_cred_stats_match_batch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        log_row(&store, a, 1_000, 1.5, None, None);
+        log_row(&store, a, 2_000, 2.5, None, None);
+        log_row(&store, b, 3_000, 7.0, None, None);
+        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap().id; // 从未被用过
+
+        let last = store.last_used().unwrap();
+        let costs = store.cost_by_cred().unwrap();
+        for id in [a, b] {
+            assert_eq!(store.last_used_at(id).unwrap(), last.get(&id).copied());
+            assert_eq!(store.cost_of(id).unwrap(), costs[&id]);
+        }
+        assert_eq!(store.last_used_at(a).unwrap(), Some(2_000));
+        assert_eq!(store.cost_of(a).unwrap(), 4.0);
+        assert_eq!(store.last_used_at(c).unwrap(), None, "无日志时是 None 而非 0");
+        assert_eq!(store.cost_of(c).unwrap(), 0.0);
+    }
+
+    /// 旧库上的单列 idx_usage_logs_cred 会被换成 (cred_id, ts) 复合索引：前缀相同，
+    /// 两条并存只是多一份写入开销。
+    #[test]
+    fn migration_replaces_cred_index_with_composite() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute("CREATE INDEX idx_usage_logs_cred ON usage_logs(cred_id)", []).unwrap();
+        init_schema(&conn).unwrap();
+
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_logs'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(names.iter().any(|n| n == "idx_usage_logs_cred_ts"), "复合索引应建好: {names:?}");
+        assert!(!names.iter().any(|n| n == "idx_usage_logs_cred"), "旧单列索引应删掉: {names:?}");
     }
 
     /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。

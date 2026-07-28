@@ -23,6 +23,7 @@ const banned: Credential = {
   priority: 0,
   disabled: false,
   expires_in: 3600,
+  expires_at: now + 3600,
   expired: false,
   created_at: now - 7 * 3600,
   updated_at: now - 120,
@@ -46,7 +47,7 @@ const banned: Credential = {
   },
 }
 
-// 正常：有效期文案长（「剩余 7 小时 40 分钟」），触发原先的换行差异。
+// 正常：有效期跨到明天（「明天 03:00 过期」），是元信息行里最长的一种文案。
 const normal: Credential = {
   id: 4,
   label: 'robertsbeth812904@yahoo.com',
@@ -54,6 +55,7 @@ const normal: Credential = {
   priority: 0,
   disabled: false,
   expires_in: 7 * 3600 + 40 * 60,
+  expires_at: now + 7 * 3600 + 40 * 60,
   expired: false,
   created_at: now - 3 * 3600,
   updated_at: now - 5,

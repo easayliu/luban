@@ -23,6 +23,8 @@ export interface Credential {
   priority: number
   disabled: boolean
   expires_in: number
+  /** 过期时刻（Unix 秒）；展示用这个，`expires_in` 只用来判临界态。 */
+  expires_at: number
   expired: boolean
   created_at: number
   updated_at: number

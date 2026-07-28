@@ -7,10 +7,11 @@ import {
   deleteCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel, setPriority,
   type Credential,
 } from '@/api/credentials'
-import { extractError, formatDuration } from '@/lib/utils'
+import { extractError, formatClockTime, formatFullTime } from '@/lib/utils'
 import {
   DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
 /** 设备上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
 export function limitToInput(deviceLimit: number): string {
@@ -26,10 +27,31 @@ export function inputToLimit(v: string): number {
   return Number.isFinite(n) && n > 0 ? n : -1
 }
 
-/** 账号是否处于「额度将满」（5h / 7d 任一 ≥90%，停用的不算）。 */
+/**
+ * 快照里**仍属于当前窗口**的使用率；窗口已过重置时刻的返回 null。
+ *
+ * 额度快照只在有请求经过时才更新（后端取该账号最后一条带限流头的日志，不设时间下限），
+ * 所以账号闲下来之后百分比会一直停在最后一次的值。5h 窗口的 reset 时刻一过，那个值就
+ * 跟现在毫无关系了——号早就满血，后台却还在报「额度将满」、红边、排在异常账号最前面。
+ *
+ * reset 缺失时无从判断新旧，保持原值（宁可虚报也不要漏报快满的号）。
+ */
+export function liveQuota(cred: Credential): { u5h: number | null; u7d: number | null } {
+  const q = cred.quota
+  if (!q) return { u5h: null, u7d: null }
+  const now = Math.floor(Date.now() / 1000)
+  const live = (u: number | null, reset: number | null) =>
+    u != null && (reset == null || reset > now) ? u : null
+  return {
+    u5h: live(q.rl_5h_utilization, q.rl_5h_reset),
+    u7d: live(q.rl_7d_utilization, q.rl_7d_reset),
+  }
+}
+
+/** 账号是否处于「额度将满」（5h / 7d 任一 ≥90%，停用的不算；已重置的窗口不算）。 */
 export function isNearLimit(cred: Credential): boolean {
-  const max = Math.max(cred.quota?.rl_5h_utilization ?? 0, cred.quota?.rl_7d_utilization ?? 0)
-  return !cred.disabled && max >= 0.9
+  const { u5h, u7d } = liveQuota(cred)
+  return !cred.disabled && Math.max(u5h ?? 0, u7d ?? 0) >= 0.9
 }
 
 /** 账号是否异常：被上游封禁或凭证已过期。 */
@@ -110,8 +132,9 @@ function compareBy(key: SortKey, a: Credential, b: Credential): number {
     case 'tier':
       return tierRank(a.tier) - tierRank(b.tier)
     case 'usage5h':
-      // 无额度数据的垫底：升序时排最前、降序时排最后，不会混在真实数值中间。
-      return (a.quota?.rl_5h_utilization ?? -1) - (b.quota?.rl_5h_utilization ?? -1)
+      // 无额度数据、以及窗口已重置的（快照是上个周期的）一并垫底：升序时排最前、
+      // 降序时排最后，不会混在真实数值中间。
+      return (liveQuota(a).u5h ?? -1) - (liveQuota(b).u5h ?? -1)
     case 'devices':
       return a.device_count - b.device_count
     case 'cost':
@@ -181,15 +204,21 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
 
-/** ⋯ 菜单内容（刷新 / 重命名 / 优先级步进 / 删除），卡片与列表共用。 */
+/**
+ * ⋯ 菜单内容（刷新 / 重命名 / 优先级步进 / 删除），卡片与列表共用。
+ *
+ * 删除只往外抛意图，确认框由调用方渲染在菜单之外——菜单一关，挂在它里面的弹窗会跟着
+ * 卸载，确认框根本来不及显示。
+ */
 export function CredentialMenuContent({
-  cred, actions, onRename,
+  cred, actions, onRename, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
+  onRequestDelete: () => void
 }) {
-  const { refresh, prio, remove } = actions
+  const { refresh, prio } = actions
   return (
     <DropdownMenuContent align="end">
       <DropdownMenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
@@ -230,17 +259,38 @@ export function CredentialMenuContent({
         </div>
       </div>
       <DropdownMenuSeparator />
-      <DropdownMenuItem
-        className="text-bad focus:bg-bad-soft"
-        onClick={() => {
-          // 删号会连带清掉该账号的用量日志与设备绑定，明确告知不可恢复。
-          if (confirm(`确定删除「${cred.label}」？其历史用量记录与设备绑定将一并清除，不可恢复。`)) remove.mutate()
-        }}
-      >
+      <DropdownMenuItem className="text-bad focus:bg-bad-soft" onClick={onRequestDelete}>
         <TrashIcon />
         删除
       </DropdownMenuItem>
     </DropdownMenuContent>
+  )
+}
+
+/** 删除单个账号的确认框。卡片与列表共用，免得两处各写一遍后果说明。 */
+export function DeleteCredentialDialog({
+  cred, actions, open, onOpenChange,
+}: {
+  cred: Credential
+  actions: CredentialActions
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="删除账号"
+      confirmText="删除"
+      pending={actions.remove.isPending}
+      onConfirm={() => actions.remove.mutate()}
+      description={
+        <>
+          确定删除「<span className="font-medium text-foreground">{cred.label}</span>」？
+          该账号的历史用量记录与设备绑定将一并清除，不可恢复。
+        </>
+      }
+    />
   )
 }
 
@@ -273,13 +323,28 @@ export function statusMeta(
   return { dot: 'bg-ok', rail: 'before:bg-transparent', label: '运行正常' }
 }
 
-/** 凭证状态/有效期 → 元信息行的文案与配色。异常态着色，正常「剩余」保持中性。 */
-export function expiryMeta(cred: Credential): { text: string; className: string } {
-  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad' }
+/**
+ * 凭证状态/有效期 → 元信息行的文案、配色与 title。异常态着色，正常态保持中性。
+ *
+ * 正常态给的是过期时刻而非「剩余 x 小时 y 分钟」：倒计时不自己走就是个假数字，
+ * 而 token 到点会自动刷新，用户真正要判断的是「几点」，不是还剩多久。
+ */
+export function expiryMeta(cred: Credential): {
+  text: string
+  className: string
+  title?: string
+} {
+  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad', title: cred.ban_reason }
   if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
   if (cred.expired) return { text: '已过期', className: 'font-medium text-bad' }
-  if (cred.expires_in <= 300) return { text: '即将过期', className: 'font-medium text-warn' }
-  return { text: `剩余 ${formatDuration(cred.expires_in)}`, className: 'text-muted-foreground' }
+  if (cred.expires_in <= 300) {
+    return { text: '即将过期', className: 'font-medium text-warn', title: `${formatFullTime(cred.expires_at)} 过期` }
+  }
+  return {
+    text: `${formatClockTime(cred.expires_at)} 过期`,
+    className: 'text-muted-foreground',
+    title: `${formatFullTime(cred.expires_at)} 过期 · 到点自动刷新`,
+  }
 }
 
 /** 启用开关的 hover 提示：封禁态说明「已被上游封禁」并提示仍可手动停用。 */

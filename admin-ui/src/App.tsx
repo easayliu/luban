@@ -15,6 +15,7 @@ import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
 import { cn, extractError } from '@/lib/utils'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
+import { useDebounced } from '@/lib/use-debounced'
 import {
   SORTS, SORT_DIR_DEFAULT, SORT_KEYS, inputToLimit, isAbnormal, isNearLimit, sortCreds,
   type SortDir, type SortKey,
@@ -28,6 +29,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { Toaster } from '@/components/ui/sonner'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -76,6 +78,8 @@ function App() {
   // 筛选与搜索刻意不持久化：它们会隐藏账号，刷新后仍生效容易让人以为账号丢了。
   const [filter, setFilter] = useState<FilterKey>('all')
   const [query, setQuery] = useState('')
+  // 输入框绑 query 保持跟手，筛选/排序用延迟值：连续敲键时不必每个字符都过一遍全量账号。
+  const debouncedQuery = useDebounced(query)
   // 条件变化后停留在旧页码可能整页为空，统一回到第一页。
   const resetPage = <T,>(set: (v: T) => void) => (v: T) => { set(v); setPage(1) }
   /**
@@ -113,9 +117,9 @@ function App() {
   // 顺序：筛选 → 搜索 → 排序 → 分页切片。
   const sorted = useMemo(() => {
     const match = FILTERS.find((f) => f.key === filter)?.match ?? (() => true)
-    const list = (creds ?? []).filter((c) => match(c) && matchQuery(c, query))
+    const list = (creds ?? []).filter((c) => match(c) && matchQuery(c, debouncedQuery))
     return sortCreds(list, sort, dir)
-  }, [creds, sort, dir, filter, query])
+  }, [creds, sort, dir, filter, debouncedQuery])
   const total = sorted.length
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   // 删账号/改每页条数可能让当前页越界，取值时夹紧（不写回 state，避免多余渲染）。
@@ -140,7 +144,8 @@ function App() {
 
   const count = creds?.length ?? 0
   const enabledCount = (creds ?? []).filter((c) => !c.disabled).length
-  const filtering = filter !== 'all' || query.trim() !== ''
+  // 跟 total 同源用延迟值，否则敲键的那一瞬文案先切成「筛选出 N / 共 M」而 N 还是旧的。
+  const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -480,6 +485,7 @@ function BatchActionsBar({
   const qc = useQueryClient()
   const [priority, setPriority] = useState('0')
   const [limit, setLimit] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   const ids = [...selected]
   const n = selected.size
@@ -512,9 +518,9 @@ function BatchActionsBar({
   })
   const applyDelete = useMutation({
     mutationFn: () => deleteCredentials(ids),
-    // 账号已不存在，留着勾选没有意义，顺手清空。
-    onSuccess: () => notify(`已删除 ${n} 个账号`, true),
-    onError,
+    // 账号已不存在，留着勾选没有意义，顺手清空。批量条不会随之卸载，确认框得自己关。
+    onSuccess: () => { setConfirmDelete(false); notify(`已删除 ${n} 个账号`, true) },
+    onError: (e) => { setConfirmDelete(false); onError(e) },
   })
 
   const busy =
@@ -558,15 +564,25 @@ function BatchActionsBar({
           <Button
             size="sm" variant="ghost" className="h-7 px-2.5 text-xs text-bad hover:text-bad"
             disabled={none || busy}
-            onClick={() => {
-              // 删号会连带清掉历史用量与设备绑定，批量更需要明确确认。
-              if (confirm(`确定删除选中的 ${n} 个账号？其历史用量记录与设备绑定将一并清除，不可恢复。`)) {
-                applyDelete.mutate()
-              }
-            }}
+            onClick={() => setConfirmDelete(true)}
           >
             <TrashIcon className="size-3.5" />删除
           </Button>
+          {/* 删号会连带清掉历史用量与设备绑定，批量更需要明确确认。 */}
+          <ConfirmDialog
+            open={confirmDelete}
+            onOpenChange={setConfirmDelete}
+            title={`删除 ${n} 个账号`}
+            confirmText={`删除 ${n} 个`}
+            pending={applyDelete.isPending}
+            onConfirm={() => applyDelete.mutate()}
+            description={
+              <>
+                确定删除选中的 <span className="font-medium text-foreground">{n}</span> 个账号？
+                它们的历史用量记录与设备绑定将一并清除，不可恢复。
+              </>
+            }
+          />
           <span className="mx-0.5 h-4 w-px bg-border" />
           <Button size="icon" variant="ghost" className="size-7" onClick={onClose} title="退出批量模式">
             <XMarkIcon className="size-3.5" />

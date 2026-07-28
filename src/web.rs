@@ -542,9 +542,11 @@ async fn refresh_credential(
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     let count = state.store.device_count(id).map_err(internal)?;
-    let quota = state.store.latest_quotas().map_err(internal)?.remove(&id);
-    let last_used = state.store.last_used().map_err(internal)?.remove(&id);
-    let cost_total = state.store.cost_by_cred().map_err(internal)?.remove(&id).unwrap_or(0.0);
+    // 单账号视图只查这一个 id：此前调的是三个「全库聚合」再 remove 一条，改一次开关就要把
+    // usage_logs 整表聚合三遍。
+    let quota = state.store.latest_quota(id).map_err(internal)?;
+    let last_used = state.store.last_used_at(id).map_err(internal)?;
+    let cost_total = state.store.cost_of(id).map_err(internal)?;
     let default_limit = state.store.default_device_limit();
     Ok(Json(
         CredentialView::new(&cred, count, default_limit).with_stats(quota, last_used, cost_total),
@@ -711,6 +713,9 @@ struct CredentialView {
     priority: i64,
     disabled: bool,
     expires_in: u64,
+    /// 过期时刻（Unix 秒）。前端展示用它而非 `expires_in`：倒计时要么静止要么得自己走，
+    /// 而绝对时刻渲染多少次都是同一个值，也不受浏览器时钟偏差影响。
+    expires_at: u64,
     expired: bool,
     created_at: u64,
     updated_at: u64,
@@ -743,6 +748,7 @@ impl CredentialView {
             priority: c.priority,
             disabled: c.disabled,
             expires_in: secs,
+            expires_at: c.expires_at,
             expired: secs == 0,
             created_at: c.created_at,
             updated_at: c.updated_at,

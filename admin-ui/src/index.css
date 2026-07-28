@@ -1,13 +1,131 @@
+/* 字体自托管（Fontsource），不走 Google CDN——luban 是单二进制自包含部署，
+   字体现连 fonts.gstatic.com 会让内网/离线环境永远停在后备字体，且那个 <link>
+   是渲染阻塞的，在拿不到 googleapis 的网络环境里要挂到超时才放行首屏。
+   打进 dist/assets/ 后由 rust-embed 一并塞进二进制，缓存策略走既有的 immutable 一年。
+
+   只导入实际用到的字重 + latin 子集：界面中文本来就落在系统中文字体上，
+   Fira 的 cyrillic/greek 一个字都用不到。sans 400/500/600/700，mono 400/500/700。 */
+@import "@fontsource/fira-sans/latin-400.css";
+@import "@fontsource/fira-sans/latin-500.css";
+@import "@fontsource/fira-sans/latin-600.css";
+@import "@fontsource/fira-sans/latin-700.css";
+@import "@fontsource/fira-code/latin-400.css";
+@import "@fontsource/fira-code/latin-500.css";
+@import "@fontsource/fira-code/latin-700.css";
+
 @import "tailwindcss";
 @import "tw-animate-css";
+
+/* ---------------------------------------------------------------------------
+   度量对齐的后备字体。
+
+   Fira 尚未就位的那一小段时间里，文字先由系统字体渲染，字体到位后换上去——若两者
+   字宽/行高不同，换字瞬间整页重排，这就是「强刷时数字会横向抖动」的来源。挂 tnum 的
+   数字尤其明显：等宽数字在两套字体里步进不同，而周围中文两边都落在同一个系统中文字体
+   上纹丝不动，一动一不动对比才格外扎眼。
+
+   下面用 size-adjust / ascent-override 把系统字体的度量校准到与 Fira 一致，于是换字
+   不再产生位移。这些数字由 `node scripts/gen-font-fallback.mjs` 从真实字体文件算出
+   （fontaine + capsize 度量库），换字体或改字重时重跑该脚本覆盖此段，不要手改。
+
+   src 按平台命中率排序，浏览器取第一个 local() 能解析到的：Helvetica Neue = macOS，
+   Segoe UI = Windows，Roboto = Android/部分 Linux，Arial 兜底。Fira Sans 的 500/600/700
+   三档平均字宽相同、合成一条区间规则；Fira Code 三档亦然，且它对 Courier New 的
+   size-adjust 是 99.98%——等宽之间本就几乎对齐。
+   --------------------------------------------------------------------------- */
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Helvetica Neue");
+  size-adjust: 101.7778%;
+  ascent-override: 91.8668%;
+  descent-override: 26.0371%;
+  line-gap-override: 0%;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Segoe UI");
+  size-adjust: 103.3022%;
+  ascent-override: 90.5111%;
+  descent-override: 25.6529%;
+  line-gap-override: 0%;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Roboto");
+  size-adjust: 102.962%;
+  ascent-override: 90.8102%;
+  descent-override: 25.7376%;
+  line-gap-override: 0%;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Arial");
+  size-adjust: 102.7365%;
+  ascent-override: 91.0095%;
+  descent-override: 25.7942%;
+  line-gap-override: 0%;
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Helvetica Neue");
+  size-adjust: 102%;
+  ascent-override: 91.6667%;
+  descent-override: 25.9804%;
+  line-gap-override: 0%;
+  font-weight: 500 700;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Segoe UI");
+  size-adjust: 103.5278%;
+  ascent-override: 90.3139%;
+  descent-override: 25.597%;
+  line-gap-override: 0%;
+  font-weight: 500 700;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Roboto");
+  size-adjust: 103.1868%;
+  ascent-override: 90.6123%;
+  descent-override: 25.6816%;
+  line-gap-override: 0%;
+  font-weight: 500 700;
+}
+@font-face {
+  font-family: "Fira Sans fallback";
+  src: local("Arial");
+  size-adjust: 102.9608%;
+  ascent-override: 90.8113%;
+  descent-override: 25.738%;
+  line-gap-override: 0%;
+  font-weight: 500 700;
+}
+@font-face {
+  font-family: "Fira Code fallback";
+  src: local("Courier New");
+  size-adjust: 99.9837%;
+  ascent-override: 99.0161%;
+  descent-override: 32.2052%;
+  line-gap-override: 0%;
+  font-weight: 400 700;
+}
 
 /* 深浅色跟随 <html> 上的 .dark 类（由 main.tsx 按系统主题切换）。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* v4 CSS-first 主题令牌：颜色引用下方 :root/.dark 的 HSL 变量，随主题动态生效。 */
 @theme {
-  --font-sans: "Fira Sans", system-ui, sans-serif;
-  --font-mono: "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* "* fallback" 是 vite.config.ts 里 fontaine 生成的度量对齐后备（size-adjust 等已校准到
+     与 Fira 一致），必须排在真字体之后、系统字体之前：Fira 未就位时由它顶上，字宽行高
+     跟最终形态一致，换字时不产生重排。这两行得手写——fontaine 只改写 `font-family:`
+     声明，看不见 Tailwind v4 `@theme` 里的自定义属性。 */
+  --font-sans: "Fira Sans", "Fira Sans fallback", system-ui, sans-serif;
+  --font-mono: "Fira Code", "Fira Code fallback", ui-monospace, SFMono-Regular, Menlo, monospace;
 
   --text-2xs: 0.6875rem;
   --text-2xs--line-height: 1rem;
