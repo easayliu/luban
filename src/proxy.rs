@@ -176,6 +176,20 @@ pub async fn handle(
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
                         rl.sniffer.feed(&bytes);
+                        // 无条件把上游的错误文本打出来。此前只有被判成账号级错误时才有日志，
+                        // 普通 400（`invalid_request_error`，多半是请求形态被上游拒了）只会留下
+                        // ReqLog 里那条 `status=400` 而不带任何原因——body 虽原样透传给了客户端，
+                        // 但服务端侧查不出所以然。压缩体跳过：打出来只会是乱码字节。
+                        if !compressed {
+                            let (etype, message) = parse_upstream_error(&bytes);
+                            tracing::warn!(
+                                cred = format!("#{} {}", cred.id, cred.label),
+                                status = status.as_u16(),
+                                error_type = %etype.as_deref().unwrap_or("-"),
+                                message = %message.chars().take(500).collect::<String>(),
+                                "上游返回 4xx"
+                            );
+                        }
                         // 压缩体读不出内容，宁可漏判也不误判（乱码可能碰巧命中特征词）。
                         if let Some(reason) =
                             (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
