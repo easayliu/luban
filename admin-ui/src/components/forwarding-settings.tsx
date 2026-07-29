@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  AdjustmentsHorizontalIcon, ChevronDownIcon, CircleStackIcon,
+  AdjustmentsHorizontalIcon, ArrowPathIcon, ChevronDownIcon, CircleStackIcon,
   IdentificationIcon, InformationCircleIcon, ServerStackIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
@@ -26,12 +26,14 @@ export function ForwardingSettings({
   onOpenChange: (open: boolean) => void
 }) {
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const enabledCount = data
+  const switches = data
     ? [
         data.spoof_identity, data.billing_cch, data.fill_client_headers,
         data.merge_beta, data.system_shape, data.orig_header_case,
-      ].filter(Boolean).length
-    : 0
+        data.thinking_signature_retry,
+      ]
+    : []
+  const enabledCount = switches.filter(Boolean).length
   const allOff = data ? enabledCount === 0 : false
 
   return (
@@ -43,7 +45,7 @@ export function ForwardingSettings({
             转发形态
             {data && (
               <Badge variant="outline" className="font-normal text-muted-foreground">
-                {allOff ? '零改写' : `${enabledCount} / 6 已开启`}
+                {allOff ? '零改写' : `${enabledCount} / ${switches.length} 已开启`}
               </Badge>
             )}
           </DialogTitle>
@@ -141,6 +143,34 @@ export function ForwardingSettings({
                   <br />
                   <strong>会影响费用</strong>：1h 缓存写入单价是 5m 的两倍，换来的是缓存保留一小时、
                   以及基座那块跨账号复用。认不出切点的模型（锚点未匹配）会原样转发，不会切错。
+                </>
+              }
+            />
+          </SettingsGroup>
+
+          <SettingsGroup
+            icon={ArrowPathIcon}
+            title="错误恢复"
+            description="上游拒绝会话历史时的自动补救。"
+          >
+            <Toggle
+              k="thinking_signature_retry"
+              label="thinking 签名兜底"
+              summary="历史 thinking 被判签名无效时，降级后自动重试一次。"
+              desc={
+                <>
+                  模型的 <code>thinking</code> 块带一段由签发账号校验的 <code>signature</code>。
+                  会话中途换了号（设备绑定到期、原账号被停用），整段历史就验不过，
+                  上游回 <code>Invalid `signature` in `thinking` block</code>，
+                  而客户端自己修不了——只能 <code>/clear</code> 重开会话。
+                  <br />
+                  开启后遇到这条错误会把历史 <code>thinking</code> 的推理原文搬进 <code>text</code> 块
+                  （裹一层 <code>&lt;previous_thinking&gt;</code>，签名丢掉），用<strong>同一个账号</strong>
+                  重发一次。搬而不是删，是为了别让模型丢掉上一轮的推理链、续跑时从头再想一遍。
+                  <br />
+                  <strong>救不了工具续跑轮</strong>：请求末尾是 <code>tool_result</code> 时，上游另外要求
+                  最后一条 assistant 消息必须以 thinking 块开头，降级完照样被拒。
+                  重试失败会原样透传最初那条 400，所以开着最坏也只是多花一次往返。
                 </>
               }
             />

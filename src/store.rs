@@ -499,9 +499,9 @@ impl CredentialStore {
     pub fn forward_flags(&self) -> ForwardFlags {
         let mut flags = ForwardFlags::default();
         let conn = self.conn.lock();
-        let Ok(mut stmt) = conn
-            .prepare("SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
-        else {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        ) else {
             return flags;
         };
         let rows = stmt.query_map(
@@ -513,6 +513,7 @@ impl CredentialStore {
                 SYSTEM_SHAPE,
                 CACHE_SCOPE_GLOBAL,
                 ORIG_HEADER_CASE,
+                THINKING_SIGNATURE_RETRY,
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         );
@@ -529,6 +530,7 @@ impl CredentialStore {
                 SYSTEM_SHAPE => new_key = Some(on),
                 CACHE_SCOPE_GLOBAL => legacy_key = Some(on),
                 ORIG_HEADER_CASE => flags.orig_header_case = on,
+                THINKING_SIGNATURE_RETRY => flags.thinking_signature_retry = on,
                 _ => {}
             }
         }
@@ -591,11 +593,20 @@ pub const CACHE_SCOPE_GLOBAL: &str = "cache_scope_global";
 /// 是否按官方拼写与顺序发出头名（`wreq` 的 `OrigHeaderMap`）；关闭则退回全小写 + 队尾追加。
 pub const ORIG_HEADER_CASE: &str = "orig_header_case";
 
-/// 转发形态开关的集合。**默认全开**，等于加入开关机制之前的既有行为。
+/// 上游以「thinking 块签名无效」拒绝时，是否降级历史 thinking 块后重试一次的 settings 键名。
+/// 缺省视为开启：它只在那一种 400 上触发，重试失败也会原样透传最初那条响应，开着不会更差。
+pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
+
+/// 转发开关的集合。**默认全开**。
 ///
-/// 上游实测（8 发对照，见 [`crate::config::known_fingerprint_gaps`]）：这些全关掉也照样
-/// 200，唯一被强制的是 `system` 里那句 `You are Claude Code, …`，而它由客户端自己发。
-/// 所以这些开关都是「形态对齐」而非「能不能用」，可以按需一项项关掉做排查。
+/// 前六项是**形态对齐**：上游实测（8 发对照，见 [`crate::config::known_fingerprint_gaps`]）
+/// 全关掉也照样 200，唯一被强制的是 `system` 里那句 `You are Claude Code, …`，而它由客户端
+/// 自己发。所以它们都是「像不像官方客户端」而非「能不能用」，可以按需一项项关掉做排查，
+/// 全开 = 加入开关机制之前的既有行为。
+///
+/// 最后一项 [`Self::thinking_signature_retry`] 不是形态对齐而是**错误恢复**，只在特定
+/// 400 上触发，正常路径完全不经过它。放在同一个集合里纯粹是因为它同样按请求读、同样
+/// 一条 SQL 读齐、同样在「转发」那个设置面板里拨。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardFlags {
     /// 改写 `metadata.user_id` 里的 account_uuid/device_id 为凭证自洽身份。
@@ -610,6 +621,9 @@ pub struct ForwardFlags {
     pub system_shape: bool,
     /// 按官方拼写与顺序发出头名（见 [`crate::config::CC_HEADER_ORDER`]）。
     pub orig_header_case: bool,
+    /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
+    /// （见 [`crate::proxy::demote_thinking_blocks`]）。
+    pub thinking_signature_retry: bool,
 }
 
 impl Default for ForwardFlags {
@@ -621,6 +635,7 @@ impl Default for ForwardFlags {
             merge_beta: true,
             system_shape: true,
             orig_header_case: true,
+            thinking_signature_retry: true,
         }
     }
 }
@@ -2038,6 +2053,7 @@ mod tests {
             (MERGE_BETA, "False"),
             (SYSTEM_SHAPE, "0"),
             (ORIG_HEADER_CASE, "0"),
+            (THINKING_SIGNATURE_RETRY, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -2051,6 +2067,7 @@ mod tests {
                 merge_beta: false,
                 system_shape: false,
                 orig_header_case: false,
+                thinking_signature_retry: false,
             }
         );
 

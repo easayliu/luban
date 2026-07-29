@@ -23,9 +23,11 @@ export interface Settings {
   system_shape: boolean
   /** 按官方拼写与顺序发出头名（Accept-Encoding 大写、anthropic-beta 小写…）。 */
   orig_header_case: boolean
+  /** 上游拒绝 thinking 块签名时，把历史 thinking 降级成 text 后重试一次。 */
+  thinking_signature_retry: boolean
 }
 
-/** 转发形态开关的键（与后端 ForwardFlags 字段同名）。 */
+/** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
 export type ForwardingKey =
   | 'spoof_identity'
   | 'billing_cch'
@@ -33,6 +35,7 @@ export type ForwardingKey =
   | 'merge_beta'
   | 'system_shape'
   | 'orig_header_case'
+  | 'thinking_signature_retry'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

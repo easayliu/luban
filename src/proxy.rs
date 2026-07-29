@@ -97,25 +97,20 @@ pub async fn handle(
     // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
     // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
     let req_speed = request_speed(&body);
-    let body = rewrite_body(&body, &cred, &device_fp, flags);
 
     // 7) 发起上游请求并流式回传。头名的拼写与顺序由 orig_header_case 决定（关掉即退回
     //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
-    let req = state.http.request(method.clone(), &url).headers(out).body(body);
-    let req = if flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
-    let resp = req.send().await;
+    //    `body` 自此保持**客户端原始请求体**不变——改写后的那份直接交给 `send`，
+    //    因为签名重试那条路要拿原始体重新走一遍改写，留着原件比留改写件更省事也更不易错。
+    let upstream = Upstream { state: &state, method: method.clone(), url, headers: out, flags };
+    let resp = upstream.send(rewrite_body(&body, &cred, &device_fp, flags)).await;
 
     match resp {
         Ok(up) => {
             let status = up.status();
-            // 判断响应是否为 SSE 流（决定用量嗅探采用逐行还是整段 JSON 模式）。
-            let is_stream = up
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.contains("text/event-stream"))
-                .unwrap_or(false);
-            // 正常情况下这里恒为 false：上游客户端开了 gzip/br/zstd/deflate 解压，wreq
+            // 是否 SSE 流（决定用量嗅探逐行还是整段 JSON）；以及我们解不开的 content-encoding。
+            //
+            // 后者正常情况下恒为 None：上游客户端开了 gzip/br/zstd/deflate 解压，wreq
             // 收到时已解码，并把 `content-encoding`/`content-length` 一并摘掉。
             // 留着这个判断是兜底——若上游哪天用了我们没开的编码，tower-http 会原样放行并保留
             // 该头，那时响应体是我们读不懂的字节，嗅探与账号级错误判定都只能跳过。
@@ -124,13 +119,7 @@ pub async fn handle(
             // **所有**响应（含 SSE）都成了压缩字节，用量/计价/封号判定整片失效。当时的 warn
             // 只在 4xx 上打，200 这条路径完全静默，症状是「统计悄悄归零且日志上看不出原因」。
             // 现在改成任何状态码都告警。
-            let content_encoding = up
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("identity"))
-                .map(str::to_string);
+            let (is_stream, content_encoding) = resp_shape(&up);
             let compressed = content_encoding.is_some();
             if let Some(enc) = &content_encoding {
                 tracing::warn!(
@@ -141,13 +130,6 @@ pub async fn handle(
             }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
-
-            let mut builder = Response::builder().status(status);
-            for (k, v) in up.headers().iter() {
-                if is_resp_forwardable(k) {
-                    builder = builder.header(k, v);
-                }
-            }
 
             // 包裹响应流：首块到达记 TTFT，边转发边嗅探用量；
             // 流结束(或断开)时在 Drop 里记 total、输出一条日志并落库。
@@ -172,6 +154,7 @@ pub async fn handle(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             ) {
+                let builder = resp_builder(&up);
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
@@ -204,6 +187,27 @@ pub async fn handle(
                                 tracing::warn!(error = %e, "自动停用凭证失败");
                             }
                         }
+                        // 「thinking 块签名无效」：这条会话的历史是**别的账号**签发的（设备
+                        // 绑定过期或凭证被停用后换了号），当前账号验不了，于是整段历史一并
+                        // 作废——客户端只会看到一条它无法自行修复的 400。这里把历史 thinking
+                        // 降级成 text 再用同一个账号重发一次；重试若仍失败就当无事发生，
+                        // 原样透传最初那条响应，所以开着它最坏也只是多一次往返。
+                        if status == StatusCode::BAD_REQUEST
+                            && !compressed
+                            && is_thinking_signature_error(&bytes)
+                        {
+                            if !flags.thinking_signature_retry {
+                                tracing::warn!(
+                                    cred = format!("#{} {}", cred.id, cred.label),
+                                    "上游拒绝 thinking 块签名（会话历史多半由其它账号签发），降级重试开关已关闭，原样透传"
+                                );
+                            } else if let Some(up) =
+                                retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl)
+                                    .await
+                            {
+                                return stream_upstream(up, rl);
+                            }
+                        }
                         builder.body(Body::from(bytes)).unwrap_or_else(|e| {
                             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
                         })
@@ -217,19 +221,7 @@ pub async fn handle(
                 };
             }
 
-            let stream = up.bytes_stream().map(move |chunk| {
-                if rl.ttft_ms.is_none() {
-                    rl.ttft_ms = Some(rl.started.elapsed().as_millis());
-                }
-                if let Ok(bytes) = &chunk {
-                    rl.sniffer.feed(bytes);
-                }
-                chunk
-            });
-
-            builder
-                .body(Body::from_stream(stream))
-                .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+            stream_upstream(up, rl)
         }
         Err(e) => {
             // wreq 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
@@ -245,6 +237,221 @@ pub async fn handle(
             (StatusCode::BAD_GATEWAY, format!("上游请求失败[{kind}]: {detail}")).into_response()
         }
     }
+}
+
+/// 一次转发要发往上游的全部固定入参（方法/URL/已装好的转发头/开关），只有请求体每次不同。
+///
+/// 存在的理由是**重试**：签名降级重试必须和首发除了 body 之外逐字节一致，否则「重试成功了」
+/// 有可能只是因为顺手换了别的东西，排查时会被带偏。把这些一次装好、两次共用，就不存在
+/// 「重建时漏了一项」的可能。
+struct Upstream<'a> {
+    state: &'a AppState,
+    method: Method,
+    url: String,
+    /// [`build_forward_headers`] 的产物，逐次 clone 后发出。
+    headers: HeaderMap,
+    flags: store::ForwardFlags,
+}
+
+impl Upstream<'_> {
+    /// 发一次。头名的拼写与顺序由 `orig_header_case` 决定（关掉即退回「全小写 +
+    /// Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
+    async fn send(&self, body: Bytes) -> Result<wreq::Response, wreq::Error> {
+        let req = self
+            .state
+            .http
+            .request(self.method.clone(), &self.url)
+            .headers(self.headers.clone())
+            .body(body);
+        let req =
+            if self.flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
+        req.send().await
+    }
+}
+
+/// 从上游响应里取出决定「响应体怎么读」的两项：是否 SSE 流、以及我们解不开的
+/// `content-encoding`（正常恒为 `None`，见 [`handle`] 里的说明）。
+fn resp_shape(up: &wreq::Response) -> (bool, Option<String>) {
+    let is_stream = up
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    let encoding = up
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("identity"))
+        .map(str::to_string);
+    (is_stream, encoding)
+}
+
+/// 拼出回给客户端的响应骨架：上游状态码 + 放行的上游响应头（见 [`is_resp_forwardable`]）。
+fn resp_builder(up: &wreq::Response) -> axum::http::response::Builder {
+    let mut builder = Response::builder().status(up.status());
+    for (k, v) in up.headers().iter() {
+        if is_resp_forwardable(k) {
+            builder = builder.header(k, v);
+        }
+    }
+    builder
+}
+
+/// 把上游响应包成流式回传：首块到达记 TTFT，边转发边嗅探用量；
+/// 流结束（或客户端断开）时 `rl` 在 Drop 里记 total、输出一条日志并落库。
+fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
+    let builder = resp_builder(&up);
+    let stream = up.bytes_stream().map(move |chunk| {
+        if rl.ttft_ms.is_none() {
+            rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+        }
+        if let Ok(bytes) = &chunk {
+            rl.sniffer.feed(bytes);
+        }
+        chunk
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+/// 上游以「thinking 块签名无效」拒绝后的兜底：把历史 thinking 降级成 text，用**同一个凭证**
+/// 重发一次。
+///
+/// 成功则返回重试那次的上游响应，并把 `rl` 改按它记账（交给调用方 [`stream_upstream`]）；
+/// 任何一步不成都返回 `None`、`rl` 不动，由调用方继续透传最初那条 400——这条兜底路径在设计上
+/// 不会让结果变差，最坏就是白花一次往返。
+///
+/// **代价是每轮一次**：客户端自己的会话记录里那些原始 thinking 块并不会因为这次重试而改写，
+/// 于是这条会话的后续每一轮都会先撞一次 400 再降级重发，直到会话结束。会话能继续跑，但上游
+/// 请求数翻倍。真正的解法是别让会话中途换号（见 `device_binding_ttl`），这里只是兜底。
+async fn retry_demoted_thinking(
+    upstream: &Upstream<'_>,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    client_body: &Bytes,
+    rl: &mut ReqLog,
+) -> Option<wreq::Response> {
+    let label = format!("#{} {}", cred.id, cred.label);
+    let Some(demoted) = demote_thinking_blocks(client_body) else {
+        tracing::warn!(
+            cred = %label,
+            "上游拒绝 thinking 块签名，但请求体里没有可降级的 thinking 块，原样透传"
+        );
+        return None;
+    };
+    tracing::warn!(
+        cred = %label,
+        "上游拒绝 thinking 块签名（会话历史多半由其它账号签发）：已把历史 thinking 降级为 text，用同一凭证重试一次"
+    );
+
+    let body = rewrite_body(&demoted, cred, device_fp, upstream.flags);
+    let up = match upstream.send(body).await {
+        Ok(up) => up,
+        Err(e) => {
+            tracing::warn!(error = %error_chain(&e), "降级 thinking 后的重试请求发不出去，透传最初那条 400");
+            return None;
+        }
+    };
+    let status = up.status();
+    if !status.is_success() {
+        // 最常见的是末轮为 `tool_result` 的工具续跑：上游另外要求「最后一条 assistant
+        // 消息必须以 thinking 块开头」，降级完照样被拒，只是换了条错误信息。
+        tracing::warn!(
+            cred = %label,
+            status = status.as_u16(),
+            "降级 thinking 后重试仍被拒，透传最初那条 400"
+        );
+        return None;
+    }
+
+    // 重试成功：这条请求日志改按重试那次记账——状态码、用量、限流都以它为准，TTFT 重新
+    // 计时。`started` 不动，故 total_ms 含两次往返，那正是客户端实际等到的时间。
+    let (is_stream, encoding) = resp_shape(&up);
+    rl.status = status.as_u16();
+    rl.ttft_ms = None;
+    rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
+    rl.ratelimit = RateLimitInfo::from_headers(up.headers());
+    Some(up)
+}
+
+/// 上游那条 400 是不是「thinking 块签名验不过」，形如
+/// `messages.1.content.0: Invalid \`signature\` in \`thinking\` block`。
+///
+/// 只按 message 文本判、不卡 `error.type`：这条错误上游归在 `invalid_request_error` 名下，
+/// 跟一大堆真正的请求形态错误同类，靠类型分不出来；而 `signature` 与 `thinking` 同时出现在
+/// 一句错误里只有这一种情况。
+fn is_thinking_signature_error(body: &[u8]) -> bool {
+    let (_, message) = parse_upstream_error(body);
+    let hay = message.to_lowercase();
+    hay.contains("signature") && hay.contains("thinking")
+}
+
+/// 把 assistant 轮里的 `thinking` 块降级成 `text` 块：推理原文原样搬进 text（外面裹一层
+/// `<previous_thinking>`，让模型分得清那不是它当时说给用户的话），带不过去的签名丢掉。
+/// `redacted_thinking` 只有一段密文 `data`、没有可搬的内容，直接删。
+///
+/// **为什么是降级而不是整块删**：删掉模型就丢了自己上一轮的推理链，续跑时容易从头再想一遍
+/// 甚至改主意——用户看到的是「它突然忘了刚才在干嘛」。搬成 text 则历史完整，只是从「想过的」
+/// 变成「说过的」。
+///
+/// 返回 `None` 表示没有可降级的块，那这条 400 另有原因，不值得再花一次往返。
+///
+/// **救不了工具续跑轮**：请求末尾是 `tool_result` 时，上游另外要求「最后一条 assistant 消息
+/// 必须以 thinking 块开头」，降级完照样被拒。这种情况下重试白跑一次，随后原样透传最初那条
+/// 400——不会更差，但也确实救不回来。
+fn demote_thinking_blocks(body: &Bytes) -> Option<Bytes> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let msgs = v.get_mut("messages")?.as_array_mut()?;
+    let mut changed = false;
+    for msg in msgs.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else { continue };
+        if obj.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        // `content` 是字符串形态的 assistant 轮压根没有 thinking 块，跳过即可。
+        let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut()) else { continue };
+        let mut next = Vec::with_capacity(content.len());
+        let mut touched = false;
+        for blk in content.iter() {
+            match blk.get("type").and_then(|t| t.as_str()) {
+                Some("thinking") => {
+                    touched = true;
+                    let text = blk.get("thinking").and_then(|t| t.as_str()).unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        next.push(previous_thinking_block(text));
+                    }
+                }
+                Some("redacted_thinking") => touched = true,
+                _ => next.push(blk.clone()),
+            }
+        }
+        // 降级后空掉的 assistant 轮（整轮只有 thinking）是上游必拒的形态——`content` 不能是
+        // 空数组。这种轮次原样留着：反正整条请求本来就要重试，少改一处也比发一个铁定被拒的
+        // body 强。
+        if !touched || next.is_empty() {
+            continue;
+        }
+        *content = next;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&v).ok().map(Bytes::from)
+}
+
+/// 由一段历史推理原文构造替代它的 text 块，key 序与官方内容块一致：`type` → `text`。
+fn previous_thinking_block(thinking: &str) -> serde_json::Value {
+    let mut blk = serde_json::Map::new();
+    blk.insert("type".into(), "text".into());
+    blk.insert(
+        "text".into(),
+        format!("<previous_thinking>\n{thinking}\n</previous_thinking>").into(),
+    );
+    serde_json::Value::Object(blk)
 }
 
 /// 展开 error 的 source 链，拼成「顶层 -> 次层 -> …」，暴露底层真实原因。
@@ -1373,6 +1580,7 @@ mod tests {
             merge_beta: false,
             system_shape: false,
             orig_header_case: false,
+            thinking_signature_retry: false,
         };
         let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags);
 
@@ -1838,6 +2046,7 @@ mod tests {
             merge_beta: false,
             system_shape: false,
             orig_header_case: false,
+            thinking_signature_retry: false,
         };
         let out = super::rewrite_body(&raw, &test_cred(), "fp", flags);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -2075,5 +2284,82 @@ mod tests {
         s2.feed(br#"{"model":"claude-opus-5","usage":{"output_tokens":5,"speed":"standard"}}"#);
         s2.finish();
         assert_eq!(s2.speed.as_deref(), Some("standard"));
+    }
+
+    // ---------- thinking 签名兜底 ----------
+
+    /// 只认「signature + thinking 同现」这一种 400，别的 `invalid_request_error` 一律不碰——
+    /// 误判的代价是给每个普通请求错误都白搭一次上游往返。
+    #[test]
+    fn detects_only_the_thinking_signature_400() {
+        let hit = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#;
+        assert!(super::is_thinking_signature_error(hit));
+
+        for miss in [
+            // 普通请求形态错误。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be greater than 0"}}"#[..],
+            // 提到了 thinking 但不是签名问题（工具续跑那条）——降级救不了它，不该触发。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"a final `assistant` message must start with a thinking block"}}"#[..],
+            // 非 JSON 的拦截页：整段当 message 扫，同样不该命中。
+            &b"<html>403 Forbidden</html>"[..],
+        ] {
+            assert!(!super::is_thinking_signature_error(miss), "不该命中: {}", String::from_utf8_lossy(miss));
+        }
+    }
+
+    /// thinking 原文搬进 text、redacted_thinking 直接删，其余块与 key 序原样不动。
+    #[test]
+    fn demotes_thinking_to_text() {
+        let raw = concat!(
+            r#"{"model":"claude-opus-5","messages":["#,
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]},"#,
+            r#"{"role":"assistant","content":["#,
+            r#"{"type":"thinking","thinking":"想了想","signature":"AAAA"},"#,
+            r#"{"type":"redacted_thinking","data":"ZZZZ"},"#,
+            r#"{"type":"text","text":"答案"}]}]}"#
+        );
+        let out = super::demote_thinking_blocks(&Bytes::from(raw)).expect("应有可降级的块");
+        let s = String::from_utf8(out.to_vec()).unwrap();
+
+        assert!(!s.contains("\"thinking\""), "thinking 块应已消失: {s}");
+        assert!(!s.contains("AAAA"), "签名应已丢弃: {s}");
+        assert!(!s.contains("ZZZZ"), "redacted_thinking 应整块删掉: {s}");
+        assert!(
+            s.contains("<previous_thinking>\\n想了想\\n</previous_thinking>"),
+            "推理原文应搬进 text: {s}"
+        );
+        assert!(s.contains(r#"{"type":"text","text":"答案"}"#), "原有 text 块应原样保留: {s}");
+        // 降级块自己也照官方内容块的 type→text 键序写。
+        assert!(
+            s.contains(r#"{"type":"text","text":"<previous_thinking>"#),
+            "降级块 key 被重排: {s}"
+        );
+    }
+
+    /// user 轮不碰（它本来就没有 thinking 块，扫到也不该动），没得降级时返回 None——
+    /// 避免为一条另有原因的 400 白发一次重试。
+    #[test]
+    fn skips_when_nothing_to_demote() {
+        let raw = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+        assert!(super::demote_thinking_blocks(&Bytes::from(raw)).is_none());
+        // 非 JSON、以及没有 messages 的请求体都不该 panic。
+        assert!(super::demote_thinking_blocks(&Bytes::from_static(b"not json")).is_none());
+        assert!(super::demote_thinking_blocks(&Bytes::from_static(br#"{"model":"x"}"#)).is_none());
+    }
+
+    /// 整轮只有 thinking 的 assistant 消息原样留着：降级完 `content` 会是空数组，
+    /// 那是上游必拒的形态，发出去反而把「多一次往返」变成「多一次注定失败的往返」。
+    #[test]
+    fn keeps_assistant_turn_that_would_become_empty() {
+        let raw = concat!(
+            r#"{"messages":[{"role":"assistant","content":["#,
+            r#"{"type":"thinking","thinking":"  ","signature":"AAAA"}]},"#,
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"实打实","signature":"BBBB"},"#,
+            r#"{"type":"text","text":"答案"}]}]}"#
+        );
+        let out = super::demote_thinking_blocks(&Bytes::from(raw)).expect("第二轮可降级");
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(s.contains("AAAA"), "空 thinking 那轮应原样留着: {s}");
+        assert!(!s.contains("BBBB"), "第二轮仍应降级: {s}");
     }
 }

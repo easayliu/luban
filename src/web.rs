@@ -588,6 +588,8 @@ struct ForwardingResp {
     system_shape: bool,
     /// 按官方拼写与顺序发出头名。
     orig_header_case: bool,
+    /// 上游拒绝 thinking 块签名时，降级历史 thinking 后重试一次。
+    thinking_signature_retry: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -599,6 +601,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             merge_beta: f.merge_beta,
             system_shape: f.system_shape,
             orig_header_case: f.orig_header_case,
+            thinking_signature_retry: f.thinking_signature_retry,
         }
     }
 }
@@ -728,6 +731,7 @@ struct SetForwardingReq {
     merge_beta: Option<bool>,
     system_shape: Option<bool>,
     orig_header_case: Option<bool>,
+    thinking_signature_retry: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -739,7 +743,7 @@ async fn set_forwarding(
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
         FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, SPOOF_BILLING_CCH,
-        SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE,
+        SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -748,6 +752,7 @@ async fn set_forwarding(
         (MERGE_BETA, req.merge_beta),
         (SYSTEM_SHAPE, req.system_shape),
         (ORIG_HEADER_CASE, req.orig_header_case),
+        (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;

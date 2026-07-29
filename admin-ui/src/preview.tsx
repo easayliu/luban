@@ -105,6 +105,7 @@ queryClient.setQueryData(['settings'], {
   merge_beta: true,
   system_shape: true,
   orig_header_case: true,
+  thinking_signature_retry: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 queryClient.setQueryData(['credential-devices', 1], [])
