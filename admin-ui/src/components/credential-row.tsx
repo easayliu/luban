@@ -249,28 +249,9 @@ export function CredentialRow({
                         {cred.tier}
                       </Badge>
                     )}
-                    {editingPriority ? (
-                      <CompactNumberEditor
-                        value={priorityValue}
-                        pending={prio.isPending}
-                        label="优先级"
-                        onChange={setPriorityValue}
-                        onSubmit={savePriority}
-                        onCancel={() => setEditingPriority(false)}
-                      />
-                    ) : (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="inline-flex h-5 items-center gap-1 rounded px-1.5 font-mono transition-colors hover:bg-muted hover:text-foreground"
-                        onClick={startPriorityEdit}
-                        title="修改调度优先级"
-                      >
-                        P{cred.priority}
-                        <PencilIcon className="size-2.5 opacity-50" />
-                      </Button>
-                    )}
+                    <span className="inline-flex h-5 items-center px-1.5 font-mono">
+                      P{cred.priority}
+                    </span>
                   </div>
                 )}
               </div>
@@ -280,6 +261,7 @@ export function CredentialRow({
                   cred={cred}
                   actions={actions}
                   onRename={() => setEditing(true)}
+                  onDeviceLimit={startLimitEdit}
                   onRequestDelete={() => setConfirmDelete(true)}
                 />
               </div>
@@ -295,7 +277,7 @@ export function CredentialRow({
             </div>
 
             <div className="mt-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 text-2xs text-muted-foreground">
-              <div className="inline-flex items-center gap-1" title="已绑定设备 / 设备上限；点击修改上限">
+              <div className="inline-flex items-center gap-1" title="已绑定设备 / 设备上限">
                 <DevicePhoneMobileIcon className="size-3.5" />
                 {editingLimit ? (
                   <CompactNumberEditor
@@ -309,10 +291,7 @@ export function CredentialRow({
                     onCancel={() => setEditingLimit(false)}
                   />
                 ) : (
-                  <Button type="button" size="sm" variant="link" className="h-5 gap-1 p-0 tnum text-2xs font-normal text-muted-foreground" onClick={startLimitEdit}>
-                    设备 {cred.device_count}/{deviceLimit}
-                    <PencilIcon className="size-2.5 opacity-50" />
-                  </Button>
+                  <span className="tnum">设备 {cred.device_count}/{deviceLimit}</span>
                 )}
               </div>
               <span className="inline-flex items-center gap-1" title="累计等价 API 费用">
@@ -437,6 +416,7 @@ export function CredentialRow({
                 actions={actions}
                 showMenu={false}
                 onRename={() => setEditing(true)}
+                onDeviceLimit={startLimitEdit}
                 onRequestDelete={() => setConfirmDelete(true)}
               />
               <Button
@@ -512,6 +492,7 @@ export function CredentialRow({
             actions={actions}
             showSwitch={false}
             onRename={() => setEditing(true)}
+            onDeviceLimit={startLimitEdit}
             onRequestDelete={() => setConfirmDelete(true)}
           />
           {/* 弹窗用 Portal 渲染到 body，挂在 <td> 里不会破坏表格结构。 */}
@@ -746,13 +727,14 @@ function ListQuotaMeter({
 }
 
 function CredentialRowActions({
-  cred, actions, showSwitch = true, showMenu = true, onRename, onRequestDelete,
+  cred, actions, showSwitch = true, showMenu = true, onRename, onDeviceLimit, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   showSwitch?: boolean
   showMenu?: boolean
   onRename: () => void
+  onDeviceLimit: () => void
   onRequestDelete: () => void
 }) {
   const { toggle } = actions
@@ -786,6 +768,7 @@ function CredentialRowActions({
           cred={cred}
           actions={actions}
           onRename={onRename}
+          onDeviceLimit={onDeviceLimit}
           onRequestDelete={onRequestDelete}
         />
       </DropdownMenu>}

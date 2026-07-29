@@ -145,7 +145,7 @@ export function CredentialCard({
                   title="点击重命名"
                 >
                   <span className="truncate text-[0.8125rem] font-semibold tracking-tight sm:text-sm">{cred.label}</span>
-                  <PencilIcon className="size-3 shrink-0 text-muted-foreground transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/name:opacity-100" />
+                  <PencilIcon className="hidden size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity sm:block group-hover/name:opacity-100" />
                 </Button>
                 <span
                   className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[0.625rem] leading-none text-muted-foreground"
@@ -196,17 +196,22 @@ export function CredentialCard({
                   </Button>
                 </form>
               ) : (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  className="inline-flex h-5 shrink-0 items-center gap-1 rounded px-1.5 font-mono text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={startPriorityEdit}
-                  title="修改调度优先级（数值小者优先）"
-                >
-                  P{cred.priority}
-                  <PencilIcon className="size-2.5 opacity-50" />
-                </Button>
+                <>
+                  <span className="inline-flex h-5 items-center px-1.5 font-mono text-2xs font-medium sm:hidden">
+                    P{cred.priority}
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="group/priority hidden h-5 shrink-0 items-center gap-1 rounded px-1.5 font-mono text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:inline-flex"
+                    onClick={startPriorityEdit}
+                    title="修改调度优先级（数值小者优先）"
+                  >
+                    P{cred.priority}
+                    <PencilIcon className="size-2.5 opacity-0 transition-opacity group-hover/priority:opacity-50" />
+                  </Button>
+                </>
               )}
               <span
                 className={cn('inline-flex min-w-0 items-center gap-1', expiry.className)}
@@ -251,6 +256,7 @@ export function CredentialCard({
               cred={cred}
               actions={actions}
               onRename={() => setEditing(true)}
+              onDeviceLimit={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
               onRequestDelete={() => setConfirmDelete(true)}
             />
           </DropdownMenu>
@@ -359,7 +365,7 @@ export function CredentialCard({
               size="icon"
               variant="ghost"
               onClick={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
-              className="size-8 shrink-0 text-muted-foreground sm:size-7"
+              className="hidden size-7 shrink-0 text-muted-foreground sm:inline-flex"
               title="调整设备上限"
               aria-label="调整设备上限"
             >

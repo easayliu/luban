@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowPathIcon, TrashIcon, PencilIcon, ChevronUpIcon, ChevronDownIcon,
+  DevicePhoneMobileIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
@@ -212,11 +213,12 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
+  onDeviceLimit: () => void
   onRequestDelete: () => void
 }) {
   const { refresh, prio } = actions
@@ -229,6 +231,10 @@ export function CredentialMenuContent({
       <DropdownMenuItem onClick={onRename}>
         <PencilIcon />
         重命名
+      </DropdownMenuItem>
+      <DropdownMenuItem onClick={onDeviceLimit}>
+        <DevicePhoneMobileIcon />
+        设备上限
       </DropdownMenuItem>
       <DropdownMenuSeparator />
       {/* 调度优先级：内联步进器，选中不关闭菜单，可连续调（数值小者优先）。 */}
