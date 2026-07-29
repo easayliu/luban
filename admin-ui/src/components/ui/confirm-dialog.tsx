@@ -41,21 +41,22 @@ export function ConfirmDialog({
         />
         <AlertDialogPrimitive.Content
           className={cn(
-            'fixed left-1/2 top-1/2 z-50 w-[calc(100vw-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-lg',
-            'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+            'fixed inset-x-0 bottom-0 z-50 w-full max-w-md overflow-hidden rounded-t-xl border border-b-0 border-border bg-card text-card-foreground shadow-lg',
+            'sm:bottom-auto sm:left-1/2 sm:right-auto sm:top-1/2 sm:w-[calc(100vw-2rem)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:border-b',
+            'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:slide-out-to-bottom-4 data-[state=open]:slide-in-from-bottom-4 sm:data-[state=closed]:zoom-out-95 sm:data-[state=open]:zoom-in-95',
           )}
         >
-          <div className="border-b border-border px-5 py-4">
+          <div className="border-b border-border px-4 py-4 sm:px-5">
             <AlertDialogPrimitive.Title className="flex items-center gap-2 text-base font-semibold leading-none tracking-tight">
               <ExclamationTriangleIcon className="size-4 shrink-0 text-bad" />
               {title}
             </AlertDialogPrimitive.Title>
           </div>
-          <div className="px-5 py-4">
+          <div className="px-4 py-4 sm:px-5">
             <AlertDialogPrimitive.Description className="text-sm text-muted-foreground">
               {description}
             </AlertDialogPrimitive.Description>
-            <div className="mt-5 flex justify-end gap-2">
+            <div className="mt-5 grid grid-cols-2 gap-2 sm:flex sm:justify-end">
               <AlertDialogPrimitive.Cancel asChild>
                 <Button variant="outline" size="sm" disabled={pending}>取消</Button>
               </AlertDialogPrimitive.Cancel>

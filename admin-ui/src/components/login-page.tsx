@@ -23,7 +23,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
   })
 
   return (
-    <div className="app-shell grid min-h-screen place-items-center bg-background px-5 py-10 text-foreground">
+    <div className="app-shell grid min-h-screen place-items-center bg-background px-4 py-8 text-foreground sm:px-5 sm:py-10">
       <div className="w-full max-w-sm">
         {/* 品牌标识 */}
         <div className="mb-6 flex flex-col items-center text-center">
@@ -35,7 +35,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
         </div>
 
         {/* 登录卡片 */}
-        <div className="rounded-xl border border-border bg-card p-6 shadow-card sm:p-7">
+        <div className="rounded-lg border border-border bg-card p-5 shadow-card sm:p-7">
           <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
             <LockClosedIcon className="size-5 text-muted-foreground" />
             管理登录
@@ -51,6 +51,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="管理密码"
+                aria-label="管理密码"
                 className="pr-10"
                 autoFocus
               />
@@ -61,6 +62,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                 className="absolute right-1 top-1/2 size-7 -translate-y-1/2 text-muted-foreground"
                 onClick={() => setShow((s) => !s)}
                 title={show ? '隐藏密码' : '显示密码'}
+                aria-label={show ? '隐藏密码' : '显示密码'}
               >
                 {show ? <EyeSlashIcon /> : <EyeIcon />}
               </Button>

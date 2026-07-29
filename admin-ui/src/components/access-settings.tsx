@@ -19,6 +19,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
 export function AccessSettings({
   open, onOpenChange,
@@ -31,11 +32,13 @@ export function AccessSettings({
 
   const [draft, setDraft] = useState('')
   const [show, setShow] = useState(false)
+  const [clearKeyOpen, setClearKeyOpen] = useState(false)
   useEffect(() => { setDraft(data?.api_key ?? '') }, [data?.api_key])
 
   const save = useMutation({
     mutationFn: (key: string) => setApiKey(key),
     onSuccess: (s: Settings) => {
+      setClearKeyOpen(false)
       toast.success(s.api_key ? '接入 Key 已保存' : '已清除，代理不再校验来访')
       qc.invalidateQueries({ queryKey: ['settings'] })
     },
@@ -59,6 +62,7 @@ export function AccessSettings({
     (currentKey ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}` : '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN')
 
   return (
+    <>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
@@ -75,7 +79,7 @@ export function AccessSettings({
           <SettingsSection title="客户端接入">
             <Field label="接入地址" code="ANTHROPIC_BASE_URL">
               <div className="flex items-center gap-2">
-                <Input readOnly value={baseUrl} className="font-mono" />
+                <Input readOnly value={baseUrl} className="font-mono" aria-label="接入地址" />
                 <CopyBtn text={baseUrl} />
               </div>
             </Field>
@@ -90,8 +94,9 @@ export function AccessSettings({
                     readOnly={envManaged}
                     placeholder={envManaged ? '' : '留空则不校验来访'}
                     className="font-mono"
+                    aria-label="接入 Key"
                   />
-                  <Button size="icon" variant="ghost" className="shrink-0" onClick={() => setShow((s) => !s)} title={show ? '隐藏' : '显示'}>
+                  <Button size="icon" variant="ghost" className="shrink-0" onClick={() => setShow((s) => !s)} title={show ? '隐藏' : '显示'} aria-label={show ? '隐藏接入 Key' : '显示接入 Key'}>
                     {show ? <EyeSlashIcon /> : <EyeIcon />}
                   </Button>
                   <CopyBtn text={draft} />
@@ -104,7 +109,7 @@ export function AccessSettings({
                     </Button>
                     {currentKey && (
                       <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
-                        onClick={() => { if (confirm('清除后代理将不校验来访身份，确定？')) save.mutate('') }}>
+                        onClick={() => setClearKeyOpen(true)}>
                         <TrashIcon />清空
                       </Button>
                     )}
@@ -138,6 +143,16 @@ export function AccessSettings({
         </DialogBody>
       </DialogContent>
     </Dialog>
+    <ConfirmDialog
+      open={clearKeyOpen}
+      onOpenChange={setClearKeyOpen}
+      title="清除接入 Key"
+      description="清除后，代理将不再校验客户端身份。"
+      confirmText="确认清除"
+      pending={save.isPending}
+      onConfirm={() => save.mutate('')}
+    />
+    </>
   )
 }
 
@@ -173,6 +188,7 @@ function DeviceBindingTtl() {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           className="w-full font-mono sm:w-40"
+          aria-label="设备绑定有效期（秒）"
         />
         <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
           {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
@@ -220,6 +236,7 @@ function DefaultDeviceLimit() {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           className="w-full font-mono sm:w-40"
+          aria-label="默认设备上限"
         />
         <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
           {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
@@ -258,6 +275,7 @@ function RequireDeviceIdToggle() {
           variant="success"
           checked={required}
           disabled={save.isPending}
+          aria-label="设备身份校验"
           onCheckedChange={(next) => save.mutate(next)}
         />
       </div>
@@ -277,6 +295,7 @@ function RequireDeviceIdToggle() {
 function AdminPassword() {
   const { data } = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const [pw, setPwInput] = useState('')
+  const [clearOpen, setClearOpen] = useState(false)
 
   const save = useMutation({
     mutationFn: async (password: string) => {
@@ -284,6 +303,7 @@ function AdminPassword() {
       else await setupPassword(password)
     },
     onSuccess: (_r, password) => {
+      setClearOpen(false)
       if (password) { setPw(password); toast.success('管理密码已设置') }
       else { clearPw(); toast.success('已清除管理密码') }
       window.location.reload()
@@ -295,6 +315,7 @@ function AdminPassword() {
   const configured = data?.configured ?? false
 
   return (
+    <>
     <Field label="管理密码（登录网页所需）">
       {envManaged ? (
         <p className="text-xs text-muted-foreground">
@@ -309,6 +330,7 @@ function AdminPassword() {
               onChange={(e) => setPwInput(e.target.value)}
               placeholder={configured ? '输入新密码以修改' : '设置密码（至少 4 位，之后登录需要）'}
               className="min-w-0 flex-1"
+              aria-label={configured ? '新管理密码' : '管理密码'}
             />
             <Button size="sm" className="w-full sm:w-auto" onClick={() => save.mutate(pw.trim())} disabled={save.isPending || pw.trim().length < 4}>
               {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <KeyIcon />}
@@ -316,7 +338,7 @@ function AdminPassword() {
             </Button>
             {configured && (
               <Button size="sm" variant="ghost" className="w-full text-bad hover:text-bad sm:w-auto"
-                onClick={() => { if (confirm('清除后网页将不再需要登录，确定？')) save.mutate('') }}
+                onClick={() => setClearOpen(true)}
                 disabled={save.isPending}>
                 <TrashIcon />清除
               </Button>
@@ -330,14 +352,24 @@ function AdminPassword() {
         </>
       )}
     </Field>
+    <ConfirmDialog
+      open={clearOpen}
+      onOpenChange={setClearOpen}
+      title="清除管理密码"
+      description="清除后，控制台将不再要求登录。"
+      confirmText="确认清除"
+      pending={save.isPending}
+      onConfirm={() => save.mutate('')}
+    />
+    </>
   )
 }
 
 function SettingsSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="overflow-hidden rounded-lg border border-border bg-card">
-      <h3 className="border-b border-border bg-muted/30 px-4 py-3 text-sm font-semibold">{title}</h3>
-      <div className="divide-y divide-border px-4 [&>*]:py-4 [&>*:first-child]:pt-4 [&>*:last-child]:pb-4">{children}</div>
+      <h3 className="border-b border-border bg-muted/30 px-3 py-3 text-sm font-semibold sm:px-4">{title}</h3>
+      <div className="divide-y divide-border px-3 sm:px-4 [&>*]:py-4 [&>*:first-child]:pt-4 [&>*:last-child]:pb-4">{children}</div>
     </section>
   )
 }
@@ -362,6 +394,7 @@ function CopyBtn({ text }: { text: string }) {
       variant="ghost"
       className={cn('h-9 w-9 shrink-0', ok && 'text-ok')}
       title="复制"
+      aria-label={ok ? '已复制' : '复制'}
       onClick={async () => {
         if (!text) return
         if (await copyText(text)) {

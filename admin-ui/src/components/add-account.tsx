@@ -104,7 +104,7 @@ export function AddAccount({
 
 function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-4">
+    <div className="rounded-lg border border-border bg-card p-3 sm:p-4">
       <div className="mb-3 flex items-center gap-2.5">
         <span className="flex size-6 items-center justify-center rounded-md bg-primary text-xs font-semibold text-primary-foreground">{n}</span>
         <span className="text-sm font-semibold">{title}</span>

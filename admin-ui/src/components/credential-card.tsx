@@ -62,7 +62,7 @@ export function CredentialCard({
   return (
     <Card
       className={cn(
-        '@container/card group/card relative overflow-hidden rounded-xl border-border bg-card p-4 pl-[calc(1rem-3px)] shadow-card transition-colors sm:p-5 sm:pl-[calc(1.25rem-3px)]',
+        '@container/card group/card relative overflow-hidden rounded-lg border-border bg-card p-3 pl-[calc(0.75rem-3px)] shadow-card transition-[border-color,box-shadow] sm:p-5 sm:pl-[calc(1.25rem-3px)]',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:transition-colors',
         'hover:border-foreground/15',
         cred.disabled && 'opacity-60',
@@ -78,17 +78,17 @@ export function CredentialCard({
             type="checkbox"
             checked={selected}
             onChange={(e) => onSelectedChange?.(e.target.checked)}
-            className="mt-3 size-4 shrink-0 accent-primary"
+            className="mt-3 size-4 shrink-0 rounded border-border accent-primary"
             aria-label={`选择 ${cred.label}`}
           />
         )}
         <div className="relative shrink-0">
           <div
             className={cn(
-              'grid size-9 place-items-center rounded-xl text-xs font-semibold sm:size-10 sm:text-sm',
+              'grid size-9 place-items-center rounded-md text-xs font-semibold sm:size-10 sm:text-sm',
               cred.disabled
                 ? 'bg-muted text-muted-foreground'
-                : 'bg-gradient-to-br from-foreground to-foreground/75 text-primary-foreground shadow-sm',
+                : 'bg-primary text-primary-foreground shadow-sm',
             )}
             aria-hidden
           >
@@ -102,20 +102,21 @@ export function CredentialCard({
             )}
             title={status.label}
             aria-label={status.label}
+            role="img"
           />
         </div>
 
         <div className="min-w-0 flex-1">
           {editing ? (
             <form
-              className="flex items-center gap-1.5"
+              className="flex min-w-0 items-center gap-1"
               onSubmit={(e) => { e.preventDefault(); rename.mutate(name.trim()) }}
             >
-              <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-8 w-56" />
-              <Button type="submit" size="icon" variant="ghost" className="h-8 w-8" disabled={rename.isPending}>
+              <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-8 min-w-0 flex-1 px-2 text-xs sm:w-56 sm:flex-none sm:px-3 sm:text-sm" aria-label="账号名称" />
+              <Button type="submit" size="icon" variant="ghost" className="h-8 w-8" disabled={rename.isPending} aria-label="保存账号名称">
                 {rename.isPending ? <ArrowPathIcon className="animate-spin" /> : <CheckIcon />}
               </Button>
-              <Button type="button" size="icon" variant="ghost" className="h-8 w-8"
+              <Button type="button" size="icon" variant="ghost" className="h-8 w-8" aria-label="取消重命名"
                 onClick={() => { setEditing(false); setName(cred.label) }}>
                 <XMarkIcon />
               </Button>
@@ -189,6 +190,7 @@ export function CredentialCard({
               onCheckedChange={(on) => toggle.mutate(!on)}
               disabled={toggle.isPending}
               title={switchTitle(cred)}
+              aria-label={switchTitle(cred)}
               className={cn(
                 toggle.isPending && 'opacity-0',
                 // 封禁/过期等异常态：开关转中性灰，不用健康绿，避免与红状态灯冲突。
@@ -201,7 +203,7 @@ export function CredentialCard({
           </span>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button size="icon" variant="ghost" className="size-8 text-muted-foreground">
+              <Button size="icon" variant="ghost" className="size-8 text-muted-foreground" aria-label={`打开 ${cred.label} 菜单`}>
                 <EllipsisHorizontalIcon />
               </Button>
             </DropdownMenuTrigger>
@@ -260,11 +262,11 @@ export function CredentialCard({
           <span className="tnum">{formatUsd(cred.cost_total)}</span>
         </span>
 
-        {/* 设备：非编辑态作为统计项，点击展开为上限输入框。
+        {/* 设备：摘要按钮展开明细，右侧铅笔单独编辑上限。
             上限三态——留空跟随全局默认（显示「默认」角标）、0 表示该账号不限、正数为独立上限。 */}
         {editingLimit ? (
           <form
-            className="ml-auto inline-flex items-center gap-1.5"
+            className="ml-auto flex w-full items-center justify-end gap-1.5 sm:w-auto"
             onSubmit={(e) => { e.preventDefault(); limit.mutate(inputToLimit(limitVal)) }}
           >
             <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
@@ -275,54 +277,49 @@ export function CredentialCard({
               onChange={(e) => setLimitVal(e.target.value)}
               autoFocus
               placeholder="默认"
-              className="h-6 w-14 px-1.5 text-2xs"
+              className="h-9 w-20 px-2 text-xs sm:h-6 sm:w-14 sm:px-1.5 sm:text-2xs"
               title="留空 = 跟随全局默认上限；0 = 该账号不限；正数 = 该账号独立上限"
+              aria-label="设备上限"
             />
-            <Button type="submit" size="icon" variant="ghost" className="size-6" disabled={limit.isPending}>
+            <Button type="submit" size="icon" variant="ghost" className="size-9 sm:size-6" disabled={limit.isPending} aria-label="保存设备上限">
               {limit.isPending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
             </Button>
-            <Button type="button" size="icon" variant="ghost" className="size-6"
+            <Button type="button" size="icon" variant="ghost" className="size-9 sm:size-6" aria-label="取消修改设备上限"
               onClick={() => { setEditingLimit(false); setLimitVal(limitToInput(cred.device_limit)) }}>
               <XMarkIcon className="size-3" />
             </Button>
           </form>
         ) : (
-          <button
-            onClick={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
-            className="group/limit ml-auto inline-flex items-center gap-1 transition-colors hover:text-foreground"
-            title={
-              cred.device_limit === 0
-                ? '跟随全局默认上限（在接入设置里改）；点击可为该账号单独设置'
-                : '点击调整该账号的设备数上限（留空可改回跟随默认）'
-            }
-          >
-            <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
-            <span className="tnum">
-              设备 {cred.device_count}/
-              {cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'}
-            </span>
-            {cred.device_limit === 0 && (
-              <span className="rounded bg-muted px-1 text-[0.625rem] leading-4 text-muted-foreground">
-                默认
+          <div className="ml-auto inline-flex h-9 items-center overflow-hidden rounded-md border border-border bg-background shadow-sm sm:h-7">
+            <button
+              onClick={() => setShowDevices((v) => !v)}
+              className="inline-flex h-full items-center gap-1.5 px-2.5 transition-colors hover:bg-muted hover:text-foreground"
+              title={showDevices ? '收起已绑定设备' : '查看已绑定设备'}
+              aria-expanded={showDevices}
+              aria-label={`${showDevices ? '收起' : '展开'}已绑定设备，当前 ${cred.device_count} 台`}
+            >
+              <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
+              <span className="tnum">
+                设备 {cred.device_count}/
+                {cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'}
               </span>
-            )}
-            <PencilIcon className="size-2.5 shrink-0 transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/limit:opacity-100" />
-          </button>
+              {cred.device_limit === 0 && (
+                <span className="rounded bg-muted px-1 text-[0.625rem] leading-4 text-muted-foreground">
+                  默认
+                </span>
+              )}
+              <ChevronDownIcon className={cn('size-3 transition-transform', showDevices && 'rotate-180')} />
+            </button>
+            <button
+              onClick={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
+              className="grid size-9 shrink-0 place-items-center border-l border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:size-7"
+              title="调整设备上限"
+              aria-label="调整设备上限"
+            >
+              <PencilIcon className="size-3" />
+            </button>
+          </div>
         )}
-
-        {/* 展开「已绑定设备」：上面的数字只说有几台，这里能看到具体是哪几台。
-            单独一个箭头按钮，因为设备统计项本身的点击已经被「改上限」占用了。 */}
-        <button
-          onClick={() => setShowDevices((v) => !v)}
-          className="inline-flex items-center transition-colors hover:text-foreground"
-          title={showDevices ? '收起已绑定设备' : '查看已绑定的设备'}
-          aria-expanded={showDevices}
-          aria-label="已绑定设备"
-        >
-          <ChevronDownIcon
-            className={cn('size-3 transition-transform', showDevices && 'rotate-180')}
-          />
-        </button>
       </div>
 
       {showDevices && <DeviceList credId={cred.id} />}
@@ -362,9 +359,15 @@ function DeviceList({ credId }: { credId: number }) {
   })
 
   return (
-    <div className="mt-3 overflow-hidden rounded-lg border border-border bg-muted/20 text-xs">
+    <div className="mt-3 animate-in overflow-hidden rounded-md border border-border bg-muted/20 text-xs fade-in-0 slide-in-from-top-1 duration-200 motion-reduce:animate-none">
+      <div className="flex items-center justify-between border-b border-border bg-muted/30 px-3 py-2">
+        <span className="font-medium text-foreground">已绑定设备</span>
+        {!isPending && !error && (
+          <span className="tnum text-2xs text-muted-foreground">{data.length} 台</span>
+        )}
+      </div>
       {isPending ? (
-        <span className="inline-flex items-center gap-1.5 p-3 text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5 p-3 text-muted-foreground" role="status">
           <ArrowPathIcon className="size-3 animate-spin" />读取设备列表…
         </span>
       ) : error ? (
@@ -375,43 +378,49 @@ function DeviceList({ credId }: { credId: number }) {
         <ul className="divide-y divide-border">
           {data.map((d) => (
             <li key={d.device_id} className="bg-card p-3">
-              <div className="flex items-center gap-2">
-                <DevicePhoneMobileIcon className="size-4 shrink-0 text-muted-foreground" />
-                <button
-                  className="min-w-0 truncate font-mono text-xs font-medium transition-colors hover:text-foreground"
-                  title={`${d.device_id}（点击复制）`}
-                  onClick={async () => {
-                    const ok = await copyText(d.device_id)
-                    if (ok) toast.success('已复制 device_id')
-                    else toast.error('复制失败', { description: d.device_id })
-                  }}
-                >
-                  {d.device_id.slice(0, 16)}…
-                </button>
-                <span
-                  className="ml-auto shrink-0 tnum text-2xs text-muted-foreground"
-                  title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
-                >
-                  {relativeTime(d.last_seen_at)}
+              <div className="flex items-start gap-2.5">
+                <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+                  <DevicePhoneMobileIcon className="size-4" />
                 </span>
+                <div className="min-w-0 flex-1">
+                  <button
+                    className="block max-w-full truncate text-left font-mono text-xs font-medium transition-colors hover:text-foreground"
+                    title={`${d.device_id}（点击复制）`}
+                    aria-label={`复制设备 ID ${d.device_id}`}
+                    onClick={async () => {
+                      const ok = await copyText(d.device_id)
+                      if (ok) toast.success('已复制 device_id')
+                      else toast.error('复制失败', { description: d.device_id })
+                    }}
+                  >
+                    {d.device_id}
+                  </button>
+                  <span
+                    className="mt-1 block tnum text-2xs text-muted-foreground"
+                    title={`首次绑定 ${new Date(d.created_at * 1000).toLocaleString()}`}
+                  >
+                    最近活跃 {relativeTime(d.last_seen_at)}
+                  </span>
+                </div>
                 <Button
-                  size="sm"
+                  size="icon"
                   variant="ghost"
-                  className="h-7 shrink-0 px-2 text-2xs text-bad hover:text-bad"
+                  className="size-9 shrink-0 text-bad hover:text-bad sm:size-8"
                   onClick={() => unbind.mutate(d.device_id)}
                   disabled={unbind.isPending}
+                  title="解绑设备"
+                  aria-label={`解绑设备 ${d.device_id}`}
                 >
                   {unbind.isPending && unbind.variables === d.device_id
                     ? <ArrowPathIcon className="size-3 animate-spin" />
                     : <XMarkIcon className="size-3" />}
-                  解绑
                 </Button>
               </div>
               <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
                 <DeviceStat label="请求" value={`${d.request_count} 次`} />
                 <DeviceStat label="本账号花费" value={formatUsd(d.cost_usd)} />
                 {d.cost_usd_all > d.cost_usd && (
-                  <DeviceStat label="全部账号花费" value={formatUsd(d.cost_usd_all)} />
+                  <DeviceStat label="全部账号花费" value={formatUsd(d.cost_usd_all)} className="col-span-2 sm:col-span-1" />
                 )}
               </div>
             </li>
@@ -422,9 +431,9 @@ function DeviceList({ credId }: { credId: number }) {
   )
 }
 
-function DeviceStat({ label, value }: { label: string; value: string }) {
+function DeviceStat({ label, value, className }: { label: string; value: string; className?: string }) {
   return (
-    <div className="rounded-md bg-muted/60 px-2.5 py-2">
+    <div className={cn('rounded-md border border-border/60 bg-muted/30 px-2.5 py-2', className)}>
       <div className="text-2xs text-muted-foreground">{label}</div>
       <div className="mt-0.5 font-medium tnum text-foreground">{value}</div>
     </div>
@@ -454,7 +463,7 @@ function QuotaBar({
       : '上游未返回该窗口的额度信息'
     return (
       <div
-        className="rounded-xl border border-dashed border-border/70 px-3 py-2.5 text-2xs text-muted-foreground"
+        className="rounded-md border border-dashed border-border/70 px-3 py-2.5 text-2xs text-muted-foreground"
         title={`${reason}。最后一次快照：${formatFullTime(snapshotTs)}`}
       >
         {label} · {reset != null ? '已重置，暂无新用量' : '暂无数据'}
@@ -466,7 +475,7 @@ function QuotaBar({
   const barColor = critical ? 'bg-bad' : util >= 0.7 ? 'bg-warn' : 'bg-ok'
   const pctColor = critical ? 'text-bad' : util >= 0.7 ? 'text-warn' : 'text-foreground'
   return (
-    <div className="rounded-xl border border-border/60 bg-surface-2/55 px-3 py-2.5 shadow-[inset_0_1px_0_rgb(255_255_255/0.5)]">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-2xs font-medium text-muted-foreground">{label}</span>
         {/* 百分比只在有请求经过时才刷新，标注快照时间，免得把很旧的数当成实时值。 */}

@@ -90,7 +90,7 @@ export function CredentialListHeader({
               type="checkbox"
               checked={!!allSelected}
               onChange={(e) => onSelectAll?.(e.target.checked)}
-              className="size-4 align-middle accent-primary"
+              className="size-4 rounded border-border align-middle accent-primary"
               aria-label="全选当前筛选结果"
             />
           ) : (
@@ -172,7 +172,7 @@ export function CredentialRow({
             type="checkbox"
             checked={selected}
             onChange={(e) => onSelectedChange?.(e.target.checked)}
-            className="size-4 align-middle accent-primary"
+            className="size-4 rounded border-border align-middle accent-primary"
             aria-label={`选择 ${cred.label}`}
           />
         )}
@@ -184,6 +184,7 @@ export function CredentialRow({
           <span
             className={cn('size-2 shrink-0 rounded-full', status.dot)}
             aria-label={status.label}
+            role="img"
           />
           <span className={cn('hidden text-2xs @md:inline', expiry.className)}>
             {nearLimit && !isAbnormal(cred)
@@ -200,11 +201,11 @@ export function CredentialRow({
             className="flex min-w-0 items-center gap-1"
             onSubmit={(e) => { e.preventDefault(); rename.mutate(name.trim()) }}
           >
-            <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-7 w-44 text-xs" />
-            <Button type="submit" size="icon" variant="ghost" className="size-7" disabled={rename.isPending}>
+            <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-7 w-36 text-xs sm:w-44" aria-label="账号名称" />
+            <Button type="submit" size="icon" variant="ghost" className="size-7" disabled={rename.isPending} aria-label="保存账号名称">
               {rename.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
             </Button>
-            <Button type="button" size="icon" variant="ghost" className="size-7"
+            <Button type="button" size="icon" variant="ghost" className="size-7" aria-label="取消重命名"
               onClick={() => { setEditing(false); setName(cred.label) }}>
               <XMarkIcon className="size-3.5" />
             </Button>
@@ -299,6 +300,7 @@ export function CredentialRow({
               onCheckedChange={(on) => toggle.mutate(!on)}
               disabled={toggle.isPending}
               title={switchTitle(cred)}
+              aria-label={switchTitle(cred)}
               className={cn(
                 'scale-90',
                 toggle.isPending && 'opacity-0',
@@ -311,7 +313,7 @@ export function CredentialRow({
           </span>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button size="icon" variant="ghost" className="size-7 shrink-0 text-muted-foreground">
+              <Button size="icon" variant="ghost" className="size-7 shrink-0 text-muted-foreground" aria-label={`打开 ${cred.label} 菜单`}>
                 <EllipsisHorizontalIcon className="size-4" />
               </Button>
             </DropdownMenuTrigger>

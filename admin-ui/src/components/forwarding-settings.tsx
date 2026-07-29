@@ -1,5 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { AdjustmentsHorizontalIcon, BeakerIcon } from '@heroicons/react/24/outline'
+import {
+  AdjustmentsHorizontalIcon, ChevronDownIcon, CircleStackIcon,
+  IdentificationIcon, InformationCircleIcon, ServerStackIcon,
+} from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import { getSettings, setForwarding, type ForwardingKey, type Settings } from '@/api/settings'
 import { extractError } from '@/lib/utils'
@@ -23,123 +26,121 @@ export function ForwardingSettings({
   onOpenChange: (open: boolean) => void
 }) {
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const allOff = data
-    ? !data.spoof_identity && !data.billing_cch && !data.fill_client_headers &&
-      !data.merge_beta && !data.cache_scope_global && !data.orig_header_case
-    : false
+  const enabledCount = data
+    ? [
+        data.spoof_identity, data.billing_cch, data.fill_client_headers,
+        data.merge_beta, data.cache_scope_global, data.orig_header_case,
+      ].filter(Boolean).length
+    : 0
+  const allOff = data ? enabledCount === 0 : false
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle>
             <AdjustmentsHorizontalIcon className="size-4" />
             转发形态
-            {allOff && <Badge variant="outline">零改写</Badge>}
+            {data && (
+              <Badge variant="outline" className="font-normal text-muted-foreground">
+                {allOff ? '零改写' : `${enabledCount} / 6 已开启`}
+              </Badge>
+            )}
           </DialogTitle>
-          <DialogDescription>控制请求转发时的兼容性处理。</DialogDescription>
+          <DialogDescription>调整身份、请求头与缓存兼容策略，修改后即时生效。</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-3 bg-muted/20">
-          <div className="flex gap-2.5 rounded-lg border border-border bg-card p-3 text-xs leading-5 text-muted-foreground">
-            <BeakerIcon className="mt-0.5 size-4 shrink-0" />
-            <div>
-              这些开关用于兼容性排查。全部关闭后，luban 仍会保留必要的{' '}
-              <code className="font-mono">Authorization</code> 注入。
-            </div>
+        <DialogBody className="space-y-4 bg-muted/20">
+          <div className="flex items-center gap-2.5 rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground shadow-sm sm:px-4">
+            <InformationCircleIcon className="size-4 shrink-0" />
+            <span>仅影响兼容性改写；必要的 <code className="font-mono text-foreground">Authorization</code> 注入始终保留。</span>
           </div>
 
-          <Toggle
-            k="spoof_identity"
-            label="身份伪装（metadata.user_id）"
-            summary="让账号身份与设备指纹保持一致。"
-            desc={
-              <>
-                把请求 <code className="font-mono">metadata.user_id</code> 里的{' '}
-                <code className="font-mono">account_uuid</code> 与{' '}
-                <code className="font-mono">device_id</code>{' '}
-                改写成所用凭证的自洽身份（真实账号 + 按设备指纹稳定派生的 device_id），
-                避免「真账号 + 陌生设备」的矛盾。关闭则原样透传客户端身份（API-key 模式的 CC
-                发的 <code className="font-mono">account_uuid</code> 是空串）。
-              </>
-            }
-          />
+          <SettingsGroup
+            icon={IdentificationIcon}
+            title="身份与订阅"
+            description="统一账号身份及订阅请求特征。"
+          >
+            <Toggle
+              k="spoof_identity"
+              label="身份一致性"
+              summary="保持 metadata.user_id 与账号、设备指纹一致。"
+              desc={
+                <>
+                  将 <code>account_uuid</code> 和 <code>device_id</code> 改写为当前凭证的自洽身份，
+                  避免账号与设备不匹配。关闭后原样透传客户端身份。
+                </>
+              }
+            />
+            <Toggle
+              k="billing_cch"
+              label="订阅计费标识"
+              summary="补齐 x-anthropic-billing-header 请求头。"
+              desc={
+                <>
+                  订阅客户端会发送 <code>cch=&lt;5 位 hex&gt;</code>，API-key 模式通常不发送。
+                  开启后会补充稳定占位值，使请求形态更接近订阅客户端。
+                </>
+              }
+            />
+          </SettingsGroup>
 
-          <Toggle
-            k="billing_cch"
-            label="补 cch（x-anthropic-billing-header）"
-            summary="补齐订阅客户端使用的 billing header。"
-            desc={
-              <>
-                官方客户端只在订阅模式下发 <code className="font-mono">cch=&lt;5 位 hex&gt;</code>，
-                API-key 模式不发，于是「OAuth token + 无 cch」是个确定性判据。注意补的是一个
-                跨账号恒定的占位值，真算法无法从抓包反推。
-              </>
-            }
-          />
+          <SettingsGroup
+            icon={ServerStackIcon}
+            title="协议与请求头"
+            description="统一 Beta 标记和客户端请求头。"
+          >
+            <Toggle
+              k="merge_beta"
+              label="Beta 标记"
+              summary="按官方顺序合并并补齐 anthropic-beta。"
+              desc={
+                <>
+                  重排客户端 Beta 标记并补入 <code>oauth-2025-04-20</code>。
+                  关闭后将原样转发客户端提供的内容。
+                </>
+              }
+            />
+            <Toggle
+              k="fill_client_headers"
+              label="客户端请求头"
+              summary="补齐缺失的版本、编码和请求标识。"
+              desc={
+                <>
+                  按需补充 <code>accept-encoding</code>、<code>anthropic-version</code> 和
+                  <code>x-client-request-id</code>。已存在的请求头不会被重复覆盖。
+                </>
+              }
+            />
+            <Toggle
+              k="orig_header_case"
+              label="请求头形态"
+              summary="还原官方客户端的头名拼写与排列顺序。"
+              desc={
+                <>
+                  调整标准头、自定义头的大小写及顺序。关闭后请求头会退回默认小写形态，
+                  仅建议在兼容性排查时临时关闭。
+                </>
+              }
+            />
+          </SettingsGroup>
 
-          <Toggle
-            k="merge_beta"
-            label="合并重排 anthropic-beta"
-            summary="按官方顺序合并并补齐 beta 标记。"
-            desc={
-              <>
-                把客户端的 beta 串按官方顺序重排并塞入{' '}
-                <code className="font-mono">oauth-2025-04-20</code>，使其与官方订阅客户端逐字节
-                一致。实测不带这个 beta 也能 200。关闭则原样转发客户端那串。
-              </>
-            }
-          />
-
-          <Toggle
-            k="fill_client_headers"
-            label="补齐缺失的客户端头"
-            summary="补齐客户端未发送的标准请求头。"
-            desc={
-              <>
-                客户端没带时补上 <code className="font-mono">accept-encoding</code>（官方取值）、
-                <code className="font-mono">anthropic-version</code>、
-                <code className="font-mono">x-client-request-id</code>（每请求一个 uuid v4）。
-                关闭后 accept-encoding 仍由上游 client 的默认头兜底，不会退化成非官方取值。
-              </>
-            }
-          />
-
-          <Toggle
-            k="orig_header_case"
-            label="头名大小写与顺序"
-            summary="按官方客户端还原头名拼写与顺序。"
-            desc={
-              <>
-                按官方客户端的原始拼写与顺序发出头名：标准头首字母大写（
-                <code className="font-mono">Accept-Encoding</code>）、SDK 自定义头全小写（
-                <code className="font-mono">anthropic-beta</code>）、
-                <code className="font-mono">X-Stainless-OS</code> 的 OS 全大写。同一张表还决定
-                头序，所以 <code className="font-mono">Host</code>/
-                <code className="font-mono">User-Agent</code>/
-                <code className="font-mono">Content-Length</code>{' '}
-                也能落在官方位置而不是被追加到队尾。
-                <span className="text-warn">
-                  {' '}关掉不等于「恢复原样」：头名会退回全小写，且 user-agent/accept-encoding
-                  会被前置到队首，比开着更不像官方客户端——这个开关只用于出问题时二分。
-                </span>
-              </>
-            }
-          />
-
-          <Toggle
-            k="cache_scope_global"
-            label="缓存 scope=global"
-            summary="提升静态 system 块的跨会话缓存命中。"
-            desc={
-              <>
-                给最长的静态 <code className="font-mono">system</code> 块标{' '}
-                <code className="font-mono">cache_control.scope = &quot;global&quot;</code>，
-                提升跨会话缓存复用。抓包显示官方订阅模式自己就带这个标记、API-key 模式不带，
-                所以它既贴形态也真省钱——<span className="text-warn">关掉会掉缓存命中率</span>，
-                只在追求「零改写」时才需要关。
-              </>
-            }
-          />
+          <SettingsGroup
+            icon={CircleStackIcon}
+            title="缓存优化"
+            description="提高静态内容的跨会话复用率。"
+          >
+            <Toggle
+              k="cache_scope_global"
+              label="全局缓存"
+              summary="为最长的静态 system 块启用 global scope。"
+              desc={
+                <>
+                  添加 <code>cache_control.scope = &quot;global&quot;</code> 以提升跨会话缓存命中率。
+                  关闭可能增加重复计算与费用，仅在追求零改写时使用。
+                </>
+              }
+            />
+          </SettingsGroup>
         </DialogBody>
       </DialogContent>
     </Dialog>
@@ -163,30 +164,61 @@ function Toggle({
     mutationFn: (next: boolean) => setForwarding(k, next),
     onSuccess: (s: Settings) => {
       toast.success(`${label}：${s[k] ? '已开启' : '已关闭'}`)
-      qc.invalidateQueries({ queryKey: ['settings'] })
+      qc.setQueryData(['settings'], s)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
     },
     onError: (e) => toast.error('保存失败', { description: extractError(e) }),
   })
 
   return (
-    <div className="rounded-lg border border-border bg-card p-4">
+    <div className="px-3 py-3 sm:px-4 sm:py-3.5">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="text-sm font-semibold">{label}</div>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">{summary}</p>
+          <div className="text-sm font-medium">{label}</div>
+          <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{summary}</p>
         </div>
         <Switch
-          className="mt-0.5 shrink-0"
+          className="mt-0.5 shrink-0 sm:mt-1"
           variant="success"
           checked={enabled}
           disabled={save.isPending}
+          aria-label={label}
           onCheckedChange={(next) => save.mutate(next)}
         />
       </div>
-      <details className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">
-        <summary className="cursor-pointer select-none font-medium text-foreground/80">技术说明</summary>
-        <div className="mt-2 leading-5">{desc}</div>
+      <details className="group mt-2 text-xs text-muted-foreground">
+        <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm text-2xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          技术说明
+          <ChevronDownIcon className="size-3 transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="mt-2 rounded-md bg-muted/50 px-3 py-2.5 leading-5 [&_code]:rounded-sm [&_code]:bg-background [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-foreground">
+          {desc}
+        </div>
       </details>
     </div>
+  )
+}
+
+function SettingsGroup({
+  icon: Icon, title, description, children,
+}: {
+  icon: typeof IdentificationIcon
+  title: string
+  description: string
+  children: React.ReactNode
+}) {
+  return (
+    <section className="overflow-hidden rounded-lg border border-border bg-card shadow-sm">
+      <div className="flex items-center gap-3 border-b border-border bg-muted/30 px-3 py-3 sm:px-4">
+        <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+          <Icon className="size-4" />
+        </span>
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">{title}</h3>
+          <p className="mt-0.5 text-2xs text-muted-foreground">{description}</p>
+        </div>
+      </div>
+      <div className="divide-y divide-border">{children}</div>
+    </section>
   )
 }

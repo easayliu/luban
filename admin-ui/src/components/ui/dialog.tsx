@@ -35,8 +35,9 @@ const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        'fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        'fixed inset-x-0 bottom-0 z-50 flex max-h-[calc(100dvh-0.5rem)] w-full max-w-xl flex-col overflow-hidden rounded-t-xl border border-b-0 border-border bg-card text-card-foreground shadow-lg',
+        'sm:bottom-auto sm:left-1/2 sm:right-auto sm:top-1/2 sm:max-h-[calc(100dvh-2rem)] sm:w-[calc(100vw-2rem)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:border-b',
+        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:slide-out-to-bottom-4 data-[state=open]:slide-in-from-bottom-4 sm:data-[state=closed]:zoom-out-95 sm:data-[state=open]:zoom-in-95',
         className,
       )}
       {...props}
@@ -58,7 +59,7 @@ DialogContent.displayName = DialogPrimitive.Content.displayName
 function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn('flex flex-col space-y-1.5 border-b border-border px-5 py-4 pr-14', className)}
+      className={cn('flex flex-col space-y-1.5 border-b border-border px-4 py-4 pr-14 sm:px-5', className)}
       {...props}
     />
   )
@@ -66,7 +67,7 @@ function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivEleme
 
 /** 内容区：超长时在弹窗内部滚动，页面本身不动。 */
 function DialogBody({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('scrollbar-dialog min-h-0 flex-1 overflow-y-auto px-5 py-4', className)} {...props} />
+  return <div className={cn('scrollbar-dialog min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5', className)} {...props} />
 }
 
 const DialogTitle = React.forwardRef<
