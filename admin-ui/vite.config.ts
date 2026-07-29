@@ -4,8 +4,23 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 import { readFileSync } from 'node:fs'
 
-const cargoManifest = readFileSync(path.resolve(__dirname, '../Cargo.toml'), 'utf8')
-const appVersion = cargoManifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? 'dev'
+/**
+ * 版本号取自 Cargo.toml（唯一真源），读不到就退回 `dev`。
+ *
+ * **必须容错**：这里抛异常会让 vite 连配置都加载不了、整个前端构建当场挂掉，而它只是页脚上
+ * 的一个字符串。Docker 的前端阶段一度就只拷 admin-ui、没有 ../Cargo.toml，于是整包构建失败
+ * （v0.2.25）；那边已补上 COPY，这条 catch 是防下一个「构建上下文里没有它」的场景。
+ */
+function readAppVersion(): string {
+  try {
+    const manifest = readFileSync(path.resolve(__dirname, '../Cargo.toml'), 'utf8')
+    return manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? 'dev'
+  } catch {
+    return 'dev'
+  }
+}
+
+const appVersion = readAppVersion()
 
 /**
  * 剥掉 Fontsource 的 `.woff` 回退，只留 woff2。

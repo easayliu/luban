@@ -3,6 +3,11 @@ FROM node:22-alpine AS frontend
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
 RUN npm install -g pnpm@10 && pnpm install --frozen-lockfile
+# vite.config.ts 从 Cargo.toml 读版本号注入 __APP_VERSION__（页脚显示），而这一阶段只拷
+# admin-ui，于是配置加载即 ENOENT、整个前端构建挂掉——v0.2.25 的镜像构建就是这么挂的，
+# 而本地与 Build 任务都有整个仓库，所以只有这条流水线会踩。放在 COPY admin-ui 之前：
+# Cargo.toml 变得远比前端源码少，这一层能一直命中缓存。
+COPY Cargo.toml /app/Cargo.toml
 COPY admin-ui ./
 RUN pnpm build
 
