@@ -77,8 +77,9 @@ pub async fn handle(
     let flags = state.store.forward_flags();
     let out = build_forward_headers(&headers, &token, flags);
 
-    // 6) 转发前改写 body：最大 system 块标 scope=global + 身份伪装（metadata.user_id 的
-    //    account_uuid/device_id 换成该凭证自洽身份、billing header 补 cch）。缓存 TTL 不动。
+    // 6) 转发前改写 body：system 形态对齐（拆成官方的 4 块 + 断点全上 1h + 基座标 scope=global）
+    //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
+    //    billing header 补 cch）。
     //    设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
     let device_fp = device_fingerprint(device_id.as_deref(), &headers);
     {
@@ -611,26 +612,47 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
     false
 }
 
-/// 合并来访的 anthropic-beta 值，补齐 [`config::INJECT_BETAS`]（对齐官方订阅客户端），
-/// 并按 [`config::CC_BETA_ORDER`] 重排。
+/// 合并来访的 `anthropic-beta`：**客户端自有的那串一字不动**，只把 API-key 模式的客户端不会
+/// 自带的那四项补进去，各自插到官方位置上。这里是「注入哪几项」的唯一真源。
 ///
-/// 只追加不重排会得到官方客户端不会产生的排列（缺失项全堆在末尾），集合对了顺序错，
-/// 一次精确字符串匹配即可判定中间有代理。表外的未知 beta 保持相对顺序附在末尾。
+/// 只追加不落位会得到官方客户端不会产生的排列（缺失项全堆在末尾），集合对了顺序错，一次精确
+/// 字符串匹配即可判定中间有代理。但**落位不能靠一张全局顺序表**——haiku 的客户端把
+/// `claude-code-20250219` 排在队尾，opus/sonnet 排在队首，任何单一总序都同时满足不了
+/// （见 [`config::cc_beta_order_is_not_a_table`]）。四对 raw 抓包里唯一稳定的是「客户端自有串
+/// 的相对顺序在订阅模式下逐字不变」，故这里保留原串，按经验规则插入：
+///
+/// - [`config::OAUTH_BETA_HEADER`]：OAuth 鉴权必需。客户端串以
+///   [`config::CC_BETA_CLAUDE_CODE`] 开头就插它后面，否则插最前（haiku 即后者）。
+/// - [`config::CC_BETA_ADVANCED_TOOL_USE`]：有 [`config::CC_BETA_EFFORT`] 就插它前面，
+///   没有就跟在客户端自有串之后（haiku）。
+/// - [`config::CC_BETA_PROMPT_CACHING_SCOPE`]：四份抓包里客户端都自带，真缺时补在末尾。
+/// - [`config::CC_BETA_EXTENDED_CACHE_TTL`]：官方恒为最后一项，故**最后**追加——这也是本
+///   函数里插入顺序有讲究的唯一一处。
+///
+/// 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；fable-5 那对
+/// 两侧会话配置不同（`context-1m` / `server-side-fallback`），能验的是落位，也一致。
+/// 回归测试见 [`tests::merged_beta_matches_official_order`]。
 fn merge_beta(incoming: Option<&HeaderValue>) -> String {
     let mut parts: Vec<String> = incoming
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    for beta in config::INJECT_BETAS {
-        if !parts.iter().any(|p| p == beta) {
-            parts.push((*beta).to_string());
-        }
+    let has = |parts: &[String], beta: &str| parts.iter().any(|p| p == beta);
+
+    if !has(&parts, config::OAUTH_BETA_HEADER) {
+        let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
+        parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
     }
-    // 稳定排序：已知 beta 按官方位次，未知的排在最后并保留原有相对顺序。
-    let rank = |p: &String| {
-        config::CC_BETA_ORDER.iter().position(|k| k == p).unwrap_or(config::CC_BETA_ORDER.len())
-    };
-    parts.sort_by_key(rank);
+    if !has(&parts, config::CC_BETA_ADVANCED_TOOL_USE) {
+        let at = parts.iter().position(|p| p == config::CC_BETA_EFFORT).unwrap_or(parts.len());
+        parts.insert(at, config::CC_BETA_ADVANCED_TOOL_USE.to_string());
+    }
+    if !has(&parts, config::CC_BETA_PROMPT_CACHING_SCOPE) {
+        parts.push(config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
+    }
+    if !has(&parts, config::CC_BETA_EXTENDED_CACHE_TTL) {
+        parts.push(config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
+    }
     parts.join(",")
 }
 
@@ -750,16 +772,12 @@ fn request_speed(body: &Bytes) -> Option<String> {
 /// 转发前改写请求体，三项各自受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
 /// 请求体逐字节原样转发）：
 ///
-/// 1. **缓存 scope**（`cache_scope_global`）：`system` 里文本最长的静态块标记
-///    `scope: "global"`，提升跨会话缓存复用。抓包 040 显示官方订阅模式自己就带这个标记，
-///    API-key 模式不带，故它既贴形态也真省钱——想恢复「零改写」才需要关掉。
+/// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
+///    见 [`align_system_shape`]。含拆块、断点全上 `ttl:1h`、基座标 `scope:"global"`。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
 ///    「真账号 + 陌生设备」的矛盾。
 /// 3. **cch**（`billing_cch`）：给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
-///
-/// **不动缓存 TTL**：客户端声明 5m 就按 5m 转发。曾把所有 ephemeral 断点无条件升成 1h，
-/// 但 1h 缓存写单价是 2 倍、且会让上游看到「1h 缓存写占比异常」，收益不值这个代价。
 ///
 /// **key 顺序**：改写要把 body 重新序列化，serde_json 默认的 `Map = BTreeMap` 会把**整个
 /// body**（含 tools/messages/content/cache_control 里每一个对象）的 key 按字母序重排，得到
@@ -774,15 +792,19 @@ fn rewrite_body(
     device_fp: &str,
     flags: store::ForwardFlags,
 ) -> Bytes {
+    // `ttl` 要上游认，前提是 `anthropic-beta` 里有 `extended-cache-ttl-2025-04-11`，而那串
+    // 是 `merge_beta` 补的（API-key 模式的客户端自己不发，cap/raw/00002 证实）。两个开关必须
+    // 同时开，否则就是「body 里写了 1h、头上没声明」的自相矛盾。
+    let shape = flags.system_shape && flags.merge_beta;
     // 三项全关：连解析都不必做，原样返回。
-    if !flags.cache_scope_global && !flags.spoof_identity && !flags.billing_cch {
+    if !shape && !flags.spoof_identity && !flags.billing_cch {
         return body.clone();
     }
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
-    let global_idx = flags.cache_scope_global.then(|| mark_largest_system_global(&mut v)).flatten();
+    let shaped = shape && align_system_shape(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
@@ -790,14 +812,14 @@ fn rewrite_body(
     );
     let spoofed = flags.spoof_identity && spoof_identity(&mut v, cred, device_fp);
     tracing::debug!(
-        scope_global_at = global_idx.map(|i| i as i64).unwrap_or(-1),
+        shaped,
         spoofed,
         cch_added,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if global_idx.is_none() && !spoofed && !cch_added {
+    if !shaped && !spoofed && !cch_added {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
@@ -945,28 +967,104 @@ fn cch_value() -> &'static str {
     config::BILLING_CCH
 }
 
-/// 给 `system` 数组里「带 cache_control 且 text 最长」的块补 `scope: "global"`。
-/// 对应订阅客户端把体积最大的静态系统提示词标为全局缓存的做法。
-/// 返回被标记的块下标；无可标记或已是 global 时返回 `None`。
-fn mark_largest_system_global(v: &mut serde_json::Value) -> Option<usize> {
-    let sys = v.get_mut("system").and_then(|s| s.as_array_mut())?;
-    let mut best: Option<(usize, usize)> = None; // (下标, text 长度)
-    for (i, blk) in sys.iter().enumerate() {
-        if blk.get("cache_control").is_none() {
-            continue;
-        }
-        let len = blk.get("text").and_then(|t| t.as_str()).map(str::len).unwrap_or(0);
-        if best.map_or(true, |(_, bl)| len > bl) {
-            best = Some((i, len));
-        }
+/// 把 API-key 模式的 3 块 `system` 改写成订阅模式的 4 块，并把全部缓存断点对齐到官方形态。
+///
+/// 两种形态的差别只有「切法」，文本本身逐字节相同（`cap/raw` 那对同机同版本抓包验证过）：
+///
+/// ```text
+/// 官方直连(00006)                     API-key 模式(00002)
+/// [0] billing header      无断点      [0] billing header      无断点
+/// [1] 身份句 57B          无断点      [1] 身份句 57B          {ephemeral}   ← 多余断点
+/// [2] 基座 1210B  {type,ttl:1h,scope:global}
+/// [3] 其余        {type,ttl:1h}       [2] 基座‖"\n\n"‖其余    {ephemeral}
+/// ```
+///
+/// 故改写是四件事，缺一都会得到真实客户端不产生的中间态，因此**同受一个开关控制**：
+/// 1. 在 [`config::CC_SYSTEM_BASE_ANCHOR`] 前的 `\n\n` 处把合并块切成基座 + 其余；
+/// 2. 基座标 `{type:ephemeral, ttl:1h, scope:global}`，其余标 `{type:ephemeral, ttl:1h}`；
+/// 3. 去掉身份句上那个断点——它的缓存前缀只有 127 字节（约 35 token），远低于最小可缓存长度，
+///    本就是空转，官方也不发；
+/// 4. body 里剩下的 ephemeral 断点（尾部那条 role=system 的消息等）补 `ttl:1h`，官方 3/3 全带。
+///
+/// **`scope:global` 只标基座**。之前是「标 text 最长的那块」，在三块形态下必然选中合并块，
+/// 而合并块含 `# Environment` 的 cwd/git、技能清单这些本机内容——跨账号不可能撞上，标了换不来
+/// 复用，还发出 `{type,scope}`（global 却无 ttl）这种官方不产生的组合。拆开之后基座是纯静态的，
+/// 全网同一份，这个标记才真正有意义。
+///
+/// **代价**：1h 缓存写单价是 5m 的 2 倍。这是形态对齐的一部分（官方就是全 1h），不是优化。
+///
+/// 保守起见只处理「确实是 API-key 三块形态」：`system` 长度不为 3、锚点匹配不到、或锚点前不是
+/// `\n\n`，一律不动结构返回 `false`。客户端本来就是 4 块（订阅形态）时同样不动。
+fn align_system_shape(v: &mut serde_json::Value) -> bool {
+    let sys = match v.get_mut("system").and_then(|s| s.as_array_mut()) {
+        Some(s) if s.len() == 3 => s,
+        _ => return false,
+    };
+    // 合并块必须本来就是个带断点的文本块，否则不是我们认识的形态。
+    if sys[2].get("cache_control").is_none() {
+        return false;
     }
-    let (idx, _) = best?;
-    let cc = sys[idx].get_mut("cache_control").and_then(|c| c.as_object_mut())?;
-    if cc.get("scope").and_then(|s| s.as_str()) == Some("global") {
-        return None;
+    let text = match sys[2].get("text").and_then(|t| t.as_str()) {
+        Some(t) => t.to_string(),
+        None => return false,
+    };
+    // 逐个模型族的锚点找，取**最早**命中的那个：基座是前缀，切得越靠前越不会把基座切碎。
+    // 锚点前必须紧跟 `\n\n`——那两个字节是两块的分隔符，切开后两边都不保留它。
+    // 用字节比较：`find` 给的是字节偏移，`p - 2` 未必落在字符边界上，直接切片会 panic。
+    let at = config::CC_SYSTEM_BASE_ANCHORS
+        .iter()
+        .filter_map(|anchor| text.find(anchor))
+        .filter(|&p| p >= 2 && &text.as_bytes()[p - 2..p] == b"\n\n")
+        .min();
+    let Some(at) = at else { return false };
+
+    if let Some(obj) = sys[1].as_object_mut() {
+        obj.remove("cache_control");
     }
-    cc.insert("scope".into(), serde_json::Value::String("global".into()));
-    Some(idx)
+    sys[2] = text_block(&text[..at - 2], cache_control(true));
+    sys.push(text_block(&text[at..], cache_control(false)));
+    fill_cache_ttl(v);
+    true
+}
+
+/// 构造一个 `system` 文本块，key 序与官方一致：`type` → `text` → `cache_control`。
+fn text_block(text: &str, cache_control: serde_json::Value) -> serde_json::Value {
+    let mut blk = serde_json::Map::new();
+    blk.insert("type".into(), "text".into());
+    blk.insert("text".into(), text.into());
+    blk.insert("cache_control".into(), cache_control);
+    serde_json::Value::Object(blk)
+}
+
+/// 构造 `cache_control`，key 序与官方一致：`type` → `ttl` → `scope`。
+fn cache_control(global: bool) -> serde_json::Value {
+    let mut cc = serde_json::Map::new();
+    cc.insert("type".into(), "ephemeral".into());
+    cc.insert("ttl".into(), config::CC_CACHE_TTL.into());
+    if global {
+        cc.insert("scope".into(), "global".into());
+    }
+    serde_json::Value::Object(cc)
+}
+
+/// 递归给 body 里所有 `cache_control: {"type":"ephemeral"}` 补上 `ttl`（已有则不动）。
+/// 追加在 `type` 之后，得到官方的 `{"type":"ephemeral","ttl":"1h"}` 键序。
+fn fill_cache_ttl(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(cc) = map.get_mut("cache_control").and_then(|c| c.as_object_mut())
+                && cc.get("type").and_then(|t| t.as_str()) == Some("ephemeral")
+                && !cc.contains_key("ttl")
+            {
+                cc.insert("ttl".into(), config::CC_CACHE_TTL.into());
+            }
+            for (_, child) in map.iter_mut() {
+                fill_cache_ttl(child);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(fill_cache_ttl),
+        _ => {}
+    }
 }
 
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
@@ -1089,40 +1187,94 @@ mod tests {
         store::ForwardFlags::default()
     }
 
-    /// API-key 模式的 CC 实际发出的 beta 串（抓包 041，经 luban 转发那一条）。
-    const CLIENT_BETA: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
-        redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
-        prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24";
+    /// 三个模型族的 `anthropic-beta`，逐字取自 `cap/raw` 的原始报文头
+    /// （claude-cli/2.1.220，每对都是同机、经 luban 与直连相隔几十秒）：
+    /// `(模型, 客户端自己发的, 官方订阅客户端发的)`。
+    ///
+    /// haiku 那对是关键反例：它的客户端把 `claude-code-20250219` 排在**队尾**、`oauth` 在
+    /// 队首，与 opus/sonnet 正好相反，任何单一顺序表都同时对不上两边。
+    const BETA_PAIRS: &[(&str, &str, &str)] = &[
+        (
+            "opus-5 (00002/00006)",
+            "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01",
+            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01,\
+             extended-cache-ttl-2025-04-11",
+        ),
+        (
+            "sonnet-5 (00012/00009)",
+            "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             effort-2025-11-24",
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,\
+             effort-2025-11-24,extended-cache-ttl-2025-04-11",
+        ),
+        (
+            "haiku-4.5 (00026/00031)",
+            "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,claude-code-20250219",
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,claude-code-20250219,\
+             advanced-tool-use-2025-11-20,extended-cache-ttl-2025-04-11",
+        ),
+    ];
 
-    /// 官方订阅客户端直连 API 时的 beta 串（抓包 040，同一台机器同一版本）。
-    const OFFICIAL_BETA: &str = "claude-code-20250219,oauth-2025-04-20,\
-        interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
-        thinking-token-count-2026-05-13,context-management-2025-06-27,\
-        prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-        advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
-
-    /// 补齐 + 重排后应与官方客户端的 beta 串**逐字节一致**，而不是把缺失项堆在末尾。
+    /// 补齐 + 落位后应与官方客户端的 beta 串**逐字节一致**，三个模型族都要过。
     #[test]
     fn merged_beta_matches_official_order() {
-        let v = HeaderValue::from_static(CLIENT_BETA);
-        assert_eq!(merge_beta(Some(&v)), OFFICIAL_BETA);
+        for (model, client, official) in BETA_PAIRS {
+            let v = HeaderValue::from_str(client).unwrap();
+            assert_eq!(&merge_beta(Some(&v)), official, "{model} 的 beta 串没对齐");
+        }
     }
 
-    /// 表外的未知 beta 保留在末尾，不因排序被丢弃或插到中间。
+    /// 客户端自有的那串**一字不动**：这是三对抓包里唯一稳定的不变量，重排它就等于自造判据。
     #[test]
-    fn merged_beta_keeps_unknown_betas_last() {
-        let raw = format!("{CLIENT_BETA},some-future-beta-2027-01-01");
-        let v = HeaderValue::from_str(&raw).unwrap();
+    fn merged_beta_preserves_client_order() {
+        for (model, client, _) in BETA_PAIRS {
+            let v = HeaderValue::from_str(client).unwrap();
+            let out = merge_beta(Some(&v));
+            let kept: Vec<&str> =
+                out.split(',').filter(|b| client.split(',').any(|c| c.trim() == *b)).collect();
+            let sent: Vec<&str> = client.split(',').map(str::trim).collect();
+            assert_eq!(kept, sent, "{model} 的客户端自有串被重排了: {out}");
+        }
+    }
+
+    /// 未知 beta 不被丢弃，也不被挪位——它在客户端串里什么位置就还在什么位置。
+    #[test]
+    fn merged_beta_keeps_unknown_betas_in_place() {
+        let (_, client, official) = BETA_PAIRS[1];
+        let v = HeaderValue::from_str(&format!("{client},some-future-beta-2027-01-01")).unwrap();
         let out = merge_beta(Some(&v));
-        assert_eq!(out, format!("{OFFICIAL_BETA},some-future-beta-2027-01-01"));
+        // 客户端把它放在自有串末尾，官方串里它就该在 effort 之后、extended-cache-ttl 之前。
+        assert_eq!(
+            out,
+            official.replace(
+                ",extended-cache-ttl-2025-04-11",
+                ",some-future-beta-2027-01-01,extended-cache-ttl-2025-04-11"
+            )
+        );
     }
 
-    /// 无来访 beta 时也要输出官方位次（oauth 在最前档、extended-cache-ttl 最后）。
+    /// 无来访 beta 是退化情形（真实客户端必带），仍要给出确定输出：四个注入项按落位规则排。
     #[test]
-    fn merged_beta_from_empty_is_ordered() {
+    fn merged_beta_from_empty_is_deterministic() {
         assert_eq!(
             merge_beta(None),
-            "oauth-2025-04-20,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,\
+            "oauth-2025-04-20,advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,\
              extended-cache-ttl-2025-04-11"
         );
     }
@@ -1205,7 +1357,7 @@ mod tests {
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
-            cache_scope_global: false,
+            system_shape: false,
             orig_header_case: false,
         };
         let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags);
@@ -1438,12 +1590,15 @@ mod tests {
             .collect()
     }
 
-    /// 线上字节的看门狗：头名的**拼写与顺序**都要与官方客户端一致（抓包 040）。
+    /// 线上字节的看门狗：头名的**拼写与顺序**都要与官方客户端一致
+    /// （基准是 `cap/raw/00006` 的原始报文头，claude-cli/2.1.220 直连）。
     ///
     /// 这条同时钉住三件事，任一退化都会失败：
     /// 1. 分裂大小写——标准头首字母大写、`anthropic-*`/`x-app`/`x-client-request-id` 全小写、
     ///    `X-Stainless-OS` 的 `OS` 全大写（机械 title-case 会写成 `X-Stainless-Os`）。
-    /// 2. `Content-Length`/`Host`/`User-Agent` 落在官方位置，而不是被追加到队尾。
+    /// 2. `User-Agent` 落在 `Content-Type` 与 `X-Claude-Code-Session-Id` 之间，而
+    ///    `Connection`/`Host`/`Accept-Encoding`/`Content-Length` 是队尾四个——这是官方线序，
+    ///    不是字母序（曾照 `cap/040.json` 的字母序排过，那是抓包工具重排的产物）。
     /// 3. 显式的 `Connection: keep-alive` 确实发出（客户端库默认认为 HTTP/1.1 隐含、不发）。
     #[tokio::test]
     async fn wire_bytes_match_official_header_form() {
@@ -1452,13 +1607,9 @@ mod tests {
             wire_names(&raw),
             &[
                 "Accept",
-                "Accept-Encoding",
                 "Authorization",
-                "Connection",
-                "Content-Length", // 客户端库自己追加，靠 CC_HEADER_ORDER 归位
                 "Content-Type",
-                "Host",       // 同上
-                "User-Agent", // 同上（来访没带，由 upstream_client 兜底）
+                "User-Agent", // 来访没带，由 upstream_client 兜底，靠 CC_HEADER_ORDER 归位
                 "X-Claude-Code-Session-Id",
                 "X-Stainless-Arch",
                 "X-Stainless-OS",
@@ -1467,6 +1618,11 @@ mod tests {
                 "anthropic-version",
                 "x-app",
                 "x-client-request-id",
+                // 队尾四个：客户端库自己追加的那些，官方也在这个位置。
+                "Connection",
+                "Host",
+                "Accept-Encoding",
+                "Content-Length",
             ],
             "线上头名的拼写或顺序与官方形态不符:\n{raw}"
         );
@@ -1534,22 +1690,125 @@ mod tests {
         }
     }
 
-    /// 转发时**不得**改写缓存 TTL：客户端声明 5m（不带 ttl）就按原样发。
-    /// 曾无条件升成 1h，代价是 2 倍缓存写单价 + 上游可见的「1h 写占比异常」，已去掉。
+    /// API-key 模式客户端的三块 `system`，形状取自 `cap/raw/00002`（内容缩短）：
+    /// billing header 无断点、身份句带 5m 断点、合并块 = 基座 ‖ `\n\n` ‖ 锚点开头的其余部分。
+    /// 尾部那条 role=system 的消息也带一个 5m 断点，和真实客户端一样。
+    const API_SHAPE_BODY: &str = concat!(
+        r#"{"model":"claude-opus-5","messages":[{"role":"system","content":[{"type":"text","#,
+        r#""text":"deferred tools","cache_control":{"type":"ephemeral"}}]}],"#,
+        r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},"#,
+        r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","#,
+        r#""cache_control":{"type":"ephemeral"}},"#,
+        r#"{"type":"text","text":"\nBASE — 基座\n\nWrite code that reads like the surrounding "#,
+        r#"code: match its comment density, naming, and idiom.\n\nREST","#,
+        r#""cache_control":{"type":"ephemeral"}}],"#,
+        r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"}}"#
+    );
+
+    /// 三块改写成官方的四块，且逐字段与 `cap/raw/00006` 的形态一致：
+    /// 身份句不再带断点、基座 `{type,ttl:1h,scope:global}`、其余 `{type,ttl:1h}`，
+    /// 消息里的断点也补上 `ttl`。切开处那个 `\n\n` 两边都不保留。
     #[test]
-    fn does_not_rewrite_cache_ttl() {
-        let raw = Bytes::from(
-            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},
-                          {"type":"text","text":"big","cache_control":{"type":"ephemeral"}}],
-                "messages":[{"role":"user","content":[{"type":"text","text":"hi",
-                          "cache_control":{"type":"ephemeral"}}]}]}"#,
+    fn aligns_system_to_official_four_blocks() {
+        let out = super::rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", all_on());
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "应拆成四块: {s}");
+        assert!(sys[0].get("cache_control").is_none(), "billing header 不该有断点: {s}");
+        assert!(sys[1].get("cache_control").is_none(), "身份句上的断点应去掉: {s}");
+        assert_eq!(sys[2]["text"], serde_json::json!("\nBASE — 基座"), "基座切错: {s}");
+        assert!(
+            sys[3]["text"].as_str().unwrap().starts_with("Write code that reads like"),
+            "其余部分应从锚点开始: {s}"
         );
+        assert!(sys[3]["text"].as_str().unwrap().ends_with("\n\nREST"), "其余部分被截断: {s}");
+
+        // 键序也要对：type → text → cache_control，cache_control 内 type → ttl → scope。
+        assert!(
+            s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}"#),
+            "基座的 cache_control 形态不对: {s}"
+        );
+        assert_eq!(
+            s.matches(r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#).count(),
+            2,
+            "其余块与消息断点都应是 1h: {s}"
+        );
+        assert!(!s.contains(r#"{"type":"ephemeral"}"#), "还有没补 ttl 的断点: {s}");
+    }
+
+    /// 一份 body 里可能**同时**含多条锚点，此时必须切在最早的那个上。
+    ///
+    /// 实例是 fable-5（`cap/raw/00035` 直连 ↔ `00037` 经 luban）：它自己的锚点
+    /// `# Communicating with the user` 在合并块偏移 1212，而 opus 那句
+    /// `Write code that reads like…` 也在正文里、偏移 3284。按表序先到先得会切在 3282，
+    /// 基座凭空多出 2072 字节；取最早命中才得到官方那 1210B 的基座。
+    #[test]
+    fn splits_at_earliest_anchor_when_several_match() {
+        let raw = Bytes::from(API_SHAPE_BODY.replace(
+            r#"\nBASE — 基座\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
+            r#"\nBASE — 基座\n\n# Communicating with the user\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
+        ));
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "应拆成四块: {v}");
+        assert_eq!(sys[2]["text"], serde_json::json!("\nBASE — 基座"), "该切在最早的锚点上: {v}");
+        assert!(
+            sys[3]["text"].as_str().unwrap().starts_with("# Communicating with the user"),
+            "其余部分应从最早那个锚点开始: {v}"
+        );
+    }
+
+    /// 锚点是**按模型族**的：sonnet-5 的基座后面跟的不是 opus 那句，而是 `# Text output …`
+    /// （`cap/raw/00009` 直连 10676B 基座 ↔ `00012` 经 luban 合并块偏移 10678）。
+    /// haiku-4.5 与 sonnet-5 共用基座，命中的也是这一条。
+    #[test]
+    fn aligns_sonnet_shape_by_its_own_anchor() {
+        let raw = Bytes::from(API_SHAPE_BODY.replace(
+            "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
+            "# Text output (does not apply to tool calls)",
+        ));
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "sonnet 锚点应能切块: {v}");
+        assert_eq!(sys[2]["text"], serde_json::json!("\nBASE — 基座"), "基座切错: {v}");
+        assert!(
+            sys[3]["text"].as_str().unwrap().starts_with("# Text output"),
+            "其余部分应从 sonnet 锚点开始: {v}"
+        );
+    }
+
+    /// 锚点匹配不到（未知模型族/新版本改了措辞）时**不动结构**，退回三块原样转发——
+    /// 宁可不拆，也不切在错误的位置上。其余两项改写照常。
+    #[test]
+    fn leaves_system_alone_when_anchor_missing() {
+        let raw = Bytes::from(API_SHAPE_BODY.replace("Write code that reads like", "改了措辞的"));
         let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
         let s = String::from_utf8(out.to_vec()).unwrap();
-        assert!(!s.contains("\"ttl\""), "不应注入 ttl: {s}");
-        // 同时确认另外两项改写仍生效（否则这个测试会因为整体没改写而空过）。
-        assert!(s.contains("cch=00000"), "应补 cch: {s}");
-        assert!(s.contains("\"scope\":\"global\""), "应标 scope: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(v["system"].as_array().unwrap().len(), 3, "不该拆块: {s}");
+        assert!(!s.contains("\"ttl\""), "不拆块时不应注入 ttl: {s}");
+        assert!(!s.contains("\"scope\""), "不拆块时不应标 scope: {s}");
+        assert!(s.contains("cch=00000"), "其余改写仍应生效: {s}");
+    }
+
+    /// 客户端本来就是订阅形态（四块）时不动 `system`——它已经是目标形态了。
+    #[test]
+    fn leaves_official_four_block_shape_alone() {
+        let raw = Bytes::from(
+            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli; cch=0848d;"},
+                          {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                          {"type":"text","text":"base","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}},
+                          {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
+        );
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        assert_eq!(out, raw, "四块形态应原样返回");
     }
 
     /// 三项 body 改写全关 = **逐字节原样透传**：不重新序列化，故连缩进、换行、转义写法
@@ -1557,18 +1816,13 @@ mod tests {
     #[test]
     fn body_flags_off_passes_through_byte_for_byte() {
         // 刻意带上多余空白与换行：一旦走了 serde 往返，这些都会被抹平。
-        let raw = Bytes::from(
-            r#"{ "model" : "claude-sonnet-5",
-   "metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},
-   "system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},
-             {"type":"text","text":"big","cache_control":{"type":"ephemeral"}}]}"#,
-        );
+        let raw = Bytes::from(format!(" {}\n", API_SHAPE_BODY));
         let flags = store::ForwardFlags {
             spoof_identity: false,
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
-            cache_scope_global: false,
+            system_shape: false,
             orig_header_case: false,
         };
         let out = super::rewrite_body(&raw, &test_cred(), "fp", flags);
@@ -1579,14 +1833,19 @@ mod tests {
         let s = String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", only_cch).to_vec())
             .unwrap();
         assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
-        assert!(!s.contains(r#""scope":"global""#), "cache_scope_global 关着不应标 scope: {s}");
+        assert!(!s.contains(r#""ttl""#), "system_shape 关着不应拆块/上 ttl: {s}");
         assert!(s.contains(r#"\"account_uuid\":\"\""#), "spoof 关着应保留空 uuid: {s}");
 
-        let only_scope = store::ForwardFlags { cache_scope_global: true, ..flags };
+        // system 形态依赖 merge_beta 补的 extended-cache-ttl beta：只开 system_shape 不生效。
+        let shape_only = store::ForwardFlags { system_shape: true, ..flags };
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", shape_only);
+        assert_eq!(out, raw, "merge_beta 关着时不应写出 ttl");
+
+        let with_beta = store::ForwardFlags { merge_beta: true, ..shape_only };
         let s =
-            String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", only_scope).to_vec())
+            String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", with_beta).to_vec())
                 .unwrap();
-        assert!(s.contains(r#""scope":"global""#), "只开 scope 时应标 scope: {s}");
+        assert!(s.contains(r#""scope":"global""#), "两个开关都开时应对齐形态: {s}");
         assert!(!s.contains("cch="), "billing_cch 关着不应补 cch: {s}");
     }
 
@@ -1597,36 +1856,43 @@ mod tests {
     /// 一旦该 feature 被摘掉，这里立刻失败。
     #[test]
     fn preserves_key_order() {
-        // 抓包 040/041 的真实字段次序：model 在 max_tokens 前、system 块是 type→text、
-        // metadata.user_id 内层是 device_id→account_uuid→session_id。字母序全都不是这样。
+        // 客户端的真实字段次序，取自 cap/raw/00002 的原始报文体：顶层是
+        // model→messages→system→tools→metadata→max_tokens→…→stream，system 块是 type→text，
+        // cache_control 是 type→ttl→scope，metadata.user_id 内层是
+        // device_id→account_uuid→session_id。字母序全都不是这样。
+        //
+        // （cap/*.json 里看到的字母序是抓包工具重新序列化的产物，不是线上的样子。）
         let raw = concat!(
-            r#"{"model":"claude-sonnet-5","max_tokens":64000,"#,
-            r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
+            r#"{"model":"claude-opus-5","messages":[],"#,
             r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"},"#,
-            r#"{"type":"text","text":"big","cache_control":{"type":"ephemeral"}}],"#,
-            r#""stream":true,"tools":[]}"#
+            r#"{"type":"text","text":"ident","cache_control":{"type":"ephemeral"}},"#,
+            r#"{"type":"text","text":"base\n\nWrite code that reads like the surrounding code: "#,
+            r#"match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral"}}],"#,
+            r#""tools":[],"#,
+            r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
+            r#""max_tokens":64000,"stream":true}"#
         );
         let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on());
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
         assert!(s.contains("cch=00000"), "应补 cch: {s}");
-        assert!(s.contains(r#""scope":"global""#), "应标 scope: {s}");
+        assert!(s.contains(r#""scope":"global""#), "应对齐 system 形态: {s}");
         assert!(s.contains(&format!(r#"\"account_uuid\":\"{}\""#, ACCOUNT_UUID)), "应填 uuid: {s}");
 
-        // 顶层顺序不变，未被字母序重排（重排后 max_tokens 会跑到 model 前）。
+        // 顶层顺序不变，未被字母序重排（重排后 max_tokens/messages 会跑到 model 前）。
         let mut at = 0;
-        for k in ["model", "max_tokens", "metadata", "system", "stream", "tools"] {
+        for k in ["model", "messages", "system", "tools", "metadata", "max_tokens", "stream"] {
             let needle = format!("\"{k}\":");
             let pos = s[at..].find(&needle).unwrap_or_else(|| panic!("顶层 key {k} 顺序错乱: {s}"));
             at += pos + needle.len();
         }
 
         // 嵌套对象同样不重排：system 块是 type→text（字母序会变成 text→type），
-        // cache_control 新增的 scope 追加在 type 之后。
-        assert!(s.contains(r#"{"type":"text","text":"big""#), "system 块 key 被重排: {s}");
+        // 拆块后新建的两块也按这个键序写回，cache_control 内是 type→ttl→scope。
+        assert!(s.contains(r#"{"type":"text","text":"base""#), "system 块 key 被重排: {s}");
         assert!(
-            s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#),
+            s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}"#),
             "cache_control key 被重排: {s}"
         );
 

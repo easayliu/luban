@@ -492,13 +492,15 @@ impl CredentialStore {
 
     /// 一次读齐全部转发形态开关（[`ForwardFlags`]）。
     ///
-    /// **一条 SQL**：这几个开关每个转发请求都要读，逐个 [`Self::get_setting`] 就是每请求 5 次
+    /// **一条 SQL**：这几个开关每个转发请求都要读，逐个 [`Self::get_setting`] 就是每请求 6 次
     /// 查询。任何读不出来的键都退回默认值（= 开启），故连表都没有时也不会挡住转发。
+    ///
+    /// [`SYSTEM_SHAPE`] 缺省时沿用旧键 [`CACHE_SCOPE_GLOBAL`]（新键存在则以新键为准）。
     pub fn forward_flags(&self) -> ForwardFlags {
         let mut flags = ForwardFlags::default();
         let conn = self.conn.lock();
-        let Ok(mut stmt) =
-            conn.prepare("SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6)")
+        let Ok(mut stmt) = conn
+            .prepare("SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
         else {
             return flags;
         };
@@ -508,12 +510,15 @@ impl CredentialStore {
                 SPOOF_BILLING_CCH,
                 FILL_CLIENT_HEADERS,
                 MERGE_BETA,
+                SYSTEM_SHAPE,
                 CACHE_SCOPE_GLOBAL,
                 ORIG_HEADER_CASE,
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         );
         let Ok(rows) = rows else { return flags };
+        // 新旧两个键各自记下来再决断：SQL 不保证行序，边读边覆盖会让结果取决于行顺序。
+        let (mut new_key, mut legacy_key) = (None, None);
         for (key, value) in rows.flatten() {
             let on = setting_is_on(&value);
             match key.as_str() {
@@ -521,10 +526,14 @@ impl CredentialStore {
                 SPOOF_BILLING_CCH => flags.billing_cch = on,
                 FILL_CLIENT_HEADERS => flags.fill_client_headers = on,
                 MERGE_BETA => flags.merge_beta = on,
-                CACHE_SCOPE_GLOBAL => flags.cache_scope_global = on,
+                SYSTEM_SHAPE => new_key = Some(on),
+                CACHE_SCOPE_GLOBAL => legacy_key = Some(on),
                 ORIG_HEADER_CASE => flags.orig_header_case = on,
                 _ => {}
             }
+        }
+        if let Some(on) = new_key.or(legacy_key) {
+            flags.system_shape = on;
         }
         flags
     }
@@ -570,7 +579,13 @@ pub const FILL_CLIENT_HEADERS: &str = "fill_client_headers";
 /// 是否合并/重排 `anthropic-beta` 并塞入 `oauth-2025-04-20`；关闭则原样转发客户端那串。
 pub const MERGE_BETA: &str = "merge_beta";
 
-/// 是否给最大的静态 system 块标 `cache_control.scope = "global"`。
+/// 是否把 `system` 改写成官方订阅客户端的 4 块形态（拆块 + 断点全上 `ttl:1h` +
+/// 基座标 `scope:"global"`）。
+pub const SYSTEM_SHAPE: &str = "system_shape";
+
+/// [`SYSTEM_SHAPE`] 的旧键名。那时它只做「给最长的 system 块标 `scope:"global"`」，
+/// 现在做整套形态对齐。旧库里若把它关过，语义上就是「别动 system」，故在新键缺省时沿用它，
+/// 免得升级后凭空替这些人打开一项会涨价的改写（1h 缓存写单价是 5m 的 2 倍）。
 pub const CACHE_SCOPE_GLOBAL: &str = "cache_scope_global";
 
 /// 是否按官方拼写与顺序发出头名（`wreq` 的 `OrigHeaderMap`）；关闭则退回全小写 + 队尾追加。
@@ -591,8 +606,8 @@ pub struct ForwardFlags {
     pub fill_client_headers: bool,
     /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
     pub merge_beta: bool,
-    /// 给最大的静态 system 块标 `scope: "global"`（跨会话缓存复用）。
-    pub cache_scope_global: bool,
+    /// 把 `system` 对齐成官方订阅客户端的 4 块形态（见 [`crate::proxy::align_system_shape`]）。
+    pub system_shape: bool,
     /// 按官方拼写与顺序发出头名（见 [`crate::config::CC_HEADER_ORDER`]）。
     pub orig_header_case: bool,
 }
@@ -604,7 +619,7 @@ impl Default for ForwardFlags {
             billing_cch: true,
             fill_client_headers: true,
             merge_beta: true,
-            cache_scope_global: true,
+            system_shape: true,
             orig_header_case: true,
         }
     }
@@ -2013,15 +2028,15 @@ mod tests {
 
         assert_eq!(store.forward_flags(), ForwardFlags::default(), "空库应等于默认值");
         assert!(ForwardFlags::default().spoof_identity, "默认必须是开");
-        assert!(ForwardFlags::default().cache_scope_global);
+        assert!(ForwardFlags::default().system_shape);
 
-        // 五个键各用一种「关」的写法，确认逐项独立且解析口径一致。
+        // 六个键各用一种「关」的写法，确认逐项独立且解析口径一致。
         for (key, off) in [
             (SPOOF_IDENTITY_ENABLED, "0"),
             (SPOOF_BILLING_CCH, "false"),
             (FILL_CLIENT_HEADERS, " FALSE "),
             (MERGE_BETA, "False"),
-            (CACHE_SCOPE_GLOBAL, "0"),
+            (SYSTEM_SHAPE, "0"),
             (ORIG_HEADER_CASE, "0"),
         ] {
             store.set_setting(key, off).unwrap();
@@ -2034,7 +2049,7 @@ mod tests {
                 billing_cch: false,
                 fill_client_headers: false,
                 merge_beta: false,
-                cache_scope_global: false,
+                system_shape: false,
                 orig_header_case: false,
             }
         );

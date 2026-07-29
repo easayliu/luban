@@ -584,8 +584,8 @@ struct ForwardingResp {
     fill_client_headers: bool,
     /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
     merge_beta: bool,
-    /// 给最大的静态 system 块标 `scope: "global"`。
-    cache_scope_global: bool,
+    /// 把 `system` 对齐成官方订阅客户端的 4 块形态（拆块 + 全 1h + 基座 global）。
+    system_shape: bool,
     /// 按官方拼写与顺序发出头名。
     orig_header_case: bool,
 }
@@ -597,7 +597,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             billing_cch: f.billing_cch,
             fill_client_headers: f.fill_client_headers,
             merge_beta: f.merge_beta,
-            cache_scope_global: f.cache_scope_global,
+            system_shape: f.system_shape,
             orig_header_case: f.orig_header_case,
         }
     }
@@ -726,7 +726,7 @@ struct SetForwardingReq {
     billing_cch: Option<bool>,
     fill_client_headers: Option<bool>,
     merge_beta: Option<bool>,
-    cache_scope_global: Option<bool>,
+    system_shape: Option<bool>,
     orig_header_case: Option<bool>,
 }
 
@@ -738,15 +738,15 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        CACHE_SCOPE_GLOBAL, FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, SPOOF_BILLING_CCH,
-        SPOOF_IDENTITY_ENABLED,
+        FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, SPOOF_BILLING_CCH,
+        SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
         (SPOOF_BILLING_CCH, req.billing_cch),
         (FILL_CLIENT_HEADERS, req.fill_client_headers),
         (MERGE_BETA, req.merge_beta),
-        (CACHE_SCOPE_GLOBAL, req.cache_scope_global),
+        (SYSTEM_SHAPE, req.system_shape),
         (ORIG_HEADER_CASE, req.orig_header_case),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {

@@ -24,45 +24,55 @@ pub const SCOPES: &str = "user:profile user:inference user:sessions:claude_code 
 /// 用 OAuth access token 调用 Anthropic API 时必须携带的 beta 头。
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
-/// 转发时确保携带的 beta 组：对齐官方订阅客户端的 `anthropic-beta`。
-/// API 模式的 Claude Code 不会自带这些，缺失会导致缓存 TTL 退化与部分工具能力关闭。
-/// - `oauth-2025-04-20`：OAuth 鉴权必需。
-/// - `extended-cache-ttl-2025-04-11`：官方订阅客户端固定携带。我们**不**改写缓存 TTL
-///   （客户端声明 5m 就按 5m 发），保留它只为让 `anthropic-beta` 与官方客户端逐字节一致。
-/// - `advanced-tool-use-2025-11-20`：对齐订阅端工具能力。
-/// - `prompt-caching-scope-2026-01-05`：允许 `cache_control.scope: "global"`（body 改写依赖）。
-pub const INJECT_BETAS: &[&str] = &[
-    OAUTH_BETA_HEADER,
-    "extended-cache-ttl-2025-04-11",
-    "advanced-tool-use-2025-11-20",
-    "prompt-caching-scope-2026-01-05",
-];
-
-/// 官方订阅客户端 `anthropic-beta` 的**排列顺序**（抓包 claude-cli/2.1.218 直连 API 得到，
-/// 两次抓包顺序一致，仅 `context-1m` 视会话有无）。
+/// **没有一张全局 beta 顺序表**——这一点是 haiku 那对抓包（`cap/raw/00026` 经 luban ↔
+/// `00031` 直连）证伪出来的，记在这里免得再走一遍回头路。
 ///
-/// 只补齐 [`INJECT_BETAS`] 会把缺失项追加到末尾，得到 `…,effort,oauth,extended-cache-ttl,
-/// advanced-tool-use` 这种官方客户端不会产生的排列——集合对了顺序错，一次精确匹配即可判定
-/// 中间有代理。故转发前按本表重排；表外的未知 beta 保持相对顺序放在末尾。
-pub const CC_BETA_ORDER: &[&str] = &[
-    "claude-code-20250219",
-    OAUTH_BETA_HEADER,
-    "context-1m-2025-08-07",
-    "interleaved-thinking-2025-05-14",
-    "redact-thinking-2026-02-12",
-    "thinking-token-count-2026-05-13",
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",
-    "mid-conversation-system-2026-04-07",
-    "advanced-tool-use-2025-11-20",
-    "effort-2025-11-24",
-    "extended-cache-ttl-2025-04-11",
-];
+/// 三个模型族的客户端自有串（去掉注入项后）：
+///
+/// | 模型 | 客户端自己发的顺序 |
+/// |---|---|
+/// | opus-5   | `claude-code, context-1m, interleaved, redact, ttc, cm, pcs, mid-conv, effort, fallback-credit` |
+/// | sonnet-5 | `claude-code, interleaved, redact, ttc, cm, pcs, mid-conv, effort` |
+/// | haiku-4.5 | `interleaved, redact, ttc, cm, pcs, claude-code` ← `claude-code` 跑到了队尾 |
+///
+/// opus/sonnet 里 `claude-code` 在最前、`oauth` 紧随其后；haiku 里 `claude-code` 在第 6 位、
+/// `oauth` 反而在最前。**任何单一总序都无法同时满足这两条**（前者要求 claude-code < oauth，
+/// 后者要求 oauth < claude-code），所以原来那张 `CC_BETA_ORDER` 只能碰巧对上 opus/sonnet。
+///
+/// 真正的不变量是：**客户端自有串的相对顺序，在订阅模式里逐字不变**（四对抓包全部满足）。
+/// 故正确做法是不排序、只按经验规则把缺的插进去——注入哪几项、各自落在哪，见
+/// [`crate::proxy::merge_beta`]，那里是唯一的真源，别再另起一张表。
+pub mod cc_beta_order_is_not_a_table {}
+
+/// `claude-code-20250219`：[`OAUTH_BETA_HEADER`] 的落位参照物。
+pub const CC_BETA_CLAUDE_CODE: &str = "claude-code-20250219";
+
+/// `effort-2025-11-24`：[`CC_BETA_ADVANCED_TOOL_USE`] 的落位参照物（haiku 不发这一项）。
+pub const CC_BETA_EFFORT: &str = "effort-2025-11-24";
+
+/// `advanced-tool-use-2025-11-20`：对齐订阅端工具能力。
+/// 官方排在 [`CC_BETA_EFFORT`] 之前；没有 effort 时排在客户端自有串之后。
+pub const CC_BETA_ADVANCED_TOOL_USE: &str = "advanced-tool-use-2025-11-20";
+
+/// `extended-cache-ttl-2025-04-11`：官方四份直连抓包里都是**最后一项**。
+///
+/// 它同时是 `cache_control.ttl` 的准入条件——[`crate::proxy::align_system_shape`] 会把断点全
+/// 改成 `ttl:1h`，没有这个 beta 那些 ttl 就是无源之水，故 system 形态对齐依赖 `merge_beta`
+/// 一起开着（耦合点在 [`crate::proxy::rewrite_body`]）。
+pub const CC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
+
+/// `prompt-caching-scope-2026-01-05`：`cache_control.scope: "global"` 的准入条件，
+/// [`crate::proxy::align_system_shape`] 给基座标 global 时依赖它。
+/// 四份 raw 抓包里客户端自己都带，实际很少真的需要补。
+pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
 
 /// 官方客户端的 `User-Agent`。用于 luban 自身发起的账号级请求（token 刷新、profile），
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.218 (external, cli)";
+///
+/// 取最近一次抓到的官方版本（cap/raw 是 2.1.220）。落后不致命——真实用户升级也有先后——
+/// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.220 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -91,26 +101,67 @@ pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 /// 把 [`crate::proxy::cch_value`] 换成从「已在缓存前缀内的内容」派生即可（见该函数注释）。
 pub const BILLING_CCH: &str = "00000";
 
-/// 官方客户端请求头的**拼写与顺序**，逐字节取自抓包 040（HTTPS 隧道内的原始字节，是唯一
-/// 可信的基准；明文到 luban 的那几个 flow 会被 mitmproxy 机械 title-case）。
+/// 官方订阅客户端把系统提示词切成 4 块，第二刀落在**基座结束处**。本表是切点之后那一段的
+/// 开头，用来在 API-key 模式的合并块里定位这一刀——**每个模型族的基座不同，各有各的锚点**。
+///
+/// 全部依据 `cap/raw` 里的原始字节（claude-cli/2.1.220，同机同版本、直连与经 luban 成对）：
+///
+/// | 模型 | 直连 / 经 luban | 官方基座 | 命中的锚点 | 在合并块里的偏移 |
+/// |---|---|---|---|---|
+/// | opus-5    | 00006 / 00002 | 1210B  | `Write code that…` | 1212  |
+/// | sonnet-5  | 00009 / 00012 | 10676B | `# Text output…`   | 10678 |
+/// | haiku-4.5 | 00031 / 00026 | 10676B | `# Text output…`   | 10678 |
+/// | fable-5   | 00035 / 00037 | 1210B  | `# Communicating…` | 1212  |
+///
+/// 四例都满足：合并块 = `基座 ‖ "\n\n" ‖ 其余`，锚点前紧跟 `\n\n`，切开后前缀与官方基座
+/// **逐字节相同**。基座本身按模型族复用：haiku 与 sonnet-5 同一份、fable-5 与 opus-5 同一份。
+///
+/// **别把「锚点互斥」当通例**：opus 与 sonnet 那两句确实互不出现在对方的 body 里，但那只是这
+/// 两个模型族的实情，换个模型就未必。fable-5 就同时含两条——它自己的锚点在偏移 1212，opus 那句
+/// 也在正文里（偏移 3284）。所以取的必须是**最早命中**的那个，绝不能按表序先到先得：那样
+/// fable 会被切在 3282，基座凭空多出 2072 字节。新增模型族时按这个前提校验，别假设互斥。
+///
+/// **认锚点不认长度**：基座长度随模型变（1210B vs 10676B），写死长度必错。锚点本身也会随
+/// CC 版本/模型族漂——一个都匹配不到就不拆（见 [`crate::proxy::align_system_shape`]），
+/// 宁可退回三块原样转发，也不切在错误的位置上。要补新模型族，**只能拿原始字节抓包**，
+/// 别拿 `cap/*.json` 顶（见 [`CC_HEADER_ORDER`] 的教训）。
+pub const CC_SYSTEM_BASE_ANCHORS: &[&str] = &[
+    // opus-4-8 / opus-5
+    "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
+    // sonnet-5 / haiku-4.5
+    "# Text output (does not apply to tool calls)",
+    // fable-5（与 opus-5 共用基座，但其余部分的开头不同）
+    "# Communicating with the user",
+];
+
+/// 官方订阅客户端每个缓存断点都带的 TTL（`cap/raw` 的四对抓包里 3/3 全是 `1h`）。
+///
+/// 写入单价是 5m 的 2 倍。它和 [`CC_SYSTEM_BASE_ANCHORS`] 的拆块是一套的：官方就是「4 块 +
+/// 全 1h」，只拆块不上 1h、或只上 1h 不拆块，都是真实客户端不产生的中间态。
+pub const CC_CACHE_TTL: &str = "1h";
+
+/// 官方客户端请求头的**拼写与顺序**，逐字节取自 `cap/raw/00006`（claude-cli/2.1.220 直连
+/// api.anthropic.com，CONNECT 隧道里的原始报文头）。
+///
+/// **别再拿 `cap/*.json` 当顺序基准**：那些文件的 `headers`/body 都被抓包工具按字母序重排过
+/// （大写头一段、小写头一段，`text` 会排在 `type` 前）。本表最初就是照抄 `cap/040` 的
+/// `headers` 字典，于是拼写抄对了、顺序抄的却是 JSON 的排序结果——`Accept-Encoding`/
+/// `Connection`/`Host`/`Content-Length` 官方全在队尾，被字母序拎到了前段。顺序信息只有
+/// `cap/raw/*.req.raw` 这种原始字节留得住。
 ///
 /// 一张表兼两用，喂给 `wreq` 的 `OrigHeaderMap`：
 /// - **拼写**：注意这不是「全部首字母大写」——`anthropic-*`/`x-app`/`x-client-request-id`
 ///   本来就是全小写（Stainless SDK 自己拼的），而 `X-Stainless-OS` 的 `OS` 是全大写，
 ///   机械 title-case 会写成 `X-Stainless-Os`。所以只能逐头列表，没有规则可套。
-/// - **顺序**：`OrigHeaderMap` 同时决定线上头序，故 `Content-Length`/`Host`/`User-Agent`
-///   （由 HTTP 客户端自己追加、原先只能待在队尾）也列在此处的官方位置上。
+/// - **顺序**：`OrigHeaderMap` 同时决定线上头序，故 `Connection`/`Host`/`Accept-Encoding`/
+///   `Content-Length`（由 HTTP 客户端自己追加）也列在此处的官方位置——恰好也是队尾四个。
 ///
 /// 实测语义（预检验证，见 [`known_fingerprint_gaps`]）：表里有、本次请求没带的头**不会**
 /// 凭空发出；反之表外的头照发，但一律小写并排在所有表内头之后。
 pub const CC_HEADER_ORDER: &[&str] = &[
     "Accept",
-    "Accept-Encoding",
     "Authorization",
-    "Connection",
-    "Content-Length",
     "Content-Type",
-    "Host",
     "User-Agent",
     "X-Claude-Code-Session-Id",
     "X-Stainless-Arch",
@@ -126,6 +177,11 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     "anthropic-version",
     "x-app",
     "x-client-request-id",
+    // 以下四个由 HTTP 客户端自己追加，官方线序里它们在队尾，不是字母序里的位置。
+    "Connection",
+    "Host",
+    "Accept-Encoding",
+    "Content-Length",
 ];
 
 /// **已知无法对齐的形态差异**（记录在案，别再重复排查）。
@@ -156,12 +212,33 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    注意 `native-tls` 不是解法：它按平台分裂（macOS 走 Security.framework、Windows 走
 ///    SChannel、Linux 才是 OpenSSL），而官方客户端三个平台统一是 BoringSSL。
 ///
-/// 4. **`cc_version` 的构建后缀**。抓包显示订阅模式是 `2.1.218.2d7`、API-key 模式是
-///    `2.1.218.0b9`（同机同版本同时段）。这个后缀随鉴权模式变化，luban 原样转发，
-///    等于补了 [`BILLING_CCH`] 却留着另一个更直接的判据。成因未知，待查。
+/// ~~4. `cc_version` 的构建后缀~~ —— **已排除，不是判据**。原记录说它随鉴权模式变化（依据是
+///    040=`2.1.218.2d7` / 041=`2.1.218.0b9`）。后续抓包否掉了这个相关性：cap/raw 的
+///    00002（经 luban）与 00006（直连）同为 `2.1.220.04c`，003/004 那对也同为 `2.1.218.d82`。
+///    后缀确实会变，但与鉴权模式无关，luban 原样转发即可。
 ///
-/// 比对基准只能用**HTTPS CONNECT 隧道**里抓到的 flow（保留原始字节）；明文 HTTP 到 luban
-/// 那几个 flow 的头名会被 mitmproxy 机械 title-case（21 个头无一例外），大小写与顺序都不可信。
+/// 5. **`cch` 是恒定占位值**。官方每次请求都不同（`0848d`、`5cb85`…），luban 固定发
+///    [`BILLING_CCH`]。详见该常量注释——上游一按此聚类就把所有账号串成一串。
+///
+/// ~~6. `system` 块的切分与缓存 TTL~~ —— **已对齐**，见 [`crate::proxy::align_system_shape`]
+///    与 [`CC_SYSTEM_BASE_ANCHORS`]。四个模型族的 raw 抓包逐字节验过。剩余风险只有锚点会随
+///    CC 版本/新模型漂，漂了就退回三块原样转发（不会切错）。
+///
+/// 7. **`fallbacks` 与 `server-side-fallback-2026-06-01`**。fable-5 那对抓包
+///    （`cap/raw/00035` 直连 ↔ `00037` 经 luban）里，直连侧多一个顶层字段
+///    `"fallbacks":[{"model":"claude-opus-5"}]`，`anthropic-beta` 里也多一项
+///    `server-side-fallback-2026-06-01`（排在 `effort` 与 `fallback-credit` 之间）；
+///    经 luban 那侧两者都没有。
+///
+///    **刻意不补**：这不是纯形态差异——`fallbacks` 声明的是「本模型不可用时改用哪个模型」，
+///    补上等于替用户决定被限流时换模型跑，模型换了计价也跟着换。凭空塞一个 beta 却不带对应
+///    字段则是另一种不自洽。只有一对抓包，还分不清它是订阅模式独有还是该会话自己开的，
+///    在拿到「同一客户端两种模式下都发/都不发」的证据之前不动它。
+///
+/// 比对基准只能用**原始字节**——`cap/raw/*.raw` 那种（HTTPS 隧道内的报文，头名大小写、头序、
+/// body 的 key 顺序都留得住）。`cap/*.json` 是抓包工具重新序列化过的：headers 与 body 的 key
+/// 全被按字母序重排，只有数组元素的顺序还作数。[`CC_HEADER_ORDER`] 曾照着它抄，抄出一份
+/// 官方客户端不会产生的头序。
 pub mod known_fingerprint_gaps {}
 
 /// 官方上游 API base（代理转发目标）。

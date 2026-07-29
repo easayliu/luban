@@ -29,7 +29,7 @@ export function ForwardingSettings({
   const enabledCount = data
     ? [
         data.spoof_identity, data.billing_cch, data.fill_client_headers,
-        data.merge_beta, data.cache_scope_global, data.orig_header_case,
+        data.merge_beta, data.system_shape, data.orig_header_case,
       ].filter(Boolean).length
     : 0
   const allOff = data ? enabledCount === 0 : false
@@ -130,13 +130,17 @@ export function ForwardingSettings({
             description="提高静态内容的跨会话复用率。"
           >
             <Toggle
-              k="cache_scope_global"
-              label="全局缓存"
-              summary="为最长的静态 system 块启用 global scope。"
+              k="system_shape"
+              label="system 形态"
+              summary="把 system 拆成官方订阅客户端的四块。"
               desc={
                 <>
-                  添加 <code>cache_control.scope = &quot;global&quot;</code> 以提升跨会话缓存命中率。
-                  关闭可能增加重复计算与费用，仅在追求零改写时使用。
+                  API-key 模式的客户端把系统提示词发成三块，官方订阅客户端发四块：基座单独一块并标
+                  <code>scope = &quot;global&quot;</code>，全部缓存断点都是 <code>ttl = &quot;1h&quot;</code>。
+                  开启后按官方切点拆块并对齐断点，文本本身逐字节不变。
+                  <br />
+                  <strong>会影响费用</strong>：1h 缓存写入单价是 5m 的两倍，换来的是缓存保留一小时、
+                  以及基座那块跨账号复用。认不出切点的模型（锚点未匹配）会原样转发，不会切错。
                 </>
               }
             />

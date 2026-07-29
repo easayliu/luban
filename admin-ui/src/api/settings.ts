@@ -19,8 +19,8 @@ export interface Settings {
   fill_client_headers: boolean
   /** 合并并按官方顺序重排 anthropic-beta（含塞入 oauth-2025-04-20）。 */
   merge_beta: boolean
-  /** 给最大的静态 system 块标 cache_control.scope = "global"。 */
-  cache_scope_global: boolean
+  /** 把 system 对齐成官方订阅客户端的 4 块形态（拆块 + 断点全 1h + 基座 global）。 */
+  system_shape: boolean
   /** 按官方拼写与顺序发出头名（Accept-Encoding 大写、anthropic-beta 小写…）。 */
   orig_header_case: boolean
 }
@@ -31,7 +31,7 @@ export type ForwardingKey =
   | 'billing_cch'
   | 'fill_client_headers'
   | 'merge_beta'
-  | 'cache_scope_global'
+  | 'system_shape'
   | 'orig_header_case'
 
 /** 读取接入设置。 */

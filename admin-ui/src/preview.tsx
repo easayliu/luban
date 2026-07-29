@@ -103,7 +103,7 @@ queryClient.setQueryData(['settings'], {
   billing_cch: true,
   fill_client_headers: true,
   merge_beta: true,
-  cache_scope_global: true,
+  system_shape: true,
   orig_header_case: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
