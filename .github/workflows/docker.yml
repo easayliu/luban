@@ -39,7 +39,16 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.v.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 缓存放 registry 而不是 type=gha：GHA 缓存按 ref 隔离，而本工作流只在 v* tag 上
+          # 触发，于是每个 tag 各写各的 scope、永远读不到上一个 tag 的——实测 v0.2.20 →
+          # v0.2.21 依赖层完整重编、总时长 376s→377s 纹丝不动。GitHub 文档：「Workflow runs
+          # also cannot restore caches created for different tag names.」，且 Docker 文档明确
+          # scope 参数绕不过这条限制。registry 后端没有 ref 限制，tag 之间可互读；目标不存在
+          # 时只是导入失败、构建照常继续，故首次运行不会挂。
+          #
+          # **mode=max 必须保留**：默认的 min 只导出最终阶段的层，而依赖预编译层在 builder
+          # 这个中间阶段里，min 模式下它根本不会进缓存。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
