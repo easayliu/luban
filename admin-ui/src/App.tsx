@@ -71,7 +71,7 @@ const FILTERS: { key: FilterKey; label: string; match: (c: Credential) => boolea
   },
   { key: 'enabled', label: '启用', match: (c) => !c.disabled },
   { key: 'disabled', label: '停用', match: (c) => c.disabled },
-  { key: 'abnormal', label: '异常（封禁/过期）', match: isAbnormal },
+  { key: 'abnormal', label: '异常（已封禁）', match: isAbnormal },
   { key: 'nearLimit', label: '额度将满', match: isNearLimit },
   { key: 'cooldown', label: '冷却中', match: (c) => !c.disabled && c.rate_limited_secs > 0 },
   {
@@ -614,8 +614,8 @@ function App() {
             </Table>
           </div>
         ) : (
-          // 按实际内容宽度排布：每张卡至少 27rem，侧栏出现后也不会把卡片硬挤窄。
-          <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fit,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+          // 每张卡至少 27rem；auto-fill 保留空轨，账号少时也不会把单张卡拉满整块内容区。
+          <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
             {pageItems.map((c) => (
               <CredentialCard
                 key={c.id}

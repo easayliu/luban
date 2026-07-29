@@ -25,6 +25,11 @@ export interface Credential {
   expires_in: number
   /** 过期时刻（Unix 秒）；展示用这个，`expires_in` 只用来判临界态。 */
   expires_at: number
+  /**
+   * access_token 是否已到期。**不代表账号有问题**：刷新是惰性的（下次被调度时才刷），
+   * 闲置久了必然为 true，下一个请求会自动刷好。凭证真正失效（refresh_token 被作废）
+   * 走的是 `ban_reason`。
+   */
   expired: boolean
   created_at: number
   updated_at: number
@@ -214,7 +219,19 @@ export interface ProbeResult {
  * 标为 `probe`，卡片上的额度与累计花费据此更新），也会真的打到上游、消耗一点点订阅额度。
  * 上游拒绝同样是 200 + 一份结果（状态码在 `status` 里），不是 HTTP 错误。
  */
-export async function probeCredential(id: number, model: string): Promise<ProbeResult> {
-  const { data } = await api.post<ProbeResult>(`/credentials/${id}/test`, { model })
+export async function probeCredential(
+  id: number,
+  model: string,
+  signal?: AbortSignal,
+): Promise<ProbeResult> {
+  const { data } = await api.post<ProbeResult>(
+    `/credentials/${id}/test`,
+    { model },
+    {
+      signal,
+      // 后端总探测上限是 30 秒；再留 5 秒给本机与代理传输，避免旧服务或断链让按钮永久 pending。
+      timeout: 35_000,
+    },
+  )
   return data
 }

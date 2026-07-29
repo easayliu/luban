@@ -262,7 +262,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </Table>
             </div>
           ) : (
-            <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fit,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+            <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
               <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
               <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
             </div>

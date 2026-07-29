@@ -774,7 +774,8 @@ function CredentialRowActions({
           <ArrowPathIcon className="absolute left-1/2 top-1/2 size-3.5 -translate-x-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
         )}
       </span>}
-      {showMenu && <DropdownMenu>
+      {/* 菜单项会继续打开 Dialog；让 Dialog 独占 modal 指针锁，关闭后页面才能正常恢复。 */}
+      {showMenu && <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button size="icon" variant="ghost" className="size-8 shrink-0 text-muted-foreground" aria-label={`打开 ${cred.label} 菜单`}>
             <EllipsisHorizontalIcon className="size-4" />

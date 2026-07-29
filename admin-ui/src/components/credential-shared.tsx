@@ -1,5 +1,6 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import axios from 'axios'
 import {
   ArrowPathIcon, TrashIcon, PencilIcon, ChevronUpIcon, ChevronDownIcon,
   DevicePhoneMobileIcon, SignalIcon, CheckCircleIcon, XCircleIcon,
@@ -62,9 +63,17 @@ export function isNearLimit(cred: Credential): boolean {
   return !cred.disabled && Math.max(u5h ?? 0, u7d ?? 0) >= 0.9
 }
 
-/** 账号是否异常：被上游封禁或凭证已过期。 */
+/**
+ * 账号是否异常——**只看被上游封禁**。
+ *
+ * `expired` 不算：那只是 access_token 到点了，而刷新是惰性的（选号之后、发请求之前必刷，
+ * 见后端 `ensure_fresh_token`），所以闲置一夜的健康账号第二天必然是 `expired=true`，
+ * 下一个请求会自动把它刷好。把它算成异常，等于每天早上给一批好号刷上红色、排到最前、
+ * 塞进「需处理」——而这里真正要回答的是「refresh_token 还灵不灵」，那个答案在 `ban_reason`：
+ * 刷新失败且判定为永久失效时，后端会 `mark_banned` 写进去。
+ */
 export function isAbnormal(cred: Credential): boolean {
-  return !!cred.ban_reason || cred.expired
+  return !!cred.ban_reason
 }
 
 // ---------- 排序 ----------
@@ -121,10 +130,13 @@ function tierRank(tier: string | null): number {
   return 0
 }
 
-/** 状态 → 严重度（越大越需要关注）；降序即「先看有问题的」。 */
+/**
+ * 状态 → 严重度（越大越需要关注）；降序即「先看有问题的」。
+ *
+ * 不含 `expired`：它不是「有问题」，见 [`isAbnormal`]。
+ */
 function statusRank(c: Credential): number {
-  if (c.ban_reason) return 5
-  if (c.expired) return 4
+  if (c.ban_reason) return 4
   if (!c.disabled && c.rate_limited_secs > 0) return 3
   if (isNearLimit(c)) return 2
   if (c.disabled) return 1
@@ -342,6 +354,13 @@ interface ProbeEntry {
   result: ProbeResult
 }
 
+/** 一次在途探测。session 用来丢弃关闭弹窗后才到达的旧结果。 */
+interface ProbeRequest {
+  model: string
+  controller: AbortController
+  session: number
+}
+
 /** 耗时展示：1 秒以内用毫秒，超过用秒（保留一位小数）。 */
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
@@ -368,30 +387,64 @@ export function ConnectivityTestDialog({
   const [model, setModel] = useState<string>(PROBE_MODELS[0])
   const [entries, setEntries] = useState<ProbeEntry[]>([])
   const seq = useRef(0)
+  const session = useRef(0)
+  const activeProbe = useRef<AbortController | null>(null)
 
   const probe = useMutation({
-    mutationFn: (m: string) => probeCredential(cred.id, m),
-    onSuccess: (result, m) => {
-      seq.current += 1
-      setEntries((prev) => [{ seq: seq.current, model: m, result }, ...prev])
+    mutationKey: ['credential-probe', cred.id],
+    // 管理页即使被浏览器判为 offline，也应立即请求本机后端并得到明确失败，而不是静默 paused。
+    networkMode: 'always',
+    mutationFn: ({ model: requestModel, controller }: ProbeRequest) =>
+      probeCredential(cred.id, requestModel, controller.signal),
+    onSuccess: (result, request) => {
+      if (request.session !== session.current) return
+      const entrySeq = ++seq.current
+      setEntries((prev) => [{ seq: entrySeq, model: request.model, result }, ...prev])
       // 测试会顺带刷新过期的 token，卡片上的有效期得跟着更新。
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
     // 这条是「请求没发出去」（账号已被删、管理密码失效等），与「上游拒绝」不同：
     // 后者是 200 + 一份带状态码的结果，会进上面的列表。
-    onError: (e) => toast.error('测试失败', { description: extractError(e) }),
+    onError: (e, request) => {
+      if (request.session !== session.current || axios.isCancel(e)) return
+      toast.error('测试失败', { description: extractError(e) })
+    },
+    onSettled: (_result, _error, request) => {
+      if (activeProbe.current === request.controller) activeProbe.current = null
+    },
   })
 
   const submit = () => {
     const m = model.trim()
-    if (m) probe.mutate(m)
+    // mutation state 要到下一次 render 才更新；ref 同步挡住双击/连续回车造成的重复扣费。
+    if (!m || activeProbe.current) return
+    const controller = new AbortController()
+    activeProbe.current = controller
+    probe.mutate({ model: m, controller, session: session.current })
   }
+
+  const cancelProbe = () => {
+    session.current += 1
+    activeProbe.current?.abort()
+    activeProbe.current = null
+    probe.reset()
+  }
+
+  // 账号因筛选、分页或重新排序离开页面时，终止前端请求并丢弃旧结果，避免重开后继承 pending。
+  useEffect(() => () => {
+    session.current += 1
+    activeProbe.current?.abort()
+  }, [])
 
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setEntries([])
+        if (!next) {
+          cancelProbe()
+          seq.current = 0
+          setEntries([])
+        }
         onOpenChange(next)
       }}
     >
@@ -434,9 +487,16 @@ export function ConnectivityTestDialog({
                 className="h-9 min-w-0 flex-1 font-mono text-xs"
                 aria-label="要测试的模型名"
               />
-              <Button type="submit" size="sm" className="h-9 shrink-0" disabled={!model.trim() || probe.isPending}>
+              <Button
+                type={probe.isPending ? 'button' : 'submit'}
+                size="sm"
+                variant={probe.isPending ? 'outline' : 'default'}
+                className="h-9 shrink-0"
+                disabled={!probe.isPending && !model.trim()}
+                onClick={probe.isPending ? cancelProbe : undefined}
+              >
                 {probe.isPending && <ArrowPathIcon className="animate-spin" />}
-                {probe.isPending ? '测试中' : '开始测试'}
+                {probe.isPending ? '取消测试' : '开始测试'}
               </Button>
             </div>
           </form>
@@ -580,44 +640,46 @@ export function tierBadgeClass(tier: string): string {
   return 'border-border bg-secondary text-secondary-foreground'
 }
 
-/** 凭证综合状态 → 状态灯颜色 + 左侧轨道色 + 文案。优先级：封禁 > 停用 > 过期 > 冷却 > 将满/将过期 > 正常。 */
+/**
+ * 凭证综合状态 → 状态灯颜色 + 左侧轨道色 + 文案。优先级：封禁 > 停用 > 冷却 > 额度将满 > 正常。
+ *
+ * **access_token 的有效期不参与判色**（既没有「已过期」也没有「即将过期」）：token 到点会在
+ * 下次使用时自动刷新，而 `expires_in <= 300` 恰恰就是后端的刷新窗口——把「马上就要被刷新」
+ * 画成琥珀色警告，是在提醒一件系统自己会处理、且用户也做不了什么的事。真正的凭证问题
+ * （refresh_token 失效）走封禁那一支。有效期本身仍在底栏如实展示，见 [`credentialExpiryMeta`]。
+ */
 export function statusMeta(
   cred: Credential,
   nearLimit: boolean,
 ): { dot: string; rail: string; label: string } {
   if (cred.ban_reason) return { dot: 'bg-bad', rail: 'before:bg-bad', label: '已封禁' }
   if (cred.disabled) return { dot: 'bg-muted-foreground/50', rail: 'before:bg-transparent', label: '已停用' }
-  if (cred.expired) return { dot: 'bg-bad', rail: 'before:bg-bad', label: '已过期' }
   if (cred.rate_limited_secs > 0) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '冷却中' }
   if (nearLimit) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '额度将满' }
-  if (cred.expires_in <= 300) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '即将过期' }
   return { dot: 'bg-ok', rail: 'before:bg-transparent', label: '运行正常' }
 }
 
 /**
- * 凭证状态/有效期 → 元信息行的文案、配色与 title。异常态着色，正常态保持中性。
+ * 凭证自身的到期时间 → 元信息行的文案、配色与 title。
  *
  * 正常态给的是过期时刻而非「剩余 x 小时 y 分钟」：倒计时不自己走就是个假数字，
  * 而 token 到点会自动刷新，用户真正要判断的是「几点」，不是还剩多久。
+ * 这里不混入停用、封禁、冷却等账号状态，避免底栏出现「凭证有效期：已停用」。
+ *
+ * 已过期的说成「待刷新」且保持中性色：刷新是惰性的（下次被调度时才刷），闲置久了必然到这个
+ * 状态，它说明的是「这个号最近没被用过」，不是「这个号坏了」。
  */
-export function expiryMeta(cred: Credential): {
+export function credentialExpiryMeta(cred: Credential): {
   text: string
   className: string
   title?: string
 } {
-  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad', title: cred.ban_reason }
-  if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
-  if (cred.expired) return { text: '已过期', className: 'font-medium text-bad' }
-  if (cred.rate_limited_secs > 0) {
-    const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
+  if (cred.expired) {
     return {
-      text: `冷却约 ${minutes} 分钟`,
-      className: 'font-medium text-warn',
-      title: '账号级限流冷却中，结束后会自动恢复调度',
+      text: '待刷新',
+      className: 'text-muted-foreground',
+      title: `access_token 已于 ${formatFullTime(cred.expires_at)} 过期 · 下次被调度时自动刷新，不影响可用性`,
     }
-  }
-  if (cred.expires_in <= 300) {
-    return { text: '即将过期', className: 'font-medium text-warn', title: `${formatFullTime(cred.expires_at)} 过期` }
   }
   return {
     text: `${formatClockTime(cred.expires_at)} 过期`,
@@ -626,10 +688,28 @@ export function expiryMeta(cred: Credential): {
   }
 }
 
+/** 列表紧凑态的综合说明：优先展示会影响账号调度的状态，再回退到真实有效期。 */
+export function expiryMeta(cred: Credential): {
+  text: string
+  className: string
+  title?: string
+} {
+  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad', title: cred.ban_reason }
+  if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
+  if (cred.rate_limited_secs > 0) {
+    const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
+    return {
+      text: `冷却约 ${minutes} 分钟`,
+      className: 'font-medium text-warn',
+      title: '账号级限流冷却中，结束后会自动恢复调度',
+    }
+  }
+  return credentialExpiryMeta(cred)
+}
+
 /** 启用开关的 hover 提示：封禁态说明「已被上游封禁」并提示仍可手动停用。 */
 export function switchTitle(cred: Credential): string {
   if (cred.disabled) return '已停用（点击启用）'
   if (cred.ban_reason) return `${cred.ban_reason} · 点击可手动停用`
-  if (cred.expired) return '凭证已过期 · 点击可手动停用'
   return '已启用（点击停用）'
 }

@@ -2228,20 +2228,63 @@ pub async fn probe(
     model: &str,
 ) -> ProbeReport {
     let started = std::time::Instant::now();
-    let token = match store::access_token_of(&state.store, &state.http, cred).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(
-                cred = format!("#{} {}", cred.id, cred.label),
-                model,
-                error = %e,
-                "连通性测试：取 access_token 失败"
-            );
-            return ProbeReport::failed(
-                started.elapsed().as_millis(),
-                format!("取 token 失败：{e}"),
-            );
+    // 一个 deadline 覆盖取/刷新 token、发送请求和读完响应体。只给 send() 套 timeout 不够：
+    // 上游若只回响应头却不结束 body，或 token 刷新卡住，前端 mutation 会永远 pending。
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let token = if cred.needs_refresh() {
+        // 刷新会轮换 refresh_token，不能把 refresh future 直接放进 timeout：上游若已经轮换、
+        // 本地却在 update_tokens 前被取消，旧 token 就作废且新 token 永久丢失。独立任务的
+        // JoinHandle 即使因等待超时被丢弃，任务仍会继续跑完并落库；页面只是不再一直等它。
+        let refresh_store = state.store.clone();
+        let refresh_http = state.http.clone();
+        let refresh_cred = cred.clone();
+        let refresh = tokio::spawn(async move {
+            store::access_token_of(&refresh_store, &refresh_http, &refresh_cred).await
+        });
+        match tokio::time::timeout_at(deadline, refresh).await {
+            Ok(Ok(Ok(t))) => t,
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    model,
+                    error = %e,
+                    "连通性测试：取 access_token 失败"
+                );
+                return ProbeReport::failed(
+                    started.elapsed().as_millis(),
+                    format!("取 token 失败：{e}"),
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    model,
+                    error = %e,
+                    "连通性测试：token 刷新任务异常退出"
+                );
+                return ProbeReport::failed(
+                    started.elapsed().as_millis(),
+                    format!("token 刷新任务异常退出：{e}"),
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    model,
+                    timeout_secs = PROBE_TIMEOUT.as_secs(),
+                    "连通性测试：取 access_token 超时，刷新任务将在后台继续"
+                );
+                return ProbeReport::failed(
+                    started.elapsed().as_millis(),
+                    format!(
+                        "连通性测试超时（总上限 {} 秒）：token 刷新仍在后台完成",
+                        PROBE_TIMEOUT.as_secs()
+                    ),
+                );
+            }
         }
+    } else {
+        cred.access_token.clone()
     };
 
     // 复用「裸客户端」那份设备指纹（`device_fingerprint(None, 空头)` 恒为 `"||"`），不另造一个：
@@ -2272,10 +2315,10 @@ pub async fn probe(
     // 全部匹配到的限流头原文，只进日志不进 JSON：结构化的那几项已经够前端展示，而排查时
     // 「上游到底回了哪些头」得看原样的一整串。请求没到上游时留空。
     let mut ratelimit_raw = String::new();
-    let report = match tokio::time::timeout(PROBE_TIMEOUT, sent).await {
+    let report = match tokio::time::timeout_at(deadline, sent).await {
         Err(_) => ProbeReport::failed(
             started.elapsed().as_millis(),
-            format!("等待上游响应超时（{} 秒）", PROBE_TIMEOUT.as_secs()),
+            format!("连通性测试超时（总上限 {} 秒）：等待上游响应未完成", PROBE_TIMEOUT.as_secs()),
         ),
         Ok(Err(e)) => ProbeReport::failed(
             started.elapsed().as_millis(),
@@ -2288,10 +2331,34 @@ pub async fn probe(
             let info = RateLimitInfo::from_headers(up.headers());
             ratelimit_raw = info.raw.clone();
             let quota = ProbeQuota::from_info(&info);
-            match up.bytes().await {
+            match tokio::time::timeout_at(deadline, up.bytes()).await {
+                // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
+                Err(_) => {
+                    log_probe_usage(
+                        &state.store,
+                        cred,
+                        model,
+                        status,
+                        &Bytes::new(),
+                        &info,
+                        &started,
+                    );
+                    ProbeReport {
+                        ok: false,
+                        status: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis(),
+                        model: None,
+                        error_type: None,
+                        error: Some(format!(
+                            "读取上游响应体超时（总上限 {} 秒）",
+                            PROBE_TIMEOUT.as_secs()
+                        )),
+                        quota,
+                    }
+                }
                 // 响应体读到一半断了：状态码与限流头都是真的，只是内容不完整，如实报出来。
                 // 这一条同样落日志——额度快照来自头，不依赖 body。
-                Err(e) => {
+                Ok(Err(e)) => {
                     log_probe_usage(
                         &state.store,
                         cred,
@@ -2311,7 +2378,7 @@ pub async fn probe(
                         quota,
                     }
                 }
-                Ok(bytes) => {
+                Ok(Ok(bytes)) => {
                     log_probe_usage(&state.store, cred, model, status, &bytes, &info, &started);
                     probe_report(status, &bytes, started.elapsed().as_millis(), quota)
                 }
