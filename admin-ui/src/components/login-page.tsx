@@ -24,11 +24,11 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
   })
 
   return (
-    <div className="app-shell grid min-h-screen place-items-center bg-background px-4 py-8 text-foreground sm:px-5 sm:py-10">
+    <div className="app-shell grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:px-5 sm:py-10">
       <div className="w-full max-w-sm">
         {/* 品牌标识 */}
         <div className="mb-6 flex flex-col items-center text-center">
-          <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-white shadow-brand">
+          <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-brand-foreground shadow-brand">
             <LogoMark className="size-7" />
           </div>
           <div className="mt-4 text-lg font-semibold leading-none tracking-tight">Luban</div>

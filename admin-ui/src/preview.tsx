@@ -5,6 +5,7 @@ import {
   ShieldCheckIcon, ExclamationTriangleIcon, SignalIcon, DevicePhoneMobileIcon,
   MagnifyingGlassIcon, PlusIcon, Cog6ToothIcon, FunnelIcon, Squares2X2Icon,
   Bars3Icon, QueueListIcon, ArrowsUpDownIcon, EllipsisVerticalIcon,
+  ArrowPathIcon,
 } from '@heroicons/react/24/outline'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
@@ -158,11 +159,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         />
       ) : (
       <>
-      <div className="app-shell flex min-h-screen flex-col bg-background text-foreground">
-        <header className="sticky top-0 z-20 border-b border-border/80 bg-background/95 backdrop-blur-xl">
-          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2.5 sm:py-3 lg:px-6">
+      <div className="app-shell flex min-h-dvh flex-col text-foreground">
+        <header className="app-header sticky top-0 z-20 border-b border-border/70 bg-background/90 backdrop-blur-xl">
+          <div className="page-frame flex items-center justify-between gap-3 py-2.5 sm:py-3">
             <div className="flex items-center gap-2.5 sm:gap-3">
-              <div className="brand-mark flex size-8 items-center justify-center rounded-md text-white sm:size-9 sm:rounded-lg">
+              <div className="brand-mark flex size-8 items-center justify-center rounded-md text-brand-foreground sm:size-9 sm:rounded-lg">
                 <LogoMark className="size-5" />
               </div>
               <div>
@@ -171,8 +172,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </div>
             </div>
             <div className="flex items-center gap-2 sm:hidden">
-              <Button size="icon" className="size-9" aria-label="添加账号"><PlusIcon /></Button>
-              <Button size="icon" variant="outline" className="size-9" aria-label="更多操作"><EllipsisVerticalIcon /></Button>
+              <Button size="icon" className="size-10" aria-label="添加账号"><PlusIcon /></Button>
+              <Button size="icon" variant="outline" className="size-10" aria-label="更多操作"><EllipsisVerticalIcon /></Button>
             </div>
             <div className="hidden items-center gap-2 sm:flex">
               <Button size="sm" variant="outline" aria-label="接入设置"><Cog6ToothIcon />接入设置</Button>
@@ -181,44 +182,58 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl flex-1 space-y-4 px-4 py-5 pb-8 sm:space-y-5 sm:py-6 lg:px-6">
-          <section className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">账号管理</h1>
-              <span className="hidden text-2xs text-muted-foreground sm:inline">每 30 秒自动刷新</span>
-            </div>
-            <div className="grid grid-cols-2 border-y border-border/80 md:grid-cols-4">
-              <OverviewMetric label="账号总数" value="2" status="2 已启用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r border-border/80 md:border-b-0" />
-              <OverviewMetric label="异常账号" value="1" status="需处理" icon={ExclamationTriangleIcon} tone="bad" className="border-b border-border/80 md:border-b-0 md:border-r" />
-              <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r border-border/80" />
-              <OverviewMetric label="活跃设备" value="2" icon={DevicePhoneMobileIcon} tone="neutral" />
-            </div>
-          </section>
+        <main className="page-frame flex-1 py-5 pb-8 sm:py-6 sm:pb-10">
+          <div className="grid gap-5 xl:grid-cols-[14rem_minmax(0,1fr)] xl:items-start xl:gap-6">
+            <aside className="min-w-0 space-y-4 xl:sticky xl:top-24">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="label-eyebrow">Account pool</span>
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-bad-soft px-2 py-1 text-2xs font-medium text-bad">
+                    <span className="size-1.5 rounded-full bg-current" aria-hidden />
+                    1 个账号需关注
+                  </span>
+                </div>
+                <h1 className="mt-2 text-xl font-semibold tracking-tight sm:text-2xl">账号调度中心</h1>
+                <p className="mt-2 hidden max-w-xl text-xs leading-5 text-muted-foreground sm:block">
+                  巡检账号健康、额度与设备容量，优先处理会影响转发的状态。
+                </p>
+                <div className="mt-3 flex items-center gap-1.5 text-2xs text-muted-foreground">
+                  <ArrowPathIcon className="size-3.5" />
+                  每 30 秒自动刷新
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-1">
+                <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" />
+                <OverviewMetric label="需处理" value="1" status="1 异常" icon={ExclamationTriangleIcon} tone="bad" />
+                <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" />
+                <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={DevicePhoneMobileIcon} tone="neutral" />
+              </div>
+            </aside>
 
-          <section className="min-w-0">
-          <div className="grid gap-3 border-b border-border/80 py-3.5 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
+          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card/90 shadow-panel">
+          <div className="grid gap-3 border-b border-border/80 px-3.5 py-4 sm:px-4 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
             <div className="flex items-baseline gap-2">
               <div className="text-sm font-semibold sm:text-base">账号列表</div>
               <div className="text-xs text-muted-foreground">共 2 个</div>
             </div>
             <div className="min-w-0 space-y-2 lg:flex lg:items-center lg:justify-end lg:space-y-0">
-              <div className="flex h-9 w-full items-center gap-2 rounded-md border border-border bg-background px-3 text-xs text-muted-foreground shadow-sm lg:mr-2 lg:w-64">
+              <div className="flex h-10 w-full items-center gap-2 rounded-md border border-border bg-background px-3 text-xs text-muted-foreground shadow-sm sm:h-9 lg:mr-2 lg:w-52 2xl:w-64">
                 <MagnifyingGlassIcon className="size-3.5" />搜索名称或 #id
               </div>
-              <div className="scrollbar-none -mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 lg:mx-0 lg:overflow-visible lg:px-0 lg:pb-0">
-                <Button size="sm" variant="outline" className="h-9 text-xs sm:h-8"><FunnelIcon />全部</Button>
-                <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
-                  <Button size="icon" variant="ghost" className="size-9 rounded-none focus-visible:z-10 sm:size-8" aria-label="卡片视图" aria-pressed={previewView === 'card'}><Squares2X2Icon className="size-4" /></Button>
-                  <Button size="icon" variant="ghost" className="size-9 rounded-none border-l border-border focus-visible:z-10 sm:size-8" aria-label="紧凑列表视图" aria-pressed={previewView === 'list'}><Bars3Icon className="size-4" /></Button>
+              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
+                <Button size="sm" variant="outline" className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><FunnelIcon />全部</Button>
+                <Button size="sm" variant="outline" className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><ArrowsUpDownIcon />优先级↑</Button>
+                <div className="grid h-10 grid-cols-2 overflow-hidden rounded-md border border-border sm:flex sm:h-8 sm:shrink-0">
+                  <Button size="icon" variant="ghost" className="h-full w-full rounded-none focus-visible:z-10 sm:w-8" aria-label="卡片视图" aria-pressed={previewView === 'card'}><Squares2X2Icon className="size-4" /></Button>
+                  <Button size="icon" variant="ghost" className="h-full w-full rounded-none border-l border-border focus-visible:z-10 sm:w-8" aria-label="紧凑列表视图" aria-pressed={previewView === 'list'}><Bars3Icon className="size-4" /></Button>
                 </div>
-                <Button size="sm" variant={previewBatch ? 'secondary' : 'outline'} className="h-9 text-xs sm:h-8"><QueueListIcon />批量</Button>
-                <Button size="sm" variant="outline" className="h-9 text-xs sm:h-8"><ArrowsUpDownIcon />优先级↑</Button>
+                <Button size="sm" variant={previewBatch ? 'secondary' : 'outline'} className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><QueueListIcon />批量</Button>
               </div>
             </div>
           </div>
 
           {previewBatch && (
-            <div className="border-b border-border bg-muted/15 p-3 sm:p-4">
+            <div className="border-b border-border bg-muted/30 p-3 sm:p-4">
             <BatchActionsBar
               all={[banned, normal]}
               selected={previewSelected}
@@ -247,12 +262,13 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </Table>
             </div>
           ) : (
-            <div className="grid grid-cols-1 items-start gap-3 pt-3 sm:gap-4 sm:pt-4 lg:grid-cols-2">
+            <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fit,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
               <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
               <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
             </div>
           )}
           </section>
+          </div>
         </main>
         <AppFooter />
       </div>

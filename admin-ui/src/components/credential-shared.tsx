@@ -1,19 +1,25 @@
+import { useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowPathIcon, TrashIcon, PencilIcon, ChevronUpIcon, ChevronDownIcon,
-  DevicePhoneMobileIcon,
+  DevicePhoneMobileIcon, SignalIcon, CheckCircleIcon, XCircleIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
-  deleteCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel, setPriority,
-  type Credential,
+  deleteCredential, probeCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel,
+  setPriority,
+  type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
-import { extractError, formatClockTime, formatFullTime } from '@/lib/utils'
+import { cn, extractError, formatClockTime, formatFullTime } from '@/lib/utils'
 import {
   DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import {
+  Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 /** 设备上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
 export function limitToInput(deviceLimit: number): string {
@@ -117,8 +123,9 @@ function tierRank(tier: string | null): number {
 
 /** 状态 → 严重度（越大越需要关注）；降序即「先看有问题的」。 */
 function statusRank(c: Credential): number {
-  if (c.ban_reason) return 4
-  if (c.expired) return 3
+  if (c.ban_reason) return 5
+  if (c.expired) return 4
+  if (!c.disabled && c.rate_limited_secs > 0) return 3
   if (isNearLimit(c)) return 2
   if (c.disabled) return 1
   return 0
@@ -213,12 +220,13 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onTest, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onTest: () => void
   onRequestDelete: () => void
 }) {
   const { refresh, prio } = actions
@@ -227,6 +235,10 @@ export function CredentialMenuContent({
       <DropdownMenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
         <ArrowPathIcon className={refresh.isPending ? 'animate-spin' : undefined} />
         刷新 token
+      </DropdownMenuItem>
+      <DropdownMenuItem onClick={onTest}>
+        <SignalIcon />
+        连通性测试
       </DropdownMenuItem>
       <DropdownMenuItem onClick={onRename}>
         <PencilIcon />
@@ -299,12 +311,257 @@ export function DeleteCredentialDialog({
       onConfirm={() => actions.remove.mutate()}
       description={
         <>
-          确定删除「<span className="font-medium text-foreground">{cred.label}</span>」？
-          该账号的历史用量记录与设备绑定将一并清除，不可恢复。
+          删除「<span className="font-medium text-foreground">{cred.label}</span>」后，
+          历史用量与设备绑定将一并清除，且无法恢复。
         </>
       }
     />
   )
+}
+
+/**
+ * 测试弹窗里的备选模型。**只是快捷入口，不是白名单**——输入框可以随便填，后端也原样发给
+ * 上游，故官方上新模型时不改这里也能测，只是少一个可点的按钮。
+ *
+ * 取现役四个模型族各一个（基座与 beta 串按族分家，见后端 `cc_system_base`/`cc_beta_seed`），
+ * 这样点一遍就覆盖了四条不同的模拟路径。
+ */
+const PROBE_MODELS = [
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'claude-haiku-4-5',
+  'claude-fable-5',
+] as const
+
+/** 一条测试记录：同一个弹窗里连测多次时按时间倒序累积，方便横向比较不同模型。 */
+interface ProbeEntry {
+  /** 自增序号，仅用作列表 key。 */
+  seq: number
+  /** 本次请求的模型名（`result.model` 是上游回报的，可能不同）。 */
+  model: string
+  result: ProbeResult
+}
+
+/** 耗时展示：1 秒以内用毫秒，超过用秒（保留一位小数）。 */
+function formatLatency(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
+}
+
+/**
+ * 连通性测试弹窗：用**这一个**账号向上游发一条最小请求，测它能不能用某个模型。
+ *
+ * 卡片与列表共用。请求形态、代价与副作用见后端 `proxy::probe`——一句话：不选号、不占设备
+ * 名额、失败也不自动停用账号，但会写一条用量日志（卡片上的额度与花费据此更新），
+ * 也真的会打到上游、花掉一点点订阅额度。
+ *
+ * 结果列表在弹窗内累积（关掉即清空）：连测几个模型时，「opus 429 而 haiku 200」这种对照
+ * 只有并排看才成立，一次只留最后一条就得靠人脑记。
+ */
+export function ConnectivityTestDialog({
+  cred, open, onOpenChange,
+}: {
+  cred: Credential
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const qc = useQueryClient()
+  const [model, setModel] = useState<string>(PROBE_MODELS[0])
+  const [entries, setEntries] = useState<ProbeEntry[]>([])
+  const seq = useRef(0)
+
+  const probe = useMutation({
+    mutationFn: (m: string) => probeCredential(cred.id, m),
+    onSuccess: (result, m) => {
+      seq.current += 1
+      setEntries((prev) => [{ seq: seq.current, model: m, result }, ...prev])
+      // 测试会顺带刷新过期的 token，卡片上的有效期得跟着更新。
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    // 这条是「请求没发出去」（账号已被删、管理密码失效等），与「上游拒绝」不同：
+    // 后者是 200 + 一份带状态码的结果，会进上面的列表。
+    onError: (e) => toast.error('测试失败', { description: extractError(e) }),
+  })
+
+  const submit = () => {
+    const m = model.trim()
+    if (m) probe.mutate(m)
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) setEntries([])
+        onOpenChange(next)
+      }}
+    >
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            <SignalIcon className="size-4 shrink-0 text-muted-foreground" />
+            连通性测试
+          </DialogTitle>
+          <DialogDescription>
+            使用「<span className="font-medium text-foreground">{cred.label}</span>」向上游发送最小请求；
+            会消耗少量订阅额度并按实际用量计入该账号，但不会改变账号状态。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogBody className="space-y-3">
+          <form
+            className="space-y-2"
+            onSubmit={(e) => { e.preventDefault(); submit() }}
+          >
+            <div className="flex flex-wrap gap-1.5">
+              {PROBE_MODELS.map((m) => (
+                <Button
+                  key={m}
+                  type="button"
+                  size="sm"
+                  variant={model === m ? 'secondary' : 'outline'}
+                  className="h-7 px-2.5 font-mono text-2xs font-normal"
+                  aria-pressed={model === m}
+                  onClick={() => setModel(m)}
+                >
+                  {m}
+                </Button>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="模型名，如 claude-opus-5"
+                className="h-9 min-w-0 flex-1 font-mono text-xs"
+                aria-label="要测试的模型名"
+              />
+              <Button type="submit" size="sm" className="h-9 shrink-0" disabled={!model.trim() || probe.isPending}>
+                {probe.isPending && <ArrowPathIcon className="animate-spin" />}
+                {probe.isPending ? '测试中' : '开始测试'}
+              </Button>
+            </div>
+          </form>
+
+          {entries.length === 0 ? (
+            <p className="py-2 text-2xs text-muted-foreground">
+              选择模型开始测试；结果会显示实时额度或上游错误。
+            </p>
+          ) : (
+            <ul className="divide-y divide-border border-t border-border">
+              {entries.map((e) => (
+                <ProbeEntryRow key={e.seq} entry={e} />
+              ))}
+            </ul>
+          )}
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** 一条测试结果：成败徽章 + 模型名 + 状态码/耗时，失败时附上游错误原文。 */
+function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
+  const { model, result } = entry
+  const Icon = result.ok ? CheckCircleIcon : XCircleIcon
+  return (
+    <li className="py-2.5">
+      <div className="flex items-start gap-2">
+        <Icon className={cn('mt-px size-4 shrink-0', result.ok ? 'text-ok' : 'text-bad')} aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="font-mono text-xs font-medium">{model}</span>
+            {/* status 为 0 表示压根没到上游（取 token 失败/连不上/超时），显示状态码会误导。 */}
+            <span className={cn('text-2xs tnum', result.ok ? 'text-ok' : 'text-bad')}>
+              {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
+            </span>
+            <span className="tnum text-2xs text-muted-foreground">{formatLatency(result.latency_ms)}</span>
+            {/* 上游回报的模型名与请求的不同 = 别名被解析成了具体版本，值得显式点出来。 */}
+            {result.model && result.model !== model && (
+              <span className="font-mono text-2xs text-muted-foreground" title="上游实际使用的模型">
+                → {result.model}
+              </span>
+            )}
+          </div>
+          {result.error && (
+            <p className="mt-1 break-words text-2xs leading-5 text-muted-foreground">
+              {result.error_type && (
+                <span className="mr-1 font-mono text-bad">{result.error_type}</span>
+              )}
+              {result.error}
+            </p>
+          )}
+          {result.quota && <ProbeQuotaLine quota={result.quota} />}
+        </div>
+      </div>
+    </li>
+  )
+}
+
+/**
+ * 本次响应带回的额度：5h / 7d 使用率 + 各自的重置时刻，429 时另标出上游要求的等待时长。
+ *
+ * 这是**这一刻**上游的说法，不是卡片上那份按用量日志存下来的快照——测试不写日志，所以看完
+ * 就没了，页面上别处不会跟着变。
+ */
+function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
+  const win = (label: string, util: number | null, reset: number | null) => {
+    if (util == null && reset == null) return null
+    const pct = util == null ? null : Math.round(util * 100)
+    return (
+      <span
+        key={label}
+        className="tnum"
+        title={reset != null ? `${label} 窗口 ${formatFullTime(reset)} 重置` : undefined}
+      >
+        {label}{' '}
+        {pct == null ? (
+          '—'
+        ) : (
+          <span className={cn('font-medium', quotaTone(util))}>{pct}%</span>
+        )}
+        {reset != null && ` · ${formatClockTime(reset)} 重置`}
+      </span>
+    )
+  }
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-2xs text-muted-foreground">
+      {win('5h', quota.rl_5h_utilization, quota.rl_5h_reset)}
+      {win('7d', quota.rl_7d_utilization, quota.rl_7d_reset)}
+      {/* 429 才有。它是上游对**这次**拒绝给出的等待时间，比窗口 reset 更直接。 */}
+      {quota.retry_after_secs != null && (
+        <span className="text-bad" title={`上游 retry-after: ${quota.retry_after_secs} 秒`}>
+          需等待 {formatWait(quota.retry_after_secs)}
+        </span>
+      )}
+      {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}
+      {quota.unified_status && quota.unified_status !== 'allowed' && (
+        <span
+          className={cn('font-mono', quota.unified_status === 'rejected' ? 'text-bad' : 'text-warn')}
+          title={
+            quota.rl_representative
+              ? `上游整体额度状态（当前由 ${quota.rl_representative} 窗口决定）`
+              : '上游整体额度状态'
+          }
+        >
+          {quota.unified_status}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/** 使用率配色，阈值与卡片额度条一致（≥90% 红、≥70% 橙）。 */
+function quotaTone(util: number | null): string {
+  if (util == null) return 'text-foreground/80'
+  if (util >= 0.9) return 'text-bad'
+  return util >= 0.7 ? 'text-warn' : 'text-foreground/80'
+}
+
+/** 等待时长：分钟以内给秒，一天以内给小时，再长给天（上游真给过 63 小时）。 */
+function formatWait(secs: number): string {
+  if (secs < 60) return `${secs} 秒`
+  if (secs < 3600) return `${Math.round(secs / 60)} 分钟`
+  if (secs < 86400) return `${(secs / 3600).toFixed(1)} 小时`
+  return `${(secs / 86400).toFixed(1)} 天`
 }
 
 /** 账号档位徽章配色：Max 20x/5x/Max/Pro/Free 用冷色系区分（避开到期徽章的绿/橙/红）。 */
@@ -323,7 +580,7 @@ export function tierBadgeClass(tier: string): string {
   return 'border-border bg-secondary text-secondary-foreground'
 }
 
-/** 凭证综合状态 → 状态灯颜色 + 左侧轨道色 + 文案。优先级：封禁 > 停用 > 过期 > 将满/将过期 > 正常。 */
+/** 凭证综合状态 → 状态灯颜色 + 左侧轨道色 + 文案。优先级：封禁 > 停用 > 过期 > 冷却 > 将满/将过期 > 正常。 */
 export function statusMeta(
   cred: Credential,
   nearLimit: boolean,
@@ -331,6 +588,7 @@ export function statusMeta(
   if (cred.ban_reason) return { dot: 'bg-bad', rail: 'before:bg-bad', label: '已封禁' }
   if (cred.disabled) return { dot: 'bg-muted-foreground/50', rail: 'before:bg-transparent', label: '已停用' }
   if (cred.expired) return { dot: 'bg-bad', rail: 'before:bg-bad', label: '已过期' }
+  if (cred.rate_limited_secs > 0) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '冷却中' }
   if (nearLimit) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '额度将满' }
   if (cred.expires_in <= 300) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '即将过期' }
   return { dot: 'bg-ok', rail: 'before:bg-transparent', label: '运行正常' }
@@ -350,6 +608,14 @@ export function expiryMeta(cred: Credential): {
   if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad', title: cred.ban_reason }
   if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
   if (cred.expired) return { text: '已过期', className: 'font-medium text-bad' }
+  if (cred.rate_limited_secs > 0) {
+    const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
+    return {
+      text: `冷却约 ${minutes} 分钟`,
+      className: 'font-medium text-warn',
+      title: '账号级限流冷却中，结束后会自动恢复调度',
+    }
+  }
   if (cred.expires_in <= 300) {
     return { text: '即将过期', className: 'font-medium text-warn', title: `${formatFullTime(cred.expires_at)} 过期` }
   }

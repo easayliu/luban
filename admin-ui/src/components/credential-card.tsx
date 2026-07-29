@@ -3,16 +3,15 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   ArrowPathIcon, PencilIcon, CheckIcon, XMarkIcon, EllipsisHorizontalIcon,
-  DevicePhoneMobileIcon, ExclamationTriangleIcon, ChevronDownIcon,
-  CalendarDaysIcon, ClockIcon, WalletIcon,
+  DevicePhoneMobileIcon, ChevronDownIcon, ClockIcon,
 } from '@heroicons/react/24/outline'
 import { listCredentialDevices, unbindCredentialDevice, type Credential } from '@/api/credentials'
 import {
   cn, copyText, extractError, formatClockTime, formatFullTime, formatUsd, relativeTime,
 } from '@/lib/utils'
 import {
-  CredentialMenuContent, DeleteCredentialDialog, expiryMeta, inputToLimit, isAbnormal,
-  isNearLimit, limitToInput, liveQuota, statusMeta, switchTitle, tierBadgeClass,
+  ConnectivityTestDialog, CredentialMenuContent, DeleteCredentialDialog, expiryMeta, inputToLimit,
+  isAbnormal, isNearLimit, limitToInput, liveQuota, statusMeta, switchTitle, tierBadgeClass,
   useCredentialActions,
 } from '@/components/credential-shared'
 import { Card } from '@/components/ui/card'
@@ -40,6 +39,7 @@ export function CredentialCard({
   // 已绑定设备明细：默认收起，展开时才挂载 DeviceList（也才发请求）。
   const [showDevices, setShowDevices] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [testing, setTesting] = useState(false)
 
   const actions = useCredentialActions(
     cred,
@@ -48,10 +48,9 @@ export function CredentialCard({
   )
   const { rename, toggle, prio, limit } = actions
 
-  // 额度接近上限（5h / 7d 任一 ≥90%）：卡片描边 + 角标提示。
+  // 额度接近上限（5h / 7d 任一 ≥90%）：用于状态标签与卡片描边。
   // 用 liveQuota 而非原始快照——窗口已重置的百分比是上个周期的，不该再触发告警。
   const { u5h, u7d } = liveQuota(cred)
-  const quotaMax = Math.max(u5h ?? 0, u7d ?? 0)
   const nearLimit = isNearLimit(cred)
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
   // 窗口已重置的仍然渲染额度条（由 QuotaBar 显示成「已重置」），只是不参与告警。
@@ -60,6 +59,7 @@ export function CredentialCard({
   const expiry = expiryMeta(cred)
   const status = statusMeta(cred, nearLimit)
   const abnormal = isAbnormal(cred)
+  const effectiveDeviceLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const startPriorityEdit = () => {
     setPriorityVal(String(cred.priority))
     setEditingPriority(true)
@@ -72,183 +72,120 @@ export function CredentialCard({
   return (
     <Card
       className={cn(
-        '@container/card group/card relative flex flex-col overflow-hidden rounded-lg border-border/80 bg-transparent p-3 pl-[calc(0.75rem-3px)] shadow-none transition-colors sm:p-4 sm:pl-[calc(1rem-3px)]',
+        '@container/card group/card relative flex flex-col overflow-hidden rounded-xl border-border/80 bg-card p-0 shadow-card transition-[border-color,box-shadow,background-color]',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:transition-colors',
-        'hover:border-foreground/20',
-        cred.disabled && 'opacity-60',
+        'hover:border-foreground/20 hover:shadow-panel',
+        cred.disabled && 'bg-muted/25',
+        selected && 'border-primary/50 ring-1 ring-primary/15',
         // 左侧状态轨：一眼分诊。正常态透明，异常态着色。
         status.rail,
-        nearLimit && 'border-bad/35',
       )}
     >
-      {/* 头部：头像 + 名称/徽章 + 开关/菜单 */}
-      <div className="flex items-start gap-2.5 sm:gap-3.5">
-        {selectable && (
-          <span className="grid size-9 shrink-0 place-items-center">
-            <input
-              type="checkbox"
-              checked={selected}
-              onChange={(e) => onSelectedChange?.(e.target.checked)}
-              className="size-4 rounded border-border accent-primary"
-              aria-label={`选择 ${cred.label}`}
-            />
-          </span>
-        )}
-        <div className="relative shrink-0">
-          <div
-            className={cn(
-              'grid size-9 place-items-center rounded-full border border-border text-xs font-semibold',
-              cred.disabled
-                ? 'bg-muted/70 text-muted-foreground/70'
-                : 'bg-muted text-foreground',
-            )}
-            aria-hidden
-          >
-            {initial}
-          </div>
-          {/* 状态灯：绿=正常 红=异常 琥珀=将满/将过期 灰=停用，环切合卡片底色。 */}
-          <span
-            className={cn(
-              'absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-background',
-              status.dot,
-            )}
-            title={status.label}
-            aria-label={status.label}
-            role="img"
-          />
-        </div>
-
-        <div className="min-w-0 flex-1">
-          {editing ? (
-            <form
-              className="flex min-w-0 items-center gap-1"
-              onSubmit={(e) => { e.preventDefault(); rename.mutate(name.trim()) }}
-            >
-              <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-8 min-w-0 flex-1 px-2 text-xs sm:w-56 sm:flex-none sm:px-3 sm:text-sm" aria-label="账号名称" />
-              <Button type="submit" size="icon" variant="ghost" className="h-8 w-8" disabled={rename.isPending} aria-label="保存账号名称">
-                {rename.isPending ? <ArrowPathIcon className="animate-spin" /> : <CheckIcon />}
-              </Button>
-              <Button type="button" size="icon" variant="ghost" className="h-8 w-8" aria-label="取消重命名"
-                onClick={() => { setEditing(false); setName(cred.label) }}>
-                <XMarkIcon />
-              </Button>
-            </form>
+      {/* 身份区只保留账号、可见状态与管理菜单；批量模式下复选框取代头像。 */}
+      <div className="p-3 pl-4 sm:p-4 sm:pl-5">
+        <div className="grid grid-cols-[2.5rem_minmax(0,1fr)_2.5rem] items-start gap-2.5 sm:gap-3">
+          {selectable ? (
+            <span className={cn('grid size-10 place-items-center rounded-full border border-border', selected && 'bg-primary/5')}>
+              <input
+                type="checkbox"
+                checked={selected}
+                onChange={(e) => onSelectedChange?.(e.target.checked)}
+                className="size-4 rounded border-border accent-primary"
+                aria-label={`选择 ${cred.label}`}
+              />
+            </span>
           ) : (
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
-              <div className="flex min-w-0 items-center gap-1.5">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="link"
-                  onClick={() => setEditing(true)}
-                  className="group/name h-5 min-w-0 justify-start gap-1.5 p-0"
-                  title="点击重命名"
-                >
-                  <span className="truncate text-[0.8125rem] font-semibold tracking-tight sm:text-sm">{cred.label}</span>
-                  <PencilIcon className="hidden size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity sm:block group-hover/name:opacity-100" />
-                </Button>
-                <span
-                  className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[0.625rem] leading-none text-muted-foreground"
-                  title={`账号 ID：${cred.id}`}
-                >
-                  #{cred.id}
-                </span>
-              </div>
-              {nearLimit && (
-                <Badge variant="bad" className="shrink-0">
-                  <ExclamationTriangleIcon className="size-3" />
-                  额度 {Math.round(quotaMax * 100)}%
-                </Badge>
+            <div
+              className={cn(
+                'grid size-10 place-items-center rounded-full border border-border text-xs font-semibold',
+                cred.disabled ? 'bg-muted/70 text-muted-foreground/70' : 'bg-muted text-foreground',
               )}
+              aria-hidden
+            >
+              {initial}
             </div>
           )}
 
-          {/* 元信息：套餐、优先级和有效期保持在同一信息行。 */}
-          <div className="mt-1.5 text-2xs text-muted-foreground">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 sm:gap-x-3">
+          <div className="min-w-0">
+            {editing ? (
+              <form
+                className="flex min-w-0 items-center gap-1"
+                onSubmit={(e) => { e.preventDefault(); rename.mutate(name.trim()) }}
+              >
+                <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus className="h-8 min-w-0 flex-1 px-2 text-xs" aria-label="账号名称" />
+                <Button type="submit" size="icon" variant="ghost" className="size-8" disabled={rename.isPending} aria-label="保存账号名称">
+                  {rename.isPending ? <ArrowPathIcon className="animate-spin" /> : <CheckIcon />}
+                </Button>
+                <Button type="button" size="icon" variant="ghost" className="size-8" aria-label="取消重命名"
+                  onClick={() => { setEditing(false); setName(cred.label) }}>
+                  <XMarkIcon />
+                </Button>
+              </form>
+            ) : (
+              <div className="truncate text-sm font-semibold tracking-tight" title={cred.label}>{cred.label}</div>
+            )}
+
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-2xs text-muted-foreground">
+              <Badge
+                variant={
+                  cred.ban_reason || cred.expired
+                    ? 'bad'
+                    : cred.rate_limited_secs > 0 || nearLimit || cred.expires_in <= 300
+                      ? 'warn'
+                      : cred.disabled ? 'outline' : 'ok'
+                }
+                className={cn('h-5 px-1.5 py-0 text-2xs', cred.disabled && 'text-muted-foreground')}
+              >
+                {status.label}
+              </Badge>
+              <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.625rem] leading-none" title={`账号 ID：${cred.id}`}>
+                #{cred.id}
+              </span>
               {cred.tier && (
-                <Badge
-                  variant="outline"
-                  className={cn('h-5 shrink-0 gap-1 px-2 py-0 text-2xs font-medium', tierBadgeClass(cred.tier))}
-                >
+                <Badge variant="outline" className={cn('h-5 px-1.5 py-0 text-2xs', tierBadgeClass(cred.tier))}>
                   {cred.tier}
                 </Badge>
               )}
               {editingPriority ? (
-                <form
-                  className="inline-flex items-center gap-0.5"
-                  onSubmit={(event) => { event.preventDefault(); savePriority() }}
-                >
+                <form className="inline-flex items-center gap-0.5" onSubmit={(event) => { event.preventDefault(); savePriority() }}>
                   <Input
                     type="number"
                     value={priorityVal}
                     onChange={(event) => setPriorityVal(event.target.value)}
                     onKeyDown={(event) => { if (event.key === 'Escape') setEditingPriority(false) }}
                     autoFocus
-                    className="h-6 w-12 px-1.5 text-center font-mono text-2xs"
+                    className="h-7 w-12 px-1 text-center font-mono text-2xs"
                     aria-label="优先级"
                   />
-                  <Button type="submit" size="icon" variant="ghost" className="size-6" disabled={prio.isPending} aria-label="保存优先级">
+                  <Button type="submit" size="icon" variant="ghost" className="size-7" disabled={prio.isPending} aria-label="保存优先级">
                     {prio.isPending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
                   </Button>
-                  <Button type="button" size="icon" variant="ghost" className="size-6" onClick={() => setEditingPriority(false)} aria-label="取消修改优先级">
+                  <Button type="button" size="icon" variant="ghost" className="size-7" onClick={() => setEditingPriority(false)} aria-label="取消修改优先级">
                     <XMarkIcon className="size-3" />
                   </Button>
                 </form>
               ) : (
-                <>
-                  <span className="inline-flex h-5 items-center px-1.5 font-mono text-2xs font-medium sm:hidden">
-                    P{cred.priority}
-                  </span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    className="group/priority hidden h-5 shrink-0 items-center gap-1 rounded px-1.5 font-mono text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground sm:inline-flex"
-                    onClick={startPriorityEdit}
-                    title="修改调度优先级（数值小者优先）"
-                  >
-                    P{cred.priority}
-                    <PencilIcon className="size-2.5 opacity-0 transition-opacity group-hover/priority:opacity-50" />
-                  </Button>
-                </>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-5 gap-1 rounded px-1.5 font-mono text-2xs font-medium"
+                  onClick={startPriorityEdit}
+                  title="修改调度优先级（数值小者优先）"
+                >
+                  P{cred.priority}
+                  <PencilIcon className="size-2.5 opacity-40" />
+                </Button>
               )}
-              <span
-                className={cn('inline-flex min-w-0 items-center gap-1', expiry.className)}
-                title={expiry.title}
-              >
-                <ClockIcon className="size-3 shrink-0" />
-                <span className="truncate">{expiry.text}</span>
-              </span>
             </div>
-          </div>
-        </div>
-
-        {/* 右上控制：启用开关 + 溢出菜单 */}
-        <div className="flex h-9 shrink-0 items-center gap-0.5 sm:gap-1">
-          {/* 启用开关：健康态开=绿；封禁/过期等异常态转中性灰（避免绿开关与红状态灯语义冲突）。
-              切换中显示加载圈占位，避免布局跳动。 */}
-          <span className="relative inline-flex items-center">
-            <Switch
-              variant="success"
-              checked={!cred.disabled}
-              onCheckedChange={(on) => toggle.mutate(!on)}
-              disabled={toggle.isPending}
-              title={switchTitle(cred)}
-              aria-label={switchTitle(cred)}
-              className={cn(
-                toggle.isPending && 'opacity-0',
-                // 封禁/过期等异常态：开关转中性灰，不用健康绿，避免与红状态灯冲突。
-                abnormal && 'data-[state=checked]:bg-muted-foreground/50',
-              )}
-            />
-            {toggle.isPending && (
-              <ArrowPathIcon className="absolute left-1/2 top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
+            {cred.ban_reason && (
+              <p className="mt-1.5 truncate text-2xs text-bad" title={cred.ban_reason}>{cred.ban_reason}</p>
             )}
-          </span>
+          </div>
+
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button size="icon" variant="ghost" className="size-8 text-muted-foreground" aria-label={`打开 ${cred.label} 菜单`}>
+              <Button size="icon" variant="ghost" className="-mr-2 -mt-2 size-10 text-muted-foreground" aria-label={`打开 ${cred.label} 菜单`}>
                 <EllipsisHorizontalIcon />
               </Button>
             </DropdownMenuTrigger>
@@ -257,15 +194,16 @@ export function CredentialCard({
               actions={actions}
               onRename={() => setEditing(true)}
               onDeviceLimit={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
+              onTest={() => setTesting(true)}
               onRequestDelete={() => setConfirmDelete(true)}
             />
           </DropdownMenu>
         </div>
       </div>
 
-      {/* 额度区：合并到一个面板，减少卡片内部重复描边。 */}
+      {/* 额度是巡检主信息：窄卡片上下堆叠，卡片自身足够宽时再并排。 */}
       {cred.quota && (has5h || has7d) && (
-        <div className={cn('mb-3 mt-3 grid border-y border-border/70 sm:mb-3.5 sm:mt-3.5', has5h && has7d && '@sm/card:grid-cols-2')}>
+        <div className={cn('mx-3 grid overflow-hidden rounded-lg border border-border/70 bg-muted/20 sm:mx-4', has5h && has7d && '@sm/card:grid-cols-2')}>
           {has5h && (
             <QuotaBar
               label="5 小时额度"
@@ -287,95 +225,119 @@ export function CredentialCard({
           )}
         </div>
       )}
+      {(!cred.quota || (!has5h && !has7d)) && (
+        <div className="mx-3 grid min-h-20 place-items-center rounded-lg border border-border/70 bg-muted/20 px-3 text-2xs text-muted-foreground sm:mx-4">
+          暂无额度数据
+        </div>
+      )}
 
-      {/* 底部：统计信息合并为一行（添加 / 最近使用 / 累计花费 / 设备）。设备可点击编辑上限。 */}
-      <div className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border/60 pt-3 text-2xs text-muted-foreground sm:gap-x-3.5">
-        <span
-          className="hidden items-center gap-1 sm:inline-flex"
-          title={`添加于 ${new Date(cred.created_at * 1000).toLocaleString()}`}
-        >
-          <CalendarDaysIcon className="size-3 shrink-0 opacity-70" />
-          {relativeTime(cred.created_at)}
-        </span>
-        <span className="inline-flex items-center gap-1" title="最近一次转发使用">
-          <ClockIcon className="size-3 shrink-0 opacity-70" />
-          {cred.last_used != null ? relativeTime(cred.last_used) : '未使用'}
-        </span>
-        <span
-          className="inline-flex items-center gap-1"
-          title="该账号历史累计等价 API 费用（按官方定价估算）"
-        >
-          <WalletIcon className="size-3 shrink-0 opacity-70" />
-          <span className="tnum">{formatUsd(cred.cost_total)}</span>
-        </span>
-
-        {/* 设备：摘要按钮展开明细，右侧铅笔单独编辑上限。
-            上限三态——留空跟随全局默认（显示「默认」角标）、0 表示该账号不限、正数为独立上限。 */}
-        {editingLimit ? (
-          <form
-            className="ml-auto flex w-full items-center justify-end gap-1.5 sm:w-auto"
-            onSubmit={(e) => { e.preventDefault(); limit.mutate(inputToLimit(limitVal)) }}
-          >
-            <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
-            <Input
-              type="number"
-              min={0}
-              value={limitVal}
-              onChange={(e) => setLimitVal(e.target.value)}
-              autoFocus
-              placeholder="默认"
-              className="h-8 w-20 px-2 text-xs sm:h-6 sm:w-14 sm:px-1.5 sm:text-2xs"
-              title="留空 = 跟随全局默认上限；0 = 该账号不限；正数 = 该账号独立上限"
-              aria-label="设备上限"
-            />
-            <Button type="submit" size="icon" variant="ghost" className="size-8 sm:size-6" disabled={limit.isPending} aria-label="保存设备上限">
-              {limit.isPending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
-            </Button>
-            <Button type="button" size="icon" variant="ghost" className="size-8 sm:size-6" aria-label="取消修改设备上限"
-              onClick={() => { setEditingLimit(false); setLimitVal(limitToInput(cred.device_limit)) }}>
-              <XMarkIcon className="size-3" />
-            </Button>
-          </form>
-        ) : (
-          <div className="ml-auto inline-flex h-8 items-center gap-0.5 sm:h-7">
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => setShowDevices((v) => !v)}
-              className="h-full gap-1.5 px-2 text-2xs font-normal text-muted-foreground"
-              title={showDevices ? '收起已绑定设备' : '查看已绑定设备'}
-              aria-expanded={showDevices}
-              aria-label={`${showDevices ? '收起' : '展开'}已绑定设备，当前 ${cred.device_count} 台`}
-            >
-              <DevicePhoneMobileIcon className="size-3 shrink-0 opacity-70" />
-              <span className="tnum">
-                设备 {cred.device_count}/
-                {cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'}
-              </span>
-              {cred.device_limit === 0 && (
-                <span className="rounded bg-muted px-1 text-[0.625rem] leading-4 text-muted-foreground">
-                  默认
-                </span>
-              )}
-              <ChevronDownIcon className={cn('size-3 transition-transform', showDevices && 'rotate-180')} />
-            </Button>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              onClick={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
-              className="hidden size-7 shrink-0 text-muted-foreground sm:inline-flex"
-              title="调整设备上限"
-              aria-label="调整设备上限"
-            >
-              <PencilIcon className="size-3" />
-            </Button>
+      {/* 固定三列事实指标，避免 footer 内容随账号数据长短跳位。 */}
+      {editingLimit ? (
+        <div className="mx-3 mt-3 rounded-lg border border-border/70 bg-muted/25 p-3 sm:mx-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-medium">设备上限</div>
+              <p className="mt-0.5 text-2xs text-muted-foreground">留空使用默认值，0 表示不限。</p>
+            </div>
+            <form className="flex w-full items-center justify-end gap-1 sm:w-auto" onSubmit={(e) => { e.preventDefault(); limit.mutate(inputToLimit(limitVal)) }}>
+              <Input
+                type="number"
+                min={0}
+                value={limitVal}
+                onChange={(e) => setLimitVal(e.target.value)}
+                autoFocus
+                placeholder="默认"
+                className="h-9 w-20 px-2 text-xs"
+                aria-label="设备上限"
+              />
+              <Button type="submit" size="icon" variant="ghost" className="size-9" disabled={limit.isPending} aria-label="保存设备上限">
+                {limit.isPending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
+              </Button>
+              <Button type="button" size="icon" variant="ghost" className="size-9" aria-label="取消修改设备上限"
+                onClick={() => { setEditingLimit(false); setLimitVal(limitToInput(cred.device_limit)) }}>
+                <XMarkIcon className="size-3" />
+              </Button>
+            </form>
           </div>
-        )}
-      </div>
+        </div>
+      ) : (
+        <div className="mx-3 mt-3 grid min-h-16 grid-cols-3 divide-x divide-border/70 rounded-lg bg-muted/35 sm:mx-4">
+          <div className="min-w-0 px-2.5 py-2.5" title="最近一次转发使用">
+            <div className="text-2xs text-muted-foreground">最近使用</div>
+            <div className="mt-1 truncate text-xs font-semibold tnum text-foreground">
+              {cred.last_used != null ? relativeTime(cred.last_used) : '未使用'}
+            </div>
+          </div>
+          <div className="min-w-0 px-2.5 py-2.5" title="该账号历史累计等价 API 费用（按官方定价估算）">
+            <div className="text-2xs text-muted-foreground">累计花费</div>
+            <div className="mt-1 truncate text-xs font-semibold tnum text-foreground">{formatUsd(cred.cost_total)}</div>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => setShowDevices((v) => !v)}
+            className="h-auto min-w-0 justify-between whitespace-normal rounded-none px-2.5 py-2 text-left hover:bg-background/50"
+            title={showDevices ? '收起已绑定设备' : '查看已绑定设备'}
+            aria-expanded={showDevices}
+            aria-label={`${showDevices ? '收起' : '展开'}已绑定设备，当前 ${cred.device_count} 台`}
+          >
+            <span className="min-w-0">
+              <span className="flex items-center gap-1 text-2xs font-normal text-muted-foreground">
+                设备
+                {cred.device_limit === 0 && <span className="rounded bg-background/70 px-1 text-[0.5625rem]">默认</span>}
+              </span>
+              <span className="mt-1 block truncate text-xs font-semibold tnum text-foreground">
+                {cred.device_count}/{effectiveDeviceLimit}
+              </span>
+            </span>
+            <ChevronDownIcon className={cn('size-3 text-muted-foreground transition-transform', showDevices && 'rotate-180')} />
+          </Button>
+        </div>
+      )}
 
-      {showDevices && <DeviceList credId={cred.id} />}
+      {showDevices && (
+        <DeviceList
+          credId={cred.id}
+          onEditLimit={() => { setLimitVal(limitToInput(cred.device_limit)); setEditingLimit(true) }}
+        />
+      )}
+
+      {/* 参与调度独占底栏，与右上管理菜单彻底分区。 */}
+      <div className="mt-3 flex min-h-12 items-center justify-between gap-3 border-t border-border/70 bg-muted/10 px-3 py-2.5 sm:px-4">
+        <div className="min-w-0">
+          <div className="text-2xs text-muted-foreground">凭证有效期</div>
+          <div className={cn('mt-0.5 flex min-w-0 items-center gap-1 text-xs font-medium', expiry.className)} title={expiry.title}>
+            <ClockIcon className="size-3 shrink-0" />
+            <span className="truncate">{expiry.text}</span>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-3">
+          <span className="text-right">
+            <span className="block text-2xs text-muted-foreground">参与调度</span>
+            <span className={cn('mt-0.5 block text-xs font-medium', cred.disabled ? 'text-muted-foreground' : 'text-foreground')}>
+              {cred.disabled ? '已停用' : '已启用'}
+            </span>
+          </span>
+          <span className="relative inline-flex items-center">
+            <Switch
+              variant="success"
+              checked={!cred.disabled}
+              onCheckedChange={(on) => toggle.mutate(!on)}
+              disabled={toggle.isPending}
+              title={switchTitle(cred)}
+              aria-label={switchTitle(cred)}
+              className={cn(
+                "relative after:absolute after:-inset-x-1 after:-inset-y-3 after:content-['']",
+                toggle.isPending && 'opacity-0',
+                abnormal && 'data-[state=checked]:bg-muted-foreground/50',
+              )}
+            />
+            {toggle.isPending && (
+              <ArrowPathIcon className="absolute left-1/2 top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 animate-spin text-muted-foreground" />
+            )}
+          </span>
+        </div>
+      </div>
 
       <DeleteCredentialDialog
         cred={cred}
@@ -383,6 +345,7 @@ export function CredentialCard({
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
       />
+      <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
     </Card>
   )
 }
@@ -393,7 +356,7 @@ export function CredentialCard({
  * 口径与上方「设备 x/y」的 x 完全一致（后端按同一个绑定 TTL 过滤），条数必然对得上；
  * 超时未活跃的绑定既不占名额也不在这里出现。
  */
-function DeviceList({ credId }: { credId: number }) {
+function DeviceList({ credId, onEditLimit }: { credId: number; onEditLimit: () => void }) {
   const qc = useQueryClient()
   const { data, isPending, error } = useQuery({
     queryKey: ['credential-devices', credId],
@@ -412,12 +375,17 @@ function DeviceList({ credId }: { credId: number }) {
   })
 
   return (
-    <div className="mt-3 animate-in border-t border-border/80 text-xs fade-in-0 slide-in-from-top-1 duration-200 motion-reduce:animate-none">
-      <div className="flex items-center justify-between border-b border-border/70 py-2.5">
-        <span className="font-medium text-foreground">已绑定设备</span>
-        {!isPending && !error && (
-          <span className="tnum text-2xs text-muted-foreground">{data.length} 台</span>
-        )}
+    <div className="mx-3 mt-3 animate-in rounded-lg border border-border/70 px-3 pb-3 text-xs fade-in-0 slide-in-from-top-1 duration-200 motion-reduce:animate-none sm:mx-4">
+      <div className="flex items-center justify-between gap-3 border-b border-border/70 py-2">
+        <span className="inline-flex items-center gap-2 font-medium text-foreground">
+          已绑定设备
+          {!isPending && !error && (
+            <span className="tnum text-2xs font-normal text-muted-foreground">{data.length} 台</span>
+          )}
+        </span>
+        <Button size="sm" variant="ghost" className="h-8 px-2 text-2xs" onClick={onEditLimit}>
+          <PencilIcon className="size-3" />调整上限
+        </Button>
       </div>
       {isPending ? (
         <span className="inline-flex items-center gap-1.5 py-3 text-muted-foreground" role="status">
@@ -428,7 +396,7 @@ function DeviceList({ credId }: { credId: number }) {
       ) : data.length === 0 ? (
         <span className="block py-3 text-muted-foreground">暂无活跃设备</span>
       ) : (
-        <ul className="divide-y divide-border">
+        <ul className="scrollbar-dialog max-h-96 divide-y divide-border overflow-y-auto overscroll-contain pr-1">
           {data.map((d) => (
             <li key={d.device_id} className="py-3">
               <div className="flex items-start gap-2.5">
@@ -520,7 +488,7 @@ function QuotaBar({
       : '上游未返回该窗口的额度信息'
     return (
       <div
-        className={cn('px-3 py-2.5 text-2xs text-muted-foreground', className)}
+        className={cn('flex min-h-24 flex-col justify-center px-3 py-3 text-2xs text-muted-foreground', className)}
         title={`${reason}。最后一次快照：${formatFullTime(snapshotTs)}`}
       >
         {label} · {reset != null ? '已重置，暂无新用量' : '暂无数据'}
@@ -532,7 +500,7 @@ function QuotaBar({
   const barColor = critical ? 'bg-bad' : util >= 0.7 ? 'bg-warn' : 'bg-ok'
   const pctColor = critical ? 'text-bad' : util >= 0.7 ? 'text-warn' : 'text-foreground'
   return (
-    <div className={cn('px-3 py-2.5', className)}>
+    <div className={cn('min-h-24 px-3 py-3', className)}>
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-2xs font-medium text-muted-foreground">{label}</span>
         {/* 百分比只在有请求经过时才刷新，标注快照时间，免得把很旧的数当成实时值。 */}

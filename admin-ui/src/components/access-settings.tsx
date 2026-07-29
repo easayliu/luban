@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Cog6ToothIcon, EyeIcon, EyeSlashIcon, ClipboardDocumentIcon, CheckIcon, SparklesIcon,
-  ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, LockClosedIcon, KeyIcon,
+  ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, KeyIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
@@ -13,11 +13,10 @@ import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth
 import { setPw, clearPw } from '@/api/client'
 import { cn, copyText, extractError, formatDuration } from '@/lib/utils'
 import {
-  Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle, DialogDescription,
+  Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
@@ -29,13 +28,12 @@ export function AccessSettings({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-2xl" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>
             <Cog6ToothIcon className="size-4" />
             接入设置
           </DialogTitle>
-          <DialogDescription>管理客户端接入、设备策略和控制台安全。</DialogDescription>
         </DialogHeader>
         <DialogBody>
           <AccessSettingsContent />
@@ -47,7 +45,8 @@ export function AccessSettings({
 
 export function AccessSettingsContent() {
   const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { data } = settingsQuery
 
   const [draft, setDraft] = useState('')
   const [show, setShow] = useState(false)
@@ -80,18 +79,30 @@ export function AccessSettingsContent() {
     `export ANTHROPIC_BASE_URL=${baseUrl}\n` +
     (currentKey ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}` : '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN')
 
+  if (settingsQuery.isPending) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+        <ArrowPathIcon className="size-4 animate-spin" />
+        正在加载设置
+      </div>
+    )
+  }
+
+  if (settingsQuery.isError) {
+    return (
+      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
+        <p className="text-sm font-medium">无法读取当前设置</p>
+        <Button size="sm" variant="outline" onClick={() => settingsQuery.refetch()} disabled={settingsQuery.isFetching}>
+          <ArrowPathIcon className={cn(settingsQuery.isFetching && 'animate-spin')} />
+          重试
+        </Button>
+      </div>
+    )
+  }
+
   return (
     <>
       <div className="space-y-8">
-        {envManaged && (
-          <div className="flex items-center gap-2 border-l-2 border-border py-1 pl-3 text-xs text-muted-foreground">
-            <Badge variant="outline" className="gap-1">
-              <LockClosedIcon className="size-3" />
-              环境接管
-            </Badge>
-            <span>部分设置由环境变量管理，页面仅供查看。</span>
-          </div>
-        )}
           <SettingsSection title="客户端接入">
             <Field label="接入地址" code="ANTHROPIC_BASE_URL">
               <div className="flex items-center gap-2">
@@ -211,7 +222,7 @@ function DeviceBindingTtl() {
         <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
       <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        超时无请求的设备会自动释放绑定；填 0 表示永不过期。
+        超时无请求的设备会自动释放绑定。
       </p>
     </Field>
   )
@@ -261,7 +272,7 @@ function DefaultDeviceLimit() {
         </span>
       </div>
       <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        未单独配置的账号跟随此值；账号卡片中的独立设置会覆盖它。
+        未单独配置的账号使用此上限；账号独立设置优先。
       </p>
     </Field>
   )
@@ -295,12 +306,9 @@ function RequireDeviceIdToggle() {
         />
       </div>
       <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        开启后，缺少 <code className="font-mono">metadata.user_id</code> 的请求会返回 403。
-        {!required && (
-          <span className="text-warn">
-            {' '}当前已关闭：这类请求会被转发，但不绑定账号、不占设备名额，因而绕过设备上限。
-          </span>
-        )}
+        {required
+          ? '缺少设备身份的请求会被拒绝。'
+          : <span className="text-warn">无设备身份的请求将被放行，且不受设备上限限制。</span>}
       </p>
     </Field>
   )
@@ -340,40 +348,43 @@ function BareRateLimit() {
   const unchanged = limit === (data?.bare_rate_limit ?? 0) && win === (data?.bare_rate_window_secs ?? 60)
 
   return (
-    <Field label="裸请求速率上限（每个账号）">
-      <div className="flex flex-wrap items-center gap-2">
-        <Input
-          type="number"
-          min={0}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          className="w-full font-mono sm:w-28"
-          aria-label="裸请求速率上限（条）"
-        />
-        <span className="text-xs text-muted-foreground">条 /</span>
-        <Input
-          type="number"
-          min={1}
-          value={windowDraft}
-          onChange={(e) => setWindowDraft(e.target.value)}
-          className="w-full font-mono sm:w-24"
-          aria-label="裸请求速率窗口（秒）"
-        />
-        <span className="text-xs text-muted-foreground">秒</span>
-        <Button size="sm" onClick={() => save.mutate({ limit, win })} disabled={save.isPending || unchanged}>
+    <Field label="无设备身份请求上限（每个账号）">
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-end">
+        <label className="space-y-1 text-2xs text-muted-foreground">
+          <span className="block">请求数</span>
+          <span className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              className="min-w-0 font-mono sm:w-28"
+              aria-label="无设备身份请求上限（条）"
+            />
+            <span>条</span>
+          </span>
+        </label>
+        <label className="space-y-1 text-2xs text-muted-foreground">
+          <span className="block">时间窗口</span>
+          <span className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={1}
+              value={windowDraft}
+              onChange={(e) => setWindowDraft(e.target.value)}
+              className="min-w-0 font-mono sm:w-24"
+              aria-label="无设备身份请求窗口（秒）"
+            />
+            <span>秒</span>
+          </span>
+        </label>
+        <Button className="col-span-2 w-full sm:w-auto" size="sm" onClick={() => save.mutate({ limit, win })} disabled={save.isPending || unchanged}>
           {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
         </Button>
-        <span className="text-xs text-muted-foreground">
-          {limit > 0 ? `每个账号每 ${formatDuration(win)} 最多 ${limit} 条` : '不限'}
-        </span>
       </div>
       <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        只统计 <code className="font-mono">/v1/messages</code> 上无
-        <code className="font-mono">metadata.user_id</code> 的请求——它们不绑定账号、不占设备名额，
-        设备上限管不到；<code className="font-mono">count_tokens</code> 不产生用量也不消耗额度，
-        不计入。某个账号发满后会自动改选其它账号，全部发满才返回
-        <code className="font-mono">429</code>（带 <code className="font-mono">retry-after</code>）。
-        计数在内存中，重启清零。
+        仅统计无设备身份的消息请求，Token 计数接口不计入；单个账号达到上限后会自动换号，
+        全部达到上限才拒绝。服务重启后重新计数。
       </p>
     </Field>
   )
@@ -381,7 +392,8 @@ function BareRateLimit() {
 
 /** 管理密码：未设置→设置；已设置→修改/清除（环境接管时只读）。 */
 function AdminPassword() {
-  const { data } = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
+  const authQuery = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
+  const { data } = authQuery
   const [pw, setPwInput] = useState('')
   const [clearOpen, setClearOpen] = useState(false)
 
@@ -402,6 +414,29 @@ function AdminPassword() {
   const envManaged = data?.env_managed ?? false
   const configured = data?.configured ?? false
 
+  if (authQuery.isPending) {
+    return (
+      <Field label="管理密码（登录网页所需）">
+        <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
+          <ArrowPathIcon className="size-3 animate-spin" />正在加载
+        </span>
+      </Field>
+    )
+  }
+
+  if (authQuery.isError) {
+    return (
+      <Field label="管理密码（登录网页所需）">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-bad">无法读取登录状态</span>
+          <Button size="sm" variant="outline" onClick={() => authQuery.refetch()} disabled={authQuery.isFetching}>
+            <ArrowPathIcon className={cn(authQuery.isFetching && 'animate-spin')} />重试
+          </Button>
+        </div>
+      </Field>
+    )
+  }
+
   return (
     <>
     <Field label="管理密码（登录网页所需）">
@@ -416,7 +451,7 @@ function AdminPassword() {
               type="password"
               value={pw}
               onChange={(e) => setPwInput(e.target.value)}
-              placeholder={configured ? '输入新密码以修改' : '设置密码（至少 4 位，之后登录需要）'}
+              placeholder={configured ? '输入新密码' : '至少 4 位'}
               className="min-w-0 flex-1"
               aria-label={configured ? '新管理密码' : '管理密码'}
             />
@@ -434,7 +469,7 @@ function AdminPassword() {
           </div>
           {!configured && (
             <p className="mt-1.5 text-xs text-muted-foreground">
-              未设置时网页对同网段开放；绑定 0.0.0.0 时建议设置。
+              未设置密码时，任何能访问控制台的设备都无需登录；对外开放时建议设置。
             </p>
           )}
         </>

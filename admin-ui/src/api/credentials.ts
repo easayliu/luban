@@ -168,3 +168,53 @@ export async function refreshCredential(id: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/refresh`)
   return data
 }
+
+/**
+ * 一次测试从上游限流头读到的额度快照。
+ *
+ * 与账号卡片上的 [`Quota`] 同名同义，但**没有 cost_5h/cost_7d**——那两个是后端按窗口起点
+ * 聚合出来的，单次响应的头里没有。这份读数会随用量日志落库，所以卡片上的额度也会跟着更新，
+ * 两处显示的是同一次读数。
+ */
+export interface ProbeQuota {
+  /** `allowed` / `allowed_warning` / `rejected`。 */
+  unified_status: string | null
+  rl_5h_utilization: number | null
+  rl_5h_reset: number | null
+  rl_7d_utilization: number | null
+  rl_7d_reset: number | null
+  /** 上游认为「当前是哪个窗口在管事」。 */
+  rl_representative: string | null
+  /** `retry-after`（秒）；只有 429 才有，是这次拒绝给出的等待时间。 */
+  retry_after_secs: number | null
+}
+
+/** 一次连通性测试的结果。 */
+export interface ProbeResult {
+  /** 上游是否 2xx。 */
+  ok: boolean
+  /** 上游 HTTP 状态码；**0 表示请求根本没到上游**（取 token 失败/连不上/超时），原因见 error。 */
+  status: number
+  /** 从发出到读完响应的耗时（毫秒）。 */
+  latency_ms: number
+  /** 上游实际回报的模型名（成功时才有）；别名会在上游解析成具体版本，故可能与请求的不同。 */
+  model: string | null
+  /** 上游错误类型（`error.type`）。 */
+  error_type: string | null
+  /** 失败原因原文。 */
+  error: string | null
+  /** 本次响应的限流头快照；请求没到上游、或响应没带这些头时为 null。 */
+  quota: ProbeQuota | null
+}
+
+/**
+ * 连通性测试：用**这一个**账号向上游发一条最小请求（`max_tokens=1`），看它能不能用该模型。
+ *
+ * 不走负载均衡选号、不占设备名额、失败也不会自动停用账号，但会写一条用量日志（`device_id`
+ * 标为 `probe`，卡片上的额度与累计花费据此更新），也会真的打到上游、消耗一点点订阅额度。
+ * 上游拒绝同样是 200 + 一份结果（状态码在 `status` 里），不是 HTTP 错误。
+ */
+export async function probeCredential(id: number, model: string): Promise<ProbeResult> {
+  const { data } = await api.post<ProbeResult>(`/credentials/${id}/test`, { model })
+  return data
+}

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowTopRightOnSquareIcon, ArrowRightIcon, ArrowPathIcon,
@@ -8,7 +8,7 @@ import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
-  Dialog, DialogContent, DialogHeader, DialogBody, DialogFooter, DialogTitle, DialogDescription,
+  Dialog, DialogContent, DialogHeader, DialogBody, DialogFooter, DialogTitle,
 } from '@/components/ui/dialog'
 import { Textarea } from '@/components/ui/textarea'
 import { Input } from '@/components/ui/input'
@@ -25,6 +25,24 @@ export function AddAccount({
   const [code, setCode] = useState('')
   const [label, setLabel] = useState('')
 
+  const reset = () => {
+    setCode('')
+    setLabel('')
+    setAuthUrl(null)
+  }
+  const handleOpenChange = (next: boolean) => {
+    if (!next) reset()
+    onOpenChange(next)
+  }
+
+  useEffect(() => {
+    if (open) {
+      setCode('')
+      setLabel('')
+      setAuthUrl(null)
+    }
+  }, [open])
+
   const authorize = useMutation({
     mutationFn: getAuthorizeUrl,
     onSuccess: ({ url }) => { setAuthUrl(url); window.open(url, '_blank', 'noopener') },
@@ -36,25 +54,20 @@ export function AddAccount({
     onSuccess: (cred) => {
       toast.success('已添加账号', { description: cred.label })
       qc.invalidateQueries({ queryKey: ['credentials'] })
-      // 关闭并复位，下次打开是干净的表单（授权码是一次性的）。
-      setCode('')
-      setLabel('')
-      setAuthUrl(null)
-      onOpenChange(false)
+      handleOpenChange(false)
     },
     onError: (e) => toast.error('添加失败', { description: extractError(e) }),
   })
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>添加 Claude 账号</DialogTitle>
-          <DialogDescription>完成 OAuth 授权后，账号会加入当前调度池。</DialogDescription>
         </DialogHeader>
         <DialogBody className="space-y-4">
           <Step n={1} title="打开授权页面">
-            <p className="text-xs leading-5 text-muted-foreground">使用需要接入的 Claude 订阅账号完成授权。</p>
+            <p className="text-xs leading-5 text-muted-foreground">使用要接入的 Claude 订阅账号授权。</p>
             <Button className="w-full sm:w-auto" onClick={() => authorize.mutate()} disabled={authorize.isPending}>
               {authorize.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowTopRightOnSquareIcon />}
               打开 Claude 授权页
@@ -92,7 +105,7 @@ export function AddAccount({
           </Step>
         </DialogBody>
         <DialogFooter>
-          <Button variant="outline" className="w-full sm:w-auto" onClick={() => onOpenChange(false)} disabled={exchange.isPending}>
+          <Button variant="outline" className="w-full sm:w-auto" onClick={() => handleOpenChange(false)} disabled={exchange.isPending}>
             取消
           </Button>
           <Button className="w-full sm:w-auto" onClick={() => exchange.mutate()} disabled={exchange.isPending || !code.trim()}>

@@ -107,6 +107,7 @@ pub async fn run(
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
         .route("/credentials/{id}/refresh", post(refresh_credential))
+        .route("/credentials/{id}/test", post(test_credential))
         .route("/usage", get(list_usage))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
@@ -540,6 +541,33 @@ async fn refresh_credential(
         }
     }
     view_of(&state, id)
+}
+
+#[derive(Deserialize)]
+struct TestReq {
+    /// 要测的模型名（如 `claude-opus-5`）。原样发给上游，不做白名单校验——模型名会随官方
+    /// 上新变化，写死一份清单只会在下次上新时把新模型挡在外面，而「模型名不对」上游本来就
+    /// 会回一条清清楚楚的 404/400，那正是这个功能要展示的东西。
+    model: String,
+}
+
+/// 连通性测试：用**指定**账号向上游发一条最小请求，看这个号能不能用这个模型。
+///
+/// 停用/封禁的号也允许测——「它是不是已经恢复了」正是要问的问题，所以这里只校验凭证存在。
+/// 测试的副作用与代价见 [`proxy::probe`]：不选号、不改账号状态，但会写一条用量日志
+/// （卡片上的额度与花费据此更新），也真的会消耗一点点订阅额度。上游拒绝（4xx/5xx）不是本接口的错误，照样 200 返回一份结果，
+/// 由前端展示状态码与原因；只有「凭证不存在」「模型名没填」才是 4xx。
+async fn test_credential(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<TestReq>,
+) -> Result<Json<proxy::ProbeReport>, ApiError> {
+    let model = req.model.trim();
+    if model.is_empty() {
+        return Err(bad_request("请填写要测试的模型名"));
+    }
+    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    Ok(Json(proxy::probe(&state, &cred, model).await))
 }
 
 /// 读取单条并转为脱敏视图（含已绑定设备数）。

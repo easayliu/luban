@@ -6,8 +6,8 @@ import {
 import { type Credential } from '@/api/credentials'
 import { cn, formatUsd, relativeTime } from '@/lib/utils'
 import {
-  CredentialMenuContent, DeleteCredentialDialog, expiryMeta, isAbnormal, isNearLimit,
-  inputToLimit, limitToInput, liveQuota, statusMeta, switchTitle, tierBadgeClass,
+  ConnectivityTestDialog, CredentialMenuContent, DeleteCredentialDialog, expiryMeta, isAbnormal,
+  isNearLimit, inputToLimit, limitToInput, liveQuota, statusMeta, switchTitle, tierBadgeClass,
   useCredentialActions,
   type CredentialActions, type SortDir, type SortKey,
 } from '@/components/credential-shared'
@@ -145,6 +145,7 @@ export function CredentialRow({
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitValue, setLimitValue] = useState(limitToInput(cred.device_limit))
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [testing, setTesting] = useState(false)
   const actions = useCredentialActions(
     cred,
     () => setEditing(false),
@@ -262,6 +263,7 @@ export function CredentialRow({
                   actions={actions}
                   onRename={() => setEditing(true)}
                   onDeviceLimit={startLimitEdit}
+                  onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
                 />
               </div>
@@ -286,6 +288,7 @@ export function CredentialRow({
                     label="设备上限"
                     placeholder="默认"
                     min={0}
+                    hint="留空 = 默认，0 = 不限"
                     onChange={setLimitValue}
                     onSubmit={saveLimit}
                     onCancel={() => setEditingLimit(false)}
@@ -417,6 +420,7 @@ export function CredentialRow({
                 showMenu={false}
                 onRename={() => setEditing(true)}
                 onDeviceLimit={startLimitEdit}
+                onTest={() => setTesting(true)}
                 onRequestDelete={() => setConfirmDelete(true)}
               />
               <Button
@@ -453,6 +457,7 @@ export function CredentialRow({
               placeholder="默认"
               min={0}
               compact
+              hint="留空 = 默认，0 = 不限"
               onChange={setLimitValue}
               onSubmit={saveLimit}
               onCancel={() => setEditingLimit(false)}
@@ -493,6 +498,7 @@ export function CredentialRow({
             showSwitch={false}
             onRename={() => setEditing(true)}
             onDeviceLimit={startLimitEdit}
+            onTest={() => setTesting(true)}
             onRequestDelete={() => setConfirmDelete(true)}
           />
           {/* 弹窗用 Portal 渲染到 body，挂在 <td> 里不会破坏表格结构。 */}
@@ -502,6 +508,7 @@ export function CredentialRow({
             open={confirmDelete}
             onOpenChange={setConfirmDelete}
           />
+          <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
         </ListCellLine>
       </TableCell>
     </TableRow>
@@ -634,7 +641,7 @@ function EditableCredentialName({
 }
 
 function CompactNumberEditor({
-  value, pending, label, placeholder, min, compact = false, onChange, onSubmit, onCancel,
+  value, pending, label, placeholder, min, compact = false, hint, onChange, onSubmit, onCancel,
 }: {
   value: string
   pending: boolean
@@ -642,38 +649,45 @@ function CompactNumberEditor({
   placeholder?: string
   min?: number
   compact?: boolean
+  hint?: string
   onChange: (value: string) => void
   onSubmit: () => void
   onCancel: () => void
 }) {
   return (
-    <form
-      className={cn('inline-flex items-center justify-end', compact ? 'gap-px' : 'gap-0.5')}
-      onSubmit={(event) => { event.preventDefault(); onSubmit() }}
-    >
-      <Input
-        type="number"
-        min={min}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => { if (event.key === 'Escape') onCancel() }}
-        autoFocus
-        placeholder={placeholder}
-        className={cn(
-          'h-7 text-center font-mono text-2xs',
-          compact
-            ? 'w-9 rounded-none border-border bg-transparent px-1 shadow-none [border-width:0_0_1px_0] focus-visible:ring-0'
-            : 'w-12 px-1.5',
-        )}
-        aria-label={label}
-      />
-      <Button type="submit" size="icon" variant="ghost" className={compact ? 'size-6' : 'size-7'} disabled={pending} aria-label={`保存${label}`}>
-        {pending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
-      </Button>
-      <Button type="button" size="icon" variant="ghost" className={compact ? 'size-6' : 'size-7'} onClick={onCancel} aria-label={`取消修改${label}`}>
-        <XMarkIcon className="size-3" />
-      </Button>
-    </form>
+    <div className="inline-flex flex-col items-end gap-1">
+      <form
+        className={cn('inline-flex items-center justify-end', compact ? 'gap-px' : 'gap-0.5')}
+        onSubmit={(event) => { event.preventDefault(); onSubmit() }}
+      >
+        <Input
+          type="number"
+          min={min}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') onCancel() }}
+          autoFocus
+          placeholder={placeholder}
+          title={hint}
+          className={cn(
+            'h-7 text-center font-mono text-2xs',
+            compact
+              ? 'w-9 rounded-none border-border bg-transparent px-1 shadow-none [border-width:0_0_1px_0] focus-visible:ring-0'
+              : 'w-12 px-1.5',
+          )}
+          aria-label={label}
+        />
+        <Button type="submit" size="icon" variant="ghost" className={compact ? 'size-6' : 'size-7'} disabled={pending} aria-label={`保存${label}`}>
+          {pending ? <ArrowPathIcon className="size-3 animate-spin" /> : <CheckIcon className="size-3" />}
+        </Button>
+        <Button type="button" size="icon" variant="ghost" className={compact ? 'size-6' : 'size-7'} onClick={onCancel} aria-label={`取消修改${label}`}>
+          <XMarkIcon className="size-3" />
+        </Button>
+      </form>
+      {hint && !compact && (
+        <span className="text-[0.625rem] leading-4 text-muted-foreground">{hint}</span>
+      )}
+    </div>
   )
 }
 
@@ -727,7 +741,8 @@ function ListQuotaMeter({
 }
 
 function CredentialRowActions({
-  cred, actions, showSwitch = true, showMenu = true, onRename, onDeviceLimit, onRequestDelete,
+  cred, actions, showSwitch = true, showMenu = true,
+  onRename, onDeviceLimit, onTest, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
@@ -735,6 +750,7 @@ function CredentialRowActions({
   showMenu?: boolean
   onRename: () => void
   onDeviceLimit: () => void
+  onTest: () => void
   onRequestDelete: () => void
 }) {
   const { toggle } = actions
@@ -769,6 +785,7 @@ function CredentialRowActions({
           actions={actions}
           onRename={onRename}
           onDeviceLimit={onDeviceLimit}
+          onTest={onTest}
           onRequestDelete={onRequestDelete}
         />
       </DropdownMenu>}

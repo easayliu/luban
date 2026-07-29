@@ -2110,6 +2110,356 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
     !matches!(n.as_str(), "content-length" | "transfer-encoding" | "connection")
 }
 
+// ---------- 连通性测试 ----------
+
+/// 一次连通性测试最多等多久。上游客户端本身没设超时（流式响应可以跑很久），但测试是人在
+/// 网页上等着的：它只发一条 `max_tokens=1` 的请求，正常几百毫秒就该回来，超过这个数就是
+/// 上游不通或被中间设备吞了，报出来比让页面一直转圈有用。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 一次连通性测试的结果（[`crate::web`] 原样 JSON 回给前端）。
+#[derive(serde::Serialize)]
+pub struct ProbeReport {
+    /// 上游是否 2xx。
+    pub ok: bool,
+    /// 上游 HTTP 状态码；**`0` 表示请求根本没到上游**（取 token 失败、连不上、超时），
+    /// 此时原因在 `error` 里。
+    pub status: u16,
+    /// 从「开始发」到「响应体读完」的耗时（毫秒）。请求没发出去时是失败前的耗时。
+    pub latency_ms: u128,
+    /// 上游实际回报的模型名（成功时才有）。可能与请求的不同——别名会在上游解析成具体版本，
+    /// 这正是「这个模型名到底指向什么」的答案。
+    pub model: Option<String>,
+    /// 上游错误类型（`error.type`，如 `rate_limit_error`/`permission_error`）。
+    pub error_type: Option<String>,
+    /// 失败原因原文（上游 `error.message`，解析不出就是整段响应体 / luban 侧的错误链）。
+    pub error: Option<String>,
+    /// 本次响应的限流头快照；请求没到上游、或响应压根没带这些头时为 `None`。
+    pub quota: Option<ProbeQuota>,
+}
+
+/// 一次测试从上游限流头读到的额度快照。
+///
+/// 字段名与 [`store::QuotaSnapshot`] 对齐（前端两处共用同一套读法），但**少了 `cost_5h`/
+/// `cost_7d`**：那两个是后端按 `usage_logs` 累加出来的，而测试刻意不落日志（见 [`probe`]），
+/// 没有数据源可算。
+///
+/// 这份读数同时会随用量日志落库（见 [`log_probe_usage`]），所以卡片上的额度也跟着更新——
+/// 弹窗与卡片显示的是同一次读数，不会一个新一个旧。
+#[derive(serde::Serialize)]
+pub struct ProbeQuota {
+    /// `anthropic-ratelimit-unified-status`（如 `allowed`/`allowed_warning`/`rejected`）。
+    pub unified_status: Option<String>,
+    pub rl_5h_utilization: Option<f64>,
+    pub rl_5h_reset: Option<i64>,
+    pub rl_7d_utilization: Option<f64>,
+    pub rl_7d_reset: Option<i64>,
+    /// `…-representative-claim`：上游认为「当前是哪个窗口在管事」。
+    pub rl_representative: Option<String>,
+    /// `retry-after`（秒）。只有 429 才有，且它是**这次拒绝**给出的等待时间，比各窗口的
+    /// reset 更直接（实测给过 63 小时，直指 7 天窗口的重置时刻）。
+    pub retry_after_secs: Option<i64>,
+}
+
+impl ProbeQuota {
+    /// 从已解析的限流头构造；一个字段都没有时返回 `None`。
+    ///
+    /// CDN 拦截页、网关错误那类响应压根不带这些头，给前端一坨全 `null` 的对象，它就得自己
+    /// 再判一遍「这些是不是全空」——不如在这里说清楚「没有」。
+    fn from_info(info: &RateLimitInfo) -> Option<Self> {
+        let q = Self {
+            unified_status: info.unified_status.clone(),
+            rl_5h_utilization: info.five_h_utilization,
+            rl_5h_reset: info.five_h_reset,
+            rl_7d_utilization: info.seven_d_utilization,
+            rl_7d_reset: info.seven_d_reset,
+            rl_representative: info.representative.clone(),
+            retry_after_secs: info.retry_after,
+        };
+        let empty = q.unified_status.is_none()
+            && q.rl_5h_utilization.is_none()
+            && q.rl_5h_reset.is_none()
+            && q.rl_7d_utilization.is_none()
+            && q.rl_7d_reset.is_none()
+            && q.rl_representative.is_none()
+            && q.retry_after_secs.is_none();
+        (!empty).then_some(q)
+    }
+}
+
+impl ProbeReport {
+    /// 请求没到上游（或没读到响应）时的结果：状态码留 0，原因写进 `error`。
+    fn failed(latency_ms: u128, error: String) -> Self {
+        Self {
+            ok: false,
+            status: 0,
+            latency_ms,
+            model: None,
+            error_type: None,
+            error: Some(error),
+            quota: None,
+        }
+    }
+}
+
+/// 用**指定**凭证向上游发一条最小请求，测这个账号能不能用这个模型。
+///
+/// 与转发路径的三处刻意不同：
+///
+/// 1. **不选号**：走 [`store::access_token_of`] 直接取这一个凭证的 token
+///    （[`store::valid_access_token_for_device`] 会按负载均衡挑号，那测出来的就不是它了），
+///    也因此不写设备绑定、不占 `device_limit` 名额、不计裸请求限流。停用/封禁的号照样能测——
+///    「它是不是已经恢复了」正是要问的问题。
+/// 2. **形态开关一律按默认全开**（[`store::ForwardFlags::default`]），不读库里那份配置：
+///    测试要回答的是「这个账号 + 这个模型通不通」，掺进用户自己拨过的开关，失败时就分不清
+///    是账号的问题还是配置的问题了。于是这里恒定发一条**官方形态**的请求，作为基准。
+/// 3. **不改账号状态**：429 不打冷却、命中封号特征也不自动停用——一次手动测试不该顺手
+///    停掉一个号，那个判定留给真实流量。
+///
+/// 但它**照常写一条用量日志**（[`log_probe_usage`]）：卡片上的额度快照与累计花费都出自
+/// `usage_logs`，不写就等于「测出来的额度只在弹窗里存在」，而这条请求真的花了钱、也真的
+/// 拿到了此刻最新的限流头。日志里那条以 `device_id = "probe"` 标出，与真实流量可区分。
+///
+/// 代价是它**真的会消耗一点订阅额度**：请求带官方 `system` 基座（opus 族约 300 token、
+/// sonnet 族约 2700），与真实流量共用同一份 1h 全局缓存前缀，稳定后走缓存读价。
+pub async fn probe(
+    state: &AppState,
+    cred: &crate::credentials::Credential,
+    model: &str,
+) -> ProbeReport {
+    let started = std::time::Instant::now();
+    let token = match store::access_token_of(&state.store, &state.http, cred).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                cred = format!("#{} {}", cred.id, cred.label),
+                model,
+                error = %e,
+                "连通性测试：取 access_token 失败"
+            );
+            return ProbeReport::failed(
+                started.elapsed().as_millis(),
+                format!("取 token 失败：{e}"),
+            );
+        }
+    };
+
+    // 复用「裸客户端」那份设备指纹（`device_fingerprint(None, 空头)` 恒为 `"||"`），不另造一个：
+    // 指纹只用于派生伪装 device_id 与 session_id，每加一份就等于给这个账号在上游多一台设备，
+    // 而测试并不需要一个自己的身份。
+    let device_fp = device_fingerprint(None, &HeaderMap::new());
+    let flags = store::ForwardFlags::default();
+    // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
+    // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。
+    let sim = Simulation {
+        base: cc_system_base(model),
+        beta: cc_beta_seed(model),
+        session_id: session_id_for(cred, &device_fp),
+    };
+    let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim));
+    let upstream = Upstream {
+        state,
+        method: Method::POST,
+        url: format!("{}/v1/messages", config::UPSTREAM_BASE_URL),
+        headers,
+        flags,
+        billable: true,
+        sim: Some(sim),
+    };
+
+    let body = probe_body(model);
+    let sent = upstream.send(upstream.shape(&body, cred, &device_fp));
+    // 全部匹配到的限流头原文，只进日志不进 JSON：结构化的那几项已经够前端展示，而排查时
+    // 「上游到底回了哪些头」得看原样的一整串。请求没到上游时留空。
+    let mut ratelimit_raw = String::new();
+    let report = match tokio::time::timeout(PROBE_TIMEOUT, sent).await {
+        Err(_) => ProbeReport::failed(
+            started.elapsed().as_millis(),
+            format!("等待上游响应超时（{} 秒）", PROBE_TIMEOUT.as_secs()),
+        ),
+        Ok(Err(e)) => ProbeReport::failed(
+            started.elapsed().as_millis(),
+            format!("上游请求失败[{}]: {}", upstream_error_kind(&e), error_chain(&e)),
+        ),
+        Ok(Ok(up)) => {
+            let status = up.status();
+            // 限流头必须在 `bytes()` 之前读——它会把整个响应消费掉，之后就没有头可看了。
+            // 200 与 429 都带这组头，后者尤其有用：能直接看出是哪个窗口满了、要等多久。
+            let info = RateLimitInfo::from_headers(up.headers());
+            ratelimit_raw = info.raw.clone();
+            let quota = ProbeQuota::from_info(&info);
+            match up.bytes().await {
+                // 响应体读到一半断了：状态码与限流头都是真的，只是内容不完整，如实报出来。
+                // 这一条同样落日志——额度快照来自头，不依赖 body。
+                Err(e) => {
+                    log_probe_usage(
+                        &state.store,
+                        cred,
+                        model,
+                        status,
+                        &Bytes::new(),
+                        &info,
+                        &started,
+                    );
+                    ProbeReport {
+                        ok: false,
+                        status: status.as_u16(),
+                        latency_ms: started.elapsed().as_millis(),
+                        model: None,
+                        error_type: None,
+                        error: Some(format!("读取上游响应体失败：{e}")),
+                        quota,
+                    }
+                }
+                Ok(bytes) => {
+                    log_probe_usage(&state.store, cred, model, status, &bytes, &info, &started);
+                    probe_report(status, &bytes, started.elapsed().as_millis(), quota)
+                }
+            }
+        }
+    };
+
+    tracing::info!(
+        cred = format!("#{} {}", cred.id, cred.label),
+        model,
+        ok = report.ok,
+        status = report.status,
+        latency_ms = report.latency_ms,
+        error = %report.error.as_deref().unwrap_or("-"),
+        ratelimit = %ratelimit_raw,
+        "连通性测试"
+    );
+    report
+}
+
+/// 测试用的最小请求体：一条 `ping`、`max_tokens=1`。
+///
+/// 其余部分（官方 `system` 四块、`metadata` 身份）由 [`rewrite_body`] 在模拟路径上补齐，
+/// 与真实转发用的是同一份代码——这里手抄一份官方形态，只会得到「测试通过但转发失败」。
+///
+/// key 序按官方的 `model → messages → … → max_tokens` 写；补出来的 `system`/`metadata`
+/// 会被 [`insert_top_level`] 放到它们的官方位置上。
+///
+/// 不发 `stream: true`（官方客户端恒为流式）：一条 1 token 的响应用非流式读最省事，而这
+/// 属于任何 API 客户端都会产生的常规形态，不是「真实客户端不产生」的那类破绽。
+fn probe_body(model: &str) -> Bytes {
+    let v = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "ping" }],
+        "max_tokens": 1,
+    });
+    // 常量结构，序列化不会失败；真失败了也会以上游 400 的形式如实报出来，不必在这里 panic。
+    Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
+}
+
+/// 用量日志里标记「这条是连通性测试」的 device_id。
+///
+/// 借 `device_id` 这一列而不新开一列：它本来就是「这条流量是谁打的」，测试正是一个特殊的
+/// 来源，与裸客户端那个 `sim:` 前缀（见 [`sim_device_id`]）同一个路子。它也不会与设备列表
+/// 串味——那张表从 `device_bindings` 出发，而测试从不写绑定。
+const PROBE_DEVICE_ID: &str = "probe";
+
+/// 把一次测试记进 `usage_logs`，口径与转发路径的 [`ReqLog`] 完全一致（同一个嗅探器、
+/// 同一套计价），差别只在 `device_id` 标成 [`PROBE_DEVICE_ID`]。
+///
+/// **为什么要记**：账号卡片上的额度快照与累计花费都出自这张表（`latest_quotas` 取的是
+/// 「最新一条带限流信息的日志」）。不记的话，测试拿到的那份最新额度就只活在弹窗里，
+/// 卡片照旧显示上一次真实请求时的旧数；而这条请求确实花掉了钱，不记也等于让累计花费虚低。
+///
+/// 写失败只告警不影响测试结果——用户要的是「通不通」，日志是副产品。
+fn log_probe_usage(
+    store: &store::CredentialStore,
+    cred: &crate::credentials::Credential,
+    req_model: &str,
+    status: StatusCode,
+    bytes: &Bytes,
+    ratelimit: &RateLimitInfo,
+    started: &std::time::Instant,
+) {
+    // 非流式、未压缩（wreq 已解码），喂整段 body 即可解析出顶层 `usage`。
+    let mut sniffer = UsageSniffer::new(false, false);
+    sniffer.feed(bytes);
+    sniffer.finish();
+    // 模型以上游回报为准，没有（4xx 没有 usage）才用请求侧那个。
+    let model = sniffer.model.clone().unwrap_or_else(|| req_model.to_string());
+    let cost_usd = crate::pricing::estimate_usd(crate::pricing::Usage {
+        model: Some(&model),
+        speed: sniffer.speed.as_deref(),
+        input_tokens: sniffer.input_tokens,
+        output_tokens: sniffer.output_tokens,
+        cache_creation_total: sniffer.cache_creation_tokens,
+        cache_5m_tokens: sniffer.cache_creation_5m,
+        cache_1h_tokens: sniffer.cache_creation_1h,
+        cache_read_tokens: sniffer.cache_read_tokens,
+    });
+    let rec = store::UsageRecord {
+        cred_id: Some(cred.id),
+        cred_label: cred.label.clone(),
+        device_id: Some(PROBE_DEVICE_ID.into()),
+        model: Some(model),
+        path: "/v1/messages".into(),
+        status: status.as_u16(),
+        has_usage: sniffer.has_usage(),
+        input_tokens: sniffer.input_tokens,
+        output_tokens: sniffer.output_tokens,
+        cache_creation_tokens: sniffer.cache_creation_tokens,
+        cache_5m_tokens: sniffer.cache_creation_5m,
+        cache_1h_tokens: sniffer.cache_creation_1h,
+        cache_read_tokens: sniffer.cache_read_tokens,
+        // 非流式一次读完，没有「首块」可言；总耗时已经说明一切。
+        ttft_ms: None,
+        total_ms: i64::try_from(started.elapsed().as_millis()).ok(),
+        unified_status: ratelimit.unified_status.clone(),
+        rl_5h_status: ratelimit.five_h_status.clone(),
+        rl_5h_reset: ratelimit.five_h_reset,
+        rl_5h_utilization: ratelimit.five_h_utilization,
+        rl_7d_status: ratelimit.seven_d_status.clone(),
+        rl_7d_reset: ratelimit.seven_d_reset,
+        rl_7d_utilization: ratelimit.seven_d_utilization,
+        rl_representative: ratelimit.representative.clone(),
+        ratelimit_raw: (!ratelimit.raw.is_empty()).then(|| ratelimit.raw.clone()),
+        cost_usd,
+    };
+    if let Err(e) = store.insert_usage_log(&rec) {
+        tracing::warn!(error = %e, "写入连通性测试的用量日志失败");
+    }
+}
+
+/// 把上游响应翻译成一份结果：2xx 取回报的模型名，其余取 `error.type`/`error.message`。
+/// 限流头由调用方先行解析（读 body 会把响应消费掉），成败两条路都带上。
+fn probe_report(
+    status: StatusCode,
+    bytes: &[u8],
+    latency_ms: u128,
+    quota: Option<ProbeQuota>,
+) -> ProbeReport {
+    if status.is_success() {
+        let model = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| Some(v.get("model")?.as_str()?.to_string()));
+        return ProbeReport {
+            ok: true,
+            status: status.as_u16(),
+            latency_ms,
+            model,
+            error_type: None,
+            error: None,
+            quota,
+        };
+    }
+    let (error_type, message) = parse_upstream_error(bytes);
+    ProbeReport {
+        ok: false,
+        status: status.as_u16(),
+        latency_ms,
+        model: None,
+        error_type,
+        // 上游偶尔糊一大坨（HTML 拦截页之类），截断到能看清病因即可。
+        error: Some(message.chars().take(500).collect()),
+        quota,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3462,5 +3812,148 @@ mod tests {
         for anchor in config::CC_SYSTEM_BASE_ANCHORS {
             assert!(!config::CC_SYSTEM_BASE_OPUS.contains(anchor), "基座里不该有拆块锚点");
         }
+    }
+
+    /// 由 `k=v` 造一份限流头解析结果，给下面两个测试共用。
+    fn rl_headers(pairs: &[(&str, &str)]) -> super::RateLimitInfo {
+        let mut h = super::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        super::RateLimitInfo::from_headers(&h)
+    }
+
+    /// 测试结果里的额度快照直接来自本次响应的限流头（200 与 429 都带）；而响应压根没有这些
+    /// 头时给 `None` 而不是一坨全空对象——CDN 拦截页、网关错误就是那样，前端不该被迫自己
+    /// 再判一遍「是不是全空」。
+    #[test]
+    fn probe_quota_reads_ratelimit_headers() {
+        let hdr = rl_headers;
+
+        let info = hdr(&[
+            ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
+            ("anthropic-ratelimit-unified-5h-reset", "1800000000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.76"),
+            ("anthropic-ratelimit-unified-representative-claim", "7d"),
+            ("retry-after", "228721"),
+        ]);
+        let q = super::ProbeQuota::from_info(&info).expect("有限流头就该有快照");
+        assert_eq!(q.unified_status.as_deref(), Some("allowed_warning"));
+        assert_eq!(q.rl_5h_utilization, Some(0.32));
+        assert_eq!(q.rl_5h_reset, Some(1_800_000_000));
+        assert_eq!(q.rl_7d_utilization, Some(0.76));
+        assert_eq!(q.rl_representative.as_deref(), Some("7d"));
+        assert_eq!(q.retry_after_secs, Some(228_721), "429 的等待时间原样带出，不夹");
+
+        // 非限流类的 anthropic- 头会被 RateLimitInfo 收进 raw，但解析不出任何额度字段。
+        assert!(
+            super::ProbeQuota::from_info(&hdr(&[("anthropic-version", "2023-06-01")])).is_none()
+        );
+        assert!(super::ProbeQuota::from_info(&hdr(&[])).is_none());
+    }
+
+    /// 测试要能让**卡片**跟着更新：卡片上的额度快照来自 `latest_quota`，而那读的是
+    /// `usage_logs` 里最新一条带限流信息的行。所以探测必须落一条日志——否则测出来的额度
+    /// 只活在弹窗里，卡片照旧显示上一次真实请求时的旧数，两处对不上。
+    ///
+    /// 同时钉住另外两件事：这条日志按**实际用量**计价（测试真的花了钱，不记等于让累计花费
+    /// 虚低），且以 `device_id = "probe"` 标出，翻日志时能与真实流量分开。
+    #[test]
+    fn probe_usage_log_feeds_the_card_quota() {
+        let store = crate::store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let info = rl_headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
+            ("anthropic-ratelimit-unified-5h-reset", "1800000000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.76"),
+        ]);
+        // 上游 200 的响应体形状（只留计价要用的字段）。
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-5-20260115","usage":{"input_tokens":320,"output_tokens":1}}"#,
+        );
+        super::log_probe_usage(
+            &store,
+            &cred,
+            "claude-opus-5",
+            StatusCode::OK,
+            &body,
+            &info,
+            &std::time::Instant::now(),
+        );
+
+        let q = store.latest_quota(cred.id).unwrap().expect("卡片应能读到这次测试的额度");
+        assert_eq!(q.rl_5h_utilization, Some(0.32));
+        assert_eq!(q.rl_7d_utilization, Some(0.76));
+        assert_eq!(q.unified_status.as_deref(), Some("allowed"));
+
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].device_id.as_deref(), Some("probe"), "日志里要能认出这是测试");
+        assert_eq!(logs[0].model.as_deref(), Some("claude-opus-5-20260115"), "模型以上游回报为准");
+        assert_eq!(logs[0].input_tokens, Some(320));
+        // opus $5/MTok 输入 + $25/MTok 输出：320×5 + 1×25 = 1625 微美元。
+        assert_eq!(logs[0].cost_usd, Some(0.001625), "按实际用量计价，不是记 0");
+    }
+
+    /// 连通性测试发出去的那条请求本身必须是**官方形态**：`system` 是官方那几块（含上游对
+    /// OAuth 凭证唯一强制的那句身份声明）、`metadata` 是该凭证自洽的身份、`anthropic-beta`
+    /// 带 `oauth-2025-04-20`、`Authorization` 是该凭证的 token。
+    ///
+    /// 真正盯的是**测试与真实转发共用同一套改写**：`probe` 只给一个裸 body，剩下的全交给
+    /// [`super::rewrite_body`]/[`super::build_forward_headers`]。若哪天有人图省事在 probe 里
+    /// 手抄一份 system，改写规则一变就会得到「测试通过但转发失败」——那比没有这个功能更糟。
+    #[test]
+    fn probe_request_is_official_shaped() {
+        let cred = test_cred();
+        let sim = super::Simulation {
+            base: super::cc_system_base("claude-opus-5"),
+            beta: super::cc_beta_seed("claude-opus-5"),
+            session_id: "sess".into(),
+        };
+        let out = super::rewrite_body(
+            &super::probe_body("claude-opus-5"),
+            &cred,
+            "fp",
+            all_on(),
+            Some(&sim),
+        );
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens。
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["model", "messages", "system", "metadata", "max_tokens"], "\n{s}");
+        assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
+
+        // 官方前三块：billing header、身份句、按模型族选出的基座。测试请求没有「客户端自己
+        // 的 system」，故第四块不存在。
+        let blocks = v["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3, "\n{s}");
+        assert!(blocks[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert_eq!(blocks[1]["text"], config::CC_SYSTEM_IDENTITY, "缺这句就用不了订阅额度");
+        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_BASE_OPUS, "opus 族基座");
+
+        // 身份：伪装 metadata 用的是这个凭证的 account_uuid，不是空串。
+        let user_id = v["metadata"]["user_id"].as_str().unwrap();
+        assert!(user_id.contains(ACCOUNT_UUID), "metadata 应带该凭证的 account_uuid: {user_id}");
+
+        let headers =
+            super::build_forward_headers(&super::HeaderMap::new(), "tok", all_on(), Some(&sim));
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(
+            beta.split(',').any(|p| p == config::OAUTH_BETA_HEADER),
+            "OAuth 鉴权必需这一项: {beta}"
+        );
+        assert_eq!(headers.get(header::AUTHORIZATION).unwrap(), "Bearer tok");
+        assert_eq!(
+            headers.get(header::USER_AGENT).unwrap(),
+            config::CC_USER_AGENT,
+            "测试请求同样按官方客户端形态发"
+        );
     }
 }

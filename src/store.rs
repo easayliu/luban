@@ -209,6 +209,17 @@ impl CredentialStore {
         Ok(Self::with_conn(conn))
     }
 
+    /// 内存库（**仅测试**）：schema 已初始化，进程退出即消失。
+    ///
+    /// 给 crate 内其它模块的测试用（`with_conn`/`init_schema` 都是本模块私有的）；
+    /// store 自己的测试直接用 `with_conn`。
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        init_schema(&conn)?;
+        Ok(Self::with_conn(conn))
+    }
+
     /// 由已初始化的连接构造（`open_default` 与测试共用）。
     fn with_conn(conn: Connection) -> Self {
         Self {
@@ -1648,6 +1659,26 @@ pub async fn valid_access_token_for_device(
         Box::pin(async move { ensure_fresh_token(store, http, &cred).await })
     })
     .await
+}
+
+/// 取**指定**凭证的可用 access_token（必要时刷新），不选号、不写设备绑定、不改动账号状态。
+///
+/// 连通性测试用（见 [`crate::proxy::probe`]）。转发那条路走
+/// [`valid_access_token_for_device`]：它会按负载均衡挑号，而测试是指名道姓要测这一个，
+/// 挑到别的号上去测出来的结论就不是这个号的。
+///
+/// 与转发路径的另一处区别是**失败不停用**：`refresh_token` 已被上游作废时那边会
+/// [`CredentialStore::mark_banned`] 并改选其它号，这里只把原因抛出去。手动点一次测试
+/// 不该顺手改动账号状态——那个判定留给真实流量，测试只负责如实报告。
+pub async fn access_token_of(
+    store: &CredentialStore,
+    http: &wreq::Client,
+    cred: &Credential,
+) -> Result<String> {
+    match ensure_fresh_token(store, http, cred).await? {
+        TokenAttempt::Ready(token) => Ok(token),
+        TokenAttempt::Revoked(reason) => anyhow::bail!("{reason}"),
+    }
 }
 
 /// [`select_with_refresh_failover`] 注入的「取一次 token」返回的 future。
