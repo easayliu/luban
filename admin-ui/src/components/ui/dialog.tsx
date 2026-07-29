@@ -2,6 +2,7 @@ import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { XMarkIcon } from '@heroicons/react/24/outline'
 import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
 
 const Dialog = DialogPrimitive.Root
 const DialogTrigger = DialogPrimitive.Trigger
@@ -14,7 +15,7 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      'fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
+      'fixed inset-0 z-50 bg-black/35 backdrop-blur-[1px] data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
       className,
     )}
     {...props}
@@ -35,20 +36,25 @@ const DialogContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        'fixed inset-x-0 bottom-0 z-50 flex max-h-[calc(100dvh-0.5rem)] w-full max-w-xl flex-col overflow-hidden rounded-t-xl border border-b-0 border-border bg-card text-card-foreground shadow-lg',
-        'sm:bottom-auto sm:left-1/2 sm:right-auto sm:top-1/2 sm:max-h-[calc(100dvh-2rem)] sm:w-[calc(100vw-2rem)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:border-b',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:slide-out-to-bottom-4 data-[state=open]:slide-in-from-bottom-4 sm:data-[state=closed]:zoom-out-95 sm:data-[state=open]:zoom-in-95',
+        'fixed left-1/2 top-1/2 z-50 flex max-h-[82dvh] w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-background text-foreground shadow-elev',
+        'sm:max-h-[calc(100dvh-3rem)]',
+        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
         className,
       )}
       {...props}
     >
       {children}
-      <DialogPrimitive.Close
-        className="absolute right-4 top-4 grid size-8 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        title="关闭"
-      >
-        <XMarkIcon className="size-4" />
-        <span className="sr-only">关闭</span>
+      <DialogPrimitive.Close asChild>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="absolute right-3 top-3 size-8 sm:right-4 sm:top-3.5"
+          title="关闭"
+          aria-label="关闭弹框"
+        >
+          <XMarkIcon className="size-4" />
+        </Button>
       </DialogPrimitive.Close>
     </DialogPrimitive.Content>
   </DialogPrimitive.Portal>
@@ -67,7 +73,24 @@ function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivEleme
 
 /** 内容区：超长时在弹窗内部滚动，页面本身不动。 */
 function DialogBody({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('scrollbar-dialog min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5', className)} {...props} />
+  return (
+    <div
+      className={cn('scrollbar-dialog min-h-0 flex-1 overscroll-contain overflow-y-auto px-4 py-4 sm:px-5', className)}
+      {...props}
+    />
+  )
+}
+
+function DialogFooter({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div
+      className={cn(
+        'flex shrink-0 flex-col-reverse gap-2 border-t border-border px-4 py-3.5 sm:flex-row sm:justify-end sm:px-5',
+        className,
+      )}
+      {...props}
+    />
+  )
 }
 
 const DialogTitle = React.forwardRef<
@@ -88,13 +111,13 @@ const DialogDescription = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description
     ref={ref}
-    className={cn('text-sm text-muted-foreground', className)}
+    className={cn('text-xs leading-5 text-muted-foreground', className)}
     {...props}
   />
 ))
 DialogDescription.displayName = DialogPrimitive.Description.displayName
 
 export {
-  Dialog, DialogTrigger, DialogClose, DialogContent, DialogHeader, DialogBody, DialogTitle,
-  DialogDescription,
+  Dialog, DialogTrigger, DialogClose, DialogContent, DialogHeader, DialogBody, DialogFooter,
+  DialogTitle, DialogDescription,
 }

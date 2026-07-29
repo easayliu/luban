@@ -134,6 +134,100 @@ pub const CC_SYSTEM_BASE_ANCHORS: &[&str] = &[
     "# Communicating with the user",
 ];
 
+/// 官方 `system[1]` 那句身份声明，四个模型族逐字节相同（57 字节）。
+///
+/// 它同时是两件事：**上游对 OAuth 凭证唯一强制的正文**（缺了它订阅额度不给用），以及
+/// 「这是不是一条 Claude Code 请求」的判据——[`crate::proxy::is_cc_shaped`] 认的就是它。
+pub const CC_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// `system[0]` 那条 billing header 里的 `cc_version`，形如 `2.1.220.04c`。
+///
+/// 后缀（`.04c`/`.564`）随构建变，与鉴权模式无关（见 [`known_fingerprint_gaps`] 第 4 条），
+/// 故取一个即可。主版本号要和 [`CC_USER_AGENT`] 对得上——同一个客户端不会一边自称 2.1.220
+/// 一边报另一个 cc_version。
+pub const CC_VERSION: &str = "2.1.220.04c";
+
+/// 模拟模式注入的官方系统提示词**基座**（opus-5 / fable-5 那一族，1214 字节）。
+///
+/// 逐字节取自 `cap/raw/00006`（opus-5 直连）的 `system[2]`，与 `00035`（fable-5）
+/// sha256 相同。开头那个 `\n` 是官方就有的，别 trim。
+///
+/// 这是**基座**，不含 `# Environment`、工具清单、技能列表那些本机内容——那些属于官方的
+/// `system[3]`（「其余」段），逐客户端不同，模拟时那一格留给来访客户端自己的 system。
+pub const CC_SYSTEM_BASE_OPUS: &str = include_str!("assets/cc_system_base_opus.txt");
+
+/// 模拟模式注入的官方系统提示词基座（sonnet-5 / haiku-4.5 那一族，10682 字节）。
+///
+/// 逐字节取自 `cap/raw/00009`（sonnet-5 直连）的 `system[2]`，与 `00031`（haiku-4.5）
+/// sha256 相同。比 opus 那份大一个数量级——这一族的基座本来就长，不是抄错了。
+pub const CC_SYSTEM_BASE_SONNET: &str = include_str!("assets/cc_system_base_sonnet.txt");
+
+/// 模拟模式下**代客户端发出**的 `anthropic-beta` 自有串（不含 luban 自己会补的那几项），
+/// opus-5 / sonnet-5 / fable-5 及认不出的模型共用这份。haiku 另有一份，见
+/// [`CC_BETA_SIMULATED_HAIKU`]——**这两份不能合并**，理由与
+/// [`cc_beta_order_is_not_a_table`] 记的是同一件事。
+///
+/// 逐字取自 `cap/raw/00009`（sonnet-5 直连）那串，去掉 [`crate::proxy::merge_beta`] 负责
+/// 插入的三项（`oauth`/`advanced-tool-use`/`extended-cache-ttl`）。于是交给 `merge_beta`
+/// 之后能**逐字节还原**官方那串，回归测试见 `tests::simulated_beta_matches_official`。
+///
+/// **刻意不取 opus-5 那串**：它比这份多 `context-1m-2025-08-07` 与
+/// `fallback-credit-2026-06-01`（fable-5 那串则多 `server-side-fallback-2026-06-01` 与
+/// `fallback-credit`），这些都不是纯形态——`context-1m` 是 1M 上下文的准入（超过 200k
+/// 输入按另一档计价），另两项关联额度回补与服务端换模型。替用户声明这类东西超出了「装成
+/// 官方客户端」的范围，与 [`known_fingerprint_gaps`] 第 7 条不补 `fallbacks` 是同一条口径。
+/// sonnet 那串是官方真实发过的完整串，本身就自洽，不存在「集合对了顺序错」的问题。
+///
+/// 来访客户端自己带的 beta 不会被这串顶掉，见 [`crate::proxy::simulated_beta`]。
+pub const CC_BETA_SIMULATED: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+    redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+    prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24";
+
+/// haiku 族的自有串，逐字取自 `cap/raw/00031`（haiku-4.5 直连），同样去掉 `merge_beta`
+/// 负责插入的三项。
+///
+/// **和另外三族的差别不只是少两项**：haiku 不发 `mid-conversation-system` 与 `effort`，
+/// 而且把 `claude-code-20250219` 排在**队尾**（另外三族在队首）。拿 sonnet 那份去发 haiku，
+/// 得到的是一个真实客户端不产生的排列——正是 [`cc_beta_order_is_not_a_table`] 记的那件事，
+/// 只不过这次落在模拟路径上。所以模型族与串是绑定的，别再想着合成一张总表。
+///
+/// 基座那边则相反：haiku 与 sonnet-5 的 `system[2]` sha256 相同，共用
+/// [`CC_SYSTEM_BASE_SONNET`]。同一族在一处相同、在另一处不同，两边各自按证据来。
+pub const CC_BETA_SIMULATED_HAIKU: &str = "interleaved-thinking-2025-05-14,\
+    redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+    prompt-caching-scope-2026-01-05,claude-code-20250219";
+
+/// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/raw/00006`（opus-5 直连）。
+///
+/// 表里**只有固定值**；随请求变的几个不在此列，由 [`crate::proxy::official_headers`] 另外
+/// 塞：`Authorization`（凭证）、`X-Claude-Code-Session-Id`（每设备派生）、
+/// `x-client-request-id`（每请求 uuid），以及 `anthropic-beta`（见 [`CC_BETA_SIMULATED`]）。
+///
+/// **头名全小写是有意的**：`HeaderName::from_static` 只收小写，大写会 panic；线上的拼写与
+/// 顺序另由 [`CC_HEADER_ORDER`] 经 `OrigHeaderMap` 决定，跟这里写成什么样无关。
+///
+/// `X-Stainless-Arch`/`OS` 这类本机信息只能填一个定值（抓包那台是 arm64 mac）——模拟路径
+/// 上来访客户端根本不提供这些，凭空造一个「每设备不同」的组合反而可能拼出 arm64+Windows
+/// 这种真实客户端不产生的搭配。代价记在这儿：所有经模拟路径的请求平台头完全一致。
+pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
+    ("accept", "application/json"),
+    ("content-type", "application/json"),
+    ("user-agent", CC_USER_AGENT),
+    ("x-stainless-arch", "arm64"),
+    ("x-stainless-lang", "js"),
+    ("x-stainless-os", "MacOS"),
+    ("x-stainless-package-version", "0.94.0"),
+    ("x-stainless-retry-count", "0"),
+    ("x-stainless-runtime", "node"),
+    ("x-stainless-runtime-version", "v26.3.0"),
+    ("x-stainless-timeout", "600"),
+    ("anthropic-dangerous-direct-browser-access", "true"),
+    ("anthropic-version", "2023-06-01"),
+    ("x-app", "cli"),
+    ("connection", "keep-alive"),
+    ("accept-encoding", CC_ACCEPT_ENCODING),
+];
+
 /// 官方订阅客户端每个缓存断点都带的 TTL（`cap/raw` 的四对抓包里 3/3 全是 `1h`）。
 ///
 /// 写入单价是 5m 的 2 倍。它和 [`CC_SYSTEM_BASE_ANCHORS`] 的拆块是一套的：官方就是「4 块 +

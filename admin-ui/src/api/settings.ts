@@ -11,6 +11,12 @@ export interface Settings {
   default_device_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
+  /** 单个账号在窗口内允许的裸请求条数；0 表示不限。 */
+  bare_rate_limit: number
+  /** 裸请求速率窗口（秒），默认 60。 */
+  bare_rate_window_secs: number
+  /** 上游 429 后最多追加尝试的账号数，不含首次请求；0 表示不重试。 */
+  rate_limit_retry_max: number
   /** 改写 metadata.user_id 里的 account_uuid/device_id 为凭证自洽身份。 */
   spoof_identity: boolean
   /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
@@ -25,6 +31,10 @@ export interface Settings {
   orig_header_case: boolean
   /** 上游拒绝 thinking 块签名时，把历史 thinking 降级成 text 后重试一次。 */
   thinking_signature_retry: boolean
+  /** 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 + 整套官方头）。 */
+  simulate_cc: boolean
+  /** 上游回 429 时按账号/模型范围冷却并换号重试；关闭时不冷却、直接透传。 */
+  rate_limit_retry: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -36,6 +46,8 @@ export type ForwardingKey =
   | 'system_shape'
   | 'orig_header_case'
   | 'thinking_signature_retry'
+  | 'simulate_cc'
+  | 'rate_limit_retry'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {
@@ -61,6 +73,26 @@ export async function setDeviceTtl(secs: number): Promise<Settings> {
 export async function setDefaultDeviceLimit(limit: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/default-device-limit', {
     default_device_limit: limit,
+  })
+  return data
+}
+
+/**
+ * 设置裸请求速率上限：单个账号在窗口内最多接多少条无 metadata.user_id 的请求。
+ * 0 表示不限；window 只在传正数时才写（不传就保持现值）。
+ */
+export async function setBareRateLimit(limit: number, windowSecs?: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/bare-rate-limit', {
+    bare_rate_limit: limit,
+    bare_rate_window_secs: windowSecs,
+  })
+  return data
+}
+
+/** 设置上游 429 后追加尝试的账号数（不含首次请求；0 = 不重试；后端夹到 0~10）。 */
+export async function setRateLimitRetryMax(n: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/rate-limit-retry-max', {
+    rate_limit_retry_max: n,
   })
   return data
 }

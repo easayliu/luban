@@ -39,35 +39,66 @@ pub async fn handle(
     // 2) 提取 device_id（在请求体 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(&body);
 
-    // 2.1) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 默认直接拒绝：
+    // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
+    //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
+    let billable = is_billable_messages(uri.path());
+
+    // 2.2) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 计费路径默认直接拒绝：
     //      这类请求既无法做身份伪装、也无从计入设备上限（会绕过 device_limit）。
     //      网页可关掉该校验（放行裸客户端），此时它们退化为不绑定、不占名额的负载均衡挑选。
     if device_id.is_none() {
-        if state.store.require_device_id() {
+        if billable && state.store.require_device_id() {
             tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
             return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）")
                 .into_response();
         }
-        tracing::debug!(%method, path = %path_and_query, "放行无设备身份的请求（设备身份校验已关闭）");
+        tracing::debug!(%method, path = %path_and_query, billable, "放行无设备身份的请求");
     }
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
-    let (token, cred) =
-        match store::valid_access_token_for_device(&state.store, &state.http, device_id.as_deref())
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // 设备数达硬上限 → 429；其余（无凭证/刷新失败等）→ 503。
-                let status = if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
-                    StatusCode::TOO_MANY_REQUESTS
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                };
-                tracing::warn!(%method, path = %path_and_query, error = %e, "拒绝转发");
-                return (status, e.to_string()).into_response();
+    // 请求的模型名：冷却按「账号 + 模型」分格，fable 那类模型级 429 不该拖累整个账号。
+    let req_model = request_model(&body);
+    // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
+    // 免得两处的 device_id/model 哪天漂开。
+    fn select<'a>(
+        device_id: Option<&'a str>,
+        billable: bool,
+        model: Option<&'a str>,
+        exclude: &'a [i64],
+    ) -> store::Select<'a> {
+        store::Select { device_id, rate_limited: billable, exclude, model, ..Default::default() }
+    }
+    let (token, cred) = match store::valid_access_token_for_device(
+        &state.store,
+        &state.http,
+        select(device_id.as_deref(), billable, req_model.as_deref(), &[]),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%method, path = %path_and_query, error = %e, "拒绝转发");
+            // 裸请求速率达上限 → 429 且带 `retry-after`：这里的等待时间是可算的（窗口长度），
+            // 给出来客户端才知道该等多久，而不是立刻重试再撞一次。
+            if let Some(rl) = e.downcast_ref::<store::BareRateLimited>() {
+                let retry = rl.retry_after_secs.to_string();
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry)],
+                    e.to_string(),
+                )
+                    .into_response();
             }
-        };
+            // 设备数达硬上限 → 429（等多久取决于别人什么时候释放，给不出 retry-after）；
+            // 其余（无凭证/刷新失败等）→ 503。
+            let status = if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return (status, e.to_string()).into_response();
+        }
+    };
 
     // 4) 目标 URL：上游 base + 原路径与查询串。
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
@@ -75,13 +106,12 @@ pub async fn handle(
     // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制，
     //    一条 SQL 读齐（默认全开 = 加入开关前的既有行为）。
     let flags = state.store.forward_flags();
-    let out = build_forward_headers(&headers, &token, flags);
-
+    // 设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
+    // 头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
+    let device_fp = device_fingerprint(device_id.as_deref(), &headers);
     // 6) 转发前改写 body：system 形态对齐（拆成官方的 4 块 + 断点全上 1h + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
-    //    billing header 补 cch）。
-    //    设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
-    let device_fp = device_fingerprint(device_id.as_deref(), &headers);
+    //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
     {
         let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("-");
         tracing::debug!(
@@ -102,8 +132,108 @@ pub async fn handle(
     //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
     //    `body` 自此保持**客户端原始请求体**不变——改写后的那份直接交给 `send`，
     //    因为签名重试那条路要拿原始体重新走一遍改写，留着原件比留改写件更省事也更不易错。
-    let upstream = Upstream { state: &state, method: method.clone(), url, headers: out, flags };
-    let resp = upstream.send(rewrite_body(&body, &cred, &device_fp, flags)).await;
+    //    非计费路径（count_tokens 等）由 [`Upstream::shape`] 原样透传：那儿既没有 `metadata`
+    //    可伪装，改写 `system` 形态反而会让计出来的 token 数偏离客户端实际要发的那份，还平白
+    //    多担一份上游挑刺的风险。
+    //
+    //    **上游 429 换号重试**（`rate_limit_retry`）：某个号被限流时，客户端自己重试也只会
+    //    继续撞同一个号——设备是粘性绑定的，而绑定只看凭证有没有被停用，不看它是不是刚被限流。
+    //    于是这里在收到 429 时给该号打上冷却（时长取自上游的 `retry-after`/`*-reset`，见
+    //    [`RateLimitInfo::cooldown`]），换一个**没试过的**号重发，并把设备**改绑**过去。
+    //
+    //    整套（选号 → 装头 → 改体）必须逐轮重来：`Authorization` 换了、`metadata` 里的伪装
+    //    身份随号变、模拟路径的 session_id 也由账号派生——只换 token 会发出一条自相矛盾的请求。
+    //    故首发也走这个循环，不存在「首发与重试形态不一致」的可能。
+    let mut tried: Vec<i64> = Vec::new();
+    let (mut token, mut cred) = (token, cred);
+    let mut retried = 0usize;
+    let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
+    let (upstream, resp) = loop {
+        let sim = Simulation::detect(&body, flags, &cred, &device_fp);
+        let out = build_forward_headers(&headers, &token, flags, sim.as_ref());
+        let upstream = Upstream {
+            state: &state,
+            method: method.clone(),
+            url: url.clone(),
+            headers: out,
+            flags,
+            billable,
+            sim,
+        };
+        let resp = upstream.send(upstream.shape(&body, &cred, &device_fp)).await;
+
+        // 只认「上游明确回 429」这一种：连不上/超时那类换个号一样连不上，重试只是浪费时间。
+        let limited = match &resp {
+            Ok(up) if up.status() == StatusCode::TOO_MANY_REQUESTS => {
+                Some(RateLimitInfo::from_headers(up.headers()))
+            }
+            _ => None,
+        };
+        let Some(info) = limited else { break (upstream, resp) };
+        // 额度真耗尽 → 冷却整个账号；窗口没跑满却被拒（实测只有 fable 这样）→ 只冷却这个模型。
+        let scope = rate_limit_scope(&info, req_model.as_deref());
+        let cooldown = info.cooldown(scope.account_level());
+        tracing::warn!(
+            cred = format!("#{} {}", cred.id, cred.label),
+            model = %req_model.as_deref().unwrap_or("-"),
+            scope = scope.label(),
+            cooldown_secs = cooldown.as_secs(),
+            ratelimit = %info.raw,
+            "上游 429"
+        );
+
+        // 冷却与重试同受一个开关：关掉即完全退回「原样透传 429」的既有行为。
+        if max_retry == 0 {
+            break (upstream, resp);
+        }
+        state.store.mark_rate_limited(cred.id, scope.model(), cooldown);
+        tried.push(cred.id);
+        if retried >= max_retry {
+            tracing::warn!(
+                cred = format!("#{} {}", cred.id, cred.label),
+                retried,
+                "上游 429，已达换号重试次数上限，透传该响应"
+            );
+            break (upstream, resp);
+        }
+
+        // 换一个没试过的号。选号顺带**改绑**这台设备（绑定的号不在候选里时会重选并改绑），
+        // 于是这台设备之后的请求直接落在新号上，不必每条都先撞一次 429。
+        match store::valid_access_token_for_device(
+            &state.store,
+            &state.http,
+            select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+        )
+        .await
+        {
+            Ok((next_token, next_cred)) => {
+                tracing::warn!(
+                    from = format!("#{} {}", cred.id, cred.label),
+                    to = format!("#{} {}", next_cred.id, next_cred.label),
+                    cooldown_secs = cooldown.as_secs(),
+                    attempt = retried + 1,
+                    "上游 429：该号已进入冷却，改用其它账号重试"
+                );
+                (token, cred) = (next_token, next_cred);
+                retried += 1;
+            }
+            // 没有别的号可用（都试过/都停用了）：保留最初那条 429 原样透传，别把它变成 503。
+            Err(e) => {
+                tracing::warn!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    error = %e,
+                    "上游 429，但没有可换的账号，原样透传"
+                );
+                break (upstream, resp);
+            }
+        }
+    };
+    // 请求日志里记哪个设备：客户端自己带了就记它的，裸客户端记出站那份**伪装** device_id。
+    // 不记的话这段流量在日志里只留下 `device=-`，既看不出是谁、也无从聚合。见 [`sim_device_id`]。
+    // 取最终那一轮的凭证与模拟参数——换过号的话，实际发出去的就是那份。
+    let logged_device = device_id
+        .clone()
+        .or_else(|| sim_device_id(upstream.sim.as_ref(), flags, &cred, &device_fp));
 
     match resp {
         Ok(up) => {
@@ -140,10 +270,11 @@ pub async fn handle(
                 path: path_and_query,
                 cred_id: cred.id,
                 cred_label: cred.label.clone(),
-                device_id,
+                device_id: logged_device,
                 status: status.as_u16(),
                 sniffer: UsageSniffer::new(is_stream, compressed),
                 req_speed,
+                req_model: req_model.clone(),
                 ratelimit,
                 store: state.store.clone(),
             };
@@ -251,9 +382,30 @@ struct Upstream<'a> {
     /// [`build_forward_headers`] 的产物，逐次 clone 后发出。
     headers: HeaderMap,
     flags: store::ForwardFlags,
+    /// 见 [`is_billable_messages`]。为假时出站体一律原样透传，见 [`Self::shape`]。
+    billable: bool,
+    /// 非 CC 客户端的模拟参数；`None` 即来访本来就是 CC 形态。见 [`Simulation`]。
+    sim: Option<Simulation>,
 }
 
 impl Upstream<'_> {
+    /// 出站体改写的唯一入口：非计费路径（count_tokens 等）原样透传。
+    ///
+    /// 首发与「thinking 签名降级重试」两条路都必须走这里，否则同一条 count_tokens 会出现
+    /// 首发透传、重试却被 shape 过的分裂形态。
+    ///
+    /// **模拟模式下 count_tokens 会低估**：出站头已经是官方那套，体却没补 system 前缀，
+    /// 于是客户端数出来的 token 比它真发时少一个基座（opus 族约 300、sonnet 族约 2700）。
+    /// 宁可低估也不在这条路径上改体：`count_tokens` 的请求体没有 `metadata`，改了既伪装不成
+    /// 也只是多担一份上游挑刺的风险，而这条路径既不产生 usage 也不消耗额度。
+    fn shape(&self, body: &Bytes, cred: &crate::credentials::Credential, device_fp: &str) -> Bytes {
+        if self.billable {
+            rewrite_body(body, cred, device_fp, self.flags, self.sim.as_ref())
+        } else {
+            body.clone()
+        }
+    }
+
     /// 发一次。头名的拼写与顺序由 `orig_header_case` 决定（关掉即退回「全小写 +
     /// Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
     async fn send(&self, body: Bytes) -> Result<wreq::Response, wreq::Error> {
@@ -347,8 +499,7 @@ async fn retry_demoted_thinking(
         "上游拒绝 thinking 块签名（会话历史多半由其它账号签发）：已把历史 thinking 降级为 text，用同一凭证重试一次"
     );
 
-    let body = rewrite_body(&demoted, cred, device_fp, upstream.flags);
-    let up = match upstream.send(body).await {
+    let up = match upstream.send(upstream.shape(&demoted, cred, device_fp)).await {
         Ok(up) => up,
         Err(e) => {
             tracing::warn!(error = %error_chain(&e), "降级 thinking 后的重试请求发不出去，透传最初那条 400");
@@ -502,6 +653,9 @@ struct ReqLog {
     sniffer: UsageSniffer,
     /// 请求体里声明的速度档；仅在响应未回报 `usage.speed` 时兜底。
     req_speed: Option<String>,
+    /// 请求体里声明的模型名；仅在响应没带 `usage`（4xx/5xx，尤其是 429）时兜底。
+    /// 否则那些记录只留下 `model=-`，排查「哪个模型被拒得多」时等于没有信息。
+    req_model: Option<String>,
     /// 上游返回的订阅账号限流快照。
     ratelimit: RateLimitInfo,
     store: std::sync::Arc<store::CredentialStore>,
@@ -513,8 +667,10 @@ impl Drop for ReqLog {
         let has_usage = self.sniffer.has_usage();
         // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
+        // 模型同理以响应为准（上游可能回落到别的模型），没有才用请求侧声明的那个。
+        let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
         let cost_usd = crate::pricing::estimate_usd(crate::pricing::Usage {
-            model: self.sniffer.model.as_deref(),
+            model: model.as_deref(),
             speed: speed.as_deref(),
             input_tokens: self.sniffer.input_tokens,
             output_tokens: self.sniffer.output_tokens,
@@ -524,10 +680,15 @@ impl Drop for ReqLog {
             cache_read_tokens: self.sniffer.cache_read_tokens,
         });
         let total_ms = self.started.elapsed().as_millis();
+        // 伪装设备（见 [`sim_device_id`]）同样只展示前 8 位，但保留 `sim:` 前缀——
+        // 截断时把前缀一起截掉，日志里就和真实 device_id 混在一起分不出来了。
         let device_short: String = self
             .device_id
             .as_ref()
-            .map(|d| d.chars().take(8).collect())
+            .map(|d| match d.strip_prefix("sim:") {
+                Some(hex) => format!("sim:{}", hex.chars().take(8).collect::<String>()),
+                None => d.chars().take(8).collect(),
+            })
             .unwrap_or_else(|| "-".into());
         let ttft = self.ttft_ms.map(|v| v as i64);
         let total = i64::try_from(total_ms).ok();
@@ -538,7 +699,7 @@ impl Drop for ReqLog {
             cred = format!("#{} {}", self.cred_id, self.cred_label),
             device = %device_short,
             status = self.status,
-            model = %self.sniffer.model.as_deref().unwrap_or("-"),
+            model = %model.as_deref().unwrap_or("-"),
             speed = %speed.as_deref().unwrap_or("-"),
             has_usage,
             input_tokens = self.sniffer.input_tokens.unwrap_or(0),
@@ -555,7 +716,7 @@ impl Drop for ReqLog {
             cred_id: Some(self.cred_id),
             cred_label: self.cred_label.clone(),
             device_id: self.device_id.clone(),
-            model: self.sniffer.model.clone(),
+            model,
             path: self.path.clone(),
             status: self.status,
             has_usage,
@@ -708,6 +869,26 @@ impl UsageSniffer {
     }
 }
 
+/// 该路径是否会消耗订阅额度——设备身份校验、出站体改写、裸请求限流计数都只对它生效。
+///
+/// 排除 `count_tokens`：官方该端点的请求体压根没有 `metadata` 字段（只接
+/// model/messages/system/tools/tool_choice/thinking），CC 自然也不会塞，于是
+/// [`extract_device_id`] 在这条路径上恒为 `None`——开着设备校验时它 100% 被拒，
+/// 客户端的 `/context` 显示与压缩前的 token 预估直接失效。而拦它并没有收益：
+/// 不产生 usage、不消耗额度、不返回内容，既无身份可伪装，也本就不该占设备名额。
+/// 放行后走 `select_for_device(None)`，即不写绑定、不占名额、按优先级档 + 档内负载
+/// 均衡挑一个号——正是想要的语义（计 token 与选中哪个账号无关）。同理它也**不计入**裸请求
+/// 速率上限：拿一条不产生 usage、不消耗额度的请求去占名额，只会把真正的请求挤掉。
+///
+/// **豁免必须精确匹配，且吃的是不含查询串的 `uri.path()`**：这个判定的两端不对称——
+/// 判成计费只是多一道校验，判成不计费却是放掉设备校验，所以拿不准时必须倒向计费。
+/// 若这里用前缀匹配，`/v1/messages/count_tokens/../` 这类路径就会被判成豁免，而出站 URL
+/// 交给 wreq 时点段会按 RFC 3986 归一化掉，上游看到的其实是 `/v1/messages/`——等于给了
+/// 一条绕开 `device_limit` 的路。精确匹配后这类路径一律落回计费侧，先过校验再说。
+fn is_billable_messages(path: &str) -> bool {
+    path.starts_with("/v1/messages") && path != "/v1/messages/count_tokens"
+}
+
 /// 从请求体提取「客户端设备标识」，用于粘性选择与设备指纹派生。
 /// 兼容两种 `metadata.user_id` 格式：
 /// - CC 内嵌 JSON（`{"device_id":...}`）：取 `device_id`。
@@ -853,9 +1034,8 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
 /// 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；fable-5 那对
 /// 两侧会话配置不同（`context-1m` / `server-side-fallback`），能验的是落位，也一致。
 /// 回归测试见 [`tests::merged_beta_matches_official_order`]。
-fn merge_beta(incoming: Option<&HeaderValue>) -> String {
+fn merge_beta(incoming: Option<&str>) -> String {
     let mut parts: Vec<String> = incoming
-        .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
     let has = |parts: &[String], beta: &str| parts.iter().any(|p| p == beta);
@@ -902,21 +1082,35 @@ fn build_forward_headers(
     headers: &HeaderMap,
     token: &str,
     flags: store::ForwardFlags,
+    sim: Option<&Simulation>,
 ) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    // `append` 而非 `insert`：同名多值头要全部保留，`insert` 会只剩最后一个。
-    for (k, v) in headers.iter() {
-        if is_forwardable(k, v) {
-            out.append(k.clone(), v.clone());
+    let mut out = match sim {
+        // 模拟模式：来访那套头一个不留，整体换成官方的（见 [`official_headers`]）。
+        Some(sim) => official_headers(sim),
+        None => {
+            let mut out = HeaderMap::new();
+            // `append` 而非 `insert`：同名多值头要全部保留，`insert` 会只剩最后一个。
+            for (k, v) in headers.iter() {
+                if is_forwardable(k, v) {
+                    out.append(k.clone(), v.clone());
+                }
+            }
+            out
         }
-    }
+    };
     // anthropic-version 缺省补齐。
     if flags.fill_client_headers && !out.contains_key("anthropic-version") {
         out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
     // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
+    // 模拟模式下先把来访那串与官方自有串取并集，再交给同一套落位规则。
+    let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+    let incoming = match sim {
+        Some(sim) => Some(simulated_beta(sim.beta, incoming)),
+        None => incoming.map(str::to_string),
+    };
     if flags.merge_beta {
-        match HeaderValue::from_str(&merge_beta(headers.get("anthropic-beta"))) {
+        match HeaderValue::from_str(&merge_beta(incoming.as_deref())) {
             Ok(v) => {
                 out.insert("anthropic-beta", v);
             }
@@ -954,6 +1148,55 @@ fn build_forward_headers(
     out
 }
 
+/// 模拟模式下整套重建的转发头：[`config::CC_SIM_HEADERS`] 那张固定表 + 两个随请求变的值
+/// （会话 id、请求 id）。`Authorization` 与 `anthropic-beta` 由 [`build_forward_headers`]
+/// 随后覆盖上去。
+///
+/// **来访客户端自己的头一个都不带过去**：一个 UA 是 `python-httpx/0.27`、没有 `x-app`、
+/// 却发着 CC 系统提示词和 OAuth token 的请求，本身就是个比缺任何单项都强的判据；留着任何
+/// 一个非官方头都等于白伪装。唯一的例外是 `anthropic-beta`——客户端可能真的需要某个 beta，
+/// 那串在 [`simulated_beta`] 里与官方自有串取并集，不丢。
+///
+/// 插入序即 [`config::CC_SIM_HEADERS`] 的表序（官方线序），末尾两个动态头除外——线上的
+/// 拼写与顺序另由 `orig_header_case` 按 [`config::CC_HEADER_ORDER`] 归位，那张表里
+/// `X-Claude-Code-Session-Id` 与 `x-client-request-id` 都在各自的官方位置上。
+fn official_headers(sim: &Simulation) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in config::CC_SIM_HEADERS {
+        match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+            (Ok(n), Ok(v)) => {
+                out.insert(n, v);
+            }
+            // 常量表，理论上不可达；真写错了也只是少一个头，不该因此拒掉整条请求。
+            _ => tracing::error!(header = name, "模拟头构造失败（常量表写错了），跳过该头"),
+        }
+    }
+    // 与 `metadata.user_id` 里的 session_id 同值——官方两处逐字相同。
+    if let Ok(v) = HeaderValue::from_str(&sim.session_id) {
+        out.insert("x-claude-code-session-id", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&uuid_v4()) {
+        out.insert("x-client-request-id", v);
+    }
+    out
+}
+
+/// 模拟模式的 `anthropic-beta` 自有串：官方那串（`seed`，按模型族取自 [`cc_beta_seed`]）
+/// 打底，来访客户端自己带的项去重后**追加在后面**，再交给 [`merge_beta`] 落位。
+///
+/// 追加而非插空：客户端带的多半是官方不发的项（`output-128k` 之类），本来就没有「官方位置」
+/// 可言，硬塞进官方串中间反而造出一个官方不产生的排列。丢掉它们更不行——那是客户端明确要的
+/// 能力，丢了它的请求就直接变了语义。
+fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
+    let mut parts: Vec<&str> = seed.split(',').map(str::trim).collect();
+    for p in incoming.unwrap_or("").split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if !parts.contains(&p) {
+            parts.push(p);
+        }
+    }
+    parts.join(",")
+}
+
 /// 按官方拼写与顺序构造 `OrigHeaderMap`（`wreq` 据它决定线上头名的大小写**与顺序**）。
 ///
 /// 整张 [`config::CC_HEADER_ORDER`] 无条件塞进去，不按本次请求裁剪——预检实测：表里有、
@@ -973,31 +1216,318 @@ pub(crate) fn orig_header_case() -> wreq::header::OrigHeaderMap {
 
 /// 生成一个随机 uuid v4（小写带连字符），用于补齐 `x-client-request-id`。
 fn uuid_v4() -> String {
-    let mut b: [u8; 16] = rand::rng().random();
+    uuid_from_bytes(rand::rng().random())
+}
+
+/// 把 16 字节按 uuid v4 的形态格式化（打上 version/variant 位，小写带连字符）。
+/// 随机来源见 [`uuid_v4`]，派生来源见 [`Simulation::session_id`]。
+fn uuid_from_bytes(mut b: [u8; 16]) -> String {
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10
     let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
     format!("{}-{}-{}-{}-{}", h(&b[0..4]), h(&b[4..6]), h(&b[6..8]), h(&b[8..10]), h(&b[10..16]))
 }
 
-/// 读取请求体里声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
-/// `anthropic-beta: fast-mode-*`）。解析失败或没有该字段时返回 `None`。
+/// 一条**非 Claude Code 请求**要装成官方客户端时的全部派生量。
 ///
-/// 仅作兜底：fast 有独立于标准档的限流，被限流时上游会回落到标准速度，
-/// 只看请求会把这类流量按 fast 价（两倍）高估——以响应 `usage.speed` 为准。
+/// `Some` 即本条请求走模拟路径：转发头整套换成官方那套（[`official_headers`]）、`system`
+/// 补上官方前缀（[`simulate_system`]）、`metadata` 补上身份（[`ensure_cc_metadata`]）。
+/// `None` 即来访本来就是 CC 形态（或开关关着），照既有路径走，一个字节都不多改。
+///
+/// **存在的理由**：订阅(OAuth)凭证在上游是「只授权给 Claude Code 用」的，`system` 里缺那句
+/// [`config::CC_SYSTEM_IDENTITY`] 就用不了额度。于是任何非 CC 客户端（各种 SDK、第三方
+/// 前端、curl）经 luban 都是死路一条。补齐它等于把这些客户端接进订阅额度，而既然要补，
+/// 就得**整条链路一起补**：只补那句身份声明、头却还是 `python-httpx`，反倒是个真实客户端
+/// 绝不会产生的组合。
+///
+/// **代价**：每条请求多一个基座前缀（opus 族 1214 字节、sonnet 族 10682 字节，约 300 /
+/// 2700 token）。它带 `ttl:1h` + `scope:global` 断点，全网同一份，稳定后基本走缓存读价；
+/// 但**部署后每个模型族的第一条**要按写入价付一次，而且会**改变模型行为**——客户端拿到的
+/// 是一个被告知「你是 Claude Code」的模型，输出风格与工具偏好都会随之偏移。不想要就把
+/// [`store::SIMULATE_CC`] 关掉，代价是这类请求退回「上游直接拒」。
+struct Simulation {
+    /// 按模型族选出的官方基座提示词；模型认不出来时 `None`——基座是逐字节从抓包取的，
+    /// 猜错一族（把 sonnet 的 10682 字节发给 opus）比不发更糟。见 [`cc_system_base`]。
+    base: Option<&'static str>,
+    /// 按模型族选出的 `anthropic-beta` 自有串（haiku 与另外三族不同，见 [`cc_beta_seed`]）。
+    beta: &'static str,
+    /// `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里 `session_id` 的**同一个**取值：
+    /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
+    ///
+    /// 由「账号 + 设备指纹」派生而非每请求随机：真实客户端一个会话内多次请求共用一个
+    /// session_id，每请求一个新的等于宣告「每条请求都是新开的会话」。代价是同一设备的
+    /// session_id 永不变（真实客户端会随会话轮换），这条记在这儿。
+    session_id: String,
+}
+
+impl Simulation {
+    /// 判定 + 派生一次做完。返回 `None` 的三种情形：开关关着、请求体不是我们能改的 JSON、
+    /// 来访已经是 CC 形态（[`is_cc_shaped`]）。
+    ///
+    /// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
+    /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
+    /// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
+    fn detect(
+        body: &Bytes,
+        flags: store::ForwardFlags,
+        cred: &crate::credentials::Credential,
+        device_fp: &str,
+    ) -> Option<Self> {
+        if !flags.simulate_cc || !flags.merge_beta {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+        if is_cc_shaped(&v) {
+            return None;
+        }
+        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+        let base = cc_system_base(model);
+        let beta = cc_beta_seed(model);
+        tracing::debug!(
+            model,
+            base_bytes = base.map(str::len).unwrap_or(0),
+            "非 CC 请求，按官方形态模拟"
+        );
+        Some(Self { base, beta, session_id: session_id_for(cred, device_fp) })
+    }
+}
+
+/// 来访是否已经是 Claude Code 形态——判据是 `system` 里有没有那句
+/// [`config::CC_SYSTEM_IDENTITY`]，因为那正是上游认的东西。
+///
+/// 用 `contains` 而不是 `starts_with`：谁把那句话塞在自己提示词中间，那也是在自称 CC，
+/// 再给他前面插一份官方前缀只会得到两句身份声明。`system` 是字符串形态的一并认。
+fn is_cc_shaped(v: &serde_json::Value) -> bool {
+    match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.contains(config::CC_SYSTEM_IDENTITY)),
+        Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY),
+        _ => false,
+    }
+}
+
+/// 按模型族选官方基座：opus-5 / fable-5 共用一份，sonnet-5 / haiku-4.5 共用另一份
+/// （`cap/raw` 四份直连抓包，两两 sha256 相同）。认不出的模型返回 `None`，只注入身份句。
+///
+/// 匹配的是**族名**而非具体版本：CC 的基座随模型族走，`claude-opus-4-1` 这种老版本
+/// 拿到的也正是 CC 今天会发给它的那份。
+fn cc_system_base(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") || m.contains("fable") {
+        Some(config::CC_SYSTEM_BASE_OPUS)
+    } else if m.contains("sonnet") || m.contains("haiku") {
+        Some(config::CC_SYSTEM_BASE_SONNET)
+    } else {
+        None
+    }
+}
+
+/// 按模型族选 `anthropic-beta` 的客户端自有串：**haiku 一份，其余（含认不出的模型）一份**。
+///
+/// 分家的理由不是「haiku 少两项」，而是它把 `claude-code-20250219` 排在队尾——拿另外三族
+/// 那串去发 haiku，得到的是真实客户端不产生的排列。详见 [`config::CC_BETA_SIMULATED_HAIKU`]。
+///
+/// **和 [`cc_system_base`] 的分族方式不一样是对的**：基座上 haiku 与 sonnet 相同，beta 上
+/// haiku 自成一族。两处各按各的证据分，别为了「看起来整齐」并成一个函数。
+fn cc_beta_seed(model: &str) -> &'static str {
+    if model.to_ascii_lowercase().contains("haiku") {
+        config::CC_BETA_SIMULATED_HAIKU
+    } else {
+        config::CC_BETA_SIMULATED
+    }
+}
+
+/// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 设备指纹)` 取前 16 字节，
+/// 按 uuid v4 形态格式化。同一设备同一账号恒定，换账号或换设备即不同。
+///
+/// 前缀是为了和 [`crate::credentials::Credential::spoof_device_id`] 分开取值——同样的输入
+/// 派生出两个字段，不加区分前缀就会得到「device_id 与 session_id 的高位相同」这种真实
+/// 客户端不产生的相关性。
+fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"luban-session\0");
+    h.update(cred.account_uuid.as_deref().unwrap_or("").as_bytes());
+    h.update([0u8]);
+    h.update(device_fp.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    uuid_from_bytes(b)
+}
+
+/// 一次请求最多 4 个缓存断点（`cache_control`），超了上游整条拒。
+/// 官方自己用掉 3 个（基座、其余、末条消息），故模拟时得数着加，见 [`simulate_system`]。
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// 把非 CC 请求的 `system` 换成官方形态的四块：
+///
+/// ```text
+/// [0] x-anthropic-billing-header: …            无断点（cch 由 ensure_billing_cch 补）
+/// [1] You are Claude Code, …（57B）            无断点
+/// [2] 官方基座（按模型族）                      {ephemeral, ttl:1h, scope:global}
+/// [3] 客户端自己的 system（原样搬来）           {ephemeral, ttl:1h}
+/// ```
+///
+/// 客户端的 `system` 是字符串就裹成一个文本块，是数组就整段搬过来（它自己的块结构、
+/// 已有的 `cache_control` 都不动），没有就只有前三块。
+///
+/// **断点是数着加的**：客户端可能自己就用满了 4 个（比如给每条工具定义都标了缓存），这时
+/// 再加就会让整条请求被上游拒——那是把「形态更像」换成「根本发不出去」。预算不够时基座与
+/// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。
+fn simulate_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
+    let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(count_cache_control(v));
+    let client: Vec<serde_json::Value> = match v.get("system") {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+            vec![text_block_bare(s)]
+        }
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+
+    let mut blocks =
+        vec![text_block_bare(&billing_header_text()), text_block_bare(config::CC_SYSTEM_IDENTITY)];
+    if let Some(base) = sim.base {
+        if budget > 0 {
+            budget -= 1;
+            blocks.push(text_block(base, cache_control(true)));
+        } else {
+            blocks.push(text_block_bare(base));
+        }
+    }
+    // 末块补断点：官方在 system 末尾必有一个，但客户端自己标过就不重复标。
+    let tail_open = client.last().is_some_and(|b| b.get("cache_control").is_none());
+    blocks.extend(client);
+    if tail_open
+        && budget > 0
+        && let Some(last) = blocks.last_mut().and_then(|b| b.as_object_mut())
+    {
+        last.insert("cache_control".into(), cache_control(false));
+    }
+
+    insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
+    // 客户端自己那些断点也对齐到 1h：官方 3/3 全带 ttl，混着 5m 是官方不产生的中间态。
+    fill_cache_ttl(v);
+    true
+}
+
+/// `system[0]` 那条 billing header 的正文。`cch` 不在这里补——那是
+/// [`ensure_billing_cch`] 的活，模拟与非模拟两条路共用它。
+fn billing_header_text() -> String {
+    format!("x-anthropic-billing-header: cc_version={}; cc_entrypoint=cli;", config::CC_VERSION)
+}
+
+/// 写入一个顶层字段，并把**新增**的那个放到官方 key 序里该在的位置：`after` 里最靠后的
+/// 那个已有键之后（一个都没有就追加在末尾）。字段本来就在时原位替换，位置不动。
+///
+/// 官方线序是 `model → messages → system → tools → metadata → max_tokens → … → stream`，
+/// 直接 append 会让补出来的 `system`/`metadata` 落到 `stream` 后面。key 顺序是这条链路上
+/// 唯一还留得住的形态信息（body 全程 `preserve_order`，见 [`rewrite_body`]），既然要装，
+/// 就装到底。注意来访客户端自己那部分 key 序照旧不动——那是它的形态，不是我们要改的。
+fn insert_top_level(
+    v: &mut serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+    after: &[&str],
+) {
+    let Some(obj) = v.as_object_mut() else { return };
+    if obj.contains_key(key) {
+        obj.insert(key.into(), value);
+        return;
+    }
+    let at = after.iter().filter_map(|k| obj.keys().position(|have| have == k)).max();
+    match at {
+        Some(at) => obj.shift_insert(at + 1, key.into(), value),
+        None => obj.insert(key.into(), value),
+    };
+}
+
+/// 递归数出 body 里现有的 `cache_control` 个数（上游按整条请求算，不只是 `system`）。
+fn count_cache_control(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(map) => {
+            let here = usize::from(map.contains_key("cache_control"));
+            here + map.values().map(count_cache_control).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control).sum(),
+        _ => 0,
+    }
+}
+
+/// 模拟模式下给没有 `metadata.user_id` 的请求造一个官方形态的身份（键序与 CC 一致：
+/// `device_id` → `account_uuid` → `session_id`，紧凑 JSON 塞在字符串里）。
+///
+/// 客户端自己带了 `user_id` 就不动——那条交给 [`spoof_identity`] 按原格式定点改写，
+/// 两条路只能有一条动它。凭证没有 `account_uuid`（旧库未回填）时返回 `false` 不造：
+/// 一个 `account_uuid` 为空、`device_id` 却是 64 位 hex 的组合，真实客户端不产生。
+fn ensure_cc_metadata(
+    v: &mut serde_json::Value,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    session_id: &str,
+) -> bool {
+    if v.get("metadata").and_then(|m| m.get("user_id")).is_some() {
+        return false;
+    }
+    let account_uuid = match cred.account_uuid.as_deref() {
+        Some(u) if !u.trim().is_empty() => u.to_string(),
+        _ => return false,
+    };
+    let Some(device_id) = cred.spoof_device_id(device_fp) else { return false };
+
+    let mut inner = serde_json::Map::new();
+    inner.insert("device_id".into(), device_id.into());
+    inner.insert("account_uuid".into(), account_uuid.into());
+    inner.insert("session_id".into(), session_id.into());
+    // 紧凑序列化（无空白），与 CC 发的那串形态一致。
+    let user_id = serde_json::Value::Object(inner).to_string();
+
+    // metadata 已经是个对象（只是没有 user_id）就往里塞，否则整个造一个——后者也覆盖掉
+    // 「metadata 存在但不是对象」这种畸形值。位置按官方 key 序落在 tools/system 之后。
+    if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        meta.insert("user_id".into(), user_id.into());
+        return true;
+    }
+    let mut meta = serde_json::Map::new();
+    meta.insert("user_id".into(), user_id.into());
+    insert_top_level(
+        v,
+        "metadata",
+        serde_json::Value::Object(meta),
+        &["tools", "system", "messages"],
+    );
+    true
+}
+
+/// 读取请求体声明的模型名（顶层 `model`）。用于按模型分格的限流冷却，见
+/// [`rate_limit_scope`]。解析失败或没有该字段时返回 `None`（退化为账号级冷却）。
+fn request_model(body: &Bytes) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    Some(v.get("model")?.as_str()?.to_string())
+}
+
+/// 读取请求体声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
+/// `anthropic-beta: fast-mode-*`）。解析失败或没有该字段时返回 `None`。
 fn request_speed(body: &Bytes) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     Some(v.get("speed")?.as_str()?.to_string())
 }
 
-/// 转发前改写请求体，三项各自受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
+/// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
 /// 请求体逐字节原样转发）：
 ///
+/// 0. **模拟**（`simulate_cc`，仅当 `sim` 为 `Some`，即来访不是 CC 形态）：补上官方
+///    `system` 前缀与 `metadata` 身份，见 [`Simulation`]。它先跑——后面几项都是在
+///    「已经是 CC 形态」的前提下做微调。
 /// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
 ///    见 [`align_system_shape`]。含拆块、断点全上 `ttl:1h`、基座标 `scope:"global"`。
+///    模拟路径已经直接产出 4 块，故两者互斥，不叠加。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
-///    「真账号 + 陌生设备」的矛盾。
+///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
+///    本来就是同一件事。
 /// 3. **cch**（`billing_cch`）：给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
 ///
 /// **key 顺序**：改写要把 body 重新序列化，serde_json 默认的 `Map = BTreeMap` 会把**整个
@@ -1012,27 +1542,34 @@ fn rewrite_body(
     cred: &crate::credentials::Credential,
     device_fp: &str,
     flags: store::ForwardFlags,
+    sim: Option<&Simulation>,
 ) -> Bytes {
     // `ttl` 要上游认，前提是 `anthropic-beta` 里有 `extended-cache-ttl-2025-04-11`，而那串
     // 是 `merge_beta` 补的（API-key 模式的客户端自己不发，cap/raw/00002 证实）。两个开关必须
     // 同时开，否则就是「body 里写了 1h、头上没声明」的自相矛盾。
     let shape = flags.system_shape && flags.merge_beta;
-    // 三项全关：连解析都不必做，原样返回。
-    if !shape && !flags.spoof_identity && !flags.billing_cch {
+    // 全关且不模拟：连解析都不必做，原样返回。
+    if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch {
         return body.clone();
     }
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
-    let shaped = shape && align_system_shape(&mut v);
+    let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim));
+    // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
+    let shaped = shape && !simulated && align_system_shape(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
     );
+    let sim_meta = flags.spoof_identity
+        && sim.is_some_and(|sim| ensure_cc_metadata(&mut v, cred, device_fp, &sim.session_id));
     let spoofed = flags.spoof_identity && spoof_identity(&mut v, cred, device_fp);
     tracing::debug!(
+        simulated,
+        sim_meta,
         shaped,
         spoofed,
         cch_added,
@@ -1040,13 +1577,36 @@ fn rewrite_body(
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if !shaped && !spoofed && !cch_added {
+    if !shaped && !spoofed && !cch_added && !simulated && !sim_meta {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
         Ok(bytes) => Bytes::from(bytes),
         Err(_) => body.clone(),
     }
+}
+
+/// 裸客户端（无 `metadata.user_id`）在请求日志里用的设备标识：出站那份**伪装** device_id，
+/// 加 `sim:` 前缀。没伪装过就返回 `None`（日志照旧是 `-`）。
+///
+/// **只在真伪装过时才记**：要求走了模拟路径（`sim` 为 `Some`）且 `spoof_identity` 开着——
+/// 那正是 [`ensure_cc_metadata`] 会把这个 id 写进出站体的条件。否则记出来的是一个上游根本
+/// 没见过的 id，比留个 `-` 更误导。
+///
+/// **前缀不是装饰**：这个值每账号恒定（指纹对裸客户端恒为 `"||"`），所有裸客户端共用同一个，
+/// 看着就像「一台设备打了全部请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成
+/// 真实设备读。它也**不写设备绑定**，故不占 `device_limit` 名额、不会出现在设备列表里
+/// （[`store::CredentialStore::list_devices`] 从 `device_bindings` 出发）。
+fn sim_device_id(
+    sim: Option<&Simulation>,
+    flags: store::ForwardFlags,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+) -> Option<String> {
+    if sim.is_none() || !flags.spoof_identity {
+        return None;
+    }
+    cred.spoof_device_id(device_fp).map(|d| format!("sim:{d}"))
 }
 
 /// 构造设备指纹：客户端原始 `device_id` + 平台 `arch`/`os`，用于派生每设备唯一的伪装
@@ -1257,6 +1817,14 @@ fn text_block(text: &str, cache_control: serde_json::Value) -> serde_json::Value
     serde_json::Value::Object(blk)
 }
 
+/// 不带缓存断点的 `system` 文本块（官方的 `system[0]`/`system[1]` 都是这个形态）。
+fn text_block_bare(text: &str) -> serde_json::Value {
+    let mut blk = serde_json::Map::new();
+    blk.insert("type".into(), "text".into());
+    blk.insert("text".into(), text.into());
+    serde_json::Value::Object(blk)
+}
+
 /// 构造 `cache_control`，key 序与官方一致：`type` → `ttl` → `scope`。
 fn cache_control(global: bool) -> serde_json::Value {
     let mut cc = serde_json::Map::new();
@@ -1288,6 +1856,70 @@ fn fill_cache_ttl(v: &mut serde_json::Value) {
     }
 }
 
+/// 一次 429 该冷却到什么范围，见 [`rate_limit_scope`]。
+#[derive(Debug, Clone, PartialEq)]
+enum LimitScope {
+    /// 额度真的耗尽：该账号所有模型一起让位。
+    Account,
+    /// 窗口没跑满却被拒（模型容量限制）：只让这一个模型让位。
+    Model(String),
+}
+
+impl LimitScope {
+    fn account_level(&self) -> bool {
+        matches!(self, Self::Account)
+    }
+
+    /// 传给 [`store::CredentialStore::mark_rate_limited`] 的模型维度。
+    fn model(&self) -> Option<&str> {
+        match self {
+            Self::Account => None,
+            Self::Model(m) => Some(m),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Account => "account",
+            Self::Model(_) => "model",
+        }
+    }
+}
+
+/// 判定一次 429 是「这个账号没额度了」还是「这个模型这会儿没容量」。
+///
+/// **规则是实测倒逼出来的**，一次真实的 fable-5 429 头长这样：
+///
+/// ```text
+/// unified-status: rejected                            ← 不是 "rate_limited"
+/// representative-claim: seven_day_overage_included     ← 指向 7d_oi
+/// 5h:    allowed,         utilization=0.08             ← 5h 几乎是空的
+/// 7d:    allowed_warning, utilization=0.76
+/// 7d_oi: rejected,        utilization=1.01             ← 真正满掉的是这个窗口
+/// retry-after: 228721
+/// ```
+///
+/// 第一版判定认死 `status == "rate_limited"` 且只看 5h/7d 两个窗口，于是把上面这条判成了
+/// 模型级——只冷却 fable 三十秒，放出去再撞，如此循环。两处教训都写在规则里：
+///
+/// 1. **状态词不止一个**：`rejected` 与 `rate_limited` 都算被拒（`allowed`/`allowed_warning`
+///    才是放行）。只认其中一个等于漏判。
+/// 2. **窗口名不能写死**：真正被拒的是 `7d_oi`（7 天含超额），代码里原本根本没解析它。
+///    故改成扫**所有** `unified-<窗口>-status/utilization`，任一被拒或 `utilization >= 1`
+///    即判账号级——不必知道窗口叫什么，也不必维护 `representative-claim` 到窗口名的映射
+///    （`seven_day_overage_included` → `7d_oi` 这种对应关系纯属猜谜）。
+///
+/// 剩下的「所有窗口都还有余量却仍被拒」才是模型容量限制，只冷却该模型。请求体里读不出模型名
+/// 时退回账号级——没有模型可挂，宁可保守。
+fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
+    let Some(model) = model else { return LimitScope::Account };
+    let rejected = |s: &str| s.contains("rate_limited") || s.contains("rejected");
+    let quota_gone = info.unified_status.as_deref().is_some_and(rejected)
+        || info.window_status.iter().any(|(_, s)| rejected(s))
+        || info.window_utilization.iter().any(|(_, u)| *u >= 1.0);
+    if quota_gone { LimitScope::Account } else { LimitScope::Model(model.to_string()) }
+}
+
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
 ///
 /// 5h/7d 两个窗口各有 status/reset(unix 秒)/utilization(0~1)；`representative` 指明
@@ -1302,6 +1934,20 @@ struct RateLimitInfo {
     seven_d_reset: Option<i64>,
     seven_d_utilization: Option<f64>,
     representative: Option<String>,
+    /// `retry-after`（秒）。429 时上游一般会给，是冷却时长最直接的来源，见
+    /// [`RateLimitInfo::cooldown`]。
+    retry_after: Option<i64>,
+    /// 不带窗口名的 `anthropic-ratelimit-unified-reset`（unix 秒）：上游给的「整体什么时候
+    /// 恢复」，比按 `representative-claim` 反查窗口更直接。
+    unified_reset: Option<i64>,
+    /// **所有** `anthropic-ratelimit-unified-<窗口>-status` 的取值（窗口名原样保留）。
+    ///
+    /// 刻意不写死窗口名：实测除了 `5h`/`7d`，还有 `7d_oi`（7 天含超额），而**真正被拒的
+    /// 正是它**——只解析 5h/7d 会看到「两个窗口都没满」，从而把一次账号级限流误判成模型
+    /// 容量限制。窗口种类是上游说了算的，只能全收，见 [`rate_limit_scope`]。
+    window_status: Vec<(String, String)>,
+    /// 所有 `…-<窗口>-utilization` 的取值。同上，全收。
+    window_utilization: Vec<(String, f64)>,
     /// 全部匹配到的限流/anthropic- 头，`k=v` 以 `, ` 连接。
     raw: String,
 }
@@ -1339,13 +1985,82 @@ impl RateLimitInfo {
                 "anthropic-ratelimit-unified-representative-claim" => {
                     info.representative = Some(val.to_string())
                 }
+                "retry-after" => info.retry_after = val.trim().parse().ok(),
+                "anthropic-ratelimit-unified-reset" => info.unified_reset = val.parse().ok(),
                 _ => {}
+            }
+            // 通用收集：`anthropic-ratelimit-unified-<窗口>-status|utilization`，窗口名不限。
+            if let Some(rest) = name.strip_prefix("anthropic-ratelimit-unified-") {
+                if let Some(win) = rest.strip_suffix("-status") {
+                    info.window_status.push((win.to_string(), val.to_string()));
+                } else if let Some(win) = rest.strip_suffix("-utilization")
+                    && let Ok(u) = val.parse::<f64>()
+                {
+                    info.window_utilization.push((win.to_string(), u));
+                }
             }
         }
         info.raw = pairs.join(", ");
         info
     }
+
+    /// 该凭证被上游 429 之后应冷却多久。
+    ///
+    /// **账号级**（额度真耗尽）取值优先级：
+    /// 1. `retry-after`（秒）——上游对这次拒绝给出的明确等待时间，最可信（实测给的是
+    ///    228721 秒 ≈ 63 小时，直指 7 天窗口的重置时刻，说明它确实算得很准）；
+    /// 2. 不带窗口名的 `anthropic-ratelimit-unified-reset` 减去当前时刻——上游给的「整体
+    ///    什么时候恢复」，比按 `representative-claim` 反查窗口名可靠；
+    /// 3. 各窗口 `*-reset` 里**最早**的那个，宁可早醒也不要多睡；
+    /// 4. 都没有 → [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
+    ///
+    /// **模型级不看任何 reset**：窗口都没跑满，reset 说的是「这个窗口什么时候重置」，跟
+    /// 「这个模型什么时候有容量」是两码事，拿它当冷却会让一个好账号的某个模型白白闲置几小时。
+    /// 那一档只认 `retry-after`，没有就用 [`DEFAULT_MODEL_COOLDOWN_SECS`]。
+    ///
+    /// 结果夹在 `[1s, 24h]`。上限从 6h 放宽到 24h 是实测改的：上游真的会给 63 小时的
+    /// `retry-after`，夹到 6h 等于每 6 小时把这个号放出去白撞一次 429。再往上放宽意义不大
+    /// ——冷却记在内存里，进程重启就清了。冷却本身也只是**选号提示**（见
+    /// [`store::CredentialStore::select_for_device`]），全部号都在冷却时会被忽略。
+    fn cooldown(&self, account_level: bool) -> std::time::Duration {
+        let now = crate::credentials::now_secs() as i64;
+        let earliest_window_reset = self
+            .window_reset_candidates()
+            .into_iter()
+            .filter(|reset| *reset > now)
+            .min()
+            .map(|reset| reset - now);
+        let fallback = if account_level {
+            self.unified_reset
+                .map(|reset| reset - now)
+                .filter(|d| *d > 0)
+                .or(earliest_window_reset)
+                .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
+        } else {
+            DEFAULT_MODEL_COOLDOWN_SECS
+        };
+        let secs = self.retry_after.unwrap_or(fallback).clamp(1, 24 * 3600);
+        std::time::Duration::from_secs(secs as u64)
+    }
+
+    /// 各窗口的 `*-reset`（unix 秒）。目前专用字段只解析了 5h/7d 两个，够用即可——
+    /// 它只是 `unified-reset` 缺失时的兜底，而实测那个头一直都在。
+    fn window_reset_candidates(&self) -> Vec<i64> {
+        [self.five_h_reset, self.seven_d_reset].into_iter().flatten().collect()
+    }
 }
+
+/// 模型级冷却在没有 `retry-after` 时的时长。
+///
+/// 取 30 秒：容量限制是「这一阵挤」，不是「这个号没额度了」，躲一小会儿就该让它回来试；
+/// 押太久等于把一个健康账号的这个模型白白闲置。
+const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
+
+/// 上游 429 但没给任何可用的等待时间时，凭证的默认冷却时长。
+///
+/// 取一分钟：这种情况多半是突发/并发限流（额度耗尽那种上游会明确给 reset），躲过这一阵即可；
+/// 冷却太长会让一个其实还能用的号长时间闲置。
+const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
 
 /// 请求头是否可转发：跳过接入 key、Host、逐跳头。
 ///
@@ -1399,9 +2114,31 @@ fn is_resp_forwardable(name: &HeaderName) -> bool {
 mod tests {
     use super::{
         Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
-        detect_account_ban, ensure_billing_cch, header, merge_beta, replace_json_str_field,
-        request_speed, store, uuid_v4,
+        detect_account_ban, ensure_billing_cch, header, is_billable_messages, merge_beta,
+        replace_json_str_field, request_speed, store, uuid_v4,
     };
+
+    /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
+    /// ——那条路径的请求体没有 `metadata` 可带，卡它等于把客户端的 token 预估打死。
+    ///
+    /// 入参是 `uri.path()`（不含查询串），故 `?beta=true` 不影响判定。
+    #[test]
+    fn count_tokens_is_not_billable() {
+        assert!(is_billable_messages("/v1/messages"));
+        assert!(!is_billable_messages("/v1/messages/count_tokens"));
+        assert!(!is_billable_messages("/v1/models"));
+    }
+
+    /// 豁免精确匹配：任何「顶着 count_tokens 前缀但归一化后不是它」的路径都必须落回计费侧。
+    /// 出站 URL 交给 wreq 时点段会按 RFC 3986 消解，`…/count_tokens/../` 到上游就成了
+    /// `/v1/messages/`——前缀匹配会在这里漏掉设备校验，等于放开 `device_limit`。
+    #[test]
+    fn count_tokens_exemption_does_not_leak_via_prefix() {
+        assert!(is_billable_messages("/v1/messages/count_tokens/.."));
+        assert!(is_billable_messages("/v1/messages/count_tokens/../"));
+        assert!(is_billable_messages("/v1/messages/count_tokens/"));
+        assert!(is_billable_messages("/v1/messages/count_tokensX"));
+    }
 
     /// 形态开关全开（= 默认，也是加入开关机制之前的既有行为）。
     fn all_on() -> store::ForwardFlags {
@@ -1457,7 +2194,11 @@ mod tests {
     fn merged_beta_matches_official_order() {
         for (model, client, official) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
-            assert_eq!(&merge_beta(Some(&v)), official, "{model} 的 beta 串没对齐");
+            assert_eq!(
+                &merge_beta(Some(v.to_str().unwrap())),
+                official,
+                "{model} 的 beta 串没对齐"
+            );
         }
     }
 
@@ -1466,7 +2207,7 @@ mod tests {
     fn merged_beta_preserves_client_order() {
         for (model, client, _) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
-            let out = merge_beta(Some(&v));
+            let out = merge_beta(Some(v.to_str().unwrap()));
             let kept: Vec<&str> =
                 out.split(',').filter(|b| client.split(',').any(|c| c.trim() == *b)).collect();
             let sent: Vec<&str> = client.split(',').map(str::trim).collect();
@@ -1479,7 +2220,7 @@ mod tests {
     fn merged_beta_keeps_unknown_betas_in_place() {
         let (_, client, official) = BETA_PAIRS[1];
         let v = HeaderValue::from_str(&format!("{client},some-future-beta-2027-01-01")).unwrap();
-        let out = merge_beta(Some(&v));
+        let out = merge_beta(Some(v.to_str().unwrap()));
         // 客户端把它放在自有串末尾，官方串里它就该在 effort 之后、extended-cache-ttl 之前。
         assert_eq!(
             out,
@@ -1538,7 +2279,7 @@ mod tests {
     /// 处理的是同一类问题（那个管值内顺序，这个管头之间的顺序）。
     #[test]
     fn forward_headers_keep_client_order() {
-        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on());
+        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on(), None);
 
         assert_eq!(
             names(&out),
@@ -1581,8 +2322,10 @@ mod tests {
             system_shape: false,
             orig_header_case: false,
             thinking_signature_retry: false,
+            simulate_cc: false,
+            rate_limit_retry: false,
         };
-        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags);
+        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None);
 
         // 头序与来访一致，且末尾不再追加 x-client-request-id。
         assert_eq!(
@@ -1623,7 +2366,7 @@ mod tests {
             HeaderValue::from_static("application/json"),
         );
 
-        let on = build_forward_headers(&bare, "tok", all_on());
+        let on = build_forward_headers(&bare, "tok", all_on(), None);
         assert_eq!(
             names(&on),
             vec![
@@ -1638,7 +2381,7 @@ mod tests {
         );
 
         let flags = store::ForwardFlags { fill_client_headers: false, ..all_on() };
-        let off = build_forward_headers(&bare, "tok", flags);
+        let off = build_forward_headers(&bare, "tok", flags, None);
         assert_eq!(
             names(&off),
             vec!["content-type", "anthropic-beta", "authorization"],
@@ -1654,7 +2397,7 @@ mod tests {
     #[test]
     fn never_leaks_client_key_upstream() {
         // token 里塞进换行——`HeaderValue::from_str` 会拒绝，走到移除分支。
-        let out = build_forward_headers(&incoming_headers(), "bad\ntoken", all_on());
+        let out = build_forward_headers(&incoming_headers(), "bad\ntoken", all_on(), None);
         assert!(!out.contains_key("authorization"), "构造失败时应移除该头: {out:?}");
         // 任何路径下都不得把接入 key 转发出去。
         for (_, v) in out.iter() {
@@ -1795,7 +2538,12 @@ mod tests {
         let req = crate::web::upstream_client()
             .unwrap()
             .post(format!("http://{addr}/v1/messages?beta=true"))
-            .headers(build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on()))
+            .headers(build_forward_headers(
+                &incoming_headers(),
+                "sk-ant-oat01-REAL",
+                all_on(),
+                None,
+            ))
             .body(r#"{"model":"claude-sonnet-5"}"#);
         let req = if orig_case { req.orig_headers(super::orig_header_case()) } else { req };
         let _ = req.send().await;
@@ -1932,7 +2680,8 @@ mod tests {
     /// 消息里的断点也补上 `ttl`。切开处那个 `\n\n` 两边都不保留。
     #[test]
     fn aligns_system_to_official_four_blocks() {
-        let out = super::rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", all_on());
+        let out =
+            super::rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", all_on(), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let sys = v["system"].as_array().unwrap();
@@ -1972,7 +2721,7 @@ mod tests {
             r#"\nBASE — 基座\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
             r#"\nBASE — 基座\n\n# Communicating with the user\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -1993,7 +2742,7 @@ mod tests {
             "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
             "# Text output (does not apply to tool calls)",
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -2010,7 +2759,7 @@ mod tests {
     #[test]
     fn leaves_system_alone_when_anchor_missing() {
         let raw = Bytes::from(API_SHAPE_BODY.replace("Write code that reads like", "改了措辞的"));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
@@ -2029,7 +2778,7 @@ mod tests {
                           {"type":"text","text":"base","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}},
                           {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
         );
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on());
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
         assert_eq!(out, raw, "四块形态应原样返回");
     }
 
@@ -2047,27 +2796,32 @@ mod tests {
             system_shape: false,
             orig_header_case: false,
             thinking_signature_retry: false,
+            simulate_cc: false,
+            rate_limit_retry: false,
         };
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags, None);
         assert_eq!(out, raw, "全关时必须原样返回");
 
         // 逐项开一个，就只有那一项生效，其余仍不动。
         let only_cch = store::ForwardFlags { billing_cch: true, ..flags };
-        let s = String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", only_cch).to_vec())
-            .unwrap();
+        let s = String::from_utf8(
+            super::rewrite_body(&raw, &test_cred(), "fp", only_cch, None).to_vec(),
+        )
+        .unwrap();
         assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
         assert!(!s.contains(r#""ttl""#), "system_shape 关着不应拆块/上 ttl: {s}");
         assert!(s.contains(r#"\"account_uuid\":\"\""#), "spoof 关着应保留空 uuid: {s}");
 
         // system 形态依赖 merge_beta 补的 extended-cache-ttl beta：只开 system_shape 不生效。
         let shape_only = store::ForwardFlags { system_shape: true, ..flags };
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", shape_only);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", shape_only, None);
         assert_eq!(out, raw, "merge_beta 关着时不应写出 ttl");
 
         let with_beta = store::ForwardFlags { merge_beta: true, ..shape_only };
-        let s =
-            String::from_utf8(super::rewrite_body(&raw, &test_cred(), "fp", with_beta).to_vec())
-                .unwrap();
+        let s = String::from_utf8(
+            super::rewrite_body(&raw, &test_cred(), "fp", with_beta, None).to_vec(),
+        )
+        .unwrap();
         assert!(s.contains(r#""scope":"global""#), "两个开关都开时应对齐形态: {s}");
         assert!(!s.contains("cch="), "billing_cch 关着不应补 cch: {s}");
     }
@@ -2095,7 +2849,7 @@ mod tests {
             r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
             r#""max_tokens":64000,"stream":true}"#
         );
-        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on());
+        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
@@ -2361,5 +3115,352 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(s.contains("AAAA"), "空 thinking 那轮应原样留着: {s}");
         assert!(!s.contains("BBBB"), "第二轮仍应降级: {s}");
+    }
+
+    // ---------- 非 CC 请求的模拟（Simulation） ----------
+
+    /// 一条普通客户端会发的请求：没有 system、没有 metadata，头也不是 CC 那套。
+    const PLAIN_BODY: &str = concat!(
+        r#"{"model":"claude-opus-5","max_tokens":1024,"#,
+        r#""messages":[{"role":"user","content":"hi"}],"stream":true}"#
+    );
+
+    fn sim_for(body: &str) -> super::Simulation {
+        super::Simulation::detect(&Bytes::from(body.to_string()), all_on(), &test_cred(), "fp")
+            .expect("普通请求应判为需要模拟")
+    }
+
+    /// 模拟串交给 `merge_beta` 之后，必须**逐字节**等于官方那串——这是
+    /// [`config::CC_BETA_SIMULATED`] / [`config::CC_BETA_SIMULATED_HAIKU`] 唯一的正确性依据。
+    ///
+    /// 两族分开验：haiku 不发 `mid-conversation-system`/`effort`，且 `claude-code-20250219`
+    /// 在**队尾**。共用一份种子串就会给 haiku 发出一个真实客户端不产生的排列。
+    #[test]
+    fn simulated_beta_matches_official() {
+        // cap/raw/00009（sonnet-5 直连）；opus-5/fable-5 只多出计价相关的那几项。
+        const OFFICIAL: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+        // cap/raw/00031（haiku-4.5 直连）：oauth 在最前、claude-code 在第 6 位。
+        const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             claude-code-20250219,advanced-tool-use-2025-11-20,extended-cache-ttl-2025-04-11";
+
+        for (model, official) in [
+            ("claude-sonnet-5", OFFICIAL),
+            ("claude-opus-5", OFFICIAL),
+            ("claude-fable-5", OFFICIAL),
+            ("gpt-4o", OFFICIAL), // 认不出的模型退回主串
+            ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
+        ] {
+            let seed = super::cc_beta_seed(model);
+            assert_eq!(merge_beta(Some(&super::simulated_beta(seed, None))), official, "{model}");
+        }
+
+        // 计价语义相关的三项刻意不发，见 config::CC_BETA_SIMULATED。
+        assert!(!OFFICIAL.contains("context-1m"), "1M 上下文不该由 luban 替客户端声明");
+        assert!(!OFFICIAL.contains("fallback"), "额度回补/服务端换模型不该由 luban 替客户端声明");
+
+        // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
+        let with_client = merge_beta(Some(&super::simulated_beta(
+            config::CC_BETA_SIMULATED,
+            Some("output-128k-2025-02-19, effort-2025-11-24"),
+        )));
+        assert!(
+            with_client.contains("output-128k-2025-02-19"),
+            "客户端的 beta 被丢了: {with_client}"
+        );
+        assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
+    }
+
+    /// 普通请求 → 官方四块 system：billing / 身份句 / 基座（1h + global）/ 客户端原文（1h）。
+    /// 基座按模型族选，且 `system` 落在 `messages` 之后（官方 key 序）。
+    #[test]
+    fn simulates_official_system_for_plain_request() {
+        let body = Bytes::from(
+            r#"{"model":"claude-sonnet-5","messages":[],"system":"你是助手","max_tokens":8}"#
+                .to_string(),
+        );
+        let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "应是官方的四块: {s}");
+        assert!(
+            sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
+            "第 0 块应是 billing header: {s}"
+        );
+        assert!(
+            sys[0]["text"].as_str().unwrap().contains("cch="),
+            "cch 应由 ensure_billing_cch 补上"
+        );
+        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
+        assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
+        assert_eq!(sys[2]["cache_control"]["ttl"], "1h");
+        assert_eq!(sys[2]["cache_control"]["scope"], "global");
+        assert_eq!(sys[3]["text"], "你是助手", "客户端原 system 应原样留在末块");
+        assert_eq!(sys[3]["cache_control"]["ttl"], "1h");
+        assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
+
+        // key 序按官方 `model → messages → system → tools → metadata → max_tokens` 落位，
+        // 补出来的两个字段不该被追加到队尾。
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["model", "messages", "system", "metadata", "max_tokens"],
+            "key 序: {s}"
+        );
+
+        // 换模型族即换基座；认不出的模型只注入前两块。
+        assert_eq!(sim_for(PLAIN_BODY).base, Some(config::CC_SYSTEM_BASE_OPUS), "opus 族基座");
+        assert_eq!(
+            sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).base,
+            Some(config::CC_SYSTEM_BASE_SONNET),
+            "haiku 与 sonnet-5 的基座 sha256 相同，共用一份"
+        );
+        assert!(
+            sim_for(r#"{"model":"gpt-4o","messages":[]}"#).base.is_none(),
+            "认不出的模型不猜基座"
+        );
+    }
+
+    /// 没有 system 的请求同样成立：三块（billing / 身份句 / 基座），且末块拿到断点。
+    #[test]
+    fn simulates_system_when_client_sent_none() {
+        let body = Bytes::from(PLAIN_BODY.to_string());
+        let sim = sim_for(PLAIN_BODY);
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
+        assert_eq!(sys[2]["cache_control"]["ttl"], "1h");
+    }
+
+    /// 已经是 CC 形态的请求一个字节都不该多改——判据是 `system` 里那句身份声明，
+    /// 字符串形态与数组形态都认。
+    #[test]
+    fn leaves_cc_shaped_request_alone() {
+        let cc = Bytes::from(API_SHAPE_BODY);
+        assert!(
+            super::Simulation::detect(&cc, all_on(), &test_cred(), "fp").is_none(),
+            "CC 形态不该走模拟路径"
+        );
+        let as_string = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":"{}","messages":[]}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(super::Simulation::detect(&as_string, all_on(), &test_cred(), "fp").is_none());
+
+        // 开关关掉、或 merge_beta 关掉（模拟出来的 beta 没人落位）时也不模拟。
+        let plain = Bytes::from(PLAIN_BODY.to_string());
+        let off = store::ForwardFlags { simulate_cc: false, ..all_on() };
+        assert!(super::Simulation::detect(&plain, off, &test_cred(), "fp").is_none());
+        let no_beta = store::ForwardFlags { merge_beta: false, ..all_on() };
+        assert!(super::Simulation::detect(&plain, no_beta, &test_cred(), "fp").is_none());
+        // 解析不了的请求体不 panic、也不模拟。
+        assert!(
+            super::Simulation::detect(
+                &Bytes::from_static(b"not json"),
+                all_on(),
+                &test_cred(),
+                "fp"
+            )
+            .is_none()
+        );
+    }
+
+    /// 客户端已经用满 4 个缓存断点时不再加——加了整条请求会被上游拒，那是把「形态更像」
+    /// 换成「根本发不出去」。
+    #[test]
+    fn respects_cache_breakpoint_budget() {
+        let blk = r#"{"type":"text","text":"t","cache_control":{"type":"ephemeral"}}"#;
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{blk},{blk},{blk},{blk}]}}"#
+        ));
+        let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
+        assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
+        // 内容照发，只是少一次缓存复用。
+        assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE_OPUS);
+    }
+
+    /// 模拟路径补 `metadata.user_id`：键序与 CC 一致，session_id 与请求头同值且逐设备稳定；
+    /// 客户端自己带了 user_id 就不新造（交给 spoof_identity 原格式改写）。
+    #[test]
+    fn injects_cc_metadata_only_when_absent() {
+        let body = Bytes::from(PLAIN_BODY.to_string());
+        let sim = sim_for(PLAIN_BODY);
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let user_id = v["metadata"]["user_id"].as_str().unwrap();
+        let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
+
+        assert_eq!(
+            inner.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["device_id", "account_uuid", "session_id"],
+            "键序应与 CC 一致: {user_id}"
+        );
+        assert_eq!(inner["account_uuid"], ACCOUNT_UUID);
+        assert_eq!(inner["device_id"], test_cred().spoof_device_id("fp").unwrap());
+        assert_eq!(inner["session_id"], sim.session_id, "两处 session_id 必须同值");
+        assert_eq!(sim.session_id, sim_for(PLAIN_BODY).session_id, "同设备同账号应恒定");
+
+        // 客户端自己带了 user_id：不新造，仍由 spoof_identity 定点改写。
+        let with_meta = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"user_aa_account_bb_session_cc"}}"#
+                .to_string(),
+        );
+        let sim2 = super::Simulation::detect(&with_meta, all_on(), &test_cred(), "fp").unwrap();
+        let out2 = super::rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2));
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(
+            v2["metadata"]["user_id"],
+            format!(
+                "user_{}_account_{ACCOUNT_UUID}_session_cc",
+                test_cred().spoof_device_id("fp").unwrap()
+            ),
+            "扁平串形态应原格式改写，而不是被换成 CC 的 JSON 形态"
+        );
+    }
+
+    /// 模拟模式下来访那套头一个不留：UA/x-app/x-stainless-* 全是官方取值，
+    /// 客户端自带的非官方头（`x-my-tool`）不转发，`anthropic-beta` 取并集。
+    #[test]
+    fn simulated_headers_replace_client_headers() {
+        let mut client = super::HeaderMap::new();
+        for (k, v) in [
+            ("user-agent", "python-httpx/0.27.0"),
+            ("accept", "text/event-stream"),
+            ("x-my-tool", "cherry-studio"),
+            ("anthropic-beta", "output-128k-2025-02-19"),
+        ] {
+            client.insert(super::HeaderName::from_static(k), HeaderValue::from_static(v));
+        }
+        let sim = sim_for(PLAIN_BODY);
+        let out = build_forward_headers(&client, "sk-ant-oat01-REAL", all_on(), Some(&sim));
+        let get = |k: &str| out.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default();
+
+        assert_eq!(get("user-agent"), config::CC_USER_AGENT);
+        assert_eq!(get("accept"), "application/json", "官方即便流式也发 application/json");
+        assert_eq!(get("x-app"), "cli");
+        assert_eq!(get("x-stainless-os"), "MacOS");
+        assert_eq!(get("anthropic-version"), "2023-06-01");
+        assert_eq!(get("accept-encoding"), config::CC_ACCEPT_ENCODING);
+        assert_eq!(get("x-claude-code-session-id"), sim.session_id, "会话 id 与 metadata 同值");
+        assert!(!get("x-client-request-id").is_empty(), "每请求一个 uuid");
+        assert_eq!(get("authorization"), "Bearer sk-ant-oat01-REAL");
+        assert!(out.get("x-my-tool").is_none(), "客户端的非官方头不该带到上游");
+        assert!(get("anthropic-beta").contains("output-128k-2025-02-19"), "客户端 beta 不该丢");
+        assert!(get("anthropic-beta").contains(config::OAUTH_BETA_HEADER));
+
+        // 表里的头全在，且没有多出表外的头（除四个由 HTTP 客户端自己追加的）。
+        for (name, _) in config::CC_SIM_HEADERS {
+            assert!(out.contains_key(*name), "缺头 {name}");
+        }
+    }
+
+    /// 裸客户端的日志设备标识：只在真伪装过时才有值，且带 `sim:` 前缀以免被当成真实设备。
+    #[test]
+    fn logs_simulated_device_only_when_spoofed() {
+        let sim = sim_for(PLAIN_BODY);
+        let id = super::sim_device_id(Some(&sim), all_on(), &test_cred(), "fp").unwrap();
+        assert_eq!(id, format!("sim:{}", test_cred().spoof_device_id("fp").unwrap()));
+
+        // 没走模拟路径（来访本来就是 CC 形态）→ 出站体里根本没有这个 id，不该记。
+        assert!(super::sim_device_id(None, all_on(), &test_cred(), "fp").is_none());
+        // spoof_identity 关着时同理：ensure_cc_metadata 不会写 metadata。
+        let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
+        assert!(super::sim_device_id(Some(&sim), no_spoof, &test_cred(), "fp").is_none());
+        // 凭证没有 account_uuid 就派生不出来，退回 `-`。
+        let no_uuid = crate::credentials::Credential { account_uuid: None, ..test_cred() };
+        assert!(super::sim_device_id(Some(&sim), all_on(), &no_uuid, "fp").is_none());
+    }
+
+    /// 429 作用域判定的回归用例，**头的取值逐字节取自一次真实的 fable-5 429**
+    /// （账号 5h 只用了 8%、7d 用了 76%，真正满掉的是 `7d_oi` = 1.01）。
+    ///
+    /// 这条用例存在的理由：第一版判定认死 `status == "rate_limited"` 且只看 5h/7d，
+    /// 会把它误判成「模型容量限制」，只冷却 fable 三十秒然后反复撞墙。
+    #[test]
+    fn rate_limit_scope_reads_every_window_not_just_5h_7d() {
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let fable = Some("claude-fable-5");
+        let real = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.08"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.76"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.01"),
+            ("retry-after", "228721"),
+        ]);
+        let scope = super::rate_limit_scope(&real, fable);
+        assert!(scope.account_level(), "unified-status=rejected + 7d_oi 满 → 账号级");
+        // retry-after 优先，但夹到 24h：上游给的 63 小时不该原样吃下，也不该被砍成 6h。
+        assert_eq!(real.cooldown(true).as_secs(), 24 * 3600);
+
+        // 所有窗口都还有余量却被拒 → 这才是模型容量限制，只冷却该模型且不吃 reset。
+        let far = crate::credentials::now_secs() as i64 + 4 * 3600;
+        let capacity = hdr(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
+            ("anthropic-ratelimit-unified-5h-reset", &far.to_string()),
+            ("anthropic-ratelimit-unified-reset", &far.to_string()),
+        ]);
+        let scope = super::rate_limit_scope(&capacity, fable);
+        assert_eq!(scope.model(), fable, "窗口都没满应判模型级");
+        assert_eq!(capacity.cooldown(false).as_secs(), 30, "模型级不该拿 reset 当冷却");
+        assert!(capacity.cooldown(true).as_secs() > 3000, "账号级才按 reset 冷却");
+
+        // retry-after 两档都优先；读不出模型名保守退回账号级；什么头都没有用默认值。
+        let with_retry = hdr(&[("retry-after", "7")]);
+        assert_eq!(with_retry.cooldown(false).as_secs(), 7);
+        assert_eq!(with_retry.cooldown(true).as_secs(), 7);
+        let bare = hdr(&[]);
+        assert!(super::rate_limit_scope(&bare, None).account_level());
+        assert_eq!(bare.cooldown(true).as_secs(), 60);
+    }
+
+    /// 基座资产是逐字节从抓包取出来的，别被编辑器/格式化工具动过。
+    #[test]
+    fn system_base_assets_are_verbatim() {
+        assert_eq!(config::CC_SYSTEM_BASE_OPUS.len(), 1214, "opus 族基座字节数（cap/raw/00006）");
+        assert_eq!(
+            config::CC_SYSTEM_BASE_SONNET.len(),
+            10682,
+            "sonnet 族基座字节数（cap/raw/00009）"
+        );
+        assert_eq!(config::CC_SYSTEM_IDENTITY.len(), 57, "身份句字节数");
+        for base in [config::CC_SYSTEM_BASE_OPUS, config::CC_SYSTEM_BASE_SONNET] {
+            assert!(
+                base.starts_with("\nYou are an interactive agent"),
+                "开头那个 \\n 是官方就有的"
+            );
+            assert!(!base.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
+        }
+        // 基座是「切点之前」那一段，锚点属于其余段，不该出现在基座里。
+        for anchor in config::CC_SYSTEM_BASE_ANCHORS {
+            assert!(!config::CC_SYSTEM_BASE_OPUS.contains(anchor), "基座里不该有拆块锚点");
+        }
     }
 }

@@ -112,6 +112,8 @@ pub async fn run(
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
         .route("/settings/default-device-limit", post(set_default_device_limit))
+        .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
+        .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/auth/password", post(auth::change_password))
@@ -298,6 +300,7 @@ async fn list_credentials(
         .iter()
         .map(|c| {
             CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), default_limit)
+                .with_cooldown(state.store.rate_limited_secs(c.id))
                 .with_stats(
                     quotas.get(&c.id).cloned(),
                     last_used.get(&c.id).copied(),
@@ -550,7 +553,9 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let cost_total = state.store.cost_of(id).map_err(internal)?;
     let default_limit = state.store.default_device_limit();
     Ok(Json(
-        CredentialView::new(&cred, count, default_limit).with_stats(quota, last_used, cost_total),
+        CredentialView::new(&cred, count, default_limit)
+            .with_cooldown(state.store.rate_limited_secs(cred.id))
+            .with_stats(quota, last_used, cost_total),
     ))
 }
 
@@ -568,6 +573,12 @@ struct SettingsResp {
     default_device_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
+    /// 单凭证裸请求速率上限（窗口内条数）；0 表示不限。
+    bare_rate_limit: i64,
+    /// 裸请求速率窗口（秒），默认 60。
+    bare_rate_window_secs: i64,
+    /// 上游 429 时最多换几个号重试；0 表示不重试。
+    rate_limit_retry_max: i64,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -590,6 +601,10 @@ struct ForwardingResp {
     orig_header_case: bool,
     /// 上游拒绝 thinking 块签名时，降级历史 thinking 后重试一次。
     thinking_signature_retry: bool,
+    /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求。
+    simulate_cc: bool,
+    /// 上游回 429 时给该号打冷却并换号重试。
+    rate_limit_retry: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -602,6 +617,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             system_shape: f.system_shape,
             orig_header_case: f.orig_header_case,
             thinking_signature_retry: f.thinking_signature_retry,
+            simulate_cc: f.simulate_cc,
+            rate_limit_retry: f.rate_limit_retry,
         }
     }
 }
@@ -610,6 +627,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let default_device_limit = state.store.default_device_limit();
     let require_device_id = state.store.require_device_id();
+    let bare_rate_limit = state.store.bare_rate_limit();
+    let bare_rate_window_secs = state.store.bare_rate_window_secs();
+    let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -618,6 +638,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             device_binding_ttl_secs,
             default_device_limit,
             require_device_id,
+            bare_rate_limit,
+            bare_rate_window_secs,
+            rate_limit_retry_max,
             forwarding,
         };
     }
@@ -633,6 +656,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         device_binding_ttl_secs,
         default_device_limit,
         require_device_id,
+        bare_rate_limit,
+        bare_rate_window_secs,
+        rate_limit_retry_max,
         forwarding,
     }
 }
@@ -704,6 +730,54 @@ async fn set_default_device_limit(
 }
 
 #[derive(Deserialize)]
+struct SetBareRateLimitReq {
+    /// 单凭证在窗口内允许的裸请求条数；0（或负数）表示不限。
+    bare_rate_limit: i64,
+    /// 窗口秒数；缺省或 `<= 0` 时保持现值不动（不因为改上限就把窗口重置成默认值）。
+    bare_rate_window_secs: Option<i64>,
+}
+
+/// 设置裸请求速率上限（每个凭证各算各的，只统计无 `metadata.user_id` 的请求）。
+///
+/// 计数在进程内存里，改上限即时生效；窗口只在显式给出正数时才写，避免前端只想调上限却把
+/// 窗口顺手清成默认值。
+async fn set_bare_rate_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetBareRateLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.bare_rate_limit.max(0);
+    state.store.set_setting(crate::store::BARE_RATE_LIMIT, &limit.to_string()).map_err(internal)?;
+    if let Some(window) = req.bare_rate_window_secs.filter(|w| *w > 0) {
+        state
+            .store
+            .set_setting(crate::store::BARE_RATE_WINDOW_SECS, &window.to_string())
+            .map_err(internal)?;
+    }
+    tracing::info!(limit, window = ?req.bare_rate_window_secs, "裸请求速率上限变更");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetRateLimitRetryMaxReq {
+    /// 上游 429 时最多换几个号重试；0 表示不重试，上限由后端夹到 10。
+    rate_limit_retry_max: i64,
+}
+
+/// 设置上游 429 的换号重试次数（开关另见转发形态里的 `rate_limit_retry`）。
+async fn set_rate_limit_retry_max(
+    State(state): State<AppState>,
+    Json(req): Json<SetRateLimitRetryMaxReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let n = req.rate_limit_retry_max.clamp(0, 10);
+    state
+        .store
+        .set_setting(crate::store::RATE_LIMIT_RETRY_MAX, &n.to_string())
+        .map_err(internal)?;
+    tracing::info!(retry_max = n, "上游 429 换号重试次数变更");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
 struct SetRequireDeviceIdReq {
     /// 是否要求请求携带有效设备身份。
     required: bool,
@@ -732,6 +806,8 @@ struct SetForwardingReq {
     system_shape: Option<bool>,
     orig_header_case: Option<bool>,
     thinking_signature_retry: Option<bool>,
+    simulate_cc: Option<bool>,
+    rate_limit_retry: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -742,8 +818,8 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, SPOOF_BILLING_CCH,
-        SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
+        FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC,
+        SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -753,6 +829,8 @@ async fn set_forwarding(
         (SYSTEM_SHAPE, req.system_shape),
         (ORIG_HEADER_CASE, req.orig_header_case),
         (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
+        (SIMULATE_CC, req.simulate_cc),
+        (RATE_LIMIT_RETRY, req.rate_limit_retry),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
@@ -794,6 +872,9 @@ struct CredentialView {
     last_used: Option<i64>,
     /// 累计等价 API 费用（USD）。
     cost_total: f64,
+    /// 被上游 429 后的剩余冷却秒数；`0` 表示不在冷却中。冷却期间该号在选号时让位，
+    /// 但**不是停用**——到点自动恢复，不需要人工介入。见 `crate::store::RateLimitCooldown`。
+    rate_limited_secs: i64,
 }
 
 impl CredentialView {
@@ -822,7 +903,14 @@ impl CredentialView {
             quota: None,
             last_used: None,
             cost_total: 0.0,
+            rate_limited_secs: 0,
         }
+    }
+
+    /// 附加剩余冷却秒数（冷却状态在内存里，取不到就是 0）。
+    fn with_cooldown(mut self, secs: i64) -> Self {
+        self.rate_limited_secs = secs;
+        self
     }
 
     /// 链式附加额度快照、最近使用时间与累计费用。

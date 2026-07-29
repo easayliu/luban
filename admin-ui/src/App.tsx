@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   PlusIcon, Cog6ToothIcon, ArrowRightStartOnRectangleIcon, ArrowsUpDownIcon, CheckIcon,
@@ -6,7 +6,7 @@ import {
   MagnifyingGlassIcon, FunnelIcon, Squares2X2Icon, Bars3Icon,
   PlayIcon, PauseIcon, TrashIcon,
   SignalIcon, ShieldCheckIcon, ExclamationTriangleIcon, DevicePhoneMobileIcon,
-  AdjustmentsHorizontalIcon, EllipsisVerticalIcon,
+  EllipsisVerticalIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
@@ -25,9 +25,11 @@ import {
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
-import { AccessSettings } from '@/components/access-settings'
-import { ForwardingSettings } from '@/components/forwarding-settings'
+import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
+import { AppFooter } from '@/components/app-footer'
+import { OverviewMetric } from '@/components/overview-metric'
+import { LogoMark } from '@/components/logo-mark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
@@ -62,11 +64,14 @@ function matchQuery(c: Credential, q: string): boolean {
   return c.label.toLowerCase().includes(t) || `#${c.id}`.includes(t) || String(c.id) === t
 }
 
+function readSettingsRoute(): SettingsSection | null {
+  if (!window.location.hash.startsWith('#/settings')) return null
+  return window.location.hash.includes('/forwarding') ? 'forwarding' : 'access'
+}
 
 function App() {
   const [adding, setAdding] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
-  const [showForwarding, setShowForwarding] = useState(false)
+  const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [pw, setPwState] = useState<string | null>(getPw())
   // 批量模式：卡片出现勾选框，工具栏变成批量操作条。
   const [batch, setBatch] = useState(false)
@@ -83,6 +88,26 @@ function App() {
   // 筛选与搜索刻意不持久化：它们会隐藏账号，刷新后仍生效容易让人以为账号丢了。
   const [filter, setFilter] = useState<FilterKey>('all')
   const [query, setQuery] = useState('')
+  useEffect(() => {
+    const syncRoute = () => setSettingsRoute(readSettingsRoute())
+    window.addEventListener('popstate', syncRoute)
+    window.addEventListener('hashchange', syncRoute)
+    return () => {
+      window.removeEventListener('popstate', syncRoute)
+      window.removeEventListener('hashchange', syncRoute)
+    }
+  }, [])
+
+  const openSettings = (section: SettingsSection) => {
+    window.history.pushState(null, '', `#/settings/${section}`)
+    setSettingsRoute(section)
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
+  const closeSettings = () => {
+    window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`)
+    setSettingsRoute(null)
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
   // 输入框绑 query 保持跟手，筛选/排序用延迟值：连续敲键时不必每个字符都过一遍全量账号。
   const debouncedQuery = useDebounced(query)
   // 条件变化后停留在旧页码可能整页为空，统一回到第一页。
@@ -147,6 +172,16 @@ function App() {
     )
   }
 
+  if (settingsRoute) {
+    return (
+      <SettingsPage
+        section={settingsRoute}
+        onSectionChange={openSettings}
+        onBack={closeSettings}
+      />
+    )
+  }
+
   const count = creds?.length ?? 0
   const enabledCount = (creds ?? []).filter((c) => !c.disabled).length
   const abnormalCount = (creds ?? []).filter(isAbnormal).length
@@ -156,13 +191,13 @@ function App() {
   const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
 
   return (
-    <div className="app-shell min-h-screen bg-background text-foreground">
+    <div className="app-shell flex min-h-screen flex-col bg-background text-foreground">
       {/* 置顶操作栏 */}
-      <header className="sticky top-0 z-20 border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
+      <header className="sticky top-0 z-20 border-b border-border/80 bg-background/95 backdrop-blur-xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2.5 sm:py-3 lg:px-6">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white shadow-brand sm:size-10 sm:rounded-xl">
-              <span className="relative font-mono text-sm font-bold">鲁</span>
+            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-md text-white sm:size-9 sm:rounded-lg">
+              <LogoMark className="size-5" />
             </div>
             <div className="min-w-0">
               <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
@@ -180,11 +215,8 @@ function App() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">
-                <DropdownMenuItem onClick={() => setShowForwarding(true)}>
-                  <AdjustmentsHorizontalIcon />转发形态
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setShowSettings(true)}>
-                  <Cog6ToothIcon />接入设置
+                <DropdownMenuItem onClick={() => openSettings('access')}>
+                  <Cog6ToothIcon />系统设置
                 </DropdownMenuItem>
                 {authState.configured && pw && (
                   <>
@@ -198,13 +230,9 @@ function App() {
             </DropdownMenu>
           </div>
           <div className="hidden items-center gap-2 sm:flex">
-            <Button size="sm" variant="outline" onClick={() => setShowForwarding(true)} title="转发形态" aria-label="转发形态">
-              <AdjustmentsHorizontalIcon />
-              <span>转发形态</span>
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => setShowSettings(true)} title="接入设置" aria-label="接入设置">
+            <Button size="sm" variant="outline" onClick={() => openSettings('access')} title="系统设置" aria-label="系统设置">
               <Cog6ToothIcon />
-              <span>接入设置</span>
+              <span>系统设置</span>
             </Button>
             <Button size="sm" onClick={() => setAdding(true)} aria-label="添加账号">
               <PlusIcon />
@@ -220,15 +248,13 @@ function App() {
         </div>
       </header>
 
-      <main className="relative mx-auto w-full max-w-7xl space-y-5 px-4 py-5 pb-8 sm:space-y-6 sm:py-6 md:py-8 lg:px-6">
-        {/* 弹窗：添加账号 / 接入设置 */}
+      <main className="relative mx-auto w-full max-w-7xl flex-1 space-y-4 px-4 py-5 pb-8 sm:space-y-5 sm:py-6 lg:px-6">
+        {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
-        <AccessSettings open={showSettings} onOpenChange={setShowSettings} />
-        <ForwardingSettings open={showForwarding} onOpenChange={setShowForwarding} />
 
         <section className="space-y-4">
           <div className="flex items-center justify-between gap-4">
-            <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">账号概览</h1>
+            <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">账号管理</h1>
             <div className="hidden shrink-0 items-center gap-1.5 text-2xs text-muted-foreground sm:flex">
               <ArrowPathIcon className="size-3.5" />
               <span>每 30 秒自动刷新</span>
@@ -236,13 +262,14 @@ function App() {
           </div>
 
           {count > 0 && (
-            <div className="grid grid-cols-2 gap-2 sm:gap-3 md:grid-cols-4 md:gap-4">
+            <div className="grid grid-cols-2 border-y border-border/80 md:grid-cols-4">
               <OverviewMetric
                 label="账号总数"
                 value={count}
                 status={`${enabledCount} 已启用`}
                 icon={ShieldCheckIcon}
                 tone={enabledCount === count ? 'ok' : 'neutral'}
+                className="border-b border-r border-border/80 md:border-b-0"
               />
               <OverviewMetric
                 label="异常账号"
@@ -250,6 +277,7 @@ function App() {
                 status={abnormalCount > 0 ? '需处理' : '正常'}
                 icon={ExclamationTriangleIcon}
                 tone={abnormalCount > 0 ? 'bad' : 'neutral'}
+                className="border-b border-border/80 md:border-b-0 md:border-r"
               />
               <OverviewMetric
                 label="额度预警"
@@ -257,6 +285,7 @@ function App() {
                 status={nearLimitCount > 0 ? '已达 90%' : '无预警'}
                 icon={SignalIcon}
                 tone={nearLimitCount > 0 ? 'warn' : 'neutral'}
+                className="border-r border-border/80"
               />
               <OverviewMetric
                 label="活跃设备"
@@ -268,10 +297,9 @@ function App() {
           )}
         </section>
 
-        <section className="space-y-3 sm:space-y-4">
+        <section className="min-w-0">
           {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
-          {count > 0 && (
-          <div className="grid gap-3 border-b border-border pb-4 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
+          <div className="grid gap-3 border-b border-border/80 py-3.5 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
             <h2 className="flex items-baseline gap-2 text-sm font-semibold tracking-tight sm:text-base">
               账号列表
               <span className="text-xs font-normal text-muted-foreground">
@@ -288,6 +316,7 @@ function App() {
                 )}
               </span>
             </h2>
+            {count > 0 && (
             <div className="min-w-0 space-y-2 lg:flex lg:items-center lg:justify-end lg:space-y-0">
               {/* 搜索：名称或 #id */}
               <div className="relative lg:mr-2">
@@ -300,14 +329,17 @@ function App() {
                   className="h-9 w-full pl-8 pr-8 text-xs lg:w-64"
                 />
                 {query && (
-                  <button
-                    className="absolute right-1.5 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="absolute right-1.5 top-1/2 size-5 -translate-y-1/2"
                     onClick={() => resetPage(setQuery)('')}
                     title="清除搜索"
                     aria-label="清除搜索"
                   >
                     <XMarkIcon className="size-3" />
-                  </button>
+                  </Button>
                 )}
               </div>
 
@@ -339,30 +371,30 @@ function App() {
 
                 {/* 视图切换：卡片 / 紧凑列表 */}
               <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-border">
-                <button
-                  className={cn(
-                    'grid h-9 w-9 place-items-center transition-colors sm:h-8 sm:w-8',
-                    view === 'card' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60',
-                  )}
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-9 w-9 rounded-none focus-visible:z-10 sm:h-8 sm:w-8"
                   onClick={() => switchView('card')}
                   title="卡片视图"
                   aria-label="卡片视图"
                   aria-pressed={view === 'card'}
                 >
                   <Squares2X2Icon className="size-4" />
-                </button>
-                <button
-                  className={cn(
-                    'grid h-9 w-9 place-items-center border-l border-border transition-colors sm:h-8 sm:w-8',
-                    view === 'list' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/60',
-                  )}
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-9 w-9 rounded-none border-l border-border focus-visible:z-10 sm:h-8 sm:w-8"
                   onClick={() => switchView('list')}
                   title="紧凑列表视图"
                   aria-label="紧凑列表视图"
                   aria-pressed={view === 'list'}
                 >
                   <Bars3Icon className="size-4" />
-                </button>
+                </Button>
                 </div>
 
                 <Button
@@ -400,17 +432,19 @@ function App() {
                 </DropdownMenu>
               </div>
             </div>
+            )}
           </div>
-          )}
 
         {/* 批量操作条 */}
         {count > 0 && batch && (
+          <div className="border-b border-border bg-muted/15 p-3 sm:p-4">
           <BatchActionsBar
             all={sorted}
             selected={selected}
             onSelectedChange={setSelected}
             onClose={() => { setBatch(false); setSelected(new Set()) }}
           />
+          </div>
         )}
 
         {/* 卡片栅格（按当前页切片） */}
@@ -419,7 +453,7 @@ function App() {
         ) : count === 0 ? (
           <EmptyState onAdd={() => setAdding(true)} />
         ) : total === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-card px-4 py-14 text-center">
+          <div className="px-4 py-14 text-center">
             <span className="mx-auto grid size-10 place-items-center rounded-md bg-muted text-muted-foreground">
               <MagnifyingGlassIcon className="size-5" />
             </span>
@@ -434,9 +468,8 @@ function App() {
             </Button>
           </div>
         ) : view === 'list' ? (
-          // Table 自带横向滚动容器；外层这层只负责圆角描边（overflow-hidden 裁掉溢出的直角）。
-          <div className="overflow-hidden rounded-lg border border-border bg-card shadow-card">
-            <Table>
+          <div>
+            <Table className="table-fixed">
               {/* 组件默认可见（mt-4 的说明文字），这里只给读屏用 */}
               <TableCaption className="sr-only">账号列表</TableCaption>
               <CredentialListHeader
@@ -465,7 +498,7 @@ function App() {
           </div>
         ) : (
           // 中等宽度保持单列确保可读性；宽屏改为双列，提高账号较多时的扫描效率。
-          <div className="grid grid-cols-1 gap-3 sm:gap-4 xl:grid-cols-2">
+          <div className="grid grid-cols-1 items-start gap-3 pt-3 sm:gap-4 sm:pt-4 lg:grid-cols-2">
             {pageItems.map((c) => (
               <CredentialCard
                 key={c.id}
@@ -480,6 +513,7 @@ function App() {
 
         {/* 分页条：账号超过一页才出现 */}
         {!isLoading && total > PAGE_SIZES[0] && (
+          <div className="px-3 pb-3 sm:px-4 sm:pb-4">
           <Pagination
             total={total}
             page={current}
@@ -488,9 +522,11 @@ function App() {
             onPageChange={setPage}
             onPageSizeChange={(n) => { setPageSize(n); setPage(1) }}
           />
+          </div>
         )}
         </section>
       </main>
+      <AppFooter />
       <Toaster position="top-right" />
     </div>
   )
@@ -580,49 +616,13 @@ function Pagination({
   )
 }
 
-function OverviewMetric({
-  label, value, status, icon: Icon, tone,
-}: {
-  label: string
-  value: number
-  status?: string
-  icon: typeof ShieldCheckIcon
-  tone: 'ok' | 'bad' | 'warn' | 'neutral'
-}) {
-  const iconClass = {
-    ok: 'bg-ok-soft text-ok',
-    bad: 'bg-bad-soft text-bad',
-    warn: 'bg-warn-soft text-warn',
-    neutral: 'bg-muted text-muted-foreground',
-  }[tone]
-  const statusClass = {
-    ok: 'text-ok',
-    bad: 'text-bad',
-    warn: 'text-warn',
-    neutral: 'text-muted-foreground',
-  }[tone]
-
-  return (
-    <div className="min-w-0 rounded-lg border border-border bg-card p-3 shadow-card sm:p-5">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-xs font-medium sm:text-sm">{label}</span>
-        <span className={cn('grid size-7 shrink-0 place-items-center rounded-md sm:size-8', iconClass)}>
-          <Icon className="size-3.5 sm:size-4" />
-        </span>
-      </div>
-      <div className="mt-3 text-2xl font-semibold leading-none tracking-tight tnum sm:mt-4 sm:text-3xl">{value}</div>
-      {status && <p className={cn('mt-1 text-2xs font-medium sm:mt-1.5 sm:text-xs', statusClass)}>{status}</p>}
-    </div>
-  )
-}
-
 /**
  * 批量操作条：全选/清空 + 优先级 / 设备上限 / 启停 / 删除。
  *
  * 所有操作都作用于**当前筛选结果里被勾选的账号**（跨页保留勾选）。写操作走各自的批量
  * 接口，后端在单事务内完成，不会出现「改了一半」的中间态。
  */
-function BatchActionsBar({
+export function BatchActionsBar({
   all, selected, onSelectedChange, onClose,
 }: {
   all: Credential[]
@@ -678,118 +678,139 @@ function BatchActionsBar({
   const allSelected = all.length > 0 && n === all.length
 
   return (
-    <div className="rounded-lg border border-border bg-card p-3 text-xs shadow-card">
-      <div className="flex items-center gap-2">
+    <section className="overflow-hidden rounded-lg border border-border bg-card text-xs">
+      <div className="flex items-center gap-3 border-b border-border bg-muted/30 px-3 py-3 sm:px-4">
+        <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+          <QueueListIcon className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-semibold">批量操作</h3>
+          <p className="mt-0.5 text-2xs text-muted-foreground" aria-live="polite">
+            已选 <span className="tnum font-semibold text-foreground">{n}</span> / {all.length} 个账号
+          </p>
+        </div>
         <Button
           size="sm"
-          variant="ghost"
-          className="h-7 px-2 text-xs"
-          title="选中当前筛选结果里的全部账号（跨页，勾选状态在翻页后保留）"
+          variant={allSelected ? 'secondary' : 'outline'}
+          className="h-8 shrink-0 px-2.5 text-xs"
+          title="选择当前筛选结果中的全部账号，包含其他分页"
           onClick={() => onSelectedChange(allSelected ? new Set() : new Set(all.map((c) => c.id)))}
         >
-          {allSelected ? '取消全选' : '全选'}
+          {allSelected ? <><CheckIcon className="size-3.5" />已全选</> : '全选'}
         </Button>
-        <span className="text-muted-foreground">
-          已选 <span className="tnum font-semibold text-foreground">{n}</span> / {all.length}
-        </span>
-        <Button size="icon" variant="ghost" className="ml-auto size-7" onClick={onClose} title="退出批量模式" aria-label="退出批量模式">
-          <XMarkIcon className="size-3.5" />
+        <Button size="icon" variant="ghost" className="size-8 shrink-0" onClick={onClose} title="退出批量模式" aria-label="退出批量模式">
+          <XMarkIcon className="size-4" />
         </Button>
       </div>
 
-      <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border pt-3 sm:flex">
+      <div className="grid gap-3 p-3 sm:p-4 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+        <div className="rounded-md border border-border bg-background p-3">
+          <div className="mb-2">
+            <h4 className="text-xs font-medium">快捷操作</h4>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
           <Button
-            size="sm" variant="outline" className="w-full text-xs sm:w-auto"
+            size="sm" variant="outline" className="w-full px-2 text-xs text-ok hover:text-ok"
             disabled={none || busy}
             onClick={() => applyDisabled.mutate(false)}
           >
             <PlayIcon className="size-3.5" />启用
           </Button>
           <Button
-            size="sm" variant="outline" className="w-full text-xs sm:w-auto"
+            size="sm" variant="outline" className="w-full px-2 text-xs"
             disabled={none || busy}
             onClick={() => applyDisabled.mutate(true)}
           >
             <PauseIcon className="size-3.5" />停用
           </Button>
           <Button
-            size="sm" variant="outline" className="w-full text-xs text-bad hover:text-bad sm:w-auto"
+            size="sm" variant="outline" className="w-full px-2 text-xs text-bad hover:text-bad"
             disabled={none || busy}
             onClick={() => setConfirmDelete(true)}
           >
             <TrashIcon className="size-3.5" />删除
           </Button>
-          {/* 删号会连带清掉历史用量与设备绑定，批量更需要明确确认。 */}
-          <ConfirmDialog
-            open={confirmDelete}
-            onOpenChange={setConfirmDelete}
-            title={`删除 ${n} 个账号`}
-            confirmText={`删除 ${n} 个`}
-            pending={applyDelete.isPending}
-            onConfirm={() => applyDelete.mutate()}
-            description={
-              <>
-                确定删除选中的 <span className="font-medium text-foreground">{n}</span> 个账号？
-                它们的历史用量记录与设备绑定将一并清除，不可恢复。
-              </>
-            }
-          />
-      </div>
-
-      <div className="mt-3 grid gap-2 border-t border-border pt-3 sm:grid-cols-2">
-        <div className="rounded-md border border-border bg-muted/30 p-2.5">
-          <div className="mb-2 text-2xs font-medium text-muted-foreground">设置优先级</div>
-          <div className="flex items-center gap-2">
-            <Input
-              type="number"
-              value={priority}
-              onChange={(e) => setPriority(e.target.value)}
-              className="h-8 min-w-0 flex-1 font-mono text-xs"
-              title="数值小者优先被调度；同一档内按设备数负载均衡"
-              aria-label="批量设置优先级"
-            />
-            <Button
-              size="sm" className="shrink-0 text-xs"
-              disabled={none || busy}
-              onClick={() => applyPriority.mutate(Math.floor(Number(priority) || 0))}
-            >
-              {applyPriority.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
-              应用
-            </Button>
           </div>
+          {none && <p className="mt-2.5 text-2xs text-muted-foreground">请先勾选需要处理的账号</p>}
         </div>
 
-        <div className="rounded-md border border-border bg-muted/30 p-2.5">
-          <div className="mb-2 text-2xs font-medium text-muted-foreground">设置设备上限</div>
-          <div className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={0}
-              value={limit}
-              onChange={(e) => setLimit(e.target.value)}
-              placeholder="默认"
-              className="h-8 min-w-0 flex-1 font-mono text-xs"
-              title="留空 = 跟随全局默认；0 = 不限；正数 = 独立上限"
-              aria-label="批量设置设备上限"
-            />
-            <Button
-              size="sm" className="shrink-0 text-xs"
-              disabled={none || busy}
-              onClick={() => applyLimit.mutate(inputToLimit(limit))}
-            >
-              {applyLimit.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
-              应用
-            </Button>
+        <div className="overflow-hidden rounded-md border border-border bg-muted/20 sm:grid sm:grid-cols-2 sm:divide-x sm:divide-y-0">
+          <div className="border-b border-border p-3 sm:border-b-0">
+            <div className="mb-2 flex items-baseline justify-between gap-3">
+              <label htmlFor="batch-priority" className="text-xs font-medium">调度优先级</label>
+              <span className="text-2xs text-muted-foreground">数值越小越优先</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                id="batch-priority"
+                type="number"
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                className="h-8 min-w-0 flex-1 font-mono text-xs"
+                aria-label="批量设置优先级"
+              />
+              <Button
+                size="sm" className="h-8 shrink-0 px-2.5 text-xs"
+                disabled={none || busy}
+                onClick={() => applyPriority.mutate(Math.floor(Number(priority) || 0))}
+              >
+                {applyPriority.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+                应用
+              </Button>
+            </div>
+          </div>
+
+          <div className="p-3">
+            <div className="mb-2 flex items-baseline justify-between gap-3">
+              <label htmlFor="batch-device-limit" className="text-xs font-medium">设备上限</label>
+              <span className="text-2xs text-muted-foreground">空=默认 · 0=不限</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                id="batch-device-limit"
+                type="number"
+                min={0}
+                value={limit}
+                onChange={(e) => setLimit(e.target.value)}
+                placeholder="默认"
+                className="h-8 min-w-0 flex-1 font-mono text-xs"
+                aria-label="批量设置设备上限"
+              />
+              <Button
+                size="sm" className="h-8 shrink-0 px-2.5 text-xs"
+                disabled={none || busy}
+                onClick={() => applyLimit.mutate(inputToLimit(limit))}
+              >
+                {applyLimit.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+                应用
+              </Button>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {/* 删号会连带清掉历史用量与设备绑定，批量更需要明确确认。 */}
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title={`删除 ${n} 个账号`}
+        confirmText={`删除 ${n} 个`}
+        pending={applyDelete.isPending}
+        onConfirm={() => applyDelete.mutate()}
+        description={
+          <>
+            确定删除选中的 <span className="font-medium text-foreground">{n}</span> 个账号？
+            它们的历史用量记录与设备绑定将一并清除，不可恢复。
+          </>
+        }
+      />
+    </section>
   )
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   return (
-    <div className="rounded-lg border border-dashed border-border bg-card px-4 py-16 text-center">
+    <div className="px-4 py-16 text-center">
       <span className="mx-auto grid size-10 place-items-center rounded-md bg-muted text-muted-foreground">
         <PlusIcon className="size-5" />
       </span>

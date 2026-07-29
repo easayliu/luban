@@ -2,6 +2,10 @@ import { defineConfig, type PluginOption } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
+import { readFileSync } from 'node:fs'
+
+const cargoManifest = readFileSync(path.resolve(__dirname, '../Cargo.toml'), 'utf8')
+const appVersion = cargoManifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? 'dev'
 
 /**
  * 剥掉 Fontsource 的 `.woff` 回退，只留 woff2。
@@ -41,6 +45,9 @@ export default defineConfig({
     // 会双双塌缩成 "Fira fallback"，两套相差 30% 的度量顶着同一个名字互相覆盖。
   ],
   base: '/',
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion),
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

@@ -12,6 +12,7 @@ import {
   DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { Button } from '@/components/ui/button'
 
 /** 设备上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
 export function limitToInput(deviceLimit: number): string {
@@ -237,25 +238,31 @@ export function CredentialMenuContent({
           className="flex items-center overflow-hidden rounded-md border border-border bg-surface-2/40"
           title="数值小者优先被调度"
         >
-          <button
-            className="grid h-6 w-6 place-items-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="size-6 rounded-none"
             onClick={(e) => { e.preventDefault(); prio.mutate(cred.priority - 1) }}
             disabled={prio.isPending}
             aria-label="提升优先级"
           >
             <ChevronUpIcon className="size-3.5" />
-          </button>
+          </Button>
           <span className="w-7 border-x border-border bg-card text-center text-xs font-medium tnum leading-6">
             {cred.priority}
           </span>
-          <button
-            className="grid h-6 w-6 place-items-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="size-6 rounded-none"
             onClick={(e) => { e.preventDefault(); prio.mutate(cred.priority + 1) }}
             disabled={prio.isPending}
             aria-label="降低优先级"
           >
             <ChevronDownIcon className="size-3.5" />
-          </button>
+          </Button>
         </div>
       </div>
       <DropdownMenuSeparator />

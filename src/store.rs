@@ -3,9 +3,9 @@
 //! 单连接 + `parking_lot::Mutex` 串行化；WAL + `synchronous=NORMAL`；STRICT 表 +
 //! `CHECK`/`UNIQUE` 约束。token 轮换走单行 `UPDATE`，不重写整库。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -24,6 +24,10 @@ pub struct CredentialStore {
     /// 上游刷新会**轮换 refresh_token**：并发刷新时后完成的那次会把已被作废的 token 写回库，
     /// 该凭证之后所有刷新都 `invalid_grant`，等于账号被自己废掉。
     refresh_locks: Mutex<HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// 裸请求的每凭证限流窗口（进程内），见 [`BareRateWindow`]。
+    bare_rate: BareRateWindow,
+    /// 被上游 429 过的凭证的冷却表（进程内），见 [`RateLimitCooldown`]。
+    cooldown: RateLimitCooldown,
 }
 
 /// 硬性设备上限触发：所有启用凭证的设备名额均已占满。
@@ -39,6 +43,145 @@ impl std::fmt::Display for DeviceLimitReached {
 }
 
 impl std::error::Error for DeviceLimitReached {}
+
+/// 裸请求速率上限触发：所有启用凭证在当前窗口内都已发满。
+///
+/// 同 [`DeviceLimitReached`] 走 `anyhow` 上传，代理层 `downcast` 后映射为 429，
+/// 并带上 `retry-after`——这里的等待时间是可算的（窗口长度），告诉客户端比让它盲目重试好。
+#[derive(Debug)]
+pub struct BareRateLimited {
+    /// 建议的重试间隔（秒），取窗口长度。
+    pub retry_after_secs: i64,
+}
+
+impl std::fmt::Display for BareRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "所有凭证的裸请求速率均已达上限，请 {} 秒后重试", self.retry_after_secs)
+    }
+}
+
+impl std::error::Error for BareRateLimited {}
+
+/// 每凭证的裸请求滑动窗口计数器（**进程内，不落库**）。
+///
+/// 只统计**无 `metadata.user_id` 的请求**：带设备身份的那些已由设备绑定 + `device_limit`
+/// 约束着，而裸请求既不写绑定也不占名额，`device_limit` 对它们完全不生效——这个计数器补的
+/// 正是那个口子（见 [`CredentialStore::select_for_device`]）。
+///
+/// **不落库是有意的**：短窗口限流本来就不该跨重启（重启后放行几条远好于把人锁在门外），
+/// 而每请求一次 `usage_logs` 聚合查询的代价，比一把内存锁高一个数量级。代价是多实例部署时
+/// 各限各的——luban 是单进程本地代理，没有这个场景；真有了再换成落库的实现。
+///
+/// 内存占用有上限：每个凭证最多存 `limit` 个时间戳（超限时不再追加），过期的在每次检查时
+/// 顺手清掉。
+#[derive(Default)]
+struct BareRateWindow {
+    /// cred_id → 窗口内每条裸请求的时刻（升序，用单调时钟，不受系统时间调整影响）。
+    hits: Mutex<HashMap<i64, VecDeque<Instant>>>,
+}
+
+impl BareRateWindow {
+    /// 该凭证在窗口内是否还有名额；有就**当场记一条**并返回 `true`。
+    ///
+    /// 检查与记账合在一起（而不是先问后记），是因为选号那步一旦选中就必然要发出去，
+    /// 中间没有可回退的位置；拆成两步只会多出一个「问过了但没发」的窗口。
+    fn try_take(&self, cred_id: i64, limit: i64, window: Duration) -> bool {
+        if limit <= 0 {
+            return true; // 未配置上限 = 不限
+        }
+        let now = Instant::now();
+        let mut hits = self.hits.lock();
+        let q = hits.entry(cred_id).or_default();
+        while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            q.pop_front();
+        }
+        if q.len() as i64 >= limit {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+
+    /// 凭证被删除/停用后清掉它的窗口，免得 map 里留下永远不再访问的键。
+    fn forget(&self, cred_id: i64) {
+        self.hits.lock().remove(&cred_id);
+    }
+}
+
+/// 被上游 429 过的凭证的冷却表（**进程内，不落库**），按 `(账号, 模型)` 分格。
+///
+/// **为什么要分模型**：实测只有 fable 会在账号窗口远未跑满时回 429——那不是额度耗尽，
+/// 是模型级的容量限制。把整个账号打进冷却等于因为一个模型不可用就把这个号的
+/// sonnet/opus 流量一起赶走，而那个号其实好好的。故冷却分两档，由
+/// [`crate::proxy::rate_limit_scope`] 依限流头判定：
+///
+/// - **账号级**（`model = None`）：额度确实耗尽（`unified-status: rate_limited` 或
+///   representative 窗口已满），该号所有模型一起让位；
+/// - **模型级**（`model = Some(m)`）：窗口没跑满却被拒，只让这个模型让位，其余照常。
+///
+/// **和「停用」是两回事**：停用是人工/封号那种需要介入的终态，冷却到点自动恢复，
+/// 不写库、不进 `ban_reason`、控制台上也不该显示成账号出了问题。
+///
+/// **不落库的取舍**：5h 额度耗尽的冷却动辄几小时，确实长于一次重启，重启后忘掉冷却会让
+/// 下一条请求再撞一次 429——但它撞完就会重新打上冷却，属于自愈，代价是一次往返；
+/// 换来的是不动 schema、也不必处理「库里写着冷却但上游其实早恢复了」的陈旧状态。
+///
+/// **冷却只是选号提示，不是硬门禁**：全部凭证都在冷却时 [`CredentialStore::select_for_device`]
+/// 会忽略冷却照常选。上游给的 reset 一旦不准（或我们算错），硬门禁会把整个代理锁死几小时，
+/// 而忽略冷却最坏也只是照常撞 429——后者永远是更好的失败方式。
+#[derive(Default)]
+struct RateLimitCooldown {
+    /// `(cred_id, 模型)` → 冷却结束时刻（单调时钟）。模型为空串表示**整个账号**。
+    until: Mutex<HashMap<(i64, String), Instant>>,
+}
+
+impl RateLimitCooldown {
+    /// 打上冷却。`model` 为 `None` 即账号级（所有模型）。
+    /// 同一格重复命中时取**较晚**的那个结束时刻，不让新的短冷却缩短旧的长冷却。
+    fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+        let deadline = Instant::now() + dur;
+        let mut until = self.until.lock();
+        let slot =
+            until.entry((cred_id, model.unwrap_or_default().to_string())).or_insert(deadline);
+        if *slot < deadline {
+            *slot = deadline;
+        }
+    }
+
+    /// 该凭证此刻对该模型是否仍在冷却中：账号级冷却对所有模型生效，模型级只挡自己那一个。
+    /// 顺手清掉已到期的项。
+    fn is_cooling(&self, cred_id: i64, model: Option<&str>) -> bool {
+        let now = Instant::now();
+        let mut until = self.until.lock();
+        let mut hit = false;
+        for key in [String::new(), model.unwrap_or_default().to_string()] {
+            match until.get(&(cred_id, key.clone())) {
+                Some(t) if *t > now => hit = true,
+                Some(_) => {
+                    until.remove(&(cred_id, key));
+                }
+                None => {}
+            }
+        }
+        hit
+    }
+
+    /// 账号级冷却的剩余秒数（未冷却返回 0），供控制台展示。
+    /// 刻意只看账号级：模型级冷却是「这个号的某个模型暂时不可用」，把它显示成账号被限流会误导。
+    fn remaining_secs(&self, cred_id: i64) -> i64 {
+        let now = Instant::now();
+        self.until
+            .lock()
+            .get(&(cred_id, String::new()))
+            .filter(|t| **t > now)
+            .map(|t| t.duration_since(now).as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn forget(&self, cred_id: i64) {
+        self.until.lock().retain(|(id, _), _| *id != cred_id);
+    }
+}
 
 impl CredentialStore {
     /// 数据库文件路径。默认 `~/.luban/luban.db`；`LUBAN_HOME` 可覆盖基目录。
@@ -68,7 +211,12 @@ impl CredentialStore {
 
     /// 由已初始化的连接构造（`open_default` 与测试共用）。
     fn with_conn(conn: Connection) -> Self {
-        Self { conn: Mutex::new(conn), refresh_locks: Mutex::new(HashMap::new()) }
+        Self {
+            conn: Mutex::new(conn),
+            refresh_locks: Mutex::new(HashMap::new()),
+            bare_rate: BareRateWindow::default(),
+            cooldown: RateLimitCooldown::default(),
+        }
     }
 
     /// 取该凭证的刷新锁（不存在则创建）。
@@ -137,6 +285,9 @@ impl CredentialStore {
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
         tx.commit()?;
+        // 号没了，它的限流窗口与冷却也留着没用（id 不会被复用，见 migrates_and_stops_id_reuse）。
+        self.bare_rate.forget(id);
+        self.cooldown.forget(id);
         Ok(n > 0)
     }
 
@@ -310,6 +461,56 @@ impl CredentialStore {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0)
             .max(0)
+    }
+
+    /// 给凭证打上「被上游限流」的冷却，见 [`RateLimitCooldown`]。时长与作用域都由调用方
+    /// 从上游响应头算出（`crate::proxy::rate_limit_scope`）：`model` 为 `None` 即账号级
+    /// （额度真耗尽），`Some(m)` 即只冷却该模型（窗口没跑满却被拒，多半是模型容量限制）。
+    pub fn mark_rate_limited(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+        self.cooldown.mark(cred_id, model, dur);
+    }
+
+    /// 该凭证剩余冷却秒数（未冷却为 0），供控制台显示「限流中，X 后恢复」。
+    pub fn rate_limited_secs(&self, cred_id: i64) -> i64 {
+        self.cooldown.remaining_secs(cred_id)
+    }
+
+    /// 上游 429 时最多换几个号重试；`0` 表示不重试（原样透传 429）。
+    /// 未设置时默认 [`DEFAULT_RATE_LIMIT_RETRY_MAX`]，上限 10——再多也只是把一次失败的
+    /// 请求拖成十几秒，不如早点把 429 交回给客户端。
+    pub fn rate_limit_retry_max(&self) -> usize {
+        self.get_setting(RATE_LIMIT_RETRY_MAX)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_RATE_LIMIT_RETRY_MAX)
+            .clamp(0, 10) as usize
+    }
+
+    /// 裸请求速率上限：单个凭证在 [`Self::bare_rate_window_secs`] 的窗口内最多接多少条
+    /// **无设备身份**的请求。`<= 0`（含未设置）表示不限——默认即不限，与加入本机制前一致。
+    ///
+    /// 只卡裸请求：带 `metadata.user_id` 的那些由设备绑定 + `device_limit` 管着，而裸请求
+    /// 不写绑定、不占名额，`device_limit` 对它们不生效。注意客户端只要自己编一个
+    /// `metadata.user_id` 就能从这条限制里出去（那时它转而受设备上限约束），这不是漏洞而是
+    /// 分工——本项限的是「没有任何身份可依据」的那部分流量。
+    pub fn bare_rate_limit(&self) -> i64 {
+        self.get_setting(BARE_RATE_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// 裸请求速率窗口（秒），默认 60。取值 `<= 0` 时退回默认，避免除零/永久封锁那类配置。
+    pub fn bare_rate_window_secs(&self) -> i64 {
+        self.get_setting(BARE_RATE_WINDOW_SECS)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_BARE_RATE_WINDOW_SECS)
     }
 
     /// 单条凭证当前**有效**绑定的设备数：已排除超过 TTL 未活跃的绑定（与选路时的惰性
@@ -500,7 +701,8 @@ impl CredentialStore {
         let mut flags = ForwardFlags::default();
         let conn = self.conn.lock();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT key, value FROM settings WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "SELECT key, value FROM settings \
+              WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         ) else {
             return flags;
         };
@@ -514,6 +716,8 @@ impl CredentialStore {
                 CACHE_SCOPE_GLOBAL,
                 ORIG_HEADER_CASE,
                 THINKING_SIGNATURE_RETRY,
+                SIMULATE_CC,
+                RATE_LIMIT_RETRY,
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         );
@@ -531,6 +735,8 @@ impl CredentialStore {
                 CACHE_SCOPE_GLOBAL => legacy_key = Some(on),
                 ORIG_HEADER_CASE => flags.orig_header_case = on,
                 THINKING_SIGNATURE_RETRY => flags.thinking_signature_retry = on,
+                SIMULATE_CC => flags.simulate_cc = on,
+                RATE_LIMIT_RETRY => flags.rate_limit_retry = on,
                 _ => {}
             }
         }
@@ -597,6 +803,14 @@ pub const ORIG_HEADER_CASE: &str = "orig_header_case";
 /// 缺省视为开启：它只在那一种 400 上触发，重试失败也会原样透传最初那条响应，开着不会更差。
 pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
 
+/// 非 Claude Code 客户端的请求，是否按官方抓包形态模拟成 CC 请求的 settings 键名。
+/// 缺省视为开启：关掉的话这类请求会因缺 `You are Claude Code, …` 被上游拒掉，等于不可用。
+pub const SIMULATE_CC: &str = "simulate_cc";
+
+/// 上游 429 时是否打冷却并换号重试的 settings 键名。缺省视为开启：不开的话被限流的号会
+/// 一直被粘性绑定的设备撞上，而其它账号闲着。
+pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
+
 /// 转发开关的集合。**默认全开**。
 ///
 /// 前六项是**形态对齐**：上游实测（8 发对照，见 [`crate::config::known_fingerprint_gaps`]）
@@ -624,6 +838,12 @@ pub struct ForwardFlags {
     /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
     /// （见 [`crate::proxy::demote_thinking_blocks`]）。
     pub thinking_signature_retry: bool,
+    /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
+    /// 整套官方头，见 [`crate::proxy::Simulation`]）。
+    pub simulate_cc: bool,
+    /// 上游回 429 时给该号打冷却并换号重试（次数见
+    /// [`CredentialStore::rate_limit_retry_max`]）；关掉即原样透传 429、也不打冷却。
+    pub rate_limit_retry: bool,
 }
 
 impl Default for ForwardFlags {
@@ -636,6 +856,8 @@ impl Default for ForwardFlags {
             system_shape: true,
             orig_header_case: true,
             thinking_signature_retry: true,
+            simulate_cc: true,
+            rate_limit_retry: true,
         }
     }
 }
@@ -652,6 +874,25 @@ pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
 /// 全局默认设备数上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
 pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
+
+/// 单凭证裸请求速率上限的 settings 键名；`<= 0` 表示不限（默认）。见
+/// [`CredentialStore::bare_rate_limit`]。
+pub const BARE_RATE_LIMIT: &str = "bare_rate_limit";
+
+/// 裸请求速率窗口（秒）的 settings 键名；`<= 0` 时退回 [`DEFAULT_BARE_RATE_WINDOW_SECS`]。
+pub const BARE_RATE_WINDOW_SECS: &str = "bare_rate_window_secs";
+
+/// 裸请求速率窗口默认值：60 秒（即上限的语义是「每分钟多少条」）。
+pub const DEFAULT_BARE_RATE_WINDOW_SECS: i64 = 60;
+
+/// 上游 429 时最多换几个号重试的 settings 键名；`0` 表示不重试。
+pub const RATE_LIMIT_RETRY_MAX: &str = "rate_limit_retry_max";
+
+/// 换号重试次数默认值：2。
+///
+/// 取 2 而不是更大：多数情况下第一次换号就落到一个额度充足的号上，真要连撞好几个，
+/// 说明整批账号都被限了，那时继续换只是把一次注定失败的请求拖长——429 早点回给客户端更好。
+pub const DEFAULT_RATE_LIMIT_RETRY_MAX: i64 = 2;
 
 /// 账号实际生效的设备数上限：返回 `0` 表示不限。
 ///
@@ -1204,6 +1445,25 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     })
 }
 
+/// [`CredentialStore::select_for_device`] 的入参。
+///
+/// 做成结构体而不是一串位置参数：两个 `Option<&str>`（`device_id` 与 `model`）挨在一起，
+/// 位置传参写反了照样编译得过，而那是一个「设备粘性按模型名走」的静默错误。
+#[derive(Default, Clone, Copy)]
+pub struct Select<'a> {
+    /// 客户端设备标识；`None` 即裸请求（不绑定、不占名额）。
+    pub device_id: Option<&'a str>,
+    /// 设备绑定有效期（秒）；`<= 0` 表示永不过期。
+    pub ttl_secs: i64,
+    /// 本次请求是否计入裸请求速率上限（只有真正消耗额度的路径才该计，见
+    /// `crate::proxy::is_billable_messages`）。
+    pub rate_limited: bool,
+    /// 本次请求已经试过的凭证（上游 429 换号重试时传入），一律出局。
+    pub exclude: &'a [i64],
+    /// 请求的模型名，用于按模型判定冷却（fable 那类模型级 429 不该拖累整个账号）。
+    pub model: Option<&'a str>,
+}
+
 impl CredentialStore {
     /// 按 device_id 做粘性选择，返回选中的凭证（刷新在锁外由调用方处理）。
     ///
@@ -1215,12 +1475,26 @@ impl CredentialStore {
     /// 4. 所有启用凭证均达设备上限 → 硬性拒绝，返回 [`DeviceLimitReached`]（代理映射为 429）。
     ///
     /// `device_id` 为 `None`（请求未带 metadata）时无从绑定/计数：退化为负载均衡挑选，
-    /// 不写绑定、也不受硬上限约束。
+    /// 不写绑定、也不受**设备**上限约束——但在 `rate_limited` 为真时受**裸请求速率上限**
+    /// 约束（见 [`Self::bare_rate_limit`]）：已发满的凭证在本轮被跳过，自然分流到其它号；
+    /// 所有号都满才返回 [`BareRateLimited`]（代理映射为 429 + `retry-after`）。
+    ///
+    /// `rate_limited` 由调用方判定——代理只对**真正消耗额度的**路径置真
+    /// （`/v1/messages`，见 `crate::proxy::is_billable_messages`）。`count_tokens` 这类
+    /// 既不产生 usage、也不消耗额度的路径不计：拿它占名额只会把真正的请求挤掉，
+    /// 而客户端的 `/context` 显示与压缩前预估全靠它。
+    ///
     /// `ttl_secs > 0` 时先清除超时未活跃的绑定（惰性过期）；`<= 0` 表示永不过期。
     /// 全部操作在单次持锁内完成，避免与其它写入竞态。
-    pub fn select_for_device(&self, device_id: Option<&str>, ttl_secs: i64) -> Result<Credential> {
-        // 全局默认上限须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
+    ///
+    /// **限流按「选一次号」计，不是按「客户端请求」计**：刷新失败换号那条路
+    /// （[`select_with_refresh_failover`]）每轮都会重选，故一次客户端请求最多可能扣掉几个
+    /// 名额。那条路只在凭证被上游作废时才走（罕见），宁可多扣也好过给它开一个绕过限流的口子。
+    pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
+        let Select { device_id, ttl_secs, rate_limited, exclude, model } = sel;
+        // 这几项须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
         let default_limit = self.default_device_limit();
+        let (rate_limit, rate_window) = (self.bare_rate_limit(), self.bare_rate_window_secs());
         let conn = self.conn.lock();
 
         // 惰性过期：清掉超过 TTL 未活跃的绑定，释放其占用的设备名额。
@@ -1235,12 +1509,23 @@ impl CredentialStore {
         let mut stmt = conn.prepare(&format!(
             "SELECT {COLS} FROM credentials WHERE disabled = 0 ORDER BY priority ASC, id ASC"
         ))?;
-        let creds: Vec<Credential> =
+        let all: Vec<Credential> =
             stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
-        if creds.is_empty() {
+        if all.is_empty() {
             anyhow::bail!("没有可用凭证，请先登录");
         }
+
+        // 本次请求已经试过的号（上游 429 换号重试时传进来）直接出局——重试再撞同一个号毫无意义。
+        let pool: Vec<Credential> = all.into_iter().filter(|c| !exclude.contains(&c.id)).collect();
+        if pool.is_empty() {
+            anyhow::bail!("已试过的凭证之外没有其它可用账号");
+        }
+        // 冷却中的号让位给还能用的；**全部都在冷却时忽略冷却**——冷却只是选号提示，
+        // 上游给的 reset 一旦不准，硬门禁会把整个代理锁死几小时，而照常发最坏只是再撞一次 429。
+        let awake: Vec<Credential> =
+            pool.iter().filter(|c| !self.cooldown.is_cooling(c.id, model)).cloned().collect();
+        let creds = if awake.is_empty() { pool } else { awake };
 
         // 1/2) 命中既有绑定。
         if let Some(did) = device_id {
@@ -1259,7 +1544,10 @@ impl CredentialStore {
                     )?;
                     return Ok(c.clone());
                 }
-                // 绑定的凭证已停用/删除：清除后重新选择。
+                // 绑定的凭证已停用/删除，或正在冷却/本轮已试过：清除绑定后重新选择，
+                // 下面选中谁就**改绑**到谁（`INSERT … ON CONFLICT DO UPDATE cred_id`）。
+                // 冷却结束后这台设备不会自己回到原号——粘性以最后一次选择为准，
+                // 这正是「429 换号重试要改绑」想要的语义。
                 conn.execute("DELETE FROM device_bindings WHERE device_id = ?1", [did])?;
             }
         }
@@ -1295,8 +1583,22 @@ impl CredentialStore {
                 None => return Err(DeviceLimitReached.into()),
             }
         } else {
-            // 无 device_id：不占名额、不受限，按优先级档 + 档内负载均衡挑一个（creds 已保证非空）。
-            creds.iter().min_by_key(|c| (c.priority, used(c), c.id)).expect("启用凭证列表非空")
+            // 无 device_id：不占设备名额，但要过裸请求速率上限。按同一套 (priority, used, id)
+            // 排好序后逐个试，第一个还有名额的即中。
+            //
+            // 拿 `try_take` 直接当 `find` 的谓词是安全的：它只在**放行**时才记一条，被跳过的
+            // （已满的）那些不留痕，而 `find` 命中即短路，故一次选号最多记一条。
+            // 不计入限流（或未配置上限）时谓词恒真，等价于原来的 `min_by_key`，零额外开销。
+            let mut ordered: Vec<&Credential> = creds.iter().collect();
+            ordered.sort_by_key(|c| (c.priority, used(c), c.id));
+            let window = Duration::from_secs(rate_window.max(1) as u64);
+            match ordered
+                .into_iter()
+                .find(|c| !rate_limited || self.bare_rate.try_take(c.id, rate_limit, window))
+            {
+                Some(c) => c,
+                None => return Err(BareRateLimited { retry_after_secs: rate_window }.into()),
+            }
         };
 
         if let Some(did) = device_id {
@@ -1340,9 +1642,9 @@ enum TokenAttempt {
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
     http: &wreq::Client,
-    device_id: Option<&str>,
+    sel: Select<'_>,
 ) -> Result<(String, Credential)> {
-    select_with_refresh_failover(store, device_id, |cred| {
+    select_with_refresh_failover(store, sel, |cred| {
         Box::pin(async move { ensure_fresh_token(store, http, &cred).await })
     })
     .await
@@ -1365,14 +1667,14 @@ type AttemptFut<'a> =
 /// `AttemptFut<'a>` 里那个 `'a` 才能是固定的。
 async fn select_with_refresh_failover<'a>(
     store: &CredentialStore,
-    device_id: Option<&str>,
+    sel: Select<'_>,
     attempt: impl Fn(Credential) -> AttemptFut<'a>,
 ) -> Result<(String, Credential)> {
-    let ttl = store.device_binding_ttl();
+    let sel = Select { ttl_secs: store.device_binding_ttl(), ..sel };
 
     for round in 0..MAX_REFRESH_FAILOVER {
         // 每轮都重新选：上一轮停用的那个已被排除，且它的设备绑定已清，这里才会换到新号。
-        let cred = store.select_for_device(device_id, ttl)?;
+        let cred = store.select_for_device(sel)?;
         match attempt(cred.clone()).await? {
             TokenAttempt::Ready(token) => return Ok((token, cred)),
             TokenAttempt::Revoked(reason) => {
@@ -1697,16 +1999,44 @@ mod tests {
         let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
 
         // 先把设备粘到 a 上（a 是 id 更小的那个，同优先级下会被先选中）。
-        let first = store.select_for_device(Some("dev-1"), 0).unwrap();
+        let first = store
+            .select_for_device(Select {
+                device_id: Some("dev-1"),
+                ttl_secs: 0,
+                rate_limited: true,
+                exclude: &[],
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(first.id, a.id);
         // 再选一次仍命中既有绑定，确认粘性生效——这正是坏号会把设备钉死的原因。
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a.id);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a.id
+        );
 
         // 模拟「a 的 refresh_token 被作废」后的停用。
         assert!(store.mark_banned(a.id, "[refresh 400] invalid_grant").unwrap());
 
         // 重选必须换到 b，而不是继续返回 a 或直接报错。
-        let after = store.select_for_device(Some("dev-1"), 0).unwrap();
+        let after = store
+            .select_for_device(Select {
+                device_id: Some("dev-1"),
+                ttl_secs: 0,
+                rate_limited: true,
+                exclude: &[],
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(after.id, b.id, "停用坏号后设备应改选到其它账号");
 
         // a 确实被停用并记了原因。
@@ -1716,7 +2046,18 @@ mod tests {
 
         // 池子空了要报错，而不是把停用的号又选回来。
         assert!(store.mark_banned(b.id, "[refresh 400] invalid_grant").unwrap());
-        assert!(store.select_for_device(Some("dev-1"), 0).is_err(), "无可用凭证时应报错");
+        assert!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_err(),
+            "无可用凭证时应报错"
+        );
     }
 
     /// 设备明细必须与设备数同口径：条数等于 `device_count`、只含本凭证的绑定、
@@ -1727,10 +2068,46 @@ mod tests {
         let (a, b) = (ids[0], ids[1]);
 
         // dev-1 粘到 a（同优先级下 id 小者先中），再来一次命中既有绑定、请求数 +1。
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
         // dev-2 是新设备：a 已有 1 台、b 还是 0 台，负载均衡会把它分给 b。
-        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-2"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            b
+        );
 
         let a_devs = store.list_devices(a).unwrap();
         assert_eq!(a_devs.len() as i64, store.device_count(a).unwrap(), "条数应等于设备数");
@@ -1759,8 +2136,32 @@ mod tests {
     fn list_devices_sums_cost_per_device() {
         let (store, ids) = store_with(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
-        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-2"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            b
+        );
 
         // dev-1 在 a 上花了 0.5+0.25，换号后在 b 上又花了 1.0；dev-2 只在 b 上花了 0.125。
         log_cost(&store, a, "dev-1", Some(0.5));
@@ -1789,7 +2190,19 @@ mod tests {
 
         // 解绑再重绑：请求数从零重数，费用是历史累计，不受影响。
         assert!(store.unbind_device(a, "dev-1").unwrap());
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
         let d = &store.list_devices(a).unwrap()[0];
         assert_eq!(d.request_count, 0, "重绑后是新的一条绑定");
         assert!((d.cost_usd - 0.75).abs() < 1e-9, "费用不该被解绑清掉");
@@ -1815,8 +2228,32 @@ mod tests {
         let (store, ids) = store_with(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
 
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
-        assert_eq!(store.select_for_device(Some("dev-2"), 0).unwrap().id, b);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-2"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            b
+        );
 
         // 拿 b 的 id 去解 dev-1（模拟后台列表已过期、设备其实绑在 a 上）：不能误伤 a 的绑定。
         assert!(!store.unbind_device(b, "dev-1").unwrap(), "跨凭证解绑应无效");
@@ -1831,7 +2268,19 @@ mod tests {
         assert!(!store.unbind_device(a, "dev-1").unwrap());
 
         // 解绑不是拉黑：设备下次请求重新走选号，仍可能落回同一个账号。
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, a);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
         assert_eq!(store.device_count(a).unwrap(), 1);
     }
 
@@ -1852,6 +2301,291 @@ mod tests {
         (store, ids)
     }
 
+    /// 裸请求速率上限：单号发满后自动分流到下一个号，全部发满才 429（[`BareRateLimited`]）。
+    /// 带 device_id 的请求不受此限——那条路由设备绑定 + `device_limit` 管着。
+    #[test]
+    fn bare_rate_limit_spills_to_next_credential_then_rejects() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.set_setting(BARE_RATE_LIMIT, "2").unwrap();
+
+        // 前两条落在 a（同优先级、设备数都是 0 时 id 小者先中），第 3、4 条 a 已满 → 溢到 b。
+        let picked: Vec<i64> = (0..4)
+            .map(|_| {
+                store
+                    .select_for_device(Select {
+                        ttl_secs: 0,
+                        rate_limited: true,
+                        exclude: &[],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        assert_eq!(picked, vec![a, a, b, b], "满了应换号而不是直接拒");
+
+        // 两个号都满 → 拒绝，且带得出重试间隔（默认窗口 60s）。
+        let err = store
+            .select_for_device(Select {
+                ttl_secs: 0,
+                rate_limited: true,
+                exclude: &[],
+                ..Default::default()
+            })
+            .unwrap_err();
+        let rl = err.downcast_ref::<BareRateLimited>().expect("应是裸请求限流错误");
+        assert_eq!(rl.retry_after_secs, DEFAULT_BARE_RATE_WINDOW_SECS);
+
+        // 带设备身份的请求照常放行：它受的是设备上限，不是这条。
+        assert!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok()
+        );
+
+        // 上限设回 0（不限）即刻恢复，计数不再拦。
+        store.set_setting(BARE_RATE_LIMIT, "0").unwrap();
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok()
+        );
+    }
+
+    /// 上游 429 打过冷却的号在选号时让位；绑定到它的设备**改绑**到新号（这正是 429 换号
+    /// 重试要的语义）；冷却结束后不自动回迁——粘性以最后一次选择为准。
+    #[test]
+    fn cooldown_makes_device_rebind_to_another_credential() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
+        store.mark_rate_limited(a, None, Duration::from_secs(300));
+        assert!(store.rate_limited_secs(a) > 0, "应处于冷却中");
+
+        // 绑定还在 a 上，但 a 在冷却 → 改选 b，并把绑定迁过去。
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            b
+        );
+        assert_eq!(store.list_devices(b).unwrap().len(), 1, "设备应已改绑到 b");
+        assert!(store.list_devices(a).unwrap().is_empty(), "a 上不该再留着这台设备");
+    }
+
+    /// 模型级冷却只挡那一个模型：fable 被容量限制时，同一个号的 sonnet/opus 照常可用。
+    /// 这是「窗口没跑满却 429」那种情况的正解——号是好的，赶走整个号纯属自伤。
+    #[test]
+    fn model_scoped_cooldown_only_blocks_that_model() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let pick = |model| {
+            store.select_for_device(Select { model: Some(model), ..Default::default() }).unwrap().id
+        };
+
+        store.mark_rate_limited(a, Some("claude-fable-5"), Duration::from_secs(300));
+        assert_eq!(pick("claude-fable-5"), b, "fable 应让位给 b");
+        assert_eq!(pick("claude-sonnet-5"), a, "同一个号的其它模型不该被牵连");
+        // 模型级冷却不算「账号被限流」，控制台不该显示成账号出了问题。
+        assert_eq!(store.rate_limited_secs(a), 0, "模型级冷却不计入账号级展示");
+
+        // 账号级冷却则对所有模型生效。
+        store.mark_rate_limited(a, None, Duration::from_secs(300));
+        assert_eq!(pick("claude-sonnet-5"), b, "账号级冷却应挡下所有模型");
+        assert!(store.rate_limited_secs(a) > 0);
+    }
+
+    /// 冷却是**选号提示**不是硬门禁：全部号都在冷却时照常选，不能把整个代理锁死。
+    /// 另外「本次已试过的号」（换号重试传进来的排除集）一律出局，重试不会再撞同一个号。
+    #[test]
+    fn cooldown_is_a_hint_and_exclusions_are_hard() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.mark_rate_limited(a, None, Duration::from_secs(300));
+        store.mark_rate_limited(b, None, Duration::from_secs(300));
+
+        // 都在冷却 → 忽略冷却照常选（宁可再撞一次 429，也不能自己把自己锁死）。
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            a
+        );
+        // 排除集是硬的：a 已试过 → 只能是 b。
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[a],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            b
+        );
+        // 两个都试过 → 明确报错，让调用方把最初那条 429 透传回去。
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[a, b],
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+
+    /// 不计费的路径（`count_tokens` 等，`rate_limited = false`）不占名额：它不产生 usage、
+    /// 不消耗额度，拿它占名额只会把真正的请求挤掉，而客户端的 token 预估全靠它。
+    #[test]
+    fn non_billable_paths_do_not_consume_rate_slots() {
+        let (store, _) = store_with(&["a"]);
+        store.set_setting(BARE_RATE_LIMIT, "1").unwrap();
+
+        // 不计入的路径打多少条都不占名额。
+        for _ in 0..5 {
+            assert!(
+                store
+                    .select_for_device(Select {
+                        ttl_secs: 0,
+                        rate_limited: false,
+                        exclude: &[],
+                        ..Default::default()
+                    })
+                    .is_ok()
+            );
+        }
+        // 名额仍是满的一格：计费路径的第一条照常放行，第二条才被拦。
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok()
+        );
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_err(),
+            "计费路径应照常受限"
+        );
+        // 被拦之后，不计费的路径依然畅通。
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: false,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok()
+        );
+    }
+
+    /// 窗口过期后名额自动回收；窗口取值非法（0/负数）时退回默认，不会把人永久锁死。
+    #[test]
+    fn bare_rate_window_expires_and_rejects_bad_config() {
+        let (store, _) = store_with(&["a"]);
+        store.set_setting(BARE_RATE_LIMIT, "1").unwrap();
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok()
+        );
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_err(),
+            "同一窗口内第二条应被拦"
+        );
+
+        // 直接把窗口内的那条时间戳推到过期，等价于等了一个窗口。
+        {
+            let mut hits = store.bare_rate.hits.lock();
+            for q in hits.values_mut() {
+                for t in q.iter_mut() {
+                    *t -= Duration::from_secs(DEFAULT_BARE_RATE_WINDOW_SECS as u64 + 1);
+                }
+            }
+        }
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .is_ok(),
+            "过期后名额应回收"
+        );
+
+        store.set_setting(BARE_RATE_WINDOW_SECS, "0").unwrap();
+        assert_eq!(
+            store.bare_rate_window_secs(),
+            DEFAULT_BARE_RATE_WINDOW_SECS,
+            "非法窗口退回默认"
+        );
+    }
+
     const REVOKED: &str = "[refresh 400] invalid_grant";
 
     /// 刷新失败要自动换号：坏号被停用、设备改绑到下一个可用号，请求正常拿到 token。
@@ -1864,16 +2598,20 @@ mod tests {
         let tried = std::cell::RefCell::new(Vec::new());
 
         // a、b 的 refresh_token 已作废，c 正常。
-        let (token, cred) = select_with_refresh_failover(&store, Some("dev-1"), |c| {
-            tried.borrow_mut().push(c.id);
-            Box::pin(async move {
-                Ok(if c.label == "c" {
-                    TokenAttempt::Ready("good-token".into())
-                } else {
-                    TokenAttempt::Revoked(REVOKED.into())
+        let (token, cred) = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| {
+                tried.borrow_mut().push(c.id);
+                Box::pin(async move {
+                    Ok(if c.label == "c" {
+                        TokenAttempt::Ready("good-token".into())
+                    } else {
+                        TokenAttempt::Revoked(REVOKED.into())
+                    })
                 })
-            })
-        })
+            },
+        )
         .await
         .unwrap();
 
@@ -1890,7 +2628,19 @@ mod tests {
         assert!(!store.get(ids[2]).unwrap().unwrap().disabled);
 
         // 设备最终绑在 c 上，后续请求直接命中它，不再重走换号。
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, ids[2]);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            ids[2]
+        );
     }
 
     /// 可重试错误（网络抖动、5xx、限流）**不得**停用凭证——误停一个健康账号的代价，
@@ -1900,10 +2650,14 @@ mod tests {
         let (store, ids) = store_with(&["a", "b"]);
         let calls = std::cell::Cell::new(0);
 
-        let e = select_with_refresh_failover(&store, Some("dev-1"), |_| {
-            calls.set(calls.get() + 1);
-            Box::pin(async { anyhow::bail!("请求 token 端点失败: connection reset") })
-        })
+        let e = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |_| {
+                calls.set(calls.get() + 1);
+                Box::pin(async { anyhow::bail!("请求 token 端点失败: connection reset") })
+            },
+        )
         .await
         .unwrap_err();
 
@@ -1913,7 +2667,19 @@ mod tests {
             assert!(!store.get(*id).unwrap().unwrap().disabled, "可重试错误不得停用凭证");
         }
         // 绑定保留，客户端重试时仍落回同一个号。
-        assert_eq!(store.select_for_device(Some("dev-1"), 0).unwrap().id, ids[0]);
+        assert_eq!(
+            store
+                .select_for_device(Select {
+                    device_id: Some("dev-1"),
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[],
+                    ..Default::default()
+                })
+                .unwrap()
+                .id,
+            ids[0]
+        );
     }
 
     /// 所有号的 refresh_token 都作废时要报错收场，不能死循环、也不能返回停用的号。
@@ -1922,10 +2688,14 @@ mod tests {
         let (store, ids) = store_with(&["a", "b"]);
         let tried = std::cell::RefCell::new(Vec::new());
 
-        let e = select_with_refresh_failover(&store, Some("dev-1"), |c| {
-            tried.borrow_mut().push(c.id);
-            Box::pin(async { Ok(TokenAttempt::Revoked(REVOKED.into())) })
-        })
+        let e = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| {
+                tried.borrow_mut().push(c.id);
+                Box::pin(async { Ok(TokenAttempt::Revoked(REVOKED.into())) })
+            },
+        )
         .await
         .unwrap_err();
 
@@ -2045,7 +2815,7 @@ mod tests {
         assert!(ForwardFlags::default().spoof_identity, "默认必须是开");
         assert!(ForwardFlags::default().system_shape);
 
-        // 六个键各用一种「关」的写法，确认逐项独立且解析口径一致。
+        // 每个键各用一种「关」的写法，确认逐项独立且解析口径一致。
         for (key, off) in [
             (SPOOF_IDENTITY_ENABLED, "0"),
             (SPOOF_BILLING_CCH, "false"),
@@ -2054,6 +2824,8 @@ mod tests {
             (SYSTEM_SHAPE, "0"),
             (ORIG_HEADER_CASE, "0"),
             (THINKING_SIGNATURE_RETRY, "0"),
+            (SIMULATE_CC, "0"),
+            (RATE_LIMIT_RETRY, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -2068,6 +2840,8 @@ mod tests {
                 system_shape: false,
                 orig_header_case: false,
                 thinking_signature_retry: false,
+                simulate_cc: false,
+                rate_limit_retry: false,
             }
         );
 

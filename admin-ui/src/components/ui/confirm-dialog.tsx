@@ -35,36 +35,37 @@ export function ConfirmDialog({
       <AlertDialogPrimitive.Portal>
         <AlertDialogPrimitive.Overlay
           className={cn(
-            'fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]',
+            'fixed inset-0 z-50 bg-black/35 backdrop-blur-[1px]',
             'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
           )}
         />
         <AlertDialogPrimitive.Content
           className={cn(
-            'fixed inset-x-0 bottom-0 z-50 w-full max-w-md overflow-hidden rounded-t-xl border border-b-0 border-border bg-card text-card-foreground shadow-lg',
-            'sm:bottom-auto sm:left-1/2 sm:right-auto sm:top-1/2 sm:w-[calc(100vw-2rem)] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-lg sm:border-b',
-            'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:slide-out-to-bottom-4 data-[state=open]:slide-in-from-bottom-4 sm:data-[state=closed]:zoom-out-95 sm:data-[state=open]:zoom-in-95',
+            'fixed left-1/2 top-1/2 z-50 w-[calc(100vw-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-border bg-background text-foreground shadow-elev',
+            'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
           )}
         >
-          <div className="border-b border-border px-4 py-4 sm:px-5">
-            <AlertDialogPrimitive.Title className="flex items-center gap-2 text-base font-semibold leading-none tracking-tight">
-              <ExclamationTriangleIcon className="size-4 shrink-0 text-bad" />
-              {title}
-            </AlertDialogPrimitive.Title>
-          </div>
-          <div className="px-4 py-4 sm:px-5">
-            <AlertDialogPrimitive.Description className="text-sm text-muted-foreground">
-              {description}
-            </AlertDialogPrimitive.Description>
-            <div className="mt-5 grid grid-cols-2 gap-2 sm:flex sm:justify-end">
-              <AlertDialogPrimitive.Cancel asChild>
-                <Button variant="outline" size="sm" disabled={pending}>取消</Button>
-              </AlertDialogPrimitive.Cancel>
-              <Button variant="destructive" size="sm" onClick={onConfirm} disabled={pending}>
-                {pending && <ArrowPathIcon className="size-3.5 animate-spin" />}
-                {confirmText}
-              </Button>
+          <div className="flex items-start gap-3 px-4 py-4 sm:px-5">
+            <span className="grid size-9 shrink-0 place-items-center rounded-full bg-bad-soft text-bad" aria-hidden>
+              <ExclamationTriangleIcon className="size-4" />
+            </span>
+            <div className="min-w-0 pt-0.5">
+              <AlertDialogPrimitive.Title className="text-base font-semibold leading-5 tracking-tight">
+                {title}
+              </AlertDialogPrimitive.Title>
+              <AlertDialogPrimitive.Description className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                {description}
+              </AlertDialogPrimitive.Description>
             </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 border-t border-border px-4 py-3.5 sm:flex sm:justify-end sm:px-5">
+            <AlertDialogPrimitive.Cancel asChild>
+              <Button variant="outline" size="sm" disabled={pending}>取消</Button>
+            </AlertDialogPrimitive.Cancel>
+            <Button variant="destructive" size="sm" onClick={onConfirm} disabled={pending}>
+              {pending && <ArrowPathIcon className="size-3.5 animate-spin" />}
+              {confirmText}
+            </Button>
           </div>
         </AlertDialogPrimitive.Content>
       </AlertDialogPrimitive.Portal>

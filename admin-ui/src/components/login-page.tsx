@@ -8,6 +8,7 @@ import { setPw } from '@/api/client'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { LogoMark } from '@/components/logo-mark'
 
 /** 管理登录页（已设置密码时展示）。登录成功回调 onSuccess(password)。 */
 export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void }) {
@@ -28,7 +29,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
         {/* 品牌标识 */}
         <div className="mb-6 flex flex-col items-center text-center">
           <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-white shadow-brand">
-            <span className="font-mono text-lg font-bold">鲁</span>
+            <LogoMark className="size-7" />
           </div>
           <div className="mt-4 text-lg font-semibold leading-none tracking-tight">Luban</div>
           <div className="label-eyebrow mt-1.5">Claude Code Gateway</div>

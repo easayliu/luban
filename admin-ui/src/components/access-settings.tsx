@@ -6,8 +6,8 @@ import {
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
 import {
-  getSettings, setApiKey, setDefaultDeviceLimit, setDeviceTtl, setRequireDeviceId,
-  type Settings,
+  getSettings, setApiKey, setBareRateLimit, setDefaultDeviceLimit, setDeviceTtl,
+  setRequireDeviceId, type Settings,
 } from '@/api/settings'
 import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
 import { setPw, clearPw } from '@/api/client'
@@ -27,6 +27,25 @@ export function AccessSettings({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>
+            <Cog6ToothIcon className="size-4" />
+            接入设置
+          </DialogTitle>
+          <DialogDescription>管理客户端接入、设备策略和控制台安全。</DialogDescription>
+        </DialogHeader>
+        <DialogBody>
+          <AccessSettingsContent />
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+export function AccessSettingsContent() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
 
@@ -63,19 +82,16 @@ export function AccessSettings({
 
   return (
     <>
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>
-            <Cog6ToothIcon className="size-4" />
-            接入设置
-            {envManaged && (
-              <Badge variant="outline" className="gap-1"><LockClosedIcon className="size-3" />环境接管</Badge>
-            )}
-          </DialogTitle>
-          <DialogDescription>管理客户端接入、设备策略和控制台安全。</DialogDescription>
-        </DialogHeader>
-        <DialogBody className="space-y-3 bg-muted/20">
+      <div className="space-y-8">
+        {envManaged && (
+          <div className="flex items-center gap-2 border-l-2 border-border py-1 pl-3 text-xs text-muted-foreground">
+            <Badge variant="outline" className="gap-1">
+              <LockClosedIcon className="size-3" />
+              环境接管
+            </Badge>
+            <span>部分设置由环境变量管理，页面仅供查看。</span>
+          </div>
+        )}
           <SettingsSection title="客户端接入">
             <Field label="接入地址" code="ANTHROPIC_BASE_URL">
               <div className="flex items-center gap-2">
@@ -135,23 +151,22 @@ export function AccessSettings({
             <DeviceBindingTtl />
             <DefaultDeviceLimit />
             <RequireDeviceIdToggle />
+            <BareRateLimit />
           </SettingsSection>
 
           <SettingsSection title="控制台安全">
             <AdminPassword />
           </SettingsSection>
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
-    <ConfirmDialog
-      open={clearKeyOpen}
-      onOpenChange={setClearKeyOpen}
-      title="清除接入 Key"
-      description="清除后，代理将不再校验客户端身份。"
-      confirmText="确认清除"
-      pending={save.isPending}
-      onConfirm={() => save.mutate('')}
-    />
+      </div>
+      <ConfirmDialog
+        open={clearKeyOpen}
+        onOpenChange={setClearKeyOpen}
+        title="清除接入 Key"
+        description="清除后，代理将不再校验客户端身份。"
+        confirmText="确认清除"
+        pending={save.isPending}
+        onConfirm={() => save.mutate('')}
+      />
     </>
   )
 }
@@ -269,7 +284,7 @@ function RequireDeviceIdToggle() {
 
   return (
     <Field label="设备身份校验">
-      <div className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
+      <div className="flex h-10 items-center justify-between gap-3">
         <span className="text-sm">{required ? '已开启' : '已关闭'}</span>
         <Switch
           variant="success"
@@ -286,6 +301,79 @@ function RequireDeviceIdToggle() {
             {' '}当前已关闭：这类请求会被转发，但不绑定账号、不占设备名额，因而绕过设备上限。
           </span>
         )}
+      </p>
+    </Field>
+  )
+}
+
+/**
+ * 裸请求速率上限：单个账号在窗口内最多接多少条无 metadata.user_id 的请求。
+ *
+ * 补的是设备上限管不到的那块——裸请求不写设备绑定、不占名额，`device_limit` 对它们不生效。
+ * 计数在服务端内存里，按账号各算各的；某个账号发满会自动换到别的账号，全满才 429。
+ */
+function BareRateLimit() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+  const [windowDraft, setWindowDraft] = useState('')
+  useEffect(() => {
+    if (data) {
+      setDraft(String(data.bare_rate_limit))
+      setWindowDraft(String(data.bare_rate_window_secs))
+    }
+  }, [data?.bare_rate_limit, data?.bare_rate_window_secs])
+
+  const save = useMutation({
+    mutationFn: ({ limit, win }: { limit: number; win: number }) => setBareRateLimit(limit, win),
+    onSuccess: (s: Settings) => {
+      toast.success(s.bare_rate_limit > 0
+        ? `裸请求上限：每个账号 ${s.bare_rate_limit} 条 / ${formatDuration(s.bare_rate_window_secs)}`
+        : '裸请求速率已取消限制')
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+  })
+
+  const limit = Math.max(0, Math.floor(Number(draft) || 0))
+  const win = Math.max(1, Math.floor(Number(windowDraft) || 60))
+  const unchanged = limit === (data?.bare_rate_limit ?? 0) && win === (data?.bare_rate_window_secs ?? 60)
+
+  return (
+    <Field label="裸请求速率上限（每个账号）">
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type="number"
+          min={0}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="w-full font-mono sm:w-28"
+          aria-label="裸请求速率上限（条）"
+        />
+        <span className="text-xs text-muted-foreground">条 /</span>
+        <Input
+          type="number"
+          min={1}
+          value={windowDraft}
+          onChange={(e) => setWindowDraft(e.target.value)}
+          className="w-full font-mono sm:w-24"
+          aria-label="裸请求速率窗口（秒）"
+        />
+        <span className="text-xs text-muted-foreground">秒</span>
+        <Button size="sm" onClick={() => save.mutate({ limit, win })} disabled={save.isPending || unchanged}>
+          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          {limit > 0 ? `每个账号每 ${formatDuration(win)} 最多 ${limit} 条` : '不限'}
+        </span>
+      </div>
+      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+        只统计 <code className="font-mono">/v1/messages</code> 上无
+        <code className="font-mono">metadata.user_id</code> 的请求——它们不绑定账号、不占设备名额，
+        设备上限管不到；<code className="font-mono">count_tokens</code> 不产生用量也不消耗额度，
+        不计入。某个账号发满后会自动改选其它账号，全部发满才返回
+        <code className="font-mono">429</code>（带 <code className="font-mono">retry-after</code>）。
+        计数在内存中，重启清零。
       </p>
     </Field>
   )
@@ -367,9 +455,9 @@ function AdminPassword() {
 
 function SettingsSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card">
-      <h3 className="border-b border-border bg-muted/30 px-3 py-3 text-sm font-semibold sm:px-4">{title}</h3>
-      <div className="divide-y divide-border px-3 sm:px-4 [&>*]:py-4 [&>*:first-child]:pt-4 [&>*:last-child]:pb-4">{children}</div>
+    <section>
+      <h3 className="mb-2 text-sm font-semibold">{title}</h3>
+      <div className="divide-y divide-border border-y border-border/80 px-1 [&>*]:py-4">{children}</div>
     </section>
   )
 }

@@ -1,16 +1,22 @@
+import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   AdjustmentsHorizontalIcon, ArrowPathIcon, ChevronDownIcon, CircleStackIcon,
-  IdentificationIcon, InformationCircleIcon, ServerStackIcon,
+  CommandLineIcon, IdentificationIcon, InformationCircleIcon, ServerStackIcon,
 } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
-import { getSettings, setForwarding, type ForwardingKey, type Settings } from '@/api/settings'
+import {
+  getSettings, setForwarding, setRateLimitRetryMax,
+  type ForwardingKey, type Settings,
+} from '@/api/settings'
 import { extractError } from '@/lib/utils'
 import {
   Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle, DialogDescription,
 } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 /**
  * 转发形态开关。
@@ -25,17 +31,6 @@ export function ForwardingSettings({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const switches = data
-    ? [
-        data.spoof_identity, data.billing_cch, data.fill_client_headers,
-        data.merge_beta, data.system_shape, data.orig_header_case,
-        data.thinking_signature_retry,
-      ]
-    : []
-  const enabledCount = switches.filter(Boolean).length
-  const allOff = data ? enabledCount === 0 : false
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl">
@@ -43,19 +38,42 @@ export function ForwardingSettings({
           <DialogTitle>
             <AdjustmentsHorizontalIcon className="size-4" />
             转发形态
-            {data && (
-              <Badge variant="outline" className="font-normal text-muted-foreground">
-                {allOff ? '零改写' : `${enabledCount} / ${switches.length} 已开启`}
-              </Badge>
-            )}
           </DialogTitle>
           <DialogDescription>调整身份、请求头与缓存兼容策略，修改后即时生效。</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-4 bg-muted/20">
-          <div className="flex items-center gap-2.5 rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground shadow-sm sm:px-4">
+        <DialogBody>
+          <ForwardingSettingsContent />
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+export function ForwardingSettingsContent() {
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const switches = data
+    ? [
+        data.spoof_identity, data.billing_cch, data.fill_client_headers,
+        data.merge_beta, data.system_shape, data.orig_header_case,
+        data.thinking_signature_retry, data.simulate_cc, data.rate_limit_retry,
+      ]
+    : []
+  const enabledCount = switches.filter(Boolean).length
+  const allOff = data ? enabledCount === 0 : false
+
+  return (
+    <div className="space-y-8">
+      <div className="flex flex-col gap-3 border-b border-border/80 pb-5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-2.5 border-l-2 border-border py-1 pl-3 text-xs leading-5 text-muted-foreground">
             <InformationCircleIcon className="size-4 shrink-0" />
             <span>仅影响兼容性改写；必要的 <code className="font-mono text-foreground">Authorization</code> 注入始终保留。</span>
-          </div>
+        </div>
+        {data && (
+          <Badge variant="outline" className="w-fit shrink-0 font-normal text-muted-foreground">
+            {allOff ? '零改写' : `${enabledCount} / ${switches.length} 已开启`}
+          </Badge>
+        )}
+      </div>
 
           <SettingsGroup
             icon={IdentificationIcon}
@@ -149,10 +167,73 @@ export function ForwardingSettings({
           </SettingsGroup>
 
           <SettingsGroup
-            icon={ArrowPathIcon}
-            title="错误恢复"
-            description="上游拒绝会话历史时的自动补救。"
+            icon={CommandLineIcon}
+            title="非官方客户端"
+            description="让 SDK、第三方前端这类请求也能用上订阅额度。"
           >
+            <Toggle
+              k="simulate_cc"
+              label="模拟 Claude Code"
+              summary="非 CC 请求按官方抓包形态补全 system 与请求头。"
+              desc={
+                <>
+                  订阅凭证在上游是「只授权给 Claude Code 用」的：<code>system</code> 里缺那句
+                  <code>You are Claude Code, …</code> 就用不了额度，于是各种 SDK、第三方前端、
+                  <code>curl</code> 经 luban 都是死路一条。
+                  <br />
+                  开启后，<strong>只有认不出是 CC 的请求</strong>会被整形：<code>system</code> 前面补上
+                  官方的三块（计费标识、身份句、按模型族选的官方基座，客户端自己的提示词原样留作末块），
+                  请求头整套换成官方那套（<code>User-Agent</code>、<code>x-app</code>、
+                  <code>x-stainless-*</code>…，客户端自带的非官方头不转发，它要的
+                  <code>anthropic-beta</code> 取并集保留），<code>metadata</code> 补上与账号自洽的身份。
+                  已经是 CC 形态的请求一个字节都不多改。
+                  <br />
+                  <strong>会影响费用与输出</strong>：每条请求多一个基座前缀（opus 族约 300 token、
+                  sonnet 族约 2700 token，带 1h 全局断点，稳定后基本走缓存读价）；而且模型会被告知
+                  「你是 Claude Code」，输出风格与工具偏好都会随之偏移。
+                  <br />
+                  这类请求通常没有 <code>metadata.user_id</code>，要先在「接入设置」里关掉
+                  <strong>设备身份校验</strong>，否则它们在进门那一步就被 403 挡掉了。
+                </>
+              }
+            />
+          </SettingsGroup>
+
+          <SettingsGroup
+            icon={ArrowPathIcon}
+            title="限流与错误恢复"
+            description="区分额度耗尽、模型容量不足和签名异常。"
+          >
+            <Toggle
+              k="rate_limit_retry"
+              label="429 智能换号"
+              summary="按账号或模型范围冷却，随后改用其它账号重发。"
+              desc={
+                <ul className="space-y-2">
+                  <li>
+                    <strong>冷却范围：</strong>额度窗口被拒或使用率达到 100% 时冷却整个账号；
+                    窗口仍有余量时视为当前模型容量不足，只冷却该模型，账号仍可承接其它模型。
+                  </li>
+                  <li>
+                    <strong>冷却时长：</strong>优先采用上游 <code>retry-after</code>；账号级其次参考整体或窗口重置时间，
+                    缺失时为 60 秒；模型级缺失时为 30 秒。单次冷却最长 24 小时。
+                  </li>
+                  <li>
+                    <strong>换号重试：</strong>每次只选择本次请求尚未尝试的账号。带设备身份的请求会同步改绑，
+                    后续请求直接使用新账号；达到重试上限或没有其它账号时原样返回 <code>429</code>。
+                  </li>
+                  <li>
+                    <strong>兜底策略：</strong>冷却只是选号提示；全部候选都在冷却时仍会继续选择，避免代理被整体锁死。
+                    冷却仅保存在内存中，服务重启后自动清空。
+                  </li>
+                  <li>
+                    <strong>成本影响：</strong>换号会失去原账号的 prompt cache，历史 <code>thinking</code> 签名也可能失效；
+                    后者由下方签名兜底处理。关闭本项或将追加次数设为 0 时，不记录冷却并直接透传 <code>429</code>。
+                  </li>
+                </ul>
+              }
+            />
+            <RetryMax />
             <Toggle
               k="thinking_signature_retry"
               label="thinking 签名兜底"
@@ -175,9 +256,63 @@ export function ForwardingSettings({
               }
             />
           </SettingsGroup>
-        </DialogBody>
-      </DialogContent>
-    </Dialog>
+    </div>
+  )
+}
+
+/** 429 后追加尝试的账号数（不含首次请求；0 = 不重试；后端夹到 0~10）。 */
+function RetryMax() {
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+  useEffect(() => {
+    if (data) setDraft(String(data.rate_limit_retry_max))
+  }, [data?.rate_limit_retry_max])
+
+  const save = useMutation({
+    mutationFn: (n: number) => setRateLimitRetryMax(n),
+    onSuccess: (s: Settings) => {
+      toast.success(s.rate_limit_retry_max > 0
+        ? `429 后最多追加尝试 ${s.rate_limit_retry_max} 个账号`
+        : '已设为直接透传 429（不冷却、不换号）')
+      qc.setQueryData(['settings'], s)
+    },
+    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+  })
+
+  const n = Math.min(10, Math.max(0, Math.floor(Number(draft) || 0)))
+  const enabled = data?.rate_limit_retry ?? true
+
+  return (
+    <div className="px-3 py-3 sm:px-4 sm:py-3.5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">追加重试账号数</div>
+          <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+            不含首次请求；例如填 2，单次请求最多共尝试 3 个账号。
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Input
+            type="number"
+            min={0}
+            max={10}
+            value={draft}
+            disabled={!enabled}
+            onChange={(e) => setDraft(e.target.value)}
+            className="w-20 font-mono"
+            aria-label="429 追加重试账号数"
+          />
+          <Button
+            size="sm"
+            onClick={() => save.mutate(n)}
+            disabled={save.isPending || !enabled || n === (data?.rate_limit_retry_max ?? 2)}
+          >
+            保存
+          </Button>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -211,21 +346,22 @@ function Toggle({
           <div className="text-sm font-medium">{label}</div>
           <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{summary}</p>
         </div>
-        <Switch
-          className="mt-0.5 shrink-0 sm:mt-1"
-          variant="success"
-          checked={enabled}
-          disabled={save.isPending}
-          aria-label={label}
-          onCheckedChange={(next) => save.mutate(next)}
-        />
+        <span className="flex h-5 shrink-0 items-center">
+          <Switch
+            variant="success"
+            checked={enabled}
+            disabled={save.isPending}
+            aria-label={label}
+            onCheckedChange={(next) => save.mutate(next)}
+          />
+        </span>
       </div>
       <details className="group mt-2 text-xs text-muted-foreground">
         <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm text-2xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
           技术说明
           <ChevronDownIcon className="size-3 transition-transform group-open:rotate-180" />
         </summary>
-        <div className="mt-2 rounded-md bg-muted/50 px-3 py-2.5 leading-5 [&_code]:rounded-sm [&_code]:bg-background [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-foreground">
+        <div className="mt-2 border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-foreground">
           {desc}
         </div>
       </details>
@@ -242,9 +378,9 @@ function SettingsGroup({
   children: React.ReactNode
 }) {
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card shadow-sm">
-      <div className="flex items-center gap-3 border-b border-border bg-muted/30 px-3 py-3 sm:px-4">
-        <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+    <section>
+      <div className="flex items-center gap-3 pb-2.5">
+        <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
           <Icon className="size-4" />
         </span>
         <div className="min-w-0">
@@ -252,7 +388,7 @@ function SettingsGroup({
           <p className="mt-0.5 text-2xs text-muted-foreground">{description}</p>
         </div>
       </div>
-      <div className="divide-y divide-border">{children}</div>
+      <div className="divide-y divide-border border-y border-border/80">{children}</div>
     </section>
   )
 }

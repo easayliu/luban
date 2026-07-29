@@ -7,10 +7,17 @@ import {
   Bars3Icon, QueueListIcon, ArrowsUpDownIcon, EllipsisVerticalIcon,
 } from '@heroicons/react/24/outline'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
+import { SettingsPage, type SettingsSection } from '@/components/settings-page'
+import { AppFooter } from '@/components/app-footer'
+import { OverviewMetric } from '@/components/overview-metric'
+import { LogoMark } from '@/components/logo-mark'
+import { BatchActionsBar } from '@/App'
 import { Button } from '@/components/ui/button'
+import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
@@ -43,16 +50,17 @@ const banned: Credential = {
   token_hint: 'sk-ant-ort01-…XQAA',
   last_used: now - 120,
   cost_total: 87.77,
+  rate_limited_secs: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
     rl_5h_utilization: 0.82,
     rl_5h_reset: now + 9 * 60,
-    rl_7d_utilization: null,
-    rl_7d_reset: null,
+    rl_7d_utilization: 0.44,
+    rl_7d_reset: now + 3 * 24 * 3600,
     rl_representative: null,
     cost_5h: 87.77,
-    cost_7d: null,
+    cost_7d: 162.35,
   },
 }
 
@@ -75,23 +83,29 @@ const normal: Credential = {
   token_hint: 'sk-ant-ort01-…igAA',
   last_used: now - 5,
   cost_total: 6.85,
+  rate_limited_secs: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
     rl_5h_utilization: 0.15,
     rl_5h_reset: now + 99 * 60,
-    rl_7d_utilization: null,
-    rl_7d_reset: null,
+    rl_7d_utilization: 0.63,
+    rl_7d_reset: now + 5 * 24 * 3600,
     rl_representative: null,
     cost_5h: 6.85,
-    cost_7d: null,
+    cost_7d: 42.18,
   },
 }
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: Infinity, refetchOnWindowFocus: false } },
 })
-const previewDialog = new URLSearchParams(window.location.search).get('dialog')
+const previewParams = new URLSearchParams(window.location.search)
+const previewDialog = previewParams.get('dialog')
+const previewSettings = previewParams.get('settings') as SettingsSection | null
+const previewView = previewParams.get('view') === 'list' ? 'list' : 'card'
+const previewBatch = previewParams.get('batch') === '1'
+const previewSelected = new Set([banned.id])
 
 queryClient.setQueryData(['settings'], {
   api_key: 'luban-preview-key',
@@ -99,6 +113,9 @@ queryClient.setQueryData(['settings'], {
   device_binding_ttl_secs: 86400,
   default_device_limit: 3,
   require_device_id: true,
+  bare_rate_limit: 0,
+  bare_rate_window_secs: 60,
+  rate_limit_retry_max: 2,
   spoof_identity: true,
   billing_cch: true,
   fill_client_headers: true,
@@ -106,6 +123,8 @@ queryClient.setQueryData(['settings'], {
   system_shape: true,
   orig_header_case: true,
   thinking_signature_retry: true,
+  simulate_cc: true,
+  rate_limit_retry: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 queryClient.setQueryData(['credential-devices', 1], [])
@@ -131,12 +150,20 @@ queryClient.setQueryData(['credential-devices', 4], [
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <div className="app-shell min-h-screen bg-background text-foreground">
-        <header className="sticky top-0 z-20 border-b border-border/70 bg-surface/85 shadow-[0_1px_0_hsl(var(--border)/0.25)] backdrop-blur-xl">
+      {previewSettings ? (
+        <SettingsPage
+          section={previewSettings === 'forwarding' ? 'forwarding' : 'access'}
+          onSectionChange={() => undefined}
+          onBack={() => undefined}
+        />
+      ) : (
+      <>
+      <div className="app-shell flex min-h-screen flex-col bg-background text-foreground">
+        <header className="sticky top-0 z-20 border-b border-border/80 bg-background/95 backdrop-blur-xl">
           <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2.5 sm:py-3 lg:px-6">
             <div className="flex items-center gap-2.5 sm:gap-3">
-              <div className="brand-mark flex size-8 items-center justify-center rounded-lg text-white shadow-brand sm:size-10 sm:rounded-xl">
-                <span className="relative font-mono text-sm font-bold">鲁</span>
+              <div className="brand-mark flex size-8 items-center justify-center rounded-md text-white sm:size-9 sm:rounded-lg">
+                <LogoMark className="size-5" />
               </div>
               <div>
                 <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
@@ -154,22 +181,22 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl space-y-5 px-4 py-5 pb-8 sm:space-y-6 sm:py-6 md:py-8 lg:px-6">
+        <main className="mx-auto w-full max-w-7xl flex-1 space-y-4 px-4 py-5 pb-8 sm:space-y-5 sm:py-6 lg:px-6">
           <section className="space-y-4">
             <div className="flex items-center justify-between">
-              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">账号概览</h1>
+              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">账号管理</h1>
               <span className="hidden text-2xs text-muted-foreground sm:inline">每 30 秒自动刷新</span>
             </div>
-            <div className="grid grid-cols-2 gap-2 sm:gap-3 md:grid-cols-4 md:gap-4">
-              <PreviewMetric label="账号总数" value="2" status="2 已启用" icon={ShieldCheckIcon} tone="ok" />
-              <PreviewMetric label="异常账号" value="1" status="需处理" icon={ExclamationTriangleIcon} tone="bad" />
-              <PreviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" />
-              <PreviewMetric label="活跃设备" value="2" icon={DevicePhoneMobileIcon} tone="neutral" />
+            <div className="grid grid-cols-2 border-y border-border/80 md:grid-cols-4">
+              <OverviewMetric label="账号总数" value="2" status="2 已启用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r border-border/80 md:border-b-0" />
+              <OverviewMetric label="异常账号" value="1" status="需处理" icon={ExclamationTriangleIcon} tone="bad" className="border-b border-border/80 md:border-b-0 md:border-r" />
+              <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r border-border/80" />
+              <OverviewMetric label="活跃设备" value="2" icon={DevicePhoneMobileIcon} tone="neutral" />
             </div>
           </section>
 
-          <section className="space-y-3 sm:space-y-4">
-          <div className="grid gap-3 border-b border-border pb-4 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
+          <section className="min-w-0">
+          <div className="grid gap-3 border-b border-border/80 py-3.5 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
             <div className="flex items-baseline gap-2">
               <div className="text-sm font-semibold sm:text-base">账号列表</div>
               <div className="text-xs text-muted-foreground">共 2 个</div>
@@ -181,56 +208,59 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <div className="scrollbar-none -mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 lg:mx-0 lg:overflow-visible lg:px-0 lg:pb-0">
                 <Button size="sm" variant="outline" className="h-9 text-xs sm:h-8"><FunnelIcon />全部</Button>
                 <div className="flex shrink-0 overflow-hidden rounded-md border border-border">
-                  <button className="grid size-9 place-items-center bg-muted sm:size-8" aria-label="卡片视图"><Squares2X2Icon className="size-4" /></button>
-                  <button className="grid size-9 place-items-center border-l border-border text-muted-foreground sm:size-8" aria-label="紧凑列表视图"><Bars3Icon className="size-4" /></button>
+                  <Button size="icon" variant="ghost" className="size-9 rounded-none focus-visible:z-10 sm:size-8" aria-label="卡片视图" aria-pressed={previewView === 'card'}><Squares2X2Icon className="size-4" /></Button>
+                  <Button size="icon" variant="ghost" className="size-9 rounded-none border-l border-border focus-visible:z-10 sm:size-8" aria-label="紧凑列表视图" aria-pressed={previewView === 'list'}><Bars3Icon className="size-4" /></Button>
                 </div>
-                <Button size="sm" variant="outline" className="h-9 text-xs sm:h-8"><QueueListIcon />批量</Button>
+                <Button size="sm" variant={previewBatch ? 'secondary' : 'outline'} className="h-9 text-xs sm:h-8"><QueueListIcon />批量</Button>
                 <Button size="sm" variant="outline" className="h-9 text-xs sm:h-8"><ArrowsUpDownIcon />优先级↑</Button>
               </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 gap-3 sm:gap-4 xl:grid-cols-2">
-            <CredentialCard cred={banned} />
-            <CredentialCard cred={normal} />
-          </div>
+          {previewBatch && (
+            <div className="border-b border-border bg-muted/15 p-3 sm:p-4">
+            <BatchActionsBar
+              all={[banned, normal]}
+              selected={previewSelected}
+              onSelectedChange={() => undefined}
+              onClose={() => undefined}
+            />
+            </div>
+          )}
+
+          {previewView === 'list' ? (
+            <div>
+              <Table className="table-fixed">
+                <TableCaption className="sr-only">账号列表</TableCaption>
+                <CredentialListHeader
+                  selectable={previewBatch}
+                  sort="priority"
+                  dir="asc"
+                  onSortChange={() => undefined}
+                  allSelected={false}
+                  onSelectAll={() => undefined}
+                />
+                <TableBody>
+                  <CredentialRow cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
+                  <CredentialRow cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 items-start gap-3 pt-3 sm:gap-4 sm:pt-4 lg:grid-cols-2">
+              <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
+              <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
+            </div>
+          )}
           </section>
         </main>
+        <AppFooter />
       </div>
       <AddAccount open={previewDialog === 'add'} onOpenChange={() => undefined} />
       <AccessSettings open={previewDialog === 'access'} onOpenChange={() => undefined} />
       <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={() => undefined} />
+      </>
+      )}
     </QueryClientProvider>
   </React.StrictMode>,
 )
-
-function PreviewMetric({ label, value, status, icon: Icon, tone }: {
-  label: string
-  value: string
-  status?: string
-  icon: typeof ShieldCheckIcon
-  tone: 'ok' | 'bad' | 'neutral'
-}) {
-  const iconClass = {
-    ok: 'bg-ok-soft text-ok',
-    bad: 'bg-bad-soft text-bad',
-    neutral: 'bg-muted text-muted-foreground',
-  }[tone]
-  const statusClass = {
-    ok: 'text-ok',
-    bad: 'text-bad',
-    neutral: 'text-muted-foreground',
-  }[tone]
-  return (
-    <div className="min-w-0 rounded-lg border border-border bg-card p-3 shadow-card sm:p-5">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-xs font-medium sm:text-sm">{label}</span>
-        <span className={`grid size-7 shrink-0 place-items-center rounded-md sm:size-8 ${iconClass}`}>
-          <Icon className="size-3.5 sm:size-4" />
-        </span>
-      </div>
-      <div className="mt-3 text-2xl font-semibold leading-none tracking-tight tnum sm:mt-4 sm:text-3xl">{value}</div>
-      {status && <p className={`mt-1 text-2xs font-medium sm:mt-1.5 sm:text-xs ${statusClass}`}>{status}</p>}
-    </div>
-  )
-}

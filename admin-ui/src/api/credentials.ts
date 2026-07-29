@@ -43,6 +43,8 @@ export interface Credential {
   last_used: number | null
   /** 累计等价 API 费用（USD）。 */
   cost_total: number
+  /** 账号级 429 冷却的剩余秒数；模型级冷却不在账号列表展示；0 = 未冷却。 */
+  rate_limited_secs: number
 }
 
 /** 一条设备绑定明细；口径同 `device_count`：只含 TTL 内仍活跃的绑定。 */

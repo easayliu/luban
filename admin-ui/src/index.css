@@ -338,6 +338,14 @@
     background: hsl(var(--muted) / 0.35);
   }
 
+  .app-footer-bar {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .app-footer-spacer {
+    height: calc(2.75rem + env(safe-area-inset-bottom));
+  }
+
   .brand-mark {
     position: relative;
     overflow: hidden;
