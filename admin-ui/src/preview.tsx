@@ -44,7 +44,8 @@ const banned: Credential = {
   expired: false,
   created_at: now - 7 * 3600,
   updated_at: now - 120,
-  device_limit: 3,
+  // 覆盖生产里最常见的「跟随默认设备上限」排版场景。
+  device_limit: 0,
   device_limit_effective: 3,
   device_count: 0,
   ban_reason: '[401] authentication_error: OAuth access token has been revoked.',
@@ -160,15 +161,15 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       ) : (
       <>
       <div className="app-shell flex min-h-dvh flex-col text-foreground">
-        <header className="app-header sticky top-0 z-20 border-b border-border/70 bg-background/90 backdrop-blur-xl">
-          <div className="page-frame flex items-center justify-between gap-3 py-2.5 sm:py-3">
+        <header className="app-header sticky top-0 z-20 border-b border-border/80 bg-card/95 backdrop-blur">
+          <div className="page-frame flex h-16 items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 sm:gap-3">
-              <div className="brand-mark flex size-8 items-center justify-center rounded-md text-brand-foreground sm:size-9 sm:rounded-lg">
-                <LogoMark className="size-5" />
+              <div className="brand-mark flex size-8 items-center justify-center rounded-lg text-brand-foreground">
+                <LogoMark className="size-[1.125rem]" />
               </div>
               <div>
-                <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
-                <div className="label-eyebrow mt-1.5 hidden whitespace-nowrap sm:block">Claude Code Gateway</div>
+                <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
+                <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">Claude Code Gateway</div>
               </div>
             </div>
             <div className="flex items-center gap-2 sm:hidden">
@@ -182,38 +183,38 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </div>
         </header>
 
-        <main className="page-frame flex-1 py-5 pb-8 sm:py-6 sm:pb-10">
-          <div className="grid gap-5 xl:grid-cols-[14rem_minmax(0,1fr)] xl:items-start xl:gap-6">
-            <aside className="min-w-0 space-y-4 xl:sticky xl:top-24">
-              <div>
+        <main className="page-frame flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
+          <div className="space-y-6 sm:space-y-8">
+            <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="preview-page-title">
+              <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="label-eyebrow">Account pool</span>
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-bad-soft px-2 py-1 text-2xs font-medium text-bad">
+                  <h1 id="preview-page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">账号调度中心</h1>
+                  <span className="inline-flex items-center gap-1.5 rounded-md bg-bad-soft px-2 py-1 text-xs font-medium text-bad ring-1 ring-inset ring-bad/15">
                     <span className="size-1.5 rounded-full bg-current" aria-hidden />
                     1 个账号需关注
                   </span>
                 </div>
-                <h1 className="mt-2 text-xl font-semibold tracking-tight sm:text-2xl">账号调度中心</h1>
-                <p className="mt-2 hidden max-w-xl text-xs leading-5 text-muted-foreground sm:block">
-                  巡检账号健康、额度与设备容量，优先处理会影响转发的状态。
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                  统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
                 </p>
-                <div className="mt-3 flex items-center gap-1.5 text-2xs text-muted-foreground">
-                  <ArrowPathIcon className="size-3.5" />
-                  每 30 秒自动刷新
-                </div>
               </div>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-1">
-                <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" />
-                <OverviewMetric label="需处理" value="1" status="1 异常" icon={ExclamationTriangleIcon} tone="bad" />
-                <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" />
-                <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={DevicePhoneMobileIcon} tone="neutral" />
+              <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
+                <ArrowPathIcon className="size-3.5" />
+                每 30 秒自动刷新
               </div>
-            </aside>
+            </section>
 
-          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card/90 shadow-panel">
-          <div className="grid gap-3 border-b border-border/80 px-3.5 py-4 sm:px-4 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
+            <section aria-label="账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm lg:grid-cols-4">
+                <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r border-border/80 lg:border-b-0" />
+                <OverviewMetric label="需处理" value="1" status="1 异常" icon={ExclamationTriangleIcon} tone="bad" className="border-b border-border/80 lg:border-b-0 lg:border-r" />
+                <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r border-border/80" />
+                <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={DevicePhoneMobileIcon} tone="neutral" />
+            </section>
+
+          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm" aria-labelledby="preview-account-list-title">
+          <div className="grid gap-4 border-b border-border/80 px-4 py-5 sm:px-6 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
             <div className="flex items-baseline gap-2">
-              <div className="text-sm font-semibold sm:text-base">账号列表</div>
+              <div id="preview-account-list-title" className="text-base font-semibold">账号列表</div>
               <div className="text-xs text-muted-foreground">共 2 个</div>
             </div>
             <div className="min-w-0 space-y-2 lg:flex lg:items-center lg:justify-end lg:space-y-0">
@@ -233,7 +234,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </div>
 
           {previewBatch && (
-            <div className="border-b border-border bg-muted/30 p-3 sm:p-4">
+            <div className="border-b border-border bg-muted/25 p-3 sm:px-6 sm:py-4">
             <BatchActionsBar
               all={[banned, normal]}
               selected={previewSelected}
@@ -262,7 +263,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </Table>
             </div>
           ) : (
-            <div className="grid items-stretch gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+            <div className="grid items-stretch gap-3 bg-muted/20 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4 lg:p-5">
               <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
               <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
             </div>

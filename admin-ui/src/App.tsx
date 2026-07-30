@@ -81,6 +81,7 @@ const FILTERS: { key: FilterKey; label: string; match: (c: Credential) => boolea
     match: (c) => c.device_limit_effective > 0 && c.device_count >= c.device_limit_effective,
   },
 ]
+const FILTER_KEYS = FILTERS.map((filter) => filter.key)
 
 function preferredInitialView(): ViewMode {
   return typeof window !== 'undefined' && window.matchMedia('(min-width: 64rem)').matches
@@ -110,14 +111,14 @@ function App() {
   // 分页（纯前端切片：列表接口一次返回全部账号）。
   const [page, setPage] = useState(1)
 
-  // 界面偏好：排序、每页条数、视图，均写 localStorage，刷新后保持。
+  // 界面偏好：排序、每页条数、视图与状态筛选均写 localStorage，刷新后保持。
   const [sort, setSort] = usePersisted<SortKey>('sort', 'priority', oneOf(SORT_KEYS))
   const [dir, setDir] = usePersisted<SortDir>('sortDir', 'asc', oneOf(['asc', 'desc'] as const))
   const [pageSize, setPageSize] = usePersisted('pageSize', PAGE_SIZES[0], numberOneOf(PAGE_SIZES))
   const [view, switchView] = usePersisted<ViewMode>('view', preferredInitialView(), oneOf(VIEW_MODES))
+  const [filter, setFilter] = usePersisted<FilterKey>('filter', 'all', oneOf(FILTER_KEYS))
 
-  // 筛选与搜索刻意不持久化：它们会隐藏账号，刷新后仍生效容易让人以为账号丢了。
-  const [filter, setFilter] = useState<FilterKey>('all')
+  // 搜索词仍只保留在当前页面，避免下次打开时被一个旧关键字悄悄隐藏账号。
   const [query, setQuery] = useState('')
   useEffect(() => {
     const syncRoute = () => setSettingsRoute(readSettingsRoute())
@@ -265,16 +266,16 @@ function App() {
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      {/* 置顶操作栏 */}
-      <header className="app-header sticky top-0 z-20 border-b border-border/70 bg-background/90 backdrop-blur-xl">
-        <div className="page-frame flex items-center justify-between gap-3 py-2.5 sm:py-3">
+      {/* 置顶操作栏：使用克制的 stacked application shell。 */}
+      <header className="app-header sticky top-0 z-20 border-b border-border/80 bg-card/95 backdrop-blur">
+        <div className="page-frame flex h-16 items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-md text-brand-foreground sm:size-9 sm:rounded-lg">
-              <LogoMark className="size-5" />
+            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-brand-foreground">
+              <LogoMark className="size-[1.125rem]" />
             </div>
             <div className="min-w-0">
-              <div className="text-[0.9375rem] font-semibold leading-none tracking-tight">Luban</div>
-              <div className="label-eyebrow mt-1.5 hidden whitespace-nowrap sm:block">Claude Code Gateway</div>
+              <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
+              <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">Claude Code Gateway</div>
             </div>
           </div>
           <div className="flex items-center gap-2 sm:hidden">
@@ -321,24 +322,24 @@ function App() {
         </div>
       </header>
 
-      <main className="page-frame relative flex-1 py-5 pb-8 sm:py-6 sm:pb-10">
+      <main className="page-frame relative flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
 
-        <div className="grid gap-5 xl:grid-cols-[14rem_minmax(0,1fr)] xl:items-start xl:gap-6">
-          <aside className="min-w-0 space-y-4 xl:sticky xl:top-24">
-            <div>
+        <div className="space-y-6 sm:space-y-8">
+          <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="page-title">
+            <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="label-eyebrow">Account pool</span>
+                <h1 id="page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">账号调度中心</h1>
                 {count > 0 && (
                   <span
                     className={cn(
-                      'inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-2xs font-medium',
+                      'inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset',
                       abnormalCount > 0
-                        ? 'bg-bad-soft text-bad'
+                        ? 'bg-bad-soft text-bad ring-bad/15'
                         : attentionCount > 0
-                          ? 'bg-warn-soft text-warn'
-                          : 'bg-ok-soft text-ok',
+                          ? 'bg-warn-soft text-warn ring-warn/15'
+                          : 'bg-ok-soft text-ok ring-ok/15',
                     )}
                   >
                     <span className="size-1.5 rounded-full bg-current" aria-hidden />
@@ -346,11 +347,11 @@ function App() {
                   </span>
                 )}
               </div>
-              <h1 className="mt-2 text-xl font-semibold tracking-tight sm:text-2xl">账号调度中心</h1>
-              <p className="mt-2 hidden max-w-xl text-xs leading-5 text-muted-foreground sm:block">
-                巡检账号健康、额度与设备容量，优先处理会影响转发的状态。
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
               </p>
-              <div className="mt-3 flex items-center gap-1.5 text-2xs text-muted-foreground">
+            </div>
+            <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
                 <ArrowPathIcon className={cn('size-3.5', isFetching && !isLoading && 'animate-spin')} />
                 {isRefetchError ? (
                   <button
@@ -363,11 +364,14 @@ function App() {
                 ) : (
                   <span>每 30 秒自动刷新</span>
                 )}
-              </div>
             </div>
+          </section>
 
-            {count > 0 && (
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-1">
+          {count > 0 && (
+            <section
+              aria-label="账号池概览"
+              className="grid grid-cols-2 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm lg:grid-cols-4"
+            >
               <OverviewMetric
                 label="可调度账号"
                 value={`${schedulableCount}/${count}`}
@@ -380,6 +384,7 @@ function App() {
                 tone={schedulableCount > 0 ? 'ok' : 'bad'}
                 active={filter === 'schedulable'}
                 onClick={() => selectMetric('schedulable')}
+                className="border-b border-r border-border/80 lg:border-b-0"
               />
               <OverviewMetric
                 label="需处理"
@@ -389,6 +394,7 @@ function App() {
                 tone={abnormalCount > 0 ? 'bad' : attentionCount > 0 ? 'warn' : 'neutral'}
                 active={filter === 'attention'}
                 onClick={() => selectMetric('attention')}
+                className="border-b border-border/80 lg:border-b-0 lg:border-r"
               />
               <OverviewMetric
                 label="额度预警"
@@ -398,6 +404,7 @@ function App() {
                 tone={nearLimitCount > 0 ? 'warn' : 'neutral'}
                 active={filter === 'nearLimit'}
                 onClick={() => selectMetric('nearLimit')}
+                className="border-r border-border/80"
               />
               <OverviewMetric
                 label="绑定设备"
@@ -408,14 +415,13 @@ function App() {
                 active={filter === 'deviceFull'}
                 onClick={fullDeviceCount > 0 ? () => selectMetric('deviceFull') : undefined}
               />
-              </div>
-            )}
-          </aside>
+            </section>
+          )}
 
-          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card/90 shadow-panel">
+          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm" aria-labelledby="account-list-title">
           {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
-          <div className="grid gap-3 border-b border-border/80 px-3.5 py-4 sm:px-4 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
-            <h2 className="flex items-baseline gap-2 text-sm font-semibold tracking-tight sm:text-base">
+          <div className="grid gap-4 border-b border-border/80 px-4 py-5 sm:px-6 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
+            <h2 id="account-list-title" className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-base font-semibold tracking-tight">
               账号列表
               <span className="text-xs font-normal text-muted-foreground">
                 {filtering ? (
@@ -553,7 +559,7 @@ function App() {
 
         {/* 批量操作条 */}
         {count > 0 && batch && (
-          <div className="border-b border-border bg-muted/30 p-3 sm:p-4">
+          <div className="border-b border-border bg-muted/25 p-3 sm:px-6 sm:py-4">
           <BatchActionsBar
             all={sorted}
             selected={selected}
@@ -615,8 +621,8 @@ function App() {
             </Table>
           </div>
         ) : (
-          // 每张卡至少 27rem；同一行等高，异常摘要不会再把相邻卡片和下一行拉出错位。
-          <div className="grid items-stretch gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+          // 保持舒展的双列卡片；auto-fill 保留空轨，账号少时也不会把单卡拉得过宽。
+          <div className="grid items-stretch gap-3 bg-muted/20 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4 lg:p-5">
             {pageItems.map((c) => (
               <CredentialCard
                 key={c.id}
@@ -631,7 +637,7 @@ function App() {
 
         {/* 分页条：实际超过一页才出现。 */}
         {!isLoading && pageCount > 1 && (
-          <div className="px-3 pb-3 sm:px-4 sm:pb-4">
+          <div className="px-4 pb-4 sm:px-6 sm:pb-5">
           <Pagination
             total={total}
             page={current}

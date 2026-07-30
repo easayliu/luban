@@ -14,10 +14,10 @@ export function OverviewMetric({
   className?: string
 }) {
   const iconClass = {
-    ok: 'bg-ok-soft text-ok',
-    bad: 'bg-bad-soft text-bad',
-    warn: 'bg-warn-soft text-warn',
-    neutral: 'bg-muted text-muted-foreground',
+    ok: 'text-ok',
+    bad: 'text-bad',
+    warn: 'text-warn',
+    neutral: 'text-muted-foreground',
   }[tone]
   const statusClass = {
     ok: 'text-ok',
@@ -28,36 +28,23 @@ export function OverviewMetric({
 
   const content = (
     <>
-      <span
-        className={cn(
-          'absolute inset-y-3 left-0 w-0.5 rounded-r-full opacity-0 transition-opacity',
-          tone === 'ok' && 'bg-ok',
-          tone === 'bad' && 'bg-bad',
-          tone === 'warn' && 'bg-warn',
-          tone === 'neutral' && 'bg-muted-foreground',
-          active && 'opacity-100',
-        )}
-        aria-hidden
-      />
-      <div className="flex items-start justify-between gap-2">
-        <p className="min-w-0 text-xs font-medium text-muted-foreground">{label}</p>
-        <span className={cn('grid size-7 shrink-0 place-items-center rounded-md', iconClass)} aria-hidden>
-          <Icon className="size-3.5" />
-        </span>
+      <div className="flex items-center justify-between gap-3">
+        <p className="min-w-0 text-sm font-medium text-muted-foreground">{label}</p>
+        <Icon className={cn('size-5 shrink-0', iconClass)} aria-hidden />
       </div>
-      <div className="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <span className="text-xl font-semibold leading-none tracking-tight tnum sm:text-2xl xl:text-xl">
+      <div className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="text-2xl font-semibold leading-none tracking-tight tnum">
           {value}
         </span>
-        {status && <span className={cn('text-xs font-medium', statusClass)}>{status}</span>}
+        {status && <span className={cn('text-xs', statusClass)}>{status}</span>}
       </div>
     </>
   )
 
   const rootClass = cn(
-    'relative min-w-0 overflow-hidden rounded-lg border border-border/80 bg-card px-3 py-3 text-left shadow-card',
-    onClick && 'cursor-pointer transition-[border-color,background-color,transform,box-shadow] hover:-translate-y-px hover:border-foreground/20 hover:shadow-elev focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background',
-    active && 'border-foreground/25 bg-primary-soft/70 ring-2 ring-ring/10',
+    'relative min-w-0 bg-card px-4 py-4 text-left sm:px-5 sm:py-5',
+    onClick && 'cursor-pointer transition-colors hover:bg-muted/35 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60',
+    active && 'bg-primary-soft/80',
     className,
   )
 
