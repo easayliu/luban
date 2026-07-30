@@ -2204,7 +2204,7 @@ impl ProbeReport {
 
 /// 用**指定**凭证向上游发一条最小请求，测这个账号能不能用这个模型。
 ///
-/// 与转发路径的三处刻意不同：
+/// 与转发路径的两处刻意不同：
 ///
 /// 1. **不选号**：走 [`store::access_token_of`] 直接取这一个凭证的 token
 ///    （[`store::valid_access_token_for_device`] 会按负载均衡挑号，那测出来的就不是它了），
@@ -2213,8 +2213,15 @@ impl ProbeReport {
 /// 2. **形态开关一律按默认全开**（[`store::ForwardFlags::default`]），不读库里那份配置：
 ///    测试要回答的是「这个账号 + 这个模型通不通」，掺进用户自己拨过的开关，失败时就分不清
 ///    是账号的问题还是配置的问题了。于是这里恒定发一条**官方形态**的请求，作为基准。
-/// 3. **不改账号状态**：429 不打冷却、命中封号特征也不自动停用——一次手动测试不该顺手
-///    停掉一个号，那个判定留给真实流量。
+///
+/// 而**账号状态照真实流量的口径更新**：这条请求是真实的——真花额度、拿到的也是上游此刻
+/// 的真实判决，429 就该打冷却（同一套 [`rate_limit_scope`] 分格）、命中封号特征就该
+/// [`store::CredentialStore::mark_banned`]、刷新时发现 `refresh_token` 被作废亦然（见
+/// [`store::access_token_of`]）。否则测试报了「已封禁」而卡片上一切如常，两边各说各话，
+/// 用户还得自己动手把号停掉。唯一仍与转发不同的是**不换号重试**——测的就是这一个，
+/// 换了号结论就不是它的了。冷却与转发共用 `rate_limit_retry` 那个开关（关掉即两边都
+/// 退回「只透传不冷却」）；注意这里读的是**库里真实配置**而非上面那份全开的形态开关——
+/// 形态按基准发、状态按真实规则记，两件事各归各。
 ///
 /// 但它**照常写一条用量日志**（[`log_probe_usage`]）：卡片上的额度快照与累计花费都出自
 /// `usage_logs`，不写就等于「测出来的额度只在弹窗里存在」，而这条请求真的花了钱、也真的
@@ -2331,6 +2338,28 @@ pub async fn probe(
             let info = RateLimitInfo::from_headers(up.headers());
             ratelimit_raw = info.raw.clone();
             let quota = ProbeQuota::from_info(&info);
+            // `content-encoding` 同样得在消费响应前看；解不开的编码下 body 是乱码字节，
+            // 封号判定必须跳过（与转发路径同一条宁漏勿误的规则）。
+            let (_, content_encoding) = resp_shape(&up);
+            let compressed = content_encoding.is_some();
+            // 429 照真实流量打冷却。开关读库里真实配置（形态那份 flags 是恒定全开的基准，
+            // 与「要不要管 429」无关）；与转发一样，重试次数配成 0 也视同关闭。
+            if status == StatusCode::TOO_MANY_REQUESTS
+                && state.store.forward_flags().rate_limit_retry
+                && state.store.rate_limit_retry_max() > 0
+            {
+                let scope = rate_limit_scope(&info, Some(model));
+                let cooldown = info.cooldown(scope.account_level());
+                tracing::warn!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    model,
+                    scope = scope.label(),
+                    cooldown_secs = cooldown.as_secs(),
+                    ratelimit = %info.raw,
+                    "连通性测试遇上游 429，该号进入冷却"
+                );
+                state.store.mark_rate_limited(cred.id, scope.model(), cooldown);
+            }
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
                 Err(_) => {
@@ -2380,6 +2409,22 @@ pub async fn probe(
                 }
                 Ok(Ok(bytes)) => {
                     log_probe_usage(&state.store, cred, model, status, &bytes, &info, &started);
+                    // 命中封号特征照真实流量停用：判定器与转发共用同一个（含 401 裸响应、
+                    // 「端点不支持」豁免那些规则），测试报出「已封禁」的同时卡片也变红，
+                    // 而不是弹窗里一个结论、列表里另一个。
+                    if let Some(reason) =
+                        (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
+                    {
+                        tracing::warn!(
+                            cred = format!("#{} {}", cred.id, cred.label),
+                            status = status.as_u16(),
+                            reason = %reason,
+                            "连通性测试检测到账号级错误，自动停用该凭证"
+                        );
+                        if let Err(e) = state.store.mark_banned(cred.id, &reason) {
+                            tracing::warn!(error = %e, "自动停用凭证失败");
+                        }
+                    }
                     probe_report(status, &bytes, started.elapsed().as_millis(), quota)
                 }
             }

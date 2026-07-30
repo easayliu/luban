@@ -400,7 +400,9 @@ export function ConnectivityTestDialog({
       if (request.session !== session.current) return
       const entrySeq = ++seq.current
       setEntries((prev) => [{ seq: entrySeq, model: request.model, result }, ...prev])
-      // 测试会顺带刷新过期的 token，卡片上的有效期得跟着更新。
+      // 测试是真实流量，账号状态照真实口径更新：可能刷新了过期 token（有效期变了）、
+      // 可能停用了命中封号特征的号（ban_reason 变了）——卡片得跟着变，别让弹窗一个说法、
+      // 列表另一个说法。上游拒绝也走 onSuccess（接口恒 200 带结果），所以这里就够了。
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
     // 这条是「请求没发出去」（账号已被删、管理密码失效等），与「上游拒绝」不同：
@@ -456,7 +458,7 @@ export function ConnectivityTestDialog({
           </DialogTitle>
           <DialogDescription>
             使用「<span className="font-medium text-foreground">{cred.label}</span>」向上游发送最小请求；
-            会消耗少量订阅额度并按实际用量计入该账号，但不会改变账号状态。
+            会消耗少量订阅额度并按实际用量计入该账号。测试结果与真实流量同等对待：限流会进入冷却，检测到封禁会自动停用。
           </DialogDescription>
         </DialogHeader>
         <DialogBody className="space-y-3">

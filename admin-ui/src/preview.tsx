@@ -32,7 +32,7 @@ mq.addEventListener('change', (e) => applyTheme(e.matches))
 
 const now = Math.floor(Date.now() / 1000)
 
-// 已封禁：额度接近满，有效期文案短（「已封禁」）。
+// 已封禁：故意使用较长的上游错误，覆盖「错误摘要把同一行卡片撑乱」的回归场景。
 const banned: Credential = {
   id: 1,
   label: 'burksupperclassmens946205@yahoo.com',
@@ -47,7 +47,7 @@ const banned: Credential = {
   device_limit: 3,
   device_limit_effective: 3,
   device_count: 0,
-  ban_reason: '账号已被上游封禁',
+  ban_reason: '[401] authentication_error: OAuth access token has been revoked.',
   token_hint: 'sk-ant-ort01-…XQAA',
   last_used: now - 120,
   cost_total: 87.77,
@@ -262,7 +262,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               </Table>
             </div>
           ) : (
-            <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+            <div className="grid items-stretch gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
               <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
               <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
             </div>

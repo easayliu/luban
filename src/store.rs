@@ -1661,15 +1661,16 @@ pub async fn valid_access_token_for_device(
     .await
 }
 
-/// 取**指定**凭证的可用 access_token（必要时刷新），不选号、不写设备绑定、不改动账号状态。
+/// 取**指定**凭证的可用 access_token（必要时刷新），不选号、不写设备绑定。
 ///
 /// 连通性测试用（见 [`crate::proxy::probe`]）。转发那条路走
 /// [`valid_access_token_for_device`]：它会按负载均衡挑号，而测试是指名道姓要测这一个，
 /// 挑到别的号上去测出来的结论就不是这个号的。
 ///
-/// 与转发路径的另一处区别是**失败不停用**：`refresh_token` 已被上游作废时那边会
-/// [`CredentialStore::mark_banned`] 并改选其它号，这里只把原因抛出去。手动点一次测试
-/// 不该顺手改动账号状态——那个判定留给真实流量，测试只负责如实报告。
+/// **失败停用的口径与转发一致**：这里发生的刷新是一次真实的上游往返，`refresh_token`
+/// 已被作废这个结论不因「是测试触发的」就打折扣——不停用的话，卡片上一切如常，
+/// 只有点过测试的人知道这个号其实已经死了。区别只在**不换号**：测试指名要测这一个，
+/// 停用之后如实把原因抛出去即可。网络抖动/5xx 这类可重试错误照旧不停用。
 pub async fn access_token_of(
     store: &CredentialStore,
     http: &wreq::Client,
@@ -1677,7 +1678,17 @@ pub async fn access_token_of(
 ) -> Result<String> {
     match ensure_fresh_token(store, http, cred).await? {
         TokenAttempt::Ready(token) => Ok(token),
-        TokenAttempt::Revoked(reason) => anyhow::bail!("{reason}"),
+        TokenAttempt::Revoked(reason) => {
+            tracing::warn!(
+                cred = format!("#{} {}", cred.id, cred.label),
+                reason = %reason,
+                "refresh_token 已被上游作废，停用该凭证"
+            );
+            if let Err(e) = store.mark_banned(cred.id, &reason) {
+                tracing::warn!(error = %e, "自动停用凭证失败");
+            }
+            anyhow::bail!("{reason}")
+        }
     }
 }
 

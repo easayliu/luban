@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   ArrowPathIcon, PencilIcon, CheckIcon, XMarkIcon, EllipsisHorizontalIcon,
-  DevicePhoneMobileIcon, ChevronDownIcon, ClockIcon, WalletIcon,
+  DevicePhoneMobileIcon, ChevronDownIcon, ClockIcon, WalletIcon, ExclamationTriangleIcon,
 } from '@heroicons/react/24/outline'
 import { listCredentialDevices, unbindCredentialDevice, type Credential } from '@/api/credentials'
 import {
@@ -67,7 +67,7 @@ export function CredentialCard({
   return (
     <Card
       className={cn(
-        '@container/card group/card relative flex flex-col overflow-hidden rounded-xl border-border/80 bg-card p-0 shadow-card transition-[border-color,box-shadow,background-color]',
+        '@container/card group/card relative flex h-full flex-col overflow-hidden rounded-xl border-border/80 bg-card p-0 shadow-card transition-[border-color,box-shadow,background-color]',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:transition-colors',
         'hover:border-foreground/20 hover:shadow-panel',
         cred.disabled && 'bg-muted/25',
@@ -205,12 +205,18 @@ export function CredentialCard({
           )}
         </div>
         {cred.ban_reason && !editing && (
-          <p
-            className="mt-3 line-clamp-2 break-words rounded-md border border-bad/15 bg-bad-soft px-2.5 py-2 text-xs leading-5 text-bad"
-            title={cred.ban_reason}
+          <div
+            className="mt-3 flex min-h-9 items-start gap-2 rounded-md border border-bad/20 bg-bad-soft/80 px-2.5 py-2 text-bad"
+            role="alert"
           >
-            {cred.ban_reason}
-          </p>
+            <ExclamationTriangleIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+            <p
+              className="line-clamp-2 min-w-0 flex-1 break-words text-xs leading-4 @sm/card:line-clamp-1"
+              title={cred.ban_reason}
+            >
+              {cred.ban_reason}
+            </p>
+          </div>
         )}
       </div>
 
@@ -328,8 +334,11 @@ export function CredentialCard({
         </div>
       )}
 
+      {/* 最少留一档间距，同时吃掉同一网格行的剩余高度，让异常卡与普通卡的底栏齐平。 */}
+      <div className="min-h-4 flex-1" aria-hidden />
+
       {/* 真实有效期与账号开关独占底栏，不再把封禁/冷却误写成“有效期”。 */}
-      <div className="mt-4 flex min-h-14 items-center justify-between gap-3 border-t border-border/70 bg-muted/10 px-3 py-3 sm:px-4">
+      <div className="flex min-h-14 items-center justify-between gap-3 border-t border-border/70 bg-muted/10 px-3 py-3 sm:px-4">
         <div className="min-w-0">
           <div className="text-xs text-muted-foreground">凭证有效期</div>
           <div className={cn('mt-1 flex min-w-0 items-center gap-1.5 text-sm font-medium', expiry.className)} title={expiry.title}>

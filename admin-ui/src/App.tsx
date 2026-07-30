@@ -23,6 +23,7 @@ import {
   type SortDir, type SortKey,
 } from '@/components/credential-shared'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialLoadingState } from '@/components/credential-loading'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
@@ -564,7 +565,7 @@ function App() {
 
         {/* 卡片栅格（按当前页切片） */}
         {isLoading ? (
-          <LoadingState />
+          <CredentialLoadingState view={view} selectable={batch} />
         ) : isError && !creds ? (
           <ErrorState error={credentialsError} onRetry={() => { void refetchCredentials() }} />
         ) : count === 0 ? (
@@ -614,8 +615,8 @@ function App() {
             </Table>
           </div>
         ) : (
-          // 每张卡至少 27rem；auto-fill 保留空轨，账号少时也不会把单张卡拉满整块内容区。
-          <div className="grid items-start gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+          // 每张卡至少 27rem；同一行等高，异常摘要不会再把相邻卡片和下一行拉出错位。
+          <div className="grid items-stretch gap-3 bg-muted/25 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
             {pageItems.map((c) => (
               <CredentialCard
                 key={c.id}
