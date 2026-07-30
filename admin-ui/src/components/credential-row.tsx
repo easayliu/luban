@@ -8,6 +8,8 @@ import { type Credential } from '@/api/credentials'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import {
   liveQuota,
+  isNearLimit,
+  statusMeta,
   switchTitle,
   tierBadgeVariant,
   useCredentialActions,
@@ -28,15 +30,17 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
 
 const COL = {
   select: 'w-3',
   account: 'w-[22%]',
-  schedule: 'w-[8%]',
+  schedule: 'w-[10%]',
   priority: 'w-[7%]',
   tier: 'w-[9%]',
-  quota: 'w-[25%]',
+  quota5h: 'w-[12%]',
+  quota7d: 'w-[11%]',
   devices: 'w-[9%]',
   recent: 'w-[12%]',
   cost: 'w-[8%]',
@@ -100,8 +104,11 @@ export function CredentialListHeader({
         <TableHead className={COL.tier} {...sortProps('tier')}>
           {sortable('账号等级', 'tier')}
         </TableHead>
-        <TableHead className={COL.quota} {...sortProps('usage5h')}>
-          {sortable('额度', 'usage5h')}
+        <TableHead className={COL.quota5h} {...sortProps('usage5h')}>
+          {sortable('5h 额度', 'usage5h')}
+        </TableHead>
+        <TableHead className={COL.quota7d} {...sortProps('usage7d')}>
+          {sortable('7d 额度', 'usage7d')}
         </TableHead>
         <TableHead className={COL.devices} {...sortProps('devices')}>
           {sortable('设备', 'devices')}
@@ -138,7 +145,7 @@ export function CredentialRow({
   return (
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
-        <TableCell colSpan={9} className="whitespace-normal p-0">
+        <TableCell colSpan={10} className="whitespace-normal p-0">
           <article className="space-y-4 p-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
@@ -166,8 +173,18 @@ export function CredentialRow({
             </div>
 
             <div className="grid grid-cols-2 gap-4 border-t pt-4">
-              <ListQuotaMeter label="5h" util={u5h} reset={cred.quota?.rl_5h_reset ?? null} />
-              <ListQuotaMeter label="7d" util={u7d} reset={cred.quota?.rl_7d_reset ?? null} />
+              <ListQuotaMeter
+                label="5h"
+                util={u5h}
+                reset={cred.quota?.rl_5h_reset ?? null}
+                cost={cred.quota?.cost_5h ?? null}
+              />
+              <ListQuotaMeter
+                label="7d"
+                util={u7d}
+                reset={cred.quota?.rl_7d_reset ?? null}
+                cost={cred.quota?.cost_7d ?? null}
+              />
             </div>
 
             <dl className="grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-3">
@@ -207,8 +224,10 @@ export function CredentialRow({
         <TableCell className={cn(COL.account, 'whitespace-normal')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="truncate font-semibold text-sm" title={cred.label}>{cred.label}</span>
+              <div className="flex min-w-0 items-baseline gap-2">
+                <span className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
+                  {cred.label}
+                </span>
                 <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
               </div>
               <span className="text-xs text-muted-foreground" title={`添加于 ${formatFullTime(cred.created_at)}`}>
@@ -230,11 +249,23 @@ export function CredentialRow({
             ? <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>
             : <span className="text-muted-foreground">—</span>}
         </TableCell>
-        <TableCell className={COL.quota}>
-          <div className="grid grid-cols-2 gap-4">
-            <ListQuotaMeter label="5h" util={u5h} reset={cred.quota?.rl_5h_reset ?? null} />
-            <ListQuotaMeter label="7d" util={u7d} reset={cred.quota?.rl_7d_reset ?? null} />
-          </div>
+        <TableCell className={COL.quota5h}>
+          <ListQuotaMeter
+            label="5h"
+            util={u5h}
+            reset={cred.quota?.rl_5h_reset ?? null}
+            cost={cred.quota?.cost_5h ?? null}
+            showLabel={false}
+          />
+        </TableCell>
+        <TableCell className={COL.quota7d}>
+          <ListQuotaMeter
+            label="7d"
+            util={u7d}
+            reset={cred.quota?.rl_7d_reset ?? null}
+            cost={cred.quota?.cost_7d ?? null}
+            showLabel={false}
+          />
         </TableCell>
         <TableCell className={COL.devices}>
           <Button
@@ -277,8 +308,19 @@ function ScheduleControl({
   actions: CredentialActions
 }) {
   const { toggle } = actions
+  const nearLimit = isNearLimit(cred)
+  const status = statusMeta(cred, nearLimit)
+  const statusDetail = cred.ban_reason
+    || (cred.disabled
+      ? '账号已停用，不参与调度'
+      : cred.rate_limited_secs > 0
+        ? `账号约 ${Math.max(1, Math.ceil(cred.rate_limited_secs / 60))} 分钟后恢复调度`
+        : nearLimit
+          ? '5 小时或 7 天额度使用率已达到 90%'
+          : '账号运行正常，可参与调度')
+
   return (
-    <div className="flex shrink-0 items-center justify-start gap-2">
+    <div className="flex shrink-0 flex-col items-end gap-3 xl:flex-row xl:items-center xl:gap-2">
       <div className="flex items-center gap-2">
         {toggle.isPending && <Spinner />}
         <Switch
@@ -289,6 +331,22 @@ function ScheduleControl({
           aria-label={`${cred.label}：${switchTitle(cred)}`}
         />
       </div>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Badge
+              render={<button type="button" />}
+              size="sm"
+              variant={status.variant}
+              aria-label={`${status.label}：${statusDetail}`}
+              aria-live="polite"
+            />
+          }
+        >
+          {status.label}
+        </TooltipTrigger>
+        <TooltipPopup className="max-w-72 break-words">{statusDetail}</TooltipPopup>
+      </Tooltip>
     </div>
   )
 }
@@ -306,16 +364,40 @@ function ListQuotaMeter({
   label,
   util,
   reset,
+  cost,
+  showLabel = true,
 }: {
   label: string
   util: number | null
   reset: number | null
+  cost: number | null
+  showLabel?: boolean
 }) {
   if (util == null) {
+    const emptyLabel = reset != null ? '已重置' : '暂无数据'
     return (
-      <div title={reset != null ? `${label}窗口已重置，之后暂无新请求` : `${label}额度暂无数据`}>
-        <p className="font-medium text-sm">{label}</p>
-        <p className="text-xs text-muted-foreground">{reset != null ? '已重置' : '暂无数据'}</p>
+      <div
+        className="flex w-full flex-col gap-2"
+        title={reset != null ? `${label}窗口已重置，之后暂无新请求` : `${label}额度暂无数据`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
+            <span
+              className={cn(
+                'min-w-0 truncate tabular-nums',
+                showLabel
+                  ? 'text-xs text-muted-foreground'
+                  : 'font-medium text-foreground text-sm leading-none',
+              )}
+              title={`${label}本周期花费 ${cost == null ? '暂无数据' : formatUsd(cost)}`}
+            >
+              {cost == null ? '—' : formatUsd(cost)}
+            </span>
+          </div>
+          <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
+        </div>
+        <div className="h-2 w-full bg-input" aria-hidden />
       </div>
     )
   }
@@ -330,8 +412,21 @@ function ListQuotaMeter({
   return (
     <Meter value={percentage} max={100} title={`${label}额度使用率 ${percentage}%`}>
       <div className="flex items-center justify-between gap-2">
-        <MeterLabel>{label}</MeterLabel>
-        <MeterValue>{() => `${percentage}%`}</MeterValue>
+        <div className="flex min-w-0 items-baseline gap-1.5">
+          <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>
+          <span
+            className={cn(
+              'min-w-0 truncate tabular-nums',
+              showLabel
+                ? 'text-xs text-muted-foreground'
+                : 'font-medium text-foreground text-sm leading-none',
+            )}
+            title={`${label}本周期花费 ${cost == null ? '暂无数据' : formatUsd(cost)}`}
+          >
+            {cost == null ? '—' : formatUsd(cost)}
+          </span>
+        </div>
+        <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
       </div>
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />

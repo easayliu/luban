@@ -93,8 +93,8 @@ function QuotaSkeleton() {
 
 function TableSkeletons({ selectable }: { selectable: boolean }) {
   const desktopColumns = selectable
-    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_8fr_7fr_9fr_25fr_9fr_12fr_8fr]'
-    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_8fr_7fr_9fr_25fr_9fr_12fr_8fr]'
+    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_10fr_7fr_9fr_12fr_11fr_9fr_12fr_8fr]'
+    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_10fr_7fr_9fr_12fr_11fr_9fr_12fr_8fr]'
 
   return (
     <div className="overflow-hidden">
@@ -107,6 +107,7 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-12" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
@@ -137,17 +138,15 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
               <div className="px-2.5">
                 <Skeleton className="h-6 w-16 rounded-md" />
               </div>
-              <div className="grid min-w-0 grid-cols-2 gap-4 px-2.5">
-                {Array.from({ length: 2 }, (_, quotaIndex) => (
-                  <div key={quotaIndex} className="min-w-0 space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <Skeleton className="h-3 w-5" />
-                      <Skeleton className="h-3 w-8" />
-                    </div>
-                    <Skeleton className="h-1.5 w-full rounded-full" />
+              {Array.from({ length: 2 }, (_, quotaIndex) => (
+                <div key={quotaIndex} className="min-w-0 space-y-2 px-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <Skeleton className="h-3 w-10" />
+                    <Skeleton className="h-3 w-8" />
                   </div>
-                ))}
-              </div>
+                  <Skeleton className="h-1.5 w-full rounded-full" />
+                </div>
+              ))}
               <div className="min-w-0 space-y-1.5 px-2.5">
                 <Skeleton className="h-3 w-10" />
                 <Skeleton className="h-2.5 w-8" />

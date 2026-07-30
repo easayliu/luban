@@ -2,37 +2,31 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
-  ArrowUpDownIcon, EllipsisVerticalIcon, GaugeIcon, LayoutGridIcon, ListChecksIcon,
-  ListFilterIcon, ListIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldCheckIcon,
-  SmartphoneIcon, TriangleAlertIcon,
+  EllipsisVerticalIcon, ListChecksIcon, PlusIcon, SettingsIcon,
 } from 'lucide-react'
-import { CredentialCard } from '@/components/credential-card'
-import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { AppFooter } from '@/components/app-footer'
-import { OverviewMetric } from '@/components/overview-metric'
+import {
+  CREDENTIAL_PAGE_SIZES,
+  CredentialWorkspace,
+  type CredentialFilterKey,
+  type CredentialPageSize,
+  type CredentialViewMode,
+} from '@/components/credential-workspace'
+import type { SortDir, SortKey } from '@/components/credential-shared'
 import { LogoMark } from '@/components/logo-mark'
-import { BatchActionsBar } from '@/App'
 import { Button } from '@/components/ui/button'
-import { CardFrame } from '@/components/ui/card'
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
-import {
-  Menu, MenuItem, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuTrigger,
-} from '@/components/ui/menu'
-import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Table, TableBody, TableCaption } from '@/components/ui/table'
-import {
-  ToggleGroup, ToggleGroupItem, ToggleGroupSeparator,
-} from '@/components/ui/toggle-group'
+import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
-// 离线预览：造封禁/正常两条假数据，直接看 CredentialCard 渲染，不连后端。
-// 仅用于本地目视对比卡片布局，未接入 App/路由。
+// 离线预览：造封禁/正常两条假数据，通过生产共用的 CredentialWorkspace 验收，不连后端。
+// 设置页和弹窗仍由查询参数单独打开，账号工作区不再维护第二套组件树。
 
 const mq = window.matchMedia('(prefers-color-scheme: dark)')
 const applyTheme = (dark: boolean) => document.documentElement.classList.toggle('dark', dark)
@@ -65,13 +59,14 @@ const banned: Credential = {
   quota: {
     ts: now,
     unified_status: 'allowed',
+    // 覆盖「5h 已重置、7d 仍有用量」时两列保持同一排版节奏的回归场景。
     rl_5h_utilization: 0.82,
-    rl_5h_reset: now + 9 * 60,
-    rl_7d_utilization: 0.44,
+    rl_5h_reset: now - 60,
+    rl_7d_utilization: 0.76,
     rl_7d_reset: now + 3 * 24 * 3600,
     rl_representative: null,
-    cost_5h: 87.77,
-    cost_7d: 162.35,
+    cost_5h: 0.0086,
+    cost_7d: 0.055,
   },
 }
 
@@ -119,14 +114,6 @@ const previewSettings: SettingsSection | null = previewSettingsParam === 'forwar
   : previewSettingsParam === 'access'
     ? 'access'
     : null
-const previewView = previewParams.get('view') === 'list' ? 'list' : 'card'
-const previewBatch = previewParams.get('batch') === '1'
-const previewSelected = new Set([banned.id])
-const previewSortItems = [
-  { label: '优先级升序', value: 'priority' },
-  { label: '最近使用', value: 'recent' },
-  { label: '累计花费', value: 'cost' },
-]
 
 function navigatePreview(search = '') {
   window.location.assign(`${window.location.pathname}${search}`)
@@ -151,6 +138,60 @@ function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSect
       section={section}
       onSectionChange={changeSection}
       onBack={() => navigatePreview()}
+    />
+  )
+}
+
+function PreviewCredentialWorkspace() {
+  const [query, setQuery] = React.useState('')
+  const [filter, setFilter] = React.useState<CredentialFilterKey>('all')
+  const [sort, setSort] = React.useState<SortKey>('priority')
+  const [dir, setDir] = React.useState<SortDir>('asc')
+  const [view, setView] = React.useState<CredentialViewMode>(
+    previewParams.get('view') === 'list' ? 'list' : 'card',
+  )
+  const [batch, setBatch] = React.useState(previewParams.get('batch') === '1')
+  const [selected, setSelected] = React.useState<Set<number>>(
+    () => new Set(previewParams.get('batch') === '1' ? [banned.id] : []),
+  )
+  const [page, setPage] = React.useState(1)
+  const [pageSize, setPageSize] = React.useState<CredentialPageSize>(CREDENTIAL_PAGE_SIZES[0])
+
+  return (
+    <CredentialWorkspace
+      data={{
+        credentials: [banned, normal],
+        isLoading: false,
+        isError: false,
+        isRefetchError: false,
+        isFetching: false,
+      }}
+      state={{
+        query,
+        filter,
+        sort,
+        dir,
+        view,
+        batch,
+        selected,
+        page,
+        pageSize,
+      }}
+      actions={{
+        onQueryChange: setQuery,
+        onFilterChange: setFilter,
+        onSortChange: (key, nextDir) => {
+          setSort(key)
+          setDir(nextDir)
+        },
+        onViewChange: setView,
+        onBatchChange: setBatch,
+        onSelectedChange: setSelected,
+        onPageChange: setPage,
+        onPageSizeChange: setPageSize,
+        onRetry: () => undefined,
+        onAdd: () => navigatePreview('?dialog=add'),
+      }}
     />
   )
 }
@@ -199,21 +240,22 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <ToastProvider position="top-right">
-        <AnchoredToastProvider>
-          <div className="relative isolate min-h-dvh">
+        <TooltipProvider>
+          <AnchoredToastProvider>
+            <div className="relative isolate min-h-dvh">
             {previewSettings ? (
               <PreviewSettingsRoute initialSection={previewSettings} />
             ) : (
               <>
                 <div className="app-shell flex min-h-dvh flex-col text-foreground">
-                  <header className="app-header sticky top-0 z-20 border-b border-border bg-card/95 backdrop-blur">
+                  <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
                     <div className="page-frame flex h-16 items-center justify-between gap-3">
-                      <div className="flex items-center gap-2.5 sm:gap-3">
-                        <div className="brand-mark flex size-8 items-center justify-center rounded-lg text-brand-foreground">
+                      <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+                        <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
                           <LogoMark className="size-[1.125rem]" />
                         </div>
-                        <div>
-                          <div className="font-heading text-sm font-semibold leading-none">Luban</div>
+                        <div className="min-w-0">
+                          <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
                           <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">
                             Claude Code Gateway
                           </div>
@@ -221,9 +263,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                       </div>
 
                       <div className="flex items-center gap-2 sm:hidden">
-                        <Button size="icon" aria-label="添加账号" onClick={() => navigatePreview('?dialog=add')}><PlusIcon /></Button>
+                        <Button size="icon-lg" aria-label="添加账号" onClick={() => navigatePreview('?dialog=add')}><PlusIcon /></Button>
                         <Menu>
-                          <MenuTrigger render={<Button size="icon" variant="outline" aria-label="更多操作" />}>
+                          <MenuTrigger render={<Button size="icon-lg" variant="outline" aria-label="更多操作" />}>
                             <EllipsisVerticalIcon />
                           </MenuTrigger>
                           <MenuPopup align="end">
@@ -242,135 +284,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                   </header>
 
                   <main className="page-frame flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
-                    <div className="space-y-6 sm:space-y-8">
-                      <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="preview-page-title">
-                        <div className="min-w-0">
-                          <h1 id="preview-page-title" className="font-heading text-2xl font-semibold tracking-tight sm:text-3xl">
-                            账号调度中心
-                          </h1>
-                          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                            统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
-                          </p>
-                        </div>
-                        <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
-                          <span className="size-1.5 rounded-full bg-success" aria-hidden />
-                          每 30 秒自动刷新
-                        </div>
-                      </section>
-
-                      <CardFrame
-                        aria-label="账号池概览"
-                        className="grid grid-cols-2 overflow-hidden lg:grid-cols-4"
-                      >
-                        <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r lg:border-b-0" />
-                        <OverviewMetric label="需处理" value="1" status="1 异常" icon={TriangleAlertIcon} tone="bad" className="border-b lg:border-b-0 lg:border-r" />
-                        <OverviewMetric label="额度预警" value="0" icon={GaugeIcon} tone="neutral" className="border-r" />
-                        <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={SmartphoneIcon} tone="neutral" />
-                      </CardFrame>
-
-                      <section className="min-w-0" aria-labelledby="preview-account-list-title">
-                        <CardFrame className="min-w-0">
-                          <div className="relative grid gap-4 px-4 py-4 sm:px-6 xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center">
-                            <div className="min-w-0">
-                              <h2 id="preview-account-list-title" className="font-heading text-sm font-semibold">账号列表</h2>
-                              <p className="mt-1 text-sm text-muted-foreground">共 2 个账号</p>
-                            </div>
-
-                            <div className="min-w-0 space-y-2 xl:flex xl:items-center xl:justify-end xl:space-y-0">
-                              <InputGroup className="xl:mr-2 xl:w-56 2xl:w-64">
-                                <InputGroupAddon><SearchIcon aria-hidden /></InputGroupAddon>
-                                <InputGroupInput aria-label="搜索账号" placeholder="搜索名称或 #id" readOnly />
-                              </InputGroup>
-
-                              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
-                                <Menu>
-                                  <MenuTrigger render={<Button className="w-full sm:w-auto" variant="outline" />}>
-                                    <ListFilterIcon />全部
-                                  </MenuTrigger>
-                                  <MenuPopup align="end">
-                                    <MenuRadioGroup value="all">
-                                      <MenuRadioItem value="all">全部</MenuRadioItem>
-                                      <MenuRadioItem value="schedulable">可调度</MenuRadioItem>
-                                      <MenuRadioItem value="attention">需处理</MenuRadioItem>
-                                    </MenuRadioGroup>
-                                  </MenuPopup>
-                                </Menu>
-
-                                <Select items={previewSortItems} value="priority">
-                                  <SelectTrigger aria-label="账号排序" className="w-full min-w-0 sm:w-40">
-                                    <ArrowUpDownIcon />
-                                    <SelectValue />
-                                  </SelectTrigger>
-                                  <SelectPopup>
-                                    {previewSortItems.map((item) => (
-                                      <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-                                    ))}
-                                  </SelectPopup>
-                                </Select>
-
-                                <ToggleGroup
-                                  aria-label="账号视图"
-                                  className="w-full sm:w-fit"
-                                  value={[previewView]}
-                                  variant="outline"
-                                >
-                                  <ToggleGroupItem className="flex-1 sm:flex-none" value="card" aria-label="卡片视图">
-                                    <LayoutGridIcon />
-                                  </ToggleGroupItem>
-                                  <ToggleGroupSeparator />
-                                  <ToggleGroupItem className="flex-1 sm:flex-none" value="list" aria-label="紧凑列表视图">
-                                    <ListIcon />
-                                  </ToggleGroupItem>
-                                </ToggleGroup>
-
-                                <Button
-                                  className="w-full sm:w-auto"
-                                  variant={previewBatch ? 'secondary' : 'outline'}
-                                >
-                                  <ListChecksIcon />批量
-                                </Button>
-                              </div>
-                            </div>
-                          </div>
-
-                          {previewBatch && (
-                            <div className="relative border-t p-3 sm:px-6 sm:py-4">
-                              <BatchActionsBar
-                                all={[banned, normal]}
-                                selected={previewSelected}
-                                onSelectedChange={() => undefined}
-                                onClose={() => undefined}
-                              />
-                            </div>
-                          )}
-
-                          {previewView === 'list' && (
-                            <Table className="table-fixed" variant="card">
-                              <TableCaption className="sr-only">账号列表</TableCaption>
-                              <CredentialListHeader
-                                selectable={previewBatch}
-                                sort="priority"
-                                dir="asc"
-                                onSortChange={() => undefined}
-                                allSelected={false}
-                                onSelectAll={() => undefined}
-                              />
-                              <TableBody>
-                                <CredentialRow cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
-                                <CredentialRow cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
-                              </TableBody>
-                            </Table>
-                          )}
-                        </CardFrame>
-
-                        {previewView === 'card' && (
-                          <div className="mt-4 grid items-stretch gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))]">
-                            <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
-                            <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
-                          </div>
-                        )}
-                      </section>
-                    </div>
+                    <PreviewCredentialWorkspace />
                   </main>
                   <AppFooter />
                 </div>
@@ -380,8 +294,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
               </>
             )}
-          </div>
-        </AnchoredToastProvider>
+            </div>
+          </AnchoredToastProvider>
+        </TooltipProvider>
       </ToastProvider>
     </QueryClientProvider>
   </React.StrictMode>,

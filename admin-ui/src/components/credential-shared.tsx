@@ -3,11 +3,11 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  PencilIcon, RefreshCwIcon, SmartphoneIcon, Trash2Icon,
+  PencilIcon, RefreshCwIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
-  deleteCredential, probeCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel,
-  setPriority,
+  clearCooldown, deleteCredential, probeCredential, refreshCredential, setDeviceLimit,
+  setDisabled, setLabel, setPriority,
   type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import { cn, extractError, formatClockTime, formatFullTime } from '@/lib/utils'
@@ -91,7 +91,7 @@ export function isAbnormal(cred: Credential): boolean {
 
 export type SortKey =
   | 'priority' | 'status' | 'name' | 'tier'
-  | 'usage5h' | 'devices' | 'cost' | 'recent' | 'created'
+  | 'usage5h' | 'usage7d' | 'devices' | 'cost' | 'recent' | 'created'
 
 export type SortDir = 'asc' | 'desc'
 
@@ -102,6 +102,7 @@ export const SORTS: { key: SortKey; label: string }[] = [
   { key: 'name', label: '名称' },
   { key: 'tier', label: '套餐' },
   { key: 'usage5h', label: '5h 使用率' },
+  { key: 'usage7d', label: '7d 使用率' },
   { key: 'devices', label: '设备数' },
   { key: 'cost', label: '累计花费' },
   { key: 'recent', label: '最近使用' },
@@ -121,6 +122,7 @@ export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
   status: 'desc',
   tier: 'desc',
   usage5h: 'desc',
+  usage7d: 'desc',
   devices: 'desc',
   cost: 'desc',
   recent: 'desc',
@@ -164,6 +166,8 @@ function compareBy(key: SortKey, a: Credential, b: Credential): number {
       // 无额度数据、以及窗口已重置的（快照是上个周期的）一并垫底：升序时排最前、
       // 降序时排最后，不会混在真实数值中间。
       return (liveQuota(a).u5h ?? -1) - (liveQuota(b).u5h ?? -1)
+    case 'usage7d':
+      return (liveQuota(a).u7d ?? -1) - (liveQuota(b).u7d ?? -1)
     case 'devices':
       return a.device_count - b.device_count
     case 'cost':
@@ -232,8 +236,13 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onSuccess: () => { toastManager.add({ title: '已删除', type: 'success' }); invalidate() },
     onError: (e) => failure('删除失败', e),
   })
+  const cooldown = useMutation({
+    mutationFn: () => clearCooldown(cred.id),
+    onSuccess: () => { toastManager.add({ title: '已解除冷却', type: 'success' }); invalidate() },
+    onError: (e) => failure('解除冷却失败', e),
+  })
 
-  return { rename, toggle, prio, limit, refresh, remove }
+  return { rename, toggle, prio, limit, refresh, remove, cooldown }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
@@ -254,7 +263,7 @@ export function CredentialMenuContent({
   onTest: () => void
   onRequestDelete: () => void
 }) {
-  const { refresh, prio } = actions
+  const { refresh, prio, cooldown } = actions
   return (
     <MenuPopup align="end">
       <MenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
@@ -265,6 +274,12 @@ export function CredentialMenuContent({
         <ActivityIcon />
         连通性测试
       </MenuItem>
+      {cred.rate_limited_secs > 0 && (
+        <MenuItem onClick={() => cooldown.mutate()} disabled={cooldown.isPending}>
+          <TimerOffIcon />
+          解除冷却
+        </MenuItem>
+      )}
       <MenuItem onClick={onRename}>
         <PencilIcon />
         重命名

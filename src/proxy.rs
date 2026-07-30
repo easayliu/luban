@@ -170,7 +170,7 @@ pub async fn handle(
             _ => None,
         };
         let Some(info) = limited else { break (upstream, resp) };
-        // 额度真耗尽 → 冷却整个账号；窗口没跑满却被拒（实测只有 fable 这样）→ 只冷却这个模型。
+        // 基础窗口真耗尽 → 冷却整个账号；只有超额池（7d_oi）满或纯容量限制 → 只冷却这个模型。
         let scope = rate_limit_scope(&info, req_model.as_deref());
         let cooldown = info.cooldown(scope.account_level());
         tracing::warn!(
@@ -1859,9 +1859,9 @@ fn fill_cache_ttl(v: &mut serde_json::Value) {
 /// 一次 429 该冷却到什么范围，见 [`rate_limit_scope`]。
 #[derive(Debug, Clone, PartialEq)]
 enum LimitScope {
-    /// 额度真的耗尽：该账号所有模型一起让位。
+    /// 基础额度窗口真的耗尽：该账号所有模型一起让位。
     Account,
-    /// 窗口没跑满却被拒（模型容量限制）：只让这一个模型让位。
+    /// 只有这一个模型没路可走（容量限制，或它专用的超额池满了）：其余模型照常。
     Model(String),
 }
 
@@ -1886,38 +1886,52 @@ impl LimitScope {
     }
 }
 
-/// 判定一次 429 是「这个账号没额度了」还是「这个模型这会儿没容量」。
+/// 判定一次 429 是「这个账号没额度了」还是「只有这一个模型没路可走」。
 ///
-/// **规则是实测倒逼出来的**，一次真实的 fable-5 429 头长这样：
+/// **规则是实测倒逼出来的**，两次真实的 fable-5 429 头长这样（形态一致）：
 ///
 /// ```text
 /// unified-status: rejected                            ← 不是 "rate_limited"
 /// representative-claim: seven_day_overage_included     ← 指向 7d_oi
-/// 5h:    allowed,         utilization=0.08             ← 5h 几乎是空的
-/// 7d:    allowed_warning, utilization=0.76
-/// 7d_oi: rejected,        utilization=1.01             ← 真正满掉的是这个窗口
-/// retry-after: 228721
+/// 5h:    allowed,         utilization=0.20             ← 基础窗口很空
+/// 7d:    allowed,         utilization=0.70
+/// 7d_oi: rejected,        utilization=1.02             ← 满掉的只有「7 天含超额」
+/// overage-status: rejected（org_level_disabled）
+/// retry-after: 304802
 /// ```
 ///
-/// 第一版判定认死 `status == "rate_limited"` 且只看 5h/7d 两个窗口，于是把上面这条判成了
-/// 模型级——只冷却 fable 三十秒，放出去再撞，如此循环。两处教训都写在规则里：
+/// 演化了三版，每版的教训都写在规则里：
 ///
 /// 1. **状态词不止一个**：`rejected` 与 `rate_limited` 都算被拒（`allowed`/`allowed_warning`
-///    才是放行）。只认其中一个等于漏判。
-/// 2. **窗口名不能写死**：真正被拒的是 `7d_oi`（7 天含超额），代码里原本根本没解析它。
-///    故改成扫**所有** `unified-<窗口>-status/utilization`，任一被拒或 `utilization >= 1`
-///    即判账号级——不必知道窗口叫什么，也不必维护 `representative-claim` 到窗口名的映射
+///    才是放行）。第一版只认 `rate_limited`，漏判。
+/// 2. **窗口名不能写死**：被拒的是 `7d_oi`（7 天含超额），第一版根本没解析它。故扫**所有**
+///    `unified-<窗口>-status/utilization`，不必维护 `representative-claim` 到窗口名的映射
 ///    （`seven_day_overage_included` → `7d_oi` 这种对应关系纯属猜谜）。
+/// 3. **超额族窗口不算账号额度**：第二版把「任一窗口被拒/打满」一律判账号级，于是上面那条
+///    把整个账号冷却了 24 小时——可它满掉的只是**超额/回补池**（`7d_oi` 比基础 7d 的
+///    利用率还高，说明两边记的不是同一笔账；fable 走的正是这个池子，见
+///    [`config::CC_BETA_SIMULATED`] 里关于 `fallback-credit` 的注）。实测在 7d_oi 仍
+///    rejected 期间，同一账号的 sonnet/opus 连通性测试照常 200——账号好好的，只有 fable
+///    没路。故 `_oi`/`overage` 窗口被拒只判**模型级**，账号级只看基础窗口。
 ///
-/// 剩下的「所有窗口都还有余量却仍被拒」才是模型容量限制，只冷却该模型。请求体里读不出模型名
-/// 时退回账号级——没有模型可挂，宁可保守。
+/// `unified-status` 是**本次请求**的判决：fable 被超额池拒掉时它同样是 `rejected`，说明
+/// 不了账号整体，故只在没有任何逐窗口明细时才拿它兜底（保守判账号级）。模型级的冷却时长
+/// 优先吃 `retry-after`（两次实测都给了，直指池子重置时刻），不会重蹈「30 秒放出去反复撞」
+/// 的循环——那是早年时长不认 `retry-after` 的锅，不是作用域的。请求体里读不出模型名时
+/// 退回账号级——没有模型可挂，宁可保守。
 fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     let Some(model) = model else { return LimitScope::Account };
     let rejected = |s: &str| s.contains("rate_limited") || s.contains("rejected");
-    let quota_gone = info.unified_status.as_deref().is_some_and(rejected)
-        || info.window_status.iter().any(|(_, s)| rejected(s))
-        || info.window_utilization.iter().any(|(_, u)| *u >= 1.0);
-    if quota_gone { LimitScope::Account } else { LimitScope::Model(model.to_string()) }
+    let overage = |w: &str| w.ends_with("_oi") || w.contains("overage");
+    let base_gone = info.window_status.iter().any(|(w, s)| !overage(w) && rejected(s))
+        || info.window_utilization.iter().any(|(w, u)| !overage(w) && *u >= 1.0);
+    let no_detail = info.window_status.is_empty() && info.window_utilization.is_empty();
+    let unified_gone = no_detail && info.unified_status.as_deref().is_some_and(rejected);
+    if base_gone || unified_gone {
+        LimitScope::Account
+    } else {
+        LimitScope::Model(model.to_string())
+    }
 }
 
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
@@ -2359,6 +2373,12 @@ pub async fn probe(
                     "连通性测试遇上游 429，该号进入冷却"
                 );
                 state.store.mark_rate_limited(cred.id, scope.model(), cooldown);
+            } else if status.is_success() {
+                // 对称的另一面：测试成功同样照真实判决恢复——上游此刻放行了「这个账号 +
+                // 这个模型」，账号级与该模型的冷却都不再成立，当场解除，不必干等冷却到点
+                // （上游的 retry-after 偏保守时，好号会被白白晾着）。其它模型的格子不动：
+                // sonnet 通了证明不了 fable 通。
+                state.store.clear_rate_limited(cred.id, Some(model));
             }
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
@@ -3846,11 +3866,12 @@ mod tests {
         assert!(super::sim_device_id(Some(&sim), all_on(), &no_uuid, "fp").is_none());
     }
 
-    /// 429 作用域判定的回归用例，**头的取值逐字节取自一次真实的 fable-5 429**
-    /// （账号 5h 只用了 8%、7d 用了 76%，真正满掉的是 `7d_oi` = 1.01）。
+    /// 429 作用域判定的回归用例，**头的取值逐字节取自两次真实的 fable-5 429**
+    /// （基础 5h/7d 都有余量，满掉的只有 `7d_oi`——fable 专用的超额池）。
     ///
-    /// 这条用例存在的理由：第一版判定认死 `status == "rate_limited"` 且只看 5h/7d，
-    /// 会把它误判成「模型容量限制」，只冷却 fable 三十秒然后反复撞墙。
+    /// 这条用例存在的理由：第二版判定把「任一窗口被拒/打满」一律判账号级，于是 fable
+    /// 吃满超额池就把整个账号冷却 24 小时——实测 7d_oi 仍 rejected 期间同一账号的
+    /// sonnet/opus 照常 200，账号级冷却纯属误伤。见 [`super::rate_limit_scope`] 的演化史。
     #[test]
     fn rate_limit_scope_reads_every_window_not_just_5h_7d() {
         let hdr = |pairs: &[(&str, &str)]| {
@@ -3876,9 +3897,37 @@ mod tests {
             ("retry-after", "228721"),
         ]);
         let scope = super::rate_limit_scope(&real, fable);
-        assert!(scope.account_level(), "unified-status=rejected + 7d_oi 满 → 账号级");
-        // retry-after 优先，但夹到 24h：上游给的 63 小时不该原样吃下，也不该被砍成 6h。
-        assert_eq!(real.cooldown(true).as_secs(), 24 * 3600);
+        assert_eq!(scope.model(), fable, "只有超额池（7d_oi）满 → 模型级，账号其余模型照常");
+        // retry-after 优先（直指池子重置时刻），但夹到 24h：63 小时不该原样吃下。
+        assert_eq!(real.cooldown(false).as_secs(), 24 * 3600);
+
+        // 第二次抓包（2026-07-30，#54）：多了 overage-status 与 org_level_disabled，
+        // 判定应当相同。overage 窗口被拒同样不算账号级。
+        let real2 = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.7"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            ("retry-after", "304802"),
+        ]);
+        assert_eq!(super::rate_limit_scope(&real2, fable).model(), fable);
+
+        // 基础窗口自己满掉才是账号级：5h 被拒 → 所有模型一起让位。
+        let exhausted = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        assert!(super::rate_limit_scope(&exhausted, fable).account_level());
+        // 没有任何逐窗口明细时，unified-status=rejected 兜底判账号级——宁可保守。
+        let unified_only = hdr(&[("anthropic-ratelimit-unified-status", "rejected")]);
+        assert!(super::rate_limit_scope(&unified_only, fable).account_level());
 
         // 所有窗口都还有余量却被拒 → 这才是模型容量限制，只冷却该模型且不吃 reset。
         let far = crate::credentials::now_secs() as i64 + 4 * 3600;

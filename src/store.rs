@@ -110,14 +110,16 @@ impl BareRateWindow {
 
 /// 被上游 429 过的凭证的冷却表（**进程内，不落库**），按 `(账号, 模型)` 分格。
 ///
-/// **为什么要分模型**：实测只有 fable 会在账号窗口远未跑满时回 429——那不是额度耗尽，
-/// 是模型级的容量限制。把整个账号打进冷却等于因为一个模型不可用就把这个号的
-/// sonnet/opus 流量一起赶走，而那个号其实好好的。故冷却分两档，由
+/// **为什么要分模型**：实测只有 fable 会在账号基础窗口（5h/7d）远未跑满时回 429——
+/// 要么是模型级容量限制，要么是 fable 专用的超额池（`7d_oi`）吃满了，两种都不是账号
+/// 额度耗尽：同一时刻 sonnet/opus 在这个号上照常可用。把整个账号打进冷却等于因为一个
+/// 模型不可用就把这个号的其余流量一起赶走。故冷却分两档，由
 /// [`crate::proxy::rate_limit_scope`] 依限流头判定：
 ///
-/// - **账号级**（`model = None`）：额度确实耗尽（`unified-status: rate_limited` 或
-///   representative 窗口已满），该号所有模型一起让位；
-/// - **模型级**（`model = Some(m)`）：窗口没跑满却被拒，只让这个模型让位，其余照常。
+/// - **账号级**（`model = None`）：**基础窗口**被拒或打满（额度确实耗尽），该号所有
+///   模型一起让位；
+/// - **模型级**（`model = Some(m)`）：基础窗口都有余量却被拒（容量限制或超额池满），
+///   只让这个模型让位，其余照常。
 ///
 /// **和「停用」是两回事**：停用是人工/封号那种需要介入的终态，冷却到点自动恢复，
 /// 不写库、不进 `ban_reason`、控制台上也不该显示成账号出了问题。
@@ -164,6 +166,21 @@ impl RateLimitCooldown {
             }
         }
         hit
+    }
+
+    /// 解除冷却。`model` 指定时清账号级 + 该模型那格——用于连通性测试成功：上游此刻放行了
+    /// 「这个账号 + 这个模型」，这两格的冷却都不再成立，其它模型的格子不动（sonnet 通了
+    /// 证明不了 fable 通）。`None` 时清掉该凭证的**所有**格——用于手动解除：冷却只是选号
+    /// 提示，解除错了最坏也只是再撞一次 429、重新打上，和「全员冷却时忽略冷却」同一条哲学。
+    fn clear(&self, cred_id: i64, model: Option<&str>) {
+        let mut until = self.until.lock();
+        match model {
+            Some(m) => {
+                until.remove(&(cred_id, String::new()));
+                until.remove(&(cred_id, m.to_string()));
+            }
+            None => until.retain(|(id, _), _| *id != cred_id),
+        }
     }
 
     /// 账号级冷却的剩余秒数（未冷却返回 0），供控制台展示。
@@ -484,6 +501,12 @@ impl CredentialStore {
     /// 该凭证剩余冷却秒数（未冷却为 0），供控制台显示「限流中，X 后恢复」。
     pub fn rate_limited_secs(&self, cred_id: i64) -> i64 {
         self.cooldown.remaining_secs(cred_id)
+    }
+
+    /// 解除该凭证的限流冷却，见 [`RateLimitCooldown::clear`]：`Some(model)` 清账号级 +
+    /// 该模型格（连通性测试成功照真实判决恢复），`None` 清全部格（后台手动解除）。
+    pub fn clear_rate_limited(&self, cred_id: i64, model: Option<&str>) {
+        self.cooldown.clear(cred_id, model);
     }
 
     /// 上游 429 时最多换几个号重试；`0` 表示不重试（原样透传 429）。
@@ -2467,6 +2490,16 @@ mod tests {
         store.mark_rate_limited(a, None, Duration::from_secs(300));
         assert_eq!(pick("claude-sonnet-5"), b, "账号级冷却应挡下所有模型");
         assert!(store.rate_limited_secs(a) > 0);
+
+        // 连通性测试成功那种「带模型」的解除：清账号级 + 被测模型格，别的模型格不动。
+        store.clear_rate_limited(a, Some("claude-sonnet-5"));
+        assert_eq!(store.rate_limited_secs(a), 0, "账号级冷却应已解除");
+        assert_eq!(pick("claude-sonnet-5"), a, "被测模型应立即可用");
+        assert_eq!(pick("claude-fable-5"), b, "sonnet 通了证明不了 fable 通，那一格要留着");
+
+        // 手动解除：全部格一起清。
+        store.clear_rate_limited(a, None);
+        assert_eq!(pick("claude-fable-5"), a, "手动解除后所有模型都该回来");
     }
 
     /// 冷却是**选号提示**不是硬门禁：全部号都在冷却时照常选，不能把整个代理锁死。

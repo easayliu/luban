@@ -174,6 +174,12 @@ export async function refreshCredential(id: number): Promise<Credential> {
   return data
 }
 
+/** 手动解除限流冷却。冷却只是选号提示：解除错了，下一条请求撞上 429 会重新打上。 */
+export async function clearCooldown(id: number): Promise<Credential> {
+  const { data } = await api.delete<Credential>(`/credentials/${id}/cooldown`)
+  return data
+}
+
 /**
  * 一次测试从上游限流头读到的额度快照。
  *

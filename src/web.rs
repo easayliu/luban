@@ -108,6 +108,7 @@ pub async fn run(
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
+        .route("/credentials/{id}/cooldown", delete(clear_cooldown))
         .route("/usage", get(list_usage))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
@@ -569,6 +570,19 @@ async fn test_credential(
     }
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(proxy::probe(&state, &cred, model).await))
+}
+
+/// 手动解除该凭证的限流冷却（账号级 + 所有模型格一起清）。
+///
+/// 冷却只是选号提示：解除错了，下一条请求撞上 429 会重新打上，最坏多一次往返——所以这里
+/// 不做任何「确认上游真的恢复了」的前置校验，想稳妥的话入口旁边就是连通性测试。
+async fn clear_cooldown(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<CredentialView>, ApiError> {
+    state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    state.store.clear_rate_limited(id, None);
+    view_of(&state, id)
 }
 
 /// 读取单条并转为脱敏视图（含已绑定设备数）。

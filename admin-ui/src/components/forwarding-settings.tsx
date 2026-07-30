@@ -107,7 +107,9 @@ export function ForwardingSettingsContent() {
         <InfoIcon aria-hidden="true" />
         <AlertTitle>必要请求头不受影响</AlertTitle>
         <AlertDescription>
-          下列开关不影响必要的 <code className="font-mono text-foreground">Authorization</code> 注入。
+          <p>
+            下列开关不影响必要的 <code className="text-foreground">Authorization</code> 注入。
+          </p>
         </AlertDescription>
       </Alert>
 
@@ -180,7 +182,7 @@ export function ForwardingSettingsContent() {
             <>
               账号额度耗尽时冷却整个账号；只有当前模型受限时仅冷却该模型。默认分别冷却
               60 / 30 秒，并优先采用上游等待时间。换号会改绑有设备身份的请求，也可能降低缓存命中率；
-              达到重试上限或没有其他账号时返回 <code>429</code>。
+              达到重试上限或没有其他账号时返回 <code className="tabular-nums">429</code>。
             </>
           }
         />
@@ -321,7 +323,7 @@ function ForwardingToggle({
             影响与限制
             <ChevronDownIcon className="size-3 transition-transform group-open:rotate-180" />
           </summary>
-          <div className="mt-2 border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-foreground">
+          <div className="mt-2 border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
             {description}
           </div>
         </details>
