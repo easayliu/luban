@@ -479,7 +479,7 @@ export function ConnectivityTestDialog({
                     aria-pressed={model === m}
                     onClick={() => setModel(m)}
                   >
-                    <span className="font-mono">{m}</span>
+                    <span>{m}</span>
                   </Button>
                 ))}
               </div>
@@ -493,7 +493,7 @@ export function ConnectivityTestDialog({
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                   placeholder="如 claude-opus-5"
-                  className="min-w-0 flex-1 font-mono"
+                  className="min-w-0 flex-1"
                 />
                 <Button
                   type={probe.isPending ? 'button' : 'submit'}
@@ -537,13 +537,13 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
       <Alert variant={result.ok ? 'success' : 'error'}>
         <Icon aria-hidden />
         <AlertTitle className="flex flex-wrap items-center gap-2">
-          <span className="font-mono">{model}</span>
+          <span>{model}</span>
           <Badge variant={result.ok ? 'success' : 'error'} size="sm">
             {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
           </Badge>
           <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
           {result.model && result.model !== model && (
-            <span className="font-mono font-normal text-muted-foreground" title="上游实际使用的模型">
+            <span className="font-normal text-muted-foreground" title="上游实际使用的模型">
               → {result.model}
             </span>
           )}
@@ -552,7 +552,7 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
           {result.error && (
             <p className="break-words">
               {result.error_type && (
-                <span className="mr-1 font-mono text-destructive-foreground">{result.error_type}</span>
+                <span className="mr-1 text-destructive-foreground">{result.error_type}</span>
               )}
               {result.error}
             </p>
@@ -604,7 +604,6 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       {quota.unified_status && quota.unified_status !== 'allowed' && (
         <span
           className={cn(
-            'font-mono',
             quota.unified_status === 'rejected'
               ? 'text-destructive-foreground'
               : 'text-warning-foreground',

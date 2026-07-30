@@ -376,7 +376,7 @@ function DeviceList({
                 <CardHeader>
                   <CardTitle className="flex min-w-0 items-center gap-2">
                     <SmartphoneIcon className="shrink-0" />
-                    <span className="min-w-0 flex-1 truncate font-mono text-sm" title={device.device_id}>
+                    <span className="min-w-0 flex-1 truncate text-sm" title={device.device_id}>
                       {device.device_id}
                     </span>
                     <Button

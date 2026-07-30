@@ -93,8 +93,8 @@ function QuotaSkeleton() {
 
 function TableSkeletons({ selectable }: { selectable: boolean }) {
   const desktopColumns = selectable
-    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_7fr_7fr_9fr_25fr_9fr_12fr_8fr]'
-    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_7fr_7fr_9fr_25fr_9fr_12fr_8fr]'
+    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_8fr_7fr_9fr_25fr_9fr_12fr_8fr]'
+    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_8fr_7fr_9fr_25fr_9fr_12fr_8fr]'
 
   return (
     <div className="overflow-hidden">
@@ -103,14 +103,14 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
           <div className="flex justify-center">
             {selectable && <Skeleton className="size-4" />}
           </div>
-          <div className="px-3"><Skeleton className="h-3 w-14" /></div>
-          <div className="flex justify-center px-2"><Skeleton className="h-3 w-10" /></div>
-          <div className="flex justify-center px-2"><Skeleton className="h-3 w-12" /></div>
-          <div className="px-2"><Skeleton className="h-3 w-14" /></div>
-          <div className="px-3"><Skeleton className="h-3 w-10" /></div>
-          <div className="px-2"><Skeleton className="h-3 w-10" /></div>
-          <div className="px-2"><Skeleton className="h-3 w-14" /></div>
-          <div className="flex justify-end px-3"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-12" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
         </div>
         <div className="divide-y">
           {Array.from({ length: 8 }, (_, index) => (
@@ -121,28 +121,23 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
               <div className="flex justify-center">
                 {selectable && <Skeleton className="size-4" />}
               </div>
-              <div className="min-w-0 px-3">
-                <div className="flex min-w-0 items-center gap-3">
-                  <Skeleton className="size-10 shrink-0 rounded-full" />
-                  <div className="min-w-0 flex-1 space-y-2">
-                    <Skeleton className="h-3.5 w-4/5" />
-                    <div className="flex items-center gap-2">
-                      <Skeleton className="h-2.5 w-12" />
-                      <Skeleton className="h-2.5 w-16" />
-                    </div>
-                  </div>
+              <div className="min-w-0 space-y-2 px-2.5">
+                <Skeleton className="h-3.5 w-4/5" />
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-2.5 w-12" />
+                  <Skeleton className="h-2.5 w-16" />
                 </div>
               </div>
-              <div className="flex justify-center px-2">
+              <div className="px-2.5">
                 <Skeleton className="h-5 w-9 rounded-full" />
               </div>
-              <div className="flex justify-center px-2">
+              <div className="px-2.5">
                 <Skeleton className="h-4 w-8" />
               </div>
-              <div className="px-2">
+              <div className="px-2.5">
                 <Skeleton className="h-6 w-16 rounded-md" />
               </div>
-              <div className="grid min-w-0 grid-cols-2 gap-4 px-3">
+              <div className="grid min-w-0 grid-cols-2 gap-4 px-2.5">
                 {Array.from({ length: 2 }, (_, quotaIndex) => (
                   <div key={quotaIndex} className="min-w-0 space-y-2">
                     <div className="flex items-center justify-between gap-2">
@@ -153,14 +148,14 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
                   </div>
                 ))}
               </div>
-              <div className="min-w-0 space-y-1.5 px-2">
+              <div className="min-w-0 space-y-1.5 px-2.5">
                 <Skeleton className="h-3 w-10" />
                 <Skeleton className="h-2.5 w-8" />
               </div>
-              <div className="min-w-0 px-2">
+              <div className="min-w-0 px-2.5">
                 <Skeleton className="h-3 w-14" />
               </div>
-              <div className="flex justify-end px-3">
+              <div className="px-2.5">
                 <Skeleton className="h-4 w-14" />
               </div>
             </div>
@@ -173,7 +168,6 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
           <div key={index} className="px-4 py-4 sm:px-5">
             <div className="flex items-start gap-3">
               {selectable && <Skeleton className="mt-3 size-4 shrink-0" />}
-              <Skeleton className="size-10 shrink-0 rounded-full" />
               <div className="min-w-0 flex-1 space-y-2">
                 <div className="flex items-center gap-2">
                   <Skeleton className="h-4 w-3/5" />
@@ -181,10 +175,7 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
                 </div>
                 <Skeleton className="h-3 w-20" />
               </div>
-              <div className="flex shrink-0 flex-col items-end gap-1.5">
-                <Skeleton className="h-2.5 w-7" />
-                <Skeleton className="h-5 w-9 rounded-full" />
-              </div>
+              <Skeleton className="h-5 w-9 shrink-0 rounded-full" />
             </div>
 
             <div className="mt-4 grid grid-cols-2 gap-4 border-t border-border/70 pt-4">
@@ -199,9 +190,9 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
               ))}
             </div>
 
-            <div className="mt-4 grid grid-cols-3 divide-x divide-border/70 border-t border-border/70 pt-4">
+            <div className="mt-4 grid grid-cols-2 gap-4 border-t border-border/70 pt-4 sm:grid-cols-3">
               {Array.from({ length: 3 }, (_, factIndex) => (
-                <div key={factIndex} className="min-w-0 px-3 first:pl-0 last:pr-0">
+                <div key={factIndex} className="min-w-0">
                   <Skeleton className="h-2.5 w-12" />
                   <Skeleton className="mt-2 h-3 w-14" />
                 </div>

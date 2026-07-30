@@ -170,12 +170,11 @@ export function AccessSettingsContent() {
           <Field className="p-5">
             <FieldLabel>
               接入地址
-              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
+              <code className="text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
             </FieldLabel>
             <InputGroup>
               <InputGroupInput
                 aria-label="接入地址"
-                className="font-mono"
                 readOnly
                 value={baseUrl}
               />
@@ -188,12 +187,11 @@ export function AccessSettingsContent() {
           <Field className="p-5">
             <FieldLabel>
               接入 Key
-              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
+              <code className="text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
             </FieldLabel>
             <InputGroup>
               <InputGroupInput
                 aria-label="接入 Key"
-                className="font-mono"
                 onChange={(event) => setDraft(event.target.value)}
                 placeholder={envManaged ? '' : '留空则不校验来访'}
                 readOnly={envManaged}
@@ -242,7 +240,7 @@ export function AccessSettingsContent() {
             )}
             {envManaged && (
               <FieldDescription>
-                由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
+                由环境变量 <code>LUBAN_API_KEY</code> 接管，网页只读。
               </FieldDescription>
             )}
           </Field>
@@ -250,7 +248,7 @@ export function AccessSettingsContent() {
           <Field className="p-5">
             <FieldLabel>Claude Code 接入片段</FieldLabel>
             <div className="relative w-full min-w-0">
-              <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 pr-10 font-mono text-xs leading-5">
+              <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 pr-10 text-xs leading-5">
                 {snippet}
               </pre>
               <div className="absolute right-2 top-2">
@@ -630,7 +628,7 @@ function AdminPassword() {
         <FieldLabel>管理密码（登录网页所需）</FieldLabel>
         {envManaged ? (
           <FieldDescription>
-            由环境变量 <code className="font-mono">LUBAN_ADMIN_PASSWORD</code> 接管，网页只读。
+            由环境变量 <code>LUBAN_ADMIN_PASSWORD</code> 接管，网页只读。
           </FieldDescription>
         ) : (
           <>

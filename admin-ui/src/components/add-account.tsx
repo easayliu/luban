@@ -158,7 +158,7 @@ export function AddAccount({
                   value={code}
                   onChange={(event) => setCode(event.target.value)}
                   placeholder="粘贴完整的 code#state"
-                  className="min-h-24 font-mono"
+                  className="min-h-24"
                   required
                 />
                 <FieldDescription>请粘贴 Claude 授权完成后返回的完整内容。</FieldDescription>

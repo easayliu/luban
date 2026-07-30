@@ -146,9 +146,9 @@ export function CredentialCard({
                 <AvatarFallback>{initial}</AvatarFallback>
               </Avatar>
               <div className="min-w-0 flex-1">
-                <span className="block truncate" title={cred.label}>{cred.label}</span>
+                <span className="block break-all leading-snug" title={cred.label}>{cred.label}</span>
                 <CardDescription className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal">
-                  <span className="font-mono">#{cred.id}</span>
+                  <span className="tabular-nums">#{cred.id}</span>
                   <span aria-hidden>·</span>
                   <span
                     className="inline-flex items-center gap-1"

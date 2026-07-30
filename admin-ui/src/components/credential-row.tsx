@@ -32,14 +32,14 @@ import { cn, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
 
 const COL = {
   select: 'w-3',
-  account: 'w-[22%] text-left',
-  schedule: 'w-[8%] text-center',
-  priority: 'w-[7%] text-center',
-  tier: 'w-[9%] text-left',
-  quota: 'w-[25%] text-left',
-  devices: 'w-[9%] text-left',
-  recent: 'w-[12%] text-left',
-  cost: 'w-[8%] text-right',
+  account: 'w-[22%]',
+  schedule: 'w-[8%]',
+  priority: 'w-[7%]',
+  tier: 'w-[9%]',
+  quota: 'w-[25%]',
+  devices: 'w-[9%]',
+  recent: 'w-[12%]',
+  cost: 'w-[8%]',
 } as const
 
 export function CredentialListHeader({
@@ -57,7 +57,7 @@ export function CredentialListHeader({
   allSelected?: boolean
   onSelectAll?: (next: boolean) => void
 }) {
-  const sortable = (label: string, key: SortKey, align: 'left' | 'center' | 'right' = 'left') => {
+  const sortable = (label: string, key: SortKey) => {
     const active = sort === key
     const Arrow = active && dir === 'asc' ? ChevronUpIcon : ChevronDownIcon
 
@@ -67,11 +67,7 @@ export function CredentialListHeader({
         size="xs"
         variant="ghost"
         onClick={() => onSortChange(key)}
-        className={cn(
-          'w-full justify-start',
-          align === 'center' && 'justify-center',
-          align === 'right' && 'justify-end',
-        )}
+        className="w-full justify-start px-0 text-left sm:text-sm"
         title={active ? `按${label}排序（点击切换升降序）` : `按${label}排序`}
       >
         {label}
@@ -94,27 +90,27 @@ export function CredentialListHeader({
             />
           )}
         </TableHead>
-        <TableHead className={cn(COL.account, 'px-3')} {...sortProps('name')}>
+        <TableHead className={COL.account} {...sortProps('name')}>
           {sortable('账号', 'name')}
         </TableHead>
-        <TableHead className={cn(COL.schedule, 'px-2')}>调度</TableHead>
-        <TableHead className={cn(COL.priority, 'px-2')} {...sortProps('priority')}>
-          {sortable('优先级', 'priority', 'center')}
+        <TableHead className={COL.schedule}>调度</TableHead>
+        <TableHead className={COL.priority} {...sortProps('priority')}>
+          {sortable('优先级', 'priority')}
         </TableHead>
-        <TableHead className={cn(COL.tier, 'px-2')} {...sortProps('tier')}>
+        <TableHead className={COL.tier} {...sortProps('tier')}>
           {sortable('账号等级', 'tier')}
         </TableHead>
-        <TableHead className={cn(COL.quota, 'px-3')} {...sortProps('usage5h')}>
+        <TableHead className={COL.quota} {...sortProps('usage5h')}>
           {sortable('额度', 'usage5h')}
         </TableHead>
-        <TableHead className={cn(COL.devices, 'px-2')} {...sortProps('devices')}>
+        <TableHead className={COL.devices} {...sortProps('devices')}>
           {sortable('设备', 'devices')}
         </TableHead>
-        <TableHead className={cn(COL.recent, 'px-2')} {...sortProps('recent')}>
+        <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable('最近使用', 'recent')}
         </TableHead>
-        <TableHead className={cn(COL.cost, 'px-3')} {...sortProps('cost')}>
-          {sortable('累计花费', 'cost', 'right')}
+        <TableHead className={COL.cost} {...sortProps('cost')}>
+          {sortable('累计花费', 'cost')}
         </TableHead>
       </TableRow>
     </TableHeader>
@@ -155,8 +151,8 @@ export function CredentialRow({
               )}
               <div className="min-w-0 flex-1">
                 <div className="flex min-w-0 items-center gap-2">
-                  <h3 className="truncate font-semibold text-sm" title={cred.label}>{cred.label}</h3>
-                  <span className="shrink-0 font-mono text-xs text-muted-foreground">#{cred.id}</span>
+                  <h3 className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>{cred.label}</h3>
+                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
                 </div>
                 <p
                   className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground"
@@ -175,7 +171,7 @@ export function CredentialRow({
             </div>
 
             <dl className="grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-3">
-              <MobileFact label="优先级"><span className="font-mono">P{cred.priority}</span></MobileFact>
+              <MobileFact label="优先级"><span className="tabular-nums">P{cred.priority}</span></MobileFact>
               <MobileFact label="账号等级">
                 {cred.tier
                   ? <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>
@@ -208,12 +204,12 @@ export function CredentialRow({
             />
           )}
         </TableCell>
-        <TableCell className={cn(COL.account, 'whitespace-normal px-3 py-3')}>
+        <TableCell className={cn(COL.account, 'whitespace-normal')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">
                 <span className="truncate font-semibold text-sm" title={cred.label}>{cred.label}</span>
-                <span className="shrink-0 font-mono text-xs text-muted-foreground">#{cred.id}</span>
+                <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
               </div>
               <span className="text-xs text-muted-foreground" title={`添加于 ${formatFullTime(cred.created_at)}`}>
                 添加于 {added}
@@ -221,26 +217,26 @@ export function CredentialRow({
             </div>
           </div>
         </TableCell>
-        <TableCell className={cn(COL.schedule, 'px-2 py-3 text-center')}>
+        <TableCell className={COL.schedule}>
           <ScheduleControl cred={cred} actions={actions} />
         </TableCell>
-        <TableCell className={cn(COL.priority, 'px-2 py-3 text-center')}>
-          <span className="font-mono font-semibold text-sm" title="数值越小，调度优先级越高">
+        <TableCell className={COL.priority}>
+          <span className="font-semibold text-sm tabular-nums" title="数值越小，调度优先级越高">
             P{cred.priority}
           </span>
         </TableCell>
-        <TableCell className={cn(COL.tier, 'px-2 py-3')}>
+        <TableCell className={COL.tier}>
           {cred.tier
             ? <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>
             : <span className="text-muted-foreground">—</span>}
         </TableCell>
-        <TableCell className={cn(COL.quota, 'px-3 py-3')}>
+        <TableCell className={COL.quota}>
           <div className="grid grid-cols-2 gap-4">
             <ListQuotaMeter label="5h" util={u5h} reset={cred.quota?.rl_5h_reset ?? null} />
             <ListQuotaMeter label="7d" util={u7d} reset={cred.quota?.rl_7d_reset ?? null} />
           </div>
         </TableCell>
-        <TableCell className={cn(COL.devices, 'px-2 py-3')}>
+        <TableCell className={COL.devices}>
           <Button
             type="button"
             size="xs"
@@ -253,10 +249,10 @@ export function CredentialRow({
             <Badge variant={policy.variant} size="sm">{policy.label}</Badge>
           </Button>
         </TableCell>
-        <TableCell className={cn(COL.recent, 'px-2 py-3 text-sm')}>
+        <TableCell className={COL.recent}>
           {cred.last_used != null ? relativeTime(cred.last_used) : '未使用'}
         </TableCell>
-        <TableCell className={cn(COL.cost, 'px-3 py-3 text-right')}>
+        <TableCell className={COL.cost}>
           <span className="tabular-nums font-medium text-sm" title="累计等价 API 费用">
             {formatUsd(cred.cost_total)}
           </span>
@@ -282,7 +278,7 @@ function ScheduleControl({
 }) {
   const { toggle } = actions
   return (
-    <div className="flex shrink-0 items-center justify-center gap-2">
+    <div className="flex shrink-0 items-center justify-start gap-2">
       <div className="flex items-center gap-2">
         {toggle.isPending && <Spinner />}
         <Switch
