@@ -3,10 +3,14 @@ import {
   CalendarDaysIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  EllipsisIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import {
+  ConnectivityTestDialog,
+  CredentialMenuContent,
+  DeleteCredentialDialog,
   liveQuota,
   isNearLimit,
   statusMeta,
@@ -18,8 +22,20 @@ import {
   type SortKey,
 } from '@/components/credential-shared'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Dialog,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Field, FieldLabel } from '@/components/ui/field'
+import { Form } from '@/components/ui/form'
+import { Input } from '@/components/ui/input'
 import {
   Meter,
   MeterIndicator,
@@ -29,6 +45,7 @@ import {
 } from '@/components/ui/meter'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
+import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
@@ -39,11 +56,12 @@ const COL = {
   schedule: 'w-[10%]',
   priority: 'w-[7%]',
   tier: 'w-[9%]',
-  quota5h: 'w-[12%]',
-  quota7d: 'w-[11%]',
+  quota5h: 'w-[11%]',
+  quota7d: 'w-[10%]',
   devices: 'w-[9%]',
-  recent: 'w-[12%]',
-  cost: 'w-[8%]',
+  recent: 'w-[11%]',
+  cost: 'w-[7%]',
+  action: 'w-[4%]',
 } as const
 
 export function CredentialListHeader({
@@ -119,6 +137,9 @@ export function CredentialListHeader({
         <TableHead className={COL.cost} {...sortProps('cost')}>
           {sortable('累计花费', 'cost')}
         </TableHead>
+        <TableHead className={COL.action}>
+          <span className="sr-only">操作</span>
+        </TableHead>
       </TableRow>
     </TableHeader>
   )
@@ -136,6 +157,10 @@ export function CredentialRow({
   onSelectedChange?: (next: boolean) => void
 }) {
   const [devicesOpen, setDevicesOpen] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [renameName, setRenameName] = useState(cred.label)
+  const [testing, setTesting] = useState(false)
   const actions = useCredentialActions(cred)
   const { u5h, u7d } = liveQuota(cred)
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
@@ -145,7 +170,7 @@ export function CredentialRow({
   return (
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
-        <TableCell colSpan={10} className="whitespace-normal p-0">
+        <TableCell colSpan={11} className="whitespace-normal p-0">
           <article className="space-y-4 p-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
@@ -169,7 +194,20 @@ export function CredentialRow({
                   添加于 {added}
                 </p>
               </div>
-              <ScheduleControl cred={cred} actions={actions} />
+              <div className="flex shrink-0 items-start gap-1">
+                <ScheduleControl cred={cred} actions={actions} />
+                <CredentialRowActionsMenu
+                  cred={cred}
+                  actions={actions}
+                  onRename={() => {
+                    setRenameName(cred.label)
+                    setRenameOpen(true)
+                  }}
+                  onDeviceLimit={() => setDevicesOpen(true)}
+                  onTest={() => setTesting(true)}
+                  onRequestDelete={() => setConfirmDelete(true)}
+                />
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-4 border-t pt-4">
@@ -288,6 +326,19 @@ export function CredentialRow({
             {formatUsd(cred.cost_total)}
           </span>
         </TableCell>
+        <TableCell className={cn(COL.action, 'text-right')}>
+          <CredentialRowActionsMenu
+            cred={cred}
+            actions={actions}
+            onRename={() => {
+              setRenameName(cred.label)
+              setRenameOpen(true)
+            }}
+            onDeviceLimit={() => setDevicesOpen(true)}
+            onTest={() => setTesting(true)}
+            onRequestDelete={() => setConfirmDelete(true)}
+          />
+        </TableCell>
       </TableRow>
 
       <CredentialDevicesDialog
@@ -296,7 +347,129 @@ export function CredentialRow({
         onOpenChange={setDevicesOpen}
         limit={actions.limit}
       />
+      <DeleteCredentialDialog
+        cred={cred}
+        actions={actions}
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+      />
+      <RenameCredentialDialog
+        cred={cred}
+        actions={actions}
+        name={renameName}
+        onNameChange={setRenameName}
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+      />
+      <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
     </>
+  )
+}
+
+function CredentialRowActionsMenu({
+  cred,
+  actions,
+  onRename,
+  onDeviceLimit,
+  onTest,
+  onRequestDelete,
+}: {
+  cred: Credential
+  actions: CredentialActions
+  onRename: () => void
+  onDeviceLimit: () => void
+  onTest: () => void
+  onRequestDelete: () => void
+}) {
+  return (
+    <Menu modal={false}>
+      <MenuTrigger
+        className={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
+        aria-label={`打开 ${cred.label} 操作菜单`}
+        title="账号操作"
+      >
+        <EllipsisIcon />
+      </MenuTrigger>
+      <CredentialMenuContent
+        cred={cred}
+        actions={actions}
+        onRename={onRename}
+        onDeviceLimit={onDeviceLimit}
+        onTest={onTest}
+        onRequestDelete={onRequestDelete}
+      />
+    </Menu>
+  )
+}
+
+function RenameCredentialDialog({
+  cred,
+  actions,
+  name,
+  onNameChange,
+  open,
+  onOpenChange,
+}: {
+  cred: Credential
+  actions: CredentialActions
+  name: string
+  onNameChange: (name: string) => void
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const normalizedName = name.trim()
+  const unchanged = normalizedName === cred.label.trim()
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup className="sm:max-w-md" showCloseButton={false}>
+        <Form
+          className="contents"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (!normalizedName || unchanged) return
+            actions.rename.mutate(normalizedName, {
+              onSuccess: () => onOpenChange(false),
+            })
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>重命名账号</DialogTitle>
+            <DialogDescription>
+              修改列表中显示的账号名称，不会变更上游凭证。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel>
+            <Field>
+              <FieldLabel htmlFor={`credential-name-${cred.id}`}>账号名称</FieldLabel>
+              <Input
+                id={`credential-name-${cred.id}`}
+                value={name}
+                onChange={(event) => onNameChange(event.target.value)}
+                autoFocus
+              />
+            </Field>
+          </DialogPanel>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={actions.rename.isPending}
+              onClick={() => onOpenChange(false)}
+            >
+              取消
+            </Button>
+            <Button
+              type="submit"
+              loading={actions.rename.isPending}
+              disabled={!normalizedName || unchanged}
+            >
+              保存
+            </Button>
+          </DialogFooter>
+        </Form>
+      </DialogPopup>
+    </Dialog>
   )
 }
 

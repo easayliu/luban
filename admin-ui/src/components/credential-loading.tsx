@@ -30,7 +30,7 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
     <div className="grid items-stretch gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))]">
       {Array.from({ length: 4 }, (_, index) => (
         <Card key={index} className="@container/card h-full overflow-hidden">
-          <CardHeader>
+          <CardHeader className="p-5 pb-4">
             <CardTitle>
               <div className="flex items-center gap-3">
                 {selectable && <Skeleton className="size-4 shrink-0" />}
@@ -47,14 +47,11 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
             <CardAction><Skeleton className="size-8" /></CardAction>
           </CardHeader>
 
-          <CardPanel className="space-y-5">
+          <CardPanel className="space-y-4 px-5 pb-5">
             <div className="flex items-center gap-2">
               <Skeleton className="h-5 w-16" />
               <Skeleton className="h-5 w-9" />
               <Skeleton className="ml-auto h-4 w-24" />
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <Skeleton className="h-4 w-16" />
             </div>
             <div className="grid gap-5 @sm/card:grid-cols-2">
               <QuotaSkeleton />
@@ -62,7 +59,7 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
             </div>
           </CardPanel>
 
-          <CardFooter className="mt-auto justify-between gap-3 border-t bg-muted/32">
+          <CardFooter className="mt-auto justify-between gap-3 border-t bg-muted/32 px-5 py-4">
             <Skeleton className="h-8 w-28" />
             <div className="flex items-center gap-2">
               <Skeleton className="h-5 w-16" />
@@ -93,8 +90,8 @@ function QuotaSkeleton() {
 
 function TableSkeletons({ selectable }: { selectable: boolean }) {
   const desktopColumns = selectable
-    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_10fr_7fr_9fr_12fr_11fr_9fr_12fr_8fr]'
-    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_10fr_7fr_9fr_12fr_11fr_9fr_12fr_8fr]'
+    ? 'grid-cols-[2.5rem_minmax(10rem,22fr)_10fr_7fr_9fr_11fr_10fr_9fr_11fr_7fr_4fr]'
+    : 'grid-cols-[0.75rem_minmax(10rem,22fr)_10fr_7fr_9fr_11fr_10fr_9fr_11fr_7fr_4fr]'
 
   return (
     <div className="overflow-hidden">
@@ -112,6 +109,7 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
           <div className="px-2.5"><Skeleton className="h-3 w-10" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
           <div className="px-2.5"><Skeleton className="h-3 w-14" /></div>
+          <div className="px-2.5" />
         </div>
         <div className="divide-y">
           {Array.from({ length: 8 }, (_, index) => (
@@ -157,6 +155,9 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
               <div className="px-2.5">
                 <Skeleton className="h-4 w-14" />
               </div>
+              <div className="flex justify-end px-2.5">
+                <Skeleton className="size-6 rounded-md" />
+              </div>
             </div>
           ))}
         </div>
@@ -174,7 +175,13 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
                 </div>
                 <Skeleton className="h-3 w-20" />
               </div>
-              <Skeleton className="h-5 w-9 shrink-0 rounded-full" />
+              <div className="flex shrink-0 items-start gap-1">
+                <div className="flex flex-col items-end gap-3">
+                  <Skeleton className="h-5 w-9 rounded-full" />
+                  <Skeleton className="h-5 w-14 rounded-md" />
+                </div>
+                <Skeleton className="size-7 rounded-md" />
+              </div>
             </div>
 
             <div className="mt-4 grid grid-cols-2 gap-4 border-t border-border/70 pt-4">

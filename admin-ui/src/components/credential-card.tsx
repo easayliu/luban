@@ -4,7 +4,6 @@ import {
   CheckIcon,
   EllipsisIcon,
   SmartphoneIcon,
-  TriangleAlertIcon,
   XIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
@@ -27,10 +26,9 @@ import {
   useCredentialActions,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { Badge, badgeVariants } from '@/components/ui/badge'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Card,
@@ -53,6 +51,7 @@ import {
 } from '@/components/ui/meter'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function CredentialCard({
   cred,
@@ -76,6 +75,14 @@ export function CredentialCard({
   const { u5h, u7d } = liveQuota(cred)
   const nearLimit = isNearLimit(cred)
   const status = statusMeta(cred, nearLimit)
+  const statusDetail = cred.ban_reason
+    || (cred.disabled
+      ? '账号已停用，不参与调度'
+      : cred.rate_limited_secs > 0
+        ? `账号约 ${Math.max(1, Math.ceil(cred.rate_limited_secs / 60))} 分钟后恢复调度`
+        : nearLimit
+          ? '5 小时或 7 天额度使用率已达到 90%'
+          : '账号运行正常，可参与调度')
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
   const has5h = cred.quota?.rl_5h_utilization != null
   const has7d = cred.quota?.rl_7d_utilization != null
@@ -93,7 +100,7 @@ export function CredentialCard({
         selected && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
       )}
     >
-      <CardHeader>
+      <CardHeader className="p-5 pb-4">
         <CardTitle className="min-w-0">
           {editing ? (
             <Form
@@ -167,7 +174,8 @@ export function CredentialCard({
           <CardAction>
             <Menu modal={false}>
               <MenuTrigger
-                render={<Button size="icon" variant="ghost" aria-label={`打开 ${cred.label} 菜单`} />}
+                className={buttonVariants({ size: 'icon', variant: 'ghost' })}
+                aria-label={`打开 ${cred.label} 菜单`}
               >
                 <EllipsisIcon />
               </MenuTrigger>
@@ -187,7 +195,7 @@ export function CredentialCard({
         )}
       </CardHeader>
 
-      <CardPanel className="space-y-5">
+      <CardPanel className="space-y-4 px-5 pb-5">
         <div className="flex flex-wrap items-center gap-2">
           {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
           <Badge variant="outline" title="调度优先级，数值越小越优先">
@@ -199,16 +207,6 @@ export function CredentialCard({
             </span>
           )}
         </div>
-
-        {cred.ban_reason && (
-          <Alert variant="error">
-            <TriangleAlertIcon />
-            <AlertTitle>账号认证异常</AlertTitle>
-            <AlertDescription>
-              <p className="line-clamp-2 break-words" title={cred.ban_reason}>{cred.ban_reason}</p>
-            </AlertDescription>
-          </Alert>
-        )}
 
         <section aria-label="额度使用" className="space-y-3">
           <div className="flex items-center justify-between gap-3">
@@ -242,7 +240,7 @@ export function CredentialCard({
         </section>
       </CardPanel>
 
-      <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32">
+      <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-5 py-4">
         <Button
           type="button"
           variant="ghost"
@@ -255,7 +253,15 @@ export function CredentialCard({
           <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
         </Button>
         <div className="flex items-center gap-2">
-          <Badge variant={status.variant}>{status.label}</Badge>
+          <Tooltip>
+            <TooltipTrigger
+              className={badgeVariants({ variant: status.variant })}
+              aria-label={`${status.label}：${statusDetail}`}
+            >
+              {status.label}
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 break-words">{statusDetail}</TooltipPopup>
+          </Tooltip>
           {toggle.isPending && <Spinner />}
           <Switch
             checked={!cred.disabled}
