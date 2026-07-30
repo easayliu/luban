@@ -2,10 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
-  ArrowPathIcon, TrashIcon, PencilIcon, ChevronUpIcon, ChevronDownIcon,
-  DevicePhoneMobileIcon, SignalIcon, CheckCircleIcon, XCircleIcon,
-} from '@heroicons/react/24/outline'
-import { toast } from 'sonner'
+  ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
+  PencilIcon, RefreshCwIcon, SmartphoneIcon, Trash2Icon,
+} from 'lucide-react'
 import {
   deleteCredential, probeCredential, refreshCredential, setDeviceLimit, setDisabled, setLabel,
   setPriority,
@@ -13,14 +12,23 @@ import {
 } from '@/api/credentials'
 import { cn, extractError, formatClockTime, formatFullTime } from '@/lib/utils'
 import {
-  DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
-} from '@/components/ui/dropdown-menu'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+  AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
+  AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import type { BadgeProps } from '@/components/ui/badge'
+import { Badge } from '@/components/ui/badge'
 import {
-  Dialog, DialogBody, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+  Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { MenuItem, MenuPopup, MenuSeparator, MenuShortcut } from '@/components/ui/menu'
+import { Spinner } from '@/components/ui/spinner'
+import { toastManager } from '@/components/ui/toast'
 
 /** 设备上限输入框的初值：跟随默认→空串；明确不限→0；独立上限→数值。 */
 export function limitToInput(deviceLimit: number): string {
@@ -188,36 +196,41 @@ export function sortCreds(list: Credential[], key: SortKey, dir: SortDir): Crede
 export function useCredentialActions(cred: Credential, onRenamed?: () => void, onLimitSaved?: () => void) {
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['credentials'] })
+  const failure = (title: string, error: unknown) => toastManager.add({
+    title,
+    description: extractError(error),
+    type: 'error',
+  })
 
   const rename = useMutation({
     mutationFn: (label: string) => setLabel(cred.id, label),
     onSuccess: () => { onRenamed?.(); invalidate() },
-    onError: (e) => toast.error('重命名失败', { description: extractError(e) }),
+    onError: (e) => failure('重命名失败', e),
   })
   const toggle = useMutation({
     mutationFn: (disabled: boolean) => setDisabled(cred.id, disabled),
     onSuccess: invalidate,
-    onError: (e) => toast.error('操作失败', { description: extractError(e) }),
+    onError: (e) => failure('操作失败', e),
   })
   const prio = useMutation({
     mutationFn: (p: number) => setPriority(cred.id, p),
     onSuccess: invalidate,
-    onError: (e) => toast.error('设置优先级失败', { description: extractError(e) }),
+    onError: (e) => failure('设置优先级失败', e),
   })
   const limit = useMutation({
     mutationFn: (n: number) => setDeviceLimit(cred.id, n),
     onSuccess: () => { onLimitSaved?.(); invalidate() },
-    onError: (e) => toast.error('设置设备上限失败', { description: extractError(e) }),
+    onError: (e) => failure('设置设备上限失败', e),
   })
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
-    onSuccess: () => { toast.success('已刷新'); invalidate() },
-    onError: (e) => toast.error('刷新失败', { description: extractError(e) }),
+    onSuccess: () => { toastManager.add({ title: '已刷新', type: 'success' }); invalidate() },
+    onError: (e) => failure('刷新失败', e),
   })
   const remove = useMutation({
     mutationFn: () => deleteCredential(cred.id),
-    onSuccess: () => { toast.success('已删除'); invalidate() },
-    onError: (e) => toast.error('删除失败', { description: extractError(e) }),
+    onSuccess: () => { toastManager.add({ title: '已删除', type: 'success' }); invalidate() },
+    onError: (e) => failure('删除失败', e),
   })
 
   return { rename, toggle, prio, limit, refresh, remove }
@@ -226,7 +239,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
 export type CredentialActions = ReturnType<typeof useCredentialActions>
 
 /**
- * ⋯ 菜单内容（刷新 / 重命名 / 优先级步进 / 删除），卡片与列表共用。
+ * ⋯ 菜单内容（刷新 / 重命名 / 优先级调整 / 删除），卡片与列表共用。
  *
  * 删除只往外抛意图，确认框由调用方渲染在菜单之外——菜单一关，挂在它里面的弹窗会跟着
  * 卸载，确认框根本来不及显示。
@@ -243,64 +256,48 @@ export function CredentialMenuContent({
 }) {
   const { refresh, prio } = actions
   return (
-    <DropdownMenuContent align="end">
-      <DropdownMenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
-        <ArrowPathIcon className={refresh.isPending ? 'animate-spin' : undefined} />
+    <MenuPopup align="end">
+      <MenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
+        <RefreshCwIcon className={refresh.isPending ? 'animate-spin' : undefined} />
         刷新 token
-      </DropdownMenuItem>
-      <DropdownMenuItem onClick={onTest}>
-        <SignalIcon />
+      </MenuItem>
+      <MenuItem onClick={onTest}>
+        <ActivityIcon />
         连通性测试
-      </DropdownMenuItem>
-      <DropdownMenuItem onClick={onRename}>
+      </MenuItem>
+      <MenuItem onClick={onRename}>
         <PencilIcon />
         重命名
-      </DropdownMenuItem>
-      <DropdownMenuItem onClick={onDeviceLimit}>
-        <DevicePhoneMobileIcon />
+      </MenuItem>
+      <MenuItem onClick={onDeviceLimit}>
+        <SmartphoneIcon />
         设备上限
-      </DropdownMenuItem>
-      <DropdownMenuSeparator />
-      {/* 调度优先级：内联步进器，选中不关闭菜单，可连续调（数值小者优先）。 */}
-      <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-sm">
-        <span className="text-muted-foreground">调度优先级</span>
-        <div
-          className="flex items-center overflow-hidden rounded-md border border-border bg-surface-2/40"
-          title="数值小者优先被调度"
-        >
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            className="size-6 rounded-none"
-            onClick={(e) => { e.preventDefault(); prio.mutate(cred.priority - 1) }}
-            disabled={prio.isPending}
-            aria-label="提升优先级"
-          >
-            <ChevronUpIcon className="size-3.5" />
-          </Button>
-          <span className="w-7 border-x border-border bg-card text-center text-xs font-medium tnum leading-6">
-            {cred.priority}
-          </span>
-          <Button
-            type="button"
-            size="icon"
-            variant="ghost"
-            className="size-6 rounded-none"
-            onClick={(e) => { e.preventDefault(); prio.mutate(cred.priority + 1) }}
-            disabled={prio.isPending}
-            aria-label="降低优先级"
-          >
-            <ChevronDownIcon className="size-3.5" />
-          </Button>
-        </div>
-      </div>
-      <DropdownMenuSeparator />
-      <DropdownMenuItem className="text-bad focus:bg-bad-soft" onClick={onRequestDelete}>
-        <TrashIcon />
+      </MenuItem>
+      <MenuSeparator />
+      <MenuItem
+        onClick={() => prio.mutate(cred.priority - 1)}
+        disabled={prio.isPending}
+        title="数值越小，调度优先级越高"
+      >
+        <ChevronUpIcon />
+        提高优先级
+        <MenuShortcut>P{cred.priority - 1}</MenuShortcut>
+      </MenuItem>
+      <MenuItem
+        onClick={() => prio.mutate(cred.priority + 1)}
+        disabled={prio.isPending}
+        title="数值越大，调度优先级越低"
+      >
+        <ChevronDownIcon />
+        降低优先级
+        <MenuShortcut>P{cred.priority + 1}</MenuShortcut>
+      </MenuItem>
+      <MenuSeparator />
+      <MenuItem variant="destructive" onClick={onRequestDelete}>
+        <Trash2Icon />
         删除
-      </DropdownMenuItem>
-    </DropdownMenuContent>
+      </MenuItem>
+    </MenuPopup>
   )
 }
 
@@ -314,20 +311,27 @@ export function DeleteCredentialDialog({
   onOpenChange: (open: boolean) => void
 }) {
   return (
-    <ConfirmDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="删除账号"
-      confirmText="删除"
-      pending={actions.remove.isPending}
-      onConfirm={() => actions.remove.mutate()}
-      description={
-        <>
-          删除「<span className="font-medium text-foreground">{cred.label}</span>」后，
-          历史用量与设备绑定将一并清除，且无法恢复。
-        </>
-      }
-    />
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogPopup>
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除账号</AlertDialogTitle>
+          <AlertDialogDescription>
+            删除「<span className="font-medium text-foreground">{cred.label}</span>」后，
+            历史用量与设备绑定将一并清除，且无法恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogClose render={<Button variant="outline" />}>取消</AlertDialogClose>
+          <Button
+            variant="destructive"
+            loading={actions.remove.isPending}
+            onClick={() => actions.remove.mutate()}
+          >
+            删除
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
   )
 }
 
@@ -409,7 +413,7 @@ export function ConnectivityTestDialog({
     // 后者是 200 + 一份带状态码的结果，会进上面的列表。
     onError: (e, request) => {
       if (request.session !== session.current || axios.isCancel(e)) return
-      toast.error('测试失败', { description: extractError(e) })
+      toastManager.add({ title: '测试失败', description: extractError(e), type: 'error' })
     },
     onSettled: (_result, _error, request) => {
       if (activeProbe.current === request.controller) activeProbe.current = null
@@ -450,72 +454,76 @@ export function ConnectivityTestDialog({
         onOpenChange(next)
       }}
     >
-      <DialogContent className="max-w-lg">
+      <DialogPopup>
         <DialogHeader>
-          <DialogTitle>
-            <SignalIcon className="size-4 shrink-0 text-muted-foreground" />
-            连通性测试
-          </DialogTitle>
+          <DialogTitle>连通性测试</DialogTitle>
           <DialogDescription>
             使用「<span className="font-medium text-foreground">{cred.label}</span>」向上游发送最小请求；
             会消耗少量订阅额度并按实际用量计入该账号。测试结果与真实流量同等对待：限流会进入冷却，检测到封禁会自动停用。
           </DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-3">
-          <form
-            className="space-y-2"
+        <DialogPanel className="space-y-4">
+          <Form
+            className="space-y-3"
             onSubmit={(e) => { e.preventDefault(); submit() }}
           >
-            <div className="flex flex-wrap gap-1.5">
-              {PROBE_MODELS.map((m) => (
+            <Field>
+              <FieldLabel>测试模型</FieldLabel>
+              <div className="flex flex-wrap gap-2">
+                {PROBE_MODELS.map((m) => (
+                  <Button
+                    key={m}
+                    type="button"
+                    size="xs"
+                    variant={model === m ? 'secondary' : 'outline'}
+                    aria-pressed={model === m}
+                    onClick={() => setModel(m)}
+                  >
+                    <span className="font-mono">{m}</span>
+                  </Button>
+                ))}
+              </div>
+              <FieldDescription>也可以直接输入尚未列出的模型名称。</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor={`probe-model-${cred.id}`}>模型名称</FieldLabel>
+              <div className="flex w-full items-center gap-2">
+                <Input
+                  id={`probe-model-${cred.id}`}
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="如 claude-opus-5"
+                  className="min-w-0 flex-1 font-mono"
+                />
                 <Button
-                  key={m}
-                  type="button"
-                  size="sm"
-                  variant={model === m ? 'secondary' : 'outline'}
-                  className="h-7 px-2.5 font-mono text-2xs font-normal"
-                  aria-pressed={model === m}
-                  onClick={() => setModel(m)}
+                  type={probe.isPending ? 'button' : 'submit'}
+                  variant={probe.isPending ? 'outline' : 'default'}
+                  disabled={!probe.isPending && !model.trim()}
+                  onClick={probe.isPending ? cancelProbe : undefined}
                 >
-                  {m}
+                  {probe.isPending ? <Spinner /> : <ActivityIcon />}
+                  {probe.isPending ? '取消测试' : '开始测试'}
                 </Button>
-              ))}
-            </div>
-            <div className="flex items-center gap-2">
-              <Input
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder="模型名，如 claude-opus-5"
-                className="h-9 min-w-0 flex-1 font-mono text-xs"
-                aria-label="要测试的模型名"
-              />
-              <Button
-                type={probe.isPending ? 'button' : 'submit'}
-                size="sm"
-                variant={probe.isPending ? 'outline' : 'default'}
-                className="h-9 shrink-0"
-                disabled={!probe.isPending && !model.trim()}
-                onClick={probe.isPending ? cancelProbe : undefined}
-              >
-                {probe.isPending && <ArrowPathIcon className="animate-spin" />}
-                {probe.isPending ? '取消测试' : '开始测试'}
-              </Button>
-            </div>
-          </form>
+              </div>
+            </Field>
+          </Form>
 
           {entries.length === 0 ? (
-            <p className="py-2 text-2xs text-muted-foreground">
-              选择模型开始测试；结果会显示实时额度或上游错误。
-            </p>
+            <Empty className="py-8">
+              <EmptyHeader>
+                <EmptyTitle>尚无测试结果</EmptyTitle>
+                <EmptyDescription>选择模型开始测试，结果会显示实时额度或上游错误。</EmptyDescription>
+              </EmptyHeader>
+            </Empty>
           ) : (
-            <ul className="divide-y divide-border border-t border-border">
+            <ul className="space-y-2">
               {entries.map((e) => (
                 <ProbeEntryRow key={e.seq} entry={e} />
               ))}
             </ul>
           )}
-        </DialogBody>
-      </DialogContent>
+        </DialogPanel>
+      </DialogPopup>
     </Dialog>
   )
 }
@@ -523,37 +531,35 @@ export function ConnectivityTestDialog({
 /** 一条测试结果：成败徽章 + 模型名 + 状态码/耗时，失败时附上游错误原文。 */
 function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
   const { model, result } = entry
-  const Icon = result.ok ? CheckCircleIcon : XCircleIcon
+  const Icon = result.ok ? CircleCheckIcon : CircleXIcon
   return (
-    <li className="py-2.5">
-      <div className="flex items-start gap-2">
-        <Icon className={cn('mt-px size-4 shrink-0', result.ok ? 'text-ok' : 'text-bad')} aria-hidden />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="font-mono text-xs font-medium">{model}</span>
-            {/* status 为 0 表示压根没到上游（取 token 失败/连不上/超时），显示状态码会误导。 */}
-            <span className={cn('text-2xs tnum', result.ok ? 'text-ok' : 'text-bad')}>
-              {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
+    <li>
+      <Alert variant={result.ok ? 'success' : 'error'}>
+        <Icon aria-hidden />
+        <AlertTitle className="flex flex-wrap items-center gap-2">
+          <span className="font-mono">{model}</span>
+          <Badge variant={result.ok ? 'success' : 'error'} size="sm">
+            {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
+          </Badge>
+          <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
+          {result.model && result.model !== model && (
+            <span className="font-mono font-normal text-muted-foreground" title="上游实际使用的模型">
+              → {result.model}
             </span>
-            <span className="tnum text-2xs text-muted-foreground">{formatLatency(result.latency_ms)}</span>
-            {/* 上游回报的模型名与请求的不同 = 别名被解析成了具体版本，值得显式点出来。 */}
-            {result.model && result.model !== model && (
-              <span className="font-mono text-2xs text-muted-foreground" title="上游实际使用的模型">
-                → {result.model}
-              </span>
-            )}
-          </div>
+          )}
+        </AlertTitle>
+        <AlertDescription>
           {result.error && (
-            <p className="mt-1 break-words text-2xs leading-5 text-muted-foreground">
+            <p className="break-words">
               {result.error_type && (
-                <span className="mr-1 font-mono text-bad">{result.error_type}</span>
+                <span className="mr-1 font-mono text-destructive-foreground">{result.error_type}</span>
               )}
               {result.error}
             </p>
           )}
           {result.quota && <ProbeQuotaLine quota={result.quota} />}
-        </div>
-      </div>
+        </AlertDescription>
+      </Alert>
     </li>
   )
 }
@@ -590,14 +596,19 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       {win('7d', quota.rl_7d_utilization, quota.rl_7d_reset)}
       {/* 429 才有。它是上游对**这次**拒绝给出的等待时间，比窗口 reset 更直接。 */}
       {quota.retry_after_secs != null && (
-        <span className="text-bad" title={`上游 retry-after: ${quota.retry_after_secs} 秒`}>
+        <span className="text-destructive-foreground" title={`上游 retry-after: ${quota.retry_after_secs} 秒`}>
           需等待 {formatWait(quota.retry_after_secs)}
         </span>
       )}
       {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}
       {quota.unified_status && quota.unified_status !== 'allowed' && (
         <span
-          className={cn('font-mono', quota.unified_status === 'rejected' ? 'text-bad' : 'text-warn')}
+          className={cn(
+            'font-mono',
+            quota.unified_status === 'rejected'
+              ? 'text-destructive-foreground'
+              : 'text-warning-foreground',
+          )}
           title={
             quota.rl_representative
               ? `上游整体额度状态（当前由 ${quota.rl_representative} 窗口决定）`
@@ -614,8 +625,8 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
 /** 使用率配色，阈值与卡片额度条一致（≥90% 红、≥70% 橙）。 */
 function quotaTone(util: number | null): string {
   if (util == null) return 'text-foreground/80'
-  if (util >= 0.9) return 'text-bad'
-  return util >= 0.7 ? 'text-warn' : 'text-foreground/80'
+  if (util >= 0.9) return 'text-destructive-foreground'
+  return util >= 0.7 ? 'text-warning-foreground' : 'text-foreground/80'
 }
 
 /** 等待时长：分钟以内给秒，一天以内给小时，再长给天（上游真给过 63 小时）。 */
@@ -626,20 +637,12 @@ function formatWait(secs: number): string {
   return `${(secs / 86400).toFixed(1)} 天`
 }
 
-/** 账号档位徽章配色：Max 20x/5x/Max/Pro/Free 用冷色系区分（避开到期徽章的绿/橙/红）。 */
-export function tierBadgeClass(tier: string): string {
+/** 账号档位使用官方 Badge 变体，避免业务层复制一套徽章色板。 */
+export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
   const t = tier.toLowerCase()
-  if (t.includes('20x'))
-    return 'border-violet-200 bg-violet-100 text-violet-700 dark:border-violet-500/30 dark:bg-violet-500/15 dark:text-violet-300'
-  if (t.includes('5x'))
-    return 'border-indigo-200 bg-indigo-100 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300'
-  if (t.includes('max'))
-    return 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-500/30 dark:bg-blue-500/15 dark:text-blue-300'
-  if (t.includes('pro'))
-    return 'border-sky-200 bg-sky-100 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300'
-  if (t.includes('free'))
-    return 'border-border bg-muted text-muted-foreground'
-  return 'border-border bg-secondary text-secondary-foreground'
+  if (t.includes('20x') || t.includes('5x') || t.includes('max')) return 'info'
+  if (t.includes('pro')) return 'secondary'
+  return 'outline'
 }
 
 /**
@@ -653,12 +656,12 @@ export function tierBadgeClass(tier: string): string {
 export function statusMeta(
   cred: Credential,
   nearLimit: boolean,
-): { dot: string; rail: string; label: string } {
-  if (cred.ban_reason) return { dot: 'bg-bad', rail: 'before:bg-bad', label: '已封禁' }
-  if (cred.disabled) return { dot: 'bg-muted-foreground/50', rail: 'before:bg-transparent', label: '已停用' }
-  if (cred.rate_limited_secs > 0) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '冷却中' }
-  if (nearLimit) return { dot: 'bg-warn', rail: 'before:bg-warn', label: '额度将满' }
-  return { dot: 'bg-ok', rail: 'before:bg-transparent', label: '运行正常' }
+): { variant: BadgeProps['variant']; label: string } {
+  if (cred.ban_reason) return { variant: 'error', label: '已封禁' }
+  if (cred.disabled) return { variant: 'secondary', label: '已停用' }
+  if (cred.rate_limited_secs > 0) return { variant: 'warning', label: '冷却中' }
+  if (nearLimit) return { variant: 'warning', label: '额度将满' }
+  return { variant: 'success', label: '运行正常' }
 }
 
 /**
@@ -696,13 +699,19 @@ export function expiryMeta(cred: Credential): {
   className: string
   title?: string
 } {
-  if (cred.ban_reason) return { text: '已封禁', className: 'font-medium text-bad', title: cred.ban_reason }
+  if (cred.ban_reason) {
+    return {
+      text: '已封禁',
+      className: 'font-medium text-destructive-foreground',
+      title: cred.ban_reason,
+    }
+  }
   if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
   if (cred.rate_limited_secs > 0) {
     const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
     return {
       text: `冷却约 ${minutes} 分钟`,
-      className: 'font-medium text-warn',
+      className: 'font-medium text-warning-foreground',
       title: '账号级限流冷却中，结束后会自动恢复调度',
     }
   }

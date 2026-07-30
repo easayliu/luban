@@ -2,11 +2,10 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
-  ShieldCheckIcon, ExclamationTriangleIcon, SignalIcon, DevicePhoneMobileIcon,
-  MagnifyingGlassIcon, PlusIcon, Cog6ToothIcon, FunnelIcon, Squares2X2Icon,
-  Bars3Icon, QueueListIcon, ArrowsUpDownIcon, EllipsisVerticalIcon,
-  ArrowPathIcon,
-} from '@heroicons/react/24/outline'
+  ArrowUpDownIcon, EllipsisVerticalIcon, GaugeIcon, LayoutGridIcon, ListChecksIcon,
+  ListFilterIcon, ListIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldCheckIcon,
+  SmartphoneIcon, TriangleAlertIcon,
+} from 'lucide-react'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { AddAccount } from '@/components/add-account'
@@ -18,7 +17,17 @@ import { OverviewMetric } from '@/components/overview-metric'
 import { LogoMark } from '@/components/logo-mark'
 import { BatchActionsBar } from '@/App'
 import { Button } from '@/components/ui/button'
+import { CardFrame } from '@/components/ui/card'
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
+import {
+  Menu, MenuItem, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuSeparator, MenuTrigger,
+} from '@/components/ui/menu'
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
+import {
+  ToggleGroup, ToggleGroupItem, ToggleGroupSeparator,
+} from '@/components/ui/toggle-group'
+import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
@@ -104,10 +113,47 @@ const queryClient = new QueryClient({
 })
 const previewParams = new URLSearchParams(window.location.search)
 const previewDialog = previewParams.get('dialog')
-const previewSettings = previewParams.get('settings') as SettingsSection | null
+const previewSettingsParam = previewParams.get('settings')
+const previewSettings: SettingsSection | null = previewSettingsParam === 'forwarding'
+  ? 'forwarding'
+  : previewSettingsParam === 'access'
+    ? 'access'
+    : null
 const previewView = previewParams.get('view') === 'list' ? 'list' : 'card'
 const previewBatch = previewParams.get('batch') === '1'
 const previewSelected = new Set([banned.id])
+const previewSortItems = [
+  { label: '优先级升序', value: 'priority' },
+  { label: '最近使用', value: 'recent' },
+  { label: '累计花费', value: 'cost' },
+]
+
+function navigatePreview(search = '') {
+  window.location.assign(`${window.location.pathname}${search}`)
+}
+
+function closePreviewDialog(nextOpen: boolean) {
+  if (!nextOpen) navigatePreview()
+}
+
+function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSection }) {
+  const [section, setSection] = React.useState<SettingsSection>(initialSection)
+
+  const changeSection = (next: SettingsSection) => {
+    setSection(next)
+    const url = new URL(window.location.href)
+    url.searchParams.set('settings', next)
+    window.history.replaceState(null, '', url)
+  }
+
+  return (
+    <SettingsPage
+      section={section}
+      onSectionChange={changeSection}
+      onBack={() => navigatePreview()}
+    />
+  )
+}
 
 queryClient.setQueryData(['settings'], {
   api_key: 'luban-preview-key',
@@ -152,132 +198,191 @@ queryClient.setQueryData(['credential-devices', 4], [
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      {previewSettings ? (
-        <SettingsPage
-          section={previewSettings === 'forwarding' ? 'forwarding' : 'access'}
-          onSectionChange={() => undefined}
-          onBack={() => undefined}
-        />
-      ) : (
-      <>
-      <div className="app-shell flex min-h-dvh flex-col text-foreground">
-        <header className="app-header sticky top-0 z-20 border-b border-border/80 bg-card/95 backdrop-blur">
-          <div className="page-frame flex h-16 items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5 sm:gap-3">
-              <div className="brand-mark flex size-8 items-center justify-center rounded-lg text-brand-foreground">
-                <LogoMark className="size-[1.125rem]" />
-              </div>
-              <div>
-                <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
-                <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">Claude Code Gateway</div>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 sm:hidden">
-              <Button size="icon" className="size-10" aria-label="添加账号"><PlusIcon /></Button>
-              <Button size="icon" variant="outline" className="size-10" aria-label="更多操作"><EllipsisVerticalIcon /></Button>
-            </div>
-            <div className="hidden items-center gap-2 sm:flex">
-              <Button size="sm" variant="outline" aria-label="接入设置"><Cog6ToothIcon />接入设置</Button>
-              <Button size="sm" aria-label="添加账号"><PlusIcon />添加账号</Button>
-            </div>
-          </div>
-        </header>
+      <ToastProvider position="top-right">
+        <AnchoredToastProvider>
+          <div className="relative isolate min-h-dvh">
+            {previewSettings ? (
+              <PreviewSettingsRoute initialSection={previewSettings} />
+            ) : (
+              <>
+                <div className="app-shell flex min-h-dvh flex-col text-foreground">
+                  <header className="app-header sticky top-0 z-20 border-b border-border bg-card/95 backdrop-blur">
+                    <div className="page-frame flex h-16 items-center justify-between gap-3">
+                      <div className="flex items-center gap-2.5 sm:gap-3">
+                        <div className="brand-mark flex size-8 items-center justify-center rounded-lg text-brand-foreground">
+                          <LogoMark className="size-[1.125rem]" />
+                        </div>
+                        <div>
+                          <div className="font-heading text-sm font-semibold leading-none">Luban</div>
+                          <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">
+                            Claude Code Gateway
+                          </div>
+                        </div>
+                      </div>
 
-        <main className="page-frame flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
-          <div className="space-y-6 sm:space-y-8">
-            <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="preview-page-title">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h1 id="preview-page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">账号调度中心</h1>
-                  <span className="inline-flex items-center gap-1.5 rounded-md bg-bad-soft px-2 py-1 text-xs font-medium text-bad ring-1 ring-inset ring-bad/15">
-                    <span className="size-1.5 rounded-full bg-current" aria-hidden />
-                    1 个账号需关注
-                  </span>
+                      <div className="flex items-center gap-2 sm:hidden">
+                        <Button size="icon" aria-label="添加账号" onClick={() => navigatePreview('?dialog=add')}><PlusIcon /></Button>
+                        <Menu>
+                          <MenuTrigger render={<Button size="icon" variant="outline" aria-label="更多操作" />}>
+                            <EllipsisVerticalIcon />
+                          </MenuTrigger>
+                          <MenuPopup align="end">
+                            <MenuItem onClick={() => navigatePreview('?settings=access')}><SettingsIcon />系统设置</MenuItem>
+                            <MenuSeparator />
+                            <MenuItem><ListChecksIcon />批量操作</MenuItem>
+                          </MenuPopup>
+                        </Menu>
+                      </div>
+
+                      <div className="hidden items-center gap-2 sm:flex">
+                        <Button size="sm" variant="outline" onClick={() => navigatePreview('?settings=access')}><SettingsIcon />系统设置</Button>
+                        <Button size="sm" onClick={() => navigatePreview('?dialog=add')}><PlusIcon />添加账号</Button>
+                      </div>
+                    </div>
+                  </header>
+
+                  <main className="page-frame flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
+                    <div className="space-y-6 sm:space-y-8">
+                      <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="preview-page-title">
+                        <div className="min-w-0">
+                          <h1 id="preview-page-title" className="font-heading text-2xl font-semibold tracking-tight sm:text-3xl">
+                            账号调度中心
+                          </h1>
+                          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                            统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
+                          </p>
+                        </div>
+                        <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
+                          <span className="size-1.5 rounded-full bg-success" aria-hidden />
+                          每 30 秒自动刷新
+                        </div>
+                      </section>
+
+                      <CardFrame
+                        aria-label="账号池概览"
+                        className="grid grid-cols-2 overflow-hidden lg:grid-cols-4"
+                      >
+                        <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r lg:border-b-0" />
+                        <OverviewMetric label="需处理" value="1" status="1 异常" icon={TriangleAlertIcon} tone="bad" className="border-b lg:border-b-0 lg:border-r" />
+                        <OverviewMetric label="额度预警" value="0" icon={GaugeIcon} tone="neutral" className="border-r" />
+                        <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={SmartphoneIcon} tone="neutral" />
+                      </CardFrame>
+
+                      <section className="min-w-0" aria-labelledby="preview-account-list-title">
+                        <CardFrame className="min-w-0">
+                          <div className="relative grid gap-4 px-4 py-4 sm:px-6 xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center">
+                            <div className="min-w-0">
+                              <h2 id="preview-account-list-title" className="font-heading text-sm font-semibold">账号列表</h2>
+                              <p className="mt-1 text-sm text-muted-foreground">共 2 个账号</p>
+                            </div>
+
+                            <div className="min-w-0 space-y-2 xl:flex xl:items-center xl:justify-end xl:space-y-0">
+                              <InputGroup className="xl:mr-2 xl:w-56 2xl:w-64">
+                                <InputGroupAddon><SearchIcon aria-hidden /></InputGroupAddon>
+                                <InputGroupInput aria-label="搜索账号" placeholder="搜索名称或 #id" readOnly />
+                              </InputGroup>
+
+                              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
+                                <Menu>
+                                  <MenuTrigger render={<Button className="w-full sm:w-auto" variant="outline" />}>
+                                    <ListFilterIcon />全部
+                                  </MenuTrigger>
+                                  <MenuPopup align="end">
+                                    <MenuRadioGroup value="all">
+                                      <MenuRadioItem value="all">全部</MenuRadioItem>
+                                      <MenuRadioItem value="schedulable">可调度</MenuRadioItem>
+                                      <MenuRadioItem value="attention">需处理</MenuRadioItem>
+                                    </MenuRadioGroup>
+                                  </MenuPopup>
+                                </Menu>
+
+                                <Select items={previewSortItems} value="priority">
+                                  <SelectTrigger aria-label="账号排序" className="w-full min-w-0 sm:w-40">
+                                    <ArrowUpDownIcon />
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectPopup>
+                                    {previewSortItems.map((item) => (
+                                      <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                                    ))}
+                                  </SelectPopup>
+                                </Select>
+
+                                <ToggleGroup
+                                  aria-label="账号视图"
+                                  className="w-full sm:w-fit"
+                                  value={[previewView]}
+                                  variant="outline"
+                                >
+                                  <ToggleGroupItem className="flex-1 sm:flex-none" value="card" aria-label="卡片视图">
+                                    <LayoutGridIcon />
+                                  </ToggleGroupItem>
+                                  <ToggleGroupSeparator />
+                                  <ToggleGroupItem className="flex-1 sm:flex-none" value="list" aria-label="紧凑列表视图">
+                                    <ListIcon />
+                                  </ToggleGroupItem>
+                                </ToggleGroup>
+
+                                <Button
+                                  className="w-full sm:w-auto"
+                                  variant={previewBatch ? 'secondary' : 'outline'}
+                                >
+                                  <ListChecksIcon />批量
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+
+                          {previewBatch && (
+                            <div className="relative border-t p-3 sm:px-6 sm:py-4">
+                              <BatchActionsBar
+                                all={[banned, normal]}
+                                selected={previewSelected}
+                                onSelectedChange={() => undefined}
+                                onClose={() => undefined}
+                              />
+                            </div>
+                          )}
+
+                          {previewView === 'list' && (
+                            <Table className="table-fixed" variant="card">
+                              <TableCaption className="sr-only">账号列表</TableCaption>
+                              <CredentialListHeader
+                                selectable={previewBatch}
+                                sort="priority"
+                                dir="asc"
+                                onSortChange={() => undefined}
+                                allSelected={false}
+                                onSelectAll={() => undefined}
+                              />
+                              <TableBody>
+                                <CredentialRow cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
+                                <CredentialRow cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
+                              </TableBody>
+                            </Table>
+                          )}
+                        </CardFrame>
+
+                        {previewView === 'card' && (
+                          <div className="mt-4 grid items-stretch gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))]">
+                            <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
+                            <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
+                          </div>
+                        )}
+                      </section>
+                    </div>
+                  </main>
+                  <AppFooter />
                 </div>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                  统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
-                </p>
-              </div>
-              <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
-                <ArrowPathIcon className="size-3.5" />
-                每 30 秒自动刷新
-              </div>
-            </section>
 
-            <section aria-label="账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm lg:grid-cols-4">
-                <OverviewMetric label="可调度账号" value="1/2" status="1 暂不可用" icon={ShieldCheckIcon} tone="ok" className="border-b border-r border-border/80 lg:border-b-0" />
-                <OverviewMetric label="需处理" value="1" status="1 异常" icon={ExclamationTriangleIcon} tone="bad" className="border-b border-border/80 lg:border-b-0 lg:border-r" />
-                <OverviewMetric label="额度预警" value="0" status="无预警" icon={SignalIcon} tone="neutral" className="border-r border-border/80" />
-                <OverviewMetric label="绑定设备" value="2" status="共 6 个名额" icon={DevicePhoneMobileIcon} tone="neutral" />
-            </section>
-
-          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm" aria-labelledby="preview-account-list-title">
-          <div className="grid gap-4 border-b border-border/80 px-4 py-5 sm:px-6 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
-            <div className="flex items-baseline gap-2">
-              <div id="preview-account-list-title" className="text-base font-semibold">账号列表</div>
-              <div className="text-xs text-muted-foreground">共 2 个</div>
-            </div>
-            <div className="min-w-0 space-y-2 lg:flex lg:items-center lg:justify-end lg:space-y-0">
-              <div className="flex h-10 w-full items-center gap-2 rounded-md border border-border bg-background px-3 text-xs text-muted-foreground shadow-sm sm:h-9 lg:mr-2 lg:w-52 2xl:w-64">
-                <MagnifyingGlassIcon className="size-3.5" />搜索名称或 #id
-              </div>
-              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
-                <Button size="sm" variant="outline" className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><FunnelIcon />全部</Button>
-                <Button size="sm" variant="outline" className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><ArrowsUpDownIcon />优先级↑</Button>
-                <div className="grid h-10 grid-cols-2 overflow-hidden rounded-md border border-border sm:flex sm:h-8 sm:shrink-0">
-                  <Button size="icon" variant="ghost" className="h-full w-full rounded-none focus-visible:z-10 sm:w-8" aria-label="卡片视图" aria-pressed={previewView === 'card'}><Squares2X2Icon className="size-4" /></Button>
-                  <Button size="icon" variant="ghost" className="h-full w-full rounded-none border-l border-border focus-visible:z-10 sm:w-8" aria-label="紧凑列表视图" aria-pressed={previewView === 'list'}><Bars3Icon className="size-4" /></Button>
-                </div>
-                <Button size="sm" variant={previewBatch ? 'secondary' : 'outline'} className="h-10 w-full justify-center text-xs sm:h-8 sm:w-auto"><QueueListIcon />批量</Button>
-              </div>
-            </div>
+                <AddAccount open={previewDialog === 'add'} onOpenChange={closePreviewDialog} />
+                <AccessSettings open={previewDialog === 'access'} onOpenChange={closePreviewDialog} />
+                <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
+              </>
+            )}
           </div>
-
-          {previewBatch && (
-            <div className="border-b border-border bg-muted/25 p-3 sm:px-6 sm:py-4">
-            <BatchActionsBar
-              all={[banned, normal]}
-              selected={previewSelected}
-              onSelectedChange={() => undefined}
-              onClose={() => undefined}
-            />
-            </div>
-          )}
-
-          {previewView === 'list' ? (
-            <div>
-              <Table className="table-fixed">
-                <TableCaption className="sr-only">账号列表</TableCaption>
-                <CredentialListHeader
-                  selectable={previewBatch}
-                  sort="priority"
-                  dir="asc"
-                  onSortChange={() => undefined}
-                  allSelected={false}
-                  onSelectAll={() => undefined}
-                />
-                <TableBody>
-                  <CredentialRow cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
-                  <CredentialRow cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
-                </TableBody>
-              </Table>
-            </div>
-          ) : (
-            <div className="grid items-stretch gap-3 bg-muted/20 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4 lg:p-5">
-              <CredentialCard cred={banned} selectable={previewBatch} selected={previewBatch} onSelectedChange={() => undefined} />
-              <CredentialCard cred={normal} selectable={previewBatch} selected={false} onSelectedChange={() => undefined} />
-            </div>
-          )}
-          </section>
-          </div>
-        </main>
-        <AppFooter />
-      </div>
-      <AddAccount open={previewDialog === 'add'} onOpenChange={() => undefined} />
-      <AccessSettings open={previewDialog === 'access'} onOpenChange={() => undefined} />
-      <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={() => undefined} />
-      </>
-      )}
+        </AnchoredToastProvider>
+      </ToastProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 )

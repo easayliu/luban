@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
+import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import './index.css'
 
 // 跟随系统深浅色：给 <html> 切换 .dark（配合 darkMode: 'class'）。
@@ -19,7 +20,13 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <ToastProvider position="top-right">
+        <AnchoredToastProvider>
+          <div className="relative isolate min-h-svh">
+            <App />
+          </div>
+        </AnchoredToastProvider>
+      </ToastProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 )

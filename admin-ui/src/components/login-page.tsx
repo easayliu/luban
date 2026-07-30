@@ -1,13 +1,18 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import {
-  LockClosedIcon, ArrowRightIcon, ArrowPathIcon, EyeIcon, EyeSlashIcon,
-} from '@heroicons/react/24/outline'
+import { ArrowRightIcon, EyeIcon, EyeOffIcon, LockKeyholeIcon } from 'lucide-react'
 import { login } from '@/api/auth'
 import { setPw } from '@/api/client'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
+import { Field, FieldError, FieldLabel } from '@/components/ui/field'
+import { Form } from '@/components/ui/form'
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from '@/components/ui/input-group'
 import { LogoMark } from '@/components/logo-mark'
 
 /** 管理登录页（已设置密码时展示）。登录成功回调 onSuccess(password)。 */
@@ -24,59 +29,73 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
   })
 
   return (
-    <div className="app-shell grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:px-5 sm:py-10">
+    <div className="app-shell grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:py-10">
       <div className="w-full max-w-sm">
-        {/* 品牌标识 */}
         <div className="mb-6 flex flex-col items-center text-center">
           <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-brand-foreground shadow-brand">
             <LogoMark className="size-7" />
           </div>
           <div className="mt-4 text-lg font-semibold leading-none tracking-tight">Luban</div>
-          <div className="label-eyebrow mt-1.5">Claude Code Gateway</div>
+          <div className="mt-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Claude Code Gateway
+          </div>
         </div>
 
-        {/* 登录卡片 */}
-        <div className="rounded-lg border border-border bg-card p-5 shadow-card sm:p-7">
-          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
-            <LockClosedIcon className="size-5 text-muted-foreground" />
-            管理登录
-          </h1>
-
-          <form
-            className="mt-5 space-y-3"
-            onSubmit={(e) => { e.preventDefault(); if (password) doLogin.mutate() }}
-          >
-            <div className="relative">
-              <Input
-                type={show ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="管理密码"
-                aria-label="管理密码"
-                className="pr-10"
-                autoFocus
-              />
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <LockKeyholeIcon aria-hidden="true" className="text-muted-foreground" />
+              管理登录
+            </CardTitle>
+            <CardDescription>输入管理密码以继续访问控制台。</CardDescription>
+          </CardHeader>
+          <CardPanel>
+            <Form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault()
+                if (password) doLogin.mutate()
+              }}
+            >
+              <Field invalid={doLogin.isError}>
+                <FieldLabel htmlFor="admin-password">管理密码</FieldLabel>
+                <InputGroup>
+                  <InputGroupInput
+                    id="admin-password"
+                    autoFocus
+                    aria-invalid={doLogin.isError || undefined}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="请输入管理密码"
+                    type={show ? 'text' : 'password'}
+                    value={password}
+                  />
+                  <InputGroupAddon align="inline-end">
+                    <Button
+                      aria-label={show ? '隐藏密码' : '显示密码'}
+                      size="icon-xs"
+                      title={show ? '隐藏密码' : '显示密码'}
+                      type="button"
+                      variant="ghost"
+                      onClick={() => setShow((visible) => !visible)}
+                    >
+                      {show ? <EyeOffIcon /> : <EyeIcon />}
+                    </Button>
+                  </InputGroupAddon>
+                </InputGroup>
+                {doLogin.isError && <FieldError>{extractError(doLogin.error)}</FieldError>}
+              </Field>
               <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                className="absolute right-1 top-1/2 size-7 -translate-y-1/2 text-muted-foreground"
-                onClick={() => setShow((s) => !s)}
-                title={show ? '隐藏密码' : '显示密码'}
-                aria-label={show ? '隐藏密码' : '显示密码'}
+                className="w-full"
+                disabled={!password}
+                loading={doLogin.isPending}
+                type="submit"
               >
-                {show ? <EyeSlashIcon /> : <EyeIcon />}
+                <ArrowRightIcon aria-hidden="true" />
+                登录
               </Button>
-            </div>
-            {doLogin.isError && (
-              <p className="text-sm text-bad">{extractError(doLogin.error)}</p>
-            )}
-            <Button type="submit" className="w-full" disabled={doLogin.isPending || !password}>
-              {doLogin.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowRightIcon />}
-              登录
-            </Button>
-          </form>
-        </div>
+            </Form>
+          </CardPanel>
+        </Card>
       </div>
     </div>
   )

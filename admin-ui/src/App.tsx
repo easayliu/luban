@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  PlusIcon, Cog6ToothIcon, ArrowRightStartOnRectangleIcon, ArrowsUpDownIcon, CheckIcon,
-  QueueListIcon, ArrowPathIcon, XMarkIcon, ChevronLeftIcon, ChevronRightIcon,
-  MagnifyingGlassIcon, FunnelIcon, Squares2X2Icon, Bars3Icon,
-  PlayIcon, PauseIcon, TrashIcon,
-  SignalIcon, ShieldCheckIcon, ExclamationTriangleIcon, DevicePhoneMobileIcon,
+  PlusIcon, SettingsIcon, LogOutIcon, ArrowUpDownIcon,
+  ListChecksIcon, RefreshCwIcon, XIcon, ChevronLeftIcon, ChevronRightIcon,
+  SearchIcon, ListFilterIcon, LayoutGridIcon, ListIcon,
+  PlayIcon, PauseIcon, Trash2Icon,
+  RadioIcon, ShieldCheckIcon, TriangleAlertIcon, SmartphoneIcon,
   EllipsisVerticalIcon,
-} from '@heroicons/react/24/outline'
-import { toast } from 'sonner'
+} from 'lucide-react'
 import {
   deleteCredentials, listCredentials, setDeviceLimits, setDisabledMany, setPriorities,
   type Credential,
@@ -19,7 +18,7 @@ import { cn, extractError } from '@/lib/utils'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import { useDebounced } from '@/lib/use-debounced'
 import {
-  SORTS, SORT_DIR_DEFAULT, SORT_KEYS, inputToLimit, isAbnormal, isNearLimit, sortCreds,
+  SORTS, SORT_DIR_DEFAULT, SORT_KEYS, isAbnormal, isNearLimit, sortCreds,
   type SortDir, type SortKey,
 } from '@/components/credential-shared'
 import { CredentialCard } from '@/components/credential-card'
@@ -29,17 +28,40 @@ import { AddAccount } from '@/components/add-account'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
-import { OverviewMetric } from '@/components/overview-metric'
+import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import { LogoMark } from '@/components/logo-mark'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
-import { Toaster } from '@/components/ui/sonner'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import {
-  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
-  DropdownMenuSeparator,
-} from '@/components/ui/dropdown-menu'
+  Menu, MenuTrigger, MenuPopup, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator,
+} from '@/components/ui/menu'
+import {
+  Card, CardPanel, CardFrame, CardFrameAction, CardFrameDescription,
+  CardFrameFooter, CardFrameHeader, CardFrameTitle, CardHeader, CardTitle,
+  CardDescription, CardAction,
+} from '@/components/ui/card'
+import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
+import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import {
+  Pagination as CossPagination, PaginationContent, PaginationItem, PaginationLink,
+} from '@/components/ui/pagination'
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
+} from '@/components/ui/empty'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
+  AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement,
+  NumberFieldInput,
+} from '@/components/ui/number-field'
+import { Spinner } from '@/components/ui/spinner'
+import { toastManager } from '@/components/ui/toast'
 
 type FilterKey =
   | 'all'
@@ -50,11 +72,19 @@ type FilterKey =
   | 'abnormal'
   | 'nearLimit'
   | 'cooldown'
+  | 'hasDevice'
   | 'deviceFull'
 type ViewMode = 'card' | 'list'
 
 /** 每页账号数可选档位（用 10/20/50 这类常规档，不迁就栅格列数）；账号少时分页条自动隐藏。 */
 const PAGE_SIZES = [10, 20, 50] as const
+const PAGE_SIZE_ITEMS = PAGE_SIZES.map((size) => ({ value: String(size), label: `${size} 个` }))
+
+const LIMIT_MODE_ITEMS = [
+  { value: 'default', label: '跟随默认' },
+  { value: 'unlimited', label: '不限设备' },
+  { value: 'custom', label: '独立上限' },
+] as const
 
 const VIEW_MODES = ['card', 'list'] as const
 
@@ -75,6 +105,7 @@ const FILTERS: { key: FilterKey; label: string; match: (c: Credential) => boolea
   { key: 'abnormal', label: '异常（已封禁）', match: isAbnormal },
   { key: 'nearLimit', label: '额度将满', match: isNearLimit },
   { key: 'cooldown', label: '冷却中', match: (c) => !c.disabled && c.rate_limited_secs > 0 },
+  { key: 'hasDevice', label: '已绑定设备', match: (c) => c.device_count > 0 },
   {
     key: 'deviceFull',
     label: '设备已满',
@@ -110,18 +141,23 @@ function App() {
   const [selected, setSelected] = useState<Set<number>>(new Set())
   // 分页（纯前端切片：列表接口一次返回全部账号）。
   const [page, setPage] = useState(1)
+  // 只有从账号页主动进入设置时，关闭设置才应该消费这条 history 记录。
+  // 直接打开 #/settings/* 的深链接则在原地替换回账号页，避免把用户带离当前站点。
+  const enteredSettingsFromAccounts = useRef(false)
 
-  // 界面偏好：排序、每页条数、视图与状态筛选均写 localStorage，刷新后保持。
+  // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文。
   const [sort, setSort] = usePersisted<SortKey>('sort', 'priority', oneOf(SORT_KEYS))
   const [dir, setDir] = usePersisted<SortDir>('sortDir', 'asc', oneOf(['asc', 'desc'] as const))
   const [pageSize, setPageSize] = usePersisted('pageSize', PAGE_SIZES[0], numberOneOf(PAGE_SIZES))
   const [view, switchView] = usePersisted<ViewMode>('view', preferredInitialView(), oneOf(VIEW_MODES))
   const [filter, setFilter] = usePersisted<FilterKey>('filter', 'all', oneOf(FILTER_KEYS))
-
-  // 搜索词仍只保留在当前页面，避免下次打开时被一个旧关键字悄悄隐藏账号。
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = usePersisted('query', '', (raw) => raw)
   useEffect(() => {
-    const syncRoute = () => setSettingsRoute(readSettingsRoute())
+    const syncRoute = () => {
+      const next = readSettingsRoute()
+      setSettingsRoute(next)
+      if (!next) enteredSettingsFromAccounts.current = false
+    }
     window.addEventListener('popstate', syncRoute)
     window.addEventListener('hashchange', syncRoute)
     return () => {
@@ -131,13 +167,25 @@ function App() {
   }, [])
 
   const openSettings = (section: SettingsSection) => {
-    window.history.pushState(null, '', `#/settings/${section}`)
+    const url = `#/settings/${section}`
+    if (settingsRoute) {
+      // Tab 切换属于同一设置页，不应为每次切换新增浏览器历史。
+      window.history.replaceState(null, '', url)
+    } else {
+      window.history.pushState(null, '', url)
+      enteredSettingsFromAccounts.current = true
+    }
     setSettingsRoute(section)
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
   const closeSettings = () => {
-    window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`)
     setSettingsRoute(null)
+    if (enteredSettingsFromAccounts.current) {
+      enteredSettingsFromAccounts.current = false
+      window.history.back()
+    } else {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+    }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
   // 输入框绑 query 保持跟手，筛选/排序用延迟值：连续敲键时不必每个字符都过一遍全量账号。
@@ -209,12 +257,7 @@ function App() {
   }
 
   if (needLogin) {
-    return (
-      <>
-        <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
-        <Toaster position="top-right" />
-      </>
-    )
+    return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
   }
 
   if (settingsRoute) {
@@ -250,27 +293,25 @@ function App() {
   ).length
   // 跟 total 同源用延迟值，否则敲键的那一瞬文案先切成「筛选出 N / 共 M」而 N 还是旧的。
   const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
-  const healthLabel = attentionCount > 0 ? `${attentionCount} 个账号需关注` : '账号池运行平稳'
-  const attentionStatus =
-    abnormalCount > 0 ? `${abnormalCount} 异常`
-      : cooldownCount > 0 ? `${cooldownCount} 冷却中`
-        : nearLimitCount > 0 ? '额度风险'
-          : '无需处理'
+  const attentionStatus = [
+    abnormalCount > 0 ? `${abnormalCount} 异常` : '',
+    cooldownCount > 0 ? `${cooldownCount} 冷却` : '',
+    nearLimitCount > 0 ? `${nearLimitCount} 额度` : '',
+  ].filter(Boolean).join(' · ') || undefined
   const deviceStatus =
     fullDeviceCount > 0 ? `${fullDeviceCount} 个账号已满`
       : unlimitedDeviceAccounts > 0 ? `${unlimitedDeviceAccounts} 个不限额账号`
         : deviceCapacity > 0 ? `共 ${deviceCapacity} 个名额`
-          : '尚未绑定'
+          : undefined
   const selectMetric = (key: FilterKey) =>
     resetPage(setFilter)(filter === key ? 'all' : key)
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      {/* 置顶操作栏：使用克制的 stacked application shell。 */}
-      <header className="app-header sticky top-0 z-20 border-b border-border/80 bg-card/95 backdrop-blur">
+      <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
         <div className="page-frame flex h-16 items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-brand-foreground">
+            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
               <LogoMark className="size-[1.125rem]" />
             </div>
             <div className="min-w-0">
@@ -279,33 +320,31 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 sm:hidden">
-            <Button size="icon" className="size-10" onClick={() => setAdding(true)} aria-label="添加账号">
+            <Button size="icon-lg" onClick={() => setAdding(true)} aria-label="添加账号">
               <PlusIcon />
             </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button size="icon" variant="outline" className="size-10" aria-label="更多操作">
-                  <EllipsisVerticalIcon />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-44">
-                <DropdownMenuItem onClick={() => openSettings('access')}>
-                  <Cog6ToothIcon />系统设置
-                </DropdownMenuItem>
+            <Menu>
+              <MenuTrigger render={<Button size="icon-lg" variant="outline" aria-label="更多操作" />}>
+                <EllipsisVerticalIcon />
+              </MenuTrigger>
+              <MenuPopup align="end" className="w-44">
+                <MenuItem onClick={() => openSettings('access')}>
+                  <SettingsIcon />系统设置
+                </MenuItem>
                 {authState.configured && pw && (
                   <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem className="text-bad focus:text-bad" onClick={() => { clearPw(); setPwState(null) }}>
-                      <ArrowRightStartOnRectangleIcon />退出登录
-                    </DropdownMenuItem>
+                    <MenuSeparator />
+                    <MenuItem variant="destructive" onClick={() => { clearPw(); setPwState(null) }}>
+                      <LogOutIcon />退出登录
+                    </MenuItem>
                   </>
                 )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+              </MenuPopup>
+            </Menu>
           </div>
           <div className="hidden items-center gap-2 sm:flex">
             <Button size="sm" variant="outline" onClick={() => openSettings('access')} title="系统设置" aria-label="系统设置">
-              <Cog6ToothIcon />
+              <SettingsIcon />
               <span>系统设置</span>
             </Button>
             <Button size="sm" onClick={() => setAdding(true)} aria-label="添加账号">
@@ -315,7 +354,7 @@ function App() {
             {authState.configured && pw && (
               <Button size="sm" variant="ghost" title="退出登录" aria-label="退出登录"
                 onClick={() => { clearPw(); setPwState(null) }}>
-                <ArrowRightStartOnRectangleIcon />
+                <LogOutIcon />
               </Button>
             )}
           </div>
@@ -329,48 +368,50 @@ function App() {
         <div className="space-y-6 sm:space-y-8">
           <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="page-title">
             <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 id="page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">账号调度中心</h1>
-                {count > 0 && (
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset',
-                      abnormalCount > 0
-                        ? 'bg-bad-soft text-bad ring-bad/15'
-                        : attentionCount > 0
-                          ? 'bg-warn-soft text-warn ring-warn/15'
-                          : 'bg-ok-soft text-ok ring-ok/15',
-                    )}
-                  >
-                    <span className="size-1.5 rounded-full bg-current" aria-hidden />
-                    {healthLabel}
-                  </span>
-                )}
-              </div>
+              <h1 id="page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">账号调度中心</h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                 统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
               </p>
             </div>
             <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
-                <ArrowPathIcon className={cn('size-3.5', isFetching && !isLoading && 'animate-spin')} />
                 {isRefetchError ? (
-                  <button
-                    type="button"
-                    className="rounded-sm font-medium text-bad underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-                    onClick={() => { void refetchCredentials() }}
-                  >
-                    刷新失败，点击重试
-                  </button>
+                  <>
+                    <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
+                    <button
+                      type="button"
+                      className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                      onClick={() => { void refetchCredentials() }}
+                    >
+                      刷新失败，点击重试
+                    </button>
+                  </>
                 ) : (
-                  <span>每 30 秒自动刷新</span>
+                  <>
+                    {isFetching && !isLoading ? (
+                      <RefreshCwIcon className="size-3.5 animate-spin" aria-hidden />
+                    ) : (
+                      <span className="size-1.5 rounded-full bg-success" aria-hidden />
+                    )}
+                    <span>每 30 秒自动刷新</span>
+                  </>
                 )}
             </div>
           </section>
 
-          {count > 0 && (
+          {isLoading ? (
+            <section
+              aria-label="正在加载账号池概览"
+              className="grid grid-cols-2 gap-3 lg:grid-cols-4"
+            >
+              <OverviewMetricSkeleton />
+              <OverviewMetricSkeleton />
+              <OverviewMetricSkeleton />
+              <OverviewMetricSkeleton />
+            </section>
+          ) : count > 0 && (
             <section
               aria-label="账号池概览"
-              className="grid grid-cols-2 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm lg:grid-cols-4"
+              className="grid grid-cols-2 gap-3 lg:grid-cols-4"
             >
               <OverviewMetric
                 label="可调度账号"
@@ -384,281 +425,234 @@ function App() {
                 tone={schedulableCount > 0 ? 'ok' : 'bad'}
                 active={filter === 'schedulable'}
                 onClick={() => selectMetric('schedulable')}
-                className="border-b border-r border-border/80 lg:border-b-0"
               />
               <OverviewMetric
                 label="需处理"
                 value={attentionCount}
                 status={attentionStatus}
-                icon={ExclamationTriangleIcon}
+                icon={TriangleAlertIcon}
                 tone={abnormalCount > 0 ? 'bad' : attentionCount > 0 ? 'warn' : 'neutral'}
                 active={filter === 'attention'}
                 onClick={() => selectMetric('attention')}
-                className="border-b border-border/80 lg:border-b-0 lg:border-r"
               />
               <OverviewMetric
                 label="额度预警"
                 value={nearLimitCount}
-                status={nearLimitCount > 0 ? '已达 90%' : '无预警'}
-                icon={SignalIcon}
+                status={nearLimitCount > 0 ? '使用率 ≥ 90%' : undefined}
+                icon={RadioIcon}
                 tone={nearLimitCount > 0 ? 'warn' : 'neutral'}
                 active={filter === 'nearLimit'}
                 onClick={() => selectMetric('nearLimit')}
-                className="border-r border-border/80"
               />
               <OverviewMetric
                 label="绑定设备"
                 value={deviceCount}
                 status={deviceStatus}
-                icon={DevicePhoneMobileIcon}
+                icon={SmartphoneIcon}
                 tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
-                active={filter === 'deviceFull'}
-                onClick={fullDeviceCount > 0 ? () => selectMetric('deviceFull') : undefined}
+                active={filter === 'deviceFull' || filter === 'hasDevice'}
+                onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
               />
             </section>
           )}
 
-          <section className="min-w-0 overflow-hidden rounded-xl border border-border/80 bg-card shadow-sm" aria-labelledby="account-list-title">
-          {/* 工具栏：计数 + 搜索 + 筛选 + 视图切换 + 批量 + 排序 */}
-          <div className="grid gap-4 border-b border-border/80 px-4 py-5 sm:px-6 lg:grid-cols-[auto_minmax(0,1fr)] lg:items-center">
-            <h2 id="account-list-title" className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-base font-semibold tracking-tight">
-              账号列表
-              <span className="text-xs font-normal text-muted-foreground">
-                {filtering ? (
-                  <>
-                    筛选出 <span className="tnum font-medium text-foreground">{total}</span> / 共{' '}
-                    <span className="tnum">{count}</span> 个
-                  </>
-                ) : (
-                  <>
-                    共 <span className="tnum font-medium text-foreground">{count}</span> 个
-                    {enabledCount < count && `（启用 ${enabledCount}）`}
-                  </>
+          <section className="min-w-0" aria-labelledby="account-list-title">
+            <CardFrame>
+              <CardFrameHeader>
+                <CardFrameTitle id="account-list-title">账号列表</CardFrameTitle>
+                <CardFrameDescription>
+                  {filtering ? (
+                    <>筛选出 <span className="tnum font-medium text-foreground">{total}</span> / 共 <span className="tnum">{count}</span> 个</>
+                  ) : (
+                    <>共 <span className="tnum font-medium text-foreground">{count}</span> 个{enabledCount < count && ` · 启用 ${enabledCount}`}</>
+                  )}
+                </CardFrameDescription>
+                {count > 0 && (
+                  <CardFrameAction>
+                    <span className="hidden text-xs text-muted-foreground md:inline">筛选条件会在刷新后保留</span>
+                  </CardFrameAction>
                 )}
-              </span>
-            </h2>
-            {count > 0 && (
-            <div className="min-w-0 space-y-2 lg:flex lg:items-center lg:justify-end lg:space-y-0">
-              {/* 搜索：名称或 #id */}
-              <div className="relative lg:mr-2">
-                <MagnifyingGlassIcon className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={query}
-                  onChange={(e) => resetPage(setQuery)(e.target.value)}
-                  placeholder="搜索名称或 #id"
-                  aria-label="搜索账号"
-                  className="h-10 w-full pl-8 pr-9 text-xs sm:h-9 lg:w-52 2xl:w-64"
-                />
-                {query && (
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="ghost"
-                    className="absolute right-1 top-1/2 size-8 -translate-y-1/2"
-                    onClick={() => resetPage(setQuery)('')}
-                    title="清除搜索"
-                    aria-label="清除搜索"
-                  >
-                    <XMarkIcon className="size-3" />
-                  </Button>
-                )}
-              </div>
+              </CardFrameHeader>
 
-              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center sm:justify-end">
-                {/* 状态筛选 */}
-                <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    size="sm"
-                    variant={filter === 'all' ? 'outline' : 'secondary'}
-                    className="h-10 w-full justify-center gap-1.5 px-2.5 text-xs sm:h-8 sm:w-auto"
-                  >
-                    <FunnelIcon className="size-3.5" />
-                    {FILTERS.find((f) => f.key === filter)!.label}
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  {FILTERS.map((f) => (
-                    <DropdownMenuItem key={f.key} onClick={() => resetPage(setFilter)(f.key)}>
-                      <CheckIcon className={cn('size-3.5', filter === f.key ? 'opacity-100' : 'opacity-0')} />
-                      {f.label}
-                      <span className="ml-auto pl-3 tnum text-2xs text-muted-foreground">
-                        {(creds ?? []).filter(f.match).length}
-                      </span>
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-                </DropdownMenu>
+              {count > 0 && (
+                <Card>
+                  <CardPanel className="p-3">
+                    <Toolbar className="w-full flex-col items-stretch sm:flex-row sm:flex-wrap sm:items-center">
+                      <InputGroup className="sm:min-w-56 sm:flex-1 xl:max-w-72">
+                        <InputGroupAddon><SearchIcon /></InputGroupAddon>
+                        <InputGroupInput
+                          value={query}
+                          onChange={(event) => resetPage(setQuery)(event.target.value)}
+                          placeholder="搜索名称或 #id"
+                          aria-label="搜索账号"
+                        />
+                        {query && (
+                          <InputGroupAddon align="inline-end">
+                            <Button size="icon-xs" variant="ghost" onClick={() => resetPage(setQuery)('')} aria-label="清除搜索">
+                              <XIcon />
+                            </Button>
+                          </InputGroupAddon>
+                        )}
+                      </InputGroup>
 
-                <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button size="sm" variant="outline" className="h-10 w-full justify-center gap-1.5 px-2.5 text-xs sm:h-8 sm:w-auto">
-                    <ArrowsUpDownIcon className="size-3.5" />
-                    {SORTS.find((s) => s.key === sort)!.label}
-                    {dir === 'asc' ? '↑' : '↓'}
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  {/* 与表头共用 changeSort：选中项再点一次即翻转升/降序 */}
-                  {SORTS.map((s) => (
-                    <DropdownMenuItem key={s.key} onClick={() => changeSort(s.key)}>
-                      <CheckIcon className={cn('size-3.5', sort === s.key ? 'opacity-100' : 'opacity-0')} />
-                      {s.label}
-                      {sort === s.key && (
-                        <span className="ml-auto pl-3 text-2xs text-muted-foreground">
-                          {dir === 'asc' ? '升序' : '降序'}
-                        </span>
-                      )}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-                </DropdownMenu>
+                      <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
+                      <ToolbarGroup className="grid grid-cols-2 sm:flex sm:flex-wrap">
+                        <Menu>
+                          <MenuTrigger render={<Button variant={filter === 'all' ? 'outline' : 'secondary'} />}>
+                            <ListFilterIcon />
+                            {FILTERS.find((item) => item.key === filter)!.label}
+                          </MenuTrigger>
+                          <MenuPopup align="end" className="w-52">
+                            <MenuRadioGroup value={filter}>
+                              {FILTERS.map((item) => (
+                                <MenuRadioItem key={item.key} value={item.key} onClick={() => resetPage(setFilter)(item.key)}>
+                                  <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                                    <span>{item.label}</span>
+                                    <span className="tnum text-xs text-muted-foreground">{pool.filter(item.match).length}</span>
+                                  </span>
+                                </MenuRadioItem>
+                              ))}
+                            </MenuRadioGroup>
+                          </MenuPopup>
+                        </Menu>
 
-                {/* 视图切换：卡片 / 紧凑列表 */}
-              <div className="grid h-10 grid-cols-2 items-center overflow-hidden rounded-md border border-border sm:flex sm:h-8 sm:shrink-0">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-full w-full rounded-none focus-visible:z-10 sm:w-8"
-                  onClick={() => switchView('card')}
-                  title="卡片视图"
-                  aria-label="卡片视图"
-                  aria-pressed={view === 'card'}
-                >
-                  <Squares2X2Icon className="size-4" />
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-full w-full rounded-none border-l border-border focus-visible:z-10 sm:w-8"
-                  onClick={() => switchView('list')}
-                  title="紧凑列表视图"
-                  aria-label="紧凑列表视图"
-                  aria-pressed={view === 'list'}
-                >
-                  <Bars3Icon className="size-4" />
-                </Button>
-                </div>
+                        <Menu>
+                          <MenuTrigger render={<Button variant="outline" />}>
+                            <ArrowUpDownIcon />
+                            {SORTS.find((item) => item.key === sort)!.label} {dir === 'asc' ? '↑' : '↓'}
+                          </MenuTrigger>
+                          <MenuPopup align="end" className="w-48">
+                            <MenuRadioGroup value={sort}>
+                              {SORTS.map((item) => (
+                                <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
+                                  <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                                    <span>{item.label}</span>
+                                    {sort === item.key && <span className="text-xs text-muted-foreground">{dir === 'asc' ? '升序' : '降序'}</span>}
+                                  </span>
+                                </MenuRadioItem>
+                              ))}
+                            </MenuRadioGroup>
+                          </MenuPopup>
+                        </Menu>
+                      </ToolbarGroup>
 
-                <Button
-                size="sm"
-                variant={batch ? 'secondary' : 'outline'}
-                className="h-10 w-full justify-center gap-1.5 px-2.5 text-xs sm:h-8 sm:w-auto"
-                onClick={() => { setBatch((b) => !b); setSelected(new Set()) }}
-                title="批量调整优先级"
-              >
-                <QueueListIcon className="size-3.5" />
-                批量
-                </Button>
-              </div>
-            </div>
-            )}
-          </div>
+                      <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
+                      <ToolbarGroup className="justify-between">
+                        <ToggleGroup
+                          value={[view]}
+                          onValueChange={(values) => {
+                            const next = values[values.length - 1]
+                            if (next === 'card' || next === 'list') switchView(next)
+                          }}
+                          variant="outline"
+                          aria-label="账号视图"
+                        >
+                          <ToggleGroupItem value="card" aria-label="卡片视图" title="卡片视图"><LayoutGridIcon /></ToggleGroupItem>
+                          <ToggleGroupSeparator />
+                          <ToggleGroupItem value="list" aria-label="列表视图" title="列表视图"><ListIcon /></ToggleGroupItem>
+                        </ToggleGroup>
+                        <Button
+                          variant={batch ? 'secondary' : 'outline'}
+                          onClick={() => { setBatch((value) => !value); setSelected(new Set()) }}
+                        >
+                          <ListChecksIcon />批量
+                        </Button>
+                      </ToolbarGroup>
+                    </Toolbar>
+                  </CardPanel>
+                </Card>
+              )}
 
-        {/* 批量操作条 */}
-        {count > 0 && batch && (
-          <div className="border-b border-border bg-muted/25 p-3 sm:px-6 sm:py-4">
-          <BatchActionsBar
-            all={sorted}
-            selected={selected}
-            onSelectedChange={setSelected}
-            onClose={() => { setBatch(false); setSelected(new Set()) }}
-          />
-          </div>
-        )}
-
-        {/* 卡片栅格（按当前页切片） */}
-        {isLoading ? (
-          <CredentialLoadingState view={view} selectable={batch} />
-        ) : isError && !creds ? (
-          <ErrorState error={credentialsError} onRetry={() => { void refetchCredentials() }} />
-        ) : count === 0 ? (
-          <EmptyState onAdd={() => setAdding(true)} />
-        ) : total === 0 ? (
-          <div className="px-4 py-14 text-center">
-            <span className="mx-auto grid size-10 place-items-center rounded-md bg-muted text-muted-foreground">
-              <MagnifyingGlassIcon className="size-5" />
-            </span>
-            <p className="mt-3 text-sm font-medium">没有符合条件的账号</p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-3"
-              onClick={() => { resetPage(setFilter)('all'); setQuery('') }}
-            >
-              清除筛选与搜索
-            </Button>
-          </div>
-        ) : view === 'list' ? (
-          <div>
-            <Table className="table-fixed">
-              {/* 组件默认可见（mt-4 的说明文字），这里只给读屏用 */}
-              <TableCaption className="sr-only">账号列表</TableCaption>
-              <CredentialListHeader
-                selectable={batch}
-                sort={sort}
-                dir={dir}
-                onSortChange={changeSort}
-                // 表头勾选框与批量条的「全选」同义：都作用于当前筛选结果（跨页）。
-                allSelected={sorted.length > 0 && sorted.every((c) => selected.has(c.id))}
-                onSelectAll={(on) =>
-                  setSelected(on ? new Set(sorted.map((c) => c.id)) : new Set())
-                }
-              />
-              <TableBody>
-                {pageItems.map((c) => (
-                  <CredentialRow
-                    key={c.id}
-                    cred={c}
-                    selectable={batch}
-                    selected={selected.has(c.id)}
-                    onSelectedChange={(on) => toggleSelected(c.id, on)}
+              {count > 0 && batch && (
+                <div className="relative p-4 pb-0">
+                  <BatchActionsBar
+                    all={sorted}
+                    selected={selected}
+                    onSelectedChange={setSelected}
+                    onClose={() => { setBatch(false); setSelected(new Set()) }}
                   />
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        ) : (
-          // 保持舒展的双列卡片；auto-fill 保留空轨，账号少时也不会把单卡拉得过宽。
-          <div className="grid items-stretch gap-3 bg-muted/20 p-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4 lg:p-5">
-            {pageItems.map((c) => (
-              <CredentialCard
-                key={c.id}
-                cred={c}
-                selectable={batch}
-                selected={selected.has(c.id)}
-                onSelectedChange={(on) => toggleSelected(c.id, on)}
-              />
-            ))}
-          </div>
-        )}
+                </div>
+              )}
 
-        {/* 分页条：实际超过一页才出现。 */}
-        {!isLoading && pageCount > 1 && (
-          <div className="px-4 pb-4 sm:px-6 sm:pb-5">
-          <Pagination
-            total={total}
-            page={current}
-            pageCount={pageCount}
-            pageSize={pageSize}
-            onPageChange={setPage}
-            onPageSizeChange={(n) => { setPageSize(n); setPage(1) }}
-          />
-          </div>
-        )}
+              {isLoading ? (
+                <div className="relative p-4"><CredentialLoadingState view={view} selectable={batch} /></div>
+              ) : isError && !creds ? (
+                <Card><ErrorState error={credentialsError} onRetry={() => { void refetchCredentials() }} /></Card>
+              ) : count === 0 ? (
+                <Card><EmptyState onAdd={() => setAdding(true)} /></Card>
+              ) : total === 0 ? (
+                <Card>
+                  <Empty>
+                    <EmptyHeader>
+                      <EmptyMedia variant="icon"><SearchIcon /></EmptyMedia>
+                      <EmptyTitle>没有符合条件的账号</EmptyTitle>
+                      <EmptyDescription>尝试清除当前筛选条件或搜索关键字。</EmptyDescription>
+                    </EmptyHeader>
+                    <EmptyContent>
+                      <Button variant="outline" onClick={() => { resetPage(setFilter)('all'); setQuery('') }}>清除筛选与搜索</Button>
+                    </EmptyContent>
+                  </Empty>
+                </Card>
+              ) : view === 'list' ? (
+                <Table variant="card" className="table-fixed">
+                  <TableCaption className="sr-only">账号列表</TableCaption>
+                  <CredentialListHeader
+                    selectable={batch}
+                    sort={sort}
+                    dir={dir}
+                    onSortChange={changeSort}
+                    allSelected={sorted.length > 0 && sorted.every((item) => selected.has(item.id))}
+                    onSelectAll={(on) => setSelected(on ? new Set(sorted.map((item) => item.id)) : new Set())}
+                  />
+                  <TableBody>
+                    {pageItems.map((item) => (
+                      <CredentialRow
+                        key={item.id}
+                        cred={item}
+                        selectable={batch}
+                        selected={selected.has(item.id)}
+                        onSelectedChange={(on) => toggleSelected(item.id, on)}
+                      />
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <div className="relative grid items-stretch gap-4 p-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))]">
+                  {pageItems.map((item) => (
+                    <CredentialCard
+                      key={item.id}
+                      cred={item}
+                      selectable={batch}
+                      selected={selected.has(item.id)}
+                      onSelectedChange={(on) => toggleSelected(item.id, on)}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {!isLoading && pageCount > 1 && (
+                <CardFrameFooter className="relative">
+                  <AccountPagination
+                    total={total}
+                    page={current}
+                    pageCount={pageCount}
+                    pageSize={pageSize}
+                    onPageChange={setPage}
+                    onPageSizeChange={(size) => { setPageSize(size); setPage(1) }}
+                  />
+                </CardFrameFooter>
+              )}
+            </CardFrame>
           </section>
         </div>
       </main>
       <AppFooter />
-      <Toaster position="top-right" />
     </div>
   )
 }
 
 /** 分页条：当前区间说明 + 每页条数 + 上/下一页（页码多时只渲染当前页附近的按钮）。 */
-function Pagination({
+function AccountPagination({
   total, page, pageCount, pageSize, onPageChange, onPageSizeChange,
 }: {
   total: number
@@ -673,69 +667,75 @@ function Pagination({
   // 页码窗口：当前页 ±2，两端夹紧，避免账号多时挤满一行。
   const start = Math.max(1, Math.min(page - 2, pageCount - 4))
   const pages = Array.from({ length: Math.min(5, pageCount) }, (_, i) => start + i)
+  const navigate = (event: React.MouseEvent<HTMLAnchorElement>, next: number) => {
+    event.preventDefault()
+    if (next >= 1 && next <= pageCount) onPageChange(next)
+  }
 
   return (
-    <div className="grid gap-3 border-t border-border/60 pt-4 text-xs text-muted-foreground sm:flex sm:items-center sm:justify-between">
+    <div className="grid gap-3 text-xs text-muted-foreground md:grid-cols-[1fr_auto_1fr] md:items-center">
       <span>
         第 <span className="tnum text-foreground">{from}-{to}</span> 个，共{' '}
         <span className="tnum text-foreground">{total}</span> 个账号
       </span>
-      <div className="flex items-center justify-between sm:hidden">
-        <Button
-          size="icon" variant="outline" className="size-9"
-          disabled={page <= 1} onClick={() => onPageChange(page - 1)} title="上一页"
-          aria-label="上一页"
-        >
-          <ChevronLeftIcon className="size-4" />
-        </Button>
-        <span className="tnum text-foreground">第 {page} / {pageCount} 页</span>
-        <Button
-          size="icon" variant="outline" className="size-9"
-          disabled={page >= pageCount} onClick={() => onPageChange(page + 1)} title="下一页"
-          aria-label="下一页"
-        >
-          <ChevronRightIcon className="size-4" />
-        </Button>
-      </div>
-      <div className="hidden items-center gap-1.5 sm:flex">
+      <CossPagination className="justify-start md:justify-center">
+        <PaginationContent>
+          <PaginationItem>
+            <PaginationLink
+              href="#"
+              size="icon-sm"
+              className={cn(page <= 1 && 'pointer-events-none opacity-50')}
+              aria-disabled={page <= 1}
+              aria-label="上一页"
+              onClick={(event) => navigate(event, page - 1)}
+            >
+              <ChevronLeftIcon />
+            </PaginationLink>
+          </PaginationItem>
+          {pages.map((item) => (
+            <PaginationItem key={item} className="max-sm:hidden">
+              <PaginationLink
+                href="#"
+                size="icon-sm"
+                isActive={item === page}
+                onClick={(event) => navigate(event, item)}
+              >
+                <span className="tnum">{item}</span>
+              </PaginationLink>
+            </PaginationItem>
+          ))}
+          <PaginationItem className="sm:hidden">
+            <span className="tnum px-2 text-foreground">{page} / {pageCount}</span>
+          </PaginationItem>
+          <PaginationItem>
+            <PaginationLink
+              href="#"
+              size="icon-sm"
+              className={cn(page >= pageCount && 'pointer-events-none opacity-50')}
+              aria-disabled={page >= pageCount}
+              aria-label="下一页"
+              onClick={(event) => navigate(event, page + 1)}
+            >
+              <ChevronRightIcon />
+            </PaginationLink>
+          </PaginationItem>
+        </PaginationContent>
+      </CossPagination>
+      <div className="flex items-center gap-2 md:justify-self-end">
         <span>每页</span>
-        {PAGE_SIZES.map((n) => (
-          <Button
-            key={n}
-            size="sm"
-            variant={n === pageSize ? 'secondary' : 'ghost'}
-            className="h-7 min-w-7 px-2 text-xs tnum"
-            onClick={() => onPageSizeChange(n)}
-          >
-            {n}
-          </Button>
-        ))}
-        <span className="mx-1 h-4 w-px bg-border" />
-        <Button
-          size="icon" variant="outline" className="size-7"
-          disabled={page <= 1} onClick={() => onPageChange(page - 1)} title="上一页"
-          aria-label="上一页"
+        <Select
+          items={PAGE_SIZE_ITEMS}
+          value={String(pageSize)}
+          onValueChange={(value) => {
+            const next = Number(value)
+            if (PAGE_SIZES.includes(next as (typeof PAGE_SIZES)[number])) onPageSizeChange(next)
+          }}
         >
-          <ChevronLeftIcon className="size-3.5" />
-        </Button>
-        {pages.map((p) => (
-          <Button
-            key={p}
-            size="sm"
-            variant={p === page ? 'default' : 'ghost'}
-            className="h-7 min-w-7 px-2 text-xs tnum"
-            onClick={() => onPageChange(p)}
-          >
-            {p}
-          </Button>
-        ))}
-        <Button
-          size="icon" variant="outline" className="size-7"
-          disabled={page >= pageCount} onClick={() => onPageChange(page + 1)} title="下一页"
-          aria-label="下一页"
-        >
-          <ChevronRightIcon className="size-3.5" />
-        </Button>
+          <SelectTrigger aria-label="每页账号数" size="sm" className="min-w-20"><SelectValue /></SelectTrigger>
+          <SelectPopup align="end">
+            {PAGE_SIZE_ITEMS.map((item) => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}
+          </SelectPopup>
+        </Select>
       </div>
     </div>
   )
@@ -756,18 +756,23 @@ export function BatchActionsBar({
   onClose: () => void
 }) {
   const qc = useQueryClient()
-  const [priority, setPriority] = useState('0')
-  const [limit, setLimit] = useState('')
+  const [priority, setPriority] = useState(0)
+  const [limitMode, setLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
+  const [customLimit, setCustomLimit] = useState(1)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
   const ids = [...selected]
   const n = selected.size
   const notify = (msg: string, clearSelection = false) => {
-    toast.success(msg)
+    toastManager.add({ title: msg, type: 'success' })
     qc.invalidateQueries({ queryKey: ['credentials'] })
     if (clearSelection) onSelectedChange(new Set())
   }
-  const onError = (e: unknown) => toast.error('批量操作失败', { description: extractError(e) })
+  const onError = (error: unknown) => toastManager.add({
+    title: '批量操作失败',
+    description: extractError(error),
+    type: 'error',
+  })
 
   const applyPriority = useMutation({
     mutationFn: (p: number) => setPriorities(ids, p),
@@ -801,171 +806,157 @@ export function BatchActionsBar({
     applyDisabled.isPending || applyDelete.isPending
   const none = n === 0
   const allSelected = all.length > 0 && n === all.length
+  const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
 
   return (
-    <section className="overflow-hidden rounded-lg border border-border bg-card text-xs">
-      <div className="flex items-center gap-3 border-b border-border bg-muted/30 px-3 py-3 sm:px-4">
-        <span className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
-          <QueueListIcon className="size-4" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-semibold">批量操作</h3>
-          <p className="mt-0.5 text-2xs text-muted-foreground" aria-live="polite">
-            已选 <span className="tnum font-semibold text-foreground">{n}</span> / {all.length} 个账号
-          </p>
-        </div>
-        <Button
-          size="sm"
-          variant={allSelected ? 'secondary' : 'outline'}
-          className="h-8 shrink-0 px-2.5 text-xs"
-          title="选择当前筛选结果中的全部账号，包含其他分页"
-          onClick={() => onSelectedChange(allSelected ? new Set() : new Set(all.map((c) => c.id)))}
-        >
-          {allSelected ? <><CheckIcon className="size-3.5" />已全选</> : '全选'}
-        </Button>
-        <Button size="icon" variant="ghost" className="size-8 shrink-0" onClick={onClose} title="退出批量模式" aria-label="退出批量模式">
-          <XMarkIcon className="size-4" />
-        </Button>
-      </div>
-
-      <div className="grid gap-3 p-3 sm:p-4 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
-        <div className="rounded-md border border-border bg-background p-3">
-          <div className="mb-2">
-            <h4 className="text-xs font-medium">快捷操作</h4>
-          </div>
-          <div className="grid grid-cols-3 gap-2">
-          <Button
-            size="sm" variant="outline" className="w-full px-2 text-xs text-ok hover:text-ok"
-            disabled={none || busy}
-            onClick={() => applyDisabled.mutate(false)}
-          >
-            <PlayIcon className="size-3.5" />启用
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">批量操作</CardTitle>
+        <CardDescription aria-live="polite">
+          已选 <span className="tnum font-medium text-foreground">{n}</span> / {all.length} 个账号
+        </CardDescription>
+        <CardAction>
+          <Button size="icon-sm" variant="ghost" onClick={onClose} title="退出批量模式" aria-label="退出批量模式">
+            <XIcon />
           </Button>
-          <Button
-            size="sm" variant="outline" className="w-full px-2 text-xs"
-            disabled={none || busy}
-            onClick={() => applyDisabled.mutate(true)}
-          >
-            <PauseIcon className="size-3.5" />停用
-          </Button>
-          <Button
-            size="sm" variant="outline" className="w-full px-2 text-xs text-bad hover:text-bad"
-            disabled={none || busy}
-            onClick={() => setConfirmDelete(true)}
-          >
-            <TrashIcon className="size-3.5" />删除
-          </Button>
-          </div>
-          {none && <p className="mt-2.5 text-2xs text-muted-foreground">请先勾选需要处理的账号</p>}
+        </CardAction>
+      </CardHeader>
+      <CardPanel className="space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+            <Checkbox
+              checked={allSelected}
+              indeterminate={n > 0 && !allSelected}
+              onCheckedChange={(checked) => onSelectedChange(checked ? new Set(all.map((item) => item.id)) : new Set())}
+            />
+            选择当前筛选结果
+          </label>
+          <Toolbar className="p-1">
+            <Button size="sm" variant="outline" disabled={none || busy} loading={applyDisabled.isPending && applyDisabled.variables === false} onClick={() => applyDisabled.mutate(false)}>
+              <PlayIcon />启用
+            </Button>
+            <Button size="sm" variant="outline" disabled={none || busy} loading={applyDisabled.isPending && applyDisabled.variables === true} onClick={() => applyDisabled.mutate(true)}>
+              <PauseIcon />停用
+            </Button>
+            <Button size="sm" variant="destructive-outline" disabled={none || busy} onClick={() => setConfirmDelete(true)}>
+              <Trash2Icon />删除
+            </Button>
+          </Toolbar>
         </div>
 
-        <div className="overflow-hidden rounded-md border border-border bg-muted/20 sm:grid sm:grid-cols-2 sm:divide-x sm:divide-y-0">
-          <div className="border-b border-border p-3 sm:border-b-0">
-            <div className="mb-2 flex items-baseline justify-between gap-3">
-              <label htmlFor="batch-priority" className="text-xs font-medium">调度优先级</label>
-              <span className="text-2xs text-muted-foreground">数值越小越优先</span>
+        {none && (
+          <Alert>
+            <ListChecksIcon />
+            <AlertTitle>尚未选择账号</AlertTitle>
+            <AlertDescription>先在当前筛选结果中勾选需要处理的账号。</AlertDescription>
+          </Alert>
+        )}
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-2">
+            <div>
+              <div className="text-sm font-medium">调度优先级</div>
+              <div className="text-xs text-muted-foreground">数值越小越优先</div>
             </div>
-            <div className="flex items-center gap-2">
-              <Input
+            <div className="flex items-end gap-2">
+              <NumberField
                 id="batch-priority"
-                type="number"
                 value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                className="h-8 min-w-0 flex-1 font-mono text-xs"
-                aria-label="批量设置优先级"
-              />
-              <Button
-                size="sm" className="h-8 shrink-0 px-2.5 text-xs"
-                disabled={none || busy}
-                onClick={() => applyPriority.mutate(Math.floor(Number(priority) || 0))}
+                min={0}
+                step={1}
+                size="sm"
+                onValueChange={(value) => setPriority(Math.max(0, Math.floor(value ?? 0)))}
               >
-                {applyPriority.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+                <NumberFieldGroup>
+                  <NumberFieldDecrement />
+                  <NumberFieldInput aria-label="批量设置优先级" />
+                  <NumberFieldIncrement />
+                </NumberFieldGroup>
+              </NumberField>
+              <Button size="sm" loading={applyPriority.isPending} disabled={none || busy} onClick={() => applyPriority.mutate(priority)}>
                 应用
               </Button>
             </div>
           </div>
 
-          <div className="p-3">
-            <div className="mb-2 flex items-baseline justify-between gap-3">
-              <label htmlFor="batch-device-limit" className="text-xs font-medium">设备上限</label>
-              <span className="text-2xs text-muted-foreground">空=默认 · 0=不限</span>
+          <div className="space-y-2">
+            <div>
+              <div className="text-sm font-medium">设备上限</div>
+              <div className="text-xs text-muted-foreground">明确选择默认、不限或独立上限</div>
             </div>
-            <div className="flex items-center gap-2">
-              <Input
-                id="batch-device-limit"
-                type="number"
-                min={0}
-                value={limit}
-                onChange={(e) => setLimit(e.target.value)}
-                placeholder="默认"
-                className="h-8 min-w-0 flex-1 font-mono text-xs"
-                aria-label="批量设置设备上限"
-              />
-              <Button
-                size="sm" className="h-8 shrink-0 px-2.5 text-xs"
-                disabled={none || busy}
-                onClick={() => applyLimit.mutate(inputToLimit(limit))}
-              >
-                {applyLimit.isPending ? <ArrowPathIcon className="size-3.5 animate-spin" /> : <CheckIcon className="size-3.5" />}
+            <div className="flex items-end gap-2">
+              <Select items={LIMIT_MODE_ITEMS} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
+                <SelectTrigger aria-label="批量设置设备上限策略" size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectPopup>
+                  {LIMIT_MODE_ITEMS.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {limitMode === 'custom' && (
+                <NumberField value={customLimit} min={1} step={1} size="sm" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
+                  <NumberFieldGroup>
+                    <NumberFieldDecrement />
+                    <NumberFieldInput aria-label="批量设置独立设备上限" />
+                    <NumberFieldIncrement />
+                  </NumberFieldGroup>
+                </NumberField>
+              )}
+              <Button size="sm" loading={applyLimit.isPending} disabled={none || busy} onClick={() => applyLimit.mutate(deviceLimit)}>
                 应用
               </Button>
             </div>
           </div>
         </div>
-      </div>
+      </CardPanel>
 
-      {/* 删号会连带清掉历史用量与设备绑定，批量更需要明确确认。 */}
-      <ConfirmDialog
-        open={confirmDelete}
-        onOpenChange={setConfirmDelete}
-        title={`删除 ${n} 个账号`}
-        confirmText={`删除 ${n} 个`}
-        pending={applyDelete.isPending}
-        onConfirm={() => applyDelete.mutate()}
-        description={
-          <>
-            确定删除选中的 <span className="font-medium text-foreground">{n}</span> 个账号？
-            它们的历史用量记录与设备绑定将一并清除，不可恢复。
-          </>
-        }
-      />
-    </section>
+      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除 {n} 个账号</AlertDialogTitle>
+            <AlertDialogDescription>
+              确定删除选中的 {n} 个账号？历史用量记录与设备绑定将一并清除，且无法恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>取消</AlertDialogClose>
+            <Button variant="destructive" loading={applyDelete.isPending} onClick={() => applyDelete.mutate()}>
+              删除 {n} 个
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </Card>
   )
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   return (
-    <div className="px-5 py-14 text-center sm:py-16">
-      <span className="mx-auto grid size-11 place-items-center rounded-lg bg-brand-soft text-brand">
-        <PlusIcon className="size-5" />
-      </span>
-      <p className="mt-3 text-sm font-semibold">建立第一个调度账号</p>
-      <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">
-        完成 Claude OAuth 授权后，账号会加入当前网关的调度池。
-      </p>
-      <Button className="mt-4" onClick={onAdd}>
-        <PlusIcon />
-        添加第一个账号
-      </Button>
-    </div>
+    <Empty>
+      <EmptyHeader>
+        <EmptyMedia variant="icon"><PlusIcon /></EmptyMedia>
+        <EmptyTitle>建立第一个调度账号</EmptyTitle>
+        <EmptyDescription>完成 Claude OAuth 授权后，账号会加入当前网关的调度池。</EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button onClick={onAdd}><PlusIcon />添加第一个账号</Button>
+      </EmptyContent>
+    </Empty>
   )
 }
 
 function ErrorState({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   return (
-    <div className="px-5 py-14 text-center sm:py-16">
-      <span className="mx-auto grid size-11 place-items-center rounded-lg bg-bad-soft text-bad">
-        <ExclamationTriangleIcon className="size-5" />
-      </span>
-      <p className="mt-3 text-sm font-semibold">暂时无法读取账号</p>
-      <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-muted-foreground">
-        {extractError(error)}
-      </p>
-      <Button variant="outline" className="mt-4" onClick={onRetry}>
-        <ArrowPathIcon />
-        重新加载
-      </Button>
-    </div>
+    <Empty role="alert">
+      <EmptyHeader>
+        <EmptyMedia variant="icon"><TriangleAlertIcon /></EmptyMedia>
+        <EmptyTitle>暂时无法读取账号</EmptyTitle>
+        <EmptyDescription className="break-words">{extractError(error)}</EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button variant="outline" onClick={onRetry}><RefreshCwIcon />重新加载</Button>
+      </EmptyContent>
+    </Empty>
   )
 }
 
@@ -973,7 +964,7 @@ function LoadingState({ fullPage = false }: { fullPage?: boolean }) {
   return (
     <div className={cn('grid place-items-center', fullPage ? 'min-h-dvh' : 'py-16')}>
       <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status" aria-live="polite">
-        <ArrowPathIcon className="size-4 animate-spin" />
+        <Spinner />
         加载中
       </div>
     </div>

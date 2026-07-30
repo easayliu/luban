@@ -53,11 +53,6 @@ export default defineConfig({
     react(),
     tailwindcss(),
     dropWoff1(),
-    // 注：度量对齐的后备字体没有走 fontaine 的构建期插件，而是用它的计算函数一次性算好、
-    // 固化在 src/index.css 里（生成脚本 scripts/gen-font-fallback.mjs）。插件方式在本项目
-    // 行不通：它只改写 `font-family:` 声明，看不见 Tailwind v4 `@theme` 里的自定义属性，
-    // 生成的后备族名压根不会被引用；且其默认命名取字族名首词，"Fira Sans" 与 "Fira Code"
-    // 会双双塌缩成 "Fira fallback"，两套相差 30% 的度量顶着同一个名字互相覆盖。
   ],
   base: '/',
   define: {

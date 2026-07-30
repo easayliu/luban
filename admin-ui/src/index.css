@@ -1,294 +1,189 @@
-/* 字体自托管（Fontsource），不走 Google CDN——luban 是单二进制自包含部署，
-   字体现连 fonts.gstatic.com 会让内网/离线环境永远停在后备字体，且那个 <link>
-   是渲染阻塞的，在拿不到 googleapis 的网络环境里要挂到超时才放行首屏。
-   打进 dist/assets/ 后由 rust-embed 一并塞进二进制，缓存策略走既有的 immutable 一年。
-
-   只导入实际用到的字重 + latin 子集：界面中文本来就落在系统中文字体上，
-   Fira 的 cyrillic/greek 一个字都用不到。sans 400/500/600/700，mono 400/500/700。 */
-@import "@fontsource/fira-sans/latin-400.css";
-@import "@fontsource/fira-sans/latin-500.css";
-@import "@fontsource/fira-sans/latin-600.css";
-@import "@fontsource/fira-sans/latin-700.css";
-@import "@fontsource/fira-code/latin-400.css";
-@import "@fontsource/fira-code/latin-500.css";
-@import "@fontsource/fira-code/latin-700.css";
-
 @import "tailwindcss";
-@import "tw-animate-css";
+@import "@fontsource-variable/inter";
 
-/* ---------------------------------------------------------------------------
-   度量对齐的后备字体。
-
-   Fira 尚未就位的那一小段时间里，文字先由系统字体渲染，字体到位后换上去——若两者
-   字宽/行高不同，换字瞬间整页重排，这就是「强刷时数字会横向抖动」的来源。挂 tnum 的
-   数字尤其明显：等宽数字在两套字体里步进不同，而周围中文两边都落在同一个系统中文字体
-   上纹丝不动，一动一不动对比才格外扎眼。
-
-   下面用 size-adjust / ascent-override 把系统字体的度量校准到与 Fira 一致，于是换字
-   不再产生位移。这些数字由 `node scripts/gen-font-fallback.mjs` 从真实字体文件算出
-   （fontaine + capsize 度量库），换字体或改字重时重跑该脚本覆盖此段，不要手改。
-
-   src 按平台命中率排序，浏览器取第一个 local() 能解析到的：Helvetica Neue = macOS，
-   Segoe UI = Windows，Roboto = Android/部分 Linux，Arial 兜底。Fira Sans 的 500/600/700
-   三档平均字宽相同、合成一条区间规则；Fira Code 三档亦然，且它对 Courier New 的
-   size-adjust 是 99.98%——等宽之间本就几乎对齐。
-   --------------------------------------------------------------------------- */
+/* The coss font registry targets Next.js. Wire the same Geist Mono asset directly
+   for this Vite application so the official typography contract remains intact. */
 @font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Helvetica Neue");
-  size-adjust: 101.7778%;
-  ascent-override: 91.8668%;
-  descent-override: 26.0371%;
-  line-gap-override: 0%;
-  font-weight: 400;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Segoe UI");
-  size-adjust: 103.3022%;
-  ascent-override: 90.5111%;
-  descent-override: 25.6529%;
-  line-gap-override: 0%;
-  font-weight: 400;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Roboto");
-  size-adjust: 102.962%;
-  ascent-override: 90.8102%;
-  descent-override: 25.7376%;
-  line-gap-override: 0%;
-  font-weight: 400;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Arial");
-  size-adjust: 102.7365%;
-  ascent-override: 91.0095%;
-  descent-override: 25.7942%;
-  line-gap-override: 0%;
-  font-weight: 400;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Helvetica Neue");
-  size-adjust: 102%;
-  ascent-override: 91.6667%;
-  descent-override: 25.9804%;
-  line-gap-override: 0%;
-  font-weight: 500 700;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Segoe UI");
-  size-adjust: 103.5278%;
-  ascent-override: 90.3139%;
-  descent-override: 25.597%;
-  line-gap-override: 0%;
-  font-weight: 500 700;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Roboto");
-  size-adjust: 103.1868%;
-  ascent-override: 90.6123%;
-  descent-override: 25.6816%;
-  line-gap-override: 0%;
-  font-weight: 500 700;
-}
-@font-face {
-  font-family: "Fira Sans fallback";
-  src: local("Arial");
-  size-adjust: 102.9608%;
-  ascent-override: 90.8113%;
-  descent-override: 25.738%;
-  line-gap-override: 0%;
-  font-weight: 500 700;
-}
-@font-face {
-  font-family: "Fira Code fallback";
-  src: local("Courier New");
-  size-adjust: 99.9837%;
-  ascent-override: 99.0161%;
-  descent-override: 32.2052%;
-  line-gap-override: 0%;
-  font-weight: 400 700;
+  font-family: "Geist Mono";
+  src: url("../node_modules/geist/dist/fonts/geist-mono/GeistMono-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
 }
 
-/* 深浅色跟随 <html> 上的 .dark 类（由 main.tsx 按系统主题切换）。 */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* v4 CSS-first 主题令牌：颜色引用下方 :root/.dark 的 HSL 变量，随主题动态生效。 */
-@theme {
-  /* "* fallback" 是 vite.config.ts 里 fontaine 生成的度量对齐后备（size-adjust 等已校准到
-     与 Fira 一致），必须排在真字体之后、系统字体之前：Fira 未就位时由它顶上，字宽行高
-     跟最终形态一致，换字时不产生重排。这两行得手写——fontaine 只改写 `font-family:`
-     声明，看不见 Tailwind v4 `@theme` 里的自定义属性。 */
-  --font-sans: "Fira Sans", "Fira Sans fallback", system-ui, sans-serif;
-  --font-mono: "Fira Code", "Fira Code fallback", ui-monospace, SFMono-Regular, Menlo, monospace;
+@theme inline {
+  --font-sans: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-heading: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   --text-2xs: 0.6875rem;
   --text-2xs--line-height: 1rem;
 
-  --color-background: hsl(var(--background));
-  --color-foreground: hsl(var(--foreground));
-  --color-surface: hsl(var(--surface));
-  --color-surface-2: hsl(var(--surface-2));
-  --color-border: hsl(var(--border));
-  --color-input: hsl(var(--input));
-  --color-ring: hsl(var(--ring));
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
 
-  --color-card: hsl(var(--card));
-  --color-card-foreground: hsl(var(--card-foreground));
+  --animate-skeleton: skeleton 2s -1s infinite linear;
+  --animate-toast-success-odd: toast-success-odd 0.32s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-success-even: toast-success-even 0.32s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-error-odd: toast-error-odd 0.28s cubic-bezier(0.5, 1, 0.89, 1);
+  --animate-toast-error-even: toast-error-even 0.28s cubic-bezier(0.5, 1, 0.89, 1);
 
-  --color-primary: hsl(var(--primary));
-  --color-primary-foreground: hsl(var(--primary-foreground));
-  --color-primary-soft: hsl(var(--primary-soft));
+  @keyframes skeleton {
+    to {
+      background-position: -200% 0;
+    }
+  }
 
-  --color-secondary: hsl(var(--secondary));
-  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  @keyframes toast-success-odd {
+    0% {
+      scale: 1;
+    }
+    30% {
+      scale: 1.025;
+    }
+    60% {
+      scale: 0.99;
+    }
+    100% {
+      scale: 1;
+    }
+  }
 
-  --color-muted: hsl(var(--muted));
-  --color-muted-foreground: hsl(var(--muted-foreground));
+  @keyframes toast-success-even {
+    0% {
+      scale: 1;
+    }
+    30% {
+      scale: 1.025;
+    }
+    60% {
+      scale: 0.99;
+    }
+    100% {
+      scale: 1;
+    }
+  }
 
-  --color-accent: hsl(var(--accent));
-  --color-accent-foreground: hsl(var(--accent-foreground));
+  @keyframes toast-error-odd {
+    0%,
+    100% {
+      translate: 0 0;
+    }
+    25%,
+    75% {
+      translate: -3px 0;
+    }
+    50% {
+      translate: 3px 0;
+    }
+  }
 
-  --color-destructive: hsl(var(--destructive));
-  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  @keyframes toast-error-even {
+    0%,
+    100% {
+      translate: 0 0;
+    }
+    25%,
+    75% {
+      translate: -3px 0;
+    }
+    50% {
+      translate: 3px 0;
+    }
+  }
+}
 
-  --color-ok: hsl(var(--ok));
-  --color-ok-foreground: hsl(var(--ok-foreground));
-  --color-ok-soft: hsl(var(--ok-soft));
+:root {
+  --accent: --alpha(var(--color-black) / 4%);
+  --accent-foreground: var(--color-neutral-800);
+  --background: var(--color-white);
+  --border: --alpha(var(--color-black) / 8%);
+  --card: var(--color-white);
+  --card-foreground: var(--color-neutral-800);
+  --destructive: var(--color-red-500);
+  --destructive-foreground: var(--color-red-700);
+  --foreground: var(--color-neutral-800);
+  --info: var(--color-blue-500);
+  --info-foreground: var(--color-blue-700);
+  --input: --alpha(var(--color-black) / 10%);
+  --muted: --alpha(var(--color-black) / 4%);
+  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-black));
+  --popover: var(--color-white);
+  --popover-foreground: var(--color-neutral-800);
+  --primary: var(--color-neutral-800);
+  --primary-foreground: var(--color-neutral-50);
+  --ring: var(--color-neutral-400);
+  --secondary: --alpha(var(--color-black) / 4%);
+  --secondary-foreground: var(--color-neutral-800);
+  --success: var(--color-emerald-500);
+  --success-foreground: var(--color-emerald-700);
+  --warning: var(--color-amber-500);
+  --warning-foreground: var(--color-amber-700);
+}
 
-  --color-warn: hsl(var(--warn));
-  --color-warn-foreground: hsl(var(--warn-foreground));
-  --color-warn-soft: hsl(var(--warn-soft));
-
-  --color-bad: hsl(var(--bad));
-  --color-bad-foreground: hsl(var(--bad-foreground));
-  --color-bad-soft: hsl(var(--bad-soft));
-
-  --color-brand: hsl(var(--brand));
-  --color-brand-foreground: hsl(var(--brand-foreground));
-  --color-brand-soft: hsl(var(--brand-soft));
-
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-
-  --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.04);
-  --shadow-elev: 0 4px 12px -4px rgb(0 0 0 / 0.12);
-  --shadow-panel: 0 1px 3px 0 rgb(0 0 0 / 0.08), 0 1px 2px -1px rgb(0 0 0 / 0.06);
-  --shadow-brand: 0 8px 18px -8px hsl(var(--brand) / 0.55);
-  --shadow-stripe: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+.dark {
+  --accent: --alpha(var(--color-white) / 4%);
+  --accent-foreground: var(--color-neutral-100);
+  --background: color-mix(in srgb, var(--color-neutral-950) 95%, var(--color-white));
+  --border: --alpha(var(--color-white) / 6%);
+  --card: color-mix(in srgb, var(--background) 98%, var(--color-white));
+  --card-foreground: var(--color-neutral-100);
+  --destructive: color-mix(in srgb, var(--color-red-500) 90%, var(--color-white));
+  --destructive-foreground: var(--color-red-400);
+  --foreground: var(--color-neutral-100);
+  --info: var(--color-blue-500);
+  --info-foreground: var(--color-blue-400);
+  --input: --alpha(var(--color-white) / 8%);
+  --muted: --alpha(var(--color-white) / 4%);
+  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-white));
+  --popover: color-mix(in srgb, var(--background) 98%, var(--color-white));
+  --popover-foreground: var(--color-neutral-100);
+  --primary: var(--color-neutral-100);
+  --primary-foreground: var(--color-neutral-800);
+  --ring: var(--color-neutral-500);
+  --secondary: --alpha(var(--color-white) / 4%);
+  --secondary-foreground: var(--color-neutral-100);
+  --success: var(--color-emerald-500);
+  --success-foreground: var(--color-emerald-400);
+  --warning: var(--color-amber-500);
+  --warning-foreground: var(--color-amber-400);
 }
 
 @layer base {
-  :root {
-    /* shadcn/ui New York 的 neutral 基底；品牌橙只用于品牌标识。 */
-    --background: 0 0% 98%;
-    --surface: 0 0% 100%;
-    --surface-2: 0 0% 96.1%;
-    --foreground: 0 0% 9%;
-
-    --card: 0 0% 100%;
-    --card-foreground: 0 0% 9%;
-
-    --primary: 0 0% 9%;
-    --primary-foreground: 0 0% 100%;
-    --primary-soft: 0 0% 96.1%;
-
-    --secondary: 0 0% 96.1%;
-    --secondary-foreground: 0 0% 9%;
-
-    --muted: 0 0% 96.1%;
-    --muted-foreground: 0 0% 45.1%;
-
-    --accent: 0 0% 96.1%;
-    --accent-foreground: 0 0% 9%;
-
-    --destructive: 347 77% 42%;
-    --destructive-foreground: 0 0% 100%;
-
-    --ok: 160 84% 27%;
-    --ok-foreground: 0 0% 100%;
-    --ok-soft: 160 45% 95%;
-
-    --warn: 30 90% 33%;
-    --warn-foreground: 0 0% 100%;
-    --warn-soft: 38 85% 94%;
-
-    --bad: 347 78% 42%;
-    --bad-foreground: 0 0% 100%;
-    --bad-soft: 347 80% 97%;
-
-    --brand: 27 91% 44%;
-    --brand-foreground: 0 0% 100%;
-    --brand-soft: 31 95% 94%;
-
-    --border: 0 0% 89.8%;
-    --input: 0 0% 89.8%;
-    --ring: 0 0% 9%;
-    --radius: 0.5rem;
-  }
-
-  .dark {
-    --background: 240 10% 3.9%;
-    --surface: 240 6% 10%;
-    --surface-2: 240 5% 15%;
-    --foreground: 0 0% 98%;
-
-    --card: 240 6% 10%;
-    --card-foreground: 0 0% 98%;
-
-    --primary: 0 0% 98%;
-    --primary-foreground: 240 6% 10%;
-    --primary-soft: 240 5% 20%;
-
-    --secondary: 240 4% 16%;
-    --secondary-foreground: 0 0% 98%;
-
-    --muted: 240 4% 16%;
-    --muted-foreground: 240 5% 65%;
-
-    --accent: 240 4% 16%;
-    --accent-foreground: 0 0% 98%;
-
-    --destructive: 347 60% 33%;
-    --destructive-foreground: 0 0% 98%;
-
-    --ok: 160 84% 45%;
-    --ok-foreground: 240 6% 10%;
-    --ok-soft: 160 40% 13%;
-
-    --warn: 43 96% 56%;
-    --warn-foreground: 240 6% 10%;
-    --warn-soft: 40 50% 15%;
-
-    --bad: 349 90% 72%;
-    --bad-foreground: 240 6% 10%;
-    --bad-soft: 347 45% 16%;
-
-    --brand: 31 92% 58%;
-    --brand-foreground: 28 18% 9%;
-    --brand-soft: 30 45% 14%;
-
-    --border: 240 5% 22%;
-    --input: 240 5% 22%;
-    --ring: 0 0% 98%;
-  }
-
-  /* v4 默认边框色为 currentColor；沿用设计令牌统一为 border 色。 */
   *,
-  ::after,
-  ::before {
-    border-color: hsl(var(--border));
+  ::before,
+  ::after {
+    border-color: var(--border);
   }
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: hsl(var(--muted-foreground) / 0.35) transparent;
+    scrollbar-color: color-mix(in srgb, var(--muted-foreground) 35%, transparent) transparent;
   }
 
   *::-webkit-scrollbar {
@@ -305,37 +200,45 @@
     min-height: 40px;
     border: 3px solid transparent;
     border-radius: 9999px;
-    background-color: hsl(var(--muted-foreground) / 0.32);
+    background-color: color-mix(in srgb, var(--muted-foreground) 32%, transparent);
     background-clip: padding-box;
   }
 
   *::-webkit-scrollbar-thumb:hover {
-    background-color: hsl(var(--muted-foreground) / 0.5);
+    background-color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
   }
 
   *::-webkit-scrollbar-thumb:active {
-    background-color: hsl(var(--muted-foreground) / 0.65);
+    background-color: color-mix(in srgb, var(--muted-foreground) 65%, transparent);
   }
 
   html {
+    color-scheme: light;
     -webkit-text-size-adjust: 100%;
     text-rendering: optimizeLegibility;
+    @apply font-sans;
+  }
+
+  html.dark {
+    color-scheme: dark;
   }
 
   body {
-    @apply bg-background text-foreground font-sans antialiased;
+    position: relative;
+    min-height: 100svh;
+    @apply bg-background font-sans text-foreground antialiased;
   }
 
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color-scheme: dark;
-    }
+  #root {
+    position: relative;
+    isolation: isolate;
+    min-height: 100svh;
   }
 }
 
 @layer components {
   .app-shell {
-    background: hsl(var(--muted) / 0.24);
+    background: var(--muted);
   }
 
   .app-header {
@@ -354,6 +257,12 @@
     padding-bottom: env(safe-area-inset-bottom);
   }
 
+  .brand-mark {
+    color: var(--primary-foreground);
+    background: var(--primary);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
   @media (min-width: 40rem) {
     .page-frame {
       padding-left: max(1.5rem, env(safe-area-inset-left));
@@ -366,11 +275,6 @@
       padding-left: max(2rem, env(safe-area-inset-left));
       padding-right: max(2rem, env(safe-area-inset-right));
     }
-  }
-
-  .brand-mark {
-    background: hsl(var(--brand));
-    box-shadow: inset 0 0 0 1px hsl(18 86% 38% / 0.25);
   }
 }
 
@@ -385,26 +289,13 @@
   }
 }
 
-@utility label-eyebrow {
-  @apply font-mono text-2xs font-medium uppercase text-muted-foreground;
-  letter-spacing: 0.08em;
-}
-
 @utility tnum {
   font-variant-numeric: tabular-nums slashed-zero;
 }
 
-@utility scrollbar-none {
-  scrollbar-width: none;
-
-  &::-webkit-scrollbar {
-    display: none;
-  }
-}
-
 @utility scrollbar-dialog {
   scrollbar-width: thin;
-  scrollbar-color: hsl(var(--border)) transparent;
+  scrollbar-color: var(--border) transparent;
   scrollbar-gutter: stable;
 
   &::-webkit-scrollbar {
@@ -428,15 +319,15 @@
     min-height: 48px;
     border: 2px solid transparent;
     border-radius: 9999px;
-    background-color: hsl(var(--border));
+    background-color: var(--border);
     background-clip: padding-box;
   }
 
   &::-webkit-scrollbar-thumb:hover {
-    background-color: hsl(var(--muted-foreground) / 0.42);
+    background-color: color-mix(in srgb, var(--muted-foreground) 42%, transparent);
   }
 
   &::-webkit-scrollbar-thumb:active {
-    background-color: hsl(var(--muted-foreground) / 0.58);
+    background-color: color-mix(in srgb, var(--muted-foreground) 58%, transparent);
   }
 }

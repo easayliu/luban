@@ -1,29 +1,30 @@
-import * as React from 'react'
-import * as SwitchPrimitive from '@radix-ui/react-switch'
-import { cn } from '@/lib/utils'
+"use client";
 
-type SwitchProps = React.ComponentPropsWithoutRef<typeof SwitchPrimitive.Root> & {
-  /** default：开=primary（黑）。success：开=绿色（启用/健康语义）。 */
-  variant?: 'default' | 'success'
-}
+import { Switch as SwitchPrimitive } from "@base-ui/react/switch";
+import type React from "react";
+import { cn } from "@/lib/utils";
 
-const Switch = React.forwardRef<React.ElementRef<typeof SwitchPrimitive.Root>, SwitchProps>(
-  ({ className, variant = 'default', ...props }, ref) => (
+export function Switch({
+  className,
+  ...props
+}: SwitchPrimitive.Root.Props): React.ReactElement {
+  return (
     <SwitchPrimitive.Root
-      ref={ref}
       className={cn(
-        'peer inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50 data-[state=unchecked]:bg-muted-foreground/30',
-        variant === 'success'
-          ? 'focus-visible:ring-ok/40 data-[state=checked]:bg-ok'
-          : 'data-[state=checked]:bg-primary',
+        "inline-flex h-[calc(var(--thumb-size)+2px)] w-[calc(var(--thumb-size)*2-2px)] shrink-0 items-center rounded-full p-px outline-none transition-[background-color,box-shadow] duration-200 [--thumb-size:--spacing(5)] focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background data-disabled:cursor-not-allowed data-checked:bg-primary data-unchecked:bg-input data-disabled:opacity-64 sm:[--thumb-size:--spacing(4)]",
         className,
       )}
+      data-slot="switch"
       {...props}
     >
-      <SwitchPrimitive.Thumb className="pointer-events-none block h-4 w-4 rounded-full bg-background shadow-sm ring-0 transition-transform data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0" />
+      <SwitchPrimitive.Thumb
+        className={cn(
+          "pointer-events-none block aspect-square h-full origin-left in-[[role=switch]:active,[data-slot=label]:active,[data-slot=field-label]:active]:not-data-disabled:scale-x-110 in-[[role=switch]:active,[data-slot=label]:active,[data-slot=field-label]:active]:rounded-[var(--thumb-size)/calc(var(--thumb-size)*1.1)] rounded-(--thumb-size) bg-background shadow-sm/5 will-change-transform [transition:translate_.15s,border-radius_.15s,scale_.1s_.1s,transform-origin_.15s] data-checked:origin-[var(--thumb-size)_50%] data-checked:translate-x-[calc(var(--thumb-size)-4px)]",
+        )}
+        data-slot="switch-thumb"
+      />
     </SwitchPrimitive.Root>
-  ),
-)
-Switch.displayName = SwitchPrimitive.Root.displayName
+  );
+}
 
-export { Switch }
+export { SwitchPrimitive };

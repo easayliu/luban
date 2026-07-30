@@ -1,44 +1,86 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Cog6ToothIcon, EyeIcon, EyeSlashIcon, ClipboardDocumentIcon, CheckIcon, SparklesIcon,
-  ArrowDownTrayIcon, TrashIcon, ArrowPathIcon, KeyIcon,
-} from '@heroicons/react/24/outline'
-import { toast } from 'sonner'
+  CheckIcon,
+  ClipboardIcon,
+  EyeIcon,
+  EyeOffIcon,
+  KeyRoundIcon,
+  SaveIcon,
+  Settings2Icon,
+  SparklesIcon,
+  Trash2Icon,
+} from 'lucide-react'
 import {
-  getSettings, setApiKey, setBareRateLimit, setDefaultDeviceLimit, setDeviceTtl,
-  setRequireDeviceId, type Settings,
+  getSettings,
+  setApiKey,
+  setBareRateLimit,
+  setDefaultDeviceLimit,
+  setDeviceTtl,
+  setRequireDeviceId,
+  type Settings,
 } from '@/api/settings'
-import { getAuthState, setup as setupPassword, changePassword } from '@/api/auth'
-import { setPw, clearPw } from '@/api/client'
-import { cn, copyText, extractError, formatDuration } from '@/lib/utils'
+import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
+import { clearPw, setPw } from '@/api/client'
+import { copyText, extractError, formatDuration } from '@/lib/utils'
 import {
-  Dialog, DialogContent, DialogHeader, DialogBody, DialogTitle,
-} from '@/components/ui/dialog'
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogDescription,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Frame, FrameHeader, FramePanel, FrameTitle } from '@/components/ui/frame'
 import { Input } from '@/components/ui/input'
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from '@/components/ui/input-group'
+import {
+  NumberField,
+  NumberFieldDecrement,
+  NumberFieldGroup,
+  NumberFieldIncrement,
+  NumberFieldInput,
+} from '@/components/ui/number-field'
+import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { toastManager } from '@/components/ui/toast'
 
 export function AccessSettings({
-  open, onOpenChange,
+  open,
+  onOpenChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl" aria-describedby={undefined}>
+      <DialogPopup className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>
-            <Cog6ToothIcon className="size-4" />
+          <DialogTitle className="flex items-center gap-2">
+            <Settings2Icon aria-hidden="true" />
             接入设置
           </DialogTitle>
+          <DialogDescription>配置客户端接入、设备策略和控制台安全。</DialogDescription>
         </DialogHeader>
-        <DialogBody>
+        <DialogPanel>
           <AccessSettingsContent />
-        </DialogBody>
-      </DialogContent>
+        </DialogPanel>
+      </DialogPopup>
     </Dialog>
   )
 }
@@ -51,16 +93,31 @@ export function AccessSettingsContent() {
   const [draft, setDraft] = useState('')
   const [show, setShow] = useState(false)
   const [clearKeyOpen, setClearKeyOpen] = useState(false)
-  useEffect(() => { setDraft(data?.api_key ?? '') }, [data?.api_key])
+
+  useEffect(() => {
+    setDraft(data?.api_key ?? '')
+  }, [data?.api_key])
 
   const save = useMutation({
     mutationFn: (key: string) => setApiKey(key),
-    onSuccess: (s: Settings) => {
+    onSuccess: (settings: Settings) => {
       setClearKeyOpen(false)
-      toast.success(s.api_key ? '接入 Key 已保存' : '已清除，代理不再校验来访')
-      qc.invalidateQueries({ queryKey: ['settings'] })
+      toastManager.add({
+        title: settings.api_key ? '接入 Key 已保存' : '接入 Key 已清除',
+        description: settings.api_key
+          ? '新的客户端接入 Key 已生效。'
+          : '代理将不再校验来访客户端。',
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
     },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({
+        title: '保存失败',
+        description: extractError(error),
+        type: 'error',
+      })
+    },
   })
 
   const baseUrl = window.location.origin
@@ -70,19 +127,21 @@ export function AccessSettingsContent() {
   const generate = () => {
     const bytes = new Uint8Array(24)
     crypto.getRandomValues(bytes)
-    const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
-    setDraft('luban-' + hex)
+    const hex = Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+    setDraft(`luban-${hex}`)
     setShow(true)
   }
 
   const snippet =
     `export ANTHROPIC_BASE_URL=${baseUrl}\n` +
-    (currentKey ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}` : '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN')
+    (currentKey
+      ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}`
+      : '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN')
 
   if (settingsQuery.isPending) {
     return (
       <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-        <ArrowPathIcon className="size-4 animate-spin" />
+        <Spinner className="size-4" />
         正在加载设置
       </div>
     )
@@ -92,8 +151,12 @@ export function AccessSettingsContent() {
     return (
       <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
         <p className="text-sm font-medium">无法读取当前设置</p>
-        <Button size="sm" variant="outline" onClick={() => settingsQuery.refetch()} disabled={settingsQuery.isFetching}>
-          <ArrowPathIcon className={cn(settingsQuery.isFetching && 'animate-spin')} />
+        <Button
+          size="sm"
+          variant="outline"
+          loading={settingsQuery.isFetching}
+          onClick={() => settingsQuery.refetch()}
+        >
           重试
         </Button>
       </div>
@@ -102,82 +165,138 @@ export function AccessSettingsContent() {
 
   return (
     <>
-      <div className="space-y-8">
-          <SettingsSection title="客户端接入">
-            <Field label="接入地址" code="ANTHROPIC_BASE_URL">
-              <div className="flex items-center gap-2">
-                <Input readOnly value={baseUrl} className="font-mono" aria-label="接入地址" />
-                <CopyBtn text={baseUrl} />
-              </div>
-            </Field>
+      <div className="space-y-4">
+        <SettingsSection title="客户端接入">
+          <Field className="p-5">
+            <FieldLabel>
+              接入地址
+              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
+            </FieldLabel>
+            <InputGroup>
+              <InputGroupInput
+                aria-label="接入地址"
+                className="font-mono"
+                readOnly
+                value={baseUrl}
+              />
+              <InputGroupAddon align="inline-end">
+                <CopyButton text={baseUrl} />
+              </InputGroupAddon>
+            </InputGroup>
+          </Field>
 
-            <Field label="接入 Key" code="ANTHROPIC_AUTH_TOKEN">
-              <div className="space-y-2">
-                <div className="flex min-w-0 items-center gap-1">
-                  <Input
-                    type={show ? 'text' : 'password'}
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    readOnly={envManaged}
-                    placeholder={envManaged ? '' : '留空则不校验来访'}
-                    className="font-mono"
-                    aria-label="接入 Key"
-                  />
-                  <Button size="icon" variant="ghost" className="shrink-0" onClick={() => setShow((s) => !s)} title={show ? '隐藏' : '显示'} aria-label={show ? '隐藏接入 Key' : '显示接入 Key'}>
-                    {show ? <EyeSlashIcon /> : <EyeIcon />}
+          <Field className="p-5">
+            <FieldLabel>
+              接入 Key
+              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
+            </FieldLabel>
+            <InputGroup>
+              <InputGroupInput
+                aria-label="接入 Key"
+                className="font-mono"
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder={envManaged ? '' : '留空则不校验来访'}
+                readOnly={envManaged}
+                type={show ? 'text' : 'password'}
+                value={draft}
+              />
+              <InputGroupAddon align="inline-end">
+                <Button
+                  aria-label={show ? '隐藏接入 Key' : '显示接入 Key'}
+                  size="icon-xs"
+                  title={show ? '隐藏' : '显示'}
+                  variant="ghost"
+                  onClick={() => setShow((visible) => !visible)}
+                >
+                  {show ? <EyeOffIcon /> : <EyeIcon />}
+                </Button>
+                <CopyButton text={draft} />
+              </InputGroupAddon>
+            </InputGroup>
+            {!envManaged && (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="outline" onClick={generate}>
+                  <SparklesIcon />
+                  生成
+                </Button>
+                <Button
+                  size="sm"
+                  loading={save.isPending}
+                  disabled={draft === currentKey}
+                  onClick={() => save.mutate(draft.trim())}
+                >
+                  <SaveIcon />
+                  保存
+                </Button>
+                {currentKey && (
+                  <Button
+                    size="sm"
+                    variant="destructive-outline"
+                    onClick={() => setClearKeyOpen(true)}
+                  >
+                    <Trash2Icon />
+                    清空
                   </Button>
-                  <CopyBtn text={draft} />
-                </div>
-                {!envManaged && (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button size="sm" variant="outline" onClick={generate}><SparklesIcon />生成</Button>
-                    <Button size="sm" onClick={() => save.mutate(draft.trim())} disabled={save.isPending || draft === currentKey}>
-                      {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
-                    </Button>
-                    {currentKey && (
-                      <Button size="sm" variant="ghost" className="text-bad hover:text-bad"
-                        onClick={() => setClearKeyOpen(true)}>
-                        <TrashIcon />清空
-                      </Button>
-                    )}
-                  </div>
                 )}
               </div>
-              {envManaged && (
-                <p className="text-xs text-muted-foreground">
-                  由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
-                </p>
-              )}
-            </Field>
+            )}
+            {envManaged && (
+              <FieldDescription>
+                由环境变量 <code className="font-mono">LUBAN_API_KEY</code> 接管，网页只读。
+              </FieldDescription>
+            )}
+          </Field>
 
-            <Field label="Claude Code 接入片段">
-              <div className="relative">
-                <pre className="scrollbar-dialog overflow-x-auto rounded-md border border-border bg-muted/40 p-3 pr-11 font-mono text-2xs leading-5">{snippet}</pre>
-                <div className="absolute right-1.5 top-1.5"><CopyBtn text={snippet} /></div>
+          <Field className="p-5">
+            <FieldLabel>Claude Code 接入片段</FieldLabel>
+            <div className="relative w-full min-w-0">
+              <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 pr-10 font-mono text-xs leading-5">
+                {snippet}
+              </pre>
+              <div className="absolute right-2 top-2">
+                <CopyButton text={snippet} />
               </div>
-            </Field>
-          </SettingsSection>
+            </div>
+          </Field>
+        </SettingsSection>
 
-          <SettingsSection title="设备策略">
-            <DeviceBindingTtl />
-            <DefaultDeviceLimit />
-            <RequireDeviceIdToggle />
-            <BareRateLimit />
-          </SettingsSection>
+        <SettingsSection title="设备策略">
+          <DeviceBindingTtl />
+          <DefaultDeviceLimit />
+          <RequireDeviceIdToggle />
+          <BareRateLimit />
+        </SettingsSection>
 
-          <SettingsSection title="控制台安全">
-            <AdminPassword />
-          </SettingsSection>
+        <SettingsSection title="控制台安全">
+          <AdminPassword />
+        </SettingsSection>
       </div>
-      <ConfirmDialog
+
+      <AlertDialog
         open={clearKeyOpen}
-        onOpenChange={setClearKeyOpen}
-        title="清除接入 Key"
-        description="清除后，代理将不再校验客户端身份。"
-        confirmText="确认清除"
-        pending={save.isPending}
-        onConfirm={() => save.mutate('')}
-      />
+        onOpenChange={(nextOpen) => {
+          if (!save.isPending) setClearKeyOpen(nextOpen)
+        }}
+      >
+        <AlertDialogPopup className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>清除接入 Key</AlertDialogTitle>
+            <AlertDialogDescription>清除后，代理将不再校验客户端身份。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
+              取消
+            </AlertDialogClose>
+            <Button
+              loading={save.isPending}
+              variant="destructive"
+              onClick={() => save.mutate('')}
+            >
+              确认清除
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </>
   )
 }
@@ -186,99 +305,130 @@ export function AccessSettingsContent() {
 function DeviceBindingTtl() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState('')
+  const [draft, setDraft] = useState<number | null>(null)
+
   useEffect(() => {
-    if (data) setDraft(String(data.device_binding_ttl_secs))
+    if (data) setDraft(data.device_binding_ttl_secs)
   }, [data?.device_binding_ttl_secs])
 
   const save = useMutation({
-    mutationFn: (secs: number) => setDeviceTtl(secs),
-    onSuccess: () => {
-      toast.success('设备绑定有效期已更新')
-      qc.invalidateQueries({ queryKey: ['settings'] })
+    mutationFn: (seconds: number) => setDeviceTtl(seconds),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: '设备策略已更新',
+        description: '设备绑定有效期已保存。',
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+    },
   })
 
   const current = data?.device_binding_ttl_secs ?? 0
-  const parsed = Math.max(0, Math.floor(Number(draft) || 0))
-  const hint = parsed > 0 ? `= ${formatDuration(parsed)}` : '永不过期（绑定长期保留）'
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+  const hint = parsed > 0 ? `相当于 ${formatDuration(parsed)}` : '永不过期（绑定长期保留）'
 
   return (
-    <Field label="设备绑定有效期（秒）">
-      <div className="flex flex-wrap items-center gap-2">
-        <Input
-          type="number"
+    <Field className="p-5">
+      <FieldLabel>设备绑定有效期（秒）</FieldLabel>
+      <div className="flex w-full flex-wrap items-center gap-2">
+        <NumberField
+          className="w-full sm:w-44"
           min={0}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          className="w-full font-mono sm:w-40"
-          aria-label="设备绑定有效期（秒）"
-        />
-        <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
-          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement />
+            <NumberFieldInput aria-label="设备绑定有效期（秒）" />
+            <NumberFieldIncrement />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          保存
         </Button>
         <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
-      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        超时无请求的设备会自动释放绑定。
-      </p>
+      <FieldDescription>超时无请求的设备会自动释放绑定。</FieldDescription>
     </Field>
   )
 }
 
-/** 全局默认设备上限：账号未单独配置（卡片上显示「默认」）时套用，免去逐个账号设置。 */
+/** 全局默认设备上限：账号未单独配置时套用。 */
 function DefaultDeviceLimit() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState('')
+  const [draft, setDraft] = useState<number | null>(null)
+
   useEffect(() => {
-    if (data) setDraft(String(data.default_device_limit))
+    if (data) setDraft(data.default_device_limit)
   }, [data?.default_device_limit])
 
   const save = useMutation({
-    mutationFn: (n: number) => setDefaultDeviceLimit(n),
-    onSuccess: (s: Settings) => {
-      toast.success(s.default_device_limit > 0
-        ? `默认设备上限已设为 ${s.default_device_limit}`
-        : '默认设备上限已取消（默认不限）')
-      qc.invalidateQueries({ queryKey: ['settings'] })
-      // 生效上限随之变化，账号卡片上的「设备 x/y」需要重取。
+    mutationFn: (limit: number) => setDefaultDeviceLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: '默认设备上限已更新',
+        description: settings.default_device_limit > 0
+          ? `每个账号最多绑定 ${settings.default_device_limit} 台设备。`
+          : '默认设备上限已取消。',
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+    },
   })
 
   const current = data?.default_device_limit ?? 0
-  const parsed = Math.max(0, Math.floor(Number(draft) || 0))
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field label="默认设备上限（每个账号）">
-      <div className="flex flex-wrap items-center gap-2">
-        <Input
-          type="number"
+    <Field className="p-5">
+      <FieldLabel>默认设备上限（每个账号）</FieldLabel>
+      <div className="flex w-full flex-wrap items-center gap-2">
+        <NumberField
+          className="w-full sm:w-44"
           min={0}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          className="w-full font-mono sm:w-40"
-          aria-label="默认设备上限"
-        />
-        <Button size="sm" onClick={() => save.mutate(parsed)} disabled={save.isPending || parsed === current}>
-          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement />
+            <NumberFieldInput aria-label="默认设备上限" />
+            <NumberFieldIncrement />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          保存
         </Button>
         <span className="text-xs text-muted-foreground">
           {parsed > 0 ? `每个账号最多 ${parsed} 台设备` : '不限（不设默认上限）'}
         </span>
       </div>
-      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        未单独配置的账号使用此上限；账号独立设置优先。
-      </p>
+      <FieldDescription>未单独配置的账号使用此上限；账号独立设置优先。</FieldDescription>
     </Field>
   )
 }
 
-/** 设备身份校验开关：关掉后放行无 metadata.user_id 的裸请求（它们不占设备名额、不受上限约束）。 */
+/** 设备身份校验开关：关掉后放行无 metadata.user_id 的裸请求。 */
 function RequireDeviceIdToggle() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
@@ -286,107 +436,121 @@ function RequireDeviceIdToggle() {
 
   const save = useMutation({
     mutationFn: (next: boolean) => setRequireDeviceId(next),
-    onSuccess: (s: Settings) => {
-      toast.success(s.require_device_id ? '已开启设备身份校验' : '已关闭，无设备身份的请求将被放行')
-      qc.invalidateQueries({ queryKey: ['settings'] })
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: settings.require_device_id ? '设备身份校验已开启' : '设备身份校验已关闭',
+        description: settings.require_device_id
+          ? '缺少设备身份的请求会被拒绝。'
+          : '无设备身份的请求将被放行。',
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
     },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+    },
   })
 
   return (
-    <Field label="设备身份校验">
-      <div className="flex h-10 items-center justify-between gap-3">
-        <span className="text-sm">{required ? '已开启' : '已关闭'}</span>
+    <Field className="p-5">
+      <div className="flex w-full items-start justify-between gap-4">
+        <div className="min-w-0 space-y-1">
+          <FieldLabel htmlFor="require-device-id">设备身份校验</FieldLabel>
+          <FieldDescription>
+            {required
+              ? '缺少设备身份的请求会被拒绝。'
+              : '无设备身份的请求将被放行，且不受设备上限限制。'}
+          </FieldDescription>
+        </div>
         <Switch
-          variant="success"
+          id="require-device-id"
           checked={required}
           disabled={save.isPending}
-          aria-label="设备身份校验"
           onCheckedChange={(next) => save.mutate(next)}
         />
       </div>
-      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
-        {required
-          ? '缺少设备身份的请求会被拒绝。'
-          : <span className="text-warn">无设备身份的请求将被放行，且不受设备上限限制。</span>}
-      </p>
     </Field>
   )
 }
 
-/**
- * 裸请求速率上限：单个账号在窗口内最多接多少条无 metadata.user_id 的请求。
- *
- * 补的是设备上限管不到的那块——裸请求不写设备绑定、不占名额，`device_limit` 对它们不生效。
- * 计数在服务端内存里，按账号各算各的；某个账号发满会自动换到别的账号，全满才 429。
- */
+/** 裸请求速率上限：单个账号在窗口内最多接收的无设备身份请求。 */
 function BareRateLimit() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState('')
-  const [windowDraft, setWindowDraft] = useState('')
+  const [draft, setDraft] = useState<number | null>(null)
+  const [windowDraft, setWindowDraft] = useState<number | null>(null)
+
   useEffect(() => {
     if (data) {
-      setDraft(String(data.bare_rate_limit))
-      setWindowDraft(String(data.bare_rate_window_secs))
+      setDraft(data.bare_rate_limit)
+      setWindowDraft(data.bare_rate_window_secs)
     }
   }, [data?.bare_rate_limit, data?.bare_rate_window_secs])
 
   const save = useMutation({
     mutationFn: ({ limit, win }: { limit: number; win: number }) => setBareRateLimit(limit, win),
-    onSuccess: (s: Settings) => {
-      toast.success(s.bare_rate_limit > 0
-        ? `裸请求上限：每个账号 ${s.bare_rate_limit} 条 / ${formatDuration(s.bare_rate_window_secs)}`
-        : '裸请求速率已取消限制')
-      qc.invalidateQueries({ queryKey: ['settings'] })
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: '无设备身份请求策略已更新',
+        description: settings.bare_rate_limit > 0
+          ? `每个账号 ${settings.bare_rate_limit} 条 / ${formatDuration(settings.bare_rate_window_secs)}。`
+          : '裸请求速率限制已取消。',
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
     },
-    onError: (e) => toast.error('保存失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+    },
   })
 
-  const limit = Math.max(0, Math.floor(Number(draft) || 0))
-  const win = Math.max(1, Math.floor(Number(windowDraft) || 60))
-  const unchanged = limit === (data?.bare_rate_limit ?? 0) && win === (data?.bare_rate_window_secs ?? 60)
+  const limit = Math.max(0, Math.floor(draft ?? 0))
+  const win = Math.max(1, Math.floor(windowDraft ?? 60))
+  const unchanged = limit === (data?.bare_rate_limit ?? 0)
+    && win === (data?.bare_rate_window_secs ?? 60)
 
   return (
-    <Field label="无设备身份请求上限（每个账号）">
-      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-end">
-        <label className="space-y-1 text-2xs text-muted-foreground">
-          <span className="block">请求数</span>
-          <span className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={0}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              className="min-w-0 font-mono sm:w-28"
-              aria-label="无设备身份请求上限（条）"
-            />
-            <span>条</span>
-          </span>
-        </label>
-        <label className="space-y-1 text-2xs text-muted-foreground">
-          <span className="block">时间窗口</span>
-          <span className="flex items-center gap-2">
-            <Input
-              type="number"
-              min={1}
-              value={windowDraft}
-              onChange={(e) => setWindowDraft(e.target.value)}
-              className="min-w-0 font-mono sm:w-24"
-              aria-label="无设备身份请求窗口（秒）"
-            />
-            <span>秒</span>
-          </span>
-        </label>
-        <Button className="col-span-2 w-full sm:w-auto" size="sm" onClick={() => save.mutate({ limit, win })} disabled={save.isPending || unchanged}>
-          {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <ArrowDownTrayIcon />}保存
-        </Button>
+    <div className="space-y-3 p-5">
+      <div>
+        <p className="font-medium text-sm">无设备身份请求上限（每个账号）</p>
+        <p className="mt-1 text-xs text-muted-foreground">分别配置请求数和统计窗口。</p>
       </div>
-      <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field>
+          <FieldLabel>请求数</FieldLabel>
+          <NumberField min={0} value={draft} onValueChange={setDraft}>
+            <NumberFieldGroup>
+              <NumberFieldDecrement />
+              <NumberFieldInput aria-label="无设备身份请求上限（条）" />
+              <NumberFieldIncrement />
+            </NumberFieldGroup>
+          </NumberField>
+        </Field>
+        <Field>
+          <FieldLabel>时间窗口（秒）</FieldLabel>
+          <NumberField min={1} value={windowDraft} onValueChange={setWindowDraft}>
+            <NumberFieldGroup>
+              <NumberFieldDecrement />
+              <NumberFieldInput aria-label="无设备身份请求窗口（秒）" />
+              <NumberFieldIncrement />
+            </NumberFieldGroup>
+          </NumberField>
+        </Field>
+      </div>
+      <Button
+        size="sm"
+        loading={save.isPending}
+        disabled={unchanged}
+        onClick={() => save.mutate({ limit, win })}
+      >
+        <SaveIcon />
+        保存
+      </Button>
+      <p className="text-xs leading-5 text-muted-foreground">
         仅统计无设备身份的消息请求，Token 计数接口不计入；单个账号达到上限后会自动换号，
         全部达到上限才拒绝。服务重启后重新计数。
       </p>
-    </Field>
+    </div>
   )
 }
 
@@ -394,21 +558,36 @@ function BareRateLimit() {
 function AdminPassword() {
   const authQuery = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const { data } = authQuery
-  const [pw, setPwInput] = useState('')
+  const [password, setPassword] = useState('')
   const [clearOpen, setClearOpen] = useState(false)
 
   const save = useMutation({
-    mutationFn: async (password: string) => {
-      if (data?.configured) await changePassword(password)
-      else await setupPassword(password)
+    mutationFn: async (nextPassword: string) => {
+      if (data?.configured) await changePassword(nextPassword)
+      else await setupPassword(nextPassword)
     },
-    onSuccess: (_r, password) => {
+    onSuccess: (_result, nextPassword) => {
       setClearOpen(false)
-      if (password) { setPw(password); toast.success('管理密码已设置') }
-      else { clearPw(); toast.success('已清除管理密码') }
+      if (nextPassword) {
+        setPw(nextPassword)
+        toastManager.add({
+          title: '管理密码已设置',
+          description: '新的管理密码已生效。',
+          type: 'success',
+        })
+      } else {
+        clearPw()
+        toastManager.add({
+          title: '管理密码已清除',
+          description: '控制台将不再要求登录。',
+          type: 'success',
+        })
+      }
       window.location.reload()
     },
-    onError: (e) => toast.error('操作失败', { description: extractError(e) }),
+    onError: (error) => {
+      toastManager.add({ title: '操作失败', description: extractError(error), type: 'error' })
+    },
   })
 
   const envManaged = data?.env_managed ?? false
@@ -416,9 +595,11 @@ function AdminPassword() {
 
   if (authQuery.isPending) {
     return (
-      <Field label="管理密码（登录网页所需）">
+      <Field className="p-5">
+        <FieldLabel>管理密码（登录网页所需）</FieldLabel>
         <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
-          <ArrowPathIcon className="size-3 animate-spin" />正在加载
+          <Spinner className="size-3" />
+          正在加载
         </span>
       </Field>
     )
@@ -426,11 +607,17 @@ function AdminPassword() {
 
   if (authQuery.isError) {
     return (
-      <Field label="管理密码（登录网页所需）">
+      <Field className="p-5">
+        <FieldLabel>管理密码（登录网页所需）</FieldLabel>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs text-bad">无法读取登录状态</span>
-          <Button size="sm" variant="outline" onClick={() => authQuery.refetch()} disabled={authQuery.isFetching}>
-            <ArrowPathIcon className={cn(authQuery.isFetching && 'animate-spin')} />重试
+          <span className="text-xs text-destructive-foreground">无法读取登录状态</span>
+          <Button
+            size="sm"
+            variant="outline"
+            loading={authQuery.isFetching}
+            onClick={() => authQuery.refetch()}
+          >
+            重试
           </Button>
         </div>
       </Field>
@@ -439,96 +626,117 @@ function AdminPassword() {
 
   return (
     <>
-    <Field label="管理密码（登录网页所需）">
-      {envManaged ? (
-        <p className="text-xs text-muted-foreground">
-          由环境变量 <code className="font-mono">LUBAN_ADMIN_PASSWORD</code> 接管，网页只读。
-        </p>
-      ) : (
-        <>
-          <div className="grid gap-2 sm:flex sm:items-center">
-            <Input
-              type="password"
-              value={pw}
-              onChange={(e) => setPwInput(e.target.value)}
-              placeholder={configured ? '输入新密码' : '至少 4 位'}
-              className="min-w-0 flex-1"
-              aria-label={configured ? '新管理密码' : '管理密码'}
-            />
-            <Button size="sm" className="w-full sm:w-auto" onClick={() => save.mutate(pw.trim())} disabled={save.isPending || pw.trim().length < 4}>
-              {save.isPending ? <ArrowPathIcon className="animate-spin" /> : <KeyIcon />}
-              {configured ? '修改' : '设置'}
-            </Button>
-            {configured && (
-              <Button size="sm" variant="ghost" className="w-full text-bad hover:text-bad sm:w-auto"
-                onClick={() => setClearOpen(true)}
-                disabled={save.isPending}>
-                <TrashIcon />清除
+      <Field className="p-5">
+        <FieldLabel>管理密码（登录网页所需）</FieldLabel>
+        {envManaged ? (
+          <FieldDescription>
+            由环境变量 <code className="font-mono">LUBAN_ADMIN_PASSWORD</code> 接管，网页只读。
+          </FieldDescription>
+        ) : (
+          <>
+            <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+              <Input
+                aria-label={configured ? '新管理密码' : '管理密码'}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={configured ? '输入新密码' : '至少 4 位'}
+                type="password"
+                value={password}
+              />
+              <Button
+                size="sm"
+                loading={save.isPending}
+                disabled={password.trim().length < 4}
+                onClick={() => save.mutate(password.trim())}
+              >
+                <KeyRoundIcon />
+                {configured ? '修改' : '设置'}
               </Button>
+              {configured && (
+                <Button
+                  size="sm"
+                  variant="destructive-outline"
+                  disabled={save.isPending}
+                  onClick={() => setClearOpen(true)}
+                >
+                  <Trash2Icon />
+                  清除
+                </Button>
+              )}
+            </div>
+            {!configured && (
+              <FieldDescription>
+                未设置密码时，任何能访问控制台的设备都无需登录；对外开放时建议设置。
+              </FieldDescription>
             )}
-          </div>
-          {!configured && (
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              未设置密码时，任何能访问控制台的设备都无需登录；对外开放时建议设置。
-            </p>
-          )}
-        </>
-      )}
-    </Field>
-    <ConfirmDialog
-      open={clearOpen}
-      onOpenChange={setClearOpen}
-      title="清除管理密码"
-      description="清除后，控制台将不再要求登录。"
-      confirmText="确认清除"
-      pending={save.isPending}
-      onConfirm={() => save.mutate('')}
-    />
+          </>
+        )}
+      </Field>
+
+      <AlertDialog
+        open={clearOpen}
+        onOpenChange={(nextOpen) => {
+          if (!save.isPending) setClearOpen(nextOpen)
+        }}
+      >
+        <AlertDialogPopup className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>清除管理密码</AlertDialogTitle>
+            <AlertDialogDescription>清除后，控制台将不再要求登录。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
+              取消
+            </AlertDialogClose>
+            <Button
+              loading={save.isPending}
+              variant="destructive"
+              onClick={() => save.mutate('')}
+            >
+              确认清除
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </>
   )
 }
 
-function SettingsSection({ title, children }: { title: string; children: React.ReactNode }) {
+function SettingsSection({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section>
-      <h3 className="mb-2 text-sm font-semibold">{title}</h3>
-      <div className="divide-y divide-border border-y border-border/80 px-1 [&>*]:py-4">{children}</div>
-    </section>
+    <Frame>
+      <FrameHeader>
+        <FrameTitle>{title}</FrameTitle>
+      </FrameHeader>
+      <FramePanel className="divide-y p-0">{children}</FramePanel>
+    </Frame>
   )
 }
 
-function Field({ label, code, children }: { label: string; code?: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap items-baseline gap-1.5 text-sm font-medium">
-        <span>{label}</span>
-        {code && <code className="font-mono text-2xs font-normal text-muted-foreground">{code}</code>}
-      </div>
-      <div>{children}</div>
-    </div>
-  )
-}
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
 
-function CopyBtn({ text }: { text: string }) {
-  const [ok, setOk] = useState(false)
   return (
     <Button
-      size="icon"
-      variant="ghost"
-      className={cn('h-9 w-9 shrink-0', ok && 'text-ok')}
+      aria-label={copied ? '已复制' : '复制'}
+      className={copied ? 'text-success' : undefined}
+      size="icon-xs"
       title="复制"
-      aria-label={ok ? '已复制' : '复制'}
+      variant="ghost"
       onClick={async () => {
         if (!text) return
         if (await copyText(text)) {
-          setOk(true)
-          setTimeout(() => setOk(false), 1200)
-        } else {
-          toast.error('复制失败，请手动选择复制')
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 1200)
+          return
         }
+        toastManager.add({
+          title: '复制失败',
+          description: '请手动选择并复制内容。',
+          type: 'error',
+        })
       }}
     >
-      {ok ? <CheckIcon /> : <ClipboardDocumentIcon />}
+      {copied ? <CheckIcon /> : <ClipboardIcon />}
     </Button>
   )
 }
