@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     middleware,
     routing::{any, delete, get, post},
@@ -145,7 +145,10 @@ pub async fn run(
     // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
     let app = Router::new()
         .nest("/api", api)
-        .route("/v1/{*path}", any(proxy::handle))
+        // axum 对 `Bytes` 提取器默认限 2MB，超过的请求进不了 handler 就被 413 拦掉——
+        // 而上游官方 /v1/messages 的上限是 32MB，长对话/带附件的合法请求很容易超 2MB。
+        // 这里放到 64MB 留出余量，真正的大小判决交给上游；管理接口维持默认即可。
+        .route("/v1/{*path}", any(proxy::handle).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         .fallback(admin_ui::fallback)
         .with_state(state);
 
