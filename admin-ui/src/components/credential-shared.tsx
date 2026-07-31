@@ -614,6 +614,15 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
           需等待 {formatWait(quota.retry_after_secs)}
         </span>
       )}
+      {/* 额度满但上游用超额计费放行：不 429、请求照常成功，只有这里能看出在烧钱。 */}
+      {quota.overage_in_use && (
+        <span
+          className="text-destructive-foreground"
+          title="本次请求由超额计费（overage）放行：额度已满，烧的是按量计费的钱"
+        >
+          超额计费中
+        </span>
+      )}
       {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}
       {quota.unified_status && quota.unified_status !== 'allowed' && (
         <span

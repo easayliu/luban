@@ -736,6 +736,7 @@ impl Drop for ReqLog {
             rl_7d_reset: self.ratelimit.seven_d_reset,
             rl_7d_utilization: self.ratelimit.seven_d_utilization,
             rl_representative: self.ratelimit.representative.clone(),
+            rl_overage_in_use: self.ratelimit.overage_in_use,
             ratelimit_raw: (!self.ratelimit.raw.is_empty()).then(|| self.ratelimit.raw.clone()),
             cost_usd,
         };
@@ -1954,6 +1955,10 @@ struct RateLimitInfo {
     /// 不带窗口名的 `anthropic-ratelimit-unified-reset`（unix 秒）：上游给的「整体什么时候
     /// 恢复」，比按 `representative-claim` 反查窗口更直接。
     unified_reset: Option<i64>,
+    /// `anthropic-ratelimit-unified-overage-in-use`：本次请求是否由**超额计费**在放行。
+    /// 这是「额度满了但不 429」的关键标记——基础窗口 rejected、请求却 200 成功，
+    /// 烧的是按量计费的钱；把它落进快照，前端才能把这种号和真正健康的号区分开。
+    overage_in_use: Option<bool>,
     /// **所有** `anthropic-ratelimit-unified-<窗口>-status` 的取值（窗口名原样保留）。
     ///
     /// 刻意不写死窗口名：实测除了 `5h`/`7d`，还有 `7d_oi`（7 天含超额），而**真正被拒的
@@ -2001,6 +2006,9 @@ impl RateLimitInfo {
                 }
                 "retry-after" => info.retry_after = val.trim().parse().ok(),
                 "anthropic-ratelimit-unified-reset" => info.unified_reset = val.parse().ok(),
+                "anthropic-ratelimit-unified-overage-in-use" => {
+                    info.overage_in_use = Some(val.trim() == "true")
+                }
                 _ => {}
             }
             // 通用收集：`anthropic-ratelimit-unified-<窗口>-status|utilization`，窗口名不限。
@@ -2172,6 +2180,9 @@ pub struct ProbeQuota {
     /// `retry-after`（秒）。只有 429 才有，且它是**这次拒绝**给出的等待时间，比各窗口的
     /// reset 更直接（实测给过 63 小时，直指 7 天窗口的重置时刻）。
     pub retry_after_secs: Option<i64>,
+    /// 本次请求是否由**超额计费**放行（`…-overage-in-use`）：额度满了但照样 200，
+    /// 烧的是按量计费的钱。
+    pub overage_in_use: Option<bool>,
 }
 
 impl ProbeQuota {
@@ -2188,6 +2199,7 @@ impl ProbeQuota {
             rl_7d_reset: info.seven_d_reset,
             rl_representative: info.representative.clone(),
             retry_after_secs: info.retry_after,
+            overage_in_use: info.overage_in_use,
         };
         let empty = q.unified_status.is_none()
             && q.rl_5h_utilization.is_none()
@@ -2195,7 +2207,8 @@ impl ProbeQuota {
             && q.rl_7d_utilization.is_none()
             && q.rl_7d_reset.is_none()
             && q.rl_representative.is_none()
-            && q.retry_after_secs.is_none();
+            && q.retry_after_secs.is_none()
+            && q.overage_in_use.is_none();
         (!empty).then_some(q)
     }
 }
@@ -2548,6 +2561,7 @@ fn log_probe_usage(
         rl_7d_reset: ratelimit.seven_d_reset,
         rl_7d_utilization: ratelimit.seven_d_utilization,
         rl_representative: ratelimit.representative.clone(),
+        rl_overage_in_use: ratelimit.overage_in_use,
         ratelimit_raw: (!ratelimit.raw.is_empty()).then(|| ratelimit.raw.clone()),
         cost_usd,
     };

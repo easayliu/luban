@@ -978,6 +978,8 @@ pub struct UsageRecord {
     pub rl_7d_reset: Option<i64>,
     pub rl_7d_utilization: Option<f64>,
     pub rl_representative: Option<String>,
+    /// 本次请求是否由超额计费放行（`…-overage-in-use`）：额度满了但照样 200，烧的是钱。
+    pub rl_overage_in_use: Option<bool>,
     pub ratelimit_raw: Option<String>,
     /// 等价 API 费用（USD）。
     pub cost_usd: Option<f64>,
@@ -1011,6 +1013,7 @@ pub struct UsageLog {
     pub rl_7d_reset: Option<i64>,
     pub rl_7d_utilization: Option<f64>,
     pub rl_representative: Option<String>,
+    pub rl_overage_in_use: Option<bool>,
     pub ratelimit_raw: Option<String>,
     pub cost_usd: Option<f64>,
 }
@@ -1026,6 +1029,9 @@ pub struct QuotaSnapshot {
     pub rl_7d_utilization: Option<f64>,
     pub rl_7d_reset: Option<i64>,
     pub rl_representative: Option<String>,
+    /// 最近一次带限流头的响应是否由**超额计费**放行：额度满了但上游照样 200，
+    /// 烧的是按量计费的钱。卡片靠它把「满了在烧钱的号」和健康号区分开。
+    pub overage_in_use: Option<bool>,
     /// 当前 5h / 7d 窗口内该凭证已用的等价费用（USD）。窗口起点由对应 reset 反推。
     pub cost_5h: Option<f64>,
     pub cost_7d: Option<f64>,
@@ -1085,7 +1091,7 @@ impl CredentialStore {
         let mut stmt = conn.prepare(
             "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
                     s.rl_5h_utilization, s.rl_5h_reset,
-                    s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative,
+                    s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative, s.overage_in_use,
                     CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
                         COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
                     END,
@@ -1117,10 +1123,11 @@ impl CredentialStore {
                     rl_7d_utilization: r.get(5)?,
                     rl_7d_reset: r.get(6)?,
                     rl_representative: r.get(7)?,
-                    cost_5h: r.get(8)?,
-                    cost_7d: r.get(9)?,
-                    requests_5h: r.get(10)?,
-                    requests_7d: r.get(11)?,
+                    overage_in_use: r.get(8)?,
+                    cost_5h: r.get(9)?,
+                    cost_7d: r.get(10)?,
+                    requests_5h: r.get(11)?,
+                    requests_7d: r.get(12)?,
                 },
             ))
         })?;
@@ -1213,10 +1220,10 @@ impl CredentialStore {
                  input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
                  cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
-                 rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                 cost_usd)
+                 rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
+                 rl_overage_in_use, ratelimit_raw, cost_usd)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 ts,
                 rec.cred_id,
@@ -1242,6 +1249,7 @@ impl CredentialStore {
                 rec.rl_7d_reset,
                 rec.rl_7d_utilization,
                 rec.rl_representative,
+                rec.rl_overage_in_use,
                 rec.ratelimit_raw,
                 rec.cost_usd,
             ],
@@ -1263,7 +1271,8 @@ impl CredentialStore {
                     "UPDATE credential_stats SET
                          snapshot_ts = ?2, unified_status = ?3,
                          rl_5h_utilization = ?4, rl_5h_reset = ?5,
-                         rl_7d_utilization = ?6, rl_7d_reset = ?7, rl_representative = ?8
+                         rl_7d_utilization = ?6, rl_7d_reset = ?7, rl_representative = ?8,
+                         overage_in_use = ?9
                       WHERE cred_id = ?1",
                     params![
                         cid,
@@ -1274,6 +1283,7 @@ impl CredentialStore {
                         rec.rl_7d_utilization,
                         rec.rl_7d_reset,
                         rec.rl_representative,
+                        rec.rl_overage_in_use,
                     ],
                 )?;
             }
@@ -1324,7 +1334,7 @@ impl CredentialStore {
                     cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                     unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                     rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                    cost_usd
+                    cost_usd, rl_overage_in_use
                FROM usage_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |r| {
@@ -1356,6 +1366,7 @@ impl CredentialStore {
                 rl_representative: r.get(24)?,
                 ratelimit_raw: r.get(25)?,
                 cost_usd: r.get(26)?,
+                rl_overage_in_use: r.get(27)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1432,6 +1443,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             rl_7d_reset        INTEGER,
             rl_7d_utilization  REAL,
             rl_representative  TEXT,
+            -- 本次请求是否由超额计费放行（overage-in-use；1/0，头缺失时为空）。
+            rl_overage_in_use  INTEGER,
             -- 原始限流头（兜底：字段变化时仍可回看）。
             ratelimit_raw      TEXT,
             -- 按官方定价估算的等价 API 费用（USD）；模型未知时为空。
@@ -1462,7 +1475,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             rl_5h_reset        INTEGER,
             rl_7d_utilization  REAL,
             rl_7d_reset        INTEGER,
-            rl_representative  TEXT
+            rl_representative  TEXT,
+            overage_in_use     INTEGER
         ) STRICT;
         -- 设备费用账本：终身累计。不记在 device_bindings 上——绑定行会被解绑/TTL 清掉重建，
         -- 而费用语义要求比绑定活得久（见 list_devices 的注）。
@@ -1489,9 +1503,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "cost_usd REAL",
         "cache_5m_tokens INTEGER",
         "cache_1h_tokens INTEGER",
+        "rl_overage_in_use INTEGER",
     ] {
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
     }
+    // credential_stats 是 0.2.37 加的表，overage_in_use 列在其后才有：同样幂等补列。
+    let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
 
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
@@ -1539,9 +1556,9 @@ fn backfill_ledger(conn: &Connection) -> Result<()> {
     tx.execute(
         "UPDATE credential_stats SET
              (snapshot_ts, unified_status, rl_5h_utilization, rl_5h_reset,
-              rl_7d_utilization, rl_7d_reset, rl_representative) =
+              rl_7d_utilization, rl_7d_reset, rl_representative, overage_in_use) =
              (SELECT MAX(u.ts), u.unified_status, u.rl_5h_utilization, u.rl_5h_reset,
-                     u.rl_7d_utilization, u.rl_7d_reset, u.rl_representative
+                     u.rl_7d_utilization, u.rl_7d_reset, u.rl_representative, u.rl_overage_in_use
                 FROM usage_logs u
                WHERE u.cred_id = credential_stats.cred_id
                  AND (u.rl_5h_utilization IS NOT NULL OR u.rl_7d_utilization IS NOT NULL))",
@@ -3056,6 +3073,56 @@ mod tests {
         // 窗口统计只看还留着的流水：新流水 ts 在窗口起点之后，计入。
         assert_eq!(q.cost_5h, Some(1.0));
         assert_eq!(q.requests_5h, Some(1));
+    }
+
+    /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，
+    /// 下一条带头的响应按新值覆盖。这是「额度满但不 429（超额计费在放行）」唯一的外显信号。
+    #[test]
+    fn overage_marker_lands_in_snapshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    rl_5h_utilization: Some(1.02),
+                    rl_5h_reset: Some(9_000),
+                    rl_overage_in_use: Some(true),
+                    ..Default::default()
+                },
+                Some(1_000),
+            )
+            .unwrap();
+        assert_eq!(store.latest_quota(a).unwrap().unwrap().overage_in_use, Some(true));
+
+        // 不带限流头的响应（CDN 拦截页之类）不动快照。
+        store
+            .insert_usage_log_at(
+                &UsageRecord { cred_id: Some(a), cost_usd: Some(1.0), ..Default::default() },
+                Some(2_000),
+            )
+            .unwrap();
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(q.overage_in_use, Some(true), "无头响应不得抹掉标记");
+        assert_eq!(q.ts, 1_000);
+
+        // 额度恢复后上游不再报 overage → 按新值覆盖。
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    rl_5h_utilization: Some(0.3),
+                    rl_5h_reset: Some(20_000),
+                    rl_overage_in_use: Some(false),
+                    ..Default::default()
+                },
+                Some(3_000),
+            )
+            .unwrap();
+        assert_eq!(store.latest_quota(a).unwrap().unwrap().overage_in_use, Some(false));
     }
 
     /// 老库升级（账本为空、流水有历史）时 init_schema 一次性回填账本；账本非空则不重复。

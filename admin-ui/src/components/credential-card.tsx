@@ -210,7 +210,18 @@ export function CredentialCard({
 
         <section aria-label="额度使用" className="space-y-3">
           <div className="flex items-center justify-between gap-3">
-            <h3 className="font-medium text-sm">额度使用</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium text-sm">额度使用</h3>
+              {cred.quota?.overage_in_use && (
+                <Badge
+                  variant="error"
+                  size="sm"
+                  title="额度已满，上游正以超额计费（overage）放行请求——不会 429，但烧的是按量计费的钱"
+                >
+                  超额计费中
+                </Badge>
+              )}
+            </div>
             {!cred.quota && <span className="text-sm text-muted-foreground">暂无数据</span>}
           </div>
           {cred.quota && (has5h || has7d) ? (

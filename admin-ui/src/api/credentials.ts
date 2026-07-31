@@ -10,6 +10,11 @@ export interface Quota {
   rl_7d_utilization: number | null
   rl_7d_reset: number | null
   rl_representative: string | null
+  /**
+   * 最近一次带限流头的响应是否由**超额计费**放行（`overage-in-use`）：额度已满但上游
+   * 照样 200，烧的是按量计费的钱——这种号永远不会 429，卡片上只有这个标记能暴露它。
+   */
+  overage_in_use: boolean | null
   /** 当前 5h / 7d 窗口内已用的等价费用（USD）。 */
   cost_5h: number | null
   cost_7d: number | null
@@ -200,6 +205,8 @@ export interface ProbeQuota {
   rl_representative: string | null
   /** `retry-after`（秒）；只有 429 才有，是这次拒绝给出的等待时间。 */
   retry_after_secs: number | null
+  /** 本次请求是否由超额计费放行（额度满了但照样 200，烧的是按量计费的钱）。 */
+  overage_in_use: boolean | null
 }
 
 /** 一次连通性测试的结果。 */
