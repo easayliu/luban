@@ -28,7 +28,7 @@ import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
 import { LogoMark } from '@/components/logo-mark'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { Spinner } from '@/components/ui/spinner'
 
@@ -41,8 +41,6 @@ function App() {
   const [adding, setAdding] = useState(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [pw, setPwState] = useState<string | null>(getPw())
-  // 批量模式：卡片出现勾选框，工具栏变成批量操作条。
-  const [batch, setBatch] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   // 分页（纯前端切片：列表接口一次返回全部账号）。
   const [page, setPage] = useState(1)
@@ -148,7 +146,7 @@ function App() {
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
-        <div className="page-frame flex h-16 items-center justify-between gap-3">
+        <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
             <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
               <LogoMark className="size-[1.125rem]" />
@@ -163,7 +161,10 @@ function App() {
               <PlusIcon />
             </Button>
             <Menu>
-              <MenuTrigger render={<Button size="icon-lg" variant="outline" aria-label="更多操作" />}>
+              <MenuTrigger
+                className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
+                aria-label="更多操作"
+              >
                 <EllipsisVerticalIcon />
               </MenuTrigger>
               <MenuPopup align="end" className="w-44">
@@ -200,7 +201,7 @@ function App() {
         </div>
       </header>
 
-      <main className="page-frame relative flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
+      <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
 
@@ -219,7 +220,6 @@ function App() {
             sort,
             dir,
             view,
-            batch,
             selected,
             page,
             pageSize,
@@ -232,7 +232,6 @@ function App() {
               setDir(nextDir)
             },
             onViewChange: switchView,
-            onBatchChange: setBatch,
             onSelectedChange: setSelected,
             onPageChange: setPage,
             onPageSizeChange: setPageSize,

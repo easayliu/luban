@@ -21,7 +21,7 @@ import {
   type SortDir,
   type SortKey,
 } from '@/components/credential-shared'
-import { Badge, type BadgeProps } from '@/components/ui/badge'
+import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -51,17 +51,17 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
 
 const COL = {
-  select: 'w-3',
-  account: 'w-[22%]',
-  schedule: 'w-[10%]',
-  priority: 'w-[7%]',
-  tier: 'w-[9%]',
-  quota5h: 'w-[11%]',
-  quota7d: 'w-[10%]',
-  devices: 'w-[9%]',
-  recent: 'w-[11%]',
-  cost: 'w-[7%]',
-  action: 'w-[4%]',
+  select: 'w-10',
+  account: 'w-auto',
+  schedule: 'w-32',
+  priority: 'w-20',
+  tier: 'w-24',
+  quota5h: 'w-32',
+  quota7d: 'w-32',
+  devices: 'w-32',
+  recent: 'w-24',
+  cost: 'w-24',
+  action: 'w-10',
 } as const
 
 export function CredentialListHeader({
@@ -103,7 +103,7 @@ export function CredentialListHeader({
   return (
     <TableHeader className="hidden xl:table-header-group">
       <TableRow>
-        <TableHead className={cn(COL.select, selectable ? 'w-10 pl-4 pr-0' : 'p-0')}>
+        <TableHead className={cn(COL.select, selectable ? 'pl-4 pr-0' : 'p-0')}>
           {selectable && (
             <Checkbox
               checked={!!allSelected}
@@ -171,7 +171,7 @@ export function CredentialRow({
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
         <TableCell colSpan={11} className="whitespace-normal p-0">
-          <article className="space-y-4 p-4 sm:p-5">
+          <article className="space-y-3 p-3 sm:space-y-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
                 <Checkbox
@@ -182,16 +182,17 @@ export function CredentialRow({
                 />
               )}
               <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 items-center gap-2">
-                  <h3 className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>{cred.label}</h3>
-                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
-                </div>
+                <h3 className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
+                  {cred.label}
+                </h3>
                 <p
-                  className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground"
+                  className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground"
                   title={`添加于 ${formatFullTime(cred.created_at)}`}
                 >
                   <CalendarDaysIcon />
-                  添加于 {added}
+                  <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="min-w-0">添加于 {added}</span>
                 </p>
               </div>
               <div className="flex shrink-0 items-start gap-1">
@@ -210,7 +211,7 @@ export function CredentialRow({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4 border-t pt-4">
+            <div className="grid grid-cols-2 gap-3 border-t pt-3 sm:gap-4 sm:pt-4">
               <ListQuotaMeter
                 label="5h"
                 util={u5h}
@@ -225,7 +226,7 @@ export function CredentialRow({
               />
             </div>
 
-            <dl className="grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-3">
+            <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
               <MobileFact label="优先级"><span className="tabular-nums">P{cred.priority}</span></MobileFact>
               <MobileFact label="账号等级">
                 {cred.tier
@@ -250,7 +251,7 @@ export function CredentialRow({
       </TableRow>
 
       <TableRow className="hidden xl:table-row" data-state={selected ? 'selected' : undefined}>
-        <TableCell className={cn(COL.select, selectable ? 'w-10 pl-4 pr-0' : 'p-0')}>
+        <TableCell className={cn(COL.select, selectable ? 'pl-4 pr-0' : 'p-0')}>
           {selectable && (
             <Checkbox
               checked={selected}
@@ -262,14 +263,15 @@ export function CredentialRow({
         <TableCell className={cn(COL.account, 'whitespace-normal')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-baseline gap-2">
-                <span className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
-                  {cred.label}
+              <span className="block min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
+                {cred.label}
+              </span>
+              <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
+                <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
+                <span aria-hidden="true">·</span>
+                <span className="min-w-0" title={`添加于 ${formatFullTime(cred.created_at)}`}>
+                  添加于 {added}
                 </span>
-                <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
-              </div>
-              <span className="text-xs text-muted-foreground" title={`添加于 ${formatFullTime(cred.created_at)}`}>
-                添加于 {added}
               </span>
             </div>
           </div>
@@ -506,15 +508,9 @@ function ScheduleControl({
       </div>
       <Tooltip>
         <TooltipTrigger
-          render={
-            <Badge
-              render={<button type="button" />}
-              size="sm"
-              variant={status.variant}
-              aria-label={`${status.label}：${statusDetail}`}
-              aria-live="polite"
-            />
-          }
+          className={badgeVariants({ size: 'sm', variant: status.variant })}
+          aria-label={`${status.label}：${statusDetail}`}
+          aria-live="polite"
         >
           {status.label}
         </TooltipTrigger>

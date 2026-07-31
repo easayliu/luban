@@ -46,7 +46,7 @@ export function SettingsPage({
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <header className="app-header sticky top-0 z-20 border-b bg-background/95 backdrop-blur">
-        <div className="page-frame flex min-h-16 items-center justify-between gap-3 py-3">
+        <div className="page-frame flex min-h-14 items-center justify-between gap-3 py-2 sm:min-h-16 sm:py-3">
           <div className="flex min-w-0 items-center gap-2">
             <span className="brand-mark flex size-7 shrink-0 items-center justify-center rounded-lg text-brand-foreground">
               <LogoMark className="size-4" />
@@ -63,7 +63,7 @@ export function SettingsPage({
         </div>
       </header>
 
-      <main className="page-frame flex-1 py-6 sm:py-8">
+      <main className="page-frame flex-1 py-5 sm:py-8">
         <div className="mx-auto w-full max-w-5xl">
           <div className="mb-5 space-y-1 sm:mb-6">
             <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">系统设置</h1>
@@ -77,7 +77,7 @@ export function SettingsPage({
               if (value === 'access' || value === 'forwarding') onSectionChange(value)
             }}
           >
-            <div className="sticky top-16 z-10 border-b bg-background/95 backdrop-blur">
+            <div className="settings-tabs-bar sticky z-10 border-b bg-background/95 backdrop-blur">
               <TabsList
                 aria-label="设置分类"
                 className="w-full justify-start sm:w-fit"

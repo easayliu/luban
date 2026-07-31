@@ -182,8 +182,8 @@ export function CredentialDevicesDialog({
             {editingLimit ? (
               <Card>
                 <CardHeader>
-                  <CardTitle>设备上限</CardTitle>
-                  <CardDescription>明确选择账号是跟随全局设置、不限设备，还是使用独立上限。</CardDescription>
+                  <CardTitle className="text-sm leading-snug">设备上限</CardTitle>
+                  <CardDescription className="text-xs">明确选择账号是跟随全局设置、不限设备，还是使用独立上限。</CardDescription>
                 </CardHeader>
                 <CardPanel className="grid gap-4 sm:grid-cols-2">
                   <Field>
@@ -232,8 +232,8 @@ export function CredentialDevicesDialog({
             ) : (
               <Card>
                 <CardHeader>
-                  <CardTitle>设备容量</CardTitle>
-                  <CardDescription>控制此账号可同时保持活跃绑定的设备数量。</CardDescription>
+                  <CardTitle className="text-sm leading-snug">设备容量</CardTitle>
+                  <CardDescription className="text-xs">控制此账号可同时保持活跃绑定的设备数量。</CardDescription>
                   <CardAction>
                     <Button type="button" size="sm" variant="outline" onClick={startEditingLimit}>
                       <PencilIcon />
@@ -246,7 +246,7 @@ export function CredentialDevicesDialog({
                     <CapacityStat label="已绑定" value={`${currentDeviceCount} 台`} />
                     <CapacityStat label="生效上限" value={effectiveLimit} />
                     <div className="min-w-0">
-                      <dt className="text-sm text-muted-foreground">上限策略</dt>
+                      <dt className="text-xs text-muted-foreground">上限策略</dt>
                       <dd className="mt-1"><Badge variant={currentPolicy.variant}>{currentPolicy.label}</Badge></dd>
                     </div>
                   </dl>
@@ -328,7 +328,7 @@ function DeviceList({
           <p className="text-xs text-muted-foreground">按最近活跃时间排序</p>
         </div>
         {!isPending && !error && (
-          <span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+          <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
             {isFetching && <Spinner />}
             {data?.length ?? 0} 台
           </span>
@@ -364,7 +364,7 @@ function DeviceList({
         <Empty className="py-10">
           <EmptyHeader>
             <EmptyMedia variant="icon"><SmartphoneIcon /></EmptyMedia>
-            <EmptyTitle>暂无活跃设备</EmptyTitle>
+            <EmptyTitle className="text-base">暂无活跃设备</EmptyTitle>
             <EmptyDescription>设备完成一次请求后会出现在这里。</EmptyDescription>
           </EmptyHeader>
         </Empty>
@@ -374,8 +374,8 @@ function DeviceList({
             <li key={device.device_id}>
               <Card>
                 <CardHeader>
-                  <CardTitle className="flex min-w-0 items-center gap-2">
-                    <SmartphoneIcon className="shrink-0" />
+                  <CardTitle className="flex min-w-0 items-center gap-2 text-sm leading-snug">
+                    <SmartphoneIcon className="size-4 shrink-0" />
                     <span className="min-w-0 flex-1 truncate text-sm" title={device.device_id}>
                       {device.device_id}
                     </span>
@@ -395,7 +395,7 @@ function DeviceList({
                       <CopyIcon />
                     </Button>
                   </CardTitle>
-                  <CardDescription title={`首次绑定 ${formatFullTime(device.created_at)} · 最近活跃 ${formatFullTime(device.last_seen_at)}`}>
+                  <CardDescription className="text-xs" title={`首次绑定 ${formatFullTime(device.created_at)} · 最近活跃 ${formatFullTime(device.last_seen_at)}`}>
                     首次绑定 {relativeTime(device.created_at)} · 最近活跃 {relativeTime(device.last_seen_at)}
                   </CardDescription>
                   <CardAction>
@@ -431,7 +431,7 @@ function DeviceList({
 function CapacityStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
-      <dt className="text-sm text-muted-foreground">{label}</dt>
+      <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="mt-1 truncate font-semibold text-sm tabular-nums" title={value}>{value}</dd>
     </div>
   )

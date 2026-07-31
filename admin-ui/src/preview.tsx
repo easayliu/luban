@@ -2,7 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
-  EllipsisVerticalIcon, ListChecksIcon, PlusIcon, SettingsIcon,
+  EllipsisVerticalIcon, PlusIcon, SettingsIcon,
 } from 'lucide-react'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
@@ -18,8 +18,8 @@ import {
 } from '@/components/credential-workspace'
 import type { SortDir, SortKey } from '@/components/credential-shared'
 import { LogoMark } from '@/components/logo-mark'
-import { Button } from '@/components/ui/button'
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
+import { Button, buttonVariants } from '@/components/ui/button'
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import type { Credential } from '@/api/credentials'
@@ -150,10 +150,7 @@ function PreviewCredentialWorkspace() {
   const [view, setView] = React.useState<CredentialViewMode>(
     previewParams.get('view') === 'list' ? 'list' : 'card',
   )
-  const [batch, setBatch] = React.useState(previewParams.get('batch') === '1')
-  const [selected, setSelected] = React.useState<Set<number>>(
-    () => new Set(previewParams.get('batch') === '1' ? [banned.id] : []),
-  )
+  const [selected, setSelected] = React.useState<Set<number>>(new Set())
   const [page, setPage] = React.useState(1)
   const [pageSize, setPageSize] = React.useState<CredentialPageSize>(CREDENTIAL_PAGE_SIZES[0])
 
@@ -172,7 +169,6 @@ function PreviewCredentialWorkspace() {
         sort,
         dir,
         view,
-        batch,
         selected,
         page,
         pageSize,
@@ -185,7 +181,6 @@ function PreviewCredentialWorkspace() {
           setDir(nextDir)
         },
         onViewChange: setView,
-        onBatchChange: setBatch,
         onSelectedChange: setSelected,
         onPageChange: setPage,
         onPageSizeChange: setPageSize,
@@ -249,7 +244,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <>
                 <div className="app-shell flex min-h-dvh flex-col text-foreground">
                   <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
-                    <div className="page-frame flex h-16 items-center justify-between gap-3">
+                    <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
                       <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
                         <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
                           <LogoMark className="size-[1.125rem]" />
@@ -265,13 +260,14 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                       <div className="flex items-center gap-2 sm:hidden">
                         <Button size="icon-lg" aria-label="添加账号" onClick={() => navigatePreview('?dialog=add')}><PlusIcon /></Button>
                         <Menu>
-                          <MenuTrigger render={<Button size="icon-lg" variant="outline" aria-label="更多操作" />}>
+                          <MenuTrigger
+                            className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
+                            aria-label="更多操作"
+                          >
                             <EllipsisVerticalIcon />
                           </MenuTrigger>
                           <MenuPopup align="end">
                             <MenuItem onClick={() => navigatePreview('?settings=access')}><SettingsIcon />系统设置</MenuItem>
-                            <MenuSeparator />
-                            <MenuItem><ListChecksIcon />批量操作</MenuItem>
                           </MenuPopup>
                         </Menu>
                       </div>
@@ -283,7 +279,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                     </div>
                   </header>
 
-                  <main className="page-frame flex-1 py-6 pb-10 sm:py-8 sm:pb-12">
+                  <main className="page-frame flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
                     <PreviewCredentialWorkspace />
                   </main>
                   <AppFooter />

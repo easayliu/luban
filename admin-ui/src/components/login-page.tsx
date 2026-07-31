@@ -35,7 +35,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
           <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-brand-foreground shadow-brand">
             <LogoMark className="size-7" />
           </div>
-          <div className="mt-4 text-lg font-semibold leading-none tracking-tight">Luban</div>
+          <div className="mt-4 text-base font-semibold leading-none tracking-tight">Luban</div>
           <div className="mt-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
             Claude Code Gateway
           </div>
@@ -43,8 +43,8 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
 
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <LockKeyholeIcon aria-hidden="true" className="text-muted-foreground" />
+            <CardTitle className="flex items-center gap-2 text-base leading-tight">
+              <LockKeyholeIcon aria-hidden="true" className="size-4 text-muted-foreground" />
               管理登录
             </CardTitle>
             <CardDescription>输入管理密码以继续访问控制台。</CardDescription>

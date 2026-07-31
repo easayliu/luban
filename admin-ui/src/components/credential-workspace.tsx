@@ -4,7 +4,6 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   LayoutGridIcon,
-  ListChecksIcon,
   ListFilterIcon,
   ListIcon,
   PlusIcon,
@@ -31,7 +30,7 @@ import {
 } from '@/components/credential-shared'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import {
   Card,
   CardFrame,
@@ -161,7 +160,6 @@ interface CredentialWorkspaceState {
   sort: SortKey
   dir: SortDir
   view: CredentialViewMode
-  batch: boolean
   selected: Set<number>
   page: number
   pageSize: CredentialPageSize
@@ -172,7 +170,6 @@ interface CredentialWorkspaceActions {
   onFilterChange: (value: CredentialFilterKey) => void
   onSortChange: (key: SortKey, dir: SortDir) => void
   onViewChange: (value: CredentialViewMode) => void
-  onBatchChange: (value: boolean) => void
   onSelectedChange: (value: Set<number>) => void
   onPageChange: (value: number) => void
   onPageSizeChange: (value: CredentialPageSize) => void
@@ -205,7 +202,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     sort,
     dir,
     view,
-    batch,
     selected,
     page,
     pageSize,
@@ -298,17 +294,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
-    <div className="space-y-6 sm:space-y-8" data-slot="credential-workspace">
+    <div className="space-y-5 sm:space-y-8" data-slot="credential-workspace">
       <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="page-title">
         <div className="min-w-0">
-          <h1 id="page-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">
+          <h1 id="page-title" className="text-xl font-semibold tracking-tight sm:text-2xl">
             账号调度中心
           </h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="mt-1.5 max-w-2xl text-sm leading-5 text-muted-foreground">
             统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
           </p>
         </div>
-        <div className="mt-4 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
+        <div className="mt-3 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
           {isRefetchError ? (
             <>
               <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
@@ -334,14 +330,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       </section>
 
       {isLoading ? (
-        <section aria-label="正在加载账号池概览" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <section aria-label="正在加载账号池概览" className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
           <OverviewMetricSkeleton />
           <OverviewMetricSkeleton />
           <OverviewMetricSkeleton />
           <OverviewMetricSkeleton />
         </section>
       ) : count > 0 && (
-        <section aria-label="账号池概览" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <section aria-label="账号池概览" className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
           <OverviewMetric
             label="可调度账号"
             value={`${schedulableCount}/${count}`}
@@ -389,9 +385,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         <CardFrame className="min-w-0">
           {count > 0 && (
             <Card>
-              <CardPanel className="p-3">
-                <Toolbar className="w-full flex-col items-stretch sm:flex-row sm:flex-wrap sm:items-center">
-                  <InputGroup className="sm:min-w-56 sm:flex-1 xl:max-w-72">
+              <CardPanel className="p-2.5 sm:p-3">
+                <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
+                  <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-72">
                     <InputGroupAddon><SearchIcon /></InputGroupAddon>
                     <InputGroupInput
                       value={query}
@@ -409,11 +405,19 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   </InputGroup>
 
                   <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
-                  <ToolbarGroup className="grid grid-cols-2 sm:flex sm:flex-wrap">
+                  <ToolbarGroup className="grid min-w-0 grid-cols-2 sm:flex sm:flex-wrap">
                     <Menu>
-                      <MenuTrigger render={<Button variant={filter === 'all' ? 'outline' : 'secondary'} />}>
+                      <MenuTrigger
+                        aria-label={`筛选：${FILTERS.find((item) => item.key === filter)!.label}`}
+                        className={cn(
+                          buttonVariants({ variant: filter === 'all' ? 'outline' : 'secondary' }),
+                          'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                        )}
+                      >
                         <ListFilterIcon />
-                        {FILTERS.find((item) => item.key === filter)!.label}
+                        <span className="min-w-0 truncate">
+                          {FILTERS.find((item) => item.key === filter)!.label}
+                        </span>
                       </MenuTrigger>
                       <MenuPopup align="end" className="w-52">
                         <MenuRadioGroup value={filter}>
@@ -432,9 +436,20 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     </Menu>
 
                     <Menu>
-                      <MenuTrigger render={<Button variant="outline" />}>
+                      <MenuTrigger
+                        aria-label={`排序：${SORTS.find((item) => item.key === sort)!.label}，${dir === 'asc' ? '升序' : '降序'}`}
+                        className={cn(
+                          buttonVariants({ variant: 'outline' }),
+                          'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                        )}
+                      >
                         <ArrowUpDownIcon />
-                        {SORTS.find((item) => item.key === sort)!.label} {dir === 'asc' ? '↑' : '↓'}
+                        <span className="min-w-0 truncate max-[22rem]:hidden">
+                          {SORTS.find((item) => item.key === sort)!.label} {dir === 'asc' ? '↑' : '↓'}
+                        </span>
+                        <span className="hidden shrink-0 max-[22rem]:inline">
+                          排序 {dir === 'asc' ? '↑' : '↓'}
+                        </span>
                       </MenuTrigger>
                       <MenuPopup align="end" className="w-48">
                         <MenuRadioGroup value={sort}>
@@ -456,16 +471,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   </ToolbarGroup>
 
                   <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block" />
-                  <ToolbarGroup className="justify-end">
-                    <Button
-                      variant={batch ? 'secondary' : 'outline'}
-                      onClick={() => {
-                        actions.onBatchChange(!batch)
-                        clearSelection()
-                      }}
-                    >
-                      <ListChecksIcon />批量
-                    </Button>
+                  <ToolbarGroup className="self-center justify-end">
                     <ToggleGroup
                       value={[view]}
                       onValueChange={(values) => {
@@ -489,23 +495,20 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             </Card>
           )}
 
-          {count > 0 && batch && (
-            <div className="relative p-4 pb-0">
+          {count > 0 && selected.size > 0 && (
+            <div className="relative p-3 pb-0 sm:p-4 sm:pb-0">
               <BatchActionsBar
                 all={sorted}
                 selected={selected}
                 onSelectedChange={actions.onSelectedChange}
-                onClose={() => {
-                  actions.onBatchChange(false)
-                  clearSelection()
-                }}
+                onClear={clearSelection}
               />
             </div>
           )}
 
           {isLoading ? (
-            <div className="relative p-4">
-              <CredentialLoadingState view={view} selectable={batch} />
+            <div className="relative p-3 sm:p-4">
+              <CredentialLoadingState view={view} selectable />
             </div>
           ) : isError && !credentials ? (
             <Card><ErrorState error={error} onRetry={actions.onRetry} /></Card>
@@ -533,10 +536,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </Empty>
             </Card>
           ) : view === 'list' ? (
-            <Table variant="card" className="table-fixed">
+            <Table variant="card" className="xl:min-w-[72rem]">
               <TableCaption className="sr-only">账号列表</TableCaption>
               <CredentialListHeader
-                selectable={batch}
+                selectable
                 sort={sort}
                 dir={dir}
                 onSortChange={changeSort}
@@ -550,7 +553,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <CredentialRow
                     key={item.id}
                     cred={item}
-                    selectable={batch}
+                    selectable
                     selected={selected.has(item.id)}
                     onSelectedChange={(checked) => toggleSelected(item.id, checked)}
                   />
@@ -558,12 +561,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </TableBody>
             </Table>
           ) : (
-            <div className="relative grid items-stretch gap-4 p-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))]">
+            <div className="relative grid items-stretch gap-3 p-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
               {pageItems.map((item) => (
                 <CredentialCard
                   key={item.id}
                   cred={item}
-                  selectable={batch}
+                  selectable
                   selected={selected.has(item.id)}
                   onSelectedChange={(checked) => toggleSelected(item.id, checked)}
                 />
@@ -572,7 +575,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           )}
 
           {!isLoading && pageCount > 1 && (
-            <CardFrameFooter className="relative">
+            <CardFrameFooter className="relative px-3 py-4 sm:px-6">
               <AccountPagination
                 total={total}
                 page={current}
@@ -617,12 +620,19 @@ function AccountPagination({
   }
 
   return (
-    <div className="grid gap-3 text-xs text-muted-foreground md:grid-cols-[1fr_auto_1fr] md:items-center">
-      <span>
-        第 <span className="tnum text-foreground">{from}-{to}</span> 个，共{' '}
-        <span className="tnum text-foreground">{total}</span> 个账号
+    <div className="grid grid-cols-[1fr_auto] items-center gap-3 text-xs text-muted-foreground md:grid-cols-[1fr_auto_1fr]">
+      <span className="min-w-0">
+        <span className="sm:hidden">
+          <span className="tnum text-foreground">{from}–{to}</span>
+          {' / '}
+          <span className="tnum text-foreground">{total}</span>
+        </span>
+        <span className="hidden sm:inline">
+          第 <span className="tnum text-foreground">{from}-{to}</span> 个，共{' '}
+          <span className="tnum text-foreground">{total}</span> 个账号
+        </span>
       </span>
-      <CossPagination className="justify-start md:justify-center">
+      <CossPagination className="col-span-2 row-start-2 justify-center md:col-span-1 md:col-start-2 md:row-start-1">
         <PaginationContent>
           <PaginationItem>
             <PaginationLink
@@ -665,8 +675,8 @@ function AccountPagination({
           </PaginationItem>
         </PaginationContent>
       </CossPagination>
-      <div className="flex items-center gap-2 md:justify-self-end">
-        <span>每页</span>
+      <div className="row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
+        <span className="max-sm:sr-only">每页</span>
         <Select
           items={PAGE_SIZE_ITEMS}
           value={String(pageSize)}

@@ -100,8 +100,8 @@ export function CredentialCard({
         selected && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
       )}
     >
-      <CardHeader className="p-5 pb-4">
-        <CardTitle className="min-w-0">
+      <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-4">
+        <CardTitle className="min-w-0 text-sm leading-snug">
           {editing ? (
             <Form
               className="flex items-center gap-2"
@@ -149,19 +149,19 @@ export function CredentialCard({
                   aria-label={`选择 ${cred.label}`}
                 />
               )}
-              <Avatar>
+              <Avatar className="max-[22rem]:hidden">
                 <AvatarFallback>{initial}</AvatarFallback>
               </Avatar>
               <div className="min-w-0 flex-1">
                 <span className="block break-all leading-snug" title={cred.label}>{cred.label}</span>
-                <CardDescription className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal">
+                <CardDescription className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-normal">
                   <span className="tabular-nums">#{cred.id}</span>
                   <span aria-hidden>·</span>
                   <span
                     className="inline-flex items-center gap-1"
                     title={`添加于 ${formatFullTime(cred.created_at)}`}
                   >
-                    <CalendarDaysIcon />
+                    <CalendarDaysIcon className="size-3.5" />
                     添加于 {relativeTime(cred.created_at)}
                   </span>
                 </CardDescription>
@@ -195,7 +195,7 @@ export function CredentialCard({
         )}
       </CardHeader>
 
-      <CardPanel className="space-y-4 px-5 pb-5">
+      <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
         <div className="flex flex-wrap items-center gap-2">
           {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
           <Badge variant="outline" title="调度优先级，数值越小越优先">
@@ -214,7 +214,7 @@ export function CredentialCard({
             {!cred.quota && <span className="text-sm text-muted-foreground">暂无数据</span>}
           </div>
           {cred.quota && (has5h || has7d) ? (
-            <div className="grid gap-5 @sm/card:grid-cols-2">
+            <div className="grid gap-4 @sm/card:grid-cols-2 @sm/card:gap-5">
               {has5h && (
                 <QuotaMeter
                   label="5 小时"
@@ -240,7 +240,7 @@ export function CredentialCard({
         </section>
       </CardPanel>
 
-      <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-5 py-4">
+      <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
         <Button
           type="button"
           variant="ghost"

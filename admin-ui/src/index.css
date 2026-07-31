@@ -248,6 +248,10 @@
     padding-top: env(safe-area-inset-top);
   }
 
+  .settings-tabs-bar {
+    top: calc(3.5rem + env(safe-area-inset-top));
+  }
+
   .page-frame {
     width: 100%;
     max-width: 80rem;
@@ -267,6 +271,10 @@
   }
 
   @media (min-width: 40rem) {
+    .settings-tabs-bar {
+      top: calc(4rem + env(safe-area-inset-top));
+    }
+
     .page-frame {
       padding-left: max(1.5rem, env(safe-area-inset-left));
       padding-right: max(1.5rem, env(safe-area-inset-right));

@@ -331,7 +331,7 @@ export function DeleteCredentialDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>删除账号</AlertDialogTitle>
           <AlertDialogDescription>
-            删除「<span className="font-medium text-foreground">{cred.label}</span>」后，
+            删除「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」后，
             历史用量与设备绑定将一并清除，且无法恢复。
           </AlertDialogDescription>
         </AlertDialogHeader>
@@ -473,7 +473,7 @@ export function ConnectivityTestDialog({
         <DialogHeader>
           <DialogTitle>连通性测试</DialogTitle>
           <DialogDescription>
-            使用「<span className="font-medium text-foreground">{cred.label}</span>」向上游发送最小请求；
+            使用「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」向上游发送最小请求；
             会消耗少量订阅额度并按实际用量计入该账号。测试结果与真实流量同等对待：限流会进入冷却，检测到封禁会自动停用。
           </DialogDescription>
         </DialogHeader>
@@ -526,7 +526,7 @@ export function ConnectivityTestDialog({
           {entries.length === 0 ? (
             <Empty className="py-8">
               <EmptyHeader>
-                <EmptyTitle>尚无测试结果</EmptyTitle>
+                <EmptyTitle className="text-base">尚无测试结果</EmptyTitle>
                 <EmptyDescription>选择模型开始测试，结果会显示实时额度或上游错误。</EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -551,14 +551,17 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
     <li>
       <Alert variant={result.ok ? 'success' : 'error'}>
         <Icon aria-hidden />
-        <AlertTitle className="flex flex-wrap items-center gap-2">
-          <span>{model}</span>
+        <AlertTitle className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="min-w-0 [overflow-wrap:anywhere]" title={model}>{model}</span>
           <Badge variant={result.ok ? 'success' : 'error'} size="sm">
             {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
           </Badge>
           <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
           {result.model && result.model !== model && (
-            <span className="font-normal text-muted-foreground" title="上游实际使用的模型">
+            <span
+              className="min-w-0 font-normal text-muted-foreground [overflow-wrap:anywhere]"
+              title={`上游实际使用的模型：${result.model}`}
+            >
               → {result.model}
             </span>
           )}
@@ -606,7 +609,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
     )
   }
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-2xs text-muted-foreground">
+    <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
       {win('5h', quota.rl_5h_utilization, quota.rl_5h_reset)}
       {win('7d', quota.rl_7d_utilization, quota.rl_7d_reset)}
       {/* 429 才有。它是上游对**这次**拒绝给出的等待时间，比窗口 reset 更直接。 */}

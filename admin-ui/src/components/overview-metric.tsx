@@ -22,13 +22,13 @@ export function OverviewMetric({
     neutral: 'text-muted-foreground',
   }[tone]
   const content = (
-    <CardPanel className="p-4 sm:p-5">
+    <CardPanel className="p-3 sm:p-5">
       <div className="flex items-center justify-between gap-3">
-        <p className="min-w-0 text-sm font-medium text-muted-foreground">{label}</p>
-        <Icon className={cn('size-5 shrink-0', iconClass)} aria-hidden />
+        <p className="min-w-0 text-xs font-medium text-muted-foreground">{label}</p>
+        <Icon className={cn('size-4 shrink-0', iconClass)} aria-hidden />
       </div>
-      <div className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <span className="text-2xl font-semibold leading-none tracking-tight tnum">
+      <div className="mt-2.5 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="text-xl font-semibold leading-none tracking-tight tnum">
           {value}
         </span>
         {status && <span className="text-xs text-muted-foreground">{status}</span>}
@@ -56,13 +56,13 @@ export function OverviewMetric({
 export function OverviewMetricSkeleton({ className }: { className?: string }) {
   return (
     <Card className={cn('min-w-0', className)}>
-      <CardPanel className="p-4 sm:p-5">
+      <CardPanel className="p-3 sm:p-5">
         <div className="flex items-center justify-between gap-3">
           <Skeleton className="h-4 w-20" />
-          <Skeleton className="size-5 rounded-md" />
+          <Skeleton className="size-4 rounded-md" />
         </div>
-        <div className="mt-3 flex items-end gap-2">
-          <Skeleton className="h-6 w-14" />
+        <div className="mt-2.5 flex items-end gap-2">
+          <Skeleton className="h-5 w-14" />
           <Skeleton className="mb-0.5 h-3 w-16" />
         </div>
       </CardPanel>
