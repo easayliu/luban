@@ -744,7 +744,7 @@ impl CredentialStore {
         let conn = self.conn.lock();
         let Ok(mut stmt) = conn.prepare(
             "SELECT key, value FROM settings \
-              WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         ) else {
             return flags;
         };
@@ -759,6 +759,7 @@ impl CredentialStore {
                 ORIG_HEADER_CASE,
                 THINKING_SIGNATURE_RETRY,
                 SIMULATE_CC,
+                FILL_METADATA,
                 RATE_LIMIT_RETRY,
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
@@ -778,6 +779,7 @@ impl CredentialStore {
                 ORIG_HEADER_CASE => flags.orig_header_case = on,
                 THINKING_SIGNATURE_RETRY => flags.thinking_signature_retry = on,
                 SIMULATE_CC => flags.simulate_cc = on,
+                FILL_METADATA => flags.fill_metadata = on,
                 RATE_LIMIT_RETRY => flags.rate_limit_retry = on,
                 _ => {}
             }
@@ -849,6 +851,10 @@ pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
 /// 缺省视为开启：关掉的话这类请求会因缺 `You are Claude Code, …` 被上游拒掉，等于不可用。
 pub const SIMULATE_CC: &str = "simulate_cc";
 
+/// 已是 CC 形态、但不带 `metadata.user_id` 的请求，是否补一份官方形态身份的 settings 键名。
+/// 缺省视为开启：官方**每条**请求都带那个字段，缺了就是一处白给的判据。
+pub const FILL_METADATA: &str = "fill_metadata";
+
 /// 上游 429 时是否打冷却并换号重试的 settings 键名。缺省视为开启：不开的话被限流的号会
 /// 一直被粘性绑定的设备撞上，而其它账号闲着。
 pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
@@ -883,6 +889,9 @@ pub struct ForwardFlags {
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。
     pub simulate_cc: bool,
+    /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，补一份官方形态的身份
+    /// （见 [`crate::proxy::bare_session_id`]）。
+    pub fill_metadata: bool,
     /// 上游回 429 时给该号打冷却并换号重试（次数见
     /// [`CredentialStore::rate_limit_retry_max`]）；关掉即原样透传 429、也不打冷却。
     pub rate_limit_retry: bool,
@@ -899,6 +908,7 @@ impl Default for ForwardFlags {
             orig_header_case: true,
             thinking_signature_retry: true,
             simulate_cc: true,
+            fill_metadata: true,
             rate_limit_retry: true,
         }
     }
@@ -3236,6 +3246,7 @@ mod tests {
             (ORIG_HEADER_CASE, "0"),
             (THINKING_SIGNATURE_RETRY, "0"),
             (SIMULATE_CC, "0"),
+            (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
         ] {
             store.set_setting(key, off).unwrap();
@@ -3252,6 +3263,7 @@ mod tests {
                 orig_header_case: false,
                 thinking_signature_retry: false,
                 simulate_cc: false,
+                fill_metadata: false,
                 rate_limit_retry: false,
             }
         );

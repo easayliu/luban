@@ -38,6 +38,9 @@ pub async fn handle(
 
     // 2) 提取 device_id（在请求体 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(&body);
+    // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
+    // body 逐轮不变，算一次即可。见 [`Upstream::bare_session`]。
+    let has_user_id = body_has_user_id(&body);
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
@@ -150,7 +153,18 @@ pub async fn handle(
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
     let (upstream, resp) = loop {
         let sim = Simulation::detect(&body, flags, &cred, &device_fp);
-        let out = build_forward_headers(&headers, &token, flags, sim.as_ref());
+        // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
+        let bare_session = bare_session_id(
+            &headers,
+            flags,
+            sim.as_ref(),
+            billable,
+            has_user_id,
+            &cred,
+            &device_fp,
+        );
+        let out =
+            build_forward_headers(&headers, &token, flags, sim.as_ref(), bare_session.as_deref());
         let upstream = Upstream {
             state: &state,
             method: method.clone(),
@@ -159,6 +173,7 @@ pub async fn handle(
             flags,
             billable,
             sim,
+            bare_session,
         };
         let resp = upstream.send(upstream.shape(&body, &cred, &device_fp)).await;
 
@@ -231,9 +246,15 @@ pub async fn handle(
     // 请求日志里记哪个设备：客户端自己带了就记它的，裸客户端记出站那份**伪装** device_id。
     // 不记的话这段流量在日志里只留下 `device=-`，既看不出是谁、也无从聚合。见 [`sim_device_id`]。
     // 取最终那一轮的凭证与模拟参数——换过号的话，实际发出去的就是那份。
-    let logged_device = device_id
-        .clone()
-        .or_else(|| sim_device_id(upstream.sim.as_ref(), flags, &cred, &device_fp));
+    let logged_device = device_id.clone().or_else(|| {
+        sim_device_id(
+            upstream.sim.as_ref(),
+            upstream.bare_session.as_deref(),
+            flags,
+            &cred,
+            &device_fp,
+        )
+    });
 
     match resp {
         Ok(up) => {
@@ -386,6 +407,15 @@ struct Upstream<'a> {
     billable: bool,
     /// 非 CC 客户端的模拟参数；`None` 即来访本来就是 CC 形态。见 [`Simulation`]。
     sim: Option<Simulation>,
+    /// **CC 形态但不带 `metadata.user_id`** 的来访要补的那份身份用的 session_id
+    /// （`sim` 为 `Some` 时恒为 `None`——那条路的会话 id 在 [`Simulation::session_id`] 里）。
+    ///
+    /// 这类来访多是第三方 CC 兼容客户端：系统提示词学了官方的，metadata 却不发。而官方
+    /// **每条**请求都带那个字段，缺了就是一处白给的判据，所以照样补（[`ensure_cc_metadata`]）。
+    /// 取值优先用来访自己带的 `X-Claude-Code-Session-Id`：官方头体两处逐字相同，另派生一个
+    /// 只会让它们对不上，那比两处都缺更显眼；没带才派生，并由 [`build_forward_headers`]
+    /// 把同一个值补进头里。
+    bare_session: Option<String>,
 }
 
 impl Upstream<'_> {
@@ -400,7 +430,14 @@ impl Upstream<'_> {
     /// 也只是多担一份上游挑刺的风险，而这条路径既不产生 usage 也不消耗额度。
     fn shape(&self, body: &Bytes, cred: &crate::credentials::Credential, device_fp: &str) -> Bytes {
         if self.billable {
-            rewrite_body(body, cred, device_fp, self.flags, self.sim.as_ref())
+            rewrite_body(
+                body,
+                cred,
+                device_fp,
+                self.flags,
+                self.sim.as_ref(),
+                self.bare_session.as_deref(),
+            )
         } else {
             body.clone()
         }
@@ -912,6 +949,18 @@ fn extract_device_id(body: &Bytes) -> Option<String> {
     (!flat.device.is_empty()).then_some(flat.device)
 }
 
+/// 来访体里有没有 `metadata.user_id`。
+///
+/// 与 [`extract_device_id`] 的区别：那个要求能**解析出设备标识**，格式认不出就是 `None`；
+/// 这里只问「这个字段在不在」——决定的是要不要给它补一份官方身份（见 [`ensure_cc_metadata`]），
+/// 而字段已经在的话，改写它是 [`spoof_identity`] 的活，两条路只能有一条动它。
+fn body_has_user_id(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| Some(v.get("metadata")?.get("user_id")?.is_string()))
+        .unwrap_or(false)
+}
+
 /// 扁平 `metadata.user_id` 中我们需要的两段：`user_<device>_account_<..>_session_<session>`。
 /// account 段被凭证真实值覆盖，故不保留。
 struct FlatUserId {
@@ -1084,6 +1133,7 @@ fn build_forward_headers(
     token: &str,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
+    bare_session: Option<&str>,
 ) -> HeaderMap {
     let mut out = match sim {
         // 模拟模式：来访那套头一个不留，整体换成官方的（见 [`official_headers`]）。
@@ -1095,6 +1145,15 @@ fn build_forward_headers(
                 if is_forwardable(k, v) {
                     out.append(k.clone(), v.clone());
                 }
+            }
+            // CC 形态的来访要补 metadata 时（见 [`Upstream::bare_session`]），头上的会话 id
+            // 必须与体里那个同值——官方两处逐字相同。`bare_session` 已经优先取的就是来访
+            // 自己那个头的值，故这里只在它压根没带时才补，不覆盖客户端原值。
+            if let Some(sid) = bare_session
+                && !out.contains_key("x-claude-code-session-id")
+                && let Ok(v) = HeaderValue::from_str(sid)
+            {
+                out.insert("x-claude-code-session-id", v);
             }
             out
         }
@@ -1340,6 +1399,47 @@ fn cc_beta_seed(model: &str) -> &'static str {
     }
 }
 
+/// 来访自己带的 `X-Claude-Code-Session-Id`（非空才算）。补 metadata 时优先用它，
+/// 见 [`Upstream::bare_session`]。
+fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get("x-claude-code-session-id")?.to_str().ok()?.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// CC 形态来访要补 `metadata.user_id` 时用的 session_id；不需要补时为 `None`。
+/// 语义与各项前提见 [`Upstream::bare_session`]。
+///
+/// 六个前提缺一不可：
+/// - `sim.is_none()`：模拟那条路自己带 session_id，不走这里；
+/// - `flags.fill_metadata`：本功能自己的开关（网页可关）；
+/// - `flags.spoof_identity`：身份伪装总开关——补出来的那份身份正是它管的东西，
+///   它关着还补，等于绕过总开关；
+/// - `billable`：非计费路径（count_tokens）出站体一律原样透传，补了也发不出去；
+/// - `!has_user_id`：字段已经在就交给 [`spoof_identity`] 原格式改写，两条路只能有一条动它；
+/// - `spoof_device_id` 有值：这是 [`ensure_cc_metadata`] 造身份的前提（无 `account_uuid`
+///   就造不出自洽身份）。不满足时连头也不补——否则会补出一个「头上有会话 id、体里没
+///   metadata」的新破绽，比两处都缺更显眼。
+fn bare_session_id(
+    headers: &HeaderMap,
+    flags: store::ForwardFlags,
+    sim: Option<&Simulation>,
+    billable: bool,
+    has_user_id: bool,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+) -> Option<String> {
+    if sim.is_some()
+        || !flags.fill_metadata
+        || !flags.spoof_identity
+        || !billable
+        || has_user_id
+        || cred.spoof_device_id(device_fp).is_none()
+    {
+        return None;
+    }
+    Some(incoming_session_id(headers).unwrap_or_else(|| session_id_for(cred, device_fp)))
+}
+
 /// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 设备指纹)` 取前 16 字节，
 /// 按 uuid v4 形态格式化。同一设备同一账号恒定，换账号或换设备即不同。
 ///
@@ -1544,6 +1644,7 @@ fn rewrite_body(
     device_fp: &str,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
+    bare_session: Option<&str>,
 ) -> Bytes {
     // `ttl` 要上游认，前提是 `anthropic-beta` 里有 `extended-cache-ttl-2025-04-11`，而那串
     // 是 `merge_beta` 补的（API-key 模式的客户端自己不发，cap/raw/00002 证实）。两个开关必须
@@ -1553,6 +1654,9 @@ fn rewrite_body(
     if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch {
         return body.clone();
     }
+    // 补 metadata 用的 session_id：模拟模式取 Simulation 那份，CC 形态来访取 `bare_session`
+    // （见 [`Upstream::bare_session`]）。两者都与出站头上的 `X-Claude-Code-Session-Id` 同值。
+    let meta_session = sim.map(|s| s.session_id.as_str()).or(bare_session);
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return body.clone(),
@@ -1566,7 +1670,7 @@ fn rewrite_body(
         "入站 metadata"
     );
     let sim_meta = flags.spoof_identity
-        && sim.is_some_and(|sim| ensure_cc_metadata(&mut v, cred, device_fp, &sim.session_id));
+        && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
     let spoofed = flags.spoof_identity && spoof_identity(&mut v, cred, device_fp);
     tracing::debug!(
         simulated,
@@ -1590,9 +1694,10 @@ fn rewrite_body(
 /// 裸客户端（无 `metadata.user_id`）在请求日志里用的设备标识：出站那份**伪装** device_id，
 /// 加 `sim:` 前缀。没伪装过就返回 `None`（日志照旧是 `-`）。
 ///
-/// **只在真伪装过时才记**：要求走了模拟路径（`sim` 为 `Some`）且 `spoof_identity` 开着——
-/// 那正是 [`ensure_cc_metadata`] 会把这个 id 写进出站体的条件。否则记出来的是一个上游根本
-/// 没见过的 id，比留个 `-` 更误导。
+/// **只在真伪装过时才记**：要求 [`ensure_cc_metadata`] 确实把这个 id 写进了出站体，也就是
+/// `spoof_identity` 开着、且走了会补身份的那两条路之一——模拟路径（`sim` 为 `Some`）或
+/// CC 形态补身份（`bare_session` 为 `Some`，见 [`Upstream::bare_session`]）。否则记出来的是
+/// 一个上游根本没见过的 id，比留个 `-` 更误导。
 ///
 /// **前缀不是装饰**：这个值每账号恒定（指纹对裸客户端恒为 `"||"`），所有裸客户端共用同一个，
 /// 看着就像「一台设备打了全部请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成
@@ -1600,11 +1705,12 @@ fn rewrite_body(
 /// （[`store::CredentialStore::list_devices`] 从 `device_bindings` 出发）。
 fn sim_device_id(
     sim: Option<&Simulation>,
+    bare_session: Option<&str>,
     flags: store::ForwardFlags,
     cred: &crate::credentials::Credential,
     device_fp: &str,
 ) -> Option<String> {
-    if sim.is_none() || !flags.spoof_identity {
+    if (sim.is_none() && bare_session.is_none()) || !flags.spoof_identity {
         return None;
     }
     cred.spoof_device_id(device_fp).map(|d| format!("sim:{d}"))
@@ -2332,7 +2438,7 @@ pub async fn probe(
         beta: cc_beta_seed(model),
         session_id: session_id_for(cred, &device_fp),
     };
-    let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim));
+    let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim), None);
     let upstream = Upstream {
         state,
         method: Method::POST,
@@ -2341,6 +2447,8 @@ pub async fn probe(
         flags,
         billable: true,
         sim: Some(sim),
+        // 走的是模拟那条路（sim 恒为 Some），会话 id 在 Simulation 里。
+        bare_session: None,
     };
 
     let body = probe_body(model);
@@ -2774,7 +2882,8 @@ mod tests {
     /// 处理的是同一类问题（那个管值内顺序，这个管头之间的顺序）。
     #[test]
     fn forward_headers_keep_client_order() {
-        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on(), None);
+        let out =
+            build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", all_on(), None, None);
 
         assert_eq!(
             names(&out),
@@ -2818,9 +2927,11 @@ mod tests {
             orig_header_case: false,
             thinking_signature_retry: false,
             simulate_cc: false,
+            fill_metadata: false,
             rate_limit_retry: false,
         };
-        let out = build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None);
+        let out =
+            build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
 
         // 头序与来访一致，且末尾不再追加 x-client-request-id。
         assert_eq!(
@@ -2861,7 +2972,7 @@ mod tests {
             HeaderValue::from_static("application/json"),
         );
 
-        let on = build_forward_headers(&bare, "tok", all_on(), None);
+        let on = build_forward_headers(&bare, "tok", all_on(), None, None);
         assert_eq!(
             names(&on),
             vec![
@@ -2876,7 +2987,7 @@ mod tests {
         );
 
         let flags = store::ForwardFlags { fill_client_headers: false, ..all_on() };
-        let off = build_forward_headers(&bare, "tok", flags, None);
+        let off = build_forward_headers(&bare, "tok", flags, None, None);
         assert_eq!(
             names(&off),
             vec!["content-type", "anthropic-beta", "authorization"],
@@ -2892,7 +3003,7 @@ mod tests {
     #[test]
     fn never_leaks_client_key_upstream() {
         // token 里塞进换行——`HeaderValue::from_str` 会拒绝，走到移除分支。
-        let out = build_forward_headers(&incoming_headers(), "bad\ntoken", all_on(), None);
+        let out = build_forward_headers(&incoming_headers(), "bad\ntoken", all_on(), None, None);
         assert!(!out.contains_key("authorization"), "构造失败时应移除该头: {out:?}");
         // 任何路径下都不得把接入 key 转发出去。
         for (_, v) in out.iter() {
@@ -3038,6 +3149,7 @@ mod tests {
                 "sk-ant-oat01-REAL",
                 all_on(),
                 None,
+                None,
             ))
             .body(r#"{"model":"claude-sonnet-5"}"#);
         let req = if orig_case { req.orig_headers(super::orig_header_case()) } else { req };
@@ -3175,8 +3287,14 @@ mod tests {
     /// 消息里的断点也补上 `ttl`。切开处那个 `\n\n` 两边都不保留。
     #[test]
     fn aligns_system_to_official_four_blocks() {
-        let out =
-            super::rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(
+            &Bytes::from(API_SHAPE_BODY),
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+        );
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let sys = v["system"].as_array().unwrap();
@@ -3216,7 +3334,7 @@ mod tests {
             r#"\nBASE — 基座\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
             r#"\nBASE — 基座\n\n# Communicating with the user\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -3237,7 +3355,7 @@ mod tests {
             "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
             "# Text output (does not apply to tool calls)",
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -3254,7 +3372,7 @@ mod tests {
     #[test]
     fn leaves_system_alone_when_anchor_missing() {
         let raw = Bytes::from(API_SHAPE_BODY.replace("Write code that reads like", "改了措辞的"));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
@@ -3273,7 +3391,7 @@ mod tests {
                           {"type":"text","text":"base","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}},
                           {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
         );
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         assert_eq!(out, raw, "四块形态应原样返回");
     }
 
@@ -3292,15 +3410,16 @@ mod tests {
             orig_header_case: false,
             thinking_signature_retry: false,
             simulate_cc: false,
+            fill_metadata: false,
             rate_limit_retry: false,
         };
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags, None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
 
         // 逐项开一个，就只有那一项生效，其余仍不动。
         let only_cch = store::ForwardFlags { billing_cch: true, ..flags };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", only_cch, None).to_vec(),
+            super::rewrite_body(&raw, &test_cred(), "fp", only_cch, None, None).to_vec(),
         )
         .unwrap();
         assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
@@ -3309,12 +3428,12 @@ mod tests {
 
         // system 形态依赖 merge_beta 补的 extended-cache-ttl beta：只开 system_shape 不生效。
         let shape_only = store::ForwardFlags { system_shape: true, ..flags };
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", shape_only, None);
+        let out = super::rewrite_body(&raw, &test_cred(), "fp", shape_only, None, None);
         assert_eq!(out, raw, "merge_beta 关着时不应写出 ttl");
 
         let with_beta = store::ForwardFlags { merge_beta: true, ..shape_only };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", with_beta, None).to_vec(),
+            super::rewrite_body(&raw, &test_cred(), "fp", with_beta, None, None).to_vec(),
         )
         .unwrap();
         assert!(s.contains(r#""scope":"global""#), "两个开关都开时应对齐形态: {s}");
@@ -3344,7 +3463,7 @@ mod tests {
             r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
             r#""max_tokens":64000,"stream":true}"#
         );
-        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), None);
+        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
@@ -3680,7 +3799,7 @@ mod tests {
                 .to_string(),
         );
         let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
@@ -3730,7 +3849,7 @@ mod tests {
     fn simulates_system_when_client_sent_none() {
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
         assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
@@ -3779,7 +3898,7 @@ mod tests {
             r#"{{"model":"claude-opus-5","messages":[],"system":[{blk},{blk},{blk},{blk}]}}"#
         ));
         let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
         assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
@@ -3793,7 +3912,7 @@ mod tests {
     fn injects_cc_metadata_only_when_absent() {
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim));
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
         let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
@@ -3814,7 +3933,7 @@ mod tests {
                 .to_string(),
         );
         let sim2 = super::Simulation::detect(&with_meta, all_on(), &test_cred(), "fp").unwrap();
-        let out2 = super::rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2));
+        let out2 = super::rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2), None);
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         assert_eq!(
             v2["metadata"]["user_id"],
@@ -3824,6 +3943,154 @@ mod tests {
             ),
             "扁平串形态应原格式改写，而不是被换成 CC 的 JSON 形态"
         );
+    }
+
+    /// CC 形态但不带 `metadata.user_id` 的来访（第三方 CC 兼容客户端）：照样补一份官方身份，
+    /// **且头体两处的 session_id 逐字节相同**。
+    ///
+    /// 判据逐条取自 `cap/raw/00006`（claude-cli/2.1.220 直连，opus-5）的原始报文：
+    /// ```text
+    /// "metadata":{"user_id":"{\"device_id\":\"832cb7…2870\",\"account_uuid\":\"edded6bb-…\",\"session_id\":\"bc201916-d0bc-4b4e-adba-caf41fb58746\"}"}
+    /// X-Claude-Code-Session-Id: bc201916-d0bc-4b4e-adba-caf41fb58746
+    /// ```
+    /// 即：内层是紧凑 JSON 字符串、键序 device_id→account_uuid→session_id、device_id 是
+    /// 64 位小写 hex、session_id 是 uuid 且与那个头**同值**。`00009`（sonnet-5）同形。
+    #[test]
+    fn cc_shaped_without_metadata_gets_aligned_identity() {
+        // CC 形态：system 里有那句身份声明，故 detect 返回 None（不模拟）。
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(
+            super::Simulation::detect(&body, all_on(), &test_cred(), "fp").is_none(),
+            "CC 形态不该走模拟"
+        );
+        assert!(!super::body_has_user_id(&body), "这条来访本来就没有 metadata.user_id");
+
+        // 来访没带会话 id 头 → 派生一个，头体同步补。
+        let client = super::HeaderMap::new();
+        let sid = super::bare_session_id(
+            &client,
+            all_on(),
+            None,
+            true,
+            super::body_has_user_id(&body),
+            &test_cred(),
+            "fp",
+        )
+        .expect("CC 形态 + 无 metadata 应补身份");
+        let out =
+            super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid.as_str()));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let user_id = v["metadata"]["user_id"].as_str().expect("应补出 metadata.user_id");
+        let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
+
+        assert_eq!(
+            inner.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["device_id", "account_uuid", "session_id"],
+            "键序应与 00006 一致: {user_id}"
+        );
+        assert!(!user_id.contains(": "), "内层须是紧凑 JSON（无空白），同 00006");
+        let device_id = inner["device_id"].as_str().unwrap();
+        assert_eq!(device_id.len(), 64, "device_id 同 00006 是 64 位 hex");
+        assert!(
+            device_id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "device_id 须是小写 hex: {device_id}"
+        );
+        let session_id = inner["session_id"].as_str().unwrap();
+        let seg: Vec<usize> = session_id.split('-').map(str::len).collect();
+        assert_eq!(seg, vec![8, 4, 4, 4, 12], "session_id 同 00006 是 uuid 形态: {session_id}");
+
+        // 头体同值——00006 里这两处逐字节相同，这正是本条路径最容易做错的地方。
+        let headers =
+            build_forward_headers(&client, "sk-ant-oat01-REAL", all_on(), None, Some(&sid));
+        assert_eq!(
+            headers.get("x-claude-code-session-id").unwrap().to_str().unwrap(),
+            session_id,
+            "头与 metadata 里的 session_id 必须逐字节相同"
+        );
+
+        // 来访自己带了那个头 → 用它的值，不另派生（否则头体对不上）。
+        let mut with_sid = super::HeaderMap::new();
+        with_sid.insert(
+            super::HeaderName::from_static("x-claude-code-session-id"),
+            HeaderValue::from_static("bc201916-d0bc-4b4e-adba-caf41fb58746"),
+        );
+        let sid2 =
+            super::bare_session_id(&with_sid, all_on(), None, true, false, &test_cred(), "fp")
+                .unwrap();
+        assert_eq!(sid2, "bc201916-d0bc-4b4e-adba-caf41fb58746", "应沿用来访自己的会话 id");
+        let out2 =
+            super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid2.as_str()));
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        let inner2: serde_json::Value =
+            serde_json::from_str(v2["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(inner2["session_id"], sid2, "体里要用来访那个值");
+        let headers2 = build_forward_headers(&with_sid, "tok", all_on(), None, Some(&sid2));
+        assert_eq!(
+            headers2.get("x-claude-code-session-id").unwrap().to_str().unwrap(),
+            sid2,
+            "客户端原值不该被覆盖"
+        );
+    }
+
+    /// 补出来的 metadata 必须与官方报文**逐字节同形**（只有取值不同）。
+    ///
+    /// 金标准逐字取自 `cap/raw/00006_101505.964.req.raw`（claude-cli/2.1.220 直连 opus-5）
+    /// 的请求体原文，位置在 `tools` 之后、`max_tokens` 之前：
+    /// ```text
+    /// …,"metadata":{"user_id":"{\"device_id\":\"832cb7e6…2870\",\"account_uuid\":\"edded6bb-2521-4a68-94cb-241bb4d96bb9\",\"session_id\":\"bc201916-d0bc-4b4e-adba-caf41fb58746\"}"},"max_tokens":64000,…
+    /// ```
+    /// 抓包不入库（`cap/` 未跟踪），故把这串固化在这里——与基座字节数、beta 串同一做法。
+    /// 逐字节比对是为了钉住**转义写法**：内层是「字符串里的 JSON」，序列化器只要把
+    /// `\"` 写成别的形式（或插进任何空白），出去的就不是官方那串了。
+    #[test]
+    fn injected_metadata_matches_raw_capture_bytes() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}}],"max_tokens":64000}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        let sid = "bc201916-d0bc-4b4e-adba-caf41fb58746";
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid));
+        let text = String::from_utf8(out.to_vec()).unwrap();
+
+        let expected = format!(
+            r#""metadata":{{"user_id":"{{\"device_id\":\"{}\",\"account_uuid\":\"{ACCOUNT_UUID}\",\"session_id\":\"{sid}\"}}"}}"#,
+            test_cred().spoof_device_id("fp").unwrap()
+        );
+        assert!(text.contains(&expected), "与 00006 的 metadata 形态不符\n实际: {text}");
+        // 位置也照抓包：metadata 在 max_tokens 之前。
+        assert!(
+            text.find(r#""metadata""#) < text.find(r#""max_tokens""#),
+            "metadata 应落在 max_tokens 之前（同 00006 的 key 序）: {text}"
+        );
+    }
+
+    /// 不该补身份的四种情形——补错了都会造出「官方不产生的形态」，比不补更糟。
+    #[test]
+    fn bare_session_skipped_when_it_would_break_shape() {
+        let bare = super::HeaderMap::new();
+        let call = |flags, sim, billable, has_user_id, cred: &crate::credentials::Credential| {
+            super::bare_session_id(&bare, flags, sim, billable, has_user_id, cred, "fp")
+        };
+        let sim = sim_for(PLAIN_BODY);
+
+        // 1) 走模拟那条路：session_id 在 Simulation 里，不能再派生一个。
+        assert!(call(all_on(), Some(&sim), true, false, &test_cred()).is_none());
+        // 2) 身份伪装关着：这是总开关。
+        let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
+        assert!(call(no_spoof, None, true, false, &test_cred()).is_none());
+        // 3) 非计费路径（count_tokens）：出站体原样透传，补了也发不出去，只剩个孤头。
+        assert!(call(all_on(), None, false, false, &test_cred()).is_none());
+        // 4) 来访已经有 user_id：交给 spoof_identity 原格式改写，两条路只能有一条动它。
+        assert!(call(all_on(), None, true, true, &test_cred()).is_none());
+        // 5) 凭证没有 account_uuid：造不出自洽身份，连头也不补（否则头有体无）。
+        let no_uuid = crate::credentials::Credential { account_uuid: None, ..test_cred() };
+        assert!(call(all_on(), None, true, false, &no_uuid).is_none());
+        // 6) 本功能自己的开关关着。
+        let no_fill = store::ForwardFlags { fill_metadata: false, ..all_on() };
+        assert!(call(no_fill, None, true, false, &test_cred()).is_none());
     }
 
     /// 模拟模式下来访那套头一个不留：UA/x-app/x-stainless-* 全是官方取值，
@@ -3840,7 +4107,7 @@ mod tests {
             client.insert(super::HeaderName::from_static(k), HeaderValue::from_static(v));
         }
         let sim = sim_for(PLAIN_BODY);
-        let out = build_forward_headers(&client, "sk-ant-oat01-REAL", all_on(), Some(&sim));
+        let out = build_forward_headers(&client, "sk-ant-oat01-REAL", all_on(), Some(&sim), None);
         let get = |k: &str| out.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default();
 
         assert_eq!(get("user-agent"), config::CC_USER_AGENT);
@@ -3866,17 +4133,23 @@ mod tests {
     #[test]
     fn logs_simulated_device_only_when_spoofed() {
         let sim = sim_for(PLAIN_BODY);
-        let id = super::sim_device_id(Some(&sim), all_on(), &test_cred(), "fp").unwrap();
-        assert_eq!(id, format!("sim:{}", test_cred().spoof_device_id("fp").unwrap()));
+        let expect = format!("sim:{}", test_cred().spoof_device_id("fp").unwrap());
+        let id = super::sim_device_id(Some(&sim), None, all_on(), &test_cred(), "fp").unwrap();
+        assert_eq!(id, expect);
 
-        // 没走模拟路径（来访本来就是 CC 形态）→ 出站体里根本没有这个 id，不该记。
-        assert!(super::sim_device_id(None, all_on(), &test_cred(), "fp").is_none());
+        // CC 形态补身份那条路（sim 为 None、bare_session 有值）同样把这个 id 发了出去，
+        // 日志要记它——否则这段流量在库里只留下 `-`，无从聚合。
+        let bare = super::sim_device_id(None, Some("sess"), all_on(), &test_cred(), "fp").unwrap();
+        assert_eq!(bare, expect, "两条补身份的路径记的是同一个 id");
+
+        // 两条路都没走（来访是 CC 形态且自带 metadata）→ 出站体里根本没有这个 id，不该记。
+        assert!(super::sim_device_id(None, None, all_on(), &test_cred(), "fp").is_none());
         // spoof_identity 关着时同理：ensure_cc_metadata 不会写 metadata。
         let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
-        assert!(super::sim_device_id(Some(&sim), no_spoof, &test_cred(), "fp").is_none());
+        assert!(super::sim_device_id(Some(&sim), None, no_spoof, &test_cred(), "fp").is_none());
         // 凭证没有 account_uuid 就派生不出来，退回 `-`。
         let no_uuid = crate::credentials::Credential { account_uuid: None, ..test_cred() };
-        assert!(super::sim_device_id(Some(&sim), all_on(), &no_uuid, "fp").is_none());
+        assert!(super::sim_device_id(Some(&sim), None, all_on(), &no_uuid, "fp").is_none());
     }
 
     /// 429 作用域判定的回归用例，**头的取值逐字节取自两次真实的 fable-5 429**
@@ -4095,6 +4368,7 @@ mod tests {
             "fp",
             all_on(),
             Some(&sim),
+            None,
         );
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -4116,8 +4390,13 @@ mod tests {
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
         assert!(user_id.contains(ACCOUNT_UUID), "metadata 应带该凭证的 account_uuid: {user_id}");
 
-        let headers =
-            super::build_forward_headers(&super::HeaderMap::new(), "tok", all_on(), Some(&sim));
+        let headers = super::build_forward_headers(
+            &super::HeaderMap::new(),
+            "tok",
+            all_on(),
+            Some(&sim),
+            None,
+        );
         let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
         assert!(
             beta.split(',').any(|p| p == config::OAUTH_BETA_HEADER),

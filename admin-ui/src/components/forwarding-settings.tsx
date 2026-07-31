@@ -119,6 +119,19 @@ export function ForwardingSettingsContent() {
           label="身份一致性"
           summary="让客户端身份与当前账号、设备保持一致；关闭后原样转发。"
         />
+        {/* 紧跟「身份一致性」：它是本项的前置开关，挨着放才好一起改。 */}
+        <ForwardingToggle
+          k="fill_metadata"
+          label="补齐设备身份"
+          summary="请求未携带设备身份时，按当前账号补一份；已携带的不改动。"
+          requires={{ key: 'spoof_identity', label: '身份一致性' }}
+          description={
+            <>
+              官方客户端每条请求都带设备身份，缺失本身就是一处差异。常见于模仿 Claude Code
+              的第三方客户端。补出的身份与「身份一致性」用同一套取值，会话标识优先沿用请求自带的。
+            </>
+          }
+        />
         <ForwardingToggle
           k="billing_cch"
           label="订阅计费标识"
@@ -149,6 +162,7 @@ export function ForwardingSettingsContent() {
           k="system_shape"
           label="系统提示词缓存"
           summary="调整系统提示词分块，提高跨会话缓存复用。"
+          requires={{ key: 'merge_beta', label: '协议与请求头 · Beta 标记' }}
           description={
             <>
               只调整分块与缓存时间，不改变提示词文本。1 小时缓存写入单价是 5 分钟的 2 倍，
@@ -163,6 +177,7 @@ export function ForwardingSettingsContent() {
           k="simulate_cc"
           label="模拟 Claude Code"
           summary="让 SDK 和第三方客户端按 Claude Code 请求形态转发。"
+          requires={{ key: 'merge_beta', label: '协议与请求头 · Beta 标记' }}
           description={
             <>
               仅改写非 Claude Code 请求。开启后会增加系统提示词和客户端请求头，
@@ -276,16 +291,24 @@ function ForwardingToggle({
   label,
   summary,
   description,
+  requires,
 }: {
   k: ForwardingKey
   label: string
   summary: string
   description?: ReactNode
+  /**
+   * 依赖的前置开关：它关着时本项即便存着「开」也不会生效（后端同样这么判），
+   * 故置灰并改写副标题，把这层依赖摆到界面上——否则就是个拨得动、却一动不动的开关。
+   * 存储值不动，前置开关一开回来，本项还是原来那个状态。
+   */
+  requires?: { key: ForwardingKey; label: string }
 }) {
   const id = useId()
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const enabled = data?.[k] ?? true
+  const blocked = requires != null && data?.[requires.key] === false
 
   const save = useMutation({
     mutationFn: (next: boolean) => setForwarding(k, next),
@@ -304,16 +327,18 @@ function ForwardingToggle({
   })
 
   return (
-    <Field className="p-5">
+    <Field className="p-5" disabled={blocked}>
       <div className="flex w-full items-start justify-between gap-4">
         <div className="min-w-0 space-y-1">
           <FieldLabel htmlFor={id}>{label}</FieldLabel>
-          <FieldDescription className="leading-5">{summary}</FieldDescription>
+          <FieldDescription className="leading-5">
+            {blocked ? `需先开启「${requires.label}」` : summary}
+          </FieldDescription>
         </div>
         <Switch
           id={id}
-          checked={enabled}
-          disabled={save.isPending}
+          checked={enabled && !blocked}
+          disabled={save.isPending || blocked}
           onCheckedChange={(next) => save.mutate(next)}
         />
       </div>

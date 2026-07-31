@@ -11,13 +11,15 @@ import {
   ConnectivityTestDialog,
   CredentialMenuContent,
   DeleteCredentialDialog,
-  liveQuota,
-  isNearLimit,
-  statusMeta,
+  evaluateCredential,
+  quotaLevel,
+  quotaPercentage,
   switchTitle,
   tierBadgeVariant,
   useCredentialActions,
   type CredentialActions,
+  type CredentialStatusMeta,
+  type QuotaFreshness,
   type SortDir,
   type SortKey,
 } from '@/components/credential-shared'
@@ -147,11 +149,13 @@ export function CredentialListHeader({
 
 export function CredentialRow({
   cred,
+  now,
   selectable = false,
   selected = false,
   onSelectedChange,
 }: {
   cred: Credential
+  now: number
   selectable?: boolean
   selected?: boolean
   onSelectedChange?: (next: boolean) => void
@@ -162,10 +166,13 @@ export function CredentialRow({
   const [renameName, setRenameName] = useState(cred.label)
   const [testing, setTesting] = useState(false)
   const actions = useCredentialActions(cred)
-  const { u5h, u7d } = liveQuota(cred)
+  const evaluation = evaluateCredential(cred, now)
+  const { quota } = evaluation
+  const u5h = quota.h5.utilization
+  const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const policy = devicePolicyMeta(cred.device_limit)
-  const added = relativeTime(cred.created_at)
+  const added = relativeTime(cred.created_at, now)
 
   return (
     <>
@@ -196,7 +203,7 @@ export function CredentialRow({
                 </p>
               </div>
               <div className="flex shrink-0 items-start gap-1">
-                <ScheduleControl cred={cred} actions={actions} />
+                <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
                 <CredentialRowActionsMenu
                   cred={cred}
                   actions={actions}
@@ -215,6 +222,7 @@ export function CredentialRow({
               <ListQuotaMeter
                 label="5h"
                 util={u5h}
+                freshness={quota.h5.freshness}
                 reset={cred.quota?.rl_5h_reset ?? null}
                 cost={cred.quota?.cost_5h ?? null}
                 requests={cred.quota?.requests_5h ?? null}
@@ -222,6 +230,7 @@ export function CredentialRow({
               <ListQuotaMeter
                 label="7d"
                 util={u7d}
+                freshness={quota.d7.freshness}
                 reset={cred.quota?.rl_7d_reset ?? null}
                 cost={cred.quota?.cost_7d ?? null}
                 requests={cred.quota?.requests_7d ?? null}
@@ -279,7 +288,7 @@ export function CredentialRow({
           </div>
         </TableCell>
         <TableCell className={COL.schedule}>
-          <ScheduleControl cred={cred} actions={actions} />
+          <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
         </TableCell>
         <TableCell className={COL.priority}>
           <span className="font-semibold text-sm tabular-nums" title="数值越小，调度优先级越高">
@@ -295,6 +304,7 @@ export function CredentialRow({
           <ListQuotaMeter
             label="5h"
             util={u5h}
+            freshness={quota.h5.freshness}
             reset={cred.quota?.rl_5h_reset ?? null}
             cost={cred.quota?.cost_5h ?? null}
             requests={cred.quota?.requests_5h ?? null}
@@ -305,6 +315,7 @@ export function CredentialRow({
           <ListQuotaMeter
             label="7d"
             util={u7d}
+            freshness={quota.d7.freshness}
             reset={cred.quota?.rl_7d_reset ?? null}
             cost={cred.quota?.cost_7d ?? null}
             requests={cred.quota?.requests_7d ?? null}
@@ -325,7 +336,7 @@ export function CredentialRow({
           </Button>
         </TableCell>
         <TableCell className={COL.recent}>
-          {cred.last_used != null ? relativeTime(cred.last_used) : '未使用'}
+          {cred.last_used != null ? relativeTime(cred.last_used, now) : '未使用'}
         </TableCell>
         <TableCell className={COL.cost}>
           <span className="tabular-nums font-medium text-sm" title="累计等价 API 费用">
@@ -482,21 +493,13 @@ function RenameCredentialDialog({
 function ScheduleControl({
   cred,
   actions,
+  status,
 }: {
   cred: Credential
   actions: CredentialActions
+  status: CredentialStatusMeta
 }) {
   const { toggle } = actions
-  const nearLimit = isNearLimit(cred)
-  const status = statusMeta(cred, nearLimit)
-  const statusDetail = cred.ban_reason
-    || (cred.disabled
-      ? '账号已停用，不参与调度'
-      : cred.rate_limited_secs > 0
-        ? `账号约 ${Math.max(1, Math.ceil(cred.rate_limited_secs / 60))} 分钟后恢复调度`
-        : nearLimit
-          ? '5 小时或 7 天额度使用率已达到 90%'
-          : '账号运行正常，可参与调度')
 
   return (
     <div className="flex shrink-0 flex-col items-end gap-3 xl:flex-row xl:items-center xl:gap-2">
@@ -513,12 +516,12 @@ function ScheduleControl({
       <Tooltip>
         <TooltipTrigger
           className={badgeVariants({ size: 'sm', variant: status.variant })}
-          aria-label={`${status.label}：${statusDetail}`}
+          aria-label={`${status.label}：${status.detail}`}
           aria-live="polite"
         >
           {status.label}
         </TooltipTrigger>
-        <TooltipPopup className="max-w-72 break-words">{statusDetail}</TooltipPopup>
+        <TooltipPopup className="max-w-72 break-words">{status.detail}</TooltipPopup>
       </Tooltip>
     </div>
   )
@@ -536,6 +539,7 @@ function MobileFact({ label, children }: { label: string; children: ReactNode })
 function ListQuotaMeter({
   label,
   util,
+  freshness,
   reset,
   cost,
   requests,
@@ -543,6 +547,7 @@ function ListQuotaMeter({
 }: {
   label: string
   util: number | null
+  freshness: QuotaFreshness
   reset: number | null
   cost: number | null
   requests: number | null
@@ -553,11 +558,15 @@ function ListQuotaMeter({
     : `${requests.toLocaleString('zh-CN')} 次 · ${cost == null ? '—' : formatUsd(cost)}`
 
   if (util == null) {
-    const emptyLabel = reset != null ? '已重置' : '暂无数据'
+    const expired = freshness === 'expired'
+    const emptyLabel = expired ? '已重置' : '暂无数据'
+    const emptyDetail = expired && reset != null
+      ? `${label}窗口已于 ${formatFullTime(reset)} 重置，之后暂无新请求`
+      : `${label}额度暂无数据`
     return (
       <div
         className="flex w-full flex-col gap-2"
-        title={reset != null ? `${label}窗口已重置，之后暂无新请求` : `${label}额度暂无数据`}
+        title={emptyDetail}
       >
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 items-baseline gap-1.5">
@@ -571,7 +580,7 @@ function ListQuotaMeter({
               )}
               title={`${label}本周期请求数与花费：${usageSummary}`}
             >
-              {reset != null ? '—' : usageSummary}
+              {expired ? '—' : usageSummary}
             </span>
           </div>
           <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
@@ -581,10 +590,11 @@ function ListQuotaMeter({
     )
   }
 
-  const percentage = Math.min(100, Math.max(0, Math.round(util * 100)))
-  const indicatorClass = util >= 0.9
+  const percentage = quotaPercentage(util) ?? 0
+  const level = quotaLevel(util)
+  const indicatorClass = level === 'critical'
     ? 'bg-destructive'
-    : util >= 0.7
+    : level === 'warning'
       ? 'bg-warning'
       : 'bg-success'
 

@@ -33,6 +33,8 @@ export interface Settings {
   thinking_signature_retry: boolean
   /** 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 + 整套官方头）。 */
   simulate_cc: boolean
+  /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
+  fill_metadata: boolean
   /** 上游回 429 时按账号/模型范围冷却并换号重试；关闭时不冷却、直接透传。 */
   rate_limit_retry: boolean
 }
@@ -47,6 +49,7 @@ export type ForwardingKey =
   | 'orig_header_case'
   | 'thinking_signature_retry'
   | 'simulate_cc'
+  | 'fill_metadata'
   | 'rate_limit_retry'
 
 /** 读取接入设置。 */

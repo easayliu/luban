@@ -119,9 +119,9 @@ export function formatUsd(v: number): string {
   return `$${v.toFixed(2)}`
 }
 
-/** Unix 秒时间戳 → 相对当前的「x 前」。 */
-export function relativeTime(unixSecs: number): string {
-  const diff = Math.floor(Date.now() / 1000) - unixSecs
+/** Unix 秒时间戳 → 相对指定时钟的「x 前」；传入时钟可让整页状态在同一轮同步更新。 */
+export function relativeTime(unixSecs: number, nowSecs = Math.floor(Date.now() / 1000)): string {
+  const diff = nowSecs - unixSecs
   if (diff < 60) return '刚刚'
   const min = Math.floor(diff / 60)
   if (min < 60) return `${min} 分钟前`

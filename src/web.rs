@@ -665,6 +665,8 @@ struct ForwardingResp {
     thinking_signature_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求。
     simulate_cc: bool,
+    /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
+    fill_metadata: bool,
     /// 上游回 429 时给该号打冷却并换号重试。
     rate_limit_retry: bool,
 }
@@ -680,6 +682,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             orig_header_case: f.orig_header_case,
             thinking_signature_retry: f.thinking_signature_retry,
             simulate_cc: f.simulate_cc,
+            fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
         }
     }
@@ -869,6 +872,7 @@ struct SetForwardingReq {
     orig_header_case: Option<bool>,
     thinking_signature_retry: Option<bool>,
     simulate_cc: Option<bool>,
+    fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
 }
 
@@ -880,8 +884,9 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC,
-        SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
+        FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY,
+        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE,
+        THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -892,6 +897,7 @@ async fn set_forwarding(
         (ORIG_HEADER_CASE, req.orig_header_case),
         (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
         (SIMULATE_CC, req.simulate_cc),
+        (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {

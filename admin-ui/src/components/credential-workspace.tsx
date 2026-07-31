@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   ArrowUpDownIcon,
   ChevronLeftIcon,
@@ -22,9 +22,9 @@ import { CredentialLoadingState } from '@/components/credential-loading'
 import {
   SORTS,
   SORT_DIR_DEFAULT,
-  isAbnormal,
-  isNearLimit,
+  evaluateCredential,
   sortCreds,
+  type CredentialEvaluation,
   type SortDir,
   type SortKey,
 } from '@/components/credential-shared'
@@ -88,37 +88,33 @@ const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
 const FILTERS: {
   key: CredentialFilterKey
   label: string
-  match: (credential: Credential) => boolean
+  match: (evaluation: CredentialEvaluation) => boolean
 }[] = [
   { key: 'all', label: '全部', match: () => true },
   {
     key: 'schedulable',
     label: '可调度',
-    match: (credential) =>
-      !credential.disabled && !isAbnormal(credential) && credential.rate_limited_secs <= 0,
+    match: (evaluation) => evaluation.schedulable,
   },
   {
     key: 'attention',
     label: '需处理',
-    match: (credential) =>
-      isAbnormal(credential)
-      || isNearLimit(credential)
-      || (!credential.disabled && credential.rate_limited_secs > 0),
+    match: (evaluation) => evaluation.needsAttention,
   },
-  { key: 'enabled', label: '启用', match: (credential) => !credential.disabled },
-  { key: 'disabled', label: '停用', match: (credential) => credential.disabled },
-  { key: 'abnormal', label: '异常（已封禁）', match: isAbnormal },
-  { key: 'nearLimit', label: '额度将满', match: isNearLimit },
+  { key: 'enabled', label: '启用', match: ({ credential }) => !credential.disabled },
+  { key: 'disabled', label: '停用', match: ({ credential }) => credential.disabled },
+  { key: 'abnormal', label: '异常（已封禁）', match: ({ credential }) => !!credential.ban_reason },
+  { key: 'nearLimit', label: '额度风险', match: (evaluation) => evaluation.quotaRisk },
   {
     key: 'cooldown',
     label: '冷却中',
-    match: (credential) => !credential.disabled && credential.rate_limited_secs > 0,
+    match: ({ credential }) => !credential.disabled && credential.rate_limited_secs > 0,
   },
-  { key: 'hasDevice', label: '已绑定设备', match: (credential) => credential.device_count > 0 },
+  { key: 'hasDevice', label: '已绑定设备', match: ({ credential }) => credential.device_count > 0 },
   {
     key: 'deviceFull',
     label: '设备已满',
-    match: (credential) =>
+    match: ({ credential }) =>
       credential.device_limit_effective > 0
       && credential.device_count >= credential.device_limit_effective,
   },
@@ -127,9 +123,31 @@ const FILTERS: {
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
 
 export function preferredInitialCredentialView(): CredentialViewMode {
-  return typeof window !== 'undefined' && window.matchMedia('(min-width: 64rem)').matches
+  return typeof window !== 'undefined' && window.matchMedia('(min-width: 80rem)').matches
     ? 'list'
     : 'card'
+}
+
+/** 额度 reset 与相对时间都依赖当前时刻；30 秒 tick 与接口刷新节奏一致。 */
+function useNowSeconds(): number {
+  const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+
+  useEffect(() => {
+    const update = () => setNow(Math.floor(Date.now() / 1000))
+    const onVisibilityChange = () => {
+      if (!document.hidden) update()
+    }
+    const interval = window.setInterval(update, 30_000)
+    window.addEventListener('focus', update)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', update)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [])
+
+  return now
 }
 
 function matchQuery(credential: Credential, query: string): boolean {
@@ -203,63 +221,127 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   } = state
   const pool = credentials ?? []
   const debouncedQuery = useDebounced(query)
+  const now = useNowSeconds()
+  const evaluatedPool = useMemo(
+    () => pool.map((credential) => evaluateCredential(credential, now)),
+    [pool, now],
+  )
 
   const sorted = useMemo(() => {
     const match = FILTERS.find((item) => item.key === filter)?.match ?? (() => true)
     return sortCreds(
-      pool.filter((credential) => match(credential) && matchQuery(credential, debouncedQuery)),
+      evaluatedPool
+        .filter((evaluation) => (
+          match(evaluation) && matchQuery(evaluation.credential, debouncedQuery)
+        ))
+        .map((evaluation) => evaluation.credential),
       sort,
       dir,
+      now,
     )
-  }, [pool, sort, dir, filter, debouncedQuery])
+  }, [evaluatedPool, sort, dir, filter, debouncedQuery, now])
+
+  const metrics = useMemo(() => {
+    const filterCounts: Record<CredentialFilterKey, number> = {
+      all: 0,
+      schedulable: 0,
+      attention: 0,
+      enabled: 0,
+      disabled: 0,
+      abnormal: 0,
+      nearLimit: 0,
+      cooldown: 0,
+      hasDevice: 0,
+      deviceFull: 0,
+    }
+    let nearLimitCount = 0
+    let activeOverageCount = 0
+    let unknownOverageCount = 0
+    let deviceCount = 0
+    let deviceCapacity = 0
+    let unlimitedDeviceAccounts = 0
+
+    for (const evaluation of evaluatedPool) {
+      const credential = evaluation.credential
+      filterCounts.all += 1
+      if (evaluation.schedulable) filterCounts.schedulable += 1
+      if (evaluation.needsAttention) filterCounts.attention += 1
+      if (credential.disabled) filterCounts.disabled += 1
+      else filterCounts.enabled += 1
+      if (credential.ban_reason) filterCounts.abnormal += 1
+      if (evaluation.quotaRisk) filterCounts.nearLimit += 1
+      if (!credential.disabled && credential.rate_limited_secs > 0) filterCounts.cooldown += 1
+      if (credential.device_count > 0) filterCounts.hasDevice += 1
+      if (
+        credential.device_limit_effective > 0
+        && credential.device_count >= credential.device_limit_effective
+      ) {
+        filterCounts.deviceFull += 1
+      }
+      // 额度概览按「超额 > 待确认 > 将满」互斥归类，避免一个账号重复出现在两项里。
+      if (
+        evaluation.nearLimit
+        && evaluation.quota.overage !== 'active'
+        && evaluation.quota.overage !== 'unknown'
+      ) {
+        nearLimitCount += 1
+      }
+      if (!credential.disabled && evaluation.quota.overage === 'active') {
+        activeOverageCount += 1
+      }
+      if (!credential.disabled && evaluation.quota.overage === 'unknown') {
+        unknownOverageCount += 1
+      }
+      deviceCount += credential.device_count
+      if (credential.device_limit_effective > 0) {
+        deviceCapacity += credential.device_limit_effective
+      } else {
+        unlimitedDeviceAccounts += 1
+      }
+    }
+
+    return {
+      filterCounts,
+      nearLimitCount,
+      activeOverageCount,
+      unknownOverageCount,
+      deviceCount,
+      deviceCapacity,
+      unlimitedDeviceAccounts,
+    }
+  }, [evaluatedPool])
 
   const count = pool.length
   const total = sorted.length
-  const enabledCount = pool.filter((credential) => !credential.disabled).length
-  const schedulableCount = pool.filter(
-    (credential) =>
-      !credential.disabled && !isAbnormal(credential) && credential.rate_limited_secs <= 0,
-  ).length
-  const abnormalCount = pool.filter(isAbnormal).length
-  const nearLimitCount = pool.filter(isNearLimit).length
-  const cooldownCount = pool.filter(
-    (credential) => !credential.disabled && credential.rate_limited_secs > 0,
-  ).length
-  const attentionCount = pool.filter(
-    (credential) =>
-      isAbnormal(credential)
-      || isNearLimit(credential)
-      || (!credential.disabled && credential.rate_limited_secs > 0),
-  ).length
-  const deviceCount = pool.reduce((sum, credential) => sum + credential.device_count, 0)
-  const deviceCapacity = pool.reduce(
-    (sum, credential) =>
-      sum + (credential.device_limit_effective > 0 ? credential.device_limit_effective : 0),
-    0,
-  )
-  const unlimitedDeviceAccounts = pool.filter(
-    (credential) => credential.device_limit_effective <= 0,
-  ).length
-  const fullDeviceCount = pool.filter(
-    (credential) =>
-      credential.device_limit_effective > 0
-      && credential.device_count >= credential.device_limit_effective,
-  ).length
+  const enabledCount = metrics.filterCounts.enabled
+  const schedulableCount = metrics.filterCounts.schedulable
+  const abnormalCount = metrics.filterCounts.abnormal
+  const cooldownCount = metrics.filterCounts.cooldown
+  const attentionCount = metrics.filterCounts.attention
+  const quotaRiskCount = metrics.filterCounts.nearLimit
+  const fullDeviceCount = metrics.filterCounts.deviceFull
   const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
   const attentionStatus = [
     abnormalCount > 0 ? `${abnormalCount} 异常` : '',
+    metrics.activeOverageCount > 0 ? `${metrics.activeOverageCount} 超额` : '',
+    metrics.unknownOverageCount > 0 ? `${metrics.unknownOverageCount} 超额待确认` : '',
     cooldownCount > 0 ? `${cooldownCount} 冷却` : '',
-    nearLimitCount > 0 ? `${nearLimitCount} 额度` : '',
+    metrics.nearLimitCount > 0 ? `${metrics.nearLimitCount} 额度` : '',
+  ].filter(Boolean).join(' · ') || undefined
+  const quotaRiskStatus = [
+    metrics.activeOverageCount > 0 ? `${metrics.activeOverageCount} 超额` : '',
+    metrics.unknownOverageCount > 0 ? `${metrics.unknownOverageCount} 待确认` : '',
+    metrics.nearLimitCount > 0 ? `${metrics.nearLimitCount} 将满` : '',
   ].filter(Boolean).join(' · ') || undefined
   const deviceStatus = fullDeviceCount > 0
     ? `${fullDeviceCount} 个账号已满`
-    : unlimitedDeviceAccounts > 0
-      ? `${unlimitedDeviceAccounts} 个不限额账号`
-      : deviceCapacity > 0
-        ? `共 ${deviceCapacity} 个名额`
+    : metrics.unlimitedDeviceAccounts > 0
+      ? `${metrics.unlimitedDeviceAccounts} 个不限额账号`
+      : metrics.deviceCapacity > 0
+        ? `共 ${metrics.deviceCapacity} 个名额`
         : undefined
 
   const clearSelection = () => actions.onSelectedChange(new Set())
@@ -344,23 +426,27 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             value={attentionCount}
             status={attentionStatus}
             icon={TriangleAlertIcon}
-            tone={abnormalCount > 0 ? 'bad' : attentionCount > 0 ? 'warn' : 'neutral'}
+            tone={abnormalCount > 0 || metrics.activeOverageCount > 0
+              ? 'bad'
+              : attentionCount > 0
+                ? 'warn'
+                : 'neutral'}
             active={filter === 'attention'}
             onClick={() => selectMetric('attention')}
           />
           <OverviewMetric
             className="border-r"
-            label="额度预警"
-            value={nearLimitCount}
-            status={nearLimitCount > 0 ? '使用率 ≥ 90%' : undefined}
+            label="额度风险"
+            value={quotaRiskCount}
+            status={quotaRiskStatus}
             icon={RadioIcon}
-            tone={nearLimitCount > 0 ? 'warn' : 'neutral'}
+            tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
             active={filter === 'nearLimit'}
             onClick={() => selectMetric('nearLimit')}
           />
           <OverviewMetric
             label="绑定设备"
-            value={deviceCount}
+            value={metrics.deviceCount}
             status={deviceStatus}
             icon={SmartphoneIcon}
             tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
@@ -418,7 +504,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                               <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
                                 <span>{item.label}</span>
                                 <span className="tnum text-xs text-muted-foreground">
-                                  {pool.filter(item.match).length}
+                                  {metrics.filterCounts[item.key]}
                                 </span>
                               </span>
                             </MenuRadioItem>
@@ -544,6 +630,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <CredentialRow
                     key={item.id}
                     cred={item}
+                    now={now}
                     selectable
                     selected={selected.has(item.id)}
                     onSelectedChange={(checked) => toggleSelected(item.id, checked)}
@@ -552,17 +639,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </TableBody>
             </Table>
           ) : (
-            <div className="relative grid items-stretch gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
+            <ul className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
               {pageItems.map((item) => (
                 <CredentialCard
                   key={item.id}
                   cred={item}
+                  now={now}
                   selectable
                   selected={selected.has(item.id)}
                   onSelectedChange={(checked) => toggleSelected(item.id, checked)}
                 />
               ))}
-            </div>
+            </ul>
           )}
 
           {!isLoading && pageCount > 1 && (

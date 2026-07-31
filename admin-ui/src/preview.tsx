@@ -25,7 +25,8 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
-// 离线预览：造封禁/正常两条假数据，通过生产共用的 CredentialWorkspace 验收，不连后端。
+// 离线预览：覆盖正常、额度风险、冷却、封禁与停用，通过生产共用的 CredentialWorkspace
+// 验收卡片层级、筛选与响应式，不连接后端。
 // 设置页和弹窗仍由查询参数单独打开，账号工作区不再维护第二套组件树。
 
 const mq = window.matchMedia('(prefers-color-scheme: dark)')
@@ -109,6 +110,182 @@ const normal: Credential = {
   },
 }
 
+// 当前窗口已满且由 overage 放行：状态、概览与「额度风险」筛选都应使用同一套红色风险语义。
+const overage: Credential = {
+  id: 2,
+  label: 'design-system-overage@example.com',
+  tier: 'Max 20x',
+  priority: 1,
+  disabled: false,
+  expires_in: 5 * 3600,
+  expires_at: now + 5 * 3600,
+  expired: false,
+  created_at: now - 15 * 24 * 3600,
+  updated_at: now - 20,
+  device_limit: -1,
+  device_limit_effective: 0,
+  device_count: 7,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…oVAA',
+  last_used: now - 18,
+  cost_total: 122.48,
+  rate_limited_secs: 0,
+  quota: {
+    ts: now - 18,
+    unified_status: 'allowed',
+    rl_5h_utilization: 1.04,
+    rl_5h_reset: now + 45 * 60,
+    rl_7d_utilization: 0.91,
+    rl_7d_reset: now + 4 * 24 * 3600,
+    rl_representative: '5h',
+    overage_in_use: true,
+    cost_5h: 18.23,
+    cost_7d: 91.62,
+    requests_5h: 412,
+    requests_7d: 3218,
+  },
+}
+
+// 正好 90% 才进入风险；7d 的 89.9% 应统一显示 89%，不能一边黄字一边误报 90%。
+const nearLimit: Credential = {
+  id: 3,
+  label: 'quota-boundary-90-percent@example.com',
+  tier: 'Pro',
+  priority: 2,
+  disabled: false,
+  expires_in: 2 * 3600,
+  expires_at: now + 2 * 3600,
+  expired: false,
+  created_at: now - 4 * 24 * 3600,
+  updated_at: now - 90,
+  device_limit: 2,
+  device_limit_effective: 2,
+  device_count: 2,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…q90A',
+  last_used: now - 90,
+  cost_total: 31.09,
+  rate_limited_secs: 0,
+  quota: {
+    ts: now - 90,
+    unified_status: 'allowed_warning',
+    rl_5h_utilization: 0.9,
+    rl_5h_reset: now + 75 * 60,
+    rl_7d_utilization: 0.899,
+    rl_7d_reset: now + 2 * 24 * 3600,
+    rl_representative: '5h',
+    overage_in_use: false,
+    cost_5h: 9.24,
+    cost_7d: 29.81,
+    requests_5h: 226,
+    requests_7d: 1288,
+  },
+}
+
+// 满额的 5h 已重置、但 7d 仍在当前窗口：前端不能证明 overage 已结束，降为琥珀色待确认。
+const unknownOverage: Credential = {
+  id: 7,
+  label: 'overage-window-needs-confirmation@example.com',
+  tier: 'Max 5x',
+  priority: 2,
+  disabled: false,
+  expires_in: 80 * 60,
+  expires_at: now + 80 * 60,
+  expired: false,
+  created_at: now - 6 * 24 * 3600,
+  updated_at: now - 4 * 60,
+  device_limit: 0,
+  device_limit_effective: 3,
+  device_count: 1,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…uNKN',
+  last_used: now - 4 * 60,
+  cost_total: 52.36,
+  rate_limited_secs: 0,
+  quota: {
+    ts: now - 4 * 60,
+    unified_status: 'allowed',
+    rl_5h_utilization: 1,
+    rl_5h_reset: now - 2 * 60,
+    rl_7d_utilization: 0.82,
+    rl_7d_reset: now + 36 * 3600,
+    rl_representative: '5h',
+    overage_in_use: true,
+    cost_5h: 12.18,
+    cost_7d: 51.92,
+    requests_5h: 296,
+    requests_7d: 1842,
+  },
+}
+
+const cooldown: Credential = {
+  id: 5,
+  label: 'cooldown-without-quota@example.com',
+  tier: 'Free',
+  priority: 3,
+  disabled: false,
+  expires_in: 45 * 60,
+  expires_at: now + 45 * 60,
+  expired: false,
+  created_at: now - 2 * 24 * 3600,
+  updated_at: now - 15,
+  device_limit: 0,
+  device_limit_effective: 3,
+  device_count: 1,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…cDWN',
+  last_used: now - 15,
+  cost_total: 0.84,
+  rate_limited_secs: 725,
+  quota: null,
+}
+
+// 停用账号的快照记录过 overage：只做历史快照提示，不再算当前额度风险。
+const disabledHistoricalOverage: Credential = {
+  id: 6,
+  label: 'disabled-historical-overage@example.com',
+  tier: null,
+  priority: 4,
+  disabled: true,
+  expires_in: 0,
+  expires_at: now - 6 * 3600,
+  expired: true,
+  created_at: now - 31 * 24 * 3600,
+  updated_at: now - 6 * 3600,
+  device_limit: 0,
+  device_limit_effective: 3,
+  device_count: 0,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…hIST',
+  last_used: now - 6 * 3600,
+  cost_total: 44.2,
+  rate_limited_secs: 0,
+  quota: {
+    ts: now - 6 * 3600,
+    unified_status: 'allowed',
+    rl_5h_utilization: 1,
+    rl_5h_reset: now - 5 * 3600,
+    rl_7d_utilization: 1,
+    rl_7d_reset: now - 4 * 3600,
+    rl_representative: '7d',
+    overage_in_use: true,
+    cost_5h: 11.72,
+    cost_7d: 43.98,
+    requests_5h: 338,
+    requests_7d: 2104,
+  },
+}
+
+const previewCredentials = [
+  banned,
+  normal,
+  overage,
+  nearLimit,
+  unknownOverage,
+  cooldown,
+  disabledHistoricalOverage,
+]
+
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: Infinity, refetchOnWindowFocus: false } },
 })
@@ -163,7 +340,7 @@ function PreviewCredentialWorkspace() {
   return (
     <CredentialWorkspace
       data={{
-        credentials: [banned, normal],
+        credentials: previewCredentials,
         isLoading: false,
         isError: false,
         isRefetchError: false,
@@ -214,6 +391,7 @@ queryClient.setQueryData(['settings'], {
   orig_header_case: true,
   thinking_signature_retry: true,
   simulate_cc: true,
+  fill_metadata: true,
   rate_limit_retry: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })

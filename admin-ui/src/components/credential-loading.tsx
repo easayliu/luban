@@ -27,48 +27,61 @@ export function CredentialLoadingState({
 
 function CardSkeletons({ selectable }: { selectable: boolean }) {
   return (
-    <div className="grid items-stretch gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
+    <ul
+      className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4"
+      aria-hidden="true"
+    >
       {Array.from({ length: 4 }, (_, index) => (
-        <Card key={index} className="@container/card h-full overflow-hidden">
-          <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-4">
-            <CardTitle className="text-sm leading-snug">
-              <div className="flex items-center gap-3">
-                {selectable && <Skeleton className="size-4 shrink-0" />}
-                <Skeleton className="size-8 shrink-0 rounded-full max-[22rem]:hidden" />
-                <div className="min-w-0 flex-1 space-y-2">
-                  <Skeleton className="h-4 w-3/5" />
-                  <CardDescription className="flex gap-2 text-xs">
-                    <Skeleton className="h-3 w-10" />
-                    <Skeleton className="h-3 w-24" />
-                  </CardDescription>
+        <li key={index} className="min-w-0 h-full">
+          <Card render={<article />} className="@container/card h-full overflow-hidden">
+            <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-4">
+              <CardTitle className="text-sm leading-snug">
+                <div className="flex items-center gap-3">
+                  {selectable && <Skeleton className="size-4 shrink-0" />}
+                  <Skeleton className="hidden size-8 shrink-0 rounded-full @sm/card:flex" />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <Skeleton className="h-4 w-3/5" />
+                    <CardDescription className="flex gap-2 text-xs">
+                      <Skeleton className="h-3 w-10" />
+                      <Skeleton className="h-3 w-24" />
+                    </CardDescription>
+                  </div>
                 </div>
+              </CardTitle>
+              <CardAction><Skeleton className="size-8" /></CardAction>
+            </CardHeader>
+
+            <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
+              <div className="flex flex-wrap items-center gap-2">
+                <Skeleton className="h-5 w-14" />
+                <Skeleton className="h-5 w-16" />
+                <Skeleton className="h-5 w-9" />
               </div>
-            </CardTitle>
-            <CardAction><Skeleton className="size-8" /></CardAction>
-          </CardHeader>
+              <section className="space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+                  <Skeleton className="h-4 w-16" />
+                  <Skeleton className="h-4 w-24" />
+                </div>
+                <div className="grid gap-4 @sm/card:grid-cols-2 @sm/card:gap-5">
+                  <QuotaSkeleton />
+                  <QuotaSkeleton />
+                </div>
+              </section>
+            </CardPanel>
 
-          <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
-            <div className="flex items-center gap-2">
-              <Skeleton className="h-5 w-16" />
-              <Skeleton className="h-5 w-9" />
-              <Skeleton className="ml-auto h-4 w-24" />
-            </div>
-            <div className="grid gap-4 @sm/card:grid-cols-2 @sm/card:gap-5">
-              <QuotaSkeleton />
-              <QuotaSkeleton />
-            </div>
-          </CardPanel>
-
-          <CardFooter className="mt-auto justify-between gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
-            <Skeleton className="h-8 w-28" />
-            <div className="flex items-center gap-2">
-              <Skeleton className="h-5 w-16" />
-              <Skeleton className="h-5 w-9 rounded-full" />
-            </div>
-          </CardFooter>
-        </Card>
+            <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-2">
+                <Skeleton className="h-9 w-28 sm:h-8" />
+                <Skeleton className="h-4 w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <Skeleton className="h-5 w-9 rounded-full" />
+              </div>
+            </CardFooter>
+          </Card>
+        </li>
       ))}
-    </div>
+    </ul>
   )
 }
 

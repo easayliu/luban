@@ -46,31 +46,226 @@ export function inputToLimit(v: string): number {
   return Number.isFinite(n) && n > 0 ? n : -1
 }
 
+export type QuotaFreshness = 'current' | 'unknown' | 'expired'
+export type QuotaLevel = 'empty' | 'ok' | 'warning' | 'critical'
+export type OverageState = 'none' | 'active' | 'historical' | 'unknown'
+
+export interface QuotaWindowMeta {
+  /** 仍属于当前窗口的使用率；明确已重置时为空。 */
+  utilization: number | null
+  /** 上游快照里的原值，仅用于判断超额标记对应哪个窗口。 */
+  rawUtilization: number | null
+  /** 与界面显示、阈值判定共用的整数百分比。 */
+  percentage: number | null
+  resetAt: number | null
+  freshness: QuotaFreshness
+  level: QuotaLevel
+}
+
+export interface QuotaRiskMeta {
+  h5: QuotaWindowMeta
+  d7: QuotaWindowMeta
+  nearLimit: boolean
+  overage: OverageState
+}
+
+export type CredentialStatusKind =
+  | 'banned'
+  | 'disabled'
+  | 'overage'
+  | 'overage-unknown'
+  | 'cooldown'
+  | 'near-limit'
+  | 'normal'
+
+export interface CredentialStatusMeta {
+  kind: CredentialStatusKind
+  variant: BadgeProps['variant']
+  label: string
+  detail: string
+  attention: boolean
+  rank: number
+}
+
+export interface CredentialEvaluation {
+  credential: Credential
+  quota: QuotaRiskMeta
+  status: CredentialStatusMeta
+  schedulable: boolean
+  nearLimit: boolean
+  quotaRisk: boolean
+  needsAttention: boolean
+}
+
+const currentUnixSeconds = () => Math.floor(Date.now() / 1000)
+
 /**
- * 快照里**仍属于当前窗口**的使用率；窗口已过重置时刻的返回 null。
- *
- * 额度快照只在有请求经过时才更新（后端取该账号最后一条带限流头的日志，不设时间下限），
- * 所以账号闲下来之后百分比会一直停在最后一次的值。5h 窗口的 reset 时刻一过，那个值就
- * 跟现在毫无关系了——号早就满血，后台却还在报「额度将满」、红边、排在异常账号最前面。
- *
- * reset 缺失时无从判断新旧，保持原值（宁可虚报也不要漏报快满的号）。
+ * 使用率统一截断成界面展示的整数百分比，颜色与告警只读这个值。
+ * 这样 89.9% 会显示为 89% 且不告警，真正达到 90% 时才同时变红并进入额度风险。
  */
-export function liveQuota(cred: Credential): { u5h: number | null; u7d: number | null } {
-  const q = cred.quota
-  if (!q) return { u5h: null, u7d: null }
-  const now = Math.floor(Date.now() / 1000)
-  const live = (u: number | null, reset: number | null) =>
-    u != null && (reset == null || reset > now) ? u : null
+export function quotaPercentage(utilization: number | null): number | null {
+  if (utilization == null || !Number.isFinite(utilization)) return null
+  const clamped = Math.min(1, Math.max(0, utilization))
+  return Math.floor(clamped * 100 + 1e-9)
+}
+
+export function quotaLevel(utilization: number | null): QuotaLevel {
+  const percentage = quotaPercentage(utilization)
+  if (percentage == null) return 'empty'
+  if (percentage >= 90) return 'critical'
+  if (percentage >= 70) return 'warning'
+  return 'ok'
+}
+
+function evaluateQuotaWindow(
+  utilization: number | null,
+  resetAt: number | null,
+  now: number,
+): QuotaWindowMeta {
+  const freshness: QuotaFreshness = resetAt == null
+    ? 'unknown'
+    : resetAt <= now
+      ? 'expired'
+      : 'current'
+  const liveUtilization = freshness === 'expired' ? null : utilization
   return {
-    u5h: live(q.rl_5h_utilization, q.rl_5h_reset),
-    u7d: live(q.rl_7d_utilization, q.rl_7d_reset),
+    utilization: liveUtilization,
+    rawUtilization: utilization,
+    percentage: quotaPercentage(liveUtilization),
+    resetAt,
+    freshness,
+    level: quotaLevel(liveUtilization),
   }
 }
 
-/** 账号是否处于「额度将满」（5h / 7d 任一 ≥90%，停用的不算；已重置的窗口不算）。 */
-export function isNearLimit(cred: Credential): boolean {
-  const { u5h, u7d } = liveQuota(cred)
-  return !cred.disabled && Math.max(u5h ?? 0, u7d ?? 0) >= 0.9
+/**
+ * 将最新额度快照解释成当前可展示的窗口与风险。
+ *
+ * `overage_in_use` 也是快照，不是实时订阅：有满额窗口仍在当前周期才称「超额计费」；
+ * 所有已报告窗口都明确重置时降级成「最近曾超额」；其余不确定情况保守标为待确认。
+ */
+export function quotaRiskMeta(cred: Credential, now = currentUnixSeconds()): QuotaRiskMeta {
+  const q = cred.quota
+  const h5 = evaluateQuotaWindow(q?.rl_5h_utilization ?? null, q?.rl_5h_reset ?? null, now)
+  const d7 = evaluateQuotaWindow(q?.rl_7d_utilization ?? null, q?.rl_7d_reset ?? null, now)
+  const windows = [h5, d7]
+  const nearLimit = windows.some((window) => (window.percentage ?? -1) >= 90)
+
+  let overage: OverageState = 'none'
+  if (q?.overage_in_use === true) {
+    const reportedWindows = windows.filter(
+      (window) => window.rawUtilization != null || window.resetAt != null,
+    )
+    const currentFullWindow = reportedWindows.some(
+      (window) => (window.rawUtilization ?? -1) >= 1 && window.freshness === 'current',
+    )
+    // 只有所有已报告窗口都明确过期，前端才能确认这是一条历史快照；若仍有窗口未重置、
+    // 但没有可对应上的满额窗口，则保守标成「待确认」，不把快照误报成仍在实时计费。
+    overage = currentFullWindow
+      ? 'active'
+      : reportedWindows.length > 0
+        && reportedWindows.every((window) => window.freshness === 'expired')
+        ? 'historical'
+        : 'unknown'
+  }
+
+  return { h5, d7, nearLimit, overage }
+}
+
+function quotaWarningDetail(quota: QuotaRiskMeta): string {
+  const windows = [
+    quota.h5.percentage != null && quota.h5.percentage >= 90
+      ? `5 小时 ${quota.h5.percentage}%`
+      : '',
+    quota.d7.percentage != null && quota.d7.percentage >= 90
+      ? `7 天 ${quota.d7.percentage}%`
+      : '',
+  ].filter(Boolean)
+  return `${windows.join('、')}，已达到额度预警线`
+}
+
+function statusFromQuota(cred: Credential, quota: QuotaRiskMeta): CredentialStatusMeta {
+  if (cred.ban_reason) {
+    return {
+      kind: 'banned', variant: 'error', label: '已封禁', detail: cred.ban_reason,
+      attention: true, rank: 6,
+    }
+  }
+  if (cred.disabled) {
+    return {
+      kind: 'disabled', variant: 'secondary', label: '已停用', detail: '账号已停用，不参与调度',
+      attention: false, rank: 1,
+    }
+  }
+  const snapshotTime = cred.quota ? formatFullTime(cred.quota.ts) : '未知时间'
+  if (quota.overage === 'active') {
+    return {
+      kind: 'overage', variant: 'error', label: '超额计费',
+      detail: `额度快照（${snapshotTime}）显示上游正以超额计费放行请求，可能产生按量费用`,
+      attention: true, rank: 5,
+    }
+  }
+  if (quota.overage === 'unknown') {
+    return {
+      kind: 'overage-unknown', variant: 'warning', label: '超额待确认',
+      detail: `额度快照（${snapshotTime}）记录了超额计费，但现有窗口信息不足以确认当前仍在计费，需等待新请求确认`,
+      attention: true, rank: 4,
+    }
+  }
+  if (cred.rate_limited_secs > 0) {
+    return {
+      kind: 'cooldown', variant: 'warning', label: '冷却中',
+      detail: `账号约 ${Math.max(1, Math.ceil(cred.rate_limited_secs / 60))} 分钟后恢复调度`,
+      attention: true, rank: 3,
+    }
+  }
+  if (quota.nearLimit) {
+    return {
+      kind: 'near-limit', variant: 'warning', label: '额度将满',
+      detail: quotaWarningDetail(quota), attention: true, rank: 2,
+    }
+  }
+  return {
+    kind: 'normal', variant: 'success', label: '运行正常', detail: '账号运行正常，可参与调度',
+    attention: false, rank: 0,
+  }
+}
+
+/** 卡片、列表、概览、筛选和排序共同消费的一份账号状态解释。 */
+export function evaluateCredential(
+  cred: Credential,
+  now = currentUnixSeconds(),
+): CredentialEvaluation {
+  const quota = quotaRiskMeta(cred, now)
+  const status = statusFromQuota(cred, quota)
+  const nearLimit = !cred.disabled && quota.nearLimit
+  const quotaRisk = !cred.disabled && (
+    nearLimit || quota.overage === 'active' || quota.overage === 'unknown'
+  )
+  const schedulable = !cred.disabled && !cred.ban_reason && cred.rate_limited_secs <= 0
+  return {
+    credential: cred,
+    quota,
+    status,
+    schedulable,
+    nearLimit,
+    quotaRisk,
+    needsAttention: status.attention,
+  }
+}
+
+/** 兼容卡片与紧凑列表：返回仍属于当前窗口的原始使用率。 */
+export function liveQuota(
+  cred: Credential,
+  now = currentUnixSeconds(),
+): { u5h: number | null; u7d: number | null } {
+  const quota = quotaRiskMeta(cred, now)
+  return { u5h: quota.h5.utilization, u7d: quota.d7.utilization }
+}
+
+/** 账号是否处于「额度将满」（停用的不算；已重置的窗口不算）。 */
+export function isNearLimit(cred: Credential, now = currentUnixSeconds()): boolean {
+  return evaluateCredential(cred, now).nearLimit
 }
 
 /**
@@ -142,45 +337,30 @@ function tierRank(tier: string | null): number {
   return 0
 }
 
-/**
- * 状态 → 严重度（越大越需要关注）；降序即「先看有问题的」。
- *
- * 不含 `expired`：它不是「有问题」，见 [`isAbnormal`]。
- */
-function statusRank(c: Credential): number {
-  if (c.ban_reason) return 4
-  if (!c.disabled && c.rate_limited_secs > 0) return 3
-  if (isNearLimit(c)) return 2
-  if (c.disabled) return 1
-  return 0
-}
-
-/** 单维度的升序比较；方向由 [`sortCreds`] 统一套用，避免每个 case 都写两遍。 */
-function compareBy(key: SortKey, a: Credential, b: Credential): number {
+/** 单维度排序值；额度与状态使用同一时钟快照，避免跨过 reset 后卡片和排序口径分叉。 */
+function sortValue(key: SortKey, credential: Credential, now: number): number | string {
   switch (key) {
     case 'status':
-      return statusRank(a) - statusRank(b)
+      return evaluateCredential(credential, now).status.rank
     case 'name':
-      return a.label.localeCompare(b.label, 'zh-CN')
+      return credential.label
     case 'tier':
-      return tierRank(a.tier) - tierRank(b.tier)
+      return tierRank(credential.tier)
     case 'usage5h':
-      // 无额度数据、以及窗口已重置的（快照是上个周期的）一并垫底：升序时排最前、
-      // 降序时排最后，不会混在真实数值中间。
-      return (liveQuota(a).u5h ?? -1) - (liveQuota(b).u5h ?? -1)
+      return quotaRiskMeta(credential, now).h5.percentage ?? -1
     case 'usage7d':
-      return (liveQuota(a).u7d ?? -1) - (liveQuota(b).u7d ?? -1)
+      return quotaRiskMeta(credential, now).d7.percentage ?? -1
     case 'devices':
-      return a.device_count - b.device_count
+      return credential.device_count
     case 'cost':
-      return (a.cost_total ?? 0) - (b.cost_total ?? 0)
+      return credential.cost_total ?? 0
     case 'recent':
-      return (a.last_used ?? 0) - (b.last_used ?? 0)
+      return credential.last_used ?? 0
     case 'created':
-      return a.created_at - b.created_at
+      return credential.created_at
     case 'priority':
     default:
-      return a.priority - b.priority
+      return credential.priority
   }
 }
 
@@ -190,9 +370,22 @@ function compareBy(key: SortKey, a: Credential, b: Credential): number {
  * 同值时一律按 id 升序兜底，保证顺序稳定——否则相同优先级的账号会在每次
  * 重新渲染时互相换位。
  */
-export function sortCreds(list: Credential[], key: SortKey, dir: SortDir): Credential[] {
+export function sortCreds(
+  list: Credential[],
+  key: SortKey,
+  dir: SortDir,
+  now = currentUnixSeconds(),
+): Credential[] {
   const sign = dir === 'asc' ? 1 : -1
-  return [...list].sort((a, b) => sign * compareBy(key, a, b) || a.id - b.id)
+  const values = new Map(list.map((credential) => [credential.id, sortValue(key, credential, now)]))
+  return [...list].sort((a, b) => {
+    const aValue = values.get(a.id)!
+    const bValue = values.get(b.id)!
+    const compared = typeof aValue === 'string' && typeof bValue === 'string'
+      ? aValue.localeCompare(bValue, 'zh-CN')
+      : Number(aValue) - Number(bValue)
+    return sign * compared || a.id - b.id
+  })
 }
 
 /**
@@ -215,8 +408,19 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
   })
   const toggle = useMutation({
     mutationFn: (disabled: boolean) => setDisabled(cred.id, disabled),
-    onSuccess: invalidate,
-    onError: (e) => failure('操作失败', e),
+    onMutate: async (disabled) => {
+      await qc.cancelQueries({ queryKey: ['credentials'] })
+      const previous = qc.getQueryData<Credential[]>(['credentials'])
+      qc.setQueryData<Credential[]>(['credentials'], (current) => current?.map((item) => (
+        item.id === cred.id ? { ...item, disabled } : item
+      )))
+      return { previous }
+    },
+    onError: (e, _disabled, context) => {
+      if (context?.previous) qc.setQueryData(['credentials'], context.previous)
+      failure('操作失败', e)
+    },
+    onSettled: () => invalidate(),
   })
   const prio = useMutation({
     mutationFn: (p: number) => setPriority(cred.id, p),
@@ -581,13 +785,13 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
 /**
  * 本次响应带回的额度：5h / 7d 使用率 + 各自的重置时刻，429 时另标出上游要求的等待时长。
  *
- * 这是**这一刻**上游的说法，不是卡片上那份按用量日志存下来的快照——测试不写日志，所以看完
- * 就没了，页面上别处不会跟着变。
+ * 这是**本次测试响应**里上游直接返回的说法；测试完成后也会写用量日志并刷新账号列表，
+ * 但这里保留逐次结果，方便对照不同模型的状态与等待时间。
  */
 function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
   const win = (label: string, util: number | null, reset: number | null) => {
     if (util == null && reset == null) return null
-    const pct = util == null ? null : Math.round(util * 100)
+    const pct = quotaPercentage(util)
     return (
       <span
         key={label}
@@ -598,7 +802,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
         {pct == null ? (
           '—'
         ) : (
-          <span className={cn('font-medium', quotaTone(util))}>{pct}%</span>
+          <span className={cn('font-medium', quotaToneClass(util))}>{pct}%</span>
         )}
         {reset != null && ` · ${formatClockTime(reset)} 重置`}
       </span>
@@ -645,10 +849,11 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
 }
 
 /** 使用率配色，阈值与卡片额度条一致（≥90% 红、≥70% 橙）。 */
-function quotaTone(util: number | null): string {
-  if (util == null) return 'text-foreground/80'
-  if (util >= 0.9) return 'text-destructive-foreground'
-  return util >= 0.7 ? 'text-warning-foreground' : 'text-foreground/80'
+function quotaToneClass(util: number | null): string {
+  const level = quotaLevel(util)
+  if (level === 'critical') return 'text-destructive-foreground'
+  if (level === 'warning') return 'text-warning-foreground'
+  return 'text-foreground/80'
 }
 
 /** 等待时长：分钟以内给秒，一天以内给小时，再长给天（上游真给过 63 小时）。 */
@@ -667,23 +872,12 @@ export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
   return 'outline'
 }
 
-/**
- * 凭证综合状态 → 状态灯颜色 + 左侧轨道色 + 文案。优先级：封禁 > 停用 > 冷却 > 额度将满 > 正常。
- *
- * **access_token 的有效期不参与判色**（既没有「已过期」也没有「即将过期」）：token 到点会在
- * 下次使用时自动刷新，而 `expires_in <= 300` 恰恰就是后端的刷新窗口——把「马上就要被刷新」
- * 画成琥珀色警告，是在提醒一件系统自己会处理、且用户也做不了什么的事。真正的凭证问题
- * （refresh_token 失效）走封禁那一支。有效期本身仍在底栏如实展示，见 [`credentialExpiryMeta`]。
- */
+/** 凭证综合状态；access_token 到期不参与判色，因为下次调度会自动刷新。 */
 export function statusMeta(
   cred: Credential,
-  nearLimit: boolean,
-): { variant: BadgeProps['variant']; label: string } {
-  if (cred.ban_reason) return { variant: 'error', label: '已封禁' }
-  if (cred.disabled) return { variant: 'secondary', label: '已停用' }
-  if (cred.rate_limited_secs > 0) return { variant: 'warning', label: '冷却中' }
-  if (nearLimit) return { variant: 'warning', label: '额度将满' }
-  return { variant: 'success', label: '运行正常' }
+  now = currentUnixSeconds(),
+): CredentialStatusMeta {
+  return evaluateCredential(cred, now).status
 }
 
 /**
