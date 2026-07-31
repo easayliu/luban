@@ -7,7 +7,8 @@
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// 授权页地址（用户在浏览器打开、登录并同意授权）。
-pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+/// 官方客户端已从 `claude.ai/oauth/authorize` 迁到 claude.com 的新路径，跟着走。
+pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 
 /// Token 交换 / 刷新端点。
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
@@ -18,8 +19,11 @@ pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// 手动粘贴模式使用的 redirect_uri，token 端点会据此校验。
 pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
-/// 申请的 OAuth scope，与 Claude Code 保持一致。
-pub const SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers";
+/// 申请的 OAuth scope，与 Claude Code 保持一致（含顺序——scope 集合也是指纹的一部分）。
+/// `org:create_api_key` luban 自身用不到，但官方客户端就带着它；`user:file_upload` 缺了
+/// 会让经代理走 Files API 的上传被上游按 scope 拒掉。
+pub const SCOPES: &str = "org:create_api_key user:profile user:inference \
+                          user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// 用 OAuth access token 调用 Anthropic API 时必须携带的 beta 头。
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";

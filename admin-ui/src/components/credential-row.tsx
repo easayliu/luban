@@ -182,7 +182,7 @@ export function CredentialRow({
                 />
               )}
               <div className="min-w-0 flex-1">
-                <h3 className="min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
+                <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={cred.label}>
                   {cred.label}
                 </h3>
                 <p
@@ -262,10 +262,10 @@ export function CredentialRow({
             />
           )}
         </TableCell>
-        <TableCell className={cn(COL.account, 'whitespace-normal')}>
+        <TableCell className={cn(COL.account, 'whitespace-nowrap')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              <span className="block min-w-0 break-all font-semibold text-sm leading-snug" title={cred.label}>
+              <span className="block min-w-0 whitespace-nowrap font-semibold text-sm leading-snug" title={cred.label}>
                 {cred.label}
               </span>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">

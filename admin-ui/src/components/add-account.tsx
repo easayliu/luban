@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowRightIcon, ExternalLinkIcon } from 'lucide-react'
+import { ArrowRightIcon, CopyIcon, ExternalLinkIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
-import { extractError } from '@/lib/utils'
+import { copyText, extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -142,8 +142,23 @@ export function AddAccount({
                     <a href={authUrl} target="_blank" rel="noopener">
                       手动打开授权页面
                     </a>
-                    。
+                    ，或复制链接到其它浏览器/设备上完成授权。
                   </p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="mt-2"
+                    onClick={async () => {
+                      const copied = await copyText(authUrl)
+                      toastManager.add(copied
+                        ? { title: '已复制授权链接', type: 'success' }
+                        : { title: '复制失败，请手动复制', description: authUrl, type: 'error' })
+                    }}
+                  >
+                    <CopyIcon />
+                    复制授权链接
+                  </Button>
                 </AlertDescription>
               </Alert>
             )}
