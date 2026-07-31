@@ -221,6 +221,7 @@ export function CredentialCard({
                   util={u5h}
                   reset={cred.quota.rl_5h_reset}
                   cost={cred.quota.cost_5h}
+                  requests={cred.quota.requests_5h}
                   snapshotTs={cred.quota.ts}
                 />
               )}
@@ -230,6 +231,7 @@ export function CredentialCard({
                   util={u7d}
                   reset={cred.quota.rl_7d_reset}
                   cost={cred.quota.cost_7d}
+                  requests={cred.quota.requests_7d}
                   snapshotTs={cred.quota.ts}
                 />
               )}
@@ -295,12 +297,14 @@ function QuotaMeter({
   util,
   reset,
   cost,
+  requests,
   snapshotTs,
 }: {
   label: string
   util: number | null
   reset: number | null
   cost: number | null
+  requests: number | null
   snapshotTs: number
 }) {
   if (util == null) {
@@ -335,10 +339,18 @@ function QuotaMeter({
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-        <span>花费 <span className="font-medium text-foreground">{formatUsd(cost ?? 0)}</span></span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span>
+          <span className="font-medium text-foreground tabular-nums">
+            {requests == null ? '—' : requests.toLocaleString('zh-CN')}
+          </span>{' '}次请求
+          <span className="mx-1.5" aria-hidden="true">·</span>
+          <span className="font-medium text-foreground">{cost == null ? '—' : formatUsd(cost)}</span>
+        </span>
         {reset != null && (
-          <span title={`${formatFullTime(reset)} 重置`}>{formatClockTime(reset)} 重置</span>
+          <span className="ml-auto" title={`${formatFullTime(reset)} 重置`}>
+            {formatClockTime(reset)} 重置
+          </span>
         )}
       </div>
     </Meter>

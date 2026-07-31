@@ -22,10 +22,12 @@ import {
   Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Combobox, ComboboxItem, ComboboxPopup, ComboboxTrigger, ComboboxValue,
+} from '@/components/ui/combobox'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
 import { MenuItem, MenuPopup, MenuSeparator, MenuShortcut } from '@/components/ui/menu'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
@@ -351,11 +353,8 @@ export function DeleteCredentialDialog({
 }
 
 /**
- * 测试弹窗里的备选模型。**只是快捷入口，不是白名单**——输入框可以随便填，后端也原样发给
- * 上游，故官方上新模型时不改这里也能测，只是少一个可点的按钮。
- *
- * 取现役四个模型族各一个（基座与 beta 串按族分家，见后端 `cc_system_base`/`cc_beta_seed`），
- * 这样点一遍就覆盖了四条不同的模拟路径。
+ * 测试弹窗里的模型选项。取现役四个模型族各一个（基座与 beta 串按族分家，见后端
+ * `cc_system_base`/`cc_beta_seed`），这样逐项测试可以覆盖四条不同的模拟路径。
  */
 const PROBE_MODELS = [
   'claude-opus-5',
@@ -473,53 +472,50 @@ export function ConnectivityTestDialog({
         <DialogHeader>
           <DialogTitle>连通性测试</DialogTitle>
           <DialogDescription>
-            使用「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」向上游发送最小请求；
-            会消耗少量订阅额度并按实际用量计入该账号。测试结果与真实流量同等对待：限流会进入冷却，检测到封禁会自动停用。
+            使用「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」
+            发送一条最小请求，验证所选模型是否可用。
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
           <Form
-            className="space-y-3"
+            className="space-y-4"
             onSubmit={(e) => { e.preventDefault(); submit() }}
           >
             <Field>
-              <FieldLabel>测试模型</FieldLabel>
-              <div className="flex flex-wrap gap-2">
-                {PROBE_MODELS.map((m) => (
-                  <Button
-                    key={m}
-                    type="button"
-                    size="xs"
-                    variant={model === m ? 'secondary' : 'outline'}
-                    aria-pressed={model === m}
-                    onClick={() => setModel(m)}
-                  >
-                    <span>{m}</span>
-                  </Button>
-                ))}
-              </div>
-              <FieldDescription>也可以直接输入尚未列出的模型名称。</FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor={`probe-model-${cred.id}`}>模型名称</FieldLabel>
-              <div className="flex w-full items-center gap-2">
-                <Input
-                  id={`probe-model-${cred.id}`}
+              <FieldLabel htmlFor={`probe-model-${cred.id}`}>测试模型</FieldLabel>
+              <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center">
+                <Combobox
+                  items={PROBE_MODELS}
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  placeholder="如 claude-opus-5"
-                  className="min-w-0 flex-1"
-                />
+                  onValueChange={(value) => value && setModel(value)}
+                  disabled={probe.isPending}
+                >
+                  <ComboboxTrigger id={`probe-model-${cred.id}`} className="min-w-0 flex-1">
+                    <ComboboxValue placeholder="选择模型" />
+                  </ComboboxTrigger>
+                  <ComboboxPopup
+                    aria-label="选择测试模型"
+                    inputPlaceholder="搜索模型"
+                    emptyText="没有匹配的模型"
+                  >
+                    {(item: string) => (
+                      <ComboboxItem key={item} value={item}>{item}</ComboboxItem>
+                    )}
+                  </ComboboxPopup>
+                </Combobox>
                 <Button
                   type={probe.isPending ? 'button' : 'submit'}
                   variant={probe.isPending ? 'outline' : 'default'}
-                  disabled={!probe.isPending && !model.trim()}
+                  className="w-full sm:w-auto sm:shrink-0"
                   onClick={probe.isPending ? cancelProbe : undefined}
                 >
                   {probe.isPending ? <Spinner /> : <ActivityIcon />}
                   {probe.isPending ? '取消测试' : '开始测试'}
                 </Button>
               </div>
+              <FieldDescription>
+                每次测试会消耗少量订阅额度，并计入该账号当前周期的请求数与花费。
+              </FieldDescription>
             </Field>
           </Form>
 
@@ -527,7 +523,7 @@ export function ConnectivityTestDialog({
             <Empty className="py-8">
               <EmptyHeader>
                 <EmptyTitle className="text-base">尚无测试结果</EmptyTitle>
-                <EmptyDescription>选择模型开始测试，结果会显示实时额度或上游错误。</EmptyDescription>
+                <EmptyDescription>选择模型并开始测试，结果会显示实时额度或上游错误。</EmptyDescription>
               </EmptyHeader>
             </Empty>
           ) : (

@@ -311,6 +311,8 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM usage_logs WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM credential_stats WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM device_costs WHERE cred_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
         tx.commit()?;
         // 号没了，它的限流窗口与冷却也留着没用（id 不会被复用，见 migrates_and_stops_id_reuse）。
@@ -326,6 +328,8 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM usage_logs", [])?;
         tx.execute("DELETE FROM device_bindings", [])?;
+        tx.execute("DELETE FROM credential_stats", [])?;
+        tx.execute("DELETE FROM device_costs", [])?;
         let n = tx.execute("DELETE FROM credentials", [])?;
         tx.commit()?;
         Ok(n)
@@ -408,10 +412,14 @@ impl CredentialStore {
         {
             let mut logs = tx.prepare("DELETE FROM usage_logs WHERE cred_id = ?1")?;
             let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+            let mut stats = tx.prepare("DELETE FROM credential_stats WHERE cred_id = ?1")?;
+            let mut costs = tx.prepare("DELETE FROM device_costs WHERE cred_id = ?1")?;
             let mut cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
             for id in ids {
                 logs.execute([id])?;
                 binds.execute([id])?;
+                stats.execute([id])?;
+                costs.execute([id])?;
                 n += cred.execute([id])?;
             }
         }
@@ -575,8 +583,8 @@ impl CredentialStore {
     /// 过滤口径与 [`Self::device_count`] 完全一致（同一个 TTL），否则后台会出现「设备数写着
     /// 2、展开却列出 5 条」这种自相矛盾的展示。
     ///
-    /// 费用来自 `usage_logs`（按 device_id 汇总），与绑定表是两套账，刻意不合并：
-    /// 绑定行会被解绑/停用/TTL 清掉并从零重新计数，用量日志则一直留着。所以「本账号费用」
+    /// 费用来自 `device_costs` 账本（写日志时同事务累加），与绑定表是两套账，刻意不合并：
+    /// 绑定行会被解绑/停用/TTL 清掉并从零重新计数，账本则终身累计。所以「本账号费用」
     /// 覆盖的时间范围可能比 `request_count` 长——它统计的是这台设备历史上经本账号花掉的钱，
     /// 而不是「本次绑定期间」。同时给出跨账号合计，便于识别换号仍在持续烧钱的同一台设备。
     pub fn list_devices(&self, cred_id: i64) -> Result<Vec<DeviceBinding>> {
@@ -585,10 +593,10 @@ impl CredentialStore {
         let ttl_clause = if ttl > 0 { "AND b.last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
             "SELECT b.device_id, b.request_count, b.created_at, b.last_seen_at, \
-                    COALESCE((SELECT SUM(u.cost_usd) FROM usage_logs u \
-                               WHERE u.cred_id = b.cred_id AND u.device_id = b.device_id), 0), \
-                    COALESCE((SELECT SUM(u.cost_usd) FROM usage_logs u \
-                               WHERE u.device_id = b.device_id), 0) \
+                    COALESCE((SELECT dc.cost_usd FROM device_costs dc \
+                               WHERE dc.cred_id = b.cred_id AND dc.device_id = b.device_id), 0), \
+                    COALESCE((SELECT SUM(dc.cost_usd) FROM device_costs dc \
+                               WHERE dc.device_id = b.device_id), 0) \
                FROM device_bindings b \
               WHERE b.cred_id = ?1 {ttl_clause} ORDER BY b.last_seen_at DESC, b.device_id ASC"
         );
@@ -1021,6 +1029,9 @@ pub struct QuotaSnapshot {
     /// 当前 5h / 7d 窗口内该凭证已用的等价费用（USD）。窗口起点由对应 reset 反推。
     pub cost_5h: Option<f64>,
     pub cost_7d: Option<f64>,
+    /// 当前 5h / 7d 窗口内经该凭证转发的请求数。口径与窗口费用完全一致。
+    pub requests_5h: Option<i64>,
+    pub requests_7d: Option<i64>,
 }
 
 /// 一条设备绑定明细（凭证卡片展开「已绑定设备」时展示）。
@@ -1047,10 +1058,13 @@ pub struct DeviceBinding {
 const WINDOW_5H_SECS: i64 = 5 * 3600;
 /// 7 天窗口秒数。
 const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
+/// 用量日志流水的保留时长：30 天。必须显著大于最长的统计窗口（7 天），
+/// 否则窗口内的流水会被裁掉、cost_7d 平白变小；30 天同时给请求日志页留够翻看余量。
+const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
 impl CredentialStore {
     /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
-    /// 并附带当前 5h / 7d 窗口内的累计费用。
+    /// 并附带当前 5h / 7d 窗口内的累计费用与请求数。
     pub fn latest_quotas(&self) -> Result<HashMap<i64, QuotaSnapshot>> {
         self.quota_snapshots(None)
     }
@@ -1060,39 +1074,38 @@ impl CredentialStore {
         Ok(self.quota_snapshots(Some(cred_id))?.remove(&cred_id))
     }
 
-    /// 额度快照 + 窗口费用，一条 SQL 出全部结果。`only` 为 `Some(id)` 时只算该凭证。
+    /// 额度快照 + 窗口费用/请求数，一条 SQL 出全部结果。`only` 为 `Some(id)` 时只算该凭证。
     ///
-    /// 快照本身借助 SQLite 的特性：`MAX(ts)` 存在时，同 SELECT 里的裸列取自该最大行。
-    /// 窗口费用（起点 = 该行的 reset 反推一个窗口时长）走 `CASE WHEN` 条件求和，与快照在同一次
-    /// 扫描里算完——此前是逐凭证再补两条 `SUM(...) WHERE cred_id=? AND ts>=?`，N 个账号就是
-    /// 2N 条额外查询，账号列表每 30 秒轮询一次，日志表越攒越大时这段开销是线性叠加的。
+    /// 快照直接读账本（credential_stats，写日志时同事务落好），不再从 usage_logs 里
+    /// 扫「最新一条带限流信息的行」——那条 CTE 的过滤列不在索引里，表越大回表越多。
+    /// 窗口统计（起点 = 快照的 reset 反推一个窗口时长）仍从流水条件聚合：窗口最长 7 天
+    /// 多一点，流水的保留期（见 [`Self::prune_usage_logs`]）覆盖它绰绰有余。
     fn quota_snapshots(&self, only: Option<i64>) -> Result<HashMap<i64, QuotaSnapshot>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "WITH latest AS (
-                 SELECT cred_id, MAX(ts) AS ts, unified_status,
-                        rl_5h_utilization, rl_5h_reset,
-                        rl_7d_utilization, rl_7d_reset, rl_representative
-                   FROM usage_logs
-                  WHERE cred_id IS NOT NULL
-                    AND (?3 IS NULL OR cred_id = ?3)
-                    AND (rl_5h_utilization IS NOT NULL OR rl_7d_utilization IS NOT NULL)
-                  GROUP BY cred_id
-             )
-             SELECT l.cred_id, l.ts, l.unified_status,
-                    l.rl_5h_utilization, l.rl_5h_reset,
-                    l.rl_7d_utilization, l.rl_7d_reset, l.rl_representative,
-                    CASE WHEN l.rl_5h_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= l.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
+            "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
+                    s.rl_5h_utilization, s.rl_5h_reset,
+                    s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative,
+                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
                     END,
-                    CASE WHEN l.rl_7d_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= l.rl_7d_reset - ?2 THEN u.cost_usd END), 0)
+                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN u.cost_usd END), 0)
+                    END,
+                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                        SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN 1 ELSE 0 END)
+                    END,
+                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                        SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN 1 ELSE 0 END)
                     END
-               FROM latest l
-               JOIN usage_logs u ON u.cred_id = l.cred_id
-              GROUP BY l.cred_id",
+               FROM credential_stats s
+               LEFT JOIN usage_logs u ON u.cred_id = s.cred_id
+              WHERE s.snapshot_ts IS NOT NULL
+                AND (?3 IS NULL OR s.cred_id = ?3)
+              GROUP BY s.cred_id",
         )?;
-        // JOIN 而非 LEFT JOIN：latest 本就取自 usage_logs，每个 cred_id 至少有一行能配上。
+        // LEFT JOIN：快照在账本里长存，而窗口内的流水可能已被裁剪清空（此时窗口统计为 0，
+        // 语义正确——窗口比保留期短，裁掉的必然是窗口外的行；真正空窗口就该是 0）。
         let rows = stmt.query_map(params![WINDOW_5H_SECS, WINDOW_7D_SECS, only], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1106,6 +1119,8 @@ impl CredentialStore {
                     rl_representative: r.get(7)?,
                     cost_5h: r.get(8)?,
                     cost_7d: r.get(9)?,
+                    requests_5h: r.get(10)?,
+                    requests_7d: r.get(11)?,
                 },
             ))
         })?;
@@ -1117,12 +1132,12 @@ impl CredentialStore {
         Ok(out)
     }
 
-    /// 每个凭证最近一次被使用（有转发记录）的时间（cred_id → Unix 秒）。
+    /// 每个凭证最近一次被使用（有转发记录）的时间（cred_id → Unix 秒）。读账本，
+    /// 不扫流水——流水会被裁剪，账本才是终身口径（下同，cost_by_cred / cost_of 亦然）。
     pub fn last_used(&self) -> Result<HashMap<i64, i64>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT cred_id, MAX(ts) FROM usage_logs
-              WHERE cred_id IS NOT NULL GROUP BY cred_id",
+            "SELECT cred_id, last_used_at FROM credential_stats WHERE last_used_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         let mut out = HashMap::new();
@@ -1136,21 +1151,21 @@ impl CredentialStore {
     /// 单个凭证最近一次被使用的时间；无记录时为 `None`。口径同 [`Self::last_used`]。
     pub fn last_used_at(&self, cred_id: i64) -> Result<Option<i64>> {
         let conn = self.conn.lock();
-        // 空集时 MAX 仍返回一行 NULL，故取 Option 而非 QueryReturnedNoRows。
-        let ts =
-            conn.query_row("SELECT MAX(ts) FROM usage_logs WHERE cred_id = ?1", [cred_id], |r| {
-                r.get::<_, Option<i64>>(0)
-            })?;
-        Ok(ts)
+        // 账本行可能还不存在（该凭证从未有过流水），optional 后拍平。
+        let ts = conn
+            .query_row(
+                "SELECT last_used_at FROM credential_stats WHERE cred_id = ?1",
+                [cred_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(ts.flatten())
     }
 
     /// 每个凭证累计的等价 API 费用（cred_id → USD 合计）。
     pub fn cost_by_cred(&self) -> Result<HashMap<i64, f64>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT cred_id, COALESCE(SUM(cost_usd), 0) FROM usage_logs
-              WHERE cred_id IS NOT NULL GROUP BY cred_id",
-        )?;
+        let mut stmt = conn.prepare("SELECT cred_id, cost_total_usd FROM credential_stats")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
         let mut out = HashMap::new();
         for row in rows {
@@ -1164,7 +1179,7 @@ impl CredentialStore {
     pub fn cost_of(&self, cred_id: i64) -> Result<f64> {
         let conn = self.conn.lock();
         let sum = conn.query_row(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_logs WHERE cred_id = ?1",
+            "SELECT COALESCE((SELECT cost_total_usd FROM credential_stats WHERE cred_id = ?1), 0)",
             [cred_id],
             |r| r.get(0),
         )?;
@@ -1173,18 +1188,37 @@ impl CredentialStore {
 
     /// 写入一条用量日志。
     pub fn insert_usage_log(&self, rec: &UsageRecord) -> Result<()> {
+        self.insert_usage_log_at(rec, None)
+    }
+
+    /// 写入一条用量日志，并在**同一事务**里把账本（credential_stats / device_costs）记上。
+    ///
+    /// 账本承接三个终身口径：最近使用、累计费用、最新额度快照。流水（usage_logs）只保留
+    /// 近期（见 [`Self::prune_usage_logs`]），这些口径若继续从流水聚合，裁剪一跑数字就会
+    /// 跟着变小；写时落账之后，读路径不再依赖流水的历史深度。同一事务保证两边不漂移。
+    ///
+    /// `ts` 为 `None` 时取当前时间；拆出这个参数是给测试用的——窗口/裁剪相关的用例
+    /// 需要指定「这条流水发生在何时」。
+    fn insert_usage_log_at(&self, rec: &UsageRecord, ts: Option<i64>) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let ts = match ts {
+            Some(t) => t,
+            // 用 SQLite 的时钟，与建表 DEFAULT unixepoch() 同源。
+            None => tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?,
+        };
+        tx.execute(
             "INSERT INTO usage_logs
-                (cred_id, cred_label, device_id, model, path, status, has_usage,
+                (ts, cred_id, cred_label, device_id, model, path, status, has_usage,
                  input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
                  cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                  rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
                  cost_usd)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
+                ts,
                 rec.cred_id,
                 rec.cred_label,
                 rec.device_id,
@@ -1212,7 +1246,73 @@ impl CredentialStore {
                 rec.cost_usd,
             ],
         )?;
+        // 落账。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属，只记日志不记账。
+        if let Some(cid) = rec.cred_id {
+            tx.execute(
+                "INSERT INTO credential_stats (cred_id, last_used_at, cost_total_usd)
+                 VALUES (?1, ?2, COALESCE(?3, 0))
+                 ON CONFLICT(cred_id) DO UPDATE SET
+                     last_used_at   = excluded.last_used_at,
+                     cost_total_usd = cost_total_usd + COALESCE(?3, 0)",
+                params![cid, ts, rec.cost_usd],
+            )?;
+            // 快照只在响应带限流头时覆盖，口径同旧版「最新一条带限流信息的行」——
+            // 更晚的普通响应不能把快照抹掉。
+            if rec.rl_5h_utilization.is_some() || rec.rl_7d_utilization.is_some() {
+                tx.execute(
+                    "UPDATE credential_stats SET
+                         snapshot_ts = ?2, unified_status = ?3,
+                         rl_5h_utilization = ?4, rl_5h_reset = ?5,
+                         rl_7d_utilization = ?6, rl_7d_reset = ?7, rl_representative = ?8
+                      WHERE cred_id = ?1",
+                    params![
+                        cid,
+                        ts,
+                        rec.unified_status,
+                        rec.rl_5h_utilization,
+                        rec.rl_5h_reset,
+                        rec.rl_7d_utilization,
+                        rec.rl_7d_reset,
+                        rec.rl_representative,
+                    ],
+                )?;
+            }
+            // 模型未知时 cost_usd 为空，无钱可记（口径同旧版 SUM 跳过 NULL）。
+            if let (Some(dev), Some(cost)) = (&rec.device_id, rec.cost_usd) {
+                tx.execute(
+                    "INSERT INTO device_costs (device_id, cred_id, cost_usd) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(device_id, cred_id) DO UPDATE SET cost_usd = cost_usd + ?3",
+                    params![dev, cid, cost],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。
+    ///
+    /// 流水裁剪不影响任何终身口径——最近使用/累计费用/最新快照都在账本里
+    /// （credential_stats / device_costs，写时落账）；还要读流水的只剩两处：
+    /// 5h/7d 窗口统计（最多回看 7 天多）和请求日志页（只翻近期），30 天都覆盖得住。
+    ///
+    /// 分批删：日志表可能积了几百万行，一条大 DELETE 会把写锁按住很久，转发路径的
+    /// 落库全得排队。批间放锁，让在线写入插队。
+    pub fn prune_usage_logs(&self) -> Result<usize> {
+        const BATCH: usize = 5_000;
+        let mut total = 0;
+        loop {
+            let n = self.conn.lock().execute(
+                "DELETE FROM usage_logs WHERE id IN (
+                     SELECT id FROM usage_logs WHERE ts < unixepoch() - ?1 LIMIT ?2)",
+                params![USAGE_LOG_RETENTION_SECS, BATCH as i64],
+            )?;
+            total += n;
+            if n < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// 最近的用量日志，按时间倒序，最多 `limit` 条。
@@ -1345,7 +1445,33 @@ fn init_schema(conn: &Connection) -> Result<()> {
         DROP INDEX IF EXISTS idx_usage_logs_cred;
         -- 设备明细要按 device_id 汇总费用（含跨账号合计）；日志表只会越攒越多，
         -- 没这条索引时展开一次卡片就是一次全表扫描。
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_device ON usage_logs(device_id, cred_id);",
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_device ON usage_logs(device_id, cred_id);
+
+        -- 账本：每凭证的终身累计统计与最新额度快照，与 usage_logs 的插入在同一事务内更新
+        -- （见 insert_usage_log_at）。分工：usage_logs 是流水，只保留近期（prune_usage_logs），
+        -- 「最近使用 / 累计费用 / 最新快照」这些终身口径落在这里，才不随流水裁剪一起变小。
+        -- 老库升级时由 backfill_ledger 从既有流水一次性回填。
+        CREATE TABLE IF NOT EXISTS credential_stats (
+            cred_id        INTEGER PRIMARY KEY,
+            last_used_at   INTEGER,
+            cost_total_usd REAL NOT NULL DEFAULT 0,
+            -- 最新一次带限流头响应的快照（列含义同 usage_logs 的 rl_* 列）。
+            snapshot_ts        INTEGER,
+            unified_status     TEXT,
+            rl_5h_utilization  REAL,
+            rl_5h_reset        INTEGER,
+            rl_7d_utilization  REAL,
+            rl_7d_reset        INTEGER,
+            rl_representative  TEXT
+        ) STRICT;
+        -- 设备费用账本：终身累计。不记在 device_bindings 上——绑定行会被解绑/TTL 清掉重建，
+        -- 而费用语义要求比绑定活得久（见 list_devices 的注）。
+        CREATE TABLE IF NOT EXISTS device_costs (
+            device_id TEXT    NOT NULL,
+            cred_id   INTEGER NOT NULL,
+            cost_usd  REAL    NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, cred_id)
+        ) STRICT, WITHOUT ROWID;",
     )
     .context("初始化凭证库 schema 失败")?;
 
@@ -1383,7 +1509,56 @@ fn init_schema(conn: &Connection) -> Result<()> {
     migrate_credentials_autoincrement(conn)?;
 
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
+    // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
+    backfill_ledger(conn)?;
+    Ok(())
+}
+
+/// 初次启动（账本还是空表）时，把既有 usage_logs 流水一次性回填进账本。
+///
+/// 账本（credential_stats / device_costs）是随「写时落账」改造新加的：老库升级上来时
+/// 流水里攒着几个月的历史，账本却是空的——不回填的话，卡片上的累计费用/最近使用/额度
+/// 快照全部清零重来。三条聚合各扫一遍流水即可，百万行也只是秒级，且只在账本为空的
+/// 那一次启动跑；此后写时落账接管，账本非空，这里直接短路。
+fn backfill_ledger(conn: &Connection) -> Result<()> {
+    let stats: i64 = conn.query_row("SELECT COUNT(*) FROM credential_stats", [], |r| r.get(0))?;
+    if stats > 0 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    // 终身口径：最近使用 + 累计费用。
+    let n = tx.execute(
+        "INSERT INTO credential_stats (cred_id, last_used_at, cost_total_usd)
+         SELECT cred_id, MAX(ts), COALESCE(SUM(cost_usd), 0)
+           FROM usage_logs WHERE cred_id IS NOT NULL GROUP BY cred_id",
+        [],
+    )?;
+    // 额度快照：每凭证最新一条带限流头的行（MAX + 裸列取自该最大行，SQLite 特性）。
+    // 没有这种行的凭证子查询给出全 NULL 行，快照列保持空，口径与写时落账一致。
+    tx.execute(
+        "UPDATE credential_stats SET
+             (snapshot_ts, unified_status, rl_5h_utilization, rl_5h_reset,
+              rl_7d_utilization, rl_7d_reset, rl_representative) =
+             (SELECT MAX(u.ts), u.unified_status, u.rl_5h_utilization, u.rl_5h_reset,
+                     u.rl_7d_utilization, u.rl_7d_reset, u.rl_representative
+                FROM usage_logs u
+               WHERE u.cred_id = credential_stats.cred_id
+                 AND (u.rl_5h_utilization IS NOT NULL OR u.rl_7d_utilization IS NOT NULL))",
+        [],
+    )?;
+    // 设备费用账本。
+    tx.execute(
+        "INSERT INTO device_costs (device_id, cred_id, cost_usd)
+         SELECT device_id, cred_id, SUM(cost_usd) FROM usage_logs
+          WHERE cred_id IS NOT NULL AND device_id IS NOT NULL AND cost_usd IS NOT NULL
+          GROUP BY device_id, cred_id",
+        [],
+    )?;
+    tx.commit()?;
+    if n > 0 {
+        tracing::info!(credentials = n, "已从既有用量日志回填账本");
+    }
     Ok(())
 }
 
@@ -1408,6 +1583,14 @@ fn purge_orphan_rows(conn: &Connection) -> Result<()> {
             [],
         )
         .context("清理无主设备绑定失败")?;
+    // 账本同口径清扫（新表初次上线时是 no-op）。
+    conn.execute(
+        "DELETE FROM credential_stats WHERE cred_id NOT IN (SELECT id FROM credentials)",
+        [],
+    )
+    .context("清理无主账本失败")?;
+    conn.execute("DELETE FROM device_costs WHERE cred_id NOT IN (SELECT id FROM credentials)", [])
+        .context("清理无主设备费用失败")?;
     if logs > 0 || binds > 0 {
         tracing::info!(usage_logs = logs, device_bindings = binds, "已清理被删账号遗留的历史数据");
     }
@@ -2273,16 +2456,18 @@ mod tests {
         assert!((d.cost_usd - 0.75).abs() < 1e-9, "费用不该被解绑清掉");
     }
 
-    /// 直接落一条用量日志（只填与费用统计相关的列）。
+    /// 走真实写入口落一条用量日志（只填与费用统计相关的字段）。
     fn log_cost(store: &CredentialStore, cred_id: i64, device_id: &str, cost: Option<f64>) {
         store
-            .conn
-            .lock()
-            .execute(
-                "INSERT INTO usage_logs (cred_id, device_id, path, status, has_usage, cost_usd) \
-                 VALUES (?1, ?2, '/v1/messages', 200, 1, ?3)",
-                params![cred_id, device_id, cost],
-            )
+            .insert_usage_log(&UsageRecord {
+                cred_id: Some(cred_id),
+                device_id: Some(device_id.to_string()),
+                path: "/v1/messages".to_string(),
+                status: 200,
+                has_usage: true,
+                cost_usd: cost,
+                ..Default::default()
+            })
             .unwrap();
     }
 
@@ -2780,7 +2965,9 @@ mod tests {
         assert!(store.list().unwrap().iter().all(|c| c.disabled));
     }
 
-    /// 往 usage_logs 塞一条带限流头的日志（ts / 费用 / 两个 reset 由调用方指定）。
+    /// 走真实写入口落一条带限流头的流水（ts / 费用 / 两个 reset 由调用方指定）。
+    /// 刻意不裸 INSERT：快照与费用如今是写时落账（credential_stats），绕过写入口
+    /// 的行只进流水不进账本，测出来的就不是线上那条路径了。
     fn log_row(
         store: &CredentialStore,
         cred_id: i64,
@@ -2789,17 +2976,19 @@ mod tests {
         r5: Option<i64>,
         r7: Option<i64>,
     ) {
-        let conn = store.conn.lock();
-        conn.execute(
-            "INSERT INTO usage_logs (cred_id, ts, cost_usd, rl_5h_utilization, rl_5h_reset, \
-                                     rl_7d_utilization, rl_7d_reset) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![cred_id, ts, cost, r5.map(|_| 0.5), r5, r7.map(|_| 0.25), r7],
-        )
-        .unwrap();
+        let rec = UsageRecord {
+            cred_id: Some(cred_id),
+            cost_usd: Some(cost),
+            rl_5h_utilization: r5.map(|_| 0.5),
+            rl_5h_reset: r5,
+            rl_7d_utilization: r7.map(|_| 0.25),
+            rl_7d_reset: r7,
+            ..Default::default()
+        };
+        store.insert_usage_log_at(&rec, Some(ts)).unwrap();
     }
 
-    /// 额度快照取「最新一条带限流信息的行」，窗口费用只算 `reset - 窗口` 之后的日志，
+    /// 额度快照取「最新一条带限流信息的行」，窗口费用和请求数只算 `reset - 窗口` 之后的日志，
     /// 且不串号。这条 SQL 从 1+2N 条查询合成了一条，口径必须逐项对上。
     #[test]
     fn latest_quotas_sums_only_current_window() {
@@ -2814,15 +3003,13 @@ mod tests {
         log_row(&store, a, 10_000, 1.0, Some(r5), Some(r5)); // 5h 窗口外
         log_row(&store, a, 90_000, 2.0, Some(r5), Some(r5)); // 窗口内
         log_row(&store, a, 95_000, 4.0, Some(r5), Some(r5)); // 窗口内，且是最新快照行
-        // 更晚但不带限流头的行：不该被选作快照，费用仍要计入窗口。
-        {
-            let conn = store.conn.lock();
-            conn.execute(
-                "INSERT INTO usage_logs (cred_id, ts, cost_usd) VALUES (?1, 99000, 8.0)",
-                [a],
+        // 更晚但不带限流头的行：不该覆盖快照，费用仍要计入窗口。
+        store
+            .insert_usage_log_at(
+                &UsageRecord { cred_id: Some(a), cost_usd: Some(8.0), ..Default::default() },
+                Some(99_000),
             )
             .unwrap();
-        }
         log_row(&store, b, 95_000, 16.0, Some(r5), Some(r5)); // 他号，不得混入
 
         let q = store.latest_quotas().unwrap();
@@ -2830,7 +3017,10 @@ mod tests {
         assert_eq!(qa.ts, 95_000, "快照应取最新一条带限流信息的行");
         assert_eq!(qa.cost_5h, Some(14.0), "只应含 ts >= reset-5h 的 2+4+8");
         assert_eq!(qa.cost_7d, Some(15.0), "7d 窗口覆盖全部 1+2+4+8");
+        assert_eq!(qa.requests_5h, Some(3), "5h 窗口应计入 3 次请求");
+        assert_eq!(qa.requests_7d, Some(4), "7d 窗口应计入 4 次请求");
         assert_eq!(q.get(&b).unwrap().cost_5h, Some(16.0), "费用不得跨账号串");
+        assert_eq!(q.get(&b).unwrap().requests_5h, Some(1), "请求数不得跨账号串");
 
         // 单账号入口与批量入口必须给出同一份结果。
         assert_eq!(store.latest_quota(a).unwrap().unwrap().cost_5h, qa.cost_5h);
@@ -2838,8 +3028,85 @@ mod tests {
         assert!(store.latest_quota(999).unwrap().is_none(), "不存在的账号应为 None");
     }
 
-    /// reset 为空时对应窗口的费用留空（而非 0）：分不清「没花钱」和「不知道窗口起点」会让
-    /// 卡片把未知显示成已用 0。
+    /// 裁剪只动流水，不动账本：累计费用/最近使用/额度快照在裁剪后原样保留。
+    #[test]
+    fn prune_keeps_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        // 一条早已过保留期的旧流水（带限流头，会写快照）+ 一条刚发生的新流水（无头）。
+        let old_ts = 1_000;
+        log_row(&store, a, old_ts, 2.0, Some(old_ts + 100), Some(old_ts + 100));
+        store
+            .insert_usage_log(&UsageRecord {
+                cred_id: Some(a),
+                cost_usd: Some(1.0),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(store.prune_usage_logs().unwrap(), 1, "只裁过保留期的旧流水");
+        assert_eq!(store.list_usage_logs(10).unwrap().len(), 1, "新流水应保留");
+        assert_eq!(store.cost_of(a).unwrap(), 3.0, "累计费用是账本口径，不随裁剪变小");
+        assert!(store.last_used_at(a).unwrap().is_some());
+        let q = store.latest_quota(a).unwrap().expect("快照在账本里长存");
+        assert_eq!(q.ts, old_ts, "快照仍是最后一次带限流头的那条");
+        // 窗口统计只看还留着的流水：新流水 ts 在窗口起点之后，计入。
+        assert_eq!(q.cost_5h, Some(1.0));
+        assert_eq!(q.requests_5h, Some(1));
+    }
+
+    /// 老库升级（账本为空、流水有历史）时 init_schema 一次性回填账本；账本非空则不重复。
+    #[test]
+    fn backfill_ledger_on_first_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        // 模拟老库形态：流水是历史攒下的（裸 INSERT，从未落过账），账本是空表。
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO usage_logs (cred_id, ts, cost_usd, device_id) \
+                 VALUES (?1, 1000, 2.0, 'd1')",
+                [a],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_logs (cred_id, ts, cost_usd, rl_5h_utilization, rl_5h_reset) \
+                 VALUES (?1, 2000, 3.0, 0.5, 9000)",
+                [a],
+            )
+            .unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        assert_eq!(store.cost_of(a).unwrap(), 5.0, "累计费用应回填齐全");
+        assert_eq!(store.last_used_at(a).unwrap(), Some(2_000));
+        let q = store.latest_quota(a).unwrap().expect("快照应从最新带限流头的行回填");
+        assert_eq!(q.ts, 2_000);
+        assert_eq!(q.rl_5h_utilization, Some(0.5));
+        let dev_cost: f64 = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT cost_usd FROM device_costs WHERE device_id = 'd1' AND cred_id = ?1",
+                [a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dev_cost, 2.0, "设备费用应回填");
+
+        // 账本已非空：再跑一遍 init_schema（每次启动都会跑）不得重复累计。
+        init_schema(&store.conn.lock()).unwrap();
+        assert_eq!(store.cost_of(a).unwrap(), 5.0, "重复启动不应翻倍");
+    }
+
+    /// reset 为空时对应窗口的费用与请求数留空（而非 0）：分不清「没用」和「不知道窗口起点」
+    /// 会让卡片把未知显示成已用 0。
     #[test]
     fn latest_quotas_leaves_cost_none_without_reset() {
         let conn = Connection::open_in_memory().unwrap();
@@ -2850,7 +3117,9 @@ mod tests {
 
         let q = store.latest_quota(a).unwrap().unwrap();
         assert_eq!(q.cost_5h, Some(3.0));
+        assert_eq!(q.requests_5h, Some(1));
         assert_eq!(q.cost_7d, None, "无 7d reset 时不应给出 0");
+        assert_eq!(q.requests_7d, None, "无 7d reset 时请求数也应未知");
     }
 
     /// 单账号的「最近使用 / 累计费用」与全量聚合同口径，无日志时分别是 None 与 0。

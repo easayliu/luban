@@ -217,12 +217,14 @@ export function CredentialRow({
                 util={u5h}
                 reset={cred.quota?.rl_5h_reset ?? null}
                 cost={cred.quota?.cost_5h ?? null}
+                requests={cred.quota?.requests_5h ?? null}
               />
               <ListQuotaMeter
                 label="7d"
                 util={u7d}
                 reset={cred.quota?.rl_7d_reset ?? null}
                 cost={cred.quota?.cost_7d ?? null}
+                requests={cred.quota?.requests_7d ?? null}
               />
             </div>
 
@@ -295,6 +297,7 @@ export function CredentialRow({
             util={u5h}
             reset={cred.quota?.rl_5h_reset ?? null}
             cost={cred.quota?.cost_5h ?? null}
+            requests={cred.quota?.requests_5h ?? null}
             showLabel={false}
           />
         </TableCell>
@@ -304,6 +307,7 @@ export function CredentialRow({
             util={u7d}
             reset={cred.quota?.rl_7d_reset ?? null}
             cost={cred.quota?.cost_7d ?? null}
+            requests={cred.quota?.requests_7d ?? null}
             showLabel={false}
           />
         </TableCell>
@@ -534,14 +538,20 @@ function ListQuotaMeter({
   util,
   reset,
   cost,
+  requests,
   showLabel = true,
 }: {
   label: string
   util: number | null
   reset: number | null
   cost: number | null
+  requests: number | null
   showLabel?: boolean
 }) {
+  const usageSummary = requests == null
+    ? '—'
+    : `${requests.toLocaleString('zh-CN')} 次 · ${cost == null ? '—' : formatUsd(cost)}`
+
   if (util == null) {
     const emptyLabel = reset != null ? '已重置' : '暂无数据'
     return (
@@ -559,9 +569,9 @@ function ListQuotaMeter({
                   ? 'text-xs text-muted-foreground'
                   : 'font-medium text-foreground text-sm leading-none',
               )}
-              title={`${label}本周期花费 ${cost == null ? '暂无数据' : formatUsd(cost)}`}
+              title={`${label}本周期请求数与花费：${usageSummary}`}
             >
-              {cost == null ? '—' : formatUsd(cost)}
+              {reset != null ? '—' : usageSummary}
             </span>
           </div>
           <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
@@ -590,9 +600,9 @@ function ListQuotaMeter({
                 ? 'text-xs text-muted-foreground'
                 : 'font-medium text-foreground text-sm leading-none',
             )}
-            title={`${label}本周期花费 ${cost == null ? '暂无数据' : formatUsd(cost)}`}
+            title={`${label}本周期请求数与花费：${usageSummary}`}
           >
-            {cost == null ? '—' : formatUsd(cost)}
+            {usageSummary}
           </span>
         </div>
         <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>

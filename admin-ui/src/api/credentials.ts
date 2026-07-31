@@ -13,6 +13,9 @@ export interface Quota {
   /** 当前 5h / 7d 窗口内已用的等价费用（USD）。 */
   cost_5h: number | null
   cost_7d: number | null
+  /** 当前 5h / 7d 窗口内经该账号转发的请求数。 */
+  requests_5h: number | null
+  requests_7d: number | null
 }
 
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */
@@ -183,9 +186,8 @@ export async function clearCooldown(id: number): Promise<Credential> {
 /**
  * 一次测试从上游限流头读到的额度快照。
  *
- * 与账号卡片上的 [`Quota`] 同名同义，但**没有 cost_5h/cost_7d**——那两个是后端按窗口起点
- * 聚合出来的，单次响应的头里没有。这份读数会随用量日志落库，所以卡片上的额度也会跟着更新，
- * 两处显示的是同一次读数。
+ * 与账号卡片上的 [`Quota`] 同名同义，但**没有窗口花费和请求数**——它们是后端按窗口起点
+ * 聚合出来的，单次响应的头里没有。这份读数会随用量日志落库，所以卡片上的额度也会跟着更新。
  */
 export interface ProbeQuota {
   /** `allowed` / `allowed_warning` / `rejected`。 */

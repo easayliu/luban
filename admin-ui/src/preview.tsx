@@ -67,6 +67,8 @@ const banned: Credential = {
     rl_representative: null,
     cost_5h: 0.0086,
     cost_7d: 0.055,
+    requests_5h: 3,
+    requests_7d: 28,
   },
 }
 
@@ -100,6 +102,8 @@ const normal: Credential = {
     rl_representative: null,
     cost_5h: 6.85,
     cost_7d: 42.18,
+    requests_5h: 128,
+    requests_7d: 914,
   },
 }
 

@@ -31,12 +31,7 @@ import {
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import { Button, buttonVariants } from '@/components/ui/button'
-import {
-  Card,
-  CardFrame,
-  CardFrameFooter,
-  CardPanel,
-} from '@/components/ui/card'
+import { Card } from '@/components/ui/card'
 import {
   Empty,
   EmptyContent,
@@ -294,17 +289,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
-    <div className="space-y-5 sm:space-y-8" data-slot="credential-workspace">
-      <section className="sm:flex sm:items-end sm:justify-between sm:gap-8" aria-labelledby="page-title">
-        <div className="min-w-0">
-          <h1 id="page-title" className="text-xl font-semibold tracking-tight sm:text-2xl">
-            账号调度中心
-          </h1>
-          <p className="mt-1.5 max-w-2xl text-sm leading-5 text-muted-foreground">
-            统一查看账号健康、额度与设备容量，快速处理会影响转发的状态。
-          </p>
-        </div>
-        <div className="mt-3 flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground sm:mt-0 sm:pb-0.5">
+    <div className="space-y-4 sm:space-y-6" data-slot="credential-workspace">
+      <section className="flex items-center justify-between gap-4" aria-labelledby="page-title">
+        <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight sm:text-xl">
+          账号池
+        </h1>
+        <div className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground sm:text-xs">
           {isRefetchError ? (
             <>
               <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
@@ -313,7 +303,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 onClick={actions.onRetry}
               >
-                刷新失败，点击重试
+                刷新失败，重试
               </button>
             </>
           ) : (
@@ -323,22 +313,23 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               ) : (
                 <span className="size-1.5 rounded-full bg-success" aria-hidden />
               )}
-              <span>每 30 秒自动刷新</span>
+              <span title="每 30 秒自动刷新">30 秒刷新</span>
             </>
           )}
         </div>
       </section>
 
       {isLoading ? (
-        <section aria-label="正在加载账号池概览" className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
-          <OverviewMetricSkeleton />
-          <OverviewMetricSkeleton />
-          <OverviewMetricSkeleton />
+        <section aria-label="正在加载账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4">
+          <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-r" />
           <OverviewMetricSkeleton />
         </section>
       ) : count > 0 && (
-        <section aria-label="账号池概览" className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
+        <section aria-label="账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4">
           <OverviewMetric
+            className="border-r border-b lg:border-b-0"
             label="可调度账号"
             value={`${schedulableCount}/${count}`}
             status={schedulableCount < count ? `${count - schedulableCount} 暂不可用` : `${enabledCount} 已启用`}
@@ -348,6 +339,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             onClick={() => selectMetric('schedulable')}
           />
           <OverviewMetric
+            className="border-b lg:border-r lg:border-b-0"
             label="需处理"
             value={attentionCount}
             status={attentionStatus}
@@ -357,6 +349,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             onClick={() => selectMetric('attention')}
           />
           <OverviewMetric
+            className="border-r"
             label="额度预警"
             value={nearLimitCount}
             status={nearLimitCount > 0 ? '使用率 ≥ 90%' : undefined}
@@ -382,11 +375,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         <p className="sr-only" aria-live="polite">
           {filtering ? `筛选出 ${total} 个，共 ${count} 个账号` : `共 ${count} 个账号`}
         </p>
-        <CardFrame className="min-w-0">
+        <div className="min-w-0 space-y-3 sm:space-y-4">
           {count > 0 && (
-            <Card>
-              <CardPanel className="p-2.5 sm:p-3">
-                <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
+            <div className="rounded-xl border bg-card p-2.5 shadow-xs/5 sm:p-3">
+              <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
                   <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-72">
                     <InputGroupAddon><SearchIcon /></InputGroupAddon>
                     <InputGroupInput
@@ -490,13 +482,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       </ToggleGroupItem>
                     </ToggleGroup>
                   </ToolbarGroup>
-                </Toolbar>
-              </CardPanel>
-            </Card>
+              </Toolbar>
+            </div>
           )}
 
           {count > 0 && selected.size > 0 && (
-            <div className="relative p-3 pb-0 sm:p-4 sm:pb-0">
+            <div className="relative">
               <BatchActionsBar
                 all={sorted}
                 selected={selected}
@@ -507,7 +498,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           )}
 
           {isLoading ? (
-            <div className="relative p-3 sm:p-4">
+            <div className="relative">
               <CredentialLoadingState view={view} selectable />
             </div>
           ) : isError && !credentials ? (
@@ -561,7 +552,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </TableBody>
             </Table>
           ) : (
-            <div className="relative grid items-stretch gap-3 p-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4 sm:p-4">
+            <div className="relative grid items-stretch gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
               {pageItems.map((item) => (
                 <CredentialCard
                   key={item.id}
@@ -575,7 +566,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           )}
 
           {!isLoading && pageCount > 1 && (
-            <CardFrameFooter className="relative px-3 py-4 sm:px-6">
+            <div className="relative py-2">
               <AccountPagination
                 total={total}
                 page={current}
@@ -587,9 +578,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   actions.onPageChange(1)
                 }}
               />
-            </CardFrameFooter>
+            </div>
           )}
-        </CardFrame>
+        </div>
       </section>
     </div>
   )

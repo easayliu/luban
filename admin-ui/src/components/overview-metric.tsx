@@ -1,6 +1,5 @@
 import type { ElementType } from 'react'
 import { cn } from '@/lib/utils'
-import { Card, CardPanel } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 
 export function OverviewMetric({
@@ -22,7 +21,7 @@ export function OverviewMetric({
     neutral: 'text-muted-foreground',
   }[tone]
   const content = (
-    <CardPanel className="p-3 sm:p-5">
+    <div className="p-3 sm:p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="min-w-0 text-xs font-medium text-muted-foreground">{label}</p>
         <Icon className={cn('size-4 shrink-0', iconClass)} aria-hidden />
@@ -33,39 +32,38 @@ export function OverviewMetric({
         </span>
         {status && <span className="text-xs text-muted-foreground">{status}</span>}
       </div>
-    </CardPanel>
+    </div>
   )
 
   const rootClass = cn(
-    'min-w-0 text-left',
-    onClick && 'cursor-pointer transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background',
-    active && 'border-primary bg-muted/56 ring-1 ring-primary/16',
+    'min-w-0 text-left transition-colors',
+    onClick && 'cursor-pointer hover:bg-muted/40 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+    active && 'bg-muted/72',
     className,
   )
 
-  return (
-    <Card
-      className={rootClass}
-      render={onClick ? <button type="button" onClick={onClick} aria-pressed={active} /> : undefined}
-    >
-      {content}
-    </Card>
-  )
+  if (onClick) {
+    return (
+      <button type="button" className={rootClass} onClick={onClick} aria-pressed={active}>
+        {content}
+      </button>
+    )
+  }
+
+  return <div className={rootClass}>{content}</div>
 }
 
 export function OverviewMetricSkeleton({ className }: { className?: string }) {
   return (
-    <Card className={cn('min-w-0', className)}>
-      <CardPanel className="p-3 sm:p-5">
-        <div className="flex items-center justify-between gap-3">
-          <Skeleton className="h-4 w-20" />
-          <Skeleton className="size-4 rounded-md" />
-        </div>
-        <div className="mt-2.5 flex items-end gap-2">
-          <Skeleton className="h-5 w-14" />
-          <Skeleton className="mb-0.5 h-3 w-16" />
-        </div>
-      </CardPanel>
-    </Card>
+    <div className={cn('min-w-0 p-3 sm:p-4', className)}>
+      <div className="flex items-center justify-between gap-3">
+        <Skeleton className="h-4 w-20" />
+        <Skeleton className="size-4 rounded-md" />
+      </div>
+      <div className="mt-2.5 flex items-end gap-2">
+        <Skeleton className="h-5 w-14" />
+        <Skeleton className="mb-0.5 h-3 w-16" />
+      </div>
+    </div>
   )
 }

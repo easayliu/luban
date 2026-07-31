@@ -84,6 +84,25 @@ pub async fn run(
         admin_env: admin_password.map(Arc::new),
     };
 
+    // 每天裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
+    // 流水只需保留近期。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务，
+    // 走 spawn_blocking 避免拿着 SQLite 锁占住异步线程。
+    {
+        let store = state.store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            loop {
+                tick.tick().await;
+                let store = store.clone();
+                match tokio::task::spawn_blocking(move || store.prune_usage_logs()).await {
+                    Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "已裁剪过期用量日志"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "裁剪用量日志失败"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     // 公开鉴权接口（无需登录）。
     let public = Router::new()
         .route("/auth/state", get(auth::state))
