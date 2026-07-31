@@ -27,10 +27,12 @@ import { AddAccount } from '@/components/add-account'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
+import { LanguageSwitcher } from '@/components/language-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { Spinner } from '@/components/ui/spinner'
+import { useI18n } from '@/lib/i18n'
 
 function readSettingsRoute(): SettingsSection | null {
   if (!window.location.hash.startsWith('#/settings')) return null
@@ -38,6 +40,7 @@ function readSettingsRoute(): SettingsSection | null {
 }
 
 function App() {
+  const { t } = useI18n()
   const [adding, setAdding] = useState(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [pw, setPwState] = useState<string | null>(getPw())
@@ -125,6 +128,12 @@ function App() {
     enabled: !needLogin && !authLoading, // 未登录时不请求受保护接口
   })
 
+  useEffect(() => {
+    if (!needLogin && !settingsRoute) {
+      document.title = t('luban · 授权代理', 'luban · Authorization Proxy')
+    }
+  }, [needLogin, settingsRoute, t])
+
   if (authLoading || !authState) {
     return <LoadingState fullPage />
   }
@@ -157,25 +166,26 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 sm:hidden">
-            <Button size="icon-lg" onClick={() => setAdding(true)} aria-label="添加账号">
+            <Button size="icon-lg" onClick={() => setAdding(true)} aria-label={t('添加账号', 'Add account')}>
               <PlusIcon />
             </Button>
+            <LanguageSwitcher compact />
             <Menu>
               <MenuTrigger
                 className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
-                aria-label="更多操作"
+                aria-label={t('更多操作', 'More actions')}
               >
                 <EllipsisVerticalIcon />
               </MenuTrigger>
               <MenuPopup align="end" className="w-44">
                 <MenuItem onClick={() => openSettings('access')}>
-                  <SettingsIcon />系统设置
+                  <SettingsIcon />{t('系统设置', 'System settings')}
                 </MenuItem>
                 {authState.configured && pw && (
                   <>
                     <MenuSeparator />
                     <MenuItem variant="destructive" onClick={() => { clearPw(); setPwState(null) }}>
-                      <LogOutIcon />退出登录
+                      <LogOutIcon />{t('退出登录', 'Sign out')}
                     </MenuItem>
                   </>
                 )}
@@ -183,16 +193,27 @@ function App() {
             </Menu>
           </div>
           <div className="hidden items-center gap-2 sm:flex">
-            <Button size="sm" variant="outline" onClick={() => openSettings('access')} title="系统设置" aria-label="系统设置">
+            <LanguageSwitcher />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => openSettings('access')}
+              title={t('系统设置', 'System settings')}
+              aria-label={t('系统设置', 'System settings')}
+            >
               <SettingsIcon />
-              <span>系统设置</span>
+              <span>{t('系统设置', 'Settings')}</span>
             </Button>
-            <Button size="sm" onClick={() => setAdding(true)} aria-label="添加账号">
+            <Button size="sm" onClick={() => setAdding(true)} aria-label={t('添加账号', 'Add account')}>
               <PlusIcon />
-              <span>添加账号</span>
+              <span>{t('添加账号', 'Add account')}</span>
             </Button>
             {authState.configured && pw && (
-              <Button size="sm" variant="ghost" title="退出登录" aria-label="退出登录"
+              <Button
+                size="sm"
+                variant="ghost"
+                title={t('退出登录', 'Sign out')}
+                aria-label={t('退出登录', 'Sign out')}
                 onClick={() => { clearPw(); setPwState(null) }}>
                 <LogOutIcon />
               </Button>
@@ -246,11 +267,12 @@ function App() {
 }
 
 function LoadingState({ fullPage = false }: { fullPage?: boolean }) {
+  const { t } = useI18n()
   return (
     <div className={cn('grid place-items-center', fullPage ? 'min-h-dvh' : 'py-16')}>
       <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status" aria-live="polite">
         <Spinner />
-        加载中
+        {t('加载中', 'Loading')}
       </div>
     </div>
   )

@@ -9,6 +9,7 @@ import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { AppFooter } from '@/components/app-footer'
+import { LanguageSwitcher } from '@/components/language-switcher'
 import {
   CREDENTIAL_PAGE_SIZES,
   CredentialWorkspace,
@@ -22,6 +23,7 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
 import type { Credential } from '@/api/credentials'
 import './index.css'
 
@@ -290,6 +292,7 @@ const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: Infinity, refetchOnWindowFocus: false } },
 })
 const previewParams = new URLSearchParams(window.location.search)
+const previewLanguage = parseLanguage(previewParams.get('lang')) ?? 'zh-CN'
 const previewDialog = previewParams.get('dialog')
 const previewSettingsParam = previewParams.get('settings')
 const previewSettings: SettingsSection | null = previewSettingsParam === 'forwarding'
@@ -299,7 +302,17 @@ const previewSettings: SettingsSection | null = previewSettingsParam === 'forwar
     : null
 
 function navigatePreview(search = '') {
-  window.location.assign(`${window.location.pathname}${search}`)
+  const next = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)
+  const language = new URLSearchParams(window.location.search).get('lang')
+  if (language && !next.has('lang')) next.set('lang', language)
+  const query = next.toString()
+  window.location.assign(`${window.location.pathname}${query ? `?${query}` : ''}`)
+}
+
+function syncPreviewLanguage(language: 'zh-CN' | 'en') {
+  const url = new URL(window.location.href)
+  url.searchParams.set('lang', language)
+  window.history.replaceState(null, '', url)
 }
 
 function closePreviewDialog(nextOpen: boolean) {
@@ -374,6 +387,66 @@ function PreviewCredentialWorkspace() {
   )
 }
 
+function PreviewHeader() {
+  const { t } = useI18n()
+
+  React.useEffect(() => {
+    document.title = t('luban · 界面预览', 'luban · UI Preview')
+  }, [t])
+
+  return (
+    <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
+      <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
+        <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+          <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
+            <LogoMark className="size-[1.125rem]" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
+            <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">
+              Claude Code Gateway
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 sm:hidden">
+          <Button
+            size="icon-lg"
+            aria-label={t('添加账号', 'Add account')}
+            onClick={() => navigatePreview('?dialog=add')}
+          >
+            <PlusIcon />
+          </Button>
+          <LanguageSwitcher compact />
+          <Menu>
+            <MenuTrigger
+              className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
+              aria-label={t('更多操作', 'More actions')}
+            >
+              <EllipsisVerticalIcon />
+            </MenuTrigger>
+            <MenuPopup align="end">
+              <MenuItem onClick={() => navigatePreview('?settings=access')}>
+                <SettingsIcon />{t('系统设置', 'System settings')}
+              </MenuItem>
+            </MenuPopup>
+          </Menu>
+        </div>
+
+        <div className="hidden items-center gap-2 sm:flex">
+          <LanguageSwitcher />
+          <Button size="sm" variant="outline" onClick={() => navigatePreview('?settings=access')}>
+            <SettingsIcon />{t('系统设置', 'Settings')}
+          </Button>
+          <Button size="sm" onClick={() => navigatePreview('?dialog=add')}>
+            <PlusIcon />{t('添加账号', 'Add account')}
+          </Button>
+        </div>
+      </div>
+    </header>
+  )
+}
+
 queryClient.setQueryData(['settings'], {
   api_key: 'luban-preview-key',
   env_managed: false,
@@ -417,51 +490,22 @@ queryClient.setQueryData(['credential-devices', 4], [
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <ToastProvider position="top-right">
-        <TooltipProvider>
-          <AnchoredToastProvider>
-            <div className="relative isolate min-h-dvh">
+    <LanguageProvider
+      initialLanguage={previewLanguage}
+      persist={false}
+      onLanguageChange={syncPreviewLanguage}
+    >
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider position="top-right">
+          <TooltipProvider>
+            <AnchoredToastProvider>
+              <div className="relative isolate min-h-dvh">
             {previewSettings ? (
               <PreviewSettingsRoute initialSection={previewSettings} />
             ) : (
               <>
                 <div className="app-shell flex min-h-dvh flex-col text-foreground">
-                  <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
-                    <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
-                      <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-                        <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-                          <LogoMark className="size-[1.125rem]" />
-                        </div>
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
-                          <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">
-                            Claude Code Gateway
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-2 sm:hidden">
-                        <Button size="icon-lg" aria-label="添加账号" onClick={() => navigatePreview('?dialog=add')}><PlusIcon /></Button>
-                        <Menu>
-                          <MenuTrigger
-                            className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
-                            aria-label="更多操作"
-                          >
-                            <EllipsisVerticalIcon />
-                          </MenuTrigger>
-                          <MenuPopup align="end">
-                            <MenuItem onClick={() => navigatePreview('?settings=access')}><SettingsIcon />系统设置</MenuItem>
-                          </MenuPopup>
-                        </Menu>
-                      </div>
-
-                      <div className="hidden items-center gap-2 sm:flex">
-                        <Button size="sm" variant="outline" onClick={() => navigatePreview('?settings=access')}><SettingsIcon />系统设置</Button>
-                        <Button size="sm" onClick={() => navigatePreview('?dialog=add')}><PlusIcon />添加账号</Button>
-                      </div>
-                    </div>
-                  </header>
+                  <PreviewHeader />
 
                   <main className="page-frame flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
                     <PreviewCredentialWorkspace />
@@ -474,10 +518,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
               </>
             )}
-            </div>
-          </AnchoredToastProvider>
-        </TooltipProvider>
-      </ToastProvider>
-    </QueryClientProvider>
+              </div>
+            </AnchoredToastProvider>
+          </TooltipProvider>
+        </ToastProvider>
+      </QueryClientProvider>
+    </LanguageProvider>
   </React.StrictMode>,
 )

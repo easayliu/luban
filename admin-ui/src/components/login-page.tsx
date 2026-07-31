@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { ArrowRightIcon, EyeIcon, EyeOffIcon, LockKeyholeIcon } from 'lucide-react'
 import { login } from '@/api/auth'
@@ -13,12 +13,23 @@ import {
   InputGroupAddon,
   InputGroupInput,
 } from '@/components/ui/input-group'
+import { LanguageSwitcher } from '@/components/language-switcher'
 import { LogoMark } from '@/components/logo-mark'
+import { useI18n } from '@/lib/i18n'
 
 /** 管理登录页（已设置密码时展示）。登录成功回调 onSuccess(password)。 */
 export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void }) {
+  const { t, language } = useI18n()
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
+
+  useEffect(() => {
+    const previousTitle = document.title
+    document.title = t('管理登录 · Luban', 'Admin sign-in · Luban')
+    return () => {
+      document.title = previousTitle
+    }
+  }, [t])
 
   const doLogin = useMutation({
     mutationFn: () => login(password),
@@ -29,7 +40,10 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
   })
 
   return (
-    <div className="app-shell grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:py-10">
+    <div className="app-shell relative grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:py-10">
+      <div className="absolute end-4 top-4 sm:end-6 sm:top-6">
+        <LanguageSwitcher />
+      </div>
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center text-center">
           <div className="brand-mark flex size-12 items-center justify-center rounded-xl text-brand-foreground shadow-brand">
@@ -45,9 +59,11 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base leading-tight">
               <LockKeyholeIcon aria-hidden="true" className="size-4 text-muted-foreground" />
-              管理登录
+              {t('管理登录', 'Admin sign-in')}
             </CardTitle>
-            <CardDescription>输入管理密码以继续访问控制台。</CardDescription>
+            <CardDescription>
+              {t('输入管理密码以继续访问控制台。', 'Enter the admin password to continue to the console.')}
+            </CardDescription>
           </CardHeader>
           <CardPanel>
             <Form
@@ -58,22 +74,24 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
               }}
             >
               <Field invalid={doLogin.isError}>
-                <FieldLabel htmlFor="admin-password">管理密码</FieldLabel>
+                <FieldLabel htmlFor="admin-password">
+                  {t('管理密码', 'Admin password')}
+                </FieldLabel>
                 <InputGroup>
                   <InputGroupInput
                     id="admin-password"
                     autoFocus
                     aria-invalid={doLogin.isError || undefined}
                     onChange={(event) => setPassword(event.target.value)}
-                    placeholder="请输入管理密码"
+                    placeholder={t('请输入管理密码', 'Enter the admin password')}
                     type={show ? 'text' : 'password'}
                     value={password}
                   />
                   <InputGroupAddon align="inline-end">
                     <Button
-                      aria-label={show ? '隐藏密码' : '显示密码'}
+                      aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
                       size="icon-xs"
-                      title={show ? '隐藏密码' : '显示密码'}
+                      title={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
                       type="button"
                       variant="ghost"
                       onClick={() => setShow((visible) => !visible)}
@@ -82,7 +100,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                     </Button>
                   </InputGroupAddon>
                 </InputGroup>
-                {doLogin.isError && <FieldError>{extractError(doLogin.error)}</FieldError>}
+                {doLogin.isError && <FieldError>{extractError(doLogin.error, language)}</FieldError>}
               </Field>
               <Button
                 className="w-full"
@@ -91,7 +109,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                 type="submit"
               >
                 <ArrowRightIcon aria-hidden="true" />
-                登录
+                {t('登录', 'Sign in')}
               </Button>
             </Form>
           </CardPanel>

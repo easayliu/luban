@@ -6,6 +6,7 @@ import {
   EllipsisIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
+import { localize, useI18n, type Language } from '@/lib/i18n'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import {
   ConnectivityTestDialog,
@@ -81,6 +82,7 @@ export function CredentialListHeader({
   allSelected?: boolean
   onSelectAll?: (next: boolean) => void
 }) {
+  const { t } = useI18n()
   const sortable = (label: string, key: SortKey) => {
     const active = sort === key
     const Arrow = active && dir === 'asc' ? ChevronUpIcon : ChevronDownIcon
@@ -92,7 +94,9 @@ export function CredentialListHeader({
         variant="ghost"
         onClick={() => onSortChange(key)}
         className="w-full justify-start px-0 text-left sm:text-sm"
-        title={active ? `按${label}排序（点击切换升降序）` : `按${label}排序`}
+        title={active
+          ? t(`按${label}排序（点击切换升降序）`, `Sort by ${label} (click to reverse direction)`)
+          : t(`按${label}排序`, `Sort by ${label}`)}
       >
         {label}
         <Arrow className={cn(!active && 'opacity-0')} />
@@ -110,37 +114,37 @@ export function CredentialListHeader({
             <Checkbox
               checked={!!allSelected}
               onCheckedChange={(checked) => onSelectAll?.(checked)}
-              aria-label="全选当前筛选结果"
+              aria-label={t('全选当前筛选结果', 'Select all filtered results')}
             />
           )}
         </TableHead>
         <TableHead className={COL.account} {...sortProps('name')}>
-          {sortable('账号', 'name')}
+          {sortable(t('账号', 'Account'), 'name')}
         </TableHead>
-        <TableHead className={COL.schedule}>调度</TableHead>
+        <TableHead className={COL.schedule}>{t('调度', 'Scheduling')}</TableHead>
         <TableHead className={COL.priority} {...sortProps('priority')}>
-          {sortable('优先级', 'priority')}
+          {sortable(t('优先级', 'Priority'), 'priority')}
         </TableHead>
         <TableHead className={COL.tier} {...sortProps('tier')}>
-          {sortable('账号等级', 'tier')}
+          {sortable(t('账号等级', 'Tier'), 'tier')}
         </TableHead>
         <TableHead className={COL.quota5h} {...sortProps('usage5h')}>
-          {sortable('5h 额度', 'usage5h')}
+          {sortable(t('5h 额度', '5h quota'), 'usage5h')}
         </TableHead>
         <TableHead className={COL.quota7d} {...sortProps('usage7d')}>
-          {sortable('7d 额度', 'usage7d')}
+          {sortable(t('7d 额度', '7d quota'), 'usage7d')}
         </TableHead>
         <TableHead className={COL.devices} {...sortProps('devices')}>
-          {sortable('设备', 'devices')}
+          {sortable(t('设备', 'Devices'), 'devices')}
         </TableHead>
         <TableHead className={COL.recent} {...sortProps('recent')}>
-          {sortable('最近使用', 'recent')}
+          {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
         <TableHead className={COL.cost} {...sortProps('cost')}>
-          {sortable('累计花费', 'cost')}
+          {sortable(t('累计花费', 'Total cost'), 'cost')}
         </TableHead>
         <TableHead className={COL.action}>
-          <span className="sr-only">操作</span>
+          <span className="sr-only">{t('操作', 'Actions')}</span>
         </TableHead>
       </TableRow>
     </TableHeader>
@@ -160,32 +164,33 @@ export function CredentialRow({
   selected?: boolean
   onSelectedChange?: (next: boolean) => void
 }) {
+  const { t, language } = useI18n()
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameName, setRenameName] = useState(cred.label)
   const [testing, setTesting] = useState(false)
   const actions = useCredentialActions(cred)
-  const evaluation = evaluateCredential(cred, now)
+  const evaluation = evaluateCredential(cred, now, language)
   const { quota } = evaluation
   const u5h = quota.h5.utilization
   const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
-  const policy = devicePolicyMeta(cred.device_limit)
-  const added = relativeTime(cred.created_at, now)
+  const policy = devicePolicyMeta(cred.device_limit, language)
+  const added = relativeTime(cred.created_at, now, language)
 
   return (
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
-        <TableCell colSpan={11} className="whitespace-normal p-0">
-          <article className="space-y-3 p-3 sm:space-y-4 sm:p-5">
+        <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
+          <article className="min-w-0 space-y-3 p-3 sm:space-y-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
                 <Checkbox
                   checked={selected}
                   onCheckedChange={(checked) => onSelectedChange?.(checked)}
                   className="mt-2"
-                  aria-label={`选择 ${cred.label}`}
+                  aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
                 />
               )}
               <div className="min-w-0 flex-1">
@@ -194,12 +199,15 @@ export function CredentialRow({
                 </h3>
                 <p
                   className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground"
-                  title={`添加于 ${formatFullTime(cred.created_at)}`}
+                  title={t(
+                    `添加于 ${formatFullTime(cred.created_at, language)}`,
+                    `Added ${formatFullTime(cred.created_at, language)}`,
+                  )}
                 >
                   <CalendarDaysIcon />
                   <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                   <span aria-hidden="true">·</span>
-                  <span className="min-w-0">添加于 {added}</span>
+                  <span className="min-w-0">{t(`添加于 ${added}`, `Added ${added}`)}</span>
                 </p>
               </div>
               <div className="flex shrink-0 items-start gap-1">
@@ -238,20 +246,20 @@ export function CredentialRow({
             </div>
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
-              <MobileFact label="优先级"><span className="tabular-nums">P{cred.priority}</span></MobileFact>
-              <MobileFact label="账号等级">
+              <MobileFact label={t('优先级', 'Priority')}><span className="tabular-nums">P{cred.priority}</span></MobileFact>
+              <MobileFact label={t('账号等级', 'Tier')}>
                 {cred.tier
                   ? <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>
                   : '—'}
               </MobileFact>
-              <MobileFact label="设备">
+              <MobileFact label={t('设备', 'Devices')}>
                 <Button
                   type="button"
                   size="xs"
                   variant="ghost"
                   onClick={() => setDevicesOpen(true)}
-                  title={`查看已绑定设备 · ${policy.label}策略`}
-                  aria-label={`查看 ${cred.label} 的已绑定设备`}
+                  title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
+                  aria-label={t(`查看 ${cred.label} 的已绑定设备`, `View bound devices for ${cred.label}`)}
                 >
                   <span className="tabular-nums">{cred.device_count}/{effectiveLimit} · {policy.label}</span>
                 </Button>
@@ -267,7 +275,7 @@ export function CredentialRow({
             <Checkbox
               checked={selected}
               onCheckedChange={(checked) => onSelectedChange?.(checked)}
-              aria-label={`选择 ${cred.label}`}
+              aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
             />
           )}
         </TableCell>
@@ -280,8 +288,8 @@ export function CredentialRow({
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                 <span aria-hidden="true">·</span>
-                <span className="min-w-0" title={`添加于 ${formatFullTime(cred.created_at)}`}>
-                  添加于 {added}
+                <span className="min-w-0" title={t(`添加于 ${formatFullTime(cred.created_at, language)}`, `Added ${formatFullTime(cred.created_at, language)}`)}>
+                  {t(`添加于 ${added}`, `Added ${added}`)}
                 </span>
               </span>
             </div>
@@ -291,7 +299,7 @@ export function CredentialRow({
           <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
         </TableCell>
         <TableCell className={COL.priority}>
-          <span className="font-semibold text-sm tabular-nums" title="数值越小，调度优先级越高">
+          <span className="font-semibold text-sm tabular-nums" title={t('数值越小，调度优先级越高', 'Lower values have higher scheduling priority')}>
             P{cred.priority}
           </span>
         </TableCell>
@@ -328,7 +336,7 @@ export function CredentialRow({
             size="xs"
             variant="ghost"
             onClick={() => setDevicesOpen(true)}
-            title={`查看已绑定设备 · ${policy.label}策略`}
+            title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
             aria-haspopup="dialog"
           >
             <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
@@ -336,10 +344,10 @@ export function CredentialRow({
           </Button>
         </TableCell>
         <TableCell className={COL.recent}>
-          {cred.last_used != null ? relativeTime(cred.last_used, now) : '未使用'}
+          {cred.last_used != null ? relativeTime(cred.last_used, now, language) : t('未使用', 'Never used')}
         </TableCell>
         <TableCell className={COL.cost}>
-          <span className="tabular-nums font-medium text-sm" title="累计等价 API 费用">
+          <span className="tabular-nums font-medium text-sm" title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}>
             {formatUsd(cred.cost_total)}
           </span>
         </TableCell>
@@ -398,12 +406,13 @@ function CredentialRowActionsMenu({
   onTest: () => void
   onRequestDelete: () => void
 }) {
+  const { t } = useI18n()
   return (
     <Menu modal={false}>
       <MenuTrigger
         className={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
-        aria-label={`打开 ${cred.label} 操作菜单`}
-        title="账号操作"
+        aria-label={t(`打开 ${cred.label} 操作菜单`, `Open actions for ${cred.label}`)}
+        title={t('账号操作', 'Account actions')}
       >
         <EllipsisIcon />
       </MenuTrigger>
@@ -434,6 +443,7 @@ function RenameCredentialDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const { t } = useI18n()
   const normalizedName = name.trim()
   const unchanged = normalizedName === cred.label.trim()
 
@@ -451,14 +461,14 @@ function RenameCredentialDialog({
           }}
         >
           <DialogHeader>
-            <DialogTitle>重命名账号</DialogTitle>
+            <DialogTitle>{t('重命名账号', 'Rename account')}</DialogTitle>
             <DialogDescription>
-              修改列表中显示的账号名称，不会变更上游凭证。
+              {t('修改列表中显示的账号名称，不会变更上游凭证。', 'Change the account name shown in the list without modifying the upstream credential.')}
             </DialogDescription>
           </DialogHeader>
           <DialogPanel>
             <Field>
-              <FieldLabel htmlFor={`credential-name-${cred.id}`}>账号名称</FieldLabel>
+              <FieldLabel htmlFor={`credential-name-${cred.id}`}>{t('账号名称', 'Account name')}</FieldLabel>
               <Input
                 id={`credential-name-${cred.id}`}
                 value={name}
@@ -474,14 +484,14 @@ function RenameCredentialDialog({
               disabled={actions.rename.isPending}
               onClick={() => onOpenChange(false)}
             >
-              取消
+              {t('取消', 'Cancel')}
             </Button>
             <Button
               type="submit"
               loading={actions.rename.isPending}
               disabled={!normalizedName || unchanged}
             >
-              保存
+              {t('保存', 'Save')}
             </Button>
           </DialogFooter>
         </Form>
@@ -499,6 +509,7 @@ function ScheduleControl({
   actions: CredentialActions
   status: CredentialStatusMeta
 }) {
+  const { language } = useI18n()
   const { toggle } = actions
 
   return (
@@ -509,14 +520,14 @@ function ScheduleControl({
           checked={!cred.disabled}
           onCheckedChange={(enabled) => toggle.mutate(!enabled)}
           disabled={toggle.isPending}
-          title={switchTitle(cred)}
-          aria-label={`${cred.label}：${switchTitle(cred)}`}
+          title={switchTitle(cred, language)}
+          aria-label={`${cred.label}: ${switchTitle(cred, language)}`}
         />
       </div>
       <Tooltip>
         <TooltipTrigger
           className={badgeVariants({ size: 'sm', variant: status.variant })}
-          aria-label={`${status.label}：${status.detail}`}
+          aria-label={`${status.label}: ${status.detail}`}
           aria-live="polite"
         >
           {status.label}
@@ -553,16 +564,23 @@ function ListQuotaMeter({
   requests: number | null
   showLabel?: boolean
 }) {
+  const { t, language, locale } = useI18n()
   const usageSummary = requests == null
     ? '—'
-    : `${requests.toLocaleString('zh-CN')} 次 · ${cost == null ? '—' : formatUsd(cost)}`
+    : t(
+        `${requests.toLocaleString(locale)} 次 · ${cost == null ? '—' : formatUsd(cost)}`,
+        `${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} · ${cost == null ? '—' : formatUsd(cost)}`,
+      )
 
   if (util == null) {
     const expired = freshness === 'expired'
-    const emptyLabel = expired ? '已重置' : '暂无数据'
+    const emptyLabel = expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')
     const emptyDetail = expired && reset != null
-      ? `${label}窗口已于 ${formatFullTime(reset)} 重置，之后暂无新请求`
-      : `${label}额度暂无数据`
+      ? t(
+          `${label}窗口已于 ${formatFullTime(reset, language)} 重置，之后暂无新请求`,
+          `${label} window reset at ${formatFullTime(reset, language)}; there are no newer requests`,
+        )
+      : t(`${label}额度暂无数据`, `No ${label} quota data`)
     return (
       <div
         className="flex w-full flex-col gap-2"
@@ -578,7 +596,7 @@ function ListQuotaMeter({
                   ? 'text-xs text-muted-foreground'
                   : 'font-medium text-foreground text-sm leading-none',
               )}
-              title={`${label}本周期请求数与花费：${usageSummary}`}
+              title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
             >
               {expired ? '—' : usageSummary}
             </span>
@@ -599,7 +617,7 @@ function ListQuotaMeter({
       : 'bg-success'
 
   return (
-    <Meter value={percentage} max={100} title={`${label}额度使用率 ${percentage}%`}>
+    <Meter value={percentage} max={100} title={t(`${label}额度使用率 ${percentage}%`, `${label} quota usage ${percentage}%`)}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-baseline gap-1.5">
           <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>
@@ -610,7 +628,7 @@ function ListQuotaMeter({
                 ? 'text-xs text-muted-foreground'
                 : 'font-medium text-foreground text-sm leading-none',
             )}
-            title={`${label}本周期请求数与花费：${usageSummary}`}
+            title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
           >
             {usageSummary}
           </span>
@@ -624,8 +642,8 @@ function ListQuotaMeter({
   )
 }
 
-function devicePolicyMeta(deviceLimit: number): { label: string; variant: BadgeProps['variant'] } {
-  if (deviceLimit === 0) return { label: '跟随默认', variant: 'secondary' }
-  if (deviceLimit < 0) return { label: '不限', variant: 'outline' }
-  return { label: '自定义', variant: 'info' }
+function devicePolicyMeta(deviceLimit: number, language: Language): { label: string; variant: BadgeProps['variant'] } {
+  if (deviceLimit === 0) return { label: localize(language, '跟随默认', 'Default'), variant: 'secondary' }
+  if (deviceLimit < 0) return { label: localize(language, '不限', 'Unlimited'), variant: 'outline' }
+  return { label: localize(language, '自定义', 'Custom'), variant: 'info' }
 }

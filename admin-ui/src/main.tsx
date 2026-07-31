@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { LanguageProvider } from '@/lib/i18n'
 import './index.css'
 
 // 跟随系统深浅色：给 <html> 切换 .dark（配合 darkMode: 'class'）。
@@ -20,16 +21,18 @@ const queryClient = new QueryClient({
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <ToastProvider position="top-right">
-        <TooltipProvider>
-          <AnchoredToastProvider>
-            <div className="relative isolate min-h-svh">
-              <App />
-            </div>
-          </AnchoredToastProvider>
-        </TooltipProvider>
-      </ToastProvider>
-    </QueryClientProvider>
+    <LanguageProvider>
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider position="top-right">
+          <TooltipProvider>
+            <AnchoredToastProvider>
+              <div className="relative isolate min-h-svh">
+                <App />
+              </div>
+            </AnchoredToastProvider>
+          </TooltipProvider>
+        </ToastProvider>
+      </QueryClientProvider>
+    </LanguageProvider>
   </React.StrictMode>,
 )

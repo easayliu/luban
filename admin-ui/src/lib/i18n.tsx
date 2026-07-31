@@ -13,18 +13,19 @@ export type Language = (typeof LANGUAGES)[number]
 
 const STORAGE_KEY = 'luban.language'
 
-function isLanguage(value: string | null): value is Language {
-  return value === 'zh-CN' || value === 'en'
+export function parseLanguage(value: string | null | undefined): Language | null {
+  if (value === 'zh-CN' || value === 'zh') return 'zh-CN'
+  if (value === 'en-US' || value === 'en') return 'en'
+  return null
 }
 
-function readLanguage(): Language {
+function readLanguage(): Language | null {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (isLanguage(stored)) return stored
+    return parseLanguage(localStorage.getItem(STORAGE_KEY))
   } catch {
     // 存储不可用时保持原有中文默认，不影响页面使用。
   }
-  return 'zh-CN'
+  return null
 }
 
 function persistLanguage(language: Language): void {
@@ -49,21 +50,30 @@ interface I18nContextValue {
 
 const I18nContext = createContext<I18nContextValue | null>(null)
 
-export function LanguageProvider({ children }: { children: ReactNode }) {
-  const [language, setLanguageState] = useState<Language>(readLanguage)
+export function LanguageProvider({
+  children,
+  initialLanguage,
+  persist = true,
+  onLanguageChange,
+}: {
+  children: ReactNode
+  initialLanguage?: Language | null
+  persist?: boolean
+  onLanguageChange?: (language: Language) => void
+}) {
+  const [language, setLanguageState] = useState<Language>(
+    () => initialLanguage ?? (persist ? readLanguage() : null) ?? 'zh-CN',
+  )
 
   const setLanguage = useCallback((next: Language) => {
     setLanguageState(next)
-    persistLanguage(next)
-  }, [])
+    if (persist) persistLanguage(next)
+    onLanguageChange?.(next)
+  }, [onLanguageChange, persist])
 
   const toggleLanguage = useCallback(() => {
-    setLanguageState((current) => {
-      const next = current === 'zh-CN' ? 'en' : 'zh-CN'
-      persistLanguage(next)
-      return next
-    })
-  }, [])
+    setLanguage(language === 'zh-CN' ? 'en' : 'zh-CN')
+  }, [language, setLanguage])
 
   const t = useCallback(
     (chinese: string, english: string) => localize(language, chinese, english),
@@ -75,14 +85,16 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   }, [language])
 
   useEffect(() => {
+    if (!persist) return undefined
     const syncAcrossTabs = (event: StorageEvent) => {
-      if (event.key === STORAGE_KEY && isLanguage(event.newValue)) {
-        setLanguageState(event.newValue)
+      const next = parseLanguage(event.newValue)
+      if (event.key === STORAGE_KEY && next) {
+        setLanguageState(next)
       }
     }
     window.addEventListener('storage', syncAcrossTabs)
     return () => window.removeEventListener('storage', syncAcrossTabs)
-  }, [])
+  }, [persist])
 
   const value = useMemo<I18nContextValue>(() => ({
     language,

@@ -5,7 +5,7 @@ import { useI18n } from '@/lib/i18n'
 export function LanguageSwitcher({ compact = false }: { compact?: boolean }) {
   const { language, toggleLanguage } = useI18n()
   const switchingToEnglish = language === 'zh-CN'
-  const label = switchingToEnglish ? 'Switch interface to English' : '将界面切换为中文'
+  const label = switchingToEnglish ? '切换至英文界面' : 'Switch interface to Chinese'
 
   return (
     <Button

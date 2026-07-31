@@ -19,6 +19,7 @@ import {
   type ForwardingKey,
   type Settings,
 } from '@/api/settings'
+import { useI18n } from '@/lib/i18n'
 import { extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -55,15 +56,22 @@ export function ForwardingSettings({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const { t } = useI18n()
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogPopup className="sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <SlidersHorizontalIcon aria-hidden="true" />
-            转发形态
+            {t('转发策略', 'Forwarding policy')}
           </DialogTitle>
-          <DialogDescription>配置兼容、缓存、限流和错误恢复策略。</DialogDescription>
+          <DialogDescription>
+            {t(
+              '配置兼容、缓存、限流和错误恢复策略。',
+              'Configure compatibility, caching, rate limiting, and error recovery policies.',
+            )}
+          </DialogDescription>
         </DialogHeader>
         <DialogPanel>
           <ForwardingSettingsContent />
@@ -74,13 +82,14 @@ export function ForwardingSettings({
 }
 
 export function ForwardingSettingsContent() {
+  const { t } = useI18n()
   const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
 
   if (settingsQuery.isPending) {
     return (
       <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
         <Spinner className="size-4" />
-        正在加载设置
+        {t('正在加载设置', 'Loading settings')}
       </div>
     )
   }
@@ -88,14 +97,16 @@ export function ForwardingSettingsContent() {
   if (settingsQuery.isError) {
     return (
       <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
-        <p className="text-sm font-medium">无法读取当前设置</p>
+        <p className="text-sm font-medium">
+          {t('无法读取当前设置', 'Unable to load current settings')}
+        </p>
         <Button
           size="sm"
           variant="outline"
           loading={settingsQuery.isFetching}
           onClick={() => settingsQuery.refetch()}
         >
-          重试
+          {t('重试', 'Retry')}
         </Button>
       </div>
     )
@@ -105,111 +116,160 @@ export function ForwardingSettingsContent() {
     <div className="space-y-4">
       <Alert variant="info">
         <InfoIcon aria-hidden="true" />
-        <AlertTitle>必要请求头不受影响</AlertTitle>
+        <AlertTitle>{t('必要请求头不受影响', 'Required headers are unaffected')}</AlertTitle>
         <AlertDescription>
           <p>
-            下列开关不影响必要的 <code className="text-foreground">Authorization</code> 注入。
+            {t('下列开关不影响必要的', 'The following toggles do not affect required')}{' '}
+            <code className="font-mono text-foreground">Authorization</code>{' '}
+            {t('注入。', 'injection.')}
           </p>
         </AlertDescription>
       </Alert>
 
-      <SettingsGroup icon={BadgeCheckIcon} title="身份与订阅">
+      <SettingsGroup icon={BadgeCheckIcon} title={t('身份与订阅', 'Identity & subscription')}>
         <ForwardingToggle
           k="spoof_identity"
-          label="身份一致性"
-          summary="让客户端身份与当前账号、设备保持一致；关闭后原样转发。"
+          label={t('身份一致性', 'Identity consistency')}
+          summary={t(
+            '让客户端身份与当前账号、设备保持一致；关闭后原样转发。',
+            'Keep the client identity consistent with the current account and device; when disabled, forward it unchanged.',
+          )}
         />
         {/* 紧跟「身份一致性」：它是本项的前置开关，挨着放才好一起改。 */}
         <ForwardingToggle
           k="fill_metadata"
-          label="补齐设备身份"
-          summary="请求未携带设备身份时，按当前账号补一份；已携带的不改动。"
-          requires={{ key: 'spoof_identity', label: '身份一致性' }}
+          label={t('补齐设备身份', 'Fill missing device identity')}
+          summary={t(
+            '请求未携带设备身份时，按当前账号补一份；已携带的不改动。',
+            'When a request lacks a device identity, add one for the current account; leave existing values unchanged.',
+          )}
+          requires={{ key: 'spoof_identity', label: t('身份一致性', 'Identity consistency') }}
           description={
             <>
-              官方客户端每条请求都带设备身份，缺失本身就是一处差异。常见于模仿 Claude Code
-              的第三方客户端。补出的身份与「身份一致性」用同一套取值，会话标识优先沿用请求自带的。
+              {t(
+                '官方客户端每条请求都带设备身份，缺失本身就是一处差异。常见于模仿 Claude Code 的第三方客户端。补出的身份与「身份一致性」用同一套取值，会话标识优先沿用请求自带的。',
+                'The official client includes a device identity with every request, so a missing identity is itself a discrepancy. This is common in third-party clients that imitate Claude Code. The generated identity uses the same values as “Identity consistency,” while a session identifier already present in the request takes precedence.',
+              )}
             </>
           }
         />
         <ForwardingToggle
           k="billing_cch"
-          label="订阅计费标识"
-          summary="补齐订阅客户端所需的计费标识。"
+          label={t('订阅计费标识', 'Subscription billing identifier')}
+          summary={t(
+            '补齐订阅客户端所需的计费标识。',
+            'Add the billing identifier required by subscription clients.',
+          )}
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={ServerIcon} title="协议与请求头">
+      <SettingsGroup icon={ServerIcon} title={t('协议与请求头', 'Protocol & request headers')}>
         <ForwardingToggle
           k="merge_beta"
-          label="Beta 标记"
-          summary="合并客户端 Beta 标记并补齐订阅所需标记。"
+          label={t('Beta 标记', 'Beta flags')}
+          summary={t(
+            '合并客户端 Beta 标记并补齐订阅所需标记。',
+            'Merge the client’s Beta flags and add the flags required for subscriptions.',
+          )}
         />
         <ForwardingToggle
           k="fill_client_headers"
-          label="客户端请求头"
-          summary="补齐缺失的版本、编码和请求标识，不覆盖已有值。"
+          label={t('客户端请求头', 'Client request headers')}
+          summary={t(
+            '补齐缺失的版本、编码和请求标识，不覆盖已有值。',
+            'Fill in missing version, encoding, and request identifiers without overwriting existing values.',
+          )}
         />
         <ForwardingToggle
           k="orig_header_case"
-          label="请求头形态"
-          summary="还原官方客户端的请求头拼写与顺序；仅在排查兼容问题时关闭。"
+          label={t('请求头形态', 'Request header shape')}
+          summary={t(
+            '还原官方客户端的请求头拼写与顺序；仅在排查兼容问题时关闭。',
+            'Restore the official client’s request header casing and order; disable only when troubleshooting compatibility issues.',
+          )}
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={DatabaseIcon} title="缓存优化">
+      <SettingsGroup icon={DatabaseIcon} title={t('缓存优化', 'Cache optimization')}>
         <ForwardingToggle
           k="system_shape"
-          label="系统提示词缓存"
-          summary="调整系统提示词分块，提高跨会话缓存复用。"
-          requires={{ key: 'merge_beta', label: '协议与请求头 · Beta 标记' }}
+          label={t('系统提示词缓存', 'System prompt caching')}
+          summary={t(
+            '调整系统提示词分块，提高跨会话缓存复用。',
+            'Adjust system prompt blocks to improve cache reuse across sessions.',
+          )}
+          requires={{
+            key: 'merge_beta',
+            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+          }}
           description={
             <>
-              只调整分块与缓存时间，不改变提示词文本。1 小时缓存写入单价是 5 分钟的 2 倍，
-              但能延长复用时间；无法识别切点时原样转发。
+              {t(
+                '只调整分块与缓存时间，不改变提示词文本。1 小时缓存写入单价是 5 分钟的 2 倍，但能延长复用时间；无法识别切点时原样转发。',
+                'Only block boundaries and cache duration are adjusted; the prompt text is unchanged. A 1-hour cache write costs twice as much as a 5-minute write, but extends the reuse window. Requests are forwarded unchanged when no split point can be identified.',
+              )}
             </>
           }
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={TerminalIcon} title="非官方客户端">
+      <SettingsGroup icon={TerminalIcon} title={t('非官方客户端', 'Third-party clients')}>
         <ForwardingToggle
           k="simulate_cc"
-          label="模拟 Claude Code"
-          summary="让 SDK 和第三方客户端按 Claude Code 请求形态转发。"
-          requires={{ key: 'merge_beta', label: '协议与请求头 · Beta 标记' }}
+          label={t('模拟 Claude Code', 'Emulate Claude Code')}
+          summary={t(
+            '让 SDK 和第三方客户端按 Claude Code 请求形态转发。',
+            'Forward SDK and third-party client requests in the Claude Code request format.',
+          )}
+          requires={{
+            key: 'merge_beta',
+            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+          }}
           description={
             <>
-              仅改写非 Claude Code 请求。开启后会增加系统提示词和客户端请求头，
-              可能提高 Token 成本并改变输出风格。此类请求通常没有设备身份，
-              需先关闭「设备身份校验」。
+              {t(
+                '仅改写非 Claude Code 请求。开启后会增加系统提示词和客户端请求头，可能提高 Token 成本并改变输出风格。此类请求通常没有设备身份，需先关闭「设备身份校验」。',
+                'Only non-Claude Code requests are rewritten. Enabling this adds a system prompt and client request headers, which may increase Token costs and change the output style. These requests usually have no device identity, so disable “Device identity checks” first.',
+              )}
             </>
           }
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={RefreshCwIcon} title="限流与错误恢复">
+      <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>
         <ForwardingToggle
           k="rate_limit_retry"
-          label="429 自动换号"
-          summary="遇到限流后，冷却受限账号或模型，并换用其他账号重试。"
+          label={t('429 自动换号', '429 automatic account switching')}
+          summary={t(
+            '遇到限流后，冷却受限账号或模型，并换用其他账号重试。',
+            'After a rate limit, cool down the affected account or model and retry with another account.',
+          )}
           description={
             <>
-              账号额度耗尽时冷却整个账号；只有当前模型受限时仅冷却该模型。默认分别冷却
-              60 / 30 秒，并优先采用上游等待时间。换号会改绑有设备身份的请求，也可能降低缓存命中率；
-              达到重试上限或没有其他账号时返回 <code className="tabular-nums">429</code>。
+              {t(
+                '账号额度耗尽时冷却整个账号；只有当前模型受限时仅冷却该模型。默认分别冷却 60 / 30 秒，并优先采用上游等待时间。换号会改绑有设备身份的请求，也可能降低缓存命中率；达到重试上限或没有其他账号时返回',
+                'When an account’s quota is exhausted, the entire account is cooled down; when only the current model is limited, only that model is cooled down. The defaults are 60 / 30 seconds respectively, with the upstream wait time taking precedence. Switching accounts rebinds requests that carry a device identity and may also reduce the cache hit rate. When the retry limit is reached or no other account is available, return',
+              )}{' '}
+              <code className="font-mono tabular-nums">429</code>{t('。', '.')}
             </>
           }
         />
         <RetryMax />
         <ForwardingToggle
           k="thinking_signature_retry"
-          label="thinking 签名兜底"
-          summary="账号切换导致历史 thinking 签名失效时，自动降级并重试一次。"
+          label={t('thinking 签名兜底', 'thinking signature fallback')}
+          summary={t(
+            '账号切换导致历史 thinking 签名失效时，自动降级并重试一次。',
+            'When switching accounts invalidates a historical thinking signature, automatically downgrade it and retry once.',
+          )}
           description={
             <>
-              无法验证的历史 <code>thinking</code> 会转为普通文本，并用同一账号重试一次，
-              不会删除原内容。工具续跑仍可能失败；重试会增加一次请求成本，失败时返回原始 400。
+              {t('无法验证的历史', 'Unverifiable historical')}{' '}
+              <code className="font-mono">thinking</code>{' '}
+              {t(
+                '会转为普通文本，并用同一账号重试一次，不会删除原内容。工具续跑仍可能失败；重试会增加一次请求成本，失败时返回原始 400。',
+                'content is converted to plain text and retried once with the same account; the original content is not deleted. Tool continuation may still fail. The retry adds the cost of one request, and a failure returns the original 400 response.',
+              )}
             </>
           }
         />
@@ -220,6 +280,7 @@ export function ForwardingSettingsContent() {
 
 /** 429 后追加尝试的账号数（不含首次请求；0 = 不重试；后端限制在 0~10）。 */
 function RetryMax() {
+  const { language, t } = useI18n()
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const [draft, setDraft] = useState<number | null>(null)
@@ -232,16 +293,26 @@ function RetryMax() {
     mutationFn: (count: number) => setRateLimitRetryMax(count),
     onSuccess: (settings: Settings) => {
       toastManager.add({
-        title: '429 重试策略已更新',
+        title: t('429 重试策略已更新', '429 retry policy updated'),
         description: settings.rate_limit_retry_max > 0
-          ? `最多追加尝试 ${settings.rate_limit_retry_max} 个账号。`
-          : '429 将直接透传，不冷却、不换号。',
+          ? t(
+              `最多追加尝试 ${settings.rate_limit_retry_max} 个账号。`,
+              `Try up to ${settings.rate_limit_retry_max} additional ${settings.rate_limit_retry_max === 1 ? 'account' : 'accounts'}.`,
+            )
+          : t(
+              '429 将直接透传，不冷却、不换号。',
+              '429 responses will pass through unchanged, without cooldown or account switching.',
+            ),
         type: 'success',
       })
       qc.setQueryData(['settings'], settings)
     },
     onError: (error) => {
-      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
     },
   })
 
@@ -252,8 +323,13 @@ function RetryMax() {
     <Field className="p-5">
       <div className="flex w-full flex-wrap items-end justify-between gap-3">
         <div className="min-w-0 space-y-1">
-          <FieldLabel>追加重试账号数</FieldLabel>
-          <FieldDescription>填 2 时最多尝试 3 个账号（含首次）。</FieldDescription>
+          <FieldLabel>{t('追加重试账号数', 'Additional retry accounts')}</FieldLabel>
+          <FieldDescription>
+            {t(
+              '填 2 时最多尝试 3 个账号（含首次）。',
+              'Set this to 2 to try up to 3 accounts in total, including the first.',
+            )}
+          </FieldDescription>
         </div>
         <div className="flex items-center gap-2">
           <NumberField
@@ -265,9 +341,15 @@ function RetryMax() {
             onValueChange={setDraft}
           >
             <NumberFieldGroup>
-              <NumberFieldDecrement />
-              <NumberFieldInput aria-label="429 追加重试账号数" />
-              <NumberFieldIncrement />
+              <NumberFieldDecrement
+                aria-label={t('减少 429 追加重试账号数', 'Decrease additional accounts retried after 429')}
+              />
+              <NumberFieldInput
+                aria-label={t('429 追加重试账号数', 'Additional accounts to retry after 429')}
+              />
+              <NumberFieldIncrement
+                aria-label={t('增加 429 追加重试账号数', 'Increase additional accounts retried after 429')}
+              />
             </NumberFieldGroup>
           </NumberField>
           <Button
@@ -277,7 +359,7 @@ function RetryMax() {
             onClick={() => save.mutate(count)}
           >
             <SaveIcon />
-            保存
+            {t('保存', 'Save')}
           </Button>
         </div>
       </div>
@@ -304,6 +386,7 @@ function ForwardingToggle({
    */
   requires?: { key: ForwardingKey; label: string }
 }) {
+  const { language, t } = useI18n()
   const id = useId()
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
@@ -314,7 +397,9 @@ function ForwardingToggle({
     mutationFn: (next: boolean) => setForwarding(k, next),
     onSuccess: (settings: Settings) => {
       toastManager.add({
-        title: `${label}${settings[k] ? '已开启' : '已关闭'}`,
+        title: settings[k]
+          ? t(`${label}已开启`, `${label} enabled`)
+          : t(`${label}已关闭`, `${label} disabled`),
         description: summary,
         type: 'success',
       })
@@ -322,7 +407,11 @@ function ForwardingToggle({
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
     onError: (error) => {
-      toastManager.add({ title: '保存失败', description: extractError(error), type: 'error' })
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
     },
   })
 
@@ -332,7 +421,9 @@ function ForwardingToggle({
         <div className="min-w-0 space-y-1">
           <FieldLabel htmlFor={id}>{label}</FieldLabel>
           <FieldDescription className="leading-5">
-            {blocked ? `需先开启「${requires.label}」` : summary}
+            {blocked
+              ? t(`需先开启「${requires.label}」`, `Enable “${requires.label}” first`)
+              : summary}
           </FieldDescription>
         </div>
         <Switch
@@ -345,8 +436,11 @@ function ForwardingToggle({
       {description && (
         <details className="group text-xs text-muted-foreground">
           <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm font-medium transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-            影响与限制
-            <ChevronDownIcon className="size-3 transition-transform group-open:rotate-180" />
+            {t('影响与限制', 'Impact & limitations')}
+            <ChevronDownIcon
+              aria-hidden="true"
+              className="size-3 transition-transform group-open:rotate-180"
+            />
           </summary>
           <div className="mt-2 border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
             {description}

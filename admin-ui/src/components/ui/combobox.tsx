@@ -4,6 +4,7 @@ import { Combobox as ComboboxPrimitive } from "@base-ui/react/combobox";
 import { CheckIcon, ChevronsUpDownIcon, SearchIcon } from "lucide-react";
 import type * as React from "react";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 import {
   selectTriggerIconClassName,
   selectTriggerVariants,
@@ -50,8 +51,8 @@ export function ComboboxValue({
 export function ComboboxPopup({
   className,
   children,
-  inputPlaceholder = "搜索…",
-  emptyText = "没有匹配项",
+  inputPlaceholder,
+  emptyText,
   side = "bottom",
   sideOffset = 4,
   align = "start",
@@ -64,6 +65,12 @@ export function ComboboxPopup({
   sideOffset?: ComboboxPrimitive.Positioner.Props["sideOffset"];
   align?: ComboboxPrimitive.Positioner.Props["align"];
 }): React.ReactElement {
+  const { t } = useI18n();
+  const resolvedInputPlaceholder =
+    inputPlaceholder === undefined ? t("搜索…", "Search…") : inputPlaceholder;
+  const resolvedEmptyText =
+    emptyText === undefined ? t("没有匹配项", "No matching options") : emptyText;
+
   return (
     <ComboboxPrimitive.Portal>
       <ComboboxPrimitive.Positioner
@@ -83,15 +90,15 @@ export function ComboboxPopup({
           <div className="relative z-10 flex min-h-9 items-center gap-2 border-b px-2.5 sm:min-h-8">
             <SearchIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
             <ComboboxPrimitive.Input
-              aria-label="搜索选项"
+              aria-label={t("搜索选项", "Search options")}
               autoComplete="off"
               className="min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground/72 sm:text-sm"
-              placeholder={inputPlaceholder}
+              placeholder={resolvedInputPlaceholder}
             />
           </div>
           <ComboboxPrimitive.Empty className="relative z-10">
             <div className="px-3 py-4 text-center text-muted-foreground text-sm">
-              {emptyText}
+              {resolvedEmptyText}
             </div>
           </ComboboxPrimitive.Empty>
           <ComboboxPrimitive.List

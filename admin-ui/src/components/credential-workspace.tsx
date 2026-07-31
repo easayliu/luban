@@ -58,6 +58,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/c
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
+import { useI18n } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
 import { cn, extractError } from '@/lib/utils'
 
@@ -81,44 +82,67 @@ export type CredentialPageSize = (typeof CREDENTIAL_PAGE_SIZES)[number]
 export const CREDENTIAL_VIEW_MODES = ['card', 'list'] as const
 
 const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
+  size,
   value: String(size),
-  label: `${size} 个`,
 }))
+
+type LocalizedLabel = readonly [chinese: string, english: string]
 
 const FILTERS: {
   key: CredentialFilterKey
-  label: string
+  label: LocalizedLabel
   match: (evaluation: CredentialEvaluation) => boolean
 }[] = [
-  { key: 'all', label: '全部', match: () => true },
+  { key: 'all', label: ['全部', 'All'], match: () => true },
   {
     key: 'schedulable',
-    label: '可调度',
+    label: ['可调度', 'Schedulable'],
     match: (evaluation) => evaluation.schedulable,
   },
   {
     key: 'attention',
-    label: '需处理',
+    label: ['需处理', 'Needs attention'],
     match: (evaluation) => evaluation.needsAttention,
   },
-  { key: 'enabled', label: '启用', match: ({ credential }) => !credential.disabled },
-  { key: 'disabled', label: '停用', match: ({ credential }) => credential.disabled },
-  { key: 'abnormal', label: '异常（已封禁）', match: ({ credential }) => !!credential.ban_reason },
-  { key: 'nearLimit', label: '额度风险', match: (evaluation) => evaluation.quotaRisk },
+  { key: 'enabled', label: ['启用', 'Enabled'], match: ({ credential }) => !credential.disabled },
+  { key: 'disabled', label: ['停用', 'Disabled'], match: ({ credential }) => credential.disabled },
+  {
+    key: 'abnormal',
+    label: ['异常（已封禁）', 'Abnormal (banned)'],
+    match: ({ credential }) => !!credential.ban_reason,
+  },
+  { key: 'nearLimit', label: ['额度风险', 'Quota risk'], match: (evaluation) => evaluation.quotaRisk },
   {
     key: 'cooldown',
-    label: '冷却中',
+    label: ['冷却中', 'Cooling down'],
     match: ({ credential }) => !credential.disabled && credential.rate_limited_secs > 0,
   },
-  { key: 'hasDevice', label: '已绑定设备', match: ({ credential }) => credential.device_count > 0 },
+  {
+    key: 'hasDevice',
+    label: ['已绑定设备', 'Devices linked'],
+    match: ({ credential }) => credential.device_count > 0,
+  },
   {
     key: 'deviceFull',
-    label: '设备已满',
+    label: ['设备已满', 'Device limit reached'],
     match: ({ credential }) =>
       credential.device_limit_effective > 0
       && credential.device_count >= credential.device_limit_effective,
   },
 ]
+
+const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
+  priority: ['优先级', 'Priority'],
+  status: ['状态', 'Status'],
+  name: ['名称', 'Name'],
+  tier: ['套餐', 'Plan'],
+  usage5h: ['5h 使用率', '5h usage'],
+  usage7d: ['7d 使用率', '7d usage'],
+  devices: ['设备数', 'Devices'],
+  cost: ['累计花费', 'Total cost'],
+  recent: ['最近使用', 'Last used'],
+  created: ['添加时间', 'Date added'],
+}
 
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
 
@@ -201,6 +225,7 @@ export interface CredentialWorkspaceProps {
  * 列表与分页在两处独立演进后产生视觉和交互差异。
  */
 export function CredentialWorkspace({ data, state, actions }: CredentialWorkspaceProps) {
+  const { language, locale, t } = useI18n()
   const {
     credentials,
     isLoading,
@@ -222,9 +247,23 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const pool = credentials ?? []
   const debouncedQuery = useDebounced(query)
   const now = useNowSeconds()
+  const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
+  const formatNumber = (value: number) => numberFormatter.format(value)
+  const filterItems = useMemo(
+    () => FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
+    [t],
+  )
+  const sortItems = useMemo(
+    () => SORTS.map(({ key }) => ({ key, label: t(...SORT_LABELS[key]) })),
+    [t],
+  )
+  const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
+    ?? t(...FILTERS[0].label)
+  const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
+    ?? t(...SORT_LABELS.priority)
   const evaluatedPool = useMemo(
-    () => pool.map((credential) => evaluateCredential(credential, now)),
-    [pool, now],
+    () => pool.map((credential) => evaluateCredential(credential, now, language)),
+    [pool, now, language],
   )
 
   const sorted = useMemo(() => {
@@ -238,8 +277,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       sort,
       dir,
       now,
+      language,
     )
-  }, [evaluatedPool, sort, dir, filter, debouncedQuery, now])
+  }, [evaluatedPool, sort, dir, filter, debouncedQuery, now, language])
 
   const metrics = useMemo(() => {
     const filterCounts: Record<CredentialFilterKey, number> = {
@@ -325,23 +365,63 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
   const attentionStatus = [
-    abnormalCount > 0 ? `${abnormalCount} 异常` : '',
-    metrics.activeOverageCount > 0 ? `${metrics.activeOverageCount} 超额` : '',
-    metrics.unknownOverageCount > 0 ? `${metrics.unknownOverageCount} 超额待确认` : '',
-    cooldownCount > 0 ? `${cooldownCount} 冷却` : '',
-    metrics.nearLimitCount > 0 ? `${metrics.nearLimitCount} 额度` : '',
+    abnormalCount > 0
+      ? t(`${formatNumber(abnormalCount)} 异常`, `${formatNumber(abnormalCount)} banned`)
+      : '',
+    metrics.activeOverageCount > 0
+      ? t(
+          `${formatNumber(metrics.activeOverageCount)} 超额`,
+          `${formatNumber(metrics.activeOverageCount)} over limit`,
+        )
+      : '',
+    metrics.unknownOverageCount > 0
+      ? t(
+          `${formatNumber(metrics.unknownOverageCount)} 超额待确认`,
+          `${formatNumber(metrics.unknownOverageCount)} pending confirmation`,
+        )
+      : '',
+    cooldownCount > 0
+      ? t(`${formatNumber(cooldownCount)} 冷却`, `${formatNumber(cooldownCount)} cooling down`)
+      : '',
+    metrics.nearLimitCount > 0
+      ? t(`${formatNumber(metrics.nearLimitCount)} 额度`, `${formatNumber(metrics.nearLimitCount)} near quota`)
+      : '',
   ].filter(Boolean).join(' · ') || undefined
   const quotaRiskStatus = [
-    metrics.activeOverageCount > 0 ? `${metrics.activeOverageCount} 超额` : '',
-    metrics.unknownOverageCount > 0 ? `${metrics.unknownOverageCount} 待确认` : '',
-    metrics.nearLimitCount > 0 ? `${metrics.nearLimitCount} 将满` : '',
+    metrics.activeOverageCount > 0
+      ? t(
+          `${formatNumber(metrics.activeOverageCount)} 超额`,
+          `${formatNumber(metrics.activeOverageCount)} over limit`,
+        )
+      : '',
+    metrics.unknownOverageCount > 0
+      ? t(
+          `${formatNumber(metrics.unknownOverageCount)} 待确认`,
+          `${formatNumber(metrics.unknownOverageCount)} pending`,
+        )
+      : '',
+    metrics.nearLimitCount > 0
+      ? t(
+          `${formatNumber(metrics.nearLimitCount)} 将满`,
+          `${formatNumber(metrics.nearLimitCount)} near limit`,
+        )
+      : '',
   ].filter(Boolean).join(' · ') || undefined
   const deviceStatus = fullDeviceCount > 0
-    ? `${fullDeviceCount} 个账号已满`
+    ? t(
+        `${formatNumber(fullDeviceCount)} 个账号已满`,
+        `${formatNumber(fullDeviceCount)} ${fullDeviceCount === 1 ? 'account' : 'accounts'} at limit`,
+      )
     : metrics.unlimitedDeviceAccounts > 0
-      ? `${metrics.unlimitedDeviceAccounts} 个不限额账号`
+      ? t(
+          `${formatNumber(metrics.unlimitedDeviceAccounts)} 个不限额账号`,
+          `${formatNumber(metrics.unlimitedDeviceAccounts)} unlimited ${metrics.unlimitedDeviceAccounts === 1 ? 'account' : 'accounts'}`,
+        )
       : metrics.deviceCapacity > 0
-        ? `共 ${metrics.deviceCapacity} 个名额`
+        ? t(
+            `共 ${formatNumber(metrics.deviceCapacity)} 个名额`,
+            `${formatNumber(metrics.deviceCapacity)} ${metrics.deviceCapacity === 1 ? 'slot' : 'slots'} total`,
+          )
         : undefined
 
   const clearSelection = () => actions.onSelectedChange(new Set())
@@ -374,9 +454,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     <div className="space-y-4 sm:space-y-6" data-slot="credential-workspace">
       <section className="flex items-center justify-between gap-4" aria-labelledby="page-title">
         <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight sm:text-xl">
-          账号池
+          {t('账号池', 'Account pool')}
         </h1>
-        <div className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground sm:text-xs">
+        <div
+          className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground sm:text-xs"
+          aria-live="polite"
+          aria-atomic="true"
+        >
           {isRefetchError ? (
             <>
               <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
@@ -385,7 +469,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 onClick={actions.onRetry}
               >
-                刷新失败，重试
+                {t('刷新失败，重试', 'Refresh failed. Retry')}
               </button>
             </>
           ) : (
@@ -395,26 +479,42 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               ) : (
                 <span className="size-1.5 rounded-full bg-success" aria-hidden />
               )}
-              <span title="每 30 秒自动刷新">30 秒刷新</span>
+              <span title={t('每 30 秒自动刷新', 'Refreshes automatically every 30 seconds')}>
+                {t('30 秒刷新', '30s refresh')}
+              </span>
             </>
           )}
         </div>
       </section>
 
       {isLoading ? (
-        <section aria-label="正在加载账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4">
+        <section
+          aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
+          className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4"
+        >
           <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
           <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
           <OverviewMetricSkeleton className="border-r" />
           <OverviewMetricSkeleton />
         </section>
       ) : count > 0 && (
-        <section aria-label="账号池概览" className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4">
+        <section
+          aria-label={t('账号池概览', 'Account pool overview')}
+          className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4"
+        >
           <OverviewMetric
             className="border-r border-b lg:border-b-0"
-            label="可调度账号"
-            value={`${schedulableCount}/${count}`}
-            status={schedulableCount < count ? `${count - schedulableCount} 暂不可用` : `${enabledCount} 已启用`}
+            label={t('可调度账号', 'Schedulable accounts')}
+            value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
+            status={schedulableCount < count
+              ? t(
+                  `${formatNumber(count - schedulableCount)} 暂不可用`,
+                  `${formatNumber(count - schedulableCount)} unavailable`,
+                )
+              : t(
+                  `${formatNumber(enabledCount)} 已启用`,
+                  `${formatNumber(enabledCount)} enabled`,
+                )}
             icon={ShieldCheckIcon}
             tone={schedulableCount > 0 ? 'ok' : 'bad'}
             active={filter === 'schedulable'}
@@ -422,8 +522,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           />
           <OverviewMetric
             className="border-b lg:border-r lg:border-b-0"
-            label="需处理"
-            value={attentionCount}
+            label={t('需处理', 'Needs attention')}
+            value={formatNumber(attentionCount)}
             status={attentionStatus}
             icon={TriangleAlertIcon}
             tone={abnormalCount > 0 || metrics.activeOverageCount > 0
@@ -436,8 +536,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           />
           <OverviewMetric
             className="border-r"
-            label="额度风险"
-            value={quotaRiskCount}
+            label={t('额度风险', 'Quota risk')}
+            value={formatNumber(quotaRiskCount)}
             status={quotaRiskStatus}
             icon={RadioIcon}
             tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
@@ -445,8 +545,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             onClick={() => selectMetric('nearLimit')}
           />
           <OverviewMetric
-            label="绑定设备"
-            value={metrics.deviceCount}
+            label={t('绑定设备', 'Linked devices')}
+            value={formatNumber(metrics.deviceCount)}
             status={deviceStatus}
             icon={SmartphoneIcon}
             tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
@@ -457,9 +557,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       )}
 
       <section className="min-w-0" aria-labelledby="account-list-title">
-        <h2 id="account-list-title" className="sr-only">账号列表</h2>
+        <h2 id="account-list-title" className="sr-only">{t('账号列表', 'Account list')}</h2>
         <p className="sr-only" aria-live="polite">
-          {filtering ? `筛选出 ${total} 个，共 ${count} 个账号` : `共 ${count} 个账号`}
+          {filtering
+            ? t(
+                `筛选出 ${formatNumber(total)} 个，共 ${formatNumber(count)} 个账号`,
+                `${formatNumber(total)} ${total === 1 ? 'match' : 'matches'} out of ${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
+              )
+            : t(
+                `共 ${formatNumber(count)} 个账号`,
+                `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'} total`,
+              )}
         </p>
         <div className="min-w-0 space-y-3 sm:space-y-4">
           {count > 0 && (
@@ -470,12 +578,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     <InputGroupInput
                       value={query}
                       onChange={(event) => changeQuery(event.target.value)}
-                      placeholder="搜索名称或 #id"
-                      aria-label="搜索账号"
+                      placeholder={t('搜索名称或 #id', 'Search name or #id')}
+                      aria-label={t('搜索账号', 'Search accounts')}
                     />
                     {query && (
                       <InputGroupAddon align="inline-end">
-                        <Button size="icon-xs" variant="ghost" onClick={() => changeQuery('')} aria-label="清除搜索">
+                        <Button
+                          size="icon-xs"
+                          variant="ghost"
+                          onClick={() => changeQuery('')}
+                          aria-label={t('清除搜索', 'Clear search')}
+                        >
                           <XIcon />
                         </Button>
                       </InputGroupAddon>
@@ -486,7 +599,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <ToolbarGroup className="grid min-w-0 grid-cols-2 sm:flex sm:flex-wrap">
                     <Menu>
                       <MenuTrigger
-                        aria-label={`筛选：${FILTERS.find((item) => item.key === filter)!.label}`}
+                        aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
                         className={cn(
                           buttonVariants({ variant: filter === 'all' ? 'outline' : 'secondary' }),
                           'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
@@ -494,17 +607,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       >
                         <ListFilterIcon />
                         <span className="min-w-0 truncate">
-                          {FILTERS.find((item) => item.key === filter)!.label}
+                          {activeFilterLabel}
                         </span>
                       </MenuTrigger>
                       <MenuPopup align="end" className="w-52">
                         <MenuRadioGroup value={filter}>
-                          {FILTERS.map((item) => (
+                          {filterItems.map((item) => (
                             <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
                               <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
                                 <span>{item.label}</span>
                                 <span className="tnum text-xs text-muted-foreground">
-                                  {metrics.filterCounts[item.key]}
+                                  {formatNumber(metrics.filterCounts[item.key])}
                                 </span>
                               </span>
                             </MenuRadioItem>
@@ -515,7 +628,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
                     <Menu>
                       <MenuTrigger
-                        aria-label={`排序：${SORTS.find((item) => item.key === sort)!.label}，${dir === 'asc' ? '升序' : '降序'}`}
+                        aria-label={t(
+                          `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
+                          `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
+                        )}
                         className={cn(
                           buttonVariants({ variant: 'outline' }),
                           'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
@@ -523,21 +639,23 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       >
                         <ArrowUpDownIcon />
                         <span className="min-w-0 truncate max-[22rem]:hidden">
-                          {SORTS.find((item) => item.key === sort)!.label} {dir === 'asc' ? '↑' : '↓'}
+                          {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
                         </span>
                         <span className="hidden shrink-0 max-[22rem]:inline">
-                          排序 {dir === 'asc' ? '↑' : '↓'}
+                          {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
                         </span>
                       </MenuTrigger>
                       <MenuPopup align="end" className="w-48">
                         <MenuRadioGroup value={sort}>
-                          {SORTS.map((item) => (
+                          {sortItems.map((item) => (
                             <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
                               <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
                                 <span>{item.label}</span>
                                 {sort === item.key && (
                                   <span className="text-xs text-muted-foreground">
-                                    {dir === 'asc' ? '升序' : '降序'}
+                                    {dir === 'asc'
+                                      ? t('升序', 'Ascending')
+                                      : t('降序', 'Descending')}
                                   </span>
                                 )}
                               </span>
@@ -557,13 +675,21 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                         if (next === 'card' || next === 'list') actions.onViewChange(next)
                       }}
                       variant="outline"
-                      aria-label="账号视图"
+                      aria-label={t('账号视图', 'Account view')}
                     >
-                      <ToggleGroupItem value="card" aria-label="卡片视图" title="卡片视图">
+                      <ToggleGroupItem
+                        value="card"
+                        aria-label={t('卡片视图', 'Card view')}
+                        title={t('卡片视图', 'Card view')}
+                      >
                         <LayoutGridIcon />
                       </ToggleGroupItem>
                       <ToggleGroupSeparator />
-                      <ToggleGroupItem value="list" aria-label="列表视图" title="列表视图">
+                      <ToggleGroupItem
+                        value="list"
+                        aria-label={t('列表视图', 'List view')}
+                        title={t('列表视图', 'List view')}
+                      >
                         <ListIcon />
                       </ToggleGroupItem>
                     </ToggleGroup>
@@ -596,8 +722,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               <Empty>
                 <EmptyHeader>
                   <EmptyMedia variant="icon"><SearchIcon /></EmptyMedia>
-                  <EmptyTitle>没有符合条件的账号</EmptyTitle>
-                  <EmptyDescription>尝试清除当前筛选条件或搜索关键字。</EmptyDescription>
+                  <EmptyTitle>{t('没有符合条件的账号', 'No matching accounts')}</EmptyTitle>
+                  <EmptyDescription>
+                    {t(
+                      '尝试清除当前筛选条件或搜索关键字。',
+                      'Try clearing the current filters or search terms.',
+                    )}
+                  </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
                   <Button
@@ -607,14 +738,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       changeFilter('all')
                     }}
                   >
-                    清除筛选与搜索
+                    {t('清除筛选与搜索', 'Clear filters and search')}
                   </Button>
                 </EmptyContent>
               </Empty>
             </Card>
           ) : view === 'list' ? (
-            <Table variant="card" className="xl:min-w-[72rem]">
-              <TableCaption className="sr-only">账号列表</TableCaption>
+            <Table variant="card" className="table-fixed xl:table-auto xl:min-w-[72rem]">
+              <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
               <CredentialListHeader
                 selectable
                 sort={sort}
@@ -689,6 +820,16 @@ function AccountPagination({
   onPageChange: (page: number) => void
   onPageSizeChange: (pageSize: CredentialPageSize) => void
 }) {
+  const { locale, t } = useI18n()
+  const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
+  const formatNumber = (value: number) => numberFormatter.format(value)
+  const pageSizeItems = useMemo(
+    () => PAGE_SIZE_ITEMS.map(({ size, value }) => ({
+      value,
+      label: t(`${numberFormatter.format(size)} 个`, `${numberFormatter.format(size)} items`),
+    })),
+    [numberFormatter, t],
+  )
   const from = (page - 1) * pageSize + 1
   const to = Math.min(page * pageSize, total)
   const start = Math.max(1, Math.min(page - 2, pageCount - 4))
@@ -702,13 +843,16 @@ function AccountPagination({
     <div className="grid grid-cols-[1fr_auto] items-center gap-3 text-xs text-muted-foreground md:grid-cols-[1fr_auto_1fr]">
       <span className="min-w-0">
         <span className="sm:hidden">
-          <span className="tnum text-foreground">{from}–{to}</span>
+          <span className="tnum text-foreground">{formatNumber(from)}–{formatNumber(to)}</span>
           {' / '}
-          <span className="tnum text-foreground">{total}</span>
+          <span className="tnum text-foreground">{formatNumber(total)}</span>
         </span>
         <span className="hidden sm:inline">
-          第 <span className="tnum text-foreground">{from}-{to}</span> 个，共{' '}
-          <span className="tnum text-foreground">{total}</span> 个账号
+          {t('第 ', 'Showing ')}
+          <span className="tnum text-foreground">{formatNumber(from)}–{formatNumber(to)}</span>
+          {t(' 个，共 ', ' of ')}
+          <span className="tnum text-foreground">{formatNumber(total)}</span>
+          {t(' 个账号', ` ${total === 1 ? 'account' : 'accounts'}`)}
         </span>
       </span>
       <CossPagination className="col-span-2 row-start-2 justify-center md:col-span-1 md:col-start-2 md:row-start-1">
@@ -719,7 +863,7 @@ function AccountPagination({
               size="icon-sm"
               className={cn(page <= 1 && 'pointer-events-none opacity-50')}
               aria-disabled={page <= 1}
-              aria-label="上一页"
+              aria-label={t('上一页', 'Previous page')}
               onClick={(event) => navigate(event, page - 1)}
             >
               <ChevronLeftIcon />
@@ -731,14 +875,20 @@ function AccountPagination({
                 href="#"
                 size="icon-sm"
                 isActive={item === page}
+                aria-label={t(
+                  `第 ${formatNumber(item)} 页`,
+                  `Page ${formatNumber(item)}`,
+                )}
                 onClick={(event) => navigate(event, item)}
               >
-                <span className="tnum">{item}</span>
+                <span className="tnum">{formatNumber(item)}</span>
               </PaginationLink>
             </PaginationItem>
           ))}
           <PaginationItem className="sm:hidden">
-            <span className="tnum px-2 text-foreground">{page} / {pageCount}</span>
+            <span className="tnum px-2 text-foreground">
+              {formatNumber(page)} / {formatNumber(pageCount)}
+            </span>
           </PaginationItem>
           <PaginationItem>
             <PaginationLink
@@ -746,7 +896,7 @@ function AccountPagination({
               size="icon-sm"
               className={cn(page >= pageCount && 'pointer-events-none opacity-50')}
               aria-disabled={page >= pageCount}
-              aria-label="下一页"
+              aria-label={t('下一页', 'Next page')}
               onClick={(event) => navigate(event, page + 1)}
             >
               <ChevronRightIcon />
@@ -755,9 +905,9 @@ function AccountPagination({
         </PaginationContent>
       </CossPagination>
       <div className="row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
-        <span className="max-sm:sr-only">每页</span>
+        <span className="max-sm:sr-only">{t('每页', 'Per page')}</span>
         <Select
-          items={PAGE_SIZE_ITEMS}
+          items={pageSizeItems}
           value={String(pageSize)}
           onValueChange={(value) => {
             const next = Number(value)
@@ -766,11 +916,15 @@ function AccountPagination({
             }
           }}
         >
-          <SelectTrigger aria-label="每页账号数" size="sm" className="min-w-20">
+          <SelectTrigger
+            aria-label={t('每页账号数', 'Accounts per page')}
+            size="sm"
+            className="min-w-20"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectPopup align="end">
-            {PAGE_SIZE_ITEMS.map((item) => (
+            {pageSizeItems.map((item) => (
               <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
             ))}
           </SelectPopup>
@@ -781,30 +935,43 @@ function AccountPagination({
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
+  const { t } = useI18n()
   return (
     <Empty>
       <EmptyHeader>
         <EmptyMedia variant="icon"><PlusIcon /></EmptyMedia>
-        <EmptyTitle>建立第一个调度账号</EmptyTitle>
-        <EmptyDescription>完成 Claude OAuth 授权后，账号会加入当前网关的调度池。</EmptyDescription>
+        <EmptyTitle>{t('建立第一个调度账号', 'Add your first schedulable account')}</EmptyTitle>
+        <EmptyDescription>
+          {t(
+            '完成 Claude OAuth 授权后，账号会加入当前网关的调度池。',
+            'After Claude OAuth authorization, the account joins this gateway’s scheduling pool.',
+          )}
+        </EmptyDescription>
       </EmptyHeader>
       <EmptyContent>
-        <Button onClick={onAdd}><PlusIcon />添加第一个账号</Button>
+        <Button onClick={onAdd}>
+          <PlusIcon />
+          {t('添加第一个账号', 'Add first account')}
+        </Button>
       </EmptyContent>
     </Empty>
   )
 }
 
 function ErrorState({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  const { language, t } = useI18n()
   return (
     <Empty role="alert">
       <EmptyHeader>
         <EmptyMedia variant="icon"><TriangleAlertIcon /></EmptyMedia>
-        <EmptyTitle>暂时无法读取账号</EmptyTitle>
-        <EmptyDescription className="break-words">{extractError(error)}</EmptyDescription>
+        <EmptyTitle>{t('暂时无法读取账号', 'Unable to load accounts')}</EmptyTitle>
+        <EmptyDescription className="break-words">{extractError(error, language)}</EmptyDescription>
       </EmptyHeader>
       <EmptyContent>
-        <Button variant="outline" onClick={onRetry}><RefreshCwIcon />重新加载</Button>
+        <Button variant="outline" onClick={onRetry}>
+          <RefreshCwIcon />
+          {t('重新加载', 'Reload')}
+        </Button>
       </EmptyContent>
     </Empty>
   )

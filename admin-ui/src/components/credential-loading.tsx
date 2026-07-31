@@ -8,6 +8,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useI18n } from '@/lib/i18n'
 
 export function CredentialLoadingState({
   view, selectable = false,
@@ -15,9 +16,16 @@ export function CredentialLoadingState({
   view: 'card' | 'list'
   selectable?: boolean
 }) {
+  const { t } = useI18n()
   return (
-    <div role="status" aria-live="polite" aria-label={view === 'card' ? '正在加载账号卡片' : '正在加载账号列表'}>
-      <span className="sr-only">加载中</span>
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label={view === 'card'
+        ? t('正在加载账号卡片', 'Loading account cards')
+        : t('正在加载账号列表', 'Loading account list')}
+    >
+      <span className="sr-only">{t('加载中', 'Loading')}</span>
       {view === 'card'
         ? <CardSkeletons selectable={selectable} />
         : <TableSkeletons selectable={selectable} />}

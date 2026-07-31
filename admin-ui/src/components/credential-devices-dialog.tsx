@@ -13,6 +13,7 @@ import {
   type Credential,
   type DeviceBinding,
 } from '@/api/credentials'
+import { useI18n } from '@/lib/i18n'
 import {
   copyText,
   extractError,
@@ -72,10 +73,14 @@ import { toastManager } from '@/components/ui/toast'
 
 type LimitPolicy = 'default' | 'unlimited' | 'custom'
 
-const LIMIT_POLICY_ITEMS: { value: LimitPolicy; label: string }[] = [
-  { value: 'default', label: '跟随全局默认' },
-  { value: 'unlimited', label: '不限设备数' },
-  { value: 'custom', label: '自定义上限' },
+const LIMIT_POLICY_ITEMS: {
+  value: LimitPolicy
+  chinese: string
+  english: string
+}[] = [
+  { value: 'default', chinese: '跟随全局默认', english: 'Use global default' },
+  { value: 'unlimited', chinese: '不限设备数', english: 'Unlimited devices' },
+  { value: 'custom', chinese: '自定义上限', english: 'Custom limit' },
 ]
 
 function policyFromLimit(limit: number): LimitPolicy {
@@ -84,10 +89,10 @@ function policyFromLimit(limit: number): LimitPolicy {
   return 'custom'
 }
 
-function policyMeta(deviceLimit: number): { label: string; variant: BadgeProps['variant'] } {
-  if (deviceLimit === 0) return { label: '跟随默认', variant: 'secondary' }
-  if (deviceLimit < 0) return { label: '不限', variant: 'outline' }
-  return { label: '自定义', variant: 'info' }
+function policyVariant(deviceLimit: number): BadgeProps['variant'] {
+  if (deviceLimit === 0) return 'secondary'
+  if (deviceLimit < 0) return 'outline'
+  return 'info'
 }
 
 export function CredentialDevicesDialog({
@@ -101,6 +106,7 @@ export function CredentialDevicesDialog({
   onOpenChange: (open: boolean) => void
   limit: CredentialActions['limit']
 }) {
+  const { t, locale } = useI18n()
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitPolicy, setLimitPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.device_limit))
   const [customLimit, setCustomLimit] = useState(Math.max(1, cred.device_limit))
@@ -111,17 +117,45 @@ export function CredentialDevicesDialog({
   })
 
   const currentDeviceCount = devices.data?.length ?? cred.device_count
+  const formattedCurrentDeviceCount = currentDeviceCount.toLocaleString(locale)
+  const currentDeviceNoun = currentDeviceCount === 1 ? 'device' : 'devices'
+  const limitPolicyItems = LIMIT_POLICY_ITEMS.map((item) => ({
+    value: item.value,
+    label: t(item.chinese, item.english),
+  }))
   const effectiveLimit = cred.device_limit_effective > 0
-    ? `${cred.device_limit_effective} 台`
-    : '不限'
-  const currentPolicy = policyMeta(cred.device_limit)
+    ? t(
+      `${cred.device_limit_effective.toLocaleString(locale)} 台`,
+      `${cred.device_limit_effective.toLocaleString(locale)} ${cred.device_limit_effective === 1 ? 'device' : 'devices'}`,
+    )
+    : t('不限', 'Unlimited')
+  const currentPolicy = {
+    label: cred.device_limit === 0
+      ? t('跟随默认', 'Use default')
+      : cred.device_limit < 0
+        ? t('不限', 'Unlimited')
+        : t('自定义', 'Custom'),
+    variant: policyVariant(cred.device_limit),
+  }
   const deviceStatus = devices.isPending
-    ? { label: '正在读取', variant: 'secondary' as const }
+    ? { label: t('正在读取', 'Loading'), variant: 'secondary' as const }
     : devices.error
-      ? { label: '读取失败', variant: 'error' as const }
+      ? { label: t('读取失败', 'Failed to load'), variant: 'error' as const }
       : devices.isFetching
-        ? { label: `刷新中 · ${currentDeviceCount} 台`, variant: 'info' as const }
-        : { label: `${currentDeviceCount} 台活跃设备`, variant: 'success' as const }
+        ? {
+            label: t(
+              `刷新中 · ${formattedCurrentDeviceCount} 台`,
+              `Refreshing · ${formattedCurrentDeviceCount} ${currentDeviceNoun}`,
+            ),
+            variant: 'info' as const,
+          }
+        : {
+            label: t(
+              `${formattedCurrentDeviceCount} 台活跃设备`,
+              `${formattedCurrentDeviceCount} active ${currentDeviceNoun}`,
+            ),
+            variant: 'success' as const,
+          }
 
   const resetEditor = () => {
     setEditingLimit(false)
@@ -161,7 +195,7 @@ export function CredentialDevicesDialog({
               <AvatarFallback><SmartphoneIcon /></AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              <DialogTitle>已绑定设备</DialogTitle>
+              <DialogTitle>{t('已绑定设备', 'Bound devices')}</DialogTitle>
               <DialogDescription className="mt-1 truncate" title={cred.label}>{cred.label}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
@@ -182,36 +216,46 @@ export function CredentialDevicesDialog({
             {editingLimit ? (
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm leading-snug">设备上限</CardTitle>
-                  <CardDescription className="text-xs">明确选择账号是跟随全局设置、不限设备，还是使用独立上限。</CardDescription>
+                  <CardTitle className="text-sm leading-snug">
+                    {t('设备上限', 'Device limit')}
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    {t(
+                      '明确选择账号是跟随全局设置、不限设备，还是使用独立上限。',
+                      'Choose whether this account uses the global default, allows unlimited devices, or has a custom limit.',
+                    )}
+                  </CardDescription>
                 </CardHeader>
                 <CardPanel className="grid gap-4 sm:grid-cols-2">
                   <Field>
-                    <FieldLabel>上限策略</FieldLabel>
+                    <FieldLabel>{t('上限策略', 'Limit policy')}</FieldLabel>
                     <Select
-                      items={LIMIT_POLICY_ITEMS}
+                      items={limitPolicyItems}
                       value={limitPolicy}
                       onValueChange={(value) => {
                         if (value) setLimitPolicy(value as LimitPolicy)
                       }}
                     >
-                      <SelectTrigger aria-label="上限策略">
+                      <SelectTrigger aria-label={t('上限策略', 'Limit policy')}>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectPopup>
-                        {LIMIT_POLICY_ITEMS.map((item) => (
+                        {limitPolicyItems.map((item) => (
                           <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
                         ))}
                       </SelectPopup>
                     </Select>
                     <FieldDescription>
-                      “默认”会自动应用全局设备上限，不等于不限。
+                      {t(
+                        '“默认”会自动应用全局设备上限，不等于不限。',
+                        '“Default” applies the global device limit; it does not mean unlimited.',
+                      )}
                     </FieldDescription>
                   </Field>
 
                   {limitPolicy === 'custom' && (
                     <Field>
-                      <FieldLabel>最多绑定设备</FieldLabel>
+                      <FieldLabel>{t('最多绑定设备', 'Maximum bound devices')}</FieldLabel>
                       <NumberField
                         value={customLimit}
                         min={1}
@@ -220,11 +264,13 @@ export function CredentialDevicesDialog({
                       >
                         <NumberFieldGroup>
                           <NumberFieldDecrement />
-                          <NumberFieldInput aria-label="自定义设备上限" />
+                          <NumberFieldInput aria-label={t('自定义设备上限', 'Custom device limit')} />
                           <NumberFieldIncrement />
                         </NumberFieldGroup>
                       </NumberField>
-                      <FieldDescription>该设置只影响当前账号。</FieldDescription>
+                      <FieldDescription>
+                        {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
+                      </FieldDescription>
                     </Field>
                   )}
                 </CardPanel>
@@ -232,21 +278,36 @@ export function CredentialDevicesDialog({
             ) : (
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm leading-snug">设备容量</CardTitle>
-                  <CardDescription className="text-xs">控制此账号可同时保持活跃绑定的设备数量。</CardDescription>
+                  <CardTitle className="text-sm leading-snug">
+                    {t('设备容量', 'Device capacity')}
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    {t(
+                      '控制此账号可同时保持活跃绑定的设备数量。',
+                      'Controls how many active device bindings this account can keep at once.',
+                    )}
+                  </CardDescription>
                   <CardAction>
                     <Button type="button" size="sm" variant="outline" onClick={startEditingLimit}>
                       <PencilIcon />
-                      调整上限
+                      {t('调整上限', 'Adjust limit')}
                     </Button>
                   </CardAction>
                 </CardHeader>
                 <CardPanel>
                   <dl className="grid grid-cols-3 gap-4">
-                    <CapacityStat label="已绑定" value={`${currentDeviceCount} 台`} />
-                    <CapacityStat label="生效上限" value={effectiveLimit} />
+                    <CapacityStat
+                      label={t('已绑定', 'Bound')}
+                      value={t(
+                        `${formattedCurrentDeviceCount} 台`,
+                        `${formattedCurrentDeviceCount} ${currentDeviceNoun}`,
+                      )}
+                    />
+                    <CapacityStat label={t('生效上限', 'Effective limit')} value={effectiveLimit} />
                     <div className="min-w-0">
-                      <dt className="text-xs text-muted-foreground">上限策略</dt>
+                      <dt className="text-xs text-muted-foreground">
+                        {t('上限策略', 'Limit policy')}
+                      </dt>
                       <dd className="mt-1"><Badge variant={currentPolicy.variant}>{currentPolicy.label}</Badge></dd>
                     </div>
                   </dl>
@@ -268,16 +329,19 @@ export function CredentialDevicesDialog({
             {editingLimit ? (
               <>
                 <Button type="button" variant="outline" disabled={limit.isPending} onClick={resetEditor}>
-                  取消
+                  {t('取消', 'Cancel')}
                 </Button>
-                <Button type="submit" loading={limit.isPending}>保存</Button>
+                <Button type="submit" loading={limit.isPending}>{t('保存', 'Save')}</Button>
               </>
             ) : (
               <>
                 <p className="mr-auto self-center text-xs text-muted-foreground">
-                  解绑只会释放当前名额；设备下次请求时仍可能重新绑定。
+                  {t(
+                    '解绑只会释放当前名额；设备下次请求时仍可能重新绑定。',
+                    'Unbinding only frees the current slot; the device may bind again on its next request.',
+                  )}
                 </p>
-                <DialogClose render={<Button variant="outline" />}>关闭</DialogClose>
+                <DialogClose render={<Button variant="outline" />}>{t('关闭', 'Close')}</DialogClose>
               </>
             )}
           </DialogFooter>
@@ -302,20 +366,25 @@ function DeviceList({
   error: Error | null
   onRetry: () => void
 }) {
+  const { t, language, locale } = useI18n()
   const qc = useQueryClient()
   const queryKey = ['credential-devices', credId] as const
+  const deviceCountText = (count: number) => {
+    const formatted = count.toLocaleString(locale)
+    return t(`${formatted} 台`, `${formatted} ${count === 1 ? 'device' : 'devices'}`)
+  }
   const unbind = useMutation({
     mutationFn: (deviceId: string) => unbindCredentialDevice(credId, deviceId),
     onSuccess: (_, deviceId) => {
-      toastManager.add({ title: '已解绑', type: 'success' })
+      toastManager.add({ title: t('已解绑', 'Device unbound'), type: 'success' })
       qc.setQueryData<DeviceBinding[]>(queryKey, (current) =>
         current?.filter((device) => device.device_id !== deviceId))
       qc.invalidateQueries({ queryKey })
       qc.invalidateQueries({ queryKey: ['credentials'] })
     },
     onError: (error) => toastManager.add({
-      title: '解绑失败',
-      description: extractError(error),
+      title: t('解绑失败', 'Failed to unbind device'),
+      description: extractError(error, language),
       type: 'error',
     }),
   })
@@ -324,19 +393,27 @@ function DeviceList({
     <section className="space-y-3" aria-labelledby={`active-devices-${credId}`}>
       <div className="flex items-end justify-between gap-3">
         <div>
-          <h3 id={`active-devices-${credId}`} className="font-semibold text-sm">活跃设备</h3>
-          <p className="text-xs text-muted-foreground">按最近活跃时间排序</p>
+          <h3 id={`active-devices-${credId}`} className="font-semibold text-sm">
+            {t('活跃设备', 'Active devices')}
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {t('按最近活跃时间排序', 'Sorted by most recent activity')}
+          </p>
         </div>
         {!isPending && !error && (
           <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
             {isFetching && <Spinner />}
-            {data?.length ?? 0} 台
+            {deviceCountText(data?.length ?? 0)}
           </span>
         )}
       </div>
 
       {isPending ? (
-        <div className="space-y-2" role="status" aria-label="正在读取设备列表">
+        <div
+          className="space-y-2"
+          role="status"
+          aria-label={t('正在读取设备列表', 'Loading device list')}
+        >
           {Array.from({ length: 2 }, (_, index) => (
             <Card key={index}>
               <CardPanel className="flex items-center gap-3">
@@ -351,12 +428,12 @@ function DeviceList({
         </div>
       ) : error ? (
         <Alert variant="error">
-          <AlertTitle>设备列表读取失败</AlertTitle>
+          <AlertTitle>{t('设备列表读取失败', 'Failed to load device list')}</AlertTitle>
           <AlertDescription>
-            <p className="break-words">{extractError(error)}</p>
+            <p className="break-words">{extractError(error, language)}</p>
             <Button type="button" size="sm" variant="destructive-outline" onClick={onRetry}>
               <RefreshCwIcon />
-              重试
+              {t('重试', 'Retry')}
             </Button>
           </AlertDescription>
         </Alert>
@@ -364,64 +441,113 @@ function DeviceList({
         <Empty className="py-10">
           <EmptyHeader>
             <EmptyMedia variant="icon"><SmartphoneIcon /></EmptyMedia>
-            <EmptyTitle className="text-base">暂无活跃设备</EmptyTitle>
-            <EmptyDescription>设备完成一次请求后会出现在这里。</EmptyDescription>
+            <EmptyTitle className="text-base">{t('暂无活跃设备', 'No active devices')}</EmptyTitle>
+            <EmptyDescription>
+              {t(
+                '设备完成一次请求后会出现在这里。',
+                'A device will appear here after it completes a request.',
+              )}
+            </EmptyDescription>
           </EmptyHeader>
         </Empty>
       ) : (
         <ul className="space-y-2">
-          {data.map((device) => (
-            <li key={device.device_id}>
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex min-w-0 items-center gap-2 text-sm leading-snug">
-                    <SmartphoneIcon className="size-4 shrink-0" />
-                    <span className="min-w-0 flex-1 truncate text-sm" title={device.device_id}>
-                      {device.device_id}
-                    </span>
-                    <Button
-                      type="button"
-                      size="icon-sm"
-                      variant="ghost"
-                      title={`${device.device_id}（点击复制）`}
-                      aria-label={`复制设备 ID ${device.device_id}`}
-                      onClick={async () => {
-                        const copied = await copyText(device.device_id)
-                        toastManager.add(copied
-                          ? { title: '已复制 device_id', type: 'success' }
-                          : { title: '复制失败', description: device.device_id, type: 'error' })
-                      }}
+          {data.map((device) => {
+            const formattedRequestCount = device.request_count.toLocaleString(locale)
+            const firstBoundFull = formatFullTime(device.created_at, language)
+            const lastSeenFull = formatFullTime(device.last_seen_at, language)
+            const firstBoundRelative = relativeTime(device.created_at, undefined, language)
+            const lastSeenRelative = relativeTime(device.last_seen_at, undefined, language)
+            return (
+              <li key={device.device_id}>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex min-w-0 items-center gap-2 text-sm leading-snug">
+                      <SmartphoneIcon className="size-4 shrink-0" />
+                      <span className="min-w-0 flex-1 truncate text-sm" title={device.device_id}>
+                        {device.device_id}
+                      </span>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="ghost"
+                        title={t(
+                          `${device.device_id}（点击复制）`,
+                          `${device.device_id} (click to copy)`,
+                        )}
+                        aria-label={t(
+                          `复制设备 ID ${device.device_id}`,
+                          `Copy device ID ${device.device_id}`,
+                        )}
+                        onClick={async () => {
+                          const copied = await copyText(device.device_id)
+                          toastManager.add(copied
+                            ? {
+                                title: t('已复制 device_id', 'Copied device_id'),
+                                type: 'success',
+                              }
+                            : {
+                                title: t('复制失败', 'Copy failed'),
+                                description: device.device_id,
+                                type: 'error',
+                              })
+                        }}
+                      >
+                        <CopyIcon />
+                      </Button>
+                    </CardTitle>
+                    <CardDescription
+                      className="text-xs"
+                      title={t(
+                        `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
+                        `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
+                      )}
                     >
-                      <CopyIcon />
-                    </Button>
-                  </CardTitle>
-                  <CardDescription className="text-xs" title={`首次绑定 ${formatFullTime(device.created_at)} · 最近活跃 ${formatFullTime(device.last_seen_at)}`}>
-                    首次绑定 {relativeTime(device.created_at)} · 最近活跃 {relativeTime(device.last_seen_at)}
-                  </CardDescription>
-                  <CardAction>
-                    <Button
-                      size="sm"
-                      variant="destructive-outline"
-                      loading={unbind.isPending && unbind.variables === device.device_id}
-                      disabled={unbind.isPending && unbind.variables !== device.device_id}
-                      onClick={() => unbind.mutate(device.device_id)}
-                      aria-label={`解绑设备 ${device.device_id}`}
-                    >
-                      <UnlinkIcon />
-                      解绑
-                    </Button>
-                  </CardAction>
-                </CardHeader>
-                <CardPanel>
-                  <dl className="grid grid-cols-3 gap-4">
-                    <DeviceStat label="请求" value={`${device.request_count} 次`} />
-                    <DeviceStat label="本账号花费" value={formatUsd(device.cost_usd)} />
-                    <DeviceStat label="全部账号花费" value={formatUsd(device.cost_usd_all)} />
-                  </dl>
-                </CardPanel>
-              </Card>
-            </li>
-          ))}
+                      {t(
+                        `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
+                        `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
+                      )}
+                    </CardDescription>
+                    <CardAction>
+                      <Button
+                        size="sm"
+                        variant="destructive-outline"
+                        loading={unbind.isPending && unbind.variables === device.device_id}
+                        disabled={unbind.isPending && unbind.variables !== device.device_id}
+                        onClick={() => unbind.mutate(device.device_id)}
+                        aria-label={t(
+                          `解绑设备 ${device.device_id}`,
+                          `Unbind device ${device.device_id}`,
+                        )}
+                      >
+                        <UnlinkIcon />
+                        {t('解绑', 'Unbind')}
+                      </Button>
+                    </CardAction>
+                  </CardHeader>
+                  <CardPanel>
+                    <dl className="grid grid-cols-3 gap-4">
+                      <DeviceStat
+                        label={t('请求', 'Requests')}
+                        value={t(
+                          `${formattedRequestCount} 次`,
+                          `${formattedRequestCount} ${device.request_count === 1 ? 'request' : 'requests'}`,
+                        )}
+                      />
+                      <DeviceStat
+                        label={t('本账号花费', 'This account cost')}
+                        value={formatUsd(device.cost_usd)}
+                      />
+                      <DeviceStat
+                        label={t('全部账号花费', 'All accounts cost')}
+                        value={formatUsd(device.cost_usd_all)}
+                      />
+                    </dl>
+                  </CardPanel>
+                </Card>
+              </li>
+            )
+          })}
         </ul>
       )}
     </section>

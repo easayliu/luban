@@ -11,6 +11,7 @@ import {
   type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import { cn, extractError, formatClockTime, formatFullTime } from '@/lib/utils'
+import { localize, useI18n, type Language } from '@/lib/i18n'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
@@ -172,61 +173,93 @@ export function quotaRiskMeta(cred: Credential, now = currentUnixSeconds()): Quo
   return { h5, d7, nearLimit, overage }
 }
 
-function quotaWarningDetail(quota: QuotaRiskMeta): string {
+function quotaWarningDetail(quota: QuotaRiskMeta, language: Language): string {
   const windows = [
     quota.h5.percentage != null && quota.h5.percentage >= 90
-      ? `5 小时 ${quota.h5.percentage}%`
+      ? localize(language, `5 小时 ${quota.h5.percentage}%`, `5-hour ${quota.h5.percentage}%`)
       : '',
     quota.d7.percentage != null && quota.d7.percentage >= 90
-      ? `7 天 ${quota.d7.percentage}%`
+      ? localize(language, `7 天 ${quota.d7.percentage}%`, `7-day ${quota.d7.percentage}%`)
       : '',
   ].filter(Boolean)
-  return `${windows.join('、')}，已达到额度预警线`
+  return localize(
+    language,
+    `${windows.join('、')}，已达到额度预警线`,
+    `${windows.join(', ')} reached the quota warning threshold`,
+  )
 }
 
-function statusFromQuota(cred: Credential, quota: QuotaRiskMeta): CredentialStatusMeta {
+function statusFromQuota(
+  cred: Credential,
+  quota: QuotaRiskMeta,
+  language: Language,
+): CredentialStatusMeta {
   if (cred.ban_reason) {
     return {
-      kind: 'banned', variant: 'error', label: '已封禁', detail: cred.ban_reason,
+      kind: 'banned', variant: 'error',
+      label: localize(language, '已封禁', 'Banned'), detail: cred.ban_reason,
       attention: true, rank: 6,
     }
   }
   if (cred.disabled) {
     return {
-      kind: 'disabled', variant: 'secondary', label: '已停用', detail: '账号已停用，不参与调度',
+      kind: 'disabled', variant: 'secondary',
+      label: localize(language, '已停用', 'Disabled'),
+      detail: localize(language, '账号已停用，不参与调度', 'This account is disabled and excluded from scheduling'),
       attention: false, rank: 1,
     }
   }
-  const snapshotTime = cred.quota ? formatFullTime(cred.quota.ts) : '未知时间'
+  const snapshotTime = cred.quota
+    ? formatFullTime(cred.quota.ts, language)
+    : localize(language, '未知时间', 'unknown time')
   if (quota.overage === 'active') {
     return {
-      kind: 'overage', variant: 'error', label: '超额计费',
-      detail: `额度快照（${snapshotTime}）显示上游正以超额计费放行请求，可能产生按量费用`,
+      kind: 'overage', variant: 'error',
+      label: localize(language, '超额计费', 'Overage billing'),
+      detail: localize(
+        language,
+        `额度快照（${snapshotTime}）显示上游正以超额计费放行请求，可能产生按量费用`,
+        `The quota snapshot (${snapshotTime}) shows requests being allowed through overage billing, which may incur usage-based charges`,
+      ),
       attention: true, rank: 5,
     }
   }
   if (quota.overage === 'unknown') {
     return {
-      kind: 'overage-unknown', variant: 'warning', label: '超额待确认',
-      detail: `额度快照（${snapshotTime}）记录了超额计费，但现有窗口信息不足以确认当前仍在计费，需等待新请求确认`,
+      kind: 'overage-unknown', variant: 'warning',
+      label: localize(language, '超额待确认', 'Overage unconfirmed'),
+      detail: localize(
+        language,
+        `额度快照（${snapshotTime}）记录了超额计费，但现有窗口信息不足以确认当前仍在计费，需等待新请求确认`,
+        `The quota snapshot (${snapshotTime}) recorded overage billing, but the available window data cannot confirm whether it is still active; wait for a new request to verify`,
+      ),
       attention: true, rank: 4,
     }
   }
   if (cred.rate_limited_secs > 0) {
+    const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
     return {
-      kind: 'cooldown', variant: 'warning', label: '冷却中',
-      detail: `账号约 ${Math.max(1, Math.ceil(cred.rate_limited_secs / 60))} 分钟后恢复调度`,
+      kind: 'cooldown', variant: 'warning',
+      label: localize(language, '冷却中', 'Cooling down'),
+      detail: localize(
+        language,
+        `账号约 ${minutes} 分钟后恢复调度`,
+        `Scheduling resumes in about ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`,
+      ),
       attention: true, rank: 3,
     }
   }
   if (quota.nearLimit) {
     return {
-      kind: 'near-limit', variant: 'warning', label: '额度将满',
-      detail: quotaWarningDetail(quota), attention: true, rank: 2,
+      kind: 'near-limit', variant: 'warning',
+      label: localize(language, '额度将满', 'Quota nearly full'),
+      detail: quotaWarningDetail(quota, language), attention: true, rank: 2,
     }
   }
   return {
-    kind: 'normal', variant: 'success', label: '运行正常', detail: '账号运行正常，可参与调度',
+    kind: 'normal', variant: 'success',
+    label: localize(language, '运行正常', 'Healthy'),
+    detail: localize(language, '账号运行正常，可参与调度', 'This account is healthy and available for scheduling'),
     attention: false, rank: 0,
   }
 }
@@ -235,9 +268,10 @@ function statusFromQuota(cred: Credential, quota: QuotaRiskMeta): CredentialStat
 export function evaluateCredential(
   cred: Credential,
   now = currentUnixSeconds(),
+  language: Language = 'zh-CN',
 ): CredentialEvaluation {
   const quota = quotaRiskMeta(cred, now)
-  const status = statusFromQuota(cred, quota)
+  const status = statusFromQuota(cred, quota, language)
   const nearLimit = !cred.disabled && quota.nearLimit
   const quotaRisk = !cred.disabled && (
     nearLimit || quota.overage === 'active' || quota.overage === 'unknown'
@@ -375,6 +409,7 @@ export function sortCreds(
   key: SortKey,
   dir: SortDir,
   now = currentUnixSeconds(),
+  language: Language = 'zh-CN',
 ): Credential[] {
   const sign = dir === 'asc' ? 1 : -1
   const values = new Map(list.map((credential) => [credential.id, sortValue(key, credential, now)]))
@@ -382,7 +417,7 @@ export function sortCreds(
     const aValue = values.get(a.id)!
     const bValue = values.get(b.id)!
     const compared = typeof aValue === 'string' && typeof bValue === 'string'
-      ? aValue.localeCompare(bValue, 'zh-CN')
+      ? aValue.localeCompare(bValue, language)
       : Number(aValue) - Number(bValue)
     return sign * compared || a.id - b.id
   })
@@ -393,18 +428,19 @@ export function sortCreds(
  * 这里只封装请求与失败提示，避免两处重复维护同一套 mutation。
  */
 export function useCredentialActions(cred: Credential, onRenamed?: () => void, onLimitSaved?: () => void) {
+  const { t, language } = useI18n()
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['credentials'] })
   const failure = (title: string, error: unknown) => toastManager.add({
     title,
-    description: extractError(error),
+    description: extractError(error, language),
     type: 'error',
   })
 
   const rename = useMutation({
     mutationFn: (label: string) => setLabel(cred.id, label),
     onSuccess: () => { onRenamed?.(); invalidate() },
-    onError: (e) => failure('重命名失败', e),
+    onError: (e) => failure(t('重命名失败', 'Rename failed'), e),
   })
   const toggle = useMutation({
     mutationFn: (disabled: boolean) => setDisabled(cred.id, disabled),
@@ -418,34 +454,34 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     },
     onError: (e, _disabled, context) => {
       if (context?.previous) qc.setQueryData(['credentials'], context.previous)
-      failure('操作失败', e)
+      failure(t('操作失败', 'Operation failed'), e)
     },
     onSettled: () => invalidate(),
   })
   const prio = useMutation({
     mutationFn: (p: number) => setPriority(cred.id, p),
     onSuccess: invalidate,
-    onError: (e) => failure('设置优先级失败', e),
+    onError: (e) => failure(t('设置优先级失败', 'Failed to set priority'), e),
   })
   const limit = useMutation({
     mutationFn: (n: number) => setDeviceLimit(cred.id, n),
     onSuccess: () => { onLimitSaved?.(); invalidate() },
-    onError: (e) => failure('设置设备上限失败', e),
+    onError: (e) => failure(t('设置设备上限失败', 'Failed to set device limit'), e),
   })
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
-    onSuccess: () => { toastManager.add({ title: '已刷新', type: 'success' }); invalidate() },
-    onError: (e) => failure('刷新失败', e),
+    onSuccess: () => { toastManager.add({ title: t('已刷新', 'Refreshed'), type: 'success' }); invalidate() },
+    onError: (e) => failure(t('刷新失败', 'Refresh failed'), e),
   })
   const remove = useMutation({
     mutationFn: () => deleteCredential(cred.id),
-    onSuccess: () => { toastManager.add({ title: '已删除', type: 'success' }); invalidate() },
-    onError: (e) => failure('删除失败', e),
+    onSuccess: () => { toastManager.add({ title: t('已删除', 'Deleted'), type: 'success' }); invalidate() },
+    onError: (e) => failure(t('删除失败', 'Delete failed'), e),
   })
   const cooldown = useMutation({
     mutationFn: () => clearCooldown(cred.id),
-    onSuccess: () => { toastManager.add({ title: '已解除冷却', type: 'success' }); invalidate() },
-    onError: (e) => failure('解除冷却失败', e),
+    onSuccess: () => { toastManager.add({ title: t('已解除冷却', 'Cooldown cleared'), type: 'success' }); invalidate() },
+    onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
   return { rename, toggle, prio, limit, refresh, remove, cooldown }
@@ -469,54 +505,55 @@ export function CredentialMenuContent({
   onTest: () => void
   onRequestDelete: () => void
 }) {
+  const { t } = useI18n()
   const { refresh, prio, cooldown } = actions
   return (
     <MenuPopup align="end">
       <MenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
         <RefreshCwIcon className={refresh.isPending ? 'animate-spin' : undefined} />
-        刷新 token
+        {t('刷新 token', 'Refresh token')}
       </MenuItem>
       <MenuItem onClick={onTest}>
         <ActivityIcon />
-        连通性测试
+        {t('连通性测试', 'Connectivity test')}
       </MenuItem>
       {cred.rate_limited_secs > 0 && (
         <MenuItem onClick={() => cooldown.mutate()} disabled={cooldown.isPending}>
           <TimerOffIcon />
-          解除冷却
+          {t('解除冷却', 'Clear cooldown')}
         </MenuItem>
       )}
       <MenuItem onClick={onRename}>
         <PencilIcon />
-        重命名
+        {t('重命名', 'Rename')}
       </MenuItem>
       <MenuItem onClick={onDeviceLimit}>
         <SmartphoneIcon />
-        设备上限
+        {t('设备上限', 'Device limit')}
       </MenuItem>
       <MenuSeparator />
       <MenuItem
         onClick={() => prio.mutate(cred.priority - 1)}
         disabled={prio.isPending}
-        title="数值越小，调度优先级越高"
+        title={t('数值越小，调度优先级越高', 'Lower values are scheduled first')}
       >
         <ChevronUpIcon />
-        提高优先级
+        {t('提高优先级', 'Increase priority')}
         <MenuShortcut>P{cred.priority - 1}</MenuShortcut>
       </MenuItem>
       <MenuItem
         onClick={() => prio.mutate(cred.priority + 1)}
         disabled={prio.isPending}
-        title="数值越大，调度优先级越低"
+        title={t('数值越大，调度优先级越低', 'Higher values are scheduled later')}
       >
         <ChevronDownIcon />
-        降低优先级
+        {t('降低优先级', 'Decrease priority')}
         <MenuShortcut>P{cred.priority + 1}</MenuShortcut>
       </MenuItem>
       <MenuSeparator />
       <MenuItem variant="destructive" onClick={onRequestDelete}>
         <Trash2Icon />
-        删除
+        {t('删除', 'Delete')}
       </MenuItem>
     </MenuPopup>
   )
@@ -531,24 +568,26 @@ export function DeleteCredentialDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const { t } = useI18n()
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogPopup>
         <AlertDialogHeader>
-          <AlertDialogTitle>删除账号</AlertDialogTitle>
+          <AlertDialogTitle>{t('删除账号', 'Delete account')}</AlertDialogTitle>
           <AlertDialogDescription>
-            删除「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」后，
-            历史用量与设备绑定将一并清除，且无法恢复。
+            {t('删除', 'Deleting ')}
+            {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>{t('」后，', '" will ')}
+            {t('历史用量与设备绑定将一并清除，且无法恢复。', 'permanently remove its usage history and device bindings. This cannot be undone.')}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogClose render={<Button variant="outline" />}>取消</AlertDialogClose>
+          <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
           <Button
             variant="destructive"
             loading={actions.remove.isPending}
             onClick={() => actions.remove.mutate()}
           >
-            删除
+            {t('删除', 'Delete')}
           </Button>
         </AlertDialogFooter>
       </AlertDialogPopup>
@@ -605,6 +644,7 @@ export function ConnectivityTestDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const { t, language } = useI18n()
   const qc = useQueryClient()
   const [model, setModel] = useState<string>(PROBE_MODELS[0])
   const [entries, setEntries] = useState<ProbeEntry[]>([])
@@ -631,7 +671,11 @@ export function ConnectivityTestDialog({
     // 后者是 200 + 一份带状态码的结果，会进上面的列表。
     onError: (e, request) => {
       if (request.session !== session.current || axios.isCancel(e)) return
-      toastManager.add({ title: '测试失败', description: extractError(e), type: 'error' })
+      toastManager.add({
+        title: t('测试失败', 'Test failed'),
+        description: extractError(e, language),
+        type: 'error',
+      })
     },
     onSettled: (_result, _error, request) => {
       if (activeProbe.current === request.controller) activeProbe.current = null
@@ -674,10 +718,11 @@ export function ConnectivityTestDialog({
     >
       <DialogPopup>
         <DialogHeader>
-          <DialogTitle>连通性测试</DialogTitle>
+          <DialogTitle>{t('连通性测试', 'Connectivity test')}</DialogTitle>
           <DialogDescription>
-            使用「<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>」
-            发送一条最小请求，验证所选模型是否可用。
+            {t('使用「', 'Send a minimal request through "')}
+            <span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>
+            {t('」发送一条最小请求，验证所选模型是否可用。', '" to verify that the selected model is available.')}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
@@ -686,7 +731,7 @@ export function ConnectivityTestDialog({
             onSubmit={(e) => { e.preventDefault(); submit() }}
           >
             <Field>
-              <FieldLabel htmlFor={`probe-model-${cred.id}`}>测试模型</FieldLabel>
+              <FieldLabel htmlFor={`probe-model-${cred.id}`}>{t('测试模型', 'Model to test')}</FieldLabel>
               <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center">
                 <Combobox
                   items={PROBE_MODELS}
@@ -695,12 +740,12 @@ export function ConnectivityTestDialog({
                   disabled={probe.isPending}
                 >
                   <ComboboxTrigger id={`probe-model-${cred.id}`} className="min-w-0 flex-1">
-                    <ComboboxValue placeholder="选择模型" />
+                    <ComboboxValue placeholder={t('选择模型', 'Select a model')} />
                   </ComboboxTrigger>
                   <ComboboxPopup
-                    aria-label="选择测试模型"
-                    inputPlaceholder="搜索模型"
-                    emptyText="没有匹配的模型"
+                    aria-label={t('选择测试模型', 'Select a model to test')}
+                    inputPlaceholder={t('搜索模型', 'Search models')}
+                    emptyText={t('没有匹配的模型', 'No matching models')}
                   >
                     {(item: string) => (
                       <ComboboxItem key={item} value={item}>{item}</ComboboxItem>
@@ -714,11 +759,14 @@ export function ConnectivityTestDialog({
                   onClick={probe.isPending ? cancelProbe : undefined}
                 >
                   {probe.isPending ? <Spinner /> : <ActivityIcon />}
-                  {probe.isPending ? '取消测试' : '开始测试'}
+                  {probe.isPending ? t('取消测试', 'Cancel test') : t('开始测试', 'Start test')}
                 </Button>
               </div>
               <FieldDescription>
-                每次测试会消耗少量订阅额度，并计入该账号当前周期的请求数与花费。
+                {t(
+                  '每次测试会消耗少量订阅额度，并计入该账号当前周期的请求数与花费。',
+                  'Each test uses a small amount of subscription quota and counts toward this account’s current-period requests and cost.',
+                )}
               </FieldDescription>
             </Field>
           </Form>
@@ -726,8 +774,13 @@ export function ConnectivityTestDialog({
           {entries.length === 0 ? (
             <Empty className="py-8">
               <EmptyHeader>
-                <EmptyTitle className="text-base">尚无测试结果</EmptyTitle>
-                <EmptyDescription>选择模型并开始测试，结果会显示实时额度或上游错误。</EmptyDescription>
+                <EmptyTitle className="text-base">{t('尚无测试结果', 'No test results yet')}</EmptyTitle>
+                <EmptyDescription>
+                  {t(
+                    '选择模型并开始测试，结果会显示实时额度或上游错误。',
+                    'Select a model and start a test to see live quota data or upstream errors.',
+                  )}
+                </EmptyDescription>
               </EmptyHeader>
             </Empty>
           ) : (
@@ -745,6 +798,7 @@ export function ConnectivityTestDialog({
 
 /** 一条测试结果：成败徽章 + 模型名 + 状态码/耗时，失败时附上游错误原文。 */
 function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
+  const { t } = useI18n()
   const { model, result } = entry
   const Icon = result.ok ? CircleCheckIcon : CircleXIcon
   return (
@@ -754,13 +808,13 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
         <AlertTitle className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="min-w-0 [overflow-wrap:anywhere]" title={model}>{model}</span>
           <Badge variant={result.ok ? 'success' : 'error'} size="sm">
-            {result.status > 0 ? `HTTP ${result.status}` : '未送达上游'}
+            {result.status > 0 ? `HTTP ${result.status}` : t('未送达上游', 'Not sent upstream')}
           </Badge>
           <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
           {result.model && result.model !== model && (
             <span
               className="min-w-0 font-normal text-muted-foreground [overflow-wrap:anywhere]"
-              title={`上游实际使用的模型：${result.model}`}
+              title={t(`上游实际使用的模型：${result.model}`, `Model actually used upstream: ${result.model}`)}
             >
               → {result.model}
             </span>
@@ -789,6 +843,7 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
  * 但这里保留逐次结果，方便对照不同模型的状态与等待时间。
  */
 function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
+  const { t, language } = useI18n()
   const win = (label: string, util: number | null, reset: number | null) => {
     if (util == null && reset == null) return null
     const pct = quotaPercentage(util)
@@ -796,7 +851,12 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       <span
         key={label}
         className="tnum"
-        title={reset != null ? `${label} 窗口 ${formatFullTime(reset)} 重置` : undefined}
+        title={reset != null
+          ? t(
+              `${label} 窗口 ${formatFullTime(reset, language)} 重置`,
+              `${label} window resets at ${formatFullTime(reset, language)}`,
+            )
+          : undefined}
       >
         {label}{' '}
         {pct == null ? (
@@ -804,7 +864,10 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
         ) : (
           <span className={cn('font-medium', quotaToneClass(util))}>{pct}%</span>
         )}
-        {reset != null && ` · ${formatClockTime(reset)} 重置`}
+        {reset != null && t(
+          ` · ${formatClockTime(reset, language)} 重置`,
+          ` · resets ${formatClockTime(reset, language)}`,
+        )}
       </span>
     )
   }
@@ -814,17 +877,26 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       {win('7d', quota.rl_7d_utilization, quota.rl_7d_reset)}
       {/* 429 才有。它是上游对**这次**拒绝给出的等待时间，比窗口 reset 更直接。 */}
       {quota.retry_after_secs != null && (
-        <span className="text-destructive-foreground" title={`上游 retry-after: ${quota.retry_after_secs} 秒`}>
-          需等待 {formatWait(quota.retry_after_secs)}
+        <span
+          className="text-destructive-foreground"
+          title={t(
+            `上游 retry-after: ${quota.retry_after_secs} 秒`,
+            `Upstream retry-after: ${quota.retry_after_secs} ${quota.retry_after_secs === 1 ? 'second' : 'seconds'}`,
+          )}
+        >
+          {t('需等待', 'Wait')} {formatWait(quota.retry_after_secs, language)}
         </span>
       )}
       {/* 额度满但上游用超额计费放行：不 429、请求照常成功，只有这里能看出在烧钱。 */}
       {quota.overage_in_use && (
         <span
           className="text-destructive-foreground"
-          title="本次请求由超额计费（overage）放行：额度已满，烧的是按量计费的钱"
+          title={t(
+            '本次请求由超额计费（overage）放行：额度已满，烧的是按量计费的钱',
+            'This request was allowed through overage billing: the quota is full and usage-based charges apply',
+          )}
         >
-          超额计费中
+          {t('超额计费中', 'Overage billing active')}
         </span>
       )}
       {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}
@@ -837,8 +909,11 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
           )}
           title={
             quota.rl_representative
-              ? `上游整体额度状态（当前由 ${quota.rl_representative} 窗口决定）`
-              : '上游整体额度状态'
+              ? t(
+                  `上游整体额度状态（当前由 ${quota.rl_representative} 窗口决定）`,
+                  `Overall upstream quota status (currently determined by the ${quota.rl_representative} window)`,
+                )
+              : t('上游整体额度状态', 'Overall upstream quota status')
           }
         >
           {quota.unified_status}
@@ -857,11 +932,20 @@ function quotaToneClass(util: number | null): string {
 }
 
 /** 等待时长：分钟以内给秒，一天以内给小时，再长给天（上游真给过 63 小时）。 */
-function formatWait(secs: number): string {
-  if (secs < 60) return `${secs} 秒`
-  if (secs < 3600) return `${Math.round(secs / 60)} 分钟`
-  if (secs < 86400) return `${(secs / 3600).toFixed(1)} 小时`
-  return `${(secs / 86400).toFixed(1)} 天`
+function formatWait(secs: number, language: Language): string {
+  if (secs < 60) {
+    return localize(language, `${secs} 秒`, `${secs} ${secs === 1 ? 'second' : 'seconds'}`)
+  }
+  if (secs < 3600) {
+    const minutes = Math.round(secs / 60)
+    return localize(language, `${minutes} 分钟`, `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`)
+  }
+  if (secs < 86400) {
+    const hours = (secs / 3600).toFixed(1)
+    return localize(language, `${hours} 小时`, `${hours} hours`)
+  }
+  const days = (secs / 86400).toFixed(1)
+  return localize(language, `${days} 天`, `${days} days`)
 }
 
 /** 账号档位使用官方 Badge 变体，避免业务层复制一套徽章色板。 */
@@ -876,8 +960,9 @@ export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
 export function statusMeta(
   cred: Credential,
   now = currentUnixSeconds(),
+  language: Language = 'zh-CN',
 ): CredentialStatusMeta {
-  return evaluateCredential(cred, now).status
+  return evaluateCredential(cred, now, language).status
 }
 
 /**
@@ -890,53 +975,87 @@ export function statusMeta(
  * 已过期的说成「待刷新」且保持中性色：刷新是惰性的（下次被调度时才刷），闲置久了必然到这个
  * 状态，它说明的是「这个号最近没被用过」，不是「这个号坏了」。
  */
-export function credentialExpiryMeta(cred: Credential): {
+export function credentialExpiryMeta(
+  cred: Credential,
+  language: Language = 'zh-CN',
+): {
   text: string
   className: string
   title?: string
 } {
   if (cred.expired) {
     return {
-      text: '待刷新',
+      text: localize(language, '待刷新', 'Refresh pending'),
       className: 'text-muted-foreground',
-      title: `access_token 已于 ${formatFullTime(cred.expires_at)} 过期 · 下次被调度时自动刷新，不影响可用性`,
+      title: localize(
+        language,
+        `access_token 已于 ${formatFullTime(cred.expires_at, language)} 过期 · 下次被调度时自动刷新，不影响可用性`,
+        `The access token expired at ${formatFullTime(cred.expires_at, language)} · It refreshes automatically the next time this account is scheduled and does not affect availability`,
+      ),
     }
   }
   return {
-    text: `${formatClockTime(cred.expires_at)} 过期`,
+    text: localize(
+      language,
+      `${formatClockTime(cred.expires_at, language)} 过期`,
+      `Expires ${formatClockTime(cred.expires_at, language)}`,
+    ),
     className: 'text-muted-foreground',
-    title: `${formatFullTime(cred.expires_at)} 过期 · 到点自动刷新`,
+    title: localize(
+      language,
+      `${formatFullTime(cred.expires_at, language)} 过期 · 到点自动刷新`,
+      `Expires ${formatFullTime(cred.expires_at, language)} · Refreshes automatically when due`,
+    ),
   }
 }
 
 /** 列表紧凑态的综合说明：优先展示会影响账号调度的状态，再回退到真实有效期。 */
-export function expiryMeta(cred: Credential): {
+export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
   text: string
   className: string
   title?: string
 } {
   if (cred.ban_reason) {
     return {
-      text: '已封禁',
+      text: localize(language, '已封禁', 'Banned'),
       className: 'font-medium text-destructive-foreground',
       title: cred.ban_reason,
     }
   }
-  if (cred.disabled) return { text: '已停用', className: 'text-muted-foreground' }
+  if (cred.disabled) {
+    return {
+      text: localize(language, '已停用', 'Disabled'),
+      className: 'text-muted-foreground',
+    }
+  }
   if (cred.rate_limited_secs > 0) {
     const minutes = Math.max(1, Math.ceil(cred.rate_limited_secs / 60))
     return {
-      text: `冷却约 ${minutes} 分钟`,
+      text: localize(
+        language,
+        `冷却约 ${minutes} 分钟`,
+        `Cooling down · about ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`,
+      ),
       className: 'font-medium text-warning-foreground',
-      title: '账号级限流冷却中，结束后会自动恢复调度',
+      title: localize(
+        language,
+        '账号级限流冷却中，结束后会自动恢复调度',
+        'Account-level rate-limit cooldown; scheduling resumes automatically when it ends',
+      ),
     }
   }
-  return credentialExpiryMeta(cred)
+  return credentialExpiryMeta(cred, language)
 }
 
 /** 启用开关的 hover 提示：封禁态说明「已被上游封禁」并提示仍可手动停用。 */
-export function switchTitle(cred: Credential): string {
-  if (cred.disabled) return '已停用（点击启用）'
-  if (cred.ban_reason) return `${cred.ban_reason} · 点击可手动停用`
-  return '已启用（点击停用）'
+export function switchTitle(cred: Credential, language: Language = 'zh-CN'): string {
+  if (cred.disabled) return localize(language, '已停用（点击启用）', 'Disabled (click to enable)')
+  if (cred.ban_reason) {
+    return localize(
+      language,
+      `${cred.ban_reason} · 点击可手动停用`,
+      `${cred.ban_reason} · Click to disable manually`,
+    )
+  }
+  return localize(language, '已启用（点击停用）', 'Enabled (click to disable)')
 }

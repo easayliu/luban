@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
+import { useI18n } from '@/lib/i18n'
 import { copyText, extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -27,6 +28,7 @@ export function AddAccount({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const { t, language } = useI18n()
   const qc = useQueryClient()
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   const [code, setCode] = useState('')
@@ -68,8 +70,8 @@ export function AddAccount({
       request.popup?.close()
       if (request.session !== authorizeSession.current) return
       toastManager.add({
-        title: '生成授权链接失败',
-        description: extractError(error),
+        title: t('生成授权链接失败', 'Failed to create authorization link'),
+        description: extractError(error, language),
         type: 'error',
       })
     },
@@ -78,13 +80,17 @@ export function AddAccount({
   const exchange = useMutation({
     mutationFn: () => exchangeCode(code.trim(), label.trim() || undefined),
     onSuccess: (cred) => {
-      toastManager.add({ title: '已添加账号', description: cred.label, type: 'success' })
+      toastManager.add({
+        title: t('已添加账号', 'Account added'),
+        description: cred.label,
+        type: 'success',
+      })
       qc.invalidateQueries({ queryKey: ['credentials'] })
       handleOpenChange(false)
     },
     onError: (error) => toastManager.add({
-      title: '添加失败',
-      description: extractError(error),
+      title: t('添加失败', 'Failed to add account'),
+      description: extractError(error, language),
       type: 'error',
     }),
   })
@@ -101,9 +107,12 @@ export function AddAccount({
     >
       <DialogPopup closeProps={{ disabled: busy }}>
         <DialogHeader>
-          <DialogTitle>添加 Claude 账号</DialogTitle>
+          <DialogTitle>{t('添加 Claude 账号', 'Add Claude account')}</DialogTitle>
           <DialogDescription>
-            完成 Claude OAuth 授权后，粘贴授权结果以接入订阅账号。
+            {t(
+              '完成 Claude OAuth 授权后，粘贴授权结果以接入订阅账号。',
+              'Complete Claude OAuth authorization, then paste the result to connect a subscription account.',
+            )}
           </DialogDescription>
         </DialogHeader>
         <Form
@@ -115,8 +124,13 @@ export function AddAccount({
         >
           <DialogPanel className="space-y-6">
             <Field>
-              <FieldLabel>1. 打开授权页面</FieldLabel>
-              <FieldDescription>使用要接入的 Claude 订阅账号完成授权。</FieldDescription>
+              <FieldLabel>{t('1. 打开授权页面', '1. Open the authorization page')}</FieldLabel>
+              <FieldDescription>
+                {t(
+                  '使用要接入的 Claude 订阅账号完成授权。',
+                  'Authorize with the Claude subscription account you want to connect.',
+                )}
+              </FieldDescription>
               <Button
                 type="button"
                 variant="outline"
@@ -128,21 +142,27 @@ export function AddAccount({
                 }}
               >
                 <ExternalLinkIcon />
-                打开 Claude 授权页
+                {t('打开 Claude 授权页', 'Open Claude authorization page')}
               </Button>
             </Field>
 
             {authUrl && (
               <Alert variant="info">
                 <ExternalLinkIcon aria-hidden />
-                <AlertTitle>授权页已在新标签打开</AlertTitle>
+                <AlertTitle>{t('授权页已在新标签打开', 'Authorization page opened in a new tab')}</AlertTitle>
                 <AlertDescription>
                   <p>
-                    如果浏览器拦截了新标签页，可{' '}
+                    {t(
+                      '如果浏览器拦截了新标签页，可',
+                      'If your browser blocked the new tab, you can',
+                    )}{' '}
                     <a href={authUrl} target="_blank" rel="noopener">
-                      手动打开授权页面
+                      {t('手动打开授权页面', 'open the authorization page manually')}
                     </a>
-                    ，或复制链接到其它浏览器/设备上完成授权。
+                    {t(
+                      '，或复制链接到其它浏览器/设备上完成授权。',
+                      ', or copy the link to another browser or device to finish authorization.',
+                    )}
                   </p>
                   <Button
                     type="button"
@@ -152,47 +172,60 @@ export function AddAccount({
                     onClick={async () => {
                       const copied = await copyText(authUrl)
                       toastManager.add(copied
-                        ? { title: '已复制授权链接', type: 'success' }
-                        : { title: '复制失败，请手动复制', description: authUrl, type: 'error' })
+                        ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
+                        : {
+                            title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
+                            description: authUrl,
+                            type: 'error',
+                          })
                     }}
                   >
                     <CopyIcon />
-                    复制授权链接
+                    {t('复制授权链接', 'Copy authorization link')}
                   </Button>
                 </AlertDescription>
               </Alert>
             )}
 
             <div className="space-y-4">
-              <div className="font-medium text-sm">2. 提交授权结果</div>
+              <div className="font-medium text-sm">
+                {t('2. 提交授权结果', '2. Submit the authorization result')}
+              </div>
               <Field name="code">
-                <FieldLabel htmlFor="oauth-result">授权结果</FieldLabel>
+                <FieldLabel htmlFor="oauth-result">{t('授权结果', 'Authorization result')}</FieldLabel>
                 <Textarea
                   id="oauth-result"
                   name="code"
                   value={code}
                   onChange={(event) => setCode(event.target.value)}
-                  placeholder="粘贴完整的 code#state"
+                  placeholder={t('粘贴完整的 code#state', 'Paste the complete code#state')}
                   className="min-h-24"
                   required
                 />
-                <FieldDescription>请粘贴 Claude 授权完成后返回的完整内容。</FieldDescription>
+                <FieldDescription>
+                  {t(
+                    '请粘贴 Claude 授权完成后返回的完整内容。',
+                    'Paste the complete value returned after Claude authorization.',
+                  )}
+                </FieldDescription>
               </Field>
               <Field name="label">
-                <FieldLabel htmlFor="account-label">账号备注（可选）</FieldLabel>
+                <FieldLabel htmlFor="account-label">
+                  {t('账号备注（可选）', 'Account label (optional)')}
+                </FieldLabel>
                 <Input
                   id="account-label"
                   name="label"
                   value={label}
                   onChange={(event) => setLabel(event.target.value)}
-                  placeholder="留空时使用账号邮箱"
+                  placeholder={t('留空时使用账号邮箱', 'Leave blank to use the account email')}
                 />
               </Field>
             </div>
           </DialogPanel>
           <DialogFooter>
             <DialogClose render={<Button variant="ghost" />} disabled={busy}>
-              取消
+              {t('取消', 'Cancel')}
             </DialogClose>
             <Button
               type="submit"
@@ -200,7 +233,7 @@ export function AddAccount({
               disabled={!code.trim()}
             >
               <ArrowRightIcon />
-              添加账号
+              {t('添加账号', 'Add account')}
             </Button>
           </DialogFooter>
         </Form>

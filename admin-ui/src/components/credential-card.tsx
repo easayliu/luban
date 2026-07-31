@@ -9,6 +9,7 @@ import {
   XIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
+import { useI18n } from '@/lib/i18n'
 import {
   cn,
   formatClockTime,
@@ -69,6 +70,7 @@ export function CredentialCard({
   selected?: boolean
   onSelectedChange?: (next: boolean) => void
 }) {
+  const { t, language } = useI18n()
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
   const [devicesOpen, setDevicesOpen] = useState(false)
@@ -77,54 +79,74 @@ export function CredentialCard({
 
   const actions = useCredentialActions(cred, () => setEditing(false))
   const { rename, toggle, limit } = actions
-  const evaluation = evaluateCredential(cred, now)
+  const evaluation = evaluateCredential(cred, now, language)
   const { quota, status } = evaluation
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
   const has5h = cred.quota?.rl_5h_utilization != null || cred.quota?.rl_5h_reset != null
   const has7d = cred.quota?.rl_7d_utilization != null || cred.quota?.rl_7d_reset != null
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const devicePolicy = cred.device_limit === 0
-    ? { label: '跟随默认', variant: 'secondary' as const }
+    ? { label: t('跟随默认', 'Default'), variant: 'secondary' as const }
     : cred.device_limit < 0
-      ? { label: '不限', variant: 'outline' as const }
-      : { label: '自定义', variant: 'info' as const }
+      ? { label: t('不限', 'Unlimited'), variant: 'outline' as const }
+      : { label: t('自定义', 'Custom'), variant: 'info' as const }
   const titleId = `credential-card-title-${cred.id}`
   const statusDetailId = `credential-card-status-${cred.id}`
   const lastUsed = cred.last_used == null
-    ? { label: '尚未使用', title: '该账号尚未转发过请求' }
+    ? { label: t('尚未使用', 'Never used'), title: t('该账号尚未转发过请求', 'This account has not forwarded any requests yet') }
     : {
-        label: `使用于 ${relativeTime(cred.last_used, now)}`,
-        title: `最近使用于 ${formatFullTime(cred.last_used)}`,
+        label: t(
+          `使用于 ${relativeTime(cred.last_used, now, language)}`,
+          `Used ${relativeTime(cred.last_used, now, language)}`,
+        ),
+        title: t(
+          `最近使用于 ${formatFullTime(cred.last_used, language)}`,
+          `Last used ${formatFullTime(cred.last_used, language)}`,
+        ),
       }
-  const quotaSnapshotTime = cred.quota ? formatFullTime(cred.quota.ts) : '未知时间'
+  const quotaSnapshotTime = cred.quota
+    ? formatFullTime(cred.quota.ts, language)
+    : t('未知时间', 'unknown time')
   const secondaryOverage = (() => {
     if (quota.overage === 'none') return null
     if (cred.disabled) {
       return {
-        label: '最近快照超额',
+        label: t('最近快照超额', 'Latest snapshot over limit'),
         variant: 'warning' as const,
-        title: `账号已停用；${quotaSnapshotTime} 的额度快照记录了超额计费，当前不纳入调度风险统计`,
+        title: t(
+          `账号已停用；${quotaSnapshotTime} 的额度快照记录了超额计费，当前不纳入调度风险统计`,
+          `The account is disabled; the ${quotaSnapshotTime} quota snapshot recorded overage billing and is excluded from current scheduling-risk totals`,
+        ),
       }
     }
     if (quota.overage === 'historical') {
       return {
-        label: '最近曾超额',
+        label: t('最近曾超额', 'Recently over limit'),
         variant: 'warning' as const,
-        title: '最近的额度快照记录了超额计费，但相关额度窗口已经重置',
+        title: t(
+          '最近的额度快照记录了超额计费，但相关额度窗口已经重置',
+          'The latest quota snapshot recorded overage billing, but the related quota windows have reset',
+        ),
       }
     }
     if (quota.overage === 'active' && status.kind !== 'overage') {
       return {
-        label: '超额计费',
+        label: t('超额计费', 'Overage billing'),
         variant: 'error' as const,
-        title: `${quotaSnapshotTime} 的额度快照显示上游正以超额计费放行请求`,
+        title: t(
+          `${quotaSnapshotTime} 的额度快照显示上游正以超额计费放行请求`,
+          `The ${quotaSnapshotTime} quota snapshot shows the upstream allowing requests through overage billing`,
+        ),
       }
     }
     if (quota.overage === 'unknown' && status.kind !== 'overage-unknown') {
       return {
-        label: '超额待确认',
+        label: t('超额待确认', 'Overage unconfirmed'),
         variant: 'warning' as const,
-        title: `${quotaSnapshotTime} 的额度快照记录了超额计费，当前状态仍需确认`,
+        title: t(
+          `${quotaSnapshotTime} 的额度快照记录了超额计费，当前状态仍需确认`,
+          `The ${quotaSnapshotTime} quota snapshot recorded overage billing; the current state still needs confirmation`,
+        ),
       }
     }
     return null
@@ -156,7 +178,7 @@ export function CredentialCard({
                     value={name}
                     onChange={(event) => setName(event.target.value)}
                     autoFocus
-                    aria-label="账号名称"
+                    aria-label={t('账号名称', 'Account name')}
                   />
                   <Button
                     type="submit"
@@ -164,7 +186,7 @@ export function CredentialCard({
                     variant="outline"
                     loading={rename.isPending}
                     disabled={!name.trim()}
-                    aria-label="保存账号名称"
+                    aria-label={t('保存账号名称', 'Save account name')}
                   >
                     <CheckIcon />
                   </Button>
@@ -172,7 +194,7 @@ export function CredentialCard({
                     type="button"
                     size="icon"
                     variant="ghost"
-                    aria-label="取消重命名"
+                    aria-label={t('取消重命名', 'Cancel renaming')}
                     onClick={() => {
                       setEditing(false)
                       setName(cred.label)
@@ -188,7 +210,7 @@ export function CredentialCard({
                   <Checkbox
                     checked={selected}
                     onCheckedChange={(checked) => onSelectedChange?.(checked)}
-                    aria-label={`选择 ${cred.label}`}
+                    aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
                   />
                 )}
                 <Avatar className="hidden @sm/card:flex" aria-hidden="true">
@@ -220,7 +242,7 @@ export function CredentialCard({
               <Menu modal={false}>
                 <MenuTrigger
                   className={buttonVariants({ size: 'icon', variant: 'ghost' })}
-                  aria-label={`打开 ${cred.label} 菜单`}
+                  aria-label={t(`打开 ${cred.label} 菜单`, `Open menu for ${cred.label}`)}
                 >
                   <EllipsisIcon />
                 </MenuTrigger>
@@ -244,23 +266,23 @@ export function CredentialCard({
           <div className="flex flex-wrap items-center gap-2">
             <Badge
               variant={status.variant}
-              aria-label={`${cred.label}：${status.label}`}
+              aria-label={t(`${cred.label}：${status.label}`, `${cred.label}: ${status.label}`)}
               aria-describedby={status.attention ? statusDetailId : undefined}
             >
               {status.label}
             </Badge>
             {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
-            <Badge variant="outline" title="调度优先级，数值越小越优先">
+            <Badge variant="outline" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
               P{cred.priority}
             </Badge>
           </div>
 
           {status.attention && <AttentionSummary id={statusDetailId} status={status} />}
 
-          <section aria-label={`${cred.label} 的额度使用`} className="space-y-3">
+          <section aria-label={t(`${cred.label} 的额度使用`, `Quota usage for ${cred.label}`)} className="space-y-3">
             <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
               <div className="flex flex-wrap items-center gap-2">
-                <h4 className="font-medium text-sm">额度使用</h4>
+                <h4 className="font-medium text-sm">{t('额度使用', 'Quota usage')}</h4>
                 {secondaryOverage && (
                   <Badge
                     variant={secondaryOverage.variant}
@@ -274,13 +296,16 @@ export function CredentialCard({
               {cred.quota ? (
                 <span
                   className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                  title={formatFullTime(cred.quota.ts)}
+                  title={formatFullTime(cred.quota.ts, language)}
                 >
                   <ClockIcon className="size-3.5" />
-                  更新于 {relativeTime(cred.quota.ts, now)}
+                  {t(
+                    `更新于 ${relativeTime(cred.quota.ts, now, language)}`,
+                    `Updated ${relativeTime(cred.quota.ts, now, language)}`,
+                  )}
                 </span>
               ) : (
-                <span className="text-sm text-muted-foreground">暂无数据</span>
+                <span className="text-sm text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
             </div>
             {cred.quota && (has5h || has7d) ? (
@@ -288,7 +313,7 @@ export function CredentialCard({
                 {has5h && (
                   <QuotaMeter
                     credentialLabel={cred.label}
-                    label="5 小时"
+                    label={t('5 小时', '5 hours')}
                     util={quota.h5.utilization}
                     freshness={quota.h5.freshness}
                     reset={cred.quota.rl_5h_reset}
@@ -300,7 +325,7 @@ export function CredentialCard({
                 {has7d && (
                   <QuotaMeter
                     credentialLabel={cred.label}
-                    label="7 天"
+                    label={t('7 天', '7 days')}
                     util={quota.d7.utilization}
                     freshness={quota.d7.freshness}
                     reset={cred.quota.rl_7d_reset}
@@ -311,7 +336,7 @@ export function CredentialCard({
                 )}
               </div>
             ) : cred.quota ? (
-              <p className="text-sm text-muted-foreground">上游尚未返回额度窗口。</p>
+              <p className="text-sm text-muted-foreground">{t('上游尚未返回额度窗口。', 'The upstream has not returned quota windows yet.')}</p>
             ) : null}
           </section>
         </CardPanel>
@@ -322,16 +347,16 @@ export function CredentialCard({
               type="button"
               variant="ghost"
               onClick={() => setDevicesOpen(true)}
-              title="查看已绑定设备"
-              aria-label={`查看 ${cred.label} 的已绑定设备`}
+              title={t('查看已绑定设备', 'View bound devices')}
+              aria-label={t(`查看 ${cred.label} 的已绑定设备`, `View bound devices for ${cred.label}`)}
               aria-haspopup="dialog"
             >
               <SmartphoneIcon />
               <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
               <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
             </Button>
-            <span className="whitespace-nowrap text-sm" title="累计等价 API 费用">
-              <span className="text-muted-foreground">累计 </span>
+            <span className="whitespace-nowrap text-sm" title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}>
+              <span className="text-muted-foreground">{t('累计 ', 'Total ')}</span>
               <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
             </span>
           </div>
@@ -341,8 +366,8 @@ export function CredentialCard({
               checked={!cred.disabled}
               onCheckedChange={(enabled) => toggle.mutate(!enabled)}
               disabled={toggle.isPending}
-              title={switchTitle(cred)}
-              aria-label={`${cred.label}：${switchTitle(cred)}`}
+              title={switchTitle(cred, language)}
+              aria-label={`${cred.label}: ${switchTitle(cred, language)}`}
             />
           </div>
         </CardFooter>
@@ -366,6 +391,7 @@ export function CredentialCard({
 }
 
 function AttentionSummary({ id, status }: { id: string; status: CredentialStatusMeta }) {
+  const { t } = useI18n()
   const [expanded, setExpanded] = useState(false)
   const expandable = status.detail.length > 52
   const isError = status.variant === 'error' || status.variant === 'destructive'
@@ -396,7 +422,7 @@ function AttentionSummary({ id, status }: { id: string; status: CredentialStatus
             aria-expanded={expanded}
             onClick={() => setExpanded((current) => !current)}
           >
-            {expanded ? '收起说明' : '查看完整说明'}
+            {expanded ? t('收起说明', 'Show less') : t('查看完整说明', 'View full details')}
             <ChevronDownIcon className={cn('transition-transform', expanded && 'rotate-180')} />
           </Button>
         )}
@@ -424,16 +450,26 @@ function QuotaMeter({
   requests: number | null
   snapshotTs: number
 }) {
+  const { t, language, locale } = useI18n()
   if (util == null) {
     const expired = freshness === 'expired'
     const reason = expired && reset != null
-      ? `窗口已在 ${formatFullTime(reset)} 重置，之后没有新请求`
-      : '上游未返回该窗口的额度信息'
+      ? t(
+          `窗口已在 ${formatFullTime(reset, language)} 重置，之后没有新请求`,
+          `The window reset at ${formatFullTime(reset, language)} and has no newer requests`,
+        )
+      : t('上游未返回该窗口的额度信息', 'The upstream did not return quota data for this window')
     return (
-      <div className="space-y-1" title={`${reason}。最后一次快照：${formatFullTime(snapshotTs)}`}>
+      <div
+        className="space-y-1"
+        title={t(
+          `${reason}。最后一次快照：${formatFullTime(snapshotTs, language)}`,
+          `${reason}. Latest snapshot: ${formatFullTime(snapshotTs, language)}`,
+        )}
+      >
         <p className="font-medium text-sm">{label}</p>
         <p className="text-sm text-muted-foreground">
-          {expired ? '已重置，暂无新用量' : '暂无数据'}
+          {expired ? t('已重置，暂无新用量', 'Reset; no new usage') : t('暂无数据', 'No data')}
         </p>
       </div>
     )
@@ -451,11 +487,11 @@ function QuotaMeter({
     <Meter value={percentage} max={100}>
       <div className="flex items-center justify-between gap-2">
         <MeterLabel>
-          <span className="sr-only">{credentialLabel} 的 </span>
+          <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
           {label}
-          <span className="sr-only">额度使用率</span>
+          <span className="sr-only">{t('额度使用率', 'quota usage')}</span>
         </MeterLabel>
-        <MeterValue title={`快照于 ${formatFullTime(snapshotTs)}`}>
+        <MeterValue title={t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}>
           {() => `${percentage}%`}
         </MeterValue>
       </div>
@@ -465,14 +501,14 @@ function QuotaMeter({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         <span>
           <span className="font-medium text-foreground tabular-nums">
-            {requests == null ? '—' : requests.toLocaleString('zh-CN')}
-          </span>{' '}次请求
+            {requests == null ? '—' : requests.toLocaleString(locale)}
+          </span>{' '}{t('次请求', requests === 1 ? 'request' : 'requests')}
           <span className="mx-1.5" aria-hidden="true">·</span>
           <span className="font-medium text-foreground">{cost == null ? '—' : formatUsd(cost)}</span>
         </span>
         {reset != null && (
-          <span className="ml-auto" title={`${formatFullTime(reset)} 重置`}>
-            {formatClockTime(reset)} 重置
+          <span className="ml-auto" title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}>
+            {t(`${formatClockTime(reset, language)} 重置`, `Resets ${formatClockTime(reset, language)}`)}
           </span>
         )}
       </div>

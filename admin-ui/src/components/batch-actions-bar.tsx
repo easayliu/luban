@@ -5,6 +5,7 @@ import {
   deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities,
   type Credential,
 } from '@/api/credentials'
+import { useI18n } from '@/lib/i18n'
 import { cn, extractError } from '@/lib/utils'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -24,9 +25,9 @@ import { toastManager } from '@/components/ui/toast'
 import { Toolbar } from '@/components/ui/toolbar'
 
 const LIMIT_MODE_ITEMS = [
-  { value: 'default', label: '跟随默认' },
-  { value: 'unlimited', label: '不限设备' },
-  { value: 'custom', label: '独立上限' },
+  { value: 'default', chinese: '跟随默认', english: 'Use default' },
+  { value: 'unlimited', chinese: '不限设备', english: 'Unlimited devices' },
+  { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
 ] as const
 
 /**
@@ -43,6 +44,7 @@ export function BatchActionsBar({
   onSelectedChange: (next: Set<number>) => void
   onClear: () => void
 }) {
+  const { t, language, locale } = useI18n()
   const qc = useQueryClient()
   const [priority, setPriority] = useState(0)
   const [limitMode, setLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
@@ -52,41 +54,66 @@ export function BatchActionsBar({
 
   const ids = [...selected]
   const n = selected.size
+  const formattedCount = n.toLocaleString(locale)
+  const formattedTotal = all.length.toLocaleString(locale)
+  const englishAccountCount = `${formattedCount} ${n === 1 ? 'account' : 'accounts'}`
+  const limitModeItems = LIMIT_MODE_ITEMS.map((item) => ({
+    value: item.value,
+    label: t(item.chinese, item.english),
+  }))
   const notify = (msg: string, clearSelection = false) => {
     toastManager.add({ title: msg, type: 'success' })
     qc.invalidateQueries({ queryKey: ['credentials'] })
     if (clearSelection) onSelectedChange(new Set())
   }
   const onError = (error: unknown) => toastManager.add({
-    title: '批量操作失败',
-    description: extractError(error),
+    title: t('批量操作失败', 'Batch operation failed'),
+    description: extractError(error, language),
     type: 'error',
   })
 
   const applyPriority = useMutation({
     mutationFn: (p: number) => setPriorities(ids, p),
-    onSuccess: (_r, p) => notify(`已把 ${n} 个账号设为 P${p}`),
+    onSuccess: (_r, p) => notify(t(
+      `已把 ${formattedCount} 个账号设为 P${p}`,
+      `Set ${englishAccountCount} to P${p}`,
+    )),
     onError,
   })
   const applyLimit = useMutation({
     mutationFn: (v: number) => setDeviceLimits(ids, v),
     onSuccess: (_r, v) =>
       notify(
-        v > 0 ? `已把 ${n} 个账号的设备上限设为 ${v}`
-          : v === 0 ? `已把 ${n} 个账号改为跟随全局默认上限`
-          : `已把 ${n} 个账号设为不限设备数`,
+        v > 0 ? t(
+          `已把 ${formattedCount} 个账号的设备上限设为 ${v.toLocaleString(locale)}`,
+          `Set the device limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
+        )
+          : v === 0 ? t(
+            `已把 ${formattedCount} 个账号改为跟随全局默认上限`,
+            `Set ${englishAccountCount} to use the global default limit`,
+          )
+            : t(
+              `已把 ${formattedCount} 个账号设为不限设备数`,
+              `Set ${englishAccountCount} to unlimited devices`,
+            ),
       ),
     onError,
   })
   const applyDisabled = useMutation({
     mutationFn: (d: boolean) => setDisabledMany(ids, d),
-    onSuccess: (_r, d) => notify(`已${d ? '停用' : '启用'} ${n} 个账号`),
+    onSuccess: (_r, d) => notify(t(
+      `已${d ? '停用' : '启用'} ${formattedCount} 个账号`,
+      `${d ? 'Disabled' : 'Enabled'} ${englishAccountCount}`,
+    )),
     onError,
   })
   const applyDelete = useMutation({
     mutationFn: () => deleteCredentials(ids),
     // 账号已不存在，留着勾选没有意义，顺手清空。批量条不会随之卸载，确认框得自己关。
-    onSuccess: () => { setConfirmDelete(false); notify(`已删除 ${n} 个账号`, true) },
+    onSuccess: () => {
+      setConfirmDelete(false)
+      notify(t(`已删除 ${formattedCount} 个账号`, `Deleted ${englishAccountCount}`), true)
+    },
     onError: (e) => { setConfirmDelete(false); onError(e) },
   })
 
@@ -97,7 +124,7 @@ export function BatchActionsBar({
   const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
 
   return (
-    <Card render={<section aria-label="批量操作" />} className="rounded-xl">
+    <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-xl">
         <div className="flex min-h-14 flex-wrap items-center gap-3 p-3">
           <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs">
             <Checkbox
@@ -106,20 +133,21 @@ export function BatchActionsBar({
               onCheckedChange={(checked) => onSelectedChange(checked ? new Set(all.map((item) => item.id)) : new Set())}
             />
             <span aria-live="polite">
-              已选 <span className="tnum font-semibold text-foreground">{n}</span>
-              <span className="text-muted-foreground"> / {all.length}</span>
+              {t('已选', 'Selected')}{' '}
+              <span className="tnum font-semibold text-foreground">{formattedCount}</span>
+              <span className="text-muted-foreground"> / {formattedTotal}</span>
             </span>
           </label>
 
           <Toolbar className="gap-3 border-0 bg-transparent p-0 shadow-none">
-            <Button size="sm" variant="outline" aria-label="启用所选账号" disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === false} onClick={() => applyDisabled.mutate(false)}>
-              <PlayIcon /><span className="max-sm:sr-only">启用</span>
+            <Button size="sm" variant="outline" aria-label={t('启用所选账号', 'Enable selected accounts')} disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === false} onClick={() => applyDisabled.mutate(false)}>
+              <PlayIcon /><span className="max-sm:sr-only">{t('启用', 'Enable')}</span>
             </Button>
-            <Button size="sm" variant="outline" aria-label="停用所选账号" disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === true} onClick={() => applyDisabled.mutate(true)}>
-              <PauseIcon /><span className="max-sm:sr-only">停用</span>
+            <Button size="sm" variant="outline" aria-label={t('停用所选账号', 'Disable selected accounts')} disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === true} onClick={() => applyDisabled.mutate(true)}>
+              <PauseIcon /><span className="max-sm:sr-only">{t('停用', 'Disable')}</span>
             </Button>
-            <Button size="sm" variant="destructive-outline" aria-label="删除所选账号" disabled={busy} onClick={() => setConfirmDelete(true)}>
-              <Trash2Icon /><span className="max-sm:sr-only">删除</span>
+            <Button size="sm" variant="destructive-outline" aria-label={t('删除所选账号', 'Delete selected accounts')} disabled={busy} onClick={() => setConfirmDelete(true)}>
+              <Trash2Icon /><span className="max-sm:sr-only">{t('删除', 'Delete')}</span>
             </Button>
           </Toolbar>
 
@@ -130,11 +158,11 @@ export function BatchActionsBar({
             aria-controls="batch-advanced-settings"
             onClick={() => setAdvancedOpen((open) => !open)}
           >
-            更多设置
+            {t('更多设置', 'More settings')}
             <ChevronDownIcon className={cn('size-4 transition-transform', advancedOpen && 'rotate-180')} />
           </Button>
 
-          <Button size="icon-sm" variant="ghost" onClick={onClear} title="清空选择" aria-label="清空选择">
+          <Button size="icon-sm" variant="ghost" onClick={onClear} title={t('清空选择', 'Clear selection')} aria-label={t('清空选择', 'Clear selection')}>
             <XIcon />
           </Button>
         </div>
@@ -143,8 +171,8 @@ export function BatchActionsBar({
           <div id="batch-advanced-settings" className="grid gap-3 border-t p-3 lg:grid-cols-2">
             <div className="flex flex-wrap items-center gap-2">
               <div className="mr-auto min-w-28">
-                <div className="text-xs font-medium">调度优先级</div>
-                <div className="text-xs text-muted-foreground">数值越小越优先</div>
+                <div className="text-xs font-medium">{t('调度优先级', 'Scheduling priority')}</div>
+                <div className="text-xs text-muted-foreground">{t('数值越小越优先', 'Lower values have higher priority')}</div>
               </div>
               <NumberField
                 id="batch-priority"
@@ -156,24 +184,24 @@ export function BatchActionsBar({
               >
                 <NumberFieldGroup>
                   <NumberFieldDecrement />
-                  <NumberFieldInput aria-label="批量设置优先级" />
+                  <NumberFieldInput aria-label={t('批量设置优先级', 'Set priority for selected accounts')} />
                   <NumberFieldIncrement />
                 </NumberFieldGroup>
               </NumberField>
               <Button size="sm" loading={applyPriority.isPending} disabled={busy} onClick={() => applyPriority.mutate(priority)}>
-                应用
+                {t('应用', 'Apply')}
               </Button>
             </div>
 
             <div className="flex flex-wrap items-center gap-2 lg:border-l lg:pl-3">
               <div className="mr-auto min-w-28">
-                <div className="text-xs font-medium">设备上限</div>
-                <div className="text-xs text-muted-foreground">默认、不限或独立上限</div>
+                <div className="text-xs font-medium">{t('设备上限', 'Device limit')}</div>
+                <div className="text-xs text-muted-foreground">{t('默认、不限或独立上限', 'Default, unlimited, or custom')}</div>
               </div>
-              <Select items={LIMIT_MODE_ITEMS} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
-                <SelectTrigger aria-label="批量设置设备上限策略" size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+              <Select items={limitModeItems} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
+                <SelectTrigger aria-label={t('批量设置设备上限策略', 'Set device limit policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
                 <SelectPopup>
-                  {LIMIT_MODE_ITEMS.map((item) => (
+                  {limitModeItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
                   ))}
                 </SelectPopup>
@@ -182,13 +210,13 @@ export function BatchActionsBar({
                 <NumberField value={customLimit} min={1} step={1} size="sm" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
                   <NumberFieldGroup>
                     <NumberFieldDecrement />
-                    <NumberFieldInput aria-label="批量设置独立设备上限" />
+                    <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
                     <NumberFieldIncrement />
                   </NumberFieldGroup>
                 </NumberField>
               )}
               <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
-                应用
+                {t('应用', 'Apply')}
               </Button>
             </div>
           </div>
@@ -197,15 +225,20 @@ export function BatchActionsBar({
         <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
           <AlertDialogPopup>
             <AlertDialogHeader>
-              <AlertDialogTitle>删除 {n} 个账号</AlertDialogTitle>
+              <AlertDialogTitle>
+                {t(`删除 ${formattedCount} 个账号`, `Delete ${englishAccountCount}`)}
+              </AlertDialogTitle>
               <AlertDialogDescription>
-                确定删除选中的 {n} 个账号？历史用量记录与设备绑定将一并清除，且无法恢复。
+                {t(
+                  `确定删除选中的 ${formattedCount} 个账号？历史用量记录与设备绑定将一并清除，且无法恢复。`,
+                  `Delete the selected ${englishAccountCount}? Usage history and device bindings will also be removed and cannot be recovered.`,
+                )}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
-              <AlertDialogClose render={<Button variant="outline" />}>取消</AlertDialogClose>
+              <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
               <Button variant="destructive" loading={applyDelete.isPending} onClick={() => applyDelete.mutate()}>
-                删除 {n} 个
+                {t(`删除 ${formattedCount} 个`, `Delete ${formattedCount}`)}
               </Button>
             </AlertDialogFooter>
           </AlertDialogPopup>
