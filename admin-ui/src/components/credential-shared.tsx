@@ -72,6 +72,7 @@ export interface QuotaRiskMeta {
 
 export type CredentialStatusKind =
   | 'banned'
+  | 'rate-limited'
   | 'disabled'
   | 'overage'
   | 'overage-unknown'
@@ -194,11 +195,26 @@ function statusFromQuota(
   quota: QuotaRiskMeta,
   language: Language,
 ): CredentialStatusMeta {
+  // 限流暂停必须排在封禁之前判：两者都是 disabled + ban_reason，只有 resume_at 能区分。
+  // 漏了这一档的话，一个只是额度用完、几小时后自己就回来的号会被显示成「已封禁」，
+  // 而封禁在这套界面里的含义是「需要人工介入，这个号可能废了」——两回事。
+  if (cred.resume_at != null) {
+    return {
+      kind: 'rate-limited', variant: 'warning',
+      label: localize(language, '限流暂停', 'Rate limited'),
+      detail: localize(
+        language,
+        `账号额度已用尽，已移出调度池，${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或做一次连通性测试立即恢复`,
+        `Quota exhausted; removed from the scheduling pool and resuming automatically at ${formatFullTime(cred.resume_at, language)}. You can also enable it manually or run a connectivity test to restore it now`,
+      ),
+      attention: true, rank: 6,
+    }
+  }
   if (cred.ban_reason) {
     return {
       kind: 'banned', variant: 'error',
       label: localize(language, '已封禁', 'Banned'), detail: cred.ban_reason,
-      attention: true, rank: 6,
+      attention: true, rank: 7,
     }
   }
   if (cred.disabled) {
@@ -310,9 +326,12 @@ export function isNearLimit(cred: Credential, now = currentUnixSeconds()): boole
  * 下一个请求会自动把它刷好。把它算成异常，等于每天早上给一批好号刷上红色、排到最前、
  * 塞进「需处理」——而这里真正要回答的是「refresh_token 还灵不灵」，那个答案在 `ban_reason`：
  * 刷新失败且判定为永久失效时，后端会 `mark_banned` 写进去。
+ *
+ * 限流暂停（`resume_at != null`）同样不算：那时 `ban_reason` 里写的是「额度用尽，几点恢复」，
+ * token 好好的、号也好好的，到点自己就回调度池了，不需要任何人处理。
  */
 export function isAbnormal(cred: Credential): boolean {
-  return !!cred.ban_reason
+  return !!cred.ban_reason && cred.resume_at == null
 }
 
 // ---------- 排序 ----------
@@ -1015,6 +1034,18 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
   className: string
   title?: string
 } {
+  // 同 `statusFromQuota`：限流暂停要排在封禁之前，否则会被显示成「已封禁」。
+  if (cred.resume_at != null) {
+    return {
+      text: localize(language, '限流暂停', 'Rate limited'),
+      className: 'font-medium text-warning-foreground',
+      title: localize(
+        language,
+        `额度用尽，${formatFullTime(cred.resume_at, language)} 自动恢复调度`,
+        `Quota exhausted; scheduling resumes at ${formatFullTime(cred.resume_at, language)}`,
+      ),
+    }
+  }
   if (cred.ban_reason) {
     return {
       text: localize(language, '已封禁', 'Banned'),

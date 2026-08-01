@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  CalendarDaysIcon,
   CheckIcon,
   ChevronDownIcon,
   ClockIcon,
@@ -92,18 +93,7 @@ export function CredentialCard({
       : { label: t('自定义', 'Custom'), variant: 'info' as const }
   const titleId = `credential-card-title-${cred.id}`
   const statusDetailId = `credential-card-status-${cred.id}`
-  const lastUsed = cred.last_used == null
-    ? { label: t('尚未使用', 'Never used'), title: t('该账号尚未转发过请求', 'This account has not forwarded any requests yet') }
-    : {
-        label: t(
-          `使用于 ${relativeTime(cred.last_used, now, language)}`,
-          `Used ${relativeTime(cred.last_used, now, language)}`,
-        ),
-        title: t(
-          `最近使用于 ${formatFullTime(cred.last_used, language)}`,
-          `Last used ${formatFullTime(cred.last_used, language)}`,
-        ),
-      }
+  const added = relativeTime(cred.created_at, now, language)
   const quotaSnapshotTime = cred.quota
     ? formatFullTime(cred.quota.ts, language)
     : t('未知时间', 'unknown time')
@@ -224,12 +214,18 @@ export function CredentialCard({
                   >
                     {cred.label}
                   </h3>
-                  <CardDescription className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-normal">
+                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
-                    <span aria-hidden>·</span>
-                    <span className="inline-flex items-center gap-1" title={lastUsed.title}>
-                      <ClockIcon className="size-3.5" />
-                      {lastUsed.label}
+                    <span aria-hidden="true">·</span>
+                    <span
+                      className="inline-flex min-w-0 items-center gap-1"
+                      title={t(
+                        `添加于 ${formatFullTime(cred.created_at, language)}`,
+                        `Added ${formatFullTime(cred.created_at, language)}`,
+                      )}
+                    >
+                      <CalendarDaysIcon className="size-3.5 shrink-0" />
+                      <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
                     </span>
                   </CardDescription>
                 </div>

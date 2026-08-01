@@ -27,6 +27,14 @@ pub struct Credential {
     pub ban_reason: Option<String>,
     /// 账号 UUID（来自 `/api/oauth/profile` 的 `account.uuid`）；转发时用于身份伪装。
     pub account_uuid: Option<String>,
+    /// 被上游限流自动停用后，**到点自动重新启用**的 Unix 时间戳（秒）；`None` 表示不自动
+    /// 恢复（人工停用、封号，或压根没停用）。
+    ///
+    /// 这一列是「限流停用」与「人工/封号停用」的唯一区分点：
+    /// [`crate::store::CredentialStore::select_for_device`] 惰性把到点的号启用回来，
+    /// 连通性测试通过也只会自动启用 `resume_at` 非空的号——人工关掉的不该被一次测试打开。
+    /// 见 [`crate::store::CredentialStore::pause_for_rate_limit`]。
+    pub resume_at: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
 }

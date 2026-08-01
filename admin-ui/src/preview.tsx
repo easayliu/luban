@@ -59,6 +59,7 @@ const banned: Credential = {
   last_used: now - 120,
   cost_total: 87.77,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -96,6 +97,7 @@ const normal: Credential = {
   last_used: now - 5,
   cost_total: 6.85,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -132,6 +134,7 @@ const overage: Credential = {
   last_used: now - 18,
   cost_total: 122.48,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now - 18,
     unified_status: 'allowed',
@@ -168,6 +171,7 @@ const nearLimit: Credential = {
   last_used: now - 90,
   cost_total: 31.09,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now - 90,
     unified_status: 'allowed_warning',
@@ -204,6 +208,7 @@ const unknownOverage: Credential = {
   last_used: now - 4 * 60,
   cost_total: 52.36,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now - 4 * 60,
     unified_status: 'allowed',
@@ -239,6 +244,7 @@ const cooldown: Credential = {
   last_used: now - 15,
   cost_total: 0.84,
   rate_limited_secs: 725,
+  resume_at: null,
   quota: null,
 }
 
@@ -262,6 +268,7 @@ const disabledHistoricalOverage: Credential = {
   last_used: now - 6 * 3600,
   cost_total: 44.2,
   rate_limited_secs: 0,
+  resume_at: null,
   quota: {
     ts: now - 6 * 3600,
     unified_status: 'allowed',

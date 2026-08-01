@@ -149,7 +149,11 @@ pub async fn run(
         // 而上游官方 /v1/messages 的上限是 32MB，长对话/带附件的合法请求很容易超 2MB。
         // 这里放到 64MB 留出余量，真正的大小判决交给上游；管理接口维持默认即可。
         .route("/v1/{*path}", any(proxy::handle).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
-        .fallback(admin_ui::fallback)
+        // 个别移动端/前置层会以 POST 打开首页；用 PRG 把最终文档历史落成 GET。
+        .route("/", get(admin_ui::fallback).post(admin_ui::redirect_root_post))
+        // SPA 只允许由 GET/HEAD 打开。若把 POST 也兜底成 index.html，浏览器会把页面
+        // 记作表单提交结果，之后在移动端刷新便弹出“确认重新提交表单”。
+        .fallback_service(get(admin_ui::fallback))
         .with_state(state);
 
     let bind = format!("{host}:{port}");
@@ -594,16 +598,18 @@ async fn test_credential(
     Ok(Json(proxy::probe(&state, &cred, model).await))
 }
 
-/// 手动解除该凭证的限流冷却（账号级 + 所有模型格一起清）。
+/// 手动解除该凭证的限流状态：进程内的模型级冷却全清，且若它是被账号级限流**自动停用**的，
+/// 一并重新启用（等价于手动打开启用开关，只是不会误碰人工停用/封号的号）。
 ///
-/// 冷却只是选号提示：解除错了，下一条请求撞上 429 会重新打上，最坏多一次往返——所以这里
-/// 不做任何「确认上游真的恢复了」的前置校验，想稳妥的话入口旁边就是连通性测试。
+/// 解除错了，下一条请求撞上 429 会重新打上，最坏多一次往返——所以这里不做任何「确认上游真的
+/// 恢复了」的前置校验，想稳妥的话入口旁边就是连通性测试（它通过时也会自动恢复调度）。
 async fn clear_cooldown(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<CredentialView>, ApiError> {
     state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     state.store.clear_rate_limited(id, None);
+    state.store.resume_if_rate_limited(id).map_err(internal)?;
     view_of(&state, id)
 }
 
@@ -943,9 +949,17 @@ struct CredentialView {
     last_used: Option<i64>,
     /// 累计等价 API 费用（USD）。
     cost_total: f64,
-    /// 被上游 429 后的剩余冷却秒数；`0` 表示不在冷却中。冷却期间该号在选号时让位，
-    /// 但**不是停用**——到点自动恢复，不需要人工介入。见 `crate::store::RateLimitCooldown`。
+    /// 被上游 429 后的剩余冷却秒数；`0` 表示不在冷却中。这一项只反映**模型级**冷却
+    /// （容量限制那种，默认 30 秒，记在进程内）：该号在选号时让位，但账号本身没被停用。
+    /// 账号级限流走的是下面的 `resume_at`。见 `crate::store::RateLimitCooldown`。
     rate_limited_secs: i64,
+    /// 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；`None` 表示
+    /// 不自动恢复（正常在用、人工停用、或封号）。
+    ///
+    /// 前端据此把「被限流暂停」和「已停用/已封号」分开显示：两者 `disabled` 都是 `true`，
+    /// 区别只在这一项。展示绝对时刻而非倒计时的理由同 `expires_at`。恢复有三条路：到点自动、
+    /// 连通性测试通过、手动打开启用开关。
+    resume_at: Option<u64>,
 }
 
 impl CredentialView {
@@ -975,6 +989,7 @@ impl CredentialView {
             last_used: None,
             cost_total: 0.0,
             rate_limited_secs: 0,
+            resume_at: c.resume_at,
         }
     }
 

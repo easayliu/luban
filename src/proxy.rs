@@ -81,10 +81,15 @@ pub async fn handle(
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(%method, path = %path_and_query, error = %e, "拒绝转发");
-            // 裸请求速率达上限 → 429 且带 `retry-after`：这里的等待时间是可算的（窗口长度），
-            // 给出来客户端才知道该等多久，而不是立刻重试再撞一次。
-            if let Some(rl) = e.downcast_ref::<store::BareRateLimited>() {
-                let retry = rl.retry_after_secs.to_string();
+            // 两类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
+            // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；所有号都在上游 429
+            // 冷却中（硬门禁）取最早解冻的那个的剩余时间。
+            let computable_retry =
+                e.downcast_ref::<store::BareRateLimited>().map(|rl| rl.retry_after_secs).or_else(
+                    || e.downcast_ref::<store::AllRateLimited>().map(|rl| rl.retry_after_secs),
+                );
+            if let Some(secs) = computable_retry {
+                let retry = secs.to_string();
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     [(header::RETRY_AFTER, retry)],
@@ -185,7 +190,7 @@ pub async fn handle(
             _ => None,
         };
         let Some(info) = limited else { break (upstream, resp) };
-        // 基础窗口真耗尽 → 冷却整个账号；只有超额池（7d_oi）满或纯容量限制 → 只冷却这个模型。
+        // 基础窗口真耗尽 → 停调度整个账号；只有超额池（7d_oi）满或纯容量限制 → 只冷却这个模型。
         let scope = rate_limit_scope(&info, req_model.as_deref());
         let cooldown = info.cooldown(scope.account_level());
         tracing::warn!(
@@ -201,7 +206,7 @@ pub async fn handle(
         if max_retry == 0 {
             break (upstream, resp);
         }
-        state.store.mark_rate_limited(cred.id, scope.model(), cooldown);
+        park_rate_limited(&state.store, &cred, &scope, cooldown);
         tried.push(cred.id);
         if retried >= max_retry {
             tracing::warn!(
@@ -2029,9 +2034,8 @@ impl LimitScope {
 fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     let Some(model) = model else { return LimitScope::Account };
     let rejected = |s: &str| s.contains("rate_limited") || s.contains("rejected");
-    let overage = |w: &str| w.ends_with("_oi") || w.contains("overage");
-    let base_gone = info.window_status.iter().any(|(w, s)| !overage(w) && rejected(s))
-        || info.window_utilization.iter().any(|(w, u)| !overage(w) && *u >= 1.0);
+    let base_gone = info.window_status.iter().any(|(w, s)| !is_overage_window(w) && rejected(s))
+        || info.window_utilization.iter().any(|(w, u)| !is_overage_window(w) && *u >= 1.0);
     let no_detail = info.window_status.is_empty() && info.window_utilization.is_empty();
     let unified_gone = no_detail && info.unified_status.as_deref().is_some_and(rejected);
     if base_gone || unified_gone {
@@ -2039,6 +2043,72 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     } else {
         LimitScope::Model(model.to_string())
     }
+}
+
+/// 一次确认的上游 429 该怎么把这个号挪出调度池，两档分开处理：
+///
+/// - **账号级**（基础窗口真耗尽）：走 [`store::CredentialStore::pause_for_rate_limit`]，
+///   把**调度开关关掉并落库**，同时记下到点自动恢复的时刻。落库是关键——额度耗尽动辄几小时
+///   到几天，只记内存的话一次进程重启就忘了，重启后又拿这个号去撞一发 429；而且后台看不到
+///   这个号为什么不干活。恢复有三条路：到点惰性自动恢复、连通性测试通过自动恢复、
+///   控制台手动打开。
+/// - **模型级**（容量限制/超额池满，账号本身好着）：仍走进程内的
+///   [`store::CredentialStore::mark_rate_limited`]。这一档默认才 30 秒，落库既不值得、也会
+///   在卡片上把一个健康账号显示成「已停用」——它的 sonnet/opus 明明还在正常服务。
+fn park_rate_limited(
+    store: &store::CredentialStore,
+    cred: &crate::credentials::Credential,
+    scope: &LimitScope,
+    cooldown: std::time::Duration,
+) {
+    let Some(model) = scope.model() else {
+        let resume_at = crate::credentials::now_secs() + cooldown.as_secs();
+        let reason = format!("上游限流：账号额度耗尽，约 {} 后自动恢复调度", human_secs(cooldown));
+        match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
+            Ok(_) => tracing::warn!(
+                cred = format!("#{} {}", cred.id, cred.label),
+                resume_at,
+                "账号级限流：已移出调度池，到点自动恢复（也可在控制台手动启用或做一次连通性测试）"
+            ),
+            // 落库失败不该把这条请求也搭进去：至少退回进程内冷却，本进程内仍不会再选它。
+            Err(e) => {
+                tracing::error!(
+                    cred = format!("#{} {}", cred.id, cred.label),
+                    error = %e,
+                    "限流停用写库失败，退回进程内冷却"
+                );
+                store.mark_rate_limited(cred.id, None, cooldown);
+            }
+        }
+        return;
+    };
+    store.mark_rate_limited(cred.id, Some(model), cooldown);
+}
+
+/// 把秒数写成人话（`3 小时 12 分钟` / `45 分钟` / `30 秒`），写进 `ban_reason` 给人看。
+///
+/// 只保留两级、且不做四舍五入：这行字是给人快速判断「还要等多久」的，`2 天 3 小时` 足够，
+/// 精确到秒反而更难读。真要精确时刻的话，`resume_at` 是原样落库的，前端自己格式化即可。
+fn human_secs(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (days, hours, mins) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
+    match (days, hours, mins) {
+        (0, 0, 0) => format!("{secs} 秒"),
+        (0, 0, m) => format!("{m} 分钟"),
+        (0, h, 0) => format!("{h} 小时"),
+        (0, h, m) => format!("{h} 小时 {m} 分钟"),
+        (d, 0, _) => format!("{d} 天"),
+        (d, h, _) => format!("{d} 天 {h} 小时"),
+    }
+}
+
+/// 该窗口是否属于**超额/回补池**而非账号基础额度（实测形态：`7d_oi`、`overage`）。
+///
+/// 它满了只说明「这条超额通道走不通」，不代表账号额度耗尽——同一时刻别的模型照常 200，
+/// 故既不判账号级（[`rate_limit_scope`]），也不拿它的 reset 当账号冷却
+/// （[`RateLimitInfo::exhausted_base_reset`]）。两处必须同一口径，故抽成一个函数。
+fn is_overage_window(w: &str) -> bool {
+    w.ends_with("_oi") || w.contains("overage")
 }
 
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
@@ -2073,6 +2143,9 @@ struct RateLimitInfo {
     window_status: Vec<(String, String)>,
     /// 所有 `…-<窗口>-utilization` 的取值。同上，全收。
     window_utilization: Vec<(String, f64)>,
+    /// 所有 `…-<窗口>-reset` 的取值（unix 秒，窗口名原样保留）。同上，全收——冷却要睡到
+    /// **被拒的那个窗口**自己的重置时刻，而它未必是 5h/7d 中的一个。
+    window_reset: Vec<(String, i64)>,
     /// 全部匹配到的限流/anthropic- 头，`k=v` 以 `, ` 连接。
     raw: String,
 }
@@ -2125,6 +2198,12 @@ impl RateLimitInfo {
                     && let Ok(u) = val.parse::<f64>()
                 {
                     info.window_utilization.push((win.to_string(), u));
+                } else if let Some(win) = rest.strip_suffix("-reset")
+                    && let Ok(ts) = val.parse::<i64>()
+                {
+                    // 不带窗口名的 `…-unified-reset` 不会命中：那时 rest 是 `reset`，
+                    // 剥不掉 `-reset` 前缀那一横，不会造出一个名字为空的假窗口。
+                    info.window_reset.push((win.to_string(), ts));
                 }
             }
         }
@@ -2134,22 +2213,30 @@ impl RateLimitInfo {
 
     /// 该凭证被上游 429 之后应冷却多久。
     ///
+    /// **冷却时长一律由上游给的重置时刻算出，没有任何写死的窗口长度**——「5h 窗口」指的是
+    /// 它的统计口径，不是「睡 5 小时」：账号是在自己那个窗口的 `*-reset` 时刻回血的，那才是
+    /// 该醒的点。只有上游一个时间都没给时才落到默认值。
+    ///
     /// **账号级**（额度真耗尽）取值优先级：
     /// 1. `retry-after`（秒）——上游对这次拒绝给出的明确等待时间，最可信（实测给的是
     ///    228721 秒 ≈ 63 小时，直指 7 天窗口的重置时刻，说明它确实算得很准）；
-    /// 2. 不带窗口名的 `anthropic-ratelimit-unified-reset` 减去当前时刻——上游给的「整体
-    ///    什么时候恢复」，比按 `representative-claim` 反查窗口名可靠；
-    /// 3. 各窗口 `*-reset` 里**最早**的那个，宁可早醒也不要多睡；
-    /// 4. 都没有 → [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
+    /// 2. **被拒/打满的那个基础窗口**自己的 `*-reset`（见 [`Self::exhausted_base_reset`]）
+    ///    ——判账号级正是因为它满了，它什么时候重置，账号就什么时候能用；
+    /// 3. 不带窗口名的 `anthropic-ratelimit-unified-reset` 减去当前时刻——上游给的「整体
+    ///    什么时候恢复」，逐窗口明细缺失时的兜底；
+    /// 4. 各窗口 `*-reset` 里**最早**的那个，连哪个满了都不知道时，宁可早醒也不要多睡；
+    /// 5. 都没有 → [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
     ///
     /// **模型级不看任何 reset**：窗口都没跑满，reset 说的是「这个窗口什么时候重置」，跟
     /// 「这个模型什么时候有容量」是两码事，拿它当冷却会让一个好账号的某个模型白白闲置几小时。
     /// 那一档只认 `retry-after`，没有就用 [`DEFAULT_MODEL_COOLDOWN_SECS`]。
     ///
-    /// 结果夹在 `[1s, 24h]`。上限从 6h 放宽到 24h 是实测改的：上游真的会给 63 小时的
-    /// `retry-after`，夹到 6h 等于每 6 小时把这个号放出去白撞一次 429。再往上放宽意义不大
-    /// ——冷却记在内存里，进程重启就清了。冷却本身也只是**选号提示**（见
-    /// [`store::CredentialStore::select_for_device`]），全部号都在冷却时会被忽略。
+    /// 结果夹在 `[1s, `[`MAX_RATE_LIMIT_COOLDOWN_SECS`]`]`：**睡满上游说的那个 reset**，
+    /// 到点自动回到调度池里参与正常选号，不做定时探活、也不提前放出去撞。上限经历过
+    /// 6h → 24h → 7d：夹得比真实窗口短，等于每到上限就把这个号放出去白撞一次 429
+    /// （上游实测给过 63 小时的 `retry-after`，7d 窗口耗尽时还会更长）。
+    /// 冷却现在是硬门禁（见 [`store::CredentialStore::select_for_device`]），
+    /// 睡过头的代价由「连通性测试成功自动解除」和控制台的手动解除兜底。
     fn cooldown(&self, account_level: bool) -> std::time::Duration {
         let now = crate::credentials::now_secs() as i64;
         let earliest_window_reset = self
@@ -2158,23 +2245,49 @@ impl RateLimitInfo {
             .filter(|reset| *reset > now)
             .min()
             .map(|reset| reset - now);
+        let future_secs = |reset: i64| Some(reset - now).filter(|d| *d > 0);
         let fallback = if account_level {
-            self.unified_reset
-                .map(|reset| reset - now)
-                .filter(|d| *d > 0)
+            self.exhausted_base_reset()
+                .and_then(future_secs)
+                .or_else(|| self.unified_reset.and_then(future_secs))
                 .or(earliest_window_reset)
                 .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
         } else {
             DEFAULT_MODEL_COOLDOWN_SECS
         };
-        let secs = self.retry_after.unwrap_or(fallback).clamp(1, 24 * 3600);
+        let secs = self.retry_after.unwrap_or(fallback).clamp(1, MAX_RATE_LIMIT_COOLDOWN_SECS);
         std::time::Duration::from_secs(secs as u64)
     }
 
-    /// 各窗口的 `*-reset`（unix 秒）。目前专用字段只解析了 5h/7d 两个，够用即可——
-    /// 它只是 `unified-reset` 缺失时的兜底，而实测那个头一直都在。
+    /// 各窗口的 `*-reset`（unix 秒），全窗口通收后再并上 5h/7d 专用字段（重复无所谓，
+    /// 调用方只取 min/max）。
     fn window_reset_candidates(&self) -> Vec<i64> {
-        [self.five_h_reset, self.seven_d_reset].into_iter().flatten().collect()
+        self.window_reset
+            .iter()
+            .map(|(_, ts)| *ts)
+            .chain([self.five_h_reset, self.seven_d_reset].into_iter().flatten())
+            .collect()
+    }
+
+    /// 已被拒/已打满的**基础窗口**（排除超额族）中最晚的那个 `*-reset`——账号级冷却该睡到的
+    /// 时刻，也是 [`rate_limit_scope`] 判账号级的依据本身。
+    ///
+    /// 取**最晚**而不是最早：5h 和 7d 同时耗尽时，5h 到点了 7d 照样拦着，早醒只是白撞一发
+    /// 429 再重新睡回去。而只有一个窗口满时 max 退化成它自己，正是要的答案。
+    ///
+    /// 只看基础窗口，与 [`rate_limit_scope`] 用同一个 [`is_overage_window`] 口径：超额池
+    /// （`7d_oi`/`overage`）满不是账号额度耗尽，它压根走不到账号级这一档。
+    fn exhausted_base_reset(&self) -> Option<i64> {
+        let rejected = |w: &str| {
+            self.window_status.iter().any(|(name, s)| {
+                name == w && (s.contains("rate_limited") || s.contains("rejected"))
+            }) || self.window_utilization.iter().any(|(name, u)| name == w && *u >= 1.0)
+        };
+        self.window_reset
+            .iter()
+            .filter(|(w, _)| !is_overage_window(w) && rejected(w))
+            .map(|(_, ts)| *ts)
+            .max()
     }
 }
 
@@ -2183,6 +2296,14 @@ impl RateLimitInfo {
 /// 取 30 秒：容量限制是「这一阵挤」，不是「这个号没额度了」，躲一小会儿就该让它回来试；
 /// 押太久等于把一个健康账号的这个模型白白闲置。
 const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
+
+/// 冷却时长的上限：7 天窗口 + 1 小时余量。
+///
+/// 账号的基础窗口最长就是 7d，睡满它即可；留 1 小时余量是因为 `retry-after` 是相对本次
+/// 请求算的，而 reset 时刻本身还可能被上游微调。上限存在的意义只剩「挡住明显异常的头」
+/// （比如 reset 落在几年后），不再是「每隔 N 小时放出去试一次」——那种试探每次都要白撞
+/// 一发 429，而额度没到点是不会自己长回来的。
+const MAX_RATE_LIMIT_COOLDOWN_SECS: i64 = 7 * 24 * 3600 + 3600;
 
 /// 上游 429 但没给任何可用的等待时间时，凭证的默认冷却时长。
 ///
@@ -2490,14 +2611,29 @@ pub async fn probe(
                     scope = scope.label(),
                     cooldown_secs = cooldown.as_secs(),
                     ratelimit = %info.raw,
-                    "连通性测试遇上游 429，该号进入冷却"
+                    "连通性测试遇上游 429，该号移出调度池"
                 );
-                state.store.mark_rate_limited(cred.id, scope.model(), cooldown);
+                park_rate_limited(&state.store, cred, &scope, cooldown);
             } else if status.is_success() {
                 // 对称的另一面：测试成功同样照真实判决恢复——上游此刻放行了「这个账号 +
-                // 这个模型」，账号级与该模型的冷却都不再成立，当场解除，不必干等冷却到点
-                // （上游的 retry-after 偏保守时，好号会被白白晾着）。其它模型的格子不动：
-                // sonnet 通了证明不了 fable 通。
+                // 这个模型」，不必干等到点（上游的 retry-after 偏保守时，好号会被白白晾着）。
+                //
+                // 两档各恢复各的：账号级那档是**落库的调度开关**，测试通过即重新启用
+                // （只对限流暂停的号生效，人工关掉的不该被一次测试打开）；模型级那档是进程内
+                // 冷却，清账号格 + 被测模型那一格，其它模型不动——sonnet 通了证明不了 fable 通。
+                match state.store.resume_if_rate_limited(cred.id) {
+                    Ok(true) => tracing::info!(
+                        cred = format!("#{} {}", cred.id, cred.label),
+                        model,
+                        "连通性测试通过，该号已重新进入调度池"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::error!(
+                        cred = format!("#{} {}", cred.id, cred.label),
+                        error = %e,
+                        "连通性测试通过但恢复调度写库失败"
+                    ),
+                }
                 state.store.clear_rate_limited(cred.id, Some(model));
             }
             match tokio::time::timeout_at(deadline, up.bytes()).await {
@@ -3262,6 +3398,7 @@ mod tests {
             device_limit: 0,
             ban_reason: None,
             account_uuid: Some(ACCOUNT_UUID.into()),
+            resume_at: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -4184,8 +4321,9 @@ mod tests {
         ]);
         let scope = super::rate_limit_scope(&real, fable);
         assert_eq!(scope.model(), fable, "只有超额池（7d_oi）满 → 模型级，账号其余模型照常");
-        // retry-after 优先（直指池子重置时刻），但夹到 24h：63 小时不该原样吃下。
-        assert_eq!(real.cooldown(false).as_secs(), 24 * 3600);
+        // retry-after 优先且原样吃下（63 小时直指超额池的重置时刻）：睡满它、到点自己回池，
+        // 中途放出去只会白撞 429——上限只挡明显异常的头，见 [`MAX_RATE_LIMIT_COOLDOWN_SECS`]。
+        assert_eq!(real.cooldown(false).as_secs(), 228721);
 
         // 第二次抓包（2026-07-30，#54）：多了 overage-status 与 org_level_disabled，
         // 判定应当相同。overage 窗口被拒同样不算账号级。
@@ -4236,6 +4374,138 @@ mod tests {
         let bare = hdr(&[]);
         assert!(super::rate_limit_scope(&bare, None).account_level());
         assert_eq!(bare.cooldown(true).as_secs(), 60);
+
+        // 7d 窗口耗尽要睡满 7 天（冷却是硬门禁，中途放出去只会白撞）；离谱的头才被上限挡下。
+        let seven_d = hdr(&[("retry-after", &(7 * 24 * 3600).to_string())]);
+        assert_eq!(seven_d.cooldown(true).as_secs(), 7 * 24 * 3600);
+        let absurd = hdr(&[("retry-after", "999999999")]);
+        assert_eq!(absurd.cooldown(true).as_secs(), super::MAX_RATE_LIMIT_COOLDOWN_SECS as u64);
+    }
+
+    /// **fable 撞 429 绝不能停用整个账号。**
+    ///
+    /// 这是一条真实事故的护栏：fable 走的是超额池（`7d_oi`），它满了的时候基础 5h/7d 还空着，
+    /// 同一账号的 sonnet/opus 照常 200。把这种 429 判成账号级，等于因为一个模型没容量就把整个
+    /// 号从调度池里摘掉——现在账号级还会**落库停用**，误伤代价比以前的进程内冷却大得多，
+    /// 所以这里直接钉住 [`super::park_rate_limited`] 的落点，而不只是钉判定函数。
+    #[test]
+    fn model_level_429_never_disables_the_account() {
+        let hdr = |kv: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in kv {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None).unwrap();
+        let fable = Some("claude-fable-5");
+
+        // 实测形态：只有超额池满，基础窗口都有余量。
+        let oi_full = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.20"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.70"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+            ("retry-after", "304802"),
+        ]);
+        let scope = super::rate_limit_scope(&oi_full, fable);
+        assert_eq!(scope.model(), fable, "超额池满只该判模型级");
+        super::park_rate_limited(&store, &cred, &scope, oi_full.cooldown(false));
+
+        let after = store.get(cred.id).unwrap().unwrap();
+        assert!(!after.disabled, "fable 撞 429 不该停用整个账号");
+        assert!(after.resume_at.is_none(), "更不该写恢复时刻——账号压根没被停");
+        assert_eq!(after.ban_reason, None, "卡片上不该显示成这个号出了问题");
+        // 但 fable 自己确实要让位，而 sonnet 照常可用。
+        let pick = |m| {
+            store.select_for_device(store::Select { model: Some(m), ..Default::default() }).is_ok()
+        };
+        assert!(!pick("claude-fable-5"), "fable 应被模型级冷却挡下");
+        assert!(pick("claude-sonnet-5"), "同一个号的 sonnet 不该被牵连");
+
+        // 对照组：基础窗口真耗尽才落库停用，并写下到点自动恢复的时刻。
+        let base_gone = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("retry-after", "3600"),
+        ]);
+        let scope = super::rate_limit_scope(&base_gone, fable);
+        assert!(scope.account_level(), "基础窗口耗尽才是账号级");
+        super::park_rate_limited(&store, &cred, &scope, base_gone.cooldown(true));
+
+        let after = store.get(cred.id).unwrap().unwrap();
+        assert!(after.disabled, "额度真耗尽才关调度开关");
+        let resume_at = after.resume_at.expect("应写下自动恢复时刻");
+        let wait = resume_at as i64 - crate::credentials::now_secs() as i64;
+        assert!((3595..=3600).contains(&wait), "恢复时刻应取上游给的等待时间，实得 {wait}");
+        assert!(after.ban_reason.unwrap().contains("1 小时"), "停用原因该写清楚还要等多久");
+    }
+
+    /// 冷却睡到**上游返回的那个重置时刻**，不是写死的 5 小时/7 天：没有 `retry-after` 时，
+    /// 取被拒的那个基础窗口自己的 `*-reset`，而不是 `unified-reset`、也不是最早的那个。
+    #[test]
+    fn account_cooldown_sleeps_until_the_exhausted_window_reset() {
+        let hdr = |kv: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in kv {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let now = crate::credentials::now_secs() as i64;
+        let at = |secs: i64| (now + secs).to_string();
+
+        // 5h 打满、7d 还有余量：该睡到 5h 自己的 reset（这里剩 2 小时，不是「5 小时」），
+        // 而不是 unified-reset 说的 9 小时、也不是 7d 的 30 小时。
+        let five_h_gone = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(2 * 3600)),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
+            ("anthropic-ratelimit-unified-7d-reset", &at(30 * 3600)),
+            ("anthropic-ratelimit-unified-reset", &at(9 * 3600)),
+        ]);
+        assert!(super::rate_limit_scope(&five_h_gone, Some("claude-sonnet-5")).account_level());
+        let secs = five_h_gone.cooldown(true).as_secs() as i64;
+        assert!((2 * 3600 - 5..=2 * 3600).contains(&secs), "应睡到 5h 窗口的 reset，实得 {secs}");
+
+        // 两个基础窗口都满 → 取**最晚**的那个：5h 到点了 7d 照样拦着，早醒只是白撞一发。
+        let both_gone = hdr(&[
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(2 * 3600)),
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
+        ]);
+        let secs = both_gone.cooldown(true).as_secs() as i64;
+        assert!((50 * 3600 - 5..=50 * 3600).contains(&secs), "应睡到较晚的 7d reset，实得 {secs}");
+
+        // 满的只有超额池：那不是账号额度耗尽，它的 reset 不该被当成账号冷却
+        // （判定本身也是模型级，这里只钉住 reset 口径不被超额窗口污染）。
+        let oi_gone = hdr(&[
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(3 * 3600)),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", &at(60 * 3600)),
+        ]);
+        let secs = oi_gone.cooldown(true).as_secs() as i64;
+        assert!(
+            (3 * 3600 - 5..=3 * 3600).contains(&secs),
+            "超额池的 reset 不该当账号冷却，实得 {secs}"
+        );
     }
 
     /// 基座资产是逐字节从抓包取出来的，别被编辑器/格式化工具动过。

@@ -15,7 +15,7 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit, ban_reason, account_uuid";
+     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -61,6 +61,30 @@ impl std::fmt::Display for BareRateLimited {
 }
 
 impl std::error::Error for BareRateLimited {}
+
+/// 限流冷却硬门禁触发：本次请求可选的凭证**全部**处于上游 429 冷却中。
+///
+/// 同 [`BareRateLimited`] 走 `anyhow` 上传，代理层 `downcast` 后映射为 429 + `retry-after`
+/// （取所有候选号中最早解冻的那个的剩余秒数——早一秒都是白撞）。
+///
+/// 曾经这里是「全员冷却就忽略冷却照常选」的软行为，理由是上游 reset 不准时硬门禁会把整个
+/// 代理锁死几小时。现在按需求改成硬的：额度真耗尽时继续发只是把 429 换个地方产生，还平白
+/// 消耗上游的失败计数。翻车时的逃生口是控制台的「解除冷却」（`DELETE
+/// /credentials/{id}/cooldown` → [`CredentialStore::clear_rate_limited`]），以及连通性
+/// 测试成功时的自动解除。
+#[derive(Debug)]
+pub struct AllRateLimited {
+    /// 建议的重试间隔（秒），取最早解冻的那个号的剩余冷却时间。
+    pub retry_after_secs: i64,
+}
+
+impl std::fmt::Display for AllRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "所有凭证均处于上游限流冷却中，请 {} 秒后重试", self.retry_after_secs)
+    }
+}
+
+impl std::error::Error for AllRateLimited {}
 
 /// 每凭证的裸请求滑动窗口计数器（**进程内，不落库**）。
 ///
@@ -124,13 +148,20 @@ impl BareRateWindow {
 /// **和「停用」是两回事**：停用是人工/封号那种需要介入的终态，冷却到点自动恢复，
 /// 不写库、不进 `ban_reason`、控制台上也不该显示成账号出了问题。
 ///
-/// **不落库的取舍**：5h 额度耗尽的冷却动辄几小时，确实长于一次重启，重启后忘掉冷却会让
-/// 下一条请求再撞一次 429——但它撞完就会重新打上冷却，属于自愈，代价是一次往返；
-/// 换来的是不动 schema、也不必处理「库里写着冷却但上游其实早恢复了」的陈旧状态。
+/// **不落库的取舍**：账号级冷却动辄几小时到几天（5h/7d 窗口耗尽），远长于一次重启，
+/// 重启后忘掉冷却会让下一条请求再撞一次 429——但它撞完就会重新打上冷却，属于自愈，
+/// 代价是一次往返；换来的是不动 schema、也不必处理「库里写着冷却但上游其实早恢复了」的
+/// 陈旧状态。硬门禁下这一条同时也是最后一道保险：真被一个离谱的 reset 锁住时，重启即解。
 ///
-/// **冷却只是选号提示，不是硬门禁**：全部凭证都在冷却时 [`CredentialStore::select_for_device`]
-/// 会忽略冷却照常选。上游给的 reset 一旦不准（或我们算错），硬门禁会把整个代理锁死几小时，
-/// 而忽略冷却最坏也只是照常撞 429——后者永远是更好的失败方式。
+/// **冷却是硬门禁**：冷却中的号一律不参与调度，全部凭证都在冷却时
+/// [`CredentialStore::select_for_device`] 直接返回 [`AllRateLimited`]（代理映射为 429 +
+/// `retry-after`），不会「忽略冷却照常选」。额度真耗尽时继续发只是把 429 换个地方产生。
+///
+/// 硬门禁的代价是上游 reset 报得过长（或我们算错）时会把代理白白锁住，故留了两个逃生口：
+/// 控制台的「解除冷却」（[`CredentialStore::clear_rate_limited`]），以及连通性测试成功时的
+/// 自动解除（见 [`Self::clear`]）。冷却时长直接睡满上游给的 reset（5h 窗口就是 5h、7d 就是
+/// 7d，见 `proxy::RateLimitInfo::cooldown`），到点自动回到调度池参与正常选号——不定时探活、
+/// 也不提前放出去撞：额度没到点是不会自己长回来的，提前试探每次都要白扔一发 429。
 #[derive(Default)]
 struct RateLimitCooldown {
     /// `(cred_id, 模型)` → 冷却结束时刻（单调时钟）。模型为空串表示**整个账号**。
@@ -181,6 +212,20 @@ impl RateLimitCooldown {
             }
             None => until.retain(|(id, _), _| *id != cred_id),
         }
+    }
+
+    /// 该凭证对该模型还要冷却多少秒（未冷却返回 0）：账号级与模型级两格都得过期才算解冻，
+    /// 故取两者的**较大**值。硬门禁下用它算 `retry-after`，见 [`AllRateLimited`]。
+    fn remaining_for(&self, cred_id: i64, model: Option<&str>) -> i64 {
+        let now = Instant::now();
+        let until = self.until.lock();
+        [String::new(), model.unwrap_or_default().to_string()]
+            .into_iter()
+            .filter_map(|key| until.get(&(cred_id, key)).copied())
+            .filter(|t| *t > now)
+            .map(|t| t.duration_since(now).as_secs() as i64)
+            .max()
+            .unwrap_or(0)
     }
 
     /// 账号级冷却的剩余秒数（未冷却返回 0），供控制台展示。
@@ -278,8 +323,12 @@ impl CredentialStore {
     }
 
     /// 列出全部凭证，按 (priority, id) 升序。
+    ///
+    /// 先惰性恢复到点的限流暂停号（[`Self::resume_due`]），否则后台会一直显示成「已停用」，
+    /// 直到下一条转发请求碰巧来触发恢复——控制台上看到的必须是此刻真实的调度状态。
     pub fn list(&self) -> Result<Vec<Credential>> {
         let conn = self.conn.lock();
+        Self::resume_due(&conn)?;
         let mut stmt =
             conn.prepare(&format!("SELECT {COLS} FROM credentials ORDER BY priority ASC, id ASC"))?;
         let rows = stmt.query_map([], row_to_cred)?;
@@ -339,33 +388,98 @@ impl CredentialStore {
     ///
     /// 停用时立即清空其设备绑定，让已绑定设备的下一次请求马上改选其它凭证，
     /// 而不必等绑定 TTL 惰性过期；重新启用时清除 `ban_reason`（若之前是被自动停用）。
+    ///
+    /// **两个方向都清 `resume_at`**：手动开 = 立刻回调度池，不该再留着一个到点又要动它的
+    /// 时间戳；手动关 = 管理员的意思是「关着」，绝不能被限流那套惰性恢复自己打开。
+    /// 于是「限流自动停用」这一状态只可能由 [`Self::pause_for_rate_limit`] 产生，
+    /// 任何一次人工干预都会把它降级成普通的手动状态。
     pub fn set_disabled(&self, id: i64, disabled: bool) -> Result<bool> {
         let conn = self.conn.lock();
         if disabled {
             conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
             Ok(conn.execute(
-                "UPDATE credentials SET disabled = 1, updated_at = unixepoch() WHERE id = ?1",
+                "UPDATE credentials SET disabled = 1, resume_at = NULL, updated_at = unixepoch() \
+                 WHERE id = ?1",
                 [id],
             )? > 0)
         } else {
             Ok(conn.execute(
-                "UPDATE credentials SET disabled = 0, ban_reason = NULL, updated_at = unixepoch() \
+                "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
+                        updated_at = unixepoch() \
                  WHERE id = ?1",
                 [id],
             )? > 0)
         }
     }
 
+    /// 上游确认限流（账号级 429）时调用：把这个号停用并记下**到点自动恢复的时刻**，
+    /// 同时清空其设备绑定，让绑在它上面的设备下一条请求立刻改选别的号。
+    ///
+    /// 与 [`Self::mark_banned`] 的唯一结构差别是多写一个 `resume_at`，而那正是
+    /// 「限流暂停」与「封号/人工停用」的分界：`resume_at` 非空的号会被
+    /// [`Self::resume_due`] 到点自动启用、也会被连通性测试成功时自动启用
+    /// （见 [`Self::resume_if_rate_limited`]），另外两种则必须人工介入。
+    ///
+    /// 为什么落库而不是只记内存（原来的 [`RateLimitCooldown`] 做法）：额度耗尽动辄几小时到
+    /// 几天，远长于一次进程重启；记内存则重启即忘，一重启就又拿这个号去撞一发 429。
+    /// 落库之后重启也记得，代价是必须自己保证「到点恢复」不依赖进程一直活着——所以恢复做成
+    /// 惰性的（选号时顺手扫一遍），而不是挂一个后台定时器。
+    ///
+    /// `reason` 直接写进 `ban_reason`，后台卡片原样展示，故调用方应带上人话的恢复时刻。
+    pub fn pause_for_rate_limit(&self, id: i64, reason: &str, resume_at: u64) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        Ok(conn.execute(
+            "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = ?3, \
+                    updated_at = unixepoch() \
+             WHERE id = ?1",
+            params![id, reason, resume_at as i64],
+        )? > 0)
+    }
+
+    /// 把所有「限流暂停且已到恢复时刻」的号重新启用，返回实际恢复的条数。
+    ///
+    /// 惰性执行（选号与列表各调一次，见 [`Self::select_for_device`]/[`Self::list`]），
+    /// 和设备绑定的 TTL 过期同一套路子：不挂后台定时器，进程没在跑的时候也不需要它跑——
+    /// 反正没人发请求。条件里的 `resume_at IS NOT NULL` 是关键，它保证只碰限流暂停的号，
+    /// 封号与人工停用的不会被顺手打开。
+    fn resume_due(conn: &Connection) -> Result<usize> {
+        Ok(conn.execute(
+            "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
+                    updated_at = unixepoch() \
+             WHERE disabled = 1 AND resume_at IS NOT NULL AND resume_at <= unixepoch()",
+            [],
+        )?)
+    }
+
+    /// 连通性测试通过时调用：若该号是被限流自动停用的（`resume_at` 非空），当场恢复调度。
+    ///
+    /// 测试成功是「上游此刻确实放这个号过」的一手证据，比我们从限流头算出来的恢复时刻更硬——
+    /// 那个时刻偏保守时，好号会被白白晾着。返回是否确有恢复。
+    ///
+    /// 只认 `resume_at` 非空的号：人工关掉的号不该被一次连通性测试打开，那是管理员的决定。
+    pub fn resume_if_rate_limited(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
+                    updated_at = unixepoch() \
+             WHERE id = ?1 AND resume_at IS NOT NULL",
+            [id],
+        )? > 0)
+    }
+
     /// 自动检测到上游账号级错误（如封号）时调用：停用凭证并记录原因，
     /// 同时清空其设备绑定，使下一次请求立即改选其它凭证。
     ///
     /// 与 [`Self::set_disabled`] 的区别在于会写入 `ban_reason`，供后台 UI 区分
-    /// 「管理员手动停用」与「上游自动判定停用」。
+    /// 「管理员手动停用」与「上游自动判定停用」。封号是需要人工介入的终态，不写
+    /// `resume_at`（对比 [`Self::pause_for_rate_limit`]）。
     pub fn mark_banned(&self, id: i64, reason: &str) -> Result<bool> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
         Ok(conn.execute(
-            "UPDATE credentials SET disabled = 1, ban_reason = ?2, updated_at = unixepoch() \
+            "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = NULL, \
+                    updated_at = unixepoch() \
              WHERE id = ?1",
             params![id, reason],
         )? > 0)
@@ -439,8 +553,11 @@ impl CredentialStore {
         {
             if disabled {
                 let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+                // 同 `set_disabled`：人工操作两个方向都清 `resume_at`，
+                // 限流那套惰性恢复不该越过管理员的决定。
                 let mut stmt = tx.prepare(
-                    "UPDATE credentials SET disabled = 1, updated_at = unixepoch() WHERE id = ?1",
+                    "UPDATE credentials SET disabled = 1, resume_at = NULL, \
+                     updated_at = unixepoch() WHERE id = ?1",
                 )?;
                 for id in ids {
                     binds.execute([id])?;
@@ -448,7 +565,7 @@ impl CredentialStore {
                 }
             } else {
                 let mut stmt = tx.prepare(
-                    "UPDATE credentials SET disabled = 0, ban_reason = NULL, \
+                    "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
                      updated_at = unixepoch() WHERE id = ?1",
                 )?;
                 for id in ids {
@@ -1535,6 +1652,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 删号时不清理）。此处须在上面所有 ADD COLUMN 之后执行，确保重建时列已齐全。
     migrate_credentials_autoincrement(conn)?;
 
+    // 被上游限流自动停用后、到点自动重新启用的时刻（unix 秒）；NULL = 不自动恢复。
+    // **必须补在重建之后**：上面那次重建按写死的列清单复制，加在它之前会被整列丢掉。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN resume_at INTEGER", []);
+
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
@@ -1686,6 +1807,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         device_limit: row.get(10)?,
         ban_reason: row.get(11)?,
         account_uuid: row.get(12)?,
+        resume_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
     })
 }
 
@@ -1718,6 +1840,11 @@ impl CredentialStore {
     ///    同数时按 (priority, id) 决定，保持确定性。
     /// 4. 所有启用凭证均达设备上限 → 硬性拒绝，返回 [`DeviceLimitReached`]（代理映射为 429）。
     ///
+    /// 被上游 429 打过冷却的号（见 [`RateLimitCooldown`]）在**任何**分支之前就被剔出候选，
+    /// 包括已有绑定命中那一支——绑定的号在冷却中会被解绑并改选到别的号上。冷却是硬门禁：
+    /// 候选被冷却清空时返回 [`AllRateLimited`]（代理映射为 429 + `retry-after`），
+    /// 不再退回「忽略冷却照常选」。
+    ///
     /// `device_id` 为 `None`（请求未带 metadata）时无从绑定/计数：退化为负载均衡挑选，
     /// 不写绑定、也不受**设备**上限约束——但在 `rate_limited` 为真时受**裸请求速率上限**
     /// 约束（见 [`Self::bare_rate_limit`]）：已发满的凭证在本轮被跳过，自然分流到其它号；
@@ -1749,6 +1876,9 @@ impl CredentialStore {
             )?;
         }
 
+        // 限流暂停到点的号先放回来，再挑——否则它们要等到有人打开控制台列表才回得了池子。
+        Self::resume_due(&conn)?;
+
         // 启用凭证，按 (priority, id) 升序。
         let mut stmt = conn.prepare(&format!(
             "SELECT {COLS} FROM credentials WHERE disabled = 0 ORDER BY priority ASC, id ASC"
@@ -1757,6 +1887,22 @@ impl CredentialStore {
             stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         if all.is_empty() {
+            // 一个能用的都没有。若其中有「限流暂停、还没到点」的，这不是配置问题而是限流：
+            // 回 429 + 最早那个的恢复时刻，比一句「没有可用凭证，请先登录」诚实得多
+            // （后者会把运维引去查登录，而实际上号都在、只是在等额度回血）。
+            let soonest: Option<i64> = conn
+                .query_row(
+                    "SELECT MIN(resume_at) FROM credentials WHERE disabled = 1 \
+                       AND resume_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(at) = soonest {
+                let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
+                return Err(AllRateLimited { retry_after_secs }.into());
+            }
             anyhow::bail!("没有可用凭证，请先登录");
         }
 
@@ -1765,11 +1911,19 @@ impl CredentialStore {
         if pool.is_empty() {
             anyhow::bail!("已试过的凭证之外没有其它可用账号");
         }
-        // 冷却中的号让位给还能用的；**全部都在冷却时忽略冷却**——冷却只是选号提示，
-        // 上游给的 reset 一旦不准，硬门禁会把整个代理锁死几小时，而照常发最坏只是再撞一次 429。
-        let awake: Vec<Credential> =
+        // 冷却中的号让位给还能用的；**全部都在冷却就直接拒**——冷却是硬门禁，被上游 429 过的
+        // 号在解冻前一律不调度。等待时间取最早解冻的那个，客户端照它重试即可。
+        let creds: Vec<Credential> =
             pool.iter().filter(|c| !self.cooldown.is_cooling(c.id, model)).cloned().collect();
-        let creds = if awake.is_empty() { pool } else { awake };
+        if creds.is_empty() {
+            let retry_after_secs = pool
+                .iter()
+                .map(|c| self.cooldown.remaining_for(c.id, model))
+                .min()
+                .unwrap_or(0)
+                .max(1);
+            return Err(AllRateLimited { retry_after_secs }.into());
+        }
 
         // 1/2) 命中既有绑定。
         if let Some(did) = device_id {
@@ -2714,16 +2868,100 @@ mod tests {
         assert_eq!(pick("claude-fable-5"), a, "手动解除后所有模型都该回来");
     }
 
-    /// 冷却是**选号提示**不是硬门禁：全部号都在冷却时照常选，不能把整个代理锁死。
+    /// 账号级限流把调度开关**落库关掉**，到点惰性自动打开；人工关的号不会被自动打开。
+    #[test]
+    fn rate_limit_pause_persists_and_auto_resumes_when_due() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let pick = || store.select_for_device(Select::default()).map(|c| c.id);
+        let now = crate::credentials::now_secs();
+
+        // a 被限流暂停（还有一小时才到点）→ 落库停用，选号自然落到 b。
+        store.pause_for_rate_limit(a, "上游限流：约 1 小时后自动恢复调度", now + 3600).unwrap();
+        let paused = store.get(a).unwrap().unwrap();
+        assert!(paused.disabled && paused.resume_at == Some(now + 3600));
+        assert_eq!(pick().unwrap(), b, "被限流暂停的号不该再被选中");
+
+        // 到点：不需要任何后台任务，下一次选号顺手把它放回来。
+        store.pause_for_rate_limit(a, "已到点", now - 1).unwrap();
+        assert_eq!(pick().unwrap(), a, "到点应自动回到调度池并按 (priority, id) 重新胜出");
+        let back = store.get(a).unwrap().unwrap();
+        assert!(!back.disabled && back.resume_at.is_none() && back.ban_reason.is_none());
+
+        // 人工停用没有 resume_at，怎么等都不会自己打开。
+        store.set_disabled(a, true).unwrap();
+        assert_eq!(pick().unwrap(), b, "人工停用的号不参与调度");
+        assert_eq!(store.get(a).unwrap().unwrap().resume_at, None, "人工停用不该有恢复时刻");
+        assert_eq!(CredentialStore::resume_due(&store.conn.lock()).unwrap(), 0, "没有该恢复的号");
+        assert!(store.get(a).unwrap().unwrap().disabled, "惰性恢复不该越过管理员的决定");
+    }
+
+    /// 连通性测试通过 → 自动回调度池；但只对**被限流暂停**的号生效。
+    #[test]
+    fn probe_success_resumes_only_rate_limited_pauses() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let now = crate::credentials::now_secs();
+
+        store.pause_for_rate_limit(a, "上游限流", now + 7 * 24 * 3600).unwrap();
+        assert!(store.resume_if_rate_limited(a).unwrap(), "限流暂停的号该被测试结果放回来");
+        let back = store.get(a).unwrap().unwrap();
+        assert!(!back.disabled && back.resume_at.is_none());
+
+        // 人工停用 / 封号：测试通过也不动它——那是管理员的决定，或需要人工介入的终态。
+        store.set_disabled(b, true).unwrap();
+        assert!(!store.resume_if_rate_limited(b).unwrap());
+        assert!(store.get(b).unwrap().unwrap().disabled, "人工停用不该被一次连通性测试打开");
+        store.mark_banned(b, "封号").unwrap();
+        assert!(!store.resume_if_rate_limited(b).unwrap());
+        assert!(store.get(b).unwrap().unwrap().disabled, "封号更不该被测试打开");
+    }
+
+    /// 全部号都因限流暂停时，回的是 429 + 最早恢复时刻，而不是「没有可用凭证，请先登录」——
+    /// 后者会把人引去查登录，实际上号都在，只是在等额度回血。
+    #[test]
+    fn all_paused_reports_rate_limit_not_missing_credentials() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let now = crate::credentials::now_secs();
+        store.pause_for_rate_limit(ids[0], "限流", now + 5 * 3600).unwrap();
+        store.pause_for_rate_limit(ids[1], "限流", now + 2 * 3600).unwrap();
+
+        let err = store.select_for_device(Select::default()).expect_err("全员暂停应报错");
+        let rl = err.downcast_ref::<AllRateLimited>().expect("应是限流错误而非「没有可用凭证」");
+        assert!(
+            (2 * 3600 - 5..=2 * 3600).contains(&rl.retry_after_secs),
+            "应给出最早恢复的那个，实得 {}",
+            rl.retry_after_secs
+        );
+    }
+
+    /// 冷却是**硬门禁**：全部号都在冷却时直接拒（429 + retry-after），不再退回照常选。
     /// 另外「本次已试过的号」（换号重试传进来的排除集）一律出局，重试不会再撞同一个号。
     #[test]
-    fn cooldown_is_a_hint_and_exclusions_are_hard() {
+    fn cooldown_is_a_hard_gate_and_exclusions_are_hard() {
         let (store, ids) = store_with(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
         store.mark_rate_limited(a, None, Duration::from_secs(300));
-        store.mark_rate_limited(b, None, Duration::from_secs(300));
+        store.mark_rate_limited(b, None, Duration::from_secs(600));
 
-        // 都在冷却 → 忽略冷却照常选（宁可再撞一次 429，也不能自己把自己锁死）。
+        // 都在冷却 → 拒绝调度，并给出最早解冻那个号（a，300s）的剩余时间。
+        let err = store
+            .select_for_device(Select {
+                ttl_secs: 0,
+                rate_limited: true,
+                exclude: &[],
+                ..Default::default()
+            })
+            .expect_err("全员冷却时不该选出任何号");
+        let rl = err.downcast_ref::<AllRateLimited>().expect("应是冷却硬门禁错误");
+        assert!(
+            (290..=300).contains(&rl.retry_after_secs),
+            "retry-after 应取最早解冻的那个号，实得 {}",
+            rl.retry_after_secs
+        );
+
+        // 逃生口：手动解除 a 的冷却后立刻可用。
+        store.clear_rate_limited(a, None);
         assert_eq!(
             store
                 .select_for_device(Select {
@@ -2736,7 +2974,19 @@ mod tests {
                 .id,
             a
         );
-        // 排除集是硬的：a 已试过 → 只能是 b。
+        // 排除集是硬的：a 已试过 → 只能是 b……但 b 还在冷却，硬门禁下同样拒绝。
+        assert!(
+            store
+                .select_for_device(Select {
+                    ttl_secs: 0,
+                    rate_limited: true,
+                    exclude: &[a],
+                    ..Default::default()
+                })
+                .is_err(),
+            "唯一剩下的候选在冷却中 → 拒绝"
+        );
+        store.clear_rate_limited(b, None);
         assert_eq!(
             store
                 .select_for_device(Select {

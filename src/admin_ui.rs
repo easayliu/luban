@@ -5,7 +5,7 @@
 use axum::{
     body::Body,
     http::{Response, StatusCode, Uri, header},
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
 };
 use rust_embed::Embed;
 
@@ -13,6 +13,13 @@ use rust_embed::Embed;
 #[derive(Embed)]
 #[folder = "admin-ui/dist"]
 struct Asset;
+
+/// 将误发到首页的 POST 文档导航转换为 GET，避免浏览器刷新时要求重新提交表单。
+///
+/// 固定跳回 `/`，不复用请求体或查询参数；真正的 API POST 会先被主路由匹配，不会走这里。
+pub async fn redirect_root_post() -> Redirect {
+    Redirect::to("/")
+}
 
 /// 作为整个应用的 fallback：命中静态资源则返回，否则 SPA fallback 到 index.html。
 /// （`/api/*` 由主路由先行匹配，不会走到这里。）
@@ -74,4 +81,96 @@ fn cache_control(path: &str) -> &'static str {
 
 fn is_asset_path(path: &str) -> bool {
     path.rsplit('/').next().map(|f| f.contains('.')).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::to_bytes,
+        http::{Method, Request, header},
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route("/", get(fallback).post(redirect_root_post))
+            .fallback_service(get(fallback))
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_serves_unknown_get_route() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/unknown/route")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("serve request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
+        );
+    }
+
+    #[tokio::test]
+    async fn root_post_uses_see_other_to_replace_post_history_with_get() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("serve request");
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&header::HeaderValue::from_static("/"))
+        );
+
+        let redirected = app()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).expect("build request"))
+            .await
+            .expect("follow redirect");
+        assert_eq!(redirected.status(), StatusCode::OK);
+        assert_eq!(
+            redirected.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_rejects_other_post_routes() {
+        for uri in ["/unknown/route", "/missing.js"] {
+            let response = app()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("serve request");
+
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_ne!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
+            );
+            assert!(
+                to_bytes(response.into_body(), 1024).await.expect("read response body").is_empty()
+            );
+        }
+    }
 }
