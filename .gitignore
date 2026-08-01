@@ -8,6 +8,12 @@
 /admin-ui/node_modules
 /admin-ui/dist
 
+# pnpm 的本地内容寻址 store 与调试日志。store 只对本机有意义（装依赖时自动重建），
+# 且平时是空目录、git 不会提示，一旦 pnpm 往里写了东西又碰上 `git add -A` 就会被整个卷进来。
+# `node_modules/.pnpm` 已被上面的 node_modules 规则覆盖。
+/.pnpm-store
+.pnpm-debug.log*
+
 # SQLite 凭证库（含 WAL/SHM）
 *.db
 *.db-wal
