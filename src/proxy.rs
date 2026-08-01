@@ -2218,14 +2218,22 @@ impl RateLimitInfo {
     /// 该醒的点。只有上游一个时间都没给时才落到默认值。
     ///
     /// **账号级**（额度真耗尽）取值优先级：
-    /// 1. `retry-after`（秒）——上游对这次拒绝给出的明确等待时间，最可信（实测给的是
-    ///    228721 秒 ≈ 63 小时，直指 7 天窗口的重置时刻，说明它确实算得很准）；
-    /// 2. **被拒/打满的那个基础窗口**自己的 `*-reset`（见 [`Self::exhausted_base_reset`]）
+    /// 1. **被拒/打满的那个基础窗口**自己的 `*-reset`（见 [`Self::exhausted_base_reset`]）
     ///    ——判账号级正是因为它满了，它什么时候重置，账号就什么时候能用；
-    /// 3. 不带窗口名的 `anthropic-ratelimit-unified-reset` 减去当前时刻——上游给的「整体
-    ///    什么时候恢复」，逐窗口明细缺失时的兜底；
+    /// 2. 不带窗口名的 `anthropic-ratelimit-unified-reset`——上游给的「整体什么时候恢复」，
+    ///    逐窗口明细缺失时的兜底；
+    /// 3. `retry-after`（秒）——连一个 reset 时刻都没给时才用它；
     /// 4. 各窗口 `*-reset` 里**最早**的那个，连哪个满了都不知道时，宁可早醒也不要多睡；
     /// 5. 都没有 → [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
+    ///
+    /// **为什么 `retry-after` 在账号级被降到第三位**（它曾经排第一）：它是个**相对秒数**，
+    /// 要重新锚回我们自己的时钟才能变成时刻，而 `*-reset` 本身就是绝对时刻。两者口径不同，
+    /// 于是漂移有三处叠加——上游把剩余时间向下取整成整秒、本地时钟与上游未必一致、界面显示
+    /// 又是截断到分钟（不进位）。线上实测的症状：同一张卡片一边写「12:20 重置」（读的是
+    /// `5h-reset`），一边写「12:19 自动恢复」（`now + retry-after`），真实差距不到一秒，
+    /// 显示出来却整整差一分钟，且那一分钟里发出去的请求必然再撞 429。
+    /// 改成直接吃窗口的 `*-reset` 之后，恢复时刻与卡片上的重置时刻**是同一个数**，
+    /// 不存在对不上的可能。`retry-after` 仍是没有 reset 时的兜底。
     ///
     /// **模型级不看任何 reset**：窗口都没跑满，reset 说的是「这个窗口什么时候重置」，跟
     /// 「这个模型什么时候有容量」是两码事，拿它当冷却会让一个好账号的某个模型白白闲置几小时。
@@ -2246,16 +2254,19 @@ impl RateLimitInfo {
             .min()
             .map(|reset| reset - now);
         let future_secs = |reset: i64| Some(reset - now).filter(|d| *d > 0);
-        let fallback = if account_level {
+        let secs = if account_level {
+            // 绝对时刻优先，相对秒数兜底——两者口径不同，混用会让恢复时刻和卡片上的重置
+            // 时刻差出一分钟（见上面的方法文档）。
             self.exhausted_base_reset()
                 .and_then(future_secs)
                 .or_else(|| self.unified_reset.and_then(future_secs))
+                .or(self.retry_after)
                 .or(earliest_window_reset)
                 .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
         } else {
-            DEFAULT_MODEL_COOLDOWN_SECS
-        };
-        let secs = self.retry_after.unwrap_or(fallback).clamp(1, MAX_RATE_LIMIT_COOLDOWN_SECS);
+            self.retry_after.unwrap_or(DEFAULT_MODEL_COOLDOWN_SECS)
+        }
+        .clamp(1, MAX_RATE_LIMIT_COOLDOWN_SECS);
         std::time::Duration::from_secs(secs as u64)
     }
 
@@ -4469,6 +4480,10 @@ mod tests {
 
         // 5h 打满、7d 还有余量：该睡到 5h 自己的 reset（这里剩 2 小时，不是「5 小时」），
         // 而不是 unified-reset 说的 9 小时、也不是 7d 的 30 小时。
+        //
+        // `retry-after` 也故意给了，且比 5h reset 少一分钟——线上真实的对不上就长这样：
+        // 它是相对秒数（上游向下取整、还要锚回本地时钟），reset 是绝对时刻，两者口径不同。
+        // 账号级必须吃 reset，否则卡片会一边写「12:20 重置」一边写「12:19 恢复」。
         let five_h_gone = hdr(&[
             ("anthropic-ratelimit-unified-status", "rejected"),
             ("anthropic-ratelimit-unified-5h-status", "rejected"),
@@ -4478,10 +4493,17 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-utilization", "0.4"),
             ("anthropic-ratelimit-unified-7d-reset", &at(30 * 3600)),
             ("anthropic-ratelimit-unified-reset", &at(9 * 3600)),
+            ("retry-after", &(2 * 3600 - 60).to_string()),
         ]);
         assert!(super::rate_limit_scope(&five_h_gone, Some("claude-sonnet-5")).account_level());
         let secs = five_h_gone.cooldown(true).as_secs() as i64;
-        assert!((2 * 3600 - 5..=2 * 3600).contains(&secs), "应睡到 5h 窗口的 reset，实得 {secs}");
+        assert!(
+            (2 * 3600 - 5..=2 * 3600).contains(&secs),
+            "应睡到 5h 窗口的 reset（而非 retry-after 的 {}），实得 {secs}",
+            2 * 3600 - 60
+        );
+        // 模型级那档没有「哪个窗口满了」可言，仍旧只认 retry-after。
+        assert_eq!(five_h_gone.cooldown(false).as_secs() as i64, 2 * 3600 - 60);
 
         // 两个基础窗口都满 → 取**最晚**的那个：5h 到点了 7d 照样拦着，早醒只是白撞一发。
         let both_gone = hdr(&[
