@@ -183,10 +183,13 @@ pub async fn handle(
         );
         let out =
             build_forward_headers(&headers, &token, flags, sim.as_ref(), bare_session.as_deref());
+        // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
+        // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
+        let target = if sim.is_some() && billable { ensure_beta_query(&url) } else { url.clone() };
         let upstream = Upstream {
             state: &state,
             method: method.clone(),
-            url: url.clone(),
+            url: target,
             headers: out,
             flags,
             billable,
@@ -1721,6 +1724,26 @@ fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("speed")?.as_str()?.to_string())
 }
 
+/// 给出站 URL 补上官方客户端恒带的 `?beta=true`（已经有 `beta=` 就原样返回）。
+///
+/// **依据**：`cap/raw` 八份抓包（四份直连、四份经 luban 的 API-key 模式）的请求行**无一例外**
+/// 是 `POST /v1/messages?beta=true`。而 Anthropic 公开的 API 里没有这个参数——文档与各语言 SDK
+/// 一律发裸 `/v1/messages`，beta 能力全靠 `anthropic-beta` 头开。两边合起来说明它是 **CC 客户端
+/// 自己的标记**，不是 beta 功能的开关：补它是形态对齐，漏它不影响功能（模拟路径现在就能用）。
+///
+/// 只在[`Simulation`]那条路上补——那条路已经把头和体整套装成了 CC，URL 上再漏掉这个参数，
+/// 就是「头上声明了一整串官方 beta、URL 却没开 beta 模式」这种真实客户端不产生的组合。
+///
+/// 客户端自己写了 `beta=`（含 `beta=false`）时不动：那是它自己的选择，替它改属于越权。
+fn ensure_beta_query(url: &str) -> String {
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    if query.split('&').any(|kv| kv.split_once('=').map(|(k, _)| k) == Some("beta")) {
+        return url.to_string();
+    }
+    let sep = if query.is_empty() { '?' } else { '&' };
+    format!("{url}{sep}beta=true")
+}
+
 /// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
 /// 请求体逐字节原样转发）：
 ///
@@ -2706,7 +2729,8 @@ pub async fn probe(
     let upstream = Upstream {
         state,
         method: Method::POST,
-        url: format!("{}/v1/messages", config::UPSTREAM_BASE_URL),
+        // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。
+        url: ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL)),
         headers,
         flags,
         billable: true,
@@ -4968,6 +4992,28 @@ mod tests {
         assert_eq!(logs[0].input_tokens, Some(320));
         // opus $5/MTok 输入 + $25/MTok 输出：320×5 + 1×25 = 1625 微美元。
         assert_eq!(logs[0].cost_usd, Some(0.001625), "按实际用量计价，不是记 0");
+    }
+
+    /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API
+    /// 里却没有这个参数——它是 CC 客户端自己的标记，故只在模拟路径上补。
+    #[test]
+    fn appends_official_beta_query() {
+        let base = "https://api.anthropic.com/v1/messages";
+        assert_eq!(super::ensure_beta_query(base), format!("{base}?beta=true"), "没有查询串就加 ?");
+        assert_eq!(
+            super::ensure_beta_query(&format!("{base}?foo=1")),
+            format!("{base}?foo=1&beta=true"),
+            "已有查询串就接 &"
+        );
+
+        // 客户端自己写了 beta= 的一律不动——包括它显式关掉的情形。
+        for already in ["?beta=true", "?beta=false", "?foo=1&beta=true", "?beta=true&foo=1"] {
+            let url = format!("{base}{already}");
+            assert_eq!(super::ensure_beta_query(&url), url, "客户端自己的 beta= 被改写了");
+        }
+        // `betas=`/`xbeta=` 不是 `beta=`，不该被当成已有。
+        assert!(super::ensure_beta_query(&format!("{base}?betas=1")).ends_with("&beta=true"));
+        assert!(super::ensure_beta_query(&format!("{base}?xbeta=1")).ends_with("&beta=true"));
     }
 
     /// 连通性测试发出去的那条请求本身必须是**官方形态**：`system` 是官方那几块（含上游对
