@@ -232,12 +232,6 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
     ("accept-encoding", CC_ACCEPT_ENCODING),
 ];
 
-/// 官方订阅客户端每个缓存断点都带的 TTL（`cap/raw` 的四对抓包里 3/3 全是 `1h`）。
-///
-/// 写入单价是 5m 的 2 倍。它和 [`CC_SYSTEM_BASE_ANCHORS`] 的拆块是一套的：官方就是「4 块 +
-/// 全 1h」，只拆块不上 1h、或只上 1h 不拆块，都是真实客户端不产生的中间态。
-pub const CC_CACHE_TTL: &str = "1h";
-
 /// 官方客户端请求头的**拼写与顺序**，逐字节取自 `cap/raw/00006`（claude-cli/2.1.220 直连
 /// api.anthropic.com，CONNECT 隧道里的原始报文头）。
 ///

@@ -679,20 +679,33 @@ function QuotaMeter({
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      <div className="flex min-w-0 items-center gap-2 overflow-hidden text-xs text-muted-foreground">
-        <span className="min-w-0 flex-1 truncate whitespace-nowrap">
-          <span className="font-medium text-foreground tabular-nums">
+      <dl className="grid min-w-0 grid-cols-3 gap-2">
+        <div className="min-w-0">
+          <dt className="text-[11px] leading-none text-muted-foreground">
+            {t('请求', requests === 1 ? 'Request' : 'Requests')}
+          </dt>
+          <dd className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums">
             {requests == null ? '—' : requests.toLocaleString(locale)}
-          </span>{' '}{t('次请求', requests === 1 ? 'request' : 'requests')}
-          <span className="mx-1.5" aria-hidden="true">·</span>
-          <span className="font-medium text-foreground">{cost == null ? '—' : formatUsd(cost)}</span>
-        </span>
-        {reset != null && (
-          <span className="ml-auto shrink-0 whitespace-nowrap" title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}>
-            {t(`${formatClockTime(reset, language)} 重置`, `Resets ${formatClockTime(reset, language)}`)}
-          </span>
-        )}
-      </div>
+          </dd>
+        </div>
+        <div className="min-w-0 text-center">
+          <dt className="text-[11px] leading-none text-muted-foreground">{t('花费', 'Cost')}</dt>
+          <dd className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums">
+            {cost == null ? '—' : formatUsd(cost)}
+          </dd>
+        </div>
+        <div className="min-w-0 text-right">
+          <dt className="text-[11px] leading-none text-muted-foreground">{t('重置', 'Reset')}</dt>
+          <dd
+            className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums"
+            title={reset != null
+              ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
+              : undefined}
+          >
+            {reset == null ? '—' : formatClockTime(reset, language)}
+          </dd>
+        </div>
+      </dl>
     </Meter>
   )
 }

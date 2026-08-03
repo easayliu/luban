@@ -190,13 +190,29 @@ export function ForwardingSettingsContent() {
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={DatabaseIcon} title={t('缓存优化', 'Cache optimization')}>
+      <SettingsGroup icon={DatabaseIcon} title={t('系统提示词', 'System prompt')}>
         <ForwardingToggle
           k="system_shape"
-          label={t('系统提示词缓存', 'System prompt caching')}
+          label={t('分块与缓存形态', 'Block shape & caching')}
           summary={t(
-            '调整系统提示词分块，提高跨会话缓存复用。',
-            'Adjust system prompt blocks to improve cache reuse across sessions.',
+            '按官方客户端对齐系统提示词的分块与缓存断点；同时把块数封顶在 4 块。',
+            'Align system prompt blocks and cache breakpoints with the official client, and cap the block count at 4.',
+          )}
+          description={
+            <>
+              {t(
+                '只调整分块，不改变提示词文本、也不改缓存时长——缓存时长（ttl）一概沿用客户端自己传的，客户端没传就用上游默认，luban 不替它决定。它不只是缓存优化：官方客户端的系统提示词恒为 4 块，超出的会被上游判成第三方应用，改从超额额度（extra usage）扣费而不是订阅额度，所以多出来的块会被并回第 4 块。无法识别切点时原样转发。',
+                'Only block boundaries are adjusted — the prompt text is unchanged, and so is cache duration: the ttl always comes from the client, or from the upstream default when the client sends none. luban never decides it for you. This is not merely a cache optimization: the official client always sends exactly 4 system blocks, and anything beyond that is treated upstream as a third-party app and billed to extra usage instead of your plan, so surplus blocks are merged back into the fourth. Requests are forwarded unchanged when no split point can be identified.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="cache_scope_global"
+          label={t('基座缓存跨账号共享', 'Share base-prompt cache across accounts')}
+          summary={t(
+            '给官方基座那块标 scope:"global"，让所有账号共用同一份基座缓存。',
+            'Mark the official base prompt block with scope:"global" so every account shares one cached copy.',
           )}
           requires={{
             key: 'merge_beta',
@@ -205,8 +221,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '只调整分块与缓存时间，不改变提示词文本。1 小时缓存写入单价是 5 分钟的 2 倍，但能延长复用时间；无法识别切点时原样转发。',
-                'Only block boundaries and cache duration are adjusted; the prompt text is unchanged. A 1-hour cache write costs twice as much as a 5-minute write, but extends the reuse window. Requests are forwarded unchanged when no split point can be identified.',
+                '基座是按模型族固定的官方提示词，全网同一份，标记后跨账号命中同一份缓存，省下重复的写入。注意：官方客户端总是把 scope 和 ttl:1h 一起发，而 luban 不写 ttl，所以发出去的是官方不产生的组合；介意形态贴合度就关掉，代价是每个账号各写各的基座缓存。该标记需要上游的 prompt-caching-scope beta，故依赖「Beta 标记」开关。',
+                'The base prompt is a fixed official block per model family — identical everywhere — so marking it lets all accounts hit one cached copy instead of each paying its own cache write. Note: the official client always sends scope together with ttl:1h, and luban does not write ttl, so the emitted combination is one the official client never produces. Turn this off if you care about exact shape fidelity; the cost is a separate base-prompt cache write per account. The marker requires the upstream prompt-caching-scope beta, hence the dependency on "Beta flags".',
               )}
             </>
           }

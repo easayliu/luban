@@ -934,6 +934,9 @@ impl CredentialStore {
         if let Some(v) = on(RATE_LIMIT_RETRY) {
             flags.rate_limit_retry = v;
         }
+        if let Some(v) = on(SYSTEM_CACHE_SCOPE) {
+            flags.cache_scope_global = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1025,6 +1028,13 @@ pub const FILL_METADATA: &str = "fill_metadata";
 /// 一直被粘性绑定的设备撞上，而其它账号闲着。
 pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 
+/// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
+/// 全网同一份，跨账号共享缓存是白捡的。
+///
+/// **键名不能叫 `cache_scope_global`**——那个名字被 [`CACHE_SCOPE_GLOBAL`] 占着，在旧库里
+/// 是 [`SYSTEM_SHAPE`] 的曾用名，复用会让旧库里关过那个开关的人莫名其妙丢掉整套 system 对齐。
+pub const SYSTEM_CACHE_SCOPE: &str = "system_cache_scope";
+
 /// 转发开关的集合。**默认全开**。
 ///
 /// 前六项是**形态对齐**：上游实测（8 发对照，见 [`crate::config::known_fingerprint_gaps`]）
@@ -1061,6 +1071,14 @@ pub struct ForwardFlags {
     /// 上游回 429 时给该号打冷却并换号重试（次数见
     /// [`CredentialStore::rate_limit_retry_max`]）；关掉即原样透传 429、也不打冷却。
     pub rate_limit_retry: bool,
+    /// 官方基座那块的缓存断点带不带 `scope:"global"`（跨账号共享同一份基座缓存）。
+    ///
+    /// 单独成一项而不是并进 [`Self::system_shape`]：它要上游的 `prompt-caching-scope` beta
+    /// 认（故还要 [`Self::merge_beta`] 开着），而且**官方从不单独发 `scope`**——官方那份总是
+    /// `{type, ttl:1h, scope}`，luban 不再替客户端写 `ttl`（那是客户端掏钱买的时长），
+    /// 于是发出去的是 `{type, scope}`。收益（跨账号复用基座）与这处形态偏差谁更重要，
+    /// 交给用户自己拨。
+    pub cache_scope_global: bool,
 }
 
 impl Default for ForwardFlags {
@@ -1076,6 +1094,7 @@ impl Default for ForwardFlags {
             simulate_cc: true,
             fill_metadata: true,
             rate_limit_retry: true,
+            cache_scope_global: true,
         }
     }
 }
@@ -3896,6 +3915,7 @@ mod tests {
             (SIMULATE_CC, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
+            (SYSTEM_CACHE_SCOPE, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -3913,6 +3933,7 @@ mod tests {
                 simulate_cc: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
+                cache_scope_global: false,
             }
         );
 

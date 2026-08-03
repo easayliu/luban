@@ -717,7 +717,7 @@ struct ForwardingResp {
     fill_client_headers: bool,
     /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
     merge_beta: bool,
-    /// 把 `system` 对齐成官方订阅客户端的 4 块形态（拆块 + 全 1h + 基座 global）。
+    /// 把 `system` 对齐成官方订阅客户端的 4 块形态（拆/并块 + 块数封顶 4）。
     system_shape: bool,
     /// 按官方拼写与顺序发出头名。
     orig_header_case: bool,
@@ -729,6 +729,8 @@ struct ForwardingResp {
     fill_metadata: bool,
     /// 上游回 429 时给该号打冷却并换号重试。
     rate_limit_retry: bool,
+    /// 官方基座那块的缓存断点带不带 `scope:"global"`（跨账号共享基座缓存）。
+    cache_scope_global: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -744,6 +746,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             simulate_cc: f.simulate_cc,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
+            cache_scope_global: f.cache_scope_global,
         }
     }
 }
@@ -934,6 +937,7 @@ struct SetForwardingReq {
     simulate_cc: Option<bool>,
     fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
+    cache_scope_global: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -945,7 +949,7 @@ async fn set_forwarding(
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
         FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY,
-        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_SHAPE,
+        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_CACHE_SCOPE, SYSTEM_SHAPE,
         THINKING_SIGNATURE_RETRY,
     };
     let items = [
@@ -959,6 +963,7 @@ async fn set_forwarding(
         (SIMULATE_CC, req.simulate_cc),
         (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),
+        (SYSTEM_CACHE_SCOPE, req.cache_scope_global),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;

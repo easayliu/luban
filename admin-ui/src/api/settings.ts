@@ -25,7 +25,7 @@ export interface Settings {
   fill_client_headers: boolean
   /** 合并并按官方顺序重排 anthropic-beta（含塞入 oauth-2025-04-20）。 */
   merge_beta: boolean
-  /** 把 system 对齐成官方订阅客户端的 4 块形态（拆块 + 断点全 1h + 基座 global）。 */
+  /** 把 system 对齐成官方订阅客户端的 4 块形态（拆/并块 + 块数封顶 4）。 */
   system_shape: boolean
   /** 按官方拼写与顺序发出头名（Accept-Encoding 大写、anthropic-beta 小写…）。 */
   orig_header_case: boolean
@@ -37,6 +37,8 @@ export interface Settings {
   fill_metadata: boolean
   /** 上游回 429 时按账号/模型范围冷却并换号重试；关闭时不冷却、直接透传。 */
   rate_limit_retry: boolean
+  /** 官方基座那块的缓存断点带不带 scope:"global"（跨账号共享同一份基座缓存）。 */
+  cache_scope_global: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -51,6 +53,7 @@ export type ForwardingKey =
   | 'simulate_cc'
   | 'fill_metadata'
   | 'rate_limit_retry'
+  | 'cache_scope_global'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {
