@@ -462,8 +462,7 @@ function AttentionSummary({ id, status }: { id: string; status: CredentialStatus
  *
  * `rejected` = 不可用，已知两种成因，而**我们区分不了**——上游只给状态词，成因没有对应的头：
  * `org_level_disabled`（没开启，见 proxy.rs `rate_limit_scope` 的抓包样例）与
- * `out_of_credits`（额度用光）。所以文案只能说「不可用」，把两种成因留在 tooltip 里，
- * 别替上游把话说死。
+ * `out_of_credits`（额度用光）。两种情况都没有可展示的可用能力，所以界面直接隐藏。
  *
  * 它没有 utilization，也没有 reset，和 `7d_oi` 那种真有用量的超额**池**是两回事——
  * 后者的 `rejected` 才是「这个池子满了/被拒了」。
@@ -478,9 +477,9 @@ function isCapabilityWindow(w: QuotaWindowMeta): boolean {
 /**
  * 把上游的状态词翻成人话。**同一个 `rejected` 在两类窗口上含义完全不同**，所以不能共用一句：
  *
- * - 可用性标记（见 [`isCapabilityWindow`]）：`rejected` = 这个账号的 Usage credits **不可用**
- *   （没开启，或额度已用光——上游没给成因，两者分不出来）。它不是坏消息，只是一项能力用不了；
- *   真要说的话，用不了反而意味着不会莫名其妙产生按量费用，所以不标红。
+ * - 可用性标记（见 [`isCapabilityWindow`]）：只有 `allowed` / `allowed_warning` 才会渲染。
+ *   `rejected` 可能是没开启，也可能是额度已用光，上游没有给成因；对用户而言都表示当前
+ *   没有可用的 Usage credits，因此直接隐藏，不占用额度区域。
  * - 用量窗口（`7d_oi` 之类）：`rejected`/`rate_limited` = 这个池子确实被拒了，标红。
  *
  * 认不出的状态词原样显示，不猜——上游随时可能加新词，硬翻只会翻错。
@@ -492,11 +491,10 @@ function windowStatusLabel(
   const status = w.status
   if (!status) return null
   if (isCapabilityWindow(w)) {
-    if (status === 'rejected') return { text: t('不可用', 'Unavailable'), bad: false }
     if (status === 'allowed' || status === 'allowed_warning') {
       return { text: t('可用', 'Available'), bad: false }
     }
-    return { text: status, bad: false }
+    return null
   }
   if (status === 'rejected' || status === 'rate_limited') {
     return { text: t('已拒', 'rejected'), bad: true }
@@ -517,9 +515,13 @@ function windowStatusLabel(
  */
 function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
   const { t, language } = useI18n()
+  const visibleWindows = windows.filter((w) =>
+    !isCapabilityWindow(w) || w.status === 'allowed' || w.status === 'allowed_warning')
+  if (visibleWindows.length === 0) return null
+
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-      {windows.map((w) => {
+      {visibleWindows.map((w) => {
         const pct = w.percentage
         const badge = windowStatusLabel(w, t)
         return (
@@ -529,8 +531,8 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
             title={[
               isCapabilityWindow(w)
                 ? t(
-                    `${w.name}：上游报告 Usage credits（套餐用量耗尽后的按量计费额度）能不能用，不是用量窗口，所以没有百分比。不可用可能是没开启，也可能是额度已用光——上游没给成因`,
-                    `${w.name}: reports whether usage credits (pay-as-you-go beyond the plan's included usage) are available — not a usage window, so it has no percentage. "Unavailable" may mean not enabled or out of credits; the upstream does not say which`,
+                    `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费额度）可用；它不是用量窗口，所以没有百分比`,
+                    `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
                   )
                 : t(`额度窗口 ${w.name}`, `Quota window ${w.name}`),
               w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
@@ -677,8 +679,8 @@ function QuotaMeter({
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        <span>
+      <div className="flex min-w-0 items-center gap-2 overflow-hidden text-xs text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate whitespace-nowrap">
           <span className="font-medium text-foreground tabular-nums">
             {requests == null ? '—' : requests.toLocaleString(locale)}
           </span>{' '}{t('次请求', requests === 1 ? 'request' : 'requests')}
@@ -686,7 +688,7 @@ function QuotaMeter({
           <span className="font-medium text-foreground">{cost == null ? '—' : formatUsd(cost)}</span>
         </span>
         {reset != null && (
-          <span className="ml-auto" title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}>
+          <span className="ml-auto shrink-0 whitespace-nowrap" title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}>
             {t(`${formatClockTime(reset, language)} 重置`, `Resets ${formatClockTime(reset, language)}`)}
           </span>
         )}

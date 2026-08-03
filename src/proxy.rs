@@ -130,7 +130,7 @@ pub async fn handle(
     // 设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
     // 头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
     let device_fp = device_fingerprint(device_id.as_deref(), &headers);
-    // 6) 转发前改写 body：system 形态对齐（拆成官方的 4 块 + 断点全上 1h + 基座标 scope=global）
+    // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 4 块 + 断点全上 1h + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
     //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
     {
@@ -1500,30 +1500,48 @@ fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> Str
 /// 官方自己用掉 3 个（基座、其余、末条消息），故模拟时得数着加，见 [`simulate_system`]。
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
+/// 官方 `system` **恒为 4 块**：`cap/raw` 里四份订阅直连抓包（00006/00009/00031/00035）
+/// 无一例外都是 `[billing, 身份句, 基座, 其余]`，API-key 模式那三份是 3 块合并态
+/// （见 [`align_system_shape`]）——两种切法都不超过 4。
+///
+/// 块数超了就不再是 CC 形态，上游按第三方应用计费，客户端会看到
+/// `Third-party apps now draw from your extra usage, not your plan limits.`
+/// ——请求照样有回复，只是从订阅额度转到了超额池。故对齐它是**计费正确性**问题，
+/// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
+const MAX_SYSTEM_BLOCKS: usize = 4;
+
 /// 把非 CC 请求的 `system` 换成官方形态的四块：
 ///
 /// ```text
 /// [0] x-anthropic-billing-header: …            无断点（cch 由 ensure_billing_cch 补）
 /// [1] You are Claude Code, …（57B）            无断点
 /// [2] 官方基座（按模型族）                      {ephemeral, ttl:1h, scope:global}
-/// [3] 客户端自己的 system（原样搬来）           {ephemeral, ttl:1h}
+/// [3] 客户端自己的 system（并成一块）           {ephemeral, ttl:1h}
 /// ```
 ///
-/// 客户端的 `system` 是字符串就裹成一个文本块，是数组就整段搬过来（它自己的块结构、
-/// 已有的 `cache_control` 都不动），没有就只有前三块。
+/// 客户端的 `system` 是字符串就裹成一个文本块，是数组就并成一块（见
+/// [`merge_system_blocks`]），没有就只有前三块。
+///
+/// **客户端那堆块必须并成一块**：官方末块就是「基座之后的全部内容」拼成的一大段，
+/// 客户端自己拆成 N 块发过来，照搬就会得到 3+N 块——超过 [`MAX_SYSTEM_BLOCKS`]
+/// 即被上游判为第三方应用、改扣超额池。
 ///
 /// **断点是数着加的**：客户端可能自己就用满了 4 个（比如给每条工具定义都标了缓存），这时
 /// 再加就会让整条请求被上游拒——那是把「形态更像」换成「根本发不出去」。预算不够时基座与
-/// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。
+/// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。预算在**合并之后**才算：
+/// 合并会消掉客户端 `system` 里那几个断点，先算就是按一个已经不存在的数字克扣基座。
 fn simulate_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
-    let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(count_cache_control(v));
     let client: Vec<serde_json::Value> = match v.get("system") {
         Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
             vec![text_block_bare(s)]
         }
-        Some(serde_json::Value::Array(a)) => a.clone(),
+        Some(serde_json::Value::Array(a)) => merge_system_blocks(a.clone()),
         _ => Vec::new(),
     };
+    // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
+    let outside = count_cache_control(v) - v.get("system").map(count_cache_control).unwrap_or(0);
+    let used = outside + client.iter().map(count_cache_control).sum::<usize>();
+    let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
     let mut blocks =
         vec![text_block_bare(&billing_header_text()), text_block_bare(config::CC_SYSTEM_IDENTITY)];
@@ -1549,6 +1567,60 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
     // 客户端自己那些断点也对齐到 1h：官方 3/3 全带 ttl，混着 5m 是官方不产生的中间态。
     fill_cache_ttl(v);
     true
+}
+
+/// 把一串 `system` 文本块并成**一块**，正文用 `\n\n` 相连。
+///
+/// **为什么是拼而不是丢**：官方末块本身就是「基座之后的全部内容」拼成的一大段
+/// （`cap/raw/00006` 里 12KB 一块），客户端把同样的内容拆成几块发过来，拼回去正是还原
+/// 官方的切法——一个字都不少，只是不再各自成块。
+///
+/// **断点取最后一个**：合并后是连续的一段，末尾那个断点覆盖它前面的全部前缀，缓存语义与
+/// 合并前的最后一个断点等价；中间那几个断点没有了，少几次缓存复用，不影响正确性。
+///
+/// 出现不是文本块的成员（`text` 不是字符串）就**原样交回**——`system` 里只能放文本块，
+/// 别的东西是我们不认识的形态，宁可照发也不猜着改。正文全空的一并丢掉：发一个空文本块
+/// 既没意义，上游也不收。
+fn merge_system_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if blocks.len() <= 1 {
+        return blocks;
+    }
+    let texts: Vec<&str> = blocks.iter().filter_map(|b| b.get("text")?.as_str()).collect();
+    if texts.len() != blocks.len() {
+        return blocks;
+    }
+    let text = texts.into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n\n");
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let cc = blocks.iter().rev().find_map(|b| b.get("cache_control").cloned());
+    vec![match cc {
+        Some(cc) => text_block(&text, cc),
+        None => text_block_bare(&text),
+    }]
+}
+
+/// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：第 4 块起的全部内容并进第 4 块
+/// （见 [`merge_system_blocks`]）。
+///
+/// 兜住[`simulate_system`] 管不到的那两类来访：一是**自称 CC 却发了 5 块以上**的第三方
+/// 客户端（[`is_cc_shaped`] 认它是 CC，于是既不模拟、也不走 [`align_system_shape`] 的三块
+/// 分支），二是任何在我们之前就把 `system` 拆碎了的中间层。它们不改就是照着第三方额度扣。
+///
+/// 已经不超过 4 块（含官方的 4 块与 API-key 的 3 块）时不动结构、返回 `false`。
+fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
+    let Some(sys) = v.get_mut("system").and_then(|s| s.as_array_mut()) else {
+        return false;
+    };
+    if sys.len() <= MAX_SYSTEM_BLOCKS {
+        return false;
+    }
+    let tail = sys.split_off(MAX_SYSTEM_BLOCKS - 1);
+    let before = tail.len();
+    let merged = merge_system_blocks(tail);
+    let changed = merged.len() < before;
+    sys.extend(merged);
+    changed
 }
 
 /// `system[0]` 那条 billing header 的正文。`cch` 不在这里补——那是
@@ -1659,7 +1731,8 @@ fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
 ///    「已经是 CC 形态」的前提下做微调。
 /// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
 ///    见 [`align_system_shape`]。含拆块、断点全上 `ttl:1h`、基座标 `scope:"global"`。
-///    模拟路径已经直接产出 4 块，故两者互斥，不叠加。
+///    模拟路径已经直接产出 4 块，故两者互斥，不叠加。同一开关还管**块数封顶**
+///    （[`cap_system_blocks`]）：超过 4 块的 `system` 会被上游判成第三方应用、改扣超额池。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
 ///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
@@ -1699,6 +1772,10 @@ fn rewrite_body(
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim));
     // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v);
+    // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
+    // 只认 `system_shape`、不像 `shape` 那样连着 `merge_beta`——合并只挪正文、不新增 `ttl`，
+    // 与 `extended-cache-ttl` 那串没有关系。
+    let capped = flags.system_shape && cap_system_blocks(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
@@ -1711,13 +1788,14 @@ fn rewrite_body(
         simulated,
         sim_meta,
         shaped,
+        capped,
         spoofed,
         cch_added,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if !shaped && !spoofed && !cch_added && !simulated && !sim_meta {
+    if !shaped && !capped && !spoofed && !cch_added && !simulated && !sim_meta {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
@@ -4129,12 +4207,12 @@ mod tests {
     }
 
     /// 客户端已经用满 4 个缓存断点时不再加——加了整条请求会被上游拒，那是把「形态更像」
-    /// 换成「根本发不出去」。
+    /// 换成「根本发不出去」。断点在别处（tools）时同样算数。
     #[test]
     fn respects_cache_breakpoint_budget() {
-        let blk = r#"{"type":"text","text":"t","cache_control":{"type":"ephemeral"}}"#;
+        let tool = r#"{"name":"t","cache_control":{"type":"ephemeral"}}"#;
         let body = Bytes::from(format!(
-            r#"{{"model":"claude-opus-5","messages":[],"system":[{blk},{blk},{blk},{blk}]}}"#
+            r#"{{"model":"claude-opus-5","messages":[],"tools":[{tool},{tool},{tool},{tool}]}}"#
         ));
         let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
             .unwrap();
@@ -4144,6 +4222,81 @@ mod tests {
         assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
         // 内容照发，只是少一次缓存复用。
         assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE_OPUS);
+    }
+
+    /// 客户端把 `system` 拆成多块时并成官方末块的一块——3+N 块会被上游判第三方应用、
+    /// 改扣超额池（`Third-party apps now draw from your extra usage`）。
+    ///
+    /// 合并腾出来的断点预算要算进去：客户端那 4 个断点合并后只剩 1 个，基座该拿到断点。
+    #[test]
+    fn merges_client_system_blocks_into_official_tail() {
+        let blk = |t: &str| {
+            format!(r#"{{"type":"text","text":"{t}","cache_control":{{"type":"ephemeral"}}}}"#)
+        };
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{},{},{},{}]}}"#,
+            blk("a"),
+            blk("b"),
+            blk("c"),
+            blk("d")
+        ));
+        let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
+            .unwrap();
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "客户端的 4 块应并成末块一块: {v}");
+        assert_eq!(sys[3]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
+        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块断点取合并前的最后一个");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert_eq!(sys[2]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
+        assert_eq!(super::count_cache_control(&v), 2, "断点数: {v}");
+
+        // 空块并不进来（发一个空文本块上游不收），只剩前三块。
+        let empty = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[],"system":[{"type":"text","text":""},{"type":"text","text":"  "}]}"#
+                .to_string(),
+        );
+        let sim = super::Simulation::detect(parsed(&empty).as_ref(), all_on(), &test_cred(), "fp")
+            .unwrap();
+        let out = super::rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
+    }
+
+    /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：既不模拟、也不走
+    /// 三块拆分器，只能靠封顶兜住，否则块数超 4 照样按第三方额度扣。
+    #[test]
+    fn caps_system_blocks_for_cc_shaped_client() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"h"}},{{"type":"text","text":"{}"}},{{"type":"text","text":"c"}},{{"type":"text","text":"d"}},{{"type":"text","text":"e","cache_control":{{"type":"ephemeral"}}}}]}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(
+            super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
+                .is_none(),
+            "CC 形态不该走模拟"
+        );
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 4, "5 块应压回 4 块: {v}");
+        assert_eq!(sys[3]["text"], "d\n\ne", "第 4 块起并成一块");
+        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral", "末块断点保留");
+
+        // 4 块及以内不动结构：官方形态与 API-key 的三块形态都不该被这条碰到。
+        let four = Bytes::from(API_SHAPE_BODY);
+        let before: serde_json::Value = serde_json::from_slice(&four).unwrap();
+        let mut after = before.clone();
+        assert!(!super::cap_system_blocks(&mut after), "3 块不该被改");
+        assert_eq!(before, after);
+
+        // 开关关掉就不封顶。
+        let off = store::ForwardFlags { system_shape: false, ..all_on() };
+        let out = super::rewrite_body(&body, &test_cred(), "fp", off, None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 5, "关掉开关应原样转发: {v}");
     }
 
     /// 模拟路径补 `metadata.user_id`：键序与 CC 一致，session_id 与请求头同值且逐设备稳定；
