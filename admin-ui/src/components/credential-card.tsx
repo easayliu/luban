@@ -6,6 +6,7 @@ import {
   ClockIcon,
   EllipsisIcon,
   SmartphoneIcon,
+  TimerOffIcon,
   TriangleAlertIcon,
   XIcon,
 } from 'lucide-react'
@@ -23,6 +24,7 @@ import {
   CredentialMenuContent,
   DeleteCredentialDialog,
   evaluateCredential,
+  modelCooldownSummary,
   quotaLevel,
   quotaPercentage,
   switchTitle,
@@ -30,6 +32,7 @@ import {
   useCredentialActions,
   type CredentialStatusMeta,
   type QuotaFreshness,
+  type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -83,8 +86,10 @@ export function CredentialCard({
   const evaluation = evaluateCredential(cred, now, language)
   const { quota, status } = evaluation
   const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
-  const has5h = cred.quota?.rl_5h_utilization != null || cred.quota?.rl_5h_reset != null
-  const has7d = cred.quota?.rl_7d_utilization != null || cred.quota?.rl_7d_reset != null
+  // 只渲染上游真报过的窗口。卡片是弹性布局，没有的那个直接不占位；表格那边列宽固定，
+  // 摘不掉，所以改成显式的「无此窗口」，见 credential-row 的 ListQuotaMeter。
+  const has5h = quota.h5.reported
+  const has7d = quota.d7.reported
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const devicePolicy = cred.device_limit === 0
     ? { label: t('跟随默认', 'Default'), variant: 'secondary' as const }
@@ -101,41 +106,41 @@ export function CredentialCard({
     if (quota.overage === 'none') return null
     if (cred.disabled) {
       return {
-        label: t('最近快照超额', 'Latest snapshot over limit'),
+        label: t('快照有 Usage credits', 'Snapshot used usage credits'),
         variant: 'warning' as const,
         title: t(
-          `账号已停用；${quotaSnapshotTime} 的额度快照记录了超额计费，当前不纳入调度风险统计`,
-          `The account is disabled; the ${quotaSnapshotTime} quota snapshot recorded overage billing and is excluded from current scheduling-risk totals`,
+          `账号已停用；${quotaSnapshotTime} 的额度快照记录了 Usage credits，当前不纳入调度风险统计`,
+          `The account is disabled; the ${quotaSnapshotTime} quota snapshot recorded usage credits and is excluded from current scheduling-risk totals`,
         ),
       }
     }
     if (quota.overage === 'historical') {
       return {
-        label: t('最近曾超额', 'Recently over limit'),
+        label: t('近期用过 Usage credits', 'Recently used usage credits'),
         variant: 'warning' as const,
         title: t(
-          '最近的额度快照记录了超额计费，但相关额度窗口已经重置',
-          'The latest quota snapshot recorded overage billing, but the related quota windows have reset',
+          '最近的额度快照记录了 Usage credits，但相关额度窗口已经重置',
+          'The latest quota snapshot recorded usage credits, but the related quota windows have reset',
         ),
       }
     }
     if (quota.overage === 'active' && status.kind !== 'overage') {
       return {
-        label: t('超额计费', 'Overage billing'),
+        label: t('Usage credits 生效中', 'Usage credits active'),
         variant: 'error' as const,
         title: t(
-          `${quotaSnapshotTime} 的额度快照显示上游正以超额计费放行请求`,
-          `The ${quotaSnapshotTime} quota snapshot shows the upstream allowing requests through overage billing`,
+          `${quotaSnapshotTime} 的额度快照显示套餐用量已耗尽，正由 Usage credits 按标准 API 价放行请求`,
+          `The ${quotaSnapshotTime} quota snapshot shows the plan's included usage exhausted and requests being served by usage credits at standard API rates`,
         ),
       }
     }
     if (quota.overage === 'unknown' && status.kind !== 'overage-unknown') {
       return {
-        label: t('超额待确认', 'Overage unconfirmed'),
+        label: t('Usage credits 待确认', 'Usage credits unconfirmed'),
         variant: 'warning' as const,
         title: t(
-          `${quotaSnapshotTime} 的额度快照记录了超额计费，当前状态仍需确认`,
-          `The ${quotaSnapshotTime} quota snapshot recorded overage billing; the current state still needs confirmation`,
+          `${quotaSnapshotTime} 的额度快照记录了 Usage credits，当前状态仍需确认`,
+          `The ${quotaSnapshotTime} quota snapshot recorded usage credits; the current state still needs confirmation`,
         ),
       }
     }
@@ -305,7 +310,13 @@ export function CredentialCard({
               )}
             </div>
             {cred.quota && (has5h || has7d) ? (
-              <div className="grid gap-4 @sm/card:grid-cols-2 @sm/card:gap-5">
+              // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
+              <div
+                className={cn(
+                  'grid gap-4',
+                  has5h && has7d && '@sm/card:grid-cols-2 @sm/card:gap-5',
+                )}
+              >
                 {has5h && (
                   <QuotaMeter
                     credentialLabel={cred.label}
@@ -334,6 +345,21 @@ export function CredentialCard({
             ) : cred.quota ? (
               <p className="text-sm text-muted-foreground">{t('上游尚未返回额度窗口。', 'The upstream has not returned quota windows yet.')}</p>
             ) : null}
+            {quota.extraWindows.length > 0 && <ExtraWindows windows={quota.extraWindows} />}
+            {cred.quota && <UpstreamVerdict quota={cred.quota} />}
+            {evaluation.modelCooling && (
+              <p
+                className="flex flex-wrap items-center gap-x-1.5 text-warning-foreground text-xs"
+                title={t(
+                  '这些模型刚被上游 429（多为容量限制或超额池满），暂时不参与选号；该账号的其余模型照常服务。到点自动恢复，也可在菜单里手动解除冷却',
+                  'These models were just rate-limited upstream (usually capacity limits or an exhausted overage pool) and are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
+                )}
+              >
+                <TimerOffIcon className="size-3.5" />
+                <span className="font-medium">{t('模型冷却', 'Model cooldown')}</span>
+                <span>{modelCooldownSummary(cred, language)}</span>
+              </p>
+            )}
           </section>
         </CardPanel>
 
@@ -424,6 +450,163 @@ function AttentionSummary({ id, status }: { id: string; status: CredentialStatus
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * 这个「窗口」其实是个**可用性标记**而不是用量窗口。
+ *
+ * 上游的 `anthropic-ratelimit-unified-overage-status` 报的是「这个账号的 Usage credits
+ * 能不能用」。Usage credits 是 Anthropic 官方术语（旧称 extra usage）：套餐包含的用量
+ * 用完后不拦你，而是切成按标准 API 价的按量计费继续跑。
+ *
+ * `rejected` = 不可用，已知两种成因，而**我们区分不了**——上游只给状态词，成因没有对应的头：
+ * `org_level_disabled`（没开启，见 proxy.rs `rate_limit_scope` 的抓包样例）与
+ * `out_of_credits`（额度用光）。所以文案只能说「不可用」，把两种成因留在 tooltip 里，
+ * 别替上游把话说死。
+ *
+ * 它没有 utilization，也没有 reset，和 `7d_oi` 那种真有用量的超额**池**是两回事——
+ * 后者的 `rejected` 才是「这个池子满了/被拒了」。
+ *
+ * 判据用「没有 utilization 且名字里有 overage、但不是 `_oi` 结尾的池子」，而不是死等
+ * `name === 'overage'`：窗口名是上游说了算的，将来多个 `overage_xxx` 也该走同一套解释。
+ */
+function isCapabilityWindow(w: QuotaWindowMeta): boolean {
+  return w.rawUtilization == null && w.name.includes('overage') && !w.name.endsWith('_oi')
+}
+
+/**
+ * 把上游的状态词翻成人话。**同一个 `rejected` 在两类窗口上含义完全不同**，所以不能共用一句：
+ *
+ * - 可用性标记（见 [`isCapabilityWindow`]）：`rejected` = 这个账号的 Usage credits **不可用**
+ *   （没开启，或额度已用光——上游没给成因，两者分不出来）。它不是坏消息，只是一项能力用不了；
+ *   真要说的话，用不了反而意味着不会莫名其妙产生按量费用，所以不标红。
+ * - 用量窗口（`7d_oi` 之类）：`rejected`/`rate_limited` = 这个池子确实被拒了，标红。
+ *
+ * 认不出的状态词原样显示，不猜——上游随时可能加新词，硬翻只会翻错。
+ */
+function windowStatusLabel(
+  w: QuotaWindowMeta,
+  t: (zh: string, en: string) => string,
+): { text: string; bad: boolean } | null {
+  const status = w.status
+  if (!status) return null
+  if (isCapabilityWindow(w)) {
+    if (status === 'rejected') return { text: t('不可用', 'Unavailable'), bad: false }
+    if (status === 'allowed' || status === 'allowed_warning') {
+      return { text: t('可用', 'Available'), bad: false }
+    }
+    return { text: status, bad: false }
+  }
+  if (status === 'rejected' || status === 'rate_limited') {
+    return { text: t('已拒', 'rejected'), bad: true }
+  }
+  // 用量窗口的 allowed 是常态，不占地方。
+  return null
+}
+
+/**
+ * 5h / 7d 之外的窗口——实测里最常见的是超额池 `7d_oi`，而**被拒的往往正是它**。
+ *
+ * 刻意画成一行紧凑标签而不是第三、第四条进度条：这些窗口没有配套的窗口内费用与请求数
+ * （那要靠 reset 反推窗口起点去聚合流水，只有 5h/7d 做得到），撑成同规格的进度条会让人
+ * 以为下面那两个数字也是它的。窗口名原样显示，不翻译、不做白名单——种类是上游说了算的。
+ *
+ * **但状态词要按窗口的种类翻译**，见 [`windowStatusLabel`]：同一个 `rejected` 在用量窗口上
+ * 是「这个池子满了」，在 `overage` 那个可用性标记上却是「Usage credits 用不了」。
+ */
+function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
+  const { t, language } = useI18n()
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+      {windows.map((w) => {
+        const pct = w.percentage
+        const badge = windowStatusLabel(w, t)
+        return (
+          <span
+            key={w.name}
+            className="inline-flex items-center gap-1"
+            title={[
+              isCapabilityWindow(w)
+                ? t(
+                    `${w.name}：上游报告 Usage credits（套餐用量耗尽后的按量计费额度）能不能用，不是用量窗口，所以没有百分比。不可用可能是没开启，也可能是额度已用光——上游没给成因`,
+                    `${w.name}: reports whether usage credits (pay-as-you-go beyond the plan's included usage) are available — not a usage window, so it has no percentage. "Unavailable" may mean not enabled or out of credits; the upstream does not say which`,
+                  )
+                : t(`额度窗口 ${w.name}`, `Quota window ${w.name}`),
+              w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
+              w.resetAt != null && t(
+                `${formatFullTime(w.resetAt, language)} 重置`,
+                `resets ${formatFullTime(w.resetAt, language)}`,
+              ),
+              !isCapabilityWindow(w) && t(
+                '该窗口没有专用的窗口内费用与请求数统计',
+                'this window has no per-window cost or request breakdown',
+              ),
+            ].filter(Boolean).join(' · ')}
+          >
+            <span className="font-medium text-foreground">{w.name}</span>
+            {/* 没有 utilization 的窗口不摆百分比位：一个 `—` 会让人以为「数据缺失」，
+                而开关式窗口本来就没有用量可言。 */}
+            {pct != null && (
+              <span className={cn('tabular-nums', badge?.bad && 'text-destructive-foreground font-medium')}>
+                {pct}%
+              </span>
+            )}
+            {badge && (
+              <span className={badge.bad ? 'text-destructive-foreground' : undefined}>
+                {badge.text}
+              </span>
+            )}
+            {w.resetAt != null && (
+              <span>{t(`· ${formatClockTime(w.resetAt, language)} 重置`, `· resets ${formatClockTime(w.resetAt, language)}`)}</span>
+            )}
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 上游对**这个账号**的整体额度判决（`anthropic-ratelimit-unified-status`），
+ * 以及它认为当前是哪个窗口在管事（`representative-claim`）。`allowed` 是常态，不占地方。
+ *
+ * 这一行是「5h / 7d 都没满，却被拒或动用了 Usage credits」时唯一能给出解释的东西：满掉的那个窗口
+ * （实测多为超额池 `7d_oi`）后端只用来判冷却、并不落库，所以卡片上没有它的进度条可看，
+ * 但上游的判决与它的名字是在快照里的。缺了这行，那种账号在界面上就是「一切正常却在烧钱」。
+ */
+function UpstreamVerdict({ quota }: { quota: NonNullable<Credential['quota']> }) {
+  const { t } = useI18n()
+  const status = quota.unified_status
+  if (!status || status === 'allowed') return null
+  const rejected = status === 'rejected'
+  return (
+    <p className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
+      <span>{t('上游判定', 'Upstream verdict')}</span>
+      <span
+        className={cn('font-medium', rejected ? 'text-destructive-foreground' : 'text-warning-foreground')}
+        title={t(
+          rejected
+            ? '上游拒绝了这次请求：该账号至少有一个额度窗口已耗尽'
+            : '上游放行但已发出预警：该账号有额度窗口接近耗尽',
+          rejected
+            ? 'The upstream rejected the request: at least one quota window for this account is exhausted'
+            : 'The upstream allowed the request but issued a warning: a quota window is close to exhaustion',
+        )}
+      >
+        {status}
+      </span>
+      {quota.rl_representative && (
+        <span
+          title={t(
+            `上游称当前起约束作用的是 ${quota.rl_representative} 窗口。若它不在上面的 5h / 7d 里，说明这是一个未被记录的窗口（多为超额池），卡片上没有对应的进度条`,
+            `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not among the 5h / 7d windows above, it is an unrecorded window (typically the overage pool) and has no meter on this card`,
+          )}
+        >
+          {t(`· 当前由 ${quota.rl_representative} 窗口决定`, `· currently bound by the ${quota.rl_representative} window`)}
+        </span>
+      )}
+    </p>
   )
 }
 

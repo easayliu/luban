@@ -29,18 +29,31 @@ pub async fn handle(
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
 
     // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
-    if let Some(expected) = effective_client_key(&state) {
-        if !client_authorized(&headers, &expected) {
-            tracing::warn!(%method, path = %path_and_query, "拒绝：无效的接入 API Key");
-            return (StatusCode::UNAUTHORIZED, "无效的 API Key").into_response();
-        }
+    if let Some(expected) = effective_client_key(&state)
+        && !client_authorized(&headers, &expected)
+    {
+        tracing::warn!(%method, path = %path_and_query, "拒绝：无效的接入 API Key");
+        return (StatusCode::UNAUTHORIZED, "无效的 API Key").into_response();
     }
 
-    // 2) 提取 device_id（在请求体 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
-    let device_id = extract_device_id(&body);
+    // 2) 请求体只解析这一次，下面五项判定全从这份结果上读。
+    //
+    //    此前 extract_device_id / body_has_user_id / request_model / request_speed 各自
+    //    `from_slice` 一遍整个 body，`Simulation::detect` 再来一遍，加上 `rewrite_body`
+    //    自己那次，一条请求要把同一份 JSON 完整解析 6 次以上（429 换号重试时后两项还按轮次
+    //    翻倍）。body 上限刚放到 64MB，长对话几 MB 是常态，这是白烧的 CPU。
+    //
+    //    `rewrite_body` 仍自己解析：它要一份**可变且每轮独立**的副本（每次重试都从客户端
+    //    原始体重新改写），共用这份只读的反而要多克隆一次。
+    //
+    //    解析失败（不是 JSON）时为 `None`，各项判定按「读不出来」退化，与逐个解析时一致。
+    let body_json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+
+    // 提取 device_id（在 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
+    let device_id = extract_device_id(body_json.as_ref());
     // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
     // body 逐轮不变，算一次即可。见 [`Upstream::bare_session`]。
-    let has_user_id = body_has_user_id(&body);
+    let has_user_id = body_has_user_id(body_json.as_ref());
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
@@ -60,7 +73,7 @@ pub async fn handle(
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
     // 请求的模型名：冷却按「账号 + 模型」分格，fable 那类模型级 429 不该拖累整个账号。
-    let req_model = request_model(&body);
+    let req_model = request_model(body_json.as_ref());
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
     // 免得两处的 device_id/model 哪天漂开。
     fn select<'a>(
@@ -134,7 +147,7 @@ pub async fn handle(
     }
     // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
     // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
-    let req_speed = request_speed(&body);
+    let req_speed = request_speed(body_json.as_ref());
 
     // 7) 发起上游请求并流式回传。头名的拼写与顺序由 orig_header_case 决定（关掉即退回
     //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
@@ -157,7 +170,7 @@ pub async fn handle(
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
     let (upstream, resp) = loop {
-        let sim = Simulation::detect(&body, flags, &cred, &device_fp);
+        let sim = Simulation::detect(body_json.as_ref(), flags, &cred, &device_fp);
         // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
         let bare_session = bare_session_id(
             &headers,
@@ -779,12 +792,35 @@ impl Drop for ReqLog {
             rl_7d_utilization: self.ratelimit.seven_d_utilization,
             rl_representative: self.ratelimit.representative.clone(),
             rl_overage_in_use: self.ratelimit.overage_in_use,
+            windows: self.ratelimit.windows(),
             ratelimit_raw: (!self.ratelimit.raw.is_empty()).then(|| self.ratelimit.raw.clone()),
             cost_usd,
         };
-        if let Err(e) = self.store.insert_usage_log(&rec) {
+        spawn_usage_log(self.store.clone(), rec);
+    }
+}
+
+/// 把一条用量日志交给阻塞线程池落库。
+///
+/// **为什么不能就地写**：调用方是 [`ReqLog::drop`]，而它是在响应流跑完（或客户端断开）时
+/// 由 tokio 的工作线程执行的。`insert_usage_log` 是同步 SQLite 写，还要抢那把全局 `conn`
+/// 锁——就地写等于在异步工作线程上做阻塞 IO，并发流一多就会把 worker 堵住，连带拖慢所有
+/// 在途转发。日志裁剪那条路早就走 `spawn_blocking` 了（见 [`crate::web::run`]），这里同理。
+///
+/// 运行时退出时会等阻塞任务跑完（`#[tokio::main]` 结束时 drop runtime 即如此），故正常
+/// 关停不会丢日志。拿不到运行时句柄的场合（单元测试里直接 drop 一个 `ReqLog`）退回就地写，
+/// 那种场景本来就没有 worker 可堵。
+fn spawn_usage_log(store: std::sync::Arc<store::CredentialStore>, rec: store::UsageRecord) {
+    let write = move || {
+        if let Err(e) = store.insert_usage_log(&rec) {
             tracing::warn!(error = %e, "写入用量日志失败");
         }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(write);
+        }
+        Err(_) => write(),
     }
 }
 
@@ -896,10 +932,11 @@ impl UsageSniffer {
 
     /// 收尾：非流式模式在此解析累积的整段 JSON。
     fn finish(&mut self) {
-        if !self.is_stream && !self.buf.is_empty() {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&self.buf) {
-                self.merge(&v);
-            }
+        if !self.is_stream
+            && !self.buf.is_empty()
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&self.buf)
+        {
+            self.merge(&v);
         }
     }
 
@@ -938,16 +975,14 @@ fn is_billable_messages(path: &str) -> bool {
 /// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows 客户端）：取 `<hash>`。
 ///
 /// 解析失败或标识为空时返回 `None`（退化为纯优先级选择、不做粘性绑定）。
-fn extract_device_id(body: &Bytes) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let user_id = json.get("metadata")?.get("user_id")?.as_str()?;
+fn extract_device_id(body: Option<&serde_json::Value>) -> Option<String> {
+    let user_id = body?.get("metadata")?.get("user_id")?.as_str()?;
     // CC 内嵌 JSON 优先。
-    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(dev) = inner.get("device_id").and_then(|d| d.as_str()) {
-            if !dev.is_empty() {
-                return Some(dev.to_string());
-            }
-        }
+    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(dev) = inner.get("device_id").and_then(|d| d.as_str())
+        && !dev.is_empty()
+    {
+        return Some(dev.to_string());
     }
     // 退化：扁平串格式，取 device 段。
     let flat = parse_flat_user_id(user_id)?;
@@ -959,11 +994,8 @@ fn extract_device_id(body: &Bytes) -> Option<String> {
 /// 与 [`extract_device_id`] 的区别：那个要求能**解析出设备标识**，格式认不出就是 `None`；
 /// 这里只问「这个字段在不在」——决定的是要不要给它补一份官方身份（见 [`ensure_cc_metadata`]），
 /// 而字段已经在的话，改写它是 [`spoof_identity`] 的活，两条路只能有一条动它。
-fn body_has_user_id(body: &Bytes) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| Some(v.get("metadata")?.get("user_id")?.is_string()))
-        .unwrap_or(false)
+fn body_has_user_id(body: Option<&serde_json::Value>) -> bool {
+    body.and_then(|v| Some(v.get("metadata")?.get("user_id")?.is_string())).unwrap_or(false)
 }
 
 /// 扁平 `metadata.user_id` 中我们需要的两段：`user_<device>_account_<..>_session_<session>`。
@@ -1056,15 +1088,15 @@ fn effective_client_key(state: &AppState) -> Option<String> {
 
 /// 校验来访身份：`x-api-key: <key>` 或 `Authorization: Bearer <key>`。
 fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
-    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if v == expected {
-            return true;
-        }
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && v == expected
+    {
+        return true;
     }
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if v.strip_prefix("Bearer ").map(str::trim) == Some(expected) {
-            return true;
-        }
+    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && v.strip_prefix("Bearer ").map(str::trim) == Some(expected)
+    {
+        return true;
     }
     false
 }
@@ -1333,7 +1365,7 @@ impl Simulation {
     /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
     /// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
     fn detect(
-        body: &Bytes,
+        body: Option<&serde_json::Value>,
         flags: store::ForwardFlags,
         cred: &crate::credentials::Credential,
         device_fp: &str,
@@ -1341,8 +1373,8 @@ impl Simulation {
         if !flags.simulate_cc || !flags.merge_beta {
             return None;
         }
-        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-        if is_cc_shaped(&v) {
+        let v = body?;
+        if is_cc_shaped(v) {
             return None;
         }
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
@@ -1609,16 +1641,14 @@ fn ensure_cc_metadata(
 
 /// 读取请求体声明的模型名（顶层 `model`）。用于按模型分格的限流冷却，见
 /// [`rate_limit_scope`]。解析失败或没有该字段时返回 `None`（退化为账号级冷却）。
-fn request_model(body: &Bytes) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    Some(v.get("model")?.as_str()?.to_string())
+fn request_model(body: Option<&serde_json::Value>) -> Option<String> {
+    Some(body?.get("model")?.as_str()?.to_string())
 }
 
 /// 读取请求体声明的速度档（顶层 `speed` 字段，如 `"fast"`；配套 header
 /// `anthropic-beta: fast-mode-*`）。解析失败或没有该字段时返回 `None`。
-fn request_speed(body: &Bytes) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    Some(v.get("speed")?.as_str()?.to_string())
+fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
+    Some(body?.get("speed")?.as_str()?.to_string())
 }
 
 /// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
@@ -1704,9 +1734,9 @@ fn rewrite_body(
 /// CC 形态补身份（`bare_session` 为 `Some`，见 [`Upstream::bare_session`]）。否则记出来的是
 /// 一个上游根本没见过的 id，比留个 `-` 更误导。
 ///
-/// **前缀不是装饰**：这个值每账号恒定（指纹对裸客户端恒为 `"||"`），所有裸客户端共用同一个，
-/// 看着就像「一台设备打了全部请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成
-/// 真实设备读。它也**不写设备绑定**，故不占 `device_limit` 名额、不会出现在设备列表里
+/// **前缀不是装饰**：这个值只随「账号 + 平台指纹」变（裸客户端没有自己的 device_id，指纹退化
+/// 成 `"|<arch>|<os>"`，同账号同平台的所有裸客户端共用一个），看着就像「一台设备打了全部
+/// 请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成真实设备读。它也**不写设备绑定**，故不占 `device_limit` 名额、不会出现在设备列表里
 /// （[`store::CredentialStore::list_devices`] 从 `device_bindings` 出发）。
 fn sim_device_id(
     sim: Option<&Simulation>,
@@ -2131,7 +2161,9 @@ struct RateLimitInfo {
     /// 不带窗口名的 `anthropic-ratelimit-unified-reset`（unix 秒）：上游给的「整体什么时候
     /// 恢复」，比按 `representative-claim` 反查窗口更直接。
     unified_reset: Option<i64>,
-    /// `anthropic-ratelimit-unified-overage-in-use`：本次请求是否由**超额计费**在放行。
+    /// `anthropic-ratelimit-unified-overage-in-use`：本次请求是否动用了 **usage credits**
+    /// （Anthropic 官方术语，旧称 extra usage：套餐包含的用量用完后不拦你，切成按标准
+    /// API 价的按量计费继续跑）。别把它叫「超额计费」——那不是官方说法。
     /// 这是「额度满了但不 429」的关键标记——基础窗口 rejected、请求却 200 成功，
     /// 烧的是按量计费的钱；把它落进快照，前端才能把这种号和真正健康的号区分开。
     overage_in_use: Option<bool>,
@@ -2268,6 +2300,40 @@ impl RateLimitInfo {
         }
         .clamp(1, MAX_RATE_LIMIT_COOLDOWN_SECS);
         std::time::Duration::from_secs(secs as u64)
+    }
+
+    /// 把逐项收集的三张表（status / utilization / reset）按窗口名合并成一份结构化快照，
+    /// 供落库展示（见 [`store::QuotaWindow`]）。
+    ///
+    /// 顺序按**首次出现**的窗口名排，即上游响应头里的顺序——前端照着渲染就是上游的原序，
+    /// 不必自己定一套排法。三张表是分开收的（解析时一个头只落一处），故这里以 status 打头、
+    /// 再把只出现在另外两张表里的窗口补上，避免漏掉「只报了 utilization 没报 status」的窗口。
+    fn windows(&self) -> Vec<store::QuotaWindow> {
+        let mut names: Vec<&str> = Vec::new();
+        for name in self
+            .window_status
+            .iter()
+            .map(|(w, _)| w.as_str())
+            .chain(self.window_utilization.iter().map(|(w, _)| w.as_str()))
+            .chain(self.window_reset.iter().map(|(w, _)| w.as_str()))
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| store::QuotaWindow {
+                name: name.to_string(),
+                status: self.window_status.iter().find(|(w, _)| w == name).map(|(_, s)| s.clone()),
+                utilization: self
+                    .window_utilization
+                    .iter()
+                    .find(|(w, _)| w == name)
+                    .map(|(_, u)| *u),
+                reset: self.window_reset.iter().find(|(w, _)| w == name).map(|(_, t)| *t),
+            })
+            .collect()
     }
 
     /// 各窗口的 `*-reset`（unix 秒），全窗口通收后再并上 5h/7d 专用字段（重复无所谓，
@@ -2418,7 +2484,7 @@ pub struct ProbeQuota {
     /// `retry-after`（秒）。只有 429 才有，且它是**这次拒绝**给出的等待时间，比各窗口的
     /// reset 更直接（实测给过 63 小时，直指 7 天窗口的重置时刻）。
     pub retry_after_secs: Option<i64>,
-    /// 本次请求是否由**超额计费**放行（`…-overage-in-use`）：额度满了但照样 200，
+    /// 本次请求是否动用了 **usage credits**（`…-overage-in-use`）：套餐额度满了但照样 200，
     /// 烧的是按量计费的钱。
     pub overage_in_use: Option<bool>,
 }
@@ -2767,7 +2833,7 @@ const PROBE_DEVICE_ID: &str = "probe";
 ///
 /// 写失败只告警不影响测试结果——用户要的是「通不通」，日志是副产品。
 fn log_probe_usage(
-    store: &store::CredentialStore,
+    store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     req_model: &str,
     status: StatusCode,
@@ -2817,12 +2883,12 @@ fn log_probe_usage(
         rl_7d_utilization: ratelimit.seven_d_utilization,
         rl_representative: ratelimit.representative.clone(),
         rl_overage_in_use: ratelimit.overage_in_use,
+        windows: ratelimit.windows(),
         ratelimit_raw: (!ratelimit.raw.is_empty()).then(|| ratelimit.raw.clone()),
         cost_usd,
     };
-    if let Err(e) = store.insert_usage_log(&rec) {
-        tracing::warn!(error = %e, "写入连通性测试的用量日志失败");
-    }
+    // 与转发路径同理：这里在 async 上下文里，同步写库会占住工作线程，见 [`spawn_usage_log`]。
+    spawn_usage_log(store.clone(), rec);
 }
 
 /// 把上游响应翻译成一份结果：2xx 取回报的模型名，其余取 `error.type`/`error.message`。
@@ -2888,6 +2954,12 @@ mod tests {
         assert!(is_billable_messages("/v1/messages/count_tokens/../"));
         assert!(is_billable_messages("/v1/messages/count_tokens/"));
         assert!(is_billable_messages("/v1/messages/count_tokensX"));
+    }
+
+    /// 把原始 body 解析一次，模拟 [`super::handle`] 里那一步——生产路径全程只解析一次，
+    /// 测试也走同一个形态，免得两边对「非法 JSON 怎么办」的理解漂开。
+    fn parsed(b: &Bytes) -> Option<serde_json::Value> {
+        serde_json::from_slice(b).ok()
     }
 
     /// 形态开关全开（= 默认，也是加入开关机制之前的既有行为）。
@@ -3773,13 +3845,18 @@ mod tests {
     }
 
     /// 请求体顶层 `speed` 字段能被读出；缺字段/非法 JSON 返回 None（不阻断转发）。
+    ///
+    /// 入参是**已解析**的 body（handler 全程只解析一次，见 [`super::handle`]），故「非法
+    /// JSON」在这里表现为 `None`——解析失败那步已经在上游发生了。
     #[test]
     fn reads_speed_from_request_body() {
-        let with = Bytes::from(r#"{"model":"claude-opus-5","speed":"fast","messages":[]}"#);
-        assert_eq!(request_speed(&with).as_deref(), Some("fast"));
-        let without = Bytes::from(r#"{"model":"claude-opus-5","messages":[]}"#);
-        assert_eq!(request_speed(&without), None);
-        assert_eq!(request_speed(&Bytes::from("not json")), None);
+        let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s).ok();
+        let with = parse(r#"{"model":"claude-opus-5","speed":"fast","messages":[]}"#);
+        assert_eq!(request_speed(with.as_ref()).as_deref(), Some("fast"));
+        let without = parse(r#"{"model":"claude-opus-5","messages":[]}"#);
+        assert_eq!(request_speed(without.as_ref()), None);
+        assert_eq!(parse("not json"), None, "非法 JSON 在解析那步就是 None");
+        assert_eq!(request_speed(None), None);
     }
 
     /// 上游 SSE 的 `usage.speed` 会被嗅探到——这是计费的权威来源（fast 被限流会回落）。
@@ -3888,8 +3965,13 @@ mod tests {
     );
 
     fn sim_for(body: &str) -> super::Simulation {
-        super::Simulation::detect(&Bytes::from(body.to_string()), all_on(), &test_cred(), "fp")
-            .expect("普通请求应判为需要模拟")
+        super::Simulation::detect(
+            parsed(&Bytes::from(body.to_string())).as_ref(),
+            all_on(),
+            &test_cred(),
+            "fp",
+        )
+        .expect("普通请求应判为需要模拟")
     }
 
     /// 模拟串交给 `merge_beta` 之后，必须**逐字节**等于官方那串——这是
@@ -3946,7 +4028,8 @@ mod tests {
             r#"{"model":"claude-sonnet-5","messages":[],"system":"你是助手","max_tokens":8}"#
                 .to_string(),
         );
-        let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
+        let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
+            .unwrap();
         let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -4010,25 +4093,33 @@ mod tests {
     fn leaves_cc_shaped_request_alone() {
         let cc = Bytes::from(API_SHAPE_BODY);
         assert!(
-            super::Simulation::detect(&cc, all_on(), &test_cred(), "fp").is_none(),
+            super::Simulation::detect(parsed(&cc).as_ref(), all_on(), &test_cred(), "fp").is_none(),
             "CC 形态不该走模拟路径"
         );
         let as_string = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","system":"{}","messages":[]}}"#,
             config::CC_SYSTEM_IDENTITY
         ));
-        assert!(super::Simulation::detect(&as_string, all_on(), &test_cred(), "fp").is_none());
+        assert!(
+            super::Simulation::detect(parsed(&as_string).as_ref(), all_on(), &test_cred(), "fp")
+                .is_none()
+        );
 
         // 开关关掉、或 merge_beta 关掉（模拟出来的 beta 没人落位）时也不模拟。
         let plain = Bytes::from(PLAIN_BODY.to_string());
         let off = store::ForwardFlags { simulate_cc: false, ..all_on() };
-        assert!(super::Simulation::detect(&plain, off, &test_cred(), "fp").is_none());
+        assert!(
+            super::Simulation::detect(parsed(&plain).as_ref(), off, &test_cred(), "fp").is_none()
+        );
         let no_beta = store::ForwardFlags { merge_beta: false, ..all_on() };
-        assert!(super::Simulation::detect(&plain, no_beta, &test_cred(), "fp").is_none());
+        assert!(
+            super::Simulation::detect(parsed(&plain).as_ref(), no_beta, &test_cred(), "fp")
+                .is_none()
+        );
         // 解析不了的请求体不 panic、也不模拟。
         assert!(
             super::Simulation::detect(
-                &Bytes::from_static(b"not json"),
+                parsed(&Bytes::from_static(b"not json")).as_ref(),
                 all_on(),
                 &test_cred(),
                 "fp"
@@ -4045,7 +4136,8 @@ mod tests {
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[],"system":[{blk},{blk},{blk},{blk}]}}"#
         ));
-        let sim = super::Simulation::detect(&body, all_on(), &test_cred(), "fp").unwrap();
+        let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
+            .unwrap();
         let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
@@ -4080,7 +4172,9 @@ mod tests {
             r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"user_aa_account_bb_session_cc"}}"#
                 .to_string(),
         );
-        let sim2 = super::Simulation::detect(&with_meta, all_on(), &test_cred(), "fp").unwrap();
+        let sim2 =
+            super::Simulation::detect(parsed(&with_meta).as_ref(), all_on(), &test_cred(), "fp")
+                .unwrap();
         let out2 = super::rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2), None);
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         assert_eq!(
@@ -4111,10 +4205,14 @@ mod tests {
             config::CC_SYSTEM_IDENTITY
         ));
         assert!(
-            super::Simulation::detect(&body, all_on(), &test_cred(), "fp").is_none(),
+            super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
+                .is_none(),
             "CC 形态不该走模拟"
         );
-        assert!(!super::body_has_user_id(&body), "这条来访本来就没有 metadata.user_id");
+        assert!(
+            !super::body_has_user_id(parsed(&body).as_ref()),
+            "这条来访本来就没有 metadata.user_id"
+        );
 
         // 来访没带会话 id 头 → 派生一个，头体同步补。
         let client = super::HeaderMap::new();
@@ -4123,7 +4221,7 @@ mod tests {
             all_on(),
             None,
             true,
-            super::body_has_user_id(&body),
+            super::body_has_user_id(parsed(&body).as_ref()),
             &test_cred(),
             "fp",
         )
@@ -4393,6 +4491,66 @@ mod tests {
         assert_eq!(absurd.cooldown(true).as_secs(), super::MAX_RATE_LIMIT_COOLDOWN_SECS as u64);
     }
 
+    /// 落库展示用的全窗口快照：三张分开收集的表（status / utilization / reset）要按窗口名
+    /// 合并回一份，且**窗口名不写死**——`7d_oi` 那类没有专用列的必须在里面，那正是这一列
+    /// 存在的理由（见 [`store::QuotaWindow`]）。
+    #[test]
+    fn snapshot_windows_merge_every_reported_window() {
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        // 逐字取自第二次真实的 fable-5 429（同 rate_limit_scope_reads_every_window_not_just_5h_7d）。
+        let info = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+            ("anthropic-ratelimit-unified-5h-reset", "9000"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.7"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+            // 只报了 status、没有 utilization/reset 的窗口也不能漏。
+            ("anthropic-ratelimit-unified-overage-status", "rejected"),
+            ("retry-after", "304802"),
+        ]);
+        let windows = info.windows();
+        let by = |n: &str| windows.iter().find(|w| w.name == n).unwrap_or_else(|| panic!("缺 {n}"));
+
+        assert_eq!(windows.len(), 4, "5h / 7d / 7d_oi / overage 四个都要在：{windows:?}");
+        assert_eq!(by("5h").utilization, Some(0.2));
+        assert_eq!(by("5h").reset, Some(9_000));
+        assert_eq!(by("5h").status.as_deref(), Some("allowed"));
+        // 没有专用列的那个——这一列的全部意义所在。
+        assert_eq!(by("7d_oi").utilization, Some(1.02));
+        assert_eq!(by("7d_oi").status.as_deref(), Some("rejected"));
+        assert_eq!(by("7d_oi").reset, None, "上游没给 reset 就该是空，不许编");
+        // 三张表里只出现在 status 那张的窗口同样要被带出来。
+        assert_eq!(by("overage").status.as_deref(), Some("rejected"));
+        assert_eq!(by("overage").utilization, None);
+        // 顺序即上游响应头里首次出现的顺序，前端照着渲染就是原序。
+        assert_eq!(
+            windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
+            ["5h", "7d", "7d_oi", "overage"]
+        );
+
+        // 不带任何限流头的响应给出空列表——落库那侧靠它判断「要不要覆盖快照」。
+        assert!(hdr(&[]).windows().is_empty());
+        // 不带窗口名的 `…-unified-status` / `…-unified-reset` 不得造出一个名字为空的假窗口。
+        let unified_only = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", "9000"),
+        ]);
+        assert!(unified_only.windows().is_empty(), "{:?}", unified_only.windows());
+    }
+
     /// **fable 撞 429 绝不能停用整个账号。**
     ///
     /// 这是一条真实事故的护栏：fable 走的是超额池（`7d_oi`），它满了的时候基础 5h/7d 还空着，
@@ -4603,7 +4761,10 @@ mod tests {
     /// 虚低），且以 `device_id = "probe"` 标出，翻日志时能与真实流量分开。
     #[test]
     fn probe_usage_log_feeds_the_card_quota() {
-        let store = crate::store::CredentialStore::open_in_memory().unwrap();
+        // Arc 包着：落库现在走 spawn_blocking（见 `spawn_usage_log`），要能把 store 交出去。
+        // 这个测试不在 tokio 运行时里，故 `Handle::try_current` 失败、退回就地同步写——
+        // 下面的断言因此仍能立刻读到结果。
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
         let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
         let info = rl_headers(&[
             ("anthropic-ratelimit-unified-status", "allowed"),

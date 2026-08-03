@@ -52,6 +52,10 @@ export type QuotaLevel = 'empty' | 'ok' | 'warning' | 'critical'
 export type OverageState = 'none' | 'active' | 'historical' | 'unknown'
 
 export interface QuotaWindowMeta {
+  /** 窗口名（`5h`/`7d`/`7d_oi` …）。上游说了算，不做白名单。 */
+  name: string
+  /** 上游对该窗口的判决（`allowed`/`allowed_warning`/`rejected`/`rate_limited`）。 */
+  status: string | null
   /** 仍属于当前窗口的使用率；明确已重置时为空。 */
   utilization: number | null
   /** 上游快照里的原值，仅用于判断超额标记对应哪个窗口。 */
@@ -61,13 +65,54 @@ export interface QuotaWindowMeta {
   resetAt: number | null
   freshness: QuotaFreshness
   level: QuotaLevel
+  /**
+   * 上游**是否报告过这个窗口**（使用率与重置时刻有其一即算）。
+   *
+   * 与「暂无数据」是两回事，界面必须分开说：没有快照是「还没跑过请求，等等就有」，
+   * 而有快照却缺这个窗口，意味着这个账号的额度模型里压根没有它（例如只有 5h 没有 7d），
+   * 再等也不会出现。混成一句「暂无数据」会让人一直等一个永远不来的数。
+   */
+  reported: boolean
 }
+
+/**
+ * `overage` 为 `unknown` 时，说明**为什么**确认不了——两种成因的处置办法完全不同：
+ *
+ * - `null`：有窗口已经重置了，它多半就是当时的成因，这只是一条过期快照，等下一条请求即可；
+ * - `'legacy-snapshot'`：这条快照落在「全窗口记录」上线之前，只有 5h/7d 两个窗口，
+ *   吃满的那个（多为超额池）压根没被存下来。同样等下一条请求，但要说清是数据缺口不是账号问题；
+ * - `'no-full-window'`：全部窗口都记下来了，也都还在当前周期，却没有一个是满的——
+ *   上游按超额放行但没报告任何已满窗口，等再多请求也不会变清楚，只能去看原始额度头。
+ */
+export type OverageUnresolved = null | 'legacy-snapshot' | 'no-full-window'
 
 export interface QuotaRiskMeta {
   h5: QuotaWindowMeta
   d7: QuotaWindowMeta
+  /**
+   * 上游报告的全部窗口。快照带了 `windows` 就用它（含 `7d_oi` 这类没有专用列的），
+   * 老快照没有就退回 `[h5, d7]`——与升级前的判定完全一致。
+   */
+  windows: QuotaWindowMeta[]
+  /** `windows` 里 5h/7d 之外的那些：卡片已经用专用进度条画了那两个，这里只补剩下的。 */
+  extraWindows: QuotaWindowMeta[]
+  /** 是否已有额度快照（`cred.quota != null`）；空态文案靠它区分「还没数据」与「无此窗口」。 */
+  hasSnapshot: boolean
   nearLimit: boolean
   overage: OverageState
+  /** `overage === 'unknown'` 的成因；其余状态下恒为 `null`。见 [`OverageUnresolved`]。 */
+  overageUnresolved: OverageUnresolved
+}
+
+/**
+ * 该窗口是否属于**超额/回补池**而非账号基础额度。
+ *
+ * 口径必须与后端 `store`/`proxy` 的 `is_overage_window` 一致（`_oi` 结尾或含 `overage`）：
+ * 那边据此判定「超额池满不等于账号额度耗尽」，前端的「额度将满」预警若把超额池算进去，
+ * 就会给一个基础额度还很空的号挂上红色，而后端明明照常在调度它。
+ */
+function isOverageWindow(name: string): boolean {
+  return name.endsWith('_oi') || name.includes('overage')
 }
 
 export type CredentialStatusKind =
@@ -97,6 +142,11 @@ export interface CredentialEvaluation {
   nearLimit: boolean
   quotaRisk: boolean
   needsAttention: boolean
+  /**
+   * 是否有**模型级**冷却在生效。与 `schedulable` 刻意分开：这一档只挡住那几个模型，
+   * 账号整体照常参与调度，把它算进「不可调度」会把一个还在正常服务的号显示成停摆。
+   */
+  modelCooling: boolean
 }
 
 const currentUnixSeconds = () => Math.floor(Date.now() / 1000)
@@ -120,9 +170,11 @@ export function quotaLevel(utilization: number | null): QuotaLevel {
 }
 
 function evaluateQuotaWindow(
+  name: string,
   utilization: number | null,
   resetAt: number | null,
   now: number,
+  status: string | null = null,
 ): QuotaWindowMeta {
   const freshness: QuotaFreshness = resetAt == null
     ? 'unknown'
@@ -131,47 +183,81 @@ function evaluateQuotaWindow(
       : 'current'
   const liveUtilization = freshness === 'expired' ? null : utilization
   return {
+    name,
+    status,
     utilization: liveUtilization,
     rawUtilization: utilization,
     percentage: quotaPercentage(liveUtilization),
     resetAt,
     freshness,
     level: quotaLevel(liveUtilization),
+    reported: utilization != null || resetAt != null,
   }
 }
 
 /**
  * 将最新额度快照解释成当前可展示的窗口与风险。
  *
- * `overage_in_use` 也是快照，不是实时订阅：有满额窗口仍在当前周期才称「超额计费」；
- * 所有已报告窗口都明确重置时降级成「最近曾超额」；其余不确定情况保守标为待确认。
+ * `overage_in_use` 也是快照，不是实时订阅：有满额窗口仍在当前周期才算「正在用 Usage credits」；
+ * 所有已报告窗口都明确重置时降级成「近期用过」；其余不确定情况保守标为待确认。
+ *
+ * **术语**：Anthropic 官方管这个叫 **usage credits**（旧称 extra usage）——套餐包含的用量
+ * 用完后不拦你，而是切成按标准 API 价的按量计费继续跑。上游头里的字段名才叫 `overage`，
+ * 界面上不要写成「超额计费」，那是我们自己编的说法。官方帮助中心只有英文版，故术语保留英文。
  */
 export function quotaRiskMeta(cred: Credential, now = currentUnixSeconds()): QuotaRiskMeta {
   const q = cred.quota
-  const h5 = evaluateQuotaWindow(q?.rl_5h_utilization ?? null, q?.rl_5h_reset ?? null, now)
-  const d7 = evaluateQuotaWindow(q?.rl_7d_utilization ?? null, q?.rl_7d_reset ?? null, now)
-  const windows = [h5, d7]
-  const nearLimit = windows.some((window) => (window.percentage ?? -1) >= 90)
+  const h5 = evaluateQuotaWindow('5h', q?.rl_5h_utilization ?? null, q?.rl_5h_reset ?? null, now)
+  const d7 = evaluateQuotaWindow('7d', q?.rl_7d_utilization ?? null, q?.rl_7d_reset ?? null, now)
+  // 后端落了全窗口就以它为准（含 7d_oi 这类没有专用列的）；老快照的 windows 是空数组，
+  // 退回 [h5, d7]——与升级前逐字一致，不会因为升级把老数据的判定改掉。
+  const hasWindowList = (q?.windows?.length ?? 0) > 0
+  const windows: QuotaWindowMeta[] = hasWindowList
+    ? q!.windows.map((w) =>
+        evaluateQuotaWindow(w.name, w.utilization ?? null, w.reset ?? null, now, w.status ?? null))
+    : [h5, d7]
+  const extraWindows = windows.filter((w) => w.name !== '5h' && w.name !== '7d')
+
+  // 「额度将满」只看基础窗口：超额池满了不代表账号额度耗尽（后端同一口径，见 isOverageWindow），
+  // 把它算进来会给一个基础额度还很空、后端照常在调度的号挂上红色预警。
+  const nearLimit = windows.some(
+    (window) => !isOverageWindow(window.name) && (window.percentage ?? -1) >= 90,
+  )
 
   let overage: OverageState = 'none'
+  let overageUnresolved: OverageUnresolved = null
   if (q?.overage_in_use === true) {
-    const reportedWindows = windows.filter(
-      (window) => window.rawUtilization != null || window.resetAt != null,
-    )
-    const currentFullWindow = reportedWindows.some(
-      (window) => (window.rawUtilization ?? -1) >= 1 && window.freshness === 'current',
+    const reportedWindows = windows.filter((window) => window.reported)
+    // 判满不要求 freshness 必须是 `current`，只排除**明确已重置**的：上游给了 7d_oi=1.02
+    // 却没给它的 reset（实测形态，重置时刻走的是 retry-after），要求 current 会让这条
+    // 证据被丢掉，于是又落回「待确认」——而那正是记录全窗口要解决的问题。
+    const fullWindow = reportedWindows.some(
+      (window) => (window.rawUtilization ?? -1) >= 1 && window.freshness !== 'expired',
     )
     // 只有所有已报告窗口都明确过期，前端才能确认这是一条历史快照；若仍有窗口未重置、
     // 但没有可对应上的满额窗口，则保守标成「待确认」，不把快照误报成仍在实时计费。
-    overage = currentFullWindow
+    overage = fullWindow
       ? 'active'
       : reportedWindows.length > 0
         && reportedWindows.every((window) => window.freshness === 'expired')
         ? 'historical'
         : 'unknown'
+    if (overage === 'unknown') {
+      // 有窗口已经重置了 → 它多半就是当时的成因，这只是条过期快照，等下条请求即可（null）。
+      // 全都还在当前周期 → 分两种：老快照压根没存全窗口，还是存全了也确实没有满的。
+      const allCurrent = reportedWindows.length > 0
+        && reportedWindows.every((window) => window.freshness === 'current')
+      overageUnresolved = !allCurrent
+        ? null
+        : hasWindowList ? 'no-full-window' : 'legacy-snapshot'
+    }
   }
 
-  return { h5, d7, nearLimit, overage }
+  return {
+    h5, d7, windows, extraWindows,
+    hasSnapshot: q != null,
+    nearLimit, overage, overageUnresolved,
+  }
 }
 
 function quotaWarningDetail(quota: QuotaRiskMeta, language: Language): string {
@@ -231,11 +317,11 @@ function statusFromQuota(
   if (quota.overage === 'active') {
     return {
       kind: 'overage', variant: 'error',
-      label: localize(language, '超额计费', 'Overage billing'),
+      label: localize(language, 'Usage credits 生效中', 'Usage credits active'),
       detail: localize(
         language,
-        `额度快照（${snapshotTime}）显示上游正以超额计费放行请求，可能产生按量费用`,
-        `The quota snapshot (${snapshotTime}) shows requests being allowed through overage billing, which may incur usage-based charges`,
+        `额度快照（${snapshotTime}）显示该账号已用完套餐包含的用量，正由 Usage credits 按标准 API 价继续放行请求`,
+        `The quota snapshot (${snapshotTime}) shows this account has used up its plan's included usage and is being served by usage credits at standard API rates`,
       ),
       attention: true, rank: 5,
     }
@@ -243,12 +329,25 @@ function statusFromQuota(
   if (quota.overage === 'unknown') {
     return {
       kind: 'overage-unknown', variant: 'warning',
-      label: localize(language, '超额待确认', 'Overage unconfirmed'),
-      detail: localize(
-        language,
-        `额度快照（${snapshotTime}）记录了超额计费，但现有窗口信息不足以确认当前仍在计费，需等待新请求确认`,
-        `The quota snapshot (${snapshotTime}) recorded overage billing, but the available window data cannot confirm whether it is still active; wait for a new request to verify`,
-      ),
+      label: localize(language, 'Usage credits 待确认', 'Usage credits unconfirmed'),
+      // 三种成因的处置办法完全不同，不能共用一句「需等待新请求确认」——见 OverageUnresolved。
+      detail: quota.overageUnresolved === 'no-full-window'
+        ? localize(
+            language,
+            `额度快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等新请求也不会更清楚，做一次连通性测试看上游此刻的原始额度头`,
+            `The quota snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this — run a connectivity test to see the upstream's current raw quota headers`,
+          )
+        : quota.overageUnresolved === 'legacy-snapshot'
+          ? localize(
+              language,
+              `额度快照（${snapshotTime}）早于「记录全部额度窗口」这次升级，只存了 5h / 7d 两个窗口，吃满的那个（多为超额池）没被存下来。下一条带额度头的请求会自动补齐`,
+              `The quota snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the overage pool) was not kept. The next request carrying quota headers will fill it in`,
+            )
+          : localize(
+              language,
+              `额度快照（${snapshotTime}）记录了 Usage credits，但现有窗口信息不足以确认当前是否仍在计费，需等待新请求确认`,
+              `The quota snapshot (${snapshotTime}) recorded usage credits, but the available window data cannot confirm whether they are still in use; wait for a new request to verify`,
+            ),
       attention: true, rank: 4,
     }
   }
@@ -292,7 +391,9 @@ export function evaluateCredential(
   const quotaRisk = !cred.disabled && (
     nearLimit || quota.overage === 'active' || quota.overage === 'unknown'
   )
+  // 只看账号级冷却：模型级那档挡的是「这个号的某几个模型」，账号本身照常在调度池里。
   const schedulable = !cred.disabled && !cred.ban_reason && cred.rate_limited_secs <= 0
+  const modelCooling = (cred.rate_limited_models?.length ?? 0) > 0
   return {
     credential: cred,
     quota,
@@ -301,7 +402,23 @@ export function evaluateCredential(
     nearLimit,
     quotaRisk,
     needsAttention: status.attention,
+    modelCooling,
   }
+}
+
+/** 把模型级冷却写成一句人话，如「fable-5 还有 5 分钟」。剩余不足一分钟时按秒说。 */
+export function modelCooldownSummary(cred: Credential, language: Language): string {
+  return (cred.rate_limited_models ?? [])
+    .map(({ model, secs }) =>
+      secs >= 60
+        ? localize(
+            language,
+            `${model} 还有 ${Math.ceil(secs / 60)} 分钟`,
+            `${model} in ${Math.ceil(secs / 60)} min`,
+          )
+        : localize(language, `${model} 还有 ${secs} 秒`, `${model} in ${secs}s`),
+    )
+    .join(localize(language, '、', ', '))
 }
 
 /** 兼容卡片与紧凑列表：返回仍属于当前窗口的原始使用率。 */
@@ -536,7 +653,8 @@ export function CredentialMenuContent({
         <ActivityIcon />
         {t('连通性测试', 'Connectivity test')}
       </MenuItem>
-      {cred.rate_limited_secs > 0 && (
+      {/* 账号级或模型级任一在冷却都该给出口——后端那个接口本来就是两档一起清的。 */}
+      {(cred.rate_limited_secs > 0 || (cred.rate_limited_models?.length ?? 0) > 0) && (
         <MenuItem onClick={() => cooldown.mutate()} disabled={cooldown.isPending}>
           <TimerOffIcon />
           {t('解除冷却', 'Clear cooldown')}
@@ -906,16 +1024,16 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
           {t('需等待', 'Wait')} {formatWait(quota.retry_after_secs, language)}
         </span>
       )}
-      {/* 额度满但上游用超额计费放行：不 429、请求照常成功，只有这里能看出在烧钱。 */}
+      {/* 套餐额度已满但上游动用 Usage credits 放行：不 429、请求照常成功，只有这里能看出在花钱。 */}
       {quota.overage_in_use && (
         <span
           className="text-destructive-foreground"
           title={t(
-            '本次请求由超额计费（overage）放行：额度已满，烧的是按量计费的钱',
-            'This request was allowed through overage billing: the quota is full and usage-based charges apply',
+            '本次请求由 Usage credits（上游头里的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
+            'This request was served by usage credits (`overage` in the upstream headers): the plan\'s included usage is exhausted and standard API rates now apply',
           )}
         >
-          {t('超额计费中', 'Overage billing active')}
+          {t('Usage credits 放行', 'Served by usage credits')}
         </span>
       )}
       {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}

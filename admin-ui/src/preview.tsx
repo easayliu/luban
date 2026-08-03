@@ -59,6 +59,7 @@ const banned: Credential = {
   last_used: now - 120,
   cost_total: 87.77,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now,
@@ -74,6 +75,10 @@ const banned: Credential = {
     cost_7d: 0.055,
     requests_5h: 3,
     requests_7d: 28,
+    windows: [
+      { name: '5h', status: 'allowed', utilization: 0.82, reset: now - 60 },
+      { name: '7d', status: 'allowed', utilization: 0.76, reset: now + 3 * 24 * 3600 },
+    ],
   },
 }
 
@@ -97,6 +102,7 @@ const normal: Credential = {
   last_used: now - 5,
   cost_total: 6.85,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now,
@@ -111,6 +117,10 @@ const normal: Credential = {
     cost_7d: 42.18,
     requests_5h: 128,
     requests_7d: 914,
+    windows: [
+      { name: '5h', status: 'allowed', utilization: 0.15, reset: now + 99 * 60 },
+      { name: '7d', status: 'allowed', utilization: 0.63, reset: now + 5 * 24 * 3600 },
+    ],
   },
 }
 
@@ -134,6 +144,7 @@ const overage: Credential = {
   last_used: now - 18,
   cost_total: 122.48,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now - 18,
@@ -148,6 +159,10 @@ const overage: Credential = {
     cost_7d: 91.62,
     requests_5h: 412,
     requests_7d: 3218,
+    windows: [
+      { name: '5h', status: 'rejected', utilization: 1.04, reset: now + 45 * 60 },
+      { name: '7d', status: 'allowed_warning', utilization: 0.91, reset: now + 4 * 24 * 3600 },
+    ],
   },
 }
 
@@ -171,6 +186,7 @@ const nearLimit: Credential = {
   last_used: now - 90,
   cost_total: 31.09,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now - 90,
@@ -185,10 +201,15 @@ const nearLimit: Credential = {
     cost_7d: 29.81,
     requests_5h: 226,
     requests_7d: 1288,
+    windows: [
+      { name: '5h', status: 'allowed_warning', utilization: 0.9, reset: now + 75 * 60 },
+      { name: '7d', status: 'allowed', utilization: 0.899, reset: now + 2 * 24 * 3600 },
+    ],
   },
 }
 
 // 满额的 5h 已重置、但 7d 仍在当前窗口：前端不能证明 overage 已结束，降为琥珀色待确认。
+// 同时兼作**老快照**（windows 为空）的回归样本：读侧应退回 [5h, 7d] 判定，与升级前一致。
 const unknownOverage: Credential = {
   id: 7,
   label: 'overage-window-needs-confirmation@example.com',
@@ -208,6 +229,7 @@ const unknownOverage: Credential = {
   last_used: now - 4 * 60,
   cost_total: 52.36,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now - 4 * 60,
@@ -222,6 +244,101 @@ const unknownOverage: Credential = {
     cost_7d: 51.92,
     requests_5h: 296,
     requests_7d: 1842,
+    // 刻意留空：这条代表「记录全部窗口」上线之前落下的老快照，用来覆盖读侧的向后兼容
+    // （windows 为空时退回 [5h, 7d] 判定，与升级前逐字一致）。
+    windows: [],
+  },
+}
+
+// 上游只给 5h、压根没有 7d 窗口：卡片应收成单列（不留空半格），表格的 7d 列则显式写
+// 「无此窗口」而不是一条与「还没数据」长得一样的空进度条。
+const only5hWindow: Credential = {
+  id: 8,
+  label: 'single-window-no-7d@example.com',
+  tier: 'Pro',
+  priority: 1,
+  disabled: false,
+  expires_in: 5 * 3600,
+  expires_at: now + 5 * 3600,
+  expired: false,
+  created_at: now - 9 * 24 * 3600,
+  updated_at: now - 30,
+  device_limit: 0,
+  device_limit_effective: 3,
+  device_count: 1,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…N7DW',
+  last_used: now - 30,
+  cost_total: 3.41,
+  rate_limited_secs: 0,
+  rate_limited_models: [],
+  resume_at: null,
+  quota: {
+    ts: now - 30,
+    unified_status: 'allowed',
+    rl_5h_utilization: 0.44,
+    rl_5h_reset: now + 2 * 3600,
+    // 上游从未返回 7d：不是数据缺失，是这个账号的额度模型里没有这个窗口。
+    rl_7d_utilization: null,
+    rl_7d_reset: null,
+    rl_representative: '5h',
+    overage_in_use: null,
+    cost_5h: 3.41,
+    cost_7d: null,
+    requests_5h: 71,
+    requests_7d: null,
+    windows: [{ name: '5h', status: 'allowed', utilization: 0.44, reset: now + 2 * 3600 }],
+  },
+}
+
+// 5h / 7d 都在当前周期且都没满，上游却回 rejected 且按超额放行——吃满的是超额池 7d_oi
+// （形态取自 proxy.rs 记录的真实 fable-5 429 头）。
+//
+// 这正是「记录全部额度窗口」要解决的场景：以前 7d_oi 不落库，卡片只能挂一个永远摘不掉的
+// 「Usage credits 待确认」；现在它在 windows 里，状态应当解析成确定的「Usage credits 生效中」，
+// 额度区多出一行 `7d_oi 102% 已拒`，「上游判定」那行则给出 rejected + representative-claim。
+const overagePoolExhausted: Credential = {
+  id: 9,
+  label: 'overage-pool-not-recorded@example.com',
+  tier: 'Max 20x',
+  priority: 0,
+  disabled: false,
+  expires_in: 3 * 3600,
+  expires_at: now + 3 * 3600,
+  expired: false,
+  created_at: now - 21 * 24 * 3600,
+  updated_at: now - 45,
+  device_limit: 0,
+  device_limit_effective: 3,
+  device_count: 2,
+  ban_reason: null,
+  token_hint: 'sk-ant-ort01-…P00L',
+  last_used: now - 45,
+  cost_total: 214.6,
+  rate_limited_secs: 0,
+  rate_limited_models: [],
+  resume_at: null,
+  quota: {
+    ts: now - 45,
+    unified_status: 'rejected',
+    rl_5h_utilization: 0.2,
+    rl_5h_reset: now + 90 * 60,
+    rl_7d_utilization: 0.7,
+    rl_7d_reset: now + 4 * 24 * 3600,
+    // 上游说了算的那个窗口是 7d_oi，而快照里没有它的使用率可画。
+    rl_representative: 'seven_day_overage_included',
+    overage_in_use: true,
+    cost_5h: 9.04,
+    cost_7d: 188.3,
+    requests_5h: 52,
+    requests_7d: 1633,
+    windows: [
+      { name: '5h', status: 'allowed', utilization: 0.2, reset: now + 90 * 60 },
+      { name: '7d', status: 'allowed', utilization: 0.7, reset: now + 4 * 24 * 3600 },
+      // 满掉的就是它，而它没有专用列——记录全窗口之前，卡片上根本看不到这一行。
+      { name: '7d_oi', status: 'rejected', utilization: 1.02 },
+      { name: 'overage', status: 'rejected' },
+    ],
   },
 }
 
@@ -244,6 +361,11 @@ const cooldown: Credential = {
   last_used: now - 15,
   cost_total: 0.84,
   rate_limited_secs: 725,
+  // 账号级冷却（落库失败的兜底状态）叠加两个模型级冷却，覆盖两档并存的展示。
+  rate_limited_models: [
+    { model: 'claude-fable-5', secs: 280 },
+    { model: 'claude-opus-5', secs: 25 },
+  ],
   resume_at: null,
   quota: null,
 }
@@ -268,6 +390,7 @@ const disabledHistoricalOverage: Credential = {
   last_used: now - 6 * 3600,
   cost_total: 44.2,
   rate_limited_secs: 0,
+  rate_limited_models: [],
   resume_at: null,
   quota: {
     ts: now - 6 * 3600,
@@ -282,6 +405,10 @@ const disabledHistoricalOverage: Credential = {
     cost_7d: 43.98,
     requests_5h: 338,
     requests_7d: 2104,
+    windows: [
+      { name: '5h', status: 'rejected', utilization: 1, reset: now - 5 * 3600 },
+      { name: '7d', status: 'rejected', utilization: 1, reset: now - 4 * 3600 },
+    ],
   },
 }
 
@@ -291,6 +418,8 @@ const previewCredentials = [
   overage,
   nearLimit,
   unknownOverage,
+  overagePoolExhausted,
+  only5hWindow,
   cooldown,
   disabledHistoricalOverage,
 ]

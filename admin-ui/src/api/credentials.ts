@@ -1,5 +1,19 @@
 import { api } from './client'
 
+/**
+ * 上游报告的一个额度窗口。窗口名原样透传（`5h`/`7d`/`7d_oi`/`overage` …），不做白名单。
+ *
+ * 5h/7d 另有专用字段，是因为只有它们能反推窗口起点去聚合窗口内费用与请求数；这里的窗口
+ * 只有上游给的三个字段。真正需要它的是 `7d_oi` 这类超额池——实测里被拒的常常正是它，
+ * 而它没有专用列，缺了这份列表后台就只能看到「5h/7d 都没满」却解释不了账号为什么在烧钱。
+ */
+export interface QuotaWindow {
+  name: string
+  status?: string | null
+  utilization?: number | null
+  reset?: number | null
+}
+
 /** 订阅账号最新额度快照（来自上游 anthropic-ratelimit-unified-* 头）。 */
 export interface Quota {
   /** 快照对应请求时间（Unix 秒）。 */
@@ -11,7 +25,7 @@ export interface Quota {
   rl_7d_reset: number | null
   rl_representative: string | null
   /**
-   * 最近一次带限流头的响应是否由**超额计费**放行（`overage-in-use`）：额度已满但上游
+   * 最近一次带限流头的响应是否动用了 **Usage credits**（上游头里叫 `overage-in-use`）：额度已满但上游
    * 照样 200，烧的是按量计费的钱——这种号永远不会 429，卡片上只有这个标记能暴露它。
    */
   overage_in_use: boolean | null
@@ -21,6 +35,17 @@ export interface Quota {
   /** 当前 5h / 7d 窗口内经该账号转发的请求数。 */
   requests_5h: number | null
   requests_7d: number | null
+  /**
+   * 上游本次报告的**全部**窗口（含上面那两个）。升级前落的老快照是空数组，
+   * 下一条带限流头的响应就会补齐。
+   */
+  windows: QuotaWindow[]
+}
+
+/** 一个模型当前的冷却剩余时间，见 `Credential.rate_limited_models`。 */
+export interface ModelCooldown {
+  model: string
+  secs: number
 }
 
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */
@@ -56,8 +81,21 @@ export interface Credential {
   last_used: number | null
   /** 累计等价 API 费用（USD）。 */
   cost_total: number
-  /** 账号级 429 冷却的剩余秒数；模型级冷却不在账号列表展示；0 = 未冷却。 */
+  /**
+   * **账号级**进程内 429 冷却的剩余秒数；0 = 未冷却。
+   *
+   * 正常路径上几乎恒为 0——账号级限流走的是落库的 `resume_at`，这一项只反映「落库失败」
+   * 的兜底状态。模型级冷却在 `rate_limited_models` 里，两者不可混用。
+   */
   rate_limited_secs: number
+  /**
+   * **模型级**冷却明细（容量限制 / 超额池满那种，默认 30 秒，记在后端进程内）。
+   *
+   * 这一档**不代表账号有问题**：只有列出的这些模型在选号时让位，该号的其余模型照常服务，
+   * 所以不能拿它把账号显示成「不可调度」。此前后端压根没透出这个字段，于是 fable 撞超额池
+   * 被冷却时后台一片正常，而选号侧已经跳过它了。
+   */
+  rate_limited_models: ModelCooldown[]
   /**
    * 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；null 表示不会
    * 自动恢复（正常在用、人工停用、或封号）。
@@ -214,7 +252,7 @@ export interface ProbeQuota {
   rl_representative: string | null
   /** `retry-after`（秒）；只有 429 才有，是这次拒绝给出的等待时间。 */
   retry_after_secs: number | null
-  /** 本次请求是否由超额计费放行（额度满了但照样 200，烧的是按量计费的钱）。 */
+  /** 本次请求是否由 Usage credits 放行（套餐额度满了但照样 200，花的是按量计费的钱）。 */
   overage_in_use: boolean | null
 }
 

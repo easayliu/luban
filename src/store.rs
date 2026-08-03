@@ -28,6 +28,17 @@ pub struct CredentialStore {
     bare_rate: BareRateWindow,
     /// 被上游 429 过的凭证的冷却表（进程内），见 [`RateLimitCooldown`]。
     cooldown: RateLimitCooldown,
+    /// `settings` 全表的内存镜像，见 [`CredentialStore::get_setting`]。
+    ///
+    /// **每条转发请求要读 8 项设置**（接入 key、设备身份校验、6 个转发形态开关、重试次数、
+    /// 绑定 TTL、设备上限、裸请求限流两项），逐项走 SQL 就是每请求 8 次查询，且全部串行在
+    /// 上面那把全局 `conn` 锁上——转发路径的落库、后台的列表查询都得排在它们后面。设置项
+    /// 极少变动，缓存住之后这些查询直接归零。
+    ///
+    /// 写路径只有 [`CredentialStore::set_setting`]/[`CredentialStore::delete_setting`] 两处，
+    /// 都是先落库再更新缓存，故进程内不会漂移。**多进程共享同一个库时会读到陈旧值**——
+    /// luban 是单进程本地代理，没有这个场景（同 [`BareRateWindow`] 的取舍）。
+    settings: parking_lot::RwLock<HashMap<String, String>>,
 }
 
 /// 硬性设备上限触发：所有启用凭证的设备名额均已占满。
@@ -229,7 +240,13 @@ impl RateLimitCooldown {
     }
 
     /// 账号级冷却的剩余秒数（未冷却返回 0），供控制台展示。
-    /// 刻意只看账号级：模型级冷却是「这个号的某个模型暂时不可用」，把它显示成账号被限流会误导。
+    ///
+    /// 刻意只看账号级（key 为空串）：模型级冷却是「这个号的某个模型暂时不可用」，账号本身
+    /// 照常在调度，把它显示成账号被限流会误导。模型级那档走 [`Self::model_remaining`]。
+    ///
+    /// **注意这一档在正常路径上几乎恒为 0**：账号级 429 现在走
+    /// [`CredentialStore::pause_for_rate_limit`] 落库（`resume_at`），只有落库失败的兜底
+    /// 分支才会退回进程内冷却。留着它正是为了让那个兜底状态在后台能看见。
     fn remaining_secs(&self, cred_id: i64) -> i64 {
         let now = Instant::now();
         self.until
@@ -238,6 +255,25 @@ impl RateLimitCooldown {
             .filter(|t| **t > now)
             .map(|t| t.duration_since(now).as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    /// 该凭证**模型级**冷却的明细：`(模型名, 剩余秒数)`，按剩余时间倒序。未冷却时为空。
+    ///
+    /// 补的是一个真实的观测盲区：模型级 429（实测里 fable 撞超额池就是这一档）只写进
+    /// `(cred_id, 模型)` 那些格子，而后台读的是账号级那一格，于是选号侧明明已经跳过这个
+    /// 模型、界面上却什么都看不到——「冷却中」那套筛选与徽章形同虚设。
+    fn model_remaining(&self, cred_id: i64) -> Vec<(String, i64)> {
+        let now = Instant::now();
+        let mut out: Vec<(String, i64)> = self
+            .until
+            .lock()
+            .iter()
+            .filter(|((id, model), t)| *id == cred_id && !model.is_empty() && **t > now)
+            .map(|((_, model), t)| (model.clone(), t.duration_since(now).as_secs() as i64))
+            .collect();
+        // 剩得最久的排前面；同秒数按模型名，保证展示顺序稳定（HashMap 迭代序是随机的）。
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
     }
 
     fn forget(&self, cred_id: i64) {
@@ -284,11 +320,15 @@ impl CredentialStore {
 
     /// 由已初始化的连接构造（`open_default` 与测试共用）。
     fn with_conn(conn: Connection) -> Self {
+        // 设置表整张读进内存，见 `settings` 字段的说明。读失败（表还不存在等）就从空表起步，
+        // 所有取值退回各自的默认值——绝不能因为读设置失败而让整个服务起不来。
+        let settings = load_settings(&conn).unwrap_or_default();
         Self {
             conn: Mutex::new(conn),
             refresh_locks: Mutex::new(HashMap::new()),
             bare_rate: BareRateWindow::default(),
             cooldown: RateLimitCooldown::default(),
+            settings: parking_lot::RwLock::new(settings),
         }
     }
 
@@ -623,9 +663,16 @@ impl CredentialStore {
         self.cooldown.mark(cred_id, model, dur);
     }
 
-    /// 该凭证剩余冷却秒数（未冷却为 0），供控制台显示「限流中，X 后恢复」。
+    /// 该凭证**账号级**冷却的剩余秒数（未冷却为 0）。见 [`RateLimitCooldown::remaining_secs`]，
+    /// 注意正常路径上账号级限流走的是落库的 `resume_at`，这一档只反映落库失败的兜底状态。
     pub fn rate_limited_secs(&self, cred_id: i64) -> i64 {
         self.cooldown.remaining_secs(cred_id)
+    }
+
+    /// 该凭证**模型级**冷却的明细 `(模型名, 剩余秒数)`，未冷却为空。
+    /// 这一档不影响账号整体调度：其余模型照常可用，见 [`RateLimitCooldown`]。
+    pub fn rate_limited_models(&self, cred_id: i64) -> Vec<(String, i64)> {
+        self.cooldown.model_remaining(cred_id)
     }
 
     /// 解除该凭证的限流冷却，见 [`RateLimitCooldown::clear`]：`Some(model)` 清账号级 +
@@ -819,25 +866,25 @@ impl CredentialStore {
         Ok(n > 0)
     }
 
-    /// 读取设置项；不存在返回 None。
+    /// 读取设置项；不存在返回 None。**走内存缓存，不查库**（见 `settings` 字段）。
+    ///
+    /// 返回值仍是 `Result` 是为了不动调用方：这条路径现在不会失败，但签名一改就要改十几处。
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock();
-        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other.into()),
-            })
+        Ok(self.settings.read().get(key).cloned())
     }
 
-    /// 写入设置项（upsert）。
+    /// 写入设置项（upsert）：先落库，成功后再更新缓存——反过来的话写库失败就会留下一份
+    /// 库里没有、内存里却生效的设置，重启即凭空回滚。
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![key, value],
-        )?;
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![key, value],
+            )?;
+        }
+        self.settings.write().insert(key.to_string(), value.to_string());
         Ok(())
     }
 
@@ -852,57 +899,44 @@ impl CredentialStore {
 
     /// 一次读齐全部转发形态开关（[`ForwardFlags`]）。
     ///
-    /// **一条 SQL**：这几个开关每个转发请求都要读，逐个 [`Self::get_setting`] 就是每请求 6 次
-    /// 查询。任何读不出来的键都退回默认值（= 开启），故连表都没有时也不会挡住转发。
+    /// 走内存缓存（见 `settings` 字段），零查询。任何读不出来的键都退回默认值（= 开启），
+    /// 故设置表是空的时候也不会挡住转发。
     ///
     /// [`SYSTEM_SHAPE`] 缺省时沿用旧键 [`CACHE_SCOPE_GLOBAL`]（新键存在则以新键为准）。
     pub fn forward_flags(&self) -> ForwardFlags {
         let mut flags = ForwardFlags::default();
-        let conn = self.conn.lock();
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT key, value FROM settings \
-              WHERE key IN (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        ) else {
-            return flags;
-        };
-        let rows = stmt.query_map(
-            params![
-                SPOOF_IDENTITY_ENABLED,
-                SPOOF_BILLING_CCH,
-                FILL_CLIENT_HEADERS,
-                MERGE_BETA,
-                SYSTEM_SHAPE,
-                CACHE_SCOPE_GLOBAL,
-                ORIG_HEADER_CASE,
-                THINKING_SIGNATURE_RETRY,
-                SIMULATE_CC,
-                FILL_METADATA,
-                RATE_LIMIT_RETRY,
-            ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        );
-        let Ok(rows) = rows else { return flags };
-        // 新旧两个键各自记下来再决断：SQL 不保证行序，边读边覆盖会让结果取决于行顺序。
-        let (mut new_key, mut legacy_key) = (None, None);
-        for (key, value) in rows.flatten() {
-            let on = setting_is_on(&value);
-            match key.as_str() {
-                SPOOF_IDENTITY_ENABLED => flags.spoof_identity = on,
-                SPOOF_BILLING_CCH => flags.billing_cch = on,
-                FILL_CLIENT_HEADERS => flags.fill_client_headers = on,
-                MERGE_BETA => flags.merge_beta = on,
-                SYSTEM_SHAPE => new_key = Some(on),
-                CACHE_SCOPE_GLOBAL => legacy_key = Some(on),
-                ORIG_HEADER_CASE => flags.orig_header_case = on,
-                THINKING_SIGNATURE_RETRY => flags.thinking_signature_retry = on,
-                SIMULATE_CC => flags.simulate_cc = on,
-                FILL_METADATA => flags.fill_metadata = on,
-                RATE_LIMIT_RETRY => flags.rate_limit_retry = on,
-                _ => {}
-            }
+        let settings = self.settings.read();
+        let on = |key: &str| settings.get(key).map(|v| setting_is_on(v));
+        if let Some(v) = on(SPOOF_IDENTITY_ENABLED) {
+            flags.spoof_identity = v;
         }
-        if let Some(on) = new_key.or(legacy_key) {
-            flags.system_shape = on;
+        if let Some(v) = on(SPOOF_BILLING_CCH) {
+            flags.billing_cch = v;
+        }
+        if let Some(v) = on(FILL_CLIENT_HEADERS) {
+            flags.fill_client_headers = v;
+        }
+        if let Some(v) = on(MERGE_BETA) {
+            flags.merge_beta = v;
+        }
+        if let Some(v) = on(ORIG_HEADER_CASE) {
+            flags.orig_header_case = v;
+        }
+        if let Some(v) = on(THINKING_SIGNATURE_RETRY) {
+            flags.thinking_signature_retry = v;
+        }
+        if let Some(v) = on(SIMULATE_CC) {
+            flags.simulate_cc = v;
+        }
+        if let Some(v) = on(FILL_METADATA) {
+            flags.fill_metadata = v;
+        }
+        if let Some(v) = on(RATE_LIMIT_RETRY) {
+            flags.rate_limit_retry = v;
+        }
+        // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
+        if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
+            flags.system_shape = v;
         }
         flags
     }
@@ -916,12 +950,27 @@ impl CredentialStore {
         }
     }
 
-    /// 删除设置项。
+    /// 删除设置项（顺序同 [`Self::set_setting`]：先落库再更新缓存）。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        {
+            let conn = self.conn.lock();
+            conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        }
+        self.settings.write().remove(key);
         Ok(())
     }
+}
+
+/// 把 `settings` 整张表读进内存。只在打开库时调一次，见 [`CredentialStore::with_conn`]。
+fn load_settings(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (k, v) = row?;
+        out.insert(k, v);
+    }
+    Ok(out)
 }
 
 /// 接入用 client api key 的 settings 键名。
@@ -1105,8 +1154,11 @@ pub struct UsageRecord {
     pub rl_7d_reset: Option<i64>,
     pub rl_7d_utilization: Option<f64>,
     pub rl_representative: Option<String>,
-    /// 本次请求是否由超额计费放行（`…-overage-in-use`）：额度满了但照样 200，烧的是钱。
+    /// 本次请求是否动用了 usage credits（`…-overage-in-use`）：套餐额度满了但照样 200，花的是钱。
     pub rl_overage_in_use: Option<bool>,
+    /// 上游本次报告的全部额度窗口，见 [`QuotaWindow`]。只写进账本快照，不进流水——
+    /// 流水那边已有 `ratelimit_raw` 保着原始头，再存一份结构化的纯属重复。
+    pub windows: Vec<QuotaWindow>,
     pub ratelimit_raw: Option<String>,
     /// 等价 API 费用（USD）。
     pub cost_usd: Option<f64>,
@@ -1145,6 +1197,30 @@ pub struct UsageLog {
     pub cost_usd: Option<f64>,
 }
 
+/// 上游报告的**一个**额度窗口。窗口名原样保留（`5h`/`7d`/`7d_oi`/`overage` …）。
+///
+/// 存在的理由：快照原先只有 5h/7d 两组写死的列，而上游的窗口种类是它说了算的——实测里
+/// 真正被拒的常常是超额池 `7d_oi`（见 `crate::proxy::rate_limit_scope` 记录的那次 fable-5
+/// 429）。它不落库，后台就只能看到「5h/7d 都没满」，却解释不了这个号为什么在烧钱或被拒，
+/// 前端只能把状态挂成一个永远摘不掉的「超额待确认」。
+///
+/// 以 JSON 数组整体存进 `credential_stats.windows`，而不是拆成一张表：快照永远是「最新一份、
+/// 整体覆盖」，没有按窗口查询或聚合的需求，一张表换来的只是删号时多四处级联清理。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaWindow {
+    /// 窗口名，取自 `anthropic-ratelimit-unified-<窗口>-*` 的中段。
+    pub name: String,
+    /// `…-status`（`allowed`/`allowed_warning`/`rejected`/`rate_limited`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// `…-utilization`，0~1（超额池可能 > 1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    /// `…-reset`，Unix 秒。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<i64>,
+}
+
 /// 单个凭证最新一次的额度快照（用于凭证卡片展示）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QuotaSnapshot {
@@ -1156,7 +1232,7 @@ pub struct QuotaSnapshot {
     pub rl_7d_utilization: Option<f64>,
     pub rl_7d_reset: Option<i64>,
     pub rl_representative: Option<String>,
-    /// 最近一次带限流头的响应是否由**超额计费**放行：额度满了但上游照样 200，
+    /// 最近一次带限流头的响应是否动用了 **usage credits**：套餐额度满了但上游照样 200，
     /// 烧的是按量计费的钱。卡片靠它把「满了在烧钱的号」和健康号区分开。
     pub overage_in_use: Option<bool>,
     /// 当前 5h / 7d 窗口内该凭证已用的等价费用（USD）。窗口起点由对应 reset 反推。
@@ -1165,6 +1241,13 @@ pub struct QuotaSnapshot {
     /// 当前 5h / 7d 窗口内经该凭证转发的请求数。口径与窗口费用完全一致。
     pub requests_5h: Option<i64>,
     pub requests_7d: Option<i64>,
+    /// 上游本次报告的**全部**窗口（含上面那两个，也含 `7d_oi` 这类没有专用列的）。
+    ///
+    /// 5h/7d 的专用列没有被它取代，两者并存是有意的：只有这两个窗口有配套的窗口内费用与
+    /// 请求数（要靠 `reset` 反推窗口起点去聚合流水），而这里的窗口只有上游给的三个字段。
+    /// 前端拿它补齐「专用列覆盖不到的那些窗口」，见 admin-ui 的 quotaRiskMeta。
+    #[serde(default)]
+    pub windows: Vec<QuotaWindow>,
 }
 
 /// 一条设备绑定明细（凭证卡片展开「已绑定设备」时展示）。
@@ -1219,6 +1302,7 @@ impl CredentialStore {
             "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
                     s.rl_5h_utilization, s.rl_5h_reset,
                     s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative, s.overage_in_use,
+                    s.windows,
                     CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
                         COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
                     END,
@@ -1232,7 +1316,21 @@ impl CredentialStore {
                         SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN 1 ELSE 0 END)
                     END
                FROM credential_stats s
-               LEFT JOIN usage_logs u ON u.cred_id = s.cred_id
+               LEFT JOIN usage_logs u
+                      ON u.cred_id = s.cred_id
+                     -- 只连**可能落进某个窗口**的流水。没有这个下界，索引
+                     -- idx_usage_logs_cred_ts 只能按 cred_id 定位，然后把该账号 30 天
+                     -- （保留期）的全部流水逐行走一遍、靠上面的 CASE 过滤——而窗口最长才 7 天。
+                     -- 账号列表每次刷新都要跑一遍这条 SQL，且全程持着那把全局 conn 锁。
+                     -- 下界引用外层的 s，故 SQLite 能把它压成 (cred_id=? AND ts>=?) 的范围扫描。
+                     --
+                     -- 取两个窗口起点里更早的那个。COALESCE 的第二个参数是给「只有一个窗口
+                     -- 有 reset」准备的：min(NULL, x) 在 SQLite 里是 NULL，会把条件变成假、
+                     -- 一行都连不上，那就把窗口费用算成 0 了。两个都没有时退化为 0（无下界），
+                     -- 此时两个 CASE 本来就恒为 NULL，多连的行不影响结果。
+                     AND u.ts >= MIN(
+                           COALESCE(s.rl_5h_reset - ?1, s.rl_7d_reset - ?2, 0),
+                           COALESCE(s.rl_7d_reset - ?2, s.rl_5h_reset - ?1, 0))
               WHERE s.snapshot_ts IS NOT NULL
                 AND (?3 IS NULL OR s.cred_id = ?3)
               GROUP BY s.cred_id",
@@ -1251,10 +1349,16 @@ impl CredentialStore {
                     rl_7d_reset: r.get(6)?,
                     rl_representative: r.get(7)?,
                     overage_in_use: r.get(8)?,
-                    cost_5h: r.get(9)?,
-                    cost_7d: r.get(10)?,
-                    requests_5h: r.get(11)?,
-                    requests_7d: r.get(12)?,
+                    // 老库补出来的列是 NULL；真存坏了也只当没有窗口，不让一条脏 JSON
+                    // 把整张账号列表打成 500。
+                    windows: r
+                        .get::<_, Option<String>>(9)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    cost_5h: r.get(10)?,
+                    cost_7d: r.get(11)?,
+                    requests_5h: r.get(12)?,
+                    requests_7d: r.get(13)?,
                 },
             ))
         })?;
@@ -1391,15 +1495,28 @@ impl CredentialStore {
                      cost_total_usd = cost_total_usd + COALESCE(?3, 0)",
                 params![cid, ts, rec.cost_usd],
             )?;
-            // 快照只在响应带限流头时覆盖，口径同旧版「最新一条带限流信息的行」——
-            // 更晚的普通响应不能把快照抹掉。
-            if rec.rl_5h_utilization.is_some() || rec.rl_7d_utilization.is_some() {
+            // 快照只在响应带**窗口级**限流信息时覆盖，口径同旧版「最新一条带限流信息的行」
+            // ——更晚的普通响应不能把快照抹掉。
+            //
+            // 判据里的 `!rec.windows.is_empty()` 不是冗余：旧口径只认 5h/7d 两个专用字段，
+            // 于是一个只上报 `7d_oi` 之类窗口的账号**永远写不进快照**，卡片恒为「暂无数据」，
+            // 哪怕它此刻正靠 usage credits 放行。窗口种类是上游说了算的，判据不能写死窗口名。
+            //
+            // 仍然不认「只有 unified_status / overage_in_use、一个窗口都没有」的响应：
+            // 那种覆盖会把已有的窗口列一并抹成空，拿一条信息更少的快照换掉信息更多的。
+            if rec.rl_5h_utilization.is_some()
+                || rec.rl_7d_utilization.is_some()
+                || !rec.windows.is_empty()
+            {
+                // 序列化失败在这里不可达（三个 Option + String 的定长结构），真失败也只是
+                // 少存这一列，不该把整条用量日志连坐掉。
+                let windows = serde_json::to_string(&rec.windows).ok();
                 tx.execute(
                     "UPDATE credential_stats SET
                          snapshot_ts = ?2, unified_status = ?3,
                          rl_5h_utilization = ?4, rl_5h_reset = ?5,
                          rl_7d_utilization = ?6, rl_7d_reset = ?7, rl_representative = ?8,
-                         overage_in_use = ?9
+                         overage_in_use = ?9, windows = ?10
                       WHERE cred_id = ?1",
                     params![
                         cid,
@@ -1411,6 +1528,7 @@ impl CredentialStore {
                         rec.rl_7d_reset,
                         rec.rl_representative,
                         rec.rl_overage_in_use,
+                        windows,
                     ],
                 )?;
             }
@@ -1570,7 +1688,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             rl_7d_reset        INTEGER,
             rl_7d_utilization  REAL,
             rl_representative  TEXT,
-            -- 本次请求是否由超额计费放行（overage-in-use；1/0，头缺失时为空）。
+            -- 本次请求是否动用了 usage credits（overage-in-use；1/0，头缺失时为空）。
             rl_overage_in_use  INTEGER,
             -- 原始限流头（兜底：字段变化时仍可回看）。
             ratelimit_raw      TEXT,
@@ -1603,7 +1721,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             rl_7d_utilization  REAL,
             rl_7d_reset        INTEGER,
             rl_representative  TEXT,
-            overage_in_use     INTEGER
+            overage_in_use     INTEGER,
+            -- 上游本次报告的全部窗口（JSON 数组，见 QuotaWindow）。5h/7d 的专用列保留：
+            -- 只有它们有配套的窗口内费用/请求数聚合，这一列补的是 7d_oi 那类没有专用列的窗口。
+            windows            TEXT
         ) STRICT;
         -- 设备费用账本：终身累计。不记在 device_bindings 上——绑定行会被解绑/TTL 清掉重建，
         -- 而费用语义要求比绑定活得久（见 list_devices 的注）。
@@ -1634,8 +1755,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
     ] {
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
     }
-    // credential_stats 是 0.2.37 加的表，overage_in_use 列在其后才有：同样幂等补列。
+    // credential_stats 是 0.2.37 加的表，这两列都在其后才有：同样幂等补列。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
+    // 全窗口快照。老库补出来是 NULL，前端按「只有 5h/7d」渲染（与升级前一模一样），
+    // 下一条带限流头的响应就会把它填上——不必也不值得从 ratelimit_raw 回溯解析。
+    let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN windows TEXT", []);
 
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
@@ -3305,6 +3429,129 @@ mod tests {
         assert!(store.latest_quota(999).unwrap().is_none(), "不存在的账号应为 None");
     }
 
+    /// 只有一个窗口带 `reset` 时，窗口统计不得被连接条件的下界误伤成 0。
+    ///
+    /// 这条护栏针对的是那个下界本身：它取「两个窗口起点里更早的那个」，而 SQLite 的
+    /// `min(NULL, x)` 是 **NULL**——不加 COALESCE 兜底的话，缺一个 reset 就会让整个
+    /// ON 条件恒假、一行流水都连不上，窗口费用与请求数齐刷刷变成 0。
+    #[test]
+    fn window_stats_survive_a_missing_reset() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+
+        // a：只有 5h 有 reset（窗口起点 82_000），7d 一直为空。
+        log_row(&store, a, 10_000, 1.0, Some(100_000), None); // 5h 窗口外
+        log_row(&store, a, 90_000, 2.0, Some(100_000), None); // 窗口内
+        log_row(&store, a, 95_000, 4.0, Some(100_000), None); // 窗口内
+        let qa = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(qa.cost_5h, Some(6.0), "缺 7d reset 不该把 5h 窗口打成 0");
+        assert_eq!(qa.requests_5h, Some(2));
+        assert_eq!(qa.cost_7d, None, "没有 7d reset 就没有 7d 窗口可算");
+        assert_eq!(qa.requests_7d, None);
+
+        // b：反过来只有 7d 有 reset（窗口起点 100_000 - 604_800，含全部行）。
+        log_row(&store, b, 90_000, 8.0, None, Some(100_000));
+        log_row(&store, b, 95_000, 16.0, None, Some(100_000));
+        let qb = store.latest_quota(b).unwrap().unwrap();
+        assert_eq!(qb.cost_7d, Some(24.0), "缺 5h reset 不该把 7d 窗口打成 0");
+        assert_eq!(qb.requests_7d, Some(2));
+        assert_eq!(qb.cost_5h, None);
+    }
+
+    /// 模型级冷却必须能被后台读到。
+    ///
+    /// 这是一处真实的观测盲区：模型级 429（fable 撞超额池就是这一档）只写进
+    /// `(cred_id, 模型)` 那些格子，而控制台读的是账号级那一格，于是选号侧明明已经跳过
+    /// 这个模型、界面上却一片正常，「冷却中」那套筛选与徽章形同虚设。
+    #[test]
+    fn model_level_cooldown_is_visible_to_the_console() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        store.mark_rate_limited(a, Some("claude-fable-5"), Duration::from_secs(300));
+        store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(30));
+
+        // 账号级那一格没被写过，account 档仍应是 0——模型级不等于账号被限流。
+        assert_eq!(store.rate_limited_secs(a), 0, "模型级不该冒充账号级");
+
+        let models = store.rate_limited_models(a);
+        assert_eq!(models.len(), 2);
+        // 剩得最久的排前面，展示顺序必须稳定（HashMap 迭代序是随机的）。
+        assert_eq!(models[0].0, "claude-fable-5");
+        assert!(models[0].1 > 290 && models[0].1 <= 300, "{models:?}");
+        assert_eq!(models[1].0, "claude-opus-5");
+
+        // 解除后即消失；账号级那档也照常工作（落库失败的兜底路径走它）。
+        store.clear_rate_limited(a, None);
+        assert!(store.rate_limited_models(a).is_empty());
+        store.mark_rate_limited(a, None, Duration::from_secs(120));
+        assert!(store.rate_limited_secs(a) > 110);
+        assert!(store.rate_limited_models(a).is_empty(), "账号级不该混进模型级明细");
+    }
+
+    /// 设置项走内存缓存后，读写口径必须与直接查库一致（含删除与重开库）。
+    #[test]
+    fn settings_cache_matches_the_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        assert_eq!(store.get_setting(REQUIRE_DEVICE_ID).unwrap(), None);
+        store.set_setting(REQUIRE_DEVICE_ID, "false").unwrap();
+        assert_eq!(store.get_setting(REQUIRE_DEVICE_ID).unwrap().as_deref(), Some("false"));
+        assert!(!store.require_device_id(), "缓存值要真的参与判定");
+
+        // 缓存和库不能漂：直接查库应看到同一个值。
+        let in_db: String = store
+            .conn
+            .lock()
+            .query_row("SELECT value FROM settings WHERE key = ?1", [REQUIRE_DEVICE_ID], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(in_db, "false");
+
+        store.set_setting(REQUIRE_DEVICE_ID, "true").unwrap();
+        assert!(store.require_device_id(), "覆盖写要立刻生效");
+        store.delete_setting(REQUIRE_DEVICE_ID).unwrap();
+        assert_eq!(store.get_setting(REQUIRE_DEVICE_ID).unwrap(), None);
+        assert!(store.require_device_id(), "删除后退回默认值（要求设备身份）");
+
+        // 转发开关同样走缓存，且新键优先于旧键。
+        store.set_setting(CACHE_SCOPE_GLOBAL, "false").unwrap();
+        assert!(!store.forward_flags().system_shape, "旧键应在新键缺省时生效");
+        store.set_setting(SYSTEM_SHAPE, "true").unwrap();
+        assert!(store.forward_flags().system_shape, "新键存在就以新键为准");
+    }
+
+    /// 重开同一个库时，缓存要从库里重新装载（否则重启后设置全部凭空回到默认值）。
+    #[test]
+    fn settings_cache_is_reloaded_on_open() {
+        let dir = std::env::temp_dir().join(format!("luban-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn).unwrap();
+            let store = CredentialStore::with_conn(conn);
+            store.set_setting(BARE_RATE_LIMIT, "42").unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        assert_eq!(store.bare_rate_limit(), 42, "重开库后设置应从库里装回来");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// 裁剪只动流水，不动账本：累计费用/最近使用/额度快照在裁剪后原样保留。
     #[test]
     fn prune_keeps_ledger() {
@@ -3336,7 +3583,7 @@ mod tests {
     }
 
     /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，
-    /// 下一条带头的响应按新值覆盖。这是「额度满但不 429（超额计费在放行）」唯一的外显信号。
+    /// 下一条带头的响应按新值覆盖。这是「额度满但不 429（usage credits 在放行）」唯一的外显信号。
     #[test]
     fn overage_marker_lands_in_snapshot() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3383,6 +3630,157 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.latest_quota(a).unwrap().unwrap().overage_in_use, Some(false));
+    }
+
+    fn win(name: &str, util: f64, reset: i64, status: &str) -> QuotaWindow {
+        QuotaWindow {
+            name: name.into(),
+            status: Some(status.into()),
+            utilization: Some(util),
+            reset: Some(reset),
+        }
+    }
+
+    /// 全窗口快照原样落库、原样读回——含 `7d_oi` 这类**没有专用列**的窗口。
+    ///
+    /// 这一列存在的全部意义就是它：5h/7d 两组写死的列覆盖不到超额池，而实测里真正被拒的
+    /// 正是它，缺了它后台就只能看到「两个窗口都没满」却解释不了这个号为什么在烧钱。
+    #[test]
+    fn snapshot_keeps_windows_without_dedicated_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        // 形态取自 proxy::rate_limit_scope 记录的那次真实 fable-5 429：基础窗口都很空，
+        // 满掉的只有超额池。
+        let windows = vec![
+            win("5h", 0.20, 9_000, "allowed"),
+            win("7d", 0.70, 90_000, "allowed"),
+            win("7d_oi", 1.02, 400_000, "rejected"),
+        ];
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    rl_5h_utilization: Some(0.20),
+                    rl_5h_reset: Some(9_000),
+                    rl_7d_utilization: Some(0.70),
+                    rl_7d_reset: Some(90_000),
+                    rl_representative: Some("seven_day_overage_included".into()),
+                    rl_overage_in_use: Some(true),
+                    windows: windows.clone(),
+                    ..Default::default()
+                },
+                Some(1_000),
+            )
+            .unwrap();
+
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(q.windows, windows, "全窗口快照应原样读回");
+        // 专用列不受影响：窗口内费用/请求数仍靠它们反推窗口起点。
+        assert_eq!(q.rl_5h_utilization, Some(0.20));
+        assert_eq!(q.rl_7d_reset, Some(90_000));
+        // 批量口径与单条口径是同一条 SQL，不能只有一边带窗口。
+        assert_eq!(store.latest_quotas().unwrap().get(&a).unwrap().windows, windows);
+    }
+
+    /// **只**上报没有专用列的窗口时，照样要写出快照。
+    ///
+    /// 旧判据是 `rl_5h_utilization.is_some() || rl_7d_utilization.is_some()`，于是这种账号
+    /// 永远写不进 credential_stats，卡片恒为「暂无数据」——哪怕它此刻正靠 usage credits 放行。
+    #[test]
+    fn snapshot_is_written_even_without_5h_or_7d() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    rl_overage_in_use: Some(true),
+                    windows: vec![win("7d_oi", 1.02, 400_000, "rejected")],
+                    ..Default::default()
+                },
+                Some(1_000),
+            )
+            .unwrap();
+
+        let q = store.latest_quota(a).unwrap().expect("只有 7d_oi 的账号也必须有快照");
+        assert_eq!(q.overage_in_use, Some(true));
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].name, "7d_oi");
+        // 没有 5h/7d 就没有窗口起点可反推，窗口内费用/请求数保持空。
+        assert_eq!(q.cost_5h, None);
+        assert_eq!(q.requests_7d, None);
+    }
+
+    /// 一个窗口都没有的响应（CDN 拦截页那类，只剩 unified-status）不得覆盖已有快照——
+    /// 否则等于拿一条信息更少的记录抹掉信息更多的。
+    #[test]
+    fn windowless_response_does_not_erase_snapshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        let windows = vec![win("5h", 0.5, 9_000, "allowed")];
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    rl_5h_utilization: Some(0.5),
+                    rl_5h_reset: Some(9_000),
+                    windows: windows.clone(),
+                    ..Default::default()
+                },
+                Some(1_000),
+            )
+            .unwrap();
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    unified_status: Some("rejected".into()),
+                    ..Default::default()
+                },
+                Some(2_000),
+            )
+            .unwrap();
+
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(q.ts, 1_000, "无窗口的响应不该顶掉快照");
+        assert_eq!(q.windows, windows);
+    }
+
+    /// 老库补出来的 `windows` 是 NULL，读回时退化成空列表（前端即按「只有 5h/7d」渲染），
+    /// 而不是把整张账号列表打成 500。存进脏 JSON 同理。
+    #[test]
+    fn legacy_and_corrupt_windows_degrade_to_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+
+        // 模拟老库：快照行有 5h/7d，windows 列为 NULL。
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO credential_stats
+                     (cred_id, snapshot_ts, rl_5h_utilization, rl_5h_reset, windows)
+                 VALUES (?1, 1000, 0.4, 9000, NULL)",
+                [a],
+            )
+            .unwrap();
+        }
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert!(q.windows.is_empty(), "老库的 NULL 应读成空列表");
+        assert_eq!(q.rl_5h_utilization, Some(0.4), "专用列照常可用");
+
+        store.conn.lock().execute("UPDATE credential_stats SET windows = '{oops'", []).unwrap();
+        assert!(store.latest_quota(a).unwrap().unwrap().windows.is_empty(), "脏 JSON 不得报错");
     }
 
     /// 老库升级（账本为空、流水有历史）时 init_schema 一次性回填账本；账本非空则不重复。

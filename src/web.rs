@@ -1,6 +1,6 @@
 //! 网页服务：授权登录 + 多凭证管理的 JSON 接口，其余路径由内嵌前端 SPA 兜底。
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -20,12 +20,30 @@ use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
 use crate::store::{self, CredentialStore};
 
+/// 一次登录尝试还没换 token 之前，PKCE 上下文最多留多久。
+///
+/// 用户要在浏览器里完成授权再把 `code#state` 粘回来，几分钟足够；留太久只是让过期的挑战
+/// 一直占着位置。到点后那次登录会被判成「尚未生成授权链接」，重新点一次即可。
+const PKCE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// 同时最多保留几个待完成的登录尝试。纯属防御——正常同时开几个标签页也就个位数，
+/// 上限只是不让反复点「添加账号」把内存撑起来。超出时丢掉最旧的那个。
+const PKCE_MAX_PENDING: usize = 32;
+
 /// 服务共享状态。
 #[derive(Clone)]
 pub struct AppState {
     pub http: wreq::Client,
-    /// 当前登录尝试的 PKCE 上下文。
-    pkce: Arc<Mutex<Option<PkceChallenge>>>,
+    /// 进行中的登录尝试：`state` → (PKCE 上下文, 创建时刻)。
+    ///
+    /// **按 state 索引而不是只留一份**：原先是个全局单槽，两个标签页（或两个人）同时点
+    /// 「添加账号」时，后一次 `authorize` 会把前一次的 verifier/state 直接覆盖掉，前一个人
+    /// 粘贴回来就撞上「state 不匹配，可能存在 CSRF 或粘贴错误」——一句会把人引去查 CSRF 的
+    /// 误导性报错，实际上只是两次登录互相踩了。
+    ///
+    /// 用 `parking_lot::Mutex` 而非 `std::sync::Mutex`：后者要 `.unwrap()` 解毒化，
+    /// 而这里每条临界区都只是查表/插表，毒化本就无从谈起。
+    pkce: Arc<parking_lot::Mutex<Vec<(String, PkceChallenge, std::time::Instant)>>>,
     /// 凭证存储。
     pub store: Arc<CredentialStore>,
     /// 接入用的 API Key（None 表示不校验来访身份）。
@@ -78,7 +96,7 @@ pub async fn run(
     let http = upstream_client()?;
     let state = AppState {
         http,
-        pkce: Arc::new(Mutex::new(None)),
+        pkce: Arc::new(parking_lot::Mutex::new(Vec::new())),
         store,
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
@@ -224,12 +242,40 @@ struct AuthorizeResp {
     url: String,
 }
 
-/// 生成新的 PKCE 挑战并返回授权 URL；PKCE 暂存于服务状态供后续交换使用。
+/// 生成新的 PKCE 挑战并返回授权 URL；挑战按其 `state` 暂存，供后续交换时取回。
+///
+/// 并发的多次登录互不干扰——每次各占一格，见 [`AppState::pkce`]。顺手清掉过期与超量的格子。
 async fn authorize(State(state): State<AppState>) -> Json<AuthorizeResp> {
     let pkce = PkceChallenge::generate();
     let url = pkce.authorize_url();
-    *state.pkce.lock().unwrap() = Some(pkce);
+    remember_pkce(&mut state.pkce.lock(), pkce, std::time::Instant::now());
     Json(AuthorizeResp { url })
+}
+
+/// 进行中的登录尝试表，见 [`AppState::pkce`]。
+type PendingPkce = Vec<(String, PkceChallenge, std::time::Instant)>;
+
+/// 记下一次新的登录尝试，顺手清掉过期与超量的格子。
+///
+/// 抽成自由函数是为了能直接测——它修的正是一个簿记 bug（并发登录互相顶掉），
+/// 而这类 bug 只在「同时两个人操作」时才现形，靠手点几乎复现不出来。
+fn remember_pkce(pending: &mut PendingPkce, pkce: PkceChallenge, now: std::time::Instant) {
+    pending.retain(|(_, _, at)| now.duration_since(*at) < PKCE_TTL);
+    pending.push((pkce.state.clone(), pkce, now));
+    // 超量时丢最旧的（尾插，故最旧在头部）。
+    let overflow = pending.len().saturating_sub(PKCE_MAX_PENDING);
+    pending.drain(..overflow);
+}
+
+/// 取出 `state` 对应的那次登录并从表中移除（一次挑战只能用一次）；过期的顺手清掉。
+fn take_pkce(
+    pending: &mut PendingPkce,
+    state: &str,
+    now: std::time::Instant,
+) -> Option<PkceChallenge> {
+    pending.retain(|(_, _, at)| now.duration_since(*at) < PKCE_TTL);
+    let i = pending.iter().position(|(s, _, _)| s == state)?;
+    Some(pending.remove(i).1)
 }
 
 #[derive(Deserialize)]
@@ -246,13 +292,14 @@ async fn exchange(
     State(state): State<AppState>,
     Json(req): Json<ExchangeReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    let pkce = state
-        .pkce
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or(bad_request("尚未生成授权链接，请先点「添加账号」"))?;
+    // 先从粘贴内容里取出 state，据此找到**它自己那次**登录的挑战——不能拿「最后一次生成的
+    // 那个」，否则并发登录会互相顶掉（见 [`AppState::pkce`]）。取出即移除：一次挑战只能用一次。
+    let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
+    let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
+        .ok_or_else(|| bad_request("这次登录已过期或未找到，请重新点「添加账号」生成授权链接"))?;
 
+    // exchange_code 内部会再比一次 state。冗余是有意的：这里是「按 state 找挑战」，那里是
+    // 「确认挑战与粘贴内容配套」，万一将来查找逻辑改错了，那道校验还在。
     let tokens = oauth::exchange_code(&state.http, &pkce, &req.code)
         .await
         .map_err(|e| bad_request(e.to_string()))?;
@@ -286,9 +333,7 @@ async fn exchange(
         )
         .map_err(internal)?;
 
-    // 成功后清空 PKCE，避免重复使用。
-    *state.pkce.lock().unwrap() = None;
-
+    // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。
     tracing::info!(id = cred.id, label = %cred.label, tier = ?cred.tier, "新增凭证");
     Ok(Json(CredentialView::new(&cred, 0, state.store.default_device_limit())))
 }
@@ -328,7 +373,10 @@ async fn list_credentials(
         .iter()
         .map(|c| {
             CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), default_limit)
-                .with_cooldown(state.store.rate_limited_secs(c.id))
+                .with_cooldown(
+                    state.store.rate_limited_secs(c.id),
+                    state.store.rate_limited_models(c.id),
+                )
                 .with_stats(
                     quotas.get(&c.id).cloned(),
                     last_used.get(&c.id).copied(),
@@ -625,7 +673,10 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let default_limit = state.store.default_device_limit();
     Ok(Json(
         CredentialView::new(&cred, count, default_limit)
-            .with_cooldown(state.store.rate_limited_secs(cred.id))
+            .with_cooldown(
+                state.store.rate_limited_secs(cred.id),
+                state.store.rate_limited_models(cred.id),
+            )
             .with_stats(quota, last_used, cost_total),
     ))
 }
@@ -918,6 +969,13 @@ async fn set_forwarding(
 
 // ---------- 视图与错误 ----------
 
+/// 一个模型当前的冷却剩余时间，见 [`CredentialView::rate_limited_models`]。
+#[derive(Serialize)]
+struct ModelCooldown {
+    model: String,
+    secs: i64,
+}
+
 /// 对外暴露的凭证视图（不返回明文 token）。
 #[derive(Serialize)]
 struct CredentialView {
@@ -949,10 +1007,18 @@ struct CredentialView {
     last_used: Option<i64>,
     /// 累计等价 API 费用（USD）。
     cost_total: f64,
-    /// 被上游 429 后的剩余冷却秒数；`0` 表示不在冷却中。这一项只反映**模型级**冷却
-    /// （容量限制那种，默认 30 秒，记在进程内）：该号在选号时让位，但账号本身没被停用。
-    /// 账号级限流走的是下面的 `resume_at`。见 `crate::store::RateLimitCooldown`。
+    /// **账号级**进程内冷却的剩余秒数；`0` 表示不在冷却中。
+    ///
+    /// 正常路径上这一项几乎恒为 0：账号级 429 走的是落库的 `resume_at`（见下），只有落库
+    /// 失败的兜底分支才会退回进程内冷却。留着它是为了让那个兜底状态在后台也能看见。
+    /// 模型级冷却在 `rate_limited_models` 里，两者不可混用——见 `crate::store::RateLimitCooldown`。
     rate_limited_secs: i64,
+    /// **模型级**冷却明细（容量限制/超额池满那种，默认 30 秒，记在进程内）。
+    ///
+    /// 这一档**不代表账号有问题**：只有列出的这些模型在选号时让位，该号的其余模型照常服务，
+    /// 所以前端不能拿它把账号显示成「不可调度」。此前它压根没被透出来，于是 fable 撞超额池
+    /// 被冷却时后台一片正常，选号侧却已经跳过它了。
+    rate_limited_models: Vec<ModelCooldown>,
     /// 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；`None` 表示
     /// 不自动恢复（正常在用、人工停用、或封号）。
     ///
@@ -989,13 +1055,16 @@ impl CredentialView {
             last_used: None,
             cost_total: 0.0,
             rate_limited_secs: 0,
+            rate_limited_models: Vec::new(),
             resume_at: c.resume_at,
         }
     }
 
-    /// 附加剩余冷却秒数（冷却状态在内存里，取不到就是 0）。
-    fn with_cooldown(mut self, secs: i64) -> Self {
+    /// 附加冷却状态：账号级剩余秒数 + 模型级明细（都在内存里，没有就是 0 / 空）。
+    fn with_cooldown(mut self, secs: i64, models: Vec<(String, i64)>) -> Self {
         self.rate_limited_secs = secs;
+        self.rate_limited_models =
+            models.into_iter().map(|(model, secs)| ModelCooldown { model, secs }).collect();
         self
     }
 
@@ -1044,5 +1113,75 @@ fn open_in_browser(url: &str) {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = std::process::Command::new(cmd.0).arg(cmd.1).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth::PkceChallenge;
+
+    /// **并发的多次登录不得互相顶掉。**
+    ///
+    /// 这是一条真实 bug 的护栏：原先 PKCE 只有一个全局槽位，两个标签页（或两个人）同时点
+    /// 「添加账号」，后一次生成就把前一次的 verifier/state 覆盖了，前一个人粘贴回来撞上的是
+    /// 「state 不匹配，可能存在 CSRF 或粘贴错误」——一句会把人引去查 CSRF 的误导性报错。
+    #[test]
+    fn concurrent_logins_do_not_clobber_each_other() {
+        let now = std::time::Instant::now();
+        let mut pending = PendingPkce::new();
+
+        let a = PkceChallenge::generate();
+        let b = PkceChallenge::generate();
+        let (sa, sb) = (a.state.clone(), b.state.clone());
+        let (va, vb) = (a.verifier.clone(), b.verifier.clone());
+        assert_ne!(sa, sb, "两次生成的 state 必须不同");
+
+        remember_pkce(&mut pending, a, now);
+        remember_pkce(&mut pending, b, now);
+
+        // 先发起的那次照样能换回**自己**的 verifier，而不是被后一次顶掉。
+        let got_a = take_pkce(&mut pending, &sa, now).expect("先发起的那次登录不该被顶掉");
+        assert_eq!(got_a.verifier, va);
+        let got_b = take_pkce(&mut pending, &sb, now).expect("后发起的那次也要在");
+        assert_eq!(got_b.verifier, vb);
+
+        // 取出即移除：一次挑战只能用一次，重放拿不到东西。
+        assert!(take_pkce(&mut pending, &sa, now).is_none(), "挑战不得被重复使用");
+        assert!(pending.is_empty());
+    }
+
+    /// 过期的登录尝试会被清掉，不认识的 state 一律取不到。
+    #[test]
+    fn pkce_entries_expire_and_unknown_state_misses() {
+        let now = std::time::Instant::now();
+        let mut pending = PendingPkce::new();
+        let p = PkceChallenge::generate();
+        let s = p.state.clone();
+        remember_pkce(&mut pending, p, now);
+
+        assert!(take_pkce(&mut pending, "someone-elses-state", now).is_none());
+        // 刚好到 TTL 就算过期（条件是严格小于）。
+        remember_pkce(&mut pending, PkceChallenge::generate(), now);
+        let expired_at = now + PKCE_TTL;
+        assert!(take_pkce(&mut pending, &s, expired_at).is_none(), "过期的应被清掉");
+        assert!(pending.is_empty(), "过期项不该留在表里");
+    }
+
+    /// 反复点「添加账号」不能把内存撑起来：超量时丢最旧的，最新的那次必须留下。
+    #[test]
+    fn pkce_table_is_bounded_and_drops_the_oldest() {
+        let now = std::time::Instant::now();
+        let mut pending = PendingPkce::new();
+        let mut states = Vec::new();
+        for _ in 0..(PKCE_MAX_PENDING + 5) {
+            let p = PkceChallenge::generate();
+            states.push(p.state.clone());
+            remember_pkce(&mut pending, p, now);
+        }
+        assert_eq!(pending.len(), PKCE_MAX_PENDING);
+        assert!(take_pkce(&mut pending, &states[0], now).is_none(), "最旧的应被丢弃");
+        let newest = states.last().unwrap();
+        assert!(take_pkce(&mut pending, newest, now).is_some(), "最新的一次必须还在");
     }
 }

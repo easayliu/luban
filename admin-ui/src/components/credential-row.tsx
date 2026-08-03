@@ -234,6 +234,8 @@ export function CredentialRow({
                 reset={cred.quota?.rl_5h_reset ?? null}
                 cost={cred.quota?.cost_5h ?? null}
                 requests={cred.quota?.requests_5h ?? null}
+                reported={quota.h5.reported}
+                hasSnapshot={quota.hasSnapshot}
               />
               <ListQuotaMeter
                 label="7d"
@@ -242,6 +244,8 @@ export function CredentialRow({
                 reset={cred.quota?.rl_7d_reset ?? null}
                 cost={cred.quota?.cost_7d ?? null}
                 requests={cred.quota?.requests_7d ?? null}
+                reported={quota.d7.reported}
+                hasSnapshot={quota.hasSnapshot}
               />
             </div>
 
@@ -316,6 +320,8 @@ export function CredentialRow({
             reset={cred.quota?.rl_5h_reset ?? null}
             cost={cred.quota?.cost_5h ?? null}
             requests={cred.quota?.requests_5h ?? null}
+            reported={quota.h5.reported}
+            hasSnapshot={quota.hasSnapshot}
             showLabel={false}
           />
         </TableCell>
@@ -327,6 +333,8 @@ export function CredentialRow({
             reset={cred.quota?.rl_7d_reset ?? null}
             cost={cred.quota?.cost_7d ?? null}
             requests={cred.quota?.requests_7d ?? null}
+            reported={quota.d7.reported}
+            hasSnapshot={quota.hasSnapshot}
             showLabel={false}
           />
         </TableCell>
@@ -554,6 +562,8 @@ function ListQuotaMeter({
   reset,
   cost,
   requests,
+  reported,
+  hasSnapshot,
   showLabel = true,
 }: {
   label: string
@@ -562,6 +572,10 @@ function ListQuotaMeter({
   reset: number | null
   cost: number | null
   requests: number | null
+  /** 上游是否报告过这个窗口；见 QuotaWindowMeta.reported。 */
+  reported: boolean
+  /** 该账号是否已有额度快照；用于把「还没数据」和「无此窗口」分开。 */
+  hasSnapshot: boolean
   showLabel?: boolean
 }) {
   const { t, language, locale } = useI18n()
@@ -571,6 +585,36 @@ function ListQuotaMeter({
         `${requests.toLocaleString(locale)} 次 · ${cost == null ? '—' : formatUsd(cost)}`,
         `${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} · ${cost == null ? '—' : formatUsd(cost)}`,
       )
+
+  // 有快照却从没报过这个窗口 = 这个账号的额度模型里没有它，再等也不会出现。
+  // 表格的列摘不掉（列宽固定、表头常驻），所以必须在格子里把原因说出来，
+  // 而不是留一条和「还没跑过请求」长得一模一样的空进度条。
+  if (hasSnapshot && !reported) {
+    return (
+      <div
+        className="flex w-full flex-col gap-2"
+        title={t(
+          `上游从未为该账号返回 ${label} 窗口，说明它的额度模型里没有这个窗口（不是数据缺失）`,
+          `The upstream has never returned a ${label} window for this account, meaning its quota model has no such window (this is not missing data)`,
+        )}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
+            <span
+              className={cn(
+                'min-w-0 truncate tabular-nums text-muted-foreground',
+                showLabel ? 'text-xs' : 'text-sm leading-none',
+              )}
+            >
+              —
+            </span>
+          </div>
+          <span className="shrink-0 text-xs text-muted-foreground">{t('无此窗口', 'Not applicable')}</span>
+        </div>
+      </div>
+    )
+  }
 
   if (util == null) {
     const expired = freshness === 'expired'

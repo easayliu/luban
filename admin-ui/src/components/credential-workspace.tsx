@@ -115,7 +115,11 @@ const FILTERS: {
   {
     key: 'cooldown',
     label: ['冷却中', 'Cooling down'],
-    match: ({ credential }) => !credential.disabled && credential.rate_limited_secs > 0,
+    // 账号级与模型级都算：两者都是「上游 429 后被挪出调度」，找问题时都得看得见。
+    // 区别（整号停摆 vs 只挡几个模型）由卡片上的状态与提示分别说明，不在这里合并语义。
+    match: (evaluation) =>
+      !evaluation.credential.disabled
+      && (evaluation.credential.rate_limited_secs > 0 || evaluation.modelCooling),
   },
   {
     key: 'hasDevice',
@@ -310,7 +314,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       else filterCounts.enabled += 1
       if (credential.ban_reason) filterCounts.abnormal += 1
       if (evaluation.quotaRisk) filterCounts.nearLimit += 1
-      if (!credential.disabled && credential.rate_limited_secs > 0) filterCounts.cooldown += 1
+      // 口径必须与上面 'cooldown' 那条筛选完全一致，否则芯片上的计数和点开后的条数对不上。
+      if (
+        !credential.disabled
+        && (credential.rate_limited_secs > 0 || evaluation.modelCooling)
+      ) {
+        filterCounts.cooldown += 1
+      }
       if (credential.device_count > 0) filterCounts.hasDevice += 1
       if (
         credential.device_limit_effective > 0
@@ -318,7 +328,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       ) {
         filterCounts.deviceFull += 1
       }
-      // 额度概览按「超额 > 待确认 > 将满」互斥归类，避免一个账号重复出现在两项里。
+      // 额度概览按「Usage credits > 待确认 > 额度将满」互斥归类，避免一个账号重复出现在两项里。
       if (
         evaluation.nearLimit
         && evaluation.quota.overage !== 'active'
@@ -370,14 +380,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       : '',
     metrics.activeOverageCount > 0
       ? t(
-          `${formatNumber(metrics.activeOverageCount)} 超额`,
-          `${formatNumber(metrics.activeOverageCount)} over limit`,
+          `${formatNumber(metrics.activeOverageCount)} 用 credits`,
+          `${formatNumber(metrics.activeOverageCount)} on credits`,
         )
       : '',
     metrics.unknownOverageCount > 0
       ? t(
-          `${formatNumber(metrics.unknownOverageCount)} 超额待确认`,
-          `${formatNumber(metrics.unknownOverageCount)} pending confirmation`,
+          `${formatNumber(metrics.unknownOverageCount)} credits 待确认`,
+          `${formatNumber(metrics.unknownOverageCount)} credits unconfirmed`,
         )
       : '',
     cooldownCount > 0
@@ -390,8 +400,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const quotaRiskStatus = [
     metrics.activeOverageCount > 0
       ? t(
-          `${formatNumber(metrics.activeOverageCount)} 超额`,
-          `${formatNumber(metrics.activeOverageCount)} over limit`,
+          `${formatNumber(metrics.activeOverageCount)} 用 credits`,
+          `${formatNumber(metrics.activeOverageCount)} on credits`,
         )
       : '',
     metrics.unknownOverageCount > 0

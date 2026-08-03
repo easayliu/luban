@@ -324,6 +324,12 @@ async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<To
     })
 }
 
+/// 只取粘贴内容里的 `state` 段，用于在进行中的多次登录里找出这一次对应的 PKCE 挑战
+/// （见 [`crate::web::AppState`] 的 `pkce`）。格式不对时给出与 [`exchange_code`] 一致的报错。
+pub fn state_of(pasted: &str) -> Result<String> {
+    Ok(split_code_state(pasted)?.1)
+}
+
 /// 从 `code#state` 拆出授权码与 state；`#` 后的 fragment 是 state。
 fn split_code_state(pasted: &str) -> Result<(String, String)> {
     let trimmed = pasted.trim();
