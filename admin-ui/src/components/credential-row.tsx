@@ -51,7 +51,7 @@ import { Switch } from '@/components/ui/switch'
 import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
-import { cn, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
+import { cn, formatClockTime, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
 
 const COL = {
   select: 'w-10',
@@ -633,21 +633,21 @@ function ListQuotaMeter({
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 items-baseline gap-1.5">
             <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
-            <span
-              className={cn(
-                'min-w-0 truncate tabular-nums',
-                showLabel
-                  ? 'text-xs text-muted-foreground'
-                  : 'font-medium text-foreground text-sm leading-none',
-              )}
-              title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
-            >
-              {expired ? '—' : usageSummary}
-            </span>
+            {!showLabel && (
+              <span
+                className="min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums"
+                title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
+              >
+                {expired ? '—' : usageSummary}
+              </span>
+            )}
           </div>
           <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
         </div>
         <div className="h-2 w-full bg-input" aria-hidden />
+        {showLabel && !expired && (requests != null || cost != null || reset != null) && (
+          <ListQuotaDetails requests={requests} cost={cost} reset={reset} />
+        )}
       </div>
     )
   }
@@ -665,24 +665,68 @@ function ListQuotaMeter({
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-baseline gap-1.5">
           <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>
-          <span
-            className={cn(
-              'min-w-0 truncate tabular-nums',
-              showLabel
-                ? 'text-xs text-muted-foreground'
-                : 'font-medium text-foreground text-sm leading-none',
-            )}
-            title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
-          >
-            {usageSummary}
-          </span>
+          {!showLabel && (
+            <span
+              className="min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums"
+              title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
+            >
+              {usageSummary}
+            </span>
+          )}
         </div>
         <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
       </div>
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
+      {showLabel && <ListQuotaDetails requests={requests} cost={cost} reset={reset} />}
     </Meter>
+  )
+}
+
+function ListQuotaDetails({
+  requests,
+  cost,
+  reset,
+}: {
+  requests: number | null
+  cost: number | null
+  reset: number | null
+}) {
+  const { t, language, locale } = useI18n()
+  const formattedRequests = requests == null
+    ? '—'
+    : t(
+        `${requests.toLocaleString(locale)} 次`,
+        `${requests.toLocaleString(locale)} req`,
+      )
+
+  return (
+    <dl className="grid min-w-0 grid-cols-2 gap-x-2 gap-y-1">
+      <div className="min-w-0">
+        <dt className="sr-only">{t('请求', requests === 1 ? 'Request' : 'Requests')}</dt>
+        <dd className="whitespace-nowrap font-medium text-xs tabular-nums">
+          {formattedRequests}
+        </dd>
+      </div>
+      <div className="min-w-0 text-right">
+        <dt className="sr-only">{t('花费', 'Cost')}</dt>
+        <dd className="whitespace-nowrap font-medium text-xs tabular-nums">
+          {cost == null ? '—' : formatUsd(cost)}
+        </dd>
+      </div>
+      <div className="col-span-2 flex min-w-0 items-baseline justify-between gap-2 text-[11px] text-muted-foreground">
+        <dt className="whitespace-nowrap">{t('重置', 'Reset')}</dt>
+        <dd
+          className="whitespace-nowrap tabular-nums"
+          title={reset == null
+            ? undefined
+            : t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+        >
+          {reset == null ? '—' : formatClockTime(reset, language)}
+        </dd>
+      </div>
+    </dl>
   )
 }
 

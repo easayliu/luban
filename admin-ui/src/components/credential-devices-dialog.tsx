@@ -15,6 +15,7 @@ import {
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
+  cn,
   copyText,
   extractError,
   formatFullTime,
@@ -295,7 +296,7 @@ export function CredentialDevicesDialog({
                   </CardAction>
                 </CardHeader>
                 <CardPanel>
-                  <dl className="grid grid-cols-3 gap-4">
+                  <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
                     <CapacityStat
                       label={t('已绑定', 'Bound')}
                       value={t(
@@ -304,7 +305,7 @@ export function CredentialDevicesDialog({
                       )}
                     />
                     <CapacityStat label={t('生效上限', 'Effective limit')} value={effectiveLimit} />
-                    <div className="min-w-0">
+                    <div className="col-span-2 min-w-0 sm:col-span-1">
                       <dt className="text-xs text-muted-foreground">
                         {t('上限策略', 'Limit policy')}
                       </dt>
@@ -526,7 +527,7 @@ function DeviceList({
                     </CardAction>
                   </CardHeader>
                   <CardPanel>
-                    <dl className="grid grid-cols-3 gap-4">
+                    <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
                       <DeviceStat
                         label={t('请求', 'Requests')}
                         value={t(
@@ -539,6 +540,7 @@ function DeviceList({
                         value={formatUsd(device.cost_usd)}
                       />
                       <DeviceStat
+                        className="col-span-2 sm:col-span-1"
                         label={t('全部账号花费', 'All accounts cost')}
                         value={formatUsd(device.cost_usd_all)}
                       />
@@ -558,16 +560,16 @@ function CapacityStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 truncate font-semibold text-sm tabular-nums" title={value}>{value}</dd>
+      <dd className="mt-1 whitespace-nowrap font-semibold text-sm tabular-nums" title={value}>{value}</dd>
     </div>
   )
 }
 
-function DeviceStat({ label, value }: { label: string; value: string }) {
+function DeviceStat({ label, value, className }: { label: string; value: string; className?: string }) {
   return (
-    <div className="min-w-0">
+    <div className={cn('min-w-0', className)}>
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 truncate font-medium text-sm tabular-nums" title={value}>{value}</dd>
+      <dd className="mt-1 whitespace-nowrap font-medium text-sm tabular-nums" title={value}>{value}</dd>
     </div>
   )
 }

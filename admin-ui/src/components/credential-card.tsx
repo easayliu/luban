@@ -214,7 +214,7 @@ export function CredentialCard({
                 <div className="min-w-0 flex-1">
                   <h3
                     id={titleId}
-                    className="line-clamp-2 break-all leading-snug @sm/card:line-clamp-1 @sm/card:truncate @sm/card:break-normal"
+                    className="block min-w-0 truncate whitespace-nowrap leading-snug"
                     title={cred.label}
                   >
                     {cred.label}
@@ -363,11 +363,12 @@ export function CredentialCard({
           </section>
         </CardPanel>
 
-        <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-2">
+        <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
+          <div className="grid min-w-0 gap-2 @sm/card:grid-cols-[auto_minmax(0,1fr)] @sm/card:items-center @sm/card:gap-4">
             <Button
               type="button"
               variant="ghost"
+              className="w-fit max-w-full justify-start"
               onClick={() => setDevicesOpen(true)}
               title={t('查看已绑定设备', 'View bound devices')}
               aria-label={t(`查看 ${cred.label} 的已绑定设备`, `View bound devices for ${cred.label}`)}

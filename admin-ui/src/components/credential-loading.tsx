@@ -77,8 +77,8 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
               </section>
             </CardPanel>
 
-            <CardFooter className="mt-auto flex-wrap justify-between gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
-              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-2">
+            <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
+              <div className="grid min-w-0 gap-2 @sm/card:grid-cols-[auto_minmax(0,1fr)] @sm/card:items-center @sm/card:gap-4">
                 <Skeleton className="h-9 w-28 sm:h-8" />
                 <Skeleton className="h-4 w-20" />
               </div>
