@@ -27,12 +27,15 @@ pub async fn handle(
     let started = std::time::Instant::now();
     let path_and_query =
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
+    // 来访 UA：转发日志与各条拒绝日志都带上（都是 info/warn，不必开 debug）。整组识别头那条
+    // debug 留着不动——排查形态时才需要那六项，日常只要认出「谁在发」，一项就够。
+    let client_ua = client_ua(&headers);
 
     // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
     if let Some(expected) = effective_client_key(&state)
         && !client_authorized(&headers, &expected)
     {
-        tracing::warn!(%method, path = %path_and_query, "rejected: invalid inbound API key");
+        tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
         return (StatusCode::UNAUTHORIZED, "invalid API key").into_response();
     }
 
@@ -64,7 +67,7 @@ pub async fn handle(
     //      网页可关掉该校验（放行裸客户端），此时它们退化为不绑定、不占名额的负载均衡挑选。
     if device_id.is_none() {
         if billable && state.store.require_device_id() {
-            tracing::warn!(%method, path = %path_and_query, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
             return (StatusCode::FORBIDDEN, "missing a usable device identity (metadata.user_id)")
                 .into_response();
         }
@@ -93,7 +96,7 @@ pub async fn handle(
     {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(%method, path = %path_and_query, error = %e, "refusing to forward");
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, error = %e, "refusing to forward");
             // 两类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
             // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；所有号都在上游 429
             // 冷却中（硬门禁）取最早解冻的那个的剩余时间。
@@ -312,6 +315,7 @@ pub async fn handle(
                 ttft_ms: None,
                 method: method.to_string(),
                 path: path_and_query,
+                ua: client_ua,
                 cred_id: cred.id,
                 cred_label: cred.label.clone(),
                 device_id: logged_device,
@@ -707,6 +711,14 @@ struct ReqLog {
     ttft_ms: Option<u128>,
     method: String,
     path: String,
+    /// 来访自己的 `User-Agent`（已截断，见 [`client_ua`]）。**不是**出站那份——出站在模拟
+    /// 模式下恒为 [`config::CC_USER_AGENT`]，打出来每条都一样，等于没打。
+    ///
+    /// 存在的理由：`path` 记的是来访原样的路径查询串（`?beta=true` 是官方 CC 自己带的，
+    /// luban 只在出站 URL 上补，见 [`ensure_beta_query`]），于是「带 metadata.user_id 却
+    /// 没有 `?beta=true`」这类第三方 CC 兼容客户端在日志里和官方客户端长得一样。UA 是
+    /// 分辨它们最省事的一项。
+    ua: String,
     cred_id: i64,
     cred_label: String,
     /// 完整 device_id；日志里只展示前 8 位（脱敏）。
@@ -759,6 +771,7 @@ impl Drop for ReqLog {
         tracing::info!(
             method = %self.method,
             path = %self.path,
+            ua = %self.ua,
             cred_id = self.cred_id, cred = %self.cred_label,
             device = %device_short,
             status = self.status,
@@ -1897,6 +1910,22 @@ fn sim_device_id(
 fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> String {
     let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
     format!("{}|{}|{}", client_device_id.unwrap_or(""), h("x-stainless-arch"), h("x-stainless-os"),)
+}
+
+/// 日志用的来访 `User-Agent`：没有该头或不是可打印 ASCII 时为 `-`。
+///
+/// 截断到 120 字符：官方 CC 那串（`claude-cli/2.1.220 (external, cli)`）只有 35 字符，
+/// 浏览器与各路 SDK 拼出来的能有几百，整条打出来会把日志行撑得没法看。截断只影响日志，
+/// 转发出去的那份头一个字节都不动。
+///
+/// 按 `char` 截而不是 `&s[..120]`：后者切在多字节 UTF-8 中间会 panic，而 UA 是来访完全
+/// 可控的字符串——为了一条日志被打崩不值当。
+fn client_ua(headers: &HeaderMap) -> String {
+    const MAX: usize = 120;
+    match headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
+        Some(ua) if !ua.trim().is_empty() => ua.chars().take(MAX).collect(),
+        _ => "-".into(),
+    }
 }
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
