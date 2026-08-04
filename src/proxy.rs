@@ -2026,6 +2026,26 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
 /// `keep:"all"` 意为「一条都不清」，故补它不改变本次请求的语义，也不动计价：与
 /// `known_fingerprint_gaps` 第 7 条的 `fallbacks`（补上等于替用户决定换模型）正相反，
 /// 那条不补的理由在这里不成立。
+///
+/// **但它不是独立字段——依赖 `thinking`**。上游对「有 `clear_thinking` 却没开 thinking」
+/// 的请求直接回 400：
+///
+/// ```text
+/// `clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive
+/// ```
+///
+/// 抓包看不出这层依赖：八份**全都**开着 thinking（opus/sonnet/fable 是 `{"type":"adaptive"}`，
+/// haiku 是 `{"budget_tokens":31999,"type":"enabled"}`），于是 8/8 共现让它看着像个独立字段。
+/// 这是一次「共现不等于无依赖」的教训——v0.2.51 上线后普通请求即因此 400。
+///
+/// **不替客户端补 `thinking`** 来满足这个依赖，三条理由都写在抓包里：
+/// 1. haiku 那份是 `budget_tokens:31999` 配 `max_tokens:32000`，budget 必须小于 max_tokens。
+///    客户端发 `max_tokens:1024` 时这个值根本塞不进去，要么改它的 max_tokens（改掉它明确
+///    要的上限与费用天花板），要么自己算一个 budget——两条都是替它做决定。
+/// 2. 开了 thinking，响应里就多出 thinking 块，客户端未必认得，直接把它弄坏。
+/// 3. thinking token 按输出计费，等于未经同意加钱。
+///
+/// 故只在客户端**自己已经开着** thinking 时才补，其余情形一个字节都不动。
 fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
@@ -2033,13 +2053,21 @@ fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     if obj.contains_key("context_management") {
         return false;
     }
+    // 没开 thinking 就不补：`clear_thinking` 依赖它，硬补上游直接 400（见函数文档）。
+    // 上游认的是 `enabled`/`adaptive` 两种，`disabled` 与字段缺失都不算。
+    let thinking_on = obj
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| matches!(t, "enabled" | "adaptive"));
+    if !thinking_on {
+        return false;
+    }
     let value = serde_json::json!({
         "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }]
     });
     // 官方顺序是 `… max_tokens, thinking, context_management, output_config, stream`。
-    // luban 不产出 `thinking`/`output_config`，故锚点取官方在它之前、我们又确实可能有的那些，
-    // [`insert_top_level`] 会落在其中最靠后的一个之后——客户端自带 `thinking` 时紧跟其后，
-    // 没有时退到 `max_tokens`/`metadata`，两种情形都排在 `stream` 之前。
+    // 走到这里必有 `thinking`，故锚点首选它，落位与官方一致。
     insert_top_level(
         v,
         "context_management",
@@ -4344,13 +4372,13 @@ mod tests {
         assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
         assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
 
-        // key 序按官方 `model → messages → system → tools → metadata → max_tokens →
-        // context_management` 落位，补出来的几个字段不该被追加到队尾。本例没有 `thinking`/
-        // `output_config`/`stream`，故 `context_management` 正好收尾。
+        // key 序按官方 `model → messages → system → tools → metadata → max_tokens` 落位，
+        // 补出来的几个字段不该被追加到队尾。本例没开 thinking，故不补 `context_management`
+        // （见 [`super::ensure_context_management`]：那个字段依赖 thinking）。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            vec!["model", "messages", "system", "metadata", "max_tokens", "context_management"],
+            vec!["model", "messages", "system", "metadata", "max_tokens"],
             "key 序: {s}"
         );
 
@@ -4381,25 +4409,66 @@ mod tests {
 
     /// 模拟路径要补 `context_management`：`cap/raw` 八份抓包逐字节相同，而声明它的
     /// `context-management-2025-06-27` 已在两份 seed 里，不补就是「头上声明了、体里没有」。
+    ///
+    /// **但只在客户端自己开了 thinking 时补**——`clear_thinking` 依赖它，没开硬补上游回
+    /// `` `clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive ``。
+    /// 抓包八份全开着 thinking，这层依赖看不出来，v0.2.51 即因此让普通请求 400。
     #[test]
     fn simulated_body_carries_official_context_management() {
         const OFFICIAL: &str =
             r#""context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}"#;
-
-        let body = Bytes::from(PLAIN_BODY.to_string());
-        let sim = sim_for(PLAIN_BODY);
+        // 开着 thinking 的来访（官方 opus/sonnet/fable 那族的形态）。
+        let thinking_body = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":1024,"#,
+            r#""messages":[{"role":"user","content":"hi"}],"#,
+            r#""thinking":{"type":"adaptive"},"stream":true}"#
+        );
+        let body = Bytes::from(thinking_body.to_string());
+        let sim = sim_for(thinking_body);
         let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(text.contains(OFFICIAL), "取值要与官方逐字节相同: {text}");
 
-        // 官方位置是 `output_config`/`stream` 之前、`system`/`metadata` 之后。
+        // 官方位置：`thinking` 之后、`stream` 之前。
         let at = text.find(OFFICIAL).unwrap();
+        assert!(at > text.find(r#""thinking""#).unwrap(), "该排在 thinking 之后: {text}");
         assert!(at < text.find(r#""stream""#).unwrap(), "该排在 stream 之前: {text}");
-        assert!(at > text.find(r#""system""#).unwrap(), "该排在 system 之后: {text}");
         assert!(at > text.find(r#""metadata""#).unwrap(), "该排在 metadata 之后: {text}");
 
         // 头上那份声明确实在，否则补了体就是反向的自相矛盾。
         assert!(sim.beta.contains("context-management-2025-06-27"), "seed 里该有对应的 beta");
+
+        // haiku 那族的 `{"type":"enabled","budget_tokens":N}` 同样算开着。
+        let haiku = concat!(
+            r#"{"model":"claude-haiku-4-5-20251001","max_tokens":32000,"#,
+            r#""messages":[{"role":"user","content":"hi"}],"#,
+            r#""thinking":{"budget_tokens":31999,"type":"enabled"}}"#
+        );
+        let b = Bytes::from(haiku.to_string());
+        let sim = sim_for(haiku);
+        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        assert!(String::from_utf8(out.to_vec()).unwrap().contains(OFFICIAL), "enabled 也该补");
+
+        // 没开 thinking 的三种写法都不补——补了上游直接 400。
+        for body in [
+            PLAIN_BODY.to_string(),
+            concat!(
+                r#"{"model":"claude-opus-5","max_tokens":16,"#,
+                r#""messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#
+            )
+            .to_string(),
+            concat!(
+                r#"{"model":"claude-opus-5","max_tokens":16,"#,
+                r#""messages":[{"role":"user","content":"hi"}],"thinking":null}"#
+            )
+            .to_string(),
+        ] {
+            let b = Bytes::from(body.clone());
+            let sim = sim_for(&body);
+            let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert!(v.get("context_management").is_none(), "没开 thinking 却补了: {body}");
+        }
     }
 
     /// 模拟路径要补官方那**第三个**缓存断点：`cap/raw` 八份抓包每条恰好 3 个，前两个在
@@ -5387,13 +5456,12 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
-        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens→context_management。
+        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens。
+        // probe 不开 thinking（一条 1 token 的探测不需要），故也不带 `context_management`
+        // ——那个字段依赖 thinking，硬补上游回 400，见 [`super::ensure_context_management`]。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(
-            keys,
-            ["model", "messages", "system", "metadata", "max_tokens", "context_management"],
-            "\n{s}"
-        );
+        assert_eq!(keys, ["model", "messages", "system", "metadata", "max_tokens"], "\n{s}");
+        assert!(v.get("context_management").is_none(), "没开 thinking 就不该补: {s}");
         assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
 
         // 官方前三块：billing header、身份句、按模型族选出的基座。测试请求没有「客户端自己
