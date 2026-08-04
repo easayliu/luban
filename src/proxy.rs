@@ -1801,6 +1801,9 @@ fn rewrite_body(
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
+    // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
+    // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
+    let msg_shape = sim.is_some() && align_message_shape(&mut v, cache);
     // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
     // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
@@ -1822,11 +1825,20 @@ fn rewrite_body(
         spoofed,
         cch_added,
         ctx_mgmt,
+        msg_shape,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if !shaped && !capped && !spoofed && !cch_added && !simulated && !sim_meta && !ctx_mgmt {
+    if !shaped
+        && !capped
+        && !spoofed
+        && !cch_added
+        && !simulated
+        && !sim_meta
+        && !ctx_mgmt
+        && !msg_shape
+    {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
@@ -2107,6 +2119,58 @@ fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
     }
     sys[2] = text_block(&text[..at - 2], cache_control(cache));
     sys.push(text_block(&text[at..], cache_control(cache.tail())));
+    true
+}
+
+/// 把 `messages` 对齐到官方形态：内容一律块数组，并给**最后一条消息的最后一块**补上官方那
+/// 第三个缓存断点。返回是否改动过。
+///
+/// **依据**：`cap/raw` 八份抓包每条都是**恰好 3 个断点**，前两个在 `system`（基座、其余），
+/// 第三个恒在最后一条消息的最后一个内容块上——`role` 是什么无关：六份非 haiku 落在末尾那条
+/// `role:"system"` 消息上，两份 haiku 没有那条消息，就落在 `user` 消息的末块。规则是位置，
+/// 不是角色。而模拟路径此前从不碰 `messages`，第三方 SDK 自己一般也不标，于是出去的请求
+/// 只有 1~2 个断点。
+///
+/// **内容字符串化归一**：官方 8/8 的 `content` 都是块数组，而第三方 SDK 常发裸字符串。
+/// 断点是块的属性，字符串上挂不住，所以要转。**转就全转**：只转最后一条会得到「一部分消息
+/// 是字符串、一部分是数组」这种两边都不像的形态。两种写法在 API 上语义完全相同，转换只改
+/// 表示、不改内容，与 [`simulate_system`] 把字符串 `system` 收成块是同一个路子。
+///
+/// **只在模拟路径调用**：CC 形态的来访自己就标好了第三个断点（`cap/raw/00012` 那条经 luban
+/// 的真实请求即如此），替它再标一次只会多占预算。
+///
+/// **预算**：断点总数封顶 [`MAX_CACHE_BREAKPOINTS`]，超了上游整条拒。这里数的是**改写后
+/// 整个 body** 的现存断点，故 [`simulate_system`] 已经用掉的那些都算在内；满了就不补——
+/// 少一次缓存命中，总好过整条请求被拒。
+fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
+    let mut changed = false;
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return false };
+    for m in msgs.iter_mut() {
+        let Some(content) = m.get_mut("content") else { continue };
+        if let Some(s) = content.as_str() {
+            *content = serde_json::Value::Array(vec![text_block_bare(s)]);
+            changed = true;
+        }
+    }
+    // 断点要在归一之后再数：刚转出来的块本身不带断点，但它得先存在才挂得上。
+    if count_cache_control(v) >= MAX_CACHE_BREAKPOINTS {
+        return changed;
+    }
+    let last = v
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|a| a.last_mut())
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(|b| b.as_object_mut());
+    let Some(block) = last else { return changed };
+    // 客户端自己标过就不动——那是它自己的缓存策略。
+    if block.contains_key("cache_control") {
+        return changed;
+    }
+    // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
+    block.insert("cache_control".into(), cache_control(shape.tail()));
     true
 }
 
@@ -4336,6 +4400,73 @@ mod tests {
 
         // 头上那份声明确实在，否则补了体就是反向的自相矛盾。
         assert!(sim.beta.contains("context-management-2025-06-27"), "seed 里该有对应的 beta");
+    }
+
+    /// 模拟路径要补官方那**第三个**缓存断点：`cap/raw` 八份抓包每条恰好 3 个，前两个在
+    /// `system`，第三个恒在最后一条消息的最后一块上（六份非 haiku 落在末尾那条 `role:"system"`
+    /// 消息，两份 haiku 没那条消息就落在 `user` 末块——规则是位置不是角色）。
+    /// 顺带把裸字符串 `content` 收成官方那样的块数组，否则断点无处可挂。
+    #[test]
+    fn simulated_body_carries_official_message_breakpoint() {
+        // 字符串 content：要转成块数组，断点落在末块。
+        let body = Bytes::from(PLAIN_BODY.to_string());
+        let sim = sim_for(PLAIN_BODY);
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let blocks = v["messages"][0]["content"].as_array().expect("content 该收成块数组");
+        assert_eq!(blocks[0]["type"], "text", "转出来的该是官方那种文本块");
+        assert_eq!(blocks[0]["text"], "hi", "正文一个字都不该变");
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral", "末块该有断点");
+        // 消息这个断点不带 `scope`（官方只在基座标），但跟着开关带 `ttl`。
+        assert!(
+            blocks.last().unwrap()["cache_control"].get("scope").is_none(),
+            "只有基座标 global"
+        );
+        assert_eq!(blocks.last().unwrap()["cache_control"]["ttl"], "1h");
+
+        // 多轮对话：断点只落在**最后一条**消息上，前面的不动。
+        let multi = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":16,"messages":["#,
+            r#"{"role":"user","content":"a"},{"role":"assistant","content":"b"},"#,
+            r#"{"role":"user","content":"c"}]}"#
+        );
+        let b = Bytes::from(multi.to_string());
+        let sim = sim_for(multi);
+        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        for (i, m) in msgs.iter().enumerate() {
+            let last = m["content"].as_array().unwrap().last().unwrap();
+            assert_eq!(
+                last.get("cache_control").is_some(),
+                i == 2,
+                "断点只该在最后一条消息上，第 {i} 条不对: {v}"
+            );
+        }
+
+        // 客户端自己标过就不动；总数封顶 4，满了不补。
+        let mine = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":["#,
+            r#"{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#
+        );
+        let b = Bytes::from(mine.to_string());
+        let sim = sim_for(mine);
+        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "客户端自己那个断点被改写了: {v}"
+        );
+        assert!(super::count_cache_control(&v) <= super::MAX_CACHE_BREAKPOINTS, "断点超上限: {v}");
+
+        // 非模拟路径不碰 messages：CC 形态的来访自己就标好了第三个断点。
+        let cc = Bytes::from(API_SHAPE_BODY);
+        let before: serde_json::Value = serde_json::from_slice(&cc).unwrap();
+        let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["messages"], before["messages"], "非模拟路径不该动 messages");
     }
 
     /// 客户端自己带了 `context_management` 就一个字节都不动——那是它自己的编辑策略。
