@@ -2170,14 +2170,27 @@ fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
 /// **预算**：断点总数封顶 [`MAX_CACHE_BREAKPOINTS`]，超了上游整条拒。这里数的是**改写后
 /// 整个 body** 的现存断点，故 [`simulate_system`] 已经用掉的那些都算在内；满了就不补——
 /// 少一次缓存命中，总好过整条请求被拒。
+///
+/// **只往非空的 `text` 块上标**，两条理由各自独立：
+/// - 抓包 8/8 那第三个断点都在 `text` 块上，别的块型没有样本，没依据的形态不猜着改；
+/// - 末块未必是 `text`。会话以 assistant 轮结尾时（prefill）末块可能是 `thinking`——那种块
+///   连签名都要上游验（见 [`is_thinking_signature_error`] 那条重试路），往上面挂 `cache_control`
+///   是拿一条能发出去的请求去赌一个没有样本的组合。`tool_result`/`image` 同理。
+///
+/// 空 `text` 块一并跳过：发一个空文本块本身就会被上游拒，见 [`merge_system_blocks`]。
 fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
     let mut changed = false;
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return false };
     for m in msgs.iter_mut() {
         let Some(content) = m.get_mut("content") else { continue };
-        if let Some(s) = content.as_str() {
-            *content = serde_json::Value::Array(vec![text_block_bare(s)]);
-            changed = true;
+        // 空串不转：`{"type":"text","text":""}` 是个上游会拒的块，而原样的 `""` 至少还是
+        // 客户端自己发出来的形态——改写不该把一条请求的失败方式换个花样。
+        match content.as_str() {
+            Some(s) if !s.is_empty() => {
+                *content = serde_json::Value::Array(vec![text_block_bare(s)]);
+                changed = true;
+            }
+            _ => {}
         }
     }
     // 断点要在归一之后再数：刚转出来的块本身不带断点，但它得先存在才挂得上。
@@ -2195,6 +2208,12 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
     let Some(block) = last else { return changed };
     // 客户端自己标过就不动——那是它自己的缓存策略。
     if block.contains_key("cache_control") {
+        return changed;
+    }
+    // 只往非空 `text` 块上标：别的块型没有抓包样本，`thinking` 那种还要上游验签名（见函数文档）。
+    let plain_text = block.get("type").and_then(|t| t.as_str()) == Some("text")
+        && block.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty());
+    if !plain_text {
         return changed;
     }
     // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
@@ -4536,6 +4555,39 @@ mod tests {
         let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"], before["messages"], "非模拟路径不该动 messages");
+
+        // 末块不是**非空 text** 时一律不标：抓包只有 text 的样本，而 `thinking` 那种块
+        // 上游还要验签名，往它上面挂 cache_control 是拿能发的请求去赌没样本的组合。
+        for (label, tail) in [
+            ("thinking 块", r#"{"type":"thinking","thinking":"想","signature":"AAAA"}"#),
+            ("空 text 块", r#"{"type":"text","text":""}"#),
+            (
+                "image 块",
+                r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}"#,
+            ),
+        ] {
+            let body = format!(
+                r#"{{"model":"claude-opus-5","max_tokens":16,"messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":[{tail}]}}]}}"#
+            );
+            let b = Bytes::from(body.clone());
+            let sim = sim_for(&body);
+            let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let last = v["messages"].as_array().unwrap().last().unwrap();
+            let blk = last["content"].as_array().unwrap().last().unwrap();
+            assert!(blk.get("cache_control").is_none(), "{label} 不该被标断点: {v}");
+        }
+
+        // 空串 content 不转成空 text 块（那种块上游会拒），原样留着。
+        let empty = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":16,"#,
+            r#""messages":[{"role":"user","content":"hi"},{"role":"assistant","content":""}]}"#
+        );
+        let b = Bytes::from(empty.to_string());
+        let sim = sim_for(empty);
+        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["messages"][1]["content"], "", "空串不该被转成空 text 块: {v}");
     }
 
     /// 客户端自己带了 `context_management` 就一个字节都不动——那是它自己的编辑策略。
