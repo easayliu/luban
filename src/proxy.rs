@@ -1809,6 +1809,13 @@ fn rewrite_body(
     // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
     let capped = shape && cap_system_blocks(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
+    // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
+    // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
+    //
+    // **只在整形真的成了才补**：`ttl:"1h"` 属于订阅那套四块形态，API-key 的三块形态官方
+    // 一个 ttl 都不带（`cap/raw/00012`）。整形没做成（比如锚点漂了、`system_shape` 关着）
+    // 时 body 还是三块，这时补 ttl 就是把半对齐换了个方向，比不补更糟。
+    let ttl_filled = cache.ttl_1h && (simulated || shaped) && fill_cache_ttl(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
         "入站 metadata"
@@ -1826,6 +1833,7 @@ fn rewrite_body(
         cch_added,
         ctx_mgmt,
         msg_shape,
+        ttl_filled,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
@@ -1838,6 +1846,7 @@ fn rewrite_body(
         && !sim_meta
         && !ctx_mgmt
         && !msg_shape
+        && !ttl_filled
     {
         return body.clone();
     }
@@ -2219,6 +2228,56 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
     // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
     block.insert("cache_control".into(), cache_control(shape.tail()));
     true
+}
+
+/// 把 body 里**所有**缓存断点的 `ttl` 补齐成 `1h`，返回是否改动过。只在
+/// [`store::ForwardFlags::cache_ttl_1h`] 开着时调用。
+///
+/// **为什么要走一遍全身**：[`align_system_shape`] 只重建 `system` 那两块，客户端自己标在
+/// `messages`/`tools` 上的断点不在它手里。于是 0.2.50 之后出现过一种官方不产生的组合——
+/// `cap/raw/00012`（真 CC 经 luban）复现：system 两个断点有 `ttl:"1h"`、消息那个没有。
+/// 而官方三个断点**要么都有**（订阅模式 00009）、**要么都没有**（API-key 模式 00012），
+/// 没有中间态。这与 [`ensure_beta_query`] 当初要消灭的是同一个形状：只对齐了一半，
+/// 拼出个两边都不像的组合。
+///
+/// **客户端自己写了 `ttl` 的不动**：那是它掏钱买的时长，与 [`cache_control`] 同一口径。
+///
+/// 键序按官方 `type` → `ttl` → `scope` **重建**而非追加：客户端若已写了 `scope`，
+/// 直接追加会得到 `{type,scope,ttl}` 这个官方不产生的排列。
+fn fill_cache_ttl(v: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(cc) = map.get_mut("cache_control").and_then(|c| c.as_object_mut())
+                && !cc.contains_key("ttl")
+            {
+                let mut rebuilt = serde_json::Map::new();
+                if let Some(t) = cc.get("type") {
+                    rebuilt.insert("type".into(), t.clone());
+                }
+                rebuilt.insert("ttl".into(), "1h".into());
+                for (k, val) in cc.iter() {
+                    if k != "type" {
+                        rebuilt.insert(k.clone(), val.clone());
+                    }
+                }
+                *cc = rebuilt;
+                changed = true;
+            }
+            for (k, val) in map.iter_mut() {
+                if k != "cache_control" {
+                    changed |= fill_cache_ttl(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for it in items.iter_mut() {
+                changed |= fill_cache_ttl(it);
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 /// 构造一个 `system` 文本块，key 序与官方一致：`type` → `text` → `cache_control`。
@@ -3821,17 +3880,17 @@ mod tests {
             s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}"#),
             "基座的 cache_control 形态不对: {s}"
         );
-        // 官方三个断点**都**带 ttl，只有基座带 scope。
+        // 官方三个断点**都**带 ttl，只有基座带 scope——包括来访自己标在消息上的那个：
+        // 只补 system 那两个会得到「两个有、一个没有」这种官方不产生的组合，见
+        // [`super::fill_cache_ttl`]。
         assert_eq!(
             s.matches(r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#).count(),
-            1,
-            "其余块该是带 ttl、不带 scope: {s}"
+            2,
+            "system 末块与消息断点都该带 ttl、不带 scope: {s}"
         );
-        // 来访自己那个断点不被改写（客户端没写 ttl 就不替它写）。
-        assert_eq!(
-            s.matches(r#""cache_control":{"type":"ephemeral"}"#).count(),
-            1,
-            "客户端原有的裸 ephemeral 被动了: {s}"
+        assert!(
+            !s.contains(r#""cache_control":{"type":"ephemeral"}"#),
+            "不该再有裸 ephemeral（半对齐）: {s}"
         );
 
         // 关掉 `cache_ttl_1h` 即回到「沿用客户端时长」：一个 ttl 都不写。
@@ -4533,7 +4592,8 @@ mod tests {
             );
         }
 
-        // 客户端自己标过就不动；总数封顶 4，满了不补。
+        // 客户端自己标过就不再多标一个；总数封顶 4，满了不补。
+        // （`ttl` 会由 [`super::fill_cache_ttl`] 补齐——三个断点要么都有、要么都没有。）
         let mine = concat!(
             r#"{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":["#,
             r#"{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#
@@ -4544,17 +4604,33 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             v["messages"][0]["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"}),
-            "客户端自己那个断点被改写了: {v}"
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "客户端那个断点只该补 ttl，不该多出 scope 或被换掉 type: {v}"
         );
+        assert_eq!(v["messages"][0]["content"][0]["text"], "hi", "正文一个字都不该动: {v}");
         assert!(super::count_cache_control(&v) <= super::MAX_CACHE_BREAKPOINTS, "断点超上限: {v}");
 
-        // 非模拟路径不碰 messages：CC 形态的来访自己就标好了第三个断点。
+        // 非模拟路径**不新标断点**：CC 形态的来访自己就标好了第三个断点，替它再标一个只会
+        // 多占预算。唯一会动的是给那个断点补 `ttl`（[`super::fill_cache_ttl`]），正文与断点
+        // 位置都不变。
         let cc = Bytes::from(API_SHAPE_BODY);
         let before: serde_json::Value = serde_json::from_slice(&cc).unwrap();
         let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["messages"], before["messages"], "非模拟路径不该动 messages");
+        assert_eq!(
+            super::count_cache_control(&v["messages"]),
+            super::count_cache_control(&before["messages"]),
+            "非模拟路径不该给 messages 新加断点: {v}"
+        );
+        assert_eq!(
+            v["messages"][0]["content"][0]["text"], before["messages"][0]["content"][0]["text"],
+            "正文不该被动: {v}"
+        );
+        assert_eq!(
+            v["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "来访那个断点该补上 ttl，与 system 两个保持一致: {v}"
+        );
 
         // 末块不是**非空 text** 时一律不标：抓包只有 text 的样本，而 `thinking` 那种块
         // 上游还要验签名，往它上面挂 cache_control 是拿能发的请求去赌没样本的组合。
