@@ -1309,20 +1309,37 @@ pub struct UsageLog {
 
 /// [`CredentialStore::query_usage_logs`] 的入参。
 ///
-/// **翻页用 `before_id` 而不是 OFFSET**：流水是只增的，翻页期间新请求会不断插到最前面，
-/// `LIMIT/OFFSET` 会因此把第二页整体往回错、重复吐出第一页尾部的记录。游标钉在 id 上就没有
-/// 这个问题——它同时也是排序键（自增，与 `ts` 同向且在同秒内仍严格有序，故不会像按 `ts`
-/// 翻页那样在同秒边界上漏记录）。
+/// **页码翻页要靠 `until_id` 钉住范围，光有 OFFSET 不够**：流水是只增的，翻页期间新请求会
+/// 不断插到最前面，纯 `LIMIT/OFFSET` 会把第二页整体往回错、重复吐出第一页尾部的记录。
+/// 调用方先取一次 `max(id)` 当锚点（[`UsageLogStats::max_id`]），之后每页都带着它，
+/// 于是整轮翻页看到的是同一个快照，页码、总条数、总花费三者始终自洽。锚点钉在 id 上而不是
+/// `ts` 上：它同时是排序键（自增，同秒内仍严格有序，不会像按 `ts` 分界那样漏记录）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageLogQuery {
     /// 只看这个凭证的流水；`None` 为全部。
     ///
     /// 已删账号的记录 `cred_id` 为 NULL（见 `prune_orphan_usage_logs`），按号筛时自然落选。
     pub cred_id: Option<i64>,
-    /// 只取 id 严格小于它的记录（翻下一页时传上一页最后一条的 id）；`None` 为从最新开始。
-    pub before_id: Option<i64>,
+    /// 翻页锚点：只取 id **小于等于**它的记录；`None` 为不设上界（即含最新写入的那些）。
+    pub until_id: Option<i64>,
+    /// 跳过前多少条（页码 × 每页条数）。
+    pub offset: i64,
     /// 最多返回条数。调用方负责收敛，这里不设默认上限。
     pub limit: i64,
+}
+
+/// 一批流水的整体口径：条数、花费合计、以及可作翻页锚点的最大 id。
+///
+/// 与 [`CredentialStore::query_usage_logs`] 走同一套筛选条件，好让「共 N 条」「合计 $X」
+/// 与实际翻得到的记录是同一个集合——分两处各写一份 WHERE 迟早会漂开。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct UsageLogStats {
+    /// 命中条数。
+    pub total: i64,
+    /// 花费合计（USD）。`cost_usd` 为 NULL 的记录（模型不在价目表里）按 0 计。
+    pub cost_usd: f64,
+    /// 命中记录里最大的 id；空集为 `None`。首次查询拿它当锚点，后续每页原样带回。
+    pub max_id: Option<i64>,
 }
 
 /// 上游报告的**一个**额度窗口。窗口名原样保留（`5h`/`7d`/`7d_oi`/`overage` …）。
@@ -1713,6 +1730,22 @@ impl CredentialStore {
         self.query_usage_logs(UsageLogQuery { limit, ..Default::default() })
     }
 
+    /// 同一批筛选条件下的条数、花费合计与最大 id。见 [`UsageLogStats`]。
+    ///
+    /// `q` 里的 `limit`/`offset` **不参与**——统计的是整个集合，不是当前这一页。
+    pub fn usage_log_stats(&self, q: UsageLogQuery) -> Result<UsageLogStats> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id)
+               FROM usage_logs
+              WHERE (?1 IS NULL OR cred_id = ?1)
+                AND (?2 IS NULL OR id <= ?2)",
+            params![q.cred_id, q.until_id],
+            |r| Ok(UsageLogStats { total: r.get(0)?, cost_usd: r.get(1)?, max_id: r.get(2)? }),
+        )
+        .map_err(Into::into)
+    }
+
     /// 按条件查用量流水，恒按 `id` 倒序。见 [`UsageLogQuery`]。
     pub fn query_usage_logs(&self, q: UsageLogQuery) -> Result<Vec<UsageLog>> {
         let conn = self.conn.lock();
@@ -1725,10 +1758,10 @@ impl CredentialStore {
                     cost_usd, rl_overage_in_use
                FROM usage_logs
               WHERE (?1 IS NULL OR cred_id = ?1)
-                AND (?2 IS NULL OR id < ?2)
-              ORDER BY id DESC LIMIT ?3",
+                AND (?2 IS NULL OR id <= ?2)
+              ORDER BY id DESC LIMIT ?3 OFFSET ?4",
         )?;
-        let rows = stmt.query_map(params![q.cred_id, q.before_id, q.limit], |r| {
+        let rows = stmt.query_map(params![q.cred_id, q.until_id, q.limit, q.offset], |r| {
             Ok(UsageLog {
                 id: r.get(0)?,
                 ts: r.get(1)?,
@@ -3810,7 +3843,8 @@ mod tests {
         assert_eq!(q.requests_5h, Some(1));
     }
 
-    /// 请求明细的两项筛选：按账号只出该账号的记录，`before_id` 游标严格取更早的一页且不重叠。
+    /// 请求明细的筛选与分页：按账号只出该账号的记录，页码不重叠，且**锚点之后新写入的记录
+    /// 不得挤动已在翻的页**——这正是页码翻页要带 `until_id` 的理由。
     #[test]
     fn usage_logs_filter_by_credential_and_paginate() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3818,31 +3852,59 @@ mod tests {
         let store = CredentialStore::with_conn(conn);
         let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
         let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
-        // a 四条、b 一条，交替写入，确保筛选不是靠「恰好连续」蒙对的。
-        for cred in [a, a, b, a, a] {
+        let log = |cred: i64, cost: f64| {
             store
-                .insert_usage_log(&UsageRecord { cred_id: Some(cred), ..Default::default() })
-                .unwrap();
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(cred),
+                    cost_usd: Some(cost),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        // a 四条、b 一条，交替写入，确保筛选不是靠「恰好连续」蒙对的。
+        for (cred, cost) in [(a, 1.0), (a, 2.0), (b, 100.0), (a, 4.0), (a, 8.0)] {
+            log(cred, cost);
         }
 
         let all =
             store.query_usage_logs(UsageLogQuery { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(all.len(), 5, "不筛时是全部");
 
-        let q = |before| {
+        // 统计与记录同一套条件：a 的四条、花费合计 15，最大 id 即锚点。
+        let only_a = UsageLogQuery { cred_id: Some(a), ..Default::default() };
+        let stats = store.usage_log_stats(only_a).unwrap();
+        assert_eq!(stats.total, 4, "b 的那条不该计入");
+        assert_eq!(stats.cost_usd, 15.0);
+        let anchor = stats.max_id.expect("有记录就有锚点");
+
+        let page = |n: i64| {
             store
-                .query_usage_logs(UsageLogQuery { cred_id: Some(a), before_id: before, limit: 3 })
+                .query_usage_logs(UsageLogQuery {
+                    cred_id: Some(a),
+                    until_id: Some(anchor),
+                    offset: n * 3,
+                    limit: 3,
+                })
                 .unwrap()
         };
-        let first = q(None);
+        let first = page(0);
         assert_eq!(first.len(), 3);
         assert!(first.iter().all(|l| l.cred_id == Some(a)), "b 的那条不该出现");
         assert!(first.windows(2).all(|w| w[0].id > w[1].id), "按 id 倒序");
 
-        let second = q(Some(first[2].id));
+        let second = page(1);
         assert_eq!(second.len(), 1, "a 共 4 条，第二页只剩 1 条");
-        assert!(second[0].id < first[2].id, "游标必须严格取更早的，不得与上一页重叠");
-        assert!(q(Some(second[0].id)).is_empty(), "翻到底为空");
+        assert!(second[0].id < first[2].id, "第二页不得与第一页重叠");
+        assert!(page(2).is_empty(), "翻到底为空");
+
+        // 翻页途中来了新请求：锚点之下的两页一字不变，锚点之上的统计才会长。
+        let ids = |logs: &[UsageLog]| logs.iter().map(|l| l.id).collect::<Vec<_>>();
+        log(a, 16.0);
+        assert_eq!(ids(&page(0)), ids(&first), "新记录不得把第一页往后挤");
+        assert_eq!(ids(&page(1)), ids(&second));
+        let pinned = store.usage_log_stats(UsageLogQuery { until_id: Some(anchor), ..only_a });
+        assert_eq!(pinned.unwrap().total, 4, "钉在锚点上的统计不动");
+        assert_eq!(store.usage_log_stats(only_a).unwrap().total, 5, "不带锚点才看得到新记录");
     }
 
     /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，

@@ -1,5 +1,6 @@
-import { useInfiniteQuery } from '@tanstack/react-query'
-import { ChevronDownIcon, RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
+import { useRef, useState } from 'react'
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
+import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
@@ -31,6 +32,20 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
+import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious,
+} from '@/components/ui/pagination'
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import {
@@ -42,8 +57,8 @@ import {
   TableRow,
 } from '@/components/ui/table'
 
-/** 每页条数。后端上限 200，取 50 是一屏滚两下的量，翻页按钮就在表格下面。 */
-const PAGE_SIZE = 50
+/** 每页条数可选值。后端上限 200。 */
+const PAGE_SIZES = [25, 50, 100] as const
 
 /** 状态码 → 徽章配色。2xx 成功、429 单独一档（额度问题，不是错误），其余 4xx/5xx 红。 */
 function statusVariant(status: number): BadgeProps['variant'] {
@@ -80,33 +95,70 @@ export function CredentialUsageDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t, language, locale } = useI18n()
+  const qc = useQueryClient()
   const credentialLabel = displayCredentialLabel(cred.label, language)
-  const usage = useInfiniteQuery({
-    queryKey: ['credential-usage', cred.id],
-    queryFn: ({ pageParam }) =>
-      listCredentialUsage(cred.id, { limit: PAGE_SIZE, before: pageParam }),
-    initialPageParam: undefined as number | undefined,
-    // 不足一页即到底；否则拿最后一条的 id 当游标（后端取 id 严格小于它的记录）。
-    getNextPageParam: (lastPage: UsageLog[]) =>
-      lastPage.length < PAGE_SIZE ? undefined : lastPage[lastPage.length - 1]?.id,
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
+  const [page, setPage] = useState(0)
+  /**
+   * 本轮翻页的锚点（首次响应给出，之后每页原样带回）。
+   *
+   * 放 ref 而不是 state，也不进 queryKey：它在一轮翻页里恒定，进 key 只会让第一页在拿到
+   * 锚点后再白白重取一次。整轮钉住同一个快照，翻页期间新到的请求不会把记录往后挤。
+   */
+  const anchor = useRef<number | null>(null)
+
+  const usage = useQuery({
+    queryKey: ['credential-usage', cred.id, page, pageSize],
+    queryFn: async () => {
+      const res = await listCredentialUsage(cred.id, {
+        limit: pageSize,
+        offset: page * pageSize,
+        until: anchor.current ?? undefined,
+      })
+      if (anchor.current == null) anchor.current = res.anchor
+      return res
+    },
     enabled: open,
+    // 翻页时先留着上一页，避免表格整块闪成骨架屏。
+    placeholderData: keepPreviousData,
   })
 
-  const rows = usage.data?.pages.flat() ?? []
-  const loadedCount = rows.length.toLocaleString(locale)
-  // 「已加载这些条」的合计，不是账号累计——流水只保留近 30 天，而卡片上的累计来自终身账本。
-  const loadedCost = rows.reduce((sum, log) => sum + (log.cost_usd ?? 0), 0)
+  const total = usage.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const rows = usage.data?.logs ?? []
+  // 页码越界（改了每页条数、或刷新后记录变少）时退回最后一页，而不是显示一页空白。
+  const currentPage = Math.min(page, totalPages - 1)
+  if (currentPage !== page) setPage(currentPage)
+  const firstIndex = currentPage * pageSize + 1
+  const lastIndex = currentPage * pageSize + rows.length
+
+  /** 重新取一轮：丢掉锚点回到第一页，于是能看到刚发生的请求。 */
+  const reload = () => {
+    anchor.current = null
+    setPage(0)
+    void qc.invalidateQueries({ queryKey: ['credential-usage', cred.id] })
+  }
+
+  const handleOpenChange = (next: boolean) => {
+    // 关掉即重置，下次打开是新的一轮（新锚点、第一页）。
+    if (!next) {
+      anchor.current = null
+      setPage(0)
+    }
+    onOpenChange(next)
+  }
+
   const status = usage.isPending
     ? { label: t('正在读取', 'Loading'), variant: 'secondary' as const }
     : usage.error
       ? { label: t('读取失败', 'Failed to load'), variant: 'error' as const }
       : {
-          label: t(`已加载 ${loadedCount} 条`, `${loadedCount} loaded`),
+          label: t(`共 ${total.toLocaleString(locale)} 条`, `${total.toLocaleString(locale)} total`),
           variant: 'info' as const,
         }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogPopup className="max-w-4xl">
         <DialogHeader>
           <div className="flex items-start gap-3 pr-8">
@@ -132,9 +184,11 @@ export function CredentialUsageDialog({
             <CardPanel className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
               <div className="min-w-0">
                 <p className="text-muted-foreground text-xs">
-                  {t('已加载记录合计花费', 'Cost of loaded records')}
+                  {t('明细合计花费', 'Cost across the log')}
                 </p>
-                <p className="mt-1 font-semibold text-sm tabular-nums">{formatUsd(loadedCost)}</p>
+                <p className="mt-1 font-semibold text-sm tabular-nums">
+                  {formatUsd(usage.data?.total_cost ?? 0)}
+                </p>
               </div>
               <p className="min-w-0 flex-1 text-muted-foreground text-xs sm:text-right">
                 {t(
@@ -151,7 +205,7 @@ export function CredentialUsageDialog({
               role="status"
               aria-label={t('正在读取请求明细', 'Loading request log')}
             >
-              {Array.from({ length: 4 }, (_, index) => (
+              {Array.from({ length: 6 }, (_, index) => (
                 <Skeleton key={index} className="h-9 w-full" />
               ))}
             </div>
@@ -171,7 +225,7 @@ export function CredentialUsageDialog({
                 </Button>
               </AlertDescription>
             </Alert>
-          ) : rows.length === 0 ? (
+          ) : total === 0 ? (
             <Empty className="py-10">
               <EmptyHeader>
                 <EmptyMedia variant="icon"><ScrollTextIcon /></EmptyMedia>
@@ -187,26 +241,86 @@ export function CredentialUsageDialog({
           ) : (
             <>
               {/* 列多，窄屏靠横向滚动而不是换行——一条记录被折成两行反而看不出对应关系。 */}
-              <div className="-mx-1 overflow-x-auto px-1">
+              <div
+                className={cn(
+                  '-mx-1 overflow-x-auto px-1 transition-opacity',
+                  usage.isFetching && 'opacity-60',
+                )}
+                aria-busy={usage.isFetching}
+              >
                 <UsageTable rows={rows} />
               </div>
-              <div className="flex items-center justify-center">
-                {usage.hasNextPage ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    loading={usage.isFetchingNextPage}
-                    onClick={() => { void usage.fetchNextPage() }}
+
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+                <p className="min-w-0 text-muted-foreground tabular-nums">
+                  {t(
+                    `第 ${firstIndex}–${lastIndex} 条，共 ${total.toLocaleString(locale)} 条`,
+                    `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
+                  )}
+                </p>
+                <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+                  <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
+                  <Select
+                    items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
+                    value={pageSize}
+                    onValueChange={(value) => {
+                      if (value == null) return
+                      // 每页条数一变，原来的页码就没有意义了，回到第一页。
+                      setPageSize(Number(value))
+                      setPage(0)
+                    }}
                   >
-                    <ChevronDownIcon />
-                    {t(`再加载 ${PAGE_SIZE} 条`, `Load ${PAGE_SIZE} more`)}
-                  </Button>
-                ) : (
-                  <p className="text-muted-foreground text-xs">
-                    {t('已经到底了', 'End of the log')}
-                  </p>
-                )}
+                    <SelectTrigger size="sm" aria-label={t('每页条数', 'Rows per page')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectPopup>
+                      {PAGE_SIZES.map((size) => (
+                        <SelectItem key={size} value={size}>{size}</SelectItem>
+                      ))}
+                    </SelectPopup>
+                  </Select>
+                </div>
+
+              {totalPages > 1 && (
+                <Pagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+                  <PaginationContent>
+                    <PaginationItem>
+                      <PaginationPrevious
+                        href="#"
+                        className={cn(
+                          (usage.isFetching || currentPage === 0) && 'pointer-events-none opacity-50',
+                        )}
+                        aria-disabled={usage.isFetching || currentPage === 0}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          setPage((current) => Math.max(0, current - 1))
+                        }}
+                      />
+                    </PaginationItem>
+                    <PaginationItem>
+                      <span className="whitespace-nowrap px-2 text-foreground text-xs tabular-nums" aria-live="polite">
+                        {t(
+                          `第 ${currentPage + 1} / ${totalPages} 页`,
+                          `Page ${currentPage + 1} of ${totalPages}`,
+                        )}
+                      </span>
+                    </PaginationItem>
+                    <PaginationItem>
+                      <PaginationNext
+                        href="#"
+                        className={cn(
+                          (usage.isFetching || currentPage >= totalPages - 1) && 'pointer-events-none opacity-50',
+                        )}
+                        aria-disabled={usage.isFetching || currentPage >= totalPages - 1}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          setPage((current) => Math.min(totalPages - 1, current + 1))
+                        }}
+                      />
+                    </PaginationItem>
+                  </PaginationContent>
+                </Pagination>
+              )}
               </div>
             </>
           )}
@@ -218,7 +332,8 @@ export function CredentialUsageDialog({
             variant="outline"
             className="mr-auto"
             disabled={usage.isFetching}
-            onClick={() => { void usage.refetch() }}
+            onClick={reload}
+            title={t('回到第一页并拉取最新记录', 'Jump back to the first page and fetch the newest records')}
           >
             <RefreshCwIcon className={usage.isFetching ? 'animate-spin' : undefined} />
             {t('刷新', 'Refresh')}

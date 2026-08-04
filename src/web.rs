@@ -354,48 +354,81 @@ async fn exchange(
 
 #[derive(Deserialize)]
 struct UsageQuery {
-    /// 返回条数上限（默认 100，最多 1000）。
+    /// 返回条数上限（默认 100，最多 1000；按号查时默认 25、最多 200）。
     #[serde(default)]
     limit: Option<i64>,
-    /// 翻页游标：只取 id 小于它的记录。理由见 [`store::UsageLogQuery::before_id`]。
+    /// 跳过前多少条（页码 × 每页条数）。
     #[serde(default)]
-    before: Option<i64>,
+    offset: Option<i64>,
+    /// 翻页锚点：只取 id ≤ 它的记录。首次不传，之后把响应里的 `anchor` 原样带回来。
+    /// 理由见 [`store::UsageLogQuery`]。
+    #[serde(default)]
+    until: Option<i64>,
+}
+
+/// 一页流水 + 整个集合的口径。前端要靠 `total` 算页数、靠 `anchor` 把整轮翻页钉在同一快照上。
+#[derive(serde::Serialize)]
+struct UsagePage {
+    /// 满足筛选（含 `until` 上界）的总条数。
+    total: i64,
+    /// 同一集合的花费合计（USD）。
+    total_cost: f64,
+    /// 本轮翻页的锚点：请求里带了 `until` 就是它，否则是当前最大 id；空集为 null。
+    anchor: Option<i64>,
+    logs: Vec<store::UsageLog>,
 }
 
 /// 列出最近的用量日志（按时间倒序）。
 async fn list_usage(
     State(state): State<AppState>,
     Query(q): Query<UsageQuery>,
-) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let logs = state
-        .store
-        .query_usage_logs(store::UsageLogQuery { cred_id: None, before_id: q.before, limit })
-        .map_err(internal)?;
-    Ok(Json(logs))
+) -> Result<Json<UsagePage>, ApiError> {
+    usage_page(&state, None, &q, 100, 1000)
 }
 
-/// 列出某凭证的请求流水（按时间倒序，支持 `before` 游标翻页）。
+/// 列出某凭证的请求流水（按时间倒序，页码翻页）。
 ///
 /// 与卡片上那些聚合数的口径**不同**，这一点得记清楚：卡片的累计花费、设备请求数读的是
 /// 终身账本（`credential_stats` / `device_costs`），而流水只保留近期（见
-/// [`store::CredentialStore::prune_usage_logs`]）。于是「明细逐条加起来 < 卡片上的累计」
-/// 是正常的，不是哪一边算错了。
+/// [`store::CredentialStore::prune_usage_logs`]）。于是「明细合计 < 卡片上的累计」是正常的，
+/// 不是哪一边算错了。
 async fn list_credential_usage(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<UsageQuery>,
-) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
+) -> Result<Json<UsagePage>, ApiError> {
     // 与设备明细同口径：凭证不存在给 404，免得前端把「账号已被删」显示成「没有请求」。
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let logs = state
-        .store
-        .query_usage_logs(store::UsageLogQuery { cred_id: Some(id), before_id: q.before, limit })
-        .map_err(internal)?;
-    Ok(Json(logs))
+    usage_page(&state, Some(id), &q, 25, 200)
+}
+
+/// 两条流水接口共用的取页逻辑：先按 `until`（没有就现取一个）钉住快照，再在同一条件下
+/// 取统计与当页记录。
+///
+/// **统计与记录必须同锚点**：先算 total 再另取一次 max(id) 当锚点的话，两次之间新写入的
+/// 请求会让 total 比锚点下真正翻得到的条数多，最后一页于是空着。
+fn usage_page(
+    state: &AppState,
+    cred_id: Option<i64>,
+    q: &UsageQuery,
+    default_limit: i64,
+    max_limit: i64,
+) -> Result<Json<UsagePage>, ApiError> {
+    let limit = q.limit.unwrap_or(default_limit).clamp(1, max_limit);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let mut filter = store::UsageLogQuery { cred_id, until_id: q.until, offset, limit };
+    let stats = state.store.usage_log_stats(filter).map_err(internal)?;
+    // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
+    filter.until_id = q.until.or(stats.max_id);
+    let logs = state.store.query_usage_logs(filter).map_err(internal)?;
+    Ok(Json(UsagePage {
+        total: stats.total,
+        total_cost: stats.cost_usd,
+        anchor: filter.until_id,
+        logs,
+    }))
 }
 
 // ---------- 凭证管理 ----------

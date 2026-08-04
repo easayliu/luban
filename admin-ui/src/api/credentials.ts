@@ -193,17 +193,29 @@ export async function listCredentialDevices(id: number): Promise<DeviceBinding[]
   return data
 }
 
+/** 一页请求明细 + 整个集合的口径（总条数、总花费、翻页锚点）。 */
+export interface UsagePage {
+  /** 锚点之下的总条数，用来算页数。 */
+  total: number
+  /** 同一集合的花费合计（USD）。 */
+  total_cost: number
+  /** 本轮翻页的锚点 id；空集为 null。 */
+  anchor: number | null
+  logs: UsageLog[]
+}
+
 /**
- * 列出某账号的请求明细（按时间倒序）。
+ * 取某账号请求明细的一页（按时间倒序）。
  *
- * `before` 是翻页游标，传上一页最后一条的 id 即取更早的一页。不用 offset：流水只增，
- * 翻页期间新请求会插到最前面，offset 会让第二页整体错位、重复吐出第一页的尾巴。
+ * **`until` 锚点必须一路带着**：流水只增，翻页期间新请求会插到最前面，光靠 offset 会把
+ * 第二页整体往回错、重复吐出第一页的尾巴。首次不传，之后把响应里的 `anchor` 原样带回来，
+ * 整轮翻页就钉在同一个快照上——页码、总条数、总花费三者始终自洽。
  */
 export async function listCredentialUsage(
   id: number,
-  params: { limit?: number; before?: number } = {},
-): Promise<UsageLog[]> {
-  const { data } = await api.get<UsageLog[]>(`/credentials/${id}/usage`, { params })
+  params: { limit?: number; offset?: number; until?: number } = {},
+): Promise<UsagePage> {
+  const { data } = await api.get<UsagePage>(`/credentials/${id}/usage`, { params })
   return data
 }
 
