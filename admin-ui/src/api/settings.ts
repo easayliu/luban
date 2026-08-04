@@ -41,6 +41,8 @@ export interface Settings {
   cache_scope_global: boolean
   /** 请求自带设备标识时，要不要换成当前账号派生的那个（spoof_identity 的子项）。 */
   spoof_device_id: boolean
+  /** 缓存断点写不写 ttl:"1h"（对齐官方）；关闭则沿用客户端自己传的时长。 */
+  cache_ttl_1h: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -57,6 +59,7 @@ export type ForwardingKey =
   | 'fill_metadata'
   | 'rate_limit_retry'
   | 'cache_scope_global'
+  | 'cache_ttl_1h'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

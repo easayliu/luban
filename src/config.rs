@@ -60,9 +60,10 @@ pub const CC_BETA_ADVANCED_TOOL_USE: &str = "advanced-tool-use-2025-11-20";
 
 /// `extended-cache-ttl-2025-04-11`：官方四份直连抓包里都是**最后一项**。
 ///
-/// 它同时是 `cache_control.ttl` 的准入条件——[`crate::proxy::align_system_shape`] 会把断点全
-/// 改成 `ttl:1h`，没有这个 beta 那些 ttl 就是无源之水，故 system 形态对齐依赖 `merge_beta`
-/// 一起开着（耦合点在 [`crate::proxy::rewrite_body`]）。
+/// 它同时是 `cache_control.ttl` 的准入条件：断点上那个 `ttl:"1h"`（默认写，由
+/// [`crate::store::ForwardFlags::cache_ttl_1h`] 拨）没有这个 beta 就是无源之水，
+/// 故那一项还连着 `merge_beta` 一起开着（耦合点在 [`crate::proxy::rewrite_body`]）。
+/// 拆块本身不依赖它——裸的 `{"type":"ephemeral"}` 是 GA 能力。
 pub const CC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 
 /// `prompt-caching-scope-2026-01-05`：`cache_control.scope: "global"` 的准入条件，

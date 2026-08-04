@@ -1533,7 +1533,7 @@ const MAX_SYSTEM_BLOCKS: usize = 4;
 /// 再加就会让整条请求被上游拒——那是把「形态更像」换成「根本发不出去」。预算不够时基座与
 /// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。预算在**合并之后**才算：
 /// 合并会消掉客户端 `system` 里那几个断点，先算就是按一个已经不存在的数字克扣基座。
-fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, scope_global: bool) -> bool {
+fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShape) -> bool {
     let client: Vec<serde_json::Value> = match v.get("system") {
         Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
             vec![text_block_bare(s)]
@@ -1551,7 +1551,7 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, scope_global: bo
     if let Some(base) = sim.base {
         if budget > 0 {
             budget -= 1;
-            blocks.push(text_block(base, cache_control(scope_global)));
+            blocks.push(text_block(base, cache_control(cache)));
         } else {
             blocks.push(text_block_bare(base));
         }
@@ -1563,7 +1563,7 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, scope_global: bo
         && budget > 0
         && let Some(last) = blocks.last_mut().and_then(|b| b.as_object_mut())
     {
-        last.insert("cache_control".into(), cache_control(false));
+        last.insert("cache_control".into(), cache_control(cache.tail()));
     }
 
     insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
@@ -1775,14 +1775,16 @@ fn rewrite_body(
     sim: Option<&Simulation>,
     bare_session: Option<&str>,
 ) -> Bytes {
-    // `system_shape` 不再连着 `merge_beta`：它现在只拆块、只标裸的 `{"type":"ephemeral"}`，
-    // 那是 GA 能力，不需要任何 beta 声明。（曾经连着，是因为它会写 `ttl:"1h"`，而 `ttl` 要
-    // `extended-cache-ttl-2025-04-11` 认——现在不写 ttl 了，见 [`cache_control`]。）
+    // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
+    // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
     let shape = flags.system_shape;
-    // `scope:"global"` 反过来仍然要 beta 认（`prompt-caching-scope-2026-01-05`，同样由
-    // `merge_beta` 补），所以它自己那个开关之外还得叠上 `merge_beta`——否则就是
-    // 「body 里标了 global、头上没声明」的自相矛盾。
-    let scope_global = flags.cache_scope_global && flags.merge_beta;
+    // `scope:"global"` 要 `prompt-caching-scope-2026-01-05`、`ttl:"1h"` 要
+    // `extended-cache-ttl-2025-04-11`，两个都由 `merge_beta` 补。故各自的开关之外还得叠上
+    // 它——否则就是「body 里写了字段、头上没声明」的自相矛盾。
+    let cache = CacheShape {
+        global: flags.cache_scope_global && flags.merge_beta,
+        ttl_1h: flags.cache_ttl_1h && flags.merge_beta,
+    };
     // 全关且不模拟：连解析都不必做，原样返回。
     if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch {
         return body.clone();
@@ -1794,13 +1796,13 @@ fn rewrite_body(
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
-    let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, scope_global));
+    let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
-    let shaped = shape && !simulated && align_system_shape(&mut v, scope_global);
+    let shaped = shape && !simulated && align_system_shape(&mut v, cache);
     // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
     let capped = shape && cap_system_blocks(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
@@ -2077,7 +2079,7 @@ fn cch_value() -> &'static str {
 ///
 /// 保守起见只处理「确实是 API-key 三块形态」：`system` 长度不为 3、锚点匹配不到、或锚点前不是
 /// `\n\n`，一律不动结构返回 `false`。客户端本来就是 4 块（订阅形态）时同样不动。
-fn align_system_shape(v: &mut serde_json::Value, scope_global: bool) -> bool {
+fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
     let sys = match v.get_mut("system").and_then(|s| s.as_array_mut()) {
         Some(s) if s.len() == 3 => s,
         _ => return false,
@@ -2103,8 +2105,8 @@ fn align_system_shape(v: &mut serde_json::Value, scope_global: bool) -> bool {
     if let Some(obj) = sys[1].as_object_mut() {
         obj.remove("cache_control");
     }
-    sys[2] = text_block(&text[..at - 2], cache_control(scope_global));
-    sys.push(text_block(&text[at..], cache_control(false)));
+    sys[2] = text_block(&text[..at - 2], cache_control(cache));
+    sys.push(text_block(&text[at..], cache_control(cache.tail())));
     true
 }
 
@@ -2125,20 +2127,43 @@ fn text_block_bare(text: &str) -> serde_json::Value {
     serde_json::Value::Object(blk)
 }
 
-/// 构造 `cache_control`，key 序与官方一致：`type` → `scope`。
+/// 缓存断点的两项可选形态，各由一个开关拨。合成一个结构体而不是并排传两个 `bool`：
+/// 相邻同型参数换了位置编译器不会吭声，而这两项落错地方产出的都是官方不发的组合。
+#[derive(Clone, Copy)]
+struct CacheShape {
+    /// 标 `scope:"global"`。**只有基座那块**该带，见 [`store::ForwardFlags::cache_scope_global`]。
+    global: bool,
+    /// 写 `ttl:"1h"`。官方**每个断点都带**，见 [`store::ForwardFlags::cache_ttl_1h`]。
+    ttl_1h: bool,
+}
+
+impl CacheShape {
+    /// 非基座断点的形态：去掉 `scope`、保留 `ttl`——官方只在基座标 `scope`
+    /// （`cap/raw/00006` 三个断点里仅一个有），而三个断点**都**有 `ttl`。
+    fn tail(self) -> Self {
+        Self { global: false, ..self }
+    }
+}
+
+/// 构造 `cache_control`，key 序与官方一致：`type` → `ttl` → `scope`
+/// （逐字节取自 `cap/raw/00006`：`{"type":"ephemeral","ttl":"1h","scope":"global"}`）。
 ///
-/// **刻意不写 `ttl`**，尽管官方那三个断点全是 `ttl:"1h"`（`cap/raw` 四对抓包 3/3）。
-/// 缓存时长是客户端掏钱买的东西——1h 的写入单价是默认 5m 的 2 倍——luban 替它改成 1h，
-/// 等于未经同意把这条请求的缓存写入费翻倍。形态上因此与官方差一个字段，认了：
-/// 那是**我们不该替客户端做的决定**，不是能不能对齐的问题。客户端自己写了 `ttl` 的照发。
+/// `ttl:"1h"` **默认写**，对齐官方——四份订阅直连抓包的三个断点 3/3 全是 `1h`，不写就是
+/// 每条请求上一处稳定差异。代价要知情：1h 的缓存**写入**单价是默认 5m 的 2 倍,故
+/// [`store::ForwardFlags::cache_ttl_1h`] 可以关掉，关掉即沿用客户端自己传的时长。
+/// 长会话里 1h 通常反而更省（5m 内没接上话就得按写入价重写一遍），但那取决于使用节奏，
+/// 所以给了开关。客户端自己写了 `ttl` 的照发，两条路都不覆盖它。
 ///
-/// `global` 由 [`store::ForwardFlags::cache_scope_global`] 拨，只标在官方基座上（那块全网
-/// 同一份才谈得上跨账号复用）。它要 `prompt-caching-scope` beta 认，故还连着 `merge_beta`，
+/// `global` 同理由 [`store::ForwardFlags::cache_scope_global`] 拨。两项各要一个 beta 认
+/// （`prompt-caching-scope` / `extended-cache-ttl`），故都还连着 `merge_beta`，
 /// 见 [`rewrite_body`]。
-fn cache_control(global: bool) -> serde_json::Value {
+fn cache_control(shape: CacheShape) -> serde_json::Value {
     let mut cc = serde_json::Map::new();
     cc.insert("type".into(), "ephemeral".into());
-    if global {
+    if shape.ttl_1h {
+        cc.insert("ttl".into(), "1h".into());
+    }
+    if shape.global {
         cc.insert("scope".into(), "global".into());
     }
     serde_json::Value::Object(cc)
@@ -3297,6 +3322,7 @@ mod tests {
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
+            cache_ttl_1h: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -3678,18 +3704,38 @@ mod tests {
         );
         assert!(sys[3]["text"].as_str().unwrap().ends_with("\n\nREST"), "其余部分被截断: {s}");
 
-        // 键序也要对：type → text → cache_control，cache_control 内 type → scope。
+        // 键序也要对：type → text → cache_control，cache_control 内 type → ttl → scope
+        // （逐字节取自 `cap/raw/00006`）。
         assert!(
-            s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#),
+            s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}"#),
             "基座的 cache_control 形态不对: {s}"
         );
-        // ttl 一概不写：缓存时长归客户端自己定，见 [`super::cache_control`]。
-        assert!(!s.contains(r#""ttl""#), "不该替客户端写 ttl: {s}");
+        // 官方三个断点**都**带 ttl，只有基座带 scope。
+        assert_eq!(
+            s.matches(r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#).count(),
+            1,
+            "其余块该是带 ttl、不带 scope: {s}"
+        );
+        // 来访自己那个断点不被改写（客户端没写 ttl 就不替它写）。
         assert_eq!(
             s.matches(r#""cache_control":{"type":"ephemeral"}"#).count(),
-            2,
-            "其余块与消息断点都是裸 ephemeral: {s}"
+            1,
+            "客户端原有的裸 ephemeral 被动了: {s}"
         );
+
+        // 关掉 `cache_ttl_1h` 即回到「沿用客户端时长」：一个 ttl 都不写。
+        let no_ttl = store::ForwardFlags { cache_ttl_1h: false, ..all_on() };
+        let out = super::rewrite_body(
+            &Bytes::from(API_SHAPE_BODY),
+            &test_cred(),
+            "fp",
+            no_ttl,
+            None,
+            None,
+        );
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains(r#""ttl""#), "关掉后不该替客户端写 ttl: {s}");
+        assert!(s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#), "{s}");
     }
 
     /// 一份 body 里可能**同时**含多条锚点，此时必须切在最早的那个上。
@@ -3793,6 +3839,7 @@ mod tests {
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
+            cache_ttl_1h: false,
         };
         let out = super::rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -3877,10 +3924,11 @@ mod tests {
         }
 
         // 嵌套对象同样不重排：system 块是 type→text（字母序会变成 text→type），
-        // 拆块后新建的两块也按这个键序写回，cache_control 内是 type→scope。
+        // 拆块后新建的两块也按这个键序写回，cache_control 内是 type→ttl→scope
+        // （字母序会变成 scope→ttl→type）。
         assert!(s.contains(r#"{"type":"text","text":"base""#), "system 块 key 被重排: {s}");
         assert!(
-            s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#),
+            s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}"#),
             "cache_control key 被重排: {s}"
         );
 
@@ -4228,8 +4276,9 @@ mod tests {
         assert_eq!(sys[3]["text"], "你是助手", "客户端原 system 应原样留在末块");
         assert_eq!(sys[3]["cache_control"]["type"], "ephemeral");
         assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
-        // 缓存时长归客户端自己定，luban 一概不写 ttl（见 [`super::cache_control`]）。
-        assert!(!s.contains(r#""ttl""#), "不该替客户端写 ttl: {s}");
+        // ttl 默认对齐官方：三个断点都是 1h（见 [`super::cache_control`]）。
+        assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
+        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
 
         // key 序按官方 `model → messages → system → tools → metadata → max_tokens →
         // context_management` 落位，补出来的几个字段不该被追加到队尾。本例没有 `thinking`/

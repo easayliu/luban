@@ -940,6 +940,9 @@ impl CredentialStore {
         if let Some(v) = on(SYSTEM_CACHE_SCOPE) {
             flags.cache_scope_global = v;
         }
+        if let Some(v) = on(SYSTEM_CACHE_TTL) {
+            flags.cache_ttl_1h = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -999,6 +1002,9 @@ pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
 /// 与 [`REQUIRE_DEVICE_ID`] 无关：那个管「没带身份的请求放不放行」，这个管「带了身份的
 /// 请求要不要改写其中的设备段」。
 pub const SPOOF_DEVICE_ID: &str = "spoof_device_id";
+
+/// 缓存断点要不要写 `ttl:"1h"`（对齐官方）。缺省视为开启；关掉即沿用客户端自己传的时长。
+pub const SYSTEM_CACHE_TTL: &str = "system_cache_ttl";
 
 /// 是否给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
 pub const SPOOF_BILLING_CCH: &str = "spoof_billing_cch";
@@ -1108,6 +1114,20 @@ pub struct ForwardFlags {
     /// 于是发出去的是 `{type, scope}`。收益（跨账号复用基座）与这处形态偏差谁更重要，
     /// 交给用户自己拨。
     pub cache_scope_global: bool,
+    /// 缓存断点写不写 `ttl:"1h"`。
+    ///
+    /// **默认开（对齐官方）**：四份订阅直连抓包的三个断点 3/3 全是 `ttl:"1h"`，而 API-key
+    /// 模式那四份是裸的 `{"type":"ephemeral"}`——也就是说这个字段正是两种模式之间真实存在的
+    /// 差别之一，不写就等于每条请求都留一处稳定差异。
+    ///
+    /// **代价要知情**：1h 的缓存**写入**单价是默认 5m 的 2 倍。命中与否取决于使用节奏——
+    /// 长会话里 1h 往往反而更省（5m 内没接上话，下一轮就得按写入价重写整个前缀），
+    /// 短促的一次性请求则是纯多付。所以给了开关：关掉即沿用客户端自己传的时长，
+    /// luban 一个字节都不改。客户端自己写了 `ttl` 的任何情况下都照发，不被覆盖。
+    ///
+    /// 与 [`Self::cache_scope_global`] 一样要 beta 认（`extended-cache-ttl-2025-04-11`，
+    /// 由 `merge_beta` 补），故还连着那个开关，见 [`crate::proxy::rewrite_body`]。
+    pub cache_ttl_1h: bool,
 }
 
 impl Default for ForwardFlags {
@@ -1125,6 +1145,7 @@ impl Default for ForwardFlags {
             fill_metadata: true,
             rate_limit_retry: true,
             cache_scope_global: true,
+            cache_ttl_1h: true,
         }
     }
 }
@@ -3947,6 +3968,7 @@ mod tests {
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
+            (SYSTEM_CACHE_TTL, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -3966,6 +3988,7 @@ mod tests {
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,
+                cache_ttl_1h: false,
             }
         );
 

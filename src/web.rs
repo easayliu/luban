@@ -733,6 +733,8 @@ struct ForwardingResp {
     rate_limit_retry: bool,
     /// 官方基座那块的缓存断点带不带 `scope:"global"`（跨账号共享基座缓存）。
     cache_scope_global: bool,
+    /// 缓存断点写不写 `ttl:"1h"`（对齐官方；关掉即沿用客户端自己传的时长）。
+    cache_ttl_1h: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -750,6 +752,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
             cache_scope_global: f.cache_scope_global,
+            cache_ttl_1h: f.cache_ttl_1h,
         }
     }
 }
@@ -942,6 +945,7 @@ struct SetForwardingReq {
     fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
     cache_scope_global: Option<bool>,
+    cache_ttl_1h: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -954,7 +958,7 @@ async fn set_forwarding(
     use crate::store::{
         FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY,
         SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
-        SYSTEM_CACHE_SCOPE, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
+        SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -969,6 +973,7 @@ async fn set_forwarding(
         (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),
         (SYSTEM_CACHE_SCOPE, req.cache_scope_global),
+        (SYSTEM_CACHE_TTL, req.cache_ttl_1h),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;

@@ -218,8 +218,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '只调整分块，不改变提示词文本、也不改缓存时长——缓存时长（ttl）一概沿用客户端自己传的，客户端没传就用上游默认，luban 不替它决定。它不只是缓存优化：官方客户端的系统提示词恒为 4 块，超出的会被上游判成第三方应用，改从超额额度（extra usage）扣费而不是订阅额度，所以多出来的块会被并回第 4 块。无法识别切点时原样转发。',
-                'Only block boundaries are adjusted — the prompt text is unchanged, and so is cache duration: the ttl always comes from the client, or from the upstream default when the client sends none. luban never decides it for you. This is not merely a cache optimization: the official client always sends exactly 4 system blocks, and anything beyond that is treated upstream as a third-party app and billed to extra usage instead of your plan, so surplus blocks are merged back into the fourth. Requests are forwarded unchanged when no split point can be identified.',
+                '只调整分块，不改变提示词文本（缓存时长另由「缓存时长对齐 1h」那项管）。它不只是缓存优化：官方客户端的系统提示词恒为 4 块，超出的会被上游判成第三方应用，改从超额额度（extra usage）扣费而不是订阅额度，所以多出来的块会被并回第 4 块。无法识别切点时原样转发。',
+                'Only block boundaries are adjusted; the prompt text is unchanged (cache duration is governed separately by “Match official cache duration”). This is not merely a cache optimization: the official client always sends exactly 4 system blocks, and anything beyond that is treated upstream as a third-party app and billed to extra usage instead of your plan, so surplus blocks are merged back into the fourth. Requests are forwarded unchanged when no split point can be identified.',
               )}
             </>
           }
@@ -238,8 +238,28 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '基座是按模型族固定的官方提示词，全网同一份，标记后跨账号命中同一份缓存，省下重复的写入。注意：官方客户端总是把 scope 和 ttl:1h 一起发，而 luban 不写 ttl，所以发出去的是官方不产生的组合；介意形态贴合度就关掉，代价是每个账号各写各的基座缓存。该标记需要上游的 prompt-caching-scope beta，故依赖「Beta 标记」开关。',
-                'The base prompt is a fixed official block per model family — identical everywhere — so marking it lets all accounts hit one cached copy instead of each paying its own cache write. Note: the official client always sends scope together with ttl:1h, and luban does not write ttl, so the emitted combination is one the official client never produces. Turn this off if you care about exact shape fidelity; the cost is a separate base-prompt cache write per account. The marker requires the upstream prompt-caching-scope beta, hence the dependency on "Beta flags".',
+                '基座是按模型族固定的官方提示词，全网同一份，标记后跨账号命中同一份缓存，省下重复的写入。官方客户端总是把 scope 和 ttl:1h 一起发，所以这项与「缓存时长对齐 1h」同时开着才是官方形态；单独关掉其中一项，发出去的就是官方不产生的组合。该标记需要上游的 prompt-caching-scope beta，故依赖「Beta 标记」开关。',
+                'The base prompt is a fixed official block per model family — identical everywhere — so marking it lets all accounts hit one cached copy instead of each paying its own cache write. The official client always sends scope together with ttl:1h, so this and “Match official cache duration” form the official shape only when both are on; turning off just one emits a combination the official client never produces. The marker requires the upstream prompt-caching-scope beta, hence the dependency on “Beta flags”.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="cache_ttl_1h"
+          label={t('缓存时长对齐 1h', 'Match official cache duration')}
+          summary={t(
+            '给缓存断点写 ttl:"1h"，与官方一致；关闭则沿用客户端自己传的时长。',
+            'Write ttl:"1h" on cache breakpoints to match the official client; when disabled, keep whatever duration the client sent.',
+          )}
+          requires={{
+            key: 'merge_beta',
+            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+          }}
+          description={
+            <>
+              {t(
+                '官方订阅客户端的三个缓存断点全带 ttl:"1h"，而 API key 模式发的是不带时长的裸断点——这一项正是两种模式之间的真实差别之一，不写就等于每条请求都留一处固定差异。代价要知道：1h 的缓存写入单价是默认 5 分钟的 2 倍。是省是亏取决于使用节奏——长会话里 1h 往往更省（5 分钟内没接上话，下一轮就得按写入价把整段前缀重写一遍），零散的一次性请求则是纯多付。关闭后 luban 一个字节都不改，客户端传什么时长就用什么。客户端自己写了时长的，任何情况下都照发不覆盖。该字段需要上游的 extended-cache-ttl beta，故依赖「Beta 标记」开关。',
+                'All three cache breakpoints from the official subscription client carry ttl:"1h", whereas API-key mode sends bare breakpoints with no duration — this is one of the real differences between the two modes, so omitting it leaves a fixed discrepancy on every request. Know the cost: a 1h cache write is priced at twice the default 5-minute write. Whether that saves or costs money depends on your usage rhythm — in long sessions 1h usually saves (if you do not reply within five minutes, the next turn rewrites the whole prefix at write price), while scattered one-off requests simply pay more. When disabled, luban changes nothing and whatever duration the client sent is used as-is. A duration written by the client itself is always forwarded untouched. The field requires the upstream extended-cache-ttl beta, hence the dependency on “Beta flags”.',
               )}
             </>
           }
