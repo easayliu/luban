@@ -455,10 +455,26 @@ function DeviceList({
         <ul className="space-y-2">
           {data.map((device) => {
             const formattedRequestCount = device.request_count.toLocaleString(locale)
-            const firstBoundFull = formatFullTime(device.created_at, language)
-            const lastSeenFull = formatFullTime(device.last_seen_at, language)
-            const firstBoundRelative = relativeTime(device.created_at, undefined, language)
-            const lastSeenRelative = relativeTime(device.last_seen_at, undefined, language)
+            // 模拟客户端没有绑定行，也就没有这两个时刻（见 DeviceBinding.simulated）。
+            const firstBoundFull = formatFullTime(device.created_at ?? 0, language)
+            const lastSeenFull = formatFullTime(device.last_seen_at ?? 0, language)
+            const firstBoundRelative = relativeTime(device.created_at ?? 0, undefined, language)
+            const lastSeenRelative = relativeTime(device.last_seen_at ?? 0, undefined, language)
+            const meta = device.simulated
+              ? t(
+                  '非 Claude Code 客户端，按账号派生的身份；不占设备名额',
+                  'Third-party client using an account-derived identity; does not use a device slot',
+                )
+              : t(
+                  `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
+                  `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
+                )
+            const metaTitle = device.simulated
+              ? undefined
+              : t(
+                  `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
+                  `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
+                )
             return (
               <li key={device.device_id}>
                 <Card>
@@ -497,34 +513,28 @@ function DeviceList({
                         <CopyIcon />
                       </Button>
                     </CardTitle>
-                    <CardDescription
-                      className="text-xs"
-                      title={t(
-                        `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
-                        `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
-                      )}
-                    >
-                      {t(
-                        `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
-                        `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
-                      )}
+                    <CardDescription className="text-xs" title={metaTitle}>
+                      {meta}
                     </CardDescription>
-                    <CardAction>
-                      <Button
-                        size="sm"
-                        variant="destructive-outline"
-                        loading={unbind.isPending && unbind.variables === device.device_id}
-                        disabled={unbind.isPending && unbind.variables !== device.device_id}
-                        onClick={() => unbind.mutate(device.device_id)}
-                        aria-label={t(
-                          `解绑设备 ${device.device_id}`,
-                          `Unbind device ${device.device_id}`,
-                        )}
-                      >
-                        <UnlinkIcon />
-                        {t('解绑', 'Unbind')}
-                      </Button>
-                    </CardAction>
+                    {/* 模拟伪设备没有绑定行可删，故不给解绑按钮——点了也只会是一次空操作。 */}
+                    {!device.simulated && (
+                      <CardAction>
+                        <Button
+                          size="sm"
+                          variant="destructive-outline"
+                          loading={unbind.isPending && unbind.variables === device.device_id}
+                          disabled={unbind.isPending && unbind.variables !== device.device_id}
+                          onClick={() => unbind.mutate(device.device_id)}
+                          aria-label={t(
+                            `解绑设备 ${device.device_id}`,
+                            `Unbind device ${device.device_id}`,
+                          )}
+                        >
+                          <UnlinkIcon />
+                          {t('解绑', 'Unbind')}
+                        </Button>
+                      </CardAction>
+                    )}
                   </CardHeader>
                   <CardPanel>
                     <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">

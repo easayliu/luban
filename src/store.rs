@@ -744,8 +744,10 @@ impl CredentialStore {
 
     /// 单条凭证当前**有效**绑定的设备明细（含费用），按最近活跃倒序。
     ///
-    /// 过滤口径与 [`Self::device_count`] 完全一致（同一个 TTL），否则后台会出现「设备数写着
-    /// 2、展开却列出 5 条」这种自相矛盾的展示。
+    /// **真实绑定**那部分的过滤口径与 [`Self::device_count`] 完全一致（同一个 TTL），否则后台
+    /// 会出现「设备数写着 2、展开却列出 5 条」这种自相矛盾的展示。末尾追加的模拟伪设备
+    /// （`simulated` 为真）**不在这个口径内**——它们不写绑定、不占名额，故 `device_count`
+    /// 数不到它们，两者本就不该相等。前端要显示「设备数」时只能数 `!simulated` 那些。
     ///
     /// 费用来自 `device_costs` 账本（写日志时同事务累加），与绑定表是两套账，刻意不合并：
     /// 绑定行会被解绑/停用/TTL 清掉并从零重新计数，账本则终身累计。所以「本账号费用」
@@ -773,13 +775,41 @@ impl CredentialStore {
                 last_seen_at: r.get(3)?,
                 cost_usd: r.get(4)?,
                 cost_usd_all: r.get(5)?,
+                simulated: false,
             })
         };
-        let rows: Vec<DeviceBinding> = if ttl > 0 {
+        let mut rows: Vec<DeviceBinding> = if ttl > 0 {
             stmt.query_map(params![cred_id, ttl], map_row)?.collect::<rusqlite::Result<_>>()?
         } else {
             stmt.query_map([cred_id], map_row)?.collect::<rusqlite::Result<_>>()?
         };
+        drop(stmt);
+
+        // 模拟客户端的伪设备：它们不写绑定（故上面那条 SQL 一条都查不到），但用量与费用
+        // 照常落进 `device_costs`。不接 TTL——那是绑定的过期规则，这里没有绑定可过期。
+        // 排在真实设备之后：真实设备是「谁在用这个号」的主线，伪设备是一条汇总。
+        let mut sim = conn.prepare(
+            "SELECT dc.device_id, dc.request_count, dc.cost_usd, \
+                    COALESCE((SELECT SUM(d2.cost_usd) FROM device_costs d2 \
+                               WHERE d2.device_id = dc.device_id), 0) \
+               FROM device_costs dc \
+              WHERE dc.cred_id = ?1 AND dc.device_id LIKE 'sim:%' \
+              ORDER BY dc.request_count DESC, dc.device_id ASC",
+        )?;
+        let sim_rows = sim.query_map([cred_id], |r| {
+            Ok(DeviceBinding {
+                device_id: r.get(0)?,
+                request_count: r.get(1)?,
+                created_at: None,
+                last_seen_at: None,
+                cost_usd: r.get(2)?,
+                cost_usd_all: r.get(3)?,
+                simulated: true,
+            })
+        })?;
+        for row in sim_rows {
+            rows.push(row?);
+        }
         Ok(rows)
     }
 
@@ -1325,12 +1355,15 @@ pub struct QuotaSnapshot {
 pub struct DeviceBinding {
     /// 客户端 `metadata.user_id` 里的原始 device_id（非伪装后的那个）。
     pub device_id: String,
-    /// 该设备经此凭证转发过的累计请求数。
+    /// 该设备经此凭证转发过的累计请求数（终身，来自 `device_costs` 账本）。
     pub request_count: i64,
-    /// 首次绑定到该凭证的时间（Unix 秒）。
-    pub created_at: i64,
-    /// 最近一次活跃时间（Unix 秒）；TTL 就是按它算的。
-    pub last_seen_at: i64,
+    /// 首次绑定到该凭证的时间（Unix 秒）。模拟客户端没有绑定行，故为 `None`。
+    pub created_at: Option<i64>,
+    /// 最近一次活跃时间（Unix 秒）；TTL 就是按它算的。模拟客户端不参与 TTL，故为 `None`。
+    pub last_seen_at: Option<i64>,
+    /// 是否是**模拟客户端**的伪设备（`sim:` 前缀，见 [`crate::proxy::sim_device_id`]）：
+    /// 不写绑定、不占 [`Self::device_count`] 名额、不能解绑，只有用量与费用是真的。
+    pub simulated: bool,
     /// 该设备经**本凭证**花掉的等价 API 费用（USD 合计，来自 `usage_logs`）。
     ///
     /// 与 `request_count` 不同源：绑定行会被解绑/停用清掉并从零重数，用量日志不会，
@@ -1602,11 +1635,16 @@ impl CredentialStore {
                     ],
                 )?;
             }
-            // 模型未知时 cost_usd 为空，无钱可记（口径同旧版 SUM 跳过 NULL）。
-            if let (Some(dev), Some(cost)) = (&rec.device_id, rec.cost_usd) {
+            // 只要认得出设备就记一笔：**请求数无条件 +1**，费用取不到（模型未知）时按 0 计。
+            // 不能像费用那样连请求数一起跳过——4xx/429 这些没有 usage 的请求同样是这台设备
+            // 打出去的，漏掉它们会让「请求数」少一大截，而排查限流恰恰要看这些。
+            if let Some(dev) = &rec.device_id {
+                let cost = rec.cost_usd.unwrap_or(0.0);
                 tx.execute(
-                    "INSERT INTO device_costs (device_id, cred_id, cost_usd) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(device_id, cred_id) DO UPDATE SET cost_usd = cost_usd + ?3",
+                    "INSERT INTO device_costs (device_id, cred_id, cost_usd, request_count)
+                          VALUES (?1, ?2, ?3, 1)
+                     ON CONFLICT(device_id, cred_id) DO UPDATE
+                            SET cost_usd = cost_usd + ?3, request_count = request_count + 1",
                     params![dev, cid, cost],
                 )?;
             }
@@ -1802,6 +1840,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             device_id TEXT    NOT NULL,
             cred_id   INTEGER NOT NULL,
             cost_usd  REAL    NOT NULL DEFAULT 0,
+            -- 终身请求数。与 device_bindings.request_count 不同源：那个随绑定行走，
+            -- 解绑/停用/TTL 清掉后从零重数；这个和费用一样终身累计，且**模拟客户端也记**
+            -- （它们不写绑定，见 crate::proxy::sim_device_id）。
+            request_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (device_id, cred_id)
         ) STRICT, WITHOUT ROWID;",
     )
@@ -1827,6 +1869,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
     }
     // credential_stats 是 0.2.37 加的表，这两列都在其后才有：同样幂等补列。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
+    // device_costs 的终身请求数是后加的：老库补出来是 0，之后的请求照常累加。
+    // 不回填——`usage_logs` 只留 30 天，拿它回填会得到一个「看着像终身、其实只有 30 天」的数，
+    // 比从 0 开始更误导。
+    let _ = conn.execute(
+        "ALTER TABLE device_costs ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // 全窗口快照。老库补出来是 NULL，前端按「只有 5h/7d」渲染（与升级前一模一样），
     // 下一条带限流头的响应就会把它填上——不必也不值得从 ratelimit_raw 回溯解析。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN windows TEXT", []);
@@ -2681,6 +2730,60 @@ mod tests {
                 .is_err(),
             "无可用凭证时应报错"
         );
+    }
+
+    /// 模拟客户端（`sim:` 前缀）不写绑定，故此前在设备列表里完全看不到——用量与费用都在
+    /// `device_costs` 里，只是没人读。现在把它们作为伪设备追加在真实设备之后。
+    ///
+    /// 同时钉住三件事：请求数**无条件**计（含没有 usage 的 4xx，否则限流排查时数字对不上）、
+    /// 不占 `device_count` 名额、跨账号合计仍然正确。
+    #[test]
+    fn lists_simulated_devices_with_request_counts() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let log = |cred: i64, dev: &str, cost: Option<f64>| {
+            store
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(cred),
+                    cred_label: "x".into(),
+                    device_id: Some(dev.into()),
+                    cost_usd: cost,
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+        let sim = "sim:ff813c9166f0d2f3";
+        log(a, sim, Some(0.01));
+        log(a, sim, Some(0.02));
+        // 模型认不出 → 无费用可计，但请求确实发生过，请求数照记。
+        log(a, sim, None);
+        // 同一个伪设备也可能落到别的账号上（换号重试／负载均衡）。
+        log(b, sim, Some(0.05));
+
+        let devs = store.list_devices(a).unwrap();
+        assert_eq!(devs.len(), 1, "伪设备该出现在列表里: {devs:?}");
+        let d = &devs[0];
+        assert!(d.simulated, "该标记成模拟客户端");
+        assert_eq!(d.device_id, sim);
+        assert_eq!(d.request_count, 3, "没有 usage 的那条也要计数");
+        assert!((d.cost_usd - 0.03).abs() < 1e-9, "本账号费用: {}", d.cost_usd);
+        assert!((d.cost_usd_all - 0.08).abs() < 1e-9, "跨账号合计: {}", d.cost_usd_all);
+        assert_eq!(d.created_at, None, "没有绑定就没有绑定时刻");
+        assert_eq!(d.last_seen_at, None);
+
+        // 不占设备名额——那是 device_bindings 的口径，伪设备一行都不写。
+        assert_eq!(store.device_count(a).unwrap(), 0, "伪设备不该计入设备数");
+
+        // 真实设备与伪设备并存时，真实的排在前面且不被标记。
+        store
+            .select_for_device(Select { device_id: Some("real-1"), ..Default::default() })
+            .unwrap();
+        log(a, "real-1", Some(1.0));
+        let devs = store.list_devices(a).unwrap();
+        assert_eq!(devs.len(), 2, "{devs:?}");
+        assert!(!devs[0].simulated && devs[0].device_id == "real-1", "真实设备排前面: {devs:?}");
+        assert!(devs[1].simulated, "伪设备排后面: {devs:?}");
+        assert_eq!(store.device_count(a).unwrap(), 1, "只有真实设备占名额");
     }
 
     /// 设备明细必须与设备数同口径：条数等于 `device_count`、只含本凭证的绑定、

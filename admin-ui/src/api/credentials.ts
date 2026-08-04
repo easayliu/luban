@@ -107,21 +107,28 @@ export interface Credential {
   resume_at: number | null
 }
 
-/** 一条设备绑定明细；口径同 `device_count`：只含 TTL 内仍活跃的绑定。 */
+/**
+ * 一条设备明细。真实绑定那部分口径同 `device_count`：只含 TTL 内仍活跃的绑定；
+ * 末尾可能追加 `simulated` 为真的伪设备，它们不占设备名额，故不计入 `device_count`。
+ */
 export interface DeviceBinding {
-  /** 客户端 metadata 里的原始 device_id。 */
+  /** 客户端 metadata 里的原始 device_id；模拟客户端是 `sim:` 前缀的派生值。 */
   device_id: string
-  /** 该设备经此账号转发过的累计请求数。 */
+  /** 该设备经此账号转发过的累计请求数（终身）。 */
   request_count: number
-  /** 首次绑定时间（Unix 秒）。 */
-  created_at: number
-  /** 最近一次活跃时间（Unix 秒）。 */
-  last_seen_at: number
+  /** 首次绑定时间（Unix 秒）；模拟客户端没有绑定，为 null。 */
+  created_at: number | null
+  /** 最近一次活跃时间（Unix 秒）；模拟客户端不参与 TTL，为 null。 */
+  last_seen_at: number | null
+  /**
+   * 是否是模拟客户端的伪设备：非 Claude Code 客户端没有自己的设备身份，代理按账号派生一个
+   * 顶替。它们不写绑定、不占设备名额、也无法解绑，只有用量与费用是真实的。
+   */
+  simulated: boolean
   /**
    * 该设备经**本账号**花掉的等价 API 费用（USD 合计）。
    *
-   * 与 request_count 不同源：请求数随绑定行走（解绑/停用后从零重数），费用来自用量日志、
-   * 一直累计，所以它覆盖的时间范围可能比请求数更长。
+   * 与 request_count 同源（都来自终身账本），故两者覆盖的时间范围一致。
    */
   cost_usd: number
   /** 该设备在**所有账号**上的累计费用（USD）；用于识别换号后仍在烧钱的同一台设备。 */

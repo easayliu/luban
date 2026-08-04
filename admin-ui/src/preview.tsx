@@ -614,6 +614,7 @@ queryClient.setQueryData(['credential-devices', 4], [
     request_count: 286,
     created_at: now - 12 * 24 * 3600,
     last_seen_at: now - 80,
+    simulated: false,
     cost_usd: 4.72,
     cost_usd_all: 12.38,
   },
@@ -622,8 +623,19 @@ queryClient.setQueryData(['credential-devices', 4], [
     request_count: 74,
     created_at: now - 3 * 24 * 3600,
     last_seen_at: now - 18 * 60,
+    simulated: false,
     cost_usd: 2.13,
     cost_usd_all: 2.13,
+  },
+  // 模拟客户端的伪设备：无绑定时刻、不可解绑，只有用量与费用是真的。
+  {
+    device_id: 'sim:ff813c9166f0d2f3e9c1c7a4b5d80e2f7a3c6b91d4e0f28a5c73b9de6104a2f8',
+    request_count: 3182,
+    created_at: null,
+    last_seen_at: null,
+    simulated: true,
+    cost_usd: 18.94,
+    cost_usd_all: 18.94,
   },
 ])
 
