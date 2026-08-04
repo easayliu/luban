@@ -21,23 +21,23 @@ use clap::{Parser, Subcommand};
 use store::CredentialStore;
 
 #[derive(Parser)]
-#[command(name = "luban", version, about = "Claude Code 授权代理")]
+#[command(name = "luban", version, about = "Claude Code authorization proxy")]
 struct Cli {
-    /// 网页服务监听地址（默认 0.0.0.0 对外可达；仅本机可设 127.0.0.1）
+    /// Web service bind address (0.0.0.0 is reachable from the network; use 127.0.0.1 for local-only).
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
-    /// 网页服务监听端口（默认命令时生效）
+    /// Web service port (used when running without a subcommand).
     #[arg(long, default_value_t = 4600)]
     port: u16,
-    /// 接入用的 API Key（Claude Code 侧填此值）；也可用环境变量 LUBAN_API_KEY。
-    /// 不设置则代理不校验来访身份（请仅本机使用）。
+    /// API key used by clients such as Claude Code; also available through LUBAN_API_KEY.
+    /// If unset, the proxy does not authenticate callers; use it only on a trusted local network.
     #[arg(long, env = "LUBAN_API_KEY")]
     api_key: Option<String>,
-    /// 管理界面登录密码；也可用环境变量 LUBAN_ADMIN_PASSWORD。
-    /// 设置后（含网页设置）管理接口需鉴权；此参数会接管、网页只读。
+    /// Admin console password; also available through LUBAN_ADMIN_PASSWORD.
+    /// Once set, admin APIs require authentication. A CLI or environment value takes precedence and makes the web setting read-only.
     #[arg(long, env = "LUBAN_ADMIN_PASSWORD")]
     admin_password: Option<String>,
-    /// 启动后自动打开浏览器（默认不打开）
+    /// Open a browser after startup (off by default).
     #[arg(long)]
     open: bool,
     #[command(subcommand)]
@@ -46,9 +46,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 列出所有已保存的凭证
+    /// List all saved credentials.
     Status,
-    /// 清空所有已保存的凭证
+    /// Remove all saved credentials.
     Logout,
 }
 
@@ -89,17 +89,23 @@ fn init_logging() {
 fn status(store: &CredentialStore) -> Result<()> {
     let list = store.list()?;
     if list.is_empty() {
-        println!("暂无凭证，运行 `luban`（无参数）打开网页添加账号。");
+        println!(
+            "No credentials saved. Run `luban` without a subcommand to open the web UI and add an account."
+        );
         return Ok(());
     }
-    println!("共 {} 个凭证（库：{}）：", list.len(), CredentialStore::db_path()?.display());
+    println!(
+        "Saved credentials ({}; database: {}):",
+        list.len(),
+        CredentialStore::db_path()?.display()
+    );
     for c in &list {
         let state = if c.disabled {
-            "已停用".to_string()
+            "disabled".to_string()
         } else if c.expires_in_secs() == 0 {
-            "已过期(将自动刷新)".to_string()
+            "expired (refreshes automatically)".to_string()
         } else {
-            format!("有效 剩余 {} 分钟", c.expires_in_secs() / 60)
+            format!("active; {} min remaining", c.expires_in_secs() / 60)
         };
         println!("  #{:<3} [P{}] {:<16} {}", c.id, c.priority, c.label, state);
     }
@@ -110,9 +116,10 @@ fn status(store: &CredentialStore) -> Result<()> {
 fn logout(store: &CredentialStore) -> Result<()> {
     let n = store.clear()?;
     if n > 0 {
-        println!("已清空 {} 个凭证（含其设备绑定与历史用量日志）。", n);
+        let noun = if n == 1 { "credential" } else { "credentials" };
+        println!("Cleared {n} {noun}, including associated device bindings and usage history.");
     } else {
-        println!("当前没有凭证，无需操作。");
+        println!("No credentials to clear.");
     }
     Ok(())
 }

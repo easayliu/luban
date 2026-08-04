@@ -17,6 +17,7 @@ import { useI18n } from '@/lib/i18n'
 import {
   cn,
   copyText,
+  displayCredentialLabel,
   extractError,
   formatFullTime,
   formatUsd,
@@ -107,7 +108,8 @@ export function CredentialDevicesDialog({
   onOpenChange: (open: boolean) => void
   limit: CredentialActions['limit']
 }) {
-  const { t, locale } = useI18n()
+  const { t, language, locale } = useI18n()
+  const credentialLabel = displayCredentialLabel(cred.label, language)
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitPolicy, setLimitPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.device_limit))
   const [customLimit, setCustomLimit] = useState(Math.max(1, cred.device_limit))
@@ -201,7 +203,7 @@ export function CredentialDevicesDialog({
             </Avatar>
             <div className="min-w-0 flex-1">
               <DialogTitle>{t('已绑定设备', 'Bound devices')}</DialogTitle>
-              <DialogDescription className="mt-1 truncate" title={cred.label}>{cred.label}</DialogDescription>
+              <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
                 <Badge variant={deviceStatus.variant} aria-live="polite">{deviceStatus.label}</Badge>

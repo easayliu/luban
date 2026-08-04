@@ -6,7 +6,7 @@
 
 use axum::{
     Json,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -49,7 +49,7 @@ pub async fn require_admin(State(state): State<AppState>, req: Request, next: Ne
     if ok {
         next.run(req).await
     } else {
-        (StatusCode::UNAUTHORIZED, "需要管理密码").into_response()
+        (StatusCode::UNAUTHORIZED, "admin password required").into_response()
     }
 }
 
@@ -78,23 +78,51 @@ fn ok_json() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    // 同 `web::internal`：错误详情只回给客户端、服务端不留痕的话，500 在日志里查不到。
+    let msg = e.to_string();
+    tracing::error!(error = %msg, "auth endpoint internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
+
+/// 记进日志的来源标识：优先前置层给的 `x-forwarded-for` 首段（luban 常挂在反代后面，
+/// 直接取对端只会得到反代自己），退回 `x-real-ip`，都没有才用 TCP 对端地址。
+///
+/// 这两个头是客户端可伪造的，所以只当**线索**用，不作任何判决依据；真要防爆破得在前置层做。
+///
+/// `peer` 由 `ConnectInfo` 提取，取决于 [`crate::web::run`] 里那句
+/// `into_make_service_with_connect_info`——换掉它这三个接口会一律 500，改动服务装配时留意。
+fn client_ip(headers: &header::HeaderMap, peer: std::net::SocketAddr) -> String {
+    let from_header = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match from_header {
+        Some(ip) => ip.to_owned(),
+        None => peer.ip().to_string(),
+    }
 }
 
 /// 校验密码（供前端登录确认，公开）。
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
     Json(req): Json<PwReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // 这是全项目唯一能看出「有人在猜管理密码」的地方，不带来源等于记了个寂寞。
+    let ip = client_ip(&headers, peer);
     match admin_hash(&state) {
-        None => Err((StatusCode::BAD_REQUEST, "尚未设置管理密码".into())),
+        None => Err((StatusCode::BAD_REQUEST, "no admin password has been set yet".into())),
         Some(h) if sha256_hex(req.password.trim()) == h => {
-            tracing::info!("管理登录成功");
+            tracing::info!(%ip, "admin login succeeded");
             Ok(ok_json())
         }
         _ => {
-            tracing::warn!("管理登录失败：密码错误");
-            Err((StatusCode::UNAUTHORIZED, "密码错误".into()))
+            tracing::warn!(%ip, "admin login failed: wrong password");
+            Err((StatusCode::UNAUTHORIZED, "wrong password".into()))
         }
     }
 }
@@ -102,35 +130,48 @@ pub async fn login(
 /// 首次设置密码（仅未配置时，公开）。
 pub async fn setup(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
     Json(req): Json<PwReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if admin_hash(&state).is_some() {
-        return Err((StatusCode::BAD_REQUEST, "已设置管理密码".into()));
+        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
     }
     let pw = req.password.trim();
     if pw.len() < 4 {
-        return Err((StatusCode::BAD_REQUEST, "密码至少 4 位".into()));
+        return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
     }
     state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
+    // 这个接口在未设密码时是**公开**的，谁先访问到谁就把密码定下来——比任何一项设置变更
+    // 都更该留痕，而其它设置变更全都记了（见 web 里那几条「…变更」）。
+    tracing::info!(ip = %client_ip(&headers, peer), "admin password set for the first time");
     Ok(ok_json())
 }
 
 /// 修改/清除密码（已鉴权；环境接管时禁止）。空串=清除。
 pub async fn change_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
     Json(req): Json<PwReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if state.admin_env.is_some() {
-        return Err((StatusCode::BAD_REQUEST, "管理密码由环境变量接管，无法在网页修改".into()));
+        return Err((StatusCode::BAD_REQUEST, "the admin password is managed by an environment variable and cannot be changed from the web UI".into()));
     }
     let pw = req.password.trim();
-    if pw.is_empty() {
+    let cleared = pw.is_empty();
+    if cleared {
         state.store.delete_setting(store::ADMIN_PASSWORD).map_err(internal)?;
     } else {
         if pw.len() < 4 {
-            return Err((StatusCode::BAD_REQUEST, "密码至少 4 位".into()));
+            return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
         }
         state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
     }
+    tracing::info!(
+        ip = %client_ip(&headers, peer),
+        cleared,
+        "admin password changed"
+    );
     Ok(ok_json())
 }

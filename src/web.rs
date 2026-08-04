@@ -80,7 +80,7 @@ pub fn upstream_client() -> Result<wreq::Client> {
         .user_agent(config::CC_USER_AGENT)
         .default_headers(defaults)
         .build()
-        .context("构造上游 HTTP 客户端失败")
+        .context("failed to build the upstream HTTP client")
 }
 
 /// 启动网页服务 + 转发代理，绑定 `host:port`，可选自动打开浏览器。
@@ -113,8 +113,8 @@ pub async fn run(
                 tick.tick().await;
                 let store = store.clone();
                 match tokio::task::spawn_blocking(move || store.prune_usage_logs()).await {
-                    Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "已裁剪过期用量日志"),
-                    Ok(Err(e)) => tracing::warn!(error = %e, "裁剪用量日志失败"),
+                    Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "pruned expired usage logs"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to prune usage logs"),
                     _ => {}
                 }
             }
@@ -158,7 +158,9 @@ pub async fn run(
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
-    let api = public.merge(protected);
+    // 失败的请求补一行「哪个方法打了哪条路径、回了几」。错误详情由 `internal`/`bad_request`
+    // 各自记，方法与路径它们看不到，只能在这一层补——两行合起来才定位得到一次失败。
+    let api = public.merge(protected).layer(middleware::from_fn(log_api_failures));
 
     // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
     let app = Router::new()
@@ -177,30 +179,32 @@ pub async fn run(
     let bind = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("绑定 {} 失败（端口可能被占用）", bind))?;
+        .with_context(|| format!("failed to bind {} (the port may be in use)", bind))?;
 
     let shown = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
     let url = format!("http://{shown}:{port}/");
     let base = url.trim_end_matches('/');
 
-    tracing::info!(addr = %bind, url = %url, "luban 已启动");
+    tracing::info!(addr = %bind, url = %url, "luban started");
     match &client_key {
         Some(_) => tracing::info!(
-            "Claude Code 接入：ANTHROPIC_BASE_URL={base}，ANTHROPIC_AUTH_TOKEN=<--api-key>"
+            "Claude Code setup: ANTHROPIC_BASE_URL={base}, ANTHROPIC_AUTH_TOKEN=<--api-key>"
         ),
         None => tracing::info!(
-            "Claude Code 接入：ANTHROPIC_BASE_URL={base}（未设 --api-key，代理不校验来访，请仅本机使用）"
+            "Claude Code setup: ANTHROPIC_BASE_URL={base} (no --api-key set, the proxy does not authenticate callers -- keep it local-only)"
         ),
     }
     if open_browser {
         open_in_browser(&url);
-        tracing::info!("已尝试打开浏览器；若未弹出请手动访问 {url}");
+        tracing::info!(url = %url, "tried to open the browser; if nothing appeared, open the url manually");
     }
 
-    axum::serve(listener, app)
+    // `into_make_service_with_connect_info` 而不是直接交 `app`：登录失败要记来源，
+    // 而对端地址只有这里能拿到（见 [`auth::client_ip`]）。
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("web 服务异常退出")?;
+        .context("the web server exited unexpectedly")?;
     Ok(())
 }
 
@@ -213,13 +217,13 @@ async fn shutdown_signal() {
     use tokio::signal;
 
     let ctrl_c = async {
-        signal::ctrl_c().await.expect("安装 Ctrl-C 处理器失败");
+        signal::ctrl_c().await.expect("failed to install the Ctrl-C handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("安装 SIGTERM 处理器失败")
+            .expect("failed to install the SIGTERM handler")
             .recv()
             .await;
     };
@@ -232,7 +236,7 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    tracing::info!("收到关闭信号，正在优雅关闭 ...");
+    tracing::info!("shutdown signal received, shutting down gracefully ...");
 }
 
 // ---------- 授权 ----------
@@ -296,7 +300,7 @@ async fn exchange(
     // 那个」，否则并发登录会互相顶掉（见 [`AppState::pkce`]）。取出即移除：一次挑战只能用一次。
     let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
     let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
-        .ok_or_else(|| bad_request("这次登录已过期或未找到，请重新点「添加账号」生成授权链接"))?;
+        .ok_or_else(|| bad_request("this login attempt expired or was not found; click 'Add account' again to generate a new authorization link"))?;
 
     // exchange_code 内部会再比一次 state。冗余是有意的：这里是「按 state 找挑战」，那里是
     // 「确认挑战与粘贴内容配套」，万一将来查找逻辑改错了，那道校验还在。
@@ -304,8 +308,15 @@ async fn exchange(
         .await
         .map_err(|e| bad_request(e.to_string()))?;
 
-    // 拉取账号 profile 拿邮箱/姓名/等级（失败不阻断，用兜底）。
-    let profile = oauth::fetch_profile(&state.http, &tokens.access_token).await.unwrap_or_default();
+    // 拉取账号 profile 拿邮箱/姓名/等级（失败不阻断，用兜底）。不阻断不等于不留痕：
+    // 悄悄吞掉的话，账号加进来标签是「账号 N」、等级空着，看不出是 profile 没拉到。
+    let profile = match oauth::fetch_profile(&state.http, &tokens.access_token).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "add credential: fetching the account profile failed, falling back for label and tier");
+            oauth::Profile::default()
+        }
+    };
 
     // 显示名优先级：用户填写 > profile 邮箱 > profile 姓名 > 交换响应邮箱 > 「账号 N」。
     let label = match req.label.map(|s| s.trim().to_string()) {
@@ -317,7 +328,7 @@ async fn exchange(
             .or_else(|| tokens.account.clone())
             .unwrap_or_else(|| {
                 let n = state.store.list().map(|v| v.len()).unwrap_or(0) + 1;
-                format!("账号 {}", n)
+                format!("Account {}", n)
             }),
     };
 
@@ -334,7 +345,7 @@ async fn exchange(
         .map_err(internal)?;
 
     // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。
-    tracing::info!(id = cred.id, label = %cred.label, tier = ?cred.tier, "新增凭证");
+    tracing::info!(cred_id = cred.id, cred = %cred.label, tier = ?cred.tier, "credential added");
     Ok(Json(CredentialView::new(&cred, 0, state.store.default_device_limit())))
 }
 
@@ -416,9 +427,12 @@ async fn unbind_credential_device(
         return Err(not_found());
     }
     if !state.store.unbind_device(id, &device_id).map_err(internal)? {
-        return Err((StatusCode::NOT_FOUND, "设备绑定不存在（可能已过期或已换到其它账号）".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "device binding not found (it may have expired or moved to another credential)".into(),
+        ));
     }
-    tracing::info!(cred_id = id, device_id = %device_id, "手动解除设备绑定");
+    tracing::info!(cred_id = id, device_id = %device_id, "device binding removed manually");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -431,7 +445,7 @@ async fn delete_credential(
     if !removed {
         return Err(not_found());
     }
-    tracing::info!(id, "删除凭证");
+    tracing::info!(cred_id = id, "credential deleted");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -484,7 +498,7 @@ async fn set_priorities(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let n = state.store.set_priorities(&req.ids, req.priority).map_err(internal)?;
-    tracing::info!(count = n, priority = req.priority, "批量设置优先级");
+    tracing::info!(count = n, priority = req.priority, "priority set in bulk");
     list_credentials(State(state)).await
 }
 
@@ -497,7 +511,7 @@ struct IdsReq {
 /// 校验批量入参并返回 id 列表；空列表视为客户端错误而非静默 no-op。
 fn check_ids(ids: &[i64]) -> Result<(), ApiError> {
     if ids.is_empty() {
-        return Err(bad_request("请至少选择一个账号"));
+        return Err(bad_request("select at least one credential"));
     }
     Ok(())
 }
@@ -518,7 +532,7 @@ async fn set_device_limits(
     // 负值统一收敛为 -1，与单账号接口保持一致。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
     let n = state.store.set_device_limits(&req.ids, limit).map_err(internal)?;
-    tracing::info!(count = n, device_limit = limit, "批量设置设备上限");
+    tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
     list_credentials(State(state)).await
 }
 
@@ -535,7 +549,7 @@ async fn set_disabled_many(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let n = state.store.set_disabled_many(&req.ids, req.disabled).map_err(internal)?;
-    tracing::info!(count = n, disabled = req.disabled, "批量启停");
+    tracing::info!(count = n, disabled = req.disabled, "enabled/disabled in bulk");
     list_credentials(State(state)).await
 }
 
@@ -548,7 +562,7 @@ async fn delete_credentials(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let n = state.store.delete_many(&req.ids).map_err(internal)?;
-    tracing::info!(count = n, "批量删除凭证");
+    tracing::info!(count = n, "credentials deleted in bulk");
     list_credentials(State(state)).await
 }
 
@@ -565,7 +579,7 @@ async fn set_label(
 ) -> Result<Json<CredentialView>, ApiError> {
     let label = req.label.trim();
     if label.is_empty() {
-        return Err(bad_request("名称不能为空"));
+        return Err(bad_request("the name must not be empty"));
     }
     if !state.store.set_label(id, label).map_err(internal)? {
         return Err(not_found());
@@ -606,13 +620,23 @@ async fn refresh_credential(
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
         .map_err(internal)?;
-    // 顺带刷新账号等级、回填账号 UUID（失败忽略，不影响 token 刷新结果）。
-    if let Ok(profile) = oauth::fetch_profile(&state.http, &tokens.access_token).await {
-        if profile.tier.is_some() {
-            let _ = state.store.set_tier(id, profile.tier.as_deref());
+    // 顺带刷新账号等级、回填账号 UUID（失败忽略，不影响 token 刷新结果）。忽略归忽略，
+    // 三处失败都留一行——否则「刷新成功了但等级还是旧的」在日志里毫无痕迹。
+    match oauth::fetch_profile(&state.http, &tokens.access_token).await {
+        Ok(profile) => {
+            if profile.tier.is_some()
+                && let Err(e) = state.store.set_tier(id, profile.tier.as_deref())
+            {
+                tracing::warn!(cred_id = id, error = %e, "failed to write back the account tier (the refresh itself succeeded)");
+            }
+            if let Some(uuid) = profile.account_uuid.as_deref()
+                && let Err(e) = state.store.set_account_uuid(id, uuid)
+            {
+                tracing::warn!(cred_id = id, error = %e, "failed to backfill the account uuid (the refresh itself succeeded)");
+            }
         }
-        if let Some(uuid) = profile.account_uuid.as_deref() {
-            let _ = state.store.set_account_uuid(id, uuid);
+        Err(e) => {
+            tracing::warn!(cred_id = id, error = %e, "fetching the profile after refresh failed, tier and uuid left unchanged");
         }
     }
     view_of(&state, id)
@@ -640,7 +664,7 @@ async fn test_credential(
 ) -> Result<Json<proxy::ProbeReport>, ApiError> {
     let model = req.model.trim();
     if model.is_empty() {
-        return Err(bad_request("请填写要测试的模型名"));
+        return Err(bad_request("specify the model name to test"));
     }
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(proxy::probe(&state, &cred, model).await))
@@ -814,7 +838,9 @@ async fn set_api_key(
     Json(req): Json<SetApiKeyReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     if state.client_key.is_some() {
-        return Err(bad_request("接入 Key 已由环境变量 LUBAN_API_KEY 接管，无法在网页修改"));
+        return Err(bad_request(
+            "the inbound key is managed by the LUBAN_API_KEY environment variable and cannot be changed from the web UI",
+        ));
     }
     let key = req.api_key.trim();
     if key.is_empty() {
@@ -887,7 +913,7 @@ async fn set_bare_rate_limit(
             .set_setting(crate::store::BARE_RATE_WINDOW_SECS, &window.to_string())
             .map_err(internal)?;
     }
-    tracing::info!(limit, window = ?req.bare_rate_window_secs, "裸请求速率上限变更");
+    tracing::info!(limit, window = ?req.bare_rate_window_secs, "bare-request rate limit changed");
     Ok(Json(settings_resp(&state)))
 }
 
@@ -907,7 +933,7 @@ async fn set_rate_limit_retry_max(
         .store
         .set_setting(crate::store::RATE_LIMIT_RETRY_MAX, &n.to_string())
         .map_err(internal)?;
-    tracing::info!(retry_max = n, "上游 429 换号重试次数变更");
+    tracing::info!(retry_max = n, "upstream-429 credential-swap retry cap changed");
     Ok(Json(settings_resp(&state)))
 }
 
@@ -925,7 +951,7 @@ async fn set_require_device_id(
 ) -> Result<Json<SettingsResp>, ApiError> {
     let value = if req.required { "true" } else { "false" };
     state.store.set_setting(crate::store::REQUIRE_DEVICE_ID, value).map_err(internal)?;
-    tracing::info!(required = req.required, "设备身份校验开关变更");
+    tracing::info!(required = req.required, "device identity check toggled");
     Ok(Json(settings_resp(&state)))
 }
 
@@ -977,7 +1003,7 @@ async fn set_forwarding(
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
-        tracing::info!(key, enabled = value, "转发形态开关变更");
+        tracing::info!(key, enabled = value, "forwarding shape toggle changed");
     }
     Ok(Json(settings_resp(&state)))
 }
@@ -1104,14 +1130,51 @@ fn mask_token(token: &str) -> String {
     if prefix.is_empty() { format!("…{}", tail) } else { format!("{}-…{}", prefix, tail) }
 }
 
+// 错误详情在这两个构造器里记，而不是让每个 handler 自己写一行：管理接口的失败此前**只**
+// 回给客户端、服务端一行不留，出了 500 在日志里根本查不到。方法与路径由
+// [`log_api_failures`] 那层补，两边合起来才是完整的一次失败。
+//
+// 没用 `#[track_caller]` 带出调用位置：这两个函数大量以 `.map_err(internal)` 的函数指针形式
+// 传递，reify 出的 shim 不透传 caller location，记出来的位置是错的，不如不记。
 fn bad_request(msg: impl Into<String>) -> ApiError {
-    (StatusCode::BAD_REQUEST, msg.into())
+    let msg = msg.into();
+    tracing::warn!(reason = %msg, "admin api rejected the request");
+    (StatusCode::BAD_REQUEST, msg)
 }
 fn not_found() -> ApiError {
-    (StatusCode::NOT_FOUND, "凭证不存在".into())
+    (StatusCode::NOT_FOUND, "credential not found".into())
+}
+
+/// `/api/*` 失败响应的兜底日志：方法、路径、状态码。
+///
+/// 挂在鉴权中间件**外面**，所以 `require_admin` 直接回的 401 也会被记下——那是唯一能看出
+/// 有人在猜管理密码的地方。成功的请求不记：管理接口的成功变更各自已有 `info!`，全记只是噪音。
+///
+/// 路径取 `OriginalUri` 而非 `uri()`：这一层在 `nest("/api", ..)` **里面**，`uri()` 已被剥掉
+/// `/api` 前缀，直接记会得到 `/auth/login` 这种对不上真实请求的路径。
+async fn log_api_failures(
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.path().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if status.is_server_error() {
+        tracing::error!(%method, %path, status = status.as_u16(), "admin api failed");
+    } else if status.is_client_error() {
+        tracing::warn!(%method, %path, status = status.as_u16(), "admin api failed");
+    }
+    resp
 }
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    let msg = e.to_string();
+    tracing::error!(error = %msg, "admin api internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
 /// 尽力打开系统默认浏览器；失败静默忽略（页面地址已打印）。

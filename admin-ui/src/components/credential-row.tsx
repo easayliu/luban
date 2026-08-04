@@ -51,7 +51,9 @@ import { Switch } from '@/components/ui/switch'
 import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
-import { cn, formatClockTime, formatFullTime, formatUsd, relativeTime } from '@/lib/utils'
+import {
+  cn, displayCredentialLabel, formatClockTime, formatFullTime, formatUsd, relativeTime,
+} from '@/lib/utils'
 
 const COL = {
   select: 'w-10',
@@ -173,6 +175,7 @@ export function CredentialRow({
   const actions = useCredentialActions(cred)
   const evaluation = evaluateCredential(cred, now, language)
   const { quota } = evaluation
+  const credentialLabel = displayCredentialLabel(cred.label, language)
   const u5h = quota.h5.utilization
   const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
@@ -190,12 +193,12 @@ export function CredentialRow({
                   checked={selected}
                   onCheckedChange={(checked) => onSelectedChange?.(checked)}
                   className="mt-2"
-                  aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
+                  aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                 />
               )}
               <div className="min-w-0 flex-1">
-                <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={cred.label}>
-                  {cred.label}
+                <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
+                  {credentialLabel}
                 </h3>
                 <p
                   className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground"
@@ -263,7 +266,7 @@ export function CredentialRow({
                   variant="ghost"
                   onClick={() => setDevicesOpen(true)}
                   title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
-                  aria-label={t(`查看 ${cred.label} 的已绑定设备`, `View bound devices for ${cred.label}`)}
+                  aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
                 >
                   <span className="tabular-nums">{cred.device_count}/{effectiveLimit} · {policy.label}</span>
                 </Button>
@@ -279,15 +282,15 @@ export function CredentialRow({
             <Checkbox
               checked={selected}
               onCheckedChange={(checked) => onSelectedChange?.(checked)}
-              aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
+              aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
             />
           )}
         </TableCell>
         <TableCell className={cn(COL.account, 'whitespace-nowrap')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              <span className="block min-w-0 whitespace-nowrap font-semibold text-sm leading-snug" title={cred.label}>
-                {cred.label}
+              <span className="block min-w-0 whitespace-nowrap font-semibold text-sm leading-snug" title={credentialLabel}>
+                {credentialLabel}
               </span>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
@@ -414,12 +417,13 @@ function CredentialRowActionsMenu({
   onTest: () => void
   onRequestDelete: () => void
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
+  const credentialLabel = displayCredentialLabel(cred.label, language)
   return (
     <Menu modal={false}>
       <MenuTrigger
         className={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
-        aria-label={t(`打开 ${cred.label} 操作菜单`, `Open actions for ${cred.label}`)}
+        aria-label={t(`打开 ${credentialLabel} 操作菜单`, `Open actions for ${credentialLabel}`)}
         title={t('账号操作', 'Account actions')}
       >
         <EllipsisIcon />
@@ -519,6 +523,7 @@ function ScheduleControl({
 }) {
   const { language } = useI18n()
   const { toggle } = actions
+  const credentialLabel = displayCredentialLabel(cred.label, language)
 
   return (
     <div className="flex shrink-0 flex-col items-end gap-3 xl:flex-row xl:items-center xl:gap-2">
@@ -529,7 +534,7 @@ function ScheduleControl({
           onCheckedChange={(enabled) => toggle.mutate(!enabled)}
           disabled={toggle.isPending}
           title={switchTitle(cred, language)}
-          aria-label={`${cred.label}: ${switchTitle(cred, language)}`}
+          aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
         />
       </div>
       <Tooltip>

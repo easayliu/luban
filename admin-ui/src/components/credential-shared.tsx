@@ -10,7 +10,9 @@ import {
   setDisabled, setLabel, setPriority,
   type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
-import { cn, extractError, formatClockTime, formatFullTime } from '@/lib/utils'
+import {
+  cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime, localizeBackendMessage,
+} from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -299,7 +301,8 @@ function statusFromQuota(
   if (cred.ban_reason) {
     return {
       kind: 'banned', variant: 'error',
-      label: localize(language, '已封禁', 'Banned'), detail: cred.ban_reason,
+      label: localize(language, '已封禁', 'Banned'),
+      detail: localizeBackendMessage(cred.ban_reason, language),
       attention: true, rank: 7,
     }
   }
@@ -419,6 +422,22 @@ export function modelCooldownSummary(cred: Credential, language: Language): stri
         : localize(language, `${model} 还有 ${secs} 秒`, `${model} in ${secs}s`),
     )
     .join(localize(language, '、', ', '))
+}
+
+/** 上游整体额度判决的稳定枚举；未知新值原样保留，避免误译。 */
+export function unifiedQuotaStatusLabel(status: string, language: Language): string {
+  switch (status) {
+    case 'allowed':
+      return localize(language, '已放行', 'Allowed')
+    case 'allowed_warning':
+      return localize(language, '已放行（预警）', 'Allowed with warning')
+    case 'rejected':
+      return localize(language, '已拒绝', 'Rejected')
+    case 'rate_limited':
+      return localize(language, '已限流', 'Rate limited')
+    default:
+      return status
+  }
 }
 
 /** 兼容卡片与紧凑列表：返回仍属于当前窗口的原始使用率。 */
@@ -705,7 +724,8 @@ export function DeleteCredentialDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
+  const credentialLabel = displayCredentialLabel(cred.label, language)
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogPopup>
@@ -713,7 +733,7 @@ export function DeleteCredentialDialog({
           <AlertDialogTitle>{t('删除账号', 'Delete account')}</AlertDialogTitle>
           <AlertDialogDescription>
             {t('删除', 'Deleting ')}
-            {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>{t('」后，', '" will ')}
+            {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{credentialLabel}</span>{t('」后，', '" will ')}
             {t('历史用量与设备绑定将一并清除，且无法恢复。', 'permanently remove its usage history and device bindings. This cannot be undone.')}
           </AlertDialogDescription>
         </AlertDialogHeader>
@@ -782,6 +802,7 @@ export function ConnectivityTestDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t, language } = useI18n()
+  const credentialLabel = displayCredentialLabel(cred.label, language)
   const qc = useQueryClient()
   const [model, setModel] = useState<string>(PROBE_MODELS[0])
   const [entries, setEntries] = useState<ProbeEntry[]>([])
@@ -858,7 +879,7 @@ export function ConnectivityTestDialog({
           <DialogTitle>{t('连通性测试', 'Connectivity test')}</DialogTitle>
           <DialogDescription>
             {t('使用「', 'Send a minimal request through "')}
-            <span className="font-medium text-foreground [overflow-wrap:anywhere]">{cred.label}</span>
+            <span className="font-medium text-foreground [overflow-wrap:anywhere]">{credentialLabel}</span>
             {t('」发送一条最小请求，验证所选模型是否可用。', '" to verify that the selected model is available.')}
           </DialogDescription>
         </DialogHeader>
@@ -935,7 +956,7 @@ export function ConnectivityTestDialog({
 
 /** 一条测试结果：成败徽章 + 模型名 + 状态码/耗时，失败时附上游错误原文。 */
 function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const { model, result } = entry
   const Icon = result.ok ? CircleCheckIcon : CircleXIcon
   return (
@@ -963,7 +984,7 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
               {result.error_type && (
                 <span className="mr-1 text-destructive-foreground">{result.error_type}</span>
               )}
-              {result.error}
+              {localizeBackendMessage(result.error, language)}
             </p>
           )}
           {result.quota && <ProbeQuotaLine quota={result.quota} />}
@@ -1040,7 +1061,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       {quota.unified_status && quota.unified_status !== 'allowed' && (
         <span
           className={cn(
-            quota.unified_status === 'rejected'
+            quota.unified_status === 'rejected' || quota.unified_status === 'rate_limited'
               ? 'text-destructive-foreground'
               : 'text-warning-foreground',
           )}
@@ -1053,7 +1074,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
               : t('上游整体额度状态', 'Overall upstream quota status')
           }
         >
-          {quota.unified_status}
+          {unifiedQuotaStatusLabel(quota.unified_status, language)}
         </span>
       )}
     </div>
@@ -1168,7 +1189,7 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
     return {
       text: localize(language, '已封禁', 'Banned'),
       className: 'font-medium text-destructive-foreground',
-      title: cred.ban_reason,
+      title: localizeBackendMessage(cred.ban_reason, language),
     }
   }
   if (cred.disabled) {
@@ -1200,10 +1221,11 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
 export function switchTitle(cred: Credential, language: Language = 'zh-CN'): string {
   if (cred.disabled) return localize(language, '已停用（点击启用）', 'Disabled (click to enable)')
   if (cred.ban_reason) {
+    const reason = localizeBackendMessage(cred.ban_reason, language)
     return localize(
       language,
-      `${cred.ban_reason} · 点击可手动停用`,
-      `${cred.ban_reason} · Click to disable manually`,
+      `${reason} · 点击可手动停用`,
+      `${reason} · Click to disable manually`,
     )
   }
   return localize(language, '已启用（点击停用）', 'Enabled (click to disable)')

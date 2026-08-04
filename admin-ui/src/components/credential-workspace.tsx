@@ -58,9 +58,9 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/c
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Language } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
-import { cn, extractError } from '@/lib/utils'
+import { cn, displayCredentialLabel, extractError } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -178,10 +178,11 @@ function useNowSeconds(): number {
   return now
 }
 
-function matchQuery(credential: Credential, query: string): boolean {
+function matchQuery(credential: Credential, query: string, language: Language): boolean {
   const value = query.trim().toLowerCase()
   if (!value) return true
   return credential.label.toLowerCase().includes(value)
+    || displayCredentialLabel(credential.label, language).toLowerCase().includes(value)
     || `#${credential.id}`.includes(value)
     || String(credential.id) === value
 }
@@ -275,7 +276,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return sortCreds(
       evaluatedPool
         .filter((evaluation) => (
-          match(evaluation) && matchQuery(evaluation.credential, debouncedQuery)
+          match(evaluation) && matchQuery(evaluation.credential, debouncedQuery, language)
         ))
         .map((evaluation) => evaluation.credential),
       sort,

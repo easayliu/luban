@@ -32,8 +32,8 @@ pub async fn handle(
     if let Some(expected) = effective_client_key(&state)
         && !client_authorized(&headers, &expected)
     {
-        tracing::warn!(%method, path = %path_and_query, "拒绝：无效的接入 API Key");
-        return (StatusCode::UNAUTHORIZED, "无效的 API Key").into_response();
+        tracing::warn!(%method, path = %path_and_query, "rejected: invalid inbound API key");
+        return (StatusCode::UNAUTHORIZED, "invalid API key").into_response();
     }
 
     // 2) 请求体只解析这一次，下面五项判定全从这份结果上读。
@@ -64,11 +64,11 @@ pub async fn handle(
     //      网页可关掉该校验（放行裸客户端），此时它们退化为不绑定、不占名额的负载均衡挑选。
     if device_id.is_none() {
         if billable && state.store.require_device_id() {
-            tracing::warn!(%method, path = %path_and_query, "拒绝：请求无有效设备身份（metadata.user_id 缺失或格式无法识别）");
-            return (StatusCode::FORBIDDEN, "缺少有效的设备身份（metadata.user_id）")
+            tracing::warn!(%method, path = %path_and_query, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
+            return (StatusCode::FORBIDDEN, "missing a usable device identity (metadata.user_id)")
                 .into_response();
         }
-        tracing::debug!(%method, path = %path_and_query, billable, "放行无设备身份的请求");
+        tracing::debug!(%method, path = %path_and_query, billable, "allowing a request with no device identity");
     }
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
@@ -93,7 +93,7 @@ pub async fn handle(
     {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(%method, path = %path_and_query, error = %e, "拒绝转发");
+            tracing::warn!(%method, path = %path_and_query, error = %e, "refusing to forward");
             // 两类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
             // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；所有号都在上游 429
             // 冷却中（硬门禁）取最早解冻的那个的剩余时间。
@@ -142,7 +142,7 @@ pub async fn handle(
             os = %h("x-stainless-os"),
             runtime = %h("x-stainless-runtime"),
             pkg = %h("x-stainless-package-version"),
-            "客户端识别头"
+            "client identification headers"
         );
     }
     // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
@@ -210,12 +210,12 @@ pub async fn handle(
         let scope = rate_limit_scope(&info, req_model.as_deref());
         let cooldown = info.cooldown(scope.account_level());
         tracing::warn!(
-            cred = format!("#{} {}", cred.id, cred.label),
+            cred_id = cred.id, cred = %cred.label,
             model = %req_model.as_deref().unwrap_or("-"),
             scope = scope.label(),
             cooldown_secs = cooldown.as_secs(),
             ratelimit = %info.raw,
-            "上游 429"
+            "upstream 429"
         );
 
         // 冷却与重试同受一个开关：关掉即完全退回「原样透传 429」的既有行为。
@@ -226,9 +226,9 @@ pub async fn handle(
         tried.push(cred.id);
         if retried >= max_retry {
             tracing::warn!(
-                cred = format!("#{} {}", cred.id, cred.label),
+                cred_id = cred.id, cred = %cred.label,
                 retried,
-                "上游 429，已达换号重试次数上限，透传该响应"
+                "upstream 429, credential-swap retry cap reached, passing the response through"
             );
             break (upstream, resp);
         }
@@ -244,11 +244,13 @@ pub async fn handle(
         {
             Ok((next_token, next_cred)) => {
                 tracing::warn!(
-                    from = format!("#{} {}", cred.id, cred.label),
-                    to = format!("#{} {}", next_cred.id, next_cred.label),
+                    cred_id = cred.id,
+                    cred = %cred.label,
+                    to_cred_id = next_cred.id,
+                    to_cred = %next_cred.label,
                     cooldown_secs = cooldown.as_secs(),
                     attempt = retried + 1,
-                    "上游 429：该号已进入冷却，改用其它账号重试"
+                    "upstream 429: credential put on cooldown, retrying with another one"
                 );
                 (token, cred) = (next_token, next_cred);
                 retried += 1;
@@ -256,9 +258,9 @@ pub async fn handle(
             // 没有别的号可用（都试过/都停用了）：保留最初那条 429 原样透传，别把它变成 503。
             Err(e) => {
                 tracing::warn!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     error = %e,
-                    "上游 429，但没有可换的账号，原样透传"
+                    "upstream 429 but no credential to swap to, passing through as is"
                 );
                 break (upstream, resp);
             }
@@ -297,7 +299,7 @@ pub async fn handle(
                 tracing::warn!(
                     status = status.as_u16(),
                     encoding = %enc,
-                    "上游响应带无法解码的 content-encoding：用量嗅探与账号级错误判定都会被跳过（该编码需在 wreq feature 里开启）"
+                    "upstream response uses an undecodable content-encoding: usage sniffing and account-level error detection are both skipped (that encoding must be enabled in wreq's features)"
                 );
             }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
@@ -339,11 +341,11 @@ pub async fn handle(
                         if !compressed {
                             let (etype, message) = parse_upstream_error(&bytes);
                             tracing::warn!(
-                                cred = format!("#{} {}", cred.id, cred.label),
+                                cred_id = cred.id, cred = %cred.label,
                                 status = status.as_u16(),
                                 error_type = %etype.as_deref().unwrap_or("-"),
                                 message = %message.chars().take(500).collect::<String>(),
-                                "上游返回 4xx"
+                                "upstream returned 4xx"
                             );
                         }
                         // 压缩体读不出内容，宁可漏判也不误判（乱码可能碰巧命中特征词）。
@@ -351,13 +353,13 @@ pub async fn handle(
                             (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
                         {
                             tracing::warn!(
-                                cred = format!("#{} {}", cred.id, cred.label),
+                                cred_id = cred.id, cred = %cred.label,
                                 status = status.as_u16(),
                                 reason = %reason,
-                                "检测到账号级错误，自动停用该凭证"
+                                "account-level error detected, auto-disabling the credential"
                             );
                             if let Err(e) = state.store.mark_banned(cred.id, &reason) {
-                                tracing::warn!(error = %e, "自动停用凭证失败");
+                                tracing::warn!(error = %e, "failed to auto-disable the credential");
                             }
                         }
                         // 「thinking 块签名无效」：这条会话的历史是**别的账号**签发的（设备
@@ -371,8 +373,8 @@ pub async fn handle(
                         {
                             if !flags.thinking_signature_retry {
                                 tracing::warn!(
-                                    cred = format!("#{} {}", cred.id, cred.label),
-                                    "上游拒绝 thinking 块签名（会话历史多半由其它账号签发），降级重试开关已关闭，原样透传"
+                                    cred_id = cred.id, cred = %cred.label,
+                                    "upstream rejected a thinking-block signature (the history was most likely signed by another credential); demote-and-retry is off, passing through as is"
                                 );
                             } else if let Some(up) =
                                 retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl)
@@ -386,7 +388,7 @@ pub async fn handle(
                         })
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "读取上游错误响应体失败");
+                        tracing::warn!(error = %e, "failed to read the upstream error body");
                         builder.body(Body::empty()).unwrap_or_else(|e| {
                             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
                         })
@@ -405,9 +407,10 @@ pub async fn handle(
                 path = %path_and_query,
                 kind,
                 error = %detail,
-                "上游请求失败"
+                "upstream request failed"
             );
-            (StatusCode::BAD_GATEWAY, format!("上游请求失败[{kind}]: {detail}")).into_response()
+            (StatusCode::BAD_GATEWAY, format!("upstream request failed [{kind}]: {detail}"))
+                .into_response()
         }
     }
 }
@@ -544,23 +547,24 @@ async fn retry_demoted_thinking(
     client_body: &Bytes,
     rl: &mut ReqLog,
 ) -> Option<wreq::Response> {
-    let label = format!("#{} {}", cred.id, cred.label);
     let Some(demoted) = demote_thinking_blocks(client_body) else {
         tracing::warn!(
-            cred = %label,
-            "上游拒绝 thinking 块签名，但请求体里没有可降级的 thinking 块，原样透传"
+            cred_id = cred.id,
+            cred = %cred.label,
+            "upstream rejected a thinking-block signature, but the body has no thinking block to demote, passing through as is"
         );
         return None;
     };
     tracing::warn!(
-        cred = %label,
-        "上游拒绝 thinking 块签名（会话历史多半由其它账号签发）：已把历史 thinking 降级为 text，用同一凭证重试一次"
+        cred_id = cred.id,
+        cred = %cred.label,
+        "upstream rejected a thinking-block signature (the history was most likely signed by another credential): demoted historical thinking to text, retrying once with the same credential"
     );
 
     let up = match upstream.send(upstream.shape(&demoted, cred, device_fp)).await {
         Ok(up) => up,
         Err(e) => {
-            tracing::warn!(error = %error_chain(&e), "降级 thinking 后的重试请求发不出去，透传最初那条 400");
+            tracing::warn!(error = %error_chain(&e), "the retry after demoting thinking could not be sent, passing the original 400 through");
             return None;
         }
     };
@@ -569,9 +573,10 @@ async fn retry_demoted_thinking(
         // 最常见的是末轮为 `tool_result` 的工具续跑：上游另外要求「最后一条 assistant
         // 消息必须以 thinking 块开头」，降级完照样被拒，只是换了条错误信息。
         tracing::warn!(
-            cred = %label,
+            cred_id = cred.id,
+            cred = %cred.label,
             status = status.as_u16(),
-            "降级 thinking 后重试仍被拒，透传最初那条 400"
+            "the retry after demoting thinking was rejected too, passing the original 400 through"
         );
         return None;
     }
@@ -754,7 +759,7 @@ impl Drop for ReqLog {
         tracing::info!(
             method = %self.method,
             path = %self.path,
-            cred = format!("#{} {}", self.cred_id, self.cred_label),
+            cred_id = self.cred_id, cred = %self.cred_label,
             device = %device_short,
             status = self.status,
             model = %model.as_deref().unwrap_or("-"),
@@ -767,7 +772,7 @@ impl Drop for ReqLog {
             ttft_ms = self.ttft_ms.map(|v| v as u64).unwrap_or(0),
             total_ms,
             cost_usd = cost_usd.map(|c| format!("{c:.5}")).unwrap_or_else(|| "-".into()),
-            "转发"
+            "forwarded"
         );
 
         let rec = store::UsageRecord {
@@ -816,7 +821,7 @@ impl Drop for ReqLog {
 fn spawn_usage_log(store: std::sync::Arc<store::CredentialStore>, rec: store::UsageRecord) {
     let write = move || {
         if let Err(e) = store.insert_usage_log(&rec) {
-            tracing::warn!(error = %e, "写入用量日志失败");
+            tracing::warn!(error = %e, "failed to write the usage log");
         }
     };
     match tokio::runtime::Handle::try_current() {
@@ -1215,7 +1220,9 @@ fn build_forward_headers(
                 out.insert("anthropic-beta", v);
             }
             // merge_beta 只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
-            Err(e) => tracing::warn!(error = %e, "构造 anthropic-beta 失败，保留来访原值"),
+            Err(e) => {
+                tracing::warn!(error = %e, "building anthropic-beta failed, keeping the inbound value")
+            }
         }
     }
     if flags.fill_client_headers {
@@ -1241,7 +1248,7 @@ fn build_forward_headers(
         // 这个头现在是**照常转发再覆盖**的，覆盖失败就必须摘掉：
         // 留在原地等于把来访者的接入 key 漏给上游。
         Err(e) => {
-            tracing::error!(error = %e, "构造 Authorization 失败，移除该头避免泄漏接入 key");
+            tracing::error!(error = %e, "building Authorization failed, dropping the header so the inbound key cannot leak");
             out.remove(header::AUTHORIZATION);
         }
     }
@@ -1268,7 +1275,10 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
                 out.insert(n, v);
             }
             // 常量表，理论上不可达；真写错了也只是少一个头，不该因此拒掉整条请求。
-            _ => tracing::error!(header = name, "模拟头构造失败（常量表写错了），跳过该头"),
+            _ => tracing::error!(
+                header = name,
+                "building a simulated header failed (bad constant table), skipping it"
+            ),
         }
     }
     // 与 `metadata.user_id` 里的 session_id 同值——官方两处逐字相同。
@@ -1386,7 +1396,7 @@ impl Simulation {
         tracing::debug!(
             model,
             base_bytes = base.map(str::len).unwrap_or(0),
-            "非 CC 请求，按官方形态模拟"
+            "non-CC request, simulating the official shape"
         );
         Some(Self { base, beta, session_id: session_id_for(cred, device_fp) })
     }
@@ -1817,8 +1827,8 @@ fn rewrite_body(
     // 时 body 还是三块，这时补 ttl 就是把半对齐换了个方向，比不补更糟。
     let ttl_filled = cache.ttl_1h && (simulated || shaped) && fill_cache_ttl(&mut v);
     tracing::debug!(
-        metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<无 metadata>".into()),
-        "入站 metadata"
+        metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<none>".into()),
+        "inbound metadata"
     );
     let sim_meta = flags.spoof_identity
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
@@ -1836,7 +1846,7 @@ fn rewrite_body(
         ttl_filled,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
-        "改写 body"
+        "rewrote body"
     );
     if !shaped
         && !capped
@@ -2434,19 +2444,22 @@ fn park_rate_limited(
 ) {
     let Some(model) = scope.model() else {
         let resume_at = crate::credentials::now_secs() + cooldown.as_secs();
-        let reason = format!("上游限流：账号额度耗尽，约 {} 后自动恢复调度", human_secs(cooldown));
+        let reason = format!(
+            "upstream rate limit: account quota exhausted, scheduling resumes automatically in about {}",
+            human_secs(cooldown)
+        );
         match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
             Ok(_) => tracing::warn!(
-                cred = format!("#{} {}", cred.id, cred.label),
+                cred_id = cred.id, cred = %cred.label,
                 resume_at,
-                "账号级限流：已移出调度池，到点自动恢复（也可在控制台手动启用或做一次连通性测试）"
+                "account-level rate limit: taken out of the pool, resumes automatically when it expires (or enable it manually / run a connectivity test from the console)"
             ),
             // 落库失败不该把这条请求也搭进去：至少退回进程内冷却，本进程内仍不会再选它。
             Err(e) => {
                 tracing::error!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     error = %e,
-                    "限流停用写库失败，退回进程内冷却"
+                    "persisting the rate-limit pause failed, falling back to an in-process cooldown"
                 );
                 store.mark_rate_limited(cred.id, None, cooldown);
             }
@@ -2456,20 +2469,20 @@ fn park_rate_limited(
     store.mark_rate_limited(cred.id, Some(model), cooldown);
 }
 
-/// 把秒数写成人话（`3 小时 12 分钟` / `45 分钟` / `30 秒`），写进 `ban_reason` 给人看。
+/// 把秒数写成人话（`3h 12m` / `45m` / `30s`），写进 `ban_reason` 给人看。
 ///
-/// 只保留两级、且不做四舍五入：这行字是给人快速判断「还要等多久」的，`2 天 3 小时` 足够，
+/// 只保留两级、且不做四舍五入：这行字是给人快速判断「还要等多久」的，`2d 3h` 足够，
 /// 精确到秒反而更难读。真要精确时刻的话，`resume_at` 是原样落库的，前端自己格式化即可。
 fn human_secs(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     let (days, hours, mins) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
     match (days, hours, mins) {
-        (0, 0, 0) => format!("{secs} 秒"),
-        (0, 0, m) => format!("{m} 分钟"),
-        (0, h, 0) => format!("{h} 小时"),
-        (0, h, m) => format!("{h} 小时 {m} 分钟"),
-        (d, 0, _) => format!("{d} 天"),
-        (d, h, _) => format!("{d} 天 {h} 小时"),
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d {h}h"),
     }
 }
 
@@ -2923,39 +2936,39 @@ pub async fn probe(
             Ok(Ok(Ok(t))) => t,
             Ok(Ok(Err(e))) => {
                 tracing::warn!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     model,
                     error = %e,
-                    "连通性测试：取 access_token 失败"
+                    "connectivity test: getting an access_token failed"
                 );
                 return ProbeReport::failed(
                     started.elapsed().as_millis(),
-                    format!("取 token 失败：{e}"),
+                    format!("failed to get a token: {e}"),
                 );
             }
             Ok(Err(e)) => {
                 tracing::error!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     model,
                     error = %e,
-                    "连通性测试：token 刷新任务异常退出"
+                    "connectivity test: the token refresh task died"
                 );
                 return ProbeReport::failed(
                     started.elapsed().as_millis(),
-                    format!("token 刷新任务异常退出：{e}"),
+                    format!("the token refresh task died: {e}"),
                 );
             }
             Err(_) => {
                 tracing::warn!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     model,
                     timeout_secs = PROBE_TIMEOUT.as_secs(),
-                    "连通性测试：取 access_token 超时，刷新任务将在后台继续"
+                    "connectivity test: getting an access_token timed out, the refresh task continues in the background"
                 );
                 return ProbeReport::failed(
                     started.elapsed().as_millis(),
                     format!(
-                        "连通性测试超时（总上限 {} 秒）：token 刷新仍在后台完成",
+                        "connectivity test timed out (overall cap {}s): the token refresh continues in the background",
                         PROBE_TIMEOUT.as_secs()
                     ),
                 );
@@ -2999,11 +3012,14 @@ pub async fn probe(
     let report = match tokio::time::timeout_at(deadline, sent).await {
         Err(_) => ProbeReport::failed(
             started.elapsed().as_millis(),
-            format!("连通性测试超时（总上限 {} 秒）：等待上游响应未完成", PROBE_TIMEOUT.as_secs()),
+            format!(
+                "connectivity test timed out (overall cap {}s): still waiting on the upstream response",
+                PROBE_TIMEOUT.as_secs()
+            ),
         ),
         Ok(Err(e)) => ProbeReport::failed(
             started.elapsed().as_millis(),
-            format!("上游请求失败[{}]: {}", upstream_error_kind(&e), error_chain(&e)),
+            format!("upstream request failed [{}]: {}", upstream_error_kind(&e), error_chain(&e)),
         ),
         Ok(Ok(up)) => {
             let status = up.status();
@@ -3025,12 +3041,12 @@ pub async fn probe(
                 let scope = rate_limit_scope(&info, Some(model));
                 let cooldown = info.cooldown(scope.account_level());
                 tracing::warn!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     model,
                     scope = scope.label(),
                     cooldown_secs = cooldown.as_secs(),
                     ratelimit = %info.raw,
-                    "连通性测试遇上游 429，该号移出调度池"
+                    "connectivity test hit an upstream 429, taking the credential out of the pool"
                 );
                 park_rate_limited(&state.store, cred, &scope, cooldown);
             } else if status.is_success() {
@@ -3042,15 +3058,15 @@ pub async fn probe(
                 // 冷却，清账号格 + 被测模型那一格，其它模型不动——sonnet 通了证明不了 fable 通。
                 match state.store.resume_if_rate_limited(cred.id) {
                     Ok(true) => tracing::info!(
-                        cred = format!("#{} {}", cred.id, cred.label),
+                        cred_id = cred.id, cred = %cred.label,
                         model,
-                        "连通性测试通过，该号已重新进入调度池"
+                        "connectivity test passed, credential is back in the pool"
                     ),
                     Ok(false) => {}
                     Err(e) => tracing::error!(
-                        cred = format!("#{} {}", cred.id, cred.label),
+                        cred_id = cred.id, cred = %cred.label,
                         error = %e,
-                        "连通性测试通过但恢复调度写库失败"
+                        "connectivity test passed but persisting the resume failed"
                     ),
                 }
                 state.store.clear_rate_limited(cred.id, Some(model));
@@ -3074,7 +3090,7 @@ pub async fn probe(
                         model: None,
                         error_type: None,
                         error: Some(format!(
-                            "读取上游响应体超时（总上限 {} 秒）",
+                            "reading the upstream response body timed out (overall cap {}s)",
                             PROBE_TIMEOUT.as_secs()
                         )),
                         quota,
@@ -3098,7 +3114,7 @@ pub async fn probe(
                         latency_ms: started.elapsed().as_millis(),
                         model: None,
                         error_type: None,
-                        error: Some(format!("读取上游响应体失败：{e}")),
+                        error: Some(format!("failed to read the upstream response body: {e}")),
                         quota,
                     }
                 }
@@ -3111,13 +3127,13 @@ pub async fn probe(
                         (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
                     {
                         tracing::warn!(
-                            cred = format!("#{} {}", cred.id, cred.label),
+                            cred_id = cred.id, cred = %cred.label,
                             status = status.as_u16(),
                             reason = %reason,
-                            "连通性测试检测到账号级错误，自动停用该凭证"
+                            "connectivity test detected an account-level error, auto-disabling the credential"
                         );
                         if let Err(e) = state.store.mark_banned(cred.id, &reason) {
-                            tracing::warn!(error = %e, "自动停用凭证失败");
+                            tracing::warn!(error = %e, "failed to auto-disable the credential");
                         }
                     }
                     probe_report(status, &bytes, started.elapsed().as_millis(), quota)
@@ -3127,14 +3143,14 @@ pub async fn probe(
     };
 
     tracing::info!(
-        cred = format!("#{} {}", cred.id, cred.label),
+        cred_id = cred.id, cred = %cred.label,
         model,
         ok = report.ok,
         status = report.status,
         latency_ms = report.latency_ms,
         error = %report.error.as_deref().unwrap_or("-"),
         ratelimit = %ratelimit_raw,
-        "连通性测试"
+        "connectivity test"
     );
     report
 }
@@ -5352,7 +5368,7 @@ mod tests {
         let resume_at = after.resume_at.expect("应写下自动恢复时刻");
         let wait = resume_at as i64 - crate::credentials::now_secs() as i64;
         assert!((3595..=3600).contains(&wait), "恢复时刻应取上游给的等待时间，实得 {wait}");
-        assert!(after.ban_reason.unwrap().contains("1 小时"), "停用原因该写清楚还要等多久");
+        assert!(after.ban_reason.unwrap().contains("1h"), "停用原因该写清楚还要等多久");
     }
 
     /// 冷却睡到**上游返回的那个重置时刻**，不是写死的 5 小时/7 天：没有 `retry-after` 时，

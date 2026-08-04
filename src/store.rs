@@ -49,7 +49,7 @@ pub struct DeviceLimitReached;
 
 impl std::fmt::Display for DeviceLimitReached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "所有凭证的设备数均已达上限，暂无可用名额")
+        write!(f, "all credentials have reached their device limits; no slot is available")
     }
 }
 
@@ -67,7 +67,11 @@ pub struct BareRateLimited {
 
 impl std::fmt::Display for BareRateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "所有凭证的裸请求速率均已达上限，请 {} 秒后重试", self.retry_after_secs)
+        write!(
+            f,
+            "all credentials have reached the bare-request rate limit; retry in {} seconds",
+            self.retry_after_secs
+        )
     }
 }
 
@@ -91,7 +95,11 @@ pub struct AllRateLimited {
 
 impl std::fmt::Display for AllRateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "所有凭证均处于上游限流冷却中，请 {} 秒后重试", self.retry_after_secs)
+        write!(
+            f,
+            "all credentials are cooling down after upstream rate limits; retry in {} seconds",
+            self.retry_after_secs
+        )
     }
 }
 
@@ -286,7 +294,9 @@ impl CredentialStore {
     pub fn db_path() -> Result<PathBuf> {
         let base = match std::env::var_os("LUBAN_HOME") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::home_dir().context("无法定位用户主目录")?.join(".luban"),
+            None => dirs::home_dir()
+                .context("could not determine the user home directory")?
+                .join(".luban"),
         };
         Ok(base.join("luban.db"))
     }
@@ -296,10 +306,10 @@ impl CredentialStore {
         let path = Self::db_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
         }
         let conn = Connection::open(&path)
-            .with_context(|| format!("打开凭证库失败: {}", path.display()))?;
+            .with_context(|| format!("failed to open credential database: {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -356,10 +366,10 @@ impl CredentialStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![label, tier, access_token, refresh_token, expires_at as i64, account_uuid],
         )
-        .context("插入凭证失败（refresh_token 可能已存在）")?;
+        .context("failed to insert credential (the refresh_token may already exist)")?;
         let id = conn.last_insert_rowid();
         conn.query_row(&format!("SELECT {COLS} FROM credentials WHERE id = ?1"), [id], row_to_cred)
-            .context("读取新插入凭证失败")
+            .context("failed to read the newly inserted credential")
     }
 
     /// 列出全部凭证，按 (priority, id) 升序。
@@ -1847,7 +1857,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (device_id, cred_id)
         ) STRICT, WITHOUT ROWID;",
     )
-    .context("初始化凭证库 schema 失败")?;
+    .context("failed to initialize credential database schema")?;
 
     // 兼容旧 usage_logs：逐列幂等新增（已存在则忽略 duplicate column）。
     for col in [
@@ -1948,7 +1958,7 @@ fn backfill_ledger(conn: &Connection) -> Result<()> {
     )?;
     tx.commit()?;
     if n > 0 {
-        tracing::info!(credentials = n, "已从既有用量日志回填账本");
+        tracing::info!(credentials = n, "ledger backfilled from existing usage logs");
     }
     Ok(())
 }
@@ -1967,23 +1977,27 @@ fn purge_orphan_rows(conn: &Connection) -> Result<()> {
               WHERE cred_id IS NOT NULL AND cred_id NOT IN (SELECT id FROM credentials)",
             [],
         )
-        .context("清理无主用量日志失败")?;
+        .context("failed to purge orphaned usage logs")?;
     let binds = conn
         .execute(
             "DELETE FROM device_bindings WHERE cred_id NOT IN (SELECT id FROM credentials)",
             [],
         )
-        .context("清理无主设备绑定失败")?;
+        .context("failed to purge orphaned device bindings")?;
     // 账本同口径清扫（新表初次上线时是 no-op）。
     conn.execute(
         "DELETE FROM credential_stats WHERE cred_id NOT IN (SELECT id FROM credentials)",
         [],
     )
-    .context("清理无主账本失败")?;
+    .context("failed to purge orphaned credential ledger entries")?;
     conn.execute("DELETE FROM device_costs WHERE cred_id NOT IN (SELECT id FROM credentials)", [])
-        .context("清理无主设备费用失败")?;
+        .context("failed to purge orphaned device cost entries")?;
     if logs > 0 || binds > 0 {
-        tracing::info!(usage_logs = logs, device_bindings = binds, "已清理被删账号遗留的历史数据");
+        tracing::info!(
+            usage_logs = logs,
+            device_bindings = binds,
+            "cleaned up history left behind by deleted credentials"
+        );
     }
     Ok(())
 }
@@ -2031,7 +2045,7 @@ fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
              ON credentials(priority, id);
          COMMIT;",
     )
-    .context("迁移 credentials 为 AUTOINCREMENT 失败")?;
+    .context("failed to migrate credentials to AUTOINCREMENT")?;
     Ok(())
 }
 
@@ -2146,13 +2160,15 @@ impl CredentialStore {
                 let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
                 return Err(AllRateLimited { retry_after_secs }.into());
             }
-            anyhow::bail!("没有可用凭证，请先登录");
+            anyhow::bail!("no available credentials; add an account first");
         }
 
         // 本次请求已经试过的号（上游 429 换号重试时传进来）直接出局——重试再撞同一个号毫无意义。
         let pool: Vec<Credential> = all.into_iter().filter(|c| !exclude.contains(&c.id)).collect();
         if pool.is_empty() {
-            anyhow::bail!("已试过的凭证之外没有其它可用账号");
+            anyhow::bail!(
+                "no other available credentials remain after excluding those already tried"
+            );
         }
         // 冷却中的号让位给还能用的；**全部都在冷却就直接拒**——冷却是硬门禁，被上游 429 过的
         // 号在解冻前一律不调度。等待时间取最早解冻的那个，客户端照它重试即可。
@@ -2310,12 +2326,12 @@ pub async fn access_token_of(
         TokenAttempt::Ready(token) => Ok(token),
         TokenAttempt::Revoked(reason) => {
             tracing::warn!(
-                cred = format!("#{} {}", cred.id, cred.label),
+                cred_id = cred.id, cred = %cred.label,
                 reason = %reason,
-                "refresh_token 已被上游作废，停用该凭证"
+                "refresh_token revoked upstream, disabling the credential"
             );
             if let Err(e) = store.mark_banned(cred.id, &reason) {
-                tracing::warn!(error = %e, "自动停用凭证失败");
+                tracing::warn!(error = %e, "failed to auto-disable the credential");
             }
             anyhow::bail!("{reason}")
         }
@@ -2351,20 +2367,25 @@ async fn select_with_refresh_failover<'a>(
             TokenAttempt::Ready(token) => return Ok((token, cred)),
             TokenAttempt::Revoked(reason) => {
                 tracing::warn!(
-                    cred = format!("#{} {}", cred.id, cred.label),
+                    cred_id = cred.id, cred = %cred.label,
                     round,
                     reason = %reason,
-                    "refresh_token 已被上游作废，停用该凭证并改选其它账号"
+                    "refresh_token revoked upstream, disabling the credential and selecting another"
                 );
                 // 停用没生效就必须中止：否则下一轮还会选中同一个号，白转满 MAX_REFRESH_FAILOVER 圈。
                 if !store.mark_banned(cred.id, &reason)? {
-                    anyhow::bail!("凭证 #{} 刷新失败且停用未生效：{reason}", cred.id);
+                    anyhow::bail!(
+                        "credential #{} refresh failed and could not be disabled: {reason}",
+                        cred.id
+                    );
                 }
             }
         }
     }
 
-    anyhow::bail!("连续 {MAX_REFRESH_FAILOVER} 个凭证刷新失败，暂无可用账号")
+    anyhow::bail!(
+        "all {MAX_REFRESH_FAILOVER} credential refresh attempts failed; no credentials are available"
+    )
 }
 
 /// 取该凭证的可用 access_token，未进入刷新窗口就直接复用，否则刷新并回写。
@@ -2386,11 +2407,14 @@ async fn ensure_fresh_token(
     // 双重检查：等锁期间可能已被其它请求刷新过。
     let cred = store.get(cred.id)?.unwrap_or_else(|| cred.clone());
     if !cred.needs_refresh() {
-        tracing::debug!(id = cred.id, "等锁期间该凭证已被刷新，复用新 token");
+        tracing::debug!(
+            cred_id = cred.id,
+            "credential was refreshed while waiting for the lock, reusing the new token"
+        );
         return Ok(TokenAttempt::Ready(cred.access_token));
     }
 
-    tracing::info!(id = cred.id, label = %cred.label, "凭证进入刷新窗口，刷新 token");
+    tracing::info!(cred_id = cred.id, cred = %cred.label, "credential entered the refresh window, refreshing token");
     let err = match crate::oauth::refresh(http, &cred.refresh_token).await {
         Ok(tokens) => {
             store.update_tokens(
@@ -2406,7 +2430,7 @@ async fn ensure_fresh_token(
 
     // 无论是否判定为永久失效，都把失败原文打出来：这个端点的失败响应形态我们没有实测样本，
     // 线上真出现一次就能据此收紧 `is_grant_revoked`。
-    tracing::warn!(id = cred.id, label = %cred.label, error = %err, "刷新 token 失败");
+    tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %err, "token refresh failed");
     match err.downcast_ref::<crate::oauth::TokenEndpointError>() {
         Some(te) if te.is_grant_revoked() => Ok(TokenAttempt::Revoked(te.ban_reason())),
         // 网络抖动 / 5xx / 限流 / 非 invalid_grant 的 4xx：凭证本身可能是好的，不停用。
@@ -3534,7 +3558,10 @@ mod tests {
         .unwrap_err();
 
         // 号用完后是 select_for_device 先报「没有可用凭证」，而不是转满 MAX_REFRESH_FAILOVER 圈。
-        assert!(e.to_string().contains("没有可用凭证"), "错误信息应指向根因: {e}");
+        assert!(
+            e.to_string().contains("no available credentials"),
+            "error message should identify the root cause: {e}"
+        );
         assert_eq!(*tried.borrow(), ids, "每个号都应被试过一次，且只试一次");
         assert!(store.list().unwrap().iter().all(|c| c.disabled));
     }

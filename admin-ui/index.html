@@ -8,6 +8,19 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <!-- 字体已自托管，由 src/index.css 导入并打进 dist/assets/，不再外连 Google Fonts。 -->
     <title>luban · 授权代理</title>
+    <script>
+      // React 挂载前先还原已保存的语言，避免英文用户首帧读到中文标题与 lang。
+      (() => {
+        try {
+          const language = localStorage.getItem('luban.language')
+          if (language !== 'en' && language !== 'en-US') return
+          document.documentElement.lang = 'en'
+          document.title = 'luban · Authorization Proxy'
+        } catch {
+          // localStorage 不可用时沿用 HTML 中的中文默认值。
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -64,7 +64,7 @@ fn serve_index() -> Response<Body> {
             .expect("build response"),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from("前端尚未构建。请在 admin-ui 目录执行 `pnpm build`。"))
+            .body(Body::from("Frontend not built yet. Run `pnpm build` in the admin-ui directory."))
             .expect("build response"),
     }
 }

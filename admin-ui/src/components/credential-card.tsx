@@ -14,6 +14,7 @@ import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
   cn,
+  displayCredentialLabel,
   formatClockTime,
   formatFullTime,
   formatUsd,
@@ -29,6 +30,7 @@ import {
   quotaPercentage,
   switchTitle,
   tierBadgeVariant,
+  unifiedQuotaStatusLabel,
   useCredentialActions,
   type CredentialStatusMeta,
   type QuotaFreshness,
@@ -85,7 +87,8 @@ export function CredentialCard({
   const { rename, toggle, limit } = actions
   const evaluation = evaluateCredential(cred, now, language)
   const { quota, status } = evaluation
-  const initial = cred.label.trim().charAt(0).toUpperCase() || '?'
+  const credentialLabel = displayCredentialLabel(cred.label, language)
+  const initial = credentialLabel.trim().charAt(0).toUpperCase() || '?'
   // 只渲染上游真报过的窗口。卡片是弹性布局，没有的那个直接不占位；表格那边列宽固定，
   // 摘不掉，所以改成显式的「无此窗口」，见 credential-row 的 ListQuotaMeter。
   const has5h = quota.h5.reported
@@ -160,7 +163,7 @@ export function CredentialCard({
           <CardTitle className="min-w-0 text-sm leading-snug">
             {editing ? (
               <>
-                <h3 id={titleId} className="sr-only">{cred.label}</h3>
+                <h3 id={titleId} className="sr-only">{credentialLabel}</h3>
                 <Form
                   className="flex items-center gap-2"
                   onSubmit={(event) => {
@@ -205,7 +208,7 @@ export function CredentialCard({
                   <Checkbox
                     checked={selected}
                     onCheckedChange={(checked) => onSelectedChange?.(checked)}
-                    aria-label={t(`选择 ${cred.label}`, `Select ${cred.label}`)}
+                    aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                   />
                 )}
                 <Avatar className="hidden @sm/card:flex" aria-hidden="true">
@@ -215,9 +218,9 @@ export function CredentialCard({
                   <h3
                     id={titleId}
                     className="block min-w-0 truncate whitespace-nowrap leading-snug"
-                    title={cred.label}
+                    title={credentialLabel}
                   >
-                    {cred.label}
+                    {credentialLabel}
                   </h3>
                   <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
@@ -243,7 +246,7 @@ export function CredentialCard({
               <Menu modal={false}>
                 <MenuTrigger
                   className={buttonVariants({ size: 'icon', variant: 'ghost' })}
-                  aria-label={t(`打开 ${cred.label} 菜单`, `Open menu for ${cred.label}`)}
+                  aria-label={t(`打开 ${credentialLabel} 菜单`, `Open menu for ${credentialLabel}`)}
                 >
                   <EllipsisIcon />
                 </MenuTrigger>
@@ -267,7 +270,7 @@ export function CredentialCard({
           <div className="flex flex-wrap items-center gap-2">
             <Badge
               variant={status.variant}
-              aria-label={t(`${cred.label}：${status.label}`, `${cred.label}: ${status.label}`)}
+              aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
               aria-describedby={status.attention ? statusDetailId : undefined}
             >
               {status.label}
@@ -280,7 +283,7 @@ export function CredentialCard({
 
           {status.attention && <AttentionSummary id={statusDetailId} status={status} />}
 
-          <section aria-label={t(`${cred.label} 的额度使用`, `Quota usage for ${cred.label}`)} className="space-y-3">
+          <section aria-label={t(`${credentialLabel} 的额度使用`, `Quota usage for ${credentialLabel}`)} className="space-y-3">
             <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="font-medium text-sm">{t('额度使用', 'Quota usage')}</h4>
@@ -319,7 +322,7 @@ export function CredentialCard({
               >
                 {has5h && (
                   <QuotaMeter
-                    credentialLabel={cred.label}
+                    credentialLabel={credentialLabel}
                     label={t('5 小时', '5 hours')}
                     util={quota.h5.utilization}
                     freshness={quota.h5.freshness}
@@ -331,7 +334,7 @@ export function CredentialCard({
                 )}
                 {has7d && (
                   <QuotaMeter
-                    credentialLabel={cred.label}
+                    credentialLabel={credentialLabel}
                     label={t('7 天', '7 days')}
                     util={quota.d7.utilization}
                     freshness={quota.d7.freshness}
@@ -371,7 +374,7 @@ export function CredentialCard({
               className="w-fit max-w-full justify-start"
               onClick={() => setDevicesOpen(true)}
               title={t('查看已绑定设备', 'View bound devices')}
-              aria-label={t(`查看 ${cred.label} 的已绑定设备`, `View bound devices for ${cred.label}`)}
+              aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
               aria-haspopup="dialog"
             >
               <SmartphoneIcon />
@@ -390,7 +393,7 @@ export function CredentialCard({
               onCheckedChange={(enabled) => toggle.mutate(!enabled)}
               disabled={toggle.isPending}
               title={switchTitle(cred, language)}
-              aria-label={`${cred.label}: ${switchTitle(cred, language)}`}
+              aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
             />
           </div>
         </CardFooter>
@@ -579,25 +582,31 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
  * 但上游的判决与它的名字是在快照里的。缺了这行，那种账号在界面上就是「一切正常却在烧钱」。
  */
 function UpstreamVerdict({ quota }: { quota: NonNullable<Credential['quota']> }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const status = quota.unified_status
   if (!status || status === 'allowed') return null
-  const rejected = status === 'rejected'
+  const destructive = status === 'rejected' || status === 'rate_limited'
+  const verdictTitle = status === 'rate_limited'
+    ? t(
+        '上游正在限流该账号，请等待相关额度窗口恢复后再重试',
+        'The upstream is rate-limiting this account; retry after the related quota window recovers',
+      )
+    : t(
+        status === 'rejected'
+          ? '上游拒绝了这次请求：该账号至少有一个额度窗口已耗尽'
+          : '上游放行但已发出预警：该账号有额度窗口接近耗尽',
+        status === 'rejected'
+          ? 'The upstream rejected the request: at least one quota window for this account is exhausted'
+          : 'The upstream allowed the request but issued a warning: a quota window is close to exhaustion',
+      )
   return (
     <p className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
       <span>{t('上游判定', 'Upstream verdict')}</span>
       <span
-        className={cn('font-medium', rejected ? 'text-destructive-foreground' : 'text-warning-foreground')}
-        title={t(
-          rejected
-            ? '上游拒绝了这次请求：该账号至少有一个额度窗口已耗尽'
-            : '上游放行但已发出预警：该账号有额度窗口接近耗尽',
-          rejected
-            ? 'The upstream rejected the request: at least one quota window for this account is exhausted'
-            : 'The upstream allowed the request but issued a warning: a quota window is close to exhaustion',
-        )}
+        className={cn('font-medium', destructive ? 'text-destructive-foreground' : 'text-warning-foreground')}
+        title={verdictTitle}
       >
-        {status}
+        {unifiedQuotaStatusLabel(status, language)}
       </span>
       {quota.rl_representative && (
         <span

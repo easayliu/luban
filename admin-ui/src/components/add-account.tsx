@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
-import { copyText, extractError } from '@/lib/utils'
+import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -82,7 +82,7 @@ export function AddAccount({
     onSuccess: (cred) => {
       toastManager.add({
         title: t('已添加账号', 'Account added'),
-        description: cred.label,
+        description: displayCredentialLabel(cred.label, language),
         type: 'success',
       })
       qc.invalidateQueries({ queryKey: ['credentials'] })

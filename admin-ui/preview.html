@@ -12,7 +12,16 @@
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600;700&display=swap"
     />
-    <title>luban · 卡片预览</title>
+    <title>luban · 界面预览</title>
+    <script>
+      // 预览页的语言由 URL 固定，React 挂载前即可让 metadata 与 ?lang 保持一致。
+      (() => {
+        const language = new URLSearchParams(window.location.search).get('lang')
+        if (language !== 'en' && language !== 'en-US') return
+        document.documentElement.lang = 'en'
+        document.title = 'luban · UI Preview'
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

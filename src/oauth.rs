@@ -139,16 +139,18 @@ pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<
         .header("anthropic-version", "2023-06-01")
         .send()
         .await
-        .context("请求 profile 端点失败")?;
+        .context("request to the profile endpoint failed")?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("profile 端点返回 {}: {}", status, text);
+        bail!("profile endpoint returned {}: {}", status, text);
     }
 
-    let p: ProfileResponse =
-        serde_json::from_str(&text).with_context(|| format!("解析 profile 响应失败: {}", text))?;
+    // 刻意不把 `text` 拼进错误：这是 **2xx** 响应，里面是这个账号的邮箱姓名，而这条 error
+    // 会一路走到日志与后台页面。serde 的报错自带字段名与行列，定位足够了。
+    let p: ProfileResponse = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse the profile response ({} bytes)", text.len()))?;
 
     let tier = tier_from(
         p.account.as_ref().and_then(|a| a.has_claude_max),
@@ -226,7 +228,7 @@ pub async fn exchange_code(
 ) -> Result<TokenSet> {
     let (code, returned_state) = split_code_state(pasted)?;
     if returned_state != pkce.state {
-        bail!("state 不匹配，可能存在 CSRF 或粘贴错误；请重新登录");
+        bail!("state mismatch, possibly CSRF or a bad paste; please log in again");
     }
 
     let body = serde_json::json!({
@@ -253,7 +255,7 @@ pub struct TokenEndpointError {
 
 impl std::fmt::Display for TokenEndpointError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "token 端点返回 {}: {}", self.status, self.body)
+        write!(f, "token endpoint returned {}: {}", self.status, self.body)
     }
 }
 
@@ -297,8 +299,12 @@ pub async fn refresh(client: &wreq::Client, refresh_token: &str) -> Result<Token
 
 /// 向 token 端点 POST，并把响应转换为带过期时间戳的 `TokenSet`。
 async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<TokenSet> {
-    let resp =
-        client.post(config::TOKEN_URL).json(&body).send().await.context("请求 token 端点失败")?;
+    let resp = client
+        .post(config::TOKEN_URL)
+        .json(&body)
+        .send()
+        .await
+        .context("request to the token endpoint failed")?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -306,8 +312,12 @@ async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<To
         return Err(TokenEndpointError { status, body: text }.into());
     }
 
-    let token: TokenResponse =
-        serde_json::from_str(&text).with_context(|| format!("解析 token 响应失败: {}", text))?;
+    // **绝不**把 `text` 拼进错误：走到这里说明是 2xx，报文里就是 access_token/refresh_token
+    // 本身，而这条 error 会被 `valid_access_token_for_device` 打进日志、被 `/api/.../refresh`
+    // 原样返回给浏览器——那等于把凭证写进日志文件和 HTTP 响应。非 2xx 的响应体不含凭证，
+    // 由 `TokenEndpointError` 原样保留（见其文档）。serde 的报错自带字段名与行列，够定位了。
+    let token: TokenResponse = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse the token response ({} bytes)", text.len()))?;
 
     // 优先用账号邮箱作标识，取不到再用组织名。
     let account = token
@@ -337,7 +347,7 @@ fn split_code_state(pasted: &str) -> Result<(String, String)> {
         Some((code, state)) if !code.is_empty() && !state.is_empty() => {
             Ok((code.to_string(), state.to_string()))
         }
-        _ => bail!("粘贴内容格式应为 `code#state`"),
+        _ => bail!("the pasted value must look like `code#state`"),
     }
 }
 
