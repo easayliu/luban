@@ -1307,6 +1307,24 @@ pub struct UsageLog {
     pub cost_usd: Option<f64>,
 }
 
+/// [`CredentialStore::query_usage_logs`] 的入参。
+///
+/// **翻页用 `before_id` 而不是 OFFSET**：流水是只增的，翻页期间新请求会不断插到最前面，
+/// `LIMIT/OFFSET` 会因此把第二页整体往回错、重复吐出第一页尾部的记录。游标钉在 id 上就没有
+/// 这个问题——它同时也是排序键（自增，与 `ts` 同向且在同秒内仍严格有序，故不会像按 `ts`
+/// 翻页那样在同秒边界上漏记录）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageLogQuery {
+    /// 只看这个凭证的流水；`None` 为全部。
+    ///
+    /// 已删账号的记录 `cred_id` 为 NULL（见 `prune_orphan_usage_logs`），按号筛时自然落选。
+    pub cred_id: Option<i64>,
+    /// 只取 id 严格小于它的记录（翻下一页时传上一页最后一条的 id）；`None` 为从最新开始。
+    pub before_id: Option<i64>,
+    /// 最多返回条数。调用方负责收敛，这里不设默认上限。
+    pub limit: i64,
+}
+
 /// 上游报告的**一个**额度窗口。窗口名原样保留（`5h`/`7d`/`7d_oi`/`overage` …）。
 ///
 /// 存在的理由：快照原先只有 5h/7d 两组写死的列，而上游的窗口种类是它说了算的——实测里
@@ -1688,8 +1706,15 @@ impl CredentialStore {
         Ok(total)
     }
 
-    /// 最近的用量日志，按时间倒序，最多 `limit` 条。
+    /// 最近的用量日志，按时间倒序，最多 `limit` 条。测试用；线上那两条路径都带筛选，
+    /// 直接走 [`Self::query_usage_logs`]。
+    #[cfg(test)]
     pub fn list_usage_logs(&self, limit: i64) -> Result<Vec<UsageLog>> {
+        self.query_usage_logs(UsageLogQuery { limit, ..Default::default() })
+    }
+
+    /// 按条件查用量流水，恒按 `id` 倒序。见 [`UsageLogQuery`]。
+    pub fn query_usage_logs(&self, q: UsageLogQuery) -> Result<Vec<UsageLog>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, ts, cred_id, cred_label, device_id, model, path, status, has_usage,
@@ -1698,9 +1723,12 @@ impl CredentialStore {
                     unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                     rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
                     cost_usd, rl_overage_in_use
-               FROM usage_logs ORDER BY id DESC LIMIT ?1",
+               FROM usage_logs
+              WHERE (?1 IS NULL OR cred_id = ?1)
+                AND (?2 IS NULL OR id < ?2)
+              ORDER BY id DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map([limit], |r| {
+        let rows = stmt.query_map(params![q.cred_id, q.before_id, q.limit], |r| {
             Ok(UsageLog {
                 id: r.get(0)?,
                 ts: r.get(1)?,
@@ -3780,6 +3808,41 @@ mod tests {
         // 窗口统计只看还留着的流水：新流水 ts 在窗口起点之后，计入。
         assert_eq!(q.cost_5h, Some(1.0));
         assert_eq!(q.requests_5h, Some(1));
+    }
+
+    /// 请求明细的两项筛选：按账号只出该账号的记录，`before_id` 游标严格取更早的一页且不重叠。
+    #[test]
+    fn usage_logs_filter_by_credential_and_paginate() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        // a 四条、b 一条，交替写入，确保筛选不是靠「恰好连续」蒙对的。
+        for cred in [a, a, b, a, a] {
+            store
+                .insert_usage_log(&UsageRecord { cred_id: Some(cred), ..Default::default() })
+                .unwrap();
+        }
+
+        let all =
+            store.query_usage_logs(UsageLogQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 5, "不筛时是全部");
+
+        let q = |before| {
+            store
+                .query_usage_logs(UsageLogQuery { cred_id: Some(a), before_id: before, limit: 3 })
+                .unwrap()
+        };
+        let first = q(None);
+        assert_eq!(first.len(), 3);
+        assert!(first.iter().all(|l| l.cred_id == Some(a)), "b 的那条不该出现");
+        assert!(first.windows(2).all(|w| w[0].id > w[1].id), "按 id 倒序");
+
+        let second = q(Some(first[2].id));
+        assert_eq!(second.len(), 1, "a 共 4 条，第二页只剩 1 条");
+        assert!(second[0].id < first[2].id, "游标必须严格取更早的，不得与上一页重叠");
+        assert!(q(Some(second[0].id)).is_empty(), "翻到底为空");
     }
 
     /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，

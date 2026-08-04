@@ -142,6 +142,7 @@ pub async fn run(
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/devices", get(list_credential_devices))
+        .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
@@ -356,6 +357,9 @@ struct UsageQuery {
     /// 返回条数上限（默认 100，最多 1000）。
     #[serde(default)]
     limit: Option<i64>,
+    /// 翻页游标：只取 id 小于它的记录。理由见 [`store::UsageLogQuery::before_id`]。
+    #[serde(default)]
+    before: Option<i64>,
 }
 
 /// 列出最近的用量日志（按时间倒序）。
@@ -364,7 +368,33 @@ async fn list_usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let logs = state.store.list_usage_logs(limit).map_err(internal)?;
+    let logs = state
+        .store
+        .query_usage_logs(store::UsageLogQuery { cred_id: None, before_id: q.before, limit })
+        .map_err(internal)?;
+    Ok(Json(logs))
+}
+
+/// 列出某凭证的请求流水（按时间倒序，支持 `before` 游标翻页）。
+///
+/// 与卡片上那些聚合数的口径**不同**，这一点得记清楚：卡片的累计花费、设备请求数读的是
+/// 终身账本（`credential_stats` / `device_costs`），而流水只保留近期（见
+/// [`store::CredentialStore::prune_usage_logs`]）。于是「明细逐条加起来 < 卡片上的累计」
+/// 是正常的，不是哪一边算错了。
+async fn list_credential_usage(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
+    // 与设备明细同口径：凭证不存在给 404，免得前端把「账号已被删」显示成「没有请求」。
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let logs = state
+        .store
+        .query_usage_logs(store::UsageLogQuery { cred_id: Some(id), before_id: q.before, limit })
+        .map_err(internal)?;
     Ok(Json(logs))
 }
 

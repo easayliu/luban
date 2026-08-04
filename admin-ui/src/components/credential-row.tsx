@@ -8,6 +8,7 @@ import {
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
+import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
   CredentialMenuContent,
@@ -168,6 +169,7 @@ export function CredentialRow({
 }) {
   const { t, language } = useI18n()
   const [devicesOpen, setDevicesOpen] = useState(false)
+  const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameName, setRenameName] = useState(cred.label)
@@ -223,6 +225,7 @@ export function CredentialRow({
                     setRenameOpen(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
                 />
@@ -371,6 +374,7 @@ export function CredentialRow({
               setRenameOpen(true)
             }}
             onDeviceLimit={() => setDevicesOpen(true)}
+            onUsage={() => setUsageOpen(true)}
             onTest={() => setTesting(true)}
             onRequestDelete={() => setConfirmDelete(true)}
           />
@@ -383,6 +387,7 @@ export function CredentialRow({
         onOpenChange={setDevicesOpen}
         limit={actions.limit}
       />
+      <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
       <DeleteCredentialDialog
         cred={cred}
         actions={actions}
@@ -407,6 +412,7 @@ function CredentialRowActionsMenu({
   actions,
   onRename,
   onDeviceLimit,
+  onUsage,
   onTest,
   onRequestDelete,
 }: {
@@ -414,6 +420,7 @@ function CredentialRowActionsMenu({
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onUsage: () => void
   onTest: () => void
   onRequestDelete: () => void
 }) {
@@ -433,6 +440,7 @@ function CredentialRowActionsMenu({
         actions={actions}
         onRename={onRename}
         onDeviceLimit={onDeviceLimit}
+        onUsage={onUsage}
         onTest={onTest}
         onRequestDelete={onRequestDelete}
       />

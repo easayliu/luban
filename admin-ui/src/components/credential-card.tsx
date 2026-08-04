@@ -37,6 +37,7 @@ import {
   type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
+import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -80,6 +81,7 @@ export function CredentialCard({
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
   const [devicesOpen, setDevicesOpen] = useState(false)
+  const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
 
@@ -258,6 +260,7 @@ export function CredentialCard({
                     setEditing(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
                 />
@@ -404,6 +407,7 @@ export function CredentialCard({
           onOpenChange={setDevicesOpen}
           limit={limit}
         />
+        <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
         <DeleteCredentialDialog
           cred={cred}
           actions={actions}

@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  PencilIcon, RefreshCwIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
+  PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, probeCredential, refreshCredential, setDeviceLimit,
@@ -651,12 +651,13 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onTest, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onUsage, onTest, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onUsage: () => void
   onTest: () => void
   onRequestDelete: () => void
 }) {
@@ -686,6 +687,10 @@ export function CredentialMenuContent({
       <MenuItem onClick={onDeviceLimit}>
         <SmartphoneIcon />
         {t('设备上限', 'Device limit')}
+      </MenuItem>
+      <MenuItem onClick={onUsage}>
+        <ScrollTextIcon />
+        {t('请求明细', 'Request log')}
       </MenuItem>
       <MenuSeparator />
       <MenuItem

@@ -135,6 +135,40 @@ export interface DeviceBinding {
   cost_usd_all: number
 }
 
+/**
+ * 一条请求流水（`usage_logs` 的一行）。
+ *
+ * **与卡片上的累计值不同源**：卡片读的是终身账本，流水只保留近 30 天，所以明细逐条加起来
+ * 通常小于卡片上的累计花费——不是哪一边算错了。
+ */
+export interface UsageLog {
+  /** 自增主键，同时是排序键与翻页游标（见 listCredentialUsage 的 before）。 */
+  id: number
+  /** 请求完成时刻（Unix 秒）。 */
+  ts: number
+  cred_id: number | null
+  cred_label: string
+  /** 客户端 device_id；模拟客户端是 `sim:` 前缀的派生值，裸请求为 null。 */
+  device_id: string | null
+  /** 优先取响应回报的模型（可能与请求声明的不同），没有才用请求体里那个。 */
+  model: string | null
+  /** 来访原样的路径与查询串。 */
+  path: string
+  status: number
+  /** 响应里是否嗅探到 usage：为 false 时下面几个 token 数是缺失而非 0。 */
+  has_usage: boolean
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_creation_tokens: number | null
+  cache_read_tokens: number | null
+  /** 首字节耗时（毫秒）。 */
+  ttft_ms: number | null
+  /** 整条请求耗时（毫秒）。 */
+  total_ms: number | null
+  /** 按模型价目表估算的等价 API 费用（USD）；模型认不出时为 null。 */
+  cost_usd: number | null
+}
+
 /** 生成授权链接（后端暂存 PKCE）。 */
 export async function getAuthorizeUrl(): Promise<{ url: string }> {
   const { data } = await api.get<{ url: string }>('/authorize')
@@ -156,6 +190,20 @@ export async function listCredentials(): Promise<Credential[]> {
 /** 列出某账号当前绑定的设备（按最近活跃倒序）。 */
 export async function listCredentialDevices(id: number): Promise<DeviceBinding[]> {
   const { data } = await api.get<DeviceBinding[]>(`/credentials/${id}/devices`)
+  return data
+}
+
+/**
+ * 列出某账号的请求明细（按时间倒序）。
+ *
+ * `before` 是翻页游标，传上一页最后一条的 id 即取更早的一页。不用 offset：流水只增，
+ * 翻页期间新请求会插到最前面，offset 会让第二页整体错位、重复吐出第一页的尾巴。
+ */
+export async function listCredentialUsage(
+  id: number,
+  params: { limit?: number; before?: number } = {},
+): Promise<UsageLog[]> {
+  const { data } = await api.get<UsageLog[]>(`/credentials/${id}/usage`, { params })
   return data
 }
 
