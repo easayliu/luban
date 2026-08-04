@@ -154,6 +154,23 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="spoof_device_id"
+          label={t('改写设备标识', 'Rewrite device identifier')}
+          summary={t(
+            '请求自带设备标识时，换成当前账号派生的那个；关闭则原样沿用。',
+            'Replace a device identifier sent by the client with one derived from the current account; when disabled, pass it through unchanged.',
+          )}
+          requires={{ key: 'spoof_identity', label: t('身份一致性', 'Identity consistency') }}
+          description={
+            <>
+              {t(
+                '官方客户端的设备标识是「机器标识」，同一台机器用哪个账号都发同一个；官方在 API key 与订阅两种模式下发的也完全相同，两者真正的差别只在账号标识那一段。所以换掉它不是形态需要，而是一道防关联措施：开启后每个账号在同一台机器上各有各的设备标识，账号之间不会因共用一个标识而被关联；代价是「一台机器多个账号」这种真实用户里很常见的情形，在经由本代理的流量里一次都不会出现。关闭后与官方逐字节一致，但同机多账号可被上游关联。请求未携带设备标识时一律派生，不受本开关影响。',
+                'The official client’s device identifier is a machine identifier: the same machine sends the same value no matter which account is used, and it is identical in both API-key and subscription modes — the only real difference between those modes is the account identifier. Replacing it is therefore not a shape requirement but an unlinking measure. When enabled, each account gets its own device identifier on the same machine, so accounts cannot be linked through a shared value; the cost is that “one machine, several accounts” — common among real users — never appears in traffic through this proxy. When disabled, the value matches the official client byte for byte, but several accounts on one machine can be linked upstream. Requests that carry no device identifier always get a derived one, regardless of this toggle.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="billing_cch"
           label={t('订阅计费标识', 'Subscription billing identifier')}
           summary={t(

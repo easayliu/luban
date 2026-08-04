@@ -1795,6 +1795,10 @@ fn rewrite_body(
         Err(_) => return body.clone(),
     };
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, scope_global));
+    // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
+    // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
+    // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
+    let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, scope_global);
     // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
@@ -1806,7 +1810,8 @@ fn rewrite_body(
     );
     let sim_meta = flags.spoof_identity
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
-    let spoofed = flags.spoof_identity && spoof_identity(&mut v, cred, device_fp);
+    let spoofed =
+        flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
     tracing::debug!(
         simulated,
         sim_meta,
@@ -1814,11 +1819,12 @@ fn rewrite_body(
         capped,
         spoofed,
         cch_added,
+        ctx_mgmt,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "改写 body"
     );
-    if !shaped && !capped && !spoofed && !cch_added && !simulated && !sim_meta {
+    if !shaped && !capped && !spoofed && !cch_added && !simulated && !sim_meta && !ctx_mgmt {
         return body.clone();
     }
     match serde_json::to_vec(&v) {
@@ -1868,19 +1874,28 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
 /// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows）：换掉 device 段与
 ///   account 段，保留 session 段，仍以扁平串回写——不把 Windows 请求伪装成 CC 的 JSON 形态。
 ///
+/// `spoof_device` 关掉时**只换 account 段**，来访自带的 `device_id` 原样保留——依据与代价
+/// 见 [`store::ForwardFlags::spoof_device_id`]（一句话：抓包证明两种官方模式的 `device_id`
+/// 相同，换掉它是反关联策略而非形态要求）。account 段照换：那才是两种模式真正的差别。
+///
 /// 凭证无 `account_uuid`（如旧库未回填）或 user_id 结构无法识别时不改动，返回 `false`。
 fn spoof_identity(
     v: &mut serde_json::Value,
     cred: &crate::credentials::Credential,
     device_fp: &str,
+    spoof_device: bool,
 ) -> bool {
     let account_uuid = match cred.account_uuid.as_deref() {
         Some(u) if !u.trim().is_empty() => u,
         _ => return false,
     };
-    let device_id = match cred.spoof_device_id(device_fp) {
-        Some(d) => d,
-        None => return false,
+    // 关掉时不必派生，也就不该因为派生不出来而放弃改写 account 段。
+    let device_id = match spoof_device {
+        true => match cred.spoof_device_id(device_fp) {
+            Some(d) => Some(d),
+            None => return false,
+        },
+        false => None,
     };
     let user_id = match v.get_mut("metadata").and_then(|m| m.get_mut("user_id")) {
         Some(u) => u,
@@ -1905,7 +1920,9 @@ fn spoof_identity(
             s = next;
             changed = true;
         }
-        if let Some(next) = replace_json_str_field(&s, "device_id", &device_id) {
+        if let Some(d) = device_id.as_deref()
+            && let Some(next) = replace_json_str_field(&s, "device_id", d)
+        {
             s = next;
             changed = true;
         }
@@ -1916,9 +1933,10 @@ fn spoof_identity(
     }
 
     // 格式二：扁平串——保持格式，只换 device 与 account，保留 session。
+    // `spoof_device` 关掉时 device 段也一并保留，只换 account 段。
     if let Some(flat) = parse_flat_user_id(&inner_str) {
-        let rebuilt =
-            format!("user_{}_account_{}_session_{}", device_id, account_uuid, flat.session);
+        let device = device_id.as_deref().unwrap_or(&flat.device);
+        let rebuilt = format!("user_{}_account_{}_session_{}", device, account_uuid, flat.session);
         *user_id = serde_json::Value::String(rebuilt);
         return true;
     }
@@ -1976,6 +1994,45 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
         }
         None => false,
     }
+}
+
+/// 补上官方客户端恒发的 `context_management`，落在官方位置（`thinking` 之后、
+/// `output_config`/`stream` 之前）。已经有这个字段就原样不动，返回 `false`。
+///
+/// **依据**：`cap/raw` 八份抓包（四份直连、四份经 luban）的顶层 `context_management`
+/// **逐字节相同**——`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`，
+/// 四个模型族无一例外，连 haiku 那两份也一样。这与 `thinking`/`output_config` 那种逐族不同
+/// 的字段不是一类，不存在「补哪一份」的选择问题。
+///
+/// **为什么该补**：这个字段要 `context-management-2025-06-27` 认，而两份 seed
+/// （[`config::CC_BETA_SIMULATED`] 与 [`config::CC_BETA_SIMULATED_HAIKU`]）**都带着它**。
+/// 不补就是「头上声明了 context-management、体里零个 `edits`」——与
+/// [`ensure_beta_query`] 要消灭的那个组合同一个形状，只是落在体上。
+///
+/// `keep:"all"` 意为「一条都不清」，故补它不改变本次请求的语义，也不动计价：与
+/// `known_fingerprint_gaps` 第 7 条的 `fallbacks`（补上等于替用户决定换模型）正相反，
+/// 那条不补的理由在这里不成立。
+fn ensure_context_management(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
+    // 对客户端自带 `beta=` 的口径）。
+    if obj.contains_key("context_management") {
+        return false;
+    }
+    let value = serde_json::json!({
+        "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }]
+    });
+    // 官方顺序是 `… max_tokens, thinking, context_management, output_config, stream`。
+    // luban 不产出 `thinking`/`output_config`，故锚点取官方在它之前、我们又确实可能有的那些，
+    // [`insert_top_level`] 会落在其中最靠后的一个之后——客户端自带 `thinking` 时紧跟其后，
+    // 没有时退到 `max_tokens`/`metadata`，两种情形都排在 `stream` 之前。
+    insert_top_level(
+        v,
+        "context_management",
+        value,
+        &["thinking", "max_tokens", "metadata", "tools", "system", "messages", "model"],
+    );
+    true
 }
 
 /// `cch` 的取值。当前是常量 [`config::BILLING_CCH`]。
@@ -3229,6 +3286,7 @@ mod tests {
     fn all_flags_off_only_injects_auth() {
         let flags = store::ForwardFlags {
             spoof_identity: false,
+            spoof_device_id: false,
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
@@ -3724,6 +3782,7 @@ mod tests {
         let raw = Bytes::from(format!(" {}\n", API_SHAPE_BODY));
         let flags = store::ForwardFlags {
             spoof_identity: false,
+            spoof_device_id: false,
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
@@ -4172,12 +4231,13 @@ mod tests {
         // 缓存时长归客户端自己定，luban 一概不写 ttl（见 [`super::cache_control`]）。
         assert!(!s.contains(r#""ttl""#), "不该替客户端写 ttl: {s}");
 
-        // key 序按官方 `model → messages → system → tools → metadata → max_tokens` 落位，
-        // 补出来的两个字段不该被追加到队尾。
+        // key 序按官方 `model → messages → system → tools → metadata → max_tokens →
+        // context_management` 落位，补出来的几个字段不该被追加到队尾。本例没有 `thinking`/
+        // `output_config`/`stream`，故 `context_management` 正好收尾。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            vec!["model", "messages", "system", "metadata", "max_tokens"],
+            vec!["model", "messages", "system", "metadata", "max_tokens", "context_management"],
             "key 序: {s}"
         );
 
@@ -4204,6 +4264,55 @@ mod tests {
         let sys = v["system"].as_array().unwrap();
         assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
+    }
+
+    /// 模拟路径要补 `context_management`：`cap/raw` 八份抓包逐字节相同，而声明它的
+    /// `context-management-2025-06-27` 已在两份 seed 里，不补就是「头上声明了、体里没有」。
+    #[test]
+    fn simulated_body_carries_official_context_management() {
+        const OFFICIAL: &str =
+            r#""context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}"#;
+
+        let body = Bytes::from(PLAIN_BODY.to_string());
+        let sim = sim_for(PLAIN_BODY);
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert!(text.contains(OFFICIAL), "取值要与官方逐字节相同: {text}");
+
+        // 官方位置是 `output_config`/`stream` 之前、`system`/`metadata` 之后。
+        let at = text.find(OFFICIAL).unwrap();
+        assert!(at < text.find(r#""stream""#).unwrap(), "该排在 stream 之前: {text}");
+        assert!(at > text.find(r#""system""#).unwrap(), "该排在 system 之后: {text}");
+        assert!(at > text.find(r#""metadata""#).unwrap(), "该排在 metadata 之后: {text}");
+
+        // 头上那份声明确实在，否则补了体就是反向的自相矛盾。
+        assert!(sim.beta.contains("context-management-2025-06-27"), "seed 里该有对应的 beta");
+    }
+
+    /// 客户端自己带了 `context_management` 就一个字节都不动——那是它自己的编辑策略。
+    /// CC 形态的来访（非模拟路径）则根本不补。
+    #[test]
+    fn context_management_respects_client_and_skips_non_simulated() {
+        let mine = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":1024,"#,
+            r#""messages":[{"role":"user","content":"hi"}],"#,
+            r#""context_management":{"edits":[]},"stream":true}"#
+        );
+        let body = Bytes::from(mine.to_string());
+        let sim = sim_for(mine);
+        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["context_management"]["edits"].as_array().unwrap().len(),
+            0,
+            "客户端的被改写了"
+        );
+
+        // 非模拟路径不补：那条路是尽量原样透传，来访本来就是 CC 形态、自己会带。
+        let cc = Bytes::from(API_SHAPE_BODY);
+        let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("context_management").is_none(), "非模拟路径不该补: {v}");
     }
 
     /// 已经是 CC 形态的请求一个字节都不该多改——判据是 `system` 里那句身份声明，
@@ -4378,6 +4487,62 @@ mod tests {
                 test_cred().spoof_device_id("fp").unwrap()
             ),
             "扁平串形态应原格式改写，而不是被换成 CC 的 JSON 形态"
+        );
+    }
+
+    /// `spoof_device_id` 关掉时只换 account 段，来访自带的 `device_id` 原样保留。
+    ///
+    /// **判据取自真实抓包对**：`cap/raw/00002`（API-key 模式经 luban）与 `00006`（订阅模式
+    /// 直连）是同机、同客户端、同模型、相隔 28 秒的两条请求，两者的 `device_id` **完全相同**
+    /// （`832cb7e6…`），只有 `account_uuid` 不同（空串 ↔ 真 uuid）。故「补 account、留 device」
+    /// 正是官方两种模式之间真实存在的那一处差别，见 [`store::ForwardFlags::spoof_device_id`]。
+    #[test]
+    fn keeps_client_device_id_when_spoof_device_off() {
+        const CLIENT_DEVICE: &str =
+            "832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870";
+        let off = store::ForwardFlags { spoof_device_id: false, ..all_on() };
+
+        // 格式一：CC 内嵌 JSON（键序与官方一致）。
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"metadata":{{"user_id":"{{\"device_id\":\"{CLIENT_DEVICE}\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}}"}}}}"#
+        ));
+        let out = super::rewrite_body(&body, &test_cred(), "fp", off, None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let inner: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["device_id"], CLIENT_DEVICE, "关掉后 device_id 该原样保留");
+        assert_eq!(inner["account_uuid"], ACCOUNT_UUID, "account 段照样要补——那才是两模式的差别");
+        assert_eq!(inner["session_id"], "ssss", "session 段一如既往不动");
+
+        // 开着时（默认）仍换成派生值：本开关不改变既有行为。
+        let on = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let v_on: serde_json::Value = serde_json::from_slice(&on).unwrap();
+        let inner_on: serde_json::Value =
+            serde_json::from_str(v_on["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(inner_on["device_id"], test_cred().spoof_device_id("fp").unwrap());
+
+        // 格式二：扁平串——device 段同样保留，仍以扁平串回写。
+        let flat = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"user_aa_account_bb_session_cc"}}"#
+                .to_string(),
+        );
+        let out = super::rewrite_body(&flat, &test_cred(), "fp", off, None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["metadata"]["user_id"], format!("user_aa_account_{ACCOUNT_UUID}_session_cc"));
+
+        // 模拟路径不受本开关影响：那条路来访压根没有 device_id，只能派生——否则产出的是
+        // 一份没有 device_id 的 metadata，官方从不发那种形态。
+        let bare = Bytes::from(PLAIN_BODY.to_string());
+        let sim = super::Simulation::detect(parsed(&bare).as_ref(), off, &test_cred(), "fp")
+            .expect("裸请求仍应走模拟");
+        let out = super::rewrite_body(&bare, &test_cred(), "fp", off, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let inner: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            inner["device_id"],
+            test_cred().spoof_device_id("fp").unwrap(),
+            "模拟路径必须派生，不受开关影响"
         );
     }
 
@@ -5042,9 +5207,13 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
-        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens。
+        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens→context_management。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["model", "messages", "system", "metadata", "max_tokens"], "\n{s}");
+        assert_eq!(
+            keys,
+            ["model", "messages", "system", "metadata", "max_tokens", "context_management"],
+            "\n{s}"
+        );
         assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
 
         // 官方前三块：billing header、身份句、按模型族选出的基座。测试请求没有「客户端自己

@@ -593,6 +593,7 @@ queryClient.setQueryData(['settings'], {
   bare_rate_window_secs: 60,
   rate_limit_retry_max: 2,
   spoof_identity: true,
+  spoof_device_id: true,
   billing_cch: true,
   fill_client_headers: true,
   merge_beta: true,

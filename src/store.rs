@@ -910,6 +910,9 @@ impl CredentialStore {
         if let Some(v) = on(SPOOF_IDENTITY_ENABLED) {
             flags.spoof_identity = v;
         }
+        if let Some(v) = on(SPOOF_DEVICE_ID) {
+            flags.spoof_device_id = v;
+        }
         if let Some(v) = on(SPOOF_BILLING_CCH) {
             flags.billing_cch = v;
         }
@@ -991,6 +994,12 @@ pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
 /// 是否改写 `metadata.user_id` 的 account_uuid/device_id；`"0"`/`"false"` 关闭，缺省视为开启。
 pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
 
+/// 来访自带 `device_id` 时，要不要把它换成本凭证派生的那个。缺省视为开启（即既有行为）。
+///
+/// 与 [`REQUIRE_DEVICE_ID`] 无关：那个管「没带身份的请求放不放行」，这个管「带了身份的
+/// 请求要不要改写其中的设备段」。
+pub const SPOOF_DEVICE_ID: &str = "spoof_device_id";
+
 /// 是否给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
 pub const SPOOF_BILLING_CCH: &str = "spoof_billing_cch";
 
@@ -1049,6 +1058,26 @@ pub const SYSTEM_CACHE_SCOPE: &str = "system_cache_scope";
 pub struct ForwardFlags {
     /// 改写 `metadata.user_id` 里的 account_uuid/device_id 为凭证自洽身份。
     pub spoof_identity: bool,
+    /// 来访**自带** `device_id` 时要不要换成派生值（[`Self::spoof_identity`] 的子项，
+    /// 它关着这项就无从谈起）。
+    ///
+    /// 单独成一项的依据来自抓包：同一台机器、同一个客户端，`cap/raw/00002`（API-key 模式
+    /// 经 luban）与 `00006`（订阅模式直连）发的 **`device_id` 完全相同**，两种模式的
+    /// `metadata` 里只有 `account_uuid` 不同（前者空串、后者真 uuid）。也就是说把 API-key
+    /// 形态转成订阅形态**并不需要**动 `device_id`——换掉它是**反关联**策略，不是形态要求。
+    ///
+    /// 两边各有代价，故交给用户拨：
+    /// - **开**（默认，既有行为）：`device_id = f(账号, 机器)`，多个账号落在同一台机器上会
+    ///   得到各不相同的设备身份，账号之间不因共用设备 id 而被串起来。代价是真实 CC 的
+    ///   `device_id` 是**机器标识、跨账号恒定**，于是经 luban 的流量里「一台机器多个账号」
+    ///   这个真实用户群里很常见的模式一次都不会出现，每个 (账号,机器) 都是全新设备。
+    /// - **关**：来访自带的 `device_id` 原样透传，与官方两模式逐字节一致（`account_uuid`
+    ///   照样补）。代价是同一台机器用多个账号时，上游能凭这个 id 把这些账号关联起来。
+    ///
+    /// **只作用于来访自带身份的那条路**（[`crate::proxy::spoof_identity`]）。模拟路径与
+    /// 「CC 形态但缺 `metadata.user_id`」那条路上来访压根没有 `device_id`，只能派生，
+    /// 不受本开关影响——否则产出的是一份没有 `device_id` 的 `metadata`，那是官方从不发的形态。
+    pub spoof_device_id: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     pub billing_cch: bool,
     /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
@@ -1085,6 +1114,7 @@ impl Default for ForwardFlags {
     fn default() -> Self {
         Self {
             spoof_identity: true,
+            spoof_device_id: true,
             billing_cch: true,
             fill_client_headers: true,
             merge_beta: true,
@@ -3906,6 +3936,7 @@ mod tests {
         // 每个键各用一种「关」的写法，确认逐项独立且解析口径一致。
         for (key, off) in [
             (SPOOF_IDENTITY_ENABLED, "0"),
+            (SPOOF_DEVICE_ID, "0"),
             (SPOOF_BILLING_CCH, "false"),
             (FILL_CLIENT_HEADERS, " FALSE "),
             (MERGE_BETA, "False"),
@@ -3924,6 +3955,7 @@ mod tests {
             f,
             ForwardFlags {
                 spoof_identity: false,
+                spoof_device_id: false,
                 billing_cch: false,
                 fill_client_headers: false,
                 merge_beta: false,

@@ -711,6 +711,8 @@ struct SettingsResp {
 struct ForwardingResp {
     /// 改写 `metadata.user_id` 的 account_uuid/device_id。
     spoof_identity: bool,
+    /// 来访自带 `device_id` 时要不要换成派生值（[`Self::spoof_identity`] 的子项）。
+    spoof_device_id: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     billing_cch: bool,
     /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
@@ -737,6 +739,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
     fn from(f: crate::store::ForwardFlags) -> Self {
         Self {
             spoof_identity: f.spoof_identity,
+            spoof_device_id: f.spoof_device_id,
             billing_cch: f.billing_cch,
             fill_client_headers: f.fill_client_headers,
             merge_beta: f.merge_beta,
@@ -928,6 +931,7 @@ async fn set_require_device_id(
 #[derive(Deserialize)]
 struct SetForwardingReq {
     spoof_identity: Option<bool>,
+    spoof_device_id: Option<bool>,
     billing_cch: Option<bool>,
     fill_client_headers: Option<bool>,
     merge_beta: Option<bool>,
@@ -949,11 +953,12 @@ async fn set_forwarding(
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
         FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, ORIG_HEADER_CASE, RATE_LIMIT_RETRY,
-        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_IDENTITY_ENABLED, SYSTEM_CACHE_SCOPE, SYSTEM_SHAPE,
-        THINKING_SIGNATURE_RETRY,
+        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
+        SYSTEM_CACHE_SCOPE, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
+        (SPOOF_DEVICE_ID, req.spoof_device_id),
         (SPOOF_BILLING_CCH, req.billing_cch),
         (FILL_CLIENT_HEADERS, req.fill_client_headers),
         (MERGE_BETA, req.merge_beta),

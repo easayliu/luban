@@ -39,11 +39,14 @@ export interface Settings {
   rate_limit_retry: boolean
   /** 官方基座那块的缓存断点带不带 scope:"global"（跨账号共享同一份基座缓存）。 */
   cache_scope_global: boolean
+  /** 请求自带设备标识时，要不要换成当前账号派生的那个（spoof_identity 的子项）。 */
+  spoof_device_id: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
 export type ForwardingKey =
   | 'spoof_identity'
+  | 'spoof_device_id'
   | 'billing_cch'
   | 'fill_client_headers'
   | 'merge_beta'
