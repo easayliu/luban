@@ -117,7 +117,11 @@ export function CredentialDevicesDialog({
     enabled: open,
   })
 
-  const currentDeviceCount = devices.data?.length ?? cred.device_count
+  // 只数真实绑定：模拟客户端的伪设备也在这个列表里，但它们不写绑定、不占设备名额，
+  // 后端的 device_count（卡片上那个数）同样数不到它们。把它们算进来，就会得到
+  // 「卡片显示 11 台、展开却是 12 台」这种对不上的展示。
+  const currentDeviceCount =
+    devices.data?.filter((device) => !device.simulated).length ?? cred.device_count
   const formattedCurrentDeviceCount = currentDeviceCount.toLocaleString(locale)
   const currentDeviceNoun = currentDeviceCount === 1 ? 'device' : 'devices'
   const limitPolicyItems = LIMIT_POLICY_ITEMS.map((item) => ({
