@@ -52,6 +52,25 @@ pub async fn handle(
     //    解析失败（不是 JSON）时为 `None`，各项判定按「读不出来」退化，与逐个解析时一致。
     let body_json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
 
+    // 转发形态开关（一条 SQL 读齐，走内存缓存）。装头改体在下面第 5 步才用得上，但预检要它，
+    // 而预检必须排在选号之前，所以整体提到这里读。
+    let flags = state.store.forward_flags();
+
+    // 2.0) 转发前预检：上游必拒的请求体就地回 400，不发出去（见 [`invalid_request_reason`]）。
+    //      排在选号之前是关键——这种请求既不该占用任何账号，也不该在某个号上留下一条 4xx。
+    if flags.request_precheck
+        && let Some(reason) = invalid_request_reason(body_json.as_ref())
+    {
+        tracing::warn!(
+            %method,
+            path = %path_and_query,
+            ua = %client_ua,
+            reason = %reason,
+            "rejected locally: the request body has a shape the upstream always refuses"
+        );
+        return invalid_request_response(&reason);
+    }
+
     // 提取 device_id（在 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(body_json.as_ref());
     // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
@@ -127,9 +146,8 @@ pub async fn handle(
     // 4) 目标 URL：上游 base + 原路径与查询串。
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
 
-    // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制，
-    //    一条 SQL 读齐（默认全开 = 加入开关前的既有行为）。
-    let flags = state.store.forward_flags();
+    // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制
+    //    （`flags` 在上面第 2 步已一并读出；默认全开 = 加入开关前的既有行为）。
     // 设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
     // 头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
     let device_fp = device_fingerprint(device_id.as_deref(), &headers);
@@ -973,6 +991,53 @@ async fn retry_demoted_thinking(
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
     Some(up)
+}
+
+/// 转发前的本地预检：请求体里有没有**上游必拒**的形态。命中则返回上游会给出的那句错误
+/// （形如 `messages.13.content.0.thinking: each thinking block must contain thinking`），
+/// 由调用方就地回 400，不发出去。见 [`store::ForwardFlags::request_precheck`]。
+///
+/// **判据只收「上游确定会拒」的形态，宁漏勿误**：漏判只是退回原有行为（发出去、被上游拒），
+/// 误判却会把一条本来能成的请求就地毙掉。所以这里既不猜、也不做启发式，只照抄上游的规则。
+///
+/// 目前只有一条规则——**空 thinking 块**：`thinking` 字段缺失、不是字符串、或是空串。
+/// 这是长会话里客户端自己攒出来的（某轮 thinking 只出了签名没出正文，原样进了历史），
+/// 之后每一轮都会带着它重发，于是同一条会话会稳定地撞出一串 400，直到用户开新会话为止。
+/// 空白串（`"  "`）不算：上游对 thinking 有没有做 trim 没有实测样本，没有依据的判据不能进。
+///
+/// 不区分角色：thinking 块本来只出现在 assistant 轮，出现在别处也照样是空块。
+/// 不区分路径：`/v1/messages` 与 `count_tokens` 校验同一套请求体规则。
+fn invalid_request_reason(body: Option<&serde_json::Value>) -> Option<String> {
+    let msgs = body?.get("messages")?.as_array()?;
+    for (i, msg) in msgs.iter().enumerate() {
+        // `content` 是字符串形态的消息里没有块，跳过即可。
+        let Some(content) = msg.get("content").and_then(|c| c.as_array()) else { continue };
+        for (j, blk) in content.iter().enumerate() {
+            if blk.get("type").and_then(|t| t.as_str()) != Some("thinking") {
+                continue;
+            }
+            if blk.get("thinking").and_then(|t| t.as_str()).is_none_or(|s| s.is_empty()) {
+                return Some(format!(
+                    "messages.{i}.content.{j}.thinking: each thinking block must contain thinking"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 预检命中时回给客户端的那条 400：形态与上游的错误体逐字段一致（`{type, error, request_id}`，
+/// `error.type` 同为 `invalid_request_error`），客户端的错误分支因此不必为「本地拒」多写一支。
+///
+/// `request_id` 为 `null`：这条请求压根没到上游，编一个 id 出来只会让人拿去查一条不存在的记录。
+fn invalid_request_response(message: &str) -> Response {
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message},
+        "request_id": serde_json::Value::Null,
+    });
+    (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "application/json")], payload.to_string())
+        .into_response()
 }
 
 /// 上游那条 400 是不是「thinking 块签名验不过」，形如
@@ -4003,6 +4068,7 @@ mod tests {
             cache_scope_global: false,
             cache_ttl_1h: false,
             nonstream_as_sse: false,
+            request_precheck: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -4509,6 +4575,7 @@ mod tests {
             cache_scope_global: false,
             cache_ttl_1h: false,
             nonstream_as_sse: false,
+            request_precheck: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -4848,6 +4915,73 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(s.contains("AAAA"), "空 thinking 那轮应原样留着: {s}");
         assert!(!s.contains("BBBB"), "第二轮仍应降级: {s}");
+    }
+
+    // ---------- 转发前预检（invalid_request_reason） ----------
+
+    /// 空 thinking 块（缺字段 / 空串 / 不是字符串）一律命中，且报出的位置与上游那句一致。
+    #[test]
+    fn precheck_catches_empty_thinking_blocks() {
+        let empty = concat!(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},"#,
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"AAAA"}]}]}"#
+        );
+        assert_eq!(
+            super::invalid_request_reason(parsed(&Bytes::from(empty)).as_ref()).as_deref(),
+            Some("messages.1.content.0.thinking: each thinking block must contain thinking"),
+            "空串 thinking 应命中，且位置要指到 messages.1.content.0"
+        );
+
+        // `thinking` 字段整个缺失、以及类型不对（上游要字符串）：同样是空块。
+        for raw in [
+            r#"{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"AAAA"}]}]}"#,
+            r#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":null}]}]}"#,
+        ] {
+            assert!(
+                super::invalid_request_reason(parsed(&Bytes::from(raw)).as_ref()).is_some(),
+                "应命中: {raw}"
+            );
+        }
+    }
+
+    /// 正常请求一条都不能拦——误判会把本来能成的请求就地毙掉，比漏判严重得多。
+    #[test]
+    fn precheck_passes_valid_bodies() {
+        for raw in [
+            // 有内容的 thinking 块。
+            r#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"想了想","signature":"AAAA"}]}]}"#,
+            // 空白串：上游有没有 trim 没有实测样本，没依据的判据不进（宁漏勿误）。
+            r#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"  "}]}]}"#,
+            // redacted_thinking 没有 `thinking` 字段，是另一种块，不能按空块判。
+            r#"{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"ZZZZ"}]}]}"#,
+            // `content` 是字符串形态的消息。
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            // 没有 messages 的请求体（count_tokens 之外的端点）。
+            r#"{"model":"claude-opus-5"}"#,
+        ] {
+            let body = parsed(&Bytes::from(raw.to_string()));
+            assert_eq!(super::invalid_request_reason(body.as_ref()), None, "不该拦: {raw}");
+        }
+
+        // 解析不出来的请求体（不是 JSON）：判不了就别判，原样转发。
+        assert_eq!(super::invalid_request_reason(None), None);
+    }
+
+    /// 拦下时回给客户端的那条 400，形态与上游的错误体逐字段一致。
+    #[tokio::test]
+    async fn precheck_response_matches_the_upstream_error_shape() {
+        let resp = super::invalid_request_response("messages.0.content.0.thinking: nope");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "messages.0.content.0.thinking: nope");
+        assert!(v["request_id"].is_null(), "没到上游，不该编一个 request_id: {v}");
     }
 
     // ---------- 非 CC 请求的模拟（Simulation） ----------

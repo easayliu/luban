@@ -606,6 +606,7 @@ queryClient.setQueryData(['settings'], {
   cache_scope_global: true,
   cache_ttl_1h: true,
   nonstream_as_sse: true,
+  request_precheck: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 queryClient.setQueryData(['credential-devices', 1], [])

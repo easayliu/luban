@@ -342,6 +342,24 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="request_precheck"
+          label={t('请求预检', 'Request precheck')}
+          summary={t(
+            '转发前先在本地检查请求体，上游必定拒绝的请求就地返回 400，不发给上游。',
+            'Check the request body locally before forwarding; requests the upstream is certain to refuse are rejected with a 400 on the spot and never sent.',
+          )}
+          description={
+            <>
+              {t('目前只检查空的', 'Currently only empty')}{' '}
+              <code className="font-mono">thinking</code>{' '}
+              {t(
+                '块——长会话里客户端自己攒出来的历史，之后每一轮都会带着它重发，于是同一条会话会稳定地撞出一串 400。拦下来客户端收到的错误文本与上游那条逐字相同，只是省掉一次往返，也不会在账号上留下一条 4xx 记录。判据宁漏勿误：只拦上游确定会拒的形态，认不出的一律照常转发。若怀疑它误伤了正常请求，关掉即完全退回「一律转发」。',
+                'blocks are checked — the client accumulates them in long sessions and resends them every turn, so one session keeps producing a stream of 400s. When a request is caught, the client receives exactly the same error text the upstream would have returned; the only difference is that a round trip is saved and no 4xx is recorded against the account. The check errs on the side of forwarding: only shapes the upstream is certain to refuse are caught, and anything unrecognized is forwarded as usual. If you suspect it is catching valid requests, disabling it restores plain “always forward” behaviour.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
     </div>
   )

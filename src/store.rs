@@ -986,6 +986,9 @@ impl CredentialStore {
         if let Some(v) = on(NONSTREAM_AS_SSE) {
             flags.nonstream_as_sse = v;
         }
+        if let Some(v) = on(REQUEST_PRECHECK) {
+            flags.request_precheck = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1090,6 +1093,11 @@ pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 /// 键名。缺省视为开启：CC 从不发非流式的 `/v1/messages`，透传等于每条这类请求都留一处
 /// 100% 稳定的判据。见 [`ForwardFlags::nonstream_as_sse`]。
 pub const NONSTREAM_AS_SSE: &str = "nonstream_as_sse";
+
+/// 转发前是否本地预检请求体、命中「上游必拒」的形态就地回 400 的 settings 键名。
+/// 缺省视为开启：命中的请求发出去只有一个结局，拦下来客户端拿到的错误逐字相同。
+/// 见 [`ForwardFlags::request_precheck`]。
+pub const REQUEST_PRECHECK: &str = "request_precheck";
 
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。
@@ -1196,6 +1204,17 @@ pub struct ForwardFlags {
     /// 以及 `ttft_ms` 记的是上游首字节、与客户端的感知对不上——后者由 `usage_logs` 的
     /// `sse_aggregated` 列标出来。
     pub nonstream_as_sse: bool,
+    /// 转发前本地预检请求体：命中**上游必拒**的形态就地回 400，不发出去
+    /// （见 [`crate::proxy::invalid_request_reason`]）。
+    ///
+    /// 与 [`Self::thinking_signature_retry`] 同属错误恢复，方向相反：那个是「上游拒了以后
+    /// 想办法救回来」，这个是「结局已经确定，就别去问了」。命中的请求发出去必是 400，
+    /// 换来的是一次白跑的往返、那个账号上多一条 4xx（错误率是上游看得见的信号），
+    /// 而客户端拿到的错误文本两边逐字一样——所以拦下来对它没有任何区别。
+    ///
+    /// 判据宁漏勿误：漏判只是退回「发出去、被上游拒」的原有行为，误判却会把一条本来能成的
+    /// 请求就地毙掉。留这个开关就是给误判兜底——关掉即完全退回加入预检之前的行为。
+    pub request_precheck: bool,
 }
 
 impl Default for ForwardFlags {
@@ -1215,6 +1234,7 @@ impl Default for ForwardFlags {
             cache_scope_global: true,
             cache_ttl_1h: true,
             nonstream_as_sse: true,
+            request_precheck: true,
         }
     }
 }
@@ -4337,6 +4357,7 @@ mod tests {
             (SYSTEM_CACHE_SCOPE, "0"),
             (SYSTEM_CACHE_TTL, "0"),
             (NONSTREAM_AS_SSE, "0"),
+            (REQUEST_PRECHECK, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -4358,6 +4379,7 @@ mod tests {
                 cache_scope_global: false,
                 cache_ttl_1h: false,
                 nonstream_as_sse: false,
+                request_precheck: false,
             }
         );
 
