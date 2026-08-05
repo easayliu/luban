@@ -336,6 +336,7 @@ pub async fn handle(
                 req_speed,
                 req_model: req_model.clone(),
                 ratelimit,
+                stream_broke: None,
                 store: state.store.clone(),
             };
 
@@ -567,8 +568,13 @@ fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
         if rl.ttft_ms.is_none() {
             rl.ttft_ms = Some(rl.started.elapsed().as_millis());
         }
-        if let Ok(bytes) = &chunk {
-            rl.sniffer.feed(bytes);
+        match &chunk {
+            Ok(bytes) => rl.sniffer.feed(bytes),
+            // 上游把流掐了。错误照旧原样交给 axum（客户端拿到的行为不变），但要留个痕
+            // 给收尾时的日志——否则这条请求在服务端侧只剩一行 `forwarded status=200`。
+            Err(e) => {
+                rl.stream_broke = Some(format!("[{}] {e}", upstream_error_kind(e)));
+            }
         }
         chunk
     });
@@ -629,6 +635,9 @@ async fn aggregate_sse(up: wreq::Response, mut rl: ReqLog) -> Response {
                 "upstream sent an error event mid-stream; mapping it to a status code"
             );
             rl.status = status.as_u16();
+            // 同一份 error 事件也进了 sniffer（两者都在 feed 同一条流）。这条路已经就地
+            // 告警并把状态码换给了客户端，留着它只会让 `ReqLog::drop` 再报一次同样的事。
+            rl.sniffer.stream_error = None;
             match serde_json::to_vec(&payload) {
                 Ok(body) => builder
                     .status(status)
@@ -1126,12 +1135,57 @@ struct ReqLog {
     req_model: Option<String>,
     /// 上游返回的订阅账号限流快照。
     ratelimit: RateLimitInfo,
+    /// 转发途中上游把流掐了（传输层错误，非 `event: error`）时的错误描述。
+    ///
+    /// 与 [`UsageSniffer::stream_error`] 分开记：那个是上游**说**自己出错了，这个是连接
+    /// 本身断了，两者排查方向不同（前者看上游侧原因，后者看网络/超时）。此前
+    /// [`stream_upstream`] 里这个分支是 `if let Ok` 的隐式丢弃——错误原样交给 axum，
+    /// 客户端拿到一条截断的流，服务端侧一行日志都没有。
+    stream_broke: Option<String>,
     store: std::sync::Arc<store::CredentialStore>,
 }
 
 impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
+        // 透传流路径的两类「200 里的失败」在此收口。响应头早发出去了，客户端拿到的
+        // 状态码改不动（也不该改，行为保持原样），但**记账用的** status 必须反映真实结果：
+        // 照搬 200 会让失败从成功率里凭空消失，正是 `aggregate_sse` 那条路早就避开的坑。
+        if let Some(payload) = self.sniffer.stream_error.take() {
+            let mapped = error_status(&payload);
+            tracing::warn!(
+                cred_id = self.cred_id, cred = %self.cred_label,
+                sent_status = self.status,
+                status = mapped.as_u16(),
+                error = %payload.get("error").map(|e| e.to_string()).unwrap_or_else(|| payload.to_string()),
+                "upstream sent an error event mid-stream; the client already got the 200 header plus that payload, logging it as the mapped status"
+            );
+            self.status = mapped.as_u16();
+        }
+        // 传输中断只告警、不改 status：这里分不清是上游掐的还是客户端自己走了（用户按了
+        // Ctrl-C 也会让流提前结束），记成 5xx 会把正常的中途取消算成服务端故障。
+        if let Some(why) = self.stream_broke.take() {
+            tracing::warn!(
+                cred_id = self.cred_id, cred = %self.cred_label,
+                status = self.status,
+                error = %why,
+                "the upstream stream broke mid-transfer; the client got a truncated response"
+            );
+        } else if self.sniffer.is_stream
+            && !self.sniffer.saw_message_stop
+            && !self.sse_aggregated
+            && self.status == StatusCode::OK.as_u16()
+        {
+            // 三种断流里最安静的一种：没报错、没断连，`message_stop` 就是没来。同样不改
+            // status——上游 EOF 与客户端提前离开在这一层是同一个现象。`output_tokens` 是
+            // 分辨二者的线索：它来自 `message_delta`，有值说明上游至少生成到了那一步。
+            tracing::warn!(
+                cred_id = self.cred_id, cred = %self.cred_label,
+                status = self.status,
+                output_tokens = self.sniffer.output_tokens.unwrap_or(0),
+                "the stream ended without message_stop; either the upstream stopped sending or the client left early, and the reply the client got is truncated"
+            );
+        }
         let has_usage = self.sniffer.has_usage();
         // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
@@ -1268,6 +1322,22 @@ struct UsageSniffer {
     /// 上游回报的实际速度档（`usage.speed`，如 `"fast"`）。fast 有独立限流，
     /// 被限流时会回落到标准档，故以响应为准、请求体只作兜底。
     speed: Option<String>,
+    /// 流中途上游改口报错的那份 `event: error` 负载（整个 data 对象）。
+    ///
+    /// 这类错误是裹在 **200** 里来的：响应头早已发出，靠状态码看不出任何异常。此前
+    /// [`Self::merge`] 只挑 usage/model，它从眼前流过去不留痕迹，于是一次失败在日志与
+    /// `usage_logs` 里都是一条 `status=200`——客户端那头报错（如上游发的 `client_gone`），
+    /// 服务端这头查无此事，且成功率统计里凭空少了一次失败。收尾时由 [`ReqLog::drop`]
+    /// 取走告警。[`aggregate_sse`] 那条路另有 [`SseAggregator`] 就地处理，不走这里。
+    stream_error: Option<serde_json::Value>,
+    /// 见过 `message_stop` —— 流式响应正常收尾的唯一标志。
+    ///
+    /// 上游的流可能既不报错、也不断连，就是**发到一半 EOF**：`bytes_stream` 平静地返回
+    /// `None`，[`Self::stream_error`] 和 [`ReqLog::stream_broke`] 双双为空，这一层看什么
+    /// 都正常，而客户端拿到的是半截回复（Claude Code 报 `Connection closed mid-response`）。
+    /// [`aggregate_sse`] 靠 [`Aggregated::Incomplete`] 拦住了这一类，透传路径此前没有对应
+    /// 的检查——三种断流方式里最安静的那种，恰恰完全无声。
+    saw_message_stop: bool,
 }
 
 impl UsageSniffer {
@@ -1308,6 +1378,15 @@ impl UsageSniffer {
             return;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            // 只在流式模式下认：非流式那条路的错误体由 `detect_account_ban` 一侧处理，
+            // 这里再记一份会让同一个 4xx 告警两次。
+            if self.is_stream {
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("error") => self.stream_error = Some(v.clone()),
+                    Some("message_stop") => self.saw_message_stop = true,
+                    _ => {}
+                }
+            }
             self.merge(&v);
         }
     }
@@ -1434,24 +1513,26 @@ fn parse_flat_user_id(s: &str) -> Option<FlatUserId> {
     Some(FlatUserId { device: device.to_string(), session: session.to_string() })
 }
 
-/// 400 场景下的账号级错误特征词：命中其一才判定为「该账号被上游封禁/停用/授权失效」，
-/// 以区别于常规的客户端请求错误（invalid_request_error，如模型名错、body 超长）——避免
-/// 客户端一条坏请求重试时把所有账号逐个误禁。命中后原文（截断）存作 `ban_reason`。
-const BAN_KEYWORDS: &[&str] = &[
-    "disabled",
-    "suspended",
-    "banned",
-    "terminated",
-    "deactivated",
-    "violat",
-    "invalid_grant",
-    "oauth",
-];
+/// 账号被停用时的**状态词**：单独出现不作数，必须与 [`BAN_SUBJECTS`] 中的主语同时出现。
+///
+/// 这些词曾是裸子串匹配，代价是上游回显请求字段名时会误伤——`"thinking.type.disabled" is
+/// not supported for this model` 是一条再普通不过的参数错误，却因字段名里含 `disabled`
+/// 被判成封号；客户端只要重试，池子里的号会被逐个扣光。状态词离开主语没有信息量，
+/// 「谁 disabled 了」才是判据，故改为共现。
+const BAN_STATES: &[&str] =
+    &["disabled", "suspended", "banned", "terminated", "deactivated", "violat"];
+
+/// [`BAN_STATES`] 的合法主语：状态词说的是这几样东西时才算账号级错误。
+const BAN_SUBJECTS: &[&str] = &["account", "organization", "workspace", "api key", "credential"];
+
+/// 与主语无关、单独出现即判定的特征词：OAuth 刷新失败的报文里没有 account 主语。
+const BAN_KEYWORDS: &[&str] = &["invalid_grant", "oauth"];
 
 /// 反向豁免：命中其一则**一定不是**账号级问题，无论状态码与特征词如何都不停用。
 /// 用于挡住「特征词碰巧出现在非账号报错里」的误杀，见 [`detect_account_ban`]。
+/// 首项不写死 endpoint/model，是因为两者都出现过同款文案。
 const NOT_ACCOUNT_PHRASES: &[&str] =
-    &["not supported for this endpoint", "does not support", "unsupported model"];
+    &["not supported for this", "does not support", "unsupported model"];
 
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
 fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
@@ -1466,12 +1547,14 @@ fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
 /// 依据状态码与响应体判定是否应自动停用该凭证，命中则返回写入 `ban_reason` 的原因
 /// （`[状态码] 类型: 消息`，截断至 200 字符）。
 ///
-/// 三档都要求响应体确实是 Anthropic 的错误 JSON（能取到 `error.type`）或命中
-/// [`BAN_KEYWORDS`]，避免把「非账号问题的 4xx」当成封号，把健康账号打成停用：
+/// 三档都要求响应体确实是 Anthropic 的错误 JSON（能取到 `error.type`）或命中特征词，
+/// 避免把「非账号问题的 4xx」当成封号，把健康账号打成停用：
 /// - 401：`authentication_error` 才停用。裸 401（CDN/网关拦截，无 `error.type`）不停用。
-/// - 403：**仅**命中 [`BAN_KEYWORDS`] 时停用。普通 `permission_error`（如 Pro 账号请求
+/// - 403：**仅**命中特征词时停用。普通 `permission_error`（如 Pro 账号请求
 ///   Opus、beta 未开通、区域限制）是能力/权限问题而非封号，原样透传即可。
 /// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。
+///
+/// 「命中特征词」= [`BAN_KEYWORDS`] 之一，或 [`BAN_SUBJECTS`] 与 [`BAN_STATES`] 各中一项。
 fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
     let (etype, message) = parse_upstream_error(body);
     let reason = || {
@@ -1488,7 +1571,11 @@ fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
     if NOT_ACCOUNT_PHRASES.iter().any(|p| hay.contains(p)) {
         return None;
     }
-    let hits_keyword = || BAN_KEYWORDS.iter().any(|k| hay.contains(k));
+    let hits_keyword = || {
+        BAN_KEYWORDS.iter().any(|k| hay.contains(k))
+            || (BAN_SUBJECTS.iter().any(|s| hay.contains(s))
+                && BAN_STATES.iter().any(|s| hay.contains(s)))
+    };
     match status {
         StatusCode::UNAUTHORIZED => {
             (etype.as_deref() == Some("authentication_error") || hits_keyword()).then(reason)
@@ -4661,6 +4748,13 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 err_body("invalid_request_error", "Your account was suspended"),
             ),
+            // 主语不止 account：组织级停用同样是封号。
+            (
+                StatusCode::FORBIDDEN,
+                err_body("permission_error", "This organization has been deactivated"),
+            ),
+            // OAuth 刷新失败没有主语词，靠独立特征词命中。
+            (StatusCode::BAD_REQUEST, err_body("invalid_request_error", "invalid_grant")),
         ];
         for (status, body) in cases {
             assert!(
@@ -4694,6 +4788,20 @@ mod tests {
                     "authentication_error",
                     "OAuth authentication is currently not supported for this endpoint",
                 ),
+            ),
+            // 上游回显请求字段名，字段名里含状态词。曾在 v0.2.69 把整池账号逐个误禁：
+            // 客户端每重试一次就扣掉一个号，而账号本身完全健康。
+            (
+                StatusCode::BAD_REQUEST,
+                err_body(
+                    "invalid_request_error",
+                    "\"thinking.type.disabled\" is not supported for this model. Thinking defaults to adaptive mode when not specified; use \"thinking.type.enabled\" with \"budget_tokens\" for extended thinking.",
+                ),
+            ),
+            // 有主语没状态词：额度/权限问题，不是封号。
+            (
+                StatusCode::BAD_REQUEST,
+                err_body("invalid_request_error", "Your account has insufficient credits"),
             ),
         ];
         for (status, body) in cases {
@@ -6059,6 +6167,7 @@ mod tests {
                 req_speed: None,
                 req_model: None,
                 ratelimit: rl_headers(&[]),
+                stream_broke: None,
                 store: store.clone(),
             })
         };
@@ -6078,6 +6187,81 @@ mod tests {
         assert_eq!(logs[1].ua_out.as_deref(), Some(config::CC_USER_AGENT), "出站换成了官方那串");
         assert_eq!(logs[2].ua.as_deref(), Some(config::CC_USER_AGENT));
         assert_eq!(logs[2].ua_out.as_deref(), Some(config::CC_USER_AGENT));
+    }
+
+    /// 透传流路径（`sse_aggregated=false`，绝大多数请求走这条）上，上游在 200 的流中途
+    /// 改口报错：客户端已经收到 200 头，改不动，但**记账**要按真实结果走。
+    ///
+    /// 这条曾是纯盲区。线上实例的原始形态是：`message_start` 与 `message_delta` 都到了，
+    /// 随后上游发 `event: error`，我们原样透传，客户端报错，而服务端只留下一行
+    /// `forwarded status=200 has_usage=true`，还照常算了花费——唯一的线索是
+    /// `output_tokens` 小得离谱（实测那次是 2）。
+    #[test]
+    fn mid_stream_error_is_billed_as_the_mapped_status() {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let mut rl = super::ReqLog {
+            started: std::time::Instant::now(),
+            ttft_ms: None,
+            method: "POST".into(),
+            path: "/v1/messages?beta=true".into(),
+            ua: "-".into(),
+            ua_out: "-".into(),
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            device_id: None,
+            status: 200,
+            sse_aggregated: false,
+            sniffer: super::UsageSniffer::new(true, false),
+            req_speed: None,
+            req_model: None,
+            ratelimit: rl_headers(&[]),
+            stream_broke: None,
+            store: store.clone(),
+        };
+        rl.sniffer.feed(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":47030}}}\n\n",
+        );
+        rl.sniffer.feed(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        drop(rl);
+
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status, 529, "流中途报错不能记成 200——失败会从成功率里消失");
+        assert_eq!(logs[0].model.as_deref(), Some("claude-opus-5"), "用量照旧嗅探，不受影响");
+        assert_eq!(logs[0].cache_read_tokens, Some(47030));
+    }
+
+    /// `message_stop` 是流正常收尾的唯一标志。缺了它、又没有 error 事件、连接层也没报错，
+    /// 是最安静的那种断流：这一层看什么都正常，客户端拿到的却是半截回复
+    /// （Claude Code 报 `Connection closed mid-response`）。
+    #[test]
+    fn message_stop_marks_a_complete_stream() {
+        let mut truncated = super::UsageSniffer::new(true, false);
+        truncated.feed(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\"}}\n\n",
+        );
+        truncated.feed(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":14}}\n\n",
+        );
+        assert!(!truncated.saw_message_stop, "流断在半路，收尾时要告警");
+        assert_eq!(truncated.output_tokens, Some(14), "已生成的部分照旧计入用量");
+
+        let mut complete = super::UsageSniffer::new(true, false);
+        complete.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert!(complete.saw_message_stop);
+    }
+
+    /// 非流式响应体里的 `{"type":"error"}` 不走流内那套：那条路的 4xx 由
+    /// [`super::detect_account_ban`] 一侧处理，这里再记一份会让同一个错误告警两次。
+    #[test]
+    fn nonstream_error_body_is_not_taken_as_a_stream_error() {
+        let mut s = super::UsageSniffer::new(false, false);
+        s.feed(br#"{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}"#);
+        s.finish();
+        assert!(s.stream_error.is_none());
     }
 
     /// 日志用的 UA 取值：缺失/空串取 `-`，过长按 char 截断（不能按字节切，会劈开多字节 UTF-8）。
@@ -6573,6 +6757,7 @@ mod tests {
             req_speed: None,
             req_model: None,
             ratelimit: rl_headers(&[]),
+            stream_broke: None,
             store,
         }
     }
