@@ -1,13 +1,18 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  CableIcon,
   CheckIcon,
   ClipboardIcon,
   EyeIcon,
   EyeOffIcon,
+  GaugeIcon,
   KeyRoundIcon,
+  LockKeyholeIcon,
   SaveIcon,
   Settings2Icon,
+  ShieldCheckIcon,
+  SmartphoneIcon,
   SparklesIcon,
   Trash2Icon,
 } from 'lucide-react'
@@ -45,7 +50,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
-import { Frame, FrameHeader, FramePanel, FrameTitle } from '@/components/ui/frame'
 import { Input } from '@/components/ui/input'
 import {
   InputGroup,
@@ -62,6 +66,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
+import { SettingsGroup } from '@/components/settings-group'
 
 export function AccessSettings({
   open,
@@ -78,12 +83,12 @@ export function AccessSettings({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings2Icon aria-hidden="true" />
-            {t('接入与安全', 'Access & security')}
+            {t('客户端接入', 'Client access')}
           </DialogTitle>
           <DialogDescription>
             {t(
-              '配置客户端接入、设备策略和控制台安全。',
-              'Configure client access, device policies, and console security.',
+              '配置客户端接入地址、身份验证 Key 和 Claude Code 片段。',
+              'Configure the client endpoint, authentication key, and Claude Code setup.',
             )}
           </DialogDescription>
         </DialogHeader>
@@ -203,7 +208,14 @@ export function AccessSettingsContent() {
   return (
     <>
       <div className="space-y-4">
-        <SettingsSection title={t('客户端接入', 'Client access')}>
+        <SettingsGroup
+          icon={CableIcon}
+          title={t('连接与认证', 'Connection & authentication')}
+          description={t(
+            '复制客户端接入地址，并配置代理用于验证来访请求的 Key。',
+            'Copy the client endpoint and configure the key used to authenticate incoming requests.',
+          )}
+        >
           <Field className="p-5">
             <FieldLabel>
               {t('接入地址', 'Access URL')}
@@ -338,34 +350,7 @@ export function AccessSettingsContent() {
               </FieldDescription>
             )}
           </Field>
-        </SettingsSection>
-
-        <SettingsSection title={t('设备策略', 'Device policies')}>
-          {data && <DevicePolicyOverview settings={data} />}
-          <DevicePolicyGroup
-            title={t('绑定与容量', 'Bindings & capacity')}
-            description={t(
-              '决定设备占用名额多久、多久内优先返回原账号，以及每个账号默认可容纳多少设备。',
-              'Control how long devices hold slots, how long they prefer their original account, and the default capacity per account.',
-            )}
-          />
-          <DeviceBindingTtl />
-          <DeviceBindingRetention />
-          <DefaultDeviceLimit />
-          <DevicePolicyGroup
-            title={t('身份与防滥用', 'Identity & abuse prevention')}
-            description={t(
-              '控制无有效设备身份的请求是直接拒绝，还是限速后放行。',
-              'Choose whether requests without a valid device identity are rejected or allowed with rate limiting.',
-            )}
-          />
-          <RequireDeviceIdToggle />
-          <BareRateLimit />
-        </SettingsSection>
-
-        <SettingsSection title={t('控制台安全', 'Console security')}>
-          <AdminPassword />
-        </SettingsSection>
+        </SettingsGroup>
       </div>
 
       <AlertDialog
@@ -399,6 +384,88 @@ export function AccessSettingsContent() {
         </AlertDialogPopup>
       </AlertDialog>
     </>
+  )
+}
+
+export function DeviceSettingsContent() {
+  const { t } = useI18n()
+  const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+
+  if (settingsQuery.isPending) {
+    return (
+      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
+        <Spinner className="size-4" />
+        {t('正在加载设备策略', 'Loading device policies')}
+      </div>
+    )
+  }
+
+  if (settingsQuery.isError) {
+    return (
+      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
+        <p className="text-sm font-medium">
+          {t('无法读取设备策略', 'Unable to load device policies')}
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          loading={settingsQuery.isFetching}
+          onClick={() => settingsQuery.refetch()}
+        >
+          {t('重试', 'Retry')}
+        </Button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      <DevicePolicyOverview settings={settingsQuery.data} />
+
+      <SettingsGroup
+        icon={GaugeIcon}
+        title={t('绑定与容量', 'Bindings & capacity')}
+        description={t(
+          '决定设备占用名额多久、多久内优先返回原账号，以及每个账号默认可容纳多少设备。',
+          'Control how long devices hold slots, how long they prefer their original account, and the default capacity per account.',
+        )}
+      >
+        <DeviceBindingTtl />
+        <DeviceBindingRetention />
+        <DefaultDeviceLimit />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={ShieldCheckIcon}
+        title={t('身份与防滥用', 'Identity & abuse prevention')}
+        description={t(
+          '控制无有效设备身份的请求是直接拒绝，还是限速后放行。',
+          'Choose whether requests without a valid device identity are rejected or allowed with rate limiting.',
+        )}
+      >
+        <RequireDeviceIdToggle />
+        <BareRateLimit />
+      </SettingsGroup>
+    </div>
+  )
+}
+
+export function SecuritySettingsContent() {
+  const { t } = useI18n()
+
+  return (
+    <div className="space-y-4">
+      <SettingsGroup
+        icon={LockKeyholeIcon}
+        title={t('管理密码', 'Admin password')}
+        description={t(
+          '控制谁可以登录管理控制台；不会影响客户端通过代理发起请求。',
+          'Control who can sign in to the admin console; this does not affect proxied client requests.',
+        )}
+      >
+        <AdminPassword />
+      </SettingsGroup>
+    </div>
   )
 }
 
@@ -441,26 +508,29 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
   ]
 
   return (
-    <section
-      aria-label={t('当前设备策略概览', 'Current device policy overview')}
-      className="grid grid-cols-2 gap-3 bg-muted/24 p-5 sm:grid-cols-4"
+    <SettingsGroup
+      icon={SmartphoneIcon}
+      title={t('当前策略', 'Current policy')}
+      description={t(
+        '下面是当前生效的设备绑定与身份处理摘要。',
+        'A summary of the device binding and identity rules currently in effect.',
+      )}
     >
-      {items.map((item) => (
-        <div key={item.label} className="min-w-0 rounded-lg border bg-background px-3 py-2.5 shadow-xs/5">
-          <p className="text-xs text-muted-foreground">{item.label}</p>
-          <p className="mt-1 truncate font-semibold text-sm" title={item.value}>{item.value}</p>
-        </div>
-      ))}
-    </section>
-  )
-}
-
-function DevicePolicyGroup({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="bg-muted/32 px-5 py-3.5">
-      <h3 className="font-semibold text-sm">{title}</h3>
-      <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">{description}</p>
-    </div>
+      <dl
+        aria-label={t('当前设备策略概览', 'Current device policy overview')}
+        className="grid grid-cols-2 sm:grid-cols-4"
+      >
+        {items.map((item, index) => (
+          <div
+            key={item.label}
+            className={`min-w-0 px-5 py-4 ${index >= 2 ? 'border-t sm:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'sm:border-l' : ''}`}
+          >
+            <dt className="text-xs text-muted-foreground">{item.label}</dt>
+            <dd className="mt-1 truncate font-semibold text-sm" title={item.value}>{item.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </SettingsGroup>
   )
 }
 
@@ -522,11 +592,20 @@ function DeviceBindingTtl() {
     : t('名额不自动释放', 'Slots are not released automatically')
 
   return (
-    <Field className="p-5">
-      <FieldLabel>{t('活跃名额有效期（小时）', 'Active slot lifetime (hours)')}</FieldLabel>
-      <div className="flex w-full flex-wrap items-center gap-2">
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('活跃名额有效期', 'Active slot lifetime')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '设备在此时长内没有请求便释放占用的账号名额；与原账号的关联仍按保留期保存。',
+            'A device releases its account slot after this much inactivity; its affinity with the original account is retained separately.',
+          )}
+        </FieldDescription>
+        <Badge variant="secondary" size="sm">{hint}</Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
         <NumberField
-          className="w-full sm:w-44"
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
           min={0}
           step={1}
           smallStep={0.5}
@@ -554,14 +633,7 @@ function DeviceBindingTtl() {
           <SaveIcon />
           {t('保存', 'Save')}
         </Button>
-        <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
-      <FieldDescription>
-        {t(
-          '设备在此时长内没有请求便释放占用的账号名额；与原账号的关联仍按下方保留期保存。',
-          'A device releases its account slot after this much inactivity; its affinity with the original account is retained for the period below.',
-        )}
-      </FieldDescription>
     </Field>
   )
 }
@@ -638,11 +710,25 @@ function DeviceBindingRetention() {
   const conflict = parsed > 0 && ttl > 0 && parsed < ttl
 
   return (
-    <Field className="p-5">
-      <FieldLabel>{t('原账号关联保留期（天）', 'Account affinity retention (days)')}</FieldLabel>
-      <div className="flex w-full flex-wrap items-center gap-2">
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('原账号关联保留期', 'Account affinity retention')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {conflict
+            ? t(
+                '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+                'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+              )
+            : t(
+                '名额释放后，设备在此期限内回来仍优先使用原账号，减少 thinking 签名跨账号导致的降级重试。',
+                'After its slot is released, a returning device still prefers its original account, reducing retries caused by account-bound thinking signatures.',
+              )}
+        </FieldDescription>
+        <Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
         <NumberField
-          className="w-full sm:w-44"
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
           min={0}
           step={1}
           smallStep={0.5}
@@ -670,19 +756,7 @@ function DeviceBindingRetention() {
           <SaveIcon />
           {t('保存', 'Save')}
         </Button>
-        <span className="text-xs text-muted-foreground">{hint}</span>
       </div>
-      <FieldDescription>
-        {conflict
-          ? t(
-              '保留期短于有效期时按有效期处理，等于关闭软绑定。',
-              'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
-            )
-          : t(
-              '名额释放后，设备在此期限内回来仍优先使用原账号，减少 thinking 签名跨账号导致的降级重试。',
-              'After its slot is released, a returning device still prefers its original account during this period, reducing fallback retries caused by account-bound thinking signatures.',
-            )}
-      </FieldDescription>
     </Field>
   )
 }
@@ -727,11 +801,27 @@ function DefaultDeviceLimit() {
   const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field className="p-5">
-      <FieldLabel>{t('默认设备上限（每个账号）', 'Default device limit (per account)')}</FieldLabel>
-      <div className="flex w-full flex-wrap items-center gap-2">
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('默认设备上限', 'Default device limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '未单独配置的账号使用此上限；账号独立设置优先。',
+            'Accounts without an individual limit use this value; account-specific settings take priority.',
+          )}
+        </FieldDescription>
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(
+                `每个账号最多 ${parsed} 台设备`,
+                `Up to ${parsed} ${parsed === 1 ? 'device' : 'devices'} per account`,
+              )
+            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+        </Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
         <NumberField
-          className="w-full sm:w-44"
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
           min={0}
           value={draft}
           onValueChange={setDraft}
@@ -755,21 +845,7 @@ function DefaultDeviceLimit() {
           <SaveIcon />
           {t('保存', 'Save')}
         </Button>
-        <span className="text-xs text-muted-foreground">
-          {parsed > 0
-            ? t(
-                `每个账号最多 ${parsed} 台设备`,
-                `Up to ${parsed} ${parsed === 1 ? 'device' : 'devices'} per account`,
-              )
-            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
-        </span>
       </div>
-      <FieldDescription>
-        {t(
-          '未单独配置的账号使用此上限；账号独立设置优先。',
-          'Accounts without an individual limit use this value; account-specific settings take priority.',
-        )}
-      </FieldDescription>
     </Field>
   )
 }
@@ -891,93 +967,98 @@ function BareRateLimit() {
     && win === (data?.bare_rate_window_secs ?? 60)
 
   return (
-    <div className="space-y-3 p-5">
-      <div>
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="font-medium text-sm">
-            {t(
-              '无设备身份请求上限（每个账号）',
-              'Request limit for requests without a device identity (per account)',
-            )}
-          </p>
-          <Badge variant={inactive ? 'secondary' : 'info'} size="sm">
-            {inactive ? t('当前不生效', 'Inactive') : t('正在生效', 'Active')}
-          </Badge>
-        </div>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {inactive
-            ? t(
-                '设备身份校验已开启，无身份请求会先被拒绝；切换到兼容模式后此限制才会生效。',
-                'Identity checks are enabled, so unidentified requests are rejected first; this limit takes effect in compatible mode.',
-              )
-            : t(
-                '限制兼容模式下放行的无身份请求，0 表示不限速。',
-                'Limits unidentified requests allowed in compatible mode; 0 means unlimited.',
+    <div className="p-5">
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,0.9fr)] lg:items-start">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-medium text-sm">
+              {t(
+                '无设备身份请求上限（每个账号）',
+                'Request limit for requests without a device identity (per account)',
               )}
-        </p>
+            </p>
+            <Badge variant={inactive ? 'secondary' : 'info'} size="sm">
+              {inactive ? t('当前不生效', 'Inactive') : t('正在生效', 'Active')}
+            </Badge>
+          </div>
+          <p className="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">
+            {inactive
+              ? t(
+                  '设备身份校验已开启，无身份请求会先被拒绝；切换到兼容模式后此限制才会生效。',
+                  'Identity checks are enabled, so unidentified requests are rejected first; this limit takes effect in compatible mode.',
+                )
+              : t(
+                  '限制兼容模式下放行的无身份请求，0 表示不限速。',
+                  'Limits unidentified requests allowed in compatible mode; 0 means unlimited.',
+                )}
+          </p>
+        </div>
+        <div className="space-y-3">
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-end gap-3">
+            <Field>
+              <FieldLabel>{t('请求数', 'Request count')}</FieldLabel>
+              <NumberField disabled={inactive} min={0} value={draft} onValueChange={setDraft}>
+                <NumberFieldGroup>
+                  <NumberFieldDecrement
+                    aria-label={t(
+                      '减少无设备身份请求上限',
+                      'Decrease the request limit for requests without a device identity',
+                    )}
+                  />
+                  <NumberFieldInput
+                    aria-label={t(
+                      '无设备身份请求上限（条）',
+                      'Request limit for requests without a device identity',
+                    )}
+                  />
+                  <NumberFieldIncrement
+                    aria-label={t(
+                      '增加无设备身份请求上限',
+                      'Increase the request limit for requests without a device identity',
+                    )}
+                  />
+                </NumberFieldGroup>
+              </NumberField>
+            </Field>
+            <Field>
+              <FieldLabel>{t('时间窗口（秒）', 'Time window (seconds)')}</FieldLabel>
+              <NumberField disabled={inactive} min={1} value={windowDraft} onValueChange={setWindowDraft}>
+                <NumberFieldGroup>
+                  <NumberFieldDecrement
+                    aria-label={t(
+                      '减少无设备身份请求时间窗口',
+                      'Decrease the time window for requests without a device identity',
+                    )}
+                  />
+                  <NumberFieldInput
+                    aria-label={t(
+                      '无设备身份请求窗口（秒）',
+                      'Time window for requests without a device identity in seconds',
+                    )}
+                  />
+                  <NumberFieldIncrement
+                    aria-label={t(
+                      '增加无设备身份请求时间窗口',
+                      'Increase the time window for requests without a device identity',
+                    )}
+                  />
+                </NumberFieldGroup>
+              </NumberField>
+            </Field>
+            <Button
+              className="max-sm:size-8 max-sm:px-0"
+              size="sm"
+              loading={save.isPending}
+              disabled={inactive || unchanged}
+              onClick={() => save.mutate({ limit, win })}
+            >
+              <SaveIcon />
+              <span className="max-sm:sr-only">{t('保存', 'Save')}</span>
+            </Button>
+          </div>
+        </div>
       </div>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field>
-          <FieldLabel>{t('请求数', 'Request count')}</FieldLabel>
-          <NumberField disabled={inactive} min={0} value={draft} onValueChange={setDraft}>
-            <NumberFieldGroup>
-              <NumberFieldDecrement
-                aria-label={t(
-                  '减少无设备身份请求上限',
-                  'Decrease the request limit for requests without a device identity',
-                )}
-              />
-              <NumberFieldInput
-                aria-label={t(
-                  '无设备身份请求上限（条）',
-                  'Request limit for requests without a device identity',
-                )}
-              />
-              <NumberFieldIncrement
-                aria-label={t(
-                  '增加无设备身份请求上限',
-                  'Increase the request limit for requests without a device identity',
-                )}
-              />
-            </NumberFieldGroup>
-          </NumberField>
-        </Field>
-        <Field>
-          <FieldLabel>{t('时间窗口（秒）', 'Time window (seconds)')}</FieldLabel>
-          <NumberField disabled={inactive} min={1} value={windowDraft} onValueChange={setWindowDraft}>
-            <NumberFieldGroup>
-              <NumberFieldDecrement
-                aria-label={t(
-                  '减少无设备身份请求时间窗口',
-                  'Decrease the time window for requests without a device identity',
-                )}
-              />
-              <NumberFieldInput
-                aria-label={t(
-                  '无设备身份请求窗口（秒）',
-                  'Time window for requests without a device identity in seconds',
-                )}
-              />
-              <NumberFieldIncrement
-                aria-label={t(
-                  '增加无设备身份请求时间窗口',
-                  'Increase the time window for requests without a device identity',
-                )}
-              />
-            </NumberFieldGroup>
-          </NumberField>
-        </Field>
-      </div>
-      <Button
-        size="sm"
-        loading={save.isPending}
-        disabled={inactive || unchanged}
-        onClick={() => save.mutate({ limit, win })}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-      <p className="text-xs leading-5 text-muted-foreground">
+      <p className="mt-4 border-t pt-4 text-xs leading-5 text-muted-foreground">
         {inactive
           ? t(
               '当前配置会保留，关闭设备身份校验后自动恢复使用。',
@@ -1157,17 +1238,6 @@ function AdminPassword() {
         </AlertDialogPopup>
       </AlertDialog>
     </>
-  )
-}
-
-function SettingsSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <Frame>
-      <FrameHeader>
-        <FrameTitle>{title}</FrameTitle>
-      </FrameHeader>
-      <FramePanel className="divide-y p-0">{children}</FramePanel>
-    </Frame>
   )
 }
 

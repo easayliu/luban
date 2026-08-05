@@ -10,7 +10,6 @@ import {
   ServerIcon,
   SlidersHorizontalIcon,
   TerminalIcon,
-  type LucideIcon,
 } from 'lucide-react'
 import {
   getSettings,
@@ -32,7 +31,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
-import { Frame, FrameHeader, FramePanel, FrameTitle } from '@/components/ui/frame'
 import {
   NumberField,
   NumberFieldDecrement,
@@ -43,6 +41,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
+import { SettingsGroup } from '@/components/settings-group'
 
 /**
  * 转发形态开关。
@@ -517,25 +516,5 @@ function ForwardingToggle({
         </details>
       )}
     </Field>
-  )
-}
-
-function SettingsGroup({
-  icon: Icon,
-  title,
-  children,
-}: {
-  icon: LucideIcon
-  title: string
-  children: ReactNode
-}) {
-  return (
-    <Frame>
-      <FrameHeader className="flex-row items-center gap-2">
-        <Icon aria-hidden="true" className="size-4 text-muted-foreground" />
-        <FrameTitle>{title}</FrameTitle>
-      </FrameHeader>
-      <FramePanel className="divide-y p-0">{children}</FramePanel>
-    </Frame>
   )
 }

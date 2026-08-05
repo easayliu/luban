@@ -431,11 +431,15 @@ const previewParams = new URLSearchParams(window.location.search)
 const previewLanguage = parseLanguage(previewParams.get('lang')) ?? 'zh-CN'
 const previewDialog = previewParams.get('dialog')
 const previewSettingsParam = previewParams.get('settings')
-const previewSettings: SettingsSection | null = previewSettingsParam === 'forwarding'
-  ? 'forwarding'
-  : previewSettingsParam === 'access'
-    ? 'access'
-    : null
+const previewSettings: SettingsSection | null = previewSettingsParam === 'devices'
+  ? 'devices'
+  : previewSettingsParam === 'forwarding'
+    ? 'forwarding'
+    : previewSettingsParam === 'security'
+      ? 'security'
+      : previewSettingsParam === 'access'
+        ? 'access'
+        : null
 
 function navigatePreview(search = '') {
   const next = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)

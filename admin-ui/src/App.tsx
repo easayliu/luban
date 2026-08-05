@@ -36,7 +36,11 @@ import { useI18n } from '@/lib/i18n'
 
 function readSettingsRoute(): SettingsSection | null {
   if (!window.location.hash.startsWith('#/settings')) return null
-  return window.location.hash.includes('/forwarding') ? 'forwarding' : 'access'
+  if (window.location.hash.includes('/devices')) return 'devices'
+  if (window.location.hash.includes('/forwarding')) return 'forwarding'
+  if (window.location.hash.includes('/security')) return 'security'
+  // 兼容旧的 #/settings 与 #/settings/access 深链接。
+  return 'access'
 }
 
 function App() {
