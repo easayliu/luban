@@ -1177,11 +1177,14 @@ impl Drop for ReqLog {
             && self.status == StatusCode::OK.as_u16()
         {
             // 三种断流里最安静的一种：没报错、没断连，`message_stop` 就是没来。同样不改
-            // status——上游 EOF 与客户端提前离开在这一层是同一个现象。`output_tokens` 是
-            // 分辨二者的线索：它来自 `message_delta`，有值说明上游至少生成到了那一步。
+            // status——上游 EOF 与客户端提前离开在这一层是同一个现象。定位断点靠
+            // `last_event` 与 `events`：断在 `message_start` 是刚开口就没了，断在
+            // `content_block_delta` 是生成到一半，断在 `message_delta` 则是只差收尾那一步。
             tracing::warn!(
                 cred_id = self.cred_id, cred = %self.cred_label,
                 status = self.status,
+                last_event = %self.sniffer.last_event.as_deref().unwrap_or("-"),
+                events = self.sniffer.events,
                 output_tokens = self.sniffer.output_tokens.unwrap_or(0),
                 "the stream ended without message_stop; either the upstream stopped sending or the client left early, and the reply the client got is truncated"
             );
@@ -1338,6 +1341,18 @@ struct UsageSniffer {
     /// [`aggregate_sse`] 靠 [`Aggregated::Incomplete`] 拦住了这一类，透传路径此前没有对应
     /// 的检查——三种断流方式里最安静的那种，恰恰完全无声。
     saw_message_stop: bool,
+    /// 最后见到的 SSE 事件类型，以及已解析的事件总数（含 `ping`）。
+    ///
+    /// 断流告警只报「没收到 `message_stop`」时，`output_tokens` 是唯一线索，而它**定位不了
+    /// 断点**：官方流式文档的三个示例里，`message_start` 的 `message.usage` 就带
+    /// `output_tokens`，取值 1/2/3，而同一条流 `message_delta` 的最终值是 15/89/510。
+    /// 也就是说一个小数字既可能是「刚开口就断」，也可能是「生成完了只差收尾」，
+    /// 而两者排查方向相反。事件类型才是判据，逐行解析本来就在做，顺手记下。
+    ///
+    /// `ping` 同样计入：文档说流中可能夹带任意多个 `ping`，`last_event=ping` 表示连接还活着
+    /// 但上游没在产出内容，与 `last_event=message_start` 是两种不同的死法。
+    last_event: Option<String>,
+    events: u32,
 }
 
 impl UsageSniffer {
@@ -1380,10 +1395,14 @@ impl UsageSniffer {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
             // 只在流式模式下认：非流式那条路的错误体由 `detect_account_ban` 一侧处理，
             // 这里再记一份会让同一个 4xx 告警两次。
-            if self.is_stream {
-                match v.get("type").and_then(|t| t.as_str()) {
-                    Some("error") => self.stream_error = Some(v.clone()),
-                    Some("message_stop") => self.saw_message_stop = true,
+            if self.is_stream
+                && let Some(t) = v.get("type").and_then(|t| t.as_str())
+            {
+                self.last_event = Some(t.to_string());
+                self.events += 1;
+                match t {
+                    "error" => self.stream_error = Some(v.clone()),
+                    "message_stop" => self.saw_message_stop = true,
                     _ => {}
                 }
             }
@@ -6248,10 +6267,14 @@ mod tests {
         );
         assert!(!truncated.saw_message_stop, "流断在半路，收尾时要告警");
         assert_eq!(truncated.output_tokens, Some(14), "已生成的部分照旧计入用量");
+        // 断点定位：光看 output_tokens 分不出「刚开口就断」和「只差收尾」，事件类型才行。
+        assert_eq!(truncated.last_event.as_deref(), Some("message_delta"));
+        assert_eq!(truncated.events, 2);
 
         let mut complete = super::UsageSniffer::new(true, false);
         complete.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         assert!(complete.saw_message_stop);
+        assert_eq!(complete.last_event.as_deref(), Some("message_stop"));
     }
 
     /// 非流式响应体里的 `{"type":"error"}` 不走流内那套：那条路的 4xx 由
