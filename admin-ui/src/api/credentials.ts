@@ -155,12 +155,19 @@ export interface UsageLog {
   /** 来访原样的路径与查询串。 */
   path: string
   /**
-   * 来访客户端自报的 `User-Agent`（已截断）；没带该头的请求与 0.2.60 之前的旧记录为 null。
+   * **来访**客户端自报的 `User-Agent`（已截断）；没带该头的请求、连通性测试（不来自任何
+   * 客户端）与 0.2.60 之前的旧记录为 null。
    *
    * 认「这条是谁发的」最省事的一项：`path` 里带不带 `?beta=true` 分不出官方 CC 与第三方
    * CC 兼容客户端——那个查询串是客户端自己加的，luban 只在出站 URL 上补。
    */
   ua: string | null
+  /**
+   * **实际发给上游**的那份 `User-Agent`；0.2.61 之前的旧记录为 null。
+   *
+   * 与 `ua` 不同即说明这条走了模拟（整套头换成官方的）；相同即原样转发。
+   */
+  ua_out: string | null
   status: number
   /** 响应里是否嗅探到 usage：为 false 时下面几个 token 数是缺失而非 0。 */
   has_usage: boolean

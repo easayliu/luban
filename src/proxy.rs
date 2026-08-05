@@ -29,7 +29,7 @@ pub async fn handle(
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
     // 来访 UA：转发日志与各条拒绝日志都带上（都是 info/warn，不必开 debug）。整组识别头那条
     // debug 留着不动——排查形态时才需要那六项，日常只要认出「谁在发」，一项就够。
-    let client_ua = client_ua(&headers);
+    let client_ua = ua_of(&headers);
 
     // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
     if let Some(expected) = effective_client_key(&state)
@@ -316,6 +316,8 @@ pub async fn handle(
                 method: method.to_string(),
                 path: path_and_query,
                 ua: client_ua,
+                // 取最终那一轮的出站头——换过号的话，实际发出去的就是那份（同 logged_device）。
+                ua_out: ua_of(&upstream.headers),
                 cred_id: cred.id,
                 cred_label: cred.label.clone(),
                 device_id: logged_device,
@@ -711,14 +713,19 @@ struct ReqLog {
     ttft_ms: Option<u128>,
     method: String,
     path: String,
-    /// 来访自己的 `User-Agent`（已截断，见 [`client_ua`]）。**不是**出站那份——出站在模拟
-    /// 模式下恒为 [`config::CC_USER_AGENT`]，打出来每条都一样，等于没打。
+    /// **来访**客户端自报的 `User-Agent`（已截断，见 [`ua_of`]）。
     ///
     /// 存在的理由：`path` 记的是来访原样的路径查询串（`?beta=true` 是官方 CC 自己带的，
     /// luban 只在出站 URL 上补，见 [`ensure_beta_query`]），于是「带 metadata.user_id 却
     /// 没有 `?beta=true`」这类第三方 CC 兼容客户端在日志里和官方客户端长得一样。UA 是
     /// 分辨它们最省事的一项。
     ua: String,
+    /// **实际发给上游**的那份 `User-Agent`（见 [`build_forward_headers`]）。
+    ///
+    /// 与 `ua` 分开记而不是只留一份：模拟路径整套头换成官方的（[`official_headers`]），
+    /// 出站恒为 [`config::CC_USER_AGENT`]；非模拟路径原样转发来访那份。于是两列一比就知道
+    /// 这条走没走模拟——只存一份的话，要么看不见真实客户端是谁，要么看不见上游收到的是什么。
+    ua_out: String,
     cred_id: i64,
     cred_label: String,
     /// 完整 device_id；日志里只展示前 8 位（脱敏）。
@@ -797,6 +804,7 @@ impl Drop for ReqLog {
             // 日志里没带 UA 用 `-` 占位（对齐列宽），入库要还原成 NULL——`-` 会被当成
             // 一个真实存在的 UA，按 UA 分组时凭空多出一类。
             ua: (self.ua != "-").then(|| self.ua.clone()),
+            ua_out: (self.ua_out != "-").then(|| self.ua_out.clone()),
             status: self.status,
             has_usage,
             input_tokens: self.sniffer.input_tokens,
@@ -1915,15 +1923,18 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
     format!("{}|{}|{}", client_device_id.unwrap_or(""), h("x-stainless-arch"), h("x-stainless-os"),)
 }
 
-/// 日志用的来访 `User-Agent`：没有该头或不是可打印 ASCII 时为 `-`。
+/// 从一组头里取 `User-Agent` 供日志与落库用：没有该头或不是可打印 ASCII 时为 `-`。
+///
+/// 来访头与出站头两侧都用它——[`ReqLog`] 两份 UA 各存各的，取值规则必须是同一套，
+/// 否则「入站 == 出站」这个判断会因为两边截断/回退方式不同而失真。
 ///
 /// 截断到 120 字符：官方 CC 那串（`claude-cli/2.1.220 (external, cli)`）只有 35 字符，
-/// 浏览器与各路 SDK 拼出来的能有几百，整条打出来会把日志行撑得没法看。截断只影响日志，
-/// 转发出去的那份头一个字节都不动。
+/// 浏览器与各路 SDK 拼出来的能有几百，整条打出来会把日志行撑得没法看。截断只影响日志与
+/// 落库，转发出去的那份头一个字节都不动。
 ///
 /// 取值恒为可见 ASCII：`to_str()` 对非 ASCII 头值直接失败，那类一律落 `-`。按 `char` 截而不是
 /// `&s[..120]` 只是不给未来留坑——真按字节切，哪天换个不做此保证的取值方式就会切出 panic。
-fn client_ua(headers: &HeaderMap) -> String {
+fn ua_of(headers: &HeaderMap) -> String {
     const MAX: usize = 120;
     match headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
         Some(ua) if !ua.trim().is_empty() => ua.chars().take(MAX).collect(),
@@ -3023,6 +3034,16 @@ pub async fn probe(
         session_id: session_id_for(cred, &device_fp),
     };
     let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim), None);
+    // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
+    // Upstream 之前取，取值规则与转发路径同一套。
+    let out_ua = ua_of(&headers);
+    let plog = ProbeLog {
+        store: &state.store,
+        cred,
+        req_model: model,
+        started: &started,
+        out_ua: (out_ua != "-").then_some(out_ua),
+    };
     let upstream = Upstream {
         state,
         method: Method::POST,
@@ -3106,15 +3127,7 @@ pub async fn probe(
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
                 Err(_) => {
-                    log_probe_usage(
-                        &state.store,
-                        cred,
-                        model,
-                        status,
-                        &Bytes::new(),
-                        &info,
-                        &started,
-                    );
+                    plog.record(status, &Bytes::new(), &info);
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -3131,15 +3144,7 @@ pub async fn probe(
                 // 响应体读到一半断了：状态码与限流头都是真的，只是内容不完整，如实报出来。
                 // 这一条同样落日志——额度快照来自头，不依赖 body。
                 Ok(Err(e)) => {
-                    log_probe_usage(
-                        &state.store,
-                        cred,
-                        model,
-                        status,
-                        &Bytes::new(),
-                        &info,
-                        &started,
-                    );
+                    plog.record(status, &Bytes::new(), &info);
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -3151,7 +3156,7 @@ pub async fn probe(
                     }
                 }
                 Ok(Ok(bytes)) => {
-                    log_probe_usage(&state.store, cred, model, status, &bytes, &info, &started);
+                    plog.record(status, &bytes, &info);
                     // 命中封号特征照真实流量停用：判定器与转发共用同一个（含 401 裸响应、
                     // 「端点不支持」豁免那些规则），测试报出「已封禁」的同时卡片也变红，
                     // 而不是弹窗里一个结论、列表里另一个。
@@ -3222,15 +3227,32 @@ const PROBE_DEVICE_ID: &str = "probe";
 /// 卡片照旧显示上一次真实请求时的旧数；而这条请求确实花掉了钱，不记也等于让累计花费虚低。
 ///
 /// 写失败只告警不影响测试结果——用户要的是「通不通」，日志是副产品。
+/// 一次探测里**逐轮不变**的那几项，供 [`ProbeLog::record`] 用。
+///
+/// 打包而不是逐个传：三个落日志的分支（body 超时 / 读断 / 读完）只有 status、body、限流头
+/// 不同，其余五项完全一样。摊平成八个参数既触了 clippy 的上限，也让三处调用各抄一遍。
+struct ProbeLog<'a> {
+    store: &'a std::sync::Arc<store::CredentialStore>,
+    cred: &'a crate::credentials::Credential,
+    req_model: &'a str,
+    started: &'a std::time::Instant,
+    /// 实际发出去那份 UA，由调用方从出站头取（没有该头时为 `None`）。
+    out_ua: Option<String>,
+}
+
+impl ProbeLog<'_> {
+    fn record(&self, status: StatusCode, bytes: &Bytes, ratelimit: &RateLimitInfo) {
+        log_probe_usage(self, status, bytes, ratelimit)
+    }
+}
+
 fn log_probe_usage(
-    store: &std::sync::Arc<store::CredentialStore>,
-    cred: &crate::credentials::Credential,
-    req_model: &str,
+    ctx: &ProbeLog<'_>,
     status: StatusCode,
     bytes: &Bytes,
     ratelimit: &RateLimitInfo,
-    started: &std::time::Instant,
 ) {
+    let ProbeLog { store, cred, req_model, started, out_ua } = ctx;
     // 非流式、未压缩（wreq 已解码），喂整段 body 即可解析出顶层 `usage`。
     let mut sniffer = UsageSniffer::new(false, false);
     sniffer.feed(bytes);
@@ -3253,9 +3275,10 @@ fn log_probe_usage(
         device_id: Some(PROBE_DEVICE_ID.into()),
         model: Some(model),
         path: "/v1/messages".into(),
-        // 连通性测试没有来访客户端——这条是 luban 自己发的。留空而不是填出站那份官方 UA：
-        // 填了就成了「有个真实 CC 客户端发过这条」，而它其实只有 PROBE_DEVICE_ID 这一个身份。
+        // 入站留空：连通性测试没有来访客户端，这条是 luban 自己发的。出站照实记——它确实
+        // 按官方形态发了那串 UA（见 `probe` 里的 build_forward_headers），照实记才对得上抓包。
         ua: None,
+        ua_out: out_ua.clone(),
         status: status.as_u16(),
         has_usage: sniffer.has_usage(),
         input_tokens: sniffer.input_tokens,
@@ -3281,7 +3304,7 @@ fn log_probe_usage(
         cost_usd,
     };
     // 与转发路径同理：这里在 async 上下文里，同步写库会占住工作线程，见 [`spawn_usage_log`]。
-    spawn_usage_log(store.clone(), rec);
+    spawn_usage_log((*store).clone(), rec);
 }
 
 /// 把上游响应翻译成一份结果：2xx 取回报的模型名，其余取 `error.type`/`error.message`。
@@ -5563,15 +5586,14 @@ mod tests {
         let body = Bytes::from(
             r#"{"model":"claude-opus-5-20260115","usage":{"input_tokens":320,"output_tokens":1}}"#,
         );
-        super::log_probe_usage(
-            &store,
-            &cred,
-            "claude-opus-5",
-            StatusCode::OK,
-            &body,
-            &info,
-            &std::time::Instant::now(),
-        );
+        super::ProbeLog {
+            store: &store,
+            cred: &cred,
+            req_model: "claude-opus-5",
+            started: &std::time::Instant::now(),
+            out_ua: Some(config::CC_USER_AGENT.into()),
+        }
+        .record(StatusCode::OK, &body, &info);
 
         let q = store.latest_quota(cred.id).unwrap().expect("卡片应能读到这次测试的额度");
         assert_eq!(q.rl_5h_utilization, Some(0.32));
@@ -5585,21 +5607,25 @@ mod tests {
         assert_eq!(logs[0].input_tokens, Some(320));
         // opus $5/MTok 输入 + $25/MTok 输出：320×5 + 1×25 = 1625 微美元。
         assert_eq!(logs[0].cost_usd, Some(0.001625), "按实际用量计价，不是记 0");
+        // 测试没有来访客户端，但确实按官方形态发了出去：入站空、出站照实。
+        assert_eq!(logs[0].ua, None, "测试不来自任何客户端，入站 UA 必须为空");
+        assert_eq!(logs[0].ua_out.as_deref(), Some(config::CC_USER_AGENT), "出站照实记");
     }
 
-    /// 来访 UA 随流水落库：带 UA 的原样存，没带（日志里用 `-` 占位）的存成 NULL——`-` 存进去
-    /// 就成了一个真实存在的 UA，按 UA 分组时会凭空多出一类。
+    /// 两份 UA 各存各的：入站记来访那份、出站记实际发出去那份，`-` 占位一律还原成 NULL
+    /// （存进去就成了一个真实存在的 UA，按 UA 分组时会凭空多出一类）。
     #[test]
     fn client_ua_lands_in_the_usage_log() {
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
         let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
-        let log = |ua: &str| {
+        let log = |ua: &str, ua_out: &str| {
             drop(super::ReqLog {
                 started: std::time::Instant::now(),
                 ttft_ms: None,
                 method: "POST".into(),
                 path: "/v1/messages?beta=true".into(),
                 ua: ua.into(),
+                ua_out: ua_out.into(),
                 cred_id: cred.id,
                 cred_label: cred.label.clone(),
                 device_id: None,
@@ -5611,14 +5637,22 @@ mod tests {
                 store: store.clone(),
             })
         };
-        log("claude-cli/2.1.220 (external, cli)");
-        log("-");
+        // 非模拟路径：来访那份原样转发，两列相同。
+        log(config::CC_USER_AGENT, config::CC_USER_AGENT);
+        // 模拟路径：来访是第三方客户端，出站换成官方那串——正是分两列才看得见的东西。
+        log("python-httpx/0.27.0", config::CC_USER_AGENT);
+        // 两边都没有（裸请求且开关关到不补头）。
+        log("-", "-");
 
         // 倒序：后写的那条在前。
         let logs = store.list_usage_logs(10).unwrap();
-        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.len(), 3);
         assert_eq!(logs[0].ua, None, "没带 UA 的请求不该存成 `-`");
-        assert_eq!(logs[1].ua.as_deref(), Some("claude-cli/2.1.220 (external, cli)"));
+        assert_eq!(logs[0].ua_out, None);
+        assert_eq!(logs[1].ua.as_deref(), Some("python-httpx/0.27.0"), "来访那份是第三方客户端");
+        assert_eq!(logs[1].ua_out.as_deref(), Some(config::CC_USER_AGENT), "出站换成了官方那串");
+        assert_eq!(logs[2].ua.as_deref(), Some(config::CC_USER_AGENT));
+        assert_eq!(logs[2].ua_out.as_deref(), Some(config::CC_USER_AGENT));
     }
 
     /// 日志用的 UA 取值：缺失/空串取 `-`，过长按 char 截断（不能按字节切，会劈开多字节 UTF-8）。
@@ -5629,7 +5663,7 @@ mod tests {
             if let Some(v) = v {
                 h.insert(super::header::USER_AGENT, HeaderValue::from_str(v).unwrap());
             }
-            super::client_ua(&h)
+            super::ua_of(&h)
         };
         assert_eq!(ua(None), "-", "没有该头");
         assert_eq!(ua(Some("   ")), "-", "空白等于没带");
@@ -5640,7 +5674,7 @@ mod tests {
         let cjk = super::HeaderValue::from_bytes("中文客户端".as_bytes()).unwrap();
         let mut h = super::HeaderMap::new();
         h.insert(super::header::USER_AGENT, cjk);
-        assert_eq!(super::client_ua(&h), "-");
+        assert_eq!(super::ua_of(&h), "-");
     }
 
     /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API

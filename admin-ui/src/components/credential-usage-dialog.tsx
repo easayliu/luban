@@ -159,7 +159,8 @@ export function CredentialUsageDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogPopup className="max-w-4xl">
+      {/* 比设备弹窗宽一档：这张表有十列，4xl 下 UA 与模型两列会被挤到只剩几个字符。 */}
+      <DialogPopup className="max-w-5xl">
         <DialogHeader>
           <div className="flex items-start gap-3 pr-8">
             <Avatar>
@@ -360,7 +361,17 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('设备', 'Device')}</TableHead>
-          <TableHead className="whitespace-nowrap">{t('客户端', 'Client')}</TableHead>
+          {/* 两份 UA 合在一列：绝大多数请求原样转发，两者是同一串，占两列纯浪费宽度。
+              只在被改写时才多显示一行出站那份，见 UaCell。 */}
+          <TableHead
+            className="min-w-52 whitespace-nowrap"
+            title={t(
+              '来访客户端自报的 User-Agent；被改写时另起一行显示实际发给上游的那份',
+              'User-Agent reported by the incoming client; when rewritten, the one actually sent upstream is shown on a second line',
+            )}
+          >
+            {t('客户端 UA', 'Client UA')}
+          </TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -415,17 +426,43 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
               <TableCell className="whitespace-nowrap font-mono text-xs" title={deviceId}>
                 {deviceShort}
               </TableCell>
-              {/* UA 是 0.2.60 才开始记的，之前的记录为空——不是「没有客户端」。 */}
-              <TableCell
-                className={cn('max-w-56 truncate', !log.ua && 'text-muted-foreground')}
-                title={log.ua ?? t('该记录没有 UA', 'No user agent on this record')}
-              >
-                {log.ua ?? '—'}
-              </TableCell>
+              <UaCell ua={log.ua} uaOut={log.ua_out} />
             </TableRow>
           )
         })}
       </TableBody>
     </Table>
+  )
+}
+
+/**
+ * UA 单元格：来访那份为主，被改写时另起一行显示实际发给上游的那份。
+ *
+ * **折行而不是截断**：真实 UA 动辄六七十字符
+ * （`claude-cli/2.1.219 (external, local-agent, agent-sdk/0.3.219)`），截断后靠 title 悬停才能
+ * 看全，而这一列的用处正是「一眼认出谁在发」。折行让它整串可见，代价只是行高。
+ *
+ * 两者相同（原样转发）时只显示一份——绝大多数请求都是这种，重复显示等于白占半屏。
+ * 都为空的是 0.2.60 之前的旧记录，不是「没有客户端」。
+ */
+function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
+  const { t } = useI18n()
+  const rewritten = !!uaOut && uaOut !== ua
+  return (
+    <TableCell className="min-w-52 max-w-72 whitespace-normal break-all align-top">
+      <span className={cn(!ua && 'text-muted-foreground')}>
+        {ua ?? (uaOut
+          ? t('无（luban 自身发起）', 'None (sent by luban itself)')
+          : '—')}
+      </span>
+      {rewritten && (
+        <span
+          className="mt-0.5 block text-muted-foreground"
+          title={t('实际发给上游的 User-Agent', 'User-Agent actually sent upstream')}
+        >
+          → {uaOut}
+        </span>
+      )}
+    </TableCell>
   )
 }
