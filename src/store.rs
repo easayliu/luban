@@ -983,6 +983,9 @@ impl CredentialStore {
         if let Some(v) = on(SYSTEM_CACHE_TTL) {
             flags.cache_ttl_1h = v;
         }
+        if let Some(v) = on(NONSTREAM_AS_SSE) {
+            flags.nonstream_as_sse = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1083,6 +1086,11 @@ pub const FILL_METADATA: &str = "fill_metadata";
 /// 一直被粘性绑定的设备撞上，而其它账号闲着。
 pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 
+/// 非流式 `/v1/messages` 是否改成流式发给上游、再聚合成整段 JSON 回给客户端的 settings
+/// 键名。缺省视为开启：CC 从不发非流式的 `/v1/messages`，透传等于每条这类请求都留一处
+/// 100% 稳定的判据。见 [`ForwardFlags::nonstream_as_sse`]。
+pub const NONSTREAM_AS_SSE: &str = "nonstream_as_sse";
+
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。
 ///
@@ -1168,6 +1176,26 @@ pub struct ForwardFlags {
     /// 与 [`Self::cache_scope_global`] 一样要 beta 认（`extended-cache-ttl-2025-04-11`，
     /// 由 `merge_beta` 补），故还连着那个开关，见 [`crate::proxy::rewrite_body`]。
     pub cache_ttl_1h: bool,
+    /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
+    ///
+    /// **这是形态对齐里最硬的一项**：官方 CC 的 `/v1/messages` **恒为 `stream:true`**，
+    /// 一条 `stream:false` 转发出去就是 100% 的判据，比 UA、比头序都硬（那些至少还有
+    /// 第三方客户端会撞对）。而流/非流在**头上完全同形**——官方即便流式也发
+    /// `accept: application/json`（见 `simulated_headers_replace_client_headers`），
+    /// 差别只在 body 那一个字段，所以改起来只动一个 bool、不碰任何头。
+    ///
+    /// 只作用于计费路径（[`crate::proxy::is_billable_messages`]）：`count_tokens`
+    /// 官方本来就是非流 JSON，动它反而制造偏差。
+    ///
+    /// 客户端侧完全无感：回给它的仍是 `content-type: application/json` + 整段 Message，
+    /// 由 [`crate::proxy::aggregate_sse`] 按官方那套事件语义攒出来。上游中途出错时那条
+    /// `event: error` 虽然裹在 200 里，也会按 `error.type` 翻译成非流式那边该有的状态码
+    /// （见 [`crate::proxy::error_status`]），故客户端的错误分支照旧能走。
+    ///
+    /// 代价是整段响应要在内存里攒齐才发出（上限即 `max_tokens`，长文本级别，不是流量级别），
+    /// 以及 `ttft_ms` 记的是上游首字节、与客户端的感知对不上——后者由 `usage_logs` 的
+    /// `sse_aggregated` 列标出来。
+    pub nonstream_as_sse: bool,
 }
 
 impl Default for ForwardFlags {
@@ -1186,6 +1214,7 @@ impl Default for ForwardFlags {
             rate_limit_retry: true,
             cache_scope_global: true,
             cache_ttl_1h: true,
+            nonstream_as_sse: true,
         }
     }
 }
@@ -1277,6 +1306,9 @@ pub struct UsageRecord {
     pub ratelimit_raw: Option<String>,
     /// 等价 API 费用（USD）。
     pub cost_usd: Option<f64>,
+    /// 这条来访本来是非流式、被改写成流式发给上游再聚合回整段 JSON（见
+    /// [`ForwardFlags::nonstream_as_sse`]）。
+    pub sse_aggregated: bool,
 }
 
 /// 一条落库后的用量日志（读取用）。
@@ -1294,6 +1326,9 @@ pub struct UsageLog {
     /// **实际发给上游**的那份 `User-Agent`；旧记录为 `None`。
     pub ua_out: Option<String>,
     pub status: u16,
+    /// 这条是非流转流聚合回来的（见 [`ForwardFlags::nonstream_as_sse`]）。
+    /// 该列是 0.2.63 加的，旧记录一律为 `false`。
+    pub sse_aggregated: bool,
     pub has_usage: bool,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -1609,9 +1644,10 @@ impl CredentialStore {
                  cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                  rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
-                 rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out)
+                 rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                     ?30)",
             params![
                 ts,
                 rec.cred_id,
@@ -1642,6 +1678,7 @@ impl CredentialStore {
                 rec.cost_usd,
                 rec.ua,
                 rec.ua_out,
+                rec.sse_aggregated as i64,
             ],
         )?;
         // 落账。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属，只记日志不记账。
@@ -1766,7 +1803,7 @@ impl CredentialStore {
                     cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                     unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                     rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                    cost_usd, rl_overage_in_use, ua, ua_out
+                    cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated
                FROM usage_logs
               WHERE (?1 IS NULL OR cred_id = ?1)
                 AND (?2 IS NULL OR id <= ?2)
@@ -1804,6 +1841,7 @@ impl CredentialStore {
                 rl_overage_in_use: r.get(27)?,
                 ua: r.get(28)?,
                 ua_out: r.get(29)?,
+                sse_aggregated: r.get::<_, i64>(30)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -1892,7 +1930,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             -- 原始限流头（兜底：字段变化时仍可回看）。
             ratelimit_raw      TEXT,
             -- 按官方定价估算的等价 API 费用（USD）；模型未知时为空。
-            cost_usd           REAL
+            cost_usd           REAL,
+            -- 这条来访本来是非流式、被改写成流式发给上游再聚合回整段 JSON（1/0）。
+            -- 它解释了同一条记录里 ttft_ms 与 total_ms 为什么会差很多：TTFT 记的是上游
+            -- 首字节，而客户端是在末尾一次性收到整段的。见 ForwardFlags::nonstream_as_sse。
+            sse_aggregated     INTEGER NOT NULL DEFAULT 0 CHECK (sse_aggregated IN (0,1))
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts   ON usage_logs(ts);
         -- 账号列表的每一项统计（最近使用 MAX(ts)、累计费用、额度窗口内费用）都是
@@ -1957,6 +1999,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "rl_overage_in_use INTEGER",
         "ua TEXT",
         "ua_out TEXT",
+        // CHECK 只写在建表里：ADD COLUMN 带 CHECK 各版本行为不一，而这一列的写入方只有
+        // insert_usage_log 一处，值恒为 0/1。
+        "sse_aggregated INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
     }
@@ -3865,6 +3910,51 @@ mod tests {
         assert_eq!(q.requests_5h, Some(1));
     }
 
+    /// 「非流转流」标记要能落库并原样读回；旧库补出来的那一列默认 0（它们本就早于这个
+    /// 功能，没有一条是聚合来的），不能是 NULL——读取侧按 `i64` 取，NULL 会直接报错。
+    #[test]
+    fn sse_aggregated_round_trips_and_defaults_to_false() {
+        // 先用**没有**该列的旧库建表，再走 init_schema 补列，走的正是升级路径。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_logs (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL DEFAULT (unixepoch()),
+                cred_id INTEGER, cred_label TEXT NOT NULL DEFAULT '',
+                device_id TEXT, model TEXT, path TEXT NOT NULL DEFAULT '',
+                status INTEGER NOT NULL DEFAULT 0,
+                has_usage INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER, output_tokens INTEGER,
+                cache_creation_tokens INTEGER, cache_read_tokens INTEGER,
+                ttft_ms INTEGER, total_ms INTEGER
+            ) STRICT;
+             INSERT INTO usage_logs (cred_label) VALUES ('old');",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let cred = store.insert("a", None, "t", "r", 0, None).unwrap().id;
+
+        for aggregated in [true, false] {
+            store
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(cred),
+                    sse_aggregated: aggregated,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let logs =
+            store.query_usage_logs(UsageLogQuery { limit: 10, ..Default::default() }).unwrap();
+        // 倒序：最新写入的（false）在前，然后是 true，最后是升级前就存在的那条。
+        assert_eq!(
+            logs.iter().map(|l| l.sse_aggregated).collect::<Vec<_>>(),
+            vec![false, true, false],
+            "标记要原样读回，且旧记录退化成 false 而不是读取失败"
+        );
+    }
+
     /// 请求明细的筛选与分页：按账号只出该账号的记录，页码不重叠，且**锚点之后新写入的记录
     /// 不得挤动已在翻的页**——这正是页码翻页要带 `until_id` 的理由。
     #[test]
@@ -4246,6 +4336,7 @@ mod tests {
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
             (SYSTEM_CACHE_TTL, "0"),
+            (NONSTREAM_AS_SSE, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -4266,6 +4357,7 @@ mod tests {
                 rate_limit_retry: false,
                 cache_scope_global: false,
                 cache_ttl_1h: false,
+                nonstream_as_sse: false,
             }
         );
 

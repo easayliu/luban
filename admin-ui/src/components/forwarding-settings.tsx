@@ -205,6 +205,22 @@ export function ForwardingSettingsContent() {
             'Restore the official client’s request header casing and order; disable only when troubleshooting compatibility issues.',
           )}
         />
+        <ForwardingToggle
+          k="nonstream_as_sse"
+          label={t('非流式请求流式化', 'Upgrade non-streaming requests')}
+          summary={t(
+            '把非流式请求改成流式发给上游，响应仍按非流式整段返回，客户端无感。',
+            'Send non-streaming requests upstream as streaming ones and return the response as a single non-streaming body, transparently to the client.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端的对话请求一律是流式的，非流式请求转发出去就是一处稳定特征。开启后 luban 只改请求里的 stream 字段，收到的流式响应会在本地拼回完整内容，再按客户端原本期待的格式返回，请求头与返回格式都不变。上游中途报错时，错误原文会照非流式该有的状态码返回，客户端的错误处理不受影响。代价：响应要等上游全部生成完才发出（与非流式本来的行为一致），且整段内容要在内存里暂存；请求明细里这类记录会标注「非流转流」，因为它的首字耗时记的是上游首字节，与客户端的感知不同。仅作用于对话请求，token 计数接口不受影响。',
+                'The official client always sends conversation requests as streaming ones, so a non-streaming request forwarded as-is is a stable tell. When enabled, luban only flips the stream field in the request, reassembles the streamed response locally, and returns it in the format the client already expected — request headers and response format are unchanged. If the upstream errors mid-stream, the raw error is returned with the status code a non-streaming request would have received, so client error handling is unaffected. Costs: the response is sent only after the upstream finishes generating (same as non-streaming behaviour anyway) and the whole body is buffered in memory; such records are tagged “stream-upgraded” in the request log, because their TTFT is the upstream first byte rather than what the client perceived. Applies to conversation requests only; the token-counting endpoint is untouched.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={DatabaseIcon} title={t('系统提示词', 'System prompt')}>

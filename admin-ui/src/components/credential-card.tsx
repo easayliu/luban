@@ -8,6 +8,7 @@ import {
   SmartphoneIcon,
   TimerOffIcon,
   TriangleAlertIcon,
+  WalletCardsIcon,
   XIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
@@ -61,6 +62,7 @@ import {
   MeterTrack,
   MeterValue,
 } from '@/components/ui/meter'
+import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 
@@ -370,7 +372,7 @@ export function CredentialCard({
         </CardPanel>
 
         <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
-          <div className="grid min-w-0 gap-2 @sm/card:grid-cols-[auto_minmax(0,1fr)] @sm/card:items-center @sm/card:gap-4">
+          <div className="flex min-w-0 items-center gap-2 @sm/card:gap-4">
             <Button
               type="button"
               variant="ghost"
@@ -384,8 +386,13 @@ export function CredentialCard({
               <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
               <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
             </Button>
-            <span className="whitespace-nowrap text-sm" title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}>
-              <span className="text-muted-foreground">{t('累计 ', 'Total ')}</span>
+            <Separator orientation="vertical" className="h-5" />
+            <span
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
+              title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}
+            >
+              <WalletCardsIcon className="size-4 text-muted-foreground" aria-hidden />
+              <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
               <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
             </span>
           </div>

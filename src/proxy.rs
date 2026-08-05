@@ -151,6 +151,14 @@ pub async fn handle(
     // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
     // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
     let req_speed = request_speed(body_json.as_ref());
+    // 这条非流式请求要不要改成流式发、再聚合回整段 JSON（见
+    // [`store::ForwardFlags::nonstream_as_sse`]）。
+    //
+    // 要求 body 能解析：解析不出来的话 [`rewrite_body`] 那边同样会原样返回，`stream` 根本
+    // 改不成 true，此时若还按聚合走，就会拿一份非 SSE 的响应去喂聚合器。两处的判据必须同源。
+    let upgrade_stream = billable
+        && flags.nonstream_as_sse
+        && body_json.as_ref().is_some_and(|v| !stream_requested(v));
 
     // 7) 发起上游请求并流式回传。头名的拼写与顺序由 orig_header_case 决定（关掉即退回
     //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
@@ -198,6 +206,7 @@ pub async fn handle(
             billable,
             sim,
             bare_session,
+            force_stream: upgrade_stream,
         };
         let resp = upstream.send(upstream.shape(&body, &cred, &device_fp)).await;
 
@@ -322,6 +331,7 @@ pub async fn handle(
                 cred_label: cred.label.clone(),
                 device_id: logged_device,
                 status: status.as_u16(),
+                sse_aggregated: false,
                 sniffer: UsageSniffer::new(is_stream, compressed),
                 req_speed,
                 req_model: req_model.clone(),
@@ -386,7 +396,7 @@ pub async fn handle(
                                 retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl)
                                     .await
                             {
-                                return stream_upstream(up, rl);
+                                return relay_upstream(up, rl, upgrade_stream).await;
                             }
                         }
                         builder.body(Body::from(bytes)).unwrap_or_else(|e| {
@@ -402,7 +412,7 @@ pub async fn handle(
                 };
             }
 
-            stream_upstream(up, rl)
+            relay_upstream(up, rl, upgrade_stream).await
         }
         Err(e) => {
             // wreq 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
@@ -446,6 +456,9 @@ struct Upstream<'a> {
     /// 只会让它们对不上，那比两处都缺更显眼；没带才派生，并由 [`build_forward_headers`]
     /// 把同一个值补进头里。
     bare_session: Option<String>,
+    /// 来访是非流式、要改写成 `stream:true` 发出（回程再聚合成整段 JSON）。
+    /// 见 [`store::ForwardFlags::nonstream_as_sse`]。
+    force_stream: bool,
 }
 
 impl Upstream<'_> {
@@ -467,6 +480,7 @@ impl Upstream<'_> {
                 self.flags,
                 self.sim.as_ref(),
                 self.bare_session.as_deref(),
+                self.force_stream,
             )
         } else {
             body.clone()
@@ -509,13 +523,40 @@ fn resp_shape(up: &wreq::Response) -> (bool, Option<String>) {
 
 /// 拼出回给客户端的响应骨架：上游状态码 + 放行的上游响应头（见 [`is_resp_forwardable`]）。
 fn resp_builder(up: &wreq::Response) -> axum::http::response::Builder {
+    resp_builder_as(up, None)
+}
+
+/// 同 [`resp_builder`]，但把 `content-type` 换成 `ct`。
+///
+/// **必须在这一层换而不是事后 `.header()` 追加**：`Builder::header` 是**追加**语义，
+/// 那样会得到两个 `content-type`（`text/event-stream` 在前），客户端按哪个都可能。
+/// 聚合路径回的是整段 JSON，上游那份 SSE 的 `content-type` 必须原地替掉。
+fn resp_builder_as(up: &wreq::Response, ct: Option<&str>) -> axum::http::response::Builder {
     let mut builder = Response::builder().status(up.status());
     for (k, v) in up.headers().iter() {
-        if is_resp_forwardable(k) {
-            builder = builder.header(k, v);
+        if !is_resp_forwardable(k) {
+            continue;
         }
+        if ct.is_some() && k == header::CONTENT_TYPE {
+            continue;
+        }
+        builder = builder.header(k, v);
     }
-    builder
+    match ct {
+        Some(ct) => builder.header(header::CONTENT_TYPE, ct),
+        None => builder,
+    }
+}
+
+/// 回程总入口：按来访形态决定原样流式回传，还是把上游的 SSE 聚合成整段 JSON。
+///
+/// `upgrade_stream` 为真即「来访是非流式、我们替它改成了流式」（见
+/// [`store::ForwardFlags::nonstream_as_sse`]）。此时**只有上游真回了 SSE 才聚合**——
+/// 上游若因为别的原因回了整段 JSON（形态没被接受、或哪天默认变了），原样透传才是对的，
+/// 拿聚合器去解一份非 SSE 的 body 只会得到一个空 Message。
+async fn relay_upstream(up: wreq::Response, rl: ReqLog, upgrade_stream: bool) -> Response {
+    let (is_stream, _) = resp_shape(&up);
+    if upgrade_stream && is_stream { aggregate_sse(up, rl).await } else { stream_upstream(up, rl) }
 }
 
 /// 把上游响应包成流式回传：首块到达记 TTFT，边转发边嗅探用量；
@@ -534,6 +575,343 @@ fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+}
+
+/// 收齐上游 SSE、聚合成一条整段 JSON 的 Message 回给客户端（来访本来发的就是非流式）。
+///
+/// 用量嗅探照旧按 SSE 逐行走——**比非流式那条路更准**：整段 JSON 模式有 1MB 的累积上限，
+/// 超了就整条丢用量，逐行模式没有这个限制。TTFT 记的是上游首字节，客户端感知不到（它只会
+/// 在末尾一次性收到整段），故日志里这两列会不一致，`sse_aggregated=true` 用来标出这类记录。
+async fn aggregate_sse(up: wreq::Response, mut rl: ReqLog) -> Response {
+    let builder = resp_builder_as(&up, Some("application/json"));
+    rl.sse_aggregated = true;
+    let mut agg = SseAggregator::default();
+    let mut stream = up.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "upstream SSE broke while aggregating; failing the request");
+                rl.status = StatusCode::BAD_GATEWAY.as_u16();
+                return (StatusCode::BAD_GATEWAY, format!("upstream stream failed: {e}"))
+                    .into_response();
+            }
+        };
+        if rl.ttft_ms.is_none() {
+            rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+        }
+        rl.sniffer.feed(&bytes);
+        agg.feed(&bytes);
+    }
+    match agg.finish() {
+        // 正常收尾：整段 Message，`content-type` 已换成 application/json。
+        Aggregated::Message(msg) => match serde_json::to_vec(&msg) {
+            Ok(body) => builder
+                .body(Body::from(body))
+                .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response()),
+            Err(e) => {
+                rl.status = StatusCode::BAD_GATEWAY.as_u16();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to serialize the aggregated message: {e}"),
+                )
+                    .into_response()
+            }
+        },
+        // 流中 `event: error`：错误 JSON 原样当响应体，**状态码按 `error.type` 映射**
+        // （见 [`error_status`]）。这条错误是裹在 200 里来的，照搬 200 等于把一次失败记成
+        // 成功——客户端要靠状态码分支，日志与统计也要靠它，所以翻译成非流式那边该有的那个。
+        Aggregated::UpstreamError(payload) => {
+            let status = error_status(&payload);
+            tracing::warn!(
+                status = status.as_u16(),
+                error = %payload.get("error").map(|e| e.to_string()).unwrap_or_else(|| payload.to_string()),
+                "upstream sent an error event mid-stream; mapping it to a status code"
+            );
+            rl.status = status.as_u16();
+            match serde_json::to_vec(&payload) {
+                Ok(body) => builder
+                    .status(status)
+                    .body(Body::from(body))
+                    .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response()),
+                Err(e) => {
+                    rl.status = StatusCode::BAD_GATEWAY.as_u16();
+                    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                }
+            }
+        }
+        // 没收到 `message_stop` 就断了 → 502。**不能把攒了一半的内容当完整响应回去**：
+        // 客户端拿到的会是一条看着正常、实则被截断的 Message，比一个明确的错误糟得多。
+        Aggregated::Incomplete(why) => {
+            tracing::warn!(reason = why, "upstream SSE ended without message_stop; returning 502");
+            rl.status = StatusCode::BAD_GATEWAY.as_u16();
+            (StatusCode::BAD_GATEWAY, format!("incomplete upstream stream: {why}")).into_response()
+        }
+    }
+}
+
+/// 上游流中 `event: error` 的 `error.type` → HTTP 状态码。
+///
+/// 取值表照抄非流式那条路上同一个错误会用的状态码（见 Anthropic 的 errors 文档），
+/// 这样开不开「非流式请求流式化」，客户端看到的状态码都一样。
+///
+/// **认不出来的类型一律 500**，不是 200：它确实是个错误，回 200 会让客户端与统计都把它
+/// 当成功。500 是最不误导的兜底——客户端会当服务端故障重试，而不是把错误体当成模型输出。
+fn error_status(payload: &serde_json::Value) -> StatusCode {
+    let kind =
+        payload.get("error").and_then(|e| e.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+    match kind {
+        "invalid_request_error" => StatusCode::BAD_REQUEST,
+        "authentication_error" => StatusCode::UNAUTHORIZED,
+        // 计费问题上游同样回 403（额度/欠费与权限不足共用一个状态码）。
+        "permission_error" | "billing_error" => StatusCode::FORBIDDEN,
+        "not_found_error" => StatusCode::NOT_FOUND,
+        "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "timeout_error" => StatusCode::REQUEST_TIMEOUT,
+        "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+        // 529 不在 `StatusCode` 的常量表里，只能按数字构造（`http` 允许 100~999）。
+        "overloaded_error" => {
+            StatusCode::from_u16(529).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        "api_error" => StatusCode::INTERNAL_SERVER_ERROR,
+        other => {
+            tracing::warn!(
+                error_type = other,
+                "unrecognized upstream error type in a mid-stream error event; falling back to 500"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// [`SseAggregator::finish`] 的三种结局。
+enum Aggregated {
+    /// 收到了 `message_stop`，攒出一条完整 Message。
+    Message(serde_json::Value),
+    /// 流中来了 `event: error`，带上那份错误 JSON 原样回给客户端。
+    UpstreamError(serde_json::Value),
+    /// 流断在半路（没有 `message_start` 或没有 `message_stop`）。
+    Incomplete(&'static str),
+}
+
+/// 把 `/v1/messages` 的 SSE 事件流攒回一条整段 Message，规则与官方各语言 SDK 一致：
+///
+/// | 事件 | 动作 |
+/// |---|---|
+/// | `message_start` | 取 `.message` 当骨架（`content` 清空重攒） |
+/// | `content_block_start` | `content[index] = .content_block`（原样收下） |
+/// | `content_block_delta` | 按 `delta.type` 追加到该块的对应字段 |
+/// | `content_block_stop` | `input_json_delta` 攒的串在这里解析成 `.input` |
+/// | `message_delta` | `.delta` 合进顶层、`.usage` 合进 `usage` |
+/// | `message_stop` | 收尾 |
+/// | `ping` / 未知事件 | 忽略 |
+///
+/// **未知的块类型自动透传**（`content_block_start` 整个收下，不挑字段），所以上游新增块类型
+/// 时这里不用改。**未知的 `delta.type` 会丢内容**，故打一条 warn 而不是静默——那是唯一需要
+/// 跟着上游演进的地方。
+#[derive(Default)]
+struct SseAggregator {
+    /// 未处理完的行尾（`feed` 按行切，最后一段不完整的留着等下一块）。
+    buf: Vec<u8>,
+    /// `message_start` 给的骨架；没收到它就说明流从一开始就不对。
+    msg: Option<serde_json::Value>,
+    /// 各 `tool_use` 块正在累积的 `partial_json`，键是块下标。
+    partial_json: std::collections::HashMap<usize, String>,
+    /// 已经 warn 过的未知 `delta.type`，同一条流里只报一次。
+    warned: Vec<String>,
+    /// 收到过 `message_stop`。
+    done: bool,
+    /// 流中的 `event: error` 负载（整个 data 对象）。
+    error: Option<serde_json::Value>,
+}
+
+impl SseAggregator {
+    /// 喂入一块响应字节，按整行处理，不完整的行尾留在 `buf` 里。
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            self.parse_line(&line[..line.len() - 1]);
+        }
+        // 防御：异常超长行避免无界增长（与 [`UsageSniffer::feed`] 同口径）。
+        if self.buf.len() > 1_000_000 {
+            self.buf.clear();
+        }
+    }
+
+    /// 解析一行。只认 `data:` 行——事件类型在 payload 自己的 `type` 字段里，
+    /// `event:` 行没有额外信息，忽略即可。
+    fn parse_line(&mut self, line: &[u8]) {
+        let Ok(s) = std::str::from_utf8(line) else { return };
+        let Some(json) = s.trim().strip_prefix("data:") else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) else { return };
+        self.apply(&v);
+    }
+
+    /// 处理一个已解析的事件。
+    fn apply(&mut self, v: &serde_json::Value) {
+        match v.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
+            "message_start" => {
+                let Some(mut msg) = v.get("message").cloned() else { return };
+                // 骨架里的 `content` 一律清空：官方那份是 `[]`，内容全靠后面的块事件攒。
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.insert("content".into(), serde_json::Value::Array(Vec::new()));
+                }
+                self.msg = Some(msg);
+            }
+            "content_block_start" => {
+                let (Some(idx), Some(block)) = (event_index(v), v.get("content_block").cloned())
+                else {
+                    return;
+                };
+                if let Some(slot) = self.block_mut(idx) {
+                    *slot = block;
+                }
+            }
+            "content_block_delta" => {
+                let (Some(idx), Some(delta)) = (event_index(v), v.get("delta").cloned()) else {
+                    return;
+                };
+                self.apply_delta(idx, &delta);
+            }
+            "content_block_stop" => {
+                let Some(idx) = event_index(v) else { return };
+                // 攒完的 `partial_json` 在这里落成 `input`。空串意味着这个块没有增量，
+                // 保留 `content_block_start` 给的那份（官方那份是 `{}`）。
+                let Some(raw) = self.partial_json.remove(&idx).filter(|s| !s.is_empty()) else {
+                    return;
+                };
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(input) => {
+                        if let Some(block) = self.block_mut(idx)
+                            && let Some(obj) = block.as_object_mut()
+                        {
+                            obj.insert("input".into(), input);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        index = idx,
+                        error = %e,
+                        "failed to parse the accumulated tool_use input_json; keeping the block's original input"
+                    ),
+                }
+            }
+            "message_delta" => {
+                let Some(msg) = self.msg.as_mut().and_then(|m| m.as_object_mut()) else { return };
+                // `delta` 里是顶层字段（stop_reason/stop_sequence/…）：逐个合进去，
+                // 不认识的字段照样合——那是上游新增的顶层信息，丢了才是错。
+                if let Some(delta) = v.get("delta").and_then(|d| d.as_object()) {
+                    for (k, val) in delta {
+                        msg.insert(k.clone(), val.clone());
+                    }
+                }
+                // `usage` 是**增量覆盖**：这里给的是最终 output_tokens 等，逐键盖上去，
+                // message_start 那份里没被提到的键（cache_read 等）保留。
+                if let Some(usage) = v.get("usage").and_then(|u| u.as_object()) {
+                    let slot = msg
+                        .entry("usage")
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    if let Some(obj) = slot.as_object_mut() {
+                        for (k, val) in usage {
+                            obj.insert(k.clone(), val.clone());
+                        }
+                    }
+                }
+            }
+            "message_stop" => self.done = true,
+            // 上游明确报错：整份 data 收下（形状与非流式的错误响应体一致：`{type, error}`）。
+            "error" => self.error = Some(v.clone()),
+            // `ping` 与将来新增的事件：没有内容要攒，忽略。
+            _ => {}
+        }
+    }
+
+    /// 按 `delta.type` 把增量追加到对应字段。
+    fn apply_delta(&mut self, idx: usize, delta: &serde_json::Value) {
+        let kind = delta.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        // 文本类三种：同样是「取一个字符串字段追加到块的同名目标字段」。
+        let text = |field: &str| delta.get(field).and_then(|t| t.as_str()).unwrap_or_default();
+        match kind {
+            "text_delta" => self.append_str(idx, "text", text("text")),
+            "thinking_delta" => self.append_str(idx, "thinking", text("thinking")),
+            "signature_delta" => self.append_str(idx, "signature", text("signature")),
+            // tool_use 的入参是分片的 JSON 串，攒到 content_block_stop 再整体解析。
+            "input_json_delta" => {
+                self.partial_json.entry(idx).or_default().push_str(text("partial_json"));
+            }
+            "citations_delta" => {
+                let Some(citation) = delta.get("citation").cloned() else { return };
+                if let Some(block) = self.block_mut(idx)
+                    && let Some(obj) = block.as_object_mut()
+                {
+                    match obj.get_mut("citations").and_then(|c| c.as_array_mut()) {
+                        Some(list) => list.push(citation),
+                        None => {
+                            obj.insert(
+                                "citations".into(),
+                                serde_json::Value::Array(vec![citation]),
+                            );
+                        }
+                    }
+                }
+            }
+            // 认不出来的增量类型 = 这块内容会丢。绝不静默：它是本聚合器唯一需要跟着上游
+            // 演进的地方，日志里没有信号的话，症状会是「响应少了一段」而查不出所以然。
+            other => {
+                if !self.warned.iter().any(|w| w == other) {
+                    self.warned.push(other.to_string());
+                    tracing::warn!(
+                        delta_type = other,
+                        "unknown SSE delta type while aggregating; its content is dropped from the aggregated response"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 把 `s` 追加到第 `idx` 块的 `field` 字段（字段不存在就新建）。
+    fn append_str(&mut self, idx: usize, field: &str, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let Some(block) = self.block_mut(idx) else { return };
+        let Some(obj) = block.as_object_mut() else { return };
+        match obj.get_mut(field).and_then(|t| t.as_str()).map(|t| format!("{t}{s}")) {
+            Some(joined) => {
+                obj.insert(field.into(), serde_json::Value::String(joined));
+            }
+            None => {
+                obj.insert(field.into(), serde_json::Value::String(s.to_string()));
+            }
+        }
+    }
+
+    /// 取第 `idx` 块的可变引用，必要时用 `null` 把数组补长——块事件理论上顺序到达，
+    /// 但下标是上游给的，按它填才不会因为一次乱序把内容写错位置。
+    fn block_mut(&mut self, idx: usize) -> Option<&mut serde_json::Value> {
+        let content = self.msg.as_mut()?.as_object_mut()?.get_mut("content")?.as_array_mut()?;
+        while content.len() <= idx {
+            content.push(serde_json::Value::Null);
+        }
+        content.get_mut(idx)
+    }
+
+    /// 收尾判定，见 [`Aggregated`]。
+    fn finish(self) -> Aggregated {
+        if let Some(err) = self.error {
+            return Aggregated::UpstreamError(err);
+        }
+        match self.msg {
+            None => Aggregated::Incomplete("no message_start event"),
+            Some(_) if !self.done => Aggregated::Incomplete("no message_stop event"),
+            Some(msg) => Aggregated::Message(msg),
+        }
+    }
+}
+
+/// 取事件里的 `index`（块事件用它定位是第几块）。
+fn event_index(v: &serde_json::Value) -> Option<usize> {
+    v.get("index")?.as_u64().map(|i| i as usize)
 }
 
 /// 上游以「thinking 块签名无效」拒绝后的兜底：把历史 thinking 降级成 text，用**同一个凭证**
@@ -731,6 +1109,13 @@ struct ReqLog {
     /// 完整 device_id；日志里只展示前 8 位（脱敏）。
     device_id: Option<String>,
     status: u16,
+    /// 这条来访本来是非流式、被改成流式发给上游再聚合回整段 JSON（见
+    /// [`store::ForwardFlags::nonstream_as_sse`]）。
+    ///
+    /// 日志与 `usage_logs` 两处都记：它解释了同一条记录里 `ttft_ms` 与 `total_ms` 为什么会
+    /// 差很多——TTFT 记的是上游首字节，而客户端是在末尾一次性收到整段的。没有这个标记的话，
+    /// 这类记录在明细里看着就像一次「首字节极快、总耗时极长」的异常请求。
+    sse_aggregated: bool,
     /// 增量嗅探到的响应用量。
     sniffer: UsageSniffer,
     /// 请求体里声明的速度档；仅在响应未回报 `usage.speed` 时兜底。
@@ -791,6 +1176,7 @@ impl Drop for ReqLog {
             cache_read_tokens = self.sniffer.cache_read_tokens.unwrap_or(0),
             ttft_ms = self.ttft_ms.map(|v| v as u64).unwrap_or(0),
             total_ms,
+            sse_aggregated = self.sse_aggregated,
             cost_usd = cost_usd.map(|c| format!("{c:.5}")).unwrap_or_else(|| "-".into()),
             "forwarded"
         );
@@ -806,6 +1192,7 @@ impl Drop for ReqLog {
             ua: (self.ua != "-").then(|| self.ua.clone()),
             ua_out: (self.ua_out != "-").then(|| self.ua_out.clone()),
             status: self.status,
+            sse_aggregated: self.sse_aggregated,
             has_usage,
             input_tokens: self.sniffer.input_tokens,
             output_tokens: self.sniffer.output_tokens,
@@ -1758,6 +2145,27 @@ fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("speed")?.as_str()?.to_string())
 }
 
+/// 来访有没有要流式响应（顶层 `stream:true`）。
+///
+/// **口径与上游一致**：只有布尔 `true` 算流式。字段缺失、`false`、以及 `"true"` 这种字符串
+/// 都不是——上游那边它们同样得到一份整段 JSON，判断口径跟着响应形态走才不会错配。
+fn stream_requested(body: &serde_json::Value) -> bool {
+    body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// 把顶层 `stream` 置为 `true`；已经是 `true` 就返回 `false`（无改动）。
+///
+/// 位置由 `preserve_order` 保证：字段已在则原位改值，不在则追加到末尾——而官方线序里
+/// `stream` 本来就是最后一个（见 [`insert_top_level`] 的说明），两条路都落在官方位置上。
+fn set_stream_true(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    if obj.get("stream").and_then(|s| s.as_bool()) == Some(true) {
+        return false;
+    }
+    obj.insert("stream".into(), serde_json::Value::Bool(true));
+    true
+}
+
 /// 给出站 URL 补上官方客户端恒带的 `?beta=true`（已经有 `beta=` 就原样返回）。
 ///
 /// **依据**：`cap/raw` 八份抓包（四份直连、四份经 luban 的 API-key 模式）的请求行**无一例外**
@@ -1793,6 +2201,8 @@ fn ensure_beta_query(url: &str) -> String {
 ///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
 ///    本来就是同一件事。
 /// 3. **cch**（`billing_cch`）：给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
+/// 4. **流式化**（`force_stream`，由 `nonstream_as_sse` 拨）：把 `stream` 置成 `true`。
+///    官方 CC 恒为 `true`，回程由 [`aggregate_sse`] 聚合回整段 JSON，客户端无感。
 ///
 /// **key 顺序**：改写要把 body 重新序列化，serde_json 默认的 `Map = BTreeMap` 会把**整个
 /// body**（含 tools/messages/content/cache_control 里每一个对象）的 key 按字母序重排，得到
@@ -1808,6 +2218,7 @@ fn rewrite_body(
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
     bare_session: Option<&str>,
+    force_stream: bool,
 ) -> Bytes {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
@@ -1820,7 +2231,7 @@ fn rewrite_body(
         ttl_1h: flags.cache_ttl_1h && flags.merge_beta,
     };
     // 全关且不模拟：连解析都不必做，原样返回。
-    if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch {
+    if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch && !force_stream {
         return body.clone();
     }
     // 补 metadata 用的 session_id：模拟模式取 Simulation 那份，CC 形态来访取 `bare_session`
@@ -1858,6 +2269,9 @@ fn rewrite_body(
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
     let spoofed =
         flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
+    // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
+    // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
+    let streamed = force_stream && set_stream_true(&mut v);
     tracing::debug!(
         simulated,
         sim_meta,
@@ -1868,6 +2282,7 @@ fn rewrite_body(
         ctx_mgmt,
         msg_shape,
         ttl_filled,
+        streamed,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
@@ -1881,6 +2296,7 @@ fn rewrite_body(
         && !ctx_mgmt
         && !msg_shape
         && !ttl_filled
+        && !streamed
     {
         return body.clone();
     }
@@ -3055,6 +3471,10 @@ pub async fn probe(
         sim: Some(sim),
         // 走的是模拟那条路（sim 恒为 Some），会话 id 在 Simulation 里。
         bare_session: None,
+        // 连通性测试保持非流式：它下面那套读法（`up.bytes()` 一把梭 + [`probe_report`] 按
+        // 整段 Message 解析出 model/error_type）是照非流式响应写的，改成 SSE 就全得跟着改，
+        // 而这条请求本来就不是客户端流量（`max_tokens:1` 的 ping），形态对齐的收益也不在这。
+        force_stream: false,
     };
 
     let body = probe_body(model);
@@ -3280,6 +3700,8 @@ fn log_probe_usage(
         ua: None,
         ua_out: out_ua.clone(),
         status: status.as_u16(),
+        // 连通性测试恒为非流式（见 `probe` 里 `force_stream: false` 的说明），不走聚合。
+        sse_aggregated: false,
         has_usage: sniffer.has_usage(),
         input_tokens: sniffer.input_tokens,
         output_tokens: sniffer.output_tokens,
@@ -3381,6 +3803,19 @@ mod tests {
     /// 形态开关全开（= 默认，也是加入开关机制之前的既有行为）。
     fn all_on() -> store::ForwardFlags {
         store::ForwardFlags::default()
+    }
+
+    /// `rewrite_body` 的测试简写：固定不做流式化。绝大多数用例验的是 system/metadata 那几项
+    /// 改写，流式化另有专门用例（[`forces_stream_true_and_keeps_key_order`]）。
+    fn rewrite_body(
+        body: &Bytes,
+        cred: &crate::credentials::Credential,
+        device_fp: &str,
+        flags: store::ForwardFlags,
+        sim: Option<&super::Simulation>,
+        bare_session: Option<&str>,
+    ) -> Bytes {
+        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false)
     }
 
     /// 三个模型族的 `anthropic-beta`，逐字取自 `cap/raw` 的原始报文头
@@ -3567,6 +4002,7 @@ mod tests {
             rate_limit_retry: false,
             cache_scope_global: false,
             cache_ttl_1h: false,
+            nonstream_as_sse: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -3926,14 +4362,8 @@ mod tests {
     /// 消息里的断点也补上 `ttl`。切开处那个 `\n\n` 两边都不保留。
     #[test]
     fn aligns_system_to_official_four_blocks() {
-        let out = super::rewrite_body(
-            &Bytes::from(API_SHAPE_BODY),
-            &test_cred(),
-            "fp",
-            all_on(),
-            None,
-            None,
-        );
+        let out =
+            rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", all_on(), None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let sys = v["system"].as_array().unwrap();
@@ -3969,14 +4399,8 @@ mod tests {
 
         // 关掉 `cache_ttl_1h` 即回到「沿用客户端时长」：一个 ttl 都不写。
         let no_ttl = store::ForwardFlags { cache_ttl_1h: false, ..all_on() };
-        let out = super::rewrite_body(
-            &Bytes::from(API_SHAPE_BODY),
-            &test_cred(),
-            "fp",
-            no_ttl,
-            None,
-            None,
-        );
+        let out =
+            rewrite_body(&Bytes::from(API_SHAPE_BODY), &test_cred(), "fp", no_ttl, None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(!s.contains(r#""ttl""#), "关掉后不该替客户端写 ttl: {s}");
         assert!(s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#), "{s}");
@@ -3994,7 +4418,7 @@ mod tests {
             r#"\nBASE — 基座\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
             r#"\nBASE — 基座\n\n# Communicating with the user\n\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\n\nREST"#,
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -4015,7 +4439,7 @@ mod tests {
             "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
             "# Text output (does not apply to tool calls)",
         ));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -4032,7 +4456,7 @@ mod tests {
     #[test]
     fn leaves_system_alone_when_anchor_missing() {
         let raw = Bytes::from(API_SHAPE_BODY.replace("Write code that reads like", "改了措辞的"));
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
@@ -4051,7 +4475,7 @@ mod tests {
                           {"type":"text","text":"base","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}},
                           {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
         );
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         assert_eq!(out, raw, "四块形态应原样返回");
     }
 
@@ -4084,14 +4508,15 @@ mod tests {
             rate_limit_retry: false,
             cache_scope_global: false,
             cache_ttl_1h: false,
+            nonstream_as_sse: false,
         };
-        let out = super::rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
+        let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
 
         // 逐项开一个，就只有那一项生效，其余仍不动。
         let only_cch = store::ForwardFlags { billing_cch: true, ..flags };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", only_cch, None, None).to_vec(),
+            rewrite_body(&raw, &test_cred(), "fp", only_cch, None, None).to_vec(),
         )
         .unwrap();
         assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
@@ -4103,7 +4528,7 @@ mod tests {
         let shape_only =
             store::ForwardFlags { system_shape: true, cache_scope_global: true, ..flags };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", shape_only, None, None).to_vec(),
+            rewrite_body(&raw, &test_cred(), "fp", shape_only, None, None).to_vec(),
         )
         .unwrap();
         assert_eq!(sys_len(&s), 4, "只开 system_shape 也该拆成四块: {s}");
@@ -4112,7 +4537,7 @@ mod tests {
         // `scope:"global"` 才连着 merge_beta（prompt-caching-scope beta 由它补）。
         let with_beta = store::ForwardFlags { merge_beta: true, ..shape_only };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", with_beta, None, None).to_vec(),
+            rewrite_body(&raw, &test_cred(), "fp", with_beta, None, None).to_vec(),
         )
         .unwrap();
         assert!(s.contains(r#""scope":"global""#), "两个开关都开时才标 global: {s}");
@@ -4121,7 +4546,7 @@ mod tests {
         // 单独关掉 cache_scope_global：照样拆块，只是不标 global。
         let no_scope = store::ForwardFlags { cache_scope_global: false, ..with_beta };
         let s = String::from_utf8(
-            super::rewrite_body(&raw, &test_cred(), "fp", no_scope, None, None).to_vec(),
+            rewrite_body(&raw, &test_cred(), "fp", no_scope, None, None).to_vec(),
         )
         .unwrap();
         assert_eq!(sys_len(&s), 4, "关 scope 不影响拆块: {s}");
@@ -4151,7 +4576,7 @@ mod tests {
             r#""metadata":{"user_id":"{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}"},"#,
             r#""max_tokens":64000,"stream":true}"#
         );
-        let out = super::rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), None, None);
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
@@ -4499,7 +4924,7 @@ mod tests {
         );
         let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
             .unwrap();
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
@@ -4552,7 +4977,7 @@ mod tests {
     fn simulates_system_when_client_sent_none() {
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
         assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
@@ -4577,7 +5002,7 @@ mod tests {
         );
         let body = Bytes::from(thinking_body.to_string());
         let sim = sim_for(thinking_body);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(text.contains(OFFICIAL), "取值要与官方逐字节相同: {text}");
 
@@ -4598,7 +5023,7 @@ mod tests {
         );
         let b = Bytes::from(haiku.to_string());
         let sim = sim_for(haiku);
-        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         assert!(String::from_utf8(out.to_vec()).unwrap().contains(OFFICIAL), "enabled 也该补");
 
         // 没开 thinking 的三种写法都不补——补了上游直接 400。
@@ -4617,7 +5042,7 @@ mod tests {
         ] {
             let b = Bytes::from(body.clone());
             let sim = sim_for(&body);
-            let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
             let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
             assert!(v.get("context_management").is_none(), "没开 thinking 却补了: {body}");
         }
@@ -4632,7 +5057,7 @@ mod tests {
         // 字符串 content：要转成块数组，断点落在末块。
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let blocks = v["messages"][0]["content"].as_array().expect("content 该收成块数组");
         assert_eq!(blocks[0]["type"], "text", "转出来的该是官方那种文本块");
@@ -4653,7 +5078,7 @@ mod tests {
         );
         let b = Bytes::from(multi.to_string());
         let sim = sim_for(multi);
-        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
@@ -4674,7 +5099,7 @@ mod tests {
         );
         let b = Bytes::from(mine.to_string());
         let sim = sim_for(mine);
-        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             v["messages"][0]["content"][0]["cache_control"],
@@ -4689,7 +5114,7 @@ mod tests {
         // 位置都不变。
         let cc = Bytes::from(API_SHAPE_BODY);
         let before: serde_json::Value = serde_json::from_slice(&cc).unwrap();
-        let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             super::count_cache_control(&v["messages"]),
@@ -4721,7 +5146,7 @@ mod tests {
             );
             let b = Bytes::from(body.clone());
             let sim = sim_for(&body);
-            let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
             let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
             let last = v["messages"].as_array().unwrap().last().unwrap();
             let blk = last["content"].as_array().unwrap().last().unwrap();
@@ -4735,7 +5160,7 @@ mod tests {
         );
         let b = Bytes::from(empty.to_string());
         let sim = sim_for(empty);
-        let out = super::rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"][1]["content"], "", "空串不该被转成空 text 块: {v}");
     }
@@ -4751,7 +5176,7 @@ mod tests {
         );
         let body = Bytes::from(mine.to_string());
         let sim = sim_for(mine);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             v["context_management"]["edits"].as_array().unwrap().len(),
@@ -4761,7 +5186,7 @@ mod tests {
 
         // 非模拟路径不补：那条路是尽量原样透传，来访本来就是 CC 形态、自己会带。
         let cc = Bytes::from(API_SHAPE_BODY);
-        let out = super::rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("context_management").is_none(), "非模拟路径不该补: {v}");
     }
@@ -4817,7 +5242,7 @@ mod tests {
         ));
         let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
             .unwrap();
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
         assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
@@ -4843,7 +5268,7 @@ mod tests {
         ));
         let sim = super::Simulation::detect(parsed(&body).as_ref(), all_on(), &test_cred(), "fp")
             .unwrap();
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
@@ -4861,7 +5286,7 @@ mod tests {
         );
         let sim = super::Simulation::detect(parsed(&empty).as_ref(), all_on(), &test_cred(), "fp")
             .unwrap();
-        let out = super::rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
     }
@@ -4879,7 +5304,7 @@ mod tests {
                 .is_none(),
             "CC 形态不该走模拟"
         );
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
         assert_eq!(sys.len(), 4, "5 块应压回 4 块: {v}");
@@ -4895,7 +5320,7 @@ mod tests {
 
         // 开关关掉就不封顶。
         let off = store::ForwardFlags { system_shape: false, ..all_on() };
-        let out = super::rewrite_body(&body, &test_cred(), "fp", off, None, None);
+        let out = rewrite_body(&body, &test_cred(), "fp", off, None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["system"].as_array().unwrap().len(), 5, "关掉开关应原样转发: {v}");
     }
@@ -4906,7 +5331,7 @@ mod tests {
     fn injects_cc_metadata_only_when_absent() {
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
         let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
@@ -4929,7 +5354,7 @@ mod tests {
         let sim2 =
             super::Simulation::detect(parsed(&with_meta).as_ref(), all_on(), &test_cred(), "fp")
                 .unwrap();
-        let out2 = super::rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2), None);
+        let out2 = rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2), None);
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         assert_eq!(
             v2["metadata"]["user_id"],
@@ -4957,7 +5382,7 @@ mod tests {
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[],"metadata":{{"user_id":"{{\"device_id\":\"{CLIENT_DEVICE}\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}}"}}}}"#
         ));
-        let out = super::rewrite_body(&body, &test_cred(), "fp", off, None, None);
+        let out = rewrite_body(&body, &test_cred(), "fp", off, None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let inner: serde_json::Value =
             serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
@@ -4966,7 +5391,7 @@ mod tests {
         assert_eq!(inner["session_id"], "ssss", "session 段一如既往不动");
 
         // 开着时（默认）仍换成派生值：本开关不改变既有行为。
-        let on = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let on = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
         let v_on: serde_json::Value = serde_json::from_slice(&on).unwrap();
         let inner_on: serde_json::Value =
             serde_json::from_str(v_on["metadata"]["user_id"].as_str().unwrap()).unwrap();
@@ -4977,7 +5402,7 @@ mod tests {
             r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"user_aa_account_bb_session_cc"}}"#
                 .to_string(),
         );
-        let out = super::rewrite_body(&flat, &test_cred(), "fp", off, None, None);
+        let out = rewrite_body(&flat, &test_cred(), "fp", off, None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["metadata"]["user_id"], format!("user_aa_account_{ACCOUNT_UUID}_session_cc"));
 
@@ -4986,7 +5411,7 @@ mod tests {
         let bare = Bytes::from(PLAIN_BODY.to_string());
         let sim = super::Simulation::detect(parsed(&bare).as_ref(), off, &test_cred(), "fp")
             .expect("裸请求仍应走模拟");
-        let out = super::rewrite_body(&bare, &test_cred(), "fp", off, Some(&sim), None);
+        let out = rewrite_body(&bare, &test_cred(), "fp", off, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let inner: serde_json::Value =
             serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
@@ -5036,8 +5461,7 @@ mod tests {
             "fp",
         )
         .expect("CC 形态 + 无 metadata 应补身份");
-        let out =
-            super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid.as_str()));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid.as_str()));
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let user_id = v["metadata"]["user_id"].as_str().expect("应补出 metadata.user_id");
         let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
@@ -5077,8 +5501,7 @@ mod tests {
             super::bare_session_id(&with_sid, all_on(), None, true, false, &test_cred(), "fp")
                 .unwrap();
         assert_eq!(sid2, "bc201916-d0bc-4b4e-adba-caf41fb58746", "应沿用来访自己的会话 id");
-        let out2 =
-            super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid2.as_str()));
+        let out2 = rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid2.as_str()));
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         let inner2: serde_json::Value =
             serde_json::from_str(v2["metadata"]["user_id"].as_str().unwrap()).unwrap();
@@ -5108,7 +5531,7 @@ mod tests {
             config::CC_SYSTEM_IDENTITY
         ));
         let sid = "bc201916-d0bc-4b4e-adba-caf41fb58746";
-        let out = super::rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid));
         let text = String::from_utf8(out.to_vec()).unwrap();
 
         let expected = format!(
@@ -5630,6 +6053,7 @@ mod tests {
                 cred_label: cred.label.clone(),
                 device_id: None,
                 status: 200,
+                sse_aggregated: false,
                 sniffer: super::UsageSniffer::new(false, false),
                 req_speed: None,
                 req_model: None,
@@ -5714,7 +6138,7 @@ mod tests {
             beta: super::cc_beta_seed("claude-opus-5"),
             session_id: "sess".into(),
         };
-        let out = super::rewrite_body(
+        let out = rewrite_body(
             &super::probe_body("claude-opus-5"),
             &cred,
             "fp",
@@ -5763,5 +6187,392 @@ mod tests {
             config::CC_USER_AGENT,
             "测试请求同样按官方客户端形态发"
         );
+    }
+    // ---------- 非流式改流式 + SSE 聚合 ----------
+
+    /// `stream` 的判定口径：只有布尔 `true` 算流式。字符串 `"true"`、数字、缺失都不是——
+    /// 上游那边它们同样回整段 JSON，判据跟着响应形态走才不会错配。
+    #[test]
+    fn stream_requested_only_counts_boolean_true() {
+        let case = |body: &str| super::stream_requested(&serde_json::from_str(body).unwrap());
+        assert!(case(r#"{"stream":true}"#));
+        assert!(!case(r#"{"stream":false}"#));
+        assert!(!case(r#"{"model":"claude-opus-5"}"#), "字段缺失 = 非流式");
+        assert!(!case(r#"{"stream":"true"}"#), "字符串不算");
+        assert!(!case(r#"{"stream":1}"#), "数字不算");
+    }
+
+    /// 流式化把 `stream` 置成 `true`，且落在官方 key 序该在的位置（队尾）：
+    /// 来访带了就原位改值，没带就追加——两条路都与官方线序一致。
+    #[test]
+    fn forces_stream_true_and_keeps_key_order() {
+        let keys = |bytes: &Bytes| {
+            let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            v.as_object().unwrap().keys().cloned().collect::<Vec<_>>()
+        };
+        // 只开流式化这一项，确保观察到的差异只来自它。
+        let only_stream = store::ForwardFlags {
+            spoof_identity: false,
+            system_shape: false,
+            billing_cch: false,
+            ..all_on()
+        };
+        let call = |body: &str| {
+            super::rewrite_body(
+                &Bytes::from(body.to_string()),
+                &test_cred(),
+                "fp",
+                only_stream,
+                None,
+                None,
+                true,
+            )
+        };
+
+        // 1) 来访压根没带 `stream`：追加到末尾（官方线序里它就是最后一个）。
+        let out = call(r#"{"model":"claude-opus-5","messages":[],"max_tokens":64}"#);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream"], serde_json::json!(true));
+        assert_eq!(keys(&out), vec!["model", "messages", "max_tokens", "stream"]);
+
+        // 2) 来访带了 `stream:false`：原位改值，位置不动。
+        let out = call(r#"{"model":"claude-opus-5","stream":false,"max_tokens":64}"#);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream"], serde_json::json!(true));
+        assert_eq!(keys(&out), vec!["model", "stream", "max_tokens"], "已有字段不该挪位置");
+
+        // 3) 开关关着：一个字节都不动（哪怕 body 是非流式的）。
+        let untouched = super::rewrite_body(
+            &Bytes::from(r#"{"model":"claude-opus-5","stream":false}"#.to_string()),
+            &test_cred(),
+            "fp",
+            only_stream,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            untouched,
+            Bytes::from(r#"{"model":"claude-opus-5","stream":false}"#.to_string())
+        );
+    }
+
+    /// 把一串 SSE 文本喂给聚合器；`chunk` 是每次喂的字节数，用来构造跨块断行。
+    fn aggregate(sse: &str, chunk: usize) -> super::Aggregated {
+        let mut agg = super::SseAggregator::default();
+        for part in sse.as_bytes().chunks(chunk.max(1)) {
+            agg.feed(part);
+        }
+        agg.finish()
+    }
+
+    fn aggregated_message(sse: &str, chunk: usize) -> serde_json::Value {
+        match aggregate(sse, chunk) {
+            super::Aggregated::Message(v) => v,
+            super::Aggregated::UpstreamError(e) => panic!("不该判成上游错误: {e}"),
+            super::Aggregated::Incomplete(why) => panic!("不该判成不完整: {why}"),
+        }
+    }
+
+    /// 一条典型的文本流：文本增量拼接、`message_delta` 的 stop_reason 与 usage 合进顶层。
+    ///
+    /// **逐字节喂一遍**：真实网络下 SSE 的分块与行边界毫无关系，聚合器必须自己攒行。
+    #[test]
+    fn aggregates_a_text_stream() {
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":10,"cache_read_input_tokens":5,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"，世界"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        for chunk in [1usize, 7, 4096] {
+            let v = aggregated_message(sse, chunk);
+            assert_eq!(v["id"], "msg_1", "chunk={chunk}");
+            assert_eq!(v["type"], "message");
+            assert_eq!(v["content"][0]["type"], "text");
+            assert_eq!(v["content"][0]["text"], "你好，世界", "文本增量要按序拼接");
+            assert_eq!(v["stop_reason"], "end_turn", "message_delta 的字段合进顶层");
+            assert_eq!(v["usage"]["output_tokens"], 42, "usage 逐键覆盖");
+            assert_eq!(v["usage"]["input_tokens"], 10, "message_start 里没被覆盖的键要留着");
+            assert_eq!(v["usage"]["cache_read_input_tokens"], 5);
+        }
+    }
+
+    /// tool_use 的入参是分片 JSON 串，攒到 `content_block_stop` 整体解析；
+    /// thinking 块的正文与签名各自拼接；未知块类型原样透传。
+    #[test]
+    fn aggregates_tool_use_thinking_and_unknown_blocks() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_2","content":[],"usage":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想一下"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"上海\"}"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"some_future_block","payload":{"k":1}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":2}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        let v = aggregated_message(sse, 5);
+
+        assert_eq!(v["content"][0]["thinking"], "先想一下");
+        assert_eq!(v["content"][0]["signature"], "sig-abc", "签名同样是分片拼接");
+        assert_eq!(v["content"][1]["name"], "get_weather");
+        assert_eq!(
+            v["content"][1]["input"],
+            serde_json::json!({"city": "上海"}),
+            "分片 JSON 要在 content_block_stop 时整体解析成 input"
+        );
+        assert_eq!(
+            v["content"][2],
+            serde_json::json!({"type":"some_future_block","payload":{"k":1}}),
+            "认不出来的块类型原样收下——上游新增块类型时这里不该跟着改"
+        );
+    }
+
+    /// 认不出来的 `delta.type` 不能把整条响应带崩：那一块的内容丢掉，其余照常攒完。
+    /// （丢内容这件事本身在 [`super::SseAggregator::apply_delta`] 里另打 warn。）
+    #[test]
+    fn unknown_delta_type_does_not_break_aggregation() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_3","content":[],"usage":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"future_delta","whatever":"x"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        let v = aggregated_message(sse, 64);
+        assert_eq!(v["content"][0]["text"], "ok", "认识的增量照样要攒上");
+    }
+
+    /// 流中 `event: error`：整份 error 负载原样交出去（回程拿它当响应体；状态码另按
+    /// [`super::error_status`] 映射，见 `mid_stream_error_maps_to_the_non_streaming_status`）。
+    #[test]
+    fn mid_stream_error_payload_is_surfaced_as_is() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_4","content":[],"usage":{}}}"#,
+            "\n\n",
+            "event: error\n",
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "\n\n",
+        );
+        match aggregate(sse, 3) {
+            super::Aggregated::UpstreamError(e) => {
+                assert_eq!(e["error"]["type"], "overloaded_error");
+                assert_eq!(e["type"], "error", "整份 data 原样带走，形状与非流式错误体一致");
+            }
+            other => panic!(
+                "应判成上游错误，实际: {}",
+                match other {
+                    super::Aggregated::Message(_) => "Message",
+                    super::Aggregated::Incomplete(_) => "Incomplete",
+                    super::Aggregated::UpstreamError(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    /// 流中错误的状态码映射：与非流式那条路上同一个错误该有的状态码一致——开不开这个功能，
+    /// 客户端看到的状态码都一样。认不出来的类型兜底 500，**不能是 200**：那会把一次失败
+    /// 记成成功，客户端与统计两边都被带偏。
+    #[test]
+    fn mid_stream_error_maps_to_the_non_streaming_status() {
+        let status = |kind: &str| {
+            super::error_status(&serde_json::json!({"type":"error","error":{"type":kind}})).as_u16()
+        };
+        assert_eq!(status("invalid_request_error"), 400);
+        assert_eq!(status("authentication_error"), 401);
+        assert_eq!(status("permission_error"), 403);
+        assert_eq!(status("billing_error"), 403);
+        assert_eq!(status("not_found_error"), 404);
+        assert_eq!(status("request_too_large"), 413);
+        assert_eq!(status("timeout_error"), 408);
+        assert_eq!(status("rate_limit_error"), 429);
+        assert_eq!(status("api_error"), 500);
+        assert_eq!(status("overloaded_error"), 529, "529 不在常量表里，按数字构造");
+        assert_eq!(status("something_new_2027"), 500, "认不出来的一律 500");
+        // 连 `error` 字段都没有的畸形负载同样按 500，绝不退回 200。
+        assert_eq!(super::error_status(&serde_json::json!({"type":"error"})).as_u16(), 500);
+    }
+
+    /// 端到端：上游在流中报 overloaded → 客户端拿到 529 + 那份错误 JSON 原文。
+    #[tokio::test]
+    async fn mid_stream_error_reaches_the_client_with_a_mapped_status() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_err","content":[],"usage":{}}}"#,
+            "\n\n",
+            "event: error\n",
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "\n\n",
+        );
+        let (status, ctype, body) = relay_sse(sse).await;
+
+        assert_eq!(status.as_u16(), 529, "上游那个 200 不能照搬——它其实是一次失败");
+        assert_eq!(ctype.as_deref(), Some("application/json"));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "overloaded_error", "错误原文原样交给客户端");
+        assert_eq!(v["error"]["message"], "Overloaded");
+    }
+
+    /// 没收到 `message_stop` 就断了 → 判不完整（回程 502）。
+    ///
+    /// **绝不能把攒了一半的内容当完整响应回去**：客户端拿到的会是一条看着正常、实则被截断的
+    /// Message，比一个明确的错误糟得多——它会被当成模型的真实输出写进会话历史。
+    #[test]
+    fn truncated_stream_is_incomplete_not_a_partial_message() {
+        let cut = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_5","content":[],"usage":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半句"}}"#,
+            "\n\n",
+        );
+        assert!(matches!(aggregate(cut, 9), super::Aggregated::Incomplete(_)));
+        // 一个事件都没来（比如连上就断）同样是不完整，不是空 Message。
+        assert!(matches!(aggregate("", 1), super::Aggregated::Incomplete(_)));
+    }
+    /// 端到端走一遍聚合回程：起一个吐 SSE 的本地上游，`aggregate_sse` 必须回一条
+    /// `content-type: application/json` 的整段 Message——客户端本来就是按非流式发的，
+    /// 它认的是这个形态。
+    #[tokio::test]
+    async fn aggregated_response_is_a_single_json_message() {
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_e2e","type":"message","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        let (status, ctype, body) = relay_sse(sse).await;
+
+        assert_eq!(status, super::StatusCode::OK);
+        assert_eq!(
+            ctype.as_deref(),
+            Some("application/json"),
+            "上游那份 text/event-stream 必须被替掉"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("回给客户端的必须是整段 JSON");
+        assert_eq!(v["id"], "msg_e2e");
+        assert_eq!(v["content"][0]["text"], "pong");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["output_tokens"], 3);
+        assert_eq!(v["usage"]["input_tokens"], 9);
+    }
+
+    /// 流断在半路 → 502，且**不带**攒了一半的内容：截断的 Message 会被客户端当成模型的
+    /// 真实输出写进会话历史，比一个明确的错误糟得多。
+    #[tokio::test]
+    async fn truncated_upstream_stream_yields_502() {
+        let sse = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_cut","content":[],"usage":{}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半句"}}"#,
+            "\n\n",
+        );
+        let (status, _, body) = relay_sse(sse).await;
+
+        assert_eq!(status, super::StatusCode::BAD_GATEWAY);
+        assert!(!String::from_utf8_lossy(&body).contains("半句"), "截断的内容不该回给客户端");
+    }
+
+    /// 起一个吐 `sse` 的本地上游，取回响应交给 [`super::aggregate_sse`]，
+    /// 返回 (状态码, content-type, 响应体)。
+    async fn relay_sse(sse: &str) -> (super::StatusCode, Option<String>, Bytes) {
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            sse.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(sse.as_bytes());
+        let (addr, server) = serve_once(resp);
+        let up = crate::web::upstream_client()
+            .unwrap()
+            .post(format!("http://{addr}/v1/messages"))
+            .send()
+            .await
+            .unwrap();
+
+        let out = super::aggregate_sse(up, req_log()).await;
+        server.join().unwrap();
+        let status = out.status();
+        let ctype =
+            out.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(String::from);
+        let body = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
+        (status, ctype, body)
+    }
+
+    /// 聚合路径要一份 `ReqLog`（它在 Drop 里落日志与用量）；这里给一份最小可用的。
+    fn req_log() -> super::ReqLog {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        super::ReqLog {
+            started: std::time::Instant::now(),
+            ttft_ms: None,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            ua: "-".into(),
+            ua_out: "-".into(),
+            cred_id: cred.id,
+            cred_label: cred.label,
+            device_id: None,
+            status: 200,
+            sse_aggregated: false,
+            sniffer: super::UsageSniffer::new(true, false),
+            req_speed: None,
+            req_model: None,
+            ratelimit: rl_headers(&[]),
+            store,
+        }
     }
 }

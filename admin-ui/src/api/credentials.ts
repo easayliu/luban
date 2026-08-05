@@ -169,6 +169,14 @@ export interface UsageLog {
    */
   ua_out: string | null
   status: number
+  /**
+   * 这条来访本来是非流式、被改写成流式发给上游再聚合回整段 JSON（转发设置里的
+   * 「非流式请求流式化」）；0.2.63 之前的旧记录一律为 false。
+   *
+   * 它解释了这类记录里 `ttft_ms` 与 `total_ms` 为什么差很多：TTFT 记的是上游首字节，
+   * 而客户端是在末尾一次性收到整段的。
+   */
+  sse_aggregated: boolean
   /** 响应里是否嗅探到 usage：为 false 时下面几个 token 数是缺失而非 0。 */
   has_usage: boolean
   input_tokens: number | null

@@ -409,8 +409,21 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {num(log.cache_creation_tokens, locale)} / {num(log.cache_read_tokens, locale)}
               </TableCell>
-              <TableCell className="whitespace-nowrap text-right tabular-nums">
+              <TableCell
+                className="whitespace-nowrap text-right tabular-nums"
+                title={log.sse_aggregated
+                  ? t(
+                      '这条请求本来是非流式，被改成流式发给上游后聚合回整段返回：首字耗时是上游的首字节，客户端则是在末尾一次性收到全部内容。',
+                      'This request arrived non-streaming and was sent upstream as a stream, then reassembled into a single response: TTFT is the upstream first byte, while the client received everything at the end.',
+                    )
+                  : undefined}
+              >
                 {ms(log.ttft_ms)} / {ms(log.total_ms)}
+                {log.sse_aggregated && (
+                  <div className="text-muted-foreground text-[10px] font-normal">
+                    {t('非流转流', 'stream-upgraded')}
+                  </div>
+                )}
               </TableCell>
               <TableCell
                 className={cn(
