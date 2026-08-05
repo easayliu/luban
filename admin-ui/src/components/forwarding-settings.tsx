@@ -342,24 +342,6 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-        <ForwardingToggle
-          k="request_precheck"
-          label={t('请求预检', 'Request precheck')}
-          summary={t(
-            '转发前修掉上游必定拒绝的空 thinking 块，让卡住的会话能接着跑。',
-            'Repair empty thinking blocks — which the upstream always refuses — before forwarding, so a stuck session can carry on.',
-          )}
-          description={
-            <>
-              {t('没有正文的', 'A')}{' '}
-              <code className="font-mono">thinking</code>{' '}
-              {t(
-                '块是上游自己签发的（某轮推理只出了签名没出正文），客户端把它存进历史后每一轮都会带着它重发，于是同一条会话会稳定地撞出一串 400，直到用户开新会话。开启后这类块在转发前就被删掉——它本来就没有内容，删了不丢任何信息，会话随即恢复正常。删完整轮会空掉的那种消息不动它，照常转发交给上游判断，不会更差。判据宁删漏不误删：只删上游确定会拒的形态，认不出的一律原样转发。若怀疑它改坏了正常请求，关掉即完全退回「一律原样转发」。',
-                'block with no text is issued by the upstream itself (a turn that produced a signature but no reasoning text). The client stores it in the conversation history and resends it every turn, so one session keeps producing a stream of 400s until the user starts a new one. When enabled, such blocks are removed before forwarding — they carry no content, so nothing is lost, and the session recovers. A message that would be left with no blocks at all is kept untouched and forwarded as usual for the upstream to judge, so it is never worse than before. The check errs on the side of leaving the request alone: only shapes the upstream is certain to refuse are removed, and anything unrecognized is forwarded verbatim. If you suspect it is altering valid requests, disabling it restores plain “forward verbatim” behaviour.',
-              )}
-            </>
-          }
-        />
       </SettingsGroup>
     </div>
   )

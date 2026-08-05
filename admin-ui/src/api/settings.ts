@@ -45,8 +45,6 @@ export interface Settings {
   cache_ttl_1h: boolean
   /** 非流式 /v1/messages 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。 */
   nonstream_as_sse: boolean
-  /** 转发前本地预检请求体，把上游必拒的空 thinking 块删掉再转发。 */
-  request_precheck: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -65,7 +63,6 @@ export type ForwardingKey =
   | 'cache_scope_global'
   | 'cache_ttl_1h'
   | 'nonstream_as_sse'
-  | 'request_precheck'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

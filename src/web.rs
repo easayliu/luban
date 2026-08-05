@@ -824,8 +824,6 @@ struct ForwardingResp {
     cache_ttl_1h: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     nonstream_as_sse: bool,
-    /// 转发前本地预检请求体，把上游必拒的空 thinking 块删掉再发。
-    request_precheck: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -845,7 +843,6 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             cache_scope_global: f.cache_scope_global,
             cache_ttl_1h: f.cache_ttl_1h,
             nonstream_as_sse: f.nonstream_as_sse,
-            request_precheck: f.request_precheck,
         }
     }
 }
@@ -1042,7 +1039,6 @@ struct SetForwardingReq {
     cache_scope_global: Option<bool>,
     cache_ttl_1h: Option<bool>,
     nonstream_as_sse: Option<bool>,
-    request_precheck: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -1054,9 +1050,8 @@ async fn set_forwarding(
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
         FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, NONSTREAM_AS_SSE, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REQUEST_PRECHECK, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
-        THINKING_SIGNATURE_RETRY,
+        RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
+        SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -1073,7 +1068,6 @@ async fn set_forwarding(
         (SYSTEM_CACHE_SCOPE, req.cache_scope_global),
         (SYSTEM_CACHE_TTL, req.cache_ttl_1h),
         (NONSTREAM_AS_SSE, req.nonstream_as_sse),
-        (REQUEST_PRECHECK, req.request_precheck),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
