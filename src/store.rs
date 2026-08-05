@@ -1094,8 +1094,8 @@ pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 /// 100% 稳定的判据。见 [`ForwardFlags::nonstream_as_sse`]。
 pub const NONSTREAM_AS_SSE: &str = "nonstream_as_sse";
 
-/// 转发前是否本地预检请求体、命中「上游必拒」的形态就地回 400 的 settings 键名。
-/// 缺省视为开启：命中的请求发出去只有一个结局，拦下来客户端拿到的错误逐字相同。
+/// 转发前是否本地预检请求体、把「上游必拒」的空 thinking 块删掉的 settings 键名。
+/// 缺省视为开启：那种块发出去只有一个结局，而它本来就没有内容，删了不丢任何信息。
 /// 见 [`ForwardFlags::request_precheck`]。
 pub const REQUEST_PRECHECK: &str = "request_precheck";
 
@@ -1204,16 +1204,16 @@ pub struct ForwardFlags {
     /// 以及 `ttft_ms` 记的是上游首字节、与客户端的感知对不上——后者由 `usage_logs` 的
     /// `sse_aggregated` 列标出来。
     pub nonstream_as_sse: bool,
-    /// 转发前本地预检请求体：命中**上游必拒**的形态就地回 400，不发出去
-    /// （见 [`crate::proxy::invalid_request_reason`]）。
+    /// 转发前本地预检请求体：把**上游必拒**的空 thinking 块删掉再发
+    /// （见 [`crate::proxy::drop_empty_thinking_blocks`]）。
     ///
-    /// 与 [`Self::thinking_signature_retry`] 同属错误恢复，方向相反：那个是「上游拒了以后
-    /// 想办法救回来」，这个是「结局已经确定，就别去问了」。命中的请求发出去必是 400，
-    /// 换来的是一次白跑的往返、那个账号上多一条 4xx（错误率是上游看得见的信号），
-    /// 而客户端拿到的错误文本两边逐字一样——所以拦下来对它没有任何区别。
+    /// 与 [`Self::thinking_signature_retry`] 同属错误恢复，一前一后：这个在发出去之前把
+    /// 已知修得好的坏形态修掉，那个在上游拒了之后兜底。空 thinking 块是上游自己签发的
+    /// （某轮 thinking 只出了签名没出正文），客户端存进历史后每轮回传，于是同一条会话稳定
+    /// 撞出一串 400 直到用户开新会话——删掉它会话就能接着跑，而块里本来就没有内容。
     ///
-    /// 判据宁漏勿误：漏判只是退回「发出去、被上游拒」的原有行为，误判却会把一条本来能成的
-    /// 请求就地毙掉。留这个开关就是给误判兜底——关掉即完全退回加入预检之前的行为。
+    /// 判据宁漏勿误：漏删只是退回「原样发出去、被上游拒」的原有行为，误删却会把一条本来能成的
+    /// 请求改坏。留这个开关就是给误删兜底——关掉即完全退回加入预检之前的行为。
     pub request_precheck: bool,
 }
 

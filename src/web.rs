@@ -824,7 +824,7 @@ struct ForwardingResp {
     cache_ttl_1h: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     nonstream_as_sse: bool,
-    /// 转发前本地预检请求体，命中上游必拒的形态就地回 400。
+    /// 转发前本地预检请求体，把上游必拒的空 thinking 块删掉再发。
     request_precheck: bool,
 }
 
