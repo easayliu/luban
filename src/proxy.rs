@@ -923,7 +923,8 @@ fn event_index(v: &serde_json::Value) -> Option<usize> {
 ///
 /// **代价是每轮一次**：客户端自己的会话记录里那些原始 thinking 块并不会因为这次重试而改写，
 /// 于是这条会话的后续每一轮都会先撞一次 400 再降级重发，直到会话结束。会话能继续跑，但上游
-/// 请求数翻倍。真正的解法是别让会话中途换号（见 `device_binding_ttl`），这里只是兜底。
+/// 请求数翻倍。真正的解法是别让会话中途换号（见 `store::CredentialStore::select_for_device`
+/// 的软绑定：名额到点就还，但设备回来仍优先回原号），这里只是兜底。
 async fn retry_demoted_thinking(
     upstream: &Upstream<'_>,
     cred: &crate::credentials::Credential,

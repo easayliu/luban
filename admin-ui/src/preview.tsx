@@ -587,6 +587,7 @@ queryClient.setQueryData(['settings'], {
   api_key: 'luban-preview-key',
   env_managed: false,
   device_binding_ttl_secs: 86400,
+  device_binding_retention_secs: 604800,
   default_device_limit: 3,
   require_device_id: true,
   bare_rate_limit: 0,

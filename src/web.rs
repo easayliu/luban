@@ -151,6 +151,7 @@ pub async fn run(
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
+        .route("/settings/device-retention", post(set_device_retention))
         .route("/settings/default-device-limit", post(set_default_device_limit))
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
@@ -778,6 +779,9 @@ struct SettingsResp {
     env_managed: bool,
     /// 设备绑定有效期（秒）；0 表示永不过期。
     device_binding_ttl_secs: i64,
+    /// 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。
+    /// 0 表示永久保留。
+    device_binding_retention_secs: i64,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
@@ -849,6 +853,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
 
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
+    let device_binding_retention_secs = state.store.device_binding_retention();
     let default_device_limit = state.store.default_device_limit();
     let require_device_id = state.store.require_device_id();
     let bare_rate_limit = state.store.bare_rate_limit();
@@ -860,6 +865,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             api_key: Some(k.to_string()),
             env_managed: true,
             device_binding_ttl_secs,
+            device_binding_retention_secs,
             default_device_limit,
             require_device_id,
             bare_rate_limit,
@@ -878,6 +884,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         api_key,
         env_managed: false,
         device_binding_ttl_secs,
+        device_binding_retention_secs,
         default_device_limit,
         require_device_id,
         bare_rate_limit,
@@ -932,6 +939,28 @@ async fn set_device_ttl(
     state
         .store
         .set_setting(crate::store::DEVICE_BINDING_TTL, &ttl.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetDeviceRetentionReq {
+    /// 软绑定保留期（秒）；0（或负数）表示永久保留。
+    device_binding_retention_secs: i64,
+}
+
+/// 设置软绑定保留期（秒）。
+///
+/// 不在这里校验「必须 >= 有效期」：两个设置各存各的，比较放在选路时做
+/// （见 [`crate::store::effective_retention`]），免得改动顺序还得先改大的那个。
+async fn set_device_retention(
+    State(state): State<AppState>,
+    Json(req): Json<SetDeviceRetentionReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let secs = req.device_binding_retention_secs.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEVICE_BINDING_RETENTION, &secs.to_string())
         .map_err(internal)?;
     Ok(Json(settings_resp(&state)))
 }

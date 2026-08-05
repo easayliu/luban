@@ -729,9 +729,12 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_BARE_RATE_WINDOW_SECS)
     }
 
-    /// 单条凭证当前**有效**绑定的设备数：已排除超过 TTL 未活跃的绑定（与选路时的惰性
-    /// 过期口径一致），故后台显示会随时间自然回落，不必等下一次请求触发 sweep。
+    /// 单条凭证当前**占名额**的设备数：已排除超过 TTL 未活跃的绑定（与选路时判上限的口径
+    /// 一致），故后台显示会随时间自然回落，不必等下一次请求触发 sweep。
     /// TTL `<= 0`（永不过期）时按全量计。
+    ///
+    /// 数不到休眠中的软绑定是有意的：它们不占名额，只是还记着「这台设备上次用的是这个号」
+    /// （见 [`Self::select_for_device`]），列进来会让「设备 x/y」这个名额口径失真。
     pub fn device_count(&self, cred_id: i64) -> Result<i64> {
         let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
@@ -828,8 +831,9 @@ impl CredentialStore {
     /// 按 `(cred_id, device_id)` 双条件删除，而不是只按 `device_id`：后台拿到的设备列表可能
     /// 已经过期（设备刚被换到别的号上），只按 device_id 删会把它从**当前**所在账号上摘掉。
     ///
-    /// 不受绑定 TTL 影响：TTL 外的残行本就不占名额，顺手删掉也无害；而明细按 TTL 过滤，
-    /// 后台能点到的必然是有效绑定。
+    /// 不受绑定 TTL 影响：TTL 外那些休眠的软绑定虽然不占名额，但还留着亲和性，解绑就是要把
+    /// 这份记忆一并抹掉（下次来当新设备重新分号）。明细按 TTL 过滤，后台能点到的必然是活跃
+    /// 绑定，休眠那些只能等保留期到点自己消失。
     pub fn unbind_device(&self, cred_id: i64, device_id: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
@@ -937,6 +941,18 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_DEVICE_BINDING_TTL_SECS)
     }
 
+    /// 软绑定保留期（秒）；未设置或解析失败时用默认值。`<= 0` 表示永久保留。
+    ///
+    /// 与 [`Self::device_binding_ttl`] 的分工：TTL 管「还占不占名额」，这个管「还记不记得
+    /// 这台设备上次用的哪个号」。见 [`effective_retention`]。
+    pub fn device_binding_retention(&self) -> i64 {
+        self.get_setting(DEVICE_BINDING_RETENTION)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_DEVICE_BINDING_RETENTION_SECS)
+    }
+
     /// 一次读齐全部转发形态开关（[`ForwardFlags`]）。
     ///
     /// 走内存缓存（见 `settings` 字段），零查询。任何读不出来的键都退回默认值（= 开启），
@@ -1036,6 +1052,29 @@ pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";
 
 /// 设备绑定有效期默认值：1 小时。
 pub const DEFAULT_DEVICE_BINDING_TTL_SECS: i64 = 3600;
+
+/// 软绑定保留期（秒）的 settings 键名；`<= 0` 表示永久保留。
+pub const DEVICE_BINDING_RETENTION: &str = "device_binding_retention_secs";
+
+/// 软绑定保留期默认值：7 天。
+///
+/// 取得比 TTL 长得多是有意的：TTL 那一小时是「名额」的粒度（要能及时把名额还给别人），
+/// 而亲和性没有名额成本——一条绑定行几十字节，多留几天换的是「同一台机器隔夜再开工还是
+/// 原来那个号」，正好覆盖 thinking 签名跨天复用的场景。
+pub const DEFAULT_DEVICE_BINDING_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// 绑定行真正被删除的时限：`None` 表示永不删除。
+///
+/// - `ttl <= 0`（绑定永不过期）：名额永远占着，删了反而丢名额语义 → 不删。
+/// - `retention <= 0`：显式要求永久保留 → 不删。
+/// - 否则取 `max(retention, ttl)`：保留期比 TTL 还短的配置是自相矛盾的（行会在还占着名额时
+///   被删掉），按 TTL 兜底，等价于「不做软绑定」的旧行为。
+pub fn effective_retention(ttl_secs: i64, retention_secs: i64) -> Option<i64> {
+    if ttl_secs <= 0 || retention_secs <= 0 {
+        return None;
+    }
+    Some(retention_secs.max(ttl_secs))
+}
 
 /// 是否改写 `metadata.user_id` 的 account_uuid/device_id；`"0"`/`"false"` 关闭，缺省视为开启。
 pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
@@ -2204,8 +2243,11 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
 pub struct Select<'a> {
     /// 客户端设备标识；`None` 即裸请求（不绑定、不占名额）。
     pub device_id: Option<&'a str>,
-    /// 设备绑定有效期（秒）；`<= 0` 表示永不过期。
+    /// 设备绑定**占名额**的有效期（秒）；`<= 0` 表示永不过期。
     pub ttl_secs: i64,
+    /// 软绑定保留期（秒）：绑定行超过 [`Self::ttl_secs`] 后不再占名额，但在这个时长内仍然
+    /// 留着，设备回来时优先回原号。`<= 0` 表示永久保留（只要不被解绑/停号就一直在）。
+    pub retention_secs: i64,
     /// 本次请求是否计入裸请求速率上限（只有真正消耗额度的路径才该计，见
     /// `crate::proxy::is_billable_messages`）。
     pub rate_limited: bool,
@@ -2219,11 +2261,14 @@ impl CredentialStore {
     /// 按 device_id 做粘性选择，返回选中的凭证（刷新在锁外由调用方处理）。
     ///
     /// 规则：
-    /// 1. 已有绑定且该凭证仍启用 → 复用（更新 last_seen / request_count），已绑定设备不受限。
-    /// 2. 绑定的凭证已停用或删除 → 清除陈旧绑定，作为新设备重新选择。
-    /// 3. 新设备 → 在仍有名额的启用凭证中做负载均衡：选“当前设备数最少”者并绑定；
+    /// 1. TTL 内的绑定（**活跃**）且该凭证仍启用 → 复用（更新 last_seen / request_count），
+    ///    已占名额的设备不再受上限约束。
+    /// 2. TTL 外但仍在保留期内的绑定（**软绑定**）→ 仍优先回原号，但要重新占名额：
+    ///    原号必须仍启用、不在冷却、未被本轮排除，且还有空位；不满足就当新设备重选并**改绑**。
+    /// 3. 绑定的凭证已停用或删除 → 作为新设备重新选择（选中谁就改绑到谁）。
+    /// 4. 新设备 → 在仍有名额的启用凭证中做负载均衡：选“当前设备数最少”者并绑定；
     ///    同数时按 (priority, id) 决定，保持确定性。
-    /// 4. 所有启用凭证均达设备上限 → 硬性拒绝，返回 [`DeviceLimitReached`]（代理映射为 429）。
+    /// 5. 所有启用凭证均达设备上限 → 硬性拒绝，返回 [`DeviceLimitReached`]（代理映射为 429）。
     ///
     /// 被上游 429 打过冷却的号（见 [`RateLimitCooldown`]）在**任何**分支之前就被剔出候选，
     /// 包括已有绑定命中那一支——绑定的号在冷却中会被解绑并改选到别的号上。冷却是硬门禁：
@@ -2240,24 +2285,29 @@ impl CredentialStore {
     /// 既不产生 usage、也不消耗额度的路径不计：拿它占名额只会把真正的请求挤掉，
     /// 而客户端的 `/context` 显示与压缩前预估全靠它。
     ///
-    /// `ttl_secs > 0` 时先清除超时未活跃的绑定（惰性过期）；`<= 0` 表示永不过期。
+    /// `ttl_secs > 0` 时超时未活跃的绑定**不再占名额**（惰性过期），但绑定行本身留到保留期
+    /// （`retention_secs`）满才删——这就是「软绑定」：设备隔了几小时再来，只要原号还有空位就
+    /// 回原号。thinking 块的签名是跟着账号走的，中途换号会让这条会话之后每一轮都先撞一次 400
+    /// 再降级重发（见 `crate::proxy::retry_demoted_thinking`），软绑定就是为了少踩这个。
+    /// `ttl_secs <= 0` 表示绑定永不过期，此时保留期无从谈起（不删任何行）。
     /// 全部操作在单次持锁内完成，避免与其它写入竞态。
     ///
     /// **限流按「选一次号」计，不是按「客户端请求」计**：刷新失败换号那条路
     /// （[`select_with_refresh_failover`]）每轮都会重选，故一次客户端请求最多可能扣掉几个
     /// 名额。那条路只在凭证被上游作废时才走（罕见），宁可多扣也好过给它开一个绕过限流的口子。
     pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
-        let Select { device_id, ttl_secs, rate_limited, exclude, model } = sel;
+        let Select { device_id, ttl_secs, retention_secs, rate_limited, exclude, model } = sel;
         // 这几项须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
         let default_limit = self.default_device_limit();
         let (rate_limit, rate_window) = (self.bare_rate_limit(), self.bare_rate_window_secs());
         let conn = self.conn.lock();
 
-        // 惰性过期：清掉超过 TTL 未活跃的绑定，释放其占用的设备名额。
-        if ttl_secs > 0 {
+        // 惰性清理：只删「连保留期都过了」的绑定。TTL 到点的那些不删——它们从这一刻起就不占
+        // 名额了（下面的 counts 按 TTL 过滤），但行还在，设备回来时还能循着它回原号。
+        if let Some(retention) = effective_retention(ttl_secs, retention_secs) {
             conn.execute(
                 "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
-                [ttl_secs],
+                [retention],
             )?;
         }
 
@@ -2312,58 +2362,73 @@ impl CredentialStore {
             return Err(AllRateLimited { retry_after_secs }.into());
         }
 
-        // 1/2) 命中既有绑定。
-        if let Some(did) = device_id {
-            let bound: Option<i64> = conn
-                .query_row("SELECT cred_id FROM device_bindings WHERE device_id = ?1", [did], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            if let Some(cid) = bound {
-                if let Some(c) = creds.iter().find(|c| c.id == cid) {
-                    conn.execute(
-                        "UPDATE device_bindings
-                            SET last_seen_at = unixepoch(), request_count = request_count + 1
-                          WHERE device_id = ?1",
-                        [did],
-                    )?;
-                    return Ok(c.clone());
-                }
-                // 绑定的凭证已停用/删除，或正在冷却/本轮已试过：清除绑定后重新选择，
-                // 下面选中谁就**改绑**到谁（`INSERT … ON CONFLICT DO UPDATE cred_id`）。
-                // 冷却结束后这台设备不会自己回到原号——粘性以最后一次选择为准，
-                // 这正是「429 换号重试要改绑」想要的语义。
-                conn.execute("DELETE FROM device_bindings WHERE device_id = ?1", [did])?;
-            }
-        }
-
-        // 各凭证当前设备数。
+        // 各凭证当前**占名额**的设备数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
+        // （口径与 [`Self::device_counts`] 一致，后台看到的数就是这里用来判上限的数）。
         let mut counts: HashMap<i64, i64> = HashMap::new();
         {
-            let mut cstmt =
-                conn.prepare("SELECT cred_id, COUNT(*) FROM device_bindings GROUP BY cred_id")?;
-            let rows = cstmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            let active = if ttl_secs > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
+            let mut cstmt = conn.prepare(&format!(
+                "SELECT cred_id, COUNT(*) FROM device_bindings {active} GROUP BY cred_id"
+            ))?;
+            let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
+            let rows = if ttl_secs > 0 {
+                cstmt.query_map([ttl_secs], map_row)?
+            } else {
+                cstmt.query_map([], map_row)?
+            };
             for row in rows {
                 let (cid, n) = row?;
                 counts.insert(cid, n);
             }
         }
 
-        // 当前设备数（惰性过期后已排除超时项）。
+        // 当前占名额的设备数（已排除 TTL 外的休眠绑定）。
         let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
         // 生效上限：账号未单独配置（device_limit == 0）时套用全局默认。
         let limit_of = |c: &Credential| effective_device_limit(c.device_limit, default_limit);
+        // 还塞得下一台设备吗（上限 <= 0 即不限）。
+        let has_room = |c: &Credential| limit_of(c) <= 0 || used(c) < limit_of(c);
 
-        // 3/4) 优先级分档调度：优先级为主键（数值小者优先），同一档内再按设备数
+        // 1/2/3) 命中既有绑定。
+        if let Some(did) = device_id {
+            // 第二列是「这条绑定还在 TTL 内吗」，交给 SQLite 与清理/计数用同一个 unixepoch()
+            // 时钟判定，免得和进程时钟差出一个边界。
+            let bound: Option<(i64, bool)> = conn
+                .query_row(
+                    "SELECT cred_id, (?2 <= 0 OR last_seen_at >= unixepoch() - ?2) \
+                       FROM device_bindings WHERE device_id = ?1",
+                    params![did, ttl_secs],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((cid, active)) = bound {
+                // 原号仍可调度（启用、不在冷却、本轮没试过）时才谈复用。
+                if let Some(c) = creds.iter().find(|c| c.id == cid) {
+                    // 活跃绑定本来就占着名额，直接续；休眠的软绑定要重新占一个位置，
+                    // 原号满了就只能改选——否则设备上限形同虚设。
+                    if active || has_room(c) {
+                        conn.execute(
+                            "UPDATE device_bindings
+                                SET last_seen_at = unixepoch(), request_count = request_count + 1
+                              WHERE device_id = ?1",
+                            [did],
+                        )?;
+                        return Ok(c.clone());
+                    }
+                }
+                // 回不去原号（停用/删除/冷却中/本轮已试过/名额已满）：往下重新选择，
+                // 选中谁就**改绑**到谁（`INSERT … ON CONFLICT DO UPDATE cred_id`）。
+                // 冷却结束后这台设备不会自己回到原号——粘性以最后一次选择为准，
+                // 这正是「429 换号重试要改绑」想要的语义。
+            }
+        }
+
+        // 4/5) 优先级分档调度：优先级为主键（数值小者优先），同一档内再按设备数
         //      负载均衡，最后 id 兜底。低优先级档仅在高优先级档全部占满/不可用后才触及。
         let chosen = if device_id.is_some() {
             // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
             // 当前优先级档全满时其成员被过滤掉，min 自然溢出到下一档；全部满则拒绝。
-            match creds
-                .iter()
-                .filter(|c| limit_of(c) <= 0 || used(c) < limit_of(c))
-                .min_by_key(|c| (c.priority, used(c), c.id))
-            {
+            match creds.iter().filter(|c| has_room(c)).min_by_key(|c| (c.priority, used(c), c.id)) {
                 Some(c) => c,
                 None => return Err(DeviceLimitReached.into()),
             }
@@ -2486,7 +2551,11 @@ async fn select_with_refresh_failover<'a>(
     sel: Select<'_>,
     attempt: impl Fn(Credential) -> AttemptFut<'a>,
 ) -> Result<(String, Credential)> {
-    let sel = Select { ttl_secs: store.device_binding_ttl(), ..sel };
+    let sel = Select {
+        ttl_secs: store.device_binding_ttl(),
+        retention_secs: store.device_binding_retention(),
+        ..sel
+    };
 
     for round in 0..MAX_REFRESH_FAILOVER {
         // 每轮都重新选：上一轮停用的那个已被排除，且它的设备绑定已清，这里才会换到新号。
@@ -3006,6 +3075,111 @@ mod tests {
             .unwrap();
         assert_eq!(store.device_count(a).unwrap(), 0);
         assert!(store.list_devices(a).unwrap().is_empty(), "超时绑定不应出现在明细里");
+    }
+
+    /// 把一条绑定的最后活跃时间往前推 `secs` 秒，模拟设备闲置。
+    fn age_binding(store: &CredentialStore, device_id: &str, secs: i64) {
+        let n = store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE device_bindings SET last_seen_at = unixepoch() - ?2 WHERE device_id = ?1",
+                params![device_id, secs],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "要推的绑定得先存在");
+    }
+
+    /// 选号入参：TTL 一分钟、保留期一小时，即「名额一分钟就还、亲和性留一小时」。
+    fn soft(device_id: &str) -> Select<'_> {
+        Select {
+            device_id: Some(device_id),
+            ttl_secs: 60,
+            retention_secs: 3600,
+            rate_limited: true,
+            ..Default::default()
+        }
+    }
+
+    /// 建库并把 TTL/保留期设成与 [`soft`] 一致——`device_count`/`list_devices` 读的是设置项，
+    /// 不跟着 `Select` 走，两边不一致的话断言的就不是同一套口径了。
+    fn soft_store(labels: &[&str]) -> (CredentialStore, Vec<i64>) {
+        let (store, ids) = store_with(labels);
+        store.set_setting(DEVICE_BINDING_TTL, "60").unwrap();
+        store.set_setting(DEVICE_BINDING_RETENTION, "3600").unwrap();
+        (store, ids)
+    }
+
+    /// 软绑定：TTL 过了名额就还回去，但设备再来时仍优先回原号——哪怕负载均衡指向别处。
+    ///
+    /// 这是 thinking 签名能续上的前提：签名跟着账号走，会话隔一小时再续跑要是换了号，
+    /// 之后每一轮都要先撞一次 400 再降级重发（见 `crate::proxy::retry_demoted_thinking`）。
+    #[test]
+    fn dormant_binding_still_steers_the_device_back_to_its_credential() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a);
+        age_binding(&store, "dev-1", 600);
+        assert_eq!(store.device_count(a).unwrap(), 0, "休眠绑定不占名额");
+
+        // 休眠期间来了台新设备：名额是空的，照样分给 a（同优先级取 id 小者）。
+        assert_eq!(store.select_for_device(soft("dev-2")).unwrap().id, a);
+        // 此刻 a 有 1 台活跃设备、b 一台都没有，纯负载均衡会把 dev-1 判给 b。
+        assert_eq!(store.device_counts().unwrap().get(&b).copied().unwrap_or(0), 0);
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a, "软绑定应把它带回 a");
+        assert_eq!(store.device_count(a).unwrap(), 2, "回来就重新占名额");
+    }
+
+    /// 软绑定是「优先」不是「特权」：原号名额已满时照常改选并改绑，否则设备上限就被绕过了。
+    #[test]
+    fn dormant_binding_gives_way_when_its_credential_is_full() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert!(store.set_device_limit(a, 1).unwrap());
+
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a);
+        age_binding(&store, "dev-1", 600);
+        // 休眠腾出的那个名额被 dev-2 占走。
+        assert_eq!(store.select_for_device(soft("dev-2")).unwrap().id, a);
+
+        // dev-1 回来时 a 已满：改选到 b，并且绑定要真的改过去（而不是留在 a 上）。
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, b);
+        assert_eq!(store.device_count(a).unwrap(), 1);
+        let a_devs: Vec<String> =
+            store.list_devices(a).unwrap().into_iter().map(|d| d.device_id).collect();
+        assert_eq!(a_devs, vec!["dev-2".to_string()]);
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, b, "改绑后应稳定在 b");
+    }
+
+    /// 保留期到点才真删行；删掉之后设备就是台新设备，回不去原号。
+    #[test]
+    fn binding_rows_are_dropped_once_the_retention_window_passes() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a);
+        age_binding(&store, "dev-1", 7200);
+        // 任一次选号都会顺手清一遍；这次同时让 a 上多一台活跃设备。
+        assert_eq!(store.select_for_device(soft("dev-2")).unwrap().id, a);
+        let rows: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM device_bindings WHERE device_id = 'dev-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "超过保留期的绑定行应被删除");
+
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, b, "已被遗忘，按负载均衡走");
+    }
+
+    #[test]
+    fn effective_retention_tri_state() {
+        assert_eq!(effective_retention(60, 3600), Some(3600), "正常配置按保留期删");
+        assert_eq!(effective_retention(60, 30), Some(60), "保留期短于 TTL 时按 TTL 兜底");
+        assert_eq!(effective_retention(60, 0), None, "保留期为 0 = 永久保留");
+        assert_eq!(effective_retention(0, 3600), None, "绑定永不过期时不删任何行");
     }
 
     /// 设备明细里的费用：本账号一列只算本账号花的，跨账号合计要把换号前的也算进去，

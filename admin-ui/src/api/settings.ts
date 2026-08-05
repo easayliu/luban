@@ -7,6 +7,8 @@ export interface Settings {
   env_managed: boolean
   /** 设备绑定有效期（秒）；0 表示永不过期。 */
   device_binding_ttl_secs: number
+  /** 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。0 = 永久保留。 */
+  device_binding_retention_secs: number
   /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
   default_device_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
@@ -80,6 +82,14 @@ export async function setApiKey(api_key: string): Promise<Settings> {
 export async function setDeviceTtl(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/device-ttl', {
     device_binding_ttl_secs: secs,
+  })
+  return data
+}
+
+/** 设置软绑定保留期（秒；0 表示永久保留）。 */
+export async function setDeviceRetention(secs: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/device-retention', {
+    device_binding_retention_secs: secs,
   })
   return data
 }
