@@ -38,7 +38,7 @@ mq.addEventListener('change', (e) => applyTheme(e.matches))
 
 const now = Math.floor(Date.now() / 1000)
 
-// 已封禁：故意使用较长的上游错误，覆盖「错误摘要把同一行卡片撑乱」的回归场景。
+// 已封禁：故意使用较长的上游错误，覆盖「原因只进入悬浮提示、不再撑高卡片」的回归场景。
 const banned: Credential = {
   id: 1,
   label: 'burksupperclassmens946205@yahoo.com',

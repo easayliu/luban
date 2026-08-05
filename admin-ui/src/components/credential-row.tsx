@@ -548,6 +548,7 @@ function ScheduleControl({
       <Tooltip>
         <TooltipTrigger
           className={badgeVariants({ size: 'sm', variant: status.variant })}
+          delay={status.kind === 'banned' ? 0 : undefined}
           aria-label={`${status.label}: ${status.detail}`}
           aria-live="polite"
         >

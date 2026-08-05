@@ -40,7 +40,7 @@ import {
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -65,6 +65,7 @@ import {
 import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function CredentialCard({
   cred,
@@ -273,20 +274,45 @@ export function CredentialCard({
 
         <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={status.variant}
-              aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
-              aria-describedby={status.attention ? statusDetailId : undefined}
-            >
-              {status.label}
-            </Badge>
+            {status.kind === 'banned' ? (
+              <Tooltip>
+                <TooltipTrigger
+                  className={cn(badgeVariants({ variant: status.variant }), 'cursor-help')}
+                  delay={0}
+                  aria-label={t(
+                    `${credentialLabel}：${status.label}。${status.detail}`,
+                    `${credentialLabel}: ${status.label}. ${status.detail}`,
+                  )}
+                  aria-live="polite"
+                >
+                  {status.label}
+                </TooltipTrigger>
+                <TooltipPopup
+                  side="bottom"
+                  align="start"
+                  className="max-w-80 whitespace-normal break-words text-left leading-5"
+                >
+                  {status.detail}
+                </TooltipPopup>
+              </Tooltip>
+            ) : (
+              <Badge
+                variant={status.variant}
+                aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
+                aria-describedby={status.attention ? statusDetailId : undefined}
+              >
+                {status.label}
+              </Badge>
+            )}
             {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
             <Badge variant="outline" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
               P{cred.priority}
             </Badge>
           </div>
 
-          {status.attention && <AttentionSummary id={statusDetailId} status={status} />}
+          {status.attention && status.kind !== 'banned' && (
+            <AttentionSummary id={statusDetailId} status={status} />
+          )}
 
           <section aria-label={t(`${credentialLabel} 的额度使用`, `Quota usage for ${credentialLabel}`)} className="space-y-3">
             <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
@@ -663,16 +689,30 @@ function QuotaMeter({
       : t('上游未返回该窗口的额度信息', 'The upstream did not return quota data for this window')
     return (
       <div
-        className="space-y-1"
+        className="flex w-full flex-col gap-2"
         title={t(
           `${reason}。最后一次快照：${formatFullTime(snapshotTs, language)}`,
           `${reason}. Latest snapshot: ${formatFullTime(snapshotTs, language)}`,
         )}
       >
-        <p className="font-medium text-sm">{label}</p>
-        <p className="text-sm text-muted-foreground">
-          {expired ? t('已重置，暂无新用量', 'Reset; no new usage') : t('暂无数据', 'No data')}
-        </p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="font-medium text-sm">{label}</p>
+          <span className="shrink-0 text-xs text-muted-foreground">
+            {expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')}
+          </span>
+        </div>
+        <div className="h-2 w-full bg-input" aria-hidden />
+        <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
+          <span>{expired ? t('暂无新用量', 'No new usage') : t('等待上游返回', 'Waiting for upstream')}</span>
+          {expired && reset != null && (
+            <span
+              className="shrink-0 whitespace-nowrap tabular-nums"
+              title={t(`${formatFullTime(reset, language)} 已重置`, `Reset at ${formatFullTime(reset, language)}`)}
+            >
+              {t(`重置于 ${formatClockTime(reset, language)}`, `Reset ${formatClockTime(reset, language)}`)}
+            </span>
+          )}
+        </div>
       </div>
     )
   }
