@@ -154,6 +154,13 @@ export interface UsageLog {
   model: string | null
   /** 来访原样的路径与查询串。 */
   path: string
+  /**
+   * 来访客户端自报的 `User-Agent`（已截断）；没带该头的请求与 0.2.60 之前的旧记录为 null。
+   *
+   * 认「这条是谁发的」最省事的一项：`path` 里带不带 `?beta=true` 分不出官方 CC 与第三方
+   * CC 兼容客户端——那个查询串是客户端自己加的，luban 只在出站 URL 上补。
+   */
+  ua: string | null
   status: number
   /** 响应里是否嗅探到 usage：为 false 时下面几个 token 数是缺失而非 0。 */
   has_usage: boolean

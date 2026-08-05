@@ -360,6 +360,7 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('设备', 'Device')}</TableHead>
+          <TableHead className="whitespace-nowrap">{t('客户端', 'Client')}</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -413,6 +414,13 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
               </TableCell>
               <TableCell className="whitespace-nowrap font-mono text-xs" title={deviceId}>
                 {deviceShort}
+              </TableCell>
+              {/* UA 是 0.2.60 才开始记的，之前的记录为空——不是「没有客户端」。 */}
+              <TableCell
+                className={cn('max-w-56 truncate', !log.ua && 'text-muted-foreground')}
+                title={log.ua ?? t('该记录没有 UA', 'No user agent on this record')}
+              >
+                {log.ua ?? '—'}
               </TableCell>
             </TableRow>
           )

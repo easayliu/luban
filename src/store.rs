@@ -1244,6 +1244,8 @@ pub struct UsageRecord {
     pub device_id: Option<String>,
     pub model: Option<String>,
     pub path: String,
+    /// 来访客户端的 `User-Agent`（已截断，见 [`crate::proxy::client_ua`]）；没带头时为 `None`。
+    pub ua: Option<String>,
     pub status: u16,
     /// 是否从响应中解析到用量。
     pub has_usage: bool,
@@ -1284,6 +1286,8 @@ pub struct UsageLog {
     pub device_id: Option<String>,
     pub model: Option<String>,
     pub path: String,
+    /// 来访客户端的 `User-Agent`（已截断）；旧记录与没带该头的请求为 `None`。
+    pub ua: Option<String>,
     pub status: u16,
     pub has_usage: bool,
     pub input_tokens: Option<i64>,
@@ -1600,9 +1604,9 @@ impl CredentialStore {
                  cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                  rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
-                 rl_overage_in_use, ratelimit_raw, cost_usd)
+                 rl_overage_in_use, ratelimit_raw, cost_usd, ua)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 ts,
                 rec.cred_id,
@@ -1631,6 +1635,7 @@ impl CredentialStore {
                 rec.rl_overage_in_use,
                 rec.ratelimit_raw,
                 rec.cost_usd,
+                rec.ua,
             ],
         )?;
         // 落账。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属，只记日志不记账。
@@ -1755,7 +1760,7 @@ impl CredentialStore {
                     cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                     unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                     rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                    cost_usd, rl_overage_in_use
+                    cost_usd, rl_overage_in_use, ua
                FROM usage_logs
               WHERE (?1 IS NULL OR cred_id = ?1)
                 AND (?2 IS NULL OR id <= ?2)
@@ -1791,6 +1796,7 @@ impl CredentialStore {
                 ratelimit_raw: r.get(25)?,
                 cost_usd: r.get(26)?,
                 rl_overage_in_use: r.get(27)?,
+                ua: r.get(28)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1847,6 +1853,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             device_id      TEXT,
             model          TEXT,
             path           TEXT    NOT NULL DEFAULT '',
+            -- 来访客户端自报的 User-Agent（已截断，见 crate::proxy::client_ua）；缺失为空。
+            -- 记的是**来访**那份而非出站——出站在模拟模式下恒为官方那串，存下来每行都一样。
+            ua             TEXT,
             status         INTEGER NOT NULL DEFAULT 0,
             -- 是否从响应中解析到用量（1/0）；未解析到时下面各 token 列为空。
             has_usage      INTEGER NOT NULL DEFAULT 0 CHECK (has_usage IN (0,1)),
@@ -1935,6 +1944,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "cache_5m_tokens INTEGER",
         "cache_1h_tokens INTEGER",
         "rl_overage_in_use INTEGER",
+        "ua TEXT",
     ] {
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
     }

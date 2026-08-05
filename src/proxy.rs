@@ -794,6 +794,9 @@ impl Drop for ReqLog {
             device_id: self.device_id.clone(),
             model,
             path: self.path.clone(),
+            // 日志里没带 UA 用 `-` 占位（对齐列宽），入库要还原成 NULL——`-` 会被当成
+            // 一个真实存在的 UA，按 UA 分组时凭空多出一类。
+            ua: (self.ua != "-").then(|| self.ua.clone()),
             status: self.status,
             has_usage,
             input_tokens: self.sniffer.input_tokens,
@@ -1918,8 +1921,8 @@ fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> St
 /// 浏览器与各路 SDK 拼出来的能有几百，整条打出来会把日志行撑得没法看。截断只影响日志，
 /// 转发出去的那份头一个字节都不动。
 ///
-/// 按 `char` 截而不是 `&s[..120]`：后者切在多字节 UTF-8 中间会 panic，而 UA 是来访完全
-/// 可控的字符串——为了一条日志被打崩不值当。
+/// 取值恒为可见 ASCII：`to_str()` 对非 ASCII 头值直接失败，那类一律落 `-`。按 `char` 截而不是
+/// `&s[..120]` 只是不给未来留坑——真按字节切，哪天换个不做此保证的取值方式就会切出 panic。
 fn client_ua(headers: &HeaderMap) -> String {
     const MAX: usize = 120;
     match headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
@@ -3250,6 +3253,9 @@ fn log_probe_usage(
         device_id: Some(PROBE_DEVICE_ID.into()),
         model: Some(model),
         path: "/v1/messages".into(),
+        // 连通性测试没有来访客户端——这条是 luban 自己发的。留空而不是填出站那份官方 UA：
+        // 填了就成了「有个真实 CC 客户端发过这条」，而它其实只有 PROBE_DEVICE_ID 这一个身份。
+        ua: None,
         status: status.as_u16(),
         has_usage: sniffer.has_usage(),
         input_tokens: sniffer.input_tokens,
@@ -5579,6 +5585,62 @@ mod tests {
         assert_eq!(logs[0].input_tokens, Some(320));
         // opus $5/MTok 输入 + $25/MTok 输出：320×5 + 1×25 = 1625 微美元。
         assert_eq!(logs[0].cost_usd, Some(0.001625), "按实际用量计价，不是记 0");
+    }
+
+    /// 来访 UA 随流水落库：带 UA 的原样存，没带（日志里用 `-` 占位）的存成 NULL——`-` 存进去
+    /// 就成了一个真实存在的 UA，按 UA 分组时会凭空多出一类。
+    #[test]
+    fn client_ua_lands_in_the_usage_log() {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let log = |ua: &str| {
+            drop(super::ReqLog {
+                started: std::time::Instant::now(),
+                ttft_ms: None,
+                method: "POST".into(),
+                path: "/v1/messages?beta=true".into(),
+                ua: ua.into(),
+                cred_id: cred.id,
+                cred_label: cred.label.clone(),
+                device_id: None,
+                status: 200,
+                sniffer: super::UsageSniffer::new(false, false),
+                req_speed: None,
+                req_model: None,
+                ratelimit: rl_headers(&[]),
+                store: store.clone(),
+            })
+        };
+        log("claude-cli/2.1.220 (external, cli)");
+        log("-");
+
+        // 倒序：后写的那条在前。
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].ua, None, "没带 UA 的请求不该存成 `-`");
+        assert_eq!(logs[1].ua.as_deref(), Some("claude-cli/2.1.220 (external, cli)"));
+    }
+
+    /// 日志用的 UA 取值：缺失/空串取 `-`，过长按 char 截断（不能按字节切，会劈开多字节 UTF-8）。
+    #[test]
+    fn client_ua_falls_back_and_truncates() {
+        let ua = |v: Option<&str>| {
+            let mut h = super::HeaderMap::new();
+            if let Some(v) = v {
+                h.insert(super::header::USER_AGENT, HeaderValue::from_str(v).unwrap());
+            }
+            super::client_ua(&h)
+        };
+        assert_eq!(ua(None), "-", "没有该头");
+        assert_eq!(ua(Some("   ")), "-", "空白等于没带");
+        assert_eq!(ua(Some(config::CC_USER_AGENT)), config::CC_USER_AGENT, "正常那串原样保留");
+        let long = "a".repeat(300);
+        assert_eq!(ua(Some(&long)).len(), 120, "超长的截到 120");
+        // 非 ASCII 的头值 `to_str()` 直接失败，落回 `-`——所以库里存的 UA 恒为可见 ASCII。
+        let cjk = super::HeaderValue::from_bytes("中文客户端".as_bytes()).unwrap();
+        let mut h = super::HeaderMap::new();
+        h.insert(super::header::USER_AGENT, cjk);
+        assert_eq!(super::client_ua(&h), "-");
     }
 
     /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API
