@@ -513,19 +513,22 @@ function windowStatusLabel(
 }
 
 /**
- * 5h / 7d 之外的窗口——实测里最常见的是超额池 `7d_oi`，而**被拒的往往正是它**。
+ * 5h / 7d 之外的窗口。`7d_oi` 已由卡片状态栏里的 Usage credits / 上游判定表达，
+ * 这里不再重复显示；其余未来出现的额外窗口仍保留，避免静默丢失新类型。
  *
  * 刻意画成一行紧凑标签而不是第三、第四条进度条：这些窗口没有配套的窗口内费用与请求数
  * （那要靠 reset 反推窗口起点去聚合流水，只有 5h/7d 做得到），撑成同规格的进度条会让人
- * 以为下面那两个数字也是它的。窗口名原样显示，不翻译、不做白名单——种类是上游说了算的。
+ * 以为下面那两个数字也是它的。窗口名原样显示，不翻译；仅过滤已被状态栏覆盖的 `7d_oi`。
  *
  * **但状态词要按窗口的种类翻译**，见 [`windowStatusLabel`]：同一个 `rejected` 在用量窗口上
  * 是「这个池子满了」，在 `overage` 那个可用性标记上却是「Usage credits 用不了」。
  */
 function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
   const { t, language } = useI18n()
-  const visibleWindows = windows.filter((w) =>
-    !isCapabilityWindow(w) || w.status === 'allowed' || w.status === 'allowed_warning')
+  const visibleWindows = windows.filter((w) => (
+    w.name.toLowerCase() !== '7d_oi'
+    && (!isCapabilityWindow(w) || w.status === 'allowed' || w.status === 'allowed_warning')
+  ))
   if (visibleWindows.length === 0) return null
 
   return (

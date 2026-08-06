@@ -104,6 +104,7 @@ export function TableRow({
 
 export function TableHead({
   className,
+  scope = "col",
   ...props
 }: React.ComponentProps<"th">): React.ReactElement {
   return (
@@ -113,6 +114,7 @@ export function TableHead({
         className,
       )}
       data-slot="table-head"
+      scope={scope}
       {...props}
     />
   );

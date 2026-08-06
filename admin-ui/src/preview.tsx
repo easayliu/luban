@@ -24,7 +24,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
-import type { Credential } from '@/api/credentials'
+import type { Credential, UsageLog, UsagePage } from '@/api/credentials'
 import './index.css'
 
 // 离线预览：覆盖正常、额度风险、冷却、封禁与停用，通过生产共用的 CredentialWorkspace
@@ -302,7 +302,7 @@ const only5hWindow: Credential = {
 //
 // 这正是「记录全部额度窗口」要解决的场景：以前 7d_oi 不落库，卡片只能挂一个永远摘不掉的
 // 「Usage credits 待确认」；现在它在 windows 里，状态应当解析成确定的「Usage credits 生效中」，
-// 额度区多出一行 `7d_oi 102% 已拒`，「上游判定」那行则给出 rejected + representative-claim。
+// `7d_oi` 不再在额度区重复显示；状态栏里的 Usage credits 与上游判定负责解释风险。
 const overagePoolExhausted: Credential = {
   id: 9,
   label: 'overage-pool-not-recorded@example.com',
@@ -624,6 +624,41 @@ queryClient.setQueryData(['settings'], {
   tool_name_mimic: true,
 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
+const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
+  id: 1200 - index,
+  ts: now - index * 73,
+  cred_id: 1,
+  cred_label: banned.label,
+  device_id: index % 4 === 0
+    ? 'sim:ff813c9166f0d2f3e9c1c7a4b5d80e2f7a3c6b91d4e0f28a5c73b9de6104a2f8'
+    : `user_${String(index + 1).padStart(2, '0')}9fd2b847c21a4e51a98d0e07`,
+  model: index % 3 === 0 ? 'claude-opus-4-1-20250805' : 'claude-sonnet-4-20250514',
+  path: '/v1/messages?beta=true',
+  ua: index % 4 === 0
+    ? 'claude-cli/2.1.219 (external, local-agent, agent-sdk/0.3.219)'
+    : 'claude-code/2.1.219 (darwin; arm64)',
+  ua_out: index === 2
+    ? 'claude-cli/2.1.219 (official, darwin, arm64)'
+    : index % 4 === 0
+      ? 'claude-cli/2.1.219 (external, local-agent, agent-sdk/0.3.219)'
+      : 'claude-code/2.1.219 (darwin; arm64)',
+  status: index === 5 ? 429 : index === 9 ? 500 : 200,
+  sse_aggregated: index === 3,
+  has_usage: index !== 9,
+  input_tokens: index === 9 ? null : 12_480 + index * 913,
+  output_tokens: index === 9 ? null : 840 + index * 47,
+  cache_creation_tokens: index === 9 ? null : 2_048 + index * 128,
+  cache_read_tokens: index === 9 ? null : 18_400 + index * 771,
+  ttft_ms: index === 9 ? null : 480 + index * 63,
+  total_ms: index === 9 ? null : 3_280 + index * 211,
+  cost_usd: index === 9 ? null : 0.0184 + index * 0.0027,
+}))
+queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
+  total: 37,
+  total_cost: 1.2846,
+  anchor: previewUsageLogs[0]?.id ?? null,
+  logs: previewUsageLogs,
+})
 queryClient.setQueryData(['credential-devices', 1], [])
 queryClient.setQueryData(['credential-devices', 4], [
   {

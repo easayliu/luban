@@ -14,7 +14,6 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardPanel } from '@/components/ui/card'
 import {
   Dialog,
   DialogClose,
@@ -51,6 +50,7 @@ import { Spinner } from '@/components/ui/spinner'
 import {
   Table,
   TableBody,
+  TableCaption,
   TableCell,
   TableHead,
   TableHeader,
@@ -97,6 +97,7 @@ export function CredentialUsageDialog({
   const { t, language, locale } = useI18n()
   const qc = useQueryClient()
   const credentialLabel = displayCredentialLabel(cred.label, language)
+  const titleRef = useRef<HTMLHeadingElement>(null)
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
   const [page, setPage] = useState(0)
   /**
@@ -131,6 +132,7 @@ export function CredentialUsageDialog({
   if (currentPage !== page) setPage(currentPage)
   const firstIndex = currentPage * pageSize + 1
   const lastIndex = currentPage * pageSize + rows.length
+  const retentionNoteId = `credential-usage-retention-${cred.id}`
 
   /** 重新取一轮：丢掉锚点回到第一页，于是能看到刚发生的请求。 */
   const reload = () => {
@@ -159,46 +161,44 @@ export function CredentialUsageDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      {/* 比设备弹窗宽一档：这张表有十列，4xl 下 UA 与模型两列会被挤到只剩几个字符。 */}
-      <DialogPopup className="max-w-5xl">
-        <DialogHeader>
-          <div className="flex items-start gap-3 pr-8">
+      <DialogPopup className="max-w-6xl" initialFocus={titleRef}>
+        <DialogHeader className="border-b bg-muted/32 p-4 sm:p-5">
+          <div className="flex items-center gap-3 pr-8">
             <Avatar>
               <AvatarFallback><ScrollTextIcon /></AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              <DialogTitle>{t('请求明细', 'Request log')}</DialogTitle>
-              <DialogDescription className="mt-1 truncate" title={credentialLabel}>
-                {credentialLabel}
-              </DialogDescription>
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <Badge variant="outline">#{cred.id}</Badge>
+              <div className="flex flex-wrap items-center gap-2">
+                <DialogTitle ref={titleRef} tabIndex={-1}>{t('请求明细', 'Request log')}</DialogTitle>
                 <Badge variant={status.variant} aria-live="polite">{status.label}</Badge>
                 {usage.isFetching && !usage.isPending && <Spinner />}
               </div>
+              <DialogDescription className="mt-1 flex min-w-0 items-center gap-1.5">
+                <span className="truncate" title={credentialLabel}>{credentialLabel}</span>
+                <span aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">#{cred.id}</span>
+              </DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
-        <DialogPanel className="space-y-4">
-          <Card>
-            <CardPanel className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
-              <div className="min-w-0">
-                <p className="text-muted-foreground text-xs">
-                  {t('明细合计花费', 'Cost across the log')}
-                </p>
-                <p className="mt-1 font-semibold text-sm tabular-nums">
-                  {formatUsd(usage.data?.total_cost ?? 0)}
-                </p>
-              </div>
-              <p className="min-w-0 flex-1 text-muted-foreground text-xs sm:text-right">
-                {t(
-                  '明细只保留最近 30 天，卡片上的累计花费来自终身账本，两者对不上是正常的。',
-                  'The request log only keeps the last 30 days, while the total cost on the card comes from the lifetime ledger — the two are not meant to match.',
-                )}
+        <DialogPanel className="space-y-3 p-4 pt-3 sm:p-5 sm:pt-3">
+          <section className="grid gap-2 rounded-xl border bg-muted/32 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-5 sm:px-4">
+            <div className="flex items-baseline justify-between gap-4 sm:block">
+              <p className="text-2xs font-medium text-muted-foreground">
+                {t('近 30 天明细花费', 'Request cost, last 30 days')}
               </p>
-            </CardPanel>
-          </Card>
+              <p className="font-semibold text-sm tabular-nums sm:mt-0.5">
+                {usage.data ? formatUsd(usage.data.total_cost) : '—'}
+              </p>
+            </div>
+            <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
+              {t(
+                '流水仅保留最近 30 天；卡片累计花费来自终身账本，因此两者无需相等。',
+                'Logs are retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
+              )}
+            </p>
+          </section>
 
           {usage.isPending ? (
             <div
@@ -241,18 +241,14 @@ export function CredentialUsageDialog({
             </Empty>
           ) : (
             <>
-              {/* 列多，窄屏靠横向滚动而不是换行——一条记录被折成两行反而看不出对应关系。 */}
-              <div
-                className={cn(
-                  '-mx-1 overflow-x-auto px-1 transition-opacity',
-                  usage.isFetching && 'opacity-60',
-                )}
-                aria-busy={usage.isFetching}
-              >
-                <UsageTable rows={rows} />
-              </div>
+              <UsageTable
+                rows={rows}
+                credentialLabel={credentialLabel}
+                descriptionId={retentionNoteId}
+                loading={usage.isFetching}
+              />
 
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t pt-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
                 <p className="min-w-0 text-muted-foreground tabular-nums">
                   {t(
                     `第 ${firstIndex}–${lastIndex} 条，共 ${total.toLocaleString(locale)} 条`,
@@ -287,13 +283,9 @@ export function CredentialUsageDialog({
                   <PaginationContent>
                     <PaginationItem>
                       <PaginationPrevious
-                        href="#"
-                        className={cn(
-                          (usage.isFetching || currentPage === 0) && 'pointer-events-none opacity-50',
-                        )}
+                        render={<Button variant="ghost" disabled={usage.isFetching || currentPage === 0} />}
                         aria-disabled={usage.isFetching || currentPage === 0}
-                        onClick={(event) => {
-                          event.preventDefault()
+                        onClick={() => {
                           setPage((current) => Math.max(0, current - 1))
                         }}
                       />
@@ -308,13 +300,9 @@ export function CredentialUsageDialog({
                     </PaginationItem>
                     <PaginationItem>
                       <PaginationNext
-                        href="#"
-                        className={cn(
-                          (usage.isFetching || currentPage >= totalPages - 1) && 'pointer-events-none opacity-50',
-                        )}
+                        render={<Button variant="ghost" disabled={usage.isFetching || currentPage >= totalPages - 1} />}
                         aria-disabled={usage.isFetching || currentPage >= totalPages - 1}
-                        onClick={(event) => {
-                          event.preventDefault()
+                        onClick={() => {
                           setPage((current) => Math.min(totalPages - 1, current + 1))
                         }}
                       />
@@ -327,7 +315,7 @@ export function CredentialUsageDialog({
           )}
         </DialogPanel>
 
-        <DialogFooter>
+        <DialogFooter className="px-4 py-3 sm:px-5">
           <Button
             type="button"
             variant="outline"
@@ -346,12 +334,56 @@ export function CredentialUsageDialog({
   )
 }
 
-function UsageTable({ rows }: { rows: UsageLog[] }) {
+function UsageTable({
+  rows,
+  credentialLabel,
+  descriptionId,
+  loading,
+}: {
+  rows: UsageLog[]
+  credentialLabel: string
+  descriptionId: string
+  loading: boolean
+}) {
   const { t, language, locale } = useI18n()
   return (
-    <Table variant="card" className="text-xs">
-      <TableHeader>
-        <TableRow>
+    <Table
+      render={(
+        <div
+          className="max-h-[32rem] rounded-xl border bg-card outline-none overscroll-contain focus-visible:ring-2 focus-visible:ring-ring sm:max-h-[min(52vh,32rem)]"
+          role="region"
+          aria-label={t(`${credentialLabel} 的请求明细表`, `Request log table for ${credentialLabel}`)}
+          aria-busy={loading}
+          tabIndex={0}
+        />
+      )}
+      className="min-w-[72rem] table-fixed text-xs"
+      aria-describedby={descriptionId}
+    >
+      <TableCaption className="sr-only">
+        {t(`${credentialLabel} 的请求明细`, `Request log for ${credentialLabel}`)}
+      </TableCaption>
+      <colgroup>
+        <col className="w-[7.5rem]" />
+        <col className="w-[4rem]" />
+        <col className="w-[9rem]" />
+        <col className="w-[4.25rem]" />
+        <col className="w-[4.25rem]" />
+        <col className="w-[6.5rem]" />
+        <col className="w-[7.25rem]" />
+        <col className="w-[5rem]" />
+        <col className="w-[6.5rem]" />
+        <col className="w-[18rem]" />
+      </colgroup>
+      <TableHeader className="sticky top-0 z-10 bg-muted/96 backdrop-blur-sm">
+        <TableRow className="bg-muted/72 [&>th]:border-b [&>th]:text-2xs">
+          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('请求', 'Request')}</TableHead>
+          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
+          <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
+          <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
+          <TableHead scope="colgroup" colSpan={2} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
+        </TableRow>
+        <TableRow className="bg-muted/96">
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('状态', 'Status')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('模型', 'Model')}</TableHead>
@@ -385,7 +417,7 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
             : '—'
           const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
           return (
-            <TableRow key={log.id}>
+            <TableRow key={log.id} className="[&>td]:px-2.5 [&>td]:py-2">
               <TableCell
                 className="whitespace-nowrap tabular-nums"
                 title={`${formatFullTime(log.ts, language)} · ${log.path}`}
@@ -451,9 +483,8 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
 /**
  * UA 单元格：来访那份为主，被改写时另起一行显示实际发给上游的那份。
  *
- * **折行而不是截断**：真实 UA 动辄六七十字符
- * （`claude-cli/2.1.219 (external, local-agent, agent-sdk/0.3.219)`），截断后靠 title 悬停才能
- * 看全，而这一列的用处正是「一眼认出谁在发」。折行让它整串可见，代价只是行高。
+ * 真实 UA 动辄六七十字符。表格内最多展示两行，避免一条长 UA 把整行撑高；完整内容保留在
+ * title 里。被改写时第二行显示实际发给上游的值。
  *
  * 两者相同（原样转发）时只显示一份——绝大多数请求都是这种，重复显示等于白占半屏。
  * 都为空的是 0.2.60 之前的旧记录，不是「没有客户端」。
@@ -461,18 +492,16 @@ function UsageTable({ rows }: { rows: UsageLog[] }) {
 function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
   const { t } = useI18n()
   const rewritten = !!uaOut && uaOut !== ua
+  const incoming = ua ?? (uaOut
+    ? t('无（luban 自身发起）', 'None (sent by luban itself)')
+    : '—')
   return (
-    <TableCell className="min-w-52 max-w-72 whitespace-normal break-all align-top">
-      <span className={cn(!ua && 'text-muted-foreground')}>
-        {ua ?? (uaOut
-          ? t('无（luban 自身发起）', 'None (sent by luban itself)')
-          : '—')}
+    <TableCell className="align-top leading-4" title={rewritten ? `${incoming}\n→ ${uaOut}` : incoming}>
+      <span className={cn('block truncate', !ua && 'text-muted-foreground')}>
+        {incoming}
       </span>
       {rewritten && (
-        <span
-          className="mt-0.5 block text-muted-foreground"
-          title={t('实际发给上游的 User-Agent', 'User-Agent actually sent upstream')}
-        >
+        <span className="mt-0.5 block truncate text-muted-foreground">
           → {uaOut}
         </span>
       )}
