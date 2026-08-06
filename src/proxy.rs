@@ -180,7 +180,7 @@ pub async fn handle(
     let (mut token, mut cred) = (token, cred);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
-    let (upstream, resp) = loop {
+    let (upstream, resp, sent) = loop {
         let sim = Simulation::detect(body_json.as_ref(), flags, &cred, &device_fp);
         // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
         let bare_session = bare_session_id(
@@ -208,7 +208,10 @@ pub async fn handle(
             bare_session,
             force_stream: upgrade_stream,
         };
-        let resp = upstream.send(upstream.shape(&body, &cred, &device_fp)).await;
+        // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
+        // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
+        let sent = upstream.shape(&body, &cred, &device_fp);
+        let resp = upstream.send(sent.clone()).await;
 
         // 只认「上游明确回 429」这一种：连不上/超时那类换个号一样连不上，重试只是浪费时间。
         let limited = match &resp {
@@ -217,7 +220,7 @@ pub async fn handle(
             }
             _ => None,
         };
-        let Some(info) = limited else { break (upstream, resp) };
+        let Some(info) = limited else { break (upstream, resp, sent) };
         // 基础窗口真耗尽 → 停调度整个账号；只有超额池（7d_oi）满或纯容量限制 → 只冷却这个模型。
         let scope = rate_limit_scope(&info, req_model.as_deref());
         let cooldown = info.cooldown(scope.account_level());
@@ -232,7 +235,7 @@ pub async fn handle(
 
         // 冷却与重试同受一个开关：关掉即完全退回「原样透传 429」的既有行为。
         if max_retry == 0 {
-            break (upstream, resp);
+            break (upstream, resp, sent);
         }
         park_rate_limited(&state.store, &cred, &scope, cooldown);
         tried.push(cred.id);
@@ -242,7 +245,7 @@ pub async fn handle(
                 retried,
                 "upstream 429, credential-swap retry cap reached, passing the response through"
             );
-            break (upstream, resp);
+            break (upstream, resp, sent);
         }
 
         // 换一个没试过的号。选号顺带**改绑**这台设备（绑定的号不在候选里时会重选并改绑），
@@ -274,7 +277,7 @@ pub async fn handle(
                     error = %e,
                     "upstream 429 but no credential to swap to, passing through as is"
                 );
-                break (upstream, resp);
+                break (upstream, resp, sent);
             }
         }
     };
@@ -364,6 +367,12 @@ pub async fn handle(
                                 message = %message.chars().take(500).collect::<String>(),
                                 "upstream returned 4xx"
                             );
+                        }
+                        // 上游把这条请求判成了第三方应用（额度改扣超额池）。这类 400 光看
+                        // 错误文本查不出所以然——问题出在**我们发出去的那份请求**长什么样，
+                        // 故把出站头与出站体的结构摘要一并打出来，作为形态对齐的依据。
+                        if !compressed && is_third_party_rejection(&bytes) {
+                            log_third_party_rejection(&sent, &upstream.headers, &cred, status);
                         }
                         // 压缩体读不出内容，宁可漏判也不误判（乱码可能碰巧命中特征词）。
                         if let Some(reason) =
@@ -1602,6 +1611,215 @@ fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
         StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST => hits_keyword().then(reason),
         _ => None,
     }
+}
+
+/// 「被判成第三方应用」的特征文案。上游原文形如：
+/// `Third-party apps now draw from your extra usage, not your plan limits.
+/// Add more at claude.ai/settings/usage and keep going`。
+///
+/// 两条都不带主语，故只能裸子串匹配；但它们只用来决定**要不要多打一条日志**，
+/// 误伤的代价仅是一条多余的 info，与 [`BAN_KEYWORDS`] 那种会停用凭证的判据不同。
+const THIRD_PARTY_PHRASES: &[&str] = &["third-party app", "extra usage"];
+
+/// 上游是否把这条请求判成了第三方应用（额度改扣超额池而非订阅额度）。
+///
+/// **注意它不会被 [`detect_account_ban`] 误判成封号**：这段文案里既没有 `oauth`/
+/// `invalid_grant`，也凑不出「主语 + 状态词」的共现，故不会停用凭证——账号是好的，
+/// 被拒的是请求形态。
+fn is_third_party_rejection(body: &[u8]) -> bool {
+    let (etype, message) = parse_upstream_error(body);
+    let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
+    THIRD_PARTY_PHRASES.iter().any(|p| hay.contains(p))
+}
+
+/// 摘要里每段文本最多保留的字符数。
+const DUMP_TEXT_HEAD: usize = 200;
+
+/// 截断到 `n` 个字符，并在尾部标出被吃掉多少，避免「看着是全文其实是截断」。
+/// 按 `char` 截而不是按字节切：请求体里有中文，按字节切会 panic。
+fn head(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    if total <= n {
+        return s.to_string();
+    }
+    format!("{}…(+{})", s.chars().take(n).collect::<String>(), total - n)
+}
+
+/// 不能进日志的头。取值本身有鉴权效力，打出来等于把凭证写进日志文件。
+/// 保留头名与位置（值换成 `<redacted>`），因为**头序**本身也是要看的东西。
+fn is_secret_header(name: &str) -> bool {
+    matches!(name, "authorization" | "x-api-key" | "cookie" | "proxy-authorization")
+}
+
+/// 上游把请求判成第三方应用时，把**我们实际发出去的那份请求**的形态打成一条 info。
+///
+/// 这类 400 的错误文本本身没有信息量（它只说「你是第三方」，不说凭什么），要查只能看
+/// 出站报文长什么样：头的拼写与顺序、`system` 块数与断点、`tools` 里的名字与类型、
+/// `metadata` 身份、顶层 key 顺序——判据在这些里面，不在错误文本里。
+///
+/// **打摘要而不是原文**，两个理由：
+///   - 隐私：`messages` 是用户的对话内容，服务端日志不该留。故只记 role + 每块的类型，
+///     `text` 只记长度；`tool_use` 记名字（工具名正是要查的那个维度）。
+///   - 体积：`system` 在模拟路径下是 10KB 量级的官方基座，原文打出来会把日志刷没。
+///     故每块只记长度 + 前 [`DUMP_TEXT_HEAD`] 字符 + `cache_control` 原样。
+///
+/// 其余顶层字段（`model`/`stream`/`metadata`/`tool_choice`/`context_management`…）**原样**
+/// 打出——它们既不含用户内容，又都是形态判据。顶层 key 的**顺序**也照抄（本 crate 开了
+/// serde_json 的 `preserve_order`），因为顺序本身就是一处判据。
+fn log_third_party_rejection(
+    sent: &Bytes,
+    headers: &HeaderMap,
+    cred: &crate::credentials::Credential,
+    status: StatusCode,
+) {
+    let hdr = headers
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str();
+            let value = if is_secret_header(name) {
+                "<redacted>".to_string()
+            } else {
+                v.to_str()
+                    .map(|s| head(s, DUMP_TEXT_HEAD))
+                    .unwrap_or_else(|_| "<non-ascii>".to_string())
+            };
+            format!("{name}: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let body = match serde_json::from_slice::<serde_json::Value>(sent) {
+        Ok(v) => request_digest(&v).to_string(),
+        Err(_) => format!(
+            "<unparsable {} bytes> {}",
+            sent.len(),
+            head(&String::from_utf8_lossy(sent), 512)
+        ),
+    };
+    tracing::info!(
+        cred_id = cred.id, cred = %cred.label,
+        status = status.as_u16(),
+        bytes = sent.len(),
+        headers = %hdr,
+        body = %body,
+        "upstream rejected the request as a third-party app; dumping the outbound request shape"
+    );
+}
+
+/// 出站请求体的结构摘要，见 [`log_third_party_rejection`] 的取舍说明。
+/// 非对象（理论上到不了这儿）原样返回。
+fn request_digest(v: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = v.as_object() else { return v.clone() };
+    let mut out = serde_json::Map::new();
+    for (k, val) in obj {
+        let digest = match k.as_str() {
+            "messages" => messages_digest(val),
+            "system" => system_digest(val),
+            "tools" => tools_digest(val),
+            _ => val.clone(),
+        };
+        out.insert(k.clone(), digest);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// `messages` 的摘要：只留「第几条、谁说的、里面是些什么块」，不留任何正文。
+/// `tool_use` 例外——它的 `name` 正是第三方判定最可能盯的维度，必须打出来。
+fn messages_digest(v: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = v.as_array() else { return v.clone() };
+    let turns = arr
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            let blocks = match m.get("content") {
+                Some(serde_json::Value::Array(bs)) => {
+                    bs.iter().map(block_label).collect::<Vec<_>>().join(",")
+                }
+                Some(serde_json::Value::String(s)) => format!("text(len={})", s.len()),
+                _ => "?".to_string(),
+            };
+            format!("{role}:{blocks}")
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "count": arr.len(), "turns": turns })
+}
+
+/// 单个内容块在摘要里的写法：`text` 只记长度，`tool_use` 记名字，其余只记类型。
+fn block_label(b: &serde_json::Value) -> String {
+    let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+    match t {
+        "tool_use" => {
+            format!("tool_use({})", b.get("name").and_then(|n| n.as_str()).unwrap_or("?"))
+        }
+        "text" => format!(
+            "text(len={})",
+            b.get("text").and_then(|t| t.as_str()).map(str::len).unwrap_or(0)
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// `system` 的摘要：每块记长度、前 [`DUMP_TEXT_HEAD`] 字符与 `cache_control` 原样。
+/// 块数与断点位置是形态对齐的核心判据（见 [`align_system_shape`]），必须能一眼数出来。
+fn system_digest(v: &serde_json::Value) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = match v {
+        serde_json::Value::String(s) => {
+            vec![serde_json::json!({ "len": s.len(), "head": head(s, DUMP_TEXT_HEAD) })]
+        }
+        serde_json::Value::Array(bs) => bs
+            .iter()
+            .map(|b| {
+                let text = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let mut o = serde_json::Map::new();
+                o.insert("len".to_string(), serde_json::json!(text.len()));
+                o.insert("head".to_string(), serde_json::json!(head(text, DUMP_TEXT_HEAD)));
+                if let Some(cc) = b.get("cache_control") {
+                    o.insert("cache_control".to_string(), cc.clone());
+                }
+                serde_json::Value::Object(o)
+            })
+            .collect(),
+        other => return other.clone(),
+    };
+    serde_json::Value::Array(blocks)
+}
+
+/// `tools` 的摘要：`name`/`type` **原样**（第三方判定最可能盯的就是这两项），
+/// `description` 截断，`input_schema` 只留顶层参数名。见过的键之外若还有别的，
+/// 把键名列出来——摘要不该悄悄吃掉一个没见过的字段。
+fn tools_digest(v: &serde_json::Value) -> serde_json::Value {
+    const KNOWN: &[&str] = &["name", "type", "description", "input_schema"];
+    let Some(arr) = v.as_array() else { return v.clone() };
+    let out = arr
+        .iter()
+        .map(|t| {
+            let mut o = serde_json::Map::new();
+            for key in ["name", "type"] {
+                if let Some(x) = t.get(key) {
+                    o.insert(key.to_string(), x.clone());
+                }
+            }
+            if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
+                o.insert("desc".to_string(), serde_json::json!(head(d, 80)));
+            }
+            if let Some(props) =
+                t.get("input_schema").and_then(|s| s.get("properties")).and_then(|p| p.as_object())
+            {
+                o.insert(
+                    "schema_props".to_string(),
+                    serde_json::json!(props.keys().collect::<Vec<_>>()),
+                );
+            }
+            let extra: Vec<&String> = t
+                .as_object()
+                .map(|m| m.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect())
+                .unwrap_or_default();
+            if !extra.is_empty() {
+                o.insert("extra_keys".to_string(), serde_json::json!(extra));
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(out)
 }
 
 /// 生效的接入 key：启动时 `--api-key`/env 覆盖优先，否则用库中网页配置的值。
@@ -3875,8 +4093,9 @@ fn probe_report(
 mod tests {
     use super::{
         Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
-        detect_account_ban, ensure_billing_cch, header, is_billable_messages, merge_beta,
-        replace_json_str_field, request_speed, store, uuid_v4,
+        detect_account_ban, ensure_billing_cch, head, header, is_billable_messages,
+        is_secret_header, is_third_party_rejection, merge_beta, replace_json_str_field,
+        request_digest, request_speed, store, uuid_v4,
     };
 
     /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
@@ -4830,6 +5049,97 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    /// 「被判成第三方应用」的那条 400 要认出来，普通 400 不能误认。
+    ///
+    /// 同一条报文还必须**不**被 [`super::detect_account_ban`] 判成封号——账号是好的，
+    /// 被拒的是请求形态；误停用等于每撞一次这个 400 就白扣一个号。
+    #[test]
+    fn detects_third_party_rejection_without_banning() {
+        let real = err_body(
+            "invalid_request_error",
+            "Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going",
+        );
+        assert!(is_third_party_rejection(&real));
+        assert!(
+            detect_account_ban(StatusCode::BAD_REQUEST, &real).is_none(),
+            "第三方判定不是账号级错误，不得停用凭证"
+        );
+
+        // 同一族的另一条文案（额度真的用光）。
+        let drained =
+            err_body("invalid_request_error", "You're out of extra usage. Add more to keep going");
+        assert!(is_third_party_rejection(&drained));
+
+        for other in [
+            err_body("invalid_request_error", "max_tokens: must be <= 64000"),
+            err_body("authentication_error", "invalid bearer token"),
+            b"<html>400 Bad Request</html>".to_vec(),
+        ] {
+            assert!(
+                !is_third_party_rejection(&other),
+                "不该误认: {}",
+                String::from_utf8_lossy(&other)
+            );
+        }
+    }
+
+    /// 摘要要留住形态判据（工具名与类型、system 块数与断点、顶层 key 顺序），
+    /// 同时不把用户对话正文带进日志。
+    #[test]
+    fn request_digest_keeps_shape_and_drops_user_text() {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            ],
+            "tools": [
+                {"name": "delegate_task", "description": "hand work to a subagent",
+                 "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}}}},
+                {"type": "web_search_20250305", "name": "web_search"},
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "我的银行卡号是 1234"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "delegate_task", "input": {"prompt": "secret"}},
+                ]},
+            ],
+            "stream": true,
+        });
+        let dumped = request_digest(&body).to_string();
+
+        // 形态判据留住了。
+        assert!(dumped.contains("delegate_task"), "工具名是要查的那个维度: {dumped}");
+        assert!(dumped.contains("web_search_20250305"), "server tool 的 type 要能看见: {dumped}");
+        assert!(dumped.contains("ephemeral"), "缓存断点要原样留着: {dumped}");
+        assert!(dumped.contains("claude-opus-5") && dumped.contains("\"stream\":true"));
+        assert!(dumped.contains("tool_use(delegate_task)"), "历史里的工具名同样要看: {dumped}");
+
+        // 用户正文没进去。
+        assert!(!dumped.contains("1234"), "用户对话正文不得进日志: {dumped}");
+        assert!(!dumped.contains("secret"), "工具入参不得进日志: {dumped}");
+
+        // 顶层 key 顺序原样（preserve_order），顺序本身也是判据。
+        let parsed: serde_json::Value = serde_json::from_str(&dumped).unwrap();
+        let keys: Vec<String> = parsed.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["model", "system", "tools", "messages", "stream"]);
+    }
+
+    /// 出站头摘要不得带出鉴权值——日志文件会被随手贴出来排查。
+    #[test]
+    fn header_dump_redacts_credentials() {
+        assert!(is_secret_header("authorization"));
+        assert!(is_secret_header("x-api-key"));
+        assert!(!is_secret_header("anthropic-beta"));
+    }
+
+    /// 截断按字符不按字节：请求体里有中文，按字节切会 panic。
+    #[test]
+    fn head_truncates_by_char() {
+        assert_eq!(head("abc", 10), "abc");
+        assert_eq!(head("中文中文中", 2), "中文…(+3)");
     }
 
     /// 补齐的 x-client-request-id 是标准 uuid v4 形态。
