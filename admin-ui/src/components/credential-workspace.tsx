@@ -55,6 +55,7 @@ import {
   PaginationLink,
 } from '@/components/ui/pagination'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
@@ -223,6 +224,22 @@ export interface CredentialWorkspaceProps {
   data: CredentialWorkspaceData
   state: CredentialWorkspaceState
   actions: CredentialWorkspaceActions
+}
+
+function WorkspaceToolbarSkeleton() {
+  return (
+    <div
+      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end"
+      aria-hidden="true"
+    >
+      <Skeleton className="col-span-2 h-9 sm:h-8 sm:min-w-56 sm:flex-1 xl:max-w-64" />
+      <div className="grid min-w-0 grid-cols-2 gap-1 sm:flex">
+        <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-24" />
+        <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
+      </div>
+      <Skeleton className="h-9 w-[4.5rem] justify-self-end sm:ml-auto sm:h-8 sm:w-16 xl:ml-0" />
+    </div>
+  )
 }
 
 /**
@@ -462,115 +479,274 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
-    <div className="space-y-4 sm:space-y-6" data-slot="credential-workspace">
-      <section className="flex items-center justify-between gap-4" aria-labelledby="page-title">
-        <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight sm:text-xl">
-          {t('账号池', 'Account pool')}
-        </h1>
+    <div className="space-y-3 sm:space-y-4" data-slot="credential-workspace">
+      <section
+        className="overflow-hidden rounded-xl border bg-card shadow-xs/5"
+        aria-labelledby="page-title"
+      >
         <div
-          className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground sm:text-xs"
-          aria-live="polite"
-          aria-atomic="true"
+          className={cn(
+            'grid gap-3 p-3 sm:p-4',
+            (isLoading || count > 0) && 'xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center',
+          )}
         >
-          {isRefetchError ? (
-            <>
-              <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
-              <button
-                type="button"
-                className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-                onClick={actions.onRetry}
-              >
-                {t('刷新失败，重试', 'Refresh failed. Retry')}
-              </button>
-            </>
-          ) : (
-            <>
-              {isFetching && !isLoading ? (
-                <RefreshCwIcon className="size-3.5 animate-spin" aria-hidden />
-              ) : (
-                <span className="size-1.5 rounded-full bg-success" aria-hidden />
+          <div className="flex min-w-0 items-center justify-between gap-3 xl:justify-start">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight">
+                {t('账号池', 'Account pool')}
+              </h1>
+              {!isLoading && (
+                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-2xs font-medium text-muted-foreground">
+                  {t(
+                    `${formatNumber(count)} 个账号`,
+                    `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
+                  )}
+                </span>
               )}
-              <span title={t('每 30 秒自动刷新', 'Refreshes automatically every 30 seconds')}>
-                {t('30 秒刷新', '30s refresh')}
-              </span>
-            </>
+            </div>
+            <div
+              className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {isRefetchError ? (
+                <>
+                  <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
+                  <button
+                    type="button"
+                    className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                    onClick={actions.onRetry}
+                  >
+                    {t('刷新失败，重试', 'Refresh failed. Retry')}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
+                    {isLoading || isFetching ? (
+                      <RefreshCwIcon className="size-3.5 animate-spin" />
+                    ) : (
+                      <span className="size-1.5 rounded-full bg-success" />
+                    )}
+                  </span>
+                  <span
+                    className="min-w-14"
+                    title={isLoading
+                      ? t('正在加载账号数据', 'Loading account data')
+                      : t('每 30 秒自动刷新', 'Refreshes automatically every 30 seconds')}
+                  >
+                    {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
+                  </span>
+                </>
+              )}
+            </div>
+          </div>
+
+          {isLoading ? (
+            <WorkspaceToolbarSkeleton />
+          ) : count > 0 && (
+            <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
+              <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-64">
+                <InputGroupAddon><SearchIcon /></InputGroupAddon>
+                <InputGroupInput
+                  value={query}
+                  onChange={(event) => changeQuery(event.target.value)}
+                  placeholder={t('搜索名称或 #id', 'Search name or #id')}
+                  aria-label={t('搜索账号', 'Search accounts')}
+                />
+                {query && (
+                  <InputGroupAddon align="inline-end">
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      onClick={() => changeQuery('')}
+                      aria-label={t('清除搜索', 'Clear search')}
+                    >
+                      <XIcon />
+                    </Button>
+                  </InputGroupAddon>
+                )}
+              </InputGroup>
+
+              <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
+              <ToolbarGroup className="grid min-w-0 grid-cols-2 sm:flex sm:flex-wrap">
+                <Menu>
+                  <MenuTrigger
+                    aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
+                    className={cn(
+                      buttonVariants({ variant: filter === 'all' ? 'outline' : 'secondary' }),
+                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    )}
+                  >
+                    <ListFilterIcon />
+                    <span className="min-w-0 truncate">
+                      {activeFilterLabel}
+                    </span>
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="w-52">
+                    <MenuRadioGroup value={filter}>
+                      {filterItems.map((item) => (
+                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
+                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                            <span>{item.label}</span>
+                            <span className="tnum text-xs text-muted-foreground">
+                              {formatNumber(metrics.filterCounts[item.key])}
+                            </span>
+                          </span>
+                        </MenuRadioItem>
+                      ))}
+                    </MenuRadioGroup>
+                  </MenuPopup>
+                </Menu>
+
+                <Menu>
+                  <MenuTrigger
+                    aria-label={t(
+                      `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
+                      `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
+                    )}
+                    className={cn(
+                      buttonVariants({ variant: 'outline' }),
+                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    )}
+                  >
+                    <ArrowUpDownIcon />
+                    <span className="min-w-0 truncate max-[22rem]:hidden">
+                      {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
+                    </span>
+                    <span className="hidden shrink-0 max-[22rem]:inline">
+                      {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
+                    </span>
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="w-48">
+                    <MenuRadioGroup value={sort}>
+                      {sortItems.map((item) => (
+                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
+                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                            <span>{item.label}</span>
+                            {sort === item.key && (
+                              <span className="text-xs text-muted-foreground">
+                                {dir === 'asc'
+                                  ? t('升序', 'Ascending')
+                                  : t('降序', 'Descending')}
+                              </span>
+                            )}
+                          </span>
+                        </MenuRadioItem>
+                      ))}
+                    </MenuRadioGroup>
+                  </MenuPopup>
+                </Menu>
+              </ToolbarGroup>
+
+              <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block xl:ml-0" />
+              <ToolbarGroup className="self-center justify-end">
+                <ToggleGroup
+                  value={[view]}
+                  onValueChange={(values) => {
+                    const next = values[values.length - 1]
+                    if (next === 'card' || next === 'list') actions.onViewChange(next)
+                  }}
+                  variant="outline"
+                  aria-label={t('账号视图', 'Account view')}
+                >
+                  <ToggleGroupItem
+                    value="card"
+                    aria-label={t('卡片视图', 'Card view')}
+                    title={t('卡片视图', 'Card view')}
+                  >
+                    <LayoutGridIcon />
+                  </ToggleGroupItem>
+                  <ToggleGroupSeparator />
+                  <ToggleGroupItem
+                    value="list"
+                    aria-label={t('列表视图', 'List view')}
+                    title={t('列表视图', 'List view')}
+                  >
+                    <ListIcon />
+                  </ToggleGroupItem>
+                </ToggleGroup>
+              </ToolbarGroup>
+            </Toolbar>
           )}
         </div>
-      </section>
 
-      {isLoading ? (
-        <section
-          aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
-          className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4"
-        >
-          <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
-          <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-          <OverviewMetricSkeleton className="border-r" />
-          <OverviewMetricSkeleton />
-        </section>
-      ) : count > 0 && (
-        <section
-          aria-label={t('账号池概览', 'Account pool overview')}
-          className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-4"
-        >
-          <OverviewMetric
-            className="border-r border-b lg:border-b-0"
-            label={t('可调度账号', 'Schedulable accounts')}
-            value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
-            status={schedulableCount < count
-              ? t(
-                  `${formatNumber(count - schedulableCount)} 暂不可用`,
-                  `${formatNumber(count - schedulableCount)} unavailable`,
-                )
-              : t(
-                  `${formatNumber(enabledCount)} 已启用`,
-                  `${formatNumber(enabledCount)} enabled`,
-                )}
-            icon={ShieldCheckIcon}
-            tone={schedulableCount > 0 ? 'ok' : 'bad'}
-            active={filter === 'schedulable'}
-            onClick={() => selectMetric('schedulable')}
-          />
-          <OverviewMetric
-            className="border-b lg:border-r lg:border-b-0"
-            label={t('需处理', 'Needs attention')}
-            value={formatNumber(attentionCount)}
-            status={attentionStatus}
-            icon={TriangleAlertIcon}
-            tone={abnormalCount > 0 || metrics.activeOverageCount > 0
-              ? 'bad'
-              : attentionCount > 0
-                ? 'warn'
-                : 'neutral'}
-            active={filter === 'attention'}
-            onClick={() => selectMetric('attention')}
-          />
-          <OverviewMetric
-            className="border-r"
-            label={t('额度风险', 'Quota risk')}
-            value={formatNumber(quotaRiskCount)}
-            status={quotaRiskStatus}
-            icon={RadioIcon}
-            tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
-            active={filter === 'nearLimit'}
-            onClick={() => selectMetric('nearLimit')}
-          />
-          <OverviewMetric
-            label={t('绑定设备', 'Linked devices')}
-            value={formatNumber(metrics.deviceCount)}
-            status={deviceStatus}
-            icon={SmartphoneIcon}
-            tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
-            active={filter === 'deviceFull' || filter === 'hasDevice'}
-            onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
-          />
-        </section>
-      )}
+        {isLoading ? (
+          <section
+            aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
+            className="grid grid-cols-2 border-t lg:grid-cols-4"
+          >
+            <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
+            <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+            <OverviewMetricSkeleton className="border-r" />
+            <OverviewMetricSkeleton />
+          </section>
+        ) : count > 0 && (
+          <section
+            aria-label={t('账号池概览', 'Account pool overview')}
+            className="grid grid-cols-2 border-t lg:grid-cols-4"
+          >
+            <OverviewMetric
+              className="border-r border-b lg:border-b-0"
+              label={t('可调度账号', 'Schedulable accounts')}
+              value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
+              status={schedulableCount < count
+                ? t(
+                    `${formatNumber(count - schedulableCount)} 暂不可用`,
+                    `${formatNumber(count - schedulableCount)} unavailable`,
+                  )
+                : t(
+                    `${formatNumber(enabledCount)} 已启用`,
+                    `${formatNumber(enabledCount)} enabled`,
+                  )}
+              icon={ShieldCheckIcon}
+              tone={schedulableCount > 0 ? 'ok' : 'bad'}
+              active={filter === 'schedulable'}
+              onClick={() => selectMetric('schedulable')}
+            />
+            <OverviewMetric
+              className="border-b lg:border-r lg:border-b-0"
+              label={t('需处理', 'Needs attention')}
+              value={formatNumber(attentionCount)}
+              status={attentionStatus}
+              icon={TriangleAlertIcon}
+              tone={abnormalCount > 0 || metrics.activeOverageCount > 0
+                ? 'bad'
+                : attentionCount > 0
+                  ? 'warn'
+                  : 'neutral'}
+              active={filter === 'attention'}
+              onClick={() => selectMetric('attention')}
+            />
+            <OverviewMetric
+              className="border-r"
+              label={t('额度风险', 'Quota risk')}
+              value={formatNumber(quotaRiskCount)}
+              status={quotaRiskStatus}
+              icon={RadioIcon}
+              tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
+              active={filter === 'nearLimit'}
+              onClick={() => selectMetric('nearLimit')}
+            />
+            <OverviewMetric
+              label={t('绑定设备', 'Linked devices')}
+              value={formatNumber(metrics.deviceCount)}
+              status={deviceStatus}
+              icon={SmartphoneIcon}
+              tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
+              active={filter === 'deviceFull' || filter === 'hasDevice'}
+              onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+            />
+          </section>
+        )}
+      </section>
 
       <section className="min-w-0" aria-labelledby="account-list-title">
         <h2 id="account-list-title" className="sr-only">{t('账号列表', 'Account list')}</h2>
         <p className="sr-only" aria-live="polite">
-          {filtering
+          {isLoading
+            ? t('正在加载账号', 'Loading accounts')
+            : filtering
             ? t(
                 `筛选出 ${formatNumber(total)} 个，共 ${formatNumber(count)} 个账号`,
                 `${formatNumber(total)} ${total === 1 ? 'match' : 'matches'} out of ${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
@@ -581,133 +757,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               )}
         </p>
         <div className="min-w-0 space-y-3 sm:space-y-4">
-          {count > 0 && (
-            <div className="rounded-xl border bg-card p-2.5 shadow-xs/5 sm:p-3">
-              <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
-                  <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-72">
-                    <InputGroupAddon><SearchIcon /></InputGroupAddon>
-                    <InputGroupInput
-                      value={query}
-                      onChange={(event) => changeQuery(event.target.value)}
-                      placeholder={t('搜索名称或 #id', 'Search name or #id')}
-                      aria-label={t('搜索账号', 'Search accounts')}
-                    />
-                    {query && (
-                      <InputGroupAddon align="inline-end">
-                        <Button
-                          size="icon-xs"
-                          variant="ghost"
-                          onClick={() => changeQuery('')}
-                          aria-label={t('清除搜索', 'Clear search')}
-                        >
-                          <XIcon />
-                        </Button>
-                      </InputGroupAddon>
-                    )}
-                  </InputGroup>
-
-                  <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
-                  <ToolbarGroup className="grid min-w-0 grid-cols-2 sm:flex sm:flex-wrap">
-                    <Menu>
-                      <MenuTrigger
-                        aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
-                        className={cn(
-                          buttonVariants({ variant: filter === 'all' ? 'outline' : 'secondary' }),
-                          'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                        )}
-                      >
-                        <ListFilterIcon />
-                        <span className="min-w-0 truncate">
-                          {activeFilterLabel}
-                        </span>
-                      </MenuTrigger>
-                      <MenuPopup align="end" className="w-52">
-                        <MenuRadioGroup value={filter}>
-                          {filterItems.map((item) => (
-                            <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
-                              <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                                <span>{item.label}</span>
-                                <span className="tnum text-xs text-muted-foreground">
-                                  {formatNumber(metrics.filterCounts[item.key])}
-                                </span>
-                              </span>
-                            </MenuRadioItem>
-                          ))}
-                        </MenuRadioGroup>
-                      </MenuPopup>
-                    </Menu>
-
-                    <Menu>
-                      <MenuTrigger
-                        aria-label={t(
-                          `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
-                          `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
-                        )}
-                        className={cn(
-                          buttonVariants({ variant: 'outline' }),
-                          'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                        )}
-                      >
-                        <ArrowUpDownIcon />
-                        <span className="min-w-0 truncate max-[22rem]:hidden">
-                          {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
-                        </span>
-                        <span className="hidden shrink-0 max-[22rem]:inline">
-                          {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
-                        </span>
-                      </MenuTrigger>
-                      <MenuPopup align="end" className="w-48">
-                        <MenuRadioGroup value={sort}>
-                          {sortItems.map((item) => (
-                            <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
-                              <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                                <span>{item.label}</span>
-                                {sort === item.key && (
-                                  <span className="text-xs text-muted-foreground">
-                                    {dir === 'asc'
-                                      ? t('升序', 'Ascending')
-                                      : t('降序', 'Descending')}
-                                  </span>
-                                )}
-                              </span>
-                            </MenuRadioItem>
-                          ))}
-                        </MenuRadioGroup>
-                      </MenuPopup>
-                    </Menu>
-                  </ToolbarGroup>
-
-                  <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block" />
-                  <ToolbarGroup className="self-center justify-end">
-                    <ToggleGroup
-                      value={[view]}
-                      onValueChange={(values) => {
-                        const next = values[values.length - 1]
-                        if (next === 'card' || next === 'list') actions.onViewChange(next)
-                      }}
-                      variant="outline"
-                      aria-label={t('账号视图', 'Account view')}
-                    >
-                      <ToggleGroupItem
-                        value="card"
-                        aria-label={t('卡片视图', 'Card view')}
-                        title={t('卡片视图', 'Card view')}
-                      >
-                        <LayoutGridIcon />
-                      </ToggleGroupItem>
-                      <ToggleGroupSeparator />
-                      <ToggleGroupItem
-                        value="list"
-                        aria-label={t('列表视图', 'List view')}
-                        title={t('列表视图', 'List view')}
-                      >
-                        <ListIcon />
-                      </ToggleGroupItem>
-                    </ToggleGroup>
-                  </ToolbarGroup>
-              </Toolbar>
-            </div>
-          )}
 
           {count > 0 && selected.size > 0 && (
             <div className="relative">
@@ -722,7 +771,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
           {isLoading ? (
             <div className="relative">
-              <CredentialLoadingState view={view} selectable />
+              <CredentialLoadingState view={view} selectable count={pageSize} />
             </div>
           ) : isError && !credentials ? (
             <Card><ErrorState error={error} onRetry={actions.onRetry} /></Card>

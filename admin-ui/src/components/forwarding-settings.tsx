@@ -220,6 +220,38 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="tool_name_mimic"
+          label={t('工具名混淆', 'Tool name obfuscation')}
+          summary={t(
+            '把会被上游判成第三方应用的工具名换成假名转发，返回时自动还原，客户端无感。',
+            'Forward tool names that would flag the request as a third-party app under generated aliases, restored transparently on the way back.',
+          )}
+          description={
+            <>
+              {t(
+                '上游按请求里的工具名判断这是不是第三方应用，命中就返回「Third-party apps now draw from your extra usage」并改扣超额额度，即使订阅额度充足。实测三个业务工具名就足以触发，而系统提示词里写什么完全不影响。开启后 luban 把这些名字换成稳定的假名发出，响应里再换回真名，客户端从头到尾看到的都是自己的工具名。官方自带的工具、MCP 工具（mcp__ 开头）和服务端工具都保留原名不动，所以对真实官方客户端没有任何影响。代价：响应内容要多做一次字符串替换；客户端中途增删工具会让假名整体重算，上游的提示词缓存会失效一次。',
+                'The upstream decides whether a request comes from a third-party app by looking at the tool names it carries; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when the plan quota is fine. In testing, three business tool names were enough to trigger it, while the system prompt contents made no difference at all. When enabled, luban forwards those names as stable aliases and swaps them back in the response, so the client only ever sees its own tool names. Official client tools, MCP tools (mcp__ prefix) and server tools keep their real names, so this is a no-op for the genuine official client. Costs: one extra string replacement pass over the response, and adding or removing tools mid-session recomputes every alias, invalidating the upstream prompt cache once.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="strip_extra_fields"
+          label={t('剥除多余字段', 'Strip extra fields')}
+          summary={t(
+            '删掉官方客户端从不发送的请求字段，只删语义等价于缺省值的那些。',
+            'Remove request fields the official client never sends, limited to those equivalent to their defaults.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端的对话请求字段是固定一套，多出来的字段就是一处稳定特征，可能导致请求被判为第三方应用而改扣超额额度。开启后 luban 会删掉两样：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时不动）；二是 thinking 里的 display 字段。代价：删掉 display 后上游不再返回思考摘要，客户端的「思考过程」会是空的，功能本身不受影响。真实官方客户端本来就不发这两样，开启对它没有任何影响。',
+                'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes two things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), and the display field inside thinking. Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. The real official client never sends either field, so enabling this is a no-op for it.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={DatabaseIcon} title={t('系统提示词', 'System prompt')}>

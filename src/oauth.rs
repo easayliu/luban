@@ -26,6 +26,9 @@ pub struct Profile {
     pub email: Option<String>,
     pub name: Option<String>,
     pub tier: Option<String>,
+    /// 组织类型原值（`claude_team`/`claude_enterprise`/`claude_max`…），团队号与个人号
+    /// 在调度与额度上完全不同（团队额度是整个组织共享的席位额度），故单独留一列供前端标记。
+    pub org_type: Option<String>,
     /// 账号唯一标识（`account.uuid`）；用于转发时的身份伪装。
     pub account_uuid: Option<String>,
 }
@@ -165,7 +168,12 @@ pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<
     let account_uuid =
         p.account.as_ref().and_then(|a| a.uuid.clone()).filter(|s| !s.trim().is_empty());
 
-    Ok(Profile { email, name, tier, account_uuid })
+    let org_type = p
+        .organization
+        .as_ref()
+        .and_then(|o| o.organization_type.clone())
+        .filter(|s| !s.trim().is_empty());
+    Ok(Profile { email, name, tier, org_type, account_uuid })
 }
 
 /// 由订阅标志推导账号等级：Max > Pro > Free；Max 附带倍数档（如 `Max 5x`）。
@@ -183,6 +191,13 @@ fn tier_from(
         return Some("Pro".into());
     }
     if let Some(t) = org_type.map(str::trim).filter(|s| !s.is_empty()) {
+        // 团队/企业号的席位**不体现在 account 的 has_claude_max/pro 上**（实测两个都是
+        // false），额度档只能从 `rate_limit_tier` 读——`default_claude_max_5x` 说明这个
+        // 组织拿的是 Max 5x 的量。此前这里直接返回 `humanize_tier("claude_team") = "team"`，
+        // 既把额度档整个丢了，大小写也和 `Max`/`Pro` 不一致。
+        if let Some(from_rate) = tier_from_rate_limit(rate_limit_tier) {
+            return Some(from_rate);
+        }
         let base = humanize_tier(t);
         // 组织类型是 max 时也带上倍数。
         return Some(if base == "Max" { with_mult("Max", mult) } else { base });
@@ -191,6 +206,16 @@ fn tier_from(
         return Some("Free".into());
     }
     None
+}
+
+/// 从 `rate_limit_tier` 读出额度档，如 `default_claude_max_5x` → `Max 5x`。
+///
+/// 只给**团队/企业号**用：个人号的档位由 `has_claude_max`/`has_claude_pro` 直接给出，
+/// 更权威；团队号那两个标志恒为 false，这个字段是唯一的信息来源。
+fn tier_from_rate_limit(rate_limit_tier: Option<&str>) -> Option<String> {
+    let raw = rate_limit_tier?.to_ascii_lowercase();
+    let base = ["max", "pro", "free"].into_iter().find(|k| raw.split('_').any(|seg| seg == *k))?;
+    Some(with_mult(&humanize_tier(base), multiplier(rate_limit_tier)))
 }
 
 /// 从 `default_claude_max_5x` 提取倍数段 `5x`（形如 `\d+x`）。
@@ -216,7 +241,15 @@ fn humanize_tier(raw: &str) -> String {
         "max" => "Max".into(),
         "pro" => "Pro".into(),
         "free" => "Free".into(),
-        other => other.to_string(),
+        // 没见过的类型（`team`/`enterprise`…）至少把首字母大写，别在界面上混着
+        // `Max`/`Pro` 显示一个小写词。
+        other => {
+            let mut c = other.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => other.to_string(),
+            }
+        }
     }
 }
 
@@ -374,8 +407,40 @@ fn urlencode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenEndpointError;
+    use super::{TokenEndpointError, tier_from};
     use wreq::StatusCode;
+
+    /// 团队号的档位只能从 `rate_limit_tier` 读——实测 `cred_id=9`（`claude_team`）的
+    /// `account.has_claude_max`/`has_claude_pro` **都是 false**，而
+    /// `organization.rate_limit_tier` 是 `default_claude_max_5x`。
+    /// 此前这条路返回的是 `"team"`：额度档整个丢了，大小写也和 `Max`/`Pro` 不一致。
+    #[test]
+    fn team_tier_comes_from_the_rate_limit_field() {
+        assert_eq!(
+            tier_from(Some(false), Some(false), Some("claude_team"), Some("default_claude_max_5x")),
+            Some("Max 5x".into())
+        );
+        // 企业号同理。
+        assert_eq!(
+            tier_from(None, None, Some("claude_enterprise"), Some("default_claude_max_20x")),
+            Some("Max 20x".into())
+        );
+        // 读不出档位时退回组织类型，但首字母大写，别在界面上混着小写词。
+        assert_eq!(tier_from(None, None, Some("claude_team"), None), Some("Team".into()));
+        assert_eq!(tier_from(None, None, Some("claude_team"), Some("weird")), Some("Team".into()));
+    }
+
+    /// 个人号的判定顺序不变：`has_claude_max`/`has_claude_pro` 比组织字段更权威。
+    #[test]
+    fn personal_tier_still_wins_over_the_org_fields() {
+        assert_eq!(
+            tier_from(Some(true), None, Some("claude_team"), Some("default_claude_max_20x")),
+            Some("Max 20x".into())
+        );
+        assert_eq!(tier_from(None, Some(true), Some("claude_team"), None), Some("Pro".into()));
+        assert_eq!(tier_from(Some(false), Some(false), None, None), Some("Free".into()));
+        assert_eq!(tier_from(None, None, None, None), None);
+    }
 
     fn err(status: StatusCode, body: &str) -> TokenEndpointError {
         TokenEndpointError { status, body: body.into() }

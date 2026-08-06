@@ -159,6 +159,14 @@ pub async fn handle(
     let upgrade_stream = billable
         && flags.nonstream_as_sse
         && body_json.as_ref().is_some_and(|v| !stream_requested(v));
+    // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
+    // 两侧共用同一份。见 [`ToolNameMap`]。
+    let tool_names = (billable && flags.tool_name_mimic)
+        .then(|| build_tool_name_map(body_json.as_ref()).map(std::sync::Arc::new))
+        .flatten();
+    if let Some(map) = &tool_names {
+        tracing::debug!(count = map.forward.len(), "obfuscating tool names");
+    }
 
     // 7) 发起上游请求并流式回传。头名的拼写与顺序由 orig_header_case 决定（关掉即退回
     //    「全小写 + Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
@@ -207,6 +215,7 @@ pub async fn handle(
             sim,
             bare_session,
             force_stream: upgrade_stream,
+            tool_names: tool_names.clone(),
         };
         // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
         // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
@@ -406,9 +415,16 @@ pub async fn handle(
                                 retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl)
                                     .await
                             {
-                                return relay_upstream(up, rl, upgrade_stream).await;
+                                return relay_upstream(up, rl, upgrade_stream, tool_names.clone())
+                                    .await;
                             }
                         }
+                        // 上游的错误文本可能回显假名（如「tool analyze_ski00 not found」），
+                        // 整段已在内存里，顺手还原一次，成本可忽略。
+                        let bytes = match &tool_names {
+                            Some(map) => Bytes::from(map.restore(&bytes)),
+                            None => bytes,
+                        };
                         builder.body(Body::from(bytes)).unwrap_or_else(|e| {
                             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
                         })
@@ -422,7 +438,7 @@ pub async fn handle(
                 };
             }
 
-            relay_upstream(up, rl, upgrade_stream).await
+            relay_upstream(up, rl, upgrade_stream, tool_names).await
         }
         Err(e) => {
             // wreq 顶层 Display 往往只有「error sending request」，真正原因在 source 链里。
@@ -469,6 +485,9 @@ struct Upstream<'a> {
     /// 来访是非流式、要改写成 `stream:true` 发出（回程再聚合成整段 JSON）。
     /// 见 [`store::ForwardFlags::nonstream_as_sse`]。
     force_stream: bool,
+    /// 工具名混淆映射；`None` 即没有要混淆的工具（真 CC／全在白名单里／`tools` 为空），
+    /// 此时请求与回程两侧都零开销。见 [`ToolNameMap`]。
+    tool_names: Option<std::sync::Arc<ToolNameMap>>,
 }
 
 impl Upstream<'_> {
@@ -491,6 +510,7 @@ impl Upstream<'_> {
                 self.sim.as_ref(),
                 self.bare_session.as_deref(),
                 self.force_stream,
+                self.tool_names.as_deref(),
             )
         } else {
             body.clone()
@@ -564,14 +584,27 @@ fn resp_builder_as(up: &wreq::Response, ct: Option<&str>) -> axum::http::respons
 /// [`store::ForwardFlags::nonstream_as_sse`]）。此时**只有上游真回了 SSE 才聚合**——
 /// 上游若因为别的原因回了整段 JSON（形态没被接受、或哪天默认变了），原样透传才是对的，
 /// 拿聚合器去解一份非 SSE 的 body 只会得到一个空 Message。
-async fn relay_upstream(up: wreq::Response, rl: ReqLog, upgrade_stream: bool) -> Response {
+async fn relay_upstream(
+    up: wreq::Response,
+    rl: ReqLog,
+    upgrade_stream: bool,
+    tool_names: Option<std::sync::Arc<ToolNameMap>>,
+) -> Response {
     let (is_stream, _) = resp_shape(&up);
-    if upgrade_stream && is_stream { aggregate_sse(up, rl).await } else { stream_upstream(up, rl) }
+    if upgrade_stream && is_stream {
+        aggregate_sse(up, rl, tool_names.as_deref()).await
+    } else {
+        stream_upstream(up, rl, tool_names)
+    }
 }
 
 /// 把上游响应包成流式回传：首块到达记 TTFT，边转发边嗅探用量；
 /// 流结束（或客户端断开）时 `rl` 在 Drop 里记 total、输出一条日志并落库。
-fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
+fn stream_upstream(
+    up: wreq::Response,
+    mut rl: ReqLog,
+    tool_names: Option<std::sync::Arc<ToolNameMap>>,
+) -> Response {
     let builder = resp_builder(&up);
     let stream = up.bytes_stream().map(move |chunk| {
         if rl.ttft_ms.is_none() {
@@ -587,9 +620,12 @@ fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
         }
         chunk
     });
-    builder
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+    // 用量嗅探喂的是**还原前**的字节（`usage` 里没有工具名，两者等价），还原只包在最外层。
+    let body = match tool_names {
+        Some(map) => Body::from_stream(restore_tool_names_stream(stream, map)),
+        None => Body::from_stream(stream),
+    };
+    builder.body(body).unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
 }
 
 /// 收齐上游 SSE、聚合成一条整段 JSON 的 Message 回给客户端（来访本来发的就是非流式）。
@@ -597,7 +633,11 @@ fn stream_upstream(up: wreq::Response, mut rl: ReqLog) -> Response {
 /// 用量嗅探照旧按 SSE 逐行走——**比非流式那条路更准**：整段 JSON 模式有 1MB 的累积上限，
 /// 超了就整条丢用量，逐行模式没有这个限制。TTFT 记的是上游首字节，客户端感知不到（它只会
 /// 在末尾一次性收到整段），故日志里这两列会不一致，`sse_aggregated=true` 用来标出这类记录。
-async fn aggregate_sse(up: wreq::Response, mut rl: ReqLog) -> Response {
+async fn aggregate_sse(
+    up: wreq::Response,
+    mut rl: ReqLog,
+    tool_names: Option<&ToolNameMap>,
+) -> Response {
     let builder = resp_builder_as(&up, Some("application/json"));
     rl.sse_aggregated = true;
     let mut agg = SseAggregator::default();
@@ -621,8 +661,12 @@ async fn aggregate_sse(up: wreq::Response, mut rl: ReqLog) -> Response {
     match agg.finish() {
         // 正常收尾：整段 Message，`content-type` 已换成 application/json。
         Aggregated::Message(msg) => match serde_json::to_vec(&msg) {
+            // 聚合完再还原：整段都在内存里，不必操心分块边界。
             Ok(body) => builder
-                .body(Body::from(body))
+                .body(Body::from(match tool_names {
+                    Some(map) => map.restore(&body),
+                    None => body,
+                }))
                 .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response()),
             Err(e) => {
                 rl.status = StatusCode::BAD_GATEWAY.as_u16();
@@ -2536,6 +2580,9 @@ fn ensure_beta_query(url: &str) -> String {
 /// 新增字段追加在末尾。回归测试见 [`tests::preserves_key_order`]。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
+// 参数多是有意的：这些全是「一次改写要知道的上下文」，打包成结构体只会多一层间接，
+// 而调用点只有 `Upstream::shape` 一处。
+#[allow(clippy::too_many_arguments)]
 fn rewrite_body(
     body: &Bytes,
     cred: &crate::credentials::Credential,
@@ -2544,6 +2591,7 @@ fn rewrite_body(
     sim: Option<&Simulation>,
     bare_session: Option<&str>,
     force_stream: bool,
+    tool_names: Option<&ToolNameMap>,
 ) -> Bytes {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
@@ -2556,7 +2604,14 @@ fn rewrite_body(
         ttl_1h: flags.cache_ttl_1h && flags.merge_beta,
     };
     // 全关且不模拟：连解析都不必做，原样返回。
-    if sim.is_none() && !shape && !flags.spoof_identity && !flags.billing_cch && !force_stream {
+    if sim.is_none()
+        && !shape
+        && !flags.spoof_identity
+        && !flags.billing_cch
+        && !flags.strip_extra_fields
+        && !force_stream
+        && tool_names.is_none()
+    {
         return body.clone();
     }
     // 补 metadata 用的 session_id：模拟模式取 Simulation 那份，CC 形态来访取 `bare_session`
@@ -2597,6 +2652,11 @@ fn rewrite_body(
     // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
+    // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
+    // 摆在队尾就不必操心谁先谁后。
+    let stripped = flags.strip_extra_fields && strip_extra_fields(&mut v);
+    // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
+    let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
         simulated,
         sim_meta,
@@ -2608,6 +2668,8 @@ fn rewrite_body(
         msg_shape,
         ttl_filled,
         streamed,
+        stripped,
+        tools_mimicked,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
@@ -2622,6 +2684,8 @@ fn rewrite_body(
         && !msg_shape
         && !ttl_filled
         && !streamed
+        && !stripped
+        && !tools_mimicked
     {
         return body.clone();
     }
@@ -3022,6 +3086,306 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
     // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
     block.insert("cache_control".into(), cache_control(shape.tail()));
     true
+}
+
+/// 剥掉官方客户端**从不发送**的顶层字段，返回是否改动过。只在
+/// [`store::ForwardFlags::strip_extra_fields`] 开着时调用。
+///
+/// 判据逐条取自 `cap/raw/00006`（opus-5）与 `00009`（sonnet-5）两份直连抓包——两份的顶层键
+/// 恒为 `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
+/// output_config, stream`，多一个就是白送的判据。
+///
+/// 目前两项：
+///
+/// 1. **`tool_choice`**：官方两份抓包里这个键**压根不存在**。但只删**等价于默认值**的那一种
+///    （恰好只有 `{"type":"auto"}` 一个键）——`{"type":"tool", "name":…}`/`{"type":"any"}`
+///    是客户端在强制选工具，`disable_parallel_tool_use` 也是它要的行为，删了就是改语义。
+///    删掉的那种对模型零影响：`auto` 本来就是缺省。
+///
+/// 2. **`thinking.display`**：官方发的是裸的 `{"type":"adaptive"}`。
+///
+///    **这一项有代价，不是零影响**：`display:"summarized"` 是客户端主动要思考摘要，剥掉之后
+///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
+///    功能不坏（块还在、签名照旧），只是看不到内容。拿「一条 400 直接打不通」换「思考摘要看不
+///    到」是划算的，但划算不等于无损，故写在这里，并由开关兜底——不接受这个代价就关掉它。
+///
+/// **对真实 CC 是空操作**：官方本来就不发这两样，走一遍什么也删不掉，故无需再叠客户端判定。
+fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    let mut changed = false;
+    if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
+        obj.remove("tool_choice");
+        changed = true;
+    }
+    if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut())
+        && thinking.remove("display").is_some()
+    {
+        changed = true;
+    }
+    changed
+}
+
+/// `tool_choice` 是否等价于「不写这个字段」，即恰好只有 `{"type":"auto"}` 一个键。
+/// 多带任何一个键（如 `disable_parallel_tool_use`）都是客户端在要一种非缺省行为，不能删。
+fn is_default_tool_choice(v: &serde_json::Value) -> bool {
+    v.as_object()
+        .is_some_and(|o| o.len() == 1 && o.get("type").and_then(|t| t.as_str()) == Some("auto"))
+}
+
+/// 假名的前缀池。取值本身不重要（上游认的是「在不在它那张第三方名单里」，不是「像不像
+/// CC」——`Skill_manage` 这种把首字母大写的写法实测也能过），重要的是**离任何真实业务名足够
+/// 远**且**稳定可逆**。
+const FAKE_TOOL_PREFIXES: &[&str] = &[
+    "analyze_",
+    "compute_",
+    "fetch_",
+    "generate_",
+    "lookup_",
+    "modify_",
+    "process_",
+    "query_",
+    "render_",
+    "resolve_",
+    "sync_",
+    "update_",
+    "validate_",
+    "convert_",
+    "extract_",
+    "manage_",
+    "monitor_",
+    "parse_",
+    "review_",
+    "search_",
+    "transform_",
+    "handle_",
+];
+
+/// 一次请求内的工具名混淆映射。
+///
+/// **为什么要混淆**：上游按 `tools[*].name` 判定「这是不是第三方应用」，命中就把额度改扣
+/// 超额池并回 400（`Third-party apps now draw from your extra usage…`）。实测判据只有工具名
+/// 一项——`system` 里明写「You are Hermes Agent, created by Nous Research」都不影响，而
+/// `skill_manage`/`skill_view`/`skills_list` 三个名字就足以触发。
+///
+/// **没有安全的数量门槛**：3 个真名会触发，26 个真名不触发，77 个 PascalCase 造名也不触发。
+/// 触发与否取决于**具体是哪些名字**，故不设阈值——只要有可混淆的名字就全混淆。
+struct ToolNameMap {
+    /// 真名 → 假名，请求侧用。
+    forward: std::collections::HashMap<String, String>,
+    /// (假名, 真名)，按假名长度**倒序**——短假名可能是长假名的子串，先替长的才不会被吃掉。
+    reverse: Vec<(String, String)>,
+    /// 最长假名的字节数。回程滑动窗口靠它决定留多少字节，见 [`Self::feed`]。
+    max_fake: usize,
+}
+
+/// 某个 tool 是否该混淆。三类保留原名：
+///
+/// 1. **server tool**（`type` 存在且不是 `custom`/`function`）：`web_search_20250305` 这类是
+///    协议语义的一部分，改了上游直接拒。
+/// 2. **`mcp__` 前缀**：实测豁免——`skill_manage`/`skill_view`/`skills_list` 原样是 400，
+///    加上 `mcp__hermes__` 前缀就回 200。真实 CC 接 MCP 时发的正是这种名字，保留它反而更真。
+/// 3. **[`config::CC_TOOL_NAMES`]**：官方自己那套，逐字就是真 CC 会发的东西。
+fn should_mimic_tool(t: &serde_json::Value) -> bool {
+    let kind = t.get("type").and_then(|k| k.as_str()).unwrap_or_default();
+    if !matches!(kind, "" | "custom" | "function") {
+        return false;
+    }
+    let Some(name) = t.get("name").and_then(|n| n.as_str()) else { return false };
+    !name.is_empty() && !name.starts_with("mcp__") && !config::CC_TOOL_NAMES.contains(&name)
+}
+
+/// 从请求体扫出要混淆的工具名，生成映射。没有可混淆的（`tools` 不是数组／全在白名单里）
+/// 返回 `None`，此后请求与回程两侧都零开销。
+///
+/// **假名对同一组工具名恒定**：seed 取 `sha256(名字集合)`，同一会话内每轮请求得到同一套假名，
+/// 上游的 prompt cache 才命中得了。客户端中途增删工具会让整套假名全变——历史里的
+/// `tool_use.name` 由 [`apply_tool_names`] 用**新**映射一起重写，故仍然自洽，代价只是缓存失效。
+fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> {
+    let tools = body?.get("tools")?.as_array()?;
+    let real: Vec<&str> = tools
+        .iter()
+        .filter(|t| should_mimic_tool(t))
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    if real.is_empty() {
+        return None;
+    }
+
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    for (i, name) in real.iter().enumerate() {
+        if i > 0 {
+            sha2::Digest::update(&mut hasher, b"\0");
+        }
+        sha2::Digest::update(&mut hasher, name.as_bytes());
+    }
+    let digest = sha2::Digest::finalize(hasher);
+    let seed = u64::from_be_bytes(digest[..8].try_into().expect("sha256 至少 8 字节"));
+
+    let mut forward = std::collections::HashMap::with_capacity(real.len());
+    let mut reverse = Vec::with_capacity(real.len());
+    let mut max_fake = 0usize;
+    for (i, name) in real.iter().enumerate() {
+        if forward.contains_key(*name) {
+            continue; // 同名工具重复声明：一个映射就够。
+        }
+        let prefix = FAKE_TOOL_PREFIXES
+            [(seed.wrapping_add(i as u64) % FAKE_TOOL_PREFIXES.len() as u64) as usize];
+        // 取真名开头三个 ASCII 字母数字，纯粹为了假名在日志里还认得出是谁。
+        let head: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
+        let fake = format!("{prefix}{head}{i:02}");
+        // 假名撞上任何一个真名就会在回程被换回去，等于自伤；序号已保证唯一，这里只是兜底。
+        if real.contains(&fake.as_str()) {
+            continue;
+        }
+        max_fake = max_fake.max(fake.len());
+        reverse.push((fake.clone(), (*name).to_string()));
+        forward.insert((*name).to_string(), fake);
+    }
+    if forward.is_empty() {
+        return None;
+    }
+    reverse.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    Some(ToolNameMap { forward, reverse, max_fake })
+}
+
+/// 把映射应用到请求体，返回是否改动过。三处必须**同时**改：
+///
+/// - `$.tools[*].name`
+/// - `$.tool_choice.name`（仅 `type == "tool"`，即客户端强制指定了某个工具）
+/// - `$.messages[*].content[*].name`（仅 `type == "tool_use"`，即历史里的工具调用）
+///
+/// 漏掉第三处的话，上游会因为 `tool_use` 引用了一个 `tools` 里没声明的名字而拒掉整条请求。
+fn apply_tool_names(v: &mut serde_json::Value, map: &ToolNameMap) -> bool {
+    let mut changed = false;
+    let mut rename = |obj: &mut serde_json::Value| {
+        let Some(name) = obj.get("name").and_then(|n| n.as_str()) else { return };
+        let Some(fake) = map.forward.get(name) else { return };
+        obj["name"] = serde_json::Value::String(fake.clone());
+        changed = true;
+    };
+
+    if let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for t in tools.iter_mut() {
+            if should_mimic_tool(t) {
+                rename(t);
+            }
+        }
+    }
+    if let Some(tc) = v.get_mut("tool_choice")
+        && tc.get("type").and_then(|t| t.as_str()) == Some("tool")
+    {
+        rename(tc);
+    }
+    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+                continue;
+            };
+            for b in blocks.iter_mut() {
+                if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    rename(b);
+                }
+            }
+        }
+    }
+    changed
+}
+
+impl ToolNameMap {
+    /// 回程还原：假名 → 真名。按假名长度倒序逐个替换。
+    ///
+    /// **按字节而不是按 `str` 做**：回程是流式的，一个 chunk 可以在任意字节处切断，
+    /// `String::from_utf8` 会在半个多字节字符上失败。假名全是 ASCII，字节级替换在 UTF-8 上
+    /// 安全（ASCII 不会出现在多字节序列内部）。
+    fn restore(&self, buf: &[u8]) -> Vec<u8> {
+        let mut out = buf.to_vec();
+        for (fake, real) in &self.reverse {
+            out = replace_bytes(&out, fake.as_bytes(), real.as_bytes());
+        }
+        out
+    }
+
+    /// 流式还原的一步：吃进一块，吐出**可以安全发走**的部分。
+    ///
+    /// 假名可能被 TCP 分块从中间切开（`analyze_ski00` 拆成 `analyze_sk` + `i00`），那一次就
+    /// 还原不了，客户端会拿到假名，下一轮请求带着假名回来，请求侧映射表里查不到，上游收到
+    /// 未声明的工具名再回一个 400。
+    ///
+    /// **顺序是「先整体还原、再留尾」，不能反过来**：先按长度切、只还原切出去的那半，
+    /// 跨在切点上的假名照样被劈开——留多少字节都挡不住，因为切点可以落在假名内部的任意位置。
+    /// 先对 `pending ‖ chunk` 整体做一次替换，完整的假名就都换掉了；剩下最多
+    /// `max_fake - 1` 个字节可能是某个假名的前半截，留到下一轮与后续字节拼起来再替。
+    /// 重复还原是幂等的（真名里不含假名），故留下来那段下一轮再过一遍也不会出错。
+    fn feed(&self, pending: &mut Vec<u8>, chunk: &[u8]) -> Bytes {
+        pending.extend_from_slice(chunk);
+        let restored = self.restore(pending);
+        let hold = self.max_fake.saturating_sub(1).min(restored.len());
+        let cut = restored.len() - hold;
+        *pending = restored[cut..].to_vec();
+        Bytes::copy_from_slice(&restored[..cut])
+    }
+
+    /// 流结束时把留存的尾巴吐出来。**不能省**：SSE 以 `\n\n` 收尾，尾巴扣着不发的话
+    /// 客户端的解析器会一直等那个终止符。
+    fn flush(&self, pending: &mut Vec<u8>) -> Bytes {
+        if pending.is_empty() {
+            return Bytes::new();
+        }
+        Bytes::from(self.restore(&std::mem::take(pending)))
+    }
+}
+
+/// 字节级子串替换。`from` 为空时原样返回（否则会死循环）。
+fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() || haystack.len() < from.len() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i <= haystack.len() - from.len() {
+        if &haystack[i..i + from.len()] == from {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&haystack[i..]);
+    out
+}
+
+/// 把上游响应流包一层工具名还原。滑动窗口的状态跟着流走，流结束时 flush 尾巴。
+///
+/// 用 `unfold` 而不是 `map`：`map` 收不到「上游流结束」这个事件，没法把留存的尾字节吐出去。
+fn restore_tool_names_stream<S>(
+    inner: S,
+    map: std::sync::Arc<ToolNameMap>,
+) -> impl futures_util::Stream<Item = Result<Bytes, wreq::Error>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, wreq::Error>> + Unpin,
+{
+    futures_util::stream::unfold(
+        (inner, map, Vec::<u8>::new(), false),
+        |(mut inner, map, mut pending, done)| async move {
+            if done {
+                return None;
+            }
+            match inner.next().await {
+                Some(Ok(bytes)) => {
+                    let out = map.feed(&mut pending, &bytes);
+                    Some((Ok(out), (inner, map, pending, false)))
+                }
+                // 上游把流掐了：错误原样交给下游（行为与不还原时一致），本次不再吐尾巴——
+                // 半截的假名还原出来也是半截，交给客户端反而更糟。
+                Some(Err(e)) => Some((Err(e), (inner, map, pending, true))),
+                None => {
+                    let tail = map.flush(&mut pending);
+                    (!tail.is_empty()).then(|| (Ok(tail), (inner, map, pending, true)))
+                }
+            }
+        },
+    )
 }
 
 /// 把 body 里**所有**缓存断点的 `ttl` 补齐成 `1h`，返回是否改动过。只在
@@ -3800,6 +4164,8 @@ pub async fn probe(
         // 整段 Message 解析出 model/error_type）是照非流式响应写的，改成 SSE 就全得跟着改，
         // 而这条请求本来就不是客户端流量（`max_tokens:1` 的 ping），形态对齐的收益也不在这。
         force_stream: false,
+        // 探测体不带 `tools`（见 [`probe_body`]），没有可混淆的名字。
+        tool_names: None,
     };
 
     let body = probe_body(model);
@@ -4092,10 +4458,10 @@ fn probe_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        Bytes, HeaderValue, StatusCode, UsageSniffer, build_forward_headers, config,
-        detect_account_ban, ensure_billing_cch, head, header, is_billable_messages,
-        is_secret_header, is_third_party_rejection, merge_beta, replace_json_str_field,
-        request_digest, request_speed, store, uuid_v4,
+        Bytes, HeaderValue, StatusCode, UsageSniffer, apply_tool_names, build_forward_headers,
+        build_tool_name_map, config, detect_account_ban, ensure_billing_cch, head, header,
+        is_billable_messages, is_secret_header, is_third_party_rejection, merge_beta,
+        replace_json_str_field, request_digest, request_speed, store, strip_extra_fields, uuid_v4,
     };
 
     /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
@@ -4141,7 +4507,7 @@ mod tests {
         sim: Option<&super::Simulation>,
         bare_session: Option<&str>,
     ) -> Bytes {
-        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false)
+        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false, None)
     }
 
     /// 三个模型族的 `anthropic-beta`，逐字取自 `cap/raw` 的原始报文头
@@ -4329,6 +4695,8 @@ mod tests {
             cache_scope_global: false,
             cache_ttl_1h: false,
             nonstream_as_sse: false,
+            strip_extra_fields: false,
+            tool_name_mimic: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -4654,6 +5022,7 @@ mod tests {
             id: 1,
             label: "t".into(),
             tier: None,
+            org_type: None,
             access_token: "a".into(),
             refresh_token: "r".into(),
             expires_at: u64::MAX,
@@ -4835,6 +5204,8 @@ mod tests {
             cache_scope_global: false,
             cache_ttl_1h: false,
             nonstream_as_sse: false,
+            strip_extra_fields: false,
+            tool_name_mimic: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -5049,6 +5420,203 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    /// 白名单三类保留原名，其余混淆。判据实测（见 [`super::ToolNameMap`]）：
+    /// `skill_manage`/`skill_view`/`skills_list` 原样是 400，加 `mcp__` 前缀或换成官方名是 200。
+    #[test]
+    fn tool_map_skips_official_mcp_and_server_tools() {
+        let body = serde_json::json!({"tools": [
+            {"name": "Bash"},                                   // 官方
+            {"name": "mcp__hermes__skill_manage"},              // MCP，实测豁免
+            {"type": "web_search_20250305", "name": "web_search"}, // server tool
+            {"name": "skill_manage"},                           // 第三方 → 混淆
+            {"name": "delegate_task"},                          // 第三方 → 混淆
+        ]});
+        let map = build_tool_name_map(Some(&body)).expect("有第三方名字就该有映射");
+        assert_eq!(map.forward.len(), 2, "只该混淆两个: {:?}", map.forward);
+        assert!(map.forward.contains_key("skill_manage"));
+        assert!(map.forward.contains_key("delegate_task"));
+        for kept in ["Bash", "mcp__hermes__skill_manage", "web_search"] {
+            assert!(!map.forward.contains_key(kept), "{kept} 该保留原名");
+        }
+        // 假名不得撞上任何真名，否则回程还原会把真名换掉。
+        for fake in map.forward.values() {
+            assert!(!map.forward.contains_key(fake.as_str()), "假名撞真名: {fake}");
+        }
+
+        // 全在白名单里 → 无映射，两侧零开销。
+        let clean = serde_json::json!({"tools": [{"name": "Bash"}, {"name": "mcp__x__y"}]});
+        assert!(build_tool_name_map(Some(&clean)).is_none());
+        assert!(build_tool_name_map(Some(&serde_json::json!({"tools": []}))).is_none());
+        assert!(build_tool_name_map(Some(&serde_json::json!({}))).is_none());
+    }
+
+    /// 同一组工具名两次构造得到同一套假名——否则每轮请求的假名都变，上游 prompt cache 全丢。
+    #[test]
+    fn tool_map_is_stable_for_the_same_tool_set() {
+        let body = serde_json::json!({"tools": [
+            {"name": "delegate_task"}, {"name": "skill_manage"}, {"name": "terminal"},
+        ]});
+        let a = build_tool_name_map(Some(&body)).unwrap();
+        let b = build_tool_name_map(Some(&body)).unwrap();
+        assert_eq!(a.forward, b.forward);
+
+        // 工具集变了假名就该变（否则新旧两套名字会撞在一起）。
+        let other = serde_json::json!({"tools": [{"name": "delegate_task"}]});
+        let c = build_tool_name_map(Some(&other)).unwrap();
+        assert_ne!(a.forward.get("delegate_task"), c.forward.get("delegate_task"));
+    }
+
+    /// 请求侧三处必须同时改：`tools[]`、`tool_choice`、历史里的 `tool_use`。
+    /// 漏掉第三处的话上游会因为 `tool_use` 引用未声明的工具名而拒掉整条请求。
+    #[test]
+    fn applies_tool_names_to_all_three_places() {
+        let mut v = serde_json::json!({
+            "tools": [{"name": "skill_manage"}, {"name": "Bash"}],
+            "tool_choice": {"type": "tool", "name": "skill_manage"},
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "skill_manage", "input": {}},
+                    {"type": "text", "text": "skill_manage 只是正文，不该动"},
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x"}]},
+            ],
+        });
+        let snapshot = v.clone();
+        let map = build_tool_name_map(Some(&snapshot)).unwrap();
+        assert!(apply_tool_names(&mut v, &map));
+        let fake = map.forward["skill_manage"].clone();
+
+        assert_eq!(v["tools"][0]["name"], serde_json::json!(fake));
+        assert_eq!(v["tools"][1]["name"], serde_json::json!("Bash"), "白名单不该动");
+        assert_eq!(v["tool_choice"]["name"], serde_json::json!(fake));
+        assert_eq!(v["messages"][0]["content"][0]["name"], serde_json::json!(fake));
+        assert!(
+            v["messages"][0]["content"][1]["text"].as_str().unwrap().contains("skill_manage"),
+            "正文里的同名字符串不该被请求侧改写"
+        );
+    }
+
+    /// 回程还原：假名换回真名，且**必须扛得住分块从假名中间切开**。
+    /// 切断那次还原不了的话，客户端会拿到假名、下一轮带着假名回来，上游再回一个 400。
+    #[test]
+    fn restores_tool_names_across_chunk_boundaries() {
+        let body = serde_json::json!({"tools": [
+            {"name": "skill_manage"}, {"name": "skill_view"}, {"name": "skills_list"},
+        ]});
+        let map = build_tool_name_map(Some(&body)).unwrap();
+        let fake = map.forward["skill_manage"].clone();
+        let wire = format!(r#"data: {{"type":"tool_use","name":"{fake}"}}"#) + "\n\n";
+
+        // 一次性还原。
+        assert_eq!(
+            String::from_utf8(map.restore(wire.as_bytes())).unwrap(),
+            wire.replace(&fake, "skill_manage")
+        );
+
+        // 逐字节喂（最坏的分块），滑动窗口必须拼回同样的结果，且尾巴要 flush 出来。
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        for b in wire.as_bytes() {
+            out.extend_from_slice(&map.feed(&mut pending, &[*b]));
+        }
+        out.extend_from_slice(&map.flush(&mut pending));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            wire.replace(&fake, "skill_manage"),
+            "分块还原结果必须与整段一致"
+        );
+    }
+
+    /// 短假名是长假名的子串时，必须先替长的——否则长假名会被先吃掉一截。
+    #[test]
+    fn restore_replaces_longer_aliases_first() {
+        let map = super::ToolNameMap {
+            forward: Default::default(),
+            reverse: vec![
+                ("fetch_abc00_long".to_string(), "REAL_LONG".to_string()),
+                ("fetch_abc00".to_string(), "REAL_SHORT".to_string()),
+            ],
+            max_fake: "fetch_abc00_long".len(),
+        };
+        assert_eq!(
+            String::from_utf8(map.restore(b"x fetch_abc00_long y fetch_abc00 z")).unwrap(),
+            "x REAL_LONG y REAL_SHORT z"
+        );
+    }
+
+    /// 官方从不发的顶层字段要剥掉，客户端真正要的语义不能动。
+    ///
+    /// 判据取自 `cap/raw/00006`/`00009`：两份直连抓包都没有 `tool_choice`，
+    /// `thinking` 也都是裸的 `{"type":"adaptive"}`。
+    #[test]
+    fn strips_only_the_fields_official_never_sends() {
+        // 等价于缺省的 tool_choice + thinking.display：都该剥。
+        let mut v = serde_json::json!({
+            "model": "claude-opus-5",
+            "tool_choice": {"type": "auto"},
+            "thinking": {"type": "adaptive", "display": "summarized"},
+        });
+        assert!(strip_extra_fields(&mut v));
+        assert!(v.get("tool_choice").is_none(), "官方不发 tool_choice: {v}");
+        assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}), "display 应剥掉: {v}");
+
+        // 强制选工具 / 强制用工具 / 关并行：都是客户端要的语义，一个都不能动。
+        for keep in [
+            serde_json::json!({"type": "tool", "name": "Bash"}),
+            serde_json::json!({"type": "any"}),
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+        ] {
+            let mut v = serde_json::json!({ "tool_choice": keep.clone() });
+            assert!(!strip_extra_fields(&mut v), "不该动: {keep}");
+            assert_eq!(v["tool_choice"], keep);
+        }
+
+        // 官方形态本身：走一遍什么也不改（对真实 CC 是空操作）。
+        let mut official = serde_json::json!({
+            "model": "claude-opus-5",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        });
+        let before = official.clone();
+        assert!(!strip_extra_fields(&mut official));
+        assert_eq!(official, before);
+    }
+
+    /// 剥字段走的是 [`super::rewrite_body`] 这条统一路径，且开关关掉即原样透传。
+    #[test]
+    fn strip_extra_fields_is_wired_and_switchable() {
+        let body = br#"{"model":"claude-opus-5","tool_choice":{"type":"auto"},"thinking":{"type":"adaptive","display":"summarized"},"messages":[]}"#;
+        let only_strip = store::ForwardFlags {
+            strip_extra_fields: true,
+            ..store::ForwardFlags {
+                spoof_identity: false,
+                spoof_device_id: false,
+                billing_cch: false,
+                fill_client_headers: false,
+                merge_beta: false,
+                system_shape: false,
+                orig_header_case: false,
+                thinking_signature_retry: false,
+                simulate_cc: false,
+                fill_metadata: false,
+                rate_limit_retry: false,
+                cache_scope_global: false,
+                cache_ttl_1h: false,
+                nonstream_as_sse: false,
+                strip_extra_fields: false,
+                tool_name_mimic: false,
+            }
+        };
+        let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains("tool_choice"), "{s}");
+        assert!(!s.contains("display"), "{s}");
+
+        let off = store::ForwardFlags { strip_extra_fields: false, ..only_strip };
+        let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", off, None, None);
+        assert_eq!(out.as_ref(), &body[..], "关掉后必须逐字节透传");
     }
 
     /// 「被判成第三方应用」的那条 400 要认出来，普通 400 不能误认。
@@ -6241,7 +6809,7 @@ mod tests {
             super::RateLimitInfo::from_headers(&h)
         };
         let store = store::CredentialStore::open_in_memory().unwrap();
-        let cred = store.insert("a", None, "at", "rt", u64::MAX, None).unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
         let fable = Some("claude-fable-5");
 
         // 实测形态：只有超额池满，基础窗口都有余量。
@@ -6436,7 +7004,7 @@ mod tests {
         // 这个测试不在 tokio 运行时里，故 `Handle::try_current` 失败、退回就地同步写——
         // 下面的断言因此仍能立刻读到结果。
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
         let info = rl_headers(&[
             ("anthropic-ratelimit-unified-status", "allowed"),
             ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
@@ -6478,7 +7046,7 @@ mod tests {
     #[test]
     fn client_ua_lands_in_the_usage_log() {
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
         let log = |ua: &str, ua_out: &str| {
             drop(super::ReqLog {
                 started: std::time::Instant::now(),
@@ -6528,7 +7096,7 @@ mod tests {
     #[test]
     fn mid_stream_error_is_billed_as_the_mapped_status() {
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
         let mut rl = super::ReqLog {
             started: std::time::Instant::now(),
             ttft_ms: None,
@@ -6744,6 +7312,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
             )
         };
 
@@ -6768,6 +7337,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
         assert_eq!(
             untouched,
@@ -7061,7 +7631,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = super::aggregate_sse(up, req_log()).await;
+        let out = super::aggregate_sse(up, req_log(), None).await;
         server.join().unwrap();
         let status = out.status();
         let ctype =
@@ -7073,7 +7643,7 @@ mod tests {
     /// 聚合路径要一份 `ReqLog`（它在 Drop 里落日志与用量）；这里给一份最小可用的。
     fn req_log() -> super::ReqLog {
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-        let cred = store.insert("t", None, "a", "r", 0, None).unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
         super::ReqLog {
             started: std::time::Instant::now(),
             ttft_ms: None,

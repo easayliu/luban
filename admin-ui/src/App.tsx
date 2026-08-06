@@ -6,7 +6,6 @@ import {
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
-import { cn } from '@/lib/utils'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
   SORT_KEYS,
@@ -31,7 +30,6 @@ import { LanguageSwitcher } from '@/components/language-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
-import { Spinner } from '@/components/ui/spinner'
 import { useI18n } from '@/lib/i18n'
 
 function readSettingsRoute(): SettingsSection | null {
@@ -138,15 +136,13 @@ function App() {
     }
   }, [needLogin, settingsRoute, t])
 
-  if (authLoading || !authState) {
-    return <LoadingState fullPage />
-  }
+  const isBootstrapping = authLoading || !authState
 
-  if (needLogin) {
+  if (!isBootstrapping && needLogin) {
     return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
   }
 
-  if (settingsRoute) {
+  if (!isBootstrapping && settingsRoute) {
     return (
       <SettingsPage
         section={settingsRoute}
@@ -170,13 +166,19 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 sm:hidden">
-            <Button size="icon-lg" onClick={() => setAdding(true)} aria-label={t('添加账号', 'Add account')}>
+            <Button
+              size="icon-lg"
+              disabled={isBootstrapping}
+              onClick={() => setAdding(true)}
+              aria-label={t('添加账号', 'Add account')}
+            >
               <PlusIcon />
             </Button>
             <LanguageSwitcher compact />
             <Menu>
               <MenuTrigger
                 className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
+                disabled={isBootstrapping}
                 aria-label={t('更多操作', 'More actions')}
               >
                 <EllipsisVerticalIcon />
@@ -185,7 +187,7 @@ function App() {
                 <MenuItem onClick={() => openSettings('access')}>
                   <SettingsIcon />{t('系统设置', 'System settings')}
                 </MenuItem>
-                {authState.configured && pw && (
+                {authState?.configured && pw && (
                   <>
                     <MenuSeparator />
                     <MenuItem variant="destructive" onClick={() => { clearPw(); setPwState(null) }}>
@@ -201,6 +203,7 @@ function App() {
             <Button
               size="sm"
               variant="outline"
+              disabled={isBootstrapping}
               onClick={() => openSettings('access')}
               title={t('系统设置', 'System settings')}
               aria-label={t('系统设置', 'System settings')}
@@ -208,11 +211,16 @@ function App() {
               <SettingsIcon />
               <span>{t('系统设置', 'Settings')}</span>
             </Button>
-            <Button size="sm" onClick={() => setAdding(true)} aria-label={t('添加账号', 'Add account')}>
+            <Button
+              size="sm"
+              disabled={isBootstrapping}
+              onClick={() => setAdding(true)}
+              aria-label={t('添加账号', 'Add account')}
+            >
               <PlusIcon />
               <span>{t('添加账号', 'Add account')}</span>
             </Button>
-            {authState.configured && pw && (
+            {authState?.configured && pw && (
               <Button
                 size="sm"
                 variant="ghost"
@@ -226,17 +234,17 @@ function App() {
         </div>
       </header>
 
-      <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
+      <main className="page-frame relative flex-1 py-4 pb-8 sm:py-5 sm:pb-10">
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
 
         <CredentialWorkspace
           data={{
-            credentials: creds,
-            isLoading,
-            isError,
-            isRefetchError,
-            isFetching,
+            credentials: isBootstrapping ? undefined : creds,
+            isLoading: isBootstrapping || isLoading,
+            isError: !isBootstrapping && isError,
+            isRefetchError: !isBootstrapping && isRefetchError,
+            isFetching: !isBootstrapping && isFetching,
             error: credentialsError,
           }}
           state={{
@@ -266,18 +274,6 @@ function App() {
         />
       </main>
       <AppFooter />
-    </div>
-  )
-}
-
-function LoadingState({ fullPage = false }: { fullPage?: boolean }) {
-  const { t } = useI18n()
-  return (
-    <div className={cn('grid place-items-center', fullPage ? 'min-h-dvh' : 'py-16')}>
-      <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status" aria-live="polite">
-        <Spinner />
-        {t('加载中', 'Loading')}
-      </div>
     </div>
   )
 }

@@ -1112,6 +1112,36 @@ function formatWait(secs: number, language: Language): string {
 }
 
 /** 账号档位使用官方 Badge 变体，避免业务层复制一套徽章色板。 */
+/** 个人账号的组织类型。这三个之外的一律当组织号，见 [isOrgAccount]。 */
+const PERSONAL_ORG_TYPES = ['claude_max', 'claude_pro', 'claude_free']
+
+/**
+ * 是不是组织号（团队/企业/其它非个人形态）。判据是 profile 的
+ * `organization.organization_type`——团队号的 `account.has_claude_max`/`has_claude_pro`
+ * 实测都是 false，光看等级分不出来（团队号的等级显示成 `Max 5x`，与个人 Max 号一模一样）。
+ *
+ * **用个人类型做白名单，而不是列举团队类型**：反过来写的话，将来冒出一个没见过的组织类型
+ * （`claude_edu` 之类）会被静默当成个人号，标记就没了。宁可给未知类型打个标（最多是多显示
+ * 一个徽章），也不要漏标。
+ *
+ * 旧库里在这一列存在之前加的号 `org_type` 为 null——**不猜**，不打标；刷新一次凭证即可补上。
+ */
+export function isOrgAccount(cred: Pick<Credential, 'org_type'>): boolean {
+  const t = cred.org_type?.trim().toLowerCase()
+  return !!t && !PERSONAL_ORG_TYPES.includes(t)
+}
+
+/**
+ * 组织号的标记文案：组织类型原值剥掉 `claude_` 前缀后首字母大写（`claude_team` → `Team`）。
+ *
+ * **不做中英翻译**：等级徽章本来就是 `Max 5x`/`Pro` 这类原文，组织标记跟着一致；而且这样
+ * 没见过的新类型（`claude_edu` → `Edu`）天然就显示得出来，不必逐个补词条。
+ */
+export function orgBadgeLabel(cred: Pick<Credential, 'org_type'>): string {
+  const bare = (cred.org_type?.trim().toLowerCase() ?? '').replace(/^claude_/, '')
+  return bare.charAt(0).toUpperCase() + bare.slice(1)
+}
+
 export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
   const t = tier.toLowerCase()
   if (t.includes('20x') || t.includes('5x') || t.includes('max')) return 'info'

@@ -53,6 +53,11 @@ export interface Credential {
   id: number
   label: string
   tier: string | null
+  /**
+   * 组织类型原值（`claude_team`/`claude_enterprise`/`claude_max`…），拉不到时为 null。
+   * 团队号的额度是整个组织共享的席位额度，跟同档位的个人号不是一回事，界面上单独打标。
+   */
+  org_type: string | null
   priority: number
   disabled: boolean
   expires_in: number

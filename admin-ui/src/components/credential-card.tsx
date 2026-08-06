@@ -2,12 +2,10 @@ import { useState } from 'react'
 import {
   CalendarDaysIcon,
   CheckIcon,
-  ChevronDownIcon,
   ClockIcon,
   EllipsisIcon,
   SmartphoneIcon,
   TimerOffIcon,
-  TriangleAlertIcon,
   WalletCardsIcon,
   XIcon,
 } from 'lucide-react'
@@ -28,12 +26,13 @@ import {
   evaluateCredential,
   modelCooldownSummary,
   quotaLevel,
+  isOrgAccount,
+  orgBadgeLabel,
   quotaPercentage,
   switchTitle,
   tierBadgeVariant,
   unifiedQuotaStatusLabel,
   useCredentialActions,
-  type CredentialStatusMeta,
   type QuotaFreshness,
   type QuotaWindowMeta,
 } from '@/components/credential-shared'
@@ -105,7 +104,9 @@ export function CredentialCard({
       ? { label: t('不限', 'Unlimited'), variant: 'outline' as const }
       : { label: t('自定义', 'Custom'), variant: 'info' as const }
   const titleId = `credential-card-title-${cred.id}`
-  const statusDetailId = `credential-card-status-${cred.id}`
+  // 所有需处理状态都用同一种渐进披露：卡片只显示状态，详情在悬浮提示里查看。
+  // 避免同一条状态再渲染一块说明，把异常卡片单独撑高。
+  const statusUsesTooltip = status.attention
   const added = relativeTime(cred.created_at, now, language)
   const quotaSnapshotTime = cred.quota
     ? formatFullTime(cred.quota.ts, language)
@@ -164,7 +165,7 @@ export function CredentialCard({
           selected && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
         )}
       >
-        <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-4">
+        <CardHeader className="p-4 pb-3">
           <CardTitle className="min-w-0 text-sm leading-snug">
             {editing ? (
               <>
@@ -272,9 +273,9 @@ export function CredentialCard({
           )}
         </CardHeader>
 
-        <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
+        <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
           <div className="flex flex-wrap items-center gap-2">
-            {status.kind === 'banned' ? (
+            {statusUsesTooltip ? (
               <Tooltip>
                 <TooltipTrigger
                   className={cn(badgeVariants({ variant: status.variant }), 'cursor-help')}
@@ -299,9 +300,22 @@ export function CredentialCard({
               <Badge
                 variant={status.variant}
                 aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
-                aria-describedby={status.attention ? statusDetailId : undefined}
               >
                 {status.label}
+              </Badge>
+            )}
+            {cred.quota && (
+              <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
+            )}
+            {isOrgAccount(cred) && (
+              <Badge
+                variant="warning"
+                title={t(
+                  `组织账号（${cred.org_type}）：额度由整个组织共享，与同档位的个人账号不是一回事`,
+                  `Organisation account (${cred.org_type}): the quota is shared across the whole organisation, unlike a personal account on the same tier`,
+                )}
+              >
+                {orgBadgeLabel(cred)}
               </Badge>
             )}
             {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
@@ -310,12 +324,8 @@ export function CredentialCard({
             </Badge>
           </div>
 
-          {status.attention && status.kind !== 'banned' && (
-            <AttentionSummary id={statusDetailId} status={status} />
-          )}
-
-          <section aria-label={t(`${credentialLabel} 的额度使用`, `Quota usage for ${credentialLabel}`)} className="space-y-3">
-            <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+          <section aria-label={t(`${credentialLabel} 的额度使用`, `Quota usage for ${credentialLabel}`)} className="space-y-2">
+            <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="font-medium text-sm">{t('额度使用', 'Quota usage')}</h4>
                 {secondaryOverage && (
@@ -347,8 +357,8 @@ export function CredentialCard({
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
               <div
                 className={cn(
-                  'grid gap-4',
-                  has5h && has7d && '@sm/card:grid-cols-2 @sm/card:gap-5',
+                  'grid gap-3',
+                  has5h && has7d && '@sm/card:grid-cols-2 @sm/card:gap-4',
                 )}
               >
                 {has5h && (
@@ -380,7 +390,6 @@ export function CredentialCard({
               <p className="text-sm text-muted-foreground">{t('上游尚未返回额度窗口。', 'The upstream has not returned quota windows yet.')}</p>
             ) : null}
             {quota.extraWindows.length > 0 && <ExtraWindows windows={quota.extraWindows} />}
-            {cred.quota && <UpstreamVerdict quota={cred.quota} />}
             {evaluation.modelCooling && (
               <p
                 className="flex flex-wrap items-center gap-x-1.5 text-warning-foreground text-xs"
@@ -397,7 +406,7 @@ export function CredentialCard({
           </section>
         </CardPanel>
 
-        <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
+        <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:py-3">
           <div className="flex min-w-0 items-center gap-2 @sm/card:gap-4">
             <Button
               type="button"
@@ -450,47 +459,6 @@ export function CredentialCard({
         <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
       </Card>
     </li>
-  )
-}
-
-function AttentionSummary({ id, status }: { id: string; status: CredentialStatusMeta }) {
-  const { t } = useI18n()
-  const [expanded, setExpanded] = useState(false)
-  const expandable = status.detail.length > 52
-  const isError = status.variant === 'error' || status.variant === 'destructive'
-
-  return (
-    <div
-      id={id}
-      className={cn(
-        'flex items-start gap-2 rounded-lg px-3 py-2.5 text-sm',
-        isError
-          ? 'bg-destructive/8 text-destructive-foreground dark:bg-destructive/16'
-          : 'bg-warning/8 text-warning-foreground dark:bg-warning/16',
-      )}
-      aria-live="polite"
-      aria-atomic="true"
-    >
-      <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-      <div className="min-w-0 flex-1">
-        <p className={cn('break-words leading-5', expandable && !expanded && 'line-clamp-2')}>
-          {status.detail}
-        </p>
-        {expandable && (
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            className="mt-1 -ml-2"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((current) => !current)}
-          >
-            {expanded ? t('收起说明', 'Show less') : t('查看完整说明', 'View full details')}
-            <ChevronDownIcon className={cn('transition-transform', expanded && 'rotate-180')} />
-          </Button>
-        )}
-      </div>
-    </div>
   )
 }
 
@@ -614,15 +582,23 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
  * 上游对**这个账号**的整体额度判决（`anthropic-ratelimit-unified-status`），
  * 以及它认为当前是哪个窗口在管事（`representative-claim`）。`allowed` 是常态，不占地方。
  *
- * 这一行是「5h / 7d 都没满，却被拒或动用了 Usage credits」时唯一能给出解释的东西：满掉的那个窗口
+ * 这个状态徽标是「5h / 7d 都没满，却被拒或动用了 Usage credits」时唯一能给出解释的东西：满掉的那个窗口
  * （实测多为超额池 `7d_oi`）后端只用来判冷却、并不落库，所以卡片上没有它的进度条可看，
- * 但上游的判决与它的名字是在快照里的。缺了这行，那种账号在界面上就是「一切正常却在烧钱」。
+ * 但上游的判决与它的名字是在快照里的。缺了这个状态，那种账号在界面上就是「一切正常却在烧钱」。
  */
-function UpstreamVerdict({ quota }: { quota: NonNullable<Credential['quota']> }) {
+function UpstreamVerdict({
+  quota,
+  credentialLabel,
+}: {
+  quota: NonNullable<Credential['quota']>
+  credentialLabel: string
+}) {
   const { t, language } = useI18n()
   const status = quota.unified_status
   if (!status || status === 'allowed') return null
   const destructive = status === 'rejected' || status === 'rate_limited'
+  const statusLabel = unifiedQuotaStatusLabel(status, language)
+  const badgeLabel = t(`上游 · ${statusLabel}`, `Upstream · ${statusLabel}`)
   const verdictTitle = status === 'rate_limited'
     ? t(
         '上游正在限流该账号，请等待相关额度窗口恢复后再重试',
@@ -636,26 +612,39 @@ function UpstreamVerdict({ quota }: { quota: NonNullable<Credential['quota']> })
           ? 'The upstream rejected the request: at least one quota window for this account is exhausted'
           : 'The upstream allowed the request but issued a warning: a quota window is close to exhaustion',
       )
+  const representativeDetail = quota.rl_representative
+    ? t(
+        `上游称当前起约束作用的是 ${quota.rl_representative} 窗口。若它不在 5h / 7d 里，说明这是一个未被记录的窗口（多为超额池），卡片上没有对应的进度条`,
+        `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not among the 5h / 7d windows, it is an unrecorded window (typically the overage pool) and has no meter on this card`,
+      )
+    : null
+  const detail = representativeDetail
+    ? t(`${verdictTitle}。${representativeDetail}`, `${verdictTitle}. ${representativeDetail}`)
+    : verdictTitle
+
   return (
-    <p className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
-      <span>{t('上游判定', 'Upstream verdict')}</span>
-      <span
-        className={cn('font-medium', destructive ? 'text-destructive-foreground' : 'text-warning-foreground')}
-        title={verdictTitle}
+    <Tooltip>
+      <TooltipTrigger
+        className={cn(
+          badgeVariants({ variant: destructive ? 'error' : 'warning' }),
+          'cursor-help',
+        )}
+        delay={0}
+        aria-label={t(
+          `${credentialLabel}：${badgeLabel}。${detail}`,
+          `${credentialLabel}: ${badgeLabel}. ${detail}`,
+        )}
       >
-        {unifiedQuotaStatusLabel(status, language)}
-      </span>
-      {quota.rl_representative && (
-        <span
-          title={t(
-            `上游称当前起约束作用的是 ${quota.rl_representative} 窗口。若它不在上面的 5h / 7d 里，说明这是一个未被记录的窗口（多为超额池），卡片上没有对应的进度条`,
-            `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not among the 5h / 7d windows above, it is an unrecorded window (typically the overage pool) and has no meter on this card`,
-          )}
-        >
-          {t(`· 当前由 ${quota.rl_representative} 窗口决定`, `· currently bound by the ${quota.rl_representative} window`)}
-        </span>
-      )}
-    </p>
+        {badgeLabel}
+      </TooltipTrigger>
+      <TooltipPopup
+        side="bottom"
+        align="start"
+        className="max-w-80 whitespace-normal break-words text-left leading-5"
+      >
+        {detail}
+      </TooltipPopup>
+    </Tooltip>
   )
 }
 
@@ -689,7 +678,7 @@ function QuotaMeter({
       : t('上游未返回该窗口的额度信息', 'The upstream did not return quota data for this window')
     return (
       <div
-        className="flex w-full flex-col gap-2"
+        className="flex w-full flex-col gap-1.5"
         title={t(
           `${reason}。最后一次快照：${formatFullTime(snapshotTs, language)}`,
           `${reason}. Latest snapshot: ${formatFullTime(snapshotTs, language)}`,
@@ -701,7 +690,7 @@ function QuotaMeter({
             {expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')}
           </span>
         </div>
-        <div className="h-2 w-full bg-input" aria-hidden />
+        <div className="h-1.5 w-full bg-input" aria-hidden />
         <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
           <span>{expired ? t('暂无新用量', 'No new usage') : t('等待上游返回', 'Waiting for upstream')}</span>
           {expired && reset != null && (
@@ -726,7 +715,7 @@ function QuotaMeter({
       : 'bg-success'
 
   return (
-    <Meter value={percentage} max={100}>
+    <Meter value={percentage} max={100} className="gap-1.5">
       <div className="flex items-center justify-between gap-2">
         <MeterLabel>
           <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
@@ -737,28 +726,31 @@ function QuotaMeter({
           {() => `${percentage}%`}
         </MeterValue>
       </div>
-      <MeterTrack>
+      <MeterTrack className="h-1.5">
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      <dl className="grid min-w-0 grid-cols-3 gap-2">
-        <div className="min-w-0">
-          <dt className="text-[11px] leading-none text-muted-foreground">
-            {t('请求', requests === 1 ? 'Request' : 'Requests')}
+      <dl className="flex min-w-0 items-baseline justify-between gap-1 text-xs leading-none text-muted-foreground @sm/card:text-[10px] @lg/card:gap-2 @lg/card:text-xs">
+        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
+          <dt
+            className="shrink-0"
+            title={t('请求数', requests === 1 ? 'Request' : 'Requests')}
+          >
+            {t('请求', 'Req')}
           </dt>
-          <dd className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums">
+          <dd className="shrink-0 tabular-nums">
             {requests == null ? '—' : requests.toLocaleString(locale)}
           </dd>
         </div>
-        <div className="min-w-0 text-center">
-          <dt className="text-[11px] leading-none text-muted-foreground">{t('花费', 'Cost')}</dt>
-          <dd className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums">
+        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
+          <dt className="shrink-0">{t('花费', 'Cost')}</dt>
+          <dd className="shrink-0 tabular-nums">
             {cost == null ? '—' : formatUsd(cost)}
           </dd>
         </div>
-        <div className="min-w-0 text-right">
-          <dt className="text-[11px] leading-none text-muted-foreground">{t('重置', 'Reset')}</dt>
+        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
+          <dt className="shrink-0">{t('重置', 'Reset')}</dt>
           <dd
-            className="mt-1 whitespace-nowrap font-medium text-xs text-foreground tabular-nums"
+            className="shrink-0 tabular-nums"
             title={reset != null
               ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
               : undefined}

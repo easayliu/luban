@@ -47,6 +47,10 @@ export interface Settings {
   cache_ttl_1h: boolean
   /** 非流式 /v1/messages 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。 */
   nonstream_as_sse: boolean
+  /** 剥掉官方客户端从不发送的顶层字段（缺省语义的 tool_choice、thinking.display）。 */
+  strip_extra_fields: boolean
+  /** 把会被上游判成第三方应用的工具名换成假名转发，回程再还原。 */
+  tool_name_mimic: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -65,6 +69,8 @@ export type ForwardingKey =
   | 'cache_scope_global'
   | 'cache_ttl_1h'
   | 'nonstream_as_sse'
+  | 'strip_extra_fields'
+  | 'tool_name_mimic'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

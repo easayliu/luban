@@ -343,11 +343,16 @@ async fn exchange(
             &tokens.refresh_token,
             tokens.expires_at,
             profile.account_uuid.as_deref(),
+            profile.org_type.as_deref(),
         )
         .map_err(internal)?;
 
     // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。
-    tracing::info!(cred_id = cred.id, cred = %cred.label, tier = ?cred.tier, "credential added");
+    tracing::info!(
+        cred_id = cred.id, cred = %cred.label,
+        tier = ?cred.tier, org_type = ?cred.org_type,
+        "credential added"
+    );
     Ok(Json(CredentialView::new(&cred, 0, state.store.default_device_limit())))
 }
 
@@ -698,6 +703,12 @@ async fn refresh_credential(
             {
                 tracing::warn!(cred_id = id, error = %e, "failed to backfill the account uuid (the refresh itself succeeded)");
             }
+            // 组织类型同样回填：旧库里的号是在这一列存在之前加的，只有刷新一次才补得上。
+            if profile.org_type.is_some()
+                && let Err(e) = state.store.set_org_type(id, profile.org_type.as_deref())
+            {
+                tracing::warn!(cred_id = id, error = %e, "failed to write back the organization type (the refresh itself succeeded)");
+            }
         }
         Err(e) => {
             tracing::warn!(cred_id = id, error = %e, "fetching the profile after refresh failed, tier and uuid left unchanged");
@@ -828,6 +839,10 @@ struct ForwardingResp {
     cache_ttl_1h: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     nonstream_as_sse: bool,
+    /// 剥掉官方客户端从不发送的顶层字段（缺省语义的 `tool_choice`、`thinking.display`）。
+    strip_extra_fields: bool,
+    /// 把会被上游判成第三方应用的工具名换成假名转发，回程再还原。
+    tool_name_mimic: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -847,6 +862,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             cache_scope_global: f.cache_scope_global,
             cache_ttl_1h: f.cache_ttl_1h,
             nonstream_as_sse: f.nonstream_as_sse,
+            strip_extra_fields: f.strip_extra_fields,
+            tool_name_mimic: f.tool_name_mimic,
         }
     }
 }
@@ -1068,6 +1085,8 @@ struct SetForwardingReq {
     cache_scope_global: Option<bool>,
     cache_ttl_1h: Option<bool>,
     nonstream_as_sse: Option<bool>,
+    strip_extra_fields: Option<bool>,
+    tool_name_mimic: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -1080,7 +1099,8 @@ async fn set_forwarding(
     use crate::store::{
         FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, NONSTREAM_AS_SSE, ORIG_HEADER_CASE,
         RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
-        SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY,
+        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -1097,6 +1117,8 @@ async fn set_forwarding(
         (SYSTEM_CACHE_SCOPE, req.cache_scope_global),
         (SYSTEM_CACHE_TTL, req.cache_ttl_1h),
         (NONSTREAM_AS_SSE, req.nonstream_as_sse),
+        (STRIP_EXTRA_FIELDS, req.strip_extra_fields),
+        (TOOL_NAME_MIMIC, req.tool_name_mimic),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
@@ -1120,6 +1142,9 @@ struct CredentialView {
     id: i64,
     label: String,
     tier: Option<String>,
+    /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
+    /// 团队额度是整个组织共享的，跟同名档位的个人号不是一回事。
+    org_type: Option<String>,
     priority: i64,
     disabled: bool,
     expires_in: u64,
@@ -1174,6 +1199,7 @@ impl CredentialView {
             id: c.id,
             label: c.label.clone(),
             tier: c.tier.clone(),
+            org_type: c.org_type.clone(),
             priority: c.priority,
             disabled: c.disabled,
             expires_in: secs,

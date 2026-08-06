@@ -11,10 +11,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useI18n } from '@/lib/i18n'
 
 export function CredentialLoadingState({
-  view, selectable = false,
+  view, selectable = false, count = 10,
 }: {
   view: 'card' | 'list'
   selectable?: boolean
+  count?: number
 }) {
   const { t } = useI18n()
   return (
@@ -27,22 +28,22 @@ export function CredentialLoadingState({
     >
       <span className="sr-only">{t('加载中', 'Loading')}</span>
       {view === 'card'
-        ? <CardSkeletons selectable={selectable} />
-        : <TableSkeletons selectable={selectable} />}
+        ? <CardSkeletons selectable={selectable} count={count} />
+        : <TableSkeletons selectable={selectable} count={count} />}
     </div>
   )
 }
 
-function CardSkeletons({ selectable }: { selectable: boolean }) {
+function CardSkeletons({ selectable, count }: { selectable: boolean; count: number }) {
   return (
     <ul
       className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4"
       aria-hidden="true"
     >
-      {Array.from({ length: 4 }, (_, index) => (
+      {Array.from({ length: count }, (_, index) => (
         <li key={index} className="min-w-0 h-full">
-          <Card render={<article />} className="@container/card h-full overflow-hidden">
-            <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-4">
+          <Card render={<article />} className="@container/card min-h-[17rem] h-full overflow-hidden">
+            <CardHeader className="p-4 pb-3">
               <CardTitle className="text-sm leading-snug">
                 <div className="flex items-center gap-3">
                   {selectable && <Skeleton className="size-4 shrink-0" />}
@@ -59,25 +60,25 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
               <CardAction><Skeleton className="size-8" /></CardAction>
             </CardHeader>
 
-            <CardPanel className="space-y-4 px-4 pb-4 sm:px-5 sm:pb-5">
+            <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
               <div className="flex flex-wrap items-center gap-2">
                 <Skeleton className="h-5 w-14" />
                 <Skeleton className="h-5 w-16" />
                 <Skeleton className="h-5 w-9" />
               </div>
-              <section className="space-y-3">
-                <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+              <section className="space-y-2">
+                <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1.5">
                   <Skeleton className="h-4 w-16" />
                   <Skeleton className="h-4 w-24" />
                 </div>
-                <div className="grid gap-4 @sm/card:grid-cols-2 @sm/card:gap-5">
+                <div className="grid gap-3 @sm/card:grid-cols-2 @sm/card:gap-4">
                   <QuotaSkeleton />
                   <QuotaSkeleton />
                 </div>
               </section>
             </CardPanel>
 
-            <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-3 sm:px-5 sm:py-4">
+            <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:py-3">
               <div className="grid min-w-0 gap-2 @sm/card:grid-cols-[auto_minmax(0,1fr)] @sm/card:items-center @sm/card:gap-4">
                 <Skeleton className="h-9 w-28 sm:h-8" />
                 <Skeleton className="h-4 w-20" />
@@ -95,12 +96,12 @@ function CardSkeletons({ selectable }: { selectable: boolean }) {
 
 function QuotaSkeleton() {
   return (
-    <div className="space-y-2">
+    <div className="space-y-1.5">
       <div className="flex justify-between gap-2">
         <Skeleton className="h-4 w-12" />
         <Skeleton className="h-4 w-10" />
       </div>
-      <Skeleton className="h-2 w-full" />
+      <Skeleton className="h-1.5 w-full" />
       <div className="flex justify-between gap-2">
         <Skeleton className="h-3 w-14" />
         <Skeleton className="h-3 w-16" />
@@ -109,7 +110,7 @@ function QuotaSkeleton() {
   )
 }
 
-function TableSkeletons({ selectable }: { selectable: boolean }) {
+function TableSkeletons({ selectable, count }: { selectable: boolean; count: number }) {
   const desktopColumns = selectable
     ? 'grid-cols-[2rem_minmax(10rem,1fr)_8rem_5rem_6rem_8rem_8rem_8rem_6rem_6rem_2.5rem]'
     : 'grid-cols-[0.75rem_minmax(10rem,1fr)_8rem_5rem_6rem_8rem_8rem_8rem_6rem_6rem_2.5rem]'
@@ -133,7 +134,7 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
           <div className="px-2.5" />
         </div>
         <div className="divide-y">
-          {Array.from({ length: 8 }, (_, index) => (
+          {Array.from({ length: count }, (_, index) => (
             <div
               key={index}
               className={`grid h-[68px] items-center ${desktopColumns}`}
@@ -185,7 +186,7 @@ function TableSkeletons({ selectable }: { selectable: boolean }) {
       </div>
 
       <div className="divide-y xl:hidden">
-        {Array.from({ length: 4 }, (_, index) => (
+        {Array.from({ length: count }, (_, index) => (
           <div key={index} className="px-3 py-3 sm:px-5 sm:py-4">
             <div className="flex items-start gap-3">
               {selectable && <Skeleton className="mt-3 size-4 shrink-0" />}

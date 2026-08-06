@@ -21,16 +21,22 @@ export function OverviewMetric({
     neutral: 'text-muted-foreground',
   }[tone]
   const content = (
-    <div className="p-3 sm:p-4">
-      <div className="flex items-center justify-between gap-3">
-        <p className="min-w-0 text-xs font-medium text-muted-foreground">{label}</p>
-        <Icon className={cn('size-4 shrink-0', iconClass)} aria-hidden />
-      </div>
-      <div className="mt-2.5 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <span className="text-xl font-semibold leading-none tracking-tight tnum">
-          {value}
-        </span>
-        {status && <span className="text-xs text-muted-foreground">{status}</span>}
+    <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4">
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+        <Icon className={cn('size-4', iconClass)} aria-hidden />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 items-baseline justify-between gap-2">
+          <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
+          <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
+            {value}
+          </span>
+        </div>
+        {status && (
+          <p className="mt-1 truncate text-2xs text-muted-foreground" title={status}>
+            {status}
+          </p>
+        )}
       </div>
     </div>
   )
@@ -55,14 +61,14 @@ export function OverviewMetric({
 
 export function OverviewMetricSkeleton({ className }: { className?: string }) {
   return (
-    <div className={cn('min-w-0 p-3 sm:p-4', className)}>
-      <div className="flex items-center justify-between gap-3">
-        <Skeleton className="h-4 w-20" />
-        <Skeleton className="size-4 rounded-md" />
-      </div>
-      <div className="mt-2.5 flex items-end gap-2">
-        <Skeleton className="h-5 w-14" />
-        <Skeleton className="mb-0.5 h-3 w-16" />
+    <div className={cn('flex min-h-16 min-w-0 items-center gap-3 px-3 py-2.5 sm:px-4', className)}>
+      <Skeleton className="size-8 shrink-0 rounded-lg" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-3">
+          <Skeleton className="h-3 w-20" />
+          <Skeleton className="h-5 w-10" />
+        </div>
+        <Skeleton className="mt-1.5 h-3 w-24 max-w-full" />
       </div>
     </div>
   )

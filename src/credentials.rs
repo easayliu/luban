@@ -10,8 +10,15 @@ pub struct Credential {
     pub id: i64,
     /// 用户可编辑的显示名（如账号备注）。
     pub label: String,
-    /// 账号等级（Max / Pro / Free 等），可能未知。
+    /// 账号等级（Max / Pro / Free 等），可能未知。团队号取的是组织的额度档
+    /// （`rate_limit_tier`），见 [`crate::oauth::tier_from_rate_limit`]。
     pub tier: Option<String>,
+    /// 组织类型原值（`claude_team`/`claude_enterprise`/`claude_max`…），来自
+    /// `/api/oauth/profile` 的 `organization.organization_type`；`None` 表示没拉到。
+    ///
+    /// 单独存一列而不是并进 [`Self::tier`]：团队号的额度是**整个组织共享**的，与个人号
+    /// 同名同档位也不是一回事，界面上得能一眼分开。
+    pub org_type: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     /// access_token 过期的 Unix 时间戳（秒）。

@@ -15,6 +15,8 @@ import {
   DeleteCredentialDialog,
   evaluateCredential,
   quotaLevel,
+  isOrgAccount,
+  orgBadgeLabel,
   quotaPercentage,
   switchTitle,
   tierBadgeVariant,
@@ -258,9 +260,14 @@ export function CredentialRow({
             <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
               <MobileFact label={t('优先级', 'Priority')}><span className="tabular-nums">P{cred.priority}</span></MobileFact>
               <MobileFact label={t('账号等级', 'Tier')}>
-                {cred.tier
-                  ? <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>
-                  : '—'}
+                <span className="flex flex-wrap items-center gap-1">
+                  {isOrgAccount(cred) && (
+                    <Badge variant="warning" size="sm">{orgBadgeLabel(cred)}</Badge>
+                  )}
+                  {cred.tier
+                    ? <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>
+                    : !isOrgAccount(cred) && '—'}
+                </span>
               </MobileFact>
               <MobileFact label={t('设备', 'Devices')}>
                 <Button
@@ -314,9 +321,22 @@ export function CredentialRow({
           </span>
         </TableCell>
         <TableCell className={COL.tier}>
-          {cred.tier
-            ? <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>
-            : <span className="text-muted-foreground">—</span>}
+          <span className="flex flex-wrap items-center gap-1">
+            {isOrgAccount(cred) && (
+              <Badge
+                variant="warning"
+                title={t(
+                  `组织账号（${cred.org_type}）：额度由整个组织共享`,
+                  `Organisation account (${cred.org_type}): the quota is shared across the whole organisation`,
+                )}
+              >
+                {orgBadgeLabel(cred)}
+              </Badge>
+            )}
+            {cred.tier
+              ? <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>
+              : !isOrgAccount(cred) && <span className="text-muted-foreground">—</span>}
+          </span>
         </TableCell>
         <TableCell className={COL.quota5h}>
           <ListQuotaMeter

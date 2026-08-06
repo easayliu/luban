@@ -15,7 +15,7 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at";
+     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -348,6 +348,9 @@ impl CredentialStore {
     }
 
     /// 插入一条新凭证，返回带 id 的完整记录。
+    // 参数多是因为一条凭证本来就有这么多字段，且调用点只有「加号」那一处；
+    // 打包成结构体只会多一个只用一次的类型。
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &self,
         label: &str,
@@ -356,15 +359,24 @@ impl CredentialStore {
         refresh_token: &str,
         expires_at: u64,
         account_uuid: Option<&str>,
+        org_type: Option<&str>,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
         // 新凭证一律落在默认档 P0：同档内按设备数负载均衡，新账号立刻参与分摊。
         // 需要瀑布式（榨干一个再用下一个）时，手动/批量把账号调到不同优先级即可。
         conn.execute(
             "INSERT INTO credentials
-                 (label, tier, access_token, refresh_token, expires_at, account_uuid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![label, tier, access_token, refresh_token, expires_at as i64, account_uuid],
+                 (label, tier, access_token, refresh_token, expires_at, account_uuid, org_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                label,
+                tier,
+                access_token,
+                refresh_token,
+                expires_at as i64,
+                account_uuid,
+                org_type
+            ],
         )
         .context("failed to insert credential (the refresh_token may already exist)")?;
         let id = conn.last_insert_rowid();
@@ -865,6 +877,15 @@ impl CredentialStore {
     }
 
     /// 更新账号等级。
+    /// 写回组织类型（`claude_team` 等）。与 [`Self::set_tier`] 分开：等级会随额度档变，
+    /// 组织类型只在换账号时才变，两者的来源虽同是 profile，语义不是一回事。
+    pub fn set_org_type(&self, id: i64, org_type: Option<&str>) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE credentials SET org_type = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, org_type],
+        )? > 0)
+    }
+
     pub fn set_tier(&self, id: i64, tier: Option<&str>) -> Result<bool> {
         self.update_one(
             "UPDATE credentials SET tier = ?2, updated_at = unixepoch() WHERE id = ?1",
@@ -1002,6 +1023,12 @@ impl CredentialStore {
         if let Some(v) = on(NONSTREAM_AS_SSE) {
             flags.nonstream_as_sse = v;
         }
+        if let Some(v) = on(STRIP_EXTRA_FIELDS) {
+            flags.strip_extra_fields = v;
+        }
+        if let Some(v) = on(TOOL_NAME_MIMIC) {
+            flags.tool_name_mimic = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1130,6 +1157,14 @@ pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 /// 100% 稳定的判据。见 [`ForwardFlags::nonstream_as_sse`]。
 pub const NONSTREAM_AS_SSE: &str = "nonstream_as_sse";
 
+/// 是否剥掉官方从不发送的顶层字段的 settings 键名。缺省视为开启。
+/// 见 [`ForwardFlags::strip_extra_fields`]。
+pub const STRIP_EXTRA_FIELDS: &str = "strip_extra_fields";
+
+/// 是否把第三方工具名混淆成假名转发的 settings 键名。缺省视为开启。
+/// 见 [`ForwardFlags::tool_name_mimic`]。
+pub const TOOL_NAME_MIMIC: &str = "tool_name_mimic";
+
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。
 ///
@@ -1235,6 +1270,33 @@ pub struct ForwardFlags {
     /// 以及 `ttft_ms` 记的是上游首字节、与客户端的感知对不上——后者由 `usage_logs` 的
     /// `sse_aggregated` 列标出来。
     pub nonstream_as_sse: bool,
+    /// 剥掉官方客户端**从不发送**的顶层字段（见 [`crate::proxy::strip_extra_fields`]）。
+    ///
+    /// 依据是两份直连抓包（`cap/raw/00006` opus-5、`00009` sonnet-5）的顶层键完全一致：
+    /// `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
+    /// output_config, stream`。多出来的键都是官方不产生的形态。目前剥两样：
+    /// 等价于缺省的 `tool_choice:{"type":"auto"}`，以及 `thinking.display`。
+    ///
+    /// **`thinking.display` 那项有代价**：剥掉后回程的 `thinking` 块文本为空，客户端看不到
+    /// 思考摘要（功能不坏，只是没内容）。默认仍开——被判成第三方应用是**整条请求打不通**，
+    /// 拿摘要换连通性划算；不接受这个代价就关掉本项。
+    ///
+    /// 对真实 CC 是空操作：它本来就不发这两样。
+    pub strip_extra_fields: bool,
+    /// 把上游会判成第三方应用的工具名换成假名转发，回程再还原（见
+    /// [`crate::proxy::ToolNameMap`]）。
+    ///
+    /// **实测**：上游只按 `tools[*].name` 判定第三方——`skill_manage`/`skill_view`/
+    /// `skills_list` 三个名字就足以让整条请求回 400（`Third-party apps now draw from your
+    /// extra usage…`，额度改扣超额池），而 `system` 里明写「You are Hermes Agent, created by
+    /// Nous Research」完全不影响。混淆后同一条请求回 200。
+    ///
+    /// 三类保留原名：server tool、`mcp__` 前缀（实测豁免）、[`crate::config::CC_TOOL_NAMES`]。
+    /// 故对真实 CC 是空操作，不必再叠客户端判定。
+    ///
+    /// 代价：回程每个 chunk 要做 N 次字节替换（N = 被混淆的工具数），且客户端增删工具会让
+    /// 整套假名重算、上游 prompt cache 失效一次。关掉即完全退回原样转发。
+    pub tool_name_mimic: bool,
 }
 
 impl Default for ForwardFlags {
@@ -1254,6 +1316,8 @@ impl Default for ForwardFlags {
             cache_scope_global: true,
             cache_ttl_1h: true,
             nonstream_as_sse: true,
+            strip_extra_fields: true,
+            tool_name_mimic: true,
         }
     }
 }
@@ -1897,6 +1961,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             label         TEXT    NOT NULL DEFAULT '',
             tier          TEXT,
+            org_type      TEXT,
             access_token  TEXT    NOT NULL,
             refresh_token TEXT    NOT NULL,
             expires_at    INTEGER NOT NULL,
@@ -2059,6 +2124,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_type TEXT", []);
     let _ = conn
         .execute("ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0", []);
     // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
@@ -2187,6 +2253,7 @@ fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             label         TEXT    NOT NULL DEFAULT '',
             tier          TEXT,
+            org_type      TEXT,
             access_token  TEXT    NOT NULL,
             refresh_token TEXT    NOT NULL,
             expires_at    INTEGER NOT NULL,
@@ -2232,6 +2299,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         ban_reason: row.get(11)?,
         account_uuid: row.get(12)?,
         resume_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
+        org_type: row.get(14)?,
     })
 }
 
@@ -2746,8 +2814,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
         {
             let conn = store.conn.lock();
             for cid in [a.id, b.id] {
@@ -2791,9 +2859,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
-        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+        let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
         assert_eq!((a.priority, b.priority, c.priority), (0, 0, 0), "新账号都应是 P0");
 
         assert_eq!(store.set_priorities(&[a.id, c.id], 2).unwrap(), 2);
@@ -2811,9 +2879,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
-        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+        let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
         // 给 a、b 各造一条设备绑定与用量日志，验证连带清理。
         {
             let conn = store.conn.lock();
@@ -2888,8 +2956,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap();
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
 
         // 先把设备粘到 a 上（a 是 id 更小的那个，同优先级下会被先选中）。
         let first = store
@@ -3347,7 +3415,7 @@ mod tests {
             // refresh_token 有 UNIQUE 约束，按 label 取值保证互不相同。
             .map(|l| {
                 store
-                    .insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None)
+                    .insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None, None)
                     .unwrap()
                     .id
             })
@@ -3898,8 +3966,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
 
         // 账号 a：reset=100_000，故 5h 窗口起点 82_000、7d 窗口起点 -504_800（含全部行）。
         let r5 = 100_000;
@@ -3941,8 +4009,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
 
         // a：只有 5h 有 reset（窗口起点 82_000），7d 一直为空。
         log_row(&store, a, 10_000, 1.0, Some(100_000), None); // 5h 窗口外
@@ -3973,7 +4041,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         store.mark_rate_limited(a, Some("claude-fable-5"), Duration::from_secs(300));
         store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(30));
@@ -4060,7 +4128,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         // 一条早已过保留期的旧流水（带限流头，会写快照）+ 一条刚发生的新流水（无头）。
         let old_ts = 1_000;
@@ -4107,7 +4175,7 @@ mod tests {
         .unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let cred = store.insert("a", None, "t", "r", 0, None).unwrap().id;
+        let cred = store.insert("a", None, "t", "r", 0, None, None).unwrap().id;
 
         for aggregated in [true, false] {
             store
@@ -4136,8 +4204,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
         let log = |cred: i64, cost: f64| {
             store
                 .insert_usage_log(&UsageRecord {
@@ -4200,7 +4268,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         store
             .insert_usage_log_at(
@@ -4261,7 +4329,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         // 形态取自 proxy::rate_limit_scope 记录的那次真实 fable-5 429：基础窗口都很空，
         // 满掉的只有超额池。
@@ -4305,7 +4373,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         store
             .insert_usage_log_at(
@@ -4335,7 +4403,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         let windows = vec![win("5h", 0.5, 9_000, "allowed")];
         store
@@ -4373,7 +4441,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         // 模拟老库：快照行有 5h/7d，windows 列为 NULL。
         {
@@ -4400,7 +4468,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
 
         // 模拟老库形态：流水是历史攒下的（裸 INSERT，从未落过账），账本是空表。
         {
@@ -4448,7 +4516,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
         log_row(&store, a, 40_000, 3.0, Some(50_000), None); // 在 5h 窗口(32_000 起)内
 
         let q = store.latest_quota(a).unwrap().unwrap();
@@ -4464,12 +4532,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None).unwrap().id;
-        let b = store.insert("b", None, "tb", "rb", 0, None).unwrap().id;
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
         log_row(&store, a, 1_000, 1.5, None, None);
         log_row(&store, a, 2_000, 2.5, None, None);
         log_row(&store, b, 3_000, 7.0, None, None);
-        let c = store.insert("c", None, "tc", "rc", 0, None).unwrap().id; // 从未被用过
+        let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap().id; // 从未被用过
 
         let last = store.last_used().unwrap();
         let costs = store.cost_by_cred().unwrap();
@@ -4511,6 +4579,8 @@ mod tests {
             (SYSTEM_CACHE_SCOPE, "0"),
             (SYSTEM_CACHE_TTL, "0"),
             (NONSTREAM_AS_SSE, "0"),
+            (STRIP_EXTRA_FIELDS, "0"),
+            (TOOL_NAME_MIMIC, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -4532,6 +4602,8 @@ mod tests {
                 cache_scope_global: false,
                 cache_ttl_1h: false,
                 nonstream_as_sse: false,
+                strip_extra_fields: false,
+                tool_name_mimic: false,
             }
         );
 
