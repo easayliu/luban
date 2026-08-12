@@ -5491,10 +5491,7 @@ mod tests {
         }
         // 假名必须走已验证豁免的 MCP 命名空间。
         for fake in map.forward.values() {
-            assert!(
-                fake.starts_with("mcp__luban__"),
-                "假名必须是 mcp__luban__ 前缀: {fake}"
-            );
+            assert!(fake.starts_with("mcp__luban__"), "假名必须是 mcp__luban__ 前缀: {fake}");
         }
 
         // blocklist 以外全不命中 → 无映射。
