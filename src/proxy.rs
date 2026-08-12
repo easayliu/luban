@@ -2655,6 +2655,9 @@ fn rewrite_body(
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
     let stripped = flags.strip_extra_fields && strip_extra_fields(&mut v);
+    // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
+    // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
+    let top_level_ordered = sim.is_some() && align_cc_top_level_order(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
@@ -2669,6 +2672,7 @@ fn rewrite_body(
         ttl_filled,
         streamed,
         stripped,
+        top_level_ordered,
         tools_mimicked,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
@@ -2685,6 +2689,7 @@ fn rewrite_body(
         && !ttl_filled
         && !streamed
         && !stripped
+        && !top_level_ordered
         && !tools_mimicked
     {
         return body.clone();
@@ -3132,9 +3137,53 @@ fn is_default_tool_choice(v: &serde_json::Value) -> bool {
         .is_some_and(|o| o.len() == 1 && o.get("type").and_then(|t| t.as_str()) == Some("auto"))
 }
 
-/// 假名的前缀池。取值本身不重要（上游认的是「在不在它那张第三方名单里」，不是「像不像
-/// CC」——`Skill_manage` 这种把首字母大写的写法实测也能过），重要的是**离任何真实业务名足够
-/// 远**且**稳定可逆**。
+/// 官方 Claude Code 对话请求的顶层键序。
+///
+/// 八份 `cap/raw/*.req.raw` 都保持这个相对顺序。haiku 没有 `output_config`，fable 多一个
+/// `fallbacks`，但共有键一个都没挪位。模拟后若仍保留 `model, system, messages, ... stream,
+/// tools` 这种来访顺序，即使字段集已对齐，也仍是一个稳定的第三方指纹。
+const CC_BODY_KEY_ORDER: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "context_management",
+    "fallbacks",
+    "output_config",
+];
+
+/// 把请求对象改成 [`CC_BODY_KEY_ORDER`] 的顺序，并保证 `stream` 在最后。
+///
+/// 不认识的字段可能有语义，不能丢；保留它们彼此的原始顺序，放在已知字段与 `stream`
+/// 之间。本函数只在 [`Simulation`] 路径调用，真 CC 请求继续保留客户端的字节与顺序。
+fn align_cc_top_level_order(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    let before: Vec<String> = obj.keys().cloned().collect();
+    let mut old = std::mem::take(obj);
+    let mut ordered = serde_json::Map::new();
+
+    for key in CC_BODY_KEY_ORDER {
+        if let Some(value) = old.shift_remove(*key) {
+            ordered.insert((*key).to_string(), value);
+        }
+    }
+    let stream = old.shift_remove("stream");
+    ordered.extend(old);
+    if let Some(value) = stream {
+        ordered.insert("stream".to_string(), value);
+    }
+
+    let changed = before.iter().map(String::as_str).ne(ordered.keys().map(String::as_str));
+    *obj = ordered;
+    changed
+}
+
+/// MCP 形态假名的工具段前缀池。来访原名加 `mcp__hermes__` 后，同一条探测由 400 变为
+/// 200，证明 MCP 命名空间是上游豁免的形态。`manage_bfl00` 之类普通假名仍可被判成
+/// 第三方，故生成的假名统一放在 `mcp__luban__*` 下。
 const FAKE_TOOL_PREFIXES: &[&str] = &[
     "analyze_",
     "compute_",
@@ -3162,13 +3211,14 @@ const FAKE_TOOL_PREFIXES: &[&str] = &[
 
 /// 一次请求内的工具名混淆映射。
 ///
-/// **为什么要混淆**：上游按 `tools[*].name` 判定「这是不是第三方应用」，命中就把额度改扣
-/// 超额池并回 400（`Third-party apps now draw from your extra usage…`）。实测判据只有工具名
-/// 一项——`system` 里明写「You are Hermes Agent, created by Nous Research」都不影响，而
+/// **为什么要混淆**：`tools[*].name` 是上游判定「这是不是第三方应用」的一个已验证判据，
+/// 命中就把额度改扣超额池并回 400（`Third-party apps now draw from your extra usage…`）。实测
+/// `system` 里明写「You are Hermes Agent, created by Nous Research」不影响，而
 /// `skill_manage`/`skill_view`/`skills_list` 三个名字就足以触发。
 ///
 /// **没有安全的数量门槛**：3 个真名会触发，26 个真名不触发，77 个 PascalCase 造名也不触发。
-/// 触发与否取决于**具体是哪些名字**，故不设阈值——只要有可混淆的名字就全混淆。
+/// 触发与否取决于**具体是哪些名字**，故不设阈值——只要有可混淆的名字就全映射成
+/// 稳定、可逆的 MCP 形态假名。
 struct ToolNameMap {
     /// 真名 → 假名，请求侧用。
     forward: std::collections::HashMap<String, String>,
@@ -3202,6 +3252,8 @@ fn should_mimic_tool(t: &serde_json::Value) -> bool {
 /// `tool_use.name` 由 [`apply_tool_names`] 用**新**映射一起重写，故仍然自洽，代价只是缓存失效。
 fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> {
     let tools = body?.get("tools")?.as_array()?;
+    let declared: std::collections::HashSet<&str> =
+        tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
     let real: Vec<&str> = tools
         .iter()
         .filter(|t| should_mimic_tool(t))
@@ -3232,10 +3284,14 @@ fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> 
             [(seed.wrapping_add(i as u64) % FAKE_TOOL_PREFIXES.len() as u64) as usize];
         // 取真名开头三个 ASCII 字母数字，纯粹为了假名在日志里还认得出是谁。
         let head: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
-        let fake = format!("{prefix}{head}{i:02}");
-        // 假名撞上任何一个真名就会在回程被换回去，等于自伤；序号已保证唯一，这里只是兜底。
-        if real.contains(&fake.as_str()) {
-            continue;
+        let stem = format!("mcp__luban__{prefix}{head}{i:02}");
+        let mut fake = stem.clone();
+        // 假名撞上任何已声明工具都会让上游分不清该调谁。序号已保证假名之间唯一，
+        // 这里再兜住来访本来就声明了同名 MCP 工具的极端情形。
+        let mut collision = 0usize;
+        while declared.contains(fake.as_str()) {
+            collision += 1;
+            fake = format!("{stem}_{collision}");
         }
         max_fake = max_fake.max(fake.len());
         reverse.push((fake.clone(), (*name).to_string()));
@@ -5443,6 +5499,10 @@ mod tests {
         // 假名不得撞上任何真名，否则回程还原会把真名换掉。
         for fake in map.forward.values() {
             assert!(!map.forward.contains_key(fake.as_str()), "假名撞真名: {fake}");
+            assert!(
+                fake.starts_with("mcp__luban__"),
+                "普通假名仍可被判为第三方，必须走已验证豁免的 MCP 命名空间: {fake}"
+            );
         }
 
         // 全在白名单里 → 无映射，两侧零开销。
@@ -5466,6 +5526,23 @@ mod tests {
         let other = serde_json::json!({"tools": [{"name": "delegate_task"}]});
         let c = build_tool_name_map(Some(&other)).unwrap();
         assert_ne!(a.forward.get("delegate_task"), c.forward.get("delegate_task"));
+    }
+
+    /// 来访若恰好已有一个和生成假名同名的 MCP 工具，第三方工具仍必须得到映射，
+    /// 不能为了避免撞名就把真名漏给上游。
+    #[test]
+    fn tool_map_resolves_declared_mcp_alias_collision() {
+        let one = serde_json::json!({"tools": [{"name": "skill_manage"}]});
+        let first = build_tool_name_map(Some(&one)).unwrap();
+        let occupied = first.forward["skill_manage"].clone();
+        let collided = serde_json::json!({"tools": [
+            {"name": "skill_manage"},
+            {"name": occupied},
+        ]});
+        let map = build_tool_name_map(Some(&collided)).expect("撞名不得让映射消失");
+        let alias = &map.forward["skill_manage"];
+        assert_ne!(alias, &occupied);
+        assert!(alias.starts_with(&format!("{occupied}_")), "应以稳定后缀解决撞名: {alias}");
     }
 
     /// 请求侧三处必须同时改：`tools[]`、`tool_choice`、历史里的 `tool_use`。
@@ -5975,6 +6052,52 @@ mod tests {
         assert!(
             sim_for(r#"{"model":"gpt-4o","messages":[]}"#).base.is_none(),
             "认不出的模型不猜基座"
+        );
+    }
+
+    /// 回归 2026-08-07 的拒绝日志：客户端的顶层顺序是
+    /// `model, system, messages, max_tokens, stream, tools, metadata, output_config`，即使
+    /// system 和工具名都已整形，这个顺序仍把第三方客户端指纹原样带了出去。
+    #[test]
+    fn simulated_request_reorders_existing_top_level_keys() {
+        let body = Bytes::from(
+            r#"{"model":"claude-sonnet-5","system":"third party","messages":[],"max_tokens":65536,"stream":true,"tools":[{"name":"skill_manage"}],"metadata":{},"output_config":{"effort":"high"}}"#
+                .to_string(),
+        );
+        let parsed_body = parsed(&body);
+        let sim = super::Simulation::detect(parsed_body.as_ref(), all_on(), &test_cred(), "fp")
+            .expect("该请求应走模拟路径");
+        let map = build_tool_name_map(parsed_body.as_ref()).unwrap();
+        let out = super::rewrite_body(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&sim),
+            None,
+            false,
+            Some(&map),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "metadata",
+                "max_tokens",
+                "output_config",
+                "stream",
+            ],
+            "模拟后顶层键序必须与官方抓包一致: {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            v["tools"][0]["name"].as_str().unwrap().starts_with("mcp__luban__"),
+            "拒绝日志里的普通假名也应改成 MCP 形态: {v}"
         );
     }
 

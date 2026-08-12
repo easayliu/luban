@@ -1286,10 +1286,11 @@ pub struct ForwardFlags {
     /// 把上游会判成第三方应用的工具名换成假名转发，回程再还原（见
     /// [`crate::proxy::ToolNameMap`]）。
     ///
-    /// **实测**：上游只按 `tools[*].name` 判定第三方——`skill_manage`/`skill_view`/
+    /// **实测**：`tools[*].name` 是上游判定第三方的一个判据——`skill_manage`/`skill_view`/
     /// `skills_list` 三个名字就足以让整条请求回 400（`Third-party apps now draw from your
     /// extra usage…`，额度改扣超额池），而 `system` 里明写「You are Hermes Agent, created by
-    /// Nous Research」完全不影响。混淆后同一条请求回 200。
+    /// Nous Research」完全不影响。映射到已验证豁免的 `mcp__luban__*` 命名空间后，
+    /// 同一条请求回 200。
     ///
     /// 三类保留原名：server tool、`mcp__` 前缀（实测豁免）、[`crate::config::CC_TOOL_NAMES`]。
     /// 故对真实 CC 是空操作，不必再叠客户端判定。

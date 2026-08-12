@@ -224,14 +224,14 @@ export function ForwardingSettingsContent() {
           k="tool_name_mimic"
           label={t('工具名混淆', 'Tool name obfuscation')}
           summary={t(
-            '把会被上游判成第三方应用的工具名换成假名转发，返回时自动还原，客户端无感。',
-            'Forward tool names that would flag the request as a third-party app under generated aliases, restored transparently on the way back.',
+            '把会被上游判成第三方应用的工具名换成 MCP 形态假名转发，返回时自动还原，客户端无感。',
+            'Forward tool names that would flag the request as a third-party app under generated MCP-shaped aliases, restored transparently on the way back.',
           )}
           description={
             <>
               {t(
-                '上游按请求里的工具名判断这是不是第三方应用，命中就返回「Third-party apps now draw from your extra usage」并改扣超额额度，即使订阅额度充足。实测三个业务工具名就足以触发，而系统提示词里写什么完全不影响。开启后 luban 把这些名字换成稳定的假名发出，响应里再换回真名，客户端从头到尾看到的都是自己的工具名。官方自带的工具、MCP 工具（mcp__ 开头）和服务端工具都保留原名不动，所以对真实官方客户端没有任何影响。代价：响应内容要多做一次字符串替换；客户端中途增删工具会让假名整体重算，上游的提示词缓存会失效一次。',
-                'The upstream decides whether a request comes from a third-party app by looking at the tool names it carries; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when the plan quota is fine. In testing, three business tool names were enough to trigger it, while the system prompt contents made no difference at all. When enabled, luban forwards those names as stable aliases and swaps them back in the response, so the client only ever sees its own tool names. Official client tools, MCP tools (mcp__ prefix) and server tools keep their real names, so this is a no-op for the genuine official client. Costs: one extra string replacement pass over the response, and adding or removing tools mid-session recomputes every alias, invalidating the upstream prompt cache once.',
+                '工具名是上游判断第三方应用的一个已验证判据，命中就返回「Third-party apps now draw from your extra usage」并改扣超额额度，即使订阅额度充足。实测三个业务工具名就足以触发，而 `mcp__` 开头的名字会被豁免。开启后 luban 把这些名字换成 `mcp__luban__*` 下的稳定假名发出，响应里再换回真名，客户端从头到尾看到的都是自己的工具名。官方自带的工具、来访本就是 MCP 的工具和服务端工具都保留原名不动，所以对真实官方客户端没有任何影响。代价：响应内容要多做一次字符串替换；客户端中途增删工具会让假名整体重算，上游的提示词缓存会失效一次。',
+                'Tool names are one verified signal the upstream uses to classify third-party apps; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when plan quota remains. Names beginning with `mcp__` are exempt in testing. When enabled, luban forwards affected names as stable aliases under `mcp__luban__*` and restores them in responses, so the client only sees its own names. Official tools, tools that already use MCP names, and server tools remain unchanged, making this a no-op for the genuine official client. Costs: one extra string replacement pass over responses, and adding or removing tools mid-session recomputes aliases and invalidates the upstream prompt cache once.',
               )}
             </>
           }
