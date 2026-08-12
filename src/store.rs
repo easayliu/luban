@@ -1318,7 +1318,7 @@ impl Default for ForwardFlags {
             cache_ttl_1h: true,
             nonstream_as_sse: true,
             strip_extra_fields: true,
-            tool_name_mimic: true,
+            tool_name_mimic: false,
         }
     }
 }
