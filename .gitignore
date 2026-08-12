@@ -29,6 +29,10 @@
 # Editor/IDE
 # .idea/
 # .vscode/
+.claude/
+
+# 本地调试日志
+*.log
 
 # TS 增量构建缓存
 /admin-ui/tsconfig.tsbuildinfo
