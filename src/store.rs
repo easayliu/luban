@@ -2159,6 +2159,35 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 该账号专用的出站代理；NULL = 直连。**同样必须补在重建之后**，理由见上一条。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN proxy TEXT", []);
 
+    // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
+    // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
+    // 本机解析 DNS——正是那个改动要治的故障（住宅代理只回一个 `unexpected EOF`），而网页上没有
+    // 自助修复的路：打开代理框，里面的值与库里一致 → 不算改动 → 保存按钮是灰的。
+    // 前缀 `socks5://` 是 9 个字符，故 substr 从第 10 个字符起原样接上。
+    // 每次启动都跑一遍：条件严格、表也小，幂等且代价可忽略。
+    conn.execute(
+        "UPDATE credentials SET proxy = 'socks5h://' || substr(proxy, 10) \
+         WHERE proxy LIKE 'socks5://%'",
+        [],
+    )
+    .context("failed to normalize stored socks5 proxy schemes")?;
+
+    // 0.2.82 起不再收 socks4/socks4a（理由见 [`crate::clients::PROXY_SCHEMES`]）。存量行
+    // **既不改写也不清空**：清成直连就是拿真实 IP 去打上游，恰恰是配代理要避免的事。留着的话
+    // 运行时那道校验会拒掉它，这个号整体不可用、错误也看得见，但光从「转发失败」那条日志推不
+    // 回协议这一层，所以启动时先把这些号点出来。
+    let socks4: Vec<String> = conn
+        .prepare("SELECT label FROM credentials WHERE proxy LIKE 'socks4%'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !socks4.is_empty() {
+        tracing::warn!(
+            credentials = ?socks4,
+            "socks4/socks4a proxies are no longer supported (they cannot carry authentication); \
+             these credentials will fail until their proxy is changed to socks5h://"
+        );
+    }
+
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
@@ -4673,5 +4702,49 @@ mod tests {
             .query_row("SELECT sql FROM sqlite_master WHERE name = 'credentials'", [], |r| r.get(0))
             .unwrap();
         assert!(ddl.contains("AUTOINCREMENT"));
+    }
+
+    /// 0.2.81 之前入库的 socks5 代理，迁移时一次性归一化成 socks5h（理由见
+    /// [`crate::clients::PROXY_SCHEME_UPGRADES`]）。不改写的话那些号会一直本机解析 DNS——正是
+    /// 那个改动要治的故障，而网页上没有自助修复的路：代理框里的值与库里一致 → 不算改动 →
+    /// 保存按钮是灰的。
+    ///
+    /// socks4/socks4a 那两种已经不收了（见 [`crate::clients::PROXY_SCHEMES`]），存量行原样留着：
+    /// 清成直连就是拿真实 IP 打上游，比这个号不可用坏得多。
+    #[test]
+    fn migration_normalizes_stored_socks_schemes() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        for (id, proxy) in [
+            (1, Some("socks5://u:p@example.com:1080")),
+            (2, Some("socks4://10.0.0.1:1080")),
+            (3, Some("socks5h://example.com:1080")),
+            (4, Some("http://127.0.0.1:8080")),
+            (5, None),
+        ] {
+            conn.execute(
+                "INSERT INTO credentials (id, access_token, refresh_token, expires_at, proxy) \
+                 VALUES (?1, 'a', ?3, 0, ?2)",
+                params![id, proxy, format!("r{id}")], // refresh_token 有 UNIQUE 约束
+            )
+            .unwrap();
+        }
+
+        init_schema(&conn).unwrap(); // 改写就发生在这一次。
+
+        let got = |id: i64| -> Option<String> {
+            conn.query_row("SELECT proxy FROM credentials WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(got(1).as_deref(), Some("socks5h://u:p@example.com:1080"), "socks5 该归一化");
+        assert_eq!(got(2).as_deref(), Some("socks4://10.0.0.1:1080"), "socks4 原样留着，不清空");
+        assert_eq!(got(3).as_deref(), Some("socks5h://example.com:1080"), "已是目标形态不该动");
+        assert_eq!(got(4).as_deref(), Some("http://127.0.0.1:8080"), "http 不该动");
+        assert_eq!(got(5), None, "直连（NULL）不该动");
+
+        // 幂等：再跑一遍不该在 socks5h 前面再叠一层。
+        init_schema(&conn).unwrap();
+        assert_eq!(got(1).as_deref(), Some("socks5h://u:p@example.com:1080"));
+        assert_eq!(got(2).as_deref(), Some("socks4://10.0.0.1:1080"));
     }
 }

@@ -34,8 +34,15 @@ pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
     let builder = match proxy {
         // `Proxy::all` 覆盖 http 与 https 两种目标；上游只有 https，但写 all 才不会因为
         // 哪天多一个 http 目标就悄悄绕开代理。
-        Some(url) => builder
-            .proxy(wreq::Proxy::all(url).with_context(|| format!("invalid proxy URL: {url}"))?),
+        Some(url) => {
+            // **建之前必须再校验一次**：`Proxy::all` 成功不等于代理会生效（见
+            // [`check_proxy_url`]），而库里完全可能存着这样一条——0.2.81 之前的入库校验拦不住，
+            // 手工改库也能塞进来。校验不过就返回 Err，让 [`ClientPool::for_credential`] 把这个号
+            // 整体判为不可用；绝不能建出一个「配置里有代理、实际直连」的客户端。
+            check_proxy_url(url)?;
+            builder
+                .proxy(wreq::Proxy::all(url).with_context(|| format!("invalid proxy URL: {url}"))?)
+        }
         // 不配代理时**不调用 `.no_proxy()`**：保留 wreq 默认的环境变量代理探测
         // （HTTPS_PROXY/ALL_PROXY 等），那是全局兜底，与逐账号代理各管一层。
         None => builder,
@@ -44,8 +51,14 @@ pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
 }
 
 /// 代理 URL 支持的协议。
-const PROXY_SCHEMES: &[&str] =
-    &["http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"];
+///
+/// **socks4/socks4a 是刻意不收的**（0.2.82 起）。SOCKS4 协议里根本没有认证字段——只有一个
+/// userid，而 wreq 的 V4 分支连 userid 都不发（`Socks4Stream::connect_with_socket`），于是 URL
+/// 里写的 `user:pass@` 被**静默丢掉**；买来的代理十有八九要认证，结果就是一条看不出原因的连接
+/// 失败。另一头 socks4a（把域名交给代理端解析的那种）是个扩展，靠把目标 IP 填成 `0.0.0.1` 这个
+/// 哨兵值来示意「后面跟的是域名」，只会说纯 SOCKS4 的代理收到它直接挂。两条路都是坑，而
+/// SOCKS4 本身早已绝迹，socks5h 能覆盖它的全部用途，所以干脆在入口就拒掉。
+const PROXY_SCHEMES: &[&str] = &["http://", "https://", "socks5://", "socks5h://"];
 
 /// 入库时归一化的协议：本机解析 → 交给代理端解析。
 ///
@@ -59,30 +72,82 @@ const PROXY_SCHEMES: &[&str] =
 /// **归一化发生在入库那一刻，不是发请求时**：存 `socks5://` 却按 `socks5h://` 跑，库里的值
 /// 与真实行为就对不上，下次出问题看着配置推不出行为。改成入库即改写，网页上保存完立刻能
 /// 看到它变成了 `socks5h://`，配置与行为始终一致，也不必额外解释。
-const PROXY_SCHEME_UPGRADES: &[(&str, &str)] =
-    &[("socks5://", "socks5h://"), ("socks4://", "socks4a://")];
+const PROXY_SCHEME_UPGRADES: &[(&str, &str)] = &[("socks5://", "socks5h://")];
 
 /// 校验一条代理 URL 能不能用，能则返回规范化后的串（去空白 + 协议归一化，见
-/// [`PROXY_SCHEME_UPGRADES`]）。
+/// [`PROXY_SCHEME_UPGRADES`]）。判据本身在 [`check_proxy_url`]——**「能构造出 `wreq::Proxy`」
+/// 是个远远不够的判据**，那里解释了为什么。
 ///
 /// **在入库那一刻校验，而不是发请求时**：存进去一条建不出客户端的代理，故障要等到下一次
 /// 真有请求选中这个号才暴露，那时现场只剩一条「所有请求都失败」。
 pub fn validate_proxy(raw: &str) -> Result<String> {
     let url = raw.trim();
     anyhow::ensure!(!url.is_empty(), "the proxy URL must not be empty");
+    let url = match PROXY_SCHEME_UPGRADES.iter().find(|(from, _)| url.starts_with(from)) {
+        Some((from, to)) => format!("{to}{}", &url[from.len()..]),
+        None => url.to_string(),
+    };
+    // 校验归一化之后那串——存什么就验什么，免得验的和跑的是两条 URL。
+    let uri = check_proxy_url(&url)?;
+    // wreq 把 path/query 整段丢掉（`builder.path_and_query("/")`）。运行时那道校验故意不管这个
+    // （免得让一条本来在跑的老配置突然报废），但**入库时要拦**：存着一段不会生效的尾巴，下次
+    // 照着配置推行为一定推错。
+    anyhow::ensure!(
+        matches!(uri.path(), "" | "/") && uri.query().is_none(),
+        "the proxy URL must not have a path or query: {url}"
+    );
+    // 真去构造一次兜底：上面的判据是照 wreq 的实现逐条复现的，这一步保证「至少建得出来」。
+    wreq::Proxy::all(&url).with_context(|| format!("invalid proxy URL: {url}"))?;
+    Ok(url)
+}
+
+/// 校验一条代理 URL 会不会被 wreq **真正当成代理**，成功时返回解析出的 URI。
+///
+/// **为什么 `wreq::Proxy::all` 成功还不够**：那一步只要求「能解析成 `Uri`、且 scheme 与
+/// authority 都在」，它连 scheme 是不是代理协议都不看。真正决定代理生不生效的是 wreq 内部的
+/// `parse_env_uri`（名字像是只管环境变量，其实显式 `.proxy()` 也走它——`proxy/matcher.rs` 里
+/// `Builder::build` 对 all/http/https 三份都调它）。它认不出来时**返回 `None` 而不报错**，
+/// `Client::builder().build()` 照样成功，于是拿到一个「配置里有代理、实际没有代理」的客户端：
+/// 请求带着真实 IP 直连打上游，日志上完全看不出来。实测会这样的几条：
+///
+/// - `socks5://u:pa#ss@h:1080` —— 密码里的裸 `#` 被当成 fragment 切掉，authority 塌成 `u:pa`；
+/// - `socks5://h:notaport`、`socks5://h:99999` —— 端口不是合法 u16；
+/// - `ftp://h:21` —— scheme 压根不是代理协议，wreq 认不出来就当没配代理。
+///
+/// 这条路把 [`ClientPool::for_credential`] 那句「配了代理就绝不退回直连」整个绕过去了，所以
+/// 判据在这里照 wreq 的实现逐条复现，且**入库时与每次建客户端时各拦一道**（见
+/// [`upstream_client`]）。
+fn check_proxy_url(url: &str) -> Result<axum::http::Uri> {
+    use axum::http::{Uri, uri::Authority};
+
     anyhow::ensure!(
         PROXY_SCHEMES.iter().any(|s| url.starts_with(s)),
         "unsupported proxy scheme (expected one of: {})",
         PROXY_SCHEMES.join(", ")
     );
-    let url = match PROXY_SCHEME_UPGRADES.iter().find(|(from, _)| url.starts_with(from)) {
-        Some((from, to)) => format!("{to}{}", &url[from.len()..]),
-        None => url.to_string(),
-    };
-    // 真去构造一次：协议对了不代表 URL 合法（缺主机、端口非数字等都在这一步才现形）。
-    // 用归一化之后那串构造——存什么就验什么，免得验的和跑的是两条 URL。
-    wreq::Proxy::all(&url).with_context(|| format!("invalid proxy URL: {url}"))?;
-    Ok(url)
+    let uri: Uri = url.parse().with_context(|| format!("invalid proxy URL: {url}"))?;
+    let authority = uri.authority().with_context(|| format!("the proxy URL has no host: {url}"))?;
+    // userinfo 由 wreq 单独取走（`authority.as_str().rsplit_once('@')`），要能自成一个合法
+    // authority 的是 host:port 那半。
+    let host_port = authority.as_str().rsplit_once('@').map_or(authority.as_str(), |(_, hp)| hp);
+    let host_port: Authority = host_port.parse().with_context(|| {
+        format!(
+            "invalid host:port in the proxy URL: {url} \
+             (special characters in user:pass@ must be percent-encoded, e.g. # as %23)"
+        )
+    })?;
+    anyhow::ensure!(!host_port.host().is_empty(), "the proxy URL has no host: {url}");
+    match host_port.port_u16() {
+        // 没写端口时 wreq 给 socks 补 1080——`h:notaport` 会被拼成 `h:notaport:1080`，解析失败，
+        // 代理就此静默失效。原地复现这一步，把它变成一条能看懂的错误。
+        None => anyhow::ensure!(
+            format!("{host_port}:1080").parse::<Authority>().is_ok(),
+            "the proxy port must be a number in 1-65535: {url}"
+        ),
+        Some(0) => anyhow::bail!("the proxy port must not be 0: {url}"),
+        Some(_) => {}
+    }
+    Ok(uri)
 }
 
 /// 「代理 URL → 客户端」缓存。
@@ -169,21 +234,30 @@ mod tests {
         }
     }
 
-    /// 六种协议都收，别的一律拒——尤其别把 `socks5` 这种漏了 `://` 的写法放进去。
+    /// 四种协议都收，别的一律拒——尤其别把 `socks5` 这种漏了 `://` 的写法放进去。
+    /// socks4/socks4a 也在拒的那一列，理由见 [`PROXY_SCHEMES`]。
     #[test]
     fn accepts_the_documented_schemes_only() {
         for ok in [
             "socks5://127.0.0.1:1080",
             "socks5h://user:pass@example.com:1080",
-            "socks4://10.0.0.1:1080",
             "http://127.0.0.1:8080",
             "https://proxy.example.com:8443",
         ] {
             assert!(validate_proxy(ok).is_ok(), "该收: {ok}");
         }
-        for bad in
-            ["", "   ", "127.0.0.1:1080", "socks5:127.0.0.1:1080", "ftp://x:1", "socks6://x:1"]
-        {
+        for bad in [
+            "",
+            "   ",
+            "127.0.0.1:1080",
+            "socks5:127.0.0.1:1080",
+            "ftp://x:1",
+            "socks6://x:1",
+            // SOCKS4 带不了认证、socks4a 又只有部分代理认，一律不收。
+            "socks4://10.0.0.1:1080",
+            "socks4a://10.0.0.1:1080",
+            "socks4://u:p@example.com:1080",
+        ] {
             assert!(validate_proxy(bad).is_err(), "该拒: {bad}");
         }
     }
@@ -197,27 +271,127 @@ mod tests {
         );
     }
 
-    /// **本机解析的两种协议入库时改写成交给代理端解析**，理由见
+    /// **本机解析的 socks5 入库时改写成交给代理端解析的 socks5h**，理由见
     /// [`PROXY_SCHEME_UPGRADES`]。改写在入库那一刻发生，故库里存的就是实际会跑的那条。
     #[test]
     fn upgrades_local_dns_schemes_on_save() {
         for (input, want) in [
             ("socks5://127.0.0.1:1080", "socks5h://127.0.0.1:1080"),
-            ("socks4://10.0.0.1:1080", "socks4a://10.0.0.1:1080"),
             // 账号密码、端口一并原样带过去，只换协议头。
             ("socks5://u:p@example.com:16901", "socks5h://u:p@example.com:16901"),
         ] {
             assert_eq!(validate_proxy(input).unwrap(), want, "该归一化: {input}");
         }
         // 已经是目标形态、以及 http(s) 那两种，一律原样不动。
-        for same in [
-            "socks5h://127.0.0.1:1080",
-            "socks4a://10.0.0.1:1080",
-            "http://127.0.0.1:8080",
-            "https://proxy.example.com:8443",
-        ] {
+        for same in
+            ["socks5h://127.0.0.1:1080", "http://127.0.0.1:8080", "https://proxy.example.com:8443"]
+        {
             assert_eq!(validate_proxy(same).unwrap(), same, "不该动: {same}");
         }
+    }
+
+    /// **能构造出 `wreq::Proxy` 不等于代理会生效**：下面这些串都能构造出来，但 wreq 内部认不
+    /// 出来就静默不挂代理，请求带着真实 IP 直连打上游（判据与实测见 [`check_proxy_url`]）。
+    /// 一条都不能放进库里。
+    #[test]
+    fn rejects_urls_that_wreq_would_silently_ignore() {
+        for bad in [
+            // 密码里的裸 `#`/`/`：`#` 之后被当 fragment 切掉，authority 塌成 `u:pa`。
+            "socks5://u:pa#ss@example.com:1080",
+            "socks5://u:pa/ss@example.com:1080",
+            // 端口不是合法 u16（`notaport`/越界/0）。
+            "socks5://example.com:notaport",
+            "socks5://example.com:99999",
+            "socks5://example.com:0",
+            "http://u:pa#ss@example.com:8080",
+            "http://example.com:notaport",
+            // path/query 会被 wreq 整段丢掉，别让它进库。
+            "socks5://example.com:1080/path",
+            "http://example.com:8080?a=1",
+        ] {
+            assert!(validate_proxy(bad).is_err(), "该拒: {bad}");
+        }
+        // 正常形态照收：percent-encode 过的密码、IPv6、以及不写端口（wreq 给 socks 补 1080）。
+        for ok in [
+            "socks5h://u:pa%23ss@example.com:1080",
+            "socks5h://[::1]:1080",
+            "socks5h://example.com",
+            "http://example.com:8080/",
+        ] {
+            assert!(validate_proxy(ok).is_ok(), "该收: {ok}");
+        }
+    }
+
+    /// **护栏：凡是 [`validate_proxy`] 放行的串，wreq 都必须真把它当代理用。**
+    ///
+    /// [`check_proxy_url`] 的判据是照 wreq 当前实现（`proxy/matcher.rs` 的 `parse_env_uri`）
+    /// 逐条复现的，wreq 一升级就可能漂。漂了的话故障形态是最坏的那种——静默直连、真实 IP 打
+    /// 上游、日志上完全看不出来——所以这里拿一个本地监听口**当目标**钉住它：那个口一旦收到
+    /// 连接，就说明代理没挂上、请求直连了。
+    ///
+    /// 全程只碰 loopback：代理指向本机的死端口，连接立刻被拒，不做 DNS 解析也不等超时。
+    #[tokio::test]
+    async fn every_accepted_proxy_url_actually_gets_used() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", target_listener.local_addr().unwrap());
+
+        // 先证明这套装置分得清「走代理」和「直连」：拿一个**真在监听**的本地口当代理，请求就
+        // 必须落在代理口上。（我们不回应 SOCKS 握手，所以那条请求最终会失败——不关心。）
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let url = validate_proxy(&format!("socks5://127.0.0.1:{proxy_port}")).unwrap();
+        let client = upstream_client(Some(&url)).unwrap();
+        let sent = target.clone();
+        tokio::spawn(async move {
+            let _ = client.get(&sent).send().await;
+        });
+        tokio::select! {
+            _ = proxy_listener.accept() => {}
+            _ = target_listener.accept() => panic!("请求没走代理，直连到了目标"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("代理口和目标口都没收到连接，这个测试装置已经失效")
+            }
+        }
+
+        // 端口 1 上不会有东西在听：连代理这一步立刻被拒，请求到不了目标——除非代理没挂上。
+        for raw in [
+            "socks5://u:p@127.0.0.1:1",
+            "socks5h://u:pa%23ss@127.0.0.1:1",
+            "socks5h://[::1]:1",
+            "http://u:p@127.0.0.1:1",
+            "https://127.0.0.1:1",
+        ] {
+            let url = validate_proxy(raw).unwrap_or_else(|e| panic!("该收 {raw}: {e:#}"));
+            let client = upstream_client(Some(&url)).expect("该建得出客户端");
+            let _ = client.get(&target).send().await;
+
+            let leaked = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                target_listener.accept(),
+            )
+            .await
+            .is_ok();
+            assert!(!leaked, "代理被静默绕过、请求直连到了目标：{raw} → {url}");
+        }
+    }
+
+    /// 老库里可能已经存着一条 wreq 会静默忽略的代理串（0.2.81 之前的入库校验拦不住，手工改库
+    /// 也能塞进来）。那种串**必须**让这个号整体不可用：建出一个「看着配了代理、实际直连」的
+    /// 客户端，等于拿真实 IP 打上游而且日志上看不出来——比这个号不可用坏得多。
+    #[test]
+    fn a_silently_ignored_proxy_errors_instead_of_going_direct() {
+        let pool = ClientPool::new().unwrap();
+        for stored in [
+            "socks5h://example.com:notaport",
+            "socks5h://u:pa#ss@example.com:1080",
+            "ftp://example.com:21",
+        ] {
+            let Err(err) = pool.for_credential(&cred_with(Some(stored))) else {
+                panic!("wreq 会静默忽略的代理串该报错，而不是直连出去: {stored}");
+            };
+            assert!(format!("{err:#}").contains("proxy"), "错误该点明是代理的问题: {err:#}");
+        }
+        assert_eq!(pool.by_proxy.read().len(), 0, "建失败不该留下缓存");
     }
 
     /// 没配代理 → 直连那一份；配了 → 另一份，且同一个 URL 第二次取命中缓存（同一个客户端）。

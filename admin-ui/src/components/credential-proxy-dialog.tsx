@@ -83,14 +83,14 @@ export function CredentialProxyDialog({
             />
             <p className="text-muted-foreground text-xs leading-relaxed">
               {t(
-                '支持 socks5://、socks5h://、socks4://、socks4a://、http://、https://，可带 user:pass@。留空表示直连。',
-                'Supports socks5://, socks5h://, socks4://, socks4a://, http://, https://, optionally with user:pass@. Leave empty for a direct connection.',
+                '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码里的特殊字符要 percent-encode，如 # 写成 %23）。留空表示直连。',
+                'Supports socks5://, socks5h://, http://, https://, optionally with user:pass@ (percent-encode special characters in the password, e.g. # as %23). Leave empty for a direct connection.',
               )}
             </p>
             <p className="text-muted-foreground text-xs leading-relaxed">
               {t(
-                '填 socks5:// 会在保存时自动改成 socks5h://（socks4:// 同理改成 socks4a://）——让代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你就近的 IP，而且不少住宅代理只接受域名形式、直接断连。',
-                'socks5:// is rewritten to socks5h:// on save (likewise socks4:// to socks4a://), so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright.',
+                '填 socks5:// 会在保存时自动改成 socks5h://——让代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你就近的 IP，而且不少住宅代理只接受域名形式、直接断连。socks4/socks4a 不再支持：SOCKS4 协议带不了账号密码，填了会被静默丢掉。',
+                'socks5:// is rewritten to socks5h:// on save, so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright. socks4/socks4a are no longer supported: the SOCKS4 protocol cannot carry a username and password, so credentials would be silently dropped.',
               )}
             </p>
           </div>
