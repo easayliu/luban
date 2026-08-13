@@ -89,8 +89,8 @@ export function CredentialProxyDialog({
             </p>
             <p className="text-muted-foreground text-xs leading-relaxed">
               {t(
-                'socks5h:// 让代理端解析域名；socks5:// 在本机解析，会把上游域名泄露给本地 DNS。',
-                'socks5h:// resolves DNS at the proxy; socks5:// resolves locally, which leaks the upstream hostname to your local DNS.',
+                '填 socks5:// 会在保存时自动改成 socks5h://（socks4:// 同理改成 socks4a://）——让代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你就近的 IP，而且不少住宅代理只接受域名形式、直接断连。',
+                'socks5:// is rewritten to socks5h:// on save (likewise socks4:// to socks4a://), so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright.',
               )}
             </p>
           </div>

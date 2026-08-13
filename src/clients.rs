@@ -43,12 +43,27 @@ pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
     builder.build().context("failed to build the upstream HTTP client")
 }
 
-/// 代理 URL 支持的协议。`socks5h` 与 `socks4a` 的区别只在 DNS 由谁解析（带 h/a 的交给代理端
-/// 解析），做代理隔离时通常要的是后者——本机解析会把目标域名泄露给本地 DNS。
+/// 代理 URL 支持的协议。
 const PROXY_SCHEMES: &[&str] =
     &["http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://"];
 
-/// 校验一条代理 URL 能不能用，能则返回规范化（去空白）后的串。
+/// 入库时归一化的协议：本机解析 → 交给代理端解析。
+///
+/// **为什么默认改掉**：luban 的出站目标永远是 `api.anthropic.com` 这一个公网域名，不存在
+/// 内网域名那类非本机解析不可的场景。而本机解析有两个实打实的坏处——把目标域名泄露给本地
+/// DNS（花钱买的是出口隔离，本地解析器上却留了一串查询记录），以及解析出的 IP 是按**你**的
+/// 位置就近的（上游走 anycast），然后再通过一个异地代理去连它，既绕远又与「真实用户从那个
+/// 出口访问」的形态对不上。此外大量住宅/移动代理压根不接受 IP 形式的连接请求，只回一个
+/// `unexpected EOF`——错误文本上完全看不出是这个原因，实测被它绕过好一阵。
+///
+/// **归一化发生在入库那一刻，不是发请求时**：存 `socks5://` 却按 `socks5h://` 跑，库里的值
+/// 与真实行为就对不上，下次出问题看着配置推不出行为。改成入库即改写，网页上保存完立刻能
+/// 看到它变成了 `socks5h://`，配置与行为始终一致，也不必额外解释。
+const PROXY_SCHEME_UPGRADES: &[(&str, &str)] =
+    &[("socks5://", "socks5h://"), ("socks4://", "socks4a://")];
+
+/// 校验一条代理 URL 能不能用，能则返回规范化后的串（去空白 + 协议归一化，见
+/// [`PROXY_SCHEME_UPGRADES`]）。
 ///
 /// **在入库那一刻校验，而不是发请求时**：存进去一条建不出客户端的代理，故障要等到下一次
 /// 真有请求选中这个号才暴露，那时现场只剩一条「所有请求都失败」。
@@ -60,9 +75,14 @@ pub fn validate_proxy(raw: &str) -> Result<String> {
         "unsupported proxy scheme (expected one of: {})",
         PROXY_SCHEMES.join(", ")
     );
+    let url = match PROXY_SCHEME_UPGRADES.iter().find(|(from, _)| url.starts_with(from)) {
+        Some((from, to)) => format!("{to}{}", &url[from.len()..]),
+        None => url.to_string(),
+    };
     // 真去构造一次：协议对了不代表 URL 合法（缺主机、端口非数字等都在这一步才现形）。
-    wreq::Proxy::all(url).with_context(|| format!("invalid proxy URL: {url}"))?;
-    Ok(url.to_string())
+    // 用归一化之后那串构造——存什么就验什么，免得验的和跑的是两条 URL。
+    wreq::Proxy::all(&url).with_context(|| format!("invalid proxy URL: {url}"))?;
+    Ok(url)
 }
 
 /// 「代理 URL → 客户端」缓存。
@@ -172,9 +192,32 @@ mod tests {
     #[test]
     fn trims_surrounding_whitespace() {
         assert_eq!(
-            validate_proxy("  socks5://127.0.0.1:1080 \n").unwrap(),
-            "socks5://127.0.0.1:1080"
+            validate_proxy("  socks5h://127.0.0.1:1080 \n").unwrap(),
+            "socks5h://127.0.0.1:1080"
         );
+    }
+
+    /// **本机解析的两种协议入库时改写成交给代理端解析**，理由见
+    /// [`PROXY_SCHEME_UPGRADES`]。改写在入库那一刻发生，故库里存的就是实际会跑的那条。
+    #[test]
+    fn upgrades_local_dns_schemes_on_save() {
+        for (input, want) in [
+            ("socks5://127.0.0.1:1080", "socks5h://127.0.0.1:1080"),
+            ("socks4://10.0.0.1:1080", "socks4a://10.0.0.1:1080"),
+            // 账号密码、端口一并原样带过去，只换协议头。
+            ("socks5://u:p@example.com:16901", "socks5h://u:p@example.com:16901"),
+        ] {
+            assert_eq!(validate_proxy(input).unwrap(), want, "该归一化: {input}");
+        }
+        // 已经是目标形态、以及 http(s) 那两种，一律原样不动。
+        for same in [
+            "socks5h://127.0.0.1:1080",
+            "socks4a://10.0.0.1:1080",
+            "http://127.0.0.1:8080",
+            "https://proxy.example.com:8443",
+        ] {
+            assert_eq!(validate_proxy(same).unwrap(), same, "不该动: {same}");
+        }
     }
 
     /// 没配代理 → 直连那一份；配了 → 另一份，且同一个 URL 第二次取命中缓存（同一个客户端）。
@@ -216,5 +259,39 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("proxy"), "错误该点明是代理的问题: {err:#}");
         assert_eq!(pool.by_proxy.read().len(), 0, "建失败不该留下缓存");
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// 拿一条**真实代理**打一发，打印出口 IP。默认不跑，需显式给 `LUBAN_TEST_PROXY`：
+    ///
+    /// ```sh
+    /// LUBAN_TEST_PROXY=socks5h://user:pass@host:1080 \
+    ///   cargo test -- --ignored --nocapture live::
+    /// ```
+    ///
+    /// **排查「代理配了但不通」时先跑它**：它把代理这一层单独摘出来，能立刻分清是代理本身
+    /// 的问题还是 luban 的问题。尤其注意 `socks5://` 与 `socks5h://` 的差别——前者在本机解析
+    /// DNS、把 IP 交给代理，不少代理（住宅/移动出口居多）只接受域名形式，于是只回一个
+    /// `unexpected EOF`，从错误文本上完全看不出是这个原因。换成 `socks5h://` 即可。
+    #[tokio::test]
+    #[ignore]
+    async fn through_a_real_proxy() {
+        let url = std::env::var("LUBAN_TEST_PROXY")
+            .expect("set LUBAN_TEST_PROXY=socks5h://user:pass@host:port");
+        let client = super::upstream_client(Some(&url)).expect("failed to build the client");
+        match client.get("https://api.ipify.org").send().await {
+            Ok(r) => println!("status={} exit_ip={:?}", r.status(), r.text().await),
+            Err(e) => {
+                println!("FAILED: {e}");
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    println!("  caused by: {s}");
+                    src = s.source();
+                }
+                panic!("could not reach the upstream through {url}");
+            }
+        }
     }
 }
