@@ -79,51 +79,6 @@ pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05"
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
 pub const CC_USER_AGENT: &str = "claude-cli/2.1.220 (external, cli)";
 
-/// 官方 Claude Code 自己那套工具名，逐个取自 `cap/raw/*.req.raw` 与 `cap/*.json`
-/// （claude-cli/2.1.220，去重后 31 个）。工具名混淆时跳过它们，
-/// 见 [`crate::proxy::build_tool_name_map`]。
-///
-/// **上游按工具名判第三方，这是实测结论**：同一条请求，工具名换成本表里的名字回 200，
-/// 换回第三方业务名（`skill_manage`/`skill_view`/`skills_list` 三个就够）回 400，
-/// 而 `system` 里放 56KB 的「You are Hermes Agent, created by Nous Research」完全不影响。
-///
-/// **表过期是软失效**：CC 新版加了工具而本表没跟上，那个名字会被一并混淆——功能不受影响
-/// （回程照样还原），只是多一处与真实 CC 的形态偏差。反过来漏掉一个第三方名字才是硬失效
-/// （整条请求 400），故宁可表短，也不臆造抓包里没见过的名字。
-pub const CC_TOOL_NAMES: &[&str] = &[
-    "Agent",
-    "AskUserQuestion",
-    "Bash",
-    "CronCreate",
-    "CronDelete",
-    "CronList",
-    "DeferredToolPlaceholder",
-    "Edit",
-    "EnterPlanMode",
-    "EnterWorktree",
-    "ExitPlanMode",
-    "ExitWorktree",
-    "LSP",
-    "NotebookEdit",
-    "Read",
-    "ReportFindings",
-    "ScheduleWakeup",
-    "SendMessage",
-    "Skill",
-    "TaskCreate",
-    "TaskGet",
-    "TaskList",
-    "TaskOutput",
-    "TaskStop",
-    "TaskUpdate",
-    "ToolSearch",
-    "WaitForMcpServers",
-    "WebFetch",
-    "WebSearch",
-    "Workflow",
-    "Write",
-];
-
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
 /// 原先该头被剥离，上游收到的是「自称 claude-cli 却完全不声明压缩支持」的请求。

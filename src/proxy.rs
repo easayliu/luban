@@ -2568,6 +2568,19 @@ struct ShapeProbe {
     values: fn(&serde_json::Value) -> Vec<String>,
 }
 
+/// 「条件句」的引子。命中其一即**不学**这条 400——见 [`remember_shape_rejection`]。
+///
+/// 判据的前提是「上游点名了这个取值 = 这个取值本身不被接受」，而条件句推翻了这个前提：
+/// ```text
+/// output_config.effort 'max' is not supported when thinking is disabled on this model.
+/// ```
+/// 这句里 `max` 并非一律不行，只是**在 thinking 关掉时**不行——学成「一律拒」，下次客户端
+/// 开着 thinking 正常发 `max` 就会被本地误拒，而上游本来会接受。
+///
+/// **宁可漏学**：真正无条件的报错里恰好出现这些词，代价不过是每次都白发一趟上游；反过来把
+/// 条件句学成无条件，代价是本地长期拒掉一批合法请求，且现象是「换个客户端就好了」，极难查。
+const CONDITIONAL_MARKS: &[&str] = &[" when ", " unless ", " without ", " while ", " if "];
+
 /// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取」，学习与拦截两侧
 /// 都不必改——它们只跟这张表打交道。
 const SHAPE_PROBES: &[ShapeProbe] = &[
@@ -2627,6 +2640,10 @@ fn remember_shape_rejection(
     let (Some(model), Some(body)) = (model, body) else { return };
     let (_, message) = parse_upstream_error(err);
     let hay = message.to_lowercase();
+    // 条件句一律不学：这条 400 说的是「在某某前提下不行」，不是「这个取值不行」。
+    if CONDITIONAL_MARKS.iter().any(|m| hay.contains(m)) {
+        return;
+    }
     for probe in SHAPE_PROBES {
         if !hay.contains(probe.keyword) {
             continue;
@@ -3384,6 +3401,13 @@ const FAKE_TOOL_PREFIXES: &[&str] = &[
 /// 已知触发上游第三方判定的工具名（实测）。命中其中任意一个即回 400
 /// `Third-party apps now draw from your extra usage…`，加 `mcp__` 前缀后豁免。
 /// 抓包（`cap/raw/*.req.raw`）确认官方 CC 从不发这些名字，故只需对这张表做最小混淆。
+///
+/// **判据在工具名而不在 system**：同一条请求，工具名换成官方 CC 那套（`Read`/`Bash` 之类）
+/// 回 200，换回这三个业务名回 400；而 `system` 里放 56KB 的「You are Hermes Agent,
+/// created by Nous Research」完全不影响。故这里只按名字列黑名单，不去动别的形态。
+///
+/// **宁可表短也别臆造**：漏掉一个真会触发的名字是硬失效（整条请求 400），凭空多列一个
+/// 则会把本来没事的工具名一起混淆（功能不受影响，只是多一处与真实 CC 的形态偏差）。
 const BLOCKED_TOOL_NAMES: &[&str] = &["skill_manage", "skill_view", "skills_list"];
 
 /// 一次请求内的工具名混淆映射。
@@ -6094,6 +6118,42 @@ mod tests {
         let body = effort_req("claude-sonnet-5", "xhigh");
         super::remember_shape_rejection(&mem, None, body.as_ref(), &err_json(EFFORT_400));
         assert!(mem.read().is_empty());
+    }
+
+    /// **条件句一条都不学**（实测原文，opus-5 的 thinking/effort 联动规则）：
+    /// `max` 并非一律不行，只是 thinking 关掉时不行。学成「一律拒」的话，下次客户端开着
+    /// thinking 正常发 `max` 就会被本地误拒——而上游本来会接受。
+    #[test]
+    fn never_learns_a_conditional_rejection() {
+        const COND_400: &str = "output_config.effort 'max' is not supported when thinking is \
+                                disabled on this model. Use effort 'high' or below, or enable thinking.";
+        let mem = super::ShapeMemory::default();
+        let body = effort_req("claude-opus-5", "max");
+        super::remember_shape_rejection(
+            &mem,
+            Some("claude-opus-5"),
+            body.as_ref(),
+            &err_json(COND_400),
+        );
+        assert!(mem.read().is_empty(), "条件句不该进表: {COND_400}");
+        // 于是开着 thinking 的那条请求照常放行，不会被本地误拒。
+        assert!(super::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref()).is_none());
+
+        // 无条件那两条不受影响——判据只挡「when/unless/without」这类前提词。
+        let mem = super::ShapeMemory::default();
+        super::remember_shape_rejection(
+            &mem,
+            Some("claude-sonnet-5"),
+            effort_req("claude-sonnet-5", "xhigh").as_ref(),
+            &err_json(EFFORT_400),
+        );
+        super::remember_shape_rejection(
+            &mem,
+            Some("claude-opus-4-6"),
+            role_req("claude-opus-4-6", "system").as_ref(),
+            &err_json(ROLE_400),
+        );
+        assert_eq!(mem.read().len(), 2, "无条件的两条仍该学得到");
     }
 
     /// 记忆表封顶后不再插入：取值来自来访请求，增长是外部可控的。
