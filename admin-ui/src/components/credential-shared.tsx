@@ -3,11 +3,11 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
+  GlobeIcon, PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, probeCredential, refreshCredential, setDeviceLimit,
-  setDisabled, setLabel, setPriority,
+  setDisabled, setLabel, setPriority, setProxy,
   type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -623,6 +623,14 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onSuccess: () => { onLimitSaved?.(); invalidate() },
     onError: (e) => failure(t('设置设备上限失败', 'Failed to set device limit'), e),
   })
+  const proxy = useMutation({
+    mutationFn: (url: string | null) => setProxy(cred.id, url),
+    onSuccess: () => {
+      toastManager.add({ title: t('已保存出站代理', 'Outbound proxy saved'), type: 'success' })
+      invalidate()
+    },
+    onError: (e) => failure(t('设置出站代理失败', 'Failed to set the outbound proxy'), e),
+  })
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
     onSuccess: () => { toastManager.add({ title: t('已刷新', 'Refreshed'), type: 'success' }); invalidate() },
@@ -639,7 +647,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
-  return { rename, toggle, prio, limit, refresh, remove, cooldown }
+  return { rename, toggle, prio, limit, proxy, refresh, remove, cooldown }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
@@ -651,12 +659,13 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onUsage, onTest, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onProxy, onUsage, onTest, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onProxy: () => void
   onUsage: () => void
   onTest: () => void
   onRequestDelete: () => void
@@ -687,6 +696,10 @@ export function CredentialMenuContent({
       <MenuItem onClick={onDeviceLimit}>
         <SmartphoneIcon />
         {t('设备上限', 'Device limit')}
+      </MenuItem>
+      <MenuItem onClick={onProxy}>
+        <GlobeIcon />
+        {t('出站代理', 'Outbound proxy')}
       </MenuItem>
       <MenuItem onClick={onUsage}>
         <ScrollTextIcon />

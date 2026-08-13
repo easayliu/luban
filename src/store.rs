@@ -15,7 +15,7 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type";
+     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -902,6 +902,19 @@ impl CredentialStore {
     }
 
     /// 重命名（设置显示名）。
+    /// 设置/清除该凭证的专用出站代理。`None` 或空串写成 NULL（直连）。
+    ///
+    /// 入参必须是 [`crate::clients::validate_proxy`] 校验过的串——这里只负责存，
+    /// 校验放在入库之前那一层，免得存进去一条建不出客户端的代理，等到下次真有请求
+    /// 选中这个号才炸。
+    pub fn set_proxy(&self, id: i64, proxy: Option<&str>) -> Result<bool> {
+        let proxy = proxy.map(str::trim).filter(|s| !s.is_empty());
+        self.update_one(
+            "UPDATE credentials SET proxy = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, proxy],
+        )
+    }
+
     pub fn set_label(&self, id: i64, label: &str) -> Result<bool> {
         self.update_one(
             "UPDATE credentials SET label = ?2, updated_at = unixepoch() WHERE id = ?1",
@@ -2143,6 +2156,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // **必须补在重建之后**：上面那次重建按写死的列清单复制，加在它之前会被整列丢掉。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN resume_at INTEGER", []);
 
+    // 该账号专用的出站代理；NULL = 直连。**同样必须补在重建之后**，理由见上一条。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN proxy TEXT", []);
+
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
@@ -2301,6 +2317,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         account_uuid: row.get(12)?,
         resume_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
         org_type: row.get(14)?,
+        proxy: row.get(15)?,
     })
 }
 
@@ -2560,11 +2577,11 @@ enum TokenAttempt {
 /// 网络抖动/5xx 这类可重试错误**不**停用，原样抛出，让客户端重试时还落回同一个号。
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
-    http: &wreq::Client,
+    clients: &crate::clients::ClientPool,
     sel: Select<'_>,
 ) -> Result<(String, Credential)> {
     select_with_refresh_failover(store, sel, |cred| {
-        Box::pin(async move { ensure_fresh_token(store, http, &cred).await })
+        Box::pin(async move { ensure_fresh_token(store, clients, &cred).await })
     })
     .await
 }
@@ -2581,10 +2598,10 @@ pub async fn valid_access_token_for_device(
 /// 停用之后如实把原因抛出去即可。网络抖动/5xx 这类可重试错误照旧不停用。
 pub async fn access_token_of(
     store: &CredentialStore,
-    http: &wreq::Client,
+    clients: &crate::clients::ClientPool,
     cred: &Credential,
 ) -> Result<String> {
-    match ensure_fresh_token(store, http, cred).await? {
+    match ensure_fresh_token(store, clients, cred).await? {
         TokenAttempt::Ready(token) => Ok(token),
         TokenAttempt::Revoked(reason) => {
             tracing::warn!(
@@ -2661,7 +2678,7 @@ async fn select_with_refresh_failover<'a>(
 /// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
 async fn ensure_fresh_token(
     store: &CredentialStore,
-    http: &wreq::Client,
+    clients: &crate::clients::ClientPool,
     cred: &Credential,
 ) -> Result<TokenAttempt> {
     if !cred.needs_refresh() {
@@ -2681,6 +2698,10 @@ async fn ensure_fresh_token(
     }
 
     tracing::info!(cred_id = cred.id, cred = %cred.label, "credential entered the refresh window, refreshing token");
+    // 刷新也必须走这个号自己的代理：只把转发挂上代理、刷新走直连的话，每次 token 过期
+    // 都会有一次带真实 IP 的请求打到上游，而且那条路径的失败最不容易被注意到。
+    // 取的是双重检查之后那份 `cred`——等锁期间代理可能刚被改过。
+    let http = &clients.for_credential(&cred)?;
     let err = match crate::oauth::refresh(http, &cred.refresh_token).await {
         Ok(tokens) => {
             store.update_tokens(

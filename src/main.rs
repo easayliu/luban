@@ -5,6 +5,7 @@
 
 mod admin_ui;
 mod auth;
+mod clients;
 mod config;
 mod credentials;
 mod oauth;

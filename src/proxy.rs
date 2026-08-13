@@ -112,7 +112,7 @@ pub async fn handle(
     }
     let (token, cred) = match store::valid_access_token_for_device(
         &state.store,
-        &state.http,
+        &state.clients,
         select(device_id.as_deref(), billable, req_model.as_deref(), &[]),
     )
     .await
@@ -228,8 +228,22 @@ pub async fn handle(
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
         let target = if sim.is_some() && billable { ensure_beta_query(&url) } else { url.clone() };
+        // 这一轮用的是 `cred` 这个号，出站客户端就取它的：配了专用代理的号必须走它自己的
+        // 代理，否则真实出口 IP 会直接打到上游。取不出来（代理配错/建不出客户端）时如实
+        // 报 503，绝不退回直连——退回去正是这个号配代理要防的事。
+        let client = match state.clients.for_credential(&cred) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label, error = %format!("{e:#}"),
+                    "refusing to forward: this credential has a proxy configured but no usable client could be built"
+                );
+                return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+            }
+        };
         let upstream = Upstream {
-            state: &state,
+            _state: std::marker::PhantomData,
+            client,
             method: method.clone(),
             url: target,
             headers: out,
@@ -284,7 +298,7 @@ pub async fn handle(
         // 于是这台设备之后的请求直接落在新号上，不必每条都先撞一次 429。
         match store::valid_access_token_for_device(
             &state.store,
-            &state.http,
+            &state.clients,
             select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
         )
         .await
@@ -497,7 +511,12 @@ pub async fn handle(
 /// 有可能只是因为顺手换了别的东西，排查时会被带偏。把这些一次装好、两次共用，就不存在
 /// 「重建时漏了一项」的可能。
 struct Upstream<'a> {
-    state: &'a AppState,
+    /// 本次请求该用的出站客户端——**由选中的那个凭证决定**，配了专用代理的号走它自己的
+    /// 那一份。首发与换号重试各自重建 [`Upstream`]，所以换号时这里也跟着换，不会出现
+    /// 「用 A 号的代理发 B 号的 token」。见 [`crate::clients::ClientPool`]。
+    client: wreq::Client,
+    /// 只为把生命周期钉在 [`AppState`] 上（客户端已在 `client` 里取好）。
+    _state: std::marker::PhantomData<&'a AppState>,
     method: Method,
     url: String,
     /// [`build_forward_headers`] 的产物，逐次 clone 后发出。
@@ -555,8 +574,7 @@ impl Upstream<'_> {
     /// Host/User-Agent/Content-Length 钉在队尾」，也就是换 wreq 之前的形态）。
     async fn send(&self, body: Bytes) -> Result<wreq::Response, wreq::Error> {
         let req = self
-            .state
-            .http
+            .client
             .request(self.method.clone(), &self.url)
             .headers(self.headers.clone())
             .body(body);
@@ -1982,7 +2000,7 @@ fn merge_beta(incoming: Option<&str>) -> String {
 /// 客户端没带的头。唯一无条件执行的是注入 `Authorization`——实测那是上游唯一必需的改动。
 ///
 /// 注意 `fill_client_headers` 关掉后，若客户端自己也没带 `accept-encoding`，兜底会落到
-/// [`crate::web::upstream_client`] 的 `default_headers`（同为官方取值），不会退化成
+/// [`crate::clients::upstream_client`] 的 `default_headers`（同为官方取值），不会退化成
 /// tower-http 那个非官方的 `zstd,gzip,deflate,br`。
 ///
 /// 无法对齐的部分（头名大小写、hyper 自己追加的 `user-agent`/`host`/`content-length`）
@@ -4321,10 +4339,10 @@ pub async fn probe(
         // 本地却在 update_tokens 前被取消，旧 token 就作废且新 token 永久丢失。独立任务的
         // JoinHandle 即使因等待超时被丢弃，任务仍会继续跑完并落库；页面只是不再一直等它。
         let refresh_store = state.store.clone();
-        let refresh_http = state.http.clone();
+        let refresh_clients = state.clients.clone();
         let refresh_cred = cred.clone();
         let refresh = tokio::spawn(async move {
-            store::access_token_of(&refresh_store, &refresh_http, &refresh_cred).await
+            store::access_token_of(&refresh_store, &refresh_clients, &refresh_cred).await
         });
         match tokio::time::timeout_at(deadline, refresh).await {
             Ok(Ok(Ok(t))) => t,
@@ -4396,7 +4414,12 @@ pub async fn probe(
         out_ua: (out_ua != "-").then_some(out_ua),
     };
     let upstream = Upstream {
-        state,
+        _state: std::marker::PhantomData,
+        // 测试也走这个号自己的代理——不然「测通了」测的是直连那条路，与真实转发不是一回事。
+        client: match state.clients.for_credential(cred) {
+            Ok(c) => c,
+            Err(e) => return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}")),
+        },
         method: Method::POST,
         // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。
         url: ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL)),
@@ -5084,7 +5107,7 @@ mod tests {
         resp.extend_from_slice(&body);
 
         let (addr, server) = serve_once(resp);
-        let up = crate::web::upstream_client()
+        let up = crate::clients::upstream_client(None)
             .unwrap()
             .post(format!("http://{addr}/v1/messages"))
             .send()
@@ -5129,7 +5152,7 @@ mod tests {
         assert_eq!(s.model, None);
     }
 
-    /// 起个裸 TCP「上游」，用 [`crate::web::upstream_client`] 那份**真配置**打一发，
+    /// 起个裸 TCP「上游」，用 [`crate::clients::upstream_client`] 那份**真配置**打一发，
     /// 返回请求的原始字节（不做大小写归一化——这里正是要看拼写的）。
     async fn capture_wire(orig_case: bool) -> String {
         use std::io::{BufRead, BufReader, Write};
@@ -5155,7 +5178,7 @@ mod tests {
             raw
         });
 
-        let req = crate::web::upstream_client()
+        let req = crate::clients::upstream_client(None)
             .unwrap()
             .post(format!("http://{addr}/v1/messages?beta=true"))
             .headers(build_forward_headers(
@@ -5278,6 +5301,7 @@ mod tests {
             ban_reason: None,
             account_uuid: Some(ACCOUNT_UUID.into()),
             resume_at: None,
+            proxy: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -8099,7 +8123,7 @@ mod tests {
         .into_bytes();
         resp.extend_from_slice(sse.as_bytes());
         let (addr, server) = serve_once(resp);
-        let up = crate::web::upstream_client()
+        let up = crate::clients::upstream_client(None)
             .unwrap()
             .post(format!("http://{addr}/v1/messages"))
             .send()

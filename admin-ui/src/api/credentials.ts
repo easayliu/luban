@@ -79,6 +79,13 @@ export interface Credential {
   device_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
   ban_reason: string | null
+  /**
+   * 该账号专用的出站代理（`socks5://`/`http://` 等）；null 表示直连。
+   *
+   * 配了之后这个号的**全部**出站流量都走它——转发、token 刷新、profile、连通性测试。
+   * 后端不脱敏原样返回：串里可能带账号密码，但打了码就没法确认自己配的是哪一条。
+   */
+  proxy: string | null
   token_hint: string
   /** 最新一次的订阅额度快照；无请求记录时为 null。 */
   quota: Quota | null
@@ -306,6 +313,12 @@ export async function deleteCredentials(ids: number[]): Promise<Credential[]> {
 /** 重命名。 */
 export async function setLabel(id: number, label: string): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/label`, { label })
+  return data
+}
+
+/** 设置/清除该账号专用的出站代理；传 null 或空串改回直连。 */
+export async function setProxy(id: number, proxy: string | null): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/proxy`, { proxy })
   return data
 }
 

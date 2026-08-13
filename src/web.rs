@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::auth;
-use crate::config;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
@@ -33,7 +32,9 @@ const PKCE_MAX_PENDING: usize = 32;
 /// 服务共享状态。
 #[derive(Clone)]
 pub struct AppState {
-    pub http: wreq::Client,
+    /// 出站客户端池：不配代理的号共用直连那一份，配了代理的各有一份。
+    /// 见 [`crate::clients::ClientPool`]。
+    pub clients: std::sync::Arc<crate::clients::ClientPool>,
     /// 进行中的登录尝试：`state` → (PKCE 上下文, 创建时刻)。
     ///
     /// **按 state 索引而不是只留一份**：原先是个全局单槽，两个标签页（或两个人）同时点
@@ -58,35 +59,6 @@ pub struct AppState {
 
 type ApiError = (StatusCode, String);
 
-/// 构造发往上游的 HTTP 客户端，刻意贴近官方客户端的传输形态：
-/// - `http1_only`：官方客户端（Bun 自带的 HTTP 客户端）走 HTTP/1.1（抓包里有
-///   `Connection`/`Host`，h2 不会有这两个头）。默认会经 ALPN 协商 h2，留下 h2 的
-///   SETTINGS/伪头指纹；h2 还强制头名小写，逐头大小写也就无从谈起。
-/// - `user_agent`：给 luban 自身发起的账号级请求（token 刷新、profile）兜底；转发 `/v1/*`
-///   时来访客户端自己的 UA 会覆盖它。
-/// - `default_headers` 里的 `accept-encoding`：**必须显式钉住**。开了解压 feature 后，
-///   tower-http 的解压中间件会给「没带这个头」的请求补一个它自己的取值
-///   `zstd,gzip,deflate,br`（顺序与写法都不是官方客户端会产生的；换到 wreq 后这个行为照旧，
-///   预检里复现过）。转发 `/v1/*` 时 [`proxy::build_forward_headers`] 通常已保证该头存在，
-///   但 `fill_client_headers` 开关关掉、且来访客户端自己也没带时就轮到这里兜底；luban 自身
-///   发起的刷新/profile 请求同理。钉成官方值即可堵死：wreq 与 tower-http 都只填「缺失」的头。
-///
-/// 抽成函数是为了让 [`crate::proxy`] 的线上字节回归测试用到的是**这一份真配置**，
-/// 而不是测试里另抄一份。无法对齐的部分见 [`config::known_fingerprint_gaps`]。
-pub fn upstream_client() -> Result<wreq::Client> {
-    use axum::http::{HeaderMap, HeaderValue, header::ACCEPT_ENCODING};
-
-    let mut defaults = HeaderMap::new();
-    defaults.insert(ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
-
-    wreq::Client::builder()
-        .http1_only()
-        .user_agent(config::CC_USER_AGENT)
-        .default_headers(defaults)
-        .build()
-        .context("failed to build the upstream HTTP client")
-}
-
 /// 启动网页服务 + 转发代理，绑定 `host:port`，可选自动打开浏览器。
 pub async fn run(
     host: &str,
@@ -97,9 +69,9 @@ pub async fn run(
     admin_password: Option<String>,
 ) -> Result<()> {
     let client_key = api_key.map(Arc::new);
-    let http = upstream_client()?;
+    let clients = std::sync::Arc::new(crate::clients::ClientPool::new()?);
     let state = AppState {
-        http,
+        clients,
         pkce: Arc::new(parking_lot::Mutex::new(Vec::new())),
         store,
         client_key: client_key.clone(),
@@ -145,6 +117,7 @@ pub async fn run(
         .route("/credentials/{id}/disabled", post(set_disabled))
         .route("/credentials/{id}/priority", post(set_priority))
         .route("/credentials/{id}/label", post(set_label))
+        .route("/credentials/{id}/proxy", post(set_proxy))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
@@ -311,13 +284,13 @@ async fn exchange(
 
     // exchange_code 内部会再比一次 state。冗余是有意的：这里是「按 state 找挑战」，那里是
     // 「确认挑战与粘贴内容配套」，万一将来查找逻辑改错了，那道校验还在。
-    let tokens = oauth::exchange_code(&state.http, &pkce, &req.code)
+    let tokens = oauth::exchange_code(state.clients.direct(), &pkce, &req.code)
         .await
         .map_err(|e| bad_request(e.to_string()))?;
 
     // 拉取账号 profile 拿邮箱/姓名/等级（失败不阻断，用兜底）。不阻断不等于不留痕：
     // 悄悄吞掉的话，账号加进来标签是「账号 N」、等级空着，看不出是 profile 没拉到。
-    let profile = match oauth::fetch_profile(&state.http, &tokens.access_token).await {
+    let profile = match oauth::fetch_profile(state.clients.direct(), &tokens.access_token).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "add credential: fetching the account profile failed, falling back for label and tier");
@@ -681,22 +654,62 @@ async fn set_device_limit(
     view_of(&state, id)
 }
 
+#[derive(Deserialize)]
+struct SetProxyReq {
+    /// 代理 URL；`null` 或空串表示清除（改回直连）。
+    proxy: Option<String>,
+}
+
+/// 设置/清除某个账号专用的出站代理。
+///
+/// 配好之后这个号的**全部**出站流量都走它：转发、token 刷新、profile、连通性测试。
+/// 校验放在入库之前——存进去一条建不出客户端的代理，故障要等到下次真有请求选中这个号
+/// 才暴露，那时现场只剩一条「这个号所有请求都失败」。
+async fn set_proxy(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetProxyReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let proxy = match req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            Some(crate::clients::validate_proxy(raw).map_err(|e| bad_request(format!("{e:#}")))?)
+        }
+        None => None,
+    };
+    if !state.store.set_proxy(id, proxy.as_deref()).map_err(internal)? {
+        return Err(not_found());
+    }
+    // 丢掉旧代理那份缓存客户端，否则它的连接池还会继续把请求送去老代理——改完之后
+    // 「看着已经换了、实际还在走旧的」是这类缓存最典型的坑。
+    if let Some(old) = cred.proxy.as_deref() {
+        state.clients.forget(old);
+    }
+    tracing::info!(
+        cred_id = id, cred = %cred.label,
+        proxy = %proxy.as_deref().unwrap_or("<direct>"),
+        "credential proxy updated"
+    );
+    view_of(&state, id)
+}
+
 /// 手动刷新一条凭证的 token。
 async fn refresh_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
-    let tokens = oauth::refresh(&state.http, &cred.refresh_token)
-        .await
-        .map_err(|e| bad_request(e.to_string()))?;
+    // 手动刷新同样走这个号自己的代理；代理坏掉时如实报错，不退回直连（见 ClientPool）。
+    let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
+    let tokens =
+        oauth::refresh(&http, &cred.refresh_token).await.map_err(|e| bad_request(e.to_string()))?;
     state
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
         .map_err(internal)?;
     // 顺带刷新账号等级、回填账号 UUID（失败忽略，不影响 token 刷新结果）。忽略归忽略，
     // 三处失败都留一行——否则「刷新成功了但等级还是旧的」在日志里毫无痕迹。
-    match oauth::fetch_profile(&state.http, &tokens.access_token).await {
+    match oauth::fetch_profile(&http, &tokens.access_token).await {
         Ok(profile) => {
             if profile.tier.is_some()
                 && let Err(e) = state.store.set_tier(id, profile.tier.as_deref())
@@ -1167,6 +1180,9 @@ struct CredentialView {
     device_count: i64,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用。
     ban_reason: Option<String>,
+    /// 该账号专用的出站代理；`None` 表示直连。**原样返回、不脱敏**：代理串里可能带账号密码，
+    /// 但这是个已经过管理鉴权的接口，而把它打码会让人没法确认自己配的到底是哪一条。
+    proxy: Option<String>,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
     /// 最新一次的订阅额度快照（无请求记录时为 None）。
@@ -1219,6 +1235,7 @@ impl CredentialView {
             ),
             device_count,
             ban_reason: c.ban_reason.clone(),
+            proxy: c.proxy.clone(),
             token_hint: mask_token(&c.refresh_token),
             quota: None,
             last_used: None,

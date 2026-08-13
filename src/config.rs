@@ -91,7 +91,7 @@ pub const CC_USER_AGENT: &str = "claude-cli/2.1.220 (external, cli)";
 /// 当时误判的根源是拿抓包当证据——那份抓包的 SSE 响应体是空的（导出没存流式 body），
 /// 只凭「没看到 `content-encoding`」就断定上游不压 SSE，属于把证据缺失当证据。
 ///
-/// 该头也被钉进 [`crate::web::upstream_client`] 的 `default_headers`，
+/// 该头也被钉进 [`crate::clients::upstream_client`] 的 `default_headers`，
 /// 免得 luban 自身的刷新/profile 请求被解压中间件补上一个非官方取值。
 pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 

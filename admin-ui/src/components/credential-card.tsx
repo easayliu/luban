@@ -37,6 +37,7 @@ import {
   type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
+import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, badgeVariants } from '@/components/ui/badge'
@@ -83,6 +84,7 @@ export function CredentialCard({
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(cred.label)
   const [devicesOpen, setDevicesOpen] = useState(false)
+  const [proxyOpen, setProxyOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -264,6 +266,7 @@ export function CredentialCard({
                     setEditing(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
@@ -443,6 +446,12 @@ export function CredentialCard({
           </div>
         </CardFooter>
 
+        <CredentialProxyDialog
+          cred={cred}
+          open={proxyOpen}
+          onOpenChange={setProxyOpen}
+          proxy={actions.proxy}
+        />
         <CredentialDevicesDialog
           cred={cred}
           open={devicesOpen}

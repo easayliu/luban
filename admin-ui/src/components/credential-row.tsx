@@ -8,6 +8,7 @@ import {
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
+import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
@@ -171,6 +172,7 @@ export function CredentialRow({
 }) {
   const { t, language } = useI18n()
   const [devicesOpen, setDevicesOpen] = useState(false)
+  const [proxyOpen, setProxyOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
@@ -227,6 +229,7 @@ export function CredentialRow({
                     setRenameOpen(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
@@ -394,6 +397,7 @@ export function CredentialRow({
               setRenameOpen(true)
             }}
             onDeviceLimit={() => setDevicesOpen(true)}
+                  onProxy={() => setProxyOpen(true)}
             onUsage={() => setUsageOpen(true)}
             onTest={() => setTesting(true)}
             onRequestDelete={() => setConfirmDelete(true)}
@@ -422,6 +426,12 @@ export function CredentialRow({
         open={renameOpen}
         onOpenChange={setRenameOpen}
       />
+      <CredentialProxyDialog
+        cred={cred}
+        open={proxyOpen}
+        onOpenChange={setProxyOpen}
+        proxy={actions.proxy}
+      />
       <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
     </>
   )
@@ -432,6 +442,7 @@ function CredentialRowActionsMenu({
   actions,
   onRename,
   onDeviceLimit,
+  onProxy,
   onUsage,
   onTest,
   onRequestDelete,
@@ -440,6 +451,7 @@ function CredentialRowActionsMenu({
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onProxy: () => void
   onUsage: () => void
   onTest: () => void
   onRequestDelete: () => void
@@ -460,6 +472,7 @@ function CredentialRowActionsMenu({
         actions={actions}
         onRename={onRename}
         onDeviceLimit={onDeviceLimit}
+        onProxy={onProxy}
         onUsage={onUsage}
         onTest={onTest}
         onRequestDelete={onRequestDelete}

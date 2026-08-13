@@ -42,6 +42,13 @@ pub struct Credential {
     /// 连通性测试通过也只会自动启用 `resume_at` 非空的号——人工关掉的不该被一次测试打开。
     /// 见 [`crate::store::CredentialStore::pause_for_rate_limit`]。
     pub resume_at: Option<u64>,
+    /// 该账号专用的出站代理（`socks5://`/`socks5h://`/`http://` 等）；`None` 或空串表示直连。
+    ///
+    /// 配了之后这个号的**全部**出站流量都走它——转发、token 刷新、profile、连通性测试。
+    /// 漏掉任何一条都会让那条请求带着真实出口 IP 打到上游，逐账号隔离当场失效，
+    /// 且日志上看不出来。故取客户端只有 [`crate::clients::ClientPool::for_credential`]
+    /// 一个入口，且建不出客户端时报错而不是退回直连。
+    pub proxy: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
