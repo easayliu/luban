@@ -1586,6 +1586,8 @@ const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
 /// 用量日志流水的保留时长：30 天。必须显著大于最长的统计窗口（7 天），
 /// 否则窗口内的流水会被裁掉、cost_7d 平白变小；30 天同时给请求日志页留够翻看余量。
 const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// RPM（每分钟请求数）的统计窗口：最近 60 秒。
+const RPM_WINDOW_SECS: i64 = 60;
 
 impl CredentialStore {
     /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
@@ -1677,6 +1679,46 @@ impl CredentialStore {
             out.insert(cid, q);
         }
         Ok(out)
+    }
+
+    /// 每个凭证最近 60 秒的请求数，即当前 RPM（cred_id → 条数）。窗口内没有请求的凭证
+    /// **不出现**在结果里，调用方按 0 处理。
+    ///
+    /// 口径与 `requests_5h`/`requests_7d` 完全一致——数的是 `usage_logs` 的流水条数，
+    /// 也就是真正发给上游的请求，失败的（4xx/5xx）同样计入，只是窗口固定为 60 秒。
+    ///
+    /// **刻意不复用 [`BareRateWindow`] 那个内存计数器**：它只数无 `metadata.user_id` 的
+    /// 裸请求（带设备身份的一条都不进），且重启即清零，拿来当 RPM 会系统性地偏小。
+    /// 而 60 秒的流水靠 `idx_usage_logs_ts` 只扫一小段范围，比那把锁贵不了多少。
+    pub fn recent_rpm(&self) -> Result<HashMap<i64, i64>> {
+        let conn = self.conn.lock();
+        // 时间下界用 SQLite 的时钟，与写入侧（insert_usage_log_at）同源：两边若各取各的
+        // 时钟，机器时间稍有偏差就会把刚写进去的那几条数丢或多数。
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, COUNT(*) FROM usage_logs
+              WHERE ts >= unixepoch() - ?1 AND cred_id IS NOT NULL
+              GROUP BY cred_id",
+        )?;
+        let rows =
+            stmt.query_map([RPM_WINDOW_SECS], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, n) = row?;
+            out.insert(cid, n);
+        }
+        Ok(out)
+    }
+
+    /// 单个凭证当前的 RPM；口径同 [`Self::recent_rpm`]，无请求时为 0。
+    pub fn recent_rpm_of(&self, cred_id: i64) -> Result<i64> {
+        let conn = self.conn.lock();
+        // 这条走 idx_usage_logs_cred_ts，直接定位到 (cred_id, 最近 60 秒) 那一小段。
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM usage_logs WHERE cred_id = ?1 AND ts >= unixepoch() - ?2",
+            params![cred_id, RPM_WINDOW_SECS],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// 每个凭证最近一次被使用（有转发记录）的时间（cred_id → Unix 秒）。读账本，
@@ -4048,6 +4090,39 @@ mod tests {
         assert_eq!(store.latest_quota(a).unwrap().unwrap().cost_5h, qa.cost_5h);
         assert_eq!(store.latest_quota(a).unwrap().unwrap().ts, qa.ts);
         assert!(store.latest_quota(999).unwrap().is_none(), "不存在的账号应为 None");
+    }
+
+    /// RPM 只数最近 60 秒，且不跨账号；窗口外的老流水与从未发过请求的号都不得混进来。
+    ///
+    /// 时间基准取的是库里的 `unixepoch()`（与写入侧同源），所以这条用例也顺带钉住
+    /// 「两边同一个时钟」：若哪天读侧改用 Rust 的系统时间，边界上的行就会时有时无。
+    #[test]
+    fn recent_rpm_counts_only_the_last_minute() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+        let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+        let hit = |cred_id, ts| {
+            let rec = UsageRecord { cred_id: Some(cred_id), ..Default::default() };
+            store.insert_usage_log_at(&rec, Some(ts)).unwrap();
+        };
+        hit(a, now);
+        hit(a, now - 30);
+        hit(a, now - 120); // 窗口外
+        hit(b, now - 5);
+
+        let rpm = store.recent_rpm().unwrap();
+        assert_eq!(rpm.get(&a).copied(), Some(2), "两分钟前那条不在 60 秒窗口内");
+        assert_eq!(rpm.get(&b).copied(), Some(1), "RPM 不得跨账号串");
+        assert_eq!(store.recent_rpm_of(a).unwrap(), 2, "单账号入口须与批量口径一致");
+        assert_eq!(store.recent_rpm_of(b).unwrap(), 1);
+
+        // 从未发过请求的号压根不进 map（调用方按 0 处理），单账号入口直接给 0。
+        let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap().id;
+        assert_eq!(store.recent_rpm().unwrap().get(&c), None);
+        assert_eq!(store.recent_rpm_of(c).unwrap(), 0);
     }
 
     /// 只有一个窗口带 `reset` 时，窗口统计不得被连接条件的下界误伤成 0。

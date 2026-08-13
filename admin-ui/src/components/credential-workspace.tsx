@@ -144,6 +144,7 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   usage5h: ['5h 使用率', '5h usage'],
   usage7d: ['7d 使用率', '7d usage'],
   devices: ['设备数', 'Devices'],
+  rpm: ['当前 RPM', 'Current RPM'],
   cost: ['累计花费', 'Total cost'],
   recent: ['最近使用', 'Last used'],
   created: ['添加时间', 'Date added'],

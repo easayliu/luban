@@ -477,7 +477,7 @@ export function isAbnormal(cred: Credential): boolean {
 
 export type SortKey =
   | 'priority' | 'status' | 'name' | 'tier'
-  | 'usage5h' | 'usage7d' | 'devices' | 'cost' | 'recent' | 'created'
+  | 'usage5h' | 'usage7d' | 'devices' | 'cost' | 'recent' | 'created' | 'rpm'
 
 export type SortDir = 'asc' | 'desc'
 
@@ -490,6 +490,7 @@ export const SORTS: { key: SortKey; label: string }[] = [
   { key: 'usage5h', label: '5h 使用率' },
   { key: 'usage7d', label: '7d 使用率' },
   { key: 'devices', label: '设备数' },
+  { key: 'rpm', label: '当前 RPM' },
   { key: 'cost', label: '累计花费' },
   { key: 'recent', label: '最近使用' },
   { key: 'created', label: '添加时间' },
@@ -510,6 +511,7 @@ export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
   usage5h: 'desc',
   usage7d: 'desc',
   devices: 'desc',
+  rpm: 'desc',
   cost: 'desc',
   recent: 'desc',
   created: 'desc',
@@ -541,6 +543,8 @@ function sortValue(key: SortKey, credential: Credential, now: number): number | 
       return quotaRiskMeta(credential, now).d7.percentage ?? -1
     case 'devices':
       return credential.device_count
+    case 'rpm':
+      return credential.rpm ?? 0
     case 'cost':
       return credential.cost_total ?? 0
     case 'recent':

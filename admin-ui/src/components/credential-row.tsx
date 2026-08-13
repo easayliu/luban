@@ -68,6 +68,7 @@ const COL = {
   quota5h: 'w-32',
   quota7d: 'w-32',
   devices: 'w-32',
+  rpm: 'w-20',
   recent: 'w-24',
   cost: 'w-24',
   action: 'w-10',
@@ -143,6 +144,9 @@ export function CredentialListHeader({
         <TableHead className={COL.devices} {...sortProps('devices')}>
           {sortable(t('设备', 'Devices'), 'devices')}
         </TableHead>
+        <TableHead className={COL.rpm} {...sortProps('rpm')}>
+          {sortable(t('RPM', 'RPM'), 'rpm')}
+        </TableHead>
         <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
@@ -191,7 +195,7 @@ export function CredentialRow({
   return (
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
-        <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
+        <TableCell colSpan={12} className="w-full max-w-0 whitespace-normal p-0">
           <article className="min-w-0 space-y-3 p-3 sm:space-y-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
@@ -283,6 +287,17 @@ export function CredentialRow({
                 >
                   <span className="tabular-nums">{cred.device_count}/{effectiveLimit} · {policy.label}</span>
                 </Button>
+              </MobileFact>
+              <MobileFact label={t('当前 RPM', 'Current RPM')}>
+                <span
+                  className="tabular-nums"
+                  title={t(
+                    '最近 60 秒经这个账号转发的请求数（含失败的）',
+                    'Requests forwarded through this account in the last 60 seconds (failures included)',
+                  )}
+                >
+                  {cred.rpm > 0 ? cred.rpm : '—'}
+                </span>
               </MobileFact>
             </dl>
           </article>
@@ -379,6 +394,18 @@ export function CredentialRow({
             <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
             <Badge variant={policy.variant} size="sm">{policy.label}</Badge>
           </Button>
+        </TableCell>
+        <TableCell className={COL.rpm}>
+          {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。 */}
+          <span
+            className={cn('tabular-nums text-sm', cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground')}
+            title={t(
+              '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+              'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+            )}
+          >
+            {cred.rpm > 0 ? cred.rpm : '—'}
+          </span>
         </TableCell>
         <TableCell className={COL.recent}>
           {cred.last_used != null ? relativeTime(cred.last_used, now, language) : t('未使用', 'Never used')}

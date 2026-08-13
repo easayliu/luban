@@ -426,6 +426,7 @@ async fn list_credentials(
     let quotas = state.store.latest_quotas().map_err(internal)?;
     let last_used = state.store.last_used().map_err(internal)?;
     let costs = state.store.cost_by_cred().map_err(internal)?;
+    let rpm = state.store.recent_rpm().map_err(internal)?;
     let default_limit = state.store.default_device_limit();
     let views = list
         .iter()
@@ -439,6 +440,8 @@ async fn list_credentials(
                     quotas.get(&c.id).cloned(),
                     last_used.get(&c.id).copied(),
                     costs.get(&c.id).copied().unwrap_or(0.0),
+                    // 窗口内一条流水都没有的账号不在 map 里，就是 0 RPM。
+                    rpm.get(&c.id).copied().unwrap_or(0),
                 )
         })
         .collect();
@@ -787,6 +790,7 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let quota = state.store.latest_quota(id).map_err(internal)?;
     let last_used = state.store.last_used_at(id).map_err(internal)?;
     let cost_total = state.store.cost_of(id).map_err(internal)?;
+    let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
     let default_limit = state.store.default_device_limit();
     Ok(Json(
         CredentialView::new(&cred, count, default_limit)
@@ -794,7 +798,7 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
             )
-            .with_stats(quota, last_used, cost_total),
+            .with_stats(quota, last_used, cost_total, rpm),
     ))
 }
 
@@ -1191,6 +1195,11 @@ struct CredentialView {
     last_used: Option<i64>,
     /// 累计等价 API 费用（USD）。
     cost_total: f64,
+    /// 当前 RPM：最近 60 秒经该账号转发的请求数（见 [`store::CredentialStore::recent_rpm`]）。
+    ///
+    /// 与 `quota.requests_5h/7d` 不同，它不依赖上游限流头——那两个要等一条带头的响应才刷新，
+    /// 且窗口起点由 `reset` 反推，看不出「此刻压了多少」。
+    rpm: i64,
     /// **账号级**进程内冷却的剩余秒数；`0` 表示不在冷却中。
     ///
     /// 正常路径上这一项几乎恒为 0：账号级 429 走的是落库的 `resume_at`（见下），只有落库
@@ -1240,6 +1249,7 @@ impl CredentialView {
             quota: None,
             last_used: None,
             cost_total: 0.0,
+            rpm: 0,
             rate_limited_secs: 0,
             rate_limited_models: Vec::new(),
             resume_at: c.resume_at,
@@ -1254,16 +1264,18 @@ impl CredentialView {
         self
     }
 
-    /// 链式附加额度快照、最近使用时间与累计费用。
+    /// 链式附加额度快照、最近使用时间、累计费用与当前 RPM。
     fn with_stats(
         mut self,
         quota: Option<store::QuotaSnapshot>,
         last_used: Option<i64>,
         cost_total: f64,
+        rpm: i64,
     ) -> Self {
         self.quota = quota;
         self.last_used = last_used;
         self.cost_total = cost_total;
+        self.rpm = rpm;
         self
     }
 }

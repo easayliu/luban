@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  ActivityIcon,
   CalendarDaysIcon,
   CheckIcon,
   ClockIcon,
@@ -433,6 +434,24 @@ export function CredentialCard({
               <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
               <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
             </span>
+            {/* 只在有流量时出现：闲置号上一个恒为 0 的 RPM 只是噪声，还会挤掉本就紧张的页脚宽度。 */}
+            {cred.rpm > 0 && (
+              <>
+                <Separator orientation="vertical" className="h-5" />
+                <span
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
+                  title={t(
+                    '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+                    'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+                  )}
+                >
+                  <ActivityIcon className="size-4 text-muted-foreground" aria-hidden />
+                  <span className="sr-only">{t('当前 RPM', 'Current RPM')}</span>
+                  <span className="font-medium tabular-nums">{cred.rpm}</span>
+                  <span className="text-muted-foreground text-xs">RPM</span>
+                </span>
+              </>
+            )}
           </div>
           <div className="flex items-center gap-2">
             {toggle.isPending && <Spinner />}
