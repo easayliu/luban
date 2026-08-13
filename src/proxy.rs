@@ -74,9 +74,32 @@ pub async fn handle(
         tracing::debug!(%method, path = %path_and_query, billable, "allowing a request with no device identity");
     }
 
-    // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
-    // 请求的模型名：冷却按「账号 + 模型」分格，fable 那类模型级 429 不该拖累整个账号。
+    // 请求的模型名：下面两处都要用它——本地形态拦截按模型索引，选号的冷却也按
+    // 「账号 + 模型」分格（fable 那类模型级 429 不该拖累整个账号）。
     let req_model = request_model(body_json.as_ref());
+
+    // 2.3) 上游已经拒过一次的「模型 + 请求里的某个取值」组合（`effort: 'xhigh'`、
+    //      `role: 'system'` 之类）→ 本地直接拒，不往上游送。这是纯粹的请求形态错误：
+    //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
+    //      账号状态无关的 4xx。规则不是写死的，是上游那条 400 自己喂出来的，回给客户端的
+    //      也是它当初那句原话，见 [`remember_shape_rejection`]。
+    if let Some((field, value, message)) =
+        known_shape_rejection(&state.shape_rejections, req_model.as_deref(), body_json.as_ref())
+    {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), %field, %value,
+            "rejected locally: upstream has already rejected this request shape"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            error_body("invalid_request_error", &message),
+        )
+            .into_response();
+    }
+
+    // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
     // 免得两处的 device_id/model 哪天漂开。
     fn select<'a>(
@@ -375,6 +398,17 @@ pub async fn handle(
                                 error_type = %etype.as_deref().unwrap_or("-"),
                                 message = %message.chars().take(500).collect::<String>(),
                                 "upstream returned 4xx"
+                            );
+                        }
+                        // 上游这条 400 如果点名了请求里的某个取值（`effort level 'xhigh'`、
+                        // `role 'system'`），记下来：下次同款组合在本地就拒了，不再白发一次。
+                        // 见 [`known_shape_rejection`]。
+                        if !compressed && status == StatusCode::BAD_REQUEST {
+                            remember_shape_rejection(
+                                &state.shape_rejections,
+                                req_model.as_deref(),
+                                body_json.as_ref(),
+                                &bytes,
                             );
                         }
                         // 上游把这条请求判成了第三方应用（额度改扣超额池）。这类 400 光看
@@ -2512,6 +2546,144 @@ fn request_model(body: Option<&serde_json::Value>) -> Option<String> {
 /// `anthropic-beta: fast-mode-*`）。解析失败或没有该字段时返回 `None`。
 fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("speed")?.as_str()?.to_string())
+}
+
+/// 请求里那些「上游一旦不认，就会在报错里逐字点名」的取值。
+///
+/// 两条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
+/// ```text
+/// This model does not support effort level 'xhigh'. Supported levels: high, low, max, medium.
+/// role 'system' is not supported on this model
+/// ```
+/// 共同形态是「字段名 + `'取值'`」。故判据取这两半的**共现**：报错里既出现该字段的名字，
+/// 又逐字引用了这次请求里的那个取值——满足才认定「是这个取值把请求打死的」，见
+/// [`remember_shape_rejection`]。单看字段名会误伤（`max_tokens` 那类报错也提字段名），
+/// 单看引号里的串则可能撞上正文里的巧合。
+struct ShapeProbe {
+    /// 记忆表里的字段标签，同时用于日志。
+    field: &'static str,
+    /// 报错文案里必须出现的字段名（小写比对）。
+    keyword: &'static str,
+    /// 从请求体里取出该字段的全部取值（去重后）。
+    values: fn(&serde_json::Value) -> Vec<String>,
+}
+
+/// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取」，学习与拦截两侧
+/// 都不必改——它们只跟这张表打交道。
+const SHAPE_PROBES: &[ShapeProbe] = &[
+    ShapeProbe { field: "effort", keyword: "effort", values: effort_values },
+    ShapeProbe { field: "role", keyword: "role", values: role_values },
+];
+
+/// `output_config.effort`（`"high"`/`"xhigh"` 等），没有则为空。
+fn effort_values(body: &serde_json::Value) -> Vec<String> {
+    match body.get("output_config").and_then(|c| c.get("effort")).and_then(|v| v.as_str()) {
+        Some(s) => vec![s.to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// `messages[].role` 里出现过的取值，去重。
+///
+/// **`user`/`assistant` 不参与**：官方永远不会点名这两个，留着只是白比对，还平添了
+/// 「报错正文里恰好出现 `'user'` 就把整个模型的普通请求全拦下」的误伤面。
+fn role_values(body: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else { return out };
+    for role in msgs.iter().filter_map(|m| m.get("role")?.as_str()) {
+        if !matches!(role, "user" | "assistant") && !out.iter().any(|v| v == role) {
+            out.push(role.to_string());
+        }
+    }
+    out
+}
+
+/// 上游拒过的「模型 + 字段 + 取值」组合 → 上游那句原话（原样留着回放）。
+type ShapeRejections = std::collections::HashMap<(String, &'static str, String), String>;
+
+/// [`ShapeRejections`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
+///
+/// **只在进程内活着，不落库**：这是从上游报错里学来的推断，重启后重新学一遍的代价不过是
+/// 一次 400；反过来，把一条学错/过期的规则持久化下去，就成了「本地永久拒掉一个其实已经
+/// 支持的取值」——那才是查不出来的故障。
+pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
+
+/// 记忆表的容量上限。每个「模型 + 字段 + 没见过的取值」占一格，而取值来自来访请求，
+/// 也就是说这张表的增长是外部可控的——封顶后不再插入（既有条目照常生效）。
+const SHAPE_MEMORY_CAP: usize = 512;
+
+/// 上游用一条 400 点名了请求里的某个取值 → 记进 [`ShapeMemory`]，之后同款组合由
+/// [`known_shape_rejection`] 在本地拦下，不再往上游送。
+///
+/// 记忆按**请求里写的那个模型名**索引（别名与全名各算一格）：客户端每次发的是同一串，
+/// 拿它当键既够用，又不会把某个模型学到的结论套到别的模型头上。
+fn remember_shape_rejection(
+    mem: &ShapeMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+    err: &[u8],
+) {
+    // 认不出模型名、或请求体不是 JSON：这条 400 照常透传给客户端，只是学不到东西。
+    let (Some(model), Some(body)) = (model, body) else { return };
+    let (_, message) = parse_upstream_error(err);
+    let hay = message.to_lowercase();
+    for probe in SHAPE_PROBES {
+        if !hay.contains(probe.keyword) {
+            continue;
+        }
+        for value in (probe.values)(body) {
+            // 上游必须**逐字引用**这次请求里的那个取值，才算认定是它的锅。
+            if !message.contains(&format!("'{value}'")) {
+                continue;
+            }
+            let mut table = mem.write();
+            let key = (model.to_string(), probe.field, value.clone());
+            if table.contains_key(&key) || table.len() >= SHAPE_MEMORY_CAP {
+                continue;
+            }
+            table.insert(key, message.clone());
+            tracing::info!(
+                model = %model,
+                field = %probe.field,
+                value = %value,
+                "learned a request-shape rejection; the same combination will be rejected locally from now on"
+            );
+        }
+    }
+}
+
+/// 这条请求里有没有**已知**会被该模型拒掉的取值；有则给出上游当初那句原话。
+///
+/// 只有「同一个模型、同一个字段、同一个取值确实被上游拒过一次」才返回 `Some`。没学过的
+/// 组合一律照常往上游发——这张表只用来挡住确定无疑的重复失败，绝不替上游做没有依据的判断。
+fn known_shape_rejection(
+    mem: &ShapeMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<(&'static str, String, String)> {
+    let (model, body) = (model?, body?);
+    let table = mem.read();
+    if table.is_empty() {
+        return None;
+    }
+    SHAPE_PROBES.iter().find_map(|probe| {
+        (probe.values)(body).into_iter().find_map(|value| {
+            let message = table.get(&(model.to_string(), probe.field, value.clone()))?;
+            Some((probe.field, value, message.clone()))
+        })
+    })
+}
+
+/// 按 Anthropic 的错误体形态打一份 JSON（`{"type":"error","error":{...}}`）。
+///
+/// 本地拒绝也要长成上游那副样子，客户端才认得——它只会去读 `error.message`。
+/// **不带 `request_id`**：这次请求根本没出去，编一个只会把人引去查一条不存在的记录。
+fn error_body(etype: &str, message: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "error",
+        "error": {"type": etype, "message": message},
+    }))
+    .unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec())
 }
 
 /// 来访有没有要流式响应（顶层 `stream:true`）。
@@ -5825,6 +5997,135 @@ mod tests {
         assert_eq!(request_speed(without.as_ref()), None);
         assert_eq!(parse("not json"), None, "非法 JSON 在解析那步就是 None");
         assert_eq!(request_speed(None), None);
+    }
+
+    /// 两条实测的形态类 400 原文（逐字），见 [`super::ShapeProbe`]。
+    const EFFORT_400: &str = "This model does not support effort level 'xhigh'. \
+                              Supported levels: high, low, max, medium.";
+    const ROLE_400: &str = "role 'system' is not supported on this model";
+
+    fn err_json(message: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        }))
+        .unwrap()
+    }
+
+    fn json_body(s: &str) -> Option<serde_json::Value> {
+        serde_json::from_str(s).ok()
+    }
+
+    /// 请求体：带 effort 档位。
+    fn effort_req(model: &str, effort: &str) -> Option<serde_json::Value> {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"output_config":{{"effort":"{effort}"}}}}"#
+        ))
+    }
+
+    /// 请求体：`messages` 里混了个 `role: system`（litellm 那类客户端会这么发）。
+    fn role_req(model: &str, role: &str) -> Option<serde_json::Value> {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"{role}","content":"you are…"}},{{"role":"user","content":"hi"}}]}}"#
+        ))
+    }
+
+    /// 学一次之后，同款「模型 + 取值」在本地就被拦下，回给客户端的是上游那句原话。
+    /// 两类样本走的是同一套机制，故一并验。
+    #[test]
+    fn rejects_a_learned_request_shape_locally() {
+        let mem = super::ShapeMemory::default();
+        let hit = |body: &Option<serde_json::Value>, model: &str| {
+            super::known_shape_rejection(&mem, Some(model), body.as_ref())
+        };
+
+        // 学之前一律放行：这张表只挡确定无疑的重复失败，不替上游做没有依据的判断。
+        assert!(hit(&effort_req("claude-sonnet-5", "xhigh"), "claude-sonnet-5").is_none());
+        assert!(hit(&role_req("claude-opus-4-6", "system"), "claude-opus-4-6").is_none());
+
+        let learn = |model: &str, body: &Option<serde_json::Value>, msg: &str| {
+            super::remember_shape_rejection(&mem, Some(model), body.as_ref(), &err_json(msg));
+        };
+        learn("claude-sonnet-5", &effort_req("claude-sonnet-5", "xhigh"), EFFORT_400);
+        learn("claude-opus-4-6", &role_req("claude-opus-4-6", "system"), ROLE_400);
+
+        let (field, value, message) =
+            hit(&effort_req("claude-sonnet-5", "xhigh"), "claude-sonnet-5").expect("该被拦下");
+        assert_eq!((field, value.as_str()), ("effort", "xhigh"));
+        assert_eq!(message, EFFORT_400, "回放上游那句原话，不自己造文案");
+
+        let (field, value, message) =
+            hit(&role_req("claude-opus-4-6", "system"), "claude-opus-4-6").expect("该被拦下");
+        assert_eq!((field, value.as_str()), ("role", "system"));
+        assert_eq!(message, ROLE_400);
+
+        // 结论只对「学过的那个模型 + 那个取值」成立，不外溢。
+        assert!(hit(&effort_req("claude-sonnet-5", "high"), "claude-sonnet-5").is_none());
+        assert!(hit(&effort_req("claude-opus-5", "xhigh"), "claude-opus-5").is_none());
+        assert!(hit(&role_req("claude-opus-4-6", "developer"), "claude-opus-4-6").is_none());
+        assert!(hit(&role_req("claude-sonnet-5", "system"), "claude-sonnet-5").is_none());
+        // 普通请求（只有 user/assistant、没写 effort）永远不进这张表的判定。
+        assert!(hit(&role_req("claude-opus-4-6", "user"), "claude-opus-4-6").is_none());
+    }
+
+    /// 不该学的几种 400：报错没提这个字段、提了字段但没逐字引用这次的取值、
+    /// 以及认不出模型名。判据是「字段名 + `'取值'` 共现」，缺一不记——记错的代价是
+    /// 本地把好请求拒了，比多发一次上游请求严重得多。
+    #[test]
+    fn learns_nothing_when_the_error_does_not_name_the_value() {
+        let cases: &[(&str, &str)] = &[
+            // 与形态无关的 400。
+            ("claude-sonnet-5", "max_tokens: 200000 > 64000, which is the maximum allowed"),
+            // 提了字段名，但引的是别的取值（这次发的是 xhigh）。
+            ("claude-sonnet-5", "This model does not support effort level 'ultra'."),
+            // 引到了取值，但通篇没提这个字段名。
+            ("claude-sonnet-5", "unexpected value 'xhigh' somewhere else entirely"),
+        ];
+        for (model, msg) in cases {
+            let mem = super::ShapeMemory::default();
+            let body = effort_req(model, "xhigh");
+            super::remember_shape_rejection(&mem, Some(model), body.as_ref(), &err_json(msg));
+            assert!(mem.read().is_empty(), "不该学: {msg}");
+            assert!(super::known_shape_rejection(&mem, Some(model), body.as_ref()).is_none());
+        }
+
+        // 认不出模型名 → 学不到东西（这条 400 照常透传，只是记不下来）。
+        let mem = super::ShapeMemory::default();
+        let body = effort_req("claude-sonnet-5", "xhigh");
+        super::remember_shape_rejection(&mem, None, body.as_ref(), &err_json(EFFORT_400));
+        assert!(mem.read().is_empty());
+    }
+
+    /// 记忆表封顶后不再插入：取值来自来访请求，增长是外部可控的。
+    #[test]
+    fn shape_memory_is_capped() {
+        let mem = super::ShapeMemory::default();
+        for i in 0..super::SHAPE_MEMORY_CAP + 10 {
+            let role = format!("r{i}");
+            let body = role_req("claude-opus-4-6", &role);
+            let msg = format!("role '{role}' is not supported on this model");
+            super::remember_shape_rejection(
+                &mem,
+                Some("claude-opus-4-6"),
+                body.as_ref(),
+                &err_json(&msg),
+            );
+        }
+        assert_eq!(mem.read().len(), super::SHAPE_MEMORY_CAP);
+    }
+
+    /// 本地拒绝回出去的那份体，形态与上游的错误体一致（客户端只读 `error.message`），
+    /// 且不编造 `request_id`——这次请求根本没出去。
+    #[test]
+    fn local_error_body_matches_the_upstream_shape() {
+        let raw = super::error_body("invalid_request_error", ROLE_400);
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], ROLE_400);
+        assert!(v.get("request_id").is_none());
+        // 上游那份也能被 parse_upstream_error 原样读回来，两侧口径一致。
+        assert_eq!(super::parse_upstream_error(&raw).1, ROLE_400);
     }
 
     /// 上游 SSE 的 `usage.speed` 会被嗅探到——这是计费的权威来源（fast 被限流会回落）。

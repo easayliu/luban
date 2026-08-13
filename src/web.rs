@@ -50,6 +50,10 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
+    /// 上游拒过的请求形态记忆表：进程内累积，用来在本地拦掉上游已经拒过一次的
+    /// 「模型 + 取值」组合（`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。
+    /// 见 [`crate::proxy::ShapeMemory`]。
+    pub shape_rejections: crate::proxy::ShapeMemory,
 }
 
 type ApiError = (StatusCode, String);
@@ -100,6 +104,7 @@ pub async fn run(
         store,
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
+        shape_rejections: Arc::default(),
     };
 
     // 每天裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
