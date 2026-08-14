@@ -33,6 +33,13 @@ pub struct CredentialStore {
     /// 与 [`Self::bare_rate`] 用同一种计数器、但**各算各的**：那个只卡没有设备身份的流量，
     /// 这个卡该账号的全部转发。两者都配了的话一条裸请求要同时过两道窗口。
     rpm_rate: RateWindow,
+    /// 每**设备** RPM 的限流窗口（进程内，窗口同 [`RPM_WINDOW_SECS`]），
+    /// 见 [`CredentialStore::take_device_rpm_slot`]。
+    ///
+    /// 键是客户端自报的 `device_id`（不是伪装后那个：要限的是发请求的那台机器）。上面两个
+    /// 窗口都按账号分桶，管的是「一个号别被打爆」；这个按设备分桶，管的是「一台机器别把
+    /// 同账号下其他设备的额度挤没」——账号 RPM 打满时，安分的设备和刷疯了的那台一起被拒。
+    device_rate: RateWindow<String>,
     /// 被上游 429 过的凭证的冷却表（进程内），见 [`RateLimitCooldown`]。
     cooldown: RateLimitCooldown,
     /// `settings` 全表的内存镜像，见 [`CredentialStore::get_setting`]。
@@ -140,63 +147,94 @@ impl std::fmt::Display for AllRateLimited {
 
 impl std::error::Error for AllRateLimited {}
 
-/// 每凭证的滑动窗口计数器（**进程内，不落库**）。
+/// 滑动窗口计数器（**进程内，不落库**）。按 `K` 分桶：账号维度是 `cred_id`，设备维度是
+/// `device_id`。
 ///
-/// 两处在用，各持一份、互不干扰：
-/// - [`CredentialStore::bare_rate`] 只数**无 `metadata.user_id` 的请求**——带设备身份的那些
-///   已由设备绑定 + `device_limit` 约束着，而裸请求既不写绑定也不占名额，`device_limit`
-///   对它们完全不生效，这份补的正是那个口子；
-/// - [`CredentialStore::rpm_rate`] 数该账号的**全部**转发，窗口固定 60 秒，即账号 RPM 上限。
+/// 三处在用，各持一份、互不干扰：
+/// - [`CredentialStore::bare_rate`]（键：cred_id）只数**无 `metadata.user_id` 的请求**——带
+///   设备身份的那些已由设备绑定 + `device_limit` 约束着，而裸请求既不写绑定也不占名额，
+///   `device_limit` 对它们完全不生效，这份补的正是那个口子；
+/// - [`CredentialStore::rpm_rate`]（键：cred_id）数该账号的**全部**转发，窗口固定 60 秒，
+///   即账号 RPM 上限；
+/// - [`CredentialStore::device_rate`]（键：device_id）数**单台设备**的全部转发，同样 60 秒
+///   窗口，即设备 RPM 上限。前两者管的是「一个号别被打爆」，这个管的是「一台机器别把同号
+///   的其他设备挤没」。
 ///
 /// **不落库是有意的**：短窗口限流本来就不该跨重启（重启后放行几条远好于把人锁在门外），
 /// 而每请求一次 `usage_logs` 聚合查询的代价，比一把内存锁高一个数量级。代价是多实例部署时
 /// 各限各的——luban 是单进程本地代理，没有这个场景；真有了再换成落库的实现。
 ///
-/// 内存占用有上限：每个凭证最多存 `limit` 个时间戳（超限时不再追加），过期的在每次检查时
+/// 内存占用有上限：每个键最多存 `limit` 个时间戳（超限时不再追加），过期的在每次检查时
 /// 顺手清掉；不限（`limit <= 0`）时一条都不记——没人会去读那个队列，记了只会无界增长。
-#[derive(Default)]
-struct RateWindow {
-    /// cred_id → 窗口内每条请求的时刻（升序，用单调时钟，不受系统时间调整影响）。
-    hits: Mutex<HashMap<i64, VecDeque<Instant>>>,
+/// 键本身的回收见 [`Self::forget`] 与 [`Self::sweep_if_crowded`]。
+struct RateWindow<K = i64> {
+    /// 键 → 窗口内每条请求的时刻（升序，用单调时钟，不受系统时间调整影响）。
+    hits: Mutex<HashMap<K, VecDeque<Instant>>>,
 }
 
-impl RateWindow {
-    /// 该凭证在窗口内是否还有名额（`limit <= 0` 即不限）。只问不记，顺手清掉过期的。
+// 手写而非 `#[derive(Default)]`：derive 会给 `K` 加上 `K: Default` 这个用不着的约束。
+impl<K> Default for RateWindow<K> {
+    fn default() -> Self {
+        Self { hits: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> RateWindow<K> {
+    /// 该键在窗口内是否还有名额（`limit <= 0` 即不限）。只问不记，顺手清掉过期的。
     ///
     /// 与 [`Self::take`] 拆开，是因为**一次选号要过两道窗口**（裸请求上限 + 账号 RPM）：
     /// 若边问边记，一个过了第一道却卡在第二道的号会白扣一个名额，而它压根没被用上。
     /// 拆开后「问过了但没发」的窗口并不存在——选号全程持着 `conn` 锁（见
     /// [`CredentialStore::select_for_device`]），选号彼此串行，中间插不进第二次选号。
-    fn has_room(&self, cred_id: i64, limit: i64, window: Duration) -> bool {
+    ///
+    /// 单闸场景（设备 RPM）没有这个顾虑，用 [`Self::try_take`] 一次问完记完。
+    fn has_room(&self, key: K, limit: i64, window: Duration) -> bool {
         if limit <= 0 {
             return true; // 未配置上限 = 不限
         }
         let mut hits = self.hits.lock();
-        let q = hits.entry(cred_id).or_default();
+        let q = hits.entry(key).or_default();
         prune(q, window);
         (q.len() as i64) < limit
     }
 
-    /// 给该凭证记一条。不限时不记（理由见结构体文档）；已满时也不记（越界的那条不该进队列，
+    /// 给该键记一条。不限时不记（理由见结构体文档）；已满时也不记（越界的那条不该进队列，
     /// 它是被拒掉的）。
-    fn take(&self, cred_id: i64, limit: i64, window: Duration) {
+    fn take(&self, key: K, limit: i64, window: Duration) {
         if limit <= 0 {
             return;
         }
         let mut hits = self.hits.lock();
-        let q = hits.entry(cred_id).or_default();
+        let q = hits.entry(key).or_default();
         prune(q, window);
         if (q.len() as i64) < limit {
             q.push_back(Instant::now());
         }
     }
 
-    /// 该凭证要等多少秒才腾出下一个名额：窗口里最早那条滚出去的那一刻。至少 1 秒——
+    /// 有名额就记一条并返回 `true`，否则原样返回 `false`。**问与记在同一把锁里**，故不存在
+    /// 两条请求同时看到「还剩最后一个名额」的竞态——[`Self::has_room`] + [`Self::take`]
+    /// 那条路靠外层的 `conn` 锁串行化，这条路自己就够。
+    fn try_take(&self, key: K, limit: i64, window: Duration) -> bool {
+        if limit <= 0 {
+            return true;
+        }
+        let mut hits = self.hits.lock();
+        let q = hits.entry(key).or_default();
+        prune(q, window);
+        if (q.len() as i64) >= limit {
+            return false;
+        }
+        q.push_back(Instant::now());
+        true
+    }
+
+    /// 该键要等多少秒才腾出下一个名额：窗口里最早那条滚出去的那一刻。至少 1 秒——
     /// 回 0 等于让客户端立刻再撞一次。空窗口（本来就有名额）同样按 1 秒算。
-    fn retry_after_secs(&self, cred_id: i64, window: Duration) -> i64 {
+    fn retry_after_secs(&self, key: &K, window: Duration) -> i64 {
         let hits = self.hits.lock();
         let left = hits
-            .get(&cred_id)
+            .get(key)
             .and_then(|q| q.front().copied())
             .map(|t| window.saturating_sub(t.elapsed()))
             .unwrap_or_default();
@@ -204,9 +242,25 @@ impl RateWindow {
         (left.as_secs() as i64 + i64::from(left.subsec_nanos() > 0)).max(1)
     }
 
-    /// 凭证被删除/停用后清掉它的窗口，免得 map 里留下永远不再访问的键。
-    fn forget(&self, cred_id: i64) {
-        self.hits.lock().remove(&cred_id);
+    /// 键失效后清掉它的窗口（凭证被删除/停用），免得 map 里留下永远不再访问的键。
+    fn forget(&self, key: &K) {
+        self.hits.lock().remove(key);
+    }
+
+    /// 键数超过 `max_keys` 时清掉所有已空的窗口。
+    ///
+    /// 凭证维度不需要这个（键有限且删号时会 [`Self::forget`]），设备维度需要：device_id 是
+    /// 客户端自报的，一个乱编 id 的脚本能往 map 里塞进无数个键。空队列（窗口内一条都没有）
+    /// 是安全的清理对象——清掉与留着的判定结果完全一样。
+    fn sweep_if_crowded(&self, window: Duration, max_keys: usize) {
+        let mut hits = self.hits.lock();
+        if hits.len() <= max_keys {
+            return;
+        }
+        hits.retain(|_, q| {
+            prune(q, window);
+            !q.is_empty()
+        });
     }
 }
 
@@ -404,6 +458,7 @@ impl CredentialStore {
             refresh_locks: Mutex::new(HashMap::new()),
             bare_rate: RateWindow::default(),
             rpm_rate: RateWindow::default(),
+            device_rate: RateWindow::default(),
             cooldown: RateLimitCooldown::default(),
             settings: parking_lot::RwLock::new(settings),
         }
@@ -494,8 +549,8 @@ impl CredentialStore {
         let n = tx.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
         tx.commit()?;
         // 号没了，它的限流窗口与冷却也留着没用（id 不会被复用，见 migrates_and_stops_id_reuse）。
-        self.bare_rate.forget(id);
-        self.rpm_rate.forget(id);
+        self.bare_rate.forget(&id);
+        self.rpm_rate.forget(&id);
         self.cooldown.forget(id);
         Ok(n > 0)
     }
@@ -785,6 +840,44 @@ impl CredentialStore {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0)
             .max(0)
+    }
+
+    /// 每设备 RPM 上限：单台设备在最近 [`RPM_WINDOW_SECS`] 秒内最多转发多少条；
+    /// `<= 0`（含未设置）表示不限，即加入本机制前的行为。
+    pub fn device_rpm_limit(&self) -> i64 {
+        self.get_setting(DEVICE_RPM_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// 给这台设备记一条转发；名额已满时不记，返回**建议等待的秒数**（窗口里最早那条滚出去
+    /// 的时刻）。上限未配置时恒为 `None`（不限，且一条都不记）。
+    ///
+    /// 与账号 RPM 刻意不同的两点：
+    /// - **不参与选号**。账号打满可以换个号发，设备打满换哪个号都是同一台机器在刷，故这道闸
+    ///   在代理入口独立判定、直接 429，不进 [`Self::select_for_device`]（那里换号是为了绕开
+    ///   一个满了的号，对设备维度没有意义，只会白白改绑设备）。
+    /// - **问与记在同一把锁里**（[`RateWindow::try_take`]）。选号那两道窗口靠 `conn` 锁串行，
+    ///   这里没有那把锁，同一台设备的并发请求必须自己防住「都看到最后一个名额」。
+    ///
+    /// 口径与账号 RPM 一致：**含失败的、含 `count_tokens`**，两个数才比得了。代价同样一致——
+    /// 记在这里的是「获准转发」的条数，上游若把它拒了也照算。
+    pub fn take_device_rpm_slot(&self, device_id: &str) -> Option<i64> {
+        let limit = self.device_rpm_limit();
+        if limit <= 0 {
+            return None;
+        }
+        let window = Duration::from_secs(RPM_WINDOW_SECS as u64);
+        // device_id 是客户端自报的，乱编 id 的脚本能把 map 撑大——超过阈值就清掉空窗口。
+        // 阈值远高于任何真实设备数：清扫要遍历全表，不该在正常规模下发生。
+        self.device_rate.sweep_if_crowded(window, DEVICE_RATE_MAX_KEYS);
+        if self.device_rate.try_take(device_id.to_string(), limit, window) {
+            return None;
+        }
+        Some(self.device_rate.retry_after_secs(&device_id.to_string(), window))
     }
 
     /// 给凭证打上「被上游限流」的冷却，见 [`RateLimitCooldown`]。时长与作用域都由调用方
@@ -1480,6 +1573,17 @@ pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
 /// 全局默认账号 RPM 上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `rpm_limit == 0`（默认值）时套用它，无需逐个账号配置。
 pub const DEFAULT_RPM_LIMIT: &str = "default_rpm_limit";
+
+/// 每设备 RPM 上限的 settings 键名；`<= 0` 表示不限（默认）。见
+/// [`CredentialStore::take_device_rpm_slot`]。
+///
+/// 全局一个值，不逐台配置：设备是自动发现的，逐台配置的运维成本远高于逐账号——真要给某台
+/// 设备开小灶，那更像是给它单独配一个账号的活。
+pub const DEVICE_RPM_LIMIT: &str = "device_rpm_limit";
+
+/// 设备限流窗口表里最多留多少个键，超过就清掉空窗口，见 [`RateWindow::sweep_if_crowded`]。
+/// 取 4096：比任何真实部署的设备数高一两个数量级，正常规模下这条清扫永远不会触发。
+const DEVICE_RATE_MAX_KEYS: usize = 4096;
 
 /// 单凭证裸请求速率上限的 settings 键名；`<= 0` 表示不限（默认）。见
 /// [`CredentialStore::bare_rate_limit`]。
@@ -2633,7 +2737,7 @@ impl CredentialStore {
         let rpm_full = |cands: &[&Credential]| -> anyhow::Error {
             let retry_after_secs = cands
                 .iter()
-                .map(|c| self.rpm_rate.retry_after_secs(c.id, rpm_window))
+                .map(|c| self.rpm_rate.retry_after_secs(&c.id, rpm_window))
                 .min()
                 .unwrap_or(1);
             RpmLimited { retry_after_secs, sticky: false }.into()
@@ -2748,7 +2852,7 @@ impl CredentialStore {
                         // 改选会改绑，而改绑会让这条会话每一轮先撞一次 thinking 签名 400）。
                         if !rpm_room(c) {
                             return Err(RpmLimited {
-                                retry_after_secs: self.rpm_rate.retry_after_secs(c.id, rpm_window),
+                                retry_after_secs: self.rpm_rate.retry_after_secs(&c.id, rpm_window),
                                 sticky: true,
                             }
                             .into());
@@ -3871,6 +3975,68 @@ mod tests {
             }
         }
         assert!(store.select_for_device(sel).is_ok(), "过期后名额应回收");
+    }
+
+    /// 每设备 RPM：各设备各算各的，打满的那台被拒并拿到 retry-after，其余设备不受影响；
+    /// 窗口滚过去后名额自己回来。上限未配置时一条都不记（也就永远不拒）。
+    #[test]
+    fn device_rpm_limit_is_per_device_and_expires() {
+        let (store, _) = store_with(&["a"]);
+
+        // 没配上限 → 恒放行，且窗口表里一条都不该有（记了只会无界增长）。
+        for _ in 0..5 {
+            assert_eq!(store.take_device_rpm_slot("dev-1"), None, "未配置上限就是不限");
+        }
+        assert!(store.device_rate.hits.lock().is_empty(), "不限时不该记账");
+
+        store.set_setting(DEVICE_RPM_LIMIT, "2").unwrap();
+        assert_eq!(store.take_device_rpm_slot("dev-1"), None);
+        assert_eq!(store.take_device_rpm_slot("dev-1"), None);
+        let retry = store.take_device_rpm_slot("dev-1").expect("第三条该被拒");
+        assert!(
+            (1..=RPM_WINDOW_SECS).contains(&retry),
+            "retry-after 要落在窗口内且不为 0：{retry}"
+        );
+
+        // 另一台设备有自己的窗口——一台刷疯了不该连累别人，这正是这道闸的目的。
+        assert_eq!(store.take_device_rpm_slot("dev-2"), None, "别的设备照常");
+
+        // 把 dev-1 窗口里的时间戳推到过期，等价于等了一个窗口。
+        {
+            let mut hits = store.device_rate.hits.lock();
+            for t in hits.get_mut("dev-1").expect("dev-1 该有窗口").iter_mut() {
+                *t -= Duration::from_secs(RPM_WINDOW_SECS as u64 + 1);
+            }
+        }
+        assert_eq!(store.take_device_rpm_slot("dev-1"), None, "过期后名额应回收");
+    }
+
+    /// 设备窗口表的清扫：device_id 是客户端自报的，乱编 id 能把 map 撑大；超过阈值时清掉
+    /// 空窗口，但**窗口内还有记录的键一个都不能丢**——丢了等于给那台设备白送一轮名额。
+    #[test]
+    fn crowded_device_windows_are_swept_without_losing_live_ones() {
+        let (store, _) = store_with(&["a"]);
+        store.set_setting(DEVICE_RPM_LIMIT, "1").unwrap();
+
+        let window = Duration::from_secs(RPM_WINDOW_SECS as u64);
+        for i in 0..(DEVICE_RATE_MAX_KEYS + 10) {
+            store.device_rate.try_take(format!("dev-{i}"), 1, window);
+        }
+        // 除了一台仍在窗口内的，其余全部推到过期。
+        {
+            let mut hits = store.device_rate.hits.lock();
+            for (k, q) in hits.iter_mut() {
+                if k != "dev-0" {
+                    for t in q.iter_mut() {
+                        *t -= Duration::from_secs(RPM_WINDOW_SECS as u64 + 1);
+                    }
+                }
+            }
+        }
+        store.device_rate.sweep_if_crowded(window, DEVICE_RATE_MAX_KEYS);
+        let hits = store.device_rate.hits.lock();
+        assert_eq!(hits.len(), 1, "过期的键该被清掉");
+        assert!(hits.contains_key("dev-0"), "还在窗口内的键不能被清掉");
     }
 
     /// 上游 429 打过冷却的号在选号时让位；绑定到它的设备**改绑**到新号（这正是 429 换号

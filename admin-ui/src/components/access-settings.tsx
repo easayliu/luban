@@ -25,6 +25,7 @@ import {
   setDefaultDeviceLimit,
   setDefaultRpmLimit,
   setDeviceRetention,
+  setDeviceRpmLimit,
   setDeviceTtl,
   setMinClientVersion,
   setRequireDeviceId,
@@ -441,13 +442,14 @@ export function DeviceSettingsContent() {
 
       <SettingsGroup
         icon={TimerIcon}
-        title={t('账号转发速率', 'Per-account request rate')}
+        title={t('转发速率', 'Request rate')}
         description={t(
-          '限制单个账号每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。',
-          'Cap how many requests a single account forwards per minute; the same window as the RPM column in the account list.',
+          '限制单个账号、以及单台设备每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。',
+          'Cap how many requests a single account — and a single device — forwards per minute; the same window as the RPM column in the account list.',
         )}
       >
         <DefaultRpmLimit />
+        <DeviceRpmLimit />
       </SettingsGroup>
 
       <SettingsGroup
@@ -505,6 +507,24 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
           `${settings.bare_rate_limit.toLocaleString(locale)} / ${formatDuration(settings.bare_rate_window_secs, language)}`,
         )
       : t('允许 · 不限速', 'Allowed · unlimited')
+  // 两道 RPM 闸各写各的，都没配才是一句「不限」；只配一边时只显示配了的那边。
+  const rpmParts = [
+    settings.default_rpm_limit > 0
+      ? t(
+          `账号 ${settings.default_rpm_limit.toLocaleString(locale)}`,
+          `${settings.default_rpm_limit.toLocaleString(locale)}/account`,
+        )
+      : null,
+    settings.device_rpm_limit > 0
+      ? t(
+          `设备 ${settings.device_rpm_limit.toLocaleString(locale)}`,
+          `${settings.device_rpm_limit.toLocaleString(locale)}/device`,
+        )
+      : null,
+  ].filter(Boolean)
+  const rpmPolicy = rpmParts.length > 0
+    ? t(`${rpmParts.join(' · ')} 条 / 分钟`, `${rpmParts.join(' · ')} per min`)
+    : t('不限', 'Unlimited')
   const items = [
     {
       label: t('名额有效期', 'Slot lifetime'),
@@ -528,13 +548,10 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         : t('不限', 'Unlimited'),
     },
     {
-      label: t('默认 RPM 上限', 'Default RPM limit'),
-      value: settings.default_rpm_limit > 0
-        ? t(
-            `${settings.default_rpm_limit.toLocaleString(locale)} 条 / 分钟`,
-            `${settings.default_rpm_limit.toLocaleString(locale)} req/min`,
-          )
-        : t('不限', 'Unlimited'),
+      // 账号与设备两道 RPM 闸挤在同一格里：概览一行六格已经到头，再加一格窄屏会散架，
+      // 而这两个值总是一起看的——「账号 30 · 设备 10」比分两格更省地方也更好读。
+      label: t('RPM 上限', 'RPM limits'),
+      value: rpmPolicy,
     },
     {
       label: t('无身份请求', 'Unidentified requests'),
@@ -964,6 +981,101 @@ function DefaultRpmLimit() {
             <NumberFieldDecrement aria-label={t('减少默认 RPM 上限', 'Decrease default RPM limit')} />
             <NumberFieldInput aria-label={t('默认 RPM 上限', 'Default RPM limit')} />
             <NumberFieldIncrement aria-label={t('增加默认 RPM 上限', 'Increase default RPM limit')} />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 每设备 RPM 上限：单台设备最近 60 秒最多转发多少条，超了直接 429，不换号。
+ *
+ * 与账号 RPM 各管一头：账号那道防的是「一个号被打爆」，这道防的是「一台机器把同账号下
+ * 其他设备的额度挤没」。两道都配了的话一条请求要先过设备、再过账号。
+ */
+function DeviceRpmLimit() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.device_rpm_limit)
+  }, [data?.device_rpm_limit])
+
+  const save = useMutation({
+    mutationFn: (limit: number) => setDeviceRpmLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('设备 RPM 上限已更新', 'Per-device RPM limit updated'),
+        description: settings.device_rpm_limit > 0
+          ? t(
+              `每台设备每分钟最多转发 ${settings.device_rpm_limit} 条请求。`,
+              `Each device forwards at most ${settings.device_rpm_limit} requests per minute.`,
+            )
+          : t('设备 RPM 上限已取消。', 'The per-device RPM limit has been removed.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.device_rpm_limit ?? 0
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+  // 关掉设备身份校验后，裸请求没有 device_id，落不进设备的桶——这时只有裸请求速率上限管得着。
+  const bareAllowed = data?.require_device_id === false
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('设备 RPM 上限', 'Per-device RPM limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '单台设备每分钟最多转发多少条，超了直接 429 并给出 retry-after。不换号：换哪个账号都是同一台机器在刷。0 表示不限。',
+            'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. No credential swap happens — it is the same machine either way. 0 means unlimited.',
+          )}
+        </FieldDescription>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" size="sm">
+            {parsed > 0
+              ? t(`每台设备每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per device`)
+              : t('不限', 'Unlimited')}
+          </Badge>
+          {parsed > 0 && bareAllowed && (
+            <Badge variant="warning" size="sm">
+              {t('无身份请求不受此闸管', 'Unidentified requests bypass this')}
+            </Badge>
+          )}
+        </div>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少设备 RPM 上限', 'Decrease per-device RPM limit')} />
+            <NumberFieldInput aria-label={t('设备 RPM 上限', 'Per-device RPM limit')} />
+            <NumberFieldIncrement aria-label={t('增加设备 RPM 上限', 'Increase per-device RPM limit')} />
           </NumberFieldGroup>
         </NumberField>
         <Button

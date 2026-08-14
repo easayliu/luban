@@ -134,6 +134,7 @@ pub async fn run(
         .route("/settings/device-retention", post(set_device_retention))
         .route("/settings/default-device-limit", post(set_default_device_limit))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
+        .route("/settings/device-rpm-limit", post(set_device_rpm_limit))
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/require-device-id", post(set_require_device_id))
@@ -865,6 +866,8 @@ struct SettingsResp {
     /// 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。
     /// 账号未单独配置时套用它。
     default_rpm_limit: i64,
+    /// 每设备 RPM 上限（单台设备最近 60 秒最多转发多少条）；0 表示不限。全局一个值。
+    device_rpm_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
     /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
@@ -946,6 +949,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_retention_secs = state.store.device_binding_retention();
     let default_device_limit = state.store.default_device_limit();
     let default_rpm_limit = state.store.default_rpm_limit();
+    let device_rpm_limit = state.store.device_rpm_limit();
     let require_device_id = state.store.require_device_id();
     let min_client_version = state.store.min_client_version().unwrap_or_default();
     let bare_rate_limit = state.store.bare_rate_limit();
@@ -960,6 +964,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             device_binding_retention_secs,
             default_device_limit,
             default_rpm_limit,
+            device_rpm_limit,
             require_device_id,
             min_client_version,
             bare_rate_limit,
@@ -981,6 +986,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         device_binding_retention_secs,
         default_device_limit,
         default_rpm_limit,
+        device_rpm_limit,
         require_device_id,
         min_client_version,
         bare_rate_limit,
@@ -1097,6 +1103,28 @@ async fn set_default_rpm_limit(
         .set_setting(crate::store::DEFAULT_RPM_LIMIT, &limit.to_string())
         .map_err(internal)?;
     tracing::info!(limit, "default rpm limit changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetDeviceRpmLimitReq {
+    /// 每设备 RPM 上限；0（或负数）表示不限。
+    device_rpm_limit: i64,
+}
+
+/// 设置每设备 RPM 上限：单台设备最近 60 秒最多转发多少条，超了直接 429，不换号。
+///
+/// 与账号 RPM 各算各的：一条请求先过设备这道闸，再在选号时过账号那道。
+async fn set_device_rpm_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetDeviceRpmLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.device_rpm_limit.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEVICE_RPM_LIMIT, &limit.to_string())
+        .map_err(internal)?;
+    tracing::info!(limit, "per-device rpm limit changed");
     Ok(Json(settings_resp(&state)))
 }
 

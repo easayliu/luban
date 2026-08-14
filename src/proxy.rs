@@ -120,6 +120,24 @@ pub async fn handle(
             .into_response();
     }
 
+    // 2.4) 每设备 RPM 上限：这台机器最近 60 秒发得太多 → 直接 429 + `retry-after`。
+    //      **不换号**：账号打满换个号还能发，设备打满换哪个号都是同一台机器在刷，换号只会
+    //      白白改绑设备（还会连累 thinking 签名，见 [`store::RpmLimited::sticky`]）。故这道闸
+    //      独立于选号，也因此排在形态拦截之后：一条发都发不出去的请求不该占掉设备的名额。
+    //      没有设备身份的请求（网页关了校验的那些）不受此闸管——它们由裸请求速率上限兜着。
+    if let Some(dev) = device_id.as_deref()
+        && let Some(retry) = state.store.take_device_rpm_slot(dev)
+    {
+        let device_short: String = dev.chars().take(8).collect();
+        tracing::warn!(%method, path = %path_and_query, ua = %client_ua, device = %device_short, retry_after = retry, "rejected: this device has reached its RPM limit");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry.to_string())],
+            format!("this device has reached its RPM limit; retry in {retry} seconds"),
+        )
+            .into_response();
+    }
+
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
     // 免得两处的 device_id/model 哪天漂开。

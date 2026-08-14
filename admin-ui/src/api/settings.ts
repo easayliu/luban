@@ -13,6 +13,8 @@ export interface Settings {
   default_device_limit: number
   /** 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。账号未单独配置时套用它。 */
   default_rpm_limit: number
+  /** 每设备 RPM 上限（单台设备最近 60 秒最多转发多少条）；0 表示不限。全局一个值。 */
+  device_rpm_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
@@ -116,6 +118,14 @@ export async function setDefaultDeviceLimit(limit: number): Promise<Settings> {
 export async function setDefaultRpmLimit(limit: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/default-rpm-limit', {
     default_rpm_limit: limit,
+  })
+  return data
+}
+
+/** 设置每设备 RPM 上限（0 表示不限）：单台设备最近 60 秒最多转发多少条，超了直接 429。 */
+export async function setDeviceRpmLimit(limit: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/device-rpm-limit', {
+    device_rpm_limit: limit,
   })
   return data
 }
