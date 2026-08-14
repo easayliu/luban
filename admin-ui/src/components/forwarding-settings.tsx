@@ -230,8 +230,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '工具名是上游判断第三方应用的一个已验证判据，命中就返回「Third-party apps now draw from your extra usage」并改扣超额额度，即使订阅额度充足。实测三个业务工具名就足以触发，而 `mcp__` 开头的名字会被豁免。开启后 luban 把这些名字换成 `mcp__luban__*` 下的稳定假名发出，响应里再换回真名，客户端从头到尾看到的都是自己的工具名。官方自带的工具、来访本就是 MCP 的工具和服务端工具都保留原名不动，所以对真实官方客户端没有任何影响。代价：响应内容要多做一次字符串替换；客户端中途增删工具会让假名整体重算，上游的提示词缓存会失效一次。',
-                'Tool names are one verified signal the upstream uses to classify third-party apps; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when plan quota remains. Names beginning with `mcp__` are exempt in testing. When enabled, luban forwards affected names as stable aliases under `mcp__luban__*` and restores them in responses, so the client only sees its own names. Official tools, tools that already use MCP names, and server tools remain unchanged, making this a no-op for the genuine official client. Costs: one extra string replacement pass over responses, and adding or removing tools mid-session recomputes aliases and invalidates the upstream prompt cache once.',
+                '工具名是上游判断第三方应用的一个已验证判据，命中就返回「Third-party apps now draw from your extra usage」并改扣超额用量，即使订阅用量充足。实测三个业务工具名就足以触发，而 `mcp__` 开头的名字会被豁免。开启后 luban 把这些名字换成 `mcp__luban__*` 下的稳定假名发出，响应里再换回真名，客户端从头到尾看到的都是自己的工具名。官方自带的工具、来访本就是 MCP 的工具和服务端工具都保留原名不动，所以对真实官方客户端没有任何影响。代价：响应内容要多做一次字符串替换；客户端中途增删工具会让假名整体重算，上游的提示词缓存会失效一次。',
+                'Tool names are one verified signal the upstream uses to classify third-party apps; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when plan usage remains. Names beginning with `mcp__` are exempt in testing. When enabled, luban forwards affected names as stable aliases under `mcp__luban__*` and restores them in responses, so the client only sees its own names. Official tools, tools that already use MCP names, and server tools remain unchanged, making this a no-op for the genuine official client. Costs: one extra string replacement pass over responses, and adding or removing tools mid-session recomputes aliases and invalidates the upstream prompt cache once.',
               )}
             </>
           }
@@ -246,7 +246,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '官方客户端的对话请求字段是固定一套，多出来的字段就是一处稳定特征，可能导致请求被判为第三方应用而改扣超额额度。开启后 luban 会删掉两样：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时不动）；二是 thinking 里的 display 字段。代价：删掉 display 后上游不再返回思考摘要，客户端的「思考过程」会是空的，功能本身不受影响。真实官方客户端本来就不发这两样，开启对它没有任何影响。',
+                '官方客户端的对话请求字段是固定一套，多出来的字段就是一处稳定特征，可能导致请求被判为第三方应用而改扣超额用量。开启后 luban 会删掉两样：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时不动）；二是 thinking 里的 display 字段。代价：删掉 display 后上游不再返回思考摘要，客户端的「思考过程」会是空的，功能本身不受影响。真实官方客户端本来就不发这两样，开启对它没有任何影响。',
                 'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes two things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), and the display field inside thinking. Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. The real official client never sends either field, so enabling this is a no-op for it.',
               )}
             </>
@@ -265,7 +265,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '只调整分块，不改变提示词文本（缓存时长另由「缓存时长对齐 1h」那项管）。它不只是缓存优化：官方客户端的系统提示词恒为 4 块，超出的会被上游判成第三方应用，改从超额额度（extra usage）扣费而不是订阅额度，所以多出来的块会被并回第 4 块。无法识别切点时原样转发。',
+                '只调整分块，不改变提示词文本（缓存时长另由「缓存时长对齐 1h」那项管）。它不只是缓存优化：官方客户端的系统提示词恒为 4 块，超出的会被上游判成第三方应用，改从超额用量（extra usage）扣费而不是订阅用量，所以多出来的块会被并回第 4 块。无法识别切点时原样转发。',
                 'Only block boundaries are adjusted; the prompt text is unchanged (cache duration is governed separately by “Match official cache duration”). This is not merely a cache optimization: the official client always sends exactly 4 system blocks, and anything beyond that is treated upstream as a third-party app and billed to extra usage instead of your plan, so surplus blocks are merged back into the fourth. Requests are forwarded unchanged when no split point can be identified.',
               )}
             </>
@@ -347,8 +347,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '账号额度耗尽时冷却整个账号；只有当前模型受限时仅冷却该模型。默认分别冷却 60 / 30 秒，并优先采用上游等待时间。换号会改绑有设备身份的请求，也可能降低缓存命中率；达到重试上限或没有其他账号时返回',
-                'When an account’s quota is exhausted, the entire account is cooled down; when only the current model is limited, only that model is cooled down. The defaults are 60 / 30 seconds respectively, with the upstream wait time taking precedence. Switching accounts rebinds requests that carry a device identity and may also reduce the cache hit rate. When the retry limit is reached or no other account is available, return',
+                '账号用量耗尽时冷却整个账号；只有当前模型受限时仅冷却该模型。默认分别冷却 60 / 30 秒，并优先采用上游等待时间。换号会改绑有设备身份的请求，也可能降低缓存命中率；达到重试上限或没有其他账号时返回',
+                'When an account’s usage is exhausted, the entire account is cooled down; when only the current model is limited, only that model is cooled down. The defaults are 60 / 30 seconds respectively, with the upstream wait time taking precedence. Switching accounts rebinds requests that carry a device identity and may also reduce the cache hit rate. When the retry limit is reached or no other account is available, return',
               )}{' '}
               <code className="font-mono tabular-nums">429</code>{t('。', '.')}
             </>

@@ -30,6 +30,8 @@ pub async fn handle(
     // 来访 UA：转发日志与各条拒绝日志都带上（都是 info/warn，不必开 debug）。整组识别头那条
     // debug 留着不动——排查形态时才需要那六项，日常只要认出「谁在发」，一项就够。
     let client_ua = ua_of(&headers);
+    // 在途计数：入口就 +1，随后 move 进 ReqLog 活到响应流结束，见 [`InFlightGuard`]。
+    let in_flight = InFlightGuard::new(state.in_flight.clone());
 
     // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
     if let Some(expected) = effective_client_key(&state)
@@ -430,6 +432,7 @@ pub async fn handle(
                 ratelimit,
                 stream_broke: None,
                 store: state.store.clone(),
+                _in_flight: in_flight,
             };
 
             // 400/401/403：先缓冲响应体做账号级错误判定，命中则自动停用该凭证并清空其
@@ -1243,6 +1246,27 @@ fn upstream_error_kind(e: &wreq::Error) -> &'static str {
     }
 }
 
+/// 在途请求计数的 RAII 句柄：构造时 +1，Drop 时 -1。
+///
+/// 挂在 [`ReqLog`] 上（而不是在 `handle` 末尾手工减一），于是它随**响应流**一起存活：
+/// 一条流式回复要几十秒才走完，那整段时间它都确实占着一条上游连接，正是「并发」要数的东西。
+/// 中途被拒的请求（限流、形态错误）不会走到 `ReqLog`，它们的句柄在 `handle` 返回时就 drop 了，
+/// 也符合直觉——那些请求根本没发出去。
+pub struct InFlightGuard(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+impl InFlightGuard {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT、总耗时与用量）并落库。
 struct ReqLog {
     started: std::time::Instant,
@@ -1291,6 +1315,8 @@ struct ReqLog {
     /// 客户端拿到一条截断的流，服务端侧一行日志都没有。
     stream_broke: Option<String>,
     store: std::sync::Arc<store::CredentialStore>,
+    /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
+    _in_flight: InFlightGuard,
 }
 
 impl Drop for ReqLog {
@@ -7652,6 +7678,7 @@ mod tests {
                 ratelimit: rl_headers(&[]),
                 stream_broke: None,
                 store: store.clone(),
+                _in_flight: super::InFlightGuard::new(Default::default()),
             })
         };
         // 非模拟路径：来访那份原样转发，两列相同。
@@ -7701,6 +7728,7 @@ mod tests {
             ratelimit: rl_headers(&[]),
             stream_broke: None,
             store: store.clone(),
+            _in_flight: super::InFlightGuard::new(Default::default()),
         };
         rl.sniffer.feed(
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":47030}}}\n\n",
@@ -7771,6 +7799,24 @@ mod tests {
         let mut h = super::HeaderMap::new();
         h.insert(super::header::USER_AGENT, cjk);
         assert_eq!(super::ua_of(&h), "-");
+    }
+
+    /// 在途计数：句柄在则计数在，句柄没了计数就得跟着回去。挂在 `ReqLog` 上的那份要活到
+    /// 响应流结束，所以这里钉住的是 Drop 语义本身——漏了它，并发数会只涨不落。
+    #[test]
+    fn in_flight_guard_counts_up_and_back_down() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counter: std::sync::Arc<std::sync::atomic::AtomicI64> = Default::default();
+        assert_eq!(counter.load(Relaxed), 0);
+
+        let a = super::InFlightGuard::new(counter.clone());
+        let b = super::InFlightGuard::new(counter.clone());
+        assert_eq!(counter.load(Relaxed), 2, "两条并发请求各占一格");
+
+        drop(a);
+        assert_eq!(counter.load(Relaxed), 1, "一条走完只减自己那格");
+        drop(b);
+        assert_eq!(counter.load(Relaxed), 0, "全部走完必须回到 0");
     }
 
     /// 版本串解析：段数不齐按 0 补齐，预发布后缀按主版本算，非数字段作废。
@@ -8306,6 +8352,7 @@ mod tests {
             ratelimit: rl_headers(&[]),
             stream_broke: None,
             store,
+            _in_flight: super::InFlightGuard::new(Default::default()),
         }
     }
 }

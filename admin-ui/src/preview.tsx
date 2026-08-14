@@ -636,7 +636,10 @@ queryClient.setQueryData(['settings'], {
   device_binding_ttl_secs: 86400,
   device_binding_retention_secs: 604800,
   default_device_limit: 3,
-  default_rpm_limit: 0,
+  // 两道 RPM 闸都给上值、版本闸也写满：概览那行最挤的就是这个组合，预览要照着最挤的看。
+  default_rpm_limit: 40,
+  device_rpm_limit: 10,
+  min_client_version: '2.1.100',
   require_device_id: true,
   bare_rate_limit: 0,
   bare_rate_window_secs: 60,
@@ -658,6 +661,7 @@ queryClient.setQueryData(['settings'], {
   strip_extra_fields: true,
   tool_name_mimic: true,
 })
+queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 })
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,

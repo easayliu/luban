@@ -15,6 +15,8 @@ import {
   cn,
   displayCredentialLabel,
   formatClockTime,
+  formatCompactNumber,
+  formatCountdown,
   formatFullTime,
   formatUsd,
   relativeTime,
@@ -24,6 +26,7 @@ import {
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
+  deviceUsageMeta,
   evaluateCredential,
   modelCooldownSummary,
   quotaLevel,
@@ -34,7 +37,6 @@ import {
   tierBadgeVariant,
   unifiedQuotaStatusLabel,
   useCredentialActions,
-  type QuotaFreshness,
   type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
@@ -42,7 +44,7 @@ import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge, badgeVariants } from '@/components/ui/badge'
+import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -111,6 +113,32 @@ export const CredentialCard = memo(function CredentialCard({
   // 0 = 不限，此时页脚只显示 RPM 本身，不画分母、也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
   const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
+  // 设备名额占用的配色与说明：空闲灰 / 健康绿 / 吃紧黄 / 占满红，见 [deviceUsageMeta]。
+  const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
+  const deviceUsageHint = (() => {
+    if (cred.device_count <= 0) {
+      return t(
+        '还没有设备绑定到这个账号。点击查看',
+        'No devices are bound to this account yet. Click to view',
+      )
+    }
+    if (cred.device_limit_effective <= 0) {
+      return t(
+        `已绑定 ${cred.device_count} 台设备，未设上限。点击查看`,
+        `${cred.device_count} bound device(s), no limit set. Click to view`,
+      )
+    }
+    if (deviceUsage.level === 'critical') {
+      return t(
+        `设备名额已占满（${cred.device_count}/${cred.device_limit_effective}）：新设备会被分到别的账号，全部占满时收到 429。点击查看`,
+        `Device slots are full (${cred.device_count}/${cred.device_limit_effective}): new devices go to another account, and get a 429 once every account is full. Click to view`,
+      )
+    }
+    return t(
+      `已占用 ${cred.device_count}/${cred.device_limit_effective} 个设备名额。点击查看`,
+      `${cred.device_count} of ${cred.device_limit_effective} device slots in use. Click to view`,
+    )
+  })()
   const devicePolicy = cred.device_limit === 0
     ? { label: t('跟随默认', 'Default'), variant: 'secondary' as const }
     : cred.device_limit < 0
@@ -131,8 +159,8 @@ export const CredentialCard = memo(function CredentialCard({
         label: t('快照有 Usage credits', 'Snapshot used usage credits'),
         variant: 'warning' as const,
         title: t(
-          `账号已停用；${quotaSnapshotTime} 的额度快照记录了 Usage credits，当前不纳入调度风险统计`,
-          `The account is disabled; the ${quotaSnapshotTime} quota snapshot recorded usage credits and is excluded from current scheduling-risk totals`,
+          `账号已停用；${quotaSnapshotTime} 的用量快照记录了 Usage credits，当前不纳入调度风险统计`,
+          `The account is disabled; the ${quotaSnapshotTime} usage snapshot recorded usage credits and is excluded from current scheduling-risk totals`,
         ),
       }
     }
@@ -141,8 +169,8 @@ export const CredentialCard = memo(function CredentialCard({
         label: t('近期用过 Usage credits', 'Recently used usage credits'),
         variant: 'warning' as const,
         title: t(
-          '最近的额度快照记录了 Usage credits，但相关额度窗口已经重置',
-          'The latest quota snapshot recorded usage credits, but the related quota windows have reset',
+          '最近的用量快照记录了 Usage credits，但相关用量窗口已经重置',
+          'The latest usage snapshot recorded usage credits, but the related usage windows have reset',
         ),
       }
     }
@@ -151,8 +179,8 @@ export const CredentialCard = memo(function CredentialCard({
         label: t('Usage credits 生效中', 'Usage credits active'),
         variant: 'error' as const,
         title: t(
-          `${quotaSnapshotTime} 的额度快照显示套餐用量已耗尽，正由 Usage credits 按标准 API 价放行请求`,
-          `The ${quotaSnapshotTime} quota snapshot shows the plan's included usage exhausted and requests being served by usage credits at standard API rates`,
+          `${quotaSnapshotTime} 的用量快照显示套餐用量已耗尽，正由 Usage credits 按标准 API 价放行请求`,
+          `The ${quotaSnapshotTime} usage snapshot shows the plan's included usage exhausted and requests being served by usage credits at standard API rates`,
         ),
       }
     }
@@ -161,8 +189,8 @@ export const CredentialCard = memo(function CredentialCard({
         label: t('Usage credits 待确认', 'Usage credits unconfirmed'),
         variant: 'warning' as const,
         title: t(
-          `${quotaSnapshotTime} 的额度快照记录了 Usage credits，当前状态仍需确认`,
-          `The ${quotaSnapshotTime} quota snapshot recorded usage credits; the current state still needs confirmation`,
+          `${quotaSnapshotTime} 的用量快照记录了 Usage credits，当前状态仍需确认`,
+          `The ${quotaSnapshotTime} usage snapshot recorded usage credits; the current state still needs confirmation`,
         ),
       }
     }
@@ -241,7 +269,7 @@ export const CredentialCard = memo(function CredentialCard({
                   >
                     {credentialLabel}
                   </h3>
-                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs font-normal">
+                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
                     <span aria-hidden="true">·</span>
                     <span
@@ -251,7 +279,7 @@ export const CredentialCard = memo(function CredentialCard({
                         `Added ${formatFullTime(cred.created_at, language)}`,
                       )}
                     >
-                      <CalendarDaysIcon className="size-3.5 shrink-0" />
+                      <CalendarDaysIcon className="size-3 shrink-0" />
                       <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
                     </span>
                   </CardDescription>
@@ -325,24 +353,25 @@ export const CredentialCard = memo(function CredentialCard({
             {isOrgAccount(cred) && (
               <Badge
                 variant="warning"
+                size="sm"
                 title={t(
-                  `组织账号（${cred.org_type}）：额度由整个组织共享，与同档位的个人账号不是一回事`,
-                  `Organisation account (${cred.org_type}): the quota is shared across the whole organisation, unlike a personal account on the same tier`,
+                  `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不是一回事`,
+                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
                 )}
               >
                 {orgBadgeLabel(cred)}
               </Badge>
             )}
-            {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
-            <Badge variant="outline" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
+            {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>}
+            <Badge variant="outline" size="sm" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
               P{cred.priority}
             </Badge>
           </div>
 
-          <section aria-label={t(`${credentialLabel} 的额度使用`, `Quota usage for ${credentialLabel}`)} className="space-y-2">
+          <section aria-label={t(`${credentialLabel} 的用量限制`, `Usage limits for ${credentialLabel}`)} className="space-y-2">
             <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1.5">
               <div className="flex flex-wrap items-center gap-2">
-                <h4 className="font-medium text-sm">{t('额度使用', 'Quota usage')}</h4>
+                <h4 className="font-medium text-xs text-muted-foreground">{t('用量限制', 'Usage limits')}</h4>
                 {secondaryOverage && (
                   <Badge
                     variant={secondaryOverage.variant}
@@ -357,9 +386,9 @@ export const CredentialCard = memo(function CredentialCard({
                 <Tooltip>
                   <TooltipTrigger
                     render={<span />}
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+                    className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
                   >
-                    <ClockIcon className="size-3.5" />
+                    <ClockIcon className="size-3" />
                     {t(
                       `更新于 ${relativeTime(cred.quota.ts, now, language)}`,
                       `Updated ${relativeTime(cred.quota.ts, now, language)}`,
@@ -368,7 +397,7 @@ export const CredentialCard = memo(function CredentialCard({
                   <TooltipPopup>{formatFullTime(cred.quota.ts, language)}</TooltipPopup>
                 </Tooltip>
               ) : (
-                <span className="text-sm text-muted-foreground">{t('暂无数据', 'No data')}</span>
+                <span className="text-2xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
             </div>
             {cred.quota && (has5h || has7d) ? (
@@ -382,30 +411,34 @@ export const CredentialCard = memo(function CredentialCard({
                 {has5h && (
                   <QuotaMeter
                     credentialLabel={credentialLabel}
-                    label={t('5 小时', '5 hours')}
+                    // 标签用 `5h`/`7d` 而不是「5 小时」：这一行现在还挤着进度条、百分比与
+                    // 重置时刻，长标签会把进度条压没；完整称呼在读屏文本里。
+                    label="5h"
+                    windowVariant="info"
                     util={quota.h5.utilization}
-                    freshness={quota.h5.freshness}
                     reset={cred.quota.rl_5h_reset}
                     cost={cred.quota.cost_5h}
                     requests={cred.quota.requests_5h}
                     snapshotTs={cred.quota.ts}
+                    now={now}
                   />
                 )}
                 {has7d && (
                   <QuotaMeter
                     credentialLabel={credentialLabel}
-                    label={t('7 天', '7 days')}
+                    label="7d"
+                    windowVariant="success"
                     util={quota.d7.utilization}
-                    freshness={quota.d7.freshness}
                     reset={cred.quota.rl_7d_reset}
                     cost={cred.quota.cost_7d}
                     requests={cred.quota.requests_7d}
                     snapshotTs={cred.quota.ts}
+                    now={now}
                   />
                 )}
               </div>
             ) : cred.quota ? (
-              <p className="text-sm text-muted-foreground">{t('上游尚未返回额度窗口。', 'The upstream has not returned quota windows yet.')}</p>
+              <p className="text-xs text-muted-foreground">{t('上游尚未返回用量窗口。', 'The upstream has not returned usage windows yet.')}</p>
             ) : null}
             {quota.extraWindows.length > 0 && <ExtraWindows windows={quota.extraWindows} />}
             {evaluation.modelCooling && (
@@ -416,7 +449,7 @@ export const CredentialCard = memo(function CredentialCard({
                   'These models were just rate-limited upstream (usually capacity limits or an exhausted overage pool) and are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
                 )}
               >
-                <TimerOffIcon className="size-3.5" />
+                <TimerOffIcon className="size-3" />
                 <span className="font-medium">{t('模型冷却', 'Model cooldown')}</span>
                 <span>{modelCooldownSummary(cred, language)}</span>
               </p>
@@ -436,18 +469,24 @@ export const CredentialCard = memo(function CredentialCard({
                 aria-haspopup="dialog"
               >
                 <SmartphoneIcon />
-                <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
+                {/* 计数本身带底色（绿 / 黄 / 红），颜色只看名额占用，见 [deviceUsageMeta]：
+                    页脚这一行全是中性色数字，光靠 `3/5` 得逐个念才知道哪个号快满了。 */}
+                <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+                  {cred.device_count}/{effectiveLimit}
+                </Badge>
                 <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
               </TooltipTrigger>
-              <TooltipPopup>{t('查看已绑定设备', 'View bound devices')}</TooltipPopup>
+              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                {deviceUsageHint}
+              </TooltipPopup>
             </Tooltip>
             <Separator orientation="vertical" className="h-5" />
             <Tooltip>
               <TooltipTrigger
                 render={<span />}
-                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
               >
-                <WalletCardsIcon className="size-4 text-muted-foreground" aria-hidden />
+                <WalletCardsIcon className="size-3.5 text-muted-foreground" aria-hidden />
                 <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
                 <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
               </TooltipTrigger>
@@ -460,7 +499,7 @@ export const CredentialCard = memo(function CredentialCard({
                 <Tooltip>
                   <TooltipTrigger
                     render={<span />}
-                    className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap text-sm"
+                    className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap text-xs"
                   >
                     {/* 页脚里唯一的实时值（隔壁两个都是累计量），用呼吸点替掉图标把「活的」画出来。
                         绿色只落在这个 6px 点上：数值本身无好坏之分，颜色留给状态（运行正常 / 冷却）。 */}
@@ -619,10 +658,10 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
             title={[
               isCapabilityWindow(w)
                 ? t(
-                    `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费额度）可用；它不是用量窗口，所以没有百分比`,
+                    `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；它不是用量窗口，所以没有百分比`,
                     `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
                   )
-                : t(`额度窗口 ${w.name}`, `Quota window ${w.name}`),
+                : t(`用量窗口 ${w.name}`, `Usage limits window ${w.name}`),
               w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
               w.resetAt != null && t(
                 `${formatFullTime(w.resetAt, language)} 重置`,
@@ -680,16 +719,16 @@ function UpstreamVerdict({
   const badgeLabel = t(`上游 · ${statusLabel}`, `Upstream · ${statusLabel}`)
   const verdictTitle = status === 'rate_limited'
     ? t(
-        '上游正在限流该账号，请等待相关额度窗口恢复后再重试',
-        'The upstream is rate-limiting this account; retry after the related quota window recovers',
+        '上游正在限流该账号，请等待相关用量窗口恢复后再重试',
+        'The upstream is rate-limiting this account; retry after the related usage window recovers',
       )
     : t(
         status === 'rejected'
-          ? '上游拒绝了这次请求：该账号至少有一个额度窗口已耗尽'
-          : '上游放行但已发出预警：该账号有额度窗口接近耗尽',
+          ? '上游拒绝了这次请求：该账号至少有一个用量窗口已耗尽'
+          : '上游放行但已发出预警：该账号有用量窗口接近耗尽',
         status === 'rejected'
-          ? 'The upstream rejected the request: at least one quota window for this account is exhausted'
-          : 'The upstream allowed the request but issued a warning: a quota window is close to exhaustion',
+          ? 'The upstream rejected the request: at least one usage window for this account is exhausted'
+          : 'The upstream allowed the request but issued a warning: a usage window is close to exhaustion',
       )
   const representativeDetail = quota.rl_representative
     ? t(
@@ -727,64 +766,66 @@ function UpstreamVerdict({
   )
 }
 
+/**
+ * 额度里的一项事实（请求数、花费）：浅灰小块，值在前、单位在后。
+ *
+ * 做成块而不是「标签: 值」的文本对——卡片上这行要能一眼扫过去，标签在小字号下只是噪声，
+ * 真要确认是什么，`title` 与读屏文本都写着全称。
+ */
+function QuotaFact({
+  label,
+  value,
+  suffix,
+  title,
+}: {
+  label: string
+  value: string
+  suffix?: string
+  title?: string
+}) {
+  return (
+    <div
+      className={cn(
+        badgeVariants({ variant: 'secondary', size: 'sm' }),
+        'min-w-0 gap-0.5 font-normal',
+      )}
+      title={title ? `${label}: ${title}` : label}
+    >
+      <dt className="sr-only">{label}</dt>
+      <dd className="truncate tabular-nums">{value}</dd>
+      {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
+    </div>
+  )
+}
+
 function QuotaMeter({
   credentialLabel,
   label,
+  windowVariant,
   util,
-  freshness,
   reset,
   cost,
   requests,
   snapshotTs,
+  now,
 }: {
   credentialLabel: string
   label: string
+  /** 窗口标签的固定配色（分类色，与占用无关）：5h 一色、7d 一色。 */
+  windowVariant: BadgeProps['variant']
   util: number | null
-  freshness: QuotaFreshness
   reset: number | null
   cost: number | null
   requests: number | null
   snapshotTs: number
+  /** 页面时钟（30 秒一跳），倒计时靠它走，见 [formatCountdown]。 */
+  now: number
 }) {
   const { t, language, locale } = useI18n()
-  if (util == null) {
-    const expired = freshness === 'expired'
-    const reason = expired && reset != null
-      ? t(
-          `窗口已在 ${formatFullTime(reset, language)} 重置，之后没有新请求`,
-          `The window reset at ${formatFullTime(reset, language)} and has no newer requests`,
-        )
-      : t('上游未返回该窗口的额度信息', 'The upstream did not return quota data for this window')
-    return (
-      <div
-        className="flex w-full flex-col gap-1.5"
-        title={t(
-          `${reason}。最后一次快照：${formatFullTime(snapshotTs, language)}`,
-          `${reason}. Latest snapshot: ${formatFullTime(snapshotTs, language)}`,
-        )}
-      >
-        <div className="flex items-center justify-between gap-2">
-          <p className="font-medium text-sm">{label}</p>
-          <span className="shrink-0 text-xs text-muted-foreground">
-            {expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')}
-          </span>
-        </div>
-        <div className="h-1.5 w-full bg-input" aria-hidden />
-        <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
-          <span>{expired ? t('暂无新用量', 'No new usage') : t('等待上游返回', 'Waiting for upstream')}</span>
-          {expired && reset != null && (
-            <span
-              className="shrink-0 whitespace-nowrap tabular-nums"
-              title={t(`${formatFullTime(reset, language)} 已重置`, `Reset at ${formatFullTime(reset, language)}`)}
-            >
-              {t(`重置于 ${formatClockTime(reset, language)}`, `Reset ${formatClockTime(reset, language)}`)}
-            </span>
-          )}
-        </div>
-      </div>
-    )
-  }
-
+  // 窗口重置后上游那份 utilization 就作废了（[evaluateQuotaWindow] 把它抹成 null），此时
+  // 这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」。那句话
+  // 占着和数据一样大的地方，说的却只是「这里没什么可看」。倒计时同理：没有未来的重置时刻
+  // 就整段不出现，而不是留个「—」占位。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
   const indicatorClass = level === 'critical'
@@ -793,51 +834,59 @@ function QuotaMeter({
       ? 'bg-warning'
       : 'bg-success'
 
+  const valueClass = level === 'critical'
+    ? 'text-destructive'
+    : level === 'warning'
+      ? 'text-warning-foreground'
+      : 'text-foreground'
+
   return (
     <Meter value={percentage} max={100} className="gap-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <MeterLabel>
+      {/* 数据先行、进度条随后：请求数与花费是「这个窗口里发生了什么」，百分比是「还剩多少」。
+          两组分行排，比原先挤在一行的三列 dl 好扫——那一行里三个标签三个值交替出现，
+          眼睛得逐个配对。 */}
+      <dl className="flex min-w-0 flex-wrap items-center gap-1">
+        <QuotaFact
+          label={t('请求数', 'Requests')}
+          value={requests == null ? '—' : formatCompactNumber(requests, locale)}
+          title={requests == null ? undefined : requests.toLocaleString(locale)}
+          suffix="req"
+        />
+        <QuotaFact
+          label={t('等价 API 费用', 'Equivalent API cost')}
+          value={cost == null ? '—' : formatUsd(cost)}
+        />
+      </dl>
+      <div className="flex min-w-0 items-center gap-1.5">
+        {/* 窗口名做成固定色的小标签（5h / 7d 各一色）：它是分类而不是状态，配色跟右边那组
+            表示占用的红黄绿分开，两侧各管一件事。 */}
+        <MeterLabel
+          className={cn(badgeVariants({ variant: windowVariant, size: 'sm' }), 'shrink-0 tabular-nums')}
+        >
           <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
           {label}
-          <span className="sr-only">{t('额度使用率', 'quota usage')}</span>
+          <span className="sr-only">{t('用量', 'usage')}</span>
         </MeterLabel>
-        <MeterValue title={t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}>
+        <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
+          <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
+        </MeterTrack>
+        <MeterValue
+          className={cn('shrink-0 font-medium text-xs', valueClass)}
+          title={t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}
+        >
           {() => `${percentage}%`}
         </MeterValue>
+        {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
+            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
+        {reset != null && reset > now && (
+          <span
+            className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
+            title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+          >
+            {formatCountdown(reset, now)}
+          </span>
+        )}
       </div>
-      <MeterTrack className="h-1.5">
-        <MeterIndicator className={indicatorClass} />
-      </MeterTrack>
-      <dl className="flex min-w-0 items-baseline justify-between gap-1 text-xs leading-none text-muted-foreground @sm/card:text-[10px] @lg/card:gap-2 @lg/card:text-xs">
-        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
-          <dt
-            className="shrink-0"
-            title={t('请求数', requests === 1 ? 'Request' : 'Requests')}
-          >
-            {t('请求', 'Req')}
-          </dt>
-          <dd className="shrink-0 tabular-nums">
-            {requests == null ? '—' : requests.toLocaleString(locale)}
-          </dd>
-        </div>
-        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
-          <dt className="shrink-0">{t('花费', 'Cost')}</dt>
-          <dd className="shrink-0 tabular-nums">
-            {cost == null ? '—' : formatUsd(cost)}
-          </dd>
-        </div>
-        <div className="inline-flex min-w-0 items-baseline gap-0.5 whitespace-nowrap @lg/card:gap-1">
-          <dt className="shrink-0">{t('重置', 'Reset')}</dt>
-          <dd
-            className="shrink-0 tabular-nums"
-            title={reset != null
-              ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
-              : undefined}
-          >
-            {reset == null ? '—' : formatClockTime(reset, language)}
-          </dd>
-        </div>
-      </dl>
     </Meter>
   )
 }

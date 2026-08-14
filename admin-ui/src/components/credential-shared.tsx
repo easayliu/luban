@@ -274,8 +274,8 @@ function quotaWarningDetail(quota: QuotaRiskMeta, language: Language): string {
   ].filter(Boolean)
   return localize(
     language,
-    `${windows.join('、')}，已达到额度预警线`,
-    `${windows.join(', ')} reached the quota warning threshold`,
+    `${windows.join('、')}，已达到用量预警线`,
+    `${windows.join(', ')} reached the usage warning threshold`,
   )
 }
 
@@ -293,8 +293,8 @@ function statusFromQuota(
       label: localize(language, '限流暂停', 'Rate limited'),
       detail: localize(
         language,
-        `账号额度已用尽，已移出调度池，${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或做一次连通性测试立即恢复`,
-        `Quota exhausted; removed from the scheduling pool and resuming automatically at ${formatFullTime(cred.resume_at, language)}. You can also enable it manually or run a connectivity test to restore it now`,
+        `账号用量已达上限，已移出调度池，${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或做一次连通性测试立即恢复`,
+        `Usage limit reached; removed from the scheduling pool and resuming automatically at ${formatFullTime(cred.resume_at, language)}. You can also enable it manually or run a connectivity test to restore it now`,
       ),
       attention: true, rank: 6,
     }
@@ -324,8 +324,8 @@ function statusFromQuota(
       label: localize(language, 'Usage credits 生效中', 'Usage credits active'),
       detail: localize(
         language,
-        `额度快照（${snapshotTime}）显示该账号已用完套餐包含的用量，正由 Usage credits 按标准 API 价继续放行请求`,
-        `The quota snapshot (${snapshotTime}) shows this account has used up its plan's included usage and is being served by usage credits at standard API rates`,
+        `用量快照（${snapshotTime}）显示该账号已用完套餐包含的用量，正由 Usage credits 按标准 API 价继续放行请求`,
+        `The usage snapshot (${snapshotTime}) shows this account has used up its plan's included usage and is being served by usage credits at standard API rates`,
       ),
       attention: true, rank: 5,
     }
@@ -338,19 +338,19 @@ function statusFromQuota(
       detail: quota.overageUnresolved === 'no-full-window'
         ? localize(
             language,
-            `额度快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等新请求也不会更清楚，做一次连通性测试看上游此刻的原始额度头`,
-            `The quota snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this — run a connectivity test to see the upstream's current raw quota headers`,
+            `用量快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等新请求也不会更清楚，做一次连通性测试看上游此刻的原始限流响应头`,
+            `The usage snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this — run a connectivity test to see the upstream's current raw rate limit headers`,
           )
         : quota.overageUnresolved === 'legacy-snapshot'
           ? localize(
               language,
-              `额度快照（${snapshotTime}）早于「记录全部额度窗口」这次升级，只存了 5h / 7d 两个窗口，吃满的那个（多为超额池）没被存下来。下一条带额度头的请求会自动补齐`,
-              `The quota snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the overage pool) was not kept. The next request carrying quota headers will fill it in`,
+              `用量快照（${snapshotTime}）早于「记录全部用量窗口」这次升级，只存了 5h / 7d 两个窗口，吃满的那个（多为超额池）没被存下来。下一条带限流响应头的请求会自动补齐`,
+              `The usage snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the overage pool) was not kept. The next request carrying rate limit headers will fill it in`,
             )
           : localize(
               language,
-              `额度快照（${snapshotTime}）记录了 Usage credits，但现有窗口信息不足以确认当前是否仍在计费，需等待新请求确认`,
-              `The quota snapshot (${snapshotTime}) recorded usage credits, but the available window data cannot confirm whether they are still in use; wait for a new request to verify`,
+              `用量快照（${snapshotTime}）记录了 Usage credits，但现有窗口信息不足以确认当前是否仍在计费，需等待新请求确认`,
+              `The usage snapshot (${snapshotTime}) recorded usage credits, but the available window data cannot confirm whether they are still in use; wait for a new request to verify`,
             ),
       attention: true, rank: 4,
     }
@@ -371,7 +371,7 @@ function statusFromQuota(
   if (quota.nearLimit) {
     return {
       kind: 'near-limit', variant: 'warning',
-      label: localize(language, '额度将满', 'Quota nearly full'),
+      label: localize(language, '用量将满', 'Usage nearly full'),
       detail: quotaWarningDetail(quota, language), attention: true, rank: 2,
     }
   }
@@ -974,8 +974,8 @@ export function ConnectivityTestDialog({
               </div>
               <FieldDescription>
                 {t(
-                  '每次测试会消耗少量订阅额度，并计入该账号当前周期的请求数与花费。',
-                  'Each test uses a small amount of subscription quota and counts toward this account’s current-period requests and cost.',
+                  '每次测试会消耗少量订阅用量，并计入该账号当前周期的请求数与花费。',
+                  'Each test uses a small amount of subscription usage and counts toward this account’s current-period requests and cost.',
                 )}
               </FieldDescription>
             </Field>
@@ -987,8 +987,8 @@ export function ConnectivityTestDialog({
                 <EmptyTitle className="text-base">{t('尚无测试结果', 'No test results yet')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '选择模型并开始测试，结果会显示实时额度或上游错误。',
-                    'Select a model and start a test to see live quota data or upstream errors.',
+                    '选择模型并开始测试，结果会显示实时用量或上游错误。',
+                    'Select a model and start a test to see live usage data or upstream errors.',
                   )}
                 </EmptyDescription>
               </EmptyHeader>
@@ -1097,7 +1097,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
           {t('需等待', 'Wait')} {formatWait(quota.retry_after_secs, language)}
         </span>
       )}
-      {/* 套餐额度已满但上游动用 Usage credits 放行：不 429、请求照常成功，只有这里能看出在花钱。 */}
+      {/* 套餐用量已满但上游动用 Usage credits 放行：不 429、请求照常成功，只有这里能看出在花钱。 */}
       {quota.overage_in_use && (
         <span
           className="text-destructive-foreground"
@@ -1120,10 +1120,10 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
           title={
             quota.rl_representative
               ? t(
-                  `上游整体额度状态（当前由 ${quota.rl_representative} 窗口决定）`,
-                  `Overall upstream quota status (currently determined by the ${quota.rl_representative} window)`,
+                  `上游整体用量状态（当前由 ${quota.rl_representative} 窗口决定）`,
+                  `Overall upstream usage status (currently determined by the ${quota.rl_representative} window)`,
                 )
-              : t('上游整体额度状态', 'Overall upstream quota status')
+              : t('上游整体用量状态', 'Overall upstream usage status')
           }
         >
           {unifiedQuotaStatusLabel(quota.unified_status, language)}
@@ -1187,6 +1187,29 @@ export function isOrgAccount(cred: Pick<Credential, 'org_type'>): boolean {
 export function orgBadgeLabel(cred: Pick<Credential, 'org_type'>): string {
   const bare = (cred.org_type?.trim().toLowerCase() ?? '').replace(/^claude_/, '')
   return bare.charAt(0).toUpperCase() + bare.slice(1)
+}
+
+/**
+ * 设备名额占用的配色，走容量类指标那套通行分级：**空闲灰、健康绿、吃紧黄、占满红**。
+ *
+ * - 一台都没绑（`count == 0`）→ 灰：这是「没在用」，不是「用得很好」，不该和健康色混在一起；
+ * - 占用 < 70% → 绿；
+ * - 占用 >= 70%，或**只剩最后一个名额** → 黄。后半条是给小分母兜底的：设备上限常是 3、5
+ *   这种数字，2/3 按百分比才 66%，可它其实只剩一个位置了；
+ * - 占满（`count >= limit`）→ 红。红**只**留给真占满：还能收设备的号涂成红色，和已经收不下
+ *   的号看着一样，那就白涂了——所以 90% 那一档在这里仍是黄的。
+ *
+ * 不限（`limit <= 0`）没有「满」这个状态，有人用就是绿，到不了黄红。
+ */
+export function deviceUsageMeta(
+  count: number,
+  effectiveLimit: number,
+): { level: QuotaLevel; variant: BadgeProps['variant'] } {
+  if (count <= 0) return { level: 'empty', variant: 'secondary' }
+  if (effectiveLimit <= 0) return { level: 'ok', variant: 'success' }
+  if (count >= effectiveLimit) return { level: 'critical', variant: 'error' }
+  const tight = quotaLevel(count / effectiveLimit) !== 'ok' || effectiveLimit - count <= 1
+  return tight ? { level: 'warning', variant: 'warning' } : { level: 'ok', variant: 'success' }
 }
 
 export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
@@ -1262,8 +1285,8 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
       className: 'font-medium text-warning-foreground',
       title: localize(
         language,
-        `额度用尽，${formatFullTime(cred.resume_at, language)} 自动恢复调度`,
-        `Quota exhausted; scheduling resumes at ${formatFullTime(cred.resume_at, language)}`,
+        `用量已达上限，${formatFullTime(cred.resume_at, language)} 自动恢复调度`,
+        `Usage limit reached; scheduling resumes at ${formatFullTime(cred.resume_at, language)}`,
       ),
     }
   }

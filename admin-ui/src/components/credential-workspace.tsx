@@ -7,6 +7,7 @@ import {
   ListFilterIcon,
   ListIcon,
   PlusIcon,
+  ActivityIcon,
   RadioIcon,
   RefreshCwIcon,
   SearchIcon,
@@ -15,7 +16,9 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
+import { getMetrics } from '@/api/metrics'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
@@ -112,7 +115,7 @@ const FILTERS: {
     label: ['异常（已封禁）', 'Abnormal (banned)'],
     match: ({ credential }) => !!credential.ban_reason,
   },
-  { key: 'nearLimit', label: ['额度风险', 'Quota risk'], match: (evaluation) => evaluation.quotaRisk },
+  { key: 'nearLimit', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
   {
     key: 'cooldown',
     label: ['冷却中', 'Cooling down'],
@@ -309,6 +312,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const searchRef = useRef<HTMLInputElement>(null)
   useSearchHotkey(searchRef)
   const now = useNowSeconds()
+  // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
+  // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
+  const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: getMetrics, refetchInterval: 10_000 })
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   const filterItems = useMemo(
@@ -452,7 +458,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       ? t(`${formatNumber(cooldownCount)} 冷却`, `${formatNumber(cooldownCount)} cooling down`)
       : '',
     metrics.nearLimitCount > 0
-      ? t(`${formatNumber(metrics.nearLimitCount)} 额度`, `${formatNumber(metrics.nearLimitCount)} near quota`)
+      ? t(`${formatNumber(metrics.nearLimitCount)} 将满`, `${formatNumber(metrics.nearLimitCount)} near limit`)
       : '',
   ].filter(Boolean).join(' · ') || undefined
   const quotaRiskStatus = [
@@ -743,17 +749,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         {isLoading ? (
           <section
             aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-4"
+            className="grid grid-cols-2 border-t lg:grid-cols-5"
           >
             <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
             <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-            <OverviewMetricSkeleton className="border-r" />
-            <OverviewMetricSkeleton />
+            <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
+            <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+            <OverviewMetricSkeleton className="col-span-2 lg:col-span-1" />
           </section>
         ) : count > 0 && (
           <section
             aria-label={t('账号池概览', 'Account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-4"
+            className="grid grid-cols-2 border-t lg:grid-cols-5"
           >
             <OverviewMetric
               className="border-r border-b lg:border-b-0"
@@ -789,7 +796,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             />
             <OverviewMetric
               className="border-r"
-              label={t('额度风险', 'Quota risk')}
+              label={t('用量风险', 'Usage risk')}
               value={formatNumber(quotaRiskCount)}
               status={quotaRiskStatus}
               icon={RadioIcon}
@@ -798,6 +805,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               onClick={() => selectMetric('nearLimit')}
             />
             <OverviewMetric
+              className="border-b lg:border-r lg:border-b-0"
               label={t('绑定设备', 'Linked devices')}
               value={formatNumber(metrics.deviceCount)}
               status={deviceStatus}
@@ -805,6 +813,21 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
               active={filter === 'deviceFull' || filter === 'hasDevice'}
               onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+            />
+            {/* 唯一一格不来自账号列表、也点不动的指标：它讲的是「此刻代理在干什么」，
+                而不是「池子里有几个号处于某状态」。窄屏独占一整行，别把它挤成半格。 */}
+            <OverviewMetric
+              className="col-span-2 lg:col-span-1"
+              label={t('实时流量', 'Live traffic')}
+              value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
+              status={metricsQuery.data
+                ? t(
+                    `RPM · ${formatNumber(metricsQuery.data.in_flight)} 在途`,
+                    `RPM · ${formatNumber(metricsQuery.data.in_flight)} in flight`,
+                  )
+                : t('读取中', 'Loading')}
+              icon={ActivityIcon}
+              tone={(metricsQuery.data?.in_flight ?? 0) > 0 ? 'ok' : 'neutral'}
             />
           </section>
         )}

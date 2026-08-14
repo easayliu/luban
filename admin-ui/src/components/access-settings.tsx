@@ -522,9 +522,8 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         )
       : null,
   ].filter(Boolean)
-  const rpmPolicy = rpmParts.length > 0
-    ? t(`${rpmParts.join(' · ')} 条 / 分钟`, `${rpmParts.join(' · ')} per min`)
-    : t('不限', 'Unlimited')
+  // 不再缀「条 / 分钟」：RPM 这个词本身就是每分钟条数，标题已经写着，缀上只会把这格挤到换行。
+  const rpmPolicy = rpmParts.length > 0 ? rpmParts.join(' · ') : t('不限', 'Unlimited')
   const items = [
     {
       label: t('名额有效期', 'Slot lifetime'),
@@ -583,10 +582,13 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         {items.map((item, index) => (
           <div
             key={item.label}
-            className={`min-w-0 px-5 py-4 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
+            // 六格铺平那档把左右内边距收窄一点：省下来的宽度全给值，少一次换行。
+            className={`min-w-0 px-5 py-4 md:px-4 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
           >
             <dt className="text-xs text-muted-foreground">{item.label}</dt>
-            <dd className="mt-1 truncate font-semibold text-sm" title={item.value}>{item.value}</dd>
+            {/* 值一律完整显示：这是「当前生效的策略」，截成 `账号 40 · 设备 1…` 等于没说。
+                放不下就换行——同一行的格子跟着一起变高，比省一行高度而藏掉半个数值划算。 */}
+            <dd className="mt-1 font-semibold text-sm leading-snug break-words">{item.value}</dd>
           </div>
         ))}
       </dl>

@@ -339,6 +339,40 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/**
+ * 剩余秒数 → 紧凑倒计时：`45m`、`2h 5m`、`6d 0h`，不足一分钟为 `<1m`。
+ *
+ * 中英文共用这套缩写：它出现在卡片上最挤的那一行（窗口标签 + 进度条 + 百分比 + 倒计时），
+ * 「6 天 0 小时」会把进度条压没，而 d/h/m 在两种语言里都读得懂。
+ *
+ * **必须配一个会走的时钟**：调用方传入的 `nowSecs` 要来自页面 tick（见 credential-workspace
+ * 的 useNowSeconds，30 秒一跳且切回前台立刻校准），否则渲染完就冻在那一刻。需要精确到分秒
+ * 的地方仍用 {@link formatFullTime} 给绝对时刻——倒计时受本地时钟偏差影响，只适合看个大概。
+ */
+export function formatCountdown(targetSecs: number, nowSecs: number): string {
+  const left = Math.max(0, targetSecs - nowSecs)
+  if (left < 60) return '<1m'
+  const minutes = Math.floor(left / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ${minutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
+}
+
+/**
+ * 大数字压成一眼可读的短形式：`3542` → `3.5K`（英文）/`3542` → `3542`、`12000` → `1.2万`
+ * （中文，随 locale 走）。
+ *
+ * 只用于空间紧张、量级比精确值更有用的地方（卡片上的请求数）。要对数的场合仍用
+ * `toLocaleString`——`3.5K` 看不出到底是 3542 还是 3549。
+ */
+export function formatCompactNumber(n: number, locale: string): string {
+  return new Intl.NumberFormat(locale, {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(n)
+}
+
 /** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
 export function formatUsd(v: number): string {
   if (!v || v <= 0) return '$0.00'

@@ -16,6 +16,7 @@ import {
   CredentialMenuContent,
   DeferredMount,
   DeleteCredentialDialog,
+  deviceUsageMeta,
   evaluateCredential,
   quotaLevel,
   isOrgAccount,
@@ -143,10 +144,10 @@ export function CredentialListHeader({
           {sortable(t('账号等级', 'Tier'), 'tier')}
         </TableHead>
         <TableHead className={COL.quota5h} {...sortProps('usage5h')}>
-          {sortable(t('5h 额度', '5h quota'), 'usage5h')}
+          {sortable(t('5h 用量', '5h usage'), 'usage5h')}
         </TableHead>
         <TableHead className={COL.quota7d} {...sortProps('usage7d')}>
-          {sortable(t('7d 额度', '7d quota'), 'usage7d')}
+          {sortable(t('7d 用量', '7d usage'), 'usage7d')}
         </TableHead>
         <TableHead className={COL.devices} {...sortProps('devices')}>
           {sortable(t('设备', 'Devices'), 'devices')}
@@ -199,6 +200,8 @@ export const CredentialRow = memo(function CredentialRow({
   const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const policy = devicePolicyMeta(cred.device_limit, language)
+  // 设备名额占用的配色：满了红、快满了黄、不限中性，与卡片共用 [deviceUsageMeta]。
+  const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
   // 0 = 不限，此时不显示分母也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
   const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
@@ -298,7 +301,10 @@ export const CredentialRow = memo(function CredentialRow({
                   title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
                   aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
                 >
-                  <span className="tabular-nums">{cred.device_count}/{effectiveLimit} · {policy.label}</span>
+                  <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+                    {cred.device_count}/{effectiveLimit}
+                  </Badge>
+                  <span className="text-muted-foreground">{policy.label}</span>
                 </Button>
               </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
@@ -358,8 +364,8 @@ export const CredentialRow = memo(function CredentialRow({
               <Badge
                 variant="warning"
                 title={t(
-                  `组织账号（${cred.org_type}）：额度由整个组织共享`,
-                  `Organisation account (${cred.org_type}): the quota is shared across the whole organisation`,
+                  `组织账号（${cred.org_type}）：用量由整个组织共享`,
+                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation`,
                 )}
               >
                 {orgBadgeLabel(cred)}
@@ -405,7 +411,10 @@ export const CredentialRow = memo(function CredentialRow({
             title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
             aria-haspopup="dialog"
           >
-            <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
+            {/* 计数底色随名额占用走（绿 / 黄 / 红），与卡片同一套判定，见 [deviceUsageMeta]。 */}
+            <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+              {cred.device_count}/{effectiveLimit}
+            </Badge>
             <Badge variant={policy.variant} size="sm">{policy.label}</Badge>
           </Button>
         </TableCell>
@@ -714,8 +723,8 @@ function ListQuotaMeter({
       <div
         className="flex w-full flex-col gap-2"
         title={t(
-          `上游从未为该账号返回 ${label} 窗口，说明它的额度模型里没有这个窗口（不是数据缺失）`,
-          `The upstream has never returned a ${label} window for this account, meaning its quota model has no such window (this is not missing data)`,
+          `上游从未为该账号返回 ${label} 窗口，说明它的用量模型里没有这个窗口（不是数据缺失）`,
+          `The upstream has never returned a ${label} window for this account, meaning its usage model has no such window (this is not missing data)`,
         )}
       >
         <div className="flex items-center justify-between gap-2">
@@ -744,7 +753,7 @@ function ListQuotaMeter({
           `${label}窗口已于 ${formatFullTime(reset, language)} 重置，之后暂无新请求`,
           `${label} window reset at ${formatFullTime(reset, language)}; there are no newer requests`,
         )
-      : t(`${label}额度暂无数据`, `No ${label} quota data`)
+      : t(`${label}用量暂无数据`, `No ${label} usage data`)
     return (
       <div
         className="flex w-full flex-col gap-2"
@@ -781,7 +790,7 @@ function ListQuotaMeter({
       : 'bg-success'
 
   return (
-    <Meter value={percentage} max={100} title={t(`${label}额度使用率 ${percentage}%`, `${label} quota usage ${percentage}%`)}>
+    <Meter value={percentage} max={100} title={t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-baseline gap-1.5">
           <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>

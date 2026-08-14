@@ -1830,7 +1830,7 @@ const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
 /// 否则窗口内的流水会被裁掉、cost_7d 平白变小；30 天同时给请求日志页留够翻看余量。
 const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// RPM（每分钟请求数）的统计窗口：最近 60 秒。
-const RPM_WINDOW_SECS: i64 = 60;
+pub const RPM_WINDOW_SECS: i64 = 60;
 
 impl CredentialStore {
     /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
@@ -1950,6 +1950,21 @@ impl CredentialStore {
             out.insert(cid, n);
         }
         Ok(out)
+    }
+
+    /// **全局 RPM**：最近 60 秒经 luban 转发的请求总数。
+    ///
+    /// 口径与 [`Self::recent_rpm`] 逐条对齐（同一张表、同一个窗口、同样只数落到某个账号头上
+    /// 的那些），所以它恒等于各账号 RPM 之和——两个数摆在同一屏上，对不上会比看不到更让人
+    /// 犯疑。代价是没选到号就失败的请求（全员限流、无可用凭证）不计入：它们压根没发出去。
+    pub fn total_rpm(&self) -> Result<i64> {
+        let conn = self.conn.lock();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM usage_logs WHERE ts >= unixepoch() - ?1 AND cred_id IS NOT NULL",
+            [RPM_WINDOW_SECS],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// 单个凭证当前的 RPM；口径同 [`Self::recent_rpm`]，无请求时为 0。
@@ -4583,6 +4598,20 @@ mod tests {
         let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap().id;
         assert_eq!(store.recent_rpm().unwrap().get(&c), None);
         assert_eq!(store.recent_rpm_of(c).unwrap(), 0);
+
+        // 全局 RPM 必须恰好是各账号之和：两个数会并排显示在同一屏上，对不上比看不到更糟。
+        assert_eq!(store.total_rpm().unwrap(), 3);
+        assert_eq!(
+            store.total_rpm().unwrap(),
+            store.recent_rpm().unwrap().values().sum::<i64>(),
+            "全局与逐账号必须同口径（同一张表、同一个窗口）"
+        );
+
+        // 没落到任何账号头上的流水（选号前就失败的那些）不计入——它们压根没发出去。
+        store
+            .insert_usage_log_at(&UsageRecord { cred_id: None, ..Default::default() }, Some(now))
+            .unwrap();
+        assert_eq!(store.total_rpm().unwrap(), 3, "无账号的流水不进全局 RPM");
     }
 
     /// 只有一个窗口带 `reset` 时，窗口统计不得被连接条件的下界误伤成 0。

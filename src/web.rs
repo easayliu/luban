@@ -55,6 +55,11 @@ pub struct AppState {
     /// 「模型 + 取值」组合（`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。
     /// 见 [`crate::proxy::ShapeMemory`]。
     pub shape_rejections: crate::proxy::ShapeMemory,
+    /// **在途请求数**：已进入转发入口、响应尚未走完的那些。
+    ///
+    /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
+    /// 只在 `handle` 返回时减一会把这类请求算成「瞬间就结束了」，并发数永远显示成 0～1。
+    pub in_flight: Arc<std::sync::atomic::AtomicI64>,
 }
 
 type ApiError = (StatusCode, String);
@@ -77,6 +82,7 @@ pub async fn run(
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
         shape_rejections: Arc::default(),
+        in_flight: Arc::default(),
     };
 
     // 每天裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
@@ -128,6 +134,7 @@ pub async fn run(
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
         .route("/usage", get(list_usage))
+        .route("/metrics", get(get_metrics))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
@@ -846,6 +853,30 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
             )
             .with_stats(quota, last_used, cost_total, rpm),
     ))
+}
+
+// ---------- 实时指标 ----------
+
+/// 整个代理此刻的两个实时数，见 [`get_metrics`]。
+#[derive(Serialize)]
+struct MetricsResp {
+    /// 全局 RPM：最近 60 秒转发的请求总数，恒等于各账号 RPM 之和
+    /// （见 [`store::CredentialStore::total_rpm`]）。
+    rpm: i64,
+    /// 在途请求数：已进入转发入口、响应尚未走完的那些（流式回复整段传输期间都算）。
+    in_flight: i64,
+    /// RPM 的统计窗口（秒），固定 60；前端据此写文案，不必两边各写死一个 60。
+    window_secs: i64,
+}
+
+/// 读取实时指标。**刻意与账号列表分开**：这两个数几秒就变一次，值得单独用一个便宜的接口
+/// 高频轮询，而账号列表那个响应要跑十几条聚合查询，按同样频率拉只是白烧数据库。
+async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>, ApiError> {
+    Ok(Json(MetricsResp {
+        rpm: state.store.total_rpm().map_err(internal)?,
+        in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed).max(0),
+        window_secs: store::RPM_WINDOW_SECS,
+    }))
 }
 
 // ---------- 接入设置 ----------
