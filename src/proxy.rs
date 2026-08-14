@@ -120,13 +120,17 @@ pub async fn handle(
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, error = %e, "refusing to forward");
-            // 两类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
-            // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；所有号都在上游 429
-            // 冷却中（硬门禁）取最早解冻的那个的剩余时间。
-            let computable_retry =
-                e.downcast_ref::<store::BareRateLimited>().map(|rl| rl.retry_after_secs).or_else(
-                    || e.downcast_ref::<store::AllRateLimited>().map(|rl| rl.retry_after_secs),
-                );
+            // 三类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
+            // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；账号 RPM 上限取窗口里
+            // 最早那条滚出去的时刻；所有号都在上游 429 冷却中（硬门禁）取最早解冻的那个的
+            // 剩余时间。
+            let computable_retry = e
+                .downcast_ref::<store::BareRateLimited>()
+                .map(|rl| rl.retry_after_secs)
+                .or_else(|| e.downcast_ref::<store::RpmLimited>().map(|rl| rl.retry_after_secs))
+                .or_else(|| {
+                    e.downcast_ref::<store::AllRateLimited>().map(|rl| rl.retry_after_secs)
+                });
             if let Some(secs) = computable_retry {
                 let retry = secs.to_string();
                 return (
@@ -5298,6 +5302,7 @@ mod tests {
             priority: 0,
             disabled: false,
             device_limit: 0,
+            rpm_limit: 0,
             ban_reason: None,
             account_uuid: Some(ACCOUNT_UUID.into()),
             resume_at: None,

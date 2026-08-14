@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
-  deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities,
+  deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities, setRpmLimits,
   type Credential,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
@@ -30,8 +30,14 @@ const LIMIT_MODE_ITEMS = [
   { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
 ] as const
 
+const RPM_MODE_ITEMS = [
+  { value: 'default', chinese: '跟随默认', english: 'Use default' },
+  { value: 'unlimited', chinese: '不限速', english: 'Unlimited' },
+  { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
+] as const
+
 /**
- * 批量操作条：全选/清空 + 优先级 / 设备上限 / 启停 / 删除。
+ * 批量操作条：全选/清空 + 优先级 / 设备上限 / RPM 上限 / 启停 / 删除。
  *
  * 所有操作都作用于**当前筛选结果里被勾选的账号**（跨页保留勾选）。写操作走各自的批量
  * 接口，后端在单事务内完成，不会出现「改了一半」的中间态。
@@ -49,6 +55,8 @@ export function BatchActionsBar({
   const [priority, setPriority] = useState(0)
   const [limitMode, setLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
   const [customLimit, setCustomLimit] = useState(1)
+  const [rpmMode, setRpmMode] = useState<'default' | 'unlimited' | 'custom'>('default')
+  const [customRpm, setCustomRpm] = useState(60)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
@@ -58,6 +66,10 @@ export function BatchActionsBar({
   const formattedTotal = all.length.toLocaleString(locale)
   const englishAccountCount = `${formattedCount} ${n === 1 ? 'account' : 'accounts'}`
   const limitModeItems = LIMIT_MODE_ITEMS.map((item) => ({
+    value: item.value,
+    label: t(item.chinese, item.english),
+  }))
+  const rpmModeItems = RPM_MODE_ITEMS.map((item) => ({
     value: item.value,
     label: t(item.chinese, item.english),
   }))
@@ -99,6 +111,25 @@ export function BatchActionsBar({
       ),
     onError,
   })
+  const applyRpmLimit = useMutation({
+    mutationFn: (v: number) => setRpmLimits(ids, v),
+    onSuccess: (_r, v) =>
+      notify(
+        v > 0 ? t(
+          `已把 ${formattedCount} 个账号的 RPM 上限设为 ${v.toLocaleString(locale)}`,
+          `Set the RPM limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
+        )
+          : v === 0 ? t(
+            `已把 ${formattedCount} 个账号改为跟随全局默认 RPM 上限`,
+            `Set ${englishAccountCount} to use the global default RPM limit`,
+          )
+            : t(
+              `已把 ${formattedCount} 个账号设为不限 RPM`,
+              `Set ${englishAccountCount} to unlimited RPM`,
+            ),
+      ),
+    onError,
+  })
   const applyDisabled = useMutation({
     mutationFn: (d: boolean) => setDisabledMany(ids, d),
     onSuccess: (_r, d) => notify(t(
@@ -118,10 +149,11 @@ export function BatchActionsBar({
   })
 
   const busy =
-    applyPriority.isPending || applyLimit.isPending ||
+    applyPriority.isPending || applyLimit.isPending || applyRpmLimit.isPending ||
     applyDisabled.isPending || applyDelete.isPending
   const allSelected = all.length > 0 && all.every((item) => selected.has(item.id))
   const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
+  const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customRpm))
 
   return (
     <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-xl">
@@ -216,6 +248,34 @@ export function BatchActionsBar({
                 </NumberField>
               )}
               <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
+                {t('应用', 'Apply')}
+              </Button>
+            </div>
+
+            {/* 独占一行：上面两格已经把宽屏那行占满了，挤进去只会把每格压到换行。 */}
+            <div className="flex flex-wrap items-center gap-2 lg:col-span-2 lg:border-t lg:pt-3">
+              <div className="mr-auto min-w-28">
+                <div className="text-xs font-medium">{t('RPM 上限', 'RPM limit')}</div>
+                <div className="text-xs text-muted-foreground">{t('每分钟最多转发多少条', 'Max requests forwarded per minute')}</div>
+              </div>
+              <Select items={rpmModeItems} value={rpmMode} onValueChange={(value) => value && setRpmMode(value as typeof rpmMode)}>
+                <SelectTrigger aria-label={t('批量设置 RPM 上限策略', 'Set RPM limit policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectPopup>
+                  {rpmModeItems.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {rpmMode === 'custom' && (
+                <NumberField value={customRpm} min={1} step={1} size="sm" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
+                  <NumberFieldGroup>
+                    <NumberFieldDecrement />
+                    <NumberFieldInput aria-label={t('批量设置独立 RPM 上限', 'Set a custom RPM limit for selected accounts')} />
+                    <NumberFieldIncrement />
+                  </NumberFieldGroup>
+                </NumberField>
+              )}
+              <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
                 {t('应用', 'Apply')}
               </Button>
             </div>

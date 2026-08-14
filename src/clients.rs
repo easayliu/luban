@@ -225,6 +225,7 @@ mod tests {
             priority: 0,
             disabled: false,
             device_limit: 0,
+            rpm_limit: 0,
             ban_reason: None,
             account_uuid: None,
             resume_at: None,

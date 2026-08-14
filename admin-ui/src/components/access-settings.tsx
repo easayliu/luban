@@ -14,6 +14,7 @@ import {
   ShieldCheckIcon,
   SmartphoneIcon,
   SparklesIcon,
+  TimerIcon,
   Trash2Icon,
 } from 'lucide-react'
 import {
@@ -21,6 +22,7 @@ import {
   setApiKey,
   setBareRateLimit,
   setDefaultDeviceLimit,
+  setDefaultRpmLimit,
   setDeviceRetention,
   setDeviceTtl,
   setRequireDeviceId,
@@ -436,6 +438,17 @@ export function DeviceSettingsContent() {
       </SettingsGroup>
 
       <SettingsGroup
+        icon={TimerIcon}
+        title={t('账号转发速率', 'Per-account request rate')}
+        description={t(
+          '限制单个账号每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。',
+          'Cap how many requests a single account forwards per minute; the same window as the RPM column in the account list.',
+        )}
+      >
+        <DefaultRpmLimit />
+      </SettingsGroup>
+
+      <SettingsGroup
         icon={ShieldCheckIcon}
         title={t('身份与防滥用', 'Identity & abuse prevention')}
         description={t(
@@ -502,6 +515,15 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         : t('不限', 'Unlimited'),
     },
     {
+      label: t('默认 RPM 上限', 'Default RPM limit'),
+      value: settings.default_rpm_limit > 0
+        ? t(
+            `${settings.default_rpm_limit.toLocaleString(locale)} 条 / 分钟`,
+            `${settings.default_rpm_limit.toLocaleString(locale)} req/min`,
+          )
+        : t('不限', 'Unlimited'),
+    },
+    {
       label: t('无身份请求', 'Unidentified requests'),
       value: bareRequestPolicy,
     },
@@ -516,14 +538,16 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         'A summary of the device binding and identity rules currently in effect.',
       )}
     >
+      {/* 一行五格在 sm 上会挤成两三个字换行，故拖到 md 才铺平；两档之间就是两列。
+          下面那串边框类是按「窄屏两列 / 宽屏一行」写死的，改列数要连它一起改。 */}
       <dl
         aria-label={t('当前设备策略概览', 'Current device policy overview')}
-        className="grid grid-cols-2 sm:grid-cols-4"
+        className="grid grid-cols-2 md:grid-cols-5"
       >
         {items.map((item, index) => (
           <div
             key={item.label}
-            className={`min-w-0 px-5 py-4 ${index >= 2 ? 'border-t sm:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'sm:border-l' : ''}`}
+            className={`min-w-0 px-5 py-4 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
           >
             <dt className="text-xs text-muted-foreground">{item.label}</dt>
             <dd className="mt-1 truncate font-semibold text-sm" title={item.value}>{item.value}</dd>
@@ -834,6 +858,93 @@ function DefaultDeviceLimit() {
             <NumberFieldIncrement
               aria-label={t('增加默认设备上限', 'Increase default device limit')}
             />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 全局默认账号 RPM 上限：账号未单独配置时套用。
+ *
+ * 窗口固定 60 秒，与账号列表那列 RPM 同一个口径（含失败的、含 count_tokens），
+ * 所以「上限 30」和「当前 12」可以直接比。
+ */
+function DefaultRpmLimit() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.default_rpm_limit)
+  }, [data?.default_rpm_limit])
+
+  const save = useMutation({
+    mutationFn: (limit: number) => setDefaultRpmLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('默认 RPM 上限已更新', 'Default RPM limit updated'),
+        description: settings.default_rpm_limit > 0
+          ? t(
+              `每个账号每分钟最多转发 ${settings.default_rpm_limit} 条请求。`,
+              `Each account forwards at most ${settings.default_rpm_limit} requests per minute.`,
+            )
+          : t('默认 RPM 上限已取消。', 'The default RPM limit has been removed.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.default_rpm_limit ?? 0
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('默认 RPM 上限', 'Default RPM limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '未单独配置的账号使用此上限；账号独立设置优先。打满后新请求分流到别的账号，已绑定的设备收到 429 与 retry-after。',
+            'Accounts without an individual limit use this value; account-specific settings take priority. Once full, new requests spill to another account and already-bound devices get a 429 with retry-after.',
+          )}
+        </FieldDescription>
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(`每个账号每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per account`)
+            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+        </Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少默认 RPM 上限', 'Decrease default RPM limit')} />
+            <NumberFieldInput aria-label={t('默认 RPM 上限', 'Default RPM limit')} />
+            <NumberFieldIncrement aria-label={t('增加默认 RPM 上限', 'Increase default RPM limit')} />
           </NumberFieldGroup>
         </NumberField>
         <Button

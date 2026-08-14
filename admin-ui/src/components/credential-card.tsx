@@ -39,6 +39,7 @@ import {
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
+import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, badgeVariants } from '@/components/ui/badge'
@@ -91,6 +92,7 @@ export const CredentialCard = memo(function CredentialCard({
   const [name, setName] = useState(cred.label)
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
+  const [rpmOpen, setRpmOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -106,6 +108,9 @@ export const CredentialCard = memo(function CredentialCard({
   const has5h = quota.h5.reported
   const has7d = quota.d7.reported
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
+  // 0 = 不限，此时页脚只显示 RPM 本身，不画分母、也不谈「打满」。
+  const rpmLimit = cred.rpm_limit_effective
+  const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
   const devicePolicy = cred.device_limit === 0
     ? { label: t('跟随默认', 'Default'), variant: 'secondary' as const }
     : cred.device_limit < 0
@@ -272,6 +277,7 @@ export const CredentialCard = memo(function CredentialCard({
                     setEditing(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onRpmLimit={() => setRpmOpen(true)}
                   onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
@@ -464,15 +470,23 @@ export const CredentialCard = memo(function CredentialCard({
                     </span>
                     <span className="sr-only">{t('当前 RPM', 'Current RPM')}</span>
                     <span className="inline-flex items-baseline gap-1">
-                      <span className="font-medium tabular-nums">{cred.rpm}</span>
+                      <span className={cn('font-medium tabular-nums', rpmFull && 'text-warning')}>
+                        {cred.rpm}
+                        {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
+                      </span>
                       <span className="text-2xs text-muted-foreground tracking-wide">RPM</span>
                     </span>
                   </TooltipTrigger>
                   <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                    {t(
-                      '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-                      'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
-                    )}
+                    {rpmLimit > 0
+                      ? t(
+                        `当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）。上限 ${rpmLimit} 条/分钟，打满后新请求分流到别的账号，已绑定的设备收到 429。`,
+                        `Current RPM: requests forwarded through this account in the last 60 seconds (failures included). Limited to ${rpmLimit}/min; once full, new requests spill to another account and already-bound devices get a 429.`,
+                      )
+                      : t(
+                        '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+                        'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+                      )}
                   </TooltipPopup>
                 </Tooltip>
               </>
@@ -491,12 +505,18 @@ export const CredentialCard = memo(function CredentialCard({
         </CardFooter>
 
         {/* 没点开过任何一个就一个都不挂：账号一多，这些常关的对话框全是白挂的组件树。 */}
-        <DeferredMount open={proxyOpen || devicesOpen || usageOpen || confirmDelete || testing}>
+        <DeferredMount open={proxyOpen || devicesOpen || usageOpen || confirmDelete || rpmOpen || testing}>
           <CredentialProxyDialog
             cred={cred}
             open={proxyOpen}
             onOpenChange={setProxyOpen}
             proxy={actions.proxy}
+          />
+          <CredentialRpmDialog
+            cred={cred}
+            open={rpmOpen}
+            onOpenChange={setRpmOpen}
+            rpmLimit={actions.rpmLimit}
           />
           <CredentialDevicesDialog
             cred={cred}

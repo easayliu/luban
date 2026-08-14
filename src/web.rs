@@ -111,6 +111,7 @@ pub async fn run(
         .route("/credentials", get(list_credentials))
         .route("/credentials/priority", post(set_priorities))
         .route("/credentials/device-limit", post(set_device_limits))
+        .route("/credentials/rpm-limit", post(set_rpm_limits))
         .route("/credentials/disabled", post(set_disabled_many))
         .route("/credentials/delete", post(delete_credentials))
         .route("/credentials/{id}", delete(delete_credential))
@@ -119,6 +120,7 @@ pub async fn run(
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/proxy", post(set_proxy))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
+        .route("/credentials/{id}/rpm-limit", post(set_rpm_limit))
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
@@ -131,6 +133,7 @@ pub async fn run(
         .route("/settings/device-ttl", post(set_device_ttl))
         .route("/settings/device-retention", post(set_device_retention))
         .route("/settings/default-device-limit", post(set_default_device_limit))
+        .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/require-device-id", post(set_require_device_id))
@@ -331,7 +334,7 @@ async fn exchange(
         tier = ?cred.tier, org_type = ?cred.org_type,
         "credential added"
     );
-    Ok(Json(CredentialView::new(&cred, 0, state.store.default_device_limit())))
+    Ok(Json(CredentialView::new(&cred, 0, DefaultLimits::of(&state.store))))
 }
 
 // ---------- 用量日志 ----------
@@ -427,11 +430,11 @@ async fn list_credentials(
     let last_used = state.store.last_used().map_err(internal)?;
     let costs = state.store.cost_by_cred().map_err(internal)?;
     let rpm = state.store.recent_rpm().map_err(internal)?;
-    let default_limit = state.store.default_device_limit();
+    let defaults = DefaultLimits::of(&state.store);
     let views = list
         .iter()
         .map(|c| {
-            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), default_limit)
+            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), defaults)
                 .with_cooldown(
                     state.store.rate_limited_secs(c.id),
                     state.store.rate_limited_models(c.id),
@@ -587,6 +590,25 @@ async fn set_device_limits(
 }
 
 #[derive(Deserialize)]
+struct SetRpmLimitsReq {
+    ids: Vec<i64>,
+    /// 三态同单账号接口：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    rpm_limit: i64,
+}
+
+/// 批量设置账号 RPM 上限，返回更新后的整份列表。
+async fn set_rpm_limits(
+    State(state): State<AppState>,
+    Json(req): Json<SetRpmLimitsReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
+    let n = state.store.set_rpm_limits(&req.ids, limit).map_err(internal)?;
+    tracing::info!(count = n, rpm_limit = limit, "rpm limit set in bulk");
+    list_credentials(State(state)).await
+}
+
+#[derive(Deserialize)]
 struct SetDisabledManyReq {
     ids: Vec<i64>,
     disabled: bool,
@@ -654,6 +676,29 @@ async fn set_device_limit(
     if !state.store.set_device_limit(id, limit).map_err(internal)? {
         return Err(not_found());
     }
+    view_of(&state, id)
+}
+
+#[derive(Deserialize)]
+struct SetRpmLimitReq {
+    /// RPM 上限三态：`> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
+    rpm_limit: i64,
+}
+
+/// 设置该账号每分钟最多转发多少条请求。
+///
+/// 计数在进程内存里，改完即时生效；已经记在窗口里的那些不会因为调高上限而消失，
+/// 也不会因为调低而被追认——只影响之后的判定。
+async fn set_rpm_limit(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetRpmLimitReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
+    if !state.store.set_rpm_limit(id, limit).map_err(internal)? {
+        return Err(not_found());
+    }
+    tracing::info!(cred_id = id, rpm_limit = limit, "rpm limit set");
     view_of(&state, id)
 }
 
@@ -791,9 +836,8 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let last_used = state.store.last_used_at(id).map_err(internal)?;
     let cost_total = state.store.cost_of(id).map_err(internal)?;
     let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
-    let default_limit = state.store.default_device_limit();
     Ok(Json(
-        CredentialView::new(&cred, count, default_limit)
+        CredentialView::new(&cred, count, DefaultLimits::of(&state.store))
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
@@ -817,6 +861,9 @@ struct SettingsResp {
     device_binding_retention_secs: i64,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
+    /// 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。
+    /// 账号未单独配置时套用它。
+    default_rpm_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
     /// 单凭证裸请求速率上限（窗口内条数）；0 表示不限。
@@ -894,6 +941,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let device_binding_retention_secs = state.store.device_binding_retention();
     let default_device_limit = state.store.default_device_limit();
+    let default_rpm_limit = state.store.default_rpm_limit();
     let require_device_id = state.store.require_device_id();
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
@@ -906,6 +954,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             device_binding_ttl_secs,
             device_binding_retention_secs,
             default_device_limit,
+            default_rpm_limit,
             require_device_id,
             bare_rate_limit,
             bare_rate_window_secs,
@@ -925,6 +974,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         device_binding_ttl_secs,
         device_binding_retention_secs,
         default_device_limit,
+        default_rpm_limit,
         require_device_id,
         bare_rate_limit,
         bare_rate_window_secs,
@@ -1020,6 +1070,26 @@ async fn set_default_device_limit(
         .store
         .set_setting(crate::store::DEFAULT_DEVICE_LIMIT, &limit.to_string())
         .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetDefaultRpmLimitReq {
+    /// 全局默认账号 RPM 上限；0（或负数）表示默认不限。
+    default_rpm_limit: i64,
+}
+
+/// 设置全局默认账号 RPM 上限（账号自身未单独配置时生效）。
+async fn set_default_rpm_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetDefaultRpmLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.default_rpm_limit.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEFAULT_RPM_LIMIT, &limit.to_string())
+        .map_err(internal)?;
+    tracing::info!(limit, "default rpm limit changed");
     Ok(Json(settings_resp(&state)))
 }
 
@@ -1158,6 +1228,24 @@ struct ModelCooldown {
     secs: i64,
 }
 
+/// 构造凭证视图时要用到的两个全局默认上限。
+///
+/// 包成结构体而不是并列两个 `i64` 参数：位置写反了照样编译得过，而那是一个「把设备上限当成
+/// RPM 上限算」的静默错误——同 [`store::Select`] 的理由。
+#[derive(Clone, Copy)]
+struct DefaultLimits {
+    /// 全局默认设备数上限，见 [`store::CredentialStore::default_device_limit`]。
+    device: i64,
+    /// 全局默认账号 RPM 上限，见 [`store::CredentialStore::default_rpm_limit`]。
+    rpm: i64,
+}
+
+impl DefaultLimits {
+    fn of(store: &store::CredentialStore) -> Self {
+        Self { device: store.default_device_limit(), rpm: store.default_rpm_limit() }
+    }
+}
+
 /// 对外暴露的凭证视图（不返回明文 token）。
 #[derive(Serialize)]
 struct CredentialView {
@@ -1182,6 +1270,11 @@ struct CredentialView {
     device_limit_effective: i64,
     /// 当前已绑定的设备数。
     device_count: i64,
+    /// 账号自身的 RPM 上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    rpm_limit: i64,
+    /// 实际生效的 RPM 上限（已套用全局默认）；0 表示不限。前端拿它和 `rpm` 一起显示成
+    /// 「12 / 30」，两个数同一个窗口（最近 60 秒），可以直接比。
+    rpm_limit_effective: i64,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用。
     ban_reason: Option<String>,
     /// 该账号专用的出站代理；`None` 表示直连。**原样返回、不脱敏**：代理串里可能带账号密码，
@@ -1222,8 +1315,8 @@ struct CredentialView {
 }
 
 impl CredentialView {
-    /// 由凭证 + 已绑定设备数 + 全局默认设备上限构造视图。
-    fn new(c: &Credential, device_count: i64, default_device_limit: i64) -> Self {
+    /// 由凭证 + 已绑定设备数 + 全局默认上限构造视图。
+    fn new(c: &Credential, device_count: i64, defaults: DefaultLimits) -> Self {
         let secs = c.expires_in_secs();
         Self {
             id: c.id,
@@ -1238,11 +1331,10 @@ impl CredentialView {
             created_at: c.created_at,
             updated_at: c.updated_at,
             device_limit: c.device_limit,
-            device_limit_effective: store::effective_device_limit(
-                c.device_limit,
-                default_device_limit,
-            ),
+            device_limit_effective: store::effective_device_limit(c.device_limit, defaults.device),
             device_count,
+            rpm_limit: c.rpm_limit,
+            rpm_limit_effective: store::effective_rpm_limit(c.rpm_limit, defaults.rpm),
             ban_reason: c.ban_reason.clone(),
             proxy: c.proxy.clone(),
             token_hint: mask_token(&c.refresh_token),

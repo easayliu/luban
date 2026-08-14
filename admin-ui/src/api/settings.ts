@@ -11,6 +11,8 @@ export interface Settings {
   device_binding_retention_secs: number
   /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
   default_device_limit: number
+  /** 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。账号未单独配置时套用它。 */
+  default_rpm_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
   /** 单个账号在窗口内允许的裸请求条数；0 表示不限。 */
@@ -104,6 +106,14 @@ export async function setDeviceRetention(secs: number): Promise<Settings> {
 export async function setDefaultDeviceLimit(limit: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/default-device-limit', {
     default_device_limit: limit,
+  })
+  return data
+}
+
+/** 设置全局默认账号 RPM 上限（0 表示默认不限）。 */
+export async function setDefaultRpmLimit(limit: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/default-rpm-limit', {
+    default_rpm_limit: limit,
   })
   return data
 }

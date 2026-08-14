@@ -15,7 +15,8 @@ use crate::credentials::Credential;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
-     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy";
+     created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
+     rpm_limit";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -24,8 +25,14 @@ pub struct CredentialStore {
     /// 上游刷新会**轮换 refresh_token**：并发刷新时后完成的那次会把已被作废的 token 写回库，
     /// 该凭证之后所有刷新都 `invalid_grant`，等于账号被自己废掉。
     refresh_locks: Mutex<HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    /// 裸请求的每凭证限流窗口（进程内），见 [`BareRateWindow`]。
-    bare_rate: BareRateWindow,
+    /// 裸请求的每凭证限流窗口（进程内），见 [`RateWindow`] 与 [`CredentialStore::bare_rate_limit`]。
+    bare_rate: RateWindow,
+    /// 每账号 RPM 的限流窗口（进程内，窗口固定 [`RPM_WINDOW_SECS`]），
+    /// 见 [`CredentialStore::default_rpm_limit`]。
+    ///
+    /// 与 [`Self::bare_rate`] 用同一种计数器、但**各算各的**：那个只卡没有设备身份的流量，
+    /// 这个卡该账号的全部转发。两者都配了的话一条裸请求要同时过两道窗口。
+    rpm_rate: RateWindow,
     /// 被上游 429 过的凭证的冷却表（进程内），见 [`RateLimitCooldown`]。
     cooldown: RateLimitCooldown,
     /// `settings` 全表的内存镜像，见 [`CredentialStore::get_setting`]。
@@ -37,7 +44,7 @@ pub struct CredentialStore {
     ///
     /// 写路径只有 [`CredentialStore::set_setting`]/[`CredentialStore::delete_setting`] 两处，
     /// 都是先落库再更新缓存，故进程内不会漂移。**多进程共享同一个库时会读到陈旧值**——
-    /// luban 是单进程本地代理，没有这个场景（同 [`BareRateWindow`] 的取舍）。
+    /// luban 是单进程本地代理，没有这个场景（同 [`RateWindow`] 的取舍）。
     settings: parking_lot::RwLock<HashMap<String, String>>,
 }
 
@@ -77,6 +84,34 @@ impl std::fmt::Display for BareRateLimited {
 
 impl std::error::Error for BareRateLimited {}
 
+/// 账号 RPM 上限触发：本次请求可用的号在最近 60 秒里都已发满。
+///
+/// 同 [`BareRateLimited`] 走 `anyhow` 上传，代理层 `downcast` 后映射为 429 + `retry-after`。
+/// 等待时间是**算得准**的：窗口里最早那条记录滚出 60 秒的那一刻就有名额，故直接给到秒。
+#[derive(Debug)]
+pub struct RpmLimited {
+    /// 建议的重试间隔（秒），取最早腾出名额的那个号。
+    pub retry_after_secs: i64,
+    /// 是**设备绑定的那个号**打满了（`true`），还是候选池里所有号都打满（`false`）。
+    ///
+    /// 两者是不同的故障：前者只影响这一台设备（换台设备照样能发），后者是整个代理没名额了。
+    /// 拒绝时那行 `refusing to forward` 日志是唯一能区分它们的地方。
+    pub sticky: bool,
+}
+
+impl std::fmt::Display for RpmLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let who = if self.sticky {
+            "the credential bound to this device has reached its RPM limit"
+        } else {
+            "all credentials have reached their RPM limits"
+        };
+        write!(f, "{}; retry in {} seconds", who, self.retry_after_secs)
+    }
+}
+
+impl std::error::Error for RpmLimited {}
+
 /// 限流冷却硬门禁触发：本次请求可选的凭证**全部**处于上游 429 冷却中。
 ///
 /// 同 [`BareRateLimited`] 走 `anyhow` 上传，代理层 `downcast` 后映射为 429 + `retry-after`
@@ -105,49 +140,80 @@ impl std::fmt::Display for AllRateLimited {
 
 impl std::error::Error for AllRateLimited {}
 
-/// 每凭证的裸请求滑动窗口计数器（**进程内，不落库**）。
+/// 每凭证的滑动窗口计数器（**进程内，不落库**）。
 ///
-/// 只统计**无 `metadata.user_id` 的请求**：带设备身份的那些已由设备绑定 + `device_limit`
-/// 约束着，而裸请求既不写绑定也不占名额，`device_limit` 对它们完全不生效——这个计数器补的
-/// 正是那个口子（见 [`CredentialStore::select_for_device`]）。
+/// 两处在用，各持一份、互不干扰：
+/// - [`CredentialStore::bare_rate`] 只数**无 `metadata.user_id` 的请求**——带设备身份的那些
+///   已由设备绑定 + `device_limit` 约束着，而裸请求既不写绑定也不占名额，`device_limit`
+///   对它们完全不生效，这份补的正是那个口子；
+/// - [`CredentialStore::rpm_rate`] 数该账号的**全部**转发，窗口固定 60 秒，即账号 RPM 上限。
 ///
 /// **不落库是有意的**：短窗口限流本来就不该跨重启（重启后放行几条远好于把人锁在门外），
 /// 而每请求一次 `usage_logs` 聚合查询的代价，比一把内存锁高一个数量级。代价是多实例部署时
 /// 各限各的——luban 是单进程本地代理，没有这个场景；真有了再换成落库的实现。
 ///
 /// 内存占用有上限：每个凭证最多存 `limit` 个时间戳（超限时不再追加），过期的在每次检查时
-/// 顺手清掉。
+/// 顺手清掉；不限（`limit <= 0`）时一条都不记——没人会去读那个队列，记了只会无界增长。
 #[derive(Default)]
-struct BareRateWindow {
-    /// cred_id → 窗口内每条裸请求的时刻（升序，用单调时钟，不受系统时间调整影响）。
+struct RateWindow {
+    /// cred_id → 窗口内每条请求的时刻（升序，用单调时钟，不受系统时间调整影响）。
     hits: Mutex<HashMap<i64, VecDeque<Instant>>>,
 }
 
-impl BareRateWindow {
-    /// 该凭证在窗口内是否还有名额；有就**当场记一条**并返回 `true`。
+impl RateWindow {
+    /// 该凭证在窗口内是否还有名额（`limit <= 0` 即不限）。只问不记，顺手清掉过期的。
     ///
-    /// 检查与记账合在一起（而不是先问后记），是因为选号那步一旦选中就必然要发出去，
-    /// 中间没有可回退的位置；拆成两步只会多出一个「问过了但没发」的窗口。
-    fn try_take(&self, cred_id: i64, limit: i64, window: Duration) -> bool {
+    /// 与 [`Self::take`] 拆开，是因为**一次选号要过两道窗口**（裸请求上限 + 账号 RPM）：
+    /// 若边问边记，一个过了第一道却卡在第二道的号会白扣一个名额，而它压根没被用上。
+    /// 拆开后「问过了但没发」的窗口并不存在——选号全程持着 `conn` 锁（见
+    /// [`CredentialStore::select_for_device`]），选号彼此串行，中间插不进第二次选号。
+    fn has_room(&self, cred_id: i64, limit: i64, window: Duration) -> bool {
         if limit <= 0 {
             return true; // 未配置上限 = 不限
         }
-        let now = Instant::now();
         let mut hits = self.hits.lock();
         let q = hits.entry(cred_id).or_default();
-        while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
-            q.pop_front();
+        prune(q, window);
+        (q.len() as i64) < limit
+    }
+
+    /// 给该凭证记一条。不限时不记（理由见结构体文档）；已满时也不记（越界的那条不该进队列，
+    /// 它是被拒掉的）。
+    fn take(&self, cred_id: i64, limit: i64, window: Duration) {
+        if limit <= 0 {
+            return;
         }
-        if q.len() as i64 >= limit {
-            return false;
+        let mut hits = self.hits.lock();
+        let q = hits.entry(cred_id).or_default();
+        prune(q, window);
+        if (q.len() as i64) < limit {
+            q.push_back(Instant::now());
         }
-        q.push_back(now);
-        true
+    }
+
+    /// 该凭证要等多少秒才腾出下一个名额：窗口里最早那条滚出去的那一刻。至少 1 秒——
+    /// 回 0 等于让客户端立刻再撞一次。空窗口（本来就有名额）同样按 1 秒算。
+    fn retry_after_secs(&self, cred_id: i64, window: Duration) -> i64 {
+        let hits = self.hits.lock();
+        let left = hits
+            .get(&cred_id)
+            .and_then(|q| q.front().copied())
+            .map(|t| window.saturating_sub(t.elapsed()))
+            .unwrap_or_default();
+        // 向上取整：不足 1 秒的余量截断成 0 就又成了「立刻重试」。
+        (left.as_secs() as i64 + i64::from(left.subsec_nanos() > 0)).max(1)
     }
 
     /// 凭证被删除/停用后清掉它的窗口，免得 map 里留下永远不再访问的键。
     fn forget(&self, cred_id: i64) {
         self.hits.lock().remove(&cred_id);
+    }
+}
+
+/// 丢掉队首所有已滚出窗口的时间戳（队列按时刻升序，故遇到第一个还在窗口内的即可停）。
+fn prune(q: &mut VecDeque<Instant>, window: Duration) {
+    while q.front().is_some_and(|t| t.elapsed() >= window) {
+        q.pop_front();
     }
 }
 
@@ -336,7 +402,8 @@ impl CredentialStore {
         Self {
             conn: Mutex::new(conn),
             refresh_locks: Mutex::new(HashMap::new()),
-            bare_rate: BareRateWindow::default(),
+            bare_rate: RateWindow::default(),
+            rpm_rate: RateWindow::default(),
             cooldown: RateLimitCooldown::default(),
             settings: parking_lot::RwLock::new(settings),
         }
@@ -428,6 +495,7 @@ impl CredentialStore {
         tx.commit()?;
         // 号没了，它的限流窗口与冷却也留着没用（id 不会被复用，见 migrates_and_stops_id_reuse）。
         self.bare_rate.forget(id);
+        self.rpm_rate.forget(id);
         self.cooldown.forget(id);
         Ok(n > 0)
     }
@@ -671,6 +739,47 @@ impl CredentialStore {
     /// 全局默认设备数上限：`<= 0` 表示默认不限。未设置或解析失败时按 0（不限）。
     pub fn default_device_limit(&self) -> i64 {
         self.get_setting(DEFAULT_DEVICE_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// 批量设置账号 RPM 上限；三态同 [`Self::set_rpm_limit`]。
+    pub fn set_rpm_limits(&self, ids: &[i64], limit: i64) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET rpm_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, limit])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 设置该账号每分钟最多转发多少条请求。三态同设备上限：`> 0` 本账号独立上限；
+    /// `0` 跟随全局默认（见 [`DEFAULT_RPM_LIMIT`]）；`< 0` 本账号明确不限。
+    ///
+    /// 计数在进程内存里（见 [`RateWindow`]），改完即时生效，不影响已经记在窗口里的那些。
+    pub fn set_rpm_limit(&self, id: i64, limit: i64) -> Result<bool> {
+        self.update_one(
+            "UPDATE credentials SET rpm_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, limit],
+        )
+    }
+
+    /// 全局默认账号 RPM 上限：`<= 0` 表示默认不限（默认即不限，与加入本机制前一致）。
+    pub fn default_rpm_limit(&self) -> i64 {
+        self.get_setting(DEFAULT_RPM_LIMIT)
             .ok()
             .flatten()
             .and_then(|s| s.trim().parse::<i64>().ok())
@@ -1349,6 +1458,10 @@ pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
 /// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
 pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
 
+/// 全局默认账号 RPM 上限的 settings 键名；`<= 0` 表示默认不限。
+/// 账号自身 `rpm_limit == 0`（默认值）时套用它，无需逐个账号配置。
+pub const DEFAULT_RPM_LIMIT: &str = "default_rpm_limit";
+
 /// 单凭证裸请求速率上限的 settings 键名；`<= 0` 表示不限（默认）。见
 /// [`CredentialStore::bare_rate_limit`]。
 pub const BARE_RATE_LIMIT: &str = "bare_rate_limit";
@@ -1379,6 +1492,13 @@ pub fn effective_device_limit(cred_limit: i64, default_limit: i64) -> i64 {
         0 => default_limit.max(0),
         _ => 0,
     }
+}
+
+/// 账号实际生效的 RPM 上限：返回 `0` 表示不限。三态语义与
+/// [`effective_device_limit`] 逐条对应（账号独立 / 跟随全局 / 明确不限），故直接委托它——
+/// 两处各写一份 `match`，哪天改了三态语义就只会改到其中一处。
+pub fn effective_rpm_limit(cred_limit: i64, default_limit: i64) -> i64 {
+    effective_device_limit(cred_limit, default_limit)
 }
 
 /// 待写入的一条用量日志（代理层组装后交给 [`CredentialStore::insert_usage_log`]）。
@@ -2201,6 +2321,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 该账号专用的出站代理；NULL = 直连。**同样必须补在重建之后**，理由见上一条。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN proxy TEXT", []);
 
+    // 该账号每分钟最多转发多少条请求（三态同 device_limit：>0 独立 / 0 跟随全局 / <0 不限）。
+    // 旧库补出来是 0 = 跟随全局默认，而全局默认也是 0（不限），故存量账号行为不变。
+    // **同样必须补在重建之后**，理由见上面 resume_at 那条。
+    let _ =
+        conn.execute("ALTER TABLE credentials ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0", []);
+
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
     // 本机解析 DNS——正是那个改动要治的故障（住宅代理只回一个 `unexpected EOF`），而网页上没有
@@ -2389,6 +2515,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         resume_at: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
         org_type: row.get(14)?,
         proxy: row.get(15)?,
+        rpm_limit: row.get(16)?,
     })
 }
 
@@ -2437,6 +2564,20 @@ impl CredentialStore {
     /// 约束（见 [`Self::bare_rate_limit`]）：已发满的凭证在本轮被跳过，自然分流到其它号；
     /// 所有号都满才返回 [`BareRateLimited`]（代理映射为 429 + `retry-after`）。
     ///
+    /// **账号 RPM 上限**（见 [`Self::default_rpm_limit`]）是所有分支共同的最后一道门，
+    /// 且两个分支的行为**故意不同**：
+    ///
+    /// - 还没定下号的（新设备、裸请求、原号不可用要改选）→ 打满的号在本轮被跳过，
+    ///   自然分流到别的号，全部打满才返回 [`RpmLimited`]；
+    /// - **已经粘在某个号上的**（命中既有绑定）→ 该号打满就**直接拒**，不改选别的号。
+    ///   换号意味着把设备改绑过去，而 thinking 块的签名是跟着账号走的，这条会话之后每一轮
+    ///   都要先撞一次 400 再降级重发（见 `crate::proxy::retry_demoted_thinking`）；
+    ///   让客户端照 `retry-after` 退避几秒，等这个号的窗口滚出名额，会话就还在原来的号上。
+    ///
+    /// 与裸请求上限不同，RPM **不看 `rate_limited`，每一次选号都计**：口径要和账号列表里
+    /// 那个「当前 RPM」对得上（那是 `usage_logs` 最近 60 秒的条数，`count_tokens` 一样在内），
+    /// 否则会出现「上限 30、显示 45」这种解释不清的画面。
+    ///
     /// `rate_limited` 由调用方判定——代理只对**真正消耗额度的**路径置真
     /// （`/v1/messages`，见 `crate::proxy::is_billable_messages`）。`count_tokens` 这类
     /// 既不产生 usage、也不消耗额度的路径不计：拿它占名额只会把真正的请求挤掉，
@@ -2452,12 +2593,32 @@ impl CredentialStore {
     /// **限流按「选一次号」计，不是按「客户端请求」计**：刷新失败换号那条路
     /// （[`select_with_refresh_failover`]）每轮都会重选，故一次客户端请求最多可能扣掉几个
     /// 名额。那条路只在凭证被上游作废时才走（罕见），宁可多扣也好过给它开一个绕过限流的口子。
+    ///
+    /// 反过来，**不经选号的那些请求一条都不计**：连通性测试指定打哪个号（不走这里），却照样
+    /// 写 `usage_logs`。所以列表里的 RPM 可能比限流器数到的略高一点点——探活是人手点出来的，
+    /// 量级上不构成干扰，但对不上时要知道差在哪。
     pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
         let Select { device_id, ttl_secs, retention_secs, rate_limited, exclude, model } = sel;
         // 这几项须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
         let default_limit = self.default_device_limit();
         let (rate_limit, rate_window) = (self.bare_rate_limit(), self.bare_rate_window_secs());
+        let default_rpm = self.default_rpm_limit();
         let conn = self.conn.lock();
+
+        // RPM 的窗口就是账号列表那一列的窗口（60 秒），两处共用同一个常量：限的和看到的
+        // 必须是同一个口径，否则「上限 30」和列表里的「RPM 45」谁也解释不了谁。
+        let rpm_window = Duration::from_secs(RPM_WINDOW_SECS as u64);
+        let rpm_limit_of = |c: &Credential| effective_rpm_limit(c.rpm_limit, default_rpm);
+        let rpm_room = |c: &Credential| self.rpm_rate.has_room(c.id, rpm_limit_of(c), rpm_window);
+        // 全员打满时的 `retry-after`：取最早腾出名额的那个号——早一秒重试都是白撞。
+        let rpm_full = |cands: &[&Credential]| -> anyhow::Error {
+            let retry_after_secs = cands
+                .iter()
+                .map(|c| self.rpm_rate.retry_after_secs(c.id, rpm_window))
+                .min()
+                .unwrap_or(1);
+            RpmLimited { retry_after_secs, sticky: false }.into()
+        };
 
         // 惰性清理：只删「连保留期都过了」的绑定。TTL 到点的那些不删——它们从这一刻起就不占
         // 名额了（下面的 counts 按 TTL 过滤），但行还在，设备回来时还能循着它回原号。
@@ -2564,12 +2725,22 @@ impl CredentialStore {
                     // 活跃绑定本来就占着名额，直接续；休眠的软绑定要重新占一个位置，
                     // 原号满了就只能改选——否则设备上限形同虚设。
                     if active || has_room(c) {
+                        // RPM 打满 → **就地拒**，不往下走改选那条路（理由见本函数文档：
+                        // 改选会改绑，而改绑会让这条会话每一轮先撞一次 thinking 签名 400）。
+                        if !rpm_room(c) {
+                            return Err(RpmLimited {
+                                retry_after_secs: self.rpm_rate.retry_after_secs(c.id, rpm_window),
+                                sticky: true,
+                            }
+                            .into());
+                        }
                         conn.execute(
                             "UPDATE device_bindings
                                 SET last_seen_at = unixepoch(), request_count = request_count + 1
                               WHERE device_id = ?1",
                             [did],
                         )?;
+                        self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
                         return Ok(c.clone());
                     }
                 }
@@ -2582,29 +2753,38 @@ impl CredentialStore {
 
         // 4/5) 优先级分档调度：优先级为主键（数值小者优先），同一档内再按设备数
         //      负载均衡，最后 id 兜底。低优先级档仅在高优先级档全部占满/不可用后才触及。
+        // (priority, 设备数, id) 是唯一的排序口径；两个分支都从这一份有序表里挑，
+        // 逐道门过滤，第一个全过的即中。
+        let mut ordered: Vec<&Credential> = creds.iter().collect();
+        ordered.sort_by_key(|c| (c.priority, used(c), c.id));
+        let bare_window = Duration::from_secs(rate_window.max(1) as u64);
         let chosen = if device_id.is_some() {
             // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
-            // 当前优先级档全满时其成员被过滤掉，min 自然溢出到下一档；全部满则拒绝。
-            match creds.iter().filter(|c| has_room(c)).min_by_key(|c| (c.priority, used(c), c.id)) {
+            // 当前优先级档全满时其成员被过滤掉，自然溢出到下一档；全部满则拒绝。
+            let with_room: Vec<&Credential> =
+                ordered.iter().copied().filter(|c| has_room(c)).collect();
+            if with_room.is_empty() {
+                return Err(DeviceLimitReached.into());
+            }
+            // 设备名额与 RPM 是两回事，故两道门分开判：都过不去时要能说清是哪一道拦的
+            // ——设备满是「换台机器也没用」，RPM 满是「等几秒就好」。
+            match with_room.iter().copied().find(|c| rpm_room(c)) {
                 Some(c) => c,
-                None => return Err(DeviceLimitReached.into()),
+                None => return Err(rpm_full(&with_room)),
             }
         } else {
-            // 无 device_id：不占设备名额，但要过裸请求速率上限。按同一套 (priority, used, id)
-            // 排好序后逐个试，第一个还有名额的即中。
-            //
-            // 拿 `try_take` 直接当 `find` 的谓词是安全的：它只在**放行**时才记一条，被跳过的
-            // （已满的）那些不留痕，而 `find` 命中即短路，故一次选号最多记一条。
-            // 不计入限流（或未配置上限）时谓词恒真，等价于原来的 `min_by_key`，零额外开销。
-            let mut ordered: Vec<&Credential> = creds.iter().collect();
-            ordered.sort_by_key(|c| (c.priority, used(c), c.id));
-            let window = Duration::from_secs(rate_window.max(1) as u64);
-            match ordered
-                .into_iter()
-                .find(|c| !rate_limited || self.bare_rate.try_take(c.id, rate_limit, window))
-            {
+            // 无 device_id：不占设备名额，但要过裸请求速率上限。
+            let bare_ok: Vec<&Credential> = ordered
+                .iter()
+                .copied()
+                .filter(|c| !rate_limited || self.bare_rate.has_room(c.id, rate_limit, bare_window))
+                .collect();
+            if bare_ok.is_empty() {
+                return Err(BareRateLimited { retry_after_secs: rate_window }.into());
+            }
+            match bare_ok.iter().copied().find(|c| rpm_room(c)) {
                 Some(c) => c,
-                None => return Err(BareRateLimited { retry_after_secs: rate_window }.into()),
+                None => return Err(rpm_full(&bare_ok)),
             }
         };
 
@@ -2615,6 +2795,13 @@ impl CredentialStore {
                     SET cred_id = ?2, last_seen_at = unixepoch(), request_count = request_count + 1",
                 params![did, chosen.id],
             )?;
+        }
+        // 两个窗口都在**选定之后**才记账（而不是边问边记）：一次选号要连过两道窗口，
+        // 边问边记的话，过了第一道却卡在第二道的那个号会白扣一个名额。理由详见
+        // [`RateWindow::has_room`]——选号全程持着 `conn` 锁，中间插不进第二次选号。
+        self.rpm_rate.take(chosen.id, rpm_limit_of(chosen), rpm_window);
+        if device_id.is_none() && rate_limited {
+            self.bare_rate.take(chosen.id, rate_limit, bare_window);
         }
         Ok(chosen.clone())
     }
@@ -3577,6 +3764,94 @@ mod tests {
                 })
                 .is_ok()
         );
+    }
+
+    /// 生效的 RPM 上限与设备上限共用一套三态语义，改了一处另一处不能悄悄漂开。
+    #[test]
+    fn effective_rpm_limit_matches_the_device_limit_tri_state() {
+        assert_eq!(effective_rpm_limit(30, 60), 30, "账号独立上限覆盖全局");
+        assert_eq!(effective_rpm_limit(0, 60), 60, "未配置则跟随全局默认");
+        assert_eq!(effective_rpm_limit(0, 0), 0, "全局也不限时不限");
+        assert_eq!(effective_rpm_limit(-1, 60), 0, "账号明确不限，忽略全局默认");
+    }
+
+    /// 账号 RPM 上限：还没定下号的请求撞到上限时溢到下一个号，全部发满才 429
+    /// （[`RpmLimited`]，且 `sticky` 为假）。账号自己配的上限盖过全局默认。
+    ///
+    /// 全程 `rate_limited: false`——RPM 与裸请求上限不同，它不看这个标志，每次选号都计。
+    #[test]
+    fn rpm_limit_spills_to_next_credential_then_rejects() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.set_setting(DEFAULT_RPM_LIMIT, "2").unwrap();
+        let sel = Select { ttl_secs: 0, ..Default::default() };
+
+        // 前两条落在 a（同优先级、设备数都是 0 时 id 小者先中），第 3、4 条 a 已满 → 溢到 b。
+        let picked: Vec<i64> = (0..4).map(|_| store.select_for_device(sel).unwrap().id).collect();
+        assert_eq!(picked, vec![a, a, b, b], "发满了应换号而不是直接拒");
+
+        let err = store.select_for_device(sel).unwrap_err();
+        let rl = err.downcast_ref::<RpmLimited>().expect("应是 RPM 限流错误");
+        assert!(!rl.sticky, "没有设备绑定，拒的是整个候选池而不是某个号");
+        assert!(
+            (1..=RPM_WINDOW_SECS).contains(&rl.retry_after_secs),
+            "重试间隔应落在一个窗口之内，实际 {}",
+            rl.retry_after_secs
+        );
+
+        // 账号独立上限盖过全局默认：a 单独放宽到 5，窗口里已有的 2 条不妨碍它继续接。
+        store.set_rpm_limit(a, 5).unwrap();
+        assert_eq!(store.select_for_device(sel).unwrap().id, a);
+
+        // 「明确不限」（-1）同样盖过全局默认：a 收紧到发不出，只剩 b 可选。
+        store.set_rpm_limit(a, 1).unwrap();
+        store.set_rpm_limit(b, -1).unwrap();
+        assert_eq!(store.select_for_device(sel).unwrap().id, b, "-1 即不限，全局默认不再生效");
+    }
+
+    /// 粘性命中的号撞到 RPM 上限时**直接拒**，不改选别的号——改绑会让这条会话之后每一轮都
+    /// 先撞一次 thinking 签名 400。窗口松了之后这台设备还在原来那个号上。
+    #[test]
+    fn rpm_limit_rejects_the_bound_credential_instead_of_rebinding() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.set_rpm_limit(a, 1).unwrap();
+        let sel = Select { device_id: Some("dev-1"), ttl_secs: 0, ..Default::default() };
+
+        assert_eq!(store.select_for_device(sel).unwrap().id, a, "新设备先落在 a");
+
+        let err = store.select_for_device(sel).unwrap_err();
+        let rl = err.downcast_ref::<RpmLimited>().expect("应是 RPM 限流错误");
+        assert!(rl.sticky, "拒的是这台设备绑定的那个号");
+        assert!(rl.retry_after_secs >= 1, "retry-after 不得为 0，否则客户端立刻再撞一次");
+        assert_eq!(store.device_count(b).unwrap(), 0, "b 空着也不该被改绑过去");
+
+        // 放宽上限即刻恢复，且仍是原来那个号——绑定自始至终没被动过。
+        store.set_rpm_limit(a, 10).unwrap();
+        assert_eq!(store.select_for_device(sel).unwrap().id, a);
+    }
+
+    /// 窗口滚过去之后名额自己回来（口径同裸请求那条，只是窗口固定 60 秒）。
+    #[test]
+    fn rpm_window_expires_and_frees_the_slot() {
+        let (store, ids) = store_with(&["a"]);
+        let a = ids[0];
+        store.set_rpm_limit(a, 1).unwrap();
+        let sel = Select { ttl_secs: 0, ..Default::default() };
+
+        assert!(store.select_for_device(sel).is_ok());
+        assert!(store.select_for_device(sel).is_err(), "同一窗口内第二条应被拦");
+
+        // 直接把窗口内的那条时间戳推到过期，等价于等了一个窗口。
+        {
+            let mut hits = store.rpm_rate.hits.lock();
+            for q in hits.values_mut() {
+                for t in q.iter_mut() {
+                    *t -= Duration::from_secs(RPM_WINDOW_SECS as u64 + 1);
+                }
+            }
+        }
+        assert!(store.select_for_device(sel).is_ok(), "过期后名额应回收");
     }
 
     /// 上游 429 打过冷却的号在选号时让位；绑定到它的设备**改绑**到新号（这正是 429 换号

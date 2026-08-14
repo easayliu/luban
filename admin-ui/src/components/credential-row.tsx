@@ -9,6 +9,7 @@ import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
+import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
@@ -184,6 +185,7 @@ export const CredentialRow = memo(function CredentialRow({
   const { t, language } = useI18n()
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
+  const [rpmOpen, setRpmOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
@@ -197,6 +199,9 @@ export const CredentialRow = memo(function CredentialRow({
   const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   const policy = devicePolicyMeta(cred.device_limit, language)
+  // 0 = 不限，此时不显示分母也不谈「打满」。
+  const rpmLimit = cred.rpm_limit_effective
+  const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
   const added = relativeTime(cred.created_at, now, language)
 
   return (
@@ -240,6 +245,7 @@ export const CredentialRow = memo(function CredentialRow({
                     setRenameOpen(true)
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
+                  onRpmLimit={() => setRpmOpen(true)}
                   onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
@@ -297,13 +303,14 @@ export const CredentialRow = memo(function CredentialRow({
               </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
                 <span
-                  className="tabular-nums"
+                  className={cn('tabular-nums', rpmFull && 'text-warning')}
                   title={t(
                     '最近 60 秒经这个账号转发的请求数（含失败的）',
                     'Requests forwarded through this account in the last 60 seconds (failures included)',
                   )}
                 >
                   {cred.rpm > 0 ? cred.rpm : '—'}
+                  {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
                 </span>
               </MobileFact>
             </dl>
@@ -403,19 +410,30 @@ export const CredentialRow = memo(function CredentialRow({
           </Button>
         </TableCell>
         <TableCell className={cn(COL.rpm, 'text-right')}>
-          {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。 */}
+          {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。
+              配了上限就带上分母——两个数同一个 60 秒窗口，直接比得出还剩多少余量。 */}
           <Tooltip>
             <TooltipTrigger
               render={<span />}
-              className={cn('tabular-nums text-sm', cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground')}
+              className={cn(
+                'tabular-nums text-sm',
+                cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground',
+                rpmFull && 'text-warning',
+              )}
             >
               {cred.rpm > 0 ? cred.rpm : '—'}
+              {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {t(
-                '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-                'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
-              )}
+              {rpmLimit > 0
+                ? t(
+                  `当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）。上限 ${rpmLimit} 条/分钟，打满后新请求分流到别的账号，已绑定的设备收到 429。`,
+                  `Current RPM: requests forwarded through this account in the last 60 seconds (failures included). Limited to ${rpmLimit}/min; once full, new requests spill to another account and already-bound devices get a 429.`,
+                )
+                : t(
+                  '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+                  'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+                )}
             </TooltipPopup>
           </Tooltip>
         </TableCell>
@@ -439,7 +457,8 @@ export const CredentialRow = memo(function CredentialRow({
               setRenameOpen(true)
             }}
             onDeviceLimit={() => setDevicesOpen(true)}
-                  onProxy={() => setProxyOpen(true)}
+            onRpmLimit={() => setRpmOpen(true)}
+            onProxy={() => setProxyOpen(true)}
             onUsage={() => setUsageOpen(true)}
             onTest={() => setTesting(true)}
             onRequestDelete={() => setConfirmDelete(true)}
@@ -448,7 +467,7 @@ export const CredentialRow = memo(function CredentialRow({
       </TableRow>
 
       {/* 与卡片同一套：没点开过就不挂，见 DeferredMount。 */}
-      <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || testing}>
+      <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || rpmOpen || testing}>
         <CredentialDevicesDialog
           cred={cred}
           open={devicesOpen}
@@ -476,6 +495,12 @@ export const CredentialRow = memo(function CredentialRow({
           onOpenChange={setProxyOpen}
           proxy={actions.proxy}
         />
+        <CredentialRpmDialog
+          cred={cred}
+          open={rpmOpen}
+          onOpenChange={setRpmOpen}
+          rpmLimit={actions.rpmLimit}
+        />
         <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
       </DeferredMount>
     </>
@@ -487,6 +512,7 @@ function CredentialRowActionsMenu({
   actions,
   onRename,
   onDeviceLimit,
+  onRpmLimit,
   onProxy,
   onUsage,
   onTest,
@@ -496,6 +522,7 @@ function CredentialRowActionsMenu({
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onRpmLimit: () => void
   onProxy: () => void
   onUsage: () => void
   onTest: () => void
@@ -517,6 +544,7 @@ function CredentialRowActionsMenu({
         actions={actions}
         onRename={onRename}
         onDeviceLimit={onDeviceLimit}
+        onRpmLimit={onRpmLimit}
         onProxy={onProxy}
         onUsage={onUsage}
         onTest={onTest}

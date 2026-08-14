@@ -3,11 +3,12 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  GlobeIcon, PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon, Trash2Icon,
+  GaugeIcon, GlobeIcon, PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon,
+  Trash2Icon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, probeCredential, refreshCredential, setDeviceLimit,
-  setDisabled, setLabel, setPriority, setProxy,
+  setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
   type Credential, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -627,6 +628,16 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onSuccess: () => { onLimitSaved?.(); invalidate() },
     onError: (e) => failure(t('设置设备上限失败', 'Failed to set device limit'), e),
   })
+  // RPM 上限与设备上限分开两个 mutation：两者的失败提示不一样，共用一个的话，
+  // 改 RPM 失败会弹出「设置设备上限失败」。
+  const rpmLimit = useMutation({
+    mutationFn: (n: number) => setRpmLimit(cred.id, n),
+    onSuccess: () => {
+      toastManager.add({ title: t('已保存 RPM 上限', 'RPM limit saved'), type: 'success' })
+      invalidate()
+    },
+    onError: (e) => failure(t('设置 RPM 上限失败', 'Failed to set the RPM limit'), e),
+  })
   const proxy = useMutation({
     mutationFn: (url: string | null) => setProxy(cred.id, url),
     onSuccess: () => {
@@ -651,7 +662,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
-  return { rename, toggle, prio, limit, proxy, refresh, remove, cooldown }
+  return { rename, toggle, prio, limit, rpmLimit, proxy, refresh, remove, cooldown }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
@@ -663,12 +674,13 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onProxy, onUsage, onTest, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onRpmLimit, onProxy, onUsage, onTest, onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
+  onRpmLimit: () => void
   onProxy: () => void
   onUsage: () => void
   onTest: () => void
@@ -700,6 +712,10 @@ export function CredentialMenuContent({
       <MenuItem onClick={onDeviceLimit}>
         <SmartphoneIcon />
         {t('设备上限', 'Device limit')}
+      </MenuItem>
+      <MenuItem onClick={onRpmLimit}>
+        <GaugeIcon />
+        {t('RPM 上限', 'RPM limit')}
       </MenuItem>
       <MenuItem onClick={onProxy}>
         <GlobeIcon />

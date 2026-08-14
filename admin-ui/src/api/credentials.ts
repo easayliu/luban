@@ -100,6 +100,14 @@ export interface Credential {
    * 还得由 `reset` 反推，看不出「此刻压了多少」；这个每次轮询都是实时重算的。
    */
   rpm: number
+  /** 账号自身的 RPM 上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。 */
+  rpm_limit: number
+  /**
+   * 实际生效的 RPM 上限（已套用全局默认）；0 表示不限。
+   *
+   * 和 `rpm` 同一个窗口（最近 60 秒），可以直接比着显示成「12 / 30」。
+   */
+  rpm_limit_effective: number
   /**
    * **账号级**进程内 429 冷却的剩余秒数；0 = 未冷却。
    *
@@ -305,6 +313,15 @@ export async function setDeviceLimits(
   return data
 }
 
+/** 批量设置账号 RPM 上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
+export async function setRpmLimits(ids: number[], rpmLimit: number): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/rpm-limit', {
+    ids,
+    rpm_limit: rpmLimit,
+  })
+  return data
+}
+
 /** 批量启用/停用。 */
 export async function setDisabledMany(ids: number[], disabled: boolean): Promise<Credential[]> {
   const { data } = await api.post<Credential[]>('/credentials/disabled', { ids, disabled })
@@ -333,6 +350,18 @@ export async function setProxy(id: number, proxy: string | null): Promise<Creden
 export async function setDeviceLimit(id: number, deviceLimit: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/device-limit`, {
     device_limit: deviceLimit,
+  })
+  return data
+}
+
+/**
+ * 设置该账号每分钟最多转发多少条请求：>0 独立上限；0 跟随全局默认；-1 明确不限。
+ *
+ * 计数在后端进程内存里，改完即时生效——已经记在窗口里的那些既不会被追认、也不会被抹掉。
+ */
+export async function setRpmLimit(id: number, rpmLimit: number): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/rpm-limit`, {
+    rpm_limit: rpmLimit,
   })
   return data
 }
