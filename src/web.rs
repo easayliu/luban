@@ -137,6 +137,7 @@ pub async fn run(
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/require-device-id", post(set_require_device_id))
+        .route("/settings/min-client-version", post(set_min_client_version))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/auth/password", post(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
@@ -866,6 +867,9 @@ struct SettingsResp {
     default_rpm_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
+    /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
+    /// 的请求，见 [`crate::store::MIN_CLIENT_VERSION`]。
+    min_client_version: String,
     /// 单凭证裸请求速率上限（窗口内条数）；0 表示不限。
     bare_rate_limit: i64,
     /// 裸请求速率窗口（秒），默认 60。
@@ -943,6 +947,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let default_device_limit = state.store.default_device_limit();
     let default_rpm_limit = state.store.default_rpm_limit();
     let require_device_id = state.store.require_device_id();
+    let min_client_version = state.store.min_client_version().unwrap_or_default();
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
@@ -956,6 +961,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             default_device_limit,
             default_rpm_limit,
             require_device_id,
+            min_client_version,
             bare_rate_limit,
             bare_rate_window_secs,
             rate_limit_retry_max,
@@ -976,6 +982,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         default_device_limit,
         default_rpm_limit,
         require_device_id,
+        min_client_version,
         bare_rate_limit,
         bare_rate_window_secs,
         rate_limit_retry_max,
@@ -1156,6 +1163,36 @@ async fn set_require_device_id(
     let value = if req.required { "true" } else { "false" };
     state.store.set_setting(crate::store::REQUIRE_DEVICE_ID, value).map_err(internal)?;
     tracing::info!(required = req.required, "device identity check toggled");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetMinClientVersionReq {
+    /// 最低 Claude Code 客户端版本（`2.1.220`、`2.1`、`2` 都收）；空串表示不限。
+    min_client_version: String,
+}
+
+/// 设置最低客户端版本闸：UA 自报 `claude-cli/<版本>` 且低于此值的请求直接 403。
+///
+/// 只收能解析的版本串——写错一个字（`v2.1`、`最新版`）在代理侧会被当成「没配」而静默放行，
+/// 那时网页上明明写着一个值、闸却没开，是最难查的一种。故在入口处直接回 400。
+async fn set_min_client_version(
+    State(state): State<AppState>,
+    Json(req): Json<SetMinClientVersionReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let version = req.min_client_version.trim();
+    if version.is_empty() {
+        state.store.delete_setting(crate::store::MIN_CLIENT_VERSION).map_err(internal)?;
+        tracing::info!("minimum client version cleared");
+        return Ok(Json(settings_resp(&state)));
+    }
+    if crate::proxy::parse_version(version).is_none() {
+        return Err(bad_request(
+            "the minimum client version must look like 2.1.220 (2 and 2.1 are accepted too)",
+        ));
+    }
+    state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).map_err(internal)?;
+    tracing::info!(version, "minimum client version changed");
     Ok(Json(settings_resp(&state)))
 }
 

@@ -15,6 +15,8 @@ export interface Settings {
   default_rpm_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
+  /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
+  min_client_version: string
   /** 单个账号在窗口内允许的裸请求条数；0 表示不限。 */
   bare_rate_limit: number
   /** 裸请求速率窗口（秒），默认 60。 */
@@ -141,6 +143,18 @@ export async function setRateLimitRetryMax(n: number): Promise<Settings> {
 /** 开关设备身份校验（关闭后放行无 metadata.user_id 的请求）。 */
 export async function setRequireDeviceId(required: boolean): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/require-device-id', { required })
+  return data
+}
+
+/**
+ * 设置最低 Claude Code 版本（`2.1.220` / `2.1` / `2`；空串清除，即不限）。
+ *
+ * 只影响 UA 里自报 claude-cli/<版本> 的请求；写不成版本号的值后端直接 400。
+ */
+export async function setMinClientVersion(version: string): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/min-client-version', {
+    min_client_version: version,
+  })
   return data
 }
 

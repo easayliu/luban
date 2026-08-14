@@ -39,6 +39,27 @@ pub async fn handle(
         return (StatusCode::UNAUTHORIZED, "invalid API key").into_response();
     }
 
+    // 1.5) 最低客户端版本闸：只卡 UA 自报 `claude-cli/<版本>` 的请求，其余一律放行，
+    //      判定见 [`below_min_client_version`]。放在这里是因为它只看一个头——比解析 body、
+    //      挑账号都便宜，该拒的越早拒越好；也因此它在 API key 之后：先认人，再谈版本。
+    if let Some((got, want)) =
+        below_min_client_version(&client_ua, state.store.min_client_version().as_deref())
+    {
+        tracing::warn!(%method, path = %path_and_query, ua = %client_ua, %got, %want, "rejected: client version below the configured minimum");
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            error_body(
+                "permission_error",
+                &format!(
+                    "Claude Code {got} is no longer accepted here; upgrade to {want} or newer \
+                     (npm i -g @anthropic-ai/claude-code)"
+                ),
+            ),
+        )
+            .into_response();
+    }
+
     // 2) 请求体只解析这一次，下面五项判定全从这份结果上读。
     //
     //    此前 extract_device_id / body_has_user_id / request_model / request_speed 各自
@@ -2961,6 +2982,49 @@ fn ua_of(headers: &HeaderMap) -> String {
         Some(ua) if !ua.trim().is_empty() => ua.chars().take(MAX).collect(),
         _ => "-".into(),
     }
+}
+
+/// 把版本串解析成可比较的三元组：`2` → `(2,0,0)`、`2.1` → `(2,1,0)`、`2.1.220` → `(2,1,220)`。
+///
+/// 三段以后的（`1.2.3.4`）忽略尾巴，预发布后缀（`2.1.220-beta.1`）按主版本 `2.1.220` 算——
+/// 这道闸只用来卡「太旧」，把 beta 判成比正式版旧会误伤真正在用新版的人。任何一段不是数字、
+/// 或压根没有第一段时返回 `None`（调用方据此当成「读不出版本」，一律放行）。
+pub(crate) fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    // 先截掉预发布/构建后缀，只留 `数字.数字…` 那一截。
+    let head: &str = s.trim().split(['-', '+']).next().unwrap_or("");
+    let mut parts = head.split('.').map(|p| p.trim().parse::<u64>().ok());
+    let major = parts.next().flatten()?;
+    // 缺失的段按 0 补（`2` == `2.0.0`）；写了但不是数字的段则整串作废。
+    let mut seg = || match parts.next() {
+        None => Some(0),
+        Some(v) => v,
+    };
+    Some((major, seg()?, seg()?))
+}
+
+/// 从 `User-Agent` 里抠出 Claude Code 自报的版本：`claude-cli/2.1.220 (external, cli)`
+/// → `(2, 1, 220)`。UA 里没有 `claude-cli/`、或后面那串不是版本号时返回 `None`。
+fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
+    let rest = ua.split_once("claude-cli/")?.1;
+    // 版本串到第一个非「数字/点」字符为止（官方那串后面跟的是空格 + `(external, cli)`）。
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
+    parse_version(&rest[..end])
+}
+
+/// 最低客户端版本闸：来访 UA 自报的 CC 版本低于 `min` 时，返回 `(自报版本, 要求版本)` 供
+/// 日志与错误消息使用；放行时返回 `None`。
+///
+/// 三种情况一律放行，都是刻意的：
+/// - `min` 没配（`None`/空串）或不是版本号 —— 闸没开；
+/// - UA 里没有 `claude-cli/` —— 非 CC 客户端（SDK、浏览器、自写脚本），无版本可比；
+/// - `claude-cli/` 后面读不出版本号 —— 宁可放过，也不为一个解析不了的串把人挡在门外。
+///
+/// 注意这只是一道**引导升级**的闸，不是安全边界：UA 是客户端自报的，随手改一个头就能绕过。
+fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(String, String)> {
+    let min = min?;
+    let want = parse_version(min)?;
+    let got = cc_cli_version(ua)?;
+    (got < want).then(|| (format!("{}.{}.{}", got.0, got.1, got.2), min.trim().to_string()))
 }
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
@@ -7689,6 +7753,64 @@ mod tests {
         let mut h = super::HeaderMap::new();
         h.insert(super::header::USER_AGENT, cjk);
         assert_eq!(super::ua_of(&h), "-");
+    }
+
+    /// 版本串解析：段数不齐按 0 补齐，预发布后缀按主版本算，非数字段作废。
+    #[test]
+    fn parses_version_strings() {
+        let v = super::parse_version;
+        assert_eq!(v("2.1.220"), Some((2, 1, 220)));
+        assert_eq!(v("2.1"), Some((2, 1, 0)), "缺的段补 0");
+        assert_eq!(v("2"), Some((2, 0, 0)));
+        assert_eq!(v(" 2.1.220 "), Some((2, 1, 220)), "首尾空白不算数");
+        assert_eq!(v("2.1.220-beta.1"), Some((2, 1, 220)), "预发布按主版本算，不判成更旧");
+        assert_eq!(v("1.2.3.4"), Some((1, 2, 3)), "第四段忽略");
+        assert_eq!(v(""), None);
+        assert_eq!(v("v2.1.220"), None, "带前缀的不猜，交给调用方按「读不出」放行");
+        assert_eq!(v("2.x.1"), None, "写了但不是数字的段整串作废");
+        // 数值比较，不是字典序：字符串比的话 "2.1.9" 会大于 "2.1.220"。
+        assert!(v("2.1.9") < v("2.1.220"));
+    }
+
+    /// UA 里的 CC 版本：认 `claude-cli/<版本>`，后面跟什么都不影响；别的客户端读不出版本。
+    #[test]
+    fn reads_the_cc_version_from_the_user_agent() {
+        let v = super::cc_cli_version;
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 220)), "官方那串");
+        assert_eq!(v("claude-cli/2.1.220"), Some((2, 1, 220)), "光秃秃一串也认");
+        assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
+        assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
+        assert_eq!(v("claude-cli/"), None, "有前缀没版本");
+        assert_eq!(v("claude-cli/next (external, cli)"), None, "版本位不是数字");
+    }
+
+    /// 最低版本闸的三态：低于门槛才拒，等于/高于放行；闸没配、UA 不是 CC、版本读不出来
+    /// 全都放行——这道闸只用来逼旧版 CC 升级，不该把别的客户端一起挡在门外。
+    #[test]
+    fn rejects_only_cc_clients_below_the_minimum() {
+        let gate = |ua: &str, min: Option<&str>| super::below_min_client_version(ua, min);
+        let old = "claude-cli/2.0.30 (external, cli)";
+
+        let (got, want) = gate(old, Some("2.1.220")).expect("旧版该被拦下");
+        assert_eq!(got, "2.0.30", "拦下时要报出自报版本，日志与提示都靠它");
+        assert_eq!(want, "2.1.220", "提示里给的是配置原样，不是解析后的三元组");
+
+        assert!(gate(config::CC_USER_AGENT, Some("2.1.220")).is_none(), "正好等于门槛要放行");
+        assert!(gate("claude-cli/3.0.0 (external, cli)", Some("2.1.220")).is_none(), "更新的放行");
+        assert!(gate(old, Some("2.1")).is_some(), "门槛写两段即 2.1.0，2.0.30 更旧——照拦");
+        assert!(gate(old, None).is_none(), "闸没配");
+        assert!(gate(old, Some("   ")).is_none(), "空串等于没配");
+        assert!(gate(old, Some("最新版")).is_none(), "门槛不是版本号 → 当没配，不能全拒");
+        assert!(gate("python-httpx/0.27.0", Some("2.1.220")).is_none(), "非 CC 客户端不受这道闸管");
+        assert!(gate("-", Some("2.1.220")).is_none(), "没带 UA 的（ua_of 落 `-`）照旧放行");
+    }
+
+    /// 上一条里「2.1 门槛拦下 2.0.30」的反面：同一个门槛不能把 2.1.0 之后的版本也拦了。
+    #[test]
+    fn a_two_segment_minimum_means_dot_zero() {
+        assert!(super::below_min_client_version("claude-cli/2.1.0", Some("2.1")).is_none());
+        assert!(super::below_min_client_version("claude-cli/2.1.220", Some("2.1")).is_none());
+        assert!(super::below_min_client_version("claude-cli/2.0.999", Some("2.1")).is_some());
     }
 
     /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API

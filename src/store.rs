@@ -1167,6 +1167,18 @@ impl CredentialStore {
         }
     }
 
+    /// 允许接入的最低 Claude Code 客户端版本（形如 `2.1.220`）；未设置或空串表示不限。
+    ///
+    /// 只影响 `User-Agent` 里自报了 `claude-cli/<版本>` 的请求，别的客户端一律放行——见
+    /// [`crate::proxy::below_min_client_version`]。
+    pub fn min_client_version(&self) -> Option<String> {
+        self.get_setting(MIN_CLIENT_VERSION)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
     /// 删除设置项（顺序同 [`Self::set_setting`]：先落库再更新缓存）。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         {
@@ -1453,6 +1465,13 @@ fn setting_is_on(value: &str) -> bool {
 /// 是否要求请求携带有效设备身份的 settings 键名；`"0"`/`"false"` 关闭（放行裸请求），
 /// 缺省或其它值视为要求（无有效 `metadata.user_id` 的请求直接 403）。
 pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
+
+/// 允许接入的最低 Claude Code 客户端版本的 settings 键名；空串或未设置表示不限。
+///
+/// 值是版本号本身（`2.1.220`、`2.1`、`2` 都收），不是布尔。判定只针对 UA 里带
+/// `claude-cli/<版本>` 的请求：这道闸是给「逼旧版 CC 升级」用的，别的客户端（SDK、
+/// 浏览器、自写脚本）UA 里根本没有版本可比，拿它们跟一个 CC 版本号比毫无意义，故一律放行。
+pub const MIN_CLIENT_VERSION: &str = "min_client_version";
 
 /// 全局默认设备数上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
@@ -4463,6 +4482,26 @@ mod tests {
         store.mark_rate_limited(a, None, Duration::from_secs(120));
         assert!(store.rate_limited_secs(a) > 110);
         assert!(store.rate_limited_models(a).is_empty(), "账号级不该混进模型级明细");
+    }
+
+    /// 最低客户端版本：未设置、空串、纯空白都等于「不限」（`None`），其余去掉首尾空白后原样返回。
+    /// 空白不归一成 `None` 的话，代理侧会拿一个空串去 `parse_version`，虽然也放行，但网页上
+    /// 会显示成「已配置」——两边说法不一致比闸本身更难查。
+    #[test]
+    fn blank_min_client_version_means_no_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        assert_eq!(store.min_client_version(), None, "没配就是不限");
+        store.set_setting(MIN_CLIENT_VERSION, "2.1.220").unwrap();
+        assert_eq!(store.min_client_version().as_deref(), Some("2.1.220"));
+        store.set_setting(MIN_CLIENT_VERSION, "  2.1  ").unwrap();
+        assert_eq!(store.min_client_version().as_deref(), Some("2.1"), "首尾空白不带进判定");
+        store.set_setting(MIN_CLIENT_VERSION, "   ").unwrap();
+        assert_eq!(store.min_client_version(), None, "只剩空白等于没配");
+        store.delete_setting(MIN_CLIENT_VERSION).unwrap();
+        assert_eq!(store.min_client_version(), None);
     }
 
     /// 设置项走内存缓存后，读写口径必须与直接查库一致（含删除与重开库）。

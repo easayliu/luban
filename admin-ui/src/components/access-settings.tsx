@@ -14,6 +14,7 @@ import {
   ShieldCheckIcon,
   SmartphoneIcon,
   SparklesIcon,
+  TerminalIcon,
   TimerIcon,
   Trash2Icon,
 } from 'lucide-react'
@@ -25,6 +26,7 @@ import {
   setDefaultRpmLimit,
   setDeviceRetention,
   setDeviceTtl,
+  setMinClientVersion,
   setRequireDeviceId,
   type Settings,
 } from '@/api/settings'
@@ -459,6 +461,17 @@ export function DeviceSettingsContent() {
         <RequireDeviceIdToggle />
         <BareRateLimit />
       </SettingsGroup>
+
+      <SettingsGroup
+        icon={TerminalIcon}
+        title={t('客户端版本', 'Client version')}
+        description={t(
+          '按 User-Agent 里自报的 claude-cli 版本卡住过旧的 Claude Code；其它客户端不受影响。',
+          'Block outdated Claude Code builds by the claude-cli version in their User-Agent; other clients are unaffected.',
+        )}
+      >
+        <MinClientVersion />
+      </SettingsGroup>
     </div>
   )
 }
@@ -527,6 +540,12 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
       label: t('无身份请求', 'Unidentified requests'),
       value: bareRequestPolicy,
     },
+    {
+      label: t('最低客户端版本', 'Minimum client version'),
+      value: settings.min_client_version
+        ? t(`${settings.min_client_version} 及以上`, `${settings.min_client_version}+`)
+        : t('不限', 'Unlimited'),
+    },
   ]
 
   return (
@@ -538,11 +557,11 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         'A summary of the device binding and identity rules currently in effect.',
       )}
     >
-      {/* 一行五格在 sm 上会挤成两三个字换行，故拖到 md 才铺平；两档之间就是两列。
+      {/* 一行六格在 sm 上会挤成两三个字换行，故拖到 md 才铺平；两档之间就是两列。
           下面那串边框类是按「窄屏两列 / 宽屏一行」写死的，改列数要连它一起改。 */}
       <dl
         aria-label={t('当前设备策略概览', 'Current device policy overview')}
-        className="grid grid-cols-2 md:grid-cols-5"
+        className="grid grid-cols-2 md:grid-cols-6"
       >
         {items.map((item, index) => (
           <div
@@ -1021,6 +1040,97 @@ function RequireDeviceIdToggle() {
           disabled={save.isPending}
           onCheckedChange={(next) => save.mutate(next)}
         />
+      </div>
+    </Field>
+  )
+}
+
+/** 版本号的可接受写法：`2`、`2.1`、`2.1.220`，可带 `-beta.1` 之类的后缀（按主版本算）。 */
+const VERSION_RE = /^\d+(\.\d+)*([-+][0-9A-Za-z.]+)?$/
+
+/**
+ * 最低 Claude Code 版本：UA 自报 `claude-cli/<版本>` 且低于此值的请求直接 403。
+ *
+ * 只是引导升级用的闸，不是安全边界——UA 是客户端自报的，改一个头就能绕过。
+ */
+function MinClientVersion() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+
+  useEffect(() => {
+    if (data) setDraft(data.min_client_version)
+  }, [data?.min_client_version])
+
+  const save = useMutation({
+    mutationFn: (version: string) => setMinClientVersion(version),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: settings.min_client_version
+          ? t('最低客户端版本已更新', 'Minimum client version updated')
+          : t('最低客户端版本已取消', 'Minimum client version removed'),
+        description: settings.min_client_version
+          ? t(
+              `低于 ${settings.min_client_version} 的 Claude Code 将被拒绝。`,
+              `Claude Code older than ${settings.min_client_version} will be rejected.`,
+            )
+          : t('不再按版本拦截客户端。', 'Clients are no longer filtered by version.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const value = draft.trim()
+  const current = data?.min_client_version ?? ''
+  // 空串是合法输入（= 取消限制），只有写错格式才拦下——后端同样会 400，这里先拦一道免得白跑。
+  const malformed = value !== '' && !VERSION_RE.test(value)
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel htmlFor="min-client-version">
+          {t('最低 Claude Code 版本', 'Minimum Claude Code version')}
+        </FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '低于该版本的 Claude Code 会收到 403 与升级提示。留空表示不限。只认 User-Agent 里的 claude-cli 版本，SDK、浏览器等其它客户端一律放行；UA 可被客户端伪造，只用于引导升级。',
+            'Older Claude Code builds get a 403 with an upgrade hint. Leave empty for no limit. Only the claude-cli version in the User-Agent is checked — SDKs, browsers and other clients always pass; a User-Agent can be forged, so treat this as an upgrade nudge, not a security boundary.',
+          )}
+        </FieldDescription>
+        <Badge variant={malformed ? 'warning' : 'secondary'} size="sm">
+          {malformed
+            ? t('写法应形如 2.1.220', 'Expected something like 2.1.220')
+            : value
+              ? t(`要求 ${value} 及以上`, `Requires ${value} or newer`)
+              : t('不限版本', 'Any version')}
+        </Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <Input
+          id="min-client-version"
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          placeholder="2.1.220"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={malformed || value === current}
+          onClick={() => save.mutate(value)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
       </div>
     </Field>
   )
