@@ -5,13 +5,11 @@ import App from './App'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider } from '@/lib/i18n'
+import { initTheme } from '@/lib/theme'
 import './index.css'
 
-// 跟随系统深浅色：给 <html> 切换 .dark（配合 darkMode: 'class'）。
-const mq = window.matchMedia('(prefers-color-scheme: dark)')
-const applyTheme = (dark: boolean) => document.documentElement.classList.toggle('dark', dark)
-applyTheme(mq.matches)
-mq.addEventListener('change', (e) => applyTheme(e.matches))
+// 渲染前先上色：系统 / 浅色 / 深色三态，见 lib/theme.ts。
+initTheme()
 
 const queryClient = new QueryClient({
   defaultOptions: {

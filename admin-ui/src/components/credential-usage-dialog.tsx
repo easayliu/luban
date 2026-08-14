@@ -3,6 +3,7 @@ import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-quer
 import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
   displayCredentialLabel,
@@ -107,6 +108,7 @@ export function CredentialUsageDialog({
    * 锚点后再白白重取一次。整轮钉住同一个快照，翻页期间新到的请求不会把记录往后挤。
    */
   const anchor = useRef<number | null>(null)
+  const wideEnoughForTable = useMediaQuery('(min-width: 64rem)')
 
   const usage = useQuery({
     queryKey: ['credential-usage', cred.id, page, pageSize],
@@ -241,12 +243,22 @@ export function CredentialUsageDialog({
             </Empty>
           ) : (
             <>
-              <UsageTable
-                rows={rows}
-                credentialLabel={credentialLabel}
-                descriptionId={retentionNoteId}
-                loading={usage.isFetching}
-              />
+              {/* 十列的宽表在窄屏只能横向拖着看，等于没法用；lg 以下换成一条一张的堆叠卡片。
+                  这里用媒体查询二选一而不是 CSS 隐藏：一页最多 100 条，两套都建出来是双倍节点。 */}
+              {wideEnoughForTable ? (
+                <UsageTable
+                  rows={rows}
+                  credentialLabel={credentialLabel}
+                  descriptionId={retentionNoteId}
+                  loading={usage.isFetching}
+                />
+              ) : (
+                <UsageCards
+                  rows={rows}
+                  credentialLabel={credentialLabel}
+                  loading={usage.isFetching}
+                />
+              )}
 
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t pt-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
                 <p className="min-w-0 text-muted-foreground tabular-nums">
@@ -331,6 +343,100 @@ export function CredentialUsageDialog({
         </DialogFooter>
       </DialogPopup>
     </Dialog>
+  )
+}
+
+/**
+ * 窄屏下的请求明细：一条请求一张卡片。
+ *
+ * 字段顺序按排查时的读法排：先看什么时候、成没成、花了多少，再看模型与 token，
+ * 最后才是耗时和来源。UA 只留一行截断——真要看全的场景基本都在桌面端。
+ */
+function UsageCards({
+  rows,
+  credentialLabel,
+  loading,
+}: {
+  rows: UsageLog[]
+  credentialLabel: string
+  loading: boolean
+}) {
+  const { t, language, locale } = useI18n()
+  const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
+
+  return (
+    <ul
+      className="max-h-[26rem] space-y-2 overflow-y-auto overscroll-contain"
+      aria-label={t(`${credentialLabel} 的请求明细`, `Request log for ${credentialLabel}`)}
+      aria-busy={loading}
+    >
+      {rows.map((log) => {
+        const deviceShort = log.device_id
+          ? log.device_id.startsWith('sim:')
+            ? `sim:${log.device_id.slice(4, 12)}`
+            : log.device_id.slice(0, 8)
+          : '—'
+        return (
+          <li key={log.id} className="rounded-lg border bg-card px-3 py-2.5 text-xs">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 font-medium tabular-nums" title={formatFullTime(log.ts, language)}>
+                {logTime(log.ts)}
+              </span>
+              <Badge variant={statusVariant(log.status)} size="sm" className="tabular-nums">
+                {log.status}
+              </Badge>
+              <span
+                className={cn(
+                  'ml-auto shrink-0 font-medium tabular-nums',
+                  log.cost_usd == null && 'font-normal text-muted-foreground',
+                )}
+              >
+                {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
+              </span>
+            </div>
+            <p className="mt-1 truncate text-muted-foreground" title={log.model ?? undefined}>
+              {log.model ?? '—'}
+            </p>
+            <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5">
+              <LogFact label={t('输入 / 输出', 'In / out')}>
+                {num(log.input_tokens, locale)} / {num(log.output_tokens, locale)}
+              </LogFact>
+              <LogFact label={t('缓存写 / 读', 'Cache w/r')}>
+                {num(log.cache_creation_tokens, locale)} / {num(log.cache_read_tokens, locale)}
+              </LogFact>
+              <LogFact label={t('首字 / 总耗时', 'TTFT / total')}>
+                {ms(log.ttft_ms)} / {ms(log.total_ms)}
+                {log.sse_aggregated && (
+                  <span className="ml-1 text-[10px] text-muted-foreground">
+                    {t('非流转流', 'stream-upgraded')}
+                  </span>
+                )}
+              </LogFact>
+              <LogFact label={t('设备', 'Device')}>
+                <span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span>
+              </LogFact>
+            </dl>
+            {(log.ua || log.ua_out) && (
+              <p
+                className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground"
+                title={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : (log.ua ?? undefined)}
+              >
+                {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
+              </p>
+            )}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+function LogFact({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-2xs text-muted-foreground">{label}</dt>
+      <dd className="truncate tabular-nums">{children}</dd>
+    </div>
   )
 }
 

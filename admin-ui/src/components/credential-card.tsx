@@ -1,6 +1,5 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import {
-  ActivityIcon,
   CalendarDaysIcon,
   CheckIcon,
   ClockIcon,
@@ -23,6 +22,7 @@ import {
 import {
   ConnectivityTestDialog,
   CredentialMenuContent,
+  DeferredMount,
   DeleteCredentialDialog,
   evaluateCredential,
   modelCooldownSummary,
@@ -68,7 +68,11 @@ import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
-export function CredentialCard({
+/**
+ * memo 的收益在于「列表本身没变，但父组件重渲染了」这类情况：搜索框每敲一个字、
+ * 勾选任意一行、翻页动画，都会重跑一遍工作区。配合稳定的 onSelectedChange 才生效。
+ */
+export const CredentialCard = memo(function CredentialCard({
   cred,
   now,
   selectable = false,
@@ -79,7 +83,8 @@ export function CredentialCard({
   now: number
   selectable?: boolean
   selected?: boolean
-  onSelectedChange?: (next: boolean) => void
+  /** 收 id 而不是每张卡现做一个闭包，回调引用才能稳定，memo 才拦得住重渲染。 */
+  onSelectedChange?: (id: number, next: boolean) => void
 }) {
   const { t, language } = useI18n()
   const [editing, setEditing] = useState(false)
@@ -216,7 +221,7 @@ export function CredentialCard({
                 {selectable && (
                   <Checkbox
                     checked={selected}
-                    onCheckedChange={(checked) => onSelectedChange?.(checked)}
+                    onCheckedChange={(checked) => onSelectedChange?.(cred.id, checked)}
                     aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                   />
                 )}
@@ -343,16 +348,19 @@ export function CredentialCard({
                 )}
               </div>
               {cred.quota ? (
-                <span
-                  className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                  title={formatFullTime(cred.quota.ts, language)}
-                >
-                  <ClockIcon className="size-3.5" />
-                  {t(
-                    `更新于 ${relativeTime(cred.quota.ts, now, language)}`,
-                    `Updated ${relativeTime(cred.quota.ts, now, language)}`,
-                  )}
-                </span>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<span />}
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+                  >
+                    <ClockIcon className="size-3.5" />
+                    {t(
+                      `更新于 ${relativeTime(cred.quota.ts, now, language)}`,
+                      `Updated ${relativeTime(cred.quota.ts, now, language)}`,
+                    )}
+                  </TooltipTrigger>
+                  <TooltipPopup>{formatFullTime(cred.quota.ts, language)}</TooltipPopup>
+                </Tooltip>
               ) : (
                 <span className="text-sm text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
@@ -412,44 +420,61 @@ export function CredentialCard({
 
         <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:py-3">
           <div className="flex min-w-0 items-center gap-2 @sm/card:gap-4">
-            <Button
-              type="button"
-              variant="ghost"
-              className="w-fit max-w-full justify-start"
-              onClick={() => setDevicesOpen(true)}
-              title={t('查看已绑定设备', 'View bound devices')}
-              aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              <SmartphoneIcon />
-              <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
-              <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
-            </Button>
+            {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、
+                触屏上完全出不来，样式也不受控，和卡片上方的状态提示不是一套东西。 */}
+            <Tooltip>
+              <TooltipTrigger
+                className={cn(buttonVariants({ variant: 'ghost' }), 'w-fit max-w-full justify-start')}
+                onClick={() => setDevicesOpen(true)}
+                aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
+                aria-haspopup="dialog"
+              >
+                <SmartphoneIcon />
+                <span className="tabular-nums">{cred.device_count}/{effectiveLimit}</span>
+                <Badge variant={devicePolicy.variant} size="sm">{devicePolicy.label}</Badge>
+              </TooltipTrigger>
+              <TooltipPopup>{t('查看已绑定设备', 'View bound devices')}</TooltipPopup>
+            </Tooltip>
             <Separator orientation="vertical" className="h-5" />
-            <span
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
-              title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}
-            >
-              <WalletCardsIcon className="size-4 text-muted-foreground" aria-hidden />
-              <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
-              <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
-            </span>
+            <Tooltip>
+              <TooltipTrigger
+                render={<span />}
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
+              >
+                <WalletCardsIcon className="size-4 text-muted-foreground" aria-hidden />
+                <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
+                <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
+              </TooltipTrigger>
+              <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
+            </Tooltip>
             {/* 只在有流量时出现：闲置号上一个恒为 0 的 RPM 只是噪声，还会挤掉本就紧张的页脚宽度。 */}
             {cred.rpm > 0 && (
               <>
                 <Separator orientation="vertical" className="h-5" />
-                <span
-                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm"
-                  title={t(
-                    '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-                    'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
-                  )}
-                >
-                  <ActivityIcon className="size-4 text-muted-foreground" aria-hidden />
-                  <span className="sr-only">{t('当前 RPM', 'Current RPM')}</span>
-                  <span className="font-medium tabular-nums">{cred.rpm}</span>
-                  <span className="text-muted-foreground text-xs">RPM</span>
-                </span>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<span />}
+                    className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap text-sm"
+                  >
+                    {/* 页脚里唯一的实时值（隔壁两个都是累计量），用呼吸点替掉图标把「活的」画出来。
+                        绿色只落在这个 6px 点上：数值本身无好坏之分，颜色留给状态（运行正常 / 冷却）。 */}
+                    <span className="relative flex size-1.5" aria-hidden>
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-success opacity-60 motion-reduce:hidden" />
+                      <span className="relative inline-flex size-1.5 rounded-full bg-success" />
+                    </span>
+                    <span className="sr-only">{t('当前 RPM', 'Current RPM')}</span>
+                    <span className="inline-flex items-baseline gap-1">
+                      <span className="font-medium tabular-nums">{cred.rpm}</span>
+                      <span className="text-2xs text-muted-foreground tracking-wide">RPM</span>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                    {t(
+                      '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+                      'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+                    )}
+                  </TooltipPopup>
+                </Tooltip>
               </>
             )}
           </div>
@@ -465,30 +490,33 @@ export function CredentialCard({
           </div>
         </CardFooter>
 
-        <CredentialProxyDialog
-          cred={cred}
-          open={proxyOpen}
-          onOpenChange={setProxyOpen}
-          proxy={actions.proxy}
-        />
-        <CredentialDevicesDialog
-          cred={cred}
-          open={devicesOpen}
-          onOpenChange={setDevicesOpen}
-          limit={limit}
-        />
-        <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
-        <DeleteCredentialDialog
-          cred={cred}
-          actions={actions}
-          open={confirmDelete}
-          onOpenChange={setConfirmDelete}
-        />
-        <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
+        {/* 没点开过任何一个就一个都不挂：账号一多，这些常关的对话框全是白挂的组件树。 */}
+        <DeferredMount open={proxyOpen || devicesOpen || usageOpen || confirmDelete || testing}>
+          <CredentialProxyDialog
+            cred={cred}
+            open={proxyOpen}
+            onOpenChange={setProxyOpen}
+            proxy={actions.proxy}
+          />
+          <CredentialDevicesDialog
+            cred={cred}
+            open={devicesOpen}
+            onOpenChange={setDevicesOpen}
+            limit={limit}
+          />
+          <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
+          <DeleteCredentialDialog
+            cred={cred}
+            actions={actions}
+            open={confirmDelete}
+            onOpenChange={setConfirmDelete}
+          />
+          <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
+        </DeferredMount>
       </Card>
     </li>
   )
-}
+})
 
 /**
  * 这个「窗口」其实是个**可用性标记**而不是用量窗口。

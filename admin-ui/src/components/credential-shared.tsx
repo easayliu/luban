@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
@@ -735,6 +735,20 @@ export function CredentialMenuContent({
       </MenuItem>
     </MenuPopup>
   )
+}
+
+/**
+ * 首次打开之后才真正挂载里面的内容，之后一直保留（保住关闭动画和已填状态）。
+ *
+ * 每个账号后面都跟着一串对话框，一页 50 个账号就是几百棵永远关着的组件树；
+ * 它们的查询虽然已经用 `enabled: open` 挡住了，组件本身的挂载与更新仍然照跑。
+ */
+export function DeferredMount({ open, children }: { open: boolean; children: ReactNode }) {
+  const [mounted, setMounted] = useState(open)
+  // 渲染期直接改自身 state 是 React 认可的「派生状态」写法，会在同一帧内重跑，
+  // 不像放进 effect 那样晚一帧——晚一帧会让对话框错过入场动画。
+  if (open && !mounted) setMounted(true)
+  return mounted ? <>{children}</> : null
 }
 
 /** 删除单个账号的确认框。卡片与列表共用，免得两处各写一遍后果说明。 */

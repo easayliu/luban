@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from 'react'
+import { memo, type ReactNode, useState } from 'react'
 import {
   CalendarDaysIcon,
   ChevronDownIcon,
@@ -13,6 +13,7 @@ import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
   CredentialMenuContent,
+  DeferredMount,
   DeleteCredentialDialog,
   evaluateCredential,
   quotaLevel,
@@ -90,7 +91,9 @@ export function CredentialListHeader({
   onSelectAll?: (next: boolean) => void
 }) {
   const { t } = useI18n()
-  const sortable = (label: string, key: SortKey) => {
+  // 数值列表头跟着单元格右对齐：数字右对齐后个位数落在同一条线上，
+  // 一列扫下来能直接比大小，这也是表格里数值列的通行排法。
+  const sortable = (label: string, key: SortKey, numeric = false) => {
     const active = sort === key
     const Arrow = active && dir === 'asc' ? ChevronUpIcon : ChevronDownIcon
 
@@ -100,7 +103,10 @@ export function CredentialListHeader({
         size="xs"
         variant="ghost"
         onClick={() => onSortChange(key)}
-        className="w-full justify-start px-0 text-left sm:text-sm"
+        className={cn(
+          'w-full px-0 sm:text-sm',
+          numeric ? 'justify-end text-right' : 'justify-start text-left',
+        )}
         title={active
           ? t(`按${label}排序（点击切换升降序）`, `Sort by ${label} (click to reverse direction)`)
           : t(`按${label}排序`, `Sort by ${label}`)}
@@ -144,14 +150,14 @@ export function CredentialListHeader({
         <TableHead className={COL.devices} {...sortProps('devices')}>
           {sortable(t('设备', 'Devices'), 'devices')}
         </TableHead>
-        <TableHead className={COL.rpm} {...sortProps('rpm')}>
-          {sortable(t('RPM', 'RPM'), 'rpm')}
+        <TableHead className={cn(COL.rpm, 'text-right')} {...sortProps('rpm')}>
+          {sortable(t('RPM', 'RPM'), 'rpm', true)}
         </TableHead>
         <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
-        <TableHead className={COL.cost} {...sortProps('cost')}>
-          {sortable(t('累计花费', 'Total cost'), 'cost')}
+        <TableHead className={cn(COL.cost, 'text-right')} {...sortProps('cost')}>
+          {sortable(t('累计花费', 'Total cost'), 'cost', true)}
         </TableHead>
         <TableHead className={COL.action}>
           <span className="sr-only">{t('操作', 'Actions')}</span>
@@ -161,7 +167,7 @@ export function CredentialListHeader({
   )
 }
 
-export function CredentialRow({
+export const CredentialRow = memo(function CredentialRow({
   cred,
   now,
   selectable = false,
@@ -172,7 +178,8 @@ export function CredentialRow({
   now: number
   selectable?: boolean
   selected?: boolean
-  onSelectedChange?: (next: boolean) => void
+  /** 收 id 而不是每张卡现做一个闭包，回调引用才能稳定，memo 才拦得住重渲染。 */
+  onSelectedChange?: (id: number, next: boolean) => void
 }) {
   const { t, language } = useI18n()
   const [devicesOpen, setDevicesOpen] = useState(false)
@@ -201,7 +208,7 @@ export function CredentialRow({
               {selectable && (
                 <Checkbox
                   checked={selected}
-                  onCheckedChange={(checked) => onSelectedChange?.(checked)}
+                  onCheckedChange={(checked) => onSelectedChange?.(cred.id, checked)}
                   className="mt-2"
                   aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                 />
@@ -309,7 +316,7 @@ export function CredentialRow({
           {selectable && (
             <Checkbox
               checked={selected}
-              onCheckedChange={(checked) => onSelectedChange?.(checked)}
+              onCheckedChange={(checked) => onSelectedChange?.(cred.id, checked)}
               aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
             />
           )}
@@ -395,25 +402,33 @@ export function CredentialRow({
             <Badge variant={policy.variant} size="sm">{policy.label}</Badge>
           </Button>
         </TableCell>
-        <TableCell className={COL.rpm}>
+        <TableCell className={cn(COL.rpm, 'text-right')}>
           {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。 */}
-          <span
-            className={cn('tabular-nums text-sm', cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground')}
-            title={t(
-              '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-              'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
-            )}
-          >
-            {cred.rpm > 0 ? cred.rpm : '—'}
-          </span>
+          <Tooltip>
+            <TooltipTrigger
+              render={<span />}
+              className={cn('tabular-nums text-sm', cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground')}
+            >
+              {cred.rpm > 0 ? cred.rpm : '—'}
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+              {t(
+                '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
+                'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+              )}
+            </TooltipPopup>
+          </Tooltip>
         </TableCell>
         <TableCell className={COL.recent}>
           {cred.last_used != null ? relativeTime(cred.last_used, now, language) : t('未使用', 'Never used')}
         </TableCell>
-        <TableCell className={COL.cost}>
-          <span className="tabular-nums font-medium text-sm" title={t('累计等价 API 费用', 'Cumulative equivalent API cost')}>
-            {formatUsd(cred.cost_total)}
-          </span>
+        <TableCell className={cn(COL.cost, 'text-right')}>
+          <Tooltip>
+            <TooltipTrigger render={<span />} className="tabular-nums font-medium text-sm">
+              {formatUsd(cred.cost_total)}
+            </TooltipTrigger>
+            <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
+          </Tooltip>
         </TableCell>
         <TableCell className={cn(COL.action, 'text-right')}>
           <CredentialRowActionsMenu
@@ -432,37 +447,40 @@ export function CredentialRow({
         </TableCell>
       </TableRow>
 
-      <CredentialDevicesDialog
-        cred={cred}
-        open={devicesOpen}
-        onOpenChange={setDevicesOpen}
-        limit={actions.limit}
-      />
-      <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
-      <DeleteCredentialDialog
-        cred={cred}
-        actions={actions}
-        open={confirmDelete}
-        onOpenChange={setConfirmDelete}
-      />
-      <RenameCredentialDialog
-        cred={cred}
-        actions={actions}
-        name={renameName}
-        onNameChange={setRenameName}
-        open={renameOpen}
-        onOpenChange={setRenameOpen}
-      />
-      <CredentialProxyDialog
-        cred={cred}
-        open={proxyOpen}
-        onOpenChange={setProxyOpen}
-        proxy={actions.proxy}
-      />
-      <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
+      {/* 与卡片同一套：没点开过就不挂，见 DeferredMount。 */}
+      <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || testing}>
+        <CredentialDevicesDialog
+          cred={cred}
+          open={devicesOpen}
+          onOpenChange={setDevicesOpen}
+          limit={actions.limit}
+        />
+        <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
+        <DeleteCredentialDialog
+          cred={cred}
+          actions={actions}
+          open={confirmDelete}
+          onOpenChange={setConfirmDelete}
+        />
+        <RenameCredentialDialog
+          cred={cred}
+          actions={actions}
+          name={renameName}
+          onNameChange={setRenameName}
+          open={renameOpen}
+          onOpenChange={setRenameOpen}
+        />
+        <CredentialProxyDialog
+          cred={cred}
+          open={proxyOpen}
+          onOpenChange={setProxyOpen}
+          proxy={actions.proxy}
+        />
+        <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
+      </DeferredMount>
     </>
   )
-}
+})
 
 function CredentialRowActionsMenu({
   cred,

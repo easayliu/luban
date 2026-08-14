@@ -27,7 +27,7 @@ import { type CredentialActions } from '@/components/credential-shared'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import {
   Card,
   CardAction,
@@ -63,6 +63,12 @@ import {
   NumberFieldInput,
 } from '@/components/ui/number-field'
 import {
+  Meter,
+  MeterIndicator,
+  MeterLabel,
+  MeterTrack,
+} from '@/components/ui/meter'
+import {
   Select,
   SelectItem,
   SelectPopup,
@@ -70,6 +76,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 
@@ -301,21 +308,46 @@ export function CredentialDevicesDialog({
                     </Button>
                   </CardAction>
                 </CardHeader>
-                <CardPanel>
-                  <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
-                    <CapacityStat
-                      label={t('已绑定', 'Bound')}
-                      value={t(
-                        `${formattedCurrentDeviceCount} 台`,
-                        `${formattedCurrentDeviceCount} ${currentDeviceNoun}`,
-                      )}
-                    />
+                <CardPanel className="space-y-3">
+                  {/* 「4 台 / 上限 10 台」这种关系，一条占用条比两个并排的数字直观得多；
+                      不限设备时没有分母，画条永远填不满的进度反而误导，所以只在有上限时出现。 */}
+                  {cred.device_limit_effective > 0 ? (
+                    <Meter
+                      value={Math.min(currentDeviceCount, cred.device_limit_effective)}
+                      max={cred.device_limit_effective}
+                      className="gap-1.5"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <MeterLabel className="text-xs text-muted-foreground">
+                          {t('名额占用', 'Slots used')}
+                        </MeterLabel>
+                        <span className="shrink-0 font-medium text-sm tabular-nums">
+                          {formattedCurrentDeviceCount}
+                          <span className="text-muted-foreground">/{cred.device_limit_effective.toLocaleString(locale)}</span>
+                        </span>
+                      </div>
+                      <MeterTrack className="h-1.5">
+                        <MeterIndicator
+                          className={currentDeviceCount >= cred.device_limit_effective ? 'bg-warning' : 'bg-success'}
+                        />
+                      </MeterTrack>
+                    </Meter>
+                  ) : (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">{t('名额占用', 'Slots used')}</span>
+                      <span className="font-medium text-sm tabular-nums">
+                        {formattedCurrentDeviceCount}
+                        <span className="text-muted-foreground">/∞</span>
+                      </span>
+                    </div>
+                  )}
+                  <dl className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
                     <CapacityStat label={t('生效上限', 'Effective limit')} value={effectiveLimit} />
-                    <div className="col-span-2 min-w-0 sm:col-span-1">
+                    <div className="min-w-0">
                       <dt className="text-xs text-muted-foreground">
                         {t('上限策略', 'Limit policy')}
                       </dt>
-                      <dd className="mt-1"><Badge variant={currentPolicy.variant}>{currentPolicy.label}</Badge></dd>
+                      <dd className="mt-1"><Badge variant={currentPolicy.variant} size="sm">{currentPolicy.label}</Badge></dd>
                     </div>
                   </dl>
                 </CardPanel>
@@ -376,10 +408,6 @@ function DeviceList({
   const { t, language, locale } = useI18n()
   const qc = useQueryClient()
   const queryKey = ['credential-devices', credId] as const
-  const deviceCountText = (count: number) => {
-    const formatted = count.toLocaleString(locale)
-    return t(`${formatted} 台`, `${formatted} ${count === 1 ? 'device' : 'devices'}`)
-  }
   const unbind = useMutation({
     mutationFn: (deviceId: string) => unbindCredentialDevice(credId, deviceId),
     onSuccess: (_, deviceId) => {
@@ -407,10 +435,13 @@ function DeviceList({
             {t('按最近活跃时间排序', 'Sorted by most recent activity')}
           </p>
         </div>
-        {!isPending && !error && (
+        {/* 这里以前还挂一个条数。但它数的是列表条目（含模拟设备），跟头部徽章那个「真实绑定数」
+            不是一个口径，两个 “N 台” 并排出现只会让人以为哪边算错了。名额多少看上面的占用条，
+            模拟设备各自带徽章，这里只留刷新指示。 */}
+        {!isPending && !error && isFetching && (
           <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-            {isFetching && <Spinner />}
-            {deviceCountText(data?.length ?? 0)}
+            <Spinner />
+            {t('刷新中', 'Refreshing')}
           </span>
         )}
       </div>
@@ -421,16 +452,17 @@ function DeviceList({
           role="status"
           aria-label={t('正在读取设备列表', 'Loading device list')}
         >
-          {Array.from({ length: 2 }, (_, index) => (
-            <Card key={index}>
-              <CardPanel className="flex items-center gap-3">
-                <Skeleton className="size-8 rounded-full" />
-                <div className="flex-1 space-y-2">
-                  <Skeleton className="h-4 w-3/5" />
-                  <Skeleton className="h-3 w-2/5" />
-                </div>
-              </CardPanel>
-            </Card>
+          {Array.from({ length: 3 }, (_, index) => (
+            <div key={index} className="rounded-lg border bg-card px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Skeleton className="size-4 shrink-0 rounded" />
+                <Skeleton className="h-4 w-2/5" />
+              </div>
+              <div className="mt-1.5 flex items-center justify-between gap-4 pl-6">
+                <Skeleton className="h-3 w-2/5" />
+                <Skeleton className="h-3 w-24 shrink-0" />
+              </div>
+            </div>
           ))}
         </div>
       ) : error ? (
@@ -458,7 +490,9 @@ function DeviceList({
           </EmptyHeader>
         </Empty>
       ) : (
-        <ul className="space-y-2">
+        // 一台设备一张带头部和统计网格的卡片，绑满十几台时要滚很久才看得完；
+        // 压成两行的紧凑条目后，同样的信息只占三分之一高度，一屏能对比多台设备。
+        <ul className="space-y-1.5">
           {data.map((device) => {
             const formattedRequestCount = device.request_count.toLocaleString(locale)
             // 模拟客户端没有绑定行，也就没有这两个时刻（见 DeviceBinding.simulated）。
@@ -468,101 +502,110 @@ function DeviceList({
             const lastSeenRelative = relativeTime(device.last_seen_at ?? 0, undefined, language)
             const meta = device.simulated
               ? t(
-                  '非 Claude Code 客户端，按账号派生的身份；不占设备名额',
-                  'Third-party client using an account-derived identity; does not use a device slot',
+                  '按账号派生的身份，不占设备名额',
+                  'Account-derived identity; does not use a device slot',
                 )
               : t(
                   `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
                   `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
                 )
-            const metaTitle = device.simulated
-              ? undefined
+            const metaDetail = device.simulated
+              ? t(
+                  '非 Claude Code 客户端，按账号派生的身份；不写绑定行，也不占设备名额',
+                  'Third-party client using an account-derived identity; it creates no binding row and uses no device slot',
+                )
               : t(
                   `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
                   `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
                 )
             return (
-              <li key={device.device_id}>
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex min-w-0 items-center gap-2 text-sm leading-snug">
-                      <SmartphoneIcon className="size-4 shrink-0" />
-                      <span className="min-w-0 flex-1 truncate text-sm" title={device.device_id}>
-                        {device.device_id}
-                      </span>
-                      <Button
-                        type="button"
-                        size="icon-sm"
-                        variant="ghost"
-                        title={t(
-                          `${device.device_id}（点击复制）`,
-                          `${device.device_id} (click to copy)`,
-                        )}
-                        aria-label={t(
-                          `复制设备 ID ${device.device_id}`,
-                          `Copy device ID ${device.device_id}`,
-                        )}
-                        onClick={async () => {
-                          const copied = await copyText(device.device_id)
-                          toastManager.add(copied
-                            ? {
-                                title: t('已复制 device_id', 'Copied device_id'),
-                                type: 'success',
-                              }
-                            : {
-                                title: t('复制失败', 'Copy failed'),
-                                description: device.device_id,
-                                type: 'error',
-                              })
-                        }}
-                      >
-                        <CopyIcon />
-                      </Button>
-                    </CardTitle>
-                    <CardDescription className="text-xs" title={metaTitle}>
+              <li key={device.device_id} className="rounded-lg border bg-card px-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-2">
+                  <SmartphoneIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={<span />}
+                      className="min-w-0 flex-1 truncate font-mono text-xs"
+                    >
+                      {device.device_id}
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-80 whitespace-normal break-all text-left">
+                      {device.device_id}
+                    </TooltipPopup>
+                  </Tooltip>
+                  {device.simulated && (
+                    <Badge variant="secondary" size="sm">{t('模拟', 'Simulated')}</Badge>
+                  )}
+                  <Tooltip>
+                    <TooltipTrigger
+                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
+                      aria-label={t(
+                        `复制设备 ID ${device.device_id}`,
+                        `Copy device ID ${device.device_id}`,
+                      )}
+                      onClick={async () => {
+                        const copied = await copyText(device.device_id)
+                        toastManager.add(copied
+                          ? {
+                              title: t('已复制 device_id', 'Copied device_id'),
+                              type: 'success',
+                            }
+                          : {
+                              title: t('复制失败', 'Copy failed'),
+                              description: device.device_id,
+                              type: 'error',
+                            })
+                      }}
+                    >
+                      <CopyIcon />
+                    </TooltipTrigger>
+                    <TooltipPopup>{t('复制设备 ID', 'Copy device ID')}</TooltipPopup>
+                  </Tooltip>
+                  {/* 模拟伪设备没有绑定行可删，故不给解绑按钮——点了也只会是一次空操作。 */}
+                  {!device.simulated && (
+                    <Button
+                      size="xs"
+                      variant="destructive-outline"
+                      className="ml-1 shrink-0"
+                      loading={unbind.isPending && unbind.variables === device.device_id}
+                      disabled={unbind.isPending && unbind.variables !== device.device_id}
+                      onClick={() => unbind.mutate(device.device_id)}
+                      aria-label={t(
+                        `解绑设备 ${device.device_id}`,
+                        `Unbind device ${device.device_id}`,
+                      )}
+                    >
+                      <UnlinkIcon />
+                      {t('解绑', 'Unbind')}
+                    </Button>
+                  )}
+                </div>
+                <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
+                  <Tooltip>
+                    <TooltipTrigger render={<span />} className="min-w-0 truncate">
                       {meta}
-                    </CardDescription>
-                    {/* 模拟伪设备没有绑定行可删，故不给解绑按钮——点了也只会是一次空操作。 */}
-                    {!device.simulated && (
-                      <CardAction>
-                        <Button
-                          size="sm"
-                          variant="destructive-outline"
-                          loading={unbind.isPending && unbind.variables === device.device_id}
-                          disabled={unbind.isPending && unbind.variables !== device.device_id}
-                          onClick={() => unbind.mutate(device.device_id)}
-                          aria-label={t(
-                            `解绑设备 ${device.device_id}`,
-                            `Unbind device ${device.device_id}`,
-                          )}
-                        >
-                          <UnlinkIcon />
-                          {t('解绑', 'Unbind')}
-                        </Button>
-                      </CardAction>
-                    )}
-                  </CardHeader>
-                  <CardPanel>
-                    <dl className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3">
-                      <DeviceStat
-                        label={t('请求', 'Requests')}
-                        value={t(
-                          `${formattedRequestCount} 次`,
-                          `${formattedRequestCount} ${device.request_count === 1 ? 'request' : 'requests'}`,
-                        )}
-                      />
-                      <DeviceStat
-                        label={t('本账号花费', 'This account cost')}
-                        value={formatUsd(device.cost_usd)}
-                      />
-                      <DeviceStat
-                        className="col-span-2 sm:col-span-1"
-                        label={t('全部账号花费', 'All accounts cost')}
-                        value={formatUsd(device.cost_usd_all)}
-                      />
-                    </dl>
-                  </CardPanel>
-                </Card>
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                      {metaDetail}
+                    </TooltipPopup>
+                  </Tooltip>
+                  <div className="flex shrink-0 items-baseline gap-3 tabular-nums">
+                    <DeviceStat
+                      label={t('请求', 'Requests')}
+                      value={formattedRequestCount}
+                    />
+                    <DeviceStat
+                      label={t('本账号', 'This account')}
+                      value={formatUsd(device.cost_usd)}
+                      hint={t('这台设备经本账号产生的等价 API 费用', 'Equivalent API cost this device incurred through this account')}
+                    />
+                    <DeviceStat
+                      label={t('全部账号', 'All accounts')}
+                      value={formatUsd(device.cost_usd_all)}
+                      hint={t('这台设备在本网关所有账号上的累计花费', "This device's total cost across every account on this gateway")}
+                    />
+                  </div>
+                </div>
               </li>
             )
           })}
@@ -581,11 +624,18 @@ function CapacityStat({ label, value }: { label: string; value: string }) {
   )
 }
 
-function DeviceStat({ label, value, className }: { label: string; value: string; className?: string }) {
+/** 设备条目里的行内统计：`标签 值`，标签退到次要色，值用前景色顶住。 */
+function DeviceStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  const stat = (
+    <span className="whitespace-nowrap">
+      {label} <span className="font-medium text-foreground">{value}</span>
+    </span>
+  )
+  if (!hint) return stat
   return (
-    <div className={cn('min-w-0', className)}>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 whitespace-nowrap font-medium text-sm tabular-nums" title={value}>{value}</dd>
-    </div>
+    <Tooltip>
+      <TooltipTrigger render={stat} />
+      <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{hint}</TooltipPopup>
+    </Tooltip>
   )
 }

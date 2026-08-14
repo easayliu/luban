@@ -36,8 +36,20 @@ export function usePersisted<T>(
   fallback: T,
   parse: (raw: string) => T | null,
   serialize: (v: T) => string = String,
+  /**
+   * 首屏优先值，通常来自 URL。链接里带的检索条件必须压过 localStorage：
+   * 别人发来的链接理应打开成他看到的那个结果集，而不是本机上次留下的筛选。
+   */
+  seed?: string | null,
 ): [T, (v: T) => void] {
   const [value, setValue] = useState<T>(() => {
+    if (seed != null) {
+      const seeded = parse(seed)
+      if (seeded != null) {
+        write(key, serialize(seeded))
+        return seeded
+      }
+    }
     const raw = read(key)
     if (raw == null) return fallback
     return parse(raw) ?? fallback

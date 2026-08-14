@@ -14,6 +14,7 @@ import {
   InputGroupInput,
 } from '@/components/ui/input-group'
 import { LanguageSwitcher } from '@/components/language-switcher'
+import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { useI18n } from '@/lib/i18n'
 
@@ -41,8 +42,9 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
 
   return (
     <div className="app-shell relative grid min-h-dvh place-items-center px-4 py-8 text-foreground sm:py-10">
-      <div className="absolute end-4 top-4 sm:end-6 sm:top-6">
+      <div className="absolute end-4 top-4 flex items-center gap-2 sm:end-6 sm:top-6">
         <LanguageSwitcher />
+        <ThemeSwitcher />
       </div>
       <div className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center text-center">

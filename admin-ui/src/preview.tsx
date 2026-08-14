@@ -24,6 +24,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
+import { initTheme } from '@/lib/theme'
 import type { Credential, UsageLog, UsagePage } from '@/api/credentials'
 import './index.css'
 
@@ -31,10 +32,7 @@ import './index.css'
 // 验收卡片层级、筛选与响应式，不连接后端。
 // 设置页和弹窗仍由查询参数单独打开，账号工作区不再维护第二套组件树。
 
-const mq = window.matchMedia('(prefers-color-scheme: dark)')
-const applyTheme = (dark: boolean) => document.documentElement.classList.toggle('dark', dark)
-applyTheme(mq.matches)
-mq.addEventListener('change', (e) => applyTheme(e.matches))
+initTheme()
 
 const now = Math.floor(Date.now() / 1000)
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import {
   ArrowLeftIcon,
   CableIcon,
@@ -14,6 +14,7 @@ import {
 import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
 import { LanguageSwitcher } from '@/components/language-switcher'
+import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button } from '@/components/ui/button'
 import {
@@ -25,24 +26,9 @@ import {
 } from '@/components/ui/select'
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
+import { useMediaQuery } from '@/lib/use-media-query'
 
 export type SettingsSection = 'access' | 'devices' | 'forwarding' | 'security'
-
-function useDesktopSettingsNavigation() {
-  const [isDesktop, setIsDesktop] = useState(
-    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 64rem)').matches,
-  )
-
-  useEffect(() => {
-    const media = window.matchMedia('(min-width: 64rem)')
-    const sync = () => setIsDesktop(media.matches)
-    sync()
-    media.addEventListener('change', sync)
-    return () => media.removeEventListener('change', sync)
-  }, [])
-
-  return isDesktop
-}
 
 export function SettingsPage({
   section,
@@ -98,7 +84,7 @@ export function SettingsPage({
   ] as const
   const active = sections.find((item) => item.key === section) ?? sections[0]
   const ActiveIcon = active.icon
-  const desktopNavigation = useDesktopSettingsNavigation()
+  const desktopNavigation = useMediaQuery('(min-width: 64rem)')
   const selectItems = sections.map((item) => ({ label: item.label, value: item.key }))
 
   const changeSection = (value: string | null) => {
@@ -138,6 +124,7 @@ export function SettingsPage({
           </Button>
           <div className="flex items-center gap-2">
             <LanguageSwitcher compact />
+            <ThemeSwitcher compact />
             <Button
               aria-label={t('返回账号', 'Back to accounts')}
               className="max-sm:size-10 max-sm:px-0"

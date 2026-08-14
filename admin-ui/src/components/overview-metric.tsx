@@ -25,18 +25,20 @@ export function OverviewMetric({
       <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
         <Icon className={cn('size-4', iconClass)} aria-hidden />
       </span>
+      {/* label 在上、数值在下且左对齐：四格宽度不同，数值若各自贴右就散在四个位置，
+          横着扫一眼比不出大小。左对齐后四个数字落在同一条起始线上。 */}
       <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-baseline justify-between gap-2">
-          <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
+        <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
+        <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
             {value}
           </span>
+          {status && (
+            <span className="min-w-0 truncate text-2xs text-muted-foreground" title={status}>
+              {status}
+            </span>
+          )}
         </div>
-        {status && (
-          <p className="mt-1 truncate text-2xs text-muted-foreground" title={status}>
-            {status}
-          </p>
-        )}
       </div>
     </div>
   )
@@ -64,11 +66,11 @@ export function OverviewMetricSkeleton({ className }: { className?: string }) {
     <div className={cn('flex min-h-16 min-w-0 items-center gap-3 px-3 py-2.5 sm:px-4', className)}>
       <Skeleton className="size-8 shrink-0 rounded-lg" />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center justify-between gap-3">
-          <Skeleton className="h-3 w-20" />
-          <Skeleton className="h-5 w-10" />
+        <Skeleton className="h-3 w-20" />
+        <div className="mt-1.5 flex items-center gap-2">
+          <Skeleton className="h-5 w-10 shrink-0" />
+          <Skeleton className="h-3 w-20 max-w-full" />
         </div>
-        <Skeleton className="mt-1.5 h-3 w-24 max-w-full" />
       </div>
     </div>
   )

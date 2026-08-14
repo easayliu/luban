@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   EllipsisVerticalIcon, LogOutIcon, PlusIcon, SettingsIcon,
@@ -8,6 +8,7 @@ import { getAuthState } from '@/api/auth'
 import { getPw, setPw, clearPw } from '@/api/client'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
+  SORT_DIR_DEFAULT,
   SORT_KEYS,
   type SortDir,
   type SortKey,
@@ -23,14 +24,32 @@ import {
   type CredentialViewMode,
 } from '@/components/credential-workspace'
 import { AddAccount } from '@/components/add-account'
-import { SettingsPage, type SettingsSection } from '@/components/settings-page'
+import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
 import { LanguageSwitcher } from '@/components/language-switcher'
+import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
+
+// 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
+// 拆成单独 chunk 后首屏少解析一截；点进设置时再拉，本地访问一瞬间的事。
+const SettingsPage = lazy(() => import('@/components/settings-page').then((m) => ({ default: m.SettingsPage })))
+
+/**
+ * 账号页的检索条件同时写进 hash（`#/?filter=attention&sort=rpm…`），
+ * 这样「我这边看到的这一屏」可以直接把地址发出去；本机偏好仍留在 localStorage 作兜底。
+ *
+ * 一律用 replaceState：筛选不是导航，逐次入栈会让后退键变成撤销筛选，
+ * 用户想退回的是上一个页面。
+ */
+function readViewParams(): URLSearchParams {
+  const hash = window.location.hash
+  const start = hash.indexOf('?')
+  return new URLSearchParams(start >= 0 ? hash.slice(start + 1) : '')
+}
 
 function readSettingsRoute(): SettingsSection | null {
   if (!window.location.hash.startsWith('#/settings')) return null
@@ -53,25 +72,59 @@ function App() {
   // 直接打开 #/settings/* 的深链接则在原地替换回账号页，避免把用户带离当前站点。
   const enteredSettingsFromAccounts = useRef(false)
 
-  // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文。
-  const [sort, setSort] = usePersisted<SortKey>('sort', 'priority', oneOf(SORT_KEYS))
-  const [dir, setDir] = usePersisted<SortDir>('sortDir', 'asc', oneOf(['asc', 'desc'] as const))
+  // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文；
+  // 链接里带了同名参数时以链接为准（见 readViewParams）。
+  const seed = useRef(readViewParams()).current
+  const [sort, setSort] = usePersisted<SortKey>(
+    'sort', 'priority', oneOf(SORT_KEYS), String, seed.get('sort'),
+  )
+  const [dir, setDir] = usePersisted<SortDir>(
+    'sortDir', 'asc', oneOf(['asc', 'desc'] as const), String, seed.get('dir'),
+  )
   const [pageSize, setPageSize] = usePersisted<CredentialPageSize>(
     'pageSize',
     CREDENTIAL_PAGE_SIZES[0],
     numberOneOf(CREDENTIAL_PAGE_SIZES) as (raw: string) => CredentialPageSize | null,
+    String,
+    seed.get('size'),
   )
   const [view, switchView] = usePersisted<CredentialViewMode>(
     'view',
     preferredInitialCredentialView(),
     oneOf(CREDENTIAL_VIEW_MODES),
+    String,
+    seed.get('view'),
   )
   const [filter, setFilter] = usePersisted<CredentialFilterKey>(
     'filter',
     'all',
     oneOf(CREDENTIAL_FILTER_KEYS),
+    String,
+    seed.get('filter'),
   )
-  const [query, setQuery] = usePersisted('query', '', (raw) => raw)
+  const [query, setQuery] = usePersisted('query', '', (raw) => raw, String, seed.get('q'))
+  // 页码只认链接，不进 localStorage：下次打开该从第一页看起。
+  const initialPage = Number(seed.get('page'))
+  useEffect(() => {
+    if (Number.isInteger(initialPage) && initialPage > 1) setPage(initialPage)
+    // 只在首屏消费一次链接里的页码。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (settingsRoute) return
+    const params = new URLSearchParams()
+    if (query.trim()) params.set('q', query.trim())
+    if (filter !== 'all') params.set('filter', filter)
+    if (sort !== 'priority') params.set('sort', sort)
+    if (dir !== SORT_DIR_DEFAULT[sort]) params.set('dir', dir)
+    if (pageSize !== CREDENTIAL_PAGE_SIZES[0]) params.set('size', String(pageSize))
+    if (page > 1) params.set('page', String(page))
+    params.set('view', view)
+    const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
+    if (window.location.href.endsWith(`#/?${params.toString()}`)) return
+    window.history.replaceState(null, '', next)
+  }, [query, filter, sort, dir, view, page, pageSize, settingsRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
@@ -144,11 +197,13 @@ function App() {
 
   if (!isBootstrapping && settingsRoute) {
     return (
-      <SettingsPage
-        section={settingsRoute}
-        onSectionChange={openSettings}
-        onBack={closeSettings}
-      />
+      <Suspense fallback={<div className="app-shell min-h-dvh" />}>
+        <SettingsPage
+          section={settingsRoute}
+          onSectionChange={openSettings}
+          onBack={closeSettings}
+        />
+      </Suspense>
     )
   }
 
@@ -175,6 +230,7 @@ function App() {
               <PlusIcon />
             </Button>
             <LanguageSwitcher compact />
+            <ThemeSwitcher compact />
             <Menu>
               <MenuTrigger
                 className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
@@ -200,6 +256,7 @@ function App() {
           </div>
           <div className="hidden items-center gap-2 sm:flex">
             <LanguageSwitcher />
+            <ThemeSwitcher />
             <Button
               size="sm"
               variant="outline"

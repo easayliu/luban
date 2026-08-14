@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import {
   ArrowUpDownIcon,
   ChevronLeftIcon,
@@ -180,13 +180,50 @@ function useNowSeconds(): number {
   return now
 }
 
-function matchQuery(credential: Credential, query: string, language: Language): boolean {
+/**
+ * `/` 与 ⌘K / Ctrl+K 聚焦搜索框——列表型控制台的通用约定。
+ *
+ * 已经在输入的时候不抢键（否则打不出 `/`）；弹层/对话框打开时也不抢，
+ * 否则焦点会跳到被遮住的输入框上，模态里反而按不动。
+ */
+function useSearchHotkey(ref: RefObject<HTMLInputElement | null>): void {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const slash = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey
+      const commandK = (event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)
+      if (!slash && !commandK) return
+      const target = event.target as HTMLElement | null
+      if (target?.isContentEditable) return
+      if (target && /^(input|textarea|select)$/i.test(target.tagName)) return
+      if (target?.closest('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return
+      const input = ref.current
+      if (!input) return
+      event.preventDefault()
+      input.focus()
+      input.select()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [ref])
+}
+
+/**
+ * 搜索匹配的字段。除名称和 #id 外还收了套餐、组织类型与当前状态文案——
+ * 「max」「team」「已封禁 / banned」这类词是排查时最先想敲进去的，只匹配名称会全部落空。
+ * 状态用的是界面上那句本地化文案，所见即可搜。
+ */
+function matchQuery(evaluation: CredentialEvaluation, query: string, language: Language): boolean {
   const value = query.trim().toLowerCase()
   if (!value) return true
-  return credential.label.toLowerCase().includes(value)
-    || displayCredentialLabel(credential.label, language).toLowerCase().includes(value)
-    || `#${credential.id}`.includes(value)
-    || String(credential.id) === value
+  const credential = evaluation.credential
+  if (`#${credential.id}`.includes(value) || String(credential.id) === value) return true
+  return [
+    credential.label,
+    displayCredentialLabel(credential.label, language),
+    credential.tier ?? '',
+    credential.org_type ?? '',
+    evaluation.status.label,
+  ].some((field) => field.toLowerCase().includes(value))
 }
 
 interface CredentialWorkspaceData {
@@ -269,6 +306,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   } = state
   const pool = credentials ?? []
   const debouncedQuery = useDebounced(query)
+  const searchRef = useRef<HTMLInputElement>(null)
+  useSearchHotkey(searchRef)
   const now = useNowSeconds()
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
@@ -294,7 +333,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return sortCreds(
       evaluatedPool
         .filter((evaluation) => (
-          match(evaluation) && matchQuery(evaluation.credential, debouncedQuery, language)
+          match(evaluation) && matchQuery(evaluation, debouncedQuery, language)
         ))
         .map((evaluation) => evaluation.credential),
       sort,
@@ -471,12 +510,19 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     )
     actions.onPageChange(1)
   }
-  const toggleSelected = (id: number, checked: boolean) => {
-    const next = new Set(selected)
+  // 勾选回调必须在多次渲染之间保持同一个引用，否则 memo 过的卡片/行每次都要重渲染
+  // （搜索框每敲一个字就是一轮）。改成收 id 的形式，就不用为每张卡片现做一个闭包；
+  // 最新的 selected 与 setter 走 ref 读取，避免闭包读到上一轮的集合把别人的勾选覆盖掉。
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const onSelectedChangeRef = useRef(actions.onSelectedChange)
+  onSelectedChangeRef.current = actions.onSelectedChange
+  const toggleSelected = useCallback((id: number, checked: boolean) => {
+    const next = new Set(selectedRef.current)
     if (checked) next.add(id)
     else next.delete(id)
-    actions.onSelectedChange(next)
-  }
+    onSelectedChangeRef.current(next)
+  }, [])
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
@@ -522,7 +568,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   </button>
                 </>
               ) : (
-                <>
+                // 自动刷新指示器同时是手动刷新入口：等下一轮 30 秒才能确认操作结果，
+                // 是这类常驻列表最常见的抱怨，而这块本来就在讲「数据有多新」。
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
+                  onClick={actions.onRetry}
+                  disabled={isLoading || isFetching}
+                  title={isLoading
+                    ? t('正在加载账号数据', 'Loading account data')
+                    : t('每 30 秒自动刷新，点击立即刷新', 'Refreshes automatically every 30 seconds. Click to refresh now')}
+                  aria-label={t('立即刷新账号数据', 'Refresh account data now')}
+                >
                   <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
                     {isLoading || isFetching ? (
                       <RefreshCwIcon className="size-3.5 animate-spin" />
@@ -530,15 +587,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       <span className="size-1.5 rounded-full bg-success" />
                     )}
                   </span>
-                  <span
-                    className="min-w-14"
-                    title={isLoading
-                      ? t('正在加载账号数据', 'Loading account data')
-                      : t('每 30 秒自动刷新', 'Refreshes automatically every 30 seconds')}
-                  >
+                  <span className="min-w-14 text-left">
                     {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
                   </span>
-                </>
+                </button>
               )}
             </div>
           </div>
@@ -550,13 +602,21 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-64">
                 <InputGroupAddon><SearchIcon /></InputGroupAddon>
                 <InputGroupInput
+                  ref={searchRef}
                   value={query}
                   onChange={(event) => changeQuery(event.target.value)}
-                  placeholder={t('搜索名称或 #id', 'Search name or #id')}
+                  onKeyDown={(event) => {
+                    // Esc 先清空、再退出输入框：清空和失焦是两个不同的意图，一次按键只做一件。
+                    if (event.key !== 'Escape') return
+                    event.preventDefault()
+                    if (query) changeQuery('')
+                    else event.currentTarget.blur()
+                  }}
+                  placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
                   aria-label={t('搜索账号', 'Search accounts')}
                 />
-                {query && (
-                  <InputGroupAddon align="inline-end">
+                <InputGroupAddon align="inline-end">
+                  {query ? (
                     <Button
                       size="icon-xs"
                       variant="ghost"
@@ -565,8 +625,16 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     >
                       <XIcon />
                     </Button>
-                  </InputGroupAddon>
-                )}
+                  ) : (
+                    // 只在指针设备上提示：触屏没有物理按键，画个 kbd 只是噪声。
+                    <kbd
+                      className="pointer-events-none hidden rounded border bg-muted px-1 font-sans text-2xs text-muted-foreground pointer-fine:inline-block"
+                      aria-hidden
+                    >
+                      /
+                    </kbd>
+                  )}
+                </InputGroupAddon>
               </InputGroup>
 
               <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
@@ -825,7 +893,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     now={now}
                     selectable
                     selected={selected.has(item.id)}
-                    onSelectedChange={(checked) => toggleSelected(item.id, checked)}
+                    onSelectedChange={toggleSelected}
                   />
                 ))}
               </TableBody>
@@ -839,7 +907,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   now={now}
                   selectable
                   selected={selected.has(item.id)}
-                  onSelectedChange={(checked) => toggleSelected(item.id, checked)}
+                  onSelectedChange={toggleSelected}
                 />
               ))}
             </ul>
