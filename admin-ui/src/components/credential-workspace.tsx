@@ -32,7 +32,7 @@ import {
   type SortKey,
 } from '@/components/credential-shared'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
-import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
+import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -795,7 +795,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               onClick={() => selectMetric('attention')}
             />
             <OverviewMetric
-              className="border-r"
+              className="border-r border-b lg:border-b-0"
               label={t('用量风险', 'Usage risk')}
               value={formatNumber(quotaRiskCount)}
               status={quotaRiskStatus}
@@ -816,18 +816,23 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             />
             {/* 唯一一格不来自账号列表、也点不动的指标：它讲的是「此刻代理在干什么」，
                 而不是「池子里有几个号处于某状态」。窄屏独占一整行，别把它挤成半格。 */}
-            <OverviewMetric
+            <LiveTrafficMetric
               className="col-span-2 lg:col-span-1"
               label={t('实时流量', 'Live traffic')}
               value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
-              status={metricsQuery.data
+              unit="RPM"
+              detail={metricsQuery.data
                 ? t(
-                    `RPM · ${formatNumber(metricsQuery.data.in_flight)} 在途`,
-                    `RPM · ${formatNumber(metricsQuery.data.in_flight)} in flight`,
+                    `${formatNumber(metricsQuery.data.in_flight)} 在途`,
+                    `${formatNumber(metricsQuery.data.in_flight)} in flight`,
                   )
                 : t('读取中', 'Loading')}
+              live={(metricsQuery.data?.in_flight ?? 0) > 0}
+              hint={t(
+                `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及此刻已进入转发、响应还没走完的在途请求数。每 10 秒刷新。`,
+                `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
+              )}
               icon={ActivityIcon}
-              tone={(metricsQuery.data?.in_flight ?? 0) > 0 ? 'ok' : 'neutral'}
             />
           </section>
         )}

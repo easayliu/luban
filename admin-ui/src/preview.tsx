@@ -86,6 +86,8 @@ const banned: Credential = {
 }
 
 // 正常：有效期跨到明天（「明天 03:00 过期」），是元信息行里最长的一种文案。
+// RPM 特意给三位数加自定义上限（`100/120 RPM`）：连同 `2/3` 与 `$6.85` 正好 15 个字符，
+// 是窄卡片页脚还排得下一行的临界值，多一个字符就该折成两行（见 credential-card 的 footerChars）。
 const normal: Credential = {
   id: 4,
   label: 'robertsbeth812904@yahoo.com',
@@ -100,15 +102,15 @@ const normal: Credential = {
   updated_at: now - 5,
   device_limit: 3,
   device_limit_effective: 3,
-  rpm_limit: 0,
-  rpm_limit_effective: 0,
+  rpm_limit: 120,
+  rpm_limit_effective: 120,
   device_count: 2,
   ban_reason: null,
   proxy: null,
   token_hint: 'sk-ant-ort01-…igAA',
   last_used: now - 5,
   cost_total: 6.85,
-  rpm: 14,
+  rpm: 100,
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
@@ -325,6 +327,8 @@ const only5hWindow: Credential = {
 // 这正是「记录全部额度窗口」要解决的场景：以前 7d_oi 不落库，卡片只能挂一个永远摘不掉的
 // 「Usage credits 待确认」；现在它在 windows 里，状态应当解析成确定的「Usage credits 生效中」，
 // `7d_oi` 不再在额度区重复显示；状态栏里的 Usage credits 与上游判定负责解释风险。
+//
+// 页脚顺带覆盖「三位数费用 + 带上限 RPM」（17 个字符）：窄卡片放不下、必须排成两行的那一档。
 const overagePoolExhausted: Credential = {
   id: 9,
   label: 'overage-pool-not-recorded@example.com',
@@ -339,15 +343,15 @@ const overagePoolExhausted: Credential = {
   updated_at: now - 45,
   device_limit: 0,
   device_limit_effective: 3,
-  rpm_limit: 0,
-  rpm_limit_effective: 0,
+  rpm_limit: 120,
+  rpm_limit_effective: 120,
   device_count: 2,
   ban_reason: null,
   proxy: null,
   token_hint: 'sk-ant-ort01-…P00L',
   last_used: now - 45,
   cost_total: 214.6,
-  rpm: 3,
+  rpm: 100,
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
