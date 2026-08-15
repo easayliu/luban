@@ -144,6 +144,7 @@ pub async fn run(
         .route("/settings/device-rpm-limit", post(set_device_rpm_limit))
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
+        .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/min-client-version", post(set_min_client_version))
         .route("/settings/forwarding", post(set_forwarding))
@@ -910,6 +911,9 @@ struct SettingsResp {
     bare_rate_window_secs: i64,
     /// 上游 429 时最多换几个号重试；0 表示不重试。
     rate_limit_retry_max: i64,
+    /// 额度使用率到多少百分比就提前把号挪出调度池；0 表示关闭（收到 429 才停）。
+    /// 见 [`crate::proxy::park_if_quota_nearly_exhausted`]。
+    quota_pause_pct: i64,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -986,6 +990,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
+    let quota_pause_pct = state.store.quota_pause_pct();
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -1001,6 +1006,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             bare_rate_limit,
             bare_rate_window_secs,
             rate_limit_retry_max,
+            quota_pause_pct,
             forwarding,
         };
     }
@@ -1023,6 +1029,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         bare_rate_limit,
         bare_rate_window_secs,
         rate_limit_retry_max,
+        quota_pause_pct,
         forwarding,
     }
 }
@@ -1204,6 +1211,25 @@ async fn set_rate_limit_retry_max(
         .set_setting(crate::store::RATE_LIMIT_RETRY_MAX, &n.to_string())
         .map_err(internal)?;
     tracing::info!(retry_max = n, "upstream-429 credential-swap retry cap changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetQuotaPausePctReq {
+    /// 额度使用率到多少百分比就提前停调度；0 表示关闭（收到 429 才停），后端夹到 0~100。
+    quota_pause_pct: i64,
+}
+
+/// 设置「额度用到多少就提前停调度」的阈值，见
+/// [`crate::proxy::park_if_quota_nearly_exhausted`]。与 429 冷却同受转发形态里的
+/// `rate_limit_retry` 总开关。
+async fn set_quota_pause_pct(
+    State(state): State<AppState>,
+    Json(req): Json<SetQuotaPausePctReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let pct = req.quota_pause_pct.clamp(0, 100);
+    state.store.set_setting(crate::store::QUOTA_PAUSE_PCT, &pct.to_string()).map_err(internal)?;
+    tracing::info!(quota_pause_pct = pct, "quota-threshold scheduling pause changed");
     Ok(Json(settings_resp(&state)))
 }
 

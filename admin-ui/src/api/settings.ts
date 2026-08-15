@@ -25,6 +25,8 @@ export interface Settings {
   bare_rate_window_secs: number
   /** 上游 429 后最多追加尝试的账号数，不含首次请求；0 表示不重试。 */
   rate_limit_retry_max: number
+  /** 额度用到多少百分比就提前把账号挪出调度池；0 表示关闭（等真收到 429 才停）。 */
+  quota_pause_pct: number
   /** 改写 metadata.user_id 里的 account_uuid/device_id 为凭证自洽身份。 */
   spoof_identity: boolean
   /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
@@ -146,6 +148,18 @@ export async function setBareRateLimit(limit: number, windowSecs?: number): Prom
 export async function setRateLimitRetryMax(n: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/rate-limit-retry-max', {
     rate_limit_retry_max: n,
+  })
+  return data
+}
+
+/**
+ * 设置「额度用到多少就提前停调度」的阈值（百分比；0 = 关闭，后端夹到 0~100）。
+ *
+ * 与 429 后的冷却同受「429 自动换号」总开关：那个关掉时本项不生效。
+ */
+export async function setQuotaPausePct(pct: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/quota-pause-pct', {
+    quota_pause_pct: pct,
   })
   return data
 }

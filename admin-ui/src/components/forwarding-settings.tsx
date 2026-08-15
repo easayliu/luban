@@ -14,6 +14,7 @@ import {
 import {
   getSettings,
   setForwarding,
+  setQuotaPausePct,
   setRateLimitRetryMax,
   type ForwardingKey,
   type Settings,
@@ -355,6 +356,7 @@ export function ForwardingSettingsContent() {
           }
         />
         <RetryMax />
+        <QuotaPausePct />
         <ForwardingToggle
           k="thinking_signature_retry"
           label={t('thinking 签名兜底', 'thinking signature fallback')}
@@ -457,6 +459,98 @@ function RetryMax() {
             loading={save.isPending}
             disabled={!enabled || count === (data?.rate_limit_retry_max ?? 2)}
             onClick={() => save.mutate(count)}
+          >
+            <SaveIcon />
+            {t('保存', 'Save')}
+          </Button>
+        </div>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 额度用到多少就提前把账号挪出调度池（0 = 关闭，等真收到 429 才停；后端限制在 0~100）。
+ *
+ * 判定用的是上游每条响应都带的基础额度窗口使用率，只看 5h/7d 这类基础窗口，不看超额池。
+ */
+function QuotaPausePct() {
+  const { language, t } = useI18n()
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.quota_pause_pct)
+  }, [data?.quota_pause_pct])
+
+  const save = useMutation({
+    mutationFn: (pct: number) => setQuotaPausePct(pct),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('提前停调度阈值已更新', 'Early pause threshold updated'),
+        description: settings.quota_pause_pct > 0
+          ? t(
+              `额度用到 ${settings.quota_pause_pct}% 就把账号挪出调度池。`,
+              `Accounts leave the pool once their quota reaches ${settings.quota_pause_pct}%.`,
+            )
+          : t(
+              '已关闭：账号会一直参与调度，直到真的收到 429。',
+              'Disabled: accounts keep taking traffic until they actually get a 429.',
+            ),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const pct = Math.min(100, Math.max(0, Math.floor(draft ?? 0)))
+  const enabled = data?.rate_limit_retry ?? true
+
+  return (
+    <Field className="p-5">
+      <div className="flex w-full flex-wrap items-end justify-between gap-3">
+        <div className="min-w-0 space-y-1">
+          <FieldLabel>{t('提前停调度阈值', 'Early pause threshold')}</FieldLabel>
+          <FieldDescription className="max-w-xl leading-5">
+            {t(
+              '上游每条响应都带着账号的用量限制使用率；到达此百分比就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。只看 5h/7d 这类基础窗口，超额池快满不算。停用后按该窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。0 表示关闭，退回「收到 429 才停」。',
+              'Every upstream response reports the account’s usage-limit utilization; once it reaches this percentage the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Only base windows such as 5h/7d count — a nearly full overage pool does not. A paused account comes back automatically when that window resets, and can also be re-enabled by hand or by a passing connectivity test. 0 disables this and reverts to pausing only on a real 429.',
+            )}
+          </FieldDescription>
+        </div>
+        <div className="flex items-center gap-2">
+          <NumberField
+            className="w-32"
+            disabled={!enabled}
+            max={100}
+            min={0}
+            value={draft}
+            onValueChange={setDraft}
+          >
+            <NumberFieldGroup>
+              <NumberFieldDecrement
+                aria-label={t('降低提前停调度阈值', 'Decrease early pause threshold')}
+              />
+              <NumberFieldInput aria-label={t('提前停调度阈值（%）', 'Early pause threshold (%)')} />
+              <NumberFieldIncrement
+                aria-label={t('提高提前停调度阈值', 'Increase early pause threshold')}
+              />
+            </NumberFieldGroup>
+          </NumberField>
+          <Button
+            size="sm"
+            loading={save.isPending}
+            disabled={!enabled || pct === (data?.quota_pause_pct ?? 90)}
+            onClick={() => save.mutate(pct)}
           >
             <SaveIcon />
             {t('保存', 'Save')}

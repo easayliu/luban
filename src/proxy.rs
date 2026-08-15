@@ -410,6 +410,13 @@ pub async fn handle(
             }
             // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
             let ratelimit = RateLimitInfo::from_headers(up.headers());
+            // 顺手看一眼额度：快用尽（默认 90%）就提前把这个号挪出调度池，别等下一条请求去撞
+            // 429，见 [`park_if_quota_nearly_exhausted`]。本次响应照常回给客户端——它已经成了，
+            // 停的是**之后**的调度。429 那条路不在这儿：上面已按账号/模型分档停过了，
+            // 重复停只会多写一次库、多刷一行日志。
+            if status != StatusCode::TOO_MANY_REQUESTS {
+                park_if_quota_nearly_exhausted(&state.store, &cred, &ratelimit);
+            }
 
             // 包裹响应流：首块到达记 TTFT，边转发边嗅探用量；
             // 流结束(或断开)时在 Drop 里记 total、输出一条日志并落库。
@@ -3993,6 +4000,80 @@ fn park_rate_limited(
     store.mark_rate_limited(cred.id, Some(model), cooldown);
 }
 
+/// 额度快用尽时**提前**把这个号挪出调度池，不必等真撞上一发 429。
+///
+/// 「收到 429 才停」是纯被动的：触发它的那条请求必然失败，而客户端那头看到的就是一次报错。
+/// 可上游在**每一条**响应里都报着基础额度窗口的使用率
+/// （`anthropic-ratelimit-unified-<窗口>-utilization`，0~1），越过阈值时这个号剩下的额度
+/// 已经不够再跑完一轮对话，继续调度只是把那发 429 推迟到下一条请求上。阈值由
+/// [`store::CredentialStore::quota_pause_pct`] 配（默认 90%，配 `0` 即关掉本机制、退回
+/// 「收到 429 才停」的老行为）。
+///
+/// 只看**基础**窗口，与 [`rate_limit_scope`] 共用 [`is_overage_window`] 口径：超额池
+/// （`7d_oi`/`overage`）快满了不代表账号额度耗尽——实测那期间同一账号的 sonnet/opus 照常
+/// 200，按它停整个号是误伤。同理这里也不做模型级那一档：使用率讲的是账号额度，不是某个
+/// 模型此刻有没有容量。
+///
+/// 停到哪：越过阈值的那些基础窗口中**最晚**的一个 `*-reset`（取 max 的理由同
+/// [`RateLimitInfo::exhausted_base_reset`]：5h 到点了 7d 照样拦着）。落库、恢复路径与账号级
+/// 429 完全一致——到点惰性自动恢复、连通性测试通过自动恢复、控制台手动打开。
+///
+/// 返回是否已经把号停在池外，调用方据此决定要不要再走「测试通过就恢复」那条路——否则一次
+/// 手动探活会把刚按阈值停掉的号放回去，下一条请求再停一次，来回拉锯。
+fn park_if_quota_nearly_exhausted(
+    store: &store::CredentialStore,
+    cred: &crate::credentials::Credential,
+    info: &RateLimitInfo,
+) -> bool {
+    // 与 429 那一档同受「限流冷却/换号重试」这个总开关：关掉它的人要的是**完全**不干预调度、
+    // 原样把上游的判决交给客户端，那时按使用率自动停号只会是个惊吓。要单独关本机制，把阈值
+    // 配成 0 即可。
+    let pct = store.quota_pause_pct();
+    if pct <= 0 || !store.forward_flags().rate_limit_retry {
+        return false;
+    }
+    let threshold = pct as f64 / 100.0;
+    let Some((window, used)) = info.saturated_base_window(threshold) else {
+        return false;
+    };
+    // 同一批限流头会被这个号所有在途请求各看一遍：已经停在池外的就别再写库、也别再刷屏。
+    // 读一次库的代价只在真越阈值时付，正常流量走不到这里。
+    if matches!(store.get(cred.id), Ok(Some(c)) if c.disabled) {
+        return true;
+    }
+    let cooldown = info.quota_pause_cooldown(threshold);
+    let resume_at = crate::credentials::now_secs() + cooldown.as_secs();
+    let reason = format!(
+        "quota nearly exhausted: window {window} is at {:.1}% (pause threshold {pct}%), scheduling resumes automatically in about {}",
+        used * 100.0,
+        human_secs(cooldown)
+    );
+    match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
+        Ok(_) => {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                window,
+                utilization = used,
+                threshold_pct = pct,
+                resume_at,
+                ratelimit = %info.raw,
+                "quota nearly exhausted: taken out of the pool before hitting a 429, resumes automatically when the window resets (or enable it manually / run a connectivity test from the console)"
+            );
+            true
+        }
+        // 落库失败就当没停：这一档是「提前量」，为它把请求也搭进去不值得，真到 429 时
+        // 账号级那条路还会再停一次。
+        Err(e) => {
+            tracing::error!(
+                cred_id = cred.id, cred = %cred.label,
+                error = %e,
+                "persisting the quota-threshold pause failed, this credential stays in the pool until it actually gets a 429"
+            );
+            false
+        }
+    }
+}
+
 /// 把秒数写成人话（`3h 12m` / `45m` / `30s`），写进 `ban_reason` 给人看。
 ///
 /// 只保留两级、且不做四舍五入：这行字是给人快速判断「还要等多久」的，`2d 3h` 足够，
@@ -4222,6 +4303,49 @@ impl RateLimitInfo {
             .map(|(_, ts)| *ts)
             .chain([self.five_h_reset, self.seven_d_reset].into_iter().flatten())
             .collect()
+    }
+
+    /// 使用率已越过 `threshold`（0~1）的**基础**窗口里，用得最狠的那个 `(窗口名, 使用率)`。
+    ///
+    /// 供 [`park_if_quota_nearly_exhausted`] 判定与写原因文案。取使用率最高的那个纯粹是为了
+    /// 让文案指向最有说服力的那一个——停多久另算，见 [`Self::quota_pause_cooldown`]。
+    /// 超额族窗口不算（[`is_overage_window`]），口径与 [`rate_limit_scope`] 一致。
+    fn saturated_base_window(&self, threshold: f64) -> Option<(&str, f64)> {
+        self.window_utilization
+            .iter()
+            .filter(|(w, u)| !is_overage_window(w) && *u >= threshold)
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(w, u)| (w.as_str(), *u))
+    }
+
+    /// 按阈值提前停调度时该睡多久：越过阈值的基础窗口中**最晚**的那个 `*-reset`。
+    ///
+    /// 取 max 而不是 min，理由同 [`Self::exhausted_base_reset`]——5h 和 7d 同时逼近上限时，
+    /// 5h 到点了 7d 照样拦着，早醒只会立刻再被停一次。没有逐窗口 reset 时退到不带窗口名的
+    /// `unified-reset`，再退到所有窗口里最早的 reset，最后才是
+    /// [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
+    ///
+    /// **不看 `retry-after`**：这一档判定发生在一条**正常响应**上，那个头压根不会出现。
+    fn quota_pause_cooldown(&self, threshold: f64) -> std::time::Duration {
+        let now = crate::credentials::now_secs() as i64;
+        let future_secs = |reset: i64| Some(reset - now).filter(|d| *d > 0);
+        let over =
+            |w: &str| self.window_utilization.iter().any(|(name, u)| name == w && *u >= threshold);
+        let saturated_reset = self
+            .window_reset
+            .iter()
+            .filter(|(w, _)| !is_overage_window(w) && over(w))
+            .map(|(_, ts)| *ts)
+            .max();
+        let earliest_window_reset =
+            self.window_reset_candidates().into_iter().filter_map(future_secs).min();
+        let secs = saturated_reset
+            .and_then(future_secs)
+            .or_else(|| self.unified_reset.and_then(future_secs))
+            .or(earliest_window_reset)
+            .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_SECS)
+            .clamp(1, MAX_RATE_LIMIT_COOLDOWN_SECS);
+        std::time::Duration::from_secs(secs as u64)
     }
 
     /// 已被拒/已打满的**基础窗口**（排除超额族）中最晚的那个 `*-reset`——账号级冷却该睡到的
@@ -4594,7 +4718,12 @@ pub async fn probe(
                     "connectivity test hit an upstream 429, taking the credential out of the pool"
                 );
                 park_rate_limited(&state.store, cred, &scope, cooldown);
-            } else if status.is_success() {
+            // 200 也可能是「就差最后一点额度」：阈值机制在这里先过一道（见
+            // [`park_if_quota_nearly_exhausted`]）。它把号停下时整条恢复分支**都不走**
+            // ——否则一次手动探活会把刚按阈值停掉的号放回池子，下一条真实请求再停一次。
+            } else if status.is_success()
+                && !park_if_quota_nearly_exhausted(&state.store, cred, &info)
+            {
                 // 对称的另一面：测试成功同样照真实判决恢复——上游此刻放行了「这个账号 +
                 // 这个模型」，不必干等到点（上游的 retry-after 偏保守时，好号会被白白晾着）。
                 //
@@ -7468,6 +7597,104 @@ mod tests {
         let wait = resume_at as i64 - crate::credentials::now_secs() as i64;
         assert!((3595..=3600).contains(&wait), "恢复时刻应取上游给的等待时间，实得 {wait}");
         assert!(after.ban_reason.unwrap().contains("1h"), "停用原因该写清楚还要等多久");
+    }
+
+    /// 额度到阈值（默认 90%）就提前停调度，不必等真撞上一发 429；而超额池逼近上限时**不停**
+    /// ——它满了同一账号的别的模型照常 200，与 [`super::rate_limit_scope`] 同一条口径。
+    #[test]
+    fn quota_threshold_parks_the_account_before_any_429() {
+        let hdr = |kv: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in kv {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let now = crate::credentials::now_secs() as i64;
+        let at = |secs: i64| (now + secs).to_string();
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+
+        // 还没到阈值：一切照旧，200 就是 200。
+        let plenty = hdr(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.60"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(2 * 3600)),
+        ]);
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &plenty));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled, "60% 还远没到该停的时候");
+
+        // 超额池 99%：那是「这条超额通道快走不通了」，不是账号额度耗尽，停号即误伤。
+        let oi_hot = hdr(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.10"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "0.99"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", &at(50 * 3600)),
+        ]);
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &oi_hot));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled, "超额池快满不该停整个号");
+
+        // 基础窗口 93%：还没被拒（status 仍是 allowed，上游也没回 429），照样提前退场，
+        // 且睡到**越过阈值的那些基础窗口里最晚**的那个 reset（7d 的 50 小时，不是 5h 的 2 小时）。
+        let hot = hdr(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.93"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(2 * 3600)),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.95"),
+            ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
+        ]);
+        assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &hot));
+        let after = store.get(cred.id).unwrap().unwrap();
+        assert!(after.disabled, "越过阈值就该把号挪出调度池");
+        let wait = after.resume_at.expect("按阈值停的号必须能到点自恢复") as i64 - now;
+        assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到较晚的 7d reset，实得 {wait}");
+        let reason = after.ban_reason.expect("卡片上要说清为什么不干活");
+        assert!(reason.contains("95.0%") && reason.contains("90%"), "原因文案：{reason}");
+
+        // 幂等：同一批限流头被并发在途的请求各看一遍，不该反复写库。
+        assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &hot));
+
+        // 阈值配成 0 = 关掉本机制，退回「收到 429 才停」。
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+        store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &hot));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled);
+
+        // 阈值可手调，两个方向都要成立。先调高：配 99 时上面那份 95% 的头不该再停号
+        // （默认的 90 是会停的）。
+        let warm = hdr(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.95"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
+        ]);
+        store.set_setting(store::QUOTA_PAUSE_PCT, "99").unwrap();
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &warm));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled, "阈值调高后 95% 不该停");
+
+        // 再调低：配 80 时同一份头就该停。
+        store.set_setting(store::QUOTA_PAUSE_PCT, "80").unwrap();
+        assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &warm));
+        assert!(store.get(cred.id).unwrap().unwrap().disabled);
+    }
+
+    /// 关掉「429 冷却/换号重试」总开关的人要的是完全不干预调度，那时阈值机制也必须闭嘴。
+    #[test]
+    fn quota_threshold_obeys_the_rate_limit_retry_switch() {
+        let mut h = super::HeaderMap::new();
+        h.insert(
+            super::HeaderName::from_static("anthropic-ratelimit-unified-5h-utilization"),
+            HeaderValue::from_static("1.0"),
+        );
+        let info = super::RateLimitInfo::from_headers(&h);
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+        store.set_setting(store::RATE_LIMIT_RETRY, "false").unwrap();
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &info));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled, "总开关关着就不该动调度");
     }
 
     /// 冷却睡到**上游返回的那个重置时刻**，不是写死的 5 小时/7 天：没有 `retry-after` 时，

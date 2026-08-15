@@ -917,6 +917,21 @@ impl CredentialStore {
             .clamp(0, 10) as usize
     }
 
+    /// 额度使用率到多少百分比就提前把这个号挪出调度池（`0` 表示关闭，只在真收到 429 时才停）。
+    ///
+    /// 判定与停用都在 `crate::proxy::park_if_quota_nearly_exhausted`：上游**每一条**响应都
+    /// 报基础额度窗口的使用率，越过这个数就当额度已耗尽，不必等下一发请求去撞 429。
+    /// 未设置时用 [`DEFAULT_QUOTA_PAUSE_PCT`]（90），取值夹在 `0..=100`（100 即「满了才停」，
+    /// 与不开本机制的差别只剩「不用等 429」）。
+    pub fn quota_pause_pct(&self) -> i64 {
+        self.get_setting(QUOTA_PAUSE_PCT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_QUOTA_PAUSE_PCT)
+            .clamp(0, 100)
+    }
+
     /// 裸请求速率上限：单个凭证在 [`Self::bare_rate_window_secs`] 的窗口内最多接多少条
     /// **无设备身份**的请求。`<= 0`（含未设置）表示不限——默认即不限，与加入本机制前一致。
     ///
@@ -1597,6 +1612,19 @@ pub const DEFAULT_BARE_RATE_WINDOW_SECS: i64 = 60;
 
 /// 上游 429 时最多换几个号重试的 settings 键名；`0` 表示不重试。
 pub const RATE_LIMIT_RETRY_MAX: &str = "rate_limit_retry_max";
+
+/// 额度使用率到多少百分比就提前把号挪出调度池的 settings 键名；`0` 表示关闭本机制
+/// （退回「收到 429 才停」的老行为）。见 [`CredentialStore::quota_pause_pct`]。
+pub const QUOTA_PAUSE_PCT: &str = "quota_pause_pct";
+
+/// 提前停调度的默认阈值：90%。
+///
+/// 不取 100：上游报的是**已用**比例，等它到 1.0 时下一条请求必然吃 429——那正是本机制要
+/// 省掉的那一发。留出 10% 而不是贴着上限卡：使用率是**一条响应报一次**的，两次上报之间
+/// 一轮长对话就能吃掉好几个百分点，阈值贴太近等于还没来得及停就已经撞上去了。剩下的那点
+/// 额度也不算白扔——号是到窗口 reset 就回来的，而不是作废。嫌保守就往上调，见
+/// [`CredentialStore::quota_pause_pct`]。
+pub const DEFAULT_QUOTA_PAUSE_PCT: i64 = 90;
 
 /// 换号重试次数默认值：2。
 ///
