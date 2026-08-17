@@ -56,6 +56,7 @@ function readSettingsRoute(): SettingsSection | null {
   if (window.location.hash.includes('/devices')) return 'devices'
   if (window.location.hash.includes('/forwarding')) return 'forwarding'
   if (window.location.hash.includes('/security')) return 'security'
+  if (window.location.hash.includes('/migration')) return 'migration'
   // 兼容旧的 #/settings 与 #/settings/access 深链接。
   return 'access'
 }

@@ -34,6 +34,15 @@ fn admin_hash(state: &AppState) -> Option<String> {
     state.store.get_setting(store::ADMIN_PASSWORD).ok().flatten().filter(|s| !s.is_empty())
 }
 
+/// 是否已启用管理鉴权（环境接管或库里存了哈希）。
+///
+/// 给那些「开着鉴权才允许」的接口用：管理接口在未设密码时是**完全敞开**的
+/// （见 [`require_admin`]），而个别接口给出去的东西比「能改配置」更重
+/// （如导出含明文 token 的迁移文件），它们得自己确认这道门锁着。
+pub fn admin_configured(state: &AppState) -> bool {
+    admin_hash(state).is_some()
+}
+
 /// 中间件：未设密码放行；已设则校验 `Authorization: Bearer <password>`。
 pub async fn require_admin(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(hash) = admin_hash(&state) else {

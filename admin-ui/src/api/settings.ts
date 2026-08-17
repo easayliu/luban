@@ -15,6 +15,8 @@ export interface Settings {
   default_rpm_limit: number
   /** 每设备 RPM 上限（单台设备最近 60 秒最多转发多少条）；0 表示不限。全局一个值。 */
   device_rpm_limit: number
+  /** 每会话 RPM 上限（单个会话最近 60 秒最多转发多少条）；0 表示不限。全局一个值。 */
+  session_rpm_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
@@ -133,6 +135,17 @@ export async function setDeviceRpmLimit(limit: number): Promise<Settings> {
 }
 
 /**
+ * 设置每会话 RPM 上限（0 表示不限）：单个会话最近 60 秒最多转发多少条，超了直接 429。
+ * 与设备 RPM 两个粒度并存，两道都该配——会话 id 换一个就是新桶，只有设备那道拦得住换 id。
+ */
+export async function setSessionRpmLimit(limit: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/session-rpm-limit', {
+    session_rpm_limit: limit,
+  })
+  return data
+}
+
+/**
  * 设置裸请求速率上限：单个账号在窗口内最多接多少条无 metadata.user_id 的请求。
  * 0 表示不限；window 只在传正数时才写（不传就保持现值）。
  */
@@ -187,5 +200,65 @@ export async function setMinClientVersion(version: string): Promise<Settings> {
  */
 export async function setForwarding(key: ForwardingKey, enabled: boolean): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/forwarding', { [key]: enabled })
+  return data
+}
+
+// ---------- 迁移：导出 / 导入 ----------
+
+/**
+ * 迁移文件：导出接口的响应，也是导入接口的入参（原样喂回去即可）。
+ *
+ * `credentials` 里**含明文 access/refresh token**——迁移要的就是它们，所以这份文件等同于
+ * 全部账号本身，只该在你自己的机器之间传。
+ */
+export interface ExportFile {
+  /** 恒为 'luban-export'，导入侧据此认文件。 */
+  kind: string
+  /** 文件格式版本。 */
+  version: number
+  /** 导出时刻（Unix 秒）。 */
+  exported_at: number
+  /** 导出该文件的 luban 版本。 */
+  luban_version: string
+  /** 全部账号（含明文 token）。 */
+  credentials: unknown[]
+  /** settings 全表，不含管理密码。 */
+  settings: Record<string, string>
+}
+
+/** 导入模式：merge = 按账号身份覆盖同名号、其余保留；replace = 先清空目标库再导入。 */
+export type ImportMode = 'merge' | 'replace'
+
+/** 导入结果计数。 */
+export interface ImportResult {
+  /** 新增的账号数。 */
+  added: number
+  /** 覆盖了已有账号的条数。 */
+  updated: number
+  /** 导入失败的条数（原因在服务端日志里）。 */
+  failed: number
+  /** replace 模式下被清掉的原有账号数。 */
+  cleared: number
+  /** 实际写入的设置项数。 */
+  settings_applied: number
+}
+
+/** 导出全部账号与设置。未设管理密码时服务端拒绝（文件含明文 token）。 */
+export async function exportAll(): Promise<ExportFile> {
+  const { data } = await api.get<ExportFile>('/export')
+  return data
+}
+
+/** 导入账号（可选连设置一起）。 */
+export async function importAll(
+  payload: ExportFile,
+  mode: ImportMode,
+  importSettings: boolean,
+): Promise<ImportResult> {
+  const { data } = await api.post<ImportResult>('/import', {
+    payload,
+    mode,
+    import_settings: importSettings,
+  })
   return data
 }

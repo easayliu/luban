@@ -38,7 +38,7 @@ pub async fn handle(
         && !client_authorized(&headers, &expected)
     {
         tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
-        return (StatusCode::UNAUTHORIZED, "invalid API key").into_response();
+        return error_response(StatusCode::UNAUTHORIZED, "authentication_error", "invalid API key");
     }
 
     // 1.5) 最低客户端版本闸：只卡 UA 自报 `claude-cli/<版本>` 的请求，其余一律放行，
@@ -48,18 +48,43 @@ pub async fn handle(
         below_min_client_version(&client_ua, state.store.min_client_version().as_deref())
     {
         tracing::warn!(%method, path = %path_and_query, ua = %client_ua, %got, %want, "rejected: client version below the configured minimum");
-        return (
+        return error_response(
             StatusCode::FORBIDDEN,
-            [(header::CONTENT_TYPE, "application/json")],
-            error_body(
-                "permission_error",
-                &format!(
-                    "Claude Code {got} is no longer accepted here; upgrade to {want} or newer \
-                     (npm i -g @anthropic-ai/claude-code)"
-                ),
+            "permission_error",
+            format!(
+                "Claude Code {got} is no longer accepted here; upgrade to {want} or newer \
+                 (npm i -g @anthropic-ai/claude-code)"
             ),
-        )
-            .into_response();
+        );
+    }
+
+    // 1.6) 每会话 RPM 上限（头这一路）：这个会话最近 60 秒发得太多 → 直接 429 + `retry-after`。
+    //
+    //      **刻意排在 body 解析之前**，这是选会话维度顺带拿到的好处：会话 id 在
+    //      `X-Claude-Code-Session-Id` 头上，而设备 id 只存在于 body 里（`metadata.user_id`），
+    //      按设备限就非得先把整个 body 解析出来才判得了。长对话几 MB 是常态，一个不退避的
+    //      客户端每秒撞十几次，那十几次全额解析纯属白烧 CPU——闸门前移正好把它省掉。
+    //
+    //      代价是形态拦截（2.3）与设备身份校验（2.2）都排在它后面，即「一条发都发不出去的
+    //      请求也会占掉会话的名额」，与设备闸那句注释的取舍相反。这里认这个代价：反复发同一条
+    //      坏形态本身就是该被节流的行为（那条路每次也要白解析一遍 body），把它算进窗口比放它
+    //      过去更对。
+    //
+    //      头上没有这个值时不在这里判，等 body 解析出会话 id 再补判（见 2.2b）；两处互斥，
+    //      同一条请求只会吃一个名额。官方客户端头体两处逐字相同，故先后两路落在同一个桶里。
+    let session_from_header = incoming_session_id(&headers);
+    if let Some(sid) = session_from_header.as_deref()
+        && let Some(retry) = state.store.take_session_rpm_slot(sid)
+    {
+        return session_rpm_rejection(
+            &state.rejection_log,
+            &method,
+            &path_and_query,
+            &client_ua,
+            sid,
+            retry,
+            "header",
+        );
     }
 
     // 2) 请求体只解析这一次，下面五项判定全从这份结果上读。
@@ -102,9 +127,8 @@ pub async fn handle(
     // 2 用 `body_has_user_id` 而不是 [`extract_device_id`]，是有意放宽：只问字段在不在，
     // 不要求格式认得出。官方哪天换一种 `user_id` 写法，宽的这条仍把它当官方客户端，最多
     // 退化成不绑定设备；严的那条会把它送进模拟，代价大得多。
-    let from_cc_client = cc_cli_version(&client_ua).is_some()
-        || has_user_id
-        || incoming_session_id(&headers).is_some();
+    let from_cc_client =
+        cc_cli_version(&client_ua).is_some() || has_user_id || session_from_header.is_some();
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
@@ -116,10 +140,37 @@ pub async fn handle(
     if device_id.is_none() {
         if billable && state.store.require_device_id() {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
-            return (StatusCode::FORBIDDEN, "missing a usable device identity (metadata.user_id)")
-                .into_response();
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "missing a usable device identity (metadata.user_id)",
+            );
         }
         tracing::debug!(%method, path = %path_and_query, billable, "allowing a request with no device identity");
+    }
+
+    // 2.2b) 每会话 RPM 上限（body 这一路）：头上没带会话 id，但 `metadata.user_id` 里有。
+    //       只在头那路没判过时才判（`session_from_header.is_none()`），否则同一条请求会吃掉
+    //       两个名额——官方两处同值，那等于把上限砍半。
+    //       顺带把会话 id 定下来（头优先、body 兜底）：下面选号失败那条日志的抑制键，
+    //       在没有设备身份时要拿它来分桶。
+    let session_id = match &session_from_header {
+        Some(sid) => Some(sid.clone()),
+        None => extract_session_id(body_json.as_ref()),
+    };
+    if session_from_header.is_none()
+        && let Some(sid) = session_id.as_deref()
+        && let Some(retry) = state.store.take_session_rpm_slot(sid)
+    {
+        return session_rpm_rejection(
+            &state.rejection_log,
+            &method,
+            &path_and_query,
+            &client_ua,
+            sid,
+            retry,
+            "body",
+        );
     }
 
     // 请求的模型名：下面两处都要用它——本地形态拦截按模型索引，选号的冷却也按
@@ -139,12 +190,7 @@ pub async fn handle(
             model = %req_model.as_deref().unwrap_or("-"), %field, %value,
             "rejected locally: upstream has already rejected this request shape"
         );
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "application/json")],
-            error_body("invalid_request_error", &message),
-        )
-            .into_response();
+        return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
     }
 
     // 2.4) 每设备 RPM 上限：这台机器最近 60 秒发得太多 → 直接 429 + `retry-after`。
@@ -152,17 +198,25 @@ pub async fn handle(
     //      白白改绑设备（还会连累 thinking 签名，见 [`store::RpmLimited::sticky`]）。故这道闸
     //      独立于选号，也因此排在形态拦截之后：一条发都发不出去的请求不该占掉设备的名额。
     //      没有设备身份的请求（网页关了校验的那些）不受此闸管——它们由裸请求速率上限兜着。
+    //
+    //      与会话闸（1.6 / 2.2b）是**同一件事的两个粒度**：那道贴合单个对话的真实节奏，这道
+    //      兜「这台机器总量别失控」——会话 id 轮换免费，只有它拦不住换 id 的客户端。语义与
+    //      两个阈值该怎么配见 [`store::SESSION_RPM_LIMIT`]。
     if let Some(dev) = device_id.as_deref()
         && let Some(retry) = state.store.take_device_rpm_slot(dev)
     {
-        let device_short: String = dev.chars().take(8).collect();
-        tracing::warn!(%method, path = %path_and_query, ua = %client_ua, device = %device_short, retry_after = retry, "rejected: this device has reached its RPM limit");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry.to_string())],
+        // 日志抑制：撞满的客户端多半每几十毫秒就再撞一次，一条一行会把日志刷没。
+        // 憋掉的条数记在下一行的 `suppressed=` 上，见 [`take_rejection_log_slot`]。
+        if let Some(suppressed) =
+            take_rejection_log_slot(&state.rejection_log, &format!("device:{dev}"))
+        {
+            let device_short: String = dev.chars().take(8).collect();
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, device = %device_short, retry_after = retry, suppressed, "rejected: this device has reached its RPM limit");
+        }
+        return rate_limit_response(
+            retry,
             format!("this device has reached its RPM limit; retry in {retry} seconds"),
-        )
-            .into_response();
+        );
     }
 
     // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
@@ -185,7 +239,31 @@ pub async fn handle(
     {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, error = %e, "refusing to forward");
+            // 这条同样要抑制，而且理由比前两道闸更硬：账号 RPM、裸请求上限、全员冷却这三种
+            // 都是**明确让客户端稍后再来**的状态，不退避的客户端会照着重试节奏一条条刷日志，
+            // 与撞设备/会话闸时一模一样。
+            //
+            // 抑制键带上**分类**：同一台设备可能一会儿是「号都在冷却」、一会儿是「没有可用
+            // 账号」，共用一个桶会把后出现的那种整个盖掉，而那恰恰是状态变了的信号。
+            let kind = if e.downcast_ref::<store::BareRateLimited>().is_some() {
+                "bare-rate-limit"
+            } else if e.downcast_ref::<store::RpmLimited>().is_some() {
+                "account-rpm"
+            } else if e.downcast_ref::<store::AllRateLimited>().is_some() {
+                "all-cooling-down"
+            } else if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
+                "device-limit"
+            } else {
+                "unavailable"
+            };
+            // 分桶用设备，没有设备身份就退到会话，都没有才并成一桶——后者本就是「裸请求」，
+            // 它们由裸请求上限统一管着，日志上也没有更细的身份可分。
+            let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
+            if let Some(suppressed) =
+                take_rejection_log_slot(&state.rejection_log, &format!("forward:{kind}:{who}"))
+            {
+                tracing::warn!(%method, path = %path_and_query, ua = %client_ua, kind, suppressed, error = %e, "refusing to forward");
+            }
             // 三类「等多久是算得出来的」限流 → 429 且带 `retry-after`，给出来客户端才知道该
             // 等多久，而不是立刻重试再撞一次：裸请求速率上限取窗口长度；账号 RPM 上限取窗口里
             // 最早那条滚出去的时刻；所有号都在上游 429 冷却中（硬门禁）取最早解冻的那个的
@@ -198,22 +276,16 @@ pub async fn handle(
                     e.downcast_ref::<store::AllRateLimited>().map(|rl| rl.retry_after_secs)
                 });
             if let Some(secs) = computable_retry {
-                let retry = secs.to_string();
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, retry)],
-                    e.to_string(),
-                )
-                    .into_response();
+                return rate_limit_response(secs, e.to_string());
             }
-            // 设备数达硬上限 → 429（等多久取决于别人什么时候释放，给不出 retry-after）；
-            // 其余（无凭证/刷新失败等）→ 503。
-            let status = if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
-                StatusCode::TOO_MANY_REQUESTS
+            // 设备数达硬上限 → 429（等多久取决于别人什么时候释放，给不出 retry-after，故这条
+            // 不走 [`rate_limit_response`]）；其余（无凭证/刷新失败等）→ 503。
+            let (status, etype) = if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
             } else {
-                StatusCode::SERVICE_UNAVAILABLE
+                (StatusCode::SERVICE_UNAVAILABLE, "api_error")
             };
-            return (status, e.to_string()).into_response();
+            return error_response(status, etype, e.to_string());
         }
     };
 
@@ -346,7 +418,11 @@ pub async fn handle(
                     cred_id = cred.id, cred = %cred.label, error = %format!("{e:#}"),
                     "refusing to forward: this credential has a proxy configured but no usable client could be built"
                 );
-                return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")).into_response();
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    format!("{e:#}"),
+                );
             }
         };
         let upstream = Upstream {
@@ -375,9 +451,10 @@ pub async fn handle(
             _ => None,
         };
         let Some(info) = limited else { break (upstream, resp, sent) };
-        // 基础窗口真耗尽 → 停调度整个账号；只有超额池（7d_oi）满或纯容量限制 → 只冷却这个模型。
+        // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
+        // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
         let scope = rate_limit_scope(&info, req_model.as_deref());
-        let cooldown = info.cooldown(scope.account_level());
+        let cooldown = info.cooldown_for(&scope);
         tracing::warn!(
             cred_id = cred.id, cred = %cred.label,
             model = %req_model.as_deref().unwrap_or("-"),
@@ -392,6 +469,20 @@ pub async fn handle(
             break (upstream, resp, sent);
         }
         park_rate_limited(&state.store, &cred, &scope, cooldown);
+        // 谁的额度都没满（容量/请求速率限制）→ **就此打住，不换号**：这一发 429 不是这个号的
+        // 问题，换到下一个号上重发只会撞同一堵墙，并把同一个模型的冷却一路盖到整池——一条客户端
+        // 请求最多能盖 max_retry+1 个号，客户端再自己重试几轮，全部账号的卡片上就都挂着这个模型
+        // 的冷却，而冷却是选号硬门禁，于是新请求一条都进不来（返回 `AllRateLimited`）。
+        // 交回 429 + `retry-after`，让客户端按上游给的节奏退避才是这一档的正解。
+        if !scope.worth_swapping() {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                model = %req_model.as_deref().unwrap_or("-"),
+                cooldown_secs = cooldown.as_secs(),
+                "upstream 429 is not account-specific (no quota window is full): passing it through instead of swapping credentials"
+            );
+            break (upstream, resp, sent);
+        }
         tried.push(cred.id);
         if retried >= max_retry {
             tracing::warn!(
@@ -590,13 +681,13 @@ pub async fn handle(
                             None => bytes,
                         };
                         builder.body(Body::from(bytes)).unwrap_or_else(|e| {
-                            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                            error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                         })
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to read the upstream error body");
                         builder.body(Body::empty()).unwrap_or_else(|e| {
-                            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                            error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                         })
                     }
                 };
@@ -615,8 +706,11 @@ pub async fn handle(
                 error = %detail,
                 "upstream request failed"
             );
-            (StatusCode::BAD_GATEWAY, format!("upstream request failed [{kind}]: {detail}"))
-                .into_response()
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("upstream request failed [{kind}]: {detail}"),
+            )
         }
     }
 }
@@ -795,7 +889,9 @@ fn stream_upstream(
         Some(map) => Body::from_stream(restore_tool_names_stream(stream, map)),
         None => Body::from_stream(stream),
     };
-    builder.body(body).unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+    builder
+        .body(body)
+        .unwrap_or_else(|e| error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string()))
 }
 
 /// 收齐上游 SSE、聚合成一条整段 JSON 的 Message 回给客户端（来访本来发的就是非流式）。
@@ -818,8 +914,11 @@ async fn aggregate_sse(
             Err(e) => {
                 tracing::warn!(error = %e, "upstream SSE broke while aggregating; failing the request");
                 rl.status = StatusCode::BAD_GATEWAY.as_u16();
-                return (StatusCode::BAD_GATEWAY, format!("upstream stream failed: {e}"))
-                    .into_response();
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    format!("upstream stream failed: {e}"),
+                );
             }
         };
         if rl.ttft_ms.is_none() {
@@ -837,14 +936,16 @@ async fn aggregate_sse(
                     Some(map) => map.restore(&body),
                     None => body,
                 }))
-                .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response()),
+                .unwrap_or_else(|e| {
+                    error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                }),
             Err(e) => {
                 rl.status = StatusCode::BAD_GATEWAY.as_u16();
-                (
+                error_response(
                     StatusCode::BAD_GATEWAY,
+                    "api_error",
                     format!("failed to serialize the aggregated message: {e}"),
                 )
-                    .into_response()
             }
         },
         // 流中 `event: error`：错误 JSON 原样当响应体，**状态码按 `error.type` 映射**
@@ -862,13 +963,12 @@ async fn aggregate_sse(
             // 告警并把状态码换给了客户端，留着它只会让 `ReqLog::drop` 再报一次同样的事。
             rl.sniffer.stream_error = None;
             match serde_json::to_vec(&payload) {
-                Ok(body) => builder
-                    .status(status)
-                    .body(Body::from(body))
-                    .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response()),
+                Ok(body) => builder.status(status).body(Body::from(body)).unwrap_or_else(|e| {
+                    error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                }),
                 Err(e) => {
                     rl.status = StatusCode::BAD_GATEWAY.as_u16();
-                    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                    error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                 }
             }
         }
@@ -877,7 +977,11 @@ async fn aggregate_sse(
         Aggregated::Incomplete(why) => {
             tracing::warn!(reason = why, "upstream SSE ended without message_stop; returning 502");
             rl.status = StatusCode::BAD_GATEWAY.as_u16();
-            (StatusCode::BAD_GATEWAY, format!("incomplete upstream stream: {why}")).into_response()
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("incomplete upstream stream: {why}"),
+            )
         }
     }
 }
@@ -1751,6 +1855,51 @@ fn extract_device_id(body: Option<&serde_json::Value>) -> Option<String> {
     // 退化：扁平串格式，取 device 段。
     let flat = parse_flat_user_id(user_id)?;
     (!flat.device.is_empty()).then_some(flat.device)
+}
+
+/// 从请求体提取会话标识，兼容与 [`extract_device_id`] 相同的两种 `metadata.user_id` 格式
+/// （内嵌 JSON 的 `session_id` 字段 / 扁平串的 `_session_` 段）。
+///
+/// 只在来访**没带** `X-Claude-Code-Session-Id` 头时才用得上：官方客户端头体两处逐字相同，
+/// 头在就直接读头（还能省掉一次 body 解析，见入口 1.6）。
+fn extract_session_id(body: Option<&serde_json::Value>) -> Option<String> {
+    let user_id = body?.get("metadata")?.get("user_id")?.as_str()?;
+    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(sid) = inner.get("session_id").and_then(|s| s.as_str())
+        && !sid.is_empty()
+    {
+        return Some(sid.to_string());
+    }
+    let flat = parse_flat_user_id(user_id)?;
+    (!flat.session.is_empty()).then_some(flat.session)
+}
+
+/// 会话 RPM 超限那条 429：两个入口（头一路、body 一路）共用，免得两处的状态码、头、正文
+/// 措辞哪天漂开。`source` 只进日志，用来分辨会话 id 是从哪儿读到的。
+fn session_rpm_rejection(
+    log: &RejectionLog,
+    method: &Method,
+    path_and_query: &str,
+    client_ua: &str,
+    session_id: &str,
+    retry: i64,
+    source: &'static str,
+) -> Response {
+    // 日志抑制同设备那道闸：憋掉的条数记在下一行的 `suppressed=` 上。
+    if let Some(suppressed) = take_rejection_log_slot(log, &format!("session:{session_id}")) {
+        // 会话 id 是 uuid，整串进日志只会把行撑长；取前 8 位足够把几个并发会话区分开，
+        // 口径与设备那条拒绝日志一致。
+        let session_short: String = session_id.chars().take(8).collect();
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            session = %session_short, %source, retry_after = retry, suppressed,
+            "rejected: this session has reached its RPM limit"
+        );
+    }
+    rate_limit_response(
+        retry,
+        format!("this session has reached its RPM limit; retry in {retry} seconds"),
+    )
 }
 
 /// 来访体里有没有 `metadata.user_id`。
@@ -2809,6 +2958,58 @@ type ShapeRejections = std::collections::HashMap<(String, &'static str, String),
 /// 支持的取值」——那才是查不出来的故障。
 pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
 
+/// 拒绝日志的抑制表：键（`device:<id>` / `session:<id>`）→ (上次真打了日志的时刻, 从那以后
+/// 憋掉的条数)。
+type RejectionCounters = std::collections::HashMap<String, (std::time::Instant, u64)>;
+
+/// [`RejectionCounters`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
+pub type RejectionLog = std::sync::Arc<parking_lot::Mutex<RejectionCounters>>;
+
+/// 同一个键两条拒绝日志之间至少隔多久。
+///
+/// 取 10 秒：撞上限的客户端往往每几十毫秒重试一次（实测有 67ms 一发的），一条不落地记就是
+/// 每秒十几行 WARN，几分钟能把日志刷得没法看，真正要查的东西全被挤走了。10 秒足够把一次
+/// 突发收成一行，又短到「这台机器还在撞」这件事不会从日志里消失——限流本身最长也就 60 秒。
+const REJECTION_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 抑制表最多留多少个键。键是客户端自报的 id，乱编 id 的脚本能把表撑大，故与限流窗口同样
+/// 需要清扫（[`take_rejection_log_slot`]）。
+const REJECTION_LOG_MAX_KEYS: usize = 4096;
+
+/// 这条拒绝要不要真打一行日志：要打则返回**上一行之后憋掉了多少条**（首次为 0），
+/// 不打则 `None`。
+///
+/// 抑制掉的条数不会凭空消失，它会记在下一行日志的 `suppressed=` 上——否则「刷了多少」这个
+/// 唯一有用的量就没了，而那正是判断「客户端在正常退避」还是「压根没读 retry-after」的依据。
+///
+/// **代价说清楚**：客户端不再发了之后，最后那截憋着的条数没有下一行可挂，就丢了；表被撑爆
+/// 触发清扫时，被清掉的老键同理。两者都只影响计数的尾巴，不影响「撞没撞、撞了多久」——
+/// 为它加一个定时冲刷的后台任务，不值当。
+fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u64> {
+    let now = std::time::Instant::now();
+    let mut map = log.lock();
+    if map.len() > REJECTION_LOG_MAX_KEYS {
+        map.retain(|_, (at, _)| now.duration_since(*at) < REJECTION_LOG_WINDOW);
+    }
+    match map.get_mut(key) {
+        // 窗口内：憋着，只把计数加一。
+        Some((at, suppressed)) if now.duration_since(*at) < REJECTION_LOG_WINDOW => {
+            *suppressed += 1;
+            None
+        }
+        // 窗口过了：把憋着的条数交出去，重新开始计。
+        Some((at, suppressed)) => {
+            let n = std::mem::take(suppressed);
+            *at = now;
+            Some(n)
+        }
+        None => {
+            map.insert(key.to_string(), (now, 0));
+            Some(0)
+        }
+    }
+}
+
 /// 记忆表的容量上限。每个「模型 + 字段 + 没见过的取值」占一格，而取值来自来访请求，
 /// 也就是说这张表的增长是外部可控的——封顶后不再插入（既有条目照常生效）。
 const SHAPE_MEMORY_CAP: usize = 512;
@@ -2889,6 +3090,37 @@ fn error_body(etype: &str, message: &str) -> Vec<u8> {
         "error": {"type": etype, "message": message},
     }))
     .unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec())
+}
+
+/// luban 自己产生的一条错误响应：状态码 + `content-type: application/json` + [`error_body`]。
+///
+/// **转发路径上回给客户端的错误一律走它**，别再直接 `(StatusCode, "一句话")`：那样发出去的是
+/// `text/plain`，而客户端（官方 SDK、各类第三方 SDK）都按 JSON 读错误体——解不出来时它们只
+/// 能退回一句按状态码编的通用话，我们精心写的那句原因就此丢掉，客户端还可能因此走上与
+/// 上游真实错误不同的重试分支。上游的错误体本来就是这个形态，本地拒绝长得一样，客户端才不必
+/// 分辨这条错误是谁产生的。
+///
+/// `etype` 用 Anthropic 那套取值：`authentication_error` / `permission_error` /
+/// `invalid_request_error` / `rate_limit_error` / `api_error`。
+fn error_response(status: StatusCode, etype: &str, message: impl AsRef<str>) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/json")], error_body(etype, message.as_ref()))
+        .into_response()
+}
+
+/// 限流那条错误响应：429 + `retry-after` + JSON 错误体。
+///
+/// 单拎出来是因为 `retry-after` 这个头不能漏——三处限流（会话、设备、账号/裸请求）的等待
+/// 时间都是**算得准**的，把它带上客户端才知道该等多久，而不是立刻再撞一次。
+fn rate_limit_response(retry_after_secs: i64, message: impl AsRef<str>) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::RETRY_AFTER, retry_after_secs.to_string()),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+        ],
+        error_body("rate_limit_error", message.as_ref()),
+    )
+        .into_response()
 }
 
 /// 来访有没有要流式响应（顶层 `stream:true`）。
@@ -3979,8 +4211,19 @@ fn cache_control(shape: CacheShape) -> serde_json::Value {
 enum LimitScope {
     /// 基础额度窗口真的耗尽：该账号所有模型一起让位。
     Account,
-    /// 只有这一个模型没路可走（容量限制，或它专用的超额池满了）：其余模型照常。
+    /// 这个号的某个额度池满了（它专用的超额/回补池）：只让这个模型让位，其余模型照常。
     Model(String),
+    /// **谁的额度都没满**，上游只是这一刻不让发：模型容量限制、或请求速率（RPM）限制。
+    ///
+    /// 与 [`Self::Model`] 分开的理由是「换号有没有意义」完全相反：额度池是**跟着账号走**的，
+    /// 换个号确实可能还有余量；而容量/速率限制是**跟着模型或出口走**的，换号重发只会在下一个
+    /// 号上撞同一发 429，并把同一个模型的冷却挨个盖满整池——线上症状就是「一个号被限流，所有
+    /// 号的卡片上都显示这个模型在冷却，新请求全被冷却硬门禁挡在门外」。故这一档只冷却撞上的
+    /// 那个号、**不换号重试**，429 连同 `retry-after` 原样交回客户端，让它按上游给的节奏退避。
+    ///
+    /// 冷却时长也另算，见 [`RateLimitInfo::transient_cooldown`]：这是几秒到几十秒的事，
+    /// 拿额度那套（可以睡满几十小时）去算它，等于因为一次瞬时拥堵把号锁掉半天。
+    Transient(String),
 }
 
 impl LimitScope {
@@ -3988,11 +4231,17 @@ impl LimitScope {
         matches!(self, Self::Account)
     }
 
+    /// 这一发 429 是不是「换个号就可能发得出去」——只有额度是跟着账号走的，
+    /// 容量/速率限制换号无益，见 [`Self::Transient`]。
+    fn worth_swapping(&self) -> bool {
+        !matches!(self, Self::Transient(_))
+    }
+
     /// 传给 [`store::CredentialStore::mark_rate_limited`] 的模型维度。
     fn model(&self) -> Option<&str> {
         match self {
             Self::Account => None,
-            Self::Model(m) => Some(m),
+            Self::Model(m) | Self::Transient(m) => Some(m),
         }
     }
 
@@ -4000,6 +4249,7 @@ impl LimitScope {
         match self {
             Self::Account => "account",
             Self::Model(_) => "model",
+            Self::Transient(_) => "transient",
         }
     }
 }
@@ -4044,10 +4294,17 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
         || info.window_utilization.iter().any(|(w, u)| !is_overage_window(w) && *u >= 1.0);
     let no_detail = info.window_status.is_empty() && info.window_utilization.is_empty();
     let unified_gone = no_detail && info.unified_status.as_deref().is_some_and(rejected);
+    // 超额/回补池被拒或打满：额度是跟着账号走的，换个号可能还有余量，故仍判 [`LimitScope::Model`]。
+    let overage_gone = info.window_status.iter().any(|(w, s)| is_overage_window(w) && rejected(s))
+        || info.window_utilization.iter().any(|(w, u)| is_overage_window(w) && *u >= 1.0);
     if base_gone || unified_gone {
         LimitScope::Account
-    } else {
+    } else if overage_gone {
         LimitScope::Model(model.to_string())
+    } else {
+        // 走到这里的 429 里，**没有一个窗口是满的**（也可能一个限流头都没带）：那就不是「这个
+        // 号没额度了」，而是容量或请求速率限制。它不跟着账号走，见 [`LimitScope::Transient`]。
+        LimitScope::Transient(model.to_string())
     }
 }
 
@@ -4058,9 +4315,11 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
 ///   到几天，只记内存的话一次进程重启就忘了，重启后又拿这个号去撞一发 429；而且后台看不到
 ///   这个号为什么不干活。恢复有三条路：到点惰性自动恢复、连通性测试通过自动恢复、
 ///   控制台手动打开。
-/// - **模型级**（容量限制/超额池满，账号本身好着）：仍走进程内的
+/// - **模型级/瞬时级**（超额池满、或容量与速率限制，账号本身好着）：仍走进程内的
 ///   [`store::CredentialStore::mark_rate_limited`]。这一档默认才 30 秒，落库既不值得、也会
 ///   在卡片上把一个健康账号显示成「已停用」——它的 sonnet/opus 明明还在正常服务。
+///   两者在这里的**落点相同**（都是 `(账号, 模型)` 那一格），差别在冷却时长与要不要换号重试，
+///   见 [`LimitScope::Transient`]。
 fn park_rate_limited(
     store: &store::CredentialStore,
     cred: &crate::credentials::Credential,
@@ -4355,6 +4614,30 @@ impl RateLimitInfo {
         std::time::Duration::from_secs(secs as u64)
     }
 
+    /// 按这一发 429 的判定档位算冷却时长，见 [`LimitScope`]。三档各有各的口径，故由 scope
+    /// 分派，调用方不必自己记「哪一档该传什么」。
+    fn cooldown_for(&self, scope: &LimitScope) -> std::time::Duration {
+        match scope {
+            LimitScope::Transient(_) => self.transient_cooldown(),
+            _ => self.cooldown(scope.account_level()),
+        }
+    }
+
+    /// 瞬时限流（容量/请求速率）的冷却：**吃 `retry-after`，但夹在
+    /// [`MAX_TRANSIENT_COOLDOWN_SECS`] 以内**。
+    ///
+    /// 这一档谁的额度都没满（见 [`LimitScope::Transient`]），等的只是「这一刻别发」，几秒到
+    /// 几十秒就过去了。而冷却是选号的硬门禁，长冷却在这一档纯属误伤：上游偶尔会在这种 429 上
+    /// 带一个按额度窗口算出来的大 `retry-after`（实测给过 63 小时），照单全收就等于因为一次
+    /// 瞬时拥堵把这个号的这个模型锁掉两天多。
+    fn transient_cooldown(&self) -> std::time::Duration {
+        let secs = self
+            .retry_after
+            .unwrap_or(DEFAULT_MODEL_COOLDOWN_SECS)
+            .clamp(1, MAX_TRANSIENT_COOLDOWN_SECS);
+        std::time::Duration::from_secs(secs as u64)
+    }
+
     /// 把逐项收集的三张表（status / utilization / reset）按窗口名合并成一份结构化快照，
     /// 供落库展示（见 [`store::QuotaWindow`]）。
     ///
@@ -4477,6 +4760,15 @@ const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
 /// （比如 reset 落在几年后），不再是「每隔 N 小时放出去试一次」——那种试探每次都要白撞
 /// 一发 429，而额度没到点是不会自己长回来的。
 const MAX_RATE_LIMIT_COOLDOWN_SECS: i64 = 7 * 24 * 3600 + 3600;
+
+/// 瞬时限流（容量/请求速率）那一档的冷却上限：60 秒。见
+/// [`RateLimitInfo::transient_cooldown`]。
+///
+/// 这一档没有任何窗口是满的，等的只是这一阵拥堵；上游在这种 429 上给出的 `retry-after`
+/// 未必按同一口径算（实测见过直接给额度窗口重置时刻的），照单全收会把一个额度充足的号
+/// 按几十小时锁住。夹到一分钟：真需要等更久时，客户端下一条请求会再撞一发、再冷却一分钟，
+/// 代价是一次往返；夹错方向（该等 1 小时却只等 1 分钟）远比反过来便宜。
+const MAX_TRANSIENT_COOLDOWN_SECS: i64 = 60;
 
 /// 上游 429 但没给任何可用的等待时间时，凭证的默认冷却时长。
 ///
@@ -4802,7 +5094,7 @@ pub async fn probe(
                 && state.store.rate_limit_retry_max() > 0
             {
                 let scope = rate_limit_scope(&info, Some(model));
-                let cooldown = info.cooldown(scope.account_level());
+                let cooldown = info.cooldown_for(&scope);
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
                     model,
@@ -5088,6 +5380,35 @@ mod tests {
         assert!(is_billable_messages("/v1/messages/count_tokens/../"));
         assert!(is_billable_messages("/v1/messages/count_tokens/"));
         assert!(is_billable_messages("/v1/messages/count_tokensX"));
+    }
+
+    /// 会话 id 的 body 兜底提取：两种 `metadata.user_id` 格式都要认得，且与设备 id 取的是
+    /// **同一串里的不同段**——两者串了的话，会话闸会按设备分桶（同机多会话又挤在一起），
+    /// 而这恰好是它要解决的问题。
+    #[test]
+    fn session_id_comes_from_either_user_id_format() {
+        // 1) CC 内嵌 JSON。
+        let inner = Bytes::from(
+            r#"{"messages":[],"metadata":{"user_id":"{\"device_id\":\"d0\",\"account_uuid\":\"a0\",\"session_id\":\"5e3f\"}"}}"#
+                .to_string(),
+        );
+        assert_eq!(super::extract_session_id(parsed(&inner).as_ref()).as_deref(), Some("5e3f"));
+        assert_eq!(super::extract_device_id(parsed(&inner).as_ref()).as_deref(), Some("d0"));
+
+        // 2) 扁平串（Windows 客户端那种形态），account 段允许为空。
+        let flat = Bytes::from(
+            r#"{"messages":[],"metadata":{"user_id":"user_dev9_account__session_sess9"}}"#
+                .to_string(),
+        );
+        assert_eq!(super::extract_session_id(parsed(&flat).as_ref()).as_deref(), Some("sess9"));
+        assert_eq!(super::extract_device_id(parsed(&flat).as_ref()).as_deref(), Some("dev9"));
+
+        // 3) 认不出的格式 / 没有 metadata → None，此时这条请求不受会话闸管（由设备闸兜）。
+        let odd = Bytes::from(
+            r#"{"messages":[],"metadata":{"user_id":"whatever-new-format"}}"#.to_string(),
+        );
+        assert!(super::extract_session_id(parsed(&odd).as_ref()).is_none());
+        assert!(super::extract_session_id(parsed(&Bytes::from("{}")).as_ref()).is_none());
     }
 
     /// 把原始 body 解析一次，模拟 [`super::handle`] 里那一步——生产路径全程只解析一次，
@@ -5419,6 +5740,86 @@ mod tests {
         let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(data).unwrap();
         e.finish().unwrap()
+    }
+
+    /// 拒绝日志的抑制：同一个键在窗口内只出一行，憋掉的条数记在下一行上，且**各键各算各的**。
+    ///
+    /// 最后那条尤其要盯住：若两台设备共用一个计数，一台刷疯了会把另一台真正需要被看见的那行
+    /// 一起憋掉——日志里就此看不到第二台撞过限，而那正是排查时唯一的线索。
+    #[test]
+    fn rejection_logs_collapse_per_key_and_report_the_gap() {
+        let log = super::RejectionLog::default();
+
+        // 首条立即出：撞限这件事本身不该等一个窗口才被看见。
+        assert_eq!(super::take_rejection_log_slot(&log, "device:a"), Some(0));
+        // 窗口内的后续全憋着。
+        for _ in 0..12 {
+            assert_eq!(super::take_rejection_log_slot(&log, "device:a"), None);
+        }
+        // 另一个键不受影响，自己也是立即出。
+        assert_eq!(super::take_rejection_log_slot(&log, "device:b"), Some(0));
+
+        // 把 a 的「上次打印时刻」推到窗口之外，等价于等了 10 秒。
+        {
+            let mut map = log.lock();
+            let (at, _) = map.get_mut("device:a").expect("a 该在表里");
+            *at -= super::REJECTION_LOG_WINDOW + std::time::Duration::from_secs(1);
+        }
+        assert_eq!(
+            super::take_rejection_log_slot(&log, "device:a"),
+            Some(12),
+            "憋掉的条数要交给下一行，否则「刷了多少」就没了"
+        );
+        // 交出去之后重新从 0 计，不该把同一批重复报一次。
+        {
+            let mut map = log.lock();
+            let (at, _) = map.get_mut("device:a").unwrap();
+            *at -= super::REJECTION_LOG_WINDOW + std::time::Duration::from_secs(1);
+        }
+        assert_eq!(super::take_rejection_log_slot(&log, "device:a"), Some(0));
+    }
+
+    /// 本地拒绝的响应体必须是**上游那副 JSON 形态**，且 `content-type` 说的就是 JSON。
+    ///
+    /// 曾经这几条是 `(StatusCode, "一句话")`，发出去是 `text/plain`：客户端按 JSON 读错误体，
+    /// 读不出来就退回一句按状态码编的通用话，我们写的原因（等多久、缺哪个字段、该升到哪版）
+    /// 全丢了。限流那条还要盯住 `retry-after`——它是「该等多久」的唯一来源，丢了客户端就只能
+    /// 立刻再撞一次。
+    #[tokio::test]
+    async fn local_rejections_speak_the_upstream_error_shape() {
+        async fn parts(
+            resp: super::Response,
+        ) -> (StatusCode, Option<String>, Option<String>, serde_json::Value) {
+            let status = resp.status();
+            let ctype = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let retry = resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            (status, ctype, retry, serde_json::from_slice(&bytes).expect("错误体必须是 JSON"))
+        }
+
+        let (status, ctype, retry, body) =
+            parts(super::error_response(StatusCode::FORBIDDEN, "permission_error", "nope")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(ctype.as_deref(), Some("application/json"));
+        assert_eq!(retry, None, "非限流的错误不该凭空带上 retry-after");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(body["error"]["message"], "nope");
+
+        let (status, ctype, retry, body) = parts(super::rate_limit_response(41, "slow down")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(ctype.as_deref(), Some("application/json"));
+        assert_eq!(retry.as_deref(), Some("41"), "限流必须带 retry-after");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "slow down");
     }
 
     /// 上游客户端必须**透明解压**，否则用量嗅探拿到的是压缩字节、什么都解析不出来。
@@ -7607,7 +8008,8 @@ mod tests {
             ("anthropic-ratelimit-unified-reset", &far.to_string()),
         ]);
         let scope = super::rate_limit_scope(&capacity, fable);
-        assert_eq!(scope.model(), fable, "窗口都没满应判模型级");
+        assert_eq!(scope.model(), fable, "窗口都没满只该冷却这一个模型");
+        assert!(!scope.worth_swapping(), "窗口都没满 → 不是这个号的问题，换号无益");
         assert_eq!(capacity.cooldown(false).as_secs(), 30, "模型级不该拿 reset 当冷却");
         assert!(capacity.cooldown(true).as_secs() > 3000, "账号级才按 reset 冷却");
 
@@ -7624,6 +8026,88 @@ mod tests {
         assert_eq!(seven_d.cooldown(true).as_secs(), 7 * 24 * 3600);
         let absurd = hdr(&[("retry-after", "999999999")]);
         assert_eq!(absurd.cooldown(true).as_secs(), super::MAX_RATE_LIMIT_COOLDOWN_SECS as u64);
+    }
+
+    /// 「一个号被限流，所有号的卡片上都显示这个模型在冷却」那条线上问题的回归测试。
+    ///
+    /// 成因是两件事叠在一起：**谁的额度都没满**的那种 429（模型容量限制、请求速率限制）
+    /// 曾与「超额池满」同判模型级，于是换号重试会拿同一条请求去下一个号上撞同一堵墙，把同一个
+    /// 模型的冷却一路盖满整池；而冷却是选号硬门禁，盖满之后新请求一条都进不来。且那种 429 上
+    /// 游偶尔会带一个按额度窗口算的大 `retry-after`，照单全收就是几十小时。
+    ///
+    /// 故这一档单列成 [`LimitScope::Transient`]：不换号（只冷却撞上的那个号）、冷却夹在
+    /// [`MAX_TRANSIENT_COOLDOWN_SECS`] 以内。额度池满那一档的行为**不变**——额度是跟着账号
+    /// 走的，换号确实可能还有余量。
+    #[test]
+    fn a_429_that_is_not_this_credentials_fault_does_not_walk_the_pool() {
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let fable = Some("claude-fable-5");
+
+        // 1) 超额池满（线上实测那份头）：这是这个号的额度，换号仍有意义，冷却照 retry-after
+        //    睡满——两项都保持原样。
+        let oi_full = hdr(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.09"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.01"),
+            ("retry-after", "228473"),
+        ]);
+        let scope = super::rate_limit_scope(&oi_full, fable);
+        assert_eq!(scope.model(), fable);
+        assert!(scope.worth_swapping(), "额度池是跟着账号走的，换号可能还有余量");
+        assert_eq!(oi_full.cooldown_for(&scope).as_secs(), 228473, "额度那档睡满 retry-after");
+
+        // 2) 请求速率限制：窗口全都 allowed，却带了一个按额度窗口算出来的大 retry-after。
+        //    不换号，且冷却夹到一分钟——照单全收会因为一阵拥堵把这个号锁掉两天多。
+        let throttled = hdr(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.11"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.40"),
+            ("retry-after", "228473"),
+        ]);
+        let scope = super::rate_limit_scope(&throttled, fable);
+        assert!(!scope.worth_swapping(), "谁的额度都没满 → 换号只会在下一个号上撞同一发 429");
+        assert_eq!(scope.model(), fable, "冷却仍落在这个号的这个模型上");
+        assert_eq!(
+            throttled.cooldown_for(&scope).as_secs(),
+            super::MAX_TRANSIENT_COOLDOWN_SECS as u64,
+            "瞬时限流的冷却要被夹住"
+        );
+
+        // 3) 一个限流头都不带的 429（上游只给了 retry-after）：同样不换号，冷却照它给的秒数。
+        let bare = hdr(&[("retry-after", "7")]);
+        let scope = super::rate_limit_scope(&bare, fable);
+        assert!(!scope.worth_swapping());
+        assert_eq!(bare.cooldown_for(&scope).as_secs(), 7);
+        // 连 retry-after 都没有时退回模型级默认值，不是账号级那个 60 秒。
+        let nothing = hdr(&[]);
+        let scope = super::rate_limit_scope(&nothing, fable);
+        assert_eq!(
+            nothing.cooldown_for(&scope).as_secs(),
+            super::DEFAULT_MODEL_COOLDOWN_SECS as u64
+        );
+
+        // 4) 账号级（基础窗口耗尽）照旧：换号有意义，且睡满窗口 reset。
+        let exhausted = hdr(&[
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("retry-after", "3600"),
+        ]);
+        let scope = super::rate_limit_scope(&exhausted, fable);
+        assert!(scope.account_level() && scope.worth_swapping());
+        assert_eq!(exhausted.cooldown_for(&scope).as_secs(), 3600);
     }
 
     /// 落库展示用的全窗口快照：三张分开收集的表（status / utilization / reset）要按窗口名

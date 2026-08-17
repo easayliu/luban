@@ -40,6 +40,19 @@ pub struct CredentialStore {
     /// 窗口都按账号分桶，管的是「一个号别被打爆」；这个按设备分桶，管的是「一台机器别把
     /// 同账号下其他设备的额度挤没」——账号 RPM 打满时，安分的设备和刷疯了的那台一起被拒。
     device_rate: RateWindow<String>,
+    /// 每**会话** RPM 的限流窗口（进程内，窗口同 [`RPM_WINDOW_SECS`]），
+    /// 见 [`CredentialStore::take_session_rpm_slot`]。
+    ///
+    /// 键是客户端自报的会话 id（`X-Claude-Code-Session-Id` 头，或 `metadata.user_id` 里的
+    /// session 段，两处官方逐字相同）。与 [`Self::device_rate`] 是**同一件事的两个粒度**：
+    /// 一台机器上开三个 CC 窗口，真实并发是三份对话的并发，按设备一刀切会让它们互相挤额度；
+    /// 按会话分桶才对得上负载的来源。
+    ///
+    /// 但它**替代不了**设备那道闸，两道要一起配：会话 id 轮换是免费的（`/clear`、开新窗口、
+    /// 重启都换一个新的，立刻是个满血的桶），而设备 id 轮换要付代价（改绑凭证、连累 thinking
+    /// 签名、吃 `device_limit` 名额）。故会话闸给的是贴合真实并发的细粒度节流，设备闸兜的是
+    /// 「这台机器总量别失控」——后者的阈值该给到前者的几倍，见 [`SESSION_RPM_LIMIT`]。
+    session_rate: RateWindow<String>,
     /// 被上游 429 过的凭证的冷却表（进程内），见 [`RateLimitCooldown`]。
     cooldown: RateLimitCooldown,
     /// `settings` 全表的内存镜像，见 [`CredentialStore::get_setting`]。
@@ -409,6 +422,79 @@ impl RateLimitCooldown {
     }
 }
 
+/// 迁移用的一条凭证：导出与导入**共用同一个形态**，导出的文件原样喂回来就是导入的入参。
+///
+/// 刻意不带的三类字段：
+/// - `id` / `created_at` / `updated_at`：id 由目标库自己发（[`CredentialStore::import_credential`]
+///   按账号身份匹配，不认 id），时间戳属于「这条记录在这个库里的历史」，搬过去只会造出一份
+///   假的过去；
+/// - 用量、绑定、账本（`usage_logs`/`device_bindings`/`credential_stats`/`device_costs`）：
+///   费用与额度快照是**按 cred_id 关联**的历史，跟着账号搬过去会与目标库自己的流水混在一起，
+///   而设备绑定压根是「哪台机器绑在哪个号上」的本机状态，换台机器毫无意义；
+/// - 管理密码：见 [`CredentialStore::settings_snapshot`]。
+///
+/// 全字段都给了 `#[serde(default)]`：迁移文件是会被人手改的（删掉几个号、改个优先级），
+/// 少一个字段就整份导入失败太脆。缺 `expires_at` 退化成 0，即「已过期」——首次使用时用
+/// refresh_token 换一份新的，正是想要的行为。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PortableCredential {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub org_type: Option<String>,
+    pub access_token: String,
+    pub refresh_token: String,
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub device_limit: i64,
+    #[serde(default)]
+    pub rpm_limit: i64,
+    #[serde(default)]
+    pub ban_reason: Option<String>,
+    #[serde(default)]
+    pub account_uuid: Option<String>,
+    #[serde(default)]
+    pub resume_at: Option<u64>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+impl From<&Credential> for PortableCredential {
+    fn from(c: &Credential) -> Self {
+        Self {
+            label: c.label.clone(),
+            tier: c.tier.clone(),
+            org_type: c.org_type.clone(),
+            access_token: c.access_token.clone(),
+            refresh_token: c.refresh_token.clone(),
+            expires_at: c.expires_at,
+            priority: c.priority,
+            disabled: c.disabled,
+            device_limit: c.device_limit,
+            rpm_limit: c.rpm_limit,
+            ban_reason: c.ban_reason.clone(),
+            account_uuid: c.account_uuid.clone(),
+            resume_at: c.resume_at,
+            proxy: c.proxy.clone(),
+        }
+    }
+}
+
+/// 导入一条凭证的结果：目标库里原本没有这个账号（`Added`），还是已经有、被这条覆盖了
+/// （`Updated`）。调用方据此报「新增 N 个、更新 M 个」——迁移最想知道的就是这两个数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    Added,
+    Updated,
+}
+
 impl CredentialStore {
     /// 数据库文件路径。默认 `~/.luban/luban.db`；`LUBAN_HOME` 可覆盖基目录。
     pub fn db_path() -> Result<PathBuf> {
@@ -459,6 +545,7 @@ impl CredentialStore {
             bare_rate: RateWindow::default(),
             rpm_rate: RateWindow::default(),
             device_rate: RateWindow::default(),
+            session_rate: RateWindow::default(),
             cooldown: RateLimitCooldown::default(),
             settings: parking_lot::RwLock::new(settings),
         }
@@ -566,6 +653,143 @@ impl CredentialStore {
         tx.execute("DELETE FROM device_costs", [])?;
         let n = tx.execute("DELETE FROM credentials", [])?;
         tx.commit()?;
+        Ok(n)
+    }
+
+    /// 导出全部凭证的可迁移形态，顺序同 [`Self::list`]（priority, id）。
+    ///
+    /// **含明文 access/refresh token**——迁移要的就是它们，脱敏过的导出等于没导。谁能调到
+    /// 这个口子就等于拿到了这些账号，故接口侧另加了一道闸（见 `crate::web` 的 `export`）。
+    pub fn export_credentials(&self) -> Result<Vec<PortableCredential>> {
+        Ok(self.list()?.iter().map(PortableCredential::from).collect())
+    }
+
+    /// 可迁移的设置快照（`settings` 全表），**去掉管理密码**。
+    ///
+    /// 管理密码是「谁能进这台机器的控制台」，属于部署本身而不是被迁移的配置：把源站的口令
+    /// 悄悄盖到目标站上，等于一次导入顺手改掉了目标站的登录方式，而做导入的人未必知道自己
+    /// 改了这个。接入 key（[`CLIENT_API_KEY`]）反过来**要带**：它是客户端侧配好的东西，
+    /// 迁移后不跟着走，所有客户端都得重配一遍。
+    pub fn settings_snapshot(&self) -> HashMap<String, String> {
+        let mut out = self.settings.read().clone();
+        out.remove(ADMIN_PASSWORD);
+        out
+    }
+
+    /// 导入一条凭证：目标库已有这个账号就整行覆盖，没有就新增。
+    ///
+    /// **匹配顺序是 `account_uuid` 优先、`refresh_token` 兜底**，这个先后有实际后果：同一个
+    /// 账号在源站重新授权过之后 refresh_token 已经是新值，只按 token 匹配会把它当成一个新
+    /// 账号插进去，目标库里同一个账号出现两行（两行还会各自去刷新同一个上游账号）。反过来，
+    /// 老库里可能有 `account_uuid` 还没拉到的号（profile 没取成功），故 token 这条兜底不能去。
+    ///
+    /// 命中后是**整行覆盖**而不是只更新 token：迁移文件是源站此刻的完整状态，优先级、设备
+    /// 上限、代理这些都是操作者在源站上调好的。想保留目标站自己的调法，就别对已有的号做导入
+    /// （或者导入后再调）——半覆盖半保留的规则说不清也记不住。
+    pub fn import_credential(&self, c: &PortableCredential) -> Result<ImportOutcome> {
+        if c.access_token.trim().is_empty() || c.refresh_token.trim().is_empty() {
+            anyhow::bail!("credential has an empty access_token or refresh_token");
+        }
+        // 空串的 uuid 当没有：老库里存过空串，拿它去匹配会把所有这类号连成一个。
+        let uuid = c.account_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let proxy = c.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let existing: Option<i64> = uuid
+            .and_then(|u| {
+                tx.query_row("SELECT id FROM credentials WHERE account_uuid = ?1", [u], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .transpose()
+            })
+            .or_else(|| {
+                tx.query_row(
+                    "SELECT id FROM credentials WHERE refresh_token = ?1",
+                    [&c.refresh_token],
+                    |r| r.get(0),
+                )
+                .optional()
+                .transpose()
+            })
+            .transpose()?;
+        let outcome = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE credentials SET
+                         label = ?2, tier = ?3, org_type = ?4, access_token = ?5,
+                         refresh_token = ?6, expires_at = ?7, priority = ?8, disabled = ?9,
+                         device_limit = ?10, rpm_limit = ?11, ban_reason = ?12,
+                         account_uuid = ?13, resume_at = ?14, proxy = ?15,
+                         updated_at = unixepoch()
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        c.label,
+                        c.tier,
+                        c.org_type,
+                        c.access_token,
+                        c.refresh_token,
+                        c.expires_at as i64,
+                        c.priority,
+                        c.disabled as i64,
+                        c.device_limit,
+                        c.rpm_limit,
+                        c.ban_reason,
+                        uuid,
+                        c.resume_at.map(|t| t as i64),
+                        proxy,
+                    ],
+                )
+                .context("failed to update the existing credential")?;
+                ImportOutcome::Updated
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO credentials
+                         (label, tier, org_type, access_token, refresh_token, expires_at,
+                          priority, disabled, device_limit, rpm_limit, ban_reason,
+                          account_uuid, resume_at, proxy)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        c.label,
+                        c.tier,
+                        c.org_type,
+                        c.access_token,
+                        c.refresh_token,
+                        c.expires_at as i64,
+                        c.priority,
+                        c.disabled as i64,
+                        c.device_limit,
+                        c.rpm_limit,
+                        c.ban_reason,
+                        uuid,
+                        c.resume_at.map(|t| t as i64),
+                        proxy,
+                    ],
+                )
+                .context("failed to insert the credential (its refresh_token may already exist)")?;
+                ImportOutcome::Added
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// 导入设置：逐项写库并同步内存镜像，返回实际写入的项数。
+    ///
+    /// 管理密码一律跳过（口径同 [`Self::settings_snapshot`]，导出不带、导入也不认——万一有人
+    /// 手工把它塞回文件里）。**只写文件里有的键**：目标库里多出来的设置保持原值，不做「以文件
+    /// 为准清空其余」——那样一份手改过的、只留了几项的文件会把目标站其余配置全部重置成默认。
+    pub fn import_settings(&self, settings: &HashMap<String, String>) -> Result<usize> {
+        let mut n = 0;
+        for (k, v) in settings {
+            if k == ADMIN_PASSWORD {
+                continue;
+            }
+            self.set_setting(k, v)?;
+            n += 1;
+        }
         Ok(n)
     }
 
@@ -878,6 +1102,36 @@ impl CredentialStore {
             return None;
         }
         Some(self.device_rate.retry_after_secs(&device_id.to_string(), window))
+    }
+
+    /// 每会话 RPM 上限：单个会话在最近 [`RPM_WINDOW_SECS`] 秒内最多转发多少条；
+    /// `<= 0`（含未设置）表示不限。语义与配套的设备闸见 [`SESSION_RPM_LIMIT`]。
+    pub fn session_rpm_limit(&self) -> i64 {
+        self.get_setting(SESSION_RPM_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// 给这个会话记一条转发；名额已满时不记，返回建议等待的秒数。口径、锁的粒度、以及
+    /// 「不参与选号」这三点都与 [`Self::take_device_rpm_slot`] 完全一致——差别只在分桶的键。
+    ///
+    /// 键的清扫比设备维度更要紧：设备 id 一台机器一个、长期不变，会话 id 每 `/clear`、每个
+    /// 新窗口都是一个新值，正常使用下就在稳定产生。故阈值单列（[`SESSION_RATE_MAX_KEYS`]）
+    /// 而不是复用设备那个。
+    pub fn take_session_rpm_slot(&self, session_id: &str) -> Option<i64> {
+        let limit = self.session_rpm_limit();
+        if limit <= 0 {
+            return None;
+        }
+        let window = Duration::from_secs(RPM_WINDOW_SECS as u64);
+        self.session_rate.sweep_if_crowded(window, SESSION_RATE_MAX_KEYS);
+        if self.session_rate.try_take(session_id.to_string(), limit, window) {
+            return None;
+        }
+        Some(self.session_rate.retry_after_secs(&session_id.to_string(), window))
     }
 
     /// 给凭证打上「被上游限流」的冷却，见 [`RateLimitCooldown`]。时长与作用域都由调用方
@@ -1599,6 +1853,24 @@ pub const DEVICE_RPM_LIMIT: &str = "device_rpm_limit";
 /// 设备限流窗口表里最多留多少个键，超过就清掉空窗口，见 [`RateWindow::sweep_if_crowded`]。
 /// 取 4096：比任何真实部署的设备数高一两个数量级，正常规模下这条清扫永远不会触发。
 const DEVICE_RATE_MAX_KEYS: usize = 4096;
+
+/// 每会话 RPM 上限的 settings 键名；`<= 0` 表示不限（默认）。见
+/// [`CredentialStore::take_session_rpm_slot`]。
+///
+/// 与 [`DEVICE_RPM_LIMIT`] 是两个粒度、**要一起配**，别只留一个：
+/// - 只配会话：一台机器开 N 个会话就是 N 倍额度，且客户端换个会话 id 就重置——`/clear` 一下
+///   便是满血的新桶，等于没有护栏；
+/// - 只配设备：同机的多个会话共用一个桶，安分的那个窗口会被刷疯的那个挤没，而这正是设备闸
+///   自己想解决的问题在下一层的复现。
+///
+/// 推荐的配法是会话给贴合单个对话真实节奏的值、设备给它的几倍当总量兜底。别把设备闸配得比
+/// 会话闸还小：那样会话这道永远轮不到判定，等于白配。
+pub const SESSION_RPM_LIMIT: &str = "session_rpm_limit";
+
+/// 会话限流窗口表里最多留多少个键，见 [`CredentialStore::take_session_rpm_slot`]。
+/// 比设备那个高一档（16384）：会话 id 正常使用下就在不断产生新值，撞上清扫的机会本就更大，
+/// 而清扫要遍历全表，不该在还装得下的时候触发。
+const SESSION_RATE_MAX_KEYS: usize = 16384;
 
 /// 单凭证裸请求速率上限的 settings 键名；`<= 0` 表示不限（默认）。见
 /// [`CredentialStore::bare_rate_limit`]。
@@ -3869,6 +4141,137 @@ mod tests {
         (store, ids)
     }
 
+    /// 导入的匹配顺序：`account_uuid` 优先，`refresh_token` 兜底。
+    ///
+    /// 第一条是这套东西的关键——账号在源站重新授权过之后 refresh_token 已经换了值，只按 token
+    /// 认就会把同一个账号在目标库里变成两行，两行还各自去刷新同一个上游账号。
+    #[test]
+    fn import_matches_by_account_uuid_then_refresh_token() {
+        let (store, _) = store_with(&["a"]);
+        let base = PortableCredential {
+            label: "acct".into(),
+            tier: Some("max".into()),
+            org_type: None,
+            access_token: "at-1".into(),
+            refresh_token: "rt-1".into(),
+            expires_at: 100,
+            priority: 2,
+            disabled: false,
+            device_limit: 3,
+            rpm_limit: 7,
+            ban_reason: None,
+            account_uuid: Some("uuid-1".into()),
+            resume_at: None,
+            proxy: None,
+        };
+        assert_eq!(store.import_credential(&base).unwrap(), ImportOutcome::Added);
+        let before = store.list().unwrap().len();
+
+        // 同一个账号、新的 refresh_token（源站重新授权过）→ 覆盖那一行，不新增。
+        let reauthed = PortableCredential {
+            refresh_token: "rt-2".into(),
+            label: "acct-renamed".into(),
+            priority: 5,
+            ..base.clone()
+        };
+        assert_eq!(store.import_credential(&reauthed).unwrap(), ImportOutcome::Updated);
+        assert_eq!(store.list().unwrap().len(), before, "同一个账号不该变成两行");
+        let got = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.account_uuid.as_deref() == Some("uuid-1"))
+            .unwrap();
+        assert_eq!(got.refresh_token, "rt-2");
+        assert_eq!(got.label, "acct-renamed", "命中后是整行覆盖");
+        assert_eq!(got.priority, 5);
+
+        // 没有 uuid 的号（profile 没拉到）仍能按 refresh_token 认出来——这条兜底不能少。
+        let no_uuid =
+            PortableCredential { account_uuid: None, refresh_token: "rt-9".into(), ..base.clone() };
+        assert_eq!(store.import_credential(&no_uuid).unwrap(), ImportOutcome::Added);
+        let again = PortableCredential { label: "by-token".into(), ..no_uuid.clone() };
+        assert_eq!(store.import_credential(&again).unwrap(), ImportOutcome::Updated);
+
+        // 空 token 的记录直接报错：让调用方把它计进 failed，而不是写一行用不了的号进去。
+        let empty = PortableCredential { access_token: "".into(), ..base.clone() };
+        assert!(store.import_credential(&empty).is_err());
+    }
+
+    /// 导出的设置快照与导入都**绕开管理密码**：那是目标机器自己的门锁，不该被一次导入换掉。
+    #[test]
+    fn admin_password_never_travels_with_settings() {
+        let (store, _) = store_with(&["a"]);
+        store.set_setting(ADMIN_PASSWORD, "hash-of-source-box").unwrap();
+        store.set_setting(CLIENT_API_KEY, "key-from-source").unwrap();
+
+        let snapshot = store.settings_snapshot();
+        assert!(!snapshot.contains_key(ADMIN_PASSWORD), "导出不带管理密码");
+        assert_eq!(
+            snapshot.get(CLIENT_API_KEY).map(String::as_str),
+            Some("key-from-source"),
+            "接入 key 要带上：不跟着走的话所有客户端都得重配"
+        );
+
+        // 手工把管理密码塞回文件里也不认。
+        let (target, _) = store_with(&["b"]);
+        target.set_setting(ADMIN_PASSWORD, "hash-of-target-box").unwrap();
+        let mut incoming = snapshot.clone();
+        incoming.insert(ADMIN_PASSWORD.into(), "hash-of-source-box".into());
+        target.import_settings(&incoming).unwrap();
+        assert_eq!(
+            target.get_setting(ADMIN_PASSWORD).unwrap().as_deref(),
+            Some("hash-of-target-box"),
+            "目标机器的管理密码不该被导入改掉"
+        );
+        assert_eq!(target.get_setting(CLIENT_API_KEY).unwrap().as_deref(), Some("key-from-source"));
+    }
+
+    /// 导出的每一项都要能原样导回来：迁移文件就是「导出的响应原样喂给导入」，
+    /// 中间掉一个字段（曾经掉过 priority）就是操作者在新机器上发现配置不对，而且很难看出来。
+    #[test]
+    fn export_round_trips_every_field() {
+        let (src, _) = store_with(&["a"]);
+        let full = PortableCredential {
+            label: "full".into(),
+            tier: Some("pro".into()),
+            org_type: Some("claude_team".into()),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at: 1_800_000_000,
+            priority: 4,
+            disabled: true,
+            device_limit: 6,
+            rpm_limit: -1,
+            ban_reason: Some("banned upstream".into()),
+            account_uuid: Some("uuid".into()),
+            resume_at: Some(1_900_000_000),
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+        };
+        src.import_credential(&full).unwrap();
+        let exported = src.export_credentials().unwrap();
+        let out = exported.iter().find(|c| c.label == "full").expect("导出里该有它");
+
+        let (dst, _) = store_with(&[]);
+        dst.import_credential(out).unwrap();
+        let back = &dst.export_credentials().unwrap()[0];
+        assert_eq!(back.label, full.label);
+        assert_eq!(back.tier, full.tier);
+        assert_eq!(back.org_type, full.org_type);
+        assert_eq!(back.access_token, full.access_token);
+        assert_eq!(back.refresh_token, full.refresh_token);
+        assert_eq!(back.expires_at, full.expires_at);
+        assert_eq!(back.priority, full.priority);
+        assert_eq!(back.disabled, full.disabled);
+        assert_eq!(back.device_limit, full.device_limit);
+        assert_eq!(back.rpm_limit, full.rpm_limit);
+        assert_eq!(back.ban_reason, full.ban_reason);
+        assert_eq!(back.account_uuid, full.account_uuid);
+        assert_eq!(back.resume_at, full.resume_at);
+        // 代理串在读出来时会归一化（socks5 → socks5h），两侧同样处理过，故比的是归一化后的值。
+        assert_eq!(back.proxy, out.proxy);
+    }
+
     /// 裸请求速率上限：单号发满后自动分流到下一个号，全部发满才 429（[`BareRateLimited`]）。
     /// 带 device_id 的请求不受此限——那条路由设备绑定 + `device_limit` 管着。
     #[test]
@@ -4052,6 +4455,42 @@ mod tests {
             }
         }
         assert_eq!(store.take_device_rpm_slot("dev-1"), None, "过期后名额应回收");
+    }
+
+    /// 每会话 RPM：各会话各算各的，与设备那道闸**互不干扰**（同一台设备上两个会话各有自己的
+    /// 窗口，这正是选会话粒度的目的）；窗口滚过去后名额自己回来，未配置上限时一条都不记。
+    #[test]
+    fn session_rpm_limit_is_per_session_and_independent_of_device() {
+        let (store, _) = store_with(&["a"]);
+
+        for _ in 0..5 {
+            assert_eq!(store.take_session_rpm_slot("sess-1"), None, "未配置上限就是不限");
+        }
+        assert!(store.session_rate.hits.lock().is_empty(), "不限时不该记账");
+
+        store.set_setting(SESSION_RPM_LIMIT, "2").unwrap();
+        assert_eq!(store.take_session_rpm_slot("sess-1"), None);
+        assert_eq!(store.take_session_rpm_slot("sess-1"), None);
+        let retry = store.take_session_rpm_slot("sess-1").expect("第三条该被拒");
+        assert!(
+            (1..=RPM_WINDOW_SECS).contains(&retry),
+            "retry-after 要落在窗口内且不为 0：{retry}"
+        );
+
+        // 同机的另一个会话有自己的桶——按设备一刀切时它会被上面那个挤没。
+        assert_eq!(store.take_session_rpm_slot("sess-2"), None, "别的会话照常");
+
+        // 两个窗口是两份计数：会话打满不该顺带把设备的桶也算上（反之同理）。
+        store.set_setting(DEVICE_RPM_LIMIT, "1").unwrap();
+        assert_eq!(store.take_device_rpm_slot("dev-1"), None, "设备的桶此刻还是空的");
+
+        {
+            let mut hits = store.session_rate.hits.lock();
+            for t in hits.get_mut("sess-1").expect("sess-1 该有窗口").iter_mut() {
+                *t -= Duration::from_secs(RPM_WINDOW_SECS as u64 + 1);
+            }
+        }
+        assert_eq!(store.take_session_rpm_slot("sess-1"), None, "过期后名额应回收");
     }
 
     /// 设备窗口表的清扫：device_id 是客户端自报的，乱编 id 能把 map 撑大；超过阈值时清掉

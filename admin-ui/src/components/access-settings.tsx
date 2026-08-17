@@ -29,6 +29,7 @@ import {
   setDeviceTtl,
   setMinClientVersion,
   setRequireDeviceId,
+  setSessionRpmLimit,
   type Settings,
 } from '@/api/settings'
 import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
@@ -444,12 +445,13 @@ export function DeviceSettingsContent() {
         icon={TimerIcon}
         title={t('转发速率', 'Request rate')}
         description={t(
-          '限制单个账号、以及单台设备每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。',
-          'Cap how many requests a single account — and a single device — forwards per minute; the same window as the RPM column in the account list.',
+          '限制单个账号、单台设备、单个会话每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。三档由粗到细，各算各的。',
+          'Cap how many requests a single account, device, or session forwards per minute; the same window as the RPM column in the account list. Three levels, coarse to fine, counted independently.',
         )}
       >
         <DefaultRpmLimit />
         <DeviceRpmLimit />
+        <SessionRpmLimit />
       </SettingsGroup>
 
       <SettingsGroup
@@ -507,7 +509,7 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
           `${settings.bare_rate_limit.toLocaleString(locale)} / ${formatDuration(settings.bare_rate_window_secs, language)}`,
         )
       : t('允许 · 不限速', 'Allowed · unlimited')
-  // 两道 RPM 闸各写各的，都没配才是一句「不限」；只配一边时只显示配了的那边。
+  // 三道 RPM 闸各写各的，都没配才是一句「不限」；只配一部分时只显示配了的那些。
   const rpmParts = [
     settings.default_rpm_limit > 0
       ? t(
@@ -519,6 +521,12 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
       ? t(
           `设备 ${settings.device_rpm_limit.toLocaleString(locale)}`,
           `${settings.device_rpm_limit.toLocaleString(locale)}/device`,
+        )
+      : null,
+    settings.session_rpm_limit > 0
+      ? t(
+          `会话 ${settings.session_rpm_limit.toLocaleString(locale)}`,
+          `${settings.session_rpm_limit.toLocaleString(locale)}/session`,
         )
       : null,
   ].filter(Boolean)
@@ -1078,6 +1086,114 @@ function DeviceRpmLimit() {
             <NumberFieldDecrement aria-label={t('减少设备 RPM 上限', 'Decrease per-device RPM limit')} />
             <NumberFieldInput aria-label={t('设备 RPM 上限', 'Per-device RPM limit')} />
             <NumberFieldIncrement aria-label={t('增加设备 RPM 上限', 'Increase per-device RPM limit')} />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 每会话 RPM 上限：单个会话最近 60 秒最多转发多少条，超了直接 429，不换号。
+ *
+ * 与设备那道是同一件事的两个粒度：一台机器上开三个 CC 窗口，真实并发是三份对话的并发，
+ * 按设备一刀切会让它们互相挤额度。但会话 id 轮换是免费的（/clear、新窗口、重启都换一个），
+ * 所以它替代不了设备闸——两道一起配，会话给贴合单个对话节奏的值，设备给它的几倍兜总量。
+ */
+function SessionRpmLimit() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.session_rpm_limit)
+  }, [data?.session_rpm_limit])
+
+  const save = useMutation({
+    mutationFn: (limit: number) => setSessionRpmLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('会话 RPM 上限已更新', 'Per-session RPM limit updated'),
+        description: settings.session_rpm_limit > 0
+          ? t(
+              `每个会话每分钟最多转发 ${settings.session_rpm_limit} 条请求。`,
+              `Each session forwards at most ${settings.session_rpm_limit} requests per minute.`,
+            )
+          : t('会话 RPM 上限已取消。', 'The per-session RPM limit has been removed.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.session_rpm_limit ?? 0
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+  const deviceLimit = data?.device_rpm_limit ?? 0
+  // 两种配错法各提示一句，都不代为改数字：改与不改是运维的判断，替他改比让他看见更糟。
+  // 1) 设备闸没配：客户端换个会话 id 就是满血的新桶，这道闸等于没有护栏。
+  const noDeviceBackstop = parsed > 0 && deviceLimit === 0
+  // 2) 设备上限不比会话大：设备的桶总是先满，会话这道永远轮不到判定，等于白配。
+  const shadowedByDevice = parsed > 0 && deviceLimit > 0 && deviceLimit <= parsed
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('会话 RPM 上限', 'Per-session RPM limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '单个会话每分钟最多转发多少条，超了直接 429 并给出 retry-after。比设备那道细一层：同一台机器上的多个会话各有自己的额度，不再互相挤。0 表示不限。',
+            'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. One level finer than the per-device gate: concurrent sessions on the same machine no longer share one budget. 0 means unlimited.',
+          )}
+        </FieldDescription>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" size="sm">
+            {parsed > 0
+              ? t(`每个会话每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per session`)
+              : t('不限', 'Unlimited')}
+          </Badge>
+          {noDeviceBackstop && (
+            <Badge variant="warning" size="sm">
+              {t('换个会话 id 即绕开，建议同时配设备上限', 'Bypassed by a new session id — set a per-device limit too')}
+            </Badge>
+          )}
+          {shadowedByDevice && (
+            <Badge variant="warning" size="sm">
+              {t(
+                `设备上限 ${deviceLimit} 更先触发，这道闸不会生效`,
+                `The per-device limit of ${deviceLimit} always trips first — this gate never fires`,
+              )}
+            </Badge>
+          )}
+        </div>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少会话 RPM 上限', 'Decrease per-session RPM limit')} />
+            <NumberFieldInput aria-label={t('会话 RPM 上限', 'Per-session RPM limit')} />
+            <NumberFieldIncrement aria-label={t('增加会话 RPM 上限', 'Increase per-session RPM limit')} />
           </NumberFieldGroup>
         </NumberField>
         <Button

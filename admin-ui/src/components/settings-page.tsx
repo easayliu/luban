@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import {
   ArrowLeftIcon,
+  ArrowRightLeftIcon,
   CableIcon,
   LockKeyholeIcon,
   SlidersHorizontalIcon,
@@ -13,6 +14,7 @@ import {
 } from '@/components/access-settings'
 import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
+import { MigrationSettingsContent } from '@/components/migration-settings'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
@@ -28,7 +30,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 
-export type SettingsSection = 'access' | 'devices' | 'forwarding' | 'security'
+export type SettingsSection = 'access' | 'devices' | 'forwarding' | 'security' | 'migration'
 
 export function SettingsPage({
   section,
@@ -70,6 +72,16 @@ export function SettingsPage({
       ),
       navDescription: t('兼容、缓存与错误恢复', 'Compatibility, caching, and recovery'),
       icon: SlidersHorizontalIcon,
+    },
+    {
+      key: 'migration',
+      label: t('迁移', 'Migration'),
+      description: t(
+        '导出这台机器的账号与设置，或导入另一台导出的文件。',
+        'Export this machine\u2019s accounts and settings, or import a file exported from another one.',
+      ),
+      navDescription: t('导出与导入账号', 'Export and import accounts'),
+      icon: ArrowRightLeftIcon,
     },
     {
       key: 'security',
@@ -237,6 +249,9 @@ export function SettingsPage({
               </TabsPanel>
               <TabsPanel className="min-w-0" value="forwarding">
                 {section === 'forwarding' && <ForwardingSettingsContent />}
+              </TabsPanel>
+              <TabsPanel className="min-w-0" value="migration">
+                {section === 'migration' && <MigrationSettingsContent />}
               </TabsPanel>
               <TabsPanel className="min-w-0" value="security">
                 {section === 'security' && <SecuritySettingsContent />}

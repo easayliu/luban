@@ -640,9 +640,11 @@ queryClient.setQueryData(['settings'], {
   device_binding_ttl_secs: 86400,
   device_binding_retention_secs: 604800,
   default_device_limit: 3,
-  // 两道 RPM 闸都给上值、版本闸也写满：概览那行最挤的就是这个组合，预览要照着最挤的看。
+  // 三道 RPM 闸都给上值、版本闸也写满：概览那行最挤的就是这个组合，预览要照着最挤的看。
+  // 设备取会话的 3 倍，即两道闸配对了的样子（设备兜总量，会话贴单个对话的节奏）。
   default_rpm_limit: 40,
-  device_rpm_limit: 10,
+  device_rpm_limit: 180,
+  session_rpm_limit: 60,
   min_client_version: '2.1.100',
   require_device_id: true,
   bare_rate_limit: 0,
