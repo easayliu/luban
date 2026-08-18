@@ -693,6 +693,52 @@ pub async fn handle(
                 };
             }
 
+            // 429 且**一个限流头都没带**：这不是额度拒绝。上游的额度 429 必定带着
+            // `anthropic-ratelimit-unified-*` 那一整套（见 [`rate_limit_scope`] 里两份实测
+            // 样本），一条都没有的 429 来自更外层——网关/边缘的节流，或容量拒绝。
+            //
+            // 这一档在 [`rate_limit_scope`] 里只能落到 [`LimitScope::Transient`]（没有窗口
+            // 可看），而 429 又不在上面那段 4xx 错误体日志的覆盖范围内（那里只收 400/401/403），
+            // 于是服务端侧除了「撞了一发 429」之外**什么都不知道**——到底是速率限制还是容量
+            // 拒绝，只写在响应体里。故这一档单独把错误文本打出来。
+            //
+            // 只在限流头全缺时打：正常的额度 429 头里已写明是哪个窗口满的、什么时候重置，
+            // 上面那条 `upstream 429` 的 `ratelimit=` 已经带着全文，再刷一行没有意义。
+            // 压缩体跳过，理由同上面那段：打出来只会是乱码字节。
+            if status == StatusCode::TOO_MANY_REQUESTS
+                && !compressed
+                && rl.ratelimit.no_limit_headers()
+            {
+                let builder = resp_builder(&up);
+                return match up.bytes().await {
+                    Ok(bytes) => {
+                        rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+                        let (etype, message) = parse_upstream_error(&bytes);
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            model = %req_model.as_deref().unwrap_or("-"),
+                            error_type = %etype.as_deref().unwrap_or("-"),
+                            message = %message.chars().take(500).collect::<String>(),
+                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is what the body says"
+                        );
+                        // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
+                        let bytes = match &tool_names {
+                            Some(map) => Bytes::from(map.restore(&bytes)),
+                            None => bytes,
+                        };
+                        builder.body(Body::from(bytes)).unwrap_or_else(|e| {
+                            error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to read the upstream 429 body");
+                        builder.body(Body::empty()).unwrap_or_else(|e| {
+                            error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                        })
+                    }
+                };
+            }
+
             relay_upstream(up, rl, upgrade_stream, tool_names).await
         }
         Err(e) => {
@@ -4555,6 +4601,21 @@ impl RateLimitInfo {
         info
     }
 
+    /// 这发响应**一个限流头都没带**：`anthropic-ratelimit-*` 与 `retry-after` 全缺。
+    ///
+    /// 不能拿 [`Self::raw`] 是否为空当判据——`raw` 连 `anthropic-organization-id`、
+    /// `anthropic-workspace-id` 这类与限流无关的头也一并收着（见 [`Self::from_headers`]
+    /// 的过滤条件里那条 `starts_with("anthropic-")`）。实测的裸 429 里就只有这两条，
+    /// `raw` 非空而限流信息为零。
+    fn no_limit_headers(&self) -> bool {
+        self.unified_status.is_none()
+            && self.unified_reset.is_none()
+            && self.retry_after.is_none()
+            && self.window_status.is_empty()
+            && self.window_utilization.is_empty()
+            && self.window_reset.is_empty()
+    }
+
     /// 该凭证被上游 429 之后应冷却多久。
     ///
     /// **冷却时长一律由上游给的重置时刻算出，没有任何写死的窗口长度**——「5h 窗口」指的是
@@ -8108,6 +8169,47 @@ mod tests {
         let scope = super::rate_limit_scope(&exhausted, fable);
         assert!(scope.account_level() && scope.worth_swapping());
         assert_eq!(exhausted.cooldown_for(&scope).as_secs(), 3600);
+    }
+
+    /// 「限流头一条都没带」的判据不能靠 [`RateLimitInfo::raw`] 是否为空——线上那发裸 429
+    /// 的 `raw` 里躺着 `anthropic-organization-id` 与 `anthropic-workspace-id`（收头的过滤
+    /// 条件包含整个 `anthropic-` 前缀），非空却没有半点限流信息。这一列决定 429 要不要额外
+    /// 把响应体打出来，判错就是「该打的不打／不该打的每条都打」。
+    #[test]
+    fn no_limit_headers_ignores_the_non_ratelimit_anthropic_headers() {
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+
+        // 线上实测那发裸 429 的全部头：raw 非空，限流信息为零。
+        let bare = hdr(&[
+            ("anthropic-organization-id", "ca437ff6-03e7-44ac-849d-ba809e024327"),
+            ("anthropic-workspace-id", "wrkspc_01FgbHGSko1X9SYxLsdgnV11"),
+        ]);
+        assert!(!bare.raw.is_empty(), "org/workspace id 确实会被收进 raw");
+        assert!(bare.no_limit_headers(), "但它们不是限流头");
+        assert!(hdr(&[]).no_limit_headers(), "什么头都没有当然算");
+
+        // 任意一条限流信息在场就不算：逐项都要挡住，漏掉哪一项就会在正常额度 429 上多打日志。
+        for one in [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", "1755480000"),
+            ("retry-after", "30"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+            ("anthropic-ratelimit-unified-5h-reset", "1755480000"),
+            // 没有专用列的窗口同样要认出来，理由同 [`rate_limit_scope`] 里的第 2 条教训。
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+        ] {
+            assert!(!hdr(&[one]).no_limit_headers(), "{} 是限流头", one.0);
+        }
     }
 
     /// 落库展示用的全窗口快照：三张分开收集的表（status / utilization / reset）要按窗口名
