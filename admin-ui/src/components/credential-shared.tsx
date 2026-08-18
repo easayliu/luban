@@ -146,10 +146,18 @@ export interface CredentialEvaluation {
   quotaRisk: boolean
   needsAttention: boolean
   /**
-   * 是否有**模型级**冷却在生效。与 `schedulable` 刻意分开：这一档只挡住那几个模型，
-   * 账号整体照常参与调度，把它算进「不可调度」会把一个还在正常服务的号显示成停摆。
+   * 是否有**挡着选号**的模型级冷却在生效（额度池满那档）。与 `schedulable` 刻意分开：
+   * 这一档只挡住那几个模型，账号整体照常参与调度，把它算进「不可调度」会把一个还在正常
+   * 服务的号显示成停摆。
    */
   modelCooling: boolean
+  /**
+   * 是否有模型**刚被上游限速**（容量/请求速率那档）。它**不挡选号**——那种 429 不是这个号
+   * 的问题，挡住只会把限速从一个号扩散到整池，见后端的 `mark_rate_limited_soft`。
+   * 所以它和 `modelCooling` 分成两项：一个是「这个模型现在不参与选号」，一个只是「刚撞过
+   * 一发，仍在服务」，混成一项就没法在界面上如实说了。
+   */
+  modelThrottled: boolean
 }
 
 const currentUnixSeconds = () => Math.floor(Date.now() / 1000)
@@ -397,7 +405,9 @@ export function evaluateCredential(
   )
   // 只看账号级冷却：模型级那档挡的是「这个号的某几个模型」，账号本身照常在调度池里。
   const schedulable = !cred.disabled && !cred.ban_reason && cred.rate_limited_secs <= 0
-  const modelCooling = (cred.rate_limited_models?.length ?? 0) > 0
+  const models = cred.rate_limited_models ?? []
+  const modelCooling = models.some((m) => m.gated)
+  const modelThrottled = models.some((m) => !m.gated)
   return {
     credential: cred,
     quota,
@@ -407,12 +417,23 @@ export function evaluateCredential(
     quotaRisk,
     needsAttention: status.attention,
     modelCooling,
+    modelThrottled,
   }
 }
 
-/** 把模型级冷却写成一句人话，如「fable-5 还有 5 分钟」。剩余不足一分钟时按秒说。 */
-export function modelCooldownSummary(cred: Credential, language: Language): string {
+/**
+ * 把模型级冷却写成一句人话，如「fable-5 还有 5 分钟」。剩余不足一分钟时按秒说。
+ *
+ * `gated` 决定取哪一档：`true` 是真被挡在选号之外的，`false` 是只被限速过、仍在服务的。
+ * 两档的措辞完全不同，故由调用方指定，不在这里混着输出。
+ */
+export function modelCooldownSummary(
+  cred: Credential,
+  language: Language,
+  gated = true,
+): string {
   return (cred.rate_limited_models ?? [])
+    .filter((m) => m.gated === gated)
     .map(({ model, secs }) =>
       secs >= 60
         ? localize(
@@ -518,15 +539,40 @@ export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
   created: 'desc',
 }
 
-/** 套餐档位 → 序号（越大越高档）。按容量排而非字母序，`max_20x` 才会排在 `pro` 前面。 */
-function tierRank(tier: string | null): number {
+/**
+ * 上游给的套餐字符串 → 归一化的档位键。**排序、配色、筛选三处共用这一个判定**。
+ *
+ * 原本排序和配色各写了一份 `includes` 链，两份都得记住「`20x` 要在 `5x` 之前、`5x` 要在
+ * `max` 之前」——同一个账号在两处判成不同档位是迟早的事（`Max 20x` 里同时含 `20x` 与
+ * `max`，任一处顺序写反就分叉）。再加上筛选就是第三份，故收成一处。
+ *
+ * 取值是**子串匹配**而非全等：上游的写法不统一（`max_20x`/`Max 20x`/`claude_max` 都见过），
+ * 见 [`crate::oauth::tier_from_rate_limit`]。认不出来的非空值与 `null` 一并归 `unknown`。
+ */
+export type PlanKey = 'max20x' | 'max5x' | 'max' | 'pro' | 'free' | 'unknown'
+
+export function planKey(tier: string | null): PlanKey {
   const t = (tier ?? '').toLowerCase()
-  if (t.includes('20x')) return 5
-  if (t.includes('5x')) return 4
-  if (t.includes('max')) return 3
-  if (t.includes('pro')) return 2
-  if (t.includes('free')) return 1
-  return 0
+  if (t.includes('20x')) return 'max20x'
+  if (t.includes('5x')) return 'max5x'
+  if (t.includes('max')) return 'max'
+  if (t.includes('pro')) return 'pro'
+  if (t.includes('free')) return 'free'
+  return 'unknown'
+}
+
+/** 档位序号（越大越高档）。按容量排而非字母序，`max_20x` 才会排在 `pro` 前面。 */
+const PLAN_RANK: Record<PlanKey, number> = {
+  max20x: 5,
+  max5x: 4,
+  max: 3,
+  pro: 2,
+  free: 1,
+  unknown: 0,
+}
+
+function tierRank(tier: string | null): number {
+  return PLAN_RANK[planKey(tier)]
 }
 
 /** 单维度排序值；额度与状态使用同一时钟快照，避免跨过 reset 后卡片和排序口径分叉。 */
@@ -1212,11 +1258,26 @@ export function deviceUsageMeta(
   return tight ? { level: 'warning', variant: 'warning' } : { level: 'ok', variant: 'success' }
 }
 
+/**
+ * 套餐档位 → 徽标配色。**档位高低要能一眼看出来**，故走一条色相由冷到暖的梯子：
+ * 灰（Free/未知）→ 蓝（Pro）→ 紫（Max / Max 5x）→ 洋红（Max 20x）。
+ *
+ * 不用绿/琥珀/红：这三色在本界面已被状态占满（健康 / 用量风险 / 故障封禁），套餐借过去就会
+ * 和同一张卡片上的状态徽标撞含义。蓝（`info`）原本给整个 Max 系列用，现在下放给 Pro——
+ * 「Pro 是蓝的」是业界通行写法，而 Max 系列腾到紫族才排得出高低，见 [`PLAN_RANK`]。
+ * 紫族两档是本文件专用的 `--plan` / `--plan-high`（定义在 index.css），不参与状态语义。
+ */
+const PLAN_BADGE: Record<PlanKey, BadgeProps['variant']> = {
+  max20x: 'planHigh',
+  max5x: 'plan',
+  max: 'plan',
+  pro: 'info',
+  free: 'outline',
+  unknown: 'outline',
+}
+
 export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
-  const t = tier.toLowerCase()
-  if (t.includes('20x') || t.includes('5x') || t.includes('max')) return 'info'
-  if (t.includes('pro')) return 'secondary'
-  return 'outline'
+  return PLAN_BADGE[planKey(tier)]
 }
 
 /** 凭证综合状态；access_token 到期不参与判色，因为下次调度会自动刷新。 */

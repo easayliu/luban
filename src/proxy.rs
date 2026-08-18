@@ -441,7 +441,7 @@ pub async fn handle(
         // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
         // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
         let sent = upstream.shape(&body, &cred, &device_fp);
-        let resp = upstream.send(sent.clone()).await;
+        let mut resp = upstream.send(sent.clone()).await;
 
         // 只认「上游明确回 429」这一种：连不上/超时那类换个号一样连不上，重试只是浪费时间。
         let limited = match &resp {
@@ -454,7 +454,21 @@ pub async fn handle(
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
         let scope = rate_limit_scope(&info, req_model.as_deref());
-        let cooldown = info.cooldown_for(&scope);
+        let mut cooldown = info.cooldown_for(&scope);
+        // 瞬时限流那档的等待时长**逐次翻倍**，见 [`next_transient_backoff`]：这一档不换号、
+        // 也不把号挪出调度池，客户端拿到的就是一发 429，那么「下次什么时候再来」就是我们唯一
+        // 还能影响拥堵的东西。取两者较大值——上游给的 `retry-after` 是下限，连撞出来的退避
+        // 只会把它往长了推，不会缩短。总开关关掉时（`max_retry == 0`）不参与：那条路要的是
+        // 完全不干预、原样透传。
+        // 连撞到 [`TRANSIENT_MAX_ATTEMPTS`] 就不再当它是一阵拥堵，见下面 park 那一步。
+        let mut transient_exhausted = false;
+        if max_retry > 0
+            && let LimitScope::Transient(model) = &scope
+        {
+            let (wait, attempts) = next_transient_backoff(&state.transient_backoff, cred.id, model);
+            cooldown = cooldown.max(wait);
+            transient_exhausted = attempts >= TRANSIENT_MAX_ATTEMPTS;
+        }
         tracing::warn!(
             cred_id = cred.id, cred = %cred.label,
             model = %req_model.as_deref().unwrap_or("-"),
@@ -468,18 +482,39 @@ pub async fn handle(
         if max_retry == 0 {
             break (upstream, resp, sent);
         }
-        park_rate_limited(&state.store, &cred, &scope, cooldown);
+        park_rate_limited(&state.store, &cred, &scope, cooldown, transient_exhausted);
         // 谁的额度都没满（容量/请求速率限制）→ **就此打住，不换号**：这一发 429 不是这个号的
         // 问题，换到下一个号上重发只会撞同一堵墙，并把同一个模型的冷却一路盖到整池——一条客户端
         // 请求最多能盖 max_retry+1 个号，客户端再自己重试几轮，全部账号的卡片上就都挂着这个模型
         // 的冷却，而冷却是选号硬门禁，于是新请求一条都进不来（返回 `AllRateLimited`）。
-        // 交回 429 + `retry-after`，让客户端按上游给的节奏退避才是这一档的正解。
+        // 交回 429 + `retry-after` 让客户端退避才是这一档的正解，且那个秒数由我们**按连撞次数
+        // 指数放大**后写回去——见下面那段与 [`next_transient_backoff`]。
         if !scope.worth_swapping() {
+            // 把退避时长写进 `retry-after` 再交回客户端。**覆盖上游那份而不是只在缺失时补**：
+            // 这一档上游给的 `retry-after` 本来就不可信（实测给过 63 小时，是按额度窗口算的，
+            // 与「此刻拥堵」无关），[`RateLimitInfo::transient_cooldown`] 早就在夹它了；这里
+            // 写回去的值已经把上游那份算进去过（取的较大值），故直接覆盖才是自洽的。
+            //
+            // 没有这一步，前面算出来的退避只活在我们自己的日志里——客户端看不见，照样秒重试。
+            if let Ok(up) = &mut resp {
+                up.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(cooldown.as_secs()));
+            }
+            // 吞够了单独记一行：这一发和前面那些「只记不挡」不是一回事，后续请求从这一刻起
+            // 会绕开这个号，日志上得看得出转折点在哪。
+            if transient_exhausted {
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    model = %req_model.as_deref().unwrap_or("-"),
+                    attempts = TRANSIENT_MAX_ATTEMPTS,
+                    cooldown_secs = cooldown.as_secs(),
+                    "transient 429s in a row on this credential+model even after the backoff maxed out: taking this model out of the pool for a cooldown so later requests go elsewhere"
+                );
+            }
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 model = %req_model.as_deref().unwrap_or("-"),
-                cooldown_secs = cooldown.as_secs(),
-                "upstream 429 is not account-specific (no quota window is full): passing it through instead of swapping credentials"
+                retry_after_secs = cooldown.as_secs(),
+                "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
             );
             break (upstream, resp, sent);
         }
@@ -617,7 +652,10 @@ pub async fn handle(
                                 cred_id = cred.id, cred = %cred.label,
                                 status = status.as_u16(),
                                 error_type = %etype.as_deref().unwrap_or("-"),
-                                message = %message.chars().take(500).collect::<String>(),
+                                // 字段名不能叫 `message`——那是 tracing 的保留字段，`fmt` 层
+                                // 把它当事件正文渲染（不带键名），上游那句话会被拼在行尾，
+                                // 看着像日志文本的一部分而不是一个字段，既读不出边界也没法按键过滤。
+                                upstream_message = %message.chars().take(500).collect::<String>(),
                                 "upstream returned 4xx"
                             );
                         }
@@ -718,7 +756,8 @@ pub async fn handle(
                             cred_id = cred.id, cred = %cred.label,
                             model = %req_model.as_deref().unwrap_or("-"),
                             error_type = %etype.as_deref().unwrap_or("-"),
-                            message = %message.chars().take(500).collect::<String>(),
+                            // 字段名同上，不能叫 `message`。
+                            upstream_message = %message.chars().take(500).collect::<String>(),
                             "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is what the body says"
                         );
                         // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
@@ -3056,6 +3095,93 @@ fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u64> {
     }
 }
 
+/// 同一条「账号 + 模型」路线上连撞瞬时限流的记录：(连撞次数, 上次命中时刻)。
+type TransientStreaks = std::collections::HashMap<(i64, String), (u32, std::time::Instant)>;
+
+/// [`TransientStreaks`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
+///
+/// 只在进程内活着：连撞的是「此刻这一阵拥堵」，重启后从头数起本来就是对的。
+pub type TransientBackoff = std::sync::Arc<parking_lot::Mutex<TransientStreaks>>;
+
+/// 瞬时限流退避的**首次**等待秒数。之后逐次翻倍，封顶 [`MAX_TRANSIENT_COOLDOWN_SECS`]。
+///
+/// 起点取 2 秒而不是 1 秒：1 秒的退避对一个正在拥堵的上游几乎等于不退，第一发就该给客户端
+/// 一个真的能让出口喘口气的间隔；而 2 秒对偶发的单次限流也不算长。
+const TRANSIENT_BACKOFF_BASE_SECS: u64 = 2;
+
+/// 多久没再撞就把连撞计数清零。
+///
+/// 取封顶值的两倍：走到封顶时我们让客户端等 60 秒，那么「等满了、回来了、再撞」属于同一串
+/// 拥堵，不该清零；而两倍于此都没再来过，说明上一阵已经过去，下次该从 2 秒重新数起——不然
+/// 计数只增不减，几小时后偶发一次限流也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
+const TRANSIENT_BACKOFF_RESET: std::time::Duration =
+    std::time::Duration::from_secs(2 * MAX_TRANSIENT_COOLDOWN_SECS as u64);
+
+/// 退避表最多留多少格。键是 `(账号, 模型)`，模型名来自来访请求体，故与拒绝日志同样需要清扫。
+const TRANSIENT_BACKOFF_MAX_KEYS: usize = 4096;
+
+/// 同一条「账号 + 模型」路线上最多连吞几发瞬时 429，超过就不再当它是「一阵拥堵」。
+///
+/// 取 6：正好是退避涨到封顶的那一发（2→4→8→16→32→60）。**退避都涨到头了还在撞**，说明这
+/// 不是一阵拥堵，而是这条路线此刻真的走不通——再无限吞下去，客户端就只是一直吃 429，而我们
+/// 手里明明还有别的号没试过。到点即把这一格挪出调度池（见 [`park_rate_limited`]），
+/// 让**后续**请求改走别的号；连撞计数同时清零，冷却过后重新从 2 秒数起。
+const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
+
+/// 这条「账号 + 模型」路线该让客户端等多久再来——**连撞一次翻一倍**，封顶
+/// [`MAX_TRANSIENT_COOLDOWN_SECS`]，静默 [`TRANSIENT_BACKOFF_RESET`] 后清零。
+///
+/// **为什么必须是指数而不是一个固定值**：瞬时限流那档我们已经不换号、也不再把号挪出调度池
+/// （见 [`park_rate_limited`]），交回客户端的就是一发 429。若每次都告诉它「30 秒后再来」，
+/// 一个正在拥堵的出口面对的就是一群按固定节拍同时回来的客户端——退避的意义正在于**让重试
+/// 的密度随失败次数下降**，固定值做不到这一点，秒级重试更是直接把拥堵喂大。指数退避让第一次
+/// 偶发限流几乎无感（2 秒），而真的撞上一堵墙时迅速拉到分钟级。
+///
+/// 返回 `(该等多久, 这是连撞的第几发)`。第二项到达 [`TRANSIENT_MAX_ATTEMPTS`] 即为「吞够了」，
+/// 此时计数就地清零——那一发之后这个号的这个模型会被挪出调度池，冷却过去再撞属于新的一串。
+///
+/// 调用一次即计一次，故只能在**确认要把这发 429 交回客户端**的那条路径上调用。
+fn next_transient_backoff(
+    state: &TransientBackoff,
+    cred_id: i64,
+    model: &str,
+) -> (std::time::Duration, u32) {
+    next_transient_backoff_at(state, cred_id, model, std::time::Instant::now())
+}
+
+/// 同 [`next_transient_backoff`]，但由调用方给出「现在」——清零那条路要等两分钟才走得到，
+/// 拿真实时钟测等于不测。
+fn next_transient_backoff_at(
+    state: &TransientBackoff,
+    cred_id: i64,
+    model: &str,
+    now: std::time::Instant,
+) -> (std::time::Duration, u32) {
+    let mut map = state.lock();
+    if map.len() > TRANSIENT_BACKOFF_MAX_KEYS {
+        map.retain(|_, (_, at)| now.duration_since(*at) < TRANSIENT_BACKOFF_RESET);
+    }
+    let slot = map.entry((cred_id, model.to_string())).or_insert((0, now));
+    // 上一发已经隔得够久 → 这是新的一串，从头数起。
+    if now.duration_since(slot.1) >= TRANSIENT_BACKOFF_RESET {
+        slot.0 = 0;
+    }
+    slot.0 = slot.0.saturating_add(1);
+    slot.1 = now;
+    let attempts = slot.0;
+    // 吞够了：这一发之后该号的该模型要被挪出调度池，计数就地清零，冷却过后重新从头数起。
+    // 不清的话冷却一到期，第一发就又被判成「连撞第 7 次」，这个号再没有机会证明自己好了。
+    if attempts >= TRANSIENT_MAX_ATTEMPTS {
+        slot.0 = 0;
+    }
+    // 第 n 次连撞等 base * 2^(n-1)；移位次数先夹住，免得在 u64 上左移过界。
+    let shift = (attempts - 1).min(u32::BITS - 1);
+    let secs = TRANSIENT_BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_TRANSIENT_COOLDOWN_SECS as u64);
+    (std::time::Duration::from_secs(secs), attempts)
+}
+
 /// 记忆表的容量上限。每个「模型 + 字段 + 没见过的取值」占一格，而取值来自来访请求，
 /// 也就是说这张表的增长是外部可控的——封顶后不再插入（既有条目照常生效）。
 const SHAPE_MEMORY_CAP: usize = 512;
@@ -4264,8 +4390,11 @@ enum LimitScope {
     /// 与 [`Self::Model`] 分开的理由是「换号有没有意义」完全相反：额度池是**跟着账号走**的，
     /// 换个号确实可能还有余量；而容量/速率限制是**跟着模型或出口走**的，换号重发只会在下一个
     /// 号上撞同一发 429，并把同一个模型的冷却挨个盖满整池——线上症状就是「一个号被限流，所有
-    /// 号的卡片上都显示这个模型在冷却，新请求全被冷却硬门禁挡在门外」。故这一档只冷却撞上的
-    /// 那个号、**不换号重试**，429 连同 `retry-after` 原样交回客户端，让它按上游给的节奏退避。
+    /// 号的卡片上都显示这个模型在冷却，新请求全被冷却硬门禁挡在门外」。
+    ///
+    /// 故这一档两条都不做：**不换号重试**（一条请求内不会走号），**冷却也不进选号门禁**
+    /// （跨请求也不会靠冷却把号一个个点掉，见 [`park_rate_limited`]）。429 连同 `retry-after`
+    /// 原样交回客户端，让它按上游给的节奏退避——上游要退避的是发请求这个动作本身，不是某个号。
     ///
     /// 冷却时长也另算，见 [`RateLimitInfo::transient_cooldown`]：这是几秒到几十秒的事，
     /// 拿额度那套（可以睡满几十小时）去算它，等于因为一次瞬时拥堵把号锁掉半天。
@@ -4361,16 +4490,22 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
 ///   到几天，只记内存的话一次进程重启就忘了，重启后又拿这个号去撞一发 429；而且后台看不到
 ///   这个号为什么不干活。恢复有三条路：到点惰性自动恢复、连通性测试通过自动恢复、
 ///   控制台手动打开。
-/// - **模型级/瞬时级**（超额池满、或容量与速率限制，账号本身好着）：仍走进程内的
-///   [`store::CredentialStore::mark_rate_limited`]。这一档默认才 30 秒，落库既不值得、也会
-///   在卡片上把一个健康账号显示成「已停用」——它的 sonnet/opus 明明还在正常服务。
-///   两者在这里的**落点相同**（都是 `(账号, 模型)` 那一格），差别在冷却时长与要不要换号重试，
-///   见 [`LimitScope::Transient`]。
+/// - **模型级**（超额池满，账号本身好着）：走进程内的
+///   [`store::CredentialStore::mark_rate_limited`]，挡住这个号的这一个模型。这一档默认才
+///   30 秒，落库既不值得、也会在卡片上把一个健康账号显示成「已停用」——它的 sonnet/opus
+///   明明还在正常服务。
+/// - **瞬时级**（容量与请求速率限制）：走
+///   [`store::CredentialStore::mark_rate_limited_soft`]，**只记不挡**。落点与上一档相同
+///   （都是 `(账号, 模型)` 那一格），但走的是另一条时间线，不参与选号，理由见下面那段注释与
+///   [`LimitScope::Transient`]。
 fn park_rate_limited(
     store: &store::CredentialStore,
     cred: &crate::credentials::Credential,
     scope: &LimitScope,
     cooldown: std::time::Duration,
+    // 瞬时限流已经在这条路线上连撞到 [`TRANSIENT_MAX_ATTEMPTS`]：这一发不再「只记不挡」，
+    // 照常挪出调度池，让后续请求改走别的号。
+    transient_exhausted: bool,
 ) {
     let Some(model) = scope.model() else {
         let resume_at = crate::credentials::now_secs() + cooldown.as_secs();
@@ -4396,6 +4531,22 @@ fn park_rate_limited(
         }
         return;
     };
+    // 瞬时限流（容量 / 请求速率）**不进选号门禁**，只留个展示用的标记。
+    //
+    // 这是那条线上问题的后半截。前半截（一条请求内换号重试把冷却盖满整池）在
+    // [`LimitScope::Transient`] 那里堵住了，但冷却本身是选号硬门禁，跨请求那条路还开着：
+    // 撞上的号被挡掉之后，设备会在下一条请求上改绑到另一个号，客户端每重试一次就点掉一个号，
+    // 转够一圈全池的这个模型都在冷却，新请求一条都进不来（返回 `AllRateLimited`）。
+    // 而这一档的 429 压根不是这个号的问题——上游限的是出口或那个模型，换谁上去都一样。
+    // 拿它挡调度，等于把上游对**一个出口**的限速翻译成对**整池账号**的封锁。
+    //
+    // 正解仍是把 429 连同 `retry-after` 交回客户端，让它按上游给的节奏退避（这一步在
+    // [`handle`] 里已经做了）。这个号照常留在池子里：客户端真立刻重试，最坏也只是同一个号
+    // 再回一发 429，不会牵连别人。
+    if matches!(scope, LimitScope::Transient(_)) && !transient_exhausted {
+        store.mark_rate_limited_soft(cred.id, Some(model), cooldown);
+        return;
+    }
     store.mark_rate_limited(cred.id, Some(model), cooldown);
 }
 
@@ -5164,7 +5315,9 @@ pub async fn probe(
                     ratelimit = %info.raw,
                     "connectivity test hit an upstream 429, taking the credential out of the pool"
                 );
-                park_rate_limited(&state.store, cred, &scope, cooldown);
+                // 连通性测试是人在网页上点出来的**单发**探活，不参与连撞计数：一次手动
+                // 探活撞上一阵拥堵，不该把这个号判成「这条路线走不通」。
+                park_rate_limited(&state.store, cred, &scope, cooldown, false);
             // 200 也可能是「就差最后一点额度」：阈值机制在这里先过一道（见
             // [`park_if_quota_nearly_exhausted`]）。它把号停下时整条恢复分支**都不走**
             // ——否则一次手动探活会把刚按阈值停掉的号放回池子，下一条真实请求再停一次。
@@ -8171,6 +8324,63 @@ mod tests {
         assert_eq!(exhausted.cooldown_for(&scope).as_secs(), 3600);
     }
 
+    /// 瞬时限流交回客户端的 `retry-after` 必须是**指数**退避，不是一个固定值。
+    ///
+    /// 这一档不换号、也不把号挪出调度池，客户端拿到的就是一发 429——那么「下次什么时候再来」
+    /// 就是我们唯一还能影响拥堵的东西。固定值做不到「重试密度随失败次数下降」：一群客户端会
+    /// 按同一个节拍同时回来，正在拥堵的出口该塌还是塌；秒级重试更是直接把拥堵喂大。
+    #[test]
+    fn transient_backoff_doubles_per_consecutive_hit_and_decays_when_quiet() {
+        let state = super::TransientBackoff::default();
+        let t0 = std::time::Instant::now();
+        let hit = |at: std::time::Instant| {
+            let (wait, attempts) = super::next_transient_backoff_at(&state, 1, "claude-opus-5", at);
+            (wait.as_secs(), attempts)
+        };
+
+        // 一串的完整形状：2 → 4 → 8 → 16 → 32 → 60，第 6 发即「吞够了」，之后重新从 2 数起。
+        // 封顶那一发就是上限本身：退避都涨到头还在撞，再吞下去只是让客户端一直吃 429。
+        let seen: Vec<(u64, u32)> =
+            (0..8).map(|i| hit(t0 + std::time::Duration::from_millis(i))).collect();
+        assert_eq!(
+            seen,
+            vec![(2, 1), (4, 2), (8, 3), (16, 4), (32, 5), (60, 6), (2, 1), (4, 2)],
+            "应逐次翻倍、在第 6 发到达上限，然后清零重来"
+        );
+        assert_eq!(
+            super::TRANSIENT_MAX_ATTEMPTS,
+            6,
+            "上限必须正好落在退避封顶那一发上，否则 60 秒那一档要么白等要么根本走不到"
+        );
+
+        // 别的账号、别的模型各算各的——一条路线拥堵不该让不相干的请求跟着等。
+        assert_eq!(
+            super::next_transient_backoff_at(&state, 2, "claude-opus-5", t0).0.as_secs(),
+            super::TRANSIENT_BACKOFF_BASE_SECS,
+            "另一个账号应从头数起"
+        );
+        assert_eq!(
+            super::next_transient_backoff_at(&state, 1, "claude-sonnet-5", t0).0.as_secs(),
+            super::TRANSIENT_BACKOFF_BASE_SECS,
+            "同一个账号的另一个模型也应从头数起"
+        );
+
+        // 静默够久 → 清零，从 2 秒重新数起。没有这条的话计数只增不减，几小时后偶发一次限流
+        // 也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
+        // 从**最后一发**（t0+7ms）算起要够久，不是从 t0 算起——重置看的是静默时长。
+        let later = t0 + super::TRANSIENT_BACKOFF_RESET + std::time::Duration::from_secs(1);
+        assert_eq!(
+            super::next_transient_backoff_at(&state, 1, "claude-opus-5", later).0.as_secs(),
+            super::TRANSIENT_BACKOFF_BASE_SECS,
+            "静默超过重置窗口后应回到起点"
+        );
+        // 刚清过零，紧接着再撞就是这一串的第二次。
+        assert_eq!(
+            super::next_transient_backoff_at(&state, 1, "claude-opus-5", later).0.as_secs(),
+            super::TRANSIENT_BACKOFF_BASE_SECS * 2,
+        );
+    }
+
     /// 「限流头一条都没带」的判据不能靠 [`RateLimitInfo::raw`] 是否为空——线上那发裸 429
     /// 的 `raw` 里躺着 `anthropic-organization-id` 与 `anthropic-workspace-id`（收头的过滤
     /// 条件包含整个 `anthropic-` 前缀），非空却没有半点限流信息。这一列决定 429 要不要额外
@@ -8308,7 +8518,7 @@ mod tests {
         ]);
         let scope = super::rate_limit_scope(&oi_full, fable);
         assert_eq!(scope.model(), fable, "超额池满只该判模型级");
-        super::park_rate_limited(&store, &cred, &scope, oi_full.cooldown(false));
+        super::park_rate_limited(&store, &cred, &scope, oi_full.cooldown(false), false);
 
         let after = store.get(cred.id).unwrap().unwrap();
         assert!(!after.disabled, "fable 撞 429 不该停用整个账号");
@@ -8330,7 +8540,7 @@ mod tests {
         ]);
         let scope = super::rate_limit_scope(&base_gone, fable);
         assert!(scope.account_level(), "基础窗口耗尽才是账号级");
-        super::park_rate_limited(&store, &cred, &scope, base_gone.cooldown(true));
+        super::park_rate_limited(&store, &cred, &scope, base_gone.cooldown(true), false);
 
         let after = store.get(cred.id).unwrap().unwrap();
         assert!(after.disabled, "额度真耗尽才关调度开关");
@@ -8338,6 +8548,38 @@ mod tests {
         let wait = resume_at as i64 - crate::credentials::now_secs() as i64;
         assert!((3595..=3600).contains(&wait), "恢复时刻应取上游给的等待时间，实得 {wait}");
         assert!(after.ban_reason.unwrap().contains("1h"), "停用原因该写清楚还要等多久");
+    }
+
+    /// 瞬时限流吞到上限之后必须**真的**把这条路线挪出调度池，否则「最多吞几次」等于没有上限。
+    ///
+    /// 两档行为差别只在最后那个参数上，故放在一个用例里对照：没吞够时只留展示标记、这个号照常
+    /// 参与选号；吞够了就走硬门禁，后续请求改走别的号。
+    #[test]
+    fn a_transient_rate_limit_only_leaves_the_pool_after_the_attempt_cap() {
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+        let scope = super::LimitScope::Transient("claude-opus-5".into());
+        let wait = std::time::Duration::from_secs(30);
+        let pick = |m| {
+            store.select_for_device(store::Select { model: Some(m), ..Default::default() }).is_ok()
+        };
+
+        // 没吞够：只记不挡——这一档的 429 不是这个号的问题，挡住它只会把限速扩散到整池。
+        super::park_rate_limited(&store, &cred, &scope, wait, false);
+        assert!(pick("claude-opus-5"), "还没到上限，这个号必须照常参与选号");
+        let models = store.rate_limited_models(cred.id);
+        assert_eq!(models.len(), 1, "但界面上要看得见");
+        assert!(!models[0].2, "这一档不挡选号，gated 应为 false");
+
+        // 吞够了：退避已经涨到头还在撞，说明这条路线此刻真的走不通，让后续请求改走别的号。
+        super::park_rate_limited(&store, &cred, &scope, wait, true);
+        assert!(!pick("claude-opus-5"), "到上限后这个模型必须被挡下");
+        assert!(pick("claude-sonnet-5"), "但只挡这一个模型，别的模型不该被牵连");
+        assert!(store.rate_limited_models(cred.id)[0].2, "此刻挂着门禁，gated 应为 true");
+
+        let after = store.get(cred.id).unwrap().unwrap();
+        assert!(!after.disabled, "这一档从头到尾都不该停用账号");
+        assert_eq!(after.ban_reason, None, "更不该在卡片上显示成这个号出了问题");
     }
 
     /// 额度到阈值（默认 90%）就提前停调度，不必等真撞上一发 429；而超额池逼近上限时**不停**

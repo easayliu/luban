@@ -15,11 +15,13 @@ import {
 } from '@/components/credential-shared'
 import {
   CREDENTIAL_FILTER_KEYS,
+  CREDENTIAL_TIER_FILTER_KEYS,
   CREDENTIAL_PAGE_SIZES,
   CREDENTIAL_VIEW_MODES,
   CredentialWorkspace,
   preferredInitialCredentialView,
   type CredentialFilterKey,
+  type CredentialTierFilterKey,
   type CredentialPageSize,
   type CredentialViewMode,
 } from '@/components/credential-workspace'
@@ -103,6 +105,13 @@ function App() {
     String,
     seed.get('filter'),
   )
+  const [tier, setTier] = usePersisted<CredentialTierFilterKey>(
+    'tier',
+    'all',
+    oneOf(CREDENTIAL_TIER_FILTER_KEYS),
+    String,
+    seed.get('tier'),
+  )
   const [query, setQuery] = usePersisted('query', '', (raw) => raw, String, seed.get('q'))
   // 页码只认链接，不进 localStorage：下次打开该从第一页看起。
   const initialPage = Number(seed.get('page'))
@@ -117,6 +126,7 @@ function App() {
     const params = new URLSearchParams()
     if (query.trim()) params.set('q', query.trim())
     if (filter !== 'all') params.set('filter', filter)
+    if (tier !== 'all') params.set('tier', tier)
     if (sort !== 'priority') params.set('sort', sort)
     if (dir !== SORT_DIR_DEFAULT[sort]) params.set('dir', dir)
     if (pageSize !== CREDENTIAL_PAGE_SIZES[0]) params.set('size', String(pageSize))
@@ -125,7 +135,7 @@ function App() {
     const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
     if (window.location.href.endsWith(`#/?${params.toString()}`)) return
     window.history.replaceState(null, '', next)
-  }, [query, filter, sort, dir, view, page, pageSize, settingsRoute])
+  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
@@ -308,6 +318,7 @@ function App() {
           state={{
             query,
             filter,
+            tier,
             sort,
             dir,
             view,
@@ -318,6 +329,7 @@ function App() {
           actions={{
             onQueryChange: setQuery,
             onFilterChange: setFilter,
+            onTierChange: setTier,
             onSortChange: (key, nextDir) => {
               setSort(key)
               setDir(nextDir)

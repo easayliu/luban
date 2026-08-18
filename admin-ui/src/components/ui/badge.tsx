@@ -30,6 +30,8 @@ export const badgeVariants = cva(
         info: "bg-info/8 text-info-foreground dark:bg-info/16",
         outline:
           "border-input bg-background text-foreground dark:bg-input/32 [button&,a&]:hover:bg-accent/50 dark:[button&,a&]:hover:bg-input/48",
+        plan: "bg-plan/8 text-plan-foreground dark:bg-plan/16",
+        planHigh: "bg-plan-high/8 text-plan-high-foreground dark:bg-plan-high/16",
         secondary:
           "bg-secondary text-secondary-foreground [button&,a&]:hover:bg-secondary/90",
         success: "bg-success/8 text-success-foreground dark:bg-success/16",

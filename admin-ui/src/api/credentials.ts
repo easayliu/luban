@@ -46,6 +46,12 @@ export interface Quota {
 export interface ModelCooldown {
   model: string
   secs: number
+  /**
+   * 这条冷却是否**挡着选号**。`true` 是额度池满那档，该模型确实不参与选号；`false` 是瞬时
+   * 限速（容量/请求速率）那档，只是个标记，该模型照常参与选号——措辞必须分开，否则会把一个
+   * 仍在服务的账号显示成停摆。
+   */
+  gated: boolean
 }
 
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */

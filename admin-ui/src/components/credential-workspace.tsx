@@ -3,6 +3,7 @@ import {
   ArrowUpDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  LayersIcon,
   LayoutGridIcon,
   ListFilterIcon,
   ListIcon,
@@ -26,8 +27,10 @@ import {
   SORTS,
   SORT_DIR_DEFAULT,
   evaluateCredential,
+  planKey,
   sortCreds,
   type CredentialEvaluation,
+  type PlanKey,
   type SortDir,
   type SortKey,
 } from '@/components/credential-shared'
@@ -77,6 +80,13 @@ export type CredentialFilterKey =
   | 'cooldown'
   | 'hasDevice'
   | 'deviceFull'
+
+/**
+ * 套餐筛选与上面那组状态筛选**是两个维度，各自独立**：一个说「这个号现在怎么样」，另一个说
+ * 「这个号是什么档位」。合进同一个单选列表的话，「Pro 里有哪些需要处理」这种最常问的问题就
+ * 提不出来——选了 Pro 就丢掉了状态条件。故单开一列，两个菜单同时生效（取交集）。
+ */
+export type CredentialTierFilterKey = 'all' | PlanKey
 
 export type CredentialViewMode = 'card' | 'list'
 
@@ -139,6 +149,21 @@ const FILTERS: {
   },
 ]
 
+/**
+ * 档位选项按**从高到低**排，与 [`tierRank`] 的口径一致——下拉里读到的顺序就是套餐的贵贱顺序，
+ * 不必再去对照徽标颜色。档位名是上游的商品名，中英文一样，故不做翻译。
+ */
+const TIER_FILTERS: { key: CredentialTierFilterKey; label: LocalizedLabel }[] = [
+  { key: 'all', label: ['全部套餐', 'All plans'] },
+  { key: 'max20x', label: ['Max 20x', 'Max 20x'] },
+  { key: 'max5x', label: ['Max 5x', 'Max 5x'] },
+  // 上游偶尔只给 `claude_max` 这种不带倍率的写法，单列一档收着，否则它会掉进「未知」里。
+  { key: 'max', label: ['Max（未标倍率）', 'Max (no multiplier)'] },
+  { key: 'pro', label: ['Pro', 'Pro'] },
+  { key: 'free', label: ['Free', 'Free'] },
+  { key: 'unknown', label: ['未知', 'Unknown'] },
+]
+
 const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   priority: ['优先级', 'Priority'],
   status: ['状态', 'Status'],
@@ -154,6 +179,7 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
 }
 
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
+export const CREDENTIAL_TIER_FILTER_KEYS = TIER_FILTERS.map((item) => item.key)
 
 export function preferredInitialCredentialView(): CredentialViewMode {
   return typeof window !== 'undefined' && window.matchMedia('(min-width: 80rem)').matches
@@ -241,6 +267,7 @@ interface CredentialWorkspaceData {
 interface CredentialWorkspaceState {
   query: string
   filter: CredentialFilterKey
+  tier: CredentialTierFilterKey
   sort: SortKey
   dir: SortDir
   view: CredentialViewMode
@@ -252,6 +279,7 @@ interface CredentialWorkspaceState {
 interface CredentialWorkspaceActions {
   onQueryChange: (value: string) => void
   onFilterChange: (value: CredentialFilterKey) => void
+  onTierChange: (value: CredentialTierFilterKey) => void
   onSortChange: (key: SortKey, dir: SortDir) => void
   onViewChange: (value: CredentialViewMode) => void
   onSelectedChange: (value: Set<number>) => void
@@ -300,6 +328,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const {
     query,
     filter,
+    tier,
     sort,
     dir,
     view,
@@ -321,12 +350,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     () => FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
     [t],
   )
+  const tierItems = useMemo(
+    () => TIER_FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
+    [t],
+  )
   const sortItems = useMemo(
     () => SORTS.map(({ key }) => ({ key, label: t(...SORT_LABELS[key]) })),
     [t],
   )
   const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
     ?? t(...FILTERS[0].label)
+  const activeTierLabel = tierItems.find((item) => item.key === tier)?.label
+    ?? t(...TIER_FILTERS[0].label)
   const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
     ?? t(...SORT_LABELS.priority)
   const evaluatedPool = useMemo(
@@ -339,7 +374,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return sortCreds(
       evaluatedPool
         .filter((evaluation) => (
-          match(evaluation) && matchQuery(evaluation, debouncedQuery, language)
+          match(evaluation)
+          && (tier === 'all' || planKey(evaluation.credential.tier) === tier)
+          && matchQuery(evaluation, debouncedQuery, language)
         ))
         .map((evaluation) => evaluation.credential),
       sort,
@@ -347,7 +384,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       now,
       language,
     )
-  }, [evaluatedPool, sort, dir, filter, debouncedQuery, now, language])
+  }, [evaluatedPool, sort, dir, filter, tier, debouncedQuery, now, language])
 
   const metrics = useMemo(() => {
     const filterCounts: Record<CredentialFilterKey, number> = {
@@ -362,6 +399,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       hasDevice: 0,
       deviceFull: 0,
     }
+    // 与状态筛选那份一样，按**整池**统计而不是按当前可见的那一屏：下拉里的数字要回答
+    // 「切过去能看到几个」，跟着当前筛选走的话每选一次数字就变一次，等于没有参考价值。
+    const tierCounts: Record<CredentialTierFilterKey, number> = {
+      all: 0,
+      max20x: 0,
+      max5x: 0,
+      max: 0,
+      pro: 0,
+      free: 0,
+      unknown: 0,
+    }
     let nearLimitCount = 0
     let activeOverageCount = 0
     let unknownOverageCount = 0
@@ -372,6 +420,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     for (const evaluation of evaluatedPool) {
       const credential = evaluation.credential
       filterCounts.all += 1
+      tierCounts.all += 1
+      tierCounts[planKey(credential.tier)] += 1
       if (evaluation.schedulable) filterCounts.schedulable += 1
       if (evaluation.needsAttention) filterCounts.attention += 1
       if (credential.disabled) filterCounts.disabled += 1
@@ -416,6 +466,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
     return {
       filterCounts,
+      tierCounts,
       nearLimitCount,
       activeOverageCount,
       unknownOverageCount,
@@ -434,7 +485,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const attentionCount = metrics.filterCounts.attention
   const quotaRiskCount = metrics.filterCounts.nearLimit
   const fullDeviceCount = metrics.filterCounts.deviceFull
-  const filtering = filter !== 'all' || debouncedQuery.trim() !== ''
+  const filtering = filter !== 'all' || tier !== 'all' || debouncedQuery.trim() !== ''
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
@@ -506,6 +557,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   }
   const changeFilter = (value: CredentialFilterKey) => {
     actions.onFilterChange(value)
+    actions.onPageChange(1)
+    clearSelection()
+  }
+  const changeTier = (value: CredentialTierFilterKey) => {
+    actions.onTierChange(value)
     actions.onPageChange(1)
     clearSelection()
   }
@@ -676,13 +732,42 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
                 <Menu>
                   <MenuTrigger
+                    aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
+                    className={cn(
+                      buttonVariants({ variant: tier === 'all' ? 'outline' : 'secondary' }),
+                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    )}
+                  >
+                    <LayersIcon />
+                    <span className="min-w-0 truncate">
+                      {activeTierLabel}
+                    </span>
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="w-52">
+                    <MenuRadioGroup value={tier}>
+                      {tierItems.map((item) => (
+                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeTier(item.key)}>
+                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                            <span className="min-w-0 truncate">{item.label}</span>
+                            <span className="tnum text-xs text-muted-foreground">
+                              {formatNumber(metrics.tierCounts[item.key])}
+                            </span>
+                          </span>
+                        </MenuRadioItem>
+                      ))}
+                    </MenuRadioGroup>
+                  </MenuPopup>
+                </Menu>
+
+                <Menu>
+                  <MenuTrigger
                     aria-label={t(
                       `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
                       `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
                     )}
                     className={cn(
                       buttonVariants({ variant: 'outline' }),
-                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                      'w-full min-w-0 justify-between max-sm:col-span-2 max-sm:[&_svg]:hidden sm:w-auto',
                     )}
                   >
                     <ArrowUpDownIcon />
@@ -893,6 +978,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     onClick={() => {
                       actions.onQueryChange('')
                       changeFilter('all')
+                      changeTier('all')
                     }}
                   >
                     {t('清除筛选与搜索', 'Clear filters and search')}

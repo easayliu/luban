@@ -37,6 +37,11 @@
   --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  /* 套餐档位专用色，见下面 :root 里的注释——不与状态色共用。 */
+  --color-plan: var(--plan);
+  --color-plan-foreground: var(--plan-foreground);
+  --color-plan-high: var(--plan-high);
+  --color-plan-high-foreground: var(--plan-high-foreground);
 
   --animate-skeleton: skeleton 2s -1s infinite linear;
   --animate-toast-success-odd: toast-success-odd 0.32s cubic-bezier(0.5, 1, 0.89, 1);
@@ -124,6 +129,13 @@
   --input: --alpha(var(--color-black) / 10%);
   --muted: --alpha(var(--color-black) / 4%);
   --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-black));
+  /* 套餐档位。绿/琥珀/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
+     出现「绿色的 Pro」被读成「这个号很健康」。故档位单开一族紫，与状态色互不干涉；
+     档位高低靠色相往洋红推进（Pro 蓝 → Max 紫 → Max 20x 洋红），见 tierBadgeVariant。 */
+  --plan: var(--color-violet-500);
+  --plan-foreground: var(--color-violet-700);
+  --plan-high: var(--color-fuchsia-500);
+  --plan-high-foreground: var(--color-fuchsia-700);
   --popover: var(--color-white);
   --popover-foreground: var(--color-neutral-800);
   --primary: var(--color-neutral-800);
@@ -152,6 +164,10 @@
   --input: --alpha(var(--color-white) / 8%);
   --muted: --alpha(var(--color-white) / 4%);
   --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-white));
+  --plan: var(--color-violet-500);
+  --plan-foreground: var(--color-violet-400);
+  --plan-high: var(--color-fuchsia-500);
+  --plan-high-foreground: var(--color-fuchsia-400);
   --popover: color-mix(in srgb, var(--background) 98%, var(--color-white));
   --popover-foreground: var(--color-neutral-100);
   --primary: var(--color-neutral-100);

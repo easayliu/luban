@@ -316,20 +316,74 @@ fn prune(q: &mut VecDeque<Instant>, window: Duration) {
 /// 也不提前放出去撞：额度没到点是不会自己长回来的，提前试探每次都要白扔一发 429。
 #[derive(Default)]
 struct RateLimitCooldown {
-    /// `(cred_id, 模型)` → 冷却结束时刻（单调时钟）。模型为空串表示**整个账号**。
-    until: Mutex<HashMap<(i64, String), Instant>>,
+    /// `(cred_id, 模型)` → 该格的冷却（单调时钟）。模型为空串表示**整个账号**。
+    until: Mutex<HashMap<(i64, String), Cooling>>,
+}
+
+/// 一格冷却的两条**独立**时间线。
+///
+/// - `gate`：额度类冷却（账号级基础窗口耗尽、模型级超额池满）。这类 429 是**跟着账号走**的
+///   ——这个号确实没额度了，挡住它去调度是对的。
+/// - `soft`：瞬时限流（容量 / 请求速率，见 `proxy::LimitScope::Transient`）。这类 429
+///   **不跟着账号走**，拿它挡调度是有害的：号被挡掉之后设备会改绑到下一个号，客户端每重试
+///   一次就点掉一个号，转够一圈全池的这个模型都在冷却，新请求一条都进不来。所以这一条只用于
+///   展示，不参与选号。
+///
+/// 分成两条而不是一条加个布尔：同一格完全可能同时挂着两种（超额池满打了 40 分钟的门禁，
+/// 半分钟后又撞了一发瞬时限速）。合成一条的话两者只能取其一——要么让瞬时那档把门禁提前解掉，
+/// 要么让门禁把瞬时那档拖长，两种都是错的。
+#[derive(Default, Clone, Copy)]
+struct Cooling {
+    gate: Option<Instant>,
+    soft: Option<Instant>,
+}
+
+impl Cooling {
+    /// 此刻是否仍挡着选号。
+    fn gating(&self, now: Instant) -> bool {
+        self.gate.is_some_and(|t| t > now)
+    }
+
+    /// 此刻是否还有任何未到期的冷却（含只用于展示的那条）；为假即可以把这一格清掉。
+    fn live(&self, now: Instant) -> bool {
+        self.gating(now) || self.soft.is_some_and(|t| t > now)
+    }
+
+    fn secs_until(deadline: Option<Instant>, now: Instant) -> i64 {
+        deadline.filter(|t| *t > now).map(|t| t.duration_since(now).as_secs() as i64).unwrap_or(0)
+    }
+
+    /// 展示用的剩余秒数：两条时间线取较晚的那个。
+    fn remaining(&self, now: Instant) -> i64 {
+        Self::secs_until(self.gate, now).max(Self::secs_until(self.soft, now))
+    }
+
+    /// 门禁的剩余秒数——`retry-after` 只能按它算，soft 那条压根不挡人。
+    fn gate_remaining(&self, now: Instant) -> i64 {
+        Self::secs_until(self.gate, now)
+    }
 }
 
 impl RateLimitCooldown {
-    /// 打上冷却。`model` 为 `None` 即账号级（所有模型）。
-    /// 同一格重复命中时取**较晚**的那个结束时刻，不让新的短冷却缩短旧的长冷却。
+    /// 打上**参与选号门禁**的冷却。`model` 为 `None` 即账号级（所有模型）。
     fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+        self.write(cred_id, model, dur, false)
+    }
+
+    /// 打上**只用于展示**的冷却，见 [`Cooling::soft`]：卡片上看得见「这个号刚被限速」，
+    /// 但它照常参与选号。
+    fn mark_soft(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+        self.write(cred_id, model, dur, true)
+    }
+
+    /// 同一条时间线重复命中时取**较晚**的那个结束时刻，不让新的短冷却缩短旧的长冷却。
+    fn write(&self, cred_id: i64, model: Option<&str>, dur: Duration, soft: bool) {
         let deadline = Instant::now() + dur;
         let mut until = self.until.lock();
-        let slot =
-            until.entry((cred_id, model.unwrap_or_default().to_string())).or_insert(deadline);
-        if *slot < deadline {
-            *slot = deadline;
+        let slot = until.entry((cred_id, model.unwrap_or_default().to_string())).or_default();
+        let line = if soft { &mut slot.soft } else { &mut slot.gate };
+        if line.is_none_or(|t| t < deadline) {
+            *line = Some(deadline);
         }
     }
 
@@ -341,7 +395,8 @@ impl RateLimitCooldown {
         let mut hit = false;
         for key in [String::new(), model.unwrap_or_default().to_string()] {
             match until.get(&(cred_id, key.clone())) {
-                Some(t) if *t > now => hit = true,
+                // 只认门禁那条线：还挂着 soft 的格子留着给界面看，但不挡选号。
+                Some(c) if c.live(now) => hit = hit || c.gating(now),
                 Some(_) => {
                     until.remove(&(cred_id, key));
                 }
@@ -373,9 +428,8 @@ impl RateLimitCooldown {
         let until = self.until.lock();
         [String::new(), model.unwrap_or_default().to_string()]
             .into_iter()
-            .filter_map(|key| until.get(&(cred_id, key)).copied())
-            .filter(|t| *t > now)
-            .map(|t| t.duration_since(now).as_secs() as i64)
+            .filter_map(|key| until.get(&(cred_id, key)))
+            .map(|c| c.gate_remaining(now))
             .max()
             .unwrap_or(0)
     }
@@ -390,12 +444,7 @@ impl RateLimitCooldown {
     /// 分支才会退回进程内冷却。留着它正是为了让那个兜底状态在后台能看见。
     fn remaining_secs(&self, cred_id: i64) -> i64 {
         let now = Instant::now();
-        self.until
-            .lock()
-            .get(&(cred_id, String::new()))
-            .filter(|t| **t > now)
-            .map(|t| t.duration_since(now).as_secs() as i64)
-            .unwrap_or(0)
+        self.until.lock().get(&(cred_id, String::new())).map(|c| c.gate_remaining(now)).unwrap_or(0)
     }
 
     /// 该凭证**模型级**冷却的明细：`(模型名, 剩余秒数)`，按剩余时间倒序。未冷却时为空。
@@ -403,14 +452,14 @@ impl RateLimitCooldown {
     /// 补的是一个真实的观测盲区：模型级 429（实测里 fable 撞超额池就是这一档）只写进
     /// `(cred_id, 模型)` 那些格子，而后台读的是账号级那一格，于是选号侧明明已经跳过这个
     /// 模型、界面上却什么都看不到——「冷却中」那套筛选与徽章形同虚设。
-    fn model_remaining(&self, cred_id: i64) -> Vec<(String, i64)> {
+    fn model_remaining(&self, cred_id: i64) -> Vec<(String, i64, bool)> {
         let now = Instant::now();
-        let mut out: Vec<(String, i64)> = self
+        let mut out: Vec<(String, i64, bool)> = self
             .until
             .lock()
             .iter()
-            .filter(|((id, model), t)| *id == cred_id && !model.is_empty() && **t > now)
-            .map(|((_, model), t)| (model.clone(), t.duration_since(now).as_secs() as i64))
+            .filter(|((id, model), c)| *id == cred_id && !model.is_empty() && c.live(now))
+            .map(|((_, model), c)| (model.clone(), c.remaining(now), c.gating(now)))
             .collect();
         // 剩得最久的排前面；同秒数按模型名，保证展示顺序稳定（HashMap 迭代序是随机的）。
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1141,15 +1190,28 @@ impl CredentialStore {
         self.cooldown.mark(cred_id, model, dur);
     }
 
+    /// 打上**只用于展示**的限流标记：卡片上看得见，但这个号照常参与选号。
+    ///
+    /// 专供瞬时限流那一档（容量 / 请求速率，见 `proxy::LimitScope::Transient`）。那种 429
+    /// 不是这个号的问题，用门禁挡它等于把上游对**出口或模型**的限速，翻译成对**整池账号**
+    /// 的封锁——见 [`Cooling`] 里的说明。
+    pub fn mark_rate_limited_soft(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+        self.cooldown.mark_soft(cred_id, model, dur);
+    }
+
     /// 该凭证**账号级**冷却的剩余秒数（未冷却为 0）。见 [`RateLimitCooldown::remaining_secs`]，
     /// 注意正常路径上账号级限流走的是落库的 `resume_at`，这一档只反映落库失败的兜底状态。
     pub fn rate_limited_secs(&self, cred_id: i64) -> i64 {
         self.cooldown.remaining_secs(cred_id)
     }
 
-    /// 该凭证**模型级**冷却的明细 `(模型名, 剩余秒数)`，未冷却为空。
-    /// 这一档不影响账号整体调度：其余模型照常可用，见 [`RateLimitCooldown`]。
-    pub fn rate_limited_models(&self, cred_id: i64) -> Vec<(String, i64)> {
+    /// 该凭证**模型级**冷却的明细 `(模型名, 剩余秒数, 是否挡选号)`，未冷却为空。
+    ///
+    /// 这一档都不影响账号整体调度：其余模型照常可用，见 [`RateLimitCooldown`]。第三项进一步
+    /// 区分同为「模型级」的两种：`true` 是额度池满，这个模型确实被挡在选号之外；`false` 是
+    /// 瞬时限速，只是个标记，该模型照常参与选号。界面上必须分开说，否则「冷却中」会把一个
+    /// 仍在服务的账号显示成停摆。
+    pub fn rate_limited_models(&self, cred_id: i64) -> Vec<(String, i64, bool)> {
         self.cooldown.model_remaining(cred_id)
     }
 
@@ -4592,6 +4654,48 @@ mod tests {
         // 手动解除：全部格一起清。
         store.clear_rate_limited(a, None);
         assert_eq!(pick("claude-fable-5"), a, "手动解除后所有模型都该回来");
+    }
+
+    /// 「一个号被限速，客户端多重试几次就把整池点掉」那条线上问题的**后半截**回归测试。
+    ///
+    /// 前半截（一条请求内换号重试盖满整池）由 `proxy::LimitScope::Transient` 挡住了，但冷却
+    /// 本身是选号硬门禁，跨请求那条路还开着：撞上的号被挡掉，设备就在下一条请求上改绑到另一个
+    /// 号，客户端每重试一次点掉一个，转够一圈全池的这个模型都在冷却，新请求一条都进不来。
+    /// 故瞬时限速这一档改成**只记不挡**——见 [`CredentialStore::mark_rate_limited_soft`]。
+    #[test]
+    fn a_transient_rate_limit_is_recorded_but_never_gates_selection() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let pick = |model| {
+            store.select_for_device(Select { model: Some(model), ..Default::default() }).unwrap().id
+        };
+
+        store.mark_rate_limited_soft(a, Some("claude-opus-5"), Duration::from_secs(30));
+        assert_eq!(pick("claude-opus-5"), a, "瞬时限速不该把这个号挡在选号之外");
+        assert_eq!(store.rate_limited_secs(a), 0, "更不该冒充账号级限流");
+
+        // 但界面上要看得见，且要能和「真的被挡住了」区分开。
+        let models = store.rate_limited_models(a);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].0, "claude-opus-5");
+        assert!(!models[0].2, "瞬时限速那条不挡选号，gated 必须是 false");
+
+        // 把整池都打上瞬时限速：选号照常给得出号，绝不能退化成 AllRateLimited。
+        store.mark_rate_limited_soft(b, Some("claude-opus-5"), Duration::from_secs(30));
+        assert!(
+            store
+                .select_for_device(Select { model: Some("claude-opus-5"), ..Default::default() })
+                .is_ok(),
+            "全池都被瞬时限速过也必须还能选出号——挡下来才是那条线上问题本身"
+        );
+
+        // 额度那档照旧硬挡，两条时间线互不干扰：同一格上叠一个门禁，立刻让位。
+        store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(300));
+        assert_eq!(pick("claude-opus-5"), b, "额度池满那档仍是硬门禁");
+        let models = store.rate_limited_models(a);
+        assert_eq!(models.len(), 1, "同一个模型只该出现一行");
+        assert!(models[0].2, "此刻挂着门禁，gated 应为 true");
+        assert!(models[0].1 > 290, "展示的剩余时间取两条线里较晚的那个：{models:?}");
     }
 
     /// 账号级限流把调度开关**落库关掉**，到点惰性自动打开；人工关的号不会被自动打开。

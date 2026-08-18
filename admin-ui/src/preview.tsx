@@ -14,6 +14,7 @@ import {
   CREDENTIAL_PAGE_SIZES,
   CredentialWorkspace,
   type CredentialFilterKey,
+  type CredentialTierFilterKey,
   type CredentialPageSize,
   type CredentialViewMode,
 } from '@/components/credential-workspace'
@@ -403,10 +404,11 @@ const cooldown: Credential = {
   cost_total: 0.84,
   rpm: 26,
   rate_limited_secs: 725,
-  // 账号级冷却（落库失败的兜底状态）叠加两个模型级冷却，覆盖两档并存的展示。
+  // 账号级冷却（落库失败的兜底状态）叠加两种模型级标记，覆盖三档并存的展示：
+  // fable 是额度池满、真被挡在选号外（gated）；opus 只是刚撞过一发限速、仍在服务（!gated）。
   rate_limited_models: [
-    { model: 'claude-fable-5', secs: 280 },
-    { model: 'claude-opus-5', secs: 25 },
+    { model: 'claude-fable-5', secs: 280, gated: true },
+    { model: 'claude-opus-5', secs: 25, gated: false },
   ],
   resume_at: null,
   quota: null,
@@ -528,6 +530,7 @@ function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSect
 function PreviewCredentialWorkspace() {
   const [query, setQuery] = React.useState('')
   const [filter, setFilter] = React.useState<CredentialFilterKey>('all')
+  const [tier, setTier] = React.useState<CredentialTierFilterKey>('all')
   const [sort, setSort] = React.useState<SortKey>('priority')
   const [dir, setDir] = React.useState<SortDir>('asc')
   const [view, setView] = React.useState<CredentialViewMode>(
@@ -549,6 +552,7 @@ function PreviewCredentialWorkspace() {
       state={{
         query,
         filter,
+        tier,
         sort,
         dir,
         view,
@@ -559,6 +563,7 @@ function PreviewCredentialWorkspace() {
       actions={{
         onQueryChange: setQuery,
         onFilterChange: setFilter,
+        onTierChange: setTier,
         onSortChange: (key, nextDir) => {
           setSort(key)
           setDir(nextDir)

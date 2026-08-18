@@ -463,13 +463,28 @@ export const CredentialCard = memo(function CredentialCard({
               <p
                 className="flex flex-wrap items-center gap-x-1.5 text-warning-foreground text-xs"
                 title={t(
-                  '这些模型刚被上游 429（多为容量限制或超额池满），暂时不参与选号；该账号的其余模型照常服务。到点自动恢复，也可在菜单里手动解除冷却',
-                  'These models were just rate-limited upstream (usually capacity limits or an exhausted overage pool) and are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
+                  '这些模型的额度池已满（上游 429），暂时不参与选号；该账号的其余模型照常服务。到点自动恢复，也可在菜单里手动解除冷却',
+                  'The overage pool for these models is exhausted (upstream 429), so they are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
                 )}
               >
                 <TimerOffIcon className="size-3" />
                 <span className="font-medium">{t('模型冷却', 'Model cooldown')}</span>
                 <span>{modelCooldownSummary(cred, language)}</span>
+              </p>
+            )}
+            {/* 与上面那条**不是**一回事，故分开显示：这一档只是刚撞过一发限速，号仍在调度池里。
+                合并成「模型冷却」会让人以为这个号已经不干活了，从而跑去查一个根本不存在的故障。 */}
+            {evaluation.modelThrottled && (
+              <p
+                className="flex flex-wrap items-center gap-x-1.5 text-muted-foreground text-xs"
+                title={t(
+                  '这些模型刚被上游限速（容量或请求速率），额度并没有用完。这种限制跟着出口或模型走、不跟着账号走，所以该账号照常参与选号——上游要的是客户端按 retry-after 退避，不是把号停掉',
+                  'These models were just throttled upstream (capacity or request rate); no quota was exhausted. That kind of limit follows the egress or the model rather than the account, so this account keeps taking part in selection — what upstream wants is the client backing off per retry-after, not an account being parked',
+                )}
+              >
+                <TimerOffIcon className="size-3" />
+                <span className="font-medium">{t('刚被限速', 'Recently throttled')}</span>
+                <span>{modelCooldownSummary(cred, language, false)}</span>
               </p>
             )}
           </section>

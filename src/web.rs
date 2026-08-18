@@ -59,6 +59,9 @@ pub struct AppState {
     /// 拒绝日志的抑制表：撞上限的客户端往往每几十毫秒重试一次，一条不落地记会把日志刷没。
     /// 见 [`crate::proxy::RejectionLog`]。
     pub rejection_log: crate::proxy::RejectionLog,
+    /// 瞬时限流的退避记忆表：同一条「账号 + 模型」路线连撞几次，交回客户端的 `retry-after`
+    /// 就翻几倍。见 [`crate::proxy::TransientBackoff`]。
+    pub transient_backoff: crate::proxy::TransientBackoff,
     /// **在途请求数**：已进入转发入口、响应尚未走完的那些。
     ///
     /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
@@ -87,6 +90,7 @@ pub async fn run(
         admin_env: admin_password.map(Arc::new),
         shape_rejections: Arc::default(),
         rejection_log: Arc::default(),
+        transient_backoff: Arc::default(),
         in_flight: Arc::default(),
     };
 
@@ -1386,6 +1390,10 @@ async fn set_forwarding(
 struct ModelCooldown {
     model: String,
     secs: i64,
+    /// 这条冷却是否**挡着选号**。`true` 是额度池满那档（该模型确实不参与选号）；`false` 是
+    /// 瞬时限速那档（只是个标记，该模型照常参与选号），见
+    /// `crate::store::CredentialStore::mark_rate_limited_soft`。
+    gated: bool,
 }
 
 /// 构造凭证视图时要用到的两个全局默认上限。
@@ -1459,11 +1467,13 @@ struct CredentialView {
     /// 失败的兜底分支才会退回进程内冷却。留着它是为了让那个兜底状态在后台也能看见。
     /// 模型级冷却在 `rate_limited_models` 里，两者不可混用——见 `crate::store::RateLimitCooldown`。
     rate_limited_secs: i64,
-    /// **模型级**冷却明细（容量限制/超额池满那种，默认 30 秒，记在进程内）。
+    /// **模型级**冷却明细（超额池满或瞬时限速，记在进程内）。
     ///
-    /// 这一档**不代表账号有问题**：只有列出的这些模型在选号时让位，该号的其余模型照常服务，
-    /// 所以前端不能拿它把账号显示成「不可调度」。此前它压根没被透出来，于是 fable 撞超额池
-    /// 被冷却时后台一片正常，选号侧却已经跳过它了。
+    /// 这一档**不代表账号有问题**：即便是挡选号的那种，也只有列出的这些模型让位，该号的其余
+    /// 模型照常服务，所以前端不能拿它把账号显示成「不可调度」。此前它压根没被透出来，于是
+    /// fable 撞超额池被冷却时后台一片正常，选号侧却已经跳过它了。
+    ///
+    /// 每条的 `gated` 进一步分开两种情形，前端的措辞必须跟着分——见 [`ModelCooldown::gated`]。
     rate_limited_models: Vec<ModelCooldown>,
     /// 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；`None` 表示
     /// 不自动恢复（正常在用、人工停用、或封号）。
@@ -1509,10 +1519,12 @@ impl CredentialView {
     }
 
     /// 附加冷却状态：账号级剩余秒数 + 模型级明细（都在内存里，没有就是 0 / 空）。
-    fn with_cooldown(mut self, secs: i64, models: Vec<(String, i64)>) -> Self {
+    fn with_cooldown(mut self, secs: i64, models: Vec<(String, i64, bool)>) -> Self {
         self.rate_limited_secs = secs;
-        self.rate_limited_models =
-            models.into_iter().map(|(model, secs)| ModelCooldown { model, secs }).collect();
+        self.rate_limited_models = models
+            .into_iter()
+            .map(|(model, secs, gated)| ModelCooldown { model, secs, gated })
+            .collect();
         self
     }
 
