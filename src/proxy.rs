@@ -353,6 +353,12 @@ pub async fn handle(
     let (mut token, mut cred) = (token, cred);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
+    // 最后那一轮**上游原样给的**限流头，只在它回 429 时有值（每轮重置，故换号换到一发 200 时
+    // 它是 `None`）。存在的理由是下面 transient 档会把我们自己算出来的退避写进 `retry-after`
+    // 再交回客户端——那之后重解 `up.headers()` 就会把自己塞的那条当成上游给的读回来，
+    // [`RateLimitInfo::no_limit_headers`] 从此恒为 false。留一份注入前的快照给循环之后用。
+    // 不给初值：循环体在任何一条 `break` 之前都必经那次赋值，给了反而是个读不到的死值。
+    let mut upstream_limit: Option<RateLimitInfo>;
     let (upstream, resp, sent) = loop {
         let sim = Simulation::detect(body_json.as_ref(), from_cc_client, flags, &cred, &device_fp);
         // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
@@ -450,6 +456,9 @@ pub async fn handle(
             }
             _ => None,
         };
+        // 注入之前先留一份，见 `upstream_limit` 的声明。非 429 时写回 `None`：换号换到一发 200
+        // 的那一轮，上一轮的 429 头不该再算数。
+        upstream_limit = limited.clone();
         let Some(info) = limited else { break (upstream, resp, sent) };
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
@@ -597,8 +606,14 @@ pub async fn handle(
                     "upstream response uses an undecodable content-encoding: usage sniffing and account-level error detection are both skipped (that encoding must be enabled in wreq's features)"
                 );
             }
-            // 解析上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
-            let ratelimit = RateLimitInfo::from_headers(up.headers());
+            // 上游限流头（订阅账号 5h/7d 额度体现在此），随请求日志入库。
+            //
+            // 429 那条路**取循环里留下的快照，不重解 `up.headers()`**：transient 档已经把我们
+            // 自己算出来的退避写进这份头的 `retry-after` 了，重解等于把自己塞的值当成上游给的
+            // 读回来，`no_limit_headers()` 就此恒为 false，下面那个「裸 429 把响应体打出来」的
+            // 分支永远不触发——而它正是为这一档写的。见 `upstream_limit` 的声明。
+            let ratelimit =
+                upstream_limit.unwrap_or_else(|| RateLimitInfo::from_headers(up.headers()));
             // 顺手看一眼额度：快用尽（默认 90%）就提前把这个号挪出调度池，别等下一条请求去撞
             // 429，见 [`park_if_quota_nearly_exhausted`]。本次响应照常回给客户端——它已经成了，
             // 停的是**之后**的调度。429 那条路不在这儿：上面已按账号/模型分档停过了，
@@ -8420,6 +8435,72 @@ mod tests {
         ] {
             assert!(!hdr(&[one]).no_limit_headers(), "{} 是限流头", one.0);
         }
+    }
+
+    /// 裸 429 的判据必须取**注入之前**那份快照（`handle` 里的 `upstream_limit`），
+    /// 不能在注入之后重解 `up.headers()`。
+    ///
+    /// 走 transient 那档时 `handle` 会把算出来的退避写回 `retry-after` 再交回客户端；
+    /// 曾经它在那之后又拿同一个 `up` 重解了一遍限流头，于是自己塞的那条被当成上游给的读回来，
+    /// [`RateLimitInfo::no_limit_headers`] 恒为 false，「裸 429 把响应体打出来」那个分支
+    /// 永远不触发——而它正是为这一档写的，且那一档的失败原因**只**写在响应体里。
+    ///
+    /// 这条盯住的是「重解是有损的、快照不受影响」这个事实；`handle` 究竟用了哪一份，
+    /// 单元测试够不着（要真实上游），由 `UPSTREAM_BASE_URL` 指向本地假上游的那套端到端跑法
+    /// 覆盖：日志里必须出现 `carried no rate-limit headers at all` 那一行。
+    #[test]
+    fn the_bare_429_verdict_must_come_from_the_pre_injection_snapshot() {
+        let mut h = super::HeaderMap::new();
+        h.insert(
+            super::HeaderName::from_static("anthropic-organization-id"),
+            HeaderValue::from_static("ca437ff6-03e7-44ac-849d-ba809e024327"),
+        );
+        h.insert(
+            super::HeaderName::from_static("anthropic-workspace-id"),
+            HeaderValue::from_static("wrkspc_01FgbHGSko1X9SYxLsdgnV11"),
+        );
+
+        // 收到这发 429 的那一刻解一份留着——这就是 `handle` 里的 `upstream_limit`。
+        // 限流信息为零 → rate_limit_scope 判 Transient，于是走注入 `retry-after` 那条路。
+        let snapshot = super::RateLimitInfo::from_headers(&h);
+        assert!(snapshot.no_limit_headers());
+        assert_eq!(
+            super::rate_limit_scope(&snapshot, Some("claude-opus-5")),
+            super::LimitScope::Transient("claude-opus-5".into())
+        );
+
+        // handle 在 transient 档把退避写回响应头，交给客户端退避。
+        h.insert(header::RETRY_AFTER, HeaderValue::from(30u64));
+
+        // 此刻重解是**有损**的：读回来的是我们自己塞的那条，判据被污染。曾经的 bug 就在这。
+        let reparsed = super::RateLimitInfo::from_headers(&h);
+        assert_eq!(reparsed.retry_after, Some(30), "读回来的是我们自己塞的那条");
+        assert!(!reparsed.no_limit_headers(), "重解之后就认不出这是发裸 429 了");
+
+        // 快照不受注入影响——正因如此 `handle` 必须复用它，而不是回头重解 `up.headers()`。
+        assert!(snapshot.no_limit_headers(), "快照仍然认得出这是发裸 429");
+        assert_eq!(snapshot.retry_after, None, "快照里不该有我们自己塞的那条");
+    }
+
+    /// 上游没给 `retry-after` 时，客户端实际拿到的退避序列。指数那一半几乎全被 30 秒的
+    /// 地板（[`DEFAULT_MODEL_COOLDOWN_SECS`]）吃掉：只有第 5、6 发才越过它。
+    /// [`next_transient_backoff`] 的注释里那句「第一次偶发限流几乎无感（2 秒）」在这条路上
+    /// 不成立。线上日志里那串 30/30/30/30/32/60 就是这么来的。
+    #[test]
+    fn the_backoff_a_client_actually_sees_is_almost_flat() {
+        let bare = super::RateLimitInfo::from_headers(&super::HeaderMap::new());
+        let floor = bare.transient_cooldown();
+        assert_eq!(floor.as_secs(), 30, "上游没给 retry-after 时的地板");
+
+        let state = super::TransientBackoff::default();
+        let t0 = std::time::Instant::now();
+        let seen: Vec<u64> = (0..6)
+            .map(|_| {
+                let (wait, _) = super::next_transient_backoff_at(&state, 1, "claude-opus-5", t0);
+                floor.max(wait).as_secs()
+            })
+            .collect();
+        assert_eq!(seen, vec![30, 30, 30, 30, 32, 60], "与线上日志逐发对得上");
     }
 
     /// 落库展示用的全窗口快照：三张分开收集的表（status / utilization / reset）要按窗口名
