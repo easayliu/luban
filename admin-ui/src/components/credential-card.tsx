@@ -18,6 +18,7 @@ import {
   formatCompactNumber,
   formatCountdown,
   formatFullTime,
+  formatTokens,
   formatUsd,
   relativeTime,
 } from '@/lib/utils'
@@ -437,6 +438,7 @@ export const CredentialCard = memo(function CredentialCard({
                     reset={cred.quota.rl_5h_reset}
                     cost={cred.quota.cost_5h}
                     requests={cred.quota.requests_5h}
+                    tokens={cred.quota.tokens_5h}
                     snapshotTs={cred.quota.ts}
                     now={now}
                   />
@@ -450,6 +452,7 @@ export const CredentialCard = memo(function CredentialCard({
                     reset={cred.quota.rl_7d_reset}
                     cost={cred.quota.cost_7d}
                     requests={cred.quota.requests_7d}
+                    tokens={cred.quota.tokens_7d}
                     snapshotTs={cred.quota.ts}
                     now={now}
                   />
@@ -846,34 +849,46 @@ function UpstreamVerdict({
 }
 
 /**
- * 额度里的一项事实（请求数、花费）：浅灰小块，值在前、单位在后。
+ * 额度里的一项事实（请求数、总 token、花费）：浅灰小块，值在前、单位在后。
  *
  * 做成块而不是「标签: 值」的文本对——卡片上这行要能一眼扫过去，标签在小字号下只是噪声，
- * 真要确认是什么，`title` 与读屏文本都写着全称。
+ * 真要确认是什么，悬浮提示与读屏文本都写着全称。
+ *
+ * 提示用 `Tooltip` 组件而不是原生 `title`，且 `delay={0}`：原生提示要等约 1 秒才冒出来，
+ * 而这三块的提示装的正是「这个数到底是什么、精确值多少」——等一秒才看见，等于没有。
+ * 触屏上原生 `title` 更是压根不出。理由同页脚那三项，见上面 CardFooter 处的注。
  */
 function QuotaFact({
   label,
   value,
   suffix,
-  title,
+  hint,
 }: {
   label: string
   value: string
   suffix?: string
-  title?: string
+  /** 提示里跟在标签后面的明细（精确值、口径说明）；不传则只显示标签。 */
+  hint?: string
 }) {
+  const { t } = useI18n()
   return (
-    <div
-      className={cn(
-        badgeVariants({ variant: 'secondary', size: 'sm' }),
-        'min-w-0 gap-0.5 font-normal',
-      )}
-      title={title ? `${label}: ${title}` : label}
-    >
-      <dt className="sr-only">{label}</dt>
-      <dd className="truncate tabular-nums">{value}</dd>
-      {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
-    </div>
+    <Tooltip>
+      <TooltipTrigger
+        render={<div />}
+        delay={0}
+        className={cn(
+          badgeVariants({ variant: 'secondary', size: 'sm' }),
+          'min-w-0 gap-0.5 font-normal',
+        )}
+      >
+        <dt className="sr-only">{label}</dt>
+        <dd className="truncate tabular-nums">{value}</dd>
+        {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
+        {hint ? t(`${label}：${hint}`, `${label}: ${hint}`) : label}
+      </TooltipPopup>
+    </Tooltip>
   )
 }
 
@@ -885,6 +900,7 @@ function QuotaMeter({
   reset,
   cost,
   requests,
+  tokens,
   snapshotTs,
   now,
 }: {
@@ -896,6 +912,8 @@ function QuotaMeter({
   reset: number | null
   cost: number | null
   requests: number | null
+  /** 本窗口内用掉的总 token（官方 usage 四项之和，见 Quota.tokens_5h）。 */
+  tokens: number | null
   snapshotTs: number
   /** 页面时钟（30 秒一跳），倒计时靠它走，见 [formatCountdown]。 */
   now: number
@@ -928,8 +946,22 @@ function QuotaMeter({
         <QuotaFact
           label={t('请求数', 'Requests')}
           value={requests == null ? '—' : formatCompactNumber(requests, locale)}
-          title={requests == null ? undefined : requests.toLocaleString(locale)}
+          hint={requests == null ? undefined : requests.toLocaleString(locale)}
           suffix="req"
+        />
+        {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
+            重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。
+            不带 `tok` 后缀：`18.4M` 的量纲一眼就是 token（隔壁两项一个带 req、一个带 $），
+            那三个字母只是把这行本就不宽的地方再挤掉一截。全称在读屏文本与悬浮提示里。 */}
+        <QuotaFact
+          label={t('总 token', 'Total tokens')}
+          value={tokens == null ? '—' : formatTokens(tokens)}
+          hint={tokens == null
+            ? undefined
+            : t(
+              `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
+              `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+            )}
         />
         <QuotaFact
           label={t('等价 API 费用', 'Equivalent API cost')}

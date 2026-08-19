@@ -2152,6 +2152,17 @@ pub struct QuotaSnapshot {
     /// 当前 5h / 7d 窗口内经该凭证转发的请求数。口径与窗口费用完全一致。
     pub requests_5h: Option<i64>,
     pub requests_7d: Option<i64>,
+    /// 当前 5h / 7d 窗口内该凭证用掉的**总 token**。窗口与上面两项完全一致，只是换了个量纲。
+    ///
+    /// 口径按官方 `usage` 对象的四项相加：`input_tokens` + `output_tokens` +
+    /// `cache_creation_input_tokens` + `cache_read_input_tokens`。官方这四项互不重叠——缓存命中
+    /// 的那部分**不**再计进 `input_tokens`——所以直接相加就是这个窗口真实吞掉的 token 量。
+    ///
+    /// **不加权**：计价那边给缓存写 ×1.25、缓存读 ×0.1（见 [`crate::pricing`]），但那是**钱**的
+    /// 口径；token 数一旦跟着加权，就和上游用量页上的数字对不上了。于是「token 很多、花费很少」
+    /// 是常态（缓存读通常占大头），两个数放在一起看才有意义。
+    pub tokens_5h: Option<i64>,
+    pub tokens_7d: Option<i64>,
     /// 上游本次报告的**全部**窗口（含上面那两个，也含 `7d_oi` 这类没有专用列的）。
     ///
     /// 5h/7d 的专用列没有被它取代，两者并存是有意的：只有这两个窗口有配套的窗口内费用与
@@ -2230,6 +2241,28 @@ impl CredentialStore {
                     END,
                     CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
                         SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN 1 ELSE 0 END)
+                    END,
+                    -- 窗口内的总 token（口径见 QuotaSnapshot::tokens_5h）。四项逐个 COALESCE 成 0
+                    -- 再相加：没嗅探到 usage 的那些行（4xx/429）各列都是 NULL，而 NULL + x 在
+                    -- SQLite 里是 NULL，会把整条流水的 token 抹掉。
+                    -- 缓存写取合计列，它为空时退回 5m/1h 两档之和——同 crate::pricing 的兜底。
+                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1
+                            THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
+                               + COALESCE(u.cache_creation_tokens,
+                                          COALESCE(u.cache_5m_tokens, 0)
+                                        + COALESCE(u.cache_1h_tokens, 0))
+                               + COALESCE(u.cache_read_tokens, 0)
+                        END), 0)
+                    END,
+                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2
+                            THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
+                               + COALESCE(u.cache_creation_tokens,
+                                          COALESCE(u.cache_5m_tokens, 0)
+                                        + COALESCE(u.cache_1h_tokens, 0))
+                               + COALESCE(u.cache_read_tokens, 0)
+                        END), 0)
                     END
                FROM credential_stats s
                LEFT JOIN usage_logs u
@@ -2275,6 +2308,8 @@ impl CredentialStore {
                     cost_7d: r.get(11)?,
                     requests_5h: r.get(12)?,
                     requests_7d: r.get(13)?,
+                    tokens_5h: r.get(14)?,
+                    tokens_7d: r.get(15)?,
                 },
             ))
         })?;
@@ -5078,6 +5113,9 @@ mod tests {
     /// 走真实写入口落一条带限流头的流水（ts / 费用 / 两个 reset 由调用方指定）。
     /// 刻意不裸 INSERT：快照与费用如今是写时落账（credential_stats），绕过写入口
     /// 的行只进流水不进账本，测出来的就不是线上那条路径了。
+    ///
+    /// 每条顺带记 10 个 token（输入/输出/缓存写/缓存读 各 1 + 3 + 2 + 4），于是窗口 token 数
+    /// 恒为「窗口内条数 × 10」，费用与请求数怎么断，token 就该怎么断。
     fn log_row(
         store: &CredentialStore,
         cred_id: i64,
@@ -5089,6 +5127,11 @@ mod tests {
         let rec = UsageRecord {
             cred_id: Some(cred_id),
             cost_usd: Some(cost),
+            has_usage: true,
+            input_tokens: Some(1),
+            output_tokens: Some(3),
+            cache_creation_tokens: Some(2),
+            cache_read_tokens: Some(4),
             rl_5h_utilization: r5.map(|_| 0.5),
             rl_5h_reset: r5,
             rl_7d_utilization: r7.map(|_| 0.25),
@@ -5129,8 +5172,13 @@ mod tests {
         assert_eq!(qa.cost_7d, Some(15.0), "7d 窗口覆盖全部 1+2+4+8");
         assert_eq!(qa.requests_5h, Some(3), "5h 窗口应计入 3 次请求");
         assert_eq!(qa.requests_7d, Some(4), "7d 窗口应计入 4 次请求");
+        // token 与费用/请求数同窗口同断点：窗口内两条带 token 的流水各 10 个，那条没嗅探到
+        // usage 的（各列 NULL）按 0 计而不是把整个和抹成 NULL。
+        assert_eq!(qa.tokens_5h, Some(20), "5h 窗口内两条 ×10，无 usage 的那条按 0");
+        assert_eq!(qa.tokens_7d, Some(30), "7d 窗口覆盖三条带 token 的流水");
         assert_eq!(q.get(&b).unwrap().cost_5h, Some(16.0), "费用不得跨账号串");
         assert_eq!(q.get(&b).unwrap().requests_5h, Some(1), "请求数不得跨账号串");
+        assert_eq!(q.get(&b).unwrap().tokens_5h, Some(10), "token 不得跨账号串");
 
         // 单账号入口与批量入口必须给出同一份结果。
         assert_eq!(store.latest_quota(a).unwrap().unwrap().cost_5h, qa.cost_5h);
@@ -5205,8 +5253,10 @@ mod tests {
         let qa = store.latest_quota(a).unwrap().unwrap();
         assert_eq!(qa.cost_5h, Some(6.0), "缺 7d reset 不该把 5h 窗口打成 0");
         assert_eq!(qa.requests_5h, Some(2));
+        assert_eq!(qa.tokens_5h, Some(20));
         assert_eq!(qa.cost_7d, None, "没有 7d reset 就没有 7d 窗口可算");
         assert_eq!(qa.requests_7d, None);
+        assert_eq!(qa.tokens_7d, None, "没有窗口就没有 token 可算，不能给 0");
 
         // b：反过来只有 7d 有 reset（窗口起点 100_000 - 604_800，含全部行）。
         log_row(&store, b, 90_000, 8.0, None, Some(100_000));
@@ -5214,7 +5264,61 @@ mod tests {
         let qb = store.latest_quota(b).unwrap().unwrap();
         assert_eq!(qb.cost_7d, Some(24.0), "缺 5h reset 不该把 7d 窗口打成 0");
         assert_eq!(qb.requests_7d, Some(2));
+        assert_eq!(qb.tokens_7d, Some(20));
         assert_eq!(qb.cost_5h, None);
+        assert_eq!(qb.tokens_5h, None);
+    }
+
+    /// 窗口 token 数按官方 `usage` 的四项相加，且**不看模型认不认得**。
+    ///
+    /// 两处容易算漏，各钉一条：
+    /// - 缓存写只报了 5m/1h 细分、没报合计时要退回两档之和，否则这类响应的缓存写整段丢失；
+    /// - 模型不在价目表里时 `cost_usd` 为 NULL（费用算不出），但 token 是上游实报的，
+    ///   该照数——把它跟着费用一起吞掉，卡片上就会出现「有请求、0 token」。
+    #[test]
+    fn window_tokens_sum_official_usage_fields() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        let reset = 100_000; // 5h 窗口起点 82_000
+
+        // 只有 5m/1h 细分的一条：输入 10 + 输出 20 + 缓存写 (30+40) + 缓存读 50 = 150。
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    has_usage: true,
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                    cache_5m_tokens: Some(30),
+                    cache_1h_tokens: Some(40),
+                    cache_read_tokens: Some(50),
+                    rl_5h_utilization: Some(0.5),
+                    rl_5h_reset: Some(reset),
+                    ..Default::default()
+                },
+                Some(90_000),
+            )
+            .unwrap();
+        // 模型未知（cost_usd 为 None）但有 token 的一条：1 + 2 = 3。
+        store
+            .insert_usage_log_at(
+                &UsageRecord {
+                    cred_id: Some(a),
+                    has_usage: true,
+                    input_tokens: Some(1),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                },
+                Some(95_000),
+            )
+            .unwrap();
+
+        let q = store.latest_quota(a).unwrap().unwrap();
+        assert_eq!(q.tokens_5h, Some(153), "细分缓存写与未计价的行都要计入");
+        assert_eq!(q.cost_5h, Some(0.0), "两条都没有 cost_usd，费用仍是 0");
+        assert_eq!(q.requests_5h, Some(2));
     }
 
     /// 模型级冷却必须能被后台读到。

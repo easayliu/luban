@@ -373,6 +373,35 @@ export function formatCompactNumber(n: number, locale: string): string {
   }).format(n)
 }
 
+/**
+ * Token 数压成 `842` / `931K` / `1.2M` / `3.4B`，**不随界面语言变**。
+ *
+ * 刻意不走 {@link formatCompactNumber}：中文 locale 下它会给出「121万」，而 token 的量纲
+ * 到处都是 K/M——官方价目表按 MTok 计价，卡片上紧挨着的就是那份价目算出来的费用，两个数换算
+ * 单位不一致就没法互相印证。同理不做本地化千分位。
+ *
+ * 精确值放 `title`（用 `toLocaleString`）：`1.2M` 看不出是 1.15M 还是 1.24M。
+ */
+export function formatTokens(n: number): string {
+  const abs = Math.abs(n)
+  if (abs < 1_000) return String(Math.round(n))
+  const units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']] as const
+  for (let i = 0; i < units.length; i++) {
+    const [size, unit] = units[i]
+    if (abs < size) continue
+    const scaled = n / size
+    // 三位有效数字以内保留一位小数（`1.2M`），到了三位整数就不再要小数（`931K`）。
+    const value = Math.abs(scaled) >= 100 ? Math.round(scaled) : Number(scaled.toFixed(1))
+    // 舍入后正好顶到 1000 时进位一档：999_999 该读成 `1M`，而不是 `1000K`。
+    if (Math.abs(value) >= 1_000 && i > 0) {
+      const [bigger, biggerUnit] = units[i - 1]
+      return `${Number((n / bigger).toFixed(1))}${biggerUnit}`
+    }
+    return `${value}${unit}`
+  }
+  return String(Math.round(n))
+}
+
 /** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
 export function formatUsd(v: number): string {
   if (!v || v <= 0) return '$0.00'

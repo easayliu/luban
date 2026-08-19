@@ -97,8 +97,10 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
 function QuotaSkeleton() {
   return (
     <div className="space-y-1.5">
-      <div className="flex justify-between gap-2">
+      {/* 三块对应窗口里的三项事实：请求数 / 总 token / 费用（见 credential-card 的 QuotaFact）。 */}
+      <div className="flex gap-1">
         <Skeleton className="h-4 w-12" />
+        <Skeleton className="h-4 w-14" />
         <Skeleton className="h-4 w-10" />
       </div>
       <Skeleton className="h-1.5 w-full" />

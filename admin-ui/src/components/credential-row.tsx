@@ -59,7 +59,7 @@ import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  cn, displayCredentialLabel, formatClockTime, formatFullTime, formatUsd, relativeTime,
+  cn, displayCredentialLabel, formatClockTime, formatFullTime, formatTokens, formatUsd, relativeTime,
 } from '@/lib/utils'
 
 const COL = {
@@ -265,6 +265,7 @@ export const CredentialRow = memo(function CredentialRow({
                 reset={cred.quota?.rl_5h_reset ?? null}
                 cost={cred.quota?.cost_5h ?? null}
                 requests={cred.quota?.requests_5h ?? null}
+                tokens={cred.quota?.tokens_5h ?? null}
                 reported={quota.h5.reported}
                 hasSnapshot={quota.hasSnapshot}
               />
@@ -275,6 +276,7 @@ export const CredentialRow = memo(function CredentialRow({
                 reset={cred.quota?.rl_7d_reset ?? null}
                 cost={cred.quota?.cost_7d ?? null}
                 requests={cred.quota?.requests_7d ?? null}
+                tokens={cred.quota?.tokens_7d ?? null}
                 reported={quota.d7.reported}
                 hasSnapshot={quota.hasSnapshot}
               />
@@ -384,6 +386,7 @@ export const CredentialRow = memo(function CredentialRow({
             reset={cred.quota?.rl_5h_reset ?? null}
             cost={cred.quota?.cost_5h ?? null}
             requests={cred.quota?.requests_5h ?? null}
+            tokens={cred.quota?.tokens_5h ?? null}
             reported={quota.h5.reported}
             hasSnapshot={quota.hasSnapshot}
             showLabel={false}
@@ -397,6 +400,7 @@ export const CredentialRow = memo(function CredentialRow({
             reset={cred.quota?.rl_7d_reset ?? null}
             cost={cred.quota?.cost_7d ?? null}
             requests={cred.quota?.requests_7d ?? null}
+            tokens={cred.quota?.tokens_7d ?? null}
             reported={quota.d7.reported}
             hasSnapshot={quota.hasSnapshot}
             showLabel={false}
@@ -691,6 +695,7 @@ function ListQuotaMeter({
   reset,
   cost,
   requests,
+  tokens,
   reported,
   hasSnapshot,
   showLabel = true,
@@ -701,6 +706,8 @@ function ListQuotaMeter({
   reset: number | null
   cost: number | null
   requests: number | null
+  /** 本窗口内用掉的总 token（官方 usage 四项之和，见 Quota.tokens_5h）。 */
+  tokens: number | null
   /** 上游是否报告过这个窗口；见 QuotaWindowMeta.reported。 */
   reported: boolean
   /** 该账号是否已有额度快照；用于把「还没数据」和「无此窗口」分开。 */
@@ -708,11 +715,16 @@ function ListQuotaMeter({
   showLabel?: boolean
 }) {
   const { t, language, locale } = useI18n()
+  // 表格那份摘要（showLabel=false）挤在 8rem 的格子里，三个数只能各留数字：`M`/`K` 标着 token、
+  // `$` 标着钱，唯一没单位的就是最左边的请求数，它的含义写在 title 里（见下面的 summaryTitle）。
   const usageSummary = requests == null
     ? '—'
+    : `${requests.toLocaleString(locale)} · ${tokens == null ? '—' : formatTokens(tokens)} · ${cost == null ? '—' : formatUsd(cost)}`
+  const summaryTitle = requests == null
+    ? undefined
     : t(
-        `${requests.toLocaleString(locale)} 次 · ${cost == null ? '—' : formatUsd(cost)}`,
-        `${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} · ${cost == null ? '—' : formatUsd(cost)}`,
+        `${label}本周期：${requests.toLocaleString(locale)} 次请求 · ${tokens == null ? '—' : `${tokens.toLocaleString(locale)} token`} · ${cost == null ? '—' : formatUsd(cost)}`,
+        `${label} this period: ${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} · ${tokens == null ? '—' : `${tokens.toLocaleString(locale)} tokens`} · ${cost == null ? '—' : formatUsd(cost)}`,
       )
 
   // 有快照却从没报过这个窗口 = 这个账号的额度模型里没有它，再等也不会出现。
@@ -763,19 +775,14 @@ function ListQuotaMeter({
           <div className="flex min-w-0 items-baseline gap-1.5">
             <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
             {!showLabel && (
-              <span
-                className="min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums"
-                title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
-              >
-                {expired ? '—' : usageSummary}
-              </span>
+              <SummaryValue hint={summaryTitle}>{expired ? '—' : usageSummary}</SummaryValue>
             )}
           </div>
           <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
         </div>
         <div className="h-2 w-full bg-input" aria-hidden />
-        {showLabel && !expired && (requests != null || cost != null || reset != null) && (
-          <ListQuotaDetails requests={requests} cost={cost} reset={reset} />
+        {showLabel && !expired && (requests != null || cost != null || tokens != null || reset != null) && (
+          <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
         )}
       </div>
     )
@@ -794,32 +801,49 @@ function ListQuotaMeter({
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-baseline gap-1.5">
           <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>
-          {!showLabel && (
-            <span
-              className="min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums"
-              title={t(`${label}本周期请求数与花费：${usageSummary}`, `${label} requests and cost this period: ${usageSummary}`)}
-            >
-              {usageSummary}
-            </span>
-          )}
+          {!showLabel && <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>}
         </div>
         <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
       </div>
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      {showLabel && <ListQuotaDetails requests={requests} cost={cost} reset={reset} />}
+      {showLabel && <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />}
     </Meter>
+  )
+}
+
+/**
+ * 表格里那一格的用量摘要（`128 · 18.4M · $6.85`）。
+ *
+ * 格子只有 8rem，三个数各留数字、还常被 `truncate` 切掉尾巴，所以提示是这里唯一能看到
+ * 「哪个数是什么、精确值多少」的地方——必须立刻出（`delay={0}`），原生 `title` 那一秒
+ * 等下来就没人再等了。没有摘要可说时（该窗口连请求数都没有）不挂提示，免得冒一个空气泡。
+ */
+function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }) {
+  const className = 'min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums'
+  if (!hint) return <span className={className}>{children}</span>
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<span />} delay={0} className={className}>
+        {children}
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
+        {hint}
+      </TooltipPopup>
+    </Tooltip>
   )
 }
 
 function ListQuotaDetails({
   requests,
   cost,
+  tokens,
   reset,
 }: {
   requests: number | null
   cost: number | null
+  tokens: number | null
   reset: number | null
 }) {
   const { t, language, locale } = useI18n()
@@ -844,16 +868,51 @@ function ListQuotaDetails({
           {cost == null ? '—' : formatUsd(cost)}
         </dd>
       </div>
+      {/* token 与「重置」同一行，不另起一行：这块要在窄屏两列里塞两个窗口，多一行就把
+          整张卡片撑高一截。左边是本窗口用掉的总 token（只给数字，量纲由 K/M 表达，
+          全称在读屏文本与悬浮提示里），右边仍是重置时刻。 */}
+      {/* 这两项的提示同样走 Tooltip 组件 + delay 0：原生 title 要等约 1 秒，而这里装的是
+          精确 token 数与精确重置时刻——都是「想确认一下」才去悬浮的东西，等一秒等于没有。 */}
       <div className="col-span-2 flex min-w-0 items-baseline justify-between gap-2 text-[11px] text-muted-foreground">
-        <dt className="whitespace-nowrap">{t('重置', 'Reset')}</dt>
-        <dd
-          className="whitespace-nowrap tabular-nums"
-          title={reset == null
-            ? undefined
-            : t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
-        >
-          {reset == null ? '—' : formatClockTime(reset, language)}
-        </dd>
+        <div className="flex min-w-0 items-baseline gap-1">
+          <dt className="sr-only">{t('总 token', 'Total tokens')}</dt>
+          <dd className="min-w-0">
+            <Tooltip>
+              <TooltipTrigger
+                render={<span />}
+                delay={0}
+                className="whitespace-nowrap font-medium text-foreground tabular-nums"
+              >
+                {tokens == null ? '—' : formatTokens(tokens)}
+              </TooltipTrigger>
+              <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
+                {tokens == null
+                  ? t('本周期总 token：暂无数据', 'Total tokens this period: no data')
+                  : t(
+                    `本周期总 token ${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
+                    `${tokens.toLocaleString(locale)} tokens this period (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+                  )}
+              </TooltipPopup>
+            </Tooltip>
+          </dd>
+        </div>
+        <div className="flex min-w-0 items-baseline gap-1">
+          <dt className="whitespace-nowrap">{t('重置', 'Reset')}</dt>
+          <dd className="min-w-0">
+            {reset == null ? (
+              <span className="whitespace-nowrap tabular-nums">—</span>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger render={<span />} delay={0} className="whitespace-nowrap tabular-nums">
+                  {formatClockTime(reset, language)}
+                </TooltipTrigger>
+                <TooltipPopup>
+                  {t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+                </TooltipPopup>
+              </Tooltip>
+            )}
+          </dd>
+        </div>
       </div>
     </dl>
   )

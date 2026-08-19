@@ -79,6 +79,8 @@ const banned: Credential = {
     cost_7d: 0.055,
     requests_5h: 3,
     requests_7d: 28,
+    tokens_5h: 41_200,
+    tokens_7d: 386_400,
     windows: [
       { name: '5h', status: 'allowed', utilization: 0.82, reset: now - 60 },
       { name: '7d', status: 'allowed', utilization: 0.76, reset: now + 3 * 24 * 3600 },
@@ -128,6 +130,8 @@ const normal: Credential = {
     cost_7d: 42.18,
     requests_5h: 128,
     requests_7d: 914,
+    tokens_5h: 18_400_000,
+    tokens_7d: 132_600_000,
     windows: [
       { name: '5h', status: 'allowed', utilization: 0.15, reset: now + 99 * 60 },
       { name: '7d', status: 'allowed', utilization: 0.63, reset: now + 5 * 24 * 3600 },
@@ -175,6 +179,8 @@ const overage: Credential = {
     cost_7d: 91.62,
     requests_5h: 412,
     requests_7d: 3218,
+    tokens_5h: 61_800_000,
+    tokens_7d: 486_300_000,
     windows: [
       { name: '5h', status: 'rejected', utilization: 1.04, reset: now + 45 * 60 },
       { name: '7d', status: 'allowed_warning', utilization: 0.91, reset: now + 4 * 24 * 3600 },
@@ -222,6 +228,8 @@ const nearLimit: Credential = {
     cost_7d: 29.81,
     requests_5h: 226,
     requests_7d: 1288,
+    tokens_5h: 33_900_000,
+    tokens_7d: 193_200_000,
     windows: [
       { name: '5h', status: 'allowed_warning', utilization: 0.9, reset: now + 75 * 60 },
       { name: '7d', status: 'allowed', utilization: 0.899, reset: now + 2 * 24 * 3600 },
@@ -270,6 +278,8 @@ const unknownOverage: Credential = {
     cost_7d: 51.92,
     requests_5h: 296,
     requests_7d: 1842,
+    tokens_5h: 44_400_000,
+    tokens_7d: 276_300_000,
     // 刻意留空：这条代表「记录全部窗口」上线之前落下的老快照，用来覆盖读侧的向后兼容
     // （windows 为空时退回 [5h, 7d] 判定，与升级前逐字一致）。
     windows: [],
@@ -318,6 +328,8 @@ const only5hWindow: Credential = {
     cost_7d: null,
     requests_5h: 71,
     requests_7d: null,
+    tokens_5h: 10_650_000,
+    tokens_7d: null,
     windows: [{ name: '5h', status: 'allowed', utilization: 0.44, reset: now + 2 * 3600 }],
   },
 }
@@ -370,6 +382,8 @@ const overagePoolExhausted: Credential = {
     cost_7d: 188.3,
     requests_5h: 52,
     requests_7d: 1633,
+    tokens_5h: 7_800_000,
+    tokens_7d: 245_000_000,
     windows: [
       { name: '5h', status: 'allowed', utilization: 0.2, reset: now + 90 * 60 },
       { name: '7d', status: 'allowed', utilization: 0.7, reset: now + 4 * 24 * 3600 },
@@ -454,6 +468,8 @@ const disabledHistoricalOverage: Credential = {
     cost_7d: 43.98,
     requests_5h: 338,
     requests_7d: 2104,
+    tokens_5h: 50_700_000,
+    tokens_7d: 315_600_000,
     windows: [
       { name: '5h', status: 'rejected', utilization: 1, reset: now - 5 * 3600 },
       { name: '7d', status: 'rejected', utilization: 1, reset: now - 4 * 3600 },
