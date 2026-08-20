@@ -177,6 +177,11 @@ pub async fn handle(
     // 「账号 + 模型」分格（fable 那类模型级 429 不该拖累整个账号）。
     let req_model = request_model(body_json.as_ref());
 
+    // 这条请求声明的输出上限。只为日志：裸 429 那一档要拿它对上游那套「每分钟输出 token」
+    // 限额，见 [`UpstreamLoad`]。算在这里是因为 `body_json` 只解析一次（见上面 2 那段），
+    // 而这个值逐轮不变。
+    let req_max_tokens = request_max_tokens(body_json.as_ref());
+
     // 2.3) 上游已经拒过一次的「模型 + 请求里的某个取值」组合（`effort: 'xhigh'`、
     //      `role: 'system'` 之类）→ 本地直接拒，不往上游送。这是纯粹的请求形态错误：
     //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
@@ -359,6 +364,10 @@ pub async fn handle(
     // [`RateLimitInfo::no_limit_headers`] 从此恒为 false。留一份注入前的快照给循环之后用。
     // 不给初值：循环体在任何一条 `break` 之前都必经那次赋值，给了反而是个读不到的死值。
     let mut upstream_limit: Option<RateLimitInfo>;
+    // 最后那一轮占住的「账号 + 模型」在飞格，见 [`UpstreamRouteGuard`]。同 `upstream_limit`：
+    // 逐轮重新赋值（换号后是另一条路线，旧的那格在赋值时归还），不给初值是因为循环体在任何
+    // 一条 `break` 之前都必经那次赋值。循环之后它会被交给 `ReqLog` 拿着，活到响应流结束。
+    let mut route_load: UpstreamRouteGuard;
     let (upstream, resp, sent) = loop {
         let sim = Simulation::detect(body_json.as_ref(), from_cc_client, flags, &cred, &device_fp);
         // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
@@ -447,6 +456,14 @@ pub async fn handle(
         // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
         // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
         let sent = upstream.shape(&body, &cred, &device_fp);
+        // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
+        // [`note_upstream_send`]。纯记录，不影响这条请求走向。
+        route_load = note_upstream_send(
+            &state.upstream_load,
+            cred.id,
+            req_model.as_deref().unwrap_or("-"),
+            req_max_tokens.unwrap_or(0),
+        );
         let mut resp = upstream.send(sent.clone()).await;
 
         // 只认「上游明确回 429」这一种：连不上/超时那类换个号一样连不上，重试只是浪费时间。
@@ -464,12 +481,13 @@ pub async fn handle(
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
         let scope = rate_limit_scope(&info, req_model.as_deref());
         let mut cooldown = info.cooldown_for(&scope);
-        // 瞬时限流那档的等待时长**逐次翻倍**，见 [`next_transient_backoff`]：这一档不换号、
+        // 瞬时限流那档的等待时长**每熬满一档翻一倍**，见 [`next_transient_backoff`]：这一档不换号、
         // 也不把号挪出调度池，客户端拿到的就是一发 429，那么「下次什么时候再来」就是我们唯一
         // 还能影响拥堵的东西。取两者较大值——上游给的 `retry-after` 是下限，连撞出来的退避
         // 只会把它往长了推，不会缩短。总开关关掉时（`max_retry == 0`）不参与：那条路要的是
         // 完全不干预、原样透传。
-        // 连撞到 [`TRANSIENT_MAX_ATTEMPTS`] 就不再当它是一阵拥堵，见下面 park 那一步。
+        // 连撞到 [`TRANSIENT_MAX_ATTEMPTS`] 档就不再当它是一阵拥堵，见下面 park 那一步。
+        // 「档」不是「发」：一批并发只顶得动一档，走到头意味着这条路线连坏了 60 秒开外。
         let mut transient_exhausted = false;
         if max_retry > 0
             && let LimitScope::Transient(model) = &scope
@@ -516,14 +534,23 @@ pub async fn handle(
                     model = %req_model.as_deref().unwrap_or("-"),
                     attempts = TRANSIENT_MAX_ATTEMPTS,
                     cooldown_secs = cooldown.as_secs(),
-                    "transient 429s in a row on this credential+model even after the backoff maxed out: taking this model out of the pool for a cooldown so later requests go elsewhere"
+                    "transient 429s all the way up the backoff ladder on this credential+model: taking this model out of the pool for a cooldown so later requests go elsewhere; this request still gets its 429 handed back"
                 );
             }
+            // 措辞分两种。这一档有两条来路（见 [`rate_limit_scope`] 的末尾分支）：窗口都没满，
+            // 和**一个限流头都没带**。后者我们其实无从判断哪个窗口是什么状态，说成「没有窗口
+            // 是满的」是在讲一件没查过的事，且与下面那行 `carried no rate-limit headers at
+            // all`（只在这一路打）直接打架。
+            let why = if info.no_limit_headers() {
+                "upstream 429 came with no rate-limit info at all, so nothing pins it on this account: passing it through with a backed-off retry-after instead of swapping credentials"
+            } else {
+                "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
+            };
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 model = %req_model.as_deref().unwrap_or("-"),
                 retry_after_secs = cooldown.as_secs(),
-                "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
+                "{why}"
             );
             break (upstream, resp, sent);
         }
@@ -644,6 +671,7 @@ pub async fn handle(
                 stream_broke: None,
                 store: state.store.clone(),
                 _in_flight: in_flight,
+                _route_load: route_load,
             };
 
             // 400/401/403：先缓冲响应体做账号级错误判定，命中则自动停用该凭证并清空其
@@ -752,8 +780,17 @@ pub async fn handle(
             //
             // 这一档在 [`rate_limit_scope`] 里只能落到 [`LimitScope::Transient`]（没有窗口
             // 可看），而 429 又不在上面那段 4xx 错误体日志的覆盖范围内（那里只收 400/401/403），
-            // 于是服务端侧除了「撞了一发 429」之外**什么都不知道**——到底是速率限制还是容量
-            // 拒绝，只写在响应体里。故这一档单独把错误文本打出来。
+            // 于是服务端侧除了「撞了一发 429」之外**什么都不知道**。故这一档把能拿到的三类
+            // 依据一次打全：
+            //
+            // 1. **响应体**——「速率限制还是容量拒绝」有时只写在这里（08d0b58 记下的那句
+            //    「40,000 output tokens per minute」就是从body里读到的）；但它也可能只有一句
+            //    `Error`（2026-08-20 实测），故光有它不够；
+            // 2. **`request-id` / `x-should-retry`**——前者是与上游对话的唯一凭据，后者是上游
+            //    自己对「这发能不能重试」的表态，见下面取头那一步；
+            // 3. **我们这一侧的发送密度**——上游按组织/工作区的每分钟口径拒的，请求数、并发数、
+            //    输出预算三者之一超了；它不说是哪一个，那就把三者的读数摆出来，见
+            //    [`UpstreamLoad`]。
             //
             // 只在限流头全缺时打：正常的额度 429 头里已写明是哪个窗口满的、什么时候重置，
             // 上面那条 `upstream 429` 的 `ratelimit=` 已经带着全文，再刷一行没有意义。
@@ -763,14 +800,45 @@ pub async fn handle(
                 && rl.ratelimit.no_limit_headers()
             {
                 let builder = resp_builder(&up);
+                // 这两个头 [`RateLimitInfo`] 收不到（它的白名单只留 `anthropic-*` /
+                // `*ratelimit*` / `retry-after`，而 `request-id` 连前缀都不带），可它们恰是
+                // 这一档最缺的两句话：`request-id` 是上游侧唯一的抓手（对工单、跨系统核对都
+                // 只认它，我们自己的日志里此前没有任何能与上游对上的标识），`x-should-retry`
+                // 是上游**自己**对「这发能不能重试」的表态——它把「速率限制还是容量拒绝」
+                // 这个我们一直只能猜的区分直接说了出来。`up.bytes()` 会吃掉 `up`，故先取走。
+                let request_id = header_text(up.headers(), "request-id");
+                let should_retry = header_text(up.headers(), "x-should-retry");
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
                         let (etype, message) = parse_upstream_error(&bytes);
+                        // 我们这一侧的发送密度，见 [`UpstreamLoad`]：这一档的成因（每分钟请求数
+                        // / 并发连接数 / 输出 token 预算，三者之一）上游一个字都不说，只能拿
+                        // 自己的读数去对它公布的限额。
+                        let load = upstream_load_snapshot(
+                            &state.upstream_load,
+                            cred.id,
+                            req_model.as_deref().unwrap_or("-"),
+                        );
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             model = %req_model.as_deref().unwrap_or("-"),
                             error_type = %etype.as_deref().unwrap_or("-"),
+                            request_id = %request_id,
+                            should_retry = %should_retry,
+                            // 请求形态里与那套「每分钟」限额有关的就这三项，**打标量而不是整段
+                            // body**：这一发在 218 毫秒内、`input_tokens=0` 就被拒了（实测），
+                            // 判据在上游那边是一次计数器查表，与请求内容无关——同一份 body 过
+                            // 一秒就能成功，body 打出来给不出任何判别变量，只是把整段会话原文
+                            // 灌进日志（长对话几 MB 是常态）。
+                            max_tokens = req_max_tokens.unwrap_or(0),
+                            stream = body_json.as_ref().is_some_and(stream_requested),
+                            body_bytes = body.len(),
+                            in_flight = state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                            cred_in_flight = load.cred_in_flight,
+                            route_in_flight = load.route_in_flight,
+                            sent_60s = load.sent,
+                            max_tokens_60s = load.max_tokens,
                             // 字段名同上，不能叫 `message`。
                             upstream_message = %message.chars().take(500).collect::<String>(),
                             "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is what the body says"
@@ -1543,6 +1611,126 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// 「账号 + 模型」维度的上游负载表：每条路线此刻有几条请求在上游那边跑着，以及每个账号在最近
+/// [`UPSTREAM_SEND_WINDOW`] 内发出去了几条、一共声明了多少输出预算。
+///
+/// 存在的理由只有一个：**裸 429（一个限流头都不带的那一档）的成因只能从我们自己这一侧的发送
+/// 密度反推**。那种 429 上游既不给 `anthropic-ratelimit-*`，错误文案也可能只有一句 `Error`
+/// （2026-08-20 实测），而它按的是组织/工作区的**每分钟**口径——请求数、并发连接数、输出
+/// token 预算，三者之一超了。上游不说是哪一个，那就把三者在我们这边的读数一并打出来（见
+/// `carried no rate-limit headers at all` 那行日志），对着组织的限额就能对上号：08d0b58 记下的
+/// 那句实测文案是「40,000 output tokens per minute」，只要 `max_tokens_60s` 越过 40000，
+/// 这发 429 就已经解释完了，不必再猜是速率还是容量。
+///
+/// 三项**只为日志服务，不参与任何判定**：这一档的行为（不换号、按连撞档位退避）一个字节没动。
+pub type UpstreamLoad = std::sync::Arc<parking_lot::Mutex<UpstreamLoadTable>>;
+
+/// 发送记录的统计窗口。取 60 秒是因为上游那套限额本身就是「每分钟」的口径——窗口对不齐，
+/// 读数与限额就没法直接比大小，而这条日志的全部用处就在这个可比性上。
+const UPSTREAM_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`UpstreamLoad`] 的表体。
+#[derive(Default)]
+pub struct UpstreamLoadTable {
+    /// `(账号, 模型)` → 此刻在上游那边跑着的请求数。**归零即删键**，故不像
+    /// [`TransientStreaks`] 那样需要清扫：模型名同样来自来访请求体（乱编就能造键），
+    /// 但这里的键活不过它那几条请求。
+    in_flight: std::collections::HashMap<(i64, String), u32>,
+    /// 账号 → 最近发出去的那些请求的 `(发送时刻, 声明的 max_tokens)`，按时刻升序。
+    ///
+    /// 键是账号 id（来自我们自己的库，有界），且每次触碰都会把滚出窗口的条目丢掉、空了就删键，
+    /// 于是这张表同样自清。
+    ///
+    /// 记**声明的** `max_tokens` 而不是实际产出：上游那档输出限额是按请求声明的上限**预扣**的
+    /// （官方文档口径），等产出算完早就拒了——这也正是「一个 token 都还没产出就撞 429」
+    /// （`input_tokens=0`、`ttft_ms=218`）的解释。
+    sent: std::collections::HashMap<i64, std::collections::VecDeque<(std::time::Instant, i64)>>,
+}
+
+/// 一条已发往上游的请求在 [`UpstreamLoad`] 里占的那一格在飞数，Drop 时归还。
+///
+/// 和 [`InFlightGuard`] 一样挂在 [`ReqLog`] 上活到**响应流结束**，理由同上：流式回复那几十秒
+/// 里连接是真占着的，而并发连接数正是这一档 429 的候选成因之一。换号重试时每轮重新占一格，
+/// 旧的那格在赋值时就归还了。
+pub struct UpstreamRouteGuard {
+    load: UpstreamLoad,
+    key: (i64, String),
+}
+
+impl Drop for UpstreamRouteGuard {
+    fn drop(&mut self) {
+        let mut table = self.load.lock();
+        if let Some(n) = table.in_flight.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                table.in_flight.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// 记一条「这就发出去了」：占住这条路线的在飞格，并把发送时刻与声明的输出上限压进窗口，
+/// 返回归还在飞格的句柄。
+///
+/// **必须在 `send` 之前调用**：上游是按它收到请求的那一刻计数的，我们这边晚记一步，读数就会
+/// 在最要紧的那一瞬（一批并发同时在飞）系统性偏小。
+fn note_upstream_send(
+    load: &UpstreamLoad,
+    cred_id: i64,
+    model: &str,
+    max_tokens: i64,
+) -> UpstreamRouteGuard {
+    let key = (cred_id, model.to_string());
+    {
+        let mut table = load.lock();
+        *table.in_flight.entry(key.clone()).or_default() += 1;
+        let q = table.sent.entry(cred_id).or_default();
+        prune_send_window(q);
+        q.push_back((std::time::Instant::now(), max_tokens));
+    }
+    UpstreamRouteGuard { load: load.clone(), key }
+}
+
+/// 丢掉队首所有已滚出 [`UPSTREAM_SEND_WINDOW`] 的条目（队列按时刻升序，遇到第一条还在窗口内的
+/// 即可停）。
+fn prune_send_window(q: &mut std::collections::VecDeque<(std::time::Instant, i64)>) {
+    while q.front().is_some_and(|(t, _)| t.elapsed() >= UPSTREAM_SEND_WINDOW) {
+        q.pop_front();
+    }
+}
+
+/// 一发裸 429 落地时，我们这一侧的发送密度读数，见 [`UpstreamLoad`]。
+struct UpstreamLoadSnapshot {
+    /// 这条「账号 + 模型」路线此刻的在飞数，**含发起这次查询的这条请求自己**（它的格子还没归还）。
+    route_in_flight: u32,
+    /// 这个账号全部模型合计的在飞数。组织/工作区那套限额不分模型，故这一项才是与限额同口径的
+    /// 那个；分模型那项留着是为了看清「是不是全压在一个模型上」。
+    cred_in_flight: u32,
+    /// 这个账号在窗口内发出去的请求数（含这一条）。
+    sent: usize,
+    /// 同一批请求声明的 `max_tokens` 之和，没声明的按 0 计。
+    max_tokens: i64,
+}
+
+/// 取一份 [`UpstreamLoadSnapshot`]；顺手把这个账号已滚出窗口的发送记录丢掉（空了就删键）。
+fn upstream_load_snapshot(load: &UpstreamLoad, cred_id: i64, model: &str) -> UpstreamLoadSnapshot {
+    let mut table = load.lock();
+    let route_in_flight = table.in_flight.get(&(cred_id, model.to_string())).copied().unwrap_or(0);
+    let cred_in_flight =
+        table.in_flight.iter().filter(|((id, _), _)| *id == cred_id).map(|(_, n)| *n).sum();
+    let (mut sent, mut max_tokens) = (0usize, 0i64);
+    if let Some(q) = table.sent.get_mut(&cred_id) {
+        prune_send_window(q);
+        sent = q.len();
+        max_tokens = q.iter().map(|(_, m)| *m).sum();
+    }
+    // 窗口内一条不剩就把键删了，见 `sent` 的说明（`get_mut` 那句借用还在，故挪到这里做）。
+    if sent == 0 {
+        table.sent.remove(&cred_id);
+    }
+    UpstreamLoadSnapshot { route_in_flight, cred_in_flight, sent, max_tokens }
+}
+
 /// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT、总耗时与用量）并落库。
 struct ReqLog {
     started: std::time::Instant,
@@ -1593,6 +1781,8 @@ struct ReqLog {
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
+    /// 「账号 + 模型」在飞格的句柄，见 [`UpstreamRouteGuard`]：同样只为让那一格活到流结束。
+    _route_load: UpstreamRouteGuard,
 }
 
 impl Drop for ReqLog {
@@ -2049,6 +2239,11 @@ const NOT_ACCOUNT_PHRASES: &[&str] =
     &["not supported for this", "does not support", "unsupported model"];
 
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
+/// 取一个响应头的文本值；缺失或非 UTF-8 时返回 `"-"`，与日志里其余缺值字段同形。
+fn header_text(headers: &HeaderMap, name: &str) -> String {
+    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string()
+}
+
 fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     let text = String::from_utf8_lossy(body);
     let v = serde_json::from_slice::<serde_json::Value>(body).ok();
@@ -2985,6 +3180,15 @@ fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("speed")?.as_str()?.to_string())
 }
 
+/// 读取请求体声明的输出上限（顶层 `max_tokens`）。解析失败或没有该字段时返回 `None`。
+///
+/// **我们从不改这个字段**（理由见 [`ensure_context_management`] 文档里的第 1 条：改掉它等于
+/// 替客户端决定费用天花板），故它就是上游那套「每分钟输出 token」限额实际预扣的那个数，
+/// 拿它来解释裸 429 是站得住的，见 [`UpstreamLoad`]。
+fn request_max_tokens(body: Option<&serde_json::Value>) -> Option<i64> {
+    body?.get("max_tokens")?.as_i64()
+}
+
 /// 请求里那些「上游一旦不认，就会在报错里逐字点名」的取值。
 ///
 /// 两条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
@@ -3110,7 +3314,10 @@ fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u64> {
     }
 }
 
-/// 同一条「账号 + 模型」路线上连撞瞬时限流的记录：(连撞次数, 上次命中时刻)。
+/// 同一条「账号 + 模型」路线上连撞瞬时限流的记录：(连撞档位, **进入这一档的时刻**)。
+///
+/// 第二项是档位的锚点而不是「上次命中时刻」：升档只看这个锚点走了多久，同一档窗口内再撞
+/// 多少发都不刷新它，见 [`next_transient_backoff_at`]。
 type TransientStreaks = std::collections::HashMap<(i64, String), (u32, std::time::Instant)>;
 
 /// [`TransientStreaks`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
@@ -3124,24 +3331,43 @@ pub type TransientBackoff = std::sync::Arc<parking_lot::Mutex<TransientStreaks>>
 /// 一个真的能让出口喘口气的间隔；而 2 秒对偶发的单次限流也不算长。
 const TRANSIENT_BACKOFF_BASE_SECS: u64 = 2;
 
-/// 多久没再撞就把连撞计数清零。
+/// 一个档位挂了多久没能往上走，就把连撞计数清零。
 ///
 /// 取封顶值的两倍：走到封顶时我们让客户端等 60 秒，那么「等满了、回来了、再撞」属于同一串
-/// 拥堵，不该清零；而两倍于此都没再来过，说明上一阵已经过去，下次该从 2 秒重新数起——不然
-/// 计数只增不减，几小时后偶发一次限流也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
+/// 拥堵，不该清零；而两倍于此都没能升档（最长的一档也才 60 秒，故这中间至少有 60 秒没人撞
+/// 过），说明上一阵已经过去，下次该从 2 秒重新数起——不然计数只增不减，几小时后偶发一次
+/// 限流也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
 const TRANSIENT_BACKOFF_RESET: std::time::Duration =
     std::time::Duration::from_secs(2 * MAX_TRANSIENT_COOLDOWN_SECS as u64);
 
 /// 退避表最多留多少格。键是 `(账号, 模型)`，模型名来自来访请求体，故与拒绝日志同样需要清扫。
 const TRANSIENT_BACKOFF_MAX_KEYS: usize = 4096;
 
-/// 同一条「账号 + 模型」路线上最多连吞几发瞬时 429，超过就不再当它是「一阵拥堵」。
+/// 同一条「账号 + 模型」路线上最多连撞到第几档瞬时 429，超过就不再当它是「一阵拥堵」。
 ///
-/// 取 6：正好是退避涨到封顶的那一发（2→4→8→16→32→60）。**退避都涨到头了还在撞**，说明这
+/// 取 6：正好是退避涨到封顶的那一档（2→4→8→16→32→60）。**退避都涨到头了还在撞**，说明这
 /// 不是一阵拥堵，而是这条路线此刻真的走不通——再无限吞下去，客户端就只是一直吃 429，而我们
 /// 手里明明还有别的号没试过。到点即把这一格挪出调度池（见 [`park_rate_limited`]），
 /// 让**后续**请求改走别的号；连撞计数同时清零，冷却过后重新从 2 秒数起。
+///
+/// 数的是**档位**不是发数，两者的区别就是这一档的成败：档位只随墙钟往上走（见
+/// [`next_transient_backoff_at`]），故走到第 6 档意味着这条路线已经连续坏了
+/// 2+4+8+16+32≈62 秒。曾经它数的是发数，于是一批并发一次性就把 6 格吃光——线上那份日志里
+/// 6 条在飞的请求在 63 毫秒内撞完（`ttft_ms` 都在 230 上下），把这个号的这个模型直接硬冷却
+/// 挪出了调度池，1.5 秒内一路点掉 5 个号，正是 [`park_rate_limited`] 那段注释里说要防的
+/// 「转够一圈全池都在冷却」。
 const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
+
+/// 连撞到第 `attempts` 档时该让客户端等多久：`base * 2^(attempts-1)`，封顶
+/// [`MAX_TRANSIENT_COOLDOWN_SECS`]。
+fn transient_backoff_for(attempts: u32) -> std::time::Duration {
+    // 移位次数先夹住，免得在 u64 上左移过界。
+    let shift = attempts.saturating_sub(1).min(u32::BITS - 1);
+    let secs = TRANSIENT_BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_TRANSIENT_COOLDOWN_SECS as u64);
+    std::time::Duration::from_secs(secs)
+}
 
 /// 这条「账号 + 模型」路线该让客户端等多久再来——**连撞一次翻一倍**，封顶
 /// [`MAX_TRANSIENT_COOLDOWN_SECS`]，静默 [`TRANSIENT_BACKOFF_RESET`] 后清零。
@@ -3152,10 +3378,14 @@ const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
 /// 的密度随失败次数下降**，固定值做不到这一点，秒级重试更是直接把拥堵喂大。指数退避让第一次
 /// 偶发限流几乎无感（2 秒），而真的撞上一堵墙时迅速拉到分钟级。
 ///
-/// 返回 `(该等多久, 这是连撞的第几发)`。第二项到达 [`TRANSIENT_MAX_ATTEMPTS`] 即为「吞够了」，
+/// 返回 `(该等多久, 这是连撞的第几档)`。第二项到达 [`TRANSIENT_MAX_ATTEMPTS`] 即为「吞够了」，
 /// 此时计数就地清零——那一发之后这个号的这个模型会被挪出调度池，冷却过去再撞属于新的一串。
 ///
-/// 调用一次即计一次，故只能在**确认要把这发 429 交回客户端**的那条路径上调用。
+/// **升档只看墙钟，不看发数**：同一档的退避时长走完之前再撞多少发都还是这一档。理由见
+/// [`TRANSIENT_MAX_ATTEMPTS`]——按发数数的话，一批并发就等于一串连撞，档位量到的是客户端
+/// 的并发度而不是「等过一轮还在撞」。顺带这也让同一瞬间在飞的那批请求拿到同一个
+/// `retry-after`，而不是各拿一个（线上那份日志里同一毫秒的两发一个 30 一个 30、隔 60 毫秒
+/// 就变成 32 和 60，对客户端毫无意义）。
 fn next_transient_backoff(
     state: &TransientBackoff,
     cred_id: i64,
@@ -3177,24 +3407,26 @@ fn next_transient_backoff_at(
         map.retain(|_, (_, at)| now.duration_since(*at) < TRANSIENT_BACKOFF_RESET);
     }
     let slot = map.entry((cred_id, model.to_string())).or_insert((0, now));
-    // 上一发已经隔得够久 → 这是新的一串，从头数起。
-    if now.duration_since(slot.1) >= TRANSIENT_BACKOFF_RESET {
+    // 这一档挂了够久都没能往上走 → 上一阵拥堵已经过去，这是新的一串，从头数起。
+    let held = now.duration_since(slot.1);
+    if held >= TRANSIENT_BACKOFF_RESET {
         slot.0 = 0;
     }
-    slot.0 = slot.0.saturating_add(1);
-    slot.1 = now;
+    // 升档的唯一条件是「这一档的退避时长已经走完，客户端等过一轮回来还在撞」。窗口内的并发
+    // 共用当前档位：既不递增，**也不刷新锚点**——刷新的话，一个压根不认 `retry-after`、
+    // 200 毫秒就重来的客户端会把锚点一直往后推，档位永远卡在第 1 档，「吞够了」那条逃生口
+    // 就此形同虚设。锚点不动，档位便按墙钟自己往上爬，与客户端的重试密度解耦。
+    if slot.0 == 0 || held >= transient_backoff_for(slot.0) {
+        slot.0 = slot.0.saturating_add(1);
+        slot.1 = now;
+    }
     let attempts = slot.0;
     // 吞够了：这一发之后该号的该模型要被挪出调度池，计数就地清零，冷却过后重新从头数起。
     // 不清的话冷却一到期，第一发就又被判成「连撞第 7 次」，这个号再没有机会证明自己好了。
     if attempts >= TRANSIENT_MAX_ATTEMPTS {
         slot.0 = 0;
     }
-    // 第 n 次连撞等 base * 2^(n-1)；移位次数先夹住，免得在 u64 上左移过界。
-    let shift = (attempts - 1).min(u32::BITS - 1);
-    let secs = TRANSIENT_BACKOFF_BASE_SECS
-        .saturating_mul(1u64 << shift)
-        .min(MAX_TRANSIENT_COOLDOWN_SECS as u64);
-    (std::time::Duration::from_secs(secs), attempts)
+    (transient_backoff_for(attempts), attempts)
 }
 
 /// 记忆表的容量上限。每个「模型 + 字段 + 没见过的取值」占一格，而取值来自来访请求，
@@ -8339,34 +8571,70 @@ mod tests {
         assert_eq!(exhausted.cooldown_for(&scope).as_secs(), 3600);
     }
 
-    /// 瞬时限流交回客户端的 `retry-after` 必须是**指数**退避，不是一个固定值。
+    /// 瞬时限流交回客户端的 `retry-after` 必须是**指数**退避，且档位只随**墙钟**往上走。
     ///
     /// 这一档不换号、也不把号挪出调度池，客户端拿到的就是一发 429——那么「下次什么时候再来」
     /// 就是我们唯一还能影响拥堵的东西。固定值做不到「重试密度随失败次数下降」：一群客户端会
     /// 按同一个节拍同时回来，正在拥堵的出口该塌还是塌；秒级重试更是直接把拥堵喂大。
+    ///
+    /// 「随墙钟」那一半是后补的，见 [`super::TRANSIENT_MAX_ATTEMPTS`]：这条用例曾经拿 1 毫秒
+    /// 间隔连打 8 发去断言整条阶梯，等于把「档位数的是并发度」这个 bug 冻进了测试里。
     #[test]
-    fn transient_backoff_doubles_per_consecutive_hit_and_decays_when_quiet() {
+    fn transient_backoff_doubles_once_per_elapsed_window_and_decays_when_quiet() {
         let state = super::TransientBackoff::default();
         let t0 = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
         let hit = |at: std::time::Instant| {
             let (wait, attempts) = super::next_transient_backoff_at(&state, 1, "claude-opus-5", at);
             (wait.as_secs(), attempts)
         };
 
-        // 一串的完整形状：2 → 4 → 8 → 16 → 32 → 60，第 6 发即「吞够了」，之后重新从 2 数起。
-        // 封顶那一发就是上限本身：退避都涨到头还在撞，再吞下去只是让客户端一直吃 429。
-        let seen: Vec<(u64, u32)> =
-            (0..8).map(|i| hit(t0 + std::time::Duration::from_millis(i))).collect();
+        // 一串的完整形状：2 → 4 → 8 → 16 → 32 → 60，第 6 档即「吞够了」，之后重新从 2 数起。
+        // 封顶那一档就是上限本身：退避都涨到头还在撞，再吞下去只是让客户端一直吃 429。
+        // 升档的时刻是**上一档等满**的时刻，故走完整条阶梯要 2+4+8+16+32=62 秒。
+        let ladder: Vec<(u64, u32)> =
+            [0, 2, 6, 14, 30, 62].iter().map(|s| hit(t0 + secs(*s))).collect();
         assert_eq!(
-            seen,
-            vec![(2, 1), (4, 2), (8, 3), (16, 4), (32, 5), (60, 6), (2, 1), (4, 2)],
-            "应逐次翻倍、在第 6 发到达上限，然后清零重来"
+            ladder,
+            vec![(2, 1), (4, 2), (8, 3), (16, 4), (32, 5), (60, 6)],
+            "每等满一档才翻一倍，第 6 档到达上限"
         );
+        assert_eq!(hit(t0 + secs(63)), (2, 1), "吞够了就地清零，下一发从头数起");
         assert_eq!(
             super::TRANSIENT_MAX_ATTEMPTS,
             6,
-            "上限必须正好落在退避封顶那一发上，否则 60 秒那一档要么白等要么根本走不到"
+            "上限必须正好落在退避封顶那一档上，否则 60 秒那一档要么白等要么根本走不到"
         );
+
+        // 并发不吃档位：同一瞬间在飞的一批请求共用当前档位，一起拿 2 秒、一起算连撞第 1 档。
+        // 线上那份日志里 6 条并发（`ttft_ms` 都在 230 上下）在 63 毫秒内撞完，按发数数就把
+        // 6 格一次性吃光，于是这个号的这个模型被硬冷却挪出调度池，1.5 秒内一路点掉 5 个号。
+        let burst: Vec<(u64, u32)> = (0..8)
+            .map(|i| {
+                let at = t0 + std::time::Duration::from_millis(i);
+                let (wait, attempts) =
+                    super::next_transient_backoff_at(&state, 3, "claude-opus-5", at);
+                (wait.as_secs(), attempts)
+            })
+            .collect();
+        assert_eq!(burst, vec![(2, 1); 8], "毫秒级的并发突发只能算连撞第 1 档");
+        assert!(
+            burst.iter().all(|(_, n)| *n < super::TRANSIENT_MAX_ATTEMPTS),
+            "并发突发绝不能触发「吞够了」——那会把这个号的这个模型硬冷却挪出调度池"
+        );
+
+        // 不认 `retry-after`、毫秒级重来的客户端照样要能把档位顶上去：锚点不刷新，档位按墙钟
+        // 自己爬。没有这一条，「吞够了」那条逃生口对这类客户端永远走不到。
+        let hammer = |at: std::time::Instant| {
+            super::next_transient_backoff_at(&state, 4, "claude-opus-5", at).1
+        };
+        let mut ms = 0u64;
+        let mut peak = 0;
+        while ms <= 62_000 {
+            peak = peak.max(hammer(t0 + std::time::Duration::from_millis(ms)));
+            ms += 200;
+        }
+        assert_eq!(peak, super::TRANSIENT_MAX_ATTEMPTS, "连坏 62 秒就该判定这条路线走不通");
 
         // 别的账号、别的模型各算各的——一条路线拥堵不该让不相干的请求跟着等。
         assert_eq!(
@@ -8380,20 +8648,14 @@ mod tests {
             "同一个账号的另一个模型也应从头数起"
         );
 
-        // 静默够久 → 清零，从 2 秒重新数起。没有这条的话计数只增不减，几小时后偶发一次限流
-        // 也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
-        // 从**最后一发**（t0+7ms）算起要够久，不是从 t0 算起——重置看的是静默时长。
-        let later = t0 + super::TRANSIENT_BACKOFF_RESET + std::time::Duration::from_secs(1);
-        assert_eq!(
-            super::next_transient_backoff_at(&state, 1, "claude-opus-5", later).0.as_secs(),
-            super::TRANSIENT_BACKOFF_BASE_SECS,
-            "静默超过重置窗口后应回到起点"
-        );
-        // 刚清过零，紧接着再撞就是这一串的第二次。
-        assert_eq!(
-            super::next_transient_backoff_at(&state, 1, "claude-opus-5", later).0.as_secs(),
-            super::TRANSIENT_BACKOFF_BASE_SECS * 2,
-        );
+        // 一档挂够久没能升上去 → 清零，从 2 秒重新数起。没有这条的话计数只增不减，几小时后
+        // 偶发一次限流也会被判成「连撞第 9 档」，直接甩给客户端 60 秒。
+        // 从**进入这一档的时刻**（上面那发 t0+63s）算起要够久，不是从 t0 算起。
+        let later = t0 + secs(63) + super::TRANSIENT_BACKOFF_RESET + secs(1);
+        assert_eq!(hit(later), (2, 1), "这一档挂过重置窗口后应回到起点");
+        // 刚清过零，等满这一档再撞才是这一串的第二档。
+        assert_eq!(hit(later + secs(1)), (2, 1), "还没等满，仍是第 1 档");
+        assert_eq!(hit(later + secs(2)), (4, 2), "等满 2 秒又撞上，这才是第 2 档");
     }
 
     /// 「限流头一条都没带」的判据不能靠 [`RateLimitInfo::raw`] 是否为空——线上那发裸 429
@@ -8483,9 +8745,13 @@ mod tests {
     }
 
     /// 上游没给 `retry-after` 时，客户端实际拿到的退避序列。指数那一半几乎全被 30 秒的
-    /// 地板（[`DEFAULT_MODEL_COOLDOWN_SECS`]）吃掉：只有第 5、6 发才越过它。
+    /// 地板（[`DEFAULT_MODEL_COOLDOWN_SECS`]）吃掉：只有第 5、6 档才越过它。
     /// [`next_transient_backoff`] 的注释里那句「第一次偶发限流几乎无感（2 秒）」在这条路上
     /// 不成立。线上日志里那串 30/30/30/30/32/60 就是这么来的。
+    ///
+    /// 但那串在线上是 63 毫秒内打完的——那是「档位数发数」的锅，现在它只能是 62 秒的产物；
+    /// 同一瞬间的一批并发从头到尾都是 30。两条一起断言，免得日后有人看着日志里的
+    /// 30/30/30/30/32/60 又把发数计数改回去。
     #[test]
     fn the_backoff_a_client_actually_sees_is_almost_flat() {
         let bare = super::RateLimitInfo::from_headers(&super::HeaderMap::new());
@@ -8494,13 +8760,27 @@ mod tests {
 
         let state = super::TransientBackoff::default();
         let t0 = std::time::Instant::now();
-        let seen: Vec<u64> = (0..6)
-            .map(|_| {
-                let (wait, _) = super::next_transient_backoff_at(&state, 1, "claude-opus-5", t0);
-                floor.max(wait).as_secs()
-            })
-            .collect();
-        assert_eq!(seen, vec![30, 30, 30, 30, 32, 60], "与线上日志逐发对得上");
+        let seen = |cred_id, offsets: &[u64]| -> Vec<u64> {
+            offsets
+                .iter()
+                .map(|ms| {
+                    let at = t0 + std::time::Duration::from_millis(*ms);
+                    let (wait, _) =
+                        super::next_transient_backoff_at(&state, cred_id, "claude-opus-5", at);
+                    floor.max(wait).as_secs()
+                })
+                .collect()
+        };
+        assert_eq!(
+            seen(1, &[0, 2_000, 6_000, 14_000, 30_000, 62_000]),
+            vec![30, 30, 30, 30, 32, 60],
+            "熬满整条阶梯才与线上日志那串逐档对得上"
+        );
+        assert_eq!(
+            seen(2, &[0, 5, 10, 13, 31, 63]),
+            vec![30; 6],
+            "线上那 63 毫秒内的 6 条并发，如今一律是第 1 档的 30 秒"
+        );
     }
 
     /// 落库展示用的全窗口快照：三张分开收集的表（status / utilization / reset）要按窗口名
@@ -8970,6 +9250,7 @@ mod tests {
                 stream_broke: None,
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
+                _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
             })
         };
         // 非模拟路径：来访那份原样转发，两列相同。
@@ -9020,6 +9301,7 @@ mod tests {
             stream_broke: None,
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
+            _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
         };
         rl.sniffer.feed(
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":47030}}}\n\n",
@@ -9108,6 +9390,106 @@ mod tests {
         assert_eq!(counter.load(Relaxed), 1, "一条走完只减自己那格");
         drop(b);
         assert_eq!(counter.load(Relaxed), 0, "全部走完必须回到 0");
+    }
+
+    /// 上游负载表的三项读数：路线在飞、账号在飞（跨模型合计）、窗口内的发送数与输出预算之和。
+    ///
+    /// 钉住它是因为这三项是裸 429 唯一的解释来源（上游那一档一个限流头都不给），读数错了
+    /// 排查就会被带向错误的方向：在飞数只涨不落会把「一条一条发」误判成并发触限，
+    /// `max_tokens` 漏加会让「输出预算超了」这条真正的成因看不出来。
+    #[test]
+    fn upstream_load_counts_in_flight_and_the_send_window() {
+        let load: super::UpstreamLoad = Default::default();
+        let snap = |model: &str| super::upstream_load_snapshot(&load, 1, model);
+
+        // 同一个号的两条路线：一条 sonnet 两发、一条 opus 一发。
+        let a = super::note_upstream_send(&load, 1, "claude-sonnet-5", 32000);
+        let b = super::note_upstream_send(&load, 1, "claude-sonnet-5", 8000);
+        let c = super::note_upstream_send(&load, 1, "claude-opus-5", 1024);
+        // 别的号不该混进来（限额按组织算，但表是按号分的）。
+        let _other = super::note_upstream_send(&load, 2, "claude-sonnet-5", 64000);
+
+        let s = snap("claude-sonnet-5");
+        assert_eq!(s.route_in_flight, 2, "这条路线两发在飞，含发起查询的那条自己");
+        assert_eq!(s.cred_in_flight, 3, "账号维度要跨模型合计——限额不分模型");
+        assert_eq!(s.sent, 3, "窗口内这个号一共发了三条");
+        assert_eq!(s.max_tokens, 32000 + 8000 + 1024, "声明的输出上限逐条累加");
+        assert_eq!(snap("claude-opus-5").route_in_flight, 1, "另一条路线各算各的");
+
+        drop(a);
+        assert_eq!(snap("claude-sonnet-5").route_in_flight, 1, "走完一条只归还自己那格");
+        drop(b);
+        drop(c);
+        let s = snap("claude-sonnet-5");
+        assert_eq!(s.route_in_flight, 0, "全部走完必须回到 0");
+        assert_eq!(s.cred_in_flight, 0);
+        assert_eq!(s.sent, 3, "在飞归零不影响发送窗口：那是「最近一分钟发过什么」，不是「还在飞」");
+
+        // 归零即删键，故不需要清扫（模型名来自来访请求体，乱编就能造键）。
+        assert!(
+            !load.lock().in_flight.keys().any(|(id, _)| *id == 1),
+            "这个号的在飞格全归还后不该留下空键"
+        );
+        // 未声明 max_tokens 的按 0 计，不影响其余条目。
+        let _d = super::note_upstream_send(&load, 3, "-", 0);
+        let s3 = super::upstream_load_snapshot(&load, 3, "-");
+        assert_eq!((s3.sent, s3.max_tokens), (1, 0));
+    }
+
+    /// 窗口外的发送记录不算数，且清空后连键一起删掉——不然一个久不用的号会永远留着一条空队列。
+    #[test]
+    fn upstream_send_window_drops_stale_entries() {
+        let load: super::UpstreamLoad = Default::default();
+        let guard = super::note_upstream_send(&load, 7, "claude-sonnet-5", 4096);
+        // 把那条记录的时刻推到窗口之外（真等 60 秒不是测试该干的事）。
+        {
+            let mut table = load.lock();
+            let q = table.sent.get_mut(&7).unwrap();
+            q[0].0 = q[0]
+                .0
+                .checked_sub(super::UPSTREAM_SEND_WINDOW)
+                .expect("Instant 是自启动起算的单调时钟，机器开机不足一分钟时减不出来");
+        }
+        let s = super::upstream_load_snapshot(&load, 7, "claude-sonnet-5");
+        assert_eq!((s.sent, s.max_tokens), (0, 0), "滚出窗口的不该再算进来");
+        assert_eq!(s.route_in_flight, 1, "但它还在飞——两件事，两条时间线");
+        assert!(!load.lock().sent.contains_key(&7), "窗口空了就把键删掉");
+        drop(guard);
+    }
+
+    /// `max_tokens` 的读法：只认顶层的整数，读不出来一律 `None`（日志里落成 0）。
+    #[test]
+    fn request_max_tokens_reads_the_declared_output_cap() {
+        let mt = |s: &str| {
+            let v: serde_json::Value = serde_json::from_str(s).unwrap();
+            super::request_max_tokens(Some(&v))
+        };
+        assert_eq!(mt(r#"{"max_tokens":64000}"#), Some(64000));
+        assert_eq!(mt(r#"{"model":"claude-sonnet-5"}"#), None, "没写就是没写，别猜一个默认值");
+        assert_eq!(mt(r#"{"max_tokens":"64000"}"#), None, "字符串不算——上游认的是整数");
+        assert_eq!(super::request_max_tokens(None), None, "body 不是 JSON 时同样读不出");
+    }
+
+    /// 响应头取文本：缺失与非 UTF-8 都落回 `-`，与日志里其余缺值字段同形。
+    #[test]
+    fn header_text_falls_back_to_a_dash() {
+        let mut h = super::HeaderMap::new();
+        h.insert(
+            super::HeaderName::from_static("request-id"),
+            HeaderValue::from_static("req_011CTt5abcd"),
+        );
+        h.insert(
+            super::HeaderName::from_static("x-should-retry"),
+            HeaderValue::from_static("true"),
+        );
+        assert_eq!(super::header_text(&h, "request-id"), "req_011CTt5abcd");
+        assert_eq!(super::header_text(&h, "x-should-retry"), "true");
+        assert_eq!(super::header_text(&h, "retry-after"), "-", "缺失落回占位");
+        h.insert(
+            super::HeaderName::from_static("x-weird"),
+            HeaderValue::from_bytes("中文".as_bytes()).unwrap(),
+        );
+        assert_eq!(super::header_text(&h, "x-weird"), "-", "非 UTF-8 头值不猜");
     }
 
     /// 版本串解析：段数不齐按 0 补齐，预发布后缀按主版本算，非数字段作废。
@@ -9644,6 +10026,7 @@ mod tests {
             stream_broke: None,
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
+            _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
         }
     }
 }

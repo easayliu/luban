@@ -62,6 +62,10 @@ pub struct AppState {
     /// 瞬时限流的退避记忆表：同一条「账号 + 模型」路线连撞几次，交回客户端的 `retry-after`
     /// 就翻几倍。见 [`crate::proxy::TransientBackoff`]。
     pub transient_backoff: crate::proxy::TransientBackoff,
+    /// 上游负载表：每条「账号 + 模型」路线此刻的在飞数，与每个账号最近一分钟的发送记录。
+    /// 只为给裸 429（一个限流头都不带的那一档）留下能对上游限额的读数，见
+    /// [`crate::proxy::UpstreamLoad`]。
+    pub upstream_load: crate::proxy::UpstreamLoad,
     /// **在途请求数**：已进入转发入口、响应尚未走完的那些。
     ///
     /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
@@ -91,6 +95,7 @@ pub async fn run(
         shape_rejections: Arc::default(),
         rejection_log: Arc::default(),
         transient_backoff: Arc::default(),
+        upstream_load: Arc::default(),
         in_flight: Arc::default(),
     };
 
