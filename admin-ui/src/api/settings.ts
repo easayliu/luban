@@ -33,8 +33,10 @@ export interface Settings {
   bare_rate_window_secs: number
   /** 上游 429 后最多追加尝试的账号数，不含首次请求；0 表示不重试。 */
   rate_limit_retry_max: number
-  /** 额度用到多少百分比就提前把账号挪出调度池；0 表示关闭（等真收到 429 才停）。 */
+  /** 5h 窗口用到多少百分比就提前把账号挪出调度池；0 表示关闭（等真收到 429 才停）。 */
   quota_pause_pct: number
+  /** 7d 窗口的同一档阈值，另算；0（默认）表示不按周用量停号。 */
+  quota_pause_pct_7d: number
   /** 改写 metadata.user_id 里的 account_uuid/device_id 为凭证自洽身份。 */
   spoof_identity: boolean
   /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
@@ -174,11 +176,15 @@ export async function setRateLimitRetryMax(n: number): Promise<Settings> {
 /**
  * 设置「额度用到多少就提前停调度」的阈值（百分比；0 = 关闭，后端夹到 0~100）。
  *
+ * 5h 与 7d 是两档、各存各的：同一个百分比在两个窗口上的后果差着数量级（5h 停号歇几小时就
+ * 回来，7d 停号是歇到下个周重置），故 7d 那档默认关。`pct7d` 不传就保持现值。
+ *
  * 与 429 后的冷却同受「429 自动换号」总开关：那个关掉时本项不生效。
  */
-export async function setQuotaPausePct(pct: number): Promise<Settings> {
+export async function setQuotaPausePct(pct: number, pct7d?: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/quota-pause-pct', {
     quota_pause_pct: pct,
+    quota_pause_pct_7d: pct7d,
   })
   return data
 }

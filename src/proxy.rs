@@ -4811,6 +4811,11 @@ fn park_rate_limited(
 /// 200，按它停整个号是误伤。同理这里也不做模型级那一档：使用率讲的是账号额度，不是某个
 /// 模型此刻有没有容量。
 ///
+/// **5h 与 7d 各用各的阈值**（[`QuotaPauseThresholds`]），默认只按 5h 停、7d 那档是关的。
+/// 混用一个数字的老口径会让一个周用量偏高的号被整段停掉——5h 明明还空着、这会儿完全能干活，
+/// 却要等到下个 7d 重置才回池。7d 真满了不需要我们提前动手：那时上游自己回 429，账号级冷却
+/// 接手，睡到 7d 重置为止。要开天级那档见 [`store::QUOTA_PAUSE_PCT_7D`]。
+///
 /// 停到哪：越过阈值的那些基础窗口中**最晚**的一个 `*-reset`（取 max 的理由同
 /// [`RateLimitInfo::exhausted_base_reset`]：5h 到点了 7d 照样拦着）。落库、恢复路径与账号级
 /// 429 完全一致——到点惰性自动恢复、连通性测试通过自动恢复、控制台手动打开。
@@ -4825,20 +4830,20 @@ fn park_if_quota_nearly_exhausted(
     // 与 429 那一档同受「限流冷却/换号重试」这个总开关：关掉它的人要的是**完全**不干预调度、
     // 原样把上游的判决交给客户端，那时按使用率自动停号只会是个惊吓。要单独关本机制，把阈值
     // 配成 0 即可。
-    let pct = store.quota_pause_pct();
-    if pct <= 0 || !store.forward_flags().rate_limit_retry {
+    let thresholds = QuotaPauseThresholds::from_store(store);
+    if thresholds.all_off() || !store.forward_flags().rate_limit_retry {
         return false;
     }
-    let threshold = pct as f64 / 100.0;
-    let Some((window, used)) = info.saturated_base_window(threshold) else {
+    let Some((window, used)) = info.saturated_base_window(&thresholds) else {
         return false;
     };
+    let pct = thresholds.pct_for(window);
     // 同一批限流头会被这个号所有在途请求各看一遍：已经停在池外的就别再写库、也别再刷屏。
     // 读一次库的代价只在真越阈值时付，正常流量走不到这里。
     if matches!(store.get(cred.id), Ok(Some(c)) if c.disabled) {
         return true;
     }
-    let cooldown = info.quota_pause_cooldown(threshold);
+    let cooldown = info.quota_pause_cooldown(&thresholds);
     let resume_at = crate::credentials::now_secs() + cooldown.as_secs();
     let reason = format!(
         "quota nearly exhausted: window {window} is at {:.1}% (pause threshold {pct}%), scheduling resumes automatically in about {}",
@@ -4895,6 +4900,52 @@ fn human_secs(d: std::time::Duration) -> String {
 /// （[`RateLimitInfo::exhausted_base_reset`]）。两处必须同一口径，故抽成一个函数。
 fn is_overage_window(w: &str) -> bool {
     w.ends_with("_oi") || w.contains("overage")
+}
+
+/// 这个窗口是不是**天级**的（`7d`，将来若有 `30d` 同理）。
+///
+/// 按名字的时间单位分，而不是照着 `7d` 写死一个等号：上游加一个新窗口时，`3d` 该跟着天级那档
+/// 走、`1h` 该跟着小时级那档走，这是唯一不用改代码也不会错档的分法。超额族在调用点已经先被
+/// [`is_overage_window`] 滤掉了，`7d_oi` 落不到这里。
+fn is_long_window(w: &str) -> bool {
+    w.ends_with('d')
+}
+
+/// 提前停调度的两档阈值：小时级窗口（`5h`）一档、天级窗口（`7d`）另一档，各自 `0` = 该档不停。
+///
+/// **不共用一个数**：同一个 90% 在两个窗口上的后果差着数量级——5h 停号最多歇几小时就自己回来，
+/// 7d 停号是歇到下个周重置。原来两档混用一个阈值，结果一个周用量偏高的号会被整段挪出池子，
+/// 哪怕它这 5 小时一点没用、还能正常干活。天级那档默认关，见
+/// [`store::QUOTA_PAUSE_PCT_7D`]。
+#[derive(Clone, Copy, Debug)]
+struct QuotaPauseThresholds {
+    /// 小时级窗口的阈值（百分比，`0` = 关）。
+    short_pct: i64,
+    /// 天级窗口的阈值（百分比，`0` = 关）。
+    long_pct: i64,
+}
+
+impl QuotaPauseThresholds {
+    fn from_store(store: &store::CredentialStore) -> Self {
+        Self { short_pct: store.quota_pause_pct(), long_pct: store.quota_pause_pct_7d() }
+    }
+
+    /// 该窗口适用的阈值（百分比）。
+    fn pct_for(&self, window: &str) -> i64 {
+        if is_long_window(window) { self.long_pct } else { self.short_pct }
+    }
+
+    /// 该窗口的使用率算不算越过了它自己那档阈值。那档配成 `0`（关）时恒为 false——
+    /// 「关」必须真的什么都不做，不能让 `used >= 0.0` 把每条响应都判成越阈值。
+    fn crossed(&self, window: &str, used: f64) -> bool {
+        let pct = self.pct_for(window);
+        pct > 0 && used >= pct as f64 / 100.0
+    }
+
+    /// 两档都关着 = 本机制整个不启用。
+    fn all_off(&self) -> bool {
+        self.short_pct <= 0 && self.long_pct <= 0
+    }
 }
 
 /// 上游订阅账号限流快照，从 `anthropic-ratelimit-unified-*` 响应头解析。
@@ -5141,32 +5192,36 @@ impl RateLimitInfo {
             .collect()
     }
 
-    /// 使用率已越过 `threshold`（0~1）的**基础**窗口里，用得最狠的那个 `(窗口名, 使用率)`。
+    /// 已越过**自己那档**阈值的**基础**窗口里，用得最狠的那个 `(窗口名, 使用率)`。
     ///
     /// 供 [`park_if_quota_nearly_exhausted`] 判定与写原因文案。取使用率最高的那个纯粹是为了
     /// 让文案指向最有说服力的那一个——停多久另算，见 [`Self::quota_pause_cooldown`]。
     /// 超额族窗口不算（[`is_overage_window`]），口径与 [`rate_limit_scope`] 一致。
-    fn saturated_base_window(&self, threshold: f64) -> Option<(&str, f64)> {
+    ///
+    /// 阈值按窗口分档取（[`QuotaPauseThresholds`]）：5h 用 5h 那档、7d 用 7d 那档，某档关着
+    /// 时那个窗口再满也不参与判定。
+    fn saturated_base_window(&self, t: &QuotaPauseThresholds) -> Option<(&str, f64)> {
         self.window_utilization
             .iter()
-            .filter(|(w, u)| !is_overage_window(w) && *u >= threshold)
+            .filter(|(w, u)| !is_overage_window(w) && t.crossed(w, *u))
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(w, u)| (w.as_str(), *u))
     }
 
-    /// 按阈值提前停调度时该睡多久：越过阈值的基础窗口中**最晚**的那个 `*-reset`。
+    /// 按阈值提前停调度时该睡多久：越过**自己那档**阈值的基础窗口中**最晚**的那个 `*-reset`。
     ///
-    /// 取 max 而不是 min，理由同 [`Self::exhausted_base_reset`]——5h 和 7d 同时逼近上限时，
-    /// 5h 到点了 7d 照样拦着，早醒只会立刻再被停一次。没有逐窗口 reset 时退到不带窗口名的
+    /// 取 max 而不是 min，理由同 [`Self::exhausted_base_reset`]——两个窗口都越过各自阈值时，
+    /// 5h 到点了 7d 那档照样拦着，早醒只会立刻再被停一次。反过来，7d 那档关着（默认）时它
+    /// 压根不参与，一次 5h 触发的停号就只睡到 5h 重置，不会被一个用了 95% 的 7d 拖成几天。没有逐窗口 reset 时退到不带窗口名的
     /// `unified-reset`，再退到所有窗口里最早的 reset，最后才是
     /// [`DEFAULT_RATE_LIMIT_COOLDOWN_SECS`]。
     ///
     /// **不看 `retry-after`**：这一档判定发生在一条**正常响应**上，那个头压根不会出现。
-    fn quota_pause_cooldown(&self, threshold: f64) -> std::time::Duration {
+    fn quota_pause_cooldown(&self, t: &QuotaPauseThresholds) -> std::time::Duration {
         let now = crate::credentials::now_secs() as i64;
         let future_secs = |reset: i64| Some(reset - now).filter(|d| *d > 0);
         let over =
-            |w: &str| self.window_utilization.iter().any(|(name, u)| name == w && *u >= threshold);
+            |w: &str| self.window_utilization.iter().any(|(name, u)| name == w && t.crossed(w, *u));
         let saturated_reset = self
             .window_reset
             .iter()
@@ -8980,8 +9035,10 @@ mod tests {
         assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &oi_hot));
         assert!(!store.get(cred.id).unwrap().unwrap().disabled, "超额池快满不该停整个号");
 
-        // 基础窗口 93%：还没被拒（status 仍是 allowed，上游也没回 429），照样提前退场，
-        // 且睡到**越过阈值的那些基础窗口里最晚**的那个 reset（7d 的 50 小时，不是 5h 的 2 小时）。
+        // 5h 93%：还没被拒（status 仍是 allowed，上游也没回 429），照样提前退场。
+        // 同一份头里 7d 也有 95%，但天级那档默认是关的——**只**按 5h 判、也只睡到 5h 的
+        // 那个 reset（2 小时），不能被一个高位的 7d 拖成 50 小时：那 5 小时后这个号明明
+        // 又能干活了。
         let hot = hdr(&[
             ("anthropic-ratelimit-unified-status", "allowed"),
             ("anthropic-ratelimit-unified-5h-status", "allowed"),
@@ -8995,12 +9052,46 @@ mod tests {
         let after = store.get(cred.id).unwrap().unwrap();
         assert!(after.disabled, "越过阈值就该把号挪出调度池");
         let wait = after.resume_at.expect("按阈值停的号必须能到点自恢复") as i64 - now;
-        assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到较晚的 7d reset，实得 {wait}");
+        assert!((2 * 3600 - 5..=2 * 3600).contains(&wait), "应睡到 5h reset，实得 {wait}");
         let reason = after.ban_reason.expect("卡片上要说清为什么不干活");
-        assert!(reason.contains("95.0%") && reason.contains("90%"), "原因文案：{reason}");
+        assert!(reason.contains("93.0%") && reason.contains("90%"), "原因文案：{reason}");
 
         // 幂等：同一批限流头被并发在途的请求各看一遍，不该反复写库。
         assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &hot));
+
+        // 只有 7d 高位、5h 还空着：默认**不停**。这个号这 5 小时完全能干活，周用量偏高不是
+        // 停它的理由——真把周额度用光了上游会自己回 429，账号级冷却那条路接手。
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+        let weekly_hot = hdr(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.10"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.97"),
+            ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
+        ]);
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot));
+        assert!(!store.get(cred.id).unwrap().unwrap().disabled, "7d 那档默认关，不该停号");
+
+        // 单独把天级那档打开（95%）：同一份头就该停，且睡到 **7d** 的 reset——这一档的代价
+        // 本来就是「停到下个周重置」，配它的人要的正是这个。
+        store.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").unwrap();
+        assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot));
+        let after = store.get(cred.id).unwrap().unwrap();
+        let wait = after.resume_at.expect("同样要能到点自恢复") as i64 - now;
+        assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到 7d reset，实得 {wait}");
+        let reason = after.ban_reason.expect("原因要写清是哪个窗口、按哪个阈值");
+        assert!(
+            reason.contains("7d") && reason.contains("97.0%") && reason.contains("95%"),
+            "{reason}"
+        );
+
+        // 两档互不干扰：5h 那档配成 0（关）时，7d 那档照样按自己的阈值停号。
+        let only_7d = store::CredentialStore::open_in_memory().unwrap();
+        let c = only_7d.insert("b", None, "at", "rt", u64::MAX, None, None).unwrap();
+        only_7d.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
+        only_7d.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").unwrap();
+        assert!(super::park_if_quota_nearly_exhausted(&only_7d, &c, &weekly_hot));
+        assert!(only_7d.get(c.id).unwrap().unwrap().disabled, "5h 那档关着不影响 7d 那档");
 
         // 阈值配成 0 = 关掉本机制，退回「收到 429 才停」。
         let store = store::CredentialStore::open_in_memory().unwrap();

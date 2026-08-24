@@ -942,9 +942,12 @@ struct SettingsResp {
     bare_rate_window_secs: i64,
     /// 上游 429 时最多换几个号重试；0 表示不重试。
     rate_limit_retry_max: i64,
-    /// 额度使用率到多少百分比就提前把号挪出调度池；0 表示关闭（收到 429 才停）。
+    /// **5h 窗口**的使用率到多少百分比就提前把号挪出调度池；0 表示关闭（收到 429 才停）。
     /// 见 [`crate::proxy::park_if_quota_nearly_exhausted`]。
     quota_pause_pct: i64,
+    /// **7d 窗口**的同一档阈值，另算；0（默认）= 不按周用量停号，见
+    /// [`crate::store::QUOTA_PAUSE_PCT_7D`]。
+    quota_pause_pct_7d: i64,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -1024,6 +1027,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
     let quota_pause_pct = state.store.quota_pause_pct();
+    let quota_pause_pct_7d = state.store.quota_pause_pct_7d();
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -1044,6 +1048,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             bare_rate_window_secs,
             rate_limit_retry_max,
             quota_pause_pct,
+            quota_pause_pct_7d,
             forwarding,
         };
     }
@@ -1071,6 +1076,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         bare_rate_window_secs,
         rate_limit_retry_max,
         quota_pause_pct,
+        quota_pause_pct_7d,
         forwarding,
     }
 }
@@ -1281,20 +1287,40 @@ async fn set_rate_limit_retry_max(
 
 #[derive(Deserialize)]
 struct SetQuotaPausePctReq {
-    /// 额度使用率到多少百分比就提前停调度；0 表示关闭（收到 429 才停），后端夹到 0~100。
+    /// **5h 窗口**的阈值：使用率到多少百分比就提前停调度；0 表示关闭（收到 429 才停），
+    /// 后端夹到 0~100。
     quota_pause_pct: i64,
+    /// **7d 窗口**的阈值，另算；0 = 不按周用量停号。不传 = 保持现值（前端只改一档时不必
+    /// 回传另一档，与裸请求速率那对字段同一个约定）。
+    #[serde(default)]
+    quota_pause_pct_7d: Option<i64>,
 }
 
 /// 设置「额度用到多少就提前停调度」的阈值，见
 /// [`crate::proxy::park_if_quota_nearly_exhausted`]。与 429 冷却同受转发形态里的
 /// `rate_limit_retry` 总开关。
+///
+/// 5h 与 7d 是**两档**、各存各的：同一个百分比在两个窗口上的后果差着数量级，7d 那档默认关
+/// （见 [`crate::store::QUOTA_PAUSE_PCT_7D`]）。
 async fn set_quota_pause_pct(
     State(state): State<AppState>,
     Json(req): Json<SetQuotaPausePctReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let pct = req.quota_pause_pct.clamp(0, 100);
     state.store.set_setting(crate::store::QUOTA_PAUSE_PCT, &pct.to_string()).map_err(internal)?;
-    tracing::info!(quota_pause_pct = pct, "quota-threshold scheduling pause changed");
+    // 7d 那档只在传了的时候写：两档各存各的，前端拨一档不该顺手把另一档也覆盖成默认值。
+    let pct_7d = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
+    if let Some(p) = pct_7d {
+        state
+            .store
+            .set_setting(crate::store::QUOTA_PAUSE_PCT_7D, &p.to_string())
+            .map_err(internal)?;
+    }
+    tracing::info!(
+        quota_pause_pct = pct,
+        quota_pause_pct_7d = ?pct_7d,
+        "quota-threshold scheduling pause changed"
+    );
     Ok(Json(settings_resp(&state)))
 }
 

@@ -1233,18 +1233,35 @@ impl CredentialStore {
             .clamp(0, 10) as usize
     }
 
-    /// 额度使用率到多少百分比就提前把这个号挪出调度池（`0` 表示关闭，只在真收到 429 时才停）。
+    /// **5h 窗口**的使用率到多少百分比就提前把这个号挪出调度池（`0` 表示关闭，只在真收到
+    /// 429 时才停）。
     ///
     /// 判定与停用都在 `crate::proxy::park_if_quota_nearly_exhausted`：上游**每一条**响应都
     /// 报基础额度窗口的使用率，越过这个数就当额度已耗尽，不必等下一发请求去撞 429。
     /// 未设置时用 [`DEFAULT_QUOTA_PAUSE_PCT`]（90），取值夹在 `0..=100`（100 即「满了才停」，
     /// 与不开本机制的差别只剩「不用等 429」）。
+    ///
+    /// **只管小时级窗口**：7d 那种天级窗口另配一档 [`Self::quota_pause_pct_7d`]，理由见
+    /// [`QUOTA_PAUSE_PCT_7D`]。
     pub fn quota_pause_pct(&self) -> i64 {
         self.get_setting(QUOTA_PAUSE_PCT)
             .ok()
             .flatten()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(DEFAULT_QUOTA_PAUSE_PCT)
+            .clamp(0, 100)
+    }
+
+    /// **7d（天级）窗口**的提前停调度阈值；`0`（含未设置，即默认）= 不按这个窗口停号。
+    ///
+    /// 与 [`Self::quota_pause_pct`] 是两档、各算各的，别指望一个数字管两边——同一个 90%
+    /// 在 5h 上是「歇几小时」，在 7d 上是「歇到几天后」。默认关，见 [`QUOTA_PAUSE_PCT_7D`]。
+    pub fn quota_pause_pct_7d(&self) -> i64 {
+        self.get_setting(QUOTA_PAUSE_PCT_7D)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_QUOTA_PAUSE_PCT_7D)
             .clamp(0, 100)
     }
 
@@ -1973,6 +1990,21 @@ pub const RATE_LIMIT_RETRY_MAX: &str = "rate_limit_retry_max";
 /// 额度使用率到多少百分比就提前把号挪出调度池的 settings 键名；`0` 表示关闭本机制
 /// （退回「收到 429 才停」的老行为）。见 [`CredentialStore::quota_pause_pct`]。
 pub const QUOTA_PAUSE_PCT: &str = "quota_pause_pct";
+
+/// 天级窗口（`7d`）提前停调度阈值的 settings 键名；`0`（默认）表示不按这个窗口停号。
+///
+/// **为什么和 [`QUOTA_PAUSE_PCT`] 分成两档**：同一个百分比在两个窗口上的后果差着数量级。
+/// 5h 到 90% 停号，最多歇几小时就自己回来了，那是「省下一发注定失败的 429」；7d 到 90%
+/// 停号，停的是**到下个 7d 重置为止**——按 [`CredentialStore::quota_pause_pct`] 原来的
+/// 混用口径，一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时里一点没用、还能正常干活。
+/// 而 7d 真满了本来也有兜底：那时上游自己会回 429，账号级冷却照常接手。
+///
+/// 所以默认只按 5h 停，天级窗口要不要提前停由使用者自己开——真要开，配个比 5h 更高的数
+/// （如 95~99）更合用：既留出「快满了别再往里灌」的余量，又不至于为了几个百分点把号停上几天。
+pub const QUOTA_PAUSE_PCT_7D: &str = "quota_pause_pct_7d";
+
+/// 天级窗口提前停调度的默认阈值：`0` = 关。理由见 [`QUOTA_PAUSE_PCT_7D`]。
+pub const DEFAULT_QUOTA_PAUSE_PCT_7D: i64 = 0;
 
 /// 提前停调度的默认阈值：90%。
 ///

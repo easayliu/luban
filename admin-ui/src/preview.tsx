@@ -677,6 +677,9 @@ queryClient.setQueryData(['settings'], {
   bare_rate_limit: 0,
   bare_rate_window_secs: 60,
   rate_limit_retry_max: 2,
+  // 提前停调度：5h 一档（默认 90），7d 另一档、默认关。
+  quota_pause_pct: 90,
+  quota_pause_pct_7d: 0,
   spoof_identity: true,
   spoof_device_id: true,
   billing_cch: true,

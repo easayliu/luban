@@ -602,24 +602,36 @@ function QuotaPausePct() {
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const [draft, setDraft] = useState<number | null>(null)
+  const [weekDraft, setWeekDraft] = useState<number | null>(null)
 
   useEffect(() => {
-    if (data) setDraft(data.quota_pause_pct)
-  }, [data?.quota_pause_pct])
+    if (data) {
+      setDraft(data.quota_pause_pct)
+      setWeekDraft(data.quota_pause_pct_7d)
+    }
+  }, [data?.quota_pause_pct, data?.quota_pause_pct_7d])
 
   const save = useMutation({
-    mutationFn: (pct: number) => setQuotaPausePct(pct),
+    mutationFn: ({ pct, week }: { pct: number; week: number }) => setQuotaPausePct(pct, week),
     onSuccess: (settings: Settings) => {
+      const parts = [
+        settings.quota_pause_pct > 0
+          ? t(`5 小时窗口 ${settings.quota_pause_pct}%`, `5h window ${settings.quota_pause_pct}%`)
+          : t('5 小时窗口不停', '5h window off'),
+        settings.quota_pause_pct_7d > 0
+          ? t(
+              `7 天窗口 ${settings.quota_pause_pct_7d}%`,
+              `7d window ${settings.quota_pause_pct_7d}%`,
+            )
+          : t('7 天窗口不停', '7d window off'),
+      ]
       toastManager.add({
         title: t('提前停调度阈值已更新', 'Early pause threshold updated'),
-        description: settings.quota_pause_pct > 0
-          ? t(
-              `额度用到 ${settings.quota_pause_pct}% 就把账号挪出调度池。`,
-              `Accounts leave the pool once their quota reaches ${settings.quota_pause_pct}%.`,
-            )
+        description: settings.quota_pause_pct > 0 || settings.quota_pause_pct_7d > 0
+          ? t(`${parts.join(' · ')}。`, `${parts.join(' · ')}.`)
           : t(
-              '已关闭：账号会一直参与调度，直到真的收到 429。',
-              'Disabled: accounts keep taking traffic until they actually get a 429.',
+              '两档都已关闭：账号会一直参与调度，直到真的收到 429。',
+              'Both thresholds are off: accounts keep taking traffic until they actually get a 429.',
             ),
         type: 'success',
       })
@@ -635,45 +647,79 @@ function QuotaPausePct() {
     },
   })
 
-  const pct = Math.min(100, Math.max(0, Math.floor(draft ?? 0)))
+  const clamp = (v: number | null) => Math.min(100, Math.max(0, Math.floor(v ?? 0)))
+  const pct = clamp(draft)
+  const week = clamp(weekDraft)
   const enabled = data?.rate_limit_retry ?? true
+  const unchanged =
+    pct === (data?.quota_pause_pct ?? 90) && week === (data?.quota_pause_pct_7d ?? 0)
 
   return (
     <Field className="p-5">
-      <div className="flex w-full flex-wrap items-end justify-between gap-3">
+      <div className="w-full space-y-3">
         <div className="min-w-0 space-y-1">
           <FieldLabel>{t('提前停调度阈值', 'Early pause threshold')}</FieldLabel>
           <FieldDescription className="max-w-xl leading-5">
             {t(
-              '上游每条响应都带着账号的用量限制使用率；到达此百分比就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。只看 5h/7d 这类基础窗口，超额池快满不算。停用后按该窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。0 表示关闭，退回「收到 429 才停」。',
-              'Every upstream response reports the account’s usage-limit utilization; once it reaches this percentage the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Only base windows such as 5h/7d count — a nearly full overage pool does not. A paused account comes back automatically when that window resets, and can also be re-enabled by hand or by a passing connectivity test. 0 disables this and reverts to pausing only on a real 429.',
+              '上游每条响应都带着账号的用量限制使用率；到达阈值就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。两个窗口各配一档，别混用：5 小时窗口停号最多歇几小时就自己回来，7 天窗口停号是歇到下个周重置——一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时一点没用。故 7 天那档默认关（周额度真用光时上游会回 429，账号级冷却照常接手）；要开建议配得比 5 小时那档更高。超额池快满不算在内。停用后按触发的那个窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。填 0 = 该档不停号。',
+              'Every upstream response reports the account’s usage-limit utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold — do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. A nearly full overage pool never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off.',
             )}
           </FieldDescription>
         </div>
-        <div className="flex items-center gap-2">
-          <NumberField
-            className="w-32"
-            disabled={!enabled}
-            max={100}
-            min={0}
-            value={draft}
-            onValueChange={setDraft}
-          >
-            <NumberFieldGroup>
-              <NumberFieldDecrement
-                aria-label={t('降低提前停调度阈值', 'Decrease early pause threshold')}
-              />
-              <NumberFieldInput aria-label={t('提前停调度阈值（%）', 'Early pause threshold (%)')} />
-              <NumberFieldIncrement
-                aria-label={t('提高提前停调度阈值', 'Increase early pause threshold')}
-              />
-            </NumberFieldGroup>
-          </NumberField>
+        <div className="flex flex-wrap items-end gap-4">
+          <div className="space-y-1.5">
+            <FieldDescription>{t('5 小时窗口', '5h window')}</FieldDescription>
+            <NumberField
+              className="w-32"
+              disabled={!enabled}
+              max={100}
+              min={0}
+              value={draft}
+              onValueChange={setDraft}
+            >
+              <NumberFieldGroup>
+                <NumberFieldDecrement
+                  aria-label={t('降低 5 小时窗口阈值', 'Decrease 5h window threshold')}
+                />
+                <NumberFieldInput
+                  aria-label={t('5 小时窗口提前停调度阈值（%）', '5h window early pause threshold (%)')}
+                />
+                <NumberFieldIncrement
+                  aria-label={t('提高 5 小时窗口阈值', 'Increase 5h window threshold')}
+                />
+              </NumberFieldGroup>
+            </NumberField>
+          </div>
+          <div className="space-y-1.5">
+            <FieldDescription>
+              {t('7 天窗口（0 = 不停）', '7d window (0 = off)')}
+            </FieldDescription>
+            <NumberField
+              className="w-32"
+              disabled={!enabled}
+              max={100}
+              min={0}
+              value={weekDraft}
+              onValueChange={setWeekDraft}
+            >
+              <NumberFieldGroup>
+                <NumberFieldDecrement
+                  aria-label={t('降低 7 天窗口阈值', 'Decrease 7d window threshold')}
+                />
+                <NumberFieldInput
+                  aria-label={t('7 天窗口提前停调度阈值（%）', '7d window early pause threshold (%)')}
+                />
+                <NumberFieldIncrement
+                  aria-label={t('提高 7 天窗口阈值', 'Increase 7d window threshold')}
+                />
+              </NumberFieldGroup>
+            </NumberField>
+          </div>
           <Button
             size="sm"
             loading={save.isPending}
-            disabled={!enabled || pct === (data?.quota_pause_pct ?? 90)}
-            onClick={() => save.mutate(pct)}
+            disabled={!enabled || unchanged}
+            onClick={() => save.mutate({ pct, week })}
           >
             <SaveIcon />
             {t('保存', 'Save')}
