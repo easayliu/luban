@@ -1603,6 +1603,20 @@ impl CredentialStore {
             .filter(|v| !v.is_empty())
     }
 
+    /// 登录时实际申请的 OAuth scope（单空格分隔）；未配置或配了个空串就是官方那一整套
+    /// [`crate::config::SCOPES`]。
+    ///
+    /// 读出来再规整一遍而不是信库里的原样：这一项可能是从别的机器 import 进来的，
+    /// 那边的写入校验未必和这边同一个版本。
+    pub fn oauth_scopes(&self) -> String {
+        self.get_setting(OAUTH_SCOPES)
+            .ok()
+            .flatten()
+            .map(|v| crate::config::normalize_scopes(&v))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| crate::config::SCOPES.to_string())
+    }
+
     /// 删除设置项（顺序同 [`Self::set_setting`]：先落库再更新缓存）。
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         {
@@ -1896,6 +1910,15 @@ pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
 /// `claude-cli/<版本>` 的请求：这道闸是给「逼旧版 CC 升级」用的，别的客户端（SDK、
 /// 浏览器、自写脚本）UA 里根本没有版本可比，拿它们跟一个 CC 版本号比毫无意义，故一律放行。
 pub const MIN_CLIENT_VERSION: &str = "min_client_version";
+
+/// 登录时申请哪些 OAuth scope 的 settings 键名；未设置或空串表示用默认的
+/// [`crate::config::SCOPES`]（官方 Claude Code 那一整套）。
+///
+/// 值是空格分隔的 scope 串本身，不是布尔。只在**新登录**时起作用：已存下来的凭证按当初授权
+/// 的范围来，改这一项不会追溯——要换范围就得把号重新登一次。刷新 token 不带 scope，故也不受影响。
+///
+/// 想少授权的一档现成值是 [`crate::config::SCOPES_MINIMAL`]，代价见那里的注释。
+pub const OAUTH_SCOPES: &str = "oauth_scopes";
 
 /// 全局默认设备数上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
@@ -5372,6 +5395,31 @@ mod tests {
         assert_eq!(store.min_client_version(), None, "只剩空白等于没配");
         store.delete_setting(MIN_CLIENT_VERSION).unwrap();
         assert_eq!(store.min_client_version(), None);
+    }
+
+    /// 登录 scope：没配 / 配了空白都退回官方默认那一串；配了就按规整后的形态原样发出去。
+    /// 库里的值可能来自另一台机器的 import，故读出来还要再规整一遍（顺序不动、只去重与压空白）。
+    #[test]
+    fn oauth_scopes_fall_back_to_the_official_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        assert_eq!(store.oauth_scopes(), crate::config::SCOPES, "没配就是官方那一整套");
+        store.set_setting(OAUTH_SCOPES, crate::config::SCOPES_MINIMAL).unwrap();
+        assert_eq!(store.oauth_scopes(), crate::config::SCOPES_MINIMAL);
+        store
+            .set_setting(OAUTH_SCOPES, "  user:inference   user:profile  user:inference ")
+            .unwrap();
+        assert_eq!(
+            store.oauth_scopes(),
+            "user:inference user:profile",
+            "压成单空格、按输入顺序去重"
+        );
+        store.set_setting(OAUTH_SCOPES, "   ").unwrap();
+        assert_eq!(store.oauth_scopes(), crate::config::SCOPES, "只剩空白等于没配");
+        store.delete_setting(OAUTH_SCOPES).unwrap();
+        assert_eq!(store.oauth_scopes(), crate::config::SCOPES);
     }
 
     /// 设置项走内存缓存后，读写口径必须与直接查库一致（含删除与重开库）。

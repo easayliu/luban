@@ -5,6 +5,7 @@ import {
   ChevronDownIcon,
   DatabaseIcon,
   InfoIcon,
+  KeyRoundIcon,
   RefreshCwIcon,
   SaveIcon,
   ServerIcon,
@@ -14,6 +15,7 @@ import {
 import {
   getSettings,
   setForwarding,
+  setOauthScopes,
   setQuotaPausePct,
   setRateLimitRetryMax,
   type ForwardingKey,
@@ -22,6 +24,7 @@ import {
 import { useI18n } from '@/lib/i18n'
 import { extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -41,6 +44,7 @@ import {
 } from '@/components/ui/number-field'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
 
@@ -178,6 +182,17 @@ export function ForwardingSettingsContent() {
             'Add the billing identifier required by subscription clients.',
           )}
         />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={KeyRoundIcon}
+        title={t('登录授权范围', 'Login authorization scopes')}
+        description={t(
+          '添加账号时向 Claude 申请哪些权限。只影响之后新登录的账号，已添加的不受影响。',
+          'Which permissions are requested from Claude when adding an account. Only affects accounts added from now on; existing ones are unchanged.',
+        )}
+      >
+        <OAuthScopes />
       </SettingsGroup>
 
       <SettingsGroup icon={ServerIcon} title={t('协议与请求头', 'Protocol & request headers')}>
@@ -377,6 +392,123 @@ export function ForwardingSettingsContent() {
         />
       </SettingsGroup>
     </div>
+  )
+}
+
+/** 一项 scope 的写法：字母数字加 `:`/`_`/`-`/`.`，与后端 `parse_scopes` 同一套口径。 */
+const SCOPE_ITEM_RE = /^[A-Za-z0-9:_.-]+$/
+
+/** 没有它 token 调不了 /v1/*，前后端都把它当必需项。 */
+const SCOPE_REQUIRED = 'user:inference'
+
+/**
+ * 登录时申请的 OAuth scope。
+ *
+ * 默认与官方 Claude Code 逐字一致（scope 集合也是指纹的一部分）；想少授权就切到精简那一档，
+ * 代价是授权请求与官方不再完全相同。改动只对之后的新登录生效——已有凭证的范围在授权那一刻
+ * 就定了，刷新 token 不带 scope，改这里不会追溯。
+ */
+function OAuthScopes() {
+  const { language, t } = useI18n()
+  const qc = useQueryClient()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+
+  useEffect(() => {
+    if (data) setDraft(data.oauth_scopes)
+  }, [data?.oauth_scopes])
+
+  const save = useMutation({
+    mutationFn: (scopes: string) => setOauthScopes(scopes),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('登录授权范围已更新', 'Login authorization scopes updated'),
+        description: settings.oauth_scopes === settings.oauth_scopes_default
+          ? t(
+              '已恢复官方默认范围；下次添加账号时生效。',
+              'Restored the official default scopes; effective the next time an account is added.',
+            )
+          : t(
+              `下次添加账号时按这 ${settings.oauth_scopes.split(' ').length} 项申请。`,
+              `The next account added will request these ${settings.oauth_scopes.split(' ').length} scopes.`,
+            ),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.oauth_scopes ?? ''
+  const official = data?.oauth_scopes_default ?? ''
+  const minimal = data?.oauth_scopes_minimal ?? ''
+  // 与后端同一口径：压空白、按输入顺序去重（不排序——顺序也是指纹的一部分）。
+  const items = Array.from(new Set(draft.split(/\s+/).filter(Boolean)))
+  const value = items.join(' ')
+  // 空串是合法输入（= 恢复默认），其余两条与后端校验一致，先在这里拦一道免得白跑一趟 400。
+  const malformed = items.some((s) => !SCOPE_ITEM_RE.test(s))
+  const missingRequired = items.length > 0 && !items.includes(SCOPE_REQUIRED)
+  const invalid = malformed || missingRequired
+  const preset = value === official
+    ? t('官方默认', 'Official default')
+    : value === minimal
+      ? t('精简', 'Minimal')
+      : t('自定义', 'Custom')
+
+  return (
+    <Field className="p-5">
+      <div className="w-full space-y-3">
+        <div className="min-w-0 space-y-1">
+          <FieldLabel htmlFor="oauth-scopes">{t('申请的 scope', 'Requested scopes')}</FieldLabel>
+          <FieldDescription className="max-w-2xl leading-5">
+            {t(
+              '空格分隔。留空恢复官方默认那一整套——与官方客户端逐字一致，scope 集合也是指纹的一部分。精简那一档只留 Luban 真正用得上的三项（推理、账号资料、文件上传），少授权的代价是授权请求与官方不再完全相同。必须含 user:inference，否则拿到的 token 调不了 /v1/*。',
+              'Space separated. Leave empty to restore the full official set — byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps only the three scopes Luban actually uses (inference, profile, file upload); requesting fewer permissions costs you an authorization request that no longer matches the official client exactly. user:inference is required, otherwise the tokens cannot call /v1/*.',
+            )}
+          </FieldDescription>
+        </div>
+        <Textarea
+          id="oauth-scopes"
+          className="font-mono"
+          size="sm"
+          placeholder={official}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={invalid ? 'warning' : 'secondary'} size="sm">
+              {malformed
+                ? t('有写法不对的 scope', 'Some scopes are malformed')
+                : missingRequired
+                  ? t('缺少 user:inference', 'user:inference is missing')
+                  : t(`${preset} · ${items.length} 项`, `${preset} · ${items.length} scopes`)}
+            </Badge>
+            <Button size="sm" variant="ghost" onClick={() => setDraft(official)}>
+              {t('官方默认', 'Official default')}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setDraft(minimal)}>
+              {t('精简', 'Minimal')}
+            </Button>
+          </div>
+          <Button
+            size="sm"
+            loading={save.isPending}
+            disabled={invalid || value === current}
+            onClick={() => save.mutate(value)}
+          >
+            <SaveIcon />
+            {t('保存', 'Save')}
+          </Button>
+        </div>
+      </div>
+    </Field>
   )
 }
 

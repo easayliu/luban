@@ -19,11 +19,76 @@ pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 /// 手动粘贴模式使用的 redirect_uri，token 端点会据此校验。
 pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
-/// 申请的 OAuth scope，与 Claude Code 保持一致（含顺序——scope 集合也是指纹的一部分）。
-/// `org:create_api_key` luban 自身用不到，但官方客户端就带着它；`user:file_upload` 缺了
-/// 会让经代理走 Files API 的上传被上游按 scope 拒掉。
+/// 登录时申请的 OAuth scope 的默认值，与 Claude Code 保持一致（含顺序——scope 集合也是
+/// 指纹的一部分）。`org:create_api_key` luban 自身用不到，但官方客户端就带着它；
+/// `user:file_upload` 缺了会让经代理走 Files API 的上传被上游按 scope 拒掉。
+///
+/// 这只是**默认值**：实际申请哪几项由 settings 里的 [`crate::store::OAUTH_SCOPES`] 决定，
+/// 没配就用这一串。要改的理由见 [`SCOPES_MINIMAL`]。
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference \
                           user:sessions:claude_code user:mcp_servers user:file_upload";
+
+/// 精简 scope：一次真实授权里观察到的最小集，只留 luban 自己用得上的三项。
+///
+/// - `user:inference` —— 转发 `/v1/*` 的唯一必需项，缺了整个代理就是空壳；
+/// - `user:profile` —— 交换后拉邮箱/等级/account_uuid，缺了只是标签与等级留白（登录不失败）；
+/// - `user:file_upload` —— 经代理走 Files API 的上传。
+///
+/// 相比 [`SCOPES`] 少了 `org:create_api_key`（建 API key，luban 从不调）、
+/// `user:sessions:claude_code`、`user:mcp_servers`（官方客户端自己的功能面）。
+/// 少要权限的代价是**授权请求与官方客户端不再逐字一致**——scope 集合也是指纹的一部分，
+/// 所以这不是默认值，是给「宁可少授权、不在意这点差异」的人留的一档。
+pub const SCOPES_MINIMAL: &str = "user:file_upload user:inference user:profile";
+
+/// scope 里必须保留的那一项：没有它 access_token 调不了 `/v1/*`，整个代理是空壳。
+pub const SCOPE_REQUIRED: &str = "user:inference";
+
+/// 一份 scope 配置里最多允许多少项。取 32：官方那套是 6 项，留一个数量级的余量，
+/// 只为挡住「把整篇文本粘进来」的手滑。
+pub const SCOPES_MAX_ITEMS: usize = 32;
+
+/// 把填进来的 scope 串规整成「单空格分隔、按输入顺序去重」的形态。
+///
+/// 顺序按输入保留而不排序：scope 集合是指纹的一部分，照抄一份抓包的顺序就该原样发出去。
+pub fn normalize_scopes(raw: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for item in raw.split_whitespace() {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out.join(" ")
+}
+
+/// 校验并规整一份 scope 配置。`Ok("")` 表示「留空 = 用默认值 [`SCOPES`]」。
+///
+/// 只查三件事：字符集、条数、必需项。不去比对一张已知 scope 白名单——上游随时会加新 scope，
+/// 白名单只会把「照抄一份新抓包」这唯一合理的用法拦下来。
+pub fn parse_scopes(raw: &str) -> Result<String, String> {
+    let normalized = normalize_scopes(raw);
+    if normalized.is_empty() {
+        return Ok(normalized);
+    }
+    let items: Vec<&str> = normalized.split(' ').collect();
+    if items.len() > SCOPES_MAX_ITEMS {
+        return Err(format!("too many scopes ({}); at most {}", items.len(), SCOPES_MAX_ITEMS));
+    }
+    if let Some(bad) = items.iter().find(|s| {
+        !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-' | '.'))
+    }) {
+        return Err(format!(
+            "invalid scope {:?}; a scope looks like `user:inference` (letters, digits, `:`, `_`, `-`, `.`)",
+            bad
+        ));
+    }
+    if !items.contains(&SCOPE_REQUIRED) {
+        return Err(format!(
+            "`{}` must be included, otherwise the tokens cannot call /v1/* and the proxy is useless",
+            SCOPE_REQUIRED
+        ));
+    }
+    Ok(normalized)
+}
 
 /// 用 OAuth access token 调用 Anthropic API 时必须携带的 beta 头。
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -339,3 +404,57 @@ pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
 
 /// 距离过期不足该秒数时视为需要刷新。
 pub const REFRESH_LEEWAY_SECS: u64 = 300;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规整只做两件事：压空白、按输入顺序去重。**不排序**——scope 集合是指纹的一部分，
+    /// 用户照抄一份抓包的顺序就该原样发出去。
+    #[test]
+    fn normalize_keeps_the_order_it_was_given() {
+        assert_eq!(
+            normalize_scopes("  user:profile\n\tuser:inference  "),
+            "user:profile user:inference"
+        );
+        assert_eq!(
+            normalize_scopes("user:inference user:profile user:inference"),
+            "user:inference user:profile"
+        );
+        assert_eq!(normalize_scopes("   "), "");
+        // 默认那两串本身已经是规整形态（写常量时手抖多个空格也能被这条测出来）。
+        assert_eq!(normalize_scopes(SCOPES), SCOPES);
+        assert_eq!(normalize_scopes(SCOPES_MINIMAL), SCOPES_MINIMAL);
+    }
+
+    /// 空串是合法输入，语义是「回到默认」——不是错误。
+    #[test]
+    fn empty_means_use_the_default() {
+        assert_eq!(parse_scopes(""), Ok(String::new()));
+        assert_eq!(parse_scopes("  \t "), Ok(String::new()));
+    }
+
+    /// 两档预设值都得过自己的校验，否则网页上的「一键切换」会撞 400。
+    #[test]
+    fn both_presets_are_accepted() {
+        assert_eq!(parse_scopes(SCOPES).as_deref(), Ok(SCOPES));
+        assert_eq!(parse_scopes(SCOPES_MINIMAL).as_deref(), Ok(SCOPES_MINIMAL));
+    }
+
+    /// 三道拦截：字符集、条数、必需项。前两道挡手滑（粘错东西），第三道挡「配了个用不了的组合」。
+    #[test]
+    fn rejects_unusable_scope_configs() {
+        // 缺 user:inference：token 拿到手也调不了 /v1/*，代理直接是空壳。
+        assert!(parse_scopes("user:profile user:file_upload").is_err());
+        // 不是 scope 的东西（引号、逗号、空格外的分隔符）。
+        assert!(parse_scopes("user:inference, user:profile").is_err());
+        assert!(parse_scopes("\"user:inference\"").is_err());
+        // 整段文本粘进来。
+        let flood = std::iter::repeat_n("user:inference", SCOPES_MAX_ITEMS + 1)
+            .enumerate()
+            .map(|(i, s)| format!("{s}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_scopes(&flood).is_err());
+    }
+}

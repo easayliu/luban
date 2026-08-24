@@ -67,10 +67,10 @@ export function SettingsPage({
       key: 'forwarding',
       label: t('转发策略', 'Forwarding policy'),
       description: t(
-        '配置协议兼容、缓存形态、限流与错误恢复。',
-        'Configure protocol compatibility, caching, rate limits, and recovery.',
+        '配置登录授权范围、协议兼容、缓存形态、限流与错误恢复。',
+        'Configure login scopes, protocol compatibility, caching, rate limits, and recovery.',
       ),
-      navDescription: t('兼容、缓存与错误恢复', 'Compatibility, caching, and recovery'),
+      navDescription: t('授权、兼容与错误恢复', 'Scopes, compatibility, and recovery'),
       icon: SlidersHorizontalIcon,
     },
     {

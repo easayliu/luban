@@ -21,6 +21,12 @@ export interface Settings {
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
   min_client_version: string
+  /** 登录时申请的 OAuth scope（空格分隔）；恒为非空，未自定义时就是 oauth_scopes_default。 */
+  oauth_scopes: string
+  /** 官方 Claude Code 那一整套 scope，也是未配置时的默认值。 */
+  oauth_scopes_default: string
+  /** 精简 scope：只留 Luban 自己用得上的三项（推理、profile、文件上传）。 */
+  oauth_scopes_minimal: string
   /** 单个账号在窗口内允许的裸请求条数；0 表示不限。 */
   bare_rate_limit: number
   /** 裸请求速率窗口（秒），默认 60。 */
@@ -191,6 +197,19 @@ export async function setRequireDeviceId(required: boolean): Promise<Settings> {
 export async function setMinClientVersion(version: string): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/min-client-version', {
     min_client_version: version,
+  })
+  return data
+}
+
+/**
+ * 设置登录时申请的 OAuth scope（空格分隔；空串恢复默认那一整套）。
+ *
+ * 只影响之后新加的账号——已存下来的凭证按当初授权的范围来，改这里不会追溯。
+ * 后端会校验字符集、条数，并要求含 `user:inference`（缺了 token 调不了 /v1/*）。
+ */
+export async function setOauthScopes(scopes: string): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/oauth-scopes', {
+    oauth_scopes: scopes,
   })
   return data
 }

@@ -162,6 +162,7 @@ pub async fn run(
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/min-client-version", post(set_min_client_version))
+        .route("/settings/oauth-scopes", post(set_oauth_scopes))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/export", get(export))
         .route("/import", post(import))
@@ -261,7 +262,10 @@ struct AuthorizeResp {
 /// 并发的多次登录互不干扰——每次各占一格，见 [`AppState::pkce`]。顺手清掉过期与超量的格子。
 async fn authorize(State(state): State<AppState>) -> Json<AuthorizeResp> {
     let pkce = PkceChallenge::generate();
-    let url = pkce.authorize_url();
+    // 申请哪些 scope 由 settings 决定（没配就是官方那一整套），见 [`store::OAUTH_SCOPES`]。
+    let scopes = state.store.oauth_scopes();
+    let url = pkce.authorize_url(&scopes);
+    tracing::info!(scopes = %scopes, "authorization link generated");
     remember_pkce(&mut state.pkce.lock(), pkce, std::time::Instant::now());
     Json(AuthorizeResp { url })
 }
@@ -925,6 +929,13 @@ struct SettingsResp {
     /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
     /// 的请求，见 [`crate::store::MIN_CLIENT_VERSION`]。
     min_client_version: String,
+    /// 登录时实际申请的 OAuth scope（空格分隔）；恒为非空——没配就是
+    /// [`crate::config::SCOPES`]。
+    oauth_scopes: String,
+    /// 默认 scope 串（[`crate::config::SCOPES`]），供网页判断当前是不是默认值。
+    oauth_scopes_default: String,
+    /// 精简 scope 串（[`crate::config::SCOPES_MINIMAL`]），网页上「只要必需项」那一档。
+    oauth_scopes_minimal: String,
     /// 单凭证裸请求速率上限（窗口内条数）；0 表示不限。
     bare_rate_limit: i64,
     /// 裸请求速率窗口（秒），默认 60。
@@ -1008,6 +1019,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let session_rpm_limit = state.store.session_rpm_limit();
     let require_device_id = state.store.require_device_id();
     let min_client_version = state.store.min_client_version().unwrap_or_default();
+    let oauth_scopes = state.store.oauth_scopes();
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
@@ -1025,6 +1037,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             session_rpm_limit,
             require_device_id,
             min_client_version,
+            oauth_scopes,
+            oauth_scopes_default: crate::config::SCOPES.to_string(),
+            oauth_scopes_minimal: crate::config::SCOPES_MINIMAL.to_string(),
             bare_rate_limit,
             bare_rate_window_secs,
             rate_limit_retry_max,
@@ -1049,6 +1064,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         session_rpm_limit,
         require_device_id,
         min_client_version,
+        oauth_scopes,
+        oauth_scopes_default: crate::config::SCOPES.to_string(),
+        oauth_scopes_minimal: crate::config::SCOPES_MINIMAL.to_string(),
         bare_rate_limit,
         bare_rate_window_secs,
         rate_limit_retry_max,
@@ -1325,6 +1343,32 @@ async fn set_min_client_version(
     }
     state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).map_err(internal)?;
     tracing::info!(version, "minimum client version changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetOAuthScopesReq {
+    /// 登录时申请的 scope（空格分隔）；空串表示回到默认的 [`crate::config::SCOPES`]。
+    oauth_scopes: String,
+}
+
+/// 设置登录时申请的 OAuth scope。
+///
+/// 只影响之后新加的账号：已存下来的凭证按当初授权的范围来，刷新也不带 scope。
+/// 写错一个字会让整轮授权在同意页上就失败，故在入口处校验（见
+/// [`crate::config::parse_scopes`]）而不是等用户去猜为什么登不上。
+async fn set_oauth_scopes(
+    State(state): State<AppState>,
+    Json(req): Json<SetOAuthScopesReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let scopes = crate::config::parse_scopes(&req.oauth_scopes).map_err(bad_request)?;
+    if scopes.is_empty() {
+        state.store.delete_setting(crate::store::OAUTH_SCOPES).map_err(internal)?;
+        tracing::info!(scopes = %crate::config::SCOPES, "oauth scopes reset to the default");
+        return Ok(Json(settings_resp(&state)));
+    }
+    state.store.set_setting(crate::store::OAUTH_SCOPES, &scopes).map_err(internal)?;
+    tracing::info!(scopes = %scopes, "oauth scopes changed");
     Ok(Json(settings_resp(&state)))
 }
 

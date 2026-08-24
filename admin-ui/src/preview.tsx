@@ -667,6 +667,12 @@ queryClient.setQueryData(['settings'], {
   device_rpm_limit: 180,
   session_rpm_limit: 60,
   min_client_version: '2.1.100',
+  // 登录 scope 给成官方那一整套（= 未自定义的样子），另外两项是那两个预设按钮的来源。
+  oauth_scopes:
+    'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+  oauth_scopes_default:
+    'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+  oauth_scopes_minimal: 'user:file_upload user:inference user:profile',
   require_device_id: true,
   bare_rate_limit: 0,
   bare_rate_window_secs: 60,

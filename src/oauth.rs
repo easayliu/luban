@@ -55,13 +55,17 @@ impl PkceChallenge {
     }
 
     /// 构造用户需要在浏览器打开的授权 URL。
-    pub fn authorize_url(&self) -> String {
+    ///
+    /// `scopes` 由调用方从 settings 取（见 [`crate::store::CredentialStore::oauth_scopes`]），
+    /// 不在这里读默认值：同一次登录里授权 URL 上的 scope 和用户在同意页上看到的必须是同一份，
+    /// 让这个函数自己去兜底只会多一条「配置没生效」的暗路。
+    pub fn authorize_url(&self, scopes: &str) -> String {
         let params = [
             ("code", "true"),
             ("client_id", config::CLIENT_ID),
             ("response_type", "code"),
             ("redirect_uri", config::REDIRECT_URI),
-            ("scope", config::SCOPES),
+            ("scope", scopes),
             ("code_challenge", &self.challenge),
             ("code_challenge_method", "S256"),
             ("state", &self.state),
