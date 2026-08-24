@@ -395,18 +395,15 @@ export function ForwardingSettingsContent() {
   )
 }
 
-/** 一项 scope 的写法：字母数字加 `:`/`_`/`-`/`.`，与后端 `parse_scopes` 同一套口径。 */
-const SCOPE_ITEM_RE = /^[A-Za-z0-9:_.-]+$/
-
-/** 没有它 token 调不了 /v1/*，前后端都把它当必需项。 */
-const SCOPE_REQUIRED = 'user:inference'
-
 /**
  * 登录时申请的 OAuth scope。
  *
  * 默认与官方 Claude Code 逐字一致（scope 集合也是指纹的一部分）；想少授权就切到精简那一档，
  * 代价是授权请求与官方不再完全相同。改动只对之后的新登录生效——已有凭证的范围在授权那一刻
  * 就定了，刷新 token 不带 scope，改这里不会追溯。
+ *
+ * **不校验**：填什么存什么，前后端都不判合法性。这个框就是拿来试上游认哪些 scope 的，
+ * 拦一道就等于把它唯一的用途拦掉；认不认由同意页说。
  */
 function OAuthScopes() {
   const { language, t } = useI18n()
@@ -451,10 +448,6 @@ function OAuthScopes() {
   // 与后端同一口径：压空白、按输入顺序去重（不排序——顺序也是指纹的一部分）。
   const items = Array.from(new Set(draft.split(/\s+/).filter(Boolean)))
   const value = items.join(' ')
-  // 空串是合法输入（= 恢复默认），其余两条与后端校验一致，先在这里拦一道免得白跑一趟 400。
-  const malformed = items.some((s) => !SCOPE_ITEM_RE.test(s))
-  const missingRequired = items.length > 0 && !items.includes(SCOPE_REQUIRED)
-  const invalid = malformed || missingRequired
   const preset = value === official
     ? t('官方默认', 'Official default')
     : value === minimal
@@ -468,8 +461,8 @@ function OAuthScopes() {
           <FieldLabel htmlFor="oauth-scopes">{t('申请的 scope', 'Requested scopes')}</FieldLabel>
           <FieldDescription className="max-w-2xl leading-5">
             {t(
-              '空格分隔。留空恢复官方默认那一整套——与官方客户端逐字一致，scope 集合也是指纹的一部分。精简那一档只留 Luban 真正用得上的三项（推理、账号资料、文件上传），少授权的代价是授权请求与官方不再完全相同。必须含 user:inference，否则拿到的 token 调不了 /v1/*。',
-              'Space separated. Leave empty to restore the full official set — byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps only the three scopes Luban actually uses (inference, profile, file upload); requesting fewer permissions costs you an authorization request that no longer matches the official client exactly. user:inference is required, otherwise the tokens cannot call /v1/*.',
+              '空格分隔，填什么发什么——这里不校验，认不认由 Claude 的同意页说（例如整个不带 scope 会被回 Missing scope parameter）。留空恢复官方默认那一整套，与官方客户端逐字一致，scope 集合也是指纹的一部分。精简那一档只留 Luban 真正用得上的三项：user:inference 转发要用（去掉这个号就只能登进来看额度）、user:profile 决定邮箱与等级读不读得到、user:file_upload 管走 Files API 的上传。',
+              'Space separated, sent verbatim — nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota), user:profile for the email and tier, user:file_upload for uploads through the Files API.',
             )}
           </FieldDescription>
         </div>
@@ -483,12 +476,10 @@ function OAuthScopes() {
         />
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={invalid ? 'warning' : 'secondary'} size="sm">
-              {malformed
-                ? t('有写法不对的 scope', 'Some scopes are malformed')
-                : missingRequired
-                  ? t('缺少 user:inference', 'user:inference is missing')
-                  : t(`${preset} · ${items.length} 项`, `${preset} · ${items.length} scopes`)}
+            <Badge variant="secondary" size="sm">
+              {items.length > 0
+                ? t(`${preset} · ${items.length} 项`, `${preset} · ${items.length} scopes`)
+                : t('留空 = 官方默认', 'Empty = official default')}
             </Badge>
             <Button size="sm" variant="ghost" onClick={() => setDraft(official)}>
               {t('官方默认', 'Official default')}
@@ -500,7 +491,7 @@ function OAuthScopes() {
           <Button
             size="sm"
             loading={save.isPending}
-            disabled={invalid || value === current}
+            disabled={value === current}
             onClick={() => save.mutate(value)}
           >
             <SaveIcon />

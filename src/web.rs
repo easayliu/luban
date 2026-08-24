@@ -1355,13 +1355,16 @@ struct SetOAuthScopesReq {
 /// 设置登录时申请的 OAuth scope。
 ///
 /// 只影响之后新加的账号：已存下来的凭证按当初授权的范围来，刷新也不带 scope。
-/// 写错一个字会让整轮授权在同意页上就失败，故在入口处校验（见
-/// [`crate::config::parse_scopes`]）而不是等用户去猜为什么登不上。
+///
+/// **不校验**，写什么存什么、原样发给上游（只做空白规整与去重，见
+/// [`crate::config::normalize_scopes`]）。这个框存在的意义就是拿来试上游认哪些 scope，
+/// 在这里替它判合法性只会把探边界的值挡在外面；真不认时同意页会明说（如
+/// `Missing scope parameter`），那比我们猜的白名单准。
 async fn set_oauth_scopes(
     State(state): State<AppState>,
     Json(req): Json<SetOAuthScopesReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let scopes = crate::config::parse_scopes(&req.oauth_scopes).map_err(bad_request)?;
+    let scopes = crate::config::normalize_scopes(&req.oauth_scopes);
     if scopes.is_empty() {
         state.store.delete_setting(crate::store::OAUTH_SCOPES).map_err(internal)?;
         tracing::info!(scopes = %crate::config::SCOPES, "oauth scopes reset to the default");
