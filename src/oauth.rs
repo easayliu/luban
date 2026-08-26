@@ -409,6 +409,66 @@ fn urlencode(input: &str) -> String {
     out
 }
 
+// ---------- session keepalive ----------
+
+/// 向上游发一次会话保活请求（`event_logging` + `metrics`）。
+///
+/// 抓包显示官方客户端在整个会话期间持续上报：`/api/event_logging/v2/batch`（~2-3 分钟）
+/// 与 `/api/claude_code/metrics`（~5 分钟）。两者都带 OAuth access_token，luban 不发这些
+/// 请求，上游可能因此判定会话已废弃并吊销 refresh_token。
+///
+/// 两个端点独立发，任一失败不影响另一个。返回 `(event_logging_ok, metrics_ok)`。
+pub async fn keepalive(client: &wreq::Client, access_token: &str) -> (bool, bool) {
+    let ev = keepalive_event_logging(client, access_token).await;
+    let mt = keepalive_metrics(client, access_token).await;
+    (ev, mt)
+}
+
+/// `POST /api/event_logging/v2/batch` — 空事件批次，只为让上游看到 token 活跃。
+async fn keepalive_event_logging(client: &wreq::Client, access_token: &str) -> bool {
+    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
+    let body = serde_json::json!({"events": []});
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("x-service-name", "claude-code")
+        .header("Accept", "application/json, text/plain, */*")
+        .json(&body)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
+/// `POST /api/claude_code/metrics` — 空指标批次，同样只为保活。
+async fn keepalive_metrics(client: &wreq::Client, access_token: &str) -> bool {
+    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_METRICS);
+    let body = serde_json::json!({
+        "resource_attributes": {
+            "service.name": "claude-code",
+            "service.version": config::KEEPALIVE_USER_AGENT.strip_prefix("claude-code/").unwrap_or("2.1.246"),
+        },
+        "metrics": []
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("Accept", "application/json, text/plain, */*")
+        .json(&body)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TokenEndpointError, tier_from};

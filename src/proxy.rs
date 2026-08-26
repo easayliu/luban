@@ -7600,12 +7600,12 @@ mod tests {
     /// 在**队尾**。共用一份种子串就会给 haiku 发出一个真实客户端不产生的排列。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/raw/00009（sonnet-5 直连）；opus-5/fable-5 只多出计价相关的那几项。
+        // cap/2.1.145/00005（opus-4-6 直连，claude-cli/2.1.245）。
         const OFFICIAL: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
-             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-             advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+             prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,\
+             effort-2025-11-24,extended-cache-ttl-2025-04-11";
         // cap/raw/00031（haiku-4.5 直连）：oauth 在最前、claude-code 在第 6 位。
         const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
@@ -9604,8 +9604,8 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = super::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 220)), "官方那串");
-        assert_eq!(v("claude-cli/2.1.220"), Some((2, 1, 220)), "光秃秃一串也认");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 245)), "官方那串");
+        assert_eq!(v("claude-cli/2.1.245"), Some((2, 1, 245)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
         assert_eq!(v("claude-cli/"), None, "有前缀没版本");

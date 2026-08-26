@@ -118,6 +118,51 @@ pub async fn run(
         });
     }
 
+    // 会话保活：定期用每个启用凭证的 access_token 向上游发 event_logging 与 metrics。
+    // 抓包显示官方客户端在整个会话期间持续上报这两个端点（~2-5 分钟一次），luban 不发
+    // 就会被上游判定为废弃会话，1 小时后吊销 refresh_token。
+    {
+        let store = state.store.clone();
+        let clients = state.clients.clone();
+        tokio::spawn(async move {
+            // 首次延迟 30 秒——启动时 token 刚拿到/刚刷新过，不必立刻打。
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                crate::config::KEEPALIVE_INTERVAL_SECS,
+            ));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let creds = match store.list() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "keepalive: failed to list credentials");
+                        continue;
+                    }
+                };
+                for cred in creds {
+                    if cred.disabled {
+                        continue;
+                    }
+                    let http = match clients.for_credential(&cred) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %e, "keepalive: cannot build HTTP client");
+                            continue;
+                        }
+                    };
+                    let (ev_ok, mt_ok) =
+                        oauth::keepalive(&http, &cred.access_token).await;
+                    if ev_ok && mt_ok {
+                        tracing::debug!(cred_id = cred.id, cred = %cred.label, "keepalive: ok");
+                    } else {
+                        tracing::warn!(cred_id = cred.id, cred = %cred.label, event_logging = ev_ok, metrics = mt_ok, "keepalive: partial failure");
+                    }
+                }
+            }
+        });
+    }
+
     // 公开鉴权接口（无需登录）。
     let public = Router::new()
         .route("/auth/state", get(auth::state))

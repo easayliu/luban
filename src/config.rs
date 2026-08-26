@@ -113,9 +113,9 @@ pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05"
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（cap/raw 是 2.1.220）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（cap/2.1.145 是 2.1.245）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.220 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.245 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -183,12 +183,12 @@ pub const CC_SYSTEM_BASE_ANCHORS: &[&str] = &[
 /// 「这是不是一条 Claude Code 请求」的判据——[`crate::proxy::is_cc_shaped`] 认的就是它。
 pub const CC_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// `system[0]` 那条 billing header 里的 `cc_version`，形如 `2.1.220.04c`。
+/// `system[0]` 那条 billing header 里的 `cc_version`，形如 `2.1.245.a77`。
 ///
-/// 后缀（`.04c`/`.564`）随构建变，与鉴权模式无关（见 [`known_fingerprint_gaps`] 第 4 条），
-/// 故取一个即可。主版本号要和 [`CC_USER_AGENT`] 对得上——同一个客户端不会一边自称 2.1.220
+/// 后缀（`.a77`/`.564`）随构建变，与鉴权模式无关（见 [`known_fingerprint_gaps`] 第 4 条），
+/// 故取一个即可。主版本号要和 [`CC_USER_AGENT`] 对得上——同一个客户端不会一边自称 2.1.245
 /// 一边报另一个 cc_version。
-pub const CC_VERSION: &str = "2.1.220.04c";
+pub const CC_VERSION: &str = "2.1.245.a77";
 
 /// 模拟模式注入的官方系统提示词**基座**（opus-5 / fable-5 那一族，1214 字节）。
 ///
@@ -205,26 +205,22 @@ pub const CC_SYSTEM_BASE_OPUS: &str = include_str!("assets/cc_system_base_opus.t
 /// sha256 相同。比 opus 那份大一个数量级——这一族的基座本来就长，不是抄错了。
 pub const CC_SYSTEM_BASE_SONNET: &str = include_str!("assets/cc_system_base_sonnet.txt");
 
-/// 模拟模式下**代客户端发出**的 `anthropic-beta` 自有串（不含 luban 自己会补的那几项），
+/// 模拟模式下**代客户端发出**的 `anthropic-beta` 自有串（不含 luban 自己会补的 `oauth`），
 /// opus-5 / sonnet-5 / fable-5 及认不出的模型共用这份。haiku 另有一份，见
 /// [`CC_BETA_SIMULATED_HAIKU`]——**这两份不能合并**，理由与
 /// [`cc_beta_order_is_not_a_table`] 记的是同一件事。
 ///
-/// 逐字取自 `cap/raw/00009`（sonnet-5 直连）那串，去掉 [`crate::proxy::merge_beta`] 负责
-/// 插入的三项（`oauth`/`advanced-tool-use`/`extended-cache-ttl`）。于是交给 `merge_beta`
-/// 之后能**逐字节还原**官方那串，回归测试见 `tests::simulated_beta_matches_official`。
-///
-/// **刻意不取 opus-5 那串**：它比这份多 `context-1m-2025-08-07` 与
-/// `fallback-credit-2026-06-01`（fable-5 那串则多 `server-side-fallback-2026-06-01` 与
-/// `fallback-credit`），这些都不是纯形态——`context-1m` 是 1M 上下文的准入（超过 200k
-/// 输入按另一档计价），另两项关联额度回补与服务端换模型。替用户声明这类东西超出了「装成
-/// 官方客户端」的范围，与 [`known_fingerprint_gaps`] 第 7 条不补 `fallbacks` 是同一条口径。
-/// sonnet 那串是官方真实发过的完整串，本身就自洽，不存在「集合对了顺序错」的问题。
+/// 逐字取自 `cap/2.1.145/00005`（opus-4-6 直连，claude-cli/2.1.245）那串，去掉
+/// [`crate::proxy::merge_beta`] 负责插入的 `oauth`。2.1.245 起 `advanced-tool-use` 与
+/// `extended-cache-ttl` 已从 merge_beta 注入项变成客户端自有串的一部分，
+/// `mid-conversation-system` 则被移除。交给 `merge_beta` 之后能**逐字节还原**官方那串，
+/// 回归测试见 `tests::simulated_beta_matches_official`。
 ///
 /// 来访客户端自己带的 beta 不会被这串顶掉，见 [`crate::proxy::simulated_beta`]。
 pub const CC_BETA_SIMULATED: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,\
     redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
-    prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24";
+    prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,\
+    extended-cache-ttl-2025-04-11";
 
 /// haiku 族的自有串，逐字取自 `cap/raw/00031`（haiku-4.5 直连），同样去掉 `merge_beta`
 /// 负责插入的三项。
@@ -259,7 +255,7 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
     ("x-stainless-arch", "arm64"),
     ("x-stainless-lang", "js"),
     ("x-stainless-os", "MacOS"),
-    ("x-stainless-package-version", "0.94.0"),
+    ("x-stainless-package-version", "0.112.1"),
     ("x-stainless-retry-count", "0"),
     ("x-stainless-runtime", "node"),
     ("x-stainless-runtime-version", "v26.3.0"),
@@ -377,6 +373,20 @@ pub const UPSTREAM_BASE_URL: &str = "https://api.anthropic.com";
 
 /// 距离过期不足该秒数时视为需要刷新。
 pub const REFRESH_LEEWAY_SECS: u64 = 300;
+
+// ---------- session keepalive ----------
+
+/// 会话保活间隔（秒）。官方客户端 `event_logging` 约 2-3 分钟一次、`metrics` 约 5 分钟
+/// 一次；这里取 5 分钟，与 metrics 节奏一致。
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 5 * 60;
+
+/// 保活请求的 User-Agent。抓包显示 `/api/event_logging/*` 与 `/api/claude_code/metrics`
+/// 都用 `claude-code/<版本>`，而非转发时的 `claude-cli/<版本>`。
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.246";
+
+/// 保活端点。官方客户端在整个会话期间持续周期性上报。
+pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";
+pub const KEEPALIVE_METRICS: &str = "/api/claude_code/metrics";
 
 #[cfg(test)]
 mod tests {
