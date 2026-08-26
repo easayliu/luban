@@ -241,8 +241,8 @@ export async function getAuthorizeUrl(): Promise<{ url: string }> {
 }
 
 /** 用粘贴的 code#state 交换并新增一条凭证。 */
-export async function exchangeCode(code: string, label?: string): Promise<Credential> {
-  const { data } = await api.post<Credential>('/exchange', { code, label })
+export async function exchangeCode(code: string, label?: string, proxy?: string): Promise<Credential> {
+  const { data } = await api.post<Credential>('/exchange', { code, label, proxy })
   return data
 }
 

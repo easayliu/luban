@@ -33,11 +33,13 @@ export function AddAccount({
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   const [code, setCode] = useState('')
   const [label, setLabel] = useState('')
+  const [proxy, setProxy] = useState('')
   const authorizeSession = useRef(0)
 
   const reset = () => {
     setCode('')
     setLabel('')
+    setProxy('')
     setAuthUrl(null)
   }
   const handleOpenChange = (next: boolean) => {
@@ -78,7 +80,7 @@ export function AddAccount({
   })
 
   const exchange = useMutation({
-    mutationFn: () => exchangeCode(code.trim(), label.trim() || undefined),
+    mutationFn: () => exchangeCode(code.trim(), label.trim() || undefined, proxy.trim() || undefined),
     onSuccess: (cred) => {
       toastManager.add({
         title: t('已添加账号', 'Account added'),
@@ -220,6 +222,26 @@ export function AddAccount({
                   onChange={(event) => setLabel(event.target.value)}
                   placeholder={t('留空时使用账号邮箱', 'Leave blank to use the account email')}
                 />
+              </Field>
+              <Field name="proxy">
+                <FieldLabel htmlFor="account-proxy">
+                  {t('出站代理（可选）', 'Outbound proxy (optional)')}
+                </FieldLabel>
+                <Input
+                  id="account-proxy"
+                  name="proxy"
+                  value={proxy}
+                  onChange={(event) => setProxy(event.target.value)}
+                  placeholder="socks5://127.0.0.1:1080"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <FieldDescription>
+                  {t(
+                    '登录换码和拉取账号信息会走此代理，入库后自动存为该账号的逐账号代理。支持 socks5://、http:// 等，留空表示直连。',
+                    'Token exchange and profile fetch will go through this proxy. It is automatically saved as the per-account proxy after login. Supports socks5://, http://, etc. Leave blank for a direct connection.',
+                  )}
+                </FieldDescription>
               </Field>
             </div>
           </DialogPanel>

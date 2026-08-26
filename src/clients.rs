@@ -168,11 +168,10 @@ impl ClientPool {
         Ok(Self { direct: upstream_client(None)?, by_proxy: Default::default() })
     }
 
-    /// 不绑定任何凭证的出站客户端（OAuth 登录换码、以及测试）。
+    /// 不绑定任何凭证的出站客户端（测试、以及登录时未指定代理的兜底）。
     ///
-    /// **登录换码这条路没有代理可用**：那一刻凭证还不存在，也就无从知道它该走哪个代理。
-    /// 想让某个号从头到尾都在代理后面，得先建号、配好代理，再走别的手段刷新——这是当前
-    /// 实现的已知边界，不是疏漏。
+    /// 登录换码时如果用户指定了代理，[`crate::web::exchange`] 会临时构建一个走代理的
+    /// 客户端；没指定时退回这份直连。
     pub fn direct(&self) -> &wreq::Client {
         &self.direct
     }
