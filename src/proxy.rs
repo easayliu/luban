@@ -844,14 +844,11 @@ pub async fn handle(
                             error_type = %etype.as_deref().unwrap_or("-"),
                             request_id = %request_id,
                             should_retry = %should_retry,
-                            // 请求形态里与那套「每分钟」限额有关的就这三项，**打标量而不是整段
-                            // body**：这一发在 218 毫秒内、`input_tokens=0` 就被拒了（实测），
-                            // 判据在上游那边是一次计数器查表，与请求内容无关——同一份 body 过
-                            // 一秒就能成功，body 打出来给不出任何判别变量，只是把整段会话原文
-                            // 灌进日志（长对话几 MB 是常态）。
                             max_tokens = req_max_tokens.unwrap_or(0),
                             stream = body_json.as_ref().is_some_and(stream_requested),
                             body_bytes = body.len(),
+                            request_body = %String::from_utf8_lossy(&body),
+                            request_headers = ?upstream.headers,
                             in_flight = state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
                             cred_in_flight = load.cred_in_flight,
                             route_in_flight = load.route_in_flight,
