@@ -61,6 +61,8 @@ export interface Settings {
   cache_scope_global: boolean
   /** 请求自带设备标识时，要不要换成当前账号派生的那个（spoof_identity 的子项）。 */
   spoof_device_id: boolean
+  /** 设备指纹只取平台（arch/os），同平台客户端收敛为同一个设备标识（spoof_device_id 的子项）。 */
+  normalize_device_fp: boolean
   /** 缓存断点写不写 ttl:"1h"（对齐官方）；关闭则沿用客户端自己传的时长。 */
   cache_ttl_1h: boolean
   /** 非流式 /v1/messages 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。 */
@@ -75,6 +77,7 @@ export interface Settings {
 export type ForwardingKey =
   | 'spoof_identity'
   | 'spoof_device_id'
+  | 'normalize_device_fp'
   | 'billing_cch'
   | 'fill_client_headers'
   | 'merge_beta'

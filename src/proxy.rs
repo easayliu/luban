@@ -309,9 +309,10 @@ pub async fn handle(
     // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制，
     //    一条 SQL 读齐（默认全开 = 加入开关前的既有行为）。
     let flags = state.store.forward_flags();
-    // 设备指纹叠加客户端原始 device_id 与平台 arch/os，使不同设备得到不同伪装 device_id。
-    // 头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
-    let device_fp = device_fingerprint(device_id.as_deref(), &headers);
+    // 设备指纹用于派生伪装 device_id。归一化开着时只取平台（arch/os），关着时叠加客户端
+    // 原始 device_id。头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
+    let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
+    let device_fp = device_fingerprint(fp_device, &headers);
     // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 4 块 + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
     //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
@@ -6248,6 +6249,7 @@ mod tests {
         let flags = store::ForwardFlags {
             spoof_identity: false,
             spoof_device_id: false,
+            normalize_device_fp: false,
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
@@ -6839,6 +6841,7 @@ mod tests {
         let flags = store::ForwardFlags {
             spoof_identity: false,
             spoof_device_id: false,
+            normalize_device_fp: false,
             billing_cch: false,
             fill_client_headers: false,
             merge_beta: false,
@@ -7258,6 +7261,7 @@ mod tests {
             ..store::ForwardFlags {
                 spoof_identity: false,
                 spoof_device_id: false,
+                normalize_device_fp: false,
                 billing_cch: false,
                 fill_client_headers: false,
                 merge_beta: false,

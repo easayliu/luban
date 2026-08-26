@@ -1553,6 +1553,9 @@ impl CredentialStore {
         if let Some(v) = on(SPOOF_DEVICE_ID) {
             flags.spoof_device_id = v;
         }
+        if let Some(v) = on(NORMALIZE_DEVICE_FP) {
+            flags.normalize_device_fp = v;
+        }
         if let Some(v) = on(SPOOF_BILLING_CCH) {
             flags.billing_cch = v;
         }
@@ -1701,6 +1704,16 @@ pub const SPOOF_IDENTITY_ENABLED: &str = "spoof_identity_enabled";
 /// 请求要不要改写其中的设备段」。
 pub const SPOOF_DEVICE_ID: &str = "spoof_device_id";
 
+/// 设备指纹是否只取平台（arch/os），不含客户端原始 `device_id`。缺省视为开启。
+///
+/// 开（默认）：`fingerprint = arch|os` → 同平台的所有客户端收敛成同一个伪装 device_id，
+/// 每个账号最多 2–3 个设备身份（macOS/arm64、Linux/x86_64…），符合真实用户一人多设备的模式。
+/// 关：`fingerprint = client_device_id|arch|os` → 每个 (账号, 客户端设备) 都是独立的设备身份，
+/// 客户端越多、上游看到该账号的设备数就越多，不符合正常用户的使用模式。
+///
+/// 只在 [`SPOOF_DEVICE_ID`] 开着时有意义——那个关着时 device_id 原样透传，指纹不参与。
+pub const NORMALIZE_DEVICE_FP: &str = "normalize_device_fp";
+
 /// 缓存断点要不要写 `ttl:"1h"`（对齐官方）。缺省视为开启；关掉即沿用客户端自己传的时长。
 pub const SYSTEM_CACHE_TTL: &str = "system_cache_ttl";
 
@@ -1795,6 +1808,15 @@ pub struct ForwardFlags {
     /// 「CC 形态但缺 `metadata.user_id`」那条路上来访压根没有 `device_id`，只能派生，
     /// 不受本开关影响——否则产出的是一份没有 `device_id` 的 `metadata`，那是官方从不发的形态。
     pub spoof_device_id: bool,
+    /// 设备指纹只取平台（arch/os），不含客户端原始 `device_id`（[`Self::spoof_device_id`]
+    /// 的子项，它关着时指纹不参与，本项无从谈起）。
+    ///
+    /// - **开**（默认）：`fingerprint = arch|os` → 同平台的所有客户端收敛成同一个伪装
+    ///   device_id，每个账号最多 2–3 个设备身份（macOS/arm64、Linux/x86_64…），符合真实
+    ///   用户一人多设备的模式。
+    /// - **关**：`fingerprint = client_device_id|arch|os` → 每个 (账号, 客户端设备) 都是
+    ///   独立的设备身份，客户端越多、上游看到该账号的设备数就越多。
+    pub normalize_device_fp: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     pub billing_cch: bool,
     /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
@@ -1894,6 +1916,7 @@ impl Default for ForwardFlags {
         Self {
             spoof_identity: true,
             spoof_device_id: true,
+            normalize_device_fp: true,
             billing_cch: true,
             fill_client_headers: true,
             merge_beta: true,
@@ -5957,6 +5980,7 @@ mod tests {
         for (key, off) in [
             (SPOOF_IDENTITY_ENABLED, "0"),
             (SPOOF_DEVICE_ID, "0"),
+            (NORMALIZE_DEVICE_FP, "0"),
             (SPOOF_BILLING_CCH, "false"),
             (FILL_CLIENT_HEADERS, " FALSE "),
             (MERGE_BETA, "False"),
@@ -5980,6 +6004,7 @@ mod tests {
             ForwardFlags {
                 spoof_identity: false,
                 spoof_device_id: false,
+                normalize_device_fp: false,
                 billing_cch: false,
                 fill_client_headers: false,
                 merge_beta: false,

@@ -175,6 +175,23 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="normalize_device_fp"
+          label={t('设备指纹归一化', 'Normalize device fingerprint')}
+          summary={t(
+            '同平台的所有客户端收敛为同一个设备标识，每个账号最多 2–3 个设备。',
+            'Converge all clients on the same platform into one device identifier, limiting each account to 2–3 devices.',
+          )}
+          requires={{ key: 'spoof_device_id', label: t('改写设备标识', 'Rewrite device identifier') }}
+          description={
+            <>
+              {t(
+                '设备指纹用于派生每个账号的伪装设备标识。开启后指纹只取平台信息（CPU 架构与操作系统），不含客户端原始设备标识——同一平台上的所有客户端都会得到同一个伪装设备标识，每个账号最多只有 2–3 个设备（如 macOS/arm64、Linux/x86_64），符合真实用户一人多设备的使用模式。关闭后指纹包含客户端原始设备标识，每个（账号、客户端设备）组合都是一个独立的上游设备标识，客户端越多、上游看到该账号的设备数就越多。',
+                'The device fingerprint is used to derive a spoofed device identifier per account. When enabled, the fingerprint uses only platform information (CPU architecture and operating system) and excludes the client’s original device identifier — all clients on the same platform share one spoofed device identifier, limiting each account to at most 2–3 devices (e.g. macOS/arm64, Linux/x86_64), which matches the usage pattern of a real user with multiple devices. When disabled, the fingerprint includes the client’s original device identifier, making each (account, client device) combination a separate upstream device identifier — the more clients there are, the more devices upstream sees for that account.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="billing_cch"
           label={t('订阅计费标识', 'Subscription billing identifier')}
           summary={t(
