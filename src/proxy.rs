@@ -7599,7 +7599,8 @@ mod tests {
 
         // 学之前不剥。
         let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw.clone());
+        let out =
+            super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw.clone());
         assert_eq!(out, raw, "学之前应该原样返回");
 
         // 喂一条 400。
@@ -7621,8 +7622,12 @@ mod tests {
         // 不同模型不受影响。
         let other_body = temp_req("claude-opus-5");
         let other_raw = Bytes::from(serde_json::to_vec(other_body.as_ref().unwrap()).unwrap());
-        let out =
-            super::maybe_strip_deprecated(&mem, Some("claude-opus-5"), other_body.as_ref(), other_raw.clone());
+        let out = super::maybe_strip_deprecated(
+            &mem,
+            Some("claude-opus-5"),
+            other_body.as_ref(),
+            other_raw.clone(),
+        );
         assert_eq!(out, other_raw, "不同模型不该被剥");
     }
 
@@ -7675,10 +7680,7 @@ mod tests {
         assert!(mem.read().is_empty());
         // 剥也一样安全。
         let raw = Bytes::from_static(b"{}");
-        assert_eq!(
-            super::maybe_strip_deprecated(&mem, None, None, raw.clone()),
-            raw
-        );
+        assert_eq!(super::maybe_strip_deprecated(&mem, None, None, raw.clone()), raw);
     }
 
     /// 本地拒绝回出去的那份体，形态与上游的错误体一致（客户端只读 `error.message`），

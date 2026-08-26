@@ -155,8 +155,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let (ev_ok, mt_ok) =
-                        oauth::keepalive(&http, &cred.access_token).await;
+                    let (ev_ok, mt_ok) = oauth::keepalive(&http, &cred.access_token).await;
                     if ev_ok && mt_ok {
                         tracing::debug!(cred_id = cred.id, cred = %cred.label, "keepalive: ok");
                     } else {
