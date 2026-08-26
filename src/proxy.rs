@@ -434,15 +434,17 @@ pub async fn handle(
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
         let target = if sim.is_some() && billable { ensure_beta_query(&url) } else { url.clone() };
         // 这一轮用的是 `cred` 这个号，出站客户端就取它的：配了专用代理的号必须走它自己的
-        // 代理，否则真实出口 IP 会直接打到上游。取不出来（代理配错/建不出客户端）时如实
-        // 报 503，绝不退回直连——退回去正是这个号配代理要防的事。
+        // 代理，否则真实出口 IP 会直接打到上游。取不出来（代理配错/建不出客户端）时直接
+        // 标记禁用踢出调度池——不退回直连，也不留在池里每次白吃一发 503。
         let client = match state.clients.for_credential(&cred) {
             Ok(c) => c,
             Err(e) => {
+                let reason = format!("[proxy] {e:#}");
                 tracing::warn!(
-                    cred_id = cred.id, cred = %cred.label, error = %format!("{e:#}"),
-                    "refusing to forward: this credential has a proxy configured but no usable client could be built"
+                    cred_id = cred.id, cred = %cred.label, error = %reason,
+                    "proxy unusable, disabling the credential"
                 );
+                let _ = state.store.mark_banned(cred.id, &reason);
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
@@ -5677,9 +5679,14 @@ pub async fn probe(
     let upstream = Upstream {
         _state: std::marker::PhantomData,
         // 测试也走这个号自己的代理——不然「测通了」测的是直连那条路，与真实转发不是一回事。
+        // 代理建不出来同样标记禁用：与转发/刷新/保活口径一致，坏代理不留在池里。
         client: match state.clients.for_credential(cred) {
             Ok(c) => c,
-            Err(e) => return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}")),
+            Err(e) => {
+                let reason = format!("[proxy] {e:#}");
+                let _ = state.store.mark_banned(cred.id, &reason);
+                return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}"));
+            }
         },
         method: Method::POST,
         // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。

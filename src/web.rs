@@ -151,7 +151,9 @@ pub async fn run(
                     let http = match clients.for_credential(&cred) {
                         Ok(c) => c,
                         Err(e) => {
-                            tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %e, "keepalive: cannot build HTTP client");
+                            let reason = format!("[proxy] {e:#}");
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %reason, "keepalive: proxy unusable, disabling the credential");
+                            let _ = store.mark_banned(cred.id, &reason);
                             continue;
                         }
                     };

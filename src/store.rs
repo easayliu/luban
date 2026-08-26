@@ -3572,8 +3572,12 @@ async fn ensure_fresh_token(
     // 刷新也必须走这个号自己的代理：只把转发挂上代理、刷新走直连的话，每次 token 过期
     // 都会有一次带真实 IP 的请求打到上游，而且那条路径的失败最不容易被注意到。
     // 取的是双重检查之后那份 `cred`——等锁期间代理可能刚被改过。
-    let http = &clients.for_credential(&cred)?;
-    let err = match crate::oauth::refresh(http, &cred.refresh_token).await {
+    // 代理建不出来是永久配置错误，走 Revoked 让上层 mark_banned 踢出调度池。
+    let http = match clients.for_credential(&cred) {
+        Ok(c) => c,
+        Err(e) => return Ok(TokenAttempt::Revoked(format!("[proxy] {e:#}"))),
+    };
+    let err = match crate::oauth::refresh(&http, &cred.refresh_token).await {
         Ok(tokens) => {
             store.update_tokens(
                 cred.id,
