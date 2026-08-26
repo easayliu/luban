@@ -198,6 +198,15 @@ pub async fn handle(
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
     }
 
+    // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）→ 剥掉后正常转发。
+    //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
+    let body = maybe_strip_deprecated(
+        &state.deprecated_fields,
+        req_model.as_deref(),
+        body_json.as_ref(),
+        body,
+    );
+
     // 2.4) 每设备 RPM 上限：这台机器最近 60 秒发得太多 → 直接 429 + `retry-after`。
     //      **不换号**：账号打满换个号还能发，设备打满换哪个号都是同一台机器在刷，换号只会
     //      白白改绑设备（还会连累 thinking 签名，见 [`store::RpmLimited::sticky`]）。故这道闸
@@ -708,6 +717,12 @@ pub async fn handle(
                         if !compressed && status == StatusCode::BAD_REQUEST {
                             remember_shape_rejection(
                                 &state.shape_rejections,
+                                req_model.as_deref(),
+                                body_json.as_ref(),
+                                &bytes,
+                            );
+                            remember_deprecated_field(
+                                &state.deprecated_fields,
                                 req_model.as_deref(),
                                 body_json.as_ref(),
                                 &bytes,
@@ -3262,6 +3277,30 @@ type ShapeRejections = std::collections::HashMap<(String, &'static str, String),
 /// 支持的取值」——那才是查不出来的故障。
 pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
 
+// ── 已废弃字段的自动剥离 ──────────────────────────────────────────────
+//
+// 与 ShapeProbe 共享「从上游 400 里学」的范式，但行为正好相反：
+// - ShapeProbe 学到的是「模型 + 取值」组合，命中即**拒绝**（回放上游原话）。
+// - 这里学到的是「模型 + 字段」组合，命中即**剥掉该字段后正常转发**。
+//
+// 典型案例：`temperature` / `top_p` / `top_k` 在部分新模型上被标为 deprecated——
+// 客户端的意图（发一条消息）是合法的，只是多带了一个上游不再接受的参数。剥掉它、
+// 请求照常成功，比拒掉再让客户端去改 SDK 参数好得多。
+
+/// 可能被上游按模型废弃的**顶层**字段。来访请求里有这个字段、且上游那条 400 含
+/// `` `字段名` `` + `deprecated` → 记下来，之后同模型自动剥掉。
+///
+/// 只放确实是**可选**的采样/生成参数——缺了它们请求也完全合法。`model`、`messages`
+/// 之类缺了上游直接 400，剥掉只是换一种死法。
+const DEPRECATABLE_FIELDS: &[&str] = &["temperature", "top_p", "top_k"];
+
+/// 上游拒过的「模型 + 已废弃字段」→ 上游那句原话（只做日志，不回放）。
+type DeprecatedFieldRejections = std::collections::HashMap<(String, String), String>;
+
+/// [`DeprecatedFieldRejections`] 的共享句柄。与 [`ShapeMemory`] 一样只活在进程内，
+/// 重启代价不过是每种组合再撞一次 400。
+pub type DeprecatedFieldMemory = std::sync::Arc<parking_lot::RwLock<DeprecatedFieldRejections>>;
+
 /// 拒绝日志的抑制表：键（`device:<id>` / `session:<id>`）→ (上次真打了日志的时刻, 从那以后
 /// 憋掉的条数)。
 type RejectionCounters = std::collections::HashMap<String, (std::time::Instant, u64)>;
@@ -3474,6 +3513,91 @@ fn remember_shape_rejection(
                 "learned a request-shape rejection; the same combination will be rejected locally from now on"
             );
         }
+    }
+}
+
+/// 上游的 400 里出现 `` `字段名` `` + `deprecated` → 记进 [`DeprecatedFieldMemory`]，
+/// 之后同模型转发前自动剥掉该字段。与 [`remember_shape_rejection`] 并行调用。
+///
+/// 典型上游原文：`` `temperature` is deprecated for this model. ``
+/// 判据是「`deprecated` 出现 + 反引号包裹的字段名与请求里确实存在的顶层键匹配」，
+/// 两项**共现**才认——单看 `deprecated` 会误伤，单看反引号里的串可能碰巧。
+fn remember_deprecated_field(
+    mem: &DeprecatedFieldMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+    err: &[u8],
+) {
+    let (Some(model), Some(body)) = (model, body) else { return };
+    let (_, message) = parse_upstream_error(err);
+    let hay = message.to_lowercase();
+    if !hay.contains("deprecated") {
+        return;
+    }
+    let Some(obj) = body.as_object() else { return };
+    for &field in DEPRECATABLE_FIELDS {
+        if !obj.contains_key(field) {
+            continue;
+        }
+        if !message.contains(&format!("`{field}`")) {
+            continue;
+        }
+        let mut table = mem.write();
+        let key = (model.to_string(), field.to_string());
+        if table.contains_key(&key) || table.len() >= SHAPE_MEMORY_CAP {
+            continue;
+        }
+        table.insert(key, message.clone());
+        tracing::info!(
+            model = %model,
+            field = %field,
+            "learned a deprecated-field rejection; the field will be stripped for this model from now on"
+        );
+    }
+}
+
+/// 请求体里有没有该模型已经被标记为 deprecated 的字段；有则从 `body` 里剥掉后返回
+/// 新的 `Bytes`，没有则原样返回（零拷贝）。
+///
+/// **先用已经解析好的 `body_json` 做只读检查**，命中了才重新解析 `body` 做改写——
+/// 绝大多数请求根本不带 `temperature` 或者模型没有废弃它，走的是零开销的快速路径。
+fn maybe_strip_deprecated(
+    mem: &DeprecatedFieldMemory,
+    model: Option<&str>,
+    body_json: Option<&serde_json::Value>,
+    body: Bytes,
+) -> Bytes {
+    let Some(model) = model else { return body };
+    let Some(bj) = body_json else { return body };
+    let Some(obj) = bj.as_object() else { return body };
+    let table = mem.read();
+    if table.is_empty() {
+        return body;
+    }
+    let to_strip: Vec<&str> = DEPRECATABLE_FIELDS
+        .iter()
+        .filter(|&&f| {
+            obj.contains_key(f) && table.contains_key(&(model.to_string(), f.to_string()))
+        })
+        .copied()
+        .collect();
+    drop(table);
+    if to_strip.is_empty() {
+        return body;
+    }
+    let mut v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    if let Some(obj) = v.as_object_mut() {
+        for f in &to_strip {
+            obj.remove(*f);
+        }
+    }
+    tracing::debug!(model, fields = ?to_strip, "stripped deprecated fields from request");
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => body,
     }
 }
 
@@ -7449,6 +7573,112 @@ mod tests {
             );
         }
         assert_eq!(mem.read().len(), super::SHAPE_MEMORY_CAP);
+    }
+
+    // ── deprecated field 学习与剥离 ──────────────────────────────────
+
+    const TEMP_400: &str = "`temperature` is deprecated for this model.";
+
+    fn temp_req(model: &str) -> Option<serde_json::Value> {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"temperature":0.7}}"#
+        ))
+    }
+
+    fn top_p_req(model: &str) -> Option<serde_json::Value> {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"top_p":0.9}}"#
+        ))
+    }
+
+    /// 学一次之后，同模型的 `temperature` 字段会被自动剥掉；不同模型不受影响。
+    #[test]
+    fn strips_deprecated_field_after_learning() {
+        let mem = super::DeprecatedFieldMemory::default();
+        let body = temp_req("claude-fable-5");
+
+        // 学之前不剥。
+        let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
+        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw.clone());
+        assert_eq!(out, raw, "学之前应该原样返回");
+
+        // 喂一条 400。
+        super::remember_deprecated_field(
+            &mem,
+            Some("claude-fable-5"),
+            body.as_ref(),
+            &err_json(TEMP_400),
+        );
+        assert_eq!(mem.read().len(), 1);
+
+        // 学过之后剥掉。
+        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("temperature").is_none(), "temperature 应该被剥掉: {v}");
+        assert!(v.get("model").is_some(), "不该动别的字段: {v}");
+        assert!(v.get("messages").is_some(), "不该动 messages: {v}");
+
+        // 不同模型不受影响。
+        let other_body = temp_req("claude-opus-5");
+        let other_raw = Bytes::from(serde_json::to_vec(other_body.as_ref().unwrap()).unwrap());
+        let out =
+            super::maybe_strip_deprecated(&mem, Some("claude-opus-5"), other_body.as_ref(), other_raw.clone());
+        assert_eq!(out, other_raw, "不同模型不该被剥");
+    }
+
+    /// 不该学的几种 400：没有 `deprecated`、没有反引号引用字段名、请求里不含该字段。
+    #[test]
+    fn learns_nothing_from_unrelated_errors() {
+        let cases: &[(&str, &str)] = &[
+            // 普通 400，跟 deprecated 无关。
+            ("claude-fable-5", "max_tokens: 200000 > 64000, which is the maximum allowed"),
+            // 有 deprecated 但没用反引号引字段名。
+            ("claude-fable-5", "temperature is deprecated for this model."),
+            // 反引号包的不是请求里有的字段。
+            ("claude-fable-5", "`top_k` is deprecated for this model."),
+        ];
+        for (model, msg) in cases {
+            let mem = super::DeprecatedFieldMemory::default();
+            let body = temp_req(model);
+            super::remember_deprecated_field(&mem, Some(model), body.as_ref(), &err_json(msg));
+            assert!(mem.read().is_empty(), "不该学: {msg}");
+        }
+    }
+
+    /// `top_p` 也走同一套机制。
+    #[test]
+    fn learns_top_p_deprecated() {
+        let mem = super::DeprecatedFieldMemory::default();
+        let body = top_p_req("claude-fable-5");
+        super::remember_deprecated_field(
+            &mem,
+            Some("claude-fable-5"),
+            body.as_ref(),
+            &err_json("`top_p` is deprecated for this model."),
+        );
+        assert_eq!(mem.read().len(), 1);
+        let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
+        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("top_p").is_none(), "top_p 应该被剥掉: {v}");
+    }
+
+    /// 没有模型或没有请求体时安全地不学不剥。
+    #[test]
+    fn graceful_on_missing_model_or_body() {
+        let mem = super::DeprecatedFieldMemory::default();
+        // model 为 None。
+        super::remember_deprecated_field(&mem, None, temp_req("x").as_ref(), &err_json(TEMP_400));
+        assert!(mem.read().is_empty());
+        // body 为 None。
+        super::remember_deprecated_field(&mem, Some("x"), None, &err_json(TEMP_400));
+        assert!(mem.read().is_empty());
+        // 剥也一样安全。
+        let raw = Bytes::from_static(b"{}");
+        assert_eq!(
+            super::maybe_strip_deprecated(&mem, None, None, raw.clone()),
+            raw
+        );
     }
 
     /// 本地拒绝回出去的那份体，形态与上游的错误体一致（客户端只读 `error.message`），

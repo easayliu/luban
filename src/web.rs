@@ -56,6 +56,9 @@ pub struct AppState {
     /// 「模型 + 取值」组合（`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。
     /// 见 [`crate::proxy::ShapeMemory`]。
     pub shape_rejections: crate::proxy::ShapeMemory,
+    /// 上游以 `deprecated` 拒过的「模型 + 字段」记忆表：学过之后转发前自动剥掉该字段，
+    /// 客户端无需改动即可正常使用。见 [`crate::proxy::DeprecatedFieldMemory`]。
+    pub deprecated_fields: crate::proxy::DeprecatedFieldMemory,
     /// 拒绝日志的抑制表：撞上限的客户端往往每几十毫秒重试一次，一条不落地记会把日志刷没。
     /// 见 [`crate::proxy::RejectionLog`]。
     pub rejection_log: crate::proxy::RejectionLog,
@@ -93,6 +96,7 @@ pub async fn run(
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
         shape_rejections: Arc::default(),
+        deprecated_fields: Arc::default(),
         rejection_log: Arc::default(),
         transient_backoff: Arc::default(),
         upstream_load: Arc::default(),
