@@ -2945,16 +2945,11 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
-/// CC 形态来访要补 `metadata.user_id` 时用的 session_id；不需要补时为 `None`。
+/// 来访没带 `metadata.user_id` 时用来补一份的 session_id；不需要补时为 `None`。
 /// 语义与各项前提见 [`Upstream::bare_session`]。
 ///
-/// 七个前提缺一不可：
+/// 六个前提缺一不可：
 /// - `sim.is_none()`：模拟那条路自己带 session_id，不走这里；
-/// - **UA 里读不出 `claude-cli/<版本>`**：读得出就是真实 CC 客户端，它这条请求没带
-///   `metadata.user_id` 就是它自己的形态，那是官方客户端真实产生的东西。替它造一份
-///   身份，等于拿我们编的 device_id/session_id 去覆盖一个本来就没问题的请求，还会顺带
-///   补上一个它自己没发的 `X-Claude-Code-Session-Id` 头。这条路只服务「抄了 CC 的
-///   `system`、却没有官方身份字段」的第三方客户端；
 /// - `flags.fill_metadata`：本功能自己的开关（网页可关）；
 /// - `flags.spoof_identity`：身份伪装总开关——补出来的那份身份正是它管的东西，
 ///   它关着还补，等于绕过总开关；
@@ -2963,6 +2958,9 @@ fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
 /// - `spoof_device_id` 有值：这是 [`ensure_cc_metadata`] 造身份的前提（无 `account_uuid`
 ///   就造不出自洽身份）。不满足时连头也不补——否则会补出一个「头上有会话 id、体里没
 ///   metadata」的新破绽，比两处都缺更显眼。
+///
+/// **不再排除真 CC 客户端**：实测 CC Desktop 等客户端有时不带 `metadata.user_id`，
+/// 上游对无 metadata 的请求走更严的限流通道，触发裸 429。补上后同一条请求立即 200。
 fn bare_session_id(
     headers: &HeaderMap,
     flags: store::ForwardFlags,
@@ -2973,7 +2971,6 @@ fn bare_session_id(
     device_fp: &str,
 ) -> Option<String> {
     if sim.is_some()
-        || cc_cli_version(&ua_of(headers)).is_some()
         || !flags.fill_metadata
         || !flags.spoof_identity
         || !billable
@@ -8802,11 +8799,12 @@ mod tests {
             "body 里的 session_id 必须与 sim.session_id 一致"
         );
 
-        // 8) 真实 CC 客户端没带 `metadata.user_id` 时不替它补。
+        // 8) 真实 CC 客户端没带 `metadata.user_id` 时也要补——上游对无 metadata 的请求
+        //    走更严的限流通道，不补会裸 429。
         assert!(
             super::bare_session_id(&cc_ua, all_on(), None, true, false, &test_cred(), "fp")
-                .is_none(),
-            "真实 CC 客户端的裸请求不该补身份"
+                .is_some(),
+            "真实 CC 客户端无 metadata 也应补身份"
         );
     }
 
