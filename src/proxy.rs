@@ -4401,14 +4401,17 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
 /// 恒为 `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
 /// output_config, stream`，多一个就是白送的判据。
 ///
-/// 目前两项：
+/// 目前三项：
 ///
 /// 1. **`tool_choice`**：官方两份抓包里这个键**压根不存在**。但只删**等价于默认值**的那一种
 ///    （恰好只有 `{"type":"auto"}` 一个键）——`{"type":"tool", "name":…}`/`{"type":"any"}`
 ///    是客户端在强制选工具，`disable_parallel_tool_use` 也是它要的行为，删了就是改语义。
 ///    删掉的那种对模型零影响：`auto` 本来就是缺省。
 ///
-/// 2. **`thinking.display`**：官方发的是裸的 `{"type":"adaptive"}`。
+/// 2. **`thinking.type == "disabled"`**：fable-5 等模型不支持显式关闭思考，会直接 400。
+///    删掉整个 `thinking` 字段让上游走 adaptive 默认值。
+///
+/// 3. **`thinking.display`**：官方发的是裸的 `{"type":"adaptive"}`。
 ///
 ///    **这一项有代价，不是零影响**：`display:"summarized"` 是客户端主动要思考摘要，剥掉之后
 ///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
@@ -4421,6 +4424,13 @@ fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
     let mut changed = false;
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
         obj.remove("tool_choice");
+        changed = true;
+    }
+    // `thinking.type == "disabled"`：fable-5 等模型不支持，直接 400。删掉整个 `thinking`
+    // 字段让上游走 adaptive 默认值——客户端的意图（不要深度思考）近似保留，好过打不通。
+    if obj.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str()) == Some("disabled")
+    {
+        obj.remove("thinking");
         changed = true;
     }
     if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut())
@@ -7350,6 +7360,21 @@ mod tests {
             assert!(!strip_extra_fields(&mut v), "不该动: {keep}");
             assert_eq!(v["tool_choice"], keep);
         }
+
+        // thinking.type == "disabled"：整个 thinking 字段删掉，上游走 adaptive 默认值。
+        let mut v = serde_json::json!({
+            "model": "claude-fable-5",
+            "thinking": {"type": "disabled"},
+        });
+        assert!(strip_extra_fields(&mut v));
+        assert!(v.get("thinking").is_none(), "disabled 应整个删掉: {v}");
+
+        // thinking.type == "enabled" 不动。
+        let mut v = serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+        });
+        assert!(!strip_extra_fields(&mut v));
+        assert_eq!(v["thinking"]["type"], "enabled");
 
         // 官方形态本身：走一遍什么也不改（对真实 CC 是空操作）。
         let mut official = serde_json::json!({
