@@ -4801,7 +4801,7 @@ where
     )
 }
 
-/// 把 body 里**所有**缓存断点的 `ttl` 补齐成 `1h`，返回是否改动过。只在
+/// 把 body 里**所有**缓存断点的 `ttl` 统一成 `1h`，返回是否改动过。只在
 /// [`store::ForwardFlags::cache_ttl_1h`] 开着时调用。
 ///
 /// **为什么要走一遍全身**：[`align_system_shape`] 只重建 `system` 那两块，客户端自己标在
@@ -4811,7 +4811,9 @@ where
 /// 没有中间态。这与 [`ensure_beta_query`] 当初要消灭的是同一个形状：只对齐了一半，
 /// 拼出个两边都不像的组合。
 ///
-/// **客户端自己写了 `ttl` 的不动**：那是它掏钱买的时长，与 [`cache_control`] 同一口径。
+/// **客户端已有的短 `ttl` 也升级**：上游要求 `ttl` 按处理序（tools → system → messages）
+/// 单调不增；客户端 `tools` 带 `ttl:"5m"` 而 luban 在 `system` 写 `ttl:"1h"` 会导致
+/// `5m → 1h` 被拒（400）。既然本开关的意图就是全部走 1h，统一升级既安全又消除排序冲突。
 ///
 /// 键序按官方 `type` → `ttl` → `scope` **重建**而非追加：客户端若已写了 `scope`，
 /// 直接追加会得到 `{type,scope,ttl}` 这个官方不产生的排列。
@@ -4820,7 +4822,7 @@ fn fill_cache_ttl(v: &mut serde_json::Value) -> bool {
     match v {
         serde_json::Value::Object(map) => {
             if let Some(cc) = map.get_mut("cache_control").and_then(|c| c.as_object_mut())
-                && !cc.contains_key("ttl")
+                && cc.get("ttl").and_then(|t| t.as_str()) != Some("1h")
             {
                 let mut rebuilt = serde_json::Map::new();
                 if let Some(t) = cc.get("type") {
@@ -4828,7 +4830,7 @@ fn fill_cache_ttl(v: &mut serde_json::Value) -> bool {
                 }
                 rebuilt.insert("ttl".into(), "1h".into());
                 for (k, val) in cc.iter() {
-                    if k != "type" {
+                    if k != "type" && k != "ttl" {
                         rebuilt.insert(k.clone(), val.clone());
                     }
                 }
@@ -6913,6 +6915,24 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(!s.contains(r#""ttl""#), "关掉后不该替客户端写 ttl: {s}");
         assert!(s.contains(r#""cache_control":{"type":"ephemeral","scope":"global"}"#), "{s}");
+    }
+
+    /// 客户端 `tools` 上带 `ttl:"5m"` 时，`fill_cache_ttl` 应升级为 `"1h"`——
+    /// 否则处理序 tools(5m) → system(1h) 违反上游单调不增约束，产生 400。
+    #[test]
+    fn upgrades_short_ttl_to_1h() {
+        let body = API_SHAPE_BODY.replace(
+            r#""metadata":{""#,
+            r#""tools":[{"name":"t","cache_control":{"type":"ephemeral","ttl":"5m"}}],"metadata":{""#,
+        );
+        let out = rewrite_body(&Bytes::from(body), &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"][0]["cache_control"]["ttl"], "1h", "tools 上的 5m 应升级为 1h: {v}");
+        assert!(
+            !out.as_ref().windows(3).any(|w| w == b"5m\""),
+            "body 里不该残留 5m: {}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     /// 一份 body 里可能**同时**含多条锚点，此时必须切在最早的那个上。
