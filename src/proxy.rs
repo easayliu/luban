@@ -109,26 +109,22 @@ pub async fn handle(
     // 这里只为日志算它：走不走模拟由 [`Simulation::detect`] 自己判，但它返回 `None` 时
     // 分不出是「本来就是 CC」还是「开关关着」，而这正是排查时要知道的那一位。
     let cc_shaped = body_json.as_ref().is_some_and(is_cc_shaped);
-    // 来访是不是 Claude Code 客户端。三个记号任一命中即算，它决定这条请求要不要走模拟
-    // （见 [`Simulation::detect`]）：
+    // 来访是不是 Claude Code 客户端——**只看 UA**：`claude-cli/<版本>` 在才算。
+    // 带着正确 UA 来的就是官方客户端，默认不动它：模拟那条路会把这串 UA 连同
+    // `x-app`/`x-stainless-*` 一起换成 [`config::CC_SIM_HEADERS`] 里的定值，客户端自报的
+    // 版本被改成更旧的 [`config::CC_USER_AGENT`]，凭空造出一个版本倒退。
     //
-    // 1. UA 自报 `claude-cli/<版本>`（[`cc_cli_version`] 能读出版本号即算）——**主判据**。
-    //    带着正确 UA 来的就是官方客户端，默认不动它：模拟那条路会把这串 UA 连同
-    //    `x-app`/`x-stainless-*` 一起换成 [`config::CC_SIM_HEADERS`] 里的定值，客户端自报的
-    //    版本被改成更旧的 [`config::CC_USER_AGENT`]，凭空造出一个版本倒退。
-    // 2. `metadata.user_id` 在（[`body_has_user_id`]）——第三方 SDK、curl 不发这个字段。
-    // 3. `X-Claude-Code-Session-Id` 头非空——CC 专有头。
+    // `metadata.user_id` 和 `X-Claude-Code-Session-Id` **不再**单独构成跳过模拟的理由：
+    // 非 CC 的 UA（`Go-http-client`、`python-httpx`……）带着这些字段，只说明它抄了请求体
+    // 或头，UA 不对齐照样是一条自相矛盾的请求，需要模拟接管。模拟路径下
+    // [`rewrite_body`] 会先剥掉客户端已有的 `metadata.user_id`，再由
+    // [`ensure_cc_metadata`] 用 `sim.session_id` 重建，确保头体自洽。
     //
     // **UA 可以伪造，这是认它的代价**：照抄 `claude-cli/...` 的第三方中转从此不再被模拟，
     // 它的 `system` 里若没有那句身份声明，上游会按第三方应用拒。要让这类客户端继续用上
     // 订阅额度，只能让它别再冒充官方 UA（改回自己的 UA 即可重新走模拟），或者自己把那句
     // 身份声明加进 `system`。这是取舍后的选择：宁可让冒充者暴露，也不对真官方客户端动手脚。
-    //
-    // 2 用 `body_has_user_id` 而不是 [`extract_device_id`]，是有意放宽：只问字段在不在，
-    // 不要求格式认得出。官方哪天换一种 `user_id` 写法，宽的这条仍把它当官方客户端，最多
-    // 退化成不绑定设备；严的那条会把它送进模拟，代价大得多。
-    let mut from_cc_client =
-        cc_cli_version(&client_ua).is_some() || has_user_id || session_from_header.is_some();
+    let from_cc_client = cc_cli_version(&client_ua).is_some();
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
@@ -592,8 +588,6 @@ pub async fn handle(
                             // 官方 CC 的样子，否则以裸 curl 头 + OAuth token 出站
                             // 照样触发上游的裸 429。
                             has_user_id = false;
-                            from_cc_client = cc_cli_version(&client_ua).is_some()
-                                || session_from_header.is_some();
                             tracing::warn!(
                                 cred_id = cred.id, cred = %cred.label,
                                 model = %req_model.as_deref().unwrap_or("-"),
@@ -2862,9 +2856,6 @@ impl Simulation {
             return None;
         }
         let v = body?;
-        if is_cc_shaped(v) {
-            return None;
-        }
         // 来访是 Claude Code 客户端（UA 自报 `claude-cli/`、或带着 CC 才发的那两个记号），
         // 说明它本来就是官方客户端的一支——VSCode 扩展、agent-sdk 之类，只是这条请求的
         // `system` 里没那句身份声明。**这种请求不模拟**，两处代价都是实打实的：
@@ -2880,6 +2871,12 @@ impl Simulation {
         // 代价记在这儿：这类请求的 `system` 里既然没有那句身份声明，上游有可能按第三方应用
         // 拒（400）。那是它自己的形态问题，该由客户端修；替它换一身皮，换来的是一条更矛盾的
         // 请求。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
+        //
+        // CC 形态（`system` 里有那句身份声明）的来访，只有同时也是真正的 CC 客户端才跳过：
+        // 非 CC 客户端（`Go-http-client`、`python-httpx`……）抄了 system 却没配套改 UA，
+        // 这种头体不一致比不模拟更容易被上游标记，不如一并接管。
+        // [`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉客户端已有的那份身份声明和
+        // billing header，再由模拟统一补上官方的，避免重复。
         if from_cc_client {
             return None;
         }
@@ -3049,6 +3046,9 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
         Some(serde_json::Value::Array(a)) => merge_system_blocks(a.clone()),
         _ => Vec::new(),
     };
+    // 客户端可能已经抄了官方的 billing header 和身份声明（`is_cc_shaped` 不再拦截非 CC
+    // 客户端的这种请求）。模拟会重新补齐这两块，先剥掉客户端那份以免重复。
+    let client = strip_cc_preamble(client);
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
     let outside = count_cache_control(v) - v.get("system").map(count_cache_control).unwrap_or(0);
     let used = outside + client.iter().map(count_cache_control).sum::<usize>();
@@ -3109,12 +3109,67 @@ fn merge_system_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value>
     }]
 }
 
+/// 剥掉客户端 `system` 块里已有的 CC 前缀：`x-anthropic-billing-header` 和
+/// [`config::CC_SYSTEM_IDENTITY`]。[`simulate_system`] 会重新补上官方的这两块，不剥就
+/// 会重复——两句身份声明比缺了更显眼。
+///
+/// 两种情况：
+/// - 独立块（未合并）：整块 `==` 那句话、或 `starts_with` billing header，整块丢掉。
+/// - 合并块（经 [`merge_system_blocks`]）：identity / billing header 嵌在一大段文本里，
+///   按子串剥掉再 trim 多余的换行。
+fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    // 先丢掉整块命中的。
+    blocks.retain(|b| {
+        let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
+            return true;
+        };
+        let trimmed = text.trim();
+        if trimmed == config::CC_SYSTEM_IDENTITY {
+            return false;
+        }
+        if trimmed.starts_with("x-anthropic-billing-header:") && !trimmed.contains("\n\n") {
+            return false;
+        }
+        true
+    });
+    // 处理合并后嵌在一大段文本里的情况：子串级剥。
+    for b in &mut blocks {
+        let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if !text.contains(config::CC_SYSTEM_IDENTITY)
+            && !text.contains("x-anthropic-billing-header:")
+        {
+            continue;
+        }
+        let mut s = text.to_string();
+        // 剥 billing header：它只占一行。
+        if let Some(start) = s.find("x-anthropic-billing-header:") {
+            let end = s[start..].find('\n').map(|i| start + i + 1).unwrap_or(s.len());
+            s.replace_range(start..end, "");
+        }
+        s = s.replace(config::CC_SYSTEM_IDENTITY, "");
+        // 连续空行归一。
+        while s.contains("\n\n\n") {
+            s = s.replace("\n\n\n", "\n\n");
+        }
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            b.as_object_mut()
+                .map(|o| o.insert("text".into(), serde_json::Value::String(String::new())));
+        } else {
+            b.as_object_mut().map(|o| o.insert("text".into(), serde_json::Value::String(trimmed)));
+        }
+    }
+    // 剥完文本变空的块也丢掉。
+    blocks.retain(|b| b.get("text").and_then(|t| t.as_str()).is_none_or(|t| !t.trim().is_empty()));
+    blocks
+}
+
 /// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：第 4 块起的全部内容并进第 4 块
 /// （见 [`merge_system_blocks`]）。
 ///
-/// 兜住[`simulate_system`] 管不到的那两类来访：一是**自称 CC 却发了 5 块以上**的第三方
-/// 客户端（[`is_cc_shaped`] 认它是 CC，于是既不模拟、也不走 [`align_system_shape`] 的三块
-/// 分支），二是任何在我们之前就把 `system` 拆碎了的中间层。它们不改就是照着第三方额度扣。
+/// 兜住任何在我们之前就把 `system` 拆碎了的中间层：块数超 4 照样按第三方额度扣。
 ///
 /// 已经不超过 4 块（含官方的 4 块与 API-key 的 3 块）时不动结构、返回 `false`。
 fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
@@ -3837,6 +3892,17 @@ fn rewrite_body(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<none>".into()),
         "inbound metadata"
     );
+    // 模拟路径下客户端可能已带 `metadata.user_id`——它的 session_id 是客户端原值，
+    // 而出站头上的 `X-Claude-Code-Session-Id` 取自 `sim.session_id`。两处不同值就是
+    // 官方不产生的矛盾，先剥掉再让 `ensure_cc_metadata` 用 sim.session_id 重建。
+    if sim.is_some() {
+        if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.remove("user_id");
+            if meta.is_empty() {
+                v.as_object_mut().map(|o| o.remove("metadata"));
+            }
+        }
+    }
     let sim_meta = flags.spoof_identity
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
     let spoofed =
@@ -7851,17 +7917,14 @@ mod tests {
     );
 
     /// 测试里一律走这个判定，别直接调 [`super::Simulation::detect`]：`from_cc_client` 要按
-    /// 代理里那条式子从 body 与来访头一起算。手填一个常量就会造出「body 带着 user_id 却按
-    /// 没带判」这种代理路径上根本产生不了的组合，而那正是本判据要管的那一位。
+    /// 代理里那条式子从 UA 算——**只看 UA**，`metadata.user_id` 和 session 头不再构成跳过理由。
     fn detect_with(
         body: &Bytes,
         headers: &super::HeaderMap,
         flags: store::ForwardFlags,
     ) -> Option<super::Simulation> {
         let v = parsed(body);
-        let from_cc_client = super::cc_cli_version(&super::ua_of(headers)).is_some()
-            || super::body_has_user_id(v.as_ref())
-            || super::incoming_session_id(headers).is_some();
+        let from_cc_client = super::cc_cli_version(&super::ua_of(headers)).is_some();
         super::Simulation::detect(v.as_ref(), from_cc_client, flags, &test_cred(), "fp")
     }
 
@@ -8243,16 +8306,50 @@ mod tests {
     /// 已经是 CC 形态的请求一个字节都不该多改——判据是 `system` 里那句身份声明，
     /// 字符串形态与数组形态都认。
     #[test]
-    fn leaves_cc_shaped_request_alone() {
-        let cc = Bytes::from(API_SHAPE_BODY);
-        assert!(detect_for(&cc, all_on()).is_none(), "CC 形态不该走模拟路径");
+    fn cc_shaped_from_non_cc_client_is_simulated() {
+        // 非 CC 客户端（无 UA / Go-http-client 等）抄了 CC 的 system 但没带 metadata.user_id：
+        // 应走模拟，把 headers 统一换成官方形态，body 里那份身份声明由 strip_cc_preamble
+        // 剥掉再重建。
+        let cc_no_meta = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}},{{"type":"text","text":"user prompt"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(detect_for(&cc_no_meta, all_on()).is_some(), "非 CC 客户端抄了 system 应走模拟");
         let as_string = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","system":"{}","messages":[]}}"#,
             config::CC_SYSTEM_IDENTITY
         ));
-        assert!(detect_for(&as_string, all_on()).is_none());
+        assert!(detect_for(&as_string, all_on()).is_some(), "字符串形态也应走模拟");
 
-        // 开关关掉、或 merge_beta 关掉（模拟出来的 beta 没人落位）时也不模拟。
+        // 带 metadata.user_id 但 UA 不是 claude-cli → 照样走模拟（只看 UA）。
+        let cc_with_meta = Bytes::from(API_SHAPE_BODY);
+        assert!(detect_for(&cc_with_meta, all_on()).is_some(), "非 CC UA 带 user_id 也走模拟");
+
+        // 真正的 CC 客户端（UA 带 claude-cli/）+ CC 形态 body 不模拟——UA 不降级。
+        let mut cc_ua = super::HeaderMap::new();
+        cc_ua.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.226 (external, cli)"),
+        );
+        assert!(detect_with(&cc_no_meta, &cc_ua, all_on()).is_none(), "真 CC 客户端不该走模拟");
+
+        // 模拟后 system 里不该有两份身份声明。
+        let sim = detect_for(&cc_no_meta, all_on()).unwrap();
+        let out = rewrite_body(&cc_no_meta, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        let id_count = sys
+            .iter()
+            .filter(|b| b.get("text").and_then(|t| t.as_str()) == Some(config::CC_SYSTEM_IDENTITY))
+            .count();
+        assert_eq!(id_count, 1, "身份声明只该出现一次: {v}");
+        // 客户端的原始 prompt 不该丢。
+        assert!(
+            sys.iter().any(|b| b.get("text").and_then(|t| t.as_str()) == Some("user prompt")),
+            "客户端原始 prompt 应保留: {v}"
+        );
+
+        // 开关关掉、或 merge_beta 关掉时也不模拟。
         let plain = Bytes::from(PLAIN_BODY.to_string());
         let off = store::ForwardFlags { simulate_cc: false, ..all_on() };
         assert!(detect_for(&plain, off).is_none());
@@ -8318,34 +8415,33 @@ mod tests {
         assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
     }
 
-    /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：既不模拟、也不走
-    /// 三块拆分器，只能靠封顶兜住，否则块数超 4 照样按第三方额度扣。
+    /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：
+    /// 非 CC 客户端现在走模拟，`strip_cc_preamble` 剥掉旧身份、`simulate_system` 补上新的。
     #[test]
-    fn caps_system_blocks_for_cc_shaped_client() {
+    fn cc_shaped_from_non_cc_client_strips_and_rebuilds() {
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"h"}},{{"type":"text","text":"{}"}},{{"type":"text","text":"c"}},{{"type":"text","text":"d"}},{{"type":"text","text":"e","cache_control":{{"type":"ephemeral"}}}}]}}"#,
             config::CC_SYSTEM_IDENTITY
         ));
-        assert!(detect_for(&body, all_on()).is_none(), "CC 形态不该走模拟");
-        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        assert!(detect_for(&body, all_on()).is_some(), "非 CC 客户端应走模拟");
+        let sim = detect_for(&body, all_on()).unwrap();
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 4, "5 块应压回 4 块: {v}");
-        assert_eq!(sys[3]["text"], "d\n\ne", "第 4 块起并成一块");
-        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral", "末块断点保留");
+        // 身份声明只有一份（模拟补的那份），客户端原来那份已被 strip 掉。
+        let id_count = sys
+            .iter()
+            .filter(|b| b.get("text").and_then(|t| t.as_str()) == Some(config::CC_SYSTEM_IDENTITY))
+            .count();
+        assert_eq!(id_count, 1, "身份声明应恰好一份: {v}");
+        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY);
 
-        // 4 块及以内不动结构：官方形态与 API-key 的三块形态都不该被这条碰到。
+        // 4 块及以内不动结构：cap_system_blocks 的直接验证。
         let four = Bytes::from(API_SHAPE_BODY);
         let before: serde_json::Value = serde_json::from_slice(&four).unwrap();
         let mut after = before.clone();
         assert!(!super::cap_system_blocks(&mut after), "3 块不该被改");
         assert_eq!(before, after);
-
-        // 开关关掉就不封顶。
-        let off = store::ForwardFlags { system_shape: false, ..all_on() };
-        let out = rewrite_body(&body, &test_cred(), "fp", off, None, None);
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["system"].as_array().unwrap().len(), 5, "关掉开关应原样转发: {v}");
     }
 
     /// 模拟路径补 `metadata.user_id`：键序与 CC 一致，session_id 与请求头同值且逐设备稳定；
@@ -8369,17 +8465,35 @@ mod tests {
         assert_eq!(inner["session_id"], sim.session_id, "两处 session_id 必须同值");
         assert_eq!(sim.session_id, sim_for(PLAIN_BODY).session_id, "同设备同账号应恒定");
 
-        // 客户端自己带了 user_id：这条压根不走模拟（判据见 [`super::Simulation::detect`]），
-        // 身份由 spoof_identity 按原格式定点改写。
+        // 客户端自己带了 user_id 但 UA 不是 claude-cli → 走模拟，原有 user_id 被剥掉，
+        // ensure_cc_metadata 用 sim.session_id 重建，确保头体自洽。
         let with_meta = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"user_aa_account_bb_session_cc"}}"#
                 .to_string(),
         );
-        assert!(detect_for(&with_meta, all_on()).is_none(), "自带 user_id 的请求不该走模拟");
-        let out2 = rewrite_body(&with_meta, &test_cred(), "fp", all_on(), None, None);
+        assert!(detect_for(&with_meta, all_on()).is_some(), "非 CC UA 带 user_id 也走模拟");
+        let sim2 = detect_for(&with_meta, all_on()).unwrap();
+        let out2 = rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim2), None);
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        let uid2 = v2["metadata"]["user_id"].as_str().unwrap();
+        let inner2: serde_json::Value = serde_json::from_str(uid2).unwrap();
         assert_eq!(
-            v2["metadata"]["user_id"],
+            inner2["session_id"].as_str().unwrap(),
+            sim2.session_id,
+            "重建后 session_id 应与 sim 一致"
+        );
+
+        // 反面：真 CC 客户端（UA 带 claude-cli/）带了 user_id → 不走模拟，spoof_identity 原格式改写。
+        let mut cc_ua = super::HeaderMap::new();
+        cc_ua.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.226 (external, cli)"),
+        );
+        assert!(detect_with(&with_meta, &cc_ua, all_on()).is_none(), "真 CC 客户端不走模拟");
+        let out3 = rewrite_body(&with_meta, &test_cred(), "fp", all_on(), None, None);
+        let v3: serde_json::Value = serde_json::from_slice(&out3).unwrap();
+        assert_eq!(
+            v3["metadata"]["user_id"],
             format!(
                 "user_{}_account_{ACCOUNT_UUID}_session_cc",
                 test_cred().spoof_device_id("fp").unwrap()
@@ -8455,12 +8569,18 @@ mod tests {
     /// 64 位小写 hex、session_id 是 uuid 且与那个头**同值**。`00009`（sonnet-5）同形。
     #[test]
     fn cc_shaped_without_metadata_gets_aligned_identity() {
-        // CC 形态：system 里有那句身份声明，故 detect 返回 None（不模拟）。
+        // CC 形态 + 真 CC 客户端：system 里有那句身份声明且 UA 是 claude-cli，
+        // detect 返回 None（不模拟），走 bare_session 路径补 metadata。
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}}]}}"#,
             config::CC_SYSTEM_IDENTITY
         ));
-        assert!(detect_for(&body, all_on()).is_none(), "CC 形态不该走模拟");
+        let mut cc_ua = super::HeaderMap::new();
+        cc_ua.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.226 (external, cli)"),
+        );
+        assert!(detect_with(&body, &cc_ua, all_on()).is_none(), "真 CC 客户端不该走模拟");
         assert!(
             !super::body_has_user_id(parsed(&body).as_ref()),
             "这条来访本来就没有 metadata.user_id"
@@ -8596,48 +8716,42 @@ mod tests {
     /// 且 `session_id` 会**头体不一致**（体里那份 `user_id` 由 `spoof_identity` 定点改写、
     /// session 段保留原值，头上却是派生的），而官方这两处逐字节相同。
     #[test]
-    fn official_client_requests_are_never_simulated() {
-        // 1) 带 metadata.user_id（CC 内嵌 JSON 形态）。
+    fn only_ua_determines_cc_client() {
+        let plain = Bytes::from(PLAIN_BODY.to_string());
+
+        // 1) metadata.user_id 在、但 UA 不是 claude-cli → 仍走模拟。
         let with_meta = Bytes::from(
             r#"{"model":"claude-opus-5","system":"you are a helpful bot","messages":[],"metadata":{"user_id":"{\"device_id\":\"d0\",\"account_uuid\":\"a0\",\"session_id\":\"11111111-1111-4111-8111-111111111111\"}"}}"#
                 .to_string(),
         );
-        assert!(detect_for(&with_meta, all_on()).is_none(), "自带 user_id 的请求不该走模拟");
+        assert!(detect_for(&with_meta, all_on()).is_some(), "非 CC UA 带 user_id 照样走模拟");
 
-        // 2) user_id 是我们认不出的格式：仍算官方客户端（判据只问字段在不在）。
-        //    严判会把这种请求送进模拟，代价比「退化成不绑定设备」大得多。
+        // 2) user_id 是认不出的格式、UA 不是 claude-cli → 同样走模拟。
         let odd_meta = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"metadata":{"user_id":"whatever-new-format"}}"#
                 .to_string(),
         );
-        assert!(super::extract_device_id(parsed(&odd_meta).as_ref()).is_none(), "格式认不出");
-        assert!(detect_for(&odd_meta, all_on()).is_none(), "格式认不出也仍是官方客户端");
+        assert!(detect_for(&odd_meta, all_on()).is_some(), "非 CC UA 带奇异 user_id 也走模拟");
 
-        // 3) 只带 X-Claude-Code-Session-Id 头（CC 专有头），body 里什么记号都没有。
+        // 3) 只带 X-Claude-Code-Session-Id 头、UA 不是 claude-cli → 走模拟。
         let mut cc_header = super::HeaderMap::new();
         cc_header.insert(
             super::HeaderName::from_static("x-claude-code-session-id"),
             HeaderValue::from_static("bc201916-d0bc-4b4e-adba-caf41fb58746"),
         );
-        let plain = Bytes::from(PLAIN_BODY.to_string());
         assert!(
-            detect_with(&plain, &cc_header, all_on()).is_none(),
-            "带 CC 专有会话头的请求不该走模拟"
+            detect_with(&plain, &cc_header, all_on()).is_some(),
+            "非 CC UA 带 session 头也走模拟"
         );
 
-        // 4) 反面：同一条 body、同一套开关，没有任何官方记号时照旧走模拟——
-        //    这几条判据只该收窄「官方客户端」那一格，不该把模拟整个关掉。
+        // 4) 裸请求、裸 UA → 走模拟。
         assert!(detect_for(&plain, all_on()).is_some(), "裸第三方请求仍应走模拟");
 
-        // 5) 只有 UA 自报 `claude-cli/<版本>`，body 里什么记号都没有：**也不模拟**。
-        //    带着正确 UA 来的就当官方客户端，代价（UA 可伪造）记在调用点的注释里。
-        //    这串取自真实的 VSCode 扩展请求：括号里跟着 `claude-vscode` 与 agent-sdk 版本，
-        //    与官方 CLI 那串（`claude-cli/2.1.220 (external, cli)`）不同，判定只看前缀与版本。
+        // 5) UA 自报 `claude-cli/<版本>` → **不模拟**，这是唯一的跳过判据。
         const VSCODE_UA: &str = "claude-cli/2.1.226 (external, claude-vscode, agent-sdk/0.3.226)";
         let mut cc_ua = super::HeaderMap::new();
         cc_ua.insert(header::USER_AGENT, HeaderValue::from_static(VSCODE_UA));
         assert!(detect_with(&plain, &cc_ua, all_on()).is_none(), "自报 claude-cli 的不该走模拟");
-        // 而且出站那串 UA 原样转发——不模拟的意义就在这里：不再降级成 CC_USER_AGENT。
         let out = build_forward_headers(&cc_ua, "tok", all_on(), None, None);
         assert_eq!(
             out.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
@@ -8645,29 +8759,29 @@ mod tests {
             "非模拟路径必须原样转发客户端自报的 UA"
         );
 
-        // 6) UA 里读不出 `claude-cli/<版本>` 的（第三方 SDK 那些）照旧走模拟——这几条判据
-        //    只该收窄「官方客户端」那一格，不该把模拟整个关掉。
+        // 6) UA 里读不出 `claude-cli/<版本>` → 走模拟。
         let mut sdk_ua = super::HeaderMap::new();
         sdk_ua.insert(header::USER_AGENT, HeaderValue::from_static("python-httpx/0.27.0"));
         assert!(detect_with(&plain, &sdk_ua, all_on()).is_some(), "第三方 UA 仍应走模拟");
 
-        // 7) 真实 CC 客户端没带 `metadata.user_id` 时，那份身份也**不替它补**——没带就是
-        //    它的真实形态。补了等于拿我们编的 device_id/session_id 覆盖一个本来没问题的
-        //    请求，还会顺带补上一个它自己没发的会话头。
+        // 7) 模拟路径下客户端原有的 metadata.user_id 被剥掉、由 ensure_cc_metadata 重建，
+        //    确保 session_id 与出站头同值。
+        let sim = detect_for(&with_meta, all_on()).unwrap();
+        let out = rewrite_body(&with_meta, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let user_id = v["metadata"]["user_id"].as_str().expect("应重建 metadata.user_id");
+        let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
+        assert_eq!(
+            inner["session_id"].as_str().unwrap(),
+            &sim.session_id,
+            "body 里的 session_id 必须与 sim.session_id 一致"
+        );
+
+        // 8) 真实 CC 客户端没带 `metadata.user_id` 时不替它补。
         assert!(
             super::bare_session_id(&cc_ua, all_on(), None, true, false, &test_cred(), "fp")
                 .is_none(),
             "真实 CC 客户端的裸请求不该补身份"
-        );
-        assert!(
-            !out.contains_key("x-claude-code-session-id"),
-            "既然不补身份，会话头也不该凭空出现"
-        );
-        // 反面：第三方 UA 抄了 CC 的 system、却没带 metadata —— 这条路本来就是为它设的。
-        assert!(
-            super::bare_session_id(&sdk_ua, all_on(), None, true, false, &test_cred(), "fp")
-                .is_some(),
-            "第三方 CC 兼容客户端仍要补身份"
         );
     }
 
