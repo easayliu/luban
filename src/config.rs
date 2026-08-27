@@ -378,20 +378,56 @@ pub const REFRESH_LEEWAY_SECS: u64 = 300;
 /// 基础保活间隔（秒）。`event_logging` 每 tick 都发；
 /// `policy_limits` + `settings` 每 `KEEPALIVE_HOURLY_TICKS` 个 tick 发一次（≈1h）；
 /// `metrics` 只在首 tick 发一次。
-pub const KEEPALIVE_INTERVAL_SECS: u64 = 5 * 60;
+///
+/// 抓包实测（`cap/2.1.145`，idle 段 09:05→09:35→10:05→10:35…）：安定后 event_logging
+/// 每 ~30 min 一次，与版本检查和 Datadog 同节奏。此前设 5 min 是猜的，
+/// 6 倍于真实频率反而是指纹。
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 30 * 60;
 
-/// 多少个基础 tick 构成一个"小时级"周期（5min × 12 = 60min）。
-pub const KEEPALIVE_HOURLY_TICKS: u64 = 12;
+/// 多少个基础 tick 构成一个"小时级"周期（30min × 2 = 60min）。
+pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
 pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.246";
+
+/// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
+/// （`advanced-tool-use`/`effort`/`extended-cache-ttl`）。取自
+/// `cap/2.1.145/00086`（idle event_logging 批次）。
+pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
+    interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+    thinking-token-count-2026-05-13,context-management-2025-06-27,\
+    prompt-caching-scope-2026-01-05";
 
 /// 保活端点路径。
 pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";
 pub const KEEPALIVE_METRICS: &str = "/api/claude_code/metrics";
 pub const KEEPALIVE_POLICY_LIMITS: &str = "/api/claude_code/policy_limits";
 pub const KEEPALIVE_SETTINGS: &str = "/api/claude_code/settings";
+
+// ---------- startup bootstrap + 周期端点 ----------
+
+/// 启动握手端点（全部发往 api.anthropic.com + OAuth token）。
+pub const KEEPALIVE_BOOTSTRAP: &str = "/api/claude_cli/bootstrap";
+pub const KEEPALIVE_PENGUIN_MODE: &str = "/api/claude_code_penguin_mode";
+
+/// Statsig 特性标志评估端点：启动 + 每 6h（= 12 个 30-min tick）。
+pub const KEEPALIVE_EVAL: &str = "/api/eval/sdk-zAZezfDKGoZuXXKe";
+pub const KEEPALIVE_EVAL_TICKS: u64 = 12;
+
+/// eval 端点的 User-Agent（真实客户端 Bun 运行时自报的 UA，与其他端点不同）。
+pub const KEEPALIVE_UA_BUN: &str = "Bun/1.4.1";
+
+// ---------- Datadog 遥测 ----------
+
+/// Datadog 日志摄入 URL（与 api.anthropic.com 是不同的主机）。
+pub const DATADOG_INTAKE_URL: &str = "https://http-intake.logs.us5.datadoghq.com/api/v2/logs";
+
+/// Datadog 公钥（公开的 client token，非 secret）。
+pub const DATADOG_API_KEY: &str = "pubea5604404508cdd34afb69e6f42a05bc";
+
+/// Datadog 请求的 User-Agent（真实客户端通过 axios 发送）。
+pub const DATADOG_USER_AGENT: &str = "axios/1.15.2";
 
 #[cfg(test)]
 mod tests {

@@ -194,6 +194,25 @@ pub async fn handle(
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
     }
 
+    // 2.3a) OpenAI 格式的 `image_url` 内容块 → 本地直接拒：Anthropic API 不认这个 type，
+    //       送上去恒为 400，白烧一次往返。客户端应改用 `{"type":"image","source":{...}}`。
+    if let Some(loc) = find_openai_image_url(body_json.as_ref()) {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            location = %loc,
+            "rejected locally: 'image_url' is an OpenAI content type, not supported by the Anthropic API"
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!(
+                "{loc}: content type 'image_url' is not supported by the Anthropic API; \
+                 use {{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"...\"}}}} \
+                 or {{\"type\":\"image\",\"source\":{{\"type\":\"url\",\"url\":\"...\"}}}}"
+            ),
+        );
+    }
+
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）→ 剥掉后正常转发。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
     let mut body = maybe_strip_deprecated(
@@ -3761,6 +3780,26 @@ fn known_shape_rejection(
             Some((probe.field, value, message.clone()))
         })
     })
+}
+
+/// 扫描 `messages[*].content[*]` 里有没有 OpenAI 格式的 `"type":"image_url"` 内容块。
+///
+/// Anthropic 不认这个 type（恒 400），本地拦掉省一次往返。返回第一个命中位置的路径
+/// （如 `messages.1.content.0`），用于错误提示。
+fn find_openai_image_url(body: Option<&serde_json::Value>) -> Option<String> {
+    let msgs = body?.get("messages")?.as_array()?;
+    for (mi, msg) in msgs.iter().enumerate() {
+        let content = match msg.get("content") {
+            Some(serde_json::Value::Array(arr)) => arr,
+            _ => continue,
+        };
+        for (ci, block) in content.iter().enumerate() {
+            if block.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                return Some(format!("messages.{mi}.content.{ci}"));
+            }
+        }
+    }
+    None
 }
 
 /// 按 Anthropic 的错误体形态打一份 JSON（`{"type":"error","error":{...}}`）。

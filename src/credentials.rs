@@ -95,7 +95,7 @@ impl Credential {
 }
 
 /// 把字节切片编码为小写十六进制字符串。
-fn hex_lower(bytes: &[u8]) -> String {
+pub fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

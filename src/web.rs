@@ -122,14 +122,16 @@ pub async fn run(
         });
     }
 
-    // 会话保活：
-    //   每 5min  — event_logging（空批次）
-    //   首 tick  — metrics（空指标，抓包显示整个会话只出现 1 次）
-    //   每 1h   — policy_limits + settings（GET，与官方客户端 1h 周期一致）
+    // 会话保活（对齐 cap/2.1.145 抓包的真实客户端行为）：
+    //   每 30min — event_logging + Datadog 遥测（idle 版本检查事件）
+    //   首 tick  — metrics + bootstrap + penguin_mode + eval（启动握手）
+    //   每 1h   — policy_limits + settings
+    //   每 6h   — eval（Statsig 特性标志刷新）
     {
         let store = state.store.clone();
         let clients = state.clients.clone();
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(
                 crate::config::KEEPALIVE_INTERVAL_SECS,
@@ -141,6 +143,7 @@ pub async fn run(
                 tick_count += 1;
                 let is_first = tick_count == 1;
                 let is_hourly = tick_count % crate::config::KEEPALIVE_HOURLY_TICKS == 0;
+                let is_eval = is_first || tick_count % crate::config::KEEPALIVE_EVAL_TICKS == 0;
 
                 let creds = match store.list() {
                     Ok(c) => c,
@@ -163,14 +166,31 @@ pub async fn run(
                         }
                     };
 
-                    let ev_ok = oauth::keepalive_event_logging(&http, &cred.access_token).await;
+                    let ctx = oauth::KeepaliveCtx::new(&cred, started.elapsed().as_secs_f64());
 
-                    let mt_ok = if is_first {
-                        oauth::keepalive_metrics(&http, &cred.access_token).await
+                    // --- 每 tick ---
+                    let ev_ok =
+                        oauth::keepalive_event_logging(&http, &cred.access_token, &ctx).await;
+                    let dd_ok = oauth::keepalive_datadog_logs(&http, &ctx).await;
+
+                    // --- 首 tick：启动握手 ---
+                    let (mt_ok, boot_ok, peng_ok) = if is_first {
+                        let mt = oauth::keepalive_metrics(&http, &cred.access_token, &ctx).await;
+                        let bo = oauth::keepalive_bootstrap(&http, &cred.access_token).await;
+                        let pg = oauth::keepalive_penguin_mode(&http, &cred.access_token).await;
+                        (mt, bo, pg)
+                    } else {
+                        (true, true, true)
+                    };
+
+                    // --- 每 6h：eval ---
+                    let eval_ok = if is_eval {
+                        oauth::keepalive_eval(&http, &cred.access_token, &ctx).await
                     } else {
                         true
                     };
 
+                    // --- 每 1h ---
                     let (pl_ok, st_ok) = if is_hourly || is_first {
                         let pl = oauth::keepalive_policy_limits(&http, &cred.access_token).await;
                         let st = oauth::keepalive_settings(&http, &cred.access_token).await;
@@ -179,13 +199,16 @@ pub async fn run(
                         (true, true)
                     };
 
-                    if ev_ok && mt_ok && pl_ok && st_ok {
+                    let all_ok =
+                        ev_ok && dd_ok && mt_ok && boot_ok && peng_ok && eval_ok && pl_ok && st_ok;
+                    if all_ok {
                         tracing::debug!(cred_id = cred.id, cred = %cred.label, tick = tick_count, "keepalive: ok");
                     } else {
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label, tick = tick_count,
-                            event_logging = ev_ok, metrics = mt_ok,
-                            policy_limits = pl_ok, settings = st_ok,
+                            event_logging = ev_ok, datadog = dd_ok,
+                            metrics = mt_ok, bootstrap = boot_ok, penguin = peng_ok,
+                            eval = eval_ok, policy_limits = pl_ok, settings = st_ok,
                             "keepalive: partial failure"
                         );
                     }

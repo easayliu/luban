@@ -411,10 +411,389 @@ fn urlencode(input: &str) -> String {
 
 // ---------- session keepalive ----------
 
-/// 每 tick（5min）发一次 `event_logging`。
-pub async fn keepalive_event_logging(client: &wreq::Client, access_token: &str) -> bool {
+/// 每次保活循环构建一份，携带该凭证在当前进程里的"会话"身份。
+///
+/// 所有 id 由 `account_uuid` 确定性派生——同一凭证在同一进程里恒定；进程重启后变。
+/// 没有 `account_uuid` 时用凭证 id 兜底（id 是自增整数，不会碰撞但也没有任何含义）。
+pub struct KeepaliveCtx {
+    /// 模拟的 session UUID。
+    pub session_id: String,
+    /// 模拟的 device_id（sha256 hex，64 字符）。
+    pub device_id: String,
+    /// 模拟的 prompt UUID。
+    prompt_id: String,
+    /// account_uuid（直传）。
+    account_uuid: String,
+    /// subscription_type（team / individual）。
+    subscription_type: String,
+    /// 进程已运行秒数。
+    uptime_secs: f64,
+}
+
+/// 进程级种子，每次启动随机一次；用于从 account_uuid 派生出每次启动不同的 session_id。
+static PROCESS_SEED: std::sync::LazyLock<[u8; 16]> = std::sync::LazyLock::new(|| {
+    let mut buf = [0u8; 16];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
+    buf
+});
+
+impl KeepaliveCtx {
+    pub fn new(cred: &crate::credentials::Credential, uptime_secs: f64) -> Self {
+        let id_str = cred.id.to_string();
+        let basis = cred.account_uuid.as_deref().unwrap_or(&id_str);
+        let seed: &[u8] = &*PROCESS_SEED;
+        let session_id = derive_uuid(basis, seed, b"session");
+        let prompt_id = derive_uuid(basis, seed, b"prompt");
+        let device_id = derive_hex64(basis, seed, b"device");
+
+        let subscription_type = match cred.org_type.as_deref() {
+            Some(t) if t.contains("team") => "team",
+            Some(t) if t.contains("enterprise") => "enterprise",
+            _ => "individual",
+        }
+        .to_string();
+
+        Self {
+            session_id,
+            device_id,
+            prompt_id,
+            account_uuid: basis.to_string(),
+            subscription_type,
+            uptime_secs,
+        }
+    }
+
+    /// 所有事件共用的 `env` 块。
+    fn env_block(&self) -> serde_json::Value {
+        serde_json::json!({
+            "platform": "darwin",
+            "node_version": "v26.3.0",
+            "terminal": "vscode",
+            "package_managers": "npm,pnpm",
+            "runtimes": "bun,node",
+            "is_running_with_bun": true,
+            "is_ci": false,
+            "is_claubbit": false,
+            "is_github_action": false,
+            "is_claude_code_action": false,
+            "is_claude_ai_auth": true,
+            "version": keepalive_version(),
+            "arch": "arm64",
+            "is_claude_code_remote": false,
+            "deployment_environment": "unknown-darwin",
+            "is_conductor": false,
+            "version_base": keepalive_version(),
+            "build_time": "2026-08-25T18:33:51Z",
+            "is_local_agent_mode": false,
+            "platform_raw": "darwin",
+            "shell": "zsh"
+        })
+    }
+
+    /// base64 编码的 `process` 运行时指标。
+    fn process_b64(&self) -> String {
+        let rss = 180_000_000.0 + self.uptime_secs * 6.0;
+        let heap = 44_000_000.0 + self.uptime_secs * 5.0;
+        let user_cpu = (self.uptime_secs * 6300.0) as u64;
+        let sys_cpu = (self.uptime_secs * 1200.0) as u64;
+        let val = serde_json::json!({
+            "uptime": self.uptime_secs,
+            "rss": rss as u64,
+            "heapTotal": (heap * 0.98) as u64,
+            "heapUsed": heap as u64,
+            "external": 16_420_226_u64,
+            "arrayBuffers": 14335_u64,
+            "constrainedMemory": 34_359_738_368_u64,
+            "cpuUsage": { "user": user_cpu, "system": sys_cpu },
+            "cpuPercent": 0.42,
+            "cpuWindowMs": (self.uptime_secs * 1000.0).min(1_800_000.0) as u64
+        });
+        URL_SAFE_NO_PAD.encode(serde_json::to_string(&val).unwrap_or_default())
+    }
+
+    /// base64 编码的 `additional_metadata`。
+    fn metadata_b64(&self, extra: serde_json::Value) -> String {
+        let mut m = serde_json::json!({
+            "renderer_mode": "default",
+            "subscription_type": &self.subscription_type,
+            "cc_prompt_id": &self.prompt_id
+        });
+        if let (Some(obj), Some(base)) = (extra.as_object(), m.as_object_mut()) {
+            for (k, v) in obj {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        URL_SAFE_NO_PAD.encode(serde_json::to_string(&m).unwrap_or_default())
+    }
+
+    /// `auth` 块。
+    fn auth_block(&self) -> serde_json::Value {
+        serde_json::json!({ "account_uuid": &self.account_uuid })
+    }
+
+    /// 生成单条 `ClaudeCodeInternalEvent`，时间戳往回偏移 `ago_ms` 毫秒。
+    fn event(
+        &self,
+        name: &str,
+        now: &chrono::DateTime<chrono::Utc>,
+        ago_ms: i64,
+        extra_meta: serde_json::Value,
+    ) -> serde_json::Value {
+        let ts = *now - chrono::Duration::milliseconds(ago_ms);
+        serde_json::json!({
+            "event_type": "ClaudeCodeInternalEvent",
+            "event_data": {
+                "event_name": name,
+                "client_timestamp": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "model": "claude-sonnet-5",
+                "session_id": &self.session_id,
+                "user_type": "external",
+                "betas": config::KEEPALIVE_EVENT_BETAS,
+                "env": self.env_block(),
+                "entrypoint": "cli",
+                "is_interactive": true,
+                "client_type": "cli",
+                "process": self.process_b64(),
+                "additional_metadata": self.metadata_b64(extra_meta),
+                "auth": self.auth_block(),
+                "event_id": uuid_v4(),
+                "device_id": &self.device_id
+            }
+        })
+    }
+
+    /// Datadog 日志条目的公共字段（flat 形态，取自 `cap/2.1.145/00066`）。
+    ///
+    /// 拆成手工构建避免 `json!` 宏在字段过多时撞 recursion_limit。
+    fn dd_entry(&self, message: &str, extra: serde_json::Value) -> serde_json::Value {
+        use serde_json::{Map, Value, json};
+        let ver = keepalive_version();
+        let mut m = Map::new();
+        let s = |v: &str| Value::String(v.to_string());
+
+        m.insert("ddsource".into(), s("nodejs"));
+        m.insert(
+            "ddtags".into(),
+            s(&format!(
+                "event:{message},arch:arm64,client_type:cli,entrypoint:cli,\
+                 model:claude-sonnet-5,platform:darwin,subscription_type:{},\
+                 user_bucket:15,user_type:external,version:{ver},version_base:{ver}",
+                self.subscription_type
+            )),
+        );
+        m.insert("message".into(), s(message));
+        m.insert("service".into(), s("claude-code"));
+        m.insert("hostname".into(), s("claude-code"));
+        m.insert("env".into(), s("external"));
+        m.insert("model".into(), s("claude-sonnet-5"));
+        m.insert("session_id".into(), s(&self.session_id));
+        m.insert("user_type".into(), s("external"));
+        m.insert("betas".into(), s(config::KEEPALIVE_EVENT_BETAS));
+        m.insert("entrypoint".into(), s("cli"));
+        m.insert("is_interactive".into(), s("true"));
+        m.insert("client_type".into(), s("cli"));
+        m.insert(
+            "process_metrics".into(),
+            json!({
+                "uptime": self.uptime_secs,
+                "rss": (180_000_000.0 + self.uptime_secs * 6.0) as u64,
+                "heapTotal": (44_000_000.0 + self.uptime_secs * 4.8) as u64,
+                "heapUsed": (44_000_000.0 + self.uptime_secs * 5.0) as u64,
+                "external": 16_420_226_u64,
+                "arrayBuffers": 14335_u64,
+                "constrainedMemory": 34_359_738_368_u64,
+                "cpuUsage": {
+                    "user": (self.uptime_secs * 6300.0) as u64,
+                    "system": (self.uptime_secs * 1200.0) as u64
+                },
+                "cpuPercent": 0.42,
+                "cpuWindowMs": 32_u64
+            }),
+        );
+        for (k, v) in
+            [("swe_bench_run_id", ""), ("swe_bench_instance_id", ""), ("swe_bench_task_id", "")]
+        {
+            m.insert(k.into(), s(v));
+        }
+        m.insert("subscription_type".into(), s(&self.subscription_type));
+        m.insert("renderer_mode".into(), s("default"));
+        m.insert("prompt_id".into(), s(&self.prompt_id));
+        m.insert("platform".into(), s("darwin"));
+        m.insert("platform_raw".into(), s("darwin"));
+        m.insert("arch".into(), s("arm64"));
+        m.insert("node_version".into(), s("v26.3.0"));
+        m.insert("terminal".into(), s("vscode"));
+        m.insert("shell".into(), s("zsh"));
+        m.insert("package_managers".into(), s("npm,pnpm"));
+        m.insert("runtimes".into(), s("bun,node"));
+        for (k, v) in [
+            ("is_running_with_bun", true),
+            ("is_ci", false),
+            ("is_claubbit", false),
+            ("is_claude_code_remote", false),
+            ("is_local_agent_mode", false),
+            ("is_conductor", false),
+            ("is_github_action", false),
+            ("is_claude_code_action", false),
+            ("is_claude_ai_auth", true),
+        ] {
+            m.insert(k.into(), Value::Bool(v));
+        }
+        m.insert("version".into(), s(ver));
+        m.insert("version_base".into(), s(ver));
+        m.insert("build_time".into(), s("2026-08-25T18:33:51Z"));
+        m.insert("deployment_environment".into(), s("unknown-darwin"));
+        m.insert("user_bucket".into(), Value::Number(15.into()));
+
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        Value::Object(m)
+    }
+
+    /// 模拟 idle 周期的 Datadog 日志条目（2 条，与 `cap/2.1.145/00066` 对齐）。
+    fn dd_idle_entries(&self) -> Vec<serde_json::Value> {
+        vec![
+            self.dd_entry(
+                "tengu_feature_ok",
+                serde_json::json!({"feature_name": "job_sweep_drafts"}),
+            ),
+            self.dd_entry("tengu_feature_ok", serde_json::json!({"feature_name": "update_check"})),
+        ]
+    }
+
+    /// eval 端点的请求体（Statsig 特性标志评估）。
+    fn eval_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "attributes": {
+                "id": &self.device_id,
+                "sessionId": &self.session_id,
+                "deviceID": &self.device_id,
+                "platform": "darwin",
+                "accountUUID": &self.account_uuid,
+                "userType": "external",
+                "subscriptionType": &self.subscription_type,
+                "organizationRole": "user",
+                "appVersion": keepalive_version(),
+                "entrypoint": "cli"
+            },
+            "forcedVariations": {},
+            "forcedFeatures": [],
+            "url": ""
+        })
+    }
+
+    /// 模拟 idle 版本检查周期产生的 7 个事件（与 `cap/2.1.145/00086` 对齐）。
+    fn idle_events(&self) -> Vec<serde_json::Value> {
+        let now = chrono::Utc::now();
+        vec![
+            self.event(
+                "tengu_native_auto_updater_start",
+                &now,
+                2200,
+                serde_json::json!({}),
+            ),
+            self.event(
+                "tengu_version_check_success",
+                &now,
+                800,
+                serde_json::json!({"latency_ms": 1430, "attempt": 1}),
+            ),
+            self.event(
+                "tengu_feature_ok",
+                &now,
+                790,
+                serde_json::json!({"feature_name": "update_check"}),
+            ),
+            self.event(
+                "tengu_native_update_complete",
+                &now,
+                780,
+                serde_json::json!({"latency_ms": 1433, "was_new_install": false, "was_force_reinstall": false}),
+            ),
+            self.event(
+                "tengu_native_auto_updater_up_to_date",
+                &now,
+                770,
+                serde_json::json!({"latency_ms": 1434}),
+            ),
+            self.event(
+                "tengu_native_version_cleanup",
+                &now,
+                760,
+                serde_json::json!({"total_count": 4, "deleted_count": 0, "protected_count": 2, "retained_count": 2}),
+            ),
+            self.event(
+                "tengu_feature_ok",
+                &now,
+                750,
+                serde_json::json!({"feature_name": "native_cleanup_versions"}),
+            ),
+        ]
+    }
+}
+
+fn keepalive_version() -> &'static str {
+    config::KEEPALIVE_USER_AGENT.strip_prefix("claude-code/").unwrap_or("2.1.246")
+}
+
+/// 从 basis+seed+tag 派生 UUID v4 格式的字符串。
+fn derive_uuid(basis: &str, seed: &[u8], tag: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(basis.as_bytes());
+    h.update(seed);
+    h.update(tag);
+    let d = h.finalize();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+        u16::from_be_bytes([d[4], d[5]]),
+        u16::from_be_bytes([d[6], d[7]]) & 0x0FFF,
+        (u16::from_be_bytes([d[8], d[9]]) & 0x3FFF) | 0x8000,
+        u64::from_be_bytes([0, 0, d[10], d[11], d[12], d[13], d[14], d[15]]),
+    )
+}
+
+/// 从 basis+seed+tag 派生 64 字符的小写 hex（与真实 device_id 格式一致）。
+fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(basis.as_bytes());
+    h.update(seed);
+    h.update(tag);
+    crate::credentials::hex_lower(&h.finalize())
+}
+
+/// 伪 UUID v4。
+fn uuid_v4() -> String {
+    let mut buf = [0u8; 16];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
+    buf[6] = (buf[6] & 0x0F) | 0x40;
+    buf[8] = (buf[8] & 0x3F) | 0x80;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u16::from_be_bytes([buf[4], buf[5]]),
+        u16::from_be_bytes([buf[6], buf[7]]),
+        u16::from_be_bytes([buf[8], buf[9]]),
+        u64::from_be_bytes([0, 0, buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+    )
+}
+
+/// 每 tick（30min）发一次 `event_logging`。
+///
+/// 真实客户端每次都带上版本检查等活动产生的事件；空批次是指纹。
+/// 这里模拟 idle 周期产生的 7 个事件（`tengu_*`），结构取自 `cap/2.1.145/00086`。
+pub async fn keepalive_event_logging(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> bool {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
-    let body = serde_json::json!({"events": []});
+    let body = serde_json::json!({ "events": ctx.idle_events() });
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", access_token))
@@ -431,15 +810,82 @@ pub async fn keepalive_event_logging(client: &wreq::Client, access_token: &str) 
     }
 }
 
-/// 首 tick 发一次 `metrics`（抓包显示整个会话只出现 1 次，带空 metrics 数组）。
-pub async fn keepalive_metrics(client: &wreq::Client, access_token: &str) -> bool {
+/// 首 tick 发一次 `metrics`。
+///
+/// 真实客户端带 4 项指标（session.count / cost.usage / token.usage / active_time.total），
+/// 空 metrics 数组是指纹。这里填合理的小值，结构取自 `cap/2.1.145/00061`。
+pub async fn keepalive_metrics(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> bool {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_METRICS);
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let body = serde_json::json!({
         "resource_attributes": {
             "service.name": "claude-code",
-            "service.version": config::KEEPALIVE_USER_AGENT.strip_prefix("claude-code/").unwrap_or("2.1.246"),
+            "service.version": keepalive_version(),
+            "os.type": "darwin",
+            "os.version": "27.0.0",
+            "host.arch": "arm64",
+            "aggregation.temporality": "delta",
+            "user.customer_type": "claude_ai",
+            "user.subscription_type": &ctx.subscription_type
         },
-        "metrics": []
+        "metrics": [
+            {
+                "name": "claude_code.session.count",
+                "description": "Count of CLI sessions started",
+                "unit": "",
+                "data_points": [{
+                    "attributes": {
+                        "user.id": &ctx.device_id,
+                        "session.id": &ctx.session_id,
+                        "terminal.type": "vscode",
+                        "start_type": "fresh"
+                    },
+                    "value": 1,
+                    "timestamp": &ts
+                }]
+            },
+            {
+                "name": "claude_code.cost.usage",
+                "description": "Cost of the Claude Code session",
+                "unit": "USD",
+                "data_points": [{
+                    "attributes": {
+                        "user.id": &ctx.device_id,
+                        "session.id": &ctx.session_id,
+                        "terminal.type": "vscode",
+                        "model": "claude-sonnet-5",
+                        "query_source": "main",
+                        "effort": "high"
+                    },
+                    "value": 0.042,
+                    "timestamp": &ts
+                }]
+            },
+            {
+                "name": "claude_code.token.usage",
+                "description": "Number of tokens used",
+                "unit": "tokens",
+                "data_points": [
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "input" }, "value": 5, "timestamp": &ts },
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "output" }, "value": 18, "timestamp": &ts },
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "cacheRead" }, "value": 22000, "timestamp": &ts },
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "cacheCreation" }, "value": 6500, "timestamp": &ts }
+                ]
+            },
+            {
+                "name": "claude_code.active_time.total",
+                "description": "Total active time in seconds",
+                "unit": "s",
+                "data_points": [
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "type": "user" }, "value": 3.8, "timestamp": &ts },
+                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "type": "cli" }, "value": 2.4, "timestamp": &ts }
+                ]
+            }
+        ]
     });
     let resp = client
         .post(&url)
@@ -484,6 +930,91 @@ pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> bo
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .header("Accept", "application/json, text/plain, */*")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
+// ---------- startup bootstrap + 周期端点 ----------
+
+/// 启动握手：`GET /api/claude_cli/bootstrap`。
+///
+/// 取自 `cap/2.1.145/00043`（UA = `claude-code/2.1.246`）。
+pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> bool {
+    let url = format!(
+        "{}{}?entrypoint=cli&model=claude-sonnet-5",
+        config::UPSTREAM_BASE_URL,
+        config::KEEPALIVE_BOOTSTRAP
+    );
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/plain, */*")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
+/// 启动握手：`GET /api/claude_code_penguin_mode`。
+///
+/// 取自 `cap/2.1.145/00044`（UA = `axios/1.15.2`，不带 Content-Type）。
+pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -> bool {
+    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_PENGUIN_MODE);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", config::DATADOG_USER_AGENT)
+        .header("Accept", "application/json, text/plain, */*")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
+/// Statsig 特性标志评估：启动 + 每 6h。
+///
+/// 取自 `cap/2.1.145/00039`（UA = `Bun/1.4.1`，Accept = `*/*`）。
+pub async fn keepalive_eval(client: &wreq::Client, access_token: &str, ctx: &KeepaliveCtx) -> bool {
+    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVAL);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", config::KEEPALIVE_UA_BUN)
+        .header("Accept", "*/*")
+        .json(&ctx.eval_body())
+        .send()
+        .await;
+    match resp {
+        Ok(r) => r.status().as_u16() < 500,
+        Err(_) => false,
+    }
+}
+
+/// Datadog 遥测日志：每 tick（30min）发往 `http-intake.logs.us5.datadoghq.com`。
+///
+/// 取自 `cap/2.1.145/00066`（idle 周期，2 条 flat 格式日志）。
+/// `dd_client` 应为直连客户端（不走凭证代理——真实客户端的 Datadog 也是直连）。
+pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx) -> bool {
+    let resp = dd_client
+        .post(config::DATADOG_INTAKE_URL)
+        .header("DD-API-KEY", config::DATADOG_API_KEY)
+        .header("User-Agent", config::DATADOG_USER_AGENT)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Encoding", "gzip, compress, deflate, br")
+        .json(&ctx.dd_idle_entries())
         .send()
         .await;
     match resp {
