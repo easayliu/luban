@@ -7,8 +7,7 @@
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// 授权页地址（用户在浏览器打开、登录并同意授权）。
-/// 官方客户端已从 `claude.ai/oauth/authorize` 迁到 claude.com 的新路径，跟着走。
-pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 
 /// Token 交换 / 刷新端点。
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
