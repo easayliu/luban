@@ -376,17 +376,23 @@ pub const REFRESH_LEEWAY_SECS: u64 = 300;
 
 // ---------- session keepalive ----------
 
-/// 会话保活间隔（秒）。官方客户端 `event_logging` 约 2-3 分钟一次、`metrics` 约 5 分钟
-/// 一次；这里取 5 分钟，与 metrics 节奏一致。
+/// 基础保活间隔（秒）。`event_logging` 每 tick 都发；
+/// `policy_limits` + `settings` 每 `KEEPALIVE_HOURLY_TICKS` 个 tick 发一次（≈1h）；
+/// `metrics` 只在首 tick 发一次。
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 5 * 60;
 
-/// 保活请求的 User-Agent。抓包显示 `/api/event_logging/*` 与 `/api/claude_code/metrics`
-/// 都用 `claude-code/<版本>`，而非转发时的 `claude-cli/<版本>`。
+/// 多少个基础 tick 构成一个"小时级"周期（5min × 12 = 60min）。
+pub const KEEPALIVE_HOURLY_TICKS: u64 = 12;
+
+/// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
+/// 而非转发时的 `claude-cli/<版本>`。
 pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.246";
 
-/// 保活端点。官方客户端在整个会话期间持续周期性上报。
+/// 保活端点路径。
 pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";
 pub const KEEPALIVE_METRICS: &str = "/api/claude_code/metrics";
+pub const KEEPALIVE_POLICY_LIMITS: &str = "/api/claude_code/policy_limits";
+pub const KEEPALIVE_SETTINGS: &str = "/api/claude_code/settings";
 
 #[cfg(test)]
 mod tests {

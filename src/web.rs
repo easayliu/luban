@@ -122,21 +122,26 @@ pub async fn run(
         });
     }
 
-    // 会话保活：定期用每个启用凭证的 access_token 向上游发 event_logging 与 metrics。
-    // 抓包显示官方客户端在整个会话期间持续上报这两个端点（~2-5 分钟一次），luban 不发
-    // 就会被上游判定为废弃会话，1 小时后吊销 refresh_token。
+    // 会话保活：
+    //   每 5min  — event_logging（空批次）
+    //   首 tick  — metrics（空指标，抓包显示整个会话只出现 1 次）
+    //   每 1h   — policy_limits + settings（GET，与官方客户端 1h 周期一致）
     {
         let store = state.store.clone();
         let clients = state.clients.clone();
         tokio::spawn(async move {
-            // 首次延迟 30 秒——启动时 token 刚拿到/刚刷新过，不必立刻打。
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(
                 crate::config::KEEPALIVE_INTERVAL_SECS,
             ));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick_count: u64 = 0;
             loop {
                 tick.tick().await;
+                tick_count += 1;
+                let is_first = tick_count == 1;
+                let is_hourly = tick_count % crate::config::KEEPALIVE_HOURLY_TICKS == 0;
+
                 let creds = match store.list() {
                     Ok(c) => c,
                     Err(e) => {
@@ -157,11 +162,32 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let (ev_ok, mt_ok) = oauth::keepalive(&http, &cred.access_token).await;
-                    if ev_ok && mt_ok {
-                        tracing::debug!(cred_id = cred.id, cred = %cred.label, "keepalive: ok");
+
+                    let ev_ok = oauth::keepalive_event_logging(&http, &cred.access_token).await;
+
+                    let mt_ok = if is_first {
+                        oauth::keepalive_metrics(&http, &cred.access_token).await
                     } else {
-                        tracing::warn!(cred_id = cred.id, cred = %cred.label, event_logging = ev_ok, metrics = mt_ok, "keepalive: partial failure");
+                        true
+                    };
+
+                    let (pl_ok, st_ok) = if is_hourly || is_first {
+                        let pl = oauth::keepalive_policy_limits(&http, &cred.access_token).await;
+                        let st = oauth::keepalive_settings(&http, &cred.access_token).await;
+                        (pl, st)
+                    } else {
+                        (true, true)
+                    };
+
+                    if ev_ok && mt_ok && pl_ok && st_ok {
+                        tracing::debug!(cred_id = cred.id, cred = %cred.label, tick = tick_count, "keepalive: ok");
+                    } else {
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label, tick = tick_count,
+                            event_logging = ev_ok, metrics = mt_ok,
+                            policy_limits = pl_ok, settings = st_ok,
+                            "keepalive: partial failure"
+                        );
                     }
                 }
             }
