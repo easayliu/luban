@@ -18,7 +18,6 @@ import { toastManager } from '@/components/ui/toast'
 
 interface AuthorizeRequest {
   session: number
-  popup: Window | null
 }
 
 /** 添加账号弹窗：授权 → 粘贴 code#state → 可选备注 → 新增一条凭证。 */
@@ -55,21 +54,10 @@ export function AddAccount({
   const authorize = useMutation({
     mutationFn: (_request: AuthorizeRequest) => getAuthorizeUrl(),
     onSuccess: ({ url }, request) => {
-      if (request.session !== authorizeSession.current) {
-        request.popup?.close()
-        return
-      }
+      if (request.session !== authorizeSession.current) return
       setAuthUrl(url)
-      if (request.popup && !request.popup.closed) {
-        try {
-          request.popup.location.replace(url)
-        } catch {
-          // 跨窗口导航失败时，弹窗内仍会显示可手动点击的授权链接。
-        }
-      }
     },
     onError: (error, request) => {
-      request.popup?.close()
       if (request.session !== authorizeSession.current) return
       toastManager.add({
         title: t('生成授权链接失败', 'Failed to create authorization link'),
@@ -138,53 +126,51 @@ export function AddAccount({
                 variant="outline"
                 loading={authorize.isPending}
                 onClick={() => {
-                  const popup = window.open('about:blank', '_blank')
-                  if (popup) popup.opener = null
-                  authorize.mutate({ session: authorizeSession.current, popup })
+                  authorize.mutate({ session: authorizeSession.current })
                 }}
               >
                 <ExternalLinkIcon />
-                {t('打开 Claude 授权页', 'Open Claude authorization page')}
+                {t('生成授权链接', 'Generate authorization link')}
               </Button>
             </Field>
 
             {authUrl && (
               <Alert variant="info">
                 <ExternalLinkIcon aria-hidden />
-                <AlertTitle>{t('授权页已在新标签打开', 'Authorization page opened in a new tab')}</AlertTitle>
+                <AlertTitle>{t('授权链接已生成', 'Authorization link ready')}</AlertTitle>
                 <AlertDescription>
                   <p>
                     {t(
-                      '如果浏览器拦截了新标签页，可',
-                      'If your browser blocked the new tab, you can',
-                    )}{' '}
-                    <a href={authUrl} target="_blank" rel="noopener">
-                      {t('手动打开授权页面', 'open the authorization page manually')}
-                    </a>
-                    {t(
-                      '，或复制链接到其它浏览器/设备上完成授权。',
-                      ', or copy the link to another browser or device to finish authorization.',
+                      '点击下方链接打开授权页面，或复制链接到其它浏览器/设备上完成授权。',
+                      'Click the link below to open the authorization page, or copy it to another browser or device.',
                     )}
                   </p>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="mt-2"
-                    onClick={async () => {
-                      const copied = await copyText(authUrl)
-                      toastManager.add(copied
-                        ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
-                        : {
-                            title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
-                            description: authUrl,
-                            type: 'error',
-                          })
-                    }}
-                  >
-                    <CopyIcon />
-                    {t('复制授权链接', 'Copy authorization link')}
-                  </Button>
+                  <div className="mt-2 flex items-center gap-2">
+                    <a href={authUrl} target="_blank" rel="noopener">
+                      <Button type="button" size="sm" variant="outline">
+                        <ExternalLinkIcon />
+                        {t('打开授权页面', 'Open authorization page')}
+                      </Button>
+                    </a>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        const copied = await copyText(authUrl)
+                        toastManager.add(copied
+                          ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
+                          : {
+                              title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
+                              description: authUrl,
+                              type: 'error',
+                            })
+                      }}
+                    >
+                      <CopyIcon />
+                      {t('复制链接', 'Copy link')}
+                    </Button>
+                  </div>
                 </AlertDescription>
               </Alert>
             )}
