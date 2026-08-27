@@ -104,7 +104,7 @@ pub async fn handle(
     let device_id = extract_device_id(body_json.as_ref());
     // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
     // body 逐轮不变，算一次即可。见 [`Upstream::bare_session`]。
-    let has_user_id = body_has_user_id(body_json.as_ref());
+    let mut has_user_id = body_has_user_id(body_json.as_ref());
     // 来访是不是本来就是 CC 形态（判据是 `system` 里那句话，见 [`is_cc_shaped`]）。
     // 这里只为日志算它：走不走模拟由 [`Simulation::detect`] 自己判，但它返回 `None` 时
     // 分不出是「本来就是 CC」还是「开关关着」，而这正是排查时要知道的那一位。
@@ -127,7 +127,7 @@ pub async fn handle(
     // 2 用 `body_has_user_id` 而不是 [`extract_device_id`]，是有意放宽：只问字段在不在，
     // 不要求格式认得出。官方哪天换一种 `user_id` 写法，宽的这条仍把它当官方客户端，最多
     // 退化成不绑定设备；严的那条会把它送进模拟，代价大得多。
-    let from_cc_client =
+    let mut from_cc_client =
         cc_cli_version(&client_ua).is_some() || has_user_id || session_from_header.is_some();
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
@@ -200,7 +200,7 @@ pub async fn handle(
 
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）→ 剥掉后正常转发。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
-    let body = maybe_strip_deprecated(
+    let mut body = maybe_strip_deprecated(
         &state.deprecated_fields,
         req_model.as_deref(),
         body_json.as_ref(),
@@ -368,6 +368,9 @@ pub async fn handle(
     let (mut token, mut cred) = (token, cred);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
+    // 裸 429 摘元数据重试：上游对带 `metadata.user_id` 的请求有一套更严的每会话限流，
+    // 实测同一条请求去掉 `metadata` 后立即 200。该标记保证只试一次。
+    let mut metadata_stripped = false;
     // 最后那一轮**上游原样给的**限流头，只在它回 429 时有值（每轮重置，故换号换到一发 200 时
     // 它是 `None`）。存在的理由是下面 transient 档会把我们自己算出来的退避写进 `retry-after`
     // 再交回客户端——那之后重解 `up.headers()` 就会把自己塞的那条当成上游给的读回来，
@@ -564,6 +567,43 @@ pub async fn handle(
                 retry_after_secs = cooldown.as_secs(),
                 "{why}"
             );
+            // 裸 429 且来访带 metadata.user_id：上游对带该字段的请求走更严的每会话限流通道，
+            // 实测同一条请求去掉 metadata 后立即 200。剥掉重试一次——只在一个限流头都没带
+            // 的那一档：正常的额度 429 已经告诉我们是哪个窗口满了，与 metadata 无关。
+            if !metadata_stripped && info.no_limit_headers() && has_user_id {
+                if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    let removed = v
+                        .get_mut("metadata")
+                        .and_then(|m| m.as_object_mut())
+                        .and_then(|m| m.remove("user_id"))
+                        .is_some();
+                    if removed {
+                        if v.get("metadata")
+                            .and_then(|m| m.as_object())
+                            .is_some_and(|m| m.is_empty())
+                        {
+                            v.as_object_mut().map(|o| o.remove("metadata"));
+                        }
+                        if let Ok(bytes) = serde_json::to_vec(&v) {
+                            body = Bytes::from(bytes);
+                            metadata_stripped = true;
+                            // 剥掉 metadata 后这条请求不再是 CC 形态来访——让
+                            // Simulation::detect 重新判定，走模拟把头和体对齐成
+                            // 官方 CC 的样子，否则以裸 curl 头 + OAuth token 出站
+                            // 照样触发上游的裸 429。
+                            has_user_id = false;
+                            from_cc_client = cc_cli_version(&client_ua).is_some()
+                                || session_from_header.is_some();
+                            tracing::warn!(
+                                cred_id = cred.id, cred = %cred.label,
+                                model = %req_model.as_deref().unwrap_or("-"),
+                                "bare 429 with metadata.user_id: stripping metadata and retrying once"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             break (upstream, resp, sent);
         }
         tried.push(cred.id);
