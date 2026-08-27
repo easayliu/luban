@@ -487,6 +487,77 @@ pub async fn handle(
         // 注入之前先留一份，见 `upstream_limit` 的声明。非 429 时写回 `None`：换号换到一发 200
         // 的那一轮，上一轮的 429 头不该再算数。
         upstream_limit = limited.clone();
+        // 401 账号级错误（token revoked / invalid_grant 等）：停用当前号并换号重试。
+        // 必须在 break 之前、loop 内部处理，才能 continue 回去用新号重发。
+        // 成功换号则 continue；换不到号或判定不命中则直接 return 透传（body 已消费，
+        // 不能再 break 出去走 4xx block，就地返回）。
+        if limited.is_none()
+            && max_retry > 0
+            && resp.as_ref().is_ok_and(|up| up.status() == StatusCode::UNAUTHORIZED)
+        {
+            let up = resp.unwrap();
+            let builder = resp_builder(&up);
+            let bytes = match up.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read the upstream 401 body");
+                    return builder.body(Body::empty()).unwrap_or_else(|e| {
+                        error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                    });
+                }
+            };
+            {
+                let (etype, message) = parse_upstream_error(&bytes);
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    status = 401u16,
+                    error_type = %etype.as_deref().unwrap_or("-"),
+                    upstream_message = %message.chars().take(500).collect::<String>(),
+                    "upstream returned 401"
+                );
+            }
+            if let Some(reason) = detect_account_ban(StatusCode::UNAUTHORIZED, &bytes) {
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    reason = %reason,
+                    "401 account-level error, auto-disabling and attempting credential swap"
+                );
+                let _ = state.store.mark_banned(cred.id, &reason);
+                tried.push(cred.id);
+                if retried < max_retry {
+                    if let Ok((next_token, next_cred)) = store::valid_access_token_for_device(
+                        &state.store,
+                        &state.clients,
+                        select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+                    )
+                    .await
+                    {
+                        tracing::info!(
+                            cred_id = cred.id, cred = %cred.label,
+                            to_cred_id = next_cred.id,
+                            to_cred = %next_cred.label,
+                            attempt = retried + 1,
+                            "401 credential swap: retrying with another credential"
+                        );
+                        (token, cred) = (next_token, next_cred);
+                        retried += 1;
+                        continue;
+                    }
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        "401 but no credential to swap to, passing through as is"
+                    );
+                }
+            }
+            // 没换号（判定不命中或换不到号）：body 已消费，就地透传。
+            let bytes = match &tool_names {
+                Some(map) => Bytes::from(map.restore(&bytes)),
+                None => bytes,
+            };
+            return builder.body(Body::from(bytes)).unwrap_or_else(|e| {
+                error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+            });
+        }
         let Some(info) = limited else { break (upstream, resp, sent) };
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
@@ -721,109 +792,86 @@ pub async fn handle(
             };
 
             // 400/401/403：先缓冲响应体做账号级错误判定，命中则自动停用该凭证并清空其
-            // 设备绑定，让下一次请求立即改选其它凭证；命中与否响应体都原样透传。
+            // 设备绑定。401 账号级错误（token revoked 等）会换号重试而非直接透传。
             if matches!(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             ) {
                 let builder = resp_builder(&up);
-                return match up.bytes().await {
-                    Ok(bytes) => {
-                        rl.ttft_ms = Some(rl.started.elapsed().as_millis());
-                        rl.sniffer.feed(&bytes);
-                        // 无条件把上游的错误文本打出来。此前只有被判成账号级错误时才有日志，
-                        // 普通 400（`invalid_request_error`，多半是请求形态被上游拒了）只会留下
-                        // ReqLog 里那条 `status=400` 而不带任何原因——body 虽原样透传给了客户端，
-                        // 但服务端侧查不出所以然。压缩体跳过：打出来只会是乱码字节。
-                        if !compressed {
-                            let (etype, message) = parse_upstream_error(&bytes);
-                            tracing::warn!(
-                                cred_id = cred.id, cred = %cred.label,
-                                status = status.as_u16(),
-                                error_type = %etype.as_deref().unwrap_or("-"),
-                                // 字段名不能叫 `message`——那是 tracing 的保留字段，`fmt` 层
-                                // 把它当事件正文渲染（不带键名），上游那句话会被拼在行尾，
-                                // 看着像日志文本的一部分而不是一个字段，既读不出边界也没法按键过滤。
-                                upstream_message = %message.chars().take(500).collect::<String>(),
-                                "upstream returned 4xx"
-                            );
-                        }
-                        // 上游这条 400 如果点名了请求里的某个取值（`effort level 'xhigh'`、
-                        // `role 'system'`），记下来：下次同款组合在本地就拒了，不再白发一次。
-                        // 见 [`known_shape_rejection`]。
-                        if !compressed && status == StatusCode::BAD_REQUEST {
-                            remember_shape_rejection(
-                                &state.shape_rejections,
-                                req_model.as_deref(),
-                                body_json.as_ref(),
-                                &bytes,
-                            );
-                            remember_deprecated_field(
-                                &state.deprecated_fields,
-                                req_model.as_deref(),
-                                body_json.as_ref(),
-                                &bytes,
-                            );
-                        }
-                        // 上游把这条请求判成了第三方应用（额度改扣超额池）。这类 400 光看
-                        // 错误文本查不出所以然——问题出在**我们发出去的那份请求**长什么样，
-                        // 故把出站头与出站体的结构摘要一并打出来，作为形态对齐的依据。
-                        if !compressed && is_third_party_rejection(&bytes) {
-                            log_third_party_rejection(&sent, &upstream.headers, &cred, status);
-                        }
-                        // 压缩体读不出内容，宁可漏判也不误判（乱码可能碰巧命中特征词）。
-                        if let Some(reason) =
-                            (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
-                        {
-                            tracing::warn!(
-                                cred_id = cred.id, cred = %cred.label,
-                                status = status.as_u16(),
-                                reason = %reason,
-                                "account-level error detected, auto-disabling the credential"
-                            );
-                            if let Err(e) = state.store.mark_banned(cred.id, &reason) {
-                                tracing::warn!(error = %e, "failed to auto-disable the credential");
-                            }
-                        }
-                        // 「thinking 块签名无效」：这条会话的历史是**别的账号**签发的（设备
-                        // 绑定过期或凭证被停用后换了号），当前账号验不了，于是整段历史一并
-                        // 作废——客户端只会看到一条它无法自行修复的 400。这里把历史 thinking
-                        // 降级成 text 再用同一个账号重发一次；重试若仍失败就当无事发生，
-                        // 原样透传最初那条响应，所以开着它最坏也只是多一次往返。
-                        if status == StatusCode::BAD_REQUEST
-                            && !compressed
-                            && is_thinking_signature_error(&bytes)
-                        {
-                            if !flags.thinking_signature_retry {
-                                tracing::warn!(
-                                    cred_id = cred.id, cred = %cred.label,
-                                    "upstream rejected a thinking-block signature (the history was most likely signed by another credential); demote-and-retry is off, passing through as is"
-                                );
-                            } else if let Some(up) =
-                                retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl)
-                                    .await
-                            {
-                                return relay_upstream(up, rl, upgrade_stream, tool_names.clone())
-                                    .await;
-                            }
-                        }
-                        // 上游的错误文本可能回显假名（如「tool analyze_ski00 not found」），
-                        // 整段已在内存里，顺手还原一次，成本可忽略。
-                        let bytes = match &tool_names {
-                            Some(map) => Bytes::from(map.restore(&bytes)),
-                            None => bytes,
-                        };
-                        builder.body(Body::from(bytes)).unwrap_or_else(|e| {
-                            error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
-                        })
-                    }
+                let err_bytes = match up.bytes().await {
+                    Ok(b) => b,
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to read the upstream error body");
-                        builder.body(Body::empty()).unwrap_or_else(|e| {
+                        return builder.body(Body::empty()).unwrap_or_else(|e| {
                             error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
-                        })
+                        });
                     }
                 };
+                rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+                rl.sniffer.feed(&err_bytes);
+                if !compressed {
+                    let (etype, message) = parse_upstream_error(&err_bytes);
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        status = status.as_u16(),
+                        error_type = %etype.as_deref().unwrap_or("-"),
+                        upstream_message = %message.chars().take(500).collect::<String>(),
+                        "upstream returned 4xx"
+                    );
+                }
+                if !compressed && status == StatusCode::BAD_REQUEST {
+                    remember_shape_rejection(
+                        &state.shape_rejections,
+                        req_model.as_deref(),
+                        body_json.as_ref(),
+                        &err_bytes,
+                    );
+                    remember_deprecated_field(
+                        &state.deprecated_fields,
+                        req_model.as_deref(),
+                        body_json.as_ref(),
+                        &err_bytes,
+                    );
+                }
+                if !compressed && is_third_party_rejection(&err_bytes) {
+                    log_third_party_rejection(&sent, &upstream.headers, &cred, status);
+                }
+                let banned =
+                    (!compressed).then(|| detect_account_ban(status, &err_bytes)).flatten();
+                if let Some(reason) = &banned {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        status = status.as_u16(),
+                        reason = %reason,
+                        "account-level error detected, auto-disabling the credential"
+                    );
+                    if let Err(e) = state.store.mark_banned(cred.id, reason) {
+                        tracing::warn!(error = %e, "failed to auto-disable the credential");
+                    }
+                }
+                // thinking 签名降级重试。
+                if status == StatusCode::BAD_REQUEST
+                    && !compressed
+                    && is_thinking_signature_error(&err_bytes)
+                {
+                    if !flags.thinking_signature_retry {
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            "upstream rejected a thinking-block signature (the history was most likely signed by another credential); demote-and-retry is off, passing through as is"
+                        );
+                    } else if let Some(up) =
+                        retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
+                    {
+                        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
+                    }
+                }
+                let err_bytes = match &tool_names {
+                    Some(map) => Bytes::from(map.restore(&err_bytes)),
+                    None => err_bytes,
+                };
+                return builder.body(Body::from(err_bytes)).unwrap_or_else(|e| {
+                    error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                });
             }
 
             // 429 且**一个限流头都没带**：这不是额度拒绝。上游的额度 429 必定带着
