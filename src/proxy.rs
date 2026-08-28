@@ -899,6 +899,12 @@ pub async fn handle(
                 }
                 if !compressed && is_third_party_rejection(&err_bytes) {
                     log_third_party_rejection(&sent, &upstream.headers, &cred, status);
+                    tracing::info!(
+                        cred_id = cred.id, cred = %cred.label,
+                        inbound_bytes = body.len(),
+                        inbound_body = %String::from_utf8_lossy(&body),
+                        "third-party rejection: dumping the INBOUND (client-original) request body for local replay"
+                    );
                 }
                 let banned =
                     (!compressed).then(|| detect_account_ban(status, &err_bytes)).flatten();
