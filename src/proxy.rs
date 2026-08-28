@@ -4846,10 +4846,19 @@ fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
         obj.remove("thinking");
         changed = true;
     }
-    if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut())
-        && thinking.remove("display").is_some()
-    {
-        changed = true;
+    if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
+        if thinking.remove("display").is_some() {
+            changed = true;
+        }
+        // thinking.type == "enabled" 时 budget_tokens 必须 >= 1024，否则上游 400。
+        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
+            if let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_u64()) {
+                if budget < 1024 {
+                    thinking.insert("budget_tokens".into(), serde_json::Value::Number(1024.into()));
+                    changed = true;
+                }
+            }
+        }
     }
     // thinking 开着时 temperature 必须是 1（上游强制），客户端设了别的值直接 400。
     // 删掉即可——默认值就是 1。判据同 ensure_context_management 那里的口径。
