@@ -2906,8 +2906,9 @@ struct Simulation {
 
 impl Simulation {
     /// 判定 + 派生一次做完。返回 `None` 的四种情形：开关关着、请求体不是我们能改的 JSON、
-    /// 来访已经是 CC 形态（[`is_cc_shaped`]）、来访是 Claude Code 客户端（`from_cc_client`，
-    /// 三个记号的取法与取舍见调用点）。
+    /// 来访已经是 CC 形态（[`is_cc_shaped`]）、来访是 Claude Code 客户端**且工具列表符合
+    /// CC 特征**（[`has_cc_tool_profile`]——含官方工具名，或没带 `tools`）。UA 自报 CC 但
+    /// 工具列表全是非官方名的请求会被视为第三方冒用，仍走模拟路径。
     ///
     /// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
     /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
@@ -2944,7 +2945,10 @@ impl Simulation {
         // 这种头体不一致比不模拟更容易被上游标记，不如一并接管。
         // [`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉客户端已有的那份身份声明和
         // billing header，再由模拟统一补上官方的，避免重复。
-        if from_cc_client {
+        // UA 自报 CC 且工具列表看起来也像 CC（含官方工具名，或压根没带 tools）→ 跳过模拟。
+        // UA 自报 CC 但 tools 里一个官方名都没有 → 大概率第三方冒用 CC UA，跳过模拟只会
+        // 让工具全变成 `mcp__luban__*` 却拿不到模拟路径的整套头/system 配合，上游仍判第三方。
+        if from_cc_client && has_cc_tool_profile(v) {
             return None;
         }
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
@@ -2972,6 +2976,22 @@ fn is_cc_shaped(v: &serde_json::Value) -> bool {
         Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY),
         _ => false,
     }
+}
+
+/// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
+/// 有 `tools` 但里面至少有一个 [`config::CC_TOOL_NAMES`] 里的官方工具名也算是。
+/// **有 tools 却一个官方名都找不到**说明 UA 是第三方中转冒用的。
+fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
+    let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else {
+        return true; // 没有 tools 字段不是判据
+    };
+    if tools.is_empty() {
+        return true;
+    }
+    tools.iter().any(|t| {
+        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        config::CC_TOOL_NAMES.contains(&name)
+    })
 }
 
 /// 按模型族选官方基座：opus-5 / fable-5 共用一份，sonnet-5 / haiku-4.5 共用另一份
@@ -8495,7 +8515,28 @@ mod tests {
             header::USER_AGENT,
             HeaderValue::from_static("claude-cli/2.1.226 (external, cli)"),
         );
-        assert!(detect_with(&cc_no_meta, &cc_ua, all_on()).is_none(), "真 CC 客户端不该走模拟");
+        assert!(
+            detect_with(&cc_no_meta, &cc_ua, all_on()).is_none(),
+            "真 CC 客户端(无tools)不该走模拟"
+        );
+
+        // CC UA + 含官方工具名 → 不模拟。
+        let cc_with_tools = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"tools":[{{"name":"Bash"}},{{"name":"custom_tool"}}]}}"#
+        ));
+        assert!(
+            detect_with(&cc_with_tools, &cc_ua, all_on()).is_none(),
+            "CC UA + 有官方工具不该走模拟"
+        );
+
+        // CC UA + 全是非官方工具名 → 视为冒用，走模拟。
+        let spoofed_ua = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[],"tools":[{"name":"exec"},{"name":"read_file"},{"name":"web_search"}]}"#.to_string()
+        );
+        assert!(
+            detect_with(&spoofed_ua, &cc_ua, all_on()).is_some(),
+            "CC UA 但零官方工具应走模拟（冒用）"
+        );
 
         // 模拟后 system 里不该有两份身份声明。
         let sim = detect_for(&cc_no_meta, all_on()).unwrap();
