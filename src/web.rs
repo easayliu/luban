@@ -166,18 +166,34 @@ pub async fn run(
                         }
                     };
 
+                    // 保活前先确保 token 新鲜——懒刷新在无代理流量时不会触发，
+                    // 长时间空闲会导致 refresh_token 过期（invalid_grant）。
+                    let access_token = match store::ensure_fresh_token(&store, &clients, &cred)
+                        .await
+                    {
+                        Ok(store::TokenAttempt::Ready(t)) => t,
+                        Ok(store::TokenAttempt::Revoked(reason)) => {
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, %reason, "keepalive: refresh_token revoked, disabling");
+                            let _ = store.mark_banned(cred.id, &reason);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %e, "keepalive: token refresh failed (transient), skipping tick");
+                            continue;
+                        }
+                    };
+
                     let ctx = oauth::KeepaliveCtx::new(&cred, started.elapsed().as_secs_f64());
 
                     // --- 每 tick ---
-                    let ev_ok =
-                        oauth::keepalive_event_logging(&http, &cred.access_token, &ctx).await;
+                    let ev_ok = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
                     let dd_ok = oauth::keepalive_datadog_logs(&http, &ctx).await;
 
                     // --- 首 tick：启动握手 ---
                     let (mt_ok, boot_ok, peng_ok) = if is_first {
-                        let mt = oauth::keepalive_metrics(&http, &cred.access_token, &ctx).await;
-                        let bo = oauth::keepalive_bootstrap(&http, &cred.access_token).await;
-                        let pg = oauth::keepalive_penguin_mode(&http, &cred.access_token).await;
+                        let mt = oauth::keepalive_metrics(&http, &access_token, &ctx).await;
+                        let bo = oauth::keepalive_bootstrap(&http, &access_token).await;
+                        let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
                         (mt, bo, pg)
                     } else {
                         (true, true, true)
@@ -185,15 +201,15 @@ pub async fn run(
 
                     // --- 每 6h：eval ---
                     let eval_ok = if is_eval {
-                        oauth::keepalive_eval(&http, &cred.access_token, &ctx).await
+                        oauth::keepalive_eval(&http, &access_token, &ctx).await
                     } else {
                         true
                     };
 
                     // --- 每 1h ---
                     let (pl_ok, st_ok) = if is_hourly || is_first {
-                        let pl = oauth::keepalive_policy_limits(&http, &cred.access_token).await;
-                        let st = oauth::keepalive_settings(&http, &cred.access_token).await;
+                        let pl = oauth::keepalive_policy_limits(&http, &access_token).await;
+                        let st = oauth::keepalive_settings(&http, &access_token).await;
                         (pl, st)
                     } else {
                         (true, true)

@@ -3428,7 +3428,7 @@ const MAX_REFRESH_FAILOVER: usize = 5;
 
 /// 一次「拿到该凭证可用 access_token」的尝试结果。可重试的错误（网络抖动、5xx、限流）
 /// 走 `Err` 直接冒泡，不在这里表达。
-enum TokenAttempt {
+pub enum TokenAttempt {
     /// 拿到可用 access_token。
     Ready(String),
     /// 该凭证的 refresh_token 已被上游永久作废，重试没有意义——外层会停用它并改选其它号。
@@ -3547,7 +3547,7 @@ async fn select_with_refresh_failover<'a>(
 /// 刷新走该凭证的专属锁 + 双重检查：上游刷新会轮换 refresh_token，并发刷新中后完成的那次
 /// 会把已作废的 token 写回库，导致该凭证之后所有刷新都 `invalid_grant`（账号被自己废掉）。
 /// 拿到锁后重新读库，若他人已刷好则直接复用，不再多打一次刷新。
-async fn ensure_fresh_token(
+pub async fn ensure_fresh_token(
     store: &CredentialStore,
     clients: &crate::clients::ClientPool,
     cred: &Credential,
