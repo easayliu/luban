@@ -477,6 +477,20 @@ pub struct SavedProxy {
     pub created_at: u64,
 }
 
+/// 迁移用的代理池条目：只保留 label 和 url，id 由目标库自己发。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PortableProxy {
+    #[serde(default)]
+    pub label: String,
+    pub url: String,
+}
+
+impl From<&SavedProxy> for PortableProxy {
+    fn from(p: &SavedProxy) -> Self {
+        Self { label: p.label.clone(), url: p.url.clone() }
+    }
+}
+
 /// 全字段都给了 `#[serde(default)]`：迁移文件是会被人手改的（删掉几个号、改个优先级），
 /// 少一个字段就整份导入失败太脆。缺 `expires_at` 退化成 0，即「已过期」——首次使用时用
 /// refresh_token 换一份新的，正是想要的行为。
@@ -706,6 +720,33 @@ impl CredentialStore {
     /// 这个口子就等于拿到了这些账号，故接口侧另加了一道闸（见 `crate::web` 的 `export`）。
     pub fn export_credentials(&self) -> Result<Vec<PortableCredential>> {
         Ok(self.list()?.iter().map(PortableCredential::from).collect())
+    }
+
+    /// 导出代理池的可迁移形态。
+    pub fn export_proxies(&self) -> Result<Vec<PortableProxy>> {
+        Ok(self.list_proxies()?.iter().map(PortableProxy::from).collect())
+    }
+
+    /// 导入一条代理：URL 已存在则更新 label，不存在则新增。返回是 Added 还是 Updated。
+    pub fn import_proxy(&self, p: &PortableProxy) -> Result<ImportOutcome> {
+        anyhow::ensure!(!p.url.is_empty(), "proxy URL must not be empty");
+        let conn = self.conn.lock();
+        let existing: Option<i64> = conn
+            .query_row("SELECT id FROM proxies WHERE url = ?1", [&p.url], |r| r.get(0))
+            .optional()?;
+        match existing {
+            Some(id) => {
+                conn.execute("UPDATE proxies SET label = ?2 WHERE id = ?1", params![id, p.label])?;
+                Ok(ImportOutcome::Updated)
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO proxies (label, url) VALUES (?1, ?2)",
+                    params![p.label, p.url],
+                )?;
+                Ok(ImportOutcome::Added)
+            }
+        }
     }
 
     /// 可迁移的设置快照（`settings` 全表），**去掉管理密码**。

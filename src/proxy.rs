@@ -939,6 +939,11 @@ pub async fn handle(
                             cred.id,
                             req_model.as_deref().unwrap_or("-"),
                         );
+                        let redacted_hdr = redact_headers(&upstream.headers);
+                        let body_digest = match serde_json::from_slice::<serde_json::Value>(&body) {
+                            Ok(v) => request_digest(&v).to_string(),
+                            Err(_) => format!("<unparsable {} bytes>", body.len()),
+                        };
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             model = %req_model.as_deref().unwrap_or("-"),
@@ -948,14 +953,13 @@ pub async fn handle(
                             max_tokens = req_max_tokens.unwrap_or(0),
                             stream = body_json.as_ref().is_some_and(stream_requested),
                             body_bytes = body.len(),
-                            request_body = %String::from_utf8_lossy(&body),
-                            request_headers = ?upstream.headers,
+                            request_body = %body_digest,
+                            request_headers = %redacted_hdr,
                             in_flight = state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
                             cred_in_flight = load.cred_in_flight,
                             route_in_flight = load.route_in_flight,
                             sent_60s = load.sent,
                             max_tokens_60s = load.max_tokens,
-                            // 字段名同上，不能叫 `message`。
                             upstream_message = %message.chars().take(500).collect::<String>(),
                             "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is what the body says"
                         );
@@ -2448,6 +2452,26 @@ fn is_secret_header(name: &str) -> bool {
     matches!(name, "authorization" | "x-api-key" | "cookie" | "proxy-authorization")
 }
 
+/// 把出站 `HeaderMap` 格式化成一行，对鉴权头脱敏。
+/// 多处日志共用（第三方 400、裸 429……），避免某条路径漏掉脱敏。
+fn redact_headers(headers: &HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str();
+            let value = if is_secret_header(name) {
+                "<redacted>".to_string()
+            } else {
+                v.to_str()
+                    .map(|s| head(s, DUMP_TEXT_HEAD))
+                    .unwrap_or_else(|_| "<non-ascii>".to_string())
+            };
+            format!("{name}: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// 上游把请求判成第三方应用时，把**我们实际发出去的那份请求**的形态打成一条 info。
 ///
 /// 这类 400 的错误文本本身没有信息量（它只说「你是第三方」，不说凭什么），要查只能看
@@ -2469,21 +2493,7 @@ fn log_third_party_rejection(
     cred: &crate::credentials::Credential,
     status: StatusCode,
 ) {
-    let hdr = headers
-        .iter()
-        .map(|(k, v)| {
-            let name = k.as_str();
-            let value = if is_secret_header(name) {
-                "<redacted>".to_string()
-            } else {
-                v.to_str()
-                    .map(|s| head(s, DUMP_TEXT_HEAD))
-                    .unwrap_or_else(|_| "<non-ascii>".to_string())
-            };
-            format!("{name}: {value}")
-        })
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let hdr = redact_headers(headers);
     let body = match serde_json::from_slice::<serde_json::Value>(sent) {
         Ok(v) => request_digest(&v).to_string(),
         Err(_) => format!(

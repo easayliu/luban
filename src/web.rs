@@ -1945,6 +1945,10 @@ struct ExportFile {
     /// `settings` 全表（不含管理密码，见 [`store::CredentialStore::settings_snapshot`]）。
     /// 用 `BTreeMap` 而不是 `HashMap`：导出文件是会被人 diff、被存进版本库的，键序必须稳定。
     settings: std::collections::BTreeMap<String, String>,
+    /// 代理池：凭证的 `proxy` 字段只存 URL，池里还有 label 这类管理信息。
+    /// 旧版导出文件没有此字段，`#[serde(default)]` 让导入侧拿到空 Vec，不会坏。
+    #[serde(default)]
+    proxies: Vec<store::PortableProxy>,
 }
 
 /// 迁移文件的 `kind` 标记。
@@ -1967,6 +1971,7 @@ async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
         ));
     }
     let credentials = state.store.export_credentials().map_err(internal)?;
+    let proxies = state.store.export_proxies().map_err(internal)?;
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1978,10 +1983,12 @@ async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
         luban_version: env!("CARGO_PKG_VERSION").to_string(),
         credentials,
         settings: state.store.settings_snapshot().into_iter().collect(),
+        proxies,
     };
     tracing::info!(
         credentials = file.credentials.len(),
         settings = file.settings.len(),
+        proxies = file.proxies.len(),
         "exported"
     );
     // 文件名带时间戳：迁移时常常连着导好几份（改完再导一次），同名会互相覆盖。
@@ -2033,6 +2040,9 @@ struct ImportResp {
     cleared: usize,
     /// 实际写入的设置项数（未勾选导入设置时为 0）。
     settings_applied: usize,
+    /// 代理池：新增 + 更新的条数。
+    proxies_added: usize,
+    proxies_updated: usize,
 }
 
 /// 导入账号与设置。
@@ -2056,8 +2066,9 @@ async fn import(
             req.payload.version
         )));
     }
-    if req.payload.credentials.is_empty() && !req.import_settings {
-        return Err(bad_request("nothing to import: the file has no credentials"));
+    if req.payload.credentials.is_empty() && req.payload.proxies.is_empty() && !req.import_settings
+    {
+        return Err(bad_request("nothing to import: the file has no credentials or proxies"));
     }
     // 清空放在导入之前、且只在 replace 下做：先清后导意味着导入失败时库是空的，
     // 所以这个模式在界面上要单独确认（见前端的 ImportDialog）。
@@ -2068,14 +2079,31 @@ async fn import(
     } else {
         0
     };
-    let mut resp = ImportResp { added: 0, updated: 0, failed: 0, cleared, settings_applied: 0 };
+    let mut resp = ImportResp {
+        added: 0,
+        updated: 0,
+        failed: 0,
+        cleared,
+        settings_applied: 0,
+        proxies_added: 0,
+        proxies_updated: 0,
+    };
+    // 代理池先于凭证导入：凭证的 `proxy` 字段引用池里的 URL，先建好池条目在管理界面上更直观。
+    for (i, p) in req.payload.proxies.iter().enumerate() {
+        match state.store.import_proxy(p) {
+            Ok(store::ImportOutcome::Added) => resp.proxies_added += 1,
+            Ok(store::ImportOutcome::Updated) => resp.proxies_updated += 1,
+            Err(e) => {
+                tracing::warn!(index = i, label = %p.label, url = %p.url, error = %e, "import: skipped one proxy");
+            }
+        }
+    }
     for (i, c) in req.payload.credentials.iter().enumerate() {
         match state.store.import_credential(c) {
             Ok(store::ImportOutcome::Added) => resp.added += 1,
             Ok(store::ImportOutcome::Updated) => resp.updated += 1,
             Err(e) => {
                 resp.failed += 1;
-                // 带上序号与 label：token 不能进日志，而这两项足够让人在文件里找到是哪条。
                 tracing::warn!(index = i, label = %c.label, error = %e, "import: skipped one credential");
             }
         }
@@ -2091,6 +2119,8 @@ async fn import(
         failed = resp.failed,
         cleared = resp.cleared,
         settings = resp.settings_applied,
+        proxies_added = resp.proxies_added,
+        proxies_updated = resp.proxies_updated,
         "imported"
     );
     Ok(Json(resp))
