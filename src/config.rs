@@ -418,6 +418,58 @@ pub const KEEPALIVE_EVAL_TICKS: u64 = 12;
 /// eval 端点的 User-Agent（真实客户端 Bun 运行时自报的 UA，与其他端点不同）。
 pub const KEEPALIVE_UA_BUN: &str = "Bun/1.4.1";
 
+// ---------- 官方 CC 工具名白名单 ----------
+
+/// 官方 Claude Code 客户端声明的全部工具名（含 deferred 展开后的名字）。
+///
+/// 来源：`cap/raw` 八份直连抓包 + `cap/2.1.145` 订阅直连。**只有这些名字在上游白名单内**，
+/// 其余 custom tool 名即使功能正常也会被上游判为第三方应用（扣超额池或 400），故
+/// [`crate::proxy::should_mimic_tool`] 对不在此集合内的 custom tool 统一加 `mcp__` 前缀。
+///
+/// 新版 CC 如果加了工具名，在这里补一条即可——漏补的代价只是多混淆一个官方名
+/// （功能不受影响，回程会还原），发现后补上即恢复。
+pub const CC_TOOL_NAMES: &[&str] = &[
+    "Agent",
+    "Artifact",
+    "AskUserQuestion",
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DeferredToolPlaceholder",
+    "DesignSync",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "LSP",
+    "ListAgents",
+    "Monitor",
+    "NotebookEdit",
+    "PushNotification",
+    "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendFeedback",
+    "SendMessage",
+    "ShareOnboardingGuide",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "ToolSearch",
+    "WaitForMcpServers",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write",
+];
+
 // ---------- Datadog 遥测 ----------
 
 /// Datadog 日志摄入 URL（与 api.anthropic.com 是不同的主机）。

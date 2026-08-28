@@ -4604,16 +4604,17 @@ const FAKE_TOOL_PREFIXES: &[&str] = &[
     "handle_",
 ];
 
-/// 已知触发上游第三方判定的工具名（实测）。命中其中任意一个即回 400
-/// `Third-party apps now draw from your extra usage…`，加 `mcp__` 前缀后豁免。
-/// 抓包（`cap/raw/*.req.raw`）确认官方 CC 从不发这些名字，故只需对这张表做最小混淆。
+/// 已知触发上游第三方判定的工具名（已弃用，仅为文档留存）。
 ///
 /// **判据在工具名而不在 system**：同一条请求，工具名换成官方 CC 那套（`Read`/`Bash` 之类）
-/// 回 200，换回这三个业务名回 400；而 `system` 里放 56KB 的「You are Hermes Agent,
-/// created by Nous Research」完全不影响。故这里只按名字列黑名单，不去动别的形态。
+/// 回 200，换回业务名回 400；而 `system` 里放 56KB 的非官方内容完全不影响。
 ///
-/// **宁可表短也别臆造**：漏掉一个真会触发的名字是硬失效（整条请求 400），凭空多列一个
-/// 则会把本来没事的工具名一起混淆（功能不受影响，只是多一处与真实 CC 的形态偏差）。
+/// 原先用黑名单——只混淆 `skill_manage`/`skill_view`/`skills_list`，其余原样透传。
+/// 但上游的触发集合在扩大：任何不在 [`config::CC_TOOL_NAMES`] 白名单内的 custom tool 名
+/// 都可能触发第三方判定（实测 `sessions_spawn`/`memory_search` 等同样 400）。
+/// 故改为**白名单**：只有官方 CC 工具名与 `mcp__` 前缀工具原样通过，其余一律混淆。
+/// 漏加一个官方名的代价仅是多混淆（功能不受影响，回程还原），远好于漏列一个触发名的硬 400。
+#[allow(dead_code)]
 const BLOCKED_TOOL_NAMES: &[&str] = &["skill_manage", "skill_view", "skills_list"];
 
 /// 一次请求内的工具名混淆映射。
@@ -4629,18 +4630,25 @@ struct ToolNameMap {
     max_fake: usize,
 }
 
-/// 某个 tool 是否该混淆：仅命中 [`BLOCKED_TOOL_NAMES`] 的工具名需要改写，其余原样透传。
-/// server tool（`web_search_20250305` 等）即使同名也不改——改了上游直接拒。
+/// 某个 tool 是否该混淆：**不在 [`config::CC_TOOL_NAMES`] 白名单内**的 custom tool 一律改写。
+///
+/// 三类保留原名：
+/// - server tool（`web_search_20250305` 等）——改了上游直接拒；
+/// - `mcp__` 前缀——实测豁免，且改了会破坏 MCP 命名空间语义；
+/// - [`config::CC_TOOL_NAMES`] 里的官方 CC 工具名。
 fn should_mimic_tool(t: &serde_json::Value) -> bool {
     let kind = t.get("type").and_then(|k| k.as_str()).unwrap_or_default();
     if !matches!(kind, "" | "custom" | "function") {
         return false;
     }
     let Some(name) = t.get("name").and_then(|n| n.as_str()) else { return false };
-    BLOCKED_TOOL_NAMES.contains(&name)
+    if name.starts_with("mcp__") {
+        return false;
+    }
+    !config::CC_TOOL_NAMES.contains(&name)
 }
 
-/// 从请求体扫出要混淆的工具名，生成映射。没有可混淆的（`tools` 不是数组／全在白名单里）
+/// 从请求体扫出要混淆的工具名，生成映射。没有可混淆的（`tools` 不是数组／全是官方名或 `mcp__` 前缀）
 /// 返回 `None`，此后请求与回程两侧都零开销。
 ///
 /// **假名对同一组工具名恒定**：seed 取 `sha256(名字集合)`，同一会话内每轮请求得到同一套假名，
@@ -7295,21 +7303,25 @@ mod tests {
         }
     }
 
-    /// 只混淆 BLOCKED_TOOL_NAMES 里的名字，其余（官方名/MCP前缀/任意第三方名）原样透传。
-    /// 判据实测：`skill_manage`/`skill_view`/`skills_list` 原样是 400，加 `mcp__` 前缀豁免。
+    /// 白名单策略：官方名/MCP前缀/server tool 保留原名，其余 custom tool 一律混淆。
     #[test]
     fn tool_map_skips_official_mcp_and_server_tools() {
         let body = serde_json::json!({"tools": [
-            {"name": "Bash"},                                      // 官方 → 保留
+            {"name": "Bash"},                                      // 官方白名单 → 保留
+            {"name": "Read"},                                      // 官方白名单 → 保留
             {"name": "mcp__hermes__skill_manage"},                 // MCP前缀 → 保留
             {"type": "web_search_20250305", "name": "web_search"}, // server tool → 保留
-            {"name": "delegate_task"},                             // 非blocklist → 保留
-            {"name": "skill_manage"},                              // blocklist → 混淆
+            {"name": "delegate_task"},                             // 非官方 custom → 混淆
+            {"name": "skill_manage"},                              // 非官方 custom → 混淆
+            {"name": "sessions_spawn"},                            // 非官方 custom → 混淆
+            {"name": "memory_search"},                             // 非官方 custom → 混淆
         ]});
-        let map = build_tool_name_map(Some(&body)).expect("blocklist命中就该有映射");
-        assert_eq!(map.forward.len(), 1, "只混淆blocklist里的: {:?}", map.forward);
-        assert!(map.forward.contains_key("skill_manage"));
-        for kept in ["Bash", "mcp__hermes__skill_manage", "web_search", "delegate_task"] {
+        let map = build_tool_name_map(Some(&body)).expect("有非官方 custom tool 就该有映射");
+        assert_eq!(map.forward.len(), 4, "应混淆 4 个非官方名: {:?}", map.forward);
+        for should_mimic in ["delegate_task", "skill_manage", "sessions_spawn", "memory_search"] {
+            assert!(map.forward.contains_key(should_mimic), "{should_mimic} 该被混淆");
+        }
+        for kept in ["Bash", "Read", "mcp__hermes__skill_manage", "web_search"] {
             assert!(!map.forward.contains_key(kept), "{kept} 该保留原名");
         }
         // 假名必须走已验证豁免的 MCP 命名空间。
@@ -7317,9 +7329,9 @@ mod tests {
             assert!(fake.starts_with("mcp__luban__"), "假名必须是 mcp__luban__ 前缀: {fake}");
         }
 
-        // blocklist 以外全不命中 → 无映射。
+        // 全是官方名或 MCP 前缀 → 无映射。
         let clean = serde_json::json!({"tools": [
-            {"name": "Bash"}, {"name": "mcp__x__y"}, {"name": "delegate_task"},
+            {"name": "Bash"}, {"name": "mcp__x__y"}, {"name": "Edit"},
         ]});
         assert!(build_tool_name_map(Some(&clean)).is_none());
         assert!(build_tool_name_map(Some(&serde_json::json!({"tools": []}))).is_none());
