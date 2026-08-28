@@ -4000,6 +4000,9 @@ fn rewrite_body(
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered = sim.is_some() && align_cc_top_level_order(&mut v);
+    // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
+    // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
+    let tools_deduped = dedup_tools(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
@@ -4015,6 +4018,7 @@ fn rewrite_body(
         streamed,
         stripped,
         top_level_ordered,
+        tools_deduped,
         tools_mimicked,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
@@ -4032,6 +4036,7 @@ fn rewrite_body(
         && !streamed
         && !stripped
         && !top_level_ordered
+        && !tools_deduped
         && !tools_mimicked
     {
         return body.clone();
@@ -4706,6 +4711,25 @@ fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> 
     }
     reverse.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
     Some(ToolNameMap { forward, reverse, max_fake })
+}
+
+/// `tools` 数组按 `name` 去重：保留每个名字的首次出现，丢弃后续重复声明。
+/// 上游对重复名直接 400（`Tool names must be unique`），而客户端侧不一定能改。
+fn dedup_tools(v: &mut serde_json::Value) -> bool {
+    let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return false;
+    };
+    let before = tools.len();
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|t| {
+        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        seen.insert(name.to_string())
+    });
+    let removed = before - tools.len();
+    if removed > 0 {
+        tracing::info!(removed, "deduped tools array (duplicate tool names)");
+    }
+    removed > 0
 }
 
 /// 把映射应用到请求体，返回是否改动过。三处必须**同时**改：
@@ -8503,9 +8527,10 @@ mod tests {
     /// 换成「根本发不出去」。断点在别处（tools）时同样算数。
     #[test]
     fn respects_cache_breakpoint_budget() {
-        let tool = r#"{"name":"t","cache_control":{"type":"ephemeral"}}"#;
+        let t = |n: &str| format!(r#"{{"name":"{n}","cache_control":{{"type":"ephemeral"}}}}"#);
         let body = Bytes::from(format!(
-            r#"{{"model":"claude-opus-5","messages":[],"tools":[{tool},{tool},{tool},{tool}]}}"#
+            r#"{{"model":"claude-opus-5","messages":[],"tools":[{},{},{},{}]}}"#,
+            t("t0"), t("t1"), t("t2"), t("t3"),
         ));
         let sim = detect_for(&body, all_on()).unwrap();
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
