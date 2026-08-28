@@ -271,6 +271,8 @@ pub async fn run(
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
         .route("/metrics", get(get_metrics))
+        .route("/metrics/cache-series", get(get_cache_series))
+        .route("/metrics/ttft-series", get(get_ttft_series))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
@@ -1189,6 +1191,54 @@ async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>,
         in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed).max(0),
         window_secs: store::RPM_WINDOW_SECS,
     }))
+}
+
+// ---------- 缓存 & TTFT 趋势 ----------
+
+#[derive(Deserialize)]
+struct SeriesQuery {
+    #[serde(default = "default_series_hours")]
+    hours: i64,
+}
+
+fn default_series_hours() -> i64 {
+    7 * 24
+}
+
+#[derive(Serialize)]
+struct CacheSeriesResp {
+    since: i64,
+    bucket_secs: i64,
+    points: Vec<store::CacheBucket>,
+}
+
+async fn get_cache_series(
+    State(state): State<AppState>,
+    Query(q): Query<SeriesQuery>,
+) -> Result<Json<CacheSeriesResp>, ApiError> {
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    let points = state.store.cache_series(since).map_err(internal)?;
+    Ok(Json(CacheSeriesResp { since, bucket_secs: 3600, points }))
+}
+
+#[derive(Serialize)]
+struct TtftSeriesResp {
+    since: i64,
+    bucket_secs: i64,
+    points: Vec<store::TtftBucket>,
+}
+
+async fn get_ttft_series(
+    State(state): State<AppState>,
+    Query(q): Query<SeriesQuery>,
+) -> Result<Json<TtftSeriesResp>, ApiError> {
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    let points = state.store.ttft_series(since).map_err(internal)?;
+    Ok(Json(TtftSeriesResp { since, bucket_secs: 3600, points }))
 }
 
 // ---------- 接入设置 ----------

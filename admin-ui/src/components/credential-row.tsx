@@ -225,17 +225,16 @@ export const CredentialRow = memo(function CredentialRow({
                 <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
                   {credentialLabel}
                 </h3>
-                <p
-                  className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground"
-                  title={t(
-                    `添加于 ${formatFullTime(cred.created_at, language)}`,
-                    `Added ${formatFullTime(cred.created_at, language)}`,
-                  )}
-                >
+                <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                   <CalendarDaysIcon />
                   <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                   <span aria-hidden="true">·</span>
-                  <span className="min-w-0">{t(`添加于 ${added}`, `Added ${added}`)}</span>
+                  <Tooltip>
+                    <TooltipTrigger render={<span />} className="min-w-0">
+                      {t(`添加于 ${added}`, `Added ${added}`)}
+                    </TooltipTrigger>
+                    <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
+                  </Tooltip>
                 </p>
               </div>
               <div className="flex shrink-0 items-start gap-1">
@@ -345,9 +344,12 @@ export const CredentialRow = memo(function CredentialRow({
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                 <span aria-hidden="true">·</span>
-                <span className="min-w-0" title={t(`添加于 ${formatFullTime(cred.created_at, language)}`, `Added ${formatFullTime(cred.created_at, language)}`)}>
-                  {t(`添加于 ${added}`, `Added ${added}`)}
-                </span>
+                <Tooltip>
+                  <TooltipTrigger render={<span />} className="min-w-0">
+                    {t(`添加于 ${added}`, `Added ${added}`)}
+                  </TooltipTrigger>
+                  <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
+                </Tooltip>
               </span>
             </div>
           </div>

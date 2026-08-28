@@ -3,6 +3,7 @@ import {
   ArrowUpDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DatabaseZapIcon,
   LayersIcon,
   LayoutGridIcon,
   ListFilterIcon,
@@ -14,6 +15,7 @@ import {
   SearchIcon,
   ShieldCheckIcon,
   SmartphoneIcon,
+  TimerIcon,
   TriangleAlertIcon,
   XIcon,
 } from 'lucide-react'
@@ -21,6 +23,16 @@ import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
+import {
+  CacheHitSparkline,
+  aggregateCacheHitRate,
+  cacheTotalsText,
+} from '@/components/cache-hit-chart'
+import {
+  CacheHitTrendDialog,
+  DEFAULT_CACHE_RANGE,
+  useCacheSeries,
+} from '@/components/cache-hit-trend-dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
 import {
@@ -36,6 +48,14 @@ import {
 } from '@/components/credential-shared'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
+import {
+  DEFAULT_TTFT_RANGE,
+  TtftSparkline,
+  TtftTrendDialog,
+  aggregateTtft,
+  formatMs,
+  useTtftSeries,
+} from '@/components/ttft-trend-dialog'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -67,7 +87,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
-import { cn, displayCredentialLabel, extractError } from '@/lib/utils'
+import { cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -344,6 +364,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
   const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: getMetrics, refetchInterval: 10_000 })
+  const cacheSeries = useCacheSeries(DEFAULT_CACHE_RANGE)
+  const poolCache = aggregateCacheHitRate(cacheSeries.slots)
+  const [cacheTrendOpen, setCacheTrendOpen] = useState(false)
+  const ttftSeries = useTtftSeries(DEFAULT_TTFT_RANGE)
+  const poolTtft = aggregateTtft(ttftSeries.slots)
+  const [ttftTrendOpen, setTtftTrendOpen] = useState(false)
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   const filterItems = useMemo(
@@ -612,6 +638,30 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   )}
                 </span>
               )}
+              {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
+                  是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
+              {!isLoading && count > 0 && (
+                <button
+                  type="button"
+                  className={cn(
+                    'inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-2 py-1 text-2xs font-medium text-muted-foreground transition-colors',
+                    'hover:bg-muted/72 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
+                    (filter === 'deviceFull' || filter === 'hasDevice') && 'bg-foreground/8 text-foreground',
+                    fullDeviceCount > 0 && 'text-warning-foreground',
+                  )}
+                  title={deviceStatus}
+                  aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
+                  onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+                >
+                  <SmartphoneIcon className="size-3" aria-hidden />
+                  <span className="tnum">
+                    {metrics.deviceCapacity > 0 && metrics.unlimitedDeviceAccounts === 0
+                      ? `${formatNumber(metrics.deviceCount)}/${formatNumber(metrics.deviceCapacity)}`
+                      : formatNumber(metrics.deviceCount)}
+                  </span>
+                  <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
+                </button>
+              )}
             </div>
             <div
               className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground"
@@ -834,18 +884,19 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         {isLoading ? (
           <section
             aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-5"
+            className="grid grid-cols-2 border-t lg:grid-cols-6"
           >
             <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
             <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
             <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
             <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+            <OverviewMetricSkeleton className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0" />
             <OverviewMetricSkeleton className="col-span-2 lg:col-span-1" />
           </section>
         ) : count > 0 && (
           <section
             aria-label={t('账号池概览', 'Account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-5"
+            className="grid grid-cols-2 border-t lg:grid-cols-6"
           >
             <OverviewMetric
               className="border-r border-b lg:border-b-0"
@@ -889,18 +940,48 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               active={filter === 'nearLimit'}
               onClick={() => selectMetric('nearLimit')}
             />
+            {/* 缓存命中率与首字时延不来自账号列表，点开是趋势而不是筛选——它们讲的是「转发出去的
+                请求质量如何」。摆在实时流量左边：三格都是流量的属性，凑在一起读。 */}
             <OverviewMetric
               className="border-b lg:border-r lg:border-b-0"
-              label={t('绑定设备', 'Linked devices')}
-              value={formatNumber(metrics.deviceCount)}
-              status={deviceStatus}
-              icon={SmartphoneIcon}
-              tone={fullDeviceCount > 0 ? 'warn' : 'neutral'}
-              active={filter === 'deviceFull' || filter === 'hasDevice'}
-              onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+              label={t('缓存命中率 · 7d', 'Cache hit rate · 7d')}
+              value={formatPercent(poolCache.rate)}
+              trend={
+                poolCache.rate == null ? undefined : (
+                  <CacheHitSparkline slots={cacheSeries.slots} className="shrink-0" />
+                )
+              }
+              status={poolCache.rate == null ? t('暂无用量', 'No usage yet') : undefined}
+              statusHint={poolCache.rate == null
+                ? undefined
+                : t(
+                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)}（按 token 加权，不是各账号命中率的平均）。点开看趋势。`,
+                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)} (token-weighted, not an average of per-account rates). Click for the trend.`,
+                  )}
+              icon={DatabaseZapIcon}
+              tone={poolCache.rate == null ? 'neutral' : poolCache.rate >= 0.5 ? 'ok' : 'warn'}
+              onClick={() => setCacheTrendOpen(true)}
             />
-            {/* 唯一一格不来自账号列表、也点不动的指标：它讲的是「此刻代理在干什么」，
-                而不是「池子里有几个号处于某状态」。窄屏独占一整行，别把它挤成半格。 */}
+            <OverviewMetric
+              className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
+              label={t('首字时延 · 7d', 'TTFT · 7d')}
+              value={formatMs(poolTtft.avgMs)}
+              trend={
+                poolTtft.avgMs == null ? undefined : (
+                  <TtftSparkline slots={ttftSeries.slots} className="shrink-0" />
+                )
+              }
+              status={poolTtft.avgMs == null ? t('暂无数据', 'No data yet') : undefined}
+              statusHint={poolTtft.avgMs == null
+                ? undefined
+                : t(
+                    `近 7 天成功请求的平均首字时延，共 ${formatNumber(poolTtft.totalCount)} 次请求。点开看趋势。`,
+                    `Average time to first token over the last 7 days, across ${formatNumber(poolTtft.totalCount)} successful requests. Click for the trend.`,
+                  )}
+              icon={TimerIcon}
+              tone={poolTtft.avgMs == null ? 'neutral' : poolTtft.avgMs <= 3000 ? 'ok' : poolTtft.avgMs <= 8000 ? 'warn' : 'bad'}
+              onClick={() => setTtftTrendOpen(true)}
+            />
             <LiveTrafficMetric
               className="col-span-2 lg:col-span-1"
               label={t('实时流量', 'Live traffic')}
@@ -1044,6 +1125,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           )}
         </div>
       </section>
+
+      <CacheHitTrendDialog open={cacheTrendOpen} onOpenChange={setCacheTrendOpen} />
+      <TtftTrendDialog open={ttftTrendOpen} onOpenChange={setTtftTrendOpen} />
     </div>
   )
 }

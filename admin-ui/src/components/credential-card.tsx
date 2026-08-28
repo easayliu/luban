@@ -291,16 +291,18 @@ export const CredentialCard = memo(function CredentialCard({
                   <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
                     <span aria-hidden="true">·</span>
-                    <span
-                      className="inline-flex min-w-0 items-center gap-1"
-                      title={t(
-                        `添加于 ${formatFullTime(cred.created_at, language)}`,
-                        `Added ${formatFullTime(cred.created_at, language)}`,
-                      )}
-                    >
-                      <CalendarDaysIcon className="size-3 shrink-0" />
-                      <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
-                    </span>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={<span />}
+                        className="inline-flex min-w-0 items-center gap-1"
+                      >
+                        <CalendarDaysIcon className="size-3 shrink-0" />
+                        <span>{t(`添加于 ${added}`, `Added ${added}`)}</span>
+                      </TooltipTrigger>
+                      <TooltipPopup>
+                        {formatFullTime(cred.created_at, language)}
+                      </TooltipPopup>
+                    </Tooltip>
                   </CardDescription>
                 </div>
               </div>

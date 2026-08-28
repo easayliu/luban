@@ -19,3 +19,41 @@ export async function getMetrics(): Promise<Metrics> {
   const { data } = await api.get<Metrics>('/metrics')
   return data
 }
+
+// ---------- 缓存命中率趋势 ----------
+
+export interface CacheSeriesPoint {
+  ts: number
+  input_tokens: number
+  cached_tokens: number
+}
+
+export interface CacheSeries {
+  since: number
+  bucket_secs: number
+  points: CacheSeriesPoint[]
+}
+
+export async function getCacheSeries(hours: number): Promise<CacheSeries> {
+  const { data } = await api.get('/metrics/cache-series', { params: { hours } })
+  return data
+}
+
+// ---------- TTFT 趋势 ----------
+
+export interface TtftSeriesPoint {
+  ts: number
+  avg_ms: number
+  count: number
+}
+
+export interface TtftSeries {
+  since: number
+  bucket_secs: number
+  points: TtftSeriesPoint[]
+}
+
+export async function getTtftSeries(hours: number): Promise<TtftSeries> {
+  const { data } = await api.get('/metrics/ttft-series', { params: { hours } })
+  return data
+}

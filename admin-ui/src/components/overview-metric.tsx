@@ -1,14 +1,16 @@
-import type { ElementType } from 'react'
+import type { ElementType, ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function OverviewMetric({
-  label, value, status, icon: Icon, tone, active = false, onClick, className,
+  label, value, status, statusHint, trend, icon: Icon, tone, active = false, onClick, className,
 }: {
   label: string
   value: number | string
   status?: string
+  statusHint?: string
+  trend?: ReactNode
   icon: ElementType<{ className?: string }>
   tone: 'ok' | 'bad' | 'warn' | 'neutral'
   active?: boolean
@@ -22,18 +24,17 @@ export function OverviewMetric({
     neutral: 'text-muted-foreground',
   }[tone]
   const content = (
-    <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4">
+    <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4" title={statusHint}>
       <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
         <Icon className={cn('size-4', iconClass)} aria-hidden />
       </span>
-      {/* label 在上、数值在下且左对齐：四格宽度不同，数值若各自贴右就散在四个位置，
-          横着扫一眼比不出大小。左对齐后四个数字落在同一条起始线上。 */}
       <div className="min-w-0 flex-1">
         <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
         <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
             {value}
           </span>
+          {trend}
           {status && (
             <span className="min-w-0 truncate text-2xs text-muted-foreground" title={status}>
               {status}

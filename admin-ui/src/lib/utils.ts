@@ -410,6 +410,146 @@ export function formatUsd(v: number): string {
   return `$${v.toFixed(2)}`
 }
 
+/**
+ * 缓存命中率：`cached / input`，值域 0–1；算不出来时返回 `null`。
+ *
+ * 分母是**全部输入** token（含缓存命中与缓存写入），不是 total——输出 token 与缓存无关，
+ * 掺进分母只会把命中率稀释。`null` 而不是 0：一条都没跑过时，「没有可谈的缓存率」与
+ * 「命中 0%」是两件事。
+ */
+export function cacheHitRate(
+  inputTokens: number | null | undefined,
+  cachedTokens: number | null | undefined,
+): number | null {
+  if (inputTokens == null || cachedTokens == null || inputTokens <= 0) return null
+  return Math.min(1, Math.max(0, cachedTokens / inputTokens))
+}
+
+/**
+ * 比率（0–1）→ 百分比文本。整数就不带小数（`94%`），带小数时留一位（`96.2%`）。
+ */
+export function formatPercent(rate: number | null): string {
+  if (rate == null) return '—'
+  const pct = rate * 100
+  const rounded = pct >= 99.95 && pct < 100 ? 99.9 : Number(pct.toFixed(1))
+  return `${rounded}%`
+}
+
+/** 趋势图的分桶粒度。 */
+export type CacheGranularity = 'hour' | 'day'
+
+/** 趋势图里的一格。`hasTraffic` 为 false 时这一格没有请求，命中率**不存在**（不是 0）。 */
+export interface CacheSlot {
+  ts: number
+  inputTokens: number
+  cachedTokens: number
+  hasTraffic: boolean
+}
+
+/**
+ * 把后端那串逐小时的点铺成**连续的**若干格。补齐空格、按本地时区合「天」。
+ */
+export function bucketCacheSeries(
+  points: readonly { ts: number; input_tokens: number; cached_tokens: number }[],
+  granularity: CacheGranularity,
+  slots: number,
+  nowMs: number = Date.now(),
+): CacheSlot[] {
+  const localDayStart = (ms: number) => {
+    const d = new Date(ms)
+    d.setHours(0, 0, 0, 0)
+    return d
+  }
+  const starts: number[] = []
+  if (granularity === 'hour') {
+    const last = Math.floor(nowMs / 1000 / 3600) * 3600
+    for (let i = slots - 1; i >= 0; i--) starts.push(last - i * 3600)
+  } else {
+    const cursor = localDayStart(nowMs)
+    cursor.setDate(cursor.getDate() - (slots - 1))
+    for (let i = 0; i < slots; i++) {
+      starts.push(Math.floor(cursor.getTime() / 1000))
+      cursor.setDate(cursor.getDate() + 1)
+    }
+  }
+
+  const out: CacheSlot[] = starts.map((ts) => ({
+    ts,
+    inputTokens: 0,
+    cachedTokens: 0,
+    hasTraffic: false,
+  }))
+  const indexOf = new Map(starts.map((ts, i) => [ts, i]))
+  for (const p of points) {
+    const key =
+      granularity === 'hour'
+        ? Math.floor(p.ts / 3600) * 3600
+        : Math.floor(localDayStart(p.ts * 1000).getTime() / 1000)
+    const i = indexOf.get(key)
+    if (i == null) continue
+    out[i].inputTokens += p.input_tokens
+    out[i].cachedTokens += p.cached_tokens
+    out[i].hasTraffic = true
+  }
+  return out
+}
+
+/** TTFT 趋势图里的一格。 */
+export interface TtftSlot {
+  ts: number
+  avgMs: number
+  count: number
+  hasTraffic: boolean
+}
+
+/** 把后端那串逐小时的 TTFT 点铺成连续的若干格。 */
+export function bucketTtftSeries(
+  points: readonly { ts: number; avg_ms: number; count: number }[],
+  granularity: CacheGranularity,
+  slots: number,
+  nowMs: number = Date.now(),
+): TtftSlot[] {
+  const localDayStart = (ms: number) => {
+    const d = new Date(ms)
+    d.setHours(0, 0, 0, 0)
+    return d
+  }
+  const starts: number[] = []
+  if (granularity === 'hour') {
+    const last = Math.floor(nowMs / 1000 / 3600) * 3600
+    for (let i = slots - 1; i >= 0; i--) starts.push(last - i * 3600)
+  } else {
+    const cursor = localDayStart(nowMs)
+    cursor.setDate(cursor.getDate() - (slots - 1))
+    for (let i = 0; i < slots; i++) {
+      starts.push(Math.floor(cursor.getTime() / 1000))
+      cursor.setDate(cursor.getDate() + 1)
+    }
+  }
+
+  const out: TtftSlot[] = starts.map((ts) => ({
+    ts,
+    avgMs: 0,
+    count: 0,
+    hasTraffic: false,
+  }))
+  const indexOf = new Map(starts.map((ts, i) => [ts, i]))
+  for (const p of points) {
+    const key =
+      granularity === 'hour'
+        ? Math.floor(p.ts / 3600) * 3600
+        : Math.floor(localDayStart(p.ts * 1000).getTime() / 1000)
+    const i = indexOf.get(key)
+    if (i == null) continue
+    const slot = out[i]
+    const prevTotal = slot.avgMs * slot.count
+    slot.count += p.count
+    slot.avgMs = slot.count > 0 ? Math.round((prevTotal + p.avg_ms * p.count) / slot.count) : 0
+    slot.hasTraffic = true
+  }
+  return out
+}
+
 /** Unix 秒时间戳 → 相对指定时钟的「x 前」；传入时钟可让整页状态在同一轮同步更新。 */
 export function relativeTime(
   unixSecs: number,

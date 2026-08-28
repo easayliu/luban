@@ -2358,6 +2358,27 @@ pub struct UsageLogQuery {
 
 /// 一批流水的整体口径：条数、花费合计、以及可作翻页锚点的最大 id。
 ///
+/// 缓存命中率趋势里的一个**小时桶**：`ts` 是这一小时的起点（Unix 秒）。
+///
+/// 回两个原始数，比率由界面算：一个 300 token 的小时里的「命中 0%」与 17K 前缀那种
+/// 小时里的「命中 94%」是两件事，光看比率判断不了。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheBucket {
+    pub ts: i64,
+    /// 全部输入 token（含缓存命中与缓存写入）。
+    pub input_tokens: i64,
+    /// 其中来自缓存的部分（`cache_read_tokens`）。
+    pub cached_tokens: i64,
+}
+
+/// TTFT（首字时延）趋势里的一个**小时桶**。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TtftBucket {
+    pub ts: i64,
+    pub avg_ms: i64,
+    pub count: i64,
+}
+
 /// 与 [`CredentialStore::query_usage_logs`] 走同一套筛选条件，好让「共 N 条」「合计 $X」
 /// 与实际翻得到的记录是同一个集合——分两处各写一份 WHERE 迟早会漂开。
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -2463,7 +2484,7 @@ const WINDOW_5H_SECS: i64 = 5 * 3600;
 const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
 /// 用量日志流水的保留时长：30 天。必须显著大于最长的统计窗口（7 天），
 /// 否则窗口内的流水会被裁掉、cost_7d 平白变小；30 天同时给请求日志页留够翻看余量。
-const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
+pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// RPM（每分钟请求数）的统计窗口：最近 60 秒。
 pub const RPM_WINDOW_SECS: i64 = 60;
 
@@ -2820,6 +2841,59 @@ impl CredentialStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// 缓存命中率趋势的逐小时桶。回两个原始数，比率由前端算——一个 300 token 的小时
+    /// 里的「命中 0%」与 17K 前缀那种小时里的「命中 94%」是两件事，光看比率判断不了。
+    ///
+    /// 这里的 `input_tokens` 是全部输入 token（含缓存命中与缓存写入），
+    /// `cached_tokens` 是其中来自缓存的部分（`cache_read_tokens`）。
+    pub fn cache_series(&self, since: i64) -> Result<Vec<CacheBucket>> {
+        const BUCKET_SECS: i64 = 3600;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT (ts / ?2) * ?2 AS bucket,
+                    SUM(
+                        COALESCE(input_tokens, 0)
+                        + COALESCE(cache_creation_tokens,
+                                   COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))
+                        + COALESCE(cache_read_tokens, 0)
+                    ),
+                    COALESCE(SUM(cache_read_tokens), 0)
+               FROM usage_logs
+              WHERE ts >= ?1
+              GROUP BY bucket
+              HAVING SUM(
+                        COALESCE(input_tokens, 0)
+                        + COALESCE(cache_creation_tokens,
+                                   COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))
+                        + COALESCE(cache_read_tokens, 0)
+                     ) > 0
+              ORDER BY bucket",
+        )?;
+        let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
+            Ok(CacheBucket { ts: r.get(0)?, input_tokens: r.get(1)?, cached_tokens: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// TTFT（首字时延）趋势的逐小时桶。只统计成功（status=200）且有 TTFT 记录的请求。
+    pub fn ttft_series(&self, since: i64) -> Result<Vec<TtftBucket>> {
+        const BUCKET_SECS: i64 = 3600;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT (ts / ?2) * ?2 AS bucket,
+                    CAST(AVG(ttft_ms) AS INTEGER),
+                    COUNT(*)
+               FROM usage_logs
+              WHERE ts >= ?1 AND ttft_ms IS NOT NULL AND status = 200
+              GROUP BY bucket
+              ORDER BY bucket",
+        )?;
+        let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
+            Ok(TtftBucket { ts: r.get(0)?, avg_ms: r.get(1)?, count: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。
