@@ -262,6 +262,9 @@ pub async fn run(
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
+        .route("/credentials/proxy", post(set_proxies))
+        .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
+        .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
         .route("/metrics", get(get_metrics))
         .route("/settings", get(get_settings))
@@ -1003,6 +1006,142 @@ async fn clear_cooldown(
     view_of(&state, id)
 }
 
+// ---------- 代理池 ----------
+
+/// 代理池条目的对外视图，附带使用该代理的凭证数量。
+#[derive(Serialize)]
+struct SavedProxyView {
+    id: i64,
+    label: String,
+    url: String,
+    created_at: u64,
+    credential_count: i64,
+}
+
+/// 列出代理池中所有记录，附带每条代理的使用量。
+async fn list_saved_proxies(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SavedProxyView>>, ApiError> {
+    let proxies = state.store.list_proxies().map_err(internal)?;
+    let counts = state.store.proxy_usage_counts().map_err(internal)?;
+    let views = proxies
+        .into_iter()
+        .map(|p| SavedProxyView {
+            credential_count: counts.get(&p.url).copied().unwrap_or(0),
+            id: p.id,
+            label: p.label,
+            url: p.url,
+            created_at: p.created_at,
+        })
+        .collect();
+    Ok(Json(views))
+}
+
+#[derive(Deserialize)]
+struct AddProxyReq {
+    label: String,
+    url: String,
+}
+
+/// 向代理池中添加一条新记录。
+async fn add_saved_proxy(
+    State(state): State<AppState>,
+    Json(req): Json<AddProxyReq>,
+) -> Result<Json<SavedProxyView>, ApiError> {
+    let label = req.label.trim();
+    if label.is_empty() {
+        return Err(bad_request("the proxy name must not be empty"));
+    }
+    let url =
+        crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
+    let p = state.store.add_proxy(label, &url).map_err(internal)?;
+    tracing::info!(proxy_id = p.id, label = %p.label, url = %p.url, "proxy added to pool");
+    Ok(Json(SavedProxyView {
+        id: p.id,
+        label: p.label,
+        url: p.url,
+        created_at: p.created_at,
+        credential_count: 0,
+    }))
+}
+
+#[derive(Deserialize)]
+struct UpdateProxyReq {
+    label: String,
+    url: String,
+}
+
+/// 更新代理池中一条记录。
+async fn update_saved_proxy(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateProxyReq>,
+) -> Result<Json<SavedProxyView>, ApiError> {
+    let label = req.label.trim();
+    if label.is_empty() {
+        return Err(bad_request("the proxy name must not be empty"));
+    }
+    let url =
+        crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
+    if !state.store.update_proxy(id, label, &url).map_err(internal)? {
+        return Err((StatusCode::NOT_FOUND, "proxy not found".into()));
+    }
+    let p = state
+        .store
+        .get_proxy(id)
+        .map_err(internal)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "proxy not found".to_string()))?;
+    let count =
+        state.store.proxy_usage_counts().map_err(internal)?.get(&p.url).copied().unwrap_or(0);
+    tracing::info!(proxy_id = id, label = %p.label, url = %p.url, "proxy updated in pool");
+    Ok(Json(SavedProxyView {
+        id: p.id,
+        label: p.label,
+        url: p.url,
+        created_at: p.created_at,
+        credential_count: count,
+    }))
+}
+
+/// 从代理池中删除一条记录（不影响已配置该地址的凭证）。
+async fn delete_saved_proxy(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.store.delete_proxy(id).map_err(internal)? {
+        return Err((StatusCode::NOT_FOUND, "proxy not found".into()));
+    }
+    tracing::info!(proxy_id = id, "proxy deleted from pool");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SetProxiesReq {
+    ids: Vec<i64>,
+    proxy: Option<String>,
+}
+
+/// 批量设置出站代理。
+async fn set_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<SetProxiesReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let proxy = match req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            Some(crate::clients::validate_proxy(raw).map_err(|e| bad_request(format!("{e:#}")))?)
+        }
+        None => None,
+    };
+    let n = state.store.set_proxies(&req.ids, proxy.as_deref()).map_err(internal)?;
+    tracing::info!(
+        count = n,
+        proxy = %proxy.as_deref().unwrap_or("<direct>"),
+        "proxy set in bulk"
+    );
+    list_credentials(State(state)).await
+}
+
 /// 读取单条并转为脱敏视图（含已绑定设备数）。
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
@@ -1619,9 +1758,8 @@ async fn set_forwarding(
 struct ModelCooldown {
     model: String,
     secs: i64,
-    /// 这条冷却是否**挡着选号**。`true` 是额度池满那档（该模型确实不参与选号）；`false` 是
-    /// 瞬时限速那档（只是个标记，该模型照常参与选号），见
-    /// `crate::store::CredentialStore::mark_rate_limited_soft`。
+    /// 这条冷却是否**挡着选号**。现在额度池满和瞬时限速两档都走门禁（总为 `true`），
+    /// 区别在于持续时间：瞬时限速从 2s 起步（ladder 退避），远短于额度池满那一档。
     gated: bool,
 }
 

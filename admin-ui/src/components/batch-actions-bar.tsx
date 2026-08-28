@@ -1,10 +1,11 @@
-import { useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ChevronDownIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
-  deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities, setRpmLimits,
+  deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities, setProxies, setRpmLimits,
   type Credential,
 } from '@/api/credentials'
+import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError } from '@/lib/utils'
 import {
@@ -16,6 +17,7 @@ import {
   Card,
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
 import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement,
   NumberFieldInput,
@@ -57,8 +59,24 @@ export function BatchActionsBar({
   const [customLimit, setCustomLimit] = useState(1)
   const [rpmMode, setRpmMode] = useState<'default' | 'unlimited' | 'custom'>('default')
   const [customRpm, setCustomRpm] = useState(60)
+  const [proxyMode, setProxyMode] = useState<'direct' | 'pool' | 'custom'>('direct')
+  const [selectedProxyUrl, setSelectedProxyUrl] = useState('')
+  const [customProxyUrl, setCustomProxyUrl] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+
+  const proxiesQuery = useQuery({
+    queryKey: ['proxies'],
+    queryFn: listProxies,
+    enabled: advancedOpen,
+  })
+  const savedProxies = proxiesQuery.data ?? []
+
+  useEffect(() => {
+    if (savedProxies.length > 0 && !selectedProxyUrl) {
+      setSelectedProxyUrl(savedProxies[0].url)
+    }
+  }, [savedProxies, selectedProxyUrl])
 
   const ids = [...selected]
   const n = selected.size
@@ -130,6 +148,22 @@ export function BatchActionsBar({
       ),
     onError,
   })
+  const applyProxy = useMutation({
+    mutationFn: (url: string | null) => setProxies(ids, url),
+    onSuccess: (_r, url) =>
+      notify(
+        url
+          ? t(
+            `已把 ${formattedCount} 个账号的出站代理设为所选地址`,
+            `Set the outbound proxy for ${englishAccountCount}`,
+          )
+          : t(
+            `已把 ${formattedCount} 个账号改回直连`,
+            `Set ${englishAccountCount} to direct connection`,
+          ),
+      ),
+    onError,
+  })
   const applyDisabled = useMutation({
     mutationFn: (d: boolean) => setDisabledMany(ids, d),
     onSuccess: (_r, d) => notify(t(
@@ -150,10 +184,16 @@ export function BatchActionsBar({
 
   const busy =
     applyPriority.isPending || applyLimit.isPending || applyRpmLimit.isPending ||
-    applyDisabled.isPending || applyDelete.isPending
+    applyProxy.isPending || applyDisabled.isPending || applyDelete.isPending
   const allSelected = all.length > 0 && all.every((item) => selected.has(item.id))
   const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
   const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customRpm))
+  const proxyUrl = proxyMode === 'direct' ? null : proxyMode === 'pool' ? selectedProxyUrl : customProxyUrl.trim()
+  const proxyModeItems = [
+    { value: 'direct', label: t('直连', 'Direct') },
+    ...(savedProxies.length > 0 ? [{ value: 'pool', label: t('从代理池选', 'From pool') }] : []),
+    { value: 'custom', label: t('自定义地址', 'Custom URL') },
+  ]
 
   return (
     <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-xl">
@@ -276,6 +316,58 @@ export function BatchActionsBar({
                 </NumberField>
               )}
               <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
+                {t('应用', 'Apply')}
+              </Button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 lg:col-span-2 lg:border-t lg:pt-3">
+              <div className="mr-auto min-w-28">
+                <div className="flex items-center gap-1.5 text-xs font-medium">
+                  <GlobeIcon className="size-3.5" />
+                  {t('出站代理', 'Outbound proxy')}
+                </div>
+                <div className="text-xs text-muted-foreground">{t('统一设置出站代理或改回直连', 'Set outbound proxy or switch to direct')}</div>
+              </div>
+              <Select items={proxyModeItems} value={proxyMode} onValueChange={(value) => value && setProxyMode(value as typeof proxyMode)}>
+                <SelectTrigger aria-label={t('批量设置出站代理策略', 'Set outbound proxy policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectPopup>
+                  {proxyModeItems.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {proxyMode === 'pool' && savedProxies.length > 0 && (
+                <Select
+                  items={savedProxies.map((p) => ({ value: p.url, label: p.label }))}
+                  value={selectedProxyUrl}
+                  onValueChange={(value) => value && setSelectedProxyUrl(value)}
+                >
+                  <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="min-w-32"><SelectValue /></SelectTrigger>
+                  <SelectPopup>
+                    {savedProxies.map((p) => (
+                      <SelectItem key={p.id} value={p.url}>{p.label}</SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+              )}
+              {proxyMode === 'custom' && (
+                <Input
+                  value={customProxyUrl}
+                  onChange={(event) => setCustomProxyUrl(event.target.value)}
+                  placeholder="socks5://127.0.0.1:1080"
+                  spellCheck={false}
+                  autoComplete="off"
+                  size="sm"
+                  className="min-w-40 max-w-64"
+                  aria-label={t('自定义代理地址', 'Custom proxy URL')}
+                />
+              )}
+              <Button
+                size="sm"
+                loading={applyProxy.isPending}
+                disabled={busy || (proxyMode === 'custom' && !customProxyUrl.trim()) || (proxyMode === 'pool' && !selectedProxyUrl)}
+                onClick={() => applyProxy.mutate(proxyUrl || null)}
+              >
                 {t('应用', 'Apply')}
               </Button>
             </div>

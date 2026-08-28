@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
+import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -84,6 +85,13 @@ export function AddAccount({
       type: 'error',
     }),
   })
+
+  const proxiesQuery = useQuery({
+    queryKey: ['proxies'],
+    queryFn: listProxies,
+    enabled: open,
+  })
+  const savedProxies = proxiesQuery.data ?? []
 
   const busy = authorize.isPending || exchange.isPending
 
@@ -213,6 +221,32 @@ export function AddAccount({
                 <FieldLabel htmlFor="account-proxy">
                   {t('出站代理（可选）', 'Outbound proxy (optional)')}
                 </FieldLabel>
+                {savedProxies.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {savedProxies.map((p) => (
+                      <Button
+                        key={p.id}
+                        type="button"
+                        size="sm"
+                        variant={proxy.trim() === p.url ? 'secondary' : 'outline'}
+                        onClick={() => setProxy(p.url)}
+                        title={p.url}
+                      >
+                        {p.label}
+                      </Button>
+                    ))}
+                    {proxy.trim() && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setProxy('')}
+                      >
+                        {t('清除', 'Clear')}
+                      </Button>
+                    )}
+                  </div>
+                )}
                 <Input
                   id="account-proxy"
                   name="proxy"

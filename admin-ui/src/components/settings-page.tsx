@@ -3,6 +3,7 @@ import {
   ArrowLeftIcon,
   ArrowRightLeftIcon,
   CableIcon,
+  GlobeIcon,
   LockKeyholeIcon,
   SlidersHorizontalIcon,
   SmartphoneIcon,
@@ -15,6 +16,7 @@ import {
 import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
 import { MigrationSettingsContent } from '@/components/migration-settings'
+import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
@@ -30,7 +32,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 
-export type SettingsSection = 'access' | 'devices' | 'forwarding' | 'security' | 'migration'
+export type SettingsSection = 'access' | 'devices' | 'proxies' | 'forwarding' | 'security' | 'migration'
 
 export function SettingsPage({
   section,
@@ -62,6 +64,16 @@ export function SettingsPage({
       ),
       navDescription: t('绑定、容量与身份校验', 'Bindings, capacity, and identity'),
       icon: SmartphoneIcon,
+    },
+    {
+      key: 'proxies',
+      label: t('代理池', 'Proxy pool'),
+      description: t(
+        '集中管理可复用的出站代理地址，方便快速分配给账号。',
+        'Manage reusable outbound proxy addresses for quick assignment to accounts.',
+      ),
+      navDescription: t('出站代理地址管理', 'Outbound proxy management'),
+      icon: GlobeIcon,
     },
     {
       key: 'forwarding',
@@ -246,6 +258,9 @@ export function SettingsPage({
               </TabsPanel>
               <TabsPanel className="min-w-0" value="devices">
                 {section === 'devices' && <DeviceSettingsContent />}
+              </TabsPanel>
+              <TabsPanel className="min-w-0" value="proxies">
+                {section === 'proxies' && <ProxyPoolSettingsContent />}
               </TabsPanel>
               <TabsPanel className="min-w-0" value="forwarding">
                 {section === 'forwarding' && <ForwardingSettingsContent />}

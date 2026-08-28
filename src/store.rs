@@ -335,7 +335,6 @@ struct RateLimitCooldown {
 #[derive(Default, Clone, Copy)]
 struct Cooling {
     gate: Option<Instant>,
-    soft: Option<Instant>,
 }
 
 impl Cooling {
@@ -344,21 +343,19 @@ impl Cooling {
         self.gate.is_some_and(|t| t > now)
     }
 
-    /// 此刻是否还有任何未到期的冷却（含只用于展示的那条）；为假即可以把这一格清掉。
+    /// 此刻是否还有未到期的冷却；为假即可以把这一格清掉。
     fn live(&self, now: Instant) -> bool {
-        self.gating(now) || self.soft.is_some_and(|t| t > now)
+        self.gating(now)
     }
 
     fn secs_until(deadline: Option<Instant>, now: Instant) -> i64 {
         deadline.filter(|t| *t > now).map(|t| t.duration_since(now).as_secs() as i64).unwrap_or(0)
     }
 
-    /// 展示用的剩余秒数：两条时间线取较晚的那个。
     fn remaining(&self, now: Instant) -> i64 {
-        Self::secs_until(self.gate, now).max(Self::secs_until(self.soft, now))
+        Self::secs_until(self.gate, now)
     }
 
-    /// 门禁的剩余秒数——`retry-after` 只能按它算，soft 那条压根不挡人。
     fn gate_remaining(&self, now: Instant) -> i64 {
         Self::secs_until(self.gate, now)
     }
@@ -366,24 +363,13 @@ impl Cooling {
 
 impl RateLimitCooldown {
     /// 打上**参与选号门禁**的冷却。`model` 为 `None` 即账号级（所有模型）。
-    fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
-        self.write(cred_id, model, dur, false)
-    }
-
-    /// 打上**只用于展示**的冷却，见 [`Cooling::soft`]：卡片上看得见「这个号刚被限速」，
-    /// 但它照常参与选号。
-    fn mark_soft(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
-        self.write(cred_id, model, dur, true)
-    }
-
     /// 同一条时间线重复命中时取**较晚**的那个结束时刻，不让新的短冷却缩短旧的长冷却。
-    fn write(&self, cred_id: i64, model: Option<&str>, dur: Duration, soft: bool) {
+    fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
         let deadline = Instant::now() + dur;
         let mut until = self.until.lock();
         let slot = until.entry((cred_id, model.unwrap_or_default().to_string())).or_default();
-        let line = if soft { &mut slot.soft } else { &mut slot.gate };
-        if line.is_none_or(|t| t < deadline) {
-            *line = Some(deadline);
+        if slot.gate.is_none_or(|t| t < deadline) {
+            slot.gate = Some(deadline);
         }
     }
 
@@ -482,6 +468,15 @@ impl RateLimitCooldown {
 ///   而设备绑定压根是「哪台机器绑在哪个号上」的本机状态，换台机器毫无意义；
 /// - 管理密码：见 [`CredentialStore::settings_snapshot`]。
 ///
+/// 代理池中的一条记录。
+#[derive(serde::Serialize, Clone)]
+pub struct SavedProxy {
+    pub id: i64,
+    pub label: String,
+    pub url: String,
+    pub created_at: u64,
+}
+
 /// 全字段都给了 `#[serde(default)]`：迁移文件是会被人手改的（删掉几个号、改个优先级），
 /// 少一个字段就整份导入失败太脆。缺 `expires_at` 退化成 0，即「已过期」——首次使用时用
 /// refresh_token 换一份新的，正是想要的行为。
@@ -1094,6 +1089,127 @@ impl CredentialStore {
         Ok(n)
     }
 
+    // ---------- 代理池 ----------
+
+    /// 列出代理池中所有记录。
+    pub fn list_proxies(&self) -> Result<Vec<SavedProxy>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, label, url, created_at FROM proxies ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SavedProxy {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                url: row.get(2)?,
+                created_at: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 读取代理池中的单条记录。
+    pub fn get_proxy(&self, id: i64) -> Result<Option<SavedProxy>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, label, url, created_at FROM proxies WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(SavedProxy {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    url: row.get(2)?,
+                    created_at: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other.into()),
+        })
+    }
+
+    /// 添加一条代理到池中，返回新记录。`url` 应已经过 `crate::clients::validate_proxy` 校验。
+    pub fn add_proxy(&self, label: &str, url: &str) -> Result<SavedProxy> {
+        let conn = self.conn.lock();
+        conn.execute("INSERT INTO proxies (label, url) VALUES (?1, ?2)", params![label, url])
+            .context("failed to add proxy (the URL may already exist in the pool)")?;
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            "SELECT id, label, url, created_at FROM proxies WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(SavedProxy {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    url: row.get(2)?,
+                    created_at: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .context("failed to read the newly inserted proxy")
+    }
+
+    /// 更新代理池中一条记录的名称和/或地址。
+    pub fn update_proxy(&self, id: i64, label: &str, url: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE proxies SET label = ?2, url = ?3 WHERE id = ?1",
+            params![id, label, url],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 从池中删除一条代理（不影响已配置该代理的凭证）。
+    pub fn delete_proxy(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM proxies WHERE id = ?1", [id])?;
+        Ok(n > 0)
+    }
+
+    /// 统计每个代理地址有多少凭证在使用。键是代理 URL，值是使用该 URL 的凭证数量。
+    pub fn proxy_usage_counts(&self) -> Result<HashMap<String, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT proxy, COUNT(*) FROM credentials \
+             WHERE proxy IS NOT NULL AND proxy != '' GROUP BY proxy",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (url, count) = r?;
+            out.insert(url, count);
+        }
+        Ok(out)
+    }
+
+    /// 批量设置出站代理：把 `ids` 里的账号统一改到 `proxy`（`None` 或空串改回直连）。
+    /// 单事务内完成。
+    pub fn set_proxies(&self, ids: &[i64], proxy: Option<&str>) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let proxy = proxy.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET proxy = ?2, updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, proxy])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// 设置该账号每分钟最多转发多少条请求。三态同设备上限：`> 0` 本账号独立上限；
     /// `0` 跟随全局默认（见 [`DEFAULT_RPM_LIMIT`]）；`< 0` 本账号明确不限。
     ///
@@ -1190,15 +1306,6 @@ impl CredentialStore {
         self.cooldown.mark(cred_id, model, dur);
     }
 
-    /// 打上**只用于展示**的限流标记：卡片上看得见，但这个号照常参与选号。
-    ///
-    /// 专供瞬时限流那一档（容量 / 请求速率，见 `proxy::LimitScope::Transient`）。那种 429
-    /// 不是这个号的问题，用门禁挡它等于把上游对**出口或模型**的限速，翻译成对**整池账号**
-    /// 的封锁——见 [`Cooling`] 里的说明。
-    pub fn mark_rate_limited_soft(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
-        self.cooldown.mark_soft(cred_id, model, dur);
-    }
-
     /// 该凭证**账号级**冷却的剩余秒数（未冷却为 0）。见 [`RateLimitCooldown::remaining_secs`]，
     /// 注意正常路径上账号级限流走的是落库的 `resume_at`，这一档只反映落库失败的兜底状态。
     pub fn rate_limited_secs(&self, cred_id: i64) -> i64 {
@@ -1207,10 +1314,9 @@ impl CredentialStore {
 
     /// 该凭证**模型级**冷却的明细 `(模型名, 剩余秒数, 是否挡选号)`，未冷却为空。
     ///
-    /// 这一档都不影响账号整体调度：其余模型照常可用，见 [`RateLimitCooldown`]。第三项进一步
-    /// 区分同为「模型级」的两种：`true` 是额度池满，这个模型确实被挡在选号之外；`false` 是
-    /// 瞬时限速，只是个标记，该模型照常参与选号。界面上必须分开说，否则「冷却中」会把一个
-    /// 仍在服务的账号显示成停摆。
+    /// 这一档都不影响账号整体调度：其余模型照常可用，见 [`RateLimitCooldown`]。第三项（gated）
+    /// 现在总为 `true`——额度池满和瞬时限速两档都走门禁，区别在于持续时间：瞬时限速的 gate
+    /// 从 2s 起步（ladder 退避），远短于额度池满那一档。
     pub fn rate_limited_models(&self, cred_id: i64) -> Vec<(String, i64, bool)> {
         self.cooldown.model_remaining(cred_id)
     }
@@ -2871,7 +2977,16 @@ fn init_schema(conn: &Connection) -> Result<()> {
             -- （它们不写绑定，见 crate::proxy::sim_device_id）。
             request_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (device_id, cred_id)
-        ) STRICT, WITHOUT ROWID;",
+        ) STRICT, WITHOUT ROWID;
+
+        -- 代理池：可复用的出站代理地址，供逐账号代理从中选取。
+        CREATE TABLE IF NOT EXISTS proxies (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            label      TEXT    NOT NULL DEFAULT '',
+            url        TEXT    NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_proxies_url ON proxies(url);",
     )
     .context("failed to initialize credential database schema")?;
 
@@ -4773,46 +4888,35 @@ mod tests {
         assert_eq!(pick("claude-fable-5"), a, "手动解除后所有模型都该回来");
     }
 
-    /// 「一个号被限速，客户端多重试几次就把整池点掉」那条线上问题的**后半截**回归测试。
+    /// 瞬时限速（容量 / 请求速率）也走选号门禁，gate 时长由 ladder 退避值决定（起步 2s）。
     ///
-    /// 前半截（一条请求内换号重试盖满整池）由 `proxy::LimitScope::Transient` 挡住了，但冷却
-    /// 本身是选号硬门禁，跨请求那条路还开着：撞上的号被挡掉，设备就在下一条请求上改绑到另一个
-    /// 号，客户端每重试一次点掉一个，转够一圈全池的这个模型都在冷却，新请求一条都进不来。
-    /// 故瞬时限速这一档改成**只记不挡**——见 [`CredentialStore::mark_rate_limited_soft`]。
+    /// 与额度池满那档的区别只在持续时间：瞬时 gate 很短，避免同一个号被反复轰出 429；
+    /// 但不至于像 30s/60s 门禁那样让整池级联封死——ladder 每个号独立从 2s 起步，交错过期。
     #[test]
-    fn a_transient_rate_limit_is_recorded_but_never_gates_selection() {
+    fn transient_rate_limit_gates_selection_with_short_cooldown() {
         let (store, ids) = store_with(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
         let pick = |model| {
             store.select_for_device(Select { model: Some(model), ..Default::default() }).unwrap().id
         };
 
-        store.mark_rate_limited_soft(a, Some("claude-opus-5"), Duration::from_secs(30));
-        assert_eq!(pick("claude-opus-5"), a, "瞬时限速不该把这个号挡在选号之外");
-        assert_eq!(store.rate_limited_secs(a), 0, "更不该冒充账号级限流");
+        // 瞬时限速走 gate：被标记的号不参与选号。
+        store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(2));
+        assert_eq!(pick("claude-opus-5"), b, "瞬时限速的短 gate 也应挡住选号");
+        assert_eq!(store.rate_limited_secs(a), 0, "不该冒充账号级限流");
 
-        // 但界面上要看得见，且要能和「真的被挡住了」区分开。
         let models = store.rate_limited_models(a);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].0, "claude-opus-5");
-        assert!(!models[0].2, "瞬时限速那条不挡选号，gated 必须是 false");
+        assert!(models[0].2, "瞬时限速现在也走 gate，gated 应为 true");
 
-        // 把整池都打上瞬时限速：选号照常给得出号，绝不能退化成 AllRateLimited。
-        store.mark_rate_limited_soft(b, Some("claude-opus-5"), Duration::from_secs(30));
-        assert!(
-            store
-                .select_for_device(Select { model: Some("claude-opus-5"), ..Default::default() })
-                .is_ok(),
-            "全池都被瞬时限速过也必须还能选出号——挡下来才是那条线上问题本身"
-        );
-
-        // 额度那档照旧硬挡，两条时间线互不干扰：同一格上叠一个门禁，立刻让位。
+        // 额度那档叠上去：长 gate 覆盖短 gate（取较晚的截止时刻）。
         store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(300));
         assert_eq!(pick("claude-opus-5"), b, "额度池满那档仍是硬门禁");
         let models = store.rate_limited_models(a);
         assert_eq!(models.len(), 1, "同一个模型只该出现一行");
         assert!(models[0].2, "此刻挂着门禁，gated 应为 true");
-        assert!(models[0].1 > 290, "展示的剩余时间取两条线里较晚的那个：{models:?}");
+        assert!(models[0].1 > 290, "展示的剩余时间应反映较长的那个门禁：{models:?}");
     }
 
     /// 账号级限流把调度开关**落库关掉**，到点惰性自动打开；人工关的号不会被自动打开。

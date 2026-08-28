@@ -627,7 +627,7 @@ pub async fn handle(
             if let Ok(up) = &mut resp {
                 up.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(cooldown.as_secs()));
             }
-            // 吞够了单独记一行：这一发和前面那些「只记不挡」不是一回事，后续请求从这一刻起
+            // 吞够了单独记一行：这一发之后 gate 时间从短退避升级为完整冷却，后续请求从这一刻起
             // 会绕开这个号，日志上得看得出转折点在哪。
             if transient_exhausted {
                 tracing::warn!(
@@ -5067,16 +5067,16 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
 ///   [`store::CredentialStore::mark_rate_limited`]，挡住这个号的这一个模型。这一档默认才
 ///   30 秒，落库既不值得、也会在卡片上把一个健康账号显示成「已停用」——它的 sonnet/opus
 ///   明明还在正常服务。
-/// - **瞬时级**（容量与请求速率限制）：走
-///   [`store::CredentialStore::mark_rate_limited_soft`]，**只记不挡**。落点与上一档相同
-///   （都是 `(账号, 模型)` 那一格），但走的是另一条时间线，不参与选号，理由见下面那段注释与
-///   [`LimitScope::Transient`]。
+/// - **瞬时级**（容量与请求速率限制）：同样走
+///   [`store::CredentialStore::mark_rate_limited`]，但 cooldown 用 ladder 退避值（2s 起步），
+///   远短于额度那一档。短 gate 阻止同一个号被立刻再选中、反复打出 429，同时因为持续时间短，
+///   不会像长 gate 那样级联封死整池。
 fn park_rate_limited(
     store: &store::CredentialStore,
     cred: &crate::credentials::Credential,
     scope: &LimitScope,
     cooldown: std::time::Duration,
-    // 瞬时限流已经在这条路线上连撞到 [`TRANSIENT_MAX_ATTEMPTS`]：这一发不再「只记不挡」，
+    // 瞬时限流已经在这条路线上连撞到 [`TRANSIENT_MAX_ATTEMPTS`]：升级为完整冷却，
     // 照常挪出调度池，让后续请求改走别的号。
     transient_exhausted: bool,
 ) {
@@ -5104,20 +5104,19 @@ fn park_rate_limited(
         }
         return;
     };
-    // 瞬时限流（容量 / 请求速率）**不进选号门禁**，只留个展示用的标记。
+    // 瞬时限流（容量 / 请求速率）：用 ladder 退避值做**短时硬门禁**。
     //
-    // 这是那条线上问题的后半截。前半截（一条请求内换号重试把冷却盖满整池）在
-    // [`LimitScope::Transient`] 那里堵住了，但冷却本身是选号硬门禁，跨请求那条路还开着：
-    // 撞上的号被挡掉之后，设备会在下一条请求上改绑到另一个号，客户端每重试一次就点掉一个号，
-    // 转够一圈全池的这个模型都在冷却，新请求一条都进不来（返回 `AllRateLimited`）。
-    // 而这一档的 429 压根不是这个号的问题——上游限的是出口或那个模型，换谁上去都一样。
-    // 拿它挡调度，等于把上游对**一个出口**的限速翻译成对**整池账号**的封锁。
+    // 之前这一档只打 soft mark（不阻塞调度），理由是「上游限的是出口，换谁都一样，不该封号」。
+    // 问题是：soft mark 不拦选号，新请求立刻又选到同一个号 → 上游容量还没恢复 → 再次 429，
+    // 形成无意义的循环轰炸。
     //
-    // 正解仍是把 429 连同 `retry-after` 交回客户端，让它按上游给的节奏退避（这一步在
-    // [`handle`] 里已经做了）。这个号照常留在池子里：客户端真立刻重试，最坏也只是同一个号
-    // 再回一发 429，不会牵连别人。
+    // 改成 gate：cooldown 已经是 max(upstream retry-after, ladder) 的较大值，ladder 从 2s 起步
+    // （2→4→8→16→32→60s），短到不会把整池封死——全池级联需要所有号同时在 gate，而 2s 的窗口
+    // 在客户端按 retry-after 退避的周期内早就放开了。跨请求的设备改绑确实会让其他号各自独立
+    // 起一把 ladder，但每个号的第一档都只 gate 2s，交错过期，同时压满的概率极低。
+    // 真连撞到 TRANSIENT_MAX_ATTEMPTS 档就升级为完整冷却（下面那条路），逻辑闭环。
     if matches!(scope, LimitScope::Transient(_)) && !transient_exhausted {
-        store.mark_rate_limited_soft(cred.id, Some(model), cooldown);
+        store.mark_rate_limited(cred.id, Some(model), cooldown);
         return;
     }
     store.mark_rate_limited(cred.id, Some(model), cooldown);
@@ -9504,14 +9503,14 @@ mod tests {
             store.select_for_device(store::Select { model: Some(m), ..Default::default() }).is_ok()
         };
 
-        // 没吞够：只记不挡——这一档的 429 不是这个号的问题，挡住它只会把限速扩散到整池。
+        // 没 exhaust：短 gate——阻止同一个号被立刻再选中，避免反复 429。
         super::park_rate_limited(&store, &cred, &scope, wait, false);
-        assert!(pick("claude-opus-5"), "还没到上限，这个号必须照常参与选号");
+        assert!(!pick("claude-opus-5"), "短 gate 也应阻止选号");
         let models = store.rate_limited_models(cred.id);
-        assert_eq!(models.len(), 1, "但界面上要看得见");
-        assert!(!models[0].2, "这一档不挡选号，gated 应为 false");
+        assert_eq!(models.len(), 1, "界面上要看得见");
+        assert!(models[0].2, "瞬时限速现在也走 gate，gated 应为 true");
 
-        // 吞够了：退避已经涨到头还在撞，说明这条路线此刻真的走不通，让后续请求改走别的号。
+        // exhaust：退避已经涨到头还在撞，说明这条路线此刻真的走不通，让后续请求改走别的号。
         super::park_rate_limited(&store, &cred, &scope, wait, true);
         assert!(!pick("claude-opus-5"), "到上限后这个模型必须被挡下");
         assert!(pick("claude-sonnet-5"), "但只挡这一个模型，别的模型不该被牵连");

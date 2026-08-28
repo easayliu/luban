@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { GlobeIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
+import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { displayCredentialLabel } from '@/lib/utils'
 import { type CredentialActions } from '@/components/credential-shared'
@@ -19,13 +21,6 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
-/**
- * 逐账号出站代理的编辑框。
- *
- * 清空输入框即改回直连——不额外做一个「清除」按钮：一个输入框两种语义，比两个入口更难
- * 点错。校验一律交给后端（[`crate::clients::validate_proxy`]），这里只负责把失败原文
- * 呈上来，免得前后端各写一套判据、哪天两边漂开。
- */
 export function CredentialProxyDialog({
   cred,
   open,
@@ -41,11 +36,16 @@ export function CredentialProxyDialog({
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [value, setValue] = useState(cred.proxy ?? '')
 
-  // 每次打开都从服务端那份重置：上一次输了一半没保存就关掉的残留，下次打开还留着的话
-  // 会让人以为它已经生效了。
   useEffect(() => {
     if (open) setValue(cred.proxy ?? '')
   }, [open, cred.proxy])
+
+  const proxiesQuery = useQuery({
+    queryKey: ['proxies'],
+    queryFn: listProxies,
+    enabled: open,
+  })
+  const savedProxies = proxiesQuery.data ?? []
 
   const trimmed = value.trim()
   const current = cred.proxy ?? ''
@@ -55,6 +55,10 @@ export function CredentialProxyDialog({
     proxy.mutate(trimmed === '' ? null : trimmed, {
       onSuccess: () => onOpenChange(false),
     })
+  }
+
+  const pickProxy = (url: string) => {
+    setValue(url)
   }
 
   return (
@@ -68,6 +72,26 @@ export function CredentialProxyDialog({
         </DialogHeader>
 
         <DialogPanel className="space-y-4">
+          {savedProxies.length > 0 && (
+            <div className="space-y-2">
+              <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
+              <div className="flex flex-wrap gap-1.5">
+                {savedProxies.map((p) => (
+                  <Button
+                    key={p.id}
+                    type="button"
+                    size="sm"
+                    variant={trimmed === p.url ? 'secondary' : 'outline'}
+                    onClick={() => pickProxy(p.url)}
+                    title={p.url}
+                  >
+                    {p.label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="space-y-2">
             <Label htmlFor="cred-proxy">{t('代理地址', 'Proxy URL')}</Label>
             <Input

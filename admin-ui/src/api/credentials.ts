@@ -350,6 +350,12 @@ export async function deleteCredentials(ids: number[]): Promise<Credential[]> {
   return data
 }
 
+/** 批量设置出站代理；传 null 或空串改回直连。 */
+export async function setProxies(ids: number[], proxy: string | null): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/proxy', { ids, proxy })
+  return data
+}
+
 /** 重命名。 */
 export async function setLabel(id: number, label: string): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/label`, { label })
