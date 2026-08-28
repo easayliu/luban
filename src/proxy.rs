@@ -3986,6 +3986,10 @@ fn rewrite_body(
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
+    // 模拟路径下客户端没发 `thinking` 时补上官方默认值。官方 CC 恒带
+    // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
+    // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
+    let thinking_filled = sim.is_some() && ensure_thinking(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
@@ -4046,6 +4050,7 @@ fn rewrite_body(
         capped,
         spoofed,
         cch_added,
+        thinking_filled,
         ctx_mgmt,
         msg_shape,
         ttl_filled,
@@ -4065,6 +4070,7 @@ fn rewrite_body(
         && !cch_added
         && !simulated
         && !sim_meta
+        && !thinking_filled
         && !ctx_mgmt
         && !msg_shape
         && !ttl_filled
@@ -4344,6 +4350,43 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
 /// 3. thinking token 按输出计费，等于未经同意加钱。
 ///
 /// 故只在客户端**自己已经开着** thinking 时才补，其余情形一个字节都不动。
+///
+/// **注意**：模拟路径下 [`ensure_thinking`] 会先补上 `thinking`，然后本函数就能自然补上
+/// `context_management`，两者配合才完整。
+
+/// 模拟路径下补 `thinking`：官方 CC 恒带 `thinking: {type: "enabled", budget_tokens: N}`。
+///
+/// `budget_tokens` 取 `max_tokens - 1`（官方实测规律：haiku `max_tokens: 32000` →
+/// `budget_tokens: 31999`，sonnet/opus 类似）。
+///
+/// 三种情况不补：
+/// - 客户端自己带了 `thinking`（`disabled`/`null`/`enabled` 都算——那是它自己的选择）；
+/// - `max_tokens` 太小（< 1024）：thinking 本身要消耗 token 预算，探测级请求不值得加。
+const THINKING_MIN_MAX_TOKENS: u64 = 1024;
+
+fn ensure_thinking(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    if obj.contains_key("thinking") {
+        return false;
+    }
+    let max_tokens = obj.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(32000);
+    if max_tokens < THINKING_MIN_MAX_TOKENS {
+        return false;
+    }
+    let budget = max_tokens.saturating_sub(1).max(1);
+    let value = serde_json::json!({
+        "type": "enabled",
+        "budget_tokens": budget,
+    });
+    insert_top_level(
+        v,
+        "thinking",
+        value,
+        &["max_tokens", "metadata", "tools", "system", "messages", "model"],
+    );
+    true
+}
+
 fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
@@ -8313,6 +8356,8 @@ mod tests {
                 "tools",
                 "metadata",
                 "max_tokens",
+                "thinking",
+                "context_management",
                 "output_config",
                 "stream",
             ],
@@ -8387,14 +8432,18 @@ mod tests {
         let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         assert!(String::from_utf8(out.to_vec()).unwrap().contains(OFFICIAL), "enabled 也该补");
 
-        // 没开 thinking 的三种写法都不补——补了上游直接 400。
+        // 没开 thinking 的几种写法都不补——补了上游直接 400。
+        // max_tokens 低于阈值时也不补（探测级请求不值得加 thinking）。
         for body in [
-            PLAIN_BODY.to_string(),
+            // max_tokens 太小，不注入 thinking
+            r#"{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#.to_string(),
+            // thinking 显式 disabled
             concat!(
                 r#"{"model":"claude-opus-5","max_tokens":16,"#,
                 r#""messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#
             )
             .to_string(),
+            // thinking 显式 null
             concat!(
                 r#"{"model":"claude-opus-5","max_tokens":16,"#,
                 r#""messages":[{"role":"user","content":"hi"}],"thinking":null}"#
