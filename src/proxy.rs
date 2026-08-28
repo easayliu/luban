@@ -4030,6 +4030,10 @@ fn rewrite_body(
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered = sim.is_some() && align_cc_top_level_order(&mut v);
+    // 模拟路径且工具列表里没有任何 CC 官方工具名时，注入核心 CC 工具声明（Bash/Read/Edit/Write）。
+    // 上游判第三方的信号之一是「自称 CC 但没有 CC 工具」，光加 mcp__ 前缀不够——
+    // 零个 CC 工具等于自证不是 CC。注入的工具在白名单内，混淆不会动它们。
+    let cc_tools_injected = sim.is_some() && inject_cc_tools(&mut v);
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
     // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
     let tools_deduped = dedup_tools(&mut v);
@@ -4048,6 +4052,7 @@ fn rewrite_body(
         streamed,
         stripped,
         top_level_ordered,
+        cc_tools_injected,
         tools_deduped,
         tools_mimicked,
         device_fp = %device_fp,
@@ -4066,6 +4071,7 @@ fn rewrite_body(
         && !streamed
         && !stripped
         && !top_level_ordered
+        && !cc_tools_injected
         && !tools_deduped
         && !tools_mimicked
     {
@@ -4741,6 +4747,47 @@ fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> 
     }
     reverse.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
     Some(ToolNameMap { forward, reverse, max_fake })
+}
+
+/// 模拟路径下的 CC 核心工具声明（Bash/Read/Edit/Write）。
+/// 逐字节取自 `cap/raw/00006`（opus-5 直连）。
+///
+/// **为什么要注入**：上游判第三方的信号之一是「自称 CC 但没有 CC 工具」。光把客户端自有
+/// 工具名加 `mcp__` 前缀不够——那只是消去负面信号（被 blocklist 的名字），而正面信号
+/// （至少存在几个 CC 官方工具声明）仍然缺失。注入这四个工具让请求的工具组合看起来是
+/// 「CC 核心 + MCP 扩展」，与真实 CC 接 MCP server 的形态一致。
+///
+/// **模型会不会调这些工具**：概率很低。客户端的 system prompt 会指名自己的工具
+/// （被混淆成 `mcp__luban__*`），模型优先响应 system 的指令。万一调了，客户端收到一个
+/// 自己没声明的 tool_use，按协议返回错误 tool_result 即可，不影响会话继续。
+static CC_TOOLS_CORE: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("assets/cc_tools_core.json"))
+            .expect("cc_tools_core.json must be a valid JSON array of tool objects")
+    });
+
+/// 如果 `tools` 里没有任何 CC 官方工具名，把 [`CC_TOOLS_CORE`] 注入到数组头部。
+/// 已有 CC 工具的请求不注入（真 CC 客户端或已经抄了 CC 声明的中转）。
+fn inject_cc_tools(v: &mut serde_json::Value) -> bool {
+    if has_cc_tool_profile(v) {
+        return false;
+    }
+    let tools = match v.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        Some(t) => t,
+        None => return false,
+    };
+    let mut injected = 0usize;
+    for stub in CC_TOOLS_CORE.iter().rev() {
+        let name = stub.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        if !tools.iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)) {
+            tools.insert(0, stub.clone());
+            injected += 1;
+        }
+    }
+    if injected > 0 {
+        tracing::info!(injected, "injected CC core tool stubs for simulation");
+    }
+    injected > 0
 }
 
 /// `tools` 数组按 `name` 去重：保留每个名字的首次出现，丢弃后续重复声明。
@@ -8272,9 +8319,17 @@ mod tests {
             "模拟后顶层键序必须与官方抓包一致: {}",
             String::from_utf8_lossy(&out)
         );
+        // 模拟路径注入了 CC 核心工具（Bash/Read/Edit/Write），它们排在前面。
+        let tool_names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(tool_names.contains(&"Bash"), "模拟路径应注入 CC 核心工具: {tool_names:?}");
         assert!(
-            v["tools"][0]["name"].as_str().unwrap().starts_with("mcp__luban__"),
-            "拒绝日志里的普通假名也应改成 MCP 形态: {v}"
+            tool_names.iter().any(|n| n.starts_with("mcp__luban__")),
+            "客户端自有工具应改成 MCP 形态: {tool_names:?}"
         );
     }
 
