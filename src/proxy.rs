@@ -2991,12 +2991,40 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
 /// 能力，丢了它的请求就直接变了语义。
 fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
     let mut parts: Vec<&str> = seed.split(',').map(str::trim).collect();
+    // 客户端自己带的 beta 只保留已知安全的项（上游已发布的 beta），过滤掉上游不认的
+    // （如 `max-tokens-5-0-2025-05-30`），否则追加进来直接 400。
     for p in incoming.unwrap_or("").split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        if !parts.contains(&p) {
+        if !parts.contains(&p) && is_known_beta(p) {
             parts.push(p);
         }
     }
     parts.join(",")
+}
+
+/// 上游已知接受的 `anthropic-beta` 前缀。只要 beta 项以这些之一开头就放行。
+/// 不在此列的客户端自发 beta 在模拟路径下静默丢弃——追加一个上游不认的 beta
+/// 就是一发稳定 400，静默丢弃好过打不通。
+fn is_known_beta(beta: &str) -> bool {
+    const KNOWN_PREFIXES: &[&str] = &[
+        "claude-code-",
+        "oauth-",
+        "interleaved-thinking-",
+        "redact-thinking-",
+        "thinking-token-count-",
+        "context-management-",
+        "prompt-caching-scope-",
+        "advanced-tool-use-",
+        "effort-",
+        "extended-cache-ttl-",
+        "output-128k-",
+        "context-1m-",
+        "mid-conversation-system-",
+        "advisor-tool-",
+        "afk-mode-",
+        "cache-diagnosis-",
+        "fast-mode-",
+    ];
+    KNOWN_PREFIXES.iter().any(|prefix| beta.starts_with(prefix))
 }
 
 /// 按官方拼写与顺序构造 `OrigHeaderMap`（`wreq` 据它决定线上头名的大小写**与顺序**）。
@@ -4027,6 +4055,16 @@ fn find_openai_image_url(body: Option<&serde_json::Value>) -> Option<String> {
         for (ci, block) in content.iter().enumerate() {
             if block.get("type").and_then(|t| t.as_str()) == Some("image_url") {
                 return Some(format!("messages.{mi}.content.{ci}"));
+            }
+            // tool_result 内嵌的 content 数组也要扫。
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
+                    for (ki, inner_block) in inner.iter().enumerate() {
+                        if inner_block.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                            return Some(format!("messages.{mi}.content.{ci}.content.{ki}"));
+                        }
+                    }
+                }
             }
         }
     }
