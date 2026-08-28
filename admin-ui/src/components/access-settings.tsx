@@ -29,6 +29,7 @@ import {
   setDeviceTtl,
   setMinClientVersion,
   setRequireDeviceId,
+  setSessionConcurrencyLimit,
   setSessionRpmLimit,
   type Settings,
 } from '@/api/settings'
@@ -445,13 +446,14 @@ export function DeviceSettingsContent() {
         icon={TimerIcon}
         title={t('转发速率', 'Request rate')}
         description={t(
-          '限制单个账号、单台设备、单个会话每分钟最多转发多少条请求；口径与账号列表里那列 RPM 完全一致。三档由粗到细，各算各的。',
-          'Cap how many requests a single account, device, or session forwards per minute; the same window as the RPM column in the account list. Three levels, coarse to fine, counted independently.',
+          '限制单个账号、单台设备、单个会话每分钟最多转发多少条请求，以及单个会话的最大并发数。RPM 与账号列表里那列口径一致，并发上限防止 Claude Desktop 的 cache 预热脉冲打爆上游。',
+          'Cap how many requests a single account, device, or session forwards per minute, and the max concurrency per session. RPM uses the same window as the account list; the concurrency cap tames Claude Desktop\'s cache-warming burst.',
         )}
       >
         <DefaultRpmLimit />
         <DeviceRpmLimit />
         <SessionRpmLimit />
+        <SessionConcurrencyLimit />
       </SettingsGroup>
 
       <SettingsGroup
@@ -527,6 +529,12 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
       ? t(
           `会话 ${settings.session_rpm_limit.toLocaleString(locale)}`,
           `${settings.session_rpm_limit.toLocaleString(locale)}/session`,
+        )
+      : null,
+    settings.session_concurrency_limit > 0
+      ? t(
+          `并发 ${settings.session_concurrency_limit}`,
+          `${settings.session_concurrency_limit} concurrent`,
         )
       : null,
   ].filter(Boolean)
@@ -1194,6 +1202,95 @@ function SessionRpmLimit() {
             <NumberFieldDecrement aria-label={t('减少会话 RPM 上限', 'Decrease per-session RPM limit')} />
             <NumberFieldInput aria-label={t('会话 RPM 上限', 'Per-session RPM limit')} />
             <NumberFieldIncrement aria-label={t('增加会话 RPM 上限', 'Increase per-session RPM limit')} />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * 每会话并发在途上限：限制单个 session 同时在飞的请求数。
+ *
+ * Claude Desktop 启动时会并行发 20+ 条 max_tokens=1 的 cache 预热请求，瞬间打爆上游的
+ * 组织级速率限制（裸 429），再经代理换号重试扩散到整个凭证池。给一个 3~5 的并发上限就能
+ * 把脉冲拉平。
+ */
+function SessionConcurrencyLimit() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.session_concurrency_limit)
+  }, [data?.session_concurrency_limit])
+
+  const save = useMutation({
+    mutationFn: (limit: number) => setSessionConcurrencyLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('会话并发上限已更新', 'Per-session concurrency limit updated'),
+        description: settings.session_concurrency_limit > 0
+          ? t(
+              `每个会话最多同时 ${settings.session_concurrency_limit} 条请求在飞。`,
+              `Each session may have at most ${settings.session_concurrency_limit} requests in flight.`,
+            )
+          : t('会话并发上限已取消。', 'The per-session concurrency limit has been removed.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.session_concurrency_limit ?? 0
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('会话并发上限', 'Per-session concurrency limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '单个会话同时在飞的最大请求数，超了直接 429 并给出 retry-after。用于遏制 Claude Desktop 启动时的 cache 预热脉冲（20+ 条并发），避免打爆上游速率限制。0 表示不限。',
+            'Maximum concurrent in-flight requests per session; beyond that it gets a 429 with retry-after. Tames the cache-warming burst Claude Desktop fires on startup (20+ concurrent requests) to avoid tripping upstream rate limits. 0 means unlimited.',
+          )}
+        </FieldDescription>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" size="sm">
+            {parsed > 0
+              ? t(`每个会话最多 ${parsed} 条并发`, `Up to ${parsed} concurrent per session`)
+              : t('不限', 'Unlimited')}
+          </Badge>
+        </div>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少会话并发上限', 'Decrease per-session concurrency limit')} />
+            <NumberFieldInput aria-label={t('会话并发上限', 'Per-session concurrency limit')} />
+            <NumberFieldIncrement aria-label={t('增加会话并发上限', 'Increase per-session concurrency limit')} />
           </NumberFieldGroup>
         </NumberField>
         <Button

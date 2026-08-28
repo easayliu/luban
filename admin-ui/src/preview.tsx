@@ -666,6 +666,7 @@ queryClient.setQueryData(['settings'], {
   default_rpm_limit: 40,
   device_rpm_limit: 180,
   session_rpm_limit: 60,
+  session_concurrency_limit: 5,
   min_client_version: '2.1.100',
   // 登录 scope 给成官方那一整套（= 未自定义的样子），另外两项是那两个预设按钮的来源。
   oauth_scopes:

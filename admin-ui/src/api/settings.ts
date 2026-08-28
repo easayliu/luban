@@ -17,6 +17,8 @@ export interface Settings {
   device_rpm_limit: number
   /** 每会话 RPM 上限（单个会话最近 60 秒最多转发多少条）；0 表示不限。全局一个值。 */
   session_rpm_limit: number
+  /** 每会话并发在途上限（单个会话同时在飞的最大请求数）；0 表示不限。 */
+  session_concurrency_limit: number
   /** 是否要求请求携带有效设备身份（metadata.user_id）；关闭后放行裸客户端。 */
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
@@ -152,6 +154,17 @@ export async function setDeviceRpmLimit(limit: number): Promise<Settings> {
 export async function setSessionRpmLimit(limit: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/session-rpm-limit', {
     session_rpm_limit: limit,
+  })
+  return data
+}
+
+/**
+ * 设置每会话并发在途上限（0 表示不限）：单个会话同时在飞的最大请求数，超了直接 429。
+ * 用于遏制 Claude Desktop 启动时的 cache 预热脉冲（20+ 条 max_tokens=1 并发）。
+ */
+export async function setSessionConcurrencyLimit(limit: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/session-concurrency-limit', {
+    session_concurrency_limit: limit,
   })
   return data
 }
