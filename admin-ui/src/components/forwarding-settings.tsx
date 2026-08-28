@@ -285,6 +285,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="inject_thinking"
+          label={t('注入 Thinking', 'Inject thinking')}
+          summary={t(
+            '模拟路径下自动补 thinking 和 context_management，与官方形态一致；同时强制 temperature=1。',
+            'Inject thinking and context_management in simulation mode to match the official shape; also forces temperature=1.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端的对话请求恒带 thinking 字段，缺了可能被上游判为第三方应用。开启后，模拟路径下客户端没发 thinking 时自动补上 {type:"enabled", budget_tokens: max_tokens-1}（max_tokens < 1024 的探测级请求不补），context_management 随之自动补上。同时 thinking 开启时上游要求 temperature 必须为 1，客户端若设了其他值会被自动剥掉。代价：注入 thinking 会改变模型行为（输出可能更长、thinking token 按输出计费）。不想要这些副作用就关掉，代价是模拟形态少一个与官方对齐的信号。',
+                'The official client always includes a thinking field on conversation requests; omitting it may cause the upstream to classify the request as third-party. When enabled, if the client did not send thinking, luban injects {type:"enabled", budget_tokens: max_tokens-1} in simulation mode (skipped for probe-level requests with max_tokens < 1024), and context_management is added automatically. Since thinking requires temperature=1, any other value the client set is stripped. Cost: injected thinking changes model behaviour (outputs may be longer, thinking tokens are billed as output). Turn it off to avoid these side effects at the cost of one less signal aligning with the official shape.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={DatabaseIcon} title={t('系统提示词', 'System prompt')}>

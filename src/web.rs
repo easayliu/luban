@@ -1282,6 +1282,8 @@ struct ForwardingResp {
     strip_extra_fields: bool,
     /// 把会被上游判成第三方应用的工具名换成假名转发，回程再还原。
     tool_name_mimic: bool,
+    /// 模拟路径下是否注入 thinking（及配套的 context_management）。
+    inject_thinking: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1304,6 +1306,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             nonstream_as_sse: f.nonstream_as_sse,
             strip_extra_fields: f.strip_extra_fields,
             tool_name_mimic: f.tool_name_mimic,
+            inject_thinking: f.inject_thinking,
         }
     }
 }
@@ -1738,6 +1741,7 @@ struct SetForwardingReq {
     nonstream_as_sse: Option<bool>,
     strip_extra_fields: Option<bool>,
     tool_name_mimic: Option<bool>,
+    inject_thinking: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -1748,10 +1752,10 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, FILL_METADATA, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL,
-        SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        FILL_CLIENT_HEADERS, FILL_METADATA, INJECT_THINKING, MERGE_BETA, NONSTREAM_AS_SSE,
+        NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH,
+        SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -1771,6 +1775,7 @@ async fn set_forwarding(
         (NONSTREAM_AS_SSE, req.nonstream_as_sse),
         (STRIP_EXTRA_FIELDS, req.strip_extra_fields),
         (TOOL_NAME_MIMIC, req.tool_name_mimic),
+        (INJECT_THINKING, req.inject_thinking),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;

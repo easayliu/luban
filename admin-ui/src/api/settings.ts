@@ -73,6 +73,8 @@ export interface Settings {
   strip_extra_fields: boolean
   /** 把会被上游判成第三方应用的工具名换成假名转发，回程再还原。 */
   tool_name_mimic: boolean
+  /** 模拟路径下是否注入 thinking（及配套的 context_management）。 */
+  inject_thinking: boolean
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -94,6 +96,7 @@ export type ForwardingKey =
   | 'nonstream_as_sse'
   | 'strip_extra_fields'
   | 'tool_name_mimic'
+  | 'inject_thinking'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

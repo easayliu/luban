@@ -3321,6 +3321,58 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
     true
 }
 
+/// 模拟后 system 第 4 块（客户端自有内容）超过此字符数时，移到 messages 首条用户消息里。
+///
+/// 上游对第 4 块有内容级检测：非 CC 特征内容超过 ~2000 字符即触发第三方判定。
+/// 实测 1900 字符安全、2021 字符触发，取 1500 留足余量。
+const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
+
+/// 把模拟后 system 第 4 块（index 3）的超长客户端内容搬到 messages 首条用户消息里。
+///
+/// 搬走后第 4 块换成一行短占位（保持 4 块形态），内容作为 `<system_instructions>` 标签
+/// 注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
+/// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
+fn relocate_long_client_system(v: &mut serde_json::Value) -> bool {
+    let sys = match v.get("system").and_then(|s| s.as_array()) {
+        Some(a) if a.len() >= 4 => a,
+        _ => return false,
+    };
+    let tail_text = match sys[3].get("text").and_then(|t| t.as_str()) {
+        Some(t) if t.len() > MAX_CLIENT_SYSTEM_CHARS => t.to_string(),
+        _ => return false,
+    };
+    // 把 system[3] 换成短占位。
+    if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
+        let cc = blocks[3].get("cache_control").cloned();
+        let mut placeholder = text_block_bare("(see conversation)");
+        if let Some(cc) = cc {
+            placeholder.as_object_mut().map(|o| o.insert("cache_control".into(), cc));
+        }
+        blocks[3] = placeholder;
+    }
+    // 注入到 messages[0] 的 content 前面。
+    let wrapped = format!("<system_instructions>\n{tail_text}\n</system_instructions>");
+    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if let Some(first) = messages.first_mut() {
+            match first.get_mut("content") {
+                Some(serde_json::Value::Array(arr)) => {
+                    arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
+                }
+                Some(serde_json::Value::String(s)) => {
+                    let combined = format!("{wrapped}\n\n{s}");
+                    *first.get_mut("content").unwrap() = serde_json::Value::String(combined);
+                }
+                _ => return false,
+            }
+        }
+    }
+    tracing::info!(
+        chars = tail_text.len(),
+        "relocated long client system from block[3] to messages[0]"
+    );
+    true
+}
+
 /// 把一串 `system` 文本块并成**一块**，正文用 `\n\n` 相连。
 ///
 /// **为什么是拼而不是丢**：官方末块本身就是「基座之后的全部内容」拼成的一大段
@@ -4132,13 +4184,17 @@ fn rewrite_body(
         Err(_) => return body.clone(),
     };
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
+    // 模拟后第 4 块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
+    // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，第 4 块只留
+    // 一个短占位，绕过内容检测且不丢失指令语义。
+    let sys_relocated = simulated && relocate_long_client_system(&mut v);
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
     // 模拟路径下客户端没发 `thinking` 时补上官方默认值。官方 CC 恒带
     // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
     // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
-    let thinking_filled = sim.is_some() && ensure_thinking(&mut v);
+    let thinking_filled = sim.is_some() && flags.inject_thinking && ensure_thinking(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
@@ -4194,6 +4250,7 @@ fn rewrite_body(
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
         simulated,
+        sys_relocated,
         sim_meta,
         shaped,
         capped,
@@ -4218,6 +4275,7 @@ fn rewrite_body(
         && !spoofed
         && !cch_added
         && !simulated
+        && !sys_relocated
         && !sim_meta
         && !thinking_filled
         && !ctx_mgmt
@@ -4754,6 +4812,18 @@ fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
         && thinking.remove("display").is_some()
     {
         changed = true;
+    }
+    // thinking 开着时 temperature 必须是 1（上游强制），客户端设了别的值直接 400。
+    // 删掉即可——默认值就是 1。判据同 ensure_context_management 那里的口径。
+    let thinking_on = obj
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| matches!(t, "enabled" | "adaptive"));
+    if thinking_on && obj.get("temperature").and_then(|t| t.as_f64()) != Some(1.0) {
+        if obj.remove("temperature").is_some() {
+            changed = true;
+        }
     }
     changed
 }
@@ -6770,6 +6840,7 @@ mod tests {
             nonstream_as_sse: false,
             strip_extra_fields: false,
             tool_name_mimic: false,
+            inject_thinking: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -7380,6 +7451,7 @@ mod tests {
             nonstream_as_sse: false,
             strip_extra_fields: false,
             tool_name_mimic: false,
+            inject_thinking: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -7819,6 +7891,7 @@ mod tests {
                 nonstream_as_sse: false,
                 strip_extra_fields: false,
                 tool_name_mimic: false,
+                inject_thinking: false,
             }
         };
         let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);

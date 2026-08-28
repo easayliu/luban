@@ -1753,6 +1753,9 @@ impl CredentialStore {
         if let Some(v) = on(TOOL_NAME_MIMIC) {
             flags.tool_name_mimic = v;
         }
+        if let Some(v) = on(INJECT_THINKING) {
+            flags.inject_thinking = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1925,6 +1928,10 @@ pub const STRIP_EXTRA_FIELDS: &str = "strip_extra_fields";
 /// 见 [`ForwardFlags::tool_name_mimic`]。
 pub const TOOL_NAME_MIMIC: &str = "tool_name_mimic";
 
+/// 模拟路径下是否注入 `thinking` 的 settings 键名。缺省视为开启。
+/// 见 [`ForwardFlags::inject_thinking`]。
+pub const INJECT_THINKING: &str = "inject_thinking";
+
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。
 ///
@@ -2066,6 +2073,12 @@ pub struct ForwardFlags {
     /// 代价：回程每个 chunk 要做 N 次字节替换（N = 被混淆的工具数），且客户端增删工具会让
     /// 整套假名重算、上游 prompt cache 失效一次。关掉即完全退回原样转发。
     pub tool_name_mimic: bool,
+    /// 模拟路径下是否注入 `thinking`（及配套的 `context_management`）。
+    ///
+    /// 官方 CC 恒带 `thinking`，缺了可能被判第三方。但注入 thinking 会改变模型行为
+    /// （输出更长、token 消耗更多），且会强制 `temperature=1`（`strip_extra_fields` 自动剥）。
+    /// 不想要这些副作用就关掉——代价是模拟形态少一个正面信号。
+    pub inject_thinking: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2088,6 +2101,7 @@ impl Default for ForwardFlags {
             nonstream_as_sse: true,
             strip_extra_fields: true,
             tool_name_mimic: true,
+            inject_thinking: true,
         }
     }
 }
@@ -6167,6 +6181,7 @@ mod tests {
             (NONSTREAM_AS_SSE, "0"),
             (STRIP_EXTRA_FIELDS, "0"),
             (TOOL_NAME_MIMIC, "0"),
+            (INJECT_THINKING, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -6191,6 +6206,7 @@ mod tests {
                 nonstream_as_sse: false,
                 strip_extra_fields: false,
                 tool_name_mimic: false,
+                inject_thinking: false,
             }
         );
 

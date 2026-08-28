@@ -589,11 +589,10 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         'A summary of the device binding and identity rules currently in effect.',
       )}
     >
-      {/* 一行六格在 sm 上会挤成两三个字换行，故拖到 md 才铺平；两档之间就是两列。
-          下面那串边框类是按「窄屏两列 / 宽屏一行」写死的，改列数要连它一起改。 */}
+      {/* 窄屏两列、宽屏一行自适应列宽（auto-cols-auto）。边框类按这个布局写死的。 */}
       <dl
         aria-label={t('当前设备策略概览', 'Current device policy overview')}
-        className="grid grid-cols-2 md:grid-cols-6"
+        className="grid grid-cols-2 md:grid-flow-col md:auto-cols-auto"
       >
         {items.map((item, index) => (
           <div
@@ -602,9 +601,7 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
             className={`min-w-0 px-5 py-4 md:px-4 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
           >
             <dt className="text-xs text-muted-foreground">{item.label}</dt>
-            {/* 值一律完整显示：这是「当前生效的策略」，截成 `账号 40 · 设备 1…` 等于没说。
-                放不下就换行——同一行的格子跟着一起变高，比省一行高度而藏掉半个数值划算。 */}
-            <dd className="mt-1 font-semibold text-sm leading-snug break-words">{item.value}</dd>
+            <dd className="mt-1 font-semibold text-sm leading-snug whitespace-nowrap">{item.value}</dd>
           </div>
         ))}
       </dl>
