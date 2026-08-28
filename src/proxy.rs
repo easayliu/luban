@@ -8530,7 +8530,10 @@ mod tests {
         let t = |n: &str| format!(r#"{{"name":"{n}","cache_control":{{"type":"ephemeral"}}}}"#);
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[],"tools":[{},{},{},{}]}}"#,
-            t("t0"), t("t1"), t("t2"), t("t3"),
+            t("t0"),
+            t("t1"),
+            t("t2"),
+            t("t3"),
         ));
         let sim = detect_for(&body, all_on()).unwrap();
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
