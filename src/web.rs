@@ -69,6 +69,9 @@ pub struct AppState {
     /// 只为给裸 429（一个限流头都不带的那一档）留下能对上游限额的读数，见
     /// [`crate::proxy::UpstreamLoad`]。
     pub upstream_load: crate::proxy::UpstreamLoad,
+    /// 每会话并发在途表：限制单个 session 同时在飞的请求数，防止 Claude Desktop 的
+    /// cache 预热脉冲（20+ 条 `max_tokens=1`）瞬间打爆上游。见 [`crate::proxy::SessionConcurrency`]。
+    pub session_concurrency: crate::proxy::SessionConcurrency,
     /// **在途请求数**：已进入转发入口、响应尚未走完的那些。
     ///
     /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
@@ -100,6 +103,7 @@ pub async fn run(
         rejection_log: Arc::default(),
         transient_backoff: Arc::default(),
         upstream_load: Arc::default(),
+        session_concurrency: Arc::default(),
         in_flight: Arc::default(),
     };
 
@@ -275,6 +279,7 @@ pub async fn run(
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
         .route("/settings/device-rpm-limit", post(set_device_rpm_limit))
         .route("/settings/session-rpm-limit", post(set_session_rpm_limit))
+        .route("/settings/session-concurrency-limit", post(set_session_concurrency_limit))
         .route("/settings/bare-rate-limit", post(set_bare_rate_limit))
         .route("/settings/rate-limit-retry-max", post(set_rate_limit_retry_max))
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
@@ -1209,6 +1214,8 @@ struct SettingsResp {
     /// 每会话 RPM 上限（单个会话最近 60 秒最多转发多少条）；0 表示不限。全局一个值。
     /// 与 [`Self::device_rpm_limit`] 两个粒度并存，见 [`crate::store::SESSION_RPM_LIMIT`]。
     session_rpm_limit: i64,
+    /// 每会话并发在途上限（单个会话同时在飞的最大请求数）；0 表示不限。
+    session_concurrency_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
     /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
@@ -1308,6 +1315,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let default_rpm_limit = state.store.default_rpm_limit();
     let device_rpm_limit = state.store.device_rpm_limit();
     let session_rpm_limit = state.store.session_rpm_limit();
+    let session_concurrency_limit = state.store.session_concurrency_limit();
     let require_device_id = state.store.require_device_id();
     let min_client_version = state.store.min_client_version().unwrap_or_default();
     let oauth_scopes = state.store.oauth_scopes();
@@ -1327,6 +1335,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             default_rpm_limit,
             device_rpm_limit,
             session_rpm_limit,
+            session_concurrency_limit,
             require_device_id,
             min_client_version,
             oauth_scopes,
@@ -1355,6 +1364,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         default_rpm_limit,
         device_rpm_limit,
         session_rpm_limit,
+        session_concurrency_limit,
         require_device_id,
         min_client_version,
         oauth_scopes,
@@ -1522,6 +1532,24 @@ async fn set_session_rpm_limit(
         .set_setting(crate::store::SESSION_RPM_LIMIT, &limit.to_string())
         .map_err(internal)?;
     tracing::info!(limit, "per-session rpm limit changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetSessionConcurrencyLimitReq {
+    session_concurrency_limit: i64,
+}
+
+async fn set_session_concurrency_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetSessionConcurrencyLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.session_concurrency_limit.max(0);
+    state
+        .store
+        .set_setting(crate::store::SESSION_CONCURRENCY_LIMIT, &limit.to_string())
+        .map_err(internal)?;
+    tracing::info!(limit, "per-session concurrency limit changed");
     Ok(Json(settings_resp(&state)))
 }
 

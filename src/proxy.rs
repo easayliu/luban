@@ -87,6 +87,29 @@ pub async fn handle(
         );
     }
 
+    // 1.7) 每会话并发在途上限（头这一路）：这个会话同时在飞的请求已达上限 → 直接 429。
+    //      与 RPM 同理：头上有就在这里判，没有等 body 里拿到 session id 再补判。
+    let concurrency_limit = state.store.session_concurrency_limit();
+    let mut session_concurrency_guard = if let Some(sid) = session_from_header.as_deref() {
+        match try_acquire_session_concurrency(&state.session_concurrency, sid, concurrency_limit) {
+            Ok(guard) => guard,
+            Err(current) => {
+                return session_concurrency_rejection(
+                    &state.rejection_log,
+                    &method,
+                    &path_and_query,
+                    &client_ua,
+                    sid,
+                    current,
+                    concurrency_limit,
+                    "header",
+                );
+            }
+        }
+    } else {
+        SessionConcurrencyGuard::dummy(state.session_concurrency.clone())
+    };
+
     // 2) 请求体只解析这一次，下面五项判定全从这份结果上读。
     //
     //    此前 extract_device_id / body_has_user_id / request_model / request_speed 各自
@@ -167,6 +190,27 @@ pub async fn handle(
             retry,
             "body",
         );
+    }
+
+    // 2.2c) 每会话并发在途上限（body 这一路）：头那路没判过时补判。
+    if session_from_header.is_none()
+        && let Some(sid) = session_id.as_deref()
+    {
+        match try_acquire_session_concurrency(&state.session_concurrency, sid, concurrency_limit) {
+            Ok(guard) => session_concurrency_guard = guard,
+            Err(current) => {
+                return session_concurrency_rejection(
+                    &state.rejection_log,
+                    &method,
+                    &path_and_query,
+                    &client_ua,
+                    sid,
+                    current,
+                    concurrency_limit,
+                    "body",
+                );
+            }
+        }
     }
 
     // 请求的模型名：下面两处都要用它——本地形态拦截按模型索引，选号的冷却也按
@@ -807,6 +851,7 @@ pub async fn handle(
                 stream_broke: None,
                 store: state.store.clone(),
                 _in_flight: in_flight,
+                _session_concurrency: session_concurrency_guard,
                 _route_load: route_load,
             };
 
@@ -1731,6 +1776,72 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// 每会话并发在途上限：限制单个 session 同时在飞的请求数。
+///
+/// Claude Desktop 启动时会并行发 20+ 条 `max_tokens=1` 的 cache 预热请求，在一秒内全部打到
+/// 上游，触发组织级的瞬时速率限制（裸 429）；随后代理侧的 strip-metadata 重试和换号逻辑
+/// 会把 damage 扩散到整个凭证池，导致后续真正的请求也全部 429。
+///
+/// 并发上限把这种脉冲拉平：超过上限的请求直接返回 429 + 短 `retry-after`，客户端自行退避后
+/// 重发，对上游的瞬时压力从 20+ 条削减到 3~5 条。
+pub type SessionConcurrency = std::sync::Arc<parking_lot::Mutex<SessionConcurrencyTable>>;
+
+/// 并发表本体。键是 session id，值是此刻在飞的请求数。归零即删键。
+#[derive(Default)]
+pub struct SessionConcurrencyTable {
+    in_flight: std::collections::HashMap<String, u32>,
+}
+
+/// 占住一个 session 的并发格，Drop 时归还。挂在 [`ReqLog`] 上活到响应流结束。
+pub struct SessionConcurrencyGuard {
+    table: SessionConcurrency,
+    session_id: String,
+}
+
+impl SessionConcurrencyGuard {
+    fn dummy(table: SessionConcurrency) -> Self {
+        Self { table, session_id: String::new() }
+    }
+}
+
+impl Drop for SessionConcurrencyGuard {
+    fn drop(&mut self) {
+        if self.session_id.is_empty() {
+            return;
+        }
+        let mut t = self.table.lock();
+        if let Some(n) = t.in_flight.get_mut(&self.session_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                t.in_flight.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// 尝试占一个 session 的并发格。成功返回 `Ok(guard)`，格子满了返回 `Err(当前在飞数)`。
+/// `limit <= 0` 时不限（总返回 Ok）。
+fn try_acquire_session_concurrency(
+    table: &SessionConcurrency,
+    session_id: &str,
+    limit: i64,
+) -> Result<SessionConcurrencyGuard, u32> {
+    if limit <= 0 {
+        return Ok(SessionConcurrencyGuard {
+            table: table.clone(),
+            session_id: session_id.to_string(),
+        });
+    }
+    let mut t = table.lock();
+    let current = t.in_flight.get(session_id).copied().unwrap_or(0);
+    if current >= limit as u32 {
+        return Err(current);
+    }
+    *t.in_flight.entry(session_id.to_string()).or_default() += 1;
+    drop(t);
+    Ok(SessionConcurrencyGuard { table: table.clone(), session_id: session_id.to_string() })
+}
+
 /// 「账号 + 模型」维度的上游负载表：每条路线此刻有几条请求在上游那边跑着，以及每个账号在最近
 /// [`UPSTREAM_SEND_WINDOW`] 内发出去了几条、一共声明了多少输出预算。
 ///
@@ -1901,6 +2012,8 @@ struct ReqLog {
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
+    /// 会话并发在途的句柄，见 [`SessionConcurrencyGuard`]：让计数活到流结束。
+    _session_concurrency: SessionConcurrencyGuard,
     /// 「账号 + 模型」在飞格的句柄，见 [`UpstreamRouteGuard`]：同样只为让那一格活到流结束。
     _route_load: UpstreamRouteGuard,
 }
@@ -2309,6 +2422,36 @@ fn session_rpm_rejection(
     rate_limit_response(
         retry,
         format!("this session has reached its RPM limit; retry in {retry} seconds"),
+    )
+}
+
+/// 会话并发在途超限那条 429。retry-after 给 1 秒：并发上限不像 RPM 那样有窗口要等，
+/// 前面的请求走完一条就空出一个格子，等一拍就好。
+fn session_concurrency_rejection(
+    log: &RejectionLog,
+    method: &Method,
+    path_and_query: &str,
+    client_ua: &str,
+    session_id: &str,
+    current: u32,
+    limit: i64,
+    source: &'static str,
+) -> Response {
+    if let Some(suppressed) =
+        take_rejection_log_slot(log, &format!("session_concurrency:{session_id}"))
+    {
+        let session_short: String = session_id.chars().take(8).collect();
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            session = %session_short, %source, current, limit, suppressed,
+            "rejected: this session has reached its concurrency limit"
+        );
+    }
+    rate_limit_response(
+        1,
+        format!(
+            "this session already has {current} requests in flight (limit {limit}); retry in 1 second"
+        ),
     )
 }
 
@@ -10059,6 +10202,7 @@ mod tests {
                 stream_broke: None,
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
+                _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
                 _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
             })
         };
@@ -10110,6 +10254,7 @@ mod tests {
             stream_broke: None,
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
+            _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
             _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
         };
         rl.sniffer.feed(
@@ -10835,6 +10980,7 @@ mod tests {
             stream_broke: None,
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
+            _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
             _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
         }
     }

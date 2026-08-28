@@ -1340,6 +1340,17 @@ impl CredentialStore {
         Some(self.session_rate.retry_after_secs(&session_id.to_string(), window))
     }
 
+    /// 每会话并发在途上限：单个会话最多同时有多少条请求在飞；`<= 0` 表示不限。
+    /// 未设置时默认 [`DEFAULT_SESSION_CONCURRENCY_LIMIT`]。
+    pub fn session_concurrency_limit(&self) -> i64 {
+        self.get_setting(SESSION_CONCURRENCY_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_SESSION_CONCURRENCY_LIMIT)
+            .max(0)
+    }
+
     /// 给凭证打上「被上游限流」的冷却，见 [`RateLimitCooldown`]。时长与作用域都由调用方
     /// 从上游响应头算出（`crate::proxy::rate_limit_scope`）：`model` 为 `None` 即账号级
     /// （额度真耗尽），`Some(m)` 即只冷却该模型（窗口没跑满却被拒，多半是模型容量限制）。
@@ -2137,6 +2148,19 @@ const DEVICE_RATE_MAX_KEYS: usize = 4096;
 /// 推荐的配法是会话给贴合单个对话真实节奏的值、设备给它的几倍当总量兜底。别把设备闸配得比
 /// 会话闸还小：那样会话这道永远轮不到判定，等于白配。
 pub const SESSION_RPM_LIMIT: &str = "session_rpm_limit";
+
+/// 每会话**并发在途**上限的 settings 键名；`<= 0`（含未设置）表示不限。
+///
+/// 与 [`SESSION_RPM_LIMIT`] 互补：RPM 控的是分钟窗口内的总量，并发上限控的是**瞬时同时在飞**
+/// 的请求数。Claude Desktop 启动时会并行发 20+ 条 `max_tokens=1` 的 cache 预热请求，
+/// 瞬间打爆上游的每组织速率限制；RPM 窗口管不住这种「一秒内全发完」的脉冲。给一个 3~5 的
+/// 并发上限就能把脉冲拉平，不必等到上游 429 再补救。
+pub const SESSION_CONCURRENCY_LIMIT: &str = "session_concurrency_limit";
+
+/// 并发上限默认值：5。一个正常的 Claude Code 会话在稳态下很少超过 3~4 条并行请求
+/// （主请求 + 1~2 个 subagent），5 留出余量不卡正常使用，同时把 20+ 的预热爆发削掉
+/// 四分之三。设为 0 表示不限。
+pub const DEFAULT_SESSION_CONCURRENCY_LIMIT: i64 = 5;
 
 /// 会话限流窗口表里最多留多少个键，见 [`CredentialStore::take_session_rpm_slot`]。
 /// 比设备那个高一档（16384）：会话 id 正常使用下就在不断产生新值，撞上清扫的机会本就更大，
