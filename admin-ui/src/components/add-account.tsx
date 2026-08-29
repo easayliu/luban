@@ -5,6 +5,7 @@ import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
+import { ProxyTestBlock } from '@/components/credential-proxy-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -231,7 +232,7 @@ export function AddAccount({
                         size="sm"
                         variant={proxy.trim() === p.url ? 'secondary' : 'outline'}
                         onClick={() => setProxy(p.url)}
-                        title={`${p.url}${p.credential_count > 0 ? ` · ${p.credential_count} ${t('个账号在用', 'account(s)')}` : ''}`}
+                        title={`${p.url}${p.credential_labels.length > 0 ? `\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}` : ''}`}
                       >
                         {p.label}
                         {p.credential_count > 0 && (
@@ -266,6 +267,7 @@ export function AddAccount({
                     'Token exchange and profile fetch will go through this proxy. It is automatically saved as the per-account proxy after login. Supports socks5://, http://, etc. Leave blank for a direct connection.',
                   )}
                 </FieldDescription>
+                <ProxyTestBlock url={proxy.trim()} />
               </Field>
             </div>
           </DialogPanel>

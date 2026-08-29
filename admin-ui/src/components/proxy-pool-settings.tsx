@@ -16,6 +16,8 @@ import {
   updateProxy,
 } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
+import { proxyMaskedUrl } from '@/components/credential-shared'
+import { ProxyTestBlock } from '@/components/credential-proxy-dialog'
 import { extractError } from '@/lib/utils'
 import {
   AlertDialog,
@@ -260,40 +262,51 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
   }
 
   return (
-    <li className="flex items-center gap-3 p-4">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium">{proxy.label}</span>
-          {proxy.credential_count > 0 && (
-            <Badge variant="secondary" size="sm">
-              {t(`${proxy.credential_count} 个账号`, `${proxy.credential_count} account${proxy.credential_count === 1 ? '' : 's'}`)}
-            </Badge>
-          )}
+    <li className="space-y-2 p-4">
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-medium">{proxy.label}</span>
+            {proxy.credential_count > 0 && (
+              <Badge variant="secondary" size="sm">
+                {t(`${proxy.credential_count} 个账号`, `${proxy.credential_count} account${proxy.credential_count === 1 ? '' : 's'}`)}
+              </Badge>
+            )}
+          </div>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground" title={proxyMaskedUrl(proxy.url)}>
+            {proxyMaskedUrl(proxy.url)}
+          </p>
         </div>
-        <p className="mt-0.5 truncate text-xs text-muted-foreground" title={proxy.url}>
-          {proxy.url}
-        </p>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          onClick={() => {
+            setLabel(proxy.label)
+            setUrl(proxy.url)
+            setEditing(true)
+          }}
+          aria-label={t('编辑', 'Edit')}
+        >
+          <PencilIcon />
+        </Button>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          onClick={() => setConfirmDelete(true)}
+          aria-label={t('删除', 'Delete')}
+        >
+          <Trash2Icon />
+        </Button>
       </div>
-      <Button
-        size="icon-sm"
-        variant="ghost"
-        onClick={() => {
-          setLabel(proxy.label)
-          setUrl(proxy.url)
-          setEditing(true)
-        }}
-        aria-label={t('编辑', 'Edit')}
-      >
-        <PencilIcon />
-      </Button>
-      <Button
-        size="icon-sm"
-        variant="ghost"
-        onClick={() => setConfirmDelete(true)}
-        aria-label={t('删除', 'Delete')}
-      >
-        <Trash2Icon />
-      </Button>
+      {proxy.credential_labels.length > 0 && (
+        <p className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+          <span>{t('使用账号：', 'Used by: ')}</span>
+          {proxy.credential_labels.map((name, i) => (
+            <Badge key={i} variant="outline" size="sm">{name}</Badge>
+          ))}
+        </p>
+      )}
+      <ProxyTestBlock url={proxy.url} />
 
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogPopup>

@@ -1461,3 +1461,20 @@ export function proxyDisplayLabel(proxy: string | null): string | null {
     return proxy.replace(/\/\/[^@]*@/, '//')
   }
 }
+
+/**
+ * 代理 URL 脱敏显示：有认证信息时显示 `protocol://***@host:port`，没有则原样。
+ */
+export function proxyMaskedUrl(proxy: string): string {
+  try {
+    const u = new URL(proxy)
+    const host = u.hostname || u.host
+    const port = u.port ? `:${u.port}` : ''
+    const hasAuth = u.username || u.password
+    return hasAuth
+      ? `${u.protocol}//***@${host}${port}`
+      : `${u.protocol}//${host}${port}`
+  } catch {
+    return proxy.replace(/\/\/[^@]*@/, '//***@')
+  }
+}

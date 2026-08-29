@@ -268,6 +268,7 @@ pub async fn run(
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
         .route("/credentials/proxy", post(set_proxies))
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
+        .route("/proxies/test", post(test_proxy))
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
         .route("/metrics", get(get_metrics))
@@ -1032,22 +1033,29 @@ struct SavedProxyView {
     url: String,
     created_at: u64,
     credential_count: i64,
+    /// 使用该代理的凭证标签列表。
+    credential_labels: Vec<String>,
 }
 
-/// 列出代理池中所有记录，附带每条代理的使用量。
+/// 列出代理池中所有记录，附带每条代理的使用量与使用者。
 async fn list_saved_proxies(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SavedProxyView>>, ApiError> {
     let proxies = state.store.list_proxies().map_err(internal)?;
     let counts = state.store.proxy_usage_counts().map_err(internal)?;
+    let mut labels = state.store.proxy_usage_labels().map_err(internal)?;
     let views = proxies
         .into_iter()
-        .map(|p| SavedProxyView {
-            credential_count: counts.get(&p.url).copied().unwrap_or(0),
-            id: p.id,
-            label: p.label,
-            url: p.url,
-            created_at: p.created_at,
+        .map(|p| {
+            let credential_labels = labels.remove(&p.url).unwrap_or_default();
+            SavedProxyView {
+                credential_count: counts.get(&p.url).copied().unwrap_or(0),
+                id: p.id,
+                label: p.label,
+                url: p.url,
+                created_at: p.created_at,
+                credential_labels,
+            }
         })
         .collect();
     Ok(Json(views))
@@ -1078,6 +1086,7 @@ async fn add_saved_proxy(
         url: p.url,
         created_at: p.created_at,
         credential_count: 0,
+        credential_labels: vec![],
     }))
 }
 
@@ -1109,6 +1118,8 @@ async fn update_saved_proxy(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "proxy not found".to_string()))?;
     let count =
         state.store.proxy_usage_counts().map_err(internal)?.get(&p.url).copied().unwrap_or(0);
+    let credential_labels =
+        state.store.proxy_usage_labels().map_err(internal)?.remove(&p.url).unwrap_or_default();
     tracing::info!(proxy_id = id, label = %p.label, url = %p.url, "proxy updated in pool");
     Ok(Json(SavedProxyView {
         id: p.id,
@@ -1116,6 +1127,7 @@ async fn update_saved_proxy(
         url: p.url,
         created_at: p.created_at,
         credential_count: count,
+        credential_labels,
     }))
 }
 
@@ -1129,6 +1141,80 @@ async fn delete_saved_proxy(
     }
     tracing::info!(proxy_id = id, "proxy deleted from pool");
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct TestProxyReq {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct TestProxyResult {
+    ok: bool,
+    ip: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
+    org: Option<String>,
+    latency_ms: u128,
+    error: Option<String>,
+}
+
+/// 测试代理连通性：通过指定代理访问 ip-api.com 获取出口 IP 和地理信息。
+async fn test_proxy(Json(req): Json<TestProxyReq>) -> Result<Json<TestProxyResult>, ApiError> {
+    let started = std::time::Instant::now();
+    let url =
+        crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
+    let client =
+        crate::clients::upstream_client(Some(&url)).map_err(|e| bad_request(format!("{e:#}")))?;
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client
+            .get("http://ip-api.com/json/?fields=query,country,regionName,city,org,status")
+            .send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Ok(Json(TestProxyResult {
+                ok: false,
+                ip: None,
+                country: None,
+                city: None,
+                region: None,
+                org: None,
+                latency_ms: started.elapsed().as_millis(),
+                error: Some(format!("{e:#}")),
+            }));
+        }
+        Err(_) => {
+            return Ok(Json(TestProxyResult {
+                ok: false,
+                ip: None,
+                country: None,
+                city: None,
+                region: None,
+                org: None,
+                latency_ms: started.elapsed().as_millis(),
+                error: Some("proxy test timed out (15s)".into()),
+            }));
+        }
+    };
+    let latency_ms = started.elapsed().as_millis();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let ok = body.get("status").and_then(|s| s.as_str()) == Some("success");
+    let str_field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Ok(Json(TestProxyResult {
+        ok,
+        ip: str_field("query"),
+        country: str_field("country"),
+        city: str_field("city"),
+        region: str_field("regionName"),
+        org: str_field("org"),
+        latency_ms,
+        error: if ok { None } else { Some(body.to_string()) },
+    }))
 }
 
 #[derive(Deserialize)]

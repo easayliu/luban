@@ -1241,6 +1241,23 @@ impl CredentialStore {
         Ok(out)
     }
 
+    /// 返回每个代理 URL 对应的使用者标签列表（`proxy_url → [label1, label2, ...]`）。
+    pub fn proxy_usage_labels(&self) -> Result<HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT proxy, label FROM credentials \
+             WHERE proxy IS NOT NULL AND proxy != '' ORDER BY proxy, label",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for r in rows {
+            let (url, label) = r?;
+            out.entry(url).or_default().push(label);
+        }
+        Ok(out)
+    }
+
     /// 批量设置出站代理：把 `ids` 里的账号统一改到 `proxy`（`None` 或空串改回直连）。
     /// 单事务内完成。
     pub fn set_proxies(&self, ids: &[i64], proxy: Option<&str>) -> Result<usize> {

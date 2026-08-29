@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { GlobeIcon } from 'lucide-react'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { GlobeIcon, MapPinIcon, PlayIcon, XIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
-import { listProxies } from '@/api/proxies'
+import { listProxies, testProxy, type ProxyTestResult } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
-import { displayCredentialLabel } from '@/lib/utils'
+import { displayCredentialLabel, extractError } from '@/lib/utils'
 import { type CredentialActions } from '@/components/credential-shared'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -83,7 +83,7 @@ export function CredentialProxyDialog({
                     size="sm"
                     variant={trimmed === p.url ? 'secondary' : 'outline'}
                     onClick={() => pickProxy(p.url)}
-                    title={`${p.url}${p.credential_count > 0 ? ` · ${p.credential_count} ${t('个账号在用', 'account(s)')}` : ''}`}
+                    title={`${p.url}${p.credential_labels.length > 0 ? `\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}` : ''}`}
                   >
                     {p.label}
                     {p.credential_count > 0 && (
@@ -122,6 +122,8 @@ export function CredentialProxyDialog({
             </p>
           </div>
 
+          <ProxyTestBlock url={trimmed} />
+
           <Alert>
             <GlobeIcon />
             <AlertDescription>
@@ -141,5 +143,58 @@ export function CredentialProxyDialog({
         </DialogFooter>
       </DialogPopup>
     </Dialog>
+  )
+}
+
+/** 代理测试按钮 + 结果展示，可复用于代理对话框和添加账号页面。 */
+export function ProxyTestBlock({ url }: { url: string }) {
+  const { t, language } = useI18n()
+  const [result, setResult] = useState<ProxyTestResult | null>(null)
+  const test = useMutation({
+    mutationFn: () => testProxy(url),
+    onSuccess: setResult,
+    onError: (e) => setResult({
+      ok: false, ip: null, country: null, city: null, region: null, org: null,
+      latency_ms: 0, error: extractError(e, language),
+    }),
+  })
+
+  if (!url) return null
+
+  return (
+    <div className="space-y-2">
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        loading={test.isPending}
+        onClick={() => test.mutate()}
+      >
+        <PlayIcon />
+        {t('测试代理', 'Test proxy')}
+      </Button>
+      {result && (
+        <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${result.ok ? 'border-success/30 bg-success/5' : 'border-destructive/30 bg-destructive/5'}`}>
+          <MapPinIcon className="mt-0.5 size-3.5 shrink-0" />
+          {result.ok ? (
+            <div className="min-w-0 space-y-0.5">
+              <p className="font-medium">{result.ip}</p>
+              <p className="text-muted-foreground">
+                {[result.city, result.region, result.country].filter(Boolean).join(', ')}
+                {result.org && ` · ${result.org}`}
+                {` · ${result.latency_ms}ms`}
+              </p>
+            </div>
+          ) : (
+            <p className="min-w-0 break-all text-destructive-foreground">
+              {result.error}{result.latency_ms > 0 && ` · ${result.latency_ms}ms`}
+            </p>
+          )}
+          <Button size="icon-sm" variant="ghost" className="-my-0.5 ml-auto shrink-0" onClick={() => setResult(null)}>
+            <XIcon className="size-3" />
+          </Button>
+        </div>
+      )}
+    </div>
   )
 }
