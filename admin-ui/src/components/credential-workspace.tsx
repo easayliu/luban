@@ -141,7 +141,14 @@ const FILTERS: {
     match: (evaluation) => evaluation.needsAttention,
   },
   { key: 'enabled', label: ['启用', 'Enabled'], match: ({ credential }) => !credential.disabled },
-  { key: 'disabled', label: ['停用', 'Disabled'], match: ({ credential }) => credential.disabled },
+  {
+    key: 'disabled',
+    label: ['手动停用', 'Manually disabled'],
+    // 只匹配人工手动关掉的号：排除封禁、Token 失效（有 ban_reason）和限流暂停（有 resume_at），
+    // 那几种各有各的 tab，混在一起会让计数虚高、点开找不到预期的号。
+    match: ({ credential }) =>
+      credential.disabled && !credential.ban_reason && credential.resume_at == null,
+  },
   {
     key: 'banned',
     label: ['已封禁', 'Banned'],
@@ -158,11 +165,12 @@ const FILTERS: {
   {
     key: 'cooldown',
     label: ['冷却中', 'Cooling down'],
-    // 账号级与模型级都算：两者都是「上游 429 后被挪出调度」，找问题时都得看得见。
-    // 区别（整号停摆 vs 只挡几个模型）由卡片上的状态与提示分别说明，不在这里合并语义。
+    // 三档都收：resume_at（额度用尽落库暂停）、rate_limited_secs（进程内账号级冷却）、
+    // modelCooling（模型级冷却）。区别由卡片上的状态与提示分别说明。
     match: (evaluation) =>
-      !evaluation.credential.disabled
-      && (evaluation.credential.rate_limited_secs > 0 || evaluation.modelCooling),
+      evaluation.credential.resume_at != null
+      || (!evaluation.credential.disabled
+        && (evaluation.credential.rate_limited_secs > 0 || evaluation.modelCooling)),
   },
   {
     key: 'hasDevice',
@@ -446,6 +454,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       free: 0,
       unknown: 0,
     }
+    let rateLimitedPauseCount = 0
     let nearLimitCount = 0
     let activeOverageCount = 0
     let unknownOverageCount = 0
@@ -460,8 +469,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       tierCounts[planKey(credential.tier)] += 1
       if (evaluation.schedulable) filterCounts.schedulable += 1
       if (evaluation.needsAttention) filterCounts.attention += 1
-      if (credential.disabled) filterCounts.disabled += 1
-      else filterCounts.enabled += 1
+      if (!credential.disabled) filterCounts.enabled += 1
+      else if (!credential.ban_reason && credential.resume_at == null) filterCounts.disabled += 1
+      if (credential.resume_at != null) rateLimitedPauseCount += 1
       if (credential.ban_reason && credential.resume_at == null) {
         if (isAccountBan(credential.ban_reason)) filterCounts.banned += 1
         else filterCounts.tokenInvalid += 1
@@ -469,8 +479,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       if (evaluation.quotaRisk) filterCounts.nearLimit += 1
       // 口径必须与上面 'cooldown' 那条筛选完全一致，否则芯片上的计数和点开后的条数对不上。
       if (
-        !credential.disabled
-        && (credential.rate_limited_secs > 0 || evaluation.modelCooling)
+        credential.resume_at != null
+        || (!credential.disabled
+          && (credential.rate_limited_secs > 0 || evaluation.modelCooling))
       ) {
         filterCounts.cooldown += 1
       }
@@ -506,6 +517,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return {
       filterCounts,
       tierCounts,
+      rateLimitedPauseCount,
       nearLimitCount,
       activeOverageCount,
       unknownOverageCount,

@@ -4,6 +4,7 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   EllipsisIcon,
+  GlobeIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
@@ -18,6 +19,7 @@ import {
   DeleteCredentialDialog,
   deviceUsageMeta,
   evaluateCredential,
+  proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
   orgBadgeLabel,
@@ -235,6 +237,22 @@ export const CredentialRow = memo(function CredentialRow({
                     </TooltipTrigger>
                     <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
                   </Tooltip>
+                  {cred.proxy && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={<button type="button" />}
+                          className="inline-flex min-w-0 items-center gap-0.5 text-info-foreground"
+                          onClick={() => setProxyOpen(true)}
+                        >
+                          <GlobeIcon className="size-3 shrink-0" />
+                          <span className="min-w-0 truncate">{proxyDisplayLabel(cred.proxy)}</span>
+                        </TooltipTrigger>
+                        <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+                      </Tooltip>
+                    </>
+                  )}
                 </p>
               </div>
               <div className="flex shrink-0 items-start gap-1">
@@ -350,6 +368,22 @@ export const CredentialRow = memo(function CredentialRow({
                   </TooltipTrigger>
                   <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
                 </Tooltip>
+                {cred.proxy && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={<button type="button" />}
+                        className="inline-flex min-w-0 items-center gap-0.5 text-info-foreground hover:underline"
+                        onClick={() => setProxyOpen(true)}
+                      >
+                        <GlobeIcon className="size-3 shrink-0" />
+                        <span className="min-w-0 truncate">{proxyDisplayLabel(cred.proxy)}</span>
+                      </TooltipTrigger>
+                      <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+                    </Tooltip>
+                  </>
+                )}
               </span>
             </div>
           </div>

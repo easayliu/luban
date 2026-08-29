@@ -1444,3 +1444,19 @@ export function switchTitle(cred: Credential, language: Language = 'zh-CN'): str
   }
   return localize(language, '已启用（点击停用）', 'Enabled (click to disable)')
 }
+
+/**
+ * 从代理 URL 中提取用于显示的简短标签：`protocol://host:port`，脱掉 user:pass。
+ * 返回 `null` 表示未配置代理（直连）。
+ */
+export function proxyDisplayLabel(proxy: string | null): string | null {
+  if (!proxy) return null
+  try {
+    const u = new URL(proxy)
+    const host = u.hostname || u.host
+    const port = u.port ? `:${u.port}` : ''
+    return `${u.protocol}//${host}${port}`
+  } catch {
+    return proxy.replace(/\/\/[^@]*@/, '//')
+  }
+}

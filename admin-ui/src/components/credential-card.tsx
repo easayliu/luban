@@ -4,6 +4,7 @@ import {
   CheckIcon,
   ClockIcon,
   EllipsisIcon,
+  GlobeIcon,
   SmartphoneIcon,
   TimerOffIcon,
   WalletCardsIcon,
@@ -30,6 +31,7 @@ import {
   deviceUsageMeta,
   evaluateCredential,
   modelCooldownSummary,
+  proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
   orgBadgeLabel,
@@ -387,6 +389,19 @@ export const CredentialCard = memo(function CredentialCard({
             <Badge variant="outline" size="sm" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
               P{cred.priority}
             </Badge>
+            {cred.proxy ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={<button type="button" />}
+                  className={cn(badgeVariants({ variant: 'info', size: 'sm' }), 'cursor-pointer gap-1')}
+                  onClick={() => setProxyOpen(true)}
+                >
+                  <GlobeIcon className="size-3" />
+                  {proxyDisplayLabel(cred.proxy)}
+                </TooltipTrigger>
+                <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+              </Tooltip>
+            ) : null}
           </div>
 
           <section aria-label={t(`${credentialLabel} 的用量限制`, `Usage limits for ${credentialLabel}`)} className="space-y-2">
