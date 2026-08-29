@@ -83,9 +83,12 @@ export function CredentialProxyDialog({
                     size="sm"
                     variant={trimmed === p.url ? 'secondary' : 'outline'}
                     onClick={() => pickProxy(p.url)}
-                    title={p.url}
+                    title={`${p.url}${p.credential_count > 0 ? ` · ${p.credential_count} ${t('个账号在用', 'account(s)')}` : ''}`}
                   >
                     {p.label}
+                    {p.credential_count > 0 && (
+                      <span className="ml-1 text-muted-foreground">({p.credential_count})</span>
+                    )}
                   </Button>
                 ))}
               </div>

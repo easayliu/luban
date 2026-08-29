@@ -719,6 +719,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onSuccess: () => {
       toastManager.add({ title: t('已保存出站代理', 'Outbound proxy saved'), type: 'success' })
       invalidate()
+      qc.invalidateQueries({ queryKey: ['proxies'] })
     },
     onError: (e) => failure(t('设置出站代理失败', 'Failed to set the outbound proxy'), e),
   })

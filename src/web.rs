@@ -510,6 +510,9 @@ async fn exchange(
     // 凭证已入库，代理存不进去时不回滚凭证（手动配一次也行），但必须如实报错让人知道。
     if let Some(ref url) = proxy {
         state.store.set_proxy(cred.id, Some(url)).map_err(internal)?;
+        // 顺手把代理加进代理池——下次添加账号时直接从池里选，不必再手打一遍。
+        // 已存在的自动忽略（URL 有唯一索引）。
+        state.store.ensure_proxy_in_pool(url);
     }
 
     // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。
@@ -921,6 +924,10 @@ async fn set_proxy(
     // 「看着已经换了、实际还在走旧的」是这类缓存最典型的坑。
     if let Some(old) = cred.proxy.as_deref() {
         state.clients.forget(old);
+    }
+    // 新代理自动入池：下次其他账号能直接从池里选，不必再手打。
+    if let Some(ref url) = proxy {
+        state.store.ensure_proxy_in_pool(url);
     }
     tracing::info!(
         cred_id = id, cred = %cred.label,

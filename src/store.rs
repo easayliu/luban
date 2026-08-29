@@ -1174,6 +1174,18 @@ impl CredentialStore {
         })
     }
 
+    /// 确保代理在池中存在：不在则自动添加（label 取 host:port），已在则忽略。
+    pub fn ensure_proxy_in_pool(&self, url: &str) {
+        let conn = self.conn.lock();
+        let label = url_to_label(url);
+        if let Err(e) = conn.execute(
+            "INSERT OR IGNORE INTO proxies (label, url) VALUES (?1, ?2)",
+            params![label, url],
+        ) {
+            tracing::debug!(error = %e, url, "ensure_proxy_in_pool: insert ignored");
+        }
+    }
+
     /// 添加一条代理到池中，返回新记录。`url` 应已经过 `crate::clients::validate_proxy` 校验。
     pub fn add_proxy(&self, label: &str, url: &str) -> Result<SavedProxy> {
         let conn = self.conn.lock();
@@ -2169,6 +2181,17 @@ impl Default for ForwardFlags {
 }
 
 /// 布尔型设置的统一口径：仅 `"0"`/`"false"`（忽略大小写与首尾空白）为关，其余为开。
+/// 从代理 URL 中提取 `host:port` 作为人可读的标签。
+///
+/// 先去掉 `scheme://`，再去掉 `user:pass@`，保留剩余部分（`host:port`）。
+/// 解析失败时回退到完整 URL。
+fn url_to_label(raw: &str) -> String {
+    let after_scheme = raw.find("://").map(|i| &raw[i + 3..]).unwrap_or(raw);
+    let after_auth =
+        after_scheme.rfind('@').map(|i| &after_scheme[i + 1..]).unwrap_or(after_scheme);
+    if after_auth.is_empty() { raw.to_string() } else { after_auth.to_string() }
+}
+
 fn setting_is_on(value: &str) -> bool {
     !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false")
 }
