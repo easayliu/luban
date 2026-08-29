@@ -222,6 +222,45 @@ pub async fn handle(
     // 而这个值逐轮不变。
     let req_max_tokens = request_max_tokens(body_json.as_ref());
 
+    // 2.3a) 4.6+ 全系列不支持 assistant message prefill（末尾 role=assistant 的轮次），
+    //       上游会返回 400。策略由 `prefill_policy` 控制：
+    //       - strip（默认）：主动剥掉末尾 assistant 轮后转发，省去白跑一趟。
+    //       - reject：本地直接 400 拒绝，不往上游送。
+    //       - off：不做任何处理，交给上游（被动重试兜底）。
+    //       后面那条被动重试（[`is_prefill_not_supported_error`] → [`retry_without_prefill`]）
+    //       仍保留作为兜底：万一新模型不在列表里、或者上游的拒绝消息换了措辞。
+    let body = if req_model.as_deref().is_some_and(model_rejects_prefill)
+        && has_trailing_assistant(body_json.as_ref())
+    {
+        match state.store.prefill_policy() {
+            store::PrefillPolicy::Strip => match strip_assistant_prefill(&body) {
+                Some(stripped) => {
+                    tracing::info!(
+                        model = %req_model.as_deref().unwrap_or("-"),
+                        "proactively stripped trailing assistant prefill for a model that does not support it"
+                    );
+                    stripped
+                }
+                None => body,
+            },
+            store::PrefillPolicy::Reject => {
+                tracing::info!(
+                    model = %req_model.as_deref().unwrap_or("-"),
+                    ua = %client_ua,
+                    "rejected: assistant message prefill is not supported by this model (prefill_policy=reject)"
+                );
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "This model does not support assistant message prefill. The conversation must end with a user message.",
+                );
+            }
+            store::PrefillPolicy::Off => body,
+        }
+    } else {
+        body
+    };
+
     // 2.3) 上游已经拒过一次的「模型 + 请求里的某个取值」组合（`effort: 'xhigh'`、
     //      `role: 'system'` 之类）→ 本地直接拒，不往上游送。这是纯粹的请求形态错误：
     //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
@@ -931,6 +970,17 @@ pub async fn handle(
                         );
                     } else if let Some(up) =
                         retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
+                    {
+                        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
+                    }
+                }
+                // assistant prefill 不支持时，剥掉末尾 assistant 轮后重试一次。
+                if status == StatusCode::BAD_REQUEST
+                    && !compressed
+                    && is_prefill_not_supported_error(&err_bytes)
+                {
+                    if let Some(up) =
+                        retry_without_prefill(&upstream, &cred, &device_fp, &body, &mut rl).await
                     {
                         return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
                     }
@@ -1661,6 +1711,116 @@ fn is_thinking_signature_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("signature") && hay.contains("thinking")
+}
+
+/// `messages` 末尾是不是 `assistant` 轮——用已解析的 `body_json` 判，零开销。
+fn has_trailing_assistant(body: Option<&serde_json::Value>) -> bool {
+    body.and_then(|v| v.get("messages"))
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.last())
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("assistant")
+}
+
+/// 模型是否不支持 assistant message prefill（4.6+ 全系列均不支持）。
+///
+/// 用于在转发前主动剥掉末尾 assistant 轮，省去被上游 400 后再重试的往返。
+/// 客户端可能带日期后缀（如 `claude-opus-4-6-20251114`），故用前缀匹配。
+fn model_rejects_prefill(model: &str) -> bool {
+    [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ]
+    .iter()
+    .any(|p| model.starts_with(p))
+}
+
+/// 上游那条 400 是不是「该模型不支持 assistant message prefill」，形如
+/// `This model does not support assistant message prefill.`
+///
+/// 只按 message 文本判、不卡 `error.type`：同样归在 `invalid_request_error` 名下。
+fn is_prefill_not_supported_error(body: &[u8]) -> bool {
+    let (_, message) = parse_upstream_error(body);
+    let hay = message.to_lowercase();
+    hay.contains("does not support") && hay.contains("prefill")
+}
+
+/// 剥掉 `messages` 末尾连续的 `assistant` 轮——也就是客户端发的 prefill。
+///
+/// 返回 `None` 表示末轮不是 assistant（不该走到这）或者剥完之后一条消息都不剩。
+fn strip_assistant_prefill(body: &Bytes) -> Option<Bytes> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let msgs = v.get_mut("messages")?.as_array_mut()?;
+    let before = msgs.len();
+    while msgs.last().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
+        msgs.pop();
+    }
+    if msgs.is_empty() || msgs.len() == before {
+        return None;
+    }
+    serde_json::to_vec(&v).ok().map(Bytes::from)
+}
+
+/// 上游拒绝 prefill 时，剥掉末尾 assistant 轮后用同一个凭证重试一次。
+///
+/// 模式与 [`retry_demoted_thinking`] 一致：对原始客户端 body 改写后走 `upstream.shape()` →
+/// `upstream.send()`，成功则替换请求日志里的状态/用量/限流信息并返回上游响应；
+/// 失败或重试仍被拒则返回 `None`，调用侧透传最初那条 400。
+async fn retry_without_prefill(
+    upstream: &Upstream<'_>,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    client_body: &Bytes,
+    rl: &mut ReqLog,
+) -> Option<wreq::Response> {
+    let Some(stripped) = strip_assistant_prefill(client_body) else {
+        tracing::warn!(
+            cred_id = cred.id,
+            cred = %cred.label,
+            "upstream says prefill not supported, but no trailing assistant message found; passing through as is"
+        );
+        return None;
+    };
+    tracing::warn!(
+        cred_id = cred.id,
+        cred = %cred.label,
+        "upstream says this model does not support assistant message prefill: stripped trailing assistant message(s), retrying once"
+    );
+
+    let up = match upstream.send(upstream.shape(&stripped, cred, device_fp)).await {
+        Ok(up) => up,
+        Err(e) => {
+            tracing::warn!(
+                error = %error_chain(&e),
+                "the retry after stripping prefill could not be sent, passing the original 400 through"
+            );
+            return None;
+        }
+    };
+    let status = up.status();
+    if !status.is_success() {
+        tracing::warn!(
+            cred_id = cred.id,
+            cred = %cred.label,
+            status = status.as_u16(),
+            "the retry after stripping prefill was rejected too, passing the original 400 through"
+        );
+        return None;
+    }
+
+    let (is_stream, encoding) = resp_shape(&up);
+    rl.status = status.as_u16();
+    rl.ttft_ms = None;
+    rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
+    rl.ratelimit = RateLimitInfo::from_headers(up.headers());
+    Some(up)
 }
 
 /// 把 assistant 轮里的 `thinking` 块降级成 `text` 块：推理原文原样搬进 text（外面裹一层

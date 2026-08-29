@@ -1772,6 +1772,17 @@ impl CredentialStore {
         }
     }
 
+    /// 4.6+ 模型收到 assistant message prefill 时的处理策略。
+    ///
+    /// 走内存缓存，零查询。缺省（未设置）= [`PrefillPolicy::Strip`]（剥掉后转发）。
+    pub fn prefill_policy(&self) -> PrefillPolicy {
+        match self.settings.read().get(PREFILL_POLICY).map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "reject" => PrefillPolicy::Reject,
+            Some(v) if v == "off" => PrefillPolicy::Off,
+            _ => PrefillPolicy::Strip,
+        }
+    }
+
     /// 允许接入的最低 Claude Code 客户端版本（形如 `2.1.220`）；未设置或空串表示不限。
     ///
     /// 只影响 `User-Agent` 里自报了 `claude-cli/<版本>` 的请求，别的客户端一律放行——见
@@ -1931,6 +1942,39 @@ pub const TOOL_NAME_MIMIC: &str = "tool_name_mimic";
 /// 模拟路径下是否注入 `thinking` 的 settings 键名。缺省视为开启。
 /// 见 [`ForwardFlags::inject_thinking`]。
 pub const INJECT_THINKING: &str = "inject_thinking";
+
+/// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
+///
+/// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
+/// 400 拒绝、不转发；`"off"` = 不做任何处理，交给上游（被动重试兜底）。
+pub const PREFILL_POLICY: &str = "prefill_policy";
+
+/// 4.6+ 模型收到 assistant message prefill 时的处理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillPolicy {
+    /// 主动剥掉末尾 assistant 轮后转发（默认）。
+    Strip,
+    /// 本地直接 400 拒绝，不转发。
+    Reject,
+    /// 不做任何处理，让上游的 400 触发被动重试兜底。
+    Off,
+}
+
+impl PrefillPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strip => "strip",
+            Self::Reject => "reject",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for PrefillPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。

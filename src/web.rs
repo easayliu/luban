@@ -288,6 +288,7 @@ pub async fn run(
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/min-client-version", post(set_min_client_version))
         .route("/settings/oauth-scopes", post(set_oauth_scopes))
+        .route("/settings/prefill-policy", post(set_prefill_policy))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/export", get(export))
         .route("/import", post(import))
@@ -1290,6 +1291,9 @@ struct SettingsResp {
     /// **7d 窗口**的同一档阈值，另算；0（默认）= 不按周用量停号，见
     /// [`crate::store::QUOTA_PAUSE_PCT_7D`]。
     quota_pause_pct_7d: i64,
+    /// 4.6+ 模型收到 assistant message prefill 时的处理策略：
+    /// `"strip"` = 剥掉后转发（默认），`"reject"` = 本地拒绝，`"off"` = 不处理。
+    prefill_policy: String,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -1377,6 +1381,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
     let quota_pause_pct = state.store.quota_pause_pct();
     let quota_pause_pct_7d = state.store.quota_pause_pct_7d();
+    let prefill_policy = state.store.prefill_policy().to_string();
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -1399,6 +1404,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             rate_limit_retry_max,
             quota_pause_pct,
             quota_pause_pct_7d,
+            prefill_policy,
             forwarding,
         };
     }
@@ -1428,6 +1434,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         rate_limit_retry_max,
         quota_pause_pct,
         quota_pause_pct_7d,
+        prefill_policy,
         forwarding,
     }
 }
@@ -1738,6 +1745,33 @@ async fn set_min_client_version(
     }
     state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).map_err(internal)?;
     tracing::info!(version, "minimum client version changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetPrefillPolicyReq {
+    /// `"strip"` / `"reject"` / `"off"`；空串或缺省回到默认的 `"strip"`。
+    prefill_policy: String,
+}
+
+async fn set_prefill_policy(
+    State(state): State<AppState>,
+    Json(req): Json<SetPrefillPolicyReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let value = req.prefill_policy.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "strip" => {
+            state.store.delete_setting(crate::store::PREFILL_POLICY).map_err(internal)?;
+            tracing::info!("prefill policy reset to default (strip)");
+        }
+        "reject" | "off" => {
+            state.store.set_setting(crate::store::PREFILL_POLICY, &value).map_err(internal)?;
+            tracing::info!(policy = %value, "prefill policy changed");
+        }
+        _ => {
+            return Err(bad_request(r#"prefill_policy must be "strip", "reject", or "off""#));
+        }
+    }
     Ok(Json(settings_resp(&state)))
 }
 
