@@ -120,6 +120,7 @@ function isOverageWindow(name: string): boolean {
 
 export type CredentialStatusKind =
   | 'banned'
+  | 'token-invalid'
   | 'rate-limited'
   | 'disabled'
   | 'overage'
@@ -287,6 +288,17 @@ function quotaWarningDetail(quota: QuotaRiskMeta, language: Language): string {
   )
 }
 
+/**
+ * ban_reason 是否来自账号级封禁（account_on_hold 等），而非单纯的 refresh_token 失效。
+ * refresh_token 失效只需重新登录即可恢复；账号封禁则需要去上游解封。
+ */
+export function isAccountBan(banReason: string): boolean {
+  if (/^\[refresh\s/i.test(banReason)) {
+    return /account_on_hold|account.{0,5}(?:suspend|disable|ban|terminat|deactivat)|violat|\/restricted/i.test(banReason)
+  }
+  return true
+}
+
 function statusFromQuota(
   cred: Credential,
   quota: QuotaRiskMeta,
@@ -308,11 +320,23 @@ function statusFromQuota(
     }
   }
   if (cred.ban_reason) {
+    if (isAccountBan(cred.ban_reason)) {
+      return {
+        kind: 'banned', variant: 'error',
+        label: localize(language, '已封禁', 'Banned'),
+        detail: localizeBackendMessage(cred.ban_reason, language),
+        attention: true, rank: 7,
+      }
+    }
     return {
-      kind: 'banned', variant: 'error',
-      label: localize(language, '已封禁', 'Banned'),
-      detail: localizeBackendMessage(cred.ban_reason, language),
-      attention: true, rank: 7,
+      kind: 'token-invalid', variant: 'warning',
+      label: localize(language, 'Token 失效', 'Token expired'),
+      detail: localize(
+        language,
+        'Refresh token 已失效，需要重新登录授权',
+        'Refresh token is no longer valid; re-authentication is required',
+      ),
+      attention: true, rank: 5,
     }
   }
   if (cred.disabled) {
@@ -1352,10 +1376,21 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
     }
   }
   if (cred.ban_reason) {
+    if (isAccountBan(cred.ban_reason)) {
+      return {
+        text: localize(language, '已封禁', 'Banned'),
+        className: 'font-medium text-destructive-foreground',
+        title: localizeBackendMessage(cred.ban_reason, language),
+      }
+    }
     return {
-      text: localize(language, '已封禁', 'Banned'),
-      className: 'font-medium text-destructive-foreground',
-      title: localizeBackendMessage(cred.ban_reason, language),
+      text: localize(language, 'Token 失效', 'Token expired'),
+      className: 'font-medium text-warning-foreground',
+      title: localize(
+        language,
+        'Refresh token 已失效，需要重新登录授权',
+        'Refresh token is no longer valid; re-authentication is required',
+      ),
     }
   }
   if (cred.disabled) {
@@ -1383,15 +1418,22 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
   return credentialExpiryMeta(cred, language)
 }
 
-/** 启用开关的 hover 提示：封禁态说明「已被上游封禁」并提示仍可手动停用。 */
+/** 启用开关的 hover 提示：封禁态说明「已被上游封禁」，Token 失效则提示重新登录。 */
 export function switchTitle(cred: Credential, language: Language = 'zh-CN'): string {
   if (cred.disabled) return localize(language, '已停用（点击启用）', 'Disabled (click to enable)')
   if (cred.ban_reason) {
-    const reason = localizeBackendMessage(cred.ban_reason, language)
+    if (isAccountBan(cred.ban_reason)) {
+      const reason = localizeBackendMessage(cred.ban_reason, language)
+      return localize(
+        language,
+        `${reason} · 点击可手动停用`,
+        `${reason} · Click to disable manually`,
+      )
+    }
     return localize(
       language,
-      `${reason} · 点击可手动停用`,
-      `${reason} · Click to disable manually`,
+      'Refresh token 已失效，需要重新登录授权 · 点击可手动停用',
+      'Refresh token expired; re-authentication required · Click to disable manually',
     )
   }
   return localize(language, '已启用（点击停用）', 'Enabled (click to disable)')
