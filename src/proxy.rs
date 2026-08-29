@@ -986,7 +986,23 @@ pub async fn handle(
                     if !flags.thinking_signature_retry {
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
-                            "upstream rejected a thinking-block signature (the history was most likely signed by another credential); demote-and-retry is off, passing through as is"
+                            "upstream rejected a thinking-block signature; demote-and-retry is off, passing through as is"
+                        );
+                    } else if let Some(up) =
+                        retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
+                    {
+                        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
+                    }
+                }
+                // thinking 块被修改降级重试（JSON 序列化改变了编码）。
+                if status == StatusCode::BAD_REQUEST
+                    && !compressed
+                    && is_thinking_modified_error(&err_bytes)
+                {
+                    if !flags.thinking_modified_retry {
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            "upstream rejected modified thinking blocks; demote-and-retry is off, passing through as is"
                         );
                     } else if let Some(up) =
                         retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
@@ -1731,6 +1747,18 @@ fn is_thinking_signature_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("signature") && hay.contains("thinking")
+}
+
+/// 上游那条 400 是不是「thinking 块被修改过」，形如
+/// `messages.N.content.M: \`thinking\` or \`redacted_thinking\` blocks in the latest
+///  assistant message cannot be modified.`
+///
+/// 成因：客户端或代理的 JSON 序列化/反序列化改变了 thinking 块的编码。
+/// 处理方式与签名错误一样——降级重试。
+fn is_thinking_modified_error(body: &[u8]) -> bool {
+    let (_, message) = parse_upstream_error(body);
+    let hay = message.to_lowercase();
+    hay.contains("cannot be modified") && hay.contains("thinking")
 }
 
 /// `messages` 末尾是不是 `assistant` 轮——用已解析的 `body_json` 判，零开销。
@@ -7088,6 +7116,7 @@ mod tests {
             system_shape: false,
             orig_header_case: false,
             thinking_signature_retry: false,
+            thinking_modified_retry: false,
             simulate_cc: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -7699,6 +7728,7 @@ mod tests {
             system_shape: false,
             orig_header_case: false,
             thinking_signature_retry: false,
+            thinking_modified_retry: false,
             simulate_cc: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -8139,6 +8169,7 @@ mod tests {
                 system_shape: false,
                 orig_header_case: false,
                 thinking_signature_retry: false,
+                thinking_modified_retry: false,
                 simulate_cc: false,
                 fill_metadata: false,
                 rate_limit_retry: false,

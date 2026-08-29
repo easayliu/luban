@@ -1758,6 +1758,9 @@ impl CredentialStore {
         if let Some(v) = on(THINKING_SIGNATURE_RETRY) {
             flags.thinking_signature_retry = v;
         }
+        if let Some(v) = on(THINKING_MODIFIED_RETRY) {
+            flags.thinking_modified_retry = v;
+        }
         if let Some(v) = on(SIMULATE_CC) {
             flags.simulate_cc = v;
         }
@@ -1955,6 +1958,10 @@ pub const ORIG_HEADER_CASE: &str = "orig_header_case";
 /// 缺省视为开启：它只在那一种 400 上触发，重试失败也会原样透传最初那条响应，开着不会更差。
 pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
 
+/// 上游以「thinking 块被修改」拒绝时，是否降级历史 thinking 块后重试一次的 settings 键名。
+/// 缺省视为开启。成因通常是 JSON 序列化改变了 thinking 块的编码。
+pub const THINKING_MODIFIED_RETRY: &str = "thinking_modified_retry";
+
 /// 非 Claude Code 客户端的请求，是否按官方抓包形态模拟成 CC 请求的 settings 键名。
 /// 缺省视为开启：关掉的话这类请求会因缺 `You are Claude Code, …` 被上游拒掉，等于不可用。
 pub const SIMULATE_CC: &str = "simulate_cc";
@@ -2086,6 +2093,9 @@ pub struct ForwardFlags {
     /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
     /// （见 [`crate::proxy::demote_thinking_blocks`]）。
     pub thinking_signature_retry: bool,
+    /// 上游以「thinking 块被修改」拒绝时，降级历史 thinking 块后重试一次。
+    /// 成因通常是 JSON 序列化改变了 thinking 块的编码。
+    pub thinking_modified_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。
     pub simulate_cc: bool,
@@ -2184,6 +2194,7 @@ impl Default for ForwardFlags {
             system_shape: true,
             orig_header_case: true,
             thinking_signature_retry: true,
+            thinking_modified_retry: true,
             simulate_cc: true,
             fill_metadata: true,
             rate_limit_retry: true,
@@ -6358,6 +6369,7 @@ mod tests {
             (STRIP_EXTRA_FIELDS, "0"),
             (TOOL_NAME_MIMIC, "0"),
             (INJECT_THINKING, "0"),
+            (THINKING_MODIFIED_RETRY, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -6374,6 +6386,7 @@ mod tests {
                 system_shape: false,
                 orig_header_case: false,
                 thinking_signature_retry: false,
+                thinking_modified_retry: false,
                 simulate_cc: false,
                 fill_metadata: false,
                 rate_limit_retry: false,

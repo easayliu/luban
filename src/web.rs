@@ -1417,6 +1417,8 @@ struct ForwardingResp {
     orig_header_case: bool,
     /// 上游拒绝 thinking 块签名时，降级历史 thinking 后重试一次。
     thinking_signature_retry: bool,
+    /// 上游拒绝被修改的 thinking 块时，降级历史 thinking 后重试一次。
+    thinking_modified_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求。
     simulate_cc: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
@@ -1449,6 +1451,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             system_shape: f.system_shape,
             orig_header_case: f.orig_header_case,
             thinking_signature_retry: f.thinking_signature_retry,
+            thinking_modified_retry: f.thinking_modified_retry,
             simulate_cc: f.simulate_cc,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
@@ -1944,6 +1947,7 @@ struct SetForwardingReq {
     system_shape: Option<bool>,
     orig_header_case: Option<bool>,
     thinking_signature_retry: Option<bool>,
+    thinking_modified_retry: Option<bool>,
     simulate_cc: Option<bool>,
     fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
@@ -1966,7 +1970,8 @@ async fn set_forwarding(
         FILL_CLIENT_HEADERS, FILL_METADATA, INJECT_THINKING, MERGE_BETA, NONSTREAM_AS_SSE,
         NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH,
         SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
+        TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -1978,6 +1983,7 @@ async fn set_forwarding(
         (SYSTEM_SHAPE, req.system_shape),
         (ORIG_HEADER_CASE, req.orig_header_case),
         (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
+        (THINKING_MODIFIED_RETRY, req.thinking_modified_retry),
         (SIMULATE_CC, req.simulate_cc),
         (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),

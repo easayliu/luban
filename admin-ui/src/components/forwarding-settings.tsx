@@ -447,6 +447,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="thinking_modified_retry"
+          label={t('thinking 修改兜底', 'thinking modification fallback')}
+          summary={t(
+            '上游检测到 thinking 块被修改时，自动降级并重试一次。',
+            'When the upstream detects modified thinking blocks, automatically downgrade them and retry once.',
+          )}
+          description={
+            <>
+              {t(
+                '成因通常是 JSON 序列化/反序列化改变了 thinking 块的编码（如 Unicode 转义、数字格式）。处理方式与签名兜底相同：把历史 thinking 块降级成普通文本后重试。',
+                'Usually caused by JSON serialization changing the encoding of thinking blocks (e.g. Unicode escapes, number formatting). Handled the same way as the signature fallback: historical thinking blocks are downgraded to plain text and retried.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
     </div>
   )
