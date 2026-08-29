@@ -16,9 +16,12 @@ import {
   getSettings,
   setForwarding,
   setOauthScopes,
+  setPrefillPolicy,
   setQuotaPausePct,
   setRateLimitRetryMax,
+  setSamplingPolicy,
   type ForwardingKey,
+  type PolicyValue,
   type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
@@ -385,6 +388,27 @@ export function ForwardingSettingsContent() {
         />
       </SettingsGroup>
 
+      <SettingsGroup icon={SlidersHorizontalIcon} title={t('请求兼容性', 'Request compatibility')}>
+        <PolicySelect
+          label={t('Assistant Prefill', 'Assistant Prefill')}
+          summary={t(
+            '4.6+ 模型不支持 assistant message prefill（末尾 assistant 轮）。',
+            'Claude 4.6+ models do not support assistant message prefill (trailing assistant turns).',
+          )}
+          value={settingsQuery.data.prefill_policy as PolicyValue}
+          settingKey="prefill"
+        />
+        <PolicySelect
+          label={t('Sampling 参数', 'Sampling parameters')}
+          summary={t(
+            '4.7+ 模型不支持 temperature / top_p / top_k。',
+            'Claude 4.7+ models do not support temperature / top_p / top_k.',
+          )}
+          value={settingsQuery.data.sampling_policy as PolicyValue}
+          settingKey="sampling"
+        />
+      </SettingsGroup>
+
       <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>
         <ForwardingToggle
           k="rate_limit_retry"
@@ -531,6 +555,76 @@ function OAuthScopes() {
             {t('保存', 'Save')}
           </Button>
         </div>
+      </div>
+    </Field>
+  )
+}
+
+type PolicyKey = 'prefill' | 'sampling'
+
+const POLICY_LABELS: Record<PolicyValue, [string, string]> = {
+  strip: ['剥离后转发', 'Strip & forward'],
+  reject: ['本地拒绝', 'Reject locally'],
+  off: ['不处理', 'Off'],
+}
+
+function PolicySelect({
+  label,
+  summary,
+  value,
+  settingKey,
+}: {
+  label: string
+  summary: string
+  value: PolicyValue
+  settingKey: PolicyKey
+}) {
+  const { language, t } = useI18n()
+  const id = useId()
+  const qc = useQueryClient()
+
+  const save = useMutation({
+    mutationFn: (next: PolicyValue) =>
+      settingKey === 'prefill' ? setPrefillPolicy(next) : setSamplingPolicy(next),
+    onSuccess: (settings: Settings) => {
+      const v = settingKey === 'prefill' ? settings.prefill_policy : settings.sampling_policy
+      const [zh, en] = POLICY_LABELS[v as PolicyValue] ?? ['', '']
+      toastManager.add({
+        title: t(`${label}：${zh}`, `${label}: ${en}`),
+        description: summary,
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  return (
+    <Field className="p-5">
+      <div className="flex w-full items-start justify-between gap-4">
+        <div className="min-w-0 space-y-1">
+          <FieldLabel htmlFor={id}>{label}</FieldLabel>
+          <FieldDescription className="leading-5">{summary}</FieldDescription>
+        </div>
+        <select
+          id={id}
+          className="h-8 min-w-28 rounded-lg border border-input bg-background px-2 text-sm shadow-xs/5 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64"
+          value={value}
+          disabled={save.isPending}
+          onChange={(e) => save.mutate(e.target.value as PolicyValue)}
+        >
+          {(Object.keys(POLICY_LABELS) as PolicyValue[]).map((k) => (
+            <option key={k} value={k}>
+              {t(POLICY_LABELS[k][0], POLICY_LABELS[k][1])}
+            </option>
+          ))}
+        </select>
       </div>
     </Field>
   )

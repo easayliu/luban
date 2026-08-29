@@ -1783,6 +1783,18 @@ impl CredentialStore {
         }
     }
 
+    /// 4.7+ 模型收到 sampling 参数（`temperature`/`top_p`/`top_k`）时的处理策略。
+    ///
+    /// 走内存缓存，零查询。缺省（未设置）= [`PrefillPolicy::Strip`]（剥掉后转发）。
+    /// 复用 [`PrefillPolicy`] 枚举——三档语义完全相同。
+    pub fn sampling_policy(&self) -> PrefillPolicy {
+        match self.settings.read().get(SAMPLING_POLICY).map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "reject" => PrefillPolicy::Reject,
+            Some(v) if v == "off" => PrefillPolicy::Off,
+            _ => PrefillPolicy::Strip,
+        }
+    }
+
     /// 允许接入的最低 Claude Code 客户端版本（形如 `2.1.220`）；未设置或空串表示不限。
     ///
     /// 只影响 `User-Agent` 里自报了 `claude-cli/<版本>` 的请求，别的客户端一律放行——见
@@ -1975,6 +1987,12 @@ impl std::fmt::Display for PrefillPolicy {
         f.write_str(self.as_str())
     }
 }
+
+/// 4.7+ 模型不支持 sampling 参数（`temperature`/`top_p`/`top_k`）时的处理策略的 settings 键名。
+///
+/// 取值与 [`PREFILL_POLICY`] 相同：`"strip"`（默认）= 主动剥掉后转发；`"reject"` = 本地
+/// 直接 400 拒绝；`"off"` = 不做任何处理，交给运行时学习兜底。
+pub const SAMPLING_POLICY: &str = "sampling_policy";
 
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。

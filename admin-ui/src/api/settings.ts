@@ -75,6 +75,10 @@ export interface Settings {
   tool_name_mimic: boolean
   /** 模拟路径下是否注入 thinking（及配套的 context_management）。 */
   inject_thinking: boolean
+  /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
+  prefill_policy: string
+  /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
+  sampling_policy: string
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -235,6 +239,25 @@ export async function setMinClientVersion(version: string): Promise<Settings> {
 export async function setOauthScopes(scopes: string): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/oauth-scopes', {
     oauth_scopes: scopes,
+  })
+  return data
+}
+
+/** 策略类型：strip = 剥离后转发（默认），reject = 本地 400 拒绝，off = 不处理。 */
+export type PolicyValue = 'strip' | 'reject' | 'off'
+
+/** 设置 prefill 处理策略。 */
+export async function setPrefillPolicy(policy: PolicyValue): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/prefill-policy', {
+    prefill_policy: policy,
+  })
+  return data
+}
+
+/** 设置 sampling 参数处理策略。 */
+export async function setSamplingPolicy(policy: PolicyValue): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/sampling-policy', {
+    sampling_policy: policy,
   })
   return data
 }

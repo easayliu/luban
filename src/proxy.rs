@@ -296,14 +296,34 @@ pub async fn handle(
         );
     }
 
-    // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）→ 剥掉后正常转发。
+    // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
+    //       策略由 `sampling_policy` 控制：strip（默认）= 剥掉后转发，reject = 本地 400，
+    //       off = 不做静态预置处理（运行时学习仍兜底）。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
-    let mut body = maybe_strip_deprecated(
-        &state.deprecated_fields,
-        req_model.as_deref(),
-        body_json.as_ref(),
-        body,
-    );
+    let sampling_policy = state.store.sampling_policy();
+    let mut body = if sampling_policy == store::PrefillPolicy::Reject
+        && req_model.as_deref().is_some_and(model_rejects_sampling)
+        && has_deprecated_sampling_field(body_json.as_ref())
+    {
+        tracing::info!(
+            model = %req_model.as_deref().unwrap_or("-"),
+            ua = %client_ua,
+            "rejected: sampling parameters (temperature/top_p/top_k) are deprecated for this model (sampling_policy=reject)"
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Sampling parameters (temperature, top_p, top_k) are deprecated for this model.",
+        );
+    } else {
+        maybe_strip_deprecated(
+            &state.deprecated_fields,
+            req_model.as_deref(),
+            body_json.as_ref(),
+            body,
+            sampling_policy != store::PrefillPolicy::Off,
+        )
+    };
 
     // 2.4) 每设备 RPM 上限：这台机器最近 60 秒发得太多 → 直接 429 + `retry-after`。
     //      **不换号**：账号打满换个号还能发，设备打满换哪个号都是同一台机器在刷，换号只会
@@ -4134,28 +4154,57 @@ fn remember_deprecated_field(
     }
 }
 
+/// 请求体里是否带了 [`DEPRECATABLE_FIELDS`] 中的任何一项——用已解析的 `body_json` 判，零开销。
+fn has_deprecated_sampling_field(body: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = body.and_then(|v| v.as_object()) else { return false };
+    DEPRECATABLE_FIELDS.iter().any(|&f| obj.contains_key(f))
+}
+
+/// 模型是否不支持 sampling 参数（`temperature`/`top_p`/`top_k`）。
+///
+/// 4.7+ 及 Sonnet 5 / Fable 5 / Mythos 5 全系列已移除这些参数，传了会 400。
+/// 注意 **4.6 仍然允许**——与 prefill 的 4.6+ 全系列不同。
+fn model_rejects_sampling(model: &str) -> bool {
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ]
+    .iter()
+    .any(|p| model.starts_with(p))
+}
+
 /// 请求体里有没有该模型已经被标记为 deprecated 的字段；有则从 `body` 里剥掉后返回
 /// 新的 `Bytes`，没有则原样返回（零拷贝）。
 ///
 /// **先用已经解析好的 `body_json` 做只读检查**，命中了才重新解析 `body` 做改写——
 /// 绝大多数请求根本不带 `temperature` 或者模型没有废弃它，走的是零开销的快速路径。
+///
+/// 除了运行时学到的 [`DeprecatedFieldMemory`]，还按官方文档预置了已知模型的 deprecated
+/// 字段（[`model_rejects_sampling`]），避免冷启动第一条请求白撞一次 400。
+///
+/// `use_static_list`：是否启用静态预置名单。`sampling_policy=off` 时传 `false`，
+/// 关掉主动剥离但保留运行时学习兜底。
 fn maybe_strip_deprecated(
     mem: &DeprecatedFieldMemory,
     model: Option<&str>,
     body_json: Option<&serde_json::Value>,
     body: Bytes,
+    use_static_list: bool,
 ) -> Bytes {
     let Some(model) = model else { return body };
     let Some(bj) = body_json else { return body };
     let Some(obj) = bj.as_object() else { return body };
+    let static_reject = use_static_list && model_rejects_sampling(model);
     let table = mem.read();
-    if table.is_empty() {
-        return body;
-    }
     let to_strip: Vec<&str> = DEPRECATABLE_FIELDS
         .iter()
         .filter(|&&f| {
-            obj.contains_key(f) && table.contains_key(&(model.to_string(), f.to_string()))
+            obj.contains_key(f)
+                && (static_reject || table.contains_key(&(model.to_string(), f.to_string())))
         })
         .copied()
         .collect();
@@ -8418,42 +8467,83 @@ mod tests {
         ))
     }
 
-    /// 学一次之后，同模型的 `temperature` 字段会被自动剥掉；不同模型不受影响。
+    /// 已知模型（4.7+）即使没学过也会主动剥掉 sampling 参数。
+    #[test]
+    fn strips_sampling_for_known_models_without_learning() {
+        let mem = super::DeprecatedFieldMemory::default();
+        for model in &[
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+        ] {
+            let body = temp_req(model);
+            let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
+            let out = super::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw, true);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert!(v.get("temperature").is_none(), "{model}: temperature 应该被主动剥掉");
+            assert!(v.get("model").is_some(), "{model}: 不该动别的字段");
+        }
+    }
+
+    /// 4.6 及更早的模型不在预置名单里，不应主动剥。
+    #[test]
+    fn does_not_strip_sampling_for_old_models() {
+        let mem = super::DeprecatedFieldMemory::default();
+        for model in &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            let body = temp_req(model);
+            let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
+            let out =
+                super::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw.clone(), true);
+            assert_eq!(out, raw, "{model}: 不该主动剥");
+        }
+    }
+
+    /// 对于不在预置名单的模型，学一次 400 之后才会剥；不同模型不受影响。
     #[test]
     fn strips_deprecated_field_after_learning() {
         let mem = super::DeprecatedFieldMemory::default();
-        let body = temp_req("claude-fable-5");
+        // 用 4.6（不在预置名单里）测试学习流程。
+        let body = temp_req("claude-opus-4-6");
 
         // 学之前不剥。
         let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out =
-            super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw.clone());
+        let out = super::maybe_strip_deprecated(
+            &mem,
+            Some("claude-opus-4-6"),
+            body.as_ref(),
+            raw.clone(),
+            true,
+        );
         assert_eq!(out, raw, "学之前应该原样返回");
 
         // 喂一条 400。
         super::remember_deprecated_field(
             &mem,
-            Some("claude-fable-5"),
+            Some("claude-opus-4-6"),
             body.as_ref(),
             &err_json(TEMP_400),
         );
         assert_eq!(mem.read().len(), 1);
 
         // 学过之后剥掉。
-        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
+        let out =
+            super::maybe_strip_deprecated(&mem, Some("claude-opus-4-6"), body.as_ref(), raw, true);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("temperature").is_none(), "temperature 应该被剥掉: {v}");
         assert!(v.get("model").is_some(), "不该动别的字段: {v}");
         assert!(v.get("messages").is_some(), "不该动 messages: {v}");
 
-        // 不同模型不受影响。
-        let other_body = temp_req("claude-opus-5");
+        // 不同模型不受影响（用 sonnet-4-6，也不在预置名单里）。
+        let other_body = temp_req("claude-sonnet-4-6");
         let other_raw = Bytes::from(serde_json::to_vec(other_body.as_ref().unwrap()).unwrap());
         let out = super::maybe_strip_deprecated(
             &mem,
-            Some("claude-opus-5"),
+            Some("claude-sonnet-4-6"),
             other_body.as_ref(),
             other_raw.clone(),
+            true,
         );
         assert_eq!(out, other_raw, "不同模型不该被剥");
     }
@@ -8490,7 +8580,8 @@ mod tests {
         );
         assert_eq!(mem.read().len(), 1);
         let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out = super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
+        let out =
+            super::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw, true);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("top_p").is_none(), "top_p 应该被剥掉: {v}");
     }
@@ -8507,7 +8598,7 @@ mod tests {
         assert!(mem.read().is_empty());
         // 剥也一样安全。
         let raw = Bytes::from_static(b"{}");
-        assert_eq!(super::maybe_strip_deprecated(&mem, None, None, raw.clone()), raw);
+        assert_eq!(super::maybe_strip_deprecated(&mem, None, None, raw.clone(), true), raw);
     }
 
     /// 本地拒绝回出去的那份体，形态与上游的错误体一致（客户端只读 `error.message`），

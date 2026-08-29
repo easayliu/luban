@@ -289,6 +289,7 @@ pub async fn run(
         .route("/settings/min-client-version", post(set_min_client_version))
         .route("/settings/oauth-scopes", post(set_oauth_scopes))
         .route("/settings/prefill-policy", post(set_prefill_policy))
+        .route("/settings/sampling-policy", post(set_sampling_policy))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/export", get(export))
         .route("/import", post(import))
@@ -1294,6 +1295,9 @@ struct SettingsResp {
     /// 4.6+ 模型收到 assistant message prefill 时的处理策略：
     /// `"strip"` = 剥掉后转发（默认），`"reject"` = 本地拒绝，`"off"` = 不处理。
     prefill_policy: String,
+    /// 4.7+ 模型收到 sampling 参数时的处理策略：
+    /// `"strip"` = 剥掉后转发（默认），`"reject"` = 本地拒绝，`"off"` = 不处理。
+    sampling_policy: String,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -1382,6 +1386,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let quota_pause_pct = state.store.quota_pause_pct();
     let quota_pause_pct_7d = state.store.quota_pause_pct_7d();
     let prefill_policy = state.store.prefill_policy().to_string();
+    let sampling_policy = state.store.sampling_policy().to_string();
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -1405,6 +1410,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             quota_pause_pct,
             quota_pause_pct_7d,
             prefill_policy,
+            sampling_policy,
             forwarding,
         };
     }
@@ -1435,6 +1441,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         quota_pause_pct,
         quota_pause_pct_7d,
         prefill_policy,
+        sampling_policy,
         forwarding,
     }
 }
@@ -1770,6 +1777,33 @@ async fn set_prefill_policy(
         }
         _ => {
             return Err(bad_request(r#"prefill_policy must be "strip", "reject", or "off""#));
+        }
+    }
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetSamplingPolicyReq {
+    /// `"strip"` / `"reject"` / `"off"`；空串或缺省回到默认的 `"strip"`。
+    sampling_policy: String,
+}
+
+async fn set_sampling_policy(
+    State(state): State<AppState>,
+    Json(req): Json<SetSamplingPolicyReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let value = req.sampling_policy.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "strip" => {
+            state.store.delete_setting(crate::store::SAMPLING_POLICY).map_err(internal)?;
+            tracing::info!("sampling policy reset to default (strip)");
+        }
+        "reject" | "off" => {
+            state.store.set_setting(crate::store::SAMPLING_POLICY, &value).map_err(internal)?;
+            tracing::info!(policy = %value, "sampling policy changed");
+        }
+        _ => {
+            return Err(bad_request(r#"sampling_policy must be "strip", "reject", or "off""#));
         }
     }
     Ok(Json(settings_resp(&state)))
