@@ -289,12 +289,18 @@ function quotaWarningDetail(quota: QuotaRiskMeta, language: Language): string {
 }
 
 /**
- * ban_reason 是否来自账号级封禁（account_on_hold 等），而非单纯的 refresh_token 失效。
- * refresh_token 失效只需重新登录即可恢复；账号封禁则需要去上游解封。
+ * ban_reason 是否来自账号级封禁（account_on_hold、account suspended 等），
+ * 而非单纯的 token 失效（refresh_token 过期、access_token revoked）。
+ *
+ * 判断顺序：账号级关键词优先命中 → token 级关键词排除 → 未知默认算封禁（保守）。
  */
 export function isAccountBan(banReason: string): boolean {
-  if (/^\[refresh\s/i.test(banReason)) {
-    return /account_on_hold|account.{0,5}(?:suspend|disable|ban|terminat|deactivat)|violat|\/restricted/i.test(banReason)
+  const lower = banReason.toLowerCase()
+  if (/account_on_hold|account.{0,5}(?:suspend|disable|ban|terminat|deactivat)|violat|\/restricted/.test(lower)) {
+    return true
+  }
+  if (/(?:token|grant).{0,15}(?:revoked|expired|invalid|not found)/.test(lower) || lower.includes('invalid_grant')) {
+    return false
   }
   return true
 }

@@ -96,7 +96,8 @@ export type CredentialFilterKey =
   | 'attention'
   | 'enabled'
   | 'disabled'
-  | 'abnormal'
+  | 'banned'
+  | 'tokenInvalid'
   | 'nearLimit'
   | 'cooldown'
   | 'hasDevice'
@@ -142,9 +143,14 @@ const FILTERS: {
   { key: 'enabled', label: ['启用', 'Enabled'], match: ({ credential }) => !credential.disabled },
   { key: 'disabled', label: ['停用', 'Disabled'], match: ({ credential }) => credential.disabled },
   {
-    key: 'abnormal',
-    label: ['异常', 'Abnormal'],
-    match: ({ credential }) => !!credential.ban_reason,
+    key: 'banned',
+    label: ['已封禁', 'Banned'],
+    match: ({ credential }) => !!credential.ban_reason && isAccountBan(credential.ban_reason),
+  },
+  {
+    key: 'tokenInvalid',
+    label: ['Token 失效', 'Token expired'],
+    match: ({ credential }) => !!credential.ban_reason && !isAccountBan(credential.ban_reason),
   },
   { key: 'nearLimit', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
   {
@@ -420,7 +426,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       attention: 0,
       enabled: 0,
       disabled: 0,
-      abnormal: 0,
+      banned: 0,
+      tokenInvalid: 0,
       nearLimit: 0,
       cooldown: 0,
       hasDevice: 0,
@@ -437,8 +444,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       free: 0,
       unknown: 0,
     }
-    let bannedCount = 0
-    let tokenInvalidCount = 0
     let nearLimitCount = 0
     let activeOverageCount = 0
     let unknownOverageCount = 0
@@ -456,9 +461,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       if (credential.disabled) filterCounts.disabled += 1
       else filterCounts.enabled += 1
       if (credential.ban_reason) {
-        filterCounts.abnormal += 1
-        if (isAccountBan(credential.ban_reason)) bannedCount += 1
-        else tokenInvalidCount += 1
+        if (isAccountBan(credential.ban_reason)) filterCounts.banned += 1
+        else filterCounts.tokenInvalid += 1
       }
       if (evaluation.quotaRisk) filterCounts.nearLimit += 1
       // 口径必须与上面 'cooldown' 那条筛选完全一致，否则芯片上的计数和点开后的条数对不上。
@@ -500,8 +504,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return {
       filterCounts,
       tierCounts,
-      bannedCount,
-      tokenInvalidCount,
       nearLimitCount,
       activeOverageCount,
       unknownOverageCount,
@@ -523,7 +525,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
-  const { bannedCount, tokenInvalidCount } = metrics
+  const bannedCount = metrics.filterCounts.banned
+  const tokenInvalidCount = metrics.filterCounts.tokenInvalid
   const attentionStatus = [
     bannedCount > 0
       ? t(`${formatNumber(bannedCount)} 封禁`, `${formatNumber(bannedCount)} banned`)

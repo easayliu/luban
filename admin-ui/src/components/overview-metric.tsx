@@ -36,9 +36,12 @@ export function OverviewMetric({
           </span>
           {trend}
           {status && (
-            <span className="min-w-0 truncate text-2xs text-muted-foreground" title={status}>
-              {status}
-            </span>
+            <Tooltip>
+              <TooltipTrigger className="min-w-0 truncate text-2xs text-muted-foreground">
+                {status}
+              </TooltipTrigger>
+              <TooltipPopup>{status}</TooltipPopup>
+            </Tooltip>
           )}
         </div>
       </div>
