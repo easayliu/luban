@@ -145,12 +145,14 @@ const FILTERS: {
   {
     key: 'banned',
     label: ['已封禁', 'Banned'],
-    match: ({ credential }) => !!credential.ban_reason && isAccountBan(credential.ban_reason),
+    match: ({ credential }) =>
+      !!credential.ban_reason && credential.resume_at == null && isAccountBan(credential.ban_reason),
   },
   {
     key: 'tokenInvalid',
     label: ['Token 失效', 'Token expired'],
-    match: ({ credential }) => !!credential.ban_reason && !isAccountBan(credential.ban_reason),
+    match: ({ credential }) =>
+      !!credential.ban_reason && credential.resume_at == null && !isAccountBan(credential.ban_reason),
   },
   { key: 'nearLimit', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
   {
@@ -460,7 +462,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       if (evaluation.needsAttention) filterCounts.attention += 1
       if (credential.disabled) filterCounts.disabled += 1
       else filterCounts.enabled += 1
-      if (credential.ban_reason) {
+      if (credential.ban_reason && credential.resume_at == null) {
         if (isAccountBan(credential.ban_reason)) filterCounts.banned += 1
         else filterCounts.tokenInvalid += 1
       }
