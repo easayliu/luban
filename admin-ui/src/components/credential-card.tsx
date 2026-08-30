@@ -185,16 +185,7 @@ export const CredentialCard = memo(function CredentialCard({
         ),
       }
     }
-    if (quota.overage === 'historical') {
-      return {
-        label: t('近期用过 Usage credits', 'Recently used usage credits'),
-        variant: 'warning' as const,
-        title: t(
-          '最近的用量快照记录了 Usage credits，但相关用量窗口已经重置',
-          'The latest usage snapshot recorded usage credits, but the related usage windows have reset',
-        ),
-      }
-    }
+    // historical：超额池窗口已重置，情况已经结束，不再显示徽章——避免与「运行正常」矛盾。
     if (quota.overage === 'active' && status.kind !== 'overage') {
       return {
         label: t('Usage credits 生效中', 'Usage credits active'),
@@ -812,7 +803,7 @@ function UpstreamVerdict({
 }) {
   const { t, language } = useI18n()
   const status = quota.unified_status
-  if (!status || status === 'allowed') return null
+  if (!status || status === 'allowed' || status === 'allowed_warning') return null
   const destructive = status === 'rejected' || status === 'rate_limited'
   const statusLabel = unifiedQuotaStatusLabel(status, language)
   const badgeLabel = t(`上游 · ${statusLabel}`, `Upstream · ${statusLabel}`)
