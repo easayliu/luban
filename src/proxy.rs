@@ -1813,7 +1813,7 @@ fn strip_assistant_prefill(body: &Bytes) -> Option<Bytes> {
     if msgs.is_empty() || msgs.len() == before {
         return None;
     }
-    serde_json::to_vec(&v).ok().map(Bytes::from)
+    serde_json::to_vec(&v).ok().map(|bytes| Bytes::from(preserve_thinking_encoding(body, bytes)))
 }
 
 /// 上游拒绝 prefill 时，剥掉末尾 assistant 轮后用同一个凭证重试一次。
@@ -1934,6 +1934,113 @@ fn previous_thinking_block(thinking: &str) -> serde_json::Value {
         format!("<previous_thinking>\n{thinking}\n</previous_thinking>").into(),
     );
     serde_json::Value::Object(blk)
+}
+
+// ---------------------------------------------------------------------------
+// thinking 块原始编码保持
+// ---------------------------------------------------------------------------
+
+/// `serde_json` 的反序列化会把 JSON 字符串里的 `\uXXXX` 解码成 UTF-8 字符；再用
+/// `to_vec` 序列化回去时只保留 serde 自己的转义策略——结果与原始 JSON 在**字节层面**
+/// 不同，即使**逻辑值**完全一致。Anthropic 上游会按字节比对 thinking 块，只要字节变了
+/// 就 400。
+///
+/// 此函数在 [`rewrite_body`] 的最终序列化之后调用：把 `rewritten` 里每个
+/// thinking / redacted_thinking 块替换回 `original` 里的原始字节。
+fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) -> Vec<u8> {
+    let Ok(orig_str) = std::str::from_utf8(original) else { return rewritten };
+    if !orig_str.contains("\"thinking\"") {
+        return rewritten;
+    }
+    let orig_blocks = thinking_block_byte_ranges(orig_str);
+    if orig_blocks.is_empty() {
+        return rewritten;
+    }
+    let rw_blocks = {
+        let Ok(s) = std::str::from_utf8(&rewritten) else { return rewritten };
+        thinking_block_byte_ranges(s)
+    };
+    let mut subs: Vec<(std::ops::Range<usize>, &[u8])> = Vec::new();
+    for ob in &orig_blocks {
+        if let Some(rb) = rw_blocks.iter().find(|r| r.msg == ob.msg && r.blk == ob.blk) {
+            let orig_slice = &original[ob.span.clone()];
+            let rw_slice = &rewritten[rb.span.clone()];
+            if orig_slice != rw_slice {
+                subs.push((rb.span.clone(), orig_slice));
+            }
+        }
+    }
+    if subs.is_empty() {
+        return rewritten;
+    }
+    subs.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut out = rewritten;
+    for (range, orig) in subs {
+        let mut v = Vec::with_capacity(out.len() - range.len() + orig.len());
+        v.extend_from_slice(&out[..range.start]);
+        v.extend_from_slice(orig);
+        v.extend_from_slice(&out[range.end..]);
+        out = v;
+    }
+    out
+}
+
+struct ThinkingBlockRef {
+    msg: usize,
+    blk: usize,
+    span: std::ops::Range<usize>,
+}
+
+/// 用 `RawValue` 零拷贝反序列化找到 `original` 里每个 thinking / redacted_thinking
+/// 块在字节层面的精确位置。
+fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct B<'a> {
+        #[serde(borrow, default)]
+        messages: Vec<M<'a>>,
+    }
+    #[derive(Deserialize)]
+    struct M<'a> {
+        role: Option<&'a str>,
+        #[serde(borrow)]
+        content: Option<&'a serde_json::value::RawValue>,
+    }
+    let Ok(body) = serde_json::from_str::<B<'_>>(json) else { return vec![] };
+    let base = json.as_ptr() as usize;
+    let mut out = Vec::new();
+    for (mi, m) in body.messages.iter().enumerate() {
+        if m.role != Some("assistant") {
+            continue;
+        }
+        let Some(raw_content) = m.content else { continue };
+        let content_str = raw_content.get();
+        // content 是字符串形态时跳过
+        if !content_str.starts_with('[') {
+            continue;
+        }
+        let Ok(blocks) = serde_json::from_str::<Vec<&serde_json::value::RawValue>>(content_str)
+        else {
+            continue;
+        };
+        for (bi, raw) in blocks.iter().enumerate() {
+            let s = raw.get();
+            if !(s.contains("\"thinking\"") || s.contains("\"redacted_thinking\"")) {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("thinking") | Some("redacted_thinking") => {}
+                    _ => continue,
+                }
+            } else {
+                continue;
+            }
+            let start = s.as_ptr() as usize - base;
+            out.push(ThinkingBlockRef { msg: mi, blk: bi, span: start..start + s.len() });
+        }
+    }
+    out
 }
 
 /// 展开 error 的 source 链，拼成「顶层 -> 次层 -> …」，暴露底层真实原因。
@@ -4251,7 +4358,7 @@ fn maybe_strip_deprecated(
     }
     tracing::debug!(model, fields = ?to_strip, "stripped deprecated fields from request");
     match serde_json::to_vec(&v) {
-        Ok(bytes) => Bytes::from(bytes),
+        Ok(bytes) => Bytes::from(preserve_thinking_encoding(&body, bytes)),
         Err(_) => body,
     }
 }
@@ -4566,7 +4673,7 @@ fn rewrite_body(
         return body.clone();
     }
     match serde_json::to_vec(&v) {
-        Ok(bytes) => Bytes::from(bytes),
+        Ok(bytes) => Bytes::from(preserve_thinking_encoding(body, bytes)),
         Err(_) => body.clone(),
     }
 }
@@ -8741,6 +8848,64 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(s.contains("AAAA"), "空 thinking 那轮应原样留着: {s}");
         assert!(!s.contains("BBBB"), "第二轮仍应降级: {s}");
+    }
+
+    // ---------- thinking 块编码保持 ----------
+
+    #[test]
+    fn preserves_thinking_encoding_unicode_escape() {
+        // 原始 body：thinking 内容含 < / >（如 Python json.dumps 产出）。
+        let original = b"{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hello \\u003cworld\\u003e\",\"signature\":\"sig==\"},{\"type\":\"text\",\"text\":\"ok\"}]},{\"role\":\"user\",\"content\":\"bye\"}],\"stream\":true}";
+
+        let orig_str = std::str::from_utf8(original.as_ref()).unwrap();
+        assert!(orig_str.contains(r"\u003c"), "original should contain \\u003c escape: {orig_str}");
+
+        // serde 反序列化把 < 解码成 <，重新序列化变成 literal <world>。
+        let mut v: serde_json::Value = serde_json::from_slice(original.as_ref()).unwrap();
+        v["stream"] = serde_json::Value::Bool(false);
+        let rewritten = serde_json::to_vec(&v).unwrap();
+        let rw_str = std::str::from_utf8(&rewritten).unwrap();
+        assert!(
+            rw_str.contains("hello <world>") && !rw_str.contains(r"\u003c"),
+            "serde should decode \\u003c to literal <: {rw_str}"
+        );
+
+        let fixed = super::preserve_thinking_encoding(original, rewritten);
+        let fixed_str = std::str::from_utf8(&fixed).unwrap();
+
+        // thinking 块应保留原始的 < 编码——不是解码后的 <。
+        assert!(
+            fixed_str.contains(r"\u003c") && fixed_str.contains(r"\u003e"),
+            "thinking content should preserve original \\u003c encoding: {fixed_str}"
+        );
+        // 非 thinking 内容的改动（stream: false）应保留。
+        assert!(
+            fixed_str.contains(r#""stream":false"#),
+            "non-thinking modifications should be preserved: {fixed_str}"
+        );
+    }
+
+    #[test]
+    fn preserve_thinking_noop_when_no_thinking() {
+        let body = br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#;
+        let rewritten = body.to_vec();
+        let result = super::preserve_thinking_encoding(body, rewritten.clone());
+        assert_eq!(result, rewritten);
+    }
+
+    #[test]
+    fn preserve_thinking_handles_redacted() {
+        let original = br#"{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"abc+123"},{"type":"text","text":"ok"}]}]}"#;
+        let mut v: serde_json::Value = serde_json::from_slice(original.as_ref()).unwrap();
+        v["stream"] = true.into();
+        let rewritten = serde_json::to_vec(&v).unwrap();
+
+        let fixed = super::preserve_thinking_encoding(original, rewritten);
+        let s = std::str::from_utf8(&fixed).unwrap();
+        assert!(
+            s.contains(r#""data":"abc+123""#),
+            "redacted_thinking data should preserve original encoding: {s}"
+        );
     }
 
     // ---------- 非 CC 请求的模拟（Simulation） ----------
