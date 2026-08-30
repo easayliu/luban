@@ -946,8 +946,20 @@ async fn refresh_credential(
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     // 手动刷新同样走这个号自己的代理；代理坏掉时如实报错，不退回直连（见 ClientPool）。
     let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
-    let tokens =
-        oauth::refresh(&http, &cred.refresh_token).await.map_err(|e| bad_request(e.to_string()))?;
+    let tokens = match oauth::refresh(&http, &cred.refresh_token).await {
+        Ok(t) => t,
+        Err(e) => {
+            // refresh_token 被永久作废（invalid_grant）→ 标记封禁，与 keepalive / 转发路径口径一致。
+            if let Some(te) = e.downcast_ref::<oauth::TokenEndpointError>() {
+                if te.is_grant_revoked() {
+                    let reason = te.ban_reason();
+                    tracing::warn!(cred_id = id, cred = %cred.label, %reason, "manual refresh: grant revoked, disabling");
+                    let _ = state.store.mark_banned(id, &reason);
+                }
+            }
+            return Err(bad_request(e.to_string()));
+        }
+    };
     state
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
