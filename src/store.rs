@@ -1788,6 +1788,12 @@ impl CredentialStore {
         if let Some(v) = on(INJECT_THINKING) {
             flags.inject_thinking = v;
         }
+        if let Some(v) = on(FLATTEN_TOOL_SCHEMAS) {
+            flags.flatten_tool_schemas = v;
+        }
+        if let Some(v) = on(STRIP_EMPTY_TEXT) {
+            flags.strip_empty_text = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -1991,6 +1997,14 @@ pub const TOOL_NAME_MIMIC: &str = "tool_name_mimic";
 /// 见 [`ForwardFlags::inject_thinking`]。
 pub const INJECT_THINKING: &str = "inject_thinking";
 
+/// 是否展平 tool `input_schema` 顶层的 `allOf`/`oneOf`/`anyOf` 的 settings 键名。
+/// 缺省视为开启：上游不支持这些关键字，直接 400。
+pub const FLATTEN_TOOL_SCHEMAS: &str = "flatten_tool_schemas";
+
+/// 是否剥除 messages 里的空 text 内容块 `{"type":"text","text":""}` 的 settings 键名。
+/// 缺省视为开启：上游要求 text 块非空，部分第三方客户端常发空块。
+pub const STRIP_EMPTY_TEXT: &str = "strip_empty_text";
+
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
@@ -2180,6 +2194,12 @@ pub struct ForwardFlags {
     /// （输出更长、token 消耗更多），且会强制 `temperature=1`（`strip_extra_fields` 自动剥）。
     /// 不想要这些副作用就关掉——代价是模拟形态少一个正面信号。
     pub inject_thinking: bool,
+    /// 展平 tool `input_schema` 顶层的 `allOf`/`oneOf`/`anyOf`。
+    /// 上游不支持这些关键字，直接 400。
+    pub flatten_tool_schemas: bool,
+    /// 剥除 messages 里的空 text 内容块 `{"type":"text","text":""}`。
+    /// 上游要求 text 块非空，部分第三方客户端常发空块。
+    pub strip_empty_text: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2204,6 +2224,8 @@ impl Default for ForwardFlags {
             strip_extra_fields: true,
             tool_name_mimic: true,
             inject_thinking: true,
+            flatten_tool_schemas: true,
+            strip_empty_text: true,
         }
     }
 }
@@ -6370,6 +6392,8 @@ mod tests {
             (TOOL_NAME_MIMIC, "0"),
             (INJECT_THINKING, "0"),
             (THINKING_MODIFIED_RETRY, "0"),
+            (FLATTEN_TOOL_SCHEMAS, "0"),
+            (STRIP_EMPTY_TEXT, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -6396,6 +6420,8 @@ mod tests {
                 strip_extra_fields: false,
                 tool_name_mimic: false,
                 inject_thinking: false,
+                flatten_tool_schemas: false,
+                strip_empty_text: false,
             }
         );
 

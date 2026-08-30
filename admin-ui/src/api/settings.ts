@@ -77,6 +77,10 @@ export interface Settings {
   tool_name_mimic: boolean
   /** 模拟路径下是否注入 thinking（及配套的 context_management）。 */
   inject_thinking: boolean
+  /** 展平 tool input_schema 顶层的 allOf/oneOf/anyOf。 */
+  flatten_tool_schemas: boolean
+  /** 剥除 messages 里的空 text 内容块。 */
+  strip_empty_text: boolean
   /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
   prefill_policy: string
   /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
@@ -104,6 +108,8 @@ export type ForwardingKey =
   | 'strip_extra_fields'
   | 'tool_name_mimic'
   | 'inject_thinking'
+  | 'flatten_tool_schemas'
+  | 'strip_empty_text'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

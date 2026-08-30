@@ -4548,6 +4548,11 @@ fn rewrite_body(
         ttl_1h: flags.cache_ttl_1h && flags.merge_beta,
     };
     // 全关且不模拟：连解析都不必做，原样返回。
+    // 额外检查：body 里含 allOf/oneOf/anyOf 或空 text 块时仍需解析（须对应开关开着）。
+    let may_need_schema_fix = flags.flatten_tool_schemas
+        && body.windows(5).any(|w| w == b"allOf" || w == b"oneOf" || w == b"anyOf");
+    let may_have_empty_text =
+        flags.strip_empty_text && body.windows(9).any(|w| w == b"\"text\":\"\"");
     if sim.is_none()
         && !shape
         && !flags.spoof_identity
@@ -4555,6 +4560,8 @@ fn rewrite_body(
         && !flags.strip_extra_fields
         && !force_stream
         && tool_names.is_none()
+        && !may_need_schema_fix
+        && !may_have_empty_text
     {
         return body.clone();
     }
@@ -4628,6 +4635,10 @@ fn rewrite_body(
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
     // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
     let tools_deduped = dedup_tools(&mut v);
+    // 空 text 块剥除：上游要求 text 块非空，第三方客户端常发空块。
+    let empty_text_stripped = flags.strip_empty_text && strip_empty_text_blocks(&mut v);
+    // input_schema 顶层的 allOf/oneOf/anyOf 展平：上游不支持，直接 400。
+    let schemas_flattened = flags.flatten_tool_schemas && flatten_tool_schemas(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
@@ -4647,6 +4658,8 @@ fn rewrite_body(
         top_level_ordered,
         cc_tools_injected,
         tools_deduped,
+        empty_text_stripped,
+        schemas_flattened,
         tools_mimicked,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
@@ -4668,6 +4681,8 @@ fn rewrite_body(
         && !top_level_ordered
         && !cc_tools_injected
         && !tools_deduped
+        && !empty_text_stripped
+        && !schemas_flattened
         && !tools_mimicked
     {
         return body.clone();
@@ -5445,6 +5460,128 @@ fn inject_cc_tools(v: &mut serde_json::Value) -> bool {
 
 /// `tools` 数组按 `name` 去重：保留每个名字的首次出现，丢弃后续重复声明。
 /// 上游对重复名直接 400（`Tool names must be unique`），而客户端侧不一定能改。
+/// 上游不支持 `input_schema` 顶层的 `allOf` / `oneOf` / `anyOf`（直接 400），
+/// 这里把它们展平为一个普通 `object` schema。
+///
+/// - **`allOf`**：按序合并——`properties` 取并集（后覆前），`required` 取并集，其余键后覆前。
+///   顶层如果还有 `type`/`properties` 等，先当第 0 块参与合并。
+/// - **`oneOf` / `anyOf`**：单元素直接解包；多元素按 `allOf` 策略合并（properties 取并集，
+///   required 取并集——比「丢掉所有分支」保留了更多信息）。
+/// - 嵌套不管：只修顶层，深层的 `allOf` 等留给上游——它只对顶层报错。
+fn flatten_tool_schemas(v: &mut serde_json::Value) -> bool {
+    let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for tool in tools.iter_mut() {
+        let Some(schema) = tool.get_mut("input_schema").and_then(|s| s.as_object_mut()) else {
+            continue;
+        };
+        // 取出 compound 关键字（只看顶层）。
+        let compound = if let Some(arr) = schema.remove("allOf") {
+            Some(arr)
+        } else if let Some(arr) = schema.remove("oneOf") {
+            Some(arr)
+        } else if let Some(arr) = schema.remove("anyOf") {
+            Some(arr)
+        } else {
+            None
+        };
+        let Some(serde_json::Value::Array(parts)) = compound else {
+            continue;
+        };
+        // 把当前顶层属性也算进去作为「第 0 块」。
+        let mut merged = serde_json::Value::Object(std::mem::take(schema));
+        for part in &parts {
+            merge_schema_into(&mut merged, part);
+        }
+        if let Some(obj) = merged.as_object_mut() {
+            obj.entry("type").or_insert_with(|| serde_json::Value::String("object".into()));
+        }
+        let serde_json::Value::Object(m) = merged else { continue };
+        *schema = m;
+        changed = true;
+    }
+    if changed {
+        tracing::info!("flattened top-level allOf/oneOf/anyOf in tool input_schema");
+    }
+    changed
+}
+
+/// 把 `src` 的字段合并进 `dst`：`properties` 取并集，`required` 取并集，其余后覆前。
+fn merge_schema_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    let (Some(dst_obj), Some(src_obj)) = (dst.as_object_mut(), src.as_object()) else {
+        return;
+    };
+    for (k, v) in src_obj {
+        match k.as_str() {
+            "properties" => {
+                let props = dst_obj
+                    .entry("properties")
+                    .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                if let (Some(existing), Some(new)) = (props.as_object_mut(), v.as_object()) {
+                    for (pk, pv) in new {
+                        existing.insert(pk.clone(), pv.clone());
+                    }
+                }
+            }
+            "required" => {
+                let req =
+                    dst_obj.entry("required").or_insert_with(|| serde_json::Value::Array(vec![]));
+                if let (Some(existing), Some(new)) = (req.as_array_mut(), v.as_array()) {
+                    for item in new {
+                        if !existing.contains(item) {
+                            existing.push(item.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                dst_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// 上游要求 `text` 内容块的 `text` 字段非空（`text content blocks must be non-empty`），
+/// 部分第三方客户端会发 `{"type":"text","text":""}` 的空块。
+///
+/// 此函数遍历 `messages`，从每条消息的 `content` 数组里剥掉空 text 块。
+/// **安全守则**：剥完后若 content 变空则不动——空数组是另一种上游必拒的形态，
+/// 不该把一种 400 换成另一种。
+fn strip_empty_text_blocks(v: &mut serde_json::Value) -> bool {
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for msg in msgs.iter_mut() {
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let non_empty_count = content
+            .iter()
+            .filter(|blk| {
+                let is_empty_text = blk.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && blk.get("text").and_then(|t| t.as_str()).is_some_and(|t| t.is_empty());
+                !is_empty_text
+            })
+            .count();
+        if non_empty_count == content.len() || non_empty_count == 0 {
+            continue;
+        }
+        content.retain(|blk| {
+            let is_empty_text = blk.get("type").and_then(|t| t.as_str()) == Some("text")
+                && blk.get("text").and_then(|t| t.as_str()).is_some_and(|t| t.is_empty());
+            !is_empty_text
+        });
+        changed = true;
+    }
+    if changed {
+        tracing::info!("stripped empty text content blocks from messages");
+    }
+    changed
+}
+
 fn dedup_tools(v: &mut serde_json::Value) -> bool {
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
@@ -7233,6 +7370,8 @@ mod tests {
             strip_extra_fields: false,
             tool_name_mimic: false,
             inject_thinking: false,
+            flatten_tool_schemas: true,
+            strip_empty_text: true,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -7845,6 +7984,8 @@ mod tests {
             strip_extra_fields: false,
             tool_name_mimic: false,
             inject_thinking: false,
+            flatten_tool_schemas: true,
+            strip_empty_text: true,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -8286,6 +8427,8 @@ mod tests {
                 strip_extra_fields: false,
                 tool_name_mimic: false,
                 inject_thinking: false,
+                flatten_tool_schemas: true,
+                strip_empty_text: true,
             }
         };
         let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);
@@ -8906,6 +9049,124 @@ mod tests {
             s.contains(r#""data":"abc+123""#),
             "redacted_thinking data should preserve original encoding: {s}"
         );
+    }
+
+    // ---------- 空 text 块剥除 ----------
+
+    #[test]
+    fn strips_empty_text_blocks_mixed() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": ""}
+                ]}
+            ]
+        });
+        assert!(super::strip_empty_text_blocks(&mut v));
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "hello");
+    }
+
+    #[test]
+    fn keeps_all_empty_text_blocks_when_nothing_else() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": ""}
+                ]}
+            ]
+        });
+        assert!(!super::strip_empty_text_blocks(&mut v));
+        assert_eq!(v["messages"][0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn noop_when_no_empty_text() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+            ]
+        });
+        assert!(!super::strip_empty_text_blocks(&mut v));
+    }
+
+    // ---------- input_schema allOf/oneOf/anyOf 展平 ----------
+
+    #[test]
+    fn flattens_allof_in_tool_schema() {
+        let mut v = serde_json::json!({
+            "tools": [{
+                "name": "my_tool",
+                "input_schema": {
+                    "allOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"properties": {"b": {"type": "number"}}, "required": ["a", "b"]}
+                    ]
+                }
+            }]
+        });
+        assert!(super::flatten_tool_schemas(&mut v));
+        let schema = &v["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["a"].is_object());
+        assert!(schema["properties"]["b"].is_object());
+        let req = schema["required"].as_array().unwrap();
+        assert!(req.contains(&serde_json::json!("a")));
+        assert!(req.contains(&serde_json::json!("b")));
+        assert!(schema.get("allOf").is_none());
+    }
+
+    #[test]
+    fn flattens_oneof_single_element() {
+        let mut v = serde_json::json!({
+            "tools": [{
+                "name": "t",
+                "input_schema": {
+                    "oneOf": [{"type": "object", "properties": {"x": {"type": "string"}}}]
+                }
+            }]
+        });
+        assert!(super::flatten_tool_schemas(&mut v));
+        let schema = &v["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["x"].is_object());
+        assert!(schema.get("oneOf").is_none());
+    }
+
+    #[test]
+    fn flattens_allof_with_existing_top_level_props() {
+        let mut v = serde_json::json!({
+            "tools": [{
+                "name": "t",
+                "input_schema": {
+                    "type": "object",
+                    "description": "desc",
+                    "allOf": [
+                        {"properties": {"a": {"type": "string"}}, "required": ["a"]}
+                    ]
+                }
+            }]
+        });
+        assert!(super::flatten_tool_schemas(&mut v));
+        let schema = &v["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["description"], "desc");
+        assert!(schema["properties"]["a"].is_object());
+        assert!(schema.get("allOf").is_none());
+    }
+
+    #[test]
+    fn noop_when_no_compound_schema() {
+        let mut v = serde_json::json!({
+            "tools": [{
+                "name": "t",
+                "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}
+            }]
+        });
+        assert!(!super::flatten_tool_schemas(&mut v));
     }
 
     // ---------- 非 CC 请求的模拟（Simulation） ----------

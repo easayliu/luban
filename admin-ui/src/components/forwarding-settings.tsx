@@ -407,6 +407,38 @@ export function ForwardingSettingsContent() {
           value={settingsQuery.data.sampling_policy as PolicyValue}
           settingKey="sampling"
         />
+        <ForwardingToggle
+          k="flatten_tool_schemas"
+          label={t('Schema 展平', 'Schema flattening')}
+          summary={t(
+            '展平 tool input_schema 顶层的 allOf / oneOf / anyOf。',
+            'Flatten top-level allOf / oneOf / anyOf in tool input_schema.',
+          )}
+          description={
+            <>
+              {t(
+                '上游 API 不支持 JSON Schema 的 allOf / oneOf / anyOf 组合关键字出现在 input_schema 顶层，直接 400。开启后自动将它们合并为一个普通 object schema 后转发。',
+                'The upstream API rejects allOf / oneOf / anyOf at the top level of tool input_schema with a 400 error. When enabled, these are automatically merged into a plain object schema before forwarding.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="strip_empty_text"
+          label={t('空 text 块剥除', 'Strip empty text blocks')}
+          summary={t(
+            '剥除 messages 中的空 text 内容块。',
+            'Strip empty text content blocks from messages.',
+          )}
+          description={
+            <>
+              {t(
+                '上游要求 text 内容块的 text 字段非空，部分第三方客户端会发送 {"type":"text","text":""} 的空块导致 400。开启后自动剥除空 text 块（若消息仅含空 text 块则保留原样）。',
+                'The upstream API requires text content blocks to be non-empty. Some third-party clients send {"type":"text","text":""} which causes a 400. When enabled, empty text blocks are automatically stripped (if a message contains only empty text blocks, it is left unchanged).',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>

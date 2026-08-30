@@ -1437,6 +1437,10 @@ struct ForwardingResp {
     tool_name_mimic: bool,
     /// 模拟路径下是否注入 thinking（及配套的 context_management）。
     inject_thinking: bool,
+    /// 展平 tool input_schema 顶层的 allOf/oneOf/anyOf。
+    flatten_tool_schemas: bool,
+    /// 剥除 messages 里的空 text 内容块。
+    strip_empty_text: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1461,6 +1465,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             strip_extra_fields: f.strip_extra_fields,
             tool_name_mimic: f.tool_name_mimic,
             inject_thinking: f.inject_thinking,
+            flatten_tool_schemas: f.flatten_tool_schemas,
+            strip_empty_text: f.strip_empty_text,
         }
     }
 }
@@ -1957,6 +1963,8 @@ struct SetForwardingReq {
     strip_extra_fields: Option<bool>,
     tool_name_mimic: Option<bool>,
     inject_thinking: Option<bool>,
+    flatten_tool_schemas: Option<bool>,
+    strip_empty_text: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -1967,11 +1975,11 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, FILL_METADATA, INJECT_THINKING, MERGE_BETA, NONSTREAM_AS_SSE,
-        NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH,
-        SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
-        TOOL_NAME_MIMIC,
+        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, INJECT_THINKING, MERGE_BETA,
+        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC,
+        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
+        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -1993,6 +2001,8 @@ async fn set_forwarding(
         (STRIP_EXTRA_FIELDS, req.strip_extra_fields),
         (TOOL_NAME_MIMIC, req.tool_name_mimic),
         (INJECT_THINKING, req.inject_thinking),
+        (FLATTEN_TOOL_SCHEMAS, req.flatten_tool_schemas),
+        (STRIP_EMPTY_TEXT, req.strip_empty_text),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
