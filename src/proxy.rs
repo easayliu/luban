@@ -486,9 +486,6 @@ pub async fn handle(
     let (mut token, mut cred) = (token, cred);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
-    // 裸 429 摘元数据重试：上游对带 `metadata.user_id` 的请求有一套更严的每会话限流，
-    // 实测同一条请求去掉 `metadata` 后立即 200。该标记保证只试一次。
-    let mut metadata_stripped = false;
     // 最后那一轮**上游原样给的**限流头，只在它回 429 时有值（每轮重置，故换号换到一发 200 时
     // 它是 `None`）。存在的理由是下面 transient 档会把我们自己算出来的退避写进 `retry-after`
     // 再交回客户端——那之后重解 `up.headers()` 就会把自己塞的那条当成上游给的读回来，
@@ -1034,7 +1031,7 @@ pub async fn handle(
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
-                        let (etype, message) = parse_upstream_error(&bytes);
+                        let (etype, _) = parse_upstream_error(&bytes);
                         // 我们这一侧的发送密度，见 [`UpstreamLoad`]：这一档的成因（每分钟请求数
                         // / 并发连接数 / 输出 token 预算，三者之一）上游一个字都不说，只能拿
                         // 自己的读数去对它公布的限额。
@@ -1064,8 +1061,8 @@ pub async fn handle(
                             route_in_flight = load.route_in_flight,
                             sent_60s = load.sent,
                             max_tokens_60s = load.max_tokens,
-                            upstream_message = %message.chars().take(500).collect::<String>(),
-                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is what the body says"
+                            response_body = %String::from_utf8_lossy(&bytes),
+                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is the full response body"
                         );
                         // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
                         let bytes = match &tool_names {
