@@ -713,6 +713,17 @@ pub async fn handle(
         if max_retry == 0 {
             break (upstream, resp, sent);
         }
+        // 裸 429（一个限流头都没带）：完全透传，不打冷却、不改 retry-after、不剥 metadata。
+        // 这类 429 来自上游服务端瞬态限流，不跟着账号走——我们干预没有意义，让官方 SDK
+        // 按自己的退避策略重试才是正解。
+        if info.no_limit_headers() {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                model = %req_model.as_deref().unwrap_or("-"),
+                "upstream 429 with no rate-limit headers: passing through as-is, letting the client handle retry"
+            );
+            break (upstream, resp, sent);
+        }
         park_rate_limited(&state.store, &cred, &scope, cooldown, transient_exhausted);
         // 谁的额度都没满（容量/请求速率限制）→ **就此打住，不换号**：这一发 429 不是这个号的
         // 问题，换到下一个号上重发只会撞同一堵墙，并把同一个模型的冷却一路盖到整池——一条客户端
@@ -741,56 +752,12 @@ pub async fn handle(
                     "transient 429s all the way up the backoff ladder on this credential+model: taking this model out of the pool for a cooldown so later requests go elsewhere; this request still gets its 429 handed back"
                 );
             }
-            // 措辞分两种。这一档有两条来路（见 [`rate_limit_scope`] 的末尾分支）：窗口都没满，
-            // 和**一个限流头都没带**。后者我们其实无从判断哪个窗口是什么状态，说成「没有窗口
-            // 是满的」是在讲一件没查过的事，且与下面那行 `carried no rate-limit headers at
-            // all`（只在这一路打）直接打架。
-            let why = if info.no_limit_headers() {
-                "upstream 429 came with no rate-limit info at all, so nothing pins it on this account: passing it through with a backed-off retry-after instead of swapping credentials"
-            } else {
-                "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
-            };
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 model = %req_model.as_deref().unwrap_or("-"),
                 retry_after_secs = cooldown.as_secs(),
-                "{why}"
+                "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
             );
-            // 裸 429 且来访带 metadata.user_id：上游对带该字段的请求走更严的每会话限流通道，
-            // 实测同一条请求去掉 metadata 后立即 200。剥掉重试一次——只在一个限流头都没带
-            // 的那一档：正常的额度 429 已经告诉我们是哪个窗口满了，与 metadata 无关。
-            if !metadata_stripped && info.no_limit_headers() && has_user_id {
-                if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) {
-                    let removed = v
-                        .get_mut("metadata")
-                        .and_then(|m| m.as_object_mut())
-                        .and_then(|m| m.remove("user_id"))
-                        .is_some();
-                    if removed {
-                        if v.get("metadata")
-                            .and_then(|m| m.as_object())
-                            .is_some_and(|m| m.is_empty())
-                        {
-                            v.as_object_mut().map(|o| o.remove("metadata"));
-                        }
-                        if let Ok(bytes) = serde_json::to_vec(&v) {
-                            body = Bytes::from(bytes);
-                            metadata_stripped = true;
-                            // 剥掉 metadata 后这条请求不再是 CC 形态来访——让
-                            // Simulation::detect 重新判定，走模拟把头和体对齐成
-                            // 官方 CC 的样子，否则以裸 curl 头 + OAuth token 出站
-                            // 照样触发上游的裸 429。
-                            has_user_id = false;
-                            tracing::warn!(
-                                cred_id = cred.id, cred = %cred.label,
-                                model = %req_model.as_deref().unwrap_or("-"),
-                                "bare 429 with metadata.user_id: stripping metadata and retrying once"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
             break (upstream, resp, sent);
         }
         tried.push(cred.id);
