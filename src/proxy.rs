@@ -1041,11 +1041,7 @@ pub async fn handle(
                             cred.id,
                             req_model.as_deref().unwrap_or("-"),
                         );
-                        let redacted_hdr = redact_headers(&upstream.headers);
-                        let body_digest = match serde_json::from_slice::<serde_json::Value>(&body) {
-                            Ok(v) => request_digest(&v).to_string(),
-                            Err(_) => format!("<unparsable {} bytes>", body.len()),
-                        };
+                        let out_headers = redact_headers(&upstream.headers);
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             model = %req_model.as_deref().unwrap_or("-"),
@@ -1054,17 +1050,17 @@ pub async fn handle(
                             should_retry = %should_retry,
                             max_tokens = req_max_tokens.unwrap_or(0),
                             stream = body_json.as_ref().is_some_and(stream_requested),
-                            body_bytes = body.len(),
-                            request_body = %body_digest,
-                            request_headers = %redacted_hdr,
                             in_flight = state.in_flight.load(std::sync::atomic::Ordering::Relaxed),
                             cred_in_flight = load.cred_in_flight,
                             route_in_flight = load.route_in_flight,
                             sent_60s = load.sent,
                             max_tokens_60s = load.max_tokens,
+                            inbound_body = %String::from_utf8_lossy(&body),
+                            outbound_body = %String::from_utf8_lossy(&sent),
+                            outbound_headers = %out_headers,
                             response_headers = %resp_headers,
                             response_body = %String::from_utf8_lossy(&bytes),
-                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is the full response"
+                            "upstream bare 429: full inbound/outbound dump for local debugging"
                         );
                         // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
                         let bytes = match &tool_names {
