@@ -431,7 +431,7 @@ pub async fn handle(
     // 原始 device_id。头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
     let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
     let device_fp = device_fingerprint(fp_device, &headers);
-    // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 4 块 + 基座标 scope=global）
+    // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 5 块 + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
     //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
     {
@@ -3460,32 +3460,40 @@ fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 按模型族选官方基座：opus-5 / fable-5 共用一份，sonnet-5 / haiku-4.5 共用另一份
-/// （`cap/raw` 四份直连抓包，两两 sha256 相同）。认不出的模型返回 `None`，只注入身份句。
+/// 按模型族选官方基座。2.1.251 起三族各有各的基座（`cap/2.1.251` 五份抓包验证）：
 ///
-/// 匹配的是**族名**而非具体版本：CC 的基座随模型族走，`claude-opus-4-1` 这种老版本
-/// 拿到的也正是 CC 今天会发给它的那份。
+/// | 模型 | 基座 | 大小 | 来源 |
+/// |---|---|---|---|
+/// | opus-5 / fable-5 | [`config::CC_SYSTEM_BASE_OPUS`] | 1156B | 00039/00041 |
+/// | sonnet-5 | [`config::CC_SYSTEM_BASE_SONNET`] | 10580B | 00048 |
+/// | haiku-4.5 / opus-4-6[1m] | [`config::CC_SYSTEM_BASE_HAIKU`] | 10682B | 00049/00019 |
+///
+/// 认不出的模型返回 `None`，只注入身份句。
 fn cc_system_base(model: &str) -> Option<&'static str> {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus") || m.contains("fable") {
+    if m.contains("opus-5") || m.contains("fable") {
         Some(config::CC_SYSTEM_BASE_OPUS)
-    } else if m.contains("sonnet") || m.contains("haiku") {
+    } else if m.contains("sonnet") {
         Some(config::CC_SYSTEM_BASE_SONNET)
+    } else if m.contains("haiku") || m.contains("opus") {
+        Some(config::CC_SYSTEM_BASE_HAIKU)
     } else {
         None
     }
 }
 
-/// 按模型族选 `anthropic-beta` 的客户端自有串：**haiku 一份，其余（含认不出的模型）一份**。
+/// 按模型族选 `anthropic-beta` 的客户端自有串：三族三份（opus / sonnet+fable / haiku）。
 ///
-/// 分家的理由不是「haiku 少两项」，而是它把 `claude-code-20250219` 排在队尾——拿另外三族
-/// 那串去发 haiku，得到的是真实客户端不产生的排列。详见 [`config::CC_BETA_SIMULATED_HAIKU`]。
-///
-/// **和 [`cc_system_base`] 的分族方式不一样是对的**：基座上 haiku 与 sonnet 相同，beta 上
-/// haiku 自成一族。两处各按各的证据分，别为了「看起来整齐」并成一个函数。
+/// 三份不能合并的根本原因见 [`config::cc_beta_order_is_not_a_table`]。差异摘要：
+/// - opus 有 `context-1m`，无 `server-side-fallback`；
+/// - sonnet/fable 有 `server-side-fallback`，无 `context-1m`；
+/// - haiku 无 `effort`/`mid-conversation-system`，`claude-code` 在第 6 位而非队首。
 fn cc_beta_seed(model: &str) -> &'static str {
-    if model.to_ascii_lowercase().contains("haiku") {
+    let m = model.to_ascii_lowercase();
+    if m.contains("haiku") {
         config::CC_BETA_SIMULATED_HAIKU
+    } else if m.contains("opus") {
+        config::CC_BETA_SIMULATED_OPUS
     } else {
         config::CC_BETA_SIMULATED
     }
@@ -3558,30 +3566,31 @@ fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> Str
 /// 官方自己用掉 3 个（基座、其余、末条消息），故模拟时得数着加，见 [`simulate_system`]。
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
-/// 官方 `system` **恒为 4 块**：`cap/raw` 里四份订阅直连抓包（00006/00009/00031/00035）
-/// 无一例外都是 `[billing, 身份句, 基座, 其余]`，API-key 模式那三份是 3 块合并态
-/// （见 [`align_system_shape`]）——两种切法都不超过 4。
+/// 官方 `system` **恒为 5 块**（2.1.251 起）：`cap/2.1.251/00019` 的结构是
+/// `[billing, 身份句, reporting, 基座, 其余]`，API-key 模式那三份是 3 块合并态
+/// （见 [`align_system_shape`]）。旧版（2.1.245 及以前）为 4 块（无 reporting）。
 ///
 /// 块数超了就不再是 CC 形态，上游按第三方应用计费，客户端会看到
 /// `Third-party apps now draw from your extra usage, not your plan limits.`
 /// ——请求照样有回复，只是从订阅额度转到了超额池。故对齐它是**计费正确性**问题，
 /// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
-const MAX_SYSTEM_BLOCKS: usize = 4;
+const MAX_SYSTEM_BLOCKS: usize = 5;
 
-/// 把非 CC 请求的 `system` 换成官方形态的四块：
+/// 把非 CC 请求的 `system` 换成官方形态的五块（2.1.251）：
 ///
 /// ```text
 /// [0] x-anthropic-billing-header: …            无断点（cch 由 ensure_billing_cch 补）
 /// [1] You are Claude Code, …（57B）            无断点
-/// [2] 官方基座（按模型族）                      {ephemeral, scope:global}
-/// [3] 客户端自己的 system（并成一块）           {ephemeral}
+/// [2] # Reporting outcomes …（911B）            无断点
+/// [3] 官方基座（按模型族）                      {ephemeral, scope:global}
+/// [4] 客户端自己的 system（并成一块）           {ephemeral}
 /// ```
 ///
 /// 客户端的 `system` 是字符串就裹成一个文本块，是数组就并成一块（见
-/// [`merge_system_blocks`]），没有就只有前三块。
+/// [`merge_system_blocks`]），没有就只有前四块。
 ///
 /// **客户端那堆块必须并成一块**：官方末块就是「基座之后的全部内容」拼成的一大段，
-/// 客户端自己拆成 N 块发过来，照搬就会得到 3+N 块——超过 [`MAX_SYSTEM_BLOCKS`]
+/// 客户端自己拆成 N 块发过来，照搬就会得到 4+N 块——超过 [`MAX_SYSTEM_BLOCKS`]
 /// 即被上游判为第三方应用、改扣超额池。
 ///
 /// **断点是数着加的**：客户端可能自己就用满了 4 个（比如给每条工具定义都标了缓存），这时
@@ -3604,8 +3613,11 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
     let used = outside + client.iter().map(count_cache_control).sum::<usize>();
     let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
-    let mut blocks =
-        vec![text_block_bare(&billing_header_text()), text_block_bare(config::CC_SYSTEM_IDENTITY)];
+    let mut blocks = vec![
+        text_block_bare(&billing_header_text(v)),
+        text_block_bare(config::CC_SYSTEM_IDENTITY),
+        text_block_bare(config::CC_SYSTEM_REPORTING),
+    ];
     if let Some(base) = sim.base {
         if budget > 0 {
             budget -= 1;
@@ -3628,36 +3640,35 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
     true
 }
 
-/// 模拟后 system 第 4 块（客户端自有内容）超过此字符数时，移到 messages 首条用户消息里。
+/// 模拟后 system 末块（客户端自有内容）超过此字符数时，移到 messages 首条用户消息里。
 ///
-/// 上游对第 4 块有内容级检测：非 CC 特征内容超过 ~2000 字符即触发第三方判定。
+/// 上游对末块有内容级检测：非 CC 特征内容超过 ~2000 字符即触发第三方判定。
 /// 实测 1900 字符安全、2021 字符触发，取 1500 留足余量。
 const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 
-/// 把模拟后 system 第 4 块（index 3）的超长客户端内容搬到 messages 首条用户消息里。
+/// 把模拟后 system 末块（客户端自有内容）的超长内容搬到 messages 首条用户消息里。
 ///
-/// 搬走后第 4 块换成一行短占位（保持 4 块形态），内容作为 `<system_instructions>` 标签
+/// 搬走后末块换成一行短占位（保持块数形态），内容作为 `<system_instructions>` 标签
 /// 注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
 /// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
 fn relocate_long_client_system(v: &mut serde_json::Value) -> bool {
     let sys = match v.get("system").and_then(|s| s.as_array()) {
-        Some(a) if a.len() >= 4 => a,
+        Some(a) if a.len() >= MAX_SYSTEM_BLOCKS => a,
         _ => return false,
     };
-    let tail_text = match sys[3].get("text").and_then(|t| t.as_str()) {
+    let last = sys.len() - 1;
+    let tail_text = match sys[last].get("text").and_then(|t| t.as_str()) {
         Some(t) if t.len() > MAX_CLIENT_SYSTEM_CHARS => t.to_string(),
         _ => return false,
     };
-    // 把 system[3] 换成短占位。
     if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
-        let cc = blocks[3].get("cache_control").cloned();
+        let cc = blocks[last].get("cache_control").cloned();
         let mut placeholder = text_block_bare("(see conversation)");
         if let Some(cc) = cc {
             placeholder.as_object_mut().map(|o| o.insert("cache_control".into(), cc));
         }
-        blocks[3] = placeholder;
+        blocks[last] = placeholder;
     }
-    // 注入到 messages[0] 的 content 前面。
     let wrapped = format!("<system_instructions>\n{tail_text}\n</system_instructions>");
     if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
         if let Some(first) = messages.first_mut() {
@@ -3675,7 +3686,8 @@ fn relocate_long_client_system(v: &mut serde_json::Value) -> bool {
     }
     tracing::info!(
         chars = tail_text.len(),
-        "relocated long client system from block[3] to messages[0]"
+        last,
+        "relocated long client system from last block to messages[0]"
     );
     true
 }
@@ -3768,12 +3780,12 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
     blocks
 }
 
-/// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：第 4 块起的全部内容并进第 4 块
+/// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：超出部分并进末块
 /// （见 [`merge_system_blocks`]）。
 ///
-/// 兜住任何在我们之前就把 `system` 拆碎了的中间层：块数超 4 照样按第三方额度扣。
+/// 兜住任何在我们之前就把 `system` 拆碎了的中间层：块数超限照样按第三方额度扣。
 ///
-/// 已经不超过 4 块（含官方的 4 块与 API-key 的 3 块）时不动结构、返回 `false`。
+/// 已经不超过限制（含官方的 5 块与 API-key 的 3 块）时不动结构、返回 `false`。
 fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
     let Some(sys) = v.get_mut("system").and_then(|s| s.as_array_mut()) else {
         return false;
@@ -3791,8 +3803,71 @@ fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 
 /// `system[0]` 那条 billing header 的正文。`cch` 不在这里补——那是
 /// [`ensure_billing_cch`] 的活，模拟与非模拟两条路共用它。
-fn billing_header_text() -> String {
-    format!("x-anthropic-billing-header: cc_version={}; cc_entrypoint=cli;", config::CC_VERSION)
+///
+/// `cc_version` 的第四段（如 `76b`）由 [`cc_version_suffix`] 从请求 body 动态派生，
+/// 算法与官方客户端一致：取第一条用户消息 text 的第 4/7/20 位字符，拼上固定 salt 与
+/// 主版本号后 SHA-256 取前 3 个 hex 字符。
+fn billing_header_text(v: &serde_json::Value) -> String {
+    let suffix = cc_version_suffix(v);
+    format!(
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli;",
+        config::CC_VERSION_BASE,
+        suffix,
+    )
+}
+
+/// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251）。
+///
+/// ```text
+/// salt    = "59cf53e54c78"
+/// chars   = text[4] || text[7] || text[20]   （越界用 "0"）
+/// suffix  = sha256(salt + chars + VERSION_BASE).hex()[0..3]
+/// ```
+///
+/// `text` 取的是 `messages` 里**第一条 `role:"user"` 消息**的**第一个 `type:"text"` 块**
+/// 的文本。官方客户端内部会跳过 `isMeta` 消息，但在实际请求 body 里这等价于第一条 user
+/// 消息的第一个 text 块（harness 注入的 system-reminder 也在同一个 user turn 的 content
+/// 数组里，排在用户实际输入之前）。
+fn cc_version_suffix(v: &serde_json::Value) -> String {
+    let text = first_user_text(v);
+    let char_at = |i: usize| text.chars().nth(i).unwrap_or('0');
+    let chars: String = [char_at(4), char_at(7), char_at(20)].iter().collect();
+
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"59cf53e54c78");
+    h.update(chars.as_bytes());
+    h.update(config::CC_VERSION_BASE.as_bytes());
+    let digest = h.finalize();
+    format!("{:02x}{:02x}", digest[0], digest[1]).chars().take(3).collect()
+}
+
+/// 从 body 的 `messages` 里取第一条 `role:"user"` 消息的第一个 `type:"text"` 块文本。
+fn first_user_text(v: &serde_json::Value) -> String {
+    let msgs = match v.get("messages").and_then(|m| m.as_array()) {
+        Some(a) => a,
+        None => return String::new(),
+    };
+    for msg in msgs {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        match msg.get("content") {
+            Some(serde_json::Value::String(s)) => return s.clone(),
+            Some(serde_json::Value::Array(blocks)) => {
+                for blk in blocks {
+                    if blk.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = blk.get("text").and_then(|t| t.as_str()) {
+                            return t.to_string();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        break;
+    }
+    String::new()
 }
 
 /// 写入一个顶层字段，并把**新增**的那个放到官方 key 序里该在的位置：`after` 里最靠后的
@@ -4471,8 +4546,8 @@ fn ensure_beta_query(url: &str) -> String {
 ///    「已经是 CC 形态」的前提下做微调。
 /// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
 ///    见 [`align_system_shape`]。含拆块与基座标 `scope:"global"`（后者另受
-///    `cache_scope_global` 管）。模拟路径已经直接产出 4 块，故两者互斥，不叠加。同一开关还管**块数封顶**
-///    （[`cap_system_blocks`]）：超过 4 块的 `system` 会被上游判成第三方应用、改扣超额池。
+///    `cache_scope_global` 管）。模拟路径已经直接产出 5 块，故两者互斥，不叠加。同一开关还管**块数封顶**
+///    （[`cap_system_blocks`]）：超过 [`MAX_SYSTEM_BLOCKS`] 块的 `system` 会被上游判成第三方应用、改扣超额池。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
 ///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
@@ -4547,8 +4622,8 @@ fn rewrite_body(
     let system_hoisted =
         flags.hoist_system_role && !is_cc_shaped(&v) && hoist_system_role_messages(&mut v);
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
-    // 模拟后第 4 块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
-    // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，第 4 块只留
+    // 模拟后末块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
+    // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，末块只留
     // 一个短占位，绕过内容检测且不丢失指令语义。
     let sys_relocated = simulated && relocate_long_client_system(&mut v);
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
@@ -4562,15 +4637,15 @@ fn rewrite_body(
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
     let msg_shape = sim.is_some() && align_message_shape(&mut v, cache);
-    // 模拟已经产出官方的 4 块形态，再走一遍三块拆分器只会切错地方。
+    // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
-    // 封顶跟在两条整形之后：那两条产出的都是 4 块，故只对它们都没管住的来访生效。
+    // 封顶跟在两条整形之后：那两条产出的都是 ≤5 块，故只对它们都没管住的来访生效。
     let capped = shape && cap_system_blocks(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
     //
-    // **只在整形真的成了才补**：`ttl:"1h"` 属于订阅那套四块形态，API-key 的三块形态官方
+    // **只在整形真的成了才补**：`ttl:"1h"` 属于订阅形态，API-key 的三块形态官方
     // 一个 ttl 都不带（`cap/raw/00012`）。整形没做成（比如锚点漂了、`system_shape` 关着）
     // 时 body 还是三块，这时补 ttl 就是把半对齐换了个方向，比不补更糟。
     let ttl_filled = cache.ttl_1h && (simulated || shaped) && fill_cache_ttl(&mut v);
@@ -9296,32 +9371,41 @@ mod tests {
     /// 在**队尾**。共用一份种子串就会给 haiku 发出一个真实客户端不产生的排列。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.145/00005（opus-4-6 直连，claude-cli/2.1.245）。
-        const OFFICIAL: &str = "claude-code-20250219,oauth-2025-04-20,\
+        // cap/2.1.251/00040（opus-5 直连，无 afk-mode 的那次）。
+        const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
+             context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,\
+             cache-diagnosis-2026-04-07";
+        // cap/2.1.251/00045（fable-5 直连，无 afk-mode 的那次）。与 sonnet-5 逐字相同。
+        const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
-             prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,\
-             effort-2025-11-24,extended-cache-ttl-2025-04-11";
-        // cap/raw/00031（haiku-4.5 直连）：oauth 在最前、claude-code 在第 6 位。
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+        // cap/2.1.251/00049（haiku-4.5 直连），去掉 afk-mode。
         const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             claude-code-20250219,advanced-tool-use-2025-11-20,extended-cache-ttl-2025-04-11";
+             claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 
         for (model, official) in [
-            ("claude-sonnet-5", OFFICIAL),
-            ("claude-opus-5", OFFICIAL),
-            ("claude-fable-5", OFFICIAL),
-            ("gpt-4o", OFFICIAL), // 认不出的模型退回主串
+            ("claude-sonnet-5", OFFICIAL_SONNET),
+            ("claude-opus-5", OFFICIAL_OPUS),
+            ("claude-fable-5", OFFICIAL_SONNET),
+            ("gpt-4o", OFFICIAL_SONNET), // 认不出的模型退回 sonnet/fable 主串
             ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
         ] {
             let seed = super::cc_beta_seed(model);
             assert_eq!(merge_beta(Some(&super::simulated_beta(seed, None))), official, "{model}");
         }
-
-        // 计价语义相关的三项刻意不发，见 config::CC_BETA_SIMULATED。
-        assert!(!OFFICIAL.contains("context-1m"), "1M 上下文不该由 luban 替客户端声明");
-        assert!(!OFFICIAL.contains("fallback"), "额度回补/服务端换模型不该由 luban 替客户端声明");
 
         // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
         let with_client = merge_beta(Some(&super::simulated_beta(
@@ -9335,7 +9419,7 @@ mod tests {
         assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
     }
 
-    /// 普通请求 → 官方四块 system：billing / 身份句 / 基座（global）/ 客户端原文。
+    /// 普通请求 → 官方五块 system：billing / 身份句 / reporting / 基座（global）/ 客户端原文。
     /// 基座按模型族选，且 `system` 落在 `messages` 之后（官方 key 序）。
     #[test]
     fn simulates_official_system_for_plain_request() {
@@ -9349,7 +9433,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 4, "应是官方的四块: {s}");
+        assert_eq!(sys.len(), 5, "应是官方的五块: {s}");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
             "第 0 块应是 billing header: {s}"
@@ -9360,18 +9444,16 @@ mod tests {
         );
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
-        assert_eq!(sys[2]["cache_control"]["scope"], "global");
-        assert_eq!(sys[3]["text"], "你是助手", "客户端原 system 应原样留在末块");
-        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral");
-        assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
-        // ttl 默认对齐官方：三个断点都是 1h（见 [`super::cache_control`]）。
-        assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
-        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_REPORTING, "第 2 块是 reporting outcomes");
+        assert!(sys[2].get("cache_control").is_none(), "reporting 块不带断点（官方如此）");
+        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
+        assert_eq!(sys[3]["cache_control"]["scope"], "global");
+        assert_eq!(sys[4]["text"], "你是助手", "客户端原 system 应原样留在末块");
+        assert_eq!(sys[4]["cache_control"]["type"], "ephemeral");
+        assert!(sys[4]["cache_control"].get("scope").is_none(), "只有基座标 global");
+        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
+        assert_eq!(sys[4]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
 
-        // key 序按官方 `model → messages → system → tools → metadata → max_tokens` 落位，
-        // 补出来的几个字段不该被追加到队尾。本例没开 thinking，故不补 `context_management`
-        // （见 [`super::ensure_context_management`]：那个字段依赖 thinking）。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -9379,12 +9461,22 @@ mod tests {
             "key 序: {s}"
         );
 
-        // 换模型族即换基座；认不出的模型只注入前两块。
-        assert_eq!(sim_for(PLAIN_BODY).base, Some(config::CC_SYSTEM_BASE_OPUS), "opus 族基座");
+        // 换模型族即换基座：三族三份基座。
+        assert_eq!(sim_for(PLAIN_BODY).base, Some(config::CC_SYSTEM_BASE_OPUS), "opus-5 短基座");
         assert_eq!(
             sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).base,
-            Some(config::CC_SYSTEM_BASE_SONNET),
-            "haiku 与 sonnet-5 的基座 sha256 相同，共用一份"
+            Some(config::CC_SYSTEM_BASE_HAIKU),
+            "haiku 用旧版长基座"
+        );
+        assert_eq!(
+            sim_for(r#"{"model":"claude-fable-5","messages":[]}"#).base,
+            Some(config::CC_SYSTEM_BASE_OPUS),
+            "fable 与 opus-5 共用短基座"
+        );
+        assert_eq!(
+            sim_for(r#"{"model":"claude-opus-4-6","messages":[]}"#).base,
+            Some(config::CC_SYSTEM_BASE_HAIKU),
+            "opus-4-6 用旧版长基座"
         );
         assert!(
             sim_for(r#"{"model":"gpt-4o","messages":[]}"#).base.is_none(),
@@ -9447,7 +9539,7 @@ mod tests {
         );
     }
 
-    /// 没有 system 的请求同样成立：三块（billing / 身份句 / 基座），且末块拿到断点。
+    /// 没有 system 的请求同样成立：四块（billing / 身份句 / reporting / 基座），末块拿到断点。
     #[test]
     fn simulates_system_when_client_sent_none() {
         let body = Bytes::from(PLAIN_BODY.to_string());
@@ -9455,8 +9547,8 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
-        assert_eq!(sys[2]["cache_control"]["scope"], "global");
+        assert_eq!(sys.len(), 4, "没有客户端 system 就只有前四块: {v}");
+        assert_eq!(sys[3]["cache_control"]["scope"], "global");
     }
 
     /// 模拟路径要补 `context_management`：`cap/raw` 八份抓包逐字节相同，而声明它的
@@ -9763,9 +9855,8 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
-        assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
-        // 内容照发，只是少一次缓存复用。
-        assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert!(v["system"][3].get("cache_control").is_none(), "预算用完时基座不带断点");
+        assert_eq!(v["system"][3]["text"], config::CC_SYSTEM_BASE_OPUS);
     }
 
     /// 客户端把 `system` 拆成多块时并成官方末块的一块——3+N 块会被上游判第三方应用、
@@ -9789,14 +9880,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 4, "客户端的 4 块应并成末块一块: {v}");
-        assert_eq!(sys[3]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
-        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral", "末块断点取合并前的最后一个");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_OPUS);
-        assert_eq!(sys[2]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
+        assert_eq!(sys.len(), 5, "客户端的 4 块应并成末块一块: {v}");
+        assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
+        assert_eq!(sys[4]["cache_control"]["type"], "ephemeral", "末块断点取合并前的最后一个");
+        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert_eq!(sys[3]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
         assert_eq!(super::count_cache_control(&v), 2, "断点数: {v}");
 
-        // 空块并不进来（发一个空文本块上游不收），只剩前三块。
+        // 空块并不进来（发一个空文本块上游不收），只剩前四块。
         let empty = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"system":[{"type":"text","text":""},{"type":"text","text":"  "}]}"#
                 .to_string(),
@@ -9804,7 +9895,7 @@ mod tests {
         let sim = detect_for(&empty, all_on()).unwrap();
         let out = rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
+        assert_eq!(v["system"].as_array().unwrap().len(), 4, "全空的块应丢掉: {v}");
     }
 
     /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：
@@ -9828,7 +9919,7 @@ mod tests {
         assert_eq!(id_count, 1, "身份声明应恰好一份: {v}");
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY);
 
-        // 4 块及以内不动结构：cap_system_blocks 的直接验证。
+        // 5 块及以内不动结构：cap_system_blocks 的直接验证。
         let four = Bytes::from(API_SHAPE_BODY);
         let before: serde_json::Value = serde_json::from_slice(&four).unwrap();
         let mut after = before.clone();
@@ -10991,14 +11082,28 @@ mod tests {
     /// 基座资产是逐字节从抓包取出来的，别被编辑器/格式化工具动过。
     #[test]
     fn system_base_assets_are_verbatim() {
-        assert_eq!(config::CC_SYSTEM_BASE_OPUS.len(), 1214, "opus 族基座字节数（cap/raw/00006）");
+        assert_eq!(
+            config::CC_SYSTEM_BASE_OPUS.len(),
+            1156,
+            "opus/fable 基座字节数（cap/2.1.251/00039）"
+        );
         assert_eq!(
             config::CC_SYSTEM_BASE_SONNET.len(),
+            10580,
+            "sonnet 基座字节数（cap/2.1.251/00048）"
+        );
+        assert_eq!(
+            config::CC_SYSTEM_BASE_HAIKU.len(),
             10682,
-            "sonnet 族基座字节数（cap/raw/00009）"
+            "haiku 基座字节数（cap/2.1.251/00049）"
         );
         assert_eq!(config::CC_SYSTEM_IDENTITY.len(), 57, "身份句字节数");
-        for base in [config::CC_SYSTEM_BASE_OPUS, config::CC_SYSTEM_BASE_SONNET] {
+        assert_eq!(config::CC_SYSTEM_REPORTING.len(), 911, "reporting 块字节数");
+        for base in [
+            config::CC_SYSTEM_BASE_OPUS,
+            config::CC_SYSTEM_BASE_SONNET,
+            config::CC_SYSTEM_BASE_HAIKU,
+        ] {
             assert!(
                 base.starts_with("\nYou are an interactive agent"),
                 "开头那个 \\n 是官方就有的"
@@ -11007,7 +11112,7 @@ mod tests {
         }
         // 基座是「切点之前」那一段，锚点属于其余段，不该出现在基座里。
         for anchor in config::CC_SYSTEM_BASE_ANCHORS {
-            assert!(!config::CC_SYSTEM_BASE_OPUS.contains(anchor), "基座里不该有拆块锚点");
+            assert!(!config::CC_SYSTEM_BASE_OPUS.contains(anchor), "opus 基座里不该有拆块锚点");
         }
     }
 
@@ -11393,12 +11498,47 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = super::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 245)), "官方那串");
-        assert_eq!(v("claude-cli/2.1.245"), Some((2, 1, 245)), "光秃秃一串也认");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 251)), "官方那串");
+        assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
         assert_eq!(v("claude-cli/"), None, "有前缀没版本");
         assert_eq!(v("claude-cli/next (external, cli)"), None, "版本位不是数字");
+    }
+
+    /// cc_version 后缀与官方客户端的算法对齐：
+    /// sha256("59cf53e54c78" + chars_at(4,7,20) + VERSION_BASE).hex()[..3]
+    #[test]
+    fn cc_version_suffix_matches_official_algorithm() {
+        // 用户消息 "hi"（短于 5 字符），位置 4/7/20 全取不到 → "000"
+        // sha256("59cf53e54c780002.1.251") 的前 3 个 hex = "76b"
+        let body: serde_json::Value = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        assert_eq!(super::cc_version_suffix(&body), "76b", "短消息 'hi'");
+
+        // 消息足够长时取 text[4], text[7], text[20]
+        let body2: serde_json::Value = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "abcdefghijklmnopqrstuvwxyz"}],
+        });
+        // chars = text[4]='e', text[7]='h', text[20]='u'
+        let suffix = super::cc_version_suffix(&body2);
+        assert_eq!(suffix.len(), 3, "始终 3 个 hex 字符");
+
+        // content 是数组时取第一个 text 块
+        let body3: serde_json::Value = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"}
+            ]}],
+        });
+        assert_eq!(super::cc_version_suffix(&body3), "76b", "数组形式与字符串形式结果一致");
+
+        // 没有 messages 时退化为全 0
+        let empty: serde_json::Value = serde_json::json!({"model": "x"});
+        assert_eq!(super::cc_version_suffix(&empty), "76b", "无消息退化为 '000' → 同 'hi'");
     }
 
     /// 最低版本闸的三态：低于门槛才拒，等于/高于放行；闸没配、UA 不是 CC、版本读不出来
@@ -11486,13 +11626,14 @@ mod tests {
         assert!(v.get("context_management").is_none(), "没开 thinking 就不该补: {s}");
         assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
 
-        // 官方前三块：billing header、身份句、按模型族选出的基座。测试请求没有「客户端自己
-        // 的 system」，故第四块不存在。
+        // 官方前四块：billing / 身份句 / reporting / 基座。测试请求没有「客户端自己
+        // 的 system」，故第五块不存在。
         let blocks = v["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 3, "\n{s}");
+        assert_eq!(blocks.len(), 4, "\n{s}");
         assert!(blocks[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
         assert_eq!(blocks[1]["text"], config::CC_SYSTEM_IDENTITY, "缺这句就用不了订阅额度");
-        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_BASE_OPUS, "opus 族基座");
+        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_REPORTING, "reporting outcomes 块");
+        assert_eq!(blocks[3]["text"], config::CC_SYSTEM_BASE_OPUS, "opus-5 用短基座");
 
         // 身份：伪装 metadata 用的是这个凭证的 account_uuid，不是空串。
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
