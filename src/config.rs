@@ -182,6 +182,13 @@ pub const CC_SYSTEM_BASE_ANCHORS: &[&str] = &[
 /// 「这是不是一条 Claude Code 请求」的判据——[`crate::proxy::is_cc_shaped`] 认的就是它。
 pub const CC_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/// [`CC_SYSTEM_IDENTITY`] 去掉句号的前缀——用于 [`crate::proxy::is_cc_shaped`] 的匹配。
+///
+/// agent-sdk 的身份句是 `"…for Claude, running within the Claude Agent SDK."`，句号变逗号，
+/// `contains(CC_SYSTEM_IDENTITY)` 匹配不到。用这个无句号前缀就能同时命中两种写法。
+pub const CC_SYSTEM_IDENTITY_PREFIX: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude";
+
 /// `system[0]` 那条 billing header 里的 `cc_version` 的**主版本**，形如 `2.1.251`。
 ///
 /// 完整 `cc_version`（如 `2.1.251.76b`）的第四段由
