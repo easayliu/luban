@@ -4611,6 +4611,10 @@ fn rewrite_body(
     let tools_deduped = dedup_tools(&mut v);
     // 空 text 块剥除：上游要求 text 块非空，第三方客户端常发空块。
     let empty_text_stripped = flags.strip_empty_text && strip_empty_text_blocks(&mut v);
+    // 空 thinking 块剥除：上游要求每个 thinking 块必须有 thinking 内容，
+    // strip_extra_fields 剥掉 thinking.display 后回程可能返回空 thinking，
+    // 客户端下一轮回传就会被拒。无条件处理——空 thinking 块永远是无效的。
+    let empty_thinking_stripped = strip_empty_thinking_blocks(&mut v);
     // input_schema 顶层的 allOf/oneOf/anyOf 展平：上游不支持，直接 400。
     let schemas_flattened = flags.flatten_tool_schemas && flatten_tool_schemas(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
@@ -4634,6 +4638,7 @@ fn rewrite_body(
         cc_tools_injected,
         tools_deduped,
         empty_text_stripped,
+        empty_thinking_stripped,
         schemas_flattened,
         tools_mimicked,
         device_fp = %device_fp,
@@ -4658,6 +4663,7 @@ fn rewrite_body(
         && !cc_tools_injected
         && !tools_deduped
         && !empty_text_stripped
+        && !empty_thinking_stripped
         && !schemas_flattened
         && !tools_mimicked
     {
@@ -5554,6 +5560,45 @@ fn strip_empty_text_blocks(v: &mut serde_json::Value) -> bool {
     }
     if changed {
         tracing::info!("stripped empty text content blocks from messages");
+    }
+    changed
+}
+
+/// 剥除 `messages` 历史里 `thinking` 字段为空的 `thinking` 块。
+///
+/// 上游要求每个 `{"type":"thinking"}` 块必须包含非空的 `thinking` 字段，否则 400
+/// （`each thinking block must contain thinking`）。
+///
+/// 常见成因：`strip_extra_fields` 剥掉了出站请求的 `thinking.display`，上游按 `omitted`
+/// 返回空 thinking 文本，客户端下一轮原样回传这些空块就会被拒。
+///
+/// 与 [`strip_empty_text_blocks`] 对称：只剥空 thinking 块，留下其余内容块；若整个
+/// `content` 只有空 thinking 块则保留原样（空 `content` 数组是另一种 400）。
+fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for msg in msgs.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let is_empty_thinking = |blk: &serde_json::Value| {
+            blk.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                && blk.get("thinking").and_then(|t| t.as_str()).map_or(true, |t| t.is_empty())
+        };
+        let non_empty_count = content.iter().filter(|blk| !is_empty_thinking(blk)).count();
+        if non_empty_count == content.len() || non_empty_count == 0 {
+            continue;
+        }
+        content.retain(|blk| !is_empty_thinking(blk));
+        changed = true;
+    }
+    if changed {
+        tracing::info!("stripped empty thinking blocks from messages");
     }
     changed
 }

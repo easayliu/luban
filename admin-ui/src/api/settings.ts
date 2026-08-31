@@ -110,6 +110,7 @@ export type ForwardingKey =
   | 'inject_thinking'
   | 'flatten_tool_schemas'
   | 'strip_empty_text'
+  | 'hoist_system_role'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {
