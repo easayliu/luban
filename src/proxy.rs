@@ -4644,6 +4644,12 @@ fn rewrite_body(
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
     // 封顶跟在两条整形之后：那两条产出的都是 ≤5 块，故只对它们都没管住的来访生效。
     let capped = shape && cap_system_blocks(&mut v);
+    // CC 子代理/desktop-3p 有时不带 billing header，上游按第三方计、限流更严。
+    // 补上 billing + 身份句让上游按订阅额度计。放在 ensure_billing_cch 之前——后者给
+    // billing header 追加 cch，得先有 billing header 它才有东西追加。
+    // simulate_cc 开着但这条请求没走模拟（CC 客户端）→ 可能缺 billing header。
+    // simulate_cc 关着时不注入——用户明确不要模拟，不该凭空加 system。
+    let prefix_injected = flags.simulate_cc && !simulated && ensure_cc_system_prefix(&mut v);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
@@ -4705,6 +4711,7 @@ fn rewrite_body(
         shaped,
         capped,
         spoofed,
+        prefix_injected,
         cch_added,
         thinking_filled,
         ctx_mgmt,
@@ -5965,6 +5972,51 @@ fn text_block(text: &str, cache_control: serde_json::Value) -> serde_json::Value
     blk.insert("text".into(), text.into());
     blk.insert("cache_control".into(), cache_control);
     serde_json::Value::Object(blk)
+}
+
+/// 给没有 billing header 的请求补上最小 CC 前缀：`[billing, 身份句]` 前插到 `system`。
+///
+/// CC 子代理（explore/search agent）和 desktop-3p 有时不带 system 字段或不含 billing
+/// header。不补的话上游按第三方应用计——扣超额池、限流更严。补上 billing + 身份句后
+/// 上游按订阅额度计，与标准 CC 请求一致。
+///
+/// **不是模拟**——不换头、不改工具名、不加基座，只在 system 最前面插两块。
+/// 已有 billing header 的（`is_cc_shaped` 命中 billing 那条路、或模拟已补过的）跳过。
+fn ensure_cc_system_prefix(v: &mut serde_json::Value) -> bool {
+    let has_billing = match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
+        }),
+        Some(serde_json::Value::String(s)) => s.contains("x-anthropic-billing-header:"),
+        _ => false,
+    };
+    if has_billing {
+        return false;
+    }
+    let prefix =
+        vec![text_block_bare(&billing_header_text(v)), text_block_bare(config::CC_SYSTEM_IDENTITY)];
+    match v.get_mut("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            for (i, blk) in prefix.into_iter().rev().enumerate() {
+                let _ = i;
+                blocks.insert(0, blk);
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            let mut blocks = prefix;
+            if !s.is_empty() {
+                blocks.push(text_block_bare(s));
+            }
+            *v.get_mut("system").unwrap() = serde_json::Value::Array(blocks);
+        }
+        _ => {
+            insert_top_level(v, "system", serde_json::Value::Array(prefix), &["messages", "model"]);
+        }
+    }
+    tracing::info!("injected billing header + identity into system for a CC client without them");
+    true
 }
 
 /// 不带缓存断点的 `system` 文本块（官方的 `system[0]`/`system[1]` 都是这个形态）。
@@ -11685,6 +11737,7 @@ mod tests {
         };
         // 只开流式化这一项，确保观察到的差异只来自它。
         let only_stream = store::ForwardFlags {
+            simulate_cc: false,
             spoof_identity: false,
             system_shape: false,
             billing_cch: false,
