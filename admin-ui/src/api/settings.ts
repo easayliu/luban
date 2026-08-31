@@ -81,6 +81,8 @@ export interface Settings {
   flatten_tool_schemas: boolean
   /** 剥除 messages 里的空 text 内容块。 */
   strip_empty_text: boolean
+  /** 将 messages 里的 role:"system" 消息提升到顶层 system 字段。 */
+  hoist_system_role: boolean
   /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
   prefill_policy: string
   /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
