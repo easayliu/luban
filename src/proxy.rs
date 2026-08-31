@@ -5040,6 +5040,16 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     if obj.contains_key("thinking") {
         return false;
     }
+    // tool_choice 强制工具调用时上游不允许 thinking，不注入。
+    // 客户端明确要强制工具，thinking 是我们补的，客户端优先。
+    if obj
+        .get("tool_choice")
+        .and_then(|tc| tc.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == "tool")
+    {
+        return false;
+    }
     let max_tokens = obj.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(32000);
     if max_tokens < THINKING_MIN_MAX_TOKENS {
         return false;
@@ -5269,6 +5279,14 @@ fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
     // 字段让上游走 adaptive 默认值——客户端的意图（不要深度思考）近似保留，好过打不通。
     if obj.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str()) == Some("disabled")
     {
+        obj.remove("thinking");
+        changed = true;
+    }
+    // tool_choice 强制工具调用时 thinking 必须关——上游硬限制 400。客户端同时发了两者时
+    // 删 thinking 保 tool_choice：强制工具是客户端明确要的语义，thinking 可缺省。
+    let forces_tool = obj.get("tool_choice").and_then(|tc| tc.get("type")).and_then(|t| t.as_str())
+        == Some("tool");
+    if forces_tool && obj.contains_key("thinking") {
         obj.remove("thinking");
         changed = true;
     }
