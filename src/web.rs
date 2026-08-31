@@ -191,23 +191,37 @@ pub async fn run(
 
                     // --- 每 tick ---
                     let ev_ok = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
+                    if ev_ok == oauth::KeepaliveResult::AuthRejected {
+                        tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (event_logging 401/403), marking as banned");
+                        let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
+                        continue;
+                    }
                     let dd_ok = oauth::keepalive_datadog_logs(&http, &ctx).await;
 
                     // --- 首 tick：启动握手 ---
                     let (mt_ok, boot_ok, peng_ok) = if is_first {
                         let mt = oauth::keepalive_metrics(&http, &access_token, &ctx).await;
                         let bo = oauth::keepalive_bootstrap(&http, &access_token).await;
+                        if bo == oauth::KeepaliveResult::AuthRejected {
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (bootstrap 401/403), marking as banned");
+                            let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
+                            continue;
+                        }
                         let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
                         (mt, bo, pg)
                     } else {
-                        (true, true, true)
+                        (
+                            oauth::KeepaliveResult::Ok,
+                            oauth::KeepaliveResult::Ok,
+                            oauth::KeepaliveResult::Ok,
+                        )
                     };
 
                     // --- 每 6h：eval ---
                     let eval_ok = if is_eval {
                         oauth::keepalive_eval(&http, &access_token, &ctx).await
                     } else {
-                        true
+                        oauth::KeepaliveResult::Ok
                     };
 
                     // --- 每 1h ---
@@ -216,19 +230,25 @@ pub async fn run(
                         let st = oauth::keepalive_settings(&http, &access_token).await;
                         (pl, st)
                     } else {
-                        (true, true)
+                        (oauth::KeepaliveResult::Ok, oauth::KeepaliveResult::Ok)
                     };
 
-                    let all_ok =
-                        ev_ok && dd_ok && mt_ok && boot_ok && peng_ok && eval_ok && pl_ok && st_ok;
+                    let all_ok = ev_ok.is_ok()
+                        && dd_ok
+                        && mt_ok.is_ok()
+                        && boot_ok.is_ok()
+                        && peng_ok.is_ok()
+                        && eval_ok.is_ok()
+                        && pl_ok.is_ok()
+                        && st_ok.is_ok();
                     if all_ok {
                         tracing::debug!(cred_id = cred.id, cred = %cred.label, tick = tick_count, "keepalive: ok");
                     } else {
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label, tick = tick_count,
-                            event_logging = ev_ok, datadog = dd_ok,
-                            metrics = mt_ok, bootstrap = boot_ok, penguin = peng_ok,
-                            eval = eval_ok, policy_limits = pl_ok, settings = st_ok,
+                            event_logging = ev_ok.is_ok(), datadog = dd_ok,
+                            metrics = mt_ok.is_ok(), bootstrap = boot_ok.is_ok(), penguin = peng_ok.is_ok(),
+                            eval = eval_ok.is_ok(), policy_limits = pl_ok.is_ok(), settings = st_ok.is_ok(),
                             "keepalive: partial failure"
                         );
                     }

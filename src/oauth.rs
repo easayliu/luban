@@ -9,6 +9,32 @@ use sha2::{Digest, Sha256};
 use crate::config;
 use crate::credentials::now_secs;
 
+/// 保活端点的返回状态。调用点根据 `AuthRejected` 标 banned 并跳过后续端点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveResult {
+    Ok,
+    /// 上游 401/403——token 已吊销或账号被暂停。
+    AuthRejected,
+    /// 网络错误或 5xx。
+    Failed,
+}
+
+impl KeepaliveResult {
+    fn from_status(status: u16) -> Self {
+        if status == 401 || status == 403 {
+            Self::AuthRejected
+        } else if status >= 500 {
+            Self::Failed
+        } else {
+            Self::Ok
+        }
+    }
+
+    pub fn is_ok(self) -> bool {
+        self == Self::Ok
+    }
+}
+
 /// 一组 OAuth token（交换或刷新得到），交由 [`crate::store`] 落库。
 #[derive(Debug, Clone)]
 pub struct TokenSet {
@@ -791,7 +817,7 @@ pub async fn keepalive_event_logging(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
-) -> bool {
+) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
     let body = serde_json::json!({ "events": ctx.idle_events() });
     let resp = client
@@ -805,8 +831,8 @@ pub async fn keepalive_event_logging(
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
@@ -818,7 +844,7 @@ pub async fn keepalive_metrics(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
-) -> bool {
+) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_METRICS);
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let body = serde_json::json!({
@@ -897,13 +923,13 @@ pub async fn keepalive_metrics(
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
 /// 每小时发一次 `GET /api/claude_code/policy_limits`。
-pub async fn keepalive_policy_limits(client: &wreq::Client, access_token: &str) -> bool {
+pub async fn keepalive_policy_limits(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_POLICY_LIMITS);
     let resp = client
         .get(&url)
@@ -914,13 +940,13 @@ pub async fn keepalive_policy_limits(client: &wreq::Client, access_token: &str) 
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
 /// 每小时发一次 `GET /api/claude_code/settings`。
-pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> bool {
+pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_SETTINGS);
     let resp = client
         .get(&url)
@@ -933,8 +959,8 @@ pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> bo
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
@@ -943,7 +969,7 @@ pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> bo
 /// 启动握手：`GET /api/claude_cli/bootstrap`。
 ///
 /// 取自 `cap/2.1.145/00043`（UA = `claude-code/2.1.246`）。
-pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> bool {
+pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!(
         "{}{}?entrypoint=cli&model=claude-sonnet-5",
         config::UPSTREAM_BASE_URL,
@@ -959,15 +985,15 @@ pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> b
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
 /// 启动握手：`GET /api/claude_code_penguin_mode`。
 ///
 /// 取自 `cap/2.1.145/00044`（UA = `axios/1.15.2`，不带 Content-Type）。
-pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -> bool {
+pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_PENGUIN_MODE);
     let resp = client
         .get(&url)
@@ -978,15 +1004,19 @@ pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 
 /// Statsig 特性标志评估：启动 + 每 6h。
 ///
 /// 取自 `cap/2.1.145/00039`（UA = `Bun/1.4.1`，Accept = `*/*`）。
-pub async fn keepalive_eval(client: &wreq::Client, access_token: &str, ctx: &KeepaliveCtx) -> bool {
+pub async fn keepalive_eval(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVAL);
     let resp = client
         .post(&url)
@@ -998,8 +1028,8 @@ pub async fn keepalive_eval(client: &wreq::Client, access_token: &str, ctx: &Kee
         .send()
         .await;
     match resp {
-        Ok(r) => r.status().as_u16() < 500,
-        Err(_) => false,
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
     }
 }
 

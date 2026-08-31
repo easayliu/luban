@@ -9,6 +9,13 @@ import { type CredentialActions } from '@/components/credential-shared'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
+  Combobox,
+  ComboboxItem,
+  ComboboxPopup,
+  ComboboxTrigger,
+  ComboboxValue,
+} from '@/components/ui/combobox'
+import {
   Dialog,
   DialogClose,
   DialogDescription,
@@ -57,10 +64,6 @@ export function CredentialProxyDialog({
     })
   }
 
-  const pickProxy = (url: string) => {
-    setValue(url)
-  }
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogPopup className="max-w-lg">
@@ -75,23 +78,52 @@ export function CredentialProxyDialog({
           {savedProxies.length > 0 && (
             <div className="space-y-2">
               <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
-              <div className="flex flex-wrap gap-1.5">
-                {savedProxies.map((p) => (
-                  <Button
-                    key={p.id}
-                    type="button"
-                    size="sm"
-                    variant={trimmed === p.url ? 'secondary' : 'outline'}
-                    onClick={() => pickProxy(p.url)}
-                    title={`${p.url}${p.credential_labels.length > 0 ? `\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}` : ''}`}
-                  >
-                    {p.label}
-                    {p.credential_count > 0 && (
-                      <span className="ml-1 text-muted-foreground">({p.credential_count})</span>
-                    )}
-                  </Button>
-                ))}
-              </div>
+              <Combobox
+                value={savedProxies.find((p) => p.url === trimmed)?.id ?? null}
+                onValueChange={(id) => {
+                  const found = savedProxies.find((p) => p.id === id)
+                  if (found) setValue(found.url)
+                }}
+                itemToStringLabel={(id) => {
+                  const p = savedProxies.find((px) => px.id === id)
+                  return p ? p.label : ''
+                }}
+                itemToStringValue={(id) => {
+                  const p = savedProxies.find((px) => px.id === id)
+                  return p ? `${p.label} ${p.url} ${p.credential_labels.join(' ')}` : ''
+                }}
+              >
+                <ComboboxTrigger className="w-full">
+                  <ComboboxValue
+                    placeholder={t('选择代理…', 'Select a proxy…')}
+                  />
+                </ComboboxTrigger>
+                <ComboboxPopup
+                  inputPlaceholder={t('搜索标签、地址或使用账号…', 'Search label, URL, or account…')}
+                  emptyText={t('无匹配结果', 'No matches')}
+                >
+                  {savedProxies.map((p) => (
+                    <ComboboxItem key={p.id} value={p.id}>
+                      <div className="min-w-0">
+                        <div className="flex items-baseline gap-2">
+                          <span className="truncate font-medium">{p.label}</span>
+                          {p.credential_count > 0 && (
+                            <span className="text-muted-foreground shrink-0 text-xs">
+                              {p.credential_count} {t('账号', 'acct')}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-muted-foreground truncate text-xs">{p.url}</div>
+                        {p.credential_labels.length > 0 && (
+                          <div className="text-muted-foreground mt-0.5 truncate text-xs">
+                            {p.credential_labels.join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    </ComboboxItem>
+                  ))}
+                </ComboboxPopup>
+              </Combobox>
             </div>
           )}
 
