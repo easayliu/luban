@@ -3426,23 +3426,25 @@ impl Simulation {
     }
 }
 
-/// 来访是否已经是 Claude Code 形态——判据是 `system` 里有没有那句身份声明的**前缀**
-/// （[`config::CC_SYSTEM_IDENTITY_PREFIX`]，不含末尾句号）。
+/// 来访是否已经是 Claude Code 形态——两条判据命中任一即算是：
 ///
-/// 用不含句号的前缀是因为 agent-sdk 的写法是 `"…for Claude, running within the Claude
-/// Agent SDK."`——句号变逗号，全文 `contains(CC_SYSTEM_IDENTITY)` 匹配不到。
+/// 1. `system` 里包含身份声明前缀 [`config::CC_SYSTEM_IDENTITY_PREFIX`]（主代理 + agent-sdk
+///    主进程，写法是 `"You are Claude Code, Anthropic's official CLI for Claude…"`）；
+/// 2. `system` 里有以 `x-anthropic-billing-header:` 开头的块（所有 CC 形态——包括子代理
+///    explore/search——都带 billing header，即使身份句完全不同）。
 ///
 /// 用 `contains` 而不是 `starts_with`：谁把那句话塞在自己提示词中间，那也是在自称 CC，
 /// 再给他前面插一份官方前缀只会得到两句身份声明。`system` 是字符串形态的一并认。
 fn is_cc_shaped(v: &serde_json::Value) -> bool {
-    match v.get("system") {
-        Some(serde_json::Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX)),
-        Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY_PREFIX),
-        _ => false,
-    }
+    let texts: Vec<&str> = match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
+        }
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        _ => return false,
+    };
+    texts.iter().any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+        || texts.iter().any(|t| t.starts_with("x-anthropic-billing-header:"))
 }
 
 /// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
