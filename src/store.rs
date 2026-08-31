@@ -1794,6 +1794,9 @@ impl CredentialStore {
         if let Some(v) = on(STRIP_EMPTY_TEXT) {
             flags.strip_empty_text = v;
         }
+        if let Some(v) = on(HOIST_SYSTEM_ROLE) {
+            flags.hoist_system_role = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -2005,6 +2008,11 @@ pub const FLATTEN_TOOL_SCHEMAS: &str = "flatten_tool_schemas";
 /// 缺省视为开启：上游要求 text 块非空，部分第三方客户端常发空块。
 pub const STRIP_EMPTY_TEXT: &str = "strip_empty_text";
 
+/// 是否将 messages 里的 `role:"system"` 消息提升到顶层 `system` 字段的 settings 键名。
+/// 缺省视为开启：Anthropic API 不支持 messages 里出现 `role:"system"`（直接 400），
+/// litellm 等第三方客户端常用此格式。
+pub const HOIST_SYSTEM_ROLE: &str = "hoist_system_role";
+
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
@@ -2200,6 +2208,12 @@ pub struct ForwardFlags {
     /// 剥除 messages 里的空 text 内容块 `{"type":"text","text":""}`。
     /// 上游要求 text 块非空，部分第三方客户端常发空块。
     pub strip_empty_text: bool,
+    /// 将 messages 里的 `role:"system"` 消息提升到顶层 `system` 字段。
+    ///
+    /// Anthropic API 不支持 messages 数组里出现 `role:"system"`（直接 400），但 litellm
+    /// 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把这些
+    /// 消息的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
+    pub hoist_system_role: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2226,6 +2240,7 @@ impl Default for ForwardFlags {
             inject_thinking: true,
             flatten_tool_schemas: true,
             strip_empty_text: true,
+            hoist_system_role: true,
         }
     }
 }
@@ -6394,6 +6409,7 @@ mod tests {
             (THINKING_MODIFIED_RETRY, "0"),
             (FLATTEN_TOOL_SCHEMAS, "0"),
             (STRIP_EMPTY_TEXT, "0"),
+            (HOIST_SYSTEM_ROLE, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -6422,6 +6438,7 @@ mod tests {
                 inject_thinking: false,
                 flatten_tool_schemas: false,
                 strip_empty_text: false,
+                hoist_system_role: false,
             }
         );
 

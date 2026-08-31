@@ -439,6 +439,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="hoist_system_role"
+          label={t('System Role 提升', 'System role hoisting')}
+          summary={t(
+            '将 messages 里的 role:"system" 消息提升到顶层 system 字段。',
+            'Hoist role:"system" messages to the top-level system field.',
+          )}
+          description={
+            <>
+              {t(
+                '上游 API 不支持 messages 数组里的 role:"system"（直接 400）。litellm 等采用 OpenAI 格式的客户端会把 system 指令放在 messages 里。开启后自动将这些消息的内容提升到顶层 system 字段，再从 messages 中移除。',
+                'The upstream API does not support role:"system" in the messages array (returns 400). Clients using OpenAI format (e.g. litellm) place system instructions in messages. When enabled, their content is automatically hoisted to the top-level system field and removed from messages.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>

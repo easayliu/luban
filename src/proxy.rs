@@ -127,7 +127,7 @@ pub async fn handle(
     let device_id = extract_device_id(body_json.as_ref());
     // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
     // body 逐轮不变，算一次即可。见 [`Upstream::bare_session`]。
-    let mut has_user_id = body_has_user_id(body_json.as_ref());
+    let has_user_id = body_has_user_id(body_json.as_ref());
     // 来访是不是本来就是 CC 形态（判据是 `system` 里那句话，见 [`is_cc_shaped`]）。
     // 这里只为日志算它：走不走模拟由 [`Simulation::detect`] 自己判，但它返回 `None` 时
     // 分不出是「本来就是 CC」还是「开关关着」，而这正是排查时要知道的那一位。
@@ -301,7 +301,7 @@ pub async fn handle(
     //       off = 不做静态预置处理（运行时学习仍兜底）。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
     let sampling_policy = state.store.sampling_policy();
-    let mut body = if sampling_policy == store::PrefillPolicy::Reject
+    let body = if sampling_policy == store::PrefillPolicy::Reject
         && req_model.as_deref().is_some_and(model_rejects_sampling)
         && has_deprecated_sampling_field(body_json.as_ref())
     {
@@ -4517,6 +4517,8 @@ fn rewrite_body(
         && body.windows(5).any(|w| w == b"allOf" || w == b"oneOf" || w == b"anyOf");
     let may_have_empty_text =
         flags.strip_empty_text && body.windows(9).any(|w| w == b"\"text\":\"\"");
+    let may_have_system_role =
+        flags.hoist_system_role && body.windows(16).any(|w| w == b"\"role\":\"system\"");
     if sim.is_none()
         && !shape
         && !flags.spoof_identity
@@ -4526,6 +4528,7 @@ fn rewrite_body(
         && tool_names.is_none()
         && !may_need_schema_fix
         && !may_have_empty_text
+        && !may_have_system_role
     {
         return body.clone();
     }
@@ -4536,6 +4539,13 @@ fn rewrite_body(
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
+    // role:"system" 提升：litellm 等第三方客户端把 system 放在 messages 里，
+    // 上游不支持该 role，提前挪到顶层 system 字段。必须在 simulate_system 之前——
+    // 后者和 align_system_shape 都只读顶层 system。
+    // CC 形态的请求跳过：CC 在 messages 里合法使用 role:"system"（如 deferred tools），
+    // 强行提升会破坏形态。
+    let system_hoisted =
+        flags.hoist_system_role && !is_cc_shaped(&v) && hoist_system_role_messages(&mut v);
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
     // 模拟后第 4 块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
     // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，第 4 块只留
@@ -4606,6 +4616,7 @@ fn rewrite_body(
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
+        system_hoisted,
         simulated,
         sys_relocated,
         sim_meta,
@@ -4629,7 +4640,8 @@ fn rewrite_body(
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
     );
-    if !shaped
+    if !system_hoisted
+        && !shaped
         && !capped
         && !spoofed
         && !cch_added
@@ -5544,6 +5556,74 @@ fn strip_empty_text_blocks(v: &mut serde_json::Value) -> bool {
         tracing::info!("stripped empty text content blocks from messages");
     }
     changed
+}
+
+/// 把 `messages` 里 `role:"system"` 的消息提升到顶层 `system` 字段。
+///
+/// litellm 等第三方客户端采用 OpenAI 格式，把 system 指令放在 `messages` 数组里
+/// （`{"role":"system","content":"..."}`），Anthropic API 不认这个 role（直接 400）。
+///
+/// 处理逻辑：
+/// 1. 从 `messages` 里找出所有 `role:"system"` 的消息，按原序收集其 content。
+/// 2. 将收集到的 content 块**前置**到顶层 `system`（已有则合并，没有则新建）。
+/// 3. 从 `messages` 里移除这些消息。
+///
+/// content 的形态：OpenAI 格式通常是纯字符串（`"content":"You are a helpful assistant"`），
+/// 也可能是 Anthropic 格式的内容块数组。两种都处理。
+fn hoist_system_role_messages(v: &mut serde_json::Value) -> bool {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let mut hoisted_blocks: Vec<serde_json::Value> = Vec::new();
+    let mut indices_to_remove: Vec<usize> = Vec::new();
+    for (i, msg) in msgs.iter().enumerate() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+            continue;
+        }
+        indices_to_remove.push(i);
+        match msg.get("content") {
+            Some(serde_json::Value::String(s)) => {
+                if !s.is_empty() {
+                    hoisted_blocks.push(serde_json::json!({"type": "text", "text": s}));
+                }
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                hoisted_blocks.extend(arr.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+    if indices_to_remove.is_empty() {
+        return false;
+    }
+    // 从 messages 里移除（倒序，避免索引偏移）。
+    let msgs = v.get_mut("messages").and_then(|m| m.as_array_mut()).unwrap();
+    for &i in indices_to_remove.iter().rev() {
+        msgs.remove(i);
+    }
+    // 合并到顶层 system：已有的内容追加在 hoisted 之后（system 消息在前、原有 system 在后）。
+    if !hoisted_blocks.is_empty() {
+        let existing: Vec<serde_json::Value> = match v.get_mut("system").map(|s| s.take()) {
+            Some(serde_json::Value::String(s)) => {
+                if s.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![serde_json::json!({"type": "text", "text": s})]
+                }
+            }
+            Some(serde_json::Value::Array(arr)) => arr,
+            _ => Vec::new(),
+        };
+        hoisted_blocks.extend(existing);
+        v.as_object_mut()
+            .unwrap()
+            .insert("system".into(), serde_json::Value::Array(hoisted_blocks));
+    }
+    tracing::info!(
+        removed = indices_to_remove.len(),
+        "hoisted role:system messages to top-level system field"
+    );
+    true
 }
 
 fn dedup_tools(v: &mut serde_json::Value) -> bool {
@@ -7336,6 +7416,7 @@ mod tests {
             inject_thinking: false,
             flatten_tool_schemas: true,
             strip_empty_text: true,
+            hoist_system_role: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -7950,6 +8031,7 @@ mod tests {
             inject_thinking: false,
             flatten_tool_schemas: true,
             strip_empty_text: true,
+            hoist_system_role: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -8393,6 +8475,7 @@ mod tests {
                 inject_thinking: false,
                 flatten_tool_schemas: true,
                 strip_empty_text: true,
+                hoist_system_role: false,
             }
         };
         let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);

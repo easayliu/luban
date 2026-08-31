@@ -1453,6 +1453,8 @@ struct ForwardingResp {
     flatten_tool_schemas: bool,
     /// 剥除 messages 里的空 text 内容块。
     strip_empty_text: bool,
+    /// 将 messages 里的 role:"system" 消息提升到顶层 system 字段。
+    hoist_system_role: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1479,6 +1481,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             inject_thinking: f.inject_thinking,
             flatten_tool_schemas: f.flatten_tool_schemas,
             strip_empty_text: f.strip_empty_text,
+            hoist_system_role: f.hoist_system_role,
         }
     }
 }
@@ -1977,6 +1980,7 @@ struct SetForwardingReq {
     inject_thinking: Option<bool>,
     flatten_tool_schemas: Option<bool>,
     strip_empty_text: Option<bool>,
+    hoist_system_role: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -1987,10 +1991,10 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, INJECT_THINKING, MERGE_BETA,
-        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, SIMULATE_CC,
-        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
-        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
+        INJECT_THINKING, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE,
+        RATE_LIMIT_RETRY, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
+        STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
         THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
@@ -2015,6 +2019,7 @@ async fn set_forwarding(
         (INJECT_THINKING, req.inject_thinking),
         (FLATTEN_TOOL_SCHEMAS, req.flatten_tool_schemas),
         (STRIP_EMPTY_TEXT, req.strip_empty_text),
+        (HOIST_SYSTEM_ROLE, req.hoist_system_role),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
