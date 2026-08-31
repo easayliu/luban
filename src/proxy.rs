@@ -1028,6 +1028,7 @@ pub async fn handle(
                 // 这个我们一直只能猜的区分直接说了出来。`up.bytes()` 会吃掉 `up`，故先取走。
                 let request_id = header_text(up.headers(), "request-id");
                 let should_retry = header_text(up.headers(), "x-should-retry");
+                let resp_headers = redact_headers(up.headers());
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
@@ -1061,8 +1062,9 @@ pub async fn handle(
                             route_in_flight = load.route_in_flight,
                             sent_60s = load.sent,
                             max_tokens_60s = load.max_tokens,
+                            response_headers = %resp_headers,
                             response_body = %String::from_utf8_lossy(&bytes),
-                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is the full response body"
+                            "upstream 429 carried no rate-limit headers at all: this is not a quota rejection, here is the full response"
                         );
                         // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
                         let bytes = match &tool_names {
