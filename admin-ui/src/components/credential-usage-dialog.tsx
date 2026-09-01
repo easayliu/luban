@@ -481,7 +481,7 @@ function UsageTable({
         <col className="w-[6.5rem]" />
         <col className="w-[18rem]" />
       </colgroup>
-      <TableHeader className="sticky top-0 z-10 bg-muted/96 backdrop-blur-sm">
+      <TableHeader className="sticky top-0 z-10 bg-surface-subtle">
         <TableRow className="bg-muted/72 [&>th]:border-b [&>th]:text-2xs">
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('请求', 'Request')}</TableHead>
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>

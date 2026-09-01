@@ -11,6 +11,36 @@
 
   --text-2xs: 0.6875rem;
   --text-2xs--line-height: 1rem;
+  /* Cloudflare 的圆角基本只有 4px 一档：按钮、输入框、卡片、弹层都贴着直角走，
+     容器比控件大 2px 而已。这里把整条 Tailwind 半径刻度压扁，组件里现有的
+     rounded-lg / rounded-2xl 等类名不用动就能整体收窄。 */
+  --radius-xs: 2px;
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 4px;
+  --radius-2xl: 6px;
+  --radius-3xl: 8px;
+  --radius-4xl: 10px;
+
+  /* 平面优先：卡片、按钮、输入框一律靠 1px 实线描边分层，不再投影。
+     只有真正浮在页面之上的东西（菜单、弹窗、气泡、toast）才留阴影，
+     所以 xs/sm near-zero，md/lg 保留可见的浮起感。 */
+  --shadow-2xs: 0 0 #0000;
+  --shadow-xs: 0 0 #0000;
+  --shadow-sm: 0 1px 1px 0 rgb(0 0 0 / 0.04);
+  --shadow-md: 0 2px 6px -1px rgb(0 0 0 / 0.10), 0 1px 2px -1px rgb(0 0 0 / 0.06);
+  --shadow-lg: 0 10px 28px -8px rgb(0 0 0 / 0.18), 0 2px 6px -2px rgb(0 0 0 / 0.08);
+  --shadow-xl: 0 18px 44px -12px rgb(0 0 0 / 0.22), 0 4px 10px -4px rgb(0 0 0 / 0.10);
+
+  --color-brand: var(--brand);
+  --color-brand-strong: var(--brand-strong);
+  --color-marine: var(--marine);
+  --color-surface-page: var(--surface-page);
+  --color-surface-subtle: var(--surface-subtle);
+  --color-button-face: var(--button-face);
+  --color-button-face-hover: var(--button-face-hover);
+  --color-button-face-disabled: var(--button-face-disabled);
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -31,6 +61,7 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-fill-foreground: var(--destructive-fill-foreground);
   --color-info: var(--info);
   --color-info-foreground: var(--info-foreground);
   --color-success: var(--success);
@@ -117,75 +148,148 @@
 }
 
 :root {
-  --accent: --alpha(var(--color-black) / 4%);
-  --accent-foreground: var(--color-neutral-800);
-  --background: var(--color-white);
-  --border: --alpha(var(--color-black) / 8%);
-  --card: var(--color-white);
-  --card-foreground: var(--color-neutral-800);
-  --destructive: var(--color-red-500);
-  --destructive-foreground: var(--color-red-700);
-  --foreground: var(--color-neutral-800);
-  --info: var(--color-blue-500);
-  --info-foreground: var(--color-blue-700);
-  --input: --alpha(var(--color-black) / 10%);
-  --muted: --alpha(var(--color-black) / 4%);
-  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-black));
-  /* 套餐档位。绿/琥珀/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
-     出现「绿色的 Pro」被读成「这个号很健康」。故档位单开一族紫，与状态色互不干涉；
-     档位高低靠色相往洋红推进（Pro 蓝 → Max 紫 → Max 20x 洋红），见 tierBadgeVariant。 */
-  --plan: var(--color-violet-500);
-  --plan-foreground: var(--color-violet-700);
-  --plan-high: var(--color-fuchsia-500);
-  --plan-high-foreground: var(--color-fuchsia-700);
-  --popover: var(--color-white);
-  --popover-foreground: var(--color-neutral-800);
-  --primary: var(--color-neutral-800);
-  --primary-foreground: var(--color-neutral-50);
-  --ring: var(--color-neutral-400);
-  --secondary: --alpha(var(--color-black) / 4%);
-  --secondary-foreground: var(--color-neutral-800);
+  /* 色值取自 Cloudflare 自家控制台设计系统 cloudflare/cf-ui
+     （packages/cf-style-const/src/variables.js）。注释里保留它原本的命名，方便回溯。
+     该仓库已归档，且没有发布深色一档与「浅色底上的文字色」，这两类见下面各自的说明。 */
+
+  /* 品牌橙沿用 logo 色 #f6821f；加深档用 cf-ui 的 pumpkin。 */
+  --brand: #f6821f;
+  --brand-strong: #e66b00;
+
+  --background: #ffffff;
+  --foreground: #333333;      /* charcoal */
+  --surface-page: #f7f7f7;    /* moonshine */
+  --surface-subtle: #f7f7f7;  /* moonshine —— 卡片内的粘性表头带 */
+  --card: #ffffff;
+  --card-foreground: #333333;
+  --popover: #ffffff;
+  --popover-foreground: #333333;
+
+  --border: #e0e0e0;          /* smoke */
+  --input: #bcbec0;           /* hail —— 比 border 深一档，让可输入区自己立起来 */
+  --ring: var(--brand);
+
+  /* muted / accent / secondary 保持半透明：它们要盖在白卡片和浅灰页面两种底上，
+     换成实色会在其中一种底上错位。这三个是交互态的叠色，不属于调色板本身。 */
+  --muted: --alpha(var(--color-black) / 5%);
+  /* cf-ui 的 storm 是 #808285，配白底只有 3.85:1——它出自对比度标准更松的年代，
+     而这个 token 承载了大量小字（含 11px 的表头）。压深到 #6f7173 取 4.9:1，色相不动。 */
+  --muted-foreground: #6f7173;
+  --accent: --alpha(var(--color-black) / 6%);
+  --accent-foreground: #333333;
+  /* 次级按钮（outline）的填充。输入框和按钮的描边、圆角、高度本来就接近，改造前靠
+     顶部高光斜面 + 投影区分「凹的井」和「凸的面」；全站压平后这两样都没了，两者在
+     浅色下同为白底、深色下同为 input/32，看上去一模一样。
+     Cloudflare 与 GitHub 的做法都是：输入框留白（可键入的井），按钮给一层浅灰填充。
+     用 alpha 而不是实色——按钮既会落在白卡片上，也会落在浅灰页面上。 */
+  --button-face: --alpha(var(--color-black) / 5%);
+  --button-face-hover: --alpha(var(--color-black) / 9%);
+  /* 禁用态要比可点的次级按钮**更淡**——墨越少越不可用。不能直接用 --muted：
+     它和 --button-face 同为 5%，会让「保存（禁用）」和「生成（可点）」看起来一样。 */
+  --button-face-disabled: --alpha(var(--color-black) / 2.5%);
+  --secondary: --alpha(var(--color-black) / 6%);
+  --secondary-foreground: #404041;  /* night */
+
+  --primary: var(--brand);
+  --primary-foreground: #ffffff;
+
+  /* 语义色。cf-ui 只给了实色，没给「淡底上的文字色」——带 foreground 后缀的那几个
+     是按同色相压深派生的，均过 AA（5.2–7.4:1），值后面标了实测对比度。 */
+  --destructive: #bd2527;              /* apple */
+  --destructive-foreground: #a61e20;   /* cherry, 7.4:1 */
+  --destructive-fill-foreground: #ffffff;
+  /* 绿留在改造前的 Tailwind emerald：cf-ui 的 colorSuccess #68970f 是暗橄榄，
+     grass/fern 偏柠檬，自然绿也没选上——这一支是唯一没走 cf-ui 的语义色。 */
   --success: var(--color-emerald-500);
   --success-foreground: var(--color-emerald-700);
-  --warning: var(--color-amber-500);
-  --warning-foreground: var(--color-amber-700);
-  --chart-1: var(--color-sky-500);
-  --chart-2: var(--color-violet-500);
+  --warning: #fca520;                  /* colorWarning */
+  --warning-foreground: #8a5a00;       /* 派生, 5.9:1 */
+  --info: #00a9eb;                     /* colorInfo */
+  --info-foreground: #0074a3;          /* 派生, 5.2:1 */
+
+  /* marine 是 cf-ui 里的 UI 蓝（区别于 info 那支偏青的信息色），用在开关这类控件上。
+     开关是**状态**不是**动作**：一屏九个橙开关会盖过唯一那颗橙色主按钮。 */
+  --marine: #2f7bbf;
+
+  /* 套餐档位。绿/黄/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
+     出现「绿色的 Pro」被读成「这个号很健康」；主色是橙，橙也被品牌占住了。
+     故档位取 cf-ui 的 twilight → sunset 这条紫到品红的线，与状态色、品牌色三方互不干涉，
+     档位高低靠色相往品红推进（Pro → Max → Max 20x），见 tierBadgeVariant。 */
+  --plan: #8176b5;                     /* twilight */
+  --plan-foreground: #5f5490;          /* 派生, 6.7:1 */
+  --plan-high: #ba77b1;                /* sunset */
+  --plan-high-foreground: #8f4f87;     /* 派生, 5.8:1 */
+
+  --chart-1: #2f7bbf;                  /* marine */
+  --chart-2: var(--brand);
+
+  /* 组件里那圈 before: 顶部高光斜面（shadcn 的立体感来源）在 Cloudflare 语汇里不存在。
+     统一收到这一个 token 上，置 transparent 即全站压平；想找回立体感就在这里给颜色。 */
+  --bevel: transparent;
 }
 
+
 .dark {
-  --accent: --alpha(var(--color-white) / 4%);
-  --accent-foreground: var(--color-neutral-100);
-  --background: color-mix(in srgb, var(--color-neutral-950) 95%, var(--color-white));
-  --border: --alpha(var(--color-white) / 6%);
-  --card: color-mix(in srgb, var(--background) 98%, var(--color-white));
-  --card-foreground: var(--color-neutral-100);
-  --destructive: color-mix(in srgb, var(--color-red-500) 90%, var(--color-white));
-  --destructive-foreground: var(--color-red-400);
-  --foreground: var(--color-neutral-100);
-  --info: var(--color-blue-500);
-  --info-foreground: var(--color-blue-400);
-  --input: --alpha(var(--color-white) / 8%);
-  --muted: --alpha(var(--color-white) / 4%);
-  --muted-foreground: color-mix(in srgb, var(--color-neutral-500) 90%, var(--color-white));
-  --plan: var(--color-violet-500);
-  --plan-foreground: var(--color-violet-400);
-  --plan-high: var(--color-fuchsia-500);
-  --plan-high-foreground: var(--color-fuchsia-400);
-  --popover: color-mix(in srgb, var(--background) 98%, var(--color-white));
-  --popover-foreground: var(--color-neutral-100);
-  --primary: var(--color-neutral-100);
-  --primary-foreground: var(--color-neutral-800);
-  --ring: var(--color-neutral-500);
-  --secondary: --alpha(var(--color-white) / 4%);
-  --secondary-foreground: var(--color-neutral-100);
+  /* cf-ui 成型于该控制台还没有深色模式的年代，这一档它没有发布。
+     以下是按同一族色相往亮处推导出来的：中性骨架自己定，彩色沿用 cf-ui 的色相。 */
+
+  --brand: #ff8f33;
+  --brand-strong: #ffa557;
+
+  --background: #1c1c1c;
+  --foreground: #ededed;
+  /* 深色的层次反过来：页面比 body 更沉，卡片浮在上面。 */
+  --surface-page: #161616;
+  --surface-subtle: #2e2e2e;
+  --card: #242424;
+  --card-foreground: #ededed;
+  --popover: #2a2a2a;
+  --popover-foreground: #ededed;
+
+  --border: #383838;
+  --input: #4a4a4a;
+  --ring: var(--brand);
+
+  --muted: --alpha(var(--color-white) / 7%);
+  --muted-foreground: #9a9a9a;
+  --accent: --alpha(var(--color-white) / 8%);
+  --accent-foreground: #ededed;
+  /* 深色下按钮要比输入框**亮**：井往下沉、面往上浮。 */
+  --button-face: --alpha(var(--color-white) / 12%);
+  --button-face-hover: --alpha(var(--color-white) / 18%);
+  --button-face-disabled: --alpha(var(--color-white) / 5%);
+  --secondary: --alpha(var(--color-white) / 8%);
+  --secondary-foreground: #ededed;
+
+  --primary: var(--brand);
+  /* 橙底上压深色字：深色模式下 --brand 已提亮，白字反而更糊。 */
+  --primary-foreground: #1c1c1c;
+
+  --destructive: #e8595b;              /* apple 提亮 */
+  --destructive-foreground: #f08d8e;
+  /* 同上：亮红底配深字，4.8:1；这是「删除」，最需要看清。 */
+  --destructive-fill-foreground: #1c1c1c;
   --success: var(--color-emerald-500);
   --success-foreground: var(--color-emerald-400);
-  --warning: var(--color-amber-500);
-  --warning-foreground: var(--color-amber-400);
-  --chart-1: var(--color-sky-400);
-  --chart-2: var(--color-violet-400);
+  /* colorWarning 本身就够亮，深色下直接用原值。 */
+  --warning: #fca520;                  /* colorWarning */
+  --warning-foreground: #fcbe5c;
+  --info: #33bdf0;                     /* colorInfo 提亮 */
+  --info-foreground: #66cef4;
+
+  --marine: #4a93d1;
+
+  --plan: #9d92cc;                     /* twilight 提亮 */
+  --plan-foreground: #b3aada;
+  --plan-high: #cc93c4;                /* sunset 提亮 */
+  --plan-high-foreground: #d9aad2;
+
+  --chart-1: #4a93d1;
+  --chart-2: var(--brand);
+
+  --bevel: transparent;
 }
+
 
 @layer base {
   *,
@@ -264,7 +368,7 @@
 
 @layer components {
   .app-shell {
-    background: var(--muted);
+    background: var(--surface-page);
   }
 
   .app-header {
@@ -288,9 +392,8 @@
   }
 
   .brand-mark {
-    color: var(--primary-foreground);
-    background: var(--primary);
-    box-shadow: inset 0 0 0 1px var(--border);
+    color: #ffffff;
+    background: #f6821f;
   }
 
   @media (min-width: 40rem) {

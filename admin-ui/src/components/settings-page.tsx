@@ -127,7 +127,7 @@ export function SettingsPage({
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
+      <header className="app-header sticky top-0 z-20 border-b bg-background">
         <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
           <Button
             aria-label={t('返回账号页', 'Back to accounts')}
@@ -187,7 +187,7 @@ export function SettingsPage({
             value={section}
             onValueChange={changeSection}
           >
-            <div className="settings-tabs-bar sticky z-10 min-w-0 self-start bg-muted/95 py-2 backdrop-blur lg:top-24 lg:w-60 lg:shrink-0 lg:bg-transparent lg:py-0 lg:backdrop-blur-none">
+            <div className="settings-tabs-bar sticky z-10 min-w-0 self-start bg-surface-page py-2 lg:top-24 lg:w-60 lg:shrink-0 lg:bg-transparent lg:py-0">
               <div className="lg:hidden">
                 <label className="sr-only" htmlFor="settings-section-select">
                   {t('设置分类', 'Settings category')}

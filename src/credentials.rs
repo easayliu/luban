@@ -88,6 +88,12 @@ impl Credential {
         Some(hex_lower(&hasher.finalize()))
     }
 
+    /// 是否被系统封禁（上游 401/403、refresh_token 撤销、代理异常等）。
+    /// 区别于手动停用（`ban_reason` 为 `None`）和限速暂停（`resume_at` 非空）。
+    pub fn is_banned(&self) -> bool {
+        self.disabled && self.ban_reason.is_some() && self.resume_at.is_none()
+    }
+
     /// 是否已过期或即将过期（进入刷新窗口）。
     pub fn needs_refresh(&self) -> bool {
         self.expires_in_secs() <= config::REFRESH_LEEWAY_SECS

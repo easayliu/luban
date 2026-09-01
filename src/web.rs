@@ -157,7 +157,7 @@ pub async fn run(
                     }
                 };
                 for cred in creds {
-                    if cred.disabled {
+                    if cred.is_banned() {
                         continue;
                     }
                     let http = match clients.for_credential(&cred) {

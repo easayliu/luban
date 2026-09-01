@@ -108,7 +108,7 @@ export function CredentialListHeader({
         variant="ghost"
         onClick={() => onSortChange(key)}
         className={cn(
-          'w-full px-0 sm:text-sm',
+          'w-full px-0 text-2xs font-semibold uppercase tracking-[0.06em] sm:text-2xs',
           numeric ? 'justify-end text-right' : 'justify-start text-left',
         )}
         title={active

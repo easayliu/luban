@@ -225,7 +225,7 @@ function TtftTable({
   return (
     <div className="max-h-64 overflow-y-auto rounded-xl border">
       <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-muted/96 backdrop-blur-sm">
+        <thead className="sticky top-0 bg-surface-subtle">
           <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
             <th scope="col" className="text-start">
               {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}

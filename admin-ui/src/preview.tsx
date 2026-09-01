@@ -496,15 +496,11 @@ const previewParams = new URLSearchParams(window.location.search)
 const previewLanguage = parseLanguage(previewParams.get('lang')) ?? 'zh-CN'
 const previewDialog = previewParams.get('dialog')
 const previewSettingsParam = previewParams.get('settings')
-const previewSettings: SettingsSection | null = previewSettingsParam === 'devices'
-  ? 'devices'
-  : previewSettingsParam === 'forwarding'
-    ? 'forwarding'
-    : previewSettingsParam === 'security'
-      ? 'security'
-      : previewSettingsParam === 'access'
-        ? 'access'
-        : null
+const PREVIEW_SETTINGS_SECTIONS: readonly SettingsSection[] = [
+  'access', 'devices', 'proxies', 'forwarding', 'security', 'migration',
+]
+const previewSettings: SettingsSection | null =
+  PREVIEW_SETTINGS_SECTIONS.find((section) => section === previewSettingsParam) ?? null
 
 function navigatePreview(search = '') {
   const next = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)
@@ -603,7 +599,7 @@ function PreviewHeader() {
   }, [t])
 
   return (
-    <header className="app-header sticky top-0 z-20 border-b bg-background/92 backdrop-blur-md">
+    <header className="app-header sticky top-0 z-20 border-b bg-background">
       <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
         <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
           <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
@@ -735,6 +731,25 @@ queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   anchor: previewUsageLogs[0]?.id ?? null,
   logs: previewUsageLogs,
 })
+// 代理池：覆盖「无人使用」「被多个账号共用」两种排版。
+queryClient.setQueryData(['proxies'], [
+  {
+    id: 1,
+    label: '香港 · 主力',
+    url: 'socks5://10.0.0.8:1080',
+    created_at: now - 12 * 86400,
+    credential_count: 2,
+    credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'],
+  },
+  {
+    id: 2,
+    label: '东京 · 备用',
+    url: 'http://tokyo.example.internal:3128',
+    created_at: now - 3 * 86400,
+    credential_count: 0,
+    credential_labels: [],
+  },
+])
 queryClient.setQueryData(['credential-devices', 1], [])
 queryClient.setQueryData(['credential-devices', 4], [
   {
