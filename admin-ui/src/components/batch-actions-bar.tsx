@@ -225,7 +225,7 @@ export function BatchActionsBar({
 
           <Button
             size="sm"
-            variant={advancedOpen ? 'secondary' : 'outline'}
+            variant="outline"
             aria-expanded={advancedOpen}
             aria-controls="batch-advanced-settings"
             onClick={() => setAdvancedOpen((open) => !open)}

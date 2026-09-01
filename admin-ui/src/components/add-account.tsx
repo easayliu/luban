@@ -5,15 +5,8 @@ import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
-import { ProxyTestBlock } from '@/components/credential-proxy-dialog'
+import { ProxyPickerCombobox, ProxyTestBlock } from '@/components/credential-proxy-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  Combobox,
-  ComboboxItem,
-  ComboboxPopup,
-  ComboboxTrigger,
-  ComboboxValue,
-} from '@/components/ui/combobox'
 import { Button } from '@/components/ui/button'
 import {
   Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader,
@@ -231,57 +224,15 @@ export function AddAccount({
                 <FieldLabel htmlFor="account-proxy">
                   {t('出站代理（可选）', 'Outbound proxy (optional)')}
                 </FieldLabel>
-                {/* 代理池选择与 [CredentialProxyDialog] 同一套 Combobox：代理池一多，
-                    平铺的 chip 会把整个表单挤长，且标签常是「1」这种看不出所以然的名字——
-                    下拉里能同时给出标签、URL 与使用者，还能搜。 */}
                 {savedProxies.length > 0 && (
                   <div className="w-full space-y-2">
                     <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
                     <div className="flex w-full items-center gap-2">
-                      <Combobox
-                        value={savedProxies.find((p) => p.url === proxy.trim())?.id ?? null}
-                        onValueChange={(id) => {
-                          const found = savedProxies.find((p) => p.id === id)
-                          if (found) setProxy(found.url)
-                        }}
-                        itemToStringLabel={(id) => {
-                          const p = savedProxies.find((px) => px.id === id)
-                          return p ? p.label : ''
-                        }}
-                        itemToStringValue={(id) => {
-                          const p = savedProxies.find((px) => px.id === id)
-                          return p ? `${p.label} ${p.url} ${p.credential_labels.join(' ')}` : ''
-                        }}
-                      >
-                        <ComboboxTrigger className="w-full min-w-0 flex-1">
-                          <ComboboxValue placeholder={t('选择代理…', 'Select a proxy…')} />
-                        </ComboboxTrigger>
-                        <ComboboxPopup
-                          inputPlaceholder={t('搜索标签、地址或使用账号…', 'Search label, URL, or account…')}
-                          emptyText={t('无匹配结果', 'No matches')}
-                        >
-                          {savedProxies.map((p) => (
-                            <ComboboxItem key={p.id} value={p.id}>
-                              <div className="min-w-0">
-                                <div className="flex items-baseline gap-2">
-                                  <span className="truncate font-medium">{p.label}</span>
-                                  {p.credential_count > 0 && (
-                                    <span className="shrink-0 text-xs text-muted-foreground">
-                                      {p.credential_count} {t('账号', 'acct')}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="truncate text-xs text-muted-foreground">{p.url}</div>
-                                {p.credential_labels.length > 0 && (
-                                  <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                                    {p.credential_labels.join(', ')}
-                                  </div>
-                                )}
-                              </div>
-                            </ComboboxItem>
-                          ))}
-                        </ComboboxPopup>
-                      </Combobox>
+                      <ProxyPickerCombobox
+                        proxies={savedProxies}
+                        value={proxy.trim()}
+                        onPick={setProxy}
+                      />
                       {proxy.trim() && (
                         <Button
                           type="button"

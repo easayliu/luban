@@ -36,6 +36,7 @@
   --color-brand: var(--brand);
   --color-brand-strong: var(--brand-strong);
   --color-marine: var(--marine);
+  --color-marine-foreground: var(--marine-foreground);
   --color-surface-page: var(--surface-page);
   --color-surface-subtle: var(--surface-subtle);
   --color-button-face: var(--button-face);
@@ -181,11 +182,24 @@
      顶部高光斜面 + 投影区分「凹的井」和「凸的面」；全站压平后这两样都没了，两者在
      浅色下同为白底、深色下同为 input/32，看上去一模一样。
      Cloudflare 与 GitHub 的做法都是：输入框留白（可键入的井），按钮给一层浅灰填充。
-     用 alpha 而不是实色——按钮既会落在白卡片上，也会落在浅灰页面上。 */
-  --button-face: --alpha(var(--color-black) / 5%);
-  --button-face-hover: --alpha(var(--color-black) / 9%);
-  /* 禁用态要比可点的次级按钮**更淡**——墨越少越不可用。不能直接用 --muted：
-     它和 --button-face 同为 5%，会让「保存（禁用）」和「生成（可点）」看起来一样。 */
+     用 alpha 而不是实色——按钮既会落在白卡片上，也会落在浅灰页面上。
+
+     **改这一族时请连带看下面这张表。** 中性填充一共五档，挤在同一段窄区间里，
+     任何两档撞到一起，靠它们表达的状态就会当场失明（曾经 --button-face 取 5%
+     与 --muted 相同，工具栏「已筛选」和批量栏「已展开」两处状态就是这么没的）：
+
+       2.5%  button-face-disabled  不可点
+       5%    muted                 背景washes、图标底、骨架屏
+       6%    accent / secondary    悬停高亮；无边框的次级按钮
+       7%    button-face           有边框的次级按钮（本 token）
+       12%   button-face-hover     次级按钮悬停
+
+     与 accent/secondary 只差 1% 是**有意保留**的：secondary 和 button-face 本就是
+     同一个概念（按钮的面，一个不带边框一个带），它们之间不该、也不再有状态切换。
+     和 muted 必须拉开——muted 会被当作状态填充用（见 OverviewMetric）。 */
+  --button-face: --alpha(var(--color-black) / 7%);
+  --button-face-hover: --alpha(var(--color-black) / 12%);
+  /* 禁用态要比可点的次级按钮**更淡**——墨越少越不可用。 */
   --button-face-disabled: --alpha(var(--color-black) / 2.5%);
   --secondary: --alpha(var(--color-black) / 6%);
   --secondary-foreground: #404041;  /* night */
@@ -210,6 +224,8 @@
   /* marine 是 cf-ui 里的 UI 蓝（区别于 info 那支偏青的信息色），用在开关这类控件上。
      开关是**状态**不是**动作**：一屏九个橙开关会盖过唯一那颗橙色主按钮。 */
   --marine: #2f7bbf;
+  /* marine 在淡蓝底上做文字偏浅，用 cf-ui 里它的深色伴色 thunder（5.6:1）。 */
+  --marine-foreground: #286ea4;
 
   /* 套餐档位。绿/黄/红在这套界面里全是**状态**语义（健康/风险/故障），套餐借过来就会
      出现「绿色的 Pro」被读成「这个号很健康」；主色是橙，橙也被品牌占住了。
@@ -254,7 +270,8 @@
   --muted-foreground: #9a9a9a;
   --accent: --alpha(var(--color-white) / 8%);
   --accent-foreground: #ededed;
-  /* 深色下按钮要比输入框**亮**：井往下沉、面往上浮。 */
+  /* 深色下按钮要比输入框**亮**：井往下沉、面往上浮。
+     这一档与 muted(7%)、accent(8%) 天然拉开了 4–5%，不需要像浅色那样另行避让。 */
   --button-face: --alpha(var(--color-white) / 12%);
   --button-face-hover: --alpha(var(--color-white) / 18%);
   --button-face-disabled: --alpha(var(--color-white) / 5%);
@@ -278,6 +295,7 @@
   --info-foreground: #66cef4;
 
   --marine: #4a93d1;
+  --marine-foreground: #7ab4e0;
 
   --plan: #9d92cc;                     /* twilight 提亮 */
   --plan-foreground: #b3aada;

@@ -541,8 +541,12 @@ function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSect
 
 function PreviewCredentialWorkspace() {
   const [query, setQuery] = React.useState('')
-  const [filter, setFilter] = React.useState<CredentialFilterKey>('all')
-  const [tier, setTier] = React.useState<CredentialTierFilterKey>('all')
+  const [filter, setFilter] = React.useState<CredentialFilterKey>(
+    (previewParams.get('filter') as CredentialFilterKey | null) ?? 'all',
+  )
+  const [tier, setTier] = React.useState<CredentialTierFilterKey>(
+    (previewParams.get('tier') as CredentialTierFilterKey | null) ?? 'all',
+  )
   const [sort, setSort] = React.useState<SortKey>('priority')
   const [dir, setDir] = React.useState<SortDir>('asc')
   const [view, setView] = React.useState<CredentialViewMode>(
@@ -733,22 +737,11 @@ queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
 })
 // 代理池：覆盖「无人使用」「被多个账号共用」两种排版。
 queryClient.setQueryData(['proxies'], [
-  {
-    id: 1,
-    label: '香港 · 主力',
-    url: 'socks5://10.0.0.8:1080',
-    created_at: now - 12 * 86400,
-    credential_count: 2,
-    credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'],
-  },
-  {
-    id: 2,
-    label: '东京 · 备用',
-    url: 'http://tokyo.example.internal:3128',
-    created_at: now - 3 * 86400,
-    credential_count: 0,
-    credential_labels: [],
-  },
+  { id: 1, label: '香港 · 主力', url: 'socks5h://sub2:sofjnwaeognw@13.57.24.38:16901', created_at: now - 12 * 86400, credential_count: 2, credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'] },
+  { id: 2, label: '1', url: 'socks5h://sub2:sofjnwaeognw@54.176.188.201:16901', created_at: now - 9 * 86400, credential_count: 0, credential_labels: [] },
+  { id: 3, label: '2', url: 'socks5h://sub2:sofjnwaeognw@57.183.8.180:16901', created_at: now - 8 * 86400, credential_count: 1, credential_labels: ['mizuno@nakanekougyou.com'] },
+  { id: 4, label: '165.254.95.89:35593', url: 'socks5h://rgyIjJ7S:AAHHpBYGWw@165.254.95.89:35593', created_at: now - 5 * 86400, credential_count: 0, credential_labels: [] },
+  { id: 5, label: '东京 · 备用', url: 'http://tokyo.example.internal:3128', created_at: now - 3 * 86400, credential_count: 0, credential_labels: [] },
 ])
 queryClient.setQueryData(['credential-devices', 1], [])
 queryClient.setQueryData(['credential-devices', 4], [

@@ -51,7 +51,7 @@ export function OverviewMetric({
   const rootClass = cn(
     'min-w-0 text-left transition-colors',
     onClick && 'cursor-pointer hover:bg-muted/40 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
-    active && 'bg-muted/72',
+    active && 'bg-marine/10 hover:bg-marine/14',
     className,
   )
 

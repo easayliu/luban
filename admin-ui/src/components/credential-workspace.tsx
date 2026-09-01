@@ -215,6 +215,10 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   created: ['添加时间', 'Date added'],
 }
 
+/** 筛选/套餐触发器在「已生效」时的染色，见 FILTERS 上方的说明。 */
+const ACTIVE_FILTER_CLASS =
+  'border-marine/40 bg-marine/10 text-marine-foreground hover:border-marine/40 hover:bg-marine/16 data-pressed:bg-marine/16'
+
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
 export const CREDENTIAL_TIER_FILTER_KEYS = TIER_FILTERS.map((item) => item.key)
 
@@ -784,8 +788,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <MenuTrigger
                     aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
                     className={cn(
-                      buttonVariants({ variant: filter === 'all' ? 'outline' : 'secondary' }),
+                      buttonVariants({ variant: 'outline' }),
                       'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                      filter !== 'all' && ACTIVE_FILTER_CLASS,
                     )}
                   >
                     <ListFilterIcon />
@@ -813,8 +818,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   <MenuTrigger
                     aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
                     className={cn(
-                      buttonVariants({ variant: tier === 'all' ? 'outline' : 'secondary' }),
+                      buttonVariants({ variant: 'outline' }),
                       'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                      tier !== 'all' && ACTIVE_FILTER_CLASS,
                     )}
                   >
                     <LayersIcon />
