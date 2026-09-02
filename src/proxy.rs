@@ -546,8 +546,14 @@ pub async fn handle(
                 "identity path: PASSTHROUGH — neither simulating nor filling identity"
             ),
         }
-        let out =
-            build_forward_headers(&headers, &token, flags, sim.as_ref(), bare_session.as_deref());
+        let out = build_forward_headers_for(
+            &headers,
+            &token,
+            flags,
+            sim.as_ref(),
+            bare_session.as_deref(),
+            req_model.as_deref(),
+        );
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
         let target = if sim.is_some() && billable { ensure_beta_query(&url) } else { url.clone() };
@@ -3078,8 +3084,9 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
     false
 }
 
-/// 合并来访的 `anthropic-beta`：**客户端自有的那串一字不动**，只把 API-key 模式的客户端不会
-/// 自带的那四项补进去，各自插到官方位置上。这里是「注入哪几项」的唯一真源。
+/// 合并来访的 `anthropic-beta`：**客户端自有的那串顺序不动**，只把 API-key 模式的客户端不会
+/// 自带的那几项补进去，各自插到官方位置上（fable 族另剥一项，见下）。这里是「注入哪几项」的
+/// 唯一真源。
 ///
 /// 只追加不落位会得到官方客户端不会产生的排列（缺失项全堆在末尾），集合对了顺序错，一次精确
 /// 字符串匹配即可判定中间有代理。但**落位不能靠一张全局顺序表**——haiku 的客户端把
@@ -3089,34 +3096,94 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
 ///
 /// - [`config::OAUTH_BETA_HEADER`]：OAuth 鉴权必需。客户端串以
 ///   [`config::CC_BETA_CLAUDE_CODE`] 开头就插它后面，否则插最前（haiku 即后者）。
-/// - [`config::CC_BETA_ADVANCED_TOOL_USE`]：有 [`config::CC_BETA_EFFORT`] 就插它前面，
-///   没有就跟在客户端自有串之后（haiku）。
+/// - [`config::CC_BETA_ADVANCED_TOOL_USE`]：有 [`config::CC_BETA_EFFORT`] 就插它前面；没有
+///   （haiku）就插在 [`config::CC_BETA_ADVISOR_TOOL`] 之后（2.1.251 起 haiku 的官方串是
+///   `…claude-code,advisor-tool,advanced-tool-use,server-side-fallback…`）；两个都没有
+///   （2.1.220 的 haiku）才跟在客户端自有串之后。
 /// - [`config::CC_BETA_PROMPT_CACHING_SCOPE`]：四份抓包里客户端都自带，真缺时补在末尾。
-/// - [`config::CC_BETA_EXTENDED_CACHE_TTL`]：官方恒为最后一项，故**最后**追加——这也是本
-///   函数里插入顺序有讲究的唯一一处。
+/// - [`config::CC_BETA_EXTENDED_CACHE_TTL`]：2.1.220 时官方恒为最后一项；2.1.251 起队尾是
+///   [`config::CC_BETA_CACHE_DIAGNOSIS`]，它排在其前。故有 `cache-diagnosis` 就插它前面，
+///   没有才追加队尾。
 ///
-/// 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；fable-5 那对
-/// 两侧会话配置不同（`context-1m` / `server-side-fallback`），能验的是落位，也一致。
-/// 回归测试见 [`tests::merged_beta_matches_official_order`]。
-fn merge_beta(incoming: Option<&str>) -> String {
+/// **2.1.251+ 世代还差几项**（判据：客户端串里有 [`config::CC_BETA_ADVISOR_TOOL`]，2.1.220
+/// 的客户端没有这项，老规则对它们保持原样）。依据 `cap/2.1.258-api` 的 API-key 端原始请求头
+/// （00006 opus / 00013 fable / 00017 sonnet / 00025 haiku），对照 `cap/2.1.258` 订阅端直连抓包：
+/// API-key 端缺 oauth / advanced-tool-use / server-side-fallback / extended-cache-ttl /
+/// cache-diagnosis，`fallback-credit` 与动态的 `afk-mode` 四族都自带；fable 另缺
+/// `thinking-display-updates`、多一个 `redact-thinking`。
+///
+/// - [`config::CC_BETA_SERVER_SIDE_FALLBACK`]：`effort` 之后；没有 `effort`（haiku）就在
+///   `advanced-tool-use` 之后。
+/// - [`config::CC_BETA_FALLBACK_CREDIT`]：`server-side-fallback` 之后（API-key 端四族都自带，
+///   这条只是兜底）。
+/// - [`config::CC_BETA_CACHE_DIAGNOSIS`]：队尾（在 `extended-cache-ttl` 之前先补，后者再插到
+///   它前面）。
+/// - fable 族（由 [`cc_beta_seed`] 判：种子里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
+///   补 `thinking-display-updates`（`fallback-credit` 之后），并**剥掉**
+///   [`config::CC_BETA_REDACT_THINKING`]——订阅端 fable 不发它，API-key 端发；这是本函数
+///   唯一会删客户端项的地方，fable 上原始思维链本来就不返回，删了没有语义损失。与之配套的
+///   body 侧 `thinking.display:"updates"` 由 [`fill_thinking_display`] 补。
+///
+/// `model` 为 `None` 时不做族相关的两条（不知道是哪族就不猜）。
+///
+/// 2.1.220 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；
+/// 2.1.258 四族以 API-key 端原始请求头为输入，同样逐字节还原订阅端官方串。回归测试见 [`tests::merged_beta_matches_official_order`] 与
+/// [`tests::merged_beta_matches_2_1_258_official_order`]。
+fn merge_beta(incoming: Option<&str>, model: Option<&str>) -> String {
     let mut parts: Vec<String> = incoming
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
     let has = |parts: &[String], beta: &str| parts.iter().any(|p| p == beta);
+    let pos = |parts: &[String], beta: &str| parts.iter().position(|p| p == beta);
+    // 2.1.251+ 世代的判据；老客户端不补下面那四项。
+    let modern = has(&parts, config::CC_BETA_ADVISOR_TOOL);
+    let seed = model.map(cc_beta_seed);
+    let seed_has = |beta: &str| seed.is_some_and(|s| s.split(',').any(|p| p.trim() == beta));
 
     if !has(&parts, config::OAUTH_BETA_HEADER) {
         let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
         parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
     }
     if !has(&parts, config::CC_BETA_ADVANCED_TOOL_USE) {
-        let at = parts.iter().position(|p| p == config::CC_BETA_EFFORT).unwrap_or(parts.len());
+        let at = parts
+            .iter()
+            .position(|p| p == config::CC_BETA_EFFORT)
+            .or_else(|| parts.iter().position(|p| p == config::CC_BETA_ADVISOR_TOOL).map(|i| i + 1))
+            .unwrap_or(parts.len());
         parts.insert(at, config::CC_BETA_ADVANCED_TOOL_USE.to_string());
     }
     if !has(&parts, config::CC_BETA_PROMPT_CACHING_SCOPE) {
         parts.push(config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
     }
+    if modern {
+        if !has(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK) {
+            let at = pos(&parts, config::CC_BETA_EFFORT)
+                .or_else(|| pos(&parts, config::CC_BETA_ADVANCED_TOOL_USE))
+                .map_or(parts.len(), |i| i + 1);
+            parts.insert(at, config::CC_BETA_SERVER_SIDE_FALLBACK.to_string());
+        }
+        if !has(&parts, config::CC_BETA_FALLBACK_CREDIT) {
+            let at =
+                pos(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK).map_or(parts.len(), |i| i + 1);
+            parts.insert(at, config::CC_BETA_FALLBACK_CREDIT.to_string());
+        }
+        if seed_has(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
+            if !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
+                let at =
+                    pos(&parts, config::CC_BETA_FALLBACK_CREDIT).map_or(parts.len(), |i| i + 1);
+                parts.insert(at, config::CC_BETA_THINKING_DISPLAY_UPDATES.to_string());
+            }
+            if !seed_has(config::CC_BETA_REDACT_THINKING) {
+                parts.retain(|p| p != config::CC_BETA_REDACT_THINKING);
+            }
+        }
+        if !has(&parts, config::CC_BETA_CACHE_DIAGNOSIS) {
+            parts.push(config::CC_BETA_CACHE_DIAGNOSIS.to_string());
+        }
+    }
     if !has(&parts, config::CC_BETA_EXTENDED_CACHE_TTL) {
-        parts.push(config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
+        let at = pos(&parts, config::CC_BETA_CACHE_DIAGNOSIS).unwrap_or(parts.len());
+        parts.insert(at, config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
     }
     parts.join(",")
 }
@@ -3142,12 +3209,27 @@ fn merge_beta(incoming: Option<&str>) -> String {
 ///
 /// 无法对齐的部分（头名大小写、hyper 自己追加的 `user-agent`/`host`/`content-length`）
 /// 见 [`crate::config::known_fingerprint_gaps`]。
+#[cfg(test)]
 fn build_forward_headers(
     headers: &HeaderMap,
     token: &str,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
     bare_session: Option<&str>,
+) -> HeaderMap {
+    build_forward_headers_for(headers, token, flags, sim, bare_session, None)
+}
+
+/// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta`] 做族相关的两条
+/// 规则（fable 的 `thinking-display-updates` / `redact-thinking`）。转发路径与探测都知道模型，
+/// 走这个；不带模型的那个留给测试与无 body 的场景。
+fn build_forward_headers_for(
+    headers: &HeaderMap,
+    token: &str,
+    flags: store::ForwardFlags,
+    sim: Option<&Simulation>,
+    bare_session: Option<&str>,
+    model: Option<&str>,
 ) -> HeaderMap {
     let mut out = match sim {
         // 模拟模式：来访那套头一个不留，整体换成官方的（见 [`official_headers`]）。
@@ -3184,7 +3266,7 @@ fn build_forward_headers(
         None => incoming.map(str::to_string),
     };
     if flags.merge_beta {
-        match HeaderValue::from_str(&merge_beta(incoming.as_deref())) {
+        match HeaderValue::from_str(&merge_beta(incoming.as_deref(), model)) {
             Ok(v) => {
                 out.insert("anthropic-beta", v);
             }
@@ -4676,6 +4758,11 @@ fn rewrite_body(
     // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
     // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
     let thinking_filled = sim.is_some() && flags.inject_thinking && ensure_thinking(&mut v);
+    // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 会补 `thinking-display-updates`，
+    // body 侧配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
+    // 与 `merge_beta` 同一个开关，否则就是「体里写了字段、头上没声明」。
+    let display_filled =
+        sim.is_none() && cc_inbound && flags.merge_beta && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
@@ -4756,6 +4843,7 @@ fn rewrite_body(
         prefix_injected,
         cch_added,
         thinking_filled,
+        display_filled,
         ctx_mgmt,
         msg_shape,
         ttl_filled,
@@ -4781,6 +4869,7 @@ fn rewrite_body(
         && !sys_relocated
         && !sim_meta
         && !thinking_filled
+        && !display_filled
         && !ctx_mgmt
         && !msg_shape
         && !ttl_filled
@@ -5124,6 +5213,23 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     true
 }
 
+/// fable 族 CC 请求补 `thinking.display:"updates"`：订阅端官方 fable-5-1 发的是
+/// `{"type":"adaptive","display":"updates"}`（`cap/2.1.258/00013`），API-key 端发裸 `adaptive`。
+/// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由 [`cc_beta_seed`]
+/// 判（种子里有 `thinking-display-updates` 的才算），与 [`merge_beta`] 补那项 beta 的判据同源。
+fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    if !cc_beta_seed(model).contains(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
+        return false;
+    }
+    let Some(th) = v.get_mut("thinking").and_then(|t| t.as_object_mut()) else { return false };
+    if th.get("type").and_then(|t| t.as_str()) != Some("adaptive") || th.contains_key("display") {
+        return false;
+    }
+    th.insert("display".into(), "updates".into());
+    true
+}
+
 fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
@@ -5199,32 +5305,52 @@ fn cch_value() -> &'static str {
 /// `\n\n`，一律不动结构返回 `false`。客户端本来就是 4 块（订阅形态）时同样不动。
 fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
     let sys = match v.get_mut("system").and_then(|s| s.as_array_mut()) {
-        Some(s) if s.len() == 3 => s,
+        Some(s) if s.len() == 3 || s.len() == 4 => s,
         _ => return false,
     };
-    // 合并块必须本来就是个带断点的文本块，否则不是我们认识的形态。
-    if sys[2].get("cache_control").is_none() {
+    let last = sys.len() - 1;
+    // 四块只认 `[billing, 身份, reporting, 合并块]`——fable 族（2.1.258 起唯一带 reporting 的）
+    // 在 API-key 模式下就是这个样子（`cap/2.1.258-api/00013`：reporting 单独成块、无断点，
+    // 合并块仍是 `基座 ‖ "\n\n" ‖ 其余`）。第三块不是逐字节的 reporting 块（或带了断点）就不是
+    // 我们认识的形态。官方的四块订阅形态 `[billing, 身份, 基座, 其余]` 第三块是基座，在这里
+    // 自然落到 `false`，不会被再切一次。
+    let reporting = last == 3;
+    if reporting
+        && (sys[2].get("text").and_then(|t| t.as_str()) != Some(config::CC_SYSTEM_REPORTING)
+            || sys[2].get("cache_control").is_some())
+    {
         return false;
     }
-    let text = match sys[2].get("text").and_then(|t| t.as_str()) {
+    // 合并块必须本来就是个带断点的文本块，否则不是我们认识的形态。
+    if sys[last].get("cache_control").is_none() {
+        return false;
+    }
+    let text = match sys[last].get("text").and_then(|t| t.as_str()) {
         Some(t) => t.to_string(),
         None => return false,
     };
+    let body = text.as_str();
     // 逐个模型族的锚点找，取**最早**命中的那个：基座是前缀，切得越靠前越不会把基座切碎。
     // 锚点前必须紧跟 `\n\n`——那两个字节是两块的分隔符，切开后两边都不保留它。
     // 用字节比较：`find` 给的是字节偏移，`p - 2` 未必落在字符边界上，直接切片会 panic。
     let at = config::CC_SYSTEM_BASE_ANCHORS
         .iter()
-        .filter_map(|anchor| text.find(anchor))
-        .filter(|&p| p >= 2 && &text.as_bytes()[p - 2..p] == b"\n\n")
+        .filter_map(|anchor| body.find(anchor))
+        .filter(|&p| p >= 2 && &body.as_bytes()[p - 2..p] == b"\n\n")
         .min();
     let Some(at) = at else { return false };
 
     if let Some(obj) = sys[1].as_object_mut() {
         obj.remove("cache_control");
     }
-    sys[2] = text_block(&text[..at - 2], cache_control(cache));
-    sys.push(text_block(&text[at..], cache_control(cache.tail())));
+    let base = text_block(&body[..at - 2], cache_control(cache));
+    let rest = text_block(&body[at..], cache_control(cache.tail()));
+    sys.truncate(2);
+    if reporting {
+        sys.push(text_block_bare(config::CC_SYSTEM_REPORTING));
+    }
+    sys.push(base);
+    sys.push(rest);
     true
 }
 
@@ -7065,7 +7191,8 @@ pub async fn probe(
         reporting: cc_system_reporting(model),
         session_id: session_id_for(cred, &device_fp),
     };
-    let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim), None);
+    let headers =
+        build_forward_headers_for(&HeaderMap::new(), &token, flags, Some(&sim), None, Some(model));
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
     // Upstream 之前取，取值规则与转发路径同一套。
     let out_ua = ua_of(&headers);
@@ -7527,13 +7654,133 @@ mod tests {
         ),
     ];
 
+    /// 2.1.258：API-key 端的**原始请求头**（`cap/2.1.258-api` 00025 haiku / 00017 sonnet /
+    /// 00006 opus / 00013 fable，CC 经 luban 的入站原文）喂进去，必须逐字节还原订阅端直连
+    /// 抓包的串（`cap/2.1.258` 00031 / 00026 / 00012 / 00013）。
+    ///
+    /// API-key 端缺的是 oauth / advanced-tool-use / server-side-fallback / extended-cache-ttl /
+    /// cache-diagnosis；`fallback-credit` 与 `afk-mode` 四族都自带；fable 缺
+    /// thinking-display-updates 却多一个 redact-thinking。API-key 端 fable 样本带 `context-1m`
+    /// （[1m] 会话）而订阅端样本不带，期望值按 opus 的位置把它放在 `oauth` 之后。
+    #[test]
+    fn merged_beta_matches_2_1_258_official_order() {
+        const CASES: &[(&str, &str, &str)] = &[
+            (
+                "claude-haiku-4-5-20251001",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
+                 fallback-credit-2026-06-01,afk-mode-2026-01-31",
+                "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,server-side-fallback-2026-07-01,\
+                 fallback-credit-2026-06-01,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,\
+                 cache-diagnosis-2026-04-07",
+            ),
+            (
+                "claude-sonnet-5",
+                "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 advisor-tool-2026-03-01,effort-2025-11-24,fallback-credit-2026-06-01,\
+                 afk-mode-2026-01-31",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,effort-2025-11-24,\
+                 server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+                 afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+            ),
+            (
+                "claude-opus-5",
+                "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+                 redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,effort-2025-11-24,\
+                 fallback-credit-2026-06-01,afk-mode-2026-01-31",
+                "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+                 interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
+                 server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+                 afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+            ),
+            (
+                "claude-fable-5-1",
+                "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+                 redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,effort-2025-11-24,\
+                 fallback-credit-2026-06-01,afk-mode-2026-01-31",
+                "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+                 interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,effort-2025-11-24,\
+                 server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+                 thinking-display-updates-2026-08-18,afk-mode-2026-01-31,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+            ),
+        ];
+        for (model, api_key_client, official) in CASES {
+            assert_eq!(
+                &merge_beta(Some(api_key_client), Some(model)),
+                official,
+                "{model} 的 beta 串没对齐"
+            );
+            // 订阅端客户端经 luban：本来就是官方串，一个字都不该动（幂等）。
+            assert_eq!(&merge_beta(Some(official), Some(model)), official, "{model} 不幂等");
+        }
+        // 不知道模型时，族相关的两条不做：fable 的 API-key 串只补通用几项。
+        let fable_api = CASES[3].1;
+        let no_model = merge_beta(Some(fable_api), None);
+        assert!(no_model.contains("redact-thinking-2026-02-12"), "不知道族就不删: {no_model}");
+        assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
+    }
+
+    /// 真实 CC（API-key 模式）的 fable 请求，body 侧要配套补 `thinking.display:"updates"`
+    /// （`cap/2.1.258/00013`）；opus 不补；客户端自己写了 `display` 的不动；`merge_beta`
+    /// 关着就不补。模拟路径不走这条（它由 `ensure_thinking` 直接产出完整形态）。
+    #[test]
+    fn fills_thinking_display_for_cc_fable_requests() {
+        let body = |model: &str, thinking: &str| {
+            Bytes::from(format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}}],"thinking":{thinking}}}"#
+            ))
+        };
+        let run = |b: &Bytes, flags: store::ForwardFlags| -> serde_json::Value {
+            serde_json::from_slice(&rewrite_body(b, &test_cred(), "fp", flags, None, None)).unwrap()
+        };
+        let fable = run(&body("claude-fable-5-1", r#"{"type":"adaptive"}"#), all_on());
+        assert_eq!(
+            fable["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "{fable}"
+        );
+        let fable_1m = run(&body("claude-fable-5-1[1m]", r#"{"type":"adaptive"}"#), all_on());
+        assert_eq!(fable_1m["thinking"]["display"], "updates", "{fable_1m}");
+        let opus = run(&body("claude-opus-5", r#"{"type":"adaptive"}"#), all_on());
+        assert_eq!(opus["thinking"], serde_json::json!({"type": "adaptive"}), "opus 不补: {opus}");
+        let own = run(
+            &body("claude-fable-5-1", r#"{"type":"adaptive","display":"summarized"}"#),
+            all_on(),
+        );
+        assert_eq!(own["thinking"]["display"], "summarized", "客户端自己写的不动: {own}");
+        let off = store::ForwardFlags { merge_beta: false, ..all_on() };
+        let v = run(&body("claude-fable-5-1", r#"{"type":"adaptive"}"#), off);
+        assert!(v["thinking"].get("display").is_none(), "merge_beta 关着就不补: {v}");
+    }
+
     /// 补齐 + 落位后应与官方客户端的 beta 串**逐字节一致**，三个模型族都要过。
     #[test]
     fn merged_beta_matches_official_order() {
         for (model, client, official) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
             assert_eq!(
-                &merge_beta(Some(v.to_str().unwrap())),
+                &merge_beta(Some(v.to_str().unwrap()), None),
                 official,
                 "{model} 的 beta 串没对齐"
             );
@@ -7545,7 +7792,7 @@ mod tests {
     fn merged_beta_preserves_client_order() {
         for (model, client, _) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
-            let out = merge_beta(Some(v.to_str().unwrap()));
+            let out = merge_beta(Some(v.to_str().unwrap()), None);
             let kept: Vec<&str> =
                 out.split(',').filter(|b| client.split(',').any(|c| c.trim() == *b)).collect();
             let sent: Vec<&str> = client.split(',').map(str::trim).collect();
@@ -7558,7 +7805,7 @@ mod tests {
     fn merged_beta_keeps_unknown_betas_in_place() {
         let (_, client, official) = BETA_PAIRS[1];
         let v = HeaderValue::from_str(&format!("{client},some-future-beta-2027-01-01")).unwrap();
-        let out = merge_beta(Some(v.to_str().unwrap()));
+        let out = merge_beta(Some(v.to_str().unwrap()), None);
         // 客户端把它放在自有串末尾，官方串里它就该在 effort 之后、extended-cache-ttl 之前。
         assert_eq!(
             out,
@@ -7573,7 +7820,7 @@ mod tests {
     #[test]
     fn merged_beta_from_empty_is_deterministic() {
         assert_eq!(
-            merge_beta(None),
+            merge_beta(None, None),
             "oauth-2025-04-20,advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,\
              extended-cache-ttl-2025-04-11"
         );
@@ -8259,6 +8506,61 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
             "其余那块只带 ttl: {v}"
         );
+    }
+
+    /// fable 族 API-key 模式是四块 `[billing, 身份(断点), reporting, 合并块(断点)]`
+    /// （`cap/2.1.258-api/00013`），要拆成订阅端官方的五块 `[billing, 身份, reporting, 基座, 其余]`
+    /// （`cap/2.1.258/00013`）。reporting 块逐字节匹配才认，其它四块形态不动。
+    #[test]
+    fn splits_fable_api_shape_with_reporting_block() {
+        let merged = "\nBASE — 基座\n\nBefore you start, say in a line what you're about to do; brief updates.";
+        let body = |system: serde_json::Value| {
+            let mut v: serde_json::Value = serde_json::from_str(API_SHAPE_BODY).unwrap();
+            v["model"] = "claude-fable-5-1".into();
+            v["system"] = system;
+            Bytes::from(serde_json::to_vec(&v).unwrap())
+        };
+        let billing = serde_json::json!({"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli;"});
+        let identity = serde_json::json!({"type":"text","text":config::CC_SYSTEM_IDENTITY,"cache_control":{"type":"ephemeral"}});
+        let reporting = serde_json::json!({"type":"text","text":config::CC_SYSTEM_REPORTING});
+
+        let four = body(serde_json::json!([
+            billing, identity, reporting,
+            {"type":"text","text":merged,"cache_control":{"type":"ephemeral"}},
+        ]));
+        {
+            let (name, raw) = ("四块", four);
+            let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let sys = v["system"].as_array().unwrap();
+            assert_eq!(sys.len(), 5, "{name}: 应拆成官方五块: {v}");
+            assert!(sys[1].get("cache_control").is_none(), "{name}: 身份句不带断点");
+            assert_eq!(sys[2]["text"], config::CC_SYSTEM_REPORTING, "{name}: 第 2 块是 reporting");
+            assert!(sys[2].get("cache_control").is_none(), "{name}: reporting 块不带断点");
+            assert_eq!(sys[3]["text"], "\nBASE — 基座", "{name}: 基座切错: {v}");
+            assert_eq!(
+                sys[3]["cache_control"],
+                serde_json::json!({"type":"ephemeral","ttl":"1h","scope":"global"}),
+                "{name}: 基座断点"
+            );
+            assert!(
+                sys[4]["text"].as_str().unwrap().starts_with("Before you start"),
+                "{name}: 其余部分应从锚点开始"
+            );
+            assert_eq!(sys[4]["cache_control"], serde_json::json!({"type":"ephemeral","ttl":"1h"}));
+        }
+
+        // 四块但第三块不是 reporting（比如官方订阅四块形态 `[billing, 身份, 基座, 其余]`，或
+        // 别的中间层塞的东西）：不动。
+        let other = body(serde_json::json!([
+            billing, identity,
+            {"type":"text","text":"not the reporting block"},
+            {"type":"text","text":merged,"cache_control":{"type":"ephemeral"}},
+        ]));
+        let out = rewrite_body(&other, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 4, "认不出的四块不该动: {v}");
+        assert!(!String::from_utf8_lossy(&out).contains("\"ttl\""), "没整形就不补 ttl");
     }
 
     /// 锚点匹配不到（未知模型族/新版本改了措辞）时**不动结构**，退回三块原样转发——
@@ -9620,14 +9922,21 @@ mod tests {
             ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
         ] {
             let seed = super::cc_beta_seed(model);
-            assert_eq!(merge_beta(Some(&super::simulated_beta(seed, None))), official, "{model}");
+            assert_eq!(
+                merge_beta(Some(&super::simulated_beta(seed, None)), Some(model)),
+                official,
+                "{model}"
+            );
         }
 
         // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
-        let with_client = merge_beta(Some(&super::simulated_beta(
-            config::CC_BETA_SIMULATED,
-            Some("output-128k-2025-02-19, effort-2025-11-24"),
-        )));
+        let with_client = merge_beta(
+            Some(&super::simulated_beta(
+                config::CC_BETA_SIMULATED,
+                Some("output-128k-2025-02-19, effort-2025-11-24"),
+            )),
+            Some("claude-sonnet-5"),
+        );
         assert!(
             with_client.contains("output-128k-2025-02-19"),
             "客户端的 beta 被丢了: {with_client}"

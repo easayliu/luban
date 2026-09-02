@@ -91,11 +91,42 @@ pub const CC_BETA_CLAUDE_CODE: &str = "claude-code-20250219";
 /// `effort-2025-11-24`：[`CC_BETA_ADVANCED_TOOL_USE`] 的落位参照物（haiku 不发这一项）。
 pub const CC_BETA_EFFORT: &str = "effort-2025-11-24";
 
+/// `advisor-tool-2026-03-01`：haiku 没有 `effort` 时 [`CC_BETA_ADVANCED_TOOL_USE`] 的落位参照物
+/// （2.1.251 起四族都带，haiku 官方串里 `advanced-tool-use` 紧跟其后，`cap/2.1.258/00031`）。
+pub const CC_BETA_ADVISOR_TOOL: &str = "advisor-tool-2026-03-01";
+
 /// `advanced-tool-use-2025-11-20`：对齐订阅端工具能力。
-/// 官方排在 [`CC_BETA_EFFORT`] 之前；没有 effort 时排在客户端自有串之后。
+/// 官方排在 [`CC_BETA_EFFORT`] 之前；没有 effort 时排在 [`CC_BETA_ADVISOR_TOOL`] 之后；
+/// 两个都没有才排在客户端自有串之后（2.1.220 的 haiku）。
 pub const CC_BETA_ADVANCED_TOOL_USE: &str = "advanced-tool-use-2025-11-20";
 
-/// `extended-cache-ttl-2025-04-11`：官方四份直连抓包里都是**最后一项**。
+/// `cache-diagnosis-2026-04-07`：2.1.251 起官方串的**最后一项**，
+/// [`CC_BETA_EXTENDED_CACHE_TTL`] 的落位参照物（排在它前面）。API-key 客户端不发，
+/// [`crate::proxy::merge_beta`] 补。
+pub const CC_BETA_CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
+
+/// `server-side-fallback-2026-07-01`：2.1.258 订阅端四族都发，API-key 端都不发
+/// （`cap/2.1.258-api` 原始请求头）。官方位置：`effort` 之后；haiku 没有 `effort`，在
+/// `advanced-tool-use` 之后。
+pub const CC_BETA_SERVER_SIDE_FALLBACK: &str = "server-side-fallback-2026-07-01";
+
+/// `fallback-credit-2026-06-01`：订阅端与 API-key 端四族都发（`cap/2.1.258-api` 原始请求头；
+/// telemetry 事件里的 `betas` 字段漏记了它，别拿那个字段当头）。官方位置：紧跟
+/// [`CC_BETA_SERVER_SIDE_FALLBACK`]，缺时补在此处。
+pub const CC_BETA_FALLBACK_CREDIT: &str = "fallback-credit-2026-06-01";
+
+/// `thinking-display-updates-2026-08-18`：订阅端**只有 fable 族**发（`cap/2.1.258/00013`），
+/// 配 body 里的 `thinking.display:"updates"`；API-key 端的 fable 不发。官方位置：
+/// [`CC_BETA_FALLBACK_CREDIT`] 之后。
+pub const CC_BETA_THINKING_DISPLAY_UPDATES: &str = "thinking-display-updates-2026-08-18";
+
+/// `redact-thinking-2026-02-12`：订阅端 fable 族**不发**（opus / sonnet / haiku 发），而
+/// API-key 端的 fable 发。故 [`crate::proxy::merge_beta`] 对 fable 族把它剥掉——fable 上原始
+/// 思维链本来就不返回，这项对它没有语义。
+pub const CC_BETA_REDACT_THINKING: &str = "redact-thinking-2026-02-12";
+
+/// `extended-cache-ttl-2025-04-11`：2.1.220 的四份直连抓包里是**最后一项**；2.1.251 起排在
+/// [`CC_BETA_CACHE_DIAGNOSIS`] 之前（`cap/2.1.258` 四族一致）。
 ///
 /// 它同时是 `cache_control.ttl` 的准入条件：断点上那个 `ttl:"1h"`（默认写，由
 /// [`crate::store::ForwardFlags::cache_ttl_1h`] 拨）没有这个 beta 就是无源之水，
@@ -155,14 +186,21 @@ pub const BILLING_CCH: &str = "00000";
 /// | haiku-4.5 | 00031 / 00026 | 10676B | `# Text output…`   | 10678 |
 /// | fable-5   | 00035 / 00037 | 1210B  | `# Communicating…` | 1212  |
 ///
-/// 以及 `cap/2.1.258/00013`（claude-cli/2.1.258，fable-5-1 直连，无成对的经 luban 样本）：
+/// 以及 claude-cli/2.1.258（订阅端直连 `cap/2.1.258` ↔ API-key 端经 luban 入站原文
+/// `cap/2.1.258-api`，同机同版本）：
 ///
-/// | 模型 | 直连 | 官方基座 | 命中的锚点 | 在合并块里的偏移 |
+/// | 模型 | 直连 / 经 luban | 官方基座 | 命中的锚点 | 在合并块里的偏移 |
 /// |---|---|---|---|---|
-/// | fable-5-1 | 2.1.258/00013 | 1214B  | `Before you start, say…` | 1216  |
+/// | opus-5    | 00012 / 00006 | 1214B  | `Write code that…` 或 `Before you start…` | 1216 |
+/// | fable-5-1 | 00013 / 00013 | 1214B  | 同上 | 1216 |
+/// | sonnet-5  | 00026 / 00017 | 10520B | `# Text output…`   | 10522 |
+/// | haiku-4.5 | 00031 / 00025 | 10622B | `# Text output…`   | 10624 |
 ///
-/// 五例都满足：合并块 = `基座 ‖ "\n\n" ‖ 其余`，锚点前紧跟 `\n\n`，切开后前缀与官方基座
+/// 全部满足：合并块 = `基座 ‖ "\n\n" ‖ 其余`，锚点前紧跟 `\n\n`，切开后前缀与官方基座
 /// **逐字节相同**。基座本身按模型族复用：haiku 与 sonnet-5 同一份、fable-5 与 opus-5 同一份。
+/// opus/fable 的其余部分开头随会话而变（订阅端那次是 `Before you start…`，API-key 端那次是
+/// `Write code that…`），两条锚点都在表里，取最早命中的即可。fable 的 API-key 形态是四块
+/// （reporting 单独成块），见 [`crate::proxy::align_system_shape`]。
 ///
 /// **别把「锚点互斥」当通例**：opus 与 sonnet 那两句确实互不出现在对方的 body 里，但那只是这
 /// 两个模型族的实情，换个模型就未必。fable-5 就同时含两条——它自己的锚点在偏移 1212，opus 那句
@@ -417,10 +455,12 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    与 [`CC_SYSTEM_BASE_ANCHORS`]。四个模型族的 raw 抓包逐字节验过。剩余风险只有锚点会随
 ///    CC 版本/新模型漂，漂了就退回三块原样转发（不会切错）。
 ///
-/// 7. **`fallbacks` 与 `server-side-fallback`**。2.1.258 的直连抓包里四族都带
+/// 7. **`fallbacks` 与 `server-side-fallback`**。2.1.258 的订阅端直连抓包里四族都带
 ///    `server-side-fallback-2026-07-01` beta，但顶层 `fallbacks` 字段**只有 fable-5-1 发**
 ///    （`"fallbacks":"default"`，`cap/2.1.258/00013`）；opus-5 / sonnet-5 / haiku 有 beta、
 ///    没字段（00012/00025/00026/00031）。故「有 beta 没字段」本身就是官方形态，不再算不自洽。
+///    API-key 端四族都**不发**这项 beta（`cap/2.1.258-api` 原始请求头），由
+///    [`crate::proxy::merge_beta`] 补。
 ///
 ///    **fable 族仍刻意不补 `fallbacks`**：它声明的是「本模型拒答/不可用时由服务端改用别的
 ///    模型」，补上等于替用户决定换模型跑，模型换了计价也跟着换。这是用户该自己拨的语义，
