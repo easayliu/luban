@@ -399,7 +399,9 @@
 
   .page-frame {
     width: 100%;
-    max-width: 80rem;
+    /* 88rem 而不是 80rem：账号列表 12 列在 80rem 里挤不开，账号名只剩 150px；
+       1440 宽的屏放宽到 88rem 后多出 128px 全给账号名。卡片视图在 ≥1408px 时正好排三列。 */
+    max-width: 88rem;
     margin-inline: auto;
     padding-left: max(1rem, env(safe-area-inset-left));
     padding-right: max(1rem, env(safe-area-inset-right));

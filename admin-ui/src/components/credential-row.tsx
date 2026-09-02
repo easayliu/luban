@@ -64,17 +64,34 @@ import {
   cn, displayCredentialLabel, formatClockTime, formatFullTime, formatTokens, formatUsd, relativeTime,
 } from '@/lib/utils'
 
+/**
+ * 列宽预算（表格是 `table-fixed`，账号列吃掉剩余宽度）。
+ *
+ * 固定列合计：xl 992px（不含「最近使用」）、2xl 1120px（多出「最近使用」，两列用量各放宽
+ * 一档）。容器最大 88rem（见 `.page-frame`）：1280 宽的屏上表格约 1214px，账号列约 220px；
+ * ≥1536 的屏约 1406px，账号列约 286px。
+ * 「最近使用」只在 2xl 起显示——它是 12 列里信息量最低的一列，排序菜单里仍可按它排。
+ * 每格内边距 p-2.5，各列的可用内容宽度 = 列宽 − 20px。
+ */
 const COL = {
-  select: 'w-10',
+  /** 表格基类给带勾选框的格子 `has-[[role=checkbox]]:w-px`（table-auto 时的「缩到内容宽」），
+      table-fixed 下会把这一列真压成 1px、勾选框叠到账号名上，这里按同等特异性写回 w-10。 */
+  select: 'w-10 has-[[role=checkbox]]:w-10',
   account: 'w-auto',
-  schedule: 'w-32',
-  priority: 'w-20',
-  tier: 'w-24',
-  quota5h: 'w-32',
-  quota7d: 'w-32',
+  /** 开关 32 + 间距 8 + 状态徽标。最长的「Usage credits 生效中 / 待确认」单行要 105px，整列得
+      168px 才放全，多数行却只有「运行正常」四个字，大半是空白。表格里让徽标换到两行（行高本来
+      就是两行：账号名 + 添加时间），列宽收到 144px，状态文字一个不丢，见 ScheduleControl。 */
+  schedule: 'w-36',
+  /** 英文表头 "PRIORITY" 加排序箭头约 68px。 */
+  priority: 'w-22',
+  /** 「Max 20x」徽标约 60px；组织账号的两枚徽标本来就换行排。 */
+  tier: 'w-22',
+  /** 摘要 `3,218 · 486M · $91.62` 用 text-xs 约 125px，放不下就截断、精确值在悬浮提示里。 */
+  quota5h: 'w-36 2xl:w-40',
+  quota7d: 'w-36 2xl:w-40',
   devices: 'w-32',
   rpm: 'w-20',
-  recent: 'w-24',
+  recent: 'hidden w-24 2xl:table-cell',
   cost: 'w-24',
   action: 'w-10',
 } as const
@@ -353,10 +370,11 @@ export const CredentialRow = memo(function CredentialRow({
             />
           )}
         </TableCell>
-        <TableCell className={cn(COL.account, 'whitespace-nowrap')}>
+        <TableCell className={cn(COL.account, 'overflow-hidden')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              <span className="block min-w-0 whitespace-nowrap font-semibold text-sm leading-snug" title={credentialLabel}>
+              {/* 账号名超出列宽就截断：table-fixed 下不截断会压到相邻列上。全名在 title 里。 */}
+              <span className="block min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
                 {credentialLabel}
               </span>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
@@ -388,7 +406,7 @@ export const CredentialRow = memo(function CredentialRow({
             </div>
           </div>
         </TableCell>
-        <TableCell className={COL.schedule}>
+        <TableCell className={cn(COL.schedule, 'overflow-hidden')}>
           <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
         </TableCell>
         <TableCell className={COL.priority}>
@@ -689,8 +707,8 @@ function ScheduleControl({
   const credentialLabel = displayCredentialLabel(cred.label, language)
 
   return (
-    <div className="flex shrink-0 flex-col items-end gap-3 xl:flex-row xl:items-center xl:gap-2">
-      <div className="flex items-center gap-2">
+    <div className="flex shrink-0 flex-col items-end gap-3 xl:min-w-0 xl:flex-row xl:items-center xl:gap-2">
+      <div className="flex shrink-0 items-center gap-2">
         {toggle.isPending && <Spinner />}
         <Switch
           checked={!cred.disabled}
@@ -702,12 +720,18 @@ function ScheduleControl({
       </div>
       <Tooltip>
         <TooltipTrigger
-          className={badgeVariants({ size: 'sm', variant: status.variant })}
+          className={cn(
+            badgeVariants({ size: 'sm', variant: status.variant }),
+            // 表格（xl 起）里「调度」列只有 9rem：徽标放开固定高度、允许换行，
+            // 「Usage credits 生效中」拆成两行放全；卡片/移动端布局不受列宽约束，照旧单行。
+            'min-w-0 max-w-full shrink xl:h-auto xl:whitespace-normal xl:py-0.5 xl:text-left',
+          )}
           delay={status.kind === 'banned' || status.kind === 'token-invalid' ? 0 : undefined}
           aria-label={`${status.label}: ${status.detail}`}
           aria-live="polite"
         >
-          {status.label}
+          {/* 两行还放不下才截断（兜底），完整文案在提示里。 */}
+          <span className="min-w-0 truncate xl:line-clamp-2 xl:whitespace-normal">{status.label}</span>
         </TooltipTrigger>
         <TooltipPopup className="max-w-72 break-words">{status.detail}</TooltipPopup>
       </Tooltip>
@@ -832,19 +856,37 @@ function ListQuotaMeter({
       ? 'bg-warning'
       : 'bg-success'
 
+  const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
+  if (!showLabel) {
+    // 表格那格 9rem：摘要独占第一行才放得全（`3,218 · 486M · $91.62`），百分比挪到进度条右侧。
+    // 和百分比挤一行时摘要只剩 80 多像素，三个数里能看到的只有第一个。
+    return (
+      <Meter value={percentage} max={100} title={title}>
+        <div className="flex min-w-0 items-baseline">
+          <MeterLabel className="sr-only">{label}</MeterLabel>
+          <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>
+        </div>
+        <div className="flex items-center gap-2">
+          <MeterTrack className="min-w-0 flex-1">
+            <MeterIndicator className={indicatorClass} />
+          </MeterTrack>
+          <MeterValue className="shrink-0 font-medium text-xs leading-none">{() => `${percentage}%`}</MeterValue>
+        </div>
+      </Meter>
+    )
+  }
   return (
-    <Meter value={percentage} max={100} title={t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)}>
+    <Meter value={percentage} max={100} title={title}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-baseline gap-1.5">
-          <MeterLabel className={cn(!showLabel && 'sr-only')}>{label}</MeterLabel>
-          {!showLabel && <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>}
+          <MeterLabel>{label}</MeterLabel>
         </div>
         <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
       </div>
       <MeterTrack>
         <MeterIndicator className={indicatorClass} />
       </MeterTrack>
-      {showLabel && <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />}
+      <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
     </Meter>
   )
 }
@@ -857,7 +899,8 @@ function ListQuotaMeter({
  * 等下来就没人再等了。没有摘要可说时（该窗口连请求数都没有）不挂提示，免得冒一个空气泡。
  */
 function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }) {
-  const className = 'min-w-0 truncate font-medium text-foreground text-sm leading-none tabular-nums'
+  // text-xs：表格那格只有 9rem，比 text-sm 多放约五个字符，`3,218 · 486M · $91.62` 刚好放全。
+  const className = 'min-w-0 truncate font-medium text-foreground text-xs leading-none tabular-nums'
   if (!hint) return <span className={className}>{children}</span>
   return (
     <Tooltip>

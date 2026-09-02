@@ -1103,7 +1103,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </Empty>
             </Card>
           ) : view === 'list' ? (
-            <Table variant="card" className="table-fixed xl:table-auto xl:min-w-[72rem]">
+            // 一律 table-fixed：列宽由 CredentialRow 的 COL 预算决定、总宽等于容器宽，表格永远
+            // 不横向滚动。之前 xl 起改成 table-auto + 最小宽 72rem，不换行的单元格会把表撑出
+            // 容器，1280–1536 宽的屏上底部多出一条横向滚动条。
+            <Table variant="card" className="table-fixed">
               <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
               <CredentialListHeader
                 selectable
