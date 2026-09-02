@@ -112,9 +112,9 @@ pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05"
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（cap/2.1.251）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（cap/2.1.258）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.251 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.258 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -155,7 +155,13 @@ pub const BILLING_CCH: &str = "00000";
 /// | haiku-4.5 | 00031 / 00026 | 10676B | `# Text output…`   | 10678 |
 /// | fable-5   | 00035 / 00037 | 1210B  | `# Communicating…` | 1212  |
 ///
-/// 四例都满足：合并块 = `基座 ‖ "\n\n" ‖ 其余`，锚点前紧跟 `\n\n`，切开后前缀与官方基座
+/// 以及 `cap/2.1.258/00013`（claude-cli/2.1.258，fable-5-1 直连，无成对的经 luban 样本）：
+///
+/// | 模型 | 直连 | 官方基座 | 命中的锚点 | 在合并块里的偏移 |
+/// |---|---|---|---|---|
+/// | fable-5-1 | 2.1.258/00013 | 1214B  | `Before you start, say…` | 1216  |
+///
+/// 五例都满足：合并块 = `基座 ‖ "\n\n" ‖ 其余`，锚点前紧跟 `\n\n`，切开后前缀与官方基座
 /// **逐字节相同**。基座本身按模型族复用：haiku 与 sonnet-5 同一份、fable-5 与 opus-5 同一份。
 ///
 /// **别把「锚点互斥」当通例**：opus 与 sonnet 那两句确实互不出现在对方的 body 里，但那只是这
@@ -174,6 +180,12 @@ pub const CC_SYSTEM_BASE_ANCHORS: &[&str] = &[
     "# Text output (does not apply to tool calls)",
     // fable-5（与 opus-5 共用基座，但其余部分的开头不同）
     "# Communicating with the user",
+    // opus-5 / fable-5-1 @ claude-cli/2.1.258（cap/2.1.258/00012、00013）。2.1.251 的三句在这份
+    // body 里**一句都不出现**，少了它整形直接退回三块、`ttl:"1h"`/`scope:"global"` 全都不写
+    // ——这正是「fable-5-1 没走 1h 缓存」的根因。基座正文也跟着变了（1156B → 1214B，
+    // `<system-reminder>` 那行换成了 mid-conversation system turns 的说法），但拆块只认锚点
+    // 不认基座，不受影响。sonnet-5 / haiku 在 2.1.258 仍以 `# Text output…` 开头（00026、00031）。
+    "Before you start, say in a line what you're about to do",
 ];
 
 /// 官方 `system[1]` 那句身份声明，四个模型族逐字节相同（57 字节）。
@@ -189,43 +201,58 @@ pub const CC_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official 
 pub const CC_SYSTEM_IDENTITY_PREFIX: &str =
     "You are Claude Code, Anthropic's official CLI for Claude";
 
-/// `system[0]` 那条 billing header 里的 `cc_version` 的**主版本**，形如 `2.1.251`。
+/// `system[0]` 那条 billing header 里的 `cc_version` 的**主版本**，形如 `2.1.258`。
 ///
-/// 完整 `cc_version`（如 `2.1.251.76b`）的第四段由
-/// [`crate::proxy::cc_version_suffix`] 从请求 body 动态派生，与官方客户端算法一致。
-/// 主版本号要和 [`CC_USER_AGENT`] 对得上——同一个客户端不会一边自称 2.1.251
+/// 完整 `cc_version`（如 `2.1.258.1e2`）的第四段：模拟路径写死
+/// [`CC_VERSION_SUFFIX_SIMULATED`]；给真实 CC 客户端补 billing header 时仍由
+/// [`crate::proxy::cc_version_suffix`] 从请求 body 派生。
+/// 主版本号要和 [`CC_USER_AGENT`] 对得上——同一个客户端不会一边自称 2.1.258
 /// 一边报另一个 cc_version。
-pub const CC_VERSION_BASE: &str = "2.1.251";
+pub const CC_VERSION_BASE: &str = "2.1.258";
 
-/// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起新增。
+/// 模拟路径写进 `cc_version` 的第四段。`cap/2.1.258` 五份对话抓包（opus-5 ×2、fable-5-1、
+/// sonnet-5、haiku-4.5，四个模型族、不同的首条用户消息）**全是** `2.1.258.1e2`，故直接
+/// 写死这个值，不再走派生算法——那套算法逆向自 2.1.251，在 2.1.258 的抓包上没有复核过
+/// （见 [`crate::proxy::cc_version_suffix`]）。真实 CC 客户端自己带的后缀照发不动。
+pub const CC_VERSION_SUFFIX_SIMULATED: &str = "1e2";
+
+/// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
-/// 逐字节取自 `cap/2.1.251/00019`（opus-4-6 直连）的 `system[2]`。它夹在身份声明与基座之间，
-/// 无 `cache_control`。5-块结构为 `[billing, 身份, reporting, 基座, 其余]`。
+/// 逐字节取自 `cap/2.1.251/00019`（opus-4-6 直连）的 `system[2]`，`cap/2.1.258/00013`
+/// （fable-5-1）sha256 相同。它夹在身份声明与基座之间，无 `cache_control`。
+///
+/// **2.1.258 起只有 fable 族带它**：`cap/2.1.258` 里 fable-5-1（00013）是 5 块
+/// `[billing, 身份, reporting, 基座, 其余]`，opus-5（00012/00025）、sonnet-5（00026）、
+/// haiku-4.5（00031）都是 4 块 `[billing, 身份, 基座, 其余]`。2.1.251 时四族都带。
+/// 按模型族注入见 [`crate::proxy::cc_system_reporting`]。
 pub const CC_SYSTEM_REPORTING: &str = include_str!("assets/cc_system_reporting.txt");
 
-/// 模拟模式注入的官方系统提示词**基座**（opus-5 / fable-5，1156 字节）。
+/// 模拟模式注入的官方系统提示词**基座**（opus-5 / fable-5-1，1214 字节）。
 ///
-/// 逐字节取自 `cap/2.1.251/00039`（opus-5 直连），与 `00041`（fable-5）sha256 相同。
+/// 逐字节取自 `cap/2.1.258/00012`（opus-5 直连），与 `00013`（fable-5-1）、`00025`（opus-5）
+/// sha256 相同。与 2.1.251 那份（1156B）只差一行：`<system-reminder>` 那句换成了
+/// mid-conversation system turns 的说法。
 pub const CC_SYSTEM_BASE_OPUS: &str = include_str!("assets/cc_system_base_opus.txt");
 
-/// 模拟模式注入的官方系统提示词基座（sonnet-5，10580 字节）。
+/// 模拟模式注入的官方系统提示词基座（sonnet-5，10520 字节）。
 ///
-/// 逐字节取自 `cap/2.1.251/00048`（sonnet-5 直连）。比旧版少了 TaskCreate 那行。
+/// 逐字节取自 `cap/2.1.258/00026`（sonnet-5 直连）。与 2.1.251 那份（10580B）同样只差
+/// `<system-reminder>` 那一行。
 pub const CC_SYSTEM_BASE_SONNET: &str = include_str!("assets/cc_system_base_sonnet.txt");
 
-/// 模拟模式注入的官方系统提示词基座（haiku-4.5 / opus-4-6[1m]，10682 字节）。
+/// 模拟模式注入的官方系统提示词基座（haiku-4.5 / opus-4-6[1m]，10622 字节）。
 ///
-/// 逐字节取自 `cap/2.1.251/00049`（haiku-4.5 直连），与 `00019`（opus-4-6）sha256 相同。
-/// 这是 2.1.245 时期 sonnet 基座的延续——haiku 与旧版 opus 仍用这份。
+/// 逐字节取自 `cap/2.1.258/00031`（haiku-4.5 直连）。2.1.251 时它与 opus-4-6 那份 sha256
+/// 相同，2.1.258 没有 opus-4-6 的样本，沿用这个映射。
 pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("assets/cc_system_base_haiku.txt");
 
 /// 模拟模式下**代客户端发出**的 `anthropic-beta` 自有串（不含 `oauth`），
-/// sonnet-5 / fable-5 及认不出的模型共用这份。opus 另有一份（[`CC_BETA_SIMULATED_OPUS`]），
-/// haiku 另有一份（[`CC_BETA_SIMULATED_HAIKU`]）——三份不能合并，理由与
-/// [`cc_beta_order_is_not_a_table`] 记的是同一件事。
+/// sonnet-5 及认不出的模型用这份。opus / fable / haiku 各另有一份
+/// （[`CC_BETA_SIMULATED_OPUS`] / [`CC_BETA_SIMULATED_FABLE`] / [`CC_BETA_SIMULATED_HAIKU`]）
+/// ——四份不能合并，理由与 [`cc_beta_order_is_not_a_table`] 记的是同一件事。
 ///
-/// 逐字取自 `cap/2.1.251/00045`（fable-5 直连）那串，去掉 `oauth` 与动态的 `afk-mode`
-/// （后者同模型两次请求有/无交替出现，不放进固定种子）。与 `00048`（sonnet-5）逐字相同。
+/// 逐字取自 `cap/2.1.258/00026`（sonnet-5 直连）那串，去掉 `oauth` 与动态的 `afk-mode`
+/// （后者同模型两次请求有/无交替出现，不放进固定种子）。与 2.1.251 的 `00048` 逐字相同。
 /// 交给 `merge_beta` 之后能**逐字节还原**官方那串。
 pub const CC_BETA_SIMULATED: &str = "claude-code-20250219,\
     interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
@@ -235,21 +262,38 @@ pub const CC_BETA_SIMULATED: &str = "claude-code-20250219,\
     server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
     extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 
-/// opus 族的自有串，逐字取自 `cap/2.1.251/00040`（opus-5 直连），去掉 `oauth` 与 `afk-mode`。
+/// fable 族的自有串，逐字取自 `cap/2.1.258/00013`（fable-5-1 直连），去掉 `oauth` 与
+/// `afk-mode`。
 ///
-/// 与 sonnet/fable 的差异：有 `context-1m`（1M 上下文），无 `server-side-fallback`。
+/// 与 sonnet 的差异：**无** `redact-thinking`，多一项 `thinking-display-updates-2026-08-18`
+/// （排在 `fallback-credit` 之后、`extended-cache-ttl` 之前），配的是 body 里的
+/// `thinking.display:"updates"`。2.1.251 时 fable-5 与 sonnet-5 那串逐字相同，2.1.258 分家了。
+pub const CC_BETA_SIMULATED_FABLE: &str = "claude-code-20250219,\
+    interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+    context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+    mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+    advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-07-01,\
+    fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,\
+    extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+
+/// opus 族的自有串，逐字取自 `cap/2.1.258/00025`（opus-5 直连，无 afk-mode 的那次），
+/// 与 `00012` 去掉 `afk-mode` 后逐字相同。
+///
+/// 与 sonnet 的差异：多 `context-1m`（1M 上下文）。2.1.251 时 opus 还没有
+/// `server-side-fallback`，2.1.258 起四族都带了。
 pub const CC_BETA_SIMULATED_OPUS: &str = "claude-code-20250219,context-1m-2025-08-07,\
     interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
     thinking-token-count-2026-05-13,context-management-2025-06-27,\
     prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
     advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
-    fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+    server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+    extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 
-/// haiku 族的自有串，逐字取自 `cap/2.1.251/00049`（haiku-4.5 直连），去掉 `oauth` 与
-/// `afk-mode`。
+/// haiku 族的自有串，逐字取自 `cap/2.1.258/00031`（haiku-4.5 直连），去掉 `oauth` 与
+/// `afk-mode`。与 2.1.251 的 `00049` 逐字相同。
 ///
-/// 与另外两族的差别：haiku 不发 `effort` 与 `mid-conversation-system`，且把
-/// `claude-code-20250219` 排在第 6 位（另外两族在队首）。
+/// 与另外三族的差别：haiku 不发 `effort` 与 `mid-conversation-system`，且把
+/// `claude-code-20250219` 排在第 6 位（另外三族在队首）。
 pub const CC_BETA_SIMULATED_HAIKU: &str = "interleaved-thinking-2025-05-14,\
     redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
     context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
@@ -257,7 +301,8 @@ pub const CC_BETA_SIMULATED_HAIKU: &str = "interleaved-thinking-2025-05-14,\
     server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
     extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 
-/// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/2.1.251/00019`（opus-4-6 直连）。
+/// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/2.1.258/00012`（opus-5 直连），
+/// 与 2.1.251 的 `00019` 逐字相同（Stainless SDK 0.112.1、node v26.3.0 都没变）。
 ///
 /// 表里**只有固定值**；随请求变的几个不在此列，由 [`crate::proxy::official_headers`] 另外
 /// 塞：`Authorization`（凭证）、`X-Claude-Code-Session-Id`（每设备派生）、
@@ -372,16 +417,14 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    与 [`CC_SYSTEM_BASE_ANCHORS`]。四个模型族的 raw 抓包逐字节验过。剩余风险只有锚点会随
 ///    CC 版本/新模型漂，漂了就退回三块原样转发（不会切错）。
 ///
-/// 7. **`fallbacks` 与 `server-side-fallback-2026-06-01`**。fable-5 那对抓包
-///    （`cap/raw/00035` 直连 ↔ `00037` 经 luban）里，直连侧多一个顶层字段
-///    `"fallbacks":[{"model":"claude-opus-5"}]`，`anthropic-beta` 里也多一项
-///    `server-side-fallback-2026-06-01`（排在 `effort` 与 `fallback-credit` 之间）；
-///    经 luban 那侧两者都没有。
+/// 7. **`fallbacks` 与 `server-side-fallback`**。2.1.258 的直连抓包里四族都带
+///    `server-side-fallback-2026-07-01` beta，但顶层 `fallbacks` 字段**只有 fable-5-1 发**
+///    （`"fallbacks":"default"`，`cap/2.1.258/00013`）；opus-5 / sonnet-5 / haiku 有 beta、
+///    没字段（00012/00025/00026/00031）。故「有 beta 没字段」本身就是官方形态，不再算不自洽。
 ///
-///    **刻意不补**：这不是纯形态差异——`fallbacks` 声明的是「本模型不可用时改用哪个模型」，
-///    补上等于替用户决定被限流时换模型跑，模型换了计价也跟着换。凭空塞一个 beta 却不带对应
-///    字段则是另一种不自洽。只有一对抓包，还分不清它是订阅模式独有还是该会话自己开的，
-///    在拿到「同一客户端两种模式下都发/都不发」的证据之前不动它。
+///    **fable 族仍刻意不补 `fallbacks`**：它声明的是「本模型拒答/不可用时由服务端改用别的
+///    模型」，补上等于替用户决定换模型跑，模型换了计价也跟着换。这是用户该自己拨的语义，
+///    不是形态。代价：模拟出的 fable-5-1 请求比官方少这一个顶层字段。
 ///
 /// 比对基准只能用**原始字节**——`cap/raw/*.raw` 那种（HTTPS 隧道内的报文，头名大小写、头序、
 /// body 的 key 顺序都留得住）。`cap/*.json` 是抓包工具重新序列化过的：headers 与 body 的 key
@@ -411,15 +454,17 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.251";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.258";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。取自
-/// `cap/2.1.251/00025`（event_logging 批次）。
+/// `cap/2.1.258/00032`（event_logging 批次，opus-5 会话那串）。比 2.1.251 多了队尾的
+/// `mid-conversation-system-2026-04-07`。
 pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
     context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
     redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-    context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+    context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+    mid-conversation-system-2026-04-07";
 
 /// 保活端点路径。
 pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";

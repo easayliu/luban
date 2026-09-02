@@ -3300,6 +3300,8 @@ fn is_known_beta(beta: &str) -> bool {
         "afk-mode-",
         "cache-diagnosis-",
         "fast-mode-",
+        // 2.1.258 起官方随 `thinking.display:"updates"` 一并发出（cap/2.1.258/00013）。
+        "thinking-display-updates-",
     ];
     KNOWN_PREFIXES.iter().any(|prefix| beta.starts_with(prefix))
 }
@@ -3357,8 +3359,11 @@ struct Simulation {
     /// 按模型族选出的官方基座提示词；模型认不出来时 `None`——基座是逐字节从抓包取的，
     /// 猜错一族（把 sonnet 的 10682 字节发给 opus）比不发更糟。见 [`cc_system_base`]。
     base: Option<&'static str>,
-    /// 按模型族选出的 `anthropic-beta` 自有串（haiku 与另外三族不同，见 [`cc_beta_seed`]）。
+    /// 按模型族选出的 `anthropic-beta` 自有串（四族四份，见 [`cc_beta_seed`]）。
     beta: &'static str,
+    /// 要不要在身份句与基座之间插 `# Reporting outcomes` 块：2.1.258 起只有 fable 族带，
+    /// 见 [`cc_system_reporting`]。
+    reporting: bool,
     /// `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里 `session_id` 的**同一个**取值：
     /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
     ///
@@ -3421,6 +3426,7 @@ impl Simulation {
         Some(Self {
             base: cc_system_base(model),
             beta: cc_beta_seed(model),
+            reporting: cc_system_reporting(model),
             session_id: session_id_for(cred, device_fp),
         })
     }
@@ -3463,13 +3469,13 @@ fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 按模型族选官方基座。2.1.251 起三族各有各的基座（`cap/2.1.251` 五份抓包验证）：
+/// 按模型族选官方基座。三族各有各的基座（`cap/2.1.258` 五份对话抓包验证）：
 ///
 /// | 模型 | 基座 | 大小 | 来源 |
 /// |---|---|---|---|
-/// | opus-5 / fable-5 | [`config::CC_SYSTEM_BASE_OPUS`] | 1156B | 00039/00041 |
-/// | sonnet-5 | [`config::CC_SYSTEM_BASE_SONNET`] | 10580B | 00048 |
-/// | haiku-4.5 / opus-4-6[1m] | [`config::CC_SYSTEM_BASE_HAIKU`] | 10682B | 00049/00019 |
+/// | opus-5 / fable-5-1 | [`config::CC_SYSTEM_BASE_OPUS`] | 1214B | 00012/00013/00025 |
+/// | sonnet-5 | [`config::CC_SYSTEM_BASE_SONNET`] | 10520B | 00026 |
+/// | haiku-4.5 / opus-4-6[1m] | [`config::CC_SYSTEM_BASE_HAIKU`] | 10622B | 00031（opus-4-6 沿用 2.1.251 的映射） |
 ///
 /// 认不出的模型返回 `None`，只注入身份句。
 fn cc_system_base(model: &str) -> Option<&'static str> {
@@ -3485,21 +3491,34 @@ fn cc_system_base(model: &str) -> Option<&'static str> {
     }
 }
 
-/// 按模型族选 `anthropic-beta` 的客户端自有串：三族三份（opus / sonnet+fable / haiku）。
+/// 按模型族选 `anthropic-beta` 的客户端自有串：四族四份（opus / fable / sonnet / haiku），
+/// 均取自 `cap/2.1.258`。
 ///
-/// 三份不能合并的根本原因见 [`config::cc_beta_order_is_not_a_table`]。差异摘要：
-/// - opus 有 `context-1m`，无 `server-side-fallback`；
-/// - sonnet/fable 有 `server-side-fallback`，无 `context-1m`；
-/// - haiku 无 `effort`/`mid-conversation-system`，`claude-code` 在第 6 位而非队首。
+/// 四份不能合并的根本原因见 [`config::cc_beta_order_is_not_a_table`]。差异摘要：
+/// - opus 多 `context-1m`；
+/// - fable 无 `redact-thinking`，多 `thinking-display-updates`；
+/// - haiku 无 `effort`/`mid-conversation-system`，`claude-code` 在第 6 位而非队首；
+/// - 认不出的模型退回 sonnet 那份。
 fn cc_beta_seed(model: &str) -> &'static str {
     let m = model.to_ascii_lowercase();
     if m.contains("haiku") {
         config::CC_BETA_SIMULATED_HAIKU
+    } else if m.contains("fable") {
+        config::CC_BETA_SIMULATED_FABLE
     } else if m.contains("opus") {
         config::CC_BETA_SIMULATED_OPUS
     } else {
         config::CC_BETA_SIMULATED
     }
+}
+
+/// 该模型族的官方 `system` 里有没有 `# Reporting outcomes` 块。
+///
+/// `cap/2.1.258`：fable-5-1（00013）有，opus-5（00012/00025）、sonnet-5（00026）、
+/// haiku-4.5（00031）都没有。2.1.251 时四族都有。fable-5 / mythos 在 2.1.258 没有样本，
+/// 按族归到 fable 一侧。
+fn cc_system_reporting(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("fable")
 }
 
 /// 来访自己带的 `X-Claude-Code-Session-Id`（非空才算）。补 metadata 时优先用它，
@@ -3569,9 +3588,9 @@ fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> Str
 /// 官方自己用掉 3 个（基座、其余、末条消息），故模拟时得数着加，见 [`simulate_system`]。
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
-/// 官方 `system` **恒为 5 块**（2.1.251 起）：`cap/2.1.251/00019` 的结构是
-/// `[billing, 身份句, reporting, 基座, 其余]`，API-key 模式那三份是 3 块合并态
-/// （见 [`align_system_shape`]）。旧版（2.1.245 及以前）为 4 块（无 reporting）。
+/// 官方 `system` **最多 5 块**：2.1.258 的 fable-5-1（`cap/2.1.258/00013`）是
+/// `[billing, 身份句, reporting, 基座, 其余]`，opus-5 / sonnet-5 / haiku 是去掉 reporting 的
+/// 4 块（2.1.251 时四族都是 5 块）；API-key 模式那三份是 3 块合并态（见 [`align_system_shape`]）。
 ///
 /// 块数超了就不再是 CC 形态，上游按第三方应用计费，客户端会看到
 /// `Third-party apps now draw from your extra usage, not your plan limits.`
@@ -3579,18 +3598,18 @@ const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
 const MAX_SYSTEM_BLOCKS: usize = 5;
 
-/// 把非 CC 请求的 `system` 换成官方形态的五块（2.1.251）：
+/// 把非 CC 请求的 `system` 换成官方形态（2.1.258，fable 族五块、其余四块）：
 ///
 /// ```text
 /// [0] x-anthropic-billing-header: …            无断点（cch 由 ensure_billing_cch 补）
 /// [1] You are Claude Code, …（57B）            无断点
-/// [2] # Reporting outcomes …（911B）            无断点
-/// [3] 官方基座（按模型族）                      {ephemeral, scope:global}
-/// [4] 客户端自己的 system（并成一块）           {ephemeral}
+/// [2] # Reporting outcomes …（911B）            无断点，**只有 fable 族有**（cc_system_reporting）
+/// [·] 官方基座（按模型族）                      {ephemeral, scope:global}
+/// [·] 客户端自己的 system（并成一块）           {ephemeral}
 /// ```
 ///
 /// 客户端的 `system` 是字符串就裹成一个文本块，是数组就并成一块（见
-/// [`merge_system_blocks`]），没有就只有前四块。
+/// [`merge_system_blocks`]），没有就没有末块。
 ///
 /// **客户端那堆块必须并成一块**：官方末块就是「基座之后的全部内容」拼成的一大段，
 /// 客户端自己拆成 N 块发过来，照搬就会得到 4+N 块——超过 [`MAX_SYSTEM_BLOCKS`]
@@ -3617,10 +3636,12 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
     let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
     let mut blocks = vec![
-        text_block_bare(&billing_header_text(v)),
+        text_block_bare(&simulated_billing_header_text()),
         text_block_bare(config::CC_SYSTEM_IDENTITY),
-        text_block_bare(config::CC_SYSTEM_REPORTING),
     ];
+    if sim.reporting {
+        blocks.push(text_block_bare(config::CC_SYSTEM_REPORTING));
+    }
     if let Some(base) = sim.base {
         if budget > 0 {
             budget -= 1;
@@ -3654,9 +3675,12 @@ const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 /// 搬走后末块换成一行短占位（保持块数形态），内容作为 `<system_instructions>` 标签
 /// 注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
 /// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
-fn relocate_long_client_system(v: &mut serde_json::Value) -> bool {
+fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
+    // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座)。多出来的那一块才是客户端
+    // 自己的 system；块数不多于它就没有可搬的东西。
+    let fixed = 2 + usize::from(sim.reporting) + usize::from(sim.base.is_some());
     let sys = match v.get("system").and_then(|s| s.as_array()) {
-        Some(a) if a.len() >= MAX_SYSTEM_BLOCKS => a,
+        Some(a) if a.len() > fixed => a,
         _ => return false,
     };
     let last = sys.len() - 1;
@@ -3804,12 +3828,13 @@ fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
     changed
 }
 
-/// `system[0]` 那条 billing header 的正文。`cch` 不在这里补——那是
-/// [`ensure_billing_cch`] 的活，模拟与非模拟两条路共用它。
+/// `system[0]` 那条 billing header 的正文，给**真实 CC 客户端**缺 billing header 时补用
+/// （[`ensure_cc_system_prefix`]）。`cch` 不在这里补——那是 [`ensure_billing_cch`] 的活。
 ///
 /// `cc_version` 的第四段（如 `76b`）由 [`cc_version_suffix`] 从请求 body 动态派生，
-/// 算法与官方客户端一致：取第一条用户消息 text 的第 4/7/20 位字符，拼上固定 salt 与
-/// 主版本号后 SHA-256 取前 3 个 hex 字符。
+/// 算法逆向自 2.1.251：取第一条用户消息 text 的第 4/7/20 位字符，拼上固定 salt 与
+/// 主版本号后 SHA-256 取前 3 个 hex 字符。模拟路径不走这条，见
+/// [`simulated_billing_header_text`]。
 fn billing_header_text(v: &serde_json::Value) -> String {
     let suffix = cc_version_suffix(v);
     format!(
@@ -3819,7 +3844,19 @@ fn billing_header_text(v: &serde_json::Value) -> String {
     )
 }
 
-/// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251）。
+/// 模拟路径的 billing header 正文：第四段写死 [`config::CC_VERSION_SUFFIX_SIMULATED`]
+/// （2.1.258 五份抓包全是 `1e2`），不走 [`cc_version_suffix`] 那套没在 2.1.258 上复核过的
+/// 派生算法。
+fn simulated_billing_header_text() -> String {
+    format!(
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli;",
+        config::CC_VERSION_BASE,
+        config::CC_VERSION_SUFFIX_SIMULATED,
+    )
+}
+
+/// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251，2.1.258 未复核；模拟路径
+/// 已改为写死，只剩 [`billing_header_text`] 在用）。
 ///
 /// ```text
 /// salt    = "59cf53e54c78"
@@ -4624,11 +4661,14 @@ fn rewrite_body(
     // 强行提升会破坏形态。
     let system_hoisted =
         flags.hoist_system_role && !is_cc_shaped(&v) && hoist_system_role_messages(&mut v);
+    // 来访自己是不是 CC 形态要在模拟之前看——模拟一跑，body 就都是 CC 形态了。
+    // 只喂给 `strip_extra_fields` 判 `thinking.display` 该不该剥。
+    let cc_inbound = is_cc_shaped(&v);
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
     // 模拟后末块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
     // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，末块只留
     // 一个短占位，绕过内容检测且不丢失指令语义。
-    let sys_relocated = simulated && relocate_long_client_system(&mut v);
+    let sys_relocated = simulated && sim.is_some_and(|s| relocate_long_client_system(&mut v, s));
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
@@ -4682,7 +4722,9 @@ fn rewrite_body(
     let streamed = force_stream && set_stream_true(&mut v);
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
-    let stripped = flags.strip_extra_fields && strip_extra_fields(&mut v);
+    // `display` 的去留：来访本来就是 CC 形态，或 `thinking` 整个是刚按官方形态补的，都留。
+    let stripped =
+        flags.strip_extra_fields && strip_extra_fields(&mut v, cc_inbound || thinking_filled);
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered = sim.is_some() && align_cc_top_level_order(&mut v);
@@ -5025,10 +5067,16 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
 /// **注意**：模拟路径下 [`ensure_thinking`] 会先补上 `thinking`，然后本函数就能自然补上
 /// `context_management`，两者配合才完整。
 
-/// 模拟路径下补 `thinking`：官方 CC 恒带 `thinking: {type: "enabled", budget_tokens: N}`。
+/// 模拟路径下补 `thinking`，形态按模型族取自 `cap/2.1.258`：
 ///
-/// `budget_tokens` 取 `max_tokens - 1`（官方实测规律：haiku `max_tokens: 32000` →
-/// `budget_tokens: 31999`，sonnet/opus 类似）。
+/// - haiku：`{"budget_tokens": N, "type": "enabled"}`（00031，`budget_tokens` 在前），
+///   `N = max_tokens - 1`（`max_tokens: 32000` → `31999`）；
+/// - fable：`{"type": "adaptive", "display": "updates"}`（00013，配 seed 里的
+///   `thinking-display-updates` beta）；
+/// - opus / sonnet / 其余：`{"type": "adaptive"}`（00012/00025/00026）。
+///
+/// 别给 opus-5 / sonnet-5 / fable 发 `enabled + budget_tokens`：这几个模型上 `budget_tokens`
+/// 直接 400。
 ///
 /// 三种情况不补：
 /// - 客户端自己带了 `thinking`（`disabled`/`null`/`enabled` 都算——那是它自己的选择）；
@@ -5036,6 +5084,7 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
 const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 
 fn ensure_thinking(v: &mut serde_json::Value) -> bool {
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_ascii_lowercase();
     let Some(obj) = v.as_object_mut() else { return false };
     if obj.contains_key("thinking") {
         return false;
@@ -5054,11 +5103,18 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     if max_tokens < THINKING_MIN_MAX_TOKENS {
         return false;
     }
-    let budget = max_tokens.saturating_sub(1).max(1);
-    let value = serde_json::json!({
-        "type": "enabled",
-        "budget_tokens": budget,
-    });
+    let value = if model.contains("haiku") {
+        let budget = max_tokens.saturating_sub(1).max(1);
+        // 官方 key 序是 `budget_tokens` → `type`，手工插入以保住顺序。
+        let mut m = serde_json::Map::new();
+        m.insert("budget_tokens".into(), serde_json::Value::Number(budget.into()));
+        m.insert("type".into(), "enabled".into());
+        serde_json::Value::Object(m)
+    } else if model.contains("fable") {
+        serde_json::json!({"type": "adaptive", "display": "updates"})
+    } else {
+        serde_json::json!({"type": "adaptive"})
+    };
     insert_top_level(
         v,
         "thinking",
@@ -5260,15 +5316,21 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
 /// 2. **`thinking.type == "disabled"`**：fable-5 等模型不支持显式关闭思考，会直接 400。
 ///    删掉整个 `thinking` 字段让上游走 adaptive 默认值。
 ///
-/// 3. **`thinking.display`**：官方发的是裸的 `{"type":"adaptive"}`。
+/// 3. **`thinking.display`**：2.1.251 及之前官方发的是裸的 `{"type":"adaptive"}`；**2.1.258 起
+///    fable 族官方自己也发 `display:"updates"`**（`cap/2.1.258/00013`，配着
+///    `thinking-display-updates-2026-08-18` beta）。故这一项由 `keep_display` 拨：来访本来
+///    就是 CC 形态（真 CC 带什么 `display` 就发什么），或 `thinking` 整个是
+///    [`ensure_thinking`] 按官方形态补的，都不剥；只剥第三方客户端自己写的 `display`。
 ///
 ///    **这一项有代价，不是零影响**：`display:"summarized"` 是客户端主动要思考摘要，剥掉之后
 ///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
 ///    功能不坏（块还在、签名照旧），只是看不到内容。拿「一条 400 直接打不通」换「思考摘要看不
 ///    到」是划算的，但划算不等于无损，故写在这里，并由开关兜底——不接受这个代价就关掉它。
 ///
-/// **对真实 CC 是空操作**：官方本来就不发这两样，走一遍什么也删不掉，故无需再叠客户端判定。
-fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
+/// **对真实 CC**：前两项本来就是空操作（官方不发 `tool_choice`、不发 `disabled`），第三项
+/// 由调用方传 `keep_display = true` 跳过——2.1.258 起 `display` 是官方形态的一部分。
+/// 判定要在模拟**之前**做（[`rewrite_body`] 里的 `cc_inbound`）：模拟一跑 body 就都是 CC 形态了。
+fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     let mut changed = false;
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
@@ -5291,7 +5353,8 @@ fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
         changed = true;
     }
     if let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut()) {
-        if thinking.remove("display").is_some() {
+        // CC 自己发的 / luban 按官方形态补的 `display` 照发；见函数文档第 3 项。
+        if !keep_display && thinking.remove("display").is_some() {
             changed = true;
         }
         // thinking.type == "enabled" 时 budget_tokens 必须 >= 1024，否则上游 400。
@@ -5328,8 +5391,9 @@ fn is_default_tool_choice(v: &serde_json::Value) -> bool {
 
 /// 官方 Claude Code 对话请求的顶层键序。
 ///
-/// 八份 `cap/raw/*.req.raw` 都保持这个相对顺序。haiku 没有 `output_config`，fable 多一个
-/// `fallbacks`，但共有键一个都没挪位。模拟后若仍保留 `model, system, messages, ... stream,
+/// 八份 `cap/raw/*.req.raw` 与 `cap/2.1.258` 五份都保持这个相对顺序。haiku 没有
+/// `output_config`，fable 多一个 `fallbacks`，首轮之外的请求有 `diagnostics`，但共有键一个都
+/// 没挪位。模拟后若仍保留 `model, system, messages, ... stream,
 /// tools` 这种来访顺序，即使字段集已对齐，也仍是一个稳定的第三方指纹。
 const CC_BODY_KEY_ORDER: &[&str] = &[
     "model",
@@ -5342,6 +5406,7 @@ const CC_BODY_KEY_ORDER: &[&str] = &[
     "context_management",
     "fallbacks",
     "output_config",
+    "diagnostics",
 ];
 
 /// 把请求对象改成 [`CC_BODY_KEY_ORDER`] 的顺序，并保证 `stream` 在最后。
@@ -6997,6 +7062,7 @@ pub async fn probe(
     let sim = Simulation {
         base: cc_system_base(model),
         beta: cc_beta_seed(model),
+        reporting: cc_system_reporting(model),
         session_id: session_id_for(cred, &device_fp),
     };
     let headers = build_forward_headers(&HeaderMap::new(), &token, flags, Some(&sim), None);
@@ -8159,6 +8225,42 @@ mod tests {
         );
     }
 
+    /// 锚点还**按 CC 版本**漂：claude-cli/2.1.258 下 fable-5-1 的其余部分以
+    /// `Before you start, say in a line what you're about to do; …` 开头（`cap/2.1.258/00013`
+    /// 直连，基座 1214B，合并块偏移 1216），2.1.251 的三句一句都不在 body 里。没有这条锚点，
+    /// fable-5-1 的请求整形退回三块，`ttl:"1h"` 与 `scope:"global"` 一个都不写。
+    #[test]
+    fn aligns_fable_5_1_shape_by_its_2_1_258_anchor() {
+        let raw = Bytes::from(
+            API_SHAPE_BODY
+                .replace("claude-opus-5", "claude-fable-5-1")
+                .replace(
+                    "Write code that reads like the surrounding code: match its comment density, naming, and idiom.",
+                    "Before you start, say in a line what you're about to do; brief updates while you work help the user follow along.",
+                ),
+        );
+        let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+
+        assert_eq!(sys.len(), 4, "fable-5-1 @2.1.258 锚点应能切块: {v}");
+        assert_eq!(sys[2]["text"], serde_json::json!("\nBASE — 基座"), "基座切错: {v}");
+        assert!(
+            sys[3]["text"].as_str().unwrap().starts_with("Before you start, say in a line"),
+            "其余部分应从 2.1.258 锚点开始: {v}"
+        );
+        assert_eq!(
+            sys[2]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"}),
+            "整形成了才有 ttl:1h + scope:global: {v}"
+        );
+        assert_eq!(
+            sys[3]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "其余那块只带 ttl: {v}"
+        );
+    }
+
     /// 锚点匹配不到（未知模型族/新版本改了措辞）时**不动结构**，退回三块原样转发——
     /// 宁可不拆，也不切在错误的位置上。其余两项改写照常。
     #[test]
@@ -8599,7 +8701,7 @@ mod tests {
             "tool_choice": {"type": "auto"},
             "thinking": {"type": "adaptive", "display": "summarized"},
         });
-        assert!(strip_extra_fields(&mut v));
+        assert!(strip_extra_fields(&mut v, false));
         assert!(v.get("tool_choice").is_none(), "官方不发 tool_choice: {v}");
         assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}), "display 应剥掉: {v}");
 
@@ -8610,7 +8712,7 @@ mod tests {
             serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
         ] {
             let mut v = serde_json::json!({ "tool_choice": keep.clone() });
-            assert!(!strip_extra_fields(&mut v), "不该动: {keep}");
+            assert!(!strip_extra_fields(&mut v, false), "不该动: {keep}");
             assert_eq!(v["tool_choice"], keep);
         }
 
@@ -8619,14 +8721,14 @@ mod tests {
             "model": "claude-fable-5",
             "thinking": {"type": "disabled"},
         });
-        assert!(strip_extra_fields(&mut v));
+        assert!(strip_extra_fields(&mut v, false));
         assert!(v.get("thinking").is_none(), "disabled 应整个删掉: {v}");
 
         // thinking.type == "enabled" 不动。
         let mut v = serde_json::json!({
             "thinking": {"type": "enabled", "budget_tokens": 10000},
         });
-        assert!(!strip_extra_fields(&mut v));
+        assert!(!strip_extra_fields(&mut v, false));
         assert_eq!(v["thinking"]["type"], "enabled");
 
         // 官方形态本身：走一遍什么也不改（对真实 CC 是空操作）。
@@ -8636,8 +8738,37 @@ mod tests {
             "output_config": {"effort": "high"},
         });
         let before = official.clone();
-        assert!(!strip_extra_fields(&mut official));
+        assert!(!strip_extra_fields(&mut official, false));
         assert_eq!(official, before);
+    }
+
+    /// 2.1.258 起官方 CC 自己发 `thinking: {type: adaptive, display: "updates"}`
+    /// （`cap/2.1.258/00013`）。CC 形态的来访不剥 `display`；非 CC 形态照剥。
+    #[test]
+    fn keeps_thinking_display_for_cc_shaped_requests() {
+        let mut cc = serde_json::json!({
+            "model": "claude-fable-5-1",
+            "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
+            "thinking": {"type": "adaptive", "display": "updates"},
+        });
+        assert!(!strip_extra_fields(&mut cc, true), "官方形态无可剥: {cc}");
+        assert_eq!(
+            cc["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "CC 自己发的 display 不能动: {cc}"
+        );
+
+        let mut third_party = serde_json::json!({
+            "model": "claude-fable-5-1",
+            "system": "You are a helpful assistant.",
+            "thinking": {"type": "adaptive", "display": "updates"},
+        });
+        assert!(strip_extra_fields(&mut third_party, false));
+        assert_eq!(
+            third_party["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "非 CC 形态照剥: {third_party}"
+        );
     }
 
     /// 剥字段走的是 [`super::rewrite_body`] 这条统一路径，且开关关掉即原样透传。
@@ -9437,23 +9568,34 @@ mod tests {
         detect_for(&Bytes::from(body.to_string()), all_on()).expect("普通请求应判为需要模拟")
     }
 
-    /// 模拟串交给 `merge_beta` 之后，必须**逐字节**等于官方那串——这是
-    /// [`config::CC_BETA_SIMULATED`] / [`config::CC_BETA_SIMULATED_HAIKU`] 唯一的正确性依据。
+    /// 模拟串交给 `merge_beta` 之后，必须**逐字节**等于官方那串——这是四份
+    /// `config::CC_BETA_SIMULATED*` 种子唯一的正确性依据。官方串取自 `cap/2.1.258`，
+    /// 去掉动态的 `afk-mode`。
     ///
-    /// 两族分开验：haiku 不发 `mid-conversation-system`/`effort`，且 `claude-code-20250219`
-    /// 在**队尾**。共用一份种子串就会给 haiku 发出一个真实客户端不产生的排列。
+    /// 四族分开验：haiku 不发 `mid-conversation-system`/`effort` 且 `claude-code-20250219`
+    /// 在**队尾**；fable 不发 `redact-thinking`、多 `thinking-display-updates`；opus 多
+    /// `context-1m`。共用一份种子串就会给某一族发出真实客户端不产生的排列。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.251/00040（opus-5 直连，无 afk-mode 的那次）。
+        // cap/2.1.258/00025（opus-5 直连，无 afk-mode 的那次）。
         const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
              context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
              redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
              advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11,\
+             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+        // cap/2.1.258/00013（fable-5-1 直连），去掉 afk-mode。
+        const OFFICIAL_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
              cache-diagnosis-2026-04-07";
-        // cap/2.1.251/00045（fable-5 直连，无 afk-mode 的那次）。与 sonnet-5 逐字相同。
+        // cap/2.1.258/00026（sonnet-5 直连），去掉 afk-mode。
         const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
@@ -9461,7 +9603,7 @@ mod tests {
              advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
              server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
              extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-        // cap/2.1.251/00049（haiku-4.5 直连），去掉 afk-mode。
+        // cap/2.1.258/00031（haiku-4.5 直连），去掉 afk-mode。
         const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
@@ -9472,8 +9614,9 @@ mod tests {
         for (model, official) in [
             ("claude-sonnet-5", OFFICIAL_SONNET),
             ("claude-opus-5", OFFICIAL_OPUS),
-            ("claude-fable-5", OFFICIAL_SONNET),
-            ("gpt-4o", OFFICIAL_SONNET), // 认不出的模型退回 sonnet/fable 主串
+            ("claude-fable-5-1", OFFICIAL_FABLE),
+            ("claude-fable-5", OFFICIAL_FABLE), // 2.1.258 没有 fable-5 样本，按族归 fable
+            ("gpt-4o", OFFICIAL_SONNET),        // 认不出的模型退回 sonnet 主串
             ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
         ] {
             let seed = super::cc_beta_seed(model);
@@ -9492,8 +9635,8 @@ mod tests {
         assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
     }
 
-    /// 普通请求 → 官方五块 system：billing / 身份句 / reporting / 基座（global）/ 客户端原文。
-    /// 基座按模型族选，且 `system` 落在 `messages` 之后（官方 key 序）。
+    /// 普通请求 → 官方四块 system（sonnet 族，2.1.258 无 reporting）：billing / 身份句 /
+    /// 基座（global）/ 客户端原文。基座按模型族选，且 `system` 落在 `messages` 之后（官方 key 序）。
     #[test]
     fn simulates_official_system_for_plain_request() {
         let body = Bytes::from(
@@ -9506,7 +9649,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 5, "应是官方的五块: {s}");
+        assert_eq!(sys.len(), 4, "sonnet 族应是官方的四块（无 reporting）: {s}");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
             "第 0 块应是 billing header: {s}"
@@ -9515,17 +9658,21 @@ mod tests {
             sys[0]["text"].as_str().unwrap().contains("cch="),
             "cch 应由 ensure_billing_cch 补上"
         );
+        assert!(
+            sys[0]["text"].as_str().unwrap().starts_with(
+                "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli;"
+            ),
+            "模拟路径的 cc_version 写死 2.1.258.1e2（cap/2.1.258 五份全是）: {s}"
+        );
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_REPORTING, "第 2 块是 reporting outcomes");
-        assert!(sys[2].get("cache_control").is_none(), "reporting 块不带断点（官方如此）");
-        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
-        assert_eq!(sys[3]["cache_control"]["scope"], "global");
-        assert_eq!(sys[4]["text"], "你是助手", "客户端原 system 应原样留在末块");
-        assert_eq!(sys[4]["cache_control"]["type"], "ephemeral");
-        assert!(sys[4]["cache_control"].get("scope").is_none(), "只有基座标 global");
-        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
-        assert_eq!(sys[4]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
+        assert_eq!(sys[2]["cache_control"]["scope"], "global");
+        assert_eq!(sys[3]["text"], "你是助手", "客户端原 system 应原样留在末块");
+        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral");
+        assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
+        assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
+        assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
@@ -9536,6 +9683,11 @@ mod tests {
 
         // 换模型族即换基座：三族三份基座。
         assert_eq!(sim_for(PLAIN_BODY).base, Some(config::CC_SYSTEM_BASE_OPUS), "opus-5 短基座");
+        assert_eq!(
+            sim_for(r#"{"model":"claude-fable-5-1","messages":[]}"#).base,
+            Some(config::CC_SYSTEM_BASE_OPUS),
+            "fable-5-1 与 opus-5 共用短基座（cap/2.1.258/00012 与 00013 sha256 相同）"
+        );
         assert_eq!(
             sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).base,
             Some(config::CC_SYSTEM_BASE_HAIKU),
@@ -9612,7 +9764,7 @@ mod tests {
         );
     }
 
-    /// 没有 system 的请求同样成立：四块（billing / 身份句 / reporting / 基座），末块拿到断点。
+    /// 没有 system 的请求同样成立：opus 族三块（billing / 身份句 / 基座），末块拿到断点。
     #[test]
     fn simulates_system_when_client_sent_none() {
         let body = Bytes::from(PLAIN_BODY.to_string());
@@ -9620,8 +9772,78 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 4, "没有客户端 system 就只有前四块: {v}");
+        assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
+        assert_eq!(sys[2]["cache_control"]["scope"], "global");
+    }
+
+    /// fable 族是 2.1.258 里唯一还带 `# Reporting outcomes` 的（`cap/2.1.258/00013`）：
+    /// 五块 `[billing, 身份句, reporting, 基座, 客户端原文]`，thinking 补成
+    /// `{adaptive, display:"updates"}` 且 `display` 不被 `strip_extra_fields` 剥掉。
+    #[test]
+    fn simulates_fable_with_reporting_block_and_display_updates() {
+        let body = concat!(
+            r#"{"model":"claude-fable-5-1","max_tokens":64000,"#,
+            r#""messages":[{"role":"user","content":"hi"}],"system":"你是助手"}"#
+        );
+        let b = Bytes::from(body.to_string());
+        let sim = sim_for(body);
+        assert!(sim.reporting, "fable 族该带 reporting");
+        assert!(!sim_for(PLAIN_BODY).reporting, "opus 族不带");
+        assert!(
+            !sim_for(r#"{"model":"claude-sonnet-5","messages":[]}"#).reporting,
+            "sonnet 族不带"
+        );
+        assert!(
+            !sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).reporting,
+            "haiku 族不带"
+        );
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 5, "fable 族是五块: {v}");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_REPORTING, "第 2 块是 reporting outcomes");
+        assert!(sys[2].get("cache_control").is_none(), "reporting 块不带断点（官方如此）");
+        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_OPUS, "fable 与 opus 共用基座");
         assert_eq!(sys[3]["cache_control"]["scope"], "global");
+        assert_eq!(sys[4]["text"], "你是助手");
+        assert_eq!(
+            v["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "fable 的 thinking 形态（cap/2.1.258/00013）: {v}"
+        );
+        assert!(
+            sim.beta.contains("thinking-display-updates-2026-08-18"),
+            "display:updates 要有对应 beta"
+        );
+    }
+
+    /// 补 `thinking` 的形态按模型族：opus/sonnet 是裸 `adaptive`，haiku 是
+    /// `{budget_tokens, type:enabled}`（key 序 budget 在前，`cap/2.1.258/00031`）。给 opus-5 /
+    /// sonnet-5 发 `budget_tokens` 会直接 400。
+    #[test]
+    fn injects_thinking_shape_per_model_family() {
+        let run = |body: &str| -> serde_json::Value {
+            let b = Bytes::from(body.to_string());
+            let sim = sim_for(body);
+            let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            serde_json::from_slice(&out).unwrap()
+        };
+        let opus = run(
+            r#"{"model":"claude-opus-5","max_tokens":64000,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_eq!(opus["thinking"], serde_json::json!({"type": "adaptive"}), "{opus}");
+        let sonnet = run(
+            r#"{"model":"claude-sonnet-5","max_tokens":64000,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert_eq!(sonnet["thinking"], serde_json::json!({"type": "adaptive"}), "{sonnet}");
+        let haiku = run(
+            r#"{"model":"claude-haiku-4-5-20251001","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let s = serde_json::to_string(&haiku).unwrap();
+        assert!(
+            s.contains(r#""thinking":{"budget_tokens":31999,"type":"enabled"}"#),
+            "haiku 的 thinking 逐字节对齐官方: {s}"
+        );
     }
 
     /// 模拟路径要补 `context_management`：`cap/raw` 八份抓包逐字节相同，而声明它的
@@ -9928,8 +10150,8 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(super::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
-        assert!(v["system"][3].get("cache_control").is_none(), "预算用完时基座不带断点");
-        assert_eq!(v["system"][3]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
+        assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE_OPUS);
     }
 
     /// 客户端把 `system` 拆成多块时并成官方末块的一块——3+N 块会被上游判第三方应用、
@@ -9953,14 +10175,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 5, "客户端的 4 块应并成末块一块: {v}");
-        assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
-        assert_eq!(sys[4]["cache_control"]["type"], "ephemeral", "末块断点取合并前的最后一个");
-        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_OPUS);
-        assert_eq!(sys[3]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
+        assert_eq!(sys.len(), 4, "客户端的 4 块应并成末块一块（opus 族无 reporting）: {v}");
+        assert_eq!(sys[3]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
+        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral", "末块断点取合并前的最后一个");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert_eq!(sys[2]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
         assert_eq!(super::count_cache_control(&v), 2, "断点数: {v}");
 
-        // 空块并不进来（发一个空文本块上游不收），只剩前四块。
+        // 空块并不进来（发一个空文本块上游不收），只剩前三块。
         let empty = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"system":[{"type":"text","text":""},{"type":"text","text":"  "}]}"#
                 .to_string(),
@@ -9968,7 +10190,7 @@ mod tests {
         let sim = detect_for(&empty, all_on()).unwrap();
         let out = rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["system"].as_array().unwrap().len(), 4, "全空的块应丢掉: {v}");
+        assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
     }
 
     /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：
@@ -11157,18 +11379,18 @@ mod tests {
     fn system_base_assets_are_verbatim() {
         assert_eq!(
             config::CC_SYSTEM_BASE_OPUS.len(),
-            1156,
-            "opus/fable 基座字节数（cap/2.1.251/00039）"
+            1214,
+            "opus/fable 基座字节数（cap/2.1.258/00012）"
         );
         assert_eq!(
             config::CC_SYSTEM_BASE_SONNET.len(),
-            10580,
-            "sonnet 基座字节数（cap/2.1.251/00048）"
+            10520,
+            "sonnet 基座字节数（cap/2.1.258/00026）"
         );
         assert_eq!(
             config::CC_SYSTEM_BASE_HAIKU.len(),
-            10682,
-            "haiku 基座字节数（cap/2.1.251/00049）"
+            10622,
+            "haiku 基座字节数（cap/2.1.258/00031）"
         );
         assert_eq!(config::CC_SYSTEM_IDENTITY.len(), 57, "身份句字节数");
         assert_eq!(config::CC_SYSTEM_REPORTING.len(), 911, "reporting 块字节数");
@@ -11571,7 +11793,7 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = super::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 251)), "官方那串");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 258)), "官方那串");
         assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -11579,17 +11801,26 @@ mod tests {
         assert_eq!(v("claude-cli/next (external, cli)"), None, "版本位不是数字");
     }
 
-    /// cc_version 后缀与官方客户端的算法对齐：
+    /// cc_version 后缀与官方客户端的算法对齐（逆向自 2.1.251）：
     /// sha256("59cf53e54c78" + chars_at(4,7,20) + VERSION_BASE).hex()[..3]
+    ///
+    /// 2.1.258 的五份抓包用户消息都是 "hi"，全为 `1e2`，与算法结论一致；但这条路只剩
+    /// [`super::billing_header_text`]（给真实 CC 补 billing header）在用，模拟路径写死
+    /// [`config::CC_VERSION_SUFFIX_SIMULATED`]。
     #[test]
     fn cc_version_suffix_matches_official_algorithm() {
         // 用户消息 "hi"（短于 5 字符），位置 4/7/20 全取不到 → "000"
-        // sha256("59cf53e54c780002.1.251") 的前 3 个 hex = "76b"
+        // sha256("59cf53e54c780002.1.258") 的前 3 个 hex = "1e2"
         let body: serde_json::Value = serde_json::json!({
             "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "hi"}],
         });
-        assert_eq!(super::cc_version_suffix(&body), "76b", "短消息 'hi'");
+        assert_eq!(super::cc_version_suffix(&body), "1e2", "短消息 'hi'");
+        assert_eq!(
+            super::cc_version_suffix(&body),
+            config::CC_VERSION_SUFFIX_SIMULATED,
+            "写死的模拟后缀与算法在 'hi' 上应一致（cap/2.1.258 五份全是 1e2）"
+        );
 
         // 消息足够长时取 text[4], text[7], text[20]
         let body2: serde_json::Value = serde_json::json!({
@@ -11607,11 +11838,11 @@ mod tests {
                 {"type": "text", "text": "hi"}
             ]}],
         });
-        assert_eq!(super::cc_version_suffix(&body3), "76b", "数组形式与字符串形式结果一致");
+        assert_eq!(super::cc_version_suffix(&body3), "1e2", "数组形式与字符串形式结果一致");
 
         // 没有 messages 时退化为全 0
         let empty: serde_json::Value = serde_json::json!({"model": "x"});
-        assert_eq!(super::cc_version_suffix(&empty), "76b", "无消息退化为 '000' → 同 'hi'");
+        assert_eq!(super::cc_version_suffix(&empty), "1e2", "无消息退化为 '000' → 同 'hi'");
     }
 
     /// 最低版本闸的三态：低于门槛才拒，等于/高于放行；闸没配、UA 不是 CC、版本读不出来
@@ -11678,6 +11909,7 @@ mod tests {
         let sim = super::Simulation {
             base: super::cc_system_base("claude-opus-5"),
             beta: super::cc_beta_seed("claude-opus-5"),
+            reporting: super::cc_system_reporting("claude-opus-5"),
             session_id: "sess".into(),
         };
         let out = rewrite_body(
@@ -11699,14 +11931,13 @@ mod tests {
         assert!(v.get("context_management").is_none(), "没开 thinking 就不该补: {s}");
         assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
 
-        // 官方前四块：billing / 身份句 / reporting / 基座。测试请求没有「客户端自己
-        // 的 system」，故第五块不存在。
+        // 官方前三块（opus 族，2.1.258 无 reporting）：billing / 身份句 / 基座。测试请求
+        // 没有「客户端自己的 system」，故第四块不存在。
         let blocks = v["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 4, "\n{s}");
+        assert_eq!(blocks.len(), 3, "\n{s}");
         assert!(blocks[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
         assert_eq!(blocks[1]["text"], config::CC_SYSTEM_IDENTITY, "缺这句就用不了订阅额度");
-        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_REPORTING, "reporting outcomes 块");
-        assert_eq!(blocks[3]["text"], config::CC_SYSTEM_BASE_OPUS, "opus-5 用短基座");
+        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_BASE_OPUS, "opus-5 用短基座");
 
         // 身份：伪装 metadata 用的是这个凭证的 account_uuid，不是空串。
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
