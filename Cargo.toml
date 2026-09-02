@@ -1,6 +1,6 @@
 [package]
 name = "luban"
-version = "0.3.64"
+version = "0.3.65"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
 # wreq 取代 reqwest：**逐头指定大小写**（`OrigHeaderMap`）是 hyper/reqwest 给不出的能力

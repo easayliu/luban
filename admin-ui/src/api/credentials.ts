@@ -64,6 +64,21 @@ export interface ModelCooldown {
   gated: boolean
 }
 
+/**
+ * 上游判过「这个号的套餐不含这个模型」（Pro 号打 fable 那类 429：一个额度窗口头都没有，只说
+ * 组织没开 extra usage）。落库、长期有效：选号时该模型绕开这个号，其余模型照常。
+ */
+export interface ModelDenial {
+  /** 归一化后的模型键（小写、去掉 `[1m]` 与日期后缀），见后端 `model_denial_key`。 */
+  model: string
+  /** 上游给出的依据摘要。 */
+  reason: string
+  /** 学到这条记录的时刻（Unix 秒）。 */
+  learned_at: number
+  /** 到点自动失效、再去试一次的时刻（Unix 秒）；null 表示直到被显式解除。 */
+  expires_at: number | null
+}
+
 /** 对外的凭证视图（后端已脱敏，无明文 token）。 */
 export interface Credential {
   id: number
@@ -139,6 +154,12 @@ export interface Credential {
    * 被冷却时后台一片正常，而选号侧已经跳过它了。
    */
   rate_limited_models: ModelCooldown[]
+  /**
+   * 上游判过「套餐不含」的模型（见 ModelDenial）。与 `rate_limited_models` 一样不代表账号有
+   * 问题，区别是它不会几十秒就过去：解除靠连通性测试通过、等级刷新变了，或菜单里手动解除。
+   * 旧后端没有这个字段，读取处一律 `?? []`。
+   */
+  denied_models?: ModelDenial[]
   /**
    * 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；null 表示不会
    * 自动恢复（正常在用、人工停用、或封号）。
@@ -461,4 +482,24 @@ export async function probeCredential(
     },
   )
   return data
+}
+
+/** `GET /api/models`：连通性测试下拉用的模型清单。 */
+export interface ModelsResp {
+  /** 价目表里的现役模型（后端单一真源，前端不再抄）。 */
+  listed: string[]
+  /** 最近 30 天客户端真实请求过的模型，按最后出现时刻倒序。 */
+  recent: { model: string; last_ts: number }[]
+}
+
+export async function listModels(): Promise<ModelsResp> {
+  const { data } = await api.get<ModelsResp>('/models')
+  return data
+}
+
+/** 与后端 `model_denial_key` 同一口径：小写、去掉 `[1m]` 与 `-YYYYMMDD` 后缀。 */
+export function modelDenialKey(model: string): string {
+  let m = model.trim().toLowerCase()
+  if (m.endsWith('[1m]')) m = m.slice(0, -4)
+  return m.replace(/-\d{8}$/, '')
 }

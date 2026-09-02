@@ -1,10 +1,11 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   EllipsisVerticalIcon, LogOutIcon, PlusIcon, SettingsIcon,
 } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
+import { getSettings } from '@/api/settings'
 import { getPw, setPw, clearPw } from '@/api/client'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
@@ -33,12 +34,89 @@ import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
 import { Button, buttonVariants } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
 
 // 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
-// 拆成单独 chunk 后首屏少解析一截；点进设置时再拉，本地访问一瞬间的事。
-const SettingsPage = lazy(() => import('@/components/settings-page').then((m) => ({ default: m.SettingsPage })))
+// 拆成单独 chunk 后首屏少解析一截。但 chunk 有 120 多 KB，远程访问时点进去要先白屏
+// 等下载——所以账号页一空闲就把它预取回来（见 `useSettingsPrefetch`），点击时只剩挂载。
+// 浏览器会缓存同一 specifier 的 import() 结果，重复调用不会再次请求。
+const loadSettingsPage = () => import('@/components/settings-page')
+const SettingsPage = lazy(() => loadSettingsPage().then((m) => ({ default: m.SettingsPage })))
+
+/** 设置页 chunk 到达前的占位：保留与设置页同构的顶栏和标题骨架，切换时页面不至于整块变白。 */
+function SettingsPageFallback({ onBack }: { onBack: () => void }) {
+  const { t } = useI18n()
+  return (
+    <div className="app-shell flex min-h-dvh flex-col text-foreground">
+      <header className="app-header sticky top-0 z-20 border-b bg-background">
+        <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
+          <Button
+            aria-label={t('返回账号页', 'Back to accounts')}
+            className="-ml-2 h-auto min-w-0 justify-start gap-2.5 px-2 py-1.5 sm:gap-3"
+            variant="ghost"
+            onClick={onBack}
+          >
+            <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
+              <LogoMark className="size-[1.125rem]" />
+            </span>
+            <span className="min-w-0 text-left">
+              <span className="block text-sm font-semibold leading-none tracking-tight">Luban</span>
+              <span className="mt-1 hidden whitespace-nowrap text-xs font-normal text-muted-foreground sm:block">
+                Claude Code Gateway
+              </span>
+            </span>
+          </Button>
+          <div className="flex items-center gap-2">
+            <LanguageSwitcher compact />
+            <ThemeSwitcher compact />
+          </div>
+        </div>
+      </header>
+      <main aria-busy="true" className="page-frame flex-1 py-5 sm:py-8">
+        <div className="max-w-2xl">
+          <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
+            {t('系统设置', 'System settings')}
+          </h1>
+          <Skeleton className="mt-3 h-4 w-3/4" />
+        </div>
+        <div className="mt-5 flex gap-8 sm:mt-7">
+          <div className="hidden w-60 shrink-0 space-y-2 lg:block">
+            {Array.from({ length: 6 }, (_, i) => <Skeleton className="h-15 w-full rounded-lg" key={i} />)}
+          </div>
+          <div className="min-w-0 flex-1 space-y-4">
+            <Skeleton className="h-9 w-2/5" />
+            <Skeleton className="h-40 w-full rounded-xl" />
+            <Skeleton className="h-28 w-full rounded-xl" />
+          </div>
+        </div>
+      </main>
+    </div>
+  )
+}
+
+/**
+ * 账号页就位后趁空闲预取设置页：chunk 与 `GET /api/settings` 一起拉，点进去两段等待都免了。
+ * 只在已通过鉴权后做——settings 是受保护接口，登录页阶段发出去只会得到 401。
+ */
+function useSettingsPrefetch(ready: boolean) {
+  const qc = useQueryClient()
+  useEffect(() => {
+    if (!ready) return
+    const run = () => {
+      void loadSettingsPage()
+      void qc.prefetchQuery({ queryKey: ['settings'], queryFn: getSettings })
+    }
+    // Safari 没有 requestIdleCallback，退回一个短延时，别抢首屏渲染。
+    if (typeof window.requestIdleCallback === 'function') {
+      const id = window.requestIdleCallback(run, { timeout: 2000 })
+      return () => window.cancelIdleCallback(id)
+    }
+    const id = setTimeout(run, 800)
+    return () => clearTimeout(id)
+  }, [ready, qc])
+}
 
 /**
  * 账号页的检索条件同时写进 hash（`#/?filter=attention&sort=rpm…`），
@@ -151,6 +229,8 @@ function App() {
   }, [])
 
   const openSettings = (section: SettingsSection) => {
+    // 预取可能还没轮到（页面刚打开就点），这里再触发一次：import() 命中缓存则是空操作。
+    void loadSettingsPage()
     const url = `#/settings/${section}`
     if (settingsRoute) {
       // Tab 切换属于同一设置页，不应为每次切换新增浏览器历史。
@@ -201,6 +281,7 @@ function App() {
   }, [needLogin, settingsRoute, t])
 
   const isBootstrapping = authLoading || !authState
+  useSettingsPrefetch(!isBootstrapping && !needLogin && !settingsRoute)
 
   if (!isBootstrapping && needLogin) {
     return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
@@ -208,7 +289,7 @@ function App() {
 
   if (!isBootstrapping && settingsRoute) {
     return (
-      <Suspense fallback={<div className="app-shell min-h-dvh" />}>
+      <Suspense fallback={<SettingsPageFallback onBack={closeSettings} />}>
         <SettingsPage
           section={settingsRoute}
           onSectionChange={openSettings}

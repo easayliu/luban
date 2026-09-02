@@ -8,6 +8,9 @@ use axum::{
     response::{IntoResponse, Redirect},
 };
 use rust_embed::Embed;
+use tower_http::compression::{
+    CompressionLayer, DefaultPredicate, Predicate, predicate::NotForContentType,
+};
 
 /// 内嵌前端构建产物（编译期从 `admin-ui/dist` 读取）。
 #[derive(Embed)]
@@ -17,6 +20,20 @@ struct Asset;
 /// 将误发到首页的 POST 文档导航转换为 GET，避免浏览器刷新时要求重新提交表单。
 ///
 /// 固定跳回 `/`，不复用请求体或查询参数；真正的 API POST 会先被主路由匹配，不会走这里。
+/// 静态资源的响应压缩层——只挂在前端这几条路由上，**不能**套到 `/v1/*`：
+/// 那边是 SSE 流式转发，中间压一层会把逐块下发攒成整包，客户端看到的就是"卡到最后一起出"。
+///
+/// 前端产物由 rust-embed 原样嵌进二进制、没有预压缩，主 bundle 近 1 MB、懒加载的设置页
+/// 也有 120 多 KB；远程访问时切到设置页会先白屏等这段下载。gzip/br 压完只剩三成左右，
+/// 而 `assets/` 又带 immutable 缓存，同一浏览器只会付一次这笔 CPU。
+pub fn compression() -> CompressionLayer<impl Predicate> {
+    // woff2 自带 brotli，再压一遍只出 CPU 不出字节；默认谓词已经排除 image/* 与 SSE。
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .compress_when(DefaultPredicate::new().and(NotForContentType::new("font/")))
+}
+
 pub async fn redirect_root_post() -> Redirect {
     Redirect::to("/")
 }

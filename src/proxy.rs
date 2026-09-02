@@ -385,6 +385,8 @@ pub async fn handle(
                 "all-cooling-down"
             } else if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
                 "device-limit"
+            } else if e.downcast_ref::<store::ModelUnsupported>().is_some() {
+                "model-unsupported"
             } else {
                 "unavailable"
             };
@@ -409,6 +411,11 @@ pub async fn handle(
                 });
             if let Some(secs) = computable_retry {
                 return rate_limit_response(secs, e.to_string());
+            }
+            // 所有号都被上游判过「套餐不含这个模型」→ 403 permission_error：等多久都没用，
+            // 客户端该换模型。照上游拒绝无权限模型的口径回，别包装成 429 误导它退避重试。
+            if e.downcast_ref::<store::ModelUnsupported>().is_some() {
+                return error_response(StatusCode::FORBIDDEN, "permission_error", e.to_string());
             }
             // 设备数达硬上限 → 429（等多久取决于别人什么时候释放，给不出 retry-after，故这条
             // 不走 [`rate_limit_response`]）；其余（无凭证/刷新失败等）→ 503。
@@ -486,6 +493,10 @@ pub async fn handle(
     let (mut token, mut cred) = (token, cred);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
+    // 「套餐不含这个模型」引发的换号次数，与 429 那套 `retried`/`max_retry` **分开计**：那个
+    // 开关管的是限流，关掉表示「429 原样透传」；而这一档是确定性失败，换号一定有意义，不受
+    // 那个开关约束，见 [`LimitScope::Unsupported`]。
+    let mut denial_swaps = 0usize;
     // 最后那一轮**上游原样给的**限流头，只在它回 429 时有值（每轮重置，故换号换到一发 200 时
     // 它是 `None`）。存在的理由是下面 transient 档会把我们自己算出来的退避写进 `retry-after`
     // 再交回客户端——那之后重解 `up.headers()` 就会把自己塞的那条当成上游给的读回来，
@@ -687,6 +698,79 @@ pub async fn handle(
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
         let scope = rate_limit_scope(&info, req_model.as_deref());
+        // 套餐不含这个模型：记准入、换号重发。学习不设条件——记录是对的就该记；换号有次数上限，
+        // 免得一条请求把整池的 Pro 号挨个点一遍。换不到号时若是「全被判过」就回 403 让客户端
+        // 换模型，其余原因（都在冷却等）保留上游那发 429 原样透传。
+        if let LimitScope::Unsupported(model) = &scope {
+            let reason = info.plan_denial_reason();
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                model = %model,
+                expires_at = info.unified_reset.unwrap_or(0),
+                ratelimit = %info.raw,
+                "upstream 429 with no quota window for this model: this account's plan does not include it, remembering that and switching accounts"
+            );
+            if let Err(e) = state.store.deny_model(cred.id, model, &reason, info.unified_reset) {
+                tracing::error!(
+                    cred_id = cred.id, cred = %cred.label,
+                    error = %e,
+                    "persisting the model denial failed (the swap still proceeds)"
+                );
+            }
+            tried.push(cred.id);
+            if denial_swaps >= MODEL_DENIAL_MAX_SWAPS {
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    model = %model,
+                    swaps = denial_swaps,
+                    "model-denial swap cap reached, passing the upstream 429 through"
+                );
+                break (upstream, resp, sent);
+            }
+            match store::valid_access_token_for_device(
+                &state.store,
+                &state.clients,
+                select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+            )
+            .await
+            {
+                Ok((next_token, next_cred)) => {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        to_cred_id = next_cred.id,
+                        to_cred = %next_cred.label,
+                        model = %model,
+                        attempt = denial_swaps + 1,
+                        "model not included in this account's plan: retrying with another account"
+                    );
+                    (token, cred) = (next_token, next_cred);
+                    denial_swaps += 1;
+                    continue;
+                }
+                Err(e) if e.downcast_ref::<store::ModelUnsupported>().is_some() => {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        model = %model,
+                        error = %e,
+                        "no enabled account can use this model, answering 403"
+                    );
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "permission_error",
+                        e.to_string(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        model = %model,
+                        error = %e,
+                        "model not included in this account's plan but no account to swap to, passing the 429 through"
+                    );
+                    break (upstream, resp, sent);
+                }
+            }
+        }
         let mut cooldown = info.cooldown_for(&scope);
         // 瞬时限流那档的等待时长**每熬满一档翻一倍**，见 [`next_transient_backoff`]：这一档不换号、
         // 也不把号挪出调度池，客户端拿到的就是一发 429，那么「下次什么时候再来」就是我们唯一
@@ -4300,6 +4384,10 @@ const TRANSIENT_BACKOFF_MAX_KEYS: usize = 4096;
 /// 「转够一圈全池都在冷却」。
 const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
 
+/// 一条请求因「套餐不含这个模型」最多换几个号。一次失败就学到一条记录、之后的选号自动绕开，
+/// 所以这个数只在**冷启动**（记录还没学到）时被碰到；设成池子里 Pro 号的常见数量级即可。
+const MODEL_DENIAL_MAX_SWAPS: usize = 4;
+
 /// 连撞到第 `attempts` 档时该让客户端等多久：`base * 2^(attempts-1)`，封顶
 /// [`MAX_TRANSIENT_COOLDOWN_SECS`]。
 fn transient_backoff_for(attempts: u32) -> std::time::Duration {
@@ -6320,6 +6408,11 @@ enum LimitScope {
     /// 冷却时长也另算，见 [`RateLimitInfo::transient_cooldown`]：这是几秒到几十秒的事，
     /// 拿额度那套（可以睡满几十小时）去算它，等于因为一次瞬时拥堵把号锁掉半天。
     Transient(String),
+    /// **这个号的套餐不含这个模型**：响应里一个额度窗口都没有，只说 usage credits 被组织关掉了
+    /// （`overage-disabled-reason`）。不是限流——等到什么时候都不会有额度长出来，除非换套餐或
+    /// 开 extra usage。故它既不打冷却也不停号，而是落一条准入记录
+    /// （[`store::CredentialStore::deny_model`]）并**换号重发**，之后的选号直接绕开这一格。
+    Unsupported(String),
 }
 
 impl LimitScope {
@@ -6337,7 +6430,7 @@ impl LimitScope {
     fn model(&self) -> Option<&str> {
         match self {
             Self::Account => None,
-            Self::Model(m) | Self::Transient(m) => Some(m),
+            Self::Model(m) | Self::Transient(m) | Self::Unsupported(m) => Some(m),
         }
     }
 
@@ -6346,6 +6439,7 @@ impl LimitScope {
             Self::Account => "account",
             Self::Model(_) => "model",
             Self::Transient(_) => "transient",
+            Self::Unsupported(_) => "unsupported",
         }
     }
 }
@@ -6389,6 +6483,13 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     let base_gone = info.window_status.iter().any(|(w, s)| !is_overage_window(w) && rejected(s))
         || info.window_utilization.iter().any(|(w, u)| !is_overage_window(w) && *u >= 1.0);
     let no_detail = info.window_status.is_empty() && info.window_utilization.is_empty();
+    // 一个额度窗口都没报、只说 credits 被组织关了：这个模型不在该套餐的任何窗口里（线上实测
+    // Pro 号打 fable：`overage-disabled-reason=org_level_disabled` + `credits-*` + 一个月后的
+    // `unified-reset`，仅此而已）。它不是限流，见 [`LimitScope::Unsupported`]。**排在最前**：
+    // 这形态下即便带了 `unified-status=rejected`，说的也是这次请求，不是账号。
+    if no_detail && info.overage_disabled_reason.is_some() {
+        return LimitScope::Unsupported(model.to_string());
+    }
     let unified_gone = no_detail && info.unified_status.as_deref().is_some_and(rejected);
     // 超额/回补池被拒或打满：额度是跟着账号走的，换个号可能还有余量，故仍判 [`LimitScope::Model`]。
     let overage_gone = info.window_status.iter().any(|(w, s)| is_overage_window(w) && rejected(s))
@@ -6647,6 +6748,10 @@ struct RateLimitInfo {
     /// 这是「额度满了但不 429」的关键标记——基础窗口 rejected、请求却 200 成功，
     /// 烧的是按量计费的钱；把它落进快照，前端才能把这种号和真正健康的号区分开。
     overage_in_use: Option<bool>,
+    /// `anthropic-ratelimit-unified-overage-disabled-reason`（实测值 `org_level_disabled`）：
+    /// 这次请求本该走 usage credits，但组织没开。它单独出现、**不带任何额度窗口头**时，说明
+    /// 这个模型压根不在该套餐的额度窗口里——Pro 号打 fable 就是这个形态，见 [`rate_limit_scope`]。
+    overage_disabled_reason: Option<String>,
     /// **所有** `anthropic-ratelimit-unified-<窗口>-status` 的取值（窗口名原样保留）。
     ///
     /// 刻意不写死窗口名：实测除了 `5h`/`7d`，还有 `7d_oi`（7 天含超额），而**真正被拒的
@@ -6699,6 +6804,9 @@ impl RateLimitInfo {
                 "anthropic-ratelimit-unified-reset" => info.unified_reset = val.parse().ok(),
                 "anthropic-ratelimit-unified-overage-in-use" => {
                     info.overage_in_use = Some(val.trim() == "true")
+                }
+                "anthropic-ratelimit-unified-overage-disabled-reason" => {
+                    info.overage_disabled_reason = Some(val.trim().to_string())
                 }
                 _ => {}
             }
@@ -6802,8 +6910,18 @@ impl RateLimitInfo {
     fn cooldown_for(&self, scope: &LimitScope) -> std::time::Duration {
         match scope {
             LimitScope::Transient(_) => self.transient_cooldown(),
+            // 套餐不含的模型不走冷却（落的是准入记录），这里没有可睡的时长。
+            LimitScope::Unsupported(_) => std::time::Duration::ZERO,
             _ => self.cooldown(scope.account_level()),
         }
+    }
+
+    /// 写进准入记录的依据：把这发 429 里说明「为什么没额度」的那几个头摘出来。
+    fn plan_denial_reason(&self) -> String {
+        let reason = self.overage_disabled_reason.as_deref().unwrap_or("-");
+        format!(
+            "upstream 429 without any quota window for this model (overage-disabled-reason={reason}): the plan does not include it"
+        )
     }
 
     /// 瞬时限流（容量/请求速率）的冷却：**吃 `retry-after`，但夹在
@@ -7283,11 +7401,26 @@ pub async fn probe(
             let compressed = content_encoding.is_some();
             // 429 照真实流量打冷却。开关读库里真实配置（形态那份 flags 是恒定全开的基准，
             // 与「要不要管 429」无关）；与转发一样，重试次数配成 0 也视同关闭。
-            if status == StatusCode::TOO_MANY_REQUESTS
+            let probe_scope = (status == StatusCode::TOO_MANY_REQUESTS)
+                .then(|| rate_limit_scope(&info, Some(model)));
+            // 套餐不含这个模型：照转发路径记一条准入记录，之后的选号绕开这一格。学习不看
+            // 429 开关——那个开关管的是限流冷却，这里记的是事实。
+            if let Some(LimitScope::Unsupported(_)) = &probe_scope {
+                let reason = info.plan_denial_reason();
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    model,
+                    ratelimit = %info.raw,
+                    "connectivity test: this account's plan does not include the model, remembering that"
+                );
+                if let Err(e) = state.store.deny_model(cred.id, model, &reason, info.unified_reset)
+                {
+                    tracing::error!(cred_id = cred.id, error = %e, "persisting the model denial failed");
+                }
+            } else if let Some(scope) = probe_scope
                 && state.store.forward_flags().rate_limit_retry
                 && state.store.rate_limit_retry_max() > 0
             {
-                let scope = rate_limit_scope(&info, Some(model));
                 let cooldown = info.cooldown_for(&scope);
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
@@ -7326,6 +7459,21 @@ pub async fn probe(
                     ),
                 }
                 state.store.clear_rate_limited(cred.id, Some(model));
+                // 上游此刻放行了这个号的这个模型，之前学到的「套餐不含」就此作废（开了 extra
+                // usage 或换了套餐都会走到这里）。
+                match state.store.clear_model_denials(cred.id, Some(model)) {
+                    Ok(n) if n > 0 => tracing::info!(
+                        cred_id = cred.id, cred = %cred.label,
+                        model,
+                        "connectivity test passed, the model is no longer marked as excluded from this account's plan"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(
+                        cred_id = cred.id, cred = %cred.label,
+                        error = %e,
+                        "connectivity test passed but clearing the model denial failed"
+                    ),
+                }
             }
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
@@ -10997,6 +11145,53 @@ mod tests {
     /// 这条用例存在的理由：第二版判定把「任一窗口被拒/打满」一律判账号级，于是 fable
     /// 吃满超额池就把整个账号冷却 24 小时——实测 7d_oi 仍 rejected 期间同一账号的
     /// sonnet/opus 照常 200，账号级冷却纯属误伤。见 [`super::rate_limit_scope`] 的演化史。
+    /// 线上实测（2026-09-02）：Pro 号打 fable 的 429 **一个额度窗口头都不带**，只有
+    /// `overage-disabled-reason=org_level_disabled`、几条 `credits-*` 和一个月后的
+    /// `unified-reset`。这不是限流而是「套餐不含」；此前被判成 transient，冷却 30 秒且不换号，
+    /// 客户端拿到 429 反复重试。
+    #[test]
+    fn plan_denial_429_is_unsupported_not_transient() {
+        let hdr = |pairs: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let fable = "claude-fable-5";
+        let info = hdr(&[
+            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            ("anthropic-ratelimit-unified-credits-can-purchase", "true"),
+            ("anthropic-ratelimit-unified-credits-has-payment-method", "false"),
+            ("anthropic-ratelimit-unified-credits-exhausted-included", "false"),
+            ("anthropic-ratelimit-unified-reset", "1790812800"),
+            ("anthropic-organization-id", "org"),
+        ]);
+        let scope = super::rate_limit_scope(&info, Some(fable));
+        assert_eq!(scope, super::LimitScope::Unsupported(fable.into()));
+        assert!(scope.worth_swapping() && !scope.account_level());
+        assert_eq!(scope.model(), Some(fable));
+        assert_eq!(info.cooldown_for(&scope), std::time::Duration::ZERO, "不打冷却");
+        assert!(info.plan_denial_reason().contains("org_level_disabled"));
+        assert_eq!(info.unified_reset, Some(1_790_812_800), "记录到点失效的时刻取 unified-reset");
+        assert!(!info.no_limit_headers(), "它带了 reset，不是裸 429");
+
+        // 同一个 overage-disabled-reason 若伴随满掉的超额池窗口，仍是「超额池满」：账号确实
+        // 有 fable 额度，只是用完了，那一档走冷却、到点回来。
+        let pool_full = hdr(&[
+            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.02"),
+        ]);
+        assert_eq!(super::rate_limit_scope(&pool_full, Some(fable)).label(), "model");
+        // 请求体里读不出模型名时照旧账号级兜底——没有模型可挂。
+        assert!(super::rate_limit_scope(&info, None).account_level());
+    }
+
     #[test]
     fn rate_limit_scope_reads_every_window_not_just_5h_7d() {
         let hdr = |pairs: &[(&str, &str)]| {

@@ -288,6 +288,7 @@ pub async fn run(
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
+        .route("/models", get(list_models))
         .route("/credentials/proxy", post(set_proxies))
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
         .route("/proxies/test", post(test_proxy))
@@ -331,10 +332,15 @@ pub async fn run(
         // 这里放到 64MB 留出余量，真正的大小判决交给上游；管理接口维持默认即可。
         .route("/v1/{*path}", any(proxy::handle).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         // 个别移动端/前置层会以 POST 打开首页；用 PRG 把最终文档历史落成 GET。
-        .route("/", get(admin_ui::fallback).post(admin_ui::redirect_root_post))
+        .route(
+            "/",
+            get(admin_ui::fallback)
+                .post(admin_ui::redirect_root_post)
+                .layer(admin_ui::compression()),
+        )
         // SPA 只允许由 GET/HEAD 打开。若把 POST 也兜底成 index.html，浏览器会把页面
         // 记作表单提交结果，之后在移动端刷新便弹出“确认重新提交表单”。
-        .fallback_service(get(admin_ui::fallback))
+        .fallback_service(get(admin_ui::fallback).layer(admin_ui::compression()))
         .with_state(state);
 
     let bind = format!("{host}:{port}");
@@ -645,6 +651,7 @@ async fn list_credentials(
     let last_used = state.store.last_used().map_err(internal)?;
     let costs = state.store.cost_by_cred().map_err(internal)?;
     let rpm = state.store.recent_rpm().map_err(internal)?;
+    let mut denials = state.store.all_model_denials().map_err(internal)?;
     let defaults = DefaultLimits::of(&state.store);
     let views = list
         .iter()
@@ -654,6 +661,7 @@ async fn list_credentials(
                     state.store.rate_limited_secs(c.id),
                     state.store.rate_limited_models(c.id),
                 )
+                .with_denials(denials.remove(&c.id).unwrap_or_default())
                 .with_stats(
                     quotas.get(&c.id).cloned(),
                     last_used.get(&c.id).copied(),
@@ -1043,7 +1051,8 @@ async fn test_credential(
 }
 
 /// 手动解除该凭证的限流状态：进程内的模型级冷却全清，且若它是被账号级限流**自动停用**的，
-/// 一并重新启用（等价于手动打开启用开关，只是不会误碰人工停用/封号的号）。
+/// 一并重新启用（等价于手动打开启用开关，只是不会误碰人工停用/封号的号）。学到的「套餐不含
+/// 某模型」记录也一并清掉——管理员刚给这个组织开了 extra usage 时，这就是让它立刻回去试的入口。
 ///
 /// 解除错了，下一条请求撞上 429 会重新打上，最坏多一次往返——所以这里不做任何「确认上游真的
 /// 恢复了」的前置校验，想稳妥的话入口旁边就是连通性测试（它通过时也会自动恢复调度）。
@@ -1053,8 +1062,37 @@ async fn clear_cooldown(
 ) -> Result<Json<CredentialView>, ApiError> {
     state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     state.store.clear_rate_limited(id, None);
+    state.store.clear_model_denials(id, None).map_err(internal)?;
     state.store.resume_if_rate_limited(id).map_err(internal)?;
     view_of(&state, id)
+}
+
+/// `GET /api/models`：控制台（连通性测试的模型下拉）用的模型清单。
+#[derive(Serialize)]
+struct ModelsResp {
+    /// 价目表里列出的现役模型（见 [`crate::pricing::LISTED_MODELS`]），前端不再抄一份。
+    listed: Vec<&'static str>,
+    /// 最近 30 天客户端真实请求过的模型（去重、按最后出现时刻倒序）。客户端在用什么就列什么，
+    /// 新模型上线不必等 luban 发版。
+    recent: Vec<RecentModel>,
+}
+
+#[derive(Serialize)]
+struct RecentModel {
+    model: String,
+    /// 最后一次出现的时刻（Unix 秒）。
+    last_ts: i64,
+}
+
+async fn list_models(State(state): State<AppState>) -> Result<Json<ModelsResp>, ApiError> {
+    let recent = state
+        .store
+        .recent_models(30)
+        .map_err(internal)?
+        .into_iter()
+        .map(|(model, last_ts)| RecentModel { model, last_ts })
+        .collect();
+    Ok(Json(ModelsResp { listed: crate::pricing::LISTED_MODELS.to_vec(), recent }))
 }
 
 // ---------- 代理池 ----------
@@ -1288,12 +1326,14 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let last_used = state.store.last_used_at(id).map_err(internal)?;
     let cost_total = state.store.cost_of(id).map_err(internal)?;
     let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
+    let denials = state.store.denied_models(id).map_err(internal)?;
     Ok(Json(
         CredentialView::new(&cred, count, DefaultLimits::of(&state.store))
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
             )
+            .with_denials(denials)
             .with_stats(quota, last_used, cost_total, rpm),
     ))
 }
@@ -2226,6 +2266,11 @@ struct CredentialView {
     ///
     /// 每条的 `gated` 进一步分开两种情形，前端的措辞必须跟着分——见 [`ModelCooldown::gated`]。
     rate_limited_models: Vec<ModelCooldown>,
+    /// 上游判过「这个号的套餐不含这些模型」（Pro 号打 fable 那类），见
+    /// [`store::CredentialStore::deny_model`]。落库、长期有效，选号时这些模型绕开该号，
+    /// 其余模型照常——同样**不代表账号有问题**。与 `rate_limited_models` 的区别是它不会
+    /// 几十秒就过去：解除靠连通性测试通过、等级刷新变了，或手动「解除冷却」。
+    denied_models: Vec<store::ModelDenial>,
     /// 被上游账号级限流而**自动停用**时，到点自动恢复调度的时刻（Unix 秒）；`None` 表示
     /// 不自动恢复（正常在用、人工停用、或封号）。
     ///
@@ -2265,8 +2310,15 @@ impl CredentialView {
             rpm: 0,
             rate_limited_secs: 0,
             rate_limited_models: Vec::new(),
+            denied_models: Vec::new(),
             resume_at: c.resume_at,
         }
+    }
+
+    /// 附加「套餐不含」的模型记录（落库的，没有就是空）。
+    fn with_denials(mut self, denials: Vec<store::ModelDenial>) -> Self {
+        self.denied_models = denials;
+        self
     }
 
     /// 附加冷却状态：账号级剩余秒数 + 模型级明细（都在内存里，没有就是 0 / 空）。

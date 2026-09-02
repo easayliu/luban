@@ -3,7 +3,7 @@
 //! 单连接 + `parking_lot::Mutex` 串行化；WAL + `synchronous=NORMAL`；STRICT 表 +
 //! `CHECK`/`UNIQUE` 约束。token 轮换走单行 `UPDATE`，不重写整库。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,72 @@ impl std::fmt::Display for DeviceLimitReached {
 }
 
 impl std::error::Error for DeviceLimitReached {}
+
+/// 请求的模型在**所有**可调度的号上都已被上游判成「套餐不含」（见
+/// [`CredentialStore::deny_model`]）：不是限流、等多久都没用，换台机器也没用。
+///
+/// 同 [`DeviceLimitReached`] 走 `anyhow` 上传，代理层 `downcast` 后映射为 403
+/// `permission_error`——照上游拒绝一个没权限模型时的口径回，客户端能一眼看懂「换模型」。
+#[derive(Debug)]
+pub struct ModelUnsupported {
+    pub model: String,
+    /// 有几个启用中的号被判过不支持它（即被排除掉的那些）。
+    pub accounts: usize,
+}
+
+impl std::fmt::Display for ModelUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "none of the {} enabled account(s) can use model {}: upstream reported that their plans do not include it (add a Max account, or clear the block from the console after enabling extra usage)",
+            self.accounts, self.model
+        )
+    }
+}
+
+impl std::error::Error for ModelUnsupported {}
+
+/// 一条「这个号用不了这个模型」的记录，见 [`CredentialStore::deny_model`]。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ModelDenial {
+    /// 归一化后的模型键，见 [`model_denial_key`]。
+    pub model: String,
+    /// 上游给出的依据（限流头摘要），供控制台展示。
+    pub reason: String,
+    /// 学到这条记录的时刻（Unix 秒）。
+    pub learned_at: i64,
+    /// 到点自动失效重新试探的时刻（Unix 秒）；`None` 表示一直有效，直到被显式清掉。
+    pub expires_at: Option<i64>,
+}
+
+/// 把模型名归一成「套餐门禁」的粒度：小写、去掉 `[1m]` 上下文后缀与 `-YYYYMMDD` 日期后缀。
+///
+/// 上游按套餐放不放行看的是模型本身，`claude-fable-5-1[1m]` 与 `claude-fable-5-1` 不会一个
+/// 放一个拒；分开记只会让每个变体各白撞一次。但**不**把 `fable-5` 与 `fable-5-1` 并成一族：
+/// 两代的准入未必同步，宁可多撞一次也别猜。
+pub fn model_denial_key(model: &str) -> String {
+    let mut m = model.trim().to_ascii_lowercase();
+    if let Some(stripped) = m.strip_suffix("[1m]") {
+        m = stripped.to_string();
+    }
+    // 形如 `-20251114` 的日期后缀：最后一段全是数字且恰好 8 位。
+    if let Some((head, tail)) = m.rsplit_once('-')
+        && tail.len() == 8
+        && tail.chars().all(|c| c.is_ascii_digit())
+    {
+        m = head.to_string();
+    }
+    m
+}
+
+/// 该模型是否属于「只有高档套餐才含」的那一族（fable / mythos）。
+///
+/// **只用于选号排序**（见 [`CredentialStore::select_for_device`] 的 `plan_rank`），不是准入
+/// 判据：真正的「能不能用」由上游回答并记进 [`ModelDenial`]。这里猜错的代价仅是多一次换号。
+pub fn premium_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("fable") || m.contains("mythos")
+}
 
 /// 裸请求速率上限触发：所有启用凭证在当前窗口内都已发满。
 ///
@@ -1623,11 +1689,137 @@ impl CredentialStore {
         )? > 0)
     }
 
+    /// 写回账号等级。**等级变了就把它的模型准入记录全清掉**：那些记录是在旧套餐下学到的
+    /// （Pro 号不含 fable），升级到 Max 后再留着就等于把新买的额度锁在门外。
     pub fn set_tier(&self, id: i64, tier: Option<&str>) -> Result<bool> {
-        self.update_one(
+        let conn = self.conn.lock();
+        let previous: Option<Option<String>> = conn
+            .query_row("SELECT tier FROM credentials WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        let Some(previous) = previous else { return Ok(false) };
+        if previous.as_deref() != tier {
+            conn.execute("DELETE FROM model_denials WHERE cred_id = ?1", [id])?;
+        }
+        Ok(conn.execute(
             "UPDATE credentials SET tier = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, tier],
-        )
+        )? > 0)
+    }
+
+    // ---------- 模型准入（套餐不含某模型） ----------
+
+    /// 记下「这个号用不了这个模型」。
+    ///
+    /// 依据是上游的 429 形态：一个额度窗口头都不带、只带 `overage-disabled-reason`——说明
+    /// 这个模型根本不在该套餐的任何额度窗口里，要走按量计费的 usage credits，而组织又没开。
+    /// 这与「超额池满」（`7d_oi` rejected，账号确实有 fable 额度只是用完了）是两回事，后者走
+    /// 进程内冷却，见 [`RateLimitCooldown`]。
+    ///
+    /// `expires_at` 取上游给的 `unified-reset`（credits 的月度窗口）：到点让它自动失效、
+    /// 下一条请求再去试一次——用户中途开了 extra usage 的话就此自愈，代价是每月每号白撞一发。
+    /// 上游没给时间就一直有效。三条显式解除的路：该号对该模型连通性测试通过、等级刷新后变了
+    /// （见 [`Self::set_tier`]）、控制台手动解除。
+    pub fn deny_model(
+        &self,
+        cred_id: i64,
+        model: &str,
+        reason: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        let key = model_denial_key(model);
+        let reason: String = reason.chars().take(300).collect();
+        self.conn.lock().execute(
+            "INSERT INTO model_denials (cred_id, model, reason, learned_at, expires_at)              VALUES (?1, ?2, ?3, unixepoch(), ?4)              ON CONFLICT(cred_id, model) DO UPDATE SET                 reason = excluded.reason, learned_at = excluded.learned_at,                 expires_at = excluded.expires_at",
+            params![cred_id, key, reason, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// 解除模型准入记录：`Some(model)` 只清那一个模型（连通性测试通过），`None` 清该号全部
+    /// （控制台手动解除）。返回清掉的条数。
+    pub fn clear_model_denials(&self, cred_id: i64, model: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(match model {
+            Some(m) => conn.execute(
+                "DELETE FROM model_denials WHERE cred_id = ?1 AND model = ?2",
+                params![cred_id, model_denial_key(m)],
+            )?,
+            None => conn.execute("DELETE FROM model_denials WHERE cred_id = ?1", [cred_id])?,
+        })
+    }
+
+    /// 该号当前仍有效的模型准入记录（到期的顺手删掉），按学到的时间倒序。
+    pub fn denied_models(&self, cred_id: i64) -> Result<Vec<ModelDenial>> {
+        let conn = self.conn.lock();
+        Self::purge_expired_denials(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT model, reason, learned_at, expires_at FROM model_denials              WHERE cred_id = ?1 ORDER BY learned_at DESC, model ASC",
+        )?;
+        let rows = stmt.query_map([cred_id], Self::row_to_denial)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// 全部号的有效准入记录，按号分组（列表页一次取齐，免得逐号查）。
+    pub fn all_model_denials(&self) -> Result<HashMap<i64, Vec<ModelDenial>>> {
+        let conn = self.conn.lock();
+        Self::purge_expired_denials(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT cred_id, model, reason, learned_at, expires_at FROM model_denials              ORDER BY learned_at DESC, model ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                ModelDenial {
+                    model: r.get(1)?,
+                    reason: r.get(2)?,
+                    learned_at: r.get(3)?,
+                    expires_at: r.get(4)?,
+                },
+            ))
+        })?;
+        let mut out: HashMap<i64, Vec<ModelDenial>> = HashMap::new();
+        for row in rows {
+            let (cid, d) = row?;
+            out.entry(cid).or_default().push(d);
+        }
+        Ok(out)
+    }
+
+    fn row_to_denial(r: &Row) -> rusqlite::Result<ModelDenial> {
+        Ok(ModelDenial {
+            model: r.get(0)?,
+            reason: r.get(1)?,
+            learned_at: r.get(2)?,
+            expires_at: r.get(3)?,
+        })
+    }
+
+    fn purge_expired_denials(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "DELETE FROM model_denials WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// 被判过不支持 `model` 的号（已到期的不算）。选号时用，调用方已持锁。
+    fn denied_creds_for(conn: &Connection, model: &str) -> Result<HashSet<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT cred_id FROM model_denials WHERE model = ?1                AND (expires_at IS NULL OR expires_at > unixepoch())",
+        )?;
+        let rows = stmt.query_map([model_denial_key(model)], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// 最近 `days` 天流水里出现过的模型（去重），附最后一次出现的时刻，按时刻倒序。
+    /// 连通性测试自己打的那些（`device_id = 'probe'`）不算——它们是人挑的，不是客户端在用的。
+    pub fn recent_models(&self, days: i64) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model, MAX(ts) AS last_ts FROM usage_logs              WHERE model IS NOT NULL AND model != ''                AND ts >= unixepoch() - ?1 * 86400                AND (device_id IS NULL OR device_id != 'probe')              GROUP BY model ORDER BY last_ts DESC",
+        )?;
+        let rows = stmt.query_map([days], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     /// 回填账号 UUID（旧库凭证登录时未存、刷新 token 时补上）。仅在非空时覆盖。
@@ -3288,7 +3480,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
             url        TEXT    NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_proxies_url ON proxies(url);",
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_proxies_url ON proxies(url);
+
+        -- 上游判成「这个号的套餐不含这个模型」的记录（Pro 号打 fable 那类 429），见
+        -- CredentialStore::deny_model。落库而不放进程内冷却：这不是几十秒的事，重启也不该忘。
+        CREATE TABLE IF NOT EXISTS model_denials (
+            cred_id    INTEGER NOT NULL,
+            model      TEXT    NOT NULL,
+            reason     TEXT    NOT NULL DEFAULT '',
+            learned_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            expires_at INTEGER,
+            PRIMARY KEY (cred_id, model)
+        ) STRICT;",
     )
     .context("failed to initialize credential database schema")?;
 
@@ -3696,6 +3899,22 @@ impl CredentialStore {
                 "no other available credentials remain after excluding those already tried"
             );
         }
+        // 上游判过「套餐不含这个模型」的号先出局（见 [`Self::deny_model`]）：这不是等一会就好
+        // 的事，也不该拿去撞。**全都被判过**就直接告诉客户端换模型，别把它包装成 429。
+        let denied: HashSet<i64> = match model {
+            Some(m) => Self::denied_creds_for(&conn, m)?,
+            None => HashSet::new(),
+        };
+        let pool: Vec<Credential> = {
+            let usable: Vec<Credential> =
+                pool.iter().filter(|c| !denied.contains(&c.id)).cloned().collect();
+            if usable.is_empty()
+                && let Some(m) = model
+            {
+                return Err(ModelUnsupported { model: m.to_string(), accounts: pool.len() }.into());
+            }
+            usable
+        };
         // 冷却中的号让位给还能用的；**全部都在冷却就直接拒**——冷却是硬门禁，被上游 429 过的
         // 号在解冻前一律不调度。等待时间取最早解冻的那个，客户端照它重试即可。
         let creds: Vec<Credential> =
@@ -3785,8 +4004,21 @@ impl CredentialStore {
         //      负载均衡，最后 id 兜底。低优先级档仅在高优先级档全部占满/不可用后才触及。
         // (priority, 设备数, id) 是唯一的排序口径；两个分支都从这一份有序表里挑，
         // 逐道门过滤，第一个全过的即中。
+        // fable/mythos 这类只有高档套餐才含的模型，同一优先级档内 Max 号排前面，等级未知的
+        // 其次，Pro/Free 垫底。**只排序不剔除**：准入以上游的判决为准（见上面的 denied），
+        // 这里猜错也只是多换一次号；而排在前面能让绝大多数请求第一发就落在能用的号上。
+        let plan_rank = |c: &Credential| -> u8 {
+            if !model.is_some_and(premium_model) {
+                return 0;
+            }
+            match c.tier.as_deref() {
+                Some(t) if t.starts_with("Max") => 0,
+                None => 1,
+                Some(_) => 2,
+            }
+        };
         let mut ordered: Vec<&Credential> = creds.iter().collect();
-        ordered.sort_by_key(|c| (c.priority, used(c), c.id));
+        ordered.sort_by_key(|c| (c.priority, plan_rank(c), used(c), c.id));
         let bare_window = Duration::from_secs(rate_window.max(1) as u64);
         let chosen = if device_id.is_some() {
             // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
@@ -5188,6 +5420,99 @@ mod tests {
         // 手动解除：全部格一起清。
         store.clear_rate_limited(a, None);
         assert_eq!(pick("claude-fable-5"), a, "手动解除后所有模型都该回来");
+    }
+
+    /// 上游判过「套餐不含这个模型」的号，该模型选号时绕开它，其余模型照常；清掉后回来。
+    #[test]
+    fn denied_model_is_skipped_until_cleared() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let pick = |model: &str| {
+            store.select_for_device(Select { model: Some(model), ..Default::default() }).unwrap().id
+        };
+        store.deny_model(a, "claude-fable-5-1[1m]", "plan", None).unwrap();
+        assert_eq!(pick("claude-fable-5-1"), b, "[1m] 变体上学到的记录对裸 id 同样生效");
+        assert_eq!(pick("claude-sonnet-5"), a, "其余模型不受影响");
+        assert_eq!(store.denied_models(a).unwrap().len(), 1);
+        assert!(store.all_model_denials().unwrap().contains_key(&a));
+        assert_eq!(store.clear_model_denials(a, Some("claude-sonnet-5")).unwrap(), 0);
+        assert_eq!(store.clear_model_denials(a, Some("claude-fable-5-1")).unwrap(), 1);
+        assert_eq!(pick("claude-fable-5-1"), a, "解除后该模型回到这个号");
+    }
+
+    /// 全部号都被判过不支持 → 是「换模型」而不是「等一会」：报 ModelUnsupported，不报限流。
+    #[test]
+    fn all_denied_is_model_unsupported_not_rate_limited() {
+        let (store, ids) = store_with(&["a", "b"]);
+        for id in &ids {
+            store.deny_model(*id, "claude-fable-5", "plan", None).unwrap();
+        }
+        let err = store
+            .select_for_device(Select { model: Some("claude-fable-5"), ..Default::default() })
+            .unwrap_err();
+        let u = err.downcast_ref::<ModelUnsupported>().expect("应是 ModelUnsupported");
+        assert_eq!(u.accounts, 2);
+        assert!(store.select_for_device(Select::default()).is_ok(), "不带模型的请求不受影响");
+    }
+
+    /// 到期的记录不再挡选号，且读列表时顺手清掉。
+    #[test]
+    fn expired_denial_is_ignored_and_purged() {
+        let (store, ids) = store_with(&["a"]);
+        let a = ids[0];
+        let past = crate::credentials::now_secs() as i64 - 1;
+        store.deny_model(a, "claude-fable-5", "plan", Some(past)).unwrap();
+        assert_eq!(
+            store
+                .select_for_device(Select { model: Some("claude-fable-5"), ..Default::default() })
+                .unwrap()
+                .id,
+            a
+        );
+        assert!(store.denied_models(a).unwrap().is_empty());
+    }
+
+    /// 等级变了（升级到 Max）就把旧套餐下学到的记录清掉；等级没变则留着。
+    #[test]
+    fn tier_change_clears_denials() {
+        let (store, ids) = store_with(&["a"]);
+        let a = ids[0];
+        store.set_tier(a, Some("Pro")).unwrap();
+        store.deny_model(a, "claude-fable-5", "plan", None).unwrap();
+        store.set_tier(a, Some("Pro")).unwrap();
+        assert_eq!(store.denied_models(a).unwrap().len(), 1, "等级没变，记录留着");
+        store.set_tier(a, Some("Max 5x")).unwrap();
+        assert!(store.denied_models(a).unwrap().is_empty(), "升级后记录作废");
+    }
+
+    /// fable/mythos 在同一优先级档内 Max 号优先、等级未知其次、Pro 垫底；其它模型不受影响，
+    /// 管理员设的优先级始终压过等级。
+    #[test]
+    fn premium_models_prefer_max_accounts_within_a_priority_tier() {
+        let (store, ids) = store_with(&["pro", "max", "unknown"]);
+        let (pro, max, unknown) = (ids[0], ids[1], ids[2]);
+        store.set_tier(pro, Some("Pro")).unwrap();
+        store.set_tier(max, Some("Max 20x")).unwrap();
+        let pick = |model: &str| {
+            store.select_for_device(Select { model: Some(model), ..Default::default() }).unwrap().id
+        };
+        assert_eq!(pick("claude-fable-5-1"), max, "fable 先落 Max");
+        assert_eq!(pick("claude-sonnet-5"), pro, "非高档模型不排等级，按 id 兜底");
+        store.set_disabled(max, true).unwrap();
+        assert_eq!(pick("claude-fable-5-1"), unknown, "Max 不在时等级未知的排在 Pro 前面");
+        store.set_disabled(max, false).unwrap();
+        store.set_priority(pro, -1).unwrap();
+        assert_eq!(pick("claude-fable-5-1"), pro, "优先级是主键，等级只在同档内排");
+    }
+
+    #[test]
+    fn model_denial_key_normalizes_variants() {
+        assert_eq!(model_denial_key("Claude-Fable-5-1[1m]"), "claude-fable-5-1");
+        assert_eq!(model_denial_key("claude-opus-4-6-20251114"), "claude-opus-4-6");
+        assert_eq!(model_denial_key("claude-fable-5"), "claude-fable-5");
+        assert_ne!(model_denial_key("claude-fable-5"), model_denial_key("claude-fable-5-1"));
+        assert!(premium_model("claude-fable-5-1[1m]") && premium_model("claude-mythos-5"));
+        assert!(!premium_model("claude-opus-5"));
     }
 
     /// 瞬时限速（容量 / 请求速率）也走选号门禁，gate 时长由 ladder 退避值决定（起步 2s）。

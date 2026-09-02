@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
@@ -7,9 +7,9 @@ import {
   Trash2Icon,
 } from 'lucide-react'
 import {
-  clearCooldown, deleteCredential, probeCredential, refreshCredential, setDeviceLimit,
-  setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
-  type Credential, type ProbeQuota, type ProbeResult,
+  clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
+  setDeviceLimit, setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
+  type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
   cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime, localizeBackendMessage,
@@ -159,6 +159,11 @@ export interface CredentialEvaluation {
    * 一发，仍在服务」，混成一项就没法在界面上如实说了。
    */
   modelThrottled: boolean
+  /**
+   * 是否有模型被上游判成**套餐不含**（Pro 号打 fable 那类）。这一档同样只挡那几个模型、不挡
+   * 账号，但与冷却不同：它不会自己过去，直到连通性测试通过、等级变化或手动解除。
+   */
+  modelDenied: boolean
 }
 
 const currentUnixSeconds = () => Math.floor(Date.now() / 1000)
@@ -438,6 +443,7 @@ export function evaluateCredential(
   const models = cred.rate_limited_models ?? []
   const modelCooling = models.some((m) => m.gated)
   const modelThrottled = models.some((m) => !m.gated)
+  const modelDenied = (cred.denied_models?.length ?? 0) > 0
   return {
     credential: cred,
     quota,
@@ -448,7 +454,13 @@ export function evaluateCredential(
     needsAttention: status.attention,
     modelCooling,
     modelThrottled,
+    modelDenied,
   }
+}
+
+/** 把「套餐不含」的模型列成一句，如「claude-fable-5、claude-fable-5-1」。 */
+export function modelDenialSummary(cred: Credential, language: Language): string {
+  return (cred.denied_models ?? []).map((d) => d.model).join(localize(language, '、', ', '))
 }
 
 /**
@@ -786,11 +798,16 @@ export function CredentialMenuContent({
         <ActivityIcon />
         {t('连通性测试', 'Connectivity test')}
       </MenuItem>
-      {/* 账号级或模型级任一在冷却都该给出口——后端那个接口本来就是两档一起清的。 */}
-      {(cred.rate_limited_secs > 0 || (cred.rate_limited_models?.length ?? 0) > 0) && (
+      {/* 账号级冷却、模型级冷却、「套餐不含」记录任一存在都该给出口——后端那个接口是三档一起清的。
+          刚给组织开了 extra usage 的管理员，靠这一项让号立刻回去试 fable。 */}
+      {(cred.rate_limited_secs > 0
+        || (cred.rate_limited_models?.length ?? 0) > 0
+        || (cred.denied_models?.length ?? 0) > 0) && (
         <MenuItem onClick={() => cooldown.mutate()} disabled={cooldown.isPending}>
           <TimerOffIcon />
-          {t('解除冷却', 'Clear cooldown')}
+          {(cred.denied_models?.length ?? 0) > 0
+            ? t('解除冷却与模型限制', 'Clear cooldown & model blocks')
+            : t('解除冷却', 'Clear cooldown')}
         </MenuItem>
       )}
       <MenuItem onClick={onRename}>
@@ -903,6 +920,18 @@ const PROBE_MODELS = [
   'claude-fable-5',
 ] as const
 
+/**
+ * 下拉的完整选项：四个基准打头（覆盖四条模拟路径），再接客户端最近真实用过的（新模型上线
+ * 不必等发版），最后补价目表里其余现役模型。去重、保序。接口没到时只有四个基准。
+ */
+function probeModelOptions(models: ModelsResp | undefined): string[] {
+  const out: string[] = [...PROBE_MODELS]
+  const push = (m: string) => { if (m && !out.includes(m)) out.push(m) }
+  models?.recent.forEach((r) => push(r.model))
+  models?.listed.forEach(push)
+  return out
+}
+
 /** 一条测试记录：同一个弹窗里连测多次时按时间倒序累积，方便横向比较不同模型。 */
 interface ProbeEntry {
   /** 自增序号，仅用作列表 key。 */
@@ -944,7 +973,23 @@ export function ConnectivityTestDialog({
   const { t, language } = useI18n()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const qc = useQueryClient()
-  const [model, setModel] = useState<string>(PROBE_MODELS[0])
+  // 该号被上游判过「套餐不含」的模型：下拉里标出来，默认选中项也绕开它们——
+  // 默认就选一个必败的模型只会白扣一次。
+  const deniedKeys = useMemo(
+    () => new Set((cred.denied_models ?? []).map((d) => d.model)),
+    [cred.denied_models],
+  )
+  const isDenied = (m: string) => deniedKeys.has(modelDenialKey(m))
+  const modelsQuery = useQuery({
+    queryKey: ['models'],
+    queryFn: listModels,
+    staleTime: 60_000,
+    enabled: open,
+  })
+  const probeModels = useMemo(() => probeModelOptions(modelsQuery.data), [modelsQuery.data])
+  const [model, setModel] = useState<string>(
+    () => PROBE_MODELS.find((m) => !isDenied(m)) ?? PROBE_MODELS[0],
+  )
   const [entries, setEntries] = useState<ProbeEntry[]>([])
   const seq = useRef(0)
   const session = useRef(0)
@@ -1032,7 +1077,7 @@ export function ConnectivityTestDialog({
               <FieldLabel htmlFor={`probe-model-${cred.id}`}>{t('测试模型', 'Model to test')}</FieldLabel>
               <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center">
                 <Combobox
-                  items={PROBE_MODELS}
+                  items={probeModels}
                   value={model}
                   onValueChange={(value) => value && setModel(value)}
                   disabled={probe.isPending}
@@ -1046,7 +1091,16 @@ export function ConnectivityTestDialog({
                     emptyText={t('没有匹配的模型', 'No matching models')}
                   >
                     {(item: string) => (
-                      <ComboboxItem key={item} value={item}>{item}</ComboboxItem>
+                      <ComboboxItem key={item} value={item}>
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="truncate">{item}</span>
+                          {isDenied(item) && (
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {t('套餐不含', 'not in plan')}
+                            </span>
+                          )}
+                        </span>
+                      </ComboboxItem>
                     )}
                   </ComboboxPopup>
                 </Combobox>

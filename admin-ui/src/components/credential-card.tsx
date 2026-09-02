@@ -3,6 +3,7 @@ import {
   CalendarDaysIcon,
   CheckIcon,
   ClockIcon,
+  BanIcon,
   EllipsisIcon,
   GlobeIcon,
   SmartphoneIcon,
@@ -31,6 +32,7 @@ import {
   deviceUsageMeta,
   evaluateCredential,
   modelCooldownSummary,
+  modelDenialSummary,
   proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
@@ -496,6 +498,20 @@ export const CredentialCard = memo(function CredentialCard({
                 <TimerOffIcon className="size-3" />
                 <span className="font-medium">{t('刚被限速', 'Recently throttled')}</span>
                 <span>{modelCooldownSummary(cred, language, false)}</span>
+              </p>
+            )}
+            {/* 第三档：上游说这个套餐压根不含这些模型。它不会自己过去，所以措辞不能是「冷却」。 */}
+            {evaluation.modelDenied && (
+              <p
+                className="flex flex-wrap items-center gap-x-1.5 text-muted-foreground text-xs"
+                title={t(
+                  '上游判定该账号的套餐不含这些模型（回了 429 却没有任何额度窗口、且组织未开 extra usage），选号时这些模型绕开它，其余模型照常。连通性测试通过、等级变化或菜单里手动解除都会清掉这条记录',
+                  'Upstream reported that this account’s plan does not include these models (a 429 with no quota window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
+                )}
+              >
+                <BanIcon className="size-3" />
+                <span className="font-medium">{t('套餐不含', 'Not in plan')}</span>
+                <span>{modelDenialSummary(cred, language)}</span>
               </p>
             )}
           </section>

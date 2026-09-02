@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "luban"
-version = "0.3.64"
+version = "0.3.65"
 dependencies = [
  "anyhow",
  "axum",
@@ -1105,6 +1105,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "wreq",
