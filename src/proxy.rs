@@ -697,7 +697,7 @@ pub async fn handle(
         let Some(info) = limited else { break (upstream, resp, sent) };
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
-        let scope = rate_limit_scope(&info, req_model.as_deref());
+        let scope = rate_limit_scope_for(&info, req_model.as_deref(), is_max_plan(&cred));
         // 套餐不含这个模型：记准入、换号重发。学习不设条件——记录是对的就该记；换号有次数上限，
         // 免得一条请求把整池的 Pro 号挨个点一遍。换不到号时若是「全被判过」就回 403 让客户端
         // 换模型，其余原因（都在冷却等）保留上游那发 429 原样透传。
@@ -705,6 +705,7 @@ pub async fn handle(
             let reason = info.plan_denial_reason();
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
+                tier = %cred.tier.as_deref().unwrap_or("-"),
                 model = %model,
                 expires_at = info.unified_reset.unwrap_or(0),
                 ratelimit = %info.raw,
@@ -4388,6 +4389,12 @@ const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
 /// 所以这个数只在**冷启动**（记录还没学到）时被碰到；设成池子里 Pro 号的常见数量级即可。
 const MODEL_DENIAL_MAX_SWAPS: usize = 4;
 
+/// 这个号是不是 Max 档（个人 Max，或团队/企业号拿的 Max 额度档——两者 `tier` 都以 `Max` 开头，
+/// 见 `crate::oauth::tier_from`）。等级未知按「不是」算：那时唯一的信息来源是上游的判决。
+fn is_max_plan(cred: &crate::credentials::Credential) -> bool {
+    cred.tier.as_deref().is_some_and(|t| t.starts_with("Max"))
+}
+
 /// 连撞到第 `attempts` 档时该让客户端等多久：`base * 2^(attempts-1)`，封顶
 /// [`MAX_TRANSIENT_COOLDOWN_SECS`]。
 fn transient_backoff_for(attempts: u32) -> std::time::Duration {
@@ -6412,7 +6419,16 @@ enum LimitScope {
     /// （`overage-disabled-reason`）。不是限流——等到什么时候都不会有额度长出来，除非换套餐或
     /// 开 extra usage。故它既不打冷却也不停号，而是落一条准入记录
     /// （[`store::CredentialStore::deny_model`]）并**换号重发**，之后的选号直接绕开这一格。
+    ///
+    /// **只给「fable/mythos 且账号等级不是 Max」**（[`store::premium_model`] + 等级）：这是唯一
+    /// 能把这形态解读成「套餐不含」的组合。其余组合见 [`Self::OverageDisabled`]。
     Unsupported(String),
+    /// 形态与 [`Self::Unsupported`] 相同（无窗口、只说 credits 被组织关了），但**不能**解读成
+    /// 「套餐不含」：请求的是所有付费套餐都含的基础模型（线上 sonnet-4-6 撞出过），或账号本就是
+    /// Max。它也不代表撞了上限——头里没有任何窗口说满了。上游到底为什么把这一发记到 credits
+    /// 上不可知，所以只做最小动作：该号该模型短冷却（默认 30 秒，同超额池那档的兜底值），
+    /// 本条请求换号重发。不落库、不停号、不记准入。
+    OverageDisabled(String),
 }
 
 impl LimitScope {
@@ -6430,7 +6446,10 @@ impl LimitScope {
     fn model(&self) -> Option<&str> {
         match self {
             Self::Account => None,
-            Self::Model(m) | Self::Transient(m) | Self::Unsupported(m) => Some(m),
+            Self::Model(m)
+            | Self::Transient(m)
+            | Self::Unsupported(m)
+            | Self::OverageDisabled(m) => Some(m),
         }
     }
 
@@ -6440,6 +6459,7 @@ impl LimitScope {
             Self::Model(_) => "model",
             Self::Transient(_) => "transient",
             Self::Unsupported(_) => "unsupported",
+            Self::OverageDisabled(_) => "overage-disabled",
         }
     }
 }
@@ -6477,7 +6497,16 @@ impl LimitScope {
 /// 优先吃 `retry-after`（两次实测都给了，直指池子重置时刻），不会重蹈「30 秒放出去反复撞」
 /// 的循环——那是早年时长不认 `retry-after` 的锅，不是作用域的。请求体里读不出模型名时
 /// 退回账号级——没有模型可挂，宁可保守。
+///
+/// 生产路径都走 [`rate_limit_scope_for`]（要带账号等级）；这个两参数的形态只剩测试在用。
+#[cfg(test)]
 fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
+    rate_limit_scope_for(info, model, false)
+}
+
+/// 同 [`rate_limit_scope`]，多一个「这个号是 Max 档吗」：只影响「无窗口 + overage 被关」那一档
+/// 的解读——Max 号的 fable 不可能是「套餐不含」，见 [`LimitScope::OverageDisabled`]。
+fn rate_limit_scope_for(info: &RateLimitInfo, model: Option<&str>, max_plan: bool) -> LimitScope {
     let Some(model) = model else { return LimitScope::Account };
     let rejected = |s: &str| s.contains("rate_limited") || s.contains("rejected");
     let base_gone = info.window_status.iter().any(|(w, s)| !is_overage_window(w) && rejected(s))
@@ -6487,8 +6516,16 @@ fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     // Pro 号打 fable：`overage-disabled-reason=org_level_disabled` + `credits-*` + 一个月后的
     // `unified-reset`，仅此而已）。它不是限流，见 [`LimitScope::Unsupported`]。**排在最前**：
     // 这形态下即便带了 `unified-status=rejected`，说的也是这次请求，不是账号。
+    //
+    // 但只有「高档套餐专属模型 + 账号不是 Max」才能这么解读。同一形态落在 sonnet/opus/haiku 上
+    // （线上 sonnet-4-6 撞出过）或落在 Max 号上，既不是「不含」也不是「撞上限」——头里没有任何
+    // 窗口说满了——只能当一次说不清的拒绝：短冷却 + 换号，见 [`LimitScope::OverageDisabled`]。
     if no_detail && info.overage_disabled_reason.is_some() {
-        return LimitScope::Unsupported(model.to_string());
+        return if store::premium_model(model) && !max_plan {
+            LimitScope::Unsupported(model.to_string())
+        } else {
+            LimitScope::OverageDisabled(model.to_string())
+        };
     }
     let unified_gone = no_detail && info.unified_status.as_deref().is_some_and(rejected);
     // 超额/回补池被拒或打满：额度是跟着账号走的，换个号可能还有余量，故仍判 [`LimitScope::Model`]。
@@ -7402,7 +7439,7 @@ pub async fn probe(
             // 429 照真实流量打冷却。开关读库里真实配置（形态那份 flags 是恒定全开的基准，
             // 与「要不要管 429」无关）；与转发一样，重试次数配成 0 也视同关闭。
             let probe_scope = (status == StatusCode::TOO_MANY_REQUESTS)
-                .then(|| rate_limit_scope(&info, Some(model)));
+                .then(|| rate_limit_scope_for(&info, Some(model), is_max_plan(cred)));
             // 套餐不含这个模型：照转发路径记一条准入记录，之后的选号绕开这一格。学习不看
             // 429 开关——那个开关管的是限流冷却，这里记的是事实。
             if let Some(LimitScope::Unsupported(_)) = &probe_scope {
@@ -11190,6 +11227,37 @@ mod tests {
         assert_eq!(super::rate_limit_scope(&pool_full, Some(fable)).label(), "model");
         // 请求体里读不出模型名时照旧账号级兜底——没有模型可挂。
         assert!(super::rate_limit_scope(&info, None).account_level());
+
+        // 线上第二例：同一形态落在 sonnet-4-6 上。sonnet 是所有付费套餐都含的，这既不是
+        // 「套餐不含」也不是撞上限（没有任何窗口说满了）：不落库、不停号，只给该号该模型 30 秒
+        // 短冷却并换号重发。
+        let sonnet = "claude-sonnet-4-6";
+        let odd = hdr(&[
+            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            (
+                "anthropic-ratelimit-unified-reset",
+                &(crate::credentials::now_secs() + 29 * 86400).to_string(),
+            ),
+        ]);
+        let scope = super::rate_limit_scope_for(&odd, Some(sonnet), false);
+        assert_eq!(scope, super::LimitScope::OverageDisabled(sonnet.into()));
+        assert!(!scope.account_level() && scope.worth_swapping());
+        assert_eq!(scope.model(), Some(sonnet), "模型级短冷却，不碰账号");
+        assert_eq!(
+            odd.cooldown_for(&scope).as_secs() as i64,
+            super::DEFAULT_MODEL_COOLDOWN_SECS,
+            "没有 retry-after 就是 30 秒兜底，绝不睡到一个月后的 reset"
+        );
+        // 同一形态、fable、但账号是 Max：不可能是「套餐不含」，同样只做短冷却 + 换号。
+        assert_eq!(
+            super::rate_limit_scope_for(&odd, Some("claude-fable-5-1[1m]"), true),
+            super::LimitScope::OverageDisabled("claude-fable-5-1[1m]".into())
+        );
+        // fable + 非 Max 才记「套餐不含」。
+        assert_eq!(
+            super::rate_limit_scope_for(&odd, Some("claude-fable-5-1[1m]"), false).label(),
+            "unsupported"
+        );
     }
 
     #[test]

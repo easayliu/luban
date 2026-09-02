@@ -3495,6 +3495,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
     )
     .context("failed to initialize credential database schema")?;
 
+    // 准入记录只该挂在高档套餐专属的模型上（见 `crate::proxy::LimitScope::Unsupported`）。
+    // 0.3.65 曾把 sonnet-4-6 这种基础模型也记进去（同形态的 429 现在只做短冷却 + 换号，见
+    // `LimitScope::OverageDisabled`），这里把那批记录清掉；之后的写入方不会再产生这类行，
+    // 此语句只是幂等的兜底。
+    conn.execute(
+        "DELETE FROM model_denials WHERE model NOT LIKE '%fable%' AND model NOT LIKE '%mythos%'",
+        [],
+    )?;
+
     // 兼容旧 usage_logs：逐列幂等新增（已存在则忽略 duplicate column）。
     for col in [
         "unified_status TEXT",
