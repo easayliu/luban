@@ -551,6 +551,17 @@ export const SORTS: { key: SortKey; label: string }[] = [
 export const SORT_KEYS = SORTS.map((s) => s.key)
 
 /**
+ * 卡片视图的网格：最多两张一排。列最小宽取「27rem 与容器一半减半个间距」的较大者——容器不够
+ * 54rem 时退成一列，再宽也只把两张撑大、不挤出第三张（卡片按 600–690px 设计，432px 只是它能
+ * 撑住的下限；容器放宽到 88rem 后三张一排就是踩在下限上）。
+ *
+ * 真卡片与加载骨架**必须共用这一条**：骨架先渲染、数据到了再换成真卡片，两边规则不一致就会
+ * 在刷新时先闪出三列再跳回两列。
+ */
+export const CREDENTIAL_CARD_GRID_CLASS =
+  'relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,max(27rem,calc(50%_-_0.5rem))),1fr))] sm:gap-4'
+
+/**
  * 各维度首次选中时的默认方向——按「用户多半想先看什么」定：
  * 优先级/名称是升序（P0 在前、A→Z），其余都是降序（最严重、用得最多、最贵、最近的排前面）。
  * 再次点击同一维度会翻转方向，此处只决定初值。

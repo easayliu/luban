@@ -7,6 +7,7 @@ import {
   CardPanel,
   CardTitle,
 } from '@/components/ui/card'
+import { CREDENTIAL_CARD_GRID_CLASS } from '@/components/credential-shared'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useI18n } from '@/lib/i18n'
 
@@ -36,10 +37,7 @@ export function CredentialLoadingState({
 
 function CardSkeletons({ selectable, count }: { selectable: boolean; count: number }) {
   return (
-    <ul
-      className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4"
-      aria-hidden="true"
-    >
+    <ul className={CREDENTIAL_CARD_GRID_CLASS} aria-hidden="true">
       {Array.from({ length: count }, (_, index) => (
         <li key={index} className="min-w-0 h-full">
           <Card render={<article />} className="@container/card min-h-[17rem] h-full overflow-hidden">
