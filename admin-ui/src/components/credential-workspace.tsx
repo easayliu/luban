@@ -1132,7 +1132,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </TableBody>
             </Table>
           ) : (
-            <ul className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,27rem),1fr))] sm:gap-4">
+            // 最多两张一排：列最小宽取「27rem 与容器一半减半个间距」的较大者。容器不够 54rem 时
+            // 照旧退成一列；容器再宽也只会把两张撑大，不会挤出第三张——卡片是按 600–690px
+            // 设计的，432px 只是它能撑住的下限（容器放宽到 88rem 后三张一排就是踩在下限上）。
+            <ul className="relative grid list-none items-stretch gap-3 p-0 [grid-template-columns:repeat(auto-fill,minmax(min(100%,max(27rem,calc(50%_-_0.5rem))),1fr))] sm:gap-4">
               {pageItems.map((item) => (
                 <CredentialCard
                   key={item.id}

@@ -1160,6 +1160,14 @@ impl Upstream<'_> {
     /// 也只是多担一份上游挑刺的风险，而这条路径既不产生 usage 也不消耗额度。
     fn shape(&self, body: &Bytes, cred: &crate::credentials::Credential, device_fp: &str) -> Bytes {
         if self.billable {
+            // body 侧要不要补 `thinking.display:"updates"`，看**实际发出的头**里有没有那项 beta
+            // （[`merge_beta`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
+            // 的串没有 `advisor-tool`，头上不补，体里就也不能写，否则上游 400：
+            // `thinking.adaptive.display: Input should be 'summarized', 'omitted'`）。
+            let display_beta =
+                self.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).is_some_and(|s| {
+                    s.split(',').any(|b| b.trim() == config::CC_BETA_THINKING_DISPLAY_UPDATES)
+                });
             rewrite_body(
                 body,
                 cred,
@@ -1169,6 +1177,7 @@ impl Upstream<'_> {
                 self.bare_session.as_deref(),
                 self.force_stream,
                 self.tool_names.as_deref(),
+                display_beta,
             )
         } else {
             body.clone()
@@ -4697,6 +4706,9 @@ fn rewrite_body(
     bare_session: Option<&str>,
     force_stream: bool,
     tool_names: Option<&ToolNameMap>,
+    // 出站头里已经带了 `thinking-display-updates` beta（由调用方从实际发出的头上判定）。
+    // 只有它为真，fable 请求的 body 才补 `thinking.display:"updates"`，见 [`fill_thinking_display`]。
+    display_beta: bool,
 ) -> Bytes {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
@@ -4758,11 +4770,15 @@ fn rewrite_body(
     // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
     // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
     let thinking_filled = sim.is_some() && flags.inject_thinking && ensure_thinking(&mut v);
-    // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 会补 `thinking-display-updates`，
-    // body 侧配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
-    // 与 `merge_beta` 同一个开关，否则就是「体里写了字段、头上没声明」。
-    let display_filled =
-        sim.is_none() && cc_inbound && flags.merge_beta && fill_thinking_display(&mut v);
+    // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 补了 `thinking-display-updates`，
+    // body 侧才配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
+    // `display_beta` 取自实际发出的头——头上没那项 beta 时体里写 `updates` 是一发稳定 400
+    // （agent-sdk / VSCode 扩展的 beta 串没有 `advisor-tool`，`merge_beta` 不给它补）。
+    let display_filled = sim.is_none()
+        && cc_inbound
+        && flags.merge_beta
+        && display_beta
+        && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
@@ -5216,7 +5232,12 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
 /// fable 族 CC 请求补 `thinking.display:"updates"`：订阅端官方 fable-5-1 发的是
 /// `{"type":"adaptive","display":"updates"}`（`cap/2.1.258/00013`），API-key 端发裸 `adaptive`。
 /// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由 [`cc_beta_seed`]
-/// 判（种子里有 `thinking-display-updates` 的才算），与 [`merge_beta`] 补那项 beta 的判据同源。
+/// 判（种子里有 `thinking-display-updates` 的才算）。
+///
+/// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body`] 的 `display_beta`）：`updates`
+/// 是 beta 才认的取值，头上没声明时上游回 400 `Input should be 'summarized', 'omitted'`。
+/// 2026-09-02 一条 `claude-vscode, agent-sdk/0.3.258` 的 fable-5-1 请求就是这样被拒的——它的
+/// beta 串没有 `advisor-tool`，[`merge_beta`] 按老世代处理不补，体里却写了。
 fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
     if !cc_beta_seed(model).contains(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
@@ -7607,7 +7628,9 @@ mod tests {
         sim: Option<&super::Simulation>,
         bare_session: Option<&str>,
     ) -> Bytes {
-        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false, None)
+        // 测试默认按「出站头里带了 thinking-display-updates」跑，fable 的 display 才补得上；
+        // 头上没有那项 beta 的反例见 `skips_thinking_display_without_the_beta`。
+        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false, None, true)
     }
 
     /// 三个模型族的 `anthropic-beta`，逐字取自 `cap/raw` 的原始报文头
@@ -7772,6 +7795,41 @@ mod tests {
         let off = store::ForwardFlags { merge_beta: false, ..all_on() };
         let v = run(&body("claude-fable-5-1", r#"{"type":"adaptive"}"#), off);
         assert!(v["thinking"].get("display").is_none(), "merge_beta 关着就不补: {v}");
+    }
+
+    /// 回归 2026-09-02 的 400：`claude-vscode, agent-sdk/0.3.258` 发来的 fable-5-1 请求，
+    /// beta 串没有 `advisor-tool`，`merge_beta` 不给它补 `thinking-display-updates`，
+    /// body 却被写了 `display:"updates"`，上游回 `Input should be 'summarized', 'omitted'`。
+    /// 体侧的补写必须跟着「出站头里到底有没有那项 beta」走。
+    #[test]
+    fn skips_thinking_display_without_the_beta() {
+        let body = Bytes::from(
+            r#"{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"thinking":{"type":"adaptive"}}"#,
+        );
+        let out = super::rewrite_body(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "头上没 beta 就不补: {v}"
+        );
+
+        // agent-sdk 那串（无 advisor-tool）经 merge_beta 也确实不会带上那项 beta——两边口径一致。
+        let sdk_beta = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,effort-2025-11-24";
+        let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"));
+        assert!(!merged.contains("thinking-display-updates"), "老世代的串不补: {merged}");
     }
 
     /// 补齐 + 落位后应与官方客户端的 beta 串**逐字节一致**，三个模型族都要过。
@@ -10039,6 +10097,7 @@ mod tests {
             None,
             false,
             Some(&map),
+            true,
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -12311,6 +12370,7 @@ mod tests {
                 None,
                 true,
                 None,
+                true,
             )
         };
 
@@ -12336,6 +12396,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         );
         assert_eq!(
             untouched,
