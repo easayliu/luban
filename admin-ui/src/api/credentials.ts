@@ -253,6 +253,14 @@ export interface UsageLog {
   total_ms: number | null
   /** 按模型价目表估算的等价 API 费用（USD）；模型认不出时为 null。 */
   cost_usd: number | null
+  /**
+   * luban 给这条入站请求发的 id（`lb-…`），同时回在响应头 `X-Oneapi-Request-Id` /
+   * `X-Luban-Request-Id` 上；New API 把它存成日志里的 `upstream_request_id`。
+   * 0.3.70 之前的旧记录为 null。
+   */
+  request_id: string | null
+  /** 上游最后一次响应头里的 `request-id`，对 Anthropic 工单用。 */
+  upstream_request_id: string | null
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */
@@ -299,9 +307,17 @@ export interface UsagePage {
  */
 export async function listCredentialUsage(
   id: number,
-  params: { limit?: number; offset?: number; until?: number } = {},
+  params: { limit?: number; offset?: number; until?: number; request_id?: string } = {},
 ): Promise<UsagePage> {
   const { data } = await api.get<UsagePage>(`/credentials/${id}/usage`, { params })
+  return data
+}
+
+/** 全部账号的流水（按时间倒序）；`request_id` 精确匹配，用于按请求 id 查一条。 */
+export async function listUsage(
+  params: { limit?: number; offset?: number; until?: number; request_id?: string } = {},
+): Promise<UsagePage> {
+  const { data } = await api.get<UsagePage>('/usage', { params })
   return data
 }
 

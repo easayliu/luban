@@ -2738,6 +2738,13 @@ pub struct UsageRecord {
     /// 这条来访本来是非流式、被改写成流式发给上游再聚合回整段 JSON（见
     /// [`ForwardFlags::nonstream_as_sse`]）。
     pub sse_aggregated: bool,
+    /// luban 给这条入站请求发的 id（`lb-<uuid>`），同时回在响应头 `X-Oneapi-Request-Id` /
+    /// `X-Luban-Request-Id` 上。New API 会把上游响应头里的 `X-Oneapi-Request-Id` 存成它日志的
+    /// `upstream_request_id`，于是拿它那边的一条日志就能在这里精确找到对应的流水。
+    /// 一条入站请求可能对应多次上游请求（429 换号、prefill 重试），故主键是 luban 自己的 id。
+    pub request_id: Option<String>,
+    /// 上游**最后一次**响应头里的 `request-id`，对 Anthropic 工单用。
+    pub upstream_request_id: Option<String>,
 }
 
 /// 一条落库后的用量日志（读取用）。
@@ -2778,6 +2785,10 @@ pub struct UsageLog {
     pub rl_overage_in_use: Option<bool>,
     pub ratelimit_raw: Option<String>,
     pub cost_usd: Option<f64>,
+    /// 见 [`UsageRecord::request_id`]；0.3.70 之前的旧记录为 `None`。
+    pub request_id: Option<String>,
+    /// 见 [`UsageRecord::upstream_request_id`]。
+    pub upstream_request_id: Option<String>,
 }
 
 /// [`CredentialStore::query_usage_logs`] 的入参。
@@ -2787,7 +2798,7 @@ pub struct UsageLog {
 /// 调用方先取一次 `max(id)` 当锚点（[`UsageLogStats::max_id`]），之后每页都带着它，
 /// 于是整轮翻页看到的是同一个快照，页码、总条数、总花费三者始终自洽。锚点钉在 id 上而不是
 /// `ts` 上：它同时是排序键（自增，同秒内仍严格有序，不会像按 `ts` 分界那样漏记录）。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UsageLogQuery {
     /// 只看这个凭证的流水；`None` 为全部。
     ///
@@ -2799,6 +2810,40 @@ pub struct UsageLogQuery {
     pub offset: i64,
     /// 最多返回条数。调用方负责收敛，这里不设默认上限。
     pub limit: i64,
+    /// 只看这一个请求 id（精确匹配，见 [`UsageRecord::request_id`]）；空白视同 `None`。
+    pub request_id: Option<String>,
+}
+
+impl UsageLogQuery {
+    /// 把筛选条件拼成 `WHERE …`（可能为空串）与对应的绑定参数。
+    ///
+    /// **按条件动态拼而不是写 `(?1 IS NULL OR col = ?1)`**：那种写法 SQLite 用不上索引，每翻
+    /// 一页都是整表扫；流水 30 天动辄几十万行，按号翻页与按请求 id 查都得走索引才像样
+    /// （`idx_usage_logs_cred_id` / `idx_usage_logs_request_id`）。统计与取页共用这一份，
+    /// 「共 N 条」与翻得到的记录永远是同一个集合。
+    fn where_clause(&self) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(c) = self.cred_id {
+            params.push(Value::Integer(c));
+            clauses.push(format!("cred_id = ?{}", params.len()));
+        }
+        if let Some(u) = self.until_id {
+            params.push(Value::Integer(u));
+            clauses.push(format!("id <= ?{}", params.len()));
+        }
+        if let Some(r) = self.request_id.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            params.push(Value::Text(r.to_string()));
+            clauses.push(format!("request_id = ?{}", params.len()));
+        }
+        let sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        (sql, params)
+    }
 }
 
 /// 一批流水的整体口径：条数、花费合计、以及可作翻页锚点的最大 id。
@@ -3186,10 +3231,11 @@ impl CredentialStore {
                  cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                  rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
-                 rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated)
+                 rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
+                 request_id, upstream_request_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30)",
+                     ?30, ?31, ?32)",
             params![
                 ts,
                 rec.cred_id,
@@ -3221,6 +3267,8 @@ impl CredentialStore {
                 rec.ua,
                 rec.ua_out,
                 rec.sse_aggregated as i64,
+                rec.request_id,
+                rec.upstream_request_id,
             ],
         )?;
         // 落账。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属，只记日志不记账。
@@ -3377,13 +3425,13 @@ impl CredentialStore {
     ///
     /// `q` 里的 `limit`/`offset` **不参与**——统计的是整个集合，不是当前这一页。
     pub fn usage_log_stats(&self, q: UsageLogQuery) -> Result<UsageLogStats> {
+        let (where_sql, params) = q.where_clause();
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id)
-               FROM usage_logs
-              WHERE (?1 IS NULL OR cred_id = ?1)
-                AND (?2 IS NULL OR id <= ?2)",
-            params![q.cred_id, q.until_id],
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id) FROM usage_logs{where_sql}"
+            ),
+            rusqlite::params_from_iter(params),
             |r| Ok(UsageLogStats { total: r.get(0)?, cost_usd: r.get(1)?, max_id: r.get(2)? }),
         )
         .map_err(Into::into)
@@ -3391,20 +3439,25 @@ impl CredentialStore {
 
     /// 按条件查用量流水，恒按 `id` 倒序。见 [`UsageLogQuery`]。
     pub fn query_usage_logs(&self, q: UsageLogQuery) -> Result<Vec<UsageLog>> {
+        let (where_sql, mut params) = q.where_clause();
+        params.push(rusqlite::types::Value::Integer(q.limit));
+        params.push(rusqlite::types::Value::Integer(q.offset));
+        let n = params.len();
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, ts, cred_id, cred_label, device_id, model, path, status, has_usage,
                     input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
                     cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
                     unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                     rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                    cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated
-               FROM usage_logs
-              WHERE (?1 IS NULL OR cred_id = ?1)
-                AND (?2 IS NULL OR id <= ?2)
-              ORDER BY id DESC LIMIT ?3 OFFSET ?4",
-        )?;
-        let rows = stmt.query_map(params![q.cred_id, q.until_id, q.limit, q.offset], |r| {
+                    cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
+                    request_id, upstream_request_id
+               FROM usage_logs{where_sql}
+              ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
+            n - 1,
+            n
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
             Ok(UsageLog {
                 id: r.get(0)?,
                 ts: r.get(1)?,
@@ -3437,6 +3490,8 @@ impl CredentialStore {
                 ua: r.get(28)?,
                 ua_out: r.get(29)?,
                 sse_aggregated: r.get::<_, i64>(30)? != 0,
+                request_id: r.get(31)?,
+                upstream_request_id: r.get(32)?,
             })
         })?;
         let mut out = Vec::new();
@@ -3639,9 +3694,20 @@ fn init_schema(conn: &Connection) -> Result<()> {
         // CHECK 只写在建表里：ADD COLUMN 带 CHECK 各版本行为不一，而这一列的写入方只有
         // insert_usage_log 一处，值恒为 0/1。
         "sse_aggregated INTEGER NOT NULL DEFAULT 0",
+        // 0.3.70：luban 自己的请求 id 与上游最后一次的 request-id，见 UsageRecord::request_id。
+        "request_id TEXT",
+        "upstream_request_id TEXT",
     ] {
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
     }
+    // 这两个索引依赖上面补出来的列 / 服务翻页的排序键，**必须在补列之后建**：
+    // - (cred_id, id)：按号翻页是 `cred_id = ? AND id <= ? ORDER BY id DESC`，与索引序完全
+    //   一致，取页不必再排序；已有的 (cred_id, ts) 是给按时间聚合用的，排序键不同。
+    // - (request_id)：按请求 id 精确查——排查时贴一个 id 进来，不能整表扫。
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_id ON usage_logs(cred_id, id);
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_request_id ON usage_logs(request_id);",
+    )?;
     // credential_stats 是 0.2.37 加的表，这两列都在其后才有：同样幂等补列。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
     // device_costs 的终身请求数是后加的：老库补出来是 0，之后的请求照常累加。
@@ -6605,7 +6671,7 @@ mod tests {
 
         // 统计与记录同一套条件：a 的四条、花费合计 15，最大 id 即锚点。
         let only_a = UsageLogQuery { cred_id: Some(a), ..Default::default() };
-        let stats = store.usage_log_stats(only_a).unwrap();
+        let stats = store.usage_log_stats(only_a.clone()).unwrap();
         assert_eq!(stats.total, 4, "b 的那条不该计入");
         assert_eq!(stats.cost_usd, 15.0);
         let anchor = stats.max_id.expect("有记录就有锚点");
@@ -6617,6 +6683,7 @@ mod tests {
                     until_id: Some(anchor),
                     offset: n * 3,
                     limit: 3,
+                    request_id: None,
                 })
                 .unwrap()
         };
@@ -6635,9 +6702,77 @@ mod tests {
         log(a, 16.0);
         assert_eq!(ids(&page(0)), ids(&first), "新记录不得把第一页往后挤");
         assert_eq!(ids(&page(1)), ids(&second));
-        let pinned = store.usage_log_stats(UsageLogQuery { until_id: Some(anchor), ..only_a });
+        let pinned =
+            store.usage_log_stats(UsageLogQuery { until_id: Some(anchor), ..only_a.clone() });
         assert_eq!(pinned.unwrap().total, 4, "钉在锚点上的统计不动");
         assert_eq!(store.usage_log_stats(only_a).unwrap().total, 5, "不带锚点才看得到新记录");
+    }
+
+    /// 请求 id 落库、可精确查；筛选走索引而不是整表扫（按号翻页同样）。
+    #[test]
+    fn usage_logs_are_searchable_by_request_id_using_indexes() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let log = |cred: i64, rid: &str, up: Option<&str>| {
+            store
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(cred),
+                    request_id: Some(rid.into()),
+                    upstream_request_id: up.map(Into::into),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        log(a, "lb-1", Some("req_up_1"));
+        log(a, "lb-2", None);
+        log(b, "lb-3", Some("req_up_3"));
+
+        let by = |rid: &str| UsageLogQuery {
+            request_id: Some(rid.into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let hit = store.query_usage_logs(by("lb-3")).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].cred_id, Some(b));
+        assert_eq!(hit[0].upstream_request_id.as_deref(), Some("req_up_3"));
+        assert_eq!(store.usage_log_stats(by("lb-3")).unwrap().total, 1, "统计与取页同一套条件");
+        assert!(store.query_usage_logs(by("nope")).unwrap().is_empty());
+        // 空白视同不筛。
+        assert_eq!(store.query_usage_logs(by("   ")).unwrap().len(), 3);
+        // 与按号筛叠加。
+        let both = UsageLogQuery {
+            cred_id: Some(a),
+            request_id: Some("lb-3".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(store.query_usage_logs(both).unwrap().is_empty(), "lb-3 是 b 的");
+
+        // 查询计划必须走索引：按号翻页走 (cred_id, id)，按请求 id 走 request_id 索引。
+        let plan = |q: &UsageLogQuery| -> String {
+            let (where_sql, params) = q.where_clause();
+            let conn = store.conn.lock();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+        };
+        let p = plan(&UsageLogQuery {
+            cred_id: Some(a),
+            until_id: Some(100),
+            limit: 10,
+            ..Default::default()
+        });
+        assert!(p.contains("idx_usage_logs_cred_id"), "按号翻页应走 (cred_id, id) 索引: {p}");
+        assert!(!p.contains("TEMP B-TREE"), "索引序即排序序，不该再排一遍: {p}");
+        let p = plan(&by("lb-1"));
+        assert!(p.contains("idx_usage_logs_request_id"), "按请求 id 应走索引: {p}");
     }
 
     /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，

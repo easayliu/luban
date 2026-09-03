@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  EllipsisVerticalIcon, LogOutIcon, PlusIcon, SettingsIcon,
+  EllipsisVerticalIcon, LogOutIcon, PlusIcon, SearchIcon, SettingsIcon,
 } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
@@ -27,6 +27,7 @@ import {
   type CredentialViewMode,
 } from '@/components/credential-workspace'
 import { AddAccount } from '@/components/add-account'
+import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
@@ -145,6 +146,7 @@ function readSettingsRoute(): SettingsSection | null {
 function App() {
   const { t } = useI18n()
   const [adding, setAdding] = useState(false)
+  const [lookupOpen, setLookupOpen] = useState(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [pw, setPwState] = useState<string | null>(getPw())
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -333,6 +335,9 @@ function App() {
                 <EllipsisVerticalIcon />
               </MenuTrigger>
               <MenuPopup align="end" className="w-44">
+                <MenuItem onClick={() => setLookupOpen(true)}>
+                  <SearchIcon />{t('请求查询', 'Request lookup')}
+                </MenuItem>
                 <MenuItem onClick={() => openSettings('access')}>
                   <SettingsIcon />{t('系统设置', 'System settings')}
                 </MenuItem>
@@ -350,6 +355,17 @@ function App() {
           <div className="hidden items-center gap-2 sm:flex">
             <LanguageSwitcher />
             <ThemeSwitcher />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={isBootstrapping}
+              onClick={() => setLookupOpen(true)}
+              title={t('按请求 ID 查流水', 'Look up a request by ID')}
+              aria-label={t('请求查询', 'Request lookup')}
+            >
+              <SearchIcon />
+              <span>{t('请求查询', 'Lookup')}</span>
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -387,6 +403,7 @@ function App() {
       <main className="page-frame relative flex-1 py-4 pb-8 sm:py-5 sm:pb-10">
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
+        <RequestLookupDialog open={lookupOpen} onOpenChange={setLookupOpen} />
 
         <CredentialWorkspace
           data={{

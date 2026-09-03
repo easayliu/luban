@@ -1,0 +1,169 @@
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { SearchIcon } from 'lucide-react'
+import { listUsage, type UsageLog } from '@/api/credentials'
+import { useI18n } from '@/lib/i18n'
+import {
+  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd,
+} from '@/lib/utils'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
+} from '@/components/ui/dialog'
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Form } from '@/components/ui/form'
+import { Input } from '@/components/ui/input'
+import { Spinner } from '@/components/ui/spinner'
+import { RequestIdChip, statusVariant } from '@/components/credential-usage-dialog'
+
+/**
+ * 按请求 id 查一条流水。
+ *
+ * 排查路径：New API 日志里的 `upstream_request_id`（就是 luban 回在 `X-Oneapi-Request-Id`
+ * 上的那个 `lb-…`），贴进来直接看到它走的是哪个账号、模型、状态、用量与花费。
+ * 不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
+ */
+export function RequestLookupDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const { t, language, locale } = useI18n()
+  const [draft, setDraft] = useState('')
+  const [submitted, setSubmitted] = useState('')
+  const query = useQuery({
+    queryKey: ['request-lookup', submitted],
+    queryFn: () => listUsage({ request_id: submitted, limit: 50 }),
+    enabled: open && submitted !== '',
+  })
+  const rows = query.data?.logs ?? []
+
+  const submit = () => {
+    const id = draft.trim()
+    if (id) setSubmitted(id)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{t('请求查询', 'Request lookup')}</DialogTitle>
+          <DialogDescription>
+            {t(
+              '贴入 luban 回在响应头 X-Oneapi-Request-Id / X-Luban-Request-Id 上的请求 ID（New API 日志里叫 upstream_request_id），查它在这里的流水。',
+              'Paste the request ID luban returned in the X-Oneapi-Request-Id / X-Luban-Request-Id response header (shown as upstream_request_id in New API logs) to find its record here.',
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel className="space-y-4">
+          <Form onSubmit={(e) => { e.preventDefault(); submit() }}>
+            <Field>
+              <FieldLabel htmlFor="request-lookup-id">{t('请求 ID', 'Request ID')}</FieldLabel>
+              <div className="flex gap-2">
+                <Input
+                  id="request-lookup-id"
+                  autoFocus
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="font-mono"
+                  placeholder="lb-…"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                />
+                <Button type="submit" disabled={!draft.trim() || query.isFetching}>
+                  {query.isFetching ? <Spinner /> : <SearchIcon />}
+                  {t('查询', 'Search')}
+                </Button>
+              </div>
+              <FieldDescription>
+                {t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
+              </FieldDescription>
+            </Field>
+          </Form>
+
+          {submitted === '' ? null : query.isPending ? (
+            <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+              <Spinner />{t('正在查询', 'Searching')}
+            </div>
+          ) : query.isError ? (
+            <Alert variant="error">
+              <AlertTitle>{t('查询失败', 'Lookup failed')}</AlertTitle>
+              <AlertDescription>{extractError(query.error, language)}</AlertDescription>
+            </Alert>
+          ) : rows.length === 0 ? (
+            <Empty className="py-8">
+              <EmptyHeader>
+                <EmptyTitle className="text-base">{t('没有找到这条请求', 'No request found')}</EmptyTitle>
+                <EmptyDescription>
+                  {t(
+                    '确认 id 完整（以 lb- 开头）；超过 30 天的流水已被裁剪。',
+                    'Check that the id is complete (it starts with lb-); records older than 30 days have been pruned.',
+                  )}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <ul className="space-y-2" aria-label={t('查询结果', 'Results')}>
+              {rows.map((log) => <LookupRow key={log.id} log={log} locale={locale} />)}
+            </ul>
+          )}
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
+  )
+}
+
+function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
+  const { t, language } = useI18n()
+  const num = (v: number | null) => (v == null ? '—' : v.toLocaleString(locale))
+  const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
+  const deviceShort = log.device_id
+    ? log.device_id.startsWith('sim:') ? `sim:${log.device_id.slice(4, 12)}` : log.device_id.slice(0, 8)
+    : '—'
+  return (
+    <li className="rounded-lg border bg-card p-3 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant={statusVariant(log.status)} size="sm" className="tabular-nums">{log.status}</Badge>
+        <span className="font-medium">
+          {log.cred_label ? displayCredentialLabel(log.cred_label, language) : t('（账号已删除）', '(account deleted)')}
+        </span>
+        {log.cred_id != null && <span className="tabular-nums text-muted-foreground">#{log.cred_id}</span>}
+        <span className="ml-auto tabular-nums text-muted-foreground">{formatFullTime(log.ts, language)}</span>
+      </div>
+      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
+        <Fact label={t('模型', 'Model')}><span title={log.model ?? undefined}>{log.model ?? '—'}</span></Fact>
+        <Fact label={t('输入 / 输出', 'In / out')}>{num(log.input_tokens)} / {num(log.output_tokens)}</Fact>
+        <Fact label={t('缓存写 / 读', 'Cache w/r')}>{num(log.cache_creation_tokens)} / {num(log.cache_read_tokens)}</Fact>
+        <Fact label={t('首字 / 总耗时', 'TTFT / total')}>{ms(log.ttft_ms)} / {ms(log.total_ms)}</Fact>
+        <Fact label={t('花费', 'Cost')}>
+          <span className={cn(log.cost_usd == null && 'text-muted-foreground')}>
+            {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
+          </span>
+        </Fact>
+        <Fact label={t('设备', 'Device')}><span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span></Fact>
+        <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
+        <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
+        <Fact label={t('路径', 'Path')}><span className="font-mono" title={log.path}>{log.path}</span></Fact>
+      </dl>
+      {(log.ua || log.ua_out) && (
+        <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground" title={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : (log.ua ?? undefined)}>
+          {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
+        </p>
+      )}
+    </li>
+  )
+}
+
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-2xs text-muted-foreground">{label}</dt>
+      <dd className="truncate tabular-nums">{children}</dd>
+    </div>
+  )
+}

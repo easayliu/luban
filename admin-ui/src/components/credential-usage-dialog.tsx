@@ -1,11 +1,12 @@
 import { useRef, useState } from 'react'
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
-import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
+import { CopyIcon, RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
+  copyText,
   displayCredentialLabel,
   extractError,
   formatFullTime,
@@ -48,6 +49,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { toastManager } from '@/components/ui/toast'
 import {
   Table,
   TableBody,
@@ -62,7 +64,7 @@ import {
 const PAGE_SIZES = [25, 50, 100] as const
 
 /** 状态码 → 徽章配色。2xx 成功、429 单独一档（额度问题，不是错误），其余 4xx/5xx 红。 */
-function statusVariant(status: number): BadgeProps['variant'] {
+export function statusVariant(status: number): BadgeProps['variant'] {
   if (status >= 200 && status < 300) return 'success'
   if (status === 429) return 'warning'
   if (status >= 400) return 'error'
@@ -415,6 +417,9 @@ function UsageCards({
               <LogFact label={t('设备', 'Device')}>
                 <span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span>
               </LogFact>
+              <LogFact label={t('请求 ID', 'Request ID')}>
+                <RequestIdChip id={log.request_id} />
+              </LogFact>
             </dl>
             {(log.ua || log.ua_out) && (
               <p
@@ -487,7 +492,7 @@ function UsageTable({
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
-          <TableHead scope="colgroup" colSpan={2} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
+          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
         </TableRow>
         <TableRow className="bg-muted/96">
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
@@ -499,6 +504,15 @@ function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('设备', 'Device')}</TableHead>
+          <TableHead
+            className="whitespace-nowrap"
+            title={t(
+              'luban 回在响应头 X-Oneapi-Request-Id 上的请求 ID，New API 日志里叫 upstream_request_id；点击复制',
+              'Request ID luban returns in the X-Oneapi-Request-Id header (upstream_request_id in New API logs); click to copy',
+            )}
+          >
+            {t('请求 ID', 'Request ID')}
+          </TableHead>
           {/* 两份 UA 合在一列：绝大多数请求原样转发，两者是同一串，占两列纯浪费宽度。
               只在被改写时才多显示一行出站那份，见 UaCell。 */}
           <TableHead
@@ -577,12 +591,44 @@ function UsageTable({
               <TableCell className="whitespace-nowrap font-mono text-xs" title={deviceId}>
                 {deviceShort}
               </TableCell>
+              <TableCell className="whitespace-nowrap">
+                <RequestIdChip id={log.request_id} />
+              </TableCell>
               <UaCell ua={log.ua} uaOut={log.ua_out} />
             </TableRow>
           )
         })}
       </TableBody>
     </Table>
+  )
+}
+
+/**
+ * 请求 id：默认只显示尾部 8 位（`lb-` 前缀加 uuid 太长，表格里放不下），完整值在 title 里，
+ * 点击复制整串。`full` 时整串显示（查询结果页有的是横向空间）。旧记录没有 id 时显示占位。
+ */
+export function RequestIdChip({ id, full = false }: { id: string | null; full?: boolean }) {
+  const { t } = useI18n()
+  if (!id) return <span className="text-muted-foreground">—</span>
+  const shown = full || id.length <= 12 ? id : `…${id.slice(-8)}`
+  const copy = async () => {
+    const ok = await copyText(id)
+    toastManager.add({
+      title: ok ? t('已复制请求 ID', 'Request ID copied') : t('复制失败', 'Copy failed'),
+      description: ok ? id : undefined,
+      type: ok ? 'success' : 'error',
+    })
+  }
+  return (
+    <button
+      type="button"
+      className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere]"
+      title={`${id}\n${t('点击复制', 'Click to copy')}`}
+      onClick={copy}
+    >
+      <span className={full ? '' : 'truncate'}>{shown}</span>
+      <CopyIcon aria-hidden className="size-3 shrink-0 text-muted-foreground" />
+    </button>
   )
 }
 

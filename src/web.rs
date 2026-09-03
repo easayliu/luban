@@ -596,6 +596,10 @@ struct UsageQuery {
     /// 理由见 [`store::UsageLogQuery`]。
     #[serde(default)]
     until: Option<i64>,
+    /// 只看这一个请求 id（luban 回在 `X-Oneapi-Request-Id` 上的那个，New API 日志里的
+    /// `upstream_request_id`）。精确匹配，空白视同不筛。
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// 一页流水 + 整个集合的口径。前端要靠 `total` 算页数、靠 `anchor` 把整轮翻页钉在同一快照上。
@@ -650,17 +654,19 @@ fn usage_page(
 ) -> Result<Json<UsagePage>, ApiError> {
     let limit = q.limit.unwrap_or(default_limit).clamp(1, max_limit);
     let offset = q.offset.unwrap_or(0).max(0);
-    let mut filter = store::UsageLogQuery { cred_id, until_id: q.until, offset, limit };
-    let stats = state.store.usage_log_stats(filter).map_err(internal)?;
+    let mut filter = store::UsageLogQuery {
+        cred_id,
+        until_id: q.until,
+        offset,
+        limit,
+        request_id: q.request_id.clone(),
+    };
+    let stats = state.store.usage_log_stats(filter.clone()).map_err(internal)?;
     // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
     filter.until_id = q.until.or(stats.max_id);
+    let anchor = filter.until_id;
     let logs = state.store.query_usage_logs(filter).map_err(internal)?;
-    Ok(Json(UsagePage {
-        total: stats.total,
-        total_cost: stats.cost_usd,
-        anchor: filter.until_id,
-        logs,
-    }))
+    Ok(Json(UsagePage { total: stats.total, total_cost: stats.cost_usd, anchor, logs }))
 }
 
 // ---------- 凭证管理 ----------

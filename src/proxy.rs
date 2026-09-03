@@ -17,6 +17,12 @@ use crate::store;
 use crate::web::AppState;
 
 /// 转发 `/v1/*` 到官方 API。
+/// 转发入口：给这条入站请求发一个 id，跑完 [`handle_inner`] 后把 id 写进响应头。
+///
+/// `X-Oneapi-Request-Id` 是给 New API 的——它读上游响应头里的这个名字，存进自己日志的
+/// `upstream_request_id`（它自己那份 id 从不发给上游，两边只能靠这条路对上）。
+/// `X-Luban-Request-Id` 是同一个值的中性名字，给别的客户端与人看。**每条响应都带**，包括
+/// 本地拒掉的那些：排查「为什么被拒」时最需要它。
 pub async fn handle(
     State(state): State<AppState>,
     method: Method,
@@ -24,7 +30,101 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let request_id = format!("lb-{}", uuid_v4());
+    let mut resp = handle_inner(state, method, uri, headers, body, &request_id).await;
+    // 错误体里也带上 id：New API 把上游错误的 `error.message` 原文展示给它的用户，响应头
+    // 到不了那一层；人拿着报错截图来问时，id 得就在那句话里。
+    if resp.status().is_client_error() || resp.status().is_server_error() {
+        resp = annotate_error_response(resp, &request_id).await;
+    }
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-oneapi-request-id", v.clone());
+        resp.headers_mut().insert("x-luban-request-id", v);
+    }
+    resp
+}
+
+/// 错误体最多收多大来改写。错误 JSON 通常几百字节；超过这个数的不是错误体，原样放行不碰。
+const ERROR_BODY_ANNOTATE_LIMIT: usize = 256 * 1024;
+
+/// 把 luban 的请求 id 写进一条 4xx/5xx 的 JSON 错误体，见 [`annotate_error_json`]。
+///
+/// 只碰 `content-type` 含 `json` 的响应：SSE、空体、非 JSON 的网关错误一律不动。收 body 会把
+/// 上游流读完，这正好也驱动了 [`ReqLog`] 的收尾——它挂在流上，读完才落日志。收不下来
+/// （超过上限）时 body 已经丢了，只能回一条自己的 502，至少把 id 带出去。
+async fn annotate_error_response(resp: Response, request_id: &str) -> Response {
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("json"));
+    if !is_json {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, ERROR_BODY_ANNOTATE_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(request_id, error = %e, "failed to buffer an error body for annotation");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!(
+                    "failed to read the upstream error body: {e} (luban request id: {request_id})"
+                ),
+            );
+        }
+    };
+    let out = annotate_error_json(&bytes, request_id).map(Bytes::from).unwrap_or(bytes);
+    // 长度变了，交给 hyper 按新 body 重算。
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(out))
+}
+
+/// 在错误 JSON 里写入 luban 的请求 id：`error.message` 末尾追加 `(luban request id: lb-…)`，
+/// 顶层加 `luban_request_id`。不是 JSON 对象时返回 `None`（原样放行）。
+///
+/// 两处都写：`message` 是人最终看到的那句话（New API 把它原文转给用户，工单截图里就是它）；
+/// 顶层字段给程序读。**不覆盖**上游自带的顶层 `request_id`（那是 Anthropic 的 `req_…`，
+/// 对它们的工单要用），故另起一个名字。`message` 里已经带着这个 id 时不重复追加。
+fn annotate_error_json(bytes: &[u8], request_id: &str) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = v.as_object_mut()?;
+    if let Some(msg) =
+        obj.get_mut("error").and_then(|e| e.as_object_mut()).and_then(|e| e.get_mut("message"))
+        && let Some(text) = msg.as_str()
+        && !text.contains(request_id)
+    {
+        *msg = serde_json::Value::String(format!("{text} (luban request id: {request_id})"));
+    }
+    obj.insert("luban_request_id".into(), serde_json::Value::String(request_id.to_string()));
+    serde_json::to_vec(&v).ok()
+}
+
+/// 来访请求头里带的请求 id（若有）：New API 用 `{client_header:…}` 透传的终端用户 id、
+/// 官方 SDK 的 `x-client-request-id` 等。只记日志，不作主键——它不是 luban 发的，可能重复或缺失。
+fn client_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-oneapi-request-id", "x-request-id", "x-client-request-id"]
+        .iter()
+        .find_map(|k| headers.get(*k).and_then(|v| v.to_str().ok()))
+        .map(|v| v.chars().take(128).collect())
+}
+
+/// 取一个响应头的文本值，缺失或非 UTF-8 时为 `None`（与 [`header_text`] 的 `"-"` 占位相对）。
+fn header_opt(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+async fn handle_inner(
+    state: AppState,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+    request_id: &str,
+) -> Response {
     let started = std::time::Instant::now();
+    let client_request_id = client_request_id(&headers);
     let path_and_query =
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
     // 来访 UA：转发日志与各条拒绝日志都带上（都是 info/warn，不必开 debug）。整组识别头那条
@@ -985,6 +1085,9 @@ pub async fn handle(
                 req_model: req_model.clone(),
                 ratelimit,
                 stream_broke: None,
+                request_id: request_id.to_string(),
+                client_request_id: client_request_id.clone(),
+                upstream_request_id: header_opt(up.headers(), "request-id"),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,
@@ -1361,10 +1464,14 @@ fn resp_builder_as(up: &wreq::Response, ct: Option<&str>) -> axum::http::respons
 /// 拿聚合器去解一份非 SSE 的 body 只会得到一个空 Message。
 async fn relay_upstream(
     up: wreq::Response,
-    rl: ReqLog,
+    mut rl: ReqLog,
     upgrade_stream: bool,
     tool_names: Option<std::sync::Arc<ToolNameMap>>,
 ) -> Response {
+    // 重试路径（thinking 降级、剥 prefill）会换一发上游响应再进来：记录以最终那一发为准。
+    if let Some(rid) = header_opt(up.headers(), "request-id") {
+        rl.upstream_request_id = Some(rid);
+    }
     let (is_stream, _) = resp_shape(&up);
     if upgrade_stream && is_stream {
         aggregate_sse(up, rl, tool_names.as_deref()).await
@@ -2416,6 +2523,12 @@ struct ReqLog {
     /// [`stream_upstream`] 里这个分支是 `if let Ok` 的隐式丢弃——错误原样交给 axum，
     /// 客户端拿到一条截断的流，服务端侧一行日志都没有。
     stream_broke: Option<String>,
+    /// luban 给这条入站请求发的 id，见 [`handle`]。
+    request_id: String,
+    /// 来访请求头里带的 id（若有），见 [`client_request_id`]。
+    client_request_id: Option<String>,
+    /// 上游**最后一次**响应头里的 `request-id`；换号/重试后以最终那一发为准。
+    upstream_request_id: Option<String>,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
@@ -2516,6 +2629,9 @@ impl Drop for ReqLog {
             total_ms,
             sse_aggregated = self.sse_aggregated,
             cost_usd = cost_usd.map(|c| format!("{c:.5}")).unwrap_or_else(|| "-".into()),
+            request_id = %self.request_id,
+            client_request_id = %self.client_request_id.as_deref().unwrap_or("-"),
+            upstream_request_id = %self.upstream_request_id.as_deref().unwrap_or("-"),
             "forwarded"
         );
 
@@ -2552,6 +2668,8 @@ impl Drop for ReqLog {
             windows: self.ratelimit.windows(),
             ratelimit_raw: (!self.ratelimit.raw.is_empty()).then(|| self.ratelimit.raw.clone()),
             cost_usd,
+            request_id: Some(self.request_id.clone()),
+            upstream_request_id: self.upstream_request_id.clone(),
         };
         spawn_usage_log(self.store.clone(), rec);
     }
@@ -7563,12 +7681,14 @@ pub async fn probe(
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
     // Upstream 之前取，取值规则与转发路径同一套。
     let out_ua = ua_of(&headers);
+    let probe_request_id = format!("lb-{}", uuid_v4());
     let plog = ProbeLog {
         store: &state.store,
         cred,
         req_model: model,
         started: &started,
         out_ua: (out_ua != "-").then_some(out_ua),
+        request_id: probe_request_id.clone(),
     };
     let upstream = Upstream {
         _state: std::marker::PhantomData,
@@ -7627,6 +7747,8 @@ pub async fn probe(
             // 封号判定必须跳过（与转发路径同一条宁漏勿误的规则）。
             let (_, content_encoding) = resp_shape(&up);
             let compressed = content_encoding.is_some();
+            // `up.bytes()` 会吃掉 `up`，上游的 request-id 先取走给流水用。
+            let upstream_request_id = header_opt(up.headers(), "request-id");
             // 429 照真实流量打冷却。开关读库里真实配置（形态那份 flags 是恒定全开的基准，
             // 与「要不要管 429」无关）；与转发一样，重试次数配成 0 也视同关闭。
             let probe_scope = (status == StatusCode::TOO_MANY_REQUESTS)
@@ -7706,7 +7828,7 @@ pub async fn probe(
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
                 Err(_) => {
-                    plog.record(status, &Bytes::new(), &info);
+                    plog.record(status, &Bytes::new(), &info, upstream_request_id.as_deref());
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -7723,7 +7845,7 @@ pub async fn probe(
                 // 响应体读到一半断了：状态码与限流头都是真的，只是内容不完整，如实报出来。
                 // 这一条同样落日志——额度快照来自头，不依赖 body。
                 Ok(Err(e)) => {
-                    plog.record(status, &Bytes::new(), &info);
+                    plog.record(status, &Bytes::new(), &info, upstream_request_id.as_deref());
                     ProbeReport {
                         ok: false,
                         status: status.as_u16(),
@@ -7735,7 +7857,7 @@ pub async fn probe(
                     }
                 }
                 Ok(Ok(bytes)) => {
-                    plog.record(status, &bytes, &info);
+                    plog.record(status, &bytes, &info, upstream_request_id.as_deref());
                     // 命中封号特征照真实流量停用：判定器与转发共用同一个（含 401 裸响应、
                     // 「端点不支持」豁免那些规则），测试报出「已封禁」的同时卡片也变红，
                     // 而不是弹窗里一个结论、列表里另一个。
@@ -7766,6 +7888,7 @@ pub async fn probe(
         latency_ms = report.latency_ms,
         error = %report.error.as_deref().unwrap_or("-"),
         ratelimit = %ratelimit_raw,
+        request_id = %probe_request_id,
         "connectivity test"
     );
     report
@@ -7817,11 +7940,19 @@ struct ProbeLog<'a> {
     started: &'a std::time::Instant,
     /// 实际发出去那份 UA，由调用方从出站头取（没有该头时为 `None`）。
     out_ua: Option<String>,
+    /// 这次测试的 luban 请求 id（同转发路径的口径，见 [`handle`]），流水里按它能查到。
+    request_id: String,
 }
 
 impl ProbeLog<'_> {
-    fn record(&self, status: StatusCode, bytes: &Bytes, ratelimit: &RateLimitInfo) {
-        log_probe_usage(self, status, bytes, ratelimit)
+    fn record(
+        &self,
+        status: StatusCode,
+        bytes: &Bytes,
+        ratelimit: &RateLimitInfo,
+        upstream_request_id: Option<&str>,
+    ) {
+        log_probe_usage(self, status, bytes, ratelimit, upstream_request_id)
     }
 }
 
@@ -7830,8 +7961,9 @@ fn log_probe_usage(
     status: StatusCode,
     bytes: &Bytes,
     ratelimit: &RateLimitInfo,
+    upstream_request_id: Option<&str>,
 ) {
-    let ProbeLog { store, cred, req_model, started, out_ua } = ctx;
+    let ProbeLog { store, cred, req_model, started, out_ua, request_id } = ctx;
     // 非流式、未压缩（wreq 已解码），喂整段 body 即可解析出顶层 `usage`。
     let mut sniffer = UsageSniffer::new(false, false);
     sniffer.feed(bytes);
@@ -7883,6 +8015,8 @@ fn log_probe_usage(
         windows: ratelimit.windows(),
         ratelimit_raw: (!ratelimit.raw.is_empty()).then(|| ratelimit.raw.clone()),
         cost_usd,
+        request_id: Some(request_id.clone()),
+        upstream_request_id: upstream_request_id.map(str::to_string),
     };
     // 与转发路径同理：这里在 async 上下文里，同步写库会占住工作线程，见 [`spawn_usage_log`]。
     spawn_usage_log((*store).clone(), rec);
@@ -9424,6 +9558,34 @@ mod tests {
             String::from_utf8(map.restore(b"x fetch_abc00_long y fetch_abc00 z")).unwrap(),
             "x REAL_LONG y REAL_SHORT z"
         );
+    }
+
+    /// 错误体里带 luban 请求 id：message 末尾追加、顶层加 luban_request_id、不动上游的 request_id。
+    #[test]
+    fn error_bodies_carry_the_luban_request_id() {
+        let rid = "lb-0000-test";
+        // 上游形态（带 Anthropic 自己的 request_id）。
+        let up = br#"{"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."},"request_id":"req_01ABC"}"#;
+        let out = super::annotate_error_json(up, rid).expect("是 JSON 对象");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "`temperature` is deprecated for this model. (luban request id: lb-0000-test)"
+        );
+        assert_eq!(v["request_id"], "req_01ABC", "上游的 request_id 不能被盖掉");
+        assert_eq!(v["luban_request_id"], rid);
+        // 再来一遍不重复追加。
+        let again: serde_json::Value =
+            serde_json::from_slice(&super::annotate_error_json(&out, rid).unwrap()).unwrap();
+        assert_eq!(again["error"]["message"], v["error"]["message"]);
+        // luban 自己的错误体同样处理。
+        let own = super::error_body("permission_error", "nope");
+        let v: serde_json::Value =
+            serde_json::from_slice(&super::annotate_error_json(&own, rid).unwrap()).unwrap();
+        assert_eq!(v["error"]["message"], "nope (luban request id: lb-0000-test)");
+        // 不是 JSON 对象：放行。
+        assert!(super::annotate_error_json(b"Error", rid).is_none());
+        assert!(super::annotate_error_json(b"[1,2]", rid).is_none());
     }
 
     /// OpenAI 方言的 `tool_choice` 翻译成 Anthropic 对象形态；上游对非对象直接 400
@@ -12455,8 +12617,9 @@ mod tests {
             req_model: "claude-opus-5",
             started: &std::time::Instant::now(),
             out_ua: Some(config::CC_USER_AGENT.into()),
+            request_id: "lb-probe-test".into(),
         }
-        .record(StatusCode::OK, &body, &info);
+        .record(StatusCode::OK, &body, &info, Some("req_up_test"));
 
         let q = store.latest_quota(cred.id).unwrap().expect("卡片应能读到这次测试的额度");
         assert_eq!(q.rl_5h_utilization, Some(0.32));
@@ -12499,6 +12662,9 @@ mod tests {
                 req_model: None,
                 ratelimit: rl_headers(&[]),
                 stream_broke: None,
+                request_id: "lb-test".into(),
+                client_request_id: None,
+                upstream_request_id: None,
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
                 _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -12551,6 +12717,9 @@ mod tests {
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            request_id: "lb-test".into(),
+            client_request_id: None,
+            upstream_request_id: None,
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -13325,6 +13494,9 @@ mod tests {
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            request_id: "lb-test".into(),
+            client_request_id: None,
+            upstream_request_id: None,
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
