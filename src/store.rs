@@ -119,6 +119,27 @@ pub struct ModelDenial {
     pub expires_at: Option<i64>,
 }
 
+/// 从上游 400 里学到的一条规则，落库供重启后回填进程内记忆，见
+/// [`CredentialStore::remember_rejections`]。两类共用一张表：
+/// - `kind = "shape"`：某模型不接受某字段的某取值（`effort: 'xhigh'`），命中本地拒；
+/// - `kind = "deprecated"`：某模型已废弃某字段（`temperature`），命中转发前剥掉，`value` 为空串。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearnedRejection {
+    pub kind: String,
+    pub model: String,
+    pub field: String,
+    pub value: String,
+    /// 上游原话，日志与本地拒绝回放用。
+    pub message: String,
+}
+
+/// 学到的规则落库后最多活多久（秒）：7 天。
+///
+/// 这是持久化这类推断的唯一安全阀。它们是从一条报错里学来的，上游哪天放开了某个取值或恢复了
+/// 某个参数，本地没有任何信号能知道——不设期限就是「永久拒掉一个其实已经支持的取值」。
+/// 7 天后丢掉重学，代价是每周每种组合白撞一次 400。
+pub const LEARNED_REJECTION_TTL_SECS: i64 = 7 * 24 * 3600;
+
 /// 把模型名归一成「套餐门禁」的粒度：小写、去掉 `[1m]` 上下文后缀与 `-YYYYMMDD` 日期后缀。
 ///
 /// 上游按套餐放不放行看的是模型本身，`claude-fable-5-1[1m]` 与 `claude-fable-5-1` 不会一个
@@ -1832,6 +1853,67 @@ impl CredentialStore {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
+    // ---------- 从上游 400 学到的规则 ----------
+
+    /// 落库一批刚学到的规则（已存在的组合原样保留，不刷新时间——保鲜期从第一次学到算）。
+    pub fn remember_rejections(&self, rows: &[LearnedRejection]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO learned_rejections (kind, model, field, value, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for r in rows {
+            let message: String = r.message.chars().take(500).collect();
+            stmt.execute(params![r.kind, r.model, r.field, r.value, message])?;
+        }
+        Ok(())
+    }
+
+    /// 读出仍在保鲜期内的全部规则（过期的顺手删掉），启动时回填进程内记忆用。
+    pub fn learned_rejections(&self) -> Result<Vec<LearnedRejection>> {
+        Ok(self.learned_rejections_with_time()?.into_iter().map(|(r, _)| r).collect())
+    }
+
+    /// 同 [`Self::learned_rejections`]，附每条学到的时刻（Unix 秒），控制台列表用。
+    pub fn learned_rejections_with_time(&self) -> Result<Vec<(LearnedRejection, i64)>> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM learned_rejections WHERE learned_at <= unixepoch() - ?1",
+            [LEARNED_REJECTION_TTL_SECS],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, model, field, value, message, learned_at FROM learned_rejections ORDER BY learned_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                LearnedRejection {
+                    kind: r.get(0)?,
+                    model: r.get(1)?,
+                    field: r.get(2)?,
+                    value: r.get(3)?,
+                    message: r.get(4)?,
+                },
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// 清空全部学到的规则（控制台逃生口：上游放开了某个取值、本地却还在拒）。返回删掉的条数。
+    pub fn clear_learned_rejections(&self) -> Result<usize> {
+        Ok(self.conn.lock().execute("DELETE FROM learned_rejections", [])?)
+    }
+
+    /// 删掉一条学到的规则（按主键四元组），返回是否确有其行。
+    pub fn forget_learned_rejection(&self, r: &LearnedRejection) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "DELETE FROM learned_rejections WHERE kind = ?1 AND model = ?2 AND field = ?3 AND value = ?4",
+            params![r.kind, r.model, r.field, r.value],
+        )? > 0)
+    }
+
     /// 最近 `days` 天流水里出现过的模型（去重），附最后一次出现的时刻，按时刻倒序。
     /// 连通性测试自己打的那些（`device_id = 'probe'`）不算——它们是人挑的，不是客户端在用的。
     pub fn recent_models(&self, days: i64) -> Result<Vec<(String, i64)>> {
@@ -3512,6 +3594,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
             learned_at INTEGER NOT NULL DEFAULT (unixepoch()),
             expires_at INTEGER,
             PRIMARY KEY (cred_id, model)
+        ) STRICT;
+
+        -- 从上游 400 学到的规则（形态拒绝 / 已废弃字段），见 CredentialStore::remember_rejections。
+        -- 只为重启回填；进程内仍以 HashMap 为准。learned_at 用来做 7 天保鲜。
+        CREATE TABLE IF NOT EXISTS learned_rejections (
+            kind       TEXT    NOT NULL,
+            model      TEXT    NOT NULL,
+            field      TEXT    NOT NULL,
+            value      TEXT    NOT NULL DEFAULT '',
+            message    TEXT    NOT NULL DEFAULT '',
+            learned_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            PRIMARY KEY (kind, model, field, value)
         ) STRICT;",
     )
     .context("failed to initialize credential database schema")?;
@@ -5527,6 +5621,54 @@ mod tests {
         // 暂停的那个号自己也被判过 → 真的没号能用，才是 ModelUnsupported。
         store.deny_model(max, "claude-fable-5", "plan", None).unwrap();
         assert!(sel().unwrap_err().downcast_ref::<ModelUnsupported>().is_some());
+    }
+
+    /// 学到的规则落库、重启可读回；过期的读不到；清空接口清得干净。
+    #[test]
+    fn learned_rejections_round_trip_and_expire() {
+        let (store, _) = store_with(&["a"]);
+        let row = |kind: &str, model: &str, field: &str, value: &str| LearnedRejection {
+            kind: kind.into(),
+            model: model.into(),
+            field: field.into(),
+            value: value.into(),
+            message: "msg".into(),
+        };
+        let rows = vec![
+            row("shape", "claude-opus-5", "effort", "xhigh"),
+            row("deprecated", "claude-haiku-4-5", "temperature", ""),
+        ];
+        store.remember_rejections(&rows).unwrap();
+        // 重复写入是幂等的。
+        store.remember_rejections(&rows[..1]).unwrap();
+        let mut got = store.learned_rejections().unwrap();
+        got.sort_by(|a, b| a.kind.cmp(&b.kind));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1], rows[0]);
+        assert_eq!(got[0], rows[1]);
+
+        // 人为把一条改成 8 天前学到的：读取时被当过期清掉。
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE learned_rejections SET learned_at = unixepoch() - ?1 WHERE kind = 'shape'",
+                [LEARNED_REJECTION_TTL_SECS + 86400],
+            )
+            .unwrap();
+        let got = store.learned_rejections().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "deprecated");
+
+        // 单条删除按四元组精确命中。
+        store.remember_rejections(&rows).unwrap();
+        assert!(store.forget_learned_rejection(&rows[0]).unwrap());
+        assert!(!store.forget_learned_rejection(&rows[0]).unwrap(), "再删一次应无行");
+        let (_, at) = store.learned_rejections_with_time().unwrap()[0].clone();
+        assert!(at > 0);
+
+        assert_eq!(store.clear_learned_rejections().unwrap(), 1);
+        assert!(store.learned_rejections().unwrap().is_empty());
     }
 
     /// 删号连带清掉它的准入记录，别留孤儿行。

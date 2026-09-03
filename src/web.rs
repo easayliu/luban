@@ -52,12 +52,12 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
-    /// 上游拒过的请求形态记忆表：进程内累积，用来在本地拦掉上游已经拒过一次的
-    /// 「模型 + 取值」组合（`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。
-    /// 见 [`crate::proxy::ShapeMemory`]。
+    /// 上游拒过的请求形态记忆表，用来在本地拦掉上游已经拒过一次的「模型 + 取值」组合
+    /// （`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。写穿落库、启动回填、
+    /// 7 天保鲜，见 [`crate::proxy::ShapeMemory`]。
     pub shape_rejections: crate::proxy::ShapeMemory,
     /// 上游以 `deprecated` 拒过的「模型 + 字段」记忆表：学过之后转发前自动剥掉该字段，
-    /// 客户端无需改动即可正常使用。见 [`crate::proxy::DeprecatedFieldMemory`]。
+    /// 客户端无需改动即可正常使用。持久化同上，见 [`crate::proxy::DeprecatedFieldMemory`]。
     pub deprecated_fields: crate::proxy::DeprecatedFieldMemory,
     /// 拒绝日志的抑制表：撞上限的客户端往往每几十毫秒重试一次，一条不落地记会把日志刷没。
     /// 见 [`crate::proxy::RejectionLog`]。
@@ -106,6 +106,27 @@ pub async fn run(
         session_concurrency: Arc::default(),
         in_flight: Arc::default(),
     };
+    // 把上次运行学到的上游规则读回来（形态拒绝 / 已废弃字段），免得每种组合重启后再撞一次 400。
+    // 读失败只告警：这是优化，不是启动的前提。
+    match state.store.learned_rejections() {
+        Ok(rows) => {
+            let (shape, deprecated) = proxy::seed_learned_memories(
+                &state.shape_rejections,
+                &state.deprecated_fields,
+                rows,
+            );
+            if shape + deprecated > 0 {
+                tracing::info!(
+                    shape,
+                    deprecated,
+                    "restored learned upstream rejections from the database"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load learned rejections; starting with empty memories")
+        }
+    }
 
     // 每天裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
     // 流水只需保留近期。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务，
@@ -290,6 +311,8 @@ pub async fn run(
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
         .route("/models", get(list_models))
+        .route("/learned-rejections", get(list_learned_rejections).delete(clear_learned_rejections))
+        .route("/learned-rejections/delete", post(forget_learned_rejection))
         .route("/credentials/proxy", post(set_proxies))
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
         .route("/proxies/test", post(test_proxy))
@@ -1066,6 +1089,95 @@ async fn clear_cooldown(
     state.store.clear_model_denials(id, None).map_err(internal)?;
     state.store.resume_if_rate_limited(id).map_err(internal)?;
     view_of(&state, id)
+}
+
+/// `GET /api/learned-rejections` 的一条：从上游 400 学到的规则，见 [`store::LearnedRejection`]。
+#[derive(Serialize)]
+struct LearnedRejectionView {
+    /// `shape`（命中本地拒）或 `deprecated`（命中转发前剥掉字段）。
+    kind: String,
+    model: String,
+    field: String,
+    /// 形态规则被拒的那个取值；废弃字段规则为空串。
+    value: String,
+    /// 上游原话。
+    message: String,
+    /// 学到的时刻（Unix 秒）。
+    learned_at: i64,
+    /// 到期自动丢弃、重新向上游验证的时刻（Unix 秒），见 [`store::LEARNED_REJECTION_TTL_SECS`]。
+    expires_at: i64,
+}
+
+async fn list_learned_rejections(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<LearnedRejectionView>>, ApiError> {
+    let rows = state.store.learned_rejections_with_time().map_err(internal)?;
+    Ok(Json(
+        rows.into_iter()
+            .rev()
+            .map(|(r, learned_at)| LearnedRejectionView {
+                kind: r.kind,
+                model: r.model,
+                field: r.field,
+                value: r.value,
+                message: r.message,
+                learned_at,
+                expires_at: learned_at + store::LEARNED_REJECTION_TTL_SECS,
+            })
+            .collect(),
+    ))
+}
+
+/// `POST /api/learned-rejections/delete`：删掉一条学到的规则，库里与进程内一起删。
+/// 用 POST 带体而不是 DELETE 带路径：`model` 里有 `[1m]` 这种字符，塞进路径段徒增转义。
+#[derive(Deserialize)]
+struct ForgetLearnedReq {
+    kind: String,
+    model: String,
+    field: String,
+    #[serde(default)]
+    value: String,
+}
+
+async fn forget_learned_rejection(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetLearnedReq>,
+) -> Result<Json<Vec<LearnedRejectionView>>, ApiError> {
+    let row = store::LearnedRejection {
+        kind: req.kind,
+        model: req.model,
+        field: req.field,
+        value: req.value,
+        message: String::new(),
+    };
+    let in_db = state.store.forget_learned_rejection(&row).map_err(internal)?;
+    let in_mem =
+        proxy::forget_learned_memory(&state.shape_rejections, &state.deprecated_fields, &row);
+    if !in_db && !in_mem {
+        return Err(not_found());
+    }
+    tracing::info!(kind = %row.kind, model = %row.model, field = %row.field, value = %row.value, "learned upstream rejection removed from the console");
+    list_learned_rejections(State(state)).await
+}
+
+/// `DELETE /api/learned-rejections`：清空从上游 400 学到的全部规则——库里的和进程内的一起清。
+///
+/// 逃生口：上游放开了某个取值或恢复了某个参数，本地却还在按学到的旧规则拒/剥。7 天保鲜期
+/// 会自动过期，等不及就手动清。清错的代价只是每种组合再撞一次 400。
+#[derive(Serialize)]
+struct ClearedLearnedResp {
+    /// 从库里删掉的条数。
+    deleted: usize,
+}
+
+async fn clear_learned_rejections(
+    State(state): State<AppState>,
+) -> Result<Json<ClearedLearnedResp>, ApiError> {
+    let deleted = state.store.clear_learned_rejections().map_err(internal)?;
+    state.shape_rejections.write().clear();
+    state.deprecated_fields.write().clear();
+    tracing::info!(deleted, "learned upstream rejections cleared from the console");
+    Ok(Json(ClearedLearnedResp { deleted }))
 }
 
 /// `GET /api/models`：控制台（连通性测试的模型下拉）用的模型清单。

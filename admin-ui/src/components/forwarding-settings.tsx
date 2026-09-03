@@ -2,6 +2,7 @@ import { useEffect, useId, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   BadgeCheckIcon,
+  BrainIcon,
   ChevronDownIcon,
   DatabaseIcon,
   InfoIcon,
@@ -11,9 +12,13 @@ import {
   ServerIcon,
   SlidersHorizontalIcon,
   TerminalIcon,
+  Trash2Icon,
 } from 'lucide-react'
 import {
+  clearLearnedRejections,
+  forgetLearnedRejection,
   getSettings,
+  listLearnedRejections,
   setForwarding,
   setOauthScopes,
   setPrefillPolicy,
@@ -21,12 +26,17 @@ import {
   setRateLimitRetryMax,
   setSamplingPolicy,
   type ForwardingKey,
+  type LearnedRejection,
   type PolicyValue,
   type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
-import { extractError } from '@/lib/utils'
+import { extractError, formatFullTime } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import {
+  AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
+  AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -456,6 +466,8 @@ export function ForwardingSettingsContent() {
           }
         />
       </SettingsGroup>
+
+      <LearnedRejections />
 
       <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>
         <ForwardingToggle
@@ -1002,5 +1014,150 @@ function ForwardingToggle({
         </details>
       )}
     </Field>
+  )
+}
+
+/**
+ * 从上游 400 学到的规则：列表 + 单条删除 + 全部清空。
+ *
+ * 这些规则是从一条报错里学来的推断，上游放开了本地没有信号能知道；后端给了 7 天保鲜期，
+ * 这里是等不及 7 天时的逃生口。删错的代价只是同一组合再撞一次 400。
+ */
+function LearnedRejections() {
+  const { t, language } = useI18n()
+  const qc = useQueryClient()
+  const [confirmClear, setConfirmClear] = useState(false)
+  const query = useQuery({ queryKey: ['learned-rejections'], queryFn: listLearnedRejections })
+  const failure = (title: string, error: unknown) =>
+    toastManager.add({ title, description: extractError(error, language), type: 'error' })
+
+  const forget = useMutation({
+    mutationFn: (row: LearnedRejection) => forgetLearnedRejection(row),
+    onSuccess: (rows) => {
+      qc.setQueryData(['learned-rejections'], rows)
+      toastManager.add({ title: t('已删除规则', 'Rule removed'), type: 'success' })
+    },
+    onError: (e) => failure(t('删除失败', 'Failed to remove'), e),
+  })
+  const clear = useMutation({
+    mutationFn: clearLearnedRejections,
+    onSuccess: (deleted) => {
+      setConfirmClear(false)
+      qc.setQueryData(['learned-rejections'], [])
+      toastManager.add({
+        title: t(`已清空 ${deleted} 条规则`, `Cleared ${deleted} rule${deleted === 1 ? '' : 's'}`),
+        type: 'success',
+      })
+    },
+    onError: (e) => { setConfirmClear(false); failure(t('清空失败', 'Failed to clear'), e) },
+  })
+
+  const rows = query.data ?? []
+  const kindLabel = (kind: string) =>
+    kind === 'shape'
+      ? t('本地拒绝', 'Rejected locally')
+      : kind === 'deprecated'
+        ? t('剥掉字段', 'Field stripped')
+        : kind
+
+  return (
+    <SettingsGroup
+      icon={BrainIcon}
+      title={t('从上游学到的规则', 'Rules learned from upstream')}
+      description={t(
+        '上游用 400 点名过的组合会被记下来：某模型不收某取值的，下次本地直接拒；某模型已废弃某参数的，下次转发前剥掉。规则落库、重启保留，7 天后自动丢弃重新验证。上游放开了而本地还在拦时，在这里删掉即可。',
+        'Combinations the upstream rejected with a 400 are remembered: a value a model refuses is rejected locally next time; a parameter a model deprecated is stripped before forwarding. Rules persist across restarts and expire after 7 days. If upstream has since allowed something, remove the rule here.',
+      )}
+    >
+      {query.isPending ? (
+        <div className="flex items-center gap-2 p-5 text-sm text-muted-foreground">
+          <Spinner />
+          {t('正在加载', 'Loading')}
+        </div>
+      ) : query.isError ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 p-5 text-sm">
+          <span className="text-destructive">{extractError(query.error, language)}</span>
+          <Button size="xs" variant="outline" onClick={() => query.refetch()}>
+            {t('重试', 'Retry')}
+          </Button>
+        </div>
+      ) : rows.length === 0 ? (
+        <p className="p-5 text-sm text-muted-foreground">
+          {t('还没有学到任何规则。', 'No rules have been learned yet.')}
+        </p>
+      ) : (
+        <>
+          <ul className="divide-y" role="list">
+            {rows.map((row) => (
+              <li
+                key={`${row.kind}:${row.model}:${row.field}:${row.value}`}
+                className="flex items-start justify-between gap-3 p-4"
+              >
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <Badge size="sm" variant={row.kind === 'shape' ? 'error' : 'info'}>
+                      {kindLabel(row.kind)}
+                    </Badge>
+                    <span className="font-medium [overflow-wrap:anywhere]">{row.model}</span>
+                    <code className="rounded bg-muted px-1.5 py-0.5 text-xs [overflow-wrap:anywhere]">
+                      {row.value ? `${row.field} = '${row.value}'` : row.field}
+                    </code>
+                  </div>
+                  {row.message && (
+                    <p className="text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]" title={row.message}>
+                      {row.message}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    {t('学到于', 'Learned')} {formatFullTime(row.learned_at, language)}
+                    {' · '}
+                    {t('到期', 'Expires')} {formatFullTime(row.expires_at, language)}
+                  </p>
+                </div>
+                <Button
+                  aria-label={t('删除这条规则', 'Remove this rule')}
+                  title={t('删除这条规则', 'Remove this rule')}
+                  size="icon"
+                  variant="ghost"
+                  className="shrink-0"
+                  disabled={forget.isPending}
+                  onClick={() => forget.mutate(row)}
+                >
+                  <Trash2Icon />
+                </Button>
+              </li>
+            ))}
+          </ul>
+          <div className="flex items-center justify-between gap-3 p-4">
+            <p className="text-xs text-muted-foreground">
+              {t(`共 ${rows.length} 条`, `${rows.length} rule${rows.length === 1 ? '' : 's'}`)}
+            </p>
+            <Button size="xs" variant="outline" onClick={() => setConfirmClear(true)}>
+              <Trash2Icon />
+              {t('全部清空', 'Clear all')}
+            </Button>
+          </div>
+          <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
+            <AlertDialogPopup>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{t('清空学到的规则', 'Clear learned rules')}</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t(
+                    `将删除全部 ${rows.length} 条规则。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
+                    `All ${rows.length} rules will be removed. The same combinations will be sent upstream once more and re-learned if rejected.`,
+                  )}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
+                <Button variant="destructive" loading={clear.isPending} onClick={() => clear.mutate()}>
+                  {t('清空', 'Clear')}
+                </Button>
+              </AlertDialogFooter>
+            </AlertDialogPopup>
+          </AlertDialog>
+        </>
+      )}
+    </SettingsGroup>
   )
 }

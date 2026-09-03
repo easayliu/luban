@@ -301,10 +301,15 @@ pub async fn handle(
     //       off = 不做静态预置处理（运行时学习仍兜底）。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
     let sampling_policy = state.store.sampling_policy();
+    // reject 策略下静态名单与学到的组合一视同仁：都是「这个模型不收这个参数」的既定事实。
     let body = if sampling_policy == store::PrefillPolicy::Reject
-        && req_model.as_deref().is_some_and(model_rejects_sampling)
-        && has_deprecated_sampling_field(body_json.as_ref())
-    {
+        && ((req_model.as_deref().is_some_and(model_rejects_sampling)
+            && has_deprecated_sampling_field(body_json.as_ref()))
+            || has_learned_deprecated_field(
+                &state.deprecated_fields,
+                req_model.as_deref(),
+                body_json.as_ref(),
+            )) {
         tracing::info!(
             model = %req_model.as_deref().unwrap_or("-"),
             ua = %client_ua,
@@ -1015,18 +1020,22 @@ pub async fn handle(
                     );
                 }
                 if !compressed && status == StatusCode::BAD_REQUEST {
-                    remember_shape_rejection(
+                    let mut learned = remember_shape_rejection(
                         &state.shape_rejections,
                         req_model.as_deref(),
                         body_json.as_ref(),
                         &err_bytes,
                     );
-                    remember_deprecated_field(
+                    learned.extend(remember_deprecated_field(
                         &state.deprecated_fields,
                         req_model.as_deref(),
                         body_json.as_ref(),
                         &err_bytes,
-                    );
+                    ));
+                    // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
+                    if let Err(e) = state.store.remember_rejections(&learned) {
+                        tracing::warn!(error = %e, "persisting learned rejections failed (kept in memory)");
+                    }
                 }
                 if !compressed && is_third_party_rejection(&err_bytes) {
                     log_third_party_rejection(&sent, &upstream.headers, &cred, status);
@@ -4278,10 +4287,77 @@ type ShapeRejections = std::collections::HashMap<(String, &'static str, String),
 
 /// [`ShapeRejections`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
 ///
-/// **只在进程内活着，不落库**：这是从上游报错里学来的推断，重启后重新学一遍的代价不过是
-/// 一次 400；反过来，把一条学错/过期的规则持久化下去，就成了「本地永久拒掉一个其实已经
-/// 支持的取值」——那才是查不出来的故障。
+/// 进程内以这张表为准；学到新条目时**写穿**到 `learned_rejections` 表，启动时由
+/// [`seed_learned_memories`] 读回来，重启不必每种组合再撞一次 400。
+///
+/// 持久化的风险是「本地永久拒掉一个其实已经支持的取值」——这是从一条报错里学来的推断，
+/// 上游放开了本地没有信号能知道。两道闸：落库的条目只活 7 天
+/// （[`store::LEARNED_REJECTION_TTL_SECS`]），到期丢掉重学；控制台可整表清空
+/// （`DELETE /api/learned-rejections`）。
 pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
+
+/// `learned_rejections.kind` 的两个取值，见 [`store::LearnedRejection`]。
+pub const LEARNED_KIND_SHAPE: &str = "shape";
+pub const LEARNED_KIND_DEPRECATED: &str = "deprecated";
+
+/// 从两张进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
+pub fn forget_learned_memory(
+    shape: &ShapeMemory,
+    deprecated: &DeprecatedFieldMemory,
+    r: &store::LearnedRejection,
+) -> bool {
+    match r.kind.as_str() {
+        LEARNED_KIND_SHAPE => {
+            let Some(probe) = SHAPE_PROBES.iter().find(|p| p.field == r.field) else {
+                return false;
+            };
+            shape.write().remove(&(r.model.clone(), probe.field, r.value.clone())).is_some()
+        }
+        LEARNED_KIND_DEPRECATED => {
+            deprecated.write().remove(&(r.model.clone(), r.field.clone())).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// 启动时把落库的规则读回两张进程内记忆表，返回 `(形态条数, 废弃字段条数)`。
+///
+/// 形态那类的 `field` 必须能对回 [`SHAPE_PROBES`] 里的某个探针（键里是 `&'static str`）；
+/// 对不上的（旧版本学的、后来删掉的探针）直接跳过，不会因为一行脏数据拒绝启动。
+pub fn seed_learned_memories(
+    shape: &ShapeMemory,
+    deprecated: &DeprecatedFieldMemory,
+    rows: Vec<store::LearnedRejection>,
+) -> (usize, usize) {
+    let (mut n_shape, mut n_dep) = (0, 0);
+    let mut shape_table = shape.write();
+    let mut dep_table = deprecated.write();
+    for r in rows {
+        match r.kind.as_str() {
+            LEARNED_KIND_SHAPE => {
+                let Some(probe) = SHAPE_PROBES.iter().find(|p| p.field == r.field) else {
+                    continue;
+                };
+                if shape_table.len() >= SHAPE_MEMORY_CAP {
+                    continue;
+                }
+                shape_table.entry((r.model, probe.field, r.value)).or_insert(r.message);
+                n_shape += 1;
+            }
+            LEARNED_KIND_DEPRECATED => {
+                if !DEPRECATABLE_FIELDS.contains(&r.field.as_str())
+                    || dep_table.len() >= SHAPE_MEMORY_CAP
+                {
+                    continue;
+                }
+                dep_table.entry((r.model, r.field)).or_insert(r.message);
+                n_dep += 1;
+            }
+            _ => {}
+        }
+    }
+    (n_shape, n_dep)
+}
 
 // ── 已废弃字段的自动剥离 ──────────────────────────────────────────────
 //
@@ -4303,8 +4379,8 @@ const DEPRECATABLE_FIELDS: &[&str] = &["temperature", "top_p", "top_k"];
 /// 上游拒过的「模型 + 已废弃字段」→ 上游那句原话（只做日志，不回放）。
 type DeprecatedFieldRejections = std::collections::HashMap<(String, String), String>;
 
-/// [`DeprecatedFieldRejections`] 的共享句柄。与 [`ShapeMemory`] 一样只活在进程内，
-/// 重启代价不过是每种组合再撞一次 400。
+/// [`DeprecatedFieldRejections`] 的共享句柄。与 [`ShapeMemory`] 同一套持久化：写穿到
+/// `learned_rejections`、启动回填、7 天保鲜。
 pub type DeprecatedFieldMemory = std::sync::Arc<parking_lot::RwLock<DeprecatedFieldRejections>>;
 
 /// 拒绝日志的抑制表：键（`device:<id>` / `session:<id>`）→ (上次真打了日志的时刻, 从那以后
@@ -4495,19 +4571,22 @@ const SHAPE_MEMORY_CAP: usize = 512;
 ///
 /// 记忆按**请求里写的那个模型名**索引（别名与全名各算一格）：客户端每次发的是同一串，
 /// 拿它当键既够用，又不会把某个模型学到的结论套到别的模型头上。
+///
+/// 返回**这次新学到**的条目（已知的不算），调用方拿去落库；空 Vec 即什么也没学到。
 fn remember_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
     err: &[u8],
-) {
+) -> Vec<store::LearnedRejection> {
+    let mut learned = Vec::new();
     // 认不出模型名、或请求体不是 JSON：这条 400 照常透传给客户端，只是学不到东西。
-    let (Some(model), Some(body)) = (model, body) else { return };
+    let (Some(model), Some(body)) = (model, body) else { return learned };
     let (_, message) = parse_upstream_error(err);
     let hay = message.to_lowercase();
     // 条件句一律不学：这条 400 说的是「在某某前提下不行」，不是「这个取值不行」。
     if CONDITIONAL_MARKS.iter().any(|m| hay.contains(m)) {
-        return;
+        return learned;
     }
     for probe in SHAPE_PROBES {
         if !hay.contains(probe.keyword) {
@@ -4524,6 +4603,13 @@ fn remember_shape_rejection(
                 continue;
             }
             table.insert(key, message.clone());
+            learned.push(store::LearnedRejection {
+                kind: LEARNED_KIND_SHAPE.into(),
+                model: model.to_string(),
+                field: probe.field.to_string(),
+                value: value.clone(),
+                message: message.clone(),
+            });
             tracing::info!(
                 model = %model,
                 field = %probe.field,
@@ -4532,6 +4618,7 @@ fn remember_shape_rejection(
             );
         }
     }
+    learned
 }
 
 /// 上游的 400 里出现 `` `字段名` `` + `deprecated` → 记进 [`DeprecatedFieldMemory`]，
@@ -4540,19 +4627,22 @@ fn remember_shape_rejection(
 /// 典型上游原文：`` `temperature` is deprecated for this model. ``
 /// 判据是「`deprecated` 出现 + 反引号包裹的字段名与请求里确实存在的顶层键匹配」，
 /// 两项**共现**才认——单看 `deprecated` 会误伤，单看反引号里的串可能碰巧。
+///
+/// 返回**这次新学到**的条目，调用方拿去落库（同 [`remember_shape_rejection`]）。
 fn remember_deprecated_field(
     mem: &DeprecatedFieldMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
     err: &[u8],
-) {
-    let (Some(model), Some(body)) = (model, body) else { return };
+) -> Vec<store::LearnedRejection> {
+    let mut learned = Vec::new();
+    let (Some(model), Some(body)) = (model, body) else { return learned };
     let (_, message) = parse_upstream_error(err);
     let hay = message.to_lowercase();
     if !hay.contains("deprecated") {
-        return;
+        return learned;
     }
-    let Some(obj) = body.as_object() else { return };
+    let Some(obj) = body.as_object() else { return learned };
     for &field in DEPRECATABLE_FIELDS {
         if !obj.contains_key(field) {
             continue;
@@ -4566,12 +4656,37 @@ fn remember_deprecated_field(
             continue;
         }
         table.insert(key, message.clone());
+        learned.push(store::LearnedRejection {
+            kind: LEARNED_KIND_DEPRECATED.into(),
+            model: model.to_string(),
+            field: field.to_string(),
+            value: String::new(),
+            message: message.clone(),
+        });
         tracing::info!(
             model = %model,
             field = %field,
             "learned a deprecated-field rejection; the field will be stripped for this model from now on"
         );
     }
+    learned
+}
+
+/// 请求体里是否带了**这个模型已学到**的废弃字段（不看静态名单）。`sampling_policy=reject`
+/// 时用：学到的组合也该本地拒，否则设置项名不副实——只拒名单里的、放过学到的。
+fn has_learned_deprecated_field(
+    mem: &DeprecatedFieldMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> bool {
+    let (Some(model), Some(obj)) = (model, body.and_then(|v| v.as_object())) else { return false };
+    let table = mem.read();
+    if table.is_empty() {
+        return false;
+    }
+    DEPRECATABLE_FIELDS
+        .iter()
+        .any(|&f| obj.contains_key(f) && table.contains_key(&(model.to_string(), f.to_string())))
 }
 
 /// 请求体里是否带了 [`DEPRECATABLE_FIELDS`] 中的任何一项——用已解析的 `body_json` 判，零开销。
@@ -9795,6 +9910,92 @@ mod tests {
         json_body(&format!(
             r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"top_p":0.9}}"#
         ))
+    }
+
+    /// 学到的规则能落库再读回：两个 remember_* 返回新学到的条目（重复不算），
+    /// `seed_learned_memories` 把它们放回两张表，对不上探针/名单的脏行跳过。
+    #[test]
+    fn learned_rejections_round_trip_through_seed() {
+        let shape = super::ShapeMemory::default();
+        let dep = super::DeprecatedFieldMemory::default();
+        let body = serde_json::json!({
+            "model": "claude-opus-5", "temperature": 0.7,
+            "output_config": {"effort": "xhigh"}, "messages": []
+        });
+        let learned_shape = super::remember_shape_rejection(
+            &shape,
+            Some("claude-opus-5"),
+            Some(&body),
+            &err_json(EFFORT_400),
+        );
+        assert_eq!(learned_shape.len(), 1, "{learned_shape:?}");
+        assert_eq!(
+            (
+                learned_shape[0].kind.as_str(),
+                learned_shape[0].field.as_str(),
+                learned_shape[0].value.as_str()
+            ),
+            ("shape", "effort", "xhigh")
+        );
+        // 再学一次同一条：表里已有，不再返回。
+        assert!(
+            super::remember_shape_rejection(
+                &shape,
+                Some("claude-opus-5"),
+                Some(&body),
+                &err_json(EFFORT_400)
+            )
+            .is_empty()
+        );
+        let learned_dep = super::remember_deprecated_field(
+            &dep,
+            Some("claude-opus-5"),
+            Some(&body),
+            &err_json(TEMP_400),
+        );
+        assert_eq!(learned_dep.len(), 1, "{learned_dep:?}");
+        assert_eq!(
+            (
+                learned_dep[0].kind.as_str(),
+                learned_dep[0].field.as_str(),
+                learned_dep[0].value.as_str()
+            ),
+            ("deprecated", "temperature", "")
+        );
+
+        // 模拟重启：空表 + 从「库里」读回的行（多两条对不上的脏行）。
+        let mut rows: Vec<store::LearnedRejection> =
+            learned_shape.into_iter().chain(learned_dep).collect();
+        rows.push(store::LearnedRejection {
+            kind: "shape".into(),
+            model: "m".into(),
+            field: "no_such_probe".into(),
+            value: "v".into(),
+            message: String::new(),
+        });
+        rows.push(store::LearnedRejection {
+            kind: "deprecated".into(),
+            model: "m".into(),
+            field: "model".into(),
+            value: String::new(),
+            message: String::new(),
+        });
+        let shape2 = super::ShapeMemory::default();
+        let dep2 = super::DeprecatedFieldMemory::default();
+        assert_eq!(super::seed_learned_memories(&shape2, &dep2, rows), (1, 1));
+        let hit = super::known_shape_rejection(&shape2, Some("claude-opus-5"), Some(&body))
+            .expect("形态规则应已回填");
+        assert_eq!((hit.0, hit.1.as_str()), ("effort", "xhigh"));
+        assert!(super::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&body)));
+        assert!(
+            !super::has_learned_deprecated_field(&dep2, Some("claude-sonnet-5"), Some(&body)),
+            "别的模型不受影响"
+        );
+        let no_temp = serde_json::json!({ "model": "claude-opus-5", "messages": [] });
+        assert!(
+            !super::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&no_temp)),
+            "请求里没带那个字段就不算"
+        );
     }
 
     /// 已知模型（4.7+）即使没学过也会主动剥掉 sampling 参数。

@@ -341,3 +341,40 @@ export async function importAll(
   })
   return data
 }
+
+/**
+ * 从上游 400 学到的一条规则（`GET /api/learned-rejections`）。
+ * `shape`：某模型不收某字段的某取值（如 effort 'xhigh'），命中本地直接拒；
+ * `deprecated`：某模型已废弃某字段（如 temperature），命中转发前剥掉。
+ * 规则落库、重启保留，7 天后自动丢弃重学；这里的删除是提前放行的逃生口。
+ */
+export interface LearnedRejection {
+  kind: 'shape' | 'deprecated' | (string & {})
+  model: string
+  field: string
+  /** 形态规则被拒的取值；废弃字段规则为空串。 */
+  value: string
+  /** 上游原话。 */
+  message: string
+  learned_at: number
+  expires_at: number
+}
+
+export async function listLearnedRejections(): Promise<LearnedRejection[]> {
+  const { data } = await api.get<LearnedRejection[]>('/learned-rejections')
+  return data
+}
+
+/** 删一条；返回删后的完整列表。 */
+export async function forgetLearnedRejection(
+  row: Pick<LearnedRejection, 'kind' | 'model' | 'field' | 'value'>,
+): Promise<LearnedRejection[]> {
+  const { data } = await api.post<LearnedRejection[]>('/learned-rejections/delete', row)
+  return data
+}
+
+/** 全部清空；返回删掉的条数。 */
+export async function clearLearnedRejections(): Promise<number> {
+  const { data } = await api.delete<{ deleted: number }>('/learned-rejections')
+  return data.deleted
+}
