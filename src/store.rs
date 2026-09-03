@@ -757,6 +757,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM credential_stats WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM device_costs WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM model_denials WHERE cred_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM credentials WHERE id = ?1", [id])?;
         tx.commit()?;
         // 号没了，它的限流窗口与冷却也留着没用（id 不会被复用，见 migrates_and_stops_id_reuse）。
@@ -775,6 +776,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM device_bindings", [])?;
         tx.execute("DELETE FROM credential_stats", [])?;
         tx.execute("DELETE FROM device_costs", [])?;
+        tx.execute("DELETE FROM model_denials", [])?;
         let n = tx.execute("DELETE FROM credentials", [])?;
         tx.commit()?;
         Ok(n)
@@ -1088,12 +1090,14 @@ impl CredentialStore {
             let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
             let mut stats = tx.prepare("DELETE FROM credential_stats WHERE cred_id = ?1")?;
             let mut costs = tx.prepare("DELETE FROM device_costs WHERE cred_id = ?1")?;
+            let mut denials = tx.prepare("DELETE FROM model_denials WHERE cred_id = ?1")?;
             let mut cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
             for id in ids {
                 logs.execute([id])?;
                 binds.execute([id])?;
                 stats.execute([id])?;
                 costs.execute([id])?;
+                denials.execute([id])?;
                 n += cred.execute([id])?;
             }
         }
@@ -1800,6 +1804,23 @@ impl CredentialStore {
             [],
         )?;
         Ok(())
+    }
+
+    /// 限流暂停中、且**不在** `denied` 里的号里最早的 `resume_at`；没有这样的号则 `None`。
+    /// 选号时用，调用方已持锁。
+    fn soonest_paused_resume(conn: &Connection, denied: &HashSet<i64>) -> Result<Option<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, resume_at FROM credentials WHERE disabled = 1 AND resume_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut soonest: Option<i64> = None;
+        for row in rows {
+            let (id, at) = row?;
+            if !denied.contains(&id) {
+                soonest = Some(soonest.map_or(at, |s| s.min(at)));
+            }
+        }
+        Ok(soonest)
     }
 
     /// 被判过不支持 `model` 的号（已到期的不算）。选号时用，调用方已持锁。
@@ -3901,29 +3922,35 @@ impl CredentialStore {
             anyhow::bail!("no available credentials; add an account first");
         }
 
+        // 上游判过「套餐不含这个模型」的号先出局（见 [`Self::deny_model`]）：这不是等一会就好
+        // 的事，也不该拿去撞。**所有启用号**都被判过才是「换模型」——这一判必须排在下面「排除
+        // 已试过的号」之前：换号重试时刚被判的那个号就在 `exclude` 里，先排除再看会把它漏数，
+        // 单个 Pro 号的池子永远报不出这条、只会把上游 429 原样透传。
+        //
+        // 但先看有没有**只是被限流暂停**（`disabled = 1` 且 `resume_at` 非空）且没被判过的号：
+        // 那是「等一会」不是「换模型」——两小时后回来的 Max 号被说成不存在、客户端拿着 403 去
+        // 换模型，比一发带恢复时刻的 429 糟得多。
+        let denied: HashSet<i64> = match model {
+            Some(m) => Self::denied_creds_for(&conn, m)?,
+            None => HashSet::new(),
+        };
+        if let Some(m) = model
+            && all.iter().all(|c| denied.contains(&c.id))
+        {
+            if let Some(at) = Self::soonest_paused_resume(&conn, &denied)? {
+                let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
+                return Err(AllRateLimited { retry_after_secs }.into());
+            }
+            return Err(ModelUnsupported { model: m.to_string(), accounts: all.len() }.into());
+        }
         // 本次请求已经试过的号（上游 429 换号重试时传进来）直接出局——重试再撞同一个号毫无意义。
-        let pool: Vec<Credential> = all.into_iter().filter(|c| !exclude.contains(&c.id)).collect();
+        let mut pool = all;
+        pool.retain(|c| !exclude.contains(&c.id) && !denied.contains(&c.id));
         if pool.is_empty() {
             anyhow::bail!(
                 "no other available credentials remain after excluding those already tried"
             );
         }
-        // 上游判过「套餐不含这个模型」的号先出局（见 [`Self::deny_model`]）：这不是等一会就好
-        // 的事，也不该拿去撞。**全都被判过**就直接告诉客户端换模型，别把它包装成 429。
-        let denied: HashSet<i64> = match model {
-            Some(m) => Self::denied_creds_for(&conn, m)?,
-            None => HashSet::new(),
-        };
-        let pool: Vec<Credential> = {
-            let usable: Vec<Credential> =
-                pool.iter().filter(|c| !denied.contains(&c.id)).cloned().collect();
-            if usable.is_empty()
-                && let Some(m) = model
-            {
-                return Err(ModelUnsupported { model: m.to_string(), accounts: pool.len() }.into());
-            }
-            usable
-        };
         // 冷却中的号让位给还能用的；**全部都在冷却就直接拒**——冷却是硬门禁，被上游 429 过的
         // 号在解冻前一律不调度。等待时间取最早解冻的那个，客户端照它重试即可。
         let creds: Vec<Credential> =
@@ -4016,8 +4043,9 @@ impl CredentialStore {
         // fable/mythos 这类只有高档套餐才含的模型，同一优先级档内 Max 号排前面，等级未知的
         // 其次，Pro/Free 垫底。**只排序不剔除**：准入以上游的判决为准（见上面的 denied），
         // 这里猜错也只是多换一次号；而排在前面能让绝大多数请求第一发就落在能用的号上。
+        let premium = model.is_some_and(premium_model);
         let plan_rank = |c: &Credential| -> u8 {
-            if !model.is_some_and(premium_model) {
+            if !premium {
                 return 0;
             }
             match c.tier.as_deref() {
@@ -5462,6 +5490,58 @@ mod tests {
         let u = err.downcast_ref::<ModelUnsupported>().expect("应是 ModelUnsupported");
         assert_eq!(u.accounts, 2);
         assert!(store.select_for_device(Select::default()).is_ok(), "不带模型的请求不受影响");
+
+        // 换号重试的形态：唯一的号刚被判过、同时也在 exclude 里——仍必须报 ModelUnsupported，
+        // 而不是「排除后没号了」那条普通错误（那条会让转发环把上游 429 原样透传）。
+        let (store, ids) = store_with(&["only"]);
+        store.deny_model(ids[0], "claude-fable-5", "plan", None).unwrap();
+        let err = store
+            .select_for_device(Select {
+                model: Some("claude-fable-5"),
+                exclude: &[ids[0]],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.downcast_ref::<ModelUnsupported>().is_some(), "{err}");
+    }
+
+    /// 全部启用号都被判过、但还有一个只是限流暂停的 Max 号：那是「等一会」不是「换模型」，
+    /// 报 AllRateLimited + 它的恢复时刻，不能回 403 把两小时后回来的号说成不存在。
+    #[test]
+    fn paused_capable_account_turns_all_denied_into_rate_limited() {
+        let (store, ids) = store_with(&["pro", "max"]);
+        let (pro, max) = (ids[0], ids[1]);
+        store.deny_model(pro, "claude-fable-5", "plan", None).unwrap();
+        let resume_at = crate::credentials::now_secs() + 7200;
+        store.pause_for_rate_limit(max, "quota", resume_at).unwrap();
+        let sel = || {
+            store.select_for_device(Select { model: Some("claude-fable-5"), ..Default::default() })
+        };
+        let err = sel().unwrap_err();
+        let rl = err.downcast_ref::<AllRateLimited>().expect("应是 AllRateLimited");
+        assert!(
+            rl.retry_after_secs > 7000 && rl.retry_after_secs <= 7200,
+            "{}",
+            rl.retry_after_secs
+        );
+        // 暂停的那个号自己也被判过 → 真的没号能用，才是 ModelUnsupported。
+        store.deny_model(max, "claude-fable-5", "plan", None).unwrap();
+        assert!(sel().unwrap_err().downcast_ref::<ModelUnsupported>().is_some());
+    }
+
+    /// 删号连带清掉它的准入记录，别留孤儿行。
+    #[test]
+    fn deleting_a_credential_drops_its_denials() {
+        let (store, ids) = store_with(&["a", "b", "c"]);
+        for id in &ids {
+            store.deny_model(*id, "claude-fable-5", "plan", None).unwrap();
+        }
+        assert!(store.delete(ids[0]).unwrap());
+        assert_eq!(store.delete_many(&ids[1..2]).unwrap(), 1);
+        let left = store.all_model_denials().unwrap();
+        assert_eq!(left.keys().copied().collect::<Vec<_>>(), vec![ids[2]]);
+        store.clear().unwrap();
+        assert!(store.all_model_denials().unwrap().is_empty());
     }
 
     /// 到期的记录不再挡选号，且读列表时顺手清掉。

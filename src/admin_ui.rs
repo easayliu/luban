@@ -17,9 +17,6 @@ use tower_http::compression::{
 #[folder = "admin-ui/dist"]
 struct Asset;
 
-/// 将误发到首页的 POST 文档导航转换为 GET，避免浏览器刷新时要求重新提交表单。
-///
-/// 固定跳回 `/`，不复用请求体或查询参数；真正的 API POST 会先被主路由匹配，不会走这里。
 /// 静态资源的响应压缩层——只挂在前端这几条路由上，**不能**套到 `/v1/*`：
 /// 那边是 SSE 流式转发，中间压一层会把逐块下发攒成整包，客户端看到的就是"卡到最后一起出"。
 ///
@@ -34,6 +31,9 @@ pub fn compression() -> CompressionLayer<impl Predicate> {
         .compress_when(DefaultPredicate::new().and(NotForContentType::new("font/")))
 }
 
+/// 将误发到首页的 POST 文档导航转换为 GET，避免浏览器刷新时要求重新提交表单。
+///
+/// 固定跳回 `/`，不复用请求体或查询参数；真正的 API POST 会先被主路由匹配，不会走这里。
 pub async fn redirect_root_post() -> Redirect {
     Redirect::to("/")
 }

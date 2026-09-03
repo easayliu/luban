@@ -990,6 +990,16 @@ export function ConnectivityTestDialog({
   const [model, setModel] = useState<string>(
     () => PROBE_MODELS.find((m) => !isDenied(m)) ?? PROBE_MODELS[0],
   )
+  // 弹窗由 DeferredMount 首次打开后一直挂着，上面的初始值只算一次；之后学到的「套餐不含」
+  // 要在**再次打开**时把已选中的必败项换掉。用户自己手选的、没被判过的模型不动。
+  useEffect(() => {
+    if (!open) return
+    setModel((current) =>
+      deniedKeys.has(modelDenialKey(current))
+        ? PROBE_MODELS.find((m) => !deniedKeys.has(modelDenialKey(m))) ?? PROBE_MODELS[0]
+        : current,
+    )
+  }, [open, deniedKeys])
   const [entries, setEntries] = useState<ProbeEntry[]>([])
   const seq = useRef(0)
   const session = useRef(0)

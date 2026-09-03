@@ -106,7 +106,8 @@ function useSettingsPrefetch(ready: boolean) {
     if (!ready) return
     const run = () => {
       void loadSettingsPage()
-      void qc.prefetchQuery({ queryKey: ['settings'], queryFn: getSettings })
+      // 每次从设置页回到账号页 ready 都会再翻一次 true；一分钟内的预取结果直接复用，别重复打接口。
+      void qc.prefetchQuery({ queryKey: ['settings'], queryFn: getSettings, staleTime: 60_000 })
     }
     // Safari 没有 requestIdleCallback，退回一个短延时，别抢首屏渲染。
     if (typeof window.requestIdleCallback === 'function') {

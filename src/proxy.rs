@@ -661,28 +661,45 @@ pub async fn handle(
                 let _ = state.store.mark_banned(cred.id, &reason);
                 tried.push(cred.id);
                 if retried < max_retry {
-                    if let Ok((next_token, next_cred)) = store::valid_access_token_for_device(
+                    match store::valid_access_token_for_device(
                         &state.store,
                         &state.clients,
                         select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
                     )
                     .await
                     {
-                        tracing::info!(
+                        Ok((next_token, next_cred)) => {
+                            tracing::info!(
+                                cred_id = cred.id, cred = %cred.label,
+                                to_cred_id = next_cred.id,
+                                to_cred = %next_cred.label,
+                                attempt = retried + 1,
+                                "401 credential swap: retrying with another credential"
+                            );
+                            (token, cred) = (next_token, next_cred);
+                            retried += 1;
+                            continue;
+                        }
+                        // 剩下的号全都被判过「套餐不含这个模型」：把上游那发 401 透传出去会让
+                        // 客户端以为是自己的鉴权坏了；与首发选号那条路一样回 403 让它换模型。
+                        Err(e) if e.downcast_ref::<store::ModelUnsupported>().is_some() => {
+                            tracing::warn!(
+                                cred_id = cred.id, cred = %cred.label,
+                                error = %e,
+                                "401 swap: no enabled account can use this model, answering 403"
+                            );
+                            return error_response(
+                                StatusCode::FORBIDDEN,
+                                "permission_error",
+                                e.to_string(),
+                            );
+                        }
+                        Err(e) => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
-                            to_cred_id = next_cred.id,
-                            to_cred = %next_cred.label,
-                            attempt = retried + 1,
-                            "401 credential swap: retrying with another credential"
-                        );
-                        (token, cred) = (next_token, next_cred);
-                        retried += 1;
-                        continue;
+                            error = %e,
+                            "401 but no credential to swap to, passing through as is"
+                        ),
                     }
-                    tracing::warn!(
-                        cred_id = cred.id, cred = %cred.label,
-                        "401 but no credential to swap to, passing through as is"
-                    );
                 }
             }
             // 没换号（判定不命中或换不到号）：body 已消费，就地透传。
@@ -4391,6 +4408,8 @@ const MODEL_DENIAL_MAX_SWAPS: usize = 4;
 
 /// 这个号是不是 Max 档（个人 Max，或团队/企业号拿的 Max 额度档——两者 `tier` 都以 `Max` 开头，
 /// 见 `crate::oauth::tier_from`）。等级未知按「不是」算：那时唯一的信息来源是上游的判决。
+/// 只有 Max 含 fable/mythos，其余等级撞到那形态的 429 都记「套餐不含」，见
+/// [`LimitScope::Unsupported`]。
 fn is_max_plan(cred: &crate::credentials::Credential) -> bool {
     cred.tier.as_deref().is_some_and(|t| t.starts_with("Max"))
 }
@@ -6420,14 +6439,15 @@ enum LimitScope {
     /// 开 extra usage。故它既不打冷却也不停号，而是落一条准入记录
     /// （[`store::CredentialStore::deny_model`]）并**换号重发**，之后的选号直接绕开这一格。
     ///
-    /// **只给「fable/mythos 且账号等级不是 Max」**（[`store::premium_model`] + 等级）：这是唯一
-    /// 能把这形态解读成「套餐不含」的组合。其余组合见 [`Self::OverageDisabled`]。
+    /// **只给「fable/mythos 且账号等级不是 Max」**（[`store::premium_model`] + [`is_max_plan`]）：
+    /// 这是唯一能把这形态解读成「套餐不含」的组合。其余组合见 [`Self::OverageDisabled`]。
     Unsupported(String),
     /// 形态与 [`Self::Unsupported`] 相同（无窗口、只说 credits 被组织关了），但**不能**解读成
     /// 「套餐不含」：请求的是所有付费套餐都含的基础模型（线上 sonnet-4-6 撞出过），或账号本就是
-    /// Max。它也不代表撞了上限——头里没有任何窗口说满了。上游到底为什么把这一发记到 credits
-    /// 上不可知，所以只做最小动作：该号该模型短冷却（默认 30 秒，同超额池那档的兜底值），
-    /// 本条请求换号重发。不落库、不停号、不记准入。
+    /// Max。它也不代表撞了上限——头里没有任何窗口说
+    /// 满了。上游到底为什么把这一发记到 credits 上不可知，所以只做最小动作：该号该模型短冷却
+    /// （同瞬时那档：吃 `retry-after` 但不超 60 秒，没给就 30 秒），本条请求换号重发。
+    /// 不落库、不停号、不记准入。
     OverageDisabled(String),
 }
 
@@ -6498,14 +6518,16 @@ impl LimitScope {
 /// 的循环——那是早年时长不认 `retry-after` 的锅，不是作用域的。请求体里读不出模型名时
 /// 退回账号级——没有模型可挂，宁可保守。
 ///
-/// 生产路径都走 [`rate_limit_scope_for`]（要带账号等级）；这个两参数的形态只剩测试在用。
+/// 生产路径都走 [`rate_limit_scope_for`]（要带账号等级）；这个两参数的形态只剩测试在用，
+/// 按「一个非 Max 号」解读。
 #[cfg(test)]
 fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> LimitScope {
     rate_limit_scope_for(info, model, false)
 }
 
-/// 同 [`rate_limit_scope`]，多一个「这个号是 Max 档吗」：只影响「无窗口 + overage 被关」那一档
-/// 的解读——Max 号的 fable 不可能是「套餐不含」，见 [`LimitScope::OverageDisabled`]。
+/// 同 [`rate_limit_scope`]，多一个「这个号是 Max 档吗」（见 [`is_max_plan`]）：只影响「无窗口 +
+/// overage 被关」那一档的解读——Max 号的 fable 不可能是「套餐不含」，见
+/// [`LimitScope::OverageDisabled`]。
 fn rate_limit_scope_for(info: &RateLimitInfo, model: Option<&str>, max_plan: bool) -> LimitScope {
     let Some(model) = model else { return LimitScope::Account };
     let rejected = |s: &str| s.contains("rate_limited") || s.contains("rejected");
@@ -6946,7 +6968,10 @@ impl RateLimitInfo {
     /// 分派，调用方不必自己记「哪一档该传什么」。
     fn cooldown_for(&self, scope: &LimitScope) -> std::time::Duration {
         match scope {
-            LimitScope::Transient(_) => self.transient_cooldown(),
+            // 说不清的拒绝同瞬时那档：吃 `retry-after` 但夹在 60 秒以内——这形态不代表撞上限，
+            // 上游若顺手给了个按额度窗口算的大 retry-after，照单全收就把一个健康号的这个模型
+            // 锁掉几天。
+            LimitScope::Transient(_) | LimitScope::OverageDisabled(_) => self.transient_cooldown(),
             // 套餐不含的模型不走冷却（落的是准入记录），这里没有可睡的时长。
             LimitScope::Unsupported(_) => std::time::Duration::ZERO,
             _ => self.cooldown(scope.account_level()),
@@ -11257,6 +11282,16 @@ mod tests {
         assert_eq!(
             super::rate_limit_scope_for(&odd, Some("claude-fable-5-1[1m]"), false).label(),
             "unsupported"
+        );
+        // 这一档即便上游顺手给了个巨大的 retry-after，也夹在瞬时上限内——它不代表撞上限。
+        let with_retry = hdr(&[
+            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            ("retry-after", "304802"),
+        ]);
+        let scope = super::rate_limit_scope_for(&with_retry, Some(sonnet), false);
+        assert_eq!(
+            with_retry.cooldown_for(&scope).as_secs() as i64,
+            super::MAX_TRANSIENT_COOLDOWN_SECS
         );
     }
 
