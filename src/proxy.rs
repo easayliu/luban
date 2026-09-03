@@ -288,7 +288,7 @@ pub async fn handle(
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            &format!(
+            format!(
                 "{loc}: content type 'image_url' is not supported by the Anthropic API; \
                  use {{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"...\"}}}} \
                  or {{\"type\":\"image\",\"source\":{{\"type\":\"url\",\"url\":\"...\"}}}}"
@@ -1086,12 +1086,10 @@ pub async fn handle(
                 if status == StatusCode::BAD_REQUEST
                     && !compressed
                     && is_prefill_not_supported_error(&err_bytes)
-                {
-                    if let Some(up) =
+                    && let Some(up) =
                         retry_without_prefill(&upstream, &cred, &device_fp, &body, &mut rl).await
-                    {
-                        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
-                    }
+                {
+                    return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
                 }
                 let err_bytes = match &tool_names {
                     Some(map) => Bytes::from(map.restore(&err_bytes)),
@@ -2827,6 +2825,9 @@ fn session_rpm_rejection(
 
 /// 会话并发在途超限那条 429。retry-after 给 1 秒：并发上限不像 RPM 那样有窗口要等，
 /// 前面的请求走完一条就空出一个格子，等一拍就好。
+///
+/// 八个参数全是日志字段，只此一处调用；为它包一个结构体只会把同一份东西抄两遍。
+#[allow(clippy::too_many_arguments)]
 fn session_concurrency_rejection(
     log: &RejectionLog,
     method: &Method,
@@ -3890,18 +3891,18 @@ fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> b
         blocks[last] = placeholder;
     }
     let wrapped = format!("<system_instructions>\n{tail_text}\n</system_instructions>");
-    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        if let Some(first) = messages.first_mut() {
-            match first.get_mut("content") {
-                Some(serde_json::Value::Array(arr)) => {
-                    arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
-                }
-                Some(serde_json::Value::String(s)) => {
-                    let combined = format!("{wrapped}\n\n{s}");
-                    *first.get_mut("content").unwrap() = serde_json::Value::String(combined);
-                }
-                _ => return false,
+    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut())
+        && let Some(first) = messages.first_mut()
+    {
+        match first.get_mut("content") {
+            Some(serde_json::Value::Array(arr)) => {
+                arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
             }
+            Some(serde_json::Value::String(s)) => {
+                let combined = format!("{wrapped}\n\n{s}");
+                *first.get_mut("content").unwrap() = serde_json::Value::String(combined);
+            }
+            _ => return false,
         }
     }
     tracing::info!(
@@ -4089,10 +4090,10 @@ fn first_user_text(v: &serde_json::Value) -> String {
             Some(serde_json::Value::String(s)) => return s.clone(),
             Some(serde_json::Value::Array(blocks)) => {
                 for blk in blocks {
-                    if blk.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = blk.get("text").and_then(|t| t.as_str()) {
-                            return t.to_string();
-                        }
+                    if blk.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = blk.get("text").and_then(|t| t.as_str())
+                    {
+                        return t.to_string();
                     }
                 }
             }
@@ -4685,12 +4686,12 @@ fn find_openai_image_url(body: Option<&serde_json::Value>) -> Option<String> {
                 return Some(format!("messages.{mi}.content.{ci}"));
             }
             // tool_result 内嵌的 content 数组也要扫。
-            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
-                    for (ki, inner_block) in inner.iter().enumerate() {
-                        if inner_block.get("type").and_then(|t| t.as_str()) == Some("image_url") {
-                            return Some(format!("messages.{mi}.content.{ci}.content.{ki}"));
-                        }
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                && let Some(inner) = block.get("content").and_then(|c| c.as_array())
+            {
+                for (ki, inner_block) in inner.iter().enumerate() {
+                    if inner_block.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        return Some(format!("messages.{mi}.content.{ci}.content.{ki}"));
                     }
                 }
             }
@@ -4922,12 +4923,12 @@ fn rewrite_body(
     // 模拟路径下客户端可能已带 `metadata.user_id`——它的 session_id 是客户端原值，
     // 而出站头上的 `X-Claude-Code-Session-Id` 取自 `sim.session_id`。两处不同值就是
     // 官方不产生的矛盾，先剥掉再让 `ensure_cc_metadata` 用 sim.session_id 重建。
-    if sim.is_some() {
-        if let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            meta.remove("user_id");
-            if meta.is_empty() {
-                v.as_object_mut().map(|o| o.remove("metadata"));
-            }
+    if sim.is_some()
+        && let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut())
+    {
+        meta.remove("user_id");
+        if meta.is_empty() {
+            v.as_object_mut().map(|o| o.remove("metadata"));
         }
     }
     let sim_meta = flags.spoof_identity
@@ -4937,6 +4938,12 @@ fn rewrite_body(
     // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
+    // OpenAI 风格的 `tool_choice`（字符串 `"auto"`/`"none"`/`"required"`、`null`，或
+    // `{"type":"function","function":{"name":…}}`）归一成 Anthropic 的对象形态——上游对非对象
+    // 直接 400 `tool_choice: Input should be an object`。**无条件做**：这种形态在 Anthropic 这边
+    // 永远无效，没有「保留原样」的价值。放在剥字段之前：归一出来的 `{"type":"auto"}` 正好由
+    // 下一步按缺省剥掉。
+    let tool_choice_normalized = normalize_tool_choice(&mut v);
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
     // `display` 的去留：来访本来就是 CC 形态，或 `thinking` 整个是刚按官方形态补的，都留。
@@ -4978,6 +4985,7 @@ fn rewrite_body(
         msg_shape,
         ttl_filled,
         streamed,
+        tool_choice_normalized,
         stripped,
         top_level_ordered,
         cc_tools_injected,
@@ -5004,6 +5012,7 @@ fn rewrite_body(
         && !msg_shape
         && !ttl_filled
         && !streamed
+        && !tool_choice_normalized
         && !stripped
         && !top_level_ordered
         && !cc_tools_injected
@@ -5246,45 +5255,9 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
     }
 }
 
-/// 补上官方客户端恒发的 `context_management`，落在官方位置（`thinking` 之后、
-/// `output_config`/`stream` 之前）。已经有这个字段就原样不动，返回 `false`。
-///
-/// **依据**：`cap/raw` 八份抓包（四份直连、四份经 luban）的顶层 `context_management`
-/// **逐字节相同**——`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`，
-/// 四个模型族无一例外，连 haiku 那两份也一样。这与 `thinking`/`output_config` 那种逐族不同
-/// 的字段不是一类，不存在「补哪一份」的选择问题。
-///
-/// **为什么该补**：这个字段要 `context-management-2025-06-27` 认，而两份 seed
-/// （[`config::CC_BETA_SIMULATED`] 与 [`config::CC_BETA_SIMULATED_HAIKU`]）**都带着它**。
-/// 不补就是「头上声明了 context-management、体里零个 `edits`」——与
-/// [`ensure_beta_query`] 要消灭的那个组合同一个形状，只是落在体上。
-///
-/// `keep:"all"` 意为「一条都不清」，故补它不改变本次请求的语义，也不动计价：与
-/// `known_fingerprint_gaps` 第 7 条的 `fallbacks`（补上等于替用户决定换模型）正相反，
-/// 那条不补的理由在这里不成立。
-///
-/// **但它不是独立字段——依赖 `thinking`**。上游对「有 `clear_thinking` 却没开 thinking」
-/// 的请求直接回 400：
-///
-/// ```text
-/// `clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive
-/// ```
-///
-/// 抓包看不出这层依赖：八份**全都**开着 thinking（opus/sonnet/fable 是 `{"type":"adaptive"}`，
-/// haiku 是 `{"budget_tokens":31999,"type":"enabled"}`），于是 8/8 共现让它看着像个独立字段。
-/// 这是一次「共现不等于无依赖」的教训——v0.2.51 上线后普通请求即因此 400。
-///
-/// **不替客户端补 `thinking`** 来满足这个依赖，三条理由都写在抓包里：
-/// 1. haiku 那份是 `budget_tokens:31999` 配 `max_tokens:32000`，budget 必须小于 max_tokens。
-///    客户端发 `max_tokens:1024` 时这个值根本塞不进去，要么改它的 max_tokens（改掉它明确
-///    要的上限与费用天花板），要么自己算一个 budget——两条都是替它做决定。
-/// 2. 开了 thinking，响应里就多出 thinking 块，客户端未必认得，直接把它弄坏。
-/// 3. thinking token 按输出计费，等于未经同意加钱。
-///
-/// 故只在客户端**自己已经开着** thinking 时才补，其余情形一个字节都不动。
-///
-/// **注意**：模拟路径下 [`ensure_thinking`] 会先补上 `thinking`，然后本函数就能自然补上
-/// `context_management`，两者配合才完整。
+/// [`ensure_thinking`] 补 `thinking` 的 `max_tokens` 下限：再小的请求，思考预算本身就塞不进去，
+/// 不值得加，见该函数文档的「三种情况不补」。
+const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 
 /// 模拟路径下补 `thinking`，形态按模型族取自 `cap/2.1.258`：
 ///
@@ -5300,8 +5273,6 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
 /// 三种情况不补：
 /// - 客户端自己带了 `thinking`（`disabled`/`null`/`enabled` 都算——那是它自己的选择）；
 /// - `max_tokens` 太小（< 1024）：thinking 本身要消耗 token 预算，探测级请求不值得加。
-const THINKING_MIN_MAX_TOKENS: u64 = 1024;
-
 fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_ascii_lowercase();
     let Some(obj) = v.as_object_mut() else { return false };
@@ -5365,6 +5336,45 @@ fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
     true
 }
 
+/// 补上官方客户端恒发的 `context_management`，落在官方位置（`thinking` 之后、
+/// `output_config`/`stream` 之前）。已经有这个字段就原样不动，返回 `false`。
+///
+/// **依据**：`cap/raw` 八份抓包（四份直连、四份经 luban）的顶层 `context_management`
+/// **逐字节相同**——`{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`，
+/// 四个模型族无一例外，连 haiku 那两份也一样。这与 `thinking`/`output_config` 那种逐族不同
+/// 的字段不是一类，不存在「补哪一份」的选择问题。
+///
+/// **为什么该补**：这个字段要 `context-management-2025-06-27` 认，而两份 seed
+/// （[`config::CC_BETA_SIMULATED`] 与 [`config::CC_BETA_SIMULATED_HAIKU`]）**都带着它**。
+/// 不补就是「头上声明了 context-management、体里零个 `edits`」——与
+/// [`ensure_beta_query`] 要消灭的那个组合同一个形状，只是落在体上。
+///
+/// `keep:"all"` 意为「一条都不清」，故补它不改变本次请求的语义，也不动计价：与
+/// `known_fingerprint_gaps` 第 7 条的 `fallbacks`（补上等于替用户决定换模型）正相反，
+/// 那条不补的理由在这里不成立。
+///
+/// **但它不是独立字段——依赖 `thinking`**。上游对「有 `clear_thinking` 却没开 thinking」
+/// 的请求直接回 400：
+///
+/// ```text
+/// `clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive
+/// ```
+///
+/// 抓包看不出这层依赖：八份**全都**开着 thinking（opus/sonnet/fable 是 `{"type":"adaptive"}`，
+/// haiku 是 `{"budget_tokens":31999,"type":"enabled"}`），于是 8/8 共现让它看着像个独立字段。
+/// 这是一次「共现不等于无依赖」的教训——v0.2.51 上线后普通请求即因此 400。
+///
+/// **不替客户端补 `thinking`** 来满足这个依赖，三条理由都写在抓包里：
+/// 1. haiku 那份是 `budget_tokens:31999` 配 `max_tokens:32000`，budget 必须小于 max_tokens。
+///    客户端发 `max_tokens:1024` 时这个值根本塞不进去，要么改它的 max_tokens（改掉它明确
+///    要的上限与费用天花板），要么自己算一个 budget——两条都是替它做决定。
+/// 2. 开了 thinking，响应里就多出 thinking 块，客户端未必认得，直接把它弄坏。
+/// 3. thinking token 按输出计费，等于未经同意加钱。
+///
+/// 故只在客户端**自己已经开着** thinking 时才补，其余情形一个字节都不动。
+///
+/// **注意**：模拟路径下 [`ensure_thinking`] 会先补上 `thinking`，然后本函数就能自然补上
+/// `context_management`，两者配合才完整。
 fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
@@ -5619,13 +5629,12 @@ fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
             changed = true;
         }
         // thinking.type == "enabled" 时 budget_tokens 必须 >= 1024，否则上游 400。
-        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
-            if let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_u64()) {
-                if budget < 1024 {
-                    thinking.insert("budget_tokens".into(), serde_json::Value::Number(1024.into()));
-                    changed = true;
-                }
-            }
+        if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled")
+            && let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_u64())
+            && budget < 1024
+        {
+            thinking.insert("budget_tokens".into(), serde_json::Value::Number(1024.into()));
+            changed = true;
         }
     }
     // thinking 开着时 temperature 必须是 1（上游强制），客户端设了别的值直接 400。
@@ -5635,12 +5644,62 @@ fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
         .and_then(|t| t.get("type"))
         .and_then(|t| t.as_str())
         .is_some_and(|t| matches!(t, "enabled" | "adaptive"));
-    if thinking_on && obj.get("temperature").and_then(|t| t.as_f64()) != Some(1.0) {
-        if obj.remove("temperature").is_some() {
-            changed = true;
-        }
+    if thinking_on
+        && obj.get("temperature").and_then(|t| t.as_f64()) != Some(1.0)
+        && obj.remove("temperature").is_some()
+    {
+        changed = true;
     }
     changed
+}
+
+/// 把 OpenAI 风格的 `tool_choice` 归一成 Anthropic 的对象形态，返回是否改动过。
+///
+/// Anthropic 只认 `{"type":"auto"|"any"|"tool"|"none", …}` 这一种对象；其它任何形态上游都回
+/// 400 `tool_choice: Input should be an object`。OpenAI 兼容层与各类 SDK 常见的几种写法及其对应：
+///
+/// | 来访 | 出站 |
+/// |---|---|
+/// | `null` | 删掉（缺省） |
+/// | `"auto"` | `{"type":"auto"}`（随后可被 [`strip_extra_fields`] 按缺省剥掉） |
+/// | `"none"` | `{"type":"none"}` |
+/// | `"required"` / `"any"` | `{"type":"any"}` |
+/// | `{"type":"function","function":{"name":X}}` | `{"type":"tool","name":X}` |
+/// | `{"type":"function"}`（没指定名字） | `{"type":"any"}` |
+///
+/// 认不出的形态**原样放行**，让上游报它自己的错——这里只翻译已知的方言，不替客户端猜。
+/// 已经是 Anthropic 对象形态的一律不动（含 `disable_parallel_tool_use` 等附加键）。
+fn normalize_tool_choice(v: &mut serde_json::Value) -> bool {
+    let Some(obj) = v.as_object_mut() else { return false };
+    let Some(tc) = obj.get("tool_choice") else { return false };
+    let replacement = match tc {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(serde_json::json!({ "type": "auto" })),
+            "none" => Some(serde_json::json!({ "type": "none" })),
+            "required" | "any" => Some(serde_json::json!({ "type": "any" })),
+            _ => return false,
+        },
+        serde_json::Value::Object(o)
+            if o.get("type").and_then(|t| t.as_str()) == Some("function") =>
+        {
+            match o.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                Some(name) => Some(serde_json::json!({ "type": "tool", "name": name })),
+                None => Some(serde_json::json!({ "type": "any" })),
+            }
+        }
+        _ => return false,
+    };
+    match replacement {
+        // `insert` 对已有键原位改值（`preserve_order`），键序不动。
+        Some(val) => {
+            obj.insert("tool_choice".into(), val);
+        }
+        None => {
+            obj.remove("tool_choice");
+        }
+    }
+    true
 }
 
 /// `tool_choice` 是否等价于「不写这个字段」，即恰好只有 `{"type":"auto"}` 一个键。
@@ -5889,15 +5948,7 @@ fn flatten_tool_schemas(v: &mut serde_json::Value) -> bool {
             continue;
         };
         // 取出 compound 关键字（只看顶层）。
-        let compound = if let Some(arr) = schema.remove("allOf") {
-            Some(arr)
-        } else if let Some(arr) = schema.remove("oneOf") {
-            Some(arr)
-        } else if let Some(arr) = schema.remove("anyOf") {
-            Some(arr)
-        } else {
-            None
-        };
+        let compound = ["allOf", "oneOf", "anyOf"].iter().find_map(|k| schema.remove(*k));
         let Some(serde_json::Value::Array(parts)) = compound else {
             continue;
         };
@@ -6017,7 +6068,7 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
         };
         let is_empty_thinking = |blk: &serde_json::Value| {
             blk.get("type").and_then(|t| t.as_str()) == Some("thinking")
-                && blk.get("thinking").and_then(|t| t.as_str()).map_or(true, |t| t.is_empty())
+                && blk.get("thinking").and_then(|t| t.as_str()).is_none_or(|t| t.is_empty())
         };
         let non_empty_count = content.iter().filter(|blk| !is_empty_thinking(blk)).count();
         if non_empty_count == content.len() || non_empty_count == 0 {
@@ -7763,7 +7814,8 @@ mod tests {
         Bytes, HeaderValue, StatusCode, UsageSniffer, apply_tool_names, build_forward_headers,
         build_tool_name_map, config, detect_account_ban, ensure_billing_cch, head, header,
         is_billable_messages, is_secret_header, is_third_party_rejection, merge_beta,
-        replace_json_str_field, request_digest, request_speed, store, strip_extra_fields, uuid_v4,
+        normalize_tool_choice, replace_json_str_field, request_digest, request_speed, store,
+        strip_extra_fields, uuid_v4,
     };
 
     /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
@@ -9259,6 +9311,62 @@ mod tests {
         );
     }
 
+    /// OpenAI 方言的 `tool_choice` 翻译成 Anthropic 对象形态；上游对非对象直接 400
+    /// `tool_choice: Input should be an object`。已是 Anthropic 形态或认不出的，一律不动。
+    #[test]
+    fn normalizes_openai_style_tool_choice() {
+        let run = |tc: serde_json::Value| {
+            let mut v = serde_json::json!({ "model": "claude-sonnet-5", "tool_choice": tc, "messages": [] });
+            let changed = normalize_tool_choice(&mut v);
+            (changed, v.get("tool_choice").cloned())
+        };
+        assert_eq!(
+            run(serde_json::json!("auto")),
+            (true, Some(serde_json::json!({"type": "auto"})))
+        );
+        assert_eq!(
+            run(serde_json::json!("none")),
+            (true, Some(serde_json::json!({"type": "none"})))
+        );
+        assert_eq!(
+            run(serde_json::json!("required")),
+            (true, Some(serde_json::json!({"type": "any"})))
+        );
+        assert_eq!(run(serde_json::json!("ANY")), (true, Some(serde_json::json!({"type": "any"}))));
+        assert_eq!(run(serde_json::Value::Null), (true, None), "null 等于没写，删掉");
+        assert_eq!(
+            run(serde_json::json!({"type": "function", "function": {"name": "get_weather"}})),
+            (true, Some(serde_json::json!({"type": "tool", "name": "get_weather"})))
+        );
+        assert_eq!(
+            run(serde_json::json!({"type": "function"})),
+            (true, Some(serde_json::json!({"type": "any"})))
+        );
+        // Anthropic 形态原样不动，附加键也不动。
+        for keep in [
+            serde_json::json!({"type": "auto"}),
+            serde_json::json!({"type": "tool", "name": "x"}),
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "none"}),
+        ] {
+            assert_eq!(run(keep.clone()), (false, Some(keep.clone())), "不该动: {keep}");
+        }
+        // 认不出的方言放行，让上游报它自己的错。
+        assert_eq!(
+            run(serde_json::json!("whatever")),
+            (false, Some(serde_json::json!("whatever")))
+        );
+        assert_eq!(run(serde_json::json!(42)), (false, Some(serde_json::json!(42))));
+        // 没有这个字段：零操作。
+        let mut none = serde_json::json!({ "model": "claude-sonnet-5", "messages": [] });
+        assert!(!normalize_tool_choice(&mut none));
+        // 归一后与剥字段接力：`"auto"` 最终整个消失，与官方形态一致。
+        let mut chain = serde_json::json!({ "model": "claude-sonnet-5", "tool_choice": "auto", "messages": [] });
+        assert!(normalize_tool_choice(&mut chain));
+        assert!(strip_extra_fields(&mut chain, false));
+        assert!(chain.get("tool_choice").is_none(), "{chain}");
+    }
+
     /// 官方从不发的顶层字段要剥掉，客户端真正要的语义不能动。
     ///
     /// 判据取自 `cap/raw/00006`/`00009`：两份直连抓包都没有 `tool_choice`，
@@ -10669,9 +10777,7 @@ mod tests {
         );
 
         // CC UA + 含官方工具名 → 不模拟。
-        let cc_with_tools = Bytes::from(format!(
-            r#"{{"model":"claude-opus-5","messages":[],"tools":[{{"name":"Bash"}},{{"name":"custom_tool"}}]}}"#
-        ));
+        let cc_with_tools = Bytes::from(r#"{"model":"claude-opus-5","messages":[],"tools":[{"name":"Bash"},{"name":"custom_tool"}]}"#.to_string());
         assert!(
             detect_with(&cc_with_tools, &cc_ua, all_on()).is_none(),
             "CC UA + 有官方工具不该走模拟"

@@ -146,8 +146,9 @@ pub async fn run(
                 tick.tick().await;
                 tick_count += 1;
                 let is_first = tick_count == 1;
-                let is_hourly = tick_count % crate::config::KEEPALIVE_HOURLY_TICKS == 0;
-                let is_eval = is_first || tick_count % crate::config::KEEPALIVE_EVAL_TICKS == 0;
+                let is_hourly = tick_count.is_multiple_of(crate::config::KEEPALIVE_HOURLY_TICKS);
+                let is_eval =
+                    is_first || tick_count.is_multiple_of(crate::config::KEEPALIVE_EVAL_TICKS);
 
                 let creds = match store.list() {
                     Ok(c) => c,
@@ -980,12 +981,12 @@ async fn refresh_credential(
         Ok(t) => t,
         Err(e) => {
             // refresh_token 被永久作废（invalid_grant）→ 标记封禁，与 keepalive / 转发路径口径一致。
-            if let Some(te) = e.downcast_ref::<oauth::TokenEndpointError>() {
-                if te.is_grant_revoked() {
-                    let reason = te.ban_reason();
-                    tracing::warn!(cred_id = id, cred = %cred.label, %reason, "manual refresh: grant revoked, disabling");
-                    let _ = state.store.mark_banned(id, &reason);
-                }
+            if let Some(te) = e.downcast_ref::<oauth::TokenEndpointError>()
+                && te.is_grant_revoked()
+            {
+                let reason = te.ban_reason();
+                tracing::warn!(cred_id = id, cred = %cred.label, %reason, "manual refresh: grant revoked, disabling");
+                let _ = state.store.mark_banned(id, &reason);
             }
             return Err(bad_request(e.to_string()));
         }
