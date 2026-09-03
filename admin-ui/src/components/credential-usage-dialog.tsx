@@ -468,7 +468,7 @@ function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[72rem] table-fixed text-xs"
+      className="min-w-[80rem] table-fixed text-xs"
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -484,6 +484,8 @@ function UsageTable({
         <col className="w-[7.25rem]" />
         <col className="w-[5rem]" />
         <col className="w-[6.5rem]" />
+        {/* 请求 ID：尾 8 位加复制图标。固定布局下每列都得在这里登记，漏一列会把后面的列挤成 0 宽。 */}
+        <col className="w-[8rem]" />
         <col className="w-[18rem]" />
       </colgroup>
       <TableHeader className="sticky top-0 z-10 bg-surface-subtle">
