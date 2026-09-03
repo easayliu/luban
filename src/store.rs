@@ -2738,8 +2738,10 @@ pub struct UsageRecord {
     /// 这条来访本来是非流式、被改写成流式发给上游再聚合回整段 JSON（见
     /// [`ForwardFlags::nonstream_as_sse`]）。
     pub sse_aggregated: bool,
-    /// luban 给这条入站请求发的 id（`lb-<uuid>`），同时回在响应头 `X-Oneapi-Request-Id` /
-    /// `X-Luban-Request-Id` 上。New API 会把上游响应头里的 `X-Oneapi-Request-Id` 存成它日志的
+    /// 这条入站请求的 id：来访带了合法 `X-Request-Id` 就是它，否则是 luban 生成的
+    /// `req_` + 16 位 base62（形态照 Stripe / Anthropic）；
+    /// 同时回在响应头 `X-Request-Id` / `X-Oneapi-Request-Id` 上。New API 会把上游响应头里的
+    /// `X-Oneapi-Request-Id` 存成它日志的
     /// `upstream_request_id`，于是拿它那边的一条日志就能在这里精确找到对应的流水。
     /// 一条入站请求可能对应多次上游请求（429 换号、prefill 重试），故主键是 luban 自己的 id。
     pub request_id: Option<String>,

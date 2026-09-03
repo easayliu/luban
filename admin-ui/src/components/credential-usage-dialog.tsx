@@ -604,7 +604,7 @@ function UsageTable({
 }
 
 /**
- * 请求 id：默认只显示尾部 8 位（`lb-` 前缀加 uuid 太长，表格里放不下），完整值在 title 里，
+ * 请求 id：默认只显示尾部 8 位（来访沿用的 id 可能长达 128 位，表格里放不下），完整值在 title 里，
  * 点击复制整串。`full` 时整串显示（查询结果页有的是横向空间）。旧记录没有 id 时显示占位。
  */
 export function RequestIdChip({ id, full = false }: { id: string | null; full?: boolean }) {

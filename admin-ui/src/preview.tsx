@@ -728,7 +728,7 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   ttft_ms: index === 9 ? null : 480 + index * 63,
   total_ms: index === 9 ? null : 3_280 + index * 211,
   cost_usd: index === 9 ? null : 0.0184 + index * 0.0027,
-  request_id: index === 11 ? null : `lb-0f3c9a2e-7b1d-4e5a-9c${String(index).padStart(2, '0')}-1a2b3c4d5e6f`,
+  request_id: index === 11 ? null : `req_Q3k9ZpL2mNv7${String(index).padStart(2, '0')}Xb`,
   upstream_request_id: index % 3 === 0 ? null : `req_01${String(index).padStart(2, '0')}HXk3M9pQ2rT`,
 }))
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {

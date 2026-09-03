@@ -17,12 +17,16 @@ use crate::store;
 use crate::web::AppState;
 
 /// 转发 `/v1/*` 到官方 API。
-/// 转发入口：给这条入站请求发一个 id，跑完 [`handle_inner`] 后把 id 写进响应头。
+/// 转发入口：给这条入站请求定一个 id，跑完 [`handle_inner`] 后把 id 写进响应头与错误体。
 ///
-/// `X-Oneapi-Request-Id` 是给 New API 的——它读上游响应头里的这个名字，存进自己日志的
-/// `upstream_request_id`（它自己那份 id 从不发给上游，两边只能靠这条路对上）。
-/// `X-Luban-Request-Id` 是同一个值的中性名字，给别的客户端与人看。**每条响应都带**，包括
-/// 本地拒掉的那些：排查「为什么被拒」时最需要它。
+/// **id 的取法照业界惯例**（nginx / Envoy / 各家网关一致）：来访已带合法 `X-Request-Id` 就沿用，
+/// 让同一个 id 贯穿客户端、New API、luban 三层；没带才生成一个，形态照 Stripe / Anthropic：
+/// `req_` + 16 位 base62 随机串（见 [`new_request_id`]）。见 [`request_id_for`]。
+///
+/// 响应头回两份同值：`X-Request-Id` 是通用名字，给任何客户端与人看；`X-Oneapi-Request-Id`
+/// 是给 New API 的——它读上游响应头里的这个名字，存进自己日志的 `upstream_request_id`
+/// （它自己那份 id 从不发给上游，两边只能靠这条路对上）。**每条响应都带**，包括本地拒掉的
+/// 那些：排查「为什么被拒」时最需要它。
 pub async fn handle(
     State(state): State<AppState>,
     method: Method,
@@ -30,7 +34,7 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let request_id = format!("lb-{}", uuid_v4());
+    let request_id = request_id_for(&headers);
     let mut resp = handle_inner(state, method, uri, headers, body, &request_id).await;
     // 错误体里也带上 id：New API 把上游错误的 `error.message` 原文展示给它的用户，响应头
     // 到不了那一层；人拿着报错截图来问时，id 得就在那句话里。
@@ -38,10 +42,45 @@ pub async fn handle(
         resp = annotate_error_response(resp, &request_id).await;
     }
     if let Ok(v) = HeaderValue::from_str(&request_id) {
-        resp.headers_mut().insert("x-oneapi-request-id", v.clone());
-        resp.headers_mut().insert("x-luban-request-id", v);
+        resp.headers_mut().insert("x-request-id", v.clone());
+        resp.headers_mut().insert("x-oneapi-request-id", v);
     }
     resp
+}
+
+/// 来访 `X-Request-Id` 能沿用的形态：`[A-Za-z0-9._-]`，1 到 128 位。
+///
+/// 它要进日志、进库、进错误体，还要原样回给下游，所以只认这套最保守的字符集——UUID、
+/// ULID、Stripe/Anthropic 那种 `req_…`、nginx 的 32 位 hex 都在内；带空格、引号、控制字符或
+/// 长得离谱的一律当没带，重新生成。
+fn acceptable_request_id(v: &str) -> bool {
+    (1..=128).contains(&v.len())
+        && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// 这条请求的 id：沿用来访合法的 `X-Request-Id`，否则生成一个（[`new_request_id`]）。
+fn request_id_for(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| acceptable_request_id(v))
+        .map(str::to_string)
+        .unwrap_or_else(new_request_id)
+}
+
+/// 生成的请求 id 里随机部分的长度。base62 的 16 位约 95 bit，比 Stripe 的 14 位略长一点，
+/// 碰撞可以不当回事；比 UUID 的 36 位短一半，日志与报错里更好认、好抄。
+const REQUEST_ID_RANDOM_LEN: usize = 16;
+
+/// 生成一个请求 id，形态照 Stripe / Anthropic 那套：`req_` + base62 随机串，如
+/// `req_Q3k9ZpL2mNv7Xb1c`。前缀说明「这是一个请求 id」，混在别的 id（账号、设备、会话）里
+/// 一眼能认出来；随机部分只用字母数字，进日志、进 URL、进错误体都不必转义。
+fn new_request_id() -> String {
+    use rand::distr::Alphanumeric;
+    let tail: String =
+        rand::rng().sample_iter(Alphanumeric).take(REQUEST_ID_RANDOM_LEN).map(char::from).collect();
+    format!("req_{tail}")
 }
 
 /// 错误体最多收多大来改写。错误 JSON 通常几百字节；超过这个数的不是错误体，原样放行不碰。
@@ -81,7 +120,7 @@ async fn annotate_error_response(resp: Response, request_id: &str) -> Response {
     Response::from_parts(parts, Body::from(out))
 }
 
-/// 在错误 JSON 里写入 luban 的请求 id：`error.message` 末尾追加 `(luban request id: lb-…)`，
+/// 在错误 JSON 里写入 luban 的请求 id：`error.message` 末尾追加 `(luban request id: req_…)`，
 /// 顶层加 `luban_request_id`。不是 JSON 对象时返回 `None`（原样放行）。
 ///
 /// 两处都写：`message` 是人最终看到的那句话（New API 把它原文转给用户，工单截图里就是它）；
@@ -7681,7 +7720,7 @@ pub async fn probe(
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
     // Upstream 之前取，取值规则与转发路径同一套。
     let out_ua = ua_of(&headers);
-    let probe_request_id = format!("lb-{}", uuid_v4());
+    let probe_request_id = new_request_id();
     let plog = ProbeLog {
         store: &state.store,
         cred,
@@ -9558,6 +9597,38 @@ mod tests {
             String::from_utf8(map.restore(b"x fetch_abc00_long y fetch_abc00 z")).unwrap(),
             "x REAL_LONG y REAL_SHORT z"
         );
+    }
+
+    /// 请求 id 取法：来访合法的 X-Request-Id 沿用（UUID / ULID / req_… / 32 位 hex 都算），
+    /// 带空格、引号、超长或没带的一律生成 `req_` + 16 位 base62。
+    #[test]
+    fn request_id_reuses_a_sane_inbound_x_request_id_else_generates_one() {
+        let with = |v: &str| {
+            let mut h = super::HeaderMap::new();
+            h.insert("x-request-id", HeaderValue::from_str(v).unwrap());
+            super::request_id_for(&h)
+        };
+        for ok in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "01J9Z3QK5V8N2X6M4P7R9T1W3Y",
+            "req_01ABCxyz",
+            "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+        ] {
+            assert_eq!(with(ok), ok, "合法的应沿用");
+        }
+        let is_generated = |s: &str| {
+            s.len() == 4 + super::REQUEST_ID_RANDOM_LEN
+                && s.starts_with("req_")
+                && s[4..].bytes().all(|b| b.is_ascii_alphanumeric())
+        };
+        for bad in ["has space", "quote\"d", "", &"x".repeat(129)] {
+            let got = with(bad);
+            assert!(is_generated(&got), "{bad:?} 不合法应重新生成，得到 {got}");
+        }
+        assert!(is_generated(&super::request_id_for(&super::HeaderMap::new())), "没带就生成");
+        assert_ne!(super::new_request_id(), super::new_request_id(), "随机，不该重复");
+        // 前后空白容忍。
+        assert_eq!(with("  abc-123  "), "abc-123");
     }
 
     /// 错误体里带 luban 请求 id：message 末尾追加、顶层加 luban_request_id、不动上游的 request_id。

@@ -254,8 +254,10 @@ export interface UsageLog {
   /** 按模型价目表估算的等价 API 费用（USD）；模型认不出时为 null。 */
   cost_usd: number | null
   /**
-   * luban 给这条入站请求发的 id（`lb-…`），同时回在响应头 `X-Oneapi-Request-Id` /
-   * `X-Luban-Request-Id` 上；New API 把它存成日志里的 `upstream_request_id`。
+   * 这条入站请求的 id：来访带了合法 `X-Request-Id` 就沿用，否则是 luban 生成的
+   * `req_` + 16 位 base62（形态照 Stripe / Anthropic）；
+   * 同时回在响应头 `X-Request-Id` / `X-Oneapi-Request-Id` 上，New API 把它存成日志里的
+   * `upstream_request_id`。
    * 0.3.70 之前的旧记录为 null。
    */
   request_id: string | null
