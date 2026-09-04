@@ -720,7 +720,16 @@ async fn handle_inner(
                     cred_id = cred.id, cred = %cred.label, error = %reason,
                     "proxy unusable, disabling the credential"
                 );
-                let _ = state.store.mark_banned(cred.id, &reason);
+                let _ = state.store.record_ban(
+                    cred.id,
+                    &store::BanContext {
+                        reason: reason.clone(),
+                        source: "proxy",
+                        error_message: Some(format!("{e:#}")),
+                        request_id: Some(request_id.to_string()),
+                        ..Default::default()
+                    },
+                );
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
@@ -774,6 +783,7 @@ async fn handle_inner(
         {
             let up = resp.unwrap();
             let builder = resp_builder(&up);
+            let up_request_id = header_opt(up.headers(), "request-id");
             let bytes = match up.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -799,7 +809,15 @@ async fn handle_inner(
                     reason = %reason,
                     "401 account-level error, auto-disabling and attempting credential swap"
                 );
-                let _ = state.store.mark_banned(cred.id, &reason);
+                let ctx = ban_context(
+                    &reason,
+                    "forward_401",
+                    StatusCode::UNAUTHORIZED,
+                    &bytes,
+                    &request_id,
+                    up_request_id.as_deref(),
+                );
+                let _ = state.store.record_ban(cred.id, &ctx);
                 tried.push(cred.id);
                 if retried < max_retry {
                     match store::valid_access_token_for_device(
@@ -1124,6 +1142,7 @@ async fn handle_inner(
                 request_id: request_id.to_string(),
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
+                forensics: capture_forensics(&upstream, &sent, &cred),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,
@@ -1157,6 +1176,9 @@ async fn handle_inner(
                         upstream_message = %message.chars().take(500).collect::<String>(),
                         "upstream returned 4xx"
                     );
+                    rl.forensics.error_type = etype;
+                    rl.forensics.error_message = Some(message);
+                    rl.forensics.third_party = is_third_party_rejection(&err_bytes);
                 }
                 if !compressed && status == StatusCode::BAD_REQUEST {
                     let mut learned = remember_shape_rejection(
@@ -1216,7 +1238,15 @@ async fn handle_inner(
                         reason = %reason,
                         "account-level error detected, auto-disabling the credential"
                     );
-                    if let Err(e) = state.store.mark_banned(cred.id, reason) {
+                    let ctx = ban_context(
+                        reason,
+                        "forward",
+                        status,
+                        &err_bytes,
+                        &request_id,
+                        rl.upstream_request_id.as_deref(),
+                    );
+                    if let Err(e) = state.store.record_ban(cred.id, &ctx) {
                         tracing::warn!(error = %e, "failed to auto-disable the credential");
                     }
                 }
@@ -1308,7 +1338,9 @@ async fn handle_inner(
                 return match up.bytes().await {
                     Ok(bytes) => {
                         rl.ttft_ms = Some(rl.started.elapsed().as_millis());
-                        let (etype, _) = parse_upstream_error(&bytes);
+                        let (etype, message) = parse_upstream_error(&bytes);
+                        rl.forensics.error_type = etype.clone();
+                        rl.forensics.error_message = Some(message);
                         // 我们这一侧的发送密度，见 [`UpstreamLoad`]：这一档的成因（每分钟请求数
                         // / 并发连接数 / 输出 token 预算，三者之一）上游一个字都不说，只能拿
                         // 自己的读数去对它公布的限额。
@@ -1985,6 +2017,7 @@ async fn retry_demoted_thinking(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
+    rl.note_retry("demoted_thinking", up.headers());
     Some(up)
 }
 
@@ -2130,6 +2163,7 @@ async fn retry_without_prefill(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
+    rl.note_retry("no_prefill", up.headers());
     Some(up)
 }
 
@@ -2598,6 +2632,8 @@ struct ReqLog {
     client_request_id: Option<String>,
     /// 上游**最后一次**响应头里的 `request-id`；换号/重试后以最终那一发为准。
     upstream_request_id: Option<String>,
+    /// 取证字段（出口、形态摘要、上游错误文案、改写标签……），见 [`store::Forensics`]。
+    forensics: store::Forensics,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
@@ -2623,6 +2659,17 @@ impl Drop for ReqLog {
                 "upstream sent an error event mid-stream; the client already got the 200 header plus that payload, logging it as the mapped status"
             );
             self.status = mapped.as_u16();
+            if self.forensics.error_type.is_none() {
+                let err = payload.get("error");
+                self.forensics.error_type =
+                    err.and_then(|e| e.get("type")).and_then(|t| t.as_str()).map(str::to_string);
+                self.forensics.error_message = Some(
+                    err.and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| payload.to_string()),
+                );
+            }
         }
         // 传输中断只告警、不改 status：这里分不清是上游掐的还是客户端自己走了（用户按了
         // Ctrl-C 也会让流提前结束），记成 5xx 会把正常的中途取消算成服务端故障。
@@ -2739,9 +2786,163 @@ impl Drop for ReqLog {
             cost_usd,
             request_id: Some(self.request_id.clone()),
             upstream_request_id: self.upstream_request_id.clone(),
+            forensics: std::mem::take(&mut self.forensics),
         };
         spawn_usage_log(self.store.clone(), rec);
     }
+}
+
+impl ReqLog {
+    /// 记一次 luban 侧的改写重试：追加标签，并把上游 request-id 换成重试那一发的。
+    /// 重试成功后这条流水按重试那次记账（见 [`retry_demoted_thinking`]），标签是唯一能看出
+    /// 「中间还发过一发被拒的」的地方。
+    fn note_retry(&mut self, tag: &str, headers: &HeaderMap) {
+        let tags = self.forensics.rewrites.get_or_insert_with(String::new);
+        if !tags.is_empty() {
+            tags.push(',');
+        }
+        tags.push_str(tag);
+        if let Some(rid) = header_opt(headers, "request-id") {
+            self.upstream_request_id = Some(rid);
+        }
+    }
+}
+
+/// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
+fn ban_context(
+    reason: &str,
+    source: &'static str,
+    status: StatusCode,
+    body: &[u8],
+    request_id: &str,
+    upstream_request_id: Option<&str>,
+) -> store::BanContext {
+    let (etype, message) = parse_upstream_error(body);
+    store::BanContext {
+        reason: reason.to_string(),
+        source,
+        status: Some(status.as_u16()),
+        error_type: etype,
+        error_message: Some(message),
+        request_id: Some(request_id.to_string()),
+        upstream_request_id: upstream_request_id.map(str::to_string),
+    }
+}
+
+/// 转发那一刻能确定的取证字段：出口代理、是否模拟、出站体形态摘要、会话 id。
+/// 错误文案、第三方判定、改写标签在响应到达后再补（见 [`handle`] 的 4xx 段与 [`ReqLog::note_retry`]）。
+fn capture_forensics(
+    upstream: &Upstream<'_>,
+    sent: &Bytes,
+    cred: &crate::credentials::Credential,
+) -> store::Forensics {
+    let (shape, session_from_body, device_id_out) = shape_summary(sent);
+    store::Forensics {
+        proxy: cred.proxy.as_deref().map(store::redact_proxy),
+        simulated: upstream.sim.is_some(),
+        shape,
+        session_id: session_from_body
+            .or_else(|| header_opt(&upstream.headers, "x-claude-code-session-id")),
+        device_id_out,
+        ..Default::default()
+    }
+}
+
+/// 出站请求体的**结构**摘要（不含任何用户正文），落进流水的 `shape` 列。
+///
+/// 与 [`request_digest`] 的区别：那个是排障日志用的、逐轮列出消息块，几百轮的会话一条就几 KB；
+/// 这个每条请求都落库，只留计数、哈希与顶层参数，大小与会话长度无关。返回值的第二、三项是从
+/// `metadata.user_id` 里取出的 session_id 与 device_id（两种格式都认，见 [`extract_session_id`]
+/// 与 [`extract_device_id`]），没有则 `None`。这里读的是**出站**体，故取到的 device_id 是上游
+/// 实际看到的那个（伪装开着时为派生值），落进 `device_id_out` 列。
+///
+/// 摘要里各项都是「拿被封的号与活着的号对照」时要看的维度：
+/// - `keys`：顶层字段及**顺序**（官方客户端的顺序是固定的，多一个字段、换个顺序都是判据）；
+/// - `system`：块数、每块长度与是否带 cache_control、全文 sha256 前 16 位（同一份基座提示词
+///   哈希相同，直接按哈希分组就能看出「哪种 system 前缀的号被封」）；
+/// - `tools`：数量、名字列表（最多 64 个）与名字串的哈希；
+/// - `messages`：条数、末条角色、各类内容块计数（text/tool_use/tool_result/thinking/image…）；
+/// - 其余顶层参数（model/max_tokens/stream/thinking/temperature/tool_choice/…）原样。
+fn shape_summary(sent: &[u8]) -> (Option<String>, Option<String>, Option<String>) {
+    use sha2::{Digest, Sha256};
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(sent) else {
+        return (None, None, None);
+    };
+    let Some(obj) = v.as_object() else { return (None, None, None) };
+    // 两种 `metadata.user_id` 格式（内嵌 JSON / 扁平串）都由这两个函数认，别在下面再手写一套。
+    let session = extract_session_id(Some(&v));
+    let device = extract_device_id(Some(&v));
+    let sha16 = |text: &str| -> String {
+        let d = Sha256::digest(text.as_bytes());
+        d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("keys".into(), serde_json::json!(obj.keys().collect::<Vec<_>>()));
+    for (k, val) in obj {
+        let digest = match k.as_str() {
+            "system" => {
+                let blocks: Vec<(usize, bool, &str)> = match val {
+                    serde_json::Value::String(s) => vec![(s.len(), false, s.as_str())],
+                    serde_json::Value::Array(bs) => bs
+                        .iter()
+                        .map(|b| {
+                            let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            (t.len(), b.get("cache_control").is_some(), t)
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let all: String = blocks.iter().map(|b| b.2).collect();
+                serde_json::json!({
+                    "blocks": blocks.iter().map(|b| serde_json::json!({"len": b.0, "cache": b.1})).collect::<Vec<_>>(),
+                    "sha": sha16(&all),
+                })
+            }
+            "tools" => {
+                let names: Vec<&str> = val
+                    .as_array()
+                    .map(|a| {
+                        a.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "count": names.len(),
+                    "sha": sha16(&names.join(",")),
+                    "names": names.iter().take(64).collect::<Vec<_>>(),
+                })
+            }
+            "messages" => {
+                let arr = val.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+                for m in arr {
+                    match m.get("content") {
+                        Some(serde_json::Value::Array(bs)) => {
+                            for b in bs {
+                                let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                                *kinds.entry(t.to_string()).or_default() += 1;
+                            }
+                        }
+                        Some(serde_json::Value::String(_)) => {
+                            *kinds.entry("text".into()).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                serde_json::json!({
+                    "count": arr.len(),
+                    "last_role": arr.last().and_then(|m| m.get("role")).cloned(),
+                    "blocks": kinds,
+                })
+            }
+            "metadata" => {
+                let uid = val.get("user_id").and_then(|u| u.as_str());
+                serde_json::json!({ "user_id": uid.is_some(), "user_id_len": uid.map(str::len) })
+            }
+            _ => val.clone(),
+        };
+        out.insert(k.clone(), digest);
+    }
+    (Some(serde_json::Value::Object(out).to_string()), session, device)
 }
 
 /// 把一条用量日志交给阻塞线程池落库。
@@ -8059,14 +8260,6 @@ pub async fn probe(
     // Upstream 之前取，取值规则与转发路径同一套。
     let out_ua = ua_of(&headers);
     let probe_request_id = new_request_id();
-    let plog = ProbeLog {
-        store: &state.store,
-        cred,
-        req_model: model,
-        started: &started,
-        out_ua: (out_ua != "-").then_some(out_ua),
-        request_id: probe_request_id.clone(),
-    };
     let upstream = Upstream {
         _state: std::marker::PhantomData,
         // 测试也走这个号自己的代理——不然「测通了」测的是直连那条路，与真实转发不是一回事。
@@ -8075,7 +8268,16 @@ pub async fn probe(
             Ok(c) => c,
             Err(e) => {
                 let reason = format!("[proxy] {e:#}");
-                let _ = state.store.mark_banned(cred.id, &reason);
+                let _ = state.store.record_ban(
+                    cred.id,
+                    &store::BanContext {
+                        reason: reason.clone(),
+                        source: "proxy",
+                        error_message: Some(format!("{e:#}")),
+                        request_id: Some(probe_request_id.clone()),
+                        ..Default::default()
+                    },
+                );
                 return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}"));
             }
         },
@@ -8097,7 +8299,17 @@ pub async fn probe(
     };
 
     let body = probe_body(model);
-    let sent = upstream.send(upstream.shape(&body, cred, &device_fp));
+    let shaped = upstream.shape(&body, cred, &device_fp);
+    let plog = ProbeLog {
+        store: &state.store,
+        cred,
+        req_model: model,
+        started: &started,
+        out_ua: (out_ua != "-").then_some(out_ua),
+        request_id: probe_request_id.clone(),
+        sent: shaped.clone(),
+    };
+    let sent = upstream.send(shaped);
     // 全部匹配到的限流头原文，只进日志不进 JSON：结构化的那几项已经够前端展示，而排查时
     // 「上游到底回了哪些头」得看原样的一整串。请求没到上游时留空。
     let mut ratelimit_raw = String::new();
@@ -8247,7 +8459,15 @@ pub async fn probe(
                             reason = %reason,
                             "connectivity test detected an account-level error, auto-disabling the credential"
                         );
-                        if let Err(e) = state.store.mark_banned(cred.id, &reason) {
+                        let ctx = ban_context(
+                            &reason,
+                            "probe",
+                            status,
+                            &bytes,
+                            &plog.request_id,
+                            upstream_request_id.as_deref(),
+                        );
+                        if let Err(e) = state.store.record_ban(cred.id, &ctx) {
                             tracing::warn!(error = %e, "failed to auto-disable the credential");
                         }
                     }
@@ -8319,6 +8539,9 @@ struct ProbeLog<'a> {
     out_ua: Option<String>,
     /// 这次测试的 luban 请求 id（同转发路径的口径，见 [`handle`]），流水里按它能查到。
     request_id: String,
+    /// 实际发出去的出站体（[`Upstream::shape`] 之后）：取证列里的形态摘要、会话 id、出站
+    /// device_id 都从它读，与转发路径的 [`capture_forensics`] 同源。`Bytes` 引用计数，留一份不拷字节。
+    sent: Bytes,
 }
 
 impl ProbeLog<'_> {
@@ -8340,7 +8563,7 @@ fn log_probe_usage(
     ratelimit: &RateLimitInfo,
     upstream_request_id: Option<&str>,
 ) {
-    let ProbeLog { store, cred, req_model, started, out_ua, request_id } = ctx;
+    let ProbeLog { store, cred, req_model, started, out_ua, request_id, sent } = ctx;
     // 非流式、未压缩（wreq 已解码），喂整段 body 即可解析出顶层 `usage`。
     let mut sniffer = UsageSniffer::new(false, false);
     sniffer.feed(bytes);
@@ -8394,6 +8617,28 @@ fn log_probe_usage(
         cost_usd,
         request_id: Some(request_id.clone()),
         upstream_request_id: upstream_request_id.map(str::to_string),
+        // 连通性测试整条都是照官方形态造的（见 `probe`），故 simulated 恒为 true；
+        // 非 2xx 时把上游文案与第三方判定一并记下，与转发路径同口径。
+        forensics: {
+            let (error_type, error_message) = if status.is_success() {
+                (None, None)
+            } else {
+                let (t, m) = parse_upstream_error(bytes);
+                (t, Some(m))
+            };
+            let (shape, session_id, device_id_out) = shape_summary(sent);
+            store::Forensics {
+                proxy: cred.proxy.as_deref().map(store::redact_proxy),
+                simulated: true,
+                shape,
+                session_id,
+                device_id_out,
+                error_type,
+                error_message,
+                third_party: !status.is_success() && is_third_party_rejection(bytes),
+                ..Default::default()
+            }
+        },
     };
     // 与转发路径同理：这里在 async 上下文里，同步写库会占住工作线程，见 [`spawn_usage_log`]。
     spawn_usage_log((*store).clone(), rec);
@@ -8440,8 +8685,8 @@ mod tests {
         Bytes, HeaderValue, StatusCode, UsageSniffer, apply_tool_names, build_forward_headers,
         build_tool_name_map, config, detect_account_ban, ensure_billing_cch, find_openai_marker,
         head, header, is_billable_messages, is_secret_header, is_third_party_rejection, merge_beta,
-        normalize_tool_choice, replace_json_str_field, request_digest, request_speed, store,
-        strip_extra_fields, uuid_v4,
+        normalize_tool_choice, replace_json_str_field, request_digest, request_speed,
+        shape_summary, store, strip_extra_fields, uuid_v4,
     };
 
     /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
@@ -10356,6 +10601,90 @@ mod tests {
                 String::from_utf8_lossy(&other)
             );
         }
+    }
+
+    /// 落库的形态摘要：留住对照维度（顶层 key 顺序、system 哈希与块数、工具名、消息块计数、
+    /// 顶层参数），取出 session_id，且一个字的用户正文都不进去。
+    #[test]
+    fn shape_summary_keeps_shape_extracts_session_and_drops_user_text() {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "我的银行卡号是 1234"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "rm -rf secret"}},
+                ]},
+                {"role": "user", "content": "plain string turn"},
+            ],
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "private project notes"},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {}}, {"name": "Read", "input_schema": {}}],
+            "metadata": {"user_id": "user_ab12_account_cd34_session_9f8e7d6c-0000-1111-2222-333344445555"},
+            "max_tokens": 32000,
+            "stream": true,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let (shape, session, device) = shape_summary(&bytes);
+        let shape = shape.expect("对象体必有摘要");
+        assert_eq!(session.as_deref(), Some("9f8e7d6c-0000-1111-2222-333344445555"));
+        assert_eq!(device.as_deref(), Some("ab12"), "扁平串的 device 段落进 device_id_out");
+        let v: serde_json::Value = serde_json::from_str(&shape).unwrap();
+        assert_eq!(
+            v["keys"],
+            serde_json::json!([
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "metadata",
+                "max_tokens",
+                "stream",
+                "thinking"
+            ]),
+            "顶层 key 顺序是判据，要原样留住"
+        );
+        assert_eq!(v["system"]["blocks"].as_array().unwrap().len(), 2);
+        assert_eq!(v["system"]["blocks"][0]["cache"], true);
+        assert_eq!(v["system"]["sha"].as_str().unwrap().len(), 16);
+        assert_eq!(v["tools"]["count"], 2);
+        assert_eq!(v["tools"]["names"], serde_json::json!(["Bash", "Read"]));
+        assert_eq!(v["messages"]["count"], 3);
+        assert_eq!(v["messages"]["last_role"], "user");
+        assert_eq!(v["messages"]["blocks"]["tool_use"], 1);
+        assert_eq!(v["messages"]["blocks"]["thinking"], 1);
+        assert_eq!(v["messages"]["blocks"]["text"], 2, "字符串 content 也算一块 text");
+        assert_eq!(v["metadata"]["user_id"], true);
+        assert_eq!(v["thinking"]["budget_tokens"], 1024);
+        assert_eq!(v["max_tokens"], 32000);
+        for leak in ["1234", "rm -rf", "private project", "You are Claude", "hmm", "user_ab12"] {
+            assert!(!shape.contains(leak), "正文/身份不得进摘要: {leak} in {shape}");
+        }
+        // 非 JSON 体没有摘要，也不 panic。
+        assert_eq!(shape_summary(b"not json"), (None, None, None));
+    }
+
+    /// CC 内嵌 JSON 格式的 `metadata.user_id`：device_id / session_id 都要认出来；
+    /// 没带 metadata 时两项为 `None`，摘要照出。
+    #[test]
+    fn shape_summary_reads_embedded_json_identity() {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "{\"device_id\":\"d230ce6e1111\",\"account_uuid\":\"acct\",\"session_id\":\"sess-1\"}"},
+        });
+        let (shape, session, device) = shape_summary(&serde_json::to_vec(&body).unwrap());
+        assert!(shape.is_some());
+        assert_eq!(session.as_deref(), Some("sess-1"));
+        assert_eq!(device.as_deref(), Some("d230ce6e1111"));
+
+        let bare = serde_json::json!({"model": "claude-opus-5", "messages": []});
+        let (shape, session, device) = shape_summary(&serde_json::to_vec(&bare).unwrap());
+        assert!(shape.is_some());
+        assert_eq!((session, device), (None, None));
     }
 
     /// 摘要要留住形态判据（工具名与类型、system 块数与断点、顶层 key 顺序），
@@ -13256,8 +13585,19 @@ mod tests {
             started: &std::time::Instant::now(),
             out_ua: Some(config::CC_USER_AGENT.into()),
             request_id: "lb-probe-test".into(),
+            sent: Bytes::from_static(
+                br#"{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"probe-dev-out\",\"account_uuid\":\"a\",\"session_id\":\"probe-sess\"}"}}"#,
+            ),
         }
         .record(StatusCode::OK, &body, &info, Some("req_up_test"));
+        let logged = &store.list_usage_logs(1).unwrap()[0];
+        assert_eq!(
+            logged.forensics.device_id_out.as_deref(),
+            Some("probe-dev-out"),
+            "测试流水也记出站 device_id"
+        );
+        assert_eq!(logged.forensics.session_id.as_deref(), Some("probe-sess"));
+        assert!(logged.forensics.shape.is_some());
 
         let q = store.latest_quota(cred.id).unwrap().expect("卡片应能读到这次测试的额度");
         assert_eq!(q.rl_5h_utilization, Some(0.32));
@@ -13303,6 +13643,7 @@ mod tests {
                 request_id: "lb-test".into(),
                 client_request_id: None,
                 upstream_request_id: None,
+                forensics: Default::default(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
                 _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -13358,6 +13699,7 @@ mod tests {
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: None,
+            forensics: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -14135,6 +14477,7 @@ mod tests {
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: None,
+            forensics: Default::default(),
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),

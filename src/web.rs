@@ -318,6 +318,8 @@ pub async fn run(
         .route("/proxies/test", post(test_proxy))
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
+        .route("/ban-events", get(list_ban_events))
+        .route("/ban-events/{id}/logs", get(list_ban_event_logs))
         .route("/metrics", get(get_metrics))
         .route("/metrics/cache-series", get(get_cache_series))
         .route("/metrics/ttft-series", get(get_ttft_series))
@@ -669,6 +671,35 @@ fn usage_page(
     Ok(Json(UsagePage { total: stats.total, total_cost: stats.cost_usd, anchor, logs }))
 }
 
+#[derive(Deserialize)]
+struct BanEventsQuery {
+    #[serde(default)]
+    cred_id: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 封号事件列表（新的在前），见 [`store::CredentialStore::record_ban`]。
+///
+/// 已删账号的事件照常返回：事件按 cred_id 存、不随删号消失——死号最容易被清理，而清理的
+/// 瞬间恰是最需要留下它的时候。
+async fn list_ban_events(
+    State(state): State<AppState>,
+    Query(q): Query<BanEventsQuery>,
+) -> Result<Json<Vec<store::BanEvent>>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    Ok(Json(state.store.list_ban_events(q.cred_id, limit).map_err(internal)?))
+}
+
+/// 某封号事件冻结下来的流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求，
+/// 带取证列（出口代理、形态摘要、上游错误文案、第三方判定、改写标签）。
+async fn list_ban_event_logs(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
+    Ok(Json(state.store.frozen_usage_logs(id).map_err(internal)?))
+}
+
 // ---------- 凭证管理 ----------
 
 /// 列出全部凭证（token 已脱敏）。
@@ -682,11 +713,13 @@ async fn list_credentials(
     let costs = state.store.cost_by_cred().map_err(internal)?;
     let rpm = state.store.recent_rpm().map_err(internal)?;
     let mut denials = state.store.all_model_denials().map_err(internal)?;
+    let bans = state.store.ban_counts().map_err(internal)?;
     let defaults = DefaultLimits::of(&state.store);
     let views = list
         .iter()
         .map(|c| {
             CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), defaults)
+                .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
                 .with_cooldown(
                     state.store.rate_limited_secs(c.id),
                     state.store.rate_limited_models(c.id),
@@ -1015,7 +1048,7 @@ async fn refresh_credential(
             {
                 let reason = te.ban_reason();
                 tracing::warn!(cred_id = id, cred = %cred.label, %reason, "manual refresh: grant revoked, disabling");
-                let _ = state.store.mark_banned(id, &reason);
+                let _ = state.store.record_ban(id, &store::refresh_ban(&reason));
             }
             return Err(bad_request(e.to_string()));
         }
@@ -2403,6 +2436,9 @@ struct CredentialView {
     /// 区别只在这一项。展示绝对时刻而非倒计时的理由同 `expires_at`。恢复有三条路：到点自动、
     /// 连通性测试通过、手动打开启用开关。
     resume_at: Option<u64>,
+    /// 该号被自动封停过几次（`ban_events` 条数，解封不清零）。列表接口才填，其余返回单个
+    /// 视图的接口为 0——前端拿列表的那份。
+    ban_count: i64,
 }
 
 impl CredentialView {
@@ -2437,7 +2473,13 @@ impl CredentialView {
             rate_limited_models: Vec::new(),
             denied_models: Vec::new(),
             resume_at: c.resume_at,
+            ban_count: 0,
         }
+    }
+
+    fn with_ban_count(mut self, n: i64) -> Self {
+        self.ban_count = n;
+        self
     }
 
     /// 附加「套餐不含」的模型记录（落库的，没有就是空）。

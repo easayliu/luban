@@ -65,6 +65,7 @@ const banned: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -117,6 +118,7 @@ const normal: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -166,6 +168,7 @@ const overage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 18,
     unified_status: 'allowed',
@@ -215,6 +218,7 @@ const nearLimit: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 90,
     unified_status: 'allowed_warning',
@@ -265,6 +269,7 @@ const unknownOverage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 4 * 60,
     unified_status: 'allowed',
@@ -314,6 +319,7 @@ const only5hWindow: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 30,
     unified_status: 'allowed',
@@ -368,6 +374,7 @@ const overagePoolExhausted: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 45,
     unified_status: 'rejected',
@@ -425,6 +432,7 @@ const cooldown: Credential = {
     { model: 'claude-opus-5', secs: 25, gated: false },
   ],
   resume_at: null,
+  ban_count: 0,
   quota: null,
 }
 
@@ -455,6 +463,7 @@ const disabledHistoricalOverage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
+  ban_count: 0,
   quota: {
     ts: now - 6 * 3600,
     unified_status: 'allowed',
@@ -730,6 +739,15 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   cost_usd: index === 9 ? null : 0.0184 + index * 0.0027,
   request_id: index === 11 ? null : `req_Q3k9ZpL2mNv7${String(index).padStart(2, '0')}Xb`,
   upstream_request_id: index % 3 === 0 ? null : `req_01${String(index).padStart(2, '0')}HXk3M9pQ2rT`,
+  proxy: index % 3 === 0 ? 'socks5h://u:***@exit-sg-01.example:1080' : null,
+  simulated: index % 4 === 0,
+  shape: '{"keys":["model","messages","system","tools","metadata","max_tokens","stream"],"system":{"blocks":[{"len":10682,"cache":true},{"len":2210,"cache":true}],"sha":"3f9a1c2b4d5e6f70"},"tools":{"count":18,"sha":"a1b2c3d4e5f60718","names":["Bash","Read","Edit"]},"messages":{"count":21,"last_role":"user","blocks":{"text":30,"tool_use":9,"tool_result":9}},"max_tokens":32000,"stream":true}',
+  session_id: '7a6d8f9e-0c1b-4a2d-9e3f-5b6c7d8e9f01',
+  device_id_out: index === 11 ? null : `d230ce6e${String(index).padStart(2, '0')}4f1a9b7c3e5d2a8f6b0c1d9e7f3a5b2c4d6e8f0a1b3c5d7e9f2a4b6c8d0e`,
+  error_type: index === 5 ? 'permission_error' : null,
+  error_message: index === 5 ? 'Your account has been disabled for violating our usage policy.' : null,
+  third_party: index === 7,
+  rewrites: index === 3 ? 'demoted_thinking' : null,
 }))
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   total: 37,

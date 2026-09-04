@@ -415,7 +415,10 @@ function UsageCards({
                 )}
               </LogFact>
               <LogFact label={t('设备', 'Device')}>
-                <span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span>
+                <span className="font-mono" title={deviceTitle(log)}>
+                  {deviceShort}
+                  {log.device_id_out && <span className="text-muted-foreground">→{log.device_id_out.slice(0, 8)}</span>}
+                </span>
               </LogFact>
               <LogFact label={t('请求 ID', 'Request ID')}>
                 <RequestIdChip id={log.request_id} />
@@ -468,7 +471,7 @@ function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[80rem] table-fixed text-xs"
+      className="min-w-[87rem] table-fixed text-xs"
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -484,6 +487,8 @@ function UsageTable({
         <col className="w-[7.25rem]" />
         <col className="w-[5rem]" />
         <col className="w-[6.5rem]" />
+        {/* 出站设备：上游实际看到的 device_id 前 8 位。 */}
+        <col className="w-[6.5rem]" />
         {/* 请求 ID：尾 8 位加复制图标。固定布局下每列都得在这里登记，漏一列会把后面的列挤成 0 宽。 */}
         <col className="w-[8rem]" />
         <col className="w-[18rem]" />
@@ -494,7 +499,7 @@ function UsageTable({
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
-          <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
+          <TableHead scope="colgroup" colSpan={4} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
         </TableRow>
         <TableRow className="bg-muted/96">
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
@@ -505,7 +510,21 @@ function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('缓存写/读', 'Cache w/r')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
-          <TableHead className="whitespace-nowrap">{t('设备', 'Device')}</TableHead>
+          <TableHead
+            className="whitespace-nowrap"
+            title={t('来访客户端自带的 device_id（设备绑定与设备上限按它算）', 'device_id carried by the incoming client (device bindings and limits use it)')}
+          >
+            {t('设备', 'Device')}
+          </TableHead>
+          <TableHead
+            className="whitespace-nowrap"
+            title={t(
+              '实际发给上游的 device_id（按账号派生）；上游侧给出的设备 id 对的是这一列。旧记录为空',
+              'device_id actually sent upstream (derived per account); an id quoted by upstream matches this column. Empty for older rows',
+            )}
+          >
+            {t('出站设备', 'Device out')}
+          </TableHead>
           <TableHead
             className="whitespace-nowrap"
             title={t(
@@ -530,7 +549,6 @@ function UsageTable({
       </TableHeader>
       <TableBody>
         {rows.map((log) => {
-          const deviceId = log.device_id ?? '—'
           // 伪设备的 `sim:` 前缀要留着——截掉就和真实 device_id 混在一起分不出来了。
           const deviceShort = log.device_id
             ? log.device_id.startsWith('sim:')
@@ -590,8 +608,11 @@ function UsageTable({
               >
                 {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
               </TableCell>
-              <TableCell className="whitespace-nowrap font-mono text-xs" title={deviceId}>
+              <TableCell className="whitespace-nowrap font-mono text-xs" title={log.device_id ?? undefined}>
                 {deviceShort}
+              </TableCell>
+              <TableCell className="whitespace-nowrap font-mono text-xs" title={log.device_id_out ?? undefined}>
+                {log.device_id_out?.slice(0, 8) ?? '—'}
               </TableCell>
               <TableCell className="whitespace-nowrap">
                 <RequestIdChip id={log.request_id} />
@@ -661,4 +682,13 @@ function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
       )}
     </TableCell>
   )
+}
+
+/**
+ * 设备格的悬停全文：来访原始 id 与出站派生 id 各一行。上游侧（工单、封号通知）给出的
+ * device_id 对的是第二行——第一行是客户端自己的 id，上游从没见过。
+ */
+function deviceTitle(log: UsageLog): string | undefined {
+  if (!log.device_id && !log.device_id_out) return undefined
+  return `in:  ${log.device_id ?? '—'}\nout: ${log.device_id_out ?? '—'}`
 }

@@ -110,6 +110,8 @@ export interface Credential {
   device_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
   ban_reason: string | null
+  /** 该号被自动封停过几次（封号事件条数，解封不清零）。见 `listBanEvents`。 */
+  ban_count: number
   /**
    * 该账号专用的出站代理（`socks5://`/`http://` 等）；null 表示直连。
    *
@@ -263,6 +265,83 @@ export interface UsageLog {
   request_id: string | null
   /** 上游最后一次响应头里的 `request-id`，对 Anthropic 工单用。 */
   upstream_request_id: string | null
+  // ---- 取证列（0.3.76 起；旧记录为 null / false）----
+  /** 这一发实际走的出站代理（密码已打码）；null 为直连。 */
+  proxy: string | null
+  /** 走了模拟路径（非 CC 客户端被改写成 CC 形态发出）。 */
+  simulated: boolean
+  /** 出站请求体的结构摘要（JSON 文本，不含用户正文）。 */
+  shape: string | null
+  /** 出站身份里的 session_id。 */
+  session_id: string | null
+  /**
+   * **实际发给上游**的 device_id（出站体 `metadata.user_id` 的 device 段）。`device_id` 是来访
+   * 客户端的原始 id，上游看到的是按账号派生的另一个值；拿上游侧的 id 回查是哪台机器只能靠它。
+   * 0.3.76 之前的旧记录为 null。
+   */
+  device_id_out: string | null
+  /** 非 2xx 时上游 `error.type` / `error.message`。 */
+  error_type: string | null
+  error_message: string | null
+  /** 上游把这条请求判成了第三方应用。 */
+  third_party: boolean
+  /** 这条请求在 luban 里经历的改写重试标签（逗号分隔）。 */
+  rewrites: string | null
+}
+
+/** 分布项：某个取值出现了多少次。 */
+export interface ValueCount {
+  value: string
+  count: number
+}
+
+/**
+ * 一条封号事件：每次自动停用落一条，只追加——解封不清、删号不删。
+ * 除上游给的那几句外还带封号当时的账号侧快照，见后端 `store::BanEvent`。
+ */
+export interface BanEvent {
+  id: number
+  ts: number
+  cred_id: number
+  cred_label: string
+  /** forward / forward_401 / probe / refresh / proxy / manual */
+  source: string
+  reason: string
+  status: number | null
+  error_type: string | null
+  error_message: string | null
+  request_id: string | null
+  upstream_request_id: string | null
+  tier: string | null
+  org_type: string | null
+  proxy: string | null
+  account_created_at: number
+  lifetime_requests: number
+  lifetime_cost_usd: number
+  last_used_at: number | null
+  requests_7d: number
+  devices_7d: number
+  models_7d: ValueCount[]
+  uas_7d: ValueCount[]
+  proxies_7d: ValueCount[]
+  last_unified_status: string | null
+  last_overage_in_use: boolean | null
+  frozen_rows: number
+  /** 封前 7 天**发给 Anthropic** 的去重设备数与分布（伪装开着时是派生值）；上游眼里的设备数看这一对。 */
+  devices_out_7d: number
+  device_ids_out_7d: ValueCount[]
+}
+
+/** 封号事件列表（新的在前）。`cred_id` 可选，含已删账号。 */
+export async function listBanEvents(params: { cred_id?: number; limit?: number } = {}): Promise<BanEvent[]> {
+  const { data } = await api.get<BanEvent[]>('/ban-events', { params })
+  return data
+}
+
+/** 某封号事件冻结下来的流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求。 */
+export async function listBanEventLogs(id: number): Promise<UsageLog[]> {
+  const { data } = await api.get<UsageLog[]>(`/ban-events/${id}/logs`)
+  return data
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */

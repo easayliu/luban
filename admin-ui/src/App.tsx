@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  EllipsisVerticalIcon, LogOutIcon, PlusIcon, SearchIcon, SettingsIcon,
+  EllipsisVerticalIcon, LogOutIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon,
 } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
@@ -28,6 +28,7 @@ import {
 } from '@/components/credential-workspace'
 import { AddAccount } from '@/components/add-account'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
+import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
@@ -147,6 +148,7 @@ function App() {
   const { t } = useI18n()
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
+  const [bansOpen, setBansOpen] = useState(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [pw, setPwState] = useState<string | null>(getPw())
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -338,6 +340,9 @@ function App() {
                 <MenuItem onClick={() => setLookupOpen(true)}>
                   <SearchIcon />{t('请求查询', 'Request lookup')}
                 </MenuItem>
+                <MenuItem onClick={() => setBansOpen(true)}>
+                  <ShieldAlertIcon />{t('封号记录', 'Ban events')}
+                </MenuItem>
                 <MenuItem onClick={() => openSettings('access')}>
                   <SettingsIcon />{t('系统设置', 'System settings')}
                 </MenuItem>
@@ -365,6 +370,17 @@ function App() {
             >
               <SearchIcon />
               <span>{t('请求查询', 'Lookup')}</span>
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={isBootstrapping}
+              onClick={() => setBansOpen(true)}
+              title={t('查看自动封停记录与封前流水', 'Review auto-disable events and the traffic before them')}
+              aria-label={t('封号记录', 'Ban events')}
+            >
+              <ShieldAlertIcon />
+              <span>{t('封号记录', 'Bans')}</span>
             </Button>
             <Button
               size="sm"
@@ -404,6 +420,7 @@ function App() {
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
         <RequestLookupDialog open={lookupOpen} onOpenChange={setLookupOpen} />
+        <BanEventsDialog open={bansOpen} onOpenChange={setBansOpen} />
 
         <CredentialWorkspace
           data={{

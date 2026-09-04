@@ -145,7 +145,8 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
             {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
           </span>
         </Fact>
-        <Fact label={t('设备', 'Device')}><span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span></Fact>
+        <Fact label={t('设备（来访）', 'Device (in)')}><span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span></Fact>
+        <Fact label={t('设备（出站）', 'Device (out)')}><span className="font-mono" title={log.device_id_out ?? undefined}>{log.device_id_out?.slice(0, 8) ?? '—'}</span></Fact>
         <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
         <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
         <Fact label={t('路径', 'Path')}><span className="font-mono" title={log.path}>{log.path}</span></Fact>

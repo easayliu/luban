@@ -1057,15 +1057,15 @@ impl CredentialStore {
     /// 与 [`Self::set_disabled`] 的区别在于会写入 `ban_reason`，供后台 UI 区分
     /// 「管理员手动停用」与「上游自动判定停用」。封号是需要人工介入的终态，不写
     /// `resume_at`（对比 [`Self::pause_for_rate_limit`]）。
+    ///
+    /// 这是 [`Self::record_ban`] 的简写：只有一句原因、没有别的上下文时用（事件来源记为
+    /// `manual`）。有上游响应在手的调用方应走 `record_ban`，把状态码、完整报文、请求 id 一并
+    /// 存进封号事件。
     pub fn mark_banned(&self, id: i64, reason: &str) -> Result<bool> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
-        Ok(conn.execute(
-            "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = NULL, \
-                    updated_at = unixepoch() \
-             WHERE id = ?1",
-            params![id, reason],
-        )? > 0)
+        self.record_ban(
+            id,
+            &BanContext { reason: reason.to_string(), source: "manual", ..Default::default() },
+        )
     }
 
     /// 设置优先级。
@@ -2763,6 +2763,54 @@ pub struct UsageRecord {
     pub request_id: Option<String>,
     /// 上游**最后一次**响应头里的 `request-id`，对 Anthropic 工单用。
     pub upstream_request_id: Option<String>,
+    /// 取证字段，见 [`Forensics`]。
+    pub forensics: Forensics,
+}
+
+/// 一条流水的**取证**字段：封号事后回溯用，选号、限流、计费一概不读。
+///
+/// 上游封号只给一句所有人都一样的文案，「为什么」只能从封前流量的形态反推：走的哪个出口、
+/// 请求体长什么样、被上游判成第三方没有、经历了哪些改写。这些此前只进 tracing 日志，日志一
+/// 滚就没了，而排查恰恰要按号聚合、拿被封的号和活着的号对照。故逐条落库。
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Forensics {
+    /// 这一发实际走的出站代理（密码已打码，见 [`redact_proxy`]）；`None` 为直连。
+    pub proxy: Option<String>,
+    /// 走了模拟路径（非 CC 客户端被改写成 CC 形态发出）。
+    pub simulated: bool,
+    /// 出站请求体的结构摘要（JSON 文本，不含用户正文），见 `crate::proxy::shape_summary`。
+    pub shape: Option<String>,
+    /// 出站身份里的 session_id（`metadata.user_id` 末段 / `X-Claude-Code-Session-Id`）。
+    pub session_id: Option<String>,
+    /// **实际发给上游**的 device_id（出站体 `metadata.user_id` 里的 device 段）。
+    ///
+    /// 与流水的 `device_id` 列分开记：那一列是**来访**客户端的原始 id（设备绑定、设备上限都按
+    /// 它算），而上游看到的是按「账号 + 平台指纹」派生出来的另一个值（见
+    /// `Credential::spoof_device_id`）。上游侧拿到一个 device_id 要回查是哪台机器、哪个号，
+    /// 只有这一列对得上；反过来看一个号在上游眼里有几台设备，也只能数这一列。
+    pub device_id_out: Option<String>,
+    /// 非 2xx 时上游 `error.type` / `error.message`（message 截断到 [`ERROR_MESSAGE_MAX`]）。
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    /// 上游把这条请求判成了第三方应用（`Third-party apps now draw from your extra usage…`）。
+    pub third_party: bool,
+    /// 这条请求在 luban 里经历的改写/重试标签（逗号分隔），如 `demoted_thinking`、`no_prefill`。
+    pub rewrites: Option<String>,
+}
+
+/// `Forensics::error_message` 的落库上限（字符）。上游错误文案通常几百字，个别会把整段
+/// 请求体回显进来，那种整段存一遍是浪费。
+pub const ERROR_MESSAGE_MAX: usize = 2000;
+
+/// 把代理 URL 里的密码打码：`socks5h://user:secret@host:1080` → `socks5h://user:***@host:1080`。
+/// 出口是谁（host）是取证要看的，密码不是；流水表会被导出、被贴到别处，不能带明文密码。
+pub fn redact_proxy(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else { return url.to_string() };
+    match userinfo.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:***@{host}"),
+        None => url.to_string(),
+    }
 }
 
 /// 一条落库后的用量日志（读取用）。
@@ -2807,6 +2855,9 @@ pub struct UsageLog {
     pub request_id: Option<String>,
     /// 见 [`UsageRecord::upstream_request_id`]。
     pub upstream_request_id: Option<String>,
+    /// 取证字段，见 [`Forensics`]。0.3.76 之前的旧记录全部为空/false。
+    #[serde(flatten)]
+    pub forensics: Forensics,
 }
 
 /// [`CredentialStore::query_usage_logs`] 的入参。
@@ -3250,10 +3301,12 @@ impl CredentialStore {
                  unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
                  rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
                  rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
-                 request_id, upstream_request_id)
+                 request_id, upstream_request_id,
+                 proxy, simulated, shape, session_id, error_type, error_message, third_party,
+                 rewrites, device_id_out)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30, ?31, ?32)",
+                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
             params![
                 ts,
                 rec.cred_id,
@@ -3287,8 +3340,40 @@ impl CredentialStore {
                 rec.sse_aggregated as i64,
                 rec.request_id,
                 rec.upstream_request_id,
+                rec.forensics.proxy,
+                rec.forensics.simulated as i64,
+                rec.forensics.shape,
+                rec.forensics.session_id,
+                rec.forensics.error_type,
+                rec.forensics.error_message.as_deref().map(|m| head_chars(m, ERROR_MESSAGE_MAX)),
+                rec.forensics.third_party as i64,
+                rec.forensics.rewrites,
+                rec.forensics.device_id_out,
             ],
         )?;
+        // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
+        // 在途的几发）要等响应流结束才落库，冻结时还不存在。故封后 FREEZE_TAIL_SECS 内到达
+        // 的这个号的流水，写入时顺手补进冻结表——不然最要紧的那一条恰好缺席。
+        if let Some(cid) = rec.cred_id {
+            let recent_ban: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM ban_events WHERE cred_id = ?1 AND ts >= ?2 - ?3
+                      ORDER BY id DESC LIMIT 1",
+                    params![cid, ts, FREEZE_TAIL_SECS],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(ban_id) = recent_ban {
+                let row_id = tx.last_insert_rowid();
+                tx.execute(
+                    &format!(
+                        "INSERT INTO usage_logs_frozen (ban_event_id, src_id, {USAGE_LOG_COLS})
+                         SELECT ?1, id, {USAGE_LOG_COLS} FROM usage_logs WHERE id = ?2"
+                    ),
+                    params![ban_id, row_id],
+                )?;
+            }
+        }
         // 落账。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属，只记日志不记账。
         if let Some(cid) = rec.cred_id {
             tx.execute(
@@ -3463,61 +3548,367 @@ impl CredentialStore {
         let n = params.len();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, ts, cred_id, cred_label, device_id, model, path, status, has_usage,
-                    input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
-                    cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
-                    unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
-                    rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
-                    cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
-                    request_id, upstream_request_id
+            "SELECT id, {USAGE_LOG_COLS}
                FROM usage_logs{where_sql}
               ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
             n - 1,
             n
         ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), usage_log_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---------- 封号事件 ----------
+
+    /// 自动停用并**落一条封号事件**（[`BanContext`]），同时把该号最近
+    /// [`FREEZE_WINDOW_SECS`] 的流水冻结进 `usage_logs_frozen`。
+    ///
+    /// 事件与冻结流水都是取证材料：解封不清、删号不删、裁剪不碰（对比 `credentials.ban_reason`
+    /// 会在重新启用时被清空、`usage_logs` 会随删号级联删除并只留 30 天）。
+    ///
+    /// 事件里除了上游给的那几句，还**当场快照**一组账号侧读数（等级、组织类型、代理、账龄、
+    /// 终身请求数与费用、封前 7 天的请求数/设备数/模型/客户端）：这些在事后从别处凑不齐——
+    /// 账号可能已被删、流水可能已被裁，而它们正是拿被封的号和活着的号对照时最先要看的列。
+    ///
+    /// 返回值同 [`Self::mark_banned`]：凭证不存在时为 `false`（此时也不落事件——没有主体）。
+    pub fn record_ban(&self, id: i64, ctx: &BanContext) -> Result<bool> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let ts: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        let updated = tx.execute(
+            "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = NULL, \
+                    updated_at = unixepoch() \
+             WHERE id = ?1",
+            params![id, ctx.reason],
+        )? > 0;
+        if !updated {
+            tx.commit()?;
+            return Ok(false);
+        }
+        // 账号侧快照。
+        let (label, tier, org_type, proxy, created_at): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = tx.query_row(
+            "SELECT label, tier, org_type, proxy, created_at FROM credentials WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        let (lifetime_cost, last_used_at): (f64, Option<i64>) = tx
+            .query_row(
+                "SELECT cost_total_usd, last_used_at FROM credential_stats WHERE cred_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0.0, None));
+        let lifetime_requests: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(request_count), 0) FROM device_costs WHERE cred_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let since = ts - FREEZE_WINDOW_SECS;
+        // 设备数分两侧：device_id 是来访客户端自报的，device_id_out 是实际发给 Anthropic 的
+        // （伪装开着时是派生值）。上游看到的是后者——「一个号在上游眼里有几台设备」看它。
+        let (requests_7d, devices_7d, devices_out_7d): (i64, i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT device_id), COUNT(DISTINCT device_id_out)
+               FROM usage_logs WHERE cred_id = ?1 AND ts >= ?2",
+            params![id, since],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let distinct = |col: &str| -> Result<String> {
+            let mut st = tx.prepare(&format!(
+                "SELECT {col}, COUNT(*) AS n FROM usage_logs
+                  WHERE cred_id = ?1 AND ts >= ?2 AND {col} IS NOT NULL
+                  GROUP BY {col} ORDER BY n DESC LIMIT 50"
+            ))?;
+            let rows = st.query_map(params![id, since], |r| {
+                Ok(serde_json::json!({ "value": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? }))
+            })?;
+            Ok(serde_json::Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?).to_string())
+        };
+        let models_7d = distinct("model")?;
+        let uas_7d = distinct("ua")?;
+        let proxies_7d = distinct("proxy")?;
+        let device_ids_out_7d = distinct("device_id_out")?;
+        // 封前最后一条流水的限流快照：额度是不是早就满了、在不在烧 credits。
+        let (last_unified, last_overage): (Option<String>, Option<i64>) = tx
+            .query_row(
+                "SELECT unified_status, overage_in_use FROM credential_stats WHERE cred_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None));
+        tx.execute(
+            "INSERT INTO ban_events
+                (ts, cred_id, cred_label, source, reason, status, error_type, error_message,
+                 request_id, upstream_request_id, tier, org_type, proxy, account_created_at,
+                 lifetime_requests, lifetime_cost_usd, last_used_at, requests_7d, devices_7d,
+                 models_7d, uas_7d, proxies_7d, last_unified_status, last_overage_in_use,
+                 devices_out_7d, device_ids_out_7d)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            params![
+                ts,
+                id,
+                label,
+                ctx.source,
+                ctx.reason,
+                ctx.status.map(i64::from),
+                ctx.error_type,
+                ctx.error_message.as_deref().map(|m| head_chars(m, ERROR_MESSAGE_MAX * 4)),
+                ctx.request_id,
+                ctx.upstream_request_id,
+                tier,
+                org_type,
+                proxy.as_deref().map(redact_proxy),
+                created_at,
+                lifetime_requests,
+                lifetime_cost,
+                last_used_at,
+                requests_7d,
+                devices_7d,
+                models_7d,
+                uas_7d,
+                proxies_7d,
+                last_unified,
+                last_overage,
+                devices_out_7d,
+                device_ids_out_7d,
+            ],
+        )?;
+        let ban_id = tx.last_insert_rowid();
+        let frozen = tx.execute(
+            &format!(
+                "INSERT INTO usage_logs_frozen (ban_event_id, src_id, {USAGE_LOG_COLS})
+                 SELECT ?1, id, {USAGE_LOG_COLS} FROM usage_logs
+                  WHERE cred_id = ?2 AND ts >= ?3 ORDER BY id"
+            ),
+            params![ban_id, id, since],
+        )?;
+        tx.execute(
+            "UPDATE ban_events SET frozen_rows = ?2 WHERE id = ?1",
+            params![ban_id, frozen as i64],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 封号事件列表（新的在前）。`cred_id` 为 `Some` 时只看那个号（含已删的号：事件按 id 存，
+    /// 不随删号消失）。
+    pub fn list_ban_events(&self, cred_id: Option<i64>, limit: i64) -> Result<Vec<BanEvent>> {
+        let conn = self.conn.lock();
+        let (where_sql, params): (&str, Vec<rusqlite::types::Value>) = match cred_id {
+            Some(c) => (" WHERE cred_id = ?1", vec![c.into(), limit.into()]),
+            None => ("", vec![limit.into()]),
+        };
+        let n = params.len();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, ts, cred_id, cred_label, source, reason, status, error_type, error_message,
+                    request_id, upstream_request_id, tier, org_type, proxy, account_created_at,
+                    lifetime_requests, lifetime_cost_usd, last_used_at, requests_7d, devices_7d,
+                    models_7d, uas_7d, proxies_7d, last_unified_status, last_overage_in_use,
+                    frozen_rows, devices_out_7d, device_ids_out_7d
+               FROM ban_events{where_sql} ORDER BY id DESC LIMIT ?{n}"
+        ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-            Ok(UsageLog {
+            let json_list = |i: usize| -> rusqlite::Result<Vec<serde_json::Value>> {
+                let raw: Option<String> = r.get(i)?;
+                Ok(raw
+                    .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
+                    .unwrap_or_default())
+            };
+            Ok(BanEvent {
                 id: r.get(0)?,
                 ts: r.get(1)?,
                 cred_id: r.get(2)?,
                 cred_label: r.get(3)?,
-                device_id: r.get(4)?,
-                model: r.get(5)?,
-                path: r.get(6)?,
-                status: r.get::<_, i64>(7)? as u16,
-                has_usage: r.get::<_, i64>(8)? != 0,
-                input_tokens: r.get(9)?,
-                output_tokens: r.get(10)?,
-                cache_creation_tokens: r.get(11)?,
-                cache_5m_tokens: r.get(12)?,
-                cache_1h_tokens: r.get(13)?,
-                cache_read_tokens: r.get(14)?,
-                ttft_ms: r.get(15)?,
-                total_ms: r.get(16)?,
-                unified_status: r.get(17)?,
-                rl_5h_status: r.get(18)?,
-                rl_5h_reset: r.get(19)?,
-                rl_5h_utilization: r.get(20)?,
-                rl_7d_status: r.get(21)?,
-                rl_7d_reset: r.get(22)?,
-                rl_7d_utilization: r.get(23)?,
-                rl_representative: r.get(24)?,
-                ratelimit_raw: r.get(25)?,
-                cost_usd: r.get(26)?,
-                rl_overage_in_use: r.get(27)?,
-                ua: r.get(28)?,
-                ua_out: r.get(29)?,
-                sse_aggregated: r.get::<_, i64>(30)? != 0,
-                request_id: r.get(31)?,
-                upstream_request_id: r.get(32)?,
+                source: r.get(4)?,
+                reason: r.get(5)?,
+                status: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
+                error_type: r.get(7)?,
+                error_message: r.get(8)?,
+                request_id: r.get(9)?,
+                upstream_request_id: r.get(10)?,
+                tier: r.get(11)?,
+                org_type: r.get(12)?,
+                proxy: r.get(13)?,
+                account_created_at: r.get(14)?,
+                lifetime_requests: r.get(15)?,
+                lifetime_cost_usd: r.get(16)?,
+                last_used_at: r.get(17)?,
+                requests_7d: r.get(18)?,
+                devices_7d: r.get(19)?,
+                models_7d: json_list(20)?,
+                uas_7d: json_list(21)?,
+                proxies_7d: json_list(22)?,
+                last_unified_status: r.get(23)?,
+                last_overage_in_use: r.get::<_, Option<i64>>(24)?.map(|v| v != 0),
+                frozen_rows: r.get(25)?,
+                devices_out_7d: r.get::<_, Option<i64>>(26)?.unwrap_or(0),
+                device_ids_out_7d: json_list(27)?,
             })
         })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// 每个凭证被自动封停过几次（cred_id → 次数）；没封过的号不出现。
+    pub fn ban_counts(&self) -> Result<HashMap<i64, i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT cred_id, COUNT(*) FROM ban_events GROUP BY cred_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// 某封号事件冻结下来的流水（按时间正序，最早的在前，读起来是一条时间线）。
+    /// `id` 是冻结表自己的主键；原流水的 id 不返回——它在原表里可能早已被裁掉。
+    pub fn frozen_usage_logs(&self, ban_event_id: i64) -> Result<Vec<UsageLog>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, {USAGE_LOG_COLS} FROM usage_logs_frozen
+              WHERE ban_event_id = ?1 ORDER BY ts, id"
+        ))?;
+        let rows = stmt.query_map([ban_event_id], usage_log_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+/// `usage_logs` 与 `usage_logs_frozen` 共用的列清单（不含各自的主键）。**读与写都用它**：
+/// 冻结是 `INSERT … SELECT` 逐列照搬，两张表的列必须一一对齐，清单只此一份才不会漂。
+/// 顺序即 [`usage_log_from_row`] 的下标顺序（从 1 起，0 号是主键）。
+const USAGE_LOG_COLS: &str = "ts, cred_id, cred_label, device_id, model, path, status, has_usage,
+        input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
+        cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
+        unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
+        rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative, ratelimit_raw,
+        cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
+        request_id, upstream_request_id,
+        proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
+        device_id_out";
+
+/// 按 [`USAGE_LOG_COLS`] 的顺序把一行读成 [`UsageLog`]（0 号列是主键）。
+fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
+    Ok(UsageLog {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        cred_id: r.get(2)?,
+        cred_label: r.get(3)?,
+        device_id: r.get(4)?,
+        model: r.get(5)?,
+        path: r.get(6)?,
+        status: r.get::<_, i64>(7)? as u16,
+        has_usage: r.get::<_, i64>(8)? != 0,
+        input_tokens: r.get(9)?,
+        output_tokens: r.get(10)?,
+        cache_creation_tokens: r.get(11)?,
+        cache_5m_tokens: r.get(12)?,
+        cache_1h_tokens: r.get(13)?,
+        cache_read_tokens: r.get(14)?,
+        ttft_ms: r.get(15)?,
+        total_ms: r.get(16)?,
+        unified_status: r.get(17)?,
+        rl_5h_status: r.get(18)?,
+        rl_5h_reset: r.get(19)?,
+        rl_5h_utilization: r.get(20)?,
+        rl_7d_status: r.get(21)?,
+        rl_7d_reset: r.get(22)?,
+        rl_7d_utilization: r.get(23)?,
+        rl_representative: r.get(24)?,
+        ratelimit_raw: r.get(25)?,
+        cost_usd: r.get(26)?,
+        rl_overage_in_use: r.get(27)?,
+        ua: r.get(28)?,
+        ua_out: r.get(29)?,
+        sse_aggregated: r.get::<_, i64>(30)? != 0,
+        request_id: r.get(31)?,
+        upstream_request_id: r.get(32)?,
+        forensics: Forensics {
+            proxy: r.get(33)?,
+            simulated: r.get::<_, Option<i64>>(34)?.unwrap_or(0) != 0,
+            shape: r.get(35)?,
+            session_id: r.get(36)?,
+            error_type: r.get(37)?,
+            error_message: r.get(38)?,
+            third_party: r.get::<_, Option<i64>>(39)?.unwrap_or(0) != 0,
+            rewrites: r.get(40)?,
+            device_id_out: r.get(41)?,
+        },
+    })
+}
+
+/// 按字符截断（不是按字节：文案里有中文，按字节切会切在多字节中间）。
+fn head_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect() }
+}
+
+/// 封号时冻结的流水回看窗口：7 天。上游的额度窗口最长 7 天，判封的依据不太可能更久远；
+/// 再长冻结表就会比流水表还大。
+pub const FREEZE_WINDOW_SECS: i64 = 7 * 24 * 3600;
+
+/// 封号事件之后多长时间内到达的流水也补进冻结表，见 `insert_usage_log_at`。触发那一发的
+/// 响应流通常几十秒内结束，10 分钟够覆盖并发在途的所有请求。
+pub const FREEZE_TAIL_SECS: i64 = 600;
+
+/// 一次自动停用的上下文，见 [`CredentialStore::record_ban`]。
+#[derive(Debug, Default, Clone)]
+pub struct BanContext {
+    /// 写进 `credentials.ban_reason` 的一句话（200 字符内），与旧 `mark_banned` 的参数同义。
+    pub reason: String,
+    /// 触发来源：`forward`（转发 4xx）、`forward_401`（转发 401 换号）、`probe`（连通性
+    /// 测试）、`refresh`（刷新 token 被作废）、`proxy`（代理建不出来）、`manual`（其它）。
+    pub source: &'static str,
+    /// 上游 HTTP 状态码（有的话）。
+    pub status: Option<u16>,
+    /// 上游 `error.type` 与**完整** `error.message`（reason 是截断过的）。
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    /// 触发那条请求的 luban 请求 id 与上游 `request-id`——拿它能在冻结流水里精确找到那一发。
+    pub request_id: Option<String>,
+    pub upstream_request_id: Option<String>,
+}
+
+/// 一条封号事件（读取用），见 [`CredentialStore::record_ban`]。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BanEvent {
+    pub id: i64,
+    pub ts: i64,
+    pub cred_id: i64,
+    pub cred_label: String,
+    pub source: String,
+    pub reason: String,
+    pub status: Option<u16>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub request_id: Option<String>,
+    pub upstream_request_id: Option<String>,
+    pub tier: Option<String>,
+    pub org_type: Option<String>,
+    /// 封号当时该号配的代理（密码已打码）。
+    pub proxy: Option<String>,
+    pub account_created_at: i64,
+    pub lifetime_requests: i64,
+    pub lifetime_cost_usd: f64,
+    pub last_used_at: Option<i64>,
+    /// 封前 7 天的请求数、去重设备数，以及模型 / 来访 UA / 代理的分布（`{value, count}`，按次数降序）。
+    pub requests_7d: i64,
+    pub devices_7d: i64,
+    pub models_7d: Vec<serde_json::Value>,
+    pub uas_7d: Vec<serde_json::Value>,
+    pub proxies_7d: Vec<serde_json::Value>,
+    /// 封前账本里最后一次限流快照的 unified_status / overage_in_use。
+    pub last_unified_status: Option<String>,
+    pub last_overage_in_use: Option<bool>,
+    /// 冻结进 `usage_logs_frozen` 的流水条数（含封后补进去的）。
+    pub frozen_rows: i64,
+    /// 封前 7 天**发给 Anthropic** 的去重设备数与分布（`device_id_out`，伪装开着时是派生值）。
+    /// 与 `devices_7d`（来访自报）分开：上游眼里这个号有几台设备，看的是这一对。
+    pub devices_out_7d: i64,
+    pub device_ids_out_7d: Vec<serde_json::Value>,
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -3614,6 +4005,82 @@ fn init_schema(conn: &Connection) -> Result<()> {
         -- 设备明细要按 device_id 汇总费用（含跨账号合计）；日志表只会越攒越多，
         -- 没这条索引时展开一次卡片就是一次全表扫描。
         CREATE INDEX IF NOT EXISTS idx_usage_logs_device ON usage_logs(device_id, cred_id);
+
+        -- 封号事件：每次自动停用落一条，只追加。解封不清、删号不删、不裁剪——这是取证材料，
+        -- 而 credentials.ban_reason 会在重新启用时清空、usage_logs 会随删号级联删除。
+        -- 列含义见 BanEvent。列表类字段（models_7d 等）存 JSON 文本。
+        CREATE TABLE IF NOT EXISTS ban_events (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                  INTEGER NOT NULL DEFAULT (unixepoch()),
+            cred_id             INTEGER NOT NULL,
+            cred_label          TEXT    NOT NULL DEFAULT '',
+            source              TEXT    NOT NULL DEFAULT '',
+            reason              TEXT    NOT NULL DEFAULT '',
+            status              INTEGER,
+            error_type          TEXT,
+            error_message       TEXT,
+            request_id          TEXT,
+            upstream_request_id TEXT,
+            tier                TEXT,
+            org_type            TEXT,
+            proxy               TEXT,
+            account_created_at  INTEGER NOT NULL DEFAULT 0,
+            lifetime_requests   INTEGER NOT NULL DEFAULT 0,
+            lifetime_cost_usd   REAL    NOT NULL DEFAULT 0,
+            last_used_at        INTEGER,
+            requests_7d         INTEGER NOT NULL DEFAULT 0,
+            devices_7d          INTEGER NOT NULL DEFAULT 0,
+            models_7d           TEXT,
+            uas_7d              TEXT,
+            proxies_7d          TEXT,
+            last_unified_status TEXT,
+            last_overage_in_use INTEGER,
+            frozen_rows         INTEGER NOT NULL DEFAULT 0,
+            devices_out_7d      INTEGER NOT NULL DEFAULT 0,
+            device_ids_out_7d   TEXT
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_ban_events_cred_ts ON ban_events(cred_id, ts);
+
+        -- 封号时冻结的流水：与 usage_logs 同列（见 USAGE_LOG_COLS），多出 ban_event_id 与原行
+        -- id（src_id）。不裁剪、不随删号删除。读法见 frozen_usage_logs。
+        CREATE TABLE IF NOT EXISTS usage_logs_frozen (
+            id             INTEGER PRIMARY KEY,
+            ban_event_id   INTEGER NOT NULL,
+            src_id         INTEGER,
+            ts             INTEGER NOT NULL DEFAULT (unixepoch()),
+            cred_id        INTEGER,
+            cred_label     TEXT    NOT NULL DEFAULT '',
+            device_id      TEXT,
+            model          TEXT,
+            path           TEXT    NOT NULL DEFAULT '',
+            ua             TEXT,
+            ua_out         TEXT,
+            status         INTEGER NOT NULL DEFAULT 0,
+            has_usage      INTEGER NOT NULL DEFAULT 0,
+            input_tokens          INTEGER,
+            output_tokens         INTEGER,
+            cache_creation_tokens INTEGER,
+            cache_5m_tokens       INTEGER,
+            cache_1h_tokens       INTEGER,
+            cache_read_tokens     INTEGER,
+            ttft_ms        INTEGER,
+            total_ms       INTEGER,
+            unified_status     TEXT,
+            rl_5h_status       TEXT,
+            rl_5h_reset        INTEGER,
+            rl_5h_utilization  REAL,
+            rl_7d_status       TEXT,
+            rl_7d_reset        INTEGER,
+            rl_7d_utilization  REAL,
+            rl_representative  TEXT,
+            rl_overage_in_use  INTEGER,
+            ratelimit_raw      TEXT,
+            cost_usd           REAL,
+            sse_aggregated     INTEGER NOT NULL DEFAULT 0,
+            request_id         TEXT,
+            upstream_request_id TEXT
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_frozen_ban ON usage_logs_frozen(ban_event_id, ts);
 
         -- 账本：每凭证的终身累计统计与最新额度快照，与 usage_logs 的插入在同一事务内更新
         -- （见 insert_usage_log_at）。分工：usage_logs 是流水，只保留近期（prune_usage_logs），
@@ -3715,8 +4182,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
         // 0.3.70：luban 自己的请求 id 与上游最后一次的 request-id，见 UsageRecord::request_id。
         "request_id TEXT",
         "upstream_request_id TEXT",
+        // 0.3.76：取证列，见 Forensics。
+        "proxy TEXT",
+        "simulated INTEGER NOT NULL DEFAULT 0",
+        "shape TEXT",
+        "session_id TEXT",
+        "error_type TEXT",
+        "error_message TEXT",
+        "third_party INTEGER NOT NULL DEFAULT 0",
+        "rewrites TEXT",
+        // 0.3.76：出站 device_id，见 Forensics::device_id_out。
+        "device_id_out TEXT",
     ] {
+        // 冻结表与流水表同列（USAGE_LOG_COLS 逐列照搬），补列必须两张一起补。
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
+        let _ = conn.execute(&format!("ALTER TABLE usage_logs_frozen ADD COLUMN {col}"), []);
     }
     // 这两个索引依赖上面补出来的列 / 服务翻页的排序键，**必须在补列之后建**：
     // - (cred_id, id)：按号翻页是 `cred_id = ? AND id <= ? ORDER BY id DESC`，与索引序完全
@@ -3726,6 +4206,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_id ON usage_logs(cred_id, id);
          CREATE INDEX IF NOT EXISTS idx_usage_logs_request_id ON usage_logs(request_id);",
     )?;
+    // ban_events 的出站设备两列是随 device_id_out 一起加的：先建过表的库幂等补上。
+    let _ = conn
+        .execute("ALTER TABLE ban_events ADD COLUMN devices_out_7d INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE ban_events ADD COLUMN device_ids_out_7d TEXT", []);
     // credential_stats 是 0.2.37 加的表，这两列都在其后才有：同样幂等补列。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
     // device_costs 的终身请求数是后加的：老库补出来是 0，之后的请求照常累加。
@@ -4344,11 +4828,21 @@ pub async fn access_token_of(
                 reason = %reason,
                 "refresh_token revoked upstream, disabling the credential"
             );
-            if let Err(e) = store.mark_banned(cred.id, &reason) {
+            if let Err(e) = store.record_ban(cred.id, &refresh_ban(&reason)) {
                 tracing::warn!(error = %e, "failed to auto-disable the credential");
             }
             anyhow::bail!("{reason}")
         }
+    }
+}
+
+/// 刷新 token 被上游作废时的封号上下文：没有 HTTP 往返可记，来源标成 `refresh`。
+pub fn refresh_ban(reason: &str) -> BanContext {
+    BanContext {
+        reason: reason.to_string(),
+        source: "refresh",
+        error_message: Some(reason.to_string()),
+        ..Default::default()
     }
 }
 
@@ -4391,7 +4885,7 @@ async fn select_with_refresh_failover<'a>(
                     "refresh_token revoked upstream, disabling the credential and selecting another"
                 );
                 // 停用没生效就必须中止：否则下一轮还会选中同一个号，白转满 MAX_REFRESH_FAILOVER 圈。
-                if !store.mark_banned(cred.id, &reason)? {
+                if !store.record_ban(cred.id, &refresh_ban(&reason))? {
                     anyhow::bail!(
                         "credential #{} refresh failed and could not be disabled: {reason}",
                         cred.id
@@ -4710,6 +5204,160 @@ mod tests {
     /// 刷新失败自动换号所依赖的那一步：停用坏号后，原本绑在它上面的设备必须能改选到别的号。
     ///
     /// `select_for_device` 会优先命中既有绑定，所以只是「不再选中被停用的号」还不够——
+    /// 封号事件与冻结流水是取证材料：落地时快照账号侧读数、冻结封前流水；封后 10 分钟内
+    /// 到达的流水（触发那一发）也要补进去；删号、解封、裁剪都不能碰它们。
+    #[test]
+    fn record_ban_freezes_history_and_survives_deletion() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+        store.set_proxy(a.id, Some("socks5h://u:secret@exit1:1080")).unwrap();
+        let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+        let mut rec = UsageRecord {
+            cred_id: Some(a.id),
+            cred_label: "a".into(),
+            device_id: Some("dev1".into()),
+            model: Some("claude-opus-5".into()),
+            ua: Some("claude-cli/2.1.259".into()),
+            status: 200,
+            cost_usd: Some(0.5),
+            forensics: Forensics {
+                proxy: Some("socks5h://u:***@exit1:1080".into()),
+                shape: Some("{\"keys\":[\"model\"]}".into()),
+                device_id_out: Some("d230ce6e-out".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 封前 3 天的两条 + 10 天前的一条（窗口外，不该被冻结）。
+        store.insert_usage_log_at(&rec, Some(now - 3 * 86400)).unwrap();
+        rec.device_id = Some("dev2".into());
+        store.insert_usage_log_at(&rec, Some(now - 3 * 86400 + 5)).unwrap();
+        store.insert_usage_log_at(&rec, Some(now - 10 * 86400)).unwrap();
+
+        let ctx = BanContext {
+            reason: "[403] permission_error: account disabled".into(),
+            source: "forward",
+            status: Some(403),
+            error_type: Some("permission_error".into()),
+            error_message: Some("Your account has been disabled for policy violations".into()),
+            request_id: Some("req_x".into()),
+            upstream_request_id: Some("up_x".into()),
+        };
+        assert!(store.record_ban(a.id, &ctx).unwrap());
+        assert!(!store.record_ban(9999, &ctx).unwrap(), "不存在的号不落事件");
+
+        let events = store.list_ban_events(None, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.cred_id, a.id);
+        assert_eq!(ev.source, "forward");
+        assert_eq!(ev.status, Some(403));
+        assert_eq!(ev.error_type.as_deref(), Some("permission_error"));
+        assert_eq!(ev.request_id.as_deref(), Some("req_x"));
+        assert_eq!(ev.proxy.as_deref(), Some("socks5h://u:***@exit1:1080"), "代理密码要打码");
+        assert_eq!(ev.lifetime_requests, 3);
+        assert!((ev.lifetime_cost_usd - 1.5).abs() < 1e-9);
+        assert_eq!(ev.requests_7d, 2);
+        assert_eq!(ev.devices_7d, 2);
+        assert_eq!(ev.devices_out_7d, 1, "两台来访设备伪装成同一个出站 device_id");
+        assert_eq!(ev.device_ids_out_7d[0]["value"], "d230ce6e-out");
+        assert_eq!(ev.device_ids_out_7d[0]["count"], 2);
+        assert_eq!(ev.models_7d[0]["value"], "claude-opus-5");
+        assert_eq!(ev.models_7d[0]["count"], 2);
+        assert_eq!(ev.frozen_rows, 2, "只冻结 7 天窗口内的流水");
+        let frozen = store.frozen_usage_logs(ev.id).unwrap();
+        assert_eq!(frozen.len(), 2);
+        assert_eq!(frozen[0].forensics.shape.as_deref(), Some("{\"keys\":[\"model\"]}"));
+        assert_eq!(frozen[0].forensics.proxy.as_deref(), Some("socks5h://u:***@exit1:1080"));
+        assert_eq!(
+            frozen[0].forensics.device_id_out.as_deref(),
+            Some("d230ce6e-out"),
+            "出站 device_id 要随流水一起落库并进冻结表"
+        );
+        assert_eq!(
+            store.list_usage_logs(10).unwrap()[0].forensics.device_id_out.as_deref(),
+            Some("d230ce6e-out")
+        );
+
+        // 封后到达的（触发那一发）也进冻结表。
+        rec.status = 403;
+        rec.forensics.error_type = Some("permission_error".into());
+        store.insert_usage_log(&rec).unwrap();
+        let frozen = store.frozen_usage_logs(ev.id).unwrap();
+        assert_eq!(frozen.len(), 3);
+        assert_eq!(frozen[2].status, 403);
+        assert_eq!(frozen[2].forensics.error_type.as_deref(), Some("permission_error"));
+        // 封后太久的不算。
+        store.insert_usage_log_at(&rec, Some(now + FREEZE_TAIL_SECS + 60)).unwrap();
+        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+
+        // 解封不清事件；删号不删事件与冻结流水；裁剪不碰冻结表。
+        store.set_disabled(a.id, false).unwrap();
+        assert_eq!(store.ban_counts().unwrap()[&a.id], 1);
+        assert!(store.delete(a.id).unwrap());
+        assert_eq!(store.list_ban_events(Some(a.id), 10).unwrap().len(), 1);
+        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+        store.prune_usage_logs().unwrap();
+        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+    }
+
+    /// 老库升级：`usage_logs` 还没有取证列、两张新表都不存在。init_schema 之后要能正常写入、
+    /// 封号、冻结——补列走的是 ALTER，冻结用的列清单两张表必须对得上。
+    #[test]
+    fn legacy_usage_logs_table_gets_forensic_columns_and_freezes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL DEFAULT '',
+                access_token TEXT NOT NULL, refresh_token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch())) STRICT;
+             CREATE TABLE usage_logs (
+                id INTEGER PRIMARY KEY, ts INTEGER NOT NULL DEFAULT (unixepoch()),
+                cred_id INTEGER, cred_label TEXT NOT NULL DEFAULT '', device_id TEXT, model TEXT,
+                path TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0,
+                has_usage INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER, output_tokens INTEGER,
+                cache_creation_tokens INTEGER, cache_read_tokens INTEGER, ttft_ms INTEGER,
+                total_ms INTEGER, unified_status TEXT, rl_5h_status TEXT, rl_5h_reset INTEGER) STRICT;",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("legacy", None, "at", "rt", u64::MAX, None, None).unwrap();
+        let rec = UsageRecord {
+            cred_id: Some(a.id),
+            cred_label: "legacy".into(),
+            status: 200,
+            forensics: Forensics { proxy: Some("http://h:1".into()), ..Default::default() },
+            ..Default::default()
+        };
+        store.insert_usage_log(&rec).unwrap();
+        assert_eq!(
+            store.list_usage_logs(10).unwrap()[0].forensics.proxy.as_deref(),
+            Some("http://h:1")
+        );
+        assert!(store.mark_banned(a.id, "banned").unwrap());
+        let ev = &store.list_ban_events(None, 10).unwrap()[0];
+        assert_eq!(ev.source, "manual");
+        assert_eq!(ev.frozen_rows, 1);
+        assert_eq!(
+            store.frozen_usage_logs(ev.id).unwrap()[0].forensics.proxy.as_deref(),
+            Some("http://h:1")
+        );
+    }
+
+    #[test]
+    fn redact_proxy_hides_only_the_password() {
+        assert_eq!(redact_proxy("socks5h://u:p@h:1"), "socks5h://u:***@h:1");
+        assert_eq!(redact_proxy("http://h:8080"), "http://h:8080");
+        assert_eq!(redact_proxy("http://u@h:8080"), "http://u@h:8080");
+        assert_eq!(redact_proxy("http://u:p:q@h"), "http://u:***@h");
+    }
+
     /// `mark_banned` 必须把它的 device_bindings 一并清掉，否则设备被钉死在坏号上，
     /// [`valid_access_token_for_device`] 的重选循环会一直选回同一个，白转满上限。
     #[test]
