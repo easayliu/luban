@@ -5273,9 +5273,9 @@ fn rewrite_body(
     let tools_deduped = dedup_tools(&mut v);
     // 空 text 块剥除：上游要求 text 块非空，第三方客户端常发空块。
     let empty_text_stripped = flags.strip_empty_text && strip_empty_text_blocks(&mut v);
-    // 空 thinking 块剥除：上游要求每个 thinking 块必须有 thinking 内容，
-    // strip_extra_fields 剥掉 thinking.display 后回程可能返回空 thinking，
-    // 客户端下一轮回传就会被拒。无条件处理——空 thinking 块永远是无效的。
+    // 无签名空 thinking 块剥除：上游要求 thinking 块有内容或有签名。带签名的空块是上游
+    // 自己回的合法形态（官方 CC 原样回传，上游接受），不动；只剥第三方客户端拼出来的
+    // 无签名空块。无条件处理——这种块永远是无效的。
     let empty_thinking_stripped = strip_empty_thinking_blocks(&mut v);
     // input_schema 顶层的 allOf/oneOf/anyOf 展平：上游不支持，直接 400。
     let schemas_flattened = flags.flatten_tool_schemas && flatten_tool_schemas(&mut v);
@@ -6356,26 +6356,27 @@ fn strip_empty_text_blocks(v: &mut serde_json::Value) -> bool {
     changed
 }
 
-/// 剥除 `messages` 历史里 `thinking` 字段为空的 `thinking` 块。
+/// 剥除 `messages` 历史里 `thinking` 为空**且没有 `signature`** 的 `thinking` 块。
 ///
-/// 上游要求每个 `{"type":"thinking"}` 块必须包含非空的 `thinking` 字段，否则 400
-/// （`each thinking block must contain thinking`）。
+/// 上游对没有内容的 thinking 块回 400（`each thinking block must contain thinking`）。
+/// 但**带签名的空块是合法的**：上游不带 `display` 时本来就只回空文本 + 签名（`cap/2.1.258`
+/// 00025/00031、`cap/2.1.258-api` 00023/00025），官方 CC 下一轮原样回传，上游 200
+/// （`cap/2.1.260` 00021/00025/00028/00029/00031，签名 776～2592 字节）。实跑日志里一条
+/// 669 消息的 opus 请求被剥掉 33 块，**全部带签名**——那些都是不该动的。
 ///
-/// 常见成因：`strip_extra_fields` 剥掉了出站请求的 `thinking.display`，上游按 `omitted`
-/// 返回空 thinking 文本，客户端下一轮原样回传这些空块就会被拒。
+/// 所以剥除只针对无签名的空块：那是第三方客户端自己拼出来的历史，上游必拒。带签名的
+/// 原样放行，与 CC 直连形态一致，也不触发上游对 thinking 块的「不可修改」校验。
 ///
-/// 与 [`strip_empty_text_blocks`] 对称：只剥空 thinking 块，留下其余内容块；若整个
-/// `content` 只有空 thinking 块则保留原样（空 `content` 数组是另一种 400）。
+/// 与 [`strip_empty_text_blocks`] 对称：只剥目标块，留下其余内容块；若整个 `content`
+/// 只有这种块则保留原样（空 `content` 数组是另一种 400）。
 fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return false;
     };
     let total = msgs.len();
     let mut changed = false;
-    // 每个被剥块的形态：`msg=<第几条>/<总数> keys=[..] sig_len=<签名字节数|none>
-    // thinking=<missing|empty>`。要回答的问题是「这些空块有没有签名」——官方 CC 回传的
-    // 空 thinking 块**带**签名且上游接受（`cap/2.1.260` 00021/00025/00028/00029/00031），
-    // 若这里剥掉的块也带签名，说明剥除是多余的；若不带，才是真正会被 400 的那种。
+    // 每个被剥块的形态：`msg=<第几条>/<总数> keys=[..] sig_len=none thinking=<missing|empty>`。
+    // 按现在的判据 sig_len 恒为 none；保留字段是为了万一判据再变时日志形态不用改。
     let mut stripped: Vec<String> = Vec::new();
     let mut kept_all_empty: Vec<String> = Vec::new();
     for (mi, msg) in msgs.iter_mut().enumerate() {
@@ -6388,6 +6389,7 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
         let is_empty_thinking = |blk: &serde_json::Value| {
             blk.get("type").and_then(|t| t.as_str()) == Some("thinking")
                 && blk.get("thinking").and_then(|t| t.as_str()).is_none_or(|t| t.is_empty())
+                && blk.get("signature").and_then(|s| s.as_str()).is_none_or(|s| s.is_empty())
         };
         let non_empty_count = content.iter().filter(|blk| !is_empty_thinking(blk)).count();
         if non_empty_count == content.len() {
@@ -6410,7 +6412,7 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
             model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
             count = stripped.len(),
             blocks = %stripped.join("; "),
-            "stripped empty thinking blocks from messages"
+            "stripped unsigned empty thinking blocks from messages"
         );
     }
     if !kept_all_empty.is_empty() {
@@ -6418,7 +6420,7 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
             model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
             count = kept_all_empty.len(),
             blocks = %kept_all_empty.join("; "),
-            "kept empty thinking blocks: stripping would leave the message with empty content"
+            "kept unsigned empty thinking blocks: stripping would leave the message with empty content"
         );
     }
     changed
@@ -10674,12 +10676,39 @@ mod tests {
                 ]}
             ]
         });
-        assert!(super::strip_empty_thinking_blocks(&mut v));
+        assert!(!super::strip_empty_thinking_blocks(&mut v), "带签名的空块合法，整体无改动");
         let first = v["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(first.len(), 1, "签名再长也剥——当前策略只看 thinking 是否为空");
-        assert_eq!(first[0]["type"], "text");
+        assert_eq!(first.len(), 2, "带签名的空 thinking 块原样放行（cap/2.1.260 官方回传形态）");
         assert_eq!(v["messages"][1]["content"].as_array().unwrap().len(), 1, "全空的消息原样保留");
         assert_eq!(v["messages"][2]["content"].as_array().unwrap().len(), 1, "非 assistant 不动");
+    }
+
+    #[test]
+    fn strips_only_unsigned_empty_thinking_blocks() {
+        let mut v = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": ""},
+                    {"type": "thinking", "thinking": "", "signature": ""},
+                    {"type": "thinking", "thinking": "", "signature": "signed"},
+                    {"type": "thinking", "thinking": "real", "signature": ""},
+                    {"type": "text", "text": "hello"}
+                ]}
+            ]
+        });
+        assert!(super::strip_empty_thinking_blocks(&mut v));
+        let kept: Vec<String> = v["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(super::block_label)
+            .collect();
+        assert_eq!(
+            kept,
+            ["thinking(len=0,sig_len=6)", "thinking(len=4,sig_len=0)", "text(len=5)"],
+            "无签名空块剥掉（含 signature 为空串的），带签名或有内容的留下"
+        );
     }
 
     #[test]
