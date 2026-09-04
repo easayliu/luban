@@ -2092,6 +2092,9 @@ impl CredentialStore {
         if let Some(v) = on(HOIST_SYSTEM_ROLE) {
             flags.hoist_system_role = v;
         }
+        if let Some(v) = on(REJECT_OPENAI_SHAPE) {
+            flags.reject_openai_shape = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -2308,6 +2311,11 @@ pub const STRIP_EMPTY_TEXT: &str = "strip_empty_text";
 /// litellm 等第三方客户端常用此格式。
 pub const HOIST_SYSTEM_ROLE: &str = "hoist_system_role";
 
+/// 是否本地拒绝带 OpenAI 格式转换残留的请求的 settings 键名。
+/// 缺省视为开启：messages 里的 `role:"system"`、`call_` 前缀的工具调用 id、OpenAI 专属顶层
+/// 字段等一律 400，不修补不转发。关掉后退回 `hoist_system_role` 等修补路径。
+pub const REJECT_OPENAI_SHAPE: &str = "reject_openai_shape";
+
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
@@ -2509,6 +2517,13 @@ pub struct ForwardFlags {
     /// 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把这些
     /// 消息的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
     pub hoist_system_role: bool,
+    /// 本地拒绝带 OpenAI 格式转换残留的请求（messages 里的 `role:"system"`、`call_` 前缀的
+    /// 工具调用 id、OpenAI 方言的 `tool_choice` / `tools`、`n` / `stop` / `user` 等 OpenAI 专属
+    /// 顶层字段），不修补、不转发，见 `proxy::find_openai_marker`。
+    ///
+    /// 开着时 `hoist_system_role` 对这类请求不再有机会生效（入口就拒了）；关掉才退回修补。
+    /// 模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
+    pub reject_openai_shape: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2536,6 +2551,7 @@ impl Default for ForwardFlags {
             flatten_tool_schemas: true,
             strip_empty_text: true,
             hoist_system_role: true,
+            reject_openai_shape: true,
         }
     }
 }
@@ -7103,6 +7119,7 @@ mod tests {
             (FLATTEN_TOOL_SCHEMAS, "0"),
             (STRIP_EMPTY_TEXT, "0"),
             (HOIST_SYSTEM_ROLE, "0"),
+            (REJECT_OPENAI_SHAPE, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -7132,6 +7149,7 @@ mod tests {
                 flatten_tool_schemas: false,
                 strip_empty_text: false,
                 hoist_system_role: false,
+                reject_openai_shape: false,
             }
         );
 

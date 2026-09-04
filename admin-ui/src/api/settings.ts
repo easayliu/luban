@@ -83,6 +83,8 @@ export interface Settings {
   strip_empty_text: boolean
   /** 将 messages 里的 role:"system" 消息提升到顶层 system 字段。 */
   hoist_system_role: boolean
+  /** 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。 */
+  reject_openai_shape: boolean
   /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
   prefill_policy: string
   /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
@@ -113,6 +115,7 @@ export type ForwardingKey =
   | 'flatten_tool_schemas'
   | 'strip_empty_text'
   | 'hoist_system_role'
+  | 'reject_openai_shape'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

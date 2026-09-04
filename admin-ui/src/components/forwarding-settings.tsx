@@ -450,6 +450,22 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="reject_openai_shape"
+          label={t('拒绝 OpenAI 转换残留', 'Reject OpenAI-format residue')}
+          summary={t(
+            '带 OpenAI 格式转换痕迹的请求本地直接 400，不修补、不转发。',
+            'Requests carrying traces of OpenAI-format conversion are rejected locally with 400, never repaired or forwarded.',
+          )}
+          description={
+            <>
+              {t(
+                '经 litellm、one-api、claude-code-router 等从 OpenAI 格式转过来的请求，到这里已是 Anthropic 形态，只能靠残留识别：messages 里的 role:"system" / "tool"、消息上的 name / tool_calls、call_ 前缀的工具调用 id、字串形态或 type:"function" 的 tool_choice、OpenAI function 形态的 tools、n / stop / user / response_format 等 OpenAI 专属顶层字段、image_url 等 OpenAI 内容块。命中任一即本地 400，错误消息指出位置与 Anthropic 的对应写法。关掉后退回下面的 System Role 提升等修补路径。不影响模拟路径：它只接管本来就是 Anthropic 形态的非 CC 请求。',
+                'Requests converted from the OpenAI format by litellm, one-api, claude-code-router and the like arrive already in Anthropic shape; the only way to tell is the residue they leave: role:"system" / "tool" in messages, name / tool_calls on a message, tool call ids prefixed call_, a string or type:"function" tool_choice, tools in the OpenAI function shape, OpenAI-only top-level fields such as n / stop / user / response_format, and OpenAI content blocks such as image_url. Any hit is rejected locally with 400 and a message naming the location and the Anthropic equivalent. Turn it off to fall back to the repair paths below (system role hoisting etc.). The simulation path is unaffected: it only takes over non-CC requests that are already in Anthropic shape.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="hoist_system_role"
           label={t('System Role 提升', 'System role hoisting')}
           summary={t(
@@ -459,8 +475,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '上游 API 不支持 messages 数组里的 role:"system"（直接 400）。litellm 等采用 OpenAI 格式的客户端会把 system 指令放在 messages 里。开启后自动将这些消息的内容提升到顶层 system 字段，再从 messages 中移除。',
-                'The upstream API does not support role:"system" in the messages array (returns 400). Clients using OpenAI format (e.g. litellm) place system instructions in messages. When enabled, their content is automatically hoisted to the top-level system field and removed from messages.',
+                '上游 API 不支持 messages 数组里的 role:"system"（直接 400）。litellm 等采用 OpenAI 格式的客户端会把 system 指令放在 messages 里。开启后自动将这些消息的内容提升到顶层 system 字段，再从 messages 中移除。仅在「拒绝 OpenAI 转换残留」关闭时才有机会生效：那个开关开着，这类请求在入口就被拒了。',
+                'The upstream API does not support role:"system" in the messages array (returns 400). Clients using OpenAI format (e.g. litellm) place system instructions in messages. When enabled, their content is automatically hoisted to the top-level system field and removed from messages. Only takes effect while "Reject OpenAI-format residue" is off: with that on, such requests are rejected at the door.',
               )}
             </>
           }
