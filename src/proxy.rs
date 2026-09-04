@@ -1188,6 +1188,28 @@ async fn handle_inner(
                         "third-party rejection: dumping the INBOUND (client-original) request body for local replay"
                     );
                 }
+                // 「each thinking block must contain thinking」：出站前已经剥过空 thinking 块，
+                // 还被拒就说明剥除条件与上游的真实判据有出入。把客户端原始请求体整体打出来
+                // （与上面第三方拒绝那条同一取舍：可复现优先），再附一份出站体的结构摘要——
+                // 摘要里 thinking 块带 len/sig_len，一眼能看出被拒的块有没有签名。
+                if !compressed
+                    && status == StatusCode::BAD_REQUEST
+                    && is_empty_thinking_error(&err_bytes)
+                {
+                    let (_, message) = parse_upstream_error(&err_bytes);
+                    let outbound = match serde_json::from_slice::<serde_json::Value>(&sent) {
+                        Ok(v) => request_digest(&v).to_string(),
+                        Err(_) => format!("<unparsable {} bytes>", sent.len()),
+                    };
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        upstream_message = %message,
+                        outbound_digest = %outbound,
+                        inbound_bytes = body.len(),
+                        inbound_body = %String::from_utf8_lossy(&body),
+                        "upstream rejected an empty thinking block; dumping the INBOUND (client-original) request body for local replay"
+                    );
+                }
                 let banned =
                     (!compressed).then(|| detect_account_ban(status, &err_bytes)).flatten();
                 if let Some(reason) = &banned {
@@ -1991,6 +2013,17 @@ fn is_thinking_modified_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("cannot be modified") && hay.contains("thinking")
+}
+
+/// 上游那条 400 是不是「thinking 块没有 thinking 内容」，形如
+/// `messages.N.content.M: each thinking block must contain thinking`。
+///
+/// [`strip_empty_thinking_blocks`] 本该在出站前把这种块剥干净；还能撞上，说明要么剥除
+/// 条件没覆盖到（比如整条 content 只有空块而被刻意保留），要么触发条件根本不是「空」
+/// 而是别的（签名缺失？）。所以命中时把**客户端原始请求体**整体打出来供复现，见调用处。
+fn is_empty_thinking_error(body: &[u8]) -> bool {
+    let (_, message) = parse_upstream_error(body);
+    message.to_lowercase().contains("must contain thinking")
 }
 
 /// `messages` 末尾是不是 `assistant` 轮——用已解析的 `body_json` 判，零开销。
@@ -3270,6 +3303,13 @@ fn block_label(b: &serde_json::Value) -> String {
         "text" => format!(
             "text(len={})",
             b.get("text").and_then(|t| t.as_str()).map(str::len).unwrap_or(0)
+        ),
+        // 空 thinking 块有没有签名是「each thinking block must contain thinking」
+        // 排障的核心判据，摘要里必须能看出来。
+        "thinking" => format!(
+            "thinking(len={},sig_len={})",
+            b.get("thinking").and_then(|t| t.as_str()).map(str::len).unwrap_or(0),
+            b.get("signature").and_then(|t| t.as_str()).map(str::len).unwrap_or(0)
         ),
         other => other.to_string(),
     }
@@ -6330,8 +6370,15 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return false;
     };
+    let total = msgs.len();
     let mut changed = false;
-    for msg in msgs.iter_mut() {
+    // 每个被剥块的形态：`msg=<第几条>/<总数> keys=[..] sig_len=<签名字节数|none>
+    // thinking=<missing|empty>`。要回答的问题是「这些空块有没有签名」——官方 CC 回传的
+    // 空 thinking 块**带**签名且上游接受（`cap/2.1.260` 00021/00025/00028/00029/00031），
+    // 若这里剥掉的块也带签名，说明剥除是多余的；若不带，才是真正会被 400 的那种。
+    let mut stripped: Vec<String> = Vec::new();
+    let mut kept_all_empty: Vec<String> = Vec::new();
+    for (mi, msg) in msgs.iter_mut().enumerate() {
         if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
         }
@@ -6343,16 +6390,58 @@ fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
                 && blk.get("thinking").and_then(|t| t.as_str()).is_none_or(|t| t.is_empty())
         };
         let non_empty_count = content.iter().filter(|blk| !is_empty_thinking(blk)).count();
-        if non_empty_count == content.len() || non_empty_count == 0 {
+        if non_empty_count == content.len() {
             continue;
         }
+        let shapes = content
+            .iter()
+            .filter(|blk| is_empty_thinking(blk))
+            .map(|blk| format!("msg={}/{} {}", mi, total, empty_thinking_shape(blk)));
+        if non_empty_count == 0 {
+            kept_all_empty.extend(shapes);
+            continue;
+        }
+        stripped.extend(shapes);
         content.retain(|blk| !is_empty_thinking(blk));
         changed = true;
     }
     if changed {
-        tracing::info!("stripped empty thinking blocks from messages");
+        tracing::info!(
+            model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
+            count = stripped.len(),
+            blocks = %stripped.join("; "),
+            "stripped empty thinking blocks from messages"
+        );
+    }
+    if !kept_all_empty.is_empty() {
+        tracing::warn!(
+            model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
+            count = kept_all_empty.len(),
+            blocks = %kept_all_empty.join("; "),
+            "kept empty thinking blocks: stripping would leave the message with empty content"
+        );
     }
     changed
+}
+
+/// 一个空 thinking 块的形态摘要，供 [`strip_empty_thinking_blocks`] 与
+/// [`block_label`] 打日志用：有哪些 key、签名多长、`thinking` 是缺失还是空串。
+/// 不打签名本身（几 KB 的 base64，没有信息量），也不打任何正文。
+fn empty_thinking_shape(blk: &serde_json::Value) -> String {
+    let keys: Vec<&str> =
+        blk.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+    let sig_len = blk
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .map(|s| s.len().to_string())
+        .unwrap_or_else(|| "none".into());
+    let thinking = match blk.get("thinking") {
+        None => "missing",
+        Some(serde_json::Value::String(s)) if s.is_empty() => "empty",
+        Some(serde_json::Value::String(_)) => "non-empty",
+        Some(_) => "non-string",
+    };
+    format!("keys=[{}] sig_len={sig_len} thinking={thinking}", keys.join(","))
 }
 
 /// 把 `messages` 里 `role:"system"` 的消息提升到顶层 `system` 字段。
@@ -10564,6 +10653,60 @@ mod tests {
         });
         assert!(!super::strip_empty_text_blocks(&mut v));
         assert_eq!(v["messages"][0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    // ---------- 空 thinking 块剥除 ----------
+
+    #[test]
+    fn strips_empty_thinking_blocks_and_keeps_all_empty_message() {
+        let mut v = serde_json::json!({
+            "model": "claude-fable-5-1",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "abc"},
+                    {"type": "text", "text": "hello"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": ""}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "thinking", "thinking": ""}
+                ]}
+            ]
+        });
+        assert!(super::strip_empty_thinking_blocks(&mut v));
+        let first = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(first.len(), 1, "签名再长也剥——当前策略只看 thinking 是否为空");
+        assert_eq!(first[0]["type"], "text");
+        assert_eq!(v["messages"][1]["content"].as_array().unwrap().len(), 1, "全空的消息原样保留");
+        assert_eq!(v["messages"][2]["content"].as_array().unwrap().len(), 1, "非 assistant 不动");
+    }
+
+    #[test]
+    fn empty_thinking_shape_reports_keys_signature_and_kind() {
+        let signed = serde_json::json!({"type": "thinking", "thinking": "", "signature": "abcd"});
+        assert_eq!(
+            super::empty_thinking_shape(&signed),
+            "keys=[type,thinking,signature] sig_len=4 thinking=empty"
+        );
+        let bare = serde_json::json!({"type": "thinking"});
+        assert_eq!(super::empty_thinking_shape(&bare), "keys=[type] sig_len=none thinking=missing");
+    }
+
+    #[test]
+    fn block_label_shows_thinking_len_and_signature_len() {
+        let b = serde_json::json!({"type": "thinking", "thinking": "abc", "signature": "xy"});
+        assert_eq!(super::block_label(&b), "thinking(len=3,sig_len=2)");
+        let b = serde_json::json!({"type": "thinking", "thinking": ""});
+        assert_eq!(super::block_label(&b), "thinking(len=0,sig_len=0)");
+    }
+
+    #[test]
+    fn detects_empty_thinking_error() {
+        let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.0: each thinking block must contain thinking"}}"#;
+        assert!(super::is_empty_thinking_error(body));
+        let other = br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}"#;
+        assert!(!super::is_empty_thinking_error(other));
     }
 
     #[test]
