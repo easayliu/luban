@@ -171,6 +171,38 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="api_telemetry"
+          label={t('逐请求遥测', 'Per-request telemetry')}
+          summary={t(
+            '替每条转发成功的请求上报官方客户端会发的那串遥测：事件链、Datadog 日志、用量指标。',
+            'Report the telemetry the official client sends for every successful request: the event chain, Datadog logs, and usage metrics.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端每发一条请求都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一串事件（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。此前 luban 只有每 30 分钟一次的保活遥测，上游看到的是「有大量 API 用量、遥测里却一条 API 调用都没有」。开启后按 2.1.258 抓包的字段与节奏（事件 30 秒、日志 10 秒、指标 5 分钟攒批）替每张账号补上，身份取实际发往上游的那份，与请求两侧一致。关闭即只剩保活遥测。',
+                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Until now luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.258 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Turn it off to keep only the keepalive telemetry.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="keepalive_telemetry"
+          label={t('保活遥测', 'Keepalive telemetry')}
+          summary={t(
+            '每 30 分钟替每张账号发一组空闲版本检查事件与 Datadog 日志，每 6 小时一次画像上报。',
+            'Every 30 minutes send a set of idle version-check events and Datadog logs for each account, plus a profile report every 6 hours.',
+          )}
+          description={
+            <>
+              {t(
+                '模拟一个开着但空闲的 Claude Code 进程。账号近 3 小时内有真实会话时，事件挂在那个会话的身份上（同一 session_id、设备标识、客户端版本），和真实客户端挂着终端没人说话时的行为一致；没有近期会话的账号才用按账号派生的空闲身份。关闭只停遥测这一半，token 刷新、启动握手（bootstrap / policy_limits / settings）与 401/403 探测照常。与「逐请求遥测」互不影响。',
+                'Simulates an open but idle Claude Code process. When the account has had a real session in the last 3 hours, the events are attached to that session (same session_id, device identifier and client version), matching what a real client does when a terminal is left open; only accounts with no recent session fall back to an account-derived idle identity. Turning it off stops only the telemetry half: token refresh, the startup handshake (bootstrap / policy_limits / settings) and 401/403 detection continue. Independent of “Per-request telemetry”.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="spoof_device_id"
           label={t('改写设备标识', 'Rewrite device identifier')}
           summary={t(

@@ -77,6 +77,10 @@ pub struct AppState {
     /// 由 [`crate::proxy::InFlightGuard`] 增减，随响应流一起存活——流式回复要几十秒才走完，
     /// 只在 `handle` 返回时减一会把这类请求算成「瞬间就结束了」，并发数永远显示成 0～1。
     pub in_flight: Arc<std::sync::atomic::AtomicI64>,
+    /// 逐请求遥测的汇聚点：转发路径在响应流结束时把每条 `/v1/messages` 的形态与用量交给它，
+    /// 由后台任务按官方节奏攒批发出（见 [`crate::telemetry`]）。保活也从它取该凭证最近一次
+    /// 见到的 `anthropic-organization-id`。
+    pub telemetry: crate::telemetry::Telemetry,
 }
 
 type ApiError = (StatusCode, String);
@@ -105,6 +109,7 @@ pub async fn run(
         upstream_load: Arc::default(),
         session_concurrency: Arc::default(),
         in_flight: Arc::default(),
+        telemetry: Default::default(),
     };
     // 把上次运行学到的上游规则读回来（形态拒绝 / 已废弃字段），免得每种组合重启后再撞一次 400。
     // 读失败只告警：这是优化，不是启动的前提。
@@ -148,13 +153,17 @@ pub async fn run(
     }
 
     // 会话保活（对齐 cap/2.1.145 抓包的真实客户端行为）：
-    //   每 30min — event_logging + Datadog 遥测（idle 版本检查事件）
-    //   首 tick  — metrics + bootstrap + penguin_mode + eval（启动握手）
+    //   每 30min — event_logging + Datadog 遥测（idle 版本检查事件）  ← `keepalive_telemetry` 开关
+    //   首 tick  — bootstrap + penguin_mode + eval（启动握手）
     //   每 1h   — policy_limits + settings
-    //   每 6h   — eval（Statsig 特性标志刷新）
+    //   每 6h   — eval（Statsig 特性标志刷新）                          ← 同一开关
+    // 指标不再由保活发假值：真实用量的指标由 `crate::telemetry` 按会话累计后发。
+    // 空闲事件的身份优先挂到该凭证最近的真实会话上（同一 session_id / device_id / 版本），
+    // 没有近期会话才用按账号派生的那套。
     {
         let store = state.store.clone();
         let clients = state.clients.clone();
+        let telemetry = state.telemetry.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -171,6 +180,8 @@ pub async fn run(
                 let is_eval =
                     is_first || tick_count.is_multiple_of(crate::config::KEEPALIVE_EVAL_TICKS);
 
+                // 开关每 tick 重读：网页上拨了下一轮就生效。
+                let send_telemetry = store.forward_flags().keepalive_telemetry;
                 let creds = match store.list() {
                     Ok(c) => c,
                     Err(e) => {
@@ -209,38 +220,55 @@ pub async fn run(
                         }
                     };
 
-                    let ctx = oauth::KeepaliveCtx::new(&cred, started.elapsed().as_secs_f64());
+                    // 组织 id 来自这个号最近一次 `/v1/messages` 响应头；还没转发过请求时缺省。
+                    // 身份优先挂到该凭证最近的真实会话上（见 `KeepaliveCtx::new`）。
+                    let session = telemetry.latest_session(
+                        cred.id,
+                        std::time::Duration::from_secs(crate::config::TELEMETRY_SESSION_IDLE_SECS),
+                    );
+                    let on_real_session = session.is_some();
+                    let ctx = oauth::KeepaliveCtx::new(
+                        &cred,
+                        started.elapsed().as_secs_f64(),
+                        telemetry.org_uuid(cred.id),
+                        session,
+                    );
 
-                    // --- 每 tick ---
-                    let ev_ok = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
-                    if ev_ok == oauth::KeepaliveResult::AuthRejected {
-                        tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (event_logging 401/403), marking as banned");
-                        let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
-                        continue;
-                    }
-                    let dd_ok = oauth::keepalive_datadog_logs(&http, &ctx).await;
+                    // --- 每 tick：空闲遥测（可关） ---
+                    let (ev_ok, dd_ok) = if send_telemetry {
+                        let ev = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
+                        if ev == oauth::KeepaliveResult::AuthRejected {
+                            tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (event_logging 401/403), marking as banned");
+                            let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
+                            continue;
+                        }
+                        (ev, oauth::keepalive_datadog_logs(&http, &ctx).await)
+                    } else {
+                        (oauth::KeepaliveResult::Ok, true)
+                    };
 
                     // --- 首 tick：启动握手 ---
-                    let (mt_ok, boot_ok, peng_ok) = if is_first {
-                        let mt = oauth::keepalive_metrics(&http, &access_token, &ctx).await;
-                        let bo = oauth::keepalive_bootstrap(&http, &access_token).await;
+                    let (boot_ok, peng_ok) = if is_first {
+                        let bo = oauth::keepalive_bootstrap(
+                            &http,
+                            &access_token,
+                            &ctx,
+                            &ctx.model_normalized(),
+                        )
+                        .await;
                         if bo == oauth::KeepaliveResult::AuthRejected {
                             tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (bootstrap 401/403), marking as banned");
                             let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
                             continue;
                         }
                         let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
-                        (mt, bo, pg)
+                        (bo, pg)
                     } else {
-                        (
-                            oauth::KeepaliveResult::Ok,
-                            oauth::KeepaliveResult::Ok,
-                            oauth::KeepaliveResult::Ok,
-                        )
+                        (oauth::KeepaliveResult::Ok, oauth::KeepaliveResult::Ok)
                     };
 
-                    // --- 每 6h：eval ---
-                    let eval_ok = if is_eval {
+                    // --- 每 6h：eval（画像也算遥测，跟同一个开关） ---
+                    let eval_ok = if is_eval && send_telemetry {
                         oauth::keepalive_eval(&http, &access_token, &ctx).await
                     } else {
                         oauth::KeepaliveResult::Ok
@@ -248,8 +276,8 @@ pub async fn run(
 
                     // --- 每 1h ---
                     let (pl_ok, st_ok) = if is_hourly || is_first {
-                        let pl = oauth::keepalive_policy_limits(&http, &access_token).await;
-                        let st = oauth::keepalive_settings(&http, &access_token).await;
+                        let pl = oauth::keepalive_policy_limits(&http, &access_token, &ctx).await;
+                        let st = oauth::keepalive_settings(&http, &access_token, &ctx).await;
                         (pl, st)
                     } else {
                         (oauth::KeepaliveResult::Ok, oauth::KeepaliveResult::Ok)
@@ -257,19 +285,24 @@ pub async fn run(
 
                     let all_ok = ev_ok.is_ok()
                         && dd_ok
-                        && mt_ok.is_ok()
                         && boot_ok.is_ok()
                         && peng_ok.is_ok()
                         && eval_ok.is_ok()
                         && pl_ok.is_ok()
                         && st_ok.is_ok();
                     if all_ok {
-                        tracing::debug!(cred_id = cred.id, cred = %cred.label, tick = tick_count, "keepalive: ok");
+                        tracing::debug!(
+                            cred_id = cred.id, cred = %cred.label, tick = tick_count,
+                            telemetry = send_telemetry, on_real_session,
+                            session = %ctx.session_id.chars().take(8).collect::<String>(),
+                            "keepalive: ok"
+                        );
                     } else {
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label, tick = tick_count,
+                            telemetry = send_telemetry, on_real_session,
                             event_logging = ev_ok.is_ok(), datadog = dd_ok,
-                            metrics = mt_ok.is_ok(), bootstrap = boot_ok.is_ok(), penguin = peng_ok.is_ok(),
+                            bootstrap = boot_ok.is_ok(), penguin = peng_ok.is_ok(),
                             eval = eval_ok.is_ok(), policy_limits = pl_ok.is_ok(), settings = st_ok.is_ok(),
                             "keepalive: partial failure"
                         );
@@ -278,6 +311,14 @@ pub async fn run(
             }
         });
     }
+
+    // 逐请求遥测的发送循环：每 5s 看一眼哪张凭证攒的事件/日志/指标到期了，用它自己的出站
+    // 客户端与 token 发出去。见 [`crate::telemetry::run_flusher`]。
+    tokio::spawn(crate::telemetry::run_flusher(
+        state.telemetry.clone(),
+        state.store.clone(),
+        state.clients.clone(),
+    ));
 
     // 公开接口（无需登录）：鉴权状态机 + 给 New API 等下游拉取的价目表。
     let public = Router::new()
@@ -1671,6 +1712,10 @@ struct ForwardingResp {
     hoist_system_role: bool,
     /// 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。
     reject_openai_shape: bool,
+    /// 替每条转发的 `/v1/messages` 上报官方客户端形态的遥测。
+    api_telemetry: bool,
+    /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
+    keepalive_telemetry: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1699,6 +1744,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             strip_empty_text: f.strip_empty_text,
             hoist_system_role: f.hoist_system_role,
             reject_openai_shape: f.reject_openai_shape,
+            api_telemetry: f.api_telemetry,
+            keepalive_telemetry: f.keepalive_telemetry,
         }
     }
 }
@@ -2284,6 +2331,8 @@ struct SetForwardingReq {
     strip_empty_text: Option<bool>,
     hoist_system_role: Option<bool>,
     reject_openai_shape: Option<bool>,
+    api_telemetry: Option<bool>,
+    keepalive_telemetry: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -2294,12 +2343,12 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
-        INJECT_THINKING, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
-        TOOL_NAME_MIMIC,
+        API_TELEMETRY, FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
+        INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
+        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, SIMULATE_CC, SPOOF_BILLING_CCH,
+        SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS,
+        SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY,
+        THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2325,6 +2374,8 @@ async fn set_forwarding(
         (STRIP_EMPTY_TEXT, req.strip_empty_text),
         (HOIST_SYSTEM_ROLE, req.hoist_system_role),
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
+        (API_TELEMETRY, req.api_telemetry),
+        (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;

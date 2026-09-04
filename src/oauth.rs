@@ -452,8 +452,16 @@ pub struct KeepaliveCtx {
     account_uuid: String,
     /// subscription_type（team / individual）。
     subscription_type: String,
+    /// 该凭证最近一次 `/v1/messages` 响应头里的 `anthropic-organization-id`；一次都没见过
+    /// 时缺省（见 [`crate::telemetry::Telemetry::org_uuid`]）。
+    organization_uuid: Option<String>,
     /// 进程已运行秒数。
     uptime_secs: f64,
+    /// 事件顶层 `model`、会话级 `betas`、客户端版本。挂到真实会话上时取该会话的，
+    /// 否则用写死的保活默认值（sonnet-5 / [`config::KEEPALIVE_EVENT_BETAS`] / 保活 UA 版本）。
+    model: String,
+    betas: String,
+    version: String,
 }
 
 /// 进程级种子，每次启动随机一次；用于从 account_uuid 派生出每次启动不同的 session_id。
@@ -464,7 +472,35 @@ static PROCESS_SEED: std::sync::LazyLock<[u8; 16]> = std::sync::LazyLock::new(||
 });
 
 impl KeepaliveCtx {
-    pub fn new(cred: &crate::credentials::Credential, uptime_secs: f64) -> Self {
+    /// `session` 有值时，空闲事件挂到这个真实会话上：session_id / device_id / prompt_id /
+    /// 版本 / 模型 / beta 全取它的，`uptime` 从该会话起点算——真实 CC 进程开着没人说话时，
+    /// 版本检查事件就是从同一个会话发出的。没有近期会话才退回按账号派生的那套身份。
+    pub fn new(
+        cred: &crate::credentials::Credential,
+        uptime_secs: f64,
+        organization_uuid: Option<String>,
+        session: Option<crate::telemetry::SessionSnapshot>,
+    ) -> Self {
+        let subscription_type =
+            crate::telemetry::subscription_type(cred.org_type.as_deref()).to_string();
+        if let Some(s) = session {
+            let uptime_secs = std::time::SystemTime::now()
+                .duration_since(s.started_wall)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(uptime_secs);
+            return Self {
+                session_id: s.session_id,
+                device_id: s.device_id,
+                prompt_id: s.prompt_id,
+                account_uuid: s.account_uuid,
+                subscription_type,
+                organization_uuid,
+                uptime_secs,
+                model: s.model,
+                betas: s.betas,
+                version: s.version,
+            };
+        }
         let id_str = cred.id.to_string();
         let basis = cred.account_uuid.as_deref().unwrap_or(&id_str);
         let seed: &[u8] = &*PROCESS_SEED;
@@ -472,89 +508,56 @@ impl KeepaliveCtx {
         let prompt_id = derive_uuid(basis, seed, b"prompt");
         let device_id = derive_hex64(basis, seed, b"device");
 
-        let subscription_type = match cred.org_type.as_deref() {
-            Some(t) if t.contains("team") => "team",
-            Some(t) if t.contains("enterprise") => "enterprise",
-            _ => "individual",
-        }
-        .to_string();
-
         Self {
             session_id,
             device_id,
             prompt_id,
             account_uuid: basis.to_string(),
             subscription_type,
+            organization_uuid,
             uptime_secs,
+            model: "claude-sonnet-5".to_string(),
+            betas: config::KEEPALIVE_EVENT_BETAS.to_string(),
+            version: keepalive_version().to_string(),
         }
     }
 
-    /// 所有事件共用的 `env` 块。
-    fn env_block(&self) -> serde_json::Value {
-        serde_json::json!({
-            "platform": "darwin",
-            "node_version": "v26.3.0",
-            "terminal": "vscode",
-            "package_managers": "npm,pnpm",
-            "runtimes": "bun,node",
-            "is_running_with_bun": true,
-            "is_ci": false,
-            "is_claubbit": false,
-            "is_github_action": false,
-            "is_claude_code_action": false,
-            "is_claude_ai_auth": true,
-            "version": keepalive_version(),
-            "arch": "arm64",
-            "is_claude_code_remote": false,
-            "deployment_environment": "unknown-darwin",
-            "is_conductor": false,
-            "version_base": keepalive_version(),
-            "build_time": "2026-08-25T18:33:51Z",
-            "is_local_agent_mode": false,
-            "platform_raw": "darwin",
-            "shell": "zsh"
-        })
-    }
-
-    /// base64 编码的 `process` 运行时指标。
-    fn process_b64(&self) -> String {
-        let rss = 180_000_000.0 + self.uptime_secs * 6.0;
-        let heap = 44_000_000.0 + self.uptime_secs * 5.0;
-        let user_cpu = (self.uptime_secs * 6300.0) as u64;
-        let sys_cpu = (self.uptime_secs * 1200.0) as u64;
-        let val = serde_json::json!({
-            "uptime": self.uptime_secs,
-            "rss": rss as u64,
-            "heapTotal": (heap * 0.98) as u64,
-            "heapUsed": heap as u64,
-            "external": 16_420_226_u64,
-            "arrayBuffers": 14335_u64,
-            "constrainedMemory": 34_359_738_368_u64,
-            "cpuUsage": { "user": user_cpu, "system": sys_cpu },
-            "cpuPercent": 0.42,
-            "cpuWindowMs": (self.uptime_secs * 1000.0).min(1_800_000.0) as u64
-        });
-        URL_SAFE_NO_PAD.encode(serde_json::to_string(&val).unwrap_or_default())
-    }
-
-    /// base64 编码的 `additional_metadata`。
-    fn metadata_b64(&self, extra: serde_json::Value) -> String {
-        let mut m = serde_json::json!({
-            "renderer_mode": "default",
-            "subscription_type": &self.subscription_type,
-            "cc_prompt_id": &self.prompt_id
-        });
-        if let (Some(obj), Some(base)) = (extra.as_object(), m.as_object_mut()) {
-            for (k, v) in obj {
-                base.insert(k.clone(), v.clone());
-            }
+    /// 事件/日志的公共字段都由 [`crate::telemetry::Identity`] 生成，与逐请求遥测同一套
+    /// （`env` 块、`auth` 块、base64 编码方式、`build_time` 查表）。
+    fn identity(&self) -> crate::telemetry::Identity {
+        crate::telemetry::Identity {
+            session_id: self.session_id.clone(),
+            device_id: self.device_id.clone(),
+            account_uuid: self.account_uuid.clone(),
+            organization_uuid: self.organization_uuid.clone(),
+            subscription_type: self.subscription_type.clone(),
+            version: self.version.clone(),
         }
-        URL_SAFE_NO_PAD.encode(serde_json::to_string(&m).unwrap_or_default())
     }
 
-    /// `auth` 块。
-    fn auth_block(&self) -> serde_json::Value {
-        serde_json::json!({ "account_uuid": &self.account_uuid })
+    /// axios 那几类端点的 UA：`claude-code/<版本>`，版本跟会话（挂到真实会话时是它的）。
+    pub fn ua(&self) -> String {
+        format!("claude-code/{}", self.version)
+    }
+
+    /// `claude-cli/<版本> (external, cli)`：mcp-registry 与 code/triggers 用的是 SDK 那份 UA。
+    pub fn cli_ua(&self) -> String {
+        format!("claude-cli/{} (external, cli)", self.version)
+    }
+
+    /// 规范模型名（去掉展示名里的 `[1m]`），bootstrap 的 `model=` 用。
+    pub fn model_normalized(&self) -> String {
+        self.model.trim_end_matches("[1m]").to_string()
+    }
+
+    /// 保活事件共用的那几项。
+    fn event_ctx(&self) -> crate::telemetry::EventCtx<'_> {
+        crate::telemetry::EventCtx {
+            model: &self.model,
+            betas: &self.betas,
+            prompt_id: &self.prompt_id,
+            uptime_secs: self.uptime_secs,
+        }
     }
 
     /// 生成单条 `ClaudeCodeInternalEvent`，时间戳往回偏移 `ago_ms` 毫秒。
@@ -566,117 +569,14 @@ impl KeepaliveCtx {
         extra_meta: serde_json::Value,
     ) -> serde_json::Value {
         let ts = *now - chrono::Duration::milliseconds(ago_ms);
-        serde_json::json!({
-            "event_type": "ClaudeCodeInternalEvent",
-            "event_data": {
-                "event_name": name,
-                "client_timestamp": ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                "model": "claude-sonnet-5",
-                "session_id": &self.session_id,
-                "user_type": "external",
-                "betas": config::KEEPALIVE_EVENT_BETAS,
-                "env": self.env_block(),
-                "entrypoint": "cli",
-                "is_interactive": true,
-                "client_type": "cli",
-                "process": self.process_b64(),
-                "additional_metadata": self.metadata_b64(extra_meta),
-                "auth": self.auth_block(),
-                "event_id": uuid_v4(),
-                "device_id": &self.device_id
-            }
-        })
+        self.identity().event(name, ts, &self.event_ctx(), extra_meta)
     }
 
-    /// Datadog 日志条目的公共字段（flat 形态，取自 `cap/2.1.145/00066`）。
-    ///
-    /// 拆成手工构建避免 `json!` 宏在字段过多时撞 recursion_limit。
+    /// Datadog 日志条目（flat 形态，取自 `cap/2.1.145/00066`）。
     fn dd_entry(&self, message: &str, extra: serde_json::Value) -> serde_json::Value {
-        use serde_json::{Map, Value, json};
-        let ver = keepalive_version();
-        let mut m = Map::new();
-        let s = |v: &str| Value::String(v.to_string());
-
-        m.insert("ddsource".into(), s("nodejs"));
-        m.insert(
-            "ddtags".into(),
-            s(&format!(
-                "event:{message},arch:arm64,client_type:cli,entrypoint:cli,\
-                 model:claude-sonnet-5,platform:darwin,subscription_type:{},\
-                 user_bucket:15,user_type:external,version:{ver},version_base:{ver}",
-                self.subscription_type
-            )),
-        );
-        m.insert("message".into(), s(message));
-        m.insert("service".into(), s("claude-code"));
-        m.insert("hostname".into(), s("claude-code"));
-        m.insert("env".into(), s("external"));
-        m.insert("model".into(), s("claude-sonnet-5"));
-        m.insert("session_id".into(), s(&self.session_id));
-        m.insert("user_type".into(), s("external"));
-        m.insert("betas".into(), s(config::KEEPALIVE_EVENT_BETAS));
-        m.insert("entrypoint".into(), s("cli"));
-        m.insert("is_interactive".into(), s("true"));
-        m.insert("client_type".into(), s("cli"));
-        m.insert(
-            "process_metrics".into(),
-            json!({
-                "uptime": self.uptime_secs,
-                "rss": (180_000_000.0 + self.uptime_secs * 6.0) as u64,
-                "heapTotal": (44_000_000.0 + self.uptime_secs * 4.8) as u64,
-                "heapUsed": (44_000_000.0 + self.uptime_secs * 5.0) as u64,
-                "external": 16_420_226_u64,
-                "arrayBuffers": 14335_u64,
-                "constrainedMemory": 34_359_738_368_u64,
-                "cpuUsage": {
-                    "user": (self.uptime_secs * 6300.0) as u64,
-                    "system": (self.uptime_secs * 1200.0) as u64
-                },
-                "cpuPercent": 0.42,
-                "cpuWindowMs": 32_u64
-            }),
-        );
-        for (k, v) in
-            [("swe_bench_run_id", ""), ("swe_bench_instance_id", ""), ("swe_bench_task_id", "")]
-        {
-            m.insert(k.into(), s(v));
-        }
-        m.insert("subscription_type".into(), s(&self.subscription_type));
-        m.insert("renderer_mode".into(), s("default"));
-        m.insert("prompt_id".into(), s(&self.prompt_id));
-        m.insert("platform".into(), s("darwin"));
-        m.insert("platform_raw".into(), s("darwin"));
-        m.insert("arch".into(), s("arm64"));
-        m.insert("node_version".into(), s("v26.3.0"));
-        m.insert("terminal".into(), s("vscode"));
-        m.insert("shell".into(), s("zsh"));
-        m.insert("package_managers".into(), s("npm,pnpm"));
-        m.insert("runtimes".into(), s("bun,node"));
-        for (k, v) in [
-            ("is_running_with_bun", true),
-            ("is_ci", false),
-            ("is_claubbit", false),
-            ("is_claude_code_remote", false),
-            ("is_local_agent_mode", false),
-            ("is_conductor", false),
-            ("is_github_action", false),
-            ("is_claude_code_action", false),
-            ("is_claude_ai_auth", true),
-        ] {
-            m.insert(k.into(), Value::Bool(v));
-        }
-        m.insert("version".into(), s(ver));
-        m.insert("version_base".into(), s(ver));
-        m.insert("build_time".into(), s("2026-08-25T18:33:51Z"));
-        m.insert("deployment_environment".into(), s("unknown-darwin"));
-        m.insert("user_bucket".into(), Value::Number(15.into()));
-
-        if let Some(obj) = extra.as_object() {
-            for (k, v) in obj {
-                m.insert(k.clone(), v.clone());
-            }
-        }
-        Value::Object(m)
+        // Datadog 那份 `model` 是规范名：把展示名的 `[1m]` 去掉。
+        let model = self.model.trim_end_matches("[1m]");
+        self.identity().dd_entry(message, &self.event_ctx(), model, extra)
     }
 
     /// 模拟 idle 周期的 Datadog 日志条目（2 条，与 `cap/2.1.145/00066` 对齐）。
@@ -692,19 +592,24 @@ impl KeepaliveCtx {
 
     /// eval 端点的请求体（Statsig 特性标志评估）。
     fn eval_body(&self) -> serde_json::Value {
+        // 官方在 `platform` 与 `accountUUID` 之间带 `organizationUUID`（`cap/2.1.258/00003`）；
+        // 还没从响应头里学到组织 id 时只能缺省。
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("id".into(), self.device_id.clone().into());
+        attrs.insert("sessionId".into(), self.session_id.clone().into());
+        attrs.insert("deviceID".into(), self.device_id.clone().into());
+        attrs.insert("platform".into(), "darwin".into());
+        if let Some(org) = &self.organization_uuid {
+            attrs.insert("organizationUUID".into(), org.clone().into());
+        }
+        attrs.insert("accountUUID".into(), self.account_uuid.clone().into());
+        attrs.insert("userType".into(), "external".into());
+        attrs.insert("subscriptionType".into(), self.subscription_type.clone().into());
+        attrs.insert("organizationRole".into(), "user".into());
+        attrs.insert("appVersion".into(), self.version.clone().into());
+        attrs.insert("entrypoint".into(), "cli".into());
         serde_json::json!({
-            "attributes": {
-                "id": &self.device_id,
-                "sessionId": &self.session_id,
-                "deviceID": &self.device_id,
-                "platform": "darwin",
-                "accountUUID": &self.account_uuid,
-                "userType": "external",
-                "subscriptionType": &self.subscription_type,
-                "organizationRole": "user",
-                "appVersion": keepalive_version(),
-                "entrypoint": "cli"
-            },
+            "attributes": attrs,
             "forcedVariations": {},
             "forcedFeatures": [],
             "url": ""
@@ -793,22 +698,6 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
     crate::credentials::hex_lower(&h.finalize())
 }
 
-/// 伪 UUID v4。
-fn uuid_v4() -> String {
-    let mut buf = [0u8; 16];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
-    buf[6] = (buf[6] & 0x0F) | 0x40;
-    buf[8] = (buf[8] & 0x3F) | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        u16::from_be_bytes([buf[4], buf[5]]),
-        u16::from_be_bytes([buf[6], buf[7]]),
-        u16::from_be_bytes([buf[8], buf[9]]),
-        u64::from_be_bytes([0, 0, buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
-    )
-}
-
 /// 每 tick（30min）发一次 `event_logging`。
 ///
 /// 真实客户端每次都带上版本检查等活动产生的事件；空批次是指纹。
@@ -824,7 +713,7 @@ pub async fn keepalive_event_logging(
         .post(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("User-Agent", ctx.ua())
         .header("x-service-name", "claude-code")
         .header("Accept", "application/json, text/plain, */*")
         .json(&body)
@@ -836,106 +725,18 @@ pub async fn keepalive_event_logging(
     }
 }
 
-/// 首 tick 发一次 `metrics`。
-///
-/// 真实客户端带 4 项指标（session.count / cost.usage / token.usage / active_time.total），
-/// 空 metrics 数组是指纹。这里填合理的小值，结构取自 `cap/2.1.145/00061`。
-pub async fn keepalive_metrics(
+/// 每小时发一次 `GET /api/claude_code/policy_limits`；会话启动时也发一次。
+pub async fn keepalive_policy_limits(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_METRICS);
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let body = serde_json::json!({
-        "resource_attributes": {
-            "service.name": "claude-code",
-            "service.version": keepalive_version(),
-            "os.type": "darwin",
-            "os.version": "27.0.0",
-            "host.arch": "arm64",
-            "aggregation.temporality": "delta",
-            "user.customer_type": "claude_ai",
-            "user.subscription_type": &ctx.subscription_type
-        },
-        "metrics": [
-            {
-                "name": "claude_code.session.count",
-                "description": "Count of CLI sessions started",
-                "unit": "",
-                "data_points": [{
-                    "attributes": {
-                        "user.id": &ctx.device_id,
-                        "session.id": &ctx.session_id,
-                        "terminal.type": "vscode",
-                        "start_type": "fresh"
-                    },
-                    "value": 1,
-                    "timestamp": &ts
-                }]
-            },
-            {
-                "name": "claude_code.cost.usage",
-                "description": "Cost of the Claude Code session",
-                "unit": "USD",
-                "data_points": [{
-                    "attributes": {
-                        "user.id": &ctx.device_id,
-                        "session.id": &ctx.session_id,
-                        "terminal.type": "vscode",
-                        "model": "claude-sonnet-5",
-                        "query_source": "main",
-                        "effort": "high"
-                    },
-                    "value": 0.042,
-                    "timestamp": &ts
-                }]
-            },
-            {
-                "name": "claude_code.token.usage",
-                "description": "Number of tokens used",
-                "unit": "tokens",
-                "data_points": [
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "input" }, "value": 5, "timestamp": &ts },
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "output" }, "value": 18, "timestamp": &ts },
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "cacheRead" }, "value": 22000, "timestamp": &ts },
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "model": "claude-sonnet-5", "query_source": "main", "effort": "high", "type": "cacheCreation" }, "value": 6500, "timestamp": &ts }
-                ]
-            },
-            {
-                "name": "claude_code.active_time.total",
-                "description": "Total active time in seconds",
-                "unit": "s",
-                "data_points": [
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "type": "user" }, "value": 3.8, "timestamp": &ts },
-                    { "attributes": { "user.id": &ctx.device_id, "session.id": &ctx.session_id, "terminal.type": "vscode", "type": "cli" }, "value": 2.4, "timestamp": &ts }
-                ]
-            }
-        ]
-    });
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
-        .header("Accept", "application/json, text/plain, */*")
-        .json(&body)
-        .send()
-        .await;
-    match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
-        Err(_) => KeepaliveResult::Failed,
-    }
-}
-
-/// 每小时发一次 `GET /api/claude_code/policy_limits`。
-pub async fn keepalive_policy_limits(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_POLICY_LIMITS);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("User-Agent", ctx.ua())
         .header("Accept", "application/json, text/plain, */*")
         .send()
         .await;
@@ -945,14 +746,18 @@ pub async fn keepalive_policy_limits(client: &wreq::Client, access_token: &str) 
     }
 }
 
-/// 每小时发一次 `GET /api/claude_code/settings`。
-pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
+/// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。
+pub async fn keepalive_settings(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_SETTINGS);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("User-Agent", ctx.ua())
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .header("Accept", "application/json, text/plain, */*")
@@ -966,12 +771,17 @@ pub async fn keepalive_settings(client: &wreq::Client, access_token: &str) -> Ke
 
 // ---------- startup bootstrap + 周期端点 ----------
 
-/// 启动握手：`GET /api/claude_cli/bootstrap`。
+/// 启动握手：`GET /api/claude_cli/bootstrap?entrypoint=cli&model=<规范名>`。
 ///
-/// 取自 `cap/2.1.145/00043`（UA = `claude-code/2.1.246`）。
-pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
+/// 头形态取自 `cap/2.1.260-1/00029`（UA = `claude-code/<版本>`）。
+pub async fn keepalive_bootstrap(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+    model: &str,
+) -> KeepaliveResult {
     let url = format!(
-        "{}{}?entrypoint=cli&model=claude-sonnet-5",
+        "{}{}?entrypoint=cli&model={model}",
         config::UPSTREAM_BASE_URL,
         config::KEEPALIVE_BOOTSTRAP
     );
@@ -979,7 +789,7 @@ pub async fn keepalive_bootstrap(client: &wreq::Client, access_token: &str) -> K
         .get(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::KEEPALIVE_USER_AGENT)
+        .header("User-Agent", ctx.ua())
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/plain, */*")
         .send()
@@ -1033,6 +843,158 @@ pub async fn keepalive_eval(
     }
 }
 
+// ---------- 会话启动握手（每个新会话一次） ----------
+
+/// `GET /mcp-registry/v0/servers?…`：无鉴权，UA 是 SDK 那份；官方按 `metadata.next_cursor`
+/// 翻页（抓包里翻了 4 页）。返回最后一页的状态。
+async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> KeepaliveResult {
+    let base = format!(
+        "{}/mcp-registry/v0/servers?version=latest&limit=100&visibility=commercial%2Cgsuite%2Centerprise%2Chealth",
+        config::UPSTREAM_BASE_URL
+    );
+    let mut cursor: Option<String> = None;
+    let mut last = KeepaliveResult::Failed;
+    for _ in 0..4 {
+        let url = match &cursor {
+            Some(c) => format!("{base}&cursor={}", urlencode(c)),
+            None => base.clone(),
+        };
+        let resp = client
+            .get(&url)
+            .header("User-Agent", ctx.cli_ua())
+            .header("Accept", "application/json, text/plain, */*")
+            .send()
+            .await;
+        let Ok(r) = resp else { return KeepaliveResult::Failed };
+        last = KeepaliveResult::from_status(r.status().as_u16());
+        let next = r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("metadata")
+                    .and_then(|m| m.get("next_cursor"))
+                    .or_else(|| v.get("next_cursor"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|c| !c.is_empty());
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    last
+}
+
+/// `GET /v1/mcp_servers?limit=1000`（claude.ai 侧配置的 MCP 连接器）；`cap/2.1.260-1/00024`。
+async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
+    let url = format!("{}/v1/mcp_servers?limit=1000", config::UPSTREAM_BASE_URL);
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", "mcp-servers-2025-12-04")
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            "anthropic-mcp-client-capabilities",
+            "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=",
+        )
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("User-Agent", config::DATADOG_USER_AGENT)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
+    }
+}
+
+/// `GET /v1/code/triggers`（Claude Code Remote 的触发器列表），带 `x-organization-uuid`；
+/// 没拿到组织 id 就不发——缺了那个头的形态官方不产生。`cap/2.1.260-1/00027`。
+async fn handshake_code_triggers(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> KeepaliveResult {
+    let Some(org) = ctx.organization_uuid.as_deref() else { return KeepaliveResult::Ok };
+    let url = format!("{}/v1/code/triggers", config::UPSTREAM_BASE_URL);
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", ctx.cli_ua())
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-client-platform", "claude_code_cli")
+        .header("x-organization-uuid", org)
+        .header("anthropic-beta", "ccr-triggers-2026-01-30")
+        .send()
+        .await;
+    match resp {
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
+    }
+}
+
+/// `downloads.claude.ai` 上的版本与插件市场元数据（无鉴权，axios UA）。
+async fn handshake_download(client: &wreq::Client, path: &str) -> KeepaliveResult {
+    let resp = client
+        .get(format!("https://downloads.claude.ai{path}"))
+        .header("Accept", "application/json, text/plain, */*")
+        .header("User-Agent", config::DATADOG_USER_AGENT)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
+    }
+}
+
+/// 替一个新会话做完整的启动握手，顺序照 `cap/2.1.260-1`（17:14:56–17:15:05）：
+/// policy_limits、settings、eval、penguin_mode、mcp-registry（翻页）、mcp_servers、
+/// code/triggers、mcp_servers、bootstrap、releases/latest、plugins latest。额度探测那条
+/// `/v1/messages` 是客户端自己发的，经 luban 转发，不在这里。
+///
+/// 失败只记日志：握手是形态补齐，不影响转发。401/403 也不在这里封号——转发路径与保活
+/// 各有自己的判定。
+pub async fn session_handshake(
+    client: &wreq::Client,
+    access_token: &str,
+    cred: &crate::credentials::Credential,
+    h: crate::telemetry::Handshake,
+    organization_uuid: Option<String>,
+) {
+    let ctx = KeepaliveCtx::new(cred, 0.0, organization_uuid, Some(h.snapshot));
+    let mut results: Vec<(&str, KeepaliveResult)> = Vec::with_capacity(11);
+    results.push(("policy_limits", keepalive_policy_limits(client, access_token, &ctx).await));
+    results.push(("settings", keepalive_settings(client, access_token, &ctx).await));
+    results.push(("eval", keepalive_eval(client, access_token, &ctx).await));
+    results.push(("penguin_mode", keepalive_penguin_mode(client, access_token).await));
+    results.push(("mcp_registry", handshake_mcp_registry(client, &ctx).await));
+    results.push(("mcp_servers", handshake_mcp_servers(client, access_token).await));
+    results.push(("code_triggers", handshake_code_triggers(client, access_token, &ctx).await));
+    results.push(("mcp_servers", handshake_mcp_servers(client, access_token).await));
+    results.push(("bootstrap", keepalive_bootstrap(client, access_token, &ctx, &h.model).await));
+    results.push((
+        "releases_latest",
+        handshake_download(client, "/claude-code-releases/latest").await,
+    ));
+    results.push((
+        "plugins_latest",
+        handshake_download(client, "/claude-code-releases/plugins/claude-plugins-official/latest")
+            .await,
+    ));
+    let failed: Vec<&str> = results.iter().filter(|(_, r)| !r.is_ok()).map(|(n, _)| *n).collect();
+    let session: String = ctx.session_id.chars().take(8).collect();
+    if failed.is_empty() {
+        tracing::debug!(cred_id = cred.id, cred = %cred.label, session, "session handshake done");
+    } else {
+        tracing::warn!(cred_id = cred.id, cred = %cred.label, session, failed = ?failed, "session handshake: some endpoints failed");
+    }
+}
+
 /// Datadog 遥测日志：每 tick（30min）发往 `http-intake.logs.us5.datadoghq.com`。
 ///
 /// 取自 `cap/2.1.145/00066`（idle 周期，2 条 flat 格式日志）。
@@ -1055,8 +1017,64 @@ pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenEndpointError, tier_from};
+    use super::{KeepaliveCtx, TokenEndpointError, tier_from};
     use wreq::StatusCode;
+
+    /// 有近期真实会话时，保活事件与 Datadog 日志挂在那个会话的身份上：同一个 session_id /
+    /// device_id / 版本 / 模型 / beta 串，`auth` 块带组织 id。没有时退回按账号派生的身份。
+    #[test]
+    fn keepalive_attaches_to_the_real_session_when_there_is_one() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let store = crate::store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+        let snapshot = crate::telemetry::SessionSnapshot {
+            session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
+            device_id: "b9".repeat(32),
+            account_uuid: "9922ef8e-7945-4f5a-ab4f-cf5f521531df".into(),
+            version: "2.1.260".into(),
+            model: "claude-opus-5[1m]".into(),
+            betas: "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07".into(),
+            prompt_id: "6c079143-0c53-4c48-817d-105460b3f622".into(),
+            started_wall: std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+        };
+        let org = Some("09520b85-f6b6-432f-97e2-6ecb804a083f".to_string());
+        let ctx = KeepaliveCtx::new(&cred, 5.0, org.clone(), Some(snapshot));
+        assert_eq!(ctx.session_id, "4dc73702-d904-4887-809d-17b93cc5357c");
+        assert_eq!(ctx.device_id, "b9".repeat(32));
+        assert!(ctx.uptime_secs >= 600.0, "uptime 从真实会话起点算，而不是 luban 的");
+
+        let ev = &ctx.idle_events()[0]["event_data"];
+        assert_eq!(ev["session_id"], "4dc73702-d904-4887-809d-17b93cc5357c");
+        assert_eq!(ev["device_id"], "b9".repeat(32));
+        assert_eq!(ev["model"], "claude-opus-5[1m]");
+        assert_eq!(ev["betas"], "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07");
+        assert_eq!(ev["env"]["version"], "2.1.260");
+        assert_eq!(ev["auth"]["organization_uuid"], "09520b85-f6b6-432f-97e2-6ecb804a083f");
+        let meta: serde_json::Value = serde_json::from_slice(
+            &STANDARD.decode(ev["additional_metadata"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["cc_prompt_id"], "6c079143-0c53-4c48-817d-105460b3f622");
+
+        let dd = &ctx.dd_idle_entries()[0];
+        assert_eq!(dd["model"], "claude-opus-5", "Datadog 那份是规范名");
+        assert_eq!(dd["session_id"], "4dc73702-d904-4887-809d-17b93cc5357c");
+        assert_eq!(dd["version"], "2.1.260");
+        assert_eq!(
+            ctx.eval_body()["attributes"]["organizationUUID"],
+            "09520b85-f6b6-432f-97e2-6ecb804a083f"
+        );
+        assert_eq!(ctx.eval_body()["attributes"]["appVersion"], "2.1.260");
+
+        // 没有近期会话：退回派生身份，模型/版本用保活默认值，auth 只有账号。
+        let idle = KeepaliveCtx::new(&cred, 5.0, None, None);
+        assert_ne!(idle.session_id, ctx.session_id);
+        let ev = &idle.idle_events()[0]["event_data"];
+        assert_eq!(ev["model"], "claude-sonnet-5");
+        assert_eq!(ev["env"]["version"], super::keepalive_version());
+        assert!(ev["auth"].get("organization_uuid").is_none());
+        assert!(idle.eval_body()["attributes"].get("organizationUUID").is_none());
+    }
 
     /// 团队号的档位只能从 `rate_limit_tier` 读——实测 `cred_id=9`（`claude_team`）的
     /// `account.has_claude_max`/`has_claude_pro` **都是 false**，而

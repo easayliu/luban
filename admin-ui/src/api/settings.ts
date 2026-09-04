@@ -85,6 +85,10 @@ export interface Settings {
   hoist_system_role: boolean
   /** 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。 */
   reject_openai_shape: boolean
+  /** 替每条转发的 /v1/messages 上报官方客户端形态的遥测（事件链、Datadog 日志、OTel 指标）。 */
+  api_telemetry: boolean
+  /** 保活循环里的空闲遥测（版本检查事件 + Datadog 日志 + GrowthBook 画像）。 */
+  keepalive_telemetry: boolean
   /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
   prefill_policy: string
   /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
@@ -116,6 +120,8 @@ export type ForwardingKey =
   | 'strip_empty_text'
   | 'hoist_system_role'
   | 'reject_openai_shape'
+  | 'api_telemetry'
+  | 'keepalive_telemetry'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

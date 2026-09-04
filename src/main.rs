@@ -12,6 +12,7 @@ mod oauth;
 mod pricing;
 mod proxy;
 mod store;
+mod telemetry;
 mod web;
 
 use std::sync::Arc;

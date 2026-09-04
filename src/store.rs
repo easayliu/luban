@@ -2095,6 +2095,12 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_OPENAI_SHAPE) {
             flags.reject_openai_shape = v;
         }
+        if let Some(v) = on(API_TELEMETRY) {
+            flags.api_telemetry = v;
+        }
+        if let Some(v) = on(KEEPALIVE_TELEMETRY) {
+            flags.keepalive_telemetry = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -2316,6 +2322,14 @@ pub const HOIST_SYSTEM_ROLE: &str = "hoist_system_role";
 /// 字段等一律 400，不修补不转发。关掉后退回 `hoist_system_role` 等修补路径。
 pub const REJECT_OPENAI_SHAPE: &str = "reject_openai_shape";
 
+/// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
+/// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
+pub const API_TELEMETRY: &str = "api_telemetry";
+
+/// 保活是否还发遥测（每 30 分钟的空闲版本检查事件 + Datadog 日志 + GrowthBook 画像）的
+/// settings 键名。缺省视为开启。见 [`ForwardFlags::keepalive_telemetry`]。
+pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
+
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
@@ -2524,6 +2538,21 @@ pub struct ForwardFlags {
     /// 开着时 `hoist_system_role` 对这类请求不再有机会生效（入口就拒了）；关掉才退回修补。
     /// 模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
     pub reject_openai_shape: bool,
+    /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
+    /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
+    /// 逐项 token 与花费）、Datadog 日志、OTel 指标，身份取实际发往上游的那份，节奏照
+    /// 抓包（30s / 10s / 5min 攒批）。见 [`crate::telemetry`]。
+    ///
+    /// 关掉即只剩 [`crate::oauth`] 的保活遥测——上游那边这个账号就成了「有大量 API 用量、
+    /// 遥测里却一条 API 调用都没有」的形态。
+    pub api_telemetry: bool,
+    /// 保活循环里的遥测那一半：每 30 分钟一组空闲版本检查事件（event_logging + Datadog）与
+    /// 每 6 小时一次 GrowthBook 画像。有近期真实会话的凭证，事件挂到那个会话的身份上
+    /// （同一 session_id / device_id / 版本），没有的才用按账号派生的空闲身份。
+    ///
+    /// 关掉只停这一半：token 刷新、bootstrap / policy_limits / settings 握手与 401/403
+    /// 探测照常。不影响 [`Self::api_telemetry`]。
+    pub keepalive_telemetry: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2552,6 +2581,8 @@ impl Default for ForwardFlags {
             strip_empty_text: true,
             hoist_system_role: true,
             reject_openai_shape: true,
+            api_telemetry: true,
+            keepalive_telemetry: true,
         }
     }
 }
@@ -7768,6 +7799,8 @@ mod tests {
             (STRIP_EMPTY_TEXT, "0"),
             (HOIST_SYSTEM_ROLE, "0"),
             (REJECT_OPENAI_SHAPE, "0"),
+            (API_TELEMETRY, "0"),
+            (KEEPALIVE_TELEMETRY, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -7798,6 +7831,8 @@ mod tests {
                 strip_empty_text: false,
                 hoist_system_role: false,
                 reject_openai_shape: false,
+                api_telemetry: false,
+                keepalive_telemetry: false,
             }
         );
 

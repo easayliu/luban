@@ -1143,6 +1143,21 @@ async fn handle_inner(
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
                 forensics: capture_forensics(&upstream, &sent, &cred),
+                // 只给计费路径上的 2xx 备料：其余路径 Drop 时也不会报，早点省掉那份 body 的引用。
+                telemetry: (flags.api_telemetry && billable && status.is_success()).then(|| {
+                    crate::telemetry::Capture {
+                        sink: state.telemetry.clone(),
+                        account_uuid: cred.account_uuid.clone(),
+                        org_type: cred.org_type.clone(),
+                        body: sent.clone(),
+                        betas: header_opt(&upstream.headers, "anthropic-beta"),
+                        session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
+                        organization_id: header_opt(up.headers(), "anthropic-organization-id"),
+                        started_at: std::time::SystemTime::now()
+                            .checked_sub(started.elapsed())
+                            .unwrap_or_else(std::time::SystemTime::now),
+                    }
+                }),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,
@@ -2634,6 +2649,10 @@ struct ReqLog {
     upstream_request_id: Option<String>,
     /// 取证字段（出口、形态摘要、上游错误文案、改写标签……），见 [`store::Forensics`]。
     forensics: store::Forensics,
+    /// 逐请求遥测要用的请求侧材料（出站体、出站 beta、会话 id、组织 id）；`None` 即这条
+    /// 不上报（开关关着、非计费路径、非 2xx）。响应侧的量在 Drop 时从 `sniffer` 取，
+    /// 一起交给 [`crate::telemetry::Telemetry::record`]。
+    telemetry: Option<crate::telemetry::Capture>,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
@@ -2646,6 +2665,8 @@ struct ReqLog {
 impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
+        // 下面两个分支会把 `stream_broke` take 掉；遥测那一步要知道这条有没有断，先记下。
+        let stream_broke = self.stream_broke.is_some();
         // 透传流路径的两类「200 里的失败」在此收口。响应头早发出去了，客户端拿到的
         // 状态码改不动（也不该改，行为保持原样），但**记账用的** status 必须反映真实结果：
         // 照搬 200 会让失败从成功率里凭空消失，正是 `aggregate_sse` 那条路早就避开的坑。
@@ -2789,6 +2810,46 @@ impl Drop for ReqLog {
             forensics: std::mem::take(&mut self.forensics),
         };
         spawn_usage_log(self.store.clone(), rec);
+
+        // 官方客户端只对**成功拿到用量**的请求发 `tengu_api_success`（失败另有 `tengu_api_error`，
+        // 这里暂不模拟）：中途断流、上游报错、没有 usage 的一律不报。
+        // 流式还要看见 `message_stop`：半截流的 `message_start` 也带 usage，但客户端那边这条
+        // 是失败的，不会有 success 事件。聚合路径（[`aggregate_sse`]）另有完整性检查，放行。
+        let stream_complete =
+            !self.sniffer.is_stream || self.sniffer.saw_message_stop || self.sse_aggregated;
+        if let Some(cap) = self.telemetry.take()
+            && self.status == StatusCode::OK.as_u16()
+            && has_usage
+            && !stream_broke
+            && stream_complete
+        {
+            let sink = cap.sink.clone();
+            sink.record(crate::telemetry::ApiCall {
+                cred_id: self.cred_id,
+                account_uuid: cap.account_uuid,
+                org_type: cap.org_type,
+                body: cap.body,
+                betas: cap.betas,
+                session_header: cap.session_header,
+                ua_out: self.ua_out.clone(),
+                organization_id: cap.organization_id,
+                started_at: cap.started_at,
+                ttft_ms: self.ttft_ms.map(|v| v as u64),
+                total_ms: total_ms as u64,
+                request_id: self.upstream_request_id.clone(),
+                message_id: self.sniffer.message_id.clone(),
+                stop_reason: self.sniffer.stop_reason.clone(),
+                resp_model: self.sniffer.model.clone(),
+                input_tokens: self.sniffer.input_tokens.unwrap_or(0),
+                output_tokens: self.sniffer.output_tokens.unwrap_or(0),
+                cache_read_tokens: self.sniffer.cache_read_tokens.unwrap_or(0),
+                cache_creation_tokens: self.sniffer.cache_creation_tokens.unwrap_or(0),
+                text_chars: self.sniffer.text_chars,
+                thinking_chars: self.sniffer.thinking_chars,
+                cost_usd,
+                speed,
+            });
+        }
     }
 }
 
@@ -3021,6 +3082,13 @@ struct UsageSniffer {
     /// 但上游没在产出内容，与 `last_event=message_start` 是两种不同的死法。
     last_event: Option<String>,
     events: u32,
+    /// 响应的 `message.id`（`msg_…`）、最终 `stop_reason`，以及正文里 text / thinking 的
+    /// 字符数。都是逐请求遥测（`tengu_api_success` / `tengu_turn_first_text` /
+    /// `tengu_prompt_cache_diagnosis_received`）要的量，顺着已经在做的逐行解析记下来。
+    message_id: Option<String>,
+    stop_reason: Option<String>,
+    text_chars: usize,
+    thinking_chars: usize,
 }
 
 impl UsageSniffer {
@@ -3086,6 +3154,46 @@ impl UsageSniffer {
             .or_else(|| v.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str()))
         {
             self.model = Some(m.to_string());
+        }
+        // `message_start.message.id` / 非流式顶层 `id`。
+        if let Some(id) = v
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .or_else(|| v.get("id"))
+            .and_then(|i| i.as_str())
+            .filter(|i| i.starts_with("msg_"))
+        {
+            self.message_id = Some(id.to_string());
+        }
+        // `message_delta.delta.stop_reason` / 非流式顶层 `stop_reason`（`null` 不算）。
+        if let Some(sr) = v
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .or_else(|| v.get("stop_reason"))
+            .and_then(|s| s.as_str())
+        {
+            self.stop_reason = Some(sr.to_string());
+        }
+        // 正文字符数：流式看 `content_block_delta.delta`，非流式看顶层 `content[]`。
+        if let Some(d) = v.get("delta") {
+            if let Some(t) = d.get("text").and_then(|t| t.as_str()) {
+                self.text_chars += t.encode_utf16().count();
+            }
+            if let Some(t) = d.get("thinking").and_then(|t| t.as_str()) {
+                self.thinking_chars += t.encode_utf16().count();
+            }
+        }
+        if !self.is_stream
+            && let Some(blocks) = v.get("content").and_then(|c| c.as_array())
+        {
+            for b in blocks {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    self.text_chars += t.encode_utf16().count();
+                }
+                if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                    self.thinking_chars += t.encode_utf16().count();
+                }
+            }
         }
         let usage = v.get("usage").or_else(|| v.get("message").and_then(|m| m.get("usage")));
         if let Some(u) = usage {
@@ -9115,6 +9223,8 @@ mod tests {
             strip_empty_text: true,
             hoist_system_role: false,
             reject_openai_shape: false,
+            api_telemetry: false,
+            keepalive_telemetry: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -9822,6 +9932,8 @@ mod tests {
             strip_empty_text: true,
             hoist_system_role: false,
             reject_openai_shape: false,
+            api_telemetry: false,
+            keepalive_telemetry: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -10557,6 +10669,8 @@ mod tests {
                 strip_empty_text: true,
                 hoist_system_role: false,
                 reject_openai_shape: false,
+                api_telemetry: false,
+                keepalive_telemetry: false,
             }
         };
         let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);
@@ -13644,6 +13758,7 @@ mod tests {
                 client_request_id: None,
                 upstream_request_id: None,
                 forensics: Default::default(),
+                telemetry: None,
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
                 _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -13700,6 +13815,7 @@ mod tests {
             client_request_id: None,
             upstream_request_id: None,
             forensics: Default::default(),
+            telemetry: None,
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -14478,6 +14594,7 @@ mod tests {
             client_request_id: None,
             upstream_request_id: None,
             forensics: Default::default(),
+            telemetry: None,
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
