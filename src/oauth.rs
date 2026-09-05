@@ -1265,19 +1265,91 @@ async fn handshake_code_triggers(
 
 /// `downloads.claude.ai` 上的版本与插件市场元数据（无鉴权，axios UA）。
 async fn handshake_download(client: &wreq::Client, path: &str) -> KeepaliveResult {
-    let resp = axios(
+    let resp = download_request(client, path).send().await;
+    match resp {
+        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Err(_) => KeepaliveResult::Failed,
+    }
+}
+
+fn download_request(client: &wreq::Client, path: &str) -> wreq::RequestBuilder {
+    axios(
         client
             .get(format!("https://downloads.claude.ai{path}"))
             .header("Accept", config::AXIOS_ACCEPT)
             .header("User-Agent", config::DATADOG_USER_AGENT),
         "download",
     )
-    .send()
-    .await;
-    match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
-        Err(_) => KeepaliveResult::Failed,
+}
+
+// ---------- 官方最新发布版 ----------
+
+/// `downloads.claude.ai/claude-code-releases/latest` 最近一次返回的版本号。
+///
+/// 那个端点的响应体就是一行裸版本串（`cap/2.1.260-2/00060`：`2.1.260`，`Content-Type:
+/// text/plain`）。真实 CC 每 ~30min 拉一次做版本检查；luban 拉它还多一个用处——来访 UA
+/// 自报的 `claude-cli/<版本>` **不能高于这个数**：一个自称 2.5.0 的客户端，在官方只发到
+/// 2.1.260 的时候，不是官方客户端。见 [`crate::proxy`] 里对 `from_cc_client` 的判定。
+///
+/// 进程内缓存，不落库：重启后头一次拉到之前，调用方退回写死的
+/// [`config::CC_VERSION_BASE`]（[`latest_release`] 返回 `None`）。
+static LATEST_RELEASE: parking_lot::Mutex<Option<(u64, u64, u64)>> = parking_lot::Mutex::new(None);
+
+/// 已学到的官方最新发布版；还没拉到过（或每次都失败）时 `None`。
+pub fn latest_release() -> Option<(u64, u64, u64)> {
+    *LATEST_RELEASE.lock()
+}
+
+/// 解析 `latest` 端点的响应体：一行 `主.次.修`，三段都得是数字。
+///
+/// 比 [`crate::proxy::parse_version`] 严：那边是给来访 UA 用的宽松解析，这里读的是官方
+/// 发布清单，形态不对（HTML 错误页、空体、多了后缀）就当没拿到——把一个错的上限记进去，
+/// 会让所有真实客户端都被判成冒充。
+pub fn parse_release_body(body: &str) -> Option<(u64, u64, u64)> {
+    let mut it = body.trim().split('.').map(|p| p.parse::<u64>().ok());
+    let v = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(v)
+}
+
+/// 记下学到的最新版；变了就打一行 info。
+fn remember_latest_release(v: (u64, u64, u64)) {
+    let mut cur = LATEST_RELEASE.lock();
+    if *cur != Some(v) {
+        tracing::info!(
+            from = %cur.map(|(a, b, c)| format!("{a}.{b}.{c}")).unwrap_or_else(|| "-".into()),
+            to = %format!("{}.{}.{}", v.0, v.1, v.2),
+            "learned the latest official Claude Code release"
+        );
+        *cur = Some(v);
     }
+}
+
+/// 拉 `/claude-code-releases/latest` 并把版本号记进 [`LATEST_RELEASE`]。
+///
+/// 请求形态与 [`handshake_download`] 完全一样（同一条抓包），只多了读体。2xx 但体解析不出
+/// 版本时缓存不动、结果按 `Ok` 报——请求本身没失败，是体不认识，日志里单独记一行。
+pub async fn fetch_latest_release(client: &wreq::Client) -> KeepaliveResult {
+    let resp = match download_request(client, "/claude-code-releases/latest").send().await {
+        Ok(r) => r,
+        Err(_) => return KeepaliveResult::Failed,
+    };
+    let status = resp.status().as_u16();
+    let result = KeepaliveResult::from_status(status);
+    if (200..300).contains(&status) {
+        match resp.text().await {
+            Ok(body) => match parse_release_body(&body) {
+                Some(v) => remember_latest_release(v),
+                None => tracing::warn!(
+                    body = %body.chars().take(80).collect::<String>(),
+                    "releases/latest: body is not a version number, keeping the cached one"
+                ),
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "releases/latest: failed to read body");
+            }
+        }
+    }
+    result
 }
 
 /// 一个新会话的启动握手，**分两段**跑。
@@ -1396,7 +1468,7 @@ impl HandshakeRunner {
     pub async fn downloads(&self, client: &wreq::Client) {
         let releases = {
             tokio::time::sleep(Duration::from_millis(config::DOWNLOAD_RELEASES_DELAY_MS)).await;
-            handshake_download(client, "/claude-code-releases/latest").await
+            fetch_latest_release(client).await
         };
         let plugins = {
             tokio::time::sleep(Duration::from_millis(
@@ -1457,6 +1529,19 @@ pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx
 
 #[cfg(test)]
 mod tests {
+    /// `releases/latest` 的体是一行裸版本串；别的形态一律不认。
+    #[test]
+    fn release_body_must_be_a_bare_three_part_version() {
+        let p = super::parse_release_body;
+        assert_eq!(p("2.1.260"), Some((2, 1, 260)), "抓包原样");
+        assert_eq!(p("2.1.260\n"), Some((2, 1, 260)), "尾随换行");
+        assert_eq!(p(""), None, "空体");
+        assert_eq!(p("2.1"), None, "两段不够");
+        assert_eq!(p("2.1.260.1"), None, "四段太多");
+        assert_eq!(p("2.1.260-beta.1"), None, "带后缀");
+        assert_eq!(p("<html>Not Found</html>"), None, "错误页");
+    }
+
     use super::{
         KeepaliveCtx, PkceChallenge, TokenEndpointError, exchange_body, parse_token_set,
         refresh_body, tier_from, urlencode,

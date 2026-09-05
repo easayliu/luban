@@ -287,7 +287,21 @@ async fn handle_inner(
     // 它的 `system` 里若没有那句身份声明，上游会按第三方应用拒。要让这类客户端继续用上
     // 订阅额度，只能让它别再冒充官方 UA（改回自己的 UA 即可重新走模拟），或者自己把那句
     // 身份声明加进 `system`。这是取舍后的选择：宁可让冒充者暴露，也不对真官方客户端动手脚。
-    let from_cc_client = cc_cli_version(&client_ua).is_some();
+    //
+    // **自报的版本还得说得通**：不高于官方已发布的最新版（[`known_latest_release`]，从
+    // `downloads.claude.ai/claude-code-releases/latest` 学来）。一个自称 `claude-cli/2.5.0`
+    // 的客户端在官方只发到 2.1.260 的时候不是官方客户端——按非 CC 客户端处理（走模拟），
+    // 也不再沿用它那个不存在的版本号去补 billing header、跑启动握手、发额度探测。
+    let from_cc_client = trusted_cc_version(&client_ua).is_some();
+    if !from_cc_client && let Some((a, b, c)) = cc_cli_version(&client_ua) {
+        let (la, lb, lc) = known_latest_release();
+        tracing::warn!(
+            ua = %client_ua,
+            claimed = %format!("{a}.{b}.{c}"),
+            latest = %format!("{la}.{lb}.{lc}"),
+            "client claims a Claude Code version newer than the latest official release; not treating it as an official client"
+        );
+    }
 
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
@@ -828,7 +842,7 @@ async fn handle_inner(
             && let Some(start) = session_start(
                 upstream.sim.as_ref(),
                 upstream.client_link.as_ref(),
-                &cc_cli_version(&client_ua)
+                &trusted_cc_version(&client_ua)
                     .map(|(a, b, c)| format!("{a}.{b}.{c}"))
                     .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),
             )
@@ -1657,7 +1671,7 @@ impl Upstream<'_> {
                 .headers
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .and_then(cc_cli_version)
+                .and_then(trusted_cc_version)
                 .map(|(a, b, c)| format!("{a}.{b}.{c}"));
             rewrite_body(
                 body,
@@ -4504,7 +4518,7 @@ fn build_forward_headers_for(
         None if flags.merge_beta => {
             // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta`]。
             let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-            Some(merge_beta(incoming, model, version.and_then(cc_cli_version)))
+            Some(merge_beta(incoming, model, version.and_then(trusted_cc_version)))
         }
         None => None,
     };
@@ -7368,6 +7382,32 @@ fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
     // 版本串到第一个非「数字/点」字符为止（官方那串后面跟的是空格 + `(external, cli)`）。
     let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
     parse_version(&rest[..end])
+}
+
+/// 官方已发布的最新 Claude Code 版本：从 `downloads.claude.ai/claude-code-releases/latest`
+/// 学来的（[`crate::oauth::latest_release`]）与写死的 [`config::CC_VERSION_BASE`] 取大者。
+///
+/// 取大者是为了两头兜底：进程刚起还没拉到 `latest` 时有个不至于太旧的下限；反过来那个
+/// 端点若哪天回了个比 luban 自己模拟的版本还旧的数（缓存、回滚），也不能把 luban 自己发
+/// 出去的版本判成「不存在」。
+pub(crate) fn known_latest_release() -> (u64, u64, u64) {
+    let base = parse_version(config::CC_VERSION_BASE).unwrap_or((0, 0, 0));
+    crate::oauth::latest_release().map_or(base, |l| l.max(base))
+}
+
+/// 来访 UA 自报的 CC 版本，**且这个版本说得通**——不高于 [`known_latest_release`]。
+///
+/// 高于官方最新版的自报版本按「读不出版本」处理（`None`）：这不是官方客户端，跳过模拟、
+/// 沿用它的版本去补 billing header / 跑握手 / 发额度探测，都是在替一个不存在的版本背书。
+/// 低于最新版的一律认——用户不升级是常态，下限另有 [`below_min_client_version`] 管。
+fn trusted_cc_version(ua: &str) -> Option<(u64, u64, u64)> {
+    trusted_cc_version_against(ua, known_latest_release())
+}
+
+/// [`trusted_cc_version`] 的纯函数形态：`latest` 由调用方给，供测试不碰全局缓存。
+fn trusted_cc_version_against(ua: &str, latest: (u64, u64, u64)) -> Option<(u64, u64, u64)> {
+    let v = cc_cli_version(ua)?;
+    (v <= latest).then_some(v)
 }
 
 /// 最低客户端版本闸：来访 UA 自报的 CC 版本低于 `min` 时，返回 `(自报版本, 要求版本)` 供
@@ -13861,7 +13901,7 @@ mod tests {
         flags: store::ForwardFlags,
     ) -> Option<super::Simulation> {
         let v = parsed(body);
-        let from_cc_client = super::cc_cli_version(&super::ua_of(headers)).is_some();
+        let from_cc_client = super::trusted_cc_version(&super::ua_of(headers)).is_some();
         super::Simulation::detect(v.as_ref(), headers, from_cc_client, flags, &test_cred(), "fp")
     }
 
@@ -17809,6 +17849,26 @@ mod tests {
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
         assert_eq!(v("claude-cli/"), None, "有前缀没版本");
         assert_eq!(v("claude-cli/next (external, cli)"), None, "版本位不是数字");
+    }
+
+    /// 自报版本高于官方最新发布版的 UA 不算官方客户端；等于或更低的照认。
+    #[test]
+    fn a_cc_version_newer_than_the_latest_release_is_not_trusted() {
+        let t = |ua: &str| super::trusted_cc_version_against(ua, (2, 1, 260));
+        assert_eq!(t("claude-cli/2.1.260 (external, cli)"), Some((2, 1, 260)), "正好最新版");
+        assert_eq!(t("claude-cli/2.1.226 (external, cli)"), Some((2, 1, 226)), "旧版照认");
+        assert_eq!(t("claude-cli/2.5.0 (external, cli)"), None, "官方没发过 2.5.0");
+        assert_eq!(t("claude-cli/2.1.261 (external, cli)"), None, "哪怕只高一个补丁号");
+        assert_eq!(t("claude-cli/3.0.0 (external, cli)"), None);
+        assert_eq!(t("python-httpx/0.27.0"), None, "非 CC 客户端本来就读不出");
+    }
+
+    /// 没学到 `latest` 时上限退回 [`config::CC_VERSION_BASE`]，且学到的值不会把上限拉到
+    /// 它之下。
+    #[test]
+    fn known_latest_release_is_at_least_the_baked_in_version() {
+        let base = super::parse_version(config::CC_VERSION_BASE).unwrap();
+        assert!(super::known_latest_release() >= base);
     }
 
     /// cc_version 后缀与官方客户端的算法对齐（逆向自 2.1.251）：

@@ -157,6 +157,9 @@ pub async fn run(
     //   每张凭证在本进程里首次被保活 — bootstrap + penguin_mode + eval（启动握手），新加的号下个 tick 补
     //   每 1h   — policy_limits + settings
     //   每 6h   — eval（Statsig 特性标志刷新）                          ← 同一开关
+    //   每 30min — downloads.claude.ai/claude-code-releases/latest（版本检查，无鉴权，
+    //              每 tick 只拉一次、借第一张可用凭证的出口）：学到的最新版是来访 UA 自报
+    //              版本的上限，见 `proxy::known_latest_release`
     // 指标不再由保活发假值：真实用量的指标由 `crate::telemetry` 按会话累计后发。
     // 空闲事件的身份优先挂到该凭证最近的真实会话上（同一 session_id / device_id / 版本），
     // 没有近期会话才用按账号派生的那套。
@@ -195,6 +198,9 @@ pub async fn run(
                 };
                 // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。
                 seen.retain(|id| creds.iter().any(|c| c.id == *id));
+                // 这一 tick 拉过 `releases/latest` 没有。它无鉴权、与账号无关，一轮拉一次就够；
+                // 但也**不用直连**——借第一张能建出客户端的凭证的出口发，跟其他出站一个待遇。
+                let mut fetched_latest = false;
                 for cred in creds {
                     if cred.is_banned() {
                         continue;
@@ -208,6 +214,18 @@ pub async fn run(
                             continue;
                         }
                     };
+
+                    if !fetched_latest {
+                        fetched_latest = true;
+                        let r = oauth::fetch_latest_release(&http).await;
+                        if !r.is_ok() {
+                            tracing::debug!(
+                                cred_id = cred.id,
+                                ?r,
+                                "keepalive: releases/latest fetch failed"
+                            );
+                        }
+                    }
 
                     // 保活前先确保 token 新鲜——懒刷新在无代理流量时不会触发，
                     // 长时间空闲会导致 refresh_token 过期（invalid_grant）。
