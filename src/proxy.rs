@@ -34,12 +34,36 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let started = std::time::Instant::now();
     let request_id = request_id_for(&headers);
-    let mut resp = handle_inner(state, method, uri, headers, body, &request_id).await;
+    // 本地拒绝的流水要用到的几样先抠出来——`handle_inner` 拿走了 headers/uri/body 的所有权。
+    // 都是头上的一次查找，体只克隆句柄（`Bytes` 引用计数），不在这儿解析。
+    let local = LocalRejectCtx {
+        method: method.to_string(),
+        path: uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string(),
+        ua: ua_of(&headers),
+        session_header: incoming_session_id(&headers, None),
+    };
+    let store = state.store.clone();
+    let log_state = RequestLogState::default();
+    let mut resp = handle_inner(state, method, uri, headers, body, &request_id, &log_state).await;
     // 错误体里也带上 id：New API 把上游错误的 `error.message` 原文展示给它的用户，响应头
     // 到不了那一层；人拿着报错截图来问时，id 得就在那句话里。
-    if resp.status().is_client_error() || resp.status().is_server_error() {
-        resp = annotate_error_response(resp, &request_id).await;
+    let is_error = resp.status().is_client_error() || resp.status().is_server_error();
+    let mut local_error = None;
+    if is_error {
+        (resp, local_error) = annotate_error_response(resp, &request_id).await;
+    }
+    // 没到上游就被 luban 自己拒掉的请求（坏形态、限流、鉴权、无可用账号……）也进流水：
+    // 否则控制台里查不到那个 id，成功率与请求数里也看不见这一批。到过上游的不在这儿记：
+    // 正常收尾的由 [`ReqLog`] 在流结束时落库，早退的由 [`log_early_upstream_failure`]
+    // 就地写带账号的那条——两者都会把 `logged` 置真。
+    if is_error && !log_state.logged.load(std::sync::atomic::Ordering::Relaxed) {
+        let parsed = log_state.parsed.lock().take();
+        spawn_usage_log(
+            store,
+            local_reject_record(&local, parsed, resp.status(), local_error, &request_id, started),
+        );
     }
     if let Ok(v) = HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v.clone());
@@ -83,6 +107,176 @@ fn new_request_id() -> String {
     format!("req_{tail}")
 }
 
+/// 一条请求进 [`handle_inner`] 之前留下的几样，本地拒绝时拿来写流水（见 [`local_reject_record`]）。
+struct LocalRejectCtx {
+    method: String,
+    path: String,
+    /// 来访 UA，缺失时是 `-` 占位（[`ua_of`]），入库前还原成 `None`。
+    ua: String,
+    /// 头上的会话 id；体里那个在 [`ParsedRequestBits`] 里（解析过体才有）。
+    session_header: Option<String>,
+}
+
+/// [`handle`] 与 [`handle_inner`] 之间关于「这条的流水谁来写」的约定。
+#[derive(Default)]
+struct RequestLogState {
+    /// 流水已经有人写了：建了 [`ReqLog`]（到过上游、正常收尾），或早退路径就地写了
+    /// （[`log_early_upstream_failure`]）。仍为 false 的 4xx/5xx 才是真正的本地拒绝，由
+    /// [`handle`] 按 [`local_reject_record`] 补一条。
+    logged: std::sync::atomic::AtomicBool,
+    /// 体解析出来之后随手放下的几样，本地拒绝的流水用它。**外层不再解析体**：API key、
+    /// 最低版本、头上的会话 RPM/并发这些拒绝都发生在体解析之前，最大 64MB 的未鉴权 JSON
+    /// 若在外层再解析一遍，就是给任何人一个白烧 CPU 的入口；解析过的那些也不必解析第二遍。
+    parsed: parking_lot::Mutex<Option<ParsedRequestBits>>,
+}
+
+/// 从来访体里读出的、流水要用的三样。见 [`RequestLogState::parsed`]。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedRequestBits {
+    model: Option<String>,
+    device_id: Option<String>,
+    session_id: Option<String>,
+}
+
+/// 本地拒绝那条 4xx/5xx 的流水：没选到账号（`cred_id` 为空——库层本来就把这类行当作
+/// 「尚未选到凭证就失败的请求」，见 `store::prune_orphan_usage_logs`），没有用量、没有出站；
+/// 记的是来访侧能看到的一切：路径、UA、模型、设备、会话、状态码、错误类型与文案、请求 id。
+///
+/// 模型/设备/体里的会话 id 来自 `parsed`——[`handle_inner`] 解析体时放下的那份；拒绝发生在
+/// 体解析之前（API key、版本闸、头上的会话限流）时它是 `None`，那类行只有头上的会话 id，
+/// 模型与设备为空。这里**绝不**自己解析体，理由见 [`RequestLogState::parsed`]。
+fn local_reject_record(
+    ctx: &LocalRejectCtx,
+    parsed: Option<ParsedRequestBits>,
+    status: StatusCode,
+    error: Option<LocalErrorFields>,
+    request_id: &str,
+    started: std::time::Instant,
+) -> store::UsageRecord {
+    let parsed = parsed.unwrap_or_default();
+    let (error_type, error_message) = error.map(|e| (e.etype, e.message)).unwrap_or_default();
+    let session_id = ctx.session_header.clone().or(parsed.session_id);
+    tracing::debug!(
+        method = %ctx.method, path = %ctx.path, ua = %ctx.ua,
+        status = status.as_u16(), request_id,
+        error_type = %error_type.as_deref().unwrap_or("-"),
+        "logging a local rejection to the usage log"
+    );
+    store::UsageRecord {
+        cred_id: None,
+        cred_label: String::new(),
+        device_id: parsed.device_id,
+        model: parsed.model,
+        path: ctx.path.clone(),
+        ua: Some(ctx.ua.clone()).filter(|u| u != "-"),
+        ua_out: None,
+        status: status.as_u16(),
+        total_ms: i64::try_from(started.elapsed().as_millis()).ok(),
+        request_id: Some(request_id.to_string()),
+        forensics: store::Forensics {
+            session_id,
+            error_type,
+            error_message,
+            rewrites: Some("rejected_locally".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// 到过上游、却没走到 [`ReqLog`] 就得返回的那几条路，就地写一条**带账号**的流水并告诉外层
+/// 已经写过。四个调用点：401 读体失败、401 换不到号（回 403 或原样透传）、429 判定「套餐不含
+/// 这个模型」且换不到号（回 403）、`upstream.send()` 连接层失败（回 502）。
+///
+/// 不写的话外层会把它们当本地拒绝补一条：`cred_id` 空、没出站 UA、没上游 request-id，还挂着
+/// `rejected_locally`——把一次真实的上游失败伪装成「没出门」。这里记的是与 [`ReqLog`] 同一套
+/// 字段：账号、出站 UA、出站体形态摘要、出口代理、上游 request-id、上游错误类型与文案、
+/// 429 那条还带额度窗口。`status` 是**客户端拿到的**状态码（同 `ReqLog` 的口径）。
+///
+/// 换号 `continue` 的那些不在这儿记：那一发在旧号上的失败由遥测报（[`record_early_failure`]），
+/// 流水只记这条请求最终落在哪个号、什么结果——与 429 换号、签名降级重试的口径一致（一条
+/// 请求一行）。
+#[allow(clippy::too_many_arguments)]
+fn log_early_upstream_failure(
+    state: &AppState,
+    log_state: &RequestLogState,
+    cred: &crate::credentials::Credential,
+    upstream: &Upstream<'_>,
+    sent: &Bytes,
+    f: EarlyUpstreamFailure<'_>,
+) {
+    let mut forensics = capture_forensics(upstream, sent, cred);
+    forensics.error_type = f.error_type;
+    forensics.error_message = f.error_message;
+    forensics.third_party = f.third_party;
+    forensics.rewrites = Some(f.tag.to_string());
+    let ratelimit = f.ratelimit.cloned().unwrap_or_default();
+    let rec = store::UsageRecord {
+        cred_id: Some(cred.id),
+        cred_label: cred.label.clone(),
+        device_id: f.device_id,
+        model: f.model,
+        path: f.path.to_string(),
+        ua: Some(f.client_ua.to_string()).filter(|u| u != "-"),
+        ua_out: Some(ua_of(&upstream.headers)),
+        status: f.status.as_u16(),
+        total_ms: i64::try_from(f.started.elapsed().as_millis()).ok(),
+        unified_status: ratelimit.unified_status.clone(),
+        rl_5h_status: ratelimit.five_h_status.clone(),
+        rl_5h_reset: ratelimit.five_h_reset,
+        rl_5h_utilization: ratelimit.five_h_utilization,
+        rl_7d_status: ratelimit.seven_d_status.clone(),
+        rl_7d_reset: ratelimit.seven_d_reset,
+        rl_7d_utilization: ratelimit.seven_d_utilization,
+        rl_representative: ratelimit.representative.clone(),
+        rl_overage_in_use: ratelimit.overage_in_use,
+        windows: ratelimit.windows(),
+        ratelimit_raw: (!ratelimit.raw.is_empty()).then(|| ratelimit.raw.clone()),
+        request_id: Some(f.request_id.to_string()),
+        upstream_request_id: f.upstream_request_id.map(str::to_string),
+        forensics,
+        ..Default::default()
+    };
+    log_state.logged.store(true, std::sync::atomic::Ordering::Relaxed);
+    spawn_usage_log(state.store.clone(), rec);
+}
+
+/// [`log_early_upstream_failure`] 的入参：那几条路各自手里有的东西。
+struct EarlyUpstreamFailure<'a> {
+    path: &'a str,
+    client_ua: &'a str,
+    model: Option<String>,
+    /// 与 [`ReqLog`] 的 `device_id` 同口径：来访的，没有就用模拟派生的（[`sim_device_id`]）。
+    device_id: Option<String>,
+    started: std::time::Instant,
+    request_id: &'a str,
+    upstream_request_id: Option<&'a str>,
+    /// 客户端拿到的状态码。
+    status: StatusCode,
+    error_type: Option<String>,
+    error_message: Option<String>,
+    third_party: bool,
+    ratelimit: Option<&'a RateLimitInfo>,
+    /// 改写标签：`upstream_401` / `model_unsupported` / `connection_error`。
+    tag: &'static str,
+}
+
+/// 从一条错误 JSON 里读出的 `error.type` / `error.message`（改写前的原文，不含追加的请求 id）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LocalErrorFields {
+    etype: Option<String>,
+    message: Option<String>,
+}
+
+impl LocalErrorFields {
+    fn from_json(bytes: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let err = v.get("error")?;
+        let field = |k: &str| err.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        Some(Self { etype: field("type"), message: field("message") })
+    }
+}
+
 /// 错误体最多收多大来改写。错误 JSON 通常几百字节；超过这个数的不是错误体，原样放行不碰。
 const ERROR_BODY_ANNOTATE_LIMIT: usize = 256 * 1024;
 
@@ -91,33 +285,43 @@ const ERROR_BODY_ANNOTATE_LIMIT: usize = 256 * 1024;
 /// 只碰 `content-type` 含 `json` 的响应：SSE、空体、非 JSON 的网关错误一律不动。收 body 会把
 /// 上游流读完，这正好也驱动了 [`ReqLog`] 的收尾——它挂在流上，读完才落日志。收不下来
 /// （超过上限）时 body 已经丢了，只能回一条自己的 502，至少把 id 带出去。
-async fn annotate_error_response(resp: Response, request_id: &str) -> Response {
+///
+/// 顺手把改写前的 `error.type` / `error.message` 读出来交回去（[`LocalErrorFields`]）：本地拒绝
+/// 写流水要用，而体在这儿已经收进内存了，别让调用方再收一遍。不是 JSON 或收不下来时为 `None`。
+async fn annotate_error_response(
+    resp: Response,
+    request_id: &str,
+) -> (Response, Option<LocalErrorFields>) {
     let is_json = resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("json"));
     if !is_json {
-        return resp;
+        return (resp, None);
     }
     let (mut parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, ERROR_BODY_ANNOTATE_LIMIT).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(request_id, error = %e, "failed to buffer an error body for annotation");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                format!(
-                    "failed to read the upstream error body: {e} (luban request id: {request_id})"
+            return (
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    format!(
+                        "failed to read the upstream error body: {e} (luban request id: {request_id})"
+                    ),
                 ),
+                None,
             );
         }
     };
+    let fields = LocalErrorFields::from_json(&bytes);
     let out = annotate_error_json(&bytes, request_id).map(Bytes::from).unwrap_or(bytes);
     // 长度变了，交给 hyper 按新 body 重算。
     parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, Body::from(out))
+    (Response::from_parts(parts, Body::from(out)), fields)
 }
 
 /// 在错误 JSON 里写入 luban 的请求 id：`error.message` 末尾追加 `(luban request id: req_…)`，
@@ -161,6 +365,9 @@ async fn handle_inner(
     headers: HeaderMap,
     body: Bytes,
     request_id: &str,
+    // 流水归属，见 [`RequestLogState`]：建 [`ReqLog`] 或早退路径就地写流水时置 `logged`，
+    // 解析完体放下 `parsed`；仍没人写的 4xx/5xx 由 [`handle`] 按本地拒绝补一条。
+    log_state: &RequestLogState,
 ) -> Response {
     let started = std::time::Instant::now();
     let client_request_id = client_request_id(&headers);
@@ -265,6 +472,12 @@ async fn handle_inner(
 
     // 提取 device_id（在 metadata.user_id 里；兼容 CC 内嵌 JSON 与扁平串两种格式）。
     let device_id = extract_device_id(body_json.as_ref());
+    // 给本地拒绝的流水留下这三样，外层就不必再解析体。见 [`RequestLogState::parsed`]。
+    *log_state.parsed.lock() = Some(ParsedRequestBits {
+        model: request_model(body_json.as_ref()),
+        device_id: device_id.clone(),
+        session_id: extract_session_id(body_json.as_ref()),
+    });
     // 该字段在不在（与「能否解析出设备标识」是两回事）：决定要不要给它补一份官方身份。
     // body 逐轮不变，算一次即可。见 [`Upstream::bare_session`]。
     let has_user_id = body_has_user_id(body_json.as_ref());
@@ -913,13 +1126,67 @@ async fn handle_inner(
                             in_band: false,
                         },
                     );
+                    log_early_upstream_failure(
+                        &state,
+                        log_state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        EarlyUpstreamFailure {
+                            path: &path_and_query,
+                            client_ua: &client_ua,
+                            model: req_model.clone(),
+                            device_id: early_logged_device(
+                                &device_id, &upstream, flags, &cred, &device_fp,
+                            ),
+                            started,
+                            request_id,
+                            upstream_request_id: up_request_id.as_deref(),
+                            status: StatusCode::UNAUTHORIZED,
+                            error_type: None,
+                            error_message: Some(format!(
+                                "failed to read the upstream 401 body: {e}"
+                            )),
+                            third_party: false,
+                            ratelimit: None,
+                            tag: "upstream_401",
+                        },
+                    );
                     return builder.body(Body::empty()).unwrap_or_else(|e| {
                         error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                     });
                 }
             };
+            let (etype, message) = parse_upstream_error(&bytes);
+            // 下面两条不换号的出路（回 403 / 原样透传）要写流水，共用这一份。
+            let early_401 = |status: StatusCode, error_type: Option<String>, message: String| {
+                log_early_upstream_failure(
+                    &state,
+                    log_state,
+                    &cred,
+                    &upstream,
+                    &sent,
+                    EarlyUpstreamFailure {
+                        path: &path_and_query,
+                        client_ua: &client_ua,
+                        model: req_model.clone(),
+                        device_id: early_logged_device(
+                            &device_id, &upstream, flags, &cred, &device_fp,
+                        ),
+                        started,
+                        request_id,
+                        upstream_request_id: up_request_id.as_deref(),
+                        status,
+                        error_type,
+                        error_message: Some(message),
+                        third_party: is_third_party_rejection(&bytes),
+                        ratelimit: None,
+                        tag: "upstream_401",
+                    },
+                );
+            };
             {
-                let (etype, message) = parse_upstream_error(&bytes);
+                let (etype, message) = (etype.clone(), message.clone());
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
                     status = 401u16,
@@ -992,6 +1259,11 @@ async fn handle_inner(
                                 error = %e,
                                 "401 swap: no enabled account can use this model, answering 403"
                             );
+                            early_401(
+                                StatusCode::FORBIDDEN,
+                                Some("permission_error".into()),
+                                e.to_string(),
+                            );
                             return error_response(
                                 StatusCode::FORBIDDEN,
                                 "permission_error",
@@ -1007,6 +1279,7 @@ async fn handle_inner(
                 }
             }
             // 没换号（判定不命中或换不到号）：body 已消费，就地透传。
+            early_401(StatusCode::UNAUTHORIZED, etype, message);
             let bytes = match &tool_names {
                 Some(map) => Bytes::from(map.restore(&bytes)),
                 None => bytes,
@@ -1075,6 +1348,66 @@ async fn handle_inner(
                         model = %model,
                         error = %e,
                         "no enabled account can use this model, answering 403"
+                    );
+                    // 这条到过上游（吃到的是 429），客户端拿到的是 403：流水按客户端口径记
+                    // 状态，额度窗口与上游 request-id 照上游那发记。
+                    // 响应头先取齐，下面读体会把 `up` 吃掉。`limited` 有值说明 `resp` 是 `Ok`
+                    // 且 429，这里的 `Err` 分支只是让类型闭合。
+                    let (up_request_id, up_org_id, up_body) = match resp {
+                        Ok(up) => (
+                            header_opt(up.headers(), "request-id"),
+                            header_opt(up.headers(), "anthropic-organization-id"),
+                            up.bytes().await.ok(),
+                        ),
+                        Err(_) => (None, None, None),
+                    };
+                    let (up_etype, up_message) = up_body
+                        .as_deref()
+                        .map(parse_upstream_error)
+                        .unwrap_or((None, String::new()));
+                    // 同 401 与连接层失败那两条：`ReqLog` 建不起来，失败遥测就地补。报的是
+                    // **这个号吃到的那发 429**（官方客户端对 429 发的正是 `tengu_api_error`），
+                    // 不是 luban 回给客户端的 403——遥测描述的是上游调用本身。
+                    record_early_failure(
+                        &state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        started,
+                        flags,
+                        billable,
+                        up_request_id.as_deref(),
+                        up_org_id,
+                        crate::telemetry::CallFailure {
+                            status: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                            error_type: up_etype,
+                            message: up_message,
+                            in_band: false,
+                        },
+                    );
+                    log_early_upstream_failure(
+                        &state,
+                        log_state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        EarlyUpstreamFailure {
+                            path: &path_and_query,
+                            client_ua: &client_ua,
+                            model: req_model.clone(),
+                            device_id: early_logged_device(
+                                &device_id, &upstream, flags, &cred, &device_fp,
+                            ),
+                            started,
+                            request_id,
+                            upstream_request_id: up_request_id.as_deref(),
+                            status: StatusCode::FORBIDDEN,
+                            error_type: Some("permission_error".into()),
+                            error_message: Some(e.to_string()),
+                            third_party: false,
+                            ratelimit: Some(&info),
+                            tag: "model_unsupported",
+                        },
                     );
                     return error_response(
                         StatusCode::FORBIDDEN,
@@ -1266,6 +1599,8 @@ async fn handle_inner(
 
             // 包裹响应流：首块到达记 TTFT，边转发边嗅探用量；
             // 流结束(或断开)时在 Drop 里记 total、输出一条日志并落库。
+            // 从这儿起流水归 ReqLog；告诉外层别再按本地拒绝补一条。
+            log_state.logged.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut rl = ReqLog {
                 started,
                 ttft_ms: None,
@@ -1586,6 +1921,28 @@ async fn handle_inner(
                     in_band: false,
                 },
             );
+            log_early_upstream_failure(
+                &state,
+                log_state,
+                &cred,
+                &upstream,
+                &sent,
+                EarlyUpstreamFailure {
+                    path: &path_and_query,
+                    client_ua: &client_ua,
+                    model: req_model.clone(),
+                    device_id: logged_device,
+                    started,
+                    request_id,
+                    upstream_request_id: None,
+                    status: StatusCode::BAD_GATEWAY,
+                    error_type: Some("api_error".into()),
+                    error_message: Some(format!("upstream request failed [{kind}]: {detail}")),
+                    third_party: false,
+                    ratelimit: None,
+                    tag: "connection_error",
+                },
+            );
             error_response(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -1593,6 +1950,27 @@ async fn handle_inner(
             )
         }
     }
+}
+
+/// 早退路径上的流水 `device_id`，与正常路径 `logged_device` 同口径：来访自带的优先，没有就
+/// 用模拟派生的那个（见 [`sim_device_id`]）。正常路径在 `match resp` 之前算一次；早退那几条
+/// 在它之前就返回了，得各自算。
+fn early_logged_device(
+    device_id: &Option<String>,
+    upstream: &Upstream<'_>,
+    flags: store::ForwardFlags,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+) -> Option<String> {
+    device_id.clone().or_else(|| {
+        sim_device_id(
+            upstream.sim.as_ref(),
+            upstream.bare_session.as_deref(),
+            flags,
+            cred,
+            device_fp,
+        )
+    })
 }
 
 /// 一次转发要发往上游的全部固定入参（方法/URL/已装好的转发头/开关），只有请求体每次不同。
@@ -8176,6 +8554,16 @@ fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
     {
         changed = true;
     }
+    // 同理 top_p：thinking 开着时上游要求「不传或 >= 0.95」（`top_p must be greater than or
+    // equal to 0.95 or unset when thinking is enabled or in adaptive mode`）。这条是条件句，
+    // 学习机制有意不学（见 `CONDITIONAL_MARKS`），只能在这里静态兜住。>= 0.95 的照发。
+    // 非数字的取值也剥：上游一样 400，留着只是换一种死法。
+    if thinking_on
+        && obj.get("top_p").is_some_and(|p| !p.as_f64().is_some_and(|p| p >= 0.95))
+        && obj.remove("top_p").is_some()
+    {
+        changed = true;
+    }
     changed
 }
 
@@ -11607,6 +11995,106 @@ mod tests {
         assert_eq!(body["error"]["message"], "slow down");
     }
 
+    /// 本地拒绝也进流水：没选到账号（`cred_id` 空），但路径、UA、模型、设备、会话、状态、
+    /// 错误类型/文案与请求 id 都在，控制台按 id 能查到。模型/设备/体里的会话来自 handle_inner
+    /// 解析体时放下的那份，这里自己不解析体。
+    #[test]
+    fn a_local_rejection_becomes_a_usage_row_without_a_credential() {
+        let ctx = super::LocalRejectCtx {
+            method: "POST".into(),
+            path: "/v1/messages?beta=true".into(),
+            ua: "python-httpx/0.27.0".into(),
+            session_header: None,
+        };
+        let parsed = super::ParsedRequestBits {
+            model: Some("claude-sonnet-5".into()),
+            device_id: Some("abc123".into()),
+            session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+        };
+        let err = super::LocalErrorFields {
+            etype: Some("invalid_request_error".into()),
+            message: Some("messages.0.role: system is not accepted".into()),
+        };
+        let rec = super::local_reject_record(
+            &ctx,
+            Some(parsed),
+            StatusCode::BAD_REQUEST,
+            Some(err),
+            "req_test0001",
+            std::time::Instant::now(),
+        );
+        assert_eq!(rec.cred_id, None);
+        assert_eq!(rec.cred_label, "");
+        assert_eq!(rec.status, 400);
+        assert_eq!(rec.path, "/v1/messages?beta=true");
+        assert_eq!(rec.ua.as_deref(), Some("python-httpx/0.27.0"));
+        assert_eq!(rec.ua_out, None, "没出站");
+        assert_eq!(rec.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(rec.device_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            rec.forensics.session_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555"),
+            "头上没有就取体里的会话段"
+        );
+        assert_eq!(rec.forensics.error_type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(
+            rec.forensics.error_message.as_deref(),
+            Some("messages.0.role: system is not accepted")
+        );
+        assert_eq!(rec.forensics.rewrites.as_deref(), Some("rejected_locally"));
+        assert_eq!(rec.request_id.as_deref(), Some("req_test0001"));
+        assert!(!rec.has_usage);
+        assert!(rec.total_ms.is_some());
+
+        // 体解析之前就拒掉的（API key / 版本闸 / 头上的会话限流）：没有 parsed，模型、设备都空，
+        // 会话只认头上的；UA 占位 `-` 还原成 NULL。
+        let ctx = super::LocalRejectCtx {
+            ua: "-".into(),
+            session_header: Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into()),
+            ..ctx
+        };
+        let rec = super::local_reject_record(
+            &ctx,
+            None,
+            StatusCode::TOO_MANY_REQUESTS,
+            None,
+            "req_test0002",
+            std::time::Instant::now(),
+        );
+        assert_eq!(rec.status, 429);
+        assert_eq!(rec.model, None);
+        assert_eq!(rec.device_id, None);
+        assert_eq!(rec.ua, None);
+        assert_eq!(
+            rec.forensics.session_id.as_deref(),
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        );
+        assert_eq!(rec.forensics.error_type, None);
+    }
+
+    /// 错误体改写时顺手读出的 type/message 是**改写前**的原文，不带追加的请求 id。
+    #[tokio::test]
+    async fn annotating_an_error_reports_the_original_error_fields() {
+        let resp = super::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "nope");
+        let (resp, fields) = super::annotate_error_response(resp, "req_x").await;
+        assert_eq!(
+            fields,
+            Some(super::LocalErrorFields {
+                etype: Some("invalid_request_error".into()),
+                message: Some("nope".into()),
+            })
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["message"], "nope (luban request id: req_x)", "体照常改写");
+
+        // 非 JSON 的响应不碰也不读。
+        let plain =
+            axum::response::IntoResponse::into_response((StatusCode::BAD_GATEWAY, "upstream down"));
+        let (_, fields) = super::annotate_error_response(plain, "req_y").await;
+        assert_eq!(fields, None);
+    }
+
     /// 上游客户端必须**透明解压**，否则用量嗅探拿到的是压缩字节、什么都解析不出来。
     ///
     /// 这正是线上花费统计消失的成因：v0.2.12 恢复转发 `accept-encoding` 让上游开始压缩响应，
@@ -12685,6 +13173,46 @@ mod tests {
         let before = official.clone();
         assert!(!strip_extra_fields(&mut official, false));
         assert_eq!(official, before);
+    }
+
+    /// thinking 开着时上游要求 `top_p` 「不传或 >= 0.95」（线上撞到的原话：`top_p must be
+    /// greater than or equal to 0.95 or unset when thinking is enabled or in adaptive mode`）。
+    /// 与 temperature 那条同源：客户端设了不合规的值就剥掉，合规的与 thinking 关着的都不动。
+    #[test]
+    fn strips_low_top_p_when_thinking_is_on() {
+        let req = |thinking: serde_json::Value, top_p: serde_json::Value| {
+            serde_json::json!({
+                "model": "claude-opus-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": thinking,
+                "top_p": top_p,
+            })
+        };
+        // enabled / adaptive 两种开法，低于 0.95 都剥；非数字也剥（上游一样 400）。
+        for thinking in [
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            serde_json::json!({"type": "adaptive"}),
+        ] {
+            for bad in [serde_json::json!(0.9), serde_json::json!(0.949), serde_json::json!("x")] {
+                let mut v = req(thinking.clone(), bad.clone());
+                assert!(strip_extra_fields(&mut v, false), "{thinking} + top_p={bad}: 应有改动");
+                assert!(v.get("top_p").is_none(), "{thinking} + top_p={bad}: 应剥掉: {v}");
+                assert!(v.get("thinking").is_some(), "thinking 自己不能动: {v}");
+            }
+            // 合规的取值照发。
+            for ok in [serde_json::json!(0.95), serde_json::json!(1.0)] {
+                let mut v = req(thinking.clone(), ok.clone());
+                assert!(!strip_extra_fields(&mut v, false), "{thinking} + top_p={ok}: 不该动");
+                assert_eq!(v["top_p"], ok);
+            }
+        }
+        // thinking 关着（disabled 且非 fable 族）或压根没传：top_p 随便填，不归这里管。
+        let mut v = req(serde_json::json!({"type": "disabled"}), serde_json::json!(0.5));
+        assert!(!strip_extra_fields(&mut v, false), "disabled: 不该动: {v}");
+        assert_eq!(v["top_p"], 0.5);
+        let mut v = serde_json::json!({ "model": "claude-opus-4-6", "top_p": 0.5 });
+        assert!(!strip_extra_fields(&mut v, false), "无 thinking: 不该动: {v}");
+        assert_eq!(v["top_p"], 0.5);
     }
 
     /// 2.1.258 起官方 CC 自己发 `thinking: {type: adaptive, display: "updates"}`

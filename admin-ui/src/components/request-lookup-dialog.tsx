@@ -45,7 +45,11 @@ export function RequestLookupDialog({
 
   const submit = () => {
     const id = draft.trim()
-    if (id) setSubmitted(id)
+    if (!id) return
+    // 同一个 id 再点一次也要真的再查：首次没查到、后台刚落库、上次网络失败，都是重查的理由。
+    // key 没变时 setState 是空操作，得显式 refetch。
+    if (id === submitted) void query.refetch()
+    else setSubmitted(id)
   }
 
   return (
@@ -130,7 +134,11 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant={statusVariant(log.status)} size="sm" className="tabular-nums">{log.status}</Badge>
         <span className="font-medium">
-          {log.cred_label ? displayCredentialLabel(log.cred_label, language) : t('（账号已删除）', '(account deleted)')}
+          {log.cred_label
+            ? displayCredentialLabel(log.cred_label, language)
+            : log.cred_id == null
+              ? t('未转发（本地拒绝）', 'Not forwarded (rejected locally)')
+              : t('（账号已删除）', '(account deleted)')}
         </span>
         {log.cred_id != null && <span className="tabular-nums text-muted-foreground">#{log.cred_id}</span>}
         <span className="ml-auto tabular-nums text-muted-foreground">{formatFullTime(log.ts, language)}</span>
@@ -156,7 +164,66 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
           {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
         </p>
       )}
+      <ForensicTags log={log} />
+      {(log.error_type || log.error_message) && (
+        <Alert variant="error" className="mt-2 py-2">
+          <AlertTitle className="font-mono text-2xs">
+            {log.error_type ?? t('错误', 'Error')}
+          </AlertTitle>
+          {log.error_message && (
+            <AlertDescription className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-2xs">
+              {log.error_message}
+            </AlertDescription>
+          )}
+        </Alert>
+      )}
     </li>
+  )
+}
+
+/** 已知改写/结局标签的可读名；认不出的原样显示。 */
+function rewriteLabel(tag: string, t: (zh: string, en: string) => string): string {
+  switch (tag) {
+    case 'rejected_locally':
+      return t('本地拒绝，未转发', 'Rejected locally, not forwarded')
+    case 'upstream_401':
+      return t('上游 401，未能换号', 'Upstream 401, no account to swap to')
+    case 'model_unsupported':
+      return t('套餐不含该模型，换号耗尽', 'Model not in plan, no account left')
+    case 'connection_error':
+      return t('上游连接失败', 'Upstream connection failed')
+    case 'demoted_thinking':
+      return t('thinking 降级重试', 'Retried with thinking demoted')
+    case 'no_prefill':
+      return t('剥掉 prefill 重试', 'Retried without prefill')
+    default:
+      return tag
+  }
+}
+
+/**
+ * 取证标签一行：这条请求在 luban 里经历了什么（改写/重试/结局）、走了模拟没有、上游判成第三方
+ * 没有、出口代理是哪个。没有一项时整行不出现。
+ */
+function ForensicTags({ log }: { log: UsageLog }) {
+  const { t } = useI18n()
+  const tags = (log.rewrites ?? '').split(',').map((x) => x.trim()).filter(Boolean)
+  if (tags.length === 0 && !log.simulated && !log.third_party && !log.proxy) return null
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      {tags.map((tag) => (
+        <Badge key={tag} variant={tag === 'rejected_locally' ? 'secondary' : 'outline'} size="sm" title={tag}>
+          {rewriteLabel(tag, t)}
+        </Badge>
+      ))}
+      {log.simulated && <Badge variant="info" size="sm">{t('模拟路径', 'Simulated')}</Badge>}
+      {log.third_party && <Badge variant="error" size="sm">{t('上游判为第三方', 'Flagged as third-party')}</Badge>}
+      {log.proxy && (
+        <span className="truncate font-mono text-2xs text-muted-foreground" title={log.proxy}>
+          {t('出口', 'Egress')} {log.proxy}
+        </span>
+      )}
+    </div>
   )
 }
 
