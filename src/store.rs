@@ -2424,6 +2424,11 @@ pub const API_TELEMETRY: &str = "api_telemetry";
 /// settings 键名。缺省视为开启。见 [`ForwardFlags::keepalive_telemetry`]。
 pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
 
+/// 上次从 `downloads.claude.ai/claude-code-releases/latest` 学到的官方最新 Claude Code 版本
+/// （`主.次.修` 串）的 settings 键名。启动时垫进 [`crate::oauth::latest_release`] 的缓存，
+/// 学到新值时写回；是来访 UA 自报版本的上限（见 `proxy::known_latest_release`）。
+pub const LATEST_CC_RELEASE: &str = "latest_cc_release";
+
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接

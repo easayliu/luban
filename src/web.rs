@@ -152,6 +152,31 @@ pub async fn run(
         });
     }
 
+    // 官方最新发布版：先用库里上次学到的垫底，之后每学到新值就写回。保活循环每 30min 学一次
+    // （下面），模拟会话的握手也会学。这样官方发新版后 luban 不用改代码，重启也不退回写死的
+    // `CC_VERSION_BASE`。
+    {
+        match state.store.get_setting(store::LATEST_CC_RELEASE) {
+            Ok(Some(raw)) => match oauth::parse_release_body(&raw) {
+                Some(v) => {
+                    oauth::seed_latest_release(v);
+                    tracing::info!(version = %oauth::release_string(v), "latest Claude Code release restored from settings");
+                }
+                None => {
+                    tracing::warn!(value = %raw, "settings.latest_cc_release is not a version number, ignoring")
+                }
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to read settings.latest_cc_release"),
+        }
+        let store = state.store.clone();
+        oauth::install_latest_release_persister(move |v| {
+            if let Err(e) = store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v)) {
+                tracing::warn!(error = %e, "failed to persist the latest Claude Code release");
+            }
+        });
+    }
+
     // 会话保活（对齐 cap/2.1.145 抓包的真实客户端行为）：
     //   每 30min — event_logging + Datadog 遥测（idle 版本检查事件）  ← `keepalive_telemetry` 开关
     //   每张凭证在本进程里首次被保活 — bootstrap + penguin_mode + eval（启动握手），新加的号下个 tick 补

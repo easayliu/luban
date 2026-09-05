@@ -1291,13 +1291,37 @@ fn download_request(client: &wreq::Client, path: &str) -> wreq::RequestBuilder {
 /// 自报的 `claude-cli/<版本>` **不能高于这个数**：一个自称 2.5.0 的客户端，在官方只发到
 /// 2.1.260 的时候，不是官方客户端。见 [`crate::proxy`] 里对 `from_cc_client` 的判定。
 ///
-/// 进程内缓存，不落库：重启后头一次拉到之前，调用方退回写死的
-/// [`config::CC_VERSION_BASE`]（[`latest_release`] 返回 `None`）。
+/// 进程内缓存，**启动时由 settings 里上次学到的值垫底**（[`seed_latest_release`]），学到新值
+/// 时经 [`install_latest_release_persister`] 装的钩子写回去——官方发了新版，luban 不用改代码
+/// 重发，重启也不会退回写死的 [`config::CC_VERSION_BASE`]。库里也没有时 [`latest_release`]
+/// 返回 `None`，调用方退回那个写死的值。
 static LATEST_RELEASE: parking_lot::Mutex<Option<(u64, u64, u64)>> = parking_lot::Mutex::new(None);
+
+/// 学到新版本时的落库钩子，见 [`install_latest_release_persister`]。
+type ReleasePersister = Box<dyn Fn((u64, u64, u64)) + Send + Sync>;
+static RELEASE_PERSISTER: std::sync::OnceLock<ReleasePersister> = std::sync::OnceLock::new();
 
 /// 已学到的官方最新发布版；还没拉到过（或每次都失败）时 `None`。
 pub fn latest_release() -> Option<(u64, u64, u64)> {
     *LATEST_RELEASE.lock()
+}
+
+/// 启动时用库里上次学到的版本垫底。只在缓存还空着时生效——已经从网上学到的不被旧值覆盖。
+pub fn seed_latest_release(v: (u64, u64, u64)) {
+    let mut cur = LATEST_RELEASE.lock();
+    if cur.is_none() {
+        *cur = Some(v);
+    }
+}
+
+/// 装上「学到新版本就落库」的钩子。只装一次，之后的调用忽略。
+pub fn install_latest_release_persister(f: impl Fn((u64, u64, u64)) + Send + Sync + 'static) {
+    let _ = RELEASE_PERSISTER.set(Box::new(f));
+}
+
+/// `主.次.修` 串，settings 里存的和日志里打的都是这个形态。
+pub fn release_string((a, b, c): (u64, u64, u64)) -> String {
+    format!("{a}.{b}.{c}")
 }
 
 /// 解析 `latest` 端点的响应体：一行 `主.次.修`，三段都得是数字。
@@ -1311,16 +1335,25 @@ pub fn parse_release_body(body: &str) -> Option<(u64, u64, u64)> {
     it.next().is_none().then_some(v)
 }
 
-/// 记下学到的最新版；变了就打一行 info。
+/// 记下学到的最新版；变了就打一行 info 并落库（钩子装了的话）。
 fn remember_latest_release(v: (u64, u64, u64)) {
-    let mut cur = LATEST_RELEASE.lock();
-    if *cur != Some(v) {
-        tracing::info!(
-            from = %cur.map(|(a, b, c)| format!("{a}.{b}.{c}")).unwrap_or_else(|| "-".into()),
-            to = %format!("{}.{}.{}", v.0, v.1, v.2),
-            "learned the latest official Claude Code release"
-        );
-        *cur = Some(v);
+    let changed = {
+        let mut cur = LATEST_RELEASE.lock();
+        if *cur == Some(v) {
+            false
+        } else {
+            tracing::info!(
+                from = %cur.map(release_string).unwrap_or_else(|| "-".into()),
+                to = %release_string(v),
+                "learned the latest official Claude Code release"
+            );
+            *cur = Some(v);
+            true
+        }
+    };
+    // 锁外调钩子：它要写库，别拿着缓存锁等 SQLite。
+    if changed && let Some(persist) = RELEASE_PERSISTER.get() {
+        persist(v);
     }
 }
 
@@ -1540,6 +1573,18 @@ mod tests {
         assert_eq!(p("2.1.260.1"), None, "四段太多");
         assert_eq!(p("2.1.260-beta.1"), None, "带后缀");
         assert_eq!(p("<html>Not Found</html>"), None, "错误页");
+    }
+
+    /// 库里的旧值只给空缓存垫底，压不过已经学到的。
+    #[test]
+    fn seeding_never_overrides_a_learned_release() {
+        // 全局缓存，别的测试也可能碰：先把它抬到一个本测试独有的高值再验证。
+        super::remember_latest_release((9, 0, 1));
+        super::seed_latest_release((9, 0, 0));
+        assert_eq!(super::latest_release(), Some((9, 0, 1)), "seed 不覆盖已学到的");
+        super::remember_latest_release((9, 0, 2));
+        assert_eq!(super::latest_release(), Some((9, 0, 2)), "网上学到的照常更新");
+        assert_eq!(super::release_string((9, 0, 2)), "9.0.2");
     }
 
     use super::{
