@@ -152,28 +152,14 @@ pub async fn run(
         });
     }
 
-    // 官方最新发布版：先用库里上次学到的垫底，之后每学到新值就写回。保活循环每 30min 学一次
-    // （下面），模拟会话的握手也会学。这样官方发新版后 luban 不用改代码，重启也不退回写死的
-    // `CC_VERSION_BASE`。
+    // 官方最新发布版：先以库里上次学到（或网页上手动填）的值为准，之后每学到新值就写回。
+    // 保活循环每 30min 学一次（下面），模拟会话的握手也会学。这样官方发新版后 luban 不用改
+    // 代码，重启也不退回写死的 `CC_VERSION_BASE`。
     {
-        match state.store.get_setting(store::LATEST_CC_RELEASE) {
-            Ok(Some(raw)) => match oauth::parse_release_body(&raw) {
-                Some(v) => {
-                    oauth::seed_latest_release(v);
-                    tracing::info!(version = %oauth::release_string(v), "latest Claude Code release restored from settings");
-                }
-                None => {
-                    tracing::warn!(value = %raw, "settings.latest_cc_release is not a version number, ignoring")
-                }
-            },
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "failed to read settings.latest_cc_release"),
-        }
+        sync_latest_release_from_store(&state.store);
         let store = state.store.clone();
-        oauth::install_latest_release_persister(move |v| {
-            if let Err(e) = store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v)) {
-                tracing::warn!(error = %e, "failed to persist the latest Claude Code release");
-            }
+        oauth::LATEST_RELEASE.install_persister(move |v| {
+            store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v))
         });
     }
 
@@ -446,6 +432,7 @@ pub async fn run(
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/min-client-version", post(set_min_client_version))
+        .route("/settings/latest-cc-release", post(set_latest_cc_release))
         .route("/settings/oauth-scopes", post(set_oauth_scopes))
         .route("/settings/prefill-policy", post(set_prefill_policy))
         .route("/settings/sampling-policy", post(set_sampling_policy))
@@ -1700,6 +1687,13 @@ struct SettingsResp {
     /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
     /// 的请求，见 [`crate::store::MIN_CLIENT_VERSION`]。
     min_client_version: String,
+    /// 已知的官方最新 Claude Code 版本（`主.次.修`）；空串表示还没学到、也没手动填。
+    /// 自动从 `downloads.claude.ai` 学（只升不降）并落库；网页可手动填、可删。来访 UA 自报
+    /// 高于 `max(它, cc_version_base)` 的版本不当官方客户端。见 [`crate::store::LATEST_CC_RELEASE`]。
+    latest_cc_release: String,
+    /// luban 模拟路径所对齐的客户端版本（[`crate::config::CC_VERSION_BASE`]），也是上限的
+    /// 兜底值。
+    cc_version_base: String,
     /// 登录时实际申请的 OAuth scope（空格分隔）；恒为非空——没配就是
     /// [`crate::config::SCOPES`]。
     oauth_scopes: String,
@@ -1820,6 +1814,27 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
     }
 }
 
+/// 读 settings 里的 `latest_cc_release`。值写坏了（手改库、旧文件）按没有处理并告警——一个解析
+/// 不了的上限等于没有上限，比静默忽略更该让人看见。
+fn read_latest_release_setting(store: &CredentialStore) -> Result<Option<oauth::ReleaseVersion>> {
+    let Some(raw) = store.get_setting(store::LATEST_CC_RELEASE)? else { return Ok(None) };
+    let v = oauth::parse_release_body(&raw);
+    if v.is_none() {
+        tracing::warn!(value = %raw, "settings.latest_cc_release is not a version number, ignoring");
+    }
+    Ok(v)
+}
+
+/// 启动时把 settings 里的 `latest_cc_release` 同步进进程内缓存（库为准）。
+///
+/// 导入设置、网页手动改/删**不走这个**：那两处要在同一把锁里先写库再同步，见
+/// [`oauth::ReleaseCache::sync_from_store`]。
+fn sync_latest_release_from_store(store: &CredentialStore) {
+    if let Err(e) = oauth::LATEST_RELEASE.sync_from_store(|| read_latest_release_setting(store)) {
+        tracing::warn!(error = %e, "failed to read settings.latest_cc_release");
+    }
+}
+
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let device_binding_retention_secs = state.store.device_binding_retention();
@@ -1830,6 +1845,9 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let session_concurrency_limit = state.store.session_concurrency_limit();
     let require_device_id = state.store.require_device_id();
     let min_client_version = state.store.min_client_version().unwrap_or_default();
+    let latest_cc_release =
+        oauth::LATEST_RELEASE.get().map(oauth::release_string).unwrap_or_default();
+    let cc_version_base = crate::config::CC_VERSION_BASE.to_string();
     let oauth_scopes = state.store.oauth_scopes();
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();
@@ -1852,6 +1870,8 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             session_concurrency_limit,
             require_device_id,
             min_client_version,
+            latest_cc_release: latest_cc_release.clone(),
+            cc_version_base: cc_version_base.clone(),
             oauth_scopes,
             oauth_scopes_default: crate::config::SCOPES.to_string(),
             oauth_scopes_minimal: crate::config::SCOPES_MINIMAL.to_string(),
@@ -1883,6 +1903,8 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         session_concurrency_limit,
         require_device_id,
         min_client_version,
+        latest_cc_release,
+        cc_version_base,
         oauth_scopes,
         oauth_scopes_default: crate::config::SCOPES.to_string(),
         oauth_scopes_minimal: crate::config::SCOPES_MINIMAL.to_string(),
@@ -2288,6 +2310,49 @@ async fn set_min_client_version(
     }
     state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).map_err(internal)?;
     tracing::info!(version, "minimum client version changed");
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetLatestCcReleaseReq {
+    /// 官方最新 Claude Code 版本，严格 `主.次.修`；空串表示删掉手动/学到的值，等下次自动学。
+    latest_cc_release: String,
+}
+
+/// 手动指定（或删掉）已知的官方最新 Claude Code 版本。
+///
+/// 场景：官方刚发了新版、保活还没轮到下一次检查，而用新版的真实客户端已经在被判成冒充；
+/// 或 `downloads.claude.ai` 从某个出口拉不到。填进去立刻生效，之后自动检查学到更新的照样
+/// 覆盖（只升不降）。删掉就退回写死的基线，等下一次检查再学。
+///
+/// 只收严格三段数字：这是官方发布清单的形态，写成 `2.1` 在这里没有含义。库先写、缓存后同步，
+/// 与 [`sync_latest_release_from_store`] 的口径一致。
+async fn set_latest_cc_release(
+    State(state): State<AppState>,
+    Json(req): Json<SetLatestCcReleaseReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let version = req.latest_cc_release.trim();
+    // 写库放进缓存的串行锁里（闭包），别先写库再同步：后台一笔迟到的落库会把这里刚写的盖掉。
+    if version.is_empty() {
+        oauth::LATEST_RELEASE
+            .sync_from_store(|| {
+                state.store.delete_setting(store::LATEST_CC_RELEASE)?;
+                Ok::<_, anyhow::Error>(None)
+            })
+            .map_err(internal)?;
+        tracing::info!("latest Claude Code release cleared; will relearn on the next check");
+        return Ok(Json(settings_resp(&state)));
+    }
+    let Some(v) = oauth::parse_release_body(version) else {
+        return Err(bad_request("the latest Claude Code release must look like 2.1.260"));
+    };
+    oauth::LATEST_RELEASE
+        .sync_from_store(|| {
+            state.store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v))?;
+            Ok::<_, anyhow::Error>(Some(v))
+        })
+        .map_err(internal)?;
+    tracing::info!(version = %oauth::release_string(v), "latest Claude Code release set manually");
     Ok(Json(settings_resp(&state)))
 }
 
@@ -2839,7 +2904,20 @@ async fn import(
     if req.import_settings {
         let settings: std::collections::HashMap<String, String> =
             req.payload.settings.into_iter().collect();
-        resp.settings_applied = state.store.import_settings(&settings).map_err(internal)?;
+        // 文件里带 `latest_cc_release` 时，整个导入放进缓存的串行锁里做，写完再以库为准同步缓存：
+        // 否则库是一个数、进程里认另一个（重启才暴露），或者后台一笔迟到的落库把刚导入的盖掉。
+        resp.settings_applied = if settings.contains_key(store::LATEST_CC_RELEASE) {
+            let mut applied = 0;
+            oauth::LATEST_RELEASE
+                .sync_from_store(|| {
+                    applied = state.store.import_settings(&settings)?;
+                    read_latest_release_setting(&state.store)
+                })
+                .map_err(internal)?;
+            applied
+        } else {
+            state.store.import_settings(&settings).map_err(internal)?
+        };
     }
     tracing::info!(
         added = resp.added,

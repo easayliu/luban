@@ -1272,96 +1272,255 @@ async fn handshake_download(client: &wreq::Client, path: &str) -> KeepaliveResul
     }
 }
 
+/// `downloads.claude.ai` 请求的超时。这两条无鉴权、与账号无关，卡住了不该拖住保活循环
+/// （版本检查排在每张凭证刷新 token 之前）；10s 与 profile 那条同档。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn download_request(client: &wreq::Client, path: &str) -> wreq::RequestBuilder {
     axios(
         client
             .get(format!("https://downloads.claude.ai{path}"))
             .header("Accept", config::AXIOS_ACCEPT)
-            .header("User-Agent", config::DATADOG_USER_AGENT),
+            .header("User-Agent", config::DATADOG_USER_AGENT)
+            .timeout(DOWNLOAD_TIMEOUT),
         "download",
     )
 }
 
 // ---------- 官方最新发布版 ----------
 
-/// `downloads.claude.ai/claude-code-releases/latest` 最近一次返回的版本号。
-///
-/// 那个端点的响应体就是一行裸版本串（`cap/2.1.260-2/00060`：`2.1.260`，`Content-Type:
-/// text/plain`）。真实 CC 每 ~30min 拉一次做版本检查；luban 拉它还多一个用处——来访 UA
-/// 自报的 `claude-cli/<版本>` **不能高于这个数**：一个自称 2.5.0 的客户端，在官方只发到
-/// 2.1.260 的时候，不是官方客户端。见 [`crate::proxy`] 里对 `from_cc_client` 的判定。
-///
-/// 进程内缓存，**启动时由 settings 里上次学到的值垫底**（[`seed_latest_release`]），学到新值
-/// 时经 [`install_latest_release_persister`] 装的钩子写回去——官方发了新版，luban 不用改代码
-/// 重发，重启也不会退回写死的 [`config::CC_VERSION_BASE`]。库里也没有时 [`latest_release`]
-/// 返回 `None`，调用方退回那个写死的值。
-static LATEST_RELEASE: parking_lot::Mutex<Option<(u64, u64, u64)>> = parking_lot::Mutex::new(None);
+/// 三段版本号 `(主, 次, 修)`。
+pub type ReleaseVersion = (u64, u64, u64);
 
-/// 学到新版本时的落库钩子，见 [`install_latest_release_persister`]。
-type ReleasePersister = Box<dyn Fn((u64, u64, u64)) + Send + Sync>;
-static RELEASE_PERSISTER: std::sync::OnceLock<ReleasePersister> = std::sync::OnceLock::new();
+/// 学到新版本时的落库钩子，见 [`ReleaseCache::install_persister`]。返回 `Err` 表示这次没写成，
+/// 缓存会记着「欠一次落库」，下次拉完 `latest` 再补（[`ReleaseCache::persist_pending`]）。
+type ReleasePersister = Box<dyn Fn(ReleaseVersion) -> anyhow::Result<()> + Send + Sync>;
 
-/// 已学到的官方最新发布版；还没拉到过（或每次都失败）时 `None`。
-pub fn latest_release() -> Option<(u64, u64, u64)> {
-    *LATEST_RELEASE.lock()
+/// 官方最新 Claude Code 发布版的进程内缓存，与 settings 里的 `latest_cc_release` 互为镜像。
+///
+/// 来源两路：
+/// - **网上学**：`downloads.claude.ai/claude-code-releases/latest` 的响应体是一行裸版本串
+///   （`cap/2.1.260-2/00060`：`2.1.260`，`text/plain`）。保活每 30min 拉一次，模拟会话的
+///   握手也拉。学到的**只升不降**（[`Self::learn`]）：那个端点回了个更旧的数（CDN 缓存、
+///   回滚）不能把已知的上限往下拽，网页上手动填的更新版本也不该被它盖掉。
+/// - **库里来**：启动、导入设置、网页手动改/删之后，以库为准整体重置（[`Self::sync_from_store`]）。
+///
+/// 用处：来访 UA 自报的 `claude-cli/<版本>` **不能高于这个数**——一个自称 2.5.0 的客户端，
+/// 在官方只发到 2.1.260 的时候不是官方客户端。见 [`crate::proxy`] 对 `from_cc_client` 的判定。
+///
+/// 落库的两个坑都在这儿堵：
+/// - 写库失败不丢：`current != persisted` 就是欠着，每次拉完 `latest` 都补一次；
+/// - 并发学到不同的值不会「后写的旧值盖掉新值」：落库串行化，写的永远是**拿到锁那一刻的
+///   缓存值**，而缓存只升不降，所以库里最终就是缓存里的。
+pub struct ReleaseCache {
+    state: parking_lot::Mutex<ReleaseState>,
+    /// 串行化落库。拿着它写 SQLite 没问题——它不是 `state` 那把锁，每条请求读上限走的是
+    /// `state`，不会被写库卡住。
+    persist_lock: parking_lot::Mutex<()>,
+    persister: std::sync::OnceLock<ReleasePersister>,
 }
 
-/// 启动时用库里上次学到的版本垫底。只在缓存还空着时生效——已经从网上学到的不被旧值覆盖。
-pub fn seed_latest_release(v: (u64, u64, u64)) {
-    let mut cur = LATEST_RELEASE.lock();
-    if cur.is_none() {
-        *cur = Some(v);
+#[derive(Default)]
+struct ReleaseState {
+    /// 当前认的最新版；`None` = 还不知道（调用方退回写死的 [`config::CC_VERSION_BASE`]）。
+    current: Option<ReleaseVersion>,
+    /// 库里已确认写成的值。与 `current` 不同就是还欠一次落库。
+    persisted: Option<ReleaseVersion>,
+}
+
+/// 进程级那一份。测试用 [`ReleaseCache::new`] 起自己的，别碰这个。
+pub static LATEST_RELEASE: ReleaseCache = ReleaseCache::new();
+
+impl Default for ReleaseCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// 装上「学到新版本就落库」的钩子。只装一次，之后的调用忽略。
-pub fn install_latest_release_persister(f: impl Fn((u64, u64, u64)) + Send + Sync + 'static) {
-    let _ = RELEASE_PERSISTER.set(Box::new(f));
+impl ReleaseCache {
+    pub const fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(ReleaseState { current: None, persisted: None }),
+            persist_lock: parking_lot::Mutex::new(()),
+            persister: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 当前认的官方最新版；还不知道时 `None`。
+    pub fn get(&self) -> Option<ReleaseVersion> {
+        self.state.lock().current
+    }
+
+    /// 装上落库钩子。只装一次，之后的调用忽略。
+    pub fn install_persister(
+        &self,
+        f: impl Fn(ReleaseVersion) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) {
+        let _ = self.persister.set(Box::new(f));
+    }
+
+    /// 以库里的值为准整体重置：启动、导入设置、网页手动改/删之后各调一次。
+    ///
+    /// **写库必须在 `write` 里做**，它跑在落库串行锁内：后台 [`Self::persist_pending`] 若正拿着锁
+    /// 往库里写一个旧值，`write` 会等它写完再写，管理员的值最后落地；反过来管理员先写，后台随后
+    /// 拿到锁时核对缓存已经变了，不会再把旧值盖上去。先在锁外写库再进来同步缓存的话，后台那笔
+    /// 迟到的写入会把库里刚改的值覆盖回去——进程里认新值、库里是旧值，重启才暴露。
+    ///
+    /// `write` 返回**库里现在的值**（写成什么就返回什么；只读的场景直接读出来返回）。库是权威：
+    /// 这一步之后 `current == persisted == v`，不欠落库。会**降**也会清空：导入了一份旧设置、或
+    /// 网页上把值删了，缓存就该跟着回去。`write` 失败则缓存不动，错误原样交回。
+    pub fn sync_from_store<E>(
+        &self,
+        write: impl FnOnce() -> Result<Option<ReleaseVersion>, E>,
+    ) -> Result<(), E> {
+        let _serial = self.persist_lock.lock();
+        let v = write()?;
+        let prev = {
+            let mut st = self.state.lock();
+            let prev = st.current;
+            st.current = v;
+            st.persisted = v;
+            prev
+        };
+        if prev != v {
+            tracing::info!(
+                from = %prev.map(release_string).unwrap_or_else(|| "-".into()),
+                to = %v.map(release_string).unwrap_or_else(|| "-".into()),
+                "latest Claude Code release synced from settings"
+            );
+        }
+        if let Some(v) = v {
+            note_profile_lag(v);
+        }
+        Ok(())
+    }
+
+    /// 从网上学到一个版本。**只升不降**：低于或等于当前值的忽略。返回是否更新了缓存。
+    /// 无论更新与否都顺手补一次欠着的落库。
+    pub fn learn(&self, v: ReleaseVersion) -> bool {
+        let changed = {
+            let mut st = self.state.lock();
+            match st.current {
+                Some(cur) if cur >= v => {
+                    if cur > v {
+                        tracing::debug!(
+                            known = %release_string(cur),
+                            fetched = %release_string(v),
+                            "releases/latest returned an older version than the one already known; ignoring"
+                        );
+                    }
+                    false
+                }
+                prev => {
+                    tracing::info!(
+                        from = %prev.map(release_string).unwrap_or_else(|| "-".into()),
+                        to = %release_string(v),
+                        "learned the latest official Claude Code release"
+                    );
+                    st.current = Some(v);
+                    true
+                }
+            }
+        };
+        if changed {
+            note_profile_lag(v);
+        }
+        self.persist_pending();
+        changed
+    }
+
+    /// 把欠着的落库补上。每次拉完 `latest`（成功与否）都调一次，上次写失败的这次补回来。
+    ///
+    /// 写的是**拿到串行锁那一刻的缓存值**，不是调用方手里的那个：两路并发各学到一个版本时，
+    /// 缓存只升不降，后写的那个写的一定是较新的。写成之后再核一遍缓存没变才标 `persisted`。
+    /// 管理员改/删（[`Self::sync_from_store`]）也在这把锁里写库，所以不会有一笔迟到的后台写入
+    /// 盖掉管理员刚落的值。
+    pub fn persist_pending(&self) {
+        let Some(persist) = self.persister.get() else { return };
+        let _serial = self.persist_lock.lock();
+        let target = {
+            let st = self.state.lock();
+            if st.current == st.persisted {
+                return;
+            }
+            st.current
+        };
+        // `current` 为 `None` 只会来自 `sync_from_store(None)`，那一步已经把 `persisted` 一并
+        // 清了，不会走到这儿；防御性地不写「空」。
+        let Some(v) = target else { return };
+        match persist(v) {
+            Ok(()) => {
+                let mut st = self.state.lock();
+                if st.current == Some(v) {
+                    st.persisted = Some(v);
+                }
+            }
+            Err(e) => tracing::warn!(
+                version = %release_string(v),
+                error = %e,
+                "failed to persist the latest Claude Code release; will retry after the next check"
+            ),
+        }
+    }
+
+    /// 测试用：还欠不欠落库。
+    #[cfg(test)]
+    fn has_pending(&self) -> bool {
+        let st = self.state.lock();
+        st.current != st.persisted
+    }
+}
+
+/// 已学到的官方最新发布版（进程级缓存）；还不知道时 `None`。
+pub fn latest_release() -> Option<ReleaseVersion> {
+    LATEST_RELEASE.get()
 }
 
 /// `主.次.修` 串，settings 里存的和日志里打的都是这个形态。
-pub fn release_string((a, b, c): (u64, u64, u64)) -> String {
+pub fn release_string((a, b, c): ReleaseVersion) -> String {
     format!("{a}.{b}.{c}")
 }
 
-/// 解析 `latest` 端点的响应体：一行 `主.次.修`，三段都得是数字。
+/// 解析 `latest` 端点的响应体（settings 里存的也是同一形态）：一行 `主.次.修`，三段都得是数字。
 ///
 /// 比 [`crate::proxy::parse_version`] 严：那边是给来访 UA 用的宽松解析，这里读的是官方
 /// 发布清单，形态不对（HTML 错误页、空体、多了后缀）就当没拿到——把一个错的上限记进去，
 /// 会让所有真实客户端都被判成冒充。
-pub fn parse_release_body(body: &str) -> Option<(u64, u64, u64)> {
+pub fn parse_release_body(body: &str) -> Option<ReleaseVersion> {
     let mut it = body.trim().split('.').map(|p| p.parse::<u64>().ok());
     let v = (it.next()??, it.next()??, it.next()??);
     it.next().is_none().then_some(v)
 }
 
-/// 记下学到的最新版；变了就打一行 info 并落库（钩子装了的话）。
-fn remember_latest_release(v: (u64, u64, u64)) {
-    let changed = {
-        let mut cur = LATEST_RELEASE.lock();
-        if *cur == Some(v) {
-            false
-        } else {
-            tracing::info!(
-                from = %cur.map(release_string).unwrap_or_else(|| "-".into()),
-                to = %release_string(v),
-                "learned the latest official Claude Code release"
-            );
-            *cur = Some(v);
-            true
-        }
-    };
-    // 锁外调钩子：它要写库，别拿着缓存锁等 SQLite。
-    if changed && let Some(persist) = RELEASE_PERSISTER.get() {
-        persist(v);
+/// 官方最新版跑到了 luban 模拟基线（[`config::CC_VERSION_BASE`]）前面时提醒一句。
+///
+/// 上限记住了新版本只解决「别把真实新版客户端判成冒充」；模拟路径发出去的仍是基线那一版的
+/// 形态（UA、billing 后缀、build_time、beta 集合），要对齐新版得重新抓包换 profile。这是
+/// 代码层面的事，日志里点一下，别让人以为学到版本号就万事大吉。
+fn note_profile_lag(v: ReleaseVersion) {
+    if let Some(base) = parse_release_body(config::CC_VERSION_BASE)
+        && v > base
+    {
+        tracing::warn!(
+            latest = %release_string(v),
+            simulated = config::CC_VERSION_BASE,
+            "official Claude Code is ahead of luban's simulated profile; simulated traffic still reports the older version until the profile is re-captured"
+        );
     }
 }
 
-/// 拉 `/claude-code-releases/latest` 并把版本号记进 [`LATEST_RELEASE`]。
+/// 拉 `/claude-code-releases/latest` 并把版本号交给 [`LATEST_RELEASE`]。
 ///
 /// 请求形态与 [`handshake_download`] 完全一样（同一条抓包），只多了读体。2xx 但体解析不出
 /// 版本时缓存不动、结果按 `Ok` 报——请求本身没失败，是体不认识，日志里单独记一行。
+/// 不论结果如何都补一次欠着的落库。
 pub async fn fetch_latest_release(client: &wreq::Client) -> KeepaliveResult {
+    let result = fetch_latest_release_inner(client).await;
+    LATEST_RELEASE.persist_pending();
+    result
+}
+
+async fn fetch_latest_release_inner(client: &wreq::Client) -> KeepaliveResult {
     let resp = match download_request(client, "/claude-code-releases/latest").send().await {
         Ok(r) => r,
         Err(_) => return KeepaliveResult::Failed,
@@ -1371,7 +1530,9 @@ pub async fn fetch_latest_release(client: &wreq::Client) -> KeepaliveResult {
     if (200..300).contains(&status) {
         match resp.text().await {
             Ok(body) => match parse_release_body(&body) {
-                Some(v) => remember_latest_release(v),
+                Some(v) => {
+                    LATEST_RELEASE.learn(v);
+                }
                 None => tracing::warn!(
                     body = %body.chars().take(80).collect::<String>(),
                     "releases/latest: body is not a version number, keeping the cached one"
@@ -1575,16 +1736,117 @@ mod tests {
         assert_eq!(p("<html>Not Found</html>"), None, "错误页");
     }
 
-    /// 库里的旧值只给空缓存垫底，压不过已经学到的。
+    /// 缓存只升不降；库同步（启动/导入/手动改删）则以库为准，能升也能降、能清空。
     #[test]
-    fn seeding_never_overrides_a_learned_release() {
-        // 全局缓存，别的测试也可能碰：先把它抬到一个本测试独有的高值再验证。
-        super::remember_latest_release((9, 0, 1));
-        super::seed_latest_release((9, 0, 0));
-        assert_eq!(super::latest_release(), Some((9, 0, 1)), "seed 不覆盖已学到的");
-        super::remember_latest_release((9, 0, 2));
-        assert_eq!(super::latest_release(), Some((9, 0, 2)), "网上学到的照常更新");
-        assert_eq!(super::release_string((9, 0, 2)), "9.0.2");
+    fn release_cache_learns_upward_and_syncs_from_store_both_ways() {
+        let c = super::ReleaseCache::new();
+        assert_eq!(c.get(), None);
+        assert!(c.learn((2, 1, 260)), "空缓存学到就记");
+        assert!(!c.learn((2, 1, 258)), "更旧的忽略");
+        assert!(!c.learn((2, 1, 260)), "相同的不算变");
+        assert!(c.learn((2, 1, 265)), "更新的记");
+        assert_eq!(c.get(), Some((2, 1, 265)));
+
+        c.sync_from_store(|| Ok::<_, ()>(Some((2, 1, 261)))).unwrap();
+        assert_eq!(c.get(), Some((2, 1, 261)), "库为准，能降");
+        c.sync_from_store(|| Ok::<_, ()>(None)).unwrap();
+        assert_eq!(c.get(), None, "库里删了缓存也清");
+        assert!(!c.has_pending(), "库同步之后不欠落库");
+        assert_eq!(c.sync_from_store(|| Err::<Option<_>, _>("io")), Err("io"), "写库失败原样交回");
+        assert_eq!(c.get(), None, "写库失败缓存不动");
+    }
+
+    /// 后台正拿着锁往库里写旧值时，管理员的改动排在它后面落地——库里最终是管理员的值。
+    ///
+    /// 复现的正是那条竞态：后台拿到锁 → 管理员写库并同步缓存 → 后台那笔迟到的写入盖掉管理员
+    /// 的值。把管理员的写库也放进同一把锁，顺序就变成后台写完 → 管理员写。
+    #[test]
+    fn an_admin_write_lands_after_an_in_flight_background_persist() {
+        use std::sync::mpsc;
+        let c = std::sync::Arc::new(super::ReleaseCache::new());
+        // 「库」：按落地顺序记下每一笔写入。
+        let db = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let db_bg = db.clone();
+        c.install_persister(move |v| {
+            started_tx.send(()).unwrap();
+            // 写库很慢：给管理员留出在这期间动手的窗口。
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            db_bg.lock().push(("bg", v));
+            Ok(())
+        });
+
+        let c_bg = c.clone();
+        let bg = std::thread::spawn(move || {
+            c_bg.learn((2, 1, 260));
+        });
+        started_rx.recv().unwrap();
+        // 后台正在锁内写库；管理员此刻改成 2.1.265。
+        let db_admin = db.clone();
+        c.sync_from_store(|| {
+            db_admin.lock().push(("admin", (2, 1, 265)));
+            Ok::<_, ()>(Some((2, 1, 265)))
+        })
+        .unwrap();
+        bg.join().unwrap();
+
+        assert_eq!(
+            &*db.lock(),
+            &[("bg", (2, 1, 260)), ("admin", (2, 1, 265))],
+            "管理员的写入最后落地"
+        );
+        assert_eq!(c.get(), Some((2, 1, 265)));
+        assert!(!c.has_pending());
+    }
+
+    /// 写库失败不丢：欠着，下次 `persist_pending` 补上；写成之后不再重复写。
+    #[test]
+    fn release_cache_retries_a_failed_persist() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let c = super::ReleaseCache::new();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let written = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (calls2, written2) = (calls.clone(), written.clone());
+        c.install_persister(move |v| {
+            // 头一次写失败，之后都成功。
+            if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("disk full");
+            }
+            written2.lock().push(v);
+            Ok(())
+        });
+
+        assert!(c.learn((2, 1, 260)));
+        assert!(c.has_pending(), "第一次写失败，欠着");
+        assert!(written.lock().is_empty());
+
+        // 下一轮拉到同一个版本：缓存没变，但欠的那次要补。
+        assert!(!c.learn((2, 1, 260)));
+        assert!(!c.has_pending(), "补写成功");
+        assert_eq!(&*written.lock(), &[(2, 1, 260)]);
+
+        c.persist_pending();
+        assert_eq!(written.lock().len(), 1, "已落库的不重复写");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 并发学到两个版本时库里落的是较新的那个：落库写的是缓存值，缓存只升不降。
+    #[test]
+    fn release_cache_persists_the_newest_value_not_the_callers() {
+        let c = super::ReleaseCache::new();
+        let written = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let w = written.clone();
+        c.install_persister(move |v| {
+            w.lock().push(v);
+            Ok(())
+        });
+        // 模拟「A 学到 2.5.0、B 学到 2.6.0 并写库、A 最后才去写」：A 那次落库写的是当时的
+        // 缓存值 2.6.0，而且因为 B 已经写过、根本不欠，A 什么都不写。
+        assert!(c.learn((2, 6, 0)));
+        assert!(!c.learn((2, 5, 0)));
+        c.persist_pending();
+        assert_eq!(&*written.lock(), &[(2, 6, 0)]);
+        assert_eq!(super::release_string((2, 6, 0)), "2.6.0");
     }
 
     use super::{

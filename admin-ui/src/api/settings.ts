@@ -23,6 +23,10 @@ export interface Settings {
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
   min_client_version: string
+  /** 已知的官方最新 Claude Code 版本（主.次.修）；空串 = 还没学到也没手动填。自动从 downloads.claude.ai 学（只升不降），可手动填/删。 */
+  latest_cc_release: string
+  /** Luban 模拟路径对齐的客户端版本，也是版本上限的兜底值。 */
+  cc_version_base: string
   /** 登录时申请的 OAuth scope（空格分隔）；恒为非空，未自定义时就是 oauth_scopes_default。 */
   oauth_scopes: string
   /** 官方 Claude Code 那一整套 scope，也是未配置时的默认值。 */
@@ -250,6 +254,18 @@ export async function setRequireDeviceId(required: boolean): Promise<Settings> {
 export async function setMinClientVersion(version: string): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/min-client-version', {
     min_client_version: version,
+  })
+  return data
+}
+
+/**
+ * 手动指定已知的官方最新 Claude Code 版本（严格 `2.1.260` 形态；空串删掉、退回基线等下次自动学）。
+ *
+ * 来访 UA 自报高于该值（与基线取大）的版本不再当官方客户端。之后自动检查学到更新的会覆盖它。
+ */
+export async function setLatestCcRelease(version: string): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/latest-cc-release', {
+    latest_cc_release: version,
   })
   return data
 }

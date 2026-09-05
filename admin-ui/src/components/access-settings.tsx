@@ -27,6 +27,7 @@ import {
   setDeviceRetention,
   setDeviceRpmLimit,
   setDeviceTtl,
+  setLatestCcRelease,
   setMinClientVersion,
   setRequireDeviceId,
   setSessionConcurrencyLimit,
@@ -472,11 +473,12 @@ export function DeviceSettingsContent() {
         icon={TerminalIcon}
         title={t('客户端版本', 'Client version')}
         description={t(
-          '按 User-Agent 里自报的 claude-cli 版本卡住过旧的 Claude Code；其它客户端不受影响。',
-          'Block outdated Claude Code builds by the claude-cli version in their User-Agent; other clients are unaffected.',
+          '按 User-Agent 里自报的 claude-cli 版本：卡住过旧的 Claude Code，并把自称比官方最新版还新的客户端识别为非官方；其它客户端不受影响。',
+          'Judge by the claude-cli version in the User-Agent: block outdated Claude Code builds, and treat clients claiming a version newer than the latest official release as unofficial; other clients are unaffected.',
         )}
       >
         <MinClientVersion />
+        <LatestCcRelease />
       </SettingsGroup>
     </div>
   )
@@ -577,6 +579,10 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
       value: settings.min_client_version
         ? t(`${settings.min_client_version} 及以上`, `${settings.min_client_version}+`)
         : t('不限', 'Unlimited'),
+    },
+    {
+      label: t('官方最新版本', 'Latest official release'),
+      value: effectiveLatestRelease(settings),
     },
   ]
 
@@ -1371,6 +1377,134 @@ function RequireDeviceIdToggle() {
 
 /** 版本号的可接受写法：`2`、`2.1`、`2.1.220`，可带 `-beta.1` 之类的后缀（按主版本算）。 */
 const VERSION_RE = /^\d+(\.\d+)*([-+][0-9A-Za-z.]+)?$/
+
+/** 严格三段版本：官方发布清单的形态，`latest_cc_release` 只收这个。 */
+const RELEASE_RE = /^\d+\.\d+\.\d+$/
+
+/** 比较两个 `主.次.修` 串；解析不出的按最小。 */
+function compareRelease(a: string, b: string): number {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+/** 实际生效的版本上限：学到/手填的值与模拟基线取大——后端同一口径。 */
+function effectiveLatestRelease(settings: Settings): string {
+  const learned = settings.latest_cc_release
+  if (!learned) return settings.cc_version_base
+  return compareRelease(learned, settings.cc_version_base) >= 0 ? learned : settings.cc_version_base
+}
+
+/**
+ * 官方最新 Claude Code 版本：来访 UA 自报高于它的不当官方客户端。
+ *
+ * 自动从 downloads.claude.ai 每 30 分钟学一次（只升不降）并落库；这里可以手动填（官方刚发新版、
+ * 自动检查还没轮到时）或删掉（退回基线、等下次自动学）。
+ */
+function LatestCcRelease() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState('')
+
+  useEffect(() => {
+    if (data) setDraft(data.latest_cc_release)
+  }, [data?.latest_cc_release])
+
+  const save = useMutation({
+    mutationFn: (version: string) => setLatestCcRelease(version),
+    onSuccess: (settings: Settings, version: string) => {
+      toastManager.add({
+        title: version
+          ? t('官方最新版本已更新', 'Latest official release updated')
+          : t('官方最新版本已清除', 'Latest official release cleared'),
+        description: version
+          ? t(
+              `自称高于 ${effectiveLatestRelease(settings)} 的客户端将按非官方处理；自动检查学到更新的版本会覆盖它。`,
+              `Clients claiming a version newer than ${effectiveLatestRelease(settings)} are treated as unofficial; a newer version learned by the automatic check will replace it.`,
+            )
+          : t(
+              `退回基线 ${settings.cc_version_base}，下次自动检查（最多 30 分钟）再学。`,
+              `Back to the baseline ${settings.cc_version_base}; the next automatic check (within 30 minutes) will relearn it.`,
+            ),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const value = draft.trim()
+  const current = data?.latest_cc_release ?? ''
+  const base = data?.cc_version_base ?? ''
+  const malformed = value !== '' && !RELEASE_RE.test(value)
+  // 填一个不高于基线的值没有效果（上限取大），提示一下免得以为生效了。
+  const belowBase = !malformed && value !== '' && base !== '' && compareRelease(value, base) < 0
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel htmlFor="latest-cc-release">
+          {t('官方最新 Claude Code 版本', 'Latest official Claude Code release')}
+        </FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            `User-Agent 里自称高于该版本的 claude-cli 不当官方客户端（走模拟路径）。每 30 分钟从 downloads.claude.ai 自动学一次，只升不降，重启保留。官方刚发新版、自动检查还没轮到时可在这里手动填；删掉则退回基线 ${base || '—'}，等下次自动学。`,
+            `A claude-cli User-Agent claiming a version newer than this is not treated as an official client (it takes the simulated path). Learned automatically from downloads.claude.ai every 30 minutes, never downgraded, kept across restarts. Fill it in by hand when a new release just shipped and the check has not run yet; clearing it falls back to the baseline ${base || '—'} until the next check.`,
+          )}
+        </FieldDescription>
+        <Badge variant={malformed || belowBase ? 'warning' : 'secondary'} size="sm">
+          {malformed
+            ? t('写法应形如 2.1.260', 'Expected something like 2.1.260')
+            : belowBase
+              ? t(`低于基线 ${base}，不会生效`, `Below the baseline ${base}; has no effect`)
+              : current
+                ? t(`当前上限 ${data ? effectiveLatestRelease(data) : current}`, `Current cap ${data ? effectiveLatestRelease(data) : current}`)
+                : t(`尚未学到，按基线 ${base}`, `Not learned yet; using the baseline ${base}`)}
+        </Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <Input
+          id="latest-cc-release"
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          placeholder={base || '2.1.260'}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <Button
+          size="sm"
+          loading={save.isPending && save.variables !== ''}
+          disabled={malformed || value === '' || value === current}
+          onClick={() => save.mutate(value)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          loading={save.isPending && save.variables === ''}
+          disabled={current === ''}
+          onClick={() => save.mutate('')}
+          aria-label={t('清除', 'Clear')}
+        >
+          <Trash2Icon />
+          {t('清除', 'Clear')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
 
 /**
  * 最低 Claude Code 版本：UA 自报 `claude-cli/<版本>` 且低于此值的请求直接 403。
