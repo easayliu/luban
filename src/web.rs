@@ -154,7 +154,7 @@ pub async fn run(
 
     // 会话保活（对齐 cap/2.1.145 抓包的真实客户端行为）：
     //   每 30min — event_logging + Datadog 遥测（idle 版本检查事件）  ← `keepalive_telemetry` 开关
-    //   首 tick  — bootstrap + penguin_mode + eval（启动握手）
+    //   每张凭证在本进程里首次被保活 — bootstrap + penguin_mode + eval（启动握手），新加的号下个 tick 补
     //   每 1h   — policy_limits + settings
     //   每 6h   — eval（Statsig 特性标志刷新）                          ← 同一开关
     // 指标不再由保活发假值：真实用量的指标由 `crate::telemetry` 按会话累计后发。
@@ -172,13 +172,17 @@ pub async fn run(
             ));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut tick_count: u64 = 0;
+            // 本进程里已经跑过「首次保活」（bootstrap + penguin_mode + eval + policy/settings
+            // 全套）的凭证。真实客户端每次进程启动都打一遍 bootstrap，luban 这边对应的是
+            // 「这张凭证第一次被本进程保活」——按凭证记，而不是按进程的首个 tick：进程跑着时
+            // 新加的号也得补上这一串，否则它在发出第一条 /v1/messages 之前只有 event_logging，
+            // 从没 bootstrap 过。
+            let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
             loop {
                 tick.tick().await;
                 tick_count += 1;
-                let is_first = tick_count == 1;
                 let is_hourly = tick_count.is_multiple_of(crate::config::KEEPALIVE_HOURLY_TICKS);
-                let is_eval =
-                    is_first || tick_count.is_multiple_of(crate::config::KEEPALIVE_EVAL_TICKS);
+                let is_eval_tick = tick_count.is_multiple_of(crate::config::KEEPALIVE_EVAL_TICKS);
 
                 // 开关每 tick 重读：网页上拨了下一轮就生效。
                 let send_telemetry = store.forward_flags().keepalive_telemetry;
@@ -189,6 +193,8 @@ pub async fn run(
                         continue;
                     }
                 };
+                // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。
+                seen.retain(|id| creds.iter().any(|c| c.id == *id));
                 for cred in creds {
                     if cred.is_banned() {
                         continue;
@@ -219,6 +225,11 @@ pub async fn run(
                             continue;
                         }
                     };
+
+                    // token 已就绪才算这张凭证的首次保活：刷新失败被 continue 掉的那轮不算，
+                    // 下一轮再补 bootstrap。
+                    let is_first = seen.insert(cred.id);
+                    let is_eval = is_first || is_eval_tick;
 
                     // 组织 id 来自这个号最近一次 `/v1/messages` 响应头；还没转发过请求时缺省。
                     // 身份优先挂到该凭证最近的真实会话上（见 `KeepaliveCtx::new`）。
@@ -256,7 +267,7 @@ pub async fn run(
                         std::time::Duration::from_secs(crate::config::KEEPALIVE_INTERVAL_SECS),
                     );
 
-                    // --- 首 tick：启动握手 ---
+                    // --- 该凭证首次保活：启动握手 ---
                     let (boot_ok, peng_ok) = if is_first && !just_handshook {
                         let bo = oauth::keepalive_bootstrap(
                             &http,
