@@ -42,7 +42,23 @@ pub const SCOPES: &str = "org:create_api_key user:profile user:inference \
 /// `user:sessions:claude_code`、`user:mcp_servers`（官方客户端自己的功能面）。
 /// 少要权限的代价是**授权请求与官方客户端不再逐字一致**——scope 集合也是指纹的一部分，
 /// 所以这不是默认值，是给「宁可少授权、不在意这点差异」的人留的一档。
+///
+/// 还有一条要知道：这一档只管**登录那一刻**。刷新 token 发的是固定的 [`REFRESH_SCOPES`]
+/// （官方行为），后端允许刷新时扩展 scope，所以第一次刷新后这个号的 scope 就回到那五项了。
 pub const SCOPES_MINIMAL: &str = "user:file_upload user:inference user:profile";
+
+/// 刷新 token 时随请求发送的 `scope`。
+///
+/// **是固定常量，不是登录时申请的那组**：官方客户端（`services/oauth/client.ts` 的
+/// `refreshOAuthToken`）对 claude.ai 订阅号刻意不传已存的 scopes，让缺省值
+/// `CLAUDE_AI_OAUTH_SCOPES` 生效——后端允许刷新时**扩展** scope，这样老 token 不必重新登录
+/// 就能拿到后来加进来的 `user:file_upload`。里面没有 `org:create_api_key`（那一项只在
+/// 授权 URL 上出现）。
+///
+/// 副作用要知道：登录时选了 [`SCOPES_MINIMAL`] 的号，第一次刷新后 scope 会被扩回这五项。
+/// 那正是官方客户端的行为，刻意不做「按 settings 发」——那会造出一条官方从不产生的请求体。
+pub const REFRESH_SCOPES: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// 把填进来的 scope 串规整成「单空格分隔、按输入顺序去重」的形态。
 ///
@@ -958,6 +974,13 @@ pub const DOWNLOAD_PLUGINS_DELAY_MS: u64 = 125_000;
 /// 辅助端点共用的 `Accept`（axios 的默认值）。
 pub const AXIOS_ACCEPT: &str = "application/json, text/plain, */*";
 
+/// 没显式传 `User-Agent` 的 axios 调用发出去的 UA（axios 的 http 适配器自己补的）。
+///
+/// 抓包里两处可见：`cap/2.1.260-2/00005`（penguin_mode）与 `00006`（mcp_servers）都是
+/// `axios/1.15.2`。OAuth 的 token 与 profile 两条在源码里同样没传 UA
+/// （`services/oauth/client.ts` / `getOauthProfile.ts`），故也是这一个。
+pub const AXIOS_DEFAULT_USER_AGENT: &str = "axios/1.15.2";
+
 /// 辅助端点的 `Accept-Encoding`：**与 Messages API 那份不是同一个串**。
 ///
 /// axios 走 Node 的 http 客户端，默认发 `gzip, compress, deflate, br`（多一个 `compress`、
@@ -1147,6 +1170,37 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
         name: "download",
         order: &["Accept", "User-Agent", "Accept-Encoding", "Host", "Connection"],
     },
+    // **无抓包，按 axios 规律推断**（`cap/` 里没有 token/profile 端点的样本）。规律取自
+    // 00005/00006/00017 三条没显式 UA 的调用：`Accept` 打头，随后是调用点 `headers` 里
+    // 的键按书写序，axios 自补的 `User-Agent` 排在它们之后，再接尾部。
+    //
+    // token 端点：源码只传了 `Content-Type`（`services/oauth/client.ts`）。
+    AxiosShape {
+        name: "oauth_token",
+        order: &[
+            "Accept",
+            "Content-Type",
+            "User-Agent",
+            "Content-Length",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
+    // profile 端点：源码传的是 `Authorization` 再 `Content-Type`（`getOauthProfile.ts`），
+    // GET 上带 `Content-Type` 是 axios 原样发出的（00006 那条 GET 就带着）。
+    AxiosShape {
+        name: "oauth_profile",
+        order: &[
+            "Accept",
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
 ];
 
 /// eval（`/api/eval/sdk-…`）**不是 axios**：它走 Bun 自带的 fetch，UA 是
@@ -1321,8 +1375,8 @@ pub const DATADOG_INTAKE_URL: &str = "https://http-intake.logs.us5.datadoghq.com
 /// Datadog 公钥（公开的 client token，非 secret）。
 pub const DATADOG_API_KEY: &str = "pubea5604404508cdd34afb69e6f42a05bc";
 
-/// Datadog 请求的 User-Agent（真实客户端通过 axios 发送）。
-pub const DATADOG_USER_AGENT: &str = "axios/1.15.2";
+/// Datadog 请求的 User-Agent（真实客户端通过 axios 发送，没传 UA，即 axios 缺省值）。
+pub const DATADOG_USER_AGENT: &str = AXIOS_DEFAULT_USER_AGENT;
 
 #[cfg(test)]
 mod tests {

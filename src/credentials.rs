@@ -44,6 +44,16 @@ pub struct Credential {
     pub ban_reason: Option<String>,
     /// 账号 UUID（来自 `/api/oauth/profile` 的 `account.uuid`）；转发时用于身份伪装。
     pub account_uuid: Option<String>,
+    /// 组织 UUID（profile 的 `organization.uuid`，交换响应的 `organization.uuid` 兜底）。
+    ///
+    /// 遥测 `auth` 块与 eval 的 `organizationUUID` 要它。此前唯一来源是这个号最近一次
+    /// `/v1/messages` 响应头里的 `anthropic-organization-id`——刚登录、或久没转发过请求时
+    /// 就缺省，而官方每条都带（345/345）。真实客户端也是登录时从 profile 存下来的
+    /// （`storeOAuthAccountInfo` 的 `organizationUuid`）。响应头学到的值仍优先。
+    pub org_uuid: Option<String>,
+    /// 订阅创建时刻，profile 的 `organization.subscription_created_at` **原串**（ISO 8601）。
+    /// eval 的 `subscriptionCreatedAt` 发它换算成的毫秒数；`None` 表示还没拉到，那一项不发。
+    pub subscription_created_at: Option<String>,
     /// 被上游限流自动停用后，**到点自动重新启用**的 Unix 时间戳（秒）；`None` 表示不自动
     /// 恢复（人工停用、封号，或压根没停用）。
     ///
@@ -64,6 +74,18 @@ pub struct Credential {
 }
 
 impl Credential {
+    /// profile 那几列还有没拉到的：账号 UUID、额度档原值、组织 UUID、订阅创建时刻。
+    /// [`crate::store::ensure_fresh_token`] 据此决定刷新后要不要顺手拉一次 profile。
+    /// `tier` / `org_type` 不算——它们在 profile 里也可能就是空的（免费号），拿它们判会让
+    /// 那类号每次刷新都多一次往返。
+    pub fn profile_incomplete(&self) -> bool {
+        let missing = |v: &Option<String>| v.as_deref().map(str::trim).is_none_or(str::is_empty);
+        missing(&self.account_uuid)
+            || missing(&self.rate_limit_tier)
+            || missing(&self.org_uuid)
+            || missing(&self.subscription_created_at)
+    }
+
     /// 距离过期的剩余秒数（已过期返回 0）。
     pub fn expires_in_secs(&self) -> u64 {
         self.expires_at.saturating_sub(now_secs())

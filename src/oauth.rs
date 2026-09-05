@@ -45,6 +45,9 @@ pub struct TokenSet {
     pub expires_at: u64,
     /// 账号邮箱（来自交换响应，用作默认显示名的兜底）。
     pub account: Option<String>,
+    /// 组织 UUID（交换响应的 `organization.uuid`）；profile 拉不到时的兜底，
+    /// 见 [`crate::credentials::Credential::org_uuid`]。刷新响应通常没有。
+    pub organization_uuid: Option<String>,
 }
 
 /// 账号 profile：邮箱、姓名、订阅等级、账号 UUID（来自 `/api/oauth/profile`）。
@@ -64,6 +67,11 @@ pub struct Profile {
     pub rate_limit_tier: Option<String>,
     /// 账号唯一标识（`account.uuid`）；用于转发时的身份伪装。
     pub account_uuid: Option<String>,
+    /// 组织 UUID（`organization.uuid`）。见 [`crate::credentials::Credential::org_uuid`]。
+    pub org_uuid: Option<String>,
+    /// 订阅创建时刻原串（`organization.subscription_created_at`，ISO 8601）。
+    /// 见 [`crate::credentials::Credential::subscription_created_at`]。
+    pub subscription_created_at: Option<String>,
 }
 
 /// 一次登录尝试的 PKCE 上下文，需在交换 token 时回传。
@@ -113,7 +121,13 @@ impl PkceChallenge {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    /// 刷新响应里**可以没有**：官方客户端是 `refresh_token: newRefreshToken = refreshToken`
+    /// （`services/oauth/client.ts`），缺了就沿用旧的。此前这里是必填，一条合法的「不轮换
+    /// refresh_token」的响应会在解析这一步被判成失败，号被白白停掉。
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// 必填，**刻意不给默认值**：官方客户端也是直接 `Date.now() + expires_in * 1000`，没有
+    /// 兜底（缺了就是 NaN）；这里若编一个「默认一小时」就是发明一个上游没说过的过期时间。
     expires_in: u64,
     #[serde(default)]
     account: Option<Account>,
@@ -131,6 +145,9 @@ struct Account {
 struct Organization {
     #[serde(default)]
     name: Option<String>,
+    /// 官方登录时 profile 拉不到就用这个当组织 id（`tokenAccount.organizationUuid`）。
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 // ---------- profile ----------
@@ -168,18 +185,50 @@ struct ProfileOrg {
     /// 如 `default_claude_max_5x` / `default_claude_max_20x`，含倍数档位。
     #[serde(default)]
     rate_limit_tier: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
+    /// ISO 8601 原串（如 `2026-04-15T13:03:55.239Z`）。官方 `storeOAuthAccountInfo` 存的
+    /// 就是它，eval 时再换算成毫秒。
+    #[serde(default)]
+    subscription_created_at: Option<String>,
 }
 
+/// 官方 profile 请求的超时（`getOauthProfile.ts` 里 axios 的 `timeout: 10000`）。
+const PROFILE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 官方 token 请求（交换与刷新）的超时（`services/oauth/client.ts` 里 `timeout: 15000`）。
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 用 access_token 获取账号 profile（邮箱、姓名、订阅等级）。
+///
+/// 形态照官方 `getOauthProfile.ts`：axios GET，显式头只有 `Authorization` 与
+/// `Content-Type: application/json`，其余（`Accept`、缺省 UA、`Accept-Encoding`、
+/// `Connection: close`）都是 axios 自己的。**没有** `anthropic-beta` / `anthropic-version`
+/// ——此前多发了这两个、少发了 `Content-Type`，UA 与 `Accept-Encoding` 还是 Messages API
+/// 那份 Bun 形态，与 [`post_token`] 一样是每个号必发的两条却与官方对不上。
 pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<Profile> {
-    let resp = client
-        .get(config::PROFILE_URL)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .context("request to the profile endpoint failed")?;
+    fetch_profile_from(client, config::PROFILE_URL, access_token).await
+}
+
+/// [`fetch_profile`] 的实现，端点可换——测试拿本地监听口核对线上形态。
+async fn fetch_profile_from(
+    client: &wreq::Client,
+    url: &str,
+    access_token: &str,
+) -> Result<Profile> {
+    let resp = axios(
+        client
+            .get(url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", config::AXIOS_DEFAULT_USER_AGENT)
+            .timeout(PROFILE_TIMEOUT),
+        "oauth_profile",
+    )
+    .send()
+    .await
+    .context("request to the profile endpoint failed")?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -215,7 +264,23 @@ pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<
         .as_ref()
         .and_then(|o| o.rate_limit_tier.clone())
         .filter(|s| !s.trim().is_empty());
-    Ok(Profile { email, name, tier, org_type, rate_limit_tier, account_uuid })
+    let org_uuid =
+        p.organization.as_ref().and_then(|o| o.uuid.clone()).filter(|s| !s.trim().is_empty());
+    let subscription_created_at = p
+        .organization
+        .as_ref()
+        .and_then(|o| o.subscription_created_at.clone())
+        .filter(|s| !s.trim().is_empty());
+    Ok(Profile {
+        email,
+        name,
+        tier,
+        org_type,
+        rate_limit_tier,
+        account_uuid,
+        org_uuid,
+        subscription_created_at,
+    })
 }
 
 /// 由订阅标志推导账号等级：Max > Pro > Free；Max 附带倍数档（如 `Max 5x`）。
@@ -306,16 +371,23 @@ pub async fn exchange_code(
         bail!("state mismatch, possibly CSRF or a bad paste; please log in again");
     }
 
-    let body = serde_json::json!({
+    // 交换响应缺 refresh_token 没有可回退的旧值，缺了就是缺了。
+    post_token(client, exchange_body(&code, &returned_state, &pkce.verifier), None).await
+}
+
+/// 授权码交换的请求体。键序照官方 `exchangeCodeForTokens`（`services/oauth/client.ts`）：
+/// `grant_type → code → redirect_uri → client_id → code_verifier → state`。serde_json 开着
+/// `preserve_order`，这个顺序会原样上线；此前是 `state` 紧跟 `code`、`redirect_uri` 在
+/// `client_id` 之后，与官方不同。
+fn exchange_body(code: &str, state: &str, verifier: &str) -> serde_json::Value {
+    serde_json::json!({
         "grant_type": "authorization_code",
         "code": code,
-        "state": returned_state,
-        "client_id": config::CLIENT_ID,
         "redirect_uri": config::REDIRECT_URI,
-        "code_verifier": pkce.verifier,
-    });
-
-    post_token(client, body).await
+        "client_id": config::CLIENT_ID,
+        "code_verifier": verifier,
+        "state": state,
+    })
 }
 
 /// token 端点返回的非 2xx 响应。作为 typed error 抛出（而不是拍平成字符串），
@@ -363,23 +435,58 @@ impl TokenEndpointError {
 
 /// 用 refresh_token 刷新出新的 access_token。
 pub async fn refresh(client: &wreq::Client, refresh_token: &str) -> Result<TokenSet> {
-    let body = serde_json::json!({
+    post_token(client, refresh_body(refresh_token), Some(refresh_token)).await
+}
+
+/// 刷新的请求体。键序照官方 `refreshOAuthToken`：
+/// `grant_type → refresh_token → client_id → scope`。`scope` 是固定的
+/// [`config::REFRESH_SCOPES`]（为什么不是登录时那组，见那里）；此前根本没发这一项。
+fn refresh_body(refresh_token: &str) -> serde_json::Value {
+    serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": config::CLIENT_ID,
-    });
-
-    post_token(client, body).await
+        "scope": config::REFRESH_SCOPES,
+    })
 }
 
 /// 向 token 端点 POST，并把响应转换为带过期时间戳的 `TokenSet`。
-async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<TokenSet> {
-    let resp = client
-        .post(config::TOKEN_URL)
-        .json(&body)
-        .send()
-        .await
-        .context("request to the token endpoint failed")?;
+///
+/// 形态照官方 `services/oauth/client.ts`：axios POST，显式头只有 `Content-Type`
+/// （由 `.json()` 补上），`Accept` / 缺省 UA / `Accept-Encoding` / `Connection: close`
+/// 是 axios 自己的，超时 15s。此前直接用 [`crate::clients::upstream_client`] 的缺省值发，
+/// UA 是 `claude-cli/…`、`Accept-Encoding` 是 Bun 那份、没有 `Accept`——也就是把 Messages
+/// API 的传输形态套在了一条官方用 axios 发的请求上。
+///
+/// `fallback_refresh` 是响应里缺 `refresh_token` 时沿用的旧值：刷新传旧 token，交换传
+/// `None`（那时没有旧值，缺了只能报错）。
+async fn post_token(
+    client: &wreq::Client,
+    body: serde_json::Value,
+    fallback_refresh: Option<&str>,
+) -> Result<TokenSet> {
+    post_token_to(client, config::TOKEN_URL, body, fallback_refresh).await
+}
+
+/// [`post_token`] 的实现，端点可换——测试拿本地监听口核对线上形态。
+async fn post_token_to(
+    client: &wreq::Client,
+    url: &str,
+    body: serde_json::Value,
+    fallback_refresh: Option<&str>,
+) -> Result<TokenSet> {
+    let resp = axios(
+        client
+            .post(url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("User-Agent", config::AXIOS_DEFAULT_USER_AGENT)
+            .json(&body)
+            .timeout(TOKEN_TIMEOUT),
+        "oauth_token",
+    )
+    .send()
+    .await
+    .context("request to the token endpoint failed")?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -387,13 +494,28 @@ async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<To
         return Err(TokenEndpointError { status, body: text }.into());
     }
 
-    // **绝不**把 `text` 拼进错误：走到这里说明是 2xx，报文里就是 access_token/refresh_token
-    // 本身，而这条 error 会被 `valid_access_token_for_device` 打进日志、被 `/api/.../refresh`
-    // 原样返回给浏览器——那等于把凭证写进日志文件和 HTTP 响应。非 2xx 的响应体不含凭证，
-    // 由 `TokenEndpointError` 原样保留（见其文档）。serde 的报错自带字段名与行列，够定位了。
-    let token: TokenResponse = serde_json::from_str(&text)
+    parse_token_set(&text, fallback_refresh)
+}
+
+/// 把 token 端点的 2xx 响应体解析成 [`TokenSet`]。
+///
+/// **绝不**把 `text` 拼进错误：走到这里说明是 2xx，报文里就是 access_token/refresh_token
+/// 本身，而这条 error 会被 `valid_access_token_for_device` 打进日志、被 `/api/.../refresh`
+/// 原样返回给浏览器——那等于把凭证写进日志文件和 HTTP 响应。非 2xx 的响应体不含凭证，
+/// 由 `TokenEndpointError` 原样保留（见其文档）。serde 的报错自带字段名与行列，够定位了。
+fn parse_token_set(text: &str, fallback_refresh: Option<&str>) -> Result<TokenSet> {
+    let token: TokenResponse = serde_json::from_str(text)
         .with_context(|| format!("failed to parse the token response ({} bytes)", text.len()))?;
 
+    // 官方：`refresh_token: newRefreshToken = refreshToken`——响应没给新的就接着用旧的。
+    let refresh_token = match (token.refresh_token, fallback_refresh) {
+        (Some(t), _) if !t.is_empty() => t,
+        (_, Some(old)) => old.to_string(),
+        (_, None) => bail!("the token response has no refresh_token"),
+    };
+
+    let organization_uuid =
+        token.organization.as_ref().and_then(|o| o.uuid.clone()).filter(|s| !s.trim().is_empty());
     // 优先用账号邮箱作标识，取不到再用组织名。
     let account = token
         .account
@@ -403,9 +525,10 @@ async fn post_token(client: &wreq::Client, body: serde_json::Value) -> Result<To
 
     Ok(TokenSet {
         access_token: token.access_token,
-        refresh_token: token.refresh_token,
+        refresh_token,
         expires_at: now_secs() + token.expires_in,
         account,
+        organization_uuid,
     })
 }
 
@@ -433,14 +556,20 @@ fn random_b64url(n: usize) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// 最小 URL 百分号编码，仅保留 RFC 3986 unreserved 字符。
+/// 查询串编码，照 JS `URLSearchParams` 的 `application/x-www-form-urlencoded` 序列化：
+/// 空格是 `+`，不转义的只有字母数字与 `*-._`（注意 `~` **要**转义、`*` **不**转义，
+/// 与 RFC 3986 的 unreserved 集恰好各差一个）。
+///
+/// 官方授权 URL 是 `authUrl.searchParams.append(...)` 拼出来的（`services/oauth/client.ts`），
+/// scope 里的空格上线就是 `+`；此前按 RFC 3986 编成 `%20`，语义等价但逐字不同。
 fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
                 out.push(b as char)
             }
+            b' ' => out.push('+'),
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -467,8 +596,9 @@ pub struct KeepaliveCtx {
     account_uuid: String,
     /// subscription_type（team / individual）。
     subscription_type: String,
-    /// 该凭证最近一次 `/v1/messages` 响应头里的 `anthropic-organization-id`；一次都没见过
-    /// 时缺省（见 [`crate::telemetry::Telemetry::org_uuid`]）。
+    /// 组织 id：该凭证最近一次 `/v1/messages` 响应头里的 `anthropic-organization-id`
+    /// 优先（见 [`crate::telemetry::Telemetry::org_uuid`]），没有就用凭证上从 profile 存的
+    /// `org_uuid`；两处都没有才缺省。
     organization_uuid: Option<String>,
     /// 进程已运行秒数。
     uptime_secs: f64,
@@ -485,6 +615,17 @@ pub struct KeepaliveCtx {
     /// 真实客户端记的是这台机器第一次登录成功的时间，luban 这边最接近的就是凭证入库那一刻
     /// （`created_at`）——同一个语义，不是编出来的常量。
     first_token_ms: Option<i64>,
+    /// `attributes.subscriptionCreatedAt`（毫秒）：profile 的 `organization.subscription_created_at`
+    /// 换算而来；凭证上还没存（旧库没刷新过）就 `None`，那一项不发。
+    subscription_created_ms: Option<i64>,
+}
+
+/// `attributes.subscriptionCreatedAt`（毫秒）：凭证上存的 ISO 8601 原串换算成 Unix 毫秒
+/// （官方 `new Date(str).getTime()`，抓包 `cap/2.1.260-2/00003` 里是 `1776258235239`）。
+/// 解析不了的串按没有处理——发一个错的时间不如不发。
+fn subscription_created_ms(cred: &crate::credentials::Credential) -> Option<i64> {
+    let raw = cred.subscription_created_at.as_deref()?.trim();
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| t.timestamp_millis())
 }
 
 /// `attributes.firstTokenTime`（毫秒）：这张凭证第一次拿到 token 的时刻。
@@ -515,6 +656,10 @@ impl KeepaliveCtx {
     ) -> Self {
         let subscription_type =
             crate::telemetry::subscription_type(cred.org_type.as_deref()).to_string();
+        // 响应头学到的组织 id 优先，凭证上 profile 存的那份垫底（同一个值，前者更新鲜）。
+        let organization_uuid = organization_uuid
+            .filter(|o| !o.trim().is_empty())
+            .or_else(|| cred.org_uuid.clone().filter(|o| !o.trim().is_empty()));
         if let Some(s) = session {
             let uptime_secs = std::time::SystemTime::now()
                 .duration_since(s.started_wall)
@@ -534,6 +679,7 @@ impl KeepaliveCtx {
                 version: s.version,
                 rate_limit_tier: cred.rate_limit_tier.clone(),
                 first_token_ms: first_token_ms(cred),
+                subscription_created_ms: subscription_created_ms(cred),
             };
         }
         let id_str = cred.id.to_string();
@@ -557,6 +703,7 @@ impl KeepaliveCtx {
             version: keepalive_version().to_string(),
             rate_limit_tier: cred.rate_limit_tier.clone(),
             first_token_ms: first_token_ms(cred),
+            subscription_created_ms: subscription_created_ms(cred),
         }
     }
 
@@ -631,7 +778,7 @@ impl KeepaliveCtx {
     /// eval 端点的请求体（Statsig 特性标志评估）。
     fn eval_body(&self) -> serde_json::Value {
         // 官方在 `platform` 与 `accountUUID` 之间带 `organizationUUID`（`cap/2.1.258/00003`）；
-        // 还没从响应头里学到组织 id 时只能缺省。
+        // 响应头没学到、凭证上也没存（旧库没刷新过）时才缺省。
         let mut attrs = serde_json::Map::new();
         attrs.insert("id".into(), self.device_id.clone().into());
         attrs.insert("sessionId".into(), self.session_id.clone().into());
@@ -649,9 +796,13 @@ impl KeepaliveCtx {
             attrs.insert("rateLimitTier".into(), raw.clone().into());
         }
         attrs.insert("organizationRole".into(), "user".into());
-        // `subscriptionCreatedAt`（订阅创建时刻，毫秒）**拿不到**：它不在 profile、bootstrap
-        // 或 policy_limits 的响应里（`cap/2.1.260-2` 全部响应体搜过），真实客户端是从本地
-        // `~/.claude.json` 读的。按 §8.2 的口径记为未对齐——不填伪造常量。
+        // `subscriptionCreatedAt`（订阅创建时刻，毫秒）来自 profile 的
+        // `organization.subscription_created_at`——真实客户端登录时把它存进 `~/.claude.json`，
+        // eval 时换算成毫秒。`cap/2.1.260-2` 里没有 profile 响应体，之前误判为拿不到。
+        // 凭证上还没存（旧库没刷新过）就不发——填个常量会让同一批号全报同一个时间。
+        if let Some(ms) = self.subscription_created_ms {
+            attrs.insert("subscriptionCreatedAt".into(), ms.into());
+        }
         if let Some(ms) = self.first_token_ms {
             attrs.insert("firstTokenTime".into(), ms.into());
         }
@@ -1306,7 +1457,10 @@ pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx
 
 #[cfg(test)]
 mod tests {
-    use super::{KeepaliveCtx, TokenEndpointError, tier_from};
+    use super::{
+        KeepaliveCtx, PkceChallenge, TokenEndpointError, exchange_body, parse_token_set,
+        refresh_body, tier_from, urlencode,
+    };
     use crate::config;
     use wreq::StatusCode;
 
@@ -1548,7 +1702,7 @@ mod tests {
     }
 
     /// statsig eval 的 `attributes`：`rateLimitTier` 发**原值**、`firstTokenTime` 取凭证
-    /// 入库那一刻，`subscriptionCreatedAt` **不发**（拿不到，见 [`super::KeepaliveCtx::eval_body`]）。
+    /// 入库那一刻，`subscriptionCreatedAt` 取 profile 存下的原串换算的毫秒数（没存就不发）。
     ///
     /// 官方那份的键序（`cap/2.1.260-2/00003`）：
     /// `… userType, subscriptionType, rateLimitTier, organizationRole,
@@ -1568,11 +1722,9 @@ mod tests {
         let first = attrs["firstTokenTime"].as_i64().expect("凭证有 created_at 就该有这一项");
         assert_eq!(first, cred.created_at as i64 * 1000);
         assert!(first > 1_700_000_000_000, "毫秒量级: {first}");
-        // 拿不到的那个明确不发——填个常量会让同一批号全都是同一个订阅创建时间。
-        assert!(
-            attrs.get("subscriptionCreatedAt").is_none(),
-            "拿不到就不发，别填伪造常量: {attrs}"
-        );
+        // 还没存订阅创建时刻的号明确不发——填个常量会让同一批号全都是同一个订阅创建时间。
+        assert!(attrs.get("subscriptionCreatedAt").is_none(), "没存就不发，别填伪造常量: {attrs}");
+        assert!(attrs.get("organizationUUID").is_none(), "响应头没学到、凭证上也没存");
 
         // 键序照抓包：rateLimitTier 夹在 subscriptionType 与 organizationRole 之间。
         let keys: Vec<&str> = attrs.as_object().unwrap().keys().map(String::as_str).collect();
@@ -1581,6 +1733,42 @@ mod tests {
         assert!(at("rateLimitTier") < at("organizationRole"));
         assert!(at("organizationRole") < at("firstTokenTime"));
         assert!(at("firstTokenTime") < at("appVersion"));
+
+        // profile 存下来之后：subscriptionCreatedAt 是毫秒数、夹在 organizationRole 与
+        // firstTokenTime 之间（`cap/2.1.260-2/00003` 的键序）；organizationUUID 用凭证上那份垫底。
+        store.set_subscription_created_at(cred.id, Some("2026-04-15T13:03:55.239Z")).unwrap();
+        store.set_org_uuid(cred.id, Some("09520b85-f6b6-432f-97e2-6ecb804a083f")).unwrap();
+        let cred = store.get(cred.id).unwrap().unwrap();
+        let attrs = KeepaliveCtx::new(&cred, 1.0, None, None).eval_body();
+        let attrs = &attrs["attributes"];
+        assert_eq!(attrs["subscriptionCreatedAt"], 1776258235239i64);
+        assert_eq!(attrs["organizationUUID"], "09520b85-f6b6-432f-97e2-6ecb804a083f");
+        let keys: Vec<&str> = attrs.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(
+            at("platform") < at("organizationUUID") && at("organizationUUID") < at("accountUUID")
+        );
+        assert!(at("organizationRole") < at("subscriptionCreatedAt"));
+        assert!(at("subscriptionCreatedAt") < at("firstTokenTime"));
+        // 响应头学到的优先于凭证上存的。
+        let fresh = KeepaliveCtx::new(
+            &cred,
+            1.0,
+            Some("11111111-2222-3333-4444-555555555555".into()),
+            None,
+        );
+        assert_eq!(
+            fresh.eval_body()["attributes"]["organizationUUID"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        // 解析不了的串按没有处理。
+        store.set_subscription_created_at(cred.id, Some("garbage")).unwrap();
+        let cred = store.get(cred.id).unwrap().unwrap();
+        assert!(
+            KeepaliveCtx::new(&cred, 1.0, None, None).eval_body()["attributes"]
+                .get("subscriptionCreatedAt")
+                .is_none()
+        );
 
         // 旧库里没回填过的号：这一项整个不发，而不是发一个空串。
         let bare = store.insert("t2", None, "a2", "r2", 0, None, None).unwrap();
@@ -1673,5 +1861,285 @@ mod tests {
 
         let long = err(StatusCode::BAD_REQUEST, &"x".repeat(500));
         assert_eq!(long.ban_reason().chars().count(), 200);
+    }
+
+    /// token / profile 两条的头序**没有抓包**，这里钉的是按 axios 规律推出来的那份
+    /// （`Accept` 打头，调用点显式头按书写序，缺省 UA 在其后，再接尾部三件套），以及
+    /// 这两条**不该**带的头：profile 此前多发了 `anthropic-beta` / `anthropic-version`。
+    /// 拿到真实抓包后若不一致，改 `config::AXIOS_SHAPES` 里那两行并把这里改成抓包序。
+    #[test]
+    fn oauth_token_and_profile_shapes_follow_axios_rules() {
+        assert_eq!(
+            config::axios_shape("oauth_token"),
+            &[
+                "Accept",
+                "Content-Type",
+                "User-Agent",
+                "Content-Length",
+                "Accept-Encoding",
+                "Host",
+                "Connection"
+            ]
+        );
+        assert_eq!(
+            config::axios_shape("oauth_profile"),
+            &[
+                "Accept",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "Accept-Encoding",
+                "Host",
+                "Connection"
+            ]
+        );
+        for h in ["anthropic-beta", "anthropic-version"] {
+            assert!(!config::axios_shape("oauth_profile").contains(&h), "profile 不带 {h}");
+            assert!(!config::axios_shape("oauth_token").contains(&h), "token 不带 {h}");
+        }
+        assert_eq!(config::AXIOS_DEFAULT_USER_AGENT, config::DATADOG_USER_AGENT);
+    }
+
+    /// 请求体键序照官方 `services/oauth/client.ts`；刷新必须带固定的 `scope`。
+    #[test]
+    fn token_bodies_match_official_key_order() {
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v.as_object().unwrap().keys().cloned().collect()
+        };
+        let ex = exchange_body("CODE", "STATE", "VERIFIER");
+        assert_eq!(
+            keys(&ex),
+            ["grant_type", "code", "redirect_uri", "client_id", "code_verifier", "state"]
+        );
+        assert_eq!(ex["redirect_uri"], config::REDIRECT_URI);
+
+        let rf = refresh_body("RT");
+        assert_eq!(keys(&rf), ["grant_type", "refresh_token", "client_id", "scope"]);
+        assert_eq!(rf["scope"], config::REFRESH_SCOPES);
+        assert_eq!(
+            config::REFRESH_SCOPES,
+            "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+            "官方 CLAUDE_AI_OAUTH_SCOPES 五项，无 org:create_api_key"
+        );
+    }
+
+    /// 刷新响应缺 `refresh_token` 时沿用旧值（官方 `newRefreshToken = refreshToken`）；
+    /// 授权码交换没有旧值可退，缺了要报错。
+    #[test]
+    fn missing_refresh_token_falls_back_to_the_old_one() {
+        let without = r#"{"access_token":"AT","expires_in":3600}"#;
+        let set = parse_token_set(without, Some("OLD")).unwrap();
+        assert_eq!(set.access_token, "AT");
+        assert_eq!(set.refresh_token, "OLD");
+        assert!(parse_token_set(without, None).is_err(), "交换时缺 refresh_token 是错");
+
+        let with = r#"{"access_token":"AT","refresh_token":"NEW","expires_in":3600,"account":{"email_address":"a@b.c"}}"#;
+        let set = parse_token_set(with, Some("OLD")).unwrap();
+        assert_eq!(set.refresh_token, "NEW", "响应给了新的就用新的");
+        assert_eq!(set.account.as_deref(), Some("a@b.c"));
+
+        let empty = r#"{"access_token":"AT","refresh_token":"","expires_in":3600}"#;
+        assert_eq!(
+            parse_token_set(empty, Some("OLD")).unwrap().refresh_token,
+            "OLD",
+            "空串按缺失处理"
+        );
+    }
+
+    /// 授权 URL 的查询串照 JS `URLSearchParams`：空格是 `+`，`~` 转义、`*` 不转义。
+    #[test]
+    fn urlencode_matches_url_search_params() {
+        assert_eq!(urlencode("user:profile user:inference"), "user%3Aprofile+user%3Ainference");
+        assert_eq!(urlencode("a~b*c"), "a%7Eb*c");
+        assert_eq!(
+            urlencode("https://platform.claude.com/oauth/code/callback"),
+            "https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+        );
+
+        let pkce = PkceChallenge::generate();
+        let url = pkce.authorize_url(config::SCOPES);
+        assert!(url.contains("&scope=org%3Acreate_api_key+user%3Aprofile+"), "{url}");
+        assert!(!url.contains("%20"), "{url}");
+        // 参数顺序照官方 `authUrl.searchParams.append` 的书写序。
+        let order = [
+            "code=",
+            "client_id=",
+            "response_type=",
+            "redirect_uri=",
+            "scope=",
+            "code_challenge=",
+            "code_challenge_method=",
+            "state=",
+        ];
+        let mut last = 0;
+        for k in order {
+            let i = url
+                .find(&format!("{}{}", if last == 0 { "?" } else { "&" }, k))
+                .unwrap_or_else(|| panic!("{k} 缺失或顺序不对: {url}"));
+            assert!(i > last, "{k} 顺序不对: {url}");
+            last = i;
+        }
+    }
+
+    /// 起一个本地 HTTP/1.1 服务：收完请求头与（按 `Content-Length`）请求体，回给定响应，
+    /// 把收到的请求**原始字节**（头 + 体）交回来。
+    fn serve_once(
+        json_body: &'static str,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json_body.len(),
+            json_body
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(&stream);
+            let mut raw = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap();
+                }
+                let end = line == "\r\n";
+                raw.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            r.read_exact(&mut body).unwrap();
+            raw.push_str(std::str::from_utf8(&body).unwrap());
+            (&stream).write_all(response.as_bytes()).unwrap();
+            raw
+        });
+        (addr, h)
+    }
+
+    /// 把原始请求拆成（请求行，头名按线上顺序与拼写，头值表，体）。
+    fn split_raw(
+        raw: &str,
+    ) -> (String, Vec<String>, std::collections::HashMap<String, String>, String) {
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap().to_string();
+        let mut names = Vec::new();
+        let mut values = std::collections::HashMap::new();
+        for l in lines {
+            let (n, v) = l.split_once(": ").unwrap();
+            names.push(n.to_string());
+            values.insert(n.to_ascii_lowercase(), v.to_string());
+        }
+        (request_line, names, values, body.to_string())
+    }
+
+    /// token 端点**线上**形态：不是比常量表，是真发一条到本地监听口、看原始字节。
+    ///
+    /// 钉的仍是按 axios 规律推出的那份（无抓包，见 `config::AXIOS_SHAPES` 里那两行的注释），
+    /// 但这里验的是「常量表 → `OrigHeaderMap` → 线上」这一整条链确实产出那个形态：头名
+    /// 拼写、顺序、`Connection: close`、`Host` / `Content-Length` 的位置、没有多余头、
+    /// 体的键序与 `scope`。拿到真实抓包后若头序不同，改常量表，这条测试跟着改。
+    #[tokio::test]
+    async fn token_request_wire_shape_is_axios() {
+        let (addr, server) = serve_once(r#"{"access_token":"AT","expires_in":3600,"scope":"x"}"#);
+        let client = crate::clients::upstream_client(None).unwrap();
+        let set = super::post_token_to(
+            &client,
+            &format!("http://{addr}/v1/oauth/token"),
+            refresh_body("OLD"),
+            Some("OLD"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.access_token, "AT");
+        assert_eq!(set.refresh_token, "OLD", "响应没给新 refresh_token 就沿用旧的");
+
+        let raw = server.join().unwrap();
+        let (line, names, values, body) = split_raw(&raw);
+        assert_eq!(line, "POST /v1/oauth/token HTTP/1.1");
+        assert_eq!(
+            names,
+            [
+                "Accept",
+                "Content-Type",
+                "User-Agent",
+                "Content-Length",
+                "Accept-Encoding",
+                "Host",
+                "Connection"
+            ],
+            "\n{raw}"
+        );
+        assert_eq!(values["accept"], config::AXIOS_ACCEPT);
+        assert_eq!(values["content-type"], "application/json");
+        assert_eq!(values["user-agent"], "axios/1.15.2");
+        assert_eq!(values["accept-encoding"], config::AXIOS_ACCEPT_ENCODING);
+        assert_eq!(values["connection"], "close");
+        assert_eq!(values["host"], addr.to_string());
+        assert_eq!(values["content-length"], body.len().to_string());
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"OLD","client_id":"{}","scope":"{}"}}"#,
+                config::CLIENT_ID,
+                config::REFRESH_SCOPES
+            ),
+            "体的键序照官方 refreshOAuthToken"
+        );
+    }
+
+    /// profile 端点**线上**形态，同上：`Authorization` 在 `Content-Type` 前（官方 headers 的
+    /// 书写序）、GET 上带 `Content-Type`、没有 `anthropic-beta` / `anthropic-version`。
+    #[tokio::test]
+    async fn profile_request_wire_shape_is_axios() {
+        let (addr, server) = serve_once(
+            r#"{"account":{"uuid":"9922ef8e-7945-4f5a-ab4f-cf5f521531df","email":"a@b.c"},"organization":{"uuid":"09520b85-f6b6-432f-97e2-6ecb804a083f","organization_type":"claude_team","rate_limit_tier":"default_claude_max_5x","subscription_created_at":"2026-04-15T13:03:55.239Z"}}"#,
+        );
+        let client = crate::clients::upstream_client(None).unwrap();
+        let profile = super::fetch_profile_from(
+            &client,
+            &format!("http://{addr}/api/oauth/profile"),
+            "TOKEN",
+        )
+        .await
+        .unwrap();
+        assert_eq!(profile.account_uuid.as_deref(), Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df"));
+        assert_eq!(profile.org_uuid.as_deref(), Some("09520b85-f6b6-432f-97e2-6ecb804a083f"));
+        assert_eq!(profile.subscription_created_at.as_deref(), Some("2026-04-15T13:03:55.239Z"));
+        assert_eq!(profile.rate_limit_tier.as_deref(), Some("default_claude_max_5x"));
+        assert_eq!(profile.org_type.as_deref(), Some("claude_team"));
+
+        let raw = server.join().unwrap();
+        let (line, names, values, body) = split_raw(&raw);
+        assert_eq!(line, "GET /api/oauth/profile HTTP/1.1");
+        assert_eq!(
+            names,
+            [
+                "Accept",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "Accept-Encoding",
+                "Host",
+                "Connection"
+            ],
+            "\n{raw}"
+        );
+        assert_eq!(values["authorization"], "Bearer TOKEN");
+        assert_eq!(values["content-type"], "application/json");
+        assert_eq!(values["user-agent"], "axios/1.15.2");
+        assert_eq!(values["accept"], config::AXIOS_ACCEPT);
+        assert_eq!(values["accept-encoding"], config::AXIOS_ACCEPT_ENCODING);
+        assert_eq!(values["connection"], "close");
+        assert!(body.is_empty());
+        for h in ["anthropic-beta", "anthropic-version"] {
+            assert!(!values.contains_key(h), "官方 profile 不带 {h}:\n{raw}");
+        }
     }
 }

@@ -3216,6 +3216,8 @@ fn telemetry_capture(
     billable: bool,
     organization_id: Option<String>,
 ) -> Option<crate::telemetry::Capture> {
+    // 组织 id 先拿凭证上 profile 存的那份垫底；响应头里的（`organization_id`）随后覆盖。
+    state.telemetry.seed_org_uuid(cred.id, cred.org_uuid.as_deref());
     (flags.api_telemetry && billable).then(|| crate::telemetry::Capture {
         sink: state.telemetry.clone(),
         account_uuid: cred.account_uuid.clone(),
@@ -11781,6 +11783,8 @@ mod tests {
             rpm_limit: 0,
             ban_reason: None,
             account_uuid: Some(ACCOUNT_UUID.into()),
+            org_uuid: None,
+            subscription_created_at: None,
             resume_at: None,
             proxy: None,
             created_at: 0,

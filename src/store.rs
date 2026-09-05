@@ -16,7 +16,7 @@ use crate::credentials::Credential;
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
-     rpm_limit, rate_limit_tier";
+     rpm_limit, rate_limit_tier, org_uuid, subscription_created_at";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -609,6 +609,13 @@ pub struct PortableCredential {
     pub ban_reason: Option<String>,
     #[serde(default)]
     pub account_uuid: Option<String>,
+    /// 组织 UUID 与订阅创建时刻原串，同 `rate_limit_tier` 的道理：不带上的话，迁移后到
+    /// 下一次成功拉 profile 之前，遥测 `auth.organization_uuid` 与 eval 的
+    /// `subscriptionCreatedAt` 会一直缺着。
+    #[serde(default)]
+    pub org_uuid: Option<String>,
+    #[serde(default)]
+    pub subscription_created_at: Option<String>,
     #[serde(default)]
     pub resume_at: Option<u64>,
     #[serde(default)]
@@ -631,6 +638,8 @@ impl From<&Credential> for PortableCredential {
             rpm_limit: c.rpm_limit,
             ban_reason: c.ban_reason.clone(),
             account_uuid: c.account_uuid.clone(),
+            org_uuid: c.org_uuid.clone(),
+            subscription_created_at: c.subscription_created_at.clone(),
             resume_at: c.resume_at,
             proxy: c.proxy.clone(),
         }
@@ -900,7 +909,7 @@ impl CredentialStore {
                          refresh_token = ?6, expires_at = ?7, priority = ?8, disabled = ?9,
                          device_limit = ?10, rpm_limit = ?11, ban_reason = ?12,
                          account_uuid = ?13, resume_at = ?14, proxy = ?15,
-                         rate_limit_tier = ?16,
+                         rate_limit_tier = ?16, org_uuid = ?17, subscription_created_at = ?18,
                          updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
@@ -920,6 +929,8 @@ impl CredentialStore {
                         c.resume_at.map(|t| t as i64),
                         proxy,
                         c.rate_limit_tier,
+                        c.org_uuid,
+                        c.subscription_created_at,
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -930,8 +941,10 @@ impl CredentialStore {
                     "INSERT INTO credentials
                          (label, tier, org_type, access_token, refresh_token, expires_at,
                           priority, disabled, device_limit, rpm_limit, ban_reason,
-                          account_uuid, resume_at, proxy, rate_limit_tier)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                          account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
+                          subscription_created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17)",
                     params![
                         c.label,
                         c.tier,
@@ -948,6 +961,8 @@ impl CredentialStore {
                         c.resume_at.map(|t| t as i64),
                         proxy,
                         c.rate_limit_tier,
+                        c.org_uuid,
+                        c.subscription_created_at,
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -1727,6 +1742,57 @@ impl CredentialStore {
     pub fn set_rate_limit_tier(&self, id: i64, raw: Option<&str>) -> Result<bool> {
         Ok(self.conn.lock().execute(
             "UPDATE credentials SET rate_limit_tier = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, raw],
+        )? > 0)
+    }
+
+    /// 把一份刚拉到的 profile 写回凭证：等级、账号 UUID、组织类型、额度档原值、组织 UUID、
+    /// 订阅创建时刻。**每一项只在 profile 给了值时才写**——profile 缺项不能把库里已有的清掉。
+    /// `fallback_org_uuid` 是 profile 没给组织 id 时的兜底（交换响应里那个），官方同一次序。
+    ///
+    /// 三条路共用：登录、手动刷新、**自动刷新**（[`ensure_fresh_token`]）。此前只有前两条写
+    /// profile 字段，自动刷新只换 token，于是「旧库刷新一次即回填」对绝大多数号——它们只会
+    /// 被自动刷新——根本不成立。
+    pub fn apply_profile(
+        &self,
+        id: i64,
+        profile: &crate::oauth::Profile,
+        fallback_org_uuid: Option<&str>,
+    ) -> Result<()> {
+        if profile.tier.is_some() {
+            self.set_tier(id, profile.tier.as_deref())?;
+        }
+        if let Some(uuid) = profile.account_uuid.as_deref() {
+            self.set_account_uuid(id, uuid)?;
+        }
+        if profile.org_type.is_some() {
+            self.set_org_type(id, profile.org_type.as_deref())?;
+        }
+        if profile.rate_limit_tier.is_some() {
+            self.set_rate_limit_tier(id, profile.rate_limit_tier.as_deref())?;
+        }
+        let org_uuid = profile.org_uuid.as_deref().or(fallback_org_uuid);
+        if org_uuid.is_some() {
+            self.set_org_uuid(id, org_uuid)?;
+        }
+        if profile.subscription_created_at.is_some() {
+            self.set_subscription_created_at(id, profile.subscription_created_at.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// 写回组织 UUID。见 [`crate::credentials::Credential::org_uuid`]。
+    pub fn set_org_uuid(&self, id: i64, org_uuid: Option<&str>) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE credentials SET org_uuid = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, org_uuid],
+        )? > 0)
+    }
+
+    /// 写回订阅创建时刻原串。见 [`crate::credentials::Credential::subscription_created_at`]。
+    pub fn set_subscription_created_at(&self, id: i64, raw: Option<&str>) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE credentials SET subscription_created_at = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, raw],
         )? > 0)
     }
@@ -2658,7 +2724,9 @@ pub const MIN_CLIENT_VERSION: &str = "min_client_version";
 /// [`crate::config::SCOPES`]（官方 Claude Code 那一整套）。
 ///
 /// 值是空格分隔的 scope 串本身，不是布尔。只在**新登录**时起作用：已存下来的凭证按当初授权
-/// 的范围来，改这一项不会追溯——要换范围就得把号重新登一次。刷新 token 不带 scope，故也不受影响。
+/// 的范围来，改这一项不会追溯——要换范围就得把号重新登一次。刷新 token 发的是固定的
+/// [`crate::config::REFRESH_SCOPES`]（官方那五项），与这一项无关；也因此选了精简 scope 的号
+/// 会在第一次刷新后被扩回五项，见那个常量的注释。
 ///
 /// 想少授权的一档现成值是 [`crate::config::SCOPES_MINIMAL`]，代价见那里的注释。
 pub const OAUTH_SCOPES: &str = "oauth_scopes";
@@ -4297,9 +4365,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_type TEXT", []);
-    // 额度档原值（profile.organization.rate_limit_tier）；statsig eval 的 `rateLimitTier`
-    // 要发它，界面上那个 `Max 5x` 是它的展示形态、顶替不了。旧库为空，下次拉 profile 回填。
-    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT", []);
     let _ = conn
         .execute("ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0", []);
     // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
@@ -4310,7 +4375,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     // 迁移：credentials.id 改为 AUTOINCREMENT。旧表（无 AUTOINCREMENT）删掉最大 id 的行后
     // 会回收复用该 id，令新账号错误继承被删账号的历史用量（usage_logs 按 cred_id 关联、
-    // 删号时不清理）。此处须在上面所有 ADD COLUMN 之后执行，确保重建时列已齐全。
+    // 删号时不清理）。此处须在上面那几条 ADD COLUMN 之后执行，确保重建时那些列已齐全；
+    // **重建之后加的列一律排在它后面**（重建按写死的列清单复制，清单外的列会被整列丢掉）。
     migrate_credentials_autoincrement(conn)?;
 
     // 被上游限流自动停用后、到点自动重新启用的时刻（unix 秒）；NULL = 不自动恢复。
@@ -4325,6 +4391,19 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // **同样必须补在重建之后**，理由见上面 resume_at 那条。
     let _ =
         conn.execute("ALTER TABLE credentials ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0", []);
+
+    // 额度档原值（profile.organization.rate_limit_tier）；statsig eval 的 `rateLimitTier`
+    // 要发它，界面上那个 `Max 5x` 是它的展示形态、顶替不了。旧库为空，下次刷新（自动或手动）回填。
+    // **必须补在重建之后**：这一行原先排在重建之前，而重建按写死的列清单复制，没有它——
+    // 一张旧的非 AUTOINCREMENT 库升上来，这一列就被整列丢掉，之后 `SELECT {COLS}` 直接
+    // `no such column: rate_limit_tier`，list/get 全挂。见 `migrates_and_stops_id_reuse`。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT", []);
+
+    // 组织 UUID 与订阅创建时刻（profile 的 `organization.uuid` / `organization.subscription_created_at`
+    // 原串）；遥测身份与 eval 属性用。旧库为空，下次刷新（自动或手动）回填。
+    // **同样必须补在重建之后**，理由见上面 resume_at 那条。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_uuid TEXT", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN subscription_created_at TEXT", []);
 
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
@@ -4460,30 +4539,27 @@ fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
     if ddl.contains("AUTOINCREMENT") {
         return Ok(());
     }
-    conn.execute_batch(
+
+    // 新表带**当前全部**列，复制的是「新表有、旧表也有」的那些。此前 DDL 与复制清单都是写死的
+    // 一份早期列表，凡是排在重建之前才 ADD 的列都会被整列丢掉（`rate_limit_tier` 就这样丢过，
+    // 见 `migrates_and_stops_id_reuse`）；改成按旧表实际有什么来复制，以后再加列也不会
+    // 掉进这个坑——只要把它写进 [`CREDENTIALS_FULL_DDL`]。
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('credentials')")?;
+    let old_cols: Vec<String> =
+        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let copy: Vec<&str> = CREDENTIALS_FULL_DDL
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| old_cols.iter().any(|c| c == name))
+        .collect();
+    let cols = copy.join(", ");
+    let defs: Vec<String> = CREDENTIALS_FULL_DDL.iter().map(|(n, d)| format!("{n} {d}")).collect();
+
+    conn.execute_batch(&format!(
         "BEGIN;
-         CREATE TABLE credentials_new (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            label         TEXT    NOT NULL DEFAULT '',
-            tier          TEXT,
-            org_type      TEXT,
-            access_token  TEXT    NOT NULL,
-            refresh_token TEXT    NOT NULL,
-            expires_at    INTEGER NOT NULL,
-            priority      INTEGER NOT NULL DEFAULT 0,
-            disabled      INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
-            created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
-            updated_at    INTEGER NOT NULL DEFAULT (unixepoch()),
-            device_limit  INTEGER NOT NULL DEFAULT 0,
-            ban_reason    TEXT,
-            account_uuid  TEXT
-         ) STRICT;
-         INSERT INTO credentials_new
-             (id, label, tier, access_token, refresh_token, expires_at, priority,
-              disabled, created_at, updated_at, device_limit, ban_reason, account_uuid)
-         SELECT id, label, tier, access_token, refresh_token, expires_at, priority,
-              disabled, created_at, updated_at, device_limit, ban_reason, account_uuid
-         FROM credentials;
+         CREATE TABLE credentials_new ({}) STRICT;
+         INSERT INTO credentials_new ({cols}) SELECT {cols} FROM credentials;
          DROP TABLE credentials;
          ALTER TABLE credentials_new RENAME TO credentials;
          CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_token
@@ -4491,10 +4567,39 @@ fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_credentials_priority
              ON credentials(priority, id);
          COMMIT;",
-    )
+        defs.join(",\n            ")
+    ))
     .context("failed to migrate credentials to AUTOINCREMENT")?;
     Ok(())
 }
+
+/// `credentials` 表**当前全部**列的定义，只给 [`migrate_credentials_autoincrement`] 重建用。
+///
+/// **加列要同步三处**：`init_schema` 里那条 ADD COLUMN、[`COLS`] / [`row_to_cred`]、以及这里。
+/// 漏了这里，一张旧的非 AUTOINCREMENT 库升级时那一列就会被整列丢掉；
+/// `migrates_and_stops_id_reuse` 用 [`COLS`] 逐列核对，漏了会红。
+const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
+    ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("label", "TEXT NOT NULL DEFAULT ''"),
+    ("tier", "TEXT"),
+    ("org_type", "TEXT"),
+    ("access_token", "TEXT NOT NULL"),
+    ("refresh_token", "TEXT NOT NULL"),
+    ("expires_at", "INTEGER NOT NULL"),
+    ("priority", "INTEGER NOT NULL DEFAULT 0"),
+    ("disabled", "INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1))"),
+    ("created_at", "INTEGER NOT NULL DEFAULT (unixepoch())"),
+    ("updated_at", "INTEGER NOT NULL DEFAULT (unixepoch())"),
+    ("device_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("ban_reason", "TEXT"),
+    ("account_uuid", "TEXT"),
+    ("resume_at", "INTEGER"),
+    ("proxy", "TEXT"),
+    ("rpm_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("rate_limit_tier", "TEXT"),
+    ("org_uuid", "TEXT"),
+    ("subscription_created_at", "TEXT"),
+];
 
 fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     Ok(Credential {
@@ -4516,6 +4621,8 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         proxy: row.get(15)?,
         rpm_limit: row.get(16)?,
         rate_limit_tier: row.get(17)?,
+        org_uuid: row.get(18)?,
+        subscription_created_at: row.get(19)?,
     })
 }
 
@@ -5018,6 +5125,25 @@ pub async fn ensure_fresh_token(
                 &tokens.refresh_token,
                 tokens.expires_at,
             )?;
+            // profile 字段还缺着的号（旧库、或登录时 profile 没拉到）顺手补一次。官方
+            // `refreshOAuthToken` 也是这样：手里已有完整资料就跳过，否则刷新后紧接着拉
+            // profile。只在缺项时拉，故每个号至多多一次往返；失败只记日志，不影响刷新结果。
+            if cred.profile_incomplete() {
+                match crate::oauth::fetch_profile(&http, &tokens.access_token).await {
+                    Ok(profile) => {
+                        if let Err(e) = store.apply_profile(
+                            cred.id,
+                            &profile,
+                            tokens.organization_uuid.as_deref(),
+                        ) {
+                            tracing::warn!(cred_id = cred.id, error = %e, "failed to backfill profile fields after refresh");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(cred_id = cred.id, error = %e, "fetching the profile after refresh failed, profile fields left as they were");
+                    }
+                }
+            }
             return Ok(TokenAttempt::Ready(tokens.access_token));
         }
         Err(e) => e,
@@ -5087,12 +5213,124 @@ mod tests {
         .unwrap();
         assert_eq!(conn.last_insert_rowid(), 4, "AUTOINCREMENT 不应复用被删的 id=3");
 
+        // **升级后的库必须能按完整列清单读**，而且要在**第一次** init_schema 之后就查——此前
+        // `rate_limit_tier` 那条 ADD COLUMN 排在重建之前，重建的复制清单里又没有它，于是旧库
+        // 升上来这一列整列消失，`SELECT {COLS}` 报 `no such column`。这个测试原先只数行数、
+        // 从不走 COLS，而且再跑一遍 init_schema 会把那列重新 ADD 回来（重启一次就「好了」），
+        // 所以查得晚了照样是绿的。
+        let store = CredentialStore::with_conn(conn);
+        let all = store.list().unwrap();
+        assert_eq!(all.len(), 3, "list 走的是完整列清单");
+        let one = store.get(4).unwrap().expect("迁移后插入的那行");
+        assert_eq!(one.access_token, "d");
+        assert!(one.rate_limit_tier.is_none() && one.org_uuid.is_none());
+        // 重建之后加的每一列都得真在表里，而不只是 ADD COLUMN 没报错。
+        let cols: Vec<String> = store
+            .conn
+            .lock()
+            .prepare("SELECT name FROM pragma_table_info('credentials')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for expected in COLS.split(',').map(str::trim) {
+            assert!(cols.iter().any(|c| c == expected), "升级后的表缺列 {expected}: {cols:?}");
+        }
+        let conn = store.conn.into_inner();
+
+        // 旧库里**已经有**排在重建之后才 ADD 的列、且有值（比如一份手工改过的库，或某个
+        // 中间版本留下的）：重建按「新表有、旧表也有」复制，值必须原样留下。
+        let conn2 = Connection::open_in_memory().unwrap();
+        conn2
+            .execute_batch(
+                "CREATE TABLE credentials (
+                    id INTEGER PRIMARY KEY,
+                    label TEXT NOT NULL DEFAULT '',
+                    tier TEXT,
+                    access_token TEXT NOT NULL,
+                    refresh_token TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    disabled INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    rate_limit_tier TEXT,
+                    proxy TEXT,
+                    org_uuid TEXT,
+                    legacy_only TEXT
+                );
+                INSERT INTO credentials (id, access_token, refresh_token, expires_at,
+                                         rate_limit_tier, proxy, org_uuid, legacy_only)
+                VALUES (7, 'a', 'ra', 0, 'default_claude_max_20x', 'socks5h://p:1080', 'org-7', 'x');",
+            )
+            .unwrap();
+        init_schema(&conn2).unwrap();
+        let store2 = CredentialStore::with_conn(conn2);
+        let c = store2.get(7).unwrap().expect("重建后行还在");
+        assert_eq!(
+            c.rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x"),
+            "重建前就有的值不能丢"
+        );
+        assert_eq!(c.proxy.as_deref(), Some("socks5h://p:1080"));
+        assert_eq!(c.org_uuid.as_deref(), Some("org-7"));
+        assert!(c.subscription_created_at.is_none(), "旧表没有的列补出来是空");
+        let store = CredentialStore::with_conn(conn);
+        let conn = store.conn.into_inner();
+
         // 迁移后再次 init_schema 必须是无副作用的 no-op（RENAME 后 DDL 仍含 AUTOINCREMENT，
         // 不应二次重建而丢数据）。
         init_schema(&conn).unwrap();
         let after: i64 =
             conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0)).unwrap();
         assert_eq!(after, 3, "二次 init_schema 不应改动数据");
+    }
+
+    /// `apply_profile` 是登录 / 手动刷新 / 自动刷新三条路共用的写回：只写 profile 给了的项，
+    /// 缺项不清库里已有的值；组织 id 退回交换响应里的兜底。`profile_incomplete` 决定自动刷新
+    /// 要不要顺手拉一次 profile——四列齐了就不再拉。
+    #[test]
+    fn apply_profile_backfills_only_what_the_profile_gives() {
+        let (store, ids) = store_with(&["a"]);
+        let id = ids[0];
+        assert!(store.get(id).unwrap().unwrap().profile_incomplete(), "刚建的号 profile 列全空");
+
+        let partial = crate::oauth::Profile {
+            tier: Some("Max 5x".into()),
+            account_uuid: Some("acct".into()),
+            rate_limit_tier: Some("default_claude_max_5x".into()),
+            ..Default::default()
+        };
+        store.apply_profile(id, &partial, Some("org-from-token")).unwrap();
+        let c = store.get(id).unwrap().unwrap();
+        assert_eq!(c.tier.as_deref(), Some("Max 5x"));
+        assert_eq!(c.account_uuid.as_deref(), Some("acct"));
+        assert_eq!(c.rate_limit_tier.as_deref(), Some("default_claude_max_5x"));
+        assert_eq!(
+            c.org_uuid.as_deref(),
+            Some("org-from-token"),
+            "profile 没给组织 id 就用交换响应的"
+        );
+        assert!(c.subscription_created_at.is_none());
+        assert!(c.profile_incomplete(), "订阅创建时刻还缺着，下次刷新还要拉");
+
+        let full = crate::oauth::Profile {
+            org_uuid: Some("org-from-profile".into()),
+            subscription_created_at: Some("2026-04-15T13:03:55.239Z".into()),
+            ..Default::default()
+        };
+        store.apply_profile(id, &full, Some("org-from-token")).unwrap();
+        let c = store.get(id).unwrap().unwrap();
+        assert_eq!(
+            c.org_uuid.as_deref(),
+            Some("org-from-profile"),
+            "profile 给了就以 profile 为准"
+        );
+        assert_eq!(c.subscription_created_at.as_deref(), Some("2026-04-15T13:03:55.239Z"));
+        assert_eq!(c.tier.as_deref(), Some("Max 5x"), "这次 profile 没给的项不能被清掉");
+        assert_eq!(c.account_uuid.as_deref(), Some("acct"));
+        assert!(!c.profile_incomplete(), "四列齐了就不再拉");
     }
 
     /// 开机清扫：被删账号遗留的用量日志/设备绑定被清掉，在册账号与无主(NULL)日志保留。
@@ -5928,6 +6166,8 @@ mod tests {
             rpm_limit: 7,
             ban_reason: None,
             account_uuid: Some("uuid-1".into()),
+            org_uuid: None,
+            subscription_created_at: None,
             resume_at: None,
             proxy: None,
         };
@@ -6013,6 +6253,8 @@ mod tests {
             rpm_limit: -1,
             ban_reason: Some("banned upstream".into()),
             account_uuid: Some("uuid".into()),
+            org_uuid: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
+            subscription_created_at: Some("2026-04-15T13:03:55.239Z".into()),
             resume_at: Some(1_900_000_000),
             proxy: Some("socks5://127.0.0.1:1080".into()),
         };
@@ -6038,6 +6280,9 @@ mod tests {
         assert_eq!(back.rpm_limit, full.rpm_limit);
         assert_eq!(back.ban_reason, full.ban_reason);
         assert_eq!(back.account_uuid, full.account_uuid);
+        // 组织 id 与订阅创建时刻同理：迁移后不该等到下一次刷新才有。
+        assert_eq!(back.org_uuid, full.org_uuid);
+        assert_eq!(back.subscription_created_at, full.subscription_created_at);
         assert_eq!(back.resume_at, full.resume_at);
         // 代理串在读出来时会归一化（socks5 → socks5h），两侧同样处理过，故比的是归一化后的值。
         assert_eq!(back.proxy, out.proxy);

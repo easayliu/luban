@@ -232,8 +232,9 @@ pub struct Identity {
     /// sha256 hex，64 位。
     pub device_id: String,
     pub account_uuid: String,
-    /// `/v1/messages` 响应头 `anthropic-organization-id`；一次都还没见过时为 `None`，
-    /// 此时 `auth` 块只带 `account_uuid`。
+    /// 组织 id：`/v1/messages` 响应头 `anthropic-organization-id` 学到的优先，没有就用凭证上
+    /// 从 profile 存下来的 `org_uuid`（见 [`Telemetry::seed_org_uuid`]）；两处都没有才为
+    /// `None`，此时 `auth` 块只带 `account_uuid`。
     pub organization_uuid: Option<String>,
     pub subscription_type: String,
     /// 客户端版本（`2.1.258`），与出站 UA 一致。
@@ -1620,6 +1621,16 @@ impl Telemetry {
     /// 某凭证最近一次响应头里的 `anthropic-organization-id`（保活事件的 `auth` 块用）。
     pub fn org_uuid(&self, cred_id: i64) -> Option<String> {
         self.0.state.lock().org_uuid.get(&cred_id).cloned()
+    }
+
+    /// 用凭证上存的组织 id（profile 的 `organization.uuid`）**垫底**：还没从响应头学到时先用它，
+    /// 学到了以响应头为准（那是同一个值，只是更新鲜）。转发路径在建遥测材料时调一次。
+    ///
+    /// 没有这一步，一张刚登录、或久没转发过请求的号发出去的头几条事件 `auth` 块里就没有
+    /// `organization_uuid`——官方 345/345 条都带。
+    pub fn seed_org_uuid(&self, cred_id: i64, org_uuid: Option<&str>) {
+        let Some(org) = org_uuid.map(str::trim).filter(|o| !o.is_empty()) else { return };
+        self.0.state.lock().org_uuid.entry(cred_id).or_insert_with(|| org.to_string());
     }
 
     /// 某凭证最近活跃的真实会话（`max_idle` 内有过请求的那些里最新的一个）；没有则 `None`。

@@ -616,11 +616,13 @@ async fn exchange(
         )
         .map_err(internal)?;
 
-    // 额度档原值不在 `insert` 的参数里（那串已经够长了），入库后单独写一次。
-    if profile.rate_limit_tier.is_some()
-        && let Err(e) = state.store.set_rate_limit_tier(cred.id, profile.rate_limit_tier.as_deref())
+    // 额度档原值、组织 UUID、订阅创建时刻不在 `insert` 的参数里（那串已经够长了），入库后
+    // 走与刷新同一份 `apply_profile` 写；profile 拉不到时组织 id 退回交换响应里那个
+    // （官方也是这个兜底次序：profile → tokenAccount）。
+    if let Err(e) =
+        state.store.apply_profile(cred.id, &profile, tokens.organization_uuid.as_deref())
     {
-        tracing::warn!(cred_id = cred.id, error = %e, "failed to store the rate limit tier");
+        tracing::warn!(cred_id = cred.id, error = %e, "failed to store the profile fields");
     }
 
     // 登录时带了代理的，入库后顺手存上——后续刷新、转发自动走它，不用再手动配一次。
@@ -1119,36 +1121,19 @@ async fn refresh_credential(
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
         .map_err(internal)?;
-    // 顺带刷新账号等级、回填账号 UUID（失败忽略，不影响 token 刷新结果）。忽略归忽略，
-    // 三处失败都留一行——否则「刷新成功了但等级还是旧的」在日志里毫无痕迹。
+    // 顺带把 profile 那几列写回（等级、账号 UUID、组织类型、额度档、组织 UUID、订阅创建时刻）：
+    // 旧库里的号是在这些列存在之前加的，只有刷新才补得上。失败忽略、不影响 token 刷新结果，
+    // 但要留一行——否则「刷新成功了但等级还是旧的」在日志里毫无痕迹。
     match oauth::fetch_profile(&http, &tokens.access_token).await {
         Ok(profile) => {
-            if profile.tier.is_some()
-                && let Err(e) = state.store.set_tier(id, profile.tier.as_deref())
+            if let Err(e) =
+                state.store.apply_profile(id, &profile, tokens.organization_uuid.as_deref())
             {
-                tracing::warn!(cred_id = id, error = %e, "failed to write back the account tier (the refresh itself succeeded)");
-            }
-            if let Some(uuid) = profile.account_uuid.as_deref()
-                && let Err(e) = state.store.set_account_uuid(id, uuid)
-            {
-                tracing::warn!(cred_id = id, error = %e, "failed to backfill the account uuid (the refresh itself succeeded)");
-            }
-            // 组织类型同样回填：旧库里的号是在这一列存在之前加的，只有刷新一次才补得上。
-            if profile.org_type.is_some()
-                && let Err(e) = state.store.set_org_type(id, profile.org_type.as_deref())
-            {
-                tracing::warn!(cred_id = id, error = %e, "failed to write back the organization type (the refresh itself succeeded)");
-            }
-            // 额度档原值：statsig eval 的 `rateLimitTier` 要它，同样只有刷新才补得上。
-            if profile.rate_limit_tier.is_some()
-                && let Err(e) =
-                    state.store.set_rate_limit_tier(id, profile.rate_limit_tier.as_deref())
-            {
-                tracing::warn!(cred_id = id, error = %e, "failed to write back the rate limit tier (the refresh itself succeeded)");
+                tracing::warn!(cred_id = id, error = %e, "failed to write back the profile fields (the refresh itself succeeded)");
             }
         }
         Err(e) => {
-            tracing::warn!(cred_id = id, error = %e, "fetching the profile after refresh failed, tier and uuid left unchanged");
+            tracing::warn!(cred_id = id, error = %e, "fetching the profile after refresh failed, profile fields left unchanged");
         }
     }
     view_of(&state, id)
@@ -2314,7 +2299,9 @@ struct SetOAuthScopesReq {
 
 /// 设置登录时申请的 OAuth scope。
 ///
-/// 只影响之后新加的账号：已存下来的凭证按当初授权的范围来，刷新也不带 scope。
+/// 只影响之后新加的账号：已存下来的凭证按当初授权的范围来。刷新发的是固定的
+/// [`crate::config::REFRESH_SCOPES`]（官方那五项），不读这一项——所以选了精简 scope 的号
+/// 会在第一次刷新后被扩回五项。
 ///
 /// **不校验**，写什么存什么、原样发给上游（只做空白规整与去重，见
 /// [`crate::config::normalize_scopes`]）。这个框存在的意义就是拿来试上游认哪些 scope，

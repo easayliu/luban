@@ -228,6 +228,8 @@ mod tests {
             rpm_limit: 0,
             ban_reason: None,
             account_uuid: None,
+            org_uuid: None,
+            subscription_created_at: None,
             resume_at: None,
             proxy: proxy.map(str::to_string),
             created_at: 0,
