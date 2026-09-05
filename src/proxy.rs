@@ -211,7 +211,8 @@ async fn handle_inner(
     //
     //      头上没有这个值时不在这里判，等 body 解析出会话 id 再补判（见 2.2b）；两处互斥，
     //      同一条请求只会吃一个名额。官方客户端头体两处逐字相同，故先后两路落在同一个桶里。
-    let session_from_header = incoming_session_id(&headers);
+    // 体还没解析，只看头；体里那个由 2.2b 补判。
+    let session_from_header = incoming_session_id(&headers, None);
     if let Some(sid) = session_from_header.as_deref()
         && let Some(retry) = state.store.take_session_rpm_slot(sid)
     {
@@ -432,6 +433,30 @@ async fn handle_inner(
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", marker.message());
     }
 
+    // 2.3a2) 会话 id 头体不一致 → 本地直接拒，见 [`session_id_conflict`]。
+    //        官方那两处逐字相同；两个都合法却不同的 uuid，luban 没有任何依据挑一个，而它
+    //        正是会话链（`cc_prompt_id` / `cc_prev_req` / `diagnostics`）的键——挑错就是把
+    //        两条链接到一起，事后再也看不出来。默认拒（`reject_session_conflict`）；关掉后
+    //        退回「取头那个 + 打一条 warn」。
+    if state.store.forward_flags().reject_session_conflict
+        && let Some((header, body)) = session_id_conflict(&headers, body_json.as_ref())
+    {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            header = %header, body = %body,
+            "rejected locally: the session id differs between X-Claude-Code-Session-Id and metadata.user_id"
+        );
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "session id mismatch: X-Claude-Code-Session-Id is {header} but \
+                 metadata.user_id carries {body}; send the same value in both \
+                 (disable reject_session_conflict to fall back to the header)"
+            ),
+        );
+    }
+
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
     //       策略由 `sampling_policy` 控制：strip（默认）= 剥掉后转发，reject = 本地 400，
     //       off = 不做静态预置处理（运行时学习仍兜底）。
@@ -602,8 +627,17 @@ async fn handle_inner(
     //
     // 要求 body 能解析：解析不出来的话 [`rewrite_body`] 那边同样会原样返回，`stream` 根本
     // 改不成 true，此时若还按聚合走，就会拿一份非 SSE 的响应去喂聚合器。两处的判据必须同源。
+    //
+    // **官方本来就非流式的那两类不改**（安全分类、额度探测，见
+    // [`CcRequestKind::keeps_nonstream`]）：这个开关的本意是「官方恒为流式，非流式请求
+    // 一看就不是 CC」，对它们恰好相反——改成流式才是官方不产生的形态。
+    let cc_kind = body_json
+        .as_ref()
+        .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
+        .unwrap_or(CcRequestKind::Main);
     let upgrade_stream = billable
         && flags.nonstream_as_sse
+        && !cc_kind.keeps_nonstream()
         && body_json.as_ref().is_some_and(|v| !stream_requested(v));
     // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
     // 两侧共用同一份。见 [`ToolNameMap`]。
@@ -649,7 +683,19 @@ async fn handle_inner(
     // 一条 `break` 之前都必经那次赋值。循环之后它会被交给 `ReqLog` 拿着，活到响应流结束。
     let mut route_load: UpstreamRouteGuard;
     let (upstream, resp, sent) = loop {
-        let sim = Simulation::detect(body_json.as_ref(), from_cc_client, flags, &cred, &device_fp);
+        let sim = Simulation::detect(
+            body_json.as_ref(),
+            &headers,
+            from_cc_client,
+            flags,
+            &cred,
+            &device_fp,
+        );
+        // 真实 CC（API-key 模式）来访的会话关联字段：它自己那条 billing header 里没有
+        // `cc_prompt_id`/`cc_prev_req`，整条也没有 `diagnostics`，而订阅端官方每条主线程
+        // 请求都有。见 [`client_session_link`]。
+        let client_link =
+            client_session_link(body_json.as_ref(), &headers, sim.as_ref(), flags, billable, &cred);
         // CC 形态的来访不走模拟，但它若不带 metadata.user_id，那份身份仍然是缺的。
         let bare_session = bare_session_id(
             &headers,
@@ -698,12 +744,18 @@ async fn handle_inner(
                 "identity path: PASSTHROUGH — neither simulating nor filling identity"
             ),
         }
+        // 出站两处要落的同一个会话 id。模拟路径不参与：那条整套头由 [`official_headers`]
+        // 给出、体也重建过，两处都取 `sim.session_id`。见 [`outbound_session_id`]。
+        let session_out = match sim {
+            Some(_) => None,
+            None => outbound_session_id(&headers, body_json.as_ref(), bare_session.as_deref()),
+        };
         let out = build_forward_headers_for(
             &headers,
             &token,
             flags,
             sim.as_ref(),
-            bare_session.as_deref(),
+            session_out.as_deref(),
             req_model.as_deref(),
         );
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
@@ -747,12 +799,51 @@ async fn handle_inner(
             billable,
             sim,
             bare_session,
+            session_out,
             force_stream: upgrade_stream,
             tool_names: tool_names.clone(),
+            client_link,
+            cc_kind,
         };
         // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
         // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
         let sent = upstream.shape(&body, &cred, &device_fp);
+        // 新会话的启动握手：**在这条主请求发出之前**开跑（`cap/2.1.260-2` 的时序是
+        // 17:10:17 policy_limits …→ 17:10:19.699 第一条 messages）。原先它排在遥测里，等回程
+        // 之后再由 5s 一跳的发送循环取走——顺序整个反了。
+        //
+        // **不再只给模拟路径发。** 原先的理由是「真实 CC 自己会打这一串」，那是错的：
+        // 要对齐形态的是**luban 这张凭证**在上游眼里的样子，而客户端自己那串（如果它真的
+        // 登录过）走的是**它自己的账号**，luban 这张凭证一条都收不到。`cap/2.1.258-api`
+        // 正好证到这一点——那台机器的 bootstrap/penguin 带的是它自己的
+        // `sk-ant-oat01-…`，与经 luban 转发的 `/v1/messages` 完全是两个账号；而经 luban
+        // 那一侧压根没有 policy_limits / settings / eval / mcp_servers / code_triggers /
+        // metrics / 额度探测。于是「一个只发 messages、从不拉策略配置的 OAuth 账号」本身
+        // 就是判据。
+        //
+        // 唯一会重复的情形是「客户端登录的正是 luban 代理的那个账号」（自代理），
+        // 那种部署本来就不该存在。
+        if billable
+            && flags.api_telemetry
+            && let Some(start) = session_start(
+                upstream.sim.as_ref(),
+                upstream.client_link.as_ref(),
+                &cc_cli_version(&client_ua)
+                    .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                    .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),
+            )
+        {
+            spawn_session_handshake(
+                &state,
+                &cred,
+                &token,
+                &sent,
+                start,
+                &upstream.headers,
+                req_model.as_deref(),
+            )
+            .await;
+        }
         // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
         // [`note_upstream_send`]。纯记录，不影响这条请求走向。
         route_load = note_upstream_send(
@@ -784,10 +875,30 @@ async fn handle_inner(
             let up = resp.unwrap();
             let builder = resp_builder(&up);
             let up_request_id = header_opt(up.headers(), "request-id");
+            // `up.bytes()` 下面就把 `up` 吃掉了，要用的响应头在这儿一次取齐。
+            let up_org_id = header_opt(up.headers(), "anthropic-organization-id");
             let bytes = match up.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to read the upstream 401 body");
+                    // 同下面那条：这条路早退，`ReqLog` 建不起来，失败遥测就地补。
+                    record_early_failure(
+                        &state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        started,
+                        flags,
+                        billable,
+                        up_request_id.as_deref(),
+                        up_org_id,
+                        crate::telemetry::CallFailure {
+                            status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                            error_type: None,
+                            message: String::new(),
+                            in_band: false,
+                        },
+                    );
                     return builder.body(Body::empty()).unwrap_or_else(|e| {
                         error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                     });
@@ -802,6 +913,26 @@ async fn handle_inner(
                     upstream_message = %message.chars().take(500).collect::<String>(),
                     "upstream returned 401"
                 );
+                // **在分叉之前记一次**：底下三条出路（换号 continue / 回 403 / 原样透传）
+                // 全都绕开了 `ReqLog::drop`。记在这里，一条 401 恰好报一次，且报在**吃到
+                // 这发 401 的那个号**上——换号之后的那一发由新号自己的 `ReqLog` 报。
+                record_early_failure(
+                    &state,
+                    &cred,
+                    &upstream,
+                    &sent,
+                    started,
+                    flags,
+                    billable,
+                    up_request_id.as_deref(),
+                    up_org_id,
+                    crate::telemetry::CallFailure {
+                        status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+                        error_type: etype,
+                        message,
+                        in_band: false,
+                    },
+                );
             }
             if let Some(reason) = detect_account_ban(StatusCode::UNAUTHORIZED, &bytes) {
                 tracing::warn!(
@@ -814,7 +945,7 @@ async fn handle_inner(
                     "forward_401",
                     StatusCode::UNAUTHORIZED,
                     &bytes,
-                    &request_id,
+                    request_id,
                     up_request_id.as_deref(),
                 );
                 let _ = state.store.record_ban(cred.id, &ctx);
@@ -1143,21 +1274,25 @@ async fn handle_inner(
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
                 forensics: capture_forensics(&upstream, &sent, &cred),
-                // 只给计费路径上的 2xx 备料：其余路径 Drop 时也不会报，早点省掉那份 body 的引用。
-                telemetry: (flags.api_telemetry && billable && status.is_success()).then(|| {
-                    crate::telemetry::Capture {
-                        sink: state.telemetry.clone(),
-                        account_uuid: cred.account_uuid.clone(),
-                        org_type: cred.org_type.clone(),
-                        body: sent.clone(),
-                        betas: header_opt(&upstream.headers, "anthropic-beta"),
-                        session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
-                        organization_id: header_opt(up.headers(), "anthropic-organization-id"),
-                        started_at: std::time::SystemTime::now()
-                            .checked_sub(started.elapsed())
-                            .unwrap_or_else(std::time::SystemTime::now),
-                    }
-                }),
+                // 只给计费路径备料：**含非 2xx**——失败的请求要报 `tengu_api_error`
+                // （官方客户端对失败请求发的正是它），报不报由 Drop 里再判。
+                telemetry: telemetry_capture(
+                    &state,
+                    &cred,
+                    &upstream,
+                    &sent,
+                    started,
+                    flags,
+                    billable,
+                    header_opt(up.headers(), "anthropic-organization-id"),
+                ),
+                // 两条路都要把回程记回去：模拟那条的会话 id 在 `sim` 里，真实 CC 那条在
+                // `client_link` 里（键是客户端自己的会话 id）。
+                cc_session: upstream
+                    .sim
+                    .as_ref()
+                    .map(|s| s.session_id.clone())
+                    .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone())),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,
@@ -1258,7 +1393,7 @@ async fn handle_inner(
                         "forward",
                         status,
                         &err_bytes,
-                        &request_id,
+                        request_id,
                         rl.upstream_request_id.as_deref(),
                     );
                     if let Err(e) = state.store.record_ban(cred.id, &ctx) {
@@ -1416,6 +1551,27 @@ async fn handle_inner(
                 error = %detail,
                 "upstream request failed"
             );
+            // 这条路上 `ReqLog` 压根没建起来（那要有响应才行），失败遥测得就地补。
+            // 官方客户端对连接层失败同样发 `tengu_api_error`，`errorType` 是
+            // `connection_error`——SDK 那边这类没有状态码，见 [`crate::telemetry::error_kind`]。
+            record_early_failure(
+                &state,
+                &cred,
+                &upstream,
+                &sent,
+                started,
+                flags,
+                billable,
+                None,
+                // 请求压根没发出去，没有响应头可取组织 id；遥测那边按凭证缓存的那份还在。
+                None,
+                crate::telemetry::CallFailure {
+                    status: None,
+                    error_type: None,
+                    message: detail.clone(),
+                    in_band: false,
+                },
+            );
             error_response(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -1457,12 +1613,22 @@ struct Upstream<'a> {
     /// 只会让它们对不上，那比两处都缺更显眼；没带才派生，并由 [`build_forward_headers`]
     /// 把同一个值补进头里。
     bare_session: Option<String>,
+    /// 这条请求出站时两处（`X-Claude-Code-Session-Id` 头与 `metadata.user_id`）都要落的
+    /// **同一个**会话 id；模拟路径为 `None`（那条的在 [`Simulation::session_id`]）。
+    /// 取值与理由见 [`outbound_session_id`]。
+    session_out: Option<String>,
     /// 来访是非流式、要改写成 `stream:true` 发出（回程再聚合成整段 JSON）。
     /// 见 [`store::ForwardFlags::nonstream_as_sse`]。
     force_stream: bool,
     /// 工具名混淆映射；`None` 即没有要混淆的工具（真 CC／全在白名单里／`tools` 为空），
     /// 此时请求与回程两侧都零开销。见 [`ToolNameMap`]。
     tool_names: Option<std::sync::Arc<ToolNameMap>>,
+    /// **真实 CC 来访**（非模拟）要补的会话关联字段：`(会话 id, 链)`。
+    /// 判据与取值见 [`client_session_link`]；模拟那条路的链在 [`Simulation::link`] 里。
+    client_link: Option<(String, CcSessionLink)>,
+    /// 这条来访属于哪一类官方 profile。除了会话链，它还管住「别把官方非流式请求改成
+    /// 流式」与「别给额度探测补 system」两条，见 [`CcRequestKind`]。
+    cc_kind: CcRequestKind,
 }
 
 impl Upstream<'_> {
@@ -1485,6 +1651,14 @@ impl Upstream<'_> {
                 self.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).is_some_and(|s| {
                     s.split(',').any(|b| b.trim() == config::CC_BETA_THINKING_DISPLAY_UPDATES)
                 });
+            // 给真实 CC 补 billing header 时写的是**它自报的**版本，不是 luban 自己那个：
+            // 见 [`billing_header_text`]。模拟路径不看这个值（那条路的版本在 profile 里）。
+            let client_version = self
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .and_then(cc_cli_version)
+                .map(|(a, b, c)| format!("{a}.{b}.{c}"));
             rewrite_body(
                 body,
                 cred,
@@ -1492,9 +1666,13 @@ impl Upstream<'_> {
                 self.flags,
                 self.sim.as_ref(),
                 self.bare_session.as_deref(),
+                self.session_out.as_deref(),
                 self.force_stream,
                 self.tool_names.as_deref(),
                 display_beta,
+                client_version.as_deref(),
+                self.client_link.as_ref().map(|(_, l)| l),
+                self.cc_kind,
             )
         } else {
             body.clone()
@@ -2005,7 +2183,9 @@ async fn retry_demoted_thinking(
         "upstream rejected a thinking-block signature (the history was most likely signed by another credential): demoted historical thinking to text, retrying once with the same credential"
     );
 
-    let up = match upstream.send(upstream.shape(&demoted, cred, device_fp)).await {
+    // 实际发出去的那份留一手：重试成了的话，请求日志与遥测的请求侧都要换成它。
+    let retried = upstream.shape(&demoted, cred, device_fp);
+    let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,
         Err(e) => {
             tracing::warn!(error = %error_chain(&e), "the retry after demoting thinking could not be sent, passing the original 400 through");
@@ -2032,7 +2212,7 @@ async fn retry_demoted_thinking(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry("demoted_thinking", up.headers());
+    rl.note_retry("demoted_thinking", up.headers(), &retried);
     Some(up)
 }
 
@@ -2152,7 +2332,9 @@ async fn retry_without_prefill(
         "upstream says this model does not support assistant message prefill: stripped trailing assistant message(s), retrying once"
     );
 
-    let up = match upstream.send(upstream.shape(&stripped, cred, device_fp)).await {
+    // 同 [`retry_demoted_thinking`]：留下实际发出去的那份。
+    let retried = upstream.shape(&stripped, cred, device_fp);
+    let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,
         Err(e) => {
             tracing::warn!(
@@ -2178,7 +2360,7 @@ async fn retry_without_prefill(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry("no_prefill", up.headers());
+    rl.note_retry("no_prefill", up.headers(), &retried);
     Some(up)
 }
 
@@ -2653,6 +2835,13 @@ struct ReqLog {
     /// 不上报（开关关着、非计费路径、非 2xx）。响应侧的量在 Drop 时从 `sniffer` 取，
     /// 一起交给 [`crate::telemetry::Telemetry::record`]。
     telemetry: Option<crate::telemetry::Capture>,
+    /// 走模拟路径时这条请求用的会话 id；收尾时把本次的上游 `request-id` 与回复
+    /// `message.id` 记回该会话，供**下一条**请求写 `cc_prev_req` 与
+    /// `diagnostics.previous_message_id`，见 [`CcSessionLink::record`]。
+    ///
+    /// 非模拟路径为 `None`：真实 CC 来访自己维护这条链，luban 不该替它记，更不该拿自己
+    /// 记的那份去覆盖。
+    cc_session: Option<String>,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
@@ -2666,7 +2855,12 @@ impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
         // 下面两个分支会把 `stream_broke` take 掉；遥测那一步要知道这条有没有断，先记下。
-        let stream_broke = self.stream_broke.is_some();
+        let stream_broke = self.stream_broke.clone();
+        // 流内错误（`event: error` 裹在 200 里）：客户端拿到的是 200 + 错误负载，SDK 那头
+        // 没有状态码，遥测要按 `in_band_<type>` 报，见 [`crate::telemetry::CallFailure`]。
+        // 400/401/403 那条路也会把错误体喂给嗅探器，故这里以「改写前是不是 200」为判据。
+        let in_band_error =
+            self.sniffer.stream_error.is_some() && self.status == StatusCode::OK.as_u16();
         // 透传流路径的两类「200 里的失败」在此收口。响应头早发出去了，客户端拿到的
         // 状态码改不动（也不该改，行为保持原样），但**记账用的** status 必须反映真实结果：
         // 照搬 200 会让失败从成功率里凭空消失，正是 `aggregate_sse` 那条路早就避开的坑。
@@ -2811,17 +3005,58 @@ impl Drop for ReqLog {
         };
         spawn_usage_log(self.store.clone(), rec);
 
-        // 官方客户端只对**成功拿到用量**的请求发 `tengu_api_success`（失败另有 `tengu_api_error`，
-        // 这里暂不模拟）：中途断流、上游报错、没有 usage 的一律不报。
-        // 流式还要看见 `message_stop`：半截流的 `message_start` 也带 usage，但客户端那边这条
-        // 是失败的，不会有 success 事件。聚合路径（[`aggregate_sse`]）另有完整性检查，放行。
+        // 模拟路径的会话链条：把这一条的上游 request-id 与回复 message.id 记回去，
+        // 同会话的下一条据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。
+        // 失败的那些照记 request-id——官方那条链上并不跳过报错的请求。
+        if let Some(sid) = &self.cc_session {
+            CcSessionLink::record(
+                CcSessionKey { cred_id: self.cred_id, session_id: sid },
+                self.upstream_request_id.as_deref(),
+                self.sniffer.message_id.as_deref(),
+            );
+        }
+
+        // 官方客户端只对**成功拿到用量**的请求发 `tengu_api_success`：中途断流、上游报错、
+        // 没有 usage 的一律不报。流式还要看见 `message_stop`：半截流的 `message_start` 也带
+        // usage，但客户端那边这条是失败的，不会有 success 事件。聚合路径
+        // （[`aggregate_sse`]）另有完整性检查，放行。
         let stream_complete =
             !self.sniffer.is_stream || self.sniffer.saw_message_stop || self.sse_aggregated;
-        if let Some(cap) = self.telemetry.take()
-            && self.status == StatusCode::OK.as_u16()
+        let ok = self.status == StatusCode::OK.as_u16()
             && has_usage
-            && !stream_broke
-            && stream_complete
+            && stream_broke.is_none()
+            && stream_complete;
+        // 失败的那些走 `tengu_api_error`。三类里只报**能确定是上游拒了**的两类：
+        //
+        // - 非 2xx（含流内 `event: error` 改写出来的那个状态码）；
+        // - 上游传输层把流掐了（`stream_broke`，有明确的错误描述）。
+        //
+        // 「没报错、没断连，就是没等到 `message_stop`」那一类不报：这一层分不清是上游 EOF
+        // 还是客户端自己走了（用户按 Ctrl-C 也长这样），替一次用户取消编一条上游错误，
+        // 比不报更糟。同理 200 + 有 usage 但流不完整的也不报。
+        let bad_status = self.status < 200 || self.status >= 300;
+        let failure = (!ok && (bad_status || stream_broke.is_some())).then(|| {
+            let (etype, message) = match (&self.forensics.error_type, &self.forensics.error_message)
+            {
+                (t, Some(m)) => (t.clone(), m.clone()),
+                _ => match &self.sniffer.body_error {
+                    Some((t, m)) => (t.clone(), m.clone()),
+                    None => (None, String::new()),
+                },
+            };
+            crate::telemetry::CallFailure {
+                status: (!in_band_error && bad_status).then_some(self.status),
+                error_type: etype,
+                message: if message.is_empty() {
+                    stream_broke.clone().unwrap_or_default()
+                } else {
+                    message
+                },
+                in_band: in_band_error,
+            }
+        });
+        if let Some(cap) = self.telemetry.take()
+            && (ok || failure.is_some())
         {
             let sink = cap.sink.clone();
             sink.record(crate::telemetry::ApiCall {
@@ -2837,6 +3072,7 @@ impl Drop for ReqLog {
                 ttft_ms: self.ttft_ms.map(|v| v as u64),
                 total_ms: total_ms as u64,
                 request_id: self.upstream_request_id.clone(),
+                client_request_id: cap.client_request_id,
                 message_id: self.sniffer.message_id.clone(),
                 stop_reason: self.sniffer.stop_reason.clone(),
                 resp_model: self.sniffer.model.clone(),
@@ -2846,18 +3082,30 @@ impl Drop for ReqLog {
                 cache_creation_tokens: self.sniffer.cache_creation_tokens.unwrap_or(0),
                 text_chars: self.sniffer.text_chars,
                 thinking_chars: self.sniffer.thinking_chars,
+                saw_thinking: self.sniffer.saw_thinking,
+                tool_use_lens: self.sniffer.tool_use_lens(),
                 cost_usd,
                 speed,
+                failure,
             });
         }
     }
 }
 
 impl ReqLog {
-    /// 记一次 luban 侧的改写重试：追加标签，并把上游 request-id 换成重试那一发的。
+    /// 记一次 luban 侧的改写重试：追加标签，把上游 request-id 换成重试那一发的，并把
+    /// **请求侧**那些由 body 算出来的东西一并换成重试实际发出去的那份。
+    ///
     /// 重试成功后这条流水按重试那次记账（见 [`retry_demoted_thinking`]），标签是唯一能看出
     /// 「中间还发过一发被拒的」的地方。
-    fn note_retry(&mut self, tag: &str, headers: &HeaderMap) {
+    ///
+    /// `sent` 不能省。响应侧（状态码、用量、model、stop_reason、限流）调用方已经换成重试
+    /// 那一发了，请求侧却还挂着首发那份 body——于是遥测里 `messageCount` /
+    /// `inputTextCharLength` / `toolsCount` / 「是不是新输入」全都算的是**一条被上游拒了的
+    /// 请求**，而同一条事件里的 requestId 与 token 来自另一条。prefill 那条尤其明显：
+    /// [`strip_assistant_prefill`] 直接弹掉末尾的 assistant 轮，`messageCount` 是真的变了。
+    /// 取证的 `shape` 列同理——它要回答的是「发出去的到底长什么样」。
+    fn note_retry(&mut self, tag: &str, headers: &HeaderMap, sent: &Bytes) {
         let tags = self.forensics.rewrites.get_or_insert_with(String::new);
         if !tags.is_empty() {
             tags.push(',');
@@ -2866,6 +3114,13 @@ impl ReqLog {
         if let Some(rid) = header_opt(headers, "request-id") {
             self.upstream_request_id = Some(rid);
         }
+        if let Some(cap) = &mut self.telemetry {
+            cap.body = sent.clone();
+        }
+        // 身份三项（session/device）重试前后逐字相同——两发都过同一个 `upstream.shape()`，
+        // 只有 messages 内容不同——故只换形态摘要那一项。
+        let (shape, _, _) = shape_summary(sent);
+        self.forensics.shape = shape;
     }
 }
 
@@ -2892,6 +3147,90 @@ fn ban_context(
 
 /// 转发那一刻能确定的取证字段：出口代理、是否模拟、出站体形态摘要、会话 id。
 /// 错误文案、第三方判定、改写标签在响应到达后再补（见 [`handle`] 的 4xx 段与 [`ReqLog::note_retry`]）。
+/// 在**没有 [`ReqLog`]** 的早退路径上，补上失败请求该有的两件事：把这一发记进模拟会话链，
+/// 与报一条 `tengu_api_error`。正常路径上这两件事都在 [`ReqLog::drop`] 里。
+///
+/// 两个调用点：`upstream.send()` 连接层就失败（`ReqLog` 建都没建），以及 401 那条路
+/// ——它把响应体 `bytes()` 掉了，没法再 `break` 出去走正常收尾，只能就地返回。
+///
+/// 会话链照记：官方那条 `cc_prev_req` 链**不跳过报错的请求**（同 [`ReqLog::drop`] 里的
+/// 说明）。连接层失败那条没有上游 request-id，`record` 会自己跳过。
+///
+/// `organization_id` 取自**上游响应头** `anthropic-organization-id`，事件的 `auth` 块要它
+/// （[`crate::telemetry::Identity::auth_block`]：没有就整个 `organization_uuid` 键都不出现，
+/// 而订阅/团队账号官方每条都带）。遥测那边按凭证缓存过一份，同一个号只要之前有过一条带
+/// 这个头的响应就还补得上；但一个进程里**头一条就是早退 401** 的号没有那份缓存，所以
+/// 拿得到就得往下传。连接层失败那条压根没有响应，只能是 `None`。
+#[allow(clippy::too_many_arguments)]
+fn record_early_failure(
+    state: &AppState,
+    cred: &crate::credentials::Credential,
+    upstream: &Upstream<'_>,
+    sent: &Bytes,
+    started: std::time::Instant,
+    flags: store::ForwardFlags,
+    billable: bool,
+    up_request_id: Option<&str>,
+    organization_id: Option<String>,
+    failure: crate::telemetry::CallFailure,
+) {
+    if let Some(sid) = upstream
+        .sim
+        .as_ref()
+        .map(|s| s.session_id.clone())
+        .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone()))
+    {
+        CcSessionLink::record(
+            CcSessionKey { cred_id: cred.id, session_id: &sid },
+            up_request_id,
+            None,
+        );
+    }
+    let Some(cap) =
+        telemetry_capture(state, cred, upstream, sent, started, flags, billable, organization_id)
+    else {
+        return;
+    };
+    cap.record_failure(
+        cred.id,
+        ua_of(&upstream.headers),
+        started.elapsed().as_millis() as u64,
+        up_request_id.map(str::to_string),
+        failure,
+    );
+}
+
+/// 逐请求遥测的请求侧材料，见 [`crate::telemetry::Capture`]。开关关着或非计费路径为 `None`。
+///
+/// 三个调用点共用：正常路径（建 [`ReqLog`] 时）、连接层就失败那条、以及 401 换号那条
+/// ——后两条压根没有 `ReqLog`，得自己就地报一条 `tengu_api_error`。字段拼装只有这一份，
+/// 免得哪天正常路径加了个字段、另外两条忘了跟。
+#[allow(clippy::too_many_arguments)]
+fn telemetry_capture(
+    state: &AppState,
+    cred: &crate::credentials::Credential,
+    upstream: &Upstream<'_>,
+    sent: &Bytes,
+    started: std::time::Instant,
+    flags: store::ForwardFlags,
+    billable: bool,
+    organization_id: Option<String>,
+) -> Option<crate::telemetry::Capture> {
+    (flags.api_telemetry && billable).then(|| crate::telemetry::Capture {
+        sink: state.telemetry.clone(),
+        account_uuid: cred.account_uuid.clone(),
+        org_type: cred.org_type.clone(),
+        body: sent.clone(),
+        betas: header_opt(&upstream.headers, "anthropic-beta"),
+        session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
+        client_request_id: header_opt(&upstream.headers, "x-client-request-id"),
+        organization_id,
+        started_at: std::time::SystemTime::now()
+            .checked_sub(started.elapsed())
+            .unwrap_or_else(std::time::SystemTime::now),
+    })
+}
+
 fn capture_forensics(
     upstream: &Upstream<'_>,
     sent: &Bytes,
@@ -3089,6 +3428,35 @@ struct UsageSniffer {
     stop_reason: Option<String>,
     text_chars: usize,
     thinking_chars: usize,
+    /// 回复里出现过 `thinking` / `redacted_thinking` 块。
+    ///
+    /// `thinkingContentLength` 官方的判据是「这条回复里有没有思考块」，而不是「思考字数
+    /// 大于零」（`redacted_thinking` 与被截断的思考块都是 0 字），此前只能拿「没有正文」
+    /// 当代理指标。
+    saw_thinking: bool,
+    /// 回复里的 `tool_use` 块：按出现顺序记名字与 `input` 的 JSON 串。
+    ///
+    /// `toolUseContentLengths` 报的是「这条回复里每个工具的入参 JSON 长度之和」，流式下
+    /// 入参是 `input_json_delta` 一片片来的，得按内容块序号拼回去。
+    tool_uses: Vec<ToolUseBlock>,
+    /// 响应体本身就是一份错误 JSON（`{"type":"error","error":{...}}`）时的类型与文案。
+    ///
+    /// 非流式 4xx/5xx 的整段体本来就攒在 `buf` 里、`finish` 时会解析一次，顺手记下——
+    /// `tengu_api_error` 的 `error` 与 `errorType` 要的正是这两项，而
+    /// [`capture_forensics`] 那份只在 400/401/403 与裸 429 上填。
+    body_error: Option<(Option<String>, String)>,
+}
+
+/// 回复里一个 `tool_use` 块：内容块序号、工具名、`input` 的 JSON 串。
+#[derive(Default, Clone)]
+struct ToolUseBlock {
+    index: i64,
+    name: String,
+    /// 流式下是拼起来的 `partial_json`；非流式下是 `input` 直接序列化的结果。
+    json: String,
+    /// 见过 `input_json_delta`：此后 `json` 是增量拼的，别再被 `content_block_start`
+    /// 里那个空 `{}` 盖回去。
+    from_delta: bool,
 }
 
 impl UsageSniffer {
@@ -3183,16 +3551,58 @@ impl UsageSniffer {
                 self.thinking_chars += t.encode_utf16().count();
             }
         }
+        // 块的类型与工具入参：流式靠 `content_block_start` 开头、`input_json_delta` 续上。
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_start") => {
+                let index = v.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                if let Some(cb) = v.get("content_block") {
+                    self.note_block(index, cb);
+                }
+            }
+            Some("content_block_delta") => {
+                if let Some(pj) =
+                    v.get("delta").and_then(|d| d.get("partial_json")).and_then(|p| p.as_str())
+                {
+                    let index = v.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                    if let Some(b) = self.tool_uses.iter_mut().find(|b| b.index == index) {
+                        // `content_block_start` 里那个 `input` 是空 `{}` 占位，增量一来就作废。
+                        if !b.from_delta {
+                            b.json.clear();
+                            b.from_delta = true;
+                        }
+                        // 防御：入参异常大时不再拼（长度已经远超任何真实工具调用）。
+                        if b.json.len() < 1_000_000 {
+                            b.json.push_str(pj);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // 响应体本身是错误 JSON：`{"type":"error","error":{"type":…,"message":…}}`。
+        // 流式的 `event: error` 也是这个形状，两条路记同一份。
+        if v.get("type").and_then(|t| t.as_str()) == Some("error")
+            && let Some(err) = v.get("error")
+        {
+            self.body_error = Some((
+                err.get("type").and_then(|t| t.as_str()).map(str::to_string),
+                err.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err.to_string()),
+            ));
+        }
         if !self.is_stream
             && let Some(blocks) = v.get("content").and_then(|c| c.as_array())
         {
-            for b in blocks {
+            for (i, b) in blocks.iter().enumerate() {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                     self.text_chars += t.encode_utf16().count();
                 }
                 if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
                     self.thinking_chars += t.encode_utf16().count();
                 }
+                self.note_block(i as i64, b);
             }
         }
         let usage = v.get("usage").or_else(|| v.get("message").and_then(|m| m.get("usage")));
@@ -3224,6 +3634,47 @@ impl UsageSniffer {
         }
     }
 
+    /// 记一个内容块的类型：思考块只记「出现过」，工具块记名字与入参。
+    fn note_block(&mut self, index: i64, cb: &serde_json::Value) {
+        match cb.get("type").and_then(|t| t.as_str()) {
+            Some("thinking" | "redacted_thinking") => self.saw_thinking = true,
+            Some(ty @ ("tool_use" | "server_tool_use" | "mcp_tool_use")) => {
+                // 防御：一条回复里的工具块数有上限，别让畸形流把内存撑爆。
+                if self.tool_uses.len() >= 256 {
+                    return;
+                }
+                let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                self.tool_uses.push(ToolUseBlock {
+                    index,
+                    name: tool_use_label(ty, name),
+                    json: cb.get("input").map(|i| i.to_string()).unwrap_or_else(|| "{}".into()),
+                    from_delta: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// `toolUseContentLengths` 那张表：工具名 → 入参 JSON 的字符数之和，按首次出现排序。
+    ///
+    /// 官方量的是 `JSON.stringify(input).length`，即**重新序列化**后的长度，而流式收到的
+    /// `partial_json` 是模型原样吐出来的串——两者只在转义与数字写法上可能差几个字符。
+    /// 能解析就 parse + 紧凑序列化后再量，解析不了（流断在半截）才退回原串。
+    fn tool_use_lens(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for b in &self.tool_uses {
+            let len = serde_json::from_str::<serde_json::Value>(&b.json)
+                .map(|v| v.to_string())
+                .map(|s| s.encode_utf16().count())
+                .unwrap_or_else(|_| b.json.encode_utf16().count());
+            match out.iter_mut().find(|(n, _)| *n == b.name) {
+                Some((_, v)) => *v += len,
+                None => out.push((b.name.clone(), len)),
+            }
+        }
+        out
+    }
+
     /// 收尾：非流式模式在此解析累积的整段 JSON。
     fn finish(&mut self) {
         if !self.is_stream
@@ -3241,6 +3692,18 @@ impl UsageSniffer {
             || self.cache_creation_tokens.is_some()
             || self.cache_read_tokens.is_some()
     }
+}
+
+/// 遥测里那张工具长度表的键：官方对工具名做同一套归一化——`mcp_tool_use` 块与 `mcp__*`
+/// 名字都记成 `mcp_tool`、`skill__*` 记成 `skill_tool`，其余原样。
+fn tool_use_label(block_type: &str, name: &str) -> String {
+    if block_type == "mcp_tool_use" || name.starts_with("mcp__") {
+        return "mcp_tool".to_string();
+    }
+    if name.starts_with("skill__") {
+        return "skill_tool".to_string();
+    }
+    name.to_string()
 }
 
 /// 该路径是否会消耗订阅额度——设备身份校验、出站体改写、裸请求限流计数都只对它生效。
@@ -3286,18 +3749,22 @@ fn extract_device_id(body: Option<&serde_json::Value>) -> Option<String> {
 /// 从请求体提取会话标识，兼容与 [`extract_device_id`] 相同的两种 `metadata.user_id` 格式
 /// （内嵌 JSON 的 `session_id` 字段 / 扁平串的 `_session_` 段）。
 ///
-/// 只在来访**没带** `X-Claude-Code-Session-Id` 头时才用得上：官方客户端头体两处逐字相同，
-/// 头在就直接读头（还能省掉一次 body 解析，见入口 1.6）。
+/// **体里那个会话 id 只有这一个解析器。** 曾经还有一份只认内嵌 JSON 的副本，于是
+/// Windows 那种扁平串（`user_<hash>_account_<acct>_session_<uuid>`）在
+/// [`incoming_session_id`] 与 [`session_id_conflict`] 眼里等于「体里没有会话 id」——
+/// 头体不一致检测对整整一类客户端形同虚设，默认拒的开关也拦不住。两种格式的差异只该
+/// 在一个函数里，别再复制一份。
 fn extract_session_id(body: Option<&serde_json::Value>) -> Option<String> {
     let user_id = body?.get("metadata")?.get("user_id")?.as_str()?;
     if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id)
-        && let Some(sid) = inner.get("session_id").and_then(|s| s.as_str())
+        && let Some(sid) = inner.get("session_id").and_then(|s| s.as_str()).map(str::trim)
         && !sid.is_empty()
     {
         return Some(sid.to_string());
     }
     let flat = parse_flat_user_id(user_id)?;
-    (!flat.session.is_empty()).then_some(flat.session)
+    let sid = flat.session.trim();
+    (!sid.is_empty()).then(|| sid.to_string())
 }
 
 /// 会话 RPM 超限那条 429：两个入口（头一路、body 一路）共用，免得两处的状态码、头、正文
@@ -3370,10 +3837,13 @@ fn body_has_user_id(body: Option<&serde_json::Value>) -> bool {
     body.and_then(|v| Some(v.get("metadata")?.get("user_id")?.is_string())).unwrap_or(false)
 }
 
-/// 扁平 `metadata.user_id` 中我们需要的两段：`user_<device>_account_<..>_session_<session>`。
-/// account 段被凭证真实值覆盖，故不保留。
+/// 扁平 `metadata.user_id` 的三段：`user_<device>_account_<account>_session_<session>`。
+///
+/// [`spoof_identity`] 只用 device 与 session（account 段由凭证真实值覆盖），
+/// [`outbound_identity`] 三段都要——它读的是**已经发出去**的那份，不能再替换任何一段。
 struct FlatUserId {
     device: String,
+    account: String,
     session: String,
 }
 
@@ -3382,8 +3852,12 @@ struct FlatUserId {
 fn parse_flat_user_id(s: &str) -> Option<FlatUserId> {
     let rest = s.strip_prefix("user_")?;
     let (device, rest) = rest.split_once("_account_")?;
-    let (_account, session) = rest.split_once("_session_")?;
-    Some(FlatUserId { device: device.to_string(), session: session.to_string() })
+    let (account, session) = rest.split_once("_session_")?;
+    Some(FlatUserId {
+        device: device.to_string(),
+        account: account.to_string(),
+        session: session.to_string(),
+    })
 }
 
 /// 账号被停用时的**状态词**：单独出现不作数，必须与 [`BAN_SUBJECTS`] 中的主语同时出现。
@@ -3742,7 +4216,7 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
 ///   这条只是兜底）。
 /// - [`config::CC_BETA_CACHE_DIAGNOSIS`]：队尾（在 `extended-cache-ttl` 之前先补，后者再插到
 ///   它前面）。
-/// - fable 族（由 [`cc_beta_seed`] 判：种子里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
+/// - fable 族（由 [`cc_profile_for`] 判：该族官方串里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
 ///   补 `thinking-display-updates`（`fallback-credit` 之后），并**剥掉**
 ///   [`config::CC_BETA_REDACT_THINKING`]——订阅端 fable 不发它，API-key 端发；这是本函数
 ///   唯一会删客户端项的地方，fable 上原始思维链本来就不返回，删了没有语义损失。与之配套的
@@ -3750,29 +4224,75 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
 ///
 /// `model` 为 `None` 时不做族相关的两条（不知道是哪族就不猜）。
 ///
+/// **非主线程 profile 整条豁免**（[`is_official_non_main_beta`]）：2.1.260 的 SDK 子代理、
+/// 标题生成、安全分类、无工具 helper 与额度探测各有一套**更短**的官方 beta 集合，把主线程那几项补进去只会
+/// 拼出一个官方从不产生的串。它们只补 `oauth`（OAuth 端硬性要求），其余一律不动。
+///
+/// **按前缀判在不在**（[`has_beta`]）：`server-side-fallback` 这类带日期的项在 2.1.258 与
+/// 2.1.260 之间换过日期，逐字相等地判会给一个已经带 `-2026-06-01` 的来访再插一条
+/// `-2026-07-01`，拼出两条同名 beta。
+///
 /// 2.1.220 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；
 /// 2.1.258 四族以 API-key 端原始请求头为输入，同样逐字节还原订阅端官方串。回归测试见 [`tests::merged_beta_matches_official_order`] 与
 /// [`tests::merged_beta_matches_2_1_258_official_order`]。
-fn merge_beta(incoming: Option<&str>, model: Option<&str>) -> String {
+fn merge_beta(
+    incoming: Option<&str>,
+    model: Option<&str>,
+    version: Option<(u64, u64, u64)>,
+) -> String {
     let mut parts: Vec<String> = incoming
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
-    let has = |parts: &[String], beta: &str| parts.iter().any(|p| p == beta);
-    let pos = |parts: &[String], beta: &str| parts.iter().position(|p| p == beta);
-    // 2.1.251+ 世代的判据；老客户端不补下面那四项。
-    let modern = has(&parts, config::CC_BETA_ADVISOR_TOOL);
-    let seed = model.map(cc_beta_seed);
-    let seed_has = |beta: &str| seed.is_some_and(|s| s.split(',').any(|p| p.trim() == beta));
+    let has = |parts: &[String], beta: &str| has_beta(parts, beta);
+    let pos = |parts: &[String], beta: &str| find_beta(parts, beta);
+
+    // 官方非主线程 profile：只保证 `oauth` 在，别的一项都不补。
+    if is_official_non_main_beta(&parts) {
+        if !has(&parts, config::OAUTH_BETA_HEADER) {
+            let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
+            parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
+        }
+        return parts.join(",");
+    }
+
+    // 2.1.251+ 世代的判据；老客户端（2.1.220）不补下面那四项。
+    //
+    // 判据不能只看 `advisor-tool`：2.1.260 的 fable 主线程把它换成了
+    // `per-turn-control`（`cap/2.1.260/00018`），只认前者就会把一条 2.1.260 的请求当成
+    // 2.1.220 处理，`cache-diagnosis` 之类一项都不补。
+    //
+    // **不能把 `fallback-credit` 也算进判据**：2.1.220 的客户端自己就发它
+    // （`cap/raw/00002`），认了它就会把老客户端一起当成 2.1.251+。
+    let modern =
+        has(&parts, config::CC_BETA_ADVISOR_TOOL) || has(&parts, config::CC_BETA_PER_TURN_CONTROL);
+    // 2.1.260 一代：`server-side-fallback` 的日期换成了 06-01。判据有三个来源——来访自报的
+    // 版本、只有这一代才发的 `per-turn-control`、以及它自己已经带的那条的日期。
+    let gen_260 = version.is_some_and(|v| v >= (2, 1, 260))
+        || has(&parts, config::CC_BETA_PER_TURN_CONTROL)
+        || parts.iter().any(|p| p == config::CC_BETA_SERVER_SIDE_FALLBACK_JUN);
+    let server_side_fallback = if gen_260 {
+        config::CC_BETA_SERVER_SIDE_FALLBACK_JUN
+    } else {
+        config::CC_BETA_SERVER_SIDE_FALLBACK
+    };
+    // 参照串按**来访自报的版本**取：拿 2.1.260 那张表去处理一个 2.1.258 的客户端，会给它
+    // 补上 `thinking-display-updates` 并剥掉 `redact-thinking`，拼出一条混了两个版本的请求。
+    let seed = model.map(|m| config::cc_profile_at(cc_profile_kind_for(m), version).beta);
+    // **按名字比，不比日期**：2.1.260 的 fable 官方串里是 `server-side-fallback-2026-06-01`，
+    // 而这里问的常量是 07-01 那个。逐字相等地判，fable 那一族就永远问不出「官方发这一项」，
+    // 于是缺了它也补不上——正是这条日期差把整个补齐分支变成了死代码。
+    let seed_has = |beta: &str| {
+        seed.is_some_and(|s: &str| s.split(',').any(|p| beta_name(p.trim()) == beta_name(beta)))
+    };
 
     if !has(&parts, config::OAUTH_BETA_HEADER) {
         let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
         parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
     }
     if !has(&parts, config::CC_BETA_ADVANCED_TOOL_USE) {
-        let at = parts
-            .iter()
-            .position(|p| p == config::CC_BETA_EFFORT)
-            .or_else(|| parts.iter().position(|p| p == config::CC_BETA_ADVISOR_TOOL).map(|i| i + 1))
+        let at = pos(&parts, config::CC_BETA_EFFORT)
+            .or_else(|| pos(&parts, config::CC_BETA_ADVISOR_TOOL).map(|i| i + 1))
+            .or_else(|| pos(&parts, config::CC_BETA_PER_TURN_CONTROL).map(|i| i + 1))
             .unwrap_or(parts.len());
         parts.insert(at, config::CC_BETA_ADVANCED_TOOL_USE.to_string());
     }
@@ -3780,15 +4300,21 @@ fn merge_beta(incoming: Option<&str>, model: Option<&str>) -> String {
         parts.push(config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
     }
     if modern {
-        if !has(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK) {
+        // 官方串里有这一项的族才补。2.1.260 的 opus 主线程整项不发了
+        // （`cap/2.1.260-2/00025`），照旧补就是把 2.1.258 的形态发给一个 2.1.260 的来访。
+        if seed_has(config::CC_BETA_SERVER_SIDE_FALLBACK)
+            && !has(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK)
+        {
             let at = pos(&parts, config::CC_BETA_EFFORT)
                 .or_else(|| pos(&parts, config::CC_BETA_ADVANCED_TOOL_USE))
                 .map_or(parts.len(), |i| i + 1);
-            parts.insert(at, config::CC_BETA_SERVER_SIDE_FALLBACK.to_string());
+            parts.insert(at, server_side_fallback.to_string());
         }
         if !has(&parts, config::CC_BETA_FALLBACK_CREDIT) {
-            let at =
-                pos(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK).map_or(parts.len(), |i| i + 1);
+            let at = pos(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK)
+                .or_else(|| pos(&parts, config::CC_BETA_EFFORT))
+                .or_else(|| pos(&parts, config::CC_BETA_ADVANCED_TOOL_USE))
+                .map_or(parts.len(), |i| i + 1);
             parts.insert(at, config::CC_BETA_FALLBACK_CREDIT.to_string());
         }
         if seed_has(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
@@ -3797,6 +4323,8 @@ fn merge_beta(incoming: Option<&str>, model: Option<&str>) -> String {
                     pos(&parts, config::CC_BETA_FALLBACK_CREDIT).map_or(parts.len(), |i| i + 1);
                 parts.insert(at, config::CC_BETA_THINKING_DISPLAY_UPDATES.to_string());
             }
+            // `thinking-display-updates` 与 `redact-thinking` 在 2.1.260 的六份抓包上恒为
+            // 互斥，2.1.258 时也只有 fable 一族如此。补了前者就得剥后者。
             if !seed_has(config::CC_BETA_REDACT_THINKING) {
                 parts.retain(|p| p != config::CC_BETA_REDACT_THINKING);
             }
@@ -3810,6 +4338,76 @@ fn merge_beta(incoming: Option<&str>, model: Option<&str>) -> String {
         parts.insert(at, config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
     }
     parts.join(",")
+}
+
+/// 一项 beta 在不在串里，**按名字比、忽略日期后缀**。
+///
+/// `beta` 传的是含日期的全名（常量都是那个形态），比较时只取到最后一个 `-` 之前的名字段：
+/// `server-side-fallback-2026-07-01` 与 `server-side-fallback-2026-06-01` 是同一项换了
+/// 日期，不是两项。逐字相等地判会让 [`merge_beta`] 给一个已经带新日期的来访再插一条旧的。
+fn has_beta(parts: &[String], beta: &str) -> bool {
+    find_beta(parts, beta).is_some()
+}
+
+/// [`has_beta`] 的位置版。
+fn find_beta(parts: &[String], beta: &str) -> Option<usize> {
+    let name = beta_name(beta);
+    parts.iter().position(|p| beta_name(p) == name)
+}
+
+/// 去掉 beta 名末尾的日期段（`-YYYY-MM-DD`）。没有日期段的原样返回。
+fn beta_name(beta: &str) -> &str {
+    // 日期段恒为 11 个字符：`-` + `2026-04-07`。短于它、或去掉之后剩下空串的，都不算带日期。
+    let Some(head) = beta.len().checked_sub(11).map(|i| &beta[..i]) else { return beta };
+    let tail = &beta[beta.len() - 11..];
+    let looks_like_date = tail.starts_with('-')
+        && tail[1..]
+            .chars()
+            .enumerate()
+            .all(|(i, c)| if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() });
+    if looks_like_date && !head.is_empty() { head } else { beta }
+}
+
+/// 这串 beta 是不是官方**非主线程** profile 那几套之一（SDK 子代理、无工具 helper、
+/// 标题生成、安全分类、额度探测）。命中即 [`merge_beta`] 只补 `oauth`、别的一项都不动。
+///
+/// 它们各自的 beta 集合都比主线程短得多，把主线程那几项（`advanced-tool-use` /
+/// `server-side-fallback` / `extended-cache-ttl` / `cache-diagnosis`）补进去，拼出来的是
+/// 官方从不产生的串。
+///
+/// 四条判据，任一命中即算（依据 `cap/2.1.260` 与 `cap/2.1.260-2` 的六个 profile）：
+///
+/// 1. 有 `auto-mode-classifier-`：只有安全分类那条发（`00019`、`00030`）；
+/// 2. 有 `structured-outputs-`：只有标题生成那条发（`2.1.260-2/00058`）；
+/// 3. **没有** `claude-code-`：无工具 helper（`00024`）与额度探测（`2.1.260-2/00004`）都不发它；
+/// 4. **SDK 子代理**（`00020`、`00025`）：有 `claude-code` 也有
+///    `thinking-display-updates`，却**一个** `effort` / `advisor-tool` / `per-turn-control`
+///    都没有。前三条判据都放它过去，于是它会被当成主线程补上 `advanced-tool-use` 与
+///    `extended-cache-ttl`——官方那条两样都没有。
+///
+///    这一条不会误伤谁：主线程四族要么有 `effort`（opus/fable/sonnet），要么有
+///    `advisor-tool`（2.1.258/2.1.260 的 haiku 主线程）；2.1.220 那代的 haiku
+///    （[`tests::BETA_PAIRS`]）压根没有 `thinking-display-updates`。
+///
+/// 走到 [`merge_beta`] 的只有 CC 形态的来访（非 CC 形态的走模拟路径），所以「没有
+/// claude-code beta」在这里是个可用的信号，而不是「随便哪个第三方客户端」。
+fn is_official_non_main_beta(parts: &[String]) -> bool {
+    // 一项都没带不算：官方每个 profile 至少五项。压根没有 `anthropic-beta` 头的来访要走
+    // 正常的补齐规则，不然它只会拿到一个孤零零的 `oauth`。
+    if parts.is_empty() {
+        return false;
+    }
+    let main_thread_marker =
+        [config::CC_BETA_EFFORT, config::CC_BETA_ADVISOR_TOOL, config::CC_BETA_PER_TURN_CONTROL]
+            .iter()
+            .any(|b| has_beta(parts, b));
+    let sdk_subagent =
+        has_beta(parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) && !main_thread_marker;
+
+    has_beta(parts, config::CC_BETA_AUTO_MODE_CLASSIFIER)
+        || has_beta(parts, config::CC_BETA_STRUCTURED_OUTPUTS)
+        || !has_beta(parts, config::CC_BETA_CLAUDE_CODE)
+        || sdk_subagent
 }
 
 /// 组装发往上游的请求头：原样转发可转发头，再对需要 luban 决定取值的头**原位覆盖**。
@@ -3839,9 +4437,9 @@ fn build_forward_headers(
     token: &str,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
-    bare_session: Option<&str>,
+    session_id: Option<&str>,
 ) -> HeaderMap {
-    build_forward_headers_for(headers, token, flags, sim, bare_session, None)
+    build_forward_headers_for(headers, token, flags, sim, session_id, None)
 }
 
 /// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta`] 做族相关的两条
@@ -3852,7 +4450,7 @@ fn build_forward_headers_for(
     token: &str,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
-    bare_session: Option<&str>,
+    session_id: Option<&str>,
     model: Option<&str>,
 ) -> HeaderMap {
     let mut out = match sim {
@@ -3866,11 +4464,21 @@ fn build_forward_headers_for(
                     out.append(k.clone(), v.clone());
                 }
             }
-            // CC 形态的来访要补 metadata 时（见 [`Upstream::bare_session`]），头上的会话 id
-            // 必须与体里那个同值——官方两处逐字相同。`bare_session` 已经优先取的就是来访
-            // 自己那个头的值，故这里只在它压根没带时才补，不覆盖客户端原值。
-            if let Some(sid) = bare_session
-                && !out.contains_key("x-claude-code-session-id")
+            // 出站两处必须**同值**：头上这个与 `metadata.user_id` 里那个，官方逐字相同。
+            //
+            // `session_id` 是 [`outbound_session_id`] 选定的那一个，故这里不是「没有才
+            // 补」而是「以它为准」——只补缺会漏掉两种情形，两种都能让出站自相矛盾：
+            //
+            // - 来访头是 `sess-42` 这类非法值、体里却有合法 uuid：选出来的是体里那个，
+            //   而非法的头原样转发了出去；
+            // - 来访没带头、体里有合法 uuid：`bare_session` 只在「体里没有 metadata」时
+            //   才有值，于是这条路上头一直是缺的。
+            //
+            // 值相同时一个字节都不动（绝大多数请求走的就是这条），故正常形态的转发不受
+            // 影响。`insert` 命中已有 key 时原位替换、位置不动；客户端重复带了这个头时
+            // 一并收敛成一个——官方不发重复头。
+            if let Some(sid) = session_id
+                && out.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()) != Some(sid)
                 && let Ok(v) = HeaderValue::from_str(sid)
             {
                 out.insert("x-claude-code-session-id", v);
@@ -3882,19 +4490,28 @@ fn build_forward_headers_for(
     if flags.fill_client_headers && !out.contains_key("anthropic-version") {
         out.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
-    // anthropic-beta 合并，确保带上 oauth，并按官方客户端顺序重排。
-    // 模拟模式下先把来访那串与官方自有串取并集，再交给同一套落位规则。
+    // anthropic-beta：两条路各走各的。
+    //
+    // - 模拟路径：整串由 profile 直接给出（[`simulated_beta`]），**不过** [`merge_beta`]。
+    //   那套增量规则是拿来补 API-key 端残缺串的，对一份已经完整的官方串只会往里插上一版
+    //   才发的项。
+    // - CC 形态来访：仍走 [`merge_beta`]，按经验规则把订阅端多出来的几项补回官方位置。
     let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
-    let incoming = match sim {
-        Some(sim) => Some(simulated_beta(sim.beta, incoming)),
-        None => incoming.map(str::to_string),
+    let beta = match sim {
+        Some(sim) => Some(simulated_beta(sim.profile.beta, incoming)),
+        None if flags.merge_beta => {
+            // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta`]。
+            let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+            Some(merge_beta(incoming, model, version.and_then(cc_cli_version)))
+        }
+        None => None,
     };
-    if flags.merge_beta {
-        match HeaderValue::from_str(&merge_beta(incoming.as_deref(), model)) {
+    if let Some(beta) = beta {
+        match HeaderValue::from_str(&beta) {
             Ok(v) => {
                 out.insert("anthropic-beta", v);
             }
-            // merge_beta 只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
+            // 两条路都只产出 ASCII，理论上不可达；真发生时保留来访原值，别把这个头发空。
             Err(e) => {
                 tracing::warn!(error = %e, "building anthropic-beta failed, keeping the inbound value")
             }
@@ -3966,27 +4583,86 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
     out
 }
 
-/// 模拟模式的 `anthropic-beta` 自有串：官方那串（`seed`，按模型族取自 [`cc_beta_seed`]）
-/// 打底，来访客户端自己带的项去重后**追加在后面**，再交给 [`merge_beta`] 落位。
+/// 模拟模式的 `anthropic-beta`：profile 那串（[`config::CcProfile::beta`]，逐字取自抓包）
+/// 打底，补上 `oauth` 的官方位置，来访客户端自己带的项去重后**追加在后面**。
+///
+/// **不再过 [`merge_beta`]。** 那套增量落位规则的输入是 API-key 端的**残缺**串，作用是把
+/// 订阅端多出来的几项补回官方位置；而 profile 里那串本来就是完整的订阅端官方串，再过一遍
+/// 只会按 2.1.258 的规则往里插 `server-side-fallback` 之类 2.1.260 已经不发的项——补出一个
+/// 两个版本的混合体。
 ///
 /// 追加而非插空：客户端带的多半是官方不发的项（`output-128k` 之类），本来就没有「官方位置」
 /// 可言，硬塞进官方串中间反而造出一个官方不产生的排列。丢掉它们更不行——那是客户端明确要的
 /// 能力，丢了它的请求就直接变了语义。
+///
+/// `oauth` 的落位：官方串以 `claude-code-20250219` 开头时紧随其后（opus / fable / sonnet），
+/// 否则排在最前（haiku 三个 profile 的 `claude-code` 在串中间，`oauth` 在队首）。这两种
+/// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta`] 用的同一条规则。
 fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
-    let mut parts: Vec<&str> = seed.split(',').map(str::trim).collect();
-    // 客户端自己带的 beta 只保留已知安全的项（上游已发布的 beta），过滤掉上游不认的
-    // （如 `max-tokens-5-0-2025-05-30`），否则追加进来直接 400。
+    let mut parts: Vec<&str> = seed.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let at = usize::from(parts.first() == Some(&config::CC_BETA_CLAUDE_CODE));
+    parts.insert(at, config::OAUTH_BETA_HEADER);
+    // 客户端自己带的 beta **一项不丢**，去重后追加在官方串之后。
     for p in incoming.unwrap_or("").split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        if !parts.contains(&p) && is_known_beta(p) {
-            parts.push(p);
+        // **同名不同日期算已经有了**：客户端带 `server-side-fallback-2026-07-01`、官方串里
+        // 是 06-01，逐字比不出重复，追加进去就是两条同名 beta——官方从不产生的形态。
+        if parts.iter().any(|q| beta_name(q) == beta_name(p)) {
+            continue;
         }
+        // **互斥项不能并存**：`redact-thinking` 与 `thinking-display-updates` 在 2.1.260 的
+        // 六份抓包上从不同时出现（前者是「原始思维链打码」，后者是「思维链按 updates 显示」，
+        // 语义本就冲突）。官方串已经选了一边，客户端带来的另一边只能丢——留着就是一条
+        // 官方不产生的组合，而 body 侧那个 `thinking.display` 也只跟着官方串走。
+        if beta_conflicts_with_seed(&parts, p) {
+            tracing::warn!(
+                beta = p,
+                "dropping a client beta that contradicts the official set for this profile"
+            );
+            continue;
+        }
+        // **认不出来的照发，交给上游判**。这里曾按一张白名单把不认识的项丢掉，理由是
+        // 「追加一个上游不认的 beta 是一发稳定 400」。那个理由站不住：
+        //
+        // - 丢掉之后**客户端并不知道**自己要的能力没了。它 body 里配套的字段还在，于是
+        //   照样 400，只是错误文案变成了「体里写了、头上没声明」——比上游直说
+        //   「不认识这个 beta」难查得多；
+        // - 白名单天生落后。上游每发一个新 beta，所有真的在用它的客户端都会被 luban
+        //   静默降级，而这条路上没人看得出来。
+        //
+        // 判「这个 beta 上游认不认」是上游的事，不是代理的事。互斥与同名那两条仍然拦
+        // （上面两个 `continue`）——那不是「上游认不认」，是**同一条请求里自相矛盾**，
+        // 拦掉是在修形态，不是在替客户端做决定。
+        if !is_known_beta(p) {
+            tracing::debug!(
+                beta = p,
+                "forwarding a client beta luban does not recognize; upstream decides"
+            );
+        }
+        parts.push(p);
     }
     parts.join(",")
 }
 
-/// 上游已知接受的 `anthropic-beta` 前缀。只要 beta 项以这些之一开头就放行。
-/// 不在此列的客户端自发 beta 在模拟路径下静默丢弃——追加一个上游不认的 beta
-/// 就是一发稳定 400，静默丢弃好过打不通。
+/// 客户端这一项与已经定下来的官方串是不是互斥。
+///
+/// 目前只有一对：[`config::CC_BETA_REDACT_THINKING`] ↔
+/// [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]。2.1.260 的六个 profile 里，有前者的
+/// （helper / 标题 / 分类 / 额度探测）必无后者，有后者的（主线程四族、SDK 子代理）必无前者。
+fn beta_conflicts_with_seed(seed: &[&str], candidate: &str) -> bool {
+    const EXCLUSIVE: &[(&str, &str)] =
+        &[(config::CC_BETA_REDACT_THINKING, config::CC_BETA_THINKING_DISPLAY_UPDATES)];
+    let has = |b: &str| seed.iter().any(|q| beta_name(q) == beta_name(b));
+    EXCLUSIVE.iter().any(|(a, b)| {
+        (beta_name(candidate) == beta_name(a) && has(b))
+            || (beta_name(candidate) == beta_name(b) && has(a))
+    })
+}
+
+/// 上游已知接受的 `anthropic-beta` 前缀。
+///
+/// **这不再是一张准入白名单**——不在此列的客户端 beta 照样转发（见 [`simulated_beta`]，
+/// 判「上游认不认」是上游的事）。它现在只用来决定要不要打一行「luban 不认识这一项」的
+/// debug 日志：上游发了新 beta 时，那行日志是唯一的提示。
 fn is_known_beta(beta: &str) -> bool {
     const KNOWN_PREFIXES: &[&str] = &[
         "claude-code-",
@@ -4008,6 +4684,14 @@ fn is_known_beta(beta: &str) -> bool {
         "fast-mode-",
         // 2.1.258 起官方随 `thinking.display:"updates"` 一并发出（cap/2.1.258/00013）。
         "thinking-display-updates-",
+        // 以下四项自 2.1.260 起在官方串里出现，见 [`config::CC_PROFILES`]。少了它们，
+        // 一个真发这些 beta 的 2.1.260 客户端经模拟路径过来时会被**静默丢掉**能力声明
+        // ——body 里配套的字段还在，于是变成「体里写了、头上没声明」的稳定 400。
+        "per-turn-control-",
+        "structured-outputs-",
+        "auto-mode-classifier-",
+        "server-side-fallback-",
+        "fallback-credit-",
     ];
     KNOWN_PREFIXES.iter().any(|prefix| beta.starts_with(prefix))
 }
@@ -4043,6 +4727,450 @@ fn uuid_from_bytes(mut b: [u8; 16]) -> String {
     format!("{}-{}-{}-{}-{}", h(&b[0..4]), h(&b[4..6]), h(&b[6..8]), h(&b[8..10]), h(&b[10..16]))
 }
 
+/// 一条模拟请求在会话链条上的位置：三个**指向别的请求**的字段。
+///
+/// 官方 2.1.260 的主线程请求全都带着这些（`cap/2.1.260-2/00059`）：
+///
+/// ```text
+/// x-anthropic-billing-header: …; cch=f850a; cc_prev_req=req_011CeiBW8Yx9A2uzWiCBsJsU;
+///                                 cc_prompt_id=16d7a19d-7939-4638-9703-b31d2fc92661;
+/// diagnostics: {"previous_message_id":"msg_011CeiBW9SXwAGthrBNmSU81"}
+/// ```
+///
+/// 一条一条独立造是造不出来的：`cc_prev_req` 是上一条请求的**上游** request-id，
+/// `previous_message_id` 是上一条回复的 `message.id`，两者都得等上游回了才知道。故它们
+/// 存在 [`CcSessionLink::load`] 那张按会话 id 索引的表里，回程由
+/// [`CcSessionLink::record`] 写回。
+#[derive(Debug, Default, Clone)]
+struct CcSessionLink {
+    /// 本轮用户输入的 id。新的用户输入换一个，工具续轮沿用同一个
+    /// （`cap/2.1.260-2/00059`、`00061` 两条续轮的 prompt id 相同）。
+    ///
+    /// `None` 即这条请求不写 `cc_prompt_id`：官方的「猜下一句」请求就不写
+    /// （`cap/2.1.260-2/00063` 有 `cc_prev_req` 没有 `cc_prompt_id`），额度探测整条
+    /// billing header 都没有。
+    prompt_id: Option<String>,
+    /// 同会话上一条请求的上游 `request-id`。会话第一条没有。
+    prev_req: Option<String>,
+    /// 同会话上一条回复的 `message.id`，写进 `diagnostics.previous_message_id`。
+    ///
+    /// 会话第一条写的是 `{"previous_message_id":null}`——**字段在、值为 null**，不是不发
+    /// 这个字段（`cap/2.1.260-2/00013`、`00025`、`00057` 三份首轮全是这个形态）。
+    prev_message_id: Option<String>,
+    /// 这条是该会话在本进程里的**第一条**请求。启动握手（[`crate::oauth::HandshakeRunner`]）
+    /// 就挂在它上面：真实客户端是「先跑完一串启动 GET，再发第一条 messages」，所以这个标记
+    /// 必须在**请求发出之前**读到，不能等回程。
+    first_seen: bool,
+    /// 这条请求要不要写 `diagnostics.previous_message_id`。
+    ///
+    /// 与 [`Self::prompt_id`] **分开**：官方的无工具 helper 带 `cc_prompt_id` 却没有
+    /// `diagnostics`（`cap/2.1.260/00024`），「猜下一句」两个都没有（`2.1.260-2/00063`）。
+    /// 一个开关管两件事就会给它们各补出一个官方没有的字段。判在 [`CcRequestKind`]。
+    diagnostics: bool,
+}
+
+impl CcSessionLink {
+    /// 设定要不要写 `diagnostics`，见 [`Self::diagnostics`]。
+    fn with_diagnostics(mut self, yes: bool) -> Self {
+        self.diagnostics = yes;
+        self
+    }
+}
+
+/// 按会话 id 索引的模拟会话链条状态。
+struct CcSessionEntry {
+    prompt_id: String,
+    prev_req: Option<String>,
+    prev_message_id: Option<String>,
+    last_seen: std::time::Instant,
+}
+
+/// 全表，键是 **`(凭证 id, 会话 id)`**。
+///
+/// **必须带凭证 id。** 会话 id 常常是客户端自己带的，而 429/401 换号时同一条请求会带着
+/// 同一个会话 id 落到另一张凭证上（转发循环每轮都重跑一次 [`Simulation::detect`] /
+/// [`client_session_link`]）。只按会话 id 分桶的话：
+///
+/// - A 账号的 `cc_prev_req` / `previous_message_id` 会被发到 B 账号上——那两个 id 是 A 的
+///   上游请求/回复，B 那边从来没见过；
+/// - 同一次用户输入在换号后会**再轮换一次** `cc_prompt_id`；
+/// - B 的 `first_seen` 是 false，于是 B 这张凭证的启动握手不会触发。
+///
+/// 遥测那边本来就是按 `(cred_id, session_id)` 分桶的（`telemetry::State::sessions`），
+/// 这里跟它对齐，两处口径才一致。
+///
+/// 进程内存里就够：这些值只在一个会话活着的时候有意义，重启后客户端那边多半也换了会话；
+/// 落库反而会把「上次进程里那条 request-id」接到一个新会话上。
+static CC_SESSIONS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(i64, String), CcSessionEntry>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// 一个会话多久没请求就忘掉：与 [`config::TELEMETRY_SESSION_IDLE_SECS`] 同口径——同一个
+/// session id 隔了几个小时再来就是另一次对话，把上次那条 request-id 接过去是假的。
+const CC_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+
+/// [`CC_SESSIONS`] 的键：**凭证 + 会话**，缺一不可，理由见那张表的注释。
+#[derive(Debug, Clone, Copy)]
+struct CcSessionKey<'a> {
+    cred_id: i64,
+    session_id: &'a str,
+}
+
+impl CcSessionKey<'_> {
+    fn owned(self) -> (i64, String) {
+        (self.cred_id, self.session_id.to_string())
+    }
+}
+
+impl CcSessionLink {
+    /// 取这条请求要写的三个关联字段，并按需换一轮 `cc_prompt_id`。
+    ///
+    /// `new_prompt` 为真（末条消息是一次新的用户输入，而非 `tool_result` 续轮）时换新的
+    /// prompt id；否则沿用会话里那个。会话第一次出现时无论如何都要生成一个。
+    ///
+    /// `wants_prompt_id` 为假时不写 `cc_prompt_id`，但**会话状态照样推进**——官方那条
+    /// 「猜下一句」请求也在同一条链上，只是自己不写这个字段。
+    fn load(key: CcSessionKey<'_>, new_prompt: bool, wants_prompt_id: bool) -> Self {
+        let now = std::time::Instant::now();
+        let mut map = CC_SESSIONS.lock();
+        map.retain(|_, e| now.duration_since(e.last_seen) < CC_SESSION_IDLE);
+        let key = key.owned();
+        let known = map.contains_key(&key);
+        let entry = map.entry(key).or_insert_with(|| CcSessionEntry {
+            prompt_id: uuid_v4(),
+            prev_req: None,
+            prev_message_id: None,
+            last_seen: now,
+        });
+        // 新建的那份 id 就是这一轮的，别再换一次。
+        if known && new_prompt {
+            entry.prompt_id = uuid_v4();
+        }
+        entry.last_seen = now;
+        Self {
+            prompt_id: wants_prompt_id.then(|| entry.prompt_id.clone()),
+            prev_req: entry.prev_req.clone(),
+            prev_message_id: entry.prev_message_id.clone(),
+            first_seen: !known,
+            // 缺省写：模拟路径只造主线程 profile，它是要 diagnostics 的。真实 CC 那条路由
+            // [`CcSessionLink::with_diagnostics`] 按 [`CcRequestKind`] 覆写。
+            diagnostics: true,
+        }
+    }
+
+    /// 回程记下这一条的上游 `request-id` 与回复的 `message.id`，供同会话下一条引用。
+    /// 两个都没有（上游连头都没回）时什么也不做——把 `None` 写回去会把链条清空，
+    /// 而官方那边链条是不会中断的。
+    fn record(key: CcSessionKey<'_>, req_id: Option<&str>, message_id: Option<&str>) {
+        if req_id.is_none() && message_id.is_none() {
+            return;
+        }
+        let mut map = CC_SESSIONS.lock();
+        let Some(entry) = map.get_mut(&key.owned()) else { return };
+        if let Some(r) = req_id {
+            entry.prev_req = Some(r.to_string());
+        }
+        if let Some(m) = message_id {
+            entry.prev_message_id = Some(m.to_string());
+        }
+        entry.last_seen = std::time::Instant::now();
+    }
+}
+
+/// **真实 CC（API-key 模式）来访**在会话链条上的位置：`(会话 id, 链)`；不该补时 `None`。
+///
+/// API-key 端的 CC 发的 billing header 是光秃秃的
+/// `x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli;`
+/// ——没有 `cch`、没有 `cc_prompt_id`、没有 `cc_prev_req`，整条请求也**没有 `diagnostics`**
+/// （`cap/2.1.258-api` 六份逐一核过）。luban 拿 OAuth token 把它转出去之后，上游看到的
+/// 就是「一条 OAuth 主线程请求，却一个会话关联字段都没有」——而订阅端官方那边这三个字段
+/// 是每条主线程请求都有的。`cch` 早就补了，这三个一直缺着。
+///
+/// 一条 CC 形态的来访属于哪一类官方 profile，**只为决定那三个关联字段各写不写**。
+///
+/// 官方六个 profile 在这三项上各不相同（`cap/2.1.260` / `cap/2.1.260-2` 逐条核过），
+/// 一刀切成主线程就会给「猜下一句」造出一个它本来没有的 `cc_prompt_id`、给无工具 helper
+/// 多出一个 `diagnostics`：
+///
+/// | profile | 抓包 | 换新 prompt id | 写 `cc_prompt_id` | 写 `diagnostics` |
+/// |---|---|:---:|:---:|:---:|
+/// | 主线程 | `2.1.260-2/00025` | 新输入时换 | 是 | 是 |
+/// | SDK 子代理 | `2.1.260/00020` | **不换**（跟父会话同一个） | 是 | 是 |
+/// | 无工具 helper | `2.1.260/00024` | 不换 | 是 | **否** |
+/// | 猜下一句 | `2.1.260-2/00063` | 不换 | **否** | **否** |
+/// | 标题生成 | `2.1.260-2/00058` | 不换 | 否 | 否 |
+/// | 安全分类 | `2.1.260/00019` | 不换 | 否 | 否 |
+///
+/// 「换新 prompt id」尤其要紧：`cc_prompt_id` 是**整个会话共享**的一个值，而
+/// [`crate::telemetry::last_is_new_prompt_body`] 只看末条消息是不是新的用户输入——
+/// 「猜下一句」那条的末条正是一句 `[SUGGESTION MODE: …]` 的 user 消息，照这个判就会换一轮
+/// id，把主线程那条链也一起带偏。子代理同理：它的末条常常是一句全新的 user 消息。
+/// 除了会话链那三项，它还管住两条「别把官方形态改坏」的规则，见
+/// [`Self::keeps_nonstream`] 与 [`Self::allows_system_prefix`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcRequestKind {
+    Main,
+    Subagent,
+    /// 「猜下一句」：带工具，末条用户消息以 `[SUGGESTION MODE:` 开头。
+    Suggestion,
+    /// 无工具的辅助调用。
+    Helper,
+    /// 标题生成：无工具、`structured-outputs` beta、**流式**。
+    Title,
+    /// 安全分类：`auto-mode-classifier` beta、`max_tokens:64`、**非流式**。
+    Classifier,
+    /// 额度探测：`max_tokens:1`、**没有 `system`**、没有 `stream`。
+    QuotaProbe,
+}
+
+impl CcRequestKind {
+    /// 判据与 [`crate::telemetry`] 那边的 `Kind` 同源，只是这里还多认一个额度探测
+    /// （遥测那边不需要区分它）。`beta` 是**来访自己**那串。
+    fn of(v: &serde_json::Value, beta: &[String]) -> Self {
+        // 额度探测最先判：它**连 `system` 都没有**，后面每一条判据都以 `system` 或
+        // `tools` 为前提，落到那里只会被当成 helper。
+        if is_quota_probe_shaped(v) {
+            return Self::QuotaProbe;
+        }
+        // 标题生成（`structured-outputs`）与安全分类（`auto-mode-classifier`）各有独有 beta。
+        if has_beta(beta, config::CC_BETA_STRUCTURED_OUTPUTS) {
+            return Self::Title;
+        }
+        if has_beta(beta, config::CC_BETA_AUTO_MODE_CLASSIFIER) {
+            return Self::Classifier;
+        }
+        let tools = v.get("tools").and_then(|t| t.as_array()).map_or(0, |t| t.len());
+        if tools == 0 {
+            return Self::Helper;
+        }
+        // 子代理：billing header 里那个 `cc_is_subagent=true`。
+        let subagent = v
+            .get("system")
+            .and_then(|s| s.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains("cc_is_subagent=true"));
+        if subagent {
+            return Self::Subagent;
+        }
+        if last_user_text_starts_with(v, "[SUGGESTION MODE:") {
+            return Self::Suggestion;
+        }
+        Self::Main
+    }
+
+    /// 只有主线程会换新一轮 `cc_prompt_id`；其余都挂在会话现有那一轮上。
+    fn rotates_prompt(self) -> bool {
+        self == Self::Main
+    }
+
+    fn wants_prompt_id(self) -> bool {
+        matches!(self, Self::Main | Self::Subagent | Self::Helper)
+    }
+
+    /// `cc_prev_req` 是**独立的第三个维度**——它与 `cc_prompt_id` 的分界线不一样：
+    /// 无工具 helper 带 `cc_prompt_id` 却**从不带** `cc_prev_req`
+    /// （`cap/2.1.260/00024`、`00027`，后者排在一堆请求之后，仍然没有）；
+    /// 「猜下一句」正相反，带 `cc_prev_req` 却不带 `cc_prompt_id`（`2.1.260-2/00063`）。
+    fn wants_prev_req(self) -> bool {
+        matches!(self, Self::Main | Self::Subagent | Self::Suggestion)
+    }
+
+    fn wants_diagnostics(self) -> bool {
+        matches!(self, Self::Main | Self::Subagent)
+    }
+
+    /// 这一类要不要进会话链。三项全不写的（标题、安全分类、额度探测）整条跳过。
+    fn on_session_chain(self) -> bool {
+        self.wants_prompt_id() || self.wants_prev_req() || self.wants_diagnostics()
+    }
+
+    /// 给这一类在 `version` 上补 billing header 时该用的**固定后缀**；这一版没有对应
+    /// profile（或版本更老）时 `None`，由调用方退回 [`cc_version_suffix`] 那套派生算法。
+    ///
+    /// 只对 2.1.260 生效：那一版的后缀是逐 profile 定死的（见 [`config::CC_PROFILES`]），
+    /// 派生算法在它上面已被证否。2.1.258 及更早仍走派生——那一版五份抓包全是 `1e2`，
+    /// 而算法在 `"hi"` 上正好也算出 `1e2`。
+    ///
+    /// 主线程与「猜下一句」是主线程那一档，后缀跟**模型族**走（`222`/`bcd`/…），
+    /// 故还要 `model`。
+    fn billing_suffix_at(self, version: &str, model: &str) -> Option<&'static str> {
+        if version != config::CC_VERSION_BASE {
+            return None;
+        }
+        let kind = match self {
+            Self::Subagent => config::CcProfileKind::SdkSubagentHaiku,
+            Self::Helper => config::CcProfileKind::HelperSubagentHaiku,
+            Self::Title => config::CcProfileKind::SessionTitleHaiku,
+            Self::Classifier => config::CcProfileKind::SecurityClassifierSonnet,
+            Self::Main | Self::Suggestion => cc_profile_kind_for(model),
+            // 额度探测压根没有 billing header，走不到这里。
+            Self::QuotaProbe => return None,
+        };
+        Some(config::cc_profile(kind).billing_suffix)
+    }
+
+    /// 这一类官方**本来就是非流式**，`nonstream_as_sse` 不能把它改成 `stream:true`。
+    ///
+    /// 安全分类（`cap/2.1.260/00019`、`00030`）与额度探测（`cap/2.1.260-2/00004`）整条都
+    /// 没有 `stream` 字段。那个开关的本意是「官方恒为流式，非流式请求一看就不是 CC」——
+    /// 对这两类恰好相反：把它们改成流式才是官方不产生的形态。其余（含标题生成）官方确实
+    /// 是 `stream:true`，照改。
+    fn keeps_nonstream(self) -> bool {
+        matches!(self, Self::Classifier | Self::QuotaProbe)
+    }
+
+    /// 这一类能不能补 `system` 前缀（billing header + 身份句）。
+    ///
+    /// 额度探测**没有 `system`**，连 billing header 都没有。给它补一份，就把一条
+    /// `max_tokens:1` 的探测改成了「带身份声明的请求」——官方从不产生。
+    fn allows_system_prefix(self) -> bool {
+        self != Self::QuotaProbe
+    }
+}
+
+/// 官方额度探测恒用的模型。四份抓包（`cap/2.1.258/00004`、`cap/2.1.260-2/00004`/`00021`/
+/// `00047`）逐字相同——它是「查额度」用的最便宜的那个。
+const QUOTA_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// 这条请求是不是官方那条额度探测，**逐字比对整个形状**。
+///
+/// 官方那条（`cap/2.1.258/00004`、`cap/2.1.260-2/00004`/`00021`/`00047`，四份逐字节相同，
+/// 只有 UA 的版本号不同）：
+///
+/// ```text
+/// {"model":"claude-haiku-4-5-20251001","max_tokens":1,
+///  "messages":[{"role":"user","content":"quota"}],"metadata":{…}}
+/// ```
+///
+/// **判据必须窄。** 只看「没有 `system` + `max_tokens:1`」的话，任何客户端的一 token 探活
+/// 都会被认成额度探测，跟着就被免掉流式化、免掉 `system` 前缀——而它需要那个前缀才能用上
+/// 订阅额度。宁可漏认（退回 helper，照常走通用路径），也不能错认。
+fn is_quota_probe_shaped(v: &serde_json::Value) -> bool {
+    if v.get("system").is_some() || v.get("tools").is_some() {
+        return false;
+    }
+    if v.get("max_tokens").and_then(|m| m.as_u64()) != Some(1) {
+        return false;
+    }
+    // **逐字比规范名**，不是「名字里带 haiku」。四份抓包里恒为
+    // `claude-haiku-4-5-20251001`；只比子串的话，haiku-3 / 3.5 / 将来某个 haiku 的一 token
+    // 请求都会被认成官方 4.5 那条探测。
+    if v.get("model").and_then(|m| m.as_str()) != Some(QUOTA_PROBE_MODEL) {
+        return false;
+    }
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let [only] = msgs.as_slice() else { return false };
+    if only.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    // 正文恰好是 `quota` 这一个词（字符串形态，或单个 text 块）。
+    match only.get("content") {
+        Some(serde_json::Value::String(s)) => s == "quota",
+        Some(serde_json::Value::Array(blocks)) => match blocks.as_slice() {
+            [b] => {
+                b.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && b.get("text").and_then(|t| t.as_str()) == Some("quota")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// 来访自己那串 `anthropic-beta`，切成逐项。给 [`CcRequestKind::of`] 用。
+fn inbound_beta_list(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("anthropic-beta")
+        .and_then(|x| x.to_str().ok())
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// 末条 `role:"user"` 消息的正文（首个 text 块，或字符串 content）是否以 `prefix` 开头。
+fn last_user_text_starts_with(v: &serde_json::Value, prefix: &str) -> bool {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let Some(last) =
+        msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return false;
+    };
+    let text = match last.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().find_map(|b| b.get("text").and_then(|t| t.as_str()))
+        }
+        _ => None,
+    };
+    text.is_some_and(|t| t.trim_start().starts_with(prefix))
+}
+
+/// **判据不能借用 [`is_official_non_main_beta`]**——那是「要不要补主线程那几项 beta」，
+/// 和「带不带会话关联字段」是两码事，六个 profile 上的分界线根本不在同一处：
+///
+/// | profile | 补主线程 beta | 带 `cc_prompt_id` / `diagnostics` |
+/// |---|---|---|
+/// | 主线程四族 | 是 | 是 / 是 |
+/// | SDK 子代理 | **否** | **是 / 是** |
+/// | 无工具 helper | 否 | 是 / 否 |
+/// | 标题生成 | 否 | 否 / 否 |
+/// | 安全分类 | 否 | 否 / 否 |
+/// | 额度探测 | 否 | 连 billing header 都没有 |
+///
+/// SDK 子代理正好落在两栏相反的那一格：它的 beta 集合不该被补，但它**确实**带着
+/// `cc_prompt_id` 与 `diagnostics`（`cap/2.1.260/00020`、`00025`）。两个判据混用，
+/// 它就被整个跳过了。
+///
+/// 故这里独立判：**只排除标题生成与安全分类**（这两类由各自独有的 beta 认出来），
+/// 其余 CC 形态的请求都补。无工具 helper 官方带 `cc_prompt_id` 但不带 `diagnostics`，
+/// 而 luban 认不出它（它没有任何独有标记），归到「补」这一侧——多一个 `diagnostics`
+/// 的代价小于整类子代理都缺关联链。
+fn client_session_link(
+    body: Option<&serde_json::Value>,
+    headers: &HeaderMap,
+    sim: Option<&Simulation>,
+    flags: store::ForwardFlags,
+    billable: bool,
+    cred: &crate::credentials::Credential,
+) -> Option<(String, CcSessionLink)> {
+    // 模拟那条路自己带链；`billing_cch` 是「允不允许动 billing header」的总开关。
+    if sim.is_some() || !billable || !flags.billing_cch {
+        return None;
+    }
+    let v = body?;
+    if !is_cc_shaped(v) {
+        return None;
+    }
+    let beta: Vec<String> = headers
+        .get("anthropic-beta")
+        .and_then(|x| x.to_str().ok())
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    // 逐类决定那三项各写不写，见 [`CcRequestKind`]。标题生成、安全分类与额度探测三项
+    // 全不写（后者连 billing header 都没有），整条就不必进链。
+    let kind = CcRequestKind::of(v, &beta);
+    if !kind.on_session_chain() {
+        return None;
+    }
+    // 客户端**自己的**会话 id：认不出合法 uuid 就不补——这条链是拿会话 id 当键的，
+    // 键都不可靠时接出来的「上一条」可能来自另一个客户端。
+    let session_id = incoming_session_id(headers, Some(v))?;
+    // 只有主线程会换新一轮 prompt id：`last_is_new_prompt_body` 只看末条消息，而
+    // 「猜下一句」与子代理的末条也常常是一句全新的 user 消息，照它判就会把整个会话的
+    // prompt id 带偏。
+    let new_prompt = kind.rotates_prompt() && crate::telemetry::last_is_new_prompt_body(v);
+    let mut link = CcSessionLink::load(
+        CcSessionKey { cred_id: cred.id, session_id: &session_id },
+        new_prompt,
+        kind.wants_prompt_id(),
+    );
+    if !kind.wants_prev_req() {
+        link.prev_req = None;
+    }
+    Some((session_id, link.with_diagnostics(kind.wants_diagnostics())))
+}
+
 /// 一条**非 Claude Code 请求**要装成官方客户端时的全部派生量。
 ///
 /// `Some` 即本条请求走模拟路径：转发头整套换成官方那套（[`official_headers`]）、`system`
@@ -4065,18 +5193,19 @@ struct Simulation {
     /// 按模型族选出的官方基座提示词；模型认不出来时 `None`——基座是逐字节从抓包取的，
     /// 猜错一族（把 sonnet 的 10682 字节发给 opus）比不发更糟。见 [`cc_system_base`]。
     base: Option<&'static str>,
-    /// 按模型族选出的 `anthropic-beta` 自有串（四族四份，见 [`cc_beta_seed`]）。
-    beta: &'static str,
-    /// 要不要在身份句与基座之间插 `# Reporting outcomes` 块：2.1.258 起只有 fable 族带，
-    /// 见 [`cc_system_reporting`]。
-    reporting: bool,
+    /// 这条请求要装成哪一类官方请求：beta 串、billing 后缀、`system` 块形态、`thinking`
+    /// 形态、`fallbacks` 与顶层键序全在里面，见 [`config::CcProfile`]。
+    profile: &'static config::CcProfile,
     /// `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里 `session_id` 的**同一个**取值：
     /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
     ///
-    /// 由「账号 + 设备指纹」派生而非每请求随机：真实客户端一个会话内多次请求共用一个
-    /// session_id，每请求一个新的等于宣告「每条请求都是新开的会话」。代价是同一设备的
-    /// session_id 永不变（真实客户端会随会话轮换），这条记在这儿。
+    /// **优先用来访自己那个**（[`incoming_session_id`]）：客户端各开各的会话，折叠成一个
+    /// 就是「一台设备上一个会话打了所有请求」。来访没带才按「账号 + 设备指纹」派生一个
+    /// ——那份是同设备恒定的，代价（真实客户端会随会话轮换）记在 [`session_id_for`]。
     session_id: String,
+    /// 这条请求在会话链条上的位置：`cc_prompt_id` / `cc_prev_req` /
+    /// `diagnostics.previous_message_id` 三个关联字段的取值，见 [`CcSessionLink`]。
+    link: CcSessionLink,
 }
 
 impl Simulation {
@@ -4090,6 +5219,7 @@ impl Simulation {
     /// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
     fn detect(
         body: Option<&serde_json::Value>,
+        headers: &HeaderMap,
         from_cc_client: bool,
         flags: store::ForwardFlags,
         cred: &crate::credentials::Credential,
@@ -4127,14 +5257,19 @@ impl Simulation {
             return None;
         }
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+        let profile = cc_profile_for(model);
+        // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个按设备派生的 id
+        // 上，就是「一台设备一个会话打了所有请求」——比每请求一个新 id 更假。来访没带才派生。
+        let session_id = incoming_session_id(headers, Some(v))
+            .unwrap_or_else(|| session_id_for(cred, device_fp));
+        let link = CcSessionLink::load(
+            CcSessionKey { cred_id: cred.id, session_id: &session_id },
+            crate::telemetry::last_is_new_prompt_body(v),
+            profile.has_billing_header(),
+        );
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
-        Some(Self {
-            base: cc_system_base(model),
-            beta: cc_beta_seed(model),
-            reporting: cc_system_reporting(model),
-            session_id: session_id_for(cred, device_fp),
-        })
+        Some(Self { base: cc_system_base(model), profile, session_id, link })
     }
 }
 
@@ -4197,41 +5332,143 @@ fn cc_system_base(model: &str) -> Option<&'static str> {
     }
 }
 
-/// 按模型族选 `anthropic-beta` 的客户端自有串：四族四份（opus / fable / sonnet / haiku），
-/// 均取自 `cap/2.1.258`。
+/// 按模型族选 2.1.260 的**主线程** profile。
 ///
-/// 四份不能合并的根本原因见 [`config::cc_beta_order_is_not_a_table`]。差异摘要：
-/// - opus 多 `context-1m`；
-/// - fable 无 `redact-thinking`，多 `thinking-display-updates`；
-/// - haiku 无 `effort`/`mid-conversation-system`，`claude-code` 在第 6 位而非队首；
-/// - 认不出的模型退回 sonnet 那份。
-fn cc_beta_seed(model: &str) -> &'static str {
+/// 模拟路径只造主线程形态：来访是第三方客户端，它的用途 luban 猜不出来，而主线程是唯一
+/// 一个「带工具、带 system、会多轮」的通用形态。把一条第三方请求装成 SDK 子代理
+/// （`cc_is_subagent=true`）或标题生成（`output_config.format=json_schema`）都会给上游一个
+/// 与请求内容对不上的用途标记，比装成主线程更假。
+///
+/// 例外是 luban 自己发的额度探测：那条本来就是官方 `QuotaProbe` 那个形态，由
+/// [`probe_simulation`] 直接指定 profile，不走这里。
+///
+/// 四族的差异见 [`config::CC_PROFILES`]；认不出的模型退回 sonnet 那份（与 2.1.258 时
+/// [`config::cc_beta_order_is_not_a_table`] 记的口径一致）。
+fn cc_profile_for(model: &str) -> &'static config::CcProfile {
+    config::cc_profile(cc_profile_kind_for(model))
+}
+
+/// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta`] 也用它（再按来访自报的
+/// 版本经 [`config::cc_profile_at`] 取对应那一版的行）。
+fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
     let m = model.to_ascii_lowercase();
     if m.contains("haiku") {
-        config::CC_BETA_SIMULATED_HAIKU
+        config::CcProfileKind::MainHaiku
     } else if m.contains("fable") {
-        config::CC_BETA_SIMULATED_FABLE
+        config::CcProfileKind::MainFable
     } else if m.contains("opus") {
-        config::CC_BETA_SIMULATED_OPUS
+        config::CcProfileKind::MainOpus
     } else {
-        config::CC_BETA_SIMULATED
+        config::CcProfileKind::MainSonnet
     }
 }
 
-/// 该模型族的官方 `system` 里有没有 `# Reporting outcomes` 块。
+/// 来访自己带的会话 id，**头和体都看**，且必须是合法的 uuid 形态。
 ///
-/// `cap/2.1.258`：fable-5-1（00013）有，opus-5（00012/00025）、sonnet-5（00026）、
-/// haiku-4.5（00031）都没有。2.1.251 时四族都有。fable-5 / mythos 在 2.1.258 没有样本，
-/// 按族归到 fable 一侧。
-fn cc_system_reporting(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("fable")
+/// 两个来源都要看：官方两处逐字相同，但第三方客户端常常只带其中一处——只认头，一个
+/// 在 `metadata.user_id` 里带了自己会话 id 的客户端就会被 luban 换成派生值，它的多轮
+/// 对话在上游看来成了「每一轮各自一个会话」。
+///
+/// **必须校验形态**（[`looks_like_uuid`]）。官方那个恒为 uuid v4，而这个值会同时写进
+/// `X-Claude-Code-Session-Id` 头和 `metadata.user_id`：
+///
+/// - 一个 `sess-42` 之类的短串本身就是判据——上游那边这个字段从来只有 uuid；
+/// - 更硬的是带控制字符/超长的值：`HeaderValue::from_str` 会失败，于是头上没有、体里
+///   却有，拼出「两处不一致」这个官方绝不产生的组合（[`official_headers`] 里那个
+///   `if let Ok(v)` 就是这么漏的）。
+///
+/// 校验不过就当没带，退回派生值——那至少是个自洽的 uuid。
+fn incoming_session_id(headers: &HeaderMap, body: Option<&serde_json::Value>) -> Option<String> {
+    // **两个来源各自校验**，不是「先取头、再拿结果去过校验」。后者会让一个非法的头
+    // **遮住**体里那个合法 uuid：`.or(from_body)` 在头存在时根本不看体，然后校验一挂，
+    // 整条退回派生值——客户端明明给了一个能用的会话 id。
+    let from_header = headers
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| looks_like_uuid(v))
+        .map(str::to_string);
+    // 体那侧走 [`extract_session_id`]——**两种 `metadata.user_id` 格式都认**。
+    let from_body = extract_session_id(body).filter(|s| looks_like_uuid(s));
+
+    match (from_header, from_body) {
+        // 两处都有且不同：官方这两处**逐字相同**，不同值说明来访自己就不自洽。
+        // 拒不拒由 [`store::ForwardFlags::reject_session_conflict`] 拨（默认拒，判在
+        // [`session_id_conflict`]）；关掉时退到这里，取头那个并留一行日志——不静默。
+        (Some(h), Some(b)) if h != b => {
+            tracing::warn!(
+                header = %h,
+                body = %b,
+                "inbound session id differs between the header and metadata.user_id;                  using the header (official CC sends the same value in both)"
+            );
+            Some(h)
+        }
+        (Some(h), _) => Some(h),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
-/// 来访自己带的 `X-Claude-Code-Session-Id`（非空才算）。补 metadata 时优先用它，
-/// 见 [`Upstream::bare_session`]。
-fn incoming_session_id(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get("x-claude-code-session-id")?.to_str().ok()?.trim();
-    (!v.is_empty()).then(|| v.to_string())
+/// 来访的会话 id 头体不一致时返回 `(头那个, 体那个)`；一致、或某一处没有/不合法时 `None`。
+///
+/// 官方 CC 的 `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里那个 `session_id`
+/// **逐字相同**。两处给出两个**都合法却不同**的 uuid，是官方从不产生的形态，而 luban 拿
+/// 会话 id 当会话链（`cc_prompt_id` / `cc_prev_req` / `diagnostics`）的键——选错一个就是把
+/// 两条链接到了一起，且没有任何办法在事后发现。
+///
+/// 只在两处**都是合法 uuid** 时才算冲突：一处非法时 [`incoming_session_id`] 本来就只认另
+/// 一处，那不是冲突，是客户端只给对了一个。
+fn session_id_conflict(
+    headers: &HeaderMap,
+    body: Option<&serde_json::Value>,
+) -> Option<(String, String)> {
+    let h = headers
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| looks_like_uuid(v))?
+        .to_string();
+    // 与 [`incoming_session_id`] 同一个解析器：扁平串（Windows 那种）也算「体里有」，
+    // 否则那一类客户端的头体冲突永远检测不到。
+    let b = extract_session_id(body).filter(|s| looks_like_uuid(s))?;
+    (h != b).then_some((h, b))
+}
+
+/// 这条请求**出站**时该落在 `X-Claude-Code-Session-Id` 头与 `metadata.user_id` 两处的
+/// 同一个会话 id（非模拟路径；模拟那条的在 [`Simulation::session_id`]）。`None` 即无从
+/// 决定，两处都保持来访原样。
+///
+/// 取值顺序就是 luban 内部已经在用的那套，只是把结论**送到出站**：
+///
+/// 1. `bare_session`（[`bare_session_id`]）——来访没有 `metadata.user_id`、由 luban 补一份
+///    的那条路。它自己已经是「来访头优先、否则按账号+设备派生」；
+/// 2. 否则 [`incoming_session_id`]——头体各自校验后选出来的那个合法值。
+///
+/// 两者都取不到时返回 `None`：这时来访要么两处都没有会话 id，要么带的两处都不是 uuid，
+/// 没有任何依据凭空造一个（`bare_session` 那条路才有派生的前提，见它的六个条件）。
+fn outbound_session_id(
+    headers: &HeaderMap,
+    body: Option<&serde_json::Value>,
+    bare_session: Option<&str>,
+) -> Option<String> {
+    match bare_session {
+        Some(sid) => Some(sid.to_string()),
+        None => incoming_session_id(headers, body),
+    }
+}
+
+/// 形如 `8-4-4-4-12` 的小写 hex uuid。只看形状，不校验 version/variant 位——官方发的是
+/// v4，但一个 v7 的 uuid 同样是个正常的会话 id，没有理由拦。
+fn looks_like_uuid(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let mut parts = s.split('-');
+    for want in groups {
+        let Some(p) = parts.next() else { return false };
+        if p.len() != want || !p.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return false;
+        }
+    }
+    parts.next().is_none()
 }
 
 /// 来访没带 `metadata.user_id` 时用来补一份的 session_id；不需要补时为 `None`。
@@ -4268,7 +5505,8 @@ fn bare_session_id(
     {
         return None;
     }
-    Some(incoming_session_id(headers).unwrap_or_else(|| session_id_for(cred, device_fp)))
+    // 走到这里必然没有 `metadata.user_id`（上面刚判过），体里也就没有会话 id 可取。
+    Some(incoming_session_id(headers, None).unwrap_or_else(|| session_id_for(cred, device_fp)))
 }
 
 /// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 设备指纹)` 取前 16 字节，
@@ -4304,15 +5542,18 @@ const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
 const MAX_SYSTEM_BLOCKS: usize = 5;
 
-/// 把非 CC 请求的 `system` 换成官方形态（2.1.258，fable 族五块、其余四块）：
+/// 把非 CC 请求的 `system` 换成官方形态（2.1.260，fable 族五块、其余四块）：
 ///
 /// ```text
 /// [0] x-anthropic-billing-header: …            无断点（cch 由 ensure_billing_cch 补）
 /// [1] You are Claude Code, …（57B）            无断点
-/// [2] # Reporting outcomes …（911B）            无断点，**只有 fable 族有**（cc_system_reporting）
-/// [·] 官方基座（按模型族）                      {ephemeral, scope:global}
-/// [·] 客户端自己的 system（并成一块）           {ephemeral}
+/// [2] # Reporting outcomes …（907B）            无断点，**只有 fable 族有**（CcSystemShape）
+/// [·] 官方基座（按模型族）                      {ephemeral, ttl:1h, scope:global}
+/// [·] 客户端自己的 system（并成一块）           {ephemeral, ttl:1h}
 /// ```
+///
+/// 块数与断点位置在 2.1.258 → 2.1.260 之间没变（`cap/2.1.260-2/00025` 对 opus、
+/// `cap/2.1.260/00018` 对 fable，逐块比对）。
 ///
 /// 客户端的 `system` 是字符串就裹成一个文本块，是数组就并成一块（见
 /// [`merge_system_blocks`]），没有就没有末块。
@@ -4326,6 +5567,11 @@ const MAX_SYSTEM_BLOCKS: usize = 5;
 /// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。预算在**合并之后**才算：
 /// 合并会消掉客户端 `system` 里那几个断点，先算就是按一个已经不存在的数字克扣基座。
 fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShape) -> bool {
+    // 官方就不发 `system` 的 profile（额度探测）：一个字节都不加。给它补 billing header
+    // 与基座，等于把一条 `max_tokens:1` 的探测装成了主线程请求。
+    if sim.profile.system == config::CcSystemShape::None {
+        return false;
+    }
     let client: Vec<serde_json::Value> = match v.get("system") {
         Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
             vec![text_block_bare(s)]
@@ -4342,10 +5588,10 @@ fn simulate_system(v: &mut serde_json::Value, sim: &Simulation, cache: CacheShap
     let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
     let mut blocks = vec![
-        text_block_bare(&simulated_billing_header_text()),
+        text_block_bare(&simulated_billing_header_text(sim)),
         text_block_bare(config::CC_SYSTEM_IDENTITY),
     ];
-    if sim.reporting {
+    if sim.profile.system == config::CcSystemShape::IdentityReporting {
         blocks.push(text_block_bare(config::CC_SYSTEM_REPORTING));
     }
     if let Some(base) = sim.base {
@@ -4381,10 +5627,16 @@ const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 /// 搬走后末块换成一行短占位（保持块数形态），内容作为 `<system_instructions>` 标签
 /// 注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
 /// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
+///
+/// **要么整个搬成，要么一个字节都不动。** 先确认 `messages[0].content` 是可写的形态，
+/// 再去动 `system`——反过来的话，落点不可写时（`content` 缺失、是数字、messages 为空）
+/// 就会得到「末块已经换成 `(see conversation)` 占位、内容却没搬到任何地方」的请求：
+/// 客户端明确下的那段指令**凭空消失**，而调用方只看到一个 `false`，以为什么都没发生。
 fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
     // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座)。多出来的那一块才是客户端
     // 自己的 system；块数不多于它就没有可搬的东西。
-    let fixed = 2 + usize::from(sim.reporting) + usize::from(sim.base.is_some());
+    let reporting = sim.profile.system == config::CcSystemShape::IdentityReporting;
+    let fixed = 2 + usize::from(reporting) + usize::from(sim.base.is_some());
     let sys = match v.get("system").and_then(|s| s.as_array()) {
         Some(a) if a.len() > fixed => a,
         _ => return false,
@@ -4394,28 +5646,45 @@ fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> b
         Some(t) if t.len() > MAX_CLIENT_SYSTEM_CHARS => t.to_string(),
         _ => return false,
     };
-    if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
-        let cc = blocks[last].get("cache_control").cloned();
-        let mut placeholder = text_block_bare("(see conversation)");
-        if let Some(cc) = cc {
-            placeholder.as_object_mut().map(|o| o.insert("cache_control".into(), cc));
-        }
-        blocks[last] = placeholder;
+    // 先探路：落点不可写就原地返回，`system` 还没被动过。
+    let writable = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.first())
+        .and_then(|f| f.get("content"))
+        .is_some_and(|c| c.is_array() || c.is_string());
+    if !writable {
+        tracing::warn!(
+            chars = tail_text.len(),
+            "messages[0].content is not writable, leaving the long client system in place"
+        );
+        return false;
     }
     let wrapped = format!("<system_instructions>\n{tail_text}\n</system_instructions>");
-    if let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut())
-        && let Some(first) = messages.first_mut()
+    // 走到这里两步都必定成功：上面刚验过 `content` 是数组或字符串。
+    if let Some(first) =
+        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.first_mut())
     {
         match first.get_mut("content") {
             Some(serde_json::Value::Array(arr)) => {
                 arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
             }
-            Some(serde_json::Value::String(s)) => {
-                let combined = format!("{wrapped}\n\n{s}");
-                *first.get_mut("content").unwrap() = serde_json::Value::String(combined);
+            Some(content @ serde_json::Value::String(_)) => {
+                let s = content.as_str().unwrap_or_default();
+                *content = serde_json::Value::String(format!("{wrapped}\n\n{s}"));
             }
             _ => return false,
         }
+    }
+    if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
+        let cc = blocks[last].get("cache_control").cloned();
+        let mut placeholder = text_block_bare("(see conversation)");
+        if let Some(cc) = cc
+            && let Some(o) = placeholder.as_object_mut()
+        {
+            o.insert("cache_control".into(), cc);
+        }
+        blocks[last] = placeholder;
     }
     tracing::info!(
         chars = tail_text.len(),
@@ -4541,24 +5810,63 @@ fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 /// 算法逆向自 2.1.251：取第一条用户消息 text 的第 4/7/20 位字符，拼上固定 salt 与
 /// 主版本号后 SHA-256 取前 3 个 hex 字符。模拟路径不走这条，见
 /// [`simulated_billing_header_text`]。
-fn billing_header_text(v: &serde_json::Value) -> String {
-    let suffix = cc_version_suffix(v);
-    format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli;",
-        config::CC_VERSION_BASE,
-        suffix,
-    )
+///
+/// **主版本取来访自报的那个**（`version`，由调用方从 UA 里解出），不是
+/// [`config::CC_VERSION_BASE`]：给一个 UA 写着 2.1.258 的来访补一条 `cc_version=2.1.260.…`
+/// 的 billing header，就是把两个版本混进了同一条请求。解不出版本（UA 缺失或不是
+/// `claude-cli/x.y.z` 形态）才退回 luban 自己那个。
+fn billing_header_text(
+    v: &serde_json::Value,
+    version: Option<&str>,
+    kind: CcRequestKind,
+) -> String {
+    let version = version.unwrap_or(config::CC_VERSION_BASE);
+    // **2.1.260 起用 profile 的固定后缀**，派生算法只留给更老的版本。
+    //
+    // 那套算法逆向自 2.1.251，在 2.1.260 上**已被证否**：六个 profile 各有固定后缀
+    // （`222`/`bcd`/`660`/`d95`/`ced`/`3de`），而算法对主线程样本算出的是 `11d`。给一个
+    // 2.1.260 的来访补一个算出来的后缀，等于发一个上游从没在这个版本上见过的值。
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    let suffix = match kind.billing_suffix_at(version, model) {
+        Some(fixed) => fixed.to_string(),
+        None => cc_version_suffix(v, version),
+    };
+    format!("x-anthropic-billing-header: cc_version={version}.{suffix}; cc_entrypoint=cli;")
 }
 
-/// 模拟路径的 billing header 正文：第四段写死 [`config::CC_VERSION_SUFFIX_SIMULATED`]
-/// （2.1.258 五份抓包全是 `1e2`），不走 [`cc_version_suffix`] 那套没在 2.1.258 上复核过的
-/// 派生算法。
-fn simulated_billing_header_text() -> String {
-    format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli;",
-        config::CC_VERSION_BASE,
-        config::CC_VERSION_SUFFIX_SIMULATED,
-    )
+/// 模拟路径的 billing header 正文，整条由 profile 与会话链条拼出。官方形态
+/// （`cap/2.1.260-2/00059`，分号后各有一个空格、末尾也有分号）：
+///
+/// ```text
+/// x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=f850a;
+///   cc_prev_req=req_011CeiBW8Yx9A2uzWiCBsJsU; cc_prompt_id=16d7a19d-…;
+/// ```
+///
+/// 各段的顺序是抓包序，六个 profile 一致：`cc_version` → `cc_entrypoint` → `cch` →
+/// `cc_is_subagent` → `cc_prev_req` → `cc_prompt_id`。`cch` 在这里就一次写好，不再等
+/// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
+///
+/// 第四段不再走 [`cc_version_suffix`] 那套派生算法：2.1.260 的六个 profile 各有各的固定
+/// 后缀（`222`/`bcd`/`660`/`d95`/`ced`/`3de`），派生算法对主线程样本算出的是 `11d`，
+/// 与哪一个都对不上。
+fn simulated_billing_header_text(sim: &Simulation) -> String {
+    let p = sim.profile;
+    let mut s = format!(
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch={};",
+        p.version,
+        p.billing_suffix,
+        cch_value(),
+    );
+    if p.subagent {
+        s.push_str(" cc_is_subagent=true;");
+    }
+    if let Some(prev) = &sim.link.prev_req {
+        s.push_str(&format!(" cc_prev_req={prev};"));
+    }
+    if let Some(pid) = &sim.link.prompt_id {
+        s.push_str(&format!(" cc_prompt_id={pid};"));
+    }
+    s
 }
 
 /// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251，2.1.258 未复核；模拟路径
@@ -4574,7 +5882,14 @@ fn simulated_billing_header_text() -> String {
 /// 的文本。官方客户端内部会跳过 `isMeta` 消息，但在实际请求 body 里这等价于第一条 user
 /// 消息的第一个 text 块（harness 注入的 system-reminder 也在同一个 user turn 的 content
 /// 数组里，排在用户实际输入之前）。
-fn cc_version_suffix(v: &serde_json::Value) -> String {
+///
+/// `version` 参与摘要，故它必须是**这条请求自报的**版本，与 `cc_version` 前三段同值。
+///
+/// 这套算法在 2.1.260 上**已被证否**：六个 profile 的后缀是固定的
+/// （`222`/`bcd`/`660`/`d95`/`ced`/`3de`，见 [`config::CC_PROFILES`]），而算法对主线程样本
+/// 算出 `11d`。它只剩「给 2.1.251 一代的来访补一个形状对的值」这一个用途，比不补强，
+/// 但别再拿它去解释 2.1.260 的抓包。
+fn cc_version_suffix(v: &serde_json::Value, version: &str) -> String {
     let text = first_user_text(v);
     let char_at = |i: usize| text.chars().nth(i).unwrap_or('0');
     let chars: String = [char_at(4), char_at(7), char_at(20)].iter().collect();
@@ -4583,7 +5898,7 @@ fn cc_version_suffix(v: &serde_json::Value) -> String {
     let mut h = Sha256::new();
     h.update(b"59cf53e54c78");
     h.update(chars.as_bytes());
-    h.update(config::CC_VERSION_BASE.as_bytes());
+    h.update(version.as_bytes());
     let digest = h.finalize();
     format!("{:02x}{:02x}", digest[0], digest[1]).chars().take(3).collect()
 }
@@ -5687,11 +7002,23 @@ fn rewrite_body(
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
     bare_session: Option<&str>,
+    // 出站两处要落的同一个会话 id（非模拟路径），见 [`outbound_session_id`]。头那侧由
+    // [`build_forward_headers_for`] 落，体这侧由 [`sync_metadata_session`] 落。
+    session_out: Option<&str>,
     force_stream: bool,
     tool_names: Option<&ToolNameMap>,
     // 出站头里已经带了 `thinking-display-updates` beta（由调用方从实际发出的头上判定）。
     // 只有它为真，fable 请求的 body 才补 `thinking.display:"updates"`，见 [`fill_thinking_display`]。
     display_beta: bool,
+    // 来访**自报**的客户端版本（`claude-cli/x.y.z`，解不出为 `None`）。只用在给真实 CC
+    // 补 billing header 时，见 [`ensure_cc_system_prefix`]。
+    client_version: Option<&str>,
+    // 真实 CC 来访要补的会话关联字段（`cc_prev_req` / `cc_prompt_id` /
+    // `diagnostics.previous_message_id`）；模拟路径为 `None`，它的链在 `sim.link` 里。
+    // 判据见 [`client_session_link`]。
+    client_link: Option<&CcSessionLink>,
+    // 这条来访属于哪一类官方 profile，见 [`CcRequestKind`]。
+    cc_kind: CcRequestKind,
 ) -> Bytes {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
@@ -5752,7 +7079,8 @@ fn rewrite_body(
     // 模拟路径下客户端没发 `thinking` 时补上官方默认值。官方 CC 恒带
     // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
     // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
-    let thinking_filled = sim.is_some() && flags.inject_thinking && ensure_thinking(&mut v);
+    let thinking_filled =
+        flags.inject_thinking && sim.is_some_and(|sim| ensure_thinking(&mut v, sim.profile));
     // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 补了 `thinking-display-updates`，
     // body 侧才配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
     // `display_beta` 取自实际发出的头——头上没那项 beta 时体里写 `updates` 是一发稳定 400
@@ -5763,9 +7091,19 @@ fn rewrite_body(
         && display_beta
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
+    // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），
+    // 见 [`ensure_diagnostics`]。只给带 billing header 的 profile 补——额度探测、标题生成
+    // 与安全分类官方都不发这个字段。
+    let diag =
+        sim.is_some_and(|s| s.profile.has_billing_header() && ensure_diagnostics(&mut v, &s.link));
+    // `fallbacks` 只归一形态、不替客户端开，见 [`ensure_fallbacks`]。
+    let fallbacks_shaped = sim.is_some_and(|s| ensure_fallbacks(&mut v, s.profile));
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
-    let msg_shape = sim.is_some() && align_message_shape(&mut v, cache);
+    // 只对带 `system` 的 profile 补：额度探测那条官方一个断点都没有（`cap/2.1.260-2/00004`），
+    // 给它标一个反倒是新破绽。
+    let msg_shape =
+        sim.is_some_and(|s| s.profile.has_billing_header()) && align_message_shape(&mut v, cache);
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
     // 封顶跟在两条整形之后：那两条产出的都是 ≤5 块，故只对它们都没管住的来访生效。
@@ -5775,8 +7113,33 @@ fn rewrite_body(
     // billing header 追加 cch，得先有 billing header 它才有东西追加。
     // simulate_cc 开着但这条请求没走模拟（CC 客户端）→ 可能缺 billing header。
     // simulate_cc 关着时不注入——用户明确不要模拟，不该凭空加 system。
-    let prefix_injected = flags.simulate_cc && !simulated && ensure_cc_system_prefix(&mut v);
+    //
+    // 判据是 `sim.is_none()` 而不是「`simulate_system` 有没有动过」：额度探测那个 profile
+    // 官方就不发 `system`（[`config::CcSystemShape::None`]），模拟路径特意没给它造，
+    // 这里再补一条 billing header 就把刚省下的形态又加了回去。
+    // **额度探测不补**（[`CcRequestKind::allows_system_prefix`]）：官方那条没有 `system`、
+    // 没有 billing header，补一份就把一条 `max_tokens:1` 的探测改成了「带身份声明的请求」。
+    // 判在这里而不是靠 `has_billing` 早退——那个判据只看「有没有 billing header」，
+    // 而额度探测正是「本来就不该有」的那一类。
+    let prefix_injected = flags.simulate_cc
+        && sim.is_none()
+        && cc_kind.allows_system_prefix()
+        && ensure_cc_system_prefix(&mut v, client_version, cc_kind);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
+    // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
+    // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。
+    let link_added = client_link.is_some_and(|l| {
+        // 没有 billing header 就整条不补：那种请求（额度探测那类）官方连 `cc_version` 都
+        // 不发，单给它一个 `diagnostics` 反而造出一个新组合。判在 `append_billing_link`
+        // 之外，因为后者「两项都已经在了」也返回 false，那种情况 `diagnostics` 还是要补。
+        if !has_billing_header(&v) {
+            return false;
+        }
+        let billing = append_billing_link(&mut v, l);
+        // `diagnostics` 同样是订阅端才有的（`cap/2.1.258-api` 六份一个都没有）。
+        let diag = l.diagnostics && ensure_diagnostics(&mut v, l);
+        billing || diag
+    });
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
     //
@@ -5791,7 +7154,13 @@ fn rewrite_body(
     // 模拟路径下客户端可能已带 `metadata.user_id`——它的 session_id 是客户端原值，
     // 而出站头上的 `X-Claude-Code-Session-Id` 取自 `sim.session_id`。两处不同值就是
     // 官方不产生的矛盾，先剥掉再让 `ensure_cc_metadata` 用 sim.session_id 重建。
+    //
+    // **必须和重建同一个条件。** 剥这一步原先只看 `sim.is_some()`，而下面重建那步要
+    // `flags.spoof_identity`：用户一旦关掉身份伪装，客户端自己带的 device/account/session
+    // 就被删掉、且没人补回来——头上还有会话 id、体里却什么都没有。那既违背这个开关的语义
+    // （「别改身份」被执行成了「把身份删了」），也违背客户端数据透传契约。
     if sim.is_some()
+        && flags.spoof_identity
         && let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut())
     {
         meta.remove("user_id");
@@ -5803,6 +7172,15 @@ fn rewrite_body(
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
     let spoofed =
         flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
+    // 客户端自带的那份 user_id 里，会话段要和出站头同值。跟在 [`spoof_identity`] 之后——
+    // 那一步刻意保留 session 段，这一步只在「luban 选的和它写的不是一个」时才动它。
+    //
+    // 与 `sim_meta`/`spoofed` 同一道闸（`spoof_identity`）：这仍是在改客户端写的身份字段，
+    // 用户把身份伪装整个关掉时，体照旧原样透传（头那侧的归一不受此闸影响——它落的就是
+    // 客户端自己给的那个合法值，见 [`outbound_session_id`]）。
+    let session_synced = flags.spoof_identity
+        && sim.is_none()
+        && session_out.is_some_and(|sid| sync_metadata_session(&mut v, sid));
     // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
@@ -5819,11 +7197,17 @@ fn rewrite_body(
         flags.strip_extra_fields && strip_extra_fields(&mut v, cc_inbound || thinking_filled);
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
-    let top_level_ordered = sim.is_some() && align_cc_top_level_order(&mut v);
+    let top_level_ordered =
+        sim.is_some_and(|sim| align_cc_top_level_order(&mut v, sim.profile.body_key_order));
     // 模拟路径且工具列表里没有任何 CC 官方工具名时，注入核心 CC 工具声明（Bash/Read/Edit/Write）。
     // 上游判第三方的信号之一是「自称 CC 但没有 CC 工具」，光加 mcp__ 前缀不够——
     // 零个 CC 工具等于自证不是 CC。注入的工具在白名单内，混淆不会动它们。
-    let cc_tools_injected = sim.is_some() && inject_cc_tools(&mut v);
+    //
+    // **只给主线程 profile 注**：官方的标题生成、安全分类、无工具 helper 与额度探测本来就
+    // 一个工具都不发（`tools: []` 或整个字段都没有），给它们塞 Bash 是把一条辅助请求装成
+    // 了主线程。判据是 profile，不是「有没有 tools 字段」。
+    let cc_tools_injected =
+        sim.is_some_and(|s| s.profile.has_billing_header() && inject_cc_tools(&mut v, s.profile));
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
     // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
     let tools_deduped = dedup_tools(&mut v);
@@ -5845,11 +7229,15 @@ fn rewrite_body(
         shaped,
         capped,
         spoofed,
+        session_synced,
         prefix_injected,
         cch_added,
+        link_added,
         thinking_filled,
         display_filled,
         ctx_mgmt,
+        diag,
+        fallbacks_shaped,
         msg_shape,
         ttl_filled,
         streamed,
@@ -5871,12 +7259,15 @@ fn rewrite_body(
         && !capped
         && !spoofed
         && !cch_added
+        && !link_added
         && !simulated
         && !sys_relocated
         && !sim_meta
         && !thinking_filled
         && !display_filled
         && !ctx_mgmt
+        && !diag
+        && !fallbacks_shaped
         && !msg_shape
         && !ttl_filled
         && !streamed
@@ -6006,6 +7397,84 @@ fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(String, Stri
 /// 相同，换掉它是反关联策略而非形态要求）。account 段照换：那才是两种模式真正的差别。
 ///
 /// 凭证无 `account_uuid`（如旧库未回填）或 user_id 结构无法识别时不改动，返回 `false`。
+/// 把来访自带的 `metadata.user_id` 里那个 `session_id` 段对齐到出站头上的取值，
+/// **保持原格式**（内嵌 JSON 定点替换 / 扁平串重拼），已经同值时不动。
+///
+/// [`spoof_identity`] 刻意保留 session 段——那是客户端自己的会话，luban 没有理由换掉它。
+/// 但「保留」与「出站两处同值」只在客户端自己就自洽时不冲突：头是 `sess-42`、体里是合法
+/// uuid，或两处给了两个不同的合法 uuid 时，[`incoming_session_id`] 已经替这条请求选定了
+/// 一个，出站两处就都得是它——否则发出去的是一份官方绝不产生的请求（那两处逐字相同）。
+///
+/// 那份 user_id **没有会话段**时补上：内嵌 JSON 在收尾 `}` 前追加 `"session_id"`（官方键序
+/// device → account → session，追加在末尾正好对齐），扁平串追加 `_session_<sid>` 段。
+/// 客户端自带 user_id 又带了合法会话头、体里却没有会话段，是官方绝不产生的组合——放行等于
+/// 把矛盾原样送到上游。这是 [`replace_json_str_field`]「不新增字段」取舍的唯一例外，且只发
+/// 生在头体本就该同值的这一处。
+///
+/// 两种格式都认不出来（既不是 JSON 对象也不是 `user_<dev>_account_<acct>` 形态）时不动。
+/// 返回是否改动过。
+fn sync_metadata_session(v: &mut serde_json::Value, session_id: &str) -> bool {
+    let Some(user_id) = v.get_mut("metadata").and_then(|m| m.get_mut("user_id")) else {
+        return false;
+    };
+    let Some(inner) = user_id.as_str().map(str::to_string) else { return false };
+
+    // 格式一：CC 内嵌 JSON。先确认那个字段确实在、且值不同，再对原串定点替换——
+    // 重新序列化会把空白与转义写法一起归一化，只有定点替换逐字节不变。
+    if let Some(obj) =
+        serde_json::from_str::<serde_json::Value>(&inner).ok().as_ref().and_then(|v| v.as_object())
+    {
+        match obj.get("session_id").and_then(|s| s.as_str()).map(str::trim) {
+            Some(cur) if cur == session_id => return false,
+            Some(_) => {
+                if let Some(next) = replace_json_str_field(&inner, "session_id", session_id) {
+                    *user_id = serde_json::Value::String(next);
+                    return true;
+                }
+                return false;
+            }
+            // 没有会话段：在收尾 `}` 前追加。官方把 session_id 放在最后一位，追加即对齐；
+            // 对原串定点插入而非重新序列化，其余内容逐字节不变。
+            None => {
+                let Some(next) = append_json_str_field(&inner, "session_id", session_id) else {
+                    return false;
+                };
+                *user_id = serde_json::Value::String(next);
+                return true;
+            }
+        }
+    }
+
+    // 格式二：扁平串（Windows 那类）——device 与 account 段原样，只换 session 段。
+    if let Some(flat) = parse_flat_user_id(&inner) {
+        if flat.session.trim() == session_id {
+            return false;
+        }
+        *user_id = serde_json::Value::String(format!(
+            "user_{}_account_{}_session_{}",
+            flat.device, flat.account, session_id
+        ));
+        return true;
+    }
+    // 扁平串缺 session 段（`user_<dev>_account_<acct>`）：整段追加。[`parse_flat_user_id`]
+    // 要求三段齐全（其余调用方读的是完整身份），故这里单独判前两段。
+    if inner.starts_with("user_") && inner.contains("_account_") {
+        *user_id = serde_json::Value::String(format!("{inner}_session_{session_id}"));
+        return true;
+    }
+    false
+}
+
+/// 在紧凑 JSON **对象**字符串的收尾 `}` 前追加一个字符串字段 `"key":"val"`，其余内容逐字节
+/// 不变。与 [`replace_json_str_field`] 配对：那边只改已有字段，这边只加不存在的。调用方须已
+/// 确认该字段不存在且 `s` 是对象；`val` 与 `key` 同为 hex/uuid/标识符，无需 JSON 转义。
+/// 串不以 `}` 收尾（前后有空白时也算）返回 `None`。
+fn append_json_str_field(s: &str, key: &str, val: &str) -> Option<String> {
+    let body = s.strip_suffix('}')?;
+    let sep = if body.trim_end().ends_with('{') { "" } else { "," };
+    Some(format!("{body}{sep}\"{key}\":\"{val}\"}}"))
+}
+
 fn spoof_identity(
     v: &mut serde_json::Value,
     cred: &crate::credentials::Credential,
@@ -6091,12 +7560,15 @@ fn replace_json_str_field(s: &str, key: &str, new_val: &str) -> Option<String> {
 ///
 /// 官方客户端只在订阅(OAuth)模式下发这个字段，API-key 模式（接入 luban 的形态）不发，
 /// 于是「OAuth token + 无 cch」是个确定性判据。抓包实测补齐后与真实客户端形态一致：
-/// `…cc_version=2.1.218.0b9; cc_entrypoint=cli; cch=00000;`
+/// `…cc_version=2.1.260.222; cc_entrypoint=cli; cch=f850a;`
 ///
 /// 只在该块确实是 billing header、且尚无 `cch=` 时改写；其余情况返回 `false` 不动结构。
 ///
-/// 注意：`system[0]` 位于第一个缓存断点之前，属于被缓存的前缀——改写它会让**部署后的第一次
-/// 请求**缓存未命中一次。因此 `cch` 的取值必须对同一前缀保持稳定，见 [`cch_value`]。
+/// **这条路只服务真实 CC 来访。** 模拟路径的 billing header 由
+/// [`simulated_billing_header_text`] 一次拼好（cch 也在里面），走不到这里。
+///
+/// `system[0]` 位于第一个缓存断点之前，直觉上「每请求变的 cch 会打爆 prompt cache」——
+/// **抓包证否了这一点**，上游不把 billing header 算进缓存键，见 [`cch_value`]。
 fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
     let blk = match v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut()) {
         Some(b) => b,
@@ -6123,26 +7595,88 @@ fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
     }
 }
 
+/// `system[0]` 是不是一条 billing header。
+fn has_billing_header(v: &serde_json::Value) -> bool {
+    v.get("system")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
+}
+
+/// 给**真实 CC 来访**那条 billing header 追加会话关联字段：`cc_prev_req` 与
+/// `cc_prompt_id`，落在 `cch` 之后（官方段序，见 [`simulated_billing_header_text`]）。
+///
+/// API-key 端的 CC 一个都不发，而订阅端官方每条主线程请求都有；luban 拿 OAuth token 转出去
+/// 之后缺着，就是「OAuth 请求没有会话关联」这个官方不产生的形态。要不要补由
+/// [`client_session_link`] 判，这里只管拼串。
+///
+/// 客户端**自己已经写了**哪一项就不动那一项——它比我们更清楚自己的链。
+fn append_billing_link(v: &mut serde_json::Value, link: &CcSessionLink) -> bool {
+    let blk = match v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut()) {
+        Some(b) => b,
+        None => return false,
+    };
+    let text = match blk.get("text").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => return false,
+    };
+    if !text.starts_with("x-anthropic-billing-header:") {
+        return false;
+    }
+    let mut s = text.trim_end().to_string();
+    let mut changed = false;
+    if !s.ends_with(';') {
+        s.push(';');
+    }
+    if let Some(prev) = &link.prev_req
+        && !s.contains("cc_prev_req=")
+    {
+        s.push_str(&format!(" cc_prev_req={prev};"));
+        changed = true;
+    }
+    if let Some(pid) = &link.prompt_id
+        && !s.contains("cc_prompt_id=")
+    {
+        s.push_str(&format!(" cc_prompt_id={pid};"));
+        changed = true;
+    }
+    if !changed {
+        return false;
+    }
+    match blk.get_mut("text") {
+        Some(t) => {
+            *t = serde_json::Value::String(s);
+            true
+        }
+        None => false,
+    }
+}
+
 /// [`ensure_thinking`] 补 `thinking` 的 `max_tokens` 下限：再小的请求，思考预算本身就塞不进去，
 /// 不值得加，见该函数文档的「三种情况不补」。
 const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 
-/// 模拟路径下补 `thinking`，形态按模型族取自 `cap/2.1.258`：
+/// 模拟路径下补 `thinking`，形态取自 profile（[`config::CcThinking`]，2.1.260 抓包）：
 ///
-/// - haiku：`{"budget_tokens": N, "type": "enabled"}`（00031，`budget_tokens` 在前），
+/// - `EnabledUpdates`（haiku 族）：`{"budget_tokens": N, "type": "enabled",
+///   "display": "updates"}`（`cap/2.1.260/00020`，`budget_tokens` 在前），
 ///   `N = max_tokens - 1`（`max_tokens: 32000` → `31999`）；
-/// - fable：`{"type": "adaptive", "display": "updates"}`（00013，配 seed 里的
-///   `thinking-display-updates` beta）；
-/// - opus / sonnet / 其余：`{"type": "adaptive"}`（00012/00025/00026）。
+/// - `AdaptiveUpdates`（opus / fable / sonnet 主线程）：
+///   `{"type": "adaptive", "display": "updates"}`（`cap/2.1.260-2/00025`、`cap/2.1.260/00018`）。
+///   2.1.258 时只有 fable 带 `display`，2.1.260 起 opus 也带了；
+/// - `Disabled` / `Absent`：不补——helper / 标题 / 分类那几个 profile 官方就是
+///   `{"type":"disabled"}` 或整个不发，而模拟路径只造主线程形态，走不到这里。
 ///
 /// 别给 opus-5 / sonnet-5 / fable 发 `enabled + budget_tokens`：这几个模型上 `budget_tokens`
 /// 直接 400。
 ///
 /// 三种情况不补：
 /// - 客户端自己带了 `thinking`（`disabled`/`null`/`enabled` 都算——那是它自己的选择）；
+/// - `tool_choice` 强制工具调用（上游不允许两者并存）；
 /// - `max_tokens` 太小（< 1024）：thinking 本身要消耗 token 预算，探测级请求不值得加。
-fn ensure_thinking(v: &mut serde_json::Value) -> bool {
-    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_ascii_lowercase();
+fn ensure_thinking(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     if obj.contains_key("thinking") {
         return false;
@@ -6161,17 +7695,26 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     if max_tokens < THINKING_MIN_MAX_TOKENS {
         return false;
     }
-    let value = if model.contains("haiku") {
-        let budget = max_tokens.saturating_sub(1).max(1);
-        // 官方 key 序是 `budget_tokens` → `type`，手工插入以保住顺序。
-        let mut m = serde_json::Map::new();
-        m.insert("budget_tokens".into(), serde_json::Value::Number(budget.into()));
-        m.insert("type".into(), "enabled".into());
-        serde_json::Value::Object(m)
-    } else if model.contains("fable") {
-        serde_json::json!({"type": "adaptive", "display": "updates"})
-    } else {
-        serde_json::json!({"type": "adaptive"})
+    let value = match profile.thinking {
+        config::CcThinking::Enabled | config::CcThinking::EnabledUpdates => {
+            let budget = max_tokens.saturating_sub(1).max(1);
+            // 官方 key 序是 `budget_tokens` → `type` → `display`，手工插入以保住顺序
+            // （`cap/2.1.260/00020`）。
+            let mut m = serde_json::Map::new();
+            m.insert("budget_tokens".into(), serde_json::Value::Number(budget.into()));
+            m.insert("type".into(), "enabled".into());
+            if profile.thinking == config::CcThinking::EnabledUpdates {
+                m.insert("display".into(), "updates".into());
+            }
+            serde_json::Value::Object(m)
+        }
+        config::CcThinking::Adaptive => serde_json::json!({"type": "adaptive"}),
+        config::CcThinking::AdaptiveUpdates => {
+            serde_json::json!({"type": "adaptive", "display": "updates"})
+        }
+        // 模拟路径只造主线程 profile，这两支走不到；真走到了就是「客户端没写、官方也不写」，
+        // 不补才是对的。
+        config::CcThinking::Disabled | config::CcThinking::Absent => return false,
     };
     insert_top_level(
         v,
@@ -6182,20 +7725,74 @@ fn ensure_thinking(v: &mut serde_json::Value) -> bool {
     true
 }
 
-/// fable 族 CC 请求补 `thinking.display:"updates"`：订阅端官方 fable-5-1 发的是
-/// `{"type":"adaptive","display":"updates"}`（`cap/2.1.258/00013`），API-key 端发裸 `adaptive`。
-/// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由 [`cc_beta_seed`]
-/// 判（种子里有 `thinking-display-updates` 的才算）。
+/// 补 `diagnostics.previous_message_id`：同会话上一条回复的 `message.id`，会话第一条写
+/// `null`。
+///
+/// **字段恒在，值可为 null**——`cap/2.1.260-2/00013`、`00025`、`00057` 三份首轮全是
+/// `{"previous_message_id":null}`，而不是不发 `diagnostics`。少这个字段与写错值同样是
+/// 一个稳定差异。
+///
+/// 官方位置在 `output_config` 之后、`stream` 之前；`insert_top_level` 找不到锚点时追加，
+/// 随后 [`align_cc_top_level_order`] 会按 profile 的键序归位，故这里的锚点只是省一次搬动。
+///
+/// 客户端自己带了 `diagnostics` 就不动——那是它自己的字段，替它改属于越权。
+/// 官方不发这个字段的 profile（`cap/2.1.260-2/00063` 那条「猜下一句」、额度探测、
+/// 标题生成、安全分类）由调用方按 profile 判，不在这里判。
+fn ensure_diagnostics(v: &mut serde_json::Value, link: &CcSessionLink) -> bool {
+    if v.get("diagnostics").is_some() {
+        return false;
+    }
+    let value = match &link.prev_message_id {
+        Some(id) => serde_json::json!({ "previous_message_id": id }),
+        None => serde_json::json!({ "previous_message_id": serde_json::Value::Null }),
+    };
+    insert_top_level(
+        v,
+        "diagnostics",
+        value,
+        &["output_config", "context_management", "thinking", "max_tokens", "metadata", "model"],
+    );
+    true
+}
+
+/// `fallbacks` 的**形态**归一：2.1.258 的官方 fable 发字符串 `"default"`，2.1.260 换成了
+/// 数组 `[{"model":"claude-opus-5"}]`（`cap/2.1.260/00018`）。
+///
+/// **只在客户端自己已经要了 fallback 时改形态，不替它凭空开。** 这个字段声明的是「本模型
+/// 拒答/不可用时由服务端改用别的模型跑」——模型换了计价也跟着换，那是用户该自己拨的语义，
+/// 不是形态。故模拟出的 fable 请求比官方少这一个顶层字段，这是**有意偏离**，不是遗漏
+/// （同 [`config::known_fingerprint_gaps`] 第 7 条）。
+///
+/// 客户端已经发了数组形态（自己就是 2.1.260 一代）时原样不动。
+fn ensure_fallbacks(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
+    let Some(official) = profile.fallbacks else { return false };
+    // 只认字符串形态的旧写法；已经是数组（或别的我们不认识的形态）就不动。
+    if !v.get("fallbacks").is_some_and(|f| f.is_string()) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(official) else { return false };
+    let Some(obj) = v.as_object_mut() else { return false };
+    // `insert` 对已有键原位改值（`preserve_order`），键序不动。
+    obj.insert("fallbacks".into(), value);
+    true
+}
+
+/// CC 请求补 `thinking.display:"updates"`：订阅端官方发的是
+/// `{"type":"adaptive","display":"updates"}`（2.1.258 只有 fable-5-1 这样，`00013`；
+/// 2.1.260 起 opus 主线程也是，`cap/2.1.260-2/00025`），API-key 端发裸 `adaptive`。
+/// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由
+/// [`cc_profile_for`] 判（该族的官方串里有 `thinking-display-updates` 的才算）。
 ///
 /// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body`] 的 `display_beta`）：`updates`
 /// 是 beta 才认的取值，头上没声明时上游回 400 `Input should be 'summarized', 'omitted'`。
 /// 2026-09-02 一条 `claude-vscode, agent-sdk/0.3.258` 的 fable-5-1 请求就是这样被拒的——它的
 /// beta 串没有 `advisor-tool`，[`merge_beta`] 按老世代处理不补，体里却写了。
+///
+/// 那个前提也是**唯一**的门槛：本函数不再自己按模型族判一遍。哪一族在哪一版发这项 beta
+/// 是 [`merge_beta`] 的事（它按来访自报的版本查 [`config::cc_profile_at`]），在这里再判
+/// 一次只会两处口径分头漂移——2.1.260 起 opus 主线程也发 `display:"updates"`，
+/// 原来那句「只有 fable」的判断当场就成了错的。
 fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
-    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
-    if !cc_beta_seed(model).contains(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
-        return false;
-    }
     let Some(th) = v.get_mut("thinking").and_then(|t| t.as_object_mut()) else { return false };
     if th.get("type").and_then(|t| t.as_str()) != Some("adaptive") || th.contains_key("display") {
         return false;
@@ -6212,8 +7809,8 @@ fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
 /// 四个模型族无一例外，连 haiku 那两份也一样。这与 `thinking`/`output_config` 那种逐族不同
 /// 的字段不是一类，不存在「补哪一份」的选择问题。
 ///
-/// **为什么该补**：这个字段要 `context-management-2025-06-27` 认，而两份 seed
-/// （[`config::CC_BETA_SIMULATED`] 与 [`config::CC_BETA_SIMULATED_HAIKU`]）**都带着它**。
+/// **为什么该补**：这个字段要 `context-management-2025-06-27` 认，而 [`config::CC_PROFILES`]
+/// 里**每一个** profile 的 beta 串都带着它。
 /// 不补就是「头上声明了 context-management、体里零个 `edits`」——与
 /// [`ensure_beta_query`] 要消灭的那个组合同一个形状，只是落在体上。
 ///
@@ -6274,17 +7871,23 @@ fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     true
 }
 
-/// `cch` 的取值。当前是常量 [`config::BILLING_CCH`]。
+/// `cch` 的取值：**每请求一个随机的 5 位小写 hex**。
 ///
-/// 真实算法无法从抓包反推，所以这里只能给占位值。**代价**：它跨账号恒定，所有经由 luban
-/// 的请求都带同一个真实客户端从不产生的 `cch`，上游一按此聚类就把所有账号串成一串。
+/// 真实算法仍未知（同账号内逐请求变化，18 组候选输入 × 6 种摘要均未命中），所以这只是个
+/// **形态模拟值**——形状对了，语义没有对齐，别当成已经对齐来读。
 ///
-/// 想改成每账号不同，把本函数换成从「已在缓存前缀内的内容」派生即可，例如
-/// `sha256(account_uuid ‖ system[1..] 文本)` 取前 5 位小写 hex：前缀不变则取值不变，
-/// 不会打爆 prompt cache，同时每个账号各自不同。（若上游会校验 cch 与内容的对应关系，
-/// 两种做法都是错值——那种情况下正确的选择是根本不补，见 config 里的说明。）
-fn cch_value() -> &'static str {
-    config::BILLING_CCH
+/// 从原先那个跨账号恒定的 `00000` 改成随机，是因为恒定值本身
+/// 就是判据：所有经由 luban 的请求都带同一个真实客户端从不产生的 `cch`，上游一按此聚类
+/// 就把所有账号串成一串。而抓包里同一账号相邻两条请求是 `993e1`、`e2d04`、`b504f`……
+/// 每条都不同（`cap/2.1.260-2`）。
+///
+/// **不会打爆 prompt cache**：这一点是抓包证出来的，不是推的。`cap/2.1.260-2` 的 00057 →
+/// 00059 是同一会话的连续两条，`system[0]` 的 cch 与 `cc_prompt_id` 都变了，00059 的
+/// `cache_creation_input_tokens` 仍只有 81（首条是 8482），也就是前缀照样命中。上游显然
+/// 不把 billing header 那一块算进缓存键——否则官方客户端自己也一次都缓存不上。
+fn cch_value() -> String {
+    let n: u32 = rand::rng().random_range(0..0x10_0000);
+    format!("{n:05x}")
 }
 
 /// 把 API-key 模式的 3 块 `system` 改写成订阅模式的 4 块，并把全部缓存断点对齐到官方形态。
@@ -6452,8 +8055,14 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
 ///    是客户端在强制选工具，`disable_parallel_tool_use` 也是它要的行为，删了就是改语义。
 ///    删掉的那种对模型零影响：`auto` 本来就是缺省。
 ///
-/// 2. **`thinking.type == "disabled"`**：fable-5 等模型不支持显式关闭思考，会直接 400。
+/// 2. **`thinking.type == "disabled"`**：fable 族不支持显式关闭思考，会直接 400。
 ///    删掉整个 `thinking` 字段让上游走 adaptive 默认值。
+///
+///    **只对 fable 族删。** 这一条曾是无条件的，那是错的：`{"type":"disabled"}` 是
+///    2.1.260 三个官方 profile（无工具 helper、标题生成、安全分类）的**正常形态**
+///    （`cap/2.1.260/00024`、`cap/2.1.260-2/00058`、`cap/2.1.260/00019`，模型分别是 haiku
+///    与 sonnet）。把它当成「官方从不发的多余字段」删掉，等于把一条官方形态的请求改成了
+///    官方不产生的形态，还顺带把客户端「不要思考」的意图翻成了「随你」——那是要花钱的。
 ///
 /// 3. **`thinking.display`**：2.1.251 及之前官方发的是裸的 `{"type":"adaptive"}`；**2.1.258 起
 ///    fable 族官方自己也发 `display:"updates"`**（`cap/2.1.258/00013`，配着
@@ -6470,15 +8079,22 @@ fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
 /// 由调用方传 `keep_display = true` 跳过——2.1.258 起 `display` 是官方形态的一部分。
 /// 判定要在模拟**之前**做（[`rewrite_body`] 里的 `cc_inbound`）：模拟一跑 body 就都是 CC 形态了。
 fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
+    let fable = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().contains("fable"));
     let Some(obj) = v.as_object_mut() else { return false };
     let mut changed = false;
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
         obj.remove("tool_choice");
         changed = true;
     }
-    // `thinking.type == "disabled"`：fable-5 等模型不支持，直接 400。删掉整个 `thinking`
+    // `thinking.type == "disabled"`：fable 族不支持，直接 400。删掉整个 `thinking`
     // 字段让上游走 adaptive 默认值——客户端的意图（不要深度思考）近似保留，好过打不通。
-    if obj.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str()) == Some("disabled")
+    // 别的族**不动**：那是 2.1.260 三个官方辅助 profile 的正常形态，见函数文档第 2 项。
+    if fable
+        && obj.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str())
+            == Some("disabled")
     {
         obj.remove("thinking");
         changed = true;
@@ -6577,37 +8193,22 @@ fn is_default_tool_choice(v: &serde_json::Value) -> bool {
         .is_some_and(|o| o.len() == 1 && o.get("type").and_then(|t| t.as_str()) == Some("auto"))
 }
 
-/// 官方 Claude Code 对话请求的顶层键序。
+/// 把请求对象改成 profile 的顶层键序（[`config::CcProfile::body_key_order`]），
+/// 并保证 `stream` 在最后。
 ///
-/// 八份 `cap/raw/*.req.raw` 与 `cap/2.1.258` 五份都保持这个相对顺序。haiku 没有
-/// `output_config`，fable 多一个 `fallbacks`，首轮之外的请求有 `diagnostics`，但共有键一个都
-/// 没挪位。模拟后若仍保留 `model, system, messages, ... stream,
-/// tools` 这种来访顺序，即使字段集已对齐，也仍是一个稳定的第三方指纹。
-const CC_BODY_KEY_ORDER: &[&str] = &[
-    "model",
-    "messages",
-    "system",
-    "tools",
-    "metadata",
-    "max_tokens",
-    "thinking",
-    "context_management",
-    "fallbacks",
-    "output_config",
-    "diagnostics",
-];
-
-/// 把请求对象改成 [`CC_BODY_KEY_ORDER`] 的顺序，并保证 `stream` 在最后。
+/// **键序按 profile 分**：主线程那串（[`config::CC_BODY_ORDER_MAIN`]）套不到安全分类
+/// （`max_tokens` 在第二位、`system` 在 `messages` 前）与额度探测（只有四个键）上，
+/// 硬套出来的是官方从不产生的排列。
 ///
 /// 不认识的字段可能有语义，不能丢；保留它们彼此的原始顺序，放在已知字段与 `stream`
 /// 之间。本函数只在 [`Simulation`] 路径调用，真 CC 请求继续保留客户端的字节与顺序。
-fn align_cc_top_level_order(v: &mut serde_json::Value) -> bool {
+fn align_cc_top_level_order(v: &mut serde_json::Value, order: &[&str]) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     let before: Vec<String> = obj.keys().cloned().collect();
     let mut old = std::mem::take(obj);
     let mut ordered = serde_json::Map::new();
 
-    for key in CC_BODY_KEY_ORDER {
+    for key in order {
         if let Some(value) = old.shift_remove(*key) {
             ordered.insert((*key).to_string(), value);
         }
@@ -6766,24 +8367,57 @@ fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> 
 /// **模型会不会调这些工具**：概率很低。客户端的 system prompt 会指名自己的工具
 /// （被混淆成 `mcp__luban__*`），模型优先响应 system 的指令。万一调了，客户端收到一个
 /// 自己没声明的 tool_use，按协议返回错误 tool_result 即可，不影响会话继续。
-static CC_TOOLS_CORE: std::sync::LazyLock<Vec<serde_json::Value>> =
+/// 官方核心四工具（Bash / Read / Edit / Write）的声明，**逐 profile 一份**。
+///
+/// **同一版本里不同模型族的工具描述并不相同**：`cap/2.1.260-2/00025`（opus）与
+/// `cap/2.1.260/00018`（fable）四个工具的 schema **无一相同**——opus 的 Bash 多了
+/// `Foreground sleep is blocked; use Monitor with an until-loop` 那句，Read 的换行说明
+/// 也换了写法。原先一份 2.1.258 的资产给所有族用，等于把上一版、别的族的措辞发出去。
+static CC_TOOLS_CORE_OPUS: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("assets/cc_tools_core.json"))
-            .expect("cc_tools_core.json must be a valid JSON array of tool objects")
+        serde_json::from_str(include_str!("assets/cc_tools_core_opus.json"))
+            .expect("cc_tools_core_opus.json must be a valid JSON array of tool objects")
     });
 
-/// 如果 `tools` 里没有任何 CC 官方工具名，把 [`CC_TOOLS_CORE`] 注入到数组头部。
-/// 已有 CC 工具的请求不注入（真 CC 客户端或已经抄了 CC 声明的中转）。
-fn inject_cc_tools(v: &mut serde_json::Value) -> bool {
-    if has_cc_tool_profile(v) {
-        return false;
+static CC_TOOLS_CORE_FABLE: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("assets/cc_tools_core_fable.json"))
+            .expect("cc_tools_core_fable.json must be a valid JSON array of tool objects")
+    });
+
+/// 按 profile 取核心工具声明。
+///
+/// sonnet / haiku 主线程**没有 2.1.260 样本**（同 [`config::CC_PROFILES`] 里那两行外推的
+/// beta），退回 opus 那份：至少版本对得上——发一份 2.1.258 的措辞是「版本混用」，而这里
+/// 只是「同版本里族别可能不对」，后者更小。抓到样本后在这里加一行即可。
+fn cc_tools_core(profile: &config::CcProfile) -> &'static [serde_json::Value] {
+    match profile.kind {
+        config::CcProfileKind::MainFable => &CC_TOOLS_CORE_FABLE,
+        _ => &CC_TOOLS_CORE_OPUS,
     }
+}
+
+/// 如果 `tools` 里没有任何 CC 官方工具名，把该 profile 的核心工具注入到数组头部。
+/// 已有 CC 工具的请求不注入（真 CC 客户端或已经抄了 CC 声明的中转）。
+fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
+    // **不能借 [`has_cc_tool_profile`] 判**：那个函数回答的是「这看起来像不像真的 CC
+    // 客户端」，对「没带 tools」和「`tools: []`」都答**是**（判不出来就不冤枉人）。而这里
+    // 问的是「这条请求已经有官方工具了吗」——空数组的答案显然是**没有**。
+    // 借用之后，一条 `tools: []` 的主线程请求就永远注不进工具，正是「零个 CC 工具等于
+    // 自证不是 CC」那个要消灭的形态。
     let tools = match v.get_mut("tools").and_then(|t| t.as_array_mut()) {
         Some(t) => t,
+        // 压根没有这个键：官方的无工具 helper / 标题 / 分类就是这个样子，别凭空造一个。
         None => return false,
     };
+    let has_official = tools.iter().any(|t| {
+        t.get("name").and_then(|n| n.as_str()).is_some_and(|n| config::CC_TOOL_NAMES.contains(&n))
+    });
+    if has_official {
+        return false;
+    }
     let mut injected = 0usize;
-    for stub in CC_TOOLS_CORE.iter().rev() {
+    for stub in cc_tools_core(profile).iter().rev() {
         let name = stub.get("name").and_then(|n| n.as_str()).unwrap_or("?");
         if !tools.iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)) {
             tools.insert(0, stub.clone());
@@ -7296,7 +8930,14 @@ fn text_block(text: &str, cache_control: serde_json::Value) -> serde_json::Value
 ///
 /// **不是模拟**——不换头、不改工具名、不加基座，只在 system 最前面插两块。
 /// 已有 billing header 的（`is_cc_shaped` 命中 billing 那条路、或模拟已补过的）跳过。
-fn ensure_cc_system_prefix(v: &mut serde_json::Value) -> bool {
+///
+/// `version` 是这个来访**自报**的客户端版本（从它自己的 UA 里解出），补出来的
+/// `cc_version` 就用它，见 [`billing_header_text`]。
+fn ensure_cc_system_prefix(
+    v: &mut serde_json::Value,
+    version: Option<&str>,
+    kind: CcRequestKind,
+) -> bool {
     let has_billing = match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
             b.get("text")
@@ -7309,8 +8950,10 @@ fn ensure_cc_system_prefix(v: &mut serde_json::Value) -> bool {
     if has_billing {
         return false;
     }
-    let prefix =
-        vec![text_block_bare(&billing_header_text(v)), text_block_bare(config::CC_SYSTEM_IDENTITY)];
+    let prefix = vec![
+        text_block_bare(&billing_header_text(v, version, kind)),
+        text_block_bare(config::CC_SYSTEM_IDENTITY),
+    ];
     match v.get_mut("system") {
         Some(serde_json::Value::Array(blocks)) => {
             for (i, blk) in prefix.into_iter().rev().enumerate() {
@@ -7478,7 +9121,7 @@ impl LimitScope {
 /// 3. **超额族窗口不算账号额度**：第二版把「任一窗口被拒/打满」一律判账号级，于是上面那条
 ///    把整个账号冷却了 24 小时——可它满掉的只是**超额/回补池**（`7d_oi` 比基础 7d 的
 ///    利用率还高，说明两边记的不是同一笔账；fable 走的正是这个池子，见
-///    [`config::CC_BETA_SIMULATED`] 里关于 `fallback-credit` 的注）。实测在 7d_oi 仍
+///    [`config::CC_BETA_FALLBACK_CREDIT`] 的注）。实测在 7d_oi 仍
 ///    rejected 期间，同一账号的 sonnet/opus 连通性测试照常 200——账号好好的，只有 fable
 ///    没路。故 `_oi`/`overage` 窗口被拒只判**模型级**，账号级只看基础窗口。
 ///
@@ -8356,12 +9999,7 @@ pub async fn probe(
     let flags = store::ForwardFlags::default();
     // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
     // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。
-    let sim = Simulation {
-        base: cc_system_base(model),
-        beta: cc_beta_seed(model),
-        reporting: cc_system_reporting(model),
-        session_id: session_id_for(cred, &device_fp),
-    };
+    let sim = probe_simulation(cred, &device_fp, model);
     let headers =
         build_forward_headers_for(&HeaderMap::new(), &token, flags, Some(&sim), None, Some(model));
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
@@ -8396,14 +10034,19 @@ pub async fn probe(
         flags,
         billable: true,
         sim: Some(sim),
-        // 走的是模拟那条路（sim 恒为 Some），会话 id 在 Simulation 里。
+        // 走的是模拟那条路（sim 恒为 Some），会话 id 在 Simulation 里，出站两处也都取它。
         bare_session: None,
+        session_out: None,
         // 连通性测试保持非流式：它下面那套读法（`up.bytes()` 一把梭 + [`probe_report`] 按
         // 整段 Message 解析出 model/error_type）是照非流式响应写的，改成 SSE 就全得跟着改，
         // 而这条请求本来就不是客户端流量（`max_tokens:1` 的 ping），形态对齐的收益也不在这。
         force_stream: false,
         // 探测体不带 `tools`（见 [`probe_body`]），没有可混淆的名字。
         tool_names: None,
+        // 同上：模拟路径的链在 `sim` 里。
+        client_link: None,
+        // 连通性测试自己造 body，形态由 profile 定，不必再判一次。
+        cc_kind: CcRequestKind::Main,
     };
 
     let body = probe_body(model);
@@ -8442,7 +10085,7 @@ pub async fn probe(
             let quota = ProbeQuota::from_info(&info);
             // `content-encoding` 同样得在消费响应前看；解不开的编码下 body 是乱码字节，
             // 封号判定必须跳过（与转发路径同一条宁漏勿误的规则）。
-            let (_, content_encoding) = resp_shape(&up);
+            let (is_sse, content_encoding) = resp_shape(&up);
             let compressed = content_encoding.is_some();
             // `up.bytes()` 会吃掉 `up`，上游的 request-id 先取走给流水用。
             let upstream_request_id = header_opt(up.headers(), "request-id");
@@ -8554,6 +10197,11 @@ pub async fn probe(
                     }
                 }
                 Ok(Ok(bytes)) => {
+                    // 主线程形态的探活是流式的（官方主线程恒为 `stream:true`），回来的是
+                    // SSE。把它攒回一条整段 Message，后面那套读法（封号判定、
+                    // [`probe_report`] 解 model/error_type）就不必分两种。攒不出来时退回
+                    // 原始字节——错误响应本来就是整段 JSON，不走 SSE。
+                    let bytes = if is_sse { aggregate_probe_sse(&bytes) } else { bytes };
                     plog.record(status, &bytes, &info, upstream_request_id.as_deref());
                     // 命中封号特征照真实流量停用：判定器与转发共用同一个（含 401 裸响应、
                     // 「端点不支持」豁免那些规则），测试报出「已封禁」的同时卡片也变红，
@@ -8609,12 +10257,455 @@ pub async fn probe(
 ///
 /// 不发 `stream: true`（官方客户端恒为流式）：一条 1 token 的响应用非流式读最省事，而这
 /// 属于任何 API 客户端都会产生的常规形态，不是「真实客户端不产生」的那类破绽。
-fn probe_body(model: &str) -> Bytes {
-    let v = serde_json::json!({
-        "model": model,
-        "messages": [{ "role": "user", "content": "ping" }],
-        "max_tokens": 1,
+/// 这条请求**实际发出去的** `metadata.user_id` 里那份身份。
+#[derive(Debug, Clone, Default)]
+struct OutboundIdentity {
+    device_id: String,
+    account_uuid: String,
+    /// 出站体里那串 `user_id` 的**原文**（连编码形态一起）。
+    ///
+    /// 额度探测直接复用它，而不是拿上面两个字段重新拼一份 JSON：客户端可能用的是
+    /// Windows 那种扁平串（`user_<device>_account_<account>_session_<session>`，
+    /// 见 [`parse_flat_user_id`]），[`spoof_identity`] 改写完仍是扁平串。重新拼成 JSON
+    /// 就会出现「同一个会话的两条请求，一条扁平一条 JSON」这种官方不产生的组合。
+    ///
+    /// 出站体压根没有 `metadata.user_id` 时为 `None`。
+    raw_user_id: Option<String>,
+}
+
+/// 从**已经改写完的出站体**里读身份，而不是重新按 `(cred, device_fp)` 派生一份。
+///
+/// 两者在默认配置下相同，但开关一改就分家：
+///
+/// - `spoof_device_id = false`（严格抓包对齐模式支持的行为）：主请求里的 `device_id`
+///   **保留客户端自己的**，只换 `account_uuid`；
+/// - `spoof_identity = false`：整份身份原样透传，一个字段都不动。
+///
+/// 这两种配置下再去派生一份，握手/额度探测/启动遥测报的就是另一台设备，而主请求报的是
+/// 客户端那台——同一个会话在上游看来来自两台机器。所以只能读出站体。
+///
+/// **两种编码都要认。** 只解 JSON 的话，Windows 那种扁平串会解析失败、退回「device 为空
+/// + 凭证账号」——主请求有设备、握手却没有，比不补更显眼。
+///
+/// 只有**整个 `user_id` 都不存在**时才退回凭证的 `account_uuid`（事件的 `auth` 块总得有个
+/// 账号）。字段存在但为空时照实报空——那才是「实际出站身份」，`spoof_identity` 关掉时
+/// 尤其如此。
+///
+/// 这里会把整个出站体解析一遍。**只在会话第一条请求上调用一次**，那点开销可以接受；
+/// 换成按 `(cred, device_fp, flags)` 重算一份逻辑，就得把 `spoof_identity` /
+/// `ensure_cc_metadata` 的分支在这里抄第二份，迟早对不上。
+fn outbound_identity(sent: &Bytes, cred: &crate::credentials::Credential) -> OutboundIdentity {
+    let no_identity = || OutboundIdentity {
+        device_id: String::new(),
+        account_uuid: cred.account_uuid.clone().unwrap_or_default(),
+        raw_user_id: None,
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(sent) else { return no_identity() };
+    let Some(raw) = v.get("metadata").and_then(|m| m.get("user_id")).and_then(|u| u.as_str())
+    else {
+        return no_identity();
+    };
+    // 形态一：CC 的内嵌 JSON。
+    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw)
+        && inner.is_object()
+    {
+        let pick = |k: &str| inner.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        return OutboundIdentity {
+            device_id: pick("device_id"),
+            account_uuid: pick("account_uuid"),
+            raw_user_id: Some(raw.to_string()),
+        };
+    }
+    // 形态二：Windows 那种扁平串。
+    if let Some(flat) = parse_flat_user_id(raw) {
+        return OutboundIdentity {
+            device_id: flat.device,
+            account_uuid: flat.account,
+            raw_user_id: Some(raw.to_string()),
+        };
+    }
+    // 认不出的第三种形态：原文照样留着给额度探测复用，字段只能空着。
+    OutboundIdentity {
+        device_id: String::new(),
+        account_uuid: cred.account_uuid.clone().unwrap_or_default(),
+        raw_user_id: Some(raw.to_string()),
+    }
+}
+
+/// 把额度探测的 `metadata.user_id` 换成**主请求实际发出去的那串原文**。
+///
+/// 官方那条额度探测与同会话的首条 messages 是同一个进程发的，`metadata.user_id` 逐字节
+/// 相同——**包括编码形态**。所以这里复用原文而不是拿字段重拼：客户端可能用的是 Windows
+/// 那种扁平串，重拼成 JSON 就成了「同一会话一条扁平一条 JSON」。
+///
+/// 主请求没发身份（`raw_user_id` 为 `None`）时原样交回：那种情况下探测体里
+/// [`ensure_cc_metadata`] 造的那份就是它唯一能有的身份，换掉反而更不一致。
+fn with_outbound_identity(body: Bytes, ident: &OutboundIdentity) -> Bytes {
+    let Some(raw) = ident.raw_user_id.as_deref() else { return body };
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return body };
+    match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        Some(meta) => {
+            meta.insert("user_id".into(), raw.into());
+        }
+        None => {
+            let mut meta = serde_json::Map::new();
+            meta.insert("user_id".into(), raw.into());
+            insert_top_level(&mut v, "metadata", serde_json::Value::Object(meta), &["messages"]);
+        }
+    }
+    serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
+}
+
+/// 一个会话在本进程里的起点，供 [`spawn_session_handshake`] 用。
+///
+/// 模拟路径与真实 CC 路径都能给出这三样，只是来源不同：前者取 [`Simulation`]，
+/// 后者取 [`client_session_link`] 那条链 + 客户端自报的版本。
+struct SessionStart<'a> {
+    session_id: &'a str,
+    /// 写进遥测身份的客户端版本。模拟路径取 profile 的，真实 CC 取它自报的那个。
+    version: String,
+    prompt_id: &'a str,
+    /// 这条来访走的是模拟路径吗。决定要不要补无鉴权的公共请求，
+    /// 见 [`crate::oauth::HandshakeRunner::public_traffic`]。
+    simulated: bool,
+}
+
+/// 从两条路里取会话起点；不是新会话（或这条请求不在链上）时 `None`。
+fn session_start<'a>(
+    sim: Option<&'a Simulation>,
+    client_link: Option<&'a (String, CcSessionLink)>,
+    client_version: &str,
+) -> Option<SessionStart<'a>> {
+    if let Some(s) = sim {
+        return s.link.first_seen.then(|| SessionStart {
+            session_id: &s.session_id,
+            version: s.profile.version.to_string(),
+            prompt_id: s.link.prompt_id.as_deref().unwrap_or_default(),
+            simulated: true,
+        });
+    }
+    let (sid, link) = client_link?;
+    link.first_seen.then(|| SessionStart {
+        session_id: sid,
+        // 真实 CC 用**它自报的**版本：这个会话在上游那边就是那个版本的客户端在跑，
+        // 握手事件里报 luban 自己那个版本等于把两个版本混进同一个会话。
+        version: client_version.to_string(),
+        prompt_id: link.prompt_id.as_deref().unwrap_or_default(),
+        simulated: false,
+    })
+}
+
+/// 替一个**新会话**在后台跑一遍官方启动握手（policy_limits / settings / eval /
+/// penguin / MCP registry / bootstrap …，见 [`crate::oauth::HandshakeRunner`]）。
+///
+/// **模拟与真实 CC 两条路都发。** 曾经只给模拟路径发，理由是「真实 CC 自己会打这一串」
+/// ——那是错的。要对齐形态的是 **luban 这张凭证**在上游眼里的样子；客户端自己那串（如果
+/// 它真的登录过）走的是**它自己的账号**，luban 这张凭证一条都收不到。
+/// `cap/2.1.258-api` 正好证到：那台机器的 bootstrap/penguin 带的是它自己的
+/// `sk-ant-oat01-…`，而经 luban 转发的那一侧**没有** policy_limits / settings / eval /
+/// mcp_servers / code_triggers / metrics / 额度探测。于是「一个只发 messages、从不拉策略
+/// 配置的 OAuth 账号」本身就是判据。
+///
+/// **只在会话的第一条请求上发一次**（[`CcSessionLink::first_seen`]，键含 cred_id，
+/// 见 [`CC_SESSIONS`]）。同一会话后续请求、以及 30 分钟一跳的保活循环，都不会再走到
+/// 这里——保活那边发的是它自己那份周期端点，两者的触发条件不重叠：保活是「按时间」，
+/// 这里是「按新会话」，撞在一起时由 `oauth::handshake_recent` 拦一道。
+async fn spawn_session_handshake(
+    state: &crate::web::AppState,
+    cred: &crate::credentials::Credential,
+    token: &str,
+    sent: &Bytes,
+    start: SessionStart<'_>,
+    out: &HeaderMap,
+    model: Option<&str>,
+) {
+    let Ok(client) = state.clients.for_credential(cred) else { return };
+    let display_model = model.unwrap_or("claude-sonnet-5").to_string();
+    // 身份取**这条主请求实际发出去的那份**，见 [`outbound_identity`]。
+    let ident = outbound_identity(sent, cred);
+    let snapshot = crate::telemetry::SessionSnapshot {
+        session_id: start.session_id.to_string(),
+        device_id: ident.device_id.clone(),
+        account_uuid: ident.account_uuid.clone(),
+        version: start.version.clone(),
+        model: display_model.clone(),
+        // 会话级 beta 从**实际发出的**头上筛，与遥测那边同一套口径。
+        betas: crate::telemetry::session_betas(
+            out.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or_default(),
+        ),
+        prompt_id: start.prompt_id.to_string(),
+        started_wall: std::time::SystemTime::now(),
+    };
+    let h = crate::telemetry::Handshake {
+        snapshot,
+        // bootstrap 的 `model=` 是规范名，去掉展示名里的 `[1m]`。
+        model: display_model.split('[').next().unwrap_or(&display_model).to_string(),
+    };
+    let org = state.telemetry.org_uuid(cred.id);
+    // 无鉴权的公共请求（mcp-registry / downloads）只给模拟客户端补：真实 CC 自己就在发
+    // 那几条（`cap/2.1.258-api` 里它们是客户端直连打的，不经 luban），再补一遍就是同一台
+    // 机器把同一批公共端点打了两遍。见 [`crate::oauth::HandshakeRunner::public_traffic`]。
+    let simulated = start.simulated;
+    let runner = crate::oauth::HandshakeRunner::new(cred, h, org, simulated);
+
+    // 整串握手跑在**一个**后台任务里，严格按抓包的先后来：
+    //
+    // ```text
+    // policy_limits + settings（并发） → eval → 额度探测 → 收尾那批
+    // ```
+    //
+    // **必须是同一个任务。** 拆成「lead 一个任务 + 限时等它 + 再 spawn rest」看着等价，
+    // 其实不是：等超时之后 rest 就发了，而 lead 可能还卡在 policy/settings 上，于是线上
+    // 顺序变成 `policy/settings → rest → eval → quota`——抓包里 eval 与额度探测是排在
+    // penguin/mcp/bootstrap 那批**之前**的。串在一个任务里，这个交错构造不出来。
+    //
+    // 调用方只**限时等一个信号**（额度探测发完），拿到或超时都继续发主请求：
+    //
+    // - 拿到 → 与抓包一致（那四条都在首条 messages 之前，+0/+1/+1442/+1648ms，
+    //   主请求 +2492ms）；
+    // - 超时 → 只是不再等，任务照跑到底。**不能用 `timeout` 直接套 future**：那会把它
+    //   整个 drop 掉、正在飞的请求当场取消，而 `note_handshake` 已经把这张凭证标成
+    //   「刚握过手」、保活也会跳过自己那份——两头都不发，这个会话的启动流量就整个没了。
+    let (probe_done, wait_probe) = tokio::sync::oneshot::channel::<()>();
+    let client_for_task = client.clone();
+    let token_for_task = token.to_string();
+    let cred_for_task = cred.clone();
+    let session_id = start.session_id.to_string();
+    let probe_version = start.version.clone();
+    tokio::spawn(async move {
+        handshake_sequence(
+            runner.lead(&client_for_task, &token_for_task),
+            send_quota_probe(
+                &client_for_task,
+                &token_for_task,
+                &cred_for_task,
+                &ident,
+                &probe_version,
+                &session_id,
+            ),
+            runner.rest(&client_for_task, &token_for_task),
+            probe_done,
+        )
+        .await;
+        // downloads 那两条离会话起点很远（+9.7s / +125s），且**无鉴权**——跟 rest 挤在
+        // 同一秒发完就是把两条本该稀稀拉拉的后台请求塞进了启动风暴。只给模拟客户端补：
+        // 真实 CC 自己就在发。见 [`crate::oauth::HandshakeRunner::downloads`]。
+        if simulated {
+            runner.downloads(&client_for_task).await;
+        }
     });
+
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_millis(config::HANDSHAKE_LEAD_TIMEOUT_MS),
+        wait_probe,
+    )
+    .await;
+    if waited.is_err() {
+        tracing::debug!(
+            cred_id = cred.id,
+            "session handshake lead is still running past the cap; sending the first request \
+             anyway (the handshake keeps going in order in the background)"
+        );
+    }
+}
+
+/// 串行跑完握手三段，并在**额度探测发完之后**发出放行信号。
+///
+/// 抽成一个函数是为了让「顺序」本身可测（[`tests::handshake_runs_in_capture_order`]）——
+/// 这段代码唯一的职责就是顺序，而顺序错了不会有任何编译期或运行期症状，只会在上游那边
+/// 看到一个真实客户端不产生的时序。
+///
+/// 放行信号发在 `quota` 之后、`rest` 之前：抓包里 eval 与额度探测排在 penguin/mcp/
+/// bootstrap 那批之前，而那批与首条 messages 是重叠的。
+async fn handshake_sequence(
+    lead: impl std::future::Future<Output = ()>,
+    quota: impl std::future::Future<Output = ()>,
+    rest: impl std::future::Future<Output = ()>,
+    probe_done: tokio::sync::oneshot::Sender<()>,
+) {
+    lead.await;
+    quota.await;
+    // 接收端可能已经等超时走了，`send` 失败是正常情形。
+    let _ = probe_done.send(());
+    rest.await;
+}
+
+/// 官方启动串里那条额度探测：`POST /v1/messages?beta=true`，haiku、`max_tokens:1`、
+/// 正文就一个词 `quota`（`cap/2.1.260-2/00004`）。
+///
+/// **只在模拟路径的新会话上补**（调用点已经判过）：真实 CC 自己每次启动都会发一条，经
+/// luban 转发过去，再补一条就是同一个会话发了两遍。
+///
+/// **代价是实打实的**：每个新的模拟会话多一次上游调用。输出只有 1 个 token，钱可以忽略，
+/// 但它**占一次请求数**——5h 窗口按请求数也算一笔。不想要就关掉 `api_telemetry`，那条开关
+/// 连这条一起管。
+///
+/// 结果只记 debug：这条既不是客户端流量，也不该影响任何转发判定，失败了就当没发过。
+async fn send_quota_probe(
+    client: &wreq::Client,
+    token: &str,
+    cred: &crate::credentials::Credential,
+    ident: &OutboundIdentity,
+    version: &str,
+    session_id: &str,
+) {
+    let model = QUOTA_PROBE_MODEL;
+    let flags = store::ForwardFlags::default();
+    let sim = Simulation {
+        base: None,
+        profile: config::cc_profile(config::CcProfileKind::QuotaProbe),
+        session_id: session_id.to_string(),
+        // 额度探测不在会话链上：官方那条既没有 billing header，也没有 `diagnostics`。
+        link: CcSessionLink::default(),
+    };
+    let mut headers =
+        build_forward_headers_for(&HeaderMap::new(), token, flags, Some(&sim), None, Some(model));
+    // **UA 跟着这个会话的版本走**，不是 luban 自己那个。
+    //
+    // 探测体与 beta 在 2.1.258 与 2.1.260 上**逐字节相同**（`cap/2.1.258/00004` ↔
+    // `cap/2.1.260-2/00004`），唯一的差别就是 UA 里那个版本号。而
+    // [`official_headers`] 用的是 [`config::CC_SIM_HEADERS`] 里钉死的
+    // [`config::CC_USER_AGENT`]，不改的话，一个 2.1.258 客户端的会话里会冒出一条
+    // `claude-cli/2.1.260` 的额度探测——同一会话里混了两个版本。
+    if let Ok(v) = HeaderValue::from_str(&format!("claude-cli/{version} (external, cli)")) {
+        headers.insert(header::USER_AGENT, v);
+    }
+    let body = rewrite_body(
+        &probe_body(model),
+        cred,
+        // 身份下面整份覆盖，这里的指纹只是 `ensure_cc_metadata` 的占位。
+        "",
+        flags,
+        Some(&sim),
+        None,
+        // 模拟路径：会话 id 走 `sim.session_id`，出站归一那步不参与。
+        None,
+        false,
+        None,
+        false,
+        None,
+        None,
+        CcRequestKind::QuotaProbe,
+    );
+    // **身份与这个会话的主请求逐字相同**：官方那条额度探测与首条 messages 是同一个进程
+    // 发的，`metadata.user_id` 里三个字段一模一样。`spoof_device_id` / `spoof_identity`
+    // 关掉时主请求发的是客户端自己那份，这里也必须跟着，否则同一会话两条请求在上游看来
+    // 来自两台设备。
+    let body = with_outbound_identity(body, ident);
+    let url = ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL));
+    let sent =
+        client.post(&url).headers(headers).orig_headers(orig_header_case()).body(body).send().await;
+    match sent {
+        Ok(r) => tracing::debug!(
+            cred_id = cred.id,
+            status = r.status().as_u16(),
+            session = %session_id.chars().take(8).collect::<String>(),
+            "quota probe sent"
+        ),
+        Err(e) => tracing::debug!(cred_id = cred.id, error = %e, "quota probe failed"),
+    }
+}
+
+/// 连通性测试那条请求的 [`Simulation`]：profile 直接指定 [`config::CcProfileKind::QuotaProbe`]。
+///
+/// 不走 [`Simulation::detect`]——这条请求是 luban 自己发的裸请求（body 里没有那句身份
+/// 声明），detect 只会在开关关掉时返回 `None`，那样发出去必被上游拒。
+///
+/// **只有 haiku 才用 `QuotaProbe`。** 官方那条额度探测**恒为 haiku-4.5**
+/// （`cap/2.1.260-2/00004`、`00021`、`00047` 三份都是），它的形状——`max_tokens:1`、
+/// 无 `system`、无 billing header、正文 `quota`、那一小串 beta——是和这个模型绑在一起的。
+/// 把一条 opus-5 或 fable 的连通性测试也套成这个形状，发出去的是「一个 opus 请求长着额度
+/// 探测的皮」，官方从不产生；而连通性测试恰恰要逐个模型都测一遍。
+///
+/// 别的模型退回该族的主线程 profile：多花一个基座的写入价（约 300 / 2700 token，且带
+/// `scope:global` 断点，全网共用一份、基本走缓存读价），换一条真实存在的形态。
+fn probe_simulation(
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    model: &str,
+) -> Simulation {
+    // **逐字比规范名**，不是「名字里带 haiku」：官方那条额度探测恒为
+    // `claude-haiku-4-5-20251001`（[`QUOTA_PROBE_MODEL`]），haiku-3 / 3.5 / 将来某个 haiku
+    // 都不该套那身皮——它们的连通性测试要走正常主线程探针。
+    let haiku = model == QUOTA_PROBE_MODEL;
+    let profile = if haiku {
+        config::cc_profile(config::CcProfileKind::QuotaProbe)
+    } else {
+        cc_profile_for(model)
+    };
+    Simulation {
+        base: if haiku { None } else { cc_system_base(model) },
+        profile,
+        session_id: session_id_for(cred, device_fp),
+        link: CcSessionLink::default(),
+    }
+}
+
+/// 把连通性测试收到的 SSE 攒回一条整段 Message；攒不出来就原样交回。
+///
+/// 与转发那条路共用 [`SseAggregator`]——两边对「什么算一条完整回复」的判断必须是同一套，
+/// 不然会出现「测试说通了、真实请求却是半截流」这种自相矛盾的结论。
+fn aggregate_probe_sse(bytes: &[u8]) -> Bytes {
+    let mut agg = SseAggregator::default();
+    agg.feed(bytes);
+    match agg.finish() {
+        Aggregated::Message(msg) | Aggregated::UpstreamError(msg) => serde_json::to_vec(&msg)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::copy_from_slice(bytes)),
+        // 半截流：原样交回，让 [`probe_report`] 按「解不出 Message」如实报告，而不是
+        // 悄悄报成成功。
+        Aggregated::Incomplete(_) => Bytes::copy_from_slice(bytes),
+    }
+}
+
+/// 主线程 profile 的连通性测试用的 `max_tokens`。
+///
+/// 官方主线程发的是 64000，但那个数字会被上游按「声明的输出预算」记进限流窗口，也被
+/// luban 自己的 [`note_upstream_send`] 记一笔——一次手动探活占掉 64000 的预算，一轮把
+/// 四个模型都测一遍就是 256000。取 1024：这是 [`THINKING_MIN_MAX_TOKENS`] 的下限，
+/// 低于它 [`ensure_thinking`] 就不补 `thinking`，跟着 `context_management` 也没了，
+/// 整条又退回那个「有主线程 system/beta、却没有 thinking」的混合形态。
+///
+/// 与官方的差别只剩这一个字段的**取值**（客户端本来就可以自己配），不再是**字段缺失**。
+const PROBE_MAIN_MAX_TOKENS: u64 = THINKING_MIN_MAX_TOKENS;
+
+/// 连通性测试的请求体，按 profile 分两种。
+///
+/// **haiku → 官方额度探测的逐字形态**（`cap/2.1.260-2/00004`）：键序
+/// `model → max_tokens → messages → metadata`（`metadata` 由 [`ensure_cc_metadata`] 补），
+/// 正文就是 `quota` 这一个词。
+///
+/// **其余模型 → 一条真正的主线程请求**。这里不能只换个 profile 就完事：`max_tokens:1`
+/// 的体配上主线程的 system/beta，会得到一条**没有 `thinking`、没有 `context_management`、
+/// 没有 `output_config`、非流式**的请求——抓包里不存在这种东西，而且它也验证不了正常
+/// 主线程链路（客户端真实流量走的是流式 + thinking 那条）。故这里把主线程该有的字段一次
+/// 给齐，剩下的 `system` / `tools` / `metadata` / `diagnostics` 由 [`rewrite_body`] 按同一
+/// 套规则补——测试与真实转发共用一套改写，这是这条测试存在的意义。
+///
+/// 代价：非 haiku 的探活会真的生成一小段回复（含 adaptive thinking），比 1 个 token 贵。
+/// 换来的是「测通了」真的等于「主线程这条路通了」。
+fn probe_body(model: &str) -> Bytes {
+    // 判据与 [`probe_simulation`] 必须同源：一个说「套 QuotaProbe profile」、另一个说
+    // 「发主线程体」，就会拼出一条谁都不是的请求。
+    let v = if model == QUOTA_PROBE_MODEL {
+        serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "quota" }],
+        })
+    } else {
+        serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "quota" }],
+            // 空数组由 [`inject_cc_tools`] 填成官方那四个；**这个键必须在**，
+            // 缺了那个函数就当是「官方无工具 helper」而不补。
+            "tools": [],
+            "max_tokens": PROBE_MAIN_MAX_TOKENS,
+            // 官方主线程恒带（`cap/2.1.260-2/00025`）；luban 没有别处会补它。
+            "output_config": { "effort": "high" },
+            "stream": true,
+        })
+    };
     // 常量结构，序列化不会失败；真失败了也会以上游 400 的形式如实报出来，不必在这里 panic。
     Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
 }
@@ -8861,6 +10952,10 @@ mod tests {
 
     /// `rewrite_body` 的测试简写：固定不做流式化。绝大多数用例验的是 system/metadata 那几项
     /// 改写，流式化另有专门用例（[`forces_stream_true_and_keeps_key_order`]）。
+    ///
+    /// `session_out` 跟着 `bare_session` 走——转发路径上「来访没带 metadata」那条正是这个
+    /// 关系（见 [`super::outbound_session_id`]）。只验出站归一的用例直接调
+    /// [`rewrite_body_with_session`]。
     fn rewrite_body(
         body: &Bytes,
         cred: &crate::credentials::Credential,
@@ -8869,9 +10964,37 @@ mod tests {
         sim: Option<&super::Simulation>,
         bare_session: Option<&str>,
     ) -> Bytes {
+        rewrite_body_with_session(body, cred, device_fp, flags, sim, bare_session, bare_session)
+    }
+
+    /// [`rewrite_body`] 的完整版：`bare_session`（要不要补一份 metadata）与 `session_out`
+    /// （出站两处要落的那个会话 id）分开给。
+    fn rewrite_body_with_session(
+        body: &Bytes,
+        cred: &crate::credentials::Credential,
+        device_fp: &str,
+        flags: store::ForwardFlags,
+        sim: Option<&super::Simulation>,
+        bare_session: Option<&str>,
+        session_out: Option<&str>,
+    ) -> Bytes {
         // 测试默认按「出站头里带了 thinking-display-updates」跑，fable 的 display 才补得上；
         // 头上没有那项 beta 的反例见 `skips_thinking_display_without_the_beta`。
-        super::rewrite_body(body, cred, device_fp, flags, sim, bare_session, false, None, true)
+        super::rewrite_body(
+            body,
+            cred,
+            device_fp,
+            flags,
+            sim,
+            bare_session,
+            session_out,
+            false,
+            None,
+            true,
+            None,
+            None,
+            super::CcRequestKind::Main,
+        )
     }
 
     /// 三个模型族的 `anthropic-beta`，逐字取自 `cap/raw` 的原始报文头
@@ -8989,25 +11112,32 @@ mod tests {
                  extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
             ),
         ];
+        // 来访自报 2.1.258，故参照的是 [`config::CC_PROFILES_2_1_258`] 那一版的官方形态。
+        let v258 = Some((2u64, 1, 258));
         for (model, api_key_client, official) in CASES {
             assert_eq!(
-                &merge_beta(Some(api_key_client), Some(model)),
+                &merge_beta(Some(api_key_client), Some(model), v258),
                 official,
                 "{model} 的 beta 串没对齐"
             );
             // 订阅端客户端经 luban：本来就是官方串，一个字都不该动（幂等）。
-            assert_eq!(&merge_beta(Some(official), Some(model)), official, "{model} 不幂等");
+            assert_eq!(&merge_beta(Some(official), Some(model), v258), official, "{model} 不幂等");
         }
         // 不知道模型时，族相关的两条不做：fable 的 API-key 串只补通用几项。
         let fable_api = CASES[3].1;
-        let no_model = merge_beta(Some(fable_api), None);
+        let no_model = merge_beta(Some(fable_api), None, v258);
         assert!(no_model.contains("redact-thinking-2026-02-12"), "不知道族就不删: {no_model}");
         assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
     }
 
-    /// 真实 CC（API-key 模式）的 fable 请求，body 侧要配套补 `thinking.display:"updates"`
-    /// （`cap/2.1.258/00013`）；opus 不补；客户端自己写了 `display` 的不动；`merge_beta`
-    /// 关着就不补。模拟路径不走这条（它由 `ensure_thinking` 直接产出完整形态）。
+    /// 真实 CC（API-key 模式）的请求，body 侧要配套补 `thinking.display:"updates"`
+    /// （fable：`cap/2.1.258/00013`；2.1.260 起 opus 主线程也发，`cap/2.1.260-2/00025`）。
+    /// 客户端自己写了 `display` 的不动；`merge_beta` 关着就不补。
+    ///
+    /// **判据只有一个**：出站头里有没有那项 beta（这里的 `display_beta` 参数恒为 true）。
+    /// 哪一族在哪一版发它由 [`super::merge_beta`] 决定，见
+    /// [`skips_thinking_display_without_the_beta`]。模拟路径不走这条（它由
+    /// `ensure_thinking` 直接产出完整形态）。
     #[test]
     fn fills_thinking_display_for_cc_fable_requests() {
         let body = |model: &str, thinking: &str| {
@@ -9026,8 +11156,13 @@ mod tests {
         );
         let fable_1m = run(&body("claude-fable-5-1[1m]", r#"{"type":"adaptive"}"#), all_on());
         assert_eq!(fable_1m["thinking"]["display"], "updates", "{fable_1m}");
+        // 2.1.260 起 opus 主线程也发这项 beta，头上有了体里就该配套写。
         let opus = run(&body("claude-opus-5", r#"{"type":"adaptive"}"#), all_on());
-        assert_eq!(opus["thinking"], serde_json::json!({"type": "adaptive"}), "opus 不补: {opus}");
+        assert_eq!(
+            opus["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "头上有 beta 就补，与模型族无关: {opus}"
+        );
         let own = run(
             &body("claude-fable-5-1", r#"{"type":"adaptive","display":"summarized"}"#),
             all_on(),
@@ -9054,9 +11189,13 @@ mod tests {
             all_on(),
             None,
             None,
+            None,
             false,
             None,
             false,
+            None,
+            None,
+            super::CcRequestKind::Main,
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
@@ -9069,7 +11208,7 @@ mod tests {
         let sdk_beta = "claude-code-20250219,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,effort-2025-11-24";
-        let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"));
+        let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"), Some((2, 1, 258)));
         assert!(!merged.contains("thinking-display-updates"), "老世代的串不补: {merged}");
     }
 
@@ -9079,7 +11218,7 @@ mod tests {
         for (model, client, official) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
             assert_eq!(
-                &merge_beta(Some(v.to_str().unwrap()), None),
+                &merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220))),
                 official,
                 "{model} 的 beta 串没对齐"
             );
@@ -9091,7 +11230,7 @@ mod tests {
     fn merged_beta_preserves_client_order() {
         for (model, client, _) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
-            let out = merge_beta(Some(v.to_str().unwrap()), None);
+            let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)));
             let kept: Vec<&str> =
                 out.split(',').filter(|b| client.split(',').any(|c| c.trim() == *b)).collect();
             let sent: Vec<&str> = client.split(',').map(str::trim).collect();
@@ -9104,7 +11243,7 @@ mod tests {
     fn merged_beta_keeps_unknown_betas_in_place() {
         let (_, client, official) = BETA_PAIRS[1];
         let v = HeaderValue::from_str(&format!("{client},some-future-beta-2027-01-01")).unwrap();
-        let out = merge_beta(Some(v.to_str().unwrap()), None);
+        let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)));
         // 客户端把它放在自有串末尾，官方串里它就该在 effort 之后、extended-cache-ttl 之前。
         assert_eq!(
             out,
@@ -9119,7 +11258,7 @@ mod tests {
     #[test]
     fn merged_beta_from_empty_is_deterministic() {
         assert_eq!(
-            merge_beta(None, None),
+            merge_beta(None, None, None),
             "oauth-2025-04-20,advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,\
              extended-cache-ttl-2025-04-11"
         );
@@ -9223,6 +11362,7 @@ mod tests {
             strip_empty_text: true,
             hoist_system_role: false,
             reject_openai_shape: false,
+            reject_session_conflict: false,
             api_telemetry: false,
             keepalive_telemetry: false,
         };
@@ -9631,6 +11771,7 @@ mod tests {
             label: "t".into(),
             tier: None,
             org_type: None,
+            rate_limit_tier: None,
             access_token: "a".into(),
             refresh_token: "r".into(),
             expires_at: u64::MAX,
@@ -9877,7 +12018,7 @@ mod tests {
         assert_eq!(v["system"].as_array().unwrap().len(), 3, "不该拆块: {s}");
         assert!(!s.contains("\"ttl\""), "不拆块时不应注入 ttl: {s}");
         assert!(!s.contains("\"scope\""), "不拆块时不应标 scope: {s}");
-        assert!(s.contains("cch=00000"), "其余改写仍应生效: {s}");
+        assert!(s.contains("; cch="), "其余改写仍应生效: {s}");
     }
 
     /// 客户端本来就是订阅形态（四块）时不动 `system`——它已经是目标形态了。
@@ -9932,6 +12073,7 @@ mod tests {
             strip_empty_text: true,
             hoist_system_role: false,
             reject_openai_shape: false,
+            reject_session_conflict: false,
             api_telemetry: false,
             keepalive_telemetry: false,
         };
@@ -9944,7 +12086,7 @@ mod tests {
             rewrite_body(&raw, &test_cred(), "fp", only_cch, None, None).to_vec(),
         )
         .unwrap();
-        assert!(s.contains("cch=00000"), "只开 cch 时应补 cch: {s}");
+        assert!(s.contains("; cch="), "只开 cch 时应补 cch: {s}");
         assert_eq!(sys_len(&s), 3, "system_shape 关着不应拆块: {s}");
         assert!(s.contains(r#"\"account_uuid\":\"\""#), "spoof 关着应保留空 uuid: {s}");
 
@@ -10005,7 +12147,7 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
 
         // 三项改写都生效了（否则会走 body.clone() 早退，测试空过）。
-        assert!(s.contains("cch=00000"), "应补 cch: {s}");
+        assert!(s.contains("; cch="), "应补 cch: {s}");
         assert!(s.contains(r#""scope":"global""#), "应对齐 system 形态: {s}");
         assert!(s.contains(&format!(r#"\"account_uuid\":\"{}\""#, ACCOUNT_UUID)), "应填 uuid: {s}");
 
@@ -10038,19 +12180,42 @@ mod tests {
         serde_json::json!({"system": [{"type": "text", "text": text}]})
     }
 
-    /// 补出的 billing header 与订阅模式的真实形态一致（抓包 040 的 `; cch=…;` 形态）。
+    /// 补出的 billing header 与订阅模式的真实形态一致（抓包 040 的 `; cch=…;` 形态）：
+    /// 追加在末尾、**5 位小写 hex**、每请求都不一样。
+    ///
+    /// 钉「每次不同」是有理由的：原先补的是常量 `00000`，跨账号恒定，上游一按它聚类就把
+    /// 所有账号串成一串。抓包里同账号相邻请求是 `993e1`/`e2d04`/`b504f`，各不相同。
     #[test]
     fn adds_cch_in_official_shape() {
-        let mut v = body_with_system0(
-            "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;",
-        );
+        const HEAD: &str = "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;";
+        let cch_of = |v: &serde_json::Value| -> String {
+            let text = v["system"][0]["text"].as_str().unwrap().to_string();
+            let rest = text.strip_prefix(HEAD).unwrap_or_else(|| panic!("前缀不该被动: {text}"));
+            let cch = rest
+                .strip_prefix(" cch=")
+                .and_then(|s| s.strip_suffix(';'))
+                .unwrap_or_else(|| panic!("cch 段形态不对: {text}"));
+            assert_eq!(cch.len(), 5, "5 位: {text}");
+            assert!(
+                cch.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "小写 hex: {text}"
+            );
+            cch.to_string()
+        };
+
+        let mut v = body_with_system0(HEAD);
         assert!(ensure_billing_cch(&mut v));
-        assert_eq!(
-            v["system"][0]["text"],
-            serde_json::json!(
-                "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli; cch=00000;"
-            )
-        );
+        let first = cch_of(&v);
+
+        // 连补 20 次，不该 20 次都一样——恒定值正是要消灭的那个判据。
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(first);
+        for _ in 0..20 {
+            let mut v = body_with_system0(HEAD);
+            assert!(ensure_billing_cch(&mut v));
+            seen.insert(cch_of(&v));
+        }
+        assert!(seen.len() > 1, "cch 该逐请求变化，20 次全同说明又写死了: {seen:?}");
     }
 
     /// 已带 cch（订阅模式客户端）不重复追加；非 billing 块不动。
@@ -10439,13 +12604,26 @@ mod tests {
             assert_eq!(v["tool_choice"], keep);
         }
 
-        // thinking.type == "disabled"：整个 thinking 字段删掉，上游走 adaptive 默认值。
+        // thinking.type == "disabled"：**只有 fable 族**要删（它不支持，上游直接 400），
+        // 删掉整个字段让上游走 adaptive 默认值。
         let mut v = serde_json::json!({
             "model": "claude-fable-5",
             "thinking": {"type": "disabled"},
         });
         assert!(strip_extra_fields(&mut v, false));
-        assert!(v.get("thinking").is_none(), "disabled 应整个删掉: {v}");
+        assert!(v.get("thinking").is_none(), "fable 上 disabled 应整个删掉: {v}");
+
+        // 别的族不动：`{"type":"disabled"}` 是 2.1.260 三个官方辅助 profile 的正常形态
+        // （无工具 helper / 标题生成是 haiku，安全分类是 sonnet）。删了既造出一个官方不
+        // 产生的形态，又把客户端「不要思考」翻成了「随你」——那是要花钱的。
+        for model in ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"] {
+            let mut v = serde_json::json!({
+                "model": model,
+                "thinking": {"type": "disabled"},
+            });
+            assert!(!strip_extra_fields(&mut v, false), "{model}: 不该动");
+            assert_eq!(v["thinking"], serde_json::json!({"type": "disabled"}), "{model}");
+        }
 
         // thinking.type == "enabled" 不动。
         let mut v = serde_json::json!({
@@ -10669,6 +12847,7 @@ mod tests {
                 strip_empty_text: true,
                 hoist_system_role: false,
                 reject_openai_shape: false,
+                reject_session_conflict: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
             }
@@ -11679,7 +13858,7 @@ mod tests {
     ) -> Option<super::Simulation> {
         let v = parsed(body);
         let from_cc_client = super::cc_cli_version(&super::ua_of(headers)).is_some();
-        super::Simulation::detect(v.as_ref(), from_cc_client, flags, &test_cred(), "fp")
+        super::Simulation::detect(v.as_ref(), headers, from_cc_client, flags, &test_cred(), "fp")
     }
 
     fn detect_for(body: &Bytes, flags: store::ForwardFlags) -> Option<super::Simulation> {
@@ -11690,78 +13869,269 @@ mod tests {
         detect_for(&Bytes::from(body.to_string()), all_on()).expect("普通请求应判为需要模拟")
     }
 
-    /// 模拟串交给 `merge_beta` 之后，必须**逐字节**等于官方那串——这是四份
-    /// `config::CC_BETA_SIMULATED*` 种子唯一的正确性依据。官方串取自 `cap/2.1.258`，
-    /// 去掉动态的 `afk-mode`。
+    /// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
+    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.260`
+    /// 与 `cap/2.1.260-2`，去掉动态的 `afk-mode`。
     ///
     /// 四族分开验：haiku 不发 `mid-conversation-system`/`effort` 且 `claude-code-20250219`
-    /// 在**队尾**；fable 不发 `redact-thinking`、多 `thinking-display-updates`；opus 多
-    /// `context-1m`。共用一份种子串就会给某一族发出真实客户端不产生的排列。
+    /// 在**串中间**；fable 用 `per-turn-control` 换掉了 `advisor-tool`、且带
+    /// `server-side-fallback`；opus 多 `context-1m`、**不发** `server-side-fallback`。
+    /// 共用一份种子串就会给某一族发出真实客户端不产生的排列。
+    ///
+    /// sonnet / haiku 两行是外推值（2.1.260 没有主线程样本），钉在这里是为了让外推本身
+    /// 有个明确的落点——抓到样本后改这两个常量，测试会立刻告诉你哪里对不上。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.258/00025（opus-5 直连，无 afk-mode 的那次）。
+        // cap/2.1.260-2/00025（opus-5 直连），去掉 afk-mode。
         const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
              context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
-             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,\
              extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-        // cap/2.1.258/00013（fable-5-1 直连），去掉 afk-mode。
+        // cap/2.1.260/00018（fable-5-1 直连），去掉 afk-mode。
         const OFFICIAL_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             server-side-fallback-2026-06-01,fallback-credit-2026-06-01,\
+             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+             cache-diagnosis-2026-04-07";
+        // 外推自 cap/2.1.258/00026（sonnet-5 直连），见 config::CC_PROFILES。
+        const DERIVED_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
              advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             server-side-fallback-2026-06-01,fallback-credit-2026-06-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
              cache-diagnosis-2026-04-07";
-        // cap/2.1.258/00026（sonnet-5 直连），去掉 afk-mode。
-        const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
-             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+        // 外推自 cap/2.1.258/00031（haiku-4.5 直连）。
+        const DERIVED_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
-             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
-             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-        // cap/2.1.258/00031（haiku-4.5 直连），去掉 afk-mode。
-        const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
-             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
-             server-side-fallback-2026-07-01,fallback-credit-2026-06-01,\
+             prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,server-side-fallback-2026-06-01,\
+             fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,\
              extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
 
         for (model, official) in [
-            ("claude-sonnet-5", OFFICIAL_SONNET),
+            ("claude-sonnet-5", DERIVED_SONNET),
             ("claude-opus-5", OFFICIAL_OPUS),
             ("claude-fable-5-1", OFFICIAL_FABLE),
-            ("claude-fable-5", OFFICIAL_FABLE), // 2.1.258 没有 fable-5 样本，按族归 fable
-            ("gpt-4o", OFFICIAL_SONNET),        // 认不出的模型退回 sonnet 主串
-            ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
+            ("claude-fable-5", OFFICIAL_FABLE), // 没有 fable-5 样本，按族归 fable
+            ("gpt-4o", DERIVED_SONNET),         // 认不出的模型退回 sonnet 主串
+            ("claude-haiku-4-5-20251001", DERIVED_HAIKU),
         ] {
-            let seed = super::cc_beta_seed(model);
-            assert_eq!(
-                merge_beta(Some(&super::simulated_beta(seed, None)), Some(model)),
-                official,
-                "{model}"
-            );
+            let profile = super::cc_profile_for(model);
+            assert_eq!(super::simulated_beta(profile.beta, None), official, "{model}");
         }
 
         // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
-        let with_client = merge_beta(
-            Some(&super::simulated_beta(
-                config::CC_BETA_SIMULATED,
-                Some("output-128k-2025-02-19, effort-2025-11-24"),
-            )),
-            Some("claude-sonnet-5"),
+        let with_client = super::simulated_beta(
+            super::cc_profile_for("claude-sonnet-5").beta,
+            Some("output-128k-2025-02-19, effort-2025-11-24"),
         );
         assert!(
             with_client.contains("output-128k-2025-02-19"),
             "客户端的 beta 被丢了: {with_client}"
         );
         assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
+    }
+
+    /// 六个已观察 profile 的 beta 串逐字对上抓包（去掉 `oauth` 与动态的 `afk-mode` 之后）。
+    ///
+    /// 这是 [`config::CC_PROFILES`] 那张表的验收：表里每一行的 `beta` 都必须能与某一份
+    /// 原始抓包对上，外推的两行（`MainSonnet`/`MainHaiku`）不在此列——它们由
+    /// [`simulated_beta_matches_official`] 钉住。
+    #[test]
+    fn profile_betas_match_the_2_1_260_captures() {
+        use config::CcProfileKind::*;
+        // 每项：profile、抓包出处、官方串（去掉 oauth 与 afk-mode）。
+        let cases: &[(config::CcProfileKind, &str, &str)] = &[
+            (
+                SdkSubagentHaiku,
+                "cap/2.1.260/00020",
+                "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 claude-code-20250219,thinking-display-updates-2026-08-18,\
+                 cache-diagnosis-2026-04-07",
+            ),
+            (
+                HelperSubagentHaiku,
+                "cap/2.1.260/00024",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,server-side-fallback-2026-06-01,\
+                 fallback-credit-2026-06-01,cache-diagnosis-2026-04-07",
+            ),
+            (
+                SessionTitleHaiku,
+                "cap/2.1.260-2/00058",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+                 structured-outputs-2025-12-15,fallback-credit-2026-06-01,\
+                 cache-diagnosis-2026-04-07",
+            ),
+            (
+                SecurityClassifierSonnet,
+                "cap/2.1.260/00019",
+                "claude-code-20250219,context-1m-2025-08-07,\
+                 interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,auto-mode-classifier-2026-07-16,\
+                 extended-cache-ttl-2025-04-11",
+            ),
+            (
+                QuotaProbe,
+                "cap/2.1.260-2/00004",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05",
+            ),
+        ];
+        for (kind, cap, official) in cases {
+            assert_eq!(config::cc_profile(*kind).beta, *official, "{kind:?}（{cap}）");
+        }
+    }
+
+    /// 官方辅助请求经 [`merge_beta`] 之后**一项都不多**：它们各有一套更短的 beta 集合，
+    /// 主线程那几项（`advanced-tool-use`/`server-side-fallback`/`extended-cache-ttl`…）
+    /// 补进去就是一个官方从不产生的串。API-key 端不发 `oauth`，那一项要补。
+    #[test]
+    fn merge_beta_leaves_official_helper_requests_alone() {
+        for (name, kind) in [
+            ("标题生成", config::CcProfileKind::SessionTitleHaiku),
+            ("安全分类", config::CcProfileKind::SecurityClassifierSonnet),
+            ("无工具 helper", config::CcProfileKind::HelperSubagentHaiku),
+            ("额度探测", config::CcProfileKind::QuotaProbe),
+        ] {
+            let official = super::simulated_beta(config::cc_profile(kind).beta, None);
+            // API-key 端那份就是官方串去掉 oauth；merge_beta 应当只把它补回来。
+            let api_key_side: Vec<&str> =
+                official.split(',').filter(|p| *p != config::OAUTH_BETA_HEADER).collect();
+            assert_eq!(
+                merge_beta(Some(&api_key_side.join(",")), None, Some((2, 1, 260))),
+                official,
+                "{name}: merge_beta 不该给辅助请求补主线程那几项"
+            );
+        }
+    }
+
+    /// **SDK 子代理不是主线程**：它有 `claude-code`，前几条判据都放它过去，于是会被补上
+    /// `advanced-tool-use` 与 `extended-cache-ttl`——官方那条（`cap/2.1.260/00020`）两样都没有。
+    ///
+    /// 判据是「有 `thinking-display-updates`，却一个 `effort`/`advisor-tool`/`per-turn-control`
+    /// 都没有」。这一条不能误伤 2.1.220 那代的 haiku（[`BETA_PAIRS`] 第三对）——它压根没有
+    /// `thinking-display-updates`，照旧要补那两项。
+    #[test]
+    fn merge_beta_leaves_the_sdk_subagent_alone() {
+        let official = super::simulated_beta(
+            config::cc_profile(config::CcProfileKind::SdkSubagentHaiku).beta,
+            None,
+        );
+        let api_key_side: Vec<&str> =
+            official.split(',').filter(|p| *p != config::OAUTH_BETA_HEADER).collect();
+        let out = merge_beta(
+            Some(&api_key_side.join(",")),
+            Some("claude-haiku-4-5-20251001"),
+            Some((2, 1, 260)),
+        );
+        assert_eq!(out, official, "SDK 子代理只该补 oauth");
+        assert!(!out.contains("advanced-tool-use"), "官方那条没有这一项: {out}");
+        assert!(!out.contains("extended-cache-ttl"), "也没有这一项: {out}");
+
+        // 反例：2.1.220 的 haiku 没有 thinking-display-updates，照旧按主线程补齐。
+        let (_, client_220, official_220) = BETA_PAIRS[2];
+        assert_eq!(
+            &merge_beta(Some(client_220), None, Some((2, 1, 220))),
+            official_220,
+            "老世代的 haiku 不该被当成 SDK 子代理"
+        );
+    }
+
+    /// 模拟路径追加客户端 beta 时，**同名不同日期**算已经有了，**互斥项**直接丢。
+    ///
+    /// 两种都是官方从不产生的组合：两条 `server-side-fallback`、或
+    /// `redact-thinking` 与 `thinking-display-updates` 并存。
+    #[test]
+    fn simulated_beta_rejects_conflicting_client_betas() {
+        let fable = super::cc_profile_for("claude-fable-5-1").beta;
+        // 官方 fable 串里是 06-01；客户端带 07-01，不该拼出两条。
+        let out = super::simulated_beta(fable, Some("server-side-fallback-2026-07-01"));
+        assert_eq!(out.matches("server-side-fallback-").count(), 1, "只该有一条: {out}");
+        assert!(out.contains("server-side-fallback-2026-06-01"), "留官方那条日期: {out}");
+
+        // opus 官方串有 thinking-display-updates，客户端带 redact-thinking → 丢。
+        let opus = super::cc_profile_for("claude-opus-5").beta;
+        let out = super::simulated_beta(opus, Some(config::CC_BETA_REDACT_THINKING));
+        assert!(!out.contains("redact-thinking"), "互斥项不能并存: {out}");
+        assert!(out.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES), "{out}");
+
+        // 反向也拦：官方串有 redact-thinking（额度探测）时，客户端的 display-updates 丢掉。
+        let probe = config::cc_profile(config::CcProfileKind::QuotaProbe).beta;
+        let out = super::simulated_beta(probe, Some(config::CC_BETA_THINKING_DISPLAY_UPDATES));
+        assert!(!out.contains("thinking-display-updates"), "反向同样互斥: {out}");
+
+        // 不冲突的照旧追加，一个都不能少。
+        let out = super::simulated_beta(opus, Some("output-128k-2025-02-19"));
+        assert!(out.contains("output-128k-2025-02-19"), "{out}");
+    }
+
+    /// 2.1.260 的 fable 缺了 `server-side-fallback-2026-06-01` 时必须补得回来。
+    ///
+    /// 回归：`seed_has` 原先是逐字比对常量 `…-2026-07-01`，而 fable 的官方串里是 06-01，
+    /// 于是「官方发这一项吗」永远答否，整个补齐分支成了死代码。
+    #[test]
+    fn merge_beta_backfills_the_fable_server_side_fallback() {
+        // 2.1.260 fable 的 API-key 端形态：缺 oauth / advanced-tool-use /
+        // server-side-fallback / extended-cache-ttl / cache-diagnosis。
+        let api_key = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             per-turn-control-2026-07-01,effort-2025-11-24,fallback-credit-2026-06-01,\
+             thinking-display-updates-2026-08-18";
+        let out = merge_beta(Some(api_key), Some("claude-fable-5-1"), Some((2, 1, 260)));
+        assert!(
+            out.contains(config::CC_BETA_SERVER_SIDE_FALLBACK_JUN),
+            "fable 该补上 06-01 那条: {out}"
+        );
+        assert!(
+            !out.contains(config::CC_BETA_SERVER_SIDE_FALLBACK),
+            "不能补成 2.1.258 那个日期: {out}"
+        );
+        assert_eq!(out.matches("server-side-fallback-").count(), 1, "{out}");
+        // 补完就是官方那串（去掉动态的 afk-mode）——这才是这条测试真正要钉的。
+        assert_eq!(
+            out,
+            super::simulated_beta(super::cc_profile_for("claude-fable-5-1").beta, None)
+        );
+        // 位置：`effort` 之后、`fallback-credit` 之前（官方序）。
+        let idx = |b: &str| out.split(',').position(|p| p.starts_with(b)).unwrap();
+        assert!(idx("effort-") < idx("server-side-fallback-"));
+        assert!(idx("server-side-fallback-") < idx("fallback-credit-"));
+
+        // 2.1.260 的 opus 整项不发，别给它补。
+        let out = merge_beta(Some(api_key), Some("claude-opus-5"), Some((2, 1, 260)));
+        assert!(!out.contains("server-side-fallback-"), "opus 2.1.260 不发这一项: {out}");
+    }
+
+    /// 带日期的 beta 按**名字**判在不在：一个已经带 `server-side-fallback-2026-06-01` 的
+    /// 2.1.260 来访，不该再被插一条 `-2026-07-01`。
+    #[test]
+    fn merge_beta_does_not_duplicate_a_redated_beta() {
+        // fable 2.1.260 的 API-key 端形态：有 per-turn-control 与 06-01 那条。
+        let incoming = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+             per-turn-control-2026-07-01,effort-2025-11-24,\
+             server-side-fallback-2026-06-01,fallback-credit-2026-06-01";
+        let out = merge_beta(Some(incoming), Some("claude-fable-5-1"), Some((2, 1, 260)));
+        assert_eq!(out.matches("server-side-fallback-").count(), 1, "只该有一条: {out}");
+        assert!(out.contains("server-side-fallback-2026-06-01"), "保留客户端那条日期: {out}");
+        assert!(out.contains(config::OAUTH_BETA_HEADER), "oauth 要补上: {out}");
     }
 
     /// 普通请求 → 官方四块 system（sonnet 族，2.1.258 无 reporting）：billing / 身份句 /
@@ -11783,15 +14153,17 @@ mod tests {
             sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
             "第 0 块应是 billing header: {s}"
         );
-        assert!(
-            sys[0]["text"].as_str().unwrap().contains("cch="),
-            "cch 应由 ensure_billing_cch 补上"
-        );
+        assert!(sys[0]["text"].as_str().unwrap().contains("; cch="), "cch 要在 billing 段里");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli;"
+                "x-anthropic-billing-header: cc_version=2.1.260.1e2; cc_entrypoint=cli;"
             ),
-            "模拟路径的 cc_version 写死 2.1.258.1e2（cap/2.1.258 五份全是）: {s}"
+            "模拟路径的 cc_version 取 profile 的版本与后缀（sonnet 主线程没有 2.1.260 样本，\
+             后缀沿用 2.1.258 那个四族通用值 1e2）: {s}"
+        );
+        assert!(
+            sys[0]["text"].as_str().unwrap().contains("cc_prompt_id="),
+            "官方主线程每条都带 cc_prompt_id（cap/2.1.260-2/00013）: {s}"
         );
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
@@ -11806,8 +14178,13 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            vec!["model", "messages", "system", "metadata", "max_tokens"],
+            vec!["model", "messages", "system", "metadata", "max_tokens", "diagnostics"],
             "key 序: {s}"
+        );
+        assert_eq!(
+            v["diagnostics"],
+            serde_json::json!({"previous_message_id": serde_json::Value::Null}),
+            "会话首条：字段在、值为 null（cap/2.1.260-2/00013）: {s}"
         );
 
         // 换模型族即换基座：三族三份基座。
@@ -11838,6 +14215,1166 @@ mod tests {
         );
     }
 
+    /// 会话链条：`cc_prompt_id` 新输入换一轮、工具续轮沿用；`cc_prev_req` 与
+    /// `diagnostics.previous_message_id` 指向上一条请求/回复。
+    ///
+    /// 这三个字段官方是**跨请求**的（`cap/2.1.260-2/00013` → `00059` → `00061`），一条一条
+    /// 独立造造不出来：造出来的会是「每条请求都是一次全新会话的第一条」。
+    /// 测试用的会话键：都挂在同一张凭证上，跨凭证隔离另见
+    /// [`session_link_is_isolated_per_credential`]。
+    fn key(session_id: &str) -> super::CcSessionKey<'_> {
+        super::CcSessionKey { cred_id: 1, session_id }
+    }
+
+    /// **同一个会话 id 落到不同凭证上，两条链必须各走各的。**
+    ///
+    /// 429/401 换号时，转发循环会带着**同一个**客户端会话 id 重跑一遍
+    /// `Simulation::detect` / `client_session_link`。只按会话 id 分桶的话，A 账号的
+    /// `cc_prev_req`（那是 A 的上游 request-id，B 从没见过）会被发到 B 上，同一次用户输入
+    /// 还会被再轮换一次 prompt id，而 B 的 `first_seen` 是 false ——B 这张凭证的启动握手
+    /// 就永远不会触发。遥测那边本来就是按 `(cred_id, session_id)` 分的，这里跟它对齐。
+    #[test]
+    fn session_link_is_isolated_per_credential() {
+        let sid = format!("test-{}", super::uuid_v4());
+        let a = super::CcSessionKey { cred_id: 1, session_id: &sid };
+        let b = super::CcSessionKey { cred_id: 2, session_id: &sid };
+
+        let first_a = super::CcSessionLink::load(a, true, true);
+        assert!(first_a.first_seen, "A 的第一条");
+        super::CcSessionLink::record(a, Some("req_a"), Some("msg_a"));
+
+        // 换到 B：同一个会话 id，但对 B 来说这是**新会话**——要触发 B 自己的启动握手，
+        // 且拿不到 A 的那两个 id。
+        let first_b = super::CcSessionLink::load(b, false, true);
+        assert!(first_b.first_seen, "换号后对 B 是新会话，B 的启动握手要触发");
+        assert!(first_b.prev_req.is_none(), "A 的 request-id 不能发给 B");
+        assert!(first_b.prev_message_id.is_none(), "A 的 message.id 同样不能");
+        assert_ne!(first_b.prompt_id, first_a.prompt_id, "两条链各自的一轮");
+
+        // B 记自己的，不影响 A。
+        super::CcSessionLink::record(b, Some("req_b"), Some("msg_b"));
+        let again_a = super::CcSessionLink::load(a, false, true);
+        assert_eq!(again_a.prev_req.as_deref(), Some("req_a"), "A 还是 A 那条");
+        assert_eq!(again_a.prompt_id, first_a.prompt_id, "换号没把 A 这一轮转掉");
+    }
+
+    #[test]
+    fn session_link_carries_prompt_and_previous_ids() {
+        let sid = format!("test-{}", super::uuid_v4());
+        let new_prompt = || super::CcSessionLink::load(key(&sid), true, true);
+        let tool_turn = || super::CcSessionLink::load(key(&sid), false, true);
+
+        // 首条：有 prompt_id，没有上一条可指。
+        let first = new_prompt();
+        let pid = first.prompt_id.clone().expect("主线程每条都带 cc_prompt_id");
+        assert!(first.prev_req.is_none(), "会话第一条没有 cc_prev_req");
+        assert!(first.prev_message_id.is_none(), "首轮 previous_message_id 为 null");
+
+        // 回程记下这一条的两个 id。
+        super::CcSessionLink::record(key(&sid), Some("req_001"), Some("msg_001"));
+
+        // 工具续轮：prompt_id 沿用，两个 prev 指向上一条。
+        let second = tool_turn();
+        assert_eq!(second.prompt_id.as_deref(), Some(pid.as_str()), "工具续轮沿用同一轮 id");
+        assert_eq!(second.prev_req.as_deref(), Some("req_001"));
+        assert_eq!(second.prev_message_id.as_deref(), Some("msg_001"));
+
+        // 新一轮用户输入：换 prompt_id，prev 仍指最近一条。
+        super::CcSessionLink::record(key(&sid), Some("req_002"), Some("msg_002"));
+        let third = new_prompt();
+        assert_ne!(third.prompt_id.as_deref(), Some(pid.as_str()), "新输入要换一轮 id");
+        assert_eq!(third.prev_req.as_deref(), Some("req_002"));
+        assert_eq!(third.prev_message_id.as_deref(), Some("msg_002"));
+
+        // 「猜下一句」那类请求不写 cc_prompt_id，但仍在同一条链上
+        // （`cap/2.1.260-2/00063`：有 cc_prev_req、没有 cc_prompt_id）。
+        let suggestion = super::CcSessionLink::load(key(&sid), false, false);
+        assert!(suggestion.prompt_id.is_none(), "不写 cc_prompt_id");
+        assert_eq!(suggestion.prev_req.as_deref(), Some("req_002"), "但照样接在链上");
+
+        // 另一个会话是另一条链，不该串味。
+        let other =
+            super::CcSessionLink::load(key(&format!("test-{}", super::uuid_v4())), true, true);
+        assert!(other.prev_req.is_none(), "不同会话各走各的链");
+    }
+
+    /// 上游只回了 request-id、没解析出 message.id（非流式解析失败、断流……）时，
+    /// 已有的 `previous_message_id` 不能被清空——官方那条链是不会中断的。
+    #[test]
+    fn session_link_record_keeps_what_it_was_not_told() {
+        let sid = format!("test-{}", super::uuid_v4());
+        let _ = super::CcSessionLink::load(key(&sid), true, true);
+        super::CcSessionLink::record(key(&sid), Some("req_001"), Some("msg_001"));
+        super::CcSessionLink::record(key(&sid), Some("req_002"), None);
+        let link = super::CcSessionLink::load(key(&sid), false, true);
+        assert_eq!(link.prev_req.as_deref(), Some("req_002"), "request-id 更新了");
+        assert_eq!(link.prev_message_id.as_deref(), Some("msg_001"), "message.id 保留上一次的");
+    }
+
+    /// 模拟路径的会话 id **优先取来访自己那个**：几个客户端各开各的会话，折叠成一个按设备
+    /// 派生的 id，在上游看来就是「一台设备上一个会话打了所有请求」。
+    ///
+    /// 头和体**两处都看**，且都要过 uuid 形态校验。
+    #[test]
+    fn simulation_keeps_the_inbound_session_id() {
+        const SID1: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        const SID2: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+        let body = Bytes::from(PLAIN_BODY.to_string());
+        let with_header = |sid: &'static str| {
+            let mut h = super::HeaderMap::new();
+            h.insert("x-claude-code-session-id", HeaderValue::from_static(sid));
+            h
+        };
+        let sim = detect_with(&body, &with_header(SID1), all_on()).expect("该请求应走模拟路径");
+        assert_eq!(sim.session_id, SID1, "来访自己带了就用它");
+
+        let sim2 = detect_with(&body, &with_header(SID2), all_on()).unwrap();
+        assert_ne!(sim.session_id, sim2.session_id, "两个客户端会话不该被折叠成一个");
+
+        // 没带的才按「账号 + 设备指纹」派生。
+        let bare = detect_for(&body, all_on()).unwrap();
+        assert_ne!(bare.session_id, SID1);
+        assert_eq!(bare.session_id, detect_for(&body, all_on()).unwrap().session_id, "派生值稳定");
+
+        // 头上没有、**体里有**：官方两处逐字相同，只认头的话，一个只在 metadata 里带了
+        // 会话 id 的客户端，它的多轮对话在上游看来就成了「每轮各自一个会话」。
+        let in_body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"metadata":{{"user_id":"{{\"device_id\":\"d\",\"session_id\":\"{SID2}\"}}"}}}}"#
+        ));
+        let from_body = detect_for(&in_body, all_on()).expect("该请求应走模拟路径");
+        assert_eq!(from_body.session_id, SID2, "体里那个也要认");
+
+        // **形态不对就不认**：官方那个恒为 uuid。`sess-42` 这种短串本身就是判据，而带控制
+        // 字符的值会让 `HeaderValue::from_str` 失败——于是头上没有、体里却有，拼出「两处
+        // 不一致」这个官方绝不产生的组合。一律退回派生值。
+        for bad in ["sess-42", "", "not-a-uuid-at-all", "D0C1FB05-9B19-4576-9465-E2B8A206DABF"] {
+            let mut h = super::HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(bad) {
+                h.insert("x-claude-code-session-id", v);
+            }
+            let s = detect_with(&body, &h, all_on()).unwrap();
+            assert_eq!(s.session_id, bare.session_id, "{bad:?} 该退回派生值");
+        }
+    }
+
+    /// **真实 CC（API-key 模式）** 的主线程请求也要补上会话关联字段。
+    ///
+    /// API-key 端那条 billing header 是光秃秃的
+    /// `cc_version=…; cc_entrypoint=cli;`——没有 `cch`、没有 `cc_prompt_id`、没有
+    /// `cc_prev_req`，整条也没有 `diagnostics`（`cap/2.1.258-api` 六份逐一核过）。luban 拿
+    /// OAuth token 转出去之后，上游看到的是「一条 OAuth 主线程请求，一个会话关联字段都
+    /// 没有」，而订阅端官方每条都有。
+    #[test]
+    fn api_key_cc_gets_the_oauth_session_chain() {
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let body = Bytes::from(format!(
+            concat!(
+                r#"{{"model":"claude-opus-5","max_tokens":64000,"#,
+                r#""messages":[{{"role":"user","content":"hi"}}],"#,
+                r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
+                r#"cc_version=2.1.260.222; cc_entrypoint=cli;"}},"#,
+                r#"{{"type":"text","text":"{}"}}],"#,
+                r#""tools":[{{"name":"Bash"}}],"#,
+                r#""metadata":{{"user_id":"{{\"device_id\":\"d\",\"session_id\":\"{}\"}}"}}}}"#
+            ),
+            config::CC_SYSTEM_IDENTITY,
+            SID
+        ));
+        let parsed_body = parsed(&body);
+        let mut headers = super::HeaderMap::new();
+        headers.insert("x-claude-code-session-id", HeaderValue::from_static(SID));
+        // 主线程的 beta 串（有 effort，不是那几套非主线程 profile）。
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
+        );
+        // UA 自报 CC + 工具列表含官方名 → 真实 CC 客户端，不走模拟。
+        headers.insert(header::USER_AGENT, HeaderValue::from_static(config::CC_USER_AGENT));
+
+        assert!(detect_with(&body, &headers, all_on()).is_none(), "真实 CC 客户端不模拟");
+
+        let (sid, link) = super::client_session_link(
+            parsed_body.as_ref(),
+            &headers,
+            None,
+            all_on(),
+            true,
+            &test_cred(),
+        )
+        .expect("主线程 CC 请求该补会话链");
+        assert_eq!(sid, SID, "键是客户端自己的会话 id");
+
+        let out = super::rewrite_body(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            Some(&link),
+            super::CcRequestKind::Main,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let billing = v["system"][0]["text"].as_str().unwrap();
+        assert!(billing.contains("; cch="), "cch 照旧补: {billing}");
+        assert!(billing.contains("cc_prompt_id="), "缺的这项要补上: {billing}");
+        assert_eq!(
+            v["diagnostics"],
+            serde_json::json!({"previous_message_id": serde_json::Value::Null}),
+            "首轮 diagnostics 字段在、值为 null: {v}"
+        );
+        // 段序：cch → cc_prev_req → cc_prompt_id（官方序）。
+        assert!(billing.find("cch=").unwrap() < billing.find("cc_prompt_id=").unwrap());
+
+        // 客户端自己写了 cc_prompt_id 的不动——它比我们更清楚自己的链。
+        let own = Bytes::from(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .replace("cc_entrypoint=cli;", "cc_entrypoint=cli; cc_prompt_id=mine;"),
+        );
+        let out = super::rewrite_body(
+            &own,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            None,
+            Some(&link),
+            super::CcRequestKind::Main,
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let billing = v["system"][0]["text"].as_str().unwrap();
+        assert!(billing.contains("cc_prompt_id=mine;"), "保留客户端自己那个: {billing}");
+        assert_eq!(billing.matches("cc_prompt_id=").count(), 1, "别补第二个: {billing}");
+    }
+
+    /// 握手三段**严格串行**，放行信号发在额度探测之后、收尾段之前。
+    ///
+    /// 回归的是一个只在慢网下才露头的交错：曾经是「lead 一个任务 + 限时等它 + 再 spawn
+    /// rest」，等超时之后 rest 就发了，而 lead 可能还卡在 policy/settings 上，线上顺序变成
+    /// `policy/settings → rest → eval → quota`——抓包里 eval 与额度探测排在 penguin/mcp/
+    /// bootstrap 那批**之前**。这种错序不会有任何编译期或运行期症状，只能靠钉住顺序。
+    #[tokio::test]
+    async fn handshake_runs_in_capture_order() {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let step = |name: &'static str, delay_ms: u64| {
+            let log = log.clone();
+            async move {
+                // lead 故意比放行上限还慢，模拟慢网。
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                log.lock().unwrap().push(name);
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let seq = tokio::spawn(super::handshake_sequence(
+            step("lead", 30),
+            step("quota", 5),
+            step("rest", 5),
+            tx,
+        ));
+
+        // 调用方只等「额度探测发完」这一个信号。
+        rx.await.expect("信号该在 quota 之后发出");
+        {
+            let seen = log.lock().unwrap();
+            assert_eq!(*seen, ["lead", "quota"], "放行时 lead 与 quota 已经完成，rest 还没开始");
+        }
+        seq.await.unwrap();
+        assert_eq!(*log.lock().unwrap(), ["lead", "quota", "rest"], "收尾段排在最后");
+    }
+
+    /// 调用方等超时之后，后台那串**照样按顺序跑完**——`rest` 不会越过还没完成的 `lead`。
+    ///
+    /// 这是上一条的另一半：超时只是「不再等」，不是「取消」，更不是「让 rest 先跑」。
+    #[tokio::test]
+    async fn handshake_keeps_its_order_after_the_caller_gives_up() {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let step = |name: &'static str, delay_ms: u64| {
+            let log = log.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                log.lock().unwrap().push(name);
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let seq = tokio::spawn(super::handshake_sequence(
+            step("lead", 60),
+            step("quota", 5),
+            step("rest", 5),
+            tx,
+        ));
+
+        // 调用方 10ms 就放弃等待（真实里是 `HANDSHAKE_LEAD_TIMEOUT_MS`）。
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(10), rx).await;
+        assert!(waited.is_err(), "该超时");
+        assert!(log.lock().unwrap().is_empty(), "此刻 lead 还没跑完");
+
+        // 放弃等待不影响后台：三段仍按序跑完，一段都没被取消。
+        seq.await.unwrap();
+        assert_eq!(*log.lock().unwrap(), ["lead", "quota", "rest"]);
+    }
+
+    /// 核心四工具的声明**逐 profile 一份**：同一版本里 opus 与 fable 的措辞并不相同。
+    ///
+    /// 依据：`cap/2.1.260-2/00025`（opus）与 `cap/2.1.260/00018`（fable）四个工具的
+    /// schema 无一相同——opus 的 Bash 多了 `Foreground sleep is blocked` 那句，Read 的
+    /// 换行说明也换了写法。原先一份 2.1.258 的资产给所有族用。
+    #[test]
+    fn core_tool_stubs_are_profile_specific() {
+        let opus = super::cc_tools_core(config::cc_profile(config::CcProfileKind::MainOpus));
+        let fable = super::cc_tools_core(config::cc_profile(config::CcProfileKind::MainFable));
+        let names = |t: &[serde_json::Value]| -> Vec<String> {
+            t.iter().map(|x| x["name"].as_str().unwrap_or("?").to_string()).collect()
+        };
+        // **顺序也是抓包的一部分**：六份主线程抓包（opus ×3 / fable ×2 / 2.1.258 opus）
+        // 核心四工具的相对次序全是 `Bash → Edit → Read → Write`。资产按字母序或按手写
+        // 顺序排都会得到一个官方不产生的排列，而这种错不会有任何运行期症状。
+        assert_eq!(names(opus), ["Bash", "Edit", "Read", "Write"], "官方核心四工具与其次序");
+        assert_eq!(names(fable), names(opus), "两族的工具集相同，差的是描述");
+        for (a, b) in opus.iter().zip(fable.iter()) {
+            assert_ne!(a, b, "{} 两族的 schema 不该相同", a["name"]);
+        }
+        // opus 那份里那句 fable 没有的话，是这两份资产真的分开了的最短证据。
+        let bash = opus.iter().find(|t| t["name"] == "Bash").unwrap();
+        assert!(
+            bash["description"].as_str().unwrap().contains("Foreground `sleep` is blocked"),
+            "opus 的 Bash 描述取自 cap/2.1.260-2/00025"
+        );
+        let fable_bash = fable.iter().find(|t| t["name"] == "Bash").unwrap();
+        assert!(!fable_bash["description"].as_str().unwrap().contains("Foreground `sleep`"));
+
+        // 没有 2.1.260 样本的两族退回 opus 那份（版本对得上优先于族别对得上）。
+        for kind in [config::CcProfileKind::MainSonnet, config::CcProfileKind::MainHaiku] {
+            assert_eq!(super::cc_tools_core(config::cc_profile(kind)), opus, "{kind:?} 退回 opus");
+        }
+    }
+
+    /// 三个关联字段**逐类给**，不能一刀切成主线程：官方六个 profile 在这三项上各不相同。
+    ///
+    /// 最要紧的是「猜下一句」：它的末条正是一句 `[SUGGESTION MODE: …]` 的 user 消息，
+    /// 照 `last_is_new_prompt_body` 判就会换一轮 prompt id，把主线程那条链一起带偏；
+    /// 而官方那条（`cap/2.1.260-2/00063`）**根本不写** `cc_prompt_id`。
+    #[test]
+    fn session_chain_fields_follow_the_request_kind() {
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let body = |tools: &str, last: &str, billing_extra: &str| {
+            Bytes::from(format!(
+                concat!(
+                    r#"{{"model":"claude-opus-5","max_tokens":64000,"#,
+                    r#""messages":[{{"role":"user","content":"hi"}},"#,
+                    r#"{{"role":"assistant","content":"y"}},"#,
+                    r#"{{"role":"user","content":"{}"}}],"#,
+                    r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
+                    r#"cc_version=2.1.260.222; cc_entrypoint=cli;{}"}}],"#,
+                    r#""tools":{},"#,
+                    r#""metadata":{{"user_id":"{{\"session_id\":\"{}\"}}"}}}}"#
+                ),
+                last, billing_extra, tools, SID
+            ))
+        };
+        let mut headers = super::HeaderMap::new();
+        headers.insert("x-claude-code-session-id", HeaderValue::from_static(SID));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
+        );
+        let link = |b: &Bytes| {
+            let parsed_body = parsed(b);
+            super::client_session_link(
+                parsed_body.as_ref(),
+                &headers,
+                None,
+                all_on(),
+                true,
+                &test_cred(),
+            )
+            .map(|(_, l)| l)
+        };
+
+        // 主线程：三项全给，新输入换一轮 id。
+        let main = link(&body(r#"[{"name":"Bash"}]"#, "next question", "")).expect("主线程要补");
+        let first_pid = main.prompt_id.clone().expect("主线程写 cc_prompt_id");
+        assert!(main.diagnostics, "主线程写 diagnostics");
+
+        // 「猜下一句」：**不写 cc_prompt_id、不写 diagnostics、也不换轮**。
+        let sugg = link(&body(
+            r#"[{"name":"Bash"}]"#,
+            "[SUGGESTION MODE: Suggest what the user might type next.]",
+            "",
+        ))
+        .expect("它仍在链上——官方那条带 cc_prev_req");
+        assert!(sugg.prompt_id.is_none(), "官方 00063 没有 cc_prompt_id");
+        assert!(!sugg.diagnostics, "官方 00063 也没有 diagnostics");
+
+        // 换轮没被它带偏：主线程再来一条新输入，拿到的仍是「上一轮之后的下一轮」，
+        // 而不是被猜下一句先转过一次。
+        let again = link(&body(r#"[{"name":"Bash"}]"#, "another question", "")).unwrap();
+        assert_ne!(again.prompt_id.as_ref(), Some(&first_pid), "新输入该换一轮");
+
+        // SDK 子代理：两项都写，但**不换轮**（跟父会话共用同一个 prompt id）。
+        let before = link(&body(r#"[{"name":"Bash"}]"#, "tool turn", "")).unwrap();
+        let sub =
+            link(&body(r#"[{"name":"Bash"}]"#, "brand new user message", " cc_is_subagent=true;"))
+                .expect("子代理要补");
+        assert!(sub.diagnostics, "官方 00020 带 diagnostics");
+        assert_eq!(sub.prompt_id, before.prompt_id, "子代理沿用父会话那一轮，不换");
+
+        // 无工具 helper：写 cc_prompt_id，**不写** diagnostics（官方 00024 没有）。
+        let helper = link(&body("[]", "anything", " cc_is_subagent=true;")).expect("helper 要补");
+        assert!(helper.prompt_id.is_some(), "官方 00024 带 cc_prompt_id");
+        assert!(!helper.diagnostics, "官方 00024 没有 diagnostics");
+    }
+
+    /// 官方**本来就非流式**的那两类不能被 `nonstream_as_sse` 改成流式，额度探测也不能被
+    /// 补上 `system`。
+    ///
+    /// 抓包：安全分类（`cap/2.1.260/00019`、`00030`）与额度探测（`2.1.260-2/00004`）整条都
+    /// 没有 `stream` 字段；额度探测连 `system` 都没有（四个顶层键 `model → max_tokens →
+    /// messages → metadata`）。那个开关的本意是「官方恒为流式，非流式一看就不是 CC」，
+    /// 对这两类恰好相反。
+    #[test]
+    fn official_nonstream_aux_requests_are_left_alone() {
+        use super::CcRequestKind as K;
+        let beta = |s: &str| -> Vec<String> {
+            s.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect()
+        };
+
+        // 额度探测：没有 system、max_tokens:1。
+        let probe: serde_json::Value =
+            serde_json::from_slice(&super::probe_body("claude-haiku-4-5-20251001")).unwrap();
+        let kind = K::of(&probe, &beta("oauth-2025-04-20,interleaved-thinking-2025-05-14"));
+        assert_eq!(kind, K::QuotaProbe, "{probe}");
+        assert!(kind.keeps_nonstream(), "官方那条没有 stream");
+        assert!(!kind.allows_system_prefix(), "官方那条没有 system，别补");
+        assert!(!kind.on_session_chain(), "也没有 billing header，不进链");
+
+        // 安全分类：非流式，但有 system。
+        let classifier = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "system": [{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.3de; cc_entrypoint=cli;"}],
+            "messages": [{"role":"user","content":"check"}],
+            "stop_sequences": ["</severity>"],
+            "thinking": {"type":"disabled"},
+        });
+        let kind =
+            K::of(&classifier, &beta("claude-code-20250219,auto-mode-classifier-2026-07-16"));
+        assert_eq!(kind, K::Classifier);
+        assert!(kind.keeps_nonstream(), "官方那条非流式");
+        assert!(kind.allows_system_prefix(), "它有 system，缺 billing 时照补");
+        assert!(!kind.on_session_chain(), "三项都不写");
+
+        // 标题生成是**流式**的，不能跟着一起豁免。
+        let title = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 32000,
+            "stream": true,
+            "system": [{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.ced; cc_entrypoint=cli;"}],
+            "messages": [{"role":"user","content":"name it"}],
+            "tools": [],
+        });
+        let kind = K::of(&title, &beta("structured-outputs-2025-12-15,advisor-tool-2026-03-01"));
+        assert_eq!(kind, K::Title);
+        assert!(!kind.keeps_nonstream(), "官方标题生成是 stream:true");
+
+        // 主线程照旧要被改成流式。
+        let main = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64000,
+            "system": [{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli;"}],
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": [{"name":"Bash"}],
+        });
+        let kind = K::of(&main, &beta("claude-code-20250219,effort-2025-11-24"));
+        assert_eq!(kind, K::Main);
+        assert!(!kind.keeps_nonstream());
+        assert!(kind.allows_system_prefix());
+    }
+
+    /// 额度探测的判据必须**窄**：只看「没有 system + max_tokens:1」的话，任何客户端的
+    /// 一 token 探活都会被认成它，跟着被免掉流式化、免掉 `system` 前缀——而它需要那个前缀
+    /// 才能用上订阅额度。宁可漏认（退回 helper 走通用路径），也不能错认。
+    #[test]
+    fn quota_probe_detection_is_narrow() {
+        use super::CcRequestKind as K;
+        let no_beta: Vec<String> = Vec::new();
+        // 官方那条（`cap/2.1.258/00004` 与 `cap/2.1.260-2/00004` 逐字节相同）。
+        let official: serde_json::Value =
+            serde_json::from_slice(&super::probe_body("claude-haiku-4-5-20251001")).unwrap();
+        assert_eq!(K::of(&official, &no_beta), K::QuotaProbe, "{official}");
+
+        // 每一处偏离都不该再算额度探测。
+        let variants: &[(&str, serde_json::Value)] = &[
+            (
+                "模型不是 haiku",
+                serde_json::json!({
+                "model": "claude-opus-5", "max_tokens": 1,
+                "messages": [{"role":"user","content":"quota"}]}),
+            ),
+            (
+                "正文不是 quota",
+                serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+                "messages": [{"role":"user","content":"ping"}]}),
+            ),
+            (
+                "不止一条消息",
+                serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+                "messages": [{"role":"user","content":"quota"},
+                             {"role":"assistant","content":"ok"}]}),
+            ),
+            (
+                "带工具",
+                serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 1, "tools": [],
+                "messages": [{"role":"user","content":"quota"}]}),
+            ),
+            (
+                "带 system",
+                serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 1, "system": "s",
+                "messages": [{"role":"user","content":"quota"}]}),
+            ),
+            (
+                "max_tokens 不是 1",
+                serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 2,
+                "messages": [{"role":"user","content":"quota"}]}),
+            ),
+        ];
+        for (why, v) in variants {
+            assert_ne!(K::of(v, &no_beta), K::QuotaProbe, "{why}: {v}");
+        }
+
+        // 单个 text 块的写法也算（官方发的是裸字符串，但这是等价形态）。
+        let block = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+            "messages": [{"role":"user","content":[{"type":"text","text":"quota"}]}]});
+        assert_eq!(K::of(&block, &no_beta), K::QuotaProbe);
+    }
+
+    /// 握手 / 额度探测的身份取**主请求实际发出去的那份**，不是重新派生一份。
+    ///
+    /// `spoof_device_id=false`（严格抓包对齐模式支持的行为）时主请求保留客户端自己的
+    /// device；`spoof_identity=false` 时整份身份原样透传。这两种配置下再派生一份，
+    /// 同一个会话在上游看来就来自两台设备。
+    #[test]
+    fn handshake_identity_follows_the_outbound_request() {
+        const CLIENT_DEV: &str = "client-device-abc";
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","max_tokens":64000,"messages":[{{"role":"user","content":"hi"}}],"metadata":{{"user_id":"{{\"device_id\":\"{CLIENT_DEV}\",\"account_uuid\":\"acct-1\",\"session_id\":\"{SID}\"}}"}}}}"#
+        ));
+        let cred = test_cred();
+        // 模拟路径：主请求发的是派生 device + 凭证 account，握手报的就是这一份。
+        let sim = detect_for(&body, all_on()).expect("非 CC 形态该走模拟");
+        let sent = rewrite_body(&body, &cred, "fp", all_on(), Some(&sim), None);
+        let simulated = super::outbound_identity(&sent, &cred);
+        assert_eq!(simulated.device_id, cred.spoof_device_id("fp").unwrap());
+        assert_eq!(simulated.account_uuid, ACCOUNT_UUID);
+
+        // **真实 CC 那条路**（`sim = None`，客户端自带 metadata）才是这两个开关真正生效
+        // 的地方：`spoof_identity` 按原格式定点改写，`spoof_device_id` 决定动不动 device。
+        let cc_body = Bytes::from(
+            String::from_utf8(body.to_vec()).unwrap().replace(
+                r#""messages":[{"role":"user","content":"hi"}]"#,
+                &format!(
+                    r#""messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"{}"}}]"#,
+                    config::CC_SYSTEM_IDENTITY
+                ),
+            ),
+        );
+        let ident = |flags| {
+            let sent = rewrite_body(&cc_body, &cred, "fp", flags, None, None);
+            super::outbound_identity(&sent, &cred)
+        };
+
+        // `spoof_device_id=false`：主请求保留客户端那个 device，握手必须跟着。
+        let keep_dev = ident(store::ForwardFlags { spoof_device_id: false, ..all_on() });
+        assert_eq!(keep_dev.device_id, CLIENT_DEV, "device 要跟着主请求，不能另派生一个");
+        assert_eq!(keep_dev.account_uuid, ACCOUNT_UUID, "account 仍然换成凭证的");
+
+        // `spoof_identity=false`：整份原样透传，两项都跟客户端。
+        let passthrough = ident(store::ForwardFlags { spoof_identity: false, ..all_on() });
+        assert_eq!(passthrough.device_id, CLIENT_DEV);
+        assert_eq!(passthrough.account_uuid, "acct-1", "连 account 都不该换");
+
+        // 额度探测复用主请求那串 `user_id` 的**原文**，逐字节相同。
+        let probe =
+            super::with_outbound_identity(super::probe_body(super::QUOTA_PROBE_MODEL), &keep_dev);
+        let v: serde_json::Value = serde_json::from_slice(&probe).unwrap();
+        assert_eq!(
+            v["metadata"]["user_id"].as_str(),
+            keep_dev.raw_user_id.as_deref(),
+            "探测与主请求逐字节同一串身份"
+        );
+        let inner: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["device_id"], CLIENT_DEV, "探测与主请求同一台设备");
+        assert_eq!(inner["account_uuid"], ACCOUNT_UUID);
+        assert_eq!(inner["session_id"], SID);
+    }
+
+    /// Windows 那种**扁平** `metadata.user_id` 同样要认，额度探测复用它的**原文**。
+    ///
+    /// 只解内嵌 JSON 的话，扁平串解析失败 → 退回「device 为空 + 凭证账号」：主请求有设备、
+    /// 握手/eval/启动遥测/额度探测却没有。而把它重拼成 JSON 又会造出「同一会话一条扁平、
+    /// 一条 JSON」——`spoof_identity` 那边特意保住了扁平形态，这里不能给拆了。
+    #[test]
+    fn outbound_identity_handles_the_windows_flat_form() {
+        const SID: &str = "9f8e7d6c-0000-1111-2222-333344445555";
+        let cred = test_cred();
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","max_tokens":64000,"messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"{}"}}],"metadata":{{"user_id":"user_winDev1_account_oldacct_session_{SID}"}}}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+
+        // 默认配置：`spoof_identity` 换掉 device 与 account，**仍以扁平串回写**。
+        let sent = rewrite_body(&body, &cred, "fp", all_on(), None, None);
+        let ident = super::outbound_identity(&sent, &cred);
+        let raw = ident.raw_user_id.clone().expect("出站体里有 user_id");
+        assert!(raw.starts_with("user_"), "出站仍是扁平串: {raw}");
+        assert!(raw.ends_with(&format!("_session_{SID}")), "session 段保留: {raw}");
+        assert_eq!(ident.device_id, cred.spoof_device_id("fp").unwrap(), "device 段解出来了");
+        assert_eq!(ident.account_uuid, ACCOUNT_UUID, "account 段也解出来了");
+        assert!(!ident.device_id.is_empty(), "不能像只解 JSON 那样退回空 device");
+
+        // `spoof_device_id=false`：device 段保留客户端的，握手跟着。
+        let sent = rewrite_body(
+            &body,
+            &cred,
+            "fp",
+            store::ForwardFlags { spoof_device_id: false, ..all_on() },
+            None,
+            None,
+        );
+        let keep = super::outbound_identity(&sent, &cred);
+        assert_eq!(keep.device_id, "winDev1");
+
+        // 额度探测复用原文，连编码形态一起——不会变成 JSON。
+        let probe =
+            super::with_outbound_identity(super::probe_body(super::QUOTA_PROBE_MODEL), &keep);
+        let v: serde_json::Value = serde_json::from_slice(&probe).unwrap();
+        let probe_uid = v["metadata"]["user_id"].as_str().unwrap();
+        assert_eq!(Some(probe_uid), keep.raw_user_id.as_deref(), "逐字节同一串");
+        assert!(probe_uid.starts_with("user_winDev1_account_"), "还是扁平串: {probe_uid}");
+    }
+
+    /// 关掉 `spoof_identity` 之后，客户端自己带的 `metadata.user_id` **必须原样留着**。
+    ///
+    /// 剥这一步原先只看 `sim.is_some()`，而重建那步要 `flags.spoof_identity`：开关一关，
+    /// 身份就被删掉且没人补回来——头上还有会话 id、体里什么都没有。那既违背这个开关的
+    /// 语义（「别改身份」被执行成了「把身份删了」），也违背客户端数据透传契约。
+    #[test]
+    fn identity_spoofing_off_keeps_the_client_metadata() {
+        const USER_ID: &str = r#"{\"device_id\":\"dev-1\",\"account_uuid\":\"acct-1\",\"session_id\":\"d0c1fb05-9b19-4576-9465-e2b8a206dabf\"}"#;
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","max_tokens":64000,"messages":[{{"role":"user","content":"hi"}}],"metadata":{{"user_id":"{USER_ID}"}}}}"#
+        ));
+        let sim = detect_for(&body, all_on()).expect("非 CC 形态该走模拟");
+
+        let off = store::ForwardFlags { spoof_identity: false, ..all_on() };
+        let out = rewrite_body(&body, &test_cred(), "fp", off, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let kept = v["metadata"]["user_id"].as_str().expect("身份不该被删掉");
+        assert!(kept.contains("dev-1"), "device_id 原样留着: {kept}");
+        assert!(kept.contains("acct-1"), "account_uuid 原样留着: {kept}");
+
+        // 开关开着时照旧重建成该凭证自洽的那份（原有行为不变）。
+        let on = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&on).unwrap();
+        let rebuilt = v["metadata"]["user_id"].as_str().unwrap();
+        assert!(rebuilt.contains(ACCOUNT_UUID), "开着就换成凭证自己的: {rebuilt}");
+        assert!(!rebuilt.contains("acct-1"));
+    }
+
+    /// 会话链的判据**独立于**「要不要补主线程 beta」——两者在六个 profile 上的分界线
+    /// 不在同一处，SDK 子代理正好落在两栏相反的那一格：它的 beta 不该被补，但它确实带着
+    /// `cc_prompt_id` 与 `diagnostics`（`cap/2.1.260/00020`）。混用一个判据它就被整个跳过。
+    ///
+    /// 只有标题生成与安全分类不补——官方这两类的 billing header 里就没有 `cc_prompt_id`。
+    #[test]
+    fn api_key_cc_session_chain_skips_only_title_and_classifier() {
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let make = |tools: &str, beta: &'static str| {
+            let body = Bytes::from(format!(
+                concat!(
+                    r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":32000,"#,
+                    r#""messages":[{{"role":"user","content":"hi"}}],"#,
+                    r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
+                    r#"cc_version=2.1.260.ced; cc_entrypoint=cli;"}}],"#,
+                    r#""tools":{},"#,
+                    r#""metadata":{{"user_id":"{{\"session_id\":\"{}\"}}"}}}}"#
+                ),
+                tools, SID
+            ));
+            let parsed_body = parsed(&body);
+            let mut h = super::HeaderMap::new();
+            h.insert("x-claude-code-session-id", HeaderValue::from_static(SID));
+            h.insert("anthropic-beta", HeaderValue::from_static(beta));
+            super::client_session_link(parsed_body.as_ref(), &h, None, all_on(), true, &test_cred())
+                .is_some()
+        };
+        // 标题生成：有 structured-outputs → 不补。
+        assert!(!make("[]", "structured-outputs-2025-12-15,advisor-tool-2026-03-01"));
+        // 安全分类：有 auto-mode-classifier → 不补。
+        assert!(!make("[]", "claude-code-20250219,auto-mode-classifier-2026-07-16"));
+        // **SDK 子代理要补**：它的 beta 集合不该被 `merge_beta` 补主线程那几项，但它自己
+        // 带着 `cc_prompt_id` 与 `diagnostics`。两个判据必须分开。
+        assert!(make(
+            r#"[{"name":"Bash"}]"#,
+            "claude-code-20250219,thinking-display-updates-2026-08-18"
+        ));
+        // 主线程：补。
+        assert!(make(r#"[{"name":"Bash"}]"#, "claude-code-20250219,effort-2025-11-24"));
+
+        // 两个判据确实分家了：同一串 beta，一个说「别补主线程项」，一个说「要补会话链」。
+        let sdk: Vec<String> = "claude-code-20250219,thinking-display-updates-2026-08-18"
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        assert!(super::is_official_non_main_beta(&sdk), "beta 不该被补主线程项");
+    }
+
+    /// 头与体**各自校验**：非法的头不能遮住体里那个合法 uuid。
+    #[test]
+    fn a_bad_header_does_not_mask_a_valid_body_session_id() {
+        const GOOD: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        const OTHER: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+        let body: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"metadata":{{"user_id":"{{\"session_id\":\"{GOOD}\"}}"}}}}"#
+        ))
+        .unwrap();
+        let with = |h: &'static str| {
+            let mut m = super::HeaderMap::new();
+            m.insert("x-claude-code-session-id", HeaderValue::from_static(h));
+            m
+        };
+
+        // 头非法：**不能**因此把体里那个合法的一起丢掉。原先 `.or(from_body)` 在头存在时
+        // 根本不看体，校验一挂整条退回派生值。
+        assert_eq!(
+            super::incoming_session_id(&with("sess-42"), Some(&body)).as_deref(),
+            Some(GOOD),
+            "非法的头不该遮住体里那个"
+        );
+        // 头合法：用头（官方两处相同，这里也是绝大多数情形）。
+        assert_eq!(
+            super::incoming_session_id(&with(OTHER), Some(&body)).as_deref(),
+            Some(OTHER),
+            "两处都合法但不同值时取头，并打一行 warn"
+        );
+        // 只有头。
+        assert_eq!(super::incoming_session_id(&with(OTHER), None).as_deref(), Some(OTHER));
+        // 两处都没有/都不合法。
+        assert!(super::incoming_session_id(&super::HeaderMap::new(), None).is_none());
+        assert!(super::incoming_session_id(&with("sess-42"), None).is_none());
+    }
+
+    /// 会话 id 头体冲突的判据：两处**都合法却不同**才算，其余一律不算。
+    ///
+    /// 拒绝本身由 `reject_session_conflict` 拨（默认开），判据在这里。只有一处合法时不算
+    /// 冲突——那是客户端只给对了一个，[`super::incoming_session_id`] 会取合法的那个。
+    #[test]
+    fn session_id_conflict_needs_two_valid_different_uuids() {
+        const A: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        const B: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+        let body = |sid: &str| -> serde_json::Value {
+            serde_json::from_str(&format!(
+                r#"{{"metadata":{{"user_id":"{{\"session_id\":\"{sid}\"}}"}}}}"#
+            ))
+            .unwrap()
+        };
+        let with = |h: &'static str| {
+            let mut m = super::HeaderMap::new();
+            m.insert("x-claude-code-session-id", HeaderValue::from_static(h));
+            m
+        };
+
+        // 两处都合法且不同 → 冲突。
+        assert_eq!(
+            super::session_id_conflict(&with(A), Some(&body(B))),
+            Some((A.to_string(), B.to_string()))
+        );
+        // 相同 → 不冲突（官方就是这个形态）。
+        assert!(super::session_id_conflict(&with(A), Some(&body(A))).is_none());
+        // 只有一处 → 不冲突。
+        assert!(super::session_id_conflict(&with(A), None).is_none());
+        assert!(super::session_id_conflict(&super::HeaderMap::new(), Some(&body(B))).is_none());
+        // 一处非法 → 不算冲突，是「只给对了一个」。
+        assert!(super::session_id_conflict(&with("sess-42"), Some(&body(B))).is_none());
+        assert_eq!(
+            super::incoming_session_id(&with("sess-42"), Some(&body(B))).as_deref(),
+            Some(B),
+            "那种情况下取合法的那个"
+        );
+    }
+
+    /// 扁平 `metadata.user_id`（Windows 那类客户端）里的会话 id 必须和内嵌 JSON 同等对待。
+    ///
+    /// 曾经体那侧有两份解析器：转发主路用认两种格式的 [`super::extract_session_id`]，而
+    /// [`super::incoming_session_id`] 与 [`super::session_id_conflict`] 用的那份只认内嵌
+    /// JSON。于是扁平串客户端在冲突检测眼里「体里没有会话 id」——头体不一致对整整一类
+    /// 客户端形同虚设，默认拒的开关也拦不住。
+    #[test]
+    fn the_flat_user_id_carries_a_session_id_too() {
+        const A: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        const B: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+        let flat = |sid: &str| -> serde_json::Value {
+            serde_json::json!({
+                "metadata": { "user_id": format!("user_deadbeef_account_acct-1_session_{sid}") }
+            })
+        };
+        let with = |h: &'static str| {
+            let mut m = super::HeaderMap::new();
+            m.insert("x-claude-code-session-id", HeaderValue::from_static(h));
+            m
+        };
+
+        // 体那侧读得出来（三个入口同一个解析器）。
+        assert_eq!(super::extract_session_id(Some(&flat(B))).as_deref(), Some(B));
+        // 头 A、扁平体 B：两处都合法且不同 → 冲突，默认开关会本地拒。
+        assert_eq!(
+            super::session_id_conflict(&with(A), Some(&flat(B))),
+            Some((A.to_string(), B.to_string())),
+            "扁平格式的头体冲突也要检测得到"
+        );
+        // 相同 → 不冲突。
+        assert!(super::session_id_conflict(&with(A), Some(&flat(A))).is_none());
+        // 头非法、扁平体合法 → 不是冲突，是「只给对了一个」，选体里那个。
+        assert!(super::session_id_conflict(&with("sess-42"), Some(&flat(B))).is_none());
+        assert_eq!(
+            super::incoming_session_id(&with("sess-42"), Some(&flat(B))).as_deref(),
+            Some(B)
+        );
+        // 头缺失、扁平体合法 → 选体里那个。
+        assert_eq!(
+            super::incoming_session_id(&super::HeaderMap::new(), Some(&flat(B))).as_deref(),
+            Some(B)
+        );
+        // 扁平串里 session 段不是 uuid → 当没带（同内嵌 JSON 那侧的口径）。
+        assert!(
+            super::incoming_session_id(&super::HeaderMap::new(), Some(&flat("sess-9"))).is_none()
+        );
+    }
+
+    /// **出站两处必须同值**：`X-Claude-Code-Session-Id` 头与 `metadata.user_id` 里那个
+    /// 会话 id，官方逐字相同。此前只验了「luban 内部选中了哪个值」，没验最终发出去的那份，
+    /// 于是两种情形一直漏着：非法的头原样转发、体里有合法值而头是缺的。
+    #[test]
+    fn the_outbound_session_id_is_the_same_in_the_header_and_the_body() {
+        const GOOD: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        const OTHER: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+        let cred = test_cred();
+        let device_fp = "fp";
+
+        // 一条 CC 形态的请求（走「补身份 / 定点改写」那条路，不走模拟）。
+        let body_with = |user_id: Option<&str>| -> Bytes {
+            let mut v = serde_json::json!({
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "system": [{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}]
+            });
+            if let Some(u) = user_id {
+                v["metadata"] = serde_json::json!({ "user_id": u });
+            }
+            Bytes::from(serde_json::to_vec(&v).unwrap())
+        };
+        let headers_with = |h: Option<&str>| {
+            let mut m = super::HeaderMap::new();
+            if let Some(h) = h {
+                m.insert("x-claude-code-session-id", HeaderValue::from_str(h).unwrap());
+            }
+            m
+        };
+
+        // 走一遍转发路径上那三步：选 bare_session → 选出站会话 id → 落到头与体。
+        let outbound = |h: Option<&str>,
+                        user_id: Option<&str>|
+         -> (Option<String>, Option<String>) {
+            let headers = headers_with(h);
+            let body = body_with(user_id);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let bare = super::bare_session_id(
+                &headers,
+                all_on(),
+                None,
+                true,
+                super::body_has_user_id(Some(&parsed)),
+                &cred,
+                device_fp,
+            );
+            let session_out = super::outbound_session_id(&headers, Some(&parsed), bare.as_deref());
+            let out_headers = super::build_forward_headers(
+                &headers,
+                "tok",
+                all_on(),
+                None,
+                session_out.as_deref(),
+            );
+            let out_body = rewrite_body_with_session(
+                &body,
+                &cred,
+                device_fp,
+                all_on(),
+                None,
+                bare.as_deref(),
+                session_out.as_deref(),
+            );
+            let out_json: serde_json::Value = serde_json::from_slice(&out_body).unwrap();
+            (
+                out_headers
+                    .get("x-claude-code-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+                super::extract_session_id(Some(&out_json)),
+            )
+        };
+        let json_id =
+            |sid: &str| format!(r#"{{"device_id":"d","account_uuid":"a","session_id":"{sid}"}}"#);
+        let flat_id = |sid: &str| format!("user_deadbeef_account_acct-1_session_{sid}");
+
+        // 1) 头是 `sess-42`、体里是合法 uuid：选体里那个，**头也得换成它**。
+        //    此前非法的头原样发了出去，出站两处对不上。
+        let (h, b) = outbound(Some("sess-42"), Some(&json_id(GOOD)));
+        assert_eq!(h.as_deref(), Some(GOOD), "非法的头要被选中的那个顶掉");
+        assert_eq!(b.as_deref(), Some(GOOD));
+        assert_eq!(h, b, "出站两处必须同值");
+
+        // 2) 头缺失、体里是合法 uuid：**头要补上**。此前 `bare_session` 只在「体里没有
+        //    metadata」时才有值，这条路上头一直是缺的。
+        let (h, b) = outbound(None, Some(&json_id(GOOD)));
+        assert_eq!(h.as_deref(), Some(GOOD), "头缺失时按体里那个补上");
+        assert_eq!(h, b);
+
+        // 3) 扁平格式同样成立（Windows 那类客户端）。
+        let (h, b) = outbound(None, Some(&flat_id(GOOD)));
+        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h, b);
+        let (h, b) = outbound(Some("sess-42"), Some(&flat_id(GOOD)));
+        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h, b);
+
+        // 4) 两处都合法却不同（默认会被 `reject_session_conflict` 本地拒；关掉后走到这里）：
+        //    [`super::incoming_session_id`] 取头那个，体里那份就得跟着改成它——否则发出去的
+        //    仍是一份官方不产生的请求。
+        let (h, b) = outbound(Some(OTHER), Some(&json_id(GOOD)));
+        assert_eq!(h.as_deref(), Some(OTHER), "两处都合法时取头");
+        assert_eq!(b.as_deref(), Some(OTHER), "体里那份要同步过去");
+        let (h, b) = outbound(Some(OTHER), Some(&flat_id(GOOD)));
+        assert_eq!((h.as_deref(), b.as_deref()), (Some(OTHER), Some(OTHER)), "扁平串同理");
+
+        // 4b) 头合法、体里有 user_id 但**没有会话段**：`bare_session` 不接（有 user_id），
+        //     [`super::ensure_cc_metadata`] 也不接（同理），此前这条路上体里一直缺着——
+        //     头有会话、体没会话，官方绝不产生。现在按各自格式补一段。
+        let (h, b) = outbound(Some(GOOD), Some(r#"{"device_id":"d","account_uuid":"a"}"#));
+        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(b.as_deref(), Some(GOOD), "内嵌 JSON 缺会话段要补上");
+        let (h, b) = outbound(Some(GOOD), Some("user_deadbeef_account_acct-1"));
+        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(b.as_deref(), Some(GOOD), "扁平串缺会话段要补上");
+
+        // 5) 头合法、体里没有 metadata：走补身份那条路，两处都是头里那个（回归）。
+        let (h, b) = outbound(Some(GOOD), None);
+        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h, b);
+
+        // 6) 头非法、体里也没有 metadata：`bare_session` 派生一个，头上那个非法值同样要被
+        //    顶掉——否则「头 sess-42 + 体里派生 uuid」又是一处对不上。
+        let (h, b) = outbound(Some("sess-42"), None);
+        assert!(h.as_deref().is_some_and(super::looks_like_uuid), "派生值是 uuid: {h:?}");
+        assert_eq!(h, b);
+
+        // 7) 正常形态（两处同值）不该被动一个字节：值相同时头不重写、体不改写。
+        let same = json_id(GOOD);
+        let before = body_with(Some(&same));
+        let (h, b) = outbound(Some(GOOD), Some(&same));
+        assert_eq!((h.as_deref(), b.as_deref()), (Some(GOOD), Some(GOOD)));
+        let after: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(super::extract_session_id(Some(&after)).as_deref(), Some(GOOD));
+    }
+
+    /// [`super::sync_metadata_session`] 把体里的会话段对齐到出站那个，**保持原格式**：
+    /// 内嵌 JSON 定点替换（字段序与其余内容逐字节不变）、扁平串重拼；本来没有会话段的
+    /// 就按各自格式补一段——头上有合法会话 id、体里没有，是官方绝不产生的组合。
+    #[test]
+    fn syncing_the_metadata_session_keeps_the_original_shape() {
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let user_id =
+            |v: &serde_json::Value| v["metadata"]["user_id"].as_str().unwrap().to_string();
+
+        // 内嵌 JSON：只有 session_id 那段变了，字段顺序与其余内容原样。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": r#"{"device_id":"dd","account_uuid":"aa","session_id":"sess-9"}"# }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(
+            user_id(&v),
+            format!(r#"{{"device_id":"dd","account_uuid":"aa","session_id":"{SID}"}}"#)
+        );
+        // 已经同值 → 不动。
+        assert!(!super::sync_metadata_session(&mut v, SID));
+
+        // 扁平串：device 与 account 段原样，只换 session 段，仍以扁平串回写。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": "user_deadbeef_account_acct-1_session_sess-9" }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(user_id(&v), format!("user_deadbeef_account_acct-1_session_{SID}"));
+        assert!(!super::sync_metadata_session(&mut v, SID));
+
+        // 内嵌 JSON 没有会话段 → 追加到末尾（官方键序 device → account → session），
+        // 其余内容逐字节不变。补过之后再同步一次是幂等的。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": r#"{"device_id":"dd","account_uuid":"aa"}"# }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(
+            user_id(&v),
+            format!(r#"{{"device_id":"dd","account_uuid":"aa","session_id":"{SID}"}}"#)
+        );
+        assert!(!super::sync_metadata_session(&mut v, SID));
+        // 空对象也能补，不多出前导逗号。
+        let mut v = serde_json::json!({ "metadata": { "user_id": "{}" } });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(user_id(&v), format!(r#"{{"session_id":"{SID}"}}"#));
+        // 扁平串缺 session 段 → 追加整段，仍是扁平串。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": "user_deadbeef_account_acct-1" }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(user_id(&v), format!("user_deadbeef_account_acct-1_session_{SID}"));
+        assert!(!super::sync_metadata_session(&mut v, SID));
+        // 两种格式都认不出 → 不动。
+        let mut v = serde_json::json!({ "metadata": { "user_id": "opaque-user-42" } });
+        assert!(!super::sync_metadata_session(&mut v, SID));
+        assert_eq!(user_id(&v), "opaque-user-42");
+        // 压根没有 metadata.user_id → 不动（那条交给 `ensure_cc_metadata`）。
+        let mut v = serde_json::json!({ "model": "claude-opus-5" });
+        assert!(!super::sync_metadata_session(&mut v, SID));
+        assert!(v.get("metadata").is_none());
+    }
+
+    /// 2.1.260 的 billing 后缀是**逐 profile 定死**的，不能再走那套派生算法。
+    ///
+    /// 算法逆向自 2.1.251，在 2.1.260 上已被证否：六个 profile 各有固定后缀，而算法对
+    /// 主线程样本算出的是 `11d`。更老的版本仍走派生（2.1.258 五份抓包全是 `1e2`，算法
+    /// 在 `"hi"` 上正好也算出 `1e2`）。
+    #[test]
+    fn billing_suffix_is_profile_fixed_on_2_1_260() {
+        use super::CcRequestKind as K;
+        let body = |model: &str| {
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        };
+        let text = |model: &str, ver: &str, kind| {
+            super::billing_header_text(&body(model), Some(ver), kind)
+        };
+
+        // 主线程按模型族：opus `222`、fable `bcd`。
+        assert!(
+            text("claude-opus-5", "2.1.260", K::Main).contains("cc_version=2.1.260.222;"),
+            "{}",
+            text("claude-opus-5", "2.1.260", K::Main)
+        );
+        assert!(text("claude-fable-5-1", "2.1.260", K::Main).contains("2.1.260.bcd;"));
+        // 「猜下一句」跟主线程同一档。
+        assert!(text("claude-opus-5", "2.1.260", K::Suggestion).contains("2.1.260.222;"));
+        // 各辅助 profile 各有各的。
+        for (kind, want) in
+            [(K::Subagent, "660"), (K::Helper, "d95"), (K::Title, "ced"), (K::Classifier, "3de")]
+        {
+            let got = text("claude-haiku-4-5-20251001", "2.1.260", kind);
+            assert!(got.contains(&format!("2.1.260.{want};")), "{kind:?}: {got}");
+        }
+
+        // 2.1.258 仍走派生算法——那一版五份抓包全是 `1e2`。
+        let old = text("claude-opus-5", "2.1.258", K::Main);
+        assert!(old.contains("cc_version=2.1.258.1e2;"), "{old}");
+    }
+
+    /// uuid 形态校验的边界：只认 `8-4-4-4-12` 的小写 hex。
+    #[test]
+    fn session_id_must_look_like_a_uuid() {
+        let ok = super::looks_like_uuid;
+        assert!(ok("d0c1fb05-9b19-4576-9465-e2b8a206dabf"));
+        // 不看 version/variant 位：v7 之类同样是个正常的会话 id，没理由拦。
+        assert!(ok("00000000-0000-0000-0000-000000000000"));
+        assert!(!ok("D0C1FB05-9B19-4576-9465-E2B8A206DABF"), "大写不是官方形态");
+        assert!(!ok("d0c1fb05-9b19-4576-9465-e2b8a206dab"), "末段少一位");
+        assert!(!ok("d0c1fb05-9b19-4576-9465-e2b8a206dabff"), "末段多一位");
+        assert!(!ok("d0c1fb05-9b19-4576-9465-e2b8a206dabf-x"), "多一段");
+        assert!(!ok("d0c1fb05_9b19_4576_9465_e2b8a206dabf"), "分隔符不对");
+        assert!(!ok("g0c1fb05-9b19-4576-9465-e2b8a206dabf"), "非 hex");
+        assert!(!ok(""));
+    }
+
+    /// 超长客户端 system 搬不动时，**一个字节都不许改**。
+    ///
+    /// 原来的实现先把末块换成 `(see conversation)` 占位、再去写 `messages[0]`，落点不可写
+    /// 时就直接 `return false`——客户端明确下的那段指令凭空消失，而调用方只看到一个
+    /// `false`，以为什么都没发生。
+    #[test]
+    fn long_client_system_is_relocated_atomically() {
+        let long = "指令".repeat(1200); // 远超 MAX_CLIENT_SYSTEM_CHARS
+        // messages[0].content 是数字：既不是数组也不是字符串，搬不过去。
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": 42}],
+            "system": long,
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let sim = detect_for(&raw, all_on()).expect("该请求应走模拟路径");
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(super::simulate_system(
+            &mut v,
+            &sim,
+            super::CacheShape { global: true, ttl_1h: true }
+        ));
+        let before = v.clone();
+        assert!(!super::relocate_long_client_system(&mut v, &sim), "搬不动就该返回 false");
+        assert_eq!(v, before, "搬不动时 body 必须原样不动，不能只剩一个占位块");
+        let tail = v["system"].as_array().unwrap().last().unwrap();
+        assert!(tail["text"].as_str().unwrap().contains("指令"), "客户端那段 system 还在: {tail}");
+
+        // messages[0] 可写时照常搬走，末块换占位。
+        let ok = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": long,
+        });
+        let raw = Bytes::from(serde_json::to_vec(&ok).unwrap());
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(super::simulate_system(
+            &mut v,
+            &sim,
+            super::CacheShape { global: true, ttl_1h: true }
+        ));
+        assert!(super::relocate_long_client_system(&mut v, &sim));
+        let tail = v["system"].as_array().unwrap().last().unwrap();
+        assert_eq!(tail["text"], "(see conversation)", "末块换成占位");
+        let first = v["messages"][0]["content"].as_str().unwrap();
+        assert!(first.starts_with("<system_instructions>"), "内容搬到了首条消息: {first}");
+        assert!(first.contains("指令"), "内容没丢");
+    }
+
     /// 回归 2026-08-07 的拒绝日志：客户端的顶层顺序是
     /// `model, system, messages, max_tokens, stream, tools, metadata, output_config`，即使
     /// system 和工具名都已整形，这个顺序仍把第三方客户端指纹原样带了出去。
@@ -11857,9 +15394,13 @@ mod tests {
             all_on(),
             Some(&sim),
             None,
+            None,
             false,
             Some(&map),
             true,
+            None,
+            None,
+            super::CcRequestKind::Main,
         );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -11875,6 +15416,8 @@ mod tests {
                 "thinking",
                 "context_management",
                 "output_config",
+                // 官方主线程每条都带（首轮值为 null），见 [`super::ensure_diagnostics`]。
+                "diagnostics",
                 "stream",
             ],
             "模拟后顶层键序必须与官方抓包一致: {}",
@@ -11906,7 +15449,7 @@ mod tests {
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
     }
 
-    /// fable 族是 2.1.258 里唯一还带 `# Reporting outcomes` 的（`cap/2.1.258/00013`）：
+    /// fable 族是 2.1.260 里唯一还带 `# Reporting outcomes` 的（`cap/2.1.260/00018`）：
     /// 五块 `[billing, 身份句, reporting, 基座, 客户端原文]`，thinking 补成
     /// `{adaptive, display:"updates"}` 且 `display` 不被 `strip_extra_fields` 剥掉。
     #[test]
@@ -11915,16 +15458,15 @@ mod tests {
             r#"{"model":"claude-fable-5-1","max_tokens":64000,"#,
             r#""messages":[{"role":"user","content":"hi"}],"system":"你是助手"}"#
         );
+        let reporting =
+            |b: &str| sim_for(b).profile.system == config::CcSystemShape::IdentityReporting;
         let b = Bytes::from(body.to_string());
         let sim = sim_for(body);
-        assert!(sim.reporting, "fable 族该带 reporting");
-        assert!(!sim_for(PLAIN_BODY).reporting, "opus 族不带");
+        assert!(reporting(body), "fable 族该带 reporting");
+        assert!(!reporting(PLAIN_BODY), "opus 族不带");
+        assert!(!reporting(r#"{"model":"claude-sonnet-5","messages":[]}"#), "sonnet 族不带");
         assert!(
-            !sim_for(r#"{"model":"claude-sonnet-5","messages":[]}"#).reporting,
-            "sonnet 族不带"
-        );
-        assert!(
-            !sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).reporting,
+            !reporting(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#),
             "haiku 族不带"
         );
         let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
@@ -11939,17 +15481,23 @@ mod tests {
         assert_eq!(
             v["thinking"],
             serde_json::json!({"type": "adaptive", "display": "updates"}),
-            "fable 的 thinking 形态（cap/2.1.258/00013）: {v}"
+            "fable 的 thinking 形态（cap/2.1.260/00018）: {v}"
+        );
+        assert_eq!(
+            v["fallbacks"],
+            serde_json::Value::Null,
+            "官方 fable 发 fallbacks，luban 有意不替用户开（换模型就换计价）: {v}"
         );
         assert!(
-            sim.beta.contains("thinking-display-updates-2026-08-18"),
+            sim.profile.beta.contains("thinking-display-updates-2026-08-18"),
             "display:updates 要有对应 beta"
         );
     }
 
-    /// 补 `thinking` 的形态按模型族：opus/sonnet 是裸 `adaptive`，haiku 是
-    /// `{budget_tokens, type:enabled}`（key 序 budget 在前，`cap/2.1.258/00031`）。给 opus-5 /
-    /// sonnet-5 发 `budget_tokens` 会直接 400。
+    /// 补 `thinking` 的形态按 profile：opus/sonnet 是 `{adaptive, display:"updates"}`
+    /// （2.1.260 起 opus 也带 display，`cap/2.1.260-2/00025`），haiku 是
+    /// `{budget_tokens, type:enabled, display:"updates"}`（key 序 budget 在前，
+    /// `cap/2.1.260/00020`）。给 opus-5 / sonnet-5 发 `budget_tokens` 会直接 400。
     #[test]
     fn injects_thinking_shape_per_model_family() {
         let run = |body: &str| -> serde_json::Value {
@@ -11961,17 +15509,27 @@ mod tests {
         let opus = run(
             r#"{"model":"claude-opus-5","max_tokens":64000,"messages":[{"role":"user","content":"hi"}]}"#,
         );
-        assert_eq!(opus["thinking"], serde_json::json!({"type": "adaptive"}), "{opus}");
+        assert_eq!(
+            opus["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "{opus}"
+        );
         let sonnet = run(
             r#"{"model":"claude-sonnet-5","max_tokens":64000,"messages":[{"role":"user","content":"hi"}]}"#,
         );
-        assert_eq!(sonnet["thinking"], serde_json::json!({"type": "adaptive"}), "{sonnet}");
+        assert_eq!(
+            sonnet["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "{sonnet}"
+        );
         let haiku = run(
             r#"{"model":"claude-haiku-4-5-20251001","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}"#,
         );
         let s = serde_json::to_string(&haiku).unwrap();
         assert!(
-            s.contains(r#""thinking":{"budget_tokens":31999,"type":"enabled"}"#),
+            s.contains(
+                r#""thinking":{"budget_tokens":31999,"type":"enabled","display":"updates"}"#
+            ),
             "haiku 的 thinking 逐字节对齐官方: {s}"
         );
     }
@@ -12005,7 +15563,10 @@ mod tests {
         assert!(at > text.find(r#""metadata""#).unwrap(), "该排在 metadata 之后: {text}");
 
         // 头上那份声明确实在，否则补了体就是反向的自相矛盾。
-        assert!(sim.beta.contains("context-management-2025-06-27"), "seed 里该有对应的 beta");
+        assert!(
+            sim.profile.beta.contains("context-management-2025-06-27"),
+            "seed 里该有对应的 beta"
+        );
 
         // haiku 那族的 `{"type":"enabled","budget_tokens":N}` 同样算开着。
         let haiku = concat!(
@@ -13759,6 +17320,7 @@ mod tests {
                 upstream_request_id: None,
                 forensics: Default::default(),
                 telemetry: None,
+                cc_session: None,
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
                 _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -13816,6 +17378,7 @@ mod tests {
             upstream_request_id: None,
             forensics: Default::default(),
             telemetry: None,
+            cc_session: None,
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -13862,12 +17425,217 @@ mod tests {
 
     /// 非流式响应体里的 `{"type":"error"}` 不走流内那套：那条路的 4xx 由
     /// [`super::detect_account_ban`] 一侧处理，这里再记一份会让同一个错误告警两次。
+    /// 但**类型与文案照记**（`body_error`）——`tengu_api_error` 的 `errorType`/`error`
+    /// 要它，而 [`super::capture_forensics`] 那份只在 400/401/403 与裸 429 上填。
     #[test]
     fn nonstream_error_body_is_not_taken_as_a_stream_error() {
         let mut s = super::UsageSniffer::new(false, false);
         s.feed(br#"{"type":"error","error":{"type":"invalid_request_error","message":"nope"}}"#);
         s.finish();
         assert!(s.stream_error.is_none());
+        assert_eq!(
+            s.body_error,
+            Some((Some("invalid_request_error".into()), "nope".into())),
+            "错误体的类型与文案要留下来"
+        );
+    }
+
+    /// `toolUseContentLengths`：流式下工具入参是 `input_json_delta` 一片片来的，按内容块
+    /// 序号拼回去；同名工具累加；键按首次出现排序；`mcp__*` 归成 `mcp_tool`。
+    /// 顺带钉住思考块的识别——`redacted_thinking` 一个字都没有，靠字数判定认不出来。
+    #[test]
+    fn the_sniffer_collects_tool_use_input_lengths() {
+        let mut s = super::UsageSniffer::new(true, false);
+        let feed = |s: &mut super::UsageSniffer, line: &str| {
+            s.feed(format!("data: {line}\n\n").as_bytes());
+        };
+        feed(&mut s, r#"{"type":"message_start","message":{"model":"claude-opus-5"}}"#);
+        feed(
+            &mut s,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"xx"}}"#,
+        );
+        feed(
+            &mut s,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}"#,
+        );
+        feed(
+            &mut s,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\""}}"#,
+        );
+        feed(
+            &mut s,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":":\"ls\"}"}}"#,
+        );
+        feed(
+            &mut s,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t2","name":"Bash","input":{}}}"#,
+        );
+        feed(
+            &mut s,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t3","name":"mcp__ide__getDiagnostics","input":{}}}"#,
+        );
+        feed(&mut s, r#"{"type":"message_stop"}"#);
+        assert!(s.saw_thinking, "redacted_thinking 也算思考块");
+        // `{"command":"ls"}` 是 16 个字符；没有增量的那个块是空 `{}` = 2；两个都叫 Bash，加起来 18。
+        assert_eq!(s.tool_use_lens(), vec![("Bash".to_string(), 18), ("mcp_tool".to_string(), 2)]);
+    }
+
+    /// 对着抓包钉住那个长度：`cap/2.1.260-2/00065` 里那条 `stop=tool_use` 的
+    /// `tengu_api_success` 报的是 `toolUseContentLengths: '{"Bash":166}'`，而同一个
+    /// `tool_use` 块的 `input`（`00061` 的 `messages[5]`）紧凑序列化正好 166 字符。
+    /// 官方量的是 `JSON.stringify(input).length`——不带空格的那份。
+    #[test]
+    fn tool_use_length_matches_the_capture_when_it_is_present() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/cap/2.1.260-2/00061_174309.489.req.raw");
+        let Ok(raw) = std::fs::read(path) else {
+            eprintln!("skipped: {path} not present");
+            return;
+        };
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers") + 4;
+        let v: serde_json::Value = serde_json::from_slice(&raw[sep..]).unwrap();
+        // 抓包里的 `tool_use` 块原样搬成一条非流式回复喂给嗅探器。
+        let block = v["messages"][5]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("那条 assistant 消息里有一个 tool_use 块")
+            .clone();
+        let thinking = v["messages"][5]["content"][0].clone();
+        let body = serde_json::json!({
+            "id": "msg_x",
+            "model": "claude-opus-5",
+            "content": [thinking, block],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        let mut s = super::UsageSniffer::new(false, false);
+        s.feed(&serde_json::to_vec(&body).unwrap());
+        s.finish();
+        assert_eq!(s.tool_use_lens(), vec![("Bash".to_string(), 166)]);
+        // 那条回复只有一个空思考块加一个工具块：`textContentLength` 与
+        // `thinkingContentLength` 抓包里都是 0，且后者**存在**——靠字数判不出来，靠块类型。
+        assert_eq!(s.text_chars, 0);
+        assert_eq!(s.thinking_chars, 0);
+        assert!(s.saw_thinking, "空思考块也要算");
+    }
+
+    /// 非流式回复里的工具块同样要认（`content[]` 直接带完整 `input`）。
+    #[test]
+    fn the_sniffer_collects_tool_use_lengths_from_a_nonstream_body() {
+        let mut s = super::UsageSniffer::new(false, false);
+        s.feed(
+            br#"{"id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a"}}],"usage":{"input_tokens":1}}"#,
+        );
+        s.finish();
+        assert!(!s.saw_thinking);
+        // serde 重新序列化后的 `{"file_path":"/a"}` = 18 个字符。
+        assert_eq!(s.tool_use_lens(), vec![("Read".to_string(), 18)]);
+    }
+
+    /// 内部重试成功后，**请求侧**的遥测也要换成重试实际发出去的那份 body。
+    ///
+    /// 此前只换了响应侧（状态码、用量、model、stop_reason、限流），请求侧还挂着首发那份
+    /// ——于是同一条 `tengu_api_success` 里，`requestId`/token 来自重试那一发，而
+    /// `messageCount`/`inputTextCharLength`/`toolsCount` 算的是**一条被上游拒了的请求**。
+    /// prefill 那条尤其明显：[`super::strip_assistant_prefill`] 直接弹掉末尾的 assistant 轮。
+    #[test]
+    fn a_successful_retry_reports_the_body_it_actually_sent() {
+        use base64::Engine as _;
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+        let sink = crate::telemetry::Telemetry::default();
+        // 首发：3 条消息，末条是 assistant prefill。重试：剥掉它，只剩 2 条。
+        let body = |msgs: &str| -> Bytes {
+            Bytes::from(format!(
+                r#"{{"model":"claude-opus-5","messages":[{msgs}],"system":[{{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}}],"metadata":{{"user_id":"{{\"device_id\":\"dd\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}}"}},"max_tokens":64000}}"#
+            ))
+        };
+        let first = body(
+            r#"{"role":"user","content":"hi"},{"role":"assistant","content":"a"},{"role":"assistant","content":"prefill"}"#,
+        );
+        let retried = body(r#"{"role":"user","content":"hi"},{"role":"assistant","content":"a"}"#);
+
+        let mut rl = super::ReqLog {
+            started: std::time::Instant::now(),
+            ttft_ms: Some(10),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            ua: config::CC_USER_AGENT.into(),
+            ua_out: config::CC_USER_AGENT.into(),
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            device_id: None,
+            status: 200,
+            sse_aggregated: false,
+            sniffer: super::UsageSniffer::new(false, false),
+            req_speed: None,
+            req_model: None,
+            ratelimit: rl_headers(&[]),
+            stream_broke: None,
+            request_id: "lb-test".into(),
+            client_request_id: None,
+            upstream_request_id: Some("req_first".into()),
+            forensics: store::Forensics {
+                shape: super::shape_summary(&first).0,
+                ..Default::default()
+            },
+            telemetry: Some(crate::telemetry::Capture {
+                sink: sink.clone(),
+                account_uuid: cred.account_uuid.clone(),
+                org_type: None,
+                body: first.clone(),
+                betas: None,
+                session_header: None,
+                client_request_id: None,
+                organization_id: None,
+                started_at: std::time::SystemTime::now(),
+            }),
+            cc_session: None,
+            store: store.clone(),
+            _in_flight: super::InFlightGuard::new(Default::default()),
+            _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
+            _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
+        };
+        // 上游回包（非流式）：有 usage，收尾按成功走。
+        rl.sniffer.feed(
+            br#"{"id":"msg_1","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"output_tokens":1}}"#,
+        );
+        // 重试成功那一步：调用方换了响应侧，`note_retry` 负责把请求侧一并换过来。
+        let mut h = super::HeaderMap::new();
+        h.insert("request-id", HeaderValue::from_static("req_retry"));
+        rl.note_retry("no_prefill", &h, &retried);
+        assert_eq!(rl.upstream_request_id.as_deref(), Some("req_retry"));
+        drop(rl);
+
+        // 取走这一批（把「到期」时间推远，攒批规则就不拦着了）。
+        let flushes =
+            sink.take_due(std::time::Instant::now() + std::time::Duration::from_secs(3_600));
+        let events: Vec<serde_json::Value> = flushes.into_iter().flat_map(|f| f.events).collect();
+        let meta = |name: &str| -> serde_json::Value {
+            let e = events
+                .iter()
+                .find(|e| e["event_data"]["event_name"] == name)
+                .unwrap_or_else(|| panic!("{name} 应当在这一批里"));
+            let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+            let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+            serde_json::from_slice(&raw).unwrap()
+        };
+        // 报的是重试那份：2 条消息，不是首发的 3 条。
+        assert_eq!(meta("tengu_api_success")["messageCount"], 2, "请求侧要跟着重试那一发走");
+        assert_eq!(meta("tengu_api_query")["messagesLength"], 2);
+        assert_eq!(meta("tengu_api_success")["requestId"], "req_retry", "响应侧本来就是重试那发");
+        assert_eq!(
+            meta("tengu_api_success")["requestBodyChars"],
+            retried.len(),
+            "体长度也得是实际发出去那份"
+        );
+
+        // 取证的形态摘要同理——它要回答的是「发出去的到底长什么样」。
+        let logged = &store.list_usage_logs(1).unwrap()[0];
+        let shape: serde_json::Value =
+            serde_json::from_str(logged.forensics.shape.as_deref().unwrap()).unwrap();
+        assert_eq!(shape["messages"]["count"], 2, "shape 列也要是重试那份");
+        assert_eq!(logged.forensics.rewrites.as_deref(), Some("no_prefill"));
     }
 
     /// 日志用的 UA 取值：缺失/空串取 `-`，过长按 char 截断（不能按字节切，会劈开多字节 UTF-8）。
@@ -14031,7 +17799,7 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = super::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 258)), "官方那串");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 260)), "官方那串");
         assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -14040,25 +17808,25 @@ mod tests {
     }
 
     /// cc_version 后缀与官方客户端的算法对齐（逆向自 2.1.251）：
-    /// sha256("59cf53e54c78" + chars_at(4,7,20) + VERSION_BASE).hex()[..3]
+    /// sha256("59cf53e54c78" + chars_at(4,7,20) + 自报版本).hex()[..3]
     ///
-    /// 2.1.258 的五份抓包用户消息都是 "hi"，全为 `1e2`，与算法结论一致；但这条路只剩
-    /// [`super::billing_header_text`]（给真实 CC 补 billing header）在用，模拟路径写死
-    /// [`config::CC_VERSION_SUFFIX_SIMULATED`]。
+    /// 2.1.258 的五份抓包用户消息都是 "hi"，全为 `1e2`，与算法结论一致。**2.1.260 已经
+    /// 证否了这套算法**：六个 profile 各有固定后缀（`222`/`bcd`/…），算法算出来的是 `11d`。
+    /// 故这条路只剩 [`super::billing_header_text`]（给真实 CC 补 billing header）在用，
+    /// 模拟路径改从 [`config::CcProfile::billing_suffix`] 取。
     #[test]
     fn cc_version_suffix_matches_official_algorithm() {
         // 用户消息 "hi"（短于 5 字符），位置 4/7/20 全取不到 → "000"
         // sha256("59cf53e54c780002.1.258") 的前 3 个 hex = "1e2"
+        let suffix = |v: &serde_json::Value| super::cc_version_suffix(v, "2.1.258");
         let body: serde_json::Value = serde_json::json!({
             "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "hi"}],
         });
-        assert_eq!(super::cc_version_suffix(&body), "1e2", "短消息 'hi'");
-        assert_eq!(
-            super::cc_version_suffix(&body),
-            config::CC_VERSION_SUFFIX_SIMULATED,
-            "写死的模拟后缀与算法在 'hi' 上应一致（cap/2.1.258 五份全是 1e2）"
-        );
+        assert_eq!(suffix(&body), "1e2", "短消息 'hi'（cap/2.1.258 五份全是 1e2）");
+        // 版本参与摘要：换个版本号，同一条消息就是另一个后缀。给一个 2.1.258 的来访写
+        // 2.1.260 的版本，连后缀都会跟着错。
+        assert_ne!(super::cc_version_suffix(&body, "2.1.260"), "1e2", "版本进摘要，换版本必换后缀");
 
         // 消息足够长时取 text[4], text[7], text[20]
         let body2: serde_json::Value = serde_json::json!({
@@ -14066,8 +17834,7 @@ mod tests {
             "messages": [{"role": "user", "content": "abcdefghijklmnopqrstuvwxyz"}],
         });
         // chars = text[4]='e', text[7]='h', text[20]='u'
-        let suffix = super::cc_version_suffix(&body2);
-        assert_eq!(suffix.len(), 3, "始终 3 个 hex 字符");
+        assert_eq!(suffix(&body2).len(), 3, "始终 3 个 hex 字符");
 
         // content 是数组时取第一个 text 块
         let body3: serde_json::Value = serde_json::json!({
@@ -14076,11 +17843,11 @@ mod tests {
                 {"type": "text", "text": "hi"}
             ]}],
         });
-        assert_eq!(super::cc_version_suffix(&body3), "1e2", "数组形式与字符串形式结果一致");
+        assert_eq!(suffix(&body3), "1e2", "数组形式与字符串形式结果一致");
 
         // 没有 messages 时退化为全 0
         let empty: serde_json::Value = serde_json::json!({"model": "x"});
-        assert_eq!(super::cc_version_suffix(&empty), "1e2", "无消息退化为 '000' → 同 'hi'");
+        assert_eq!(suffix(&empty), "1e2", "无消息退化为 '000' → 同 'hi'");
     }
 
     /// 最低版本闸的三态：低于门槛才拒，等于/高于放行；闸没配、UA 不是 CC、版本读不出来
@@ -14144,38 +17911,25 @@ mod tests {
     #[test]
     fn probe_request_is_official_shaped() {
         let cred = test_cred();
-        let sim = super::Simulation {
-            base: super::cc_system_base("claude-opus-5"),
-            beta: super::cc_beta_seed("claude-opus-5"),
-            reporting: super::cc_system_reporting("claude-opus-5"),
-            session_id: "sess".into(),
-        };
-        let out = rewrite_body(
-            &super::probe_body("claude-opus-5"),
-            &cred,
-            "fp",
-            all_on(),
-            Some(&sim),
-            None,
-        );
+        const HAIKU: &str = "claude-haiku-4-5-20251001";
+        let sim = super::probe_simulation(&cred, "fp", HAIKU);
+        let out = rewrite_body(&super::probe_body(HAIKU), &cred, "fp", all_on(), Some(&sim), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
-        // 顶层 key 序：官方是 model→messages→system→metadata→max_tokens。
+        // 官方额度探测的顶层 key 序（`cap/2.1.260-2/00004`）：
+        // model → max_tokens → messages → metadata。
         // probe 不开 thinking（一条 1 token 的探测不需要），故也不带 `context_management`
         // ——那个字段依赖 thinking，硬补上游回 400，见 [`super::ensure_context_management`]。
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["model", "messages", "system", "metadata", "max_tokens"], "\n{s}");
+        assert_eq!(keys, ["model", "max_tokens", "messages", "metadata"], "\n{s}");
         assert!(v.get("context_management").is_none(), "没开 thinking 就不该补: {s}");
         assert_eq!(v["max_tokens"], 1, "测试只要 1 个 token，别把额度花在正文上");
 
-        // 官方前三块（opus 族，2.1.258 无 reporting）：billing / 身份句 / 基座。测试请求
-        // 没有「客户端自己的 system」，故第四块不存在。
-        let blocks = v["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 3, "\n{s}");
-        assert!(blocks[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
-        assert_eq!(blocks[1]["text"], config::CC_SYSTEM_IDENTITY, "缺这句就用不了订阅额度");
-        assert_eq!(blocks[2]["text"], config::CC_SYSTEM_BASE_OPUS, "opus-5 用短基座");
+        // 官方那条额度探测**没有 system**：不发 billing header、不发基座、不发工具。
+        assert!(v.get("system").is_none(), "QuotaProbe 不带 system: {s}");
+        assert!(v.get("tools").is_none(), "也不带工具: {s}");
+        assert!(v.get("diagnostics").is_none(), "更没有 diagnostics: {s}");
 
         // 身份：伪装 metadata 用的是这个凭证的 account_uuid，不是空串。
         let user_id = v["metadata"]["user_id"].as_str().unwrap();
@@ -14199,6 +17953,78 @@ mod tests {
             config::CC_USER_AGENT,
             "测试请求同样按官方客户端形态发"
         );
+
+        // **别的模型不套额度探测那身皮**：官方那条恒为 haiku-4.5，一条 opus 请求长着
+        // 「无 system、无 billing header、那一小串 beta」的样子，官方从不产生。
+        // 连通性测试恰恰要逐个模型都测一遍，所以这条必须分开。
+        for model in ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5"] {
+            let sim = super::probe_simulation(&cred, "fp", model);
+            assert_ne!(
+                sim.profile.kind,
+                config::CcProfileKind::QuotaProbe,
+                "{model} 不该套 QuotaProbe"
+            );
+            let out =
+                rewrite_body(&super::probe_body(model), &cred, "fp", all_on(), Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let sys = v["system"].as_array().unwrap_or_else(|| panic!("{model} 该有 system"));
+            assert!(
+                sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
+                "{model}: 主线程形态要带 billing header"
+            );
+            assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "{model}: 身份声明");
+            let beta = super::simulated_beta(sim.profile.beta, None);
+            assert!(beta.contains(config::CC_BETA_CLAUDE_CODE), "{model}: 主线程串带 claude-code");
+
+            // **不能只换 profile**：`max_tokens:1` 的体配主线程的 system/beta，会得到一条
+            // 没有 `thinking`/`context_management`/`output_config`、还非流式的请求——同样是
+            // 抓包里不存在的混合形态，也验证不了真实主线程链路。逐项钉住。
+            assert_eq!(v["thinking"]["type"], "adaptive", "{model}: 要有 thinking\n{v}");
+            assert_eq!(
+                v["context_management"]["edits"][0]["type"], "clear_thinking_20251015",
+                "{model}: 要有 context_management\n{v}"
+            );
+            assert_eq!(v["output_config"]["effort"], "high", "{model}: 官方主线程恒带\n{v}");
+            assert_eq!(v["stream"], true, "{model}: 官方主线程恒为流式\n{v}");
+            assert_eq!(
+                v["diagnostics"],
+                serde_json::json!({ "previous_message_id": serde_json::Value::Null }),
+                "{model}: 首轮 diagnostics\n{v}"
+            );
+            let tools = v["tools"].as_array().unwrap_or_else(|| panic!("{model} 该注入工具"));
+            assert!(tools.iter().any(|t| t["name"] == "Bash"), "{model}: 要有官方工具\n{v}");
+            let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(keys.first(), Some(&"model"), "{model}: key 序");
+            assert_eq!(keys.last(), Some(&"stream"), "{model}: stream 在队尾");
+        }
+    }
+
+    /// 主线程形态的探活收到的是 SSE，要攒回一条整段 Message 再交给后面那套读法
+    /// （封号判定、[`super::probe_report`] 解 model/error_type）。
+    #[test]
+    fn probe_aggregates_the_streamed_response() {
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","#,
+            r#""role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"#,
+            r#""usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            "\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let out = super::aggregate_probe_sse(SSE.as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "claude-opus-5", "probe_report 靠这个字段: {v}");
+        assert_eq!(v["content"][0]["text"], "ok");
+
+        // 半截流不能悄悄报成功：原样交回，让 probe_report 按「解不出 Message」处理。
+        let half = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n";
+        assert_eq!(super::aggregate_probe_sse(half.as_bytes()), Bytes::from(half));
     }
     // ---------- 非流式改流式 + SSE 聚合 ----------
 
@@ -14238,9 +18064,13 @@ mod tests {
                 only_stream,
                 None,
                 None,
+                None,
                 true,
                 None,
                 true,
+                None,
+                None,
+                super::CcRequestKind::Main,
             )
         };
 
@@ -14264,9 +18094,13 @@ mod tests {
             only_stream,
             None,
             None,
+            None,
             false,
             None,
             true,
+            None,
+            None,
+            super::CcRequestKind::Main,
         );
         assert_eq!(
             untouched,
@@ -14595,6 +18429,7 @@ mod tests {
             upstream_request_id: None,
             forensics: Default::default(),
             telemetry: None,
+            cc_session: None,
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),

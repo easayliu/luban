@@ -5,6 +5,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 use crate::config;
 use crate::credentials::now_secs;
@@ -55,6 +56,12 @@ pub struct Profile {
     /// 组织类型原值（`claude_team`/`claude_enterprise`/`claude_max`…），团队号与个人号
     /// 在调度与额度上完全不同（团队额度是整个组织共享的席位额度），故单独留一列供前端标记。
     pub org_type: Option<String>,
+    /// 额度档**原值**（`default_claude_max_5x` 之类），来自 `organization.rate_limit_tier`。
+    ///
+    /// 与 [`Self::tier`] 是两回事：那个是给界面看的（`Max 5x`），这个是 statsig eval 的
+    /// `attributes.rateLimitTier` 要发的原串（`cap/2.1.260-2/00003`）。拿展示串顶替，
+    /// 发出去的就是一个上游从没见过的取值。
+    pub rate_limit_tier: Option<String>,
     /// 账号唯一标识（`account.uuid`）；用于转发时的身份伪装。
     pub account_uuid: Option<String>,
 }
@@ -203,7 +210,12 @@ pub async fn fetch_profile(client: &wreq::Client, access_token: &str) -> Result<
         .as_ref()
         .and_then(|o| o.organization_type.clone())
         .filter(|s| !s.trim().is_empty());
-    Ok(Profile { email, name, tier, org_type, account_uuid })
+    let rate_limit_tier = p
+        .organization
+        .as_ref()
+        .and_then(|o| o.rate_limit_tier.clone())
+        .filter(|s| !s.trim().is_empty());
+    Ok(Profile { email, name, tier, org_type, rate_limit_tier, account_uuid })
 }
 
 /// 由订阅标志推导账号等级：Max > Pro > Free；Max 附带倍数档（如 `Max 5x`）。
@@ -442,6 +454,9 @@ fn urlencode(input: &str) -> String {
 /// 所有 id 由 `account_uuid` 确定性派生——同一凭证在同一进程里恒定；进程重启后变。
 /// 没有 `account_uuid` 时用凭证 id 兜底（id 是自增整数，不会碰撞但也没有任何含义）。
 pub struct KeepaliveCtx {
+    /// 这份上下文属于哪张凭证。只用来给 [`AXIOS_ETAGS`] 分桶——条件请求的缓存键得跟着
+    /// 账号走，不同账号的 policy_limits 本来就不是同一份。
+    pub cred_id: i64,
     /// 模拟的 session UUID。
     pub session_id: String,
     /// 模拟的 device_id（sha256 hex，64 字符）。
@@ -462,6 +477,23 @@ pub struct KeepaliveCtx {
     model: String,
     betas: String,
     version: String,
+    /// 额度档原值，statsig eval 的 `attributes.rateLimitTier`。
+    /// 见 [`crate::credentials::Credential::rate_limit_tier`]。
+    rate_limit_tier: Option<String>,
+    /// `attributes.firstTokenTime`（毫秒）：这张凭证**第一次拿到 token** 的时刻。
+    ///
+    /// 真实客户端记的是这台机器第一次登录成功的时间，luban 这边最接近的就是凭证入库那一刻
+    /// （`created_at`）——同一个语义，不是编出来的常量。
+    first_token_ms: Option<i64>,
+}
+
+/// `attributes.firstTokenTime`（毫秒）：这张凭证第一次拿到 token 的时刻。
+///
+/// 取凭证入库那一刻（`created_at`，秒）×1000。真实客户端记的是本机第一次登录成功的时间，
+/// 语义是同一个；`created_at` 为 0（旧库里没有这一列时的默认值）就返回 `None`——发一个
+/// 1970 年的时间戳比不发更显眼。
+fn first_token_ms(cred: &crate::credentials::Credential) -> Option<i64> {
+    (cred.created_at > 0).then(|| cred.created_at as i64 * 1000)
 }
 
 /// 进程级种子，每次启动随机一次；用于从 account_uuid 派生出每次启动不同的 session_id。
@@ -489,6 +521,7 @@ impl KeepaliveCtx {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(uptime_secs);
             return Self {
+                cred_id: cred.id,
                 session_id: s.session_id,
                 device_id: s.device_id,
                 prompt_id: s.prompt_id,
@@ -499,6 +532,8 @@ impl KeepaliveCtx {
                 model: s.model,
                 betas: s.betas,
                 version: s.version,
+                rate_limit_tier: cred.rate_limit_tier.clone(),
+                first_token_ms: first_token_ms(cred),
             };
         }
         let id_str = cred.id.to_string();
@@ -509,6 +544,7 @@ impl KeepaliveCtx {
         let device_id = derive_hex64(basis, seed, b"device");
 
         Self {
+            cred_id: cred.id,
             session_id,
             device_id,
             prompt_id,
@@ -519,6 +555,8 @@ impl KeepaliveCtx {
             model: "claude-sonnet-5".to_string(),
             betas: config::KEEPALIVE_EVENT_BETAS.to_string(),
             version: keepalive_version().to_string(),
+            rate_limit_tier: cred.rate_limit_tier.clone(),
+            first_token_ms: first_token_ms(cred),
         }
     }
 
@@ -605,7 +643,18 @@ impl KeepaliveCtx {
         attrs.insert("accountUUID".into(), self.account_uuid.clone().into());
         attrs.insert("userType".into(), "external".into());
         attrs.insert("subscriptionType".into(), self.subscription_type.clone().into());
+        // 额度档**原值**（`default_claude_max_5x`），不是界面上那个 `Max 5x`。旧库里的号
+        // 还没回填过就没有这一项——比发一个上游从没见过的取值强。
+        if let Some(raw) = &self.rate_limit_tier {
+            attrs.insert("rateLimitTier".into(), raw.clone().into());
+        }
         attrs.insert("organizationRole".into(), "user".into());
+        // `subscriptionCreatedAt`（订阅创建时刻，毫秒）**拿不到**：它不在 profile、bootstrap
+        // 或 policy_limits 的响应里（`cap/2.1.260-2` 全部响应体搜过），真实客户端是从本地
+        // `~/.claude.json` 读的。按 §8.2 的口径记为未对齐——不填伪造常量。
+        if let Some(ms) = self.first_token_ms {
+            attrs.insert("firstTokenTime".into(), ms.into());
+        }
         attrs.insert("appVersion".into(), self.version.clone().into());
         attrs.insert("entrypoint".into(), "cli".into());
         serde_json::json!({
@@ -698,6 +747,86 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
     crate::credentials::hex_lower(&h.finalize())
 }
 
+// ---------- Axios 形态 ----------
+
+/// 给一条辅助请求套上 axios 的传输形态：`Accept-Encoding` / `Connection` 两个头 + 该端点的
+/// 线上头序（[`config::axios_shape`]）。
+///
+/// **必须每条都套**：这些端点原先复用的是 Messages API 客户端的 `default_headers`，于是
+/// 发出去的 `Accept-Encoding` 是 Bun 那份 `gzip, deflate, br, zstd`，`Connection` 缺省成
+/// `keep-alive`，头名还全是小写、`Host`/`Content-Length` 钉在队尾——十来个端点整整齐齐地
+/// 与官方对不上，而它们恰好是**每个会话都会发一遍**的那批。
+///
+/// 头**值**由各调用点自己 `.header(...)`，本函数只管形态；漏加一个头不会凭空发出，
+/// 多加的排在队尾（见 [`crate::proxy::orig_header_case`] 记的同一套 `OrigHeaderMap` 语义）。
+pub(crate) fn axios(req: wreq::RequestBuilder, shape: &str) -> wreq::RequestBuilder {
+    req.header("Accept-Encoding", config::AXIOS_ACCEPT_ENCODING)
+        .header("Connection", config::AXIOS_CONNECTION)
+        .orig_headers(orig_headers(config::axios_shape(shape)))
+}
+
+/// 按给定的头名表构造 `OrigHeaderMap`（决定线上的拼写与顺序）。
+pub(crate) fn orig_headers(order: &[&'static str]) -> wreq::header::OrigHeaderMap {
+    let mut orig = wreq::header::OrigHeaderMap::new();
+    for name in order {
+        orig.insert(*name);
+    }
+    orig
+}
+
+/// `policy_limits` / `settings` 的条件请求缓存：`(凭证 id, 端点) → 上次响应体的 sha256`。
+///
+/// 官方发的是 `If-None-Match: "sha256:<hex>"`，而那个 hex 就是**客户端自己算的响应体
+/// 摘要**——`cap/2.1.260-2/00002` 那条 settings 的值是
+/// `44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a`，正是 `{}` 的
+/// sha256。所以这不是服务端给的 ETag，是客户端的本地缓存键。
+///
+/// **只在进程内存里**：真实客户端把它写在 `~/.claude.json` 里，跨进程留存；luban 重启后
+/// 第一发不带这个头——那与「一台刚装好的机器第一次跑 CC」是同一个形态，能接受。落库
+/// 反而要为一个纯缓存字段加一列。
+static AXIOS_ETAGS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(i64, &'static str), String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// 每张凭证最近一次跑完启动握手的时刻。保活循环据此跳过自己那份重复的启动串，
+/// 见 [`handshake_recent`]。
+static LAST_HANDSHAKE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// 记一次启动握手。
+fn note_handshake(cred_id: i64) {
+    LAST_HANDSHAKE.lock().insert(cred_id, std::time::Instant::now());
+}
+
+/// 这张凭证在 `within` 之内跑过启动握手吗。
+///
+/// 保活的首 tick 会发 `bootstrap` + `penguin_mode`、每小时发 `policy_limits` + `settings`，
+/// 而新会话的启动握手把这四条**全都**发了一遍。两边触发条件不同（一个按时间、一个按新
+/// 会话），撞在一起时上游看到的就是同一个账号几秒内把同一批端点打了两遍——真实客户端
+/// 一次进程启动只打一遍。故保活那边先问一句这个。
+pub fn handshake_recent(cred_id: i64, within: std::time::Duration) -> bool {
+    LAST_HANDSHAKE
+        .lock()
+        .get(&cred_id)
+        .is_some_and(|t| std::time::Instant::now().duration_since(*t) < within)
+}
+
+/// 取该凭证该端点上次缓存的 `If-None-Match` 值（`"sha256:…"`，含引号）。
+fn etag_of(cred_id: i64, endpoint: &'static str) -> Option<String> {
+    AXIOS_ETAGS.lock().get(&(cred_id, endpoint)).map(|h| format!("\"sha256:{h}\""))
+}
+
+/// 收到 200 时记下响应体的 sha256；304 时保留原值（上游说的就是「没变」）。
+fn remember_etag(cred_id: i64, endpoint: &'static str, status: u16, body: &[u8]) {
+    if status != 200 {
+        return;
+    }
+    use sha2::{Digest, Sha256};
+    let hex = crate::credentials::hex_lower(&Sha256::digest(body));
+    AXIOS_ETAGS.lock().insert((cred_id, endpoint), hex);
+}
+
 /// 每 tick（30min）发一次 `event_logging`。
 ///
 /// 真实客户端每次都带上版本检查等活动产生的事件；空批次是指纹。
@@ -709,16 +838,19 @@ pub async fn keepalive_event_logging(
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
     let body = serde_json::json!({ "events": ctx.idle_events() });
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", ctx.ua())
-        .header("x-service-name", "claude-code")
-        .header("Accept", "application/json, text/plain, */*")
-        .json(&body)
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", ctx.ua())
+            .header("x-service-name", "claude-code")
+            .header("Accept", config::AXIOS_ACCEPT)
+            .json(&body),
+        "event_logging",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
@@ -726,24 +858,28 @@ pub async fn keepalive_event_logging(
 }
 
 /// 每小时发一次 `GET /api/claude_code/policy_limits`；会话启动时也发一次。
+///
+/// 带 `If-None-Match`（见 [`etag_of`]）：官方每次都带，缺了它就是「一个从不缓存的客户端
+/// 每小时把同一份策略重拉一遍」。
 pub async fn keepalive_policy_limits(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_POLICY_LIMITS);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", ctx.ua())
-        .header("Accept", "application/json, text/plain, */*")
-        .send()
-        .await;
-    match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
-        Err(_) => KeepaliveResult::Failed,
+    let mut req = axios(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", ctx.ua())
+            .header("Accept", config::AXIOS_ACCEPT),
+        "policy_limits",
+    );
+    if let Some(etag) = etag_of(ctx.cred_id, "policy_limits") {
+        req = req.header("If-None-Match", etag);
     }
+    conditional_get(req, ctx.cred_id, "policy_limits").await
 }
 
 /// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。
@@ -753,20 +889,37 @@ pub async fn keepalive_settings(
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_SETTINGS);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", ctx.ua())
-        .header("Cache-Control", "no-cache")
-        .header("Pragma", "no-cache")
-        .header("Accept", "application/json, text/plain, */*")
-        .send()
-        .await;
-    match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
-        Err(_) => KeepaliveResult::Failed,
+    let mut req = axios(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", ctx.ua())
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("Accept", config::AXIOS_ACCEPT),
+        "settings",
+    );
+    if let Some(etag) = etag_of(ctx.cred_id, "settings") {
+        req = req.header("If-None-Match", etag);
     }
+    conditional_get(req, ctx.cred_id, "settings").await
+}
+
+/// 发一条条件 GET，并把 200 的响应体摘要记进 [`AXIOS_ETAGS`] 供下次带 `If-None-Match`。
+///
+/// 304 视为成功：那正是缓存命中时官方拿到的状态。
+async fn conditional_get(
+    req: wreq::RequestBuilder,
+    cred_id: i64,
+    endpoint: &'static str,
+) -> KeepaliveResult {
+    let Ok(r) = req.send().await else { return KeepaliveResult::Failed };
+    let status = r.status().as_u16();
+    // 读 body 只为算摘要；这两个端点的响应都是几百字节量级。
+    let body = r.bytes().await.unwrap_or_default();
+    remember_etag(cred_id, endpoint, status, &body);
+    if status == 304 { KeepaliveResult::Ok } else { KeepaliveResult::from_status(status) }
 }
 
 // ---------- startup bootstrap + 周期端点 ----------
@@ -785,15 +938,18 @@ pub async fn keepalive_bootstrap(
         config::UPSTREAM_BASE_URL,
         config::KEEPALIVE_BOOTSTRAP
     );
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", ctx.ua())
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/plain, */*")
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", ctx.ua())
+            .header("Content-Type", "application/json")
+            .header("Accept", config::AXIOS_ACCEPT),
+        "bootstrap",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
@@ -802,17 +958,20 @@ pub async fn keepalive_bootstrap(
 
 /// 启动握手：`GET /api/claude_code_penguin_mode`。
 ///
-/// 取自 `cap/2.1.145/00044`（UA = `axios/1.15.2`，不带 Content-Type）。
+/// 取自 `cap/2.1.260-2/00005`（UA = `axios/1.15.2`，不带 Content-Type）。
 pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_PENGUIN_MODE);
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", config::DATADOG_USER_AGENT)
-        .header("Accept", "application/json, text/plain, */*")
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", config::DATADOG_USER_AGENT)
+            .header("Accept", config::AXIOS_ACCEPT),
+        "penguin_mode",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
@@ -828,12 +987,18 @@ pub async fn keepalive_eval(
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVAL);
+    // **不套 axios 形态**：eval 走的是 Bun 自带的 fetch，`Connection: keep-alive`、
+    // `Accept: */*`、`Accept-Encoding` 跟 Messages API 那份一样，见 [`config::AXIOS_SHAPE_EVAL`]。
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("Connection", "keep-alive")
         .header("User-Agent", config::KEEPALIVE_UA_BUN)
         .header("Accept", "*/*")
+        .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
+        .orig_headers(orig_headers(config::AXIOS_SHAPE_EVAL.order))
         .json(&ctx.eval_body())
         .send()
         .await;
@@ -859,12 +1024,15 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
             Some(c) => format!("{base}&cursor={}", urlencode(c)),
             None => base.clone(),
         };
-        let resp = client
-            .get(&url)
-            .header("User-Agent", ctx.cli_ua())
-            .header("Accept", "application/json, text/plain, */*")
-            .send()
-            .await;
+        let resp = axios(
+            client
+                .get(&url)
+                .header("User-Agent", ctx.cli_ua())
+                .header("Accept", config::AXIOS_ACCEPT),
+            "mcp_registry",
+        )
+        .send()
+        .await;
         let Ok(r) = resp else { return KeepaliveResult::Failed };
         last = KeepaliveResult::from_status(r.status().as_u16());
         let next = r
@@ -890,21 +1058,24 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
 /// `GET /v1/mcp_servers?limit=1000`（claude.ai 侧配置的 MCP 连接器）；`cap/2.1.260-1/00024`。
 async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
     let url = format!("{}/v1/mcp_servers?limit=1000", config::UPSTREAM_BASE_URL);
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", "mcp-servers-2025-12-04")
-        .header("anthropic-version", "2023-06-01")
-        .header(
-            "anthropic-mcp-client-capabilities",
-            "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=",
-        )
-        .header("MCP-Protocol-Version", "2025-11-25")
-        .header("User-Agent", config::DATADOG_USER_AGENT)
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .get(&url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", "mcp-servers-2025-12-04")
+            .header("anthropic-version", "2023-06-01")
+            .header(
+                "anthropic-mcp-client-capabilities",
+                "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=",
+            )
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .header("User-Agent", config::DATADOG_USER_AGENT),
+        "mcp_servers",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
@@ -920,18 +1091,21 @@ async fn handshake_code_triggers(
 ) -> KeepaliveResult {
     let Some(org) = ctx.organization_uuid.as_deref() else { return KeepaliveResult::Ok };
     let url = format!("{}/v1/code/triggers", config::UPSTREAM_BASE_URL);
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Content-Type", "application/json")
-        .header("User-Agent", ctx.cli_ua())
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-client-platform", "claude_code_cli")
-        .header("x-organization-uuid", org)
-        .header("anthropic-beta", "ccr-triggers-2026-01-30")
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .get(&url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", ctx.cli_ua())
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-client-platform", "claude_code_cli")
+            .header("x-organization-uuid", org)
+            .header("anthropic-beta", "ccr-triggers-2026-01-30"),
+        "code_triggers",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
@@ -940,58 +1114,171 @@ async fn handshake_code_triggers(
 
 /// `downloads.claude.ai` 上的版本与插件市场元数据（无鉴权，axios UA）。
 async fn handshake_download(client: &wreq::Client, path: &str) -> KeepaliveResult {
-    let resp = client
-        .get(format!("https://downloads.claude.ai{path}"))
-        .header("Accept", "application/json, text/plain, */*")
-        .header("User-Agent", config::DATADOG_USER_AGENT)
-        .send()
-        .await;
+    let resp = axios(
+        client
+            .get(format!("https://downloads.claude.ai{path}"))
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("User-Agent", config::DATADOG_USER_AGENT),
+        "download",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
         Err(_) => KeepaliveResult::Failed,
     }
 }
 
-/// 替一个新会话做完整的启动握手，顺序照 `cap/2.1.260-1`（17:14:56–17:15:05）：
-/// policy_limits、settings、eval、penguin_mode、mcp-registry（翻页）、mcp_servers、
-/// code/triggers、mcp_servers、bootstrap、releases/latest、plugins latest。额度探测那条
-/// `/v1/messages` 是客户端自己发的，经 luban 转发，不在这里。
+/// 一个新会话的启动握手，**分两段**跑。
+///
+/// 抓包里的时序（`cap/2.1.260-2`，同一个会话；末列是相对第一条的偏移）：
+///
+/// ```text
+/// 17:10:17.207  policy_limits ┐ 同时发                     +0ms   ┐
+/// 17:10:17.208  settings      ┘                            +1ms   │ 领跑段
+/// 17:10:18.649  eval                ← 等前面那组回来        +1442ms│ 都在首条
+/// 17:10:18.855  quota probe (messages)                     +1648ms┘ messages 之前
+/// 17:10:18.909  penguin_mode  ┐                            +1702ms ┐
+/// 17:10:18.915  mcp_servers   │                            +1708ms │
+/// 17:10:18.919  mcp-registry  │ 同时发（17ms 内五条）        +1712ms │ 收尾段
+/// 17:10:18.921  bootstrap     │                            +1714ms │ 与主请求
+/// 17:10:18.926  code/triggers ┘                            +1719ms │ 重叠
+/// 17:10:19.355  mcp-registry?cursor=…  ← 翻页只能串行       +2148ms │
+/// 17:10:19.697  mcp-registry?cursor=…                      +2490ms │
+/// 17:10:19.699  **第一条 /v1/messages**                     +2492ms │
+/// 17:10:20.072  mcp-registry?cursor=…                      +2865ms ┘
+/// ```
+///
+/// 也就是说：**领跑那四条确实排在首条 messages 之前**（政策/设置/特性开关/额度探测），
+/// 而收尾那批与主请求是重叠的、甚至排在它后面。故 [`Self::lead`] 由转发路径 `await`
+/// （带上限，见 [`config::HANDSHAKE_LEAD_TIMEOUT_MS`]），[`Self::rest`] 照旧 spawn。
 ///
 /// 失败只记日志：握手是形态补齐，不影响转发。401/403 也不在这里封号——转发路径与保活
 /// 各有自己的判定。
-pub async fn session_handshake(
-    client: &wreq::Client,
-    access_token: &str,
-    cred: &crate::credentials::Credential,
-    h: crate::telemetry::Handshake,
-    organization_uuid: Option<String>,
-) {
-    let ctx = KeepaliveCtx::new(cred, 0.0, organization_uuid, Some(h.snapshot));
-    let mut results: Vec<(&str, KeepaliveResult)> = Vec::with_capacity(11);
-    results.push(("policy_limits", keepalive_policy_limits(client, access_token, &ctx).await));
-    results.push(("settings", keepalive_settings(client, access_token, &ctx).await));
-    results.push(("eval", keepalive_eval(client, access_token, &ctx).await));
-    results.push(("penguin_mode", keepalive_penguin_mode(client, access_token).await));
-    results.push(("mcp_registry", handshake_mcp_registry(client, &ctx).await));
-    results.push(("mcp_servers", handshake_mcp_servers(client, access_token).await));
-    results.push(("code_triggers", handshake_code_triggers(client, access_token, &ctx).await));
-    results.push(("mcp_servers", handshake_mcp_servers(client, access_token).await));
-    results.push(("bootstrap", keepalive_bootstrap(client, access_token, &ctx, &h.model).await));
-    results.push((
-        "releases_latest",
-        handshake_download(client, "/claude-code-releases/latest").await,
-    ));
-    results.push((
-        "plugins_latest",
-        handshake_download(client, "/claude-code-releases/plugins/claude-plugins-official/latest")
-            .await,
-    ));
-    let failed: Vec<&str> = results.iter().filter(|(_, r)| !r.is_ok()).map(|(n, _)| *n).collect();
-    let session: String = ctx.session_id.chars().take(8).collect();
-    if failed.is_empty() {
-        tracing::debug!(cred_id = cred.id, cred = %cred.label, session, "session handshake done");
-    } else {
-        tracing::warn!(cred_id = cred.id, cred = %cred.label, session, failed = ?failed, "session handshake: some endpoints failed");
+pub struct HandshakeRunner {
+    ctx: KeepaliveCtx,
+    /// bootstrap 的 `model=` 参数：规范名。
+    model: String,
+    cred_id: i64,
+    cred_label: String,
+    /// 要不要补**无鉴权的公共请求**（mcp-registry、downloads）。
+    ///
+    /// 这几条不带 `Authorization`，与「哪个账号」无关，补不补都不影响凭证形态；但真实
+    /// CC 客户端**自己也在发**（`cap/2.1.258-api` 里 mcp-registry 与 releases/latest 都
+    /// 是客户端直连打的，不经 luban）。同一台机器上再补一遍，从上游看就是同一个客户端把
+    /// 同一批公共端点打了两遍。
+    ///
+    /// 故只给**模拟客户端**补：那种客户端根本不是 CC，不会自己发这些。
+    public_traffic: bool,
+}
+
+impl HandshakeRunner {
+    /// `public_traffic` 见 [`Self::public_traffic`]：模拟客户端传 `true`，真实 CC 传 `false`。
+    pub fn new(
+        cred: &crate::credentials::Credential,
+        h: crate::telemetry::Handshake,
+        organization_uuid: Option<String>,
+        public_traffic: bool,
+    ) -> Self {
+        note_handshake(cred.id);
+        Self {
+            ctx: KeepaliveCtx::new(cred, 0.0, organization_uuid, Some(h.snapshot)),
+            model: h.model,
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            public_traffic,
+        }
+    }
+
+    /// 领跑段：`policy_limits` + `settings`（并发）→ `eval`。**调用方应当在发出这个会话的
+    /// 首条 `/v1/messages` 之前 `await` 它**，额度探测紧随其后由调用方发。
+    pub async fn lead(&self, client: &wreq::Client, access_token: &str) {
+        let (policy_limits, settings) = tokio::join!(
+            keepalive_policy_limits(client, access_token, &self.ctx),
+            keepalive_settings(client, access_token, &self.ctx),
+        );
+        let eval = keepalive_eval(client, access_token, &self.ctx).await;
+        self.report(
+            "lead",
+            &[("policy_limits", policy_limits), ("settings", settings), ("eval", eval)],
+        );
+    }
+
+    /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers /
+    /// downloads。抓包里这批与首条 messages 重叠，故 spawn 即可，不必挡着主请求。
+    pub async fn rest(&self, client: &wreq::Client, access_token: &str) {
+        let (penguin_mode, mcp_servers, mcp_registry, bootstrap, code_triggers, mcp_servers_2) = tokio::join!(
+            keepalive_penguin_mode(client, access_token),
+            handshake_mcp_servers(client, access_token),
+            self.maybe_registry(client),
+            keepalive_bootstrap(client, access_token, &self.ctx, &self.model),
+            handshake_code_triggers(client, access_token, &self.ctx),
+            handshake_mcp_servers(client, access_token),
+        );
+        self.report(
+            "rest",
+            &[
+                ("penguin_mode", penguin_mode),
+                ("mcp_servers", mcp_servers),
+                ("mcp_registry", mcp_registry),
+                ("bootstrap", bootstrap),
+                ("code_triggers", code_triggers),
+                ("mcp_servers", mcp_servers_2),
+            ],
+        );
+    }
+
+    /// `downloads.claude.ai` 上那两条：**不跟 rest 一起发，各自延迟**。
+    ///
+    /// 抓包里它们离会话起点很远，且节奏完全不同（`cap/2.1.260-2`）：
+    ///
+    /// ```text
+    /// 17:14:56.354  policy_limits（会话起点）
+    /// 17:15:05.957  releases/latest                      +9.6s
+    /// 17:17:01.380  plugins/claude-plugins-official      +2min5s
+    /// ```
+    ///
+    /// 另一个会话（17:43:01 起）的 releases 也在 +9.8s，plugins 那一整段窗口里干脆没有。
+    /// 跟 rest 一起在 +2s 内发完，就是把两条本该稀稀拉拉的后台请求挤成了启动风暴的一部分。
+    ///
+    /// 这两条**无鉴权**，与账号无关，晚发几秒/几分钟不影响任何功能。
+    pub async fn downloads(&self, client: &wreq::Client) {
+        let releases = {
+            tokio::time::sleep(Duration::from_millis(config::DOWNLOAD_RELEASES_DELAY_MS)).await;
+            handshake_download(client, "/claude-code-releases/latest").await
+        };
+        let plugins = {
+            tokio::time::sleep(Duration::from_millis(
+                config::DOWNLOAD_PLUGINS_DELAY_MS - config::DOWNLOAD_RELEASES_DELAY_MS,
+            ))
+            .await;
+            handshake_download(
+                client,
+                "/claude-code-releases/plugins/claude-plugins-official/latest",
+            )
+            .await
+        };
+        self.report("downloads", &[("releases_latest", releases), ("plugins_latest", plugins)]);
+    }
+
+    /// mcp-registry 翻页：**无鉴权的公共请求**，真实 CC 自己也在发，故只给模拟客户端补。
+    /// 见 [`Self::public_traffic`]。
+    async fn maybe_registry(&self, client: &wreq::Client) -> KeepaliveResult {
+        if !self.public_traffic {
+            return KeepaliveResult::Ok;
+        }
+        handshake_mcp_registry(client, &self.ctx).await
+    }
+
+    fn report(&self, stage: &str, results: &[(&str, KeepaliveResult)]) {
+        let failed: Vec<&str> =
+            results.iter().filter(|(_, r)| !r.is_ok()).map(|(n, _)| *n).collect();
+        let session: String = self.ctx.session_id.chars().take(8).collect();
+        if failed.is_empty() {
+            tracing::debug!(cred_id = self.cred_id, cred = %self.cred_label, session, stage, "session handshake done");
+        } else {
+            tracing::warn!(cred_id = self.cred_id, cred = %self.cred_label, session, stage, failed = ?failed, "session handshake: some endpoints failed");
+        }
     }
 }
 
@@ -1000,15 +1287,17 @@ pub async fn session_handshake(
 /// 取自 `cap/2.1.145/00066`（idle 周期，2 条 flat 格式日志）。
 /// `dd_client` 应为直连客户端（不走凭证代理——真实客户端的 Datadog 也是直连）。
 pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx) -> bool {
-    let resp = dd_client
-        .post(config::DATADOG_INTAKE_URL)
-        .header("DD-API-KEY", config::DATADOG_API_KEY)
-        .header("User-Agent", config::DATADOG_USER_AGENT)
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Accept-Encoding", "gzip, compress, deflate, br")
-        .json(&ctx.dd_idle_entries())
-        .send()
-        .await;
+    let resp = axios(
+        dd_client
+            .post(config::DATADOG_INTAKE_URL)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("DD-API-KEY", config::DATADOG_API_KEY)
+            .header("User-Agent", config::DATADOG_USER_AGENT)
+            .json(&ctx.dd_idle_entries()),
+        "datadog",
+    )
+    .send()
+    .await;
     match resp {
         Ok(r) => r.status().as_u16() < 500,
         Err(_) => false,
@@ -1018,7 +1307,189 @@ pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx
 #[cfg(test)]
 mod tests {
     use super::{KeepaliveCtx, TokenEndpointError, tier_from};
+    use crate::config;
     use wreq::StatusCode;
+
+    /// axios 那套辅助端点的头序表逐条对上抓包（`cap/2.1.260-2`）。
+    ///
+    /// 这是 [`config::AXIOS_SHAPES`] 唯一的正确性依据。钉住它是因为「头序」这种东西改错了
+    /// 不会有任何运行时症状——请求照样 200，只是每个会话十来条请求整整齐齐地与官方不一样。
+    #[test]
+    fn axios_header_orders_match_the_captures() {
+        // (端点, 抓包编号, 逐字头序)
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "policy_limits",
+                "00001",
+                &[
+                    "Accept",
+                    "Authorization",
+                    "anthropic-beta",
+                    "User-Agent",
+                    "If-None-Match",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+            (
+                "settings",
+                "00002",
+                &[
+                    "Accept",
+                    "Authorization",
+                    "anthropic-beta",
+                    "User-Agent",
+                    "Cache-Control",
+                    "Pragma",
+                    "If-None-Match",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+            (
+                "penguin_mode",
+                "00005",
+                &[
+                    "Accept",
+                    "Authorization",
+                    "anthropic-beta",
+                    "User-Agent",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+            (
+                "mcp_registry",
+                "00007",
+                &["Accept", "User-Agent", "Accept-Encoding", "Host", "Connection"],
+            ),
+            (
+                "bootstrap",
+                "00008",
+                &[
+                    "Accept",
+                    "Content-Type",
+                    "User-Agent",
+                    "Authorization",
+                    "anthropic-beta",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+            (
+                "event_logging",
+                "00016",
+                &[
+                    "Accept",
+                    "Content-Type",
+                    "User-Agent",
+                    "x-service-name",
+                    "Authorization",
+                    "anthropic-beta",
+                    "Content-Length",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+            (
+                "datadog",
+                "00017",
+                &[
+                    "Accept",
+                    "Content-Type",
+                    "DD-API-KEY",
+                    "User-Agent",
+                    "Content-Length",
+                    "Accept-Encoding",
+                    "Host",
+                    "Connection",
+                ],
+            ),
+        ];
+        for (name, cap, order) in cases {
+            assert_eq!(config::axios_shape(name), *order, "{name}（cap/2.1.260-2/{cap}）");
+        }
+
+        // `Authorization` 与 `User-Agent` 的先后在两个端点上正好相反——这正是「不能合并成
+        // 一张总表」的证据，别哪天又想着统一。
+        let pos = |ep: &str, h: &str| config::axios_shape(ep).iter().position(|x| *x == h).unwrap();
+        assert!(pos("policy_limits", "Authorization") < pos("policy_limits", "User-Agent"));
+        assert!(pos("bootstrap", "User-Agent") < pos("bootstrap", "Authorization"));
+
+        // 尾部三件套 11 类一致。
+        for shape in config::AXIOS_SHAPES {
+            assert_eq!(
+                &shape.order[shape.order.len() - 3..],
+                &["Accept-Encoding", "Host", "Connection"],
+                "{} 的尾部",
+                shape.name
+            );
+        }
+
+        // eval 不是 axios：Bun 的 fetch，`Connection` 在串中间而不是队尾。
+        let eval = config::AXIOS_SHAPE_EVAL.order;
+        assert_eq!(eval.last(), Some(&"Content-Length"), "eval 队尾是 Content-Length");
+        assert!(eval.contains(&"Connection"));
+        assert_ne!(eval.last(), Some(&"Connection"));
+    }
+
+    /// `If-None-Match` 里那串 `sha256:…` 是**客户端自己算的响应体摘要**，不是服务端 ETag。
+    ///
+    /// 依据：`cap/2.1.260-2/00002` 那条 settings 发的是
+    /// `"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"`，
+    /// 而那正是 `{}` 的 sha256。
+    #[test]
+    fn conditional_get_hashes_the_cached_body() {
+        const EMPTY_OBJECT_SHA: &str =
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+        // 用一个本测试专属的凭证 id，免得和别的用例共用那张进程级表。
+        let id = 90_001;
+
+        // 没缓存过就不带这个头——一台刚装好的机器第一次跑就是这个形态。
+        assert!(super::etag_of(id, "settings").is_none());
+
+        super::remember_etag(id, "settings", 200, b"{}");
+        assert_eq!(
+            super::etag_of(id, "settings").as_deref(),
+            Some(format!("\"sha256:{EMPTY_OBJECT_SHA}\"").as_str()),
+            "与 cap/2.1.260-2/00002 逐字相同"
+        );
+
+        // 304 不动缓存：上游说的就是「没变」，拿一个空 body 覆盖会把下次的条件请求打歪。
+        super::remember_etag(id, "settings", 304, b"");
+        assert_eq!(
+            super::etag_of(id, "settings").as_deref(),
+            Some(format!("\"sha256:{EMPTY_OBJECT_SHA}\"").as_str()),
+            "304 保留原值"
+        );
+
+        // 换了内容就换摘要；不同端点各记各的。
+        super::remember_etag(id, "settings", 200, b"{\"a\":1}");
+        assert_ne!(
+            super::etag_of(id, "settings").as_deref(),
+            Some(format!("\"sha256:{EMPTY_OBJECT_SHA}\"").as_str())
+        );
+        assert!(super::etag_of(id, "policy_limits").is_none(), "两个端点不共用一个键");
+    }
+
+    /// 保活循环靠这个标记跳过自己那份重复的启动串：新会话的握手已经把
+    /// bootstrap / penguin / policy_limits / settings 全打过一遍了。
+    #[test]
+    fn a_recent_handshake_is_visible_to_the_keepalive_loop() {
+        use std::time::Duration;
+        let id = 90_002;
+        assert!(!super::handshake_recent(id, Duration::from_secs(1800)), "没握过手就没有标记");
+        super::note_handshake(id);
+        assert!(super::handshake_recent(id, Duration::from_secs(1800)), "刚握过");
+        // 窗口足够短时又算「不近」——保活下一跳照常发自己那份。
+        assert!(!super::handshake_recent(id, Duration::ZERO));
+        assert!(!super::handshake_recent(90_003, Duration::from_secs(1800)), "别的号不受影响");
+    }
 
     /// 有近期真实会话时，保活事件与 Datadog 日志挂在那个会话的身份上：同一个 session_id /
     /// device_id / 版本 / 模型 / beta 串，`auth` 块带组织 id。没有时退回按账号派生的身份。
@@ -1074,6 +1545,47 @@ mod tests {
         assert_eq!(ev["env"]["version"], super::keepalive_version());
         assert!(ev["auth"].get("organization_uuid").is_none());
         assert!(idle.eval_body()["attributes"].get("organizationUUID").is_none());
+    }
+
+    /// statsig eval 的 `attributes`：`rateLimitTier` 发**原值**、`firstTokenTime` 取凭证
+    /// 入库那一刻，`subscriptionCreatedAt` **不发**（拿不到，见 [`super::KeepaliveCtx::eval_body`]）。
+    ///
+    /// 官方那份的键序（`cap/2.1.260-2/00003`）：
+    /// `… userType, subscriptionType, rateLimitTier, organizationRole,
+    ///    subscriptionCreatedAt, firstTokenTime, appVersion, entrypoint`。
+    #[test]
+    fn eval_attributes_carry_the_raw_rate_limit_tier() {
+        let store = crate::store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("t", None, "a", "r", 0, None, Some("claude_team")).unwrap();
+        store.set_rate_limit_tier(cred.id, Some("default_claude_max_5x")).unwrap();
+        let cred = store.get(cred.id).unwrap().unwrap();
+
+        let attrs = KeepaliveCtx::new(&cred, 1.0, None, None).eval_body();
+        let attrs = &attrs["attributes"];
+        assert_eq!(attrs["rateLimitTier"], "default_claude_max_5x", "发原值，不是界面上的 Max 5x");
+        assert_eq!(attrs["subscriptionType"], "team");
+        // 入库那一刻的毫秒时间戳，不是 0、也不是编出来的常量。
+        let first = attrs["firstTokenTime"].as_i64().expect("凭证有 created_at 就该有这一项");
+        assert_eq!(first, cred.created_at as i64 * 1000);
+        assert!(first > 1_700_000_000_000, "毫秒量级: {first}");
+        // 拿不到的那个明确不发——填个常量会让同一批号全都是同一个订阅创建时间。
+        assert!(
+            attrs.get("subscriptionCreatedAt").is_none(),
+            "拿不到就不发，别填伪造常量: {attrs}"
+        );
+
+        // 键序照抓包：rateLimitTier 夹在 subscriptionType 与 organizationRole 之间。
+        let keys: Vec<&str> = attrs.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(at("subscriptionType") < at("rateLimitTier"));
+        assert!(at("rateLimitTier") < at("organizationRole"));
+        assert!(at("organizationRole") < at("firstTokenTime"));
+        assert!(at("firstTokenTime") < at("appVersion"));
+
+        // 旧库里没回填过的号：这一项整个不发，而不是发一个空串。
+        let bare = store.insert("t2", None, "a2", "r2", 0, None, None).unwrap();
+        let bare = KeepaliveCtx::new(&bare, 1.0, None, None).eval_body();
+        assert!(bare["attributes"].get("rateLimitTier").is_none());
     }
 
     /// 团队号的档位只能从 `rate_limit_tier` 读——实测 `cred_id=9`（`claude_team`）的

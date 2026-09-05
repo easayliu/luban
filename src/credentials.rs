@@ -19,6 +19,12 @@ pub struct Credential {
     /// 单独存一列而不是并进 [`Self::tier`]：团队号的额度是**整个组织共享**的，与个人号
     /// 同名同档位也不是一回事，界面上得能一眼分开。
     pub org_type: Option<String>,
+    /// 额度档**原值**（`default_claude_max_5x` 之类），来自 `/api/oauth/profile` 的
+    /// `organization.rate_limit_tier`；`None` 表示没拉到（旧库、或 profile 里就没有）。
+    ///
+    /// 与 [`Self::tier`] 分开存：那个是展示串（`Max 5x`），这个是 statsig eval 的
+    /// `attributes.rateLimitTier` 要原样发出去的值，见 [`crate::oauth::KeepaliveCtx`]。
+    pub rate_limit_tier: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     /// access_token 过期的 Unix 时间戳（秒）。

@@ -218,6 +218,7 @@ mod tests {
             label: "t".into(),
             tier: None,
             org_type: None,
+            rate_limit_tier: None,
             access_token: "a".into(),
             refresh_token: "r".into(),
             expires_at: 0,

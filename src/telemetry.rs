@@ -20,8 +20,9 @@
 //! 事件字段的取法逐项对照 `cap/2.1.258/00020`、`00032`（event_logging）与 `00019`、`00029`
 //! （Datadog）。拿不到的量（客户端内部的消息条数、渲染路径等）按抓包里的规律估，见各处注释。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Bytes;
@@ -55,6 +56,29 @@ struct TplEvent {
     /// growth：`variation_id`。
     #[serde(default)]
     var: Option<i64>,
+    /// 这条事件的 `additional_metadata` 阶段，见 [`MetaStage`]。缺省即
+    /// [`MetaStage::Prompt`]（三项都写），模板里只给另外两阶段的事件标了这个字段。
+    #[serde(default)]
+    stage: MetaStage,
+}
+
+/// `additional_metadata` 的三个阶段。官方在会话早期**不写**后两项，逐阶段加上去
+/// （`cap/2.1.260-2/00016` 一批 194 条：57 条带 `renderer_mode`，其中 34 条带
+/// `cc_prompt_id`，其余 137 条只有 `subscription_type`）。
+///
+/// 给一条 `tengu_cli_flags`（进程刚起来、界面还没画、用户一个字都没输）写上
+/// `renderer_mode:"default"` 和一个 `cc_prompt_id`，是官方从不产生的组合，而这类事件
+/// 一个会话有近百条。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MetaStage {
+    /// 只有 `subscription_type`：进程启动到界面起来之间。
+    Startup,
+    /// `renderer_mode` + `subscription_type`：界面起来了，用户还没提交。
+    Renderer,
+    /// 三项齐全：用户已经提交，这一轮有 `cc_prompt_id` 了。
+    #[default]
+    Prompt,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -80,9 +104,15 @@ static TEMPLATE: std::sync::LazyLock<Template> = std::sync::LazyLock::new(|| {
 
 /// 官方 Datadog 那份日志只收这几类事件（`cap/2.1.258` 四批 285 条与 `cap/2.1.260-1` 六批
 /// 对照：`tengu_feature_ok` 全部、`tengu_api_success`、启动那几条，其余只进 event_logging）。
+///
+/// `tengu_api_error` 与 `tengu_feature_bad` 抓包里没出现过——那几个会话没有失败请求；
+/// 它们在 2.1.260 自己那份 Datadog 白名单里，故一并收（失败收尾那两条事件由
+/// [`Telemetry::process`] 直接推 Datadog，不经这张表）。
 const DD_EVENT_NAMES: &[&str] = &[
     "tengu_feature_ok",
+    "tengu_feature_bad",
     "tengu_api_success",
+    "tengu_api_error",
     "tengu_started",
     "tengu_timer",
     "tengu_init",
@@ -175,9 +205,9 @@ where
                 obj.insert("snapshotCount".into(), Value::from(subst.prompt_index));
             }
             let c = ctx(t);
-            events.push((t, id.event(&e.name, t, &c, meta.clone())));
+            events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
             if DD_EVENT_NAMES.contains(&e.name.as_str()) {
-                dd.push(id.dd_entry(&e.name, &c, resp_model, snake_flat(&meta)));
+                dd.push(id.dd_entry_at(e.stage, &e.name, &c, resp_model, snake_flat(&meta)));
             }
         }
     }
@@ -265,12 +295,20 @@ impl Identity {
     }
 
     /// `additional_metadata`：标准 base64（**带填充**，抓包里以 `=` 收尾；此前保活用的
-    /// url-safe 无填充是另一种编码，一眼可辨）。前三项固定，`extra` 追加在后。
-    pub fn metadata_b64(&self, prompt_id: &str, extra: Value) -> String {
+    /// url-safe 无填充是另一种编码，一眼可辨）。前几项固定，`extra` 追加在后。
+    ///
+    /// 前几项**按阶段给**（[`MetaStage`]）：启动早期只有 `subscription_type`，界面起来后
+    /// 多 `renderer_mode`，用户提交后才多 `cc_prompt_id`。键序照抓包：`renderer_mode` →
+    /// `subscription_type` → `cc_prompt_id`。
+    fn metadata_b64_at(&self, stage: MetaStage, prompt_id: &str, extra: Value) -> String {
         let mut m = Map::new();
-        m.insert("renderer_mode".into(), "default".into());
+        if stage != MetaStage::Startup {
+            m.insert("renderer_mode".into(), "default".into());
+        }
         m.insert("subscription_type".into(), self.subscription_type.clone().into());
-        m.insert("cc_prompt_id".into(), prompt_id.into());
+        if stage == MetaStage::Prompt {
+            m.insert("cc_prompt_id".into(), prompt_id.into());
+        }
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 m.insert(k.clone(), v.clone());
@@ -279,12 +317,29 @@ impl Identity {
         STANDARD.encode(Value::Object(m).to_string())
     }
 
-    /// 一条 `ClaudeCodeInternalEvent`。
+    /// 一条 `ClaudeCodeInternalEvent`（`additional_metadata` 按用户输入之后那个阶段写）。
     pub fn event(&self, name: &str, ts: DateTime<Utc>, ctx: &EventCtx<'_>, extra: Value) -> Value {
+        self.event_at(MetaStage::Prompt, name, ts, ctx, extra)
+    }
+
+    /// [`Self::event`] 的分阶段版本，见 [`MetaStage`]。
+    fn event_at(
+        &self,
+        stage: MetaStage,
+        name: &str,
+        ts: DateTime<Utc>,
+        ctx: &EventCtx<'_>,
+        extra: Value,
+    ) -> Value {
         // 顶层 `model` 跟事件自己的 meta.model 走（api_query 是这条请求的展示名、api_success
         // 是规范名，标题生成那条就是 haiku），没有 meta.model 的事件才用会话主模型
         // （`cap/2.1.260-2`：title_generated / tool_schema_sizes 顶层都是 `claude-opus-5[1m]`）。
         let model = extra.get("model").and_then(|m| m.as_str()).unwrap_or(ctx.model);
+        // 顶层 `betas` 同理：**API 事件报这条请求的完整 beta 串**，界面事件报会话级那份。
+        // `cap/2.1.260-2/00016` 里 `tengu_api_query`/`tengu_api_success` 的 `betas` 是出站头
+        // 那一整串（含 `advanced-tool-use`/`effort`/`afk-mode`…），而同一批里的
+        // `tengu_turn_end` 只有会话级那 9 项。一套 ctx 走天下就会把两者报成同一个值。
+        let betas = extra.get("betas").and_then(|b| b.as_str()).unwrap_or(ctx.betas);
         json!({
             "event_type": "ClaudeCodeInternalEvent",
             "event_data": {
@@ -293,13 +348,13 @@ impl Identity {
                 "model": model,
                 "session_id": &self.session_id,
                 "user_type": "external",
-                "betas": ctx.betas,
+                "betas": betas,
                 "env": self.env_block(),
                 "entrypoint": "cli",
                 "is_interactive": true,
                 "client_type": "cli",
                 "process": process_b64(ctx.uptime_secs),
-                "additional_metadata": self.metadata_b64(ctx.prompt_id, extra),
+                "additional_metadata": self.metadata_b64_at(stage, ctx.prompt_id, extra),
                 "auth": self.auth_block(),
                 "event_id": uuid_v4(),
                 "device_id": &self.device_id
@@ -337,7 +392,26 @@ impl Identity {
     /// 附加字段，直接平铺；带 `provider` 时 `ddtags` 里也多一项（api_success 的形态）。
     ///
     /// 手工建表而不是一个大 `json!`：字段太多会撞宏的 recursion_limit。
+    /// 一条 Datadog 日志（`additional_metadata` 那三项在这里是平铺的顶层字段，按用户输入
+    /// 之后那个阶段写）。
     pub fn dd_entry(&self, message: &str, ctx: &EventCtx<'_>, model: &str, extra: Value) -> Value {
+        self.dd_entry_at(MetaStage::Prompt, message, ctx, model, extra)
+    }
+
+    /// [`Self::dd_entry`] 的分阶段版本。
+    ///
+    /// Datadog 那份与 event_logging 完全同一套阶段规则（`cap/2.1.260-2/00017` 一批 80 条：
+    /// 59 条既无 `renderer_mode` 也无 `prompt_id`，7 条只有 `renderer_mode`，16 条两者都有）。
+    /// 原先这两项是无条件写的，于是每个会话有近六十条启动日志带着「界面模式」和一个
+    /// 当时还不存在的 prompt id。
+    fn dd_entry_at(
+        &self,
+        stage: MetaStage,
+        message: &str,
+        ctx: &EventCtx<'_>,
+        model: &str,
+        extra: Value,
+    ) -> Value {
         let s = |v: &str| Value::String(v.to_string());
         // 附加字段平铺在公共字段之后，同名会盖掉：`tengu_api_success` 的 meta 自带 `model`
         // （这条请求实际用的规范名），于是 DD 那份的 `model` 与 `ddtags` 都跟它走——
@@ -371,7 +445,13 @@ impl Identity {
         m.insert("model".into(), s(model));
         m.insert("session_id".into(), s(&self.session_id));
         m.insert("user_type".into(), s("external"));
-        m.insert("betas".into(), s(ctx.betas));
+        // 同 `model`：meta 自带 `betas` 的（只有 `tengu_api_success`）就跟它走，报这条请求的
+        // 完整 beta 串；其余事件用会话级那份。`cap/2.1.260-2/00017` 里整批 80 条日志只有
+        // `tengu_api_success` 那条的 betas 带着 `afk-mode`/`extended-cache-ttl`。
+        m.insert(
+            "betas".into(),
+            s(extra.get("betas").and_then(|b| b.as_str()).unwrap_or(ctx.betas)),
+        );
         m.insert("entrypoint".into(), s("cli"));
         m.insert("is_interactive".into(), s("true"));
         m.insert("client_type".into(), s("cli"));
@@ -380,8 +460,14 @@ impl Identity {
             m.insert(k.into(), s(""));
         }
         m.insert("subscription_type".into(), s(&self.subscription_type));
-        m.insert("renderer_mode".into(), s("default"));
-        m.insert("prompt_id".into(), s(ctx.prompt_id));
+        // 分阶段，见 [`MetaStage`]：启动早期两项都没有，界面起来后只有 `renderer_mode`，
+        // 用户提交后才多 `prompt_id`。
+        if stage != MetaStage::Startup {
+            m.insert("renderer_mode".into(), s("default"));
+        }
+        if stage == MetaStage::Prompt {
+            m.insert("prompt_id".into(), s(ctx.prompt_id));
+        }
         m.insert("platform".into(), s("darwin"));
         m.insert("platform_raw".into(), s("darwin"));
         m.insert("arch".into(), s("arm64"));
@@ -438,7 +524,7 @@ pub fn process_metrics(uptime_secs: f64) -> Value {
     })
 }
 
-/// base64 编码的 `process`（标准字典、带填充，同 [`Identity::metadata_b64`]）。
+/// base64 编码的 `process`（标准字典、带填充，同 `Identity::metadata_b64_at`）。
 pub fn process_b64(uptime_secs: f64) -> String {
     STANDARD.encode(process_metrics(uptime_secs).to_string())
 }
@@ -487,12 +573,28 @@ pub fn camel_to_snake(s: &str) -> String {
 /// 从出站 `anthropic-beta` 里筛出会话级那几项，顺序照原串。见
 /// [`config::TELEMETRY_SESSION_BETA_PREFIXES`]。
 pub fn session_betas(header: &str) -> String {
-    header
+    let mut out: Vec<&str> = header
         .split(',')
         .map(str::trim)
         .filter(|b| config::TELEMETRY_SESSION_BETA_PREFIXES.iter().any(|p| b.starts_with(p)))
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect();
+    // `redact-thinking` **不跟请求头走**：会话级那份始终带着它。
+    //
+    // `cap/2.1.260-2/00016` 是硬证据——同一批事件里，`tengu_api_query` 的 betas（= 出站头）
+    // **没有** `redact-thinking`（2.1.260 的 opus 主线程已经不发了），而 `tengu_turn_end`
+    // 那份会话级的**有**。也就是说会话级集合是客户端自己的一张固定表，不是请求头的子集。
+    // 只按头过滤，2.1.260 起每个会话的界面事件都会少这一项。
+    //
+    // 落位在 `interleaved-thinking` 之后（抓包序，也正是
+    // [`config::TELEMETRY_SESSION_BETA_PREFIXES`] 里的位置）。
+    if !out.iter().any(|b| b.starts_with("redact-thinking-")) {
+        let at = out
+            .iter()
+            .position(|b| b.starts_with("interleaved-thinking-"))
+            .map_or(out.len(), |i| i + 1);
+        out.insert(at, config::CC_BETA_REDACT_THINKING);
+    }
+    out.join(",")
 }
 
 /// 出站 UA（`claude-cli/2.1.258 (external, cli)`）里的版本号；认不出时退回
@@ -516,33 +618,40 @@ pub async fn post_event_logging(
     events: &[Value],
 ) -> Option<u16> {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
-    client
-        .post(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", format!("claude-code/{version}"))
-        .header("x-service-name", "claude-code")
-        .header("Accept", "application/json, text/plain, */*")
-        .json(&json!({ "events": events }))
-        .send()
-        .await
-        .ok()
-        .map(|r| r.status().as_u16())
+    crate::oauth::axios(
+        client
+            .post(&url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("claude-code/{version}"))
+            .header("x-service-name", "claude-code")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .json(&json!({ "events": events })),
+        "event_logging",
+    )
+    .send()
+    .await
+    .ok()
+    .map(|r| r.status().as_u16())
 }
 
 /// Datadog 日志摄入。真实客户端用 axios 直发，不带 Authorization。
 pub async fn post_datadog(client: &wreq::Client, entries: &[Value]) -> Option<u16> {
-    client
-        .post(config::DATADOG_INTAKE_URL)
-        .header("DD-API-KEY", config::DATADOG_API_KEY)
-        .header("User-Agent", config::DATADOG_USER_AGENT)
-        .header("Accept", "application/json, text/plain, */*")
-        .header("Accept-Encoding", "gzip, compress, deflate, br")
-        .json(&entries)
-        .send()
-        .await
-        .ok()
-        .map(|r| r.status().as_u16())
+    crate::oauth::axios(
+        client
+            .post(config::DATADOG_INTAKE_URL)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Content-Type", "application/json")
+            .header("DD-API-KEY", config::DATADOG_API_KEY)
+            .header("User-Agent", config::DATADOG_USER_AGENT)
+            .json(&entries),
+        "datadog",
+    )
+    .send()
+    .await
+    .ok()
+    .map(|r| r.status().as_u16())
 }
 
 /// OTel 指标。
@@ -553,17 +662,21 @@ pub async fn post_metrics(
     body: &Value,
 ) -> Option<u16> {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_METRICS);
-    client
-        .post(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("User-Agent", format!("claude-code/{version}"))
-        .header("Accept", "application/json, text/plain, */*")
-        .json(body)
-        .send()
-        .await
-        .ok()
-        .map(|r| r.status().as_u16())
+    crate::oauth::axios(
+        client
+            .post(&url)
+            .header("Accept", config::AXIOS_ACCEPT)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", format!("claude-code/{version}"))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .json(body),
+        "metrics",
+    )
+    .send()
+    .await
+    .ok()
+    .map(|r| r.status().as_u16())
 }
 
 // ---------- 逐请求：转发路径交过来的一条 API 调用 ----------
@@ -592,6 +705,8 @@ pub struct ApiCall {
     pub total_ms: u64,
     /// 上游响应头 `request-id`。
     pub request_id: Option<String>,
+    /// 出站的 `x-client-request-id`（官方客户端每请求一个 uuid v4）。失败事件要报它。
+    pub client_request_id: Option<String>,
     /// 响应里的 `message.id`（`msg_…`）。
     pub message_id: Option<String>,
     pub stop_reason: Option<String>,
@@ -604,8 +719,34 @@ pub struct ApiCall {
     /// 响应正文里 text / thinking 的字符数。
     pub text_chars: usize,
     pub thinking_chars: usize,
+    /// 响应里出现过思考块（`redacted_thinking` 与空思考块都算），决定要不要报
+    /// `thinkingContentLength`。
+    pub saw_thinking: bool,
+    /// 响应里每个工具的入参 JSON 字符数（工具名 → 之和，按首次出现排序），
+    /// 即 `toolUseContentLengths`。
+    pub tool_use_lens: Vec<(String, usize)>,
     pub cost_usd: Option<f64>,
     pub speed: Option<String>,
+    /// 这条请求**失败**了：报 `tengu_api_error` 而不是 `tengu_api_success`。
+    pub failure: Option<CallFailure>,
+}
+
+/// 一条失败请求客户端那头看到的东西。
+///
+/// 官方客户端对失败请求发的是 `tengu_api_error`（外加一条
+/// `tengu_feature_bad{api_request}` 与一条 `terminal_reason: "api_error"` 的
+/// `tengu_turn_end`），字段与 `tengu_api_success` 大半重合但不含任何用量。
+pub struct CallFailure {
+    /// HTTP 状态码；中途 `event: error` 那种客户端拿到的是 200 + 错误负载，SDK 那边
+    /// 状态码为空，故这里也留空（见 `in_band`）。
+    pub status: Option<u16>,
+    /// 上游 `error.type`（`rate_limit_error`、`overloaded_error`…）。
+    pub error_type: Option<String>,
+    /// 上游 `error.message`，或本地对断流的描述。
+    pub message: String,
+    /// 错误是裹在 200 里的流内事件（`event: error`）而不是 HTTP 状态码。官方对这类的
+    /// `errorType` 报 `in_band_<上游 type>`。
+    pub in_band: bool,
 }
 
 /// 转发路径在建 `ReqLog` 时先攒好的那部分（响应侧的量在流结束时才有）。
@@ -616,8 +757,59 @@ pub struct Capture {
     pub body: Bytes,
     pub betas: Option<String>,
     pub session_header: Option<String>,
+    /// 实际发出的 `x-client-request-id`。
+    pub client_request_id: Option<String>,
     pub organization_id: Option<String>,
     pub started_at: SystemTime,
+}
+
+impl Capture {
+    /// 一条**没走到正常收尾**的请求：连接层就失败了（`ReqLog` 压根没建起来），或者在
+    /// `ReqLog` 建起来之前就早退了（401 换号那条路）。响应侧的量一概没有，收尾走
+    /// [`Telemetry::process`] 的失败分支，与正常路径上那条 `tengu_api_error` 同一套。
+    ///
+    /// 放在这里而不是在 [`crate::proxy`] 里现拼一个 [`ApiCall`]：那结构二十多个字段，
+    /// 在调用点各写一份迟早会漂开——「哪些字段在失败时该留空」是这一侧的知识。
+    pub fn record_failure(
+        self,
+        cred_id: i64,
+        ua_out: String,
+        total_ms: u64,
+        request_id: Option<String>,
+        failure: CallFailure,
+    ) {
+        let sink = self.sink.clone();
+        sink.record(ApiCall {
+            cred_id,
+            account_uuid: self.account_uuid,
+            org_type: self.org_type,
+            body: self.body,
+            betas: self.betas,
+            session_header: self.session_header,
+            ua_out,
+            organization_id: self.organization_id,
+            started_at: self.started_at,
+            // 首字节从未到达（连接层失败），或响应体没读成（401 那条）。
+            ttft_ms: None,
+            total_ms,
+            request_id,
+            client_request_id: self.client_request_id,
+            message_id: None,
+            stop_reason: None,
+            resp_model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            text_chars: 0,
+            thinking_chars: 0,
+            saw_thinking: false,
+            tool_use_lens: Vec::new(),
+            cost_usd: None,
+            speed: None,
+            failure: Some(failure),
+        });
+    }
 }
 
 /// 这条请求在会话里扮演的角色，决定 `querySource` 与要不要发 turn 级事件。
@@ -698,6 +890,16 @@ struct RequestShape {
     prompt_len: usize,
     /// billing header 里的 `cc_prompt_id`。
     cc_prompt_id: Option<String>,
+    /// billing header 里的 `cc_prev_req`：**这条请求自己声明的上一条 request-id**。
+    ///
+    /// 与 `previousRequestId` 是同一件事——`cap/2.1.260-2` 那个会话三条续轮逐字相同
+    /// （体里 `cc_prev_req=req_011CeiBW8Yx9…` ↔ 事件里 `previousRequestId` 同值），官方
+    /// 两处出自同一个 `requestJournal`。故它是权威源：出站体已经这么发给上游了，遥测
+    /// 再从会话状态另算一份，两份不一致时上游把请求体和事件批一 join 就能看出来。
+    cc_prev_req: Option<String>,
+    /// 顶层 `diagnostics.previous_message_id`：同理，是这条请求自己声明的上一条 message.id。
+    /// 空值（`null`）与字段缺失都记 `None`。
+    diag_prev_message_id: Option<String>,
     is_subagent: bool,
     system_blocks: usize,
     system_chars: usize,
@@ -818,6 +1020,87 @@ fn sha256_hex(data: &[u8]) -> String {
     crate::credentials::hex_lower(&Sha256::digest(data))
 }
 
+/// 失败请求的 `errorType`：把状态码 + 上游 `error.type`/文案归到官方那套分类里。
+///
+/// 官方那个判定（2.1.260 的 `ate()`）有四十来条分支，按顺序试；这里只保留一个转发代理
+/// 真能看见的那些，顺序与官方一致——顺序要紧，比如 429 在 `>=400` 之前、`overloaded_error`
+/// 在 `>=500` 之前。
+///
+/// 流内错误（`in_band`）官方走的是另一条分支：SDK 那边这类没有状态码、只有 `type`，报
+/// `in_band_<type>`。
+fn error_kind(f: &CallFailure) -> String {
+    let msg = f.message.to_lowercase();
+    let etype = f.error_type.as_deref().unwrap_or("");
+    if f.in_band {
+        let t = if etype.is_empty() { "unknown" } else { etype };
+        return format!("in_band_{}", camel_to_snake(t));
+    }
+    let Some(status) = f.status else {
+        // 没有状态码 = 连接层就没走通。
+        return "connection_error".to_string();
+    };
+    if status == 429 {
+        return "rate_limit".to_string();
+    }
+    if status == 529 || etype == "overloaded_error" {
+        return "server_overload".to_string();
+    }
+    if msg.contains("prompt is too long") || etype == "prompt_too_long_error" {
+        return "prompt_too_long".to_string();
+    }
+    if status == 413 || msg.contains("request exceeds the maximum size") {
+        return "request_too_large".to_string();
+    }
+    if status == 404 && etype == "not_found_error" && msg.contains("model: ") {
+        return "model_not_found".to_string();
+    }
+    if status == 400 {
+        for (needle, kind) in [
+            ("could not process image", "image_unprocessable"),
+            ("text content blocks must be non-empty", "empty_text_block"),
+            ("text content blocks must contain non-whitespace text", "empty_text_block"),
+            ("diagnostics.previous_message_id", "previous_message_id_invalid"),
+            ("grammar compilation", "grammar_compile_error"),
+            ("request body is not valid json", "request_body_invalid_json"),
+        ] {
+            if msg.contains(needle) {
+                return kind.to_string();
+            }
+        }
+        if msg.contains("signature") && msg.contains("thinking") {
+            return "invalid_thinking_signature".to_string();
+        }
+    }
+    if msg.contains("credit balance is too low") {
+        return "credit_balance_low".to_string();
+    }
+    if msg.contains("oauth token has been revoked") || msg.contains("token has been revoked") {
+        return "token_revoked".to_string();
+    }
+    if status == 401 || status == 403 {
+        return "auth_error".to_string();
+    }
+    if status >= 500 {
+        return "server_error".to_string();
+    }
+    if status >= 400 {
+        return "client_error".to_string();
+    }
+    "unknown".to_string()
+}
+
+/// `tengu_feature_bad{api_request}` 的 `error_code`：官方对「重试都用光了」与「这类错误
+/// 压根不重试」分别报 `api_request_retry_exhausted` 与 `api_request_non_retryable`
+/// （可重试的状态码是 `{401,403,404,407,413,429}` 加 5xx 与连接层错误）。
+fn api_request_error_code(f: &CallFailure) -> &'static str {
+    let retryable = match f.status {
+        // 没有状态码（连接层）与流内错误都属于会重试的那类。
+        None => true,
+        Some(s) => matches!(s, 401 | 403 | 404 | 407 | 413 | 429) || s >= 500,
+    };
+    if retryable { "api_request_retry_exhausted" } else { "api_request_non_retryable" }
+}
+
 /// 官方那些「长度」都是 JavaScript 的 `String.length`，即 UTF-16 码元数：中文一个字算 1、
 /// emoji 算 2，而不是 UTF-8 字节数或码点数（`cap/2.1.260-2/00057`：requestBodyChars 101459，
 /// 同一份 body 的字节数是 101908）。
@@ -874,6 +1157,18 @@ fn walk_content(content: &Value, shape: &mut RequestShape) {
             }
         }
         _ => {}
+    }
+}
+
+/// [`last_is_new_prompt`] 的整体 body 版本，给转发路径判「这条请求要不要换一个
+/// `cc_prompt_id`」用（见 [`crate::proxy::CcSessionLink`]）：新的用户输入换一个，
+/// 工具续轮沿用同一个。
+///
+/// 没有 `messages`（或不是数组）时算作新一轮——那种请求本来就不在任何一条链上。
+pub fn last_is_new_prompt_body(body: &Value) -> bool {
+    match body.get("messages").and_then(|m| m.as_array()) {
+        Some(msgs) => last_is_new_prompt(msgs).0,
+        None => true,
     }
 }
 
@@ -937,6 +1232,13 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         ..Default::default()
     };
     (shape.device_id, shape.session_id, shape.account_uuid) = parse_user_id(&v);
+    // 这条请求自己声明的上一条 message.id（官方主线程每条都带，首轮是 `null`）。
+    shape.diag_prev_message_id = v
+        .get("diagnostics")
+        .and_then(|d| d.get("previous_message_id"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
 
     // system：块数、总长、首块（billing header）、末两块。
     if let Some(sys) = v.get("system") {
@@ -953,12 +1255,16 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
             shape.sys0_len = js_len(first);
             shape.sys0_hash = sha256_hex(first.as_bytes());
             if first.starts_with("x-anthropic-billing-header:") {
-                shape.cc_prompt_id = first
-                    .split(';')
-                    .map(str::trim)
-                    .find_map(|kv| kv.strip_prefix("cc_prompt_id="))
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
+                let field = |name: &str| -> Option<String> {
+                    first
+                        .split(';')
+                        .map(str::trim)
+                        .find_map(|kv| kv.strip_prefix(name))
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
+                shape.cc_prompt_id = field("cc_prompt_id=");
+                shape.cc_prev_req = field("cc_prev_req=");
                 shape.is_subagent = first.contains("cc_is_subagent=true");
             }
         }
@@ -1076,6 +1382,8 @@ struct Session {
     turn_depth: u32,
     /// 本轮开始（用户提交）的时刻，`tengu_turn_end.duration_ms` 与首字上屏时长的起点。
     turn_started: Option<SystemTime>,
+    /// **上一轮**用户提交的时刻：`active_time.total{type:user}` 的窗口下界，见 `user_secs`。
+    prev_prompt_submit: Option<SystemTime>,
     /// 本轮已经出现过正文（`tengu_turn_first_text` 只发一次）。
     turn_text_seen: bool,
     /// 本轮已执行的工具调用数。
@@ -1155,6 +1463,10 @@ struct CallMetric {
     new_session: bool,
     /// 这个会话 id 此前已按退出收尾过，这次是 resume（`start_type: resume`）。
     resumed: bool,
+    /// 这条请求真的拿到了用量。失败的请求照样占 `session.count` 与 `active_time`（会话确实
+    /// 起了、CLI 确实忙过），但**不进** `cost.usage` 与 `token.usage`——官方那两个计数器
+    /// 是在成功回包时才加的，替它记一串 0 只会凭空多出一堆零值数据点。
+    usage: bool,
 }
 
 /// 一张凭证攒着还没发出去的东西。
@@ -1192,15 +1504,15 @@ struct State {
     /// `claude --resume`：新进程、从头计数，但 `session.count` 报 `start_type: resume`。
     /// 保留 [`config::TELEMETRY_ENDED_SESSION_MEMORY_SECS`]。
     ended: HashMap<(i64, String), Instant>,
-    /// 新会话待做的启动握手（policy_limits / settings / eval / bootstrap …那串 GET），
-    /// 由 [`run_flusher`] 取走执行。
-    handshakes: Vec<Handshake>,
 }
 
 /// 一个新会话要做的启动握手：真实客户端每次拉起进程都会用当前账号打这一串端点
 /// （`cap/2.1.260-1` 17:14:56–17:15:05），luban 替它补上，身份取该会话的。
+///
+/// 由转发路径在该会话**首条请求发出之前**构造并 spawn，见
+/// [`crate::proxy::spawn_session_handshake`]；凭证本身作为单独的参数传给
+/// [`crate::oauth::HandshakeRunner`]，不放进这个结构。
 pub struct Handshake {
-    pub cred_id: i64,
     pub snapshot: SessionSnapshot,
     /// bootstrap 的 `model=` 参数：规范名。
     pub model: String,
@@ -1208,7 +1520,31 @@ pub struct Handshake {
 
 /// 逐请求遥测的汇聚点：转发路径往里 [`Telemetry::record`]，[`run_flusher`] 定时取走发出。
 #[derive(Clone, Default)]
-pub struct Telemetry(Arc<parking_lot::Mutex<State>>);
+pub struct Telemetry(Arc<Shared>);
+
+#[derive(Default)]
+struct Shared {
+    state: parking_lot::Mutex<State>,
+    ingest: IngestQueue,
+}
+
+/// 待处理的调用队列：**入队是同步的，出队只有一个消费者**，故处理顺序恒等于
+/// [`crate::proxy::ReqLog`] 的析构顺序，也就是响应完成的先后。
+///
+/// 为什么不能一条一个 `spawn_blocking`：那是往一个最多 512 线程的池子里扔任务，前后脚
+/// 提交的两条谁先跑没有任何保证。而 [`Telemetry::process`] 里一多半状态是**按顺序**累积的
+/// （`last_main_request_id` 那条链、`turn_depth`、`prev_total_input`、扣住侧查询要看的
+/// 「这个会话在不在」……），顺序一乱，报出去的就是一份自相矛盾的会话历史。
+///
+/// 同一会话上真会并发的是「主线程 + 标题/安全分类/子代理」这几对，两条响应在同一毫秒内
+/// 结束并不稀奇；最难看的一种是标题那条抢在会话首条主请求前面被处理——扣留分支要求会话
+/// **已经存在**，抢先了就会以一条 haiku 标题请求为起点铺开整串启动事件。
+#[derive(Default)]
+struct IngestQueue {
+    calls: parking_lot::Mutex<VecDeque<ApiCall>>,
+    /// 已经有一个消费者在跑。只用来保证「同时最多一个」，队列本身的顺序由 `calls` 保证。
+    draining: AtomicBool,
+}
 
 /// 一次要发出去的东西（一张凭证下的一个会话）。
 pub struct Flush {
@@ -1224,9 +1560,30 @@ pub struct Flush {
 impl Telemetry {
     /// 记一条已完成的 API 调用。解析请求体要几毫秒（100KB+ 的 JSON），且调用方在 `Drop`
     /// 里——扔到运行时上做，拿不到运行时（测试）就就地做。
+    ///
+    /// **入队这一步是同步的**：队列顺序 = `Drop` 顺序 = 响应完成顺序，随后由唯一的消费者
+    /// 按序处理，见 [`IngestQueue`]。
     pub fn record(&self, call: ApiCall) {
+        {
+            let mut q = self.0.ingest.calls.lock();
+            // 消费慢过生产时封顶：每条 `ApiCall` 拎着一份出站体（100KB+ 是常态），
+            // 无上限的队列在上游长时间挂起时能把内存吃穿。丢**新**的而不是旧的——
+            // 旧的丢掉会把已经排好的那条链从中间截断。
+            if q.len() >= config::TELEMETRY_INGEST_QUEUE_MAX {
+                tracing::warn!(
+                    queued = q.len(),
+                    "the telemetry ingest queue is full; dropping this call's events"
+                );
+                return;
+            }
+            q.push_back(call);
+        }
+        // 已经有消费者在跑就交给它——顺序正是靠「同时只有一个」保住的。
+        if self.0.ingest.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let me = self.clone();
-        let work = move || me.ingest(call);
+        let work = move || me.drain();
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn_blocking(work);
@@ -1235,20 +1592,40 @@ impl Telemetry {
         }
     }
 
-    /// 某凭证最近一次响应头里的 `anthropic-organization-id`（保活事件的 `auth` 块用）。
-    pub fn org_uuid(&self, cred_id: i64) -> Option<String> {
-        self.0.lock().org_uuid.get(&cred_id).cloned()
+    /// 唯一的消费者：把队列按 FIFO 排空。
+    ///
+    /// 队列锁**不跨** `process`（那是几毫秒的 JSON 解析加事件构造）：先 `pop_front` 拿到
+    /// 手里再去锁状态，两把锁不嵌套，入队方也就从不被处理阻塞。
+    fn drain(&self) {
+        loop {
+            let next = self.0.ingest.calls.lock().pop_front();
+            let Some(call) = next else {
+                // 空了：先放掉标志再复查一次。这中间入队的那条看到的是「有人在跑」，
+                // 不会自己起一个消费者，复查就是接住它的那一手。
+                self.0.ingest.draining.store(false, Ordering::Release);
+                if self.0.ingest.calls.lock().is_empty() {
+                    return;
+                }
+                // 又有了：抢回消费者身份接着跑；抢不到说明刚入队那条已经起了一个，让给它。
+                if self.0.ingest.draining.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                continue;
+            };
+            let mut st = self.0.state.lock();
+            Self::process(&mut st, call, true, None);
+        }
     }
 
-    /// 取走待做的启动握手。
-    pub fn take_handshakes(&self) -> Vec<Handshake> {
-        std::mem::take(&mut self.0.lock().handshakes)
+    /// 某凭证最近一次响应头里的 `anthropic-organization-id`（保活事件的 `auth` 块用）。
+    pub fn org_uuid(&self, cred_id: i64) -> Option<String> {
+        self.0.state.lock().org_uuid.get(&cred_id).cloned()
     }
 
     /// 某凭证最近活跃的真实会话（`max_idle` 内有过请求的那些里最新的一个）；没有则 `None`。
     /// 保活拿它把空闲事件挂到真实会话上，见 [`SessionSnapshot`]。
     pub fn latest_session(&self, cred_id: i64, max_idle: Duration) -> Option<SessionSnapshot> {
-        let st = self.0.lock();
+        let st = self.0.state.lock();
         let now = Instant::now();
         st.sessions
             .iter()
@@ -1266,8 +1643,11 @@ impl Telemetry {
             })
     }
 
+    /// 就地处理一条调用（测试用）。转发路径走 [`Self::record`]——那条要经队列才能保住
+    /// 顺序，而测试本来就是单线程按序调用，直接进 `process` 少一层异步。
+    #[cfg(test)]
     fn ingest(&self, call: ApiCall) {
-        let mut st = self.0.lock();
+        let mut st = self.0.state.lock();
         Self::process(&mut st, call, true, None);
     }
 
@@ -1368,6 +1748,7 @@ impl Telemetry {
             last_main_depth: 0,
             turn_depth: 0,
             turn_started: None,
+            prev_prompt_submit: None,
             turn_text_seen: false,
             turn_tool_calls: 0,
             shell_snapshot_done: false,
@@ -1390,21 +1771,37 @@ impl Telemetry {
         sess.last_seen = now;
         // 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
         let turn_over = call.stop_reason.as_deref().is_none_or(|s| s != "tool_use");
-        let emit_first_turn = kind == Kind::Main && turn_over && !sess.first_turn_done;
+        // 这条请求客户端那头是失败的：收尾走 `tengu_api_error` 那一串，且没有任何用量。
+        let failed = call.failure.is_some();
+        // 首轮那串版本检查是「一轮跑完了」才发的，失败的那轮不算。
+        let emit_first_turn = kind == Kind::Main && turn_over && !failed && !sess.first_turn_done;
         if emit_first_turn {
             sess.first_turn_done = true;
         }
+        let is_main = kind == Kind::Main;
+        // 版本跟着每条走没问题（同一会话所有请求同一个 UA），但 **`betas` 只跟主线程**。
+        //
+        // 会话级 beta 是「这个会话」的属性，而侧查询（标题生成用 haiku + structured-outputs、
+        // 安全分类用 auto-mode-classifier）各有一套完全不同的 beta。无条件覆盖之后，从侧
+        // 查询结束到下一条主请求之间，[`Telemetry::latest_session`]（保活挂身份用）与指标
+        // 导出那条 `tengu_feature_ok{internal_metrics_export}` 报的就是标题生成的 beta ——
+        // 一个「会话主模型是 opus、会话 beta 却是标题生成那套」的组合，官方不产生。
+        //
+        // 会话第一条就是侧查询时还是要写一次，否则整个会话的 beta 都是空的。
         sess.version = version.clone();
-        sess.betas = session_betas(call.betas.as_deref().unwrap_or(""));
+        if is_main || sess.betas.is_empty() {
+            sess.betas = session_betas(call.betas.as_deref().unwrap_or(""));
+        }
         // 新一轮用户输入（只有主线程算）：prompt 计数 +1、换 prompt_id（优先用 billing header
         // 里客户端自己的）与 queryChainId、depth 归零。tool_result 续轮沿用上一轮的，depth +1。
         // 侧查询（标题、猜下一句）不动这些计数。
-        let is_main = kind == Kind::Main;
         let new_prompt = is_main && (shape.new_prompt || sess.prompt_index == 0);
         if new_prompt {
             sess.prompt_index += 1;
             sess.chain_id = uuid_v4();
             sess.turn_depth = 0;
+            // 换 `turn_started` 之前先把上一轮的提交时刻挪走：`user_secs` 的窗口下界要它。
+            sess.prev_prompt_submit = sess.turn_started;
             sess.turn_started = Some(call.started_at - Duration::from_millis(15));
             sess.turn_text_seen = false;
             sess.turn_tool_calls = 0;
@@ -1416,8 +1813,18 @@ impl Telemetry {
         }
         let prompt_id = sess.prompt_id.clone();
         // 主线程与猜下一句走 `previousRequestId` 链；标题那类没有。
-        let previous_request_id =
-            kind.has_chain().then(|| sess.last_main_request_id.clone()).flatten();
+        //
+        // **以出站体里那份 `cc_prev_req` 为准**（同 `cc_prompt_id` 的取法）：那是这条请求
+        // 已经发给上游的声明，而会话状态是回程时另算的一份。两者本该恒等（`cap/2.1.260-2`
+        // 三条续轮逐字相同），但它们的更新路径不同——`cc_prev_req` 由
+        // [`crate::proxy::CcSessionLink::record`] 在 `ReqLog::drop` 里**同步**写，
+        // 这里的 `last_main_request_id` 走 [`Telemetry::record`] 那条队列。让遥测复述请求
+        // 自己说过的话，两份就不可能对不上；体里没有（会话首轮、没有 billing header 的
+        // 来访）才回落到会话状态。
+        let previous_request_id = kind
+            .has_chain()
+            .then(|| shape.cc_prev_req.clone().or_else(|| sess.last_main_request_id.clone()))
+            .flatten();
         let prev_main_message_id = sess.last_main_message_id.clone();
         let prev_main_depth = sess.last_main_depth;
         // `timeSinceLastApiCallMs` = **这条完成时刻 − 上一条完成时刻**（不分主线程/侧查询，
@@ -1435,7 +1842,9 @@ impl Telemetry {
         let session_model = sess.last_model.clone().unwrap_or_else(|| sess.default_model.clone());
         let model_changed =
             is_main && sess.last_model.as_deref().is_some_and(|m| m != display_model);
-        let previous_message_id = sess.last_message_id.clone();
+        // 同理：`diagnostics.previous_message_id` 是这条请求自己声明的那个，优先于会话状态。
+        let previous_message_id =
+            shape.diag_prev_message_id.clone().or_else(|| sess.last_message_id.clone());
         let tools_slot =
             if kind.has_boundary() { &sess.tools_hash_main } else { &sess.tools_hash_side };
         let tools_changed = tools_slot.as_deref() != Some(shape.tools_hash.as_str());
@@ -1456,16 +1865,32 @@ impl Telemetry {
         let first_text_in_turn = is_main && call.text_chars > 0 && !sess.turn_text_seen;
         // 首字之前跑过的工具数 = 本轮此前的 + 这条续轮带回来的。
         let tool_calls_before = sess.turn_tool_calls + shape.tool_uses.len() as u32;
-        // 用户这次输入前花的时间：上一条结束到这次提交（封顶 5s）；首次输入没有上一条，取 0.9s。
+        // `active_time.total{type:user}`：用户敲这条输入花掉的时间。
+        //
+        // 官方的口径不是「上一条请求结束到这次提交」，而是**输入框里每次改动之间的间隔之和**
+        // （`ActivityTracker.recordUserActivity`：每个按键/粘贴/提交各记一次，只累加
+        // 间隔小于 `USER_ACTIVITY_TIMEOUT_MS` = 5s 的那些，且 CLI 忙着的时候不算）。
+        // 也就是说它量的是「打字时长」，与那一轮 API 花了多久无关——旧口径取 CLI 时长的
+        // 一个比例是量错了对象。
+        //
+        // 代理这一侧看不见按键，但看得见输入的**字数**，而打字时长就是它的线性函数。
+        // 三份抓包（一次输入 2 字 → 0.878s / 2 字 → 1.118s / 3 字 + 20 字 → 3.988s 合计）
+        // 拟合出 `0.8 + 0.1 × 字数`：2 字 → 1.0（实测均值 0.998）、3 字 + 20 字 → 1.1 + 2.8
+        // = 3.9（实测 3.988）。0.8s 是「上一次活动到第一个按键」加「最后一个按键到提交」
+        // 那两段，0.1s/字 ≈ 10 字/秒。
+        //
+        // 再按可用窗口截断：窗口是**上一次提交到这次提交**（会话第一条则从进程起点算），
+        // 不能是「上一条请求结束到这次提交」——用户会边看回复边打字，抓包里第二次输入
+        // 贡献的 2.9s 就大于上一轮结束之后剩下的那 2.2s。粘贴一大段时估算值会顶到窗口上限，
+        // 方向也是对的（官方那边粘贴只记一次改动，只有两段间隔）。
         let user_secs = if !new_prompt {
             0.0
-        } else if sess.prompt_index <= 1 {
-            0.9
         } else {
             let submit = call.started_at - Duration::from_millis(15);
-            prev_end
-                .and_then(|e| submit.duration_since(e).ok())
-                .map_or(0.9, |d| d.as_secs_f64().min(5.0))
+            let typed = 0.8 + 0.1 * shape.prompt_len as f64;
+            let base = sess.prev_prompt_submit.unwrap_or(sess.started_wall);
+            let window = submit.duration_since(base).map_or(typed, |d| d.as_secs_f64());
+            typed.min(window).max(0.0)
         };
         let shell_snapshot_first = is_main
             && !sess.shell_snapshot_done
@@ -1482,10 +1907,13 @@ impl Telemetry {
             sess.last_main_message_id =
                 call.message_id.clone().or(sess.last_main_message_id.take());
             sess.last_main_depth = sess.turn_depth;
-            sess.prev_total_input = call.input_tokens
-                + call.cache_read_tokens
-                + call.cache_creation_tokens
-                + call.output_tokens;
+            // 失败那条没有用量，`messageTokens`（「对话此刻的 token 数」）不该被它清零。
+            if !failed {
+                sess.prev_total_input = call.input_tokens
+                    + call.cache_read_tokens
+                    + call.cache_creation_tokens
+                    + call.output_tokens;
+            }
             sess.last_model = Some(display_model.clone());
             sess.turn_tool_calls += shape.tool_uses.len() as u32;
             if first_text_in_turn {
@@ -1498,10 +1926,14 @@ impl Telemetry {
                 sess.turn_depth += 1;
             }
         }
-        if kind.has_boundary() {
-            sess.tools_hash_main = Some(shape.tools_hash.clone());
-        } else {
-            sess.tools_hash_side = Some(shape.tools_hash.clone());
+        // 长度表报过一次就不再重发——但失败那条压根没报（`tengu_tool_schema_sizes` 在官方
+        // 那边就长在 `tengu_api_success` 里），别让它把「已报过」的标记占掉。
+        if !failed {
+            if kind.has_boundary() {
+                sess.tools_hash_main = Some(shape.tools_hash.clone());
+            } else {
+                sess.tools_hash_side = Some(shape.tools_hash.clone());
+            }
         }
         sess.counted = true;
         let ctx_model = if is_main { display_model.clone() } else { session_model };
@@ -1852,14 +2284,17 @@ impl Telemetry {
         }
         push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
 
-        // 首字节到达。
-        push(t_first, "tengu_feature_ok", feature("api_request"));
-        dd.push(identity.dd_entry(
-            "tengu_feature_ok",
-            &ctx(t_first),
-            &dd_model,
-            feature("api_request"),
-        ));
+        // 首字节到达。失败那条没有这一条：官方的 `tengu_feature_ok{api_request}` 是请求
+        // **成功返回**之后才打的，失败走的是下面的 `tengu_feature_bad{api_request}`。
+        if !failed {
+            push(t_first, "tengu_feature_ok", feature("api_request"));
+            dd.push(identity.dd_entry(
+                "tengu_feature_ok",
+                &ctx(t_first),
+                &dd_model,
+                feature("api_request"),
+            ));
+        }
         if first_text_in_turn {
             let t_paint = ms(t_first, 30);
             push(
@@ -1902,140 +2337,251 @@ impl Telemetry {
             );
         }
 
-        // 收尾：tengu_api_success（键序照抓包）。
-        let mut success = Map::new();
-        let mut put = |k: &str, v: Value| {
-            success.insert(k.to_string(), v);
-        };
-        put("model", json!(&resp_model));
-        if has_1m {
-            put("preNormalizedModel", json!(&display_model));
-        }
-        put("betas", json!(&betas_full));
-        put("messageCount", json!(shape.messages_len));
-        put("messageTokens", json!(message_tokens));
-        put("inputTokens", json!(call.input_tokens));
-        put("outputTokens", json!(call.output_tokens));
-        put("cachedInputTokens", json!(call.cache_read_tokens));
-        put("uncachedInputTokens", json!(call.cache_creation_tokens));
-        put("durationMs", json!(total));
-        // 比 durationMs 多出的那 1–5ms 是客户端重试包装层的开销，官方五条是 +3/+5/+1/+1/+4；
-        // 按 request-id 取个稳定的零头，别恒等。
+        // 两条收尾事件都要的量。
+        //
+        // `durationMsIncludingRetries` 比 `durationMs` 多出的那 1–5ms 是客户端重试包装层的
+        // 开销，官方五条是 +3/+5/+1/+1/+4；按 request-id 取个稳定的零头，别恒等。
         let retry_pad = call
             .request_id
             .as_deref()
             .map(|r| r.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b))))
             .unwrap_or(0)
             % 5;
-        put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
-        put("attempt", json!(1));
-        put("ttftMs", json!(ttft));
-        put("buildAgeMins", json!(build_age_mins));
-        put("provider", json!("firstParty"));
-        put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
-        put("stop_reason", json!(call.stop_reason.as_deref().unwrap_or("end_turn")));
-        if let Some(e) = &effort {
-            put("effort_level", json!(e));
-        }
-        // 只有主线程（和子代理）报「是不是默认模型/默认 effort」；猜下一句和标题那类不报。
-        if matches!(kind, Kind::Main | Kind::Subagent) {
-            put("is_default_model", json!(display_model == default_model));
-            put("default_model", json!(&default_model));
+        let body_chars = std::str::from_utf8(&call.body).map(js_len).unwrap_or(call.body.len());
+
+        // 收尾：成功报 `tengu_api_success`、失败报 `tengu_api_error`——两条并列，且互斥。
+        //
+        // 官方对失败请求发的是 `tengu_api_error`（`ate()` 分类 + 上游文案，没有任何用量）
+        // 外加一条 `tengu_feature_bad{api_request}`；成功那条独有的
+        // `tengu_tool_schema_sizes` 与标题生成收尾也只在成功时发（前者就在官方
+        // `tengu_api_success` 那个函数里）。
+        if !failed {
+            // 收尾：tengu_api_success（键序照抓包）。
+            let mut success = Map::new();
+            let mut put = |k: &str, v: Value| {
+                success.insert(k.to_string(), v);
+            };
+            put("model", json!(&resp_model));
+            if has_1m {
+                put("preNormalizedModel", json!(&display_model));
+            }
+            put("betas", json!(&betas_full));
+            put("messageCount", json!(shape.messages_len));
+            put("messageTokens", json!(message_tokens));
+            put("inputTokens", json!(call.input_tokens));
+            put("outputTokens", json!(call.output_tokens));
+            put("cachedInputTokens", json!(call.cache_read_tokens));
+            put("uncachedInputTokens", json!(call.cache_creation_tokens));
+            put("durationMs", json!(total));
+            put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
+            put("attempt", json!(1));
+            put("ttftMs", json!(ttft));
+            put("buildAgeMins", json!(build_age_mins));
+            put("provider", json!("firstParty"));
+            put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
+            put("stop_reason", json!(call.stop_reason.as_deref().unwrap_or("end_turn")));
             if let Some(e) = &effort {
-                put("is_default_effort", json!(true));
-                put("default_effort_level", json!(e));
+                put("effort_level", json!(e));
+            }
+            // 只有主线程（和子代理）报「是不是默认模型/默认 effort」；猜下一句和标题那类不报。
+            if matches!(kind, Kind::Main | Kind::Subagent) {
+                put("is_default_model", json!(display_model == default_model));
+                put("default_model", json!(&default_model));
+                if let Some(e) = &effort {
+                    put("is_default_effort", json!(true));
+                    put("default_effort_level", json!(e));
+                }
+            }
+            put("costUSD", json!(call.cost_usd.unwrap_or(0.0)));
+            put("didFallBackToNonStreaming", json!(false));
+            put("isNonInteractiveSession", json!(false));
+            put("print", json!(false));
+            put("isTTY", json!(true));
+            put("querySource", json!(query_source));
+            if kind.has_chain() {
+                put("queryChainId", json!(&chain_id));
+                put("queryDepth", json!(query_depth));
+            }
+            put("permissionMode", json!(shape.permission_mode));
+            put("globalCacheStrategy", json!("system_prompt"));
+            if shape.has_cache_control {
+                put("prompt_cache_ttl", json!(cache_ttl));
+                put("prompt_cache_ttl_reason", json!("subscriber"));
+            }
+            put("textContentLength", json!(call.text_chars));
+            // 官方的判据是「这条回复里有没有思考块」（`redacted_thinking` 与空思考块都算）；
+            // 嗅探不到块类型时退回旧的代理指标——有思考字数，或整条没有正文（`tool_use`
+            // 收尾的那种回复必带思考块），抓包里三种情形都对得上。
+            if call.saw_thinking || call.thinking_chars > 0 || call.text_chars == 0 {
+                put("thinkingContentLength", json!(call.thinking_chars));
+            }
+            put("narrationBlockCount", json!(0));
+            // `toolUseContentLengths`：这条回复里每个工具的入参 JSON 字符数之和，键按首次
+            // 出现排序，整张表**序列化成一个字符串**塞进事件（与 `toolSchemaCharLengths`
+            // 同一种写法）；一个 `tool_use` 块都没有时整个字段不出现。
+            if !call.tool_use_lens.is_empty() {
+                let mut table = Map::new();
+                for (name, len) in &call.tool_use_lens {
+                    table.insert(name.clone(), json!(len));
+                }
+                put("toolUseContentLengths", json!(Value::Object(table).to_string()));
+            }
+            put("imageBlockCount", json!(shape.image_blocks));
+            put("imageTotalPixels", json!(0));
+            put("imageTotalBytes", json!(shape.image_bytes));
+            put("documentBlockCount", json!(shape.doc_blocks));
+            put("documentTotalBytes", json!(shape.doc_bytes));
+            put("inputTextCharLength", json!(shape.input_text_chars));
+            put("estimatedInputTokens", json!(shape.estimated_tokens));
+            put("systemCharLength", json!(shape.system_chars));
+            if modern && kind.has_boundary() {
+                put("systemPromptSource", json!("live_unrecorded"));
+            }
+            put("toolsCharLength", json!(shape.tools_chars));
+            put("toolsCount", json!(shape.tools_count));
+            put("deferredToolsCount", json!(shape.deferred_tools));
+            put("toolSchemasHash", json!(&shape.tools_hash));
+            put("requestBodyEncoding", json!("identity"));
+            put("requestBodyChars", json!(body_chars));
+            put("gzipSkipReason", json!("proxy"));
+            put("fastMode", json!(shape.fast_mode));
+            if let Some(prev) = &previous_request_id {
+                put("previousRequestId", json!(prev));
+            }
+            if let Some(ms_since) = time_since_last {
+                put("timeSinceLastApiCallMs", json!(ms_since));
+            }
+            let success = Value::Object(success);
+            push(t_end, "tengu_api_success", success.clone());
+            dd.push(identity.dd_entry(
+                "tengu_api_success",
+                &ctx(t_end),
+                &dd_model,
+                snake_flat(&success),
+            ));
+
+            // 工具集变了才报一次（无工具的侧查询也算一种：`{}` 那份）。
+            if tools_changed {
+                push(
+                    t_end,
+                    "tengu_tool_schema_sizes",
+                    json!({
+                        "toolSchemasHash": &shape.tools_hash,
+                        "toolSchemaCharLengths": &shape.tool_lens,
+                        "toolsCharLength": shape.tools_chars,
+                        "toolsCount": shape.tools_count,
+                        "deferredToolsCount": shape.deferred_tools
+                    }),
+                );
+            }
+            if kind == Kind::Title {
+                push(t_end, "tengu_session_title_generated", json!({ "success": true }));
             }
         }
-        put("costUSD", json!(call.cost_usd.unwrap_or(0.0)));
-        put("didFallBackToNonStreaming", json!(false));
-        put("isNonInteractiveSession", json!(false));
-        put("print", json!(false));
-        put("isTTY", json!(true));
-        put("querySource", json!(query_source));
-        if kind.has_chain() {
-            put("queryChainId", json!(&chain_id));
-            put("queryDepth", json!(query_depth));
-        }
-        put("permissionMode", json!(shape.permission_mode));
-        put("globalCacheStrategy", json!("system_prompt"));
-        if shape.has_cache_control {
-            put("prompt_cache_ttl", json!(cache_ttl));
-            put("prompt_cache_ttl_reason", json!("subscriber"));
-        }
-        put("textContentLength", json!(call.text_chars));
-        // 没有正文（tool_use 收尾）或真有思考内容时才带思考长度，抓包里三种情形都对得上。
-        if call.thinking_chars > 0 || call.text_chars == 0 {
-            put("thinkingContentLength", json!(call.thinking_chars));
-        }
-        put("narrationBlockCount", json!(0));
-        put("imageBlockCount", json!(shape.image_blocks));
-        put("imageTotalPixels", json!(0));
-        put("imageTotalBytes", json!(shape.image_bytes));
-        put("documentBlockCount", json!(shape.doc_blocks));
-        put("documentTotalBytes", json!(shape.doc_bytes));
-        put("inputTextCharLength", json!(shape.input_text_chars));
-        put("estimatedInputTokens", json!(shape.estimated_tokens));
-        put("systemCharLength", json!(shape.system_chars));
-        if modern && kind.has_boundary() {
-            put("systemPromptSource", json!("live_unrecorded"));
-        }
-        put("toolsCharLength", json!(shape.tools_chars));
-        put("toolsCount", json!(shape.tools_count));
-        put("deferredToolsCount", json!(shape.deferred_tools));
-        put("toolSchemasHash", json!(&shape.tools_hash));
-        put("requestBodyEncoding", json!("identity"));
-        put(
-            "requestBodyChars",
-            json!(std::str::from_utf8(&call.body).map(js_len).unwrap_or(call.body.len())),
-        );
-        put("gzipSkipReason", json!("proxy"));
-        put("fastMode", json!(shape.fast_mode));
-        if let Some(prev) = &previous_request_id {
-            put("previousRequestId", json!(prev));
-        }
-        if let Some(ms_since) = time_since_last {
-            put("timeSinceLastApiCallMs", json!(ms_since));
-        }
-        let success = Value::Object(success);
-        push(t_end, "tengu_api_success", success.clone());
-        dd.push(identity.dd_entry(
-            "tengu_api_success",
-            &ctx(t_end),
-            &dd_model,
-            snake_flat(&success),
-        ));
 
-        // 工具集变了才报一次（无工具的侧查询也算一种：`{}` 那份）。
-        if tools_changed {
-            push(
-                t_end,
-                "tengu_tool_schema_sizes",
-                json!({
-                    "toolSchemasHash": &shape.tools_hash,
-                    "toolSchemaCharLengths": &shape.tool_lens,
-                    "toolsCharLength": shape.tools_chars,
-                    "toolsCount": shape.tools_count,
-                    "deferredToolsCount": shape.deferred_tools
-                }),
-            );
-        }
-        if kind == Kind::Title {
-            push(t_end, "tengu_session_title_generated", json!({ "success": true }));
+        // 失败收尾：`tengu_feature_bad{api_request}` + `tengu_api_error`，两条都进 Datadog
+        // （官方那份 Datadog 白名单里 `tengu_api_error` 与 `tengu_feature_bad` 都在）。
+        let mut error_kind_name = String::new();
+        if let Some(fail) = &call.failure {
+            let kind_name = error_kind(fail);
+            let code = api_request_error_code(fail);
+            let bad = json!({ "feature_name": "api_request", "error_code": code });
+            push(t_end, "tengu_feature_bad", bad.clone());
+            dd.push(identity.dd_entry("tengu_feature_bad", &ctx(t_end), &dd_model, bad));
+
+            let mut err = Map::new();
+            let mut put = |k: &str, v: Value| {
+                err.insert(k.to_string(), v);
+            };
+            put("model", json!(&display_model));
+            // 上游文案原样报（官方截断在 4000 字），除非连 request-id 都没拿到——那种情形
+            // 官方换成 `API error: type=… status=…` 这句合成文案。
+            let has_request_id = call.request_id.as_deref().is_some_and(|r| !r.is_empty());
+            let message = if has_request_id && !fail.message.trim().is_empty() {
+                let m = fail.message.trim();
+                match m.char_indices().nth(4_000) {
+                    Some((cut, _)) => format!("{}\u{2026}<truncated>", &m[..cut]),
+                    None => m.to_string(),
+                }
+            } else {
+                format!(
+                    "API error: type={kind_name} status={}",
+                    fail.status.map_or_else(|| "none".to_string(), |s| s.to_string())
+                )
+            };
+            put("error", json!(message));
+            // `status` 是十进制串而不是数字（官方 `FP()` 就是 `String(status)`）；流内错误
+            // 那种 SDK 侧没有状态码，整个字段不出现。
+            if let Some(st) = fail.status {
+                put("status", json!(st.to_string()));
+            }
+            put("errorType", json!(&kind_name));
+            if let Some(e) = &effort {
+                put("effort_level", json!(e));
+            }
+            put("messageCount", json!(shape.messages_len));
+            put("messageTokens", json!(message_tokens));
+            put("durationMs", json!(total));
+            put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
+            put("attempt", json!(1));
+            put("provider", json!("firstParty"));
+            if has_request_id {
+                put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
+            }
+            if let Some(crid) = call.client_request_id.as_deref().filter(|c| !c.is_empty()) {
+                put("clientRequestId", json!(crid));
+            }
+            put("didFallBackToNonStreaming", json!(false));
+            put("requestBodyEncoding", json!("identity"));
+            put("requestBodyChars", json!(body_chars));
+            put("gzipSkipReason", json!("proxy"));
+            if kind.has_chain() {
+                put("queryChainId", json!(&chain_id));
+                put("queryDepth", json!(query_depth));
+            }
+            put("querySource", json!(query_source));
+            put("fastMode", json!(shape.fast_mode));
+            if let Some(prev) = &previous_request_id {
+                put("previousRequestId", json!(prev));
+            }
+            let err = Value::Object(err);
+            push(t_end, "tengu_api_error", err.clone());
+            dd.push(identity.dd_entry("tengu_api_error", &ctx(t_end), &dd_model, snake_flat(&err)));
+            error_kind_name = kind_name;
         }
 
         // 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
-        let turn_end = |terminal: &str, duration: i64| {
-            json!({
-                "terminal_reason": terminal,
-                "is_error": false,
-                "is_subagent": kind == Kind::Subagent,
-                "goal_active": false,
-                "duration_ms": duration,
-                "query_source": query_source,
-                "query_source_category": kind.category()
-            })
+        //
+        // `error_kind` 只有 `terminal_reason: "api_error"` 那种才带（官方是
+        // `error_kind: Te(reason==="api_error" ? errorKind ?? "unknown" : undefined)`，
+        // 其余情形整个键不出现）。
+        let turn_end = |terminal: &str, duration: i64, error_kind: Option<&str>| {
+            let mut o = Map::new();
+            o.insert("terminal_reason".into(), json!(terminal));
+            if let Some(k) = error_kind {
+                o.insert("error_kind".into(), json!(k));
+            }
+            o.insert("is_error".into(), json!(error_kind.is_some()));
+            o.insert("is_subagent".into(), json!(kind == Kind::Subagent));
+            o.insert("goal_active".into(), json!(false));
+            o.insert("duration_ms".into(), json!(duration));
+            o.insert("query_source".into(), json!(query_source));
+            o.insert("query_source_category".into(), json!(kind.category()));
+            Value::Object(o)
         };
-        if is_main && turn_over {
+        if is_main && turn_over && failed {
+            // 请求失败也是一轮的终点，但没有 stop hook、没有 `tengu_feature_ok{turn}`、
+            // 也没有首轮那串——那些都挂在「跑完了」这条路上。
+            push(
+                ms(t_end, 1),
+                "tengu_turn_end",
+                turn_end(
+                    "api_error",
+                    (ms(t_end, 1) - turn_started).num_milliseconds().max(total),
+                    Some(if error_kind_name.is_empty() { "unknown" } else { &error_kind_name }),
+                ),
+            );
+        } else if is_main && turn_over {
             take_tpl(&TEMPLATE.turn, t_end);
             if emit_first_turn {
                 take_tpl(&TEMPLATE.first_turn, t_end);
@@ -2047,7 +2593,7 @@ impl Telemetry {
             push(
                 t2,
                 "tengu_turn_end",
-                turn_end("completed", (t2 - turn_started).num_milliseconds().max(total)),
+                turn_end("completed", (t2 - turn_started).num_milliseconds().max(total), None),
             );
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
@@ -2058,7 +2604,8 @@ impl Telemetry {
             dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), &dd_model, feature("turn")));
         }
         // 猜下一句：自己就是一轮（`cap/2.1.260-2` 09:43:21），收尾多一条 fork 统计，没有 tips。
-        if kind == Kind::Suggestion {
+        // 失败的那条只有上面的错误串（fork 统计报的是这一发的用量，没有用量就没有它）。
+        if kind == Kind::Suggestion && !failed {
             let t1 = ms(t_end, 1);
             let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
             let hit_rate =
@@ -2087,39 +2634,36 @@ impl Telemetry {
                     "queryDepth": prev_main_depth
                 }),
             );
-            push(t1, "tengu_turn_end", turn_end("completed", total + 7));
+            push(t1, "tengu_turn_end", turn_end("completed", total + 7, None));
         }
 
         // `take_tpl` 借着 `tpl_events`/`tpl_dd`，到这里已经不再用它，可以并进主队列。
         events.extend(tpl_events);
         dd.extend(tpl_dd);
 
-        // 新会话：把启动握手那串 GET 交给发送循环去做（用该凭证的 token 与代理）。
-        if is_new_session {
-            st.handshakes.push(Handshake {
-                cred_id: call.cred_id,
-                snapshot: SessionSnapshot {
-                    session_id: session_id.clone(),
-                    device_id: device_id.clone(),
-                    account_uuid: account_uuid.clone(),
-                    version: version.clone(),
-                    model: display_model.clone(),
-                    betas: betas_session.clone(),
-                    prompt_id: prompt_id.clone(),
-                    started_wall,
-                },
-                model: resp_model.clone(),
-            });
-        }
+        // 启动握手**不在这里排队**。这里是回程（`ReqLog` 收尾之后），排在这儿等于让上游
+        // 先看到一条 messages、几秒后才看到这个「会话」的启动流量——顺序整个反了。
+        // 现在由转发路径在**首条请求发出之前**直接开跑，见
+        // [`crate::proxy::spawn_session_handshake`]；那里还能分辨模拟与真实 CC，后者自己
+        // 会打这一串，luban 不该重复。
+        let _ = is_new_session;
 
         // ---- 入队 ----
         let pending = st.pending.entry((call.cred_id, session_id.clone())).or_default();
         pending.version = version;
         pending.subscription_type = identity.subscription_type.clone();
         pending.identity = Some(identity.clone());
-        pending.model = display_model.clone();
-        pending.betas = betas_session.clone();
-        pending.prompt_id = prompt_id.clone();
+        // **模型 / beta / prompt_id 只跟主线程走**（第一条就是侧查询时先占个位）。
+        //
+        // 这三项是导出指标时那条 `tengu_feature_ok{internal_metrics_export}` 的上下文，
+        // 代表的是「这个会话」。被一条标题生成（haiku + structured-outputs、且没有
+        // `cc_prompt_id`）覆盖之后，导出事件报的就成了 haiku 与标题那套 beta——而同一批
+        // 指标里的 `model` 属性仍是会话主模型，自相矛盾。
+        if is_main || pending.model.is_empty() {
+            pending.model = display_model.clone();
+            pending.betas = betas_session.clone();
+            pending.prompt_id = prompt_id.clone();
+        }
         pending.started_wall = Some(started_wall);
         pending.events_since.get_or_insert(now);
         pending.events.extend(events);
@@ -2142,6 +2686,7 @@ impl Telemetry {
             user_secs,
             new_session: is_new_session && !counted,
             resumed,
+            usage: !failed,
         });
 
         // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去。
@@ -2162,7 +2707,7 @@ impl Telemetry {
     /// 或任一路条数到了 [`config::TELEMETRY_BATCH_MAX`]。每个会话一份 [`Flush`]，同一张凭证
     /// 的多个会话各发各的。
     pub fn take_due(&self, now: Instant) -> Vec<Flush> {
-        let mut st = self.0.lock();
+        let mut st = self.0.state.lock();
         let org_uuids = st.org_uuid.clone();
         let mut out = Vec::new();
         for ((cred_id, session), p) in st.pending.iter_mut() {
@@ -2257,7 +2802,7 @@ impl Telemetry {
     /// 再关，这期间保活挂在这个会话上的空闲事件正好把这段空白填成「开着没说话」。
     pub fn gc(&self, now: Instant) {
         let idle = Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS);
-        let mut st = self.0.lock();
+        let mut st = self.0.state.lock();
         // 扣住太久的侧查询：没等到主线程请求，按会话现有的 prompt id 补发。
         let hold = Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS);
         let stale: Vec<(i64, String)> = st
@@ -2430,18 +2975,20 @@ fn metrics_body(
             && a.effort == b.effort
     };
     for c in calls {
-        match cost.iter_mut().find(|(k, _)| same(k, c)) {
-            Some((_, v)) => *v += c.cost,
-            None => cost.push((c, c.cost)),
-        }
-        match tokens.iter_mut().find(|(k, _)| same(k, c)) {
-            Some((_, v)) => {
-                v[0] += c.input;
-                v[1] += c.output;
-                v[2] += c.cache_read;
-                v[3] += c.cache_creation;
+        if c.usage {
+            match cost.iter_mut().find(|(k, _)| same(k, c)) {
+                Some((_, v)) => *v += c.cost,
+                None => cost.push((c, c.cost)),
             }
-            None => tokens.push((c, [c.input, c.output, c.cache_read, c.cache_creation])),
+            match tokens.iter_mut().find(|(k, _)| same(k, c)) {
+                Some((_, v)) => {
+                    v[0] += c.input;
+                    v[1] += c.output;
+                    v[2] += c.cache_read;
+                    v[3] += c.cache_creation;
+                }
+                None => tokens.push((c, [c.input, c.output, c.cache_read, c.cache_creation])),
+            }
         }
         match active.iter_mut().find(|(k, _)| k.session_id == c.session_id) {
             Some((_, v)) => {
@@ -2487,18 +3034,24 @@ fn metrics_body(
             "data_points": sessions
         }));
     }
-    metrics.push(json!({
-        "name": "claude_code.cost.usage",
-        "description": "Cost of the Claude Code session",
-        "unit": "USD",
-        "data_points": cost_points
-    }));
-    metrics.push(json!({
-        "name": "claude_code.token.usage",
-        "description": "Number of tokens used",
-        "unit": "tokens",
-        "data_points": token_points
-    }));
+    // 一批里全是失败请求时这两项没有任何数据点——官方那种批次里它们压根不出现，
+    // 别发一个空数组。
+    if !cost_points.is_empty() {
+        metrics.push(json!({
+            "name": "claude_code.cost.usage",
+            "description": "Cost of the Claude Code session",
+            "unit": "USD",
+            "data_points": cost_points
+        }));
+    }
+    if !token_points.is_empty() {
+        metrics.push(json!({
+            "name": "claude_code.token.usage",
+            "description": "Number of tokens used",
+            "unit": "tokens",
+            "data_points": token_points
+        }));
+    }
     metrics.push(json!({
         "name": "claude_code.active_time.total",
         "description": "Total active time in seconds",
@@ -2533,20 +3086,6 @@ pub async fn run_flusher(
         tick.tick().await;
         let now = Instant::now();
         t.gc(now);
-        for h in t.take_handshakes() {
-            let Ok(Some(cred)) = store.get(h.cred_id) else { continue };
-            if cred.is_banned() {
-                continue;
-            }
-            let Ok(client) = clients.for_credential(&cred) else { continue };
-            let Ok(crate::store::TokenAttempt::Ready(token)) =
-                crate::store::ensure_fresh_token(&store, &clients, &cred).await
-            else {
-                continue;
-            };
-            let org = t.org_uuid(h.cred_id);
-            crate::oauth::session_handshake(&client, &token, &cred, h, org).await;
-        }
         for f in t.take_due(now) {
             let Ok(Some(cred)) = store.get(f.cred_id) else { continue };
             if cred.is_banned() {
@@ -2677,6 +3216,7 @@ mod tests {
             ttft_ms: Some(1800),
             total_ms: 6118,
             request_id: Some(request_id.into()),
+            client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
             message_id: Some("msg_011Cedjuoa4oBPzoB2CSUNEB".into()),
             stop_reason: Some(stop.into()),
             resp_model: Some("claude-opus-5".into()),
@@ -2686,9 +3226,32 @@ mod tests {
             cache_creation_tokens: 8729,
             text_chars: 87,
             thinking_chars: 0,
+            saw_thinking: false,
+            tool_use_lens: Vec::new(),
             cost_usd: Some(0.18),
             speed: None,
+            failure: None,
         }
+    }
+
+    /// 把一条调用改成「客户端那头失败了」。
+    fn failed(mut c: ApiCall, status: Option<u16>, etype: &str, message: &str) -> ApiCall {
+        c.stop_reason = None;
+        c.message_id = None;
+        c.resp_model = None;
+        c.input_tokens = 0;
+        c.output_tokens = 0;
+        c.cache_read_tokens = 0;
+        c.cache_creation_tokens = 0;
+        c.text_chars = 0;
+        c.cost_usd = None;
+        c.failure = Some(CallFailure {
+            status,
+            error_type: (!etype.is_empty()).then(|| etype.to_string()),
+            message: message.to_string(),
+            in_band: status.is_none() && !etype.is_empty(),
+        });
+        c
     }
 
     /// `cc_body` 里 metadata 的 session_id；待发批次按 (凭证, 会话) 取。
@@ -2716,11 +3279,11 @@ mod tests {
     /// 新会话的首批带完整的启动那串 + 每轮输入那串 + 首轮版本检查，身份与占位符按会话替换；
     /// 同一会话第二条请求不再有启动与首轮那两串；握手任务每个会话排一次。
     #[test]
-    fn new_session_gets_the_startup_burst_and_a_handshake() {
+    fn new_session_gets_the_startup_burst() {
         let t = Telemetry::default();
         t.ingest(call(cc_body(true), "req_1", "end_turn"));
         {
-            let st = t.0.lock();
+            let st = t.0.state.lock();
             let p = &st.pending[&key()];
             let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
             assert!(
@@ -2758,7 +3321,37 @@ mod tests {
             )
             .unwrap();
             assert_eq!(meta["permissionMode"], "auto", "占位符按请求体替换");
-            assert_eq!(meta["cc_prompt_id"], "6c079143-0c53-4c48-817d-105460b3f622");
+            // 启动早期的事件**只有** `subscription_type`：那会儿界面还没画、用户一个字都
+            // 没输，`renderer_mode` 与 `cc_prompt_id` 都还不存在，见 [`super::MetaStage`]。
+            assert_eq!(meta["cc_prompt_id"], Value::Null, "启动事件不写 cc_prompt_id");
+            assert_eq!(meta["renderer_mode"], Value::Null, "也不写 renderer_mode");
+            assert_eq!(meta["subscription_type"], "team", "只有这一项");
+            // 界面起来之后、用户提交之前的那几条：有 renderer_mode，仍没有 cc_prompt_id。
+            let probe = p
+                .events
+                .iter()
+                .find(|(_, e)| ev_name(e) == "tengu_terminal_probe")
+                .map(|(_, e)| e["event_data"].clone())
+                .expect("startup 模板里有这一条");
+            let probe_meta: Value = serde_json::from_slice(
+                &STANDARD.decode(probe["additional_metadata"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(probe_meta["renderer_mode"], "default");
+            assert_eq!(probe_meta["cc_prompt_id"], Value::Null, "还没提交就没有这一项");
+            // 用户提交之后那一批三项齐全。
+            let query = p
+                .events
+                .iter()
+                .find(|(_, e)| ev_name(e) == "tengu_api_query")
+                .map(|(_, e)| e["event_data"].clone())
+                .unwrap();
+            let query_meta: Value = serde_json::from_slice(
+                &STANDARD.decode(query["additional_metadata"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(query_meta["renderer_mode"], "default");
+            assert_eq!(query_meta["cc_prompt_id"], "6c079143-0c53-4c48-817d-105460b3f622");
             assert_eq!(init["session_id"], SESSION);
             assert_eq!(init["model"], "claude-opus-5[1m]");
             let timer = p
@@ -2808,18 +3401,13 @@ mod tests {
                 p.dd.iter().any(|d| d["feature_name"] == "ca_certs_load" && d["cert_count"] == 144)
             );
             assert!(!p.dd.iter().any(|d| d["message"] == "tengu_skill_loaded"));
-            assert_eq!(st.handshakes.len(), 1);
-            assert_eq!(st.handshakes[0].snapshot.session_id, SESSION);
-            assert_eq!(st.handshakes[0].model, "claude-opus-5");
         }
-        assert_eq!(t.take_handshakes().len(), 1);
-        assert!(t.take_handshakes().is_empty());
 
         // 同一会话第二轮：有输入串、没有启动串与首轮那串。
         let mut second = call(cc_body(true), "req_2", "end_turn");
         second.started_at = SystemTime::now();
         t.ingest(second);
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let names: Vec<&str> = st.pending[&key()].events.iter().map(|(_, e)| ev_name(e)).collect();
         assert_eq!(names.iter().filter(|n| **n == "tengu_started").count(), 1);
         assert_eq!(names.iter().filter(|n| **n == "tengu_native_auto_updater_start").count(), 1);
@@ -2833,7 +3421,6 @@ mod tests {
             1,
             "首次输入才有"
         );
-        assert!(st.handshakes.is_empty(), "握手只排一次");
     }
 
     #[test]
@@ -2854,7 +3441,7 @@ mod tests {
         );
         t.ingest(call(body.to_string().into_bytes(), "req_b", "end_turn"));
         {
-            let st = t.0.lock();
+            let st = t.0.state.lock();
             assert_eq!(st.pending.len(), 2, "两个会话两个批次");
             assert!(st.pending.contains_key(&key()));
             assert!(st.pending.contains_key(&(7, "other-session".to_string())));
@@ -2886,11 +3473,50 @@ mod tests {
         assert_eq!(s.model, "claude-opus-5[1m]");
         assert_eq!(
             s.betas,
-            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12",
+            "会话级那份始终带 redact-thinking，哪怕请求头里没有"
         );
         assert_eq!(s.prompt_id, "6c079143-0c53-4c48-817d-105460b3f622");
         assert!(t.latest_session(8, Duration::from_secs(3600)).is_none(), "别的凭证没有");
         assert!(t.latest_session(7, Duration::ZERO).is_none(), "超过闲置上限就不算近期");
+
+        // **侧查询不许把会话级上下文改掉**：标题生成用的是 haiku + 一套完全不同的 beta，
+        // 覆盖之后，从它结束到下一条主请求之间，保活挂的身份与指标导出报的就都是标题生成
+        // 那套——一个「会话主模型 opus、会话 beta 却是标题那套」的组合，官方不产生。
+        let mut title = call(
+            json!({
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 32000,
+                "stream": true,
+                "thinking": {"type": "disabled"},
+                "system": [
+                    {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.ced; cc_entrypoint=cli; cch=b1b2c;"},
+                    {"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions."}
+                ],
+                "messages": [{"role":"user","content":"<session>\nhi\n</session>\n\nWrite the title"}],
+                "metadata": {"user_id": "{\"device_id\":\"b9\",\"account_uuid\":\"a\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}"}
+            })
+            .to_string()
+            .into_bytes(),
+            "req_title",
+            "end_turn",
+        );
+        title.betas = Some(
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             structured-outputs-2025-12-15"
+                .into(),
+        );
+        t.ingest(title);
+        // 侧查询先被扣住等新一轮 prompt id；覆盖发生在**补发**那一刻，所以要让它到期。
+        assert_eq!(t.0.state.lock().sessions[&key()].deferred.len(), 1, "先扣住");
+        t.gc(Instant::now() + Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1));
+        assert!(t.0.state.lock().sessions[&key()].deferred.is_empty(), "补发了");
+
+        let after = t.latest_session(7, Duration::from_secs(3600)).expect("会话还在");
+        assert_eq!(after.model, s.model, "会话主模型不该被标题生成改成 haiku");
+        assert_eq!(after.betas, s.betas, "会话级 beta 不该被标题生成那套覆盖");
+        assert_eq!(after.prompt_id, s.prompt_id, "prompt_id 同样不该被侧查询改掉");
     }
 
     /// 会话闲置到期 = 客户端退出：补退出事件链，三路立刻到期一起发（`cap/2.1.260-1`）。
@@ -3030,7 +3656,7 @@ mod tests {
         assert!(parse_shape(body.to_string().as_bytes()).unwrap().quota_probe);
         let t = Telemetry::default();
         t.ingest(call(body.to_string().into_bytes(), "req_q", "max_tokens"));
-        assert!(t.0.lock().pending.is_empty());
+        assert!(t.0.state.lock().pending.is_empty());
         assert!(t.latest_session(7, Duration::from_secs(60)).is_none(), "也不算开了会话");
     }
 
@@ -3103,7 +3729,7 @@ mod tests {
         second.ua_out = "claude-cli/2.1.260 (external, cli)".into();
         t.ingest(second);
 
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = &st.pending[&key()];
         let by_name = |n: &str| -> Vec<Value> {
             p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
@@ -3153,8 +3779,8 @@ mod tests {
         let ends = by_name("tengu_turn_end");
         assert_eq!(ends.len(), 1, "tool_use 那条不结束这一轮");
         assert!(ends[0]["duration_ms"].as_i64().unwrap() >= 10_000, "整轮时长，从提交算起");
-        // active_time：cli 只算 end_turn 收尾的那条（6.118s），tool_use 那条不算；user 是首次
-        // 输入的 0.9s。
+        // active_time：cli 只算 end_turn 收尾的那条（6.118s），tool_use 那条不算；user 是
+        // 敲那 11 个字（`hello there`）的时长估算 0.8 + 0.1×11 = 1.9s。
         let m = metrics_body(&p.metrics, "2.1.260", "team", None);
         let active = m["metrics"][3]["data_points"].as_array().unwrap();
         let by_type = |ty: &str| {
@@ -3163,7 +3789,7 @@ mod tests {
                 .unwrap()
         };
         assert!((by_type("cli") - 6.118).abs() < 0.01, "{}", by_type("cli"));
-        assert!((by_type("user") - 0.9).abs() < 0.01);
+        assert!((by_type("user") - 1.9).abs() < 0.01, "{}", by_type("user"));
         // durationMsIncludingRetries 比 durationMs 多 1–5ms，按 request-id 稳定。
         let s0 = &successes[0];
         let d =
@@ -3192,7 +3818,7 @@ mod tests {
         sugg.started_at = SystemTime::now() - Duration::from_secs(5);
         sugg.ua_out = "claude-cli/2.1.260 (external, cli)".into();
         t.ingest(sugg);
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = &st.pending[&key()];
         let metas: Vec<Value> = p
             .events
@@ -3294,7 +3920,7 @@ mod tests {
         t.ingest(title);
         // 侧查询会先扣住等下一条主线程；这里没有，走超时补发。
         t.gc(Instant::now() + Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1));
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = &st.pending[&key()];
         let query = p
             .events
@@ -3385,7 +4011,7 @@ mod tests {
         let mut third = call(body.to_string().into_bytes(), "req_main2", "end_turn");
         third.started_at = SystemTime::now() - Duration::from_secs(2);
         t.ingest(third);
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let n = st.pending[&key()]
             .events
             .iter()
@@ -3431,7 +4057,7 @@ mod tests {
         let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
         second.started_at = SystemTime::now() - Duration::from_secs(10);
         t.ingest(second);
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = &st.pending[&key()];
         let prompts: Vec<Value> = p
             .events
@@ -3487,7 +4113,7 @@ mod tests {
         title.betas = Some("claude-code-20250219,oauth-2025-04-20".into());
         t.ingest(title);
         {
-            let st = t.0.lock();
+            let st = t.0.state.lock();
             assert_eq!(st.sessions[&key()].deferred.len(), 1, "扣住了");
             assert!(
                 !st.pending[&key()]
@@ -3505,7 +4131,7 @@ mod tests {
         second.started_at = SystemTime::now() - Duration::from_secs(11);
         t.ingest(second);
         {
-            let st = t.0.lock();
+            let st = t.0.state.lock();
             assert!(st.sessions[&key()].deferred.is_empty());
             let p = &st.pending[&key()];
             let title_success = p
@@ -3552,9 +4178,9 @@ mod tests {
         t.ingest(title2);
         let now = Instant::now();
         t.gc(now);
-        assert_eq!(t.0.lock().sessions[&key()].deferred.len(), 1, "还没到 10s");
+        assert_eq!(t.0.state.lock().sessions[&key()].deferred.len(), 1, "还没到 10s");
         t.gc(now + Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1));
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         assert!(st.sessions[&key()].deferred.is_empty());
         let n = st.pending[&key()]
             .events
@@ -3603,6 +4229,499 @@ mod tests {
         }
     }
 
+    /// 链的权威源是**请求自己带的那份**，不是回程时另算的会话状态。
+    ///
+    /// 出站体的 billing header 里那个 `cc_prev_req` 与遥测的 `previousRequestId` 说的是
+    /// 同一件事——`cap/2.1.260-2` 三条续轮逐字相同，官方两处出自同一个 `requestJournal`。
+    /// luban 这边两者的更新路径不同（前者在 `ReqLog::drop` 里同步写，后者走 ingest 队列），
+    /// 让遥测复述请求自己说过的话，两份就不可能对不上。
+    /// `diagnostics.previous_message_id` 同理。
+    #[test]
+    fn the_chain_fields_come_from_the_request_itself() {
+        const PREV_REQ: &str = "req_011CeiBW8Yx9A2uzWiCBsJsU";
+        const PREV_MSG: &str = "msg_011CeiBWZwBH2rmLqr63MhHD";
+        let t = Telemetry::default();
+        // 会话首条：体里没有 `cc_prev_req`，链上没有上一条。
+        t.ingest(call(cc_body(true), "req_1", "end_turn"));
+        // 第二条：体里自报了一个**与会话状态不同**的 `cc_prev_req` 和 `previous_message_id`。
+        // 会话状态此刻记着 `req_1` / `msg_011Ced…`，两者都该被体里那份顶掉。
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["system"][0]["text"] = json!(format!(
+            "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=b6499; \
+             cc_prompt_id=6c079143-0c53-4c48-817d-105460b3f622; cc_prev_req={PREV_REQ};"
+        ));
+        v["diagnostics"] = json!({ "previous_message_id": PREV_MSG });
+        // 换个模型让缓存诊断那条事件发出来（它带 `previousMessageId`）。
+        v["model"] = json!("claude-sonnet-5");
+        let mut c = call(serde_json::to_vec(&v).unwrap(), "req_2", "end_turn");
+        c.resp_model = Some("claude-sonnet-5".into());
+        t.ingest(c);
+
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let meta = |name: &str, nth: usize| -> Value {
+            let (_, e) = p.events.iter().filter(|(_, e)| ev_name(e) == name).nth(nth).unwrap();
+            let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+            let raw =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+            serde_json::from_slice::<Value>(&raw).unwrap()
+        };
+        assert!(meta("tengu_api_query", 0).get("previousRequestId").is_none(), "首条没有上一条");
+        assert_eq!(
+            meta("tengu_api_query", 1)["previousRequestId"],
+            PREV_REQ,
+            "以体里自报的 cc_prev_req 为准，而不是会话状态里的 req_1"
+        );
+        assert_eq!(meta("tengu_api_success", 1)["previousRequestId"], PREV_REQ);
+        assert_eq!(
+            meta("tengu_prompt_cache_diagnosis_received", 0)["previousMessageId"],
+            PREV_MSG,
+            "以体里 diagnostics.previous_message_id 为准"
+        );
+    }
+
+    /// 体里没有 `cc_prev_req` 时仍回落到会话状态：会话首轮、没有 billing header 的来访、
+    /// 关掉链注入的那些都走这条路。
+    #[test]
+    fn the_chain_falls_back_to_session_state_without_a_declared_prev() {
+        let t = Telemetry::default();
+        t.ingest(call(cc_body(true), "req_1", "end_turn"));
+        t.ingest(call(cc_body(false), "req_2", "end_turn"));
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let (_, e) =
+            p.events.iter().filter(|(_, e)| ev_name(e) == "tengu_api_query").nth(1).unwrap();
+        let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let m: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(m["previousRequestId"], "req_1", "体里没自报就用会话状态那条链");
+    }
+
+    /// 处理顺序必须等于**入队顺序**（= `ReqLog::drop` 顺序 = 响应完成顺序）。
+    ///
+    /// 此前每条调用各起一个 `spawn_blocking`，那是往一个几百线程的池子里扔任务，前后脚
+    /// 提交的两条谁先跑没有保证；而 `process` 里一多半状态是按顺序累积的。这里从**多个
+    /// 线程**并发 `record`，再断言那条 `previousRequestId` 链严丝合缝——乱序处理会让链
+    /// 在某一处指回更早的一条，或者干脆指向自己后面那条。
+    #[test]
+    fn the_ingest_queue_processes_calls_in_the_order_they_were_recorded() {
+        const N: usize = 64;
+        // 体要够大，`process` 里那趟 JSON 解析才占得住时间——生产快过消费，队列上才真的
+        // 会同时压着好几条。体小的话每条 record 都在下一条入队前就处理完了，什么都测不出来。
+        let big = {
+            let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+            v["system"][3]["text"] = json!("While auto mode is active: ".repeat(8_000));
+            serde_json::to_vec(&v).unwrap()
+        };
+        // 先把 N 条都造好：构造的开销留在计时之外，`record` 那一串才是背靠背的。
+        let calls: Vec<ApiCall> =
+            (0..N).map(|i| call(big.clone(), &format!("req_{i:02}"), "end_turn")).collect();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .max_blocking_threads(8)
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = Telemetry::default();
+        rt.block_on(async {
+            // 入队是同步的，故入队顺序就是这里的循环顺序。
+            for c in calls {
+                t.record(c);
+            }
+            // 等队列排空：最多等 30 秒，正常是几百毫秒。
+            for _ in 0..3_000 {
+                let done = {
+                    let st = t.0.state.lock();
+                    st.pending.get(&key()).is_some_and(|p| {
+                        p.events.iter().filter(|(_, e)| ev_name(e) == "tengu_api_query").count()
+                            == N
+                    })
+                };
+                if done {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("ingest queue did not drain");
+        });
+
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let chain: Vec<Option<String>> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_query")
+            .map(|(_, e)| {
+                let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .unwrap();
+                let m: Value = serde_json::from_slice(&raw).unwrap();
+                m.get("previousRequestId").and_then(|v| v.as_str()).map(str::to_string)
+            })
+            .collect();
+        assert_eq!(chain.len(), N);
+        assert_eq!(chain[0], None, "首条没有上一条");
+        for (i, prev) in chain.iter().enumerate().skip(1) {
+            assert_eq!(
+                prev.as_deref(),
+                Some(format!("req_{:02}", i - 1)).as_deref(),
+                "第 {i} 条的 previousRequestId 应当是紧挨着的上一条"
+            );
+        }
+    }
+
+    /// `toolUseContentLengths`：回复里带工具调用时，`tengu_api_success` 多一个字段，值是
+    /// 「工具名 → 入参 JSON 字符数」那张表**序列化成的字符串**（与 `toolSchemaCharLengths`
+    /// 同一种写法），一个工具都没有时整个字段不出现。
+    #[test]
+    fn tool_use_content_lengths_ride_along_with_the_success() {
+        let t = Telemetry::default();
+        let mut c = call(cc_body(true), "req_tu", "tool_use");
+        c.tool_use_lens = vec![("Bash".into(), 169), ("Read".into(), 42)];
+        t.ingest(c);
+        t.ingest(call(cc_body(true), "req_plain", "end_turn"));
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let successes: Vec<Value> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| {
+                let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .unwrap();
+                serde_json::from_slice::<Value>(&raw).unwrap()
+            })
+            .collect();
+        assert_eq!(successes[0]["toolUseContentLengths"], r#"{"Bash":169,"Read":42}"#);
+        assert!(
+            successes[1].get("toolUseContentLengths").is_none(),
+            "回复里没有 tool_use 块的话整个字段不出现"
+        );
+    }
+
+    /// 失败请求走 `tengu_api_error` 而不是 `tengu_api_success`：分类按状态码、文案取上游
+    /// 原文，收尾多一条 `tengu_feature_bad{api_request}` 与一条
+    /// `terminal_reason: "api_error"` 的 `tengu_turn_end`；成功那条独有的东西一样都没有。
+    #[test]
+    fn a_failed_call_reports_an_api_error_instead_of_a_success() {
+        let t = Telemetry::default();
+        t.ingest(failed(
+            call(cc_body(true), "req_429", "end_turn"),
+            Some(429),
+            "rate_limit_error",
+            "This request would exceed your organization's rate limit",
+        ));
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).expect("入队");
+        let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
+        assert!(names.contains(&"tengu_api_error"));
+        assert!(!names.contains(&"tengu_api_success"), "两条互斥");
+        assert!(!names.contains(&"tengu_tool_schema_sizes"), "长度表只在成功那条里发");
+        let meta_of = |name: &str| {
+            let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == name).unwrap();
+            let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+            let raw =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+            serde_json::from_slice::<Value>(&raw).unwrap()
+        };
+        let err = meta_of("tengu_api_error");
+        assert_eq!(err["errorType"], "rate_limit");
+        assert_eq!(err["status"], "429", "状态码是十进制串，不是数字");
+        assert_eq!(err["error"], "This request would exceed your organization's rate limit");
+        assert_eq!(err["model"], "claude-opus-5[1m]");
+        assert_eq!(err["attempt"], 1);
+        assert_eq!(err["provider"], "firstParty");
+        assert_eq!(err["requestId"], "req_429");
+        assert_eq!(err["clientRequestId"], "3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e");
+        assert_eq!(err["querySource"], "repl_main_thread");
+        assert_eq!(err["queryDepth"], 0);
+        assert_eq!(err["requestBodyEncoding"], "identity");
+        assert!(err.get("inputTokens").is_none(), "失败那条没有任何用量字段");
+        assert!(err.get("costUSD").is_none());
+        // 收尾：feature_bad + api_error 两条都进 Datadog，但没有 feature_ok{api_request}。
+        let bad = meta_of("tengu_feature_bad");
+        assert_eq!(bad["feature_name"], "api_request");
+        assert_eq!(bad["error_code"], "api_request_retry_exhausted");
+        assert!(p.dd.iter().any(|d| d["message"] == "tengu_api_error"));
+        assert!(p.dd.iter().any(|d| d["message"] == "tengu_feature_bad"));
+        // 这批里所有 feature 事件的名字：`api_request` 只能以 bad 的形式出现一次。
+        let features = |name: &str| -> Vec<String> {
+            p.events
+                .iter()
+                .filter(|(_, e)| ev_name(e) == name)
+                .filter_map(|(_, e)| {
+                    let b64 = e["event_data"]["additional_metadata"].as_str()?;
+                    let raw =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                            .ok()?;
+                    let v: Value = serde_json::from_slice(&raw).ok()?;
+                    Some(v["feature_name"].as_str()?.to_string())
+                })
+                .collect()
+        };
+        assert!(
+            !features("tengu_feature_ok").contains(&"api_request".to_string()),
+            "官方的 feature_ok{{api_request}} 是成功回包才打的"
+        );
+        assert!(
+            !features("tengu_feature_ok").contains(&"turn".to_string()),
+            "失败的那轮没有 feature_ok{{turn}}，也没有 stop hook"
+        );
+        assert!(!features("tengu_feature_ok").contains(&"hook_stop_handler".to_string()));
+        // 一轮到此为止，但走的是 api_error 那条。
+        assert_eq!(p.events.iter().filter(|(_, e)| ev_name(e) == "tengu_turn_end").count(), 1);
+        let end = meta_of("tengu_turn_end");
+        assert_eq!(end["terminal_reason"], "api_error");
+        assert_eq!(end["error_kind"], "rate_limit");
+        assert_eq!(end["is_error"], true);
+        // 指标：会话照数、active_time 照记，但 cost/token 一个数据点都没有。
+        let m = metrics_body(&p.metrics, "2.1.260", "team", None);
+        let names: Vec<&str> =
+            m["metrics"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"claude_code.session.count"));
+        assert!(names.contains(&"claude_code.active_time.total"));
+        assert!(!names.contains(&"claude_code.cost.usage"), "失败请求不进 cost");
+        assert!(!names.contains(&"claude_code.token.usage"), "失败请求不进 token");
+    }
+
+    /// 连 `ReqLog` 都没建起来的那两条路（连接层失败、401 换号）由
+    /// [`Capture::record_failure`] 就地补一条失败遥测：响应侧的量一概没有，
+    /// 事件链与正常路径上那条 `tengu_api_error` 同一套。
+    #[test]
+    fn a_capture_can_report_a_failure_without_a_response() {
+        let t = Telemetry::default();
+        let cap = |sink: Telemetry| Capture {
+            sink,
+            account_uuid: Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df".into()),
+            org_type: Some("claude_team".into()),
+            body: Bytes::from(cc_body(true)),
+            betas: Some("claude-code-20250219,oauth-2025-04-20".into()),
+            session_header: None,
+            client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
+            organization_id: None,
+            started_at: SystemTime::now() - Duration::from_secs(3),
+        };
+        // 连接层就失败：没有状态码、没有上游 request-id。
+        cap(t.clone()).record_failure(
+            7,
+            "claude-cli/2.1.260 (external, cli)".into(),
+            1_200,
+            None,
+            CallFailure {
+                status: None,
+                error_type: None,
+                message: "error sending request: connection refused".into(),
+                in_band: false,
+            },
+        );
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).expect("入队");
+        let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
+        assert!(names.contains(&"tengu_api_error"));
+        assert!(!names.contains(&"tengu_api_success"));
+        let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_error").unwrap();
+        let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let err: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(err["errorType"], "connection_error");
+        assert!(err.get("status").is_none(), "连接层失败没有 HTTP 状态码");
+        assert!(err.get("requestId").is_none(), "上游 request-id 都没拿到");
+        assert_eq!(err["clientRequestId"], "3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e");
+        assert_eq!(err["durationMs"], 1_200);
+        // 请求侧的量照旧从出站体算（那份 body 确实拼好了、只是没发出去）。
+        assert_eq!(err["messageCount"], 3);
+        assert!(err.get("inputTokens").is_none(), "响应侧一个字段都没有");
+        // 一轮到此为止，走 api_error 那条。
+        let (_, end) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_turn_end").unwrap();
+        let b64 = end["event_data"]["additional_metadata"].as_str().unwrap();
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let end: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(end["terminal_reason"], "api_error");
+        assert_eq!(end["error_kind"], "connection_error");
+        // 请求没发出去，没有响应头可取组织 id；这个号之前也没有过带那个头的响应，
+        // 于是 `auth` 里只有 account——官方对连不上的那类同样拿不到更多。
+        assert!(e["event_data"]["auth"].get("organization_uuid").is_none());
+    }
+
+    /// 401 那条路（换号/回 403/原样透传三条出路都绕开 `ReqLog::drop`）报的是带状态码的
+    /// `auth_error`，且**响应头里的组织 id 要带进 `auth` 块**。
+    ///
+    /// 组织 id 遥测这边按凭证缓存过一份，同一个号之前有过一条带这个头的响应就还补得上；
+    /// 但一个进程里头一条就是早退 401 的号没有那份缓存，`auth` 里就会整个少掉
+    /// `organization_uuid`——而订阅/团队账号官方每条事件都带。所以 401 那条路要把响应头
+    /// 上那份传下来（连接层失败那条没有响应，只能靠缓存）。
+    #[test]
+    fn a_401_early_return_still_reports_an_auth_error() {
+        let t = Telemetry::default();
+        Capture {
+            sink: t.clone(),
+            account_uuid: Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df".into()),
+            org_type: Some("claude_team".into()),
+            body: Bytes::from(cc_body(true)),
+            betas: None,
+            session_header: None,
+            client_request_id: None,
+            organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
+            started_at: SystemTime::now() - Duration::from_secs(2),
+        }
+        .record_failure(
+            7,
+            "claude-cli/2.1.260 (external, cli)".into(),
+            800,
+            Some("req_401".into()),
+            CallFailure {
+                status: Some(401),
+                error_type: Some("authentication_error".into()),
+                message: "OAuth token has been revoked".into(),
+                in_band: false,
+            },
+        );
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_error").unwrap();
+        let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let err: Value = serde_json::from_slice(&raw).unwrap();
+        // `token_revoked` 在官方 `ate()` 里排在 401 → auth_error 之前。
+        assert_eq!(err["errorType"], "token_revoked");
+        assert_eq!(err["status"], "401");
+        assert_eq!(err["requestId"], "req_401");
+        assert_eq!(err["error"], "OAuth token has been revoked");
+        // 这个号在这个进程里还没有过任何一条成功响应，`auth` 里那个组织 id 只能来自
+        // 这一发 401 自己的响应头。
+        assert_eq!(
+            e["event_data"]["auth"]["organization_uuid"], "09520b85-f6b6-432f-97e2-6ecb804a083f",
+            "早退 401 的事件也要带上组织 id"
+        );
+        assert_eq!(e["event_data"]["auth"]["account_uuid"], "9922ef8e-7945-4f5a-ab4f-cf5f521531df");
+    }
+
+    /// 流内错误（`event: error` 裹在 200 里）：SDK 那头没有状态码，官方报
+    /// `in_band_<上游 type>`，`status` 字段整个不出现。
+    #[test]
+    fn an_in_band_stream_error_is_reported_as_in_band() {
+        let t = Telemetry::default();
+        t.ingest(failed(
+            call(cc_body(true), "req_ib", "end_turn"),
+            None,
+            "overloaded_error",
+            "Overloaded",
+        ));
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_error").unwrap();
+        let b64 = e["event_data"]["additional_metadata"].as_str().unwrap();
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        let err: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(err["errorType"], "in_band_overloaded_error");
+        assert!(err.get("status").is_none(), "流内错误没有 HTTP 状态码");
+    }
+
+    /// `errorType` 的分类顺序与官方 `ate()` 一致：429 在「4xx」之前、529/overloaded 在
+    /// 「5xx」之前，非重试类的 400 报 `client_error` 且 `error_code` 换成 non_retryable。
+    #[test]
+    fn error_kinds_follow_the_official_classifier() {
+        let f = |status: Option<u16>, etype: &str, msg: &str| CallFailure {
+            status,
+            error_type: (!etype.is_empty()).then(|| etype.to_string()),
+            message: msg.to_string(),
+            in_band: false,
+        };
+        assert_eq!(error_kind(&f(Some(429), "rate_limit_error", "")), "rate_limit");
+        assert_eq!(error_kind(&f(Some(529), "overloaded_error", "")), "server_overload");
+        assert_eq!(error_kind(&f(Some(500), "overloaded_error", "")), "server_overload");
+        assert_eq!(error_kind(&f(Some(500), "api_error", "")), "server_error");
+        assert_eq!(error_kind(&f(Some(401), "authentication_error", "")), "auth_error");
+        assert_eq!(error_kind(&f(Some(403), "permission_error", "")), "auth_error");
+        assert_eq!(error_kind(&f(Some(413), "", "")), "request_too_large");
+        assert_eq!(
+            error_kind(&f(Some(400), "invalid_request_error", "prompt is too long: 1 tokens")),
+            "prompt_too_long"
+        );
+        assert_eq!(
+            error_kind(&f(
+                Some(400),
+                "invalid_request_error",
+                "text content blocks must be non-empty"
+            )),
+            "empty_text_block"
+        );
+        assert_eq!(
+            error_kind(&f(Some(404), "not_found_error", "model: claude-nope")),
+            "model_not_found"
+        );
+        assert_eq!(error_kind(&f(Some(400), "invalid_request_error", "whatever")), "client_error");
+        assert_eq!(error_kind(&f(None, "", "connection reset")), "connection_error");
+        assert_eq!(api_request_error_code(&f(Some(429), "", "")), "api_request_retry_exhausted");
+        assert_eq!(api_request_error_code(&f(Some(500), "", "")), "api_request_retry_exhausted");
+        assert_eq!(api_request_error_code(&f(None, "", "")), "api_request_retry_exhausted");
+        assert_eq!(api_request_error_code(&f(Some(400), "", "")), "api_request_non_retryable");
+    }
+
+    /// `active_time.total{type:user}` 是**打字时长**，与 API 花了多久无关：估算
+    /// `0.8 + 0.1 × 字数`，再按「上一次提交到这次提交」的窗口截断。
+    ///
+    /// 三份抓包（`cap/2.1.260-2`）的实测值：2 字 → 0.878、2 字 → 1.118、
+    /// 3 字 + 20 字 → 3.988。这里复现第三份那个两轮会话。
+    #[test]
+    fn user_active_time_tracks_the_typed_length() {
+        let t = Telemetry::default();
+        let prompt = |text: &str| {
+            let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+            v["messages"] = json!([{"role":"user","content":[{"type":"text","text":text}]}]);
+            serde_json::to_vec(&v).unwrap()
+        };
+        // 第一轮：3 个字（`hii`），窗口是进程起点到提交那 3.085s → 0.8 + 0.3 = 1.1。
+        let mut first = call(prompt("hii"), "req_1", "end_turn");
+        first.started_at = SystemTime::now() - Duration::from_millis(9_800);
+        first.total_ms = 3_779;
+        t.ingest(first);
+        // 第二轮：20 个字，两次提交相隔 6.06s，估算 0.8 + 2.0 = 2.8 < 6.06，取估算值。
+        let mut second = call(prompt("hilele what can u do"), "req_2", "end_turn");
+        second.started_at = SystemTime::now() - Duration::from_millis(9_800 - 6_060);
+        second.total_ms = 6_338;
+        t.ingest(second);
+
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let m = metrics_body(&p.metrics, "2.1.260", "team", None);
+        let active = m["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "claude_code.active_time.total")
+            .unwrap()["data_points"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let by_type = |ty: &str| {
+            active.iter().find(|d| d["attributes"]["type"] == ty).unwrap()["value"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!((by_type("user") - 3.9).abs() < 0.05, "{}", by_type("user"));
+        // cli 仍是两条 end_turn 的时长之和（抓包 10.053）。
+        assert!((by_type("cli") - 10.117).abs() < 0.05, "{}", by_type("cli"));
+    }
+
+    /// 用户输入窗口比估算值短时按窗口截断：粘一大段再立刻回车，打字时长不可能超过
+    /// 「上次提交到这次提交」那段真实时间。
+    #[test]
+    fn user_active_time_is_capped_by_the_window() {
+        let t = Telemetry::default();
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["messages"] = json!([{"role":"user","content":[{"type":"text","text":"x".repeat(500)}]}]);
+        let mut c = call(serde_json::to_vec(&v).unwrap(), "req_paste", "end_turn");
+        c.started_at = SystemTime::now() - Duration::from_secs(5);
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        // 估算 0.8 + 50 = 50.8s，但会话起点只比提交早 3.1s。
+        assert!((p.metrics[0].user_secs - 3.085).abs() < 0.05, "{}", p.metrics[0].user_secs);
+    }
+
     #[test]
     fn dd_model_drops_the_date_suffix() {
         assert_eq!(dd_model_short("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
@@ -3635,12 +4754,50 @@ mod tests {
         assert_eq!(version_from_ua("curl/8.0"), config::CC_VERSION_BASE);
     }
 
+    /// Datadog 那份日志与 event_logging 是**同一套阶段规则**：启动早期两项都没有，界面起来
+    /// 后只有 `renderer_mode`，用户提交后才多 `prompt_id`。
+    ///
+    /// 依据 `cap/2.1.260-2/00017` 一批 80 条：59 条两项皆无（`tengu_started`/`tengu_init`/
+    /// `tengu_timer`/大部分 `tengu_feature_ok`）、7 条只有 `renderer_mode`、16 条两者都有。
+    /// 原先这两项无条件写，于是每个会话有近六十条启动日志带着「界面模式」和一个当时还不
+    /// 存在的 prompt id。
+    #[test]
+    fn datadog_entries_follow_the_same_metadata_stages() {
+        let id = identity();
+        let ctx = EventCtx { model: "claude-opus-5", betas: "a", prompt_id: "p", uptime_secs: 1.0 };
+        let at = |stage| id.dd_entry_at(stage, "tengu_started", &ctx, "claude-opus-5", json!({}));
+
+        let early = at(super::MetaStage::Startup);
+        assert_eq!(early["renderer_mode"], Value::Null, "启动早期没有界面");
+        assert_eq!(early["prompt_id"], Value::Null, "也还没有用户输入");
+        assert_eq!(early["session_id"], id.session_id, "别的公共字段照旧");
+
+        let mid = at(super::MetaStage::Renderer);
+        assert_eq!(mid["renderer_mode"], "default");
+        assert_eq!(mid["prompt_id"], Value::Null, "界面起来了但还没提交");
+
+        let late = at(super::MetaStage::Prompt);
+        assert_eq!(late["renderer_mode"], "default");
+        assert_eq!(late["prompt_id"], "p");
+    }
+
     #[test]
     fn metadata_is_standard_base64_with_padding() {
         let id = identity();
-        let b64 = id.metadata_b64("p", json!({"feature_name":"notification_show"}));
-        let decoded = STANDARD.decode(&b64).expect("standard base64");
-        let v: Value = serde_json::from_slice(&decoded).unwrap();
+        let at = |stage| {
+            let b64 = id.metadata_b64_at(stage, "p", json!({"feature_name":"notification_show"}));
+            let decoded = STANDARD.decode(&b64).expect("standard base64");
+            (b64, serde_json::from_slice::<Value>(&decoded).unwrap())
+        };
+        // 三个阶段各写几项，见 [`super::MetaStage`]。
+        let (_, early) = at(super::MetaStage::Startup);
+        assert_eq!(early["renderer_mode"], Value::Null, "启动早期没有界面");
+        assert_eq!(early["cc_prompt_id"], Value::Null, "也还没有用户输入");
+        assert_eq!(early["subscription_type"], "team");
+        let (_, mid) = at(super::MetaStage::Renderer);
+        assert_eq!(mid["renderer_mode"], "default");
+        assert_eq!(mid["cc_prompt_id"], Value::Null, "界面起来了但还没提交");
+        let (b64, v) = at(super::MetaStage::Prompt);
         assert_eq!(v["renderer_mode"], "default");
         assert_eq!(v["subscription_type"], "team");
         assert_eq!(v["cc_prompt_id"], "p");
@@ -3715,7 +4872,7 @@ mod tests {
     fn full_chain_for_a_main_thread_call_and_continuation() {
         let t = Telemetry::default();
         t.ingest(call(cc_body(true), "req_1", "tool_use"));
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = st.pending.get(&key()).expect("queued under the credential + session");
         let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
         assert!(names.contains(&"tengu_api_query"));
@@ -3748,10 +4905,29 @@ mod tests {
         assert_eq!(success.1["event_data"]["model"], "claude-opus-5");
         let query = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_query").unwrap();
         assert_eq!(query.1["event_data"]["model"], "claude-opus-5[1m]");
+        // API 事件（query/success）报的是**这条请求的完整 beta 串**，含 `effort` 这种
+        // 只在请求头上出现的项；界面事件（turn_end 等）报会话级那份，见
+        // [`super::Identity::event`]。`cap/2.1.260-2/00016` 同一批里两者取值不同。
+        const FULL: &str = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+             interleaved-thinking-2025-05-14,effort-2025-11-24";
+        // 会话级那份**始终带 `redact-thinking`**，哪怕请求头里没有——见 [`super::session_betas`]。
+        const SESSION: &str = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12";
+        assert_eq!(success.1["event_data"]["betas"], FULL, "api_success 报完整串");
+        assert_eq!(query.1["event_data"]["betas"], FULL, "api_query 也报完整串");
+        let other = p
+            .events
+            .iter()
+            .find(|(_, e)| !matches!(ev_name(e), "tengu_api_query" | "tengu_api_success"))
+            .expect("这一批里总有别的事件");
         assert_eq!(
-            success.1["event_data"]["betas"],
-            "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+            other.1["event_data"]["betas"],
+            SESSION,
+            "非 API 事件（{}）报会话级那份",
+            ev_name(&other.1)
         );
+        let dd_success = p.dd.iter().find(|d| d["message"] == "tengu_api_success").unwrap();
+        assert_eq!(dd_success["betas"], FULL, "Datadog 的 api_success 同样是完整串");
         assert_eq!(
             success.1["event_data"]["auth"]["organization_uuid"],
             "09520b85-f6b6-432f-97e2-6ecb804a083f"
@@ -3764,7 +4940,7 @@ mod tests {
         let mut second = call(cc_body(false), "req_2", "end_turn");
         second.started_at = SystemTime::now();
         t.ingest(second);
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let p = st.pending.get(&key()).unwrap();
         let success2 = p
             .events
@@ -3804,7 +4980,7 @@ mod tests {
         body["tools"] = json!([]);
         let t = Telemetry::default();
         t.ingest(call(body.to_string().into_bytes(), "req_h", "end_turn"));
-        let st = t.0.lock();
+        let st = t.0.state.lock();
         let names: Vec<String> =
             st.pending[&key()].events.iter().map(|(_, e)| ev_name(e).to_string()).collect();
         assert!(!names.iter().any(|n| n == "tengu_turn_end"));
@@ -3829,7 +5005,7 @@ mod tests {
         let mut c = call(body.to_string().into_bytes(), "req_x", "end_turn");
         c.session_header = Some("s".into());
         t.ingest(c);
-        assert!(t.0.lock().pending.is_empty(), "没有 device_id 就不报");
+        assert!(t.0.state.lock().pending.is_empty(), "没有 device_id 就不报");
     }
 
     #[test]

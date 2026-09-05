@@ -174,14 +174,14 @@ export function ForwardingSettingsContent() {
           k="api_telemetry"
           label={t('逐请求遥测', 'Per-request telemetry')}
           summary={t(
-            '替每条转发成功的请求上报官方客户端会发的那串遥测：事件链、Datadog 日志、用量指标。',
-            'Report the telemetry the official client sends for every successful request: the event chain, Datadog logs, and usage metrics.',
+            '替每条转发出去的请求上报官方客户端会发的那串遥测：事件链、Datadog 日志、用量指标；失败的请求报错误事件。',
+            'Report the telemetry the official client sends for every forwarded request: the event chain, Datadog logs, and usage metrics — with an error event for the ones that fail.',
           )}
           description={
             <>
               {t(
-                '官方客户端每发一条请求都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一串事件（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。此前 luban 只有每 30 分钟一次的保活遥测，上游看到的是「有大量 API 用量、遥测里却一条 API 调用都没有」。开启后按 2.1.258 抓包的字段与节奏（事件 30 秒、日志 10 秒、指标 5 分钟攒批）替每张账号补上，身份取实际发往上游的那份，与请求两侧一致。关闭即只剩保活遥测。',
-                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Until now luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.258 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Turn it off to keep only the keepalive telemetry.',
+                '官方客户端每发一条请求都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一串事件（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。此前 luban 只有每 30 分钟一次的保活遥测，上游看到的是「有大量 API 用量、遥测里却一条 API 调用都没有」。开启后按 2.1.260 抓包的字段与节奏（事件 30 秒、日志 10 秒、指标 5 分钟攒批）替每张账号补上，身份取实际发往上游的那份，与请求两侧一致。失败的请求同样上报——官方客户端对它们发的是 tengu_api_error 加 tengu_feature_bad，只报成功那些一样是个可对照出来的差异。关闭即只剩保活遥测。',
+                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Until now luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.260 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Failed requests are reported too — the official client sends tengu_api_error plus tengu_feature_bad for those, so reporting only the successes is itself a detectable discrepancy. Turn it off to keep only the keepalive telemetry.',
               )}
             </>
           }
@@ -493,6 +493,22 @@ export function ForwardingSettingsContent() {
               {t(
                 '经 litellm、one-api、claude-code-router 等从 OpenAI 格式转过来的请求，到这里已是 Anthropic 形态，只能靠残留识别：messages 里的 role:"system" / "tool"、消息上的 name / tool_calls、call_ 前缀的工具调用 id、字串形态或 type:"function" 的 tool_choice、OpenAI function 形态的 tools、n / stop / user / response_format 等 OpenAI 专属顶层字段、image_url 等 OpenAI 内容块。命中任一即本地 400，错误消息指出位置与 Anthropic 的对应写法。关掉后退回下面的 System Role 提升等修补路径。不影响模拟路径：它只接管本来就是 Anthropic 形态的非 CC 请求。',
                 'Requests converted from the OpenAI format by litellm, one-api, claude-code-router and the like arrive already in Anthropic shape; the only way to tell is the residue they leave: role:"system" / "tool" in messages, name / tool_calls on a message, tool call ids prefixed call_, a string or type:"function" tool_choice, tools in the OpenAI function shape, OpenAI-only top-level fields such as n / stop / user / response_format, and OpenAI content blocks such as image_url. Any hit is rejected locally with 400 and a message naming the location and the Anthropic equivalent. Turn it off to fall back to the repair paths below (system role hoisting etc.). The simulation path is unaffected: it only takes over non-CC requests that are already in Anthropic shape.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="reject_session_conflict"
+          label={t('拒绝会话 id 冲突', 'Reject session id conflicts')}
+          summary={t(
+            '请求头与 metadata 里的会话 id 不一致时本地直接 400，不替客户端挑一个。',
+            'When the session id in the header and in metadata disagree, reject locally with 400 instead of picking one.',
+          )}
+          description={
+            <>
+              {t(
+                '官方 Claude Code 在 X-Claude-Code-Session-Id 与 metadata.user_id 两处发的是同一个值，逐字相同。两处给出两个都合法却不同的 UUID，是官方从不产生的形态；而 luban 用会话 id 作为会话链（cc_prompt_id / cc_prev_req / diagnostics.previous_message_id）的键，挑错一个就把两条链接到了一起，事后再也看不出来。开启后这类请求本地 400，错误消息里列出两个值。关掉后退回「取请求头那个 + 记一条 warn 日志」。只有一处合法时不算冲突——那是客户端只给对了一个，照常取合法的那个。',
+                'Official Claude Code sends the same value in X-Claude-Code-Session-Id and in metadata.user_id, byte for byte. Two different but individually valid UUIDs is a shape the official client never produces, and luban keys the session chain (cc_prompt_id / cc_prev_req / diagnostics.previous_message_id) on the session id — picking the wrong one splices two chains together with no way to notice afterwards. When enabled such requests are rejected locally with 400, naming both values. Turn it off to fall back to using the header value and logging a warning. If only one of the two is a valid UUID it is not a conflict: the client simply got one of them right, and that one is used.',
               )}
             </>
           }

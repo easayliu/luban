@@ -16,7 +16,7 @@ use crate::credentials::Credential;
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
-     rpm_limit";
+     rpm_limit, rate_limit_tier";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -589,6 +589,10 @@ pub struct PortableCredential {
     pub tier: Option<String>,
     #[serde(default)]
     pub org_type: Option<String>,
+    /// 额度档原值（`default_claude_max_5x`）；statsig eval 的 `rateLimitTier` 要它。
+    /// 不带上的话，迁移后到下一次成功拉 profile 之前，那个字段会一直缺着。
+    #[serde(default)]
+    pub rate_limit_tier: Option<String>,
     pub access_token: String,
     pub refresh_token: String,
     #[serde(default)]
@@ -617,6 +621,7 @@ impl From<&Credential> for PortableCredential {
             label: c.label.clone(),
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
+            rate_limit_tier: c.rate_limit_tier.clone(),
             access_token: c.access_token.clone(),
             refresh_token: c.refresh_token.clone(),
             expires_at: c.expires_at,
@@ -895,6 +900,7 @@ impl CredentialStore {
                          refresh_token = ?6, expires_at = ?7, priority = ?8, disabled = ?9,
                          device_limit = ?10, rpm_limit = ?11, ban_reason = ?12,
                          account_uuid = ?13, resume_at = ?14, proxy = ?15,
+                         rate_limit_tier = ?16,
                          updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
@@ -913,6 +919,7 @@ impl CredentialStore {
                         uuid,
                         c.resume_at.map(|t| t as i64),
                         proxy,
+                        c.rate_limit_tier,
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -923,8 +930,8 @@ impl CredentialStore {
                     "INSERT INTO credentials
                          (label, tier, org_type, access_token, refresh_token, expires_at,
                           priority, disabled, device_limit, rpm_limit, ban_reason,
-                          account_uuid, resume_at, proxy)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                          account_uuid, resume_at, proxy, rate_limit_tier)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         c.label,
                         c.tier,
@@ -940,6 +947,7 @@ impl CredentialStore {
                         uuid,
                         c.resume_at.map(|t| t as i64),
                         proxy,
+                        c.rate_limit_tier,
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -1714,6 +1722,15 @@ impl CredentialStore {
         )? > 0)
     }
 
+    /// 写回额度档原值（`default_claude_max_5x` 之类）。
+    /// 见 [`crate::credentials::Credential::rate_limit_tier`]。
+    pub fn set_rate_limit_tier(&self, id: i64, raw: Option<&str>) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE credentials SET rate_limit_tier = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, raw],
+        )? > 0)
+    }
+
     /// 写回账号等级。**等级变了就把它的模型准入记录全清掉**：那些记录是在旧套餐下学到的
     /// （Pro 号不含 fable），升级到 Max 后再留着就等于把新买的额度锁在门外。
     pub fn set_tier(&self, id: i64, tier: Option<&str>) -> Result<bool> {
@@ -2095,6 +2112,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_OPENAI_SHAPE) {
             flags.reject_openai_shape = v;
         }
+        if let Some(v) = on(REJECT_SESSION_CONFLICT) {
+            flags.reject_session_conflict = v;
+        }
         if let Some(v) = on(API_TELEMETRY) {
             flags.api_telemetry = v;
         }
@@ -2322,6 +2342,14 @@ pub const HOIST_SYSTEM_ROLE: &str = "hoist_system_role";
 /// 字段等一律 400，不修补不转发。关掉后退回 `hoist_system_role` 等修补路径。
 pub const REJECT_OPENAI_SHAPE: &str = "reject_openai_shape";
 
+/// 来访的会话 id 在**头与体两处不一致**时是否本地拒绝的 settings 键名。缺省视为开启。
+///
+/// 官方 CC 的 `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里那个 `session_id`
+/// **逐字相同**；两处给出两个不同的合法 uuid，是官方从不产生的形态。开着即 400 挡在门口
+/// （连带避免「按哪一个建会话链」这个没有正确答案的问题）；关掉则取头那个并打一条 warn。
+/// 见 [`ForwardFlags::reject_session_conflict`]。
+pub const REJECT_SESSION_CONFLICT: &str = "reject_session_conflict";
+
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
 /// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
 pub const API_TELEMETRY: &str = "api_telemetry";
@@ -2538,10 +2566,21 @@ pub struct ForwardFlags {
     /// 开着时 `hoist_system_role` 对这类请求不再有机会生效（入口就拒了）；关掉才退回修补。
     /// 模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
     pub reject_openai_shape: bool,
+    /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
+    ///
+    /// 官方两处逐字相同，不同值说明来访自己就不自洽——而 luban 拿会话 id 当会话链
+    /// （`cc_prompt_id` / `cc_prev_req` / `diagnostics`）的键，选错一个就是把两条链
+    /// 接到了一起。默认开：宁可让客户端修好自己的形态，也不猜。
+    ///
+    /// 关掉后退回「取头那个 + 打一条 warn」。见 [`crate::proxy::session_id_conflict`]。
+    pub reject_session_conflict: bool,
     /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
     /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
     /// 逐项 token 与花费）、Datadog 日志、OTel 指标，身份取实际发往上游的那份，节奏照
     /// 抓包（30s / 10s / 5min 攒批）。见 [`crate::telemetry`]。
+    ///
+    /// 失败的请求走另一条收尾（`tengu_api_error` + `tengu_feature_bad{api_request}` +
+    /// `terminal_reason: "api_error"` 的 `tengu_turn_end`），与官方一致。
     ///
     /// 关掉即只剩 [`crate::oauth`] 的保活遥测——上游那边这个账号就成了「有大量 API 用量、
     /// 遥测里却一条 API 调用都没有」的形态。
@@ -2581,6 +2620,7 @@ impl Default for ForwardFlags {
             strip_empty_text: true,
             hoist_system_role: true,
             reject_openai_shape: true,
+            reject_session_conflict: true,
             api_telemetry: true,
             keepalive_telemetry: true,
         }
@@ -4257,6 +4297,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 兼容旧库：新增列时若已存在会报 duplicate column，忽略即可（幂等）。
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN tier TEXT", []);
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_type TEXT", []);
+    // 额度档原值（profile.organization.rate_limit_tier）；statsig eval 的 `rateLimitTier`
+    // 要发它，界面上那个 `Max 5x` 是它的展示形态、顶替不了。旧库为空，下次拉 profile 回填。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN rate_limit_tier TEXT", []);
     let _ = conn
         .execute("ALTER TABLE credentials ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0", []);
     // 自动检测到的上游账号级错误原因（如封号）；NULL 表示未被自动停用，
@@ -4472,6 +4515,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         org_type: row.get(14)?,
         proxy: row.get(15)?,
         rpm_limit: row.get(16)?,
+        rate_limit_tier: row.get(17)?,
     })
 }
 
@@ -5874,6 +5918,7 @@ mod tests {
             label: "acct".into(),
             tier: Some("max".into()),
             org_type: None,
+            rate_limit_tier: None,
             access_token: "at-1".into(),
             refresh_token: "rt-1".into(),
             expires_at: 100,
@@ -5958,6 +6003,7 @@ mod tests {
             label: "full".into(),
             tier: Some("pro".into()),
             org_type: Some("claude_team".into()),
+            rate_limit_tier: Some("default_claude_max_5x".into()),
             access_token: "at".into(),
             refresh_token: "rt".into(),
             expires_at: 1_800_000_000,
@@ -5980,6 +6026,9 @@ mod tests {
         assert_eq!(back.label, full.label);
         assert_eq!(back.tier, full.tier);
         assert_eq!(back.org_type, full.org_type);
+        // 额度档原值也要跟着走：迁移后到下一次成功拉 profile 之前，statsig eval 的
+        // `rateLimitTier` 全靠它。
+        assert_eq!(back.rate_limit_tier, full.rate_limit_tier);
         assert_eq!(back.access_token, full.access_token);
         assert_eq!(back.refresh_token, full.refresh_token);
         assert_eq!(back.expires_at, full.expires_at);
@@ -7799,6 +7848,7 @@ mod tests {
             (STRIP_EMPTY_TEXT, "0"),
             (HOIST_SYSTEM_ROLE, "0"),
             (REJECT_OPENAI_SHAPE, "0"),
+            (REJECT_SESSION_CONFLICT, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
         ] {
@@ -7831,6 +7881,7 @@ mod tests {
                 strip_empty_text: false,
                 hoist_system_role: false,
                 reject_openai_shape: false,
+                reject_session_conflict: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
             }

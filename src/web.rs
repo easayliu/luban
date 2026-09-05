@@ -247,8 +247,17 @@ pub async fn run(
                         (oauth::KeepaliveResult::Ok, true)
                     };
 
+                    // 这个号刚因为一个新会话跑过完整的启动握手（见
+                    // [`crate::proxy::spawn_session_handshake`]）就别再发一遍：那一串已经
+                    // 把 bootstrap / penguin / policy_limits / settings 全打过了，保活再来
+                    // 一次，上游看到的是同一个账号几秒内把同一批端点打了两遍。
+                    let just_handshook = oauth::handshake_recent(
+                        cred.id,
+                        std::time::Duration::from_secs(crate::config::KEEPALIVE_INTERVAL_SECS),
+                    );
+
                     // --- 首 tick：启动握手 ---
-                    let (boot_ok, peng_ok) = if is_first {
+                    let (boot_ok, peng_ok) = if is_first && !just_handshook {
                         let bo = oauth::keepalive_bootstrap(
                             &http,
                             &access_token,
@@ -268,17 +277,22 @@ pub async fn run(
                     };
 
                     // --- 每 6h：eval（画像也算遥测，跟同一个开关） ---
-                    let eval_ok = if is_eval && send_telemetry {
+                    // 同 policy/settings：刚因为新会话握过手的号跳过——那一串里已经发过
+                    // 一次 eval，30 秒后的首个 tick 再发一次就是同一分钟内两条。
+                    let eval_ok = if is_eval && send_telemetry && !just_handshook {
                         oauth::keepalive_eval(&http, &access_token, &ctx).await
                     } else {
                         oauth::KeepaliveResult::Ok
                     };
 
                     // --- 每 1h ---
-                    let (pl_ok, st_ok) = if is_hourly || is_first {
-                        let pl = oauth::keepalive_policy_limits(&http, &access_token, &ctx).await;
-                        let st = oauth::keepalive_settings(&http, &access_token, &ctx).await;
-                        (pl, st)
+                    // 官方这两条是同时发的（`cap/2.1.260-2` 的 00001/00002 相差 1ms），
+                    // 一前一后 await 出来的间隔是 luban 自己造的。
+                    let (pl_ok, st_ok) = if (is_hourly || is_first) && !just_handshook {
+                        tokio::join!(
+                            oauth::keepalive_policy_limits(&http, &access_token, &ctx),
+                            oauth::keepalive_settings(&http, &access_token, &ctx),
+                        )
                     } else {
                         (oauth::KeepaliveResult::Ok, oauth::KeepaliveResult::Ok)
                     };
@@ -601,6 +615,13 @@ async fn exchange(
             profile.org_type.as_deref(),
         )
         .map_err(internal)?;
+
+    // 额度档原值不在 `insert` 的参数里（那串已经够长了），入库后单独写一次。
+    if profile.rate_limit_tier.is_some()
+        && let Err(e) = state.store.set_rate_limit_tier(cred.id, profile.rate_limit_tier.as_deref())
+    {
+        tracing::warn!(cred_id = cred.id, error = %e, "failed to store the rate limit tier");
+    }
 
     // 登录时带了代理的，入库后顺手存上——后续刷新、转发自动走它，不用再手动配一次。
     // 凭证已入库，代理存不进去时不回滚凭证（手动配一次也行），但必须如实报错让人知道。
@@ -1117,6 +1138,13 @@ async fn refresh_credential(
                 && let Err(e) = state.store.set_org_type(id, profile.org_type.as_deref())
             {
                 tracing::warn!(cred_id = id, error = %e, "failed to write back the organization type (the refresh itself succeeded)");
+            }
+            // 额度档原值：statsig eval 的 `rateLimitTier` 要它，同样只有刷新才补得上。
+            if profile.rate_limit_tier.is_some()
+                && let Err(e) =
+                    state.store.set_rate_limit_tier(id, profile.rate_limit_tier.as_deref())
+            {
+                tracing::warn!(cred_id = id, error = %e, "failed to write back the rate limit tier (the refresh itself succeeded)");
             }
         }
         Err(e) => {
@@ -1712,6 +1740,8 @@ struct ForwardingResp {
     hoist_system_role: bool,
     /// 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。
     reject_openai_shape: bool,
+    /// 会话 id 头体不一致时本地拒绝，不替客户端选一个。
+    reject_session_conflict: bool,
     /// 替每条转发的 `/v1/messages` 上报官方客户端形态的遥测。
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
@@ -1744,6 +1774,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             strip_empty_text: f.strip_empty_text,
             hoist_system_role: f.hoist_system_role,
             reject_openai_shape: f.reject_openai_shape,
+            reject_session_conflict: f.reject_session_conflict,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
         }
@@ -2331,6 +2362,7 @@ struct SetForwardingReq {
     strip_empty_text: Option<bool>,
     hoist_system_role: Option<bool>,
     reject_openai_shape: Option<bool>,
+    reject_session_conflict: Option<bool>,
     api_telemetry: Option<bool>,
     keepalive_telemetry: Option<bool>,
 }
@@ -2345,10 +2377,10 @@ async fn set_forwarding(
     use crate::store::{
         API_TELEMETRY, FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
         INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, SIMULATE_CC, SPOOF_BILLING_CCH,
-        SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS,
-        SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY,
-        THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_SESSION_CONFLICT,
+        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
+        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2374,6 +2406,7 @@ async fn set_forwarding(
         (STRIP_EMPTY_TEXT, req.strip_empty_text),
         (HOIST_SYSTEM_ROLE, req.hoist_system_role),
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
+        (REJECT_SESSION_CONFLICT, req.reject_session_conflict),
         (API_TELEMETRY, req.api_telemetry),
         (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
     ];
