@@ -91,6 +91,8 @@ export interface Settings {
   reject_openai_shape: boolean
   /** 会话 id 在请求头与 metadata 两处不一致时本地拒绝，不替客户端选一个。 */
   reject_session_conflict: boolean
+  /** 本地拒绝探针 / 探活类请求（403），不转发。 */
+  reject_probes: boolean
   /** 替每条转发的 /v1/messages 上报官方客户端形态的遥测（事件链、Datadog 日志、OTel 指标）。 */
   api_telemetry: boolean
   /** 保活循环里的空闲遥测（版本检查事件 + Datadog 日志 + GrowthBook 画像）。 */
@@ -127,6 +129,7 @@ export type ForwardingKey =
   | 'hoist_system_role'
   | 'reject_openai_shape'
   | 'reject_session_conflict'
+  | 'reject_probes'
   | 'api_telemetry'
   | 'keepalive_telemetry'
 

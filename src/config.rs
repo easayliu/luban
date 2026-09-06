@@ -280,6 +280,12 @@ pub const CC_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official 
 pub const CC_SYSTEM_IDENTITY_PREFIX: &str =
     "You are Claude Code, Anthropic's official CLI for Claude";
 
+/// 官方**子代理**（SDK 子代理、Helper）`system[1]` 那句身份声明，逐字取自
+/// `cap/2.1.260/00020`、`00024`、`00027`——三份完全相同。子代理不写 [`CC_SYSTEM_IDENTITY`]，
+/// 写的是这句。供 `proxy::is_official_helper_request` 认官方 Helper 用。
+pub const CC_SDK_AGENT_IDENTITY: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
 /// `system[0]` 那条 billing header 里的 `cc_version` 的**主版本**，形如 `2.1.260`。
 ///
 /// 完整 `cc_version`（如 `2.1.260.222`）的第四段：模拟路径按 profile 取

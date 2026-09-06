@@ -498,6 +498,22 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="reject_probes"
+          label={t('拒绝探针请求', 'Reject probe requests')}
+          summary={t(
+            '下游中转拿账号做探活/测活的那类请求本地直接 403，不到上游。',
+            'Health-check / channel-test requests that downstream relays send to probe the account are rejected locally with 403 and never reach upstream.',
+          )}
+          description={
+            <>
+              {t(
+                '探活脚本借 Claude Code 的 UA 发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个一次性会话只问一句话」，是封号复盘里最显眼的判据。三条强特征，命中任一即拒，只对自报 claude-cli UA 的请求生效：带 system、没有 tools、只有一条消息、max_tokens 在 2 到 16 之间；带 system、没有 tools、只有一条消息、不是官方那两种无 tools 形态，且来自一台从没见过的设备；system 里的 CC 身份句出现在不止一块里。「没有 tools」按值算，缺失、null、[] 都是没有，加空字段绕不过。官方 Claude Code 的三种无 tools 请求（cache 预热、haiku Helper、安全分类）按取值逐项对、都在判据之外。身份字段写错的（device_id 不是 64 位 hex、session_id 不是 UUID，如 channel-test）不算探针、不在这里拒，而是不当官方客户端、走模拟路径重建身份。只看形态、一条就判，不做计数。边界：把官方 haiku Helper 的取值逐字抄全的探针，形态上就是官方请求，这里分不出来。',
+                "Probe scripts borrow the Claude Code UA to send a single tool-less one-liner; upstream sees each one as \"a device opening a throwaway session to ask one question\", the most conspicuous pattern in the ban post-mortem. Three strong signatures, any one of which rejects, applied only to requests claiming a claude-cli UA: a system prompt with no tools, a single message and max_tokens between 2 and 16; a system prompt with no tools, a single message, not one of the two official tool-less shapes, and a never-seen device; the Claude Code identity sentence in more than one system block. \"No tools\" is judged by value: missing, null and [] all count, so padding with empty fields does not help. The three tool-less shapes official Claude Code does send (cache prewarm, the haiku helper, the security classifier) are matched value by value and fall outside all three. Malformed identities (a device_id that is not 64-hex, a session_id that is not a UUID, e.g. channel-test) are not probes and are not rejected here; they are simply not treated as an official client and go through the simulation path, which rebuilds the identity. Shape only, decided per request, no counting. Limit: a probe that copies the official haiku helper's values verbatim is, by shape, an official request and cannot be told apart here.",
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="reject_session_conflict"
           label={t('拒绝会话 id 冲突', 'Reject session id conflicts')}
           summary={t(

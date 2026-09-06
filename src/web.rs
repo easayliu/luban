@@ -1775,6 +1775,8 @@ struct ForwardingResp {
     reject_openai_shape: bool,
     /// 会话 id 头体不一致时本地拒绝，不替客户端选一个。
     reject_session_conflict: bool,
+    /// 本地拒绝探针 / 探活类请求（403），不转发。
+    reject_probes: bool,
     /// 替每条转发的 `/v1/messages` 上报官方客户端形态的遥测。
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
@@ -1808,6 +1810,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             hoist_system_role: f.hoist_system_role,
             reject_openai_shape: f.reject_openai_shape,
             reject_session_conflict: f.reject_session_conflict,
+            reject_probes: f.reject_probes,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
         }
@@ -2469,6 +2472,7 @@ struct SetForwardingReq {
     hoist_system_role: Option<bool>,
     reject_openai_shape: Option<bool>,
     reject_session_conflict: Option<bool>,
+    reject_probes: Option<bool>,
     api_telemetry: Option<bool>,
     keepalive_telemetry: Option<bool>,
 }
@@ -2483,10 +2487,11 @@ async fn set_forwarding(
     use crate::store::{
         API_TELEMETRY, FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
         INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_SESSION_CONFLICT,
-        SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
-        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
-        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_PROBES,
+        REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
+        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
+        TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2513,6 +2518,7 @@ async fn set_forwarding(
         (HOIST_SYSTEM_ROLE, req.hoist_system_role),
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
         (REJECT_SESSION_CONFLICT, req.reject_session_conflict),
+        (REJECT_PROBES, req.reject_probes),
         (API_TELEMETRY, req.api_telemetry),
         (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
     ];

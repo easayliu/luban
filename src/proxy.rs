@@ -485,21 +485,21 @@ async fn handle_inner(
     // 这里只为日志算它：走不走模拟由 [`Simulation::detect`] 自己判，但它返回 `None` 时
     // 分不出是「本来就是 CC」还是「开关关着」，而这正是排查时要知道的那一位。
     let cc_shaped = body_json.as_ref().is_some_and(is_cc_shaped);
-    // 来访是不是 Claude Code 客户端——**只看 UA**：`claude-cli/<版本>` 在才算。
-    // 带着正确 UA 来的就是官方客户端，默认不动它：模拟那条路会把这串 UA 连同
-    // `x-app`/`x-stainless-*` 一起换成 [`config::CC_SIM_HEADERS`] 里的定值，客户端自报的
-    // 版本被改成更旧的 [`config::CC_USER_AGENT`]，凭空造出一个版本倒退。
+    // 来访是不是 Claude Code 客户端——这一位**只看 UA**：`claude-cli/<版本>` 在才算。
+    // 它是 [`Simulation::detect`] 跳过模拟的必要条件之一，不是充分条件：还得体也是 CC 形态
+    // （上面的 `cc_shaped`）且工具列表像 CC。带着正确 UA 与形态来的就是官方客户端，不动它：
+    // 模拟那条路会把这串 UA 连同 `x-app`/`x-stainless-*` 一起换成 [`config::CC_SIM_HEADERS`]
+    // 里的定值。
     //
-    // `metadata.user_id` 和 `X-Claude-Code-Session-Id` **不再**单独构成跳过模拟的理由：
+    // `metadata.user_id` 和 `X-Claude-Code-Session-Id` **不**单独构成跳过模拟的理由：
     // 非 CC 的 UA（`Go-http-client`、`python-httpx`……）带着这些字段，只说明它抄了请求体
     // 或头，UA 不对齐照样是一条自相矛盾的请求，需要模拟接管。模拟路径下
     // [`rewrite_body`] 会先剥掉客户端已有的 `metadata.user_id`，再由
     // [`ensure_cc_metadata`] 用 `sim.session_id` 重建，确保头体自洽。
     //
-    // **UA 可以伪造，这是认它的代价**：照抄 `claude-cli/...` 的第三方中转从此不再被模拟，
-    // 它的 `system` 里若没有那句身份声明，上游会按第三方应用拒。要让这类客户端继续用上
-    // 订阅额度，只能让它别再冒充官方 UA（改回自己的 UA 即可重新走模拟），或者自己把那句
-    // 身份声明加进 `system`。这是取舍后的选择：宁可让冒充者暴露，也不对真官方客户端动手脚。
+    // **UA 可以伪造**，所以只认 UA 不够：照抄 `claude-cli/...` 却没抄 system 形态的第三方
+    // 中转（封号复盘里的探活脚本就是），透传出去是一条头体矛盾的请求，比模拟更容易被上游
+    // 标记——这类请求由 [`Simulation::detect`] 按形态识出来、一并走模拟接管。
     //
     // **自报的版本还得说得通**：不高于官方已发布的最新版（[`known_latest_release`]，从
     // `downloads.claude.ai/claude-code-releases/latest` 学来）。一个自称 `claude-cli/2.5.0`
@@ -682,6 +682,38 @@ async fn handle_inner(
                  (disable reject_session_conflict to fall back to the header)"
             ),
         );
+    }
+
+    // 2.3a3) 探针类请求 → 本地直接拒（403），不到上游，见 [`probe_signature`]。身份写错的
+    //        不在这里拒，由 [`Simulation::detect`] 送进模拟重建身份。
+    //        下游中转的探活脚本借 CC 的 UA 发一条无 tools 的单句小请求，每条在上游侧都是
+    //        「一台设备开一个一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与
+    //        身份上的强特征，一条就够判，不做计数。只判计费路径；`reject_probes` 关掉即放行。
+    if billable
+        && state.store.forward_flags().reject_probes
+        && let Some(kind) = probe_signature(
+            body_json.as_ref(),
+            from_cc_client,
+            device_id.as_deref(),
+            &inbound_beta_list(&headers),
+            || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
+        )
+    {
+        // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
+        // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。
+        let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
+        if let Some(suppressed) =
+            take_rejection_log_slot(&state.rejection_log, &format!("probe:{}:{who}", kind.tag()))
+        {
+            let device_short: String = who.chars().take(8).collect();
+            tracing::warn!(
+                %method, path = %path_and_query, ua = %client_ua,
+                model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
+                kind = kind.tag(), from_cc_client, suppressed,
+                "rejected locally: request matches a probe / health-check signature"
+            );
+        }
+        return error_response(StatusCode::FORBIDDEN, "permission_error", kind.message());
     }
 
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
@@ -5603,10 +5635,15 @@ struct Simulation {
 }
 
 impl Simulation {
-    /// 判定 + 派生一次做完。返回 `None` 的四种情形：开关关着、请求体不是我们能改的 JSON、
-    /// 来访已经是 CC 形态（[`is_cc_shaped`]）、来访是 Claude Code 客户端**且工具列表符合
-    /// CC 特征**（[`has_cc_tool_profile`]——含官方工具名，或没带 `tools`）。UA 自报 CC 但
-    /// 工具列表全是非官方名的请求会被视为第三方冒用，仍走模拟路径。
+    /// 判定 + 派生一次做完。返回 `None` 的三种情形：开关关着、请求体不是我们能改的 JSON、
+    /// 来访是 Claude Code 客户端**且体也是完整的 CC 形态**——身份格式合法
+    /// （[`cc_identity_well_formed`]），且要么是官方额度探测（[`is_quota_probe_shaped`]，官方
+    /// 唯一一条没有 system 的），要么 `system` 里带着身份声明或 billing header
+    /// （[`is_cc_shaped`]）、带着官方那段基座提示词（[`has_cc_base_prompt`]；`max_tokens=1` 的
+    /// 预热与官方 Helper 除外）、工具列表符合 CC 特征（[`has_cc_tool_profile`]——含官方工具名，
+    /// 或没带 `tools`）。
+    /// UA 自报 CC 但体不完整（缺那几样中的任一）、或工具列表全是非官方名的请求，都视为第三方
+    /// 冒用 CC UA，仍走模拟路径重塑成官方形态。
     ///
     /// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
     /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
@@ -5623,31 +5660,55 @@ impl Simulation {
             return None;
         }
         let v = body?;
-        // 来访是 Claude Code 客户端（UA 自报 `claude-cli/`、或带着 CC 才发的那两个记号），
-        // 说明它本来就是官方客户端的一支——VSCode 扩展、agent-sdk 之类，只是这条请求的
-        // `system` 里没那句身份声明。**这种请求不模拟**，两处代价都是实打实的：
+        // 真正的 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）**不模拟**：整套换头
+        // 会把它自报的 UA 与 `x-app`/`x-stainless-*` 换成抓包那台机器的取值，凭空造出一台
+        // 别的机器。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
         //
-        // - 整套换头会把它自报的 UA（如 `claude-cli/2.1.226 (external, claude-vscode,
-        //   agent-sdk/0.3.226)`）换成 [`config::CC_USER_AGENT`] 那串更旧的版本，凭空造出
-        //   一个版本倒退，而 `x-app`/`x-stainless-*` 也跟着换成抓包那台机器的取值；
-        // - 更硬的是 `session_id` 会**头体不一致**：体里那份 `user_id` 走
-        //   [`spoof_identity`] 定点改写、session 段保留客户端原值，头上却是
-        //   [`Self::session_id`] 派生的那个，而官方这两处逐字节相同（`cap/raw/00006`）。
-        //   [`ensure_cc_metadata`] 见到已有 `user_id` 就早退，补不上这道缝。
+        // 「真正的 CC 客户端」要 UA 与体两头都对得上。只对一头的两种都走模拟：
+        // - CC 形态（`system` 里有身份声明 / billing header）但 UA 不是 CC（`Go-http-client`、
+        //   `python-httpx`……）：抄了 system 却没配套改 UA，这种头体不一致比不模拟更容易被
+        //   上游标记，不如一并接管。[`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉
+        //   客户端已有的那份身份声明和 billing header，再由模拟统一补上官方的，避免重复；
+        // - UA 是 CC 但体不是 CC 形态：见下。
         //
-        // 代价记在这儿：这类请求的 `system` 里既然没有那句身份声明，上游有可能按第三方应用
-        // 拒（400）。那是它自己的形态问题，该由客户端修；替它换一身皮，换来的是一条更矛盾的
-        // 请求。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
-        //
-        // CC 形态（`system` 里有那句身份声明）的来访，只有同时也是真正的 CC 客户端才跳过：
-        // 非 CC 客户端（`Go-http-client`、`python-httpx`……）抄了 system 却没配套改 UA，
-        // 这种头体不一致比不模拟更容易被上游标记，不如一并接管。
-        // [`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉客户端已有的那份身份声明和
-        // billing header，再由模拟统一补上官方的，避免重复。
-        // UA 自报 CC 且工具列表看起来也像 CC（含官方工具名，或压根没带 tools）→ 跳过模拟。
-        // UA 自报 CC 但 tools 里一个官方名都没有 → 大概率第三方冒用 CC UA，跳过模拟只会
-        // 让工具全变成 `mcp__luban__*` 却拿不到模拟路径的整套头/system 配合，上游仍判第三方。
-        if from_cc_client && has_cc_tool_profile(v) {
+        // UA 自报 CC、体是 CC 形态、工具列表看起来也像 CC（含官方工具名，或压根没带 tools）
+        // → 跳过模拟。差任何一样都当第三方冒用 CC UA 处理，走模拟：
+        // - tools 里一个官方名都没有 → 跳过模拟只会让工具全变成 `mcp__luban__*` 却拿不到
+        //   模拟路径的整套头/system 配合，上游仍判第三方；
+        // - `system` 里既没有身份声明也没有 billing header → 真 CC（含 VSCode 扩展、
+        //   agent-sdk、子代理）每条请求都带 billing header 块，没有它的不是官方客户端发的。
+        //   封号复盘（`ban.log`）里那批探活请求正是这个样子：`claude-cli/2.1.220` 的 UA、
+        //   官方格式的 `metadata.user_id`，配一份 3 块、无 tools、55 token 的自造 system。
+        //   照抄了 UA 却没抄形态，透传出去就是一条头体矛盾的请求；模拟接管后 UA、头、
+        //   system 全套换成官方的，反而自洽。上面那段「不模拟真 CC」的两处代价对这类
+        //   请求已不成立：模拟 UA 取已知最新版（不会倒退），会话 id 优先沿用来访自己那个；
+        // - `system` 里有身份声明却**没有基座提示词**（[`has_cc_base_prompt`]）→ 官方只要写了
+        //   身份句就一定带基座（主请求 1.2KB–10KB，haiku 工具调用 3KB），只抄身份句不抄基座
+        //   的是去掉基座省 token 的第三方。`ban.log` 里 `claude-cli/2.1.165` 那批就是：billing
+        //   header + 身份句两块、`tools: []`、每台新设备跑同样四道题。透传出去是一条官方从不
+        //   发的形态；模拟接管后补上基座与官方工具，出去的才是完整的官方请求。唯一的例外是
+        //   `max_tokens=1` 的 cache 预热：2.1.187 Claude Desktop 的预热就带这两块 system，
+        //   给它补基座和工具只会把一条预热改成一条截到 1 token 的主请求，更假。
+        //   另一个例外是**官方 Helper 子代理**（[`is_official_helper_request`]）：它整个 system
+        //   只有 `[153, 62]` 两块、没有任何长块（`cap/2.1.260/00024`），按基座阈值判会把一条
+        //   官方请求送进模拟、给它接上一份主线程基座——那才是形态异常。例外按官方 Helper 的
+        //   形态逐项对（两块 system、子代理 billing header、SDK 身份句、haiku + `tools: []` +
+        //   `max_tokens=32000` + 流式），不是看到一个 `cc_is_subagent=true` 标记就放。带长
+        //   提示词的 SDK 子代理不需要这个例外，它过的是基座阈值。
+        //   身份格式也是一头：device 不是 64 位 hex、session 不是 uuid 的（[`cc_identity_well_formed`]）
+        //   同样不当官方客户端，走模拟让身份被重建——抄错的值不该到上游，但也不算探针，不拒。
+        //   官方**额度探测**（[`is_quota_probe_shaped`]：haiku、`max_tokens=1`、正文 `quota`、
+        //   **没有 system 也没有 tools**）过不了 `is_cc_shaped`，得单独放：它是官方形态里唯一
+        //   一条没有 system 的，装成主线程（补 system、基座、工具）正是既定要求里禁止的事。
+        //   这里曾经漏过一次——把「CC UA 且工具像 CC」收成「还得是 CC 形态」时忘了它。
+        let prewarm = request_max_tokens(Some(v)) == Some(1);
+        let official_shape = is_quota_probe_shaped(v)
+            || (is_cc_shaped(v)
+                && (prewarm
+                    || is_official_helper_request(v, &inbound_beta_list(headers))
+                    || has_cc_base_prompt(v))
+                && has_cc_tool_profile(v));
+        if from_cc_client && cc_identity_well_formed(headers, v) && official_shape {
             return None;
         }
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
@@ -5687,6 +5748,65 @@ fn is_cc_shaped(v: &serde_json::Value) -> bool {
     texts.iter().any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
         || texts.iter().any(|t| t.starts_with("x-anthropic-billing-header:"))
 }
+
+/// `system` 里是否带着官方那段基座提示词：任一块（或字符串形态的整段）长度不小于
+/// [`CC_BASE_PROMPT_MIN_LEN`]。官方带身份句的请求都带基座——opus 主线程 1214 字节、
+/// sonnet/haiku 主线程一万多、haiku 工具调用 3059（`cap/` 抓包）；只抄了 billing header 与
+/// 身份句、system 总共不到两百字节的，是去掉基座的第三方或探针。
+fn has_cc_base_prompt(v: &serde_json::Value) -> bool {
+    match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.len() >= CC_BASE_PROMPT_MIN_LEN),
+        Some(serde_json::Value::String(s)) => s.len() >= CC_BASE_PROMPT_MIN_LEN,
+        _ => false,
+    }
+}
+
+/// 这条请求是不是**官方 Helper 子代理**（`cap/2.1.260/00024`、`00027`）——官方唯一一种带
+/// billing header 却没有任何长块的形态，也是基座要求唯一的子代理例外。逐项对：
+///
+/// 1. `system` 恰好两块；
+/// 2. 第一块是 billing header 且带 `cc_is_subagent=true`；
+/// 3. 第二块**逐字**是 [`config::CC_SDK_AGENT_IDENTITY`]（子代理不写 CC 那句身份声明，写这句）；
+/// 4. 其余 body 取值与官方 Helper 一致（[`is_official_helper_shape`]：haiku 全名、`tools: []`、
+///    `thinking.type=disabled`、`max_tokens=32000`、流式）；
+/// 5. 来访 `anthropic-beta` 里带齐 Helper profile 的每一项 beta
+///    （[`config::CcProfileKind::HelperSubagentHaiku`]，[`has_profile_betas`]）。
+///
+/// 曾经只看第 2 条那个标记，于是任何请求在 billing header 里加一句 `cc_is_subagent=true` 就能
+/// 免掉基座要求、把一条并不完整的 CC 请求送去透传——已知设备或多轮消息还不命中探针判定。
+/// 后来补了 system 与 body，仍没看 beta 头：抄两块 system 加五个字段就够。现在三层都要对，
+/// 而三层都抄全了它就**是**一条官方 Helper。带长提示词的 SDK 子代理（`00020`，第三块 29465
+/// 字节）不走这里，它过的是基座阈值。
+fn is_official_helper_request(v: &serde_json::Value, beta: &[String]) -> bool {
+    let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
+    if blocks.len() != 2 {
+        return false;
+    }
+    let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    text(0).starts_with("x-anthropic-billing-header:")
+        && text(0).contains("cc_is_subagent=true")
+        && text(1) == config::CC_SDK_AGENT_IDENTITY
+        && is_official_helper_shape(v)
+        && has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku)
+}
+
+/// 来访的 `anthropic-beta` 是否带齐了某个官方 profile 的**每一项** beta（多带不算错——
+/// 来访那串还有 `oauth`/`afk-mode` 之类 profile 表里刻意去掉的项）。
+fn has_profile_betas(beta: &[String], kind: config::CcProfileKind) -> bool {
+    config::cc_profile(kind)
+        .beta
+        .split(',')
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .all(|b| has_beta(beta, b))
+}
+
+/// [`has_cc_base_prompt`] 的阈值：1000 字节。官方最短的基座是 opus 那份 1214 字节，留两成
+/// 余量；仿冒者那两块加起来不到两百字节，中间空得很宽。
+const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 
 /// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
 /// 有 `tools` 但里面至少有一个 [`config::CC_TOOL_NAMES`] 里的官方工具名也算是。
@@ -5849,6 +5969,293 @@ fn outbound_session_id(
         Some(sid) => Some(sid.to_string()),
         None => incoming_session_id(headers, body),
     }
+}
+
+/// [`probe_signature`] 命中的哪一条判据。日志与错误消息按类写清楚，运维一眼能看出拦的是什么。
+///
+/// 身份格式不对（device 不是 64 位 hex、session 不是 uuid）**不在**这里：那是「抄错了」而不是
+/// 探针，交给模拟路径重建身份（[`cc_identity_well_formed`] 决定它进不了透传），不拒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    /// 单句 ping：有 system、无 tools、恰好 1 条消息、`max_tokens` 在 `2..=16`。
+    Ping,
+    /// 凭空冒出的一次性对话：有 system、无 tools、恰好 1 条消息、不是官方那两种无 tools
+    /// 形态、且设备从没见过。
+    ThrowawayConversation,
+    /// system 里 CC 身份句出现在**不止一块**里。官方只写一次。
+    DuplicateIdentity,
+}
+
+impl ProbeKind {
+    /// 进日志的短名。
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::ThrowawayConversation => "throwaway-conversation",
+            Self::DuplicateIdentity => "duplicate-identity",
+        }
+    }
+
+    /// 回给客户端的错误消息。
+    fn message(self) -> &'static str {
+        match self {
+            Self::Ping => {
+                "automated probe / health-check requests are not forwarded: single-message ping with a system prompt and max_tokens in 2..=16"
+            }
+            Self::ThrowawayConversation => {
+                "automated probe / health-check requests are not forwarded: first request from an unknown device is a tool-less single-message conversation"
+            }
+            Self::DuplicateIdentity => {
+                "automated probe / health-check requests are not forwarded: the Claude Code identity sentence appears in more than one system block"
+            }
+        }
+    }
+}
+
+/// 探针 / 探活请求的强特征；命中返回是哪一条（[`ProbeKind`]），没命中 `None`。
+///
+/// 背景是一次真实封号（`ban.log`）。被封的号一天里收到三类探活，全都自报 CC 的 UA、
+/// 带官方那两块 system（billing header + 身份句），却在别处露馅：
+///
+/// | 类 | 形态 | 露馅处 |
+/// |---|---|---|
+/// | 每 15 分钟一条的 haiku | 3 块 system `[70, 57, 57]`、无 `tools`、1 条消息、`max_tokens=2`、36 token | 官方从不在带 system 的请求上给个位数的 `max_tokens`（预热那条 `max_tokens=1` **没有** system） |
+/// | 封前 8 分钟的 21 条 | 同样 3 块 system、无 `tools`/`thinking`、1 条消息、`temperature=1`、每条一个新 device_id + 新 session_id | 官方一台新机器的第一条是预热（无 system）或主请求（带 tools），从不是「没有 tools 的一句话对话」 |
+/// | `sdk-cli` 每 20 分钟一条 | `device_id`=`channel-test`、`session_id`=`channel-test-claude-code` | 官方 device_id 恒为 64 位 hex、session_id 恒为 uuid（`cap/` 37 份样本无一例外） |
+///
+/// 第三类**不在这里拒**：身份写错是「抄错了」，不是探针形态。它由 [`cc_identity_well_formed`]
+/// 挡在透传门外、走模拟——模拟路径本来就会剥掉来访的 `metadata.user_id`，用凭证 + 平台指纹
+/// 重建一份合法身份，那个 `channel-test` 到不了上游。代价是这类探活换了身合法的皮照常放行；
+/// 它 `max_tokens=256`、设备恒定，也不命中下面三条。这是有意的取舍：只拒探针，不拒抄错的。
+///
+/// 三条判据，**任一命中即算**，全部只对自报 CC 的 UA（`from_cc_client`）生效——非 CC 的 UA
+/// 本就走模拟路径，形态与身份会被整套重建：
+///
+/// - **单句 ping**（[`ProbeKind::Ping`]）：有 system、没有 tools、恰好 1 条消息、`max_tokens`
+///   在 `2..=16`。下界排除官方 cache 预热（`max_tokens=1`；2.1.187 Claude Desktop 的预热带
+///   `[billing, identity]` 两块 system，见 `ban.log`），上界远低于官方带 system 的最小值 64
+///   （补全建议）。**只对自报 CC 的 UA**：Go 之类非 CC 客户端的正常业务里，单条消息 +
+///   `max_tokens` 为 1/4/10/16 的小请求成百上千，且那条路走模拟、身份由 luban 重建，上游看
+///   不到来访侧的任何身份轮换，不缺这道闸；
+/// - **凭空冒出的一次性对话**（[`ProbeKind::ThrowawayConversation`]）：有 system、没有
+///   tools、恰好 1 条消息、`max_tokens != 1`、不是官方那三种无 tools 请求、且设备从没见过
+///   （[`store::CredentialStore::device_is_known`]）。官方无 tools 的请求只有四种：预热
+///   （`max_tokens=1`）、Helper（[`is_official_helper_request`]）、标题生成
+///   （[`is_official_title_request`]）、安全分类（[`is_official_classifier_request`]）；后三种
+///   按 system 结构 + beta 头 + body 取值**逐项**对，不是「带了某个字段就放」。标题生成必须在
+///   豁免里：它在用户第一句话后与主请求**并发**发出，一台全新设备上若它先到，设备还没绑定，
+///   不豁免就会把一条官方请求当成一次性对话拒掉。老设备发同样的形态不算：那可能是某个真
+///   客户端的边角请求；
+/// - **身份句重复**（[`ProbeKind::DuplicateIdentity`]）：system 里含 CC 身份句的块不止一个。
+///   官方只写一次；`ban.log` 那份 `[70, 57, 57]` 的第三块与身份句等长，多半就是它又抄了一遍。
+///   这条不看设备，正好补上「已知设备发同形态」时第三条够不着的口子。
+///
+/// **「没有 tools」按值算，不按键算**：`tools` 缺失、`null`、`[]` 都是没有；`thinking` 为
+/// `null`、`stop_sequences` 缺失/`null`/`[]` 同样按没有算。否则加一个空字段就绕过去了。
+///
+/// **边界要说清**：形态判据拦得住现在这批和它们的简单变种。把官方 haiku 工具调用的形态
+/// 逐字抄全（`tools: []` + `thinking` 对象 + `max_tokens: 32000`）的探针，形态上就是一条官方
+/// 请求，这里分不出来——那时剩下的信号只有行为（身份轮换、节奏），不在本函数范围内。
+///
+/// 只看形态与身份、一条就判，不做任何计数——所以不存在「合法流量大了会误伤」的问题。
+fn probe_signature(
+    body: Option<&serde_json::Value>,
+    from_cc_client: bool,
+    device_id: Option<&str>,
+    beta: &[String],
+    device_known: impl FnOnce() -> bool,
+) -> Option<ProbeKind> {
+    if !from_cc_client {
+        return None;
+    }
+    let v = body?;
+    // 身份句重复：不依赖下面「无 tools / 单条消息」的前提，先判。
+    if cc_identity_blocks(v) > 1 {
+        return Some(ProbeKind::DuplicateIdentity);
+    }
+    // 另两条都要求：有 system、没有 tools、恰好一条（用户）消息。
+    let has_system = v.get("system").is_some_and(|s| !s.is_null());
+    let no_tools = field_is_empty(v.get("tools"));
+    let single_message = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|m| m.len() == 1 && m[0].get("role").and_then(|r| r.as_str()) == Some("user"));
+    if !(has_system && no_tools && single_message) {
+        return None;
+    }
+    let max_tokens = request_max_tokens(Some(v));
+    if max_tokens.is_some_and(|m| (2..=16).contains(&m)) {
+        return Some(ProbeKind::Ping);
+    }
+    // 官方那三种无 tools 请求的**完整**样子，见 [`is_official_helper_request`]、
+    // [`is_official_title_request`]、[`is_official_classifier_request`]：system 结构、beta 头、
+    // body 取值逐项对，不是「带了某个字段就放」，也不是只对 body 那几个字段。
+    if max_tokens != Some(1)
+        && !is_official_helper_request(v, beta)
+        && !is_official_title_request(v, beta)
+        && !is_official_classifier_request(v, beta)
+        && device_id.is_some()
+        && !device_known()
+    {
+        return Some(ProbeKind::ThrowawayConversation);
+    }
+    None
+}
+
+/// 官方 Helper / 标题生成两条 haiku 请求共有的 **body 取值**（`cap/2.1.260/00024`、`00027`、
+/// `2.1.260-2/00058`）：模型是 haiku 4.5 全名、`tools` 字段**存在且为空数组**、`thinking.type`
+/// 是 `disabled`、`max_tokens` 恰为 32000、`stream` 为 true。五项齐了才算。
+///
+/// 每一项都在堵一个绕法：`thinking: {}` 或 `enabled` 不是这两种请求的写法（带 `enabled` 的
+/// 只有 SDK 子代理，它带工具）；`tools` 缺失或 `null` 不是官方写法；`max_tokens` 只认 32000
+/// 而不是「不小于某数」；模型换成 opus/sonnet 的不是 Helper——`ban.log` 里 `claude-cli/2.1.165`
+/// 那批（opus-5、`max_tokens=10240`、`tools: []`、每台新设备同样四道题）就是被上一版「thinking
+/// 对象 + max_tokens >= 4096」的宽豁免放过去的。
+///
+/// **只是 body 那一半**：单独用它放行不够（抄五个字段就够了），要配上 system 结构与 beta 头，
+/// 见 [`is_official_helper_request`] 与 [`is_official_title_request`]。
+fn is_official_helper_shape(v: &serde_json::Value) -> bool {
+    v.get("model").and_then(|m| m.as_str()) == Some(QUOTA_PROBE_MODEL)
+        && v.get("tools").is_some_and(|t| t.as_array().is_some_and(|a| a.is_empty()))
+        && thinking_type(v) == Some("disabled")
+        && request_max_tokens(Some(v)) == Some(32000)
+        && v.get("stream").and_then(|b| b.as_bool()) == Some(true)
+}
+
+/// 官方**标题生成**（`cap/2.1.260-2/00058`）的完整样子：[`is_official_helper_shape`] 的 body
+/// 取值，加 system 恰好三块——billing header、CC 身份句、不短于 1000 字节的标题提示词
+/// （抓包 3059）——加 `structured-outputs` beta。
+///
+/// 它与 Helper 是两种请求：Helper 是子代理（SDK 身份句、两块），标题生成是主线程身份（CC
+/// 身份句、带长提示词）。两条都在第三条判据的豁免里，见 [`probe_signature`] 里标题生成为什么
+/// 必须豁免。
+fn is_official_title_request(v: &serde_json::Value, beta: &[String]) -> bool {
+    let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
+    if blocks.len() != 3 {
+        return false;
+    }
+    let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    text(0).starts_with("x-anthropic-billing-header:")
+        && text(1) == config::CC_SYSTEM_IDENTITY
+        && text(2).len() >= CC_BASE_PROMPT_MIN_LEN
+        && has_beta(beta, config::CC_BETA_STRUCTURED_OUTPUTS)
+        && is_official_helper_shape(v)
+}
+
+/// 官方**安全分类**（`cap/2.1.260/00019`、`00030`）的完整样子：
+///
+/// - system 恰好三块：billing header、不短于 1000 字节的分类提示词（抓包 123785）、以
+///   `## Session Context` 开头的会话上下文块（抓包 248 字节）；
+/// - body：`max_tokens` 恰为 64、`stop_sequences` 是非空且不含空串的字符串数组、
+///   `thinking.type` 是 `disabled`、没有 `tools` 字段、非流式；
+/// - 头：带 `auto-mode-classifier` beta。
+///
+/// 曾经只看第一块是 billing header，两块 system 就能装成分类请求；三块的结构与各块内容现在
+/// 都要对上。
+fn is_official_classifier_request(v: &serde_json::Value, beta: &[String]) -> bool {
+    let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
+    if blocks.len() != 3 {
+        return false;
+    }
+    let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    let stop_ok = v.get("stop_sequences").and_then(|s| s.as_array()).is_some_and(|a| {
+        !a.is_empty() && a.iter().all(|x| x.as_str().is_some_and(|t| !t.is_empty()))
+    });
+    text(0).starts_with("x-anthropic-billing-header:")
+        && text(1).len() >= CC_BASE_PROMPT_MIN_LEN
+        && text(2).trim_start().starts_with("## Session Context")
+        && request_max_tokens(Some(v)) == Some(64)
+        && stop_ok
+        && thinking_type(v) == Some("disabled")
+        && v.get("tools").is_none()
+        && v.get("stream").and_then(|b| b.as_bool()) != Some(true)
+        && has_beta(beta, config::CC_BETA_AUTO_MODE_CLASSIFIER)
+}
+
+/// `thinking.type` 的字串值；`thinking` 不是对象、没有 `type`、或 `type` 不是字串时 `None`。
+/// `{}`、`null`、字串形态的 `thinking` 都落到 `None`。
+fn thinking_type(v: &serde_json::Value) -> Option<&str> {
+    v.get("thinking")?.get("type")?.as_str()
+}
+
+/// 来访的 CC 身份是否**格式合法**：`metadata.user_id` 按 CC 格式解析出的 device 段（若有）
+/// 是 64 位小写 hex、session 段（若有）是 uuid，`X-Claude-Code-Session-Id` 头（若带了、非空）
+/// 也是 uuid。三处都没带算合法——「没带」由 [`bare_session_id`] 那条路补，不是这里的事。
+///
+/// 是 [`Simulation::detect`] 放行透传的前提之一。官方两处身份恒为 64 位 hex + uuid（`cap/`
+/// 37 份样本无一例外）；按 CC 格式写却写错的（`ban.log` 里 `device_id=channel-test`、
+/// `session_id=channel-test-claude-code` 那批探活），不当官方客户端，走模拟——那条路会剥掉这份
+/// 身份、用凭证 + 平台指纹重建合法的一份，抄错的值到不了上游。
+///
+/// **头上那个原样看、不过滤**：[`incoming_session_id`] 会把不是 uuid 的头丢掉（给会话链、限流
+/// 用的值必须合法），拿它的结果来判就永远判不到非法头。这里直接读原值。
+///
+/// **内嵌 JSON 里字段的类型也算格式**：`"session_id": null` / 数字 / 对象，在 [`extract_session_id`]
+/// 眼里是「没带」（它只认字串），但官方这两个字段恒为字串——写了这个键却不是字串，同样是
+/// 抄错了；放它透传的话 `spoof_identity` 只换 device 与 account 段，那个 `null` 会原样留在出站的
+/// `user_id` 里。故这里另看一眼原始 JSON：键在，就必须是非空字串。
+fn cc_identity_well_formed(headers: &HeaderMap, v: &serde_json::Value) -> bool {
+    let header_ok = headers
+        .get("x-claude-code-session-id")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .is_none_or(looks_like_uuid);
+    header_ok
+        && cc_identity_fields_are_strings(v)
+        && extract_device_id(Some(v)).is_none_or(|d| is_hex64(&d))
+        && extract_session_id(Some(v)).is_none_or(|s| looks_like_uuid(&s))
+}
+
+/// `metadata.user_id` 若是 CC 的内嵌 JSON 形态，其中出现的 `device_id` / `session_id` 键都得是
+/// **没有首尾空白的非空字串**。不是内嵌 JSON（扁平串、或随便一个串）、或压根没有
+/// `metadata.user_id`，算通过——那两种由 [`extract_device_id`] / [`extract_session_id`] 自己的
+/// 解析规则管。
+///
+/// 空白也算格式：[`extract_session_id`] 会 trim（给会话链用的值得干净），于是 `" <uuid> "`
+/// 在它眼里是合法 uuid；但官方从不给这两个字段加空白，写了就是抄错了，放透传的话原串里那两个
+/// 空格会留在出站 `user_id` 里、与头上的值不再逐字相同。
+fn cc_identity_fields_are_strings(v: &serde_json::Value) -> bool {
+    let Some(user_id) = v.get("metadata").and_then(|m| m.get("user_id")).and_then(|u| u.as_str())
+    else {
+        return true;
+    };
+    let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id) else { return true };
+    let Some(obj) = inner.as_object() else { return true };
+    ["device_id", "session_id"].iter().all(|k| {
+        obj.get(*k).is_none_or(|val| val.as_str().is_some_and(|s| !s.is_empty() && s == s.trim()))
+    })
+}
+
+/// 字段「等于没有」：缺失、`null`、空数组。给 [`probe_signature`] 用——探针加一个 `tools: []`
+/// 不该算成「带了 tools」。
+fn field_is_empty(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// system 里包含 CC 身份句（[`config::CC_SYSTEM_IDENTITY_PREFIX`]）的块数。字符串形态的
+/// system 按一块算。
+fn cc_identity_blocks(v: &serde_json::Value) -> usize {
+    match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .filter(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+            .count(),
+        Some(serde_json::Value::String(s)) => {
+            usize::from(s.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+        }
+        _ => 0,
+    }
+}
+
+/// 64 位小写 hex——官方 CC 的 `device_id`（`sha256` 十六进制）恒为此形。
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// 形如 `8-4-4-4-12` 的小写 hex uuid。只看形状，不校验 version/variant 位——官方发的是
@@ -7844,7 +8251,10 @@ fn sync_metadata_session(v: &mut serde_json::Value, session_id: &str) -> bool {
     if let Some(obj) =
         serde_json::from_str::<serde_json::Value>(&inner).ok().as_ref().and_then(|v| v.as_object())
     {
-        match obj.get("session_id").and_then(|s| s.as_str()).map(str::trim) {
+        // **逐字节比，不 trim**：`" <uuid> "` 与头上的 `<uuid>` 不是同一个值。校验那侧
+        // （[`extract_session_id`]）trim 过，这里若也 trim 就会判成「已同值」而放着不改，
+        // 出站头体就差了两个空格——官方那两处逐字相同。
+        match obj.get("session_id").and_then(|s| s.as_str()) {
             Some(cur) if cur == session_id => return false,
             Some(_) => {
                 if let Some(next) = replace_json_str_field(&inner, "session_id", session_id) {
@@ -7867,7 +8277,8 @@ fn sync_metadata_session(v: &mut serde_json::Value, session_id: &str) -> bool {
 
     // 格式二：扁平串（Windows 那类）——device 与 account 段原样，只换 session 段。
     if let Some(flat) = parse_flat_user_id(&inner) {
-        if flat.session.trim() == session_id {
+        // 同上，逐字节比。
+        if flat.session == session_id {
             return false;
         }
         *user_id = serde_json::Value::String(format!(
@@ -11793,6 +12204,7 @@ mod tests {
             hoist_system_role: false,
             reject_openai_shape: false,
             reject_session_conflict: false,
+            reject_probes: false,
             api_telemetry: false,
             keepalive_telemetry: false,
         };
@@ -12606,6 +13018,7 @@ mod tests {
             hoist_system_role: false,
             reject_openai_shape: false,
             reject_session_conflict: false,
+            reject_probes: false,
             api_telemetry: false,
             keepalive_telemetry: false,
         };
@@ -13420,6 +13833,7 @@ mod tests {
                 hoist_system_role: false,
                 reject_openai_shape: false,
                 reject_session_conflict: false,
+                reject_probes: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
             }
@@ -14421,6 +14835,12 @@ mod tests {
         r#""messages":[{"role":"user","content":"hi"}],"stream":true}"#
     );
 
+    /// 一块够长的「基座提示词」，给要装成真 CC 的测试体用：真 CC 只要写了身份句就一定带
+    /// 基座（[`super::has_cc_base_prompt`]），测试体里少了它会被当成去掉基座的第三方而走模拟。
+    fn base_block() -> String {
+        format!(r#"{{"type":"text","text":"{}"}}"#, "x".repeat(1200))
+    }
+
     /// 测试里一律走这个判定，别直接调 [`super::Simulation::detect`]：`from_cc_client` 要按
     /// 代理里那条式子从 UA 算——**只看 UA**，`metadata.user_id` 和 session 头不再构成跳过理由。
     fn detect_with(
@@ -14945,11 +15365,14 @@ mod tests {
                 r#""messages":[{{"role":"user","content":"hi"}}],"#,
                 r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
                 r#"cc_version=2.1.260.222; cc_entrypoint=cli;"}},"#,
-                r#"{{"type":"text","text":"{}"}}],"#,
+                r#"{{"type":"text","text":"{}"}},{}],"#,
                 r#""tools":[{{"name":"Bash"}}],"#,
-                r#""metadata":{{"user_id":"{{\"device_id\":\"d\",\"session_id\":\"{}\"}}"}}}}"#
+                r#""metadata":{{"user_id":"{{\"device_id\":\"{}\",\"session_id\":\"{}\"}}"}}}}"#
             ),
             config::CC_SYSTEM_IDENTITY,
+            base_block(),
+            // 真 CC 的 device_id 恒为 64 位 hex；不合法的会被 detect 当成非官方客户端送去模拟。
+            "832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870",
             SID
         ));
         let parsed_body = parsed(&body);
@@ -15799,6 +16222,16 @@ mod tests {
         );
         // 已经同值 → 不动。
         assert!(!super::sync_metadata_session(&mut v, SID));
+        // 值只差首尾空白也**要**改：逐字节比，不 trim——否则头上写的是干净的 uuid，体里留着
+        // 带空格的那份，两处不再逐字相同。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": format!(r#"{{"device_id":"dd","account_uuid":"aa","session_id":" {SID} "}}"#) }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID), "带空白的同值也得改写");
+        assert_eq!(
+            user_id(&v),
+            format!(r#"{{"device_id":"dd","account_uuid":"aa","session_id":"{SID}"}}"#)
+        );
 
         // 扁平串：device 与 account 段原样，只换 session 段，仍以扁平串回写。
         let mut v = serde_json::json!({
@@ -15807,6 +16240,12 @@ mod tests {
         assert!(super::sync_metadata_session(&mut v, SID));
         assert_eq!(user_id(&v), format!("user_deadbeef_account_acct-1_session_{SID}"));
         assert!(!super::sync_metadata_session(&mut v, SID));
+        // 扁平串的 session 段带尾部空白同样要改写。
+        let mut v = serde_json::json!({
+            "metadata": { "user_id": format!("user_deadbeef_account_acct-1_session_{SID} ") }
+        });
+        assert!(super::sync_metadata_session(&mut v, SID));
+        assert_eq!(user_id(&v), format!("user_deadbeef_account_acct-1_session_{SID}"));
 
         // 内嵌 JSON 没有会话段 → 追加到末尾（官方键序 device → account → session），
         // 其余内容逐字节不变。补过之后再同步一次是幂等的。
@@ -16348,17 +16787,218 @@ mod tests {
             header::USER_AGENT,
             HeaderValue::from_static("claude-cli/2.1.226 (external, cli)"),
         );
+        // 真 CC 的体：身份句 + 基座；抄了身份句却没基座的 cc_no_meta 在 CC UA 下也走模拟。
+        let cc_full = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}},{},{{"type":"text","text":"user prompt"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
         assert!(
-            detect_with(&cc_no_meta, &cc_ua, all_on()).is_none(),
+            detect_with(&cc_full, &cc_ua, all_on()).is_none(),
             "真 CC 客户端(无tools)不该走模拟"
         );
+        assert!(
+            detect_with(&cc_no_meta, &cc_ua, all_on()).is_some(),
+            "CC UA + 身份句但没基座 → 去掉基座的第三方，走模拟"
+        );
 
-        // CC UA + 含官方工具名 → 不模拟。
-        let cc_with_tools = Bytes::from(r#"{"model":"claude-opus-5","messages":[],"tools":[{"name":"Bash"},{"name":"custom_tool"}]}"#.to_string());
+        // CC UA + CC 形态 system + 含官方工具名 → 不模拟。
+        let cc_with_tools = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}},{}],"tools":[{{"name":"Bash"}},{{"name":"custom_tool"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
         assert!(
             detect_with(&cc_with_tools, &cc_ua, all_on()).is_none(),
-            "CC UA + 有官方工具不该走模拟"
+            "CC UA + CC 形态 + 有官方工具不该走模拟"
         );
+
+        // CC UA 但 system 里既无身份声明也无 billing header → 冒用 UA，走模拟。
+        // 这就是封号复盘里那批探活请求的形态：官方 UA + 官方格式 user_id + 自造的 3 块 system。
+        let cc_ua_fake_shape = Bytes::from(
+            r#"{"model":"claude-sonnet-5","system":[{"type":"text","text":"probe"},{"type":"text","text":"a"},{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"temperature":1,"stream":true}"#,
+        );
+        assert!(
+            detect_with(&cc_ua_fake_shape, &cc_ua, all_on()).is_some(),
+            "CC UA + 非 CC 形态 system 应走模拟"
+        );
+        assert!(
+            detect_with(&Bytes::from(PLAIN_BODY), &cc_ua, all_on()).is_some(),
+            "CC UA + 没有 system 也应走模拟"
+        );
+        // billing header 块 + 子代理自己那段长提示词（身份句不同）算 CC 形态 → 不模拟。
+        let cc_billing_only = Bytes::from(format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.abcdef; cch=00000"}},{{"type":"text","text":"You are a search agent. {}"}}],"messages":[{{"role":"user","content":"hi"}}]}}"#,
+            "x".repeat(1200)
+        ));
+        assert!(
+            detect_with(&cc_billing_only, &cc_ua, all_on()).is_none(),
+            "CC UA + billing header + 子代理长提示词不该走模拟"
+        );
+
+        // CC UA + billing header + 身份句、却**没有基座**（ban.log 里 claude-cli/2.1.165 那批：
+        // 两块 system、tools: []、每台新设备同样四道题）→ 去掉基座的第三方，走模拟补全。
+        let no_base = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.165.abcdef; cch=00000"}},{{"type":"text","text":"{}"}}],"messages":[{{"role":"user","content":"hi"}}],"max_tokens":10240,"stream":true,"tools":[],"thinking":{{"type":"adaptive"}}}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(
+            detect_with(&no_base, &cc_ua, all_on()).is_some(),
+            "CC UA + 身份句但没有基座的该走模拟"
+        );
+        // 同样两块 system 但 max_tokens=1 → 2.1.187 Claude Desktop 的 cache 预热，照旧透传。
+        let prewarm = Bytes::from(format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.187.abcdef"}},{{"type":"text","text":"{}"}}],"max_tokens":1}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(
+            detect_with(&prewarm, &cc_ua, all_on()).is_none(),
+            "max_tokens=1 的预热不该因为没基座而被模拟"
+        );
+        // 官方额度探测（`cap/2.1.260-2/00004`）：没有 system、没有 tools、haiku、max_tokens=1、
+        // 正文 `quota`。它过不了 is_cc_shaped，必须单独放行——装成主线程会给它补 system、基座
+        // 和工具，正是既定要求里禁止的。曾在收紧「CC 形态」条件时漏掉过一次。
+        let quota = Bytes::from(
+            r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"quota"}],"metadata":{"user_id":"{\"device_id\":\"832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870\",\"account_uuid\":\"a\",\"session_id\":\"d0c1fb05-9b19-4576-9465-e2b8a206dabf\"}"}}"#,
+        );
+        assert!(
+            super::is_quota_probe_shaped(&parsed(&quota).unwrap()),
+            "测试体本身得是官方额度探测形态"
+        );
+        assert!(detect_with(&quota, &cc_ua, all_on()).is_none(), "官方额度探测不该被模拟成主线程");
+        // 差一点就不是额度探测：正文不是 quota、或模型不是 haiku 4.5 全名 → 没有 system 又不是
+        // 额度探测的，照旧走模拟。
+        let not_quota = Bytes::from(
+            r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(detect_with(&not_quota, &cc_ua, all_on()).is_some());
+        let wrong_model = Bytes::from(
+            r#"{"model":"claude-opus-5","max_tokens":1,"messages":[{"role":"user","content":"quota"}]}"#,
+        );
+        assert!(detect_with(&wrong_model, &cc_ua, all_on()).is_some());
+        // 官方 Helper（`cap/2.1.260/00024`）：子代理 billing header + SDK 身份句两块，没有任何
+        // 长块，haiku、tools: []、max_tokens 32000、流式。基座阈值对它例外，照旧透传。
+        const SUB_BILLING: &str = "x-anthropic-billing-header: cc_version=2.1.260.d95; cc_entrypoint=cli; cch=ca354; cc_is_subagent=true; cc_prompt_id=bd224f00-5a91-4f15-b92f-0f47c663eae8;";
+        let helper_body = |model: &str,
+                           tools: &str,
+                           max_tokens: u32,
+                           stream: &str,
+                           sdk_line: &str| {
+            Bytes::from(format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"{SUB_BILLING}"}},{{"type":"text","text":"{sdk_line}"}}],"tools":{tools},"max_tokens":{max_tokens},"thinking":{{"type":"disabled"}},"temperature":1{stream}}}"#
+            ))
+        };
+        let helper = helper_body(
+            "claude-haiku-4-5-20251001",
+            "[]",
+            32000,
+            r#","stream":true"#,
+            config::CC_SDK_AGENT_IDENTITY,
+        );
+        let mut helper_headers = cc_ua.clone();
+        helper_headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(
+                config::cc_profile(config::CcProfileKind::HelperSubagentHaiku).beta,
+            )
+            .unwrap(),
+        );
+        assert!(
+            detect_with(&helper, &helper_headers, all_on()).is_none(),
+            "官方 Helper 子代理没有长块也不该被模拟"
+        );
+        assert!(
+            detect_with(&helper, &cc_ua, all_on()).is_some(),
+            "同样的 system 与 body、头上没带 Helper 的 beta → 不是官方 Helper，走模拟"
+        );
+        // 只抄了 `cc_is_subagent=true` 这个标记、其余不是官方 Helper 取值的，例外不成立，
+        // 照基座阈值走模拟——每一条都是曾经能绕过的写法。
+        for (label, body) in [
+            (
+                "模型是 opus",
+                helper_body(
+                    "claude-opus-5",
+                    "[]",
+                    32000,
+                    r#","stream":true"#,
+                    config::CC_SDK_AGENT_IDENTITY,
+                ),
+            ),
+            (
+                "带了工具",
+                helper_body(
+                    "claude-haiku-4-5-20251001",
+                    r#"[{"name":"Bash"}]"#,
+                    32000,
+                    r#","stream":true"#,
+                    config::CC_SDK_AGENT_IDENTITY,
+                ),
+            ),
+            (
+                "max_tokens 不是 32000",
+                helper_body(
+                    "claude-haiku-4-5-20251001",
+                    "[]",
+                    1024,
+                    r#","stream":true"#,
+                    config::CC_SDK_AGENT_IDENTITY,
+                ),
+            ),
+            (
+                "非流式",
+                helper_body(
+                    "claude-haiku-4-5-20251001",
+                    "[]",
+                    32000,
+                    "",
+                    config::CC_SDK_AGENT_IDENTITY,
+                ),
+            ),
+            (
+                "第二块不是 SDK 身份句",
+                helper_body(
+                    "claude-haiku-4-5-20251001",
+                    "[]",
+                    32000,
+                    r#","stream":true"#,
+                    config::CC_SYSTEM_IDENTITY,
+                ),
+            ),
+        ] {
+            assert!(detect_with(&body, &helper_headers, all_on()).is_some(), "{label}");
+        }
+        // 三块 system（多出一块短的）也不是 Helper：官方 Helper 恰好两块。
+        let three_blocks = Bytes::from(format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"{SUB_BILLING}"}},{{"type":"text","text":"{}"}},{{"type":"text","text":"extra"}}],"tools":[],"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"stream":true}}"#,
+            config::CC_SDK_AGENT_IDENTITY
+        ));
+        assert!(detect_with(&three_blocks, &helper_headers, all_on()).is_some());
+        // 身份写错的（device 不是 64 位 hex / session 不是 uuid）也进不了透传，走模拟重建身份：
+        // 这就是 ban.log 里 `channel-test` 那批探活的去向。
+        let bad_identity = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":"hi"}}],"system":[{{"type":"text","text":"{}"}},{}],"tools":[{{"name":"Bash"}}],"metadata":{{"user_id":"{{\"device_id\":\"channel-test\",\"account_uuid\":\"a\",\"session_id\":\"channel-test-claude-code\"}}"}}}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
+        assert!(
+            detect_with(&bad_identity, &cc_ua, all_on()).is_some(),
+            "身份格式不合法的不当官方客户端，走模拟"
+        );
+        let mut bad_header = cc_ua.clone();
+        bad_header.insert(
+            super::HeaderName::from_static("x-claude-code-session-id"),
+            HeaderValue::from_static("channel-test-claude-code"),
+        );
+        assert!(
+            detect_with(&cc_full, &bad_header, all_on()).is_some(),
+            "体合法、会话头非法的也走模拟"
+        );
+        // 只抄一句 cc_is_subagent=true 却没有 billing header 前缀的更不算。
+        let fake_sub = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"cc_is_subagent=true"}},{{"type":"text","text":"{}"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        assert!(detect_with(&fake_sub, &cc_ua, all_on()).is_some());
 
         // CC UA + 全是非官方工具名 → 视为冒用，走模拟。
         let spoofed_ua = Bytes::from(
@@ -16522,7 +17162,18 @@ mod tests {
             "重建后 session_id 应与 sim 一致"
         );
 
-        // 反面：真 CC 客户端（UA 带 claude-cli/）带了 user_id → 不走模拟，spoof_identity 原格式改写。
+        // 反面：真 CC 客户端（UA 带 claude-cli/ **且** system 是 CC 形态）带了 user_id →
+        // 不走模拟，spoof_identity 原格式改写。只有 UA 没有形态的那种见
+        // [`cc_client_needs_both_ua_and_cc_shape`]。
+        // 扁平串里 device 段与 session 段都得是官方格式（64 位 hex / uuid），否则 detect 会把它
+        // 当成身份写错的非官方客户端送去模拟，测不到透传那条路。
+        const FLAT_DEV: &str = "832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870";
+        const FLAT_SESS: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let with_meta = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":[{{"type":"text","text":"{}"}},{}],"messages":[],"metadata":{{"user_id":"user_{FLAT_DEV}_account_bb_session_{FLAT_SESS}"}}}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
         let mut cc_ua = super::HeaderMap::new();
         cc_ua.insert(
             header::USER_AGENT,
@@ -16534,7 +17185,7 @@ mod tests {
         assert_eq!(
             v3["metadata"]["user_id"],
             format!(
-                "user_{}_account_{ACCOUNT_UUID}_session_cc",
+                "user_{}_account_{ACCOUNT_UUID}_session_{FLAT_SESS}",
                 test_cred().spoof_device_id("fp").unwrap()
             ),
             "扁平串形态应原格式改写，而不是被换成 CC 的 JSON 形态"
@@ -16611,8 +17262,9 @@ mod tests {
         // CC 形态 + 真 CC 客户端：system 里有那句身份声明且 UA 是 claude-cli，
         // detect 返回 None（不模拟），走 bare_session 路径补 metadata。
         let body = Bytes::from(format!(
-            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}}]}}"#,
-            config::CC_SYSTEM_IDENTITY
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}"}},{}]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
         ));
         let mut cc_ua = super::HeaderMap::new();
         cc_ua.insert(
@@ -16748,14 +17400,409 @@ mod tests {
         assert!(call(no_fill, None, true, false, &test_cred()).is_none());
     }
 
-    /// 官方客户端（CC 内核）的请求不该走模拟，哪怕它这条请求的 `system` 里没有那句身份
-    /// 声明——VSCode 扩展、agent-sdk 都会发这种请求。
-    ///
-    /// 换头的代价是具体的：UA 会从客户端自报的版本倒退成 [`config::CC_USER_AGENT`]，
-    /// 且 `session_id` 会**头体不一致**（体里那份 `user_id` 由 `spoof_identity` 定点改写、
-    /// session 段保留原值，头上却是派生的），而官方这两处逐字节相同。
+    /// [`cc_identity_well_formed`]：三处身份都合法（或都没带）才算；头上的非法值**原样**看，
+    /// 不像 [`incoming_session_id`] 那样先过滤掉。这就是 `channel-test` 那类探活进不了透传、
+    /// 被送去模拟的那道门。
     #[test]
-    fn only_ua_determines_cc_client() {
+    fn identity_well_formed_checks_all_three_sources() {
+        const DEV: &str = "4fef933b15e89f7060000573496ce0eab6e9f0d1cf43e31dd4c7dc1c6801cfb5";
+        const SESS: &str = "8f79a3c7-1125-4096-a03d-feb0d4c10d52";
+        let body = |dev: &str, sess: &str| -> serde_json::Value {
+            serde_json::json!({
+                "model": "claude-opus-5",
+                "messages": [],
+                "metadata": {"user_id": format!(r#"{{"device_id":"{dev}","account_uuid":"a","session_id":"{sess}"}}"#)}
+            })
+        };
+        let ok = body(DEV, SESS);
+        let none = super::HeaderMap::new();
+        assert!(super::cc_identity_well_formed(&none, &ok));
+        assert!(
+            super::cc_identity_well_formed(
+                &none,
+                &serde_json::json!({"model": "m", "messages": []})
+            ),
+            "三处都没带算合法（补身份是另一条路的事）"
+        );
+        assert!(!super::cc_identity_well_formed(&none, &body("channel-test", SESS)));
+        assert!(!super::cc_identity_well_formed(&none, &body(DEV, "channel-test-claude-code")));
+        // 扁平串格式的 device 段同样要 64 位 hex。
+        let flat = serde_json::json!({"model": "m", "messages": [], "metadata": {"user_id": format!("user_abc_account_x_session_{SESS}")}});
+        assert!(!super::cc_identity_well_formed(&none, &flat));
+
+        // 头上的非法值原样看：会话链那条路把它过滤掉了，这里不能跟着丢。
+        let mut h = super::HeaderMap::new();
+        h.insert(
+            super::HeaderName::from_static("x-claude-code-session-id"),
+            HeaderValue::from_static("  channel-test-claude-code "),
+        );
+        assert_eq!(super::incoming_session_id(&h, None), None, "对照：会话链那边会丢掉它");
+        assert!(!super::cc_identity_well_formed(&h, &ok), "体合法、头非法 → 不合法");
+        let mut good = super::HeaderMap::new();
+        good.insert(
+            super::HeaderName::from_static("x-claude-code-session-id"),
+            HeaderValue::from_static(SESS),
+        );
+        assert!(super::cc_identity_well_formed(&good, &ok));
+        let mut blank = super::HeaderMap::new();
+        blank.insert(
+            super::HeaderName::from_static("x-claude-code-session-id"),
+            HeaderValue::from_static("   "),
+        );
+        assert!(super::cc_identity_well_formed(&blank, &ok), "空白头当没带");
+
+        // 内嵌 JSON 里 session_id / device_id 写了键却不是字串：extract_* 会当成「没带」，但官方
+        // 恒为字串，这是抄错了——不合法。透传会把那个 null 原样留在出站 user_id 里。
+        for (label, uid) in [
+            (
+                "session_id 为 null",
+                format!(r#"{{"device_id":"{DEV}","account_uuid":"a","session_id":null}}"#),
+            ),
+            (
+                "session_id 为数字",
+                format!(r#"{{"device_id":"{DEV}","account_uuid":"a","session_id":42}}"#),
+            ),
+            (
+                "session_id 为对象",
+                format!(r#"{{"device_id":"{DEV}","account_uuid":"a","session_id":{{}}}}"#),
+            ),
+            (
+                "session_id 为空串",
+                format!(r#"{{"device_id":"{DEV}","account_uuid":"a","session_id":""}}"#),
+            ),
+            (
+                "device_id 为 null",
+                format!(r#"{{"device_id":null,"account_uuid":"a","session_id":"{SESS}"}}"#),
+            ),
+            (
+                "device_id 为数字",
+                format!(r#"{{"device_id":1,"account_uuid":"a","session_id":"{SESS}"}}"#),
+            ),
+        ] {
+            let bad =
+                serde_json::json!({"model": "m", "messages": [], "metadata": {"user_id": uid}});
+            assert!(!super::cc_identity_well_formed(&none, &bad), "{label}");
+        }
+        // 首尾空白也是抄错：extract_session_id 会 trim 后认成合法 uuid，这里不能跟着放。
+        let padded = serde_json::json!({"model": "m", "messages": [], "metadata": {"user_id": format!(r#"{{"device_id":"{DEV}","account_uuid":"a","session_id":" {SESS} "}}"#)}});
+        assert!(!super::cc_identity_well_formed(&none, &padded), "带空白的 session_id 不合法");
+        let padded_dev = serde_json::json!({"model": "m", "messages": [], "metadata": {"user_id": format!(r#"{{"device_id":"{DEV} ","account_uuid":"a","session_id":"{SESS}"}}"#)}});
+        assert!(!super::cc_identity_well_formed(&none, &padded_dev), "带空白的 device_id 不合法");
+        // 键干脆不写是「没带」，合法；内嵌 JSON 只有 account_uuid 也合法。
+        let only_account = serde_json::json!({"model": "m", "messages": [], "metadata": {"user_id": r#"{"account_uuid":"a"}"#}});
+        assert!(super::cc_identity_well_formed(&none, &only_account));
+    }
+
+    /// 探针判定（[`probe_signature`]）：封号复盘里的三类探活形态都命中，官方 CC 的三种
+    /// 无 tools 请求（预热 / haiku 工具调用 / 补全建议）与带 tools 的主请求都不命中；老设备的
+    /// 「一句话对话」不算；下游那个去掉基座、带空 tools 与 thinking 的客户端不算。
+    #[test]
+    fn probe_signature_matches_probes_and_spares_official_shapes() {
+        use super::ProbeKind::*;
+        const DEV: &str = "4fef933b15e89f7060000573496ce0eab6e9f0d1cf43e31dd4c7dc1c6801cfb5";
+        let identity = config::CC_SYSTEM_IDENTITY;
+        // 官方两块：billing header + 身份句。
+        let cc_sys = format!(
+            r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abcdef"}},{{"type":"text","text":"{identity}"}}]"#
+        );
+        // ban.log 里探针那份 3 块：billing header + 身份句 + 身份句（第三块与身份句等长）。
+        let probe_sys = format!(
+            r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abcdef"}},{{"type":"text","text":"{identity}"}},{{"type":"text","text":"{identity}"}}]"#
+        );
+        let one_msg = r#"[{"role":"user","content":"hi"}]"#;
+        let sig_beta = |body: &str, cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let beta: Vec<String> = beta.iter().map(|b| b.to_string()).collect();
+            super::probe_signature(Some(&v), cc, dev, &beta, || known)
+        };
+        let sig = |body: &str, cc: bool, dev: Option<&str>, known: bool| {
+            sig_beta(body, cc, dev, known, &[])
+        };
+
+        // ---- ban.log 三类探针，按复盘里的形态复现 ----
+        // A) 每 15 分钟一条的 haiku ping：3 块 system、max_tokens=2、老设备。
+        //    身份句重复先于 ping 命中；把第三块换成别的文字后就是 ping。
+        let ping3 = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","system":{probe_sys},"messages":{one_msg},"max_tokens":2,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&ping3, true, Some(DEV), true), Some(DuplicateIdentity));
+        let ping = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":2,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&ping, true, Some(DEV), true), Some(Ping), "老设备也算：判据在 max_tokens");
+        // B) 封前 21 条：3 块 system、无 tools/thinking、temperature=1、max_tokens=1024、新设备。
+        let burst3 = format!(
+            r#"{{"model":"claude-sonnet-5","system":{probe_sys},"messages":{one_msg},"max_tokens":1024,"temperature":1,"stream":true,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&burst3, true, Some(DEV), false), Some(DuplicateIdentity));
+        assert_eq!(
+            sig(&burst3, true, Some(DEV), true),
+            Some(DuplicateIdentity),
+            "已知设备发同形态：身份句重复这条补上"
+        );
+        let burst = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":1024,"temperature":1,"stream":true,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&burst, true, Some(DEV), false), Some(ThrowawayConversation));
+        assert_eq!(sig(&burst, true, Some(DEV), true), None, "老设备发同样形态不算");
+        // C) channel-test 身份**不在这里拒**：它的形态不命中三条（max_tokens=256、设备恒定），
+        //    由 detect 送进模拟重建身份，见 [`cc_identity_well_formed`] 的测试。
+        let channel_test = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":256,"stream":true,"thinking":{{"type":"adaptive"}},"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&channel_test, true, Some("channel-test"), true), None);
+
+        // ---- 换成非 CC UA：一律不判（那条路走模拟） ----
+        assert_eq!(sig(&ping3, false, Some(DEV), false), None);
+        assert_eq!(sig(&burst, false, Some(DEV), false), None);
+
+        // ---- 加空字段绕不过 ----
+        let padded = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":1024,"tools":[],"thinking":null,"stop_sequences":[],"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&padded, true, Some(DEV), false), Some(ThrowawayConversation));
+        let padded_ping = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":8,"tools":null,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&padded_ping, true, Some(DEV), true), Some(Ping));
+        // thinking 给个非对象也不算「带了 thinking」。
+        let fake_thinking = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":1024,"thinking":"adaptive","metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&fake_thinking, true, Some(DEV), false), Some(ThrowawayConversation));
+        // thinking 是对象但 max_tokens 不到官方工具调用那档 → 仍算。
+        let small_thinking = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":1024,"thinking":{{"type":"adaptive"}},"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&small_thinking, true, Some(DEV), false), Some(ThrowawayConversation));
+
+        // ---- 官方三种无 tools 请求都不命中（形态取自 cap/ 抓包） ----
+        let prewarm = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":{one_msg},"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&prewarm, true, Some(DEV), false), None, "预热不算");
+        // 2.1.187 Claude Desktop 的预热带 [billing, identity] 两块 system（ban.log）。
+        let prewarm_with_sys = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":{one_msg},"system":{cc_sys},"max_tokens":1,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&prewarm_with_sys, true, Some(DEV), false), None, "带 system 的预热不算");
+        // 只有 Helper / 安全分类的 body 取值、system 是普通 CC 两块、也没带各自的 beta：
+        // 这不是官方那两种请求，是抄了几个字段的探针，**要**命中。完整形态的放行见下面。
+        let haiku_body_only = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":{one_msg},"system":{cc_sys},"tools":[],"metadata":{{}},"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"stream":true}}"#
+        );
+        assert_eq!(sig(&haiku_body_only, true, Some(DEV), false), Some(ThrowawayConversation));
+        let classifier_body_only = format!(
+            r#"{{"model":"claude-sonnet-5","max_tokens":64,"system":{cc_sys},"messages":{one_msg},"stop_sequences":["\\n"],"thinking":{{"type":"disabled"}},"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&classifier_body_only, true, Some(DEV), false), Some(ThrowawayConversation));
+        let main = format!(
+            r#"{{"model":"claude-opus-5","system":{cc_sys},"messages":{one_msg},"tools":[{{"name":"Bash"}}],"max_tokens":32000,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&main, true, Some(DEV), false), None, "带 tools 的主请求不算");
+        // 多轮对话不算，哪怕其余都像。
+        let multi = format!(
+            r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":[{{"role":"user","content":"a"}},{{"role":"assistant","content":"b"}},{{"role":"user","content":"c"}}],"max_tokens":8,"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&multi, true, Some(DEV), false), None);
+
+        // ---- ban.log 里 claude-cli/2.1.165 那批：opus-5、去掉基座、tools: []、thinking 对象、
+        //      max_tokens 10240，每台新设备同样四道题。上一版的宽豁免放过了它；按官方 Helper
+        //      的取值逐项对之后（模型不是 haiku、max_tokens 不是 32000）它就是一次性对话。
+        let rig = format!(
+            r#"{{"model":"claude-opus-5","system":{cc_sys},"messages":{one_msg},"max_tokens":10240,"stream":true,"tools":[],"output_config":{{}},"thinking":{{"type":"adaptive"}},"metadata":{{}}}}"#
+        );
+        assert_eq!(sig(&rig, true, Some(DEV), false), Some(ThrowawayConversation));
+
+        // ---- 豁免只认官方取值：下面每一条都是「抄了个字段名」的绕法，全部仍命中 ----
+        for (label, body) in [
+            (
+                "thinking:{} + 4096",
+                format!(
+                    r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":4096,"tools":[],"thinking":{{}},"stream":true,"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "thinking:{} + stop_sequences",
+                format!(
+                    r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":64,"thinking":{{}},"stop_sequences":["x"],"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "helper 取值但模型是 opus",
+                format!(
+                    r#"{{"model":"claude-opus-5","system":{cc_sys},"messages":{one_msg},"max_tokens":32000,"tools":[],"thinking":{{"type":"disabled"}},"stream":true,"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "helper 取值但 max_tokens 31999",
+                format!(
+                    r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":31999,"tools":[],"thinking":{{"type":"disabled"}},"stream":true,"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "helper 取值但 tools 缺失",
+                format!(
+                    r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":32000,"thinking":{{"type":"disabled"}},"stream":true,"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "helper 取值但非流式",
+                format!(
+                    r#"{{"model":"claude-haiku-4-5-20251001","system":{cc_sys},"messages":{one_msg},"max_tokens":32000,"tools":[],"thinking":{{"type":"disabled"}},"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "classifier 取值但 max_tokens 63",
+                format!(
+                    r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":63,"thinking":{{"type":"disabled"}},"stop_sequences":["</x>"],"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "classifier 取值但 max_tokens 65",
+                format!(
+                    r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":65,"thinking":{{"type":"disabled"}},"stop_sequences":["</x>"],"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "classifier 取值但 stop_sequences 里是空串",
+                format!(
+                    r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":64,"thinking":{{"type":"disabled"}},"stop_sequences":[""],"metadata":{{}}}}"#
+                ),
+            ),
+            (
+                "classifier 取值但流式",
+                format!(
+                    r#"{{"model":"claude-sonnet-5","system":{cc_sys},"messages":{one_msg},"max_tokens":64,"thinking":{{"type":"disabled"}},"stop_sequences":["</x>"],"stream":true,"metadata":{{}}}}"#
+                ),
+            ),
+        ] {
+            assert_eq!(sig(&body, true, Some(DEV), false), Some(ThrowawayConversation), "{label}");
+        }
+        // 只抄 Helper 的 body 五个字段、system 却是普通 CC 两块（billing + CC 身份句、没有 SDK
+        // 身份句也没有长提示词）：不是 Helper 也不是标题生成，照样是一次性对话。
+        let helper_body_only = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":{one_msg},"system":{cc_sys},"tools":[],"metadata":{{}},"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"stream":true}}"#
+        );
+        assert_eq!(sig(&helper_body_only, true, Some(DEV), false), Some(ThrowawayConversation));
+
+        // ---- 官方三种无 tools 请求抄全了才免：这是形态判据的边界，形态上它们就是官方请求 ----
+        let sub_billing = "x-anthropic-billing-header: cc_version=2.1.260.d95; cc_entrypoint=cli; cch=ca354; cc_is_subagent=true; cc_prompt_id=bd224f00-5a91-4f15-b92f-0f47c663eae8;";
+        let sdk = config::CC_SDK_AGENT_IDENTITY;
+        let helper_exact = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":{one_msg},"system":[{{"type":"text","text":"{sub_billing}"}},{{"type":"text","text":"{sdk}"}}],"tools":[],"metadata":{{}},"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"stream":true}}"#
+        );
+        let helper_betas: Vec<&str> =
+            config::cc_profile(config::CcProfileKind::HelperSubagentHaiku)
+                .beta
+                .split(',')
+                .collect();
+        assert_eq!(
+            sig_beta(&helper_exact, true, Some(DEV), false, &helper_betas),
+            None,
+            "官方 Helper 放行"
+        );
+        let long = "x".repeat(3059);
+        let title_exact = format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":{one_msg},"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.ced; cch=00000"}},{{"type":"text","text":"{identity}"}},{{"type":"text","text":"{long}"}}],"tools":[],"metadata":{{}},"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"output_config":{{}},"stream":true}}"#
+        );
+        assert_eq!(
+            sig_beta(&title_exact, true, Some(DEV), false, &[config::CC_BETA_STRUCTURED_OUTPUTS]),
+            None,
+            "官方标题生成放行（它与主请求并发，新设备上可能先到）"
+        );
+        let session_ctx = r"  ## Session Context\n\n- **User identity**: `e@x`";
+        let classifier_exact = format!(
+            r#"{{"model":"claude-sonnet-5","max_tokens":64,"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.260.3de; cch=00000"}},{{"type":"text","text":"{long}"}},{{"type":"text","text":"{session_ctx}"}}],"messages":{one_msg},"stop_sequences":["</severity>"],"thinking":{{"type":"disabled"}},"metadata":{{}}}}"#
+        );
+        assert_eq!(
+            sig_beta(
+                &classifier_exact,
+                true,
+                Some(DEV),
+                false,
+                &[config::CC_BETA_AUTO_MODE_CLASSIFIER]
+            ),
+            None,
+            "官方安全分类放行"
+        );
+
+        // ---- 三种官方请求各少一样，都不放 ----
+        for (label, body, beta) in [
+            ("Helper 缺官方 beta", helper_exact.clone(), vec![]),
+            ("Helper 只带了部分官方 beta", helper_exact.clone(), helper_betas[..3].to_vec()),
+            (
+                "Helper 第二块是 CC 身份句而不是 SDK 身份句",
+                helper_exact.replace(sdk, identity),
+                helper_betas.clone(),
+            ),
+            (
+                "Helper thinking.type=enabled",
+                helper_exact.replace(r#""type":"disabled""#, r#""type":"enabled""#),
+                helper_betas.clone(),
+            ),
+            (
+                "Helper 的 billing header 没有子代理标记",
+                helper_exact.replace("cc_is_subagent=true; ", ""),
+                helper_betas.clone(),
+            ),
+            ("标题生成缺 structured-outputs beta", title_exact.clone(), vec![]),
+            (
+                "标题生成的提示词不够长",
+                title_exact.replace(&long, "short"),
+                vec![config::CC_BETA_STRUCTURED_OUTPUTS],
+            ),
+            ("安全分类缺 auto-mode-classifier beta", classifier_exact.clone(), vec![]),
+            (
+                "安全分类 thinking.type=adaptive",
+                classifier_exact.replace(r#""type":"disabled""#, r#""type":"adaptive""#),
+                vec![config::CC_BETA_AUTO_MODE_CLASSIFIER],
+            ),
+            (
+                "安全分类第一块不是 billing header",
+                classifier_exact.replace("x-anthropic-billing-header: ", ""),
+                vec![config::CC_BETA_AUTO_MODE_CLASSIFIER],
+            ),
+            (
+                "安全分类只有两块 system",
+                classifier_exact
+                    .replace(&format!(r#",{{"type":"text","text":"{session_ctx}"}}"#), ""),
+                vec![config::CC_BETA_AUTO_MODE_CLASSIFIER],
+            ),
+            (
+                "安全分类第三块不是 Session Context",
+                classifier_exact.replace(session_ctx, "something else"),
+                vec![config::CC_BETA_AUTO_MODE_CLASSIFIER],
+            ),
+            (
+                "安全分类中间块不够长",
+                classifier_exact.replace(&long, "short"),
+                vec![config::CC_BETA_AUTO_MODE_CLASSIFIER],
+            ),
+        ] {
+            assert_eq!(
+                sig_beta(&body, true, Some(DEV), false, &beta),
+                Some(ThrowawayConversation),
+                "{label}"
+            );
+        }
+
+        // 字符串形态的 system 里身份句只算一块。
+        let as_string = format!(
+            r#"{{"model":"claude-opus-5","system":"{identity} {identity}","messages":{one_msg},"tools":[{{"name":"Bash"}}],"max_tokens":32000}}"#
+        );
+        assert_eq!(sig(&as_string, true, Some(DEV), true), None);
+    }
+
+    /// 「是官方客户端」要 UA 与体两头都对得上：UA 自报 `claude-cli/<版本>` **且** `system`
+    /// 是 CC 形态（身份声明或 billing header 块，[`is_cc_shaped`]）。只有 UA、体不是 CC
+    /// 形态的请求是抄了 UA 的第三方——封号复盘里那批探活请求正是这样——走模拟；`metadata`
+    /// 与 session 头本身不构成跳过理由。
+    ///
+    /// 真 CC 不模拟的代价仍然成立（换头会把它自报的 UA 换掉、`x-stainless-*` 换成抓包机器
+    /// 的取值），故 CC 形态的真客户端照旧原样转发。
+    #[test]
+    fn cc_client_needs_both_ua_and_cc_shape() {
         let plain = Bytes::from(PLAIN_BODY.to_string());
 
         // 1) metadata.user_id 在、但 UA 不是 claude-cli → 仍走模拟。
@@ -16786,11 +17833,29 @@ mod tests {
         // 4) 裸请求、裸 UA → 走模拟。
         assert!(detect_for(&plain, all_on()).is_some(), "裸第三方请求仍应走模拟");
 
-        // 5) UA 自报 `claude-cli/<版本>` → **不模拟**，这是唯一的跳过判据。
+        // 5) UA 自报 `claude-cli/<版本>` 但体不是 CC 形态（没 system / 自造 system）→ 抄了
+        //    UA 的第三方，**走模拟**。
         const VSCODE_UA: &str = "claude-cli/2.1.226 (external, claude-vscode, agent-sdk/0.3.226)";
         let mut cc_ua = super::HeaderMap::new();
         cc_ua.insert(header::USER_AGENT, HeaderValue::from_static(VSCODE_UA));
-        assert!(detect_with(&plain, &cc_ua, all_on()).is_none(), "自报 claude-cli 的不该走模拟");
+        assert!(
+            detect_with(&plain, &cc_ua, all_on()).is_some(),
+            "只有 claude-cli UA、没有 CC 形态的该走模拟"
+        );
+        assert!(
+            detect_with(&with_meta, &cc_ua, all_on()).is_some(),
+            "claude-cli UA + 自造 system + 官方格式 user_id 仍该走模拟"
+        );
+        // 5b) UA 与形态都对上 → **不模拟**，且非模拟路径原样转发它自报的 UA。
+        let cc_shaped = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":[{{"type":"text","text":"{}"}},{}],"messages":[]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
+        assert!(
+            detect_with(&cc_shaped, &cc_ua, all_on()).is_none(),
+            "claude-cli UA + CC 形态的不该走模拟"
+        );
         let out = build_forward_headers(&cc_ua, "tok", all_on(), None, None);
         assert_eq!(
             out.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),

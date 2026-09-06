@@ -1483,6 +1483,23 @@ impl CredentialStore {
         Some(self.session_rate.retry_after_secs(&session_id.to_string(), window))
     }
 
+    /// 这台设备是否已有绑定记录（任一凭证、不论是否仍在 TTL 内）。有记录就是「见过的设备」；
+    /// 绑定被保留期清掉后它会再次被当成没见过，那时它也确实很久没来了。供探针判定
+    /// （`proxy::probe_signature`）区分「老设备的一条小请求」与「凭空冒出来的一次性会话」。
+    pub fn device_is_known(&self, device_id: &str) -> bool {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM device_bindings WHERE device_id = ?1 LIMIT 1",
+                [device_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// 每会话并发在途上限：单个会话最多同时有多少条请求在飞；`<= 0` 表示不限。
     /// 未设置时默认 [`DEFAULT_SESSION_CONCURRENCY_LIMIT`]。
     pub fn session_concurrency_limit(&self) -> i64 {
@@ -2181,6 +2198,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_SESSION_CONFLICT) {
             flags.reject_session_conflict = v;
         }
+        if let Some(v) = on(REJECT_PROBES) {
+            flags.reject_probes = v;
+        }
         if let Some(v) = on(API_TELEMETRY) {
             flags.api_telemetry = v;
         }
@@ -2416,6 +2436,16 @@ pub const REJECT_OPENAI_SHAPE: &str = "reject_openai_shape";
 /// 见 [`ForwardFlags::reject_session_conflict`]。
 pub const REJECT_SESSION_CONFLICT: &str = "reject_session_conflict";
 
+/// 是否本地拒绝**探针类**请求的 settings 键名。缺省视为开启。
+///
+/// 下游中转拿账号做「探活/测活」时发的请求有一组只有它们才会有的强特征（自报 CC 的 UA，
+/// 却是无 tools 的单条小消息、`max_tokens` 只有个位数、或身份句在 system 里重复）。身份字段
+/// 写错的不算探针、不在这里拒，由模拟路径重建身份。
+/// 这些请求每一条都是上游侧「一台设备开一个一次性会话只问一句话」的记录，真实用户从不产生，
+/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。
+/// 见 [`ForwardFlags::reject_probes`] 与 `proxy::probe_signature`。
+pub const REJECT_PROBES: &str = "reject_probes";
+
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
 /// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
 pub const API_TELEMETRY: &str = "api_telemetry";
@@ -2645,6 +2675,19 @@ pub struct ForwardFlags {
     ///
     /// 关掉后退回「取头那个 + 打一条 warn」。见 [`crate::proxy::session_id_conflict`]。
     pub reject_session_conflict: bool,
+    /// 本地拒绝**探针类**请求（403），不转发。判据是一组只有探活脚本才会有的强特征，任一
+    /// 命中即拒，全部只对自报 CC UA 的请求生效，见 [`crate::proxy::probe_signature`]：
+    /// - 带 system、没有 tools、只有一条消息、`max_tokens` 在 2..=16；
+    /// - 带 system、没有 tools、只有一条消息、不是官方那两种无 tools 形态，且来自一台从没
+    ///   见过的设备；
+    /// - system 里 CC 身份句出现在不止一块里。
+    ///
+    /// 身份字段写错的（device 不是 64 位 hex、session 不是 uuid）**不在这里拒**：那是抄错了，
+    /// 不是探针，由模拟路径重建身份（`proxy::cc_identity_well_formed`）。「没有 tools」按值算：
+    /// 缺失、`null`、`[]` 都是没有，加空字段绕不过。只看形态、一条就判，不做计数。官方 CC 的
+    /// 四种无 tools 请求（cache 预热、Helper 子代理、标题生成、安全分类）按 system 结构 + beta
+    /// 头 + body 取值逐项对、都在判据之外，见 `cap/` 抓包与 `proxy::probe_signature`。默认开。
+    pub reject_probes: bool,
     /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
     /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
     /// 逐项 token 与花费）、Datadog 日志、OTel 指标，身份取实际发往上游的那份，节奏照
@@ -2692,6 +2735,7 @@ impl Default for ForwardFlags {
             hoist_system_role: true,
             reject_openai_shape: true,
             reject_session_conflict: true,
+            reject_probes: true,
             api_telemetry: true,
             keepalive_telemetry: true,
         }
@@ -8099,6 +8143,7 @@ mod tests {
             (HOIST_SYSTEM_ROLE, "0"),
             (REJECT_OPENAI_SHAPE, "0"),
             (REJECT_SESSION_CONFLICT, "0"),
+            (REJECT_PROBES, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
         ] {
@@ -8132,6 +8177,7 @@ mod tests {
                 hoist_system_role: false,
                 reject_openai_shape: false,
                 reject_session_conflict: false,
+                reject_probes: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
             }
