@@ -2341,10 +2341,13 @@ pub const SPOOF_DEVICE_ID: &str = "spoof_device_id";
 
 /// 设备指纹是否只取平台（arch/os），不含客户端原始 `device_id`。缺省视为开启。
 ///
-/// 开（默认）：`fingerprint = arch|os` → 同平台的所有客户端收敛成同一个伪装 device_id，
-/// 每个账号最多 2–3 个设备身份（macOS/arm64、Linux/x86_64…），符合真实用户一人多设备的模式。
-/// 关：`fingerprint = client_device_id|arch|os` → 每个 (账号, 客户端设备) 都是独立的设备身份，
-/// 客户端越多、上游看到该账号的设备数就越多，不符合正常用户的使用模式。
+/// 开（默认）：`fingerprint = arch|os|出站 UA` → **同平台且同客户端版本**的客户端收敛成同一个
+/// 伪装 device_id，符合真实用户一人多设备的模式。
+/// 关：`fingerprint = client_device_id|arch|os|出站 UA` → 每个 (账号, 客户端设备) 都是独立的
+/// 设备身份，客户端越多、上游看到该账号的设备数就越多，不符合正常用户的使用模式。
+///
+/// **出站 UA 两档都在指纹里，不受本开关影响**：一台设备只能有一个客户端版本，否则上游会看到
+/// 同一个 device_id 在同一秒里自报好几个版本。见 [`crate::proxy::device_fingerprint`]。
 ///
 /// 只在 [`SPOOF_DEVICE_ID`] 开着时有意义——那个关着时 device_id 原样透传，指纹不参与。
 pub const NORMALIZE_DEVICE_FP: &str = "normalize_device_fp";
@@ -2542,11 +2545,13 @@ pub struct ForwardFlags {
     /// 设备指纹只取平台（arch/os），不含客户端原始 `device_id`（[`Self::spoof_device_id`]
     /// 的子项，它关着时指纹不参与，本项无从谈起）。
     ///
-    /// - **开**（默认）：`fingerprint = arch|os` → 同平台的所有客户端收敛成同一个伪装
-    ///   device_id，每个账号最多 2–3 个设备身份（macOS/arm64、Linux/x86_64…），符合真实
-    ///   用户一人多设备的模式。
-    /// - **关**：`fingerprint = client_device_id|arch|os` → 每个 (账号, 客户端设备) 都是
-    ///   独立的设备身份，客户端越多、上游看到该账号的设备数就越多。
+    /// - **开**（默认）：`fingerprint = arch|os|出站 UA` → 同平台**且同客户端版本**的客户端
+    ///   收敛成同一个伪装 device_id，符合真实用户一人多设备的模式。
+    /// - **关**：`fingerprint = client_device_id|arch|os|出站 UA` → 每个 (账号, 客户端设备)
+    ///   都是独立的设备身份，客户端越多、上游看到该账号的设备数就越多。
+    ///
+    /// 出站 UA 那段两档都有、不受本开关约束：一台设备只能有一个客户端版本，换版本即换设备。
+    /// 理由与代价（升级会换一次 device_id）见 [`crate::proxy::device_fingerprint`]。
     pub normalize_device_fp: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     pub billing_cch: bool,

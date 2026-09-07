@@ -862,7 +862,11 @@ async fn handle_inner(
     // 设备指纹用于派生伪装 device_id。归一化开着时只取平台（arch/os），关着时叠加客户端
     // 原始 device_id。头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
     let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
-    let device_fp = device_fingerprint(fp_device, &headers);
+    // **出站 UA 也进指纹**：一台设备只能有一个客户端版本，换版本就是换设备。判据与
+    // [`Simulation::detect`] 同源（都走 [`simulates_cc`]），不然指纹会把一条请求算到另一台
+    // 设备名下。理由与代价见 [`device_fingerprint`]。
+    let simulating = simulates_cc(body_json.as_ref(), &headers, from_cc_client, flags);
+    let device_fp = device_fingerprint(fp_device, &headers, outbound_ua(&client_ua, simulating));
     // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 5 块 + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
     //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
@@ -5635,19 +5639,8 @@ struct Simulation {
 }
 
 impl Simulation {
-    /// 判定 + 派生一次做完。返回 `None` 的三种情形：开关关着、请求体不是我们能改的 JSON、
-    /// 来访是 Claude Code 客户端**且体也是完整的 CC 形态**——身份格式合法
-    /// （[`cc_identity_well_formed`]），且要么是官方额度探测（[`is_quota_probe_shaped`]，官方
-    /// 唯一一条没有 system 的），要么 `system` 里带着身份声明或 billing header
-    /// （[`is_cc_shaped`]）、带着官方那段基座提示词（[`has_cc_base_prompt`]；`max_tokens=1` 的
-    /// 预热与官方 Helper 除外）、工具列表符合 CC 特征（[`has_cc_tool_profile`]——含官方工具名，
-    /// 或没带 `tools`）。
-    /// UA 自报 CC 但体不完整（缺那几样中的任一）、或工具列表全是非官方名的请求，都视为第三方
-    /// 冒用 CC UA，仍走模拟路径重塑成官方形态。
-    ///
-    /// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
-    /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
-    /// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
+    /// 判定 + 派生一次做完：判定见 [`simulates_cc`]（它说不模拟就返回 `None`），这里只负责
+    /// 把模拟身份——profile、会话 id、会话链——派生出来。
     fn detect(
         body: Option<&serde_json::Value>,
         headers: &HeaderMap,
@@ -5656,59 +5649,8 @@ impl Simulation {
         cred: &crate::credentials::Credential,
         device_fp: &str,
     ) -> Option<Self> {
-        if !flags.simulate_cc || !flags.merge_beta {
-            return None;
-        }
         let v = body?;
-        // 真正的 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）**不模拟**：整套换头
-        // 会把它自报的 UA 与 `x-app`/`x-stainless-*` 换成抓包那台机器的取值，凭空造出一台
-        // 别的机器。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
-        //
-        // 「真正的 CC 客户端」要 UA 与体两头都对得上。只对一头的两种都走模拟：
-        // - CC 形态（`system` 里有身份声明 / billing header）但 UA 不是 CC（`Go-http-client`、
-        //   `python-httpx`……）：抄了 system 却没配套改 UA，这种头体不一致比不模拟更容易被
-        //   上游标记，不如一并接管。[`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉
-        //   客户端已有的那份身份声明和 billing header，再由模拟统一补上官方的，避免重复；
-        // - UA 是 CC 但体不是 CC 形态：见下。
-        //
-        // UA 自报 CC、体是 CC 形态、工具列表看起来也像 CC（含官方工具名，或压根没带 tools）
-        // → 跳过模拟。差任何一样都当第三方冒用 CC UA 处理，走模拟：
-        // - tools 里一个官方名都没有 → 跳过模拟只会让工具全变成 `mcp__luban__*` 却拿不到
-        //   模拟路径的整套头/system 配合，上游仍判第三方；
-        // - `system` 里既没有身份声明也没有 billing header → 真 CC（含 VSCode 扩展、
-        //   agent-sdk、子代理）每条请求都带 billing header 块，没有它的不是官方客户端发的。
-        //   封号复盘（`ban.log`）里那批探活请求正是这个样子：`claude-cli/2.1.220` 的 UA、
-        //   官方格式的 `metadata.user_id`，配一份 3 块、无 tools、55 token 的自造 system。
-        //   照抄了 UA 却没抄形态，透传出去就是一条头体矛盾的请求；模拟接管后 UA、头、
-        //   system 全套换成官方的，反而自洽。上面那段「不模拟真 CC」的两处代价对这类
-        //   请求已不成立：模拟 UA 取已知最新版（不会倒退），会话 id 优先沿用来访自己那个；
-        // - `system` 里有身份声明却**没有基座提示词**（[`has_cc_base_prompt`]）→ 官方只要写了
-        //   身份句就一定带基座（主请求 1.2KB–10KB，haiku 工具调用 3KB），只抄身份句不抄基座
-        //   的是去掉基座省 token 的第三方。`ban.log` 里 `claude-cli/2.1.165` 那批就是：billing
-        //   header + 身份句两块、`tools: []`、每台新设备跑同样四道题。透传出去是一条官方从不
-        //   发的形态；模拟接管后补上基座与官方工具，出去的才是完整的官方请求。唯一的例外是
-        //   `max_tokens=1` 的 cache 预热：2.1.187 Claude Desktop 的预热就带这两块 system，
-        //   给它补基座和工具只会把一条预热改成一条截到 1 token 的主请求，更假。
-        //   另一个例外是**官方 Helper 子代理**（[`is_official_helper_request`]）：它整个 system
-        //   只有 `[153, 62]` 两块、没有任何长块（`cap/2.1.260/00024`），按基座阈值判会把一条
-        //   官方请求送进模拟、给它接上一份主线程基座——那才是形态异常。例外按官方 Helper 的
-        //   形态逐项对（两块 system、子代理 billing header、SDK 身份句、haiku + `tools: []` +
-        //   `max_tokens=32000` + 流式），不是看到一个 `cc_is_subagent=true` 标记就放。带长
-        //   提示词的 SDK 子代理不需要这个例外，它过的是基座阈值。
-        //   身份格式也是一头：device 不是 64 位 hex、session 不是 uuid 的（[`cc_identity_well_formed`]）
-        //   同样不当官方客户端，走模拟让身份被重建——抄错的值不该到上游，但也不算探针，不拒。
-        //   官方**额度探测**（[`is_quota_probe_shaped`]：haiku、`max_tokens=1`、正文 `quota`、
-        //   **没有 system 也没有 tools**）过不了 `is_cc_shaped`，得单独放：它是官方形态里唯一
-        //   一条没有 system 的，装成主线程（补 system、基座、工具）正是既定要求里禁止的事。
-        //   这里曾经漏过一次——把「CC UA 且工具像 CC」收成「还得是 CC 形态」时忘了它。
-        let prewarm = request_max_tokens(Some(v)) == Some(1);
-        let official_shape = is_quota_probe_shaped(v)
-            || (is_cc_shaped(v)
-                && (prewarm
-                    || is_official_helper_request(v, &inbound_beta_list(headers))
-                    || has_cc_base_prompt(v))
-                && has_cc_tool_profile(v));
-        if from_cc_client && cc_identity_well_formed(headers, v) && official_shape {
+        if !simulates_cc(Some(v), headers, from_cc_client, flags) {
             return None;
         }
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
@@ -5726,6 +5668,86 @@ impl Simulation {
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
         Some(Self { base: cc_system_base(model), profile, session_id, link })
     }
+}
+
+/// 这条请求会不会被模拟路径接管——[`Simulation::detect`] 的判定部分，单拎出来是因为
+/// **设备指纹要在 detect 之前就知道出站 UA**（[`device_fingerprint`] / [`outbound_ua`]）：
+/// 模拟路径整套换头，UA 恒为 [`config::CC_USER_AGENT`]，与来访自报的那串是两台设备。
+/// detect 自己也调它，两处判据只有这一份，不会各判各的。
+///
+/// 返回 `false`（原样转发）的三种情形：开关关着、请求体不是我们能改的 JSON、
+/// 来访是 Claude Code 客户端**且体也是完整的 CC 形态**——身份格式合法
+/// （[`cc_identity_well_formed`]），且要么是官方额度探测（[`is_quota_probe_shaped`]，官方
+/// 唯一一条没有 system 的），要么 `system` 里带着身份声明或 billing header
+/// （[`is_cc_shaped`]）、带着官方那段基座提示词（[`has_cc_base_prompt`]；`max_tokens=1` 的
+/// 预热与官方 Helper 除外）、工具列表符合 CC 特征（[`has_cc_tool_profile`]——含官方工具名，
+/// 或没带 `tools`）。
+/// UA 自报 CC 但体不完整（缺那几样中的任一）、或工具列表全是非官方名的请求，都视为第三方
+/// 冒用 CC UA，仍走模拟路径重塑成官方形态。
+///
+/// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
+/// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
+/// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
+fn simulates_cc(
+    body: Option<&serde_json::Value>,
+    headers: &HeaderMap,
+    from_cc_client: bool,
+    flags: store::ForwardFlags,
+) -> bool {
+    if !flags.simulate_cc || !flags.merge_beta {
+        return false;
+    }
+    let Some(v) = body else { return false };
+    // 真正的 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）**不模拟**：整套换头
+    // 会把它自报的 UA 与 `x-app`/`x-stainless-*` 换成抓包那台机器的取值，凭空造出一台
+    // 别的机器。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
+    //
+    // 「真正的 CC 客户端」要 UA 与体两头都对得上。只对一头的两种都走模拟：
+    // - CC 形态（`system` 里有身份声明 / billing header）但 UA 不是 CC（`Go-http-client`、
+    //   `python-httpx`……）：抄了 system 却没配套改 UA，这种头体不一致比不模拟更容易被
+    //   上游标记，不如一并接管。[`simulate_system`] 里的 [`strip_cc_preamble`] 会剥掉
+    //   客户端已有的那份身份声明和 billing header，再由模拟统一补上官方的，避免重复；
+    // - UA 是 CC 但体不是 CC 形态：见下。
+    //
+    // UA 自报 CC、体是 CC 形态、工具列表看起来也像 CC（含官方工具名，或压根没带 tools）
+    // → 跳过模拟。差任何一样都当第三方冒用 CC UA 处理，走模拟：
+    // - tools 里一个官方名都没有 → 跳过模拟只会让工具全变成 `mcp__luban__*` 却拿不到
+    //   模拟路径的整套头/system 配合，上游仍判第三方；
+    // - `system` 里既没有身份声明也没有 billing header → 真 CC（含 VSCode 扩展、
+    //   agent-sdk、子代理）每条请求都带 billing header 块，没有它的不是官方客户端发的。
+    //   封号复盘（`ban.log`）里那批探活请求正是这个样子：`claude-cli/2.1.220` 的 UA、
+    //   官方格式的 `metadata.user_id`，配一份 3 块、无 tools、55 token 的自造 system。
+    //   照抄了 UA 却没抄形态，透传出去就是一条头体矛盾的请求；模拟接管后 UA、头、
+    //   system 全套换成官方的，反而自洽。上面那段「不模拟真 CC」的两处代价对这类
+    //   请求已不成立：模拟 UA 取已知最新版（不会倒退），会话 id 优先沿用来访自己那个；
+    // - `system` 里有身份声明却**没有基座提示词**（[`has_cc_base_prompt`]）→ 官方只要写了
+    //   身份句就一定带基座（主请求 1.2KB–10KB，haiku 工具调用 3KB），只抄身份句不抄基座
+    //   的是去掉基座省 token 的第三方。`ban.log` 里 `claude-cli/2.1.165` 那批就是：billing
+    //   header + 身份句两块、`tools: []`、每台新设备跑同样四道题。透传出去是一条官方从不
+    //   发的形态；模拟接管后补上基座与官方工具，出去的才是完整的官方请求。唯一的例外是
+    //   `max_tokens=1` 的 cache 预热：2.1.187 Claude Desktop 的预热就带这两块 system，
+    //   给它补基座和工具只会把一条预热改成一条截到 1 token 的主请求，更假。
+    //   另一个例外是**官方 Helper 子代理**（[`is_official_helper_request`]）：它整个 system
+    //   只有 `[153, 62]` 两块、没有任何长块（`cap/2.1.260/00024`），按基座阈值判会把一条
+    //   官方请求送进模拟、给它接上一份主线程基座——那才是形态异常。例外按官方 Helper 的
+    //   形态逐项对（两块 system、子代理 billing header、SDK 身份句、haiku + `tools: []` +
+    //   `max_tokens=32000` + 流式），不是看到一个 `cc_is_subagent=true` 标记就放。带长
+    //   提示词的 SDK 子代理不需要这个例外，它过的是基座阈值。
+    //   身份格式也是一头：device 不是 64 位 hex、session 不是 uuid 的（[`cc_identity_well_formed`]）
+    //   同样不当官方客户端，走模拟让身份被重建——抄错的值不该到上游，但也不算探针，不拒。
+    //   官方**额度探测**（[`is_quota_probe_shaped`]：haiku、`max_tokens=1`、正文 `quota`、
+    //   **没有 system 也没有 tools**）过不了 `is_cc_shaped`，得单独放：它是官方形态里唯一
+    //   一条没有 system 的，装成主线程（补 system、基座、工具）正是既定要求里禁止的事。
+    //   这里曾经漏过一次——把「CC UA 且工具像 CC」收成「还得是 CC 形态」时忘了它。
+    let prewarm = request_max_tokens(Some(v)) == Some(1);
+    let official_shape = is_quota_probe_shaped(v)
+        || (is_cc_shaped(v)
+            && (prewarm
+                || is_official_helper_request(v, &inbound_beta_list(headers))
+                || has_cc_base_prompt(v))
+            && has_cc_tool_profile(v));
+    // 三样都对上 = 真正的官方客户端，原样转发；差任何一样都由模拟接管。
+    !(from_cc_client && cc_identity_well_formed(headers, v) && official_shape)
 }
 
 /// 来访是否已经是 Claude Code 形态——两条判据命中任一即算是：
@@ -8115,12 +8137,43 @@ fn sim_device_id(
     cred.spoof_device_id(device_fp).map(|d| format!("sim:{d}"))
 }
 
-/// 构造设备指纹：客户端原始 `device_id` + 平台 `arch`/`os`，用于派生每设备唯一的伪装
-/// device_id。刻意只取**稳定的硬件/系统身份**，排除会随客户端升级变动的字段
-/// （runtime 版本、UA 版本号），以免每次升级都刷新 device_id。
-fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap) -> String {
+/// 构造设备指纹：客户端原始 `device_id` + 平台 `arch`/`os` + **这条请求实际发往上游的 UA**，
+/// 用于派生每设备唯一的伪装 device_id。
+///
+/// **出站 UA 必须在里面**，否则伪装 device_id 与它自己发出去的客户端版本是脱钩的：
+/// [`NORMALIZE_DEVICE_FP`](store::NORMALIZE_DEVICE_FP) 开着时同平台的所有客户端收敛成一个
+/// device_id，可它们各自的 UA 仍原样透传，上游看到的就是**同一台设备同时跑着好几个版本**。
+/// 封号复盘（`luban-ban-3`，Pro 号建号第 3 天挂起）里这条最刺眼：一个出站 device_id 上
+/// 223 条请求在 `2.1.141 (sdk-cli)` / `2.1.263 (claude-vscode)` / `2.1.260 (claude-vscode)` /
+/// `2.1.223 (sdk-cli)` 四串 UA 之间来回跳了 44 次，**最小间隔 0 秒**；另一个 device_id 上
+/// 122 条跳了 50 次，还带 `2.1.260 → 2.1.220` 的降级。一台真机不可能在同一秒既是 2.1.141 的
+/// sdk-cli 又是 2.1.263 的 VSCode 扩展——这是任何用量特征都掩不住的自证。
+///
+/// 代价是**客户端升级会换一个 device_id**（真实 CC 的 device_id 是跨升级恒定的机器标识）。
+/// 两害相权：升级换 id 在上游看来是「这台机器重装了一次」，真实用户里常见；同一秒里版本
+/// 反复横跳则是官方客户端**不可能**产生的形态。同理，设备数从「每平台 1 个」变成
+/// 「每 (平台, 客户端版本) 1 个」，上限仍受设备绑定名额（[`store::DEFAULT_DEVICE_LIMIT`]）约束。
+///
+/// 除 UA 外仍只取**稳定的硬件/系统身份**：runtime 版本、SDK 包版本这些同一版本客户端也会
+/// 各不相同的字段不进指纹，免得同一台机器碎成一堆设备。
+fn device_fingerprint(client_device_id: Option<&str>, headers: &HeaderMap, out_ua: &str) -> String {
     let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
-    format!("{}|{}|{}", client_device_id.unwrap_or(""), h("x-stainless-arch"), h("x-stainless-os"),)
+    format!(
+        "{}|{}|{}|{}",
+        client_device_id.unwrap_or(""),
+        h("x-stainless-arch"),
+        h("x-stainless-os"),
+        out_ua,
+    )
+}
+
+/// 这条请求实际发往上游的 UA：模拟路径整套换头，UA 恒为 [`config::CC_USER_AGENT`]
+/// （[`config::CC_SIM_HEADERS`]）；其余路径原样转发来访那份。
+///
+/// 只用于算设备指纹——真正装头的是 [`build_forward_headers_for`]，两处的取值规则必须同源，
+/// 不然指纹会把一条请求算到另一台设备名下。
+fn outbound_ua(client_ua: &str, simulated: bool) -> &str {
+    if simulated { config::CC_USER_AGENT } else { client_ua }
 }
 
 /// 从一组头里取 `User-Agent` 供日志与落库用：没有该头或不是可打印 ASCII 时为 `-`。
@@ -10833,10 +10886,12 @@ pub async fn probe(
         cred.access_token.clone()
     };
 
-    // 复用「裸客户端」那份设备指纹（`device_fingerprint(None, 空头)` 恒为 `"||"`），不另造一个：
-    // 指纹只用于派生伪装 device_id 与 session_id，每加一份就等于给这个账号在上游多一台设备，
-    // 而测试并不需要一个自己的身份。
-    let device_fp = device_fingerprint(None, &HeaderMap::new());
+    // 复用「裸客户端」那份设备指纹，不另造一个：指纹只用于派生伪装 device_id 与 session_id，
+    // 每加一份就等于给这个账号在上游多一台设备，而测试并不需要一个自己的身份。
+    //
+    // UA 那段给 [`config::CC_USER_AGENT`]：这条测试走模拟路径，发出去的就是它。写死空串会让
+    // 这台「设备」的指纹与它自报的版本对不上——正是 [`device_fingerprint`] 要堵的那件事。
+    let device_fp = device_fingerprint(None, &HeaderMap::new(), config::CC_USER_AGENT);
     let flags = store::ForwardFlags::default();
     // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
     // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。
@@ -17190,6 +17245,107 @@ mod tests {
             ),
             "扁平串形态应原格式改写，而不是被换成 CC 的 JSON 形态"
         );
+    }
+
+    /// 平台头齐全的一份来访头，供设备指纹用例用。
+    fn platform_headers(client_ua: Option<&'static str>) -> super::HeaderMap {
+        let mut h = super::HeaderMap::new();
+        h.insert("x-stainless-arch", HeaderValue::from_static("arm64"));
+        h.insert("x-stainless-os", HeaderValue::from_static("MacOS"));
+        if let Some(ua) = client_ua {
+            h.insert(header::USER_AGENT, HeaderValue::from_static(ua));
+        }
+        h
+    }
+
+    /// 出站 UA 进设备指纹：**同一台设备只会有一个客户端版本**，换版本就是换设备。
+    ///
+    /// 复盘依据见 [`super::device_fingerprint`]：归一化把同平台的客户端收敛成一个 device_id，
+    /// 各自的 UA 却原样透传，上游看到的是「同一台设备同一秒里既是 2.1.141 的 sdk-cli
+    /// 又是 2.1.263 的 VSCode 扩展」——官方客户端不可能产生的形态。
+    #[test]
+    fn device_fingerprint_separates_client_versions() {
+        const UA_OLD: &str = "claude-cli/2.1.141 (external, sdk-cli)";
+        const UA_NEW: &str = "claude-cli/2.1.263 (external, claude-vscode, agent-sdk/0.3.263)";
+        let h = platform_headers(None);
+
+        let old = super::device_fingerprint(None, &h, UA_OLD);
+        let new = super::device_fingerprint(None, &h, UA_NEW);
+        assert_ne!(old, new, "同平台、不同客户端版本必须落在两台设备上");
+        assert_ne!(
+            test_cred().spoof_device_id(&old),
+            test_cred().spoof_device_id(&new),
+            "指纹不同，派生出的伪装 device_id 也必须不同"
+        );
+        // 同一版本恒定：升级才换设备，逐请求不会漂。
+        assert_eq!(old, super::device_fingerprint(None, &h, UA_OLD));
+
+        // 归一化开着（`client_device_id = None`）时，同平台 + 同版本的多个客户端仍收敛成
+        // 一台设备——这是本次改动**没有**动的那一半。
+        assert_eq!(
+            super::device_fingerprint(None, &h, UA_OLD),
+            super::device_fingerprint(None, &platform_headers(None), UA_OLD),
+        );
+        // 归一化关着时照旧按客户端设备分开。
+        assert_ne!(
+            super::device_fingerprint(Some("dev-a"), &h, UA_OLD),
+            super::device_fingerprint(Some("dev-b"), &h, UA_OLD),
+        );
+        // 平台仍然参与：同版本、不同系统不是一台设备。
+        let mut win = super::HeaderMap::new();
+        win.insert("x-stainless-arch", HeaderValue::from_static("x64"));
+        win.insert("x-stainless-os", HeaderValue::from_static("Windows"));
+        assert_ne!(old, super::device_fingerprint(None, &win, UA_OLD));
+    }
+
+    /// 指纹里那段 UA 取的是**出站**那份：模拟路径整套换头（UA 恒为
+    /// [`config::CC_USER_AGENT`]），所以被模拟的第三方客户端落在「官方客户端」那台设备上，
+    /// 而不是各自自报的 UA 上——否则指纹与真正发出去的版本又对不上了。
+    #[test]
+    fn device_fingerprint_follows_the_outbound_ua() {
+        assert_eq!(super::outbound_ua("python-httpx/0.27.0", true), config::CC_USER_AGENT);
+        assert_eq!(super::outbound_ua("Go-http-client/2.0", true), config::CC_USER_AGENT);
+        assert_eq!(
+            super::outbound_ua("claude-cli/2.1.141 (external, sdk-cli)", false),
+            "claude-cli/2.1.141 (external, sdk-cli)",
+            "非模拟路径原样转发来访那份，指纹也跟着它"
+        );
+
+        let h = platform_headers(None);
+        assert_eq!(
+            super::device_fingerprint(None, &h, super::outbound_ua("python-httpx/0.27.0", true)),
+            super::device_fingerprint(None, &h, super::outbound_ua("Go-http-client/2.0", true)),
+            "两个第三方 UA 都被重塑成同一个官方客户端，就是同一台设备"
+        );
+    }
+
+    /// [`super::simulates_cc`] 与 [`super::Simulation::detect`] 必须给出同一个答案——指纹在
+    /// detect 之前先用前者算出站 UA，两处判据一旦分叉，一条请求就会被算到另一台设备名下。
+    #[test]
+    fn simulates_cc_agrees_with_detect() {
+        const CC_UA: &str = "claude-cli/2.1.260 (external, cli)";
+        let cc_shaped = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":[{{"type":"text","text":"{}"}},{}],"messages":[]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
+        let plain = Bytes::from(PLAIN_BODY.to_string());
+        let sim_off = store::ForwardFlags { simulate_cc: false, ..all_on() };
+
+        let agrees = |body: &Bytes, headers: &super::HeaderMap, flags: store::ForwardFlags| {
+            let v = parsed(body);
+            let from_cc = super::trusted_cc_version(&super::ua_of(headers)).is_some();
+            let by_predicate = super::simulates_cc(v.as_ref(), headers, from_cc, flags);
+            let by_detect = detect_with(body, headers, flags).is_some();
+            assert_eq!(by_predicate, by_detect, "两处判据必须同源");
+            by_predicate
+        };
+
+        let cc_ua = platform_headers(Some(CC_UA));
+        assert!(!agrees(&cc_shaped, &cc_ua, all_on()), "真 CC（UA + 形态都对）不模拟");
+        assert!(agrees(&cc_shaped, &platform_headers(None), all_on()), "抄了形态没抄 UA 的走模拟");
+        assert!(agrees(&plain, &cc_ua, all_on()), "抄了 UA 没抄形态的走模拟");
+        assert!(!agrees(&plain, &cc_ua, sim_off), "开关关着一律不模拟");
     }
 
     /// `spoof_device_id` 关掉时只换 account 段，来访自带的 `device_id` 原样保留。
