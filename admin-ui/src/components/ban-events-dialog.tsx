@@ -1,12 +1,15 @@
 import React, { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronDownIcon, ChevronRightIcon, CopyIcon, RefreshCwIcon } from 'lucide-react'
+import {
+  ChevronDownIcon, ChevronRightIcon, CopyIcon, DownloadIcon, RefreshCwIcon,
+} from 'lucide-react'
 import {
   listBanEventLogs, listBanEvents, type BanEvent, type UsageLog, type ValueCount,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
-  cn, copyText, displayCredentialLabel, extractError, formatFullTime, formatUsd,
+  cn, copyText, displayCredentialLabel, downloadJson, extractError, fileStamp, formatFullTime,
+  formatUsd,
 } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -72,6 +75,17 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
     toastManager.add({
       type: ok ? 'success' : 'error',
       title: ok ? t('已复制事件与流水 JSON', 'Copied event + logs as JSON') : t('复制失败', 'Copy failed'),
+    })
+  }
+
+  // 复盘要的是**整份**：一次封号常带上千行流水（封前 7 天全量），复制到剪贴板经常在半路
+  // 断掉——超长文本、非安全上下文下的 execCommand 回退都会。存成文件不吃这两样限制，拿到
+  // 的一定是完整的那份。
+  const downloadAll = () => {
+    downloadJson(`luban-ban-${ev.id}-${fileStamp(ev.ts)}.json`, { event: ev, logs: rows })
+    toastManager.add({
+      type: 'success',
+      title: t(`已存成文件（${rows.length} 条流水）`, `Saved to a file (${rows.length} rows)`),
     })
   }
 
@@ -145,9 +159,14 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
             {t('封前 7 天 + 封后 10 分钟内到达的请求，含触发那一发', 'Requests from 7 days before to 10 minutes after, including the triggering one')}
           </span>
         </div>
-        <Button size="sm" variant="outline" onClick={copyAll} disabled={logs.isPending}>
-          <CopyIcon />{t('复制 JSON', 'Copy JSON')}
-        </Button>
+        <div className="flex shrink-0 gap-2">
+          <Button size="sm" variant="outline" onClick={copyAll} disabled={logs.isPending}>
+            <CopyIcon />{t('复制 JSON', 'Copy JSON')}
+          </Button>
+          <Button size="sm" variant="outline" onClick={downloadAll} disabled={logs.isPending}>
+            <DownloadIcon />{t('下载 JSON', 'Download JSON')}
+          </Button>
+        </div>
       </div>
 
       {logs.isPending ? (

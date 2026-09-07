@@ -340,6 +340,32 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 /**
+ * 把一份 JSON 存成本地文件：Blob + 临时 `<a download>`，下完立刻释放 URL。
+ *
+ * 不用 `<a href="/api/...">` 直连接口：那些接口都要带管理密码头，浏览器自己发的导航请求不
+ * 带头，只会拿到 401。数据本来就已经在手里，序列化下来即可。
+ *
+ * 与 {@link copyText} 是同一件事的两条路：几千行的流水复制到剪贴板经常半路失败（超长文本、
+ * 非安全上下文下的 execCommand 回退），存成文件不受这两样限制。
+ */
+export function downloadJson(filename: string, data: unknown): void {
+  const url = URL.createObjectURL(
+    new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }),
+  )
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+/** Unix 秒 → 文件名里的时间戳：`20260907-021208`，本地时区。 */
+export function fileStamp(unixSecs: number): string {
+  const d = new Date(unixSecs * 1000)
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+}
+
+/**
  * 剩余秒数 → 紧凑倒计时：`45m`、`2h 5m`、`6d 0h`，不足一分钟为 `<1m`。
  *
  * 中英文共用这套缩写：它出现在卡片上最挤的那一行（窗口标签 + 进度条 + 百分比 + 倒计时），
