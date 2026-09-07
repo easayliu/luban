@@ -3953,16 +3953,30 @@ impl CredentialStore {
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
-    /// 某封号事件冻结下来的流水（按时间正序，最早的在前，读起来是一条时间线）。
+    /// 某封号事件冻结下来的**一页**流水（按时间正序，最早的在前，读起来是一条时间线），
+    /// 连同该事件冻结的总条数一起给出。
+    ///
+    /// 一次封号常冻下上千行、几十 MB（每行还带形态摘要 JSON），整份吐给页面既慢又白读，
+    /// 所以这里只给一页。总条数与当页在同一把锁里取：冻结表写完就不再变，两者天然自洽。
     /// `id` 是冻结表自己的主键；原流水的 id 不返回——它在原表里可能早已被裁掉。
-    pub fn frozen_usage_logs(&self, ban_event_id: i64) -> Result<Vec<UsageLog>> {
+    pub fn frozen_usage_logs(
+        &self,
+        ban_event_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(i64, Vec<UsageLog>)> {
         let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usage_logs_frozen WHERE ban_event_id = ?1",
+            [ban_event_id],
+            |r| r.get(0),
+        )?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id, {USAGE_LOG_COLS} FROM usage_logs_frozen
-              WHERE ban_event_id = ?1 ORDER BY ts, id"
+              WHERE ban_event_id = ?1 ORDER BY ts, id LIMIT ?2 OFFSET ?3"
         ))?;
-        let rows = stmt.query_map([ban_event_id], usage_log_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rows = stmt.query_map([ban_event_id, limit, offset], usage_log_from_row)?;
+        Ok((total, rows.collect::<rusqlite::Result<Vec<_>>>()?))
     }
 }
 
@@ -5629,7 +5643,7 @@ mod tests {
         assert_eq!(ev.models_7d[0]["value"], "claude-opus-5");
         assert_eq!(ev.models_7d[0]["count"], 2);
         assert_eq!(ev.frozen_rows, 2, "只冻结 7 天窗口内的流水");
-        let frozen = store.frozen_usage_logs(ev.id).unwrap();
+        let frozen = store.frozen_usage_logs(ev.id, 100, 0).unwrap().1;
         assert_eq!(frozen.len(), 2);
         assert_eq!(frozen[0].forensics.shape.as_deref(), Some("{\"keys\":[\"model\"]}"));
         assert_eq!(frozen[0].forensics.proxy.as_deref(), Some("socks5h://u:***@exit1:1080"));
@@ -5647,22 +5661,32 @@ mod tests {
         rec.status = 403;
         rec.forensics.error_type = Some("permission_error".into());
         store.insert_usage_log(&rec).unwrap();
-        let frozen = store.frozen_usage_logs(ev.id).unwrap();
+        let frozen = store.frozen_usage_logs(ev.id, 100, 0).unwrap().1;
         assert_eq!(frozen.len(), 3);
         assert_eq!(frozen[2].status, 403);
         assert_eq!(frozen[2].forensics.error_type.as_deref(), Some("permission_error"));
+
+        // 翻页：总条数报的是整份，页只给要的那几条，越界页空着（页面靠 total 算页数）。
+        let (total, page) = store.frozen_usage_logs(ev.id, 2, 0).unwrap();
+        assert_eq!((total, page.len()), (3, 2));
+        assert_eq!(page[0].ts, frozen[0].ts);
+        let (total, page) = store.frozen_usage_logs(ev.id, 2, 2).unwrap();
+        assert_eq!((total, page.len()), (3, 1));
+        assert_eq!(page[0].status, 403, "第二页接着同一条时间线，不从头再来");
+        assert!(store.frozen_usage_logs(ev.id, 2, 10).unwrap().1.is_empty());
+
         // 封后太久的不算。
         store.insert_usage_log_at(&rec, Some(now + FREEZE_TAIL_SECS + 60)).unwrap();
-        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+        assert_eq!(store.frozen_usage_logs(ev.id, 100, 0).unwrap().1.len(), 3);
 
         // 解封不清事件；删号不删事件与冻结流水；裁剪不碰冻结表。
         store.set_disabled(a.id, false).unwrap();
         assert_eq!(store.ban_counts().unwrap()[&a.id], 1);
         assert!(store.delete(a.id).unwrap());
         assert_eq!(store.list_ban_events(Some(a.id), 10).unwrap().len(), 1);
-        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+        assert_eq!(store.frozen_usage_logs(ev.id, 100, 0).unwrap().1.len(), 3);
         store.prune_usage_logs().unwrap();
-        assert_eq!(store.frozen_usage_logs(ev.id).unwrap().len(), 3);
+        assert_eq!(store.frozen_usage_logs(ev.id, 100, 0).unwrap().1.len(), 3);
     }
 
     /// 老库升级：`usage_logs` 还没有取证列、两张新表都不存在。init_schema 之后要能正常写入、
@@ -5707,7 +5731,7 @@ mod tests {
         assert_eq!(ev.source, "manual");
         assert_eq!(ev.frozen_rows, 1);
         assert_eq!(
-            store.frozen_usage_logs(ev.id).unwrap()[0].forensics.proxy.as_deref(),
+            store.frozen_usage_logs(ev.id, 100, 0).unwrap().1[0].forensics.proxy.as_deref(),
             Some("http://h:1")
         );
     }

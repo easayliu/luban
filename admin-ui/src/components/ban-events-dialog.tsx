@@ -1,10 +1,11 @@
 import React, { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   ChevronDownIcon, ChevronRightIcon, CopyIcon, DownloadIcon, RefreshCwIcon,
 } from 'lucide-react'
 import {
-  listBanEventLogs, listBanEvents, type BanEvent, type UsageLog, type ValueCount,
+  fetchAllBanEventLogs, listBanEventLogs, listBanEvents,
+  type BanEvent, type UsageLog, type ValueCount,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
@@ -18,12 +19,21 @@ import {
   Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
+import {
+  Pagination, PaginationContent, PaginationItem, PaginationNext, PaginationPrevious,
+} from '@/components/ui/pagination'
+import {
+  Select, SelectItem, SelectPopup, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
 import { RequestIdChip, statusVariant } from '@/components/credential-usage-dialog'
+
+/** 冻结流水每页条数可选值。后端上限 1000。 */
+const PAGE_SIZES = [25, 50, 100] as const
 
 /** 触发来源 → 人话。 */
 function sourceLabel(source: string, t: (zh: string, en: string) => string): string {
@@ -62,16 +72,54 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
 
 /** 一条事件的详情：账号侧快照 + 冻结流水时间线。 */
 function BanEventDetail({ ev }: { ev: BanEvent }) {
-  const { t, language } = useI18n()
+  const { t, language, locale } = useI18n()
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
+  const [page, setPage] = useState(0)
+  /** 导出（复制/下载）正在连着翻页拉整份：期间两个按钮都锁上，免得拉出半份。 */
+  const [exporting, setExporting] = useState(false)
   const logs = useQuery({
-    queryKey: ['ban-event-logs', ev.id],
-    queryFn: () => listBanEventLogs(ev.id),
+    queryKey: ['ban-event-logs', ev.id, page, pageSize],
+    queryFn: () => listBanEventLogs(ev.id, { limit: pageSize, offset: page * pageSize }),
+    // 翻页时先留着上一页，避免时间线整块闪成 spinner。
+    placeholderData: keepPreviousData,
   })
-  const rows = logs.data ?? []
+  const rows = logs.data?.logs ?? []
+  // 冻结表写完就不再变，总条数用接口给的；接口还没回来时先用事件里记着的那个数。
+  const total = logs.data?.total ?? ev.frozen_rows
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  // 页码越界（改了每页条数）时退回最后一页，而不是显示一页空白。
+  const currentPage = Math.min(page, totalPages - 1)
+  if (currentPage !== page) setPage(currentPage)
+  const firstIndex = currentPage * pageSize + 1
+  const lastIndex = currentPage * pageSize + rows.length
   const dash = '—'
 
+  /**
+   * 取证包要的是**整份**，而页面只按页拉——导出时现连着翻完再拼。
+   *
+   * 拼在前端而不是给后端开一个「全量」口子：整份常有几十 MB，一次性生成、传输、驻留在
+   * 内存里的代价只有真按了导出的人该付，翻着看的人不该跟着等。
+   */
+  const collect = async (): Promise<{ event: BanEvent; logs: UsageLog[] } | null> => {
+    setExporting(true)
+    try {
+      return { event: ev, logs: await fetchAllBanEventLogs(ev.id) }
+    } catch (err) {
+      toastManager.add({
+        type: 'error',
+        title: t('取整份流水失败', 'Failed to fetch the full timeline'),
+        description: extractError(err, language),
+      })
+      return null
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const copyAll = async () => {
-    const ok = await copyText(JSON.stringify({ event: ev, logs: rows }, null, 2))
+    const pack = await collect()
+    if (!pack) return
+    const ok = await copyText(JSON.stringify(pack, null, 2))
     toastManager.add({
       type: ok ? 'success' : 'error',
       title: ok ? t('已复制事件与流水 JSON', 'Copied event + logs as JSON') : t('复制失败', 'Copy failed'),
@@ -81,11 +129,13 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
   // 复盘要的是**整份**：一次封号常带上千行流水（封前 7 天全量），复制到剪贴板经常在半路
   // 断掉——超长文本、非安全上下文下的 execCommand 回退都会。存成文件不吃这两样限制，拿到
   // 的一定是完整的那份。
-  const downloadAll = () => {
-    downloadJson(`luban-ban-${ev.id}-${fileStamp(ev.ts)}.json`, { event: ev, logs: rows })
+  const downloadAll = async () => {
+    const pack = await collect()
+    if (!pack) return
+    downloadJson(`luban-ban-${ev.id}-${fileStamp(ev.ts)}.json`, pack)
     toastManager.add({
       type: 'success',
-      title: t(`已存成文件（${rows.length} 条流水）`, `Saved to a file (${rows.length} rows)`),
+      title: t(`已存成文件（${pack.logs.length} 条流水）`, `Saved to a file (${pack.logs.length} rows)`),
     })
   }
 
@@ -156,15 +206,16 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
         <div className="text-sm font-medium">
           {t('封前流水时间线', 'Traffic timeline before the ban')}
           <span className="ml-2 text-xs text-muted-foreground">
-            {t('封前 7 天 + 封后 10 分钟内到达的请求，含触发那一发', 'Requests from 7 days before to 10 minutes after, including the triggering one')}
+            {t('封前 7 天 + 封后 10 分钟内到达的请求，含触发那一发；表里按页看，导出给的是整份', 'Requests from 7 days before to 10 minutes after, including the triggering one; the table pages, the export gives you all of them')}
           </span>
         </div>
         <div className="flex shrink-0 gap-2">
-          <Button size="sm" variant="outline" onClick={copyAll} disabled={logs.isPending}>
+          <Button size="sm" variant="outline" onClick={copyAll} disabled={exporting || total === 0}>
             <CopyIcon />{t('复制 JSON', 'Copy JSON')}
           </Button>
-          <Button size="sm" variant="outline" onClick={downloadAll} disabled={logs.isPending}>
-            <DownloadIcon />{t('下载 JSON', 'Download JSON')}
+          <Button size="sm" variant="outline" onClick={downloadAll} disabled={exporting || total === 0}>
+            {exporting ? <Spinner className="size-4" /> : <DownloadIcon />}
+            {t('下载 JSON', 'Download JSON')}
           </Button>
         </div>
       </div>
@@ -176,33 +227,91 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
           <AlertTitle>{t('读取失败', 'Failed to load')}</AlertTitle>
           <AlertDescription>{extractError(logs.error, language)}</AlertDescription>
         </Alert>
-      ) : rows.length === 0 ? (
+      ) : total === 0 ? (
         <div className="py-4 text-center text-sm text-muted-foreground">
           {t('这次封号之前没有留下流水（可能已被裁剪，或账号刚加进来就被封）', 'No traffic was recorded before this ban (pruned, or the account was banned right after being added)')}
         </div>
       ) : (
-        <div className="overflow-x-auto rounded-md border bg-background">
-          <Table className="text-xs">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
-                <TableHead>{t('状态', 'Status')}</TableHead>
-                <TableHead>{t('模型', 'Model')}</TableHead>
-                <TableHead>{t('设备（来访→出站）', 'Device (in→out)')}</TableHead>
-                <TableHead>{t('客户端 UA', 'Client UA')}</TableHead>
-                <TableHead>{t('出口', 'Proxy')}</TableHead>
-                <TableHead>{t('标记', 'Flags')}</TableHead>
-                <TableHead className="text-right">{t('输入/输出', 'In/Out')}</TableHead>
-                <TableHead className="text-right">{t('花费', 'Cost')}</TableHead>
-                <TableHead>{t('上游报错', 'Upstream error')}</TableHead>
-                <TableHead>{t('形态', 'Shape')}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((log) => <FrozenRow key={log.id} log={log} trigger={log.request_id != null && log.request_id === ev.request_id} />)}
-            </TableBody>
-          </Table>
-        </div>
+        <>
+          <div className="overflow-x-auto rounded-md border bg-background">
+            <Table className="text-xs">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
+                  <TableHead>{t('状态', 'Status')}</TableHead>
+                  <TableHead>{t('模型', 'Model')}</TableHead>
+                  <TableHead>{t('设备（来访→出站）', 'Device (in→out)')}</TableHead>
+                  <TableHead>{t('客户端 UA', 'Client UA')}</TableHead>
+                  <TableHead>{t('出口', 'Proxy')}</TableHead>
+                  <TableHead>{t('标记', 'Flags')}</TableHead>
+                  <TableHead className="text-right">{t('输入/输出', 'In/Out')}</TableHead>
+                  <TableHead className="text-right">{t('花费', 'Cost')}</TableHead>
+                  <TableHead>{t('上游报错', 'Upstream error')}</TableHead>
+                  <TableHead>{t('形态', 'Shape')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((log) => <FrozenRow key={log.id} log={log} trigger={log.request_id != null && log.request_id === ev.request_id} />)}
+              </TableBody>
+            </Table>
+          </div>
+
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t pt-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+            <p className="min-w-0 text-muted-foreground tabular-nums">
+              {t(
+                `第 ${firstIndex}–${lastIndex} 条，共 ${total.toLocaleString(locale)} 条`,
+                `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
+              )}
+            </p>
+            <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+              <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
+              <Select
+                items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
+                value={pageSize}
+                onValueChange={(value) => {
+                  if (value == null) return
+                  // 每页条数一变，原来的页码就没有意义了，回到第一页。
+                  setPageSize(Number(value))
+                  setPage(0)
+                }}
+              >
+                <SelectTrigger size="sm" aria-label={t('每页条数', 'Rows per page')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectPopup>
+                  {PAGE_SIZES.map((size) => (
+                    <SelectItem key={size} value={size}>{size}</SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
+            {totalPages > 1 && (
+              <Pagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      render={<Button variant="ghost" disabled={logs.isFetching || currentPage === 0} />}
+                      aria-disabled={logs.isFetching || currentPage === 0}
+                      onClick={() => setPage((current) => Math.max(0, current - 1))}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
+                      {t(`第 ${currentPage + 1} / ${totalPages} 页`, `Page ${currentPage + 1} of ${totalPages}`)}
+                    </span>
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      render={<Button variant="ghost" disabled={logs.isFetching || currentPage >= totalPages - 1} />}
+                      aria-disabled={logs.isFetching || currentPage >= totalPages - 1}
+                      onClick={() => setPage((current) => Math.min(totalPages - 1, current + 1))}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            )}
+          </div>
+        </>
       )}
     </div>
   )

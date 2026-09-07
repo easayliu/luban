@@ -796,13 +796,37 @@ async fn list_ban_events(
     Ok(Json(state.store.list_ban_events(q.cred_id, limit).map_err(internal)?))
 }
 
-/// 某封号事件冻结下来的流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求，
+#[derive(Deserialize)]
+struct FrozenLogsQuery {
+    /// 返回条数上限（默认 100，最多 1000）。
+    #[serde(default)]
+    limit: Option<i64>,
+    /// 跳过前多少条（页码 × 每页条数）。
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+/// 一页冻结流水 + 该事件冻结的总条数。翻页锚点这里不需要：冻结表写完就不再变。
+#[derive(serde::Serialize)]
+struct FrozenLogPage {
+    total: i64,
+    logs: Vec<store::UsageLog>,
+}
+
+/// 某封号事件冻结下来的一页流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求，
 /// 带取证列（出口代理、形态摘要、上游错误文案、第三方判定、改写标签）。
+///
+/// 一次封号常冻下上千行、几十 MB，整份一次吐出去页面要卡住半天，所以按页给；要整份的
+/// （下载取证包）由前端连着翻完再拼。
 async fn list_ban_event_logs(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Vec<store::UsageLog>>, ApiError> {
-    Ok(Json(state.store.frozen_usage_logs(id).map_err(internal)?))
+    Query(q): Query<FrozenLogsQuery>,
+) -> Result<Json<FrozenLogPage>, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (total, logs) = state.store.frozen_usage_logs(id, limit, offset).map_err(internal)?;
+    Ok(Json(FrozenLogPage { total, logs }))
 }
 
 // ---------- 凭证管理 ----------

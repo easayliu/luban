@@ -338,10 +338,35 @@ export async function listBanEvents(params: { cred_id?: number; limit?: number }
   return data
 }
 
-/** 某封号事件冻结下来的流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求。 */
-export async function listBanEventLogs(id: number): Promise<UsageLog[]> {
-  const { data } = await api.get<UsageLog[]>(`/ban-events/${id}/logs`)
+/** 一页冻结流水 + 该事件冻结的总条数。冻结表写完就不再变，翻页不需要锚点。 */
+export interface FrozenLogPage {
+  total: number
+  logs: UsageLog[]
+}
+
+/**
+ * 某封号事件冻结下来的**一页**流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求。
+ *
+ * 一次封号常冻下上千行、几十 MB（每行还带形态摘要），一次全拉页面要白等好几秒再卡在渲染上，
+ * 所以按页取；要整份的走 `fetchAllBanEventLogs`。
+ */
+export async function listBanEventLogs(
+  id: number,
+  params: { limit?: number; offset?: number } = {},
+): Promise<FrozenLogPage> {
+  const { data } = await api.get<FrozenLogPage>(`/ban-events/${id}/logs`, { params })
   return data
+}
+
+/** 取证包用的整份流水：按后端上限连着翻完再拼，只在导出时才走这条路。 */
+export async function fetchAllBanEventLogs(id: number): Promise<UsageLog[]> {
+  const pageSize = 1000
+  const all: UsageLog[] = []
+  for (;;) {
+    const page = await listBanEventLogs(id, { limit: pageSize, offset: all.length })
+    all.push(...page.logs)
+    if (page.logs.length < pageSize || all.length >= page.total) return all
+  }
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */
