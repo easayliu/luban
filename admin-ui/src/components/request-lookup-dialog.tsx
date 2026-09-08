@@ -206,6 +206,10 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('上游 200 却零输出', 'Upstream 200 with zero output')
     case 'refusal':
       return t('上游拒答（refusal）', 'Upstream refusal')
+    case 'served_by_fallback':
+      return t('拒答后由 fallback 模型作答', 'Refused, answered by the fallback model')
+    case 'no_fallbacks':
+      return t('上游不认 fallback 目标，剥掉重试', 'Retried without fallbacks (target rejected)')
     case 'demoted_thinking':
       return t('thinking 降级重试', 'Retried with thinking demoted')
     case 'no_prefill':

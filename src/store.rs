@@ -2210,6 +2210,9 @@ impl CredentialStore {
         if let Some(v) = on(KEEPALIVE_TELEMETRY) {
             flags.keepalive_telemetry = v;
         }
+        if let Some(v) = on(REFUSAL_FALLBACK) {
+            flags.refusal_fallback = v;
+        }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
             flags.system_shape = v;
@@ -2460,6 +2463,10 @@ pub const API_TELEMETRY: &str = "api_telemetry";
 /// 保活是否还发遥测（每 30 分钟的空闲版本检查事件 + Datadog 日志 + GrowthBook 画像）的
 /// settings 键名。缺省视为开启。见 [`ForwardFlags::keepalive_telemetry`]。
 pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
+
+/// 是否给主线程请求补服务端 refusal fallback（`fallbacks` 字段 + `server-side-fallback`
+/// beta）的 settings 键名。缺省视为开启。见 [`ForwardFlags::refusal_fallback`]。
+pub const REFUSAL_FALLBACK: &str = "refusal_fallback";
 
 /// 上次从 `downloads.claude.ai/claude-code-releases/latest` 学到的官方最新 Claude Code 版本
 /// （`主.次.修` 串）的 settings 键名。启动时垫进 [`crate::oauth::latest_release`] 的缓存，
@@ -2720,6 +2727,16 @@ pub struct ForwardFlags {
     /// 关掉只停这一半：token 刷新、bootstrap / policy_limits / settings 握手与 401/403
     /// 探测照常。不影响 [`Self::api_telemetry`]。
     pub keepalive_telemetry: bool,
+    /// 主线程请求补**服务端 refusal fallback**：安全分类器拒答（`stop_reason: "refusal"`，
+    /// 如 cyber 类）时由上游在同一次调用里换模型重跑，客户端拿到的是回答而不是拒答。
+    /// fable 族补官方 2.1.260 那份 `[{"model":"claude-opus-5"}]`（形态逐字同官方），opus-5
+    /// 补 luban 自定的 `[{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]`（官方
+    /// opus 客户端不发这个字段，是有意偏离），出站头一并带 `server-side-fallback-2026-06-01`。
+    /// 客户端自己带了数组形态的不动；只对主线程 profile 补，辅助请求（helper / 标题 / 分类 /
+    /// 额度探测）官方都不发。上游以 400 拒掉某个 fallback 目标时，剥掉重发一次并记进「从上游
+    /// 学到的规则」，之后该模型不再补。落到 fallback 的回复按实际服务的模型计价。
+    /// 见 `crate::proxy::refusal_fallbacks_for`。
+    pub refusal_fallback: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2752,6 +2769,7 @@ impl Default for ForwardFlags {
             reject_probes: true,
             api_telemetry: true,
             keepalive_telemetry: true,
+            refusal_fallback: true,
         }
     }
 }
@@ -8202,6 +8220,7 @@ mod tests {
             (REJECT_PROBES, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
+            (REFUSAL_FALLBACK, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -8236,6 +8255,7 @@ mod tests {
                 reject_probes: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
+                refusal_fallback: false,
             }
         );
 

@@ -1831,6 +1831,8 @@ struct ForwardingResp {
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
     keepalive_telemetry: bool,
+    /// 主线程请求补服务端 refusal fallback（拒答时上游换模型重跑）。
+    refusal_fallback: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1863,6 +1865,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_probes: f.reject_probes,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
+            refusal_fallback: f.refusal_fallback,
         }
     }
 }
@@ -2525,6 +2528,7 @@ struct SetForwardingReq {
     reject_probes: Option<bool>,
     api_telemetry: Option<bool>,
     keepalive_telemetry: Option<bool>,
+    refusal_fallback: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -2537,7 +2541,7 @@ async fn set_forwarding(
     use crate::store::{
         API_TELEMETRY, FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
         INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_PROBES,
+        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REFUSAL_FALLBACK, REJECT_OPENAI_SHAPE, REJECT_PROBES,
         REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
         SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
         SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
@@ -2571,6 +2575,7 @@ async fn set_forwarding(
         (REJECT_PROBES, req.reject_probes),
         (API_TELEMETRY, req.api_telemetry),
         (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
+        (REFUSAL_FALLBACK, req.refusal_fallback),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
