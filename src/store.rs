@@ -119,10 +119,13 @@ pub struct ModelDenial {
     pub expires_at: Option<i64>,
 }
 
-/// 从上游 400 里学到的一条规则，落库供重启后回填进程内记忆，见
-/// [`CredentialStore::remember_rejections`]。两类共用一张表：
+/// 从上游响应里学到的一条规则，落库供重启后回填进程内记忆，见
+/// [`CredentialStore::remember_rejections`]。三类共用一张表：
 /// - `kind = "shape"`：某模型不接受某字段的某取值（`effort: 'xhigh'`），命中本地拒；
-/// - `kind = "deprecated"`：某模型已废弃某字段（`temperature`），命中转发前剥掉，`value` 为空串。
+/// - `kind = "deprecated"`：某模型已废弃某字段（`temperature`），命中转发前剥掉，`value` 为空串；
+/// - `kind = "empty_reply"`：某模型对「无 tools 的单条消息 + 这个 `max_tokens`」回过 200 却零
+///   输出（`field = "max_tokens"`，`value` 是那个数），同类请求命中本地拒，`message` 是当时
+///   截下的上游回复开头，见 `crate::proxy::known_empty_reply`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnedRejection {
     pub kind: String,
@@ -2445,8 +2448,9 @@ pub const REJECT_SESSION_CONFLICT: &str = "reject_session_conflict";
 /// 却是无 tools 的单条小消息、`max_tokens` 只有个位数、或身份句在 system 里重复）。身份字段
 /// 写错的不算探针、不在这里拒，由模拟路径重建身份。
 /// 这些请求每一条都是上游侧「一台设备开一个一次性会话只问一句话」的记录，真实用户从不产生，
-/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。
-/// 见 [`ForwardFlags::reject_probes`] 与 `proxy::probe_signature`。
+/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。同一开关也管从响应学来的
+/// 「上游回过零输出的请求类」（`kind = "empty_reply"`，不限 UA）。
+/// 见 [`ForwardFlags::reject_probes`]、`proxy::probe_signature` 与 `proxy::known_empty_reply`。
 pub const REJECT_PROBES: &str = "reject_probes";
 
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
@@ -2691,7 +2695,12 @@ pub struct ForwardFlags {
     /// 不是探针，由模拟路径重建身份（`proxy::cc_identity_well_formed`）。「没有 tools」按值算：
     /// 缺失、`null`、`[]` 都是没有，加空字段绕不过。只看形态、一条就判，不做计数。官方 CC 的
     /// 四种无 tools 请求（cache 预热、Helper 子代理、标题生成、安全分类）按 system 结构 + beta
-    /// 头 + body 取值逐项对、都在判据之外，见 `cap/` 抓包与 `proxy::probe_signature`。默认开。
+    /// 头 + body 取值逐项对、都在判据之外，见 `cap/` 抓包与 `proxy::probe_signature`。
+    ///
+    /// 同一开关还管**从响应学来的**第四条（不限 UA）：上游对某模型的「无 tools 单条消息 +
+    /// 某个 `max_tokens`」回过 200 却零输出之后，同类请求本地 403，见
+    /// `proxy::known_empty_reply`——那是上游收了输入的钱、一个字没回，每条都是一次白白留下的
+    /// 「一台设备只问一句话」记录。规则随其他学到的规则落库、7 天到期、控制台可删。默认开。
     pub reject_probes: bool,
     /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
     /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
@@ -2989,7 +2998,18 @@ pub struct Forensics {
     pub third_party: bool,
     /// 这条请求在 luban 里经历的改写/重试标签（逗号分隔），如 `demoted_thinking`、`no_prefill`。
     pub rewrites: Option<String>,
+    /// 上游回了 **200 却零输出**（有 `usage`、`output_tokens = 0`）时截取的响应体开头
+    /// （字符数上限 [`RESPONSE_EXCERPT_MAX`]），见 `crate::proxy::UsageSniffer::excerpt`。
+    ///
+    /// 正常回复不存：一条流水带一份正文，表会成倍膨胀，而排查只需要异常那几条。零输出是
+    /// 「上游收了输入的钱、一个字没回」——状态码、用量、错误列三处都看不出它回了什么，这一列
+    /// 是唯一能看到上游原话的地方（`stop_reason`、有没有 `content`、是不是 `refusal`）。
+    pub response_excerpt: Option<String>,
 }
+
+/// `Forensics::response_excerpt` 的落库上限（字符）。零输出的回复本身就很短（一段没有
+/// `content` 的 Message JSON 几百字节），4000 足以整份留下；超出的多半是别的东西，截掉。
+pub const RESPONSE_EXCERPT_MAX: usize = 4000;
 
 /// `Forensics::error_message` 的落库上限（字符）。上游错误文案通常几百字，个别会把整段
 /// 请求体回显进来，那种整段存一遍是浪费。
@@ -3496,10 +3516,10 @@ impl CredentialStore {
                  rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
                  request_id, upstream_request_id,
                  proxy, simulated, shape, session_id, error_type, error_message, third_party,
-                 rewrites, device_id_out)
+                 rewrites, device_id_out, response_excerpt)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
             params![
                 ts,
                 rec.cred_id,
@@ -3542,6 +3562,10 @@ impl CredentialStore {
                 rec.forensics.third_party as i64,
                 rec.forensics.rewrites,
                 rec.forensics.device_id_out,
+                rec.forensics
+                    .response_excerpt
+                    .as_deref()
+                    .map(|m| head_chars(m, RESPONSE_EXCERPT_MAX)),
             ],
         )?;
         // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
@@ -3996,7 +4020,7 @@ const USAGE_LOG_COLS: &str = "ts, cred_id, cred_label, device_id, model, path, s
         cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
         request_id, upstream_request_id,
         proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
-        device_id_out";
+        device_id_out, response_excerpt";
 
 /// 按 [`USAGE_LOG_COLS`] 的顺序把一行读成 [`UsageLog`]（0 号列是主键）。
 fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
@@ -4044,6 +4068,7 @@ fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
             third_party: r.get::<_, Option<i64>>(39)?.unwrap_or(0) != 0,
             rewrites: r.get(40)?,
             device_id_out: r.get(41)?,
+            response_excerpt: r.get(42)?,
         },
     })
 }
@@ -4400,6 +4425,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "rewrites TEXT",
         // 0.3.76：出站 device_id，见 Forensics::device_id_out。
         "device_id_out TEXT",
+        // 0.3.89：上游 200 却零输出时截取的响应体，见 Forensics::response_excerpt。
+        "response_excerpt TEXT",
     ] {
         // 冻结表与流水表同列（USAGE_LOG_COLS 逐列照搬），补列必须两张一起补。
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);

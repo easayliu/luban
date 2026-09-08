@@ -750,6 +750,7 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   error_message: index === 5 ? 'Your account has been disabled for violating our usage policy.' : null,
   third_party: index === 7,
   rewrites: index === 3 ? 'demoted_thinking' : null,
+  response_excerpt: null,
 }))
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   total: 37,

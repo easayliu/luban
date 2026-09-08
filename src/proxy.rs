@@ -716,6 +716,40 @@ async fn handle_inner(
         return error_response(StatusCode::FORBIDDEN, "permission_error", kind.message());
     }
 
+    // 2.3a4) 上游对这一类请求（模型 + 无 tools 单条消息 + 这个 max_tokens）回过 200 却零输出
+    //        → 本地 403，不再送。规则不是写死的，是上一条零输出的回复自己喂出来的，见
+    //        [`known_empty_reply`]；回给客户端的文案带上上游当时的原话。与探针同一开关，
+    //        不限 UA——模拟路径重建的是身份，改不了「问一句、上游一个字不回」这件事。
+    if billable
+        && state.store.forward_flags().reject_probes
+        && let Some((max_tokens, excerpt)) =
+            known_empty_reply(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
+    {
+        let model = req_model.as_deref().unwrap_or("-");
+        let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
+        if let Some(suppressed) = take_rejection_log_slot(
+            &state.rejection_log,
+            &format!("empty-reply:{model}:{max_tokens}:{who}"),
+        ) {
+            let device_short: String = who.chars().take(8).collect();
+            tracing::warn!(
+                %method, path = %path_and_query, ua = %client_ua,
+                %model, max_tokens, device = %device_short, suppressed,
+                "rejected locally: upstream has already answered this request class with zero output tokens"
+            );
+        }
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            format!(
+                "not forwarded: upstream has already answered this request class (model {model}, \
+                 tool-less single-message, max_tokens {max_tokens}) with 200 and zero output tokens; \
+                 upstream reply was: {}",
+                excerpt.chars().take(300).collect::<String>()
+            ),
+        );
+    }
+
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
     //       策略由 `sampling_policy` 控制：strip（默认）= 剥掉后转发，reject = 本地 400，
     //       off = 不做静态预置处理（运行时学习仍兜底）。
@@ -1678,6 +1712,13 @@ async fn handle_inner(
                     .as_ref()
                     .map(|s| s.session_id.clone())
                     .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone())),
+                // 只给计费路径分类：count_tokens 之流没有「回复」可言。
+                empty_reply_key: if billable {
+                    empty_reply_class(req_model.as_deref(), body_json.as_ref())
+                } else {
+                    None
+                },
+                empty_replies: state.empty_replies.clone(),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,
@@ -3270,6 +3311,12 @@ struct ReqLog {
     /// 非模拟路径为 `None`：真实 CC 来访自己维护这条链，luban 不该替它记，更不该拿自己
     /// 记的那份去覆盖。
     cc_session: Option<String>,
+    /// 这条请求所属的「零输出请求类」（模型 + `max_tokens`），见 [`empty_reply_class`]；
+    /// `None` 即不属于任何一类（带 tools、多轮、非计费路径……），收尾时不学。
+    empty_reply_key: Option<(String, i64)>,
+    /// 零输出请求类的记忆表，收尾时上游回了 200 却零输出就把 `empty_reply_key` 记进去，
+    /// 见 [`ReqLog::note_empty_reply`]。
+    empty_replies: EmptyReplyMemory,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     _in_flight: InFlightGuard,
@@ -3342,6 +3389,17 @@ impl Drop for ReqLog {
             );
         }
         let has_usage = self.sniffer.has_usage();
+        // 200 + `output_tokens = 0`、且流是完整收尾的：上游收了输入的钱、一个字没回。状态码
+        // 与用量列都看不出它回了什么，这里把截下的响应体开头记进流水、打一行 warn，并把这一类
+        // 请求（模型 + 无 tools 单条消息 + 这个 max_tokens）学进记忆表，之后同类本地拒，见
+        // [`known_empty_reply`]。断流 / 没等到 `message_stop` 的不算：那是没收完，不是没回。
+        if self.status == StatusCode::OK.as_u16()
+            && self.sniffer.output_tokens == Some(0)
+            && stream_broke.is_none()
+            && (!self.sniffer.is_stream || self.sniffer.saw_message_stop || self.sse_aggregated)
+        {
+            self.note_empty_reply();
+        }
         // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
         // 模型同理以响应为准（上游可能回落到别的模型），没有才用请求侧声明的那个。
@@ -3550,7 +3608,42 @@ impl ReqLog {
         let (shape, _, _) = shape_summary(sent);
         self.forensics.shape = shape;
     }
+
+    /// 上游回了 200 却零输出（判据见 [`Drop`] 里的调用处）：响应体开头记进流水的
+    /// `response_excerpt`、标签加 `empty_reply`、打一行 warn 把原话带上；这条属于某个
+    /// 零输出请求类（[`Self::empty_reply_key`]）就学进 [`EmptyReplyMemory`] 并写穿落库。
+    fn note_empty_reply(&mut self) {
+        let excerpt = self.sniffer.excerpt().unwrap_or_default();
+        let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
+        tracing::warn!(
+            cred_id = self.cred_id, cred = %self.cred_label,
+            model = %model.as_deref().unwrap_or("-"),
+            input_tokens = self.sniffer.input_tokens.unwrap_or(0),
+            stop_reason = %self.sniffer.stop_reason.as_deref().unwrap_or("-"),
+            request_id = %self.request_id,
+            upstream_request_id = %self.upstream_request_id.as_deref().unwrap_or("-"),
+            response = %excerpt.chars().take(500).collect::<String>(),
+            "upstream returned 200 with zero output tokens; the reply is kept on the usage log and this request class will be rejected locally from now on"
+        );
+        self.forensics.response_excerpt = (!excerpt.is_empty()).then(|| excerpt.clone());
+        let tags = self.forensics.rewrites.get_or_insert_with(String::new);
+        if !tags.is_empty() {
+            tags.push(',');
+        }
+        tags.push_str(REWRITE_EMPTY_REPLY);
+        if let Some((model, max_tokens)) = self.empty_reply_key.take()
+            && let Some(row) =
+                remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt)
+            && let Err(e) = self.store.remember_rejections(&[row])
+        {
+            // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
+            tracing::warn!(error = %e, "persisting the empty-reply rule failed (kept in memory)");
+        }
+    }
 }
+
+/// 流水 `rewrites` 列里标「上游 200 却零输出」的标签，见 [`ReqLog::note_empty_reply`]。
+const REWRITE_EMPTY_REPLY: &str = "empty_reply";
 
 /// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
 fn ban_context(
@@ -3875,7 +3968,19 @@ struct UsageSniffer {
     /// `tengu_api_error` 的 `error` 与 `errorType` 要的正是这两项，而
     /// [`capture_forensics`] 那份只在 400/401/403 与裸 429 上填。
     body_error: Option<(Option<String>, String)>,
+    /// 响应体**原样**的开头，最多 [`RESPONSE_EXCERPT_BYTES`] 字节，流式非流式都留。
+    ///
+    /// 与 `buf` 分开：流式那条路的 `buf` 逐行吃掉不留痕，非流式那条路 `finish` 后才解析。
+    /// 这份只在收尾时上游回了「200 却零输出」才用得上（[`ReqLog::note_empty_reply`]）——
+    /// 用量列写着 `input=425 output=0`，却没有任何一处能看到上游到底回了什么：是没有
+    /// `content` 的空 Message、`stop_reason: "refusal"`、还是别的形状。留下开头这一小段
+    /// 就够回答这个问题，代价是每条请求多拷几 KB。
+    head: Vec<u8>,
 }
+
+/// [`UsageSniffer::head`] 最多留多少字节。零输出的回复本身只有几百字节；8 KiB 连流式的
+/// `message_start` + `message_delta` + `message_stop` 三段也装得下。
+const RESPONSE_EXCERPT_BYTES: usize = 8 * 1024;
 
 /// 回复里一个 `tool_use` 块：内容块序号、工具名、`input` 的 JSON 串。
 #[derive(Default, Clone)]
@@ -3898,6 +4003,10 @@ impl UsageSniffer {
     fn feed(&mut self, chunk: &[u8]) {
         if self.opaque {
             return;
+        }
+        if self.head.len() < RESPONSE_EXCERPT_BYTES {
+            let room = RESPONSE_EXCERPT_BYTES - self.head.len();
+            self.head.extend_from_slice(&chunk[..chunk.len().min(room)]);
         }
         if self.is_stream {
             self.buf.extend_from_slice(chunk);
@@ -4113,6 +4222,19 @@ impl UsageSniffer {
         {
             self.merge(&v);
         }
+    }
+
+    /// 响应体开头（[`Self::head`]）按 UTF-8 转成文本；一个字节都没收到时 `None`。
+    /// 截断落在多字节字符中间时最后那个字符丢掉，不留替换符。
+    fn excerpt(&self) -> Option<String> {
+        if self.head.is_empty() {
+            return None;
+        }
+        let text = match std::str::from_utf8(&self.head) {
+            Ok(t) => t.to_string(),
+            Err(e) => String::from_utf8_lossy(&self.head[..e.valid_up_to()]).into_owned(),
+        };
+        Some(text)
     }
 
     /// 是否解析到任一用量字段。
@@ -6937,14 +7059,16 @@ type ShapeRejections = std::collections::HashMap<(String, &'static str, String),
 /// （`DELETE /api/learned-rejections`）。
 pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
 
-/// `learned_rejections.kind` 的两个取值，见 [`store::LearnedRejection`]。
+/// `learned_rejections.kind` 的三个取值，见 [`store::LearnedRejection`]。
 pub const LEARNED_KIND_SHAPE: &str = "shape";
 pub const LEARNED_KIND_DEPRECATED: &str = "deprecated";
+pub const LEARNED_KIND_EMPTY_REPLY: &str = "empty_reply";
 
-/// 从两张进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
+/// 从三张进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
 pub fn forget_learned_memory(
     shape: &ShapeMemory,
     deprecated: &DeprecatedFieldMemory,
+    empty: &EmptyReplyMemory,
     r: &store::LearnedRejection,
 ) -> bool {
     match r.kind.as_str() {
@@ -6957,22 +7081,29 @@ pub fn forget_learned_memory(
         LEARNED_KIND_DEPRECATED => {
             deprecated.write().remove(&(r.model.clone(), r.field.clone())).is_some()
         }
+        LEARNED_KIND_EMPTY_REPLY => {
+            let Some(max_tokens) = empty_reply_row_key(&r.field, &r.value) else { return false };
+            empty.write().remove(&(r.model.clone(), max_tokens)).is_some()
+        }
         _ => false,
     }
 }
 
-/// 启动时把落库的规则读回两张进程内记忆表，返回 `(形态条数, 废弃字段条数)`。
+/// 启动时把落库的规则读回三张进程内记忆表，返回 `(形态条数, 废弃字段条数, 零输出条数)`。
 ///
 /// 形态那类的 `field` 必须能对回 [`SHAPE_PROBES`] 里的某个探针（键里是 `&'static str`）；
-/// 对不上的（旧版本学的、后来删掉的探针）直接跳过，不会因为一行脏数据拒绝启动。
+/// 对不上的（旧版本学的、后来删掉的探针）直接跳过，不会因为一行脏数据拒绝启动。零输出那类
+/// 的 `value` 必须是个整数（`max_tokens`），同理。
 pub fn seed_learned_memories(
     shape: &ShapeMemory,
     deprecated: &DeprecatedFieldMemory,
+    empty: &EmptyReplyMemory,
     rows: Vec<store::LearnedRejection>,
-) -> (usize, usize) {
-    let (mut n_shape, mut n_dep) = (0, 0);
+) -> (usize, usize, usize) {
+    let (mut n_shape, mut n_dep, mut n_empty) = (0, 0, 0);
     let mut shape_table = shape.write();
     let mut dep_table = deprecated.write();
+    let mut empty_table = empty.write();
     for r in rows {
         match r.kind.as_str() {
             LEARNED_KIND_SHAPE => {
@@ -6994,10 +7125,112 @@ pub fn seed_learned_memories(
                 dep_table.entry((r.model, r.field)).or_insert(r.message);
                 n_dep += 1;
             }
+            LEARNED_KIND_EMPTY_REPLY => {
+                let Some(max_tokens) = empty_reply_row_key(&r.field, &r.value) else { continue };
+                if empty_table.len() >= SHAPE_MEMORY_CAP {
+                    continue;
+                }
+                empty_table.entry((r.model, max_tokens)).or_insert(r.message);
+                n_empty += 1;
+            }
             _ => {}
         }
     }
-    (n_shape, n_dep)
+    (n_shape, n_dep, n_empty)
+}
+
+// ── 上游回过零输出的请求类 ────────────────────────────────────────────
+//
+// 与上面两张表同一套「从上游学」的范式，但学的不是 400，是 **200**：上游收了输入的钱
+// （`usage.input_tokens` 几百）、`output_tokens = 0`、一个字没回。封号复盘（luban-ban-9）里
+// 这样的记录有 205 条，13 小时里每 37 秒一条，全是同一个下游中转对 `claude-fable-5` 发的
+// 无 tools 单句小请求（`max_tokens` 1/4/16/64/512），而同形态换成 fable-5-1、或带上 tools、
+// 或 `max_tokens` 放到几千，上游都正常回复——即这是「模型 + 请求类」层面的稳定行为，
+// 不是偶发。每一条在上游侧都是「一台设备只问一句话、什么都没得到」的记录，白白留下探活
+// 一样的痕迹；本地拒掉它们既省钱也少留痕。
+//
+// 判据放在**响应侧**而不是写死形态：哪些模型对哪种请求回空，luban 事先不知道，也不该猜。
+// 第一条照常放行，回来零输出就把这一类记下来（并把上游原话截下来供人看），之后同类本地拒。
+// 「类」取得很窄——模型 + 无 tools + 恰好一条用户消息 + 同一个 `max_tokens`——带 tools 的、
+// 多轮的、换个 `max_tokens` 的一律不受影响；宁可多放一条，不误伤真业务。
+
+/// 零输出记忆表里 `field` 列的固定值：类键的另一半就是这个字段的取值。
+const EMPTY_REPLY_FIELD: &str = "max_tokens";
+
+/// 上游回过零输出的「模型 + `max_tokens`」→ 当时截下的上游回复开头（本地拒时回给客户端）。
+type EmptyReplyRejections = std::collections::HashMap<(String, i64), String>;
+
+/// [`EmptyReplyRejections`] 的共享句柄。与 [`ShapeMemory`] 同一套持久化：写穿到
+/// `learned_rejections`（`kind = "empty_reply"`）、启动回填、7 天保鲜。
+pub type EmptyReplyMemory = std::sync::Arc<parking_lot::RwLock<EmptyReplyRejections>>;
+
+/// 落库行的 `(field, value)` 能否对回一个类键：`field` 必须是 `max_tokens`、`value` 是整数。
+fn empty_reply_row_key(field: &str, value: &str) -> Option<i64> {
+    (field == EMPTY_REPLY_FIELD).then(|| value.parse().ok()).flatten()
+}
+
+/// 这条请求属于哪个「零输出请求类」：`(模型, max_tokens)`。只有**无 tools（按值算）、恰好一条
+/// 用户消息、带 `max_tokens`** 的请求才归类；其余（带 tools、多轮、没写 `max_tokens`）返回
+/// `None`——它们既不学也不拒。模型取来访声明的那个（与 [`known_empty_reply`] 同一侧，学与
+/// 判必须看同一个值）。
+fn empty_reply_class(
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<(String, i64)> {
+    let (model, v) = (model?, body?);
+    let single_user_message = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|m| m.len() == 1 && m[0].get("role").and_then(|r| r.as_str()) == Some("user"));
+    if !single_user_message || !field_is_empty(v.get("tools")) {
+        return None;
+    }
+    Some((model.to_string(), request_max_tokens(Some(v))?))
+}
+
+/// 这条请求是不是**已知**会被上游回零输出的那一类；是则给出 `(max_tokens, 上游当时的回复)`。
+///
+/// 只有「同一个模型、同一种无 tools 单条消息、同一个 `max_tokens`」确实回过一次零输出才
+/// `Some`。没学过的一律照常往上游发。
+fn known_empty_reply(
+    mem: &EmptyReplyMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<(i64, String)> {
+    let key = empty_reply_class(model, body)?;
+    let table = mem.read();
+    if table.is_empty() {
+        return None;
+    }
+    table.get(&key).map(|excerpt| (key.1, excerpt.clone()))
+}
+
+/// 上游对这一类回了零输出 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
+/// 不重复、表满了不记），调用方拿去落库。
+fn remember_empty_reply(
+    mem: &EmptyReplyMemory,
+    model: &str,
+    max_tokens: i64,
+    excerpt: &str,
+) -> Option<store::LearnedRejection> {
+    let mut table = mem.write();
+    let key = (model.to_string(), max_tokens);
+    if table.contains_key(&key) || table.len() >= SHAPE_MEMORY_CAP {
+        return None;
+    }
+    table.insert(key, excerpt.to_string());
+    tracing::info!(
+        model = %model,
+        max_tokens,
+        "learned an empty-reply request class; tool-less single-message requests of this shape will be rejected locally from now on"
+    );
+    Some(store::LearnedRejection {
+        kind: LEARNED_KIND_EMPTY_REPLY.into(),
+        model: model.to_string(),
+        field: EMPTY_REPLY_FIELD.into(),
+        value: max_tokens.to_string(),
+        message: excerpt.to_string(),
+    })
 }
 
 // ── 已废弃字段的自动剥离 ──────────────────────────────────────────────
@@ -14294,6 +14527,110 @@ mod tests {
         ))
     }
 
+    /// 零输出请求类的归类与命中：只有「无 tools（按值算）+ 恰好一条用户消息 + 带 max_tokens」
+    /// 才归类；带 tools、多轮、换 max_tokens、换模型的都不命中——宁可多放一条，不误伤真业务。
+    #[test]
+    fn empty_reply_class_is_narrow_and_known_empty_reply_matches_only_the_same_class() {
+        let mem = super::EmptyReplyMemory::default();
+        let body = |extra: &str| -> serde_json::Value {
+            serde_json::from_str(&format!(
+                r#"{{"model":"claude-fable-5","system":"s","messages":[{{"role":"user","content":"ping"}}],"max_tokens":16{extra}}}"#
+            ))
+            .unwrap()
+        };
+        let ping = body("");
+        assert_eq!(
+            super::empty_reply_class(Some("claude-fable-5"), Some(&ping)),
+            Some(("claude-fable-5".to_string(), 16))
+        );
+        // 归类不看 UA、不看 system、不看 stream：模拟路径改的是身份，改不了「问一句不回」。
+        assert_eq!(
+            super::empty_reply_class(Some("claude-fable-5"), Some(&body(r#","stream":true"#))),
+            Some(("claude-fable-5".to_string(), 16))
+        );
+        // `tools: []` / `null` 按没有算；真带了工具就不归类。
+        assert!(super::empty_reply_class(Some("m"), Some(&body(r#","tools":[]"#))).is_some());
+        assert!(super::empty_reply_class(Some("m"), Some(&body(r#","tools":null"#))).is_some());
+        assert!(
+            super::empty_reply_class(
+                Some("m"),
+                Some(&body(r#","tools":[{"name":"Read","input_schema":{"type":"object"}}]"#))
+            )
+            .is_none()
+        );
+        // 多轮、没写 max_tokens、没有模型：不归类。
+        let multi: serde_json::Value = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}],"max_tokens":16}"#,
+        )
+        .unwrap();
+        assert!(super::empty_reply_class(Some("m"), Some(&multi)).is_none());
+        let no_cap: serde_json::Value =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"a"}]}"#)
+                .unwrap();
+        assert!(super::empty_reply_class(Some("m"), Some(&no_cap)).is_none());
+        assert!(super::empty_reply_class(None, Some(&ping)).is_none());
+
+        // 没学过：一律放行。
+        assert!(super::known_empty_reply(&mem, Some("claude-fable-5"), Some(&ping)).is_none());
+        super::remember_empty_reply(&mem, "claude-fable-5", 16, "{}").unwrap();
+        assert_eq!(
+            super::known_empty_reply(&mem, Some("claude-fable-5"), Some(&ping)),
+            Some((16, "{}".to_string()))
+        );
+        // 换 max_tokens / 换模型 / 带 tools：都是另一类，不命中。
+        let other_cap: serde_json::Value = serde_json::from_str(
+            r#"{"model":"claude-fable-5","messages":[{"role":"user","content":"ping"}],"max_tokens":8192}"#,
+        )
+        .unwrap();
+        assert!(super::known_empty_reply(&mem, Some("claude-fable-5"), Some(&other_cap)).is_none());
+        assert!(super::known_empty_reply(&mem, Some("claude-fable-5-1"), Some(&ping)).is_none());
+        assert!(
+            super::known_empty_reply(
+                &mem,
+                Some("claude-fable-5"),
+                Some(&body(r#","tools":[{"name":"Read","input_schema":{"type":"object"}}]"#))
+            )
+            .is_none()
+        );
+    }
+
+    /// 嗅探器留下响应体开头：流式非流式都留、封顶不无界、截在多字节字符中间时丢掉半个字。
+    #[test]
+    fn the_sniffer_keeps_a_bounded_excerpt_of_the_raw_reply() {
+        let mut s = super::UsageSniffer::new(false, false);
+        assert!(s.excerpt().is_none(), "一个字节都没收到时没有摘录");
+        s.feed(br#"{"id":"msg_1","content":[],"stop_reason":"end_turn","#);
+        s.feed(br#""usage":{"input_tokens":425,"output_tokens":0}}"#);
+        s.finish();
+        assert_eq!(s.output_tokens, Some(0));
+        assert_eq!(
+            s.excerpt().as_deref(),
+            Some(
+                r#"{"id":"msg_1","content":[],"stop_reason":"end_turn","usage":{"input_tokens":425,"output_tokens":0}}"#
+            )
+        );
+
+        // 流式：逐行解析吃掉 `buf`，摘录仍是原样的字节。
+        let mut st = super::UsageSniffer::new(true, false);
+        st.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":0}}}\n\n");
+        assert!(st.excerpt().unwrap().starts_with("event: message_start\ndata: "));
+
+        // 封顶：超过上限的部分不留；截在「中」字中间时丢掉半个字符，不出替换符。
+        let mut big = super::UsageSniffer::new(false, false);
+        let filler = "x".repeat(super::RESPONSE_EXCERPT_BYTES - 1);
+        big.feed(filler.as_bytes());
+        big.feed("中文".as_bytes());
+        let ex = big.excerpt().unwrap();
+        assert_eq!(ex.len(), super::RESPONSE_EXCERPT_BYTES - 1);
+        assert!(ex.ends_with('x'));
+        assert!(!ex.contains('\u{FFFD}'));
+
+        // 解不开的编码：什么都不留。
+        let mut opaque = super::UsageSniffer::new(false, true);
+        opaque.feed(b"gzip bytes");
+        assert!(opaque.excerpt().is_none());
+    }
+
     /// 学到的规则能落库再读回：两个 remember_* 返回新学到的条目（重复不算），
     /// `seed_learned_memories` 把它们放回两张表，对不上探针/名单的脏行跳过。
     #[test]
@@ -14362,9 +14699,54 @@ mod tests {
             value: String::new(),
             message: String::new(),
         });
+        // 零输出那类：一条正常的，一条 value 不是整数的脏行。
+        let ping = serde_json::json!({
+            "model": "claude-fable-5", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let empty = super::EmptyReplyMemory::default();
+        let learned_empty =
+            super::remember_empty_reply(&empty, "claude-fable-5", 16, r#"{"content":[]}"#)
+                .expect("首次学到");
+        assert_eq!(
+            (
+                learned_empty.kind.as_str(),
+                learned_empty.field.as_str(),
+                learned_empty.value.as_str()
+            ),
+            ("empty_reply", "max_tokens", "16")
+        );
+        assert!(
+            super::remember_empty_reply(&empty, "claude-fable-5", 16, "again").is_none(),
+            "同一类第二次不算新学到"
+        );
+        rows.push(learned_empty);
+        rows.push(store::LearnedRejection {
+            kind: "empty_reply".into(),
+            model: "m".into(),
+            field: "max_tokens".into(),
+            value: "sixteen".into(),
+            message: String::new(),
+        });
         let shape2 = super::ShapeMemory::default();
         let dep2 = super::DeprecatedFieldMemory::default();
-        assert_eq!(super::seed_learned_memories(&shape2, &dep2, rows), (1, 1));
+        let empty2 = super::EmptyReplyMemory::default();
+        assert_eq!(super::seed_learned_memories(&shape2, &dep2, &empty2, rows), (1, 1, 1));
+        let (max_tokens, excerpt) =
+            super::known_empty_reply(&empty2, Some("claude-fable-5"), Some(&ping))
+                .expect("零输出规则应已回填");
+        assert_eq!((max_tokens, excerpt.as_str()), (16, r#"{"content":[]}"#));
+        // 控制台单条删除：删得掉、删过就不再命中；对不上的行返回 false。
+        let row = store::LearnedRejection {
+            kind: "empty_reply".into(),
+            model: "claude-fable-5".into(),
+            field: "max_tokens".into(),
+            value: "16".into(),
+            message: String::new(),
+        };
+        assert!(super::forget_learned_memory(&shape2, &dep2, &empty2, &row));
+        assert!(!super::forget_learned_memory(&shape2, &dep2, &empty2, &row));
+        assert!(super::known_empty_reply(&empty2, Some("claude-fable-5"), Some(&ping)).is_none());
         let hit = super::known_shape_rejection(&shape2, Some("claude-opus-5"), Some(&body))
             .expect("形态规则应已回填");
         assert_eq!((hit.0, hit.1.as_str()), ("effort", "xhigh"));
@@ -19084,6 +19466,114 @@ mod tests {
         assert_eq!(logs[0].ua_out.as_deref(), Some(config::CC_USER_AGENT), "出站照实记");
     }
 
+    /// 上游回 200 却零输出：收尾时响应体开头落进流水的 `response_excerpt`、标签 `empty_reply`，
+    /// 这一类（模型 + max_tokens）学进记忆表并写穿落库；半截流（没等到 `message_stop`）与
+    /// 正常回复都不算。
+    #[test]
+    fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+        let mem = super::EmptyReplyMemory::default();
+        let log = |is_stream: bool, body: &[u8], key: Option<(&str, i64)>| {
+            let mut sniffer = super::UsageSniffer::new(is_stream, false);
+            sniffer.feed(body);
+            drop(super::ReqLog {
+                started: std::time::Instant::now(),
+                ttft_ms: None,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                ua: "Go-http-client/1.1".into(),
+                ua_out: config::CC_USER_AGENT.into(),
+                cred_id: cred.id,
+                cred_label: cred.label.clone(),
+                device_id: None,
+                status: 200,
+                sse_aggregated: false,
+                sniffer,
+                req_speed: None,
+                req_model: Some("claude-fable-5".into()),
+                ratelimit: rl_headers(&[]),
+                stream_broke: None,
+                request_id: "lb-test".into(),
+                client_request_id: None,
+                upstream_request_id: None,
+                forensics: Default::default(),
+                telemetry: None,
+                cc_session: None,
+                empty_reply_key: key.map(|(m, n)| (m.to_string(), n)),
+                empty_replies: mem.clone(),
+                store: store.clone(),
+                _in_flight: super::InFlightGuard::new(Default::default()),
+                _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
+                _route_load: super::note_upstream_send(&Default::default(), 0, "-", 0),
+            })
+        };
+        let empty = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":425,"output_tokens":0}}"#;
+        // 1) 非流式零输出：学到 + 落库 + 流水带原文。
+        log(false, empty, Some(("claude-fable-5", 16)));
+        assert_eq!(
+            mem.read().get(&("claude-fable-5".to_string(), 16)).map(String::as_str),
+            Some(std::str::from_utf8(empty).unwrap())
+        );
+        let rows = store.learned_rejections().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (
+                rows[0].kind.as_str(),
+                rows[0].model.as_str(),
+                rows[0].field.as_str(),
+                rows[0].value.as_str()
+            ),
+            ("empty_reply", "claude-fable-5", "max_tokens", "16")
+        );
+        assert!(rows[0].message.starts_with(r#"{"id":"msg_1""#), "上游原话落库供人看");
+        // 2) 正常回复（输出 1）：什么都不记。
+        log(
+            false,
+            br#"{"id":"msg_2","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":427,"output_tokens":1}}"#,
+            Some(("claude-fable-5-1", 1)),
+        );
+        assert!(!mem.read().contains_key(&("claude-fable-5-1".to_string(), 1)));
+        // 3) 流式：`message_delta` 报 0 但没等到 `message_stop`——半截流，不算零输出。
+        log(
+            true,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":425,\"output_tokens\":0}}}\n\n",
+            Some(("claude-fable-5", 4)),
+        );
+        assert!(!mem.read().contains_key(&("claude-fable-5".to_string(), 4)), "半截流不学");
+        // 4) 流式且完整收尾、最终 output_tokens = 0：学。
+        log(
+            true,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":425,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            Some(("claude-fable-5", 4)),
+        );
+        assert!(mem.read().contains_key(&("claude-fable-5".to_string(), 4)));
+        // 5) 不属于任何一类（带 tools 的请求）却回了零输出：流水照记原文，记忆表不动。
+        log(false, empty, None);
+        assert_eq!(mem.read().len(), 2);
+
+        // 流水（倒序）：1、4、5 三条带原文与标签，2、3 不带。
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 5);
+        let excerpted: Vec<bool> =
+            logs.iter().map(|l| l.forensics.response_excerpt.is_some()).collect();
+        assert_eq!(excerpted, vec![true, true, false, false, true]);
+        assert_eq!(logs[4].forensics.rewrites.as_deref(), Some("empty_reply"));
+        assert_eq!(
+            logs[4].forensics.response_excerpt.as_deref(),
+            Some(std::str::from_utf8(empty).unwrap())
+        );
+        assert_eq!(logs[3].forensics.rewrites, None);
+        assert!(
+            logs[1]
+                .forensics
+                .response_excerpt
+                .as_deref()
+                .unwrap()
+                .starts_with("event: message_start")
+        );
+    }
+
     /// 两份 UA 各存各的：入站记来访那份、出站记实际发出去那份，`-` 占位一律还原成 NULL
     /// （存进去就成了一个真实存在的 UA，按 UA 分组时会凭空多出一类）。
     #[test]
@@ -19114,6 +19604,8 @@ mod tests {
                 forensics: Default::default(),
                 telemetry: None,
                 cc_session: None,
+                empty_reply_key: None,
+                empty_replies: Default::default(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
                 _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -19172,6 +19664,8 @@ mod tests {
             forensics: Default::default(),
             telemetry: None,
             cc_session: None,
+            empty_reply_key: None,
+            empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -19384,6 +19878,8 @@ mod tests {
                 started_at: std::time::SystemTime::now(),
             }),
             cc_session: None,
+            empty_reply_key: None,
+            empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),
@@ -20243,6 +20739,8 @@ mod tests {
             forensics: Default::default(),
             telemetry: None,
             cc_session: None,
+            empty_reply_key: None,
+            empty_replies: Default::default(),
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),
             _session_concurrency: super::SessionConcurrencyGuard::dummy(Default::default()),

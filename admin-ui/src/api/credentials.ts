@@ -287,6 +287,11 @@ export interface UsageLog {
   third_party: boolean
   /** 这条请求在 luban 里经历的改写重试标签（逗号分隔）。 */
   rewrites: string | null
+  /**
+   * 上游回了 200 却零输出（有 usage、output_tokens = 0）时截下的响应体开头（最多 4000 字）。
+   * 正常回复为 null——只有这类异常才留正文，是唯一能看到上游到底回了什么的地方。0.3.89 起。
+   */
+  response_excerpt: string | null
 }
 
 /** 分布项：某个取值出现了多少次。 */
