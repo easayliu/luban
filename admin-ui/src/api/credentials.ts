@@ -142,6 +142,17 @@ export interface Credential {
    */
   rpm_limit_effective: number
   /**
+   * 账号自身的「额度用到多少就提前停调度」阈值（5h 窗口，百分比）：null 跟随全局；
+   * 0 本账号这一档不停；1..100 独立阈值。
+   */
+  quota_pause_pct: number | null
+  /** 同上，7d 窗口那一档。 */
+  quota_pause_pct_7d: number | null
+  /** 5h 档实际生效的阈值（已套用全局）；0 = 这一档不停。 */
+  quota_pause_pct_effective: number
+  /** 7d 档实际生效的阈值（已套用全局）；0 = 这一档不停。 */
+  quota_pause_pct_7d_effective: number
+  /**
    * **账号级**进程内 429 冷却的剩余秒数；0 = 未冷却。
    *
    * 正常路径上几乎恒为 0——账号级限流走的是落库的 `resume_at`，这一项只反映「落库失败」
@@ -477,6 +488,20 @@ export async function setDeviceLimits(
   return data
 }
 
+/** 批量设置账号自己的提前停调度阈值（两档三态同单账号接口：null 跟随全局；0 不停；1..100 独立阈值）。 */
+export async function setCredentialQuotaPausePcts(
+  ids: number[],
+  pct: number | null,
+  pct7d: number | null,
+): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/quota-pause-pct', {
+    ids,
+    quota_pause_pct: pct,
+    quota_pause_pct_7d: pct7d,
+  })
+  return data
+}
+
 /** 批量设置账号 RPM 上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
 export async function setRpmLimits(ids: number[], rpmLimit: number): Promise<Credential[]> {
   const { data } = await api.post<Credential[]>('/credentials/rpm-limit', {
@@ -532,6 +557,24 @@ export async function setDeviceLimit(id: number, deviceLimit: number): Promise<C
 export async function setRpmLimit(id: number, rpmLimit: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/rpm-limit`, {
     rpm_limit: rpmLimit,
+  })
+  return data
+}
+
+/**
+ * 设置该账号自己的「额度用到多少就提前停调度」阈值，覆盖全局设置。两档各自：null 跟随全局；
+ * 0 本账号这一档不停；1..100 独立阈值。整份覆盖，两档都要传。
+ *
+ * 下一条带限流头的响应起生效；已经按旧阈值停下的号不会因为调高而自动回池。
+ */
+export async function setCredentialQuotaPausePct(
+  id: number,
+  pct: number | null,
+  pct7d: number | null,
+): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/quota-pause-pct`, {
+    quota_pause_pct: pct,
+    quota_pause_pct_7d: pct7d,
   })
   return data
 }

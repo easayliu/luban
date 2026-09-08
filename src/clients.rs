@@ -226,6 +226,8 @@ mod tests {
             disabled: false,
             device_limit: 0,
             rpm_limit: 0,
+            quota_pause_pct: None,
+            quota_pause_pct_7d: None,
             ban_reason: None,
             account_uuid: None,
             org_uuid: None,

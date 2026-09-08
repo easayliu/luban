@@ -498,17 +498,33 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
-          k="refusal_fallback"
-          label={t('拒答换模型重跑', 'Refusal fallback')}
+          k="fable_refusal_fallback"
+          label={t('Fable 拒答换模型重跑', 'Fable refusal fallback')}
           summary={t(
-            '主线程请求带上服务端 fallback：安全分类器拒答时由上游在同一次调用里换模型重跑，fable 落 opus-5，opus-5 落 4.8 再落 4.6。',
-            'Main-thread requests carry a server-side fallback: when the safety classifier refuses, upstream reruns the same call on another model — fable to opus-5, opus-5 to 4.8 then 4.6.',
+            'fable 主线程请求带上官方那份服务端 fallback：安全分类器拒答时由上游在同一次调用里换 opus-5 重跑。形态逐字同官方 2.1.260，默认开。',
+            'Fable main-thread requests carry the official server-side fallback: when the safety classifier refuses, upstream reruns the same call on opus-5. Byte-for-byte the official 2.1.260 shape; on by default.',
           )}
           description={
             <>
               {t(
-                'Fable 5.1 / Fable 5 / Opus 5 带安全分类器，命中（多为 cyber 类，良性安全工作也会误伤）时回 200 加 stop_reason refusal、正文为空。官方 Claude Code 2.1.260 在 fable 上自带 fallbacks: [{"model":"claude-opus-5"}] 和 server-side-fallback beta，拒答会由上游换 Opus 5 重跑，用户看不到拒答。开启后 luban 给 fable 主线程补上与官方逐字相同的这份；给 opus-5 主线程补 luban 自定的 [4.8, 4.6] 链（官方 opus 客户端不发这个字段，这是有意偏离），出站头一并带 server-side-fallback-2026-06-01。客户端自己带了数组形态的不动；helper / 标题 / 安全分类 / 额度探测这些辅助请求官方都不发，不补。上游以 400 拒掉某个 fallback 目标时，剥掉重发一次并记进「从上游学到的规则」，之后该模型不再补。落到 fallback 的回复按实际服务的模型计价，同一对话约一小时内会粘在 fallback 模型上。输出前就被拒的请求上游不计费，流水里花费记 0。关闭即回到裸拒答。',
-                'Fable 5.1 / Fable 5 / Opus 5 run safety classifiers; a hit (mostly the cyber category, and benign security work gets caught too) returns 200 with stop_reason refusal and empty content. Official Claude Code 2.1.260 sends fallbacks: [{"model":"claude-opus-5"}] plus the server-side-fallback beta on fable, so upstream reruns a refused call on Opus 5 and the user never sees the refusal. When enabled, luban adds that exact field to fable main-thread requests, and a luban-defined [4.8, 4.6] chain to opus-5 main-thread requests (the official opus client does not send the field; this is a deliberate deviation), with server-side-fallback-2026-06-01 in the outbound header. A client-supplied array form is left alone; helper / title / classifier / quota-probe requests are not touched, as the official client never sends it there. If upstream rejects a fallback target with a 400, the field is stripped and the request resent once, and the rule lands under Rules learned from upstream so that model is not padded again. A reply served by a fallback is priced at the model that actually served it, and the conversation sticks to the fallback model for about an hour. Requests refused before any output are not billed upstream, so their cost is recorded as 0. Turn it off to get the raw refusal.',
+                'Fable 5.1 / Fable 5 带安全分类器，命中（多为 cyber 类，良性安全工作也会误伤）时回 200 加 stop_reason refusal、正文为空。官方 Claude Code 2.1.260 在 fable 上自带 fallbacks: [{"model":"claude-opus-5"}] 和 server-side-fallback beta，拒答会由上游换 Opus 5 重跑，用户看不到拒答。开启后 luban 给 fable 主线程补上与官方逐字相同的这份，出站头一并带 server-side-fallback-2026-06-01——有抓包依据，补上反而更像官方；关掉则模拟出的 fable 请求比官方少这一个字段、回到裸拒答。客户端自己带了数组形态的不动；helper / 标题 / 安全分类 / 额度探测这些辅助请求官方都不发，不补。上游以 400 拒掉 fallback 目标时，剥掉重发一次并记进「从上游学到的规则」，之后该模型不再补。落到 fallback 的回复按实际服务的模型计价，同一对话约一小时内会粘在 fallback 模型上。输出前就被拒的请求上游不计费，流水里花费记 0。opus-5 那条自定链是另一个开关，见下。',
+                'Fable 5.1 / Fable 5 run safety classifiers; a hit (mostly the cyber category, and benign security work gets caught too) returns 200 with stop_reason refusal and empty content. Official Claude Code 2.1.260 sends fallbacks: [{"model":"claude-opus-5"}] plus the server-side-fallback beta on fable, so upstream reruns a refused call on Opus 5 and the user never sees the refusal. When enabled, luban adds that exact field to fable main-thread requests, with server-side-fallback-2026-06-01 in the outbound header; this is backed by a capture, so adding it makes the request more like the official client, not less. Turned off, simulated fable requests lack that one field and you get the raw refusal. A client-supplied array form is left alone; helper / title / classifier / quota-probe requests are not touched, as the official client never sends it there. If upstream rejects the fallback target with a 400, the field is stripped and the request resent once, and the rule lands under Rules learned from upstream so that model is not padded again. A reply served by a fallback is priced at the model that actually served it, and the conversation sticks to the fallback model for about an hour. Requests refused before any output are not billed upstream, so their cost is recorded as 0. The luban-defined opus-5 chain is a separate switch below.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="opus_refusal_fallback"
+          label={t('Opus 拒答换模型重跑（实验）', 'Opus refusal fallback (experimental)')}
+          summary={t(
+            'opus-5 主线程请求带上 luban 自定的 fallback 链：拒答时上游落 4.8 再落 4.6。官方 opus 客户端不发这个字段，默认关。',
+            'Opus-5 main-thread requests carry a luban-defined fallback chain: on refusal upstream falls to 4.8, then 4.6. The official opus client never sends this field; off by default.',
+          )}
+          description={
+            <>
+              {t(
+                '官方 Claude Code 2.1.260 的 opus 客户端只带 server-side-fallback beta、不发 fallbacks 字段——「有 beta 没字段」就是官方形态。开启后 luban 给 opus-5 主线程补上自定的 fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]（cyber 类拒答官方推荐的 fallback 正是 4.8），这是一份官方客户端从不产生的请求形态：封号复盘里查不出它导致了 account_on_hold，但作为风控层面的自证风险，它只该是独立的实验开关，默认关、保持官方 opus 请求形态。其余行为同上一条：只补主线程、客户端自带的不动、上游 400 拒掉目标后学下来不再补、落到 fallback 的回复按实际作答模型计价。若日后要重新启用，更稳妥的做法是发字符串 "default" 让上游按当前推荐模型路由，或先读 /v1/models 的 allowed_fallback_models、全部目标获允许时再发自定链。',
+                'The official Claude Code 2.1.260 opus client sends only the server-side-fallback beta and no fallbacks field; "beta present, field absent" is the official shape. When enabled, luban adds a self-defined fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}] to opus-5 main-thread requests (4.8 is the fallback officially recommended for cyber refusals). That is a request shape the official client never produces: the ban post-mortem does not show it caused account_on_hold, but as a fingerprint risk it belongs behind a separate experimental switch, off by default, keeping the official opus request shape. Everything else matches the switch above: main thread only, client-supplied arrays left alone, a 400 on a fallback target is learned and the model is not padded again, replies served by a fallback are priced at the model that answered. If you re-enable it later, the safer options are sending the string "default" so upstream routes to its current recommended model, or reading allowed_fallback_models from /v1/models first and only sending the custom chain when every target is allowed.',
               )}
             </>
           }
@@ -960,8 +976,8 @@ function QuotaPausePct() {
           <FieldLabel>{t('提前停调度阈值', 'Early pause threshold')}</FieldLabel>
           <FieldDescription className="max-w-xl leading-5">
             {t(
-              '上游每条响应都带着账号的用量限制使用率；到达阈值就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。两个窗口各配一档，别混用：5 小时窗口停号最多歇几小时就自己回来，7 天窗口停号是歇到下个周重置——一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时一点没用。故 7 天那档默认关（周额度真用光时上游会回 429，账号级冷却照常接手）；要开建议配得比 5 小时那档更高。超额池快满不算在内。停用后按触发的那个窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。填 0 = 该档不停号。',
-              'Every upstream response reports the account’s usage-limit utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold — do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. A nearly full overage pool never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off.',
+              '上游每条响应都带着账号的用量限制使用率；到达阈值就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。两个窗口各配一档，别混用：5 小时窗口停号最多歇几小时就自己回来，7 天窗口停号是歇到下个周重置——一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时一点没用。故 7 天那档默认关（周额度真用光时上游会回 429，账号级冷却照常接手）；要开建议配得比 5 小时那档更高。超额池快满不算在内。停用后按触发的那个窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。填 0 = 该档不停号。这里是全局值；单个账号可在账号菜单「提前停调度阈值」里逐档覆盖（跟随全局 / 这一档不停 / 独立阈值）。',
+              'Every upstream response reports the account’s usage-limit utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold — do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. A nearly full overage pool never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (use global / off for this account / custom threshold).',
             )}
           </FieldDescription>
         </div>

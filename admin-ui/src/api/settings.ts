@@ -97,8 +97,10 @@ export interface Settings {
   api_telemetry: boolean
   /** 保活循环里的空闲遥测（版本检查事件 + Datadog 日志 + GrowthBook 画像）。 */
   keepalive_telemetry: boolean
-  /** 主线程请求补服务端 refusal fallback：拒答时由上游换模型重跑（fable→opus-5，opus-5→4.8→4.6）。 */
-  refusal_fallback: boolean
+  /** fable 族主线程请求补官方那份服务端 refusal fallback：拒答时由上游换 opus-5 重跑。默认开。 */
+  fable_refusal_fallback: boolean
+  /** opus-5 族主线程请求补 luban 自定的 refusal fallback 链（4.8→4.6）。官方不发这个字段，实验开关，默认关。 */
+  opus_refusal_fallback: boolean
   /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
   prefill_policy: string
   /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
@@ -134,7 +136,8 @@ export type ForwardingKey =
   | 'reject_probes'
   | 'api_telemetry'
   | 'keepalive_telemetry'
-  | 'refusal_fallback'
+  | 'fable_refusal_fallback'
+  | 'opus_refusal_fallback'
 
 /** 读取接入设置。 */
 export async function getSettings(): Promise<Settings> {

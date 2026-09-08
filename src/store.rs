@@ -16,7 +16,8 @@ use crate::credentials::Credential;
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
-     rpm_limit, rate_limit_tier, org_uuid, subscription_created_at";
+     rpm_limit, rate_limit_tier, org_uuid, subscription_created_at, quota_pause_pct, \
+     quota_pause_pct_7d";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -623,6 +624,12 @@ pub struct PortableCredential {
     pub resume_at: Option<u64>,
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 逐账号的提前停调度阈值（5h / 7d 两档）；`None` 跟随全局。见
+    /// [`Credential::quota_pause_pct`]。
+    #[serde(default)]
+    pub quota_pause_pct: Option<i64>,
+    #[serde(default)]
+    pub quota_pause_pct_7d: Option<i64>,
 }
 
 impl From<&Credential> for PortableCredential {
@@ -645,6 +652,8 @@ impl From<&Credential> for PortableCredential {
             subscription_created_at: c.subscription_created_at.clone(),
             resume_at: c.resume_at,
             proxy: c.proxy.clone(),
+            quota_pause_pct: c.quota_pause_pct,
+            quota_pause_pct_7d: c.quota_pause_pct_7d,
         }
     }
 }
@@ -913,6 +922,7 @@ impl CredentialStore {
                          device_limit = ?10, rpm_limit = ?11, ban_reason = ?12,
                          account_uuid = ?13, resume_at = ?14, proxy = ?15,
                          rate_limit_tier = ?16, org_uuid = ?17, subscription_created_at = ?18,
+                         quota_pause_pct = ?19, quota_pause_pct_7d = ?20,
                          updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
@@ -934,6 +944,8 @@ impl CredentialStore {
                         c.rate_limit_tier,
                         c.org_uuid,
                         c.subscription_created_at,
+                        c.quota_pause_pct,
+                        c.quota_pause_pct_7d,
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -945,9 +957,9 @@ impl CredentialStore {
                          (label, tier, org_type, access_token, refresh_token, expires_at,
                           priority, disabled, device_limit, rpm_limit, ban_reason,
                           account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
-                          subscription_created_at)
+                          subscription_created_at, quota_pause_pct, quota_pause_pct_7d)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17)",
+                             ?16, ?17, ?18, ?19)",
                     params![
                         c.label,
                         c.tier,
@@ -966,6 +978,8 @@ impl CredentialStore {
                         c.rate_limit_tier,
                         c.org_uuid,
                         c.subscription_created_at,
+                        c.quota_pause_pct,
+                        c.quota_pause_pct_7d,
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -1227,6 +1241,34 @@ impl CredentialStore {
             .max(0)
     }
 
+    /// 批量设置账号自己的提前停调度阈值（两档整份覆盖）；三态同 [`Self::set_quota_pause_pcts`]。
+    pub fn set_quota_pause_pcts_many(
+        &self,
+        ids: &[i64],
+        short_pct: Option<i64>,
+        long_pct: Option<i64>,
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let short_pct = short_pct.map(|p| p.clamp(0, 100));
+        let long_pct = long_pct.map(|p| p.clamp(0, 100));
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET quota_pause_pct = ?2, quota_pause_pct_7d = ?3, \
+                 updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, short_pct, long_pct])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// 批量设置账号 RPM 上限；三态同 [`Self::set_rpm_limit`]。
     pub fn set_rpm_limits(&self, ids: &[i64], limit: i64) -> Result<usize> {
         if ids.is_empty() {
@@ -1405,6 +1447,23 @@ impl CredentialStore {
         self.update_one(
             "UPDATE credentials SET rpm_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
             params![id, limit],
+        )
+    }
+
+    /// 设置该账号自己的「额度用到多少就提前停调度」阈值（5h / 7d 两档，百分比）。
+    /// 每档 `None` = 跟随全局、`Some(0)` = 本账号这一档不停、`Some(1..=100)` = 独立阈值；
+    /// 取值夹到 `0..=100`。生效值见 [`effective_quota_pause_pct`]，判定在
+    /// `crate::proxy::park_if_quota_nearly_exhausted`——下一条带限流头的响应起生效。
+    pub fn set_quota_pause_pcts(
+        &self,
+        id: i64,
+        short_pct: Option<i64>,
+        long_pct: Option<i64>,
+    ) -> Result<bool> {
+        self.update_one(
+            "UPDATE credentials SET quota_pause_pct = ?2, quota_pause_pct_7d = ?3, \
+             updated_at = unixepoch() WHERE id = ?1",
+            params![id, short_pct.map(|p| p.clamp(0, 100)), long_pct.map(|p| p.clamp(0, 100))],
         )
     }
 
@@ -2210,8 +2269,12 @@ impl CredentialStore {
         if let Some(v) = on(KEEPALIVE_TELEMETRY) {
             flags.keepalive_telemetry = v;
         }
-        if let Some(v) = on(REFUSAL_FALLBACK) {
-            flags.refusal_fallback = v;
+        // fable 那档沿用 v0.3.91 的单一旧键；opus 那档默认关，旧键不算数。
+        if let Some(v) = on(FABLE_REFUSAL_FALLBACK).or_else(|| on(REFUSAL_FALLBACK_LEGACY)) {
+            flags.fable_refusal_fallback = v;
+        }
+        if let Some(v) = on(OPUS_REFUSAL_FALLBACK) {
+            flags.opus_refusal_fallback = v;
         }
         // 新键存在就以它为准，否则沿用旧键——旧库里若把旧键关过，语义就是「别动 system」。
         if let Some(v) = on(SYSTEM_SHAPE).or_else(|| on(CACHE_SCOPE_GLOBAL)) {
@@ -2464,9 +2527,21 @@ pub const API_TELEMETRY: &str = "api_telemetry";
 /// settings 键名。缺省视为开启。见 [`ForwardFlags::keepalive_telemetry`]。
 pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
 
-/// 是否给主线程请求补服务端 refusal fallback（`fallbacks` 字段 + `server-side-fallback`
-/// beta）的 settings 键名。缺省视为开启。见 [`ForwardFlags::refusal_fallback`]。
-pub const REFUSAL_FALLBACK: &str = "refusal_fallback";
+/// 主线程 **fable 族**补不补服务端 refusal fallback（`fallbacks: [{"model":"claude-opus-5"}]`
+/// + `server-side-fallback` beta）的 settings 键名。缺省视为开启：这份形态逐字取自官方
+/// 2.1.260 抓包，补上反而更像官方。见 [`ForwardFlags::fable_refusal_fallback`]。
+pub const FABLE_REFUSAL_FALLBACK: &str = "fable_refusal_fallback";
+
+/// 主线程 **opus-5 族**补不补 luban 自定的 refusal fallback 链（4.8 → 4.6）的 settings 键名。
+/// 缺省视为**关闭**：官方 opus 客户端不发这个字段，补了就是一份官方客户端从不产生的请求
+/// 形态；封号复盘里查不出它导致了 `account_on_hold`，但作为风控形态风险它该是独立的实验
+/// 开关而不是默认行为。见 [`ForwardFlags::opus_refusal_fallback`]。
+pub const OPUS_REFUSAL_FALLBACK: &str = "opus_refusal_fallback";
+
+/// v0.3.91 的单一开关键名（fable 与 opus 一起管）。v0.3.92 起拆成 [`FABLE_REFUSAL_FALLBACK`]
+/// 与 [`OPUS_REFUSAL_FALLBACK`]；旧键只在 fable 新键缺省时沿用（旧库里关过即「fable 也别补」），
+/// **不**沿用到 opus——把 opus 那条默认关掉正是拆分的目的，旧库里开着也不算数。
+pub const REFUSAL_FALLBACK_LEGACY: &str = "refusal_fallback";
 
 /// 上次从 `downloads.claude.ai/claude-code-releases/latest` 学到的官方最新 Claude Code 版本
 /// （`主.次.修` 串）的 settings 键名。启动时垫进 [`crate::oauth::latest_release`] 的缓存，
@@ -2727,16 +2802,22 @@ pub struct ForwardFlags {
     /// 关掉只停这一半：token 刷新、bootstrap / policy_limits / settings 握手与 401/403
     /// 探测照常。不影响 [`Self::api_telemetry`]。
     pub keepalive_telemetry: bool,
-    /// 主线程请求补**服务端 refusal fallback**：安全分类器拒答（`stop_reason: "refusal"`，
-    /// 如 cyber 类）时由上游在同一次调用里换模型重跑，客户端拿到的是回答而不是拒答。
-    /// fable 族补官方 2.1.260 那份 `[{"model":"claude-opus-5"}]`（形态逐字同官方），opus-5
-    /// 补 luban 自定的 `[{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]`（官方
-    /// opus 客户端不发这个字段，是有意偏离），出站头一并带 `server-side-fallback-2026-06-01`。
-    /// 客户端自己带了数组形态的不动；只对主线程 profile 补，辅助请求（helper / 标题 / 分类 /
-    /// 额度探测）官方都不发。上游以 400 拒掉某个 fallback 目标时，剥掉重发一次并记进「从上游
-    /// 学到的规则」，之后该模型不再补。落到 fallback 的回复按实际服务的模型计价。
+    /// **fable 族**主线程请求补服务端 refusal fallback：安全分类器拒答（`stop_reason:
+    /// "refusal"`，如 cyber 类）时由上游在同一次调用里换模型重跑，客户端拿到的是回答而不是
+    /// 拒答。补的是官方 2.1.260 那份 `[{"model":"claude-opus-5"}]`（形态逐字同官方），出站头
+    /// 一并带 `server-side-fallback-2026-06-01`。客户端自己带了数组形态的不动；只对主线程
+    /// profile 补，辅助请求（helper / 标题 / 分类 / 额度探测）官方都不发。上游以 400 拒掉某个
+    /// fallback 目标时，剥掉重发一次并记进「从上游学到的规则」，之后该模型不再补。落到
+    /// fallback 的回复按实际服务的模型计价。默认开：有官方抓包依据，补上反而更像官方。
     /// 见 `crate::proxy::refusal_fallbacks_for`。
-    pub refusal_fallback: bool,
+    pub fable_refusal_fallback: bool,
+    /// **opus-5 族**主线程请求补 luban 自定的 refusal fallback 链
+    /// `[{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]`（`config::OPUS_REFUSAL_FALLBACKS`）。
+    /// 官方 2.1.260 的 opus 客户端**不发**这个字段：补了就是一份官方从不产生的请求形态，
+    /// 是风控层面的自证风险，故**默认关**、作为独立实验开关保留；关着时 opus-5 的请求形态与
+    /// 官方一致（有 beta 没字段）。其余行为（只补主线程、客户端自带的不动、400 学习后不再补、
+    /// 按实际作答模型计价）同 [`Self::fable_refusal_fallback`]。
+    pub opus_refusal_fallback: bool,
 }
 
 impl Default for ForwardFlags {
@@ -2769,7 +2850,8 @@ impl Default for ForwardFlags {
             reject_probes: true,
             api_telemetry: true,
             keepalive_telemetry: true,
-            refusal_fallback: true,
+            fable_refusal_fallback: true,
+            opus_refusal_fallback: false,
         }
     }
 }
@@ -2927,6 +3009,15 @@ pub fn effective_device_limit(cred_limit: i64, default_limit: i64) -> i64 {
 /// 两处各写一份 `match`，哪天改了三态语义就只会改到其中一处。
 pub fn effective_rpm_limit(cred_limit: i64, default_limit: i64) -> i64 {
     effective_device_limit(cred_limit, default_limit)
+}
+
+/// 账号实际生效的提前停调度阈值（百分比，`0` = 这一档不停）：账号自己配了
+/// （[`Credential::quota_pause_pct`] / `quota_pause_pct_7d`）就用它，否则跟随全局那档。
+///
+/// 两档各自调用一次，别把 5h 的账号值配上 7d 的全局值——同 [`CredentialStore::quota_pause_pct`]
+/// 那两档「各算各的」的口径。
+pub fn effective_quota_pause_pct(cred_pct: Option<i64>, global_pct: i64) -> i64 {
+    cred_pct.unwrap_or(global_pct).clamp(0, 100)
 }
 
 /// 待写入的一条用量日志（代理层组装后交给 [`CredentialStore::insert_usage_log`]）。
@@ -4518,6 +4609,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_uuid TEXT", []);
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN subscription_created_at TEXT", []);
 
+    // 逐账号的「额度用到多少就提前停调度」阈值（5h / 7d 两档，百分比）。NULL = 跟随全局
+    // [`QUOTA_PAUSE_PCT`] / [`QUOTA_PAUSE_PCT_7D`]，0 = 本账号这一档不停，1..=100 = 独立阈值。
+    // 旧库补出来全是 NULL，即全部跟随全局，存量行为不变。**同样必须补在重建之后**。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN quota_pause_pct INTEGER", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN quota_pause_pct_7d INTEGER", []);
+
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
     // 本机解析 DNS——正是那个改动要治的故障（住宅代理只回一个 `unexpected EOF`），而网页上没有
@@ -4712,6 +4809,8 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("rate_limit_tier", "TEXT"),
     ("org_uuid", "TEXT"),
     ("subscription_created_at", "TEXT"),
+    ("quota_pause_pct", "INTEGER"),
+    ("quota_pause_pct_7d", "INTEGER"),
 ];
 
 fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
@@ -4736,6 +4835,8 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         rate_limit_tier: row.get(17)?,
         org_uuid: row.get(18)?,
         subscription_created_at: row.get(19)?,
+        quota_pause_pct: row.get(20)?,
+        quota_pause_pct_7d: row.get(21)?,
     })
 }
 
@@ -6287,6 +6388,8 @@ mod tests {
             disabled: false,
             device_limit: 3,
             rpm_limit: 7,
+            quota_pause_pct: None,
+            quota_pause_pct_7d: None,
             ban_reason: None,
             account_uuid: Some("uuid-1".into()),
             org_uuid: None,
@@ -6374,6 +6477,8 @@ mod tests {
             disabled: true,
             device_limit: 6,
             rpm_limit: -1,
+            quota_pause_pct: Some(95),
+            quota_pause_pct_7d: Some(0),
             ban_reason: Some("banned upstream".into()),
             account_uuid: Some("uuid".into()),
             org_uuid: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
@@ -6401,6 +6506,10 @@ mod tests {
         assert_eq!(back.disabled, full.disabled);
         assert_eq!(back.device_limit, full.device_limit);
         assert_eq!(back.rpm_limit, full.rpm_limit);
+        // 逐账号的提前停调度阈值同样要跟着走：`Some(0)`（这一档不停）与 `None`（跟随全局）
+        // 是两个不同的值，导出再导入不能把前者抹成后者。
+        assert_eq!(back.quota_pause_pct, Some(95));
+        assert_eq!(back.quota_pause_pct_7d, Some(0));
         assert_eq!(back.ban_reason, full.ban_reason);
         assert_eq!(back.account_uuid, full.account_uuid);
         // 组织 id 与订阅创建时刻同理：迁移后不该等到下一次刷新才有。
@@ -8190,6 +8299,11 @@ mod tests {
         assert_eq!(store.forward_flags(), ForwardFlags::default(), "空库应等于默认值");
         assert!(ForwardFlags::default().spoof_identity, "默认必须是开");
         assert!(ForwardFlags::default().system_shape);
+        assert!(ForwardFlags::default().fable_refusal_fallback, "fable 那档有官方依据，默认开");
+        assert!(
+            !ForwardFlags::default().opus_refusal_fallback,
+            "opus 那档是官方不产生的形态，默认必须是关"
+        );
 
         // 每个键各用一种「关」的写法，确认逐项独立且解析口径一致。
         for (key, off) in [
@@ -8220,7 +8334,8 @@ mod tests {
             (REJECT_PROBES, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
-            (REFUSAL_FALLBACK, "0"),
+            (FABLE_REFUSAL_FALLBACK, "0"),
+            (OPUS_REFUSAL_FALLBACK, "0"),
         ] {
             store.set_setting(key, off).unwrap();
         }
@@ -8255,7 +8370,8 @@ mod tests {
                 reject_probes: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
-                refusal_fallback: false,
+                fable_refusal_fallback: false,
+                opus_refusal_fallback: false,
             }
         );
 
@@ -8269,6 +8385,35 @@ mod tests {
         // 无法识别的取值算「开」，不能因为写错字把形态悄悄关掉。
         store.set_setting(SPOOF_IDENTITY_ENABLED, "yes").unwrap();
         assert!(store.forward_flags().spoof_identity);
+    }
+
+    /// v0.3.91 的单一 `refusal_fallback` 旧键拆成 fable / opus 两档后：旧键只沿用到 fable
+    /// （关过的库升级后 fable 也别补），对 opus 不算数（旧库里开着，opus 仍按默认关）；
+    /// 新键一旦写了就以新键为准。
+    #[test]
+    fn forward_flags_split_refusal_fallback_keys_migrate_legacy_to_fable_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        // 旧库把总开关关了：fable 跟着关，opus 本来就关。
+        store.set_setting(REFUSAL_FALLBACK_LEGACY, "0").unwrap();
+        let f = store.forward_flags();
+        assert!(!f.fable_refusal_fallback, "旧键关过 = fable 也别补");
+        assert!(!f.opus_refusal_fallback);
+
+        // 旧库把总开关明确开着：fable 开，opus **不**跟着开——默认关正是拆分的目的。
+        store.set_setting(REFUSAL_FALLBACK_LEGACY, "1").unwrap();
+        let f = store.forward_flags();
+        assert!(f.fable_refusal_fallback);
+        assert!(!f.opus_refusal_fallback, "旧键开着也不能把 opus 那条实验开关带开");
+
+        // 新键存在就以新键为准，旧键不再作数；两档互不影响。
+        store.set_setting(FABLE_REFUSAL_FALLBACK, "0").unwrap();
+        store.set_setting(OPUS_REFUSAL_FALLBACK, "1").unwrap();
+        let f = store.forward_flags();
+        assert!(!f.fable_refusal_fallback, "fable 新键 0 压过旧键 1");
+        assert!(f.opus_refusal_fallback, "opus 显式开才开");
     }
 
     /// 旧库上的单列 idx_usage_logs_cred 会被换成 (cred_id, ts) 复合索引：前缀相同，

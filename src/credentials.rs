@@ -39,6 +39,15 @@ pub struct Credential {
     /// `> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
     /// 生效值见 [`crate::store::effective_rpm_limit`]，计数窗口见 `crate::store` 里的选号。
     pub rpm_limit: i64,
+    /// 该账号自己的「额度用到多少就提前停调度」阈值（**5h 窗口**，百分比）。
+    /// `None` 跟随全局 [`crate::store::QUOTA_PAUSE_PCT`]；`Some(0)` 本账号这一档不停；
+    /// `Some(1..=100)` 本账号独立阈值。生效值见 [`crate::store::effective_quota_pause_pct`]。
+    ///
+    /// 与 [`Self::rpm_limit`] 的三态编码不同（那边 `0` 是「跟随」）：这里 `0` 本身就是一个
+    /// 有意义的取值（关），「跟随」只能用 NULL 表达。
+    pub quota_pause_pct: Option<i64>,
+    /// 同上，**7d 窗口**那一档；`None` 跟随全局 [`crate::store::QUOTA_PAUSE_PCT_7D`]。
+    pub quota_pause_pct_7d: Option<i64>,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用
     /// （手动停用或未停用皆为 `None`）。见 [`crate::store::CredentialStore::mark_banned`]。
     pub ban_reason: Option<String>,

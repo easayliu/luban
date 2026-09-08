@@ -9254,12 +9254,13 @@ fn ensure_diagnostics(v: &mut serde_json::Value, link: &CcSessionLink) -> bool {
     true
 }
 
-/// 这条请求该补哪份 `fallbacks`（`refusal_fallback` 开着、计费路径、主线程 profile 时）：
+/// 这条请求该补哪份 `fallbacks`（计费路径、主线程 profile，且该族的开关开着时）：
 ///
-/// - fable 族：官方 2.1.260 那份 `[{"model":"claude-opus-5"}]`（profile 里逐字取自抓包）；
-/// - opus-5 族：luban 自定的 [`config::OPUS_REFUSAL_FALLBACKS`]（4.8 → 4.6）；官方 opus
-///   客户端不发这个字段，这是有意偏离——cyber 拒答换模型重跑比裸拒答更要紧，官方推荐的
-///   cyber 类 fallback 正是 4.8；
+/// - fable 族（`fable_refusal_fallback`，默认开）：官方 2.1.260 那份
+///   `[{"model":"claude-opus-5"}]`（profile 里逐字取自抓包），补上反而更像官方；
+/// - opus-5 族（`opus_refusal_fallback`，**默认关**）：luban 自定的
+///   [`config::OPUS_REFUSAL_FALLBACKS`]（4.8 → 4.6）。官方 opus 客户端不发这个字段，补了就是
+///   官方从不产生的请求形态，是风控层面的自证风险，故只作为独立实验开关保留；
 /// - 其余模型（sonnet / haiku / 4.x）：不补，它们本身没有分类器拒答一说。
 ///
 /// 上游曾以 400 拒过这个模型的 fallback 目标（[`remember_fallback_rejection`]）的，也不补。
@@ -9270,14 +9271,20 @@ fn refusal_fallbacks_for(
     cc_kind: CcRequestKind,
     learned: &DeprecatedFieldMemory,
 ) -> Option<&'static str> {
-    if !flags.refusal_fallback || !billable || cc_kind != CcRequestKind::Main {
+    if !billable || cc_kind != CcRequestKind::Main {
         return None;
     }
     let model = model?;
     let m = model.to_ascii_lowercase();
     let plan = if m.contains("fable") {
+        if !flags.fable_refusal_fallback {
+            return None;
+        }
         cc_profile_for(model).fallbacks?
     } else if m.starts_with("claude-opus-5") {
+        if !flags.opus_refusal_fallback {
+            return None;
+        }
         config::OPUS_REFUSAL_FALLBACKS
     } else {
         return None;
@@ -9356,7 +9363,7 @@ fn ensure_fallbacks(v: &mut serde_json::Value, plan: &str) -> bool {
     true
 }
 
-/// `fallbacks` 的**形态**归一（`refusal_fallback` 关着时走这条）：2.1.258 的官方 fable 发
+/// `fallbacks` 的**形态**归一（该族的 refusal fallback 开关关着时走这条）：2.1.258 的官方 fable 发
 /// 字符串 `"default"`，2.1.260 换成了数组 `[{"model":"claude-opus-5"}]`（`cap/2.1.260/00018`）。
 ///
 /// 只在客户端自己已经要了 fallback 时改形态，不替它凭空开——开关关着即用户明确不要
@@ -10865,6 +10872,8 @@ fn park_rate_limited(
 /// 模型此刻有没有容量。
 ///
 /// **5h 与 7d 各用各的阈值**（[`QuotaPauseThresholds`]），默认只按 5h 停、7d 那档是关的。
+/// 两档都可以**逐账号覆盖**（`Credential::quota_pause_pct` / `quota_pause_pct_7d`，控制台
+/// 账号菜单里配）：账号配了的那档用账号的，配 0 即这个号这一档不停，没配的跟随全局。
 /// 混用一个数字的老口径会让一个周用量偏高的号被整段停掉——5h 明明还空着、这会儿完全能干活，
 /// 却要等到下个 7d 重置才回池。7d 真满了不需要我们提前动手：那时上游自己回 429，账号级冷却
 /// 接手，睡到 7d 重置为止。要开天级那档见 [`store::QUOTA_PAUSE_PCT_7D`]。
@@ -10883,7 +10892,7 @@ fn park_if_quota_nearly_exhausted(
     // 与 429 那一档同受「限流冷却/换号重试」这个总开关：关掉它的人要的是**完全**不干预调度、
     // 原样把上游的判决交给客户端，那时按使用率自动停号只会是个惊吓。要单独关本机制，把阈值
     // 配成 0 即可。
-    let thresholds = QuotaPauseThresholds::from_store(store);
+    let thresholds = QuotaPauseThresholds::for_credential(store, cred);
     if thresholds.all_off() || !store.forward_flags().rate_limit_retry {
         return false;
     }
@@ -10979,8 +10988,23 @@ struct QuotaPauseThresholds {
 }
 
 impl QuotaPauseThresholds {
-    fn from_store(store: &store::CredentialStore) -> Self {
-        Self { short_pct: store.quota_pause_pct(), long_pct: store.quota_pause_pct_7d() }
+    /// 这个账号生效的两档阈值：账号自己配了的那档用账号的
+    /// （[`crate::credentials::Credential::quota_pause_pct`] / `quota_pause_pct_7d`），
+    /// 没配的跟随全局。两档各自取，见 [`store::effective_quota_pause_pct`]。
+    fn for_credential(
+        store: &store::CredentialStore,
+        cred: &crate::credentials::Credential,
+    ) -> Self {
+        Self {
+            short_pct: store::effective_quota_pause_pct(
+                cred.quota_pause_pct,
+                store.quota_pause_pct(),
+            ),
+            long_pct: store::effective_quota_pause_pct(
+                cred.quota_pause_pct_7d,
+                store.quota_pause_pct_7d(),
+            ),
+        }
     }
 
     /// 该窗口适用的阈值（百分比）。
@@ -12994,7 +13018,8 @@ mod tests {
             reject_probes: false,
             api_telemetry: false,
             keepalive_telemetry: false,
-            refusal_fallback: false,
+            fable_refusal_fallback: false,
+            opus_refusal_fallback: false,
         };
         let out =
             build_forward_headers(&incoming_headers(), "sk-ant-oat01-REAL", flags, None, None);
@@ -13509,6 +13534,8 @@ mod tests {
             disabled: false,
             device_limit: 0,
             rpm_limit: 0,
+            quota_pause_pct: None,
+            quota_pause_pct_7d: None,
             ban_reason: None,
             account_uuid: Some(ACCOUNT_UUID.into()),
             org_uuid: None,
@@ -13809,7 +13836,8 @@ mod tests {
             reject_probes: false,
             api_telemetry: false,
             keepalive_telemetry: false,
-            refusal_fallback: false,
+            fable_refusal_fallback: false,
+            opus_refusal_fallback: false,
         };
         let out = rewrite_body(&raw, &test_cred(), "fp", flags, None, None);
         assert_eq!(out, raw, "全关时必须原样返回");
@@ -14625,7 +14653,8 @@ mod tests {
                 reject_probes: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
-                refusal_fallback: false,
+                fable_refusal_fallback: false,
+                opus_refusal_fallback: false,
             }
         };
         let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);
@@ -15879,14 +15908,21 @@ mod tests {
         detect_for(&Bytes::from(body.to_string()), all_on()).expect("普通请求应判为需要模拟")
     }
 
-    /// `refusal_fallbacks_for`：只给主线程、计费、开关开着的 fable / opus-5 补；fable 用官方
-    /// 那份，opus-5 用 luban 自定的 4.8 → 4.6 链；sonnet/haiku 不补；上游拒过的模型不补。
+    /// `refusal_fallbacks_for`：只给主线程、计费、且该族开关开着的 fable / opus-5 补；fable 用
+    /// 官方那份（默认开），opus-5 用 luban 自定的 4.8 → 4.6 链（默认关、要显式开）；两档互不
+    /// 影响；sonnet/haiku 不补；上游拒过的模型不补。
     #[test]
     fn refusal_fallbacks_are_chosen_per_family_and_gated() {
         use super::CcRequestKind::*;
         let mem = super::DeprecatedFieldMemory::default();
-        let on = all_on();
-        let off = store::ForwardFlags { refusal_fallback: false, ..all_on() };
+        let defaults = all_on();
+        assert!(defaults.fable_refusal_fallback && !defaults.opus_refusal_fallback);
+        let on = store::ForwardFlags { opus_refusal_fallback: true, ..defaults };
+        let off = store::ForwardFlags {
+            fable_refusal_fallback: false,
+            opus_refusal_fallback: false,
+            ..defaults
+        };
         let pick = |m: &str, flags: store::ForwardFlags, billable: bool, kind| {
             super::refusal_fallbacks_for(Some(m), flags, billable, kind, &mem)
         };
@@ -15902,9 +15938,30 @@ mod tests {
         assert_eq!(pick("claude-opus-4-8", on, true, Main), None, "4.x 不补");
         assert_eq!(pick("claude-haiku-4-5-20251001", on, true, Main), None);
         assert_eq!(pick("claude-fable-5-1", off, true, Main), None, "开关关着不补");
+        assert_eq!(pick("claude-opus-5", off, true, Main), None, "开关关着不补");
+        // 默认值：fable 补、opus 不补——opus 那份是官方不产生的形态，得显式打开。
+        assert_eq!(
+            pick("claude-fable-5-1", defaults, true, Main),
+            Some(r#"[{"model":"claude-opus-5"}]"#),
+            "fable 默认开"
+        );
+        assert_eq!(pick("claude-opus-5", defaults, true, Main), None, "opus 默认关");
+        assert_eq!(pick("claude-opus-5[1m]", defaults, true, Main), None, "opus 默认关");
+        // 两档各管各的：只开 opus 时 fable 不补，反之亦然。
+        let opus_only = store::ForwardFlags { fable_refusal_fallback: false, ..on };
+        assert_eq!(
+            pick("claude-fable-5-1", opus_only, true, Main),
+            None,
+            "fable 关着不受 opus 影响"
+        );
+        assert_eq!(
+            pick("claude-opus-5", opus_only, true, Main),
+            Some(config::OPUS_REFUSAL_FALLBACKS)
+        );
         assert_eq!(pick("claude-fable-5-1", on, false, Main), None, "count_tokens 不补");
         for kind in [Subagent, Suggestion, Helper, Title, Classifier, QuotaProbe] {
             assert_eq!(pick("claude-fable-5-1", on, true, kind), None, "辅助请求不补: {kind:?}");
+            assert_eq!(pick("claude-opus-5", on, true, kind), None, "辅助请求不补: {kind:?}");
         }
         assert_eq!(super::refusal_fallbacks_for(None, on, true, Main, &mem), None);
 
@@ -17772,7 +17829,7 @@ mod tests {
         assert_eq!(
             v["fallbacks"],
             serde_json::Value::Null,
-            "没给 fallbacks 字面量（refusal_fallback 关着）时不替用户开: {v}"
+            "没给 fallbacks 字面量（该族 refusal fallback 开关关着）时不替用户开: {v}"
         );
         assert!(
             sim.profile.beta.contains("thinking-display-updates-2026-08-18"),
@@ -20077,6 +20134,93 @@ mod tests {
         store.set_setting(store::QUOTA_PAUSE_PCT, "80").unwrap();
         assert!(super::park_if_quota_nearly_exhausted(&store, &cred, &warm));
         assert!(store.get(cred.id).unwrap().unwrap().disabled);
+    }
+
+    /// 逐账号阈值覆盖全局：账号自己配了的那档用账号的，`Some(0)` 是「这个号这一档不停」
+    /// 而不是「跟随」，`None` 才跟随；两档各自覆盖、互不串档。
+    #[test]
+    fn quota_threshold_is_overridable_per_credential() {
+        let hdr = |kv: &[(&str, &str)]| {
+            let mut h = super::HeaderMap::new();
+            for (k, v) in kv {
+                h.insert(
+                    super::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            super::RateLimitInfo::from_headers(&h)
+        };
+        let now = crate::credentials::now_secs() as i64;
+        let at = |secs: i64| (now + secs).to_string();
+        let warm = hdr(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.95"),
+            ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.97"),
+            ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
+        ]);
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let fresh = |id: i64| store.get(id).unwrap().unwrap();
+
+        // 全局 90：没配覆盖的号 95% 该停。
+        let a = store.insert("a", None, "at", "rt-a", u64::MAX, None, None).unwrap();
+        assert!(super::park_if_quota_nearly_exhausted(&store, &a, &warm));
+        assert!(fresh(a.id).disabled, "跟随全局 90 的号 95% 该停");
+
+        // 账号自己配 99：同一份头不停；配回 None 又跟随全局。
+        let b = store.insert("b", None, "at", "rt-b", u64::MAX, None, None).unwrap();
+        assert!(store.set_quota_pause_pcts(b.id, Some(99), None).unwrap());
+        let b = fresh(b.id);
+        assert_eq!((b.quota_pause_pct, b.quota_pause_pct_7d), (Some(99), None));
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &b, &warm));
+        assert!(!fresh(b.id).disabled, "账号阈值 99 覆盖全局 90，95% 不该停");
+        assert!(store.set_quota_pause_pcts(b.id, None, None).unwrap());
+        let b = fresh(b.id);
+        assert!(super::park_if_quota_nearly_exhausted(&store, &b, &warm));
+        assert!(fresh(b.id).disabled, "清掉覆盖就回到全局 90");
+
+        // 账号配 0 = 这个号这一档不停，哪怕全局开着；7d 档没配、全局也关，整个不停。
+        let c = store.insert("c", None, "at", "rt-c", u64::MAX, None, None).unwrap();
+        assert!(store.set_quota_pause_pcts(c.id, Some(0), None).unwrap());
+        let c = fresh(c.id);
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &c, &warm));
+        assert!(!fresh(c.id).disabled, "账号 5h 档配 0 即不停，不是跟随全局");
+
+        // 只给这个号开 7d 档（95）而全局 7d 关着：按 7d 停、睡到 7d 的 reset。
+        let d = store.insert("d", None, "at", "rt-d", u64::MAX, None, None).unwrap();
+        assert!(store.set_quota_pause_pcts(d.id, Some(0), Some(95)).unwrap());
+        let d = fresh(d.id);
+        assert!(super::park_if_quota_nearly_exhausted(&store, &d, &warm));
+        let after = fresh(d.id);
+        assert!(after.disabled);
+        let wait = after.resume_at.expect("按阈值停的号要能到点自恢复") as i64 - now;
+        assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到 7d reset，实得 {wait}");
+        assert!(after.ban_reason.unwrap().contains("7d"));
+
+        // 反过来：全局 5h 关着、账号自己开 80，95% 也停。
+        store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
+        let e = store.insert("e", None, "at", "rt-e", u64::MAX, None, None).unwrap();
+        assert!(!super::park_if_quota_nearly_exhausted(&store, &e, &warm));
+        assert!(store.set_quota_pause_pcts(e.id, Some(80), None).unwrap());
+        let e = fresh(e.id);
+        assert!(super::park_if_quota_nearly_exhausted(&store, &e, &warm));
+        assert!(fresh(e.id).disabled, "全局关着不妨碍账号自己开");
+
+        // 越界值夹到 0..=100；不存在的号返回 false。
+        assert!(store.set_quota_pause_pcts(e.id, Some(250), Some(-3)).unwrap());
+        let e = fresh(e.id);
+        assert_eq!((e.quota_pause_pct, e.quota_pause_pct_7d), (Some(100), Some(0)));
+        assert!(!store.set_quota_pause_pcts(9999, Some(50), None).unwrap());
+
+        // 批量：整份覆盖所选的号（含把已有覆盖清回 None），没选的不动，返回改了几条。
+        let n = store.set_quota_pause_pcts_many(&[a.id, e.id, 9999], None, Some(120)).unwrap();
+        assert_eq!(n, 2);
+        for id in [a.id, e.id] {
+            let c = fresh(id);
+            assert_eq!((c.quota_pause_pct, c.quota_pause_pct_7d), (None, Some(100)));
+        }
+        let d = fresh(d.id);
+        assert_eq!((d.quota_pause_pct, d.quota_pause_pct_7d), (Some(0), Some(95)), "没选的不动");
+        assert_eq!(store.set_quota_pause_pcts_many(&[], Some(1), None).unwrap(), 0);
     }
 
     /// 关掉「429 冷却/换号重试」总开关的人要的是完全不干预调度，那时阈值机制也必须闭嘴。

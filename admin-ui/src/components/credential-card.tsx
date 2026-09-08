@@ -47,6 +47,7 @@ import {
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
+import { CredentialQuotaDialog } from '@/components/credential-quota-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
@@ -100,6 +101,7 @@ export const CredentialCard = memo(function CredentialCard({
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
   const [rpmOpen, setRpmOpen] = useState(false)
+  const [quotaOpen, setQuotaOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -322,6 +324,7 @@ export const CredentialCard = memo(function CredentialCard({
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
                   onRpmLimit={() => setRpmOpen(true)}
+                  onQuotaPause={() => setQuotaOpen(true)}
                   onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
@@ -650,7 +653,7 @@ export const CredentialCard = memo(function CredentialCard({
         </CardFooter>
 
         {/* 没点开过任何一个就一个都不挂：账号一多，这些常关的对话框全是白挂的组件树。 */}
-        <DeferredMount open={proxyOpen || devicesOpen || usageOpen || confirmDelete || rpmOpen || testing}>
+        <DeferredMount open={proxyOpen || devicesOpen || usageOpen || confirmDelete || rpmOpen || quotaOpen || testing}>
           <CredentialProxyDialog
             cred={cred}
             open={proxyOpen}
@@ -662,6 +665,12 @@ export const CredentialCard = memo(function CredentialCard({
             open={rpmOpen}
             onOpenChange={setRpmOpen}
             rpmLimit={actions.rpmLimit}
+          />
+          <CredentialQuotaDialog
+            cred={cred}
+            open={quotaOpen}
+            onOpenChange={setQuotaOpen}
+            quotaPause={actions.quotaPause}
           />
           <CredentialDevicesDialog
             cred={cred}

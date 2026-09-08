@@ -410,6 +410,7 @@ pub async fn run(
         .route("/credentials/priority", post(set_priorities))
         .route("/credentials/device-limit", post(set_device_limits))
         .route("/credentials/rpm-limit", post(set_rpm_limits))
+        .route("/credentials/quota-pause-pct", post(set_quota_pause_pcts_many))
         .route("/credentials/disabled", post(set_disabled_many))
         .route("/credentials/delete", post(delete_credentials))
         .route("/credentials/{id}", delete(delete_credential))
@@ -419,6 +420,7 @@ pub async fn run(
         .route("/credentials/{id}/proxy", post(set_proxy))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
         .route("/credentials/{id}/rpm-limit", post(set_rpm_limit))
+        .route("/credentials/{id}/quota-pause-pct", post(set_credential_quota_pause_pct))
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
@@ -1044,6 +1046,35 @@ async fn set_rpm_limits(
 }
 
 #[derive(Deserialize)]
+struct SetQuotaPausePctsManyReq {
+    ids: Vec<i64>,
+    /// 两档三态同单账号接口 [`SetCredentialQuotaPausePctReq`]：`null` 跟随全局、`0` 不停、
+    /// `1..=100` 独立阈值；整份覆盖，两档都要传。
+    #[serde(default)]
+    quota_pause_pct: Option<i64>,
+    #[serde(default)]
+    quota_pause_pct_7d: Option<i64>,
+}
+
+/// 批量设置账号自己的提前停调度阈值，返回更新后的整份列表。
+async fn set_quota_pause_pcts_many(
+    State(state): State<AppState>,
+    Json(req): Json<SetQuotaPausePctsManyReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
+    let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
+    let n = state.store.set_quota_pause_pcts_many(&req.ids, short, long).map_err(internal)?;
+    tracing::info!(
+        count = n,
+        quota_pause_pct = ?short,
+        quota_pause_pct_7d = ?long,
+        "per-account quota-threshold pause set in bulk"
+    );
+    list_credentials(State(state)).await
+}
+
+#[derive(Deserialize)]
 struct SetDisabledManyReq {
     ids: Vec<i64>,
     disabled: bool,
@@ -1134,6 +1165,41 @@ async fn set_rpm_limit(
         return Err(not_found());
     }
     tracing::info!(cred_id = id, rpm_limit = limit, "rpm limit set");
+    view_of(&state, id)
+}
+
+#[derive(Deserialize)]
+struct SetCredentialQuotaPausePctReq {
+    /// **5h 窗口**这一档：`null`（或不传）= 跟随全局；`0` = 本账号这一档不停；`1..=100` =
+    /// 本账号独立阈值。后端夹到 0~100。
+    #[serde(default)]
+    quota_pause_pct: Option<i64>,
+    /// **7d 窗口**那一档，同上。两档**都要传**：这是整份覆盖，不传即视为「跟随全局」——
+    /// 与全局那个接口「不传 = 保持现值」的约定不同，因为这里的三态里「跟随」本身就是 null。
+    #[serde(default)]
+    quota_pause_pct_7d: Option<i64>,
+}
+
+/// 设置该账号自己的「额度用到多少就提前停调度」阈值，覆盖全局的
+/// [`crate::store::QUOTA_PAUSE_PCT`] / [`crate::store::QUOTA_PAUSE_PCT_7D`]。判定见
+/// [`crate::proxy::park_if_quota_nearly_exhausted`]，下一条带限流头的响应起生效；已经按
+/// 旧阈值停下的号不会因为调高阈值而自动回池——到点自恢复、手动启用或连通性测试照旧。
+async fn set_credential_quota_pause_pct(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetCredentialQuotaPausePctReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
+    let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
+    if !state.store.set_quota_pause_pcts(id, short, long).map_err(internal)? {
+        return Err(not_found());
+    }
+    tracing::info!(
+        cred_id = id,
+        quota_pause_pct = ?short,
+        quota_pause_pct_7d = ?long,
+        "per-account quota-threshold pause changed"
+    );
     view_of(&state, id)
 }
 
@@ -1831,8 +1897,10 @@ struct ForwardingResp {
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
     keepalive_telemetry: bool,
-    /// 主线程请求补服务端 refusal fallback（拒答时上游换模型重跑）。
-    refusal_fallback: bool,
+    /// fable 族主线程请求补官方那份服务端 refusal fallback（拒答时上游换 opus-5 重跑）。
+    fable_refusal_fallback: bool,
+    /// opus-5 族主线程请求补 luban 自定的 refusal fallback 链（4.8 → 4.6）；实验开关，默认关。
+    opus_refusal_fallback: bool,
 }
 
 impl From<crate::store::ForwardFlags> for ForwardingResp {
@@ -1865,7 +1933,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_probes: f.reject_probes,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
-            refusal_fallback: f.refusal_fallback,
+            fable_refusal_fallback: f.fable_refusal_fallback,
+            opus_refusal_fallback: f.opus_refusal_fallback,
         }
     }
 }
@@ -2528,7 +2597,8 @@ struct SetForwardingReq {
     reject_probes: Option<bool>,
     api_telemetry: Option<bool>,
     keepalive_telemetry: Option<bool>,
-    refusal_fallback: Option<bool>,
+    fable_refusal_fallback: Option<bool>,
+    opus_refusal_fallback: Option<bool>,
 }
 
 /// 逐项开关转发形态改动。全关即「零改写直接转发」——实测上游唯一必需的是注入
@@ -2539,13 +2609,13 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        API_TELEMETRY, FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
-        INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REFUSAL_FALLBACK, REJECT_OPENAI_SHAPE, REJECT_PROBES,
-        REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
-        TOOL_NAME_MIMIC,
+        API_TELEMETRY, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS, FILL_METADATA,
+        FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
+        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
+        RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_SESSION_CONFLICT, SIMULATE_CC,
+        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
+        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2575,7 +2645,8 @@ async fn set_forwarding(
         (REJECT_PROBES, req.reject_probes),
         (API_TELEMETRY, req.api_telemetry),
         (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
-        (REFUSAL_FALLBACK, req.refusal_fallback),
+        (FABLE_REFUSAL_FALLBACK, req.fable_refusal_fallback),
+        (OPUS_REFUSAL_FALLBACK, req.opus_refusal_fallback),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
         state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
@@ -2606,11 +2677,20 @@ struct DefaultLimits {
     device: i64,
     /// 全局默认账号 RPM 上限，见 [`store::CredentialStore::default_rpm_limit`]。
     rpm: i64,
+    /// 全局的提前停调度阈值（5h 档），见 [`store::CredentialStore::quota_pause_pct`]。
+    quota_pct: i64,
+    /// 同上，7d 档，见 [`store::CredentialStore::quota_pause_pct_7d`]。
+    quota_pct_7d: i64,
 }
 
 impl DefaultLimits {
     fn of(store: &store::CredentialStore) -> Self {
-        Self { device: store.default_device_limit(), rpm: store.default_rpm_limit() }
+        Self {
+            device: store.default_device_limit(),
+            rpm: store.default_rpm_limit(),
+            quota_pct: store.quota_pause_pct(),
+            quota_pct_7d: store.quota_pause_pct_7d(),
+        }
     }
 }
 
@@ -2643,6 +2723,15 @@ struct CredentialView {
     /// 实际生效的 RPM 上限（已套用全局默认）；0 表示不限。前端拿它和 `rpm` 一起显示成
     /// 「12 / 30」，两个数同一个窗口（最近 60 秒），可以直接比。
     rpm_limit_effective: i64,
+    /// 账号自身的提前停调度阈值（5h 档，百分比）：`null` 跟随全局；`0` 本账号这一档不停；
+    /// `1..=100` 独立阈值。见 [`crate::credentials::Credential::quota_pause_pct`]。
+    quota_pause_pct: Option<i64>,
+    /// 同上，7d 档。
+    quota_pause_pct_7d: Option<i64>,
+    /// 5h 档实际生效的阈值（已套用全局）；`0` = 这一档不停。
+    quota_pause_pct_effective: i64,
+    /// 7d 档实际生效的阈值（已套用全局）；`0` = 这一档不停。
+    quota_pause_pct_7d_effective: i64,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用。
     ban_reason: Option<String>,
     /// 该账号专用的出站代理；`None` 表示直连。**原样返回、不脱敏**：代理串里可能带账号密码，
@@ -2713,6 +2802,16 @@ impl CredentialView {
             device_count,
             rpm_limit: c.rpm_limit,
             rpm_limit_effective: store::effective_rpm_limit(c.rpm_limit, defaults.rpm),
+            quota_pause_pct: c.quota_pause_pct,
+            quota_pause_pct_7d: c.quota_pause_pct_7d,
+            quota_pause_pct_effective: store::effective_quota_pause_pct(
+                c.quota_pause_pct,
+                defaults.quota_pct,
+            ),
+            quota_pause_pct_7d_effective: store::effective_quota_pause_pct(
+                c.quota_pause_pct_7d,
+                defaults.quota_pct_7d,
+            ),
             ban_reason: c.ban_reason.clone(),
             proxy: c.proxy.clone(),
             token_hint: mask_token(&c.refresh_token),

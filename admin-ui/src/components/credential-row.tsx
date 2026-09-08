@@ -11,6 +11,7 @@ import { localize, useI18n, type Language } from '@/lib/i18n'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
+import { CredentialQuotaDialog } from '@/components/credential-quota-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
@@ -206,6 +207,7 @@ export const CredentialRow = memo(function CredentialRow({
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
   const [rpmOpen, setRpmOpen] = useState(false)
+  const [quotaOpen, setQuotaOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
@@ -283,6 +285,7 @@ export const CredentialRow = memo(function CredentialRow({
                   }}
                   onDeviceLimit={() => setDevicesOpen(true)}
                   onRpmLimit={() => setRpmOpen(true)}
+                  onQuotaPause={() => setQuotaOpen(true)}
                   onProxy={() => setProxyOpen(true)}
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
@@ -525,6 +528,7 @@ export const CredentialRow = memo(function CredentialRow({
             }}
             onDeviceLimit={() => setDevicesOpen(true)}
             onRpmLimit={() => setRpmOpen(true)}
+            onQuotaPause={() => setQuotaOpen(true)}
             onProxy={() => setProxyOpen(true)}
             onUsage={() => setUsageOpen(true)}
             onTest={() => setTesting(true)}
@@ -534,7 +538,7 @@ export const CredentialRow = memo(function CredentialRow({
       </TableRow>
 
       {/* 与卡片同一套：没点开过就不挂，见 DeferredMount。 */}
-      <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || rpmOpen || testing}>
+      <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || rpmOpen || quotaOpen || testing}>
         <CredentialDevicesDialog
           cred={cred}
           open={devicesOpen}
@@ -568,6 +572,12 @@ export const CredentialRow = memo(function CredentialRow({
           onOpenChange={setRpmOpen}
           rpmLimit={actions.rpmLimit}
         />
+        <CredentialQuotaDialog
+          cred={cred}
+          open={quotaOpen}
+          onOpenChange={setQuotaOpen}
+          quotaPause={actions.quotaPause}
+        />
         <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
       </DeferredMount>
     </>
@@ -580,6 +590,7 @@ function CredentialRowActionsMenu({
   onRename,
   onDeviceLimit,
   onRpmLimit,
+  onQuotaPause,
   onProxy,
   onUsage,
   onTest,
@@ -590,6 +601,7 @@ function CredentialRowActionsMenu({
   onRename: () => void
   onDeviceLimit: () => void
   onRpmLimit: () => void
+  onQuotaPause: () => void
   onProxy: () => void
   onUsage: () => void
   onTest: () => void
@@ -612,6 +624,7 @@ function CredentialRowActionsMenu({
         onRename={onRename}
         onDeviceLimit={onDeviceLimit}
         onRpmLimit={onRpmLimit}
+        onQuotaPause={onQuotaPause}
         onProxy={onProxy}
         onUsage={onUsage}
         onTest={onTest}

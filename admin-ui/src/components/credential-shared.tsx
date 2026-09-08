@@ -3,12 +3,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  GaugeIcon, GlobeIcon, PencilIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon, TimerOffIcon,
-  Trash2Icon,
+  GaugeIcon, GlobeIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon,
+  TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
-  setDeviceLimit, setDisabled, setLabel, setPriority, setProxy, setRpmLimit,
+  setCredentialQuotaPausePct, setDeviceLimit, setDisabled, setLabel, setPriority, setProxy,
+  setRpmLimit,
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -737,6 +738,16 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     },
     onError: (e) => failure(t('设置 RPM 上限失败', 'Failed to set the RPM limit'), e),
   })
+  // 逐账号的提前停调度阈值，同样单独一个 mutation，失败提示才对得上。
+  const quotaPause = useMutation({
+    mutationFn: ({ pct, pct7d }: { pct: number | null; pct7d: number | null }) =>
+      setCredentialQuotaPausePct(cred.id, pct, pct7d),
+    onSuccess: () => {
+      toastManager.add({ title: t('已保存提前停调度阈值', 'Early pause threshold saved'), type: 'success' })
+      invalidate()
+    },
+    onError: (e) => failure(t('设置提前停调度阈值失败', 'Failed to set the early pause threshold'), e),
+  })
   const proxy = useMutation({
     mutationFn: (url: string | null) => setProxy(cred.id, url),
     onSuccess: () => {
@@ -762,7 +773,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
-  return { rename, toggle, prio, limit, rpmLimit, proxy, refresh, remove, cooldown }
+  return { rename, toggle, prio, limit, rpmLimit, quotaPause, proxy, refresh, remove, cooldown }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
@@ -774,13 +785,15 @@ export type CredentialActions = ReturnType<typeof useCredentialActions>
  * 卸载，确认框根本来不及显示。
  */
 export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onRpmLimit, onProxy, onUsage, onTest, onRequestDelete,
+  cred, actions, onRename, onDeviceLimit, onRpmLimit, onQuotaPause, onProxy, onUsage, onTest,
+  onRequestDelete,
 }: {
   cred: Credential
   actions: CredentialActions
   onRename: () => void
   onDeviceLimit: () => void
   onRpmLimit: () => void
+  onQuotaPause: () => void
   onProxy: () => void
   onUsage: () => void
   onTest: () => void
@@ -821,6 +834,10 @@ export function CredentialMenuContent({
       <MenuItem onClick={onRpmLimit}>
         <GaugeIcon />
         {t('RPM 上限', 'RPM limit')}
+      </MenuItem>
+      <MenuItem onClick={onQuotaPause}>
+        <PercentIcon />
+        {t('提前停调度阈值', 'Early pause threshold')}
       </MenuItem>
       <MenuItem onClick={onProxy}>
         <GlobeIcon />

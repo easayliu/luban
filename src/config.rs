@@ -131,9 +131,11 @@ pub const CC_BETA_CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
 pub const CC_BETA_SERVER_SIDE_FALLBACK: &str = "server-side-fallback-2026-07-01";
 
 /// 主线程 opus-5 的 refusal fallback 链：cyber 类拒答按官方推荐先落 4.8，4.8 也拒再落 4.6。
-/// 官方 2.1.260 的 opus 客户端**不发** `fallbacks`，这条是 luban 自定的（`refusal_fallback`
-/// 开关）；上游按模型公布允许的 fallback 目标（`/v1/models` 的 `allowed_fallback_models`），
-/// 不在名单里的会 400，那条 400 由 `crate::proxy::remember_fallback_rejection` 学下来、剥掉重发。
+/// 官方 2.1.260 的 opus 客户端**不发** `fallbacks`，这条是 luban 自定的，只在
+/// `opus_refusal_fallback` 实验开关（**默认关**）开着时补——补了就是官方从不产生的请求形态，
+/// 见 [`crate::store::OPUS_REFUSAL_FALLBACK`]。上游按模型公布允许的 fallback 目标
+/// （`/v1/models` 的 `allowed_fallback_models`），不在名单里的会 400，那条 400 由
+/// `crate::proxy::remember_fallback_rejection` 学下来、剥掉重发。
 pub const OPUS_REFUSAL_FALLBACKS: &str =
     r#"[{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]"#;
 
@@ -896,11 +898,12 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    API-key 端四族都**不发**这项 beta（`cap/2.1.258-api` 原始请求头），由
 ///    [`crate::proxy::merge_beta`] 补。
 ///
-///    `fallbacks` 由 `refusal_fallback` 开关（默认开）决定补不补，见
-///    [`crate::proxy::refusal_fallbacks_for`]：开着时 fable 主线程补官方那份
-///    `[{"model":"claude-opus-5"}]`（形态与官方逐字相同）、opus-5 主线程补 luban 自定的
-///    [`OPUS_REFUSAL_FALLBACKS`]（官方 2.1.260 的 opus 不发这个字段，**这是有意偏离**：拒答
-///    换模型重跑比裸拒答更要紧）；关掉则回到「模拟出的 fable-5-1 请求比官方少这一个字段」。
+///    `fallbacks` 分两档开关决定补不补，见 [`crate::proxy::refusal_fallbacks_for`]：
+///    `fable_refusal_fallback`（默认开）开着时 fable 主线程补官方那份 `[{"model":"claude-opus-5"}]`
+///    （形态与官方逐字相同），关掉则回到「模拟出的 fable-5-1 请求比官方少这一个字段」；
+///    `opus_refusal_fallback`（**默认关**，实验开关）开着时 opus-5 主线程补 luban 自定的
+///    [`OPUS_REFUSAL_FALLBACKS`]——官方 2.1.260 的 opus 不发这个字段，补上是官方从不产生的
+///    形态，故默认保持与官方一致（有 beta 没字段）。
 ///
 /// 比对基准只能用**原始字节**——`cap/raw/*.raw` 那种（HTTPS 隧道内的报文，头名大小写、头序、
 /// body 的 key 顺序都留得住）。`cap/*.json` 是抓包工具重新序列化过的：headers 与 body 的 key

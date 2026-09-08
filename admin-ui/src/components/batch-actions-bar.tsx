@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
-  deleteCredentials, setDeviceLimits, setDisabledMany, setPriorities, setProxies, setRpmLimits,
+  deleteCredentials, setCredentialQuotaPausePcts, setDeviceLimits, setDisabledMany, setPriorities,
+  setProxies, setRpmLimits,
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
@@ -38,6 +39,59 @@ const RPM_MODE_ITEMS = [
   { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
 ] as const
 
+/** 提前停调度阈值的三态：与后端取值一一对应（null / 0 / 1..100），5h 与 7d 两档各用一份。 */
+const QUOTA_MODE_ITEMS = [
+  { value: 'default', chinese: '跟随全局', english: 'Use global' },
+  { value: 'off', chinese: '不停', english: 'Off' },
+  { value: 'custom', chinese: '独立阈值', english: 'Custom' },
+] as const
+type QuotaMode = (typeof QUOTA_MODE_ITEMS)[number]['value']
+
+function quotaPctOf(mode: QuotaMode, custom: number): number | null {
+  if (mode === 'default') return null
+  if (mode === 'off') return 0
+  return Math.min(100, Math.max(1, Math.floor(custom)))
+}
+
+function describeQuotaPct(pct: number | null, t: (zh: string, en: string) => string): string {
+  if (pct === null) return t('跟随全局', 'global')
+  if (pct <= 0) return t('不停', 'off')
+  return `${pct}%`
+}
+
+/** 策略下拉的统一宽度：基础组件默认 `w-full`，放进行内会把整行撑开，这里钉成一个固定宽度。 */
+const MODE_SELECT_CLASS = 'w-40'
+
+/**
+ * 「更多设置」里的一行：左栏标题 + 一句说明，中栏控件，右栏那一项自己的「应用」。
+ *
+ * 每项各自应用、互不牵连，所以按钮跟在各自那行里而不是面板底部一个总的。窄屏退成上下
+ * 三段，宽屏三栏对齐，标题栏定宽让各行的控件竖向对齐。`stacked` 给多档控件（如 5h / 7d
+ * 两行）用，把中栏改成纵向排列。
+ */
+function SettingRow({
+  title, hint, action, stacked = false, children,
+}: {
+  title: ReactNode
+  hint: string
+  action: ReactNode
+  stacked?: boolean
+  children: ReactNode
+}) {
+  return (
+    <div className="grid gap-x-6 gap-y-2 px-4 py-3 sm:grid-cols-[minmax(10rem,14rem)_minmax(0,1fr)_auto] sm:items-center">
+      <div className="min-w-0">
+        <div className="text-xs font-medium">{title}</div>
+        <div className="text-xs text-muted-foreground">{hint}</div>
+      </div>
+      <div className={cn('flex min-w-0 gap-2', stacked ? 'flex-col items-start' : 'flex-wrap items-center')}>
+        {children}
+      </div>
+      <div className="flex sm:justify-end">{action}</div>
+    </div>
+  )
+}
+
 /**
  * 批量操作条：全选/清空 + 优先级 / 设备上限 / RPM 上限 / 启停 / 删除。
  *
@@ -59,6 +113,10 @@ export function BatchActionsBar({
   const [customLimit, setCustomLimit] = useState(1)
   const [rpmMode, setRpmMode] = useState<'default' | 'unlimited' | 'custom'>('default')
   const [customRpm, setCustomRpm] = useState(60)
+  const [quotaShortMode, setQuotaShortMode] = useState<QuotaMode>('default')
+  const [quotaShortCustom, setQuotaShortCustom] = useState(90)
+  const [quotaLongMode, setQuotaLongMode] = useState<QuotaMode>('default')
+  const [quotaLongCustom, setQuotaLongCustom] = useState(95)
   const [proxyMode, setProxyMode] = useState<'direct' | 'pool' | 'custom'>('direct')
   const [selectedProxyUrl, setSelectedProxyUrl] = useState('')
   const [customProxyUrl, setCustomProxyUrl] = useState('')
@@ -88,6 +146,10 @@ export function BatchActionsBar({
     label: t(item.chinese, item.english),
   }))
   const rpmModeItems = RPM_MODE_ITEMS.map((item) => ({
+    value: item.value,
+    label: t(item.chinese, item.english),
+  }))
+  const quotaModeItems = QUOTA_MODE_ITEMS.map((item) => ({
     value: item.value,
     label: t(item.chinese, item.english),
   }))
@@ -148,6 +210,16 @@ export function BatchActionsBar({
       ),
     onError,
   })
+  const applyQuotaPause = useMutation({
+    mutationFn: ({ pct, pct7d }: { pct: number | null; pct7d: number | null }) =>
+      setCredentialQuotaPausePcts(ids, pct, pct7d),
+    onSuccess: (_r, { pct, pct7d }) =>
+      notify(t(
+        `已把 ${formattedCount} 个账号的提前停调度阈值设为：5 小时 ${describeQuotaPct(pct, t)} · 7 天 ${describeQuotaPct(pct7d, t)}`,
+        `Set the early pause threshold for ${englishAccountCount}: 5h ${describeQuotaPct(pct, t)} · 7d ${describeQuotaPct(pct7d, t)}`,
+      )),
+    onError,
+  })
   const applyProxy = useMutation({
     mutationFn: (url: string | null) => setProxies(ids, url),
     onSuccess: (_r, url) =>
@@ -184,10 +256,13 @@ export function BatchActionsBar({
 
   const busy =
     applyPriority.isPending || applyLimit.isPending || applyRpmLimit.isPending ||
-    applyProxy.isPending || applyDisabled.isPending || applyDelete.isPending
+    applyQuotaPause.isPending || applyProxy.isPending || applyDisabled.isPending ||
+    applyDelete.isPending
   const allSelected = all.length > 0 && all.every((item) => selected.has(item.id))
   const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
   const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customRpm))
+  const quotaPct = quotaPctOf(quotaShortMode, quotaShortCustom)
+  const quotaPct7d = quotaPctOf(quotaLongMode, quotaLongCustom)
   const proxyUrl = proxyMode === 'direct' ? null : proxyMode === 'pool' ? selectedProxyUrl : customProxyUrl.trim()
   const proxyModeItems = [
     { value: 'direct', label: t('直连', 'Direct') },
@@ -240,18 +315,23 @@ export function BatchActionsBar({
         </div>
 
         {advancedOpen && (
-          <div id="batch-advanced-settings" className="grid gap-3 border-t p-3 lg:grid-cols-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="mr-auto min-w-28">
-                <div className="text-xs font-medium">{t('调度优先级', 'Scheduling priority')}</div>
-                <div className="text-xs text-muted-foreground">{t('数值越小越优先', 'Lower values have higher priority')}</div>
-              </div>
+          <div id="batch-advanced-settings" className="divide-y border-t">
+            <SettingRow
+              title={t('调度优先级', 'Scheduling priority')}
+              hint={t('数值越小越优先', 'Lower values have higher priority')}
+              action={
+                <Button size="sm" loading={applyPriority.isPending} disabled={busy} onClick={() => applyPriority.mutate(priority)}>
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+            >
               <NumberField
                 id="batch-priority"
                 value={priority}
                 min={0}
                 step={1}
                 size="sm"
+                className="w-32"
                 onValueChange={(value) => setPriority(Math.max(0, Math.floor(value ?? 0)))}
               >
                 <NumberFieldGroup>
@@ -260,18 +340,19 @@ export function BatchActionsBar({
                   <NumberFieldIncrement />
                 </NumberFieldGroup>
               </NumberField>
-              <Button size="sm" loading={applyPriority.isPending} disabled={busy} onClick={() => applyPriority.mutate(priority)}>
-                {t('应用', 'Apply')}
-              </Button>
-            </div>
+            </SettingRow>
 
-            <div className="flex flex-wrap items-center gap-2 lg:border-l lg:pl-3">
-              <div className="mr-auto min-w-28">
-                <div className="text-xs font-medium">{t('设备上限', 'Device limit')}</div>
-                <div className="text-xs text-muted-foreground">{t('默认、不限或独立上限', 'Default, unlimited, or custom')}</div>
-              </div>
+            <SettingRow
+              title={t('设备上限', 'Device limit')}
+              hint={t('默认、不限或独立上限', 'Default, unlimited, or custom')}
+              action={
+                <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+            >
               <Select items={limitModeItems} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
-                <SelectTrigger aria-label={t('批量设置设备上限策略', 'Set device limit policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectTrigger aria-label={t('批量设置设备上限策略', 'Set device limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup>
                   {limitModeItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
@@ -279,7 +360,7 @@ export function BatchActionsBar({
                 </SelectPopup>
               </Select>
               {limitMode === 'custom' && (
-                <NumberField value={customLimit} min={1} step={1} size="sm" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
+                <NumberField value={customLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
                   <NumberFieldGroup>
                     <NumberFieldDecrement />
                     <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
@@ -287,19 +368,19 @@ export function BatchActionsBar({
                   </NumberFieldGroup>
                 </NumberField>
               )}
-              <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
-                {t('应用', 'Apply')}
-              </Button>
-            </div>
+            </SettingRow>
 
-            {/* 独占一行：上面两格已经把宽屏那行占满了，挤进去只会把每格压到换行。 */}
-            <div className="flex flex-wrap items-center gap-2 lg:col-span-2 lg:border-t lg:pt-3">
-              <div className="mr-auto min-w-28">
-                <div className="text-xs font-medium">{t('RPM 上限', 'RPM limit')}</div>
-                <div className="text-xs text-muted-foreground">{t('每分钟最多转发多少条', 'Max requests forwarded per minute')}</div>
-              </div>
+            <SettingRow
+              title={t('RPM 上限', 'RPM limit')}
+              hint={t('每分钟最多转发多少条', 'Max requests forwarded per minute')}
+              action={
+                <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+            >
               <Select items={rpmModeItems} value={rpmMode} onValueChange={(value) => value && setRpmMode(value as typeof rpmMode)}>
-                <SelectTrigger aria-label={t('批量设置 RPM 上限策略', 'Set RPM limit policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectTrigger aria-label={t('批量设置 RPM 上限策略', 'Set RPM limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup>
                   {rpmModeItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
@@ -307,7 +388,7 @@ export function BatchActionsBar({
                 </SelectPopup>
               </Select>
               {rpmMode === 'custom' && (
-                <NumberField value={customRpm} min={1} step={1} size="sm" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
+                <NumberField value={customRpm} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
                   <NumberFieldGroup>
                     <NumberFieldDecrement />
                     <NumberFieldInput aria-label={t('批量设置独立 RPM 上限', 'Set a custom RPM limit for selected accounts')} />
@@ -315,21 +396,74 @@ export function BatchActionsBar({
                   </NumberFieldGroup>
                 </NumberField>
               )}
-              <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
-                {t('应用', 'Apply')}
-              </Button>
-            </div>
+            </SettingRow>
 
-            <div className="flex flex-wrap items-center gap-2 lg:col-span-2 lg:border-t lg:pt-3">
-              <div className="mr-auto min-w-28">
-                <div className="flex items-center gap-1.5 text-xs font-medium">
+            {/* 提前停调度阈值：5h / 7d 两档各自三态，一次整份覆盖所选账号（覆盖设置页的全局值）。 */}
+            <SettingRow
+              title={t('提前停调度阈值', 'Early pause threshold')}
+              hint={t('额度用到多少就挪出调度池，两档一起覆盖全局', 'Leave the pool at this utilization; both windows override the global value')}
+              action={
+                <Button size="sm" loading={applyQuotaPause.isPending} disabled={busy} onClick={() => applyQuotaPause.mutate({ pct: quotaPct, pct7d: quotaPct7d })}>
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+              stacked
+            >
+              {([
+                ['short', t('5 小时', '5h'), quotaShortMode, setQuotaShortMode, quotaShortCustom, setQuotaShortCustom,
+                  t('批量设置 5 小时窗口阈值策略', 'Set the 5h window threshold policy for selected accounts'),
+                  t('批量设置 5 小时窗口阈值（%）', 'Set a custom 5h window threshold (%) for selected accounts')],
+                ['long', t('7 天', '7d'), quotaLongMode, setQuotaLongMode, quotaLongCustom, setQuotaLongCustom,
+                  t('批量设置 7 天窗口阈值策略', 'Set the 7d window threshold policy for selected accounts'),
+                  t('批量设置 7 天窗口阈值（%）', 'Set a custom 7d window threshold (%) for selected accounts')],
+              ] as const).map(([key, label, mode, setMode, custom, setCustom, modeAria, customAria]) => (
+                <div key={key} className="flex flex-wrap items-center gap-2">
+                  <span className="w-12 shrink-0 text-xs text-muted-foreground">{label}</span>
+                  <Select items={quotaModeItems} value={mode} onValueChange={(value) => value && setMode(value as QuotaMode)}>
+                    <SelectTrigger aria-label={modeAria} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                    <SelectPopup>
+                      {quotaModeItems.map((item) => (
+                        <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                      ))}
+                    </SelectPopup>
+                  </Select>
+                  {mode === 'custom' && (
+                    <>
+                      <NumberField value={custom} min={1} max={100} step={1} size="sm" className="w-32" onValueChange={(value) => setCustom(Math.min(100, Math.max(1, Math.floor(value ?? 1))))}>
+                        <NumberFieldGroup>
+                          <NumberFieldDecrement />
+                          <NumberFieldInput aria-label={customAria} />
+                          <NumberFieldIncrement />
+                        </NumberFieldGroup>
+                      </NumberField>
+                      <span className="text-xs text-muted-foreground">%</span>
+                    </>
+                  )}
+                </div>
+              ))}
+            </SettingRow>
+
+            <SettingRow
+              title={(
+                <span className="inline-flex items-center gap-1.5">
                   <GlobeIcon className="size-3.5" />
                   {t('出站代理', 'Outbound proxy')}
-                </div>
-                <div className="text-xs text-muted-foreground">{t('统一设置出站代理或改回直连', 'Set outbound proxy or switch to direct')}</div>
-              </div>
+                </span>
+              )}
+              hint={t('统一设置出站代理或改回直连', 'Set outbound proxy or switch to direct')}
+              action={
+                <Button
+                  size="sm"
+                  loading={applyProxy.isPending}
+                  disabled={busy || (proxyMode === 'custom' && !customProxyUrl.trim()) || (proxyMode === 'pool' && !selectedProxyUrl)}
+                  onClick={() => applyProxy.mutate(proxyUrl || null)}
+                >
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+            >
               <Select items={proxyModeItems} value={proxyMode} onValueChange={(value) => value && setProxyMode(value as typeof proxyMode)}>
-                <SelectTrigger aria-label={t('批量设置出站代理策略', 'Set outbound proxy policy for selected accounts')} size="sm" className="min-w-28"><SelectValue /></SelectTrigger>
+                <SelectTrigger aria-label={t('批量设置出站代理策略', 'Set outbound proxy policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup>
                   {proxyModeItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
@@ -342,7 +476,7 @@ export function BatchActionsBar({
                   value={selectedProxyUrl}
                   onValueChange={(value) => value && setSelectedProxyUrl(value)}
                 >
-                  <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="min-w-32"><SelectValue /></SelectTrigger>
+                  <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="w-56"><SelectValue /></SelectTrigger>
                   <SelectPopup>
                     {savedProxies.map((p) => (
                       <SelectItem key={p.id} value={p.url}>{p.label}</SelectItem>
@@ -358,19 +492,11 @@ export function BatchActionsBar({
                   spellCheck={false}
                   autoComplete="off"
                   size="sm"
-                  className="min-w-40 max-w-64"
+                  className="w-72 max-w-full"
                   aria-label={t('自定义代理地址', 'Custom proxy URL')}
                 />
               )}
-              <Button
-                size="sm"
-                loading={applyProxy.isPending}
-                disabled={busy || (proxyMode === 'custom' && !customProxyUrl.trim()) || (proxyMode === 'pool' && !selectedProxyUrl)}
-                onClick={() => applyProxy.mutate(proxyUrl || null)}
-              >
-                {t('应用', 'Apply')}
-              </Button>
-            </div>
+            </SettingRow>
           </div>
         )}
 
