@@ -716,7 +716,39 @@ async fn handle_inner(
         return error_response(StatusCode::FORBIDDEN, "permission_error", kind.message());
     }
 
-    // 2.3a4) 上游对这一类请求（模型 + 无 tools 单条消息 + 这个 max_tokens）回过 200 却零输出
+    // 2.3a4) 上游拒答过的提示词（同一模型、system + messages 逐字相同）→ 本地 403，不再送。
+    //        拒答是内容分类器给这一条内容的判决（`stop_reason: "refusal"`），换个号、换个形态
+    //        重发结果一样，只会在账号上再添一笔；见 [`known_refused_prompt`]。
+    if billable
+        && state.store.forward_flags().reject_probes
+        && let Some(excerpt) =
+            known_refused_prompt(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
+    {
+        let model = req_model.as_deref().unwrap_or("-");
+        let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
+        if let Some(suppressed) =
+            take_rejection_log_slot(&state.rejection_log, &format!("refusal:{model}:{who}"))
+        {
+            let device_short: String = who.chars().take(8).collect();
+            tracing::warn!(
+                %method, path = %path_and_query, ua = %client_ua,
+                %model, device = %device_short, suppressed,
+                "rejected locally: upstream has already refused this exact prompt"
+            );
+        }
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            format!(
+                "not forwarded: upstream has already refused this exact prompt (model {model}, \
+                 stop_reason refusal); resending it would only add to the account's record. \
+                 Upstream reply was: {}",
+                excerpt.chars().take(300).collect::<String>()
+            ),
+        );
+    }
+
+    // 2.3a5) 上游对这一类请求（模型 + 无 tools 单条消息 + 这个 max_tokens）回过 200 却零输出
     //        → 本地 403，不再送。规则不是写死的，是上一条零输出的回复自己喂出来的，见
     //        [`known_empty_reply`]；回给客户端的文案带上上游当时的原话。与探针同一开关，
     //        不限 UA——模拟路径重建的是身份，改不了「问一句、上游一个字不回」这件事。
@@ -1715,6 +1747,14 @@ async fn handle_inner(
                 // 只给计费路径分类：count_tokens 之流没有「回复」可言。
                 empty_reply_key: if billable {
                     empty_reply_class(req_model.as_deref(), body_json.as_ref())
+                } else {
+                    None
+                },
+                prompt_key: if billable {
+                    req_model
+                        .as_deref()
+                        .zip(body_json.as_ref().and_then(prompt_digest))
+                        .map(|(m, d)| (m.to_string(), d))
                 } else {
                     None
                 },
@@ -3314,8 +3354,11 @@ struct ReqLog {
     /// 这条请求所属的「零输出请求类」（模型 + `max_tokens`），见 [`empty_reply_class`]；
     /// `None` 即不属于任何一类（带 tools、多轮、非计费路径……），收尾时不学。
     empty_reply_key: Option<(String, i64)>,
-    /// 零输出请求类的记忆表，收尾时上游回了 200 却零输出就把 `empty_reply_key` 记进去，
-    /// 见 [`ReqLog::note_empty_reply`]。
+    /// 这条请求的「模型 + 提示词哈希」（[`prompt_digest`]），上游拒答（`stop_reason:
+    /// "refusal"`）时按它学，见 [`known_refused_prompt`]；非计费路径为 `None`。
+    prompt_key: Option<(String, String)>,
+    /// 零输出请求类与被拒答提示词的记忆表，收尾时按上游回复的种类往里记，
+    /// 见 [`ReqLog::note_unanswered_reply`]。
     empty_replies: EmptyReplyMemory,
     store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
@@ -3389,16 +3432,17 @@ impl Drop for ReqLog {
             );
         }
         let has_usage = self.sniffer.has_usage();
-        // 200 + `output_tokens = 0`、且流是完整收尾的：上游收了输入的钱、一个字没回。状态码
-        // 与用量列都看不出它回了什么，这里把截下的响应体开头记进流水、打一行 warn，并把这一类
-        // 请求（模型 + 无 tools 单条消息 + 这个 max_tokens）学进记忆表，之后同类本地拒，见
-        // [`known_empty_reply`]。断流 / 没等到 `message_stop` 的不算：那是没收完，不是没回。
+        // 200 却没回答——`output_tokens = 0`（上游收了输入的钱、一个字没回）或
+        // `stop_reason: "refusal"`（内容分类器拒答，正文为空或半截）——且流是完整收尾的：
+        // 状态码与用量列都看不出它回了什么，这里把截下的响应体开头记进流水、打一行 warn，
+        // 并按种类学进记忆表，之后本地拒，见 [`ReqLog::note_unanswered_reply`]。断流 / 没等到
+        // `message_stop` 的不算：那是没收完，不是没回。
         if self.status == StatusCode::OK.as_u16()
-            && self.sniffer.output_tokens == Some(0)
+            && (self.sniffer.output_tokens == Some(0) || self.sniffer.refused())
             && stream_broke.is_none()
             && (!self.sniffer.is_stream || self.sniffer.saw_message_stop || self.sse_aggregated)
         {
-            self.note_empty_reply();
+            self.note_unanswered_reply();
         }
         // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
@@ -3609,41 +3653,60 @@ impl ReqLog {
         self.forensics.shape = shape;
     }
 
-    /// 上游回了 200 却零输出（判据见 [`Drop`] 里的调用处）：响应体开头记进流水的
-    /// `response_excerpt`、标签加 `empty_reply`、打一行 warn 把原话带上；这条属于某个
-    /// 零输出请求类（[`Self::empty_reply_key`]）就学进 [`EmptyReplyMemory`] 并写穿落库。
-    fn note_empty_reply(&mut self) {
+    /// 上游回了 200 却没回答（判据见 [`Drop`] 里的调用处）：响应体开头记进流水的
+    /// `response_excerpt`、打一行 warn 把原话带上，再按**种类**学、写穿落库：
+    ///
+    /// - `stop_reason: "refusal"`（标签 `refusal`）：是内容分类器拒了**这一条提示词**
+    ///   （`stop_details.category` 如 `cyber`），与请求形态无关——按 [`Self::prompt_key`]
+    ///   （模型 + 提示词哈希）学，之后只拦逐字相同的提示词重发。**不能**按请求类学：
+    ///   一条触发拒答的内容会把同形态的所有正常请求一起拦掉（v0.3.89 就犯过这个错，
+    ///   `opus-5 + max_tokens 65536` 那一类被一条 cyber 拒答连坐）；
+    /// - 其余零输出（标签 `empty_reply`）：上游对这类请求形态本身不回——按
+    ///   [`Self::empty_reply_key`]（模型 + 无 tools 单条消息 + `max_tokens`）学。
+    fn note_unanswered_reply(&mut self) {
         let excerpt = self.sniffer.excerpt().unwrap_or_default();
         let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
+        let refused = self.sniffer.refused();
         tracing::warn!(
             cred_id = self.cred_id, cred = %self.cred_label,
             model = %model.as_deref().unwrap_or("-"),
             input_tokens = self.sniffer.input_tokens.unwrap_or(0),
+            output_tokens = self.sniffer.output_tokens.unwrap_or(0),
             stop_reason = %self.sniffer.stop_reason.as_deref().unwrap_or("-"),
             request_id = %self.request_id,
             upstream_request_id = %self.upstream_request_id.as_deref().unwrap_or("-"),
             response = %excerpt.chars().take(500).collect::<String>(),
-            "upstream returned 200 with zero output tokens; the reply is kept on the usage log and this request class will be rejected locally from now on"
+            kind = if refused { "refusal" } else { "empty_reply" },
+            "upstream returned 200 without an answer (a refusal, or zero output tokens); the reply is kept on the usage log and the refused prompt / request class will be rejected locally from now on"
         );
         self.forensics.response_excerpt = (!excerpt.is_empty()).then(|| excerpt.clone());
         let tags = self.forensics.rewrites.get_or_insert_with(String::new);
         if !tags.is_empty() {
             tags.push(',');
         }
-        tags.push_str(REWRITE_EMPTY_REPLY);
-        if let Some((model, max_tokens)) = self.empty_reply_key.take()
-            && let Some(row) =
+        tags.push_str(if refused { REWRITE_REFUSAL } else { REWRITE_EMPTY_REPLY });
+        let learned = if refused {
+            self.prompt_key.take().and_then(|(model, digest)| {
+                remember_refused_prompt(&self.empty_replies, &model, &digest, &excerpt)
+            })
+        } else {
+            self.empty_reply_key.take().and_then(|(model, max_tokens)| {
                 remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt)
+            })
+        };
+        if let Some(row) = learned
             && let Err(e) = self.store.remember_rejections(&[row])
         {
             // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
-            tracing::warn!(error = %e, "persisting the empty-reply rule failed (kept in memory)");
+            tracing::warn!(error = %e, "persisting the learned reply rule failed (kept in memory)");
         }
     }
 }
 
-/// 流水 `rewrites` 列里标「上游 200 却零输出」的标签，见 [`ReqLog::note_empty_reply`]。
+/// 流水 `rewrites` 列里标「上游 200 却零输出」的标签，见 [`ReqLog::note_unanswered_reply`]。
 const REWRITE_EMPTY_REPLY: &str = "empty_reply";
+/// 流水 `rewrites` 列里标「上游拒答（`stop_reason: "refusal"`）」的标签。
+const REWRITE_REFUSAL: &str = "refusal";
 
 /// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
 fn ban_context(
@@ -4235,6 +4298,12 @@ impl UsageSniffer {
             Err(e) => String::from_utf8_lossy(&self.head[..e.valid_up_to()]).into_owned(),
         };
         Some(text)
+    }
+
+    /// 上游以 `stop_reason: "refusal"` 收尾——内容分类器拒了这条提示词（`stop_details` 里有
+    /// 类别与解释）。非流式看顶层，流式看 `message_delta.delta`，两处都进 [`Self::merge`]。
+    fn refused(&self) -> bool {
+        self.stop_reason.as_deref() == Some("refusal")
     }
 
     /// 是否解析到任一用量字段。
@@ -7059,12 +7128,13 @@ type ShapeRejections = std::collections::HashMap<(String, &'static str, String),
 /// （`DELETE /api/learned-rejections`）。
 pub type ShapeMemory = std::sync::Arc<parking_lot::RwLock<ShapeRejections>>;
 
-/// `learned_rejections.kind` 的三个取值，见 [`store::LearnedRejection`]。
+/// `learned_rejections.kind` 的四个取值，见 [`store::LearnedRejection`]。
 pub const LEARNED_KIND_SHAPE: &str = "shape";
 pub const LEARNED_KIND_DEPRECATED: &str = "deprecated";
 pub const LEARNED_KIND_EMPTY_REPLY: &str = "empty_reply";
+pub const LEARNED_KIND_REFUSAL: &str = "refusal";
 
-/// 从三张进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
+/// 从进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
 pub fn forget_learned_memory(
     shape: &ShapeMemory,
     deprecated: &DeprecatedFieldMemory,
@@ -7083,24 +7153,45 @@ pub fn forget_learned_memory(
         }
         LEARNED_KIND_EMPTY_REPLY => {
             let Some(max_tokens) = empty_reply_row_key(&r.field, &r.value) else { return false };
-            empty.write().remove(&(r.model.clone(), max_tokens)).is_some()
+            empty.write().classes.remove(&(r.model.clone(), max_tokens)).is_some()
+        }
+        LEARNED_KIND_REFUSAL => {
+            if r.field != REFUSAL_FIELD {
+                return false;
+            }
+            empty.write().prompts.remove(&(r.model.clone(), r.value.clone())).is_some()
         }
         _ => false,
     }
 }
 
-/// 启动时把落库的规则读回三张进程内记忆表，返回 `(形态条数, 废弃字段条数, 零输出条数)`。
+/// [`seed_learned_memories`] 的回填结果：各类回填条数，以及**该从库里删掉**的过期规则。
+#[derive(Debug, Default, PartialEq)]
+pub struct SeededMemories {
+    pub shape: usize,
+    pub deprecated: usize,
+    pub empty_reply: usize,
+    pub refusal: usize,
+    /// v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
+    /// 拒答的内容把同形态的所有正常请求一起拦掉。这类行按新逻辑不该存在：不回填，交给
+    /// 调用方从库里删掉，免得下次启动再撞一遍。判据是 `message`（当时截的上游回复）里带
+    /// `"stop_reason":"refusal"`。
+    pub stale: Vec<store::LearnedRejection>,
+}
+
+/// 启动时把落库的规则读回进程内记忆表，返回各类条数与该删的过期行（[`SeededMemories`]）。
 ///
 /// 形态那类的 `field` 必须能对回 [`SHAPE_PROBES`] 里的某个探针（键里是 `&'static str`）；
 /// 对不上的（旧版本学的、后来删掉的探针）直接跳过，不会因为一行脏数据拒绝启动。零输出那类
-/// 的 `value` 必须是个整数（`max_tokens`），同理。
+/// 的 `value` 必须是个整数（`max_tokens`）、且不是拒答学成的（见 [`SeededMemories::stale`]），
+/// 拒答那类的 `field` 必须是 [`REFUSAL_FIELD`]，同理。
 pub fn seed_learned_memories(
     shape: &ShapeMemory,
     deprecated: &DeprecatedFieldMemory,
     empty: &EmptyReplyMemory,
     rows: Vec<store::LearnedRejection>,
-) -> (usize, usize, usize) {
-    let (mut n_shape, mut n_dep, mut n_empty) = (0, 0, 0);
+) -> SeededMemories {
+    let mut out = SeededMemories::default();
     let mut shape_table = shape.write();
     let mut dep_table = deprecated.write();
     let mut empty_table = empty.write();
@@ -7114,7 +7205,7 @@ pub fn seed_learned_memories(
                     continue;
                 }
                 shape_table.entry((r.model, probe.field, r.value)).or_insert(r.message);
-                n_shape += 1;
+                out.shape += 1;
             }
             LEARNED_KIND_DEPRECATED => {
                 if !DEPRECATABLE_FIELDS.contains(&r.field.as_str())
@@ -7123,20 +7214,31 @@ pub fn seed_learned_memories(
                     continue;
                 }
                 dep_table.entry((r.model, r.field)).or_insert(r.message);
-                n_dep += 1;
+                out.deprecated += 1;
             }
             LEARNED_KIND_EMPTY_REPLY => {
-                let Some(max_tokens) = empty_reply_row_key(&r.field, &r.value) else { continue };
-                if empty_table.len() >= SHAPE_MEMORY_CAP {
+                if r.message.contains(r#""stop_reason":"refusal""#) {
+                    out.stale.push(r);
                     continue;
                 }
-                empty_table.entry((r.model, max_tokens)).or_insert(r.message);
-                n_empty += 1;
+                let Some(max_tokens) = empty_reply_row_key(&r.field, &r.value) else { continue };
+                if empty_table.classes.len() >= SHAPE_MEMORY_CAP {
+                    continue;
+                }
+                empty_table.classes.entry((r.model, max_tokens)).or_insert(r.message);
+                out.empty_reply += 1;
+            }
+            LEARNED_KIND_REFUSAL => {
+                if r.field != REFUSAL_FIELD || empty_table.prompts.len() >= SHAPE_MEMORY_CAP {
+                    continue;
+                }
+                empty_table.prompts.entry((r.model, r.value)).or_insert(r.message);
+                out.refusal += 1;
             }
             _ => {}
         }
     }
-    (n_shape, n_dep, n_empty)
+    out
 }
 
 // ── 上游回过零输出的请求类 ────────────────────────────────────────────
@@ -7153,16 +7255,86 @@ pub fn seed_learned_memories(
 // 第一条照常放行，回来零输出就把这一类记下来（并把上游原话截下来供人看），之后同类本地拒。
 // 「类」取得很窄——模型 + 无 tools + 恰好一条用户消息 + 同一个 `max_tokens`——带 tools 的、
 // 多轮的、换个 `max_tokens` 的一律不受影响；宁可多放一条，不误伤真业务。
+//
+// **拒答是另一回事**：`stop_reason: "refusal"` + `stop_details.category`（如 `cyber`）是内容
+// 分类器拒了**那一条提示词**，换个形态照样拒、换条内容就不拒——和请求类毫无关系。它按
+// 「模型 + 提示词哈希」记（[`prompt_digest`]），只拦逐字相同的重发；重发一条已被拒的内容
+// 才是账号上的污点，正常业务的其他请求一条不拦。同一张表的两个格子，同一套落库/回填/删除。
 
 /// 零输出记忆表里 `field` 列的固定值：类键的另一半就是这个字段的取值。
 const EMPTY_REPLY_FIELD: &str = "max_tokens";
+/// 拒答记忆表里 `field` 列的固定值：`value` 是提示词哈希（[`prompt_digest`]）。
+const REFUSAL_FIELD: &str = "prompt_sha";
 
-/// 上游回过零输出的「模型 + `max_tokens`」→ 当时截下的上游回复开头（本地拒时回给客户端）。
-type EmptyReplyRejections = std::collections::HashMap<(String, i64), String>;
+/// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」，
+/// 值都是当时截下的上游回复开头（本地拒时回给客户端）。
+#[derive(Default)]
+pub struct EmptyReplyRejections {
+    classes: std::collections::HashMap<(String, i64), String>,
+    prompts: std::collections::HashMap<(String, String), String>,
+}
 
 /// [`EmptyReplyRejections`] 的共享句柄。与 [`ShapeMemory`] 同一套持久化：写穿到
-/// `learned_rejections`（`kind = "empty_reply"`）、启动回填、7 天保鲜。
+/// `learned_rejections`（`kind = "empty_reply"` / `"refusal"`）、启动回填、7 天保鲜。
 pub type EmptyReplyMemory = std::sync::Arc<parking_lot::RwLock<EmptyReplyRejections>>;
+
+/// 提示词哈希：`system` 与 `messages` 两个字段紧凑序列化后的 sha256 前 16 位 hex。
+/// 只看来访体（学与判看同一侧）；没有 `messages` 的不算。
+fn prompt_digest(body: &serde_json::Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let messages = body.get("messages")?;
+    let mut h = Sha256::new();
+    if let Some(system) = body.get("system") {
+        h.update(system.to_string().as_bytes());
+    }
+    h.update(b"\0");
+    h.update(messages.to_string().as_bytes());
+    Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+/// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` 逐字相同）；
+/// 是则给出当时截下的上游回复。
+fn known_refused_prompt(
+    mem: &EmptyReplyMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<String> {
+    let model = model?;
+    let table = mem.read();
+    if table.prompts.is_empty() {
+        return None;
+    }
+    let digest = prompt_digest(body?)?;
+    table.prompts.get(&(model.to_string(), digest)).cloned()
+}
+
+/// 上游拒答了这条提示词 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
+/// 不重复、表满了不记），调用方拿去落库。
+fn remember_refused_prompt(
+    mem: &EmptyReplyMemory,
+    model: &str,
+    digest: &str,
+    excerpt: &str,
+) -> Option<store::LearnedRejection> {
+    let mut table = mem.write();
+    let key = (model.to_string(), digest.to_string());
+    if table.prompts.contains_key(&key) || table.prompts.len() >= SHAPE_MEMORY_CAP {
+        return None;
+    }
+    table.prompts.insert(key, excerpt.to_string());
+    tracing::info!(
+        model = %model,
+        prompt_sha = %digest,
+        "learned a refused prompt; the same prompt will be rejected locally from now on"
+    );
+    Some(store::LearnedRejection {
+        kind: LEARNED_KIND_REFUSAL.into(),
+        model: model.to_string(),
+        field: REFUSAL_FIELD.into(),
+        value: digest.to_string(),
+        message: excerpt.to_string(),
+    })
+}
 
 /// 落库行的 `(field, value)` 能否对回一个类键：`field` 必须是 `max_tokens`、`value` 是整数。
 fn empty_reply_row_key(field: &str, value: &str) -> Option<i64> {
@@ -7199,10 +7371,10 @@ fn known_empty_reply(
 ) -> Option<(i64, String)> {
     let key = empty_reply_class(model, body)?;
     let table = mem.read();
-    if table.is_empty() {
+    if table.classes.is_empty() {
         return None;
     }
-    table.get(&key).map(|excerpt| (key.1, excerpt.clone()))
+    table.classes.get(&key).map(|excerpt| (key.1, excerpt.clone()))
 }
 
 /// 上游对这一类回了零输出 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
@@ -7215,10 +7387,10 @@ fn remember_empty_reply(
 ) -> Option<store::LearnedRejection> {
     let mut table = mem.write();
     let key = (model.to_string(), max_tokens);
-    if table.contains_key(&key) || table.len() >= SHAPE_MEMORY_CAP {
+    if table.classes.contains_key(&key) || table.classes.len() >= SHAPE_MEMORY_CAP {
         return None;
     }
-    table.insert(key, excerpt.to_string());
+    table.classes.insert(key, excerpt.to_string());
     tracing::info!(
         model = %model,
         max_tokens,
@@ -14728,10 +14900,89 @@ mod tests {
             value: "sixteen".into(),
             message: String::new(),
         });
+        // 拒答那类：一条正常的；再加一条 v0.3.89 学错的（拒答被记成了请求类）——不回填、报成过期。
+        let refused = super::remember_refused_prompt(
+            &empty,
+            "claude-opus-5",
+            "deadbeef",
+            r#"{"stop_reason":"refusal"}"#,
+        )
+        .expect("首次学到");
+        assert_eq!(
+            (refused.kind.as_str(), refused.field.as_str(), refused.value.as_str()),
+            ("refusal", "prompt_sha", "deadbeef")
+        );
+        rows.push(refused);
+        let stale = store::LearnedRejection {
+            kind: "empty_reply".into(),
+            model: "claude-opus-5".into(),
+            field: "max_tokens".into(),
+            value: "65536".into(),
+            message:
+                r#"{"content":[],"stop_reason":"refusal","stop_details":{"category":"cyber"}}"#
+                    .into(),
+        };
+        rows.push(stale.clone());
         let shape2 = super::ShapeMemory::default();
         let dep2 = super::DeprecatedFieldMemory::default();
         let empty2 = super::EmptyReplyMemory::default();
-        assert_eq!(super::seed_learned_memories(&shape2, &dep2, &empty2, rows), (1, 1, 1));
+        assert_eq!(
+            super::seed_learned_memories(&shape2, &dep2, &empty2, rows),
+            super::SeededMemories {
+                shape: 1,
+                deprecated: 1,
+                empty_reply: 1,
+                refusal: 1,
+                stale: vec![stale]
+            }
+        );
+        let opus_ping = serde_json::json!({
+            "model": "claude-opus-5", "max_tokens": 65536,
+            "messages": [{"role": "user", "content": "anything"}]
+        });
+        assert!(
+            super::known_empty_reply(&empty2, Some("claude-opus-5"), Some(&opus_ping)).is_none(),
+            "学错的那条不回填：同形态的正常请求不受连坐"
+        );
+        let refused_body = serde_json::json!({
+            "model": "claude-opus-5", "messages": [{"role": "user", "content": "x"}]
+        });
+        let digest = super::prompt_digest(&refused_body).unwrap();
+        super::remember_refused_prompt(&empty2, "claude-opus-5", &digest, "{}").unwrap();
+        assert_eq!(
+            super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&refused_body))
+                .as_deref(),
+            Some("{}")
+        );
+        // 提示词改一个字、或换个模型：不命中。
+        let other_body = serde_json::json!({
+            "model": "claude-opus-5", "messages": [{"role": "user", "content": "y"}]
+        });
+        assert!(
+            super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&other_body))
+                .is_none()
+        );
+        assert!(
+            super::known_refused_prompt(&empty2, Some("claude-sonnet-5"), Some(&refused_body))
+                .is_none()
+        );
+        // system 也进哈希：同一条 messages 换 system 是另一条提示词。
+        let with_sys = serde_json::json!({
+            "system": "s", "model": "claude-opus-5", "messages": [{"role": "user", "content": "x"}]
+        });
+        assert_ne!(super::prompt_digest(&with_sys), Some(digest.clone()));
+        let refusal_row = store::LearnedRejection {
+            kind: "refusal".into(),
+            model: "claude-opus-5".into(),
+            field: "prompt_sha".into(),
+            value: digest,
+            message: String::new(),
+        };
+        assert!(super::forget_learned_memory(&shape2, &dep2, &empty2, &refusal_row));
+        assert!(
+            super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&refused_body))
+                .is_none()
+        );
         let (max_tokens, excerpt) =
             super::known_empty_reply(&empty2, Some("claude-fable-5"), Some(&ping))
                 .expect("零输出规则应已回填");
@@ -19474,7 +19725,10 @@ mod tests {
         let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
         let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
         let mem = super::EmptyReplyMemory::default();
-        let log = |is_stream: bool, body: &[u8], key: Option<(&str, i64)>| {
+        let log = |is_stream: bool,
+                   body: &[u8],
+                   key: Option<(&str, i64)>,
+                   prompt: Option<(&str, &str)>| {
             let mut sniffer = super::UsageSniffer::new(is_stream, false);
             sniffer.feed(body);
             drop(super::ReqLog {
@@ -19501,6 +19755,7 @@ mod tests {
                 telemetry: None,
                 cc_session: None,
                 empty_reply_key: key.map(|(m, n)| (m.to_string(), n)),
+                prompt_key: prompt.map(|(m, d)| (m.to_string(), d.to_string())),
                 empty_replies: mem.clone(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
@@ -19509,12 +19764,13 @@ mod tests {
             })
         };
         let empty = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":425,"output_tokens":0}}"#;
-        // 1) 非流式零输出：学到 + 落库 + 流水带原文。
-        log(false, empty, Some(("claude-fable-5", 16)));
+        // 1) 非流式零输出：学到 + 落库 + 流水带原文；不是拒答，不按提示词学。
+        log(false, empty, Some(("claude-fable-5", 16)), Some(("claude-fable-5", "aa")));
         assert_eq!(
-            mem.read().get(&("claude-fable-5".to_string(), 16)).map(String::as_str),
+            mem.read().classes.get(&("claude-fable-5".to_string(), 16)).map(String::as_str),
             Some(std::str::from_utf8(empty).unwrap())
         );
+        assert!(mem.read().prompts.is_empty(), "零输出不是拒答，不按提示词学");
         let rows = store.learned_rejections().unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(
@@ -19532,40 +19788,80 @@ mod tests {
             false,
             br#"{"id":"msg_2","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":427,"output_tokens":1}}"#,
             Some(("claude-fable-5-1", 1)),
+            Some(("claude-fable-5-1", "bb")),
         );
-        assert!(!mem.read().contains_key(&("claude-fable-5-1".to_string(), 1)));
-        // 3) 流式：`message_delta` 报 0 但没等到 `message_stop`——半截流，不算零输出。
+        assert!(!mem.read().classes.contains_key(&("claude-fable-5-1".to_string(), 1)));
+        assert!(mem.read().prompts.is_empty());
+        // 3) 流式：`message_start` 报 0 但没等到 `message_stop`——半截流，不算零输出。
         log(
             true,
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":425,\"output_tokens\":0}}}\n\n",
             Some(("claude-fable-5", 4)),
+            None,
         );
-        assert!(!mem.read().contains_key(&("claude-fable-5".to_string(), 4)), "半截流不学");
+        assert!(!mem.read().classes.contains_key(&("claude-fable-5".to_string(), 4)), "半截流不学");
         // 4) 流式且完整收尾、最终 output_tokens = 0：学。
         log(
             true,
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":425,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             Some(("claude-fable-5", 4)),
+            None,
         );
-        assert!(mem.read().contains_key(&("claude-fable-5".to_string(), 4)));
+        assert!(mem.read().classes.contains_key(&("claude-fable-5".to_string(), 4)));
         // 5) 不属于任何一类（带 tools 的请求）却回了零输出：流水照记原文，记忆表不动。
-        log(false, empty, None);
-        assert_eq!(mem.read().len(), 2);
+        log(false, empty, None, None);
+        assert_eq!(mem.read().classes.len(), 2);
+        // 6) 拒答（`stop_reason: "refusal"`，实测 opus-5 + max_tokens 65536 的 cyber 拒答）：
+        //    按提示词哈希学，**不**按请求类学——否则一条内容连坐同形态的所有正常请求。
+        let refusal = br#"{"model":"claude-opus-5","id":"msg_2","type":"message","role":"assistant","content":[],"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"blocked"},"usage":{"input_tokens":1200,"output_tokens":0}}"#;
+        log(false, refusal, Some(("claude-opus-5", 65536)), Some(("claude-opus-5", "deadbeef")));
+        assert!(
+            !mem.read().classes.contains_key(&("claude-opus-5".to_string(), 65536)),
+            "拒答不能学成请求类"
+        );
+        assert!(
+            mem.read()
+                .prompts
+                .get(&("claude-opus-5".to_string(), "deadbeef".to_string()))
+                .unwrap()
+                .contains(r#""category":"cyber""#)
+        );
+        let rows = store.learned_rejections().unwrap();
+        let refused_row = rows.iter().find(|r| r.kind == "refusal").expect("拒答规则落库");
+        assert_eq!(
+            (refused_row.field.as_str(), refused_row.value.as_str()),
+            ("prompt_sha", "deadbeef")
+        );
+        assert!(rows.iter().all(|r| !(r.kind == "empty_reply" && r.model == "claude-opus-5")));
+        // 7) 拒答带半截正文（流式、output_tokens > 0）同样算：判据是 stop_reason，不是 0。
+        log(
+            true,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":37}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            Some(("claude-opus-5", 65536)),
+            Some(("claude-opus-5", "cafe")),
+        );
+        assert!(
+            mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "cafe".to_string()))
+        );
+        assert!(!mem.read().classes.contains_key(&("claude-opus-5".to_string(), 65536)));
 
-        // 流水（倒序）：1、4、5 三条带原文与标签，2、3 不带。
+        // 流水（倒序）：7、6、5、4、1 带原文，2、3 不带；标签按种类分。
         let logs = store.list_usage_logs(10).unwrap();
-        assert_eq!(logs.len(), 5);
+        assert_eq!(logs.len(), 7);
         let excerpted: Vec<bool> =
             logs.iter().map(|l| l.forensics.response_excerpt.is_some()).collect();
-        assert_eq!(excerpted, vec![true, true, false, false, true]);
-        assert_eq!(logs[4].forensics.rewrites.as_deref(), Some("empty_reply"));
+        assert_eq!(excerpted, vec![true, true, true, true, false, false, true]);
+        assert_eq!(logs[0].forensics.rewrites.as_deref(), Some("refusal"));
+        assert_eq!(logs[1].forensics.rewrites.as_deref(), Some("refusal"));
+        assert_eq!(logs[2].forensics.rewrites.as_deref(), Some("empty_reply"));
+        assert_eq!(logs[6].forensics.rewrites.as_deref(), Some("empty_reply"));
         assert_eq!(
-            logs[4].forensics.response_excerpt.as_deref(),
+            logs[6].forensics.response_excerpt.as_deref(),
             Some(std::str::from_utf8(empty).unwrap())
         );
-        assert_eq!(logs[3].forensics.rewrites, None);
+        assert_eq!(logs[5].forensics.rewrites, None);
         assert!(
-            logs[1]
+            logs[3]
                 .forensics
                 .response_excerpt
                 .as_deref()
@@ -19605,6 +19901,7 @@ mod tests {
                 telemetry: None,
                 cc_session: None,
                 empty_reply_key: None,
+                prompt_key: None,
                 empty_replies: Default::default(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
@@ -19665,6 +19962,7 @@ mod tests {
             telemetry: None,
             cc_session: None,
             empty_reply_key: None,
+            prompt_key: None,
             empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
@@ -19879,6 +20177,7 @@ mod tests {
             }),
             cc_session: None,
             empty_reply_key: None,
+            prompt_key: None,
             empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
@@ -20740,6 +21039,7 @@ mod tests {
             telemetry: None,
             cc_session: None,
             empty_reply_key: None,
+            prompt_key: None,
             empty_replies: Default::default(),
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),

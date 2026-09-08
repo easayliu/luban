@@ -4425,7 +4425,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "rewrites TEXT",
         // 0.3.76：出站 device_id，见 Forensics::device_id_out。
         "device_id_out TEXT",
-        // 0.3.89：上游 200 却零输出时截取的响应体，见 Forensics::response_excerpt。
+        // 0.3.89：上游 200 却零输出 / 拒答时截取的响应体，见 Forensics::response_excerpt。
         "response_excerpt TEXT",
     ] {
         // 冻结表与流水表同列（USAGE_LOG_COLS 逐列照搬），补列必须两张一起补。

@@ -59,9 +59,10 @@ pub struct AppState {
     /// 上游以 `deprecated` 拒过的「模型 + 字段」记忆表：学过之后转发前自动剥掉该字段，
     /// 客户端无需改动即可正常使用。持久化同上，见 [`crate::proxy::DeprecatedFieldMemory`]。
     pub deprecated_fields: crate::proxy::DeprecatedFieldMemory,
-    /// 上游回过 **200 却零输出**的「模型 + 无 tools 单条消息 + `max_tokens`」记忆表：学过之后
-    /// 同类请求本地 403，不再白发一次、也不再在上游留一条「问一句什么都没得到」的记录。
-    /// 持久化同上（`kind = "empty_reply"`），见 [`crate::proxy::EmptyReplyMemory`]。
+    /// 上游回过 **200 却零输出**的「模型 + 无 tools 单条消息 + `max_tokens`」，与上游**拒答**
+    /// 过的「模型 + 提示词哈希」两格记忆表：学过之后同类 / 同一条提示词本地 403，不再白发一次、
+    /// 也不再在上游留一条「问一句什么都没得到」或「又发了一遍被拒的内容」的记录。
+    /// 持久化同上（`kind = "empty_reply"` / `"refusal"`），见 [`crate::proxy::EmptyReplyMemory`]。
     pub empty_replies: crate::proxy::EmptyReplyMemory,
     /// 拒绝日志的抑制表：撞上限的客户端往往每几十毫秒重试一次，一条不落地记会把日志刷没。
     /// 见 [`crate::proxy::RejectionLog`]。
@@ -120,16 +121,28 @@ pub async fn run(
     // 重启后再白撞一次。读失败只告警：这是优化，不是启动的前提。
     match state.store.learned_rejections() {
         Ok(rows) => {
-            let (shape, deprecated, empty_reply) = proxy::seed_learned_memories(
+            let seeded = proxy::seed_learned_memories(
                 &state.shape_rejections,
                 &state.deprecated_fields,
                 &state.empty_replies,
                 rows,
             );
-            if shape + deprecated + empty_reply > 0 {
+            // 学错的旧规则（拒答被 v0.3.89 记成了请求类）：不回填，顺手从库里删掉。
+            for r in &seeded.stale {
+                match state.store.forget_learned_rejection(r) {
+                    Ok(_) => tracing::warn!(
+                        model = %r.model, field = %r.field, value = %r.value,
+                        "dropped a stale learned rule: a refusal had been recorded as a request class (v0.3.89); refusals are now keyed by prompt"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "failed to drop a stale learned rule"),
+                }
+            }
+            let proxy::SeededMemories { shape, deprecated, empty_reply, refusal, .. } = seeded;
+            if shape + deprecated + empty_reply + refusal > 0 {
                 tracing::info!(
                     shape,
                     empty_reply,
+                    refusal,
                     deprecated,
                     "restored learned upstream rejections from the database"
                 );
@@ -1259,8 +1272,8 @@ async fn clear_cooldown(
 /// `GET /api/learned-rejections` 的一条：从上游响应学到的规则，见 [`store::LearnedRejection`]。
 #[derive(Serialize)]
 struct LearnedRejectionView {
-    /// `shape`（命中本地拒）、`deprecated`（命中转发前剥掉字段）或 `empty_reply`（上游对这类
-    /// 回过零输出，命中本地拒）。
+    /// `shape`（命中本地拒）、`deprecated`（命中转发前剥掉字段）、`empty_reply`（上游对这类
+    /// 回过零输出，命中本地拒）或 `refusal`（上游拒答过这条提示词，同一条命中本地拒）。
     kind: String,
     model: String,
     field: String,
@@ -1346,7 +1359,7 @@ async fn clear_learned_rejections(
     let deleted = state.store.clear_learned_rejections().map_err(internal)?;
     state.shape_rejections.write().clear();
     state.deprecated_fields.write().clear();
-    state.empty_replies.write().clear();
+    *state.empty_replies.write() = Default::default();
     tracing::info!(deleted, "learned upstream rejections cleared from the console");
     Ok(Json(ClearedLearnedResp { deleted }))
 }

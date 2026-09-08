@@ -168,7 +168,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
       {log.response_excerpt && (
         <div className="mt-2 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-2">
           <p className="text-2xs font-medium">
-            {t('上游回复（200 却零输出，截取开头）', 'Upstream reply (200 with zero output, excerpt)')}
+            {t('上游回复（截取开头）', 'Upstream reply (excerpt)')}
           </p>
           <pre className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap break-all font-mono text-2xs text-muted-foreground">
             {log.response_excerpt}
@@ -204,6 +204,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('上游连接失败', 'Upstream connection failed')
     case 'empty_reply':
       return t('上游 200 却零输出', 'Upstream 200 with zero output')
+    case 'refusal':
+      return t('上游拒答（refusal）', 'Upstream refusal')
     case 'demoted_thinking':
       return t('thinking 降级重试', 'Retried with thinking demoted')
     case 'no_prefill':

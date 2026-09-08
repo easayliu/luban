@@ -378,14 +378,16 @@ export async function importAll(
  * `shape`：某模型不收某字段的某取值（如 effort 'xhigh'），命中本地直接拒；
  * `deprecated`：某模型已废弃某字段（如 temperature），命中转发前剥掉；
  * `empty_reply`：某模型对「无 tools 的单条消息 + 这个 max_tokens」回过 200 却零输出，
- * 同类命中本地直接拒（`field` 恒为 max_tokens，`value` 是那个数，`message` 是上游当时的回复开头）。
+ * 同类命中本地直接拒（`field` 恒为 max_tokens，`value` 是那个数，`message` 是上游当时的回复开头）；
+ * `refusal`：某模型拒答过这条提示词（stop_reason refusal），逐字相同的重发本地直接拒
+ * （`field` 恒为 prompt_sha，`value` 是 system + messages 的哈希，`message` 是上游当时的回复开头）。
  * 规则落库、重启保留，7 天后自动丢弃重学；这里的删除是提前放行的逃生口。
  */
 export interface LearnedRejection {
-  kind: 'shape' | 'deprecated' | 'empty_reply' | (string & {})
+  kind: 'shape' | 'deprecated' | 'empty_reply' | 'refusal' | (string & {})
   model: string
   field: string
-  /** 形态规则被拒的取值 / 零输出规则的 max_tokens；废弃字段规则为空串。 */
+  /** 形态规则被拒的取值 / 零输出规则的 max_tokens / 拒答规则的提示词哈希；废弃字段规则为空串。 */
   value: string
   /** 上游原话（零输出规则是当时截下的回复开头）。 */
   message: string
