@@ -127,16 +127,8 @@ pub async fn run(
                 &state.empty_replies,
                 rows,
             );
-            // 学错的旧规则（拒答被 v0.3.89 记成了请求类）：不回填，顺手从库里删掉。
-            for r in &seeded.stale {
-                match state.store.forget_learned_rejection(r) {
-                    Ok(_) => tracing::warn!(
-                        model = %r.model, field = %r.field, value = %r.value,
-                        "dropped a stale learned rule: a refusal had been recorded as a request class (v0.3.89); refusals are now keyed by prompt"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "failed to drop a stale learned rule"),
-                }
-            }
+            // 按新逻辑不该存在的旧行：不回填，顺手从库里删掉。
+            drop_stale_learned_rules(&state.store, &seeded.stale);
             let proxy::SeededMemories { shape, deprecated, empty_reply, refusal, .. } = seeded;
             if shape + deprecated + empty_reply + refusal > 0 {
                 tracing::info!(
@@ -167,6 +159,55 @@ pub async fn run(
                     Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "pruned expired usage logs"),
                     Ok(Err(e)) => tracing::warn!(error = %e, "failed to prune usage logs"),
                     _ => {}
+                }
+            }
+        });
+    }
+
+    // 学到的规则每小时按库重建一遍进程内记忆表：7 天保鲜期此前只在**读库**时生效
+    // （`learned_rejections_with_time` 顺手删过期行），而请求路径判的是进程内 HashMap，进程
+    // 不重启规则就永不过期——一条 7 天前学的拒答提示词能一直本地 403 下去。重建 = 读库
+    // （过期行随手删掉）→ 清表 → 回填，同一把写锁内完成；读库到清表之间刚学到、还没落库的
+    // 那一两条会从内存里掉一次，下个整点从库里回来，代价是那种组合多撞一次上游，可以接受。
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 首个 tick 立即到，启动时已经回填过一遍，跳过。
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let store = state.store.clone();
+                let rows =
+                    match tokio::task::spawn_blocking(move || store.learned_rejections()).await {
+                        Ok(Ok(rows)) => rows,
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "failed to reload learned rules for expiry");
+                            continue;
+                        }
+                        Err(_) => continue,
+                    };
+                let before = proxy::learned_memory_len(
+                    &state.shape_rejections,
+                    &state.deprecated_fields,
+                    &state.empty_replies,
+                );
+                let seeded = proxy::resync_learned_memories(
+                    &state.shape_rejections,
+                    &state.deprecated_fields,
+                    &state.empty_replies,
+                    rows,
+                );
+                // 启动时删过一遍，这里一般是空的；库被旧版本进程并行写过才会再有。
+                drop_stale_learned_rules(&state.store, &seeded.stale);
+                let after = seeded.shape + seeded.deprecated + seeded.empty_reply + seeded.refusal;
+                if after != before {
+                    tracing::info!(
+                        before,
+                        after,
+                        "learned upstream rules resynced from the store; expired ones dropped from memory"
+                    );
                 }
             }
         });
@@ -1373,6 +1414,20 @@ async fn list_learned_rejections(
     ))
 }
 
+/// 把回填时挑出来的过期旧行（[`proxy::SeededMemories::stale`]）从库里删掉，逐条打 warn。
+/// 启动回填与每小时重建两处共用；删失败只告警，下次再试。
+fn drop_stale_learned_rules(store: &CredentialStore, stale: &[store::LearnedRejection]) {
+    for r in stale {
+        match store.forget_learned_rejection(r) {
+            Ok(_) => tracing::warn!(
+                kind = %r.kind, model = %r.model, field = %r.field, value = %r.value,
+                "dropped a stale learned rule: a refusal had been recorded as a request class (v0.3.89); refusals are now keyed by prompt"
+            ),
+            Err(e) => tracing::warn!(error = %e, "failed to drop a stale learned rule"),
+        }
+    }
+}
+
 /// `POST /api/learned-rejections/delete`：删掉一条学到的规则，库里与进程内一起删。
 /// 用 POST 带体而不是 DELETE 带路径：`model` 里有 `[1m]` 这种字符，塞进路径段徒增转义。
 #[derive(Deserialize)]
@@ -1893,6 +1948,10 @@ struct ForwardingResp {
     reject_session_conflict: bool,
     /// 本地拒绝探针 / 探活类请求（403），不转发。
     reject_probes: bool,
+    /// 本地拒绝上游分类器已拒答过的那条提示词的逐字重发（403）；出站带 fallbacks 的不拦。
+    reject_refusals: bool,
+    /// 本地拒绝上游回过 200 却零输出的请求类（403）。
+    reject_empty_replies: bool,
     /// 替每条转发的 `/v1/messages` 上报官方客户端形态的遥测。
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
@@ -1931,6 +1990,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_openai_shape: f.reject_openai_shape,
             reject_session_conflict: f.reject_session_conflict,
             reject_probes: f.reject_probes,
+            reject_refusals: f.reject_refusals,
+            reject_empty_replies: f.reject_empty_replies,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
             fable_refusal_fallback: f.fable_refusal_fallback,
@@ -2595,6 +2656,8 @@ struct SetForwardingReq {
     reject_openai_shape: Option<bool>,
     reject_session_conflict: Option<bool>,
     reject_probes: Option<bool>,
+    reject_refusals: Option<bool>,
+    reject_empty_replies: Option<bool>,
     api_telemetry: Option<bool>,
     keepalive_telemetry: Option<bool>,
     fable_refusal_fallback: Option<bool>,
@@ -2612,10 +2675,11 @@ async fn set_forwarding(
         API_TELEMETRY, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS, FILL_METADATA,
         FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
         NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_SESSION_CONFLICT, SIMULATE_CC,
-        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
-        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
-        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        RATE_LIMIT_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES,
+        REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
+        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
+        TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2643,6 +2707,8 @@ async fn set_forwarding(
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
         (REJECT_SESSION_CONFLICT, req.reject_session_conflict),
         (REJECT_PROBES, req.reject_probes),
+        (REJECT_REFUSALS, req.reject_refusals),
+        (REJECT_EMPTY_REPLIES, req.reject_empty_replies),
         (API_TELEMETRY, req.api_telemetry),
         (KEEPALIVE_TELEMETRY, req.keepalive_telemetry),
         (FABLE_REFUSAL_FALLBACK, req.fable_refusal_fallback),

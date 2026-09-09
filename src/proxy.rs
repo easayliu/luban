@@ -716,12 +716,25 @@ async fn handle_inner(
         return error_response(StatusCode::FORBIDDEN, "permission_error", kind.message());
     }
 
-    // 2.3a4) 上游分类器拒答过的提示词（同一模型、system + messages 逐字相同）→ 本地 403，
-    //        不再送。学进来的只有带 `stop_details.category` 的分类器判决（见
+    // 2.3a4) 上游分类器拒答过的提示词（同一模型、system + messages + tools + tool_choice 逐字
+    //        相同）→ 本地 403，不再送。学进来的只有带 `stop_details.category` 的分类器判决（见
     //        [`UsageSniffer::classifier_refusal`]），那是确定性的：换个号、换个形态重发结果
-    //        一样；见 [`known_refused_prompt`]。
+    //        一样；见 [`known_refused_prompt`]。自己的开关 `reject_refusals`（0.3.93 之前借用
+    //        `reject_probes`，关探针就把这条一起放行了）。
+    //
+    //        **出站会带 `fallbacks` 的不拦**（客户端自带的，或 luban 按族开关要补的，见
+    //        [`outbound_carries_fallbacks`]）：带 fallback 的请求上游拒答后会换模型重跑，那正是
+    //        拒答该走的路。此前不看这一点，fallback 关着时学到的一条拒答，之后即便把 fallback
+    //        打开也永远走不到上游——本地先 403 了。
     if billable
-        && state.store.forward_flags().reject_probes
+        && state.store.forward_flags().reject_refusals
+        && !outbound_carries_fallbacks(
+            body_json.as_ref(),
+            req_model.as_deref(),
+            state.store.forward_flags(),
+            &inbound_beta_list(&headers),
+            &state.deprecated_fields,
+        )
         && let Some(excerpt) =
             known_refused_prompt(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
     {
@@ -743,7 +756,7 @@ async fn handle_inner(
             format!(
                 "not forwarded: upstream's safety classifier has already refused this exact \
                  prompt (model {model}, stop_reason refusal); an identical resend gets the same \
-                 verdict. Change the prompt or the model to send it. Upstream reply was: {}",
+                 verdict. Change the prompt or the model to send it. Upstream verdict: {}",
                 excerpt.chars().take(300).collect::<String>()
             ),
         );
@@ -751,10 +764,11 @@ async fn handle_inner(
 
     // 2.3a5) 上游对这一类请求（模型 + 无 tools 单条消息 + 这个 max_tokens）回过 200 却零输出
     //        → 本地 403，不再送。规则不是写死的，是上一条零输出的回复自己喂出来的，见
-    //        [`known_empty_reply`]；回给客户端的文案带上上游当时的原话。与探针同一开关，
-    //        不限 UA——模拟路径重建的是身份，改不了「问一句、上游一个字不回」这件事。
+    //        [`known_empty_reply`]；回给客户端的文案带上上游当时的原话。自己的开关
+    //        `reject_empty_replies`，不限 UA——模拟路径重建的是身份，改不了「问一句、上游一个字
+    //        不回」这件事。
     if billable
-        && state.store.forward_flags().reject_probes
+        && state.store.forward_flags().reject_empty_replies
         && let Some((max_tokens, excerpt)) =
             known_empty_reply(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
     {
@@ -1080,15 +1094,24 @@ async fn handle_inner(
             Some(_) => None,
             None => outbound_session_id(&headers, body_json.as_ref(), bare_session.as_deref()),
         };
-        // 要不要补 `fallbacks`（拒答时上游换模型重跑），见 [`refusal_fallbacks_for`]；
-        // 头体两侧同一个判断：体里写了字段，头上就得有对应的 beta。
-        let refusal_fallbacks = refusal_fallbacks_for(
-            req_model.as_deref(),
-            flags,
-            billable,
-            cc_kind,
-            &state.deprecated_fields,
-        );
+        // 要不要补 `fallbacks`（拒答时上游换模型重跑），见 [`refusal_fallbacks_for`]。客户端
+        // 自己带了数组形态的，luban 一个字不动、也就**不算 luban 补的**：`refusal_fallbacks`
+        // 留 `None`，上游若以 400 拒了它，那是客户端的字段、原样回给客户端，不进「从上游学到
+        // 的规则」、不剥掉重试（此前只看开关，客户端的目标被拒会被当成 luban 的学下来，
+        // 该模型 7 天内不再补——污染的是全局规则）。头上的 beta 另算：体里只要有这个字段
+        // （客户端带的或 luban 补的），头上就得有 `server-side-fallback`。
+        let client_fallbacks = client_supplied_fallbacks(body_json.as_ref());
+        let refusal_fallbacks = if client_fallbacks {
+            None
+        } else {
+            refusal_fallbacks_for(
+                req_model.as_deref(),
+                flags,
+                billable,
+                cc_kind,
+                &state.deprecated_fields,
+            )
+        };
         let out = build_forward_headers_for(
             &headers,
             &token,
@@ -1096,7 +1119,7 @@ async fn handle_inner(
             sim.as_ref(),
             session_out.as_deref(),
             req_model.as_deref(),
-            refusal_fallbacks.is_some(),
+            refusal_fallbacks.is_some() || (billable && client_fallbacks),
         );
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
@@ -1921,7 +1944,8 @@ async fn handle_inner(
                 }
                 // luban 补的 `fallbacks` 被上游拒了（目标不在 allowed_fallback_models 之类）：
                 // 记下来以后不补，这一发剥掉重试一次。客户端自己带的 fallbacks 不在此列——
-                // 那是它的字段，被拒了照原样回给它。
+                // 那是它的字段，被拒了照原样回给它：客户端带了数组时 `refusal_fallbacks` 就是
+                // `None`（见上面装头处），这里判 `is_some()` 即「确是 luban 写进去的」。
                 if status == StatusCode::BAD_REQUEST
                     && !compressed
                     && upstream.refusal_fallbacks.is_some()
@@ -3553,9 +3577,13 @@ impl Drop for ReqLog {
         let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
         // 输出前就被分类器拒掉的（`stop_reason: "refusal"`、零输出）上游**不计费**：usage 里
         // 报了 token 数但不扣钱（官方 Refusals and fallback 页）。照 usage 算会把一堆 0 输出的
-        // 拒答算成真金白银。流到一半被掐的按已产出部分正常计费，走下面那条。
-        let refused_before_output =
-            self.sniffer.refused() && self.sniffer.output_tokens.unwrap_or(0) == 0;
+        // 拒答算成真金白银。流到一半被掐的按已产出部分正常计费（输入 + 已流出的输出都算），
+        // 走下面那条。「输出前」的判据不只看 `output_tokens`：那个数没解析到（`None`）时不能
+        // 当 0——回复里已经见过任何内容块（[`UsageSniffer::saw_output_block`]，`fallback` 切换
+        // 标记不算）的，就是流到一半被掐的，得计费。
+        let refused_before_output = self.sniffer.refused()
+            && self.sniffer.output_tokens.unwrap_or(0) == 0
+            && !self.sniffer.saw_output_block;
         let cost_usd = if refused_before_output {
             Some(0.0)
         } else {
@@ -3816,8 +3844,14 @@ impl ReqLog {
         tags.push_str(if refused { REWRITE_REFUSAL } else { REWRITE_EMPTY_REPLY });
         let learned = if refused {
             verdict.and_then(|category| {
-                // 规则文案带上类别，设置页与 403 文案一眼能看出是哪类判决。
-                let message = format!("[{category}] {excerpt}");
+                // 规则文案 = 「[类别] stop_details=<原样 JSON>」：设置页与 403 文案一眼看出是
+                // 哪类判决、上游给了什么解释。取 stop_details 而不是响应体开头——开头是
+                // usage 样板，判决在流末尾；有 verdict 就一定解析到过 stop_details 对象，
+                // 退回 excerpt 只是防御。
+                let message = match &self.sniffer.refusal_details {
+                    Some(details) => format!("[{category}] stop_details={details}"),
+                    None => format!("[{category}] {excerpt}"),
+                };
                 self.prompt_key.take().and_then(|(model, digest)| {
                     remember_refused_prompt(&self.empty_replies, &model, &digest, &message)
                 })
@@ -4155,6 +4189,11 @@ struct UsageSniffer {
     /// 上游不跑 fallback、把主模型的拒答原样返回并在这里提示「直接重试这个模型可能成功」。
     /// 有它的拒答是没救成，不是救不了，同样不能学。
     refusal_recommended_model: Option<String>,
+    /// `stop_details` 对象**原样**的紧凑 JSON（`{"type":"refusal","category":"cyber",
+    /// "explanation":…}`）。拒答规则的文案取的是它，不是响应体开头：流式回复的开头是
+    /// `message_start` 那段 usage 样板，拒答的判决在流**末尾**的 `message_delta` 里，按开头
+    /// 截 500 字永远够不到——0.3.93 之前学到的 refusal 规则文案就全是一段 usage JSON。
+    refusal_details: Option<String>,
     text_chars: usize,
     thinking_chars: usize,
     /// 回复里出现过 `thinking` / `redacted_thinking` 块。
@@ -4163,6 +4202,11 @@ struct UsageSniffer {
     /// 大于零」（`redacted_thinking` 与被截断的思考块都是 0 字），此前只能拿「没有正文」
     /// 当代理指标。
     saw_thinking: bool,
+    /// 回复里出现过**任何**输出内容块（`fallback` 切换标记除外——它不是模型产出）。拒答计价
+    /// 用：`output_tokens` 没解析到时，靠它分「输出前被拒（不计费）」与「流到一半被掐（已
+    /// 流出的照常计费）」；只看 text / thinking / tool_use 三种会漏掉 `server_tool_use` 的结果
+    /// 块之类不认识的类型。
+    saw_output_block: bool,
     /// 回复里的 `tool_use` 块：按出现顺序记名字与 `input` 的 JSON 串。
     ///
     /// `toolUseContentLengths` 报的是「这条回复里每个工具的入参 JSON 长度之和」，流式下
@@ -4302,6 +4346,7 @@ impl UsageSniffer {
             self.refusal_category = sd.get("category").and_then(|c| c.as_str()).map(str::to_string);
             self.refusal_recommended_model =
                 sd.get("recommended_model").and_then(|m| m.as_str()).map(str::to_string);
+            self.refusal_details = Some(sd.to_string());
         }
         // 正文字符数：流式看 `content_block_delta.delta`，非流式看顶层 `content[]`。
         if let Some(d) = v.get("delta") {
@@ -4397,7 +4442,11 @@ impl UsageSniffer {
 
     /// 记一个内容块的类型：思考块只记「出现过」，工具块记名字与入参。
     fn note_block(&mut self, index: i64, cb: &serde_json::Value) {
-        match cb.get("type").and_then(|t| t.as_str()) {
+        let ty = cb.get("type").and_then(|t| t.as_str());
+        if ty != Some("fallback") {
+            self.saw_output_block = true;
+        }
+        match ty {
             Some("thinking" | "redacted_thinking") => self.saw_thinking = true,
             Some("fallback") => {
                 if let Some(to) = cb.get("to").and_then(|t| t.get("model")).and_then(|m| m.as_str())
@@ -4475,8 +4524,11 @@ impl UsageSniffer {
     /// `stop_reason: "refusal"`、`stop_details.category` 非空（分类器给了类别）、且没有
     /// `recommended_model`（有它说明 fallback 没跑成，直接重试可能就答了）。是则给出类别。
     ///
-    /// 模型自己的拒绝（category 为空）带采样，原样重发可能就答了，锁 7 天是误伤；官方文档
-    /// 也只说输出前的拒答不计费、不占限流，「重发在账号上添一笔」没有依据——判据宁可收紧。
+    /// category 为空的一律不学。官方文档说 `stop_details` 只是参考信息、`category` 与
+    /// `explanation` 都可能为 `null`（且要把 `null` 当成一种长期存在的正常取值）——所以「空即
+    /// 模型自拒」只是对多数样本成立的近似，不是定义；但学与不学两边的代价不对称：不学最多
+    /// 让那条提示词再白跑一次上游，学错则把可能能答的请求锁 7 天。判据宁可收紧。官方文档也
+    /// 只说输出前的拒答不计费、不占限流，「重发在账号上添一笔」没有依据。
     fn classifier_refusal(&self) -> Option<&str> {
         if !self.refused() || self.refusal_recommended_model.is_some() {
             return None;
@@ -7380,7 +7432,7 @@ pub struct SeededMemories {
     /// v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
     /// 拒答的内容把同形态的所有正常请求一起拦掉。这类行按新逻辑不该存在：不回填，交给
     /// 调用方从库里删掉，免得下次启动再撞一遍。判据是 `message`（当时截的上游回复）里带
-    /// `"stop_reason":"refusal"`。
+    /// `"stop_reason":"refusal"`（去空白比）。
     pub stale: Vec<store::LearnedRejection>,
 }
 
@@ -7396,10 +7448,42 @@ pub fn seed_learned_memories(
     empty: &EmptyReplyMemory,
     rows: Vec<store::LearnedRejection>,
 ) -> SeededMemories {
-    let mut out = SeededMemories::default();
     let mut shape_table = shape.write();
     let mut dep_table = deprecated.write();
     let mut empty_table = empty.write();
+    seed_tables(&mut shape_table, &mut dep_table, &mut empty_table, rows)
+}
+
+/// 按库里现存的规则**重建**三张进程内记忆表：清空后回填，三把写锁一直拿着，请求路径看不到
+/// 「表空了但还没回填」的中间态。
+///
+/// 7 天保鲜期落在库的 `learned_at` 列上，`Store::learned_rejections` 读库时顺手删过期行；
+/// 但请求路径判的是这几张 HashMap，只回填不清表，进程活着规则就永不过期。`web` 里每小时
+/// 调一次。读库到拿锁之间刚学到、还没落库的那一两条会从内存里掉一次，下个整点从库里回来。
+pub fn resync_learned_memories(
+    shape: &ShapeMemory,
+    deprecated: &DeprecatedFieldMemory,
+    empty: &EmptyReplyMemory,
+    rows: Vec<store::LearnedRejection>,
+) -> SeededMemories {
+    let mut shape_table = shape.write();
+    let mut dep_table = deprecated.write();
+    let mut empty_table = empty.write();
+    shape_table.clear();
+    dep_table.clear();
+    *empty_table = Default::default();
+    seed_tables(&mut shape_table, &mut dep_table, &mut empty_table, rows)
+}
+
+/// [`seed_learned_memories`] / [`resync_learned_memories`] 共用的回填本体：调用方已拿着三把
+/// 写锁。
+fn seed_tables(
+    shape_table: &mut ShapeRejections,
+    dep_table: &mut DeprecatedFieldRejections,
+    empty_table: &mut EmptyReplyRejections,
+    rows: Vec<store::LearnedRejection>,
+) -> SeededMemories {
+    let mut out = SeededMemories::default();
     for r in rows {
         match r.kind.as_str() {
             LEARNED_KIND_SHAPE => {
@@ -7422,7 +7506,11 @@ pub fn seed_learned_memories(
                 out.deprecated += 1;
             }
             LEARNED_KIND_EMPTY_REPLY => {
-                if r.message.contains(r#""stop_reason":"refusal""#) {
+                // 去掉空白再比：上游的 JSON 是紧凑的，但截到的原文若经过任何一层
+                // pretty-print（或 SSE 里 `"stop_reason": "refusal"` 带空格），紧凑写法就对不上，
+                // 学错的那条会一直连坐整类请求。
+                let compact: String = r.message.chars().filter(|c| !c.is_whitespace()).collect();
+                if compact.contains(r#""stop_reason":"refusal""#) {
                     out.stale.push(r);
                     continue;
                 }
@@ -7444,6 +7532,20 @@ pub fn seed_learned_memories(
         }
     }
     out
+}
+
+/// 三张进程内记忆表目前一共几条（重建前后对比、日志用）。
+pub fn learned_memory_len(
+    shape: &ShapeMemory,
+    deprecated: &DeprecatedFieldMemory,
+    empty: &EmptyReplyMemory,
+) -> usize {
+    // 加锁顺序与 [`resync_learned_memories`] 一致（shape → deprecated → empty），两者都同时
+    // 持多把锁，顺序不同就是理论上的死锁。
+    let s = shape.read();
+    let d = deprecated.read();
+    let e = empty.read();
+    s.len() + d.len() + e.classes.len() + e.prompts.len()
 }
 
 // ── 上游回过零输出的请求类 ────────────────────────────────────────────
@@ -7473,8 +7575,14 @@ const EMPTY_REPLY_FIELD: &str = "max_tokens";
 /// 拒答记忆表里 `field` 列的固定值：`value` 是提示词哈希（[`prompt_digest`]）。
 const REFUSAL_FIELD: &str = "prompt_sha";
 
-/// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」，
-/// 值都是当时截下的上游回复开头（本地拒时回给客户端）。
+/// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」。
+/// 值是本地拒时回给客户端的那段文案：零输出格是当时截下的上游回复开头（信息就在开头——
+/// 一段没有 `content` 的 Message），拒答格是「[类别] stop_details=<原样 JSON>」（判决在流
+/// 末尾，开头截不到）。
+///
+/// 拒答格**不分凭证**：分类器判决对同一条提示词是确定性的，换个号重发结果一样（这个池子里
+/// 的号都是订阅端账号，不涉及官方按 organization 审批的网络安全验证计划），一张号上学到的
+/// 对全池生效。
 #[derive(Default)]
 pub struct EmptyReplyRejections {
     classes: std::collections::HashMap<(String, i64), String>,
@@ -7485,22 +7593,29 @@ pub struct EmptyReplyRejections {
 /// `learned_rejections`（`kind = "empty_reply"` / `"refusal"`）、启动回填、7 天保鲜。
 pub type EmptyReplyMemory = std::sync::Arc<parking_lot::RwLock<EmptyReplyRejections>>;
 
-/// 提示词哈希：`system` 与 `messages` 两个字段紧凑序列化后的 sha256 前 16 位 hex。
-/// 只看来访体（学与判看同一侧）；没有 `messages` 的不算。
+/// 提示词哈希：`system`、`messages`、`tools`、`tool_choice` 四个字段紧凑序列化后的 sha256
+/// 前 16 位 hex。只看来访体（学与判看同一侧）；没有 `messages` 的不算。
+///
+/// `tools` 也进哈希：分类器看的是整条请求，同一段文字配不同的工具集（能不能执行命令、
+/// 能不能读写文件）风险不一样，判决未必一样——键取窄一点，宁可多送一条，不用一条判决拦
+/// 另一种上下文。缺失的字段按「没有」哈希，与显式 `null` / `[]` 不同，这是有意的：形态
+/// 不同就是不同的请求。
 fn prompt_digest(body: &serde_json::Value) -> Option<String> {
     use sha2::{Digest, Sha256};
     let messages = body.get("messages")?;
     let mut h = Sha256::new();
-    if let Some(system) = body.get("system") {
-        h.update(system.to_string().as_bytes());
+    for field in ["system", "tools", "tool_choice"] {
+        if let Some(v) = body.get(field) {
+            h.update(v.to_string().as_bytes());
+        }
+        h.update(b"\0");
     }
-    h.update(b"\0");
     h.update(messages.to_string().as_bytes());
     Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
 }
 
-/// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` 逐字相同）；
-/// 是则给出当时截下的上游回复。
+/// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` + `tools` +
+/// `tool_choice` 逐字相同）；是则给出当时记下的判决文案（`[类别] stop_details=…`）。
 fn known_refused_prompt(
     mem: &EmptyReplyMemory,
     model: Option<&str>,
@@ -8469,6 +8584,9 @@ fn rewrite_body(
     };
     // 全关且不模拟：连解析都不必做，原样返回。
     // 额外检查：body 里含 allOf/oneOf/anyOf 或空 text 块时仍需解析（须对应开关开着）。
+    // 要补 `fallbacks` 的也不能走这条：调用方已按同一个判断在头上补了 `server-side-fallback`
+    // beta（[`build_forward_headers_for`]），体里不写字段就是「有 beta 没字段」——对 fable 而言
+    // 恰是官方 2.1.260 之前的旧形态，且拒答时上游不会换模型重跑，开关等于没开。
     let may_need_schema_fix = flags.flatten_tool_schemas
         && body.windows(5).any(|w| w == b"allOf" || w == b"oneOf" || w == b"anyOf");
     let may_have_empty_text =
@@ -8485,6 +8603,7 @@ fn rewrite_body(
         && !may_need_schema_fix
         && !may_have_empty_text
         && !may_have_system_role
+        && fallbacks.is_none()
     {
         return body.clone();
     }
@@ -9259,12 +9378,16 @@ fn ensure_diagnostics(v: &mut serde_json::Value, link: &CcSessionLink) -> bool {
 
 /// 这条请求该补哪份 `fallbacks`（计费路径、主线程 profile，且该族的开关开着时）：
 ///
-/// - fable 族（`fable_refusal_fallback`，默认开）：官方 2.1.260 那份
+/// - fable 族（`fable_refusal_fallback`，默认关）：官方 2.1.260 那份
 ///   `[{"model":"claude-opus-5"}]`（profile 里逐字取自抓包），补上反而更像官方；
 /// - opus-5 族（`opus_refusal_fallback`，**默认关**）：luban 自定的
 ///   [`config::OPUS_REFUSAL_FALLBACKS`]（4.8 → 4.6）。官方 opus 客户端不发这个字段，补了就是
 ///   官方从不产生的请求形态，是风控层面的自证风险，故只作为独立实验开关保留；
-/// - 其余模型（sonnet / haiku / 4.x）：不补，它们本身没有分类器拒答一说。
+/// - 其余模型（sonnet / haiku / 4.x）：不补。**不是**它们没有分类器——官方文档明说 Sonnet 5
+///   与 Opus 4.7/4.8 同样带实时网络安全分类器、同样以 200 + `stop_reason: "refusal"` 拒答——
+///   而是官方客户端在这些模型上不发 `fallbacks` 字段，luban 不凭空造官方从不产生的请求形态
+///   （opus-5 那条自定链就是为此才默认关的）。它们的拒答照样被嗅探器记流水、按提示词学
+///   （[`UsageSniffer::classifier_refusal`] 不看模型族），只是不替它们换模型重跑。
 ///
 /// 上游曾以 400 拒过这个模型的 fallback 目标（[`remember_fallback_rejection`]）的，也不补。
 fn refusal_fallbacks_for(
@@ -9296,6 +9419,58 @@ fn refusal_fallbacks_for(
         return None;
     }
     Some(plan)
+}
+
+/// 客户端自己带了**数组形态**的 `fallbacks`（[`ensure_fallbacks`] 对它一个字不动）。有则
+/// luban 不算补过：`refusal_fallbacks` 留 `None`，上游 400 拒它时不学、不剥掉重试。字符串
+/// `"default"` 不算——那一份会被 luban 换成数组（[`ensure_fallbacks`] / [`normalize_fallbacks`]），
+/// 出站的是 luban 的字面量。
+fn client_supplied_fallbacks(body: Option<&serde_json::Value>) -> bool {
+    body.and_then(|v| v.get("fallbacks")).is_some_and(|f| !f.is_string())
+}
+
+/// 这条请求出站时会不会带 `fallbacks`——客户端自己写了（数组非空，或 2.1.258 那种字符串
+/// `"default"`，两种形态 [`rewrite_body`] 都会保留/归一后送出），或 luban 按族开关要补
+/// （[`refusal_fallbacks_for`]）。带的请求上游拒答后会自己换模型重跑，本地的「已拒答提示词」
+/// 规则（[`known_refused_prompt`]）不该拦它。字符串只认 `"default"`——抓包里唯一出现过的
+/// 字符串形态（`cap/2.1.258/00013`），2.1.260 起换成数组（`cap/2.1.260/00018`）；空串或别的
+/// 字面量官方客户端从没发过、上游一定 400，不算「带了 fallback」，不该拿它绕过本地规则。
+/// `cc_kind` 在这里按体与 beta 头现算：调用点在 `handle_inner` 早于主流程算 `cc_kind` 的
+/// 位置，而 [`CcRequestKind::of`] 是纯函数。
+fn outbound_carries_fallbacks(
+    body: Option<&serde_json::Value>,
+    model: Option<&str>,
+    flags: store::ForwardFlags,
+    inbound_beta: &[String],
+    learned: &DeprecatedFieldMemory,
+) -> bool {
+    let Some(v) = body else { return false };
+    let client = v.get("fallbacks");
+    // 客户端带了非字符串：luban 一个字不动（[`client_supplied_fallbacks`]），出站就是它那份——
+    // 算不算「带了」看它是不是一份上游会认的数组；`[]`、`null`、`{}`、`[null]`、`[{}]` 上游
+    // 一定 400，本地规则不能为它让路。
+    if let Some(f) = client
+        && !f.is_string()
+    {
+        return valid_fallback_array(f);
+    }
+    // 字段缺失或是字符串：luban 有计划就写计划（[`ensure_fallbacks`] 会把任何字符串换掉）。
+    let cc_kind = CcRequestKind::of(v, inbound_beta);
+    if refusal_fallbacks_for(model, flags, true, cc_kind, learned).is_some() {
+        return true;
+    }
+    // 没计划：字符串原样出站，只有 `"default"` 上游认。
+    client.and_then(|f| f.as_str()) == Some("default")
+}
+
+/// 一份上游会认的 `fallbacks` 数组：非空，每一项是带非空 `model` 字符串的对象。官方定义就
+/// 这一种元素形态（可选 `max_tokens` 覆盖不在此判），别的写法上游 400。
+fn valid_fallback_array(f: &serde_json::Value) -> bool {
+    f.as_array().is_some_and(|a| {
+        !a.is_empty()
+            && a.iter()
+                .all(|e| e.get("model").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
+    })
 }
 
 /// 记忆表里「这个模型不收 `fallbacks`」那条的字段名。与已废弃字段同一张表、同一套落库
@@ -13019,6 +13194,8 @@ mod tests {
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
+            reject_refusals: false,
+            reject_empty_replies: false,
             api_telemetry: false,
             keepalive_telemetry: false,
             fable_refusal_fallback: false,
@@ -13837,6 +14014,8 @@ mod tests {
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
+            reject_refusals: false,
+            reject_empty_replies: false,
             api_telemetry: false,
             keepalive_telemetry: false,
             fable_refusal_fallback: false,
@@ -14654,6 +14833,8 @@ mod tests {
                 reject_openai_shape: false,
                 reject_session_conflict: false,
                 reject_probes: false,
+                reject_refusals: false,
+                reject_empty_replies: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
                 fable_refusal_fallback: false,
@@ -15375,6 +15556,109 @@ mod tests {
         );
     }
 
+    /// [`prompt_digest`]：`tools` 与 `tool_choice` 也进哈希——同一段文字配不同工具集是不同的
+    /// 请求；缺失与显式 `[]` 也不同。
+    #[test]
+    fn prompt_digest_covers_tools_and_tool_choice() {
+        let base = serde_json::json!({
+            "model": "claude-opus-5", "messages": [{"role": "user", "content": "x"}]
+        });
+        let d0 = super::prompt_digest(&base).unwrap();
+        let mut with_tools = base.clone();
+        with_tools["tools"] =
+            serde_json::json!([{"name": "Bash", "input_schema": {"type": "object"}}]);
+        let d1 = super::prompt_digest(&with_tools).unwrap();
+        assert_ne!(d0, d1, "带 tools 是另一条");
+        let mut other_tools = with_tools.clone();
+        other_tools["tools"][0]["name"] = serde_json::json!("Read");
+        assert_ne!(d1, super::prompt_digest(&other_tools).unwrap(), "换个工具是另一条");
+        let mut with_choice = with_tools.clone();
+        with_choice["tool_choice"] = serde_json::json!({"type": "auto"});
+        assert_ne!(d1, super::prompt_digest(&with_choice).unwrap(), "tool_choice 也算");
+        let mut empty_tools = base.clone();
+        empty_tools["tools"] = serde_json::json!([]);
+        assert_ne!(d0, super::prompt_digest(&empty_tools).unwrap(), "显式 [] 与缺失不同");
+        // 同一条重算稳定。
+        assert_eq!(d1, super::prompt_digest(&with_tools).unwrap());
+        // 没有 messages 的不算。
+        assert!(super::prompt_digest(&serde_json::json!({"system": "s"})).is_none());
+    }
+
+    /// v0.3.89 学错的 empty_reply 行：文案里的 `"stop_reason":"refusal"` 不论有没有空白、
+    /// 字段顺序如何，都判为 stale、不回填。
+    #[test]
+    fn stale_refusal_rows_are_detected_regardless_of_whitespace() {
+        let row = |message: &str| store::LearnedRejection {
+            kind: "empty_reply".into(),
+            model: "claude-opus-5".into(),
+            field: "max_tokens".into(),
+            value: "65536".into(),
+            message: message.into(),
+        };
+        let rows = vec![
+            row(r#"{"content":[],"stop_reason":"refusal"}"#),
+            row(r#"{"content": [], "stop_reason": "refusal", "stop_details": null}"#),
+            row(
+                "event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\" : \"refusal\"}}",
+            ),
+            // 真正的零输出（end_turn）：照常回填。
+            row(r#"{"content":[],"stop_reason":"end_turn","usage":{"output_tokens":0}}"#),
+        ];
+        let shape = super::ShapeMemory::default();
+        let dep = super::DeprecatedFieldMemory::default();
+        let empty = super::EmptyReplyMemory::default();
+        let seeded = super::seed_learned_memories(&shape, &dep, &empty, rows);
+        assert_eq!(seeded.stale.len(), 3, "三种写法都判为学错的拒答");
+        assert_eq!(seeded.empty_reply, 1, "end_turn 那条照常回填");
+        // 同键的 stale 行都被挑出来后，表里只剩 end_turn 那条（同键 or_insert 只留第一条）。
+        assert_eq!(empty.read().classes.len(), 1);
+    }
+
+    /// [`resync_learned_memories`]：按传入的行整体重建三张表——库里没有的（过期被删的）从
+    /// 内存里消失，库里有的回来；[`learned_memory_len`] 前后可比。
+    #[test]
+    fn resync_learned_memories_drops_rows_missing_from_store() {
+        let shape = super::ShapeMemory::default();
+        let dep = super::DeprecatedFieldMemory::default();
+        let empty = super::EmptyReplyMemory::default();
+        // 先各学一条。
+        let probe = &super::SHAPE_PROBES[0];
+        shape.write().insert(("claude-opus-5".into(), probe.field, "v".into()), "m".into());
+        dep.write().insert(("claude-opus-5".into(), super::FALLBACKS_FIELD.into()), "m".into());
+        super::remember_empty_reply(&empty, "claude-fable-5", 16, "{}").unwrap();
+        let refused =
+            super::remember_refused_prompt(&empty, "claude-opus-5", "deadbeef", "[cyber]").unwrap();
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), 4);
+        // 库里只剩拒答那一条（其余三条已过期被删）：重建后内存里也只剩它。
+        let seeded = super::resync_learned_memories(&shape, &dep, &empty, vec![refused.clone()]);
+        assert_eq!(
+            seeded,
+            super::SeededMemories {
+                shape: 0,
+                deprecated: 0,
+                empty_reply: 0,
+                refusal: 1,
+                stale: vec![]
+            }
+        );
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), 1);
+        assert!(shape.read().is_empty());
+        assert!(dep.read().is_empty());
+        assert!(empty.read().classes.is_empty());
+        assert_eq!(
+            empty
+                .read()
+                .prompts
+                .get(&("claude-opus-5".into(), "deadbeef".into()))
+                .map(String::as_str),
+            Some("[cyber]")
+        );
+        // 库里空了：内存也空。
+        let seeded = super::resync_learned_memories(&shape, &dep, &empty, vec![]);
+        assert_eq!(seeded, super::SeededMemories::default());
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), 0);
+    }
+
     /// 已知模型（4.7+）即使没学过也会主动剥掉 sampling 参数。
     #[test]
     fn strips_sampling_for_known_models_without_learning() {
@@ -15919,8 +16203,15 @@ mod tests {
         use super::CcRequestKind::*;
         let mem = super::DeprecatedFieldMemory::default();
         let defaults = all_on();
-        assert!(defaults.fable_refusal_fallback && !defaults.opus_refusal_fallback);
-        let on = store::ForwardFlags { opus_refusal_fallback: true, ..defaults };
+        assert!(
+            !defaults.fable_refusal_fallback && !defaults.opus_refusal_fallback,
+            "两档都默认关"
+        );
+        let on = store::ForwardFlags {
+            fable_refusal_fallback: true,
+            opus_refusal_fallback: true,
+            ..defaults
+        };
         let off = store::ForwardFlags {
             fable_refusal_fallback: false,
             opus_refusal_fallback: false,
@@ -15937,17 +16228,18 @@ mod tests {
         assert_eq!(pick("claude-fable-5", on, true, Main), Some(r#"[{"model":"claude-opus-5"}]"#));
         assert_eq!(pick("claude-opus-5", on, true, Main), Some(config::OPUS_REFUSAL_FALLBACKS));
         assert_eq!(pick("claude-opus-5[1m]", on, true, Main), Some(config::OPUS_REFUSAL_FALLBACKS));
-        assert_eq!(pick("claude-sonnet-5", on, true, Main), None, "sonnet 没有分类器拒答");
+        assert_eq!(
+            pick("claude-sonnet-5", on, true, Main),
+            None,
+            "sonnet 官方客户端不发该字段，不补"
+        );
         assert_eq!(pick("claude-opus-4-8", on, true, Main), None, "4.x 不补");
         assert_eq!(pick("claude-haiku-4-5-20251001", on, true, Main), None);
         assert_eq!(pick("claude-fable-5-1", off, true, Main), None, "开关关着不补");
         assert_eq!(pick("claude-opus-5", off, true, Main), None, "开关关着不补");
-        // 默认值：fable 补、opus 不补——opus 那份是官方不产生的形态，得显式打开。
-        assert_eq!(
-            pick("claude-fable-5-1", defaults, true, Main),
-            Some(r#"[{"model":"claude-opus-5"}]"#),
-            "fable 默认开"
-        );
+        // 默认值：两档都不补——fable 那份替用户决定换模型作答，opus 那份是官方不产生的形态，
+        // 都得显式打开。
+        assert_eq!(pick("claude-fable-5-1", defaults, true, Main), None, "fable 默认关");
         assert_eq!(pick("claude-opus-5", defaults, true, Main), None, "opus 默认关");
         assert_eq!(pick("claude-opus-5[1m]", defaults, true, Main), None, "opus 默认关");
         // 两档各管各的：只开 opus 时 fable 不补，反之亦然。
@@ -16004,8 +16296,188 @@ mod tests {
         assert!(!super::DEPRECATABLE_FIELDS.contains(&"fallbacks"));
     }
 
+    /// [`client_supplied_fallbacks`]：客户端带了数组（哪怕是空数组）算它自己的；字符串
+    /// `"default"`、缺失都不算——那两种出站的是 luban 的字面量。
+    #[test]
+    fn client_supplied_fallbacks_means_any_non_string_field() {
+        let body = |f: serde_json::Value| {
+            let mut v = serde_json::json!({"model": "claude-fable-5-1", "messages": []});
+            v["fallbacks"] = f;
+            v
+        };
+        assert!(super::client_supplied_fallbacks(Some(&body(
+            serde_json::json!([{"model": "claude-opus-4-8"}])
+        ))));
+        assert!(super::client_supplied_fallbacks(Some(&body(serde_json::json!([])))));
+        assert!(!super::client_supplied_fallbacks(Some(&body(serde_json::json!("default")))));
+        assert!(!super::client_supplied_fallbacks(Some(
+            &serde_json::json!({"model": "claude-fable-5-1"})
+        )));
+        assert!(!super::client_supplied_fallbacks(None));
+    }
+
+    /// [`outbound_carries_fallbacks`]：客户端自带 `fallbacks`（数组非空或字符串 "default"）的、
+    /// 或 luban 按族开关要补的请求算「带」；空数组不算；开关关着且客户端没带的不算；helper
+    /// 之类非主线程请求 luban 不补，也不算。带的请求 2.3a4 不本地 403。
+    #[test]
+    fn outbound_carries_fallbacks_sees_client_arrays_and_luban_padding() {
+        let mem = super::DeprecatedFieldMemory::default();
+        let defaults = store::ForwardFlags::default();
+        let off = store::ForwardFlags {
+            fable_refusal_fallback: false,
+            opus_refusal_fallback: false,
+            ..defaults
+        };
+        let main = serde_json::json!({
+            "model": "claude-fable-5-1", "max_tokens": 32000, "stream": true,
+            "system": [{"type": "text", "text": "You are Claude Code"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let carries = |body: &serde_json::Value, model: &str, flags| {
+            super::outbound_carries_fallbacks(Some(body), Some(model), flags, &[], &mem)
+        };
+        // fable 默认关 → 不带；显式开 → luban 会补 → 带。
+        assert!(!carries(&main, "claude-fable-5-1", defaults));
+        let fable_on = store::ForwardFlags { fable_refusal_fallback: true, ..defaults };
+        assert!(carries(&main, "claude-fable-5-1", fable_on));
+        // 全关、客户端也没带 → 不带。
+        assert!(!carries(&main, "claude-fable-5-1", off));
+        // opus-5 默认关 → 不带；显式开 → 带。
+        assert!(!carries(&main, "claude-opus-5", defaults));
+        assert!(carries(
+            &main,
+            "claude-opus-5",
+            store::ForwardFlags { opus_refusal_fallback: true, ..defaults }
+        ));
+        // sonnet：luban 不补 → 不带。
+        assert!(!carries(&main, "claude-sonnet-5", defaults));
+        // 客户端自带数组 / "default"：开关关着也算带；空数组不算。
+        let mut with_arr = main.clone();
+        with_arr["fallbacks"] = serde_json::json!([{"model": "claude-opus-4-8"}]);
+        assert!(carries(&with_arr, "claude-sonnet-5", off));
+        let mut with_default = main.clone();
+        with_default["fallbacks"] = serde_json::json!("default");
+        assert!(carries(&with_default, "claude-sonnet-5", off));
+        // 客户端带的非字符串形态 luban 不动，出站就是它那份：空数组、null、对象、元素不是
+        // 带 model 的对象——上游一定 400，开关开着也不算带了 fallback。
+        for bogus in [
+            serde_json::json!([]),
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([null]),
+            serde_json::json!([{}]),
+            serde_json::json!(["bogus"]),
+            serde_json::json!([{"model": ""}]),
+            serde_json::json!([{"model": "claude-opus-4-8"}, {}]),
+        ] {
+            let mut with_bogus = main.clone();
+            with_bogus["fallbacks"] = bogus.clone();
+            assert!(!carries(&with_bogus, "claude-fable-5-1", fable_on), "{bogus} 不算");
+            assert!(!carries(&with_bogus, "claude-fable-5-1", off), "{bogus} 不算");
+        }
+        // 客户端字符串写错、但开关开着：luban 会把字符串换成自己的计划 → 带。
+        let mut bad_string = main.clone();
+        bad_string["fallbacks"] = serde_json::json!("auto");
+        assert!(carries(&bad_string, "claude-fable-5-1", fable_on));
+        // 字符串只认 "default"（抓包 cap/2.1.258/00013 那份）：空串或别的字面量官方从没发过、
+        // 上游一定 400，不算带了 fallback。
+        for bogus in ["", "auto", "Default"] {
+            let mut with_bogus = main.clone();
+            with_bogus["fallbacks"] = serde_json::json!(bogus);
+            assert!(!carries(&with_bogus, "claude-sonnet-5", off), "{bogus:?} 不算");
+        }
+        // 非主线程（无 tools 的 helper）luban 不补 → 不带。
+        let mut helper = main.clone();
+        helper.as_object_mut().unwrap().remove("tools");
+        assert!(!carries(&helper, "claude-fable-5-1", defaults));
+        // 无体 → 不带。
+        assert!(!super::outbound_carries_fallbacks(
+            None,
+            Some("claude-fable-5-1"),
+            defaults,
+            &[],
+            &mem
+        ));
+        // 上游 400 拒过这个模型的 fallback 目标：luban 不再补 → 不带。
+        mem.write().insert(
+            ("claude-fable-5-1".to_string(), super::FALLBACKS_FIELD.to_string()),
+            "rejected".into(),
+        );
+        assert!(!carries(&main, "claude-fable-5-1", defaults));
+    }
+
     /// 体侧 `ensure_fallbacks`：没写的补在 `context_management` 之后、`output_config` 之前
     /// （官方键序），字符串 `"default"` 换成数组，客户端自己的数组不动。
+    /// `rewrite_body` 的「全关且不模拟」快路径不能吞掉 `fallbacks`：头上按同一个判断补了
+    /// beta，体里必须写字段，否则 fable 的拒答换模型重跑名存实亡。反例：不补时快路径照走、
+    /// 体原样。
+    #[test]
+    fn rewrite_body_fast_path_still_writes_fallbacks() {
+        let off = store::ForwardFlags {
+            spoof_identity: false,
+            spoof_device_id: false,
+            normalize_device_fp: false,
+            billing_cch: false,
+            fill_client_headers: false,
+            merge_beta: false,
+            system_shape: false,
+            orig_header_case: false,
+            thinking_signature_retry: false,
+            thinking_modified_retry: false,
+            simulate_cc: false,
+            fill_metadata: false,
+            rate_limit_retry: false,
+            cache_scope_global: false,
+            cache_ttl_1h: false,
+            nonstream_as_sse: false,
+            strip_extra_fields: false,
+            tool_name_mimic: false,
+            inject_thinking: false,
+            flatten_tool_schemas: false,
+            strip_empty_text: false,
+            hoist_system_role: false,
+            reject_openai_shape: false,
+            reject_session_conflict: false,
+            reject_probes: false,
+            reject_refusals: false,
+            reject_empty_replies: false,
+            api_telemetry: false,
+            keepalive_telemetry: false,
+            fable_refusal_fallback: true,
+            opus_refusal_fallback: false,
+        };
+        let body = Bytes::from_static(
+            br#"{"model":"claude-fable-5-1","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let plan = super::cc_profile_for("claude-fable-5-1").fallbacks.unwrap();
+        let shape = |fallbacks: Option<&str>| {
+            super::rewrite_body(
+                &body,
+                &test_cred(),
+                "fp",
+                off,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                None,
+                None,
+                super::CcRequestKind::Main,
+                fallbacks,
+            )
+        };
+        // 不补：快路径，体原样。
+        assert_eq!(shape(None), body);
+        // 补：体里必须有官方那份数组，且按官方键序落在 max_tokens 之后。
+        let out: serde_json::Value = serde_json::from_slice(&shape(Some(plan))).unwrap();
+        assert_eq!(out["fallbacks"], serde_json::json!([{"model": "claude-opus-5"}]));
+        let keys: Vec<&str> = out.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["model", "max_tokens", "fallbacks", "messages"]);
+    }
+
     #[test]
     fn ensure_fallbacks_inserts_at_the_official_position_and_keeps_client_arrays() {
         let plan = config::OPUS_REFUSAL_FALLBACKS;
@@ -16191,6 +16663,29 @@ mod tests {
         assert!(logs[1].cost_usd.unwrap() > 0.0);
         assert!(logs[0].cost_usd.unwrap() > 0.0, "半截拒答按已产出计价");
         assert_eq!(logs[0].forensics.rewrites.as_deref(), Some("refusal"));
+        // 4) 流到一半被掐、但 usage 里没有 output_tokens：正文已经流出来了，不能当「输出前」
+        //    记 0——官方口径是已流出的输出与输入都计费。
+        log(br#"{"id":"msg_n","model":"claude-opus-5","content":[{"type":"text","text":"part"}],"stop_reason":"refusal","usage":{"input_tokens":1000}}"#);
+        // 5) 输出前被拒、usage 里同样没有 output_tokens：仍是 0。
+        log(br#"{"id":"msg_z","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":1000}}"#);
+        // 6) 半截被掐、正文只有不认识的块类型（服务端工具结果）、usage 缺 output_tokens：
+        //    见过内容块就不是「输出前」，照常计价。
+        log(br#"{"id":"msg_u","model":"claude-opus-5","content":[{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]}],"stop_reason":"refusal","usage":{"input_tokens":1000}}"#);
+        // 7) 主模型与 fallback 都在输出前被拒：正文里只有 `fallback` 切换标记，它不是产出，
+        //    仍按「输出前」记 0。
+        log(br#"{"id":"msg_ff","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"}}],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":1000,"output_tokens":0}}"#);
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 7);
+        assert_eq!(logs[0].cost_usd, Some(0.0), "只有 fallback 切换标记：仍是输出前被拒");
+        assert!(
+            logs[1].cost_usd.unwrap() > 0.0,
+            "不认识的内容块也算已输出：usage 缺 output_tokens 时不能记 0"
+        );
+        assert_eq!(logs[2].cost_usd, Some(0.0), "输出前被拒、usage 缺 output_tokens：仍记 0");
+        assert!(
+            logs[3].cost_usd.unwrap() > 0.0,
+            "半截拒答、usage 缺 output_tokens：按输入计价，不能记 0"
+        );
     }
 
     /// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
@@ -20603,13 +21098,36 @@ mod tests {
                 .unwrap()
                 .starts_with("event: message_start")
         );
-        // 学到的规则文案带类别前缀，后面是上游原话。
+        // 学到的规则文案 = 「[类别] stop_details=<原样 JSON>」——带上游的解释字段，不带
+        // 响应体开头那段 usage 样板；流式的判决在 `message_delta` 里，文案照样取到它而不是
+        // `message_start`。
+        let deadbeef = mem
+            .read()
+            .prompts
+            .get(&("claude-opus-5".to_string(), "deadbeef".to_string()))
+            .cloned()
+            .unwrap();
+        assert!(deadbeef.starts_with("[cyber] stop_details={"), "{deadbeef}");
+        assert!(deadbeef.contains(r#""explanation":"blocked""#), "{deadbeef}");
+        assert!(!deadbeef.contains("usage"), "文案不该是响应体开头：{deadbeef}");
+        let cafe = mem
+            .read()
+            .prompts
+            .get(&("claude-opus-5".to_string(), "cafe".to_string()))
+            .cloned()
+            .unwrap();
         assert!(
-            mem.read()
-                .prompts
-                .get(&("claude-opus-5".to_string(), "deadbeef".to_string()))
+            cafe.starts_with(r#"[cyber] stop_details={"type":"refusal","category":"cyber""#),
+            "{cafe}"
+        );
+        assert!(!cafe.contains("message_start"), "流式文案不该是流开头：{cafe}");
+        assert!(
+            store
+                .learned_rejections()
                 .unwrap()
-                .starts_with("[cyber] {")
+                .iter()
+                .any(|r| r.kind == "refusal" && r.value == "cafe" && r.message == cafe),
+            "落库的文案与进程内一致"
         );
 
         // 8) category 为空的拒答是模型自己拒的（带采样，重发可能就答）：标签、原文照记，

@@ -93,11 +93,15 @@ export interface Settings {
   reject_session_conflict: boolean
   /** 本地拒绝探针 / 探活类请求（403），不转发。 */
   reject_probes: boolean
+  /** 本地拒绝上游分类器已拒答过的那条提示词的逐字重发（403）；出站带 fallbacks 的不拦。 */
+  reject_refusals: boolean
+  /** 本地拒绝上游回过 200 却零输出的请求类（403）。 */
+  reject_empty_replies: boolean
   /** 替每条转发的 /v1/messages 上报官方客户端形态的遥测（事件链、Datadog 日志、OTel 指标）。 */
   api_telemetry: boolean
   /** 保活循环里的空闲遥测（版本检查事件 + Datadog 日志 + GrowthBook 画像）。 */
   keepalive_telemetry: boolean
-  /** fable 族主线程请求补官方那份服务端 refusal fallback：拒答时由上游换 opus-5 重跑。默认开。 */
+  /** fable 族主线程请求补官方那份服务端 refusal fallback：拒答时由上游换 opus-5 重跑。默认关。 */
   fable_refusal_fallback: boolean
   /** opus-5 族主线程请求补 luban 自定的 refusal fallback 链（4.8→4.6）。官方不发这个字段，实验开关，默认关。 */
   opus_refusal_fallback: boolean
@@ -134,6 +138,8 @@ export type ForwardingKey =
   | 'reject_openai_shape'
   | 'reject_session_conflict'
   | 'reject_probes'
+  | 'reject_refusals'
+  | 'reject_empty_replies'
   | 'api_telemetry'
   | 'keepalive_telemetry'
   | 'fable_refusal_fallback'

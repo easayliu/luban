@@ -2263,6 +2263,14 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_PROBES) {
             flags.reject_probes = v;
         }
+        // 拆分前三件事共用 `reject_probes`：旧库只写过它的，两条新键沿用它的取值（关过 =
+        // 用户当时把学到的规则也一起关了，升级不能悄悄开回来）；新键一旦写了就以新键为准。
+        if let Some(v) = on(REJECT_REFUSALS).or_else(|| on(REJECT_PROBES)) {
+            flags.reject_refusals = v;
+        }
+        if let Some(v) = on(REJECT_EMPTY_REPLIES).or_else(|| on(REJECT_PROBES)) {
+            flags.reject_empty_replies = v;
+        }
         if let Some(v) = on(API_TELEMETRY) {
             flags.api_telemetry = v;
         }
@@ -2514,10 +2522,24 @@ pub const REJECT_SESSION_CONFLICT: &str = "reject_session_conflict";
 /// 却是无 tools 的单条小消息、`max_tokens` 只有个位数、或身份句在 system 里重复）。身份字段
 /// 写错的不算探针、不在这里拒，由模拟路径重建身份。
 /// 这些请求每一条都是上游侧「一台设备开一个一次性会话只问一句话」的记录，真实用户从不产生，
-/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。同一开关也管从响应学来的
-/// 「上游回过零输出的请求类」（`kind = "empty_reply"`，不限 UA）。
-/// 见 [`ForwardFlags::reject_probes`]、`proxy::probe_signature` 与 `proxy::known_empty_reply`。
+/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。只管形态判据这一件事：
+/// 从响应学来的两类规则（拒答提示词、零输出请求类）各有自己的开关，见 [`REJECT_REFUSALS`]
+/// 与 [`REJECT_EMPTY_REPLIES`]（0.3.93 之前三者共用这一个键，关掉探针就把学到的规则一起放行了）。
+/// 见 [`ForwardFlags::reject_probes`] 与 `proxy::probe_signature`。
 pub const REJECT_PROBES: &str = "reject_probes";
+
+/// 是否本地拒绝**上游分类器已经拒答过的那条提示词**（同一模型、`system` + `messages` +
+/// `tools` + `tool_choice` 逐字相同的重发，不分凭证；`kind = "refusal"`）。默认开。只挡出站不带 `fallbacks`
+/// 的请求：带了 fallback 的上游会换模型重跑，本地拦下反而让 fallback 永远没机会。
+/// 旧库没写过这个键时沿用 [`REJECT_PROBES`] 的取值（拆分前共用）。
+/// 见 [`ForwardFlags::reject_refusals`] 与 `proxy::known_refused_prompt`。
+pub const REJECT_REFUSALS: &str = "reject_refusals";
+
+/// 是否本地拒绝**上游回过 200 却零输出的请求类**（模型 + 无 tools 单条消息 + 同一个
+/// `max_tokens`；`kind = "empty_reply"`，不限 UA）。默认开。旧库没写过这个键时沿用
+/// [`REJECT_PROBES`] 的取值（拆分前共用）。
+/// 见 [`ForwardFlags::reject_empty_replies`] 与 `proxy::known_empty_reply`。
+pub const REJECT_EMPTY_REPLIES: &str = "reject_empty_replies";
 
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
 /// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
@@ -2528,8 +2550,10 @@ pub const API_TELEMETRY: &str = "api_telemetry";
 pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
 
 /// 主线程 **fable 族**补不补服务端 refusal fallback（`fallbacks: [{"model":"claude-opus-5"}]`
-/// + `server-side-fallback` beta）的 settings 键名。缺省视为开启：这份形态逐字取自官方
-/// 2.1.260 抓包，补上反而更像官方。见 [`ForwardFlags::fable_refusal_fallback`]。
+/// + `server-side-fallback` beta）的 settings 键名。缺省视为**关**：形态虽逐字取自官方
+/// 2.1.260 抓包，但开着等于替用户决定「拒答就换 opus-5 作答」——作答模型、计价、约一小时的
+/// 粘连都随之改变，用户还看不到拒答本身；这该由用户自己拨开。
+/// 见 [`ForwardFlags::fable_refusal_fallback`]。
 pub const FABLE_REFUSAL_FALLBACK: &str = "fable_refusal_fallback";
 
 /// 主线程 **opus-5 族**补不补 luban 自定的 refusal fallback 链（4.8 → 4.6）的 settings 键名。
@@ -2779,11 +2803,22 @@ pub struct ForwardFlags {
     /// 四种无 tools 请求（cache 预热、Helper 子代理、标题生成、安全分类）按 system 结构 + beta
     /// 头 + body 取值逐项对、都在判据之外，见 `cap/` 抓包与 `proxy::probe_signature`。
     ///
-    /// 同一开关还管**从响应学来的**第四条（不限 UA）：上游对某模型的「无 tools 单条消息 +
-    /// 某个 `max_tokens`」回过 200 却零输出之后，同类请求本地 403，见
-    /// `proxy::known_empty_reply`——那是上游收了输入的钱、一个字没回，每条都是一次白白留下的
-    /// 「一台设备只问一句话」记录。规则随其他学到的规则落库、7 天到期、控制台可删。默认开。
+    /// 只管这三条形态判据。从响应学来的两类规则各有自己的开关（[`Self::reject_refusals`]、
+    /// [`Self::reject_empty_replies`]）：三件事的依据、误伤面、该不该开都不一样，共用一个键
+    /// 就没法单独关一件。默认开。
     pub reject_probes: bool,
+    /// 是否本地 403 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
+    /// 见 `proxy::known_refused_prompt`）。拒答是内容分类器给那一条提示词的确定性判决
+    /// （`stop_details.category` 非空），换个号、换个形态重发结果一样，本地拦下省一次白跑。
+    /// **只挡出站不带 `fallbacks` 的请求**：客户端自带、或 luban 按族开关补上 fallback 的请求，
+    /// 上游会换模型重跑，那正是拒答该走的路，本地拦下反而让它永远走不到。规则随其他学到的
+    /// 规则落库、7 天到期、控制台可删。默认开。
+    pub reject_refusals: bool,
+    /// 是否本地 403 **上游回过 200 却零输出的请求类**（模型 + 无 tools 单条消息 + 同一个
+    /// `max_tokens`，不限 UA；`kind = "empty_reply"`，见 `proxy::known_empty_reply`）——那是
+    /// 上游收了输入的钱、一个字没回，每条都是一次白白留下的「一台设备只问一句话」记录。
+    /// 规则随其他学到的规则落库、7 天到期、控制台可删。默认开。
+    pub reject_empty_replies: bool,
     /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
     /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
     /// 逐项 token 与花费）、Datadog 日志、OTel 指标，身份取实际发往上游的那份，节奏照
@@ -2808,8 +2843,11 @@ pub struct ForwardFlags {
     /// 一并带 `server-side-fallback-2026-06-01`。客户端自己带了数组形态的不动；只对主线程
     /// profile 补，辅助请求（helper / 标题 / 分类 / 额度探测）官方都不发。上游以 400 拒掉某个
     /// fallback 目标时，剥掉重发一次并记进「从上游学到的规则」，之后该模型不再补。落到
-    /// fallback 的回复按实际服务的模型计价。默认开：有官方抓包依据，补上反而更像官方。
-    /// 见 `crate::proxy::refusal_fallbacks_for`。
+    /// fallback 的回复按实际服务的模型计价。**默认关**：形态有官方 2.1.260 抓包依据，但它替
+    /// 用户决定了拒答后由 opus-5 作答、按 opus 计价、同一对话约一小时粘在 opus 上，且用户看不到
+    /// 拒答本身——这些改变该由用户自己拨开；关着时客户端自带的 `fallbacks` 照样保留、只归一
+    /// 形态（`"default"` → 数组），头上的 beta 由 [`Self::merge_beta`] 按版本补，「有 beta 没
+    /// 字段」正是 2.1.260 之前的官方形态。见 `crate::proxy::refusal_fallbacks_for`。
     pub fable_refusal_fallback: bool,
     /// **opus-5 族**主线程请求补 luban 自定的 refusal fallback 链
     /// `[{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]`（`config::OPUS_REFUSAL_FALLBACKS`）。
@@ -2848,9 +2886,11 @@ impl Default for ForwardFlags {
             reject_openai_shape: true,
             reject_session_conflict: true,
             reject_probes: true,
+            reject_refusals: true,
+            reject_empty_replies: true,
             api_telemetry: true,
             keepalive_telemetry: true,
-            fable_refusal_fallback: true,
+            fable_refusal_fallback: false,
             opus_refusal_fallback: false,
         }
     }
@@ -8299,7 +8339,10 @@ mod tests {
         assert_eq!(store.forward_flags(), ForwardFlags::default(), "空库应等于默认值");
         assert!(ForwardFlags::default().spoof_identity, "默认必须是开");
         assert!(ForwardFlags::default().system_shape);
-        assert!(ForwardFlags::default().fable_refusal_fallback, "fable 那档有官方依据，默认开");
+        assert!(
+            !ForwardFlags::default().fable_refusal_fallback,
+            "fable 那档替用户决定换模型作答，默认必须是关"
+        );
         assert!(
             !ForwardFlags::default().opus_refusal_fallback,
             "opus 那档是官方不产生的形态，默认必须是关"
@@ -8332,6 +8375,8 @@ mod tests {
             (REJECT_OPENAI_SHAPE, "0"),
             (REJECT_SESSION_CONFLICT, "0"),
             (REJECT_PROBES, "0"),
+            (REJECT_REFUSALS, "0"),
+            (REJECT_EMPTY_REPLIES, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
             (FABLE_REFUSAL_FALLBACK, "0"),
@@ -8368,6 +8413,8 @@ mod tests {
                 reject_openai_shape: false,
                 reject_session_conflict: false,
                 reject_probes: false,
+                reject_refusals: false,
+                reject_empty_replies: false,
                 api_telemetry: false,
                 keepalive_telemetry: false,
                 fable_refusal_fallback: false,
@@ -8385,6 +8432,38 @@ mod tests {
         // 无法识别的取值算「开」，不能因为写错字把形态悄悄关掉。
         store.set_setting(SPOOF_IDENTITY_ENABLED, "yes").unwrap();
         assert!(store.forward_flags().spoof_identity);
+    }
+
+    /// 0.3.93 把 `reject_probes` 拆成三个键：旧库只写过 `reject_probes=0` 的，升级后两条新键
+    /// 沿用它（用户当时关掉的是整套，不能悄悄开回来）；旧键开着的新键也开；新键一旦写了
+    /// 就以新键为准，与旧键互不影响。
+    #[test]
+    fn forward_flags_reject_probes_legacy_value_seeds_split_switches() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+
+        // 全新库：三个都默认开。
+        let f = store.forward_flags();
+        assert!(f.reject_probes && f.reject_refusals && f.reject_empty_replies);
+
+        // 旧库只关过 reject_probes：两条新键跟着关。
+        store.set_setting(REJECT_PROBES, "0").unwrap();
+        let f = store.forward_flags();
+        assert!(!f.reject_probes);
+        assert!(!f.reject_refusals, "旧键关过 = 学到的拒答规则也别拦");
+        assert!(!f.reject_empty_replies, "旧键关过 = 零输出规则也别拦");
+
+        // 新键显式开：压过旧键；另一条没写的仍跟旧键。
+        store.set_setting(REJECT_REFUSALS, "1").unwrap();
+        let f = store.forward_flags();
+        assert!(!f.reject_probes && f.reject_refusals && !f.reject_empty_replies);
+
+        // 旧键开、新键显式关：新键为准。
+        store.set_setting(REJECT_PROBES, "1").unwrap();
+        store.set_setting(REJECT_EMPTY_REPLIES, "0").unwrap();
+        let f = store.forward_flags();
+        assert!(f.reject_probes && f.reject_refusals && !f.reject_empty_replies);
     }
 
     /// v0.3.91 的单一 `refusal_fallback` 旧键拆成 fable / opus 两档后：旧键只沿用到 fable
