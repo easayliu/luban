@@ -93,7 +93,7 @@ export interface Settings {
   reject_session_conflict: boolean
   /** 本地拒绝探针 / 探活类请求（403），不转发。 */
   reject_probes: boolean
-  /** 本地拒绝上游分类器已拒答过的那条提示词的逐字重发（403）；出站带 fallbacks 的不拦。 */
+  /** 上游分类器已拒答过的那条提示词逐字重发时，本地原样回放上游那次的响应（200 + 同一段 stop_reason refusal 的体），不到上游；出站带 fallbacks 的不拦。 */
   reject_refusals: boolean
   /** 本地拒绝上游回过 200 却零输出的请求类（403）。 */
   reject_empty_replies: boolean

@@ -126,15 +126,34 @@ pub struct ModelDenial {
 /// - `kind = "deprecated"`：某模型已废弃某字段（`temperature`），命中转发前剥掉，`value` 为空串；
 /// - `kind = "empty_reply"`：某模型对「无 tools 的单条消息 + 这个 `max_tokens`」回过 200 却零
 ///   输出（`field = "max_tokens"`，`value` 是那个数），同类请求命中本地拒，`message` 是当时
-///   截下的上游回复开头，见 `crate::proxy::known_empty_reply`。
+///   截下的上游回复开头，见 `crate::proxy::known_empty_reply`；
+/// - `kind = "refusal"`：上游分类器拒答过某条提示词（`field = "prompt_sha"`，`value` 是提示词
+///   哈希），逐字相同的重发命中时**原样回放上游那次的响应**（[`Self::reply`]：200 + 同一段体），
+///   `message` 是「[类别] stop_details=…」的判决文案，控制台与日志看，见
+///   `crate::proxy::known_refused_prompt`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnedRejection {
     pub kind: String,
     pub model: String,
     pub field: String,
     pub value: String,
-    /// 上游原话，日志与本地拒绝回放用。
+    /// 上游原话，日志与控制台列表用。
     pub message: String,
+    /// 上游那次的**完整响应体**，命中时原样回放；只有拒答那类有，其余为 `None`。
+    pub reply: Option<LearnedReply>,
+}
+
+/// 学到规则时上游那次回复的原样响应体（拒答那类专用），见 [`LearnedRejection::reply`]。
+///
+/// 存的是**上游发来的字节**：来访要流式时上游回的是 SSE（`sse = true`），要非流式时是整段
+/// JSON；回放时按来访这次要的形态给——形态一致原样发，不一致才在两种形态间转换。状态码不存：
+/// 拒答恒是 200（`stop_reason: "refusal"` 裹在正常 Message 里），非 200 的响应根本学不进来。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearnedReply {
+    /// 体是 SSE 事件流（`text/event-stream`）还是整段 JSON。
+    pub sse: bool,
+    /// 响应体原文（UTF-8）。
+    pub body: String,
 }
 
 /// 学到的规则落库后最多活多久（秒）：7 天。
@@ -2031,11 +2050,20 @@ impl CredentialStore {
         }
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "INSERT OR IGNORE INTO learned_rejections (kind, model, field, value, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO learned_rejections (kind, model, field, value, message, reply_sse, reply_body) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for r in rows {
             let message: String = r.message.chars().take(500).collect();
-            stmt.execute(params![r.kind, r.model, r.field, r.value, message])?;
+            // 回放体不截：拒答的体本来就只有几百字节到几 KB，学的那头已按上限把过大的挡掉了
+            // （`proxy::UsageSniffer::refusal_reply`），截一刀等于回放一段残缺的 SSE。
+            let (reply_sse, reply_body) = match &r.reply {
+                Some(reply) => (reply.sse as i64, reply.body.as_str()),
+                None => (0, ""),
+            };
+            stmt.execute(params![
+                r.kind, r.model, r.field, r.value, message, reply_sse, reply_body
+            ])?;
         }
         Ok(())
     }
@@ -2053,9 +2081,15 @@ impl CredentialStore {
             [LEARNED_REJECTION_TTL_SECS],
         )?;
         let mut stmt = conn.prepare(
-            "SELECT kind, model, field, value, message, learned_at FROM learned_rejections ORDER BY learned_at ASC",
+            "SELECT kind, model, field, value, message, learned_at, reply_sse, reply_body \
+             FROM learned_rejections ORDER BY learned_at ASC",
         )?;
         let rows = stmt.query_map([], |r| {
+            // 空体即「没有」：这两列是 0.3.98 补的，之前学的行读出来就是默认值。
+            let reply_sse: i64 = r.get(6)?;
+            let reply_body: String = r.get(7)?;
+            let reply = (!reply_body.is_empty())
+                .then_some(LearnedReply { sse: reply_sse != 0, body: reply_body });
             Ok((
                 LearnedRejection {
                     kind: r.get(0)?,
@@ -2063,6 +2097,7 @@ impl CredentialStore {
                     field: r.get(2)?,
                     value: r.get(3)?,
                     message: r.get(4)?,
+                    reply,
                 },
                 r.get::<_, i64>(5)?,
             ))
@@ -2821,8 +2856,10 @@ pub struct ForwardFlags {
     /// [`Self::reject_empty_replies`]）：三件事的依据、误伤面、该不该开都不一样，共用一个键
     /// 就没法单独关一件。默认开。
     pub reject_probes: bool,
-    /// 是否本地 403 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
-    /// 见 `proxy::known_refused_prompt`）。拒答是内容分类器给那一条提示词的确定性判决
+    /// 是否本地拦下 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
+    /// 见 `proxy::known_refused_prompt`）——拦下时**原样回放上游那次的响应**（200 + 同一段
+    /// `stop_reason: "refusal"` 的体，见 [`LearnedReply`]），不是 luban 自己造一条 403：客户端
+    /// 看到的与上游亲自拒一次完全一样。拒答是内容分类器给那一条提示词的确定性判决
     /// （`stop_details.category` 非空），换个号、换个形态重发结果一样，本地拦下省一次白跑。
     /// **只挡出站不带 `fallbacks` 的请求**：客户端自带、或 luban 按族开关补上 fallback 的请求，
     /// 上游会换模型重跑，那正是拒答该走的路，本地拦下反而让它永远走不到。规则随其他学到的
@@ -4533,8 +4570,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (cred_id, model)
         ) STRICT;
 
-        -- 从上游 400 学到的规则（形态拒绝 / 已废弃字段），见 CredentialStore::remember_rejections。
-        -- 只为重启回填；进程内仍以 HashMap 为准。learned_at 用来做 7 天保鲜。
+        -- 从上游响应学到的规则（形态拒绝 / 已废弃字段 / 零输出请求类 / 拒答过的提示词），见
+        -- CredentialStore::remember_rejections。只为重启回填；进程内仍以 HashMap 为准。
+        -- learned_at 用来做 7 天保鲜。reply_sse / reply_body 是拒答那类要原样回放的上游响应体
+        -- （0.3.98 补列，见 LearnedReply）。
         CREATE TABLE IF NOT EXISTS learned_rejections (
             kind       TEXT    NOT NULL,
             model      TEXT    NOT NULL,
@@ -4542,10 +4581,17 @@ fn init_schema(conn: &Connection) -> Result<()> {
             value      TEXT    NOT NULL DEFAULT '',
             message    TEXT    NOT NULL DEFAULT '',
             learned_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            reply_sse  INTEGER NOT NULL DEFAULT 0,
+            reply_body TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (kind, model, field, value)
         ) STRICT;",
     )
     .context("failed to initialize credential database schema")?;
+
+    // 兼容 0.3.98 之前建的 learned_rejections：补拒答回放体两列（已存在则忽略 duplicate column）。
+    for col in ["reply_sse INTEGER NOT NULL DEFAULT 0", "reply_body TEXT NOT NULL DEFAULT ''"] {
+        let _ = conn.execute(&format!("ALTER TABLE learned_rejections ADD COLUMN {col}"), []);
+    }
 
     // 准入记录只该挂在高档套餐专属的模型上（见 `crate::proxy::LimitScope::Unsupported`）。
     // 0.3.65 曾把 sonnet-4-6 这种基础模型也记进去（同形态的 429 现在只做短冷却 + 换号，见
@@ -6980,6 +7026,7 @@ mod tests {
             field: field.into(),
             value: value.into(),
             message: "msg".into(),
+            reply: None,
         };
         let rows = vec![
             row("shape", "claude-opus-5", "effort", "xhigh"),
@@ -6993,6 +7040,27 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[1], rows[0]);
         assert_eq!(got[0], rows[1]);
+        // 拒答那类带上游响应体：两列原样往返，体不截（message 仍截 500 字）。
+        let long_body =
+            format!("event: message_start\ndata: {{\"pad\":\"{}\"}}\n\n", "x".repeat(4000));
+        let refusal = LearnedRejection {
+            kind: "refusal".into(),
+            model: "claude-opus-5".into(),
+            field: "prompt_sha".into(),
+            value: "deadbeef".into(),
+            message: "m".repeat(600),
+            reply: Some(LearnedReply { sse: true, body: long_body.clone() }),
+        };
+        store.remember_rejections(&[refusal]).unwrap();
+        let back = store
+            .learned_rejections()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "refusal")
+            .expect("拒答行落库");
+        assert_eq!(back.message.chars().count(), 500);
+        assert_eq!(back.reply, Some(LearnedReply { sse: true, body: long_body }));
+        assert!(store.forget_learned_rejection(&back).unwrap());
 
         // 人为把一条改成 8 天前学到的：读取时被当过期清掉。
         store

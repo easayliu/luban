@@ -717,10 +717,13 @@ async fn handle_inner(
     }
 
     // 2.3a4) 上游分类器拒答过的提示词（同一模型、system + messages + tools + tool_choice 逐字
-    //        相同）→ 本地 403，不再送。学进来的只有带 `stop_details.category` 的分类器判决（见
-    //        [`UsageSniffer::classifier_refusal`]），那是确定性的：换个号、换个形态重发结果
-    //        一样；见 [`known_refused_prompt`]。自己的开关 `reject_refusals`（0.3.93 之前借用
-    //        `reject_probes`，关探针就把这条一起放行了）。
+    //        相同）→ **原样回放上游那次的响应**（200 + 同一段 `stop_reason: "refusal"` 的体，
+    //        见 [`replay_refusal`]），不再送。不是 luban 自己造一条 403：客户端看到的与上游
+    //        亲自再拒一次完全一样（0.3.98 之前回的是 403 permission_error，客户端按错误
+    //        处理、看不到 stop_details）。学进来的只有带 `stop_details.category` 的分类器判决
+    //        （见 [`UsageSniffer::classifier_refusal`]），那是确定性的：换个号、换个形态重发
+    //        结果一样；见 [`known_refused_prompt`]。自己的开关 `reject_refusals`（0.3.93 之前
+    //        借用 `reject_probes`，关探针就把这条一起放行了）。
     //
     //        **出站会带 `fallbacks` 的不拦**（客户端自带的，或 luban 按族开关要补的，见
     //        [`outbound_carries_fallbacks`]）：带 fallback 的请求上游拒答后会换模型重跑，那正是
@@ -735,31 +738,37 @@ async fn handle_inner(
             &inbound_beta_list(&headers),
             &state.deprecated_fields,
         )
-        && let Some(excerpt) =
+        && let Some(refused) =
             known_refused_prompt(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
     {
         let model = req_model.as_deref().unwrap_or("-");
         let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
-        if let Some(suppressed) =
-            take_rejection_log_slot(&state.rejection_log, &format!("refusal:{model}:{who}"))
-        {
-            let device_short: String = who.chars().take(8).collect();
-            tracing::warn!(
+        let device_short: String = who.chars().take(8).collect();
+        let wants_stream = body_json.as_ref().is_some_and(stream_requested);
+        match replay_refusal(&refused.reply, wants_stream) {
+            Some(resp) => {
+                if let Some(suppressed) =
+                    take_rejection_log_slot(&state.rejection_log, &format!("refusal:{model}:{who}"))
+                {
+                    tracing::warn!(
+                        %method, path = %path_and_query, ua = %client_ua,
+                        %model, device = %device_short, suppressed,
+                        stream = wants_stream, replay_sse = refused.reply.sse,
+                        verdict = %refused.verdict.chars().take(300).collect::<String>(),
+                        "not forwarded: upstream has already refused this exact prompt; replaying upstream's refusal (200 + the same body) locally"
+                    );
+                }
+                return resp;
+            }
+            // 学到的体按这次要的形态拼不出来（理论上不会：学的时候要求流完整收尾）——
+            // 照常送上游，宁可多送一条，不回一段残缺的响应。
+            None => tracing::warn!(
                 %method, path = %path_and_query, ua = %client_ua,
-                %model, device = %device_short, suppressed,
-                "rejected locally: upstream has already refused this exact prompt"
-            );
-        }
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            format!(
-                "not forwarded: upstream's safety classifier has already refused this exact \
-                 prompt (model {model}, stop_reason refusal); an identical resend gets the same \
-                 verdict. Change the prompt or the model to send it. Upstream verdict: {}",
-                excerpt.chars().take(300).collect::<String>()
+                %model, device = %device_short,
+                stream = wants_stream, replay_sse = refused.reply.sse,
+                "the recorded upstream refusal could not be replayed in the shape this request asked for; forwarding upstream"
             ),
-        );
+        }
     }
 
     // 2.3a5) 上游对这一类请求（模型 + 无 tools 单条消息 + 这个 max_tokens）回过 200 却零输出
@@ -3814,12 +3823,28 @@ impl ReqLog {
         // 拒答只学分类器判决（category 非空且没有 recommended_model）；模型自拒带采样，
         // 原样重发可能就答了；带 recommended_model 说明 fallback 没跑成，直接重试可能就成。
         let verdict = self.sniffer.classifier_refusal().map(str::to_string);
+        // 拒答要学还得有上游那次的原样响应体（命中时回放的就是它）：体太大、流到一半才被掐
+        // 的都没有，见 [`UsageSniffer::refusal_reply`]。
+        let reply = if refused && verdict.is_some() { self.sniffer.refusal_reply() } else { None };
         let learn = if !refused {
             if self.empty_reply_key.is_some() { "request_class" } else { "none" }
         } else if verdict.is_some() {
-            if self.prompt_key.is_some() { "prompt" } else { "none" }
+            if self.prompt_key.is_some() && reply.is_some() { "prompt" } else { "none" }
         } else {
             "none"
+        };
+        let reply_note = match (&reply, refused && verdict.is_some()) {
+            (Some(r), _) => {
+                if r.sse {
+                    "kept_sse"
+                } else {
+                    "kept_json"
+                }
+            }
+            (None, true) if self.sniffer.saw_output_block => "mid_stream",
+            (None, true) if self.sniffer.reply_overflow => "too_large",
+            (None, true) => "missing",
+            (None, false) => "-",
         };
         tracing::warn!(
             cred_id = self.cred_id, cred = %self.cred_label,
@@ -3834,7 +3859,8 @@ impl ReqLog {
             response = %excerpt.chars().take(500).collect::<String>(),
             kind = if refused { "refusal" } else { "empty_reply" },
             learn,
-            "upstream returned 200 without an answer; the reply is kept on the usage log. learn=prompt: this exact prompt is rejected locally from now on (classifier verdict); learn=request_class: this model + request class is; learn=none: nothing learned, a resend may succeed"
+            reply = reply_note,
+            "upstream returned 200 without an answer; the reply is kept on the usage log. learn=prompt: an identical resend of this exact prompt gets this upstream refusal replayed locally from now on (classifier verdict; reply=kept_*); learn=request_class: this model + request class is rejected locally; learn=none: nothing learned, a resend goes upstream (reply=mid_stream / too_large: the refusal came after output or the body was too big to replay)"
         );
         self.forensics.response_excerpt = (!excerpt.is_empty()).then(|| excerpt.clone());
         let tags = self.forensics.rewrites.get_or_insert_with(String::new);
@@ -3843,17 +3869,17 @@ impl ReqLog {
         }
         tags.push_str(if refused { REWRITE_REFUSAL } else { REWRITE_EMPTY_REPLY });
         let learned = if refused {
-            verdict.and_then(|category| {
-                // 规则文案 = 「[类别] stop_details=<原样 JSON>」：设置页与 403 文案一眼看出是
+            verdict.zip(reply).and_then(|(category, reply)| {
+                // 规则文案 = 「[类别] stop_details=<原样 JSON>」：设置页与日志一眼看出是
                 // 哪类判决、上游给了什么解释。取 stop_details 而不是响应体开头——开头是
                 // usage 样板，判决在流末尾；有 verdict 就一定解析到过 stop_details 对象，
-                // 退回 excerpt 只是防御。
+                // 退回 excerpt 只是防御。回给客户端的不是这段文案，是 `reply` 里上游的原样体。
                 let message = match &self.sniffer.refusal_details {
                     Some(details) => format!("[{category}] stop_details={details}"),
                     None => format!("[{category}] {excerpt}"),
                 };
                 self.prompt_key.take().and_then(|(model, digest)| {
-                    remember_refused_prompt(&self.empty_replies, &model, &digest, &message)
+                    remember_refused_prompt(&self.empty_replies, &model, &digest, &message, reply)
                 })
             })
         } else {
@@ -4230,6 +4256,11 @@ struct UsageSniffer {
     /// `content` 的空 Message、`stop_reason: "refusal"`、还是别的形状。留下开头这一小段
     /// 就够回答这个问题，代价是每条请求多拷几 KB。
     head: Vec<u8>,
+    /// 响应体**原样全文**，供学到拒答时原样回放（[`Self::refusal_reply`]）。只在还没见到任何
+    /// 输出内容块、且没超过 [`REFUSAL_REPLY_BYTES`] 时攒：正常回复几 KB 内就到第一个
+    /// `content_block_start`，此后不再拷；超上限的清空并标 `reply_overflow`，这条不学。
+    reply: Vec<u8>,
+    reply_overflow: bool,
 }
 
 /// [`UsageSniffer::head`] 最多留多少字节。零输出的回复本身只有几百字节；8 KiB 连流式的
@@ -4261,6 +4292,14 @@ impl UsageSniffer {
         if self.head.len() < RESPONSE_EXCERPT_BYTES {
             let room = RESPONSE_EXCERPT_BYTES - self.head.len();
             self.head.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        if !self.reply_overflow && !self.saw_output_block {
+            if self.reply.len() + chunk.len() > REFUSAL_REPLY_BYTES {
+                self.reply = Vec::new();
+                self.reply_overflow = true;
+            } else {
+                self.reply.extend_from_slice(chunk);
+            }
         }
         if self.is_stream {
             self.buf.extend_from_slice(chunk);
@@ -4512,6 +4551,19 @@ impl UsageSniffer {
             Err(e) => String::from_utf8_lossy(&self.head[..e.valid_up_to()]).into_owned(),
         };
         Some(text)
+    }
+
+    /// 上游这次响应的原样全文，学拒答时连同判决一起记下、之后原样回放（[`replay_refusal`]）。
+    ///
+    /// `None` 的几种情形都不学这条拒答：体超过 [`REFUSAL_REPLY_BYTES`]；回复里已经出现过输出
+    /// 内容块（流到一半才被掐的——分类器看的是采样出来的正文，不是对提示词的确定性判决，
+    /// 把半截答案当固定回复回放也不对）；体不是 UTF-8；一个字节都没收到。
+    fn refusal_reply(&self) -> Option<store::LearnedReply> {
+        if self.reply_overflow || self.saw_output_block || self.reply.is_empty() {
+            return None;
+        }
+        let body = String::from_utf8(self.reply.clone()).ok()?;
+        Some(store::LearnedReply { sse: self.is_stream, body })
     }
 
     /// 上游以 `stop_reason: "refusal"` 收尾——分类器或模型自己拒了这条提示词（`stop_details`
@@ -7509,10 +7561,12 @@ pub struct SeededMemories {
     pub deprecated: usize,
     pub empty_reply: usize,
     pub refusal: usize,
-    /// v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
-    /// 拒答的内容把同形态的所有正常请求一起拦掉。这类行按新逻辑不该存在：不回填，交给
-    /// 调用方从库里删掉，免得下次启动再撞一遍。判据是 `message`（当时截的上游回复）里带
-    /// `"stop_reason":"refusal"`（去空白比）。
+    /// 按新逻辑不该存在的旧行：不回填，交给调用方从库里删掉，免得下次启动再撞一遍。两种：
+    /// - v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
+    ///   拒答的内容把同形态的所有正常请求一起拦掉。判据是 `message`（当时截的上游回复）里带
+    ///   `"stop_reason":"refusal"`（去空白比）；
+    /// - 0.3.98 之前学的拒答规则没存上游那次的响应体（[`store::LearnedRejection::reply`]），
+    ///   命中回的是 luban 自己造的 403；现在要原样回放上游的响应，没有体的删掉重学。
     pub stale: Vec<store::LearnedRejection>,
 }
 
@@ -7606,7 +7660,16 @@ fn seed_tables(
                 if r.field != REFUSAL_FIELD {
                     continue;
                 }
-                empty_table.prompts.entry((r.model, r.value)).or_insert(r.message);
+                // 没带上游响应体的是 0.3.98 之前学的：那版命中回的是 luban 自己造的 403，
+                // 现在要原样回放上游那次的响应，没有体就回放不出来——当过期删掉、下次重学。
+                let Some(reply) = r.reply else {
+                    out.stale.push(store::LearnedRejection { reply: None, ..r });
+                    continue;
+                };
+                empty_table
+                    .prompts
+                    .entry((r.model, r.value))
+                    .or_insert(RefusedPrompt { verdict: r.message, reply });
                 out.refusal += 1;
             }
             _ => {}
@@ -7657,9 +7720,11 @@ const EMPTY_REPLY_FIELD: &str = "max_tokens";
 const REFUSAL_FIELD: &str = "prompt_sha";
 
 /// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」。
-/// 值是本地拒时回给客户端的那段文案：零输出格是当时截下的上游回复开头（信息就在开头——
-/// 一段没有 `content` 的 Message），拒答格是「[类别] stop_details=<原样 JSON>」（判决在流
-/// 末尾，开头截不到）。
+/// 零输出格的值是本地拒时回给客户端的那段文案：当时截下的上游回复开头（信息就在开头——
+/// 一段没有 `content` 的 Message）。拒答格的值是 [`RefusedPrompt`]：判决文案「[类别]
+/// stop_details=<原样 JSON>」（判决在流末尾，开头截不到）给日志与控制台看，外加上游那次的
+/// **完整响应体**——命中时不是 luban 自己造一条 403，而是把上游那次的 200 + 体原样回放给
+/// 客户端，见 [`replay_refusal`]。
 ///
 /// 拒答格**不分凭证**：分类器判决对同一条提示词是确定性的，换个号重发结果一样（这个池子里
 /// 的号都是订阅端账号，不涉及官方按 organization 审批的网络安全验证计划），一张号上学到的
@@ -7673,7 +7738,19 @@ const REFUSAL_FIELD: &str = "prompt_sha";
 #[derive(Default)]
 pub struct EmptyReplyRejections {
     classes: std::collections::HashMap<(String, i64), String>,
-    prompts: std::collections::HashMap<(String, String), String>,
+    prompts: std::collections::HashMap<(String, String), RefusedPrompt>,
+}
+
+/// 拒答格里的一条：上游对这条提示词的判决文案，与当时那次响应的原样体。
+///
+/// 没有 `reply` 的拒答**不进表**（0.3.98 之前学的行回填时按过期删掉、重学）：这一格的用途
+/// 就是原样回放，回放不出来就不该拦。
+#[derive(Debug, Clone, PartialEq)]
+struct RefusedPrompt {
+    /// 「[类别] stop_details=<原样 JSON>」，见 [`ReqLog::note_unanswered_reply`]。
+    verdict: String,
+    /// 上游那次的响应体与形态，见 [`store::LearnedReply`]。
+    reply: store::LearnedReply,
 }
 
 /// [`EmptyReplyRejections`] 的共享句柄。与 [`ShapeMemory`] 同一套持久化：写穿到
@@ -7702,12 +7779,13 @@ fn prompt_digest(body: &serde_json::Value) -> Option<String> {
 }
 
 /// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` + `tools` +
-/// `tool_choice` 逐字相同）；是则给出当时记下的判决文案（`[类别] stop_details=…`）。
+/// `tool_choice` 逐字相同）；是则给出当时记下的判决文案（`[类别] stop_details=…`）与上游那次
+/// 的原样响应体（[`RefusedPrompt`]）。
 fn known_refused_prompt(
     mem: &EmptyReplyMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
-) -> Option<String> {
+) -> Option<RefusedPrompt> {
     let model = model?;
     let table = mem.read();
     if table.prompts.is_empty() {
@@ -7717,24 +7795,27 @@ fn known_refused_prompt(
     table.prompts.get(&(model.to_string(), digest)).cloned()
 }
 
-/// 上游拒答了这条提示词 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
-/// 不重复），调用方拿去落库。不设上限，见 [`EmptyReplyRejections`]。
+/// 上游拒答了这条提示词 → 连同上游那次的原样响应体记进 [`EmptyReplyMemory`]。返回**这次
+/// 新学到**的那条（已有的不重复），调用方拿去落库。不设上限，见 [`EmptyReplyRejections`]。
 fn remember_refused_prompt(
     mem: &EmptyReplyMemory,
     model: &str,
     digest: &str,
     excerpt: &str,
+    reply: store::LearnedReply,
 ) -> Option<store::LearnedRejection> {
     let mut table = mem.write();
     let key = (model.to_string(), digest.to_string());
     if table.prompts.contains_key(&key) {
         return None;
     }
-    table.prompts.insert(key, excerpt.to_string());
+    table.prompts.insert(key, RefusedPrompt { verdict: excerpt.to_string(), reply: reply.clone() });
     tracing::info!(
         model = %model,
         prompt_sha = %digest,
-        "learned a refused prompt; the same prompt will be rejected locally from now on"
+        reply_sse = reply.sse,
+        reply_bytes = reply.body.len(),
+        "learned a refused prompt; an identical resend will get upstream's refusal replayed locally from now on"
     );
     Some(store::LearnedRejection {
         kind: LEARNED_KIND_REFUSAL.into(),
@@ -7742,7 +7823,135 @@ fn remember_refused_prompt(
         field: REFUSAL_FIELD.into(),
         value: digest.to_string(),
         message: excerpt.to_string(),
+        reply: Some(reply),
     })
+}
+
+/// [`UsageSniffer::reply`] 最多留多少字节，超过就不学这条拒答。输出前被拒的体只有几百字节到
+/// 几 KB（流式是 `message_start` + 若干 `ping` + `message_delta` + `message_stop`）；64 KiB
+/// 是给 `stop_details.explanation` 与偶发的长 usage 留的余量，正常回复早在几 KB 内就见到
+/// 第一个内容块、停止攒了。
+const REFUSAL_REPLY_BYTES: usize = 64 * 1024;
+
+/// SSE 响应的 `content-type`，与上游一致。
+const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
+
+/// 把上游那次的拒答按**这次来访要的形态**回放：200 + 上游的体。
+///
+/// 形态一致（学的时候是 SSE、这次也要流式；或都是非流式）原样发字节；不一致才转换：SSE →
+/// 整段 JSON 走 [`SseAggregator`]（与来访非流式、上游 SSE 时的聚合路径同一套），整段 JSON →
+/// SSE 走 [`message_to_sse`]。转不出来（学到的体残缺、解析失败）返回 `None`，调用方照常转发
+/// 上游——宁可多送一条，不回一段拼不齐的响应。
+fn replay_refusal(reply: &store::LearnedReply, wants_stream: bool) -> Option<Response> {
+    let (content_type, body): (&str, Vec<u8>) = match (reply.sse, wants_stream) {
+        (true, true) => (SSE_CONTENT_TYPE, reply.body.clone().into_bytes()),
+        (false, false) => ("application/json", reply.body.clone().into_bytes()),
+        (true, false) => {
+            let mut agg = SseAggregator::default();
+            agg.feed(reply.body.as_bytes());
+            match agg.finish() {
+                Aggregated::Message(msg) => ("application/json", serde_json::to_vec(&msg).ok()?),
+                Aggregated::UpstreamError(_) | Aggregated::Incomplete(_) => return None,
+            }
+        }
+        (false, true) => {
+            let msg: serde_json::Value = serde_json::from_str(&reply.body).ok()?;
+            (SSE_CONTENT_TYPE, message_to_sse(&msg)?.into_bytes())
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .ok()
+}
+
+/// 把一条整段 Message 展成 `/v1/messages` 的 SSE 事件流（[`SseAggregator`] 的逆操作）：
+/// `message_start`（骨架，`content` 清空、停止字段置空）→ 每个内容块的
+/// `content_block_start` / 一条整块的 `content_block_delta` / `content_block_stop` →
+/// `message_delta`（`stop_reason` / `stop_sequence` / `stop_details` + `usage`）→ `message_stop`。
+///
+/// 只用于回放学到的拒答，而学进来的都是**输出前**被拒的（`content` 为空），块那一段基本走
+/// 不到；仍按官方 delta 种类写全（text / thinking / tool_use 入参），不认识的块类型整块放在
+/// `content_block_start` 里——与聚合器「未知块原样收下」对称。不是对象、没有 `content` 数组的
+/// 返回 `None`。
+fn message_to_sse(msg: &serde_json::Value) -> Option<String> {
+    use serde_json::{Value, json};
+    let obj = msg.as_object()?;
+    let content = obj.get("content")?.as_array()?;
+    let mut out = String::new();
+    let mut event = |name: &str, data: Value| {
+        out.push_str("event: ");
+        out.push_str(name);
+        out.push_str("\ndata: ");
+        out.push_str(&data.to_string());
+        out.push_str("\n\n");
+    };
+    let mut skeleton = obj.clone();
+    skeleton.insert("content".into(), json!([]));
+    for k in ["stop_reason", "stop_sequence", "stop_details"] {
+        if skeleton.contains_key(k) {
+            skeleton.insert(k.into(), Value::Null);
+        }
+    }
+    event("message_start", json!({"type": "message_start", "message": Value::Object(skeleton)}));
+    for (index, block) in content.iter().enumerate() {
+        let Some(b) = block.as_object() else { continue };
+        let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let mut start = b.clone();
+        let mut deltas: Vec<Value> = Vec::new();
+        match ty {
+            "text" => {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    start.insert("text".into(), json!(""));
+                    deltas.push(json!({"type": "text_delta", "text": t}));
+                }
+            }
+            "thinking" => {
+                if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                    start.insert("thinking".into(), json!(""));
+                    deltas.push(json!({"type": "thinking_delta", "thinking": t}));
+                }
+                if let Some(sig) = b.get("signature").and_then(|t| t.as_str()) {
+                    start.insert("signature".into(), json!(""));
+                    deltas.push(json!({"type": "signature_delta", "signature": sig}));
+                }
+            }
+            "tool_use" | "server_tool_use" | "mcp_tool_use" => {
+                if let Some(input) = b.get("input") {
+                    start.insert("input".into(), json!({}));
+                    deltas.push(
+                        json!({"type": "input_json_delta", "partial_json": input.to_string()}),
+                    );
+                }
+            }
+            _ => {}
+        }
+        event(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": index, "content_block": Value::Object(start)}),
+        );
+        for delta in deltas {
+            event(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": index, "delta": delta}),
+            );
+        }
+        event("content_block_stop", json!({"type": "content_block_stop", "index": index}));
+    }
+    let mut delta = serde_json::Map::new();
+    for k in ["stop_reason", "stop_sequence", "stop_details"] {
+        if let Some(v) = obj.get(k) {
+            delta.insert(k.into(), v.clone());
+        }
+    }
+    let usage = obj.get("usage").cloned().unwrap_or(Value::Null);
+    event(
+        "message_delta",
+        json!({"type": "message_delta", "delta": Value::Object(delta), "usage": usage}),
+    );
+    event("message_stop", json!({"type": "message_stop"}));
+    Some(out)
 }
 
 /// 落库行的 `(field, value)` 能否对回一个类键：`field` 必须是 `max_tokens`、`value` 是整数。
@@ -7811,6 +8020,7 @@ fn remember_empty_reply(
         field: EMPTY_REPLY_FIELD.into(),
         value: max_tokens.to_string(),
         message: excerpt.to_string(),
+        reply: None,
     })
 }
 
@@ -8064,6 +8274,7 @@ fn remember_shape_rejection(
                 field: probe.field.to_string(),
                 value: value.clone(),
                 message: message.clone(),
+                reply: None,
             });
             tracing::info!(
                 model = %model,
@@ -8117,6 +8328,7 @@ fn remember_deprecated_field(
             field: field.to_string(),
             value: String::new(),
             message: message.clone(),
+            reply: None,
         });
         tracing::info!(
             model = %model,
@@ -9600,6 +9812,7 @@ fn remember_fallback_rejection(
         field: FALLBACKS_FIELD.into(),
         value: String::new(),
         message,
+        reply: None,
     })
 }
 
@@ -12803,6 +13016,14 @@ mod tests {
         shape_summary, store, strip_extra_fields, uuid_v4,
     };
 
+    /// 测试用：一段上游拒答的整段 JSON 响应体（非流式），当作学规则时记下的回放体。
+    fn json_reply() -> store::LearnedReply {
+        store::LearnedReply {
+            sse: false,
+            body: r#"{"id":"msg_r","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"blocked"},"usage":{"input_tokens":12,"output_tokens":0}}"#.into(),
+        }
+    }
+
     /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
     /// ——那条路径的请求体没有 `metadata` 可带，卡它等于把客户端的 token 预估打死。
     ///
@@ -15584,6 +15805,7 @@ mod tests {
             field: "no_such_probe".into(),
             value: "v".into(),
             message: String::new(),
+            reply: None,
         });
         rows.push(store::LearnedRejection {
             kind: "deprecated".into(),
@@ -15591,6 +15813,7 @@ mod tests {
             field: "model".into(),
             value: String::new(),
             message: String::new(),
+            reply: None,
         });
         // 零输出那类：一条正常的，一条 value 不是整数的脏行。
         let ping = serde_json::json!({
@@ -15620,6 +15843,7 @@ mod tests {
             field: "max_tokens".into(),
             value: "sixteen".into(),
             message: String::new(),
+            reply: None,
         });
         // 拒答那类：一条正常的；再加一条 v0.3.89 学错的（拒答被记成了请求类）——不回填、报成过期。
         let refused = super::remember_refused_prompt(
@@ -15627,6 +15851,7 @@ mod tests {
             "claude-opus-5",
             "deadbeef",
             r#"{"stop_reason":"refusal"}"#,
+            json_reply(),
         )
         .expect("首次学到");
         assert_eq!(
@@ -15642,8 +15867,19 @@ mod tests {
             message:
                 r#"{"content":[],"stop_reason":"refusal","stop_details":{"category":"cyber"}}"#
                     .into(),
+            reply: None,
         };
         rows.push(stale.clone());
+        // 0.3.98 之前学的拒答规则：没存上游响应体，回放不出来——同样不回填、报成过期。
+        let legacy_refusal = store::LearnedRejection {
+            kind: "refusal".into(),
+            model: "claude-opus-5".into(),
+            field: "prompt_sha".into(),
+            value: "0ld".into(),
+            message: "[cyber] stop_details={}".into(),
+            reply: None,
+        };
+        rows.push(legacy_refusal.clone());
         let shape2 = super::ShapeMemory::default();
         let dep2 = super::DeprecatedFieldMemory::default();
         let empty2 = super::EmptyReplyMemory::default();
@@ -15654,7 +15890,7 @@ mod tests {
                 deprecated: 1,
                 empty_reply: 1,
                 refusal: 1,
-                stale: vec![stale]
+                stale: vec![stale, legacy_refusal]
             }
         );
         let opus_ping = serde_json::json!({
@@ -15669,12 +15905,12 @@ mod tests {
             "model": "claude-opus-5", "messages": [{"role": "user", "content": "x"}]
         });
         let digest = super::prompt_digest(&refused_body).unwrap();
-        super::remember_refused_prompt(&empty2, "claude-opus-5", &digest, "{}").unwrap();
-        assert_eq!(
-            super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&refused_body))
-                .as_deref(),
-            Some("{}")
-        );
+        super::remember_refused_prompt(&empty2, "claude-opus-5", &digest, "{}", json_reply())
+            .unwrap();
+        let hit = super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&refused_body))
+            .expect("逐字相同的提示词命中");
+        assert_eq!(hit.verdict, "{}");
+        assert_eq!(hit.reply, json_reply(), "命中时拿到的是学规则时上游那次的原样体");
         // 提示词改一个字、或换个模型：不命中。
         let other_body = serde_json::json!({
             "model": "claude-opus-5", "messages": [{"role": "user", "content": "y"}]
@@ -15698,6 +15934,7 @@ mod tests {
             field: "prompt_sha".into(),
             value: digest,
             message: String::new(),
+            reply: None,
         };
         assert!(super::forget_learned_memory(&shape2, &dep2, &empty2, &refusal_row));
         assert!(
@@ -15715,6 +15952,7 @@ mod tests {
             field: "max_tokens".into(),
             value: "16".into(),
             message: String::new(),
+            reply: None,
         };
         assert!(super::forget_learned_memory(&shape2, &dep2, &empty2, &row));
         assert!(!super::forget_learned_memory(&shape2, &dep2, &empty2, &row));
@@ -15734,6 +15972,150 @@ mod tests {
         );
     }
 
+    /// 学到拒答时上游那次的原样体（SSE 或整段 JSON），按来访这次要的形态回放：形态一致逐字节
+    /// 原样，不一致才在两种形态间转换，而且转换是可逆的——JSON 展成的 SSE 再聚合回来是同一条
+    /// Message；残缺的 SSE 拼不出整段 JSON 时不回放（`None`，调用方照常转发）。
+    #[tokio::test]
+    async fn replays_the_recorded_refusal_in_the_shape_the_request_asks_for() {
+        async fn parts(resp: super::Response) -> (StatusCode, axum::http::HeaderMap, String) {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+            (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+        const SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null,\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":\"blocked\"}},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let sse = store::LearnedReply { sse: true, body: SSE.into() };
+        let json = json_reply();
+
+        // 形态一致：状态 200、content-type 跟形态走、体逐字节原样。
+        let (status, headers, body) =
+            parts(super::replay_refusal(&sse, true).expect("SSE → 流式")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), super::SSE_CONTENT_TYPE);
+        assert_eq!(body, SSE);
+        let (status, headers, body) =
+            parts(super::replay_refusal(&json, false).expect("JSON → 非流式")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(body, json.body);
+
+        // SSE 学的、这次要非流式：聚合成整段 Message，判决字段都在。
+        let (status, headers, body) =
+            parts(super::replay_refusal(&sse, false).expect("SSE → 非流式")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["id"], "msg_s");
+        assert_eq!(msg["stop_reason"], "refusal");
+        assert_eq!(msg["stop_details"]["category"], "cyber");
+        assert_eq!(msg["content"], serde_json::json!([]));
+        assert_eq!(msg["usage"]["input_tokens"], 12);
+        assert_eq!(msg["usage"]["output_tokens"], 0);
+
+        // JSON 学的、这次要流式：展成 SSE，再用聚合器收回来必须是同一条 Message。
+        let (status, headers, body) =
+            parts(super::replay_refusal(&json, true).expect("JSON → 流式")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), super::SSE_CONTENT_TYPE);
+        assert!(
+            body.starts_with("event: message_start\ndata: {\"type\":\"message_start\""),
+            "{body}"
+        );
+        assert!(
+            body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{body}"
+        );
+        let mut agg = super::SseAggregator::default();
+        agg.feed(body.as_bytes());
+        let super::Aggregated::Message(back) = agg.finish() else {
+            panic!("展开的 SSE 应能聚合")
+        };
+        let want: serde_json::Value = serde_json::from_str(&json.body).unwrap();
+        assert_eq!(back, want, "JSON → SSE → JSON 往返无损");
+
+        // 带正文的 Message 也能展开再收回（回放路径学不到这种，但转换本身得是对的）。
+        let rich = serde_json::json!({
+            "id": "msg_c", "type": "message", "role": "assistant", "model": "claude-opus-5",
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "fallback", "from": {"model": "a"}, "to": {"model": "b"}}
+            ],
+            "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let mut agg = super::SseAggregator::default();
+        agg.feed(super::message_to_sse(&rich).unwrap().as_bytes());
+        let super::Aggregated::Message(back) = agg.finish() else { panic!("应能聚合") };
+        assert_eq!(back, rich);
+
+        // 残缺的 SSE（没有 message_stop）拼不出整段 JSON：不回放。
+        let broken = store::LearnedReply {
+            sse: true,
+            body: SSE
+                .trim_end_matches("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .into(),
+        };
+        assert!(super::replay_refusal(&broken, false).is_none());
+        // 形态一致时不看内容，原样发（学的那头保证过流是完整收尾的）。
+        assert!(super::replay_refusal(&broken, true).is_some());
+        // 不是对象 / 没有 content 的 JSON 展不成 SSE。
+        let bogus = store::LearnedReply { sse: false, body: "[]".into() };
+        assert!(super::replay_refusal(&bogus, true).is_none());
+        assert!(super::message_to_sse(&serde_json::json!({"id": "x"})).is_none());
+    }
+
+    /// [`UsageSniffer::refusal_reply`]：原样全文只在「没超上限、没见过输出内容块」时留着；
+    /// 超上限清空不学，见过 `content_block_start`（`fallback` 标记不算）也不学。
+    #[test]
+    fn sniffer_keeps_the_full_reply_only_while_it_is_replayable() {
+        // 正常的小体：原样。
+        let mut st = super::UsageSniffer::new(false, false);
+        st.feed(br#"{"id":"msg_1","content":[],"#);
+        st.feed(br#""stop_reason":"refusal","usage":{"output_tokens":0}}"#);
+        st.finish();
+        assert_eq!(
+            st.refusal_reply(),
+            Some(store::LearnedReply {
+                sse: false,
+                body: r#"{"id":"msg_1","content":[],"stop_reason":"refusal","usage":{"output_tokens":0}}"#.into()
+            })
+        );
+        // 超上限：清空并标记，之后再喂也不攒。
+        let mut st = super::UsageSniffer::new(true, false);
+        st.feed(&vec![b'x'; super::REFUSAL_REPLY_BYTES]);
+        st.feed(b"y");
+        assert!(st.reply_overflow);
+        assert!(st.reply.is_empty());
+        st.feed(b"z");
+        assert!(st.reply.is_empty());
+        assert!(st.refusal_reply().is_none());
+        // 见过输出内容块：不学，且此后不再拷字节（省内存）。
+        let mut st = super::UsageSniffer::new(true, false);
+        st.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":1}}}\n\n");
+        let before = st.reply.len();
+        st.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+        let after = st.reply.len();
+        assert!(after > before, "含首个内容块的那一块还在缓冲里");
+        st.feed(b"event: content_block_delta\ndata: {}\n\n");
+        assert_eq!(st.reply.len(), after, "见过输出块后不再攒");
+        assert!(st.refusal_reply().is_none());
+        // fallback 切换标记不算输出块：照常攒。
+        let mut st = super::UsageSniffer::new(true, false);
+        st.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"a\"},\"to\":{\"model\":\"b\"}}}\n\n");
+        assert!(st.refusal_reply().is_some_and(|r| r.sse));
+        // 一个字节都没收到 / opaque：没有。
+        assert!(super::UsageSniffer::new(true, false).refusal_reply().is_none());
+        let mut st = super::UsageSniffer::new(false, true);
+        st.feed(b"{}");
+        assert!(st.refusal_reply().is_none());
+        // 不是 UTF-8：没有。
+        let mut st = super::UsageSniffer::new(false, false);
+        st.feed(&[0xff, 0xfe, b'{', b'}']);
+        assert!(st.refusal_reply().is_none());
+    }
+
     /// 拒答格不设上限：学到的条数越过 [`SHAPE_MEMORY_CAP`] 照样进表、照样命中（此前套用那个
     /// 上限，实测 2 小时 512 条 `reasoning_extraction` 撞满后新的就学不进了）；重复的不重学。
     /// [`clear_learned_memory_kind`] 只清指定种类、别的表不动，种类名对不上什么都不动。
@@ -15749,7 +16131,8 @@ mod tests {
                     &empty,
                     "claude-opus-5",
                     &format!("{i:016x}"),
-                    "[cyber]"
+                    "[cyber]",
+                    json_reply(),
                 )
                 .is_some(),
                 "第 {i} 条也要学进去"
@@ -15760,7 +16143,8 @@ mod tests {
                 &empty,
                 "claude-opus-5",
                 &format!("{:016x}", 0),
-                "[cyber]"
+                "[cyber]",
+                json_reply(),
             )
             .is_none(),
             "重复的不重学"
@@ -15768,7 +16152,8 @@ mod tests {
         assert_eq!(empty.read().prompts.len(), n);
         let last = serde_json::json!({"messages": [{"role": "user", "content": "x"}]});
         let digest = super::prompt_digest(&last).unwrap();
-        super::remember_refused_prompt(&empty, "claude-opus-5", &digest, "[cyber]").unwrap();
+        super::remember_refused_prompt(&empty, "claude-opus-5", &digest, "[cyber]", json_reply())
+            .unwrap();
         assert!(super::known_refused_prompt(&empty, Some("claude-opus-5"), Some(&last)).is_some());
         // 回填同样不设上限。
         let rows: Vec<store::LearnedRejection> = (0..n)
@@ -15778,6 +16163,7 @@ mod tests {
                 field: "prompt_sha".into(),
                 value: format!("{i:016x}"),
                 message: "[cyber]".into(),
+                reply: Some(json_reply()),
             })
             .collect();
         let seeded = super::resync_learned_memories(&shape, &dep, &empty, rows);
@@ -15836,6 +16222,7 @@ mod tests {
             field: "max_tokens".into(),
             value: "65536".into(),
             message: message.into(),
+            reply: None,
         };
         let rows = vec![
             row(r#"{"content":[],"stop_reason":"refusal"}"#),
@@ -15868,8 +16255,14 @@ mod tests {
         shape.write().insert(("claude-opus-5".into(), probe.field, "v".into()), "m".into());
         dep.write().insert(("claude-opus-5".into(), super::FALLBACKS_FIELD.into()), "m".into());
         super::remember_empty_reply(&empty, "claude-fable-5", 16, "{}").unwrap();
-        let refused =
-            super::remember_refused_prompt(&empty, "claude-opus-5", "deadbeef", "[cyber]").unwrap();
+        let refused = super::remember_refused_prompt(
+            &empty,
+            "claude-opus-5",
+            "deadbeef",
+            "[cyber]",
+            json_reply(),
+        )
+        .unwrap();
         assert_eq!(super::learned_memory_len(&shape, &dep, &empty), 4);
         // 库里只剩拒答那一条（其余三条已过期被删）：重建后内存里也只剩它。
         let seeded = super::resync_learned_memories(&shape, &dep, &empty, vec![refused.clone()]);
@@ -15892,7 +16285,7 @@ mod tests {
                 .read()
                 .prompts
                 .get(&("claude-opus-5".into(), "deadbeef".into()))
-                .map(String::as_str),
+                .map(|p| p.verdict.as_str()),
             Some("[cyber]")
         );
         // 库里空了：内存也空。
@@ -21295,6 +21688,7 @@ mod tests {
                 .prompts
                 .get(&("claude-opus-5".to_string(), "deadbeef".to_string()))
                 .unwrap()
+                .verdict
                 .contains(r#""category":"cyber""#)
         );
         let rows = store.learned_rejections().unwrap();
@@ -21343,21 +21737,41 @@ mod tests {
         // 学到的规则文案 = 「[类别] stop_details=<原样 JSON>」——带上游的解释字段，不带
         // 响应体开头那段 usage 样板；流式的判决在 `message_delta` 里，文案照样取到它而不是
         // `message_start`。
-        let deadbeef = mem
+        let deadbeef_entry = mem
             .read()
             .prompts
             .get(&("claude-opus-5".to_string(), "deadbeef".to_string()))
             .cloned()
             .unwrap();
+        // 回放体 = 上游那次的原样响应（非流式整段 JSON），一个字节不差。
+        assert_eq!(
+            deadbeef_entry.reply,
+            store::LearnedReply { sse: false, body: std::str::from_utf8(refusal).unwrap().into() }
+        );
+        let deadbeef = deadbeef_entry.verdict;
         assert!(deadbeef.starts_with("[cyber] stop_details={"), "{deadbeef}");
         assert!(deadbeef.contains(r#""explanation":"blocked""#), "{deadbeef}");
         assert!(!deadbeef.contains("usage"), "文案不该是响应体开头：{deadbeef}");
-        let cafe = mem
+        let cafe_entry = mem
             .read()
             .prompts
             .get(&("claude-opus-5".to_string(), "cafe".to_string()))
             .cloned()
             .unwrap();
+        // 流式学到的回放体是整条 SSE 原文，形态标 sse。
+        assert!(cafe_entry.reply.sse);
+        assert!(
+            cafe_entry.reply.body.starts_with("event: message_start\n"),
+            "{}",
+            cafe_entry.reply.body
+        );
+        assert!(
+            cafe_entry
+                .reply
+                .body
+                .ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+        );
+        let cafe = cafe_entry.verdict;
         assert!(
             cafe.starts_with(r#"[cyber] stop_details={"type":"refusal","category":"cyber""#),
             "{cafe}"
@@ -21388,10 +21802,23 @@ mod tests {
             "fallback 没跑成的拒答不能锁提示词"
         );
         assert!(!mem.read().classes.contains_key(&("claude-opus-5".to_string(), 65536)));
+        // 10) 分类器判决齐全、但回复里已经有输出内容块（流到一半才被掐）：没有可回放的确定性
+        //     响应——流水照记 refusal 标签，**不学**。
+        log(
+            true,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":37}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            None,
+            Some(("claude-opus-5", "m1d")),
+        );
+        assert!(
+            !mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "m1d".to_string())),
+            "流到一半才被掐的拒答没有可回放的响应，不学"
+        );
         let logs = store.list_usage_logs(10).unwrap();
-        assert_eq!(logs.len(), 9);
+        assert_eq!(logs.len(), 10);
         assert_eq!(logs[0].forensics.rewrites.as_deref(), Some("refusal"));
         assert_eq!(logs[1].forensics.rewrites.as_deref(), Some("refusal"));
+        assert_eq!(logs[2].forensics.rewrites.as_deref(), Some("refusal"));
         assert!(logs[0].forensics.response_excerpt.is_some());
         assert!(logs[1].forensics.response_excerpt.is_some());
         let rows = store.learned_rejections().unwrap();

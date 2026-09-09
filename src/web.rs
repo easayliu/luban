@@ -1396,7 +1396,8 @@ async fn clear_cooldown(
 #[derive(Serialize)]
 struct LearnedRejectionView {
     /// `shape`（命中本地拒）、`deprecated`（命中转发前剥掉字段）、`empty_reply`（上游对这类
-    /// 回过零输出，命中本地拒）或 `refusal`（上游拒答过这条提示词，同一条命中本地拒）。
+    /// 回过零输出，命中本地拒）或 `refusal`（上游拒答过这条提示词，同一条命中时原样回放上游
+    /// 那次的响应，见 [`store::LearnedReply`]）。
     kind: String,
     model: String,
     field: String,
@@ -1437,7 +1438,7 @@ fn drop_stale_learned_rules(store: &CredentialStore, stale: &[store::LearnedReje
         match store.forget_learned_rejection(r) {
             Ok(_) => tracing::warn!(
                 kind = %r.kind, model = %r.model, field = %r.field, value = %r.value,
-                "dropped a stale learned rule: a refusal had been recorded as a request class (v0.3.89); refusals are now keyed by prompt"
+                "dropped a stale learned rule written by an older version: a refusal recorded as a request class (v0.3.89), or a refusal rule without the upstream reply to replay (before 0.3.98); it is relearned on the next hit"
             ),
             Err(e) => tracing::warn!(error = %e, "failed to drop a stale learned rule"),
         }
@@ -1465,6 +1466,7 @@ async fn forget_learned_rejection(
         field: req.field,
         value: req.value,
         message: String::new(),
+        reply: None,
     };
     let in_db = state.store.forget_learned_rejection(&row).map_err(internal)?;
     let in_mem = proxy::forget_learned_memory(
