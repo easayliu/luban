@@ -31,7 +31,7 @@ import {
   type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
-import { extractError, formatFullTime } from '@/lib/utils'
+import { cn, extractError, formatFullTime, relativeTime } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -47,6 +47,7 @@ import {
   DialogPopup,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import {
   NumberField,
@@ -1135,10 +1136,63 @@ function ForwardingToggle({
  * 这些规则是从一条报错里学来的推断，上游放开了本地没有信号能知道；后端给了 7 天保鲜期，
  * 这里是等不及 7 天时的逃生口。删错的代价只是同一组合再撞一次 400。
  */
+/** 规则种类 → 徽章色调、状态点颜色；未知种类退回中性灰。 */
+const RULE_TONES: Record<string, { badge: 'error' | 'info' | 'warning'; dot: string }> = {
+  shape: { badge: 'error', dot: 'bg-destructive' },
+  deprecated: { badge: 'info', dot: 'bg-info' },
+  empty_reply: { badge: 'warning', dot: 'bg-warning' },
+  refusal: { badge: 'error', dot: 'bg-destructive' },
+}
+const RULE_KIND_ORDER = ['refusal', 'empty_reply', 'shape', 'deprecated']
+
+const ruleKey = (row: Pick<LearnedRejection, 'kind' | 'model' | 'field' | 'value'>) =>
+  `${row.kind}:${row.model}:${row.field}:${row.value}`
+
+/** 规则文案开头的「[类别]」拆出来单独当标签显示，剩下的才是上游原话。 */
+function splitRuleMessage(message: string): { tag: string | null; body: string } {
+  const m = /^\[([^\]\n]{1,48})\]\s*/.exec(message)
+  return m ? { tag: m[1], body: message.slice(m[0].length) } : { tag: null, body: message }
+}
+
+function FilterChip({
+  active,
+  count,
+  dot,
+  label,
+  onClick,
+}: {
+  active: boolean
+  count: number
+  dot?: string
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      aria-pressed={active}
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background',
+        active
+          ? 'border-border bg-muted font-medium text-foreground'
+          : 'border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+      )}
+      type="button"
+      onClick={onClick}
+    >
+      {dot && <span aria-hidden="true" className={cn('size-1.5 rounded-full', dot)} />}
+      {label}
+      <span className="tabular-nums opacity-60">{count}</span>
+    </button>
+  )
+}
+
 function LearnedRejections() {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const [confirmClear, setConfirmClear] = useState(false)
+  const [kindFilter, setKindFilter] = useState<string>('all')
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const query = useQuery({ queryKey: ['learned-rejections'], queryFn: listLearnedRejections })
   const failure = (title: string, error: unknown) =>
     toastManager.add({ title, description: extractError(error, language), type: 'error' })
@@ -1176,6 +1230,36 @@ function LearnedRejections() {
             ? t('拒答过的提示词，本地拒绝', 'Refused prompt, rejected locally')
             : kind
 
+  /** 到期还剩多久——比一个绝对时间戳更能一眼看出这条规则还要拦多久。 */
+  const expiresIn = (unixSecs: number) => {
+    const diff = unixSecs - Math.floor(Date.now() / 1000)
+    if (diff <= 0) return t('已到期', 'Expired')
+    const hours = Math.floor(diff / 3600)
+    if (hours < 1) {
+      const min = Math.max(1, Math.floor(diff / 60))
+      return t(`${min} 分钟后到期`, `Expires in ${min}m`)
+    }
+    if (hours < 24) return t(`${hours} 小时后到期`, `Expires in ${hours}h`)
+    const days = Math.floor(hours / 24)
+    return t(`${days} 天后到期`, `Expires in ${days}d`)
+  }
+
+  const counts = rows.reduce<Record<string, number>>((acc, row) => {
+    acc[row.kind] = (acc[row.kind] ?? 0) + 1
+    return acc
+  }, {})
+  const kinds = [
+    ...RULE_KIND_ORDER.filter((k) => counts[k]),
+    ...Object.keys(counts).filter((k) => !RULE_KIND_ORDER.includes(k)).sort(),
+  ]
+  const visible = kindFilter === 'all' ? rows : rows.filter((row) => row.kind === kindFilter)
+  const toggleMessage = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(key)) next.add(key)
+      return next
+    })
+
   return (
     <SettingsGroup
       icon={BrainIcon}
@@ -1198,61 +1282,142 @@ function LearnedRejections() {
           </Button>
         </div>
       ) : rows.length === 0 ? (
-        <p className="p-5 text-sm text-muted-foreground">
-          {t('还没有学到任何规则。', 'No rules have been learned yet.')}
-        </p>
+        <Empty className="py-10 md:py-12">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <BrainIcon />
+            </EmptyMedia>
+            <EmptyTitle className="text-base sm:text-base">
+              {t('还没有学到任何规则', 'No rules learned yet')}
+            </EmptyTitle>
+            <EmptyDescription className="text-xs leading-5">
+              {t(
+                '上游拒掉某个取值、废弃某个参数，或对某条提示词拒答之后，规则会自动出现在这里。',
+                'Rules appear here on their own once upstream rejects a value, deprecates a parameter, or refuses a prompt.',
+              )}
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
       ) : (
         <>
-          <ul className="divide-y" role="list">
-            {rows.map((row) => (
-              <li
-                key={`${row.kind}:${row.model}:${row.field}:${row.value}`}
-                className="flex items-start justify-between gap-3 p-4"
-              >
-                <div className="min-w-0 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2 text-sm">
-                    <Badge size="sm" variant={row.kind === 'deprecated' ? 'info' : 'error'}>
-                      {kindLabel(row.kind)}
-                    </Badge>
-                    <span className="font-medium [overflow-wrap:anywhere]">{row.model}</span>
-                    <code className="rounded bg-muted px-1.5 py-0.5 text-xs [overflow-wrap:anywhere]">
-                      {row.value ? `${row.field} = '${row.value}'` : row.field}
-                    </code>
-                  </div>
-                  {row.message && (
-                    <p className="text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]" title={row.message}>
-                      {row.message}
-                    </p>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    {t('学到于', 'Learned')} {formatFullTime(row.learned_at, language)}
-                    {' · '}
-                    {t('到期', 'Expires')} {formatFullTime(row.expires_at, language)}
-                  </p>
-                </div>
-                <Button
-                  aria-label={t('删除这条规则', 'Remove this rule')}
-                  title={t('删除这条规则', 'Remove this rule')}
-                  size="icon"
-                  variant="ghost"
-                  className="shrink-0"
-                  disabled={forget.isPending}
-                  onClick={() => forget.mutate(row)}
-                >
-                  <Trash2Icon />
-                </Button>
-              </li>
-            ))}
-          </ul>
-          <div className="flex items-center justify-between gap-3 p-4">
-            <p className="text-xs text-muted-foreground">
-              {t(`共 ${rows.length} 条`, `${rows.length} rule${rows.length === 1 ? '' : 's'}`)}
-            </p>
-            <Button size="xs" variant="outline" onClick={() => setConfirmClear(true)}>
+          {/* 工具条：总数 + 按种类筛选 + 清空，动作放顶部，列表本身保持干净 */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
+            <div className="flex flex-wrap items-center gap-1">
+              <FilterChip
+                active={kindFilter === 'all'}
+                count={rows.length}
+                label={t('全部', 'All')}
+                onClick={() => setKindFilter('all')}
+              />
+              {kinds.map((kind) => (
+                <FilterChip
+                  key={kind}
+                  active={kindFilter === kind}
+                  count={counts[kind]}
+                  dot={RULE_TONES[kind]?.dot}
+                  label={kindLabel(kind)}
+                  onClick={() => setKindFilter(kind)}
+                />
+              ))}
+            </div>
+            <Button
+              className="ms-auto"
+              size="xs"
+              variant="outline"
+              onClick={() => setConfirmClear(true)}
+            >
               <Trash2Icon />
               {t('全部清空', 'Clear all')}
             </Button>
           </div>
+          {visible.length === 0 ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm text-muted-foreground">
+              {t('这一类下没有规则。', 'No rules of this kind.')}
+              <Button size="xs" variant="outline" onClick={() => setKindFilter('all')}>
+                {t('看全部', 'Show all')}
+              </Button>
+            </div>
+          ) : (
+            <ul className="divide-y" role="list">
+              {visible.map((row) => {
+                const key = ruleKey(row)
+                const tone = RULE_TONES[row.kind]
+                const { tag, body } = splitRuleMessage(row.message ?? '')
+                const open = expanded.has(key)
+                return (
+                  <li key={key} className="flex items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/40">
+                    <span
+                      aria-hidden="true"
+                      className={cn('mt-2 size-1.5 shrink-0 rounded-full', tone?.dot ?? 'bg-muted-foreground')}
+                    />
+                    <div className="min-w-0 flex-1 space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className="text-sm font-medium [overflow-wrap:anywhere]">{row.model}</span>
+                        <Badge size="sm" variant={tone?.badge ?? 'secondary'}>
+                          {kindLabel(row.kind)}
+                        </Badge>
+                        <code className="inline-flex min-w-0 items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">
+                          <span className="text-muted-foreground">{row.field}</span>
+                          {row.value && (
+                            <>
+                              <span className="text-muted-foreground/60">=</span>
+                              <span className="[overflow-wrap:anywhere]">{row.value}</span>
+                            </>
+                          )}
+                        </code>
+                      </div>
+                      {body && (
+                        <div className="space-y-1.5">
+                          <button
+                            aria-expanded={open}
+                            className="flex w-full items-center gap-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
+                            type="button"
+                            onClick={() => toggleMessage(key)}
+                          >
+                            <ChevronDownIcon
+                              aria-hidden="true"
+                              className={cn('size-3.5 shrink-0 transition-transform', !open && '-rotate-90')}
+                            />
+                            {tag && (
+                              <span className="shrink-0 rounded bg-muted px-1 py-px font-mono text-[10px]">
+                                {tag}
+                              </span>
+                            )}
+                            <span className={cn('min-w-0 flex-1 font-mono text-[11px]', !open && 'truncate')}>
+                              {open ? t('上游当时的回复', 'Upstream reply') : body}
+                            </span>
+                          </button>
+                          {open && (
+                            <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono text-[11px] leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+                              {body}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
+                        <span title={formatFullTime(row.learned_at, language)}>
+                          {t('学到于', 'Learned')} {relativeTime(row.learned_at, undefined, language)}
+                        </span>
+                        <span aria-hidden="true" className="opacity-40">·</span>
+                        <span title={formatFullTime(row.expires_at, language)}>{expiresIn(row.expires_at)}</span>
+                      </div>
+                    </div>
+                    <Button
+                      aria-label={t('删除这条规则', 'Remove this rule')}
+                      title={t('删除这条规则', 'Remove this rule')}
+                      size="icon"
+                      variant="ghost"
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      disabled={forget.isPending}
+                      onClick={() => forget.mutate(row)}
+                    >
+                      <Trash2Icon />
+                    </Button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
           <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
             <AlertDialogPopup>
               <AlertDialogHeader>

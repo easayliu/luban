@@ -3782,17 +3782,31 @@ impl ReqLog {
         let excerpt = self.sniffer.excerpt().unwrap_or_default();
         let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
         let refused = self.sniffer.refused();
+        // 先判定再打日志：一行里就能看出这条是拒答还是零输出、分类器给了什么、学没学。
+        // 拒答只学分类器判决（category 非空且没有 recommended_model）；模型自拒带采样，
+        // 原样重发可能就答了；带 recommended_model 说明 fallback 没跑成，直接重试可能就成。
+        let verdict = self.sniffer.classifier_refusal().map(str::to_string);
+        let learn = if !refused {
+            if self.empty_reply_key.is_some() { "request_class" } else { "none" }
+        } else if verdict.is_some() {
+            if self.prompt_key.is_some() { "prompt" } else { "none" }
+        } else {
+            "none"
+        };
         tracing::warn!(
             cred_id = self.cred_id, cred = %self.cred_label,
             model = %model.as_deref().unwrap_or("-"),
             input_tokens = self.sniffer.input_tokens.unwrap_or(0),
             output_tokens = self.sniffer.output_tokens.unwrap_or(0),
             stop_reason = %self.sniffer.stop_reason.as_deref().unwrap_or("-"),
+            category = %self.sniffer.refusal_category.as_deref().unwrap_or("-"),
+            recommended_model = %self.sniffer.refusal_recommended_model.as_deref().unwrap_or("-"),
             request_id = %self.request_id,
             upstream_request_id = %self.upstream_request_id.as_deref().unwrap_or("-"),
             response = %excerpt.chars().take(500).collect::<String>(),
             kind = if refused { "refusal" } else { "empty_reply" },
-            "upstream returned 200 without an answer (a refusal, or zero output tokens); the reply is kept on the usage log and the refused prompt / request class will be rejected locally from now on"
+            learn,
+            "upstream returned 200 without an answer; the reply is kept on the usage log. learn=prompt: this exact prompt is rejected locally from now on (classifier verdict); learn=request_class: this model + request class is; learn=none: nothing learned, a resend may succeed"
         );
         self.forensics.response_excerpt = (!excerpt.is_empty()).then(|| excerpt.clone());
         let tags = self.forensics.rewrites.get_or_insert_with(String::new);
@@ -3801,24 +3815,13 @@ impl ReqLog {
         }
         tags.push_str(if refused { REWRITE_REFUSAL } else { REWRITE_EMPTY_REPLY });
         let learned = if refused {
-            match self.sniffer.classifier_refusal() {
-                Some(category) => {
-                    // 规则文案带上类别，设置页与 403 文案一眼能看出是哪类判决。
-                    let message = format!("[{category}] {excerpt}");
-                    self.prompt_key.take().and_then(|(model, digest)| {
-                        remember_refused_prompt(&self.empty_replies, &model, &digest, &message)
-                    })
-                }
-                None => {
-                    tracing::info!(
-                        category = %self.sniffer.refusal_category.as_deref().unwrap_or("-"),
-                        recommended_model = %self.sniffer.refusal_recommended_model.as_deref().unwrap_or("-"),
-                        request_id = %self.request_id,
-                        "the refusal is not a classifier verdict (no category, or the fallback could not run); not learned, a resend may succeed"
-                    );
-                    None
-                }
-            }
+            verdict.and_then(|category| {
+                // 规则文案带上类别，设置页与 403 文案一眼能看出是哪类判决。
+                let message = format!("[{category}] {excerpt}");
+                self.prompt_key.take().and_then(|(model, digest)| {
+                    remember_refused_prompt(&self.empty_replies, &model, &digest, &message)
+                })
+            })
         } else {
             self.empty_reply_key.take().and_then(|(model, max_tokens)| {
                 remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt)
