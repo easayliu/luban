@@ -421,6 +421,20 @@ export async function forgetLearnedRejection(
   return data
 }
 
+/** 删一组（同种类、同模型、同类别；类别即规则文案开头的 [类别]，不传为该模型全部）；返回删后的完整列表。 */
+export async function forgetLearnedGroup(group: {
+  kind: string
+  model: string
+  category?: string | null
+}): Promise<LearnedRejection[]> {
+  const { data } = await api.post<LearnedRejection[]>('/learned-rejections/delete-group', {
+    kind: group.kind,
+    model: group.model,
+    category: group.category ?? null,
+  })
+  return data
+}
+
 /** 清空：不传 kind 清全部，传了只清那一种类；返回删掉的条数。 */
 export async function clearLearnedRejections(kind?: string): Promise<number> {
   const { data } = await api.delete<{ deleted: number }>('/learned-rejections', {

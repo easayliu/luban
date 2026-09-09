@@ -7422,6 +7422,11 @@ pub fn forget_learned_memory(
     }
 }
 
+/// 学到的规则的全部种类名（`learned_rejections.kind` 列的取值域），控制台按种类清空时先拿它
+/// 校验，再动库和内存。
+pub const LEARNED_KINDS: [&str; 4] =
+    [LEARNED_KIND_SHAPE, LEARNED_KIND_DEPRECATED, LEARNED_KIND_EMPTY_REPLY, LEARNED_KIND_REFUSAL];
+
 /// 清掉某一种类的进程内规则（控制台「清空这一类」）。种类名对不上返回 `false`，什么都不动。
 pub fn clear_learned_memory_kind(
     shape: &ShapeMemory,

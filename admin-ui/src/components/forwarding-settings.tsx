@@ -5,6 +5,8 @@ import {
   BrainIcon,
   ChevronDownIcon,
   DatabaseIcon,
+  SearchIcon,
+  XIcon,
   InfoIcon,
   KeyRoundIcon,
   RefreshCwIcon,
@@ -16,6 +18,7 @@ import {
 } from 'lucide-react'
 import {
   clearLearnedRejections,
+  forgetLearnedGroup,
   forgetLearnedRejection,
   getSettings,
   listLearnedRejections,
@@ -49,6 +52,7 @@ import {
 } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
 import {
   NumberField,
   NumberFieldDecrement,
@@ -56,6 +60,12 @@ import {
   NumberFieldIncrement,
   NumberFieldInput,
 } from '@/components/ui/number-field'
+import {
+  Pagination, PaginationContent, PaginationItem, PaginationNext, PaginationPrevious,
+} from '@/components/ui/pagination'
+import {
+  Select, SelectItem, SelectPopup, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
@@ -1219,12 +1229,210 @@ function FilterChip({
   )
 }
 
+/** 拒答组内每页条数可选值。 */
+const GROUP_PAGE_SIZES = [25, 50, 100] as const
+
+/**
+ * 一组拒答规则（同模型 + 同类别）：组头一行，展开后是紧凑的一行一条（模型与类别已在组头，
+ * 每条只剩哈希、时间、原话与删除），分页翻看；整组可一键删。一个下游被分类器盯上几小时就是
+ * 几百条，逐条三行平铺既翻不完也删不完。
+ */
+function RefusalGroup({
+  group,
+  open,
+  onToggle,
+  onDeleteGroup,
+  onForget,
+  forgetPending,
+  kindLabel,
+  expiresIn,
+}: {
+  group: { key: string; model: string; tag: string | null; rows: LearnedRejection[]; latest: number }
+  open: boolean
+  onToggle: () => void
+  onDeleteGroup: () => void
+  onForget: (row: LearnedRejection) => void
+  forgetPending: boolean
+  kindLabel: (kind: string) => string
+  expiresIn: (unixSecs: number) => string
+}) {
+  const { t, language } = useI18n()
+  const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState<number>(GROUP_PAGE_SIZES[0])
+  const [openMessages, setOpenMessages] = useState<ReadonlySet<string>>(() => new Set())
+  const total = group.rows.length
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  // 删到页码越界（最后一页删空了）时退回最后一页。
+  const currentPage = Math.min(page, totalPages - 1)
+  const pageRows = group.rows.slice(currentPage * pageSize, currentPage * pageSize + pageSize)
+  const firstIndex = currentPage * pageSize + 1
+  const lastIndex = currentPage * pageSize + pageRows.length
+  const toggleMessage = (key: string) =>
+    setOpenMessages((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(key)) next.add(key)
+      return next
+    })
+  return (
+    <li className="px-4 py-3">
+      <div className="flex items-start gap-3">
+        <span aria-hidden="true" className={cn('mt-2 size-1.5 shrink-0 rounded-full', RULE_TONES.refusal.dot)} />
+        <button
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-left"
+          type="button"
+          onClick={onToggle}
+        >
+          <ChevronDownIcon
+            aria-hidden="true"
+            className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', !open && '-rotate-90')}
+          />
+          <span className="text-sm font-medium [overflow-wrap:anywhere]">{group.model}</span>
+          <Badge size="sm" variant={RULE_TONES.refusal.badge}>
+            {kindLabel('refusal')}
+          </Badge>
+          {group.tag && <span className="rounded bg-muted px-1 py-px font-mono text-[10px]">{group.tag}</span>}
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {t(`${total} 条提示词`, `${total} prompt${total === 1 ? '' : 's'}`)}
+          </span>
+          <span className="text-[11px] text-muted-foreground" title={formatFullTime(group.latest, language)}>
+            {t('最近学到于', 'Latest')} {relativeTime(group.latest, undefined, language)}
+          </span>
+        </button>
+        <Button
+          aria-label={t('删除这一组规则', 'Remove this rule group')}
+          title={t('删除这一组规则', 'Remove this rule group')}
+          size="icon"
+          variant="ghost"
+          className="shrink-0 text-muted-foreground hover:text-foreground"
+          onClick={onDeleteGroup}
+        >
+          <Trash2Icon />
+        </Button>
+      </div>
+      {open && (
+        <div className="mt-2 ms-4 overflow-hidden rounded-md border">
+          <ul className="divide-y" role="list">
+            {pageRows.map((row) => {
+              const key = ruleKey(row)
+              const { body } = splitRuleMessage(row.message ?? '')
+              const showing = openMessages.has(key)
+              return (
+                <li key={key} className="px-3 py-1.5 text-[11px] transition-colors hover:bg-muted/40">
+                  <div className="flex items-center gap-2">
+                    <button
+                      aria-expanded={showing}
+                      aria-label={t('上游当时的判决', 'Upstream verdict')}
+                      className="shrink-0 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-30"
+                      disabled={!body}
+                      type="button"
+                      onClick={() => toggleMessage(key)}
+                    >
+                      <ChevronDownIcon
+                        aria-hidden="true"
+                        className={cn('size-3.5 transition-transform', !showing && '-rotate-90')}
+                      />
+                    </button>
+                    <code className="min-w-0 shrink-0 font-mono [overflow-wrap:anywhere]">{row.value}</code>
+                    <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground">{body}</span>
+                    <span className="shrink-0 whitespace-nowrap text-muted-foreground tabular-nums" title={formatFullTime(row.learned_at, language)}>
+                      {relativeTime(row.learned_at, undefined, language)}
+                    </span>
+                    <span className="hidden shrink-0 whitespace-nowrap text-muted-foreground tabular-nums sm:inline" title={formatFullTime(row.expires_at, language)}>
+                      {expiresIn(row.expires_at)}
+                    </span>
+                    <Button
+                      aria-label={t('删除这条规则', 'Remove this rule')}
+                      title={t('删除这条规则', 'Remove this rule')}
+                      size="icon-xs"
+                      variant="ghost"
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      disabled={forgetPending}
+                      onClick={() => onForget(row)}
+                    >
+                      <Trash2Icon />
+                    </Button>
+                  </div>
+                  {showing && body && (
+                    <pre className="mt-1.5 max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+                      {body}
+                    </pre>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+          {(total > GROUP_PAGE_SIZES[0] || totalPages > 1) && (
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/30 px-3 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+              <p className="min-w-0 text-muted-foreground tabular-nums">
+                {t(`第 ${firstIndex}–${lastIndex} 条，共 ${total} 条`, `${firstIndex}–${lastIndex} of ${total}`)}
+              </p>
+              <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+                <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
+                <Select
+                  items={GROUP_PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
+                  value={pageSize}
+                  onValueChange={(value) => {
+                    if (value == null) return
+                    setPageSize(Number(value))
+                    setPage(0)
+                  }}
+                >
+                  <SelectTrigger size="sm" aria-label={t('每页条数', 'Rows per page')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectPopup>
+                    {GROUP_PAGE_SIZES.map((size) => (
+                      <SelectItem key={size} value={size}>{size}</SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+              </div>
+              {totalPages > 1 && (
+                <Pagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+                  <PaginationContent>
+                    <PaginationItem>
+                      <PaginationPrevious
+                        render={<Button variant="ghost" disabled={currentPage === 0} />}
+                        aria-disabled={currentPage === 0}
+                        onClick={() => setPage((current) => Math.max(0, current - 1))}
+                      />
+                    </PaginationItem>
+                    <PaginationItem>
+                      <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
+                        {t(`第 ${currentPage + 1} / ${totalPages} 页`, `Page ${currentPage + 1} of ${totalPages}`)}
+                      </span>
+                    </PaginationItem>
+                    <PaginationItem>
+                      <PaginationNext
+                        render={<Button variant="ghost" disabled={currentPage >= totalPages - 1} />}
+                        aria-disabled={currentPage >= totalPages - 1}
+                        onClick={() => setPage((current) => Math.min(totalPages - 1, current + 1))}
+                      />
+                    </PaginationItem>
+                  </PaginationContent>
+                </Pagination>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </li>
+  )
+}
+
 function LearnedRejections() {
   const { t, language } = useI18n()
   const qc = useQueryClient()
-  /** 清空确认框：`null` 关着，`'all'` 清全部，其余是要清的种类。 */
-  const [confirmClear, setConfirmClear] = useState<string | null>(null)
+  /** 清空确认框：关着 / 清全部 / 清一种类 / 删一组（同模型同类别）。 */
+  type ClearTarget =
+    | { type: 'all' }
+    | { type: 'kind'; kind: string }
+    | { type: 'group'; kind: string; model: string; category: string | null; count: number }
+  const [confirmClear, setConfirmClear] = useState<ClearTarget | null>(null)
   const [kindFilter, setKindFilter] = useState<string>('all')
+  /** 搜索框：按模型 / 字段取值（哈希）/ 规则文案子串过滤，几百条拒答里找一条 403 报出的哈希用。 */
+  const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const query = useQuery({ queryKey: ['learned-rejections'], queryFn: listLearnedRejections })
   const failure = (title: string, error: unknown) =>
@@ -1252,6 +1460,15 @@ function LearnedRejections() {
       })
     },
     onError: (e) => { setConfirmClear(null); failure(t('清空失败', 'Failed to clear'), e) },
+  })
+  const forgetGroup = useMutation({
+    mutationFn: (group: { kind: string; model: string; category: string | null }) => forgetLearnedGroup(group),
+    onSuccess: (rows) => {
+      setConfirmClear(null)
+      qc.setQueryData(['learned-rejections'], rows)
+      toastManager.add({ title: t('已删除这一组规则', 'Rule group removed'), type: 'success' })
+    },
+    onError: (e) => { setConfirmClear(null); failure(t('删除失败', 'Failed to remove'), e) },
   })
 
   const rows = query.data ?? []
@@ -1288,7 +1505,13 @@ function LearnedRejections() {
     ...RULE_KIND_ORDER.filter((k) => counts[k]),
     ...Object.keys(counts).filter((k) => !RULE_KIND_ORDER.includes(k)).sort(),
   ]
-  const visible = kindFilter === 'all' ? rows : rows.filter((row) => row.kind === kindFilter)
+  const byKind = kindFilter === 'all' ? rows : rows.filter((row) => row.kind === kindFilter)
+  const needle = search.trim().toLowerCase()
+  const visible = needle
+    ? byKind.filter((row) =>
+        [row.model, row.field, row.value, row.message ?? ''].some((s) => s.toLowerCase().includes(needle)),
+      )
+    : byKind
   const toggleMessage = (key: string) =>
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -1407,8 +1630,8 @@ function LearnedRejections() {
       icon={BrainIcon}
       title={t('从上游学到的规则', 'Rules learned from upstream')}
       description={t(
-        '上游点名过的组合会被记下来：某模型不收某取值的（400），下次本地直接拒；某模型已废弃某参数的（400），下次转发前剥掉；某模型对「无 tools 的单条消息 + 某个 max_tokens」回过 200 却零输出的，同类下次本地直接拒；某模型被分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的那条提示词，逐字相同的重发本地直接拒——只拦那一条内容，同形态的其他请求不受影响；模型自己拒的（无 category）或 fallback 没跑成的（带 recommended_model）不学（两条都是 403，各随「拒绝已拒答的提示词」/「拒绝零输出请求类」开关；出站带 fallbacks 的请求不拦），规则文案里是「[类别] + 上游 stop_details 原样」——零输出规则的文案才是上游回复的开头。规则落库、重启保留，7 天后自动丢弃重新验证。拒答规则不设上限、按「模型 + 类别」折叠成一组，点开看每条；筛选到某一类时可只清空那一类。上游放开了而本地还在拦时，在这里删掉即可。',
-        'Combinations upstream has called out are remembered: a value a model refuses (400) is rejected locally next time; a parameter a model deprecated (400) is stripped before forwarding; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape; refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned (both 403, governed by "Reject refused prompts" / "Reject empty-reply request classes" respectively; requests going out with fallbacks are not blocked), with "[category] " plus the upstream stop_details verbatim kept as the rule text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to see each prompt, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
+        '上游点名过的组合会被记下来：某模型不收某取值的（400），下次本地直接拒；某模型已废弃某参数的（400），下次转发前剥掉；某模型对「无 tools 的单条消息 + 某个 max_tokens」回过 200 却零输出的，同类下次本地直接拒；某模型被分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的那条提示词，逐字相同的重发本地直接拒——只拦那一条内容，同形态的其他请求不受影响；模型自己拒的（无 category）或 fallback 没跑成的（带 recommended_model）不学（两条都是 403，各随「拒绝已拒答的提示词」/「拒绝零输出请求类」开关；出站带 fallbacks 的请求不拦），规则文案里是「[类别] + 上游 stop_details 原样」——零输出规则的文案才是上游回复的开头。规则落库、重启保留，7 天后自动丢弃重新验证。拒答规则不设上限、按「模型 + 类别」折叠成一组，点开分页看每条、可整组删除；顶部可按模型 / 哈希 / 原话搜索，筛选到某一类时可只清空那一类。上游放开了而本地还在拦时，在这里删掉即可。',
+        'Combinations upstream has called out are remembered: a value a model refuses (400) is rejected locally next time; a parameter a model deprecated (400) is stripped before forwarding; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape; refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned (both 403, governed by "Reject refused prompts" / "Reject empty-reply request classes" respectively; requests going out with fallbacks are not blocked), with "[category] " plus the upstream stop_details verbatim kept as the rule text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to page through its prompts or remove the whole group, search by model / hash / text at the top, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
       )}
     >
       {query.isPending ? (
@@ -1462,14 +1685,34 @@ function LearnedRejections() {
                 />
               ))}
             </div>
-            <div className="ms-auto flex items-center gap-1.5">
+            <div className="ms-auto flex flex-wrap items-center gap-1.5">
+              <div className="relative">
+                <SearchIcon aria-hidden="true" className="pointer-events-none absolute start-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  aria-label={t('搜索规则', 'Search rules')}
+                  className="h-7 w-52 ps-7 pe-7 text-xs"
+                  placeholder={t('模型 / 哈希 / 原话', 'Model / hash / text')}
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+                {search && (
+                  <button
+                    aria-label={t('清除搜索', 'Clear search')}
+                    className="absolute end-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                    type="button"
+                    onClick={() => setSearch('')}
+                  >
+                    <XIcon className="size-3.5" />
+                  </button>
+                )}
+              </div>
               {kindFilter !== 'all' && (counts[kindFilter] ?? 0) > 0 && (
-                <Button size="xs" variant="outline" onClick={() => setConfirmClear(kindFilter)}>
+                <Button size="xs" variant="outline" onClick={() => setConfirmClear({ type: 'kind', kind: kindFilter })}>
                   <Trash2Icon />
                   {t(`清空这一类 ${counts[kindFilter]}`, `Clear this kind ${counts[kindFilter]}`)}
                 </Button>
               )}
-              <Button size="xs" variant="outline" onClick={() => setConfirmClear('all')}>
+              <Button size="xs" variant="outline" onClick={() => setConfirmClear({ type: 'all' })}>
                 <Trash2Icon />
                 {t('全部清空', 'Clear all')}
               </Button>
@@ -1477,8 +1720,8 @@ function LearnedRejections() {
           </div>
           {visible.length === 0 ? (
             <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm text-muted-foreground">
-              {t('这一类下没有规则。', 'No rules of this kind.')}
-              <Button size="xs" variant="outline" onClick={() => setKindFilter('all')}>
+              {needle ? t('没有匹配的规则。', 'No matching rules.') : t('这一类下没有规则。', 'No rules of this kind.')}
+              <Button size="xs" variant="outline" onClick={() => { setKindFilter('all'); setSearch('') }}>
                 {t('看全部', 'Show all')}
               </Button>
             </div>
@@ -1488,48 +1731,25 @@ function LearnedRejections() {
                 entry.type === 'row' ? (
                   <RuleItem key={ruleKey(entry.row)} row={entry.row} />
                 ) : (
-                  <li key={entry.key} className="px-4 py-3">
-                    <div className="flex items-start gap-3">
-                      <span
-                        aria-hidden="true"
-                        className={cn('mt-2 size-1.5 shrink-0 rounded-full', RULE_TONES.refusal.dot)}
-                      />
-                      <button
-                        aria-expanded={expanded.has(entry.key)}
-                        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-left"
-                        type="button"
-                        onClick={() => toggleMessage(entry.key)}
-                      >
-                        <span className="text-sm font-medium [overflow-wrap:anywhere]">{entry.model}</span>
-                        <Badge size="sm" variant={RULE_TONES.refusal.badge}>
-                          {kindLabel('refusal')}
-                        </Badge>
-                        {entry.tag && (
-                          <span className="rounded bg-muted px-1 py-px font-mono text-[10px]">{entry.tag}</span>
-                        )}
-                        <span className="text-xs text-muted-foreground tabular-nums">
-                          {t(`${entry.rows.length} 条提示词`, `${entry.rows.length} prompt${entry.rows.length === 1 ? '' : 's'}`)}
-                        </span>
-                        <span className="text-[11px] text-muted-foreground" title={formatFullTime(entry.latest, language)}>
-                          {t('最近学到于', 'Latest')} {relativeTime(entry.latest, undefined, language)}
-                        </span>
-                        <ChevronDownIcon
-                          aria-hidden="true"
-                          className={cn(
-                            'ms-auto size-3.5 shrink-0 text-muted-foreground transition-transform',
-                            !expanded.has(entry.key) && '-rotate-90',
-                          )}
-                        />
-                      </button>
-                    </div>
-                    {expanded.has(entry.key) && (
-                      <ul className="mt-2 divide-y rounded-md border" role="list">
-                        {entry.rows.map((row) => (
-                          <RuleItem key={ruleKey(row)} row={row} />
-                        ))}
-                      </ul>
-                    )}
-                  </li>
+                  <RefusalGroup
+                    key={entry.key}
+                    group={entry}
+                    open={expanded.has(entry.key)}
+                    onToggle={() => toggleMessage(entry.key)}
+                    onDeleteGroup={() =>
+                      setConfirmClear({
+                        type: 'group',
+                        kind: 'refusal',
+                        model: entry.model,
+                        category: entry.tag,
+                        count: entry.rows.length,
+                      })
+                    }
+                    onForget={(row) => forget.mutate(row)}
+                    forgetPending={forget.isPending}
+                    kindLabel={kindLabel}
+                    expiresIn={expiresIn}
+                  />
                 ),
               )}
             </ul>
@@ -1538,30 +1758,44 @@ function LearnedRejections() {
             <AlertDialogPopup>
               <AlertDialogHeader>
                 <AlertDialogTitle>
-                  {confirmClear && confirmClear !== 'all'
-                    ? t(`清空「${kindLabel(confirmClear)}」`, `Clear "${kindLabel(confirmClear)}"`)
-                    : t('清空学到的规则', 'Clear learned rules')}
+                  {confirmClear?.type === 'kind'
+                    ? t(`清空「${kindLabel(confirmClear.kind)}」`, `Clear "${kindLabel(confirmClear.kind)}"`)
+                    : confirmClear?.type === 'group'
+                      ? t('删除这一组规则', 'Remove this rule group')
+                      : t('清空学到的规则', 'Clear learned rules')}
                 </AlertDialogTitle>
                 <AlertDialogDescription>
-                  {confirmClear && confirmClear !== 'all'
+                  {confirmClear?.type === 'kind'
                     ? t(
-                        `将删除这一类的 ${counts[confirmClear] ?? 0} 条规则，其他种类不动。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
-                        `${counts[confirmClear] ?? 0} rules of this kind will be removed; other kinds are untouched. The same combinations will be sent upstream once more and re-learned if rejected.`,
+                        `将删除这一类的 ${counts[confirmClear.kind] ?? 0} 条规则，其他种类不动。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
+                        `${counts[confirmClear.kind] ?? 0} rules of this kind will be removed; other kinds are untouched. The same combinations will be sent upstream once more and re-learned if rejected.`,
                       )
-                    : t(
-                        `将删除全部 ${rows.length} 条规则。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
-                        `All ${rows.length} rules will be removed. The same combinations will be sent upstream once more and re-learned if rejected.`,
-                      )}
+                    : confirmClear?.type === 'group'
+                      ? t(
+                          `将删除 ${confirmClear.model}${confirmClear.category ? ` 的 ${confirmClear.category} 类` : ''} 共 ${confirmClear.count} 条拒答提示词规则，其他模型、其他类别不动。之后这些提示词逐字重发会再送到上游一次，被拒的话会重新学到。`,
+                          `${confirmClear.count} refused-prompt rules for ${confirmClear.model}${confirmClear.category ? ` (${confirmClear.category})` : ''} will be removed; other models and categories are untouched. Resending those prompts verbatim will reach upstream once more and be re-learned if refused.`,
+                        )
+                      : t(
+                          `将删除全部 ${rows.length} 条规则。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
+                          `All ${rows.length} rules will be removed. The same combinations will be sent upstream once more and re-learned if rejected.`,
+                        )}
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
                 <Button
                   variant="destructive"
-                  loading={clear.isPending}
-                  onClick={() => clear.mutate(confirmClear === 'all' ? null : confirmClear)}
+                  loading={clear.isPending || forgetGroup.isPending}
+                  onClick={() => {
+                    if (!confirmClear) return
+                    if (confirmClear.type === 'group') {
+                      forgetGroup.mutate({ kind: confirmClear.kind, model: confirmClear.model, category: confirmClear.category })
+                    } else {
+                      clear.mutate(confirmClear.type === 'kind' ? confirmClear.kind : null)
+                    }
+                  }}
                 >
-                  {t('清空', 'Clear')}
+                  {confirmClear?.type === 'group' ? t('删除', 'Remove') : t('清空', 'Clear')}
                 </Button>
               </AlertDialogFooter>
             </AlertDialogPopup>

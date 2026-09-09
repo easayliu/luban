@@ -471,6 +471,7 @@ pub async fn run(
         .route("/models", get(list_models))
         .route("/learned-rejections", get(list_learned_rejections).delete(clear_learned_rejections))
         .route("/learned-rejections/delete", post(forget_learned_rejection))
+        .route("/learned-rejections/delete-group", post(forget_learned_group))
         .route("/credentials/proxy", post(set_proxies))
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
         .route("/proxies/test", post(test_proxy))
@@ -1464,9 +1465,59 @@ async fn forget_learned_rejection(
     list_learned_rejections(State(state)).await
 }
 
+/// `POST /api/learned-rejections/delete-group`：删掉「同一种类、同一模型、同一类别」的一组规则，
+/// 库里与进程内一起删，回删后的完整列表。类别是规则文案开头的 `[类别]`（控制台就按它折叠），
+/// 不传即该模型该种类的全部。给拒答提示词那一格准备的：一个下游被 `reasoning_extraction` 盯上
+/// 几小时就是几百条，按组删才不必连别的模型、别的类别一起清。
+#[derive(Deserialize)]
+struct ForgetLearnedGroupReq {
+    kind: String,
+    model: String,
+    #[serde(default)]
+    category: Option<String>,
+}
+
+async fn forget_learned_group(
+    State(state): State<AppState>,
+    Json(req): Json<ForgetLearnedGroupReq>,
+) -> Result<Json<Vec<LearnedRejectionView>>, ApiError> {
+    let category = req.category.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let in_category = |message: &str| match category {
+        None => true,
+        Some(c) => message
+            .strip_prefix('[')
+            .and_then(|m| m.strip_prefix(c))
+            .and_then(|m| m.strip_prefix(']'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)),
+    };
+    let rows = state.store.learned_rejections().map_err(internal)?;
+    let mut deleted = 0usize;
+    for r in rows
+        .iter()
+        .filter(|r| r.kind == req.kind && r.model == req.model && in_category(&r.message))
+    {
+        let in_db = state.store.forget_learned_rejection(r).map_err(internal)?;
+        let in_mem = proxy::forget_learned_memory(
+            &state.shape_rejections,
+            &state.deprecated_fields,
+            &state.empty_replies,
+            r,
+        );
+        deleted += usize::from(in_db || in_mem);
+    }
+    if deleted == 0 {
+        return Err(not_found());
+    }
+    tracing::info!(
+        deleted, kind = %req.kind, model = %req.model, category = category.unwrap_or("-"),
+        "a group of learned upstream rejections removed from the console"
+    );
+    list_learned_rejections(State(state)).await
+}
+
 /// `DELETE /api/learned-rejections[?kind=…]`：清空从上游学到的规则——库里的和进程内的一起清。
 /// 不带 `kind` 清全部；带了只清那一种类（`shape` / `deprecated` / `empty_reply` / `refusal`），
-/// 种类名对不上回 400。
+/// 种类名对不上（含空串）回 400，什么都不动。
 ///
 /// 逃生口：上游放开了某个取值或恢复了某个参数，本地却还在按学到的旧规则拒/剥。7 天保鲜期
 /// 会自动过期，等不及就手动清。清错的代价只是每种组合再撞一次 400。按种类清是给拒答提示词
@@ -1486,7 +1537,11 @@ async fn clear_learned_rejections(
     State(state): State<AppState>,
     Query(q): Query<ClearLearnedQuery>,
 ) -> Result<Json<ClearedLearnedResp>, ApiError> {
-    let deleted = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    // 两条分支都是**先删库、再清内存**：库删失败回 500 时内存原样不动，不会出现「接口报错、
+    // 规则却已经从进程里消失」。反过来的窄窗口（库已删、内存还没清，或这中间刚学到一条新的
+    // 只进了内存）由每小时按库重建兜底，最多多拦或多放一条到下个整点。
+    let deleted = match q.kind.as_deref() {
+        // 没带 `kind` 才是清全部；带了但是空串按未知种类 400，免得 `?kind=` 手滑成全清。
         None => {
             let deleted = state.store.clear_learned_rejections().map_err(internal)?;
             state.shape_rejections.write().clear();
@@ -1496,15 +1551,17 @@ async fn clear_learned_rejections(
             deleted
         }
         Some(kind) => {
-            if !proxy::clear_learned_memory_kind(
+            let kind = kind.trim();
+            if !proxy::LEARNED_KINDS.contains(&kind) {
+                return Err(bad_request(format!("unknown rule kind: {kind:?}")));
+            }
+            let deleted = state.store.clear_learned_rejections_of_kind(kind).map_err(internal)?;
+            proxy::clear_learned_memory_kind(
                 &state.shape_rejections,
                 &state.deprecated_fields,
                 &state.empty_replies,
                 kind,
-            ) {
-                return Err(bad_request(format!("unknown rule kind: {kind}")));
-            }
-            let deleted = state.store.clear_learned_rejections_of_kind(kind).map_err(internal)?;
+            );
             tracing::info!(
                 deleted,
                 kind,
