@@ -7422,6 +7422,23 @@ pub fn forget_learned_memory(
     }
 }
 
+/// 清掉某一种类的进程内规则（控制台「清空这一类」）。种类名对不上返回 `false`，什么都不动。
+pub fn clear_learned_memory_kind(
+    shape: &ShapeMemory,
+    deprecated: &DeprecatedFieldMemory,
+    empty: &EmptyReplyMemory,
+    kind: &str,
+) -> bool {
+    match kind {
+        LEARNED_KIND_SHAPE => shape.write().clear(),
+        LEARNED_KIND_DEPRECATED => deprecated.write().clear(),
+        LEARNED_KIND_EMPTY_REPLY => empty.write().classes.clear(),
+        LEARNED_KIND_REFUSAL => empty.write().prompts.clear(),
+        _ => return false,
+    }
+    true
+}
+
 /// [`seed_learned_memories`] 的回填结果：各类回填条数，以及**该从库里删掉**的过期规则。
 #[derive(Debug, Default, PartialEq)]
 pub struct SeededMemories {
@@ -7522,7 +7539,8 @@ fn seed_tables(
                 out.empty_reply += 1;
             }
             LEARNED_KIND_REFUSAL => {
-                if r.field != REFUSAL_FIELD || empty_table.prompts.len() >= SHAPE_MEMORY_CAP {
+                // 拒答格不设上限（见 [`EmptyReplyRejections`]），库里有多少回填多少。
+                if r.field != REFUSAL_FIELD {
                     continue;
                 }
                 empty_table.prompts.entry((r.model, r.value)).or_insert(r.message);
@@ -7583,6 +7601,12 @@ const REFUSAL_FIELD: &str = "prompt_sha";
 /// 拒答格**不分凭证**：分类器判决对同一条提示词是确定性的，换个号重发结果一样（这个池子里
 /// 的号都是订阅端账号，不涉及官方按 organization 审批的网络安全验证计划），一张号上学到的
 /// 对全池生效。
+///
+/// 拒答格**不设容量上限**：每条规则只拦逐字相同的那一条提示词，而 agent 循环里每一轮的提示词
+/// 都不同（对话在变长），一个下游被分类器盯上时几小时就能灌进几百条各不相同的拒答——实测
+/// 2 小时 512 条 `reasoning_extraction`，此前套用 [`SHAPE_MEMORY_CAP`] 撞满后新的就学不进了。
+/// 每条几十字节、7 天到期（库里按 `learned_at` 删，进程内每小时按库重建），放着无妨；列表
+/// 被淹没的问题由控制台按「模型 + 类别」折叠、按种类清空来解。
 #[derive(Default)]
 pub struct EmptyReplyRejections {
     classes: std::collections::HashMap<(String, i64), String>,
@@ -7631,7 +7655,7 @@ fn known_refused_prompt(
 }
 
 /// 上游拒答了这条提示词 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
-/// 不重复、表满了不记），调用方拿去落库。
+/// 不重复），调用方拿去落库。不设上限，见 [`EmptyReplyRejections`]。
 fn remember_refused_prompt(
     mem: &EmptyReplyMemory,
     model: &str,
@@ -7640,7 +7664,7 @@ fn remember_refused_prompt(
 ) -> Option<store::LearnedRejection> {
     let mut table = mem.write();
     let key = (model.to_string(), digest.to_string());
-    if table.prompts.contains_key(&key) || table.prompts.len() >= SHAPE_MEMORY_CAP {
+    if table.prompts.contains_key(&key) {
         return None;
     }
     table.prompts.insert(key, excerpt.to_string());
@@ -15554,6 +15578,70 @@ mod tests {
             !super::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&no_temp)),
             "请求里没带那个字段就不算"
         );
+    }
+
+    /// 拒答格不设上限：学到的条数越过 [`SHAPE_MEMORY_CAP`] 照样进表、照样命中（此前套用那个
+    /// 上限，实测 2 小时 512 条 `reasoning_extraction` 撞满后新的就学不进了）；重复的不重学。
+    /// [`clear_learned_memory_kind`] 只清指定种类、别的表不动，种类名对不上什么都不动。
+    #[test]
+    fn refused_prompts_are_unbounded_and_cleared_per_kind() {
+        let shape = super::ShapeMemory::default();
+        let dep = super::DeprecatedFieldMemory::default();
+        let empty = super::EmptyReplyMemory::default();
+        let n = super::SHAPE_MEMORY_CAP + 10;
+        for i in 0..n {
+            assert!(
+                super::remember_refused_prompt(
+                    &empty,
+                    "claude-opus-5",
+                    &format!("{i:016x}"),
+                    "[cyber]"
+                )
+                .is_some(),
+                "第 {i} 条也要学进去"
+            );
+        }
+        assert!(
+            super::remember_refused_prompt(
+                &empty,
+                "claude-opus-5",
+                &format!("{:016x}", 0),
+                "[cyber]"
+            )
+            .is_none(),
+            "重复的不重学"
+        );
+        assert_eq!(empty.read().prompts.len(), n);
+        let last = serde_json::json!({"messages": [{"role": "user", "content": "x"}]});
+        let digest = super::prompt_digest(&last).unwrap();
+        super::remember_refused_prompt(&empty, "claude-opus-5", &digest, "[cyber]").unwrap();
+        assert!(super::known_refused_prompt(&empty, Some("claude-opus-5"), Some(&last)).is_some());
+        // 回填同样不设上限。
+        let rows: Vec<store::LearnedRejection> = (0..n)
+            .map(|i| store::LearnedRejection {
+                kind: "refusal".into(),
+                model: "claude-opus-5".into(),
+                field: "prompt_sha".into(),
+                value: format!("{i:016x}"),
+                message: "[cyber]".into(),
+            })
+            .collect();
+        let seeded = super::resync_learned_memories(&shape, &dep, &empty, rows);
+        assert_eq!(seeded.refusal, n);
+        assert!(seeded.stale.is_empty());
+        // 按种类清空：只清拒答格。
+        super::remember_empty_reply(&empty, "claude-fable-5", 16, "{}").unwrap();
+        dep.write().insert(("claude-opus-5".into(), super::FALLBACKS_FIELD.into()), "m".into());
+        assert!(!super::clear_learned_memory_kind(&shape, &dep, &empty, "bogus"));
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), n + 2);
+        assert!(super::clear_learned_memory_kind(&shape, &dep, &empty, "refusal"));
+        assert!(empty.read().prompts.is_empty());
+        assert_eq!(empty.read().classes.len(), 1);
+        assert_eq!(dep.read().len(), 1);
+        assert!(super::clear_learned_memory_kind(&shape, &dep, &empty, "empty_reply"));
+        assert!(empty.read().classes.is_empty());
+        assert!(super::clear_learned_memory_kind(&shape, &dep, &empty, "deprecated"));
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), 0);
     }
 
     /// [`prompt_digest`]：`tools` 与 `tool_choice` 也进哈希——同一段文字配不同工具集是不同的

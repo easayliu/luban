@@ -392,7 +392,8 @@ export async function importAll(
  * `empty_reply`：某模型对「无 tools 的单条消息 + 这个 max_tokens」回过 200 却零输出，
  * 同类命中本地直接拒（`field` 恒为 max_tokens，`value` 是那个数，`message` 是上游当时的回复开头）；
  * `refusal`：某模型拒答过这条提示词（stop_reason refusal），逐字相同的重发本地直接拒
- * （`field` 恒为 prompt_sha，`value` 是 system + messages 的哈希，`message` 是上游当时的回复开头）。
+ * （`field` 恒为 prompt_sha，`value` 是 system + messages + tools + tool_choice 的哈希，`message` 是
+ * 「[类别] stop_details=…」）。拒答规则不设上限，控制台按「模型 + 类别」折叠显示、可按种类清空。
  * 规则落库、重启保留，7 天后自动丢弃重学；这里的删除是提前放行的逃生口。
  */
 export interface LearnedRejection {
@@ -420,8 +421,10 @@ export async function forgetLearnedRejection(
   return data
 }
 
-/** 全部清空；返回删掉的条数。 */
-export async function clearLearnedRejections(): Promise<number> {
-  const { data } = await api.delete<{ deleted: number }>('/learned-rejections')
+/** 清空：不传 kind 清全部，传了只清那一种类；返回删掉的条数。 */
+export async function clearLearnedRejections(kind?: string): Promise<number> {
+  const { data } = await api.delete<{ deleted: number }>('/learned-rejections', {
+    params: kind ? { kind } : undefined,
+  })
   return data.deleted
 }

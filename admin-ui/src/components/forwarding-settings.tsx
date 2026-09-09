@@ -1222,7 +1222,8 @@ function FilterChip({
 function LearnedRejections() {
   const { t, language } = useI18n()
   const qc = useQueryClient()
-  const [confirmClear, setConfirmClear] = useState(false)
+  /** 清空确认框：`null` 关着，`'all'` 清全部，其余是要清的种类。 */
+  const [confirmClear, setConfirmClear] = useState<string | null>(null)
   const [kindFilter, setKindFilter] = useState<string>('all')
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const query = useQuery({ queryKey: ['learned-rejections'], queryFn: listLearnedRejections })
@@ -1238,16 +1239,19 @@ function LearnedRejections() {
     onError: (e) => failure(t('删除失败', 'Failed to remove'), e),
   })
   const clear = useMutation({
-    mutationFn: clearLearnedRejections,
-    onSuccess: (deleted) => {
-      setConfirmClear(false)
-      qc.setQueryData(['learned-rejections'], [])
+    // `kind` 为空清全部，否则只清那一种类（拒答提示词几百条时不必连别的规则一起清）。
+    mutationFn: (kind: string | null) => clearLearnedRejections(kind ?? undefined),
+    onSuccess: (deleted, kind) => {
+      setConfirmClear(null)
+      qc.setQueryData<LearnedRejection[]>(['learned-rejections'], (prev) =>
+        kind ? (prev ?? []).filter((row) => row.kind !== kind) : [],
+      )
       toastManager.add({
         title: t(`已清空 ${deleted} 条规则`, `Cleared ${deleted} rule${deleted === 1 ? '' : 's'}`),
         type: 'success',
       })
     },
-    onError: (e) => { setConfirmClear(false); failure(t('清空失败', 'Failed to clear'), e) },
+    onError: (e) => { setConfirmClear(null); failure(t('清空失败', 'Failed to clear'), e) },
   })
 
   const rows = query.data ?? []
@@ -1292,13 +1296,119 @@ function LearnedRejections() {
       return next
     })
 
+  /**
+   * 拒答规则按「模型 + 类别」折叠成一组：每条只拦逐字相同的一条提示词，一个下游被分类器盯上
+   * 几小时就是几百条，平铺会把其他几条有用的规则淹掉。别的种类照常一行一条。行本来按学到
+   * 时间倒序，组按首次出现排、组内保持原序。
+   */
+  type Entry =
+    | { type: 'row'; row: LearnedRejection }
+    | { type: 'group'; key: string; model: string; tag: string | null; rows: LearnedRejection[]; latest: number }
+  const entries: Entry[] = []
+  const groups = new Map<string, Extract<Entry, { type: 'group' }>>()
+  for (const row of visible) {
+    if (row.kind !== 'refusal') {
+      entries.push({ type: 'row', row })
+      continue
+    }
+    const { tag } = splitRuleMessage(row.message ?? '')
+    const key = `group:refusal:${row.model}:${tag ?? ''}`
+    let group = groups.get(key)
+    if (!group) {
+      group = { type: 'group', key, model: row.model, tag, rows: [], latest: row.learned_at }
+      groups.set(key, group)
+      entries.push(group)
+    }
+    group.rows.push(row)
+    group.latest = Math.max(group.latest, row.learned_at)
+  }
+
+  /** 一条规则：模型、种类、字段取值、可展开的上游原话、时间、删除。 */
+  function RuleItem({ row }: { row: LearnedRejection }) {
+    const key = ruleKey(row)
+    const tone = RULE_TONES[row.kind]
+    const { tag, body } = splitRuleMessage(row.message ?? '')
+    const open = expanded.has(key)
+    return (
+      <li className="flex items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/40">
+        <span
+          aria-hidden="true"
+          className={cn('mt-2 size-1.5 shrink-0 rounded-full', tone?.dot ?? 'bg-muted-foreground')}
+        />
+        <div className="min-w-0 flex-1 space-y-1.5">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="text-sm font-medium [overflow-wrap:anywhere]">{row.model}</span>
+            <Badge size="sm" variant={tone?.badge ?? 'secondary'}>
+              {kindLabel(row.kind)}
+            </Badge>
+            <code className="inline-flex min-w-0 items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">
+              <span className="text-muted-foreground">{row.field}</span>
+              {row.value && (
+                <>
+                  <span className="text-muted-foreground/60">=</span>
+                  <span className="[overflow-wrap:anywhere]">{row.value}</span>
+                </>
+              )}
+            </code>
+          </div>
+          {body && (
+            <div className="space-y-1.5">
+              <button
+                aria-expanded={open}
+                className="flex w-full items-center gap-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
+                type="button"
+                onClick={() => toggleMessage(key)}
+              >
+                <ChevronDownIcon
+                  aria-hidden="true"
+                  className={cn('size-3.5 shrink-0 transition-transform', !open && '-rotate-90')}
+                />
+                {tag && (
+                  <span className="shrink-0 rounded bg-muted px-1 py-px font-mono text-[10px]">
+                    {tag}
+                  </span>
+                )}
+                <span className={cn('min-w-0 flex-1 font-mono text-[11px]', !open && 'truncate')}>
+                  {open ? t('上游当时的回复', 'Upstream reply') : body}
+                </span>
+              </button>
+              {open && (
+                <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono text-[11px] leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+                  {body}
+                </pre>
+              )}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
+            <span title={formatFullTime(row.learned_at, language)}>
+              {t('学到于', 'Learned')} {relativeTime(row.learned_at, undefined, language)}
+            </span>
+            <span aria-hidden="true" className="opacity-40">·</span>
+            <span title={formatFullTime(row.expires_at, language)}>{expiresIn(row.expires_at)}</span>
+          </div>
+        </div>
+        <Button
+          aria-label={t('删除这条规则', 'Remove this rule')}
+          title={t('删除这条规则', 'Remove this rule')}
+          size="icon"
+          variant="ghost"
+          className="shrink-0 text-muted-foreground hover:text-foreground"
+          disabled={forget.isPending}
+          onClick={() => forget.mutate(row)}
+        >
+          <Trash2Icon />
+        </Button>
+      </li>
+    )
+  }
+
   return (
     <SettingsGroup
       icon={BrainIcon}
       title={t('从上游学到的规则', 'Rules learned from upstream')}
       description={t(
-        '上游点名过的组合会被记下来：某模型不收某取值的（400），下次本地直接拒；某模型已废弃某参数的（400），下次转发前剥掉；某模型对「无 tools 的单条消息 + 某个 max_tokens」回过 200 却零输出的，同类下次本地直接拒；某模型被分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的那条提示词，逐字相同的重发本地直接拒——只拦那一条内容，同形态的其他请求不受影响；模型自己拒的（无 category）或 fallback 没跑成的（带 recommended_model）不学（两条都是 403，各随「拒绝已拒答的提示词」/「拒绝零输出请求类」开关；出站带 fallbacks 的请求不拦），规则文案里是「[类别] + 上游 stop_details 原样」——零输出规则的文案才是上游回复的开头。规则落库、重启保留，7 天后自动丢弃重新验证。上游放开了而本地还在拦时，在这里删掉即可。',
-        'Combinations upstream has called out are remembered: a value a model refuses (400) is rejected locally next time; a parameter a model deprecated (400) is stripped before forwarding; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape; refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned (both 403, governed by "Reject refused prompts" / "Reject empty-reply request classes" respectively; requests going out with fallbacks are not blocked), with "[category] " plus the upstream stop_details verbatim kept as the rule text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. If upstream has since allowed something, remove the rule here.',
+        '上游点名过的组合会被记下来：某模型不收某取值的（400），下次本地直接拒；某模型已废弃某参数的（400），下次转发前剥掉；某模型对「无 tools 的单条消息 + 某个 max_tokens」回过 200 却零输出的，同类下次本地直接拒；某模型被分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的那条提示词，逐字相同的重发本地直接拒——只拦那一条内容，同形态的其他请求不受影响；模型自己拒的（无 category）或 fallback 没跑成的（带 recommended_model）不学（两条都是 403，各随「拒绝已拒答的提示词」/「拒绝零输出请求类」开关；出站带 fallbacks 的请求不拦），规则文案里是「[类别] + 上游 stop_details 原样」——零输出规则的文案才是上游回复的开头。规则落库、重启保留，7 天后自动丢弃重新验证。拒答规则不设上限、按「模型 + 类别」折叠成一组，点开看每条；筛选到某一类时可只清空那一类。上游放开了而本地还在拦时，在这里删掉即可。',
+        'Combinations upstream has called out are remembered: a value a model refuses (400) is rejected locally next time; a parameter a model deprecated (400) is stripped before forwarding; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape; refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned (both 403, governed by "Reject refused prompts" / "Reject empty-reply request classes" respectively; requests going out with fallbacks are not blocked), with "[category] " plus the upstream stop_details verbatim kept as the rule text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to see each prompt, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
       )}
     >
       {query.isPending ? (
@@ -1352,15 +1462,18 @@ function LearnedRejections() {
                 />
               ))}
             </div>
-            <Button
-              className="ms-auto"
-              size="xs"
-              variant="outline"
-              onClick={() => setConfirmClear(true)}
-            >
-              <Trash2Icon />
-              {t('全部清空', 'Clear all')}
-            </Button>
+            <div className="ms-auto flex items-center gap-1.5">
+              {kindFilter !== 'all' && (counts[kindFilter] ?? 0) > 0 && (
+                <Button size="xs" variant="outline" onClick={() => setConfirmClear(kindFilter)}>
+                  <Trash2Icon />
+                  {t(`清空这一类 ${counts[kindFilter]}`, `Clear this kind ${counts[kindFilter]}`)}
+                </Button>
+              )}
+              <Button size="xs" variant="outline" onClick={() => setConfirmClear('all')}>
+                <Trash2Icon />
+                {t('全部清空', 'Clear all')}
+              </Button>
+            </div>
           </div>
           {visible.length === 0 ? (
             <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm text-muted-foreground">
@@ -1371,99 +1484,83 @@ function LearnedRejections() {
             </div>
           ) : (
             <ul className="divide-y" role="list">
-              {visible.map((row) => {
-                const key = ruleKey(row)
-                const tone = RULE_TONES[row.kind]
-                const { tag, body } = splitRuleMessage(row.message ?? '')
-                const open = expanded.has(key)
-                return (
-                  <li key={key} className="flex items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/40">
-                    <span
-                      aria-hidden="true"
-                      className={cn('mt-2 size-1.5 shrink-0 rounded-full', tone?.dot ?? 'bg-muted-foreground')}
-                    />
-                    <div className="min-w-0 flex-1 space-y-1.5">
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                        <span className="text-sm font-medium [overflow-wrap:anywhere]">{row.model}</span>
-                        <Badge size="sm" variant={tone?.badge ?? 'secondary'}>
-                          {kindLabel(row.kind)}
+              {entries.map((entry) =>
+                entry.type === 'row' ? (
+                  <RuleItem key={ruleKey(entry.row)} row={entry.row} />
+                ) : (
+                  <li key={entry.key} className="px-4 py-3">
+                    <div className="flex items-start gap-3">
+                      <span
+                        aria-hidden="true"
+                        className={cn('mt-2 size-1.5 shrink-0 rounded-full', RULE_TONES.refusal.dot)}
+                      />
+                      <button
+                        aria-expanded={expanded.has(entry.key)}
+                        className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-left"
+                        type="button"
+                        onClick={() => toggleMessage(entry.key)}
+                      >
+                        <span className="text-sm font-medium [overflow-wrap:anywhere]">{entry.model}</span>
+                        <Badge size="sm" variant={RULE_TONES.refusal.badge}>
+                          {kindLabel('refusal')}
                         </Badge>
-                        <code className="inline-flex min-w-0 items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">
-                          <span className="text-muted-foreground">{row.field}</span>
-                          {row.value && (
-                            <>
-                              <span className="text-muted-foreground/60">=</span>
-                              <span className="[overflow-wrap:anywhere]">{row.value}</span>
-                            </>
-                          )}
-                        </code>
-                      </div>
-                      {body && (
-                        <div className="space-y-1.5">
-                          <button
-                            aria-expanded={open}
-                            className="flex w-full items-center gap-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
-                            type="button"
-                            onClick={() => toggleMessage(key)}
-                          >
-                            <ChevronDownIcon
-                              aria-hidden="true"
-                              className={cn('size-3.5 shrink-0 transition-transform', !open && '-rotate-90')}
-                            />
-                            {tag && (
-                              <span className="shrink-0 rounded bg-muted px-1 py-px font-mono text-[10px]">
-                                {tag}
-                              </span>
-                            )}
-                            <span className={cn('min-w-0 flex-1 font-mono text-[11px]', !open && 'truncate')}>
-                              {open ? t('上游当时的回复', 'Upstream reply') : body}
-                            </span>
-                          </button>
-                          {open && (
-                            <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono text-[11px] leading-5 text-muted-foreground [overflow-wrap:anywhere]">
-                              {body}
-                            </pre>
-                          )}
-                        </div>
-                      )}
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
-                        <span title={formatFullTime(row.learned_at, language)}>
-                          {t('学到于', 'Learned')} {relativeTime(row.learned_at, undefined, language)}
+                        {entry.tag && (
+                          <span className="rounded bg-muted px-1 py-px font-mono text-[10px]">{entry.tag}</span>
+                        )}
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {t(`${entry.rows.length} 条提示词`, `${entry.rows.length} prompt${entry.rows.length === 1 ? '' : 's'}`)}
                         </span>
-                        <span aria-hidden="true" className="opacity-40">·</span>
-                        <span title={formatFullTime(row.expires_at, language)}>{expiresIn(row.expires_at)}</span>
-                      </div>
+                        <span className="text-[11px] text-muted-foreground" title={formatFullTime(entry.latest, language)}>
+                          {t('最近学到于', 'Latest')} {relativeTime(entry.latest, undefined, language)}
+                        </span>
+                        <ChevronDownIcon
+                          aria-hidden="true"
+                          className={cn(
+                            'ms-auto size-3.5 shrink-0 text-muted-foreground transition-transform',
+                            !expanded.has(entry.key) && '-rotate-90',
+                          )}
+                        />
+                      </button>
                     </div>
-                    <Button
-                      aria-label={t('删除这条规则', 'Remove this rule')}
-                      title={t('删除这条规则', 'Remove this rule')}
-                      size="icon"
-                      variant="ghost"
-                      className="shrink-0 text-muted-foreground hover:text-foreground"
-                      disabled={forget.isPending}
-                      onClick={() => forget.mutate(row)}
-                    >
-                      <Trash2Icon />
-                    </Button>
+                    {expanded.has(entry.key) && (
+                      <ul className="mt-2 divide-y rounded-md border" role="list">
+                        {entry.rows.map((row) => (
+                          <RuleItem key={ruleKey(row)} row={row} />
+                        ))}
+                      </ul>
+                    )}
                   </li>
-                )
-              })}
+                ),
+              )}
             </ul>
           )}
-          <AlertDialog open={confirmClear} onOpenChange={setConfirmClear}>
+          <AlertDialog open={confirmClear !== null} onOpenChange={(open) => { if (!open) setConfirmClear(null) }}>
             <AlertDialogPopup>
               <AlertDialogHeader>
-                <AlertDialogTitle>{t('清空学到的规则', 'Clear learned rules')}</AlertDialogTitle>
+                <AlertDialogTitle>
+                  {confirmClear && confirmClear !== 'all'
+                    ? t(`清空「${kindLabel(confirmClear)}」`, `Clear "${kindLabel(confirmClear)}"`)
+                    : t('清空学到的规则', 'Clear learned rules')}
+                </AlertDialogTitle>
                 <AlertDialogDescription>
-                  {t(
-                    `将删除全部 ${rows.length} 条规则。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
-                    `All ${rows.length} rules will be removed. The same combinations will be sent upstream once more and re-learned if rejected.`,
-                  )}
+                  {confirmClear && confirmClear !== 'all'
+                    ? t(
+                        `将删除这一类的 ${counts[confirmClear] ?? 0} 条规则，其他种类不动。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
+                        `${counts[confirmClear] ?? 0} rules of this kind will be removed; other kinds are untouched. The same combinations will be sent upstream once more and re-learned if rejected.`,
+                      )
+                    : t(
+                        `将删除全部 ${rows.length} 条规则。之后同样的组合会再向上游发一次，被拒的话会重新学到。`,
+                        `All ${rows.length} rules will be removed. The same combinations will be sent upstream once more and re-learned if rejected.`,
+                      )}
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
-                <Button variant="destructive" loading={clear.isPending} onClick={() => clear.mutate()}>
+                <Button
+                  variant="destructive"
+                  loading={clear.isPending}
+                  onClick={() => clear.mutate(confirmClear === 'all' ? null : confirmClear)}
+                >
                   {t('清空', 'Clear')}
                 </Button>
               </AlertDialogFooter>

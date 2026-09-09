@@ -2068,6 +2068,13 @@ impl CredentialStore {
         Ok(self.conn.lock().execute("DELETE FROM learned_rejections", [])?)
     }
 
+    /// 只清某一种类（`kind` 列）的规则，返回删掉的条数。控制台「清空这一类」用：几百条拒答
+    /// 提示词淹没列表时，不必连 `deprecated` 那几条有用的一起清掉。
+    /// 拒答规则不设条数上限（进程内与库里都是），只靠 7 天保鲜期与这里的手动清理收口。
+    pub fn clear_learned_rejections_of_kind(&self, kind: &str) -> Result<usize> {
+        Ok(self.conn.lock().execute("DELETE FROM learned_rejections WHERE kind = ?1", [kind])?)
+    }
+
     /// 删掉一条学到的规则（按主键四元组），返回是否确有其行。
     pub fn forget_learned_rejection(&self, r: &LearnedRejection) -> Result<bool> {
         Ok(self.conn.lock().execute(

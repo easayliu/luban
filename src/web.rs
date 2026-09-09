@@ -1464,24 +1464,55 @@ async fn forget_learned_rejection(
     list_learned_rejections(State(state)).await
 }
 
-/// `DELETE /api/learned-rejections`：清空从上游 400 学到的全部规则——库里的和进程内的一起清。
+/// `DELETE /api/learned-rejections[?kind=…]`：清空从上游学到的规则——库里的和进程内的一起清。
+/// 不带 `kind` 清全部；带了只清那一种类（`shape` / `deprecated` / `empty_reply` / `refusal`），
+/// 种类名对不上回 400。
 ///
 /// 逃生口：上游放开了某个取值或恢复了某个参数，本地却还在按学到的旧规则拒/剥。7 天保鲜期
-/// 会自动过期，等不及就手动清。清错的代价只是每种组合再撞一次 400。
+/// 会自动过期，等不及就手动清。清错的代价只是每种组合再撞一次 400。按种类清是给拒答提示词
+/// 那一格准备的：一个下游被分类器盯上，几小时就灌进上百条，不该为清它们把别的规则也清掉。
 #[derive(Serialize)]
 struct ClearedLearnedResp {
     /// 从库里删掉的条数。
     deleted: usize,
 }
 
+#[derive(Deserialize)]
+struct ClearLearnedQuery {
+    kind: Option<String>,
+}
+
 async fn clear_learned_rejections(
     State(state): State<AppState>,
+    Query(q): Query<ClearLearnedQuery>,
 ) -> Result<Json<ClearedLearnedResp>, ApiError> {
-    let deleted = state.store.clear_learned_rejections().map_err(internal)?;
-    state.shape_rejections.write().clear();
-    state.deprecated_fields.write().clear();
-    *state.empty_replies.write() = Default::default();
-    tracing::info!(deleted, "learned upstream rejections cleared from the console");
+    let deleted = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => {
+            let deleted = state.store.clear_learned_rejections().map_err(internal)?;
+            state.shape_rejections.write().clear();
+            state.deprecated_fields.write().clear();
+            *state.empty_replies.write() = Default::default();
+            tracing::info!(deleted, "learned upstream rejections cleared from the console");
+            deleted
+        }
+        Some(kind) => {
+            if !proxy::clear_learned_memory_kind(
+                &state.shape_rejections,
+                &state.deprecated_fields,
+                &state.empty_replies,
+                kind,
+            ) {
+                return Err(bad_request(format!("unknown rule kind: {kind}")));
+            }
+            let deleted = state.store.clear_learned_rejections_of_kind(kind).map_err(internal)?;
+            tracing::info!(
+                deleted,
+                kind,
+                "learned upstream rejections of one kind cleared from the console"
+            );
+            deleted
+        }
+    };
     Ok(Json(ClearedLearnedResp { deleted }))
 }
 
