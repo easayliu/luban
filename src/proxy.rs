@@ -4729,8 +4729,23 @@ const BAN_KEYWORDS: &[&str] = &["invalid_grant", "oauth"];
 /// 反向豁免：命中其一则**一定不是**账号级问题，无论状态码与特征词如何都不停用。
 /// 用于挡住「特征词碰巧出现在非账号报错里」的误杀，见 [`detect_account_ban`]。
 /// 首项不写死 endpoint/model，是因为两者都出现过同款文案。
-const NOT_ACCOUNT_PHRASES: &[&str] =
-    &["not supported for this", "does not support", "unsupported model"];
+///
+/// 每一项都是**裸子串**匹配，且一旦命中就把 `oauth` 特征词与 401 `authentication_error`
+/// 两条判据整个作废，所以写得越像上游原话越好——短到只剩「not allowed for this」这种
+/// 片段，任何顺带提到它的真封号文案都会被放过去。「主语 + 状态词」共现不受这里影响，
+/// 见 [`detect_account_ban`]。
+///
+/// 末项取自 `OAuth authentication is currently not allowed for this organization.`：组织
+/// 管理员没放开（或关掉了）Claude Code 的 OAuth 登录，是**组织侧的权限配置**、开回来就
+/// 恢复，不是账号被封；它带 `oauth` 一词，不豁免会被 [`BAN_KEYWORDS`] 命中而永久停用
+/// （保活路径此前正是这么误封的）。只去掉结尾的主语（organization / workspace 都可能），
+/// 前半句整句保留。
+const NOT_ACCOUNT_PHRASES: &[&str] = &[
+    "not supported for this",
+    "does not support",
+    "unsupported model",
+    "oauth authentication is currently not allowed for this",
+];
 
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
 /// 取一个响应头的文本值；缺失或非 UTF-8 时返回 `"-"`，与日志里其余缺值字段同形。
@@ -4738,7 +4753,7 @@ fn header_text(headers: &HeaderMap, name: &str) -> String {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string()
 }
 
-fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
+pub(crate) fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     let text = String::from_utf8_lossy(body);
     let v = serde_json::from_slice::<serde_json::Value>(body).ok();
     let field = |name: &str| {
@@ -4758,34 +4773,77 @@ fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
 /// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。
 ///
 /// 「命中特征词」= [`BAN_KEYWORDS`] 之一，或 [`BAN_SUBJECTS`] 与 [`BAN_STATES`] 各中一项。
-fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
+pub(crate) fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
     let (etype, message) = parse_upstream_error(body);
-    let reason = || {
-        let head = match &etype {
-            Some(t) => format!("[{}] {t}: {message}", status.as_u16()),
-            None => format!("[{}] {message}", status.as_u16()),
-        };
-        head.chars().take(200).collect::<String>()
-    };
-    let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
-    // 先排除「端点/能力不支持」这类与账号状态无关的报错——它们可能带上 oauth 等特征词
-    // （如 401 `OAuth authentication is currently not supported for this endpoint`），
-    // 但账号本身是好的，停用了反而白扣一个号。
-    if NOT_ACCOUNT_PHRASES.iter().any(|p| hay.contains(p)) {
-        return None;
-    }
-    let hits_keyword = || {
-        BAN_KEYWORDS.iter().any(|k| hay.contains(k))
-            || (BAN_SUBJECTS.iter().any(|s| hay.contains(s))
-                && BAN_STATES.iter().any(|s| hay.contains(s)))
-    };
-    match status {
-        StatusCode::UNAUTHORIZED => {
-            (etype.as_deref() == Some("authentication_error") || hits_keyword()).then(reason)
+    match ban_verdict(status, etype.as_deref(), &message) {
+        BanVerdict::Ban => {
+            let head = match &etype {
+                Some(t) => format!("[{}] {t}: {message}", status.as_u16()),
+                None => format!("[{}] {message}", status.as_u16()),
+            };
+            Some(head.chars().take(200).collect())
         }
-        StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST => hits_keyword().then(reason),
-        _ => None,
+        BanVerdict::Exempt { phrase, overrode_signal: true } => {
+            // 豁免改写了结论：没有它这条会被停用。新出现的混合文案（真封号却顺带提到豁免
+            // 短语）会先在这里露头，而不是等复盘时才发现漏封。豁免没改写结论的（比如
+            // 400 参数错误里回显了字段名）不记，那是每天都有的正常报错。
+            tracing::warn!(
+                status = status.as_u16(),
+                error_type = etype.as_deref().unwrap_or("-"),
+                phrase,
+                message = %message.chars().take(300).collect::<String>(),
+                "account-ban check: an exemption phrase overrode a ban signal; leaving the credential enabled (review if this is a new upstream wording)"
+            );
+            None
+        }
+        BanVerdict::Exempt { overrode_signal: false, .. } | BanVerdict::Clear => None,
     }
+}
+
+/// [`detect_account_ban`] 的纯判定部分，拆出来是为了能直接测「豁免有没有改写结论」。
+#[derive(Debug, PartialEq, Eq)]
+enum BanVerdict {
+    /// 账号级错误，停用。
+    Ban,
+    /// 命中了 [`NOT_ACCOUNT_PHRASES`] 的 `phrase` 而放行；`overrode_signal` 为真表示
+    /// 若无豁免本会停用（特征词或 401 `authentication_error` 命中了），值得记一条日志。
+    Exempt { phrase: &'static str, overrode_signal: bool },
+    /// 什么都没命中，普通 4xx。
+    Clear,
+}
+
+fn ban_verdict(status: StatusCode, etype: Option<&str>, message: &str) -> BanVerdict {
+    let hay = format!("{} {}", etype.unwrap_or(""), message).to_lowercase();
+    // 「主语 + 状态词」共现（organization disabled / account suspended）是最明确的账号级
+    // 信号，**压过下面的豁免**：将来上游若把「organization disabled … OAuth … not allowed
+    // for this organization」写在同一句里，不能因为带了豁免短语就漏掉一次真封号。
+    let subject_and_state =
+        BAN_SUBJECTS.iter().any(|s| hay.contains(s)) && BAN_STATES.iter().any(|s| hay.contains(s));
+    // 较弱的两条判据：独立特征词，以及 401 的 `authentication_error` 类型。
+    let weak_signal = match status {
+        StatusCode::UNAUTHORIZED => {
+            etype == Some("authentication_error") || BAN_KEYWORDS.iter().any(|k| hay.contains(k))
+        }
+        StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST => {
+            BAN_KEYWORDS.iter().any(|k| hay.contains(k))
+        }
+        _ => false,
+    };
+    if subject_and_state
+        && matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST
+        )
+    {
+        return BanVerdict::Ban;
+    }
+    // 排除「端点/能力不支持」「组织没放开 OAuth」这类与账号状态无关的报错——它们可能带上
+    // oauth 等特征词（如 401 `OAuth authentication is currently not supported for this
+    // endpoint`），但账号本身是好的，停用了反而白扣一个号。豁免只挡得住上面两条弱判据。
+    if let Some(phrase) = NOT_ACCOUNT_PHRASES.iter().find(|p| hay.contains(*p)) {
+        return BanVerdict::Exempt { phrase, overrode_signal: weak_signal };
+    }
+    if weak_signal { BanVerdict::Ban } else { BanVerdict::Clear }
 }
 
 /// 「被判成第三方应用」的特征文案。上游原文形如：
@@ -11752,7 +11810,7 @@ impl ProbeReport {
 ///
 /// 而**账号状态照真实流量的口径更新**：这条请求是真实的——真花额度、拿到的也是上游此刻
 /// 的真实判决，429 就该打冷却（同一套 [`rate_limit_scope`] 分格）、命中封号特征就该
-/// [`store::CredentialStore::mark_banned`]、刷新时发现 `refresh_token` 被作废亦然（见
+/// [`store::CredentialStore::record_ban`]、刷新时发现 `refresh_token` 被作废亦然（见
 /// [`store::access_token_of`]）。否则测试报了「已封禁」而卡片上一切如常，两边各说各话，
 /// 用户还得自己动手把号停掉。唯一仍与转发不同的是**不换号重试**——测的就是这一个，
 /// 换了号结论就不是它的了。冷却与转发共用 `rate_limit_retry` 那个开关（关掉即两边都
@@ -14230,6 +14288,21 @@ mod tests {
             ),
             // OAuth 刷新失败没有主语词，靠独立特征词命中。
             (StatusCode::BAD_REQUEST, err_body("invalid_request_error", "invalid_grant")),
+            // 豁免短语与明确的「主语 + 状态词」同句：后者优先，仍是封号。
+            (
+                StatusCode::FORBIDDEN,
+                err_body(
+                    "permission_error",
+                    "This organization has been disabled; OAuth authentication is not allowed for this organization.",
+                ),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                err_body(
+                    "permission_error",
+                    "Account suspended: this feature is not supported for this account.",
+                ),
+            ),
         ];
         for (status, body) in cases {
             assert!(
@@ -14238,6 +14311,66 @@ mod tests {
                 String::from_utf8_lossy(&body)
             );
         }
+    }
+
+    /// 豁免有没有改写结论要分得清：改写了的（没有豁免就会停用）记日志，没改写的（普通
+    /// 参数错误回显字段名）不记；「主语 + 状态词」共现不受豁免影响。
+    #[test]
+    fn ban_verdict_tells_overriding_exemptions_apart() {
+        use super::{BanVerdict, ban_verdict};
+        let org_oauth = "OAuth authentication is currently not allowed for this organization.";
+        assert_eq!(
+            ban_verdict(StatusCode::FORBIDDEN, Some("permission_error"), org_oauth),
+            BanVerdict::Exempt {
+                phrase: "oauth authentication is currently not allowed for this",
+                overrode_signal: true,
+            },
+            "带 oauth 特征词，没有豁免会停用"
+        );
+        assert_eq!(
+            ban_verdict(
+                StatusCode::UNAUTHORIZED,
+                Some("authentication_error"),
+                "OAuth authentication is currently not supported for this endpoint",
+            ),
+            BanVerdict::Exempt { phrase: "not supported for this", overrode_signal: true },
+            "401 authentication_error 本会停用"
+        );
+        assert_eq!(
+            ban_verdict(
+                StatusCode::BAD_REQUEST,
+                Some("invalid_request_error"),
+                "\"thinking.type.disabled\" is not supported for this model.",
+            ),
+            BanVerdict::Exempt { phrase: "not supported for this", overrode_signal: false },
+            "状态词没有主语、没有特征词：豁免没改写什么，不必记"
+        );
+        assert_eq!(
+            ban_verdict(
+                StatusCode::FORBIDDEN,
+                Some("permission_error"),
+                "This organization has been disabled; OAuth authentication is not allowed for this organization.",
+            ),
+            BanVerdict::Ban,
+            "主语 + 状态词压过豁免"
+        );
+        assert_eq!(
+            ban_verdict(
+                StatusCode::FORBIDDEN,
+                Some("permission_error"),
+                "No access to claude-opus-5"
+            ),
+            BanVerdict::Clear
+        );
+        assert_eq!(
+            ban_verdict(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("rate_limit_error"),
+                "account suspended"
+            ),
+            BanVerdict::Clear,
+            "只看 400/401/403"
+        );
     }
 
     /// 非账号问题的 4xx 不得停用——这类误杀会把健康账号一个个扣掉。
@@ -14277,6 +14410,22 @@ mod tests {
             (
                 StatusCode::BAD_REQUEST,
                 err_body("invalid_request_error", "Your account has insufficient credits"),
+            ),
+            // 组织没放开 OAuth：组织侧权限配置，管理员开回来就恢复。带 `oauth` 一词，
+            // 不豁免会被特征词命中；401/403 两种状态码都见过同款文案。
+            (
+                StatusCode::FORBIDDEN,
+                err_body(
+                    "permission_error",
+                    "OAuth authentication is currently not allowed for this organization.",
+                ),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                err_body(
+                    "authentication_error",
+                    "OAuth authentication is currently not allowed for this organization.",
+                ),
             ),
         ];
         for (status, body) in cases {

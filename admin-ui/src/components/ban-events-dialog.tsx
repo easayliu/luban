@@ -41,6 +41,7 @@ function sourceLabel(source: string, t: (zh: string, en: string) => string): str
     case 'forward': return t('转发 4xx', 'Forward 4xx')
     case 'forward_401': return t('转发 401 换号', 'Forward 401 swap')
     case 'probe': return t('连通性测试', 'Connectivity test')
+    case 'keepalive': return t('保活端点 401/403', 'Keepalive 401/403')
     case 'refresh': return t('刷新 token 被作废', 'Refresh revoked')
     case 'proxy': return t('代理不可用', 'Proxy unusable')
     default: return source

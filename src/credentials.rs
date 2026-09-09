@@ -49,7 +49,7 @@ pub struct Credential {
     /// 同上，**7d 窗口**那一档；`None` 跟随全局 [`crate::store::QUOTA_PAUSE_PCT_7D`]。
     pub quota_pause_pct_7d: Option<i64>,
     /// 自动检测到的上游账号级错误原因（如封号）；`None` 表示未被自动停用
-    /// （手动停用或未停用皆为 `None`）。见 [`crate::store::CredentialStore::mark_banned`]。
+    /// （手动停用或未停用皆为 `None`）。见 [`crate::store::CredentialStore::record_ban`]。
     pub ban_reason: Option<String>,
     /// 账号 UUID（来自 `/api/oauth/profile` 的 `account.uuid`）；转发时用于身份伪装。
     pub account_uuid: Option<String>,

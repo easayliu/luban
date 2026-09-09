@@ -11,29 +11,96 @@ use crate::config;
 use crate::credentials::now_secs;
 
 /// 保活端点的返回状态。调用点根据 `AuthRejected` 标 banned 并跳过后续端点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepaliveResult {
     Ok,
-    /// 上游 401/403——token 已吊销或账号被暂停。
-    AuthRejected,
+    /// 上游 401/403——token 已吊销、账号被暂停，也可能是组织权限不足或区域限制。到底是
+    /// 哪一种只有响应体说得清，所以把状态码、响应体与上游 `request-id` 一并带回，由调用点
+    /// 写进封号事件（[`crate::store::CredentialStore::record_ban`]）。此前这是个单元变体，
+    /// 落库的原因固定成「upstream 401/403」、来源记成 `manual`，事后无从区分。
+    AuthRejected(AuthRejection),
     /// 网络错误或 5xx。
     Failed,
 }
 
+/// 保活端点 401/403 时的响应上下文，见 [`KeepaliveResult::AuthRejected`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRejection {
+    /// 哪个端点拒的（`event_logging` / `bootstrap` / `policy_limits` / …）。
+    pub endpoint: &'static str,
+    pub status: u16,
+    /// 响应体原文，最多 [`AUTH_REJECTION_BODY_CAP`] 个字符。通常是 Anthropic 的错误 JSON
+    /// （`error.type` / `error.message`），也可能是网关的 HTML；解析交给调用点。
+    pub body: String,
+    /// 上游响应头 `request-id`。
+    pub request_id: Option<String>,
+}
+
+/// 401/403 响应体最多留这么多字符：错误 JSON 几百字节，网关 HTML 几 KB，再长的没有诊断价值。
+pub const AUTH_REJECTION_BODY_CAP: usize = 4096;
+
+/// 从线上最多**读**这么多字节就停：[`AUTH_REJECTION_BODY_CAP`] 是字符数，UTF-8 一个字符最多
+/// 4 字节，读到这里必定够截。与「先整体读完再截」的差别在于异常大的网关页面不会整个进内存。
+const AUTH_REJECTION_READ_CAP: usize = AUTH_REJECTION_BODY_CAP * 4;
+
 impl KeepaliveResult {
+    /// 非 401/403 的状态码直接定档。401/403 必须走 [`Self::from_response`] /
+    /// [`Self::from_parts`] 把响应体带上，别在这里丢掉。
     fn from_status(status: u16) -> Self {
-        if status == 401 || status == 403 {
-            Self::AuthRejected
-        } else if status >= 500 {
-            Self::Failed
-        } else {
-            Self::Ok
-        }
+        debug_assert!(status != 401 && status != 403, "401/403 must carry the response body");
+        if status >= 500 { Self::Failed } else { Self::Ok }
     }
 
-    pub fn is_ok(self) -> bool {
-        self == Self::Ok
+    /// 按响应定档：401/403 时读体、取 `request-id`，其它状态码不读体。
+    async fn from_response(r: wreq::Response, endpoint: &'static str) -> Self {
+        let status = r.status().as_u16();
+        if status != 401 && status != 403 {
+            return Self::from_status(status);
+        }
+        let request_id = upstream_request_id(&r);
+        let body = read_body_capped(r, AUTH_REJECTION_READ_CAP).await;
+        Self::from_parts(endpoint, status, request_id, &body)
     }
+
+    /// 体已经在手（条件 GET 为算摘要总会读体）时用。
+    fn from_parts(
+        endpoint: &'static str,
+        status: u16,
+        request_id: Option<String>,
+        body: &[u8],
+    ) -> Self {
+        if status != 401 && status != 403 {
+            return Self::from_status(status);
+        }
+        let body = String::from_utf8_lossy(body).chars().take(AUTH_REJECTION_BODY_CAP).collect();
+        Self::AuthRejected(AuthRejection { endpoint, status, body, request_id })
+    }
+
+    pub fn is_ok(&self) -> bool {
+        *self == Self::Ok
+    }
+}
+
+/// 上游响应头 `request-id`（与转发路径记进流水的是同一个头）。
+fn upstream_request_id(r: &wreq::Response) -> Option<String> {
+    r.headers().get("request-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+/// 逐块读响应体，攒够 `cap` 字节就停、不再等剩下的；读到一半出错就交出已有的部分。
+/// 只用于**要存下来的错误体**：正常 2xx 体（etag 摘要、版本号）仍整体读，它们本来就小且要完整。
+async fn read_body_capped(r: wreq::Response, cap: usize) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let mut out = Vec::new();
+    let mut stream = r.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let room = cap.saturating_sub(out.len());
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
 }
 
 /// 一组 OAuth token（交换或刷新得到），交由 [`crate::store`] 落库。
@@ -1003,7 +1070,7 @@ pub async fn keepalive_event_logging(
     .send()
     .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "event_logging").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1067,6 +1134,10 @@ async fn conditional_get(
 ) -> KeepaliveResult {
     let Ok(r) = req.send().await else { return KeepaliveResult::Failed };
     let status = r.status().as_u16();
+    if status == 401 || status == 403 {
+        // 拒绝体只为存证，受限读；摘要只记 200 的体（见 remember_etag），这里不用算。
+        return KeepaliveResult::from_response(r, endpoint).await;
+    }
     // 读 body 只为算摘要；这两个端点的响应都是几百字节量级。
     let body = r.bytes().await.unwrap_or_default();
     remember_etag(cred_id, endpoint, status, &body);
@@ -1102,7 +1173,7 @@ pub async fn keepalive_bootstrap(
     .send()
     .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "bootstrap").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1124,7 +1195,7 @@ pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -
     .send()
     .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "penguin_mode").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1154,7 +1225,7 @@ pub async fn keepalive_eval(
         .send()
         .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "eval").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1185,7 +1256,11 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
         .send()
         .await;
         let Ok(r) = resp else { return KeepaliveResult::Failed };
-        last = KeepaliveResult::from_status(r.status().as_u16());
+        let status = r.status().as_u16();
+        if status == 401 || status == 403 {
+            return KeepaliveResult::from_response(r, "mcp_registry").await;
+        }
+        last = KeepaliveResult::from_status(status);
         let next = r
             .json::<serde_json::Value>()
             .await
@@ -1228,7 +1303,7 @@ async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> Kee
     .send()
     .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "mcp_servers").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1258,7 +1333,7 @@ async fn handshake_code_triggers(
     .send()
     .await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "code_triggers").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1267,7 +1342,7 @@ async fn handshake_code_triggers(
 async fn handshake_download(client: &wreq::Client, path: &str) -> KeepaliveResult {
     let resp = download_request(client, path).send().await;
     match resp {
-        Ok(r) => KeepaliveResult::from_status(r.status().as_u16()),
+        Ok(r) => KeepaliveResult::from_response(r, "download").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
@@ -1526,6 +1601,9 @@ async fn fetch_latest_release_inner(client: &wreq::Client) -> KeepaliveResult {
         Err(_) => return KeepaliveResult::Failed,
     };
     let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return KeepaliveResult::from_response(resp, "releases_latest").await;
+    }
     let result = KeepaliveResult::from_status(status);
     if (200..300).contains(&status) {
         match resp.text().await {
@@ -1723,6 +1801,35 @@ pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx
 
 #[cfg(test)]
 mod tests {
+    use super::{AUTH_REJECTION_BODY_CAP, KeepaliveResult};
+
+    /// 401/403 必须把状态码、响应体、上游 request-id 带回来；别的状态码照旧只定档。
+    #[test]
+    fn keepalive_result_keeps_the_rejection_context() {
+        let body =
+            br#"{"error":{"type":"permission_error","message":"Organization has been disabled."}}"#;
+        match KeepaliveResult::from_parts("bootstrap", 403, Some("req_1".into()), body) {
+            KeepaliveResult::AuthRejected(r) => {
+                assert_eq!(r.endpoint, "bootstrap");
+                assert_eq!(r.status, 403);
+                assert_eq!(r.request_id.as_deref(), Some("req_1"));
+                assert!(r.body.contains("Organization has been disabled"));
+            }
+            other => panic!("expected AuthRejected, got {other:?}"),
+        }
+        assert!(KeepaliveResult::from_parts("x", 200, None, b"").is_ok());
+        assert!(KeepaliveResult::from_parts("x", 304, None, b"").is_ok());
+        assert_eq!(KeepaliveResult::from_parts("x", 503, None, b"oops"), KeepaliveResult::Failed);
+        // 超长体按字符截断，别把几十 KB 的网关页面整个塞进封号事件。
+        let long = "é".repeat(AUTH_REJECTION_BODY_CAP * 2);
+        let KeepaliveResult::AuthRejected(r) =
+            KeepaliveResult::from_parts("x", 401, None, long.as_bytes())
+        else {
+            panic!("401 must be AuthRejected");
+        };
+        assert_eq!(r.body.chars().count(), AUTH_REJECTION_BODY_CAP);
+    }
+
     /// `releases/latest` 的体是一行裸版本串；别的形态一律不认。
     #[test]
     fn release_body_must_be_a_bare_three_part_version() {

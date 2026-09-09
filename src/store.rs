@@ -1038,7 +1038,7 @@ impl CredentialStore {
     /// 上游确认限流（账号级 429）时调用：把这个号停用并记下**到点自动恢复的时刻**，
     /// 同时清空其设备绑定，让绑在它上面的设备下一条请求立刻改选别的号。
     ///
-    /// 与 [`Self::mark_banned`] 的唯一结构差别是多写一个 `resume_at`，而那正是
+    /// 与 [`Self::record_ban`] 的唯一结构差别是多写一个 `resume_at`，而那正是
     /// 「限流暂停」与「封号/人工停用」的分界：`resume_at` 非空的号会被
     /// [`Self::resume_due`] 到点自动启用、也会被连通性测试成功时自动启用
     /// （见 [`Self::resume_if_rate_limited`]），另外两种则必须人工介入。
@@ -1098,9 +1098,16 @@ impl CredentialStore {
     /// 「管理员手动停用」与「上游自动判定停用」。封号是需要人工介入的终态，不写
     /// `resume_at`（对比 [`Self::pause_for_rate_limit`]）。
     ///
-    /// 这是 [`Self::record_ban`] 的简写：只有一句原因、没有别的上下文时用（事件来源记为
-    /// `manual`）。有上游响应在手的调用方应走 `record_ban`，把状态码、完整报文、请求 id 一并
-    /// 存进封号事件。
+    /// 这是 [`Self::record_ban`] 的简写：只有一句原因、没有别的上下文（事件来源记为
+    /// `manual`）。**已弃用**：生产路径一律走 `record_ban`，把状态码、完整报文、请求 id
+    /// 一并存进封号事件——此前保活循环拿它记 401/403，事件里只剩「upstream 401/403」，
+    /// token 吊销、组织权限、区域限制与真封号分不开（见 `web::handle_keepalive_rejection`）。
+    /// 保留为兼容入口并标 deprecated，新调用点编译时会被警告；测试里用它造「已封禁」状态。
+    #[allow(dead_code)] // 兼容入口：本 crate 内只剩测试在用
+    #[deprecated(
+        since = "0.3.97",
+        note = "走 record_ban 并带上 BanContext（状态码、错误正文、request id），别只留一句原因"
+    )]
     pub fn mark_banned(&self, id: i64, reason: &str) -> Result<bool> {
         self.record_ban(
             id,
@@ -3943,7 +3950,7 @@ impl CredentialStore {
     /// 终身请求数与费用、封前 7 天的请求数/设备数/模型/客户端）：这些在事后从别处凑不齐——
     /// 账号可能已被删、流水可能已被裁，而它们正是拿被封的号和活着的号对照时最先要看的列。
     ///
-    /// 返回值同 [`Self::mark_banned`]：凭证不存在时为 `false`（此时也不落事件——没有主体）。
+    /// 凭证不存在时返回 `false`（此时也不落事件——没有主体）。
     pub fn record_ban(&self, id: i64, ctx: &BanContext) -> Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
@@ -4245,10 +4252,12 @@ pub const FREEZE_TAIL_SECS: i64 = 600;
 /// 一次自动停用的上下文，见 [`CredentialStore::record_ban`]。
 #[derive(Debug, Default, Clone)]
 pub struct BanContext {
-    /// 写进 `credentials.ban_reason` 的一句话（200 字符内），与旧 `mark_banned` 的参数同义。
+    /// 写进 `credentials.ban_reason` 的一句话（200 字符内）。
     pub reason: String,
     /// 触发来源：`forward`（转发 4xx）、`forward_401`（转发 401 换号）、`probe`（连通性
-    /// 测试）、`refresh`（刷新 token 被作废）、`proxy`（代理建不出来）、`manual`（其它）。
+    /// 测试）、`keepalive`（保活端点 401/403）、`refresh`（刷新 token 被作废）、`proxy`
+    /// （代理建不出来）、`manual`（其它，目前只有测试用）。前端
+    /// `ban-events-dialog.tsx` 的 `sourceLabel` 与这份表一一对应。
     pub source: &'static str,
     /// 上游 HTTP 状态码（有的话）。
     pub status: Option<u16>,
@@ -5235,7 +5244,7 @@ pub enum TokenAttempt {
 /// **刷新失败要自动换号**：`select_for_device` 在返回前就写好了设备绑定，之后才轮到刷新。
 /// 若刷新失败直接把错误抛出去，这个设备就被钉死在坏号上——绑定还在，下一次请求照样选中它，
 /// 永远 503 直到人工介入。故这里在「refresh_token 已被作废」时停用该凭证
-/// （[`CredentialStore::mark_banned`] 会连带清掉它的设备绑定），再重选一个号继续。
+/// （[`CredentialStore::record_ban`] 会连带清掉它的设备绑定），再重选一个号继续。
 /// 网络抖动/5xx 这类可重试错误**不**停用，原样抛出，让客户端重试时还落回同一个号。
 pub async fn valid_access_token_for_device(
     store: &CredentialStore,
@@ -5422,6 +5431,8 @@ pub async fn ensure_fresh_token(
 
 #[cfg(test)]
 mod tests {
+    // 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
+    #![allow(deprecated)]
     use super::*;
 
     /// 旧库（无 AUTOINCREMENT）经 init_schema 迁移后，删号腾出的 id 不再被复用。

@@ -268,8 +268,10 @@ pub async fn run(
                         continue;
                     }
                 };
-                // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。
-                seen.retain(|id| creds.iter().any(|c| c.id == *id));
+                // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。已封禁的也
+                // 忘掉：它在下面被跳过，之后若被管理员重新启用，就该像新号一样重新跑一遍
+                // bootstrap，而不是因为停用前那一轮的标记还在而只发 event_logging。
+                seen.retain(|id| creds.iter().any(|c| c.id == *id && !c.is_banned()));
                 // 这一 tick 拉过 `releases/latest` 没有。它无鉴权、与账号无关，一轮拉一次就够；
                 // 但也**不用直连**——借第一张能建出客户端的凭证的出口发，跟其他出站一个待遇。
                 let mut fetched_latest = false;
@@ -282,7 +284,17 @@ pub async fn run(
                         Err(e) => {
                             let reason = format!("[proxy] {e:#}");
                             tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %reason, "keepalive: proxy unusable, disabling the credential");
-                            let _ = store.mark_banned(cred.id, &reason);
+                            // 与转发路径的同一分支（`proxy::handle`）口径一致：来源 `proxy`、
+                            // 完整错误进 error_message。保活没有来访请求，request_id 留空。
+                            let _ = store.record_ban(
+                                cred.id,
+                                &store::BanContext {
+                                    reason,
+                                    source: "proxy",
+                                    error_message: Some(format!("{e:#}")),
+                                    ..Default::default()
+                                },
+                            );
                             continue;
                         }
                     };
@@ -307,7 +319,7 @@ pub async fn run(
                         Ok(store::TokenAttempt::Ready(t)) => t,
                         Ok(store::TokenAttempt::Revoked(reason)) => {
                             tracing::warn!(cred_id = cred.id, cred = %cred.label, %reason, "keepalive: refresh_token revoked, disabling");
-                            let _ = store.mark_banned(cred.id, &reason);
+                            let _ = store.record_ban(cred.id, &store::refresh_ban(&reason));
                             continue;
                         }
                         Err(e) => {
@@ -338,9 +350,12 @@ pub async fn run(
                     // --- 每 tick：空闲遥测（可关） ---
                     let (ev_ok, dd_ok) = if send_telemetry {
                         let ev = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
-                        if ev == oauth::KeepaliveResult::AuthRejected {
-                            tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (event_logging 401/403), marking as banned");
-                            let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
+                        if let oauth::KeepaliveResult::AuthRejected(rej) = &ev {
+                            handle_keepalive_rejection(&store, &cred, rej);
+                            // 无论停没停成，这一轮的首次握手都没跑完：撤掉标记，下轮（没停成
+                            // 的号）或重新启用后（停成的号）重来一遍。库写失败时号仍是启用
+                            // 的，尤其不能当成「处理完了」。
+                            seen.remove(&cred.id);
                             continue;
                         }
                         (ev, oauth::keepalive_datadog_logs(&http, &ctx).await)
@@ -366,9 +381,9 @@ pub async fn run(
                             &ctx.model_normalized(),
                         )
                         .await;
-                        if bo == oauth::KeepaliveResult::AuthRejected {
-                            tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: token rejected by upstream (bootstrap 401/403), marking as banned");
-                            let _ = store.mark_banned(cred.id, "[keepalive] upstream 401/403");
+                        if let oauth::KeepaliveResult::AuthRejected(rej) = &bo {
+                            handle_keepalive_rejection(&store, &cred, rej);
+                            seen.remove(&cred.id);
                             continue;
                         }
                         let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
@@ -3304,10 +3319,244 @@ fn open_in_browser(url: &str) {
     }
 }
 
+/// 保活端点回 401/403：**诊断与停用判定分开**。先把完整上下文（端点、状态码、错误类型与
+/// 文案、上游 request-id）记进日志，再按转发路径同一套 [`proxy::detect_account_ban`] 决定
+/// 要不要停用——命中账号级特征（401 `authentication_error`、`invalid_grant`、「账号 /
+/// 组织 被停用」之类）才 [`CredentialStore::record_ban`]，事件里带同一份上下文；没命中的
+/// （组织未放开 OAuth、`permission_error`、区域限制、网关页面……）只记日志，凭证留在池里。
+/// 返回是否停用了。
+///
+/// 此前这里是「任何 401/403 一律 `mark_banned`」：来源记成 `manual`、原因固定「upstream
+/// 401/403」，状态码、正文、request-id 全丢，且组织权限配置一类**可恢复**的拒绝也被当成
+/// 终态永久停用。转发路径早就不这么判了（见 `detect_account_ban` 的三档说明），保活没理由
+/// 更激进：它发的还是与账号状态无关的遥测/握手端点。
+///
+/// 不停用的那些该不该临时暂停（比如组织管理员把 OAuth 关了，开回来之前每条真实请求都会
+/// 吃 403）——等这批带类型的诊断日志攒出分布再定，现在先不替用户决定。
+///
+/// 返回值是「**确实停用了**」：判定不命中、库写失败、号已不存在都算 `false`——库写失败时
+/// 号仍是启用的，调用方不能把它当成处理完了。
+fn handle_keepalive_rejection(
+    store: &CredentialStore,
+    cred: &Credential,
+    rej: &oauth::AuthRejection,
+) -> bool {
+    let ctx = keepalive_ban_context(rej);
+    let account_level = keepalive_rejection_is_account_level(rej);
+    if !account_level {
+        tracing::warn!(
+            cred_id = cred.id, cred = %cred.label,
+            endpoint = rej.endpoint, status = rej.status,
+            error_type = ctx.error_type.as_deref().unwrap_or("-"),
+            error_message = ctx.error_message.as_deref().unwrap_or("-"),
+            upstream_request_id = ctx.upstream_request_id.as_deref().unwrap_or("-"),
+            "keepalive: upstream rejected the token but it is not an account-level error; leaving the credential enabled"
+        );
+        return false;
+    }
+    tracing::warn!(
+        cred_id = cred.id, cred = %cred.label,
+        endpoint = rej.endpoint, status = rej.status,
+        error_type = ctx.error_type.as_deref().unwrap_or("-"),
+        upstream_request_id = ctx.upstream_request_id.as_deref().unwrap_or("-"),
+        reason = %ctx.reason,
+        "keepalive: account-level error from upstream, marking as banned"
+    );
+    match store.record_ban(cred.id, &ctx) {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: credential vanished before it could be disabled");
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                cred_id = cred.id, cred = %cred.label, error = %e,
+                "keepalive: failed to disable the credential; it stays enabled until the next tick or a forwarded request trips the same check"
+            );
+            false
+        }
+    }
+}
+
+/// 保活 401/403 是不是账号级错误：与转发路径共用 [`proxy::detect_account_ban`] 的判据，
+/// 两边对同一条报文给同一个答案，免得保活放行的号下一条真实请求又被转发路径停掉（或反过来）。
+fn keepalive_rejection_is_account_level(rej: &oauth::AuthRejection) -> bool {
+    StatusCode::from_u16(rej.status)
+        .ok()
+        .and_then(|status| proxy::detect_account_ban(status, rej.body.as_bytes()))
+        .is_some()
+}
+
+/// 把保活端点的 401/403 响应整理成封号上下文：`reason` 是 `[keepalive/<端点> <状态码>]
+/// <类型>: <文案>` 截到 200 字符；`error_message` 是完整文案（体不是 Anthropic 错误 JSON
+/// 时就是整段体，比如网关的 HTML）；空体写明 `(empty body)`，别留一个光秃秃的前缀。
+fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
+    let (error_type, message) = proxy::parse_upstream_error(rej.body.as_bytes());
+    let message = if message.trim().is_empty() { "(empty body)".to_string() } else { message };
+    let head = match &error_type {
+        Some(t) => format!("[keepalive/{} {}] {t}: {message}", rej.endpoint, rej.status),
+        None => format!("[keepalive/{} {}] {message}", rej.endpoint, rej.status),
+    };
+    store::BanContext {
+        reason: head.chars().take(200).collect(),
+        source: "keepalive",
+        status: Some(rej.status),
+        error_type,
+        error_message: Some(message),
+        request_id: None,
+        upstream_request_id: rej.request_id.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    /// 保活 401/403 的封号上下文要能区分「类型」：permission_error 与 authentication_error
+    /// 在 reason / error_type 里都得看得见，状态码与上游 request-id 一并带上。
+    #[test]
+    fn keepalive_ban_context_keeps_status_type_message_and_request_id() {
+        let rej = oauth::AuthRejection {
+            endpoint: "bootstrap",
+            status: 403,
+            body: r#"{"error":{"type":"permission_error","message":"Your organization does not have access to Claude Code."}}"#.into(),
+            request_id: Some("req_abc".into()),
+        };
+        let ctx = keepalive_ban_context(&rej);
+        assert_eq!(ctx.source, "keepalive");
+        assert_eq!(ctx.status, Some(403));
+        assert_eq!(ctx.error_type.as_deref(), Some("permission_error"));
+        assert_eq!(
+            ctx.error_message.as_deref(),
+            Some("Your organization does not have access to Claude Code.")
+        );
+        assert_eq!(ctx.upstream_request_id.as_deref(), Some("req_abc"));
+        assert!(ctx.request_id.is_none(), "保活没有来访请求");
+        assert_eq!(
+            ctx.reason,
+            "[keepalive/bootstrap 403] permission_error: Your organization does not have access to Claude Code."
+        );
+
+        // 非 JSON 体（网关页面）：类型缺省、整段体进 error_message、reason 截到 200 字符。
+        let html = format!("<html>{}</html>", "x".repeat(500));
+        let rej = oauth::AuthRejection {
+            endpoint: "event_logging",
+            status: 401,
+            body: html.clone(),
+            request_id: None,
+        };
+        let ctx = keepalive_ban_context(&rej);
+        assert!(ctx.error_type.is_none());
+        assert_eq!(ctx.error_message.as_deref(), Some(html.as_str()));
+        assert!(ctx.reason.starts_with("[keepalive/event_logging 401] <html>"));
+        assert_eq!(ctx.reason.chars().count(), 200);
+        assert!(ctx.upstream_request_id.is_none());
+
+        // 空体：写明，别留一个光秃秃的前缀。
+        let rej = oauth::AuthRejection {
+            endpoint: "bootstrap",
+            status: 403,
+            body: String::new(),
+            request_id: None,
+        };
+        let ctx = keepalive_ban_context(&rej);
+        assert_eq!(ctx.reason, "[keepalive/bootstrap 403] (empty body)");
+        assert_eq!(ctx.error_message.as_deref(), Some("(empty body)"));
+    }
+
+    /// 返回值要如实反映「确实停用了」：账号级错误 → 停用且落事件、`true`；非账号级 → 号
+    /// 原样启用、`false`；号已不存在 → `false`。
+    #[test]
+    fn handle_keepalive_rejection_reports_whether_the_ban_landed() {
+        let store = CredentialStore::open_in_memory().unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+        let rej = |status: u16, t: &str, m: &str| oauth::AuthRejection {
+            endpoint: "event_logging",
+            status,
+            body: serde_json::json!({"error": {"type": t, "message": m}}).to_string(),
+            request_id: Some("req_k".into()),
+        };
+
+        // 非账号级：不停用。
+        let org_policy = rej(
+            403,
+            "permission_error",
+            "OAuth authentication is currently not allowed for this organization.",
+        );
+        assert!(!handle_keepalive_rejection(&store, &a, &org_policy));
+        assert!(!store.get(a.id).unwrap().unwrap().is_banned());
+        assert!(store.list_ban_events(None, 10).unwrap().is_empty());
+
+        // 账号级：停用、事件带完整上下文。
+        let revoked = rej(401, "authentication_error", "OAuth token has been revoked");
+        assert!(handle_keepalive_rejection(&store, &a, &revoked));
+        let got = store.get(a.id).unwrap().unwrap();
+        assert!(got.is_banned());
+        assert_eq!(
+            got.ban_reason.as_deref(),
+            Some(
+                "[keepalive/event_logging 401] authentication_error: OAuth token has been revoked"
+            )
+        );
+        let ev = &store.list_ban_events(None, 10).unwrap()[0];
+        assert_eq!(ev.source, "keepalive");
+        assert_eq!(ev.status, Some(401));
+        assert_eq!(ev.error_type.as_deref(), Some("authentication_error"));
+        assert_eq!(ev.upstream_request_id.as_deref(), Some("req_k"));
+
+        // 号已经被删：没有主体，`false`，b 不受影响。
+        store.delete(a.id).unwrap();
+        assert!(!handle_keepalive_rejection(&store, &a, &revoked));
+        assert!(!store.get(b.id).unwrap().unwrap().is_banned());
+    }
+
+    /// 保活的 401/403 不再一律停用：只有账号级错误才算，判据与转发路径同一套。
+    #[test]
+    fn keepalive_rejection_bans_only_account_level_errors() {
+        let rej = |status: u16, body: &str| oauth::AuthRejection {
+            endpoint: "bootstrap",
+            status,
+            body: body.to_string(),
+            request_id: None,
+        };
+        let err = |t: &str, m: &str| {
+            serde_json::json!({"type": "error", "error": {"type": t, "message": m}}).to_string()
+        };
+        // 该停用：token 作废、账号 / 组织被停用。
+        for (status, body) in [
+            (401, err("authentication_error", "Invalid bearer token")),
+            (401, err("authentication_error", "OAuth token has been revoked")),
+            (403, err("permission_error", "Your organization has been disabled.")),
+            (403, err("permission_error", "This account has been suspended for policy violations")),
+        ] {
+            assert!(keepalive_rejection_is_account_level(&rej(status, &body)), "{status} {body}");
+        }
+        // 不该停用：组织没放开 OAuth（管理员开回来就好）、权限 / 能力不足、网关页面、空体。
+        for (status, body) in [
+            (
+                403,
+                err(
+                    "permission_error",
+                    "OAuth authentication is currently not allowed for this organization.",
+                ),
+            ),
+            (
+                401,
+                err(
+                    "authentication_error",
+                    "OAuth authentication is currently not allowed for this organization.",
+                ),
+            ),
+            (403, err("permission_error", "Your account does not have access to claude-opus-5")),
+            (403, err("permission_error", "This model is not available in your region")),
+            (403, "<html>403 Forbidden</html>".to_string()),
+            (401, String::new()),
+        ] {
+            assert!(!keepalive_rejection_is_account_level(&rej(status, &body)), "{status} {body}");
+        }
+    }
 
     /// 对 New API 输出的倍率必须按它的基准（1.0 = $2/MTok）换算，且缓存倍率按模型区分。
     /// 这里核对几个代表值，防止基准常量或字段映射被改错后静默给下游错价。
