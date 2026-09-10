@@ -58,12 +58,20 @@ pub async fn handle(
     // 否则控制台里查不到那个 id，成功率与请求数里也看不见这一批。到过上游的不在这儿记：
     // 正常收尾的由 [`ReqLog`] 在流结束时落库，早退的由 [`log_early_upstream_failure`]
     // 就地写带账号的那条——两者都会把 `logged` 置真。
-    if is_error && !log_state.logged.load(std::sync::atomic::Ordering::Relaxed) {
+    // 本地回放的 200（[`RequestLogState::local_replay`]）同样补一条：它没到上游、没有凭证，
+    // 但客户端确实拿到了一条响应，审计与统计都得看得见。
+    let local_replay = log_state.local_replay.lock().take();
+    if (is_error || local_replay.is_some())
+        && !log_state.logged.load(std::sync::atomic::Ordering::Relaxed)
+    {
         let parsed = log_state.parsed.lock().take();
-        spawn_usage_log(
-            store,
-            local_reject_record(&local, parsed, resp.status(), local_error, &request_id, started),
-        );
+        let mut rec =
+            local_reject_record(&local, parsed, resp.status(), local_error, &request_id, started);
+        if let Some(tag) = local_replay {
+            rec.forensics.rewrites = Some(tag.into());
+            rec.cost_usd = Some(0.0);
+        }
+        spawn_usage_log(store, rec);
     }
     if let Ok(v) = HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v.clone());
@@ -128,7 +136,18 @@ struct RequestLogState {
     /// 最低版本、头上的会话 RPM/并发这些拒绝都发生在体解析之前，最大 64MB 的未鉴权 JSON
     /// 若在外层再解析一遍，就是给任何人一个白烧 CPU 的入口；解析过的那些也不必解析第二遍。
     parsed: parking_lot::Mutex<Option<ParsedRequestBits>>,
+    /// 这条请求在本地以 **200** 收尾、没到上游：回放了学到的上游拒答（按提示词学的
+    /// [`REWRITE_REFUSAL_REPLAY`]，或按应用学的 [`REWRITE_APP_REFUSAL_REPLAY`]）。[`handle`]
+    /// 只给 4xx/5xx 补本地流水，
+    /// 这类 200 若不标出来就从流水、请求查询与统计里消失——0.3.98 把本地 403 改成回放 200
+    /// 时正是这样漏掉的。有标签的按本地流水补一条：无凭证、无用量、花费 0、`rewrites` 记标签。
+    local_replay: parking_lot::Mutex<Option<&'static str>>,
 }
+
+/// 流水 `rewrites` 里标「本地回放了学到的上游拒答」（[`known_refused_prompt`] 命中）。
+const REWRITE_REFUSAL_REPLAY: &str = "refusal_replay";
+/// 流水 `rewrites` 里标「本地回放了按应用学到的上游拒答」（[`known_app_refusal`] 命中）。
+const REWRITE_APP_REFUSAL_REPLAY: &str = "app_refusal_replay";
 
 /// 从来访体里读出的、流水要用的三样。见 [`RequestLogState::parsed`]。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -138,9 +157,10 @@ struct ParsedRequestBits {
     session_id: Option<String>,
 }
 
-/// 本地拒绝那条 4xx/5xx 的流水：没选到账号（`cred_id` 为空——库层本来就把这类行当作
-/// 「尚未选到凭证就失败的请求」，见 `store::prune_orphan_usage_logs`），没有用量、没有出站；
-/// 记的是来访侧能看到的一切：路径、UA、模型、设备、会话、状态码、错误类型与文案、请求 id。
+/// 本地拒绝那条 4xx/5xx（或本地回放那条 200，调用方再改 `rewrites` 与花费）的流水：没选到
+/// 账号（`cred_id` 为空——库层本来就把这类行当作「尚未选到凭证就失败的请求」，见
+/// `store::prune_orphan_usage_logs`），没有用量、没有出站；记的是来访侧能看到的一切：
+/// 路径、UA、模型、设备、会话、状态码、错误类型与文案、请求 id。
 ///
 /// 模型/设备/体里的会话 id 来自 `parsed`——[`handle_inner`] 解析体时放下的那份；拒绝发生在
 /// 体解析之前（API key、版本闸、头上的会话限流）时它是 `None`，那类行只有头上的会话 id，
@@ -686,16 +706,18 @@ async fn handle_inner(
 
     // 2.3a3) 探针类请求 → 本地直接拒（403），不到上游，见 [`probe_signature`]。身份写错的
     //        不在这里拒，由 [`Simulation::detect`] 送进模拟重建身份。
-    //        下游中转的探活脚本借 CC 的 UA 发一条无 tools 的单句小请求，每条在上游侧都是
-    //        「一台设备开一个一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与
-    //        身份上的强特征，一条就够判，不做计数。只判计费路径；`reject_probes` 关掉即放行。
+    //        下游中转的探活脚本发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个
+    //        一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与身份上的强特征，
+    //        一条就够判，不做计数。**不限 UA**（0.3.99 起）：此前只判自报 claude-cli 的，
+    //        Go-http-client 的探活反而走模拟、被装成官方形态发了出去。只判计费路径；
+    //        `reject_probes` 关掉即放行。
     if billable
         && state.store.forward_flags().reject_probes
         && let Some(kind) = probe_signature(
             body_json.as_ref(),
-            from_cc_client,
             device_id.as_deref(),
             &inbound_beta_list(&headers),
+            state.store.forward_flags().reject_probes_strict,
             || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
         )
     {
@@ -758,6 +780,7 @@ async fn handle_inner(
                         "not forwarded: upstream has already refused this exact prompt; replaying upstream's refusal (200 + the same body) locally"
                     );
                 }
+                *log_state.local_replay.lock() = Some(REWRITE_REFUSAL_REPLAY);
                 return resp;
             }
             // 学到的体按这次要的形态拼不出来（理论上不会：学的时候要求流完整收尾）——
@@ -767,6 +790,52 @@ async fn handle_inner(
                 %model, device = %device_short,
                 stream = wants_stream, replay_sse = refused.reply.sse,
                 "the recorded upstream refusal could not be replayed in the shape this request asked for; forwarding upstream"
+            ),
+        }
+    }
+
+    // 2.3a4c) 按应用学到的拒答（只对**识别不了会话**的来访）：同一模型 + 同一份 system 被上游
+    //         分类器拒得够多（至少 3 条且占三成以上，见 [`record_app_request`]）→ 之后这个应用
+    //         的每条请求都回放最近那条拒答，见 [`known_app_refusal`]。
+    //         封号复盘里 Go-http-client 那场风暴每条正文都不同、按提示词学的规则一条都命不中，
+    //         而它只有 4 种 system——对不带身份的中转流量，system 就是「哪个应用」。带会话 id 或
+    //         device_id 的来访不走这条：它们的 system 是客户端每轮都在变的官方形态，且真人对话
+    //         偶发一次拒答不该连坐整个会话。与 2.3a4 共用 `reject_refusals` 开关与 fallbacks 例外。
+    let session_less = device_id.is_none() && session_id.is_none();
+    if billable
+        && session_less
+        && state.store.forward_flags().reject_refusals
+        && !outbound_carries_fallbacks(
+            body_json.as_ref(),
+            req_model.as_deref(),
+            state.store.forward_flags(),
+            &inbound_beta_list(&headers),
+            &state.deprecated_fields,
+        )
+        && let Some(refused) =
+            known_app_refusal(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
+    {
+        let model = req_model.as_deref().unwrap_or("-");
+        let wants_stream = body_json.as_ref().is_some_and(stream_requested);
+        match replay_refusal(&refused.reply, wants_stream) {
+            Some(resp) => {
+                if let Some(suppressed) = take_rejection_log_slot(
+                    &state.rejection_log,
+                    &format!("app-refusal:{model}:{client_ua}"),
+                ) {
+                    tracing::warn!(
+                        %method, path = %path_and_query, ua = %client_ua,
+                        %model, suppressed, stream = wants_stream, replay_sse = refused.reply.sse,
+                        verdict = %refused.verdict.chars().take(300).collect::<String>(),
+                        "not forwarded: upstream has already refused this session-less app (same model + system); replaying upstream's refusal locally"
+                    );
+                }
+                *log_state.local_replay.lock() = Some(REWRITE_APP_REFUSAL_REPLAY);
+                return resp;
+            }
+            None => tracing::warn!(
+                %method, path = %path_and_query, ua = %client_ua, %model,
+                "the recorded app-level refusal could not be replayed in the shape this request asked for; forwarding upstream"
             ),
         }
     }
@@ -1068,14 +1137,27 @@ async fn handle_inner(
         // 只有我们真动了手脚的两路打 info（默认级别就能看见），原样转发那路留在 debug——
         // 那是绝大多数流量，每条刷一行没有意义。
         match (&sim, &bare_session) {
-            (Some(s), _) => tracing::info!(
-                cred_id = cred.id, cred = %cred.label,
-                ua = %client_ua,
-                model = %req_model.as_deref().unwrap_or("-"),
-                base_bytes = s.base.map(str::len).unwrap_or(0),
-                session_id = %s.session_id,
-                "identity path: SIMULATED — rebuilding this non-CC request into the official CC shape"
-            ),
+            (Some(s), _) => {
+                // 来访体的结构事实（不含正文）：流水的 `shape` 列记的是出站体、模拟之后已是
+                // 官方形态，来访原本几块 system、有没有 billing header、几个 tools 只有这里能看到。
+                let facts = body_json.as_ref().map(inbound_facts);
+                tracing::info!(
+                    cred_id = cred.id, cred = %cred.label,
+                    ua = %client_ua,
+                    model = %req_model.as_deref().unwrap_or("-"),
+                    reason = s.reason.tag(),
+                    from_cc_client,
+                    system_blocks = facts.as_ref().map_or(0, |f| f.system_blocks),
+                    system_bytes = facts.as_ref().map_or(0, |f| f.system_bytes),
+                    billing_header = facts.as_ref().is_some_and(|f| f.billing_header),
+                    identity = facts.as_ref().is_some_and(|f| f.identity),
+                    tools = facts.as_ref().map_or(0, |f| f.tools),
+                    max_tokens = facts.as_ref().and_then(|f| f.max_tokens).unwrap_or(-1),
+                    base_bytes = s.base.map(str::len).unwrap_or(0),
+                    session_id = %s.session_id,
+                    "identity path: SIMULATED — rebuilding this request into the official CC shape; reason names the first check it failed (not_cc_client / identity_malformed / not_cc_shaped / no_base_prompt / tools_not_cc)"
+                )
+            }
             (None, Some(sid)) => tracing::info!(
                 cred_id = cred.id, cred = %cred.label,
                 ua = %client_ua,
@@ -1798,6 +1880,14 @@ async fn handle_inner(
                     req_model
                         .as_deref()
                         .zip(body_json.as_ref().and_then(prompt_digest))
+                        .map(|(m, d)| (m.to_string(), d))
+                } else {
+                    None
+                },
+                app_key: if billable && session_less {
+                    req_model
+                        .as_deref()
+                        .zip(body_json.as_ref().and_then(app_system_digest))
                         .map(|(m, d)| (m.to_string(), d))
                 } else {
                     None
@@ -3477,6 +3567,9 @@ struct ReqLog {
     /// 这条请求的「模型 + 提示词哈希」（[`prompt_digest`]），上游拒答（`stop_reason:
     /// "refusal"`）时按它学，见 [`known_refused_prompt`]；非计费路径为 `None`。
     prompt_key: Option<(String, String)>,
+    /// 这条请求的「模型 + system 哈希」（[`app_system_digest`]），只有**识别不了会话**的来访（没有
+    /// 会话 id 也没有 device_id）且带 system 时才有；上游拒答时按它学，见 [`known_app_refusal`]。
+    app_key: Option<(String, String)>,
     /// 零输出请求类与被拒答提示词的记忆表，收尾时按上游回复的种类往里记，
     /// 见 [`ReqLog::note_unanswered_reply`]。
     empty_replies: EmptyReplyMemory,
@@ -3563,6 +3656,13 @@ impl Drop for ReqLog {
             && (!self.sniffer.is_stream || self.sniffer.saw_message_stop || self.sse_aggregated)
         {
             self.note_unanswered_reply();
+        }
+        // 识别不了会话的应用：这条到过上游、拿到 200 却不是（可学的）拒答——只给应用的请求总数
+        // 记一笔，拒答比例的分母就是它。拒答那条已在 note_unanswered_reply 里连分子一起记了。
+        if self.status == StatusCode::OK.as_u16()
+            && let Some((model, digest)) = self.app_key.take()
+        {
+            record_app_request(&self.empty_replies, &model, &digest, None);
         }
         // 请求模型拒答、上游按 `fallbacks` 换了模型作答：标签记下，`model` 列与计价都是
         // 作答的那个（响应顶层 `model` 已经是它）。
@@ -3868,8 +3968,9 @@ impl ReqLog {
             tags.push(',');
         }
         tags.push_str(if refused { REWRITE_REFUSAL } else { REWRITE_EMPTY_REPLY });
-        let learned = if refused {
-            verdict.zip(reply).and_then(|(category, reply)| {
+        let mut learned: Vec<store::LearnedRejection> = Vec::new();
+        if refused {
+            if let Some((category, reply)) = verdict.zip(reply) {
                 // 规则文案 = 「[类别] stop_details=<原样 JSON>」：设置页与日志一眼看出是
                 // 哪类判决、上游给了什么解释。取 stop_details 而不是响应体开头——开头是
                 // usage 样板，判决在流末尾；有 verdict 就一定解析到过 stop_details 对象，
@@ -3878,17 +3979,32 @@ impl ReqLog {
                     Some(details) => format!("[{category}] stop_details={details}"),
                     None => format!("[{category}] {excerpt}"),
                 };
-                self.prompt_key.take().and_then(|(model, digest)| {
-                    remember_refused_prompt(&self.empty_replies, &model, &digest, &message, reply)
-                })
-            })
-        } else {
-            self.empty_reply_key.take().and_then(|(model, max_tokens)| {
-                remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt)
-            })
-        };
-        if let Some(row) = learned
-            && let Err(e) = self.store.remember_rejections(&[row])
+                // 按提示词学（所有来访）：只拦逐字相同的重发。
+                if let Some((model, digest)) = self.prompt_key.take() {
+                    learned.extend(remember_refused_prompt(
+                        &self.empty_replies,
+                        &model,
+                        &digest,
+                        &message,
+                        reply.clone(),
+                    ));
+                }
+                // 按应用学（只有识别不了会话的来访）：给应用记一条拒答，拒答比例够了才学成
+                // 「同一模型 + 同一份 system 一律回放」。`take` 掉后 Drop 里那条「只计总数」不再重复计。
+                if let Some((model, digest)) = self.app_key.take() {
+                    learned.extend(record_app_request(
+                        &self.empty_replies,
+                        &model,
+                        &digest,
+                        Some((&message, &reply)),
+                    ));
+                }
+            }
+        } else if let Some((model, max_tokens)) = self.empty_reply_key.take() {
+            learned.extend(remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt));
+        }
+        if !learned.is_empty()
+            && let Err(e) = self.store.remember_rejections(&learned)
         {
             // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
             tracing::warn!(error = %e, "persisting the learned reply rule failed (kept in memory)");
@@ -4021,6 +4137,7 @@ fn capture_forensics(
     store::Forensics {
         proxy: cred.proxy.as_deref().map(store::redact_proxy),
         simulated: upstream.sim.is_some(),
+        sim_reason: upstream.sim.as_ref().map(|s| s.reason.tag().to_string()),
         shape,
         session_id: session_from_body
             .or_else(|| header_opt(&upstream.headers, "x-claude-code-session-id")),
@@ -6194,6 +6311,78 @@ struct Simulation {
     /// 这条请求在会话链条上的位置：`cc_prompt_id` / `cc_prev_req` /
     /// `diagnostics.previous_message_id` 三个关联字段的取值，见 [`CcSessionLink`]。
     link: CcSessionLink,
+    /// 为什么走了模拟——[`simulates_cc`] 三道判据里没过的那一道，见 [`SimulationReason`]。
+    /// 进日志与流水的 `sim_reason` 列：光一个「模拟路径」标签看不出是 UA 不可信、身份写错、
+    /// 还是形态不完整，排查官方客户端为何被接管时这是唯一线索。
+    reason: SimulationReason,
+}
+
+/// 一条请求被模拟路径接管的原因：[`simulates_cc`] 要求 UA 可信、身份合法、形态完整三样
+/// 同时成立才原样转发，这里记的是**第一道**没过的判据（按 UA → 身份 → 形态的顺序查）。
+///
+/// 只有走了模拟才有值；判定的口径与 [`simulates_cc`] 同源（[`simulation_reason`] 是它的本体）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimulationReason {
+    /// UA 不是可信的 Claude Code 版本（非 CC 客户端，或自报版本高于已知最新版）。
+    NotCcClient,
+    /// UA 可信，但 `metadata.user_id` / 会话头的身份字段格式不对（device 不是 64 位 hex、
+    /// session 不是 uuid、带空白……），见 [`cc_identity_well_formed`]。
+    IdentityMalformed,
+    /// UA 与身份都对，但 `system` 里既没有 CC 身份句也没有 billing header，见 [`is_cc_shaped`]
+    /// （官方桌面端不带 system 的 `max_tokens=1` 预热例外，见 [`simulation_reason`]）。
+    NotCcShaped,
+    /// CC 形态，但既不是 `max_tokens=1` 预热、也不是官方 Helper、`system` 里也没有不少于
+    /// [`CC_BASE_PROMPT_MIN_LEN`] 字节的基座提示词，见 [`has_cc_base_prompt`]。
+    NoBasePrompt,
+    /// 前面都对，`tools` 非空却一个官方工具名都没有，见 [`has_cc_tool_profile`]。
+    ToolsNotCc,
+    /// luban 自己发的探测（连通性测试、额度探测）：不是来访，没有判定，只为把探测装成官方形态。
+    Probe,
+}
+
+impl SimulationReason {
+    /// 日志与流水里的标签。
+    fn tag(self) -> &'static str {
+        match self {
+            Self::NotCcClient => "not_cc_client",
+            Self::IdentityMalformed => "identity_malformed",
+            Self::NotCcShaped => "not_cc_shaped",
+            Self::NoBasePrompt => "no_base_prompt",
+            Self::ToolsNotCc => "tools_not_cc",
+            Self::Probe => "probe",
+        }
+    }
+}
+
+/// 来访体的几项**结构**事实（不含任何正文），随 `identity path: SIMULATED` 那行日志打出，
+/// 配合 [`SimulationReason`] 一眼看出被接管的请求长什么样：system 几块、共多少字节、有没有
+/// billing header / 身份句、几个 tools、`max_tokens`。流水的 `shape` 列记的是**出站**体，
+/// 模拟之后已经是官方形态，来访原本的样子只有这里能看到。
+struct InboundFacts {
+    system_blocks: usize,
+    system_bytes: usize,
+    billing_header: bool,
+    identity: bool,
+    tools: usize,
+    max_tokens: Option<i64>,
+}
+
+fn inbound_facts(v: &serde_json::Value) -> InboundFacts {
+    let texts: Vec<&str> = match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
+        }
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        _ => Vec::new(),
+    };
+    InboundFacts {
+        system_blocks: texts.len(),
+        system_bytes: texts.iter().map(|t| t.len()).sum(),
+        billing_header: texts.iter().any(|t| t.starts_with("x-anthropic-billing-header:")),
+        identity: texts.iter().any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX)),
+        tools: v.get("tools").and_then(|t| t.as_array()).map_or(0, |t| t.len()),
+        max_tokens: request_max_tokens(Some(v)),
+    }
 }
 
 impl Simulation {
@@ -6208,9 +6397,7 @@ impl Simulation {
         device_fp: &str,
     ) -> Option<Self> {
         let v = body?;
-        if !simulates_cc(Some(v), headers, from_cc_client, flags) {
-            return None;
-        }
+        let reason = simulation_reason(Some(v), headers, from_cc_client, flags)?;
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
         let profile = cc_profile_for(model);
         // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个按设备派生的 id
@@ -6224,7 +6411,7 @@ impl Simulation {
         );
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
-        Some(Self { base: cc_system_base(model), profile, session_id, link })
+        Some(Self { base: cc_system_base(model), profile, session_id, link, reason })
     }
 }
 
@@ -6252,10 +6439,21 @@ fn simulates_cc(
     from_cc_client: bool,
     flags: store::ForwardFlags,
 ) -> bool {
+    simulation_reason(body, headers, from_cc_client, flags).is_some()
+}
+
+/// [`simulates_cc`] 的本体：不模拟返回 `None`，模拟则给出**第一道**没过的判据
+/// （[`SimulationReason`]，按 UA → 身份 → 形态的顺序查，形态内部再按 CC 形态 → 基座 → 工具）。
+fn simulation_reason(
+    body: Option<&serde_json::Value>,
+    headers: &HeaderMap,
+    from_cc_client: bool,
+    flags: store::ForwardFlags,
+) -> Option<SimulationReason> {
     if !flags.simulate_cc || !flags.merge_beta {
-        return false;
+        return None;
     }
-    let Some(v) = body else { return false };
+    let v = body?;
     // 真正的 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）**不模拟**：整套换头
     // 会把它自报的 UA 与 `x-app`/`x-stainless-*` 换成抓包那台机器的取值，凭空造出一台
     // 别的机器。身份仍由 [`spoof_identity`] 按原格式改写，这条路只做它自己的事。
@@ -6297,15 +6495,47 @@ fn simulates_cc(
     //   **没有 system 也没有 tools**）过不了 `is_cc_shaped`，得单独放：它是官方形态里唯一
     //   一条没有 system 的，装成主线程（补 system、基座、工具）正是既定要求里禁止的事。
     //   这里曾经漏过一次——把「CC UA 且工具像 CC」收成「还得是 CC 形态」时忘了它。
+    // 三样都对上 = 真正的官方客户端，原样转发；差任何一样都由模拟接管。查的顺序即
+    // 记进 [`SimulationReason`] 的顺序：UA 不可信时身份与形态怎样都不看了。
+    if !from_cc_client {
+        return Some(SimulationReason::NotCcClient);
+    }
+    if !cc_identity_well_formed(headers, v) {
+        return Some(SimulationReason::IdentityMalformed);
+    }
+    if is_quota_probe_shaped(v) {
+        return None;
+    }
     let prewarm = request_max_tokens(Some(v)) == Some(1);
-    let official_shape = is_quota_probe_shaped(v)
-        || (is_cc_shaped(v)
-            && (prewarm
-                || is_official_helper_request(v, &inbound_beta_list(headers))
-                || has_cc_base_prompt(v))
-            && has_cc_tool_profile(v));
-    // 三样都对上 = 真正的官方客户端，原样转发；差任何一样都由模拟接管。
-    !(from_cc_client && cc_identity_well_formed(headers, v) && official_shape)
+    if !is_cc_shaped(v) {
+        // 官方桌面端（`claude-desktop-3p`）的 cache 预热：`max_tokens=1`，system 缺失或只有
+        // 一块几百字节的应用块，没有身份句也没有 billing header（`ban/luban-ban-37/38/42`
+        // 里 500 多条，主线程请求则全是完整官方形态）。UA 可信、身份合法、tools 空或含官方
+        // 工具名的这种预热原样放行，非模拟路径的 [`ensure_cc_system_prefix`] 会补上 billing
+        // header 与身份句——与桌面端自己另一种预热形态 `[billing, 身份句]` 一致；此前送进模拟
+        // 被重建成带基座与工具的主线程体，出站 UA 也换成了 cli，同一台机器被劈成两台设备。
+        // 带长块（不少于基座阈值）的 1 token 请求不在此列：那是第三方的长 system。**要带官方
+        // 身份**（`metadata.user_id` 里有 device_id，格式已在上面判过）：复盘里桌面端的预热全带
+        // 186 字节的 user_id；一条什么身份都没有的 1 token 请求仍按第三方走模拟。
+        if prewarm
+            && !has_cc_base_prompt(v)
+            && has_cc_tool_profile(v)
+            && extract_device_id(Some(v)).is_some()
+        {
+            return None;
+        }
+        return Some(SimulationReason::NotCcShaped);
+    }
+    if !(prewarm
+        || is_official_helper_request(v, &inbound_beta_list(headers))
+        || has_cc_base_prompt(v))
+    {
+        return Some(SimulationReason::NoBasePrompt);
+    }
+    if !has_cc_tool_profile(v) {
+        return Some(SimulationReason::ToolsNotCc);
+    }
+    None
 }
 
 /// 来访是否已经是 Claude Code 形态——两条判据命中任一即算是：
@@ -6564,7 +6794,16 @@ enum ProbeKind {
     ThrowawayConversation,
     /// system 里 CC 身份句出现在**不止一块**里。官方只写一次。
     DuplicateIdentity,
+    /// 短开场（严格模式，[`store::ForwardFlags::reject_probes_strict`]）：无 system、无 tools、
+    /// 恰好 1 条用户消息、正文不超过 [`PROBE_SHORT_OPENER_BYTES`] 字节、`max_tokens != 1`。
+    /// 测活脚本发的正是「hi」「ping」「test」。
+    ShortOpener,
 }
+
+/// [`ProbeKind::ShortOpener`] 的正文上限，按 UTF-8 **字节**算：英文 32 个字符，中文约十个字。
+/// 「hi」「ping」「test」「你好」「测试」都在几个字节内；按字符算会把三十个汉字的一整句话也
+/// 算进去，那已是正常的单轮对话。
+const PROBE_SHORT_OPENER_BYTES: usize = 32;
 
 impl ProbeKind {
     /// 进日志的短名。
@@ -6573,6 +6812,7 @@ impl ProbeKind {
             Self::Ping => "ping",
             Self::ThrowawayConversation => "throwaway-conversation",
             Self::DuplicateIdentity => "duplicate-identity",
+            Self::ShortOpener => "short-opener",
         }
     }
 
@@ -6580,7 +6820,10 @@ impl ProbeKind {
     fn message(self) -> &'static str {
         match self {
             Self::Ping => {
-                "automated probe / health-check requests are not forwarded: single-message ping with a system prompt and max_tokens in 2..=16"
+                "automated probe / health-check requests are not forwarded: single-message ping with max_tokens in 2..=16"
+            }
+            Self::ShortOpener => {
+                "automated probe / health-check requests are not forwarded: a single one-line user message with no system prompt and no tools"
             }
             Self::ThrowawayConversation => {
                 "automated probe / health-check requests are not forwarded: first request from an unknown device is a tool-less single-message conversation"
@@ -6608,15 +6851,15 @@ impl ProbeKind {
 /// 重建一份合法身份，那个 `channel-test` 到不了上游。代价是这类探活换了身合法的皮照常放行；
 /// 它 `max_tokens=256`、设备恒定，也不命中下面三条。这是有意的取舍：只拒探针，不拒抄错的。
 ///
-/// 三条判据，**任一命中即算**，全部只对自报 CC 的 UA（`from_cc_client`）生效——非 CC 的 UA
-/// 本就走模拟路径，形态与身份会被整套重建：
+/// 三条判据，**任一命中即算**，**不限 UA**（0.3.99 起；此前只对自报 CC 的 UA 生效，非 CC 的
+/// 探活走模拟被装成官方形态发了出去，见 `ban/luban-ban-37/38/42`）：
 ///
-/// - **单句 ping**（[`ProbeKind::Ping`]）：有 system、没有 tools、恰好 1 条消息、`max_tokens`
-///   在 `2..=16`。下界排除官方 cache 预热（`max_tokens=1`；2.1.187 Claude Desktop 的预热带
+/// - **单句 ping**（[`ProbeKind::Ping`]）：没有 tools、恰好 1 条消息、`max_tokens` 在 `2..=16`，
+///   不要求带 system。下界排除官方 cache 预热（`max_tokens=1`；2.1.187 Claude Desktop 的预热带
 ///   `[billing, identity]` 两块 system，见 `ban.log`），上界远低于官方带 system 的最小值 64
-///   （补全建议）。**只对自报 CC 的 UA**：Go 之类非 CC 客户端的正常业务里，单条消息 +
-///   `max_tokens` 为 1/4/10/16 的小请求成百上千，且那条路走模拟、身份由 luban 重建，上游看
-///   不到来访侧的任何身份轮换，不缺这道闸；
+///   （补全建议）；官方也没有任何一种「无 system、`max_tokens` 在 2 到 16」的请求。
+///   严格模式（`strict`，[`store::ForwardFlags::reject_probes_strict`]）下 ping 不再要求无
+///   tools，并多一条**短开场**（[`ProbeKind::ShortOpener`]），见函数体内的说明；
 /// - **凭空冒出的一次性对话**（[`ProbeKind::ThrowawayConversation`]）：有 system、没有
 ///   tools、恰好 1 条消息、`max_tokens != 1`、不是官方那三种无 tools 请求、且设备从没见过
 ///   （[`store::CredentialStore::device_is_known`]）。官方无 tools 的请求只有四种：预热
@@ -6640,32 +6883,66 @@ impl ProbeKind {
 /// 只看形态与身份、一条就判，不做任何计数——所以不存在「合法流量大了会误伤」的问题。
 fn probe_signature(
     body: Option<&serde_json::Value>,
-    from_cc_client: bool,
     device_id: Option<&str>,
     beta: &[String],
+    strict: bool,
     device_known: impl FnOnce() -> bool,
 ) -> Option<ProbeKind> {
-    if !from_cc_client {
-        return None;
-    }
     let v = body?;
     // 身份句重复：不依赖下面「无 tools / 单条消息」的前提，先判。
     if cc_identity_blocks(v) > 1 {
         return Some(ProbeKind::DuplicateIdentity);
     }
-    // 另两条都要求：有 system、没有 tools、恰好一条（用户）消息。
+    // 其余几条都要求恰好一条（用户）消息；除严格模式的 ping 外还要求没有 tools。
     let has_system = v.get("system").is_some_and(|s| !s.is_null());
     let no_tools = field_is_empty(v.get("tools"));
     let single_message = v
         .get("messages")
         .and_then(|m| m.as_array())
         .is_some_and(|m| m.len() == 1 && m[0].get("role").and_then(|r| r.as_str()) == Some("user"));
-    if !(has_system && no_tools && single_message) {
+    if !single_message {
         return None;
     }
     let max_tokens = request_max_tokens(Some(v));
+    // 严格模式（[`store::ForwardFlags::reject_probes_strict`]，默认关）多收两刀，覆盖复盘里
+    // 默认判据放过去的 Go-http-client 探活：
+    // - ping 不再要求无 tools：`max_tokens` 不超过 16 装不下一次 tool_use 调用，带着工具只给
+    //   16 个 token 只能是测活（复盘里 4 个 tools、max_tokens 16 那批）；
+    // - 短开场：无 system、无 tools、一条不超过 32 字节的用户消息、`max_tokens != 1`（复盘里
+    //   max_tokens 50 / 1024 / 32000、正文一句「hi」那三批）。官方没有任何一种无 system 的请求
+    //   （额度探测是 max_tokens 1，已排除）。代价是真人用裸聊天客户端经中转站发的第一句
+    //   「你好」也会被拒，故默认关。
+    if strict {
+        if max_tokens.is_some_and(|m| (2..=16).contains(&m)) {
+            return Some(ProbeKind::Ping);
+        }
+        if !has_system
+            && no_tools
+            && max_tokens != Some(1)
+            && single_user_text_bytes(v).is_some_and(|n| n <= PROBE_SHORT_OPENER_BYTES)
+        {
+            return Some(ProbeKind::ShortOpener);
+        }
+    }
+    if !no_tools {
+        return None;
+    }
+    // ping **不要求带 system**：官方没有任何一种「无 system、max_tokens 在 2 到 16」的请求
+    // （额度探测恒为 `max_tokens=1`），而不带身份的下游（Go-http-client）的探活恰恰多半不带
+    // system——封号复盘里它们每 3 到 6 秒一批、四五个模型一起问一句，此前因为 UA 不是
+    // claude-cli 一律不判、全走模拟发了出去。
+    //
+    // **有意不按 UA、身份或正文长短收窄**（复审曾提出「普通 SDK 也可能合法用 max_tokens: 8」）：
+    // 这里的下游是中转站与 Claude Code 客户端，四份封号导出里这一形态每个号 160 到 210 条、
+    // 无一条是分类业务；而放行的代价不只是多一条请求——它会被模拟成带基座的官方形态发出去，
+    // 正是「一台设备只问一句话」的封号判据。这类探活就不该到上游，误伤的分类请求收到的是
+    // 一条写明原因的 403。
     if max_tokens.is_some_and(|m| (2..=16).contains(&m)) {
         return Some(ProbeKind::Ping);
+    }
+    // 一次性会话那条仍要求带 system：不带 system 只问一句的第三方小应用太常见，按它拒会误伤。
+    if !has_system {
+        return None;
     }
     // 官方那三种无 tools 请求的**完整**样子，见 [`is_official_helper_request`]、
     // [`is_official_title_request`]、[`is_official_classifier_request`]：system 结构、beta 头、
@@ -6680,6 +6957,28 @@ fn probe_signature(
         return Some(ProbeKind::ThrowawayConversation);
     }
     None
+}
+
+/// 唯一那条用户消息的正文 UTF-8 字节数（`content` 是字串，或全部 text 块拼起来，各自去掉首尾
+/// 空白）；没有文本块、或带了非文本块（图片、文档）返回 `None`——带附件的不是「一句话」，
+/// 短开场判据不认。
+fn single_user_text_bytes(v: &serde_json::Value) -> Option<usize> {
+    let msgs = v.get("messages")?.as_array()?;
+    let content = msgs.first()?.get("content")?;
+    match content {
+        serde_json::Value::String(s) => Some(s.trim().len()),
+        serde_json::Value::Array(blocks) => {
+            let mut n = 0;
+            for b in blocks {
+                if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                    return None;
+                }
+                n += b.get("text").and_then(|t| t.as_str())?.trim().len();
+            }
+            Some(n)
+        }
+        _ => None,
+    }
 }
 
 /// 官方 Helper / 标题生成两条 haiku 请求共有的 **body 取值**（`cap/2.1.260/00024`、`00027`、
@@ -7500,6 +7799,7 @@ pub const LEARNED_KIND_SHAPE: &str = "shape";
 pub const LEARNED_KIND_DEPRECATED: &str = "deprecated";
 pub const LEARNED_KIND_EMPTY_REPLY: &str = "empty_reply";
 pub const LEARNED_KIND_REFUSAL: &str = "refusal";
+pub const LEARNED_KIND_APP_REFUSAL: &str = "app_refusal";
 
 /// 从进程内记忆表里删掉一条规则（控制台单条删除，与库里的删除配对）。返回是否确有其条。
 pub fn forget_learned_memory(
@@ -7528,14 +7828,25 @@ pub fn forget_learned_memory(
             }
             empty.write().prompts.remove(&(r.model.clone(), r.value.clone())).is_some()
         }
+        LEARNED_KIND_APP_REFUSAL => {
+            if r.field != APP_REFUSAL_FIELD {
+                return false;
+            }
+            empty.write().apps.remove(&(r.model.clone(), r.value.clone())).is_some()
+        }
         _ => false,
     }
 }
 
 /// 学到的规则的全部种类名（`learned_rejections.kind` 列的取值域），控制台按种类清空时先拿它
 /// 校验，再动库和内存。
-pub const LEARNED_KINDS: [&str; 4] =
-    [LEARNED_KIND_SHAPE, LEARNED_KIND_DEPRECATED, LEARNED_KIND_EMPTY_REPLY, LEARNED_KIND_REFUSAL];
+pub const LEARNED_KINDS: [&str; 5] = [
+    LEARNED_KIND_SHAPE,
+    LEARNED_KIND_DEPRECATED,
+    LEARNED_KIND_EMPTY_REPLY,
+    LEARNED_KIND_REFUSAL,
+    LEARNED_KIND_APP_REFUSAL,
+];
 
 /// 清掉某一种类的进程内规则（控制台「清空这一类」）。种类名对不上返回 `false`，什么都不动。
 pub fn clear_learned_memory_kind(
@@ -7549,6 +7860,7 @@ pub fn clear_learned_memory_kind(
         LEARNED_KIND_DEPRECATED => deprecated.write().clear(),
         LEARNED_KIND_EMPTY_REPLY => empty.write().classes.clear(),
         LEARNED_KIND_REFUSAL => empty.write().prompts.clear(),
+        LEARNED_KIND_APP_REFUSAL => empty.write().apps.clear(),
         _ => return false,
     }
     true
@@ -7561,6 +7873,7 @@ pub struct SeededMemories {
     pub deprecated: usize,
     pub empty_reply: usize,
     pub refusal: usize,
+    pub app_refusal: usize,
     /// 按新逻辑不该存在的旧行：不回填，交给调用方从库里删掉，免得下次启动再撞一遍。两种：
     /// - v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
     ///   拒答的内容把同形态的所有正常请求一起拦掉。判据是 `message`（当时截的上游回复）里带
@@ -7605,7 +7918,10 @@ pub fn resync_learned_memories(
     let mut empty_table = empty.write();
     shape_table.clear();
     dep_table.clear();
+    // 计数器是进程内的统计，不在库里，重建时留着——否则每小时归零，风暴应用每小时白挨几条。
+    let counters = std::mem::take(&mut empty_table.app_counters);
     *empty_table = Default::default();
+    empty_table.app_counters = counters;
     seed_tables(&mut shape_table, &mut dep_table, &mut empty_table, rows)
 }
 
@@ -7672,6 +7988,20 @@ fn seed_tables(
                     .or_insert(RefusedPrompt { verdict: r.message, reply });
                 out.refusal += 1;
             }
+            LEARNED_KIND_APP_REFUSAL => {
+                if r.field != APP_REFUSAL_FIELD {
+                    continue;
+                }
+                let Some(reply) = r.reply else {
+                    out.stale.push(store::LearnedRejection { reply: None, ..r });
+                    continue;
+                };
+                empty_table
+                    .apps
+                    .entry((r.model, r.value))
+                    .or_insert(RefusedPrompt { verdict: r.message, reply });
+                out.app_refusal += 1;
+            }
             _ => {}
         }
     }
@@ -7689,7 +8019,7 @@ pub fn learned_memory_len(
     let s = shape.read();
     let d = deprecated.read();
     let e = empty.read();
-    s.len() + d.len() + e.classes.len() + e.prompts.len()
+    s.len() + d.len() + e.classes.len() + e.prompts.len() + e.apps.len()
 }
 
 // ── 上游回过零输出的请求类 ────────────────────────────────────────────
@@ -7718,6 +8048,8 @@ pub fn learned_memory_len(
 const EMPTY_REPLY_FIELD: &str = "max_tokens";
 /// 拒答记忆表里 `field` 列的固定值：`value` 是提示词哈希（[`prompt_digest`]）。
 const REFUSAL_FIELD: &str = "prompt_sha";
+/// 按应用学的拒答里 `field` 列的固定值：`value` 是来访 system 的哈希（[`app_system_digest`]）。
+const APP_REFUSAL_FIELD: &str = "system_sha";
 
 /// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」。
 /// 零输出格的值是本地拒时回给客户端的那段文案：当时截下的上游回复开头（信息就在开头——
@@ -7739,7 +8071,30 @@ const REFUSAL_FIELD: &str = "prompt_sha";
 pub struct EmptyReplyRejections {
     classes: std::collections::HashMap<(String, i64), String>,
     prompts: std::collections::HashMap<(String, String), RefusedPrompt>,
+    /// 按**应用**学的拒答：「模型 + 来访 system 哈希」→ 判决与回放体，见 [`known_app_refusal`]。
+    /// 只对**识别不了会话**的来访（没有会话 id 也没有 device_id，Go-http-client 这类中转）学与判。
+    apps: std::collections::HashMap<(String, String), RefusedPrompt>,
+    /// 按应用学的**计数器**：「模型 + system 哈希」→ 到过上游的请求数与其中被分类器拒答的条数，
+    /// 学不学看比例（[`record_app_request`]）。只在进程内，不落库；每小时重建记忆表时保留
+    /// （[`resync_learned_memories`]），表满时整体清掉从头计。
+    app_counters: std::collections::HashMap<(String, String), AppCounter>,
 }
+
+/// 一个识别不了会话的应用（模型 + system）在上游的战绩：到过上游几条、被分类器拒了几条。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AppCounter {
+    total: u32,
+    refused: u32,
+}
+
+/// 按应用学的门槛：拒答至少这么多条……
+const APP_REFUSAL_MIN_REFUSALS: u32 = 3;
+/// ……且占该应用到过上游的请求数的比例不低于这个百分数。封号复盘里的风暴应用拒答率 35% 到
+/// 63%，同一批中转站上真人的 agent 会话（固定 18 字节 system、几十到两百多轮）1% 到 2%——
+/// 单看一条拒答分不开两者，比例分得很开。
+const APP_REFUSAL_MIN_RATIO_PCT: u32 = 30;
+/// 计数器最多记多少个应用；满了整体清掉重计（只是进程内的统计，丢了代价是多送几条）。
+const APP_COUNTER_MAX_KEYS: usize = 4096;
 
 /// 拒答格里的一条：上游对这条提示词的判决文案，与当时那次响应的原样体。
 ///
@@ -7776,6 +8131,124 @@ fn prompt_digest(body: &serde_json::Value) -> Option<String> {
     }
     h.update(messages.to_string().as_bytes());
     Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+/// 来访 `system` 的哈希：紧凑序列化后 sha256 前 16 位 hex。没有 `system`、或是空串 / 空数组
+/// 的返回 `None`——没有 system 的请求识别不出「哪个应用」，不学也不判。
+///
+/// 这是**识别不了会话的来访**的「会话」替身：不带会话 id 也不带 device_id 的中转流量，luban
+/// 派生的会话 id 按「账号 + 指纹」恒定、还把同账号上的 Go、python、node 全折成一个，拿它当键
+/// 既太粗又和账号绑死；而对这类来访，system 就是「哪个应用在说话」——封号复盘（`ban/`）里那场
+/// reasoning_extraction 风暴 568 条请求只有 4 种 system，正文每条不同、提示词哈希永远对不上。
+fn app_system_digest(body: &serde_json::Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let system = body.get("system")?;
+    let empty = match system {
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Null => true,
+        _ => false,
+    };
+    if empty {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(system.to_string().as_bytes());
+    Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+/// 这条请求是不是来自**已知被上游拒答过的应用**（同一模型、`system` 逐字相同，见
+/// [`app_system_digest`]）；是则给出当时记下的判决与上游那次的原样响应体。只对识别不了会话的
+/// 来访调用，见 [`EmptyReplyRejections::apps`]。
+fn known_app_refusal(
+    mem: &EmptyReplyMemory,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<RefusedPrompt> {
+    let model = model?;
+    let table = mem.read();
+    if table.apps.is_empty() {
+        return None;
+    }
+    let digest = app_system_digest(body?)?;
+    table.apps.get(&(model.to_string(), digest)).cloned()
+}
+
+/// 一条识别不了会话的来访到过上游、拿到了 200：给它的应用（模型 + system 哈希）记一笔；
+/// 若这条是分类器拒答（`refusal` 带判决文案与回放体），拒答数也加一，并判要不要学：拒答至少
+/// [`APP_REFUSAL_MIN_REFUSALS`] 条、且占该应用请求数不低于 [`APP_REFUSAL_MIN_RATIO_PCT`]%，
+/// 学成 `app_refusal` 规则（[`remember_app_refusal`]），返回新学到的那条供落库。
+///
+/// 为什么按比例而不是一条就学：同一批中转站上既有拒答率过半的风暴应用，也有固定 system、
+/// 偶尔撞一次分类器的真人会话（复盘里 1% 到 2%）；一条就学会把后者整个应用连坐 7 天。
+/// 已学过的应用不再计。
+fn record_app_request(
+    mem: &EmptyReplyMemory,
+    model: &str,
+    digest: &str,
+    refusal: Option<(&str, &store::LearnedReply)>,
+) -> Option<store::LearnedRejection> {
+    let key = (model.to_string(), digest.to_string());
+    {
+        let mut table = mem.write();
+        if table.apps.contains_key(&key) {
+            return None;
+        }
+        if !table.app_counters.contains_key(&key)
+            && table.app_counters.len() >= APP_COUNTER_MAX_KEYS
+        {
+            table.app_counters.clear();
+        }
+        let counter = table.app_counters.entry(key).or_default();
+        counter.total += 1;
+        refusal?;
+        counter.refused += 1;
+        let enough = counter.refused >= APP_REFUSAL_MIN_REFUSALS
+            && counter.refused * 100 >= counter.total * APP_REFUSAL_MIN_RATIO_PCT;
+        if !enough {
+            tracing::info!(
+                model = %model, system_sha = %digest,
+                refused = counter.refused, total = counter.total,
+                min_refusals = APP_REFUSAL_MIN_REFUSALS, min_ratio_pct = APP_REFUSAL_MIN_RATIO_PCT,
+                "session-less app refused again; below the app-level learning threshold, not learned yet"
+            );
+            return None;
+        }
+    }
+    let (message, reply) = refusal?;
+    remember_app_refusal(mem, model, digest, message, reply.clone())
+}
+
+/// 把一个识别不了会话的应用（模型 + system 哈希）记成「上游一律拒答」，之后同应用的每条请求
+/// 回放 `reply`。门槛在 [`record_app_request`] 里判，这里只管写。返回**这次新学到**的那条
+/// （已有的不重复），调用方拿去落库。
+fn remember_app_refusal(
+    mem: &EmptyReplyMemory,
+    model: &str,
+    digest: &str,
+    excerpt: &str,
+    reply: store::LearnedReply,
+) -> Option<store::LearnedRejection> {
+    let mut table = mem.write();
+    let key = (model.to_string(), digest.to_string());
+    if table.apps.contains_key(&key) {
+        return None;
+    }
+    table.apps.insert(key, RefusedPrompt { verdict: excerpt.to_string(), reply: reply.clone() });
+    tracing::warn!(
+        model = %model,
+        system_sha = %digest,
+        reply_sse = reply.sse,
+        "learned an app-level refusal: this session-less app is refused often enough that every further request with the same model and system gets upstream's refusal replayed locally"
+    );
+    Some(store::LearnedRejection {
+        kind: LEARNED_KIND_APP_REFUSAL.into(),
+        model: model.to_string(),
+        field: APP_REFUSAL_FIELD.into(),
+        value: digest.to_string(),
+        message: excerpt.to_string(),
+        reply: Some(reply),
+    })
 }
 
 /// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` + `tools` +
@@ -9728,12 +10201,17 @@ fn client_supplied_fallbacks(body: Option<&serde_json::Value>) -> bool {
     body.and_then(|v| v.get("fallbacks")).is_some_and(|f| !f.is_string())
 }
 
-/// 这条请求出站时会不会带 `fallbacks`——客户端自己写了（数组非空，或 2.1.258 那种字符串
-/// `"default"`，两种形态 [`rewrite_body`] 都会保留/归一后送出），或 luban 按族开关要补
+/// 这条请求出站时会不会带一份**上游会照着换模型重跑**的 `fallbacks`——客户端自己写了合法的
+/// 数组（[`valid_fallback_array`]，[`rewrite_body`] 一字不动送出），或 luban 按族开关要补
 /// （[`refusal_fallbacks_for`]）。带的请求上游拒答后会自己换模型重跑，本地的「已拒答提示词」
-/// 规则（[`known_refused_prompt`]）不该拦它。字符串只认 `"default"`——抓包里唯一出现过的
-/// 字符串形态（`cap/2.1.258/00013`），2.1.260 起换成数组（`cap/2.1.260/00018`）；空串或别的
-/// 字面量官方客户端从没发过、上游一定 400，不算「带了 fallback」，不该拿它绕过本地规则。
+/// 规则（[`known_refused_prompt`]）不该拦它。
+///
+/// **字符串形态一律不算**，与 [`client_supplied_fallbacks`] 同口径。2.1.258 那种 `"default"`
+/// （`cap/2.1.258/00013`）在 luban 有计划时会被 [`ensure_fallbacks`] 换成计划（上面那条已经
+/// 算进去了）；没计划时它原样出站，而头那侧按「客户端没带」处理、不补 `server-side-fallback`
+/// beta，是「体里有字段、头上没声明」的形态，上游不会为它换模型重跑——放行只是白送一次拒答，
+/// 该本地回放上游那次的 200。此前这里把没计划的 `"default"` 也当成「带了」，门禁与实际出站
+/// 体不一致。空串或别的字面量上游一定 400，同样不算。
 /// `cc_kind` 在这里按体与 beta 头现算：调用点在 `handle_inner` 早于主流程算 `cc_kind` 的
 /// 位置，而 [`CcRequestKind::of`] 是纯函数。
 fn outbound_carries_fallbacks(
@@ -9753,13 +10231,10 @@ fn outbound_carries_fallbacks(
     {
         return valid_fallback_array(f);
     }
-    // 字段缺失或是字符串：luban 有计划就写计划（[`ensure_fallbacks`] 会把任何字符串换掉）。
+    // 字段缺失或是字符串：luban 有计划就写计划（[`ensure_fallbacks`] 会把任何字符串换掉），
+    // 没计划就是没带——字符串不算，见函数文档。
     let cc_kind = CcRequestKind::of(v, inbound_beta);
-    if refusal_fallbacks_for(model, flags, true, cc_kind, learned).is_some() {
-        return true;
-    }
-    // 没计划：字符串原样出站，只有 `"default"` 上游认。
-    client.and_then(|f| f.as_str()) == Some("default")
+    refusal_fallbacks_for(model, flags, true, cc_kind, learned).is_some()
 }
 
 /// 一份上游会认的 `fallbacks` 数组：非空，每一项是带非空 `model` 字符串的对象。官方定义就
@@ -12677,6 +13152,7 @@ async fn send_quota_probe(
         session_id: session_id.to_string(),
         // 额度探测不在会话链上：官方那条既没有 billing header，也没有 `diagnostics`。
         link: CcSessionLink::default(),
+        reason: SimulationReason::Probe,
     };
     let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
@@ -12766,6 +13242,7 @@ fn probe_simulation(
         profile,
         session_id: session_id_for(cred, device_fp),
         link: CcSessionLink::default(),
+        reason: SimulationReason::Probe,
     }
 }
 
@@ -13502,6 +13979,7 @@ mod tests {
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
+            reject_probes_strict: false,
             reject_refusals: false,
             reject_empty_replies: false,
             api_telemetry: false,
@@ -14322,6 +14800,7 @@ mod tests {
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
+            reject_probes_strict: false,
             reject_refusals: false,
             reject_empty_replies: false,
             api_telemetry: false,
@@ -15232,6 +15711,7 @@ mod tests {
                 reject_openai_shape: false,
                 reject_session_conflict: false,
                 reject_probes: false,
+                reject_probes_strict: false,
                 reject_refusals: false,
                 reject_empty_replies: false,
                 api_telemetry: false,
@@ -15880,6 +16360,29 @@ mod tests {
             reply: None,
         };
         rows.push(legacy_refusal.clone());
+        // 按应用学的：一条正常的（带体），一条没体的旧行（报成过期）。
+        let app_row =
+            super::remember_app_refusal(&empty, "claude-opus-5", "5y5", "[cyber] x", json_reply())
+                .expect("首次学到");
+        assert_eq!(
+            (app_row.kind.as_str(), app_row.field.as_str(), app_row.value.as_str()),
+            ("app_refusal", "system_sha", "5y5")
+        );
+        assert!(
+            super::remember_app_refusal(&empty, "claude-opus-5", "5y5", "again", json_reply())
+                .is_none(),
+            "同一应用第二次不算新学到"
+        );
+        rows.push(app_row);
+        let legacy_app = store::LearnedRejection {
+            kind: "app_refusal".into(),
+            model: "claude-opus-5".into(),
+            field: "system_sha".into(),
+            value: "0ldapp".into(),
+            message: "[cyber] stop_details={}".into(),
+            reply: None,
+        };
+        rows.push(legacy_app.clone());
         let shape2 = super::ShapeMemory::default();
         let dep2 = super::DeprecatedFieldMemory::default();
         let empty2 = super::EmptyReplyMemory::default();
@@ -15890,7 +16393,8 @@ mod tests {
                 deprecated: 1,
                 empty_reply: 1,
                 refusal: 1,
-                stale: vec![stale, legacy_refusal]
+                app_refusal: 1,
+                stale: vec![stale, legacy_refusal, legacy_app]
             }
         );
         let opus_ping = serde_json::json!({
@@ -15940,6 +16444,57 @@ mod tests {
         assert!(
             super::known_refused_prompt(&empty2, Some("claude-opus-5"), Some(&refused_body))
                 .is_none()
+        );
+        // 按应用学的那条回填了：同模型 + 同 system 命中，换 system / 换模型不命中，删得掉。
+        let app_body = |sys: &str| serde_json::json!({"model": "claude-opus-5", "system": sys, "messages": [{"role": "user", "content": "anything"}]});
+        let sys_a = "you are app A";
+        let sha_a = super::app_system_digest(&app_body(sys_a)).unwrap();
+        super::remember_app_refusal(&empty2, "claude-opus-5", &sha_a, "[cyber]", json_reply())
+            .unwrap();
+        let hit = super::known_app_refusal(&empty2, Some("claude-opus-5"), Some(&app_body(sys_a)))
+            .expect("同模型 + 同 system 命中");
+        assert_eq!(hit.reply, json_reply());
+        assert!(
+            super::known_app_refusal(
+                &empty2,
+                Some("claude-opus-5"),
+                Some(&app_body("you are app B"))
+            )
+            .is_none()
+        );
+        assert!(
+            super::known_app_refusal(&empty2, Some("claude-sonnet-5"), Some(&app_body(sys_a)))
+                .is_none()
+        );
+        let app_rule = store::LearnedRejection {
+            kind: "app_refusal".into(),
+            model: "claude-opus-5".into(),
+            field: "system_sha".into(),
+            value: sha_a,
+            message: String::new(),
+            reply: None,
+        };
+        assert!(super::forget_learned_memory(&shape2, &dep2, &empty2, &app_rule));
+        assert!(
+            super::known_app_refusal(&empty2, Some("claude-opus-5"), Some(&app_body(sys_a)))
+                .is_none()
+        );
+        // 没有 system 的请求没有应用身份：不学也不判。
+        assert_eq!(super::app_system_digest(&serde_json::json!({"messages": []})), None);
+        assert_eq!(
+            super::app_system_digest(&serde_json::json!({"system": "", "messages": []})),
+            None
+        );
+        assert_eq!(
+            super::app_system_digest(&serde_json::json!({"system": [], "messages": []})),
+            None
+        );
+        // system 的字串形态与单块数组形态是两份不同的 system。
+        assert_ne!(
+            super::app_system_digest(&app_body(sys_a)),
+            super::app_system_digest(
+                &serde_json::json!({"system": [{"type": "text", "text": sys_a}]})
+            )
         );
         let (max_tokens, excerpt) =
             super::known_empty_reply(&empty2, Some("claude-fable-5"), Some(&ping))
@@ -16174,6 +16729,12 @@ mod tests {
         dep.write().insert(("claude-opus-5".into(), super::FALLBACKS_FIELD.into()), "m".into());
         assert!(!super::clear_learned_memory_kind(&shape, &dep, &empty, "bogus"));
         assert_eq!(super::learned_memory_len(&shape, &dep, &empty), n + 2);
+        super::remember_app_refusal(&empty, "claude-opus-5", "app", "[cyber]", json_reply())
+            .unwrap();
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), n + 3);
+        assert!(super::clear_learned_memory_kind(&shape, &dep, &empty, "app_refusal"));
+        assert!(empty.read().apps.is_empty());
+        assert_eq!(super::learned_memory_len(&shape, &dep, &empty), n + 2);
         assert!(super::clear_learned_memory_kind(&shape, &dep, &empty, "refusal"));
         assert!(empty.read().prompts.is_empty());
         assert_eq!(empty.read().classes.len(), 1);
@@ -16273,6 +16834,7 @@ mod tests {
                 deprecated: 0,
                 empty_reply: 0,
                 refusal: 1,
+                app_refusal: 0,
                 stale: vec![]
             }
         );
@@ -16987,13 +17549,18 @@ mod tests {
         ));
         // sonnet：luban 不补 → 不带。
         assert!(!carries(&main, "claude-sonnet-5", defaults));
-        // 客户端自带数组 / "default"：开关关着也算带；空数组不算。
+        // 客户端自带合法数组：开关关着也算带；空数组不算。
         let mut with_arr = main.clone();
         with_arr["fallbacks"] = serde_json::json!([{"model": "claude-opus-4-8"}]);
         assert!(carries(&with_arr, "claude-sonnet-5", off));
+        // 字符串 "default"：有计划时会被换成计划 → 带；没计划时原样出站、头上不补 beta，
+        // 上游不会换模型重跑 → 不算带，命中已学到的拒答就本地回放。
         let mut with_default = main.clone();
         with_default["fallbacks"] = serde_json::json!("default");
-        assert!(carries(&with_default, "claude-sonnet-5", off));
+        assert!(carries(&with_default, "claude-fable-5-1", fable_on));
+        assert!(!carries(&with_default, "claude-fable-5-1", off));
+        assert!(!carries(&with_default, "claude-sonnet-5", off));
+        assert!(!carries(&with_default, "claude-sonnet-5", defaults));
         // 客户端带的非字符串形态 luban 不动，出站就是它那份：空数组、null、对象、元素不是
         // 带 model 的对象——上游一定 400，开关开着也不算带了 fallback。
         for bogus in [
@@ -17015,8 +17582,7 @@ mod tests {
         let mut bad_string = main.clone();
         bad_string["fallbacks"] = serde_json::json!("auto");
         assert!(carries(&bad_string, "claude-fable-5-1", fable_on));
-        // 字符串只认 "default"（抓包 cap/2.1.258/00013 那份）：空串或别的字面量官方从没发过、
-        // 上游一定 400，不算带了 fallback。
+        // 别的字符串同样不算：官方从没发过、上游一定 400。
         for bogus in ["", "auto", "Default"] {
             let mut with_bogus = main.clone();
             with_bogus["fallbacks"] = serde_json::json!(bogus);
@@ -17075,6 +17641,7 @@ mod tests {
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
+            reject_probes_strict: false,
             reject_refusals: false,
             reject_empty_replies: false,
             api_telemetry: false,
@@ -17276,6 +17843,7 @@ mod tests {
                 cc_session: None,
                 empty_reply_key: None,
                 prompt_key: None,
+                app_key: None,
                 empty_replies: Default::default(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
@@ -19758,6 +20326,190 @@ mod tests {
         assert!(!agrees(&plain, &cc_ua, sim_off), "开关关着一律不模拟");
     }
 
+    /// [`record_app_request`]：按比例学——拒答至少 3 条且占该应用请求数三成以上才学；风暴应用
+    /// 几条就学到，固定 system 偶尔撞一次分类器的真人会话永远学不到；学到后不再计；正常回答
+    /// 只加分母；表满整体清掉。
+    #[test]
+    fn app_refusals_are_learned_by_ratio_not_by_a_single_hit() {
+        let mem = super::EmptyReplyMemory::default();
+        let reply = json_reply();
+        let hit = |m: &super::EmptyReplyMemory, sha: &str| {
+            super::record_app_request(
+                m,
+                "claude-opus-5",
+                sha,
+                Some(("[reasoning_extraction]", &reply)),
+            )
+        };
+        let ok = |m: &super::EmptyReplyMemory, sha: &str| {
+            super::record_app_request(m, "claude-opus-5", sha, None)
+        };
+        // 风暴应用：拒、答、拒、拒 → 第三条拒答时 3/4 = 75%，学到。
+        assert!(hit(&mem, "storm").is_none());
+        assert!(ok(&mem, "storm").is_none());
+        assert!(hit(&mem, "storm").is_none(), "两条不够");
+        let learned = hit(&mem, "storm").expect("第三条拒答、占 75%，学到");
+        assert_eq!((learned.kind.as_str(), learned.value.as_str()), ("app_refusal", "storm"));
+        assert_eq!(learned.reply, Some(reply.clone()));
+        assert!(mem.read().apps.contains_key(&("claude-opus-5".to_string(), "storm".to_string())));
+        // 学到之后不再计，也不重复学。
+        assert!(hit(&mem, "storm").is_none());
+        assert!(ok(&mem, "storm").is_none());
+        // 真人会话：98 条正常、2 条拒答 → 2%，永远不学；再来一条拒答 3/101 也不学（比例不够）。
+        for _ in 0..98 {
+            assert!(ok(&mem, "agent").is_none());
+        }
+        assert!(hit(&mem, "agent").is_none());
+        assert!(hit(&mem, "agent").is_none());
+        assert!(hit(&mem, "agent").is_none(), "3 条但只占 3%，不学");
+        assert!(!mem.read().apps.contains_key(&("claude-opus-5".to_string(), "agent".to_string())));
+        assert_eq!(
+            mem.read().app_counters.get(&("claude-opus-5".to_string(), "agent".to_string())),
+            Some(&super::AppCounter { total: 101, refused: 3 })
+        );
+        // 3 条拒答、3 条正常 = 50%：学。恰好 30% 也学（3/10）。
+        for i in 0..3 {
+            assert!(ok(&mem, "half").is_none(), "{i}");
+            assert!(hit(&mem, "half").is_none() || i == 2);
+        }
+        assert!(mem.read().apps.contains_key(&("claude-opus-5".to_string(), "half".to_string())));
+        for _ in 0..7 {
+            ok(&mem, "edge");
+        }
+        assert!(hit(&mem, "edge").is_none());
+        assert!(hit(&mem, "edge").is_none());
+        assert!(hit(&mem, "edge").is_some(), "3/10 = 30% 恰好到线");
+        // 每小时重建记忆表时计数器保留。
+        let shape = super::ShapeMemory::default();
+        let dep = super::DeprecatedFieldMemory::default();
+        super::resync_learned_memories(&shape, &dep, &mem, vec![]);
+        assert!(mem.read().apps.is_empty(), "规则按库重建（库里没有）");
+        assert_eq!(
+            mem.read().app_counters.get(&("claude-opus-5".to_string(), "agent".to_string())),
+            Some(&super::AppCounter { total: 101, refused: 3 }),
+            "计数器不随重建丢失"
+        );
+        // 表满：整体清掉重计。
+        for i in 0..super::APP_COUNTER_MAX_KEYS {
+            ok(&mem, &format!("k{i}"));
+        }
+        assert!(mem.read().app_counters.len() <= super::APP_COUNTER_MAX_KEYS);
+        ok(&mem, "one-more");
+        assert!(mem.read().app_counters.len() <= super::APP_COUNTER_MAX_KEYS);
+    }
+
+    /// [`simulation_reason`]：记的是三道判据里**第一道**没过的（UA → 身份 → 形态，形态内部
+    /// CC 形态 → 基座 → 工具）；全过与官方额度探测为 `None`；`detect` 把同一个原因带进
+    /// [`Simulation::reason`]，流水的 `sim_reason` 列与 SIMULATED 日志行都取它。
+    #[test]
+    fn simulation_reason_names_the_first_failed_check() {
+        use super::SimulationReason::*;
+        const CC_UA: &str = "claude-cli/2.1.260 (external, cli)";
+        let cc_ua = platform_headers(Some(CC_UA));
+        let no_ua = platform_headers(None);
+        let reason = |body: &str, headers: &super::HeaderMap| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let from_cc = super::trusted_cc_version(&super::ua_of(headers)).is_some();
+            super::simulation_reason(Some(&v), headers, from_cc, all_on())
+        };
+        let identity = |device: &str| {
+            format!(
+                r#""metadata":{{"user_id":"{{\"device_id\":\"{device}\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}}"}}"#
+            )
+        };
+        let good_dev = "b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d";
+        let full = format!(
+            r#"{{"model":"claude-opus-5","max_tokens":32000,"system":[{{"type":"text","text":"{}"}},{}],"tools":[{{"name":"Bash","input_schema":{{"type":"object"}}}}],"messages":[],{}}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block(),
+            identity(good_dev)
+        );
+        // 全对：不模拟。
+        assert_eq!(reason(&full, &cc_ua), None);
+        // UA 不是 CC：形态再对也是 not_cc_client。
+        assert_eq!(reason(&full, &no_ua), Some(NotCcClient));
+        // 身份写错（device 不是 64 位 hex）：identity_malformed，排在形态之前。
+        let bad_identity = full.replace(good_dev, "not-a-device");
+        assert_eq!(reason(&bad_identity, &cc_ua), Some(IdentityMalformed));
+        // 没有身份句、没有 billing header：not_cc_shaped。
+        let plain = format!(
+            r#"{{"model":"claude-opus-5","max_tokens":1024,"system":"be brief","messages":[],{}}}"#,
+            identity(good_dev)
+        );
+        assert_eq!(reason(&plain, &cc_ua), Some(NotCcShaped));
+        // 只抄了身份句、没抄基座、也不是预热：no_base_prompt。
+        let no_base = format!(
+            r#"{{"model":"claude-opus-5","max_tokens":1024,"system":[{{"type":"text","text":"{}"}}],"messages":[],{}}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            identity(good_dev)
+        );
+        assert_eq!(reason(&no_base, &cc_ua), Some(NoBasePrompt));
+        // 同一份体 max_tokens=1 即 cache 预热：基座免检，不模拟。
+        let prewarm = no_base.replace(r#""max_tokens":1024"#, r#""max_tokens":1"#);
+        assert_eq!(reason(&prewarm, &cc_ua), None);
+        // 身份句 + 基座都在，tools 却一个官方名都没有：tools_not_cc。
+        let odd_tools = full.replace(r#""name":"Bash""#, r#""name":"my_tool""#);
+        assert_eq!(reason(&odd_tools, &cc_ua), Some(ToolsNotCc));
+        // 官方桌面端预热：max_tokens=1、没有 system（或只有一块几百字节的应用块）、没有
+        // tools——不是 CC 形态也放行；带长 system 的 1 token 请求仍算第三方。
+        let desktop_prewarm = format!(
+            r#"{{"model":"claude-fable-5-1","max_tokens":1,"messages":[{{"role":"user","content":"warm"}}],{}}}"#,
+            identity(good_dev)
+        );
+        assert_eq!(reason(&desktop_prewarm, &cc_ua), None);
+        let desktop_prewarm_app = desktop_prewarm.replace(
+            r#""max_tokens":1,"#,
+            &format!(
+                r#""max_tokens":1,"system":[{{"type":"text","text":"{}"}}],"#,
+                "a".repeat(911)
+            ),
+        );
+        assert_eq!(reason(&desktop_prewarm_app, &cc_ua), None);
+        let desktop_prewarm_tools = desktop_prewarm.replace(
+            r#""max_tokens":1,"#,
+            r#""max_tokens":1,"tools":[{"name":"mcp__ccd_session__spawn_task","input_schema":{"type":"object"}}],"#,
+        );
+        assert_eq!(
+            reason(&desktop_prewarm_tools, &cc_ua),
+            Some(NotCcShaped),
+            "只有非官方名的 tools 不享预热例外，仍按不是 CC 形态走模拟"
+        );
+        let anonymous_prewarm = r#"{"model":"claude-fable-5-1","max_tokens":1,"messages":[{"role":"user","content":"warm"}]}"#;
+        assert_eq!(
+            reason(anonymous_prewarm, &cc_ua),
+            Some(NotCcShaped),
+            "不带身份的 1 token 请求不算桌面端预热"
+        );
+        let long_prewarm = desktop_prewarm.replace(
+            r#""max_tokens":1,"#,
+            &format!(r#""max_tokens":1,"system":"{}","#, "b".repeat(1500)),
+        );
+        assert_eq!(reason(&long_prewarm, &cc_ua), Some(NotCcShaped));
+        assert_eq!(reason(&desktop_prewarm, &no_ua), Some(NotCcClient), "UA 不可信照样模拟");
+        let prewarm_bad_id = desktop_prewarm.replace(good_dev, "nope");
+        assert_eq!(reason(&prewarm_bad_id, &cc_ua), Some(IdentityMalformed));
+        // 开关关着：什么原因都没有。
+        let v: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        let sim_off = store::ForwardFlags { simulate_cc: false, ..all_on() };
+        assert_eq!(super::simulation_reason(Some(&v), &cc_ua, true, sim_off), None);
+        // detect 带出同一个原因，标签与流水列一致。
+        let sim = detect_with(&Bytes::from(plain.clone()), &cc_ua, all_on()).expect("走模拟");
+        assert_eq!(sim.reason, NotCcShaped);
+        assert_eq!(sim.reason.tag(), "not_cc_shaped");
+        // 来访事实：块数、字节数、有没有身份句 / billing header、tools 数、max_tokens。
+        let f = super::inbound_facts(&serde_json::from_str::<serde_json::Value>(&full).unwrap());
+        assert_eq!(
+            (f.system_blocks, f.identity, f.billing_header, f.tools, f.max_tokens),
+            (2, true, false, 1, Some(32000))
+        );
+        assert!(f.system_bytes > super::CC_BASE_PROMPT_MIN_LEN);
+        let f = super::inbound_facts(&v);
+        assert_eq!(
+            (f.system_blocks, f.system_bytes, f.identity, f.tools),
+            (1, "be brief".len(), false, 0)
+        );
+    }
+
     /// `spoof_device_id` 关掉时只换 account 段，来访自带的 `device_id` 原样保留。
     ///
     /// **判据取自真实抓包对**：`cap/raw/00002`（API-key 模式经 luban）与 `00006`（订阅模式
@@ -20076,10 +20828,14 @@ mod tests {
             r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abcdef"}},{{"type":"text","text":"{identity}"}},{{"type":"text","text":"{identity}"}}]"#
         );
         let one_msg = r#"[{"role":"user","content":"hi"}]"#;
-        let sig_beta = |body: &str, cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
+        let sig_beta = |body: &str, _cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
             let beta: Vec<String> = beta.iter().map(|b| b.to_string()).collect();
-            super::probe_signature(Some(&v), cc, dev, &beta, || known)
+            super::probe_signature(Some(&v), dev, &beta, false, || known)
+        };
+        let strict = |body: &str| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            super::probe_signature(Some(&v), None, &[], true, || false)
         };
         let sig = |body: &str, cc: bool, dev: Option<&str>, known: bool| {
             sig_beta(body, cc, dev, known, &[])
@@ -20118,9 +20874,60 @@ mod tests {
         );
         assert_eq!(sig(&channel_test, true, Some("channel-test"), true), None);
 
-        // ---- 换成非 CC UA：一律不判（那条路走模拟） ----
-        assert_eq!(sig(&ping3, false, Some(DEV), false), None);
-        assert_eq!(sig(&burst, false, Some(DEV), false), None);
+        // ---- 不限 UA（0.3.99 起）：非 CC UA 同样判——Go-http-client 的探活此前全走模拟 ----
+        assert_eq!(sig(&ping3, false, Some(DEV), false), Some(DuplicateIdentity));
+        assert_eq!(sig(&burst, false, Some(DEV), false), Some(ThrowawayConversation));
+        // 不带 system 的 ping 也算：官方没有「无 system、max_tokens 2..16」的请求。
+        let bare_ping =
+            format!(r#"{{"model":"claude-sonnet-4-6","messages":{one_msg},"max_tokens":16}}"#);
+        assert_eq!(sig(&bare_ping, false, None, false), Some(Ping));
+        assert_eq!(sig(&bare_ping, true, None, false), Some(Ping));
+        // 不带 system、max_tokens 正常的单句请求不算一次性会话：第三方小应用太常见。
+        let bare_chat =
+            format!(r#"{{"model":"claude-sonnet-4-6","messages":{one_msg},"max_tokens":1024}}"#);
+        assert_eq!(sig(&bare_chat, false, Some(DEV), false), None);
+        // 默认判据：带 tools 的不算 ping（复盘里 mt=16 带 4 个 tools 的那批照常放行）。
+        let tooled_ping = format!(
+            r#"{{"model":"claude-sonnet-4-6","messages":{one_msg},"max_tokens":16,"tools":[{{"name":"t","input_schema":{{"type":"object"}}}}]}}"#
+        );
+        assert_eq!(sig(&tooled_ping, false, None, false), None);
+
+        // ---- 严格模式（默认关）：多收两刀 ----
+        // 带 tools 的 ping 也算：16 个 token 装不下一次 tool_use。
+        assert_eq!(strict(&tooled_ping), Some(Ping));
+        // 短开场：无 system、无 tools、一句「hi」，max_tokens 随便多大。
+        for mt in [50, 1024, 32000] {
+            let opener =
+                format!(r#"{{"model":"claude-opus-5","messages":{one_msg},"max_tokens":{mt}}}"#);
+            assert_eq!(strict(&opener), Some(ShortOpener), "max_tokens {mt}");
+            assert_eq!(sig(&opener, false, None, false), None, "默认判据不拦 max_tokens {mt}");
+        }
+        // 文本块形态、带首尾空白也算；不超过 32 字节。中文短语同样算，一整句话不算。
+        let blocks = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"  ping  "}]}],"max_tokens":1024}"#;
+        assert_eq!(strict(blocks), Some(ShortOpener));
+        let zh_opener = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"你好，测试一下"}],"max_tokens":1024}"#;
+        assert_eq!(strict(zh_opener), Some(ShortOpener), "7 个汉字 21 字节");
+        // 正文长了就是正常单轮对话，不算（30 个汉字 90 字节，按字符算会误伤）。
+        let real = format!(
+            r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":"{}"}}],"max_tokens":1024}}"#,
+            "请把下面这段话翻译成英文，并保留原有的段落结构与专有名词。"
+        );
+        assert_eq!(strict(&real), None);
+        // 带 system、带 tools、带附件、max_tokens=1（预热）、多条消息：都不是短开场。
+        let with_sys = format!(
+            r#"{{"model":"claude-opus-5","system":"be brief","messages":{one_msg},"max_tokens":1024}}"#
+        );
+        assert_eq!(strict(&with_sys), None);
+        let with_tools = format!(
+            r#"{{"model":"claude-opus-5","messages":{one_msg},"max_tokens":1024,"tools":[{{"name":"t","input_schema":{{"type":"object"}}}}]}}"#
+        );
+        assert_eq!(strict(&with_tools), None);
+        let with_image = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{}}]}],"max_tokens":1024}"#;
+        assert_eq!(strict(with_image), None);
+        let prewarm = format!(r#"{{"model":"claude-opus-5","messages":{one_msg},"max_tokens":1}}"#);
+        assert_eq!(strict(&prewarm), None);
+        let two_msgs = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"hi"}],"max_tokens":1024}"#;
+        assert_eq!(strict(two_msgs), None);
 
         // ---- 加空字段绕不过 ----
         let padded = format!(
@@ -21620,6 +22427,8 @@ mod tests {
                 cc_session: None,
                 empty_reply_key: key.map(|(m, n)| (m.to_string(), n)),
                 prompt_key: prompt.map(|(m, d)| (m.to_string(), d.to_string())),
+                // 与提示词哈希同源的 system 哈希：按应用学的那条与按提示词学的那条一起验。
+                app_key: prompt.map(|(m, d)| (m.to_string(), format!("app-{d}"))),
                 empty_replies: mem.clone(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
@@ -21691,7 +22500,14 @@ mod tests {
                 .verdict
                 .contains(r#""category":"cyber""#)
         );
+        // 按应用学的那条（测试里 app_key 与提示词哈希同源）：一条拒答只记计数，不到门槛不学。
+        assert!(mem.read().apps.is_empty(), "一条拒答不够按应用学");
+        assert_eq!(
+            mem.read().app_counters.get(&("claude-opus-5".to_string(), "app-deadbeef".to_string())),
+            Some(&super::AppCounter { total: 1, refused: 1 })
+        );
         let rows = store.learned_rejections().unwrap();
+        assert!(rows.iter().all(|r| r.kind != "app_refusal"));
         let refused_row = rows.iter().find(|r| r.kind == "refusal").expect("拒答规则落库");
         assert_eq!(
             (refused_row.field.as_str(), refused_row.value.as_str()),
@@ -21814,6 +22630,15 @@ mod tests {
             !mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "m1d".to_string())),
             "流到一半才被掐的拒答没有可回放的响应，不学"
         );
+        assert!(
+            !mem.read().apps.contains_key(&("claude-opus-5".to_string(), "app-m1d".to_string())),
+            "按应用学的同样要求体可回放"
+        );
+        // 流到一半才被掐的：不算可学的拒答，只给应用的总数记一笔（分母）。
+        assert_eq!(
+            mem.read().app_counters.get(&("claude-opus-5".to_string(), "app-m1d".to_string())),
+            Some(&super::AppCounter { total: 1, refused: 0 })
+        );
         let logs = store.list_usage_logs(10).unwrap();
         assert_eq!(logs.len(), 10);
         assert_eq!(logs[0].forensics.rewrites.as_deref(), Some("refusal"));
@@ -21861,6 +22686,7 @@ mod tests {
                 cc_session: None,
                 empty_reply_key: None,
                 prompt_key: None,
+                app_key: None,
                 empty_replies: Default::default(),
                 store: store.clone(),
                 _in_flight: super::InFlightGuard::new(Default::default()),
@@ -21922,6 +22748,7 @@ mod tests {
             cc_session: None,
             empty_reply_key: None,
             prompt_key: None,
+            app_key: None,
             empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
@@ -22137,6 +22964,7 @@ mod tests {
             cc_session: None,
             empty_reply_key: None,
             prompt_key: None,
+            app_key: None,
             empty_replies: Default::default(),
             store: store.clone(),
             _in_flight: super::InFlightGuard::new(Default::default()),
@@ -23001,6 +23829,7 @@ mod tests {
             cc_session: None,
             empty_reply_key: None,
             prompt_key: None,
+            app_key: None,
             empty_replies: Default::default(),
             store,
             _in_flight: super::InFlightGuard::new(Default::default()),

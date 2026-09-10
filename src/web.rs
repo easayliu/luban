@@ -129,12 +129,15 @@ pub async fn run(
             );
             // 按新逻辑不该存在的旧行：不回填，顺手从库里删掉。
             drop_stale_learned_rules(&state.store, &seeded.stale);
-            let proxy::SeededMemories { shape, deprecated, empty_reply, refusal, .. } = seeded;
-            if shape + deprecated + empty_reply + refusal > 0 {
+            let proxy::SeededMemories {
+                shape, deprecated, empty_reply, refusal, app_refusal, ..
+            } = seeded;
+            if shape + deprecated + empty_reply + refusal + app_refusal > 0 {
                 tracing::info!(
                     shape,
                     empty_reply,
                     refusal,
+                    app_refusal,
                     deprecated,
                     "restored learned upstream rejections from the database"
                 );
@@ -1396,8 +1399,9 @@ async fn clear_cooldown(
 #[derive(Serialize)]
 struct LearnedRejectionView {
     /// `shape`（命中本地拒）、`deprecated`（命中转发前剥掉字段）、`empty_reply`（上游对这类
-    /// 回过零输出，命中本地拒）或 `refusal`（上游拒答过这条提示词，同一条命中时原样回放上游
-    /// 那次的响应，见 [`store::LearnedReply`]）。
+    /// 回过零输出，命中本地拒）、`refusal`（上游拒答过这条提示词，同一条命中时原样回放上游
+    /// 那次的响应，见 [`store::LearnedReply`]）或 `app_refusal`（上游拒答过某个识别不了会话的
+    /// 应用，同一模型 + 同一份 system 命中时回放）。
     kind: String,
     model: String,
     field: String,
@@ -2053,6 +2057,8 @@ struct ForwardingResp {
     reject_session_conflict: bool,
     /// 本地拒绝探针 / 探活类请求（403），不转发。
     reject_probes: bool,
+    /// 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据。默认关。
+    reject_probes_strict: bool,
     /// 本地拒绝上游分类器已拒答过的那条提示词的逐字重发（403）；出站带 fallbacks 的不拦。
     reject_refusals: bool,
     /// 本地拒绝上游回过 200 却零输出的请求类（403）。
@@ -2095,6 +2101,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_openai_shape: f.reject_openai_shape,
             reject_session_conflict: f.reject_session_conflict,
             reject_probes: f.reject_probes,
+            reject_probes_strict: f.reject_probes_strict,
             reject_refusals: f.reject_refusals,
             reject_empty_replies: f.reject_empty_replies,
             api_telemetry: f.api_telemetry,
@@ -2761,6 +2768,7 @@ struct SetForwardingReq {
     reject_openai_shape: Option<bool>,
     reject_session_conflict: Option<bool>,
     reject_probes: Option<bool>,
+    reject_probes_strict: Option<bool>,
     reject_refusals: Option<bool>,
     reject_empty_replies: Option<bool>,
     api_telemetry: Option<bool>,
@@ -2781,10 +2789,10 @@ async fn set_forwarding(
         FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
         NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
         RATE_LIMIT_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES,
-        REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
-        TOOL_NAME_MIMIC,
+        REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC,
+        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
+        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
+        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2812,6 +2820,7 @@ async fn set_forwarding(
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
         (REJECT_SESSION_CONFLICT, req.reject_session_conflict),
         (REJECT_PROBES, req.reject_probes),
+        (REJECT_PROBES_STRICT, req.reject_probes_strict),
         (REJECT_REFUSALS, req.reject_refusals),
         (REJECT_EMPTY_REPLIES, req.reject_empty_replies),
         (API_TELEMETRY, req.api_telemetry),

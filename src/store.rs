@@ -130,7 +130,10 @@ pub struct ModelDenial {
 /// - `kind = "refusal"`：上游分类器拒答过某条提示词（`field = "prompt_sha"`，`value` 是提示词
 ///   哈希），逐字相同的重发命中时**原样回放上游那次的响应**（[`Self::reply`]：200 + 同一段体），
 ///   `message` 是「[类别] stop_details=…」的判决文案，控制台与日志看，见
-///   `crate::proxy::known_refused_prompt`。
+///   `crate::proxy::known_refused_prompt`；
+/// - `kind = "app_refusal"`：上游分类器拒答过某个**识别不了会话的应用**（`field = "system_sha"`，
+///   `value` 是来访 system 的哈希），同一模型 + 同一份 system 的请求命中时同样回放；拒答至少
+///   3 条且占该应用请求数三成以上才学，见 `crate::proxy::record_app_request`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnedRejection {
     pub kind: String,
@@ -2312,6 +2315,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_PROBES) {
             flags.reject_probes = v;
         }
+        if let Some(v) = on(REJECT_PROBES_STRICT) {
+            flags.reject_probes_strict = v;
+        }
         // 拆分前三件事共用 `reject_probes`：旧库只写过它的，两条新键沿用它的取值（关过 =
         // 用户当时把学到的规则也一起关了，升级不能悄悄开回来）；新键一旦写了就以新键为准。
         if let Some(v) = on(REJECT_REFUSALS).or_else(|| on(REJECT_PROBES)) {
@@ -2590,6 +2596,11 @@ pub const REJECT_REFUSALS: &str = "reject_refusals";
 /// 见 [`ForwardFlags::reject_empty_replies`] 与 `proxy::known_empty_reply`。
 pub const REJECT_EMPTY_REPLIES: &str = "reject_empty_replies";
 
+/// 探针拒绝的**严格模式**：ping 不再要求无 tools，并新增「短开场」判据（无 system、无 tools、
+/// 一条几个字的用户消息）。默认关——会误伤真人用裸聊天客户端发的第一句「你好」。
+/// 见 [`ForwardFlags::reject_probes_strict`] 与 `proxy::probe_signature`。
+pub const REJECT_PROBES_STRICT: &str = "reject_probes_strict";
+
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
 /// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
 pub const API_TELEMETRY: &str = "api_telemetry";
@@ -2856,6 +2867,13 @@ pub struct ForwardFlags {
     /// [`Self::reject_empty_replies`]）：三件事的依据、误伤面、该不该开都不一样，共用一个键
     /// 就没法单独关一件。默认开。
     pub reject_probes: bool,
+    /// 探针拒绝的**严格模式**（随 [`Self::reject_probes`] 一起才生效）：ping 不再要求无 tools
+    /// （`max_tokens` 不超过 16 装不下一次 tool_use，带工具只给 16 个 token 只能是测活）；新增
+    /// 「短开场」——无 system、无 tools、恰好一条不超过 32 字节（中文约十个字）的用户消息、`max_tokens != 1`
+    /// （测活脚本的「hi」「ping」「test」）。覆盖封号复盘里默认判据放过去的那几批 Go-http-client
+    /// 探活（4 个 tools + max_tokens 16；max_tokens 50 / 1024 / 32000 只问一句）。代价是真人用
+    /// 裸聊天客户端经中转站发的第一句「你好」也会被拒，故**默认关**。
+    pub reject_probes_strict: bool,
     /// 是否本地拦下 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
     /// 见 `proxy::known_refused_prompt`）——拦下时**原样回放上游那次的响应**（200 + 同一段
     /// `stop_reason: "refusal"` 的体，见 [`LearnedReply`]），不是 luban 自己造一条 403：客户端
@@ -2937,6 +2955,7 @@ impl Default for ForwardFlags {
             reject_openai_shape: true,
             reject_session_conflict: true,
             reject_probes: true,
+            reject_probes_strict: false,
             reject_refusals: true,
             reject_empty_replies: true,
             api_telemetry: true,
@@ -3180,6 +3199,10 @@ pub struct Forensics {
     pub proxy: Option<String>,
     /// 走了模拟路径（非 CC 客户端被改写成 CC 形态发出）。
     pub simulated: bool,
+    /// 走模拟的原因标签（`not_cc_client` / `identity_malformed` / `not_cc_shaped` /
+    /// `no_base_prompt` / `tools_not_cc` / `probe`），见 `crate::proxy::SimulationReason`；
+    /// 没走模拟为 `None`。0.3.99 之前的旧记录也是 `None`。
+    pub sim_reason: Option<String>,
     /// 出站请求体的结构摘要（JSON 文本，不含用户正文），见 `crate::proxy::shape_summary`。
     pub shape: Option<String>,
     /// 出站身份里的 session_id（`metadata.user_id` 末段 / `X-Claude-Code-Session-Id`）。
@@ -3716,10 +3739,10 @@ impl CredentialStore {
                  rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
                  request_id, upstream_request_id,
                  proxy, simulated, shape, session_id, error_type, error_message, third_party,
-                 rewrites, device_id_out, response_excerpt)
+                 rewrites, device_id_out, response_excerpt, sim_reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
+                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
             params![
                 ts,
                 rec.cred_id,
@@ -3766,6 +3789,7 @@ impl CredentialStore {
                     .response_excerpt
                     .as_deref()
                     .map(|m| head_chars(m, RESPONSE_EXCERPT_MAX)),
+                rec.forensics.sim_reason,
             ],
         )?;
         // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
@@ -4220,7 +4244,7 @@ const USAGE_LOG_COLS: &str = "ts, cred_id, cred_label, device_id, model, path, s
         cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
         request_id, upstream_request_id,
         proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
-        device_id_out, response_excerpt";
+        device_id_out, response_excerpt, sim_reason";
 
 /// 按 [`USAGE_LOG_COLS`] 的顺序把一行读成 [`UsageLog`]（0 号列是主键）。
 fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
@@ -4269,6 +4293,7 @@ fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
             rewrites: r.get(40)?,
             device_id_out: r.get(41)?,
             response_excerpt: r.get(42)?,
+            sim_reason: r.get(43)?,
         },
     })
 }
@@ -4638,6 +4663,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "device_id_out TEXT",
         // 0.3.89：上游 200 却零输出 / 拒答时截取的响应体，见 Forensics::response_excerpt。
         "response_excerpt TEXT",
+        // 0.3.99：走模拟路径的原因标签，见 Forensics::sim_reason。
+        "sim_reason TEXT",
     ] {
         // 冻结表与流水表同列（USAGE_LOG_COLS 逐列照搬），补列必须两张一起补。
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
@@ -5857,6 +5884,8 @@ mod tests {
                 proxy: Some("socks5h://u:***@exit1:1080".into()),
                 shape: Some("{\"keys\":[\"model\"]}".into()),
                 device_id_out: Some("d230ce6e-out".into()),
+                simulated: true,
+                sim_reason: Some("not_cc_shaped".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -5866,6 +5895,10 @@ mod tests {
         rec.device_id = Some("dev2".into());
         store.insert_usage_log_at(&rec, Some(now - 3 * 86400 + 5)).unwrap();
         store.insert_usage_log_at(&rec, Some(now - 10 * 86400)).unwrap();
+        // 模拟原因随流水落库、读回。
+        let back = store.list_usage_logs(1).unwrap().remove(0);
+        assert!(back.forensics.simulated);
+        assert_eq!(back.forensics.sim_reason.as_deref(), Some("not_cc_shaped"));
 
         let ctx = BanContext {
             reason: "[403] permission_error: account disabled".into(),
@@ -8463,6 +8496,7 @@ mod tests {
             (REJECT_PROBES, "0"),
             (REJECT_REFUSALS, "0"),
             (REJECT_EMPTY_REPLIES, "0"),
+            (REJECT_PROBES_STRICT, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
             (FABLE_REFUSAL_FALLBACK, "0"),
@@ -8499,6 +8533,7 @@ mod tests {
                 reject_openai_shape: false,
                 reject_session_conflict: false,
                 reject_probes: false,
+                reject_probes_strict: false,
                 reject_refusals: false,
                 reject_empty_replies: false,
                 api_telemetry: false,

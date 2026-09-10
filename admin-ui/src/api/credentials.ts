@@ -303,6 +303,11 @@ export interface UsageLog {
    * 正常回复为 null——只有这类异常才留正文，是唯一能看到上游到底回了什么的地方。0.3.89 起。
    */
   response_excerpt: string | null
+  /**
+   * 走模拟路径的原因标签：not_cc_client / identity_malformed / not_cc_shaped / no_base_prompt /
+   * tools_not_cc / probe。没走模拟为 null；0.3.99 之前的旧记录也是 null。
+   */
+  sim_reason: string | null
 }
 
 /** 分布项：某个取值出现了多少次。 */

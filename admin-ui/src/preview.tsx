@@ -787,6 +787,7 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   third_party: index === 7,
   rewrites: index === 3 ? 'demoted_thinking' : null,
   response_excerpt: null,
+  sim_reason: index % 4 === 0 ? (index % 8 === 0 ? 'not_cc_shaped' : 'no_base_prompt') : null,
 }))
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   total: 37,

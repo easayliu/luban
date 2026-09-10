@@ -91,9 +91,11 @@ export interface Settings {
   reject_openai_shape: boolean
   /** 会话 id 在请求头与 metadata 两处不一致时本地拒绝，不替客户端选一个。 */
   reject_session_conflict: boolean
-  /** 本地拒绝探针 / 探活类请求（403），不转发。 */
+  /** 本地拒绝探针 / 探活类请求（403），不转发；不限 UA。 */
   reject_probes: boolean
-  /** 上游分类器已拒答过的那条提示词逐字重发时，本地原样回放上游那次的响应（200 + 同一段 stop_reason refusal 的体），不到上游；出站带 fallbacks 的不拦。 */
+  /** 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据（无 system、无 tools、一条不超过 32 字节、中文约十个字的用户消息）。默认关。 */
+  reject_probes_strict: boolean
+  /** 上游分类器已拒答过的那条提示词逐字重发时，本地原样回放上游那次的响应（200 + 同一段 stop_reason refusal 的体），不到上游；识别不了会话的来访另按「模型 + system」学，拒答至少 3 条且占该应用请求三成以上才学、之后同应用一律回放；出站带 fallbacks 的不拦。 */
   reject_refusals: boolean
   /** 本地拒绝上游回过 200 却零输出的请求类（403）。 */
   reject_empty_replies: boolean
@@ -138,6 +140,7 @@ export type ForwardingKey =
   | 'reject_openai_shape'
   | 'reject_session_conflict'
   | 'reject_probes'
+  | 'reject_probes_strict'
   | 'reject_refusals'
   | 'reject_empty_replies'
   | 'api_telemetry'

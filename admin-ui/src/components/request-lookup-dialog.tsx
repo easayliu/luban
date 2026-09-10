@@ -192,10 +192,34 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
 }
 
 /** 已知改写/结局标签的可读名；认不出的原样显示。 */
+/** 走模拟路径的原因（流水 `sim_reason` 列）：三道判据里没过的第一道。 */
+function simReasonLabel(reason: string, t: (zh: string, en: string) => string): string {
+  switch (reason) {
+    case 'not_cc_client':
+      return t('UA 不是可信 CC 版本', 'UA is not a trusted CC version')
+    case 'identity_malformed':
+      return t('身份字段格式不对', 'Malformed identity fields')
+    case 'not_cc_shaped':
+      return t('system 无身份句与 billing header', 'No identity line or billing header')
+    case 'no_base_prompt':
+      return t('缺基座提示词', 'Missing base prompt')
+    case 'tools_not_cc':
+      return t('tools 无官方工具名', 'No official tool names')
+    case 'probe':
+      return t('luban 探测', 'luban probe')
+    default:
+      return reason
+  }
+}
+
 function rewriteLabel(tag: string, t: (zh: string, en: string) => string): string {
   switch (tag) {
     case 'rejected_locally':
       return t('本地拒绝，未转发', 'Rejected locally, not forwarded')
+    case 'refusal_replay':
+      return t('本地回放已学到的上游拒答，未转发', 'Replayed a learned upstream refusal locally, not forwarded')
+    case 'app_refusal_replay':
+      return t('本地回放按应用学到的上游拒答，未转发', 'Replayed a learned app-level upstream refusal locally, not forwarded')
     case 'upstream_401':
       return t('上游 401，未能换号', 'Upstream 401, no account to swap to')
     case 'model_unsupported':
@@ -230,11 +254,21 @@ function ForensicTags({ log }: { log: UsageLog }) {
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5">
       {tags.map((tag) => (
-        <Badge key={tag} variant={tag === 'rejected_locally' ? 'secondary' : 'outline'} size="sm" title={tag}>
+        <Badge
+          key={tag}
+          variant={tag === 'rejected_locally' || tag === 'refusal_replay' || tag === 'app_refusal_replay' ? 'secondary' : 'outline'}
+          size="sm"
+          title={tag}
+        >
           {rewriteLabel(tag, t)}
         </Badge>
       ))}
-      {log.simulated && <Badge variant="info" size="sm">{t('模拟路径', 'Simulated')}</Badge>}
+      {log.simulated && (
+        <Badge variant="info" size="sm" title={log.sim_reason ?? undefined}>
+          {t('模拟路径', 'Simulated')}
+          {log.sim_reason ? ` · ${simReasonLabel(log.sim_reason, t)}` : ''}
+        </Badge>
+      )}
       {log.third_party && <Badge variant="error" size="sm">{t('上游判为第三方', 'Flagged as third-party')}</Badge>}
       {log.proxy && (
         <span className="truncate font-mono text-2xs text-muted-foreground" title={log.proxy}>
