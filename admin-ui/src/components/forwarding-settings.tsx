@@ -162,6 +162,14 @@ export function ForwardingSettingsContent() {
             '让客户端身份与当前账号、设备保持一致；关闭后原样转发。',
             'Keep the client identity consistent with the current account and device; when disabled, forward it unchanged.',
           )}
+          description={
+            <>
+              {t(
+                '改写请求里的账号标识与设备标识为当前账号那一份，并把客户端的会话标识按账号派生成另一个稳定值：同一条会话在同一个账号上始终是同一个值，多轮对话与缓存照常接续；换到另一个账号就是另一个值。不这样做的话，设备因账号停用或限流被改绑到别的账号时，同一个会话标识会带着两个设备标识先后出现在两个账号下——官方客户端一条会话只属于一个账号、一台设备，封号复盘里两个号的会话就是这样在半分钟内先后出现在两个组织下。请求头与 metadata 两处始终落同一个值。',
+                'Rewrites the account and device identifiers in the request to those of the current account, and derives a stable per-account value from the client’s session identifier: the same session always maps to the same value on the same account, so multi-turn conversations and caching continue as usual, while another account gets a different value. Without this, when a device is rebound to another account because its account was disabled or rate-limited, the same session identifier would appear under two accounts with two device identifiers — the official client’s session belongs to exactly one account and one device, and in the ban review two accounts showed exactly such sessions surfacing in two organizations within half a minute. The header and metadata always carry the same value.',
+              )}
+            </>
+          }
         />
         {/* 紧跟「身份一致性」：它是本项的前置开关，挨着放才好一起改。 */}
         <ForwardingToggle
@@ -433,8 +441,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '仅改写非 Claude Code 请求。开启后会增加系统提示词和客户端请求头，可能提高 Token 成本并改变输出风格。此类请求通常没有设备身份，需先关闭「设备身份校验」。',
-                'Only non-Claude Code requests are rewritten. Enabling this adds a system prompt and client request headers, which may increase Token costs and change the output style. These requests usually have no device identity, so disable “Device identity checks” first.',
+                '仅改写非 Claude Code 请求。开启后会增加系统提示词和客户端请求头，可能提高 Token 成本并改变输出风格。此类请求通常没有设备身份，需先关闭「设备身份校验」。官方客户端自己发出的两种不带基座提示词的请求原样放行：桌面端的缓存预热，以及 WebSearch 工具另发的那条搜索子调用（一条用户消息、只带 web_search 这一个服务端工具且强制调用、系统提示只有一句搜索助手说明）。此前后者会被重建成主线程请求，同一台机器在几秒内以另一个版本、另一台设备、另一条会话冒出来发一条搜索。',
+                'Only non-Claude Code requests are rewritten. Enabling this adds a system prompt and client request headers, which may increase Token costs and change the output style. These requests usually have no device identity, so disable “Device identity checks” first. Two requests the official client itself sends without the base prompt are passed through unchanged: the desktop app’s cache warm-up, and the separate search sub-call made by the WebSearch tool (one user message, a single forced web_search server tool, and a one-line search-assistant system prompt). Previously the latter was rebuilt into a main-thread request, so the same machine showed up seconds later as another version, another device and another session sending a search.',
               )}
             </>
           }

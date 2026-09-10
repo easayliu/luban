@@ -1183,7 +1183,13 @@ async fn handle_inner(
         // 给出、体也重建过，两处都取 `sim.session_id`。见 [`outbound_session_id`]。
         let session_out = match sim {
             Some(_) => None,
-            None => outbound_session_id(&headers, body_json.as_ref(), bare_session.as_deref()),
+            None => outbound_session_id(
+                &headers,
+                body_json.as_ref(),
+                bare_session.as_deref(),
+                &cred,
+                flags.spoof_identity,
+            ),
         };
         // 要不要补 `fallbacks`（拒答时上游换模型重跑），见 [`refusal_fallbacks_for`]。客户端
         // 自己带了数组形态的，luban 一个字不动、也就**不算 luban 补的**：`refusal_fallbacks`
@@ -6329,10 +6335,11 @@ enum SimulationReason {
     /// session 不是 uuid、带空白……），见 [`cc_identity_well_formed`]。
     IdentityMalformed,
     /// UA 与身份都对，但 `system` 里既没有 CC 身份句也没有 billing header，见 [`is_cc_shaped`]
-    /// （官方桌面端不带 system 的 `max_tokens=1` 预热例外，见 [`simulation_reason`]）。
+    /// （官方桌面端不带 system 的 `max_tokens=1` 预热、官方 WebSearch 子调用例外，见
+    /// [`simulation_reason`] 与 [`is_official_web_search_request`]）。
     NotCcShaped,
-    /// CC 形态，但既不是 `max_tokens=1` 预热、也不是官方 Helper、`system` 里也没有不少于
-    /// [`CC_BASE_PROMPT_MIN_LEN`] 字节的基座提示词，见 [`has_cc_base_prompt`]。
+    /// CC 形态，但既不是 `max_tokens=1` 预热、也不是官方 Helper 或 WebSearch 子调用、`system`
+    /// 里也没有不少于 [`CC_BASE_PROMPT_MIN_LEN`] 字节的基座提示词，见 [`has_cc_base_prompt`]。
     NoBasePrompt,
     /// 前面都对，`tools` 非空却一个官方工具名都没有，见 [`has_cc_tool_profile`]。
     ToolsNotCc,
@@ -6402,7 +6409,10 @@ impl Simulation {
         let profile = cc_profile_for(model);
         // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个按设备派生的 id
         // 上，就是「一台设备一个会话打了所有请求」——比每请求一个新 id 更假。来访没带才派生。
+        // 来访那个按账号钉住（[`account_session_id`]）：同一条会话换号后不该带着同一个 uuid
+        // 出现在另一个组织下；与透传路径同一道闸（`spoof_identity`）。
         let session_id = incoming_session_id(headers, Some(v))
+            .map(|sid| pin_session_id(cred, sid, flags.spoof_identity))
             .unwrap_or_else(|| session_id_for(cred, device_fp));
         let link = CcSessionLink::load(
             CcSessionKey { cred_id: cred.id, session_id: &session_id },
@@ -6504,6 +6514,13 @@ fn simulation_reason(
         return Some(SimulationReason::IdentityMalformed);
     }
     if is_quota_probe_shaped(v) {
+        return None;
+    }
+    // 官方 WebSearch 子调用（[`is_official_web_search_request`]）：没有基座、可能连 billing
+    // header 都没有，按下面两道判据会落到 `no_base_prompt` / `not_cc_shaped`。它是主线程会话
+    // 中途另发的一条，重建成主线程体等于让同一台机器在几秒内以另一个版本、另一台设备、另一
+    // 条会话冒出来发一条搜索。放行走透传：头、身份、会话与主线程同源。
+    if is_official_web_search_request(v) {
         return None;
     }
     let prewarm = request_max_tokens(Some(v)) == Some(1);
@@ -6617,6 +6634,60 @@ fn has_profile_betas(beta: &[String], kind: config::CcProfileKind) -> bool {
 /// [`has_cc_base_prompt`] 的阈值：1000 字节。官方最短的基座是 opus 那份 1214 字节，留两成
 /// 余量；仿冒者那两块加起来不到两百字节，中间空得很宽。
 const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
+
+/// 这条请求是不是**官方 WebSearch 子调用**。CC 的 WebSearch 工具不在主线程里直接调 server
+/// tool，而是另发一条请求：一条用户消息（要搜的问题）、`tools` 只有 `web_search_*` 这一个
+/// server tool、`tool_choice` 强制它、`system` 只有一句「You are an assistant for performing a
+/// web search tool use」（57 字节，前面可能还有一块 billing header）。它没有基座、没有身份句，
+/// 按 [`simulation_reason`] 的判据会落到 `no_base_prompt`（带 billing header）或
+/// `not_cc_shaped`（不带），被重建成带基座与四个官方工具的主线程体，出站 UA 换成模拟那版、
+/// device_id 与会话 id 也换成模拟派生的——一条 `claude-cli/2.1.220` 的主线程会话中途冒出一台
+/// 2.1.260 的新设备发了一条搜索（`ban/luban-ban-13`、`ban-14` 各 2、3 条，`ban-37` 3 条；出站
+/// system 是 `[billing, 身份, 基座, 57 字节]`，末块正是那句搜索助手提示）。放行后走透传路径：
+/// 头、身份、会话与主线程同源；没带 billing header 的由 [`ensure_cc_system_prefix`] 补前缀，
+/// server tool 在工具改名那步本来就按原名保留。
+///
+/// 逐项对，缺一不算：
+/// 1. `tools` 恰好一个，`type` 以 `web_search_` 开头且 `name` 是 `web_search`；
+/// 2. `tool_choice` 是 `{"type":"tool","name":"web_search"}`；
+/// 3. `messages` 恰好一条且是用户消息；
+/// 4. `system` 去掉 billing header 后恰好一块，不到 [`CC_BASE_PROMPT_MIN_LEN`] 字节、不含 CC
+///    身份句、且提到 web search（字符串形态的 `system` 一并认）。
+///
+/// 第三方要冒充得把这四项全抄对，而抄全了它就**是**一条 WebSearch 子调用——透传出去的形态
+/// 与官方无异，比重建成主线程体更接近真实。
+fn is_official_web_search_request(v: &serde_json::Value) -> bool {
+    let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else { return false };
+    let [tool] = tools.as_slice() else { return false };
+    let ty = tool.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+    if !ty.starts_with("web_search_") || name != "web_search" {
+        return false;
+    }
+    let Some(choice) = v.get("tool_choice") else { return false };
+    if choice.get("type").and_then(|t| t.as_str()) != Some("tool")
+        || choice.get("name").and_then(|n| n.as_str()) != Some("web_search")
+    {
+        return false;
+    }
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let [msg] = msgs.as_slice() else { return false };
+    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let texts: Vec<&str> = match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
+        }
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        _ => return false,
+    };
+    let mut prompts = texts.iter().filter(|t| !t.starts_with("x-anthropic-billing-header:"));
+    let (Some(prompt), None) = (prompts.next(), prompts.next()) else { return false };
+    prompt.len() < CC_BASE_PROMPT_MIN_LEN
+        && !prompt.contains(config::CC_SYSTEM_IDENTITY_PREFIX)
+        && prompt.to_ascii_lowercase().contains("web search")
+}
 
 /// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
 /// 有 `tools` 但里面至少有一个 [`config::CC_TOOL_NAMES`] 里的官方工具名也算是。
@@ -6765,8 +6836,10 @@ fn session_id_conflict(
 /// 取值顺序就是 luban 内部已经在用的那套，只是把结论**送到出站**：
 ///
 /// 1. `bare_session`（[`bare_session_id`]）——来访没有 `metadata.user_id`、由 luban 补一份
-///    的那条路。它自己已经是「来访头优先、否则按账号+设备派生」；
-/// 2. 否则 [`incoming_session_id`]——头体各自校验后选出来的那个合法值。
+///    的那条路。它自己已经是「来访头优先（按账号钉住）、否则按账号+设备派生」；
+/// 2. 否则 [`incoming_session_id`]——头体各自校验后选出来的那个合法值，`pin`
+///    （[`store::ForwardFlags::spoof_identity`]）开着时按账号钉住（[`account_session_id`]），
+///    关着时原值照发。
 ///
 /// 两者都取不到时返回 `None`：这时来访要么两处都没有会话 id，要么带的两处都不是 uuid，
 /// 没有任何依据凭空造一个（`bare_session` 那条路才有派生的前提，见它的六个条件）。
@@ -6774,10 +6847,12 @@ fn outbound_session_id(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
     bare_session: Option<&str>,
+    cred: &crate::credentials::Credential,
+    pin: bool,
 ) -> Option<String> {
     match bare_session {
         Some(sid) => Some(sid.to_string()),
-        None => incoming_session_id(headers, body),
+        None => incoming_session_id(headers, body).map(|sid| pin_session_id(cred, sid, pin)),
     }
 }
 
@@ -7185,8 +7260,13 @@ fn bare_session_id(
     {
         return None;
     }
-    // 走到这里必然没有 `metadata.user_id`（上面刚判过），体里也就没有会话 id 可取。
-    Some(incoming_session_id(headers, None).unwrap_or_else(|| session_id_for(cred, device_fp)))
+    // 走到这里必然没有 `metadata.user_id`（上面刚判过），体里也就没有会话 id 可取。来访头上
+    // 那个按账号钉住（[`account_session_id`]，本函数已要求 `spoof_identity` 开着），没带才派生。
+    Some(
+        incoming_session_id(headers, None)
+            .map(|sid| pin_session_id(cred, sid, true))
+            .unwrap_or_else(|| session_id_for(cred, device_fp)),
+    )
 }
 
 /// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 设备指纹)` 取前 16 字节，
@@ -7206,6 +7286,53 @@ fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> Str
     let mut b = [0u8; 16];
     b.copy_from_slice(&digest[..16]);
     uuid_from_bytes(b)
+}
+
+/// 来访自带会话 id 时，出站两处（`X-Claude-Code-Session-Id` 与 `metadata.user_id`）落的那个
+/// **按账号钉住**的会话 id：`sha256("luban-session-pin" ‖ account_uuid ‖ 来访会话 id)` 取前
+/// 16 字节按 uuid v4 格式化。同一条来访会话在同一个账号上恒定（多轮对话在上游仍是一条
+/// 会话、缓存照常接上），换到另一个账号即是另一个 uuid。
+///
+/// 为什么不能把来访那个原样透传：设备绑定的账号被停用 / 冷却时这台设备会被改绑到别的号，
+/// 而客户端那条会话还在继续。`ban/luban-ban-13`、`ban-14` 里两条会话就是这样在 30 秒内先后
+/// 出现在两个组织下——device_id 按账号派生（[`crate::credentials::Credential::spoof_device_id`]）
+/// 所以是两台设备，会话 uuid 却是同一个。官方客户端一条会话只属于一个账号、一台设备，「同一
+/// 个 session uuid 跨两个 org、配两个 device_id」是它永远不产生的形态。钉住之后上游在新号上
+/// 看到的是一条全新的会话配一台全新的设备，自洽。
+///
+/// 三处都走这一份（[`outbound_session_id`]、[`bare_session_id`]、[`Simulation::detect`]），
+/// 与 [`spoof_identity`] 同一道闸：这是在改客户端写的身份字段，身份伪装关着时来访原值照发。
+/// 前缀与 [`session_id_for`] 不同、输入也不同（那边是设备指纹，这边是来访会话 id），不会撞
+/// 出同值。没有 `account_uuid` 的凭证派生不出来（返回 `None`，调用方沿用来访原值）——那种
+/// 号的身份本来就补不出来（`spoof_device_id` 同样为 `None`）。
+fn account_session_id(
+    cred: &crate::credentials::Credential,
+    client_session: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let account = cred.account_uuid.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+    let mut h = Sha256::new();
+    h.update(b"luban-session-pin\0");
+    h.update(account.as_bytes());
+    h.update([0u8]);
+    h.update(client_session.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    Some(uuid_from_bytes(b))
+}
+
+/// [`account_session_id`] 的开关版：`pin` 为真（[`store::ForwardFlags::spoof_identity`]）时按账号
+/// 钉住，派生不出来或开关关着都沿用来访原值。
+fn pin_session_id(
+    cred: &crate::credentials::Credential,
+    client_session: String,
+    pin: bool,
+) -> String {
+    if !pin {
+        return client_session;
+    }
+    account_session_id(cred, &client_session).unwrap_or(client_session)
 }
 
 /// 一次请求最多 4 个缓存断点（`cache_control`），超了上游整条拒。
@@ -9789,10 +9916,12 @@ fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(String, Stri
 /// 把来访自带的 `metadata.user_id` 里那个 `session_id` 段对齐到出站头上的取值，
 /// **保持原格式**（内嵌 JSON 定点替换 / 扁平串重拼），已经同值时不动。
 ///
-/// [`spoof_identity`] 刻意保留 session 段——那是客户端自己的会话，luban 没有理由换掉它。
-/// 但「保留」与「出站两处同值」只在客户端自己就自洽时不冲突：头是 `sess-42`、体里是合法
-/// uuid，或两处给了两个不同的合法 uuid 时，[`incoming_session_id`] 已经替这条请求选定了
-/// 一个，出站两处就都得是它——否则发出去的是一份官方绝不产生的请求（那两处逐字相同）。
+/// [`spoof_identity`] 刻意不碰 session 段——那一步只管 account / device 两段，会话段由这里
+/// 统一对齐到 [`outbound_session_id`] 选定的那个：身份伪装开着时是按账号钉住的派生值
+/// （[`account_session_id`]，同一条来访会话换号后不再带着同一个 uuid 出现在另一个组织下），
+/// 关着时就是客户端自己那个合法值。头是 `sess-42`、体里是合法 uuid，或两处给了两个不同的合法
+/// uuid 时，[`incoming_session_id`] 已经替这条请求选定了一个，出站两处就都得是它——否则发出
+/// 去的是一份官方绝不产生的请求（那两处逐字相同）。
 ///
 /// 那份 user_id **没有会话段**时补上：内嵌 JSON 在收尾 `}` 前追加 `"session_id"`（官方键序
 /// device → account → session，追加在末尾正好对齐），扁平串追加 `_session_<sid>` 段。
@@ -18347,8 +18476,18 @@ mod tests {
             h.insert("x-claude-code-session-id", HeaderValue::from_static(sid));
             h
         };
+        // 沿用的是**按账号钉住**的派生值（[`super::account_session_id`]）：来访会话之间仍然
+        // 一一对应，只是换了账号就是另一个 uuid；身份伪装关着时才是来访原值。
+        let pin = |sid: &str| super::account_session_id(&test_cred(), sid).unwrap();
         let sim = detect_with(&body, &with_header(SID1), all_on()).expect("该请求应走模拟路径");
-        assert_eq!(sim.session_id, SID1, "来访自己带了就用它");
+        assert_eq!(sim.session_id, pin(SID1), "来访自己带了就用它（按账号钉住）");
+        assert_ne!(sim.session_id, SID1);
+        let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
+        assert_eq!(
+            detect_with(&body, &with_header(SID1), no_spoof).unwrap().session_id,
+            SID1,
+            "身份伪装关着时原值照用"
+        );
 
         let sim2 = detect_with(&body, &with_header(SID2), all_on()).unwrap();
         assert_ne!(sim.session_id, sim2.session_id, "两个客户端会话不该被折叠成一个");
@@ -18364,7 +18503,7 @@ mod tests {
             r#"{{"model":"claude-opus-5","messages":[],"metadata":{{"user_id":"{{\"device_id\":\"d\",\"session_id\":\"{SID2}\"}}"}}}}"#
         ));
         let from_body = detect_for(&in_body, all_on()).expect("该请求应走模拟路径");
-        assert_eq!(from_body.session_id, SID2, "体里那个也要认");
+        assert_eq!(from_body.session_id, pin(SID2), "体里那个也要认");
 
         // **形态不对就不认**：官方那个恒为 uuid。`sess-42` 这种短串本身就是判据，而带控制
         // 字符的值会让 `HeaderValue::from_str` 失败——于是头上没有、体里却有，拼出「两处
@@ -19129,34 +19268,36 @@ mod tests {
         };
 
         // 走一遍转发路径上那三步：选 bare_session → 选出站会话 id → 落到头与体。
-        let outbound = |h: Option<&str>,
-                        user_id: Option<&str>|
+        let outbound_with = |flags: store::ForwardFlags,
+                             h: Option<&str>,
+                             user_id: Option<&str>|
          -> (Option<String>, Option<String>) {
             let headers = headers_with(h);
             let body = body_with(user_id);
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let bare = super::bare_session_id(
                 &headers,
-                all_on(),
+                flags,
                 None,
                 true,
                 super::body_has_user_id(Some(&parsed)),
                 &cred,
                 device_fp,
             );
-            let session_out = super::outbound_session_id(&headers, Some(&parsed), bare.as_deref());
-            let out_headers = super::build_forward_headers(
+            let session_out = super::outbound_session_id(
                 &headers,
-                "tok",
-                all_on(),
-                None,
-                session_out.as_deref(),
+                Some(&parsed),
+                bare.as_deref(),
+                &cred,
+                flags.spoof_identity,
             );
+            let out_headers =
+                super::build_forward_headers(&headers, "tok", flags, None, session_out.as_deref());
             let out_body = rewrite_body_with_session(
                 &body,
                 &cred,
                 device_fp,
-                all_on(),
+                flags,
                 None,
                 bare.as_deref(),
                 session_out.as_deref(),
@@ -19170,53 +19311,66 @@ mod tests {
                 super::extract_session_id(Some(&out_json)),
             )
         };
+        let outbound = |h: Option<&str>, user_id: Option<&str>| outbound_with(all_on(), h, user_id);
         let json_id =
             |sid: &str| format!(r#"{{"device_id":"d","account_uuid":"a","session_id":"{sid}"}}"#);
         let flat_id = |sid: &str| format!("user_deadbeef_account_acct-1_session_{sid}");
+        // 身份伪装开着时出站落的是**按账号钉住**的派生值（[`super::account_session_id`]），
+        // 不是来访原值：同一条会话换号后不该带着同一个 uuid 出现在另一个组织下。
+        let pin = |sid: &str| super::account_session_id(&cred, sid).unwrap();
+        let good = pin(GOOD);
+        let other = pin(OTHER);
+        assert_ne!(good, GOOD, "钉住的值与来访原值不同");
+        assert_ne!(good, other, "两条来访会话钉出来的是两个值");
+        assert!(super::looks_like_uuid(&good), "钉住的值是 uuid: {good}");
 
         // 1) 头是 `sess-42`、体里是合法 uuid：选体里那个，**头也得换成它**。
         //    此前非法的头原样发了出去，出站两处对不上。
         let (h, b) = outbound(Some("sess-42"), Some(&json_id(GOOD)));
-        assert_eq!(h.as_deref(), Some(GOOD), "非法的头要被选中的那个顶掉");
-        assert_eq!(b.as_deref(), Some(GOOD));
+        assert_eq!(h.as_deref(), Some(good.as_str()), "非法的头要被选中的那个顶掉");
+        assert_eq!(b.as_deref(), Some(good.as_str()));
         assert_eq!(h, b, "出站两处必须同值");
 
         // 2) 头缺失、体里是合法 uuid：**头要补上**。此前 `bare_session` 只在「体里没有
         //    metadata」时才有值，这条路上头一直是缺的。
         let (h, b) = outbound(None, Some(&json_id(GOOD)));
-        assert_eq!(h.as_deref(), Some(GOOD), "头缺失时按体里那个补上");
+        assert_eq!(h.as_deref(), Some(good.as_str()), "头缺失时按体里那个补上");
         assert_eq!(h, b);
 
         // 3) 扁平格式同样成立（Windows 那类客户端）。
         let (h, b) = outbound(None, Some(&flat_id(GOOD)));
-        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h.as_deref(), Some(good.as_str()));
         assert_eq!(h, b);
         let (h, b) = outbound(Some("sess-42"), Some(&flat_id(GOOD)));
-        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h.as_deref(), Some(good.as_str()));
         assert_eq!(h, b);
 
         // 4) 两处都合法却不同（默认会被 `reject_session_conflict` 本地拒；关掉后走到这里）：
         //    [`super::incoming_session_id`] 取头那个，体里那份就得跟着改成它——否则发出去的
         //    仍是一份官方不产生的请求。
         let (h, b) = outbound(Some(OTHER), Some(&json_id(GOOD)));
-        assert_eq!(h.as_deref(), Some(OTHER), "两处都合法时取头");
-        assert_eq!(b.as_deref(), Some(OTHER), "体里那份要同步过去");
+        assert_eq!(h.as_deref(), Some(other.as_str()), "两处都合法时取头");
+        assert_eq!(b.as_deref(), Some(other.as_str()), "体里那份要同步过去");
         let (h, b) = outbound(Some(OTHER), Some(&flat_id(GOOD)));
-        assert_eq!((h.as_deref(), b.as_deref()), (Some(OTHER), Some(OTHER)), "扁平串同理");
+        assert_eq!(
+            (h.as_deref(), b.as_deref()),
+            (Some(other.as_str()), Some(other.as_str())),
+            "扁平串同理"
+        );
 
         // 4b) 头合法、体里有 user_id 但**没有会话段**：`bare_session` 不接（有 user_id），
         //     [`super::ensure_cc_metadata`] 也不接（同理），此前这条路上体里一直缺着——
         //     头有会话、体没会话，官方绝不产生。现在按各自格式补一段。
         let (h, b) = outbound(Some(GOOD), Some(r#"{"device_id":"d","account_uuid":"a"}"#));
-        assert_eq!(h.as_deref(), Some(GOOD));
-        assert_eq!(b.as_deref(), Some(GOOD), "内嵌 JSON 缺会话段要补上");
+        assert_eq!(h.as_deref(), Some(good.as_str()));
+        assert_eq!(b.as_deref(), Some(good.as_str()), "内嵌 JSON 缺会话段要补上");
         let (h, b) = outbound(Some(GOOD), Some("user_deadbeef_account_acct-1"));
-        assert_eq!(h.as_deref(), Some(GOOD));
-        assert_eq!(b.as_deref(), Some(GOOD), "扁平串缺会话段要补上");
+        assert_eq!(h.as_deref(), Some(good.as_str()));
+        assert_eq!(b.as_deref(), Some(good.as_str()), "扁平串缺会话段要补上");
 
-        // 5) 头合法、体里没有 metadata：走补身份那条路，两处都是头里那个（回归）。
+        // 5) 头合法、体里没有 metadata：走补身份那条路，两处都是头里那个钉住后的值（回归）。
         let (h, b) = outbound(Some(GOOD), None);
-        assert_eq!(h.as_deref(), Some(GOOD));
+        assert_eq!(h.as_deref(), Some(good.as_str()));
         assert_eq!(h, b);
 
         // 6) 头非法、体里也没有 metadata：`bare_session` 派生一个，头上那个非法值同样要被
@@ -19225,13 +19379,55 @@ mod tests {
         assert!(h.as_deref().is_some_and(super::looks_like_uuid), "派生值是 uuid: {h:?}");
         assert_eq!(h, b);
 
-        // 7) 正常形态（两处同值）不该被动一个字节：值相同时头不重写、体不改写。
+        // 7) 正常形态（两处同值）：钉住后两处仍同值；**身份伪装关着**时一个字节都不动——
+        //    头不重写、体不改写，来访原值照发。
         let same = json_id(GOOD);
-        let before = body_with(Some(&same));
         let (h, b) = outbound(Some(GOOD), Some(&same));
-        assert_eq!((h.as_deref(), b.as_deref()), (Some(GOOD), Some(GOOD)));
+        assert_eq!((h.as_deref(), b.as_deref()), (Some(good.as_str()), Some(good.as_str())));
+        let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
+        let before = body_with(Some(&same));
+        let (h, b) = outbound_with(no_spoof, Some(GOOD), Some(&same));
+        assert_eq!((h.as_deref(), b.as_deref()), (Some(GOOD), Some(GOOD)), "关着时原值照发");
         let after: serde_json::Value = serde_json::from_slice(&before).unwrap();
         assert_eq!(super::extract_session_id(Some(&after)).as_deref(), Some(GOOD));
+        // 关着时头体不一致的来访照样被归一到选中的那个原值（归一不受这道闸影响）。
+        let (h, b) = outbound_with(no_spoof, Some(OTHER), Some(&json_id(GOOD)));
+        assert_eq!(
+            (h.as_deref(), b.as_deref()),
+            (Some(OTHER), Some(GOOD)),
+            "关着时体里的身份字段不动、头归一到选中的那个"
+        );
+    }
+
+    /// [`super::account_session_id`]：同一条来访会话在同一个账号上恒定、换账号即不同；没有
+    /// `account_uuid` 的凭证派生不出来；与设备派生那份（[`super::session_id_for`]）不撞。
+    /// 这是 `ban/luban-ban-13/14` 里「同一个 session uuid 30 秒内出现在两个组织下」的修法。
+    #[test]
+    fn the_outbound_session_id_is_pinned_per_account() {
+        const SID: &str = "8d80a214-b800-4073-a976-c98058fa0eef";
+        const SID2: &str = "47904256-0f00-4445-a5da-e660c674ffe1";
+        let a = test_cred();
+        let mut b = test_cred();
+        b.id = 2;
+        b.account_uuid = Some("f54bd3ef-9040-4d35-a50f-3caa75ce4b97".into());
+        let on_a = super::account_session_id(&a, SID).unwrap();
+        let on_b = super::account_session_id(&b, SID).unwrap();
+        assert!(super::looks_like_uuid(&on_a), "{on_a}");
+        assert_ne!(on_a, SID, "不是来访原值");
+        assert_ne!(on_a, on_b, "换账号即是另一条会话");
+        assert_eq!(on_a, super::account_session_id(&a, SID).unwrap(), "同账号同会话恒定");
+        assert_ne!(on_a, super::account_session_id(&a, SID2).unwrap(), "同账号两条会话不折叠");
+        assert_ne!(on_a, super::session_id_for(&a, SID), "与设备派生那份前缀不同，同输入也不撞");
+        // 没有 account_uuid：派生不出来，调用方沿用原值。
+        let mut bare = test_cred();
+        bare.account_uuid = None;
+        assert_eq!(super::account_session_id(&bare, SID), None);
+        assert_eq!(super::pin_session_id(&bare, SID.into(), true), SID);
+        bare.account_uuid = Some("  ".into());
+        assert_eq!(super::account_session_id(&bare, SID), None);
+        // 开关关着：原值。
+        assert_eq!(super::pin_session_id(&a, SID.into(), false), SID);
+        assert_eq!(super::pin_session_id(&a, SID.into(), true), on_a);
     }
 
     /// [`super::sync_metadata_session`] 把体里的会话段对齐到出站那个，**保持原格式**：
@@ -20488,6 +20684,142 @@ mod tests {
         assert_eq!(reason(&desktop_prewarm, &no_ua), Some(NotCcClient), "UA 不可信照样模拟");
         let prewarm_bad_id = desktop_prewarm.replace(good_dev, "nope");
         assert_eq!(reason(&prewarm_bad_id, &cc_ua), Some(IdentityMalformed));
+        // 官方 WebSearch 子调用：一条用户消息、只有 web_search 这个 server tool 且被 tool_choice
+        // 强制、system 只有一句搜索助手提示（可带 billing header）。没有基座也放行，否则会被
+        // 重建成主线程体、换 UA 换设备换会话（`ban/luban-ban-13/14`）。
+        const WS_TOOL: &str = r#"{"type":"web_search_20250305","name":"web_search","max_uses":8}"#;
+        const WS_CHOICE: &str = r#""tool_choice":{"type":"tool","name":"web_search"},"#;
+        const WS_PROMPT: &str = "You are an assistant for performing a web search tool use";
+        let ws_block = |text: &str| {
+            format!(r#"{{"type":"text","text":"{text}","cache_control":{{"type":"ephemeral"}}}}"#)
+        };
+        let web_search = |system: &str, tools: &str, choice: &str, messages: &str| {
+            format!(
+                r#"{{"model":"claude-opus-5","max_tokens":64000,"system":{system},"tools":[{tools}],{choice}"messages":{messages},{}}}"#,
+                identity(good_dev)
+            )
+        };
+        let one_msg = r#"[{"role":"user","content":"Perform a web search for the query: rust 1.90 release notes"}]"#;
+        let ws_sys = format!("[{}]", ws_block(WS_PROMPT));
+        let ws = web_search(&ws_sys, WS_TOOL, WS_CHOICE, one_msg);
+        assert_eq!(reason(&ws, &cc_ua), None, "不带 billing header 的 WebSearch 子调用放行");
+        let ws_billing_sys = format!(
+            r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=1e2f3;"}},{}]"#,
+            ws_block(WS_PROMPT)
+        );
+        assert_eq!(
+            reason(&web_search(&ws_billing_sys, WS_TOOL, WS_CHOICE, one_msg), &cc_ua),
+            None,
+            "带 billing header 的同样放行"
+        );
+        let ws_string_sys = format!(r#""{WS_PROMPT}""#);
+        assert_eq!(
+            reason(&web_search(&ws_string_sys, WS_TOOL, WS_CHOICE, one_msg), &cc_ua),
+            None,
+            "字符串形态的 system 一并认"
+        );
+        // 差一项都不算，仍按原判据走模拟：
+        assert_eq!(
+            reason(&web_search(&ws_sys, WS_TOOL, "", one_msg), &cc_ua),
+            Some(NotCcShaped),
+            "没有 tool_choice 强制"
+        );
+        assert_eq!(
+            reason(
+                &web_search(&ws_sys, WS_TOOL, r#""tool_choice":{"type":"auto"},"#, one_msg),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "tool_choice 不是强制 web_search"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &ws_sys,
+                    &format!(r#"{WS_TOOL},{{"name":"Bash","input_schema":{{"type":"object"}}}}"#),
+                    WS_CHOICE,
+                    one_msg
+                ),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "多了别的工具"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &ws_sys,
+                    r#"{"name":"web_search","input_schema":{"type":"object"}}"#,
+                    WS_CHOICE,
+                    one_msg
+                ),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "同名却不是 server tool"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &ws_sys,
+                    WS_TOOL,
+                    WS_CHOICE,
+                    r#"[{"role":"user","content":"search a"},{"role":"assistant","content":"ok"},{"role":"user","content":"search b"}]"#
+                ),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "不止一条消息"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &format!("[{}]", ws_block(&"w".repeat(1500))),
+                    WS_TOOL,
+                    WS_CHOICE,
+                    one_msg
+                ),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "system 是长块"
+        );
+        assert_eq!(
+            reason(
+                &web_search(&format!("[{}]", ws_block("be brief")), WS_TOOL, WS_CHOICE, one_msg),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "system 与搜索无关"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &format!("[{},{}]", ws_block(WS_PROMPT), ws_block("and more")),
+                    WS_TOOL,
+                    WS_CHOICE,
+                    one_msg
+                ),
+                &cc_ua
+            ),
+            Some(NotCcShaped),
+            "去掉 billing header 后不止一块"
+        );
+        assert_eq!(
+            reason(
+                &web_search(
+                    &format!("[{}]", ws_block(config::CC_SYSTEM_IDENTITY)),
+                    WS_TOOL,
+                    WS_CHOICE,
+                    one_msg
+                ),
+                &cc_ua
+            ),
+            Some(NoBasePrompt),
+            "写了身份句就是主线程形态，按基座判"
+        );
+        assert_eq!(reason(&ws, &no_ua), Some(NotCcClient), "UA 不可信照样模拟");
+        assert_eq!(reason(&ws.replace(good_dev, "nope"), &cc_ua), Some(IdentityMalformed));
         // 开关关着：什么原因都没有。
         let v: serde_json::Value = serde_json::from_str(&plain).unwrap();
         let sim_off = store::ForwardFlags { simulate_cc: false, ..all_on() };
@@ -20637,26 +20969,33 @@ mod tests {
             "头与 metadata 里的 session_id 必须逐字节相同"
         );
 
-        // 来访自己带了那个头 → 用它的值，不另派生（否则头体对不上）。
+        // 来访自己带了那个头 → 沿用它（按账号钉住，[`super::account_session_id`]），不按设备
+        // 另派生；头体落的是同一个值。
+        const CLIENT_SID: &str = "bc201916-d0bc-4b4e-adba-caf41fb58746";
         let mut with_sid = super::HeaderMap::new();
         with_sid.insert(
             super::HeaderName::from_static("x-claude-code-session-id"),
-            HeaderValue::from_static("bc201916-d0bc-4b4e-adba-caf41fb58746"),
+            HeaderValue::from_static(CLIENT_SID),
         );
         let sid2 =
             super::bare_session_id(&with_sid, all_on(), None, true, false, &test_cred(), "fp")
                 .unwrap();
-        assert_eq!(sid2, "bc201916-d0bc-4b4e-adba-caf41fb58746", "应沿用来访自己的会话 id");
+        assert_eq!(
+            sid2,
+            super::account_session_id(&test_cred(), CLIENT_SID).unwrap(),
+            "应沿用来访自己的会话 id（按账号钉住）"
+        );
+        assert_ne!(sid2, sid, "来访带了会话 id 就不按设备派生");
         let out2 = rewrite_body(&body, &test_cred(), "fp", all_on(), None, Some(sid2.as_str()));
         let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
         let inner2: serde_json::Value =
             serde_json::from_str(v2["metadata"]["user_id"].as_str().unwrap()).unwrap();
-        assert_eq!(inner2["session_id"], sid2, "体里要用来访那个值");
+        assert_eq!(inner2["session_id"], sid2, "体里要用同一个值");
         let headers2 = build_forward_headers(&with_sid, "tok", all_on(), None, Some(&sid2));
         assert_eq!(
             headers2.get("x-claude-code-session-id").unwrap().to_str().unwrap(),
             sid2,
-            "客户端原值不该被覆盖"
+            "头上那个来访原值要被钉住后的值顶掉，与体同值"
         );
     }
 
