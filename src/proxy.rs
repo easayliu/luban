@@ -1239,7 +1239,10 @@ async fn handle_inner(
             sim.as_ref(),
             session_out.as_deref(),
             req_model.as_deref(),
-            refusal_fallbacks.is_some() || (billable && client_fallbacks),
+            BodyBetaFacts {
+                fallbacks: refusal_fallbacks.is_some() || (billable && client_fallbacks),
+                redacted_thinking: billable && body_carries_redacted_thinking(&body),
+            },
         );
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
@@ -2019,6 +2022,19 @@ async fn handle_inner(
                     let (_, message) = parse_upstream_error(&err_bytes);
                     let trace = error_block_path(&message)
                         .and_then(|(mi, bi)| trace_thinking_block(&body, &sent, mi, bi));
+                    // 头那侧的判据，与体那侧同等重要：这种块的准入条件就是那项 beta，
+                    // 出站头上没有它、体里却带着块，上游必拒——而体的对照三项会全部「相同」，
+                    // 单看它们会把结论错判成「客户端发来就是坏的」。见
+                    // [`body_carries_redacted_thinking`]。
+                    let beta_declared = upstream
+                        .headers
+                        .get("anthropic-beta")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|b| {
+                            b.split(',').any(|p| {
+                                beta_name(p.trim()) == beta_name(config::CC_BETA_REDACT_THINKING)
+                            })
+                        });
                     match trace {
                         Some(t) => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
@@ -2029,13 +2045,15 @@ async fn handle_inner(
                             turn_identical = ?t.turn_identical,
                             inbound_turn = %t.inbound_turn,
                             outbound_turn = %t.outbound_turn,
-                            "upstream rejected a redacted_thinking block's data; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken"
+                            beta_declared,
+                            "upstream rejected a redacted_thinking block's data; beta_declared=false means the outbound header dropped redact-thinking while the body still carries such blocks, inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken"
                         ),
                         // 坐标解析不出来，或那个坐标上压根没有思考块：两者都说明这条错误的
                         // 形态与判据的假设对不上，原文打出来供修判据。
                         None => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             upstream_message = %message,
+                            beta_declared,
                             "upstream rejected a redacted_thinking block's data, but the block it names could not be located in the outbound body"
                         ),
                     }
@@ -5563,6 +5581,7 @@ fn merge_beta(
     incoming: Option<&str>,
     model: Option<&str>,
     version: Option<(u64, u64, u64)>,
+    carries_redacted_thinking: bool,
 ) -> String {
     let mut parts: Vec<String> = incoming
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
@@ -5649,8 +5668,24 @@ fn merge_beta(
             }
             // `thinking-display-updates` 与 `redact-thinking` 在 2.1.260 的六份抓包上恒为
             // 互斥，2.1.258 时也只有 fable 一族如此。补了前者就得剥后者。
-            if !seed_has(config::CC_BETA_REDACT_THINKING) {
-                parts.retain(|p| p != config::CC_BETA_REDACT_THINKING);
+            if !seed_has(config::CC_BETA_REDACT_THINKING)
+                && parts.iter().any(|p| p == config::CC_BETA_REDACT_THINKING)
+            {
+                if carries_redacted_thinking {
+                    // 例外见 [`body_carries_redacted_thinking`]：历史里已经有上游签发的
+                    // `redacted_thinking` 块，剥掉这项声明就是一条确定的 400。
+                    tracing::warn!(
+                        beta = config::CC_BETA_REDACT_THINKING,
+                        "keeping a client beta that contradicts the official set for this profile: the body carries redacted_thinking blocks"
+                    );
+                } else {
+                    // 这条动作此前是哑的，而它与模拟路径那条是同一件事，日志也该对称。
+                    tracing::warn!(
+                        beta = config::CC_BETA_REDACT_THINKING,
+                        "dropping a client beta that contradicts the official set for this profile"
+                    );
+                    parts.retain(|p| p != config::CC_BETA_REDACT_THINKING);
+                }
             }
         }
         if !has(&parts, config::CC_BETA_CACHE_DIAGNOSIS) {
@@ -5751,6 +5786,20 @@ fn is_official_non_main_beta(parts: &[String]) -> bool {
         || sdk_subagent
 }
 
+/// 出站**体**里那两件决定 `anthropic-beta` 怎么拼的事实，由调用方算好递进来——头那边不碰体。
+///
+/// 两项都是「体里有、头上就得有／就不能没有」的配对关系：声明与内容自相矛盾的请求，上游一律
+/// 400，而那两种矛盾都是 luban 自己拼出来的。
+#[derive(Clone, Copy, Default)]
+struct BodyBetaFacts {
+    /// 出站体会带 `fallbacks`（[`refusal_fallbacks_for`]）：头上必须有 `server-side-fallback`
+    /// beta，否则是「体里写了字段、头上没声明」，见 [`ensure_fallback_beta`]。
+    fallbacks: bool,
+    /// 出站体里有 `redacted_thinking` 块：`redact-thinking` 这项 beta 就不能剥，
+    /// 见 [`body_carries_redacted_thinking`]。
+    redacted_thinking: bool,
+}
+
 /// 组装发往上游的请求头：原样转发可转发头，再对需要 luban 决定取值的头**原位覆盖**。
 ///
 /// **头序**：`HeaderMap` 按插入序迭代，hyper 也按这个顺序写到线上，所以来访客户端的头序
@@ -5780,7 +5829,15 @@ fn build_forward_headers(
     sim: Option<&Simulation>,
     session_id: Option<&str>,
 ) -> HeaderMap {
-    build_forward_headers_for(headers, token, flags, sim, session_id, None, false)
+    build_forward_headers_for(
+        headers,
+        token,
+        flags,
+        sim,
+        session_id,
+        None,
+        BodyBetaFacts::default(),
+    )
 }
 
 /// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta`] 做族相关的两条
@@ -5793,9 +5850,7 @@ fn build_forward_headers_for(
     sim: Option<&Simulation>,
     session_id: Option<&str>,
     model: Option<&str>,
-    // 出站体会带 `fallbacks`（[`refusal_fallbacks_for`]）：头上必须有 `server-side-fallback`
-    // beta，否则是「体里写了字段、头上没声明」的自相矛盾，见 [`ensure_fallback_beta`]。
-    fallback_beta: bool,
+    body_facts: BodyBetaFacts,
 ) -> HeaderMap {
     let mut out = match sim {
         // 模拟模式：来访那套头一个不留，整体换成官方的（见 [`official_headers`]）。
@@ -5842,15 +5897,20 @@ fn build_forward_headers_for(
     // - CC 形态来访：仍走 [`merge_beta`]，按经验规则把订阅端多出来的几项补回官方位置。
     let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
     let beta = match sim {
-        Some(sim) => Some(simulated_beta(sim.profile.beta, incoming)),
+        Some(sim) => Some(simulated_beta(sim.profile.beta, incoming, body_facts.redacted_thinking)),
         None if flags.merge_beta => {
             // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta`]。
             let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-            Some(merge_beta(incoming, model, version.and_then(trusted_cc_version)))
+            Some(merge_beta(
+                incoming,
+                model,
+                version.and_then(trusted_cc_version),
+                body_facts.redacted_thinking,
+            ))
         }
         None => None,
     };
-    let beta = if fallback_beta {
+    let beta = if body_facts.fallbacks {
         Some(ensure_fallback_beta(
             beta.or_else(|| incoming.map(str::to_string)).unwrap_or_default(),
         ))
@@ -5949,7 +6009,7 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
 /// `oauth` 的落位：官方串以 `claude-code-20250219` 开头时紧随其后（opus / fable / sonnet），
 /// 否则排在最前（haiku 三个 profile 的 `claude-code` 在串中间，`oauth` 在队首）。这两种
 /// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta`] 用的同一条规则。
-fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
+fn simulated_beta(seed: &str, incoming: Option<&str>, carries_redacted_thinking: bool) -> String {
     let mut parts: Vec<&str> = seed.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let at = usize::from(parts.first() == Some(&config::CC_BETA_CLAUDE_CODE));
     parts.insert(at, config::OAUTH_BETA_HEADER);
@@ -5965,11 +6025,23 @@ fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
         // 语义本就冲突）。官方串已经选了一边，客户端带来的另一边只能丢——留着就是一条
         // 官方不产生的组合，而 body 侧那个 `thinking.display` 也只跟着官方串走。
         if beta_conflicts_with_seed(&parts, p) {
-            tracing::warn!(
-                beta = p,
-                "dropping a client beta that contradicts the official set for this profile"
-            );
-            continue;
+            // 例外见 [`body_carries_redacted_thinking`]：只放 `redact-thinking` 这一项，
+            // 且只在体里真有那种块时放——反方向（官方串带 `redact-thinking`、客户端带
+            // `thinking-display-updates`）没有这个问题，`display` 只是个显示偏好。
+            if carries_redacted_thinking
+                && beta_name(p) == beta_name(config::CC_BETA_REDACT_THINKING)
+            {
+                tracing::warn!(
+                    beta = p,
+                    "keeping a client beta that contradicts the official set for this profile: the body carries redacted_thinking blocks"
+                );
+            } else {
+                tracing::warn!(
+                    beta = p,
+                    "dropping a client beta that contradicts the official set for this profile"
+                );
+                continue;
+            }
         }
         // **认不出来的照发，交给上游判**。这里曾按一张白名单把不认识的项丢掉，理由是
         // 「追加一个上游不认的 beta 是一发稳定 400」。那个理由站不住：
@@ -9731,6 +9803,24 @@ fn body_contains(body: &[u8], needle: &[u8]) -> bool {
     body.windows(needle.len()).any(|w| w == needle)
 }
 
+/// 体里带不带 `redacted_thinking` 块。
+///
+/// 用处只有一个：这种块里那段 `data` 是上游自己签发的密文，而它的准入条件是
+/// [`config::CC_BETA_REDACT_THINKING`] 那项 beta。头上没有它、体里却带着这种块，上游回
+/// `messages.N.content.M: Invalid \`data\` in \`redacted_thinking\` block`——一条确定的 400，
+/// 而且历史里那块不会消失，这条会话此后每发必拒。
+///
+/// 所以 [`merge_beta`] 与 [`simulated_beta`] 那条「互斥项二选一」的规则在这种体上要让路：
+/// 互斥本身是从六份 2.1.260 抓包**外推**出来的（`MainSonnet` 那行至今缺抓包，见
+/// [`config::cc_2_1_260_missing_samples`]），代价是一处形态偏差；而剥掉一个客户端明确声明、
+/// 历史里正用着的能力，代价是必然的失败。两害相权取形态偏差。
+///
+/// 字节扫、不解析：它落在每条计费请求的热路上，而 `"redacted_thinking"` 这个串只会出现在
+/// 块的 `type` 上（正文里出现也只是多留一项 beta，不改变任何其他行为）。
+fn body_carries_redacted_thinking(body: &[u8]) -> bool {
+    body_contains(body, b"\"redacted_thinking\"")
+}
+
 /// 体里有没有 `"键": "值"` 这一对，**键与冒号、冒号与值之间允许任意 JSON 空白**
 /// （空格、制表、换行、回车）。`key` / `value` 都要自带引号，如
 /// `body_has_pair(body, b"\"role\"", b"\"system\"")`。
@@ -13137,7 +13227,8 @@ pub async fn probe(
         Some(&sim),
         None,
         Some(model),
-        false,
+        // 探测体是 luban 自己造的：既不带 `fallbacks`，也没有任何历史块。
+        BodyBetaFacts::default(),
     );
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
     // Upstream 之前取，取值规则与转发路径同一套。
@@ -13705,7 +13796,8 @@ async fn send_quota_probe(
         Some(&sim),
         None,
         Some(model),
-        false,
+        // 探测体是 luban 自己造的：既不带 `fallbacks`，也没有任何历史块。
+        BodyBetaFacts::default(),
     );
     // **UA 跟着这个会话的版本走**，不是 luban 自己那个。
     //
@@ -14274,16 +14366,20 @@ mod tests {
         let v258 = Some((2u64, 1, 258));
         for (model, api_key_client, official) in CASES {
             assert_eq!(
-                &merge_beta(Some(api_key_client), Some(model), v258),
+                &merge_beta(Some(api_key_client), Some(model), v258, false),
                 official,
                 "{model} 的 beta 串没对齐"
             );
             // 订阅端客户端经 luban：本来就是官方串，一个字都不该动（幂等）。
-            assert_eq!(&merge_beta(Some(official), Some(model), v258), official, "{model} 不幂等");
+            assert_eq!(
+                &merge_beta(Some(official), Some(model), v258, false),
+                official,
+                "{model} 不幂等"
+            );
         }
         // 不知道模型时，族相关的两条不做：fable 的 API-key 串只补通用几项。
         let fable_api = CASES[3].1;
-        let no_model = merge_beta(Some(fable_api), None, v258);
+        let no_model = merge_beta(Some(fable_api), None, v258, false);
         assert!(no_model.contains("redact-thinking-2026-02-12"), "不知道族就不删: {no_model}");
         assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
     }
@@ -14367,7 +14463,7 @@ mod tests {
         let sdk_beta = "claude-code-20250219,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,effort-2025-11-24";
-        let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"), Some((2, 1, 258)));
+        let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"), Some((2, 1, 258)), false);
         assert!(!merged.contains("thinking-display-updates"), "老世代的串不补: {merged}");
     }
 
@@ -14377,7 +14473,7 @@ mod tests {
         for (model, client, official) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
             assert_eq!(
-                &merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220))),
+                &merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)), false),
                 official,
                 "{model} 的 beta 串没对齐"
             );
@@ -14389,7 +14485,7 @@ mod tests {
     fn merged_beta_preserves_client_order() {
         for (model, client, _) in BETA_PAIRS {
             let v = HeaderValue::from_str(client).unwrap();
-            let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)));
+            let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)), false);
             let kept: Vec<&str> =
                 out.split(',').filter(|b| client.split(',').any(|c| c.trim() == *b)).collect();
             let sent: Vec<&str> = client.split(',').map(str::trim).collect();
@@ -14402,7 +14498,7 @@ mod tests {
     fn merged_beta_keeps_unknown_betas_in_place() {
         let (_, client, official) = BETA_PAIRS[1];
         let v = HeaderValue::from_str(&format!("{client},some-future-beta-2027-01-01")).unwrap();
-        let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)));
+        let out = merge_beta(Some(v.to_str().unwrap()), None, Some((2, 1, 220)), false);
         // 客户端把它放在自有串末尾，官方串里它就该在 effort 之后、extended-cache-ttl 之前。
         assert_eq!(
             out,
@@ -14417,7 +14513,7 @@ mod tests {
     #[test]
     fn merged_beta_from_empty_is_deterministic() {
         assert_eq!(
-            merge_beta(None, None, None),
+            merge_beta(None, None, None, false),
             "oauth-2025-04-20,advanced-tool-use-2025-11-20,prompt-caching-scope-2026-01-05,\
              extended-cache-ttl-2025-04-11"
         );
@@ -18822,7 +18918,7 @@ mod tests {
             Some(&sim),
             None,
             Some("claude-opus-5"),
-            true,
+            super::BodyBetaFacts { fallbacks: true, ..Default::default() },
         );
         let beta = with.get("anthropic-beta").unwrap().to_str().unwrap().to_string();
         assert_eq!(beta.matches("server-side-fallback-").count(), 1, "{beta}");
@@ -18836,7 +18932,7 @@ mod tests {
             Some(&sim),
             None,
             Some("claude-opus-5"),
-            false,
+            super::BodyBetaFacts::default(),
         );
         assert!(
             !without
@@ -18993,13 +19089,14 @@ mod tests {
             ("claude-haiku-4-5-20251001", DERIVED_HAIKU),
         ] {
             let profile = super::cc_profile_for(model);
-            assert_eq!(super::simulated_beta(profile.beta, None), official, "{model}");
+            assert_eq!(super::simulated_beta(profile.beta, None, false), official, "{model}");
         }
 
         // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
         let with_client = super::simulated_beta(
             super::cc_profile_for("claude-sonnet-5").beta,
             Some("output-128k-2025-02-19, effort-2025-11-24"),
+            false,
         );
         assert!(
             with_client.contains("output-128k-2025-02-19"),
@@ -19076,12 +19173,12 @@ mod tests {
             ("无工具 helper", config::CcProfileKind::HelperSubagentHaiku),
             ("额度探测", config::CcProfileKind::QuotaProbe),
         ] {
-            let official = super::simulated_beta(config::cc_profile(kind).beta, None);
+            let official = super::simulated_beta(config::cc_profile(kind).beta, None, false);
             // API-key 端那份就是官方串去掉 oauth；merge_beta 应当只把它补回来。
             let api_key_side: Vec<&str> =
                 official.split(',').filter(|p| *p != config::OAUTH_BETA_HEADER).collect();
             assert_eq!(
-                merge_beta(Some(&api_key_side.join(",")), None, Some((2, 1, 260))),
+                merge_beta(Some(&api_key_side.join(",")), None, Some((2, 1, 260)), false),
                 official,
                 "{name}: merge_beta 不该给辅助请求补主线程那几项"
             );
@@ -19099,6 +19196,7 @@ mod tests {
         let official = super::simulated_beta(
             config::cc_profile(config::CcProfileKind::SdkSubagentHaiku).beta,
             None,
+            false,
         );
         let api_key_side: Vec<&str> =
             official.split(',').filter(|p| *p != config::OAUTH_BETA_HEADER).collect();
@@ -19106,6 +19204,7 @@ mod tests {
             Some(&api_key_side.join(",")),
             Some("claude-haiku-4-5-20251001"),
             Some((2, 1, 260)),
+            false,
         );
         assert_eq!(out, official, "SDK 子代理只该补 oauth");
         assert!(!out.contains("advanced-tool-use"), "官方那条没有这一项: {out}");
@@ -19114,10 +19213,84 @@ mod tests {
         // 反例：2.1.220 的 haiku 没有 thinking-display-updates，照旧按主线程补齐。
         let (_, client_220, official_220) = BETA_PAIRS[2];
         assert_eq!(
-            &merge_beta(Some(client_220), None, Some((2, 1, 220))),
+            &merge_beta(Some(client_220), None, Some((2, 1, 220)), false),
             official_220,
             "老世代的 haiku 不该被当成 SDK 子代理"
         );
+    }
+
+    /// 体里带着 `redacted_thinking` 块时，`redact-thinking` 这项客户端 beta 两条路都不剥。
+    ///
+    /// 剥掉它就是「头上没声明、体里却带着块」，上游回
+    /// `Invalid \`data\` in \`redacted_thinking\` block`——而那些块不会从历史里消失，这条会话
+    /// 此后每发必拒。互斥规则本身是外推的，让路的该是它。见 [`body_carries_redacted_thinking`]。
+    #[test]
+    fn the_redact_thinking_beta_survives_when_the_body_carries_such_blocks() {
+        // 透传路（merge_beta）：2.1.260+ 的 sonnet seed 带 display-updates、不带 redact-thinking。
+        // 客户端串取官方那份再加上这一项——短串走不到互斥那一步（2.1.251+ 那组规则的判据是
+        // 串里有 `advisor-tool`，见 [`merge_beta`]）。
+        let client = format!(
+            "{},{}",
+            super::cc_profile_for("claude-sonnet-5").beta,
+            config::CC_BETA_REDACT_THINKING
+        );
+        let v263 = Some((2, 1, 263));
+        let dropped = merge_beta(Some(&client), Some("claude-sonnet-5"), v263, false);
+        assert!(!dropped.contains("redact-thinking"), "默认仍按互斥剥掉: {dropped}");
+        let kept = merge_beta(Some(&client), Some("claude-sonnet-5"), v263, true);
+        assert!(kept.contains(config::CC_BETA_REDACT_THINKING), "体里有块就得留着: {kept}");
+        // 例外只保这一项，别的补齐规则一个都不动。
+        assert_eq!(
+            dropped.split(',').filter(|p| !p.contains("redact-thinking")).collect::<Vec<_>>(),
+            kept.split(',').filter(|p| !p.contains("redact-thinking")).collect::<Vec<_>>(),
+            "除这一项外两串应逐项相同\ndropped={dropped}\nkept={kept}"
+        );
+
+        // 模拟路（simulated_beta）：同一条例外。
+        let opus = super::cc_profile_for("claude-opus-5").beta;
+        let kept = super::simulated_beta(opus, Some(config::CC_BETA_REDACT_THINKING), true);
+        assert!(kept.contains(config::CC_BETA_REDACT_THINKING), "模拟路同样留着: {kept}");
+        assert!(kept.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES), "官方那项照旧在: {kept}");
+
+        // 反方向不给例外：官方串带 redact-thinking 时，客户端的 display-updates 照丢——
+        // `display` 只是显示偏好，丢了不会让上游拒任何历史块。
+        let probe = config::cc_profile(config::CcProfileKind::QuotaProbe).beta;
+        let out =
+            super::simulated_beta(probe, Some(config::CC_BETA_THINKING_DISPLAY_UPDATES), true);
+        assert!(!out.contains("thinking-display-updates"), "反向不受例外影响: {out}");
+    }
+
+    /// 判据只认块的 `type`，且不解析整份体。
+    #[test]
+    fn detects_redacted_thinking_blocks_in_the_raw_body() {
+        assert!(super::body_carries_redacted_thinking(
+            br#"{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"x"}]}]}"#
+        ));
+        // 缩进过的体同样认得出（键值之间的空白不影响这个串本身）。
+        assert!(super::body_carries_redacted_thinking(
+            b"{\n  \"type\": \"redacted_thinking\",\n  \"data\": \"x\"\n}"
+        ));
+        // 粗筛的已知代价：一条正文**恰好就是**这个词的用户消息也算命中（那两个引号是
+        // JSON 自己的）。后果只是多留一项客户端本来就声明过的 beta，不改别的行为，
+        // 故不为它去解析整份体。
+        assert!(super::body_carries_redacted_thinking(
+            br#"{"messages":[{"role":"user","content":"redacted_thinking"}]}"#
+        ));
+        for miss in [
+            &br#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"s"}]}]}"#[..],
+            // 正文里提到它：JSON 里那对引号是转义过的 `\"`，凑不出这个串。
+            &br#"{"messages":[{"role":"user","content":"what is a \"redacted_thinking\" block"}]}"#[..],
+            // 这个词出现在别处，两侧没有引号。
+            &br#"{"messages":[{"role":"user","content":"about redacted_thinking blocks"}]}"#[..],
+            &b"{}"[..],
+            &b""[..],
+        ] {
+            assert!(
+                !super::body_carries_redacted_thinking(miss),
+                "不该命中: {}",
+                String::from_utf8_lossy(miss)
+            );
+        }
     }
 
     /// 模拟路径追加客户端 beta 时，**同名不同日期**算已经有了，**互斥项**直接丢。
@@ -19128,23 +19301,24 @@ mod tests {
     fn simulated_beta_rejects_conflicting_client_betas() {
         let fable = super::cc_profile_for("claude-fable-5-1").beta;
         // 官方 fable 串里是 06-01；客户端带 07-01，不该拼出两条。
-        let out = super::simulated_beta(fable, Some("server-side-fallback-2026-07-01"));
+        let out = super::simulated_beta(fable, Some("server-side-fallback-2026-07-01"), false);
         assert_eq!(out.matches("server-side-fallback-").count(), 1, "只该有一条: {out}");
         assert!(out.contains("server-side-fallback-2026-06-01"), "留官方那条日期: {out}");
 
         // opus 官方串有 thinking-display-updates，客户端带 redact-thinking → 丢。
         let opus = super::cc_profile_for("claude-opus-5").beta;
-        let out = super::simulated_beta(opus, Some(config::CC_BETA_REDACT_THINKING));
+        let out = super::simulated_beta(opus, Some(config::CC_BETA_REDACT_THINKING), false);
         assert!(!out.contains("redact-thinking"), "互斥项不能并存: {out}");
         assert!(out.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES), "{out}");
 
         // 反向也拦：官方串有 redact-thinking（额度探测）时，客户端的 display-updates 丢掉。
         let probe = config::cc_profile(config::CcProfileKind::QuotaProbe).beta;
-        let out = super::simulated_beta(probe, Some(config::CC_BETA_THINKING_DISPLAY_UPDATES));
+        let out =
+            super::simulated_beta(probe, Some(config::CC_BETA_THINKING_DISPLAY_UPDATES), false);
         assert!(!out.contains("thinking-display-updates"), "反向同样互斥: {out}");
 
         // 不冲突的照旧追加，一个都不能少。
-        let out = super::simulated_beta(opus, Some("output-128k-2025-02-19"));
+        let out = super::simulated_beta(opus, Some("output-128k-2025-02-19"), false);
         assert!(out.contains("output-128k-2025-02-19"), "{out}");
     }
 
@@ -19161,7 +19335,7 @@ mod tests {
              prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
              per-turn-control-2026-07-01,effort-2025-11-24,fallback-credit-2026-06-01,\
              thinking-display-updates-2026-08-18";
-        let out = merge_beta(Some(api_key), Some("claude-fable-5-1"), Some((2, 1, 260)));
+        let out = merge_beta(Some(api_key), Some("claude-fable-5-1"), Some((2, 1, 260)), false);
         assert!(
             out.contains(config::CC_BETA_SERVER_SIDE_FALLBACK_JUN),
             "fable 该补上 06-01 那条: {out}"
@@ -19174,7 +19348,7 @@ mod tests {
         // 补完就是官方那串（去掉动态的 afk-mode）——这才是这条测试真正要钉的。
         assert_eq!(
             out,
-            super::simulated_beta(super::cc_profile_for("claude-fable-5-1").beta, None)
+            super::simulated_beta(super::cc_profile_for("claude-fable-5-1").beta, None, false)
         );
         // 位置：`effort` 之后、`fallback-credit` 之前（官方序）。
         let idx = |b: &str| out.split(',').position(|p| p.starts_with(b)).unwrap();
@@ -19182,7 +19356,7 @@ mod tests {
         assert!(idx("server-side-fallback-") < idx("fallback-credit-"));
 
         // 2.1.260 的 opus 整项不发，别给它补。
-        let out = merge_beta(Some(api_key), Some("claude-opus-5"), Some((2, 1, 260)));
+        let out = merge_beta(Some(api_key), Some("claude-opus-5"), Some((2, 1, 260)), false);
         assert!(!out.contains("server-side-fallback-"), "opus 2.1.260 不发这一项: {out}");
     }
 
@@ -19196,7 +19370,7 @@ mod tests {
              prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
              per-turn-control-2026-07-01,effort-2025-11-24,\
              server-side-fallback-2026-06-01,fallback-credit-2026-06-01";
-        let out = merge_beta(Some(incoming), Some("claude-fable-5-1"), Some((2, 1, 260)));
+        let out = merge_beta(Some(incoming), Some("claude-fable-5-1"), Some((2, 1, 260)), false);
         assert_eq!(out.matches("server-side-fallback-").count(), 1, "只该有一条: {out}");
         assert!(out.contains("server-side-fallback-2026-06-01"), "保留客户端那条日期: {out}");
         assert!(out.contains(config::OAUTH_BETA_HEADER), "oauth 要补上: {out}");
@@ -24624,7 +24798,7 @@ mod tests {
                 "{model}: 主线程形态要带 billing header"
             );
             assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "{model}: 身份声明");
-            let beta = super::simulated_beta(sim.profile.beta, None);
+            let beta = super::simulated_beta(sim.profile.beta, None, false);
             assert!(beta.contains(config::CC_BETA_CLAUDE_CODE), "{model}: 主线程串带 claude-code");
 
             // **不能只换 profile**：`max_tokens:1` 的体配主线程的 system/beta，会得到一条
