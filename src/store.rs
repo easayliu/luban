@@ -2271,6 +2271,9 @@ impl CredentialStore {
         if let Some(v) = on(THINKING_MODIFIED_RETRY) {
             flags.thinking_modified_retry = v;
         }
+        if let Some(v) = on(REDACTED_THINKING_RETRY) {
+            flags.redacted_thinking_retry = v;
+        }
         if let Some(v) = on(SIMULATE_CC) {
             flags.simulate_cc = v;
         }
@@ -2517,6 +2520,11 @@ pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
 /// 缺省视为开启。成因通常是 JSON 序列化改变了 thinking 块的编码。
 pub const THINKING_MODIFIED_RETRY: &str = "thinking_modified_retry";
 
+/// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，是否降级历史 thinking 块后重试一次的
+/// settings 键名。缺省视为开启。与上面两项同一个兜底（[`crate::proxy::demote_thinking_blocks`]
+/// 对 `redacted_thinking` 是整块删），只是上游点名的是那段密文。
+pub const REDACTED_THINKING_RETRY: &str = "redacted_thinking_retry";
+
 /// 非 Claude Code 客户端的请求，是否按官方抓包形态模拟成 CC 请求的 settings 键名。
 /// 缺省视为开启：关掉的话这类请求会因缺 `You are Claude Code, …` 被上游拒掉，等于不可用。
 pub const SIMULATE_CC: &str = "simulate_cc";
@@ -2741,6 +2749,10 @@ pub struct ForwardFlags {
     /// 上游以「thinking 块被修改」拒绝时，降级历史 thinking 块后重试一次。
     /// 成因通常是 JSON 序列化改变了 thinking 块的编码。
     pub thinking_modified_retry: bool,
+    /// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，降级历史 thinking 块后重试一次。
+    /// 那段密文是上游自己签发的，验不过通常是会话中途换了号、或那一轮 assistant 消息被改写过
+    /// （见 [`crate::proxy::trace_thinking_block`] 那行日志怎么分辨）。
+    pub redacted_thinking_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。
     pub simulate_cc: bool,
@@ -2955,6 +2967,7 @@ impl Default for ForwardFlags {
             orig_header_case: true,
             thinking_signature_retry: true,
             thinking_modified_retry: true,
+            redacted_thinking_retry: true,
             simulate_cc: true,
             fill_metadata: true,
             rate_limit_retry: true,
@@ -8576,6 +8589,7 @@ mod tests {
             (TOOL_NAME_MIMIC, "0"),
             (INJECT_THINKING, "0"),
             (THINKING_MODIFIED_RETRY, "0"),
+            (REDACTED_THINKING_RETRY, "0"),
             (FLATTEN_TOOL_SCHEMAS, "0"),
             (STRIP_EMPTY_TEXT, "0"),
             (HOIST_SYSTEM_ROLE, "0"),
@@ -8606,6 +8620,7 @@ mod tests {
                 orig_header_case: false,
                 thinking_signature_retry: false,
                 thinking_modified_retry: false,
+                redacted_thinking_retry: false,
                 simulate_cc: false,
                 fill_metadata: false,
                 rate_limit_retry: false,

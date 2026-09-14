@@ -2056,6 +2056,8 @@ struct ForwardingResp {
     thinking_signature_retry: bool,
     /// 上游拒绝被修改的 thinking 块时，降级历史 thinking 后重试一次。
     thinking_modified_retry: bool,
+    /// 上游拒绝 `redacted_thinking` 块的密文时，降级历史 thinking 后重试一次。
+    redacted_thinking_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求。
     simulate_cc: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
@@ -2116,6 +2118,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             orig_header_case: f.orig_header_case,
             thinking_signature_retry: f.thinking_signature_retry,
             thinking_modified_retry: f.thinking_modified_retry,
+            redacted_thinking_retry: f.redacted_thinking_retry,
             simulate_cc: f.simulate_cc,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
@@ -2783,6 +2786,7 @@ struct SetForwardingReq {
     orig_header_case: Option<bool>,
     thinking_signature_retry: Option<bool>,
     thinking_modified_retry: Option<bool>,
+    redacted_thinking_retry: Option<bool>,
     simulate_cc: Option<bool>,
     fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
@@ -2818,8 +2822,8 @@ async fn set_forwarding(
         API_TELEMETRY, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS, FILL_METADATA,
         FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
         NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES,
-        REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC,
+        RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE,
+        REJECT_PROBES, REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC,
         SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
         STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
         THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
@@ -2835,6 +2839,7 @@ async fn set_forwarding(
         (ORIG_HEADER_CASE, req.orig_header_case),
         (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
         (THINKING_MODIFIED_RETRY, req.thinking_modified_retry),
+        (REDACTED_THINKING_RETRY, req.redacted_thinking_retry),
         (SIMULATE_CC, req.simulate_cc),
         (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),

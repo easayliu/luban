@@ -2008,6 +2008,38 @@ async fn handle_inner(
                         "upstream rejected an empty thinking block; dumping the INBOUND (client-original) request body for local replay"
                     );
                 }
+                // 「Invalid `data` in `redacted_thinking` block」：把上游点名的那个块在入站
+                // （客户端原件）与出站（luban 实际发出去的）两份体里对一遍，一行日志回答
+                // 「是不是 luban 改的、改的是这个块还是它所在那一轮」。判据见
+                // [`trace_thinking_block`]；这条不打正文，故不受 `inbound_body` 那种体量之累。
+                if !compressed
+                    && status == StatusCode::BAD_REQUEST
+                    && is_redacted_thinking_data_error(&err_bytes)
+                {
+                    let (_, message) = parse_upstream_error(&err_bytes);
+                    let trace = error_block_path(&message)
+                        .and_then(|(mi, bi)| trace_thinking_block(&body, &sent, mi, bi));
+                    match trace {
+                        Some(t) => tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            upstream_message = %message,
+                            outbound_at = %t.outbound_at,
+                            inbound_at = %t.inbound_at,
+                            payload_len = t.payload_len,
+                            turn_identical = ?t.turn_identical,
+                            inbound_turn = %t.inbound_turn,
+                            outbound_turn = %t.outbound_turn,
+                            "upstream rejected a redacted_thinking block's data; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken"
+                        ),
+                        // 坐标解析不出来，或那个坐标上压根没有思考块：两者都说明这条错误的
+                        // 形态与判据的假设对不上，原文打出来供修判据。
+                        None => tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            upstream_message = %message,
+                            "upstream rejected a redacted_thinking block's data, but the block it names could not be located in the outbound body"
+                        ),
+                    }
+                }
                 let banned =
                     (!compressed).then(|| detect_account_ban(status, &err_bytes)).flatten();
                 if let Some(reason) = &banned {
@@ -2039,8 +2071,15 @@ async fn handle_inner(
                             cred_id = cred.id, cred = %cred.label,
                             "upstream rejected a thinking-block signature; demote-and-retry is off, passing through as is"
                         );
-                    } else if let Some(up) =
-                        retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
+                    } else if let Some(up) = retry_demoted_thinking(
+                        &upstream,
+                        &cred,
+                        &device_fp,
+                        &body,
+                        &mut rl,
+                        "a thinking-block signature",
+                    )
+                    .await
                     {
                         return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
                     }
@@ -2055,8 +2094,38 @@ async fn handle_inner(
                             cred_id = cred.id, cred = %cred.label,
                             "upstream rejected modified thinking blocks; demote-and-retry is off, passing through as is"
                         );
-                    } else if let Some(up) =
-                        retry_demoted_thinking(&upstream, &cred, &device_fp, &body, &mut rl).await
+                    } else if let Some(up) = retry_demoted_thinking(
+                        &upstream,
+                        &cred,
+                        &device_fp,
+                        &body,
+                        &mut rl,
+                        "modified thinking blocks",
+                    )
+                    .await
+                    {
+                        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
+                    }
+                }
+                // `redacted_thinking` 密文验不过：与签名那条同一类事、同一个兜底。
+                if status == StatusCode::BAD_REQUEST
+                    && !compressed
+                    && is_redacted_thinking_data_error(&err_bytes)
+                {
+                    if !flags.redacted_thinking_retry {
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            "upstream rejected a redacted_thinking block's data; demote-and-retry is off, passing through as is"
+                        );
+                    } else if let Some(up) = retry_demoted_thinking(
+                        &upstream,
+                        &cred,
+                        &device_fp,
+                        &body,
+                        &mut rl,
+                        "a redacted_thinking block's data",
+                    )
+                    .await
                     {
                         return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
                     }
@@ -2861,8 +2930,10 @@ fn event_index(v: &serde_json::Value) -> Option<usize> {
     v.get("index")?.as_u64().map(|i| i as usize)
 }
 
-/// 上游以「thinking 块签名无效」拒绝后的兜底：把历史 thinking 降级成 text，用**同一个凭证**
-/// 重发一次。
+/// 上游验不过历史思考块（签名、被改过的编码、`redacted_thinking` 的密文）之后的兜底：把历史
+/// thinking 降级成 text、`redacted_thinking` 整块删掉，用**同一个凭证**重发一次。
+///
+/// `reason` 只进日志，写的是上游这次点名的是哪一样（三条调用路各自传自己的那句）。
 ///
 /// 成功则返回重试那次的上游响应，并把 `rl` 改按它记账（交给调用方 [`stream_upstream`]）；
 /// 任何一步不成都返回 `None`、`rl` 不动，由调用方继续透传最初那条 400——这条兜底路径在设计上
@@ -2878,19 +2949,22 @@ async fn retry_demoted_thinking(
     device_fp: &str,
     client_body: &Bytes,
     rl: &mut ReqLog,
+    reason: &str,
 ) -> Option<wreq::Response> {
     let Some(demoted) = demote_thinking_blocks(client_body) else {
         tracing::warn!(
             cred_id = cred.id,
             cred = %cred.label,
-            "upstream rejected a thinking-block signature, but the body has no thinking block to demote, passing through as is"
+            reason,
+            "upstream rejected a historical thinking block, but the body has no thinking block to demote, passing through as is"
         );
         return None;
     };
     tracing::warn!(
         cred_id = cred.id,
         cred = %cred.label,
-        "upstream rejected a thinking-block signature (the history was most likely signed by another credential): demoted historical thinking to text, retrying once with the same credential"
+        reason,
+        "upstream rejected a historical thinking block (it was most likely issued to another credential, or the turn holding it was rewritten): demoted historical thinking to text, retrying once with the same credential"
     );
 
     // 实际发出去的那份留一手：重试成了的话，请求日志与遥测的请求侧都要换成它。
@@ -2997,6 +3071,20 @@ fn is_thinking_modified_error(body: &[u8]) -> bool {
 fn is_empty_thinking_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     message.to_lowercase().contains("must contain thinking")
+}
+
+/// 上游那条 400 是不是「`redacted_thinking` 块的密文验不过」，形如
+/// `messages.5.content.48: Invalid \`data\` in \`redacted_thinking\` block`。
+///
+/// 与 [`is_thinking_signature_error`] 是同一类事（上游验不过历史思考块里那段它自己签发的
+/// 载荷），只是被点名的是 `redacted_thinking` 的密文而不是 `thinking` 的签名，处理方式也一样
+/// ——降级重试，[`demote_thinking_blocks`] 对 `redacted_thinking` 正是整块删。
+///
+/// 两条判据不重叠：这句里没有 `signature`，签名那句里没有 `redacted_thinking`。
+fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
+    let (_, message) = parse_upstream_error(body);
+    let hay = message.to_lowercase();
+    hay.contains("redacted_thinking") && hay.contains("data")
 }
 
 /// `messages` 末尾是不是 `assistant` 轮——用已解析的 `body_json` 判，零开销。
@@ -3190,7 +3278,12 @@ fn previous_thinking_block(thinking: &str) -> serde_json::Value {
 /// thinking / redacted_thinking 块替换回 `original` 里的原始字节。
 fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) -> Vec<u8> {
     let Ok(orig_str) = std::str::from_utf8(original) else { return rewritten };
-    if !orig_str.contains("\"thinking\"") {
+    // 两个都要找：`"redacted_thinking"` 里没有 `"thinking"` 这个子串（前面那个引号被
+    // `redacted_` 占着）。只找后者的话，一份只有 `redacted_thinking` 块、顶层又没有
+    // `thinking` 字段的体（第三方中转常见）会整段跳过不还原——而 base64 的标准字母表里正有
+    // `/`，`\/` 又是合法 JSON 转义，转义过的体一经 serde 往返就换了字节，上游必拒。
+    // 判据与 [`thinking_block_byte_ranges`] 里那道块级过滤保持同一口径。
+    if !(orig_str.contains("\"thinking\"") || orig_str.contains("\"redacted_thinking\"")) {
         return rewritten;
     }
     let orig_blocks = thinking_block_byte_ranges(orig_str);
@@ -3251,9 +3344,10 @@ struct ThinkingBlockRef {
     blk: usize,
     span: std::ops::Range<usize>,
     /// 这个块的**稳定身份**：`thinking` 的 `signature`、`redacted_thinking` 的 `data`。
-    /// 两者都是 base64（`[A-Za-z0-9+/=]`），不受 JSON 转义策略影响，改写前后逐字相同，
-    /// 所以拿它配对不怕下标移位，见 [`preserve_thinking_encoding`]。客户端自己拼的块可能
-    /// 两样都没有，那时是 `None`。
+    /// 两者都是 base64（`[A-Za-z0-9+/=]`），而这里存的是**解析之后**的值——原文把 `/` 写成
+    /// `\/` 也好、原样也好，解出来都是同一串，所以拿它配对既不怕下标移位、也不怕两侧转义
+    /// 策略不同，见 [`preserve_thinking_encoding`]。客户端自己拼的块可能两样都没有，
+    /// 那时是 `None`。
     key: Option<String>,
 }
 
@@ -3312,6 +3406,94 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
         }
     }
     out
+}
+
+/// 从上游 400 的 message 里解析 `messages.<i>.content.<j>` 这个坐标。
+///
+/// 官方这类错误恒以它开头（`messages.5.content.48: Invalid …`）；不是这个形态就返回 `None`，
+/// 调用方照常透传，只是少一份定位信息。
+fn error_block_path(message: &str) -> Option<(usize, usize)> {
+    let (msg, rest) = message.strip_prefix("messages.")?.split_once(".content.")?;
+    let blk: &str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((msg.parse().ok()?, blk.parse().ok()?))
+}
+
+/// 被上游点名的那个思考块在**入站**（客户端原件）与**出站**（luban 实际发出去的那份）两侧的
+/// 对照，见 [`trace_thinking_block`]。
+struct ThinkingBlockTrace {
+    /// 出站体里的坐标，也就是上游报错里那个（原样回显，供核对解析对没对）。
+    outbound_at: String,
+    /// 入站体里同一个块的坐标；`none` 表示**入站体里根本没有这段载荷**。
+    inbound_at: String,
+    /// 载荷（`redacted_thinking` 的 `data` / `thinking` 的 `signature`）的字节数。
+    payload_len: usize,
+    /// 那一轮 assistant 消息在两侧是否逐字节相同。`None` 表示有一侧取不到那条消息。
+    turn_identical: Option<bool>,
+    /// 那一轮的块型序列（`tool_use` 连名字一起，见 [`block_label`]），两侧各一份。
+    inbound_turn: String,
+    outbound_turn: String,
+}
+
+/// 拿上游点名的坐标，在出站体里取到那个思考块，再**用载荷本身当身份**回到入站体里找同一个块。
+///
+/// 载荷是 base64（`data` / `signature` 都是），JSON 转义策略碰不到它，改写前后逐字相同，
+/// 所以这条比对不受「消息或块被删掉导致下标前移」的影响——这正是要它的原因：坐标对不上也
+/// 照样找得到。
+///
+/// 打出来的几项各回答一个问题：
+/// - `inbound_at=none`：入站体里没有这段载荷 = **luban 把它改坏了**，这是唯一一种 luban 的锅；
+/// - `inbound_at` 与 `outbound_at` 不同：块还在，但下标前移过（有消息或块被删）；
+/// - `turn_identical=false`：那一轮除这个块之外还被改过——工具名混淆（[`apply_tool_names`]）
+///   会改历史里的 `tool_use.name`，两份 `*_turn` 一比就能看出改的是哪一块；
+/// - 三项全对上：luban 原样转发，坏在客户端发来的那份或上游自己那边。
+///
+/// 不打任何正文，也不打载荷本身（几 KB 密文，没有信息量）。
+fn trace_thinking_block(
+    inbound: &[u8],
+    outbound: &[u8],
+    mi: usize,
+    bi: usize,
+) -> Option<ThinkingBlockTrace> {
+    let out_str = std::str::from_utf8(outbound).ok()?;
+    let out_blocks = thinking_block_byte_ranges(out_str);
+    let ob = out_blocks.iter().find(|b| b.msg == mi && b.blk == bi)?;
+    let key = ob.key.clone();
+    let payload_len = key.as_deref().map(str::len).unwrap_or(0);
+
+    let in_blocks =
+        std::str::from_utf8(inbound).map(thinking_block_byte_ranges).unwrap_or_default();
+    let ib = key.as_deref().and_then(|k| in_blocks.iter().find(|b| b.key.as_deref() == Some(k)));
+
+    let turn_of = |body: &[u8], idx: usize| -> Option<serde_json::Value> {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()?
+            .get("messages")?
+            .as_array()?
+            .get(idx)
+            .cloned()
+    };
+    let out_turn = turn_of(outbound, mi);
+    let in_turn = ib.and_then(|b| turn_of(inbound, b.msg));
+    // 逐字节比那一轮：两侧都已是 `serde_json::Value`，同一套序列化下的字节差异就是真差异
+    // （`preserve_order` 保着键序）。序列化失败当作「比不出来」，不牵连整份对照。
+    let turn_identical = match (&in_turn, &out_turn) {
+        (Some(a), Some(b)) => match (serde_json::to_vec(a), serde_json::to_vec(b)) {
+            (Ok(a), Ok(b)) => Some(a == b),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    Some(ThinkingBlockTrace {
+        outbound_at: format!("messages.{mi}.content.{bi}"),
+        inbound_at: ib
+            .map(|b| format!("messages.{}.content.{}", b.msg, b.blk))
+            .unwrap_or_else(|| "none".into()),
+        payload_len,
+        turn_identical,
+        inbound_turn: in_turn.as_ref().map(turn_label).unwrap_or_else(|| "-".into()),
+        outbound_turn: out_turn.as_ref().map(turn_label).unwrap_or_else(|| "-".into()),
+    })
 }
 
 /// 展开 error 的 source 链，拼成「顶层 -> 次层 -> …」，暴露底层真实原因。
@@ -5193,21 +5375,21 @@ fn request_digest(v: &serde_json::Value) -> serde_json::Value {
 /// `tool_use` 例外——它的 `name` 正是第三方判定最可能盯的维度，必须打出来。
 fn messages_digest(v: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = v.as_array() else { return v.clone() };
-    let turns = arr
-        .iter()
-        .map(|m| {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-            let blocks = match m.get("content") {
-                Some(serde_json::Value::Array(bs)) => {
-                    bs.iter().map(block_label).collect::<Vec<_>>().join(",")
-                }
-                Some(serde_json::Value::String(s)) => format!("text(len={})", s.len()),
-                _ => "?".to_string(),
-            };
-            format!("{role}:{blocks}")
-        })
-        .collect::<Vec<_>>();
+    let turns = arr.iter().map(turn_label).collect::<Vec<_>>();
     serde_json::json!({ "count": arr.len(), "turns": turns })
+}
+
+/// 单条消息在摘要里的写法：`角色:块,块,…`。见 [`block_label`]。
+fn turn_label(m: &serde_json::Value) -> String {
+    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+    let blocks = match m.get("content") {
+        Some(serde_json::Value::Array(bs)) => {
+            bs.iter().map(block_label).collect::<Vec<_>>().join(",")
+        }
+        Some(serde_json::Value::String(s)) => format!("text(len={})", s.len()),
+        _ => "?".to_string(),
+    };
+    format!("{role}:{blocks}")
 }
 
 /// 单个内容块在摘要里的写法：`text` 只记长度，`tool_use` 记名字，其余只记类型。
@@ -5227,6 +5409,11 @@ fn block_label(b: &serde_json::Value) -> String {
             "thinking(len={},sig_len={})",
             b.get("thinking").and_then(|t| t.as_str()).map(str::len).unwrap_or(0),
             b.get("signature").and_then(|t| t.as_str()).map(str::len).unwrap_or(0)
+        ),
+        // 密文长度是「这一块有没有被动过」的唯一可打指标（`data` 本身几 KB，没有信息量）。
+        "redacted_thinking" => format!(
+            "redacted_thinking(data_len={})",
+            b.get("data").and_then(|d| d.as_str()).map(str::len).unwrap_or(0)
         ),
         other => other.to_string(),
     }
@@ -14321,6 +14508,7 @@ mod tests {
             orig_header_case: false,
             thinking_signature_retry: false,
             thinking_modified_retry: false,
+            redacted_thinking_retry: false,
             simulate_cc: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -15142,6 +15330,7 @@ mod tests {
             orig_header_case: false,
             thinking_signature_retry: false,
             thinking_modified_retry: false,
+            redacted_thinking_retry: false,
             simulate_cc: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -16229,6 +16418,7 @@ mod tests {
                 orig_header_case: false,
                 thinking_signature_retry: false,
                 thinking_modified_retry: false,
+                redacted_thinking_retry: false,
                 simulate_cc: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
@@ -17748,6 +17938,134 @@ mod tests {
         }
     }
 
+    /// `redacted_thinking` 的密文那条 400 自成一档：与签名、被改、空块三条判据互不误触。
+    #[test]
+    fn detects_only_the_redacted_thinking_data_400() {
+        let hit = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.48: Invalid `data` in `redacted_thinking` block"}}"#;
+        assert!(super::is_redacted_thinking_data_error(hit));
+        // 三条老判据都不该认领它，否则日志与重试原因会张冠李戴。
+        assert!(!super::is_thinking_signature_error(hit));
+        assert!(!super::is_thinking_modified_error(hit));
+        assert!(!super::is_empty_thinking_error(hit));
+
+        for miss in [
+            // 签名那条：有 thinking 没 redacted_thinking。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block"}}"#[..],
+            // 被改那条：提到了 redacted_thinking，但没提 data，且另有专属判据。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified."}}"#[..],
+            // 普通请求形态错误。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be greater than 0"}}"#[..],
+            &b"<html>403 Forbidden</html>"[..],
+        ] {
+            assert!(
+                !super::is_redacted_thinking_data_error(miss),
+                "不该命中: {}",
+                String::from_utf8_lossy(miss)
+            );
+        }
+    }
+
+    /// 坐标解析：官方那句以 `messages.<i>.content.<j>:` 开头，别的形态一律给 `None`。
+    #[test]
+    fn parses_the_error_block_path() {
+        assert_eq!(
+            super::error_block_path(
+                "messages.5.content.48: Invalid `data` in `redacted_thinking` block"
+            ),
+            Some((5, 48))
+        );
+        assert_eq!(super::error_block_path("messages.0.content.0: whatever"), Some((0, 0)));
+        for miss in [
+            "max_tokens: must be greater than 0",
+            "messages.5: system content must contain at least one block",
+            "messages.x.content.1: nope",
+            "messages.5.content.x: nope",
+            "",
+        ] {
+            assert_eq!(super::error_block_path(miss), None, "不该解析出坐标: {miss}");
+        }
+    }
+
+    // ---------- 被拒的 redacted_thinking 块：入站 / 出站对照 ----------
+
+    /// 构造一份带两轮 assistant 的体：第 2 轮（下标 `2`）末块是 `redacted_thinking`。
+    fn traceable_body(data: &str, tool: &str, lead_system: bool) -> Vec<u8> {
+        let lead = if lead_system {
+            r#"{"role":"system","content":[{"type":"text","text":"x"}]},"#
+        } else {
+            ""
+        };
+        format!(
+            concat!(
+                r#"{{"model":"claude-sonnet-5","messages":["#,
+                r#"{{"role":"user","content":[{{"type":"text","text":"hi"}}]}},"#,
+                "{lead}",
+                r#"{{"role":"assistant","content":["#,
+                r#"{{"type":"thinking","thinking":"t","signature":"SIG"}},"#,
+                r#"{{"type":"tool_use","id":"tu1","name":"{tool}","input":{{}}}},"#,
+                r#"{{"type":"redacted_thinking","data":"{data}"}}]}}]}}"#
+            ),
+            lead = lead,
+            tool = tool,
+            data = data
+        )
+        .into_bytes()
+    }
+
+    /// luban 一个字节没动：坐标两侧相同，那一轮也逐字节相同——这就是「坏在客户端发来的那份」。
+    #[test]
+    fn traces_an_untouched_redacted_block() {
+        let body = traceable_body("ENCRYPTED", "Bash", false);
+        let t = super::trace_thinking_block(&body, &body, 1, 2).expect("该坐标上有思考块");
+        assert_eq!(t.outbound_at, "messages.1.content.2");
+        assert_eq!(t.inbound_at, "messages.1.content.2");
+        assert_eq!(t.payload_len, "ENCRYPTED".len());
+        assert_eq!(t.turn_identical, Some(true));
+        assert_eq!(t.inbound_turn, t.outbound_turn);
+        assert!(t.outbound_turn.contains("redacted_thinking(data_len=9)"), "{}", t.outbound_turn);
+    }
+
+    /// 出站少了一条消息（丢空壳 / 提升 role:"system"）：下标前移，但按密文仍找得到同一个块。
+    #[test]
+    fn traces_a_shifted_redacted_block() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", true);
+        let outbound = traceable_body("ENCRYPTED", "Bash", false);
+        let t = super::trace_thinking_block(&inbound, &outbound, 1, 2).expect("该坐标上有思考块");
+        assert_eq!(t.outbound_at, "messages.1.content.2");
+        assert_eq!(t.inbound_at, "messages.2.content.2", "按密文配对，不受下标前移影响");
+        assert_eq!(t.turn_identical, Some(true), "那一轮本身没被改");
+    }
+
+    /// 出站那段密文入站体里根本没有：只有这一种情形是 luban 把它改坏了。
+    #[test]
+    fn traces_a_corrupted_redacted_block() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", false);
+        let outbound = traceable_body("CORRUPTED", "Bash", false);
+        let t = super::trace_thinking_block(&inbound, &outbound, 1, 2).expect("该坐标上有思考块");
+        assert_eq!(t.inbound_at, "none");
+        assert_eq!(t.turn_identical, None, "入站那一轮都定位不到，无从比对");
+    }
+
+    /// 密文原样、但那一轮里的 `tool_use.name` 被改过（工具名混淆）：两份 turn 摘要一比即见。
+    #[test]
+    fn traces_a_rewritten_turn_around_the_redacted_block() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", false);
+        let outbound = traceable_body("ENCRYPTED", "mcp__luban__abcBas00", false);
+        let t = super::trace_thinking_block(&inbound, &outbound, 1, 2).expect("该坐标上有思考块");
+        assert_eq!(t.inbound_at, "messages.1.content.2", "块本身没动");
+        assert_eq!(t.turn_identical, Some(false));
+        assert!(t.inbound_turn.contains("tool_use(Bash)"), "{}", t.inbound_turn);
+        assert!(t.outbound_turn.contains("tool_use(mcp__luban__abcBas00)"), "{}", t.outbound_turn);
+    }
+
+    /// 坐标上没有思考块（判据与形态对不上）：给 `None`，调用方打原文而不是编一份对照。
+    #[test]
+    fn traces_nothing_when_the_named_block_is_not_a_thinking_block() {
+        let body = traceable_body("ENCRYPTED", "Bash", false);
+        assert!(super::trace_thinking_block(&body, &body, 1, 1).is_none(), "那是 tool_use");
+        assert!(super::trace_thinking_block(&body, &body, 9, 0).is_none(), "越界");
+    }
+
     /// thinking 原文搬进 text、redacted_thinking 直接删，其余块与 key 序原样不动。
     #[test]
     fn demotes_thinking_to_text() {
@@ -17845,6 +18163,30 @@ mod tests {
         let rewritten = body.to_vec();
         let result = super::preserve_thinking_encoding(body, rewritten.clone());
         assert_eq!(result, rewritten);
+    }
+
+    /// 只有 `redacted_thinking` 块、顶层没有 `thinking` 字段的体：入口判据以前只找
+    /// `"thinking"`，这类体整段跳过不还原。而 base64 里有 `/`、`\/` 又是合法 JSON 转义
+    /// （PHP 那类编码器默认就这么写），serde 往返会把它还原成 `/`——逻辑值没变、字节变了，
+    /// 上游按字节校验必拒，且降级重试也救不回下一轮。
+    #[test]
+    fn preserve_thinking_restores_escaped_slashes_in_a_redacted_only_body() {
+        let original = br#"{"model":"claude-sonnet-5","messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"ab\/cd+ef\/gh"}]}]}"#;
+        let mut v: serde_json::Value = serde_json::from_slice(original.as_ref()).unwrap();
+        v["stream"] = true.into(); // 任意一处真实改写，逼出一次重新序列化
+        let rewritten = serde_json::to_vec(&v).unwrap();
+        assert!(
+            !String::from_utf8(rewritten.clone()).unwrap().contains(r"ab\/cd"),
+            "前提：serde 会把 \\/ 写回成 /"
+        );
+
+        let fixed = super::preserve_thinking_encoding(original, rewritten);
+        let s = String::from_utf8(fixed).unwrap();
+        assert!(
+            s.contains(r#"{"type":"redacted_thinking","data":"ab\/cd+ef\/gh"}"#),
+            "整块原始字节应还原（含 \\/ 转义）: {s}"
+        );
+        assert!(s.contains(r#""stream":true"#), "还原只针对思考块，改写本身不该被回滚: {s}");
     }
 
     #[test]
@@ -18329,6 +18671,7 @@ mod tests {
             orig_header_case: false,
             thinking_signature_retry: false,
             thinking_modified_retry: false,
+            redacted_thinking_retry: false,
             simulate_cc: false,
             fill_metadata: false,
             rate_limit_retry: false,

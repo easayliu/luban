@@ -702,6 +702,26 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="redacted_thinking_retry"
+          label={t('redacted thinking 兜底', 'redacted thinking fallback')}
+          summary={t(
+            '上游拒绝 redacted_thinking 块的密文时，自动降级并重试一次。',
+            'When the upstream rejects the ciphertext of a redacted_thinking block, automatically downgrade it and retry once.',
+          )}
+          description={
+            <>
+              {t('上游回', 'The upstream returns')}{' '}
+              <code className="font-mono">
+                Invalid `data` in `redacted_thinking` block
+              </code>{' '}
+              {t(
+                '时触发。那段密文由上游签发，验不过通常是会话中途换了号，或该轮 assistant 消息在转发时被改写过（如工具名混淆）。处理方式与另两档兜底相同：历史 thinking 降级成普通文本、redacted_thinking 整块删掉后重试一次；命中时日志会打出这一块在收到与发出两份请求体里的对照，据此可判断是哪一种成因。',
+                '. The ciphertext is issued by the upstream, so a failure usually means the session switched accounts midway, or that assistant turn was rewritten on forwarding (for example by tool-name mimicry). Handled like the other two fallbacks: historical thinking is downgraded to plain text, redacted_thinking blocks are dropped, and the request is retried once. On a hit, the log compares that block between the received and the forwarded request body so the cause can be told apart.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
     </div>
   )

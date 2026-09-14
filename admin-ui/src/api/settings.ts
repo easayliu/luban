@@ -59,6 +59,8 @@ export interface Settings {
   thinking_signature_retry: boolean
   /** 上游拒绝被修改的 thinking 块时，降级历史 thinking 后重试一次。 */
   thinking_modified_retry: boolean
+  /** 上游拒绝 redacted_thinking 块的密文（Invalid `data`）时，降级历史 thinking 后重试一次。 */
+  redacted_thinking_retry: boolean
   /** 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 + 整套官方头）；官方桌面端预热与 WebSearch 子调用原样放行。 */
   simulate_cc: boolean
   /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
@@ -125,6 +127,7 @@ export type ForwardingKey =
   | 'orig_header_case'
   | 'thinking_signature_retry'
   | 'thinking_modified_retry'
+  | 'redacted_thinking_retry'
   | 'simulate_cc'
   | 'fill_metadata'
   | 'rate_limit_retry'
