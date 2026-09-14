@@ -1260,13 +1260,14 @@ impl CredentialStore {
         )
     }
 
-    /// 全局默认设备数上限：`<= 0` 表示默认不限。未设置或解析失败时按 0（不限）。
+    /// 全局默认设备数上限：`<= 0` 表示显式不限。未设置或解析失败时使用
+    /// [`DEFAULT_DEVICE_LIMIT_VALUE`]。
     pub fn default_device_limit(&self) -> i64 {
         self.get_setting(DEFAULT_DEVICE_LIMIT)
             .ok()
             .flatten()
             .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0)
+            .unwrap_or(DEFAULT_DEVICE_LIMIT_VALUE)
             .max(0)
     }
 
@@ -2835,6 +2836,11 @@ pub struct ForwardFlags {
     /// Anthropic API 不支持 messages 数组里出现 `role:"system"`（直接 400），但 litellm
     /// 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把这些
     /// 消息的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
+    ///
+    /// **CC 形态的请求整个跳过**：官方自己在 messages 里合法使用 `role:"system"`
+    /// （deferred tools），硬提升会破坏形态。唯一的例外是**空壳**（content 为空数组 / 空串 /
+    /// `null` / 缺失 / 整条只有空 text 块）：不论这个开关与来访形态，一律在出站前丢掉，见
+    /// `proxy::drop_empty_system_messages`——上游对它恒回 400，而它一个内容块都没有。
     pub hoist_system_role: bool,
     /// 本地拒绝带 OpenAI 格式转换残留的请求（messages 里的 `role:"system"`、`call_` 前缀的
     /// 工具调用 id、OpenAI 方言的 `tool_choice` / `tools`、`n` / `stop` / `user` 等 OpenAI 专属
@@ -3013,9 +3019,13 @@ pub const MIN_CLIENT_VERSION: &str = "min_client_version";
 /// 想少授权的一档现成值是 [`crate::config::SCOPES_MINIMAL`]，代价见那里的注释。
 pub const OAUTH_SCOPES: &str = "oauth_scopes";
 
-/// 全局默认设备数上限的 settings 键名；`<= 0` 表示默认不限。
+/// 全局默认设备数上限的 settings 键名；`<= 0` 表示显式不限。
 /// 账号自身 `device_limit == 0`（默认值）时套用它，无需逐个账号配置。
 pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
+
+/// 未写入 `default_device_limit` 时的默认上限。用于防止新账号在多个设备、session
+/// 并行使用时无限扩张；写入 settings 的值仍优先，账号级 `< 0` 仍可明确不限。
+pub const DEFAULT_DEVICE_LIMIT_VALUE: i64 = 5;
 
 /// 全局默认账号 RPM 上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `rpm_limit == 0`（默认值）时套用它，无需逐个账号配置。
@@ -3113,8 +3123,8 @@ pub const DEFAULT_RATE_LIMIT_RETRY_MAX: i64 = 2;
 /// 账号实际生效的设备数上限：返回 `0` 表示不限。
 ///
 /// `cred_limit` 三态——`> 0` 账号独立上限（覆盖全局）；`0` 跟随全局默认 `default_limit`；
-/// `< 0` 账号明确不限（即便全局有默认值也不限）。旧库所有账号都是 0，全局默认亦为 0
-/// （不限），故行为与加入本机制前一致。
+/// `< 0` 账号明确不限（即便全局有默认值也不限）。旧库启动时若未显式配置，会写入
+/// [`DEFAULT_DEVICE_LIMIT_VALUE`]；显式写入的 0（不限）保持不变。
 pub fn effective_device_limit(cred_limit: i64, default_limit: i64) -> i64 {
     match cred_limit {
         n if n > 0 => n,
@@ -4782,6 +4792,28 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
     }
 
+    // 未配置全局设备上限的旧库升级到受控默认值；显式写入的 0（不限）保留不动。
+    //
+    // 这一行**不改变判定**：`CredentialStore::default_device_limit` 在设置缺失时本来就回落到
+    // 同一个 [`DEFAULT_DEVICE_LIMIT_VALUE`]，写进表只是让它在控制台里看得见、改得动。真正
+    // 「多出一道上限」的是 v0.2.8 引入这个全局默认那一次，从更老的库升上来的部署会在这里第一次
+    // 落这一行——所以只在**确实插入了**（`INSERT OR IGNORE` 影响行数为 1）时说一声：迁移可以
+    // 安静，但改变了一台部署的可用面的那一次不该安静。已经有这一行的（绝大多数）一个字不打。
+    let device_limit_seeded = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![DEFAULT_DEVICE_LIMIT, DEFAULT_DEVICE_LIMIT_VALUE.to_string()],
+    )?;
+    if device_limit_seeded > 0 {
+        tracing::warn!(
+            key = DEFAULT_DEVICE_LIMIT,
+            value = DEFAULT_DEVICE_LIMIT_VALUE,
+            "this database had no global default device limit; wrote {DEFAULT_DEVICE_LIMIT_VALUE}. \
+             Accounts whose own device_limit is 0 now allow at most {DEFAULT_DEVICE_LIMIT_VALUE} \
+             bound devices each; change it under Settings (0 = unlimited), or set a per-account \
+             limit (negative = that account is explicitly unlimited)"
+        );
+    }
+
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
@@ -5516,6 +5548,53 @@ mod tests {
     // 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
     #![allow(deprecated)]
     use super::*;
+
+    /// 全局默认设备上限的播种：库里没有这一项才写入 [`DEFAULT_DEVICE_LIMIT_VALUE`]，
+    /// 已经有值的（包括显式写的 `0` = 不限）一个字不动，重复启动也不会改回去。
+    ///
+    /// 判定本身不依赖这一行——[`CredentialStore::default_device_limit`] 在设置缺失时回落到
+    /// 同一个常量；写进表是为了让它在控制台里看得见、改得动。真正「多出一道上限」的是从
+    /// v0.2.8 之前的库升上来那一次，所以确实插入时会 warn 一条（日志不在断言范围内）。
+    #[test]
+    fn seeds_the_default_device_limit_only_when_absent() {
+        // 空库：播种成默认值。
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let read = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![DEFAULT_DEVICE_LIMIT],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(read(&conn).as_deref(), Some(DEFAULT_DEVICE_LIMIT_VALUE.to_string().as_str()));
+        // 再跑一遍（每次启动都会跑）：不重复写、值不变。
+        init_schema(&conn).unwrap();
+        assert_eq!(read(&conn).as_deref(), Some(DEFAULT_DEVICE_LIMIT_VALUE.to_string().as_str()));
+
+        // 用户显式写过的值一律保留，"0"（不限）也不会被改成 5。
+        for explicit in ["0", "12"] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![DEFAULT_DEVICE_LIMIT, explicit],
+            )
+            .unwrap();
+            init_schema(&conn).unwrap();
+            assert_eq!(read(&conn).as_deref(), Some(explicit), "显式配置不该被迁移改写");
+        }
+
+        // 缺这一行时判定仍是同一个值——这一行不改变行为。
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![DEFAULT_DEVICE_LIMIT]).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        assert_eq!(store.default_device_limit(), DEFAULT_DEVICE_LIMIT_VALUE);
+    }
 
     /// 旧库（无 AUTOINCREMENT）经 init_schema 迁移后，删号腾出的 id 不再被复用。
     #[test]

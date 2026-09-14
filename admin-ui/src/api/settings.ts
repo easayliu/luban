@@ -85,7 +85,7 @@ export interface Settings {
   flatten_tool_schemas: boolean
   /** 剥除 messages 里的空 text 内容块。 */
   strip_empty_text: boolean
-  /** 将 messages 里的 role:"system" 消息提升到顶层 system 字段。 */
+  /** 将 messages 里的 role:"system" 消息提升到顶层 system 字段（CC 形态的请求跳过；content 为空壳的那种无论开关与形态一律丢掉，上游恒 400）。 */
   hoist_system_role: boolean
   /** 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。 */
   reject_openai_shape: boolean

@@ -3201,9 +3201,29 @@ fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) -> Vec<u8> {
         let Ok(s) = std::str::from_utf8(&rewritten) else { return rewritten };
         thinking_block_byte_ranges(s)
     };
+    // 改写过程中整条消息可能被删掉（[`drop_empty_system_messages`]、
+    // [`hoist_system_role_messages`]），消息里的块也可能被剥掉（[`strip_empty_text_blocks`]、
+    // [`strip_empty_thinking_blocks`]）——下标一移，按 `(msg, blk)` 配对就会把 A 块的原始字节
+    // 盖到 B 块上，历史与签名一起错乱。所以带 `signature` / `data` 的按那个值配（base64，
+    // 改写前后逐字相同），只有两侧的 `(msg, blk)` 完全对齐时才退回按位置配。
+    let aligned = orig_blocks.len() == rw_blocks.len()
+        && orig_blocks.iter().zip(&rw_blocks).all(|(o, r)| o.msg == r.msg && o.blk == r.blk);
+    let unique = |list: &[ThinkingBlockRef], key: &str| {
+        list.iter().filter(|b| b.key.as_deref() == Some(key)).count() == 1
+    };
     let mut subs: Vec<(std::ops::Range<usize>, &[u8])> = Vec::new();
     for ob in &orig_blocks {
-        if let Some(rb) = rw_blocks.iter().find(|r| r.msg == ob.msg && r.blk == ob.blk) {
+        let rb = match ob.key.as_deref() {
+            // 两侧各只出现一次才算认得出是同一个块；重复的（客户端把同一块贴了两遍）退回位置。
+            Some(key) if unique(&orig_blocks, key) && unique(&rw_blocks, key) => {
+                rw_blocks.iter().find(|r| r.key.as_deref() == Some(key))
+            }
+            // 没有签名的块只在完全对齐时按位置配。错位时宁可不还原：它没有签名，上游无从
+            // 按字节校验，重新编码一遍无害，而配错了就是把历史改乱。
+            _ if aligned => rw_blocks.iter().find(|r| r.msg == ob.msg && r.blk == ob.blk),
+            _ => None,
+        };
+        if let Some(rb) = rb {
             let orig_slice = &original[ob.span.clone()];
             let rw_slice = &rewritten[rb.span.clone()];
             if orig_slice != rw_slice {
@@ -3230,6 +3250,11 @@ struct ThinkingBlockRef {
     msg: usize,
     blk: usize,
     span: std::ops::Range<usize>,
+    /// 这个块的**稳定身份**：`thinking` 的 `signature`、`redacted_thinking` 的 `data`。
+    /// 两者都是 base64（`[A-Za-z0-9+/=]`），不受 JSON 转义策略影响，改写前后逐字相同，
+    /// 所以拿它配对不怕下标移位，见 [`preserve_thinking_encoding`]。客户端自己拼的块可能
+    /// 两样都没有，那时是 `None`。
+    key: Option<String>,
 }
 
 /// 用 `RawValue` 零拷贝反序列化找到 `original` 里每个 thinking / redacted_thinking
@@ -3278,7 +3303,12 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
                 continue;
             }
             let start = s.as_ptr() as usize - base;
-            out.push(ThinkingBlockRef { msg: mi, blk: bi, span: start..start + s.len() });
+            let key = serde_json::from_str::<serde_json::Value>(s).ok().and_then(|v| {
+                ["signature", "data"]
+                    .iter()
+                    .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
+            });
+            out.push(ThinkingBlockRef { msg: mi, blk: bi, span: start..start + s.len(), key });
         }
     }
     out
@@ -9504,6 +9534,48 @@ fn ensure_beta_query(url: &str) -> String {
     format!("{url}{sep}beta=true")
 }
 
+/// `body` 里有没有出现过这串字节。给 [`rewrite_body`] 的入口快速路径用：拿字面量粗筛
+/// 「要不要解析」比解析一遍便宜得多。
+///
+/// 单独一个函数是为了**让窗口宽度不可能写错**：原先三处各自写着
+/// `body.windows(N).any(|w| w == b"…")`，其中 `"role":"system"` 那处的 `N` 比字面量宽了一位，
+/// 比较恒为 `false`，那一项白白当了一版死代码。
+fn body_contains(body: &[u8], needle: &[u8]) -> bool {
+    body.windows(needle.len()).any(|w| w == needle)
+}
+
+/// 体里有没有 `"键": "值"` 这一对，**键与冒号、冒号与值之间允许任意 JSON 空白**
+/// （空格、制表、换行、回车）。`key` / `value` 都要自带引号，如
+/// `body_has_pair(body, b"\"role\"", b"\"system\"")`。
+///
+/// 粗筛为什么要容空白：缩进过的请求体（不少中转、SDK 的调试模式会 pretty-print）里写的是
+/// `"role": "system"`，按紧凑字面量找一定落空，[`rewrite_body`] 的快速路径就直接原样返回，
+/// 空壳 system 的清理与空 text 块的剥除全被跳过——判据不该取决于客户端的缩进风格。
+///
+/// 仍然只认**字面量形态的键与值**：把键写成 `"\u0072ole"` 这种转义的绕得过去。现实里没有
+/// 客户端这么发（serde / encoding/json / Python 的 json 都不转义 ASCII 字母），真出现了也只是
+/// 退回「不解析、原样转发」，上游照常给它一条 400，不会得出错误的结论。
+fn body_has_pair(body: &[u8], key: &[u8], value: &[u8]) -> bool {
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+    body.windows(key.len()).enumerate().any(|(i, w)| {
+        if w != key {
+            return false;
+        }
+        let mut j = i + key.len();
+        while body.get(j).is_some_and(|&b| is_ws(b)) {
+            j += 1;
+        }
+        if body.get(j) != Some(&b':') {
+            return false;
+        }
+        j += 1;
+        while body.get(j).is_some_and(|&b| is_ws(b)) {
+            j += 1;
+        }
+        body.get(j..).is_some_and(|rest| rest.starts_with(value))
+    })
+}
+
 /// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
 /// 请求体逐字节原样转发）：
 ///
@@ -9575,11 +9647,12 @@ fn rewrite_body(
     // beta（[`build_forward_headers_for`]），体里不写字段就是「有 beta 没字段」——对 fable 而言
     // 恰是官方 2.1.260 之前的旧形态，且拒答时上游不会换模型重跑，开关等于没开。
     let may_need_schema_fix = flags.flatten_tool_schemas
-        && body.windows(5).any(|w| w == b"allOf" || w == b"oneOf" || w == b"anyOf");
-    let may_have_empty_text =
-        flags.strip_empty_text && body.windows(9).any(|w| w == b"\"text\":\"\"");
-    let may_have_system_role =
-        flags.hoist_system_role && body.windows(16).any(|w| w == b"\"role\":\"system\"");
+        && [b"allOf", b"oneOf", b"anyOf"].iter().any(|n| body_contains(body, *n));
+    let may_have_empty_text = flags.strip_empty_text && body_has_pair(body, b"\"text\"", b"\"\"");
+    // 体里出现过 `"role": "system"` 的一律解析：`hoist_system_role` 关着时提升那步不跑，但
+    // **空壳照丢**（[`drop_empty_system_messages`]，上游对它恒 400），所以这一项不挂在那个
+    // 开关上。键值之间的空白由 [`body_has_pair`] 容掉，缩进过的体不会从这里漏过去。
+    let has_system_role_msg = body_has_pair(body, b"\"role\"", b"\"system\"");
     if sim.is_none()
         && !shape
         && !flags.spoof_identity
@@ -9589,7 +9662,7 @@ fn rewrite_body(
         && tool_names.is_none()
         && !may_need_schema_fix
         && !may_have_empty_text
-        && !may_have_system_role
+        && !has_system_role_msg
         && fallbacks.is_none()
     {
         return body.clone();
@@ -9601,6 +9674,11 @@ fn rewrite_body(
         Ok(v) => v,
         Err(_) => return body.clone(),
     };
+    // 空壳 `role:"system"` 消息：一个内容块都没有的那种，上游恒 400
+    // （`messages.N: system content must contain at least one block`）。放在提升之前，
+    // 两条路都要过它——见 [`drop_empty_system_messages`] 里为什么不受 `hoist_system_role`
+    // 与 CC 形态那道豁免管。
+    let empty_system_dropped = drop_empty_system_messages(&mut v);
     // role:"system" 提升：litellm 等第三方客户端把 system 放在 messages 里，
     // 上游不支持该 role，提前挪到顶层 system 字段。必须在 simulate_system 之前——
     // 后者和 align_system_shape 都只读顶层 system。
@@ -9769,6 +9847,7 @@ fn rewrite_body(
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     tracing::debug!(
+        empty_system_dropped,
         system_hoisted,
         simulated,
         sys_relocated,
@@ -9801,7 +9880,8 @@ fn rewrite_body(
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
     );
-    if !system_hoisted
+    if !empty_system_dropped
+        && !system_hoisted
         && !shaped
         && !capped
         && !spoofed
@@ -11418,6 +11498,66 @@ fn empty_thinking_shape(blk: &serde_json::Value) -> String {
         Some(_) => "non-string",
     };
     format!("keys=[{}] sig_len={sig_len} thinking={thinking}", keys.join(","))
+}
+
+/// 丢掉 `content` 为**空壳**的 `role:"system"` 消息：空数组、空串、字段缺失或为 `null`、
+/// 以及整条只有空 `text` 块的。返回是否确有丢掉的。
+///
+/// 上游对这种消息恒回 400（`messages.N: system content must contain at least one block`；
+/// 全是空 text 块的那种是 `text content blocks must be non-empty`）。实跑里撞上它的是一条
+/// `claude-cli/2.1.270 (external, claude-vscode, agent-sdk/0.3.270)` 的正经 CC 请求
+/// （`req_grlwDAtQQpqvf54d`，透传、没走模拟）：官方在 `messages` 里合法使用 `role:"system"`
+/// （deferred tools），这次那条是个空壳。
+///
+/// **不受 `hoist_system_role` 开关与「CC 形态跳过」那道豁免管**，理由是两者的取舍在这里都不
+/// 成立：豁免是怕把官方合法的 `role:"system"` 提升掉、破坏形态，而空壳一个块都没有，不携带
+/// 任何语义，留着必是一次 400、丢掉什么也不丢；开关管的是「要不要替第三方客户端把 system
+/// 挪位置」，也与「上游必拒的形态」无关。只在上游本来就会拒的请求上动手，所以它不可能把一条
+/// 本来能过的请求改坏。
+///
+/// **只碰 `role:"system"`**：空 content 的 user / assistant 消息同样会被上游拒，但删掉它们会
+/// 改变轮次交替（末轮变成 assistant、整个 messages 变空……），那是另一回事，不在这里处理。
+fn drop_empty_system_messages(v: &mut serde_json::Value) -> bool {
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let total = msgs.len();
+    let mut dropped: Vec<String> = Vec::new();
+    let is_empty_shell = |msg: &serde_json::Value| {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+            return false;
+        }
+        match msg.get("content") {
+            // 字段缺失或写成 null。
+            None | Some(serde_json::Value::Null) => true,
+            // 空串。**不 trim**：一个空格在上游那边是合法的非空文本，判它为空就是替客户端
+            // 删掉一条它认为有内容的消息。
+            Some(serde_json::Value::String(s)) => s.is_empty(),
+            // 空数组，或整条只有空 `text` 块——后者 `strip_empty_text_blocks` 按约定不会去剥
+            // （剥完会变空），留下来同样是一次 400。
+            Some(serde_json::Value::Array(arr)) => arr.iter().all(|blk| {
+                blk.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && blk.get("text").and_then(|t| t.as_str()).is_some_and(str::is_empty)
+            }),
+            // 别的形态（对象、数字……）不是本函数的事，交给上游去说。
+            Some(_) => false,
+        }
+    };
+    for (i, msg) in msgs.iter().enumerate() {
+        if is_empty_shell(msg) {
+            dropped.push(format!("{i}/{total}"));
+        }
+    }
+    if dropped.is_empty() {
+        return false;
+    }
+    msgs.retain(|msg| !is_empty_shell(msg));
+    tracing::info!(
+        count = dropped.len(),
+        at = %dropped.join(", "),
+        "dropped empty role:\"system\" messages: upstream rejects a system message with no content blocks"
+    );
+    true
 }
 
 /// 把 `messages` 里 `role:"system"` 的消息提升到顶层 `system` 字段。
@@ -15800,6 +15940,182 @@ mod tests {
         });
         assert_eq!(find_openai_marker(Some(&body), false, true), None);
         assert_eq!(find_openai_marker(None, false, true), None);
+    }
+
+    /// 删掉空壳 system 消息之后，thinking 块的原始字节仍要落回**它自己**那一块。
+    ///
+    /// [`preserve_thinking_encoding`] 原先按 `(消息下标, 块下标)` 配对；一旦有整条消息被删
+    /// （空壳 system、role:"system" 提升）或消息内的块被剥（空 text / 无签名空 thinking），
+    /// 下标就会前移，A 块的原始字节会被盖到 B 块上——历史与签名一起错乱，上游按签名校验必拒。
+    /// 现在带 `signature` / `data` 的按那个值配，与下标无关。
+    #[test]
+    fn thinking_bytes_follow_their_own_block_when_messages_are_dropped() {
+        // 两条空壳 system 夹在两轮之间；两轮 thinking 的正文都带 \u003c 转义（serde 重新
+        // 序列化会解码成字面量 `<`，正是这套字节还原存在的理由）。
+        const A: &str = r#"{"type":"thinking","thinking":"A\u003cx\u003e","signature":"sigA=="}"#;
+        const B: &str = r#"{"type":"thinking","thinking":"B\u003cy\u003e","signature":"sigB=="}"#;
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","system":[{{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}}],"messages":[{{"role":"system","content":[]}},{{"role":"user","content":"hi"}},{{"role":"assistant","content":[{A},{{"type":"text","text":"a"}}]}},{{"role":"system","content":[]}},{{"role":"user","content":"more"}},{{"role":"assistant","content":[{B},{{"type":"text","text":"b"}}]}}]}}"#
+        ));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains(r#""role":"system""#), "空壳该被丢掉: {s}");
+        assert!(s.contains(A), "A 轮的原始字节该原样落回 A 块: {s}");
+        assert!(s.contains(B), "B 轮的原始字节该原样落回 B 块: {s}");
+        assert_eq!(s.matches("sigA==").count(), 1, "A 的签名不该被复制到第二轮: {s}");
+        assert_eq!(s.matches("sigB==").count(), 1, "B 的签名该还在: {s}");
+        assert_eq!(s.matches(r"A\u003cx").count(), 1, "A 的正文只该出现一次: {s}");
+    }
+
+    /// 空壳 system 的清理要能**自己撑起整条改写**：所有改写开关都关着时，入口的快速返回与
+    /// 末尾的「什么都没改就回原体」都不能把它漏掉——漏掉就是空壳照样出站、上游照样 400。
+    #[test]
+    fn dropping_an_empty_system_message_survives_both_early_returns() {
+        let flags = store::ForwardFlags {
+            system_shape: false,
+            spoof_identity: false,
+            billing_cch: false,
+            strip_extra_fields: false,
+            flatten_tool_schemas: false,
+            strip_empty_text: false,
+            // 提升那步关掉：空壳的清理不该挂在它身上。
+            hoist_system_role: false,
+            ..store::ForwardFlags::default()
+        };
+        let body = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"},{"role":"system","content":[]}]}"#,
+        );
+        let out = rewrite_body(&body, &test_cred(), "fp", flags, None, None);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains(r#""role":"system""#), "空壳该被丢掉: {s}");
+        assert!(s.contains(r#""content":"hi""#), "用户消息要留着: {s}");
+        // 反向：同一套开关下，没有空壳的体一个字节都不该动。
+        let clean =
+            Bytes::from(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(rewrite_body(&clean, &test_cred(), "fp", flags, None, None), clean);
+    }
+
+    /// 入口快速路径的粗筛容得下缩进：`"role": "system"`（键值之间有空白、还带换行）与紧凑写法
+    /// 一样要进解析路径，否则 pretty-print 过的体会带着空壳原样出站。
+    #[test]
+    fn the_fast_path_probe_tolerates_pretty_printed_json() {
+        let pair = |b: &str| super::body_has_pair(b.as_bytes(), b"\"role\"", b"\"system\"");
+        assert!(pair(r#"{"role":"system"}"#));
+        assert!(pair("{\"role\": \"system\"}"));
+        assert!(pair("{\n  \"role\"\t:\r\n    \"system\"\n}"));
+        assert!(!pair(r#"{"role":"user","system":"x"}"#), "别的键值对不算");
+        assert!(!pair(r#"{"role":"systematic"}"#), "值要整段对上：闭引号把它钉死，systematic 不算");
+        assert!(!pair(r#"{"role" "system"}"#), "缺冒号不算");
+        assert!(!pair(r#"{"rolex":"system"}"#), "键不是 role 不算");
+        assert!(!pair(r#"{"role":"#), "截断的体不算，也不能越界");
+
+        // 空 text 块那一项同样容空白。
+        let text = |b: &str| super::body_has_pair(b.as_bytes(), b"\"text\"", b"\"\"");
+        assert!(text(r#"{"text":""}"#));
+        assert!(text("{\"text\" : \"\"}"));
+        assert!(!text(r#"{"text":"x"}"#));
+
+        // 端到端：所有改写开关都关着 + 缩进过的体，空壳照样被丢掉。
+        let flags = store::ForwardFlags {
+            system_shape: false,
+            spoof_identity: false,
+            billing_cch: false,
+            strip_extra_fields: false,
+            flatten_tool_schemas: false,
+            strip_empty_text: false,
+            hoist_system_role: false,
+            ..store::ForwardFlags::default()
+        };
+        let pretty = Bytes::from(
+            "{\n  \"model\": \"claude-opus-5\",\n  \"messages\": [\n    \
+             {\"role\": \"user\", \"content\": \"hi\"},\n    \
+             {\"role\": \"system\", \"content\": []}\n  ]\n}",
+        );
+        let out = rewrite_body(&pretty, &test_cred(), "fp", flags, None, None);
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        assert!(!s.contains(r#""role":"system""#), "缩进过的体里的空壳也该被丢掉: {s}");
+        assert!(s.contains(r#""content":"hi""#), "用户消息要留着: {s}");
+    }
+
+    /// 空壳 `role:"system"` 消息在出站前被丢掉：五种空形态都算（空数组、空串、`null`、
+    /// 字段缺失、整条只有空 text 块），带内容的一字不动，别的角色一概不碰。
+    ///
+    /// 最后一段走完整条 `rewrite_body`：**CC 形态的请求同样会丢**——`hoist_system_role` 的
+    /// 「CC 形态跳过」保的是官方带内容的那条 `role:"system"`（deferred tools），不是空壳；
+    /// 实跑里正是一条 agent-sdk 的 CC 请求带着空壳换回一次 400（`req_grlwDAtQQpqvf54d`）。
+    #[test]
+    fn empty_system_messages_are_dropped_before_going_out() {
+        let sys = |content: Option<serde_json::Value>| match content {
+            Some(c) => serde_json::json!({ "role": "system", "content": c }),
+            None => serde_json::json!({ "role": "system" }),
+        };
+        let user = serde_json::json!({ "role": "user", "content": "hi" });
+
+        // 五种空形态，逐个单独验：丢掉之后只剩那条用户消息。
+        for content in [
+            Some(serde_json::json!([])),
+            Some(serde_json::json!("")),
+            Some(serde_json::Value::Null),
+            None,
+            Some(
+                serde_json::json!([{ "type": "text", "text": "" }, { "type": "text", "text": "" }]),
+            ),
+        ] {
+            let mut v = serde_json::json!({ "messages": [user.clone(), sys(content.clone())] });
+            assert!(super::drop_empty_system_messages(&mut v), "这条该算空壳: {content:?}");
+            assert_eq!(v["messages"], serde_json::json!([user.clone()]));
+        }
+
+        // 带内容的一律不动：官方 deferred tools 那条、空格、数组里混着一个非空块。
+        for content in [
+            serde_json::json!("deferred"),
+            serde_json::json!(" "),
+            serde_json::json!([{ "type": "text", "text": "x" }]),
+            serde_json::json!([{ "type": "text", "text": "" }, { "type": "text", "text": "x" }]),
+            serde_json::json!({ "type": "text", "text": "" }),
+        ] {
+            let mut v = serde_json::json!({ "messages": [sys(Some(content.clone()))] });
+            assert!(!super::drop_empty_system_messages(&mut v), "这条不该算空壳: {content}");
+            assert_eq!(v["messages"], serde_json::json!([sys(Some(content))]));
+        }
+
+        // 只碰 role:"system"：空 content 的 user / assistant 留着（删了会改轮次交替）。
+        let mut v = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": [] },
+                { "role": "assistant", "content": [] },
+            ]
+        });
+        assert!(!super::drop_empty_system_messages(&mut v));
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+
+        // 多条空壳一起丢，其余消息的相对顺序不变；没有 messages 的体不动。
+        let mut v = serde_json::json!({
+            "messages": [sys(Some(serde_json::json!([]))), user.clone(), sys(None), user.clone()]
+        });
+        assert!(super::drop_empty_system_messages(&mut v));
+        assert_eq!(v["messages"], serde_json::json!([user.clone(), user.clone()]));
+        let mut v = serde_json::json!({ "model": "claude-opus-5" });
+        assert!(!super::drop_empty_system_messages(&mut v));
+
+        // 整条 rewrite_body：CC 形态（system 里有身份句）的请求，空壳照丢。
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "claude-opus-5",
+                "messages": [user.clone(), sys(Some(serde_json::json!([]))), user.clone()],
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                }],
+            })
+            .to_string(),
+        );
+        let out: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", all_on(), None, None))
+                .unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "空壳该被丢掉: {out}");
+        assert!(msgs.iter().all(|m| m["role"] == "user"), "留下的必须是那两条用户消息: {out}");
     }
 
     #[test]
