@@ -137,7 +137,8 @@ struct RequestLogState {
     /// 若在外层再解析一遍，就是给任何人一个白烧 CPU 的入口；解析过的那些也不必解析第二遍。
     parsed: parking_lot::Mutex<Option<ParsedRequestBits>>,
     /// 这条请求在本地以 **200** 收尾、没到上游：回放了学到的上游拒答（按提示词学的
-    /// [`REWRITE_REFUSAL_REPLAY`]，或按应用学的 [`REWRITE_APP_REFUSAL_REPLAY`]）。[`handle`]
+    /// [`REWRITE_REFUSAL_REPLAY`]，或按应用学的 [`REWRITE_APP_REFUSAL_REPLAY`]），或是探针
+    /// 命中后本地作答的那条最小回复（[`REWRITE_PROBE_REPLY`]）。[`handle`]
     /// 只给 4xx/5xx 补本地流水，
     /// 这类 200 若不标出来就从流水、请求查询与统计里消失——0.3.98 把本地 403 改成回放 200
     /// 时正是这样漏掉的。有标签的按本地流水补一条：无凭证、无用量、花费 0、`rewrites` 记标签。
@@ -148,6 +149,9 @@ struct RequestLogState {
 const REWRITE_REFUSAL_REPLAY: &str = "refusal_replay";
 /// 流水 `rewrites` 里标「本地回放了按应用学到的上游拒答」（[`known_app_refusal`] 命中）。
 const REWRITE_APP_REFUSAL_REPLAY: &str = "app_refusal_replay";
+/// 流水 `rewrites` 里标「探针命中，本地回了一条最小的 200」（[`probe_signature`] 命中、
+/// [`probe_reply`] 作答）。
+const REWRITE_PROBE_REPLY: &str = "probe_reply";
 
 /// 从来访体里读出的、流水要用的三样。见 [`RequestLogState::parsed`]。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -536,13 +540,75 @@ async fn handle_inner(
         );
     }
 
+    // 请求的模型名：好几处都要用它——本地形态拦截按模型索引，选号的冷却也按
+    // 「账号 + 模型」分格（fable 那类模型级 429 不该拖累整个账号），本地作答那条回的也是它。
+    let req_model = request_model(body_json.as_ref());
+    // 这条请求的会话 id（头优先、body 兜底）：选号失败与本地拒绝那几条日志的抑制键，
+    // 在没有设备身份时要拿它来分桶；每会话限流在 2.2b / 2.2c 用的也是它。
+    let session_id = match &session_from_header {
+        Some(sid) => Some(sid.clone()),
+        None => extract_session_id(body_json.as_ref()),
+    };
+
     // 2.1) 这条路径是否消耗订阅额度——决定要不要卡设备身份、要不要改写出站体。
     //      判定吃 `uri.path()` 而非上面那个带查询串的 `path_and_query`：豁免要精确匹配。
     let billable = is_billable_messages(uri.path());
 
+    // 2.1a) 探针类请求 → **本地回一条最小的正常回复**（200，见 [`probe_reply`]），不到上游，
+    //       见 [`probe_signature`]。身份写错的不在这里拒，由 [`Simulation::detect`] 送进模拟
+    //       重建身份。
+    //       **位置有意排在下面 2.2 的设备身份闸之前**：探活多半根本不带 `metadata.user_id`
+    //       （封号复盘里 Go-http-client 那批就是），而 `require_device_id` 默认开着、会先回一条
+    //       403——那正是下游把整个 key 摘下去的信号，这一版要修的就是它。排在这里也意味着探针
+    //       不占每会话 RPM 与并发名额（2.2b / 2.2c）：它根本不出站。
+    //       0.3.101 之前回的是 403 permission_error：探活恰恰是下游中转用来判断「这个号还能
+    //       不能用」的那条请求，luban 的 403 在它那侧与「号被封了」长得一样，整个 key 被摘下
+    //       去、真流量跟着停——而这条请求根本没到上游、账号一点事没有。回 200 后探活看到的是
+    //       「健康」，上游那边一条请求都没多。是 luban 就地答的、没到上游这件事标在三处：
+    //       响应头 `x-luban-local: probe_reply` 与 `x-luban-probe-kind: <判据>`、Message id 的
+    //       `msg_luban` 前缀、以及流水里的 `probe_reply` 标签（花费 0）。
+    //       下游中转的探活脚本发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个
+    //       一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与身份上的强特征，
+    //       一条就够判，不做计数。**不限 UA**（0.3.99 起）：此前只判自报 claude-cli 的，
+    //       Go-http-client 的探活反而走模拟、被装成官方形态发了出去。只判计费路径；
+    //       `reject_probes` 关掉即放行。
+    if billable
+        && state.store.forward_flags().reject_probes
+        && let Some(kind) = probe_signature(
+            body_json.as_ref(),
+            device_id.as_deref(),
+            &inbound_beta_list(&headers),
+            state.store.forward_flags().reject_probes_strict,
+            || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
+        )
+    {
+        // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
+        // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。
+        let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
+        if let Some(suppressed) =
+            take_rejection_log_slot(&state.rejection_log, &format!("probe:{}:{who}", kind.tag()))
+        {
+            let device_short: String = who.chars().take(8).collect();
+            tracing::warn!(
+                %method, path = %path_and_query, ua = %client_ua,
+                model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
+                kind = kind.tag(), from_cc_client, suppressed, reason = kind.message(),
+                "not forwarded: request matches a probe / health-check signature; answered locally with a minimal 200"
+            );
+        }
+        *log_state.local_replay.lock() = Some(REWRITE_PROBE_REPLY);
+        return probe_reply(
+            kind,
+            req_model.as_deref(),
+            body_json.as_ref().is_some_and(stream_requested),
+        );
+    }
+
     // 2.2) 无有效设备身份（无 metadata / 无法识别的 user_id 格式）→ 计费路径默认直接拒绝：
     //      这类请求既无法做身份伪装、也无从计入设备上限（会绕过 device_limit）。
     //      网页可关掉该校验（放行裸客户端），此时它们退化为不绑定、不占名额的负载均衡挑选。
+    //      不带身份的**探针**到不了这里：它在 2.1a 就被就地答掉了——这道闸回的 403 与「号被封了」
+    //      在下游那侧长得一样，探活撞上它整个 key 就被摘下去。
     if device_id.is_none() {
         if billable && state.store.require_device_id() {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
@@ -558,12 +624,7 @@ async fn handle_inner(
     // 2.2b) 每会话 RPM 上限（body 这一路）：头上没带会话 id，但 `metadata.user_id` 里有。
     //       只在头那路没判过时才判（`session_from_header.is_none()`），否则同一条请求会吃掉
     //       两个名额——官方两处同值，那等于把上限砍半。
-    //       顺带把会话 id 定下来（头优先、body 兜底）：下面选号失败那条日志的抑制键，
-    //       在没有设备身份时要拿它来分桶。
-    let session_id = match &session_from_header {
-        Some(sid) => Some(sid.clone()),
-        None => extract_session_id(body_json.as_ref()),
-    };
+    //       会话 id（头优先、body 兜底）在上面 2.1 就定下来了。
     if session_from_header.is_none()
         && let Some(sid) = session_id.as_deref()
         && let Some(retry) = state.store.take_session_rpm_slot(sid)
@@ -599,10 +660,6 @@ async fn handle_inner(
             }
         }
     }
-
-    // 请求的模型名：下面两处都要用它——本地形态拦截按模型索引，选号的冷却也按
-    // 「账号 + 模型」分格（fable 那类模型级 429 不该拖累整个账号）。
-    let req_model = request_model(body_json.as_ref());
 
     // 这条请求声明的输出上限。只为日志：裸 429 那一档要拿它对上游那套「每分钟输出 token」
     // 限额，见 [`UpstreamLoad`]。算在这里是因为 `body_json` 只解析一次（见上面 2 那段），
@@ -702,40 +759,6 @@ async fn handle_inner(
                  (disable reject_session_conflict to fall back to the header)"
             ),
         );
-    }
-
-    // 2.3a3) 探针类请求 → 本地直接拒（403），不到上游，见 [`probe_signature`]。身份写错的
-    //        不在这里拒，由 [`Simulation::detect`] 送进模拟重建身份。
-    //        下游中转的探活脚本发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个
-    //        一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与身份上的强特征，
-    //        一条就够判，不做计数。**不限 UA**（0.3.99 起）：此前只判自报 claude-cli 的，
-    //        Go-http-client 的探活反而走模拟、被装成官方形态发了出去。只判计费路径；
-    //        `reject_probes` 关掉即放行。
-    if billable
-        && state.store.forward_flags().reject_probes
-        && let Some(kind) = probe_signature(
-            body_json.as_ref(),
-            device_id.as_deref(),
-            &inbound_beta_list(&headers),
-            state.store.forward_flags().reject_probes_strict,
-            || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
-        )
-    {
-        // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
-        // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。
-        let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
-        if let Some(suppressed) =
-            take_rejection_log_slot(&state.rejection_log, &format!("probe:{}:{who}", kind.tag()))
-        {
-            let device_short: String = who.chars().take(8).collect();
-            tracing::warn!(
-                %method, path = %path_and_query, ua = %client_ua,
-                model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
-                kind = kind.tag(), from_cc_client, suppressed,
-                "rejected locally: request matches a probe / health-check signature"
-            );
-        }
-        return error_response(StatusCode::FORBIDDEN, "permission_error", kind.message());
     }
 
     // 2.3a4) 上游分类器拒答过的提示词（同一模型、system + messages + tools + tool_choice 逐字
@@ -6891,7 +6914,8 @@ impl ProbeKind {
         }
     }
 
-    /// 回给客户端的错误消息。
+    /// 进日志的原因说明：拦的是哪一条判据。0.3.101 起探针回的是一条正常的 200
+    /// （[`probe_reply`]），这段话不再进响应体——探活看到的是「健康」，看不出被拦过。
     fn message(self) -> &'static str {
         match self {
             Self::Ping => {
@@ -8464,6 +8488,70 @@ fn replay_refusal(reply: &store::LearnedReply, wants_stream: bool) -> Option<Res
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(body))
         .ok()
+}
+
+/// 探针命中时本地回给客户端的正文（[`probe_reply`]）。探活脚本只看状态码与「有没有回话」，
+/// 一个字就够；严格模式下被短开场判据拦住的真人看到的也是它，下一句正常长度的话照常放行。
+const PROBE_REPLY_TEXT: &str = "OK";
+
+/// 「这条是 luban 就地答的、没到上游」的标记头，值是流水里的那个标签（[`REWRITE_PROBE_REPLY`]）。
+/// 上游不会回这个头，所以它在抓包、下游面板与自己的日志里都是确定的证据；放在头上而不是体里，
+/// 是因为探活只看状态码与正文，头不影响它把这个号判成健康的。
+const LOCAL_REPLY_HEADER: &str = "x-luban-local";
+/// 本地作答那条命中的是哪一条探针判据（[`ProbeKind::tag`]），与日志行里的 `kind` 同一个值。
+const PROBE_KIND_HEADER: &str = "x-luban-probe-kind";
+/// 本地作答那条 Message 的 id 前缀：`msg_luban` + 随机串。官方的是 `msg_01…`，这里一眼能认出
+/// 来——下游面板与流水多半只记 id，正文未必留得下。
+const PROBE_REPLY_ID_PREFIX: &str = "msg_luban";
+
+/// 探针 / 探活请求的本地回复：**200 + 一条最小的正常回复**，不到上游。
+///
+/// 按来访要的形态给：要流式就把这条 Message 展成 SSE（[`message_to_sse`]，与回放学到的拒答
+/// 同一套），否则整段 JSON。`model` 原样回来访声明的那个（没写就留空——那种请求上游本会回
+/// 400，这里不替它编一个）；`usage` 记名义上的 1 进 1 出，流水里的花费记 0（见
+/// [`REWRITE_PROBE_REPLY`]）。为什么不回 403，见调用处 2.3a3 的说明。
+///
+/// **标出来是 luban 答的**：响应头 [`LOCAL_REPLY_HEADER`] + [`PROBE_KIND_HEADER`]，Message id 用
+/// [`PROBE_REPLY_ID_PREFIX`] 前缀（流式那条在 `message_start` 里同样带着）。三处都在正文的语义
+/// 之外——探活读到的仍是一条正常回复，而抓包、下游面板与自己的流水里这条认得出来、不会被当成
+/// 上游真答过一次。
+fn probe_reply(kind: ProbeKind, model: Option<&str>, wants_stream: bool) -> Response {
+    use rand::distr::Alphanumeric;
+    let tail: String = rand::rng().sample_iter(Alphanumeric).take(16).map(char::from).collect();
+    let msg = serde_json::json!({
+        "id": format!("{PROBE_REPLY_ID_PREFIX}{tail}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model.unwrap_or_default(),
+        "content": [{ "type": "text", "text": PROBE_REPLY_TEXT }],
+        "stop_reason": "end_turn",
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+    });
+    // 展不成 SSE 只可能是上面这段字面量被改坏了（没有 `content` 数组）；真走到那一步宁可回
+    // 整段 JSON，也不回一段拼不齐的流。
+    let (content_type, body) = match wants_stream.then(|| message_to_sse(&msg)).flatten() {
+        Some(sse) => (SSE_CONTENT_TYPE, sse.into_bytes()),
+        None => ("application/json", serde_json::to_vec(&msg).unwrap_or_default()),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(LOCAL_REPLY_HEADER, REWRITE_PROBE_REPLY)
+        .header(PROBE_KIND_HEADER, kind.tag())
+        .body(Body::from(body))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "failed to build the local probe reply",
+            )
+        })
 }
 
 /// 把一条整段 Message 展成 `/v1/messages` 的 SSE 事件流（[`SseAggregator`] 的逆操作）：
@@ -16654,6 +16742,176 @@ mod tests {
             !super::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&no_temp)),
             "请求里没带那个字段就不算"
         );
+    }
+
+    /// 不带设备身份的探活走**整条 [`handle`]**：拿到的是本地那条 200（而不是设备身份闸的
+    /// 403），头上带标记、体是一条正常回复，并且流水里落了一条标 `probe_reply`、花费 0、
+    /// 没有凭证的本地记录。
+    ///
+    /// 守的是两件真出过问题的事：一、`require_device_id` 默认开着，不带 `metadata.user_id` 的
+    /// 计费请求在 2.2 就是一条 403，而封号复盘里 Go-http-client 那批探活恰恰不带身份、探针判据
+    /// 也明确允许 `device_id` 为 `None`——两段一旦调了个个儿，这类探活又会拿到 403，下游照旧把
+    /// 整个 key 摘下去；二、本地以 200 收尾的请求不标 `local_replay` 就会从流水、请求查询与
+    /// 统计里整个消失（0.3.98 把本地 403 改成回放 200 时正是这样漏掉的）。
+    #[tokio::test]
+    async fn a_device_less_probe_is_answered_locally_and_logged() {
+        let store = std::sync::Arc::new(store::CredentialStore::open_in_memory().unwrap());
+        assert!(store.require_device_id(), "这条用例的前提是设备身份闸开着");
+        assert!(store.forward_flags().reject_probes, "这条用例的前提是探针开关开着");
+        let state = crate::web::AppState::for_test(store.clone());
+
+        // 复盘里那批 Go-http-client 探活的形态：没有 metadata（即没有 device_id）、没有 system、
+        // 没有 tools、一条消息、max_tokens 8。
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": "ping" }],
+        });
+        let mut headers = super::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+        let resp = super::handle(
+            axum::extract::State(state),
+            axum::http::Method::POST,
+            "/v1/messages".parse::<axum::http::Uri>().unwrap(),
+            headers,
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "设备身份闸不该抢在探针前面回一条 403");
+        assert_eq!(resp.headers().get(super::LOCAL_REPLY_HEADER).unwrap(), "probe_reply");
+        assert_eq!(resp.headers().get(super::PROBE_KIND_HEADER).unwrap(), "ping");
+        assert!(resp.headers().get("x-request-id").is_some(), "本地作答也要带请求 id");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let msg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(msg["content"][0]["text"], super::PROBE_REPLY_TEXT);
+        assert_eq!(msg["model"], "claude-opus-5");
+        assert!(msg["id"].as_str().unwrap().starts_with(super::PROBE_REPLY_ID_PREFIX));
+
+        // 流水是 `spawn_blocking` 写的，等它落下来（最多 2 秒，正常几毫秒）。
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = store.list_usage_logs(10).unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows.len(), 1, "本地以 200 收尾的探针也要进流水");
+        let row = &rows[0];
+        assert_eq!(row.status, 200);
+        assert_eq!(row.path, "/v1/messages");
+        assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(row.forensics.rewrites.as_deref(), Some(super::REWRITE_PROBE_REPLY));
+        assert_eq!(row.cost_usd, Some(0.0));
+        assert_eq!(row.cred_id, None, "没到上游，不该挂在任何账号上");
+        assert!(!row.has_usage, "没到上游，没有用量");
+    }
+
+    /// 开关关掉之后同一条探活照常往下走（走到没有可用账号那步），确认上面那条 200 是
+    /// `reject_probes` 给的，而不是别的什么早退路径顺手回的。
+    #[tokio::test]
+    async fn the_same_probe_goes_on_when_the_switch_is_off() {
+        let store = std::sync::Arc::new(store::CredentialStore::open_in_memory().unwrap());
+        // `"0"` / `"false"` 才算关，别的取值一律算开，见 `store::setting_is_on`。
+        store.set_setting(store::REJECT_PROBES, "0").unwrap();
+        store.set_setting(store::REQUIRE_DEVICE_ID, "0").unwrap();
+        let state = crate::web::AppState::for_test(store.clone());
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": "ping" }],
+        });
+        let mut headers = super::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+        let resp = super::handle(
+            axum::extract::State(state),
+            axum::http::Method::POST,
+            "/v1/messages".parse::<axum::http::Uri>().unwrap(),
+            headers,
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        // 关掉之后这条探活照常往下走，最终停在「没有可用账号」那一步（本地库里一个号都没有），
+        // 而不是由 2.1a 就地作答。
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(super::LOCAL_REPLY_HEADER).is_none());
+    }
+
+    /// 探针命中时本地回的那条：200 + 一条最小的正常回复，按来访要的形态给（非流式整段 JSON、
+    /// 流式展成 SSE 且能原样聚合回来），model 原样回来访声明的那个、没写就留空，正文里不带
+    /// 任何「被拦了」的痕迹——探活看到的必须是「健康」。是 luban 就地答的这件事标在头上
+    /// （`x-luban-local` / `x-luban-probe-kind`）与 Message id 的 `msg_luban` 前缀里。
+    #[tokio::test]
+    async fn probe_reply_is_a_minimal_200_in_the_shape_the_request_asks_for() {
+        async fn parts(resp: super::Response) -> (StatusCode, axum::http::HeaderMap, String) {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+            (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+
+        // 非流式：整段 Message，字段齐全、状态 200。
+        let (status, headers, body) =
+            parts(super::probe_reply(super::ProbeKind::Ping, Some("claude-opus-5"), false)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        // 标记：这条是 luban 就地答的、命中的是哪条判据。
+        assert_eq!(headers.get(super::LOCAL_REPLY_HEADER).unwrap(), super::REWRITE_PROBE_REPLY);
+        assert_eq!(headers.get(super::PROBE_KIND_HEADER).unwrap(), "ping");
+        let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["type"], "message");
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["model"], "claude-opus-5");
+        assert_eq!(msg["stop_reason"], "end_turn");
+        assert_eq!(msg["content"][0]["type"], "text");
+        assert_eq!(msg["content"][0]["text"], super::PROBE_REPLY_TEXT);
+        assert_eq!(msg["usage"]["output_tokens"], 1);
+        assert!(
+            msg["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(super::PROBE_REPLY_ID_PREFIX) && id.len() > 16),
+            "id 要一眼认得出是本地答的：{body}"
+        );
+        // 正文里除了 id 的前缀不留别的痕迹：探活读到的必须是一条正常回复。
+        let without_id = body.replace(msg["id"].as_str().unwrap(), "");
+        for word in ["probe", "health", "forward", "luban", "403"] {
+            assert!(!without_id.contains(word), "本地回复不该露出被拦的痕迹：{word} in {body}");
+        }
+        // 两条的 id 不同：探活一条接一条，同一个 id 在下游那侧会被当成同一条回复。
+        let (_, _, again) =
+            parts(super::probe_reply(super::ProbeKind::Ping, Some("claude-opus-5"), false)).await;
+        let msg2: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert_ne!(msg["id"], msg2["id"]);
+
+        // 流式：展成 SSE，再聚合回来是同一条 Message。
+        let (status, headers, body) =
+            parts(super::probe_reply(super::ProbeKind::ShortOpener, Some("claude-opus-5"), true))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), super::SSE_CONTENT_TYPE);
+        assert_eq!(headers.get(super::LOCAL_REPLY_HEADER).unwrap(), super::REWRITE_PROBE_REPLY);
+        assert_eq!(headers.get(super::PROBE_KIND_HEADER).unwrap(), "short-opener");
+        assert!(body.starts_with("event: message_start\n"), "{body}");
+        assert!(
+            body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            "{body}"
+        );
+        let mut agg = super::SseAggregator::default();
+        agg.feed(body.as_bytes());
+        let super::Aggregated::Message(back) = agg.finish() else {
+            panic!("本地回复的 SSE 应能聚合")
+        };
+        assert_eq!(back["content"][0]["text"], super::PROBE_REPLY_TEXT);
+        assert_eq!(back["stop_reason"], "end_turn");
+
+        // 来访没写 model：留空，不替它编一个。
+        let (_, _, body) =
+            parts(super::probe_reply(super::ProbeKind::DuplicateIdentity, None, false)).await;
+        let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["model"], "");
     }
 
     /// 学到拒答时上游那次的原样体（SSE 或整段 JSON），按来访这次要的形态回放：形态一致逐字节

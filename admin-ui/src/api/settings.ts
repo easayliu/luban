@@ -91,7 +91,7 @@ export interface Settings {
   reject_openai_shape: boolean
   /** 会话 id 在请求头与 metadata 两处不一致时本地拒绝，不替客户端选一个。 */
   reject_session_conflict: boolean
-  /** 本地拒绝探针 / 探活类请求（403），不转发；不限 UA。 */
+  /** 本地就地回答探针 / 探活类请求（200 + 一句「OK」，头上标 x-luban-local: probe_reply、id 以 msg_luban 开头、流水标 probe_reply 花费 0），不转发；不限 UA。 */
   reject_probes: boolean
   /** 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据（无 system、无 tools、一条不超过 32 字节、中文约十个字的用户消息）。默认关。 */
   reject_probes_strict: boolean

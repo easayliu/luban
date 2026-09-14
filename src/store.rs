@@ -2577,7 +2577,8 @@ pub const REJECT_SESSION_CONFLICT: &str = "reject_session_conflict";
 /// 却是无 tools 的单条小消息、`max_tokens` 只有个位数、或身份句在 system 里重复）。身份字段
 /// 写错的不算探针、不在这里拒，由模拟路径重建身份。
 /// 这些请求每一条都是上游侧「一台设备开一个一次性会话只问一句话」的记录，真实用户从不产生，
-/// 是封号复盘里最显眼的判据。开着即 403 挡在门口；关掉则照常转发。只管形态判据这一件事：
+/// 是封号复盘里最显眼的判据。开着即在门口就地回一条最小的正常回复（200 + 一句「OK」，
+/// 0.3.101 之前是 403）；关掉则照常转发。只管形态判据这一件事：
 /// 从响应学来的两类规则（拒答提示词、零输出请求类）各有自己的开关，见 [`REJECT_REFUSALS`]
 /// 与 [`REJECT_EMPTY_REPLIES`]（0.3.93 之前三者共用这一个键，关掉探针就把学到的规则一起放行了）。
 /// 见 [`ForwardFlags::reject_probes`] 与 `proxy::probe_signature`。
@@ -2610,7 +2611,7 @@ pub const API_TELEMETRY: &str = "api_telemetry";
 pub const KEEPALIVE_TELEMETRY: &str = "keepalive_telemetry";
 
 /// 主线程 **fable 族**补不补服务端 refusal fallback（`fallbacks: [{"model":"claude-opus-5"}]`
-/// + `server-side-fallback` beta）的 settings 键名。缺省视为**关**：形态虽逐字取自官方
+/// 加 `server-side-fallback` beta）的 settings 键名。缺省视为**关**：形态虽逐字取自官方
 /// 2.1.260 抓包，但开着等于替用户决定「拒答就换 opus-5 作答」——作答模型、计价、约一小时的
 /// 粘连都随之改变，用户还看不到拒答本身；这该由用户自己拨开。
 /// 见 [`ForwardFlags::fable_refusal_fallback`]。
@@ -2850,8 +2851,9 @@ pub struct ForwardFlags {
     ///
     /// 关掉后退回「取头那个 + 打一条 warn」。见 [`crate::proxy::session_id_conflict`]。
     pub reject_session_conflict: bool,
-    /// 本地拒绝**探针类**请求（403），不转发。判据是一组只有探活脚本才会有的强特征，任一
-    /// 命中即拒，全部只对自报 CC UA 的请求生效，见 [`crate::proxy::probe_signature`]：
+    /// 本地就地回答**探针类**请求（200 + 一条最小的正常回复，见 `proxy::probe_reply`），
+    /// 不转发。判据是一组只有探活脚本才会有的强特征，任一命中即算，不限 UA，
+    /// 见 [`crate::proxy::probe_signature`]：
     /// - 带 system、没有 tools、只有一条消息、`max_tokens` 在 2..=16；
     /// - 带 system、没有 tools、只有一条消息、不是官方那两种无 tools 形态，且来自一台从没
     ///   见过的设备；
@@ -2863,6 +2865,12 @@ pub struct ForwardFlags {
     /// 四种无 tools 请求（cache 预热、Helper 子代理、标题生成、安全分类）按 system 结构 + beta
     /// 头 + body 取值逐项对、都在判据之外，见 `cap/` 抓包与 `proxy::probe_signature`。
     ///
+    /// 命中回的是 200 而不是 403（0.3.101 起）：探活正是下游中转判断「这个号还能不能用」的
+    /// 那条请求，luban 的 403 在它那侧与「号被封了」长得一样，整个 key 会被摘下去、真流量跟着
+    /// 停——而这条请求根本没到上游、账号一点事没有。本地作答的这条标得出来：响应头
+    /// `x-luban-local: probe_reply` 与 `x-luban-probe-kind: <判据>`、Message id 以 `msg_luban`
+    /// 开头、流水里标 `probe_reply` 且花费记 0。
+    ///
     /// 只管这三条形态判据。从响应学来的两类规则各有自己的开关（[`Self::reject_refusals`]、
     /// [`Self::reject_empty_replies`]）：三件事的依据、误伤面、该不该开都不一样，共用一个键
     /// 就没法单独关一件。默认开。
@@ -2872,7 +2880,8 @@ pub struct ForwardFlags {
     /// 「短开场」——无 system、无 tools、恰好一条不超过 32 字节（中文约十个字）的用户消息、`max_tokens != 1`
     /// （测活脚本的「hi」「ping」「test」）。覆盖封号复盘里默认判据放过去的那几批 Go-http-client
     /// 探活（4 个 tools + max_tokens 16；max_tokens 50 / 1024 / 32000 只问一句）。代价是真人用
-    /// 裸聊天客户端经中转站发的第一句「你好」也会被拒，故**默认关**。
+    /// 裸聊天客户端经中转站发的第一句「你好」也会被拦下、收到探活那条一样的「OK」，
+    /// 故**默认关**。
     pub reject_probes_strict: bool,
     /// 是否本地拦下 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
     /// 见 `proxy::known_refused_prompt`）——拦下时**原样回放上游那次的响应**（200 + 同一段

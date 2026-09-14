@@ -220,6 +220,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('本地回放已学到的上游拒答，未转发', 'Replayed a learned upstream refusal locally, not forwarded')
     case 'app_refusal_replay':
       return t('本地回放按应用学到的上游拒答，未转发', 'Replayed a learned app-level upstream refusal locally, not forwarded')
+    case 'probe_reply':
+      return t('探针命中，本地回了一条最小的 200，未转发', 'Probe signature matched, answered locally with a minimal 200, not forwarded')
     case 'upstream_401':
       return t('上游 401，未能换号', 'Upstream 401, no account to swap to')
     case 'model_unsupported':
@@ -256,7 +258,7 @@ function ForensicTags({ log }: { log: UsageLog }) {
       {tags.map((tag) => (
         <Badge
           key={tag}
-          variant={tag === 'rejected_locally' || tag === 'refusal_replay' || tag === 'app_refusal_replay' ? 'secondary' : 'outline'}
+          variant={tag === 'rejected_locally' || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
           size="sm"
           title={tag}
         >

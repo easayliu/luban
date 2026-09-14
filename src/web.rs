@@ -88,6 +88,35 @@ pub struct AppState {
     pub telemetry: crate::telemetry::Telemetry,
 }
 
+impl AppState {
+    /// 测试用的最小状态：给定（内存）库，其余字段全取默认。
+    ///
+    /// `pkce` 是私有字段，crate 内别处的测试自己拼不出 [`AppState`]，而转发路径
+    /// （[`crate::proxy::handle`]）的端到端用例要的正是一份能跑的状态。不出网——
+    /// [`crate::clients::ClientPool::new`] 只是把出站客户端建起来。
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Arc<CredentialStore>) -> Self {
+        Self {
+            clients: std::sync::Arc::new(
+                crate::clients::ClientPool::new().expect("测试用的出站客户端池建不起来"),
+            ),
+            pkce: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            store,
+            client_key: None,
+            admin_env: None,
+            shape_rejections: Arc::default(),
+            deprecated_fields: Arc::default(),
+            empty_replies: Arc::default(),
+            rejection_log: Arc::default(),
+            transient_backoff: Arc::default(),
+            upstream_load: Arc::default(),
+            session_concurrency: Arc::default(),
+            in_flight: Arc::default(),
+            telemetry: Default::default(),
+        }
+    }
+}
+
 type ApiError = (StatusCode, String);
 
 /// 启动网页服务 + 转发代理，绑定 `host:port`，可选自动打开浏览器。
@@ -2055,11 +2084,12 @@ struct ForwardingResp {
     reject_openai_shape: bool,
     /// 会话 id 头体不一致时本地拒绝，不替客户端选一个。
     reject_session_conflict: bool,
-    /// 本地拒绝探针 / 探活类请求（403），不转发。
+    /// 本地就地回答探针 / 探活类请求（200 + 一句「OK」，头上标 x-luban-local），不转发。
     reject_probes: bool,
     /// 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据。默认关。
     reject_probes_strict: bool,
-    /// 本地拒绝上游分类器已拒答过的那条提示词的逐字重发（403）；出站带 fallbacks 的不拦。
+    /// 本地拦下上游分类器已拒答过的那条提示词的逐字重发，原样回放上游那次的响应（200）；
+    /// 出站带 fallbacks 的不拦。
     reject_refusals: bool,
     /// 本地拒绝上游回过 200 却零输出的请求类（403）。
     reject_empty_replies: bool,
