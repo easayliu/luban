@@ -9,11 +9,33 @@ pub(super) struct OpenAiMarker {
     pub(super) kind: &'static str,
     /// 给客户端那句话的主体（不含路径前缀）。
     reason: String,
+    /// 触发这条判据的那个值的**截短**摘录，只在值本身就是证据时给（目前只有
+    /// `tool_call_id`：`location` 与 `kind` 说得出「哪个 id 触发的」，说不出「它长什么样」，
+    /// 而分辨「真是 OpenAI 转换器回填的」还是「某个客户端自己就这么发 id」只能看这个）。
+    /// 其余类别留 `None`——那些的 `kind` 已经把形态说尽了。见 [`SAMPLE_CAP`]。
+    pub(super) sample: Option<String>,
+}
+
+/// 摘录进日志的字符数上限。id 不是机密，但没必要整条打；`call_` 之后那几位足够看出
+/// 生成器的形态（OpenAI 是 `call_` + 24 位字母数字）。
+const SAMPLE_CAP: usize = 16;
+
+fn sample_of(v: &str) -> String {
+    match v.char_indices().nth(SAMPLE_CAP) {
+        Some((at, _)) => format!("{}…", &v[..at]),
+        None => v.to_string(),
+    }
 }
 
 impl OpenAiMarker {
     fn new(location: String, kind: &'static str, reason: impl Into<String>) -> Self {
-        Self { location, kind, reason: reason.into() }
+        Self { location, kind, reason: reason.into(), sample: None }
+    }
+
+    /// 带上触发值的摘录，见 [`Self::sample`]。
+    fn with_sample(mut self, value: &str) -> Self {
+        self.sample = Some(sample_of(value));
+        self
     }
 
     /// 回给客户端的 `error.message`：路径 + 原因 + 一句总括，让它知道该修客户端而不是换号重试。
@@ -176,17 +198,18 @@ pub(super) fn find_openai_marker(
                         _ => None,
                     };
                     if let Some(k) = id_key
-                        && block
-                            .get(k)
-                            .and_then(|i| i.as_str())
-                            .is_some_and(|i| i.starts_with("call_"))
+                        && let Some(id) =
+                            block.get(k).and_then(|i| i.as_str()).filter(|i| i.starts_with("call_"))
                     {
-                        return Some(OpenAiMarker::new(
-                            format!("{loc}.{k}"),
-                            "tool_call_id",
-                            "tool call id starts with 'call_', the OpenAI tool_calls id form; \
-                             Anthropic tool_use ids are issued by the API as 'toolu_...'",
-                        ));
+                        return Some(
+                            OpenAiMarker::new(
+                                format!("{loc}.{k}"),
+                                "tool_call_id",
+                                "tool call id starts with 'call_', the OpenAI tool_calls id form; \
+                                 Anthropic tool_use ids are issued by the API as 'toolu_...'",
+                            )
+                            .with_sample(id),
+                        );
                     }
                 }
                 // tool_result 内嵌的 content 数组也要扫。
@@ -424,6 +447,28 @@ mod tests {
                 {"type": "tool_use", "id": "call_1", "name": "f", "input": {}}
             ]}]
         });
-        assert_eq!(find_openai_marker(Some(&body), true, true).unwrap().kind, "tool_call_id");
+        let m = find_openai_marker(Some(&body), true, true).unwrap();
+        assert_eq!(m.kind, "tool_call_id");
+        // CC 形态照拒——判据没放宽，只是把证据留进日志。
+        assert_eq!(m.sample.as_deref(), Some("call_1"), "触发值要能进日志");
+    }
+
+    /// 摘录封顶：id 不是机密，但没必要整条进日志；`call_` 之后那几位足够看出生成器的形态。
+    #[test]
+    fn the_tool_call_id_sample_is_capped() {
+        let long = format!("call_{}", "a".repeat(40));
+        let body = serde_json::json!({"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": long, "name": "f", "input": {}}
+        ]}]});
+        let m = find_openai_marker(Some(&body), false, true).unwrap();
+        let sample = m.sample.expect("该带摘录");
+        assert!(sample.starts_with("call_aaaaaaaaaaa"), "{sample}");
+        assert!(sample.ends_with('…'), "截断了就该带省略号: {sample}");
+        assert_eq!(sample.chars().count(), 17, "16 个字符 + 省略号");
+        // 其余类别不带摘录：它们的 kind 已经把形态说尽了。
+        let img = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x"}}
+        ]}]});
+        assert_eq!(find_openai_marker(Some(&img), false, false).unwrap().sample, None);
     }
 }

@@ -45,8 +45,8 @@ use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
     block_site, error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
-    is_thinking_modified_error, is_thinking_signature_error, retry_demoted_thinking,
-    retry_without_prefill, thinking_block_error_kind, trace_thinking_block,
+    is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
+    retry_demoted_thinking, retry_without_prefill, thinking_block_error_kind, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
@@ -410,9 +410,15 @@ pub(super) async fn handle_inner(
     //       模拟路径不受影响：它只接管**本来就是 Anthropic 形态**的非 CC 请求。
     let reject_openai_shape = state.store.forward_flags().reject_openai_shape;
     if let Some(marker) = find_openai_marker(body_json.as_ref(), cc_shaped, reject_openai_shape) {
+        // `cc_shaped` 与 `value` 是这条拒绝**唯一**能被复核的两项：判据只认形态，而同一条
+        // `tool_call_id` 既可能是转换器回填的真残留，也可能是个自报 CC、历史却经过转换器的
+        // 客户端。没有这两项，事后只能看见「拒了一条」，看不出拒得对不对。
+        // 拒绝本身不受它们影响——判据与开关都没变，这里只是把证据留下。
         tracing::warn!(
             %method, path = %path_and_query, ua = %client_ua,
             location = %marker.location, kind = %marker.kind,
+            cc_shaped,
+            value = %marker.sample.as_deref().unwrap_or("-"),
             "rejected locally: request carries OpenAI-format residue, not accepted as an Anthropic Messages request"
         );
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", marker.message());
@@ -1718,25 +1724,35 @@ pub(super) async fn handle_inner(
                             outbound_turn = %t.outbound_turn,
                             "upstream rejected a historical thinking block; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken; inbound_at=ambiguous/unkeyed means the block could not be identified and nothing is being claimed"
                         ),
-                        // 坐标解析得出来，那个位置上却不是思考块。对「cannot be modified」这条
-                        // 400 这本身就是线索：上游记得那里是思考块，luban 发出去的那份不是。
-                        // 两侧各打一份坐标落点（[`block_site`]），块数一比就知道 luban 有没有
-                        // 剥掉过块、那个位置现在换成了什么。
-                        (None, Some((mi, bi))) => tracing::warn!(
-                            cred_id = cred.id, cred = %cred.label,
-                            kind,
-                            upstream_message = %message,
-                            outbound_site = %block_site(&sent, mi, bi),
-                            inbound_site = %block_site(&body, mi, bi),
-                            "upstream named a block that is not a thinking block in the outbound body; compare blocks= on both sides to see whether luban stripped one, and at= for what sits there now"
-                        ),
-                        // 坐标压根解析不出来：这条错误的形态与判据的假设对不上，原文打出来供修判据。
-                        (None, None) => tracing::warn!(
-                            cred_id = cred.id, cred = %cred.label,
-                            kind,
-                            upstream_message = %message,
-                            "upstream rejected a historical thinking block, but its message carries no messages.<i>.content.<j> path to trace"
-                        ),
+                        // 坐标定位不到那个块。两种子情形（解析不出坐标 / 坐标上不是思考块）
+                        // 都落到这里退而求其次：上游那句话点名的是**最后一条 assistant 消息**，
+                        // 那一条我们自己找得到，不必信它的下标——现网见过 `messages.65.content.13`
+                        // 落在一份 551 条消息的体上、两侧都越界（`inbound_site` 与 `outbound_site`
+                        // 逐项相同即此情形）。两项 `latest_*_same` 只要有一个为假，才是 luban
+                        // 动过那一轮；字节那项为假更是板上钉钉，上游校验的就是它。
+                        (None, path) => {
+                            let last = latest_assistant_diff(&body, &sent);
+                            tracing::warn!(
+                                cred_id = cred.id, cred = %cred.label,
+                                kind,
+                                upstream_message = %message,
+                                outbound_site = %path.map_or_else(
+                                    || "<no path in the error>".into(),
+                                    |(mi, bi)| block_site(&sent, mi, bi),
+                                ),
+                                inbound_site = %path.map_or_else(
+                                    || "<no path in the error>".into(),
+                                    |(mi, bi)| block_site(&body, mi, bi),
+                                ),
+                                latest_inbound_at = %last.inbound_at,
+                                latest_outbound_at = %last.outbound_at,
+                                latest_turn_same = ?last.turn_same,
+                                latest_thinking_bytes_same = ?last.thinking_bytes_same,
+                                latest_inbound_turn = %last.inbound_turn,
+                                latest_outbound_turn = %last.outbound_turn,
+                                "upstream named a block luban could not locate; *_site says what sits at that coordinate on each side (identical sites mean luban did not touch it, out of range means the coordinate does not address the body we sent); latest_thinking_bytes_same=false means luban changed the very bytes upstream validates, latest_turn_same=false means it restructured that turn, and only both being true clears luban for that turn"
+                            )
+                        }
                     }
                 }
                 let banned =

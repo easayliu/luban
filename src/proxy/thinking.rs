@@ -471,6 +471,117 @@ pub(super) fn block_site(body: &[u8], mi: usize, bi: usize) -> String {
     }
 }
 
+/// 最后一条 assistant 消息在入站与出站两份体里的对照，见 [`latest_assistant_diff`]。
+pub(super) struct LatestAssistant {
+    /// 两侧各自那条消息的下标（`none` = 这份体里没有 assistant 消息）。
+    pub(super) inbound_at: String,
+    pub(super) outbound_at: String,
+    /// 那一轮的**逻辑值**是否相同（两侧各自 `serde_json::Value` 再同一套序列化后比）。
+    /// 抓的是结构性改写：块被剥掉、`tool_use.name` 被混淆。`None` 表示有一侧取不到。
+    ///
+    /// **不能单凭它判无罪**：Value 往返会抹平空白与转义，客户端发 `"\u0061"`、luban 出站写
+    /// `"a"`，逻辑值一样而字节已经变了——而上游对思考块校验的正是字节。故另有下面那项。
+    pub(super) turn_same: Option<bool>,
+    /// 那一轮里**全部思考块的原始字节**是否逐字相同（见 [`thinking_bytes_of_turn`]）。
+    /// 这一项才对得上上游的判据。`None` 表示有一侧不是合法 UTF-8 或取不到那一轮。
+    pub(super) thinking_bytes_same: Option<bool>,
+    /// 两侧各自的块型序列（[`turn_label`]，过长截断）。
+    pub(super) inbound_turn: String,
+    pub(super) outbound_turn: String,
+}
+
+/// 轮摘要进日志的长度上限。块标签本身不含正文，但一轮几十块拼起来仍能刷屏。
+const TURN_LABEL_CAP: usize = 400;
+
+fn capped_turn_label(m: &serde_json::Value) -> String {
+    let s = turn_label(m);
+    match s.char_indices().nth(TURN_LABEL_CAP) {
+        Some((at, _)) => format!("{}…(+{}B)", &s[..at], s.len() - at),
+        None => s,
+    }
+}
+
+/// 两份体各自最后一条 assistant 消息的对照。
+///
+/// 「`thinking` blocks in the latest assistant message cannot be modified」这条 400 明说了是
+/// **最后一条 assistant 消息**，而它随手给的那个坐标未必对得上 luban 实际发出去的那份体——
+/// 现网见过 `messages.65.content.13` 落在一份 551 条消息的体上，而那第 65 条只有 2 块，
+/// 入站出站都越界（见 [`block_site`] 打出来的两侧落点）。坐标靠不住就别靠坐标：两侧各自
+/// 找最后一条 assistant 消息自己比。
+///
+/// 两项判断分开给，因为它们回答的不是同一个问题，合成一个就必有一头失真：
+/// - `turn_same=false`：那一轮的**结构**被改过（块被剥、`tool_use.name` 被混淆），两份
+///   `*_turn` 一比即见改的是哪一块；
+/// - `thinking_bytes_same=false`：那一轮里思考块的**原始字节**变了——上游校验的就是这个，
+///   这一项为假才是这条 400 板上钉钉的成因。
+///
+/// 只有两项**都**为真才能说 luban 原样转发了那一轮，这条 400 的成因在 luban 之外（最常见的
+/// 是那些块由另一个凭证签发，见 [`retry_demoted_thinking`] 的措辞）。
+///
+/// 为什么不直接比整轮的原始字节：[`rewrite_body`] 出站恒是紧凑序列化，客户端只要发过缩进
+/// JSON，整轮的字节就必然不同——那会让 `false` 成为常态，把一条「luban 什么实质都没改」
+/// 的请求指认成改过。而排版差异不在上游的判据里，思考块的字节在（`preserve_thinking_encoding`
+/// 专门把它们还原回原样），所以字节这一项只取思考块。
+pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAssistant {
+    let last_assistant = |body: &[u8]| -> Option<(usize, serde_json::Value)> {
+        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let msgs = v.get("messages")?.as_array()?;
+        msgs.iter()
+            .enumerate()
+            .rev()
+            .find(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .map(|(i, m)| (i, m.clone()))
+    };
+    let ib = last_assistant(inbound);
+    let ob = last_assistant(outbound);
+    let at = |x: &Option<(usize, serde_json::Value)>| {
+        x.as_ref().map_or_else(|| "none".into(), |(i, _)| format!("messages.{i}"))
+    };
+    let label = |x: &Option<(usize, serde_json::Value)>| {
+        x.as_ref().map_or_else(|| "-".into(), |(_, m)| capped_turn_label(m))
+    };
+    // 结构比：两侧各自 `Value` 再同一套序列化。这一步会抹平空白与转义，故只作数于「结构变了」
+    // 这一头，判无罪要连下面那项一起看。
+    let turn_same = match (&ib, &ob) {
+        (Some((_, a)), Some((_, b))) => match (serde_json::to_vec(a), serde_json::to_vec(b)) {
+            (Ok(a), Ok(b)) => Some(a == b),
+            _ => None,
+        },
+        _ => None,
+    };
+    // 字节比：只取那一轮里的思考块，那才是上游按字节校验的东西。
+    let thinking_bytes_same = match (
+        std::str::from_utf8(inbound).ok().zip(ib.as_ref()),
+        std::str::from_utf8(outbound).ok().zip(ob.as_ref()),
+    ) {
+        (Some((i, (im, _))), Some((o, (om, _)))) => {
+            Some(thinking_bytes_of_turn(i, *im) == thinking_bytes_of_turn(o, *om))
+        }
+        _ => None,
+    };
+    LatestAssistant {
+        inbound_at: at(&ib),
+        outbound_at: at(&ob),
+        turn_same,
+        thinking_bytes_same,
+        inbound_turn: label(&ib),
+        outbound_turn: label(&ob),
+    }
+}
+
+/// 某一轮里全部思考块的**原始字节**，按出现顺序。
+///
+/// 取原文切片而不是解析后的值：上游对 `signature` / `data` 是按字节校验的，而
+/// `serde_json` 往返会换掉转义策略（`\/` 写回 `/`、`\u0061` 写回 `a`），逻辑值没变、字节变了，
+/// 正是 [`preserve_thinking_encoding`] 要防的那一种。
+fn thinking_bytes_of_turn(json: &str, msg: usize) -> Vec<&str> {
+    thinking_block_byte_ranges(json)
+        .into_iter()
+        .filter(|b| b.msg == msg)
+        .map(|b| &json[b.span])
+        .collect()
+}
+
 /// 入站体里那个对应块的定位结果。没配上的三种理由分开记：它们指向的结论完全相反，
 /// 混成一个 `none` 就会把「认不出来」说成「luban 改坏了」，而那行日志的全部价值正在于此。
 #[derive(Clone, Copy)]
@@ -593,8 +704,13 @@ pub(super) fn trace_thinking_block(
         _ => None,
     };
     let in_turn = ib.and_then(|b| turn_of(inbound, b.msg));
-    // 逐字节比那一轮：两侧都已是 `serde_json::Value`，同一套序列化下的字节差异就是真差异
+    // 比那一轮：两侧都已是 `serde_json::Value`，同一套序列化下的差异就是结构上的真差异
     // （`preserve_order` 保着键序）。序列化失败当作「比不出来」，不牵连整份对照。
+    //
+    // **这是逻辑值比较，不是字节比较**：Value 往返会抹平空白与转义。被点名的那个块无须
+    // 担心——它是按 `key`（`signature` / `data`）配上的，配上即等于那段载荷逐字相同；这里
+    // 比的是那一轮里**除它之外**还有没有被动过（工具名混淆那类）。要整轮思考块的字节级
+    // 判断，见 [`latest_assistant_diff`] 的 `thinking_bytes_same`。
     let turn_identical = match (&in_turn, &out_turn) {
         (Some(a), Some(b)) => match (serde_json::to_vec(a), serde_json::to_vec(b)) {
             (Ok(a), Ok(b)) => Some(a == b),
@@ -1036,6 +1152,112 @@ mod tests {
         assert_eq!(crate::proxy::block_site(&body, 7, 0), "msgs=2 <no messages.7>");
         assert_eq!(crate::proxy::block_site(b"not json", 0, 0), "<unparsable>");
         assert_eq!(crate::proxy::block_site(br#"{"model":"x"}"#, 0, 0), "<no messages>");
+    }
+
+    // ---------- 最后一条 assistant 消息的对照 ----------
+
+    /// luban 一个字节没动：两侧同一条消息、逐字节相同。这是「坐标靠不住」时唯一还能作数的判断。
+    #[test]
+    fn latest_assistant_diff_sees_an_untouched_turn() {
+        let body = traceable_body("ENCRYPTED", "Bash", false);
+        let d = crate::proxy::latest_assistant_diff(&body, &body);
+        assert_eq!(d.inbound_at, "messages.1");
+        assert_eq!(d.outbound_at, "messages.1");
+        assert_eq!(d.turn_same, Some(true));
+        assert_eq!(d.thinking_bytes_same, Some(true));
+        assert!(d.outbound_turn.starts_with("assistant:thinking("), "{}", d.outbound_turn);
+    }
+
+    /// 出站少了一条消息（丢空壳 / 提升 role:"system"）：下标不同，但那一轮本身没变。
+    /// 下标一动就判为改过的话，每条被丢过空壳的请求都会被诬告一次。
+    #[test]
+    fn latest_assistant_diff_is_not_fooled_by_an_index_shift() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", true);
+        let outbound = traceable_body("ENCRYPTED", "Bash", false);
+        let d = crate::proxy::latest_assistant_diff(&inbound, &outbound);
+        assert_eq!(d.inbound_at, "messages.2");
+        assert_eq!(d.outbound_at, "messages.1");
+        assert_eq!(d.turn_same, Some(true), "挪了位置不等于改了内容");
+        assert_eq!(d.thinking_bytes_same, Some(true), "块的字节也没动");
+    }
+
+    /// 那一轮真被改过（工具名混淆）：`turn_same=false`，两份摘要一比就看出改的是哪一块。
+    /// 而思考块的字节没动——两项分开给才说得清「改的是结构，不是上游校验的那部分」。
+    #[test]
+    fn latest_assistant_diff_catches_a_rewritten_turn() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", false);
+        let outbound = traceable_body("ENCRYPTED", "mcp__luban__abcBas00", false);
+        let d = crate::proxy::latest_assistant_diff(&inbound, &outbound);
+        assert_eq!(d.turn_same, Some(false), "结构变了");
+        assert_eq!(d.thinking_bytes_same, Some(true), "改的是工具名，思考块的字节没动");
+        assert!(d.inbound_turn.contains("tool_use(Bash)"), "{}", d.inbound_turn);
+        assert!(d.outbound_turn.contains("tool_use(mcp__luban__abcBas00)"), "{}", d.outbound_turn);
+    }
+
+    /// 一条 assistant 消息都没有：给 `none`，不下结论。
+    #[test]
+    fn latest_assistant_diff_reports_none_without_an_assistant_turn() {
+        let body = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+        let d = crate::proxy::latest_assistant_diff(body, body);
+        assert_eq!(d.inbound_at, "none");
+        assert_eq!(d.outbound_at, "none");
+        assert_eq!(d.turn_same, None);
+        assert_eq!(d.thinking_bytes_same, None);
+        assert_eq!(d.inbound_turn, "-");
+    }
+
+    /// 逻辑值相同、字节不同：客户端把签名里的 `/` 写成 `\/`（PHP 那类编码器的默认），
+    /// luban 出站写回 `/`。`turn_same` 看不出来（Value 往返抹平转义），而上游对签名是按字节
+    /// 校验的——只认结构那一项就会把这条 400 的真凶判成无罪。
+    #[test]
+    fn latest_assistant_diff_catches_a_reencoded_signature() {
+        let turn = |sig: &str| {
+            format!(
+                concat!(
+                    r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}},"#,
+                    r#"{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"{sig}"}}]}}]}}"#
+                ),
+                sig = sig
+            )
+        };
+        let inbound = turn(r"ab\/cd==");
+        let outbound = turn("ab/cd==");
+        let d = crate::proxy::latest_assistant_diff(inbound.as_bytes(), outbound.as_bytes());
+        assert_eq!(d.turn_same, Some(true), "逻辑值确实相同，这一项看不出问题");
+        assert_eq!(d.thinking_bytes_same, Some(false), "字节变了，上游校验的正是它");
+    }
+
+    /// 反过来：整轮排版变了（客户端发缩进 JSON，出站恒紧凑），但思考块的字节被
+    /// `preserve_thinking_encoding` 原样还原。字节这一项只取思考块，正是为了不把这种
+    /// 「什么实质都没改」的请求指认成改过。
+    #[test]
+    fn latest_assistant_diff_ignores_reformatting_around_the_blocks() {
+        let inbound = concat!(
+            "{\n  \"messages\": [\n    {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"hi\"}]},\n",
+            "    {\"role\": \"assistant\", \"content\": [{\"type\":\"thinking\",\"thinking\":\"t\",\"signature\":\"SIG\"}]}\n  ]\n}"
+        );
+        let outbound = concat!(
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},"#,
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]}]}"#
+        );
+        assert_ne!(inbound, outbound, "两份原始字节本来就不同");
+        let d = crate::proxy::latest_assistant_diff(inbound.as_bytes(), outbound.as_bytes());
+        assert_eq!(d.turn_same, Some(true));
+        assert_eq!(d.thinking_bytes_same, Some(true), "块本身逐字相同，排版不算改");
+    }
+
+    /// 轮摘要封顶：块标签不含正文，但一轮几十块拼起来照样刷屏。
+    #[test]
+    fn latest_assistant_diff_caps_a_long_turn_label() {
+        let blocks = (0..80)
+            .map(|i| format!(r#"{{"type":"tool_use","id":"t{i}","name":"Bash","input":{{}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(r#"{{"messages":[{{"role":"assistant","content":[{blocks}]}}]}}"#);
+        let d = crate::proxy::latest_assistant_diff(body.as_bytes(), body.as_bytes());
+        assert!(d.outbound_turn.contains("…(+"), "该截断: {}", d.outbound_turn);
+        assert!(d.outbound_turn.chars().count() < 450, "截断后仍太长: {}", d.outbound_turn);
+        assert_eq!(d.turn_same, Some(true), "截断只影响日志，不影响比对");
     }
 
     /// 块既没有 `signature` 也没有 `data`：没有可当身份的载荷，落 `unkeyed`。
