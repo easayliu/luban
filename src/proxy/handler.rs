@@ -46,7 +46,7 @@ use super::simulation::{Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
     error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
     is_thinking_modified_error, is_thinking_signature_error, retry_demoted_thinking,
-    retry_without_prefill, trace_thinking_block,
+    retry_without_prefill, thinking_block_error_kind, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
@@ -1689,13 +1689,17 @@ pub(super) async fn handle_inner(
                         "upstream rejected an empty thinking block; dumping the INBOUND (client-original) request body for local replay"
                     );
                 }
-                // 「Invalid `data` in `redacted_thinking` block」：把上游点名的那个块在入站
-                // （客户端原件）与出站（luban 实际发出去的）两份体里对一遍，一行日志回答
-                // 「是不是 luban 改的、改的是这个块还是它所在那一轮」。判据见
-                // [`trace_thinking_block`]；这条不打正文，故不受 `inbound_body` 那种体量之累。
+                // 历史思考块验不过的那三条 400（签名 / 被改过 / `redacted_thinking` 的密文）：
+                // 把上游点名的那个块在入站（客户端原件）与出站（luban 实际发出去的）两份体里
+                // 对一遍，一行日志回答「是不是 luban 改的、改的是这个块还是它所在那一轮」。
+                //
+                // 三条共用这一段：它们的兜底各不相同，但问的是同一个问题，而
+                // [`trace_thinking_block`] 本就不分块型（`thinking` 按 `signature` 配、
+                // `redacted_thinking` 按 `data` 配）。`kind` 记是哪一条，见
+                // [`thinking_block_error_kind`]。这条不打正文，故不受 `inbound_body` 那种体量之累。
                 if !compressed
                     && status == StatusCode::BAD_REQUEST
-                    && is_redacted_thinking_data_error(&err_bytes)
+                    && let Some(kind) = thinking_block_error_kind(&err_bytes)
                 {
                     let (_, message) = parse_upstream_error(&err_bytes);
                     let trace = error_block_path(&message)
@@ -1703,6 +1707,7 @@ pub(super) async fn handle_inner(
                     match trace {
                         Some(t) => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
+                            kind,
                             upstream_message = %message,
                             outbound_at = %t.outbound_at,
                             inbound_at = %t.inbound_at,
@@ -1710,14 +1715,15 @@ pub(super) async fn handle_inner(
                             turn_identical = ?t.turn_identical,
                             inbound_turn = %t.inbound_turn,
                             outbound_turn = %t.outbound_turn,
-                            "upstream rejected a redacted_thinking block's data; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken"
+                            "upstream rejected a historical thinking block; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken; inbound_at=ambiguous/unkeyed means the block could not be identified and nothing is being claimed"
                         ),
                         // 坐标解析不出来，或那个坐标上压根没有思考块：两者都说明这条错误的
                         // 形态与判据的假设对不上，原文打出来供修判据。
                         None => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
+                            kind,
                             upstream_message = %message,
-                            "upstream rejected a redacted_thinking block's data, but the block it names could not be located in the outbound body"
+                            "upstream rejected a historical thinking block, but the block it names could not be located in the outbound body"
                         ),
                     }
                 }

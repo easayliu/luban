@@ -63,7 +63,8 @@ mod thinking;
 use thinking::{
     demote_thinking_blocks, empty_thinking_shape, error_block_path, is_empty_thinking_error,
     is_redacted_thinking_data_error, is_thinking_modified_error, is_thinking_signature_error,
-    preserve_thinking_encoding, strip_empty_thinking_blocks, trace_thinking_block,
+    preserve_thinking_encoding, strip_empty_thinking_blocks, thinking_block_error_kind,
+    trace_thinking_block,
 };
 
 mod rate_limit;

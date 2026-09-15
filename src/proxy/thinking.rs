@@ -127,6 +127,30 @@ pub(super) fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
     hay.contains("redacted_thinking") && hay.contains("data")
 }
 
+/// 上游那条 400 是不是「历史思考块验不过」的任意一种，是的话给出是哪一种（只进日志）。
+///
+/// 三条各有自己的兜底重试——开关不同、降级后能不能救回来也不同，见 [`handle`] 里并排的
+/// 那三段。但**取证问的是同一个问题**：那个块是 luban 改坏的，还是客户端发来就是坏的。
+/// [`trace_thinking_block`] 本身也不分块型（`thinking` 按 `signature` 配对、
+/// `redacted_thinking` 按 `data` 配对，两者都是 base64、改写前后逐字相同），所以三条共用
+/// 同一段入站/出站对照，这个函数只负责认出「是这一类」并记下是哪一条。
+///
+/// 顺序即优先级，与那三段重试的先后一致：三条判据在实测形态上互不重叠（见测试里的互斥断言），
+/// 但「被改」那句里 `thinking` 与 `redacted_thinking` 同现，上游哪天改措辞添上 `signature`
+/// 或 `data` 就会有两条同时认领；排在前面的先认领，日志里的 `kind` 与实际走的那条兜底就不会
+/// 张冠李戴。
+pub(super) fn thinking_block_error_kind(body: &[u8]) -> Option<&'static str> {
+    if is_thinking_signature_error(body) {
+        Some("signature")
+    } else if is_thinking_modified_error(body) {
+        Some("modified")
+    } else if is_redacted_thinking_data_error(body) {
+        Some("redacted_data")
+    } else {
+        None
+    }
+}
+
 /// 上游拒绝 prefill 时，剥掉末尾 assistant 轮后用同一个凭证重试一次。
 ///
 /// 模式与 [`retry_demoted_thinking`] 一致：对原始客户端 body 改写后走 `upstream.shape()` →
@@ -408,7 +432,9 @@ pub(super) fn error_block_path(message: &str) -> Option<(usize, usize)> {
 pub(super) struct ThinkingBlockTrace {
     /// 出站体里的坐标，也就是上游报错里那个（原样回显，供核对解析对没对）。
     pub(super) outbound_at: String,
-    /// 入站体里同一个块的坐标；`none` 表示**入站体里根本没有这段载荷**。
+    /// 入站体里同一个块的坐标，或没配上的理由（三者结论完全不同，见 [`InboundMatch`]）：
+    /// `none` 表示**入站体里根本没有这段载荷**，`ambiguous(xN)` 表示同一段载荷有 N 处、
+    /// 认不出是哪一个，`unkeyed` 表示这个块压根没有可当身份的载荷。
     pub(super) inbound_at: String,
     /// 载荷（`redacted_thinking` 的 `data` / `thinking` 的 `signature`）的字节数。
     pub(super) payload_len: usize,
@@ -419,6 +445,68 @@ pub(super) struct ThinkingBlockTrace {
     pub(super) outbound_turn: String,
 }
 
+/// 入站体里那个对应块的定位结果。没配上的三种理由分开记：它们指向的结论完全相反，
+/// 混成一个 `none` 就会把「认不出来」说成「luban 改坏了」，而那行日志的全部价值正在于此。
+#[derive(Clone, Copy)]
+enum InboundMatch<'a> {
+    Found(&'a ThinkingBlockRef),
+    /// 有载荷可配，入站体里一处都没有 —— 唯一一种 luban 的锅。
+    Missing,
+    /// 同一段载荷两侧不止一处，坐标也对不上：认不出是哪一个，附上入站那侧的处数。
+    Ambiguous(usize),
+    /// 这个块既没有 `signature` 也没有 `data`，没有可当身份的载荷。
+    Unkeyed,
+}
+
+/// 在入站体里找出站那个块的对应物，口径与 [`preserve_thinking_encoding`] 一致：
+/// **两侧各只出现一次**才认按载荷配得上。
+///
+/// 客户端把同一块贴了两遍（中转站转发的历史里常见）时，`find` 会一律配到第一处——出站问的
+/// 是第二处，配回来的却是第一轮，`turn_identical` 于是恒为 `false`，日志报「luban 改了那一轮」，
+/// 正好是这段取证要排除的那个误判。
+///
+/// 不唯一时还留一条能答的路，但**坐标本身不算数**：`coord_turn_identical` 说的是「入站与出站
+/// 在同一条消息下标上那一轮逐字节相同」，相同才认这个坐标。
+///
+/// 只比坐标不够。前面丢过消息时（[`drop_empty_system_messages`]、[`hoist_system_role_messages`]）
+/// 整串下标会前移，出站 `(mi, bi)` 上那个块可能来自入站的另一条消息，而入站同一坐标上恰好是
+/// 另一处同款载荷——载荷对得上、坐标也对得上，配出来却是两条不同的轮次，`turn_identical` 于是
+/// 又成了那个凭空的 `false`。轮次逐字节相同则不然：那一轮一致，它的第 `bi` 块自然是同一个块，
+/// 报出来的三项都成立（贴了两遍但 luban 没挪动过任何东西，是重复里最常见的一种，这条能答就答）。
+///
+/// 轮次对不上就认 `Ambiguous`：那时「luban 改了那一轮」与「配错了同款载荷」长得一模一样，
+/// 分不出来就不下结论。代价是真被改写过的那一轮在载荷重复时失去这条判断——宁可少一条，
+/// 也不能给一个反过来的。
+fn match_inbound_block<'a>(
+    in_blocks: &'a [ThinkingBlockRef],
+    out_blocks: &[ThinkingBlockRef],
+    key: Option<&str>,
+    (mi, bi): (usize, usize),
+    coord_turn_identical: impl FnOnce() -> bool,
+) -> InboundMatch<'a> {
+    let Some(key) = key else { return InboundMatch::Unkeyed };
+    let hits =
+        |list: &[ThinkingBlockRef]| list.iter().filter(|b| b.key.as_deref() == Some(key)).count();
+    let n_in = hits(in_blocks);
+    if n_in == 0 {
+        return InboundMatch::Missing;
+    }
+    // 出站那侧也要唯一：两处出站块共用一段载荷、入站只剩一处时（中间那轮被删），按载荷配
+    // 同样会把另一轮的坐标报上来。
+    if n_in == 1 && hits(out_blocks) == 1 {
+        let found = in_blocks.iter().find(|b| b.key.as_deref() == Some(key));
+        return found.map_or(InboundMatch::Missing, InboundMatch::Found);
+    }
+    // 载荷不唯一：先看那一轮立不立得住，立得住才去取坐标上那个块（闭包只在这条路上求值，
+    // 唯一那条不多解一遍入站体）。
+    let at_coord = coord_turn_identical()
+        .then(|| {
+            in_blocks.iter().find(|b| b.msg == mi && b.blk == bi && b.key.as_deref() == Some(key))
+        })
+        .flatten();
+    at_coord.map_or(InboundMatch::Ambiguous(n_in), InboundMatch::Found)
+}
+
 /// 拿上游点名的坐标，在出站体里取到那个思考块，再**用载荷本身当身份**回到入站体里找同一个块。
 ///
 /// 载荷是 base64（`data` / `signature` 都是），JSON 转义策略碰不到它，改写前后逐字相同，
@@ -426,7 +514,8 @@ pub(super) struct ThinkingBlockTrace {
 /// 照样找得到。
 ///
 /// 打出来的几项各回答一个问题：
-/// - `inbound_at=none`：入站体里没有这段载荷 = **luban 把它改坏了**，这是唯一一种 luban 的锅；
+/// - `inbound_at=none`：入站体里没有这段载荷 = **luban 把它改坏了**，这是唯一一种 luban 的锅
+///   （`ambiguous(xN)` 与 `unkeyed` 是「认不出来」，不是这一档，见 [`InboundMatch`]）；
 /// - `inbound_at` 与 `outbound_at` 不同：块还在，但下标前移过（有消息或块被删）；
 /// - `turn_identical=false`：那一轮除这个块之外还被改过——工具名混淆（[`apply_tool_names`]）
 ///   会改历史里的 `tool_use.name`，两份 `*_turn` 一比就能看出改的是哪一块；
@@ -447,7 +536,6 @@ pub(super) fn trace_thinking_block(
 
     let in_blocks =
         std::str::from_utf8(inbound).map(thinking_block_byte_ranges).unwrap_or_default();
-    let ib = key.as_deref().and_then(|k| in_blocks.iter().find(|b| b.key.as_deref() == Some(k)));
 
     let turn_of = |body: &[u8], idx: usize| -> Option<serde_json::Value> {
         serde_json::from_slice::<serde_json::Value>(body)
@@ -458,6 +546,26 @@ pub(super) fn trace_thinking_block(
             .cloned()
     };
     let out_turn = turn_of(outbound, mi);
+    // 载荷重复时给坐标背书的那一轮，见 [`match_inbound_block`]。取不到或序列化不了都算
+    // 不成立——这条只用来**放行**一个坐标，存疑一律不放。
+    let coord_turn_identical = || match (turn_of(inbound, mi), &out_turn) {
+        (Some(a), Some(b)) => match (serde_json::to_vec(&a), serde_json::to_vec(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+        _ => false,
+    };
+    let matched = match_inbound_block(
+        &in_blocks,
+        &out_blocks,
+        key.as_deref(),
+        (mi, bi),
+        coord_turn_identical,
+    );
+    let ib = match matched {
+        InboundMatch::Found(b) => Some(b),
+        _ => None,
+    };
     let in_turn = ib.and_then(|b| turn_of(inbound, b.msg));
     // 逐字节比那一轮：两侧都已是 `serde_json::Value`，同一套序列化下的字节差异就是真差异
     // （`preserve_order` 保着键序）。序列化失败当作「比不出来」，不牵连整份对照。
@@ -471,9 +579,12 @@ pub(super) fn trace_thinking_block(
 
     Some(ThinkingBlockTrace {
         outbound_at: format!("messages.{mi}.content.{bi}"),
-        inbound_at: ib
-            .map(|b| format!("messages.{}.content.{}", b.msg, b.blk))
-            .unwrap_or_else(|| "none".into()),
+        inbound_at: match matched {
+            InboundMatch::Found(b) => format!("messages.{}.content.{}", b.msg, b.blk),
+            InboundMatch::Missing => "none".into(),
+            InboundMatch::Ambiguous(n) => format!("ambiguous(x{n})"),
+            InboundMatch::Unkeyed => "unkeyed".into(),
+        },
         payload_len,
         turn_identical,
         inbound_turn: in_turn.as_ref().map(turn_label).unwrap_or_else(|| "-".into()),
@@ -650,6 +761,45 @@ mod tests {
         }
     }
 
+    /// 三条 400 共用同一段取证，但各记各的 `kind`；不属这一类的 400 一概不认领——认领了就是
+    /// 给每个普通请求错误白打一行对照日志。
+    #[test]
+    fn classifies_all_three_thinking_400s() {
+        for (msg, kind) in [
+            ("messages.1.content.0: Invalid `signature` in `thinking` block", "signature"),
+            (
+                "messages.43.content.110: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.",
+                "modified",
+            ),
+            ("messages.5.content.48: Invalid `data` in `redacted_thinking` block", "redacted_data"),
+        ] {
+            let body = format!(
+                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{msg}"}}}}"#
+            );
+            assert_eq!(
+                crate::proxy::thinking_block_error_kind(body.as_bytes()),
+                Some(kind),
+                "该归到 {kind}: {msg}"
+            );
+        }
+
+        for miss in [
+            // 空 thinking 块那条：另有专属的「整体 dump 入站体」路径，不该在这里再打一行。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: each thinking block must contain thinking"}}"#[..],
+            // 提到了 thinking，但说的是末轮形态，不是某个块验不过。
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"a final `assistant` message must start with a thinking block"}}"#[..],
+            &br#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be greater than 0"}}"#[..],
+            &b"<html>403 Forbidden</html>"[..],
+        ] {
+            assert_eq!(
+                crate::proxy::thinking_block_error_kind(miss),
+                None,
+                "不该认领: {}",
+                String::from_utf8_lossy(miss)
+            );
+        }
+    }
+
     /// 坐标解析：官方那句以 `messages.<i>.content.<j>:` 开头，别的形态一律给 `None`。
     #[test]
     fn parses_the_error_block_path() {
@@ -752,6 +902,129 @@ mod tests {
         let body = traceable_body("ENCRYPTED", "Bash", false);
         assert!(crate::proxy::trace_thinking_block(&body, &body, 1, 1).is_none(), "那是 tool_use");
         assert!(crate::proxy::trace_thinking_block(&body, &body, 9, 0).is_none(), "越界");
+    }
+
+    /// 两轮 assistant 带着**同一段**密文（客户端把同一块贴了两遍，经中转站转发的历史里常见）。
+    /// 两轮的 `tool_use.name` 不同，配错了轮次 `turn_identical` 立刻变 false。
+    ///
+    /// `leads` 是前面垫几条会被 luban 丢掉的消息（空壳 `role:"system"`）：垫 n 条再与垫 0 条
+    /// 的那份对照，就是「出站整串下标前移 n 位」。
+    fn duplicate_payload_body(leads: usize) -> Vec<u8> {
+        let lead = r#"{"role":"system","content":[{"type":"text","text":"x"}]},"#.repeat(leads);
+        format!(
+            concat!(
+                r#"{{"model":"claude-sonnet-5","messages":["#,
+                r#"{{"role":"user","content":[{{"type":"text","text":"hi"}}]}},"#,
+                "{lead}",
+                r#"{{"role":"assistant","content":["#,
+                r#"{{"type":"tool_use","id":"tu1","name":"Bash","input":{{}}}},"#,
+                r#"{{"type":"redacted_thinking","data":"DUP"}}]}},"#,
+                r#"{{"role":"user","content":[{{"type":"text","text":"more"}}]}},"#,
+                r#"{{"role":"assistant","content":["#,
+                r#"{{"type":"tool_use","id":"tu2","name":"Read","input":{{}}}},"#,
+                r#"{{"type":"redacted_thinking","data":"DUP"}}]}}]}}"#
+            ),
+            lead = lead
+        )
+        .into_bytes()
+    }
+
+    /// 同一段密文出现两处、但坐标对得上：按坐标 + 载荷双证认下第二轮那个。
+    ///
+    /// 这条守的是按载荷配对那步少了唯一性检查的回归——`find` 一律给第一处，于是出站问的是
+    /// 第 3 条消息、配回来的是第 1 条，`turn_identical` 变 false，日志报「luban 改了那一轮」，
+    /// 而 luban 一个字节都没动。
+    #[test]
+    fn traces_the_right_one_of_two_identical_payloads() {
+        let body = duplicate_payload_body(0);
+        let t = crate::proxy::trace_thinking_block(&body, &body, 3, 1).expect("该坐标上有思考块");
+        assert_eq!(t.outbound_at, "messages.3.content.1");
+        assert_eq!(t.inbound_at, "messages.3.content.1", "不该配到第一处那个同款密文");
+        assert_eq!(t.turn_identical, Some(true), "luban 什么都没改");
+        assert!(t.outbound_turn.contains("tool_use(Read)"), "{}", t.outbound_turn);
+    }
+
+    /// 同一段密文出现两处，坐标又因为前移对不上：认不出是哪一个，落 `ambiguous`、不下结论。
+    /// 宁可少一条判断也不能给一个错的——`turn_identical=false` 会被读成「luban 改了那一轮」。
+    #[test]
+    fn refuses_to_guess_between_two_identical_payloads() {
+        let inbound = duplicate_payload_body(1);
+        let outbound = duplicate_payload_body(0);
+        let t = crate::proxy::trace_thinking_block(&inbound, &outbound, 3, 1)
+            .expect("该坐标上有思考块");
+        assert_eq!(t.inbound_at, "ambiguous(x2)");
+        assert_eq!(t.turn_identical, None, "认不出对应块，就没有可比的那一轮");
+        assert_eq!(t.inbound_turn, "-");
+        assert!(t.outbound_turn.contains("tool_use(Read)"), "{}", t.outbound_turn);
+    }
+
+    /// 载荷重复、坐标也对得上，但坐标上装的是**另一个**同款块：仍要认 `ambiguous`。
+    ///
+    /// 丢掉两条空壳 `role:"system"` 后整串前移两位，出站 `messages.3.content.1` 是 Read 那轮的
+    /// 密文，入站同一坐标上恰好是 Bash 那轮的同款密文——载荷对得上、坐标也对得上，配出来却是
+    /// 两条不同的轮次。只认「坐标 + 载荷」双证的话这里会报 `turn_identical=false`，等于凭空
+    /// 指认 luban 改了那一轮。
+    #[test]
+    fn refuses_a_coordinate_that_lands_on_the_other_duplicate() {
+        let inbound = duplicate_payload_body(2);
+        let outbound = duplicate_payload_body(0);
+        // 前提先钉住：入站那个坐标上确实有一个同款载荷的块，否则这条用例是空转的。
+        let decoy = crate::proxy::trace_thinking_block(&inbound, &inbound, 3, 1)
+            .expect("入站同一坐标上也有一个同款密文块");
+        assert!(decoy.outbound_turn.contains("tool_use(Bash)"), "{}", decoy.outbound_turn);
+
+        let t = crate::proxy::trace_thinking_block(&inbound, &outbound, 3, 1)
+            .expect("该坐标上有思考块");
+        assert!(
+            t.outbound_turn.contains("tool_use(Read)"),
+            "出站问的是 Read 那轮: {}",
+            t.outbound_turn
+        );
+        assert_eq!(t.inbound_at, "ambiguous(x2)", "坐标撞上了另一个同款块，不能认");
+        assert_eq!(t.turn_identical, None);
+        assert_eq!(t.inbound_turn, "-");
+    }
+
+    /// 块既没有 `signature` 也没有 `data`：没有可当身份的载荷，落 `unkeyed`。
+    /// 不能落 `none`——那一档的意思是「luban 把它改坏了」。
+    #[test]
+    fn marks_a_payloadless_block_unkeyed_not_missing() {
+        let body = concat!(
+            r#"{"model":"claude-sonnet-5","messages":["#,
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]},"#,
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"t"}]}]}"#
+        )
+        .as_bytes();
+        let t = crate::proxy::trace_thinking_block(body, body, 1, 0).expect("该坐标上有思考块");
+        assert_eq!(t.inbound_at, "unkeyed");
+        assert_eq!(t.payload_len, 0);
+        assert_eq!(t.turn_identical, None);
+    }
+
+    /// 签名那条 400 走的是同一段对照：`thinking` 块按 `signature` 配对，与密文侧对称。
+    /// 配错块型的话 `payload_len` 会是密文那 9 个字节。
+    #[test]
+    fn traces_a_thinking_block_by_its_signature() {
+        let body = traceable_body("ENCRYPTED", "Bash", false);
+        let t = crate::proxy::trace_thinking_block(&body, &body, 1, 0).expect("该坐标上有思考块");
+        assert_eq!(t.outbound_at, "messages.1.content.0");
+        assert_eq!(t.inbound_at, "messages.1.content.0");
+        assert_eq!(t.payload_len, "SIG".len(), "载荷记的是签名，不是同一轮里那段密文");
+        assert_eq!(t.turn_identical, Some(true));
+    }
+
+    /// 签名侧的「luban 改坏了」：出站那个签名入站体里根本没有，`inbound_at=none`。
+    #[test]
+    fn traces_a_corrupted_thinking_signature() {
+        let inbound = traceable_body("ENCRYPTED", "Bash", false);
+        let outbound = String::from_utf8(inbound.clone())
+            .expect("固定字面量")
+            .replace("\"SIG\"", "\"XIG\"")
+            .into_bytes();
+        let t = crate::proxy::trace_thinking_block(&inbound, &outbound, 1, 0)
+            .expect("该坐标上有思考块");
+        assert_eq!(t.inbound_at, "none");
+        assert_eq!(t.turn_identical, None, "入站那一轮都定位不到，无从比对");
     }
 
     /// thinking 原文搬进 text、redacted_thinking 直接删，其余块与 key 序原样不动。
