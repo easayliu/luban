@@ -61,10 +61,10 @@ use probe_detect::{
 mod thinking;
 #[cfg(test)]
 use thinking::{
-    demote_thinking_blocks, empty_thinking_shape, error_block_path, is_empty_thinking_error,
-    is_redacted_thinking_data_error, is_thinking_modified_error, is_thinking_signature_error,
-    preserve_thinking_encoding, strip_empty_thinking_blocks, thinking_block_error_kind,
-    trace_thinking_block,
+    block_site, demote_thinking_blocks, empty_thinking_shape, error_block_path,
+    is_empty_thinking_error, is_redacted_thinking_data_error, is_thinking_modified_error,
+    is_thinking_signature_error, preserve_thinking_encoding, strip_empty_thinking_blocks,
+    thinking_block_error_kind, trace_thinking_block,
 };
 
 mod rate_limit;
@@ -81,10 +81,10 @@ pub(crate) use body::parse_version;
 use body::ua_of;
 #[cfg(test)]
 use body::{
-    CacheShape, FALLBACKS_FIELD, ToolNameMap, apply_tool_names, below_min_client_version,
-    body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version, cc_tools_core,
-    client_supplied_fallbacks, device_fingerprint, drop_empty_system_messages, ensure_beta_query,
-    ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
+    CacheShape, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
+    below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
+    cc_tools_core, client_supplied_fallbacks, device_fingerprint, drop_empty_system_messages,
+    ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
     flatten_tool_schemas, is_billable_messages, is_fallback_rejection, known_latest_release,
     normalize_tool_choice, outbound_carries_fallbacks, outbound_identity, outbound_ua,
     refusal_fallbacks_for, remember_fallback_rejection, replace_json_str_field, rewrite_body,

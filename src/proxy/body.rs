@@ -1396,7 +1396,13 @@ pub(super) fn cch_value() -> String {
 ///
 /// 保守起见只处理「确实是 API-key 三块形态」：`system` 长度不为 3、锚点匹配不到、或锚点前不是
 /// `\n\n`，一律不动结构返回 `false`。客户端本来就是 4 块（订阅形态）时同样不动。
+///
+/// **预算**：拆基座是净 +1（身份句原本带断点时抵回来，净 0），断点总数不能顶过
+/// [`MAX_CACHE_BREAKPOINTS`]，满了就整形不做——与 [`align_message_shape`] 同一口径，
+/// 理由见函数体里那道闸。
 pub(super) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
+    // 拆开前先数一遍整个 body 的断点，见下面那道预算闸（`sys` 一借出去就数不了了）。
+    let total = count_cache_control(v);
     let sys = match v.get_mut("system").and_then(|s| s.as_array_mut()) {
         Some(s) if s.len() == 3 || s.len() == 4 => s,
         _ => return false,
@@ -1432,6 +1438,23 @@ pub(super) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -
         .filter(|&p| p >= 2 && &body.as_bytes()[p - 2..p] == b"\n\n")
         .min();
     let Some(at) = at else { return false };
+
+    // 预算闸：断点总数封顶 [`MAX_CACHE_BREAKPOINTS`]，超了上游整条拒
+    // （`A maximum of 4 blocks with cache_control may be provided. Found 5.`）。
+    //
+    // 这次改写的净变化是 **+1 减掉身份句上那个**：合并块那一个断点拆成基座与其余两个（+1），
+    // 身份句上那个若在则一并去掉（-1）。官方 API-key 三块形态里身份句**带**断点，净变化为 0，
+    // 这道闸永远不响；净 +1 只出现在身份句没标断点的那一种来访上，而它若又在 `messages` 里
+    // 自己标满了断点，拆开就正好顶到 5。
+    //
+    // 满了就整形不做（`false`，一个字节不动），不做「拆开但其余那块不标断点」：官方两块都有
+    // 断点，标一个不标一个是个官方不产生的半对齐形态，与 [`fill_cache_ttl`] 那处
+    // 「整形没做成就别补 ttl」同一个取舍。代价是这一条请求走客户端自己那份三块形态出去，
+    // 少一次基座级缓存命中——总好过整条被拒。判据与 [`align_message_shape`] 同一口径。
+    if total + 1 - usize::from(sys[1].get("cache_control").is_some()) > MAX_CACHE_BREAKPOINTS {
+        tracing::debug!(breakpoints = total, "system 整形会把缓存断点顶过上限，这一条按原样转发");
+        return false;
+    }
 
     if let Some(obj) = sys[1].as_object_mut() {
         obj.remove("cache_control");
@@ -4077,6 +4100,65 @@ mod tests {
 
     /// 体侧 `ensure_fallbacks`：没写的补在 `context_management` 之后、`output_config` 之前
     /// （官方键序），字符串 `"default"` 换成数组，客户端自己的数组不动。
+    /// 整形不能把缓存断点顶过 4 个。合并块那一个拆成基座 + 其余是净 +1，身份句没标断点时
+    /// 抵不回来；客户端又在 `messages` 里标满三个，出去就是上游那条
+    /// `A maximum of 4 blocks with cache_control may be provided. Found 5.`——整条被拒，
+    /// 而少拆一次只是少一次基座级缓存命中。
+    #[test]
+    fn align_system_shape_respects_the_breakpoint_budget() {
+        let merged =
+            format!("base text\n\n{}\nrest of it", crate::config::CC_SYSTEM_BASE_ANCHORS[0]);
+        // `msg_breakpoints` 条客户端自己标在 messages 里的断点，加 system 合并块那一个。
+        let mk = |msg_breakpoints: usize| {
+            let blocks: Vec<serde_json::Value> = (0..msg_breakpoints)
+                .map(|i| {
+                    serde_json::json!({
+                        "type": "text",
+                        "text": format!("m{i}"),
+                        "cache_control": {"type": "ephemeral"}
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "model": "claude-opus-5",
+                "system": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli;"},
+                    // 身份句**不带**断点：这一档的净变化才是 +1，官方 API-key 形态带着它、净 0。
+                    {"type": "text", "text": crate::config::CC_SYSTEM_IDENTITY},
+                    {"type": "text", "text": merged, "cache_control": {"type": "ephemeral"}},
+                ],
+                "messages": [{"role": "user", "content": blocks}],
+            })
+        };
+        let shape = crate::proxy::CacheShape { global: true, ttl_1h: true };
+
+        // 3 + 1 = 4，已经满了：不整形，且一个字节都不动。
+        let mut full = mk(3);
+        let before = full.clone();
+        assert!(!crate::proxy::align_system_shape(&mut full, shape), "满了不该再拆");
+        assert_eq!(full, before, "不拆就该原样留着，别留下半拆的形态");
+        assert_eq!(crate::proxy::count_cache_control(&full), 4);
+
+        // 2 + 1 = 3，还差一个：照常拆，拆完正好顶到 4。
+        let mut room = mk(2);
+        assert!(crate::proxy::align_system_shape(&mut room, shape));
+        assert_eq!(
+            crate::proxy::count_cache_control(&room),
+            crate::proxy::MAX_CACHE_BREAKPOINTS,
+            "还有位置就该拆"
+        );
+        assert_eq!(room["system"].as_array().unwrap().len(), 4, "拆成 [billing, 身份, 基座, 其余]");
+
+        // 身份句自带断点的那一档（官方 API-key 三块形态）：2 + 2 = 4 已经满着，但拆开是净 0
+        // ——身份句那个被去掉、合并块那个变两个——这道闸不该拦它。
+        let mut official = mk(2);
+        official["system"][1]["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        assert_eq!(crate::proxy::count_cache_control(&official), 4, "拆之前就已经满了");
+        assert!(crate::proxy::align_system_shape(&mut official, shape), "净 0，这道闸不该拦它");
+        assert_eq!(crate::proxy::count_cache_control(&official), 4, "拆完还是 4");
+        assert!(official["system"][1].get("cache_control").is_none(), "身份句那个该被去掉");
+    }
+
     /// `rewrite_body` 的「全关且不模拟」快路径不能吞掉 `fallbacks`：头上按同一个判断补了
     /// beta，体里必须写字段，否则 fable 的拒答换模型重跑名存实亡。反例：不补时快路径照走、
     /// 体原样。

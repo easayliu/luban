@@ -44,7 +44,7 @@ use super::session_id::{
 use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
-    error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
+    block_site, error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
     is_thinking_modified_error, is_thinking_signature_error, retry_demoted_thinking,
     retry_without_prefill, thinking_block_error_kind, trace_thinking_block,
 };
@@ -1702,10 +1702,11 @@ pub(super) async fn handle_inner(
                     && let Some(kind) = thinking_block_error_kind(&err_bytes)
                 {
                     let (_, message) = parse_upstream_error(&err_bytes);
-                    let trace = error_block_path(&message)
-                        .and_then(|(mi, bi)| trace_thinking_block(&body, &sent, mi, bi));
-                    match trace {
-                        Some(t) => tracing::warn!(
+                    let path = error_block_path(&message);
+                    let trace =
+                        path.and_then(|(mi, bi)| trace_thinking_block(&body, &sent, mi, bi));
+                    match (trace, path) {
+                        (Some(t), _) => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             kind,
                             upstream_message = %message,
@@ -1717,13 +1718,24 @@ pub(super) async fn handle_inner(
                             outbound_turn = %t.outbound_turn,
                             "upstream rejected a historical thinking block; inbound_at=none means luban corrupted it, turn_identical=false means luban rewrote something else in that same assistant turn (tool-name mimicry), all matching means it arrived broken; inbound_at=ambiguous/unkeyed means the block could not be identified and nothing is being claimed"
                         ),
-                        // 坐标解析不出来，或那个坐标上压根没有思考块：两者都说明这条错误的
-                        // 形态与判据的假设对不上，原文打出来供修判据。
-                        None => tracing::warn!(
+                        // 坐标解析得出来，那个位置上却不是思考块。对「cannot be modified」这条
+                        // 400 这本身就是线索：上游记得那里是思考块，luban 发出去的那份不是。
+                        // 两侧各打一份坐标落点（[`block_site`]），块数一比就知道 luban 有没有
+                        // 剥掉过块、那个位置现在换成了什么。
+                        (None, Some((mi, bi))) => tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             kind,
                             upstream_message = %message,
-                            "upstream rejected a historical thinking block, but the block it names could not be located in the outbound body"
+                            outbound_site = %block_site(&sent, mi, bi),
+                            inbound_site = %block_site(&body, mi, bi),
+                            "upstream named a block that is not a thinking block in the outbound body; compare blocks= on both sides to see whether luban stripped one, and at= for what sits there now"
+                        ),
+                        // 坐标压根解析不出来：这条错误的形态与判据的假设对不上，原文打出来供修判据。
+                        (None, None) => tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            kind,
+                            upstream_message = %message,
+                            "upstream rejected a historical thinking block, but its message carries no messages.<i>.content.<j> path to trace"
                         ),
                     }
                 }

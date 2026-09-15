@@ -3,7 +3,7 @@
 use axum::body::Bytes;
 
 use super::ban::parse_upstream_error;
-use super::digest::turn_label;
+use super::digest::{block_label, turn_label};
 use super::logging::{ReqLog, UsageSniffer};
 use super::rate_limit::RateLimitInfo;
 use super::upstream::{Upstream, error_chain, resp_shape, strip_assistant_prefill};
@@ -443,6 +443,32 @@ pub(super) struct ThinkingBlockTrace {
     /// 那一轮的块型序列（`tool_use` 连名字一起，见 [`block_label`]），两侧各一份。
     pub(super) inbound_turn: String,
     pub(super) outbound_turn: String,
+}
+
+/// 上游点名的那个坐标在一份体里落到什么上：`msgs=N role=R blocks=M at=<块标签>`。
+///
+/// [`trace_thinking_block`] 给 `None` 时（坐标上不是思考块）唯一能打的东西。那种情形下光有
+/// 一句「定位不到」等于什么都没说，而这三项各回答一个问题：`msgs` 与 `role` 说坐标本身对不对得上
+/// （上游那句「latest assistant message」指的是哪一条）；`blocks` 说那条消息在出站体里还剩几块，
+/// 与入站一比就知道 luban 有没有剥掉过块；`at` 说那个位置现在装的是什么——对「cannot be modified」
+/// 这条 400，上游记得那里是思考块而出站体里不是，本身就是答案。
+pub(super) fn block_site(body: &[u8], mi: usize, bi: usize) -> String {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return "<unparsable>".into();
+    };
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else {
+        return "<no messages>".into();
+    };
+    let Some(msg) = msgs.get(mi) else { return format!("msgs={} <no messages.{mi}>", msgs.len()) };
+    let n = msgs.len();
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+    let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+        return format!("msgs={n} role={role} content=<not an array>");
+    };
+    match blocks.get(bi) {
+        Some(b) => format!("msgs={n} role={role} blocks={} at={}", blocks.len(), block_label(b)),
+        None => format!("msgs={n} role={role} blocks={} at=<out of range>", blocks.len()),
+    }
 }
 
 /// 入站体里那个对应块的定位结果。没配上的三种理由分开记：它们指向的结论完全相反，
@@ -983,6 +1009,33 @@ mod tests {
         assert_eq!(t.inbound_at, "ambiguous(x2)", "坐标撞上了另一个同款块，不能认");
         assert_eq!(t.turn_identical, None);
         assert_eq!(t.inbound_turn, "-");
+    }
+
+    /// 坐标落点：定位不到思考块时唯一能打的东西，三项各答一个问题。
+    #[test]
+    fn block_site_reports_where_the_coordinate_lands() {
+        let body = traceable_body("ENCRYPTED", "Bash", false);
+        assert_eq!(
+            crate::proxy::block_site(&body, 1, 2),
+            "msgs=2 role=assistant blocks=3 at=redacted_thinking(data_len=9)"
+        );
+        // 上游点名的位置上不是思考块——「cannot be modified」那条 400 的现网形态。
+        assert_eq!(
+            crate::proxy::block_site(&body, 1, 1),
+            "msgs=2 role=assistant blocks=3 at=tool_use(Bash)"
+        );
+        // 出站体里那条消息被剥短了：`blocks=` 两侧一比就看得出来。
+        assert_eq!(
+            crate::proxy::block_site(&body, 1, 9),
+            "msgs=2 role=assistant blocks=3 at=<out of range>"
+        );
+        assert_eq!(
+            crate::proxy::block_site(&body, 0, 0),
+            "msgs=2 role=user blocks=1 at=text(len=2)"
+        );
+        assert_eq!(crate::proxy::block_site(&body, 7, 0), "msgs=2 <no messages.7>");
+        assert_eq!(crate::proxy::block_site(b"not json", 0, 0), "<unparsable>");
+        assert_eq!(crate::proxy::block_site(br#"{"model":"x"}"#, 0, 0), "<no messages>");
     }
 
     /// 块既没有 `signature` 也没有 `data`：没有可当身份的载荷，落 `unkeyed`。
