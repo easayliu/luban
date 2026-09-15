@@ -490,29 +490,60 @@ pub(super) struct LatestAssistant {
     pub(super) outbound_turn: String,
 }
 
-/// 轮摘要进日志的长度上限。块标签本身不含正文，但一轮几十块拼起来仍能刷屏。
+/// 轮摘要进日志的长度上限。块标签本身不含正文，但一串几十块拼起来仍能刷屏。
 const TURN_LABEL_CAP: usize = 400;
 
-fn capped_turn_label(m: &serde_json::Value) -> String {
-    let s = turn_label(m);
+fn cap_label(s: String) -> String {
     match s.char_indices().nth(TURN_LABEL_CAP) {
         Some((at, _)) => format!("{}…(+{}B)", &s[..at], s.len() - at),
         None => s,
     }
 }
 
-/// 两份体各自最后一条 assistant 消息的对照。
+/// 末尾那**一串连续的** assistant 消息的下标区间（左闭右开）。
+///
+/// 上游把相邻同角色的消息并成一轮（Messages API 的既定行为），所以它说的「latest assistant
+/// message」是这一整串，不是数组里最后那一条。只看最后一条会把
+/// `assistant(thinking) → assistant(tool_use)` 判成「末轮没有思考块」——而那一轮明明有，
+/// [`demote_thinking_blocks`] 也确实动得到它。
+fn latest_assistant_run(msgs: &[serde_json::Value]) -> Option<std::ops::Range<usize>> {
+    let is_assistant =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("assistant");
+    let end = msgs.iter().rposition(is_assistant)? + 1;
+    let mut start = end - 1;
+    while start > 0 && is_assistant(&msgs[start - 1]) {
+        start -= 1;
+    }
+    Some(start..end)
+}
+
+/// 一串消息在摘要里的写法：块按上游合并后的顺序连起来，`assistant:blk,blk,…`。
+/// 与 [`turn_label`] 同一套块标签，只是跨越整串。
+fn run_label(msgs: &[serde_json::Value], run: std::ops::Range<usize>) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    for m in &msgs[run] {
+        match m.get("content") {
+            Some(serde_json::Value::Array(bs)) => blocks.extend(bs.iter().map(block_label)),
+            Some(serde_json::Value::String(t)) => blocks.push(format!("text(len={})", t.len())),
+            _ => blocks.push("?".into()),
+        }
+    }
+    cap_label(format!("assistant:{}", blocks.join(",")))
+}
+
+/// 两份体各自末尾那串 assistant 消息的对照。
 ///
 /// 「`thinking` blocks in the latest assistant message cannot be modified」这条 400 明说了是
-/// **最后一条 assistant 消息**，而它随手给的那个坐标未必对得上 luban 实际发出去的那份体——
-/// 现网见过 `messages.65.content.13` 落在一份 551 条消息的体上，而那第 65 条只有 2 块，
-/// 入站出站都越界（见 [`block_site`] 打出来的两侧落点）。坐标靠不住就别靠坐标：两侧各自
-/// 找最后一条 assistant 消息自己比。
+/// **最后一条 assistant 消息**（按上游的合并口径即末尾那一串，见 [`latest_assistant_run`]），
+/// 而它随手给的那个坐标未必对得上 luban 实际发出去的那份体——现网见过
+/// `messages.65.content.13` 落在一份 551 条消息的体上、`messages.223.content.21` 落在一份
+/// 1403 条的体上，两侧都越界（见 [`block_site`] 打出来的两侧落点）。坐标靠不住就别靠坐标：
+/// 两侧各自找那一串自己比。
 ///
 /// 两项判断分开给，因为它们回答的不是同一个问题，合成一个就必有一头失真：
-/// - `turn_same=false`：那一轮的**结构**被改过（块被剥、`tool_use.name` 被混淆），两份
+/// - `turn_same=false`：那一串的**结构**被改过（块被剥、`tool_use.name` 被混淆），两份
 ///   `*_turn` 一比即见改的是哪一块；
-/// - `thinking_bytes_same=false`：那一轮里思考块的**原始字节**变了——上游校验的就是这个，
+/// - `thinking_bytes_same=false`：那一串里思考块的**原始字节**变了——上游校验的就是这个，
 ///   这一项为假才是这条 400 板上钉钉的成因。
 ///
 /// 只有两项**都**为真才能说 luban 原样转发了那一轮，这条 400 的成因在 luban 之外（最常见的
@@ -523,39 +554,47 @@ fn capped_turn_label(m: &serde_json::Value) -> String {
 /// 的请求指认成改过。而排版差异不在上游的判据里，思考块的字节在（`preserve_thinking_encoding`
 /// 专门把它们还原回原样），所以字节这一项只取思考块。
 pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAssistant {
-    let last_assistant = |body: &[u8]| -> Option<(usize, serde_json::Value)> {
+    let parse = |body: &[u8]| -> Option<(serde_json::Value, std::ops::Range<usize>)> {
         let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-        let msgs = v.get("messages")?.as_array()?;
-        msgs.iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .map(|(i, m)| (i, m.clone()))
+        let run = latest_assistant_run(v.get("messages")?.as_array()?)?;
+        Some((v, run))
     };
-    let ib = last_assistant(inbound);
-    let ob = last_assistant(outbound);
-    let at = |x: &Option<(usize, serde_json::Value)>| {
-        x.as_ref().map_or_else(|| "none".into(), |(i, _)| format!("messages.{i}"))
+    let ib = parse(inbound);
+    let ob = parse(outbound);
+    type Parsed = Option<(serde_json::Value, std::ops::Range<usize>)>;
+    let msgs = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+        v.get("messages").and_then(|m| m.as_array()).cloned().unwrap_or_default()
     };
-    let label = |x: &Option<(usize, serde_json::Value)>| {
-        x.as_ref().map_or_else(|| "-".into(), |(_, m)| capped_turn_label(m))
+    let at = |x: &Parsed| match x {
+        None => "none".to_string(),
+        // 一条就写一条，连着好几条才写区间——绝大多数请求是前者，别让日志凭空多个减号。
+        Some((_, r)) if r.len() == 1 => format!("messages.{}", r.start),
+        Some((_, r)) => format!("messages.{}-{}", r.start, r.end - 1),
     };
-    // 结构比：两侧各自 `Value` 再同一套序列化。这一步会抹平空白与转义，故只作数于「结构变了」
-    // 这一头，判无罪要连下面那项一起看。
+    let label = |x: &Parsed| match x {
+        None => "-".to_string(),
+        Some((v, r)) => run_label(&msgs(v), r.clone()),
+    };
+    // 结构比：两侧各自把那一串序列化成数组再比。这一步会抹平空白与转义，故只作数于
+    // 「结构变了」这一头，判无罪要连下面那项一起看。串长不同（luban 拆了或并了消息）
+    // 直接就是两个不同的数组，同样落到 false。
     let turn_same = match (&ib, &ob) {
-        (Some((_, a)), Some((_, b))) => match (serde_json::to_vec(a), serde_json::to_vec(b)) {
-            (Ok(a), Ok(b)) => Some(a == b),
-            _ => None,
-        },
+        (Some((iv, ir)), Some((ov, or))) => {
+            let (im, om) = (msgs(iv), msgs(ov));
+            match (serde_json::to_vec(&im[ir.clone()]), serde_json::to_vec(&om[or.clone()])) {
+                (Ok(a), Ok(b)) => Some(a == b),
+                _ => None,
+            }
+        }
         _ => None,
     };
-    // 字节比：只取那一轮里的思考块，那才是上游按字节校验的东西。
+    // 字节比：只取那一串里的思考块，那才是上游按字节校验的东西。
     let thinking_bytes_same = match (
         std::str::from_utf8(inbound).ok().zip(ib.as_ref()),
         std::str::from_utf8(outbound).ok().zip(ob.as_ref()),
     ) {
-        (Some((i, (im, _))), Some((o, (om, _)))) => {
-            Some(thinking_bytes_of_turn(i, *im) == thinking_bytes_of_turn(o, *om))
+        (Some((i, (_, ir))), Some((o, (_, or)))) => {
+            Some(thinking_bytes_of_run(i, ir.clone()) == thinking_bytes_of_run(o, or.clone()))
         }
         _ => None,
     };
@@ -569,15 +608,56 @@ pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAs
     }
 }
 
-/// 某一轮里全部思考块的**原始字节**，按出现顺序。
+/// 末尾那串 assistant 消息里有没有 `thinking` / `redacted_thinking` 块。
+///
+/// [`is_thinking_modified_error`] 那条 400 点名的是**最后一条 assistant 消息**（按上游的合并
+/// 口径即末尾那一串，见 [`latest_assistant_run`]），而 [`retry_demoted_thinking`] 的全部动作
+/// 就是把思考块降级成 text、把 `redacted_thinking` 删掉。那一串里一个思考块都没有时，降级
+/// 改不到它一个字节，重发出去的还是同一条被拒的形态——这一发上游往返是**注定白费的**，
+/// 且它每轮复发（历史里那个缺口不会自己长回来）。
+///
+/// 现网形态：`assistant:tool_use(Edit)` 单块一串——上游当初连着 `tool_use` 一起签发的那个
+/// thinking 块被客户端或它上游的中转丢掉了，于是每一轮都先撞一次 400、再白跑一次重试。
+///
+/// **按串不按条**：`assistant(thinking) → assistant(tool_use)` 在上游眼里是一轮，思考块在
+/// 前一条上，降级动得到它，这种要照常重试。存疑一律算「有」——多跑一次重试只是回到改这道
+/// 闸之前，而少跑一次就是把一条本可救回的会话判死。
+///
+/// **必须传出站体**（`sent`），不能传客户端原件。哪几条消息挨在一起是 [`rewrite_body`] 之后
+/// 才定下来的：[`hoist_system_role_messages`] 与 [`drop_empty_system_messages`] 会把
+/// `messages` 里的 `role:"system"` 整条摘走，于是
+/// `assistant(thinking) → system → assistant(tool_use)` 出站时变成两条挨着的 assistant、
+/// 被上游并成一轮。拿原件判，那条 system 还夹在中间，串就只剩最后一条、看着没有思考块，
+/// 于是跳过一次**本该跑**的重试。出站体是上游真正看到并拒掉的那一份，不必去复刻改写规则。
+///
+/// 降级本身仍作用在客户端原件上（[`retry_demoted_thinking`] 拿 `client_body` 重走一遍
+/// `shape`），这不矛盾：它对**每一条** assistant 消息一视同仁地降级，出站串里那些块无论
+/// 原先隔着什么，源头都在原件里，降级都动得到。
+pub(super) fn latest_assistant_has_thinking(outbound: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(outbound) else { return false };
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let Some(run) = latest_assistant_run(msgs) else { return false };
+    msgs[run].iter().any(|m| {
+        m.get("content").and_then(|c| c.as_array()).is_some_and(|bs| {
+            bs.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+        })
+    })
+}
+
+/// 一串消息里全部思考块的**原始字节**，按出现顺序。
 ///
 /// 取原文切片而不是解析后的值：上游对 `signature` / `data` 是按字节校验的，而
 /// `serde_json` 往返会换掉转义策略（`\/` 写回 `/`、`\u0061` 写回 `a`），逻辑值没变、字节变了，
 /// 正是 [`preserve_thinking_encoding`] 要防的那一种。
-fn thinking_bytes_of_turn(json: &str, msg: usize) -> Vec<&str> {
+fn thinking_bytes_of_run(json: &str, run: std::ops::Range<usize>) -> Vec<&str> {
     thinking_block_byte_ranges(json)
         .into_iter()
-        .filter(|b| b.msg == msg)
+        .filter(|b| run.contains(&b.msg))
         .map(|b| &json[b.span])
         .collect()
 }
@@ -1206,6 +1286,54 @@ mod tests {
         assert_eq!(d.inbound_turn, "-");
     }
 
+    /// 末轮是连续两条 assistant（上游并成一轮）：区间写成 `messages.A-B`，块按合并后的顺序
+    /// 连起来，而 luban 改的是**靠前**那一条。只比数组里最后那一条会给出 `turn_same=true`
+    /// 的伪无罪——改的那条压根没进比较。
+    #[test]
+    fn latest_assistant_diff_covers_the_whole_merged_run() {
+        let run = |name: &str| {
+            format!(
+                concat!(
+                    r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}},"#,
+                    r#"{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"{name}","input":{{}}}}]}},"#,
+                    r#"{{"role":"assistant","content":[{{"type":"text","text":"done"}}]}}]}}"#
+                ),
+                name = name
+            )
+        };
+        let inbound = run("Bash");
+        let outbound = run("mcp__luban__abcBas00");
+        let d = crate::proxy::latest_assistant_diff(inbound.as_bytes(), outbound.as_bytes());
+        assert_eq!(d.inbound_at, "messages.1-2", "整串都算这一轮");
+        assert_eq!(d.turn_same, Some(false), "改的是串里靠前那条，不能算没改");
+        assert!(d.inbound_turn.contains("tool_use(Bash)"), "{}", d.inbound_turn);
+        assert!(
+            d.inbound_turn.contains("text(len=4)"),
+            "块要按合并后的顺序连起来: {}",
+            d.inbound_turn
+        );
+    }
+
+    /// 思考块在串里靠前那条上、被 luban 改了字节：同样要抓到。
+    #[test]
+    fn latest_assistant_diff_checks_thinking_bytes_across_the_run() {
+        let run = |sig: &str| {
+            format!(
+                concat!(
+                    r#"{{"messages":[{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"{sig}"}}]}},"#,
+                    r#"{{"role":"assistant","content":[{{"type":"text","text":"done"}}]}}]}}"#
+                ),
+                sig = sig
+            )
+        };
+        let d = crate::proxy::latest_assistant_diff(
+            run(r"ab\/cd==").as_bytes(),
+            run("ab/cd==").as_bytes(),
+        );
+        assert_eq!(d.turn_same, Some(true), "逻辑值相同");
+        assert_eq!(d.thinking_bytes_same, Some(false), "字节变了，且那个块不在串的最后一条上");
+    }
+
     /// 逻辑值相同、字节不同：客户端把签名里的 `/` 写成 `\/`（PHP 那类编码器的默认），
     /// luban 出站写回 `/`。`turn_same` 看不出来（Value 往返抹平转义），而上游对签名是按字节
     /// 校验的——只认结构那一项就会把这条 400 的真凶判成无罪。
@@ -1244,6 +1372,91 @@ mod tests {
         let d = crate::proxy::latest_assistant_diff(inbound.as_bytes(), outbound.as_bytes());
         assert_eq!(d.turn_same, Some(true));
         assert_eq!(d.thinking_bytes_same, Some(true), "块本身逐字相同，排版不算改");
+    }
+
+    /// 最后一条 assistant 消息里有没有可降级的思考块——「被改过」那条 400 要不要花一次
+    /// 上游往返去重试，全看这个。
+    #[test]
+    fn latest_assistant_has_thinking_gates_the_pointless_retry() {
+        // 现网形态：末轮只有一个 tool_use，思考块被客户端丢了。降级改不到它，重试白跑。
+        let no_thinking = br#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"hi"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(!crate::proxy::latest_assistant_has_thinking(no_thinking));
+
+        // 末轮带思考块：降级动得到它，该重试。
+        let with_thinking = br#"{"messages":[
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"t","signature":"SIG"},
+                {"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(crate::proxy::latest_assistant_has_thinking(with_thinking));
+
+        // redacted_thinking 同样算：降级对它是整块删。
+        let redacted = br#"{"messages":[{"role":"assistant","content":[
+            {"type":"redacted_thinking","data":"ZZZZ"}]}]}"#;
+        assert!(crate::proxy::latest_assistant_has_thinking(redacted));
+
+        // 隔着一条 user 的更早那轮不算：上游不会把它并进来，降级救不了被点名的那一轮。
+        let only_earlier = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
+            {"role":"user","content":[{"type":"text","text":"go on"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(!crate::proxy::latest_assistant_has_thinking(only_earlier));
+
+        // 连续两条 assistant：上游并成一轮，思考块在前一条上，降级动得到它 —— 该重试。
+        // 只看数组里最后那一条会判成「没有」，把一条本可救回的会话判死。
+        let merged_run = br#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"hi"}]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(
+            crate::proxy::latest_assistant_has_thinking(merged_run),
+            "相邻同角色会被上游并成一轮，思考块在串里就算有"
+        );
+
+        // 夹着一条 `role:"system"` 的两条 assistant：**按这份体**它们不相邻，串就只有最后
+        // 那一条，判「没有」是对的。但 rewrite_body 会把这条 system 整条摘走
+        // （hoist_system_role_messages / drop_empty_system_messages），出站时两条 assistant
+        // 挨在一起、被上游并成一轮，那一轮是带思考块的——所以调用处必须传出站体。
+        // 下面两条断言钉的就是这个差别：同一段历史，改写前后结论相反。
+        let separated = br#"{"messages":[
+            {"role":"user","content":[{"type":"text","text":"hi"}]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
+            {"role":"system","content":[{"type":"text","text":"deferred tools"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(
+            !crate::proxy::latest_assistant_has_thinking(separated),
+            "这份体里那条 system 还夹在中间，串确实只有最后一条"
+        );
+        let hoisted = br#"{"system":[{"type":"text","text":"deferred tools"}],"messages":[
+            {"role":"user","content":[{"type":"text","text":"hi"}]},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(
+            crate::proxy::latest_assistant_has_thinking(hoisted),
+            "system 被提升走之后两条 assistant 相邻，这一轮带着思考块，该重试"
+        );
+
+        // 三条连着、思考块在最前面那条：整串都要看，不是只看倒数第二条。
+        let long_run = br#"{"messages":[
+            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
+            {"role":"assistant","content":[{"type":"text","text":"a"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
+        assert!(crate::proxy::latest_assistant_has_thinking(long_run));
+
+        // 取不到就当没有：宁可少跑一次重试，也不拿一次上游往返去赌。
+        for none in [
+            &br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#[..],
+            &br#"{"messages":[{"role":"assistant","content":"plain string"}]}"#[..],
+            &br#"{"model":"x"}"#[..],
+            &b"not json"[..],
+        ] {
+            assert!(
+                !crate::proxy::latest_assistant_has_thinking(none),
+                "不该算有: {}",
+                String::from_utf8_lossy(none)
+            );
+        }
     }
 
     /// 轮摘要封顶：块标签不含正文，但一轮几十块拼起来照样刷屏。

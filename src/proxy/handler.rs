@@ -46,7 +46,8 @@ use super::simulation::{Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
     block_site, error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
     is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
-    retry_demoted_thinking, retry_without_prefill, thinking_block_error_kind, trace_thinking_block,
+    latest_assistant_has_thinking, retry_demoted_thinking, retry_without_prefill,
+    thinking_block_error_kind, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
@@ -1808,6 +1809,18 @@ pub(super) async fn handle_inner(
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             "upstream rejected modified thinking blocks; demote-and-retry is off, passing through as is"
+                        );
+                    } else if !latest_assistant_has_thinking(&sent) {
+                        // 这条 400 点名的是最后一条 assistant 消息，而降级重试的全部动作就是
+                        // 处理思考块。那一轮里一个都没有时，重发的还是同一条被拒的形态——
+                        // 这一发上游往返注定白费，且它每轮复发（历史里那个缺口不会自己长回来）。
+                        //
+                        // 判的是 `sent` 不是 `body`：哪几条消息挨在一起（上游据此并轮）是改写
+                        // 之后才定下来的，摘掉一条 `role:"system"` 就能让两条 assistant 变成
+                        // 相邻。见 [`latest_assistant_has_thinking`]。
+                        tracing::warn!(
+                            cred_id = cred.id, cred = %cred.label,
+                            "upstream rejected modified thinking blocks, but the latest assistant message has no thinking block to demote (its blocks were most likely dropped by the client before it got here); skipping the retry that could not change that turn, passing through as is"
                         );
                     } else if let Some(up) = retry_demoted_thinking(
                         &upstream,
