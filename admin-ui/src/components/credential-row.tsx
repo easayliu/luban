@@ -91,28 +91,31 @@ const COL = {
       168px 才放全，多数行却只有「运行正常」四个字，大半是空白。表格里让徽标换到两行（行高本来
       就是两行：账号名 + 添加时间），列宽收到 144px，状态文字一个不丢，见 ScheduleControl。 */
   schedule: 'w-36',
-  /** 英文表头 "PRIORITY" 加排序箭头约 68px。 */
-  priority: 'w-22',
-  /** 「Max 20x」徽标约 60px；组织账号的两枚徽标本来就换行排。 */
-  tier: 'w-22',
+  /** 格子里只有 `P0`（约 18px），宽度是英文表头 `PRIORITY` + 排序箭头（约 86px）定的；
+      表头允许越到下一列的内边距里（`TOTAL COST` 一直如此），收到 80px 仍读得全。 */
+  priority: 'w-20',
+  /** 「Max 20x」徽标 58px；组织账号的两枚徽标本来就换行排。 */
+  tier: 'w-20',
   /**
-   * 摘要 `3,218 · 486M · $91.62` 用 text-xs 约 125px，放不下就截断、精确值在悬浮提示里。
+   * 一格里排四样：用量摘要（最长 `1,633 · 245M · $188.30` 实测约 140px）、百分比 28px、
+   * 进度条、重置倒计时 44px，分两行的依据见 [ListQuotaMeter] 里那段排版注释。
    *
-   * 格子里多了一项重置倒计时（见 [QuotaCountdown]，约 31px）：它和摘要同一行，进度条那行仍只有
-   * 进度条与百分比。w-36 时摘要被倒计时挤到 85px、三个数看得到头一个半，放宽这一档（+16px）
-   * 补回来；多要的 16px 从设备列匀过来，固定列合计不变，账号列一个像素都没少。
+   * 内容宽 = 列宽 − 20px：w-44 给 156px、2xl 的 w-48 给 172px。2xl 下除最长的那一条外都放得全，
+   * xl 下四位数请求 + 三位美元的几行会截尾——精确值在悬浮提示里（delay=0）。再宽就只能动账号列了，
+   * 那是身份列，不动。多要的 16px 由优先级、账号等级、RPM、累计花费（2xl 再加「最近使用」）
+   * 各让 8px 匀出来，固定列合计不变。
    */
-  quota5h: 'w-40 2xl:w-44',
-  quota7d: 'w-40 2xl:w-44',
+  quota5h: 'w-44 2xl:w-48',
+  quota7d: 'w-44 2xl:w-48',
   /**
    * 只剩一枚 `2/5` 名额徽章——「跟随默认」那枚不再画（见 [devicePolicyMeta]），w-32 里有一半
    * 是空白。收到 w-24：英文表头 `DEVICES` 比同宽的 `LAST USED`、`TOTAL COST` 都短，那两列
    * 一直是这个宽度。
    */
   devices: 'w-24',
-  rpm: 'w-20',
-  recent: 'hidden w-24 2xl:table-cell',
-  cost: 'w-24',
+  rpm: 'w-18',
+  recent: 'hidden w-22 2xl:table-cell',
+  cost: 'w-22',
   action: 'w-10',
 } as const
 
@@ -879,12 +882,14 @@ function ListQuotaMeter({
               <SummaryValue hint={summaryTitle}>{expired ? '—' : usageSummary}</SummaryValue>
             )}
           </div>
-          <div className="flex shrink-0 items-baseline gap-1.5">
-            <span className="text-xs text-muted-foreground">{emptyLabel}</span>
-            {!showLabel && <QuotaCountdown reset={reset} now={now} />}
-          </div>
+          <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
         </div>
-        <div className="h-2 w-full bg-input" aria-hidden />
+        {/* 两行的排法与有用量时保持一致（见下面那条注释）：第一行说用量，第二行是这个窗口的时间
+            维度——占位条虽然没有数据可画，位置与倒计时的落点仍与隔壁格子对得齐。 */}
+        <div className="flex items-center gap-2">
+          <div className="h-2 min-w-0 flex-1 bg-input" aria-hidden />
+          {!showLabel && <QuotaCountdown reset={reset} now={now} />}
+        </div>
         {showLabel && !expired && (requests != null || cost != null || tokens != null || reset != null) && (
           <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
         )}
@@ -902,22 +907,26 @@ function ListQuotaMeter({
 
   const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
   if (!showLabel) {
-    // 表格那格 10rem，两行各管一件事：第一行是「这个窗口发生了什么」（用量摘要 + 还有多久重置），
-    // 第二行是「还剩多少」（进度条 + 百分比）。倒计时不跟进度条挤一行——它占 31px、百分比再占
-    // 28px，两道 gap 之后进度条只剩 65px，比同一行里的文字还短，一眼看不出长短差别；挪上去之后
-    // 进度条拿回整行（约 104px）。代价是摘要窄了一档、长值会截断，精确值本来就在悬浮提示里。
+    // 表格那格 11rem（内容宽 156px）里要排四样东西，按「谁跟谁是一件事」分两行，而不是按大小塞：
+    // 第一行是用量本身（摘要 + 百分比，两个都在回答「用掉多少」），第二行是这个窗口的时间维度
+    // （进度条 + 还有多久重置）。
+    //
+    // 分法是按实测宽度定的：摘要最长 `1,633 · 245M · $188.30` 要 130px，百分比 28px、倒计时
+    // 44px。倒计时若留在第一行，130 + 8 + 44 = 182px 放不下、摘要必被截断（上一版就是这样）；
+    // 换成百分比同行是 166px，xl 下只有最长的那几条会截掉尾巴、2xl（内容宽 172px）一条都不截。
+    // 进度条这边反而更宽：整行减去倒计时还有 104px（2xl 120px），比没有倒计时之前的 88px 还长。
     return (
       <Meter value={percentage} max={100} title={title}>
         <div className="flex min-w-0 items-baseline justify-between gap-2">
           <MeterLabel className="sr-only">{label}</MeterLabel>
           <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>
-          <QuotaCountdown reset={reset} now={now} />
+          <MeterValue className="shrink-0 font-medium text-xs leading-none">{() => `${percentage}%`}</MeterValue>
         </div>
         <div className="flex items-center gap-2">
           <MeterTrack className="min-w-0 flex-1">
             <MeterIndicator className={indicatorClass} />
           </MeterTrack>
-          <MeterValue className="shrink-0 font-medium text-xs leading-none">{() => `${percentage}%`}</MeterValue>
+          <QuotaCountdown reset={reset} now={now} />
         </div>
       </Meter>
     )
@@ -964,8 +973,8 @@ function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }
 /**
  * 「还有多久重置」——与卡片上那枚倒计时同一个表达（见 credential-card 里的同一段）：`text-2xs`
  * 的次要色、同一套 [formatCountdown] 缩写，精确到分的绝对时刻放在 title 里。两种视图看同一个数
- * 时长得一样，从卡片切到表格不用重新认一遍。位置两边不同：卡片宽，跟在百分比后面仍留得下进度条；
- * 表格那格只有 10rem，它靠右贴在摘要那一行，把第二行整行让给进度条。
+ * 时长得一样，从卡片切到表格不用重新认一遍。位置两边不同：卡片宽，进度条、百分比、倒计时三样
+ * 挤一行仍留得下进度条；表格那格只有 11rem，百分比跟摘要走、倒计时跟进度条走，见那段排版注释。
  *
  * 倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；它受本地时钟偏差影响，只适合
  * 看个大概，要对准时刻的场合仍看 title 里的 [formatFullTime]。
