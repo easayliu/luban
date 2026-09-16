@@ -62,14 +62,22 @@ import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  cn, displayCredentialLabel, formatClockTime, formatFullTime, formatTokens, formatUsd, relativeTime,
+  cn,
+  displayCredentialLabel,
+  formatClockTime,
+  formatCountdown,
+  formatFullTime,
+  formatTokens,
+  formatUsd,
+  relativeTime,
 } from '@/lib/utils'
 
 /**
  * 列宽预算（表格是 `table-fixed`，账号列吃掉剩余宽度）。
  *
  * 固定列合计：xl 992px（不含「最近使用」）、2xl 1120px（多出「最近使用」，两列用量各放宽
- * 一档）。容器最大 88rem（见 `.page-frame`）：1280 宽的屏上表格约 1214px，账号列约 220px；
+ * 一档）。改这里时两列用量与设备列是一组：它们之间只能互相匀，合计一动账号列就跟着缩。
+ * 容器最大 88rem（见 `.page-frame`）：1280 宽的屏上表格约 1214px，账号列约 220px；
  * ≥1536 的屏约 1406px，账号列约 286px。
  * 「最近使用」只在 2xl 起显示——它是 12 列里信息量最低的一列，排序菜单里仍可按它排。
  * 每格内边距 p-2.5，各列的可用内容宽度 = 列宽 − 20px。
@@ -87,10 +95,21 @@ const COL = {
   priority: 'w-22',
   /** 「Max 20x」徽标约 60px；组织账号的两枚徽标本来就换行排。 */
   tier: 'w-22',
-  /** 摘要 `3,218 · 486M · $91.62` 用 text-xs 约 125px，放不下就截断、精确值在悬浮提示里。 */
-  quota5h: 'w-36 2xl:w-40',
-  quota7d: 'w-36 2xl:w-40',
-  devices: 'w-32',
+  /**
+   * 摘要 `3,218 · 486M · $91.62` 用 text-xs 约 125px，放不下就截断、精确值在悬浮提示里。
+   *
+   * 格子里多了一项重置倒计时（见 [QuotaCountdown]，约 31px）：它和摘要同一行，进度条那行仍只有
+   * 进度条与百分比。w-36 时摘要被倒计时挤到 85px、三个数看得到头一个半，放宽这一档（+16px）
+   * 补回来；多要的 16px 从设备列匀过来，固定列合计不变，账号列一个像素都没少。
+   */
+  quota5h: 'w-40 2xl:w-44',
+  quota7d: 'w-40 2xl:w-44',
+  /**
+   * 只剩一枚 `2/5` 名额徽章——「跟随默认」那枚不再画（见 [devicePolicyMeta]），w-32 里有一半
+   * 是空白。收到 w-24：英文表头 `DEVICES` 比同宽的 `LAST USED`、`TOTAL COST` 都短，那两列
+   * 一直是这个宽度。
+   */
+  devices: 'w-24',
   rpm: 'w-20',
   recent: 'hidden w-24 2xl:table-cell',
   cost: 'w-24',
@@ -305,6 +324,7 @@ export const CredentialRow = memo(function CredentialRow({
                 tokens={cred.quota?.tokens_5h ?? null}
                 reported={quota.h5.reported}
                 hasSnapshot={quota.hasSnapshot}
+                now={now}
               />
               <ListQuotaMeter
                 label="7d"
@@ -316,6 +336,7 @@ export const CredentialRow = memo(function CredentialRow({
                 tokens={cred.quota?.tokens_7d ?? null}
                 reported={quota.d7.reported}
                 hasSnapshot={quota.hasSnapshot}
+                now={now}
               />
             </div>
 
@@ -343,7 +364,8 @@ export const CredentialRow = memo(function CredentialRow({
                   <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
                     {cred.device_count}/{effectiveLimit}
                   </Badge>
-                  <span className="text-muted-foreground">{policy.label}</span>
+                  {/* 同上：跟随默认不占这一行的宽度，见 [devicePolicyMeta]。 */}
+                  {!policy.isDefault && <span className="text-muted-foreground">{policy.label}</span>}
                 </Button>
               </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
@@ -446,6 +468,7 @@ export const CredentialRow = memo(function CredentialRow({
             tokens={cred.quota?.tokens_5h ?? null}
             reported={quota.h5.reported}
             hasSnapshot={quota.hasSnapshot}
+            now={now}
             showLabel={false}
           />
         </TableCell>
@@ -460,6 +483,7 @@ export const CredentialRow = memo(function CredentialRow({
             tokens={cred.quota?.tokens_7d ?? null}
             reported={quota.d7.reported}
             hasSnapshot={quota.hasSnapshot}
+            now={now}
             showLabel={false}
           />
         </TableCell>
@@ -476,7 +500,8 @@ export const CredentialRow = memo(function CredentialRow({
             <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
               {cred.device_count}/{effectiveLimit}
             </Badge>
-            <Badge variant={policy.variant} size="sm">{policy.label}</Badge>
+            {/* 跟随默认那一档不画徽章，见 [devicePolicyMeta]；策略仍写在按钮的悬浮提示里。 */}
+            {!policy.isDefault && <Badge variant={policy.variant} size="sm">{policy.label}</Badge>}
           </Button>
         </TableCell>
         <TableCell className={cn(COL.rpm, 'text-right')}>
@@ -771,6 +796,7 @@ function ListQuotaMeter({
   tokens,
   reported,
   hasSnapshot,
+  now,
   showLabel = true,
 }: {
   label: string
@@ -785,6 +811,8 @@ function ListQuotaMeter({
   reported: boolean
   /** 该账号是否已有额度快照；用于把「还没数据」和「无此窗口」分开。 */
   hasSnapshot: boolean
+  /** 页面时钟（30 秒一跳），重置倒计时靠它走，见 [formatCountdown]。 */
+  now: number
   showLabel?: boolean
 }) {
   const { t, language, locale } = useI18n()
@@ -851,7 +879,10 @@ function ListQuotaMeter({
               <SummaryValue hint={summaryTitle}>{expired ? '—' : usageSummary}</SummaryValue>
             )}
           </div>
-          <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
+          <div className="flex shrink-0 items-baseline gap-1.5">
+            <span className="text-xs text-muted-foreground">{emptyLabel}</span>
+            {!showLabel && <QuotaCountdown reset={reset} now={now} />}
+          </div>
         </div>
         <div className="h-2 w-full bg-input" aria-hidden />
         {showLabel && !expired && (requests != null || cost != null || tokens != null || reset != null) && (
@@ -871,13 +902,16 @@ function ListQuotaMeter({
 
   const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
   if (!showLabel) {
-    // 表格那格 9rem：摘要独占第一行才放得全（`3,218 · 486M · $91.62`），百分比挪到进度条右侧。
-    // 和百分比挤一行时摘要只剩 80 多像素，三个数里能看到的只有第一个。
+    // 表格那格 10rem，两行各管一件事：第一行是「这个窗口发生了什么」（用量摘要 + 还有多久重置），
+    // 第二行是「还剩多少」（进度条 + 百分比）。倒计时不跟进度条挤一行——它占 31px、百分比再占
+    // 28px，两道 gap 之后进度条只剩 65px，比同一行里的文字还短，一眼看不出长短差别；挪上去之后
+    // 进度条拿回整行（约 104px）。代价是摘要窄了一档、长值会截断，精确值本来就在悬浮提示里。
     return (
       <Meter value={percentage} max={100} title={title}>
-        <div className="flex min-w-0 items-baseline">
+        <div className="flex min-w-0 items-baseline justify-between gap-2">
           <MeterLabel className="sr-only">{label}</MeterLabel>
           <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>
+          <QuotaCountdown reset={reset} now={now} />
         </div>
         <div className="flex items-center gap-2">
           <MeterTrack className="min-w-0 flex-1">
@@ -924,6 +958,31 @@ function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }
         {hint}
       </TooltipPopup>
     </Tooltip>
+  )
+}
+
+/**
+ * 「还有多久重置」——与卡片上那枚倒计时同一个表达（见 credential-card 里的同一段）：`text-2xs`
+ * 的次要色、同一套 [formatCountdown] 缩写，精确到分的绝对时刻放在 title 里。两种视图看同一个数
+ * 时长得一样，从卡片切到表格不用重新认一遍。位置两边不同：卡片宽，跟在百分比后面仍留得下进度条；
+ * 表格那格只有 10rem，它靠右贴在摘要那一行，把第二行整行让给进度条。
+ *
+ * 倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；它受本地时钟偏差影响，只适合
+ * 看个大概，要对准时刻的场合仍看 title 里的 [formatFullTime]。
+ *
+ * 已经重置过的窗口（`reset <= now`）不画：那不是「到期时间」而是一段过去，格子右上角的
+ * 「已重置」已经说明了状态，具体时刻在整格的悬浮提示里。上游没报重置时刻的同理留空。
+ */
+function QuotaCountdown({ reset, now }: { reset: number | null; now: number }) {
+  const { t, language } = useI18n()
+  if (reset == null || reset <= now) return null
+  return (
+    <span
+      className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
+      title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+    >
+      {formatCountdown(reset, now)}
+    </span>
   )
 }
 
@@ -1010,8 +1069,20 @@ function ListQuotaDetails({
   )
 }
 
-function devicePolicyMeta(deviceLimit: number, language: Language): { label: string; variant: BadgeProps['variant'] } {
-  if (deviceLimit === 0) return { label: localize(language, '跟随默认', 'Default'), variant: 'secondary' }
-  if (deviceLimit < 0) return { label: localize(language, '不限', 'Unlimited'), variant: 'outline' }
-  return { label: localize(language, '自定义', 'Custom'), variant: 'info' }
+/**
+ * 名额策略的标签与配色。`isDefault`（跟随全局默认）是绝大多数账号的状态，列表里**不画**
+ * 这枚徽章：一列里每行都挂着同一个词，读者得逐行确认它没变，而真正要一眼看出来的是
+ * 「这个号被单独改过」。默认这一档只留在悬浮提示与设备对话框里——没有丢信息，只是不占位。
+ */
+function devicePolicyMeta(
+  deviceLimit: number,
+  language: Language,
+): { label: string; variant: BadgeProps['variant']; isDefault: boolean } {
+  if (deviceLimit === 0) {
+    return { label: localize(language, '跟随默认', 'Default'), variant: 'secondary', isDefault: true }
+  }
+  if (deviceLimit < 0) {
+    return { label: localize(language, '不限', 'Unlimited'), variant: 'outline', isDefault: false }
+  }
+  return { label: localize(language, '自定义', 'Custom'), variant: 'info', isDefault: false }
 }
