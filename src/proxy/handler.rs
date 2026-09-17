@@ -14,10 +14,10 @@ use super::ban::{
 };
 use super::body::{
     below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
-    client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
-    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
-    outbound_carries_fallbacks, outbound_ua, refusal_fallbacks_for, remember_fallback_rejection,
-    sim_device_id, stream_requested, trusted_cc_version, ua_of,
+    cc_tools_to_inject, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
+    extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
+    known_latest_release, outbound_carries_fallbacks, outbound_ua, refusal_fallbacks_for,
+    remember_fallback_rejection, sim_device_id, stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -1610,6 +1610,14 @@ pub(super) async fn handle_inner(
                     None
                 },
                 empty_replies: state.empty_replies.clone(),
+                // 只有模拟主线程 profile 会注；判据与 [`inject_cc_tools`] 同源。
+                injected_tools: upstream
+                    .sim
+                    .as_ref()
+                    .filter(|s| s.profile.has_billing_header())
+                    .zip(body_json.as_ref())
+                    .map(|(s, b)| cc_tools_to_inject(b, s.profile))
+                    .unwrap_or_default(),
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,

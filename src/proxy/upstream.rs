@@ -1079,6 +1079,7 @@ mod tests {
                 prompt_key: None,
                 app_key: None,
                 empty_replies: Default::default(),
+                injected_tools: Vec::new(),
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1169,6 +1170,7 @@ mod tests {
                 // 与提示词哈希同源的 system 哈希：按应用学的那条与按提示词学的那条一起验。
                 app_key: prompt.map(|(m, d)| (m.to_string(), format!("app-{d}"))),
                 empty_replies: mem.clone(),
+                injected_tools: Vec::new(),
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1429,6 +1431,7 @@ mod tests {
                 prompt_key: None,
                 app_key: None,
                 empty_replies: Default::default(),
+                injected_tools: Vec::new(),
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1456,6 +1459,85 @@ mod tests {
     }
 
     /// 透传流路径（`sse_aggregated=false`，绝大多数请求走这条）上，上游在 200 的流中途
+    /// 模型调了模拟路径注进去、客户端没声明的官方工具：`rewrites` 列打 `injected_tool_called`
+    /// 标签。客户端会收到一个自己不认识的 tool_use，这是注入策略的已知代价；此前只在文档里
+    /// 写着「概率低」，没有任何一处量过——流水的 `shape` 只记 tool_use 个数，遥测那张表又把
+    /// 名字归了类。调的是客户端自己的工具（假名 `mcp__luban__*`）或没注过的名字，不打标签。
+    #[test]
+    fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log() {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+        let build = |injected: Vec<&'static str>| crate::proxy::ReqLog {
+            started: std::time::Instant::now(),
+            ttft_ms: None,
+            method: "POST".into(),
+            path: "/v1/messages?beta=true".into(),
+            ua: "Go-http-client/1.1".into(),
+            ua_out: config::CC_USER_AGENT.into(),
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            device_id: None,
+            status: 200,
+            sse_aggregated: false,
+            sniffer: crate::proxy::UsageSniffer::new(true, false),
+            req_speed: None,
+            req_model: Some("claude-opus-5".into()),
+            ratelimit: rl_headers(&[]),
+            stream_broke: None,
+            request_id: "lb-test".into(),
+            client_request_id: None,
+            upstream_request_id: None,
+            forensics: Default::default(),
+            telemetry: None,
+            cc_session: None,
+            empty_reply_key: None,
+            prompt_key: None,
+            app_key: None,
+            empty_replies: Default::default(),
+            injected_tools: injected,
+            store: store.clone(),
+            _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
+            _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
+            _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+        };
+        let reply = |name: &str| -> Vec<u8> {
+            const SSE: &str = "event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t0\",\"name\":\"NAME\",\"input\":{}}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            SSE.replace("NAME", name).into_bytes()
+        };
+        // 调了注入的 Bash → 打标签。
+        let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
+        rl.sniffer.feed(&reply("Bash"));
+        drop(rl);
+        // 调的是客户端自己的工具（假名）→ 不打。
+        let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
+        rl.sniffer.feed(&reply("mcp__luban__query_bas00"));
+        drop(rl);
+        // 非模拟路径（没注过）调 Bash → 不打：那是客户端自己声明的 Bash。
+        let mut rl = build(Vec::new());
+        rl.sniffer.feed(&reply("Bash"));
+        drop(rl);
+
+        let logs = store.list_usage_logs(10).unwrap();
+        assert_eq!(logs.len(), 3);
+        // list 按时间倒序：最后写入的在前。
+        let tags: Vec<Option<&str>> =
+            logs.iter().rev().map(|l| l.forensics.rewrites.as_deref()).collect();
+        assert_eq!(tags, [Some("injected_tool_called"), None, None], "{tags:?}");
+        assert_eq!(logs[2].status, 200, "标签不改状态码与记账");
+    }
+
     /// 改口报错：客户端已经收到 200 头，改不动，但**记账**要按真实结果走。
     ///
     /// 这条曾是纯盲区。线上实例的原始形态是：`message_start` 与 `message_delta` 都到了，
@@ -1493,6 +1575,7 @@ mod tests {
             prompt_key: None,
             app_key: None,
             empty_replies: Default::default(),
+            injected_tools: Vec::new(),
             store: store.clone(),
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
@@ -1576,6 +1659,7 @@ mod tests {
             prompt_key: None,
             app_key: None,
             empty_replies: Default::default(),
+            injected_tools: Vec::new(),
             store: store.clone(),
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
@@ -2034,6 +2118,7 @@ mod tests {
             prompt_key: None,
             app_key: None,
             empty_replies: Default::default(),
+            injected_tools: Vec::new(),
             store,
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),

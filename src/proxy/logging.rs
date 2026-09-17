@@ -94,6 +94,12 @@ pub(super) struct ReqLog {
     /// 零输出请求类与被拒答提示词的记忆表，收尾时按上游回复的种类往里记，
     /// 见 [`ReqLog::note_unanswered_reply`]。
     pub(super) empty_replies: EmptyReplyMemory,
+    /// 模拟路径替客户端注进去、客户端自己**没声明**的官方工具名（[`cc_tools_to_inject`]）；
+    /// 非模拟路径与没注的为空。收尾时与回复里的 `tool_use` 名对一遍：模型若调了其中一个，
+    /// 客户端会收到一个自己不认识的工具调用——这是注入策略的已知代价，此前只在文档里写着
+    /// 「概率低」，没有任何地方量过。流水的 `shape` 只记 tool_use 的个数不记名字，
+    /// `toolUseContentLengths` 那张表又把名字归了类，两处都答不了「调的是不是注入的」。
+    pub(super) injected_tools: Vec<&'static str>,
     pub(super) store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     pub(super) _in_flight: InFlightGuard,
@@ -201,6 +207,30 @@ impl Drop for ReqLog {
             }
             tags.push_str(REWRITE_SERVED_BY_FALLBACK);
         }
+        // 回复里要客户端执行的 tool_use 名单，与注入名单对一遍。名字挂在下面那条 `forwarded`
+        // 上（没有就是 `-`），调到注入工具的另打一行 warn 并在 `rewrites` 列打标签——导出
+        // 与库里按标签就能数出「多少次、哪些客户端」，不必翻日志。
+        let tool_uses = self.sniffer.tool_use_names();
+        let injected_called: Vec<&str> =
+            tool_uses.iter().copied().filter(|n| self.injected_tools.contains(n)).collect();
+        if !injected_called.is_empty() {
+            tracing::warn!(
+                cred_id = self.cred_id, cred = %self.cred_label,
+                ua = %self.ua,
+                model = %self.sniffer.model.as_deref().or(self.req_model.as_deref()).unwrap_or("-"),
+                called = %injected_called.join(","),
+                tool_uses = %tool_uses.join(","),
+                request_id = %self.request_id,
+                "the model called an injected CC tool the client never declared"
+            );
+            let tags = self.forensics.rewrites.get_or_insert_with(String::new);
+            if !tags.is_empty() {
+                tags.push(',');
+            }
+            tags.push_str(REWRITE_INJECTED_TOOL_CALLED);
+        }
+        let tool_uses_col =
+            if tool_uses.is_empty() { "-".to_string() } else { tool_uses.join(",") };
         // 速度档以上游回报为准（fast 被限流时会回落），响应没带才退回请求声明。
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
         // 模型同理以响应为准（上游可能回落到别的模型），没有才用请求侧声明的那个。
@@ -263,6 +293,7 @@ impl Drop for ReqLog {
             request_id = %self.request_id,
             client_request_id = %self.client_request_id.as_deref().unwrap_or("-"),
             upstream_request_id = %self.upstream_request_id.as_deref().unwrap_or("-"),
+            tool_uses = %tool_uses_col,
             "forwarded"
         );
 
@@ -539,6 +570,9 @@ const REWRITE_EMPTY_REPLY: &str = "empty_reply";
 const REWRITE_REFUSAL: &str = "refusal";
 /// 流水 `rewrites` 列里标「请求模型拒答、由 fallback 模型作答」的标签。
 const REWRITE_SERVED_BY_FALLBACK: &str = "served_by_fallback";
+/// 流水 `rewrites` 列里标「模型调了模拟路径注入的、客户端没声明的官方工具」的标签，
+/// 见 [`ReqLog::injected_tools`]。
+const REWRITE_INJECTED_TOOL_CALLED: &str = "injected_tool_called";
 
 /// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
 pub(super) fn ban_context(
@@ -909,7 +943,15 @@ pub(super) const RESPONSE_EXCERPT_BYTES: usize = 8 * 1024;
 #[derive(Default, Clone)]
 struct ToolUseBlock {
     index: i64,
+    /// 遥测用的归类名（[`tool_use_label`]：`mcp__*` 归 `mcp_tool`、`skill__*` 归 `skill_tool`）。
     name: String,
+    /// 上游回的原名，一字不改——回答「模型到底调了哪个」用的是它，归类名答不了。
+    /// 回程还原假名在嗅探之后（[`stream_upstream`] 先喂嗅探器再过 [`restore_tool_names_stream`]），
+    /// 故客户端自有工具在这里是 `mcp__luban__*` 那个假名，注入的官方工具是官方名。
+    raw_name: String,
+    /// 是客户端要去执行的 `tool_use`（`server_tool_use` / `mcp_tool_use` 由上游自己跑完，
+    /// 客户端只看结果，不算）。
+    client_side: bool,
     /// 流式下是拼起来的 `partial_json`；非流式下是 `input` 直接序列化的结果。
     json: String,
     /// 见过 `input_json_delta`：此后 `json` 是增量拼的，别再被 `content_block_start`
@@ -1140,6 +1182,8 @@ impl UsageSniffer {
                 self.tool_uses.push(ToolUseBlock {
                     index,
                     name: tool_use_label(ty, name),
+                    raw_name: name.to_string(),
+                    client_side: ty == "tool_use",
                     json: cb.get("input").map(|i| i.to_string()).unwrap_or_else(|| "{}".into()),
                     from_delta: false,
                 });
@@ -1163,6 +1207,18 @@ impl UsageSniffer {
             match out.iter_mut().find(|(n, _)| *n == b.name) {
                 Some((_, v)) => *v += len,
                 None => out.push((b.name.clone(), len)),
+            }
+        }
+        out
+    }
+
+    /// 这条回复里要客户端去执行的 `tool_use` 原名，按首次出现去重。server tool 与
+    /// MCP server 那两类不在内：上游自己跑完，客户端拿不到 tool_use。
+    pub(super) fn tool_use_names(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for b in self.tool_uses.iter().filter(|b| b.client_side) {
+            if !out.contains(&b.raw_name.as_str()) {
+                out.push(&b.raw_name);
             }
         }
         out
@@ -1532,5 +1588,29 @@ mod tests {
         assert!(!s.saw_thinking);
         // serde 重新序列化后的 `{"file_path":"/a"}` = 18 个字符。
         assert_eq!(s.tool_use_lens(), vec![("Read".to_string(), 18)]);
+    }
+
+    /// 回复里的 `tool_use` **原名**另记一份：遥测那张表把 `mcp__*` 归成 `mcp_tool`，答不了
+    /// 「模型到底调了哪个」。server tool 与 MCP server 的调用不算——上游自己跑完，客户端拿
+    /// 不到那个 tool_use。同名多次只记一次。
+    #[test]
+    fn the_sniffer_keeps_raw_tool_use_names_for_client_side_blocks() {
+        let mut s = crate::proxy::UsageSniffer::new(true, false);
+        let block = |i: u32, ty: &str, name: &str| -> Vec<u8> {
+            const EV: &str = "event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":IDX,\"content_block\":{\"type\":\"TY\",\"id\":\"tIDX\",\"name\":\"NAME\",\"input\":{}}}
+
+";
+            EV.replace("IDX", &i.to_string()).replace("TY", ty).replace("NAME", name).into_bytes()
+        };
+        s.feed(&block(0, "tool_use", "Bash"));
+        s.feed(&block(1, "tool_use", "mcp__luban__query_bas00"));
+        s.feed(&block(2, "server_tool_use", "web_search"));
+        s.feed(&block(3, "mcp_tool_use", "mcp__ide__getDiagnostics"));
+        s.feed(&block(4, "tool_use", "Bash"));
+        assert_eq!(s.tool_use_names(), ["Bash", "mcp__luban__query_bas00"]);
+        // 遥测那张表照旧按归类名走，不受影响。
+        let lens: Vec<String> = s.tool_use_lens().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(lens, ["Bash", "mcp_tool", "web_search"]);
     }
 }

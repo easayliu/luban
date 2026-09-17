@@ -240,6 +240,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('thinking 降级重试', 'Retried with thinking demoted')
     case 'no_prefill':
       return t('剥掉 prefill 重试', 'Retried without prefill')
+    case 'injected_tool_called':
+      return t('模型调了注入的 CC 工具，客户端未声明', 'Model called an injected CC tool the client never declared')
     default:
       return tag
   }
