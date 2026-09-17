@@ -649,13 +649,16 @@ pub(super) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// 官方已发布的最新 Claude Code 版本：从 `downloads.claude.ai/claude-code-releases/latest`
-/// 学来的（[`crate::oauth::latest_release`]）与写死的 [`config::CC_VERSION_BASE`] 取大者。
+/// 学来的（[`crate::oauth::latest_release`]）与写死的 [`config::CC_LATEST_KNOWN_RELEASE`]
+/// 取大者。
 ///
-/// 取大者是为了两头兜底：进程刚起还没拉到 `latest` 时有个不至于太旧的下限；反过来那个
-/// 端点若哪天回了个比 luban 自己模拟的版本还旧的数（缓存、回滚），也不能把 luban 自己发
-/// 出去的版本判成「不存在」。
+/// 取大者是为了两头兜底：进程刚起还没拉到 `latest` 时有个不至于太旧的下限——下限是**抓包
+/// 证实过的**最新版，不是模拟路径那个更旧的 [`config::CC_VERSION_BASE`]，否则启动窗口里真实
+/// 新版的来访会被判成冒充；反过来那个端点若哪天回了个更旧的数（缓存、回滚），也不能把已经
+/// 证实存在的版本判成「不存在」。写死的那个不低于模拟版本，有测试钉着，故 luban 自己发出去
+/// 的版本也在上限之内。
 pub(crate) fn known_latest_release() -> (u64, u64, u64) {
-    let base = parse_version(config::CC_VERSION_BASE).unwrap_or((0, 0, 0));
+    let base = parse_version(config::CC_LATEST_KNOWN_RELEASE).unwrap_or((0, 0, 0));
     crate::oauth::latest_release().map_or(base, |l| l.max(base))
 }
 
@@ -5401,12 +5404,19 @@ mod tests {
         assert_eq!(t("python-httpx/0.27.0"), None, "非 CC 客户端本来就读不出");
     }
 
-    /// 没学到 `latest` 时上限退回 [`config::CC_VERSION_BASE`]，且学到的值不会把上限拉到
-    /// 它之下。
+    /// 没学到 `latest` 时上限退回 [`config::CC_LATEST_KNOWN_RELEASE`]，且学到的值不会把上限
+    /// 拉到它之下。模拟版本 [`config::CC_VERSION_BASE`] 更旧，自然也在上限之内。
     #[test]
     fn known_latest_release_is_at_least_the_baked_in_version() {
-        let base = crate::proxy::parse_version(config::CC_VERSION_BASE).unwrap();
-        assert!(crate::proxy::known_latest_release() >= base);
+        let v = |s: &str| crate::proxy::parse_version(s).unwrap();
+        let latest = crate::proxy::known_latest_release();
+        assert!(latest >= v(config::CC_LATEST_KNOWN_RELEASE));
+        assert!(latest >= v(config::CC_VERSION_BASE));
+        // 抓包证实的 2.1.270 来访：没学到 `latest` 也得认，不能落成「读不出版本」。
+        assert_eq!(
+            crate::proxy::trusted_cc_version("claude-cli/2.1.270 (external, cli)"),
+            Some((2, 1, 270))
+        );
     }
 
     /// 最低版本闸的三态：低于门槛才拒，等于/高于放行；闸没配、UA 不是 CC、版本读不出来

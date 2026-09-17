@@ -42,16 +42,26 @@ use super::uuid_from_bytes;
 /// - [`config::CC_BETA_SERVER_SIDE_FALLBACK`]：`effort` 之后；没有 `effort`（haiku）就在
 ///   `advanced-tool-use` 之后。
 /// - [`config::CC_BETA_FALLBACK_CREDIT`]：`server-side-fallback` 之后（API-key 端四族都自带，
-///   这条只是兜底）。
+///   这条只是兜底）。与 `server-side-fallback` 同一道闸：**参照串里有这一项的族才补**——
+///   2.1.270 的 sonnet 主线程两项都不发了（`cap/2.1.270/00017`）。
 /// - [`config::CC_BETA_CACHE_DIAGNOSIS`]：队尾（在 `extended-cache-ttl` 之前先补，后者再插到
-///   它前面）。
+///   它前面）。2.1.270 起队尾是 [`config::CC_BETA_MESSAGE_THREADS`]，有它就插它前面。
+/// - [`config::CC_BETA_MESSAGE_THREADS`]：**不补**。2.1.270 没有 API-key 端样本，不知道那一侧
+///   发不发；且它与 body 顶层的 `thread` 成对。来访带了就原位保留。
 /// - fable 族（由 [`cc_profile_for`] 判：该族官方串里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
-///   补 `thinking-display-updates`（`fallback-credit` 之后），并**剥掉**
+///   补 `thinking-display-updates`（`fallback-credit` 之后；没有它——2.1.270 的 sonnet——就沿
+///   `server-side-fallback` → `effort` → `advanced-tool-use` 这条链找上一格），并**剥掉**
 ///   [`config::CC_BETA_REDACT_THINKING`]——订阅端 fable 不发它，API-key 端发；这是本函数
 ///   唯一会删客户端项的地方，fable 上原始思维链本来就不返回，删了没有语义损失。与之配套的
 ///   body 侧 `thinking.display:"updates"` 由 [`fill_thinking_display`] 补。
 ///
-/// `model` 为 `None` 时不做族相关的两条（不知道是哪族就不猜）。
+/// `model` 为 `None` 时族相关的几条一条都不做（`server-side-fallback` / `fallback-credit` /
+/// `thinking-display-updates` 与剥 `redact-thinking`）——不知道是哪族就不猜。
+///
+/// **参照串按来访自报的版本取**（[`config::cc_profile_at`]）：2.1.258 / 2.1.260 / 2.1.270
+/// 三张表，2.1.270 只有 sonnet 一行。对一条**完整的**订阅端串本函数必须幂等——参照串选错
+/// 一版，就会把上一版才有的项塞回一条官方请求里（2.1.270 sonnet 曾被补回
+/// `server-side-fallback` 与 `fallback-credit`，见 [`tests::merged_beta_is_idempotent_on_2_1_270_sonnet`]）。
 ///
 /// **非主线程 profile 整条豁免**（[`is_official_non_main_beta`]）：2.1.260 的 SDK 子代理、
 /// 标题生成、安全分类、无工具 helper 与额度探测各有一套**更短**的官方 beta 集合，把主线程那几项补进去只会
@@ -139,7 +149,12 @@ pub(super) fn merge_beta(
                 .map_or(parts.len(), |i| i + 1);
             parts.insert(at, server_side_fallback.to_string());
         }
-        if !has(&parts, config::CC_BETA_FALLBACK_CREDIT) {
+        // 同上一项：官方串里有它的族才补。2.1.270 的 sonnet 主线程把 `server-side-fallback` 与
+        // `fallback-credit` 一起去掉了（`cap/2.1.270/00017`），照旧补就是给一条完整的订阅端请求
+        // 塞回两个上一版的 beta。API-key 端四族本来都自带它，这条在 2.1.258 / 2.1.260 上只是兜底。
+        if seed_has(config::CC_BETA_FALLBACK_CREDIT)
+            && !has(&parts, config::CC_BETA_FALLBACK_CREDIT)
+        {
             let at = pos(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK)
                 .or_else(|| pos(&parts, config::CC_BETA_EFFORT))
                 .or_else(|| pos(&parts, config::CC_BETA_ADVANCED_TOOL_USE))
@@ -148,8 +163,16 @@ pub(super) fn merge_beta(
         }
         if seed_has(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
             if !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
-                let at =
-                    pos(&parts, config::CC_BETA_FALLBACK_CREDIT).map_or(parts.len(), |i| i + 1);
+                // 官方位置紧跟 `fallback-credit`（2.1.258 fable、2.1.260 四族）。2.1.270 的
+                // sonnet 不发 `fallback-credit` 了，它就紧跟 `effort`（`cap/2.1.270/00017`：
+                // `…effort,thinking-display-updates,afk-mode…`）。锚点链与上面补
+                // `fallback-credit` 的那条相同——它本来就落在这条链的下一格。只认
+                // `fallback-credit` 会把它掉到队尾、排在 `message-threads` 后面。
+                let at = pos(&parts, config::CC_BETA_FALLBACK_CREDIT)
+                    .or_else(|| pos(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK))
+                    .or_else(|| pos(&parts, config::CC_BETA_EFFORT))
+                    .or_else(|| pos(&parts, config::CC_BETA_ADVANCED_TOOL_USE))
+                    .map_or(parts.len(), |i| i + 1);
                 parts.insert(at, config::CC_BETA_THINKING_DISPLAY_UPDATES.to_string());
             }
             // `thinking-display-updates` 与 `redact-thinking` 在 2.1.260 的六份抓包上恒为
@@ -159,7 +182,10 @@ pub(super) fn merge_beta(
             }
         }
         if !has(&parts, config::CC_BETA_CACHE_DIAGNOSIS) {
-            parts.push(config::CC_BETA_CACHE_DIAGNOSIS.to_string());
+            // 2.1.258 / 2.1.260 时它是队尾；2.1.270 起队尾是 `message-threads`
+            // （`cap/2.1.270/00017`、`00024`），来访带了就插它前面。
+            let at = pos(&parts, config::CC_BETA_MESSAGE_THREADS).unwrap_or(parts.len());
+            parts.insert(at, config::CC_BETA_CACHE_DIAGNOSIS.to_string());
         }
     }
     if !has(&parts, config::CC_BETA_EXTENDED_CACHE_TTL) {
@@ -760,6 +786,124 @@ mod tests {
         let no_model = merge_beta(Some(fable_api), None, v258);
         assert!(no_model.contains("redact-thinking-2026-02-12"), "不知道族就不删: {no_model}");
         assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
+    }
+
+    /// 2.1.270 的**完整订阅端串**经 [`merge_beta`] 必须一个字不动。
+    ///
+    /// `cap/2.1.270/00017` / `00025`（sonnet-5 直连，同一会话首轮与续轮，beta 逐字相同）：
+    /// 这一版 sonnet 主线程**不发** `server-side-fallback` 与 `fallback-credit`，队尾多了
+    /// `message-threads`。v0.3.114 之前 [`config::cc_profile_at`] 把所有 ≥2.1.260 的来访都套
+    /// 2.1.260 那张表，那张表的 sonnet 行（外推的）两项都有，于是一条完整的官方请求会被塞回
+    /// `server-side-fallback-2026-06-01,fallback-credit-2026-06-01`——一个官方 2.1.270 不产生的串。
+    ///
+    /// 同一批抓包里的标题生成 haiku（`00024`）与额度探测（`00005`）一并钉住：前者走非主线程
+    /// 豁免、后者没有 `claude-code`，本来就只补 `oauth`，这里防回归。
+    ///
+    /// 其余三族**没有 2.1.270 样本、不外推**：仍按 2.1.260 表处理。opus 的完整 2.1.260 串在
+    /// 自报 2.1.270 时同样不该动——那张表的 opus 行本来就不发 `server-side-fallback`。
+    #[test]
+    fn merged_beta_is_idempotent_on_2_1_270_sonnet() {
+        const SONNET_00017: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             thinking-display-updates-2026-08-18,afk-mode-2026-01-31,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        const TITLE_00024: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             advisor-tool-2026-03-01,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,\
+             message-threads-2026-08-12";
+        const QUOTA_00005: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+        let v270 = Some((2u64, 1, 270));
+        let haiku = Some("claude-haiku-4-5-20251001");
+        assert_eq!(merge_beta(Some(SONNET_00017), Some("claude-sonnet-5"), v270), SONNET_00017);
+        assert_eq!(merge_beta(Some(TITLE_00024), haiku, v270), TITLE_00024);
+        assert_eq!(merge_beta(Some(QUOTA_00005), haiku, v270), QUOTA_00005);
+        // 更高的、还没抓包的小版本按最近一份已证形态处理，不退回 2.1.260 表。
+        assert_eq!(
+            merge_beta(Some(SONNET_00017), Some("claude-sonnet-5"), Some((2, 1, 299))),
+            SONNET_00017
+        );
+        // 2.1.270 sonnet 的 profile 行就是这条串去掉 `oauth` 与 `afk-mode`，模拟路径的拼法
+        // （[`simulated_beta`]）要能把 `oauth` 放回原位。
+        let seed = config::cc_profile_at(config::CcProfileKind::MainSonnet, v270);
+        assert_eq!(seed.version, "2.1.270");
+        assert_eq!(
+            crate::proxy::simulated_beta(seed.beta, None),
+            SONNET_00017.replace(",afk-mode-2026-01-31", "")
+        );
+        // 其余三族不外推：自报 2.1.270 的 opus 仍拿 2.1.260 的行，完整的 2.1.260 opus 串不动。
+        let opus_260 = config::cc_profile(config::CcProfileKind::MainOpus);
+        assert_eq!(
+            config::cc_profile_at(config::CcProfileKind::MainOpus, v270).beta,
+            opus_260.beta
+        );
+        let opus_official = crate::proxy::simulated_beta(opus_260.beta, None);
+        assert_eq!(merge_beta(Some(&opus_official), Some("claude-opus-5"), v270), opus_official);
+    }
+
+    /// 2.1.270 sonnet 的**API-key 端没有抓包**，这里只钉落位规则，不宣称差分：把 2.1.258 那套
+    /// 「API-key 端缺 oauth / advanced-tool-use / extended-cache-ttl / cache-diagnosis」套到
+    /// `00017` 上（`server-side-fallback` 这一版本来就没有），补回去要落在官方位置——尤其
+    /// `cache-diagnosis` 不再是队尾，得插在 `message-threads` 之前。真样本到了若差分不同，
+    /// 改的是这条测试的输入，不是落位规则。
+    #[test]
+    fn merged_beta_places_cache_diagnosis_before_message_threads() {
+        const OFFICIAL: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             thinking-display-updates-2026-08-18,afk-mode-2026-01-31,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        let stripped: Vec<&str> = OFFICIAL
+            .split(',')
+            .filter(|p| {
+                ![
+                    config::OAUTH_BETA_HEADER,
+                    config::CC_BETA_ADVANCED_TOOL_USE,
+                    config::CC_BETA_EXTENDED_CACHE_TTL,
+                    config::CC_BETA_CACHE_DIAGNOSIS,
+                ]
+                .contains(p)
+            })
+            .collect();
+        assert_eq!(
+            merge_beta(Some(&stripped.join(",")), Some("claude-sonnet-5"), Some((2, 1, 270))),
+            OFFICIAL
+        );
+    }
+
+    /// 2.1.270 sonnet 官方串**只缺** `thinking-display-updates` 时，补回去要落在 `effort` 之后、
+    /// `afk-mode` 之前（`cap/2.1.270/00017`）。这一版没有 `fallback-credit`，此前只认它做锚点，
+    /// 于是这一项会被追加到队尾、排在 `message-threads` 后面。
+    ///
+    /// 「只缺这一项」现实里对应 API-key 端的 2.1.270 sonnet（2.1.258 时 API-key 端的 fable 就是
+    /// 缺它），没有抓包，故只钉落位，不宣称差分。
+    #[test]
+    fn merged_beta_places_thinking_display_after_effort_without_fallback_credit() {
+        const OFFICIAL: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,\
+             thinking-display-updates-2026-08-18,afk-mode-2026-01-31,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        let without = OFFICIAL.replace(",thinking-display-updates-2026-08-18", "");
+        assert_eq!(
+            merge_beta(Some(&without), Some("claude-sonnet-5"), Some((2, 1, 270))),
+            OFFICIAL
+        );
+        // 连 `afk-mode` 也没带（它是动态项）：仍紧跟 `effort`。
+        let without_afk = without.replace(",afk-mode-2026-01-31", "");
+        assert_eq!(
+            merge_beta(Some(&without_afk), Some("claude-sonnet-5"), Some((2, 1, 270))),
+            OFFICIAL.replace(",afk-mode-2026-01-31", "")
+        );
     }
 
     /// 补齐 + 落位后应与官方客户端的 beta 串**逐字节一致**，三个模型族都要过。

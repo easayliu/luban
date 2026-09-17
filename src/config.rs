@@ -185,6 +185,16 @@ pub const CC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 /// 四份 raw 抓包里客户端自己都带，实际很少真的需要补。
 pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
 
+/// `message-threads-2026-08-12`：2.1.270 新增（`cap/2.1.270/00017`、`00025` sonnet 主线程，
+/// `00024` 标题生成），配 body 顶层的 `thread`（首轮 `{"type":"create"}`，续轮
+/// `{"type":"continue","previous_message_id":…}`）。官方位置：**队尾**，在
+/// [`CC_BETA_CACHE_DIAGNOSIS`] 之后——后者从此不再是最后一项，[`crate::proxy::merge_beta`]
+/// 补 `cache-diagnosis` 时有它就插它前面。
+///
+/// `merge_beta` **不补**这一项：没有 2.1.270 API-key 端的抓包，不知道那一侧发不发；且它与
+/// body 里的 `thread` 成对，头上补了、体里没有就是一个新组合。
+pub const CC_BETA_MESSAGE_THREADS: &str = "message-threads-2026-08-12";
+
 /// 官方客户端的 `User-Agent`。用于 luban 自身发起的账号级请求（token 刷新、profile），
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
@@ -307,6 +317,21 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
 pub const CC_VERSION_BASE: &str = "2.1.260";
+
+/// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
+/// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
+/// `claude-code-releases/latest` 与它取大者。
+///
+/// **与 [`CC_VERSION_BASE`] 是两件事。** 后者是模拟路径发出去的版本，和 [`CC_USER_AGENT`]、
+/// [`CC_BUILD_TIMES`]、[`CC_PROFILES`] 那几串 beta 绑在一起，只能随重新抓包整套换；这一个只
+/// 回答「官方发到哪了」，抓到新版的请求就能抬，不牵动模拟形态。原先两者共用一个常量，于是
+/// luban 刚起、还没拉到 `latest` 的那段时间里，一条真实 2.1.270 的来访会被判成「自报版本高于
+/// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
+/// `server-side-fallback` / `fallback-credit`。
+///
+/// 依据：`cap/2.1.270`（sonnet 主线程 `00017` / `00025`，UA `claude-cli/2.1.270`）。
+/// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.270";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -449,6 +474,25 @@ pub const CC_BODY_ORDER_MAIN: &[&str] = &[
     "context_management",
     "fallbacks",
     "output_config",
+    "diagnostics",
+];
+
+/// 2.1.270 主线程 sonnet 的顶层键序（`cap/2.1.270/00017`、`00025`）：比 [`CC_BODY_ORDER_MAIN`]
+/// 多一个 `thread`，落在 `output_config` 与 `diagnostics` 之间；其余共有键一个没挪位。
+/// `temperature` / `fallbacks` 这两条抓包都不发，位置沿用主线程那串。
+pub const CC_BODY_ORDER_MAIN_2_1_270: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "temperature",
+    "context_management",
+    "fallbacks",
+    "output_config",
+    "thread",
     "diagnostics",
 ];
 
@@ -740,6 +784,45 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
     },
 ];
 
+/// 2.1.270 的 profile，**只有抓到样本的那一行**：主线程 sonnet-5（`cap/2.1.270/00017`、
+/// `00025`，同一会话的首轮与续轮，beta 串逐字相同）。
+///
+/// 相对 [`CC_PROFILES`] 里那行外推的 2.1.260 sonnet：
+/// - **整项不发** `server-side-fallback` 与 `fallback-credit`——2.1.258 起四族都带的两项，到
+///   这一版的 sonnet 主线程一个都没有了；
+/// - 队尾新增 [`CC_BETA_MESSAGE_THREADS`]，配 body 顶层的 `thread`（[`CC_BODY_ORDER_MAIN_2_1_270`]）；
+/// - 后缀是 `100`（两条都是），不再是 2.1.258 四族通用的 `1e2`。
+///
+/// **其余 kind 一行都不编。** opus / fable / haiku 的 2.1.270 主线程没有样本，「跟着 sonnet 一起
+/// 不发那两项」是外推——2.1.260 时 opus 就已单独不发 `server-side-fallback` 而 fable 留着换了
+/// 日期，同一版本里各族并不同步，外推不成立。查不到的 kind 由 [`cc_profile_at`] 落回 2.1.260
+/// 那张表，与此前的行为一致。
+///
+/// 同一批抓包里另有标题生成 haiku（`00024`，后缀 `0e3`，beta 队尾同样多了 `message-threads`）
+/// 与额度探测（`00005`，与 2.1.260 逐字相同）。标题生成那行没编：它走
+/// [`crate::proxy::merge_beta`] 的非主线程豁免、只补 `oauth`，本来就原样透传；模拟路径用的仍是
+/// 2.1.260 表（[`CC_USER_AGENT`] 自报 2.1.260），编了也没人用。
+///
+/// **这张表目前只喂 [`crate::proxy::merge_beta`]**（经 [`cc_profile_at`]）。模拟路径走
+/// [`cc_profile`]，不看版本。
+pub const CC_PROFILES_2_1_270: &[CcProfile] = &[CcProfile {
+    kind: CcProfileKind::MainSonnet,
+    version: "2.1.270",
+    // `cap/2.1.270/00017`（sonnet-5 直连），去掉 `oauth` 与 `afk-mode`。
+    beta: "claude-code-20250219,interleaved-thinking-2025-05-14,\
+           thinking-token-count-2026-05-13,context-management-2025-06-27,\
+           prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+           advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
+           thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+           cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+    billing_suffix: "100",
+    subagent: false,
+    system: CcSystemShape::Identity,
+    thinking: CcThinking::AdaptiveUpdates,
+    fallbacks: None,
+    body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+}];
+
 /// 按 kind 取 **2.1.260** 的 profile。表是常量，查不到即编译期就漏写了一行，故直接兜底到
 /// `MainOpus` 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
@@ -748,17 +831,28 @@ pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
 
 /// 按 kind **与来访自报的版本**取 profile。
 ///
-/// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。低于 2.1.260
-/// 时取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的客户端还不是
-/// 2.1.260，猜新的一版等于给它们集体换一套形态。
+/// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。三档：
+/// - 低于 2.1.260 取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的
+///   客户端还不是 2.1.260，猜新的一版等于给它们集体换一套形态；
+/// - 2.1.270 及以上先查 [`CC_PROFILES_2_1_270`]，那张表里只有抓到样本的 kind；
+/// - 其余（2.1.260 ~ 2.1.269，以及 2.1.270+ 里没有样本的 kind）取 [`CC_PROFILES`]。
 ///
-/// 只有主线程四族有旧版行，其余 kind 一律落回 2.1.260 那张表。
+/// 只有主线程四族有 2.1.258 行、只有 sonnet 有 2.1.270 行，其余 kind 一律落回 2.1.260 那张表。
+///
+/// 「2.1.270 及以上」而不是「恰为 2.1.270」：抓不到每一个小版本，新客户端来了先按最近一份
+/// 已证的形态处理，比退回两版之前的表离真相更近。此前所有 ≥2.1.260 都套 2.1.260 表也是这个
+/// 思路，只是那张表的 sonnet 行把 2.1.270 已经不发的 `server-side-fallback` / `fallback-credit`
+/// 又补回了一条**完整的**订阅端请求——见 [`crate::proxy::merge_beta`] 的测试
+/// `merged_beta_is_idempotent_on_2_1_270_sonnet`。
 pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &'static CcProfile {
-    let is_260 = version.is_some_and(|v| v >= (2, 1, 260));
-    if !is_260 && let Some(p) = CC_PROFILES_2_1_258.iter().find(|p| p.kind == kind) {
-        return p;
+    let find = |table: &'static [CcProfile]| table.iter().find(|p| p.kind == kind);
+    match version {
+        Some(v) if v >= (2, 1, 270) => {
+            find(CC_PROFILES_2_1_270).unwrap_or_else(|| cc_profile(kind))
+        }
+        Some(v) if v >= (2, 1, 260) => cc_profile(kind),
+        _ => find(CC_PROFILES_2_1_258).unwrap_or_else(|| cc_profile(kind)),
     }
-    cc_profile(kind)
 }
 
 /// **2.1.260 还缺的抓包**（记在案，别把外推当成已证）。
@@ -772,6 +866,18 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
 /// 前三项缺着时，[`CC_PROFILES`] 里 `MainSonnet` / `MainHaiku` 两行是外推值，四模型族的
 /// 差分矩阵不能宣称完整。
 pub mod cc_2_1_260_missing_samples {}
+
+/// **2.1.270 还缺的抓包**（`cap/2.1.270` 只有 sonnet 主线程、标题生成 haiku、额度探测三种）。
+///
+/// 1. opus / fable / haiku 的主线程——[`CC_PROFILES_2_1_270`] 因此只有 sonnet 一行，其余落回
+///    2.1.260 表。「是不是也一起不发 `server-side-fallback` / `fallback-credit`」抓到之前不猜。
+/// 2. API-key 端任何一族——「API-key → OAuth」的差分在 2.1.270 上还是不是 2.1.258 那五项
+///    （oauth / advanced-tool-use / server-side-fallback / extended-cache-ttl / cache-diagnosis）
+///    无从验证，尤其不知道 API-key 端发不发 `message-threads`；
+///    [`crate::proxy::merge_beta`] 因此不补它。
+/// 3. 子代理 / helper / 安全分类——非主线程豁免让它们照旧只补 `oauth`，但各自的官方串有没有
+///    变（比如也长出 `message-threads`）没有证据。
+pub mod cc_2_1_270_missing_samples {}
 
 /// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/2.1.258/00012`（opus-5 直连），
 /// 与 2.1.251 的 `00019` 逐字相同（Stainless SDK 0.112.1、node v26.3.0 都没变）。
@@ -1399,6 +1505,42 @@ pub const DATADOG_USER_AGENT: &str = AXIOS_DEFAULT_USER_AGENT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`CC_LATEST_KNOWN_RELEASE`] 是可信版本的下限：低于模拟版本会把 luban 自己发出去的
+    /// 版本判成「不存在」，低于 2.1.270 表的版本则那张表永远选不中。
+    #[test]
+    fn latest_known_release_is_not_behind_any_profile_table() {
+        let v = |s: &str| crate::proxy::parse_version(s).unwrap();
+        let latest = v(CC_LATEST_KNOWN_RELEASE);
+        assert!(latest >= v(CC_VERSION_BASE), "低于模拟版本 {CC_VERSION_BASE}");
+        for p in CC_PROFILES.iter().chain(CC_PROFILES_2_1_258).chain(CC_PROFILES_2_1_270) {
+            assert!(latest >= v(p.version), "{:?} 的 {} 表选不中", p.kind, p.version);
+        }
+    }
+
+    /// [`cc_profile_at`] 的三档：<2.1.260 与读不出版本取 2.1.258 表；2.1.260 ~ 2.1.269 取
+    /// 2.1.260 表；≥2.1.270 先查 2.1.270 表，**只有 sonnet 有行**，其余 kind 落回 2.1.260 表
+    /// （没有样本不外推）。
+    #[test]
+    fn cc_profile_at_picks_the_newest_observed_table_per_kind() {
+        use CcProfileKind::*;
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 270))).version, "2.1.270");
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 300))).version, "2.1.270");
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 269))).version, "2.1.260");
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 260))).version, "2.1.260");
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 259))).version, "2.1.258");
+        assert_eq!(cc_profile_at(MainSonnet, None).version, "2.1.258");
+        for kind in [MainOpus, MainFable, MainHaiku, SessionTitleHaiku, QuotaProbe] {
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 270))).version, "2.1.260", "{kind:?}");
+        }
+        // 2.1.258 表只有主线程四族，其余 kind 在老版本下也落回 2.1.260 表。
+        assert_eq!(cc_profile_at(QuotaProbe, Some((2, 1, 258))).version, "2.1.260");
+        // 2.1.270 表里的每一行都得是 2.1.270 的，且 kind 不重复。
+        let mut kinds: Vec<_> = CC_PROFILES_2_1_270.iter().map(|p| p.kind).collect();
+        assert!(CC_PROFILES_2_1_270.iter().all(|p| p.version == "2.1.270"));
+        kinds.dedup();
+        assert_eq!(kinds.len(), CC_PROFILES_2_1_270.len());
+    }
 
     /// 规整只做两件事：压空白、按输入顺序去重。**不排序**——scope 集合是指纹的一部分，
     /// 用户照抄一份抓包的顺序就该原样发出去。

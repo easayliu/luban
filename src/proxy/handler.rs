@@ -208,8 +208,9 @@ pub(super) async fn handle_inner(
     // 标记——这类请求由 [`Simulation::detect`] 按形态识出来、一并走模拟接管。
     //
     // **自报的版本还得说得通**：不高于官方已发布的最新版（[`known_latest_release`]，从
-    // `downloads.claude.ai/claude-code-releases/latest` 学来）。一个自称 `claude-cli/2.5.0`
-    // 的客户端在官方只发到 2.1.260 的时候不是官方客户端——按非 CC 客户端处理（走模拟），
+    // `downloads.claude.ai/claude-code-releases/latest` 学来，下限是抓包证实过的
+    // [`config::CC_LATEST_KNOWN_RELEASE`]）。一个自称 `claude-cli/2.5.0` 的客户端在官方只发到
+    // 2.1.270 的时候不是官方客户端——按非 CC 客户端处理（走模拟），
     // 也不再沿用它那个不存在的版本号去补 billing header、跑启动握手、发额度探测。
     let from_cc_client = trusted_cc_version(&client_ua).is_some();
     if !from_cc_client && let Some((a, b, c)) = cc_cli_version(&client_ua) {

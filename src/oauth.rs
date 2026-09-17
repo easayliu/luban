@@ -1397,7 +1397,8 @@ pub struct ReleaseCache {
 
 #[derive(Default)]
 struct ReleaseState {
-    /// 当前认的最新版；`None` = 还不知道（调用方退回写死的 [`config::CC_VERSION_BASE`]）。
+    /// 当前认的最新版；`None` = 还不知道（调用方退回写死的
+    /// [`config::CC_LATEST_KNOWN_RELEASE`]）。
     current: Option<ReleaseVersion>,
     /// 库里已确认写成的值。与 `current` 不同就是还欠一次落库。
     persisted: Option<ReleaseVersion>,

@@ -247,7 +247,7 @@ pub async fn run(
 
     // 官方最新发布版：先以库里上次学到（或网页上手动填）的值为准，之后每学到新值就写回。
     // 保活循环每 30min 学一次（下面），模拟会话的握手也会学。这样官方发新版后 luban 不用改
-    // 代码，重启也不退回写死的 `CC_VERSION_BASE`。
+    // 代码，重启也不退回写死的 `CC_LATEST_KNOWN_RELEASE`。
     {
         sync_latest_release_from_store(&state.store);
         let store = state.store.clone();
@@ -2000,8 +2000,9 @@ struct SettingsResp {
     /// 自动从 `downloads.claude.ai` 学（只升不降）并落库；网页可手动填、可删。来访 UA 自报
     /// 高于 `max(它, cc_version_base)` 的版本不当官方客户端。见 [`crate::store::LATEST_CC_RELEASE`]。
     latest_cc_release: String,
-    /// luban 模拟路径所对齐的客户端版本（[`crate::config::CC_VERSION_BASE`]），也是上限的
-    /// 兜底值。
+    /// 上限的写死兜底值：抓包证实存在的最新官方版本
+    /// （[`crate::config::CC_LATEST_KNOWN_RELEASE`]）。字段名沿用旧的，前端按它显示「退回基线」；
+    /// 它**不再是**模拟路径的版本（那是 [`crate::config::CC_VERSION_BASE`]，可以更旧）。
     cc_version_base: String,
     /// 登录时实际申请的 OAuth scope（空格分隔）；恒为非空——没配就是
     /// [`crate::config::SCOPES`]。
@@ -2178,7 +2179,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let min_client_version = state.store.min_client_version().unwrap_or_default();
     let latest_cc_release =
         oauth::LATEST_RELEASE.get().map(oauth::release_string).unwrap_or_default();
-    let cc_version_base = crate::config::CC_VERSION_BASE.to_string();
+    let cc_version_base = crate::config::CC_LATEST_KNOWN_RELEASE.to_string();
     let oauth_scopes = state.store.oauth_scopes();
     let bare_rate_limit = state.store.bare_rate_limit();
     let bare_rate_window_secs = state.store.bare_rate_window_secs();

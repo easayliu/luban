@@ -135,6 +135,56 @@ struct Subst<'a> {
     resumed: bool,
     /// 第几次输入（`tengu_file_history_snapshot_success.snapshotCount`）。
     prompt_index: u32,
+    /// 正文里有延迟加载的工具（`defer_loading: true`）。没有就不发
+    /// `tengu_deferred_tools_pool_change`、`tengu_attachments` 里也没有 `deferred_tools_delta`
+    /// ——官方 API-key 端（全量声明、无 ToolSearch）正是这个形态（`cap/2.1.258-api/00002`、
+    /// `00022`），而订阅端延迟形态两者都有（`cap/2.1.258/00020`、`00032`）。
+    deferred: bool,
+    /// `tengu_tool_search_mode_decision` 的 meta，见 [`tool_search_decision`]。模板里那两条
+    /// 的 meta 只是占位，一律以这份覆盖。
+    tool_search: Value,
+}
+
+/// `tengu_tool_search_mode_decision` 的 meta，**跟着正文里实际启用的能力走**。
+///
+/// 官方三种取值（event_logging 抓包解出 `additional_metadata`）：
+///
+/// | 正文 | enabled | reason | mcpToolCount |
+/// |---|---|---|---|
+/// | 声明了 `ToolSearch`（订阅端延迟形态，`cap/2.1.258/00032`、`2.1.270/00020`，同时带 `defer_loading` 占位） | true | `tst_enabled` | 28 / 2，是**会话里** MCP 工具总数，不在正文里 |
+/// | 有工具、没有 `ToolSearch`（API-key 端 34 个全量声明，`cap/2.1.258-api/00022`） | false | `not_registered` | 2，正好等于正文里 `mcp__*` 的个数 |
+/// | 没有工具（haiku helper，`cap/2.1.260-2/00065`） | false | `no_tools_in_request` | 0 |
+///
+/// **判「已启用」看的是 `ToolSearch` 本身，不是 `defer_loading` 占位。** 延迟声明只是把工具
+/// 藏起来，能不能搜出来靠的是 `ToolSearch` 这条工具；一条只带占位、不带它的请求，模型无处发起
+/// 搜索，代理这边也没有替它执行搜索的能力（见 `crate::proxy::cc_tools_core` 为什么不注这一对），
+/// 报 `tst_enabled` 就是在宣称一个没有的能力。官方样本里两者总是同时出现，所以这条判据对官方
+/// 形态没有区别，只在「半抄」的正文上分得开。工具池那两条事件（`pool_change`、
+/// `deferred_tools_delta`）仍跟着 `defer_loading` 声明走——池子是声明出来的，搜索是另一回事。
+///
+/// 此前只看「有没有工具」，有就报 `tst_enabled`：模拟路径注入的 11 个官方工具与真 CC
+/// API-key 端的全量声明都没有 ToolSearch，遥测却在宣称延迟加载已启用——正文与遥测互相矛盾。
+///
+/// 延迟形态下 `mcpToolCount` 是客户端本地的数，正文里看不到，沿用模板那个 `2`（抓包里
+/// 确有 2 的样本）；`not_registered` 只在 API-key 端观察到，订阅端没有「有工具却不延迟」的
+/// 官方样本，对模拟路径这是**更自洽**的取值而不是已证的。
+fn tool_search_decision(shape: &RequestShape, checked_model: &str) -> Value {
+    let (enabled, reason, mcp) = if shape.has_tool_search {
+        (true, "tst_enabled", 2)
+    } else if shape.tools_count == 0 {
+        (false, "no_tools_in_request", 0)
+    } else {
+        (false, "not_registered", shape.mcp_tools)
+    };
+    json!({
+        "enabled": enabled,
+        "mode": "tst",
+        "reason": reason,
+        "checkedModel": checked_model,
+        "mcpToolCount": mcp,
+        "mcpNonBlocking": false,
+        "userType": "external"
+    })
 }
 
 /// 展示模型名 → 用户设置里的写法：`claude-opus-5[1m]` → `opus[1m]`、`claude-fable-5-1` → `fable`。
@@ -192,7 +242,20 @@ where
                 ));
                 continue;
             }
+            // 延迟工具池相关的事件跟着正文走，见 [`Subst::deferred`]。
+            if e.name == "tengu_deferred_tools_pool_change" && !subst.deferred {
+                continue;
+            }
             let mut meta = substitute(&e.meta, subst);
+            if e.name == "tengu_tool_search_mode_decision" {
+                meta = subst.tool_search.clone();
+            }
+            if e.name == "tengu_attachments"
+                && !subst.deferred
+                && let Some(types) = meta.get_mut("attachment_types").and_then(|t| t.as_array_mut())
+            {
+                types.retain(|t| t.as_str() != Some("deferred_tools_delta"));
+            }
             if e.name == "tengu_timer"
                 && meta.get("event").and_then(|x| x.as_str()) == Some("startup")
                 && let Some(obj) = meta.as_object_mut()
@@ -916,6 +979,12 @@ struct RequestShape {
     /// `{"Agent":3078,…}` 那串 JSON。
     tool_lens: String,
     deferred_tools: usize,
+    /// 正文里**非延迟**的 `mcp__*` 工具数（`tengu_tool_search_mode_decision.mcpToolCount`
+    /// 在非延迟形态下的取值：`cap/2.1.258-api` 报 2，正文里正好是两个 `mcp__ide__*`）。
+    mcp_tools: usize,
+    /// 正文里声明了 `ToolSearch` 这个工具（非延迟）。它是延迟加载真正能用的前提：模型要靠它
+    /// 把 `defer_loading` 的工具搜出来。只有占位声明、没有它，搜索无处发起。
+    has_tool_search: bool,
     input_text_chars: usize,
     /// `estimatedInputTokens`，见 [`parse_shape`] 里的口径说明。
     estimated_tokens: usize,
@@ -1298,6 +1367,12 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
                 continue;
             }
             if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                if name.starts_with("mcp__") {
+                    shape.mcp_tools += 1;
+                }
+                if name == "ToolSearch" {
+                    shape.has_tool_search = true;
+                }
                 lens.insert(name.to_string(), Value::from(js_len(&t.to_string())));
             }
         }
@@ -2007,6 +2082,8 @@ impl Telemetry {
             permission_mode: shape.permission_mode,
             resumed,
             prompt_index,
+            deferred: shape.deferred_tools > 0,
+            tool_search: tool_search_decision(&shape, &display_model),
         };
         let mut take_tpl = |tpl: &[TplEvent], anchor: DateTime<Utc>| {
             let (ev, d) = emit_template(tpl, anchor, &identity, ctx, &dd_model, &subst);
@@ -2282,15 +2359,7 @@ impl Telemetry {
             push(
                 t0,
                 "tengu_tool_search_mode_decision",
-                json!({
-                    "enabled": shape.tools_count > 0,
-                    "mode": "tst",
-                    "reason": if shape.tools_count > 0 { "tst_enabled" } else { "no_tools_in_request" },
-                    "checkedModel": &display_model,
-                    "mcpToolCount": if shape.tools_count > 0 { 2 } else { 0 },
-                    "mcpNonBlocking": false,
-                    "userType": "external"
-                }),
+                tool_search_decision(&shape, &display_model),
             );
         }
         push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
@@ -3711,6 +3780,128 @@ mod tests {
         .unwrap()
     }
 
+    /// 正文改成订阅端延迟形态：`ToolSearch` + `DeferredToolPlaceholder` 那一对都在
+    /// （`cap/2.1.258/00012`）。
+    fn tool_search_body() -> Vec<u8> {
+        let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        body["tools"] = json!([
+            {"name":"Bash","description":"run","input_schema":{"type":"object"}},
+            {"name":"ToolSearch","description":"search","input_schema":{"type":"object"}},
+            {"name":"DeferredToolPlaceholder","description":"d","input_schema":{"type":"object"},"defer_loading":true}
+        ]);
+        body.to_string().into_bytes()
+    }
+
+    /// 正文改成 API-key 端那种**全量声明、无延迟**的工具形态（`cap/2.1.258-api/00006`：内建 +
+    /// 两个 `mcp__ide__*`，没有 `defer_loading`）。
+    fn undeferred_body() -> Vec<u8> {
+        let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        body["tools"] = json!([
+            {"name":"Bash","description":"run","input_schema":{"type":"object"}},
+            {"name":"Read","description":"read","input_schema":{"type":"object"}},
+            {"name":"mcp__ide__getDiagnostics","description":"d","input_schema":{"type":"object"}},
+            {"name":"mcp__ide__executeCode","description":"e","input_schema":{"type":"object"}}
+        ]);
+        body.to_string().into_bytes()
+    }
+
+    /// `tengu_tool_search_mode_decision` 按正文里**实际启用**的能力取值，三档对齐抓包：延迟形态
+    /// `tst_enabled`；全量声明无延迟 `not_registered` 且 `mcpToolCount` 等于正文里 `mcp__*` 的
+    /// 个数（`cap/2.1.258-api/00022` 报 2，正文正好两个 `mcp__ide__*`）；无工具
+    /// `no_tools_in_request`。此前只要有工具就报 `tst_enabled`——模拟路径与 API-key 端的正文都
+    /// 没有 ToolSearch，遥测却说延迟加载开着。
+    ///
+    /// **反例**：只有 `defer_loading` 占位、没有 `ToolSearch`（`cc_body(true)` 正是 Bash +
+    /// DeferredToolPlaceholder）——延迟声明在、搜索能力不在，报 `not_registered`。官方样本里两者
+    /// 总是同时出现，判据落在 `ToolSearch` 上才不会给半抄的正文宣称一个没有的能力。
+    #[test]
+    fn tool_search_decision_follows_the_body() {
+        let official = parse_shape(&tool_search_body()).unwrap();
+        assert!(official.has_tool_search && official.deferred_tools == 1);
+        let m = tool_search_decision(&official, "claude-opus-5[1m]");
+        assert_eq!(m["enabled"], true);
+        assert_eq!(m["reason"], "tst_enabled");
+        assert_eq!(m["checkedModel"], "claude-opus-5[1m]");
+
+        let placeholder_only = parse_shape(&cc_body(true)).unwrap();
+        assert!(!placeholder_only.has_tool_search && placeholder_only.deferred_tools == 1);
+        let m = tool_search_decision(&placeholder_only, "claude-opus-5[1m]");
+        assert_eq!(m["enabled"], false, "只有占位、没有 ToolSearch 不算启用");
+        assert_eq!(m["reason"], "not_registered");
+
+        let full = parse_shape(&undeferred_body()).unwrap();
+        assert_eq!(full.deferred_tools, 0);
+        assert_eq!(full.mcp_tools, 2);
+        let m = tool_search_decision(&full, "claude-opus-5[1m]");
+        assert_eq!(m["enabled"], false);
+        assert_eq!(m["reason"], "not_registered");
+        assert_eq!(m["mcpToolCount"], 2);
+
+        let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        body["tools"] = json!([]);
+        let none = parse_shape(&body.to_string().into_bytes()).unwrap();
+        let m = tool_search_decision(&none, "claude-haiku-4-5-20251001");
+        assert_eq!(m["enabled"], false);
+        assert_eq!(m["reason"], "no_tools_in_request");
+        assert_eq!(m["mcpToolCount"], 0);
+    }
+
+    /// 首轮模板里的三条延迟工具相关事件跟着正文走：工具池两样看 `defer_loading` 声明、搜索
+    /// 模式看 `ToolSearch`。正文没有 `defer_loading` 工具时，不发
+    /// `tengu_deferred_tools_pool_change`、`tengu_attachments` 里没有 `deferred_tools_delta`、
+    /// `tengu_tool_search_mode_decision` 报 `not_registered`——与 `cap/2.1.258-api/00002`
+    /// 一致；有延迟工具时三样照旧（`cap/2.1.258/00020`）。
+    #[test]
+    fn template_deferred_tool_events_follow_the_body() {
+        let run = |body: Vec<u8>| -> (usize, Vec<Value>, Vec<Value>) {
+            let t = Telemetry::default();
+            t.ingest(call(body, "req_1", "end_turn"));
+            let st = t.0.state.lock();
+            let p = &st.pending[&key()];
+            let by_name = |n: &str| -> Vec<Value> {
+                p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+            };
+            (
+                by_name("tengu_deferred_tools_pool_change").len(),
+                by_name("tengu_attachments"),
+                by_name("tengu_tool_search_mode_decision"),
+            )
+        };
+        let has_delta = |atts: &[Value]| {
+            atts.iter().any(|a| {
+                a["attachment_types"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| t == "deferred_tools_delta"))
+            })
+        };
+
+        let (pool, atts, tst) = run(undeferred_body());
+        assert_eq!(pool, 0, "没有延迟工具就没有工具池变更");
+        assert!(!atts.is_empty() && !has_delta(&atts), "附件里不该有 deferred_tools_delta");
+        assert!(!tst.is_empty());
+        assert!(
+            tst.iter().all(|m| m["reason"] == "not_registered" && m["enabled"] == false),
+            "{tst:?}"
+        );
+        assert!(tst.iter().all(|m| m["mcpToolCount"] == 2), "{tst:?}");
+
+        let (pool, atts, tst) = run(tool_search_body());
+        assert!(pool >= 1, "延迟形态照发工具池变更");
+        assert!(has_delta(&atts));
+        assert!(
+            tst.iter().all(|m| m["reason"] == "tst_enabled" && m["enabled"] == true),
+            "{tst:?}"
+        );
+
+        // 只有占位、没有 ToolSearch：工具池两样跟着延迟声明走仍发，搜索模式却不算启用。
+        let (pool, atts, tst) = run(cc_body(true));
+        assert!(pool >= 1 && has_delta(&atts));
+        assert!(
+            tst.iter().all(|m| m["reason"] == "not_registered" && m["enabled"] == false),
+            "{tst:?}"
+        );
+    }
+
     /// 工具长度表的 hash 是长度表 JSON 的 sha256 前 12 位：无工具时是 sha256("{}") 的前缀
     /// `44136fa355b3`，`cap/2.1.260-1` 那 16 个工具的表算出来是 `65b78f5c8f58`。
     #[test]
@@ -4868,6 +5059,7 @@ mod tests {
         assert_eq!(s.sys0_len, 132, "billing header 那块的长度与抓包一致");
         assert_eq!(s.tools_count, 2);
         assert_eq!(s.deferred_tools, 1);
+        assert_eq!(s.mcp_tools, 0);
         assert_eq!(s.tools_hash.len(), 12);
         assert_eq!(s.thinking_type, "adaptive");
         assert_eq!(s.effort.as_deref(), Some("high"));
