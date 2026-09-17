@@ -440,10 +440,11 @@ pub(super) fn rewrite_body(
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered =
         sim.is_some_and(|sim| align_cc_top_level_order(&mut v, sim.profile.body_key_order));
-    // 模拟路径且工具列表里没有任何 CC 官方工具名时，注入官方主线程恒带的 11 个真工具
-    //（[`cc_tools_core`]）。上游判第三方的信号之一是「自称 CC 但没有 CC 工具」，光加 mcp__
-    // 前缀不够——零个 CC 工具等于自证不是 CC；而只注四个也不是官方形态：2.1.258 / 2.1.260 /
-    // 2.1.270 的主线程抓包最少 13 个工具。注入的工具在白名单内，混淆不会动它们。
+    // 模拟路径把官方主线程恒带的 11 个真工具（[`cc_tools_core`]）对齐进工具列表：客户端没
+    // 声明的补上，声明了的同名工具换成官方那条，其余原样。上游判第三方的信号之一是
+    // 「自称 CC 但没有 CC 工具」，光加 mcp__ 前缀不够——零个 CC 工具等于自证不是 CC；而只注
+    // 四个也不是官方形态：2.1.258 / 2.1.260 / 2.1.270 的主线程抓包最少 13 个工具。注入的
+    // 工具在白名单内，混淆不会动它们。
     //
     // **只给主线程 profile 注**：官方的标题生成、安全分类、无工具 helper 与额度探测本来就
     // 一个工具都不发（`tools: []` 或整个字段都没有），给它们塞 Bash 是把一条辅助请求装成
@@ -1929,19 +1930,26 @@ pub(super) fn cc_tools_core(profile: &config::CcProfile) -> &'static [serde_json
     }
 }
 
-/// [`inject_cc_tools`] 会往这条请求里注哪几个工具名；**不改体**。
+/// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
 ///
 /// 判据只写这一份，注入与流水两边共用：注入按它改体，[`ReqLog`] 按它在回复里认「模型调了
 /// 一个客户端没声明的注入工具」。分开写两份判据，早晚有一边漂掉，流水就会把客户端自己的
 /// 工具记成注入的、或反过来。
 ///
-/// 返回空的三种情形：没有 `tools` 键（官方的无工具 helper / 标题 / 分类就是这个样子，别
-/// 凭空造一个）、`tools` 里已有任何 CC 官方工具名（真 CC 客户端或已经抄了 CC 声明的中转）、
-/// 该 profile 的每个工具名客户端都已声明。
+/// 返回空的两种情形：没有 `tools` 键（官方的无工具 helper / 标题 / 分类就是这个样子，别
+/// 凭空造一个）、该 profile 的每个工具名客户端都已声明。
+///
+/// **客户端已带部分官方名时照样补缺的**。原先「有任何一个官方名就一个都不注」，理由是
+/// 「真 CC 或抄了 CC 声明的中转，别动」——但真 CC 不走模拟路径，会走到这里的是抄了一部分的：
+/// 现网一条 Go-http-client 声明了 15 个官方名，其中 TaskCreate / TaskGet / TaskUpdate /
+/// TaskList 是 2.1.258 API-key 端才有的拼法，2.1.260 恒带的 11 个里又缺 ListAgents /
+/// ReportFindings / ScheduleWakeup / Workflow 四个，出站 UA 却自报 2.1.260。「自称 2.1.260、
+/// 工具集是上一版的拼法、还缺四个恒带的」这个组合官方同样不产生。只加不删：老版本多出来
+/// 的那几个是客户端的能力，删了是改它的行为。
 ///
 /// **不能借 [`has_cc_tool_profile`] 判**：那个函数回答的是「这看起来像不像真的 CC 客户端」，
 /// 对「没带 tools」和「`tools: []`」都答**是**（判不出来就不冤枉人）。而这里问的是「这条
-/// 请求已经有官方工具了吗」——空数组的答案显然是**没有**。借用之后，一条 `tools: []` 的
+/// 请求缺哪些官方工具」——空数组的答案显然是**全缺**。借用之后，一条 `tools: []` 的
 /// 主线程请求就永远注不进工具，正是「零个 CC 工具等于自证不是 CC」那个要消灭的形态。
 pub(super) fn cc_tools_to_inject(
     v: &serde_json::Value,
@@ -1951,9 +1959,6 @@ pub(super) fn cc_tools_to_inject(
         return Vec::new();
     };
     let declared: Vec<&str> = tools.iter().filter_map(|t| t.get("name")?.as_str()).collect();
-    if declared.iter().any(|n| config::CC_TOOL_NAMES.contains(n)) {
-        return Vec::new();
-    }
     cc_tools_core(profile)
         .iter()
         .filter_map(|stub| stub.get("name")?.as_str())
@@ -1961,24 +1966,103 @@ pub(super) fn cc_tools_to_inject(
         .collect()
 }
 
-/// 如果 `tools` 里没有任何 CC 官方工具名，把该 profile 的 11 个官方工具注入到数组头部。
-/// 注不注、注哪几个由 [`cc_tools_to_inject`] 定。
+/// 客户端自带的同名工具与官方声明的**参数表面**是否一致：`input_schema.properties` 的键集相同、
+/// `required` 的集合相同。
+///
+/// 只用于日志，不再决定换不换。换是一律换的（见 [`inject_cc_tools`]）；这个判据标出的是换了
+/// 之后**可能**执行不了的那几条——客户端若要一个官方 schema 里没有的必填参数，模型按官方
+/// schema 永远不会给。那种客户端的工具在换之前本来也和官方不是一回事，出了问题至少日志里
+/// 点得出名字。
+fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value) -> bool {
+    fn surface(t: &serde_json::Value) -> Option<(Vec<&str>, Vec<&str>)> {
+        let schema = t.get("input_schema")?.as_object()?;
+        let mut props: Vec<&str> = match schema.get("properties") {
+            Some(p) => p.as_object()?.keys().map(String::as_str).collect(),
+            None => Vec::new(),
+        };
+        let mut required: Vec<&str> = match schema.get("required") {
+            Some(r) => r.as_array()?.iter().filter_map(|x| x.as_str()).collect(),
+            None => Vec::new(),
+        };
+        props.sort_unstable();
+        required.sort_unstable();
+        Some((props, required))
+    }
+    matches!((surface(client), surface(official)), (Some(a), Some(b)) if a == b)
+}
+
+/// 把该 profile 的 11 个官方主线程工具对齐进 `tools`：出站列表**以这 11 条按官方声明序开头**，
+/// 每一条都是资产里那个对象（客户端没声明的是补的，声明了同名的是换的），客户端其余工具
+/// 跟在后面、相对次序不变。补哪几个由 [`cc_tools_to_inject`] 定，流水那侧对的也是这一份。
+///
+/// **同名为什么一律换**：会走到这里的客户端本来就在模拟路径上，它用了官方名却自己写描述、
+/// 自己拼 schema，这条声明与官方的差别正是上游最容易盯的形态之一（官方客户端连
+/// `toolSchemaCharLengths` 都逐条上报）。既然整条请求已在按官方形态重建，同名工具留一份
+/// 自己写的版本只是留一处破绽。代价：参数表面与官方不一致的客户端（多要一个必填参数之类），
+/// 模型按官方 schema 拼的入参它可能不认——换之前 [`same_schema_surface`] 把这些名字打进
+/// 日志，出了事对得上是哪个客户端的哪条工具。
+///
+/// **为什么不是原位换、缺的插头部**：那样客户端只缺 ListAgents 等四个时，补的四个全排在
+/// Agent 前面，11 条的相对次序就不是官方的了。官方的内建工具是一段固定次序，MCP 工具跟在
+/// 最后（`cap/2.1.258-api/00006`：`Write` 之后才是 `mcp__ide__*`），这里照这个形态排。
+///
+/// **换不换不看 JSON 值相等**：`Value` 的相等忽略对象键序，客户端一条内容全同、键序不同的
+/// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 11 条一律以资产对象
+/// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body`] 那条
+/// 「什么都没改就原样透传」的快路。
 fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
     let missing = cc_tools_to_inject(v, profile);
-    if missing.is_empty() {
-        return false;
-    }
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
-    // 倒着往头部插，插完的相对次序就是资产里的官方声明序。
-    for stub in cc_tools_core(profile).iter().rev() {
-        let name = stub.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        if missing.contains(&name) {
-            tools.insert(0, stub.clone());
+    let stubs = cc_tools_core(profile);
+    let official_names: Vec<&str> =
+        stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
+    let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);
+
+    // 客户端的同名声明与官方那条差在哪：只为日志与计数，落位一律用官方对象。
+    let mut replaced = 0usize;
+    let mut surface_differs: Vec<&str> = Vec::new();
+    for stub in stubs {
+        let Some(name) = stub.get("name").and_then(|n| n.as_str()) else { continue };
+        for t in tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)) {
+            if serde_json::to_string(t).ok() != serde_json::to_string(stub).ok() {
+                replaced += 1;
+                if !same_schema_surface(t, stub) {
+                    surface_differs.push(name);
+                }
+            }
         }
     }
-    tracing::info!(injected = missing.len(), "injected CC main-thread tool stubs for simulation");
+
+    let before: Vec<Option<String>> = tools.iter().map(name_of).collect();
+    let mut aligned: Vec<serde_json::Value> = stubs.to_vec();
+    aligned.extend(
+        tools
+            .iter()
+            .filter(|t| {
+                !t.get("name").and_then(|n| n.as_str()).is_some_and(|n| official_names.contains(&n))
+            })
+            .cloned(),
+    );
+    let reordered = aligned.iter().map(name_of).collect::<Vec<_>>() != before;
+    if missing.is_empty() && replaced == 0 && !reordered {
+        return false;
+    }
+    *tools = aligned;
+
+    if !surface_differs.is_empty() {
+        tracing::info!(
+            tools = %surface_differs.join(","),
+            "replaced same-named client tools whose parameter surface differs from the official one"
+        );
+    }
+    tracing::info!(
+        injected = missing.len(),
+        replaced,
+        reordered,
+        "aligned CC main-thread tool stubs for simulation"
+    );
     true
 }
 
@@ -4430,10 +4514,17 @@ mod tests {
         assert!(super::cc_tools_to_inject(&body(""), profile).is_empty());
         // 空数组：全部 11 个。
         assert_eq!(super::cc_tools_to_inject(&body(r#","tools":[]"#), profile), all);
-        // 已有任一官方名：不注（真 CC 或抄了 CC 声明的中转）。
-        assert!(
-            super::cc_tools_to_inject(&body(r#","tools":[{"name":"Skill"}]"#), profile).is_empty()
-        );
+        // 已带部分官方名：只补缺的，顺序仍是官方声明序。
+        let partial = body(r#","tools":[{"name":"Skill"},{"name":"Bash"},{"name":"TaskCreate"}]"#);
+        let expect: Vec<&str> =
+            all.iter().copied().filter(|n| !["Skill", "Bash"].contains(n)).collect();
+        assert_eq!(super::cc_tools_to_inject(&partial, profile), expect);
+        // 11 个全声明了：不注。
+        let full = body(&format!(
+            r#","tools":[{}]"#,
+            all.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
+        ));
+        assert!(super::cc_tools_to_inject(&full, profile).is_empty());
         // 只有第三方名：全部 11 个，与真正注进去的一致。
         let mut v = body(r#","tools":[{"name":"exec"},{"name":"read_file"}]"#);
         let planned = super::cc_tools_to_inject(&v, profile);
@@ -4449,6 +4540,89 @@ mod tests {
         assert_eq!(injected, planned, "注进去的名单必须就是判据给出的那份");
         // 客户端自己的工具仍在后面，一个没丢。
         assert_eq!(v["tools"].as_array().unwrap().len(), all.len() + 2);
+    }
+
+    /// 客户端已带部分官方名的「半抄」克隆：缺的补到头部，同名的一律整条换成官方声明（参数
+    /// 表面一致与否都换，不一致的只多一行日志），老版本多出来的不删。依据是现网一条
+    /// Go-http-client：15 个官方名（含 2.1.258 才有的 TaskCreate 等）、缺 2.1.260 恒带的四个，
+    /// 原先一个都不补。
+    #[test]
+    fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
+        let profile = config::cc_profile(config::CcProfileKind::MainOpus);
+        let official = crate::proxy::cc_tools_core(profile);
+        let official_read = official.iter().find(|t| t["name"] == "Read").unwrap();
+        let official_bash = official.iter().find(|t| t["name"] == "Bash").unwrap();
+        // Read：抄了参数表面（同一组 properties / required），自己写的描述 → 换。
+        let mut client_read = official_read.clone();
+        client_read["description"] = serde_json::json!("reads a file, my own wording");
+        client_read.as_object_mut().unwrap().remove("eager_input_streaming");
+        // Bash：多要一个必填 `cwd`，参数表面与官方不一致 → 照样换，只是多一行日志。
+        let client_bash = serde_json::json!({
+            "name": "Bash", "description": "run",
+            "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}}, "required": ["command", "cwd"]}
+        });
+        let mut v = serde_json::json!({
+            "model": "claude-opus-5", "messages": [],
+            "tools": [{"name": "my_tool", "input_schema": {"type": "object"}}, client_read, client_bash, {"name": "TaskCreate", "input_schema": {"type": "object"}}]
+        });
+        let planned = super::cc_tools_to_inject(&v, profile);
+        assert!(!planned.contains(&"Read") && !planned.contains(&"Bash"), "{planned:?}");
+        assert_eq!(planned.len(), 9, "11 个里客户端已有 Read / Bash 两个");
+        assert!(super::inject_cc_tools(&mut v, profile));
+        let tools = v["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // 头部是完整的 11 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
+        // 工具紧随其后、相对次序不变。
+        let all: Vec<&str> = official.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(&names[..11], all.as_slice());
+        assert_eq!(&names[11..], ["my_tool", "TaskCreate"]);
+        let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
+        assert_eq!(read, official_read, "参数表面一致的 Read 整条换成官方声明");
+        let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
+        assert_eq!(bash, official_bash, "参数表面不一致的 Bash 同样换成官方声明");
+        assert!(!super::same_schema_surface(&client_bash, official_bash), "日志判据认得出它不一致");
+        assert!(names.contains(&"TaskCreate"), "老版本多出来的不删");
+    }
+
+    /// 客户端把 11 个全声明了，但次序不是官方的、其中一条键序不同（内容全同）：出站仍要是
+    /// 按官方序排列的 11 条逐字节官方声明。`Value` 相等忽略键序，按它跳过替换会把客户端键序
+    /// 原样发出去；只缺几条时把缺的插头部则会把次序排乱。
+    #[test]
+    fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
+        let profile = config::cc_profile(config::CcProfileKind::MainOpus);
+        let official = crate::proxy::cc_tools_core(profile);
+        let expected = serde_json::to_string(official).unwrap();
+        // 倒序声明，并把第一条（Write）的键序打乱：input_schema 提到 name 之前。
+        let mut declared: Vec<serde_json::Value> = official.iter().rev().cloned().collect();
+        let scrambled = {
+            let src = declared[0].as_object().unwrap();
+            let mut m = serde_json::Map::new();
+            m.insert("input_schema".into(), src["input_schema"].clone());
+            for (k, val) in src.iter().filter(|(k, _)| *k != "input_schema") {
+                m.insert(k.clone(), val.clone());
+            }
+            serde_json::Value::Object(m)
+        };
+        assert_eq!(scrambled, declared[0], "Value 相等看不出键序不同——这正是要防的");
+        assert_ne!(
+            serde_json::to_string(&scrambled).unwrap(),
+            serde_json::to_string(&declared[0]).unwrap()
+        );
+        declared[0] = scrambled;
+        declared.push(serde_json::json!({"name": "my_tool", "input_schema": {"type": "object"}}));
+        let mut v =
+            serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": declared});
+        assert!(super::cc_tools_to_inject(&v, profile).is_empty(), "一个都不缺");
+        assert!(super::inject_cc_tools(&mut v, profile), "次序与键序都要改");
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(
+            serde_json::to_string(&tools[..11]).unwrap(),
+            expected,
+            "11 条逐字节等于资产、按资产序"
+        );
+        assert_eq!(tools[11]["name"], "my_tool");
+        // 已经是官方形态的再过一遍什么都不动。
+        assert!(!super::inject_cc_tools(&mut v, profile));
     }
 
     /// Windows 那种**扁平** `metadata.user_id` 同样要认，额度探测复用它的**原文**。
