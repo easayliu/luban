@@ -94,33 +94,130 @@ static CC_SESSIONS: std::sync::LazyLock<
 /// session id 隔了几个小时再来就是另一次对话，把上次那条 request-id 接过去是假的。
 const CC_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
-/// 每个会话上一条请求的**缓存前缀指纹**（[`crate::proxy::cache_prefix_fingerprint`]），
-/// 给 [`cache_prefix_stable`] 判「这一轮的 tools + system 与上一轮是不是同一份」。
+/// 每个会话上一条请求的**缓存前缀**（[`CachePrefix`]），给 [`cache_prefix_stable`] 判
+/// 「这一轮的 tools + system 与上一轮是不是同一份」，变了的话还要拿上一轮的正文对出差异。
 ///
 /// 与 [`CC_SESSIONS`] 分开存而不是并进 [`CcSessionEntry`]：那张表只在 `billing_cch` 开着、
 /// 且这一类请求上会话链时才建条目（[`client_session_link`]），而补消息断点这件事与
 /// billing header 无关，生产实例 `billing_cch` 关着时也要能判。键同样是 `(凭证 id, 会话 id)`，
 /// 理由同那张表；过期口径同 [`CC_SESSION_IDLE`]。
+///
+/// 存的是 system 各块**正文**而不只是指纹：一个会话几十 KB，活跃会话几百个也就几十 MB，
+/// 换来的是前缀一变就能在日志里看到**变的是哪一块、哪一段**——流水的 shape 只有长度和
+/// sha，现网那个尾块每轮长 51 字节的会话光看流水查不出多的是什么。
 static CC_PREFIX_FPS: std::sync::LazyLock<parking_lot::Mutex<PrefixFpMap>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-/// [`CC_PREFIX_FPS`] 的值：`(凭证 id, 会话 id) → (前缀指纹, 最后一次见到)`。
-type PrefixFpMap = std::collections::HashMap<(i64, String), (u64, std::time::Instant)>;
+/// [`CC_PREFIX_FPS`] 的值：`(凭证 id, 会话 id) → (上一轮前缀, 最后一次见到)`。
+type PrefixFpMap = std::collections::HashMap<(i64, String), (CachePrefix, std::time::Instant)>;
 
-/// 记下这一轮的缓存前缀指纹，并回答**上一轮**的是不是同一个值。会话第一次出现、或隔了
-/// [`CC_SESSION_IDLE`] 再来，都算不稳定（`false`）。
+/// 一条请求缓存前缀里**会进缓存键**的部分：`tools` 的指纹，加 `system` 各块正文
+/// （不含 billing header 那一块）。由 [`crate::proxy::cache_prefix_of`] 算。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CachePrefix {
+    pub(super) tools_fp: u64,
+    pub(super) system: Vec<String>,
+}
+
+/// 记下这一轮的缓存前缀，并回答**上一轮**的是不是同一份。会话第一次出现、或隔了
+/// [`CC_SESSION_IDLE`] 再来，都算不稳定（`false`）。变了的话按块对出差异打一行 info
+/// （[`log_prefix_change`]）。
 ///
 /// 这是 [`crate::proxy::ensure_cc_message_breakpoint`] 的闸：prompt cache 是前缀缓存，
 /// `system` 里任何一块变了，它后面的 `messages` 不管标不标断点都是未命中——标了只是把
 /// 「按输入价裸算」换成「按 1.25 倍写入价裸算」。v0.3.121 上线后 claude-vscode 2.1.273
 /// 那个会话就是这样：system 尾块每轮长 51 字节，24 轮每轮把 25 万 token 的历史整段写进
 /// 缓存，`cache_read` 始终停在 27,126（tools + system 前三块），一个字都没读到。
-pub(super) fn cache_prefix_stable(key: CcSessionKey<'_>, fp: u64) -> bool {
+pub(super) fn cache_prefix_stable(key: CcSessionKey<'_>, prefix: CachePrefix) -> bool {
     let now = std::time::Instant::now();
     let mut map = CC_PREFIX_FPS.lock();
     map.retain(|_, (_, seen)| now.duration_since(*seen) < CC_SESSION_IDLE);
-    let prev = map.insert(key.owned(), (fp, now));
-    prev.is_some_and(|(p, _)| p == fp)
+    let session_id = key.session_id.to_string();
+    let Some((prev, _)) = map.insert(key.owned(), (prefix.clone(), now)) else { return false };
+    if prev == prefix {
+        return true;
+    }
+    log_prefix_change(&session_id, &prev, &prefix);
+    false
+}
+
+/// 差异段最多打这么多字符，两边各一段；system 块几十 KB，整块打出来没法看。
+const PREFIX_DIFF_MAX_CHARS: usize = 400;
+
+/// 变了的那块另打**当前正文的末尾**这么多字符：光看差异段不知道它接在什么后面，
+/// 尾块的末尾正是客户端逐轮追加内容的地方。
+const PREFIX_TAIL_CHARS: usize = 600;
+
+/// 同一会话相邻两轮前缀不同时，逐块把不同的那一段打进日志：块号、两轮长度、差异起点、
+/// 去掉的段原文、加上的段原文、该块当前末尾原文。块数不同或 tools 变了各打一行。
+///
+/// 打的是 system 正文而不是摘要：这行日志就是给「多出来的到底是什么」这个问题的，
+/// 流水的 shape 刻意不存正文，这里是唯一能看到原文的地方。只在前缀变了的轮次打。
+fn log_prefix_change(session_id: &str, prev: &CachePrefix, cur: &CachePrefix) {
+    if prev.tools_fp != cur.tools_fp {
+        tracing::info!(session = %session_id, "cache prefix changed between turns: tools differ");
+    }
+    if prev.system.len() != cur.system.len() {
+        tracing::info!(
+            session = %session_id,
+            prev_blocks = prev.system.len(),
+            cur_blocks = cur.system.len(),
+            "cache prefix changed between turns: system block count differs"
+        );
+        return;
+    }
+    for (i, (a, b)) in prev.system.iter().zip(&cur.system).enumerate() {
+        let Some((at, removed, added)) = text_diff(a, b) else { continue };
+        tracing::info!(
+            session = %session_id,
+            block = i,
+            prev_len = a.len(),
+            cur_len = b.len(),
+            at,
+            removed = ?truncate_chars(removed, PREFIX_DIFF_MAX_CHARS),
+            added = ?truncate_chars(added, PREFIX_DIFF_MAX_CHARS),
+            cur_tail = ?tail_chars(b, PREFIX_TAIL_CHARS),
+            "cache prefix changed between turns: system block differs"
+        );
+    }
+}
+
+/// 两段文本的差异：去掉公共前缀与公共后缀后剩下的中段，返回 `(差异起点字节偏移,
+/// 旧中段, 新中段)`；两段相同返回 `None`。切点落在字符边界上。
+pub(super) fn text_diff<'a>(a: &'a str, b: &'a str) -> Option<(usize, &'a str, &'a str)> {
+    if a == b {
+        return None;
+    }
+    let mut p = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(p) || !b.is_char_boundary(p) {
+        p -= 1;
+    }
+    let max_s = a.len().min(b.len()) - p;
+    let mut s = a.bytes().rev().zip(b.bytes().rev()).take_while(|(x, y)| x == y).count().min(max_s);
+    while !a.is_char_boundary(a.len() - s) || !b.is_char_boundary(b.len() - s) {
+        s -= 1;
+    }
+    Some((p, &a[p..a.len() - s], &b[p..b.len() - s]))
+}
+
+/// 取末尾 `n` 个字符，截过的在开头加 `(共 N 字符)…`。
+fn tail_chars(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    if total <= n {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(total - n).collect();
+    format!("(共 {total} 字符)…{tail}")
+}
+
+/// 截到前 `max` 个字符，截过的在末尾加 `…(共 N 字符)`。
+fn truncate_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…(共 {total} 字符)")
 }
 
 /// [`CC_SESSIONS`] 的键：**凭证 + 会话**，缺一不可，理由见那张表的注释。
@@ -413,6 +510,56 @@ pub(super) fn client_session_link(
 mod tests {
     use crate::proxy::test_support::{all_on, base_block, detect_with, parsed, test_cred};
     use crate::proxy::{Bytes, HeaderValue, config, header};
+
+    /// 前缀差异日志靠 [`super::text_diff`] 找出两轮 system 块里变的那一段：只剩中段、
+    /// 切点在字符边界上；[`super::cache_prefix_stable`] 变了回 `false`、没变回 `true`。
+    #[test]
+    fn prefix_diff_isolates_the_changed_segment() {
+        use super::{CachePrefix, cache_prefix_stable, text_diff};
+        // 现网那种尾块每轮追加：差异段就是追加的那 51 字节。
+        let tail = "…memory\n\n# Notes";
+        let grown = format!("{tail}\n\n<total_tokens>14999746 tokens left</total_tokens>");
+        let (at, removed, added) = text_diff(tail, &grown).unwrap();
+        assert_eq!(at, tail.len());
+        assert_eq!(removed, "");
+        assert_eq!(added, "\n\n<total_tokens>14999746 tokens left</total_tokens>");
+        assert_eq!(added.len(), 51, "49 字节提醒加 \\n\\n 正是流水里每轮多出的 51");
+        // 中段替换、多字节字符：切点不能落在字符中间。
+        let (at, removed, added) = text_diff("前缀中文后缀", "前缀英文后缀").unwrap();
+        assert_eq!(at, "前缀".len());
+        assert_eq!((removed, added), ("中", "英"));
+        // 数字变了（同长度替换）。
+        let (at, removed, added) =
+            text_diff("<total_tokens>15000000 tokens left>", "<total_tokens>14999746 tokens left>")
+                .unwrap();
+        assert_eq!(at, "<total_tokens>1".len());
+        assert_eq!((removed, added), ("5000000", "4999746"));
+        assert!(text_diff("same", "same").is_none());
+        assert_eq!(text_diff("", "x").unwrap(), (0, "", "x"));
+        assert_eq!(super::truncate_chars("abc", 5), "abc");
+        assert_eq!(super::truncate_chars("abcdefgh", 3), "abc…(共 8 字符)");
+        assert_eq!(super::tail_chars("abc", 5), "abc");
+        assert_eq!(super::tail_chars("abcdefgh", 3), "(共 8 字符)…fgh");
+
+        let sid = crate::proxy::uuid_v4();
+        let key = crate::proxy::CcSessionKey { cred_id: 7, session_id: &sid };
+        let p = |tail: &str| CachePrefix { tools_fp: 1, system: vec!["base".into(), tail.into()] };
+        assert!(!cache_prefix_stable(key, p(tail)), "第一轮没有上一轮可比");
+        assert!(cache_prefix_stable(key, p(tail)), "同一份前缀");
+        assert!(!cache_prefix_stable(key, p(&grown)), "尾块变了");
+        assert!(cache_prefix_stable(key, p(&grown)), "稳住了");
+        assert!(
+            !cache_prefix_stable(key, CachePrefix { tools_fp: 2, ..p(&grown) }),
+            "只有 tools 变也算变"
+        );
+        assert!(
+            !cache_prefix_stable(
+                key,
+                CachePrefix { tools_fp: 2, system: vec!["base".into(), "x".into(), "y".into()] }
+            ),
+            "块数变了"
+        );
+    }
 
     /// 会话链条：`cc_prompt_id` 新输入换一轮、工具续轮沿用；`cc_prev_req` 与
     /// `diagnostics.previous_message_id` 指向上一条请求/回复。

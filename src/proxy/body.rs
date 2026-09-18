@@ -8,7 +8,9 @@ use crate::store;
 
 use super::ban::parse_upstream_error;
 use super::learned_rules::{DeprecatedFieldMemory, LEARNED_KIND_DEPRECATED, SHAPE_MEMORY_CAP};
-use super::session_link::{CcRequestKind, CcSessionKey, CcSessionLink, cache_prefix_stable};
+use super::session_link::{
+    CachePrefix, CcRequestKind, CcSessionKey, CcSessionLink, cache_prefix_stable,
+};
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, Simulation, billing_header_text, cap_system_blocks, cc_profile_for,
     cc_profile_kind_for, is_cc_shaped, relocate_long_client_system, simulate_system,
@@ -364,7 +366,7 @@ pub(super) fn rewrite_body(
         && session_out.is_some_and(|sid| {
             cache_prefix_stable(
                 CcSessionKey { cred_id: cred.id, session_id: sid },
-                cache_prefix_fingerprint(&v),
+                cache_prefix_of(&v),
             )
         })
         && ensure_cc_message_breakpoint(&mut v);
@@ -1682,32 +1684,30 @@ pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) 
     true
 }
 
-/// 这条请求缓存前缀里**会进缓存键**的部分的指纹：`tools` 整段加 `system` 各块正文，
-/// 不含 billing header 那一块。给 [`cache_prefix_stable`] 跨轮比对。
+/// 这条请求缓存前缀里**会进缓存键**的部分：`tools` 整段的指纹，加 `system` 各块正文，
+/// 不含 billing header 那一块。给 [`cache_prefix_stable`] 跨轮比对，变了还能对出差异。
 ///
 /// billing header 不算：官方每条请求的 `cch` / `cc_prev_req` / `cc_prompt_id` 都在变，抓包里
 /// 前缀照样命中（`cap/2.1.260-2` 00057 → 00059，见 [`cch_value`]），上游显然不把那一块算
 /// 进缓存键。`cache_control` 本身也不算——它决定在哪里切、不决定内容。在 luban 自己动
 /// `system` 之前算：补前缀、cch 这些是逐轮确定的改写，客户端两轮发的一样，改完也一样。
-pub(super) fn cache_prefix_fingerprint(v: &serde_json::Value) -> u64 {
+pub(super) fn cache_prefix_of(v: &serde_json::Value) -> CachePrefix {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     if let Some(tools) = v.get("tools") {
         tools.to_string().hash(&mut h);
     }
-    match v.get("system") {
-        Some(serde_json::Value::String(s)) => s.hash(&mut h),
-        Some(serde_json::Value::Array(blocks)) => {
-            for t in blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())) {
-                if t.starts_with("x-anthropic-billing-header:") {
-                    continue;
-                }
-                t.hash(&mut h);
-            }
-        }
-        _ => {}
-    }
-    h.finish()
+    let system = match v.get("system") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .filter(|t| !t.starts_with("x-anthropic-billing-header:"))
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    CachePrefix { tools_fp: h.finish(), system }
 }
 
 /// 真 CC 来访的 `messages` 里**一个断点都没有**时，给最后一条消息的末块补上第三个断点。
