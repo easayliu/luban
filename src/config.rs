@@ -1439,17 +1439,40 @@ pub fn axios_shape(name: &str) -> &'static [&'static str] {
 
 // ---------- 官方 CC 工具名白名单 ----------
 
-/// 官方 Claude Code 客户端声明的全部工具名（含 deferred 展开后的名字）。
+/// 官方 Claude Code 客户端声明过的全部工具名（含 deferred 展开后的名字与老版本的旧名）。
 ///
-/// 来源：`cap/raw` 八份直连抓包 + `cap/2.1.145` 订阅直连。**只有这些名字在上游白名单内**，
-/// 其余 custom tool 名即使功能正常也会被上游判为第三方应用（扣超额池或 400），故
-/// [`crate::proxy::should_mimic_tool`] 对不在此集合内的 custom tool 统一加 `mcp__` 前缀。
+/// **只有这些名字在上游白名单内**，其余 custom tool 名即使功能正常也会被上游判为第三方应用
+/// （扣超额池或 400），故 [`crate::proxy::should_mimic_tool`] 对不在此集合内的 custom tool
+/// 统一加 `mcp__` 前缀。
+///
+/// 来源分三段，每段按字母序：
+/// 1. **现版本主线程与延迟池**：`cap/2.1.258`～`cap/2.1.270` 全部 `/v1/messages` 抓包里
+///    `tools[*].name` 的并集，加上 OAuth 端 ToolSearch 延迟池列表（正文 attachment 里的
+///    「deferred tools」清单）与 Agent 描述里点名的 `Artifact*` 三件。
+/// 2. **老版本旧名**：取自 2.1.276 二进制里官方自带的**旧名→新名改名表**
+///    （`Task→Agent`、`KillShell/KillBash→TaskStop`、`BashOutput/AgentOutput(Tool)→TaskOutput`、
+///    `ListPeers→ListAgents`、`Brief→SendUserMessage`、`ListMcpResources/ReadMcpResource(Dir)→…Tool`），
+///    TaskStop / TaskOutput 工具定义上的 `aliases`，以及 SDK 侧 `BUILTIN_TOOL_NAMES`
+///    （`Glob` / `Grep` / `Task` / `TodoWrite` / `SendUserMessage`）。这些名字在 2.1.258 之前的
+///    版本里是主线程直接声明的（`Glob` / `Grep` 到 2.1.238 仍在正文里，2.1.258 起才并进延迟池），
+///    老版本 CC 经 luban 转发时若被混淆成 `mcp__luban__*`，等于把官方名改成了官方从不发的名字。
+/// 3. **更早的旧名**：`LS` / `MultiEdit` / `NotebookRead` 在 2.1.276 的权限规则表
+///    （`filePatternTools` 等）里仍按工具名处理，1.x～2.0 的客户端曾直接声明。
+///
+/// 只收**证实官方发过**的名字：二进制里另有一批带 feature gate 的内部工具
+/// （`SuggestConnectors` / `ProposeGoal` / `TeamCreate` 之类）与 SDK 的 `REPL` / `JavaScript`，
+/// 没在任何抓包或改名表里出现过，不收——白名单收错一个名字的代价是那个名字原样出站被判第三方，
+/// 与漏收一个官方名（只是多混淆、功能不受影响、回程还原）不对称。
 ///
 /// 新版 CC 如果加了工具名，在这里补一条即可——漏补的代价只是多混淆一个官方名
 /// （功能不受影响，回程会还原），发现后补上即恢复。
 pub const CC_TOOL_NAMES: &[&str] = &[
+    // ---- 1. 现版本主线程与延迟池（cap/2.1.258～2.1.270） ----
     "Agent",
     "Artifact",
+    "ArtifactCheck",
+    "ArtifactComments",
+    "ArtifactData",
     "AskUserQuestion",
     "Bash",
     "CronCreate",
@@ -1458,6 +1481,7 @@ pub const CC_TOOL_NAMES: &[&str] = &[
     "DeferredToolPlaceholder",
     "DesignSync",
     "Edit",
+    "EndConversation",
     "EnterPlanMode",
     "EnterWorktree",
     "ExitPlanMode",
@@ -1487,6 +1511,32 @@ pub const CC_TOOL_NAMES: &[&str] = &[
     "WebSearch",
     "Workflow",
     "Write",
+    // ---- 2. 老版本旧名（2.1.276 二进制的改名表 / aliases / SDK BUILTIN_TOOL_NAMES） ----
+    "AgentOutput",
+    "AgentOutputTool",
+    "BashOutput",
+    "BashOutputTool",
+    "Brief",
+    "Glob",
+    "Grep",
+    "KillBash",
+    "KillShell",
+    "ListMcpResources",
+    "ListMcpResourcesTool",
+    "ListPeers",
+    "PowerShell",
+    "ReadMcpResource",
+    "ReadMcpResourceDir",
+    "ReadMcpResourceDirTool",
+    "ReadMcpResourceTool",
+    "SendUserMessage",
+    "StructuredOutput",
+    "Task",
+    "TodoWrite",
+    // ---- 3. 更早的旧名（1.x～2.0 直接声明，2.1.276 权限规则表仍按工具名处理） ----
+    "LS",
+    "MultiEdit",
+    "NotebookRead",
 ];
 
 // ---------- 逐请求遥测（tengu_api_* 事件链） ----------
@@ -1587,6 +1637,32 @@ pub const DATADOG_USER_AGENT: &str = AXIOS_DEFAULT_USER_AGENT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`CC_TOOL_NAMES`] 不得有重名（重名说明两段之间抄串了），且几个已证实的老版本旧名
+    /// 必须在——它们不在时老版本 CC 的 `Glob` / `Grep` / `Task` 会被混淆成 `mcp__luban__*`。
+    #[test]
+    fn cc_tool_names_are_unique_and_cover_legacy_official_names() {
+        let mut seen = std::collections::HashSet::new();
+        for n in CC_TOOL_NAMES {
+            assert!(seen.insert(*n), "白名单重名: {n}");
+        }
+        for legacy in [
+            "Glob",
+            "Grep",
+            "Task",
+            "TodoWrite",
+            "KillShell",
+            "BashOutput",
+            "EndConversation",
+            "ArtifactComments",
+        ] {
+            assert!(CC_TOOL_NAMES.contains(&legacy), "缺老版本官方名 {legacy}");
+        }
+        // 二进制里的内部 / feature-gate 工具没证实官方发过，不该混进来。
+        for unverified in ["REPL", "JavaScript", "TeamCreate", "SuggestConnectors"] {
+            assert!(!CC_TOOL_NAMES.contains(&unverified), "{unverified} 未证实，不该在白名单");
+        }
+    }
 
     /// [`CC_LATEST_KNOWN_RELEASE`] 是可信版本的下限：低于模拟版本会把 luban 自己发出去的
     /// 版本判成「不存在」，低于 2.1.270 表的版本则那张表永远选不中。

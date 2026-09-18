@@ -3760,6 +3760,45 @@ mod tests {
         assert!(build_tool_name_map(Some(&serde_json::json!({}))).is_none());
     }
 
+    /// 老版本 CC（2.1.258 之前）主线程直接声明 `Glob` / `Grep`，更老的还叫 `Task` / `TodoWrite` /
+    /// `KillShell` / `BashOutput`——都是官方名，混淆成 `mcp__luban__*` 反而是官方从不发的形态。
+    /// 同一条请求里 OpenClaw 那种小写业务名（`read` / `exec` / `sessions_spawn`）照旧混淆：
+    /// 白名单按大小写精确匹配，`read` 不因为有个 `Read` 就放行。
+    #[test]
+    fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
+        let body = serde_json::json!({"tools": [
+            {"name": "Glob"}, {"name": "Grep"}, {"name": "Task"}, {"name": "TodoWrite"},
+            {"name": "KillShell"}, {"name": "BashOutput"}, {"name": "EndConversation"},
+            {"name": "ArtifactComments"}, {"name": "MultiEdit"},
+            {"name": "read"}, {"name": "exec"}, {"name": "sessions_spawn"},
+            {"name": "qieman__GetFundDiagnosis"},
+        ]});
+        let map = build_tool_name_map(Some(&body)).expect("小写业务名该有映射");
+        assert_eq!(map.forward.len(), 4, "只混淆 4 个非官方名: {:?}", map.forward);
+        for kept in [
+            "Glob",
+            "Grep",
+            "Task",
+            "TodoWrite",
+            "KillShell",
+            "BashOutput",
+            "EndConversation",
+            "ArtifactComments",
+            "MultiEdit",
+        ] {
+            assert!(!map.forward.contains_key(kept), "{kept} 是官方旧名，该保留");
+        }
+        for mimic in ["read", "exec", "sessions_spawn", "qieman__GetFundDiagnosis"] {
+            assert!(map.forward.contains_key(mimic), "{mimic} 该被混淆");
+        }
+
+        // 只有老版本官方名 → 无映射，请求与回程两侧零开销。
+        let legacy_only = serde_json::json!({"tools": [
+            {"name": "Glob"}, {"name": "Grep"}, {"name": "Task"}, {"name": "Bash"},
+        ]});
+        assert!(build_tool_name_map(Some(&legacy_only)).is_none());
+    }
+
     /// 同一组工具名两次构造得到同一套假名——否则每轮请求的假名都变，上游 prompt cache 全丢。
     #[test]
     fn tool_map_is_stable_for_the_same_tool_set() {
