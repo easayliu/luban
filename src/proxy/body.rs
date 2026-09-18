@@ -11,7 +11,7 @@ use super::learned_rules::{DeprecatedFieldMemory, LEARNED_KIND_DEPRECATED, SHAPE
 use super::session_link::{CcRequestKind, CcSessionLink};
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, Simulation, billing_header_text, cap_system_blocks, cc_profile_for,
-    is_cc_shaped, relocate_long_client_system, simulate_system,
+    cc_profile_kind_for, is_cc_shaped, relocate_long_client_system, simulate_system,
 };
 use super::thinking::{preserve_thinking_encoding, strip_empty_thinking_blocks};
 use super::{count_cache_control, ensure_cc_metadata, insert_top_level};
@@ -235,6 +235,9 @@ pub(super) fn rewrite_body(
     // 出站头里已经带了 `thinking-display-updates` beta（由调用方从实际发出的头上判定）。
     // 只有它为真，fable 请求的 body 才补 `thinking.display:"updates"`，见 [`fill_thinking_display`]。
     display_beta: bool,
+    // 出站头里已经带了 `advanced-tool-use` beta（同样由调用方从实际发出的头上判定）。
+    // 真 CC 路径只有它为真才给工具补 `eager_input_streaming`，见 [`eager_tools_wanted`]。
+    adv_beta: bool,
     // 来访**自报**的客户端版本（`claude-cli/x.y.z`，解不出为 `None`）。只用在给真实 CC
     // 补 billing header 时，见 [`ensure_cc_system_prefix`]。
     client_version: Option<&str>,
@@ -269,8 +272,13 @@ pub(super) fn rewrite_body(
     // **空壳照丢**（[`drop_empty_system_messages`]，上游对它恒 400），所以这一项不挂在那个
     // 开关上。键值之间的空白由 [`body_has_pair`] 容掉，缩进过的体不会从这里漏过去。
     let has_system_role_msg = body_has_pair(body, b"\"role\"", b"\"system\"");
+    // 真 CC 路径要不要补 `eager_input_streaming` 得解析了才知道；没有 `tools` 字面量的体
+    // 一定不补，不必为它解析。
+    let may_fill_eager =
+        flags.eager_tool_streaming && adv_beta && body_contains(body, b"\"tools\"");
     if sim.is_none()
         && !shape
+        && !may_fill_eager
         && !flags.spoof_identity
         && !flags.billing_cch
         && !flags.strip_extra_fields
@@ -451,6 +459,13 @@ pub(super) fn rewrite_body(
     // 了主线程。判据是 profile，不是「有没有 tools 字段」。
     let cc_tools_injected =
         sim.is_some_and(|s| s.profile.has_billing_header() && inject_cc_tools(&mut v, s.profile));
+    // 工具声明的 `eager_input_streaming`：跟在注入之后——注入的官方工具资产自带正确取值
+    // （opus 那份带、fable 那份不带），这一步只管客户端自己声明、保留下来的那些。条件来源两条
+    // 路径不同（真 CC 看来访版本 × 模型 × 用途，模拟看出站 profile），规则共用，见
+    // [`eager_tools_wanted`] 与 [`fill_eager_tools`]。
+    let eager_filled = flags.eager_tool_streaming
+        && eager_tools_wanted(&v, sim, cc_inbound, cc_kind, client_version, adv_beta)
+        && fill_eager_tools(&mut v);
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
     // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
     let tools_deduped = dedup_tools(&mut v);
@@ -489,6 +504,7 @@ pub(super) fn rewrite_body(
         stripped,
         top_level_ordered,
         cc_tools_injected,
+        eager_filled,
         tools_deduped,
         empty_text_stripped,
         empty_thinking_stripped,
@@ -520,6 +536,7 @@ pub(super) fn rewrite_body(
         && !stripped
         && !top_level_ordered
         && !cc_tools_injected
+        && !eager_filled
         && !tools_deduped
         && !empty_text_stripped
         && !empty_thinking_stripped
@@ -532,6 +549,96 @@ pub(super) fn rewrite_body(
         Ok(bytes) => Bytes::from(preserve_thinking_encoding(body, bytes)),
         Err(_) => body.clone(),
     }
+}
+
+/// 这条请求的客户端工具该不该补 `eager_input_streaming: true`。证据与规则见
+/// [`config::CcEagerTools`]，两条路径的**条件来源不同**：
+///
+/// - **真 CC 路径**（`sim` 为 `None`、来访是 CC 形态）：按来访**自报的版本 × 模型**查证据
+///   （[`config::cc_eager_tools_at`]，版本要**精确命中**抓包那一版，不沿 beta 参照那套
+///   「落回最近一版」的兜底——2.1.270 的 opus 没样本就不补），且用途得是主线程或猜下一句（[`CcRequestKind::Main`] /
+///   [`CcRequestKind::Suggestion`]——2.1.258/00025 那条猜下一句同样全带；子代理 / helper /
+///   标题 / 分类没有主线程的证据，不猜），且出站头里真有 `advanced-tool-use`（带 eager 的官方
+///   请求头上都有它，API-key 端两样都没有，只补体不补头就是另一个官方不产生的组合）。
+///   读不出版本一律不补——不知道是哪一版就没法查表。
+/// - **模拟路径**：按**出站的模拟 profile** 判，与来访客户端自报什么版本无关（出站 UA 是
+///   profile 那一版）。profile 记了 On/Off 就照记的；[`config::CcEagerTools::Unknown`]
+///   （2.1.260 的 sonnet / haiku 外推行）跟随注入的那份官方工具资产（[`cc_tools_core`]）——
+///   资产带则客户端保留的工具也带，一条请求里不出现「注入的带、客户端的不带」。只给主线程
+///   profile 判（`has_billing_header`，与注入同一道闸）。
+fn eager_tools_wanted(
+    v: &serde_json::Value,
+    sim: Option<&Simulation>,
+    cc_inbound: bool,
+    cc_kind: CcRequestKind,
+    client_version: Option<&str>,
+    adv_beta: bool,
+) -> bool {
+    use config::CcEagerTools::{Off, On, Unknown};
+    match sim {
+        Some(sim) => {
+            let profile = sim.profile;
+            if !profile.has_billing_header()
+                || !profile.beta.split(',').any(|b| b.trim() == config::CC_BETA_ADVANCED_TOOL_USE)
+            {
+                return false;
+            }
+            match profile.eager_tools {
+                On => true,
+                Off => false,
+                Unknown => {
+                    let asset = cc_tools_core(profile);
+                    !asset.is_empty()
+                        && asset.iter().all(|t| {
+                            t.get("eager_input_streaming").and_then(|e| e.as_bool()) == Some(true)
+                        })
+                }
+            }
+        }
+        None => {
+            if !cc_inbound
+                || !adv_beta
+                || !matches!(cc_kind, CcRequestKind::Main | CcRequestKind::Suggestion)
+            {
+                return false;
+            }
+            let Some(version) = client_version.and_then(parse_version) else { return false };
+            let Some(model) = v.get("model").and_then(|m| m.as_str()) else { return false };
+            config::cc_eager_tools_at(cc_profile_kind_for(model), Some(version)) == On
+        }
+    }
+}
+
+/// 给客户端声明的**内建形态**工具补 `eager_input_streaming: true`。该不该补由
+/// [`eager_tools_wanted`] 定，这里只管「补到哪些工具上」，两条路径共用：
+///
+/// - 客户端已写了这个键（`true` 或 `false`）的不覆盖——那是它的显式设置；
+/// - 只补**有 `input_schema`、名字不以 `mcp__` 开头、没有 `defer_loading: true`** 的工具：
+///   订阅端样本里 MCP 工具全在延迟池里、正文里一个没有，带不带无从证实；`DeferredToolPlaceholder`
+///   占位在每条样本里都不带；服务端工具（`type: web_search_…`）没有 `input_schema`，也没有
+///   带着 eager 的样本。没有证据的工具类型不猜。
+///
+/// 键追加在对象末尾：官方声明序是 `name, description, input_schema, eager_input_streaming`
+/// （`cap/2.1.258/00012` 每一条）。
+pub(super) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
+    let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else { return false };
+    let mut changed = false;
+    for tool in tools.iter_mut() {
+        let Some(obj) = tool.as_object_mut() else { continue };
+        let builtin_name =
+            obj.get("name").and_then(|n| n.as_str()).is_some_and(|n| !n.starts_with("mcp__"));
+        let deferred = obj.get("defer_loading").and_then(|d| d.as_bool()) == Some(true);
+        if !builtin_name
+            || deferred
+            || !obj.contains_key("input_schema")
+            || obj.contains_key("eager_input_streaming")
+        {
+            continue;
+        }
+        obj.insert("eager_input_streaming".into(), serde_json::Value::Bool(true));
+        changed = true;
+    }
+    changed
 }
 
 /// 裸客户端（无 `metadata.user_id`）在请求日志里用的设备标识：出站那份**伪装** device_id，
@@ -2009,6 +2116,11 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
 /// Agent 前面，11 条的相对次序就不是官方的了。官方的内建工具是一段固定次序，MCP 工具跟在
 /// 最后（`cap/2.1.258-api/00006`：`Write` 之后才是 `mcp__ide__*`），这里照这个形态排。
 ///
+/// **同名声明里显式写的 `eager_input_streaming` 保留**：那是客户端的设置（true 或 false 都是），
+/// 换成官方对象时不能顺手抹掉（fable 资产没有这个键）或改成资产的值（opus 资产是 true）。
+/// 与 [`fill_eager_tools`]「已有值不覆盖」是同一条约定，只是这里发生在替换那一步。其余字段
+/// 一律取资产的。
+///
 /// **换不换不看 JSON 值相等**：`Value` 的相等忽略对象键序，客户端一条内容全同、键序不同的
 /// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 11 条一律以资产对象
 /// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body`] 那条
@@ -2039,7 +2151,24 @@ fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bo
     }
 
     let before: Vec<Option<String>> = tools.iter().map(name_of).collect();
-    let mut aligned: Vec<serde_json::Value> = stubs.to_vec();
+    let mut aligned: Vec<serde_json::Value> = stubs
+        .iter()
+        .map(|stub| {
+            let mut out = stub.clone();
+            let name = stub.get("name").and_then(|n| n.as_str());
+            let explicit = tools
+                .iter()
+                .find(|t| t.get("name").and_then(|n| n.as_str()) == name)
+                .and_then(|t| t.get("eager_input_streaming"))
+                .cloned();
+            if let Some(explicit) = explicit
+                && let Some(obj) = out.as_object_mut()
+            {
+                obj.insert("eager_input_streaming".into(), explicit);
+            }
+            out
+        })
+        .collect();
     aligned.extend(
         tools
             .iter()
@@ -2882,6 +3011,7 @@ mod tests {
             false,
             None,
             false,
+            false,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -2900,6 +3030,223 @@ mod tests {
              prompt-caching-scope-2026-01-05,effort-2025-11-24";
         let merged = merge_beta(Some(sdk_beta), Some("claude-fable-5-1"), Some((2, 1, 258)));
         assert!(!merged.contains("thinking-display-updates"), "老世代的串不补: {merged}");
+    }
+
+    /// 真 CC（API-key 三块形态）请求，工具五种形态各一个：内建、客户端显式写了 `false` 的内建、
+    /// `mcp__*`、`defer_loading` 占位、服务端工具。
+    fn eager_body(model: &str, with_identity: bool) -> Bytes {
+        // 非 CC 形态：既没有身份句也没有 billing header（[`is_cc_shaped`] 两样任一都算 CC）。
+        let system = if with_identity {
+            serde_json::json!([
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli;"},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "\nBASE\n\nWrite code that reads like the surrounding code.", "cache_control": {"type": "ephemeral"}}
+            ])
+        } else {
+            serde_json::json!([{"type": "text", "text": "You are a helpful assistant."}])
+        };
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": system,
+            "tools": [
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                {"name": "Read", "description": "read", "input_schema": {"type": "object"}, "eager_input_streaming": false},
+                {"name": "mcp__ide__getDiagnostics", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "DeferredToolPlaceholder", "description": "p", "input_schema": {"type": "object"}, "defer_loading": true},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+            ],
+            "max_tokens": 64000,
+            "stream": true
+        })
+        .to_string()
+        .into()
+    }
+
+    /// 真 CC 路径跑一遍 [`rewrite_body`]，只拨 eager 相关的几个入参。
+    fn run_eager(
+        model: &str,
+        version: Option<&str>,
+        kind: crate::proxy::CcRequestKind,
+        adv_beta: bool,
+        flags: store::ForwardFlags,
+        with_identity: bool,
+    ) -> serde_json::Value {
+        let out = crate::proxy::rewrite_body(
+            &eager_body(model, with_identity),
+            &test_cred(),
+            "fp",
+            flags,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            adv_beta,
+            version,
+            None,
+            kind,
+            None,
+        );
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn eager_of<'a>(v: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+        v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .and_then(|t| t.get("eager_input_streaming"))
+    }
+
+    /// 真 CC 路径：已证「全带」的 profile（2.1.258 四族、2.1.260 opus、2.1.270 sonnet）给内建工具
+    /// 补 `eager_input_streaming: true`，键落在对象末尾（官方声明序）；客户端显式写的 `false`、
+    /// `mcp__*`、占位、服务端工具一个不动。猜下一句那条用途同样补（`cap/2.1.258/00025`）。
+    #[test]
+    fn fills_eager_input_streaming_on_verified_real_cc_profiles() {
+        use crate::proxy::CcRequestKind::{Main, Suggestion};
+        for (model, version, kind) in [
+            ("claude-opus-5", "2.1.258", Main),
+            ("claude-haiku-4-5-20251001", "2.1.258", Main),
+            ("claude-fable-5-1", "2.1.258", Main),
+            ("claude-opus-5", "2.1.260", Main),
+            ("claude-sonnet-5", "2.1.270", Main),
+            ("claude-opus-5", "2.1.258", Suggestion),
+        ] {
+            let v = run_eager(model, Some(version), kind, true, all_on(), true);
+            let tag = format!("{model} {version} {kind:?}");
+            assert_eq!(eager_of(&v, "Bash"), Some(&serde_json::json!(true)), "{tag}: 内建该补");
+            assert_eq!(
+                eager_of(&v, "Read"),
+                Some(&serde_json::json!(false)),
+                "{tag}: 显式 false 不覆盖"
+            );
+            assert!(eager_of(&v, "mcp__ide__getDiagnostics").is_none(), "{tag}: mcp 不猜");
+            assert!(eager_of(&v, "DeferredToolPlaceholder").is_none(), "{tag}: 占位不动");
+            assert!(eager_of(&v, "web_search").is_none(), "{tag}: 服务端工具不动");
+            let bash = v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "Bash").unwrap();
+            assert_eq!(
+                bash.as_object().unwrap().keys().next_back().map(String::as_str),
+                Some("eager_input_streaming"),
+                "{tag}: 键在末尾"
+            );
+        }
+    }
+
+    /// 真 CC 路径不补的每一种：profile 证实不带（2.1.260 fable）、没有样本（2.1.260 sonnet /
+    /// haiku、2.1.270 opus、样本之间的 2.1.261）、出站头没有 `advanced-tool-use`、读不出版本、
+    /// 用途不是主线程、开关关着、来访不是 CC 形态。
+    ///
+    /// 2.1.270 / 2.1.261 的 opus 钉的是「证据查表不走 beta 那套兜底」：beta 参照给 2.1.270 的
+    /// opus 落回 2.1.260 那行是兼容需要，eager 没抓过就是没证据。
+    #[test]
+    fn skips_eager_input_streaming_without_evidence() {
+        use crate::proxy::CcRequestKind::{Helper, Main, Subagent};
+        let none = |v: &serde_json::Value, why: &str| {
+            assert!(eager_of(v, "Bash").is_none(), "{why}: {}", v["tools"]);
+        };
+        none(
+            &run_eager("claude-fable-5-1", Some("2.1.260"), Main, true, all_on(), true),
+            "fable 2.1.260 证实不带",
+        );
+        none(
+            &run_eager("claude-sonnet-5", Some("2.1.260"), Main, true, all_on(), true),
+            "sonnet 2.1.260 没样本",
+        );
+        none(
+            &run_eager("claude-haiku-4-5-20251001", Some("2.1.260"), Main, true, all_on(), true),
+            "haiku 2.1.260 没样本",
+        );
+        none(
+            &run_eager("claude-opus-5", Some("2.1.270"), Main, true, all_on(), true),
+            "opus 2.1.270 没样本，不继承 2.1.260",
+        );
+        none(
+            &run_eager("claude-opus-5", Some("2.1.261"), Main, true, all_on(), true),
+            "样本之间的版本没样本",
+        );
+        none(
+            &run_eager("claude-opus-5", Some("2.1.258"), Main, false, all_on(), true),
+            "头上没 advanced-tool-use",
+        );
+        none(&run_eager("claude-opus-5", None, Main, true, all_on(), true), "读不出版本");
+        none(
+            &run_eager("claude-opus-5", Some("2.1.258"), Subagent, true, all_on(), true),
+            "子代理没证据",
+        );
+        none(
+            &run_eager("claude-opus-5", Some("2.1.258"), Helper, true, all_on(), true),
+            "helper 没证据",
+        );
+        let off = store::ForwardFlags { eager_tool_streaming: false, ..all_on() };
+        none(&run_eager("claude-opus-5", Some("2.1.258"), Main, true, off, true), "开关关着");
+        none(
+            &run_eager("claude-opus-5", Some("2.1.258"), Main, true, all_on(), false),
+            "非 CC 形态",
+        );
+    }
+
+    /// 模拟路径：按**出站 profile** 判，与来访自报的版本无关。opus（On）给客户端保留的工具补；
+    /// fable（Off）不补；sonnet（Unknown）跟随注入的 opus 资产，也补。注入的 11 个官方工具不受
+    /// 影响——它们自带取值（opus 全带、fable 全不带）。
+    #[test]
+    fn simulated_eager_input_streaming_follows_the_outbound_profile() {
+        let body = |model: &str| -> Bytes {
+            serde_json::json!({
+                "model": model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "my_tool", "description": "t", "input_schema": {"type": "object"}},
+                    {"name": "explicit_off", "description": "t", "input_schema": {"type": "object"}, "eager_input_streaming": false},
+                    {"name": "mcp__x__y", "description": "t", "input_schema": {"type": "object"}}
+                ],
+                "stream": true
+            })
+            .to_string()
+            .into()
+        };
+        for (model, expect) in
+            [("claude-opus-5", true), ("claude-fable-5-1", false), ("claude-sonnet-5", true)]
+        {
+            let b = body(model);
+            let sim = sim_for(std::str::from_utf8(&b).unwrap());
+            let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            // 客户端工具在混淆之后带 `mcp__luban__` 前缀，按后缀找。
+            let find = |suffix: &str| {
+                v["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{model}: 找不到 {suffix}: {}", v["tools"]))
+            };
+            assert_eq!(
+                find("my_tool").get("eager_input_streaming"),
+                expect.then(|| serde_json::json!(true)).as_ref(),
+                "{model}: 客户端工具"
+            );
+            assert_eq!(
+                find("explicit_off")["eager_input_streaming"],
+                false,
+                "{model}: 显式 false 不覆盖"
+            );
+            assert!(
+                find("mcp__x__y").get("eager_input_streaming").is_none(),
+                "{model}: 来访自带的 mcp 不猜"
+            );
+            // 注入的官方工具与资产一致。
+            let bash = find("Bash");
+            assert_eq!(
+                bash.get("eager_input_streaming").is_some(),
+                model != "claude-fable-5-1",
+                "{model}: 注入的 Bash"
+            );
+        }
     }
 
     /// 三块改写成官方的四块，且逐字段与 `cap/raw/00006` 的形态一致：
@@ -3165,6 +3512,7 @@ mod tests {
             rate_limit_retry: false,
             cache_scope_global: false,
             cache_ttl_1h: false,
+            eager_tool_streaming: false,
             nonstream_as_sse: false,
             strip_extra_fields: false,
             tool_name_mimic: false,
@@ -3839,6 +4187,7 @@ mod tests {
                 rate_limit_retry: false,
                 cache_scope_global: false,
                 cache_ttl_1h: false,
+                eager_tool_streaming: false,
                 nonstream_as_sse: false,
                 strip_extra_fields: false,
                 tool_name_mimic: false,
@@ -4310,6 +4659,7 @@ mod tests {
             rate_limit_retry: false,
             cache_scope_global: false,
             cache_ttl_1h: false,
+            eager_tool_streaming: false,
             nonstream_as_sse: false,
             strip_extra_fields: false,
             tool_name_mimic: false,
@@ -4343,6 +4693,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 None,
                 None,
@@ -4409,6 +4760,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             None,
             None,
@@ -4543,6 +4895,62 @@ mod tests {
         assert_eq!(injected, planned, "注进去的名单必须就是判据给出的那份");
         // 客户端自己的工具仍在后面，一个没丢。
         assert_eq!(v["tools"].as_array().unwrap().len(), all.len() + 2);
+    }
+
+    /// 同名替换保留客户端显式写的 `eager_input_streaming`：opus 资产带 true，客户端 Read 写了
+    /// false → 出站 Read 是官方对象但 eager 为 false；fable 资产没有这个键，客户端 Read 写了
+    /// true → 出站 Read 带 true；没写的一律等于资产。整条模拟路径走完（注入 → 补 eager → 混淆）
+    /// 结论不变——补 eager 那步对已有键不动。
+    #[test]
+    fn same_named_client_tools_keep_their_explicit_eager_setting() {
+        for (kind, model, client_value) in [
+            (config::CcProfileKind::MainOpus, "claude-opus-5", false),
+            (config::CcProfileKind::MainFable, "claude-fable-5-1", true),
+        ] {
+            let profile = config::cc_profile(kind);
+            let asset = crate::proxy::cc_tools_core(profile);
+            let asset_read = asset.iter().find(|t| t["name"] == "Read").unwrap();
+            let asset_bash = asset.iter().find(|t| t["name"] == "Bash").unwrap();
+            let mut v = serde_json::json!({
+                "model": model, "messages": [],
+                "tools": [
+                    {"name": "Read", "description": "mine", "input_schema": {"type": "object"}, "eager_input_streaming": client_value},
+                    {"name": "Bash", "description": "mine", "input_schema": {"type": "object"}}
+                ]
+            });
+            assert!(super::inject_cc_tools(&mut v, profile));
+            let tools = v["tools"].as_array().unwrap();
+            let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
+            let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
+            let mut expect_read = asset_read.clone();
+            expect_read["eager_input_streaming"] = serde_json::json!(client_value);
+            assert_eq!(
+                serde_json::to_string(read).unwrap(),
+                serde_json::to_string(&expect_read).unwrap(),
+                "{model}: 官方对象 + 客户端显式 eager"
+            );
+            assert_eq!(
+                serde_json::to_string(bash).unwrap(),
+                serde_json::to_string(asset_bash).unwrap(),
+                "{model}: 没写的等于资产"
+            );
+
+            // 整条模拟路径：补 eager 那步不覆盖已有键，混淆不动白名单里的官方名。
+            let body: Bytes = serde_json::json!({
+                "model": model, "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "Read", "description": "mine", "input_schema": {"type": "object"}, "eager_input_streaming": client_value}],
+                "stream": true
+            })
+            .to_string()
+            .into();
+            let sim = sim_for(std::str::from_utf8(&body).unwrap());
+            let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let read =
+                out["tools"].as_array().unwrap().iter().find(|t| t["name"] == "Read").unwrap();
+            assert_eq!(read["eager_input_streaming"], client_value, "{model}: 出站保留显式值");
+        }
     }
 
     /// 客户端已带部分官方名的「半抄」克隆：缺的补到头部，同名的一律整条换成官方声明（参数
@@ -4802,6 +5210,7 @@ mod tests {
             None,
             false,
             Some(&map),
+            true,
             true,
             None,
             None,
@@ -5525,6 +5934,7 @@ mod tests {
                 true,
                 None,
                 true,
+                true,
                 None,
                 None,
                 crate::proxy::CcRequestKind::Main,
@@ -5555,6 +5965,7 @@ mod tests {
             None,
             false,
             None,
+            true,
             true,
             None,
             None,

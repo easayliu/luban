@@ -2069,6 +2069,8 @@ struct ForwardingResp {
     cache_scope_global: bool,
     /// 缓存断点写不写 `ttl:"1h"`（对齐官方；关掉即沿用客户端自己传的时长）。
     cache_ttl_1h: bool,
+    /// 工具声明补不补 `eager_input_streaming: true`（只补抓包证实过的版本 × 模型 × 用途）。
+    eager_tool_streaming: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     nonstream_as_sse: bool,
     /// 剥掉官方客户端从不发送的顶层字段（缺省语义的 `tool_choice`、`thinking.display`）。
@@ -2125,6 +2127,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             rate_limit_retry: f.rate_limit_retry,
             cache_scope_global: f.cache_scope_global,
             cache_ttl_1h: f.cache_ttl_1h,
+            eager_tool_streaming: f.eager_tool_streaming,
             nonstream_as_sse: f.nonstream_as_sse,
             strip_extra_fields: f.strip_extra_fields,
             tool_name_mimic: f.tool_name_mimic,
@@ -2793,6 +2796,7 @@ struct SetForwardingReq {
     rate_limit_retry: Option<bool>,
     cache_scope_global: Option<bool>,
     cache_ttl_1h: Option<bool>,
+    eager_tool_streaming: Option<bool>,
     nonstream_as_sse: Option<bool>,
     strip_extra_fields: Option<bool>,
     tool_name_mimic: Option<bool>,
@@ -2820,14 +2824,15 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        API_TELEMETRY, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS, FILL_METADATA,
-        FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
-        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE,
-        REJECT_PROBES, REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC,
-        SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT,
-        STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
-        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        API_TELEMETRY, EAGER_TOOL_STREAMING, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS,
+        FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING,
+        KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
+        OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY,
+        REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_PROBES_STRICT,
+        REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
+        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
+        TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -2846,6 +2851,7 @@ async fn set_forwarding(
         (RATE_LIMIT_RETRY, req.rate_limit_retry),
         (SYSTEM_CACHE_SCOPE, req.cache_scope_global),
         (SYSTEM_CACHE_TTL, req.cache_ttl_1h),
+        (EAGER_TOOL_STREAMING, req.eager_tool_streaming),
         (NONSTREAM_AS_SSE, req.nonstream_as_sse),
         (STRIP_EXTRA_FIELDS, req.strip_extra_fields),
         (TOOL_NAME_MIMIC, req.tool_name_mimic),

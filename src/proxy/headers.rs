@@ -1041,6 +1041,7 @@ mod tests {
             rate_limit_retry: false,
             cache_scope_global: false,
             cache_ttl_1h: false,
+            eager_tool_streaming: false,
             nonstream_as_sse: false,
             strip_extra_fields: false,
             tool_name_mimic: false,

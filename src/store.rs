@@ -2292,6 +2292,9 @@ impl CredentialStore {
         if let Some(v) = on(NONSTREAM_AS_SSE) {
             flags.nonstream_as_sse = v;
         }
+        if let Some(v) = on(EAGER_TOOL_STREAMING) {
+            flags.eager_tool_streaming = v;
+        }
         if let Some(v) = on(STRIP_EXTRA_FIELDS) {
             flags.strip_extra_fields = v;
         }
@@ -2542,6 +2545,10 @@ pub const RATE_LIMIT_RETRY: &str = "rate_limit_retry";
 /// 100% 稳定的判据。见 [`ForwardFlags::nonstream_as_sse`]。
 pub const NONSTREAM_AS_SSE: &str = "nonstream_as_sse";
 
+/// 工具声明要不要补 `eager_input_streaming: true`（按已证实的 profile）。缺省视为开启。
+/// 见 [`ForwardFlags::eager_tool_streaming`]。
+pub const EAGER_TOOL_STREAMING: &str = "eager_tool_streaming";
+
 /// 是否剥掉官方从不发送的顶层字段的 settings 键名。缺省视为开启。
 /// 见 [`ForwardFlags::strip_extra_fields`]。
 pub const STRIP_EXTRA_FIELDS: &str = "strip_extra_fields";
@@ -2784,6 +2791,15 @@ pub struct ForwardFlags {
     /// 与 [`Self::cache_scope_global`] 一样要 beta 认（`extended-cache-ttl-2025-04-11`，
     /// 由 `merge_beta` 补），故还连着那个开关，见 [`crate::proxy::rewrite_body`]。
     pub cache_ttl_1h: bool,
+    /// 工具声明补 `eager_input_streaming: true`，只补**抓包证实**该 profile 全带的那些组合
+    /// （[`crate::config::CcEagerTools`]）：真 CC 按来访版本 × 模型 × 用途查表，模拟路径按出站
+    /// profile；客户端显式写了的值不覆盖，`mcp__*` / 延迟占位 / 服务端工具不动。
+    ///
+    /// 订阅端主线程的每个内建工具都带这个字段、API-key 端一个不带，是两种模式间一处逐工具
+    /// 重复的固定差异。它与出站头上的 `advanced-tool-use` beta 同现，故还连着 `merge_beta`
+    /// （耦合点在 [`crate::proxy::rewrite_body`]）。收益是缩小声明差异，对封号率的影响幅度
+    /// 没有量过，所以单独给开关。
+    pub eager_tool_streaming: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     ///
     /// **这是形态对齐里最硬的一项**：官方 CC 的 `/v1/messages` **恒为 `stream:true`**，
@@ -2973,6 +2989,7 @@ impl Default for ForwardFlags {
             rate_limit_retry: true,
             cache_scope_global: true,
             cache_ttl_1h: true,
+            eager_tool_streaming: true,
             nonstream_as_sse: true,
             strip_extra_fields: true,
             tool_name_mimic: true,
@@ -8584,6 +8601,7 @@ mod tests {
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
             (SYSTEM_CACHE_TTL, "0"),
+            (EAGER_TOOL_STREAMING, "0"),
             (NONSTREAM_AS_SSE, "0"),
             (STRIP_EXTRA_FIELDS, "0"),
             (TOOL_NAME_MIMIC, "0"),
@@ -8626,6 +8644,7 @@ mod tests {
                 rate_limit_retry: false,
                 cache_scope_global: false,
                 cache_ttl_1h: false,
+                eager_tool_streaming: false,
                 nonstream_as_sse: false,
                 strip_extra_fields: false,
                 tool_name_mimic: false,

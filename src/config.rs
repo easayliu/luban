@@ -446,6 +446,52 @@ pub struct CcProfile {
     pub fallbacks: Option<&'static str>,
     /// 顶层键序，见 [`CC_BODY_ORDER_MAIN`]。
     pub body_key_order: &'static [&'static str],
+    /// 这个 profile 的官方请求里，每个**非延迟**工具带不带 `eager_input_streaming: true`。
+    /// 取值只写抓包证实过的，见 [`CcEagerTools`]。
+    pub eager_tools: CcEagerTools,
+}
+
+/// 官方请求里工具声明带不带 `eager_input_streaming: true`——按 profile（版本 × 模型 × 用途）
+/// 记，**只记抓包证实过的**。
+///
+/// 证据矩阵（`cap/` 全部 `/v1/messages` 抓包，逐条数过）：
+///
+/// | 版本 | 模型 / 用途 | 非延迟工具 | eager |
+/// |---|---|---:|---|
+/// | 2.1.258 OAuth | opus / fable / sonnet / haiku 主线程 | 15 | 全带 |
+/// | 2.1.258 API-key | 四族主线程 | 34 / 37 | 全不带 |
+/// | 2.1.260 | opus 主线程（7 条） | 15 | 全带 |
+/// | 2.1.260 | fable 主线程（3 条） | 12 | 全不带 |
+/// | 2.1.260 | SDK 子代理 haiku（4 条） | 4 | 全不带 |
+/// | 2.1.270 | sonnet 主线程（2 条） | 15 | 全带 |
+///
+/// 每一条要么全带要么全不带，没有混合；`DeferredToolPlaceholder` 那条占位永远不带。fable 在
+/// 2.1.258 带、2.1.260 不带，说明它是「版本 × 模型」的联合属性，不能按模型单独推，所以
+/// 2.1.260 的 sonnet / haiku 主线程与 2.1.270 的其余三族一律 [`Self::Unknown`]。
+///
+/// **它与 `advanced-tool-use` beta 同现**：带 eager 的每一条头上都有那项 beta，API-key 端
+/// 两者都没有。体侧补写因此要求出站头里真有它（[`crate::proxy::rewrite_body`]）。
+///
+/// **真 CC 路径按版本精确查**（[`cc_eager_tools_at`]）：只有来访自报的版本恰好是某张表抓包的
+/// 那一版（2.1.258 / 2.1.260 / 2.1.270）且该 kind 有行，才拿得到 On/Off；其余版本一律
+/// [`Self::Unknown`]。这与 beta 参照串的取法（[`cc_profile_at`]，落回最近一版）**刻意不同**：
+/// 那是兼容兜底——新客户端来了总得给它一串 beta；这里是证据——没抓过的版本就是没证据，
+/// 2.1.270 的 opus 不能因为 2.1.260 的 opus 带就跟着带。
+///
+/// 补写规则两条路径共用（[`crate::proxy::fill_eager_tools`]）：客户端已写的值（true 或 false）
+/// 不覆盖；profile 不是 [`Self::On`] 就不补；只补有 `input_schema` 的内建形态客户端工具——
+/// `defer_loading` 占位、`mcp__*`（订阅端样本里 MCP 工具全在延迟池里、正文里一个没有，带不带
+/// 无从证实）、服务端工具（`type: web_search_…`，没有 `input_schema`）都不动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcEagerTools {
+    /// 抓包证实该 profile 的非延迟工具全带 `eager_input_streaming: true`。
+    On,
+    /// 抓包证实一个都不带。
+    Off,
+    /// 没有这个 profile 的样本。真 CC 路径不补；模拟路径跟随注入的官方工具资产
+    /// （[`crate::proxy::cc_tools_core`]）——那份资产带什么，保留下来的客户端工具就跟什么，
+    /// 一条请求里不出现「注入的带、客户端的不带」这种官方从不产生的混合。
+    Unknown,
 }
 
 impl CcProfile {
@@ -550,6 +596,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::AdaptiveUpdates,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        // `cap/2.1.260-2/00013` 等 7 条全带。
+        eager_tools: CcEagerTools::On,
     },
     CcProfile {
         kind: CcProfileKind::MainFable,
@@ -573,6 +621,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         // 官方形态的一部分，形态与要不要替用户拨这个开关是两件事。
         fallbacks: Some(r#"[{"model":"claude-opus-5"}]"#),
         body_key_order: CC_BODY_ORDER_MAIN,
+        // `cap/2.1.260/00018` 等 3 条全不带。
+        eager_tools: CcEagerTools::Off,
     },
     CcProfile {
         kind: CcProfileKind::MainSonnet,
@@ -594,6 +644,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::AdaptiveUpdates,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        // 没有样本；模拟路径跟随 opus 那份资产。
+        eager_tools: CcEagerTools::Unknown,
     },
     CcProfile {
         kind: CcProfileKind::MainHaiku,
@@ -612,6 +664,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::EnabledUpdates,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        // 没有样本；模拟路径跟随 opus 那份资产。
+        eager_tools: CcEagerTools::Unknown,
     },
     CcProfile {
         kind: CcProfileKind::SdkSubagentHaiku,
@@ -628,6 +682,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::EnabledUpdates,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        // `cap/2.1.260/00020` 等 4 条全不带。
+        eager_tools: CcEagerTools::Off,
     },
     CcProfile {
         kind: CcProfileKind::HelperSubagentHaiku,
@@ -643,6 +699,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::Disabled,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::Unknown,
     },
     CcProfile {
         kind: CcProfileKind::SessionTitleHaiku,
@@ -660,6 +717,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::Disabled,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::Unknown,
     },
     CcProfile {
         kind: CcProfileKind::SecurityClassifierSonnet,
@@ -677,6 +735,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::Disabled,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_CLASSIFIER,
+        eager_tools: CcEagerTools::Unknown,
     },
     CcProfile {
         kind: CcProfileKind::QuotaProbe,
@@ -692,6 +751,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
         thinking: CcThinking::Absent,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_QUOTA,
+        eager_tools: CcEagerTools::Unknown,
     },
 ];
 
@@ -727,6 +787,8 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         thinking: CcThinking::Adaptive,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        // 2.1.258 四族 OAuth 主线程全带（`cap/2.1.258/00012` / `00013` / `00026` / `00031`）。
+        eager_tools: CcEagerTools::On,
     },
     CcProfile {
         kind: CcProfileKind::MainFable,
@@ -746,6 +808,7 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         // 2.1.258 发的是字符串 `"default"`（`cap/2.1.258/00013`）。
         fallbacks: Some(r#""default""#),
         body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::On,
     },
     CcProfile {
         kind: CcProfileKind::MainSonnet,
@@ -764,6 +827,7 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         thinking: CcThinking::Adaptive,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::On,
     },
     CcProfile {
         kind: CcProfileKind::MainHaiku,
@@ -781,6 +845,7 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         thinking: CcThinking::Enabled,
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::On,
     },
 ];
 
@@ -821,6 +886,8 @@ pub const CC_PROFILES_2_1_270: &[CcProfile] = &[CcProfile {
     thinking: CcThinking::AdaptiveUpdates,
     fallbacks: None,
     body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+    // `cap/2.1.270/00017` / `00025` 全带。
+    eager_tools: CcEagerTools::On,
 }];
 
 /// 按 kind 取 **2.1.260** 的 profile。表是常量，查不到即编译期就漏写了一行，故直接兜底到
@@ -866,6 +933,21 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
 /// 前三项缺着时，[`CC_PROFILES`] 里 `MainSonnet` / `MainHaiku` 两行是外推值，四模型族的
 /// 差分矩阵不能宣称完整。
 pub mod cc_2_1_260_missing_samples {}
+
+/// 某 kind 在**恰好**这一版上的 eager 证据（[`CcEagerTools`]）：三张表里找 `kind` 相同、
+/// `version` 与来访自报版本逐段相等的那一行；没有就是 [`CcEagerTools::Unknown`]。
+///
+/// 不走 [`cc_profile_at`]：那条会把 2.1.270 的 opus 落到 2.1.260 的行上，beta 参照需要这种
+/// 兜底，eager 的证据不需要——见 [`CcEagerTools`] 的说明。读不出版本同样 Unknown。
+pub fn cc_eager_tools_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> CcEagerTools {
+    let Some(version) = version else { return CcEagerTools::Unknown };
+    CC_PROFILES_2_1_258
+        .iter()
+        .chain(CC_PROFILES)
+        .chain(CC_PROFILES_2_1_270)
+        .find(|p| p.kind == kind && crate::proxy::parse_version(p.version) == Some(version))
+        .map_or(CcEagerTools::Unknown, |p| p.eager_tools)
+}
 
 /// **2.1.270 还缺的抓包**（`cap/2.1.270` 只有 sonnet 主线程、标题生成 haiku、额度探测三种）。
 ///
@@ -1516,6 +1598,31 @@ mod tests {
         for p in CC_PROFILES.iter().chain(CC_PROFILES_2_1_258).chain(CC_PROFILES_2_1_270) {
             assert!(latest >= v(p.version), "{:?} 的 {} 表选不中", p.kind, p.version);
         }
+    }
+
+    /// [`cc_eager_tools_at`] 只认版本精确命中的行：2.1.270 的 opus 不继承 2.1.260 的 On，
+    /// 样本之间的版本（2.1.259 / 2.1.261）与读不出版本都是 Unknown——与 [`cc_profile_at`]
+    /// 给 beta 用的兜底分开。
+    #[test]
+    fn cc_eager_tools_at_requires_an_exact_version_match() {
+        use CcEagerTools::{Off, On, Unknown};
+        use CcProfileKind::*;
+        assert_eq!(cc_eager_tools_at(MainOpus, Some((2, 1, 258))), On);
+        assert_eq!(cc_eager_tools_at(MainOpus, Some((2, 1, 260))), On);
+        assert_eq!(cc_eager_tools_at(MainFable, Some((2, 1, 260))), Off);
+        assert_eq!(cc_eager_tools_at(MainSonnet, Some((2, 1, 270))), On);
+        assert_eq!(cc_eager_tools_at(SdkSubagentHaiku, Some((2, 1, 260))), Off);
+        assert_eq!(cc_eager_tools_at(MainOpus, Some((2, 1, 270))), Unknown, "opus 2.1.270 没样本");
+        assert_eq!(cc_eager_tools_at(MainOpus, Some((2, 1, 259))), Unknown);
+        assert_eq!(cc_eager_tools_at(MainOpus, Some((2, 1, 261))), Unknown);
+        assert_eq!(
+            cc_eager_tools_at(MainSonnet, Some((2, 1, 260))),
+            Unknown,
+            "外推行记的就是 Unknown"
+        );
+        assert_eq!(cc_eager_tools_at(MainOpus, None), Unknown);
+        // 对照：beta 参照会落回最近一版，这里不会。
+        assert_eq!(cc_profile_at(MainOpus, Some((2, 1, 270))).eager_tools, On);
     }
 
     /// [`cc_profile_at`] 的三档：<2.1.260 与读不出版本取 2.1.258 表；2.1.260 ~ 2.1.269 取

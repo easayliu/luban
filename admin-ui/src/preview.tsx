@@ -741,6 +741,7 @@ queryClient.setQueryData(['settings'], {
   rate_limit_retry: true,
   cache_scope_global: true,
   cache_ttl_1h: true,
+  eager_tool_streaming: true,
   nonstream_as_sse: true,
   strip_extra_fields: true,
   tool_name_mimic: true,

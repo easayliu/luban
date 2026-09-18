@@ -75,6 +75,8 @@ export interface Settings {
   normalize_device_fp: boolean
   /** 缓存断点写不写 ttl:"1h"（对齐官方）；关闭则沿用客户端自己传的时长。 */
   cache_ttl_1h: boolean
+  /** 工具声明补不补 eager_input_streaming:true（只补抓包证实过的版本 × 模型 × 用途）。 */
+  eager_tool_streaming: boolean
   /** 非流式 /v1/messages 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。 */
   nonstream_as_sse: boolean
   /** 剥掉官方客户端从不发送的顶层字段（缺省语义的 tool_choice、thinking.display）。 */
@@ -133,6 +135,7 @@ export type ForwardingKey =
   | 'rate_limit_retry'
   | 'cache_scope_global'
   | 'cache_ttl_1h'
+  | 'eager_tool_streaming'
   | 'nonstream_as_sse'
   | 'strip_extra_fields'
   | 'tool_name_mimic'

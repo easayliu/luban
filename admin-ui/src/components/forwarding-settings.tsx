@@ -424,6 +424,26 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="eager_tool_streaming"
+          label={t('工具声明对齐 eager 流式', 'Match official eager tool streaming')}
+          summary={t(
+            '给工具声明补 eager_input_streaming:true，只补抓包证实过的版本、模型与用途组合。',
+            'Add eager_input_streaming:true to tool declarations, only for version, model and purpose combinations confirmed by captures.',
+          )}
+          requires={{
+            key: 'merge_beta',
+            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+          }}
+          description={
+            <>
+              {t(
+                '官方订阅客户端主线程请求里的每个内建工具都带 eager_input_streaming:true，API key 模式一个都不带——这是两种模式之间逐工具重复的一处固定差异。补齐只按抓包证实过的组合做：2.1.258 四个模型族、2.1.260 的 opus、2.1.270 的 sonnet 补；2.1.260 的 fable 证实不带，不补；没有样本的组合不猜。真实 Claude Code 请求按客户端自报的版本、模型与请求用途判断；模拟请求按实际出站的模拟 profile 判断。客户端自己写了这个字段（无论 true 还是 false）的不覆盖；MCP 工具、延迟加载占位与服务端工具没有样本，不动。该字段与上游的 advanced-tool-use beta 同现，故依赖「Beta 标记」开关。收益是缩小声明差异，对封号率的影响幅度尚未量过。',
+                'Every built-in tool in a main-thread request from the official subscription client carries eager_input_streaming:true, while API-key mode sends none — a fixed per-tool difference between the two modes. The fill only covers combinations confirmed by captures: all four model families on 2.1.258, opus on 2.1.260 and sonnet on 2.1.270 are filled; fable on 2.1.260 is confirmed absent and left alone; combinations without a sample are not guessed. Real Claude Code requests are judged by the client’s reported version, model and request purpose; emulated requests by the emulated profile actually sent upstream. A value the client wrote itself (true or false) is never overwritten; MCP tools, deferred-loading placeholders and server tools have no samples and are left untouched. The field appears together with the upstream advanced-tool-use beta, hence the dependency on “Beta flags”. The benefit is a smaller declaration gap; the effect on ban rates has not been measured.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={TerminalIcon} title={t('非官方客户端', 'Third-party clients')}>

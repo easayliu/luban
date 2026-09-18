@@ -102,10 +102,16 @@ impl Upstream<'_> {
             // （[`merge_beta`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
             // 的串没有 `advisor-tool`，头上不补，体里就也不能写，否则上游 400：
             // `thinking.adaptive.display: Input should be 'summarized', 'omitted'`）。
-            let display_beta =
-                self.headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).is_some_and(|s| {
-                    s.split(',').any(|b| b.trim() == config::CC_BETA_THINKING_DISPLAY_UPDATES)
-                });
+            let has_beta = |name: &str| {
+                self.headers
+                    .get("anthropic-beta")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|s| s.split(',').any(|b| b.trim() == name))
+            };
+            let display_beta = has_beta(config::CC_BETA_THINKING_DISPLAY_UPDATES);
+            // 同理，工具声明上的 `eager_input_streaming` 只在出站头带了 `advanced-tool-use`
+            // 时才补：带 eager 的官方请求头上都有它，见 [`config::CcEagerTools`]。
+            let adv_beta = has_beta(config::CC_BETA_ADVANCED_TOOL_USE);
             // 给真实 CC 补 billing header 时写的是**它自报的**版本，不是 luban 自己那个：
             // 见 [`billing_header_text`]。模拟路径不看这个值（那条路的版本在 profile 里）。
             let client_version = self
@@ -125,6 +131,7 @@ impl Upstream<'_> {
                 self.force_stream,
                 self.tool_names.as_deref(),
                 display_beta,
+                adv_beta,
                 client_version.as_deref(),
                 self.client_link.as_ref().map(|(_, l)| l),
                 self.cc_kind,

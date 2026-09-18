@@ -62,6 +62,7 @@ pub(super) fn rewrite_body_with_session(
         false,
         None,
         true,
+        true,
         None,
         None,
         super::CcRequestKind::Main,
