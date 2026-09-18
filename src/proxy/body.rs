@@ -353,6 +353,13 @@ pub(super) fn rewrite_body(
     // 给它标一个反倒是新破绽。
     let msg_shape =
         sim.is_some_and(|s| s.profile.has_billing_header()) && align_message_shape(&mut v, cache);
+    // 真 CC 来访 `messages` 里一个断点都没有时也补一个，最小改动、抄客户端自己的 ttl，
+    // 见 [`ensure_cc_message_breakpoint`]。额度探测不补（官方那条一个断点都没有）。
+    let cc_msg_shape = shape
+        && sim.is_none()
+        && cc_inbound
+        && cc_kind.allows_system_prefix()
+        && ensure_cc_message_breakpoint(&mut v);
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
     // CC 子代理/desktop-3p 有时不带 billing header，上游按第三方计、限流更严。
@@ -501,6 +508,7 @@ pub(super) fn rewrite_body(
         diag,
         fallbacks_shaped,
         msg_shape,
+        cc_msg_shape,
         ttl_filled,
         streamed,
         tool_choice_normalized,
@@ -533,6 +541,7 @@ pub(super) fn rewrite_body(
         && !diag
         && !fallbacks_shaped
         && !msg_shape
+        && !cc_msg_shape
         && !ttl_filled
         && !streamed
         && !tool_choice_normalized
@@ -1662,6 +1671,76 @@ pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) 
     }
     // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
     block.insert("cache_control".into(), cache_control(shape.tail()));
+    true
+}
+
+/// 真 CC 来访的 `messages` 里**一个断点都没有**时，给最后一条消息的末块补上第三个断点。
+/// 返回是否改动过。只在非模拟路径、来访是 CC 形态（[`is_cc_shaped`]）且不是额度探测时调用，
+/// 受 [`store::ForwardFlags::system_shape`] 管。
+///
+/// **起因**：现网 `claude-cli/2.1.273 (external, claude-vscode, agent-sdk/0.3.273)` 的一个
+/// 会话（`req_zu6ELzACscXlpGSg` 及前后 24 轮）：客户端把 4 个断点里的 3 个花在 `system` 上
+/// （身份句、基座、尾块），`messages` 上一个没标。用量上就是 `cache_read` 恒等于工具声明加
+/// `system` 前三块，之后 6 万到 16 万 token 的对话历史每轮裸算、写入为 0，24 轮累计约
+/// 240 万 token 原价——走缓存读只要一成。luban 此前在非模拟路径不碰消息断点，前提是
+/// 「CC 自己会标」（官方 CLI 的第三个断点落在末尾那条 `role:"system"` 消息上，
+/// `cap/2.1.260-2/00061`），这个客户端不是这样。
+///
+/// **与 [`align_message_shape`] 的分工**：那一个是模拟路径的，会把全部字符串 `content`
+/// 收成块数组、按开关写 `ttl`。这里对真 CC 的 body 只做最小改动：
+/// - 客户端 `messages` 里已有任何断点就不动——那是它自己的策略；
+/// - 不改 `content` 的表示：官方 CLI 自己就是新旧混着发（旧 reminder 是字符串、新的是
+///   块数组），末条是字符串时不转也不标；
+/// - 断点的 `ttl` **抄客户端 `system` 里最后一个断点的**（去掉 `scope`）：上游要求 `ttl`
+///   按 tools → system → messages 单调不增，客户端 `system` 写 `5m`、这里写 `1h` 是一发
+///   400。`system` 里没有断点就写裸的 `{type:ephemeral}`；
+/// - 只往非空 `text` 与 `tool_result` 块上标、预算封顶 [`MAX_CACHE_BREAKPOINTS`]，与模拟
+///   路径同一口径。
+pub(super) fn ensure_cc_message_breakpoint(v: &mut serde_json::Value) -> bool {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    if msgs.is_empty() || msgs.iter().map(count_cache_control).sum::<usize>() > 0 {
+        return false;
+    }
+    if count_cache_control(v) >= MAX_CACHE_BREAKPOINTS {
+        return false;
+    }
+    let template = v
+        .get("system")
+        .and_then(|s| s.as_array())
+        .and_then(|blocks| blocks.iter().rev().find_map(|b| b.get("cache_control")))
+        .and_then(|cc| cc.as_object())
+        .filter(|cc| cc.contains_key("type"))
+        .map(|cc| {
+            let mut out = serde_json::Map::new();
+            for k in ["type", "ttl"] {
+                if let Some(val) = cc.get(k) {
+                    out.insert(k.into(), val.clone());
+                }
+            }
+            serde_json::Value::Object(out)
+        })
+        .unwrap_or_else(|| serde_json::json!({"type": "ephemeral"}));
+    let last = v
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|a| a.last_mut())
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(|b| b.as_object_mut());
+    let Some(block) = last else { return false };
+    let markable = match block.get("type").and_then(|t| t.as_str()) {
+        Some("text") => block.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty()),
+        Some("tool_result") => true,
+        _ => false,
+    };
+    if !markable {
+        return false;
+    }
+    block.insert("cache_control".into(), template);
+    tracing::info!(
+        "added the third cache breakpoint to the last message of a CC request that had none"
+    );
     true
 }
 
@@ -4650,6 +4729,115 @@ mod tests {
             "rejected".into(),
         );
         assert!(!carries(&main, "claude-fable-5-1", defaults));
+    }
+
+    /// 真 CC 来访 `messages` 里一个断点都没有时补第三个断点（[`ensure_cc_message_breakpoint`]）。
+    /// 形态照现网 `req_zu6ELzACscXlpGSg`：claude-vscode 2.1.273 的 agent-sdk 构建，5 块
+    /// `system`（billing、身份句、基座、无断点块、尾块），身份句 / 基座 / 尾块各带 `5m` 断点，
+    /// 末条是 `tool_result`、`messages` 里零断点。
+    #[test]
+    fn cc_request_without_message_breakpoint_gets_one_on_the_last_block() {
+        let system = |ttl: &str| {
+            format!(
+                concat!(
+                    r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.273.abc; cc_entrypoint=claude-vscode;"}},"#,
+                    r#"{{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.","cache_control":{{"type":"ephemeral","ttl":"{ttl}"}}}},"#,
+                    r#"{{"type":"text","text":"{base}","cache_control":{{"type":"ephemeral","ttl":"{ttl}"}}}},"#,
+                    r#"{{"type":"text","text":"env"}},"#,
+                    r#"{{"type":"text","text":"tail","cache_control":{{"type":"ephemeral","ttl":"{ttl}"}}}}]"#
+                ),
+                ttl = ttl,
+                base = "x".repeat(1200),
+            )
+        };
+        let tool_loop = concat!(
+            r#"[{"role":"user","content":"ls"},"#,
+            r#"{"role":"system","content":"<total_tokens>15000000 tokens left</total_tokens>"},"#,
+            r#"{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"a"}}]},"#,
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"a.txt"}]}]"#
+        );
+        let body = |system: &str, messages: &str| {
+            Bytes::from(format!(
+                r#"{{"model":"claude-opus-5","system":{system},"messages":{messages},"max_tokens":64000,"stream":true,"metadata":{{"user_id":"{{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}}"}}}}"#
+            ))
+        };
+        let run = |b: &Bytes, flags: store::ForwardFlags| -> serde_json::Value {
+            serde_json::from_slice(&rewrite_body(b, &test_cred(), "fp", flags, None, None)).unwrap()
+        };
+
+        // 正例：末块 tool_result 拿到断点，ttl 抄 system 的 5m 而不是开关的 1h，不带 scope；
+        // 字符串形态的旧 reminder 不被转成块数组；总数正好 4。
+        let v = run(&body(&system("5m"), tool_loop), all_on());
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "messages 不该增删: {v}");
+        assert!(msgs[1]["content"].is_string(), "旧 reminder 的字符串形态不该被转: {v}");
+        let last = msgs[3]["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["type"], "tool_result");
+        assert_eq!(
+            last["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
+            "断点该抄 system 尾块的 ttl: {v}"
+        );
+        assert_eq!(last["content"], "a.txt", "正文不动");
+        assert_eq!(crate::proxy::count_cache_control(&v), 4, "总数正好封顶: {v}");
+        assert_eq!(v["system"].as_array().unwrap().len(), 5, "system 块数不变: {v}");
+
+        // 客户端 system 断点不带 ttl → 消息断点也不带。
+        let bare = system("5m").replace(r#","ttl":"5m""#, "");
+        let v = run(&body(&bare, tool_loop), all_on());
+        let last = v["messages"][3]["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["cache_control"], serde_json::json!({"type": "ephemeral"}), "{v}");
+
+        // 反例一：客户端 messages 里自己标过（哪怕标在中间那条）→ 一个字节不动。
+        let marked = tool_loop.replace(
+            r#"{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"a"}}"#,
+            r#"{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"a"},"cache_control":{"type":"ephemeral"}}"#,
+        );
+        let v = run(&body(&system("5m"), &marked), all_on());
+        assert!(
+            v["messages"][3]["content"][0].get("cache_control").is_none(),
+            "客户端自己标过就不再标: {v}"
+        );
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1);
+
+        // 反例二：末条是字符串 content → 不转、不标（官方 CLI 自己就混着发）。
+        let str_tail = concat!(
+            r#"[{"role":"user","content":"ls"},"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"ok"}]},"#,
+            r#"{"role":"user","content":"and then?"}]"#
+        );
+        let v = run(&body(&system("5m"), str_tail), all_on());
+        assert!(v["messages"][2]["content"].is_string(), "末条字符串不该被转: {v}");
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0);
+
+        // 反例三：预算满（system 里 4 个断点）→ 不标。
+        let full = system("5m").replace(
+            r#"{"type":"text","text":"env"}"#,
+            r#"{"type":"text","text":"env","cache_control":{"type":"ephemeral","ttl":"5m"}}"#,
+        );
+        let v = run(&body(&full, tool_loop), all_on());
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "预算满不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control(&v), 4);
+
+        // 反例四：末块是 thinking → 不标。
+        let thinking_tail = concat!(
+            r#"[{"role":"user","content":"ls"},"#,
+            r#"{"role":"assistant","content":[{"type":"thinking","thinking":"想","signature":"AAAA"}]}]"#
+        );
+        let v = run(&body(&system("5m"), thinking_tail), all_on());
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "{v}");
+
+        // 反例五：system_shape 开关关着 → 不标。
+        let mut off = all_on();
+        off.system_shape = false;
+        let v = run(&body(&system("5m"), tool_loop), off);
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "开关关着不标: {v}");
+
+        // 反例六：非 CC 形态（没有身份句、没有 billing header）走非模拟路径 → 不标，
+        // 这一步只给真 CC 补。
+        let plain_sys = r#"[{"type":"text","text":"You are a helpful bot.","cache_control":{"type":"ephemeral"}}]"#;
+        let v = run(&body(plain_sys, tool_loop), all_on());
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "非 CC 形态不标: {v}");
     }
 
     /// 体侧 `ensure_fallbacks`：没写的补在 `context_management` 之后、`output_config` 之前
