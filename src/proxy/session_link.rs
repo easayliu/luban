@@ -94,6 +94,35 @@ static CC_SESSIONS: std::sync::LazyLock<
 /// session id 隔了几个小时再来就是另一次对话，把上次那条 request-id 接过去是假的。
 const CC_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
+/// 每个会话上一条请求的**缓存前缀指纹**（[`crate::proxy::cache_prefix_fingerprint`]），
+/// 给 [`cache_prefix_stable`] 判「这一轮的 tools + system 与上一轮是不是同一份」。
+///
+/// 与 [`CC_SESSIONS`] 分开存而不是并进 [`CcSessionEntry`]：那张表只在 `billing_cch` 开着、
+/// 且这一类请求上会话链时才建条目（[`client_session_link`]），而补消息断点这件事与
+/// billing header 无关，生产实例 `billing_cch` 关着时也要能判。键同样是 `(凭证 id, 会话 id)`，
+/// 理由同那张表；过期口径同 [`CC_SESSION_IDLE`]。
+static CC_PREFIX_FPS: std::sync::LazyLock<parking_lot::Mutex<PrefixFpMap>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// [`CC_PREFIX_FPS`] 的值：`(凭证 id, 会话 id) → (前缀指纹, 最后一次见到)`。
+type PrefixFpMap = std::collections::HashMap<(i64, String), (u64, std::time::Instant)>;
+
+/// 记下这一轮的缓存前缀指纹，并回答**上一轮**的是不是同一个值。会话第一次出现、或隔了
+/// [`CC_SESSION_IDLE`] 再来，都算不稳定（`false`）。
+///
+/// 这是 [`crate::proxy::ensure_cc_message_breakpoint`] 的闸：prompt cache 是前缀缓存，
+/// `system` 里任何一块变了，它后面的 `messages` 不管标不标断点都是未命中——标了只是把
+/// 「按输入价裸算」换成「按 1.25 倍写入价裸算」。v0.3.121 上线后 claude-vscode 2.1.273
+/// 那个会话就是这样：system 尾块每轮长 51 字节，24 轮每轮把 25 万 token 的历史整段写进
+/// 缓存，`cache_read` 始终停在 27,126（tools + system 前三块），一个字都没读到。
+pub(super) fn cache_prefix_stable(key: CcSessionKey<'_>, fp: u64) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = CC_PREFIX_FPS.lock();
+    map.retain(|_, (_, seen)| now.duration_since(*seen) < CC_SESSION_IDLE);
+    let prev = map.insert(key.owned(), (fp, now));
+    prev.is_some_and(|(p, _)| p == fp)
+}
+
 /// [`CC_SESSIONS`] 的键：**凭证 + 会话**，缺一不可，理由见那张表的注释。
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CcSessionKey<'a> {

@@ -8,7 +8,7 @@ use crate::store;
 
 use super::ban::parse_upstream_error;
 use super::learned_rules::{DeprecatedFieldMemory, LEARNED_KIND_DEPRECATED, SHAPE_MEMORY_CAP};
-use super::session_link::{CcRequestKind, CcSessionLink};
+use super::session_link::{CcRequestKind, CcSessionKey, CcSessionLink, cache_prefix_stable};
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, Simulation, billing_header_text, cap_system_blocks, cc_profile_for,
     cc_profile_kind_for, is_cc_shaped, relocate_long_client_system, simulate_system,
@@ -355,10 +355,18 @@ pub(super) fn rewrite_body(
         sim.is_some_and(|s| s.profile.has_billing_header()) && align_message_shape(&mut v, cache);
     // 真 CC 来访 `messages` 里一个断点都没有时也补一个，最小改动、抄客户端自己的 ttl，
     // 见 [`ensure_cc_message_breakpoint`]。额度探测不补（官方那条一个断点都没有）。
+    // **只在 tools + system 与上一轮相同时补**（[`cache_prefix_stable`]）：前缀变了，后面的
+    // messages 标了断点也是未命中，只会把裸算换成更贵的写入；会话第一轮同样不补。
     let cc_msg_shape = shape
         && sim.is_none()
         && cc_inbound
         && cc_kind.allows_system_prefix()
+        && session_out.is_some_and(|sid| {
+            cache_prefix_stable(
+                CcSessionKey { cred_id: cred.id, session_id: sid },
+                cache_prefix_fingerprint(&v),
+            )
+        })
         && ensure_cc_message_breakpoint(&mut v);
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
@@ -1674,9 +1682,44 @@ pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) 
     true
 }
 
+/// 这条请求缓存前缀里**会进缓存键**的部分的指纹：`tools` 整段加 `system` 各块正文，
+/// 不含 billing header 那一块。给 [`cache_prefix_stable`] 跨轮比对。
+///
+/// billing header 不算：官方每条请求的 `cch` / `cc_prev_req` / `cc_prompt_id` 都在变，抓包里
+/// 前缀照样命中（`cap/2.1.260-2` 00057 → 00059，见 [`cch_value`]），上游显然不把那一块算
+/// 进缓存键。`cache_control` 本身也不算——它决定在哪里切、不决定内容。在 luban 自己动
+/// `system` 之前算：补前缀、cch 这些是逐轮确定的改写，客户端两轮发的一样，改完也一样。
+pub(super) fn cache_prefix_fingerprint(v: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(tools) = v.get("tools") {
+        tools.to_string().hash(&mut h);
+    }
+    match v.get("system") {
+        Some(serde_json::Value::String(s)) => s.hash(&mut h),
+        Some(serde_json::Value::Array(blocks)) => {
+            for t in blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())) {
+                if t.starts_with("x-anthropic-billing-header:") {
+                    continue;
+                }
+                t.hash(&mut h);
+            }
+        }
+        _ => {}
+    }
+    h.finish()
+}
+
 /// 真 CC 来访的 `messages` 里**一个断点都没有**时，给最后一条消息的末块补上第三个断点。
-/// 返回是否改动过。只在非模拟路径、来访是 CC 形态（[`is_cc_shaped`]）且不是额度探测时调用，
+/// 返回是否改动过。只在非模拟路径、来访是 CC 形态（[`is_cc_shaped`]）、不是额度探测、
+/// **且这一轮的缓存前缀与上一轮相同**（[`cache_prefix_stable`]）时调用，
 /// 受 [`store::ForwardFlags::system_shape`] 管。
+///
+/// **为什么要看前缀稳不稳**：prompt cache 是前缀缓存，tools → system → messages 顺序拼起来
+/// 逐断点匹配。`system` 里有一块每轮都变，它后面的 `messages` 不管标不标断点都是未命中，
+/// 标了只是把「按输入价裸算」换成「按 1.25 倍写入价裸算」。v0.3.121 只加断点不看前缀，
+/// 上线后那个会话 24 轮每轮把 25 万 token 的历史整段写进缓存、`cache_read` 始终停在
+/// 27,126——比不标还贵两成半。前缀稳定的客户端才标，第一轮也不标（没有上一轮可比）。
 ///
 /// **起因**：现网 `claude-cli/2.1.273 (external, claude-vscode, agent-sdk/0.3.273)` 的一个
 /// 会话（`req_zu6ELzACscXlpGSg` 及前后 24 轮）：客户端把 4 个断点里的 3 个花在 `system` 上
@@ -4731,10 +4774,11 @@ mod tests {
         assert!(!carries(&main, "claude-fable-5-1", defaults));
     }
 
-    /// 真 CC 来访 `messages` 里一个断点都没有时补第三个断点（[`ensure_cc_message_breakpoint`]）。
+    /// 真 CC 来访 `messages` 里一个断点都没有时补第三个断点（[`ensure_cc_message_breakpoint`]），
+    /// 且只在缓存前缀与上一轮相同时补（[`cache_prefix_stable`]）。
     /// 形态照现网 `req_zu6ELzACscXlpGSg`：claude-vscode 2.1.273 的 agent-sdk 构建，5 块
     /// `system`（billing、身份句、基座、无断点块、尾块），身份句 / 基座 / 尾块各带 `5m` 断点，
-    /// 末条是 `tool_result`、`messages` 里零断点。
+    /// 末条是 `tool_result`、`messages` 里零断点；它的尾块每轮长 51 字节，那种轮次不能标。
     #[test]
     fn cc_request_without_message_breakpoint_gets_one_on_the_last_block() {
         let system = |ttl: &str| {
@@ -4761,9 +4805,73 @@ mod tests {
                 r#"{{"model":"claude-opus-5","system":{system},"messages":{messages},"max_tokens":64000,"stream":true,"metadata":{{"user_id":"{{\"device_id\":\"dddd\",\"account_uuid\":\"\",\"session_id\":\"ssss\"}}"}}}}"#
             ))
         };
+        // 每个用例一个新会话 id；同一份体发两轮，第二轮的前缀与第一轮相同，闸才放行。
+        let once =
+            |b: &Bytes, flags: store::ForwardFlags, sid: Option<&str>| -> serde_json::Value {
+                serde_json::from_slice(&crate::proxy::test_support::rewrite_body_with_session(
+                    b,
+                    &test_cred(),
+                    "fp",
+                    flags,
+                    None,
+                    None,
+                    sid,
+                ))
+                .unwrap()
+            };
         let run = |b: &Bytes, flags: store::ForwardFlags| -> serde_json::Value {
-            serde_json::from_slice(&rewrite_body(b, &test_cred(), "fp", flags, None, None)).unwrap()
+            let sid = crate::proxy::uuid_v4();
+            once(b, flags, Some(&sid));
+            once(b, flags, Some(&sid))
         };
+
+        // 会话第一轮：没有上一轮可比，不标。
+        let sid = crate::proxy::uuid_v4();
+        let v = once(&body(&system("5m"), tool_loop), all_on(), Some(&sid));
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "第一轮不标: {v}");
+        // 第二轮同一份前缀 → 标。
+        let v = once(&body(&system("5m"), tool_loop), all_on(), Some(&sid));
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1, "第二轮该标: {v}");
+        // 第三轮 system 尾块变了（现网那种每轮长 51 字节）→ 不标：前缀变了，标了也是未命中。
+        let grown = system("5m").replace(
+            r#""text":"tail""#,
+            r#""text":"tail\n\n<total_tokens>1 tokens left</total_tokens>""#,
+        );
+        let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "尾块变了不标: {v}");
+        // 第四轮尾块又稳住 → 再标。
+        let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1, "稳住后再标: {v}");
+        // tools 变了同样算前缀变了。
+        let with_tools = body(&grown, tool_loop);
+        let with_tools = Bytes::from(String::from_utf8(with_tools.to_vec()).unwrap().replace(
+            r#""max_tokens":64000"#,
+            r#""tools":[{"name":"Read","input_schema":{"type":"object"}}],"max_tokens":64000"#,
+        ));
+        let v = once(&with_tools, all_on(), Some(&sid));
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "tools 变了不标: {v}");
+        // 只有 billing header 变（cch / cc_prev_req 逐轮不同）不算前缀变。
+        let cch = body(&grown, tool_loop);
+        let cch = Bytes::from(
+            String::from_utf8(cch.to_vec())
+                .unwrap()
+                .replace("cc_entrypoint=claude-vscode;", "cc_entrypoint=claude-vscode; cch=abcde;"),
+        );
+        let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
+        assert_eq!(
+            crate::proxy::count_cache_control(&v["messages"]),
+            0,
+            "tools 刚变回来这一轮不标: {v}"
+        );
+        let v = once(&cch, all_on(), Some(&sid));
+        assert_eq!(
+            crate::proxy::count_cache_control(&v["messages"]),
+            1,
+            "只有 billing header 变仍算稳定: {v}"
+        );
+        // 没有会话 id 可作键 → 不标。
+        let v = once(&body(&system("5m"), tool_loop), all_on(), None);
+        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "没有会话键不标: {v}");
 
         // 正例：末块 tool_result 拿到断点，ttl 抄 system 的 5m 而不是开关的 1h，不带 scope；
         // 字符串形态的旧 reminder 不被转成块数组；总数正好 4。
