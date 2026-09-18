@@ -358,7 +358,8 @@ pub(super) fn rewrite_body(
     // 真 CC 来访 `messages` 里一个断点都没有时也补一个，最小改动、抄客户端自己的 ttl，
     // 见 [`ensure_cc_message_breakpoint`]。额度探测不补（官方那条一个断点都没有）。
     // **只在 tools + system 与上一轮相同时补**（[`cache_prefix_stable`]）：前缀变了，后面的
-    // messages 标了断点也是未命中，只会把裸算换成更贵的写入；会话第一轮同样不补。
+    // messages 标了断点也是未命中，只会把裸算换成更贵的写入；会话第一轮同样不补。按
+    // 请求类别分谱系：同一会话里主线程与辅助请求交替出现，不能互相当对方的「上一轮」。
     let cc_msg_shape = shape
         && sim.is_none()
         && cc_inbound
@@ -366,6 +367,7 @@ pub(super) fn rewrite_body(
         && session_out.is_some_and(|sid| {
             cache_prefix_stable(
                 CcSessionKey { cred_id: cred.id, session_id: sid },
+                cc_kind,
                 cache_prefix_of(&v),
             )
         })
@@ -4842,7 +4844,7 @@ mod tests {
         // 第四轮尾块又稳住 → 再标。
         let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
         assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1, "稳住后再标: {v}");
-        // tools 变了同样算前缀变了。
+        // tools 变了是另一条谱系，对它是第一轮 → 不标。
         let with_tools = body(&grown, tool_loop);
         let with_tools = Bytes::from(String::from_utf8(with_tools.to_vec()).unwrap().replace(
             r#""max_tokens":64000"#,
@@ -4857,11 +4859,13 @@ mod tests {
                 .unwrap()
                 .replace("cc_entrypoint=claude-vscode;", "cc_entrypoint=claude-vscode; cch=abcde;"),
         );
+        // tools 换回去：那条谱系的记录还在、system 没变 → 稳定照标（谱系按 tools 分，
+        // 中间夹的另一套 tools 不算这条谱系的「上一轮」）。
         let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
         assert_eq!(
             crate::proxy::count_cache_control(&v["messages"]),
-            0,
-            "tools 刚变回来这一轮不标: {v}"
+            1,
+            "tools 换回去，旧谱系仍稳定: {v}"
         );
         let v = once(&cch, all_on(), Some(&sid));
         assert_eq!(

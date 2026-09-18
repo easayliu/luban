@@ -94,22 +94,29 @@ static CC_SESSIONS: std::sync::LazyLock<
 /// session id 隔了几个小时再来就是另一次对话，把上次那条 request-id 接过去是假的。
 const CC_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
-/// 每个会话上一条请求的**缓存前缀**（[`CachePrefix`]），给 [`cache_prefix_stable`] 判
-/// 「这一轮的 tools + system 与上一轮是不是同一份」，变了的话还要拿上一轮的正文对出差异。
+/// 每个**前缀谱系**上一条请求的 system 正文指纹与正文（[`PrefixEntry`]），给
+/// [`cache_prefix_stable`] 判「这一轮的 system 与上一轮是不是同一份」，变了的话还要拿
+/// 上一轮的正文对出差异。
+///
+/// 键是 [`PrefixKey`]：凭证、会话之外还带**请求类别、tools 指纹、system 块数**。只按
+/// （凭证，会话）分桶是错的：现网一个会话里主线程（3 块 system、一套 tools）与辅助请求
+/// （2 块、另一套 tools）交替出现，两种形态互相覆盖对方的「上一轮」，稳定性永远判不成，
+/// 日志里全是 tools differ / block count differs 的噪音。tools 或块数一变就是另一条谱系，
+/// 对那条谱系来说是第一轮、不补断点——与「不稳定」同一个结果，但不会打掉别人的记录。
 ///
 /// 与 [`CC_SESSIONS`] 分开存而不是并进 [`CcSessionEntry`]：那张表只在 `billing_cch` 开着、
 /// 且这一类请求上会话链时才建条目（[`client_session_link`]），而补消息断点这件事与
-/// billing header 无关，生产实例 `billing_cch` 关着时也要能判。键同样是 `(凭证 id, 会话 id)`，
-/// 理由同那张表；过期口径同 [`CC_SESSION_IDLE`]。
+/// billing header 无关，生产实例 `billing_cch` 关着时也要能判。过期口径同 [`CC_SESSION_IDLE`]。
 ///
-/// 存的是 system 各块**正文**而不只是指纹：一个会话几十 KB，活跃会话几百个也就几十 MB，
-/// 换来的是前缀一变就能在日志里看到**变的是哪一块、哪一段**——流水的 shape 只有长度和
-/// sha，现网那个尾块每轮长 51 字节的会话光看流水查不出多的是什么。
-static CC_PREFIX_FPS: std::sync::LazyLock<parking_lot::Mutex<PrefixFpMap>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-/// [`CC_PREFIX_FPS`] 的值：`(凭证 id, 会话 id) → (上一轮前缀, 最后一次见到)`。
-type PrefixFpMap = std::collections::HashMap<(i64, String), (CachePrefix, std::time::Instant)>;
+/// 稳定性只看 system 正文的**指纹**，正文只是诊断附件：前缀一变就能在日志里看到变的是
+/// 哪一块、哪一段——流水的 shape 只有长度和 sha，现网那个尾块每轮长 51 字节的会话光看
+/// 流水查不出多的是什么。正文受 [`PrefixLimits`] 管，超限只留指纹、不留正文，判断照做、
+/// 日志少一行差异。
+///
+/// **锁内只做表操作**：指纹、字节数、正文拷贝都在拿锁前算好（[`cache_prefix_stable`]），
+/// 比对与日志在放锁后做。锁内多扫一遍几十 KB 正文，别的会话都得等。
+static CC_PREFIX_FPS: std::sync::LazyLock<parking_lot::Mutex<PrefixTable>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(PrefixTable::default()));
 
 /// 一条请求缓存前缀里**会进缓存键**的部分：`tools` 的指纹，加 `system` 各块正文
 /// （不含 billing header 那一块）。由 [`crate::proxy::cache_prefix_of`] 算。
@@ -119,25 +126,150 @@ pub(super) struct CachePrefix {
     pub(super) system: Vec<String>,
 }
 
-/// 记下这一轮的缓存前缀，并回答**上一轮**的是不是同一份。会话第一次出现、或隔了
-/// [`CC_SESSION_IDLE`] 再来，都算不稳定（`false`）。变了的话按块对出差异打一行 info
-/// （[`log_prefix_change`]）。
+impl CachePrefix {
+    fn system_fp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.system.hash(&mut h);
+        h.finish()
+    }
+
+    /// 正文在表里占的字节：各块字符数之和，**加上每块 `String` 头的容器开销**。只算字符
+    /// 会被「20 万个单字符块」绕过——字符 200 KB、元素区 4.8 MB。
+    fn stored_bytes(&self) -> usize {
+        self.system.iter().map(String::len).sum::<usize>()
+            + self.system.len() * std::mem::size_of::<String>()
+    }
+}
+
+/// [`PrefixTable`] 的键：一条**前缀谱系**。理由见 [`CC_PREFIX_FPS`]。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrefixKey {
+    cred_id: i64,
+    session_id: String,
+    kind: CcRequestKind,
+    tools_fp: u64,
+    blocks: usize,
+}
+
+/// [`PrefixTable`] 里一条谱系的条目。`system` 为 `None` 表示正文因预算被放弃，指纹照留。
+#[derive(Debug, Clone)]
+struct PrefixEntry {
+    system_fp: u64,
+    system: Option<Vec<String>>,
+    /// `system` 占的字节数（`None` 时为 0），维护 [`PrefixTable::text_bytes`] 用。
+    bytes: usize,
+    seen: std::time::Instant,
+}
+
+/// 正文与条目数的上限。各管一件事：单条块数或字节太大的不存（一条 system 超过
+/// `entry_bytes` 多半是把整本文档塞进了 system，诊断价值也低；块数上限挡住海量小块，
+/// 前缀采集在 system 块数封顶之前，封顶保护不到这张表）；总字节到 `total_bytes` 后新来的
+/// 只留指纹；条目数到 `entries` 后按最久未见淘汰——一直有请求的会话不会因
+/// [`CC_SESSION_IDLE`] 过期，没有这一条表只增不减。
+#[derive(Debug, Clone, Copy)]
+struct PrefixLimits {
+    entry_blocks: usize,
+    entry_bytes: usize,
+    total_bytes: usize,
+    entries: usize,
+}
+
+impl PrefixLimits {
+    /// 生产用的一组：单条 64 块 / 256 KiB、总共 64 MiB、一万条谱系。
+    const DEFAULT: Self = Self {
+        entry_blocks: 64,
+        entry_bytes: 256 * 1024,
+        total_bytes: 64 * 1024 * 1024,
+        entries: 10_000,
+    };
+}
+
+/// `谱系 → 上一轮`，外加正文总字节数。
+#[derive(Debug, Default)]
+struct PrefixTable {
+    map: std::collections::HashMap<PrefixKey, PrefixEntry>,
+    text_bytes: usize,
+}
+
+impl PrefixTable {
+    /// 记下这一轮，返回上一轮的条目（没有即 `None`）。`text` 是调用方在锁外拷好的正文
+    /// （单条上限已经在锁外判过），这里只再看总预算；`bytes` 是它入表要占的字节。
+    /// 只做表操作，不算指纹、不比对、不打日志。
+    fn record(
+        &mut self,
+        key: PrefixKey,
+        system_fp: u64,
+        text: Option<Vec<String>>,
+        bytes: usize,
+        now: std::time::Instant,
+        limits: PrefixLimits,
+    ) -> Option<PrefixEntry> {
+        // 过期清理与条目数上限都要在插入前做，不然刚插的这条可能就被自己淘汰掉。
+        self.map.retain(|_, e| now.duration_since(e.seen) < CC_SESSION_IDLE);
+        self.text_bytes = self.map.values().map(|e| e.bytes).sum();
+        while self.map.len() >= limits.entries && !self.map.contains_key(&key) {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.seen).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(e) = self.map.remove(&oldest) {
+                self.text_bytes -= e.bytes;
+            }
+        }
+        let prev = self.map.remove(&key);
+        if let Some(e) = &prev {
+            self.text_bytes -= e.bytes;
+        }
+        let keep_text = text.is_some() && self.text_bytes + bytes <= limits.total_bytes;
+        let entry = PrefixEntry {
+            system_fp,
+            system: if keep_text { text } else { None },
+            bytes: if keep_text { bytes } else { 0 },
+            seen: now,
+        };
+        self.text_bytes += entry.bytes;
+        self.map.insert(key, entry);
+        prev
+    }
+}
+
+/// 记下这一轮的缓存前缀，并回答同一谱系**上一轮**的 system 是不是同一份。谱系第一次出现
+/// （含 tools 或块数刚变过）、或隔了 [`CC_SESSION_IDLE`] 再来，都算不稳定（`false`）。
+/// 变了的话按块对出差异打一行 info（[`log_prefix_change`]）——指纹与拷贝在锁前算，
+/// 比对与日志在锁后做，锁内只有表操作。
 ///
 /// 这是 [`crate::proxy::ensure_cc_message_breakpoint`] 的闸：prompt cache 是前缀缓存，
 /// `system` 里任何一块变了，它后面的 `messages` 不管标不标断点都是未命中——标了只是把
 /// 「按输入价裸算」换成「按 1.25 倍写入价裸算」。v0.3.121 上线后 claude-vscode 2.1.273
 /// 那个会话就是这样：system 尾块每轮长 51 字节，24 轮每轮把 25 万 token 的历史整段写进
 /// 缓存，`cache_read` 始终停在 27,126（tools + system 前三块），一个字都没读到。
-pub(super) fn cache_prefix_stable(key: CcSessionKey<'_>, prefix: CachePrefix) -> bool {
+pub(super) fn cache_prefix_stable(
+    key: CcSessionKey<'_>,
+    kind: CcRequestKind,
+    prefix: CachePrefix,
+) -> bool {
+    let limits = PrefixLimits::DEFAULT;
+    // 锁外：指纹、字节数、单条上限、正文拷贝。
+    let system_fp = prefix.system_fp();
+    let bytes = prefix.stored_bytes();
+    let text = (prefix.system.len() <= limits.entry_blocks && bytes <= limits.entry_bytes)
+        .then(|| prefix.system.clone());
+    let lineage = PrefixKey {
+        cred_id: key.cred_id,
+        session_id: key.session_id.to_string(),
+        kind,
+        tools_fp: prefix.tools_fp,
+        blocks: prefix.system.len(),
+    };
     let now = std::time::Instant::now();
-    let mut map = CC_PREFIX_FPS.lock();
-    map.retain(|_, (_, seen)| now.duration_since(*seen) < CC_SESSION_IDLE);
-    let session_id = key.session_id.to_string();
-    let Some((prev, _)) = map.insert(key.owned(), (prefix.clone(), now)) else { return false };
-    if prev == prefix {
+    let prev = CC_PREFIX_FPS.lock().record(lineage, system_fp, text, bytes, now, limits);
+    // 锁外：比对与日志。
+    let Some(prev) = prev else { return false };
+    if prev.system_fp == system_fp {
         return true;
     }
-    log_prefix_change(&session_id, &prev, &prefix);
+    log_prefix_change(key.session_id, &prev, &prefix);
     false
 }
 
@@ -148,25 +280,21 @@ const PREFIX_DIFF_MAX_CHARS: usize = 400;
 /// 尾块的末尾正是客户端逐轮追加内容的地方。
 const PREFIX_TAIL_CHARS: usize = 600;
 
-/// 同一会话相邻两轮前缀不同时，逐块把不同的那一段打进日志：块号、两轮长度、差异起点、
-/// 去掉的段原文、加上的段原文、该块当前末尾原文。块数不同或 tools 变了各打一行。
+/// 同一谱系相邻两轮 system 不同时，逐块把不同的那一段打进日志：块号、两轮长度、差异起点、
+/// 去掉的段原文、加上的段原文、该块当前末尾原文。上一轮正文因预算没留时只打一行说明。
+/// tools 变、块数变不在这里——那是另一条谱系（[`PrefixKey`]），不算同一前缀的变化。
 ///
 /// 打的是 system 正文而不是摘要：这行日志就是给「多出来的到底是什么」这个问题的，
 /// 流水的 shape 刻意不存正文，这里是唯一能看到原文的地方。只在前缀变了的轮次打。
-fn log_prefix_change(session_id: &str, prev: &CachePrefix, cur: &CachePrefix) {
-    if prev.tools_fp != cur.tools_fp {
-        tracing::info!(session = %session_id, "cache prefix changed between turns: tools differ");
-    }
-    if prev.system.len() != cur.system.len() {
+fn log_prefix_change(session_id: &str, prev: &PrefixEntry, cur: &CachePrefix) {
+    let Some(prev_system) = &prev.system else {
         tracing::info!(
             session = %session_id,
-            prev_blocks = prev.system.len(),
-            cur_blocks = cur.system.len(),
-            "cache prefix changed between turns: system block count differs"
+            "cache prefix changed between turns: system differs (previous text not kept, over budget)"
         );
         return;
-    }
-    for (i, (a, b)) in prev.system.iter().zip(&cur.system).enumerate() {
+    };
+    for (i, (a, b)) in prev_system.iter().zip(&cur.system).enumerate() {
         let Some((at, removed, added)) = text_diff(a, b) else { continue };
         tracing::info!(
             session = %session_id,
@@ -318,7 +446,7 @@ impl CcSessionLink {
 /// id，把主线程那条链也一起带偏。子代理同理：它的末条常常是一句全新的 user 消息。
 /// 除了会话链那三项，它还管住两条「别把官方形态改坏」的规则，见
 /// [`Self::keeps_nonstream`] 与 [`Self::allows_system_prefix`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CcRequestKind {
     Main,
     Subagent,
@@ -541,24 +669,108 @@ mod tests {
         assert_eq!(super::tail_chars("abc", 5), "abc");
         assert_eq!(super::tail_chars("abcdefgh", 3), "(共 8 字符)…fgh");
 
+        use crate::proxy::CcRequestKind::{Main, Subagent};
         let sid = crate::proxy::uuid_v4();
         let key = crate::proxy::CcSessionKey { cred_id: 7, session_id: &sid };
         let p = |tail: &str| CachePrefix { tools_fp: 1, system: vec!["base".into(), tail.into()] };
-        assert!(!cache_prefix_stable(key, p(tail)), "第一轮没有上一轮可比");
-        assert!(cache_prefix_stable(key, p(tail)), "同一份前缀");
-        assert!(!cache_prefix_stable(key, p(&grown)), "尾块变了");
-        assert!(cache_prefix_stable(key, p(&grown)), "稳住了");
+        assert!(!cache_prefix_stable(key, Main, p(tail)), "第一轮没有上一轮可比");
+        assert!(cache_prefix_stable(key, Main, p(tail)), "同一份前缀");
+        assert!(!cache_prefix_stable(key, Main, p(&grown)), "尾块变了");
+        assert!(cache_prefix_stable(key, Main, p(&grown)), "稳住了");
         assert!(
-            !cache_prefix_stable(key, CachePrefix { tools_fp: 2, ..p(&grown) }),
-            "只有 tools 变也算变"
+            !cache_prefix_stable(key, Main, CachePrefix { tools_fp: 2, ..p(&grown) }),
+            "tools 变了是另一条谱系，第一轮"
         );
         assert!(
             !cache_prefix_stable(
                 key,
+                Main,
                 CachePrefix { tools_fp: 2, system: vec!["base".into(), "x".into(), "y".into()] }
             ),
-            "块数变了"
+            "块数变了是另一条谱系，第一轮"
         );
+
+        // 现网那种交替：主线程 3 块 + 一套 tools，辅助请求 2 块 + 另一套 tools，共用会话 id。
+        // 两条谱系各记各的，主线程第二轮照样判稳定，不被中间那条辅助请求打掉。
+        let sid = crate::proxy::uuid_v4();
+        let key = crate::proxy::CcSessionKey { cred_id: 7, session_id: &sid };
+        let main =
+            || CachePrefix { tools_fp: 11, system: vec!["a".into(), "b".into(), "c".into()] };
+        let helper = || CachePrefix { tools_fp: 22, system: vec!["h".into(), "i".into()] };
+        assert!(!cache_prefix_stable(key, Main, main()), "主线程第一轮");
+        assert!(!cache_prefix_stable(key, Subagent, helper()), "辅助第一轮");
+        assert!(cache_prefix_stable(key, Main, main()), "主线程第二轮：中间夹的辅助请求不算变");
+        assert!(cache_prefix_stable(key, Subagent, helper()), "辅助第二轮同理");
+        // 同形态不同类别也分开：类别在键里。
+        assert!(!cache_prefix_stable(key, Subagent, main()), "同一份前缀换个类别是新谱系");
+    }
+
+    /// 正文预算：总量超限只丢正文不丢指纹（稳定性照判）；条目数到顶按最久未见淘汰；同一
+    /// 谱系更新时先扣旧条目的字节；容器开销算进字节；单条块数 / 字节上限在锁外判
+    /// （[`super::cache_prefix_stable`]），这里用 `text: None` 模拟已被判掉。
+    #[test]
+    fn prefix_table_keeps_fingerprints_when_text_is_over_budget() {
+        use super::{CachePrefix, PrefixKey, PrefixLimits, PrefixTable};
+        let now = std::time::Instant::now();
+        let at = |secs: u64| now + std::time::Duration::from_secs(secs);
+        let sz = std::mem::size_of::<String>();
+        // 总预算：两条各「10 字符 + 一块头」正好装下，第三条装不下。
+        let limits = PrefixLimits {
+            entry_blocks: 64,
+            entry_bytes: 256 * 1024,
+            total_bytes: 2 * (10 + sz) + 5,
+            entries: 3,
+        };
+        let mut t = PrefixTable::default();
+        let p = |text: &str| CachePrefix { tools_fp: 1, system: vec![text.to_string()] };
+        let k = |i: i64| PrefixKey {
+            cred_id: i,
+            session_id: format!("s{i}"),
+            kind: crate::proxy::CcRequestKind::Main,
+            tools_fp: 1,
+            blocks: 1,
+        };
+        let rec = |t: &mut PrefixTable, i: i64, text: &str, keep: bool, when| {
+            let pf = p(text);
+            t.record(
+                k(i),
+                pf.system_fp(),
+                keep.then(|| pf.system.clone()),
+                pf.stored_bytes(),
+                when,
+                limits,
+            )
+        };
+
+        // 容器开销算进字节：一块 10 字符占 10 + size_of::<String>()。
+        assert_eq!(p("x".repeat(10).as_str()).stored_bytes(), 10 + sz);
+        // 20 万个单字符块：字符 20 万，入表字节远大于此。
+        let many = CachePrefix { tools_fp: 1, system: vec!["x".to_string(); 200_000] };
+        assert_eq!(many.stored_bytes(), 200_000 + 200_000 * sz);
+
+        // 单条在锁外被判掉（text: None）：只留指纹，稳定性照判。
+        assert!(rec(&mut t, 1, "x", false, at(0)).is_none());
+        assert!(t.map[&k(1)].system.is_none(), "单条超限不留正文");
+        assert_eq!(t.text_bytes, 0);
+        let prev = rec(&mut t, 1, "x", false, at(0)).unwrap();
+        assert_eq!(prev.system_fp, p("x").system_fp());
+        assert_ne!(prev.system_fp, p("y").system_fp());
+
+        // 两条各 10 字符都留；第三条总量超限只留指纹。
+        rec(&mut t, 2, "a".repeat(10).as_str(), true, at(1));
+        rec(&mut t, 3, "b".repeat(10).as_str(), true, at(2));
+        assert_eq!(t.text_bytes, 2 * (10 + sz));
+        assert_eq!(t.map.len(), 3);
+        // 条目数已到 3，新谱系进来淘汰最久未见的那一个（k(1)，seen 最早）。
+        rec(&mut t, 4, "c".repeat(8).as_str(), true, at(3));
+        assert_eq!(t.map.len(), 3, "条目数封顶");
+        assert!(!t.map.contains_key(&k(1)), "淘汰最久未见的");
+        assert!(t.map[&k(4)].system.is_none(), "总量超限只留指纹");
+        assert_eq!(t.text_bytes, 2 * (10 + sz));
+        // 同一谱系换成短正文：先扣旧的，再加新的。
+        rec(&mut t, 2, "abc", true, at(4));
+        assert_eq!(t.text_bytes, (10 + sz) + (3 + sz));
+        assert_eq!(t.map[&k(2)].system.as_deref(), Some(&["abc".to_string()][..]));
     }
 
     /// 会话链条：`cc_prompt_id` 新输入换一轮、工具续轮沿用；`cc_prev_req` 与
