@@ -9,7 +9,7 @@ use super::simulation::{
     cc_identity_blocks, field_is_empty, is_official_classifier_request, is_official_helper_request,
     is_official_title_request,
 };
-use super::{REWRITE_PROBE_REPLY, error_response, request_max_tokens};
+use super::{REWRITE_PROBE_REPLY, error_response, is_quota_probe_shaped, request_max_tokens};
 
 /// [`probe_signature`] 命中的哪一条判据。日志与错误消息按类写清楚，运维一眼能看出拦的是什么。
 ///
@@ -17,8 +17,13 @@ use super::{REWRITE_PROBE_REPLY, error_response, request_max_tokens};
 /// 探针，交给模拟路径重建身份（[`cc_identity_well_formed`] 决定它进不了透传），不拒。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeKind {
-    /// 单句 ping：有 system、无 tools、恰好 1 条消息、`max_tokens` 在 `2..=16`。
+    /// 单句 ping：无 tools、恰好 1 条消息、`max_tokens` 在 `2..=16`（带不带 system 都算）。
     Ping,
+    /// 1 token 的探活：无 system、无 tools、恰好 1 条用户消息、`max_tokens=1`，且不可能是官方
+    /// 那两种 1 token 形态——UA 不是可信的 Claude Code，或可信却既没带 device_id 也不是额度
+    /// 探测。官方的 cache 预热与额度探测都来自可信 UA 且带身份；下游中转的健康检查
+    /// （`Go-http-client` 每 5 分钟一条）正是这个形态，此前走模拟被补上 10KB 基座发了出去。
+    OneTokenPing,
     /// 凭空冒出的一次性对话：有 system、无 tools、恰好 1 条消息、不是官方那两种无 tools
     /// 形态、且设备从没见过。
     ThrowawayConversation,
@@ -40,6 +45,7 @@ impl ProbeKind {
     pub(super) fn tag(self) -> &'static str {
         match self {
             Self::Ping => "ping",
+            Self::OneTokenPing => "one-token-ping",
             Self::ThrowawayConversation => "throwaway-conversation",
             Self::DuplicateIdentity => "duplicate-identity",
             Self::ShortOpener => "short-opener",
@@ -52,6 +58,9 @@ impl ProbeKind {
         match self {
             Self::Ping => {
                 "automated probe / health-check requests are not forwarded: single-message ping with max_tokens in 2..=16"
+            }
+            Self::OneTokenPing => {
+                "automated probe / health-check requests are not forwarded: single-message max_tokens=1 request with no system prompt and no tools that cannot be an official Claude Code prewarm or quota probe"
             }
             Self::ShortOpener => {
                 "automated probe / health-check requests are not forwarded: a single one-line user message with no system prompt and no tools"
@@ -91,6 +100,14 @@ impl ProbeKind {
 ///   （补全建议）；官方也没有任何一种「无 system、`max_tokens` 在 2 到 16」的请求。
 ///   严格模式（`strict`，[`store::ForwardFlags::reject_probes_strict`]）下 ping 不再要求无
 ///   tools，并多一条**短开场**（[`ProbeKind::ShortOpener`]），见函数体内的说明；
+/// - **1 token 探活**（[`ProbeKind::OneTokenPing`]）：无 system、无 tools、恰好 1 条消息、
+///   `max_tokens=1`，且**不可能是官方的**：`from_cc_client` 为假（UA 不是可信的 Claude Code），
+///   或 UA 可信却没带 device_id 且不是额度探测形态（[`is_quota_probe_shaped`]）。上一条把 1
+///   排除是为了放过官方的 cache 预热与额度探测，但那两种都来自可信 UA 且带身份——非 CC UA
+///   的 1 token 请求不可能是它们。ban 导出里这一形态 138 条（`Go-http-client` / `python-httpx`，
+///   一个号每 5 分钟一条、跨两天），此前全部走模拟、被补成三块 system 加 10622 字节基座发了
+///   出去：一条「带完整基座、不带 tools、只要 1 个 token」的请求官方从不产生。UA 可信且带
+///   device_id 的 1 token 请求这里不碰，它是桌面端预热，由模拟路径按形态放行；
 /// - **凭空冒出的一次性对话**（[`ProbeKind::ThrowawayConversation`]）：有 system、没有
 ///   tools、恰好 1 条消息、`max_tokens != 1`、不是官方那三种无 tools 请求、且设备从没见过
 ///   （[`store::CredentialStore::device_is_known`]）。官方无 tools 的请求只有四种：预热
@@ -116,6 +133,7 @@ pub(super) fn probe_signature(
     body: Option<&serde_json::Value>,
     device_id: Option<&str>,
     beta: &[String],
+    from_cc_client: bool,
     strict: bool,
     device_known: impl FnOnce() -> bool,
 ) -> Option<ProbeKind> {
@@ -170,6 +188,16 @@ pub(super) fn probe_signature(
     // 一条写明原因的 403。
     if max_tokens.is_some_and(|m| (2..=16).contains(&m)) {
         return Some(ProbeKind::Ping);
+    }
+    // 1 token 探活。`has_system` 按「键存在且非 null」算：桌面端预热有一种带一块几百字节应用块的
+    // 形态，这里不碰它；官方两种无 system 的 1 token 形态（额度探测、无 system 的桌面端预热）
+    // 都来自可信 UA 且带身份，所以 UA 不可信的一律算，UA 可信的只在「没带 device_id 且不是额度
+    // 探测」时算——那样一条什么身份都没有的 1 token 请求，模拟路径本来也按第三方处理。
+    if max_tokens == Some(1)
+        && !has_system
+        && (!from_cc_client || (device_id.is_none() && !is_quota_probe_shaped(v)))
+    {
+        return Some(ProbeKind::OneTokenPing);
     }
     // 一次性会话那条仍要求带 system：不带 system 只问一句的第三方小应用太常见，按它拒会误伤。
     if !has_system {
@@ -231,7 +259,8 @@ pub(super) const PROBE_REPLY_ID_PREFIX: &str = "msg_luban";
 /// 按来访要的形态给：要流式就把这条 Message 展成 SSE（[`message_to_sse`]，与回放学到的拒答
 /// 同一套），否则整段 JSON。`model` 原样回来访声明的那个（没写就留空——那种请求上游本会回
 /// 400，这里不替它编一个）；`usage` 记名义上的 1 进 1 出，流水里的花费记 0（见
-/// [`REWRITE_PROBE_REPLY`]）。为什么不回 403，见调用处 2.3a3 的说明。
+/// [`REWRITE_PROBE_REPLY`]）；`stop_reason` 按来访要的输出上限给——[`ProbeKind::OneTokenPing`]
+/// 那条只要 1 个 token，真上游回的必是 `max_tokens`，其余是 `end_turn`。为什么不回 403，见调用处 2.3a3 的说明。
 ///
 /// **标出来是 luban 答的**：响应头 [`LOCAL_REPLY_HEADER`] + [`PROBE_KIND_HEADER`]，Message id 用
 /// [`PROBE_REPLY_ID_PREFIX`] 前缀（流式那条在 `message_start` 里同样带着）。三处都在正文的语义
@@ -241,13 +270,18 @@ pub(super) fn probe_reply(kind: ProbeKind, model: Option<&str>, wants_stream: bo
     use rand::RngExt;
     use rand::distr::Alphanumeric;
     let tail: String = rand::rng().sample_iter(Alphanumeric).take(16).map(char::from).collect();
+    // 来访只要 1 个 token 时上游必然是被截断的，回 `max_tokens`；其余照常收在 `end_turn`。
+    let stop_reason = match kind {
+        ProbeKind::OneTokenPing => "max_tokens",
+        _ => "end_turn",
+    };
     let msg = serde_json::json!({
         "id": format!("{PROBE_REPLY_ID_PREFIX}{tail}"),
         "type": "message",
         "role": "assistant",
         "model": model.unwrap_or_default(),
         "content": [{ "type": "text", "text": PROBE_REPLY_TEXT }],
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
         "usage": {
             "input_tokens": 1,
@@ -462,6 +496,31 @@ mod tests {
         .await;
         let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(msg["model"], "");
+
+        // 1 token 探活：来访只要 1 个 token，真上游回的必是截断，stop_reason 给 max_tokens；
+        // 流式那条 message_delta 里同样是它。
+        let (_, headers, body) = parts(crate::proxy::probe_reply(
+            crate::proxy::ProbeKind::OneTokenPing,
+            Some("claude-opus-4-8"),
+            false,
+        ))
+        .await;
+        assert_eq!(headers.get(crate::proxy::PROBE_KIND_HEADER).unwrap(), "one-token-ping");
+        let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(msg["stop_reason"], "max_tokens");
+        assert_eq!(msg["usage"]["output_tokens"], 1);
+        let (_, _, body) = parts(crate::proxy::probe_reply(
+            crate::proxy::ProbeKind::OneTokenPing,
+            Some("claude-opus-4-8"),
+            true,
+        ))
+        .await;
+        let mut agg = crate::proxy::SseAggregator::default();
+        agg.feed(body.as_bytes());
+        let crate::proxy::Aggregated::Message(back) = agg.finish() else {
+            panic!("本地回复的 SSE 应能聚合")
+        };
+        assert_eq!(back["stop_reason"], "max_tokens");
     }
 
     /// 探针判定（[`probe_signature`]）：封号复盘里的三类探活形态都命中，官方 CC 的三种
@@ -481,14 +540,14 @@ mod tests {
             r#"[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abcdef"}},{{"type":"text","text":"{identity}"}},{{"type":"text","text":"{identity}"}}]"#
         );
         let one_msg = r#"[{"role":"user","content":"hi"}]"#;
-        let sig_beta = |body: &str, _cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
+        let sig_beta = |body: &str, cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
             let beta: Vec<String> = beta.iter().map(|b| b.to_string()).collect();
-            crate::proxy::probe_signature(Some(&v), dev, &beta, false, || known)
+            crate::proxy::probe_signature(Some(&v), dev, &beta, cc, false, || known)
         };
         let strict = |body: &str| {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
-            crate::proxy::probe_signature(Some(&v), None, &[], true, || false)
+            crate::proxy::probe_signature(Some(&v), None, &[], false, true, || false)
         };
         let sig = |body: &str, cc: bool, dev: Option<&str>, known: bool| {
             sig_beta(body, cc, dev, known, &[])
@@ -577,8 +636,65 @@ mod tests {
         assert_eq!(strict(&with_tools), None);
         let with_image = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{}}]}],"max_tokens":1024}"#;
         assert_eq!(strict(with_image), None);
+        // 无 system、无身份、UA 不可信的 1 token 请求在严格模式下命中的是 1 token 探活（排在
+        // 短开场之前）；短开场自己不认 max_tokens=1。
         let prewarm = format!(r#"{{"model":"claude-opus-5","messages":{one_msg},"max_tokens":1}}"#);
-        assert_eq!(strict(&prewarm), None);
+        assert_eq!(strict(&prewarm), Some(OneTokenPing));
+
+        // ---- 1 token 探活：ban 导出里 Go-http-client 每 5 分钟一条的健康检查 ----
+        // 非 CC UA：无 system、无 tools、一条消息、max_tokens=1 → 命中，带不带 device_id 都算
+        // （Go 客户端抄了 metadata.user_id 的也有），流式与否无关，模型无关。
+        let one_token = |model: &str, extra: &str| {
+            format!(r#"{{"model":"{model}","messages":{one_msg},"max_tokens":1{extra}}}"#)
+        };
+        assert_eq!(sig(&one_token("claude-opus-4-8", ""), false, None, false), Some(OneTokenPing));
+        assert_eq!(
+            sig(&one_token("claude-opus-4-8", r#","stream":true"#), false, Some(DEV), true),
+            Some(OneTokenPing),
+            "带 device_id、老设备、流式：UA 不可信就算"
+        );
+        assert_eq!(
+            sig(&one_token("claude-haiku-4-5-20251001", ""), false, None, false),
+            Some(OneTokenPing),
+            "haiku 也算：官方额度探测来自可信 UA"
+        );
+        // 非 CC UA 抄了官方额度探测的正文（haiku + `quota`）：仍算——不是可信 UA 发的就不是官方探测。
+        let quota_probe = r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"quota"}]}"#;
+        assert_eq!(sig(quota_probe, false, None, false), Some(OneTokenPing));
+        // 可信 UA：带 device_id 的是桌面端预热，不碰（由模拟路径按形态放行）；额度探测形态
+        // 不碰；什么身份都没有的 1 token 请求算——模拟路径本来也按第三方处理它。
+        assert_eq!(sig(&one_token("claude-opus-5", ""), true, Some(DEV), false), None);
+        assert_eq!(sig(quota_probe, true, None, false), None, "官方额度探测不带身份也放");
+        assert_eq!(sig(&one_token("claude-opus-5", ""), true, None, false), Some(OneTokenPing));
+        // 带 system 的 1 token 请求不算：桌面端另一种预热带 `[billing, 身份句]` 两块，第三方带
+        // 长 system 的由模拟接管；`system: null` 按没有算，加个空 tools 也绕不过。
+        let sys_prewarm = format!(
+            r#"{{"model":"claude-opus-5","system":{cc_sys},"messages":{one_msg},"max_tokens":1}}"#
+        );
+        assert_eq!(sig(&sys_prewarm, false, None, false), None);
+        assert_eq!(
+            sig(&one_token("claude-opus-5", r#","system":"be brief""#), false, None, false),
+            None
+        );
+        assert_eq!(
+            sig(&one_token("claude-opus-5", r#","system":null,"tools":[]"#), false, None, false),
+            Some(OneTokenPing)
+        );
+        // 带 tools 或多条消息的不算。
+        assert_eq!(
+            sig(
+                &one_token(
+                    "claude-opus-5",
+                    r#","tools":[{"name":"t","input_schema":{"type":"object"}}]"#
+                ),
+                false,
+                None,
+                false
+            ),
+            None
+        );
+        let two_turn_one_token = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"hi"}],"max_tokens":1}"#;
+        assert_eq!(sig(two_turn_one_token, false, None, false), None);
         let two_msgs = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"hi"}],"max_tokens":1024}"#;
         assert_eq!(strict(two_msgs), None);
 

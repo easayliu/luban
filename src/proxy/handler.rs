@@ -253,14 +253,17 @@ pub(super) async fn handle_inner(
     //       下游中转的探活脚本发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个
     //       一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与身份上的强特征，
     //       一条就够判，不做计数。**不限 UA**（0.3.99 起）：此前只判自报 claude-cli 的，
-    //       Go-http-client 的探活反而走模拟、被装成官方形态发了出去。只判计费路径；
-    //       `reject_probes` 关掉即放行。
+    //       Go-http-client 的探活反而走模拟、被装成官方形态发了出去。UA 只在一处反向参与：
+    //       1 token 探活（[`ProbeKind::OneTokenPing`]）对不可信 UA 一律算、对可信 UA 只在没带
+    //       身份时算——官方的预热与额度探测都来自可信 UA。只判计费路径；`reject_probes` 关掉
+    //       即放行。
     if billable
         && state.store.forward_flags().reject_probes
         && let Some(kind) = probe_signature(
             body_json.as_ref(),
             device_id.as_deref(),
             &inbound_beta_list(&headers),
+            from_cc_client,
             state.store.forward_flags().reject_probes_strict,
             || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
         )
