@@ -673,7 +673,7 @@ pub(super) const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// `Third-party apps now draw from your extra usage, not your plan limits.`
 /// ——请求照样有回复，只是从订阅额度转到了超额池。故对齐它是**计费正确性**问题，
 /// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
-const MAX_SYSTEM_BLOCKS: usize = 5;
+pub(super) const MAX_SYSTEM_BLOCKS: usize = 5;
 
 /// 把非 CC 请求的 `system` 换成官方形态（2.1.260，fable 族五块、其余四块）：
 ///

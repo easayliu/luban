@@ -355,8 +355,6 @@ pub(super) fn rewrite_body(
         sim.is_some_and(|s| s.profile.has_billing_header()) && align_message_shape(&mut v, cache);
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
     let shaped = shape && !simulated && align_system_shape(&mut v, cache);
-    // 封顶跟在两条整形之后：那两条产出的都是 ≤5 块，故只对它们都没管住的来访生效。
-    let capped = shape && cap_system_blocks(&mut v);
     // CC 子代理/desktop-3p 有时不带 billing header，上游按第三方计、限流更严。
     // 补上 billing + 身份句让上游按订阅额度计。放在 ensure_billing_cch 之前——后者给
     // billing header 追加 cch，得先有 billing header 它才有东西追加。
@@ -389,6 +387,11 @@ pub(super) fn rewrite_body(
         let diag = l.diagnostics && ensure_diagnostics(&mut v, l);
         billing || diag
     });
+    // 封顶排在**所有会增加 system 块数的步骤之后**：两条整形产出的都是 ≤5 块，而补前缀会在
+    // 最前面加一到两块。原先它排在补前缀之前，一条客户端 5 块、没 billing header 的来访
+    // （现网 2.1.238，req_ujomarOOPtXL38jx）过了封顶再被补成 6 或 7 块，出站正好超过
+    // `MAX_SYSTEM_BLOCKS`，上游按第三方应用计——封顶本来要防的正是这个。
+    let capped = shape && cap_system_blocks(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
     //
@@ -2669,6 +2672,14 @@ pub(super) fn text_block(text: &str, cache_control: serde_json::Value) -> serde_
 /// **不是模拟**——不换头、不改工具名、不加基座，只在 system 最前面插两块。
 /// 已有 billing header 的（`is_cc_shaped` 命中 billing 那条路、或模拟已补过的）跳过。
 ///
+/// **身份句已在就只补 billing header。** 老版本 API-key 模式的 CC（现网 `claude-cli/2.1.238`，
+/// req_ujomarOOPtXL38jx）发的 system 是 `[身份句(带断点), 基座, …]`——有身份句、没 billing
+/// header。原先只查 billing header 在不在，于是两块都插，出站变成
+/// `[billing, 身份句, 身份句(带断点), …]`：身份句重复、块数还多了一块。改成按块判：身份句
+/// （[`config::CC_SYSTEM_IDENTITY_PREFIX`]，含 agent-sdk 那种逗号变体）已在任一块里，就只在
+/// 最前面插 billing header；官方序本来就是 billing 在身份句之前，客户端的身份句连同它自己的
+/// `cache_control` 原样留在第二块。
+///
 /// `version` 是这个来访**自报**的客户端版本（从它自己的 UA 里解出），补出来的
 /// `cc_version` 就用它，见 [`billing_header_text`]。
 fn ensure_cc_system_prefix(
@@ -2688,10 +2699,19 @@ fn ensure_cc_system_prefix(
     if has_billing {
         return false;
     }
-    let prefix = vec![
-        text_block_bare(&billing_header_text(v, version, kind)),
-        text_block_bare(config::CC_SYSTEM_IDENTITY),
-    ];
+    let has_identity = match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+        }),
+        Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY_PREFIX),
+        _ => false,
+    };
+    let mut prefix = vec![text_block_bare(&billing_header_text(v, version, kind))];
+    if !has_identity {
+        prefix.push(text_block_bare(config::CC_SYSTEM_IDENTITY));
+    }
     match v.get_mut("system") {
         Some(serde_json::Value::Array(blocks)) => {
             for (i, blk) in prefix.into_iter().rev().enumerate() {
@@ -2710,7 +2730,15 @@ fn ensure_cc_system_prefix(
             insert_top_level(v, "system", serde_json::Value::Array(prefix), &["messages", "model"]);
         }
     }
-    tracing::info!("injected billing header + identity into system for a CC client without them");
+    if has_identity {
+        tracing::info!(
+            "injected billing header into system for a CC client that had only the identity line"
+        );
+    } else {
+        tracing::info!(
+            "injected billing header + identity into system for a CC client without them"
+        );
+    }
     true
 }
 
@@ -5592,6 +5620,72 @@ mod tests {
     /// ```
     /// 即：内层是紧凑 JSON 字符串、键序 device_id→account_uuid→session_id、device_id 是
     /// 64 位小写 hex、session_id 是 uuid 且与那个头**同值**。`00009`（sonnet-5）同形。
+    /// 老版本 API-key 模式的 CC：system 是 `[身份句(带断点), 基座, 其余…]`，有身份句、没 billing
+    /// header（现网 `claude-cli/2.1.238`，req_ujomarOOPtXL38jx 的形态）。补前缀只该插一块
+    /// billing header，客户端的身份句连同它的 `cache_control` 留在第二块——原先会再插一句
+    /// 身份句，出站 `[billing, 身份, 身份(带断点), …]`。
+    #[test]
+    fn prefix_injection_keeps_the_client_identity_block() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}","cache_control":{{"type":"ephemeral"}}}},{},{{"type":"text","text":"tail"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert!(
+            sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
+            "{sys:?}"
+        );
+        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY);
+        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral", "客户端身份句的断点原样保留");
+        let identities = sys
+            .iter()
+            .filter(|b| {
+                b["text"].as_str().is_some_and(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+            })
+            .count();
+        assert_eq!(identities, 1, "身份句只能有一句: {sys:?}");
+        assert_eq!(sys.len(), 4, "原 3 块 + billing header");
+
+        // 字符串形态的 system 同理：已含身份句就只在前面加 billing header。
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":"{}\n\nrest"}}"#,
+            config::CC_SYSTEM_IDENTITY
+        ));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "{sys:?}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert!(sys[1]["text"].as_str().unwrap().starts_with(config::CC_SYSTEM_IDENTITY));
+    }
+
+    /// 封顶必须排在补前缀之后：客户端 5 块、没 billing header 的来访，补前缀后是 6 块，超过
+    /// [`MAX_SYSTEM_BLOCKS`]。原先封顶在前、补前缀在后，这 6 块就原样出站，上游
+    /// 按第三方应用计费——现网 2.1.238 那条出站是 7 块。
+    #[test]
+    fn system_block_cap_runs_after_prefix_injection() {
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[],"system":[{{"type":"text","text":"{}","cache_control":{{"type":"ephemeral"}}}},{},{{"type":"text","text":"env"}},{{"type":"text","text":"memory"}},{{"type":"text","text":"tail"}}]}}"#,
+            config::CC_SYSTEM_IDENTITY,
+            base_block()
+        ));
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert!(
+            sys.len() <= crate::proxy::simulation::MAX_SYSTEM_BLOCKS,
+            "封顶没管住补前缀后的块数: {}",
+            sys.len()
+        );
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY);
+        let all: String = sys.iter().filter_map(|b| b["text"].as_str()).collect();
+        assert!(all.contains("memory") && all.contains("tail"), "并块不能丢内容: {sys:?}");
+    }
+
     #[test]
     fn cc_shaped_without_metadata_gets_aligned_identity() {
         // CC 形态 + 真 CC 客户端：system 里有那句身份声明且 UA 是 claude-cli，
