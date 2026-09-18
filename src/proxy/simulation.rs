@@ -1404,8 +1404,42 @@ mod tests {
             "来访那个断点该补上 ttl，与 system 两个保持一致: {v}"
         );
 
-        // 末块不是**非空 text** 时一律不标：抓包只有 text 的样本，而 `thinking` 那种块
-        // 上游还要验签名，往它上面挂 cache_control 是拿能发的请求去赌没样本的组合。
+        // 末块是 `tool_result` 也标：官方样本 `cap/2.1.260/00025`、`00029` 里最后一条 user
+        // 消息的末块就是 tool_result、带 `{type:ephemeral}`。agent 循环每一轮都以 tool_result
+        // 收尾，不标它就等于整个循环的 messages 永远没有断点（`req_Fxs76cgvc57N5GNr`：77 条
+        // 消息、10 万 token 裸算、cache_creation 为 0）。
+        let tool_loop = concat!(
+            r#"{"model":"claude-opus-5","max_tokens":16,"messages":["#,
+            r#"{"role":"user","content":"ls"},"#,
+            r#"{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]},"#,
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"a.txt"}]}]}"#
+        );
+        let b = Bytes::from(tool_loop.to_string());
+        let sim = sim_for(tool_loop);
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let last = msgs.last().unwrap()["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["type"], "tool_result", "末块该还是 tool_result: {v}");
+        assert_eq!(
+            last["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "tool_result 末块该被标上第三个断点: {v}"
+        );
+        assert_eq!(last["tool_use_id"], "tu_1", "tool_result 其余字段一个不动: {v}");
+        assert_eq!(last["content"], "a.txt", "tool_result 正文一个字不动: {v}");
+        assert!(
+            msgs[1]["content"][0].get("cache_control").is_none(),
+            "前一条的 tool_use 不该被标: {v}"
+        );
+        assert_eq!(
+            crate::proxy::count_cache_control(&v["messages"]),
+            1,
+            "messages 里恰好一个断点: {v}"
+        );
+
+        // 末块不是**非空 text / tool_result** 时一律不标：`thinking` 那种块上游还要验签名，
+        // 往它上面挂 cache_control 是拿能发的请求去赌没样本的组合；image 没有样本。
         for (label, tail) in [
             ("thinking 块", r#"{"type":"thinking","thinking":"想","signature":"AAAA"}"#),
             ("空 text 块", r#"{"type":"text","text":""}"#),

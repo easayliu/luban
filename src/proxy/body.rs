@@ -1606,11 +1606,16 @@ pub(super) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -
 /// 整个 body** 的现存断点，故 [`simulate_system`] 已经用掉的那些都算在内；满了就不补——
 /// 少一次缓存命中，总好过整条请求被拒。
 ///
-/// **只往非空的 `text` 块上标**，两条理由各自独立：
-/// - 抓包 8/8 那第三个断点都在 `text` 块上，别的块型没有样本，没依据的形态不猜着改；
-/// - 末块未必是 `text`。会话以 assistant 轮结尾时（prefill）末块可能是 `thinking`——那种块
+/// **只往非空的 `text` 块与 `tool_result` 块上标**，两条理由各自独立：
+/// - 有样本的才标。`cap/raw` 八份那第三个断点都在 `text` 块上；`tool_result` 的样本是
+///   `cap/2.1.260/00025`、`00029`（SDK 子代理 haiku）——最后一条 `user` 消息的末块是
+///   `tool_result`，官方照样在它上面标了 `{type:ephemeral}`。规则是「最后一块」，块型不是判据。
+///   `tool_result` 曾被排除在外，后果是 agent 循环的每一轮都拿不到消息级缓存：
+///   `req_Fxs76cgvc57N5GNr` 那条 77 条消息、35 对 tool_use/tool_result 的请求，出站 `messages`
+///   一个断点都没有，10 万 token 全部裸算、cache_creation 为 0，且每轮都是这个形态。
+/// - 末块未必是这两种。会话以 assistant 轮结尾时（prefill）末块可能是 `thinking`——那种块
 ///   连签名都要上游验（见 [`is_thinking_signature_error`] 那条重试路），往上面挂 `cache_control`
-///   是拿一条能发出去的请求去赌一个没有样本的组合。`tool_result`/`image` 同理。
+///   是拿一条能发出去的请求去赌一个没有样本的组合。`image` 同样没有样本，一并不碰。
 ///
 /// 空 `text` 块一并跳过：发一个空文本块本身就会被上游拒，见 [`merge_system_blocks`]。
 pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
@@ -1645,10 +1650,14 @@ pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) 
     if block.contains_key("cache_control") {
         return changed;
     }
-    // 只往非空 `text` 块上标：别的块型没有抓包样本，`thinking` 那种还要上游验签名（见函数文档）。
-    let plain_text = block.get("type").and_then(|t| t.as_str()) == Some("text")
-        && block.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty());
-    if !plain_text {
+    // 只往非空 `text` 块与 `tool_result` 块上标：这两种有抓包样本；`thinking` 那种还要上游
+    // 验签名，`image` 没样本，都不碰（见函数文档）。
+    let markable = match block.get("type").and_then(|t| t.as_str()) {
+        Some("text") => block.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty()),
+        Some("tool_result") => true,
+        _ => false,
+    };
+    if !markable {
         return changed;
     }
     // 用 `tail()`：官方只在基座标 `scope`，消息这个断点是 `{type, ttl}`。
