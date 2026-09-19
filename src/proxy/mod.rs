@@ -78,7 +78,6 @@ use rate_limit::{
 };
 
 mod body;
-pub(crate) use body::parse_version;
 use body::ua_of;
 #[cfg(test)]
 use body::{
@@ -92,6 +91,7 @@ use body::{
     sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
     sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
+pub(crate) use body::{SESSION_KEY_VERSION, parse_version};
 
 mod upstream;
 use upstream::Upstream;

@@ -1968,7 +1968,7 @@ impl CredentialStore {
             .flatten();
         let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
-            "SELECT session_key, slot, request_count, created_at, last_seen_at \
+            "SELECT session_key, slot, request_count, created_at, last_seen_at, last_model \
                FROM session_bindings \
               WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, session_key ASC"
         );
@@ -1986,6 +1986,7 @@ impl CredentialStore {
                 request_count: r.get(2)?,
                 created_at: r.get(3)?,
                 last_seen_at: r.get(4)?,
+                last_model: r.get(5)?,
             })
         };
         let rows = if ttl > 0 {
@@ -3946,8 +3947,8 @@ pub struct DeviceBinding {
 /// [`CredentialStore::session_count`] 一致：只含 TTL 内仍活跃的。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionBinding {
-    /// 会话键：来访自带的会话 id，或缓存前缀加首条用户消息的指纹（32 个 hex 字符），见
-    /// `Select::session_key`。
+    /// 会话键：`lb:v2:sid:<来访自带的会话 id>` 或 `lb:v2:pfx:<缓存前缀加首条用户消息的指纹>`，
+    /// 见 `crate::proxy::session_binding_key` 与 `Select::session_key`。
     pub session_key: String,
     /// 在该凭证上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。
     pub slot: i64,
@@ -3961,6 +3962,9 @@ pub struct SessionBinding {
     pub created_at: i64,
     /// 最近一次活跃时间（Unix 秒）；TTL 按它算。
     pub last_seen_at: i64,
+    /// 最近一轮请求的模型；**不参与键**（理由见 `crate::proxy::session_binding_key`），只用来
+    /// 在后台一眼看出这条会话在跑什么。旧库补列出来是 `None`，下次命中即回填。
+    pub last_model: Option<String>,
 }
 
 /// 5 小时窗口秒数。
@@ -5103,15 +5107,19 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ON device_bindings(cred_id);
 
         -- 模拟会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
-        -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 里的 session_key）：
+        -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 的
+        -- `session_binding_key`：`lb:v2:sid:<来访会话 id>` 或 `lb:v2:pfx:<缓存前缀指纹>`）：
         -- 带设备身份的由 device_bindings 管，一条请求不占两份名额。
         -- slot：这条会话在该凭证上占的槽位（0 起，取活跃绑定里最小的空位），出站会话 id 由
         -- 「账号 + 槽位」派生——槽位释放后被下一个对话复用，上游看到的会话 id 数有界。
+        -- last_model：最近一轮请求的模型，**只记不参与键**（键里带模型会把同一条对话换模型
+        -- 的那一轮劈成两条会话、占两份名额，见 `session_binding_key` 的记述）；给后台列。
         CREATE TABLE IF NOT EXISTS session_bindings (
             session_key   TEXT    PRIMARY KEY,
             cred_id       INTEGER NOT NULL,
             slot          INTEGER NOT NULL DEFAULT 0,
             request_count INTEGER NOT NULL DEFAULT 0,
+            last_model    TEXT,
             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
             last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
@@ -5479,6 +5487,19 @@ fn init_schema(conn: &Connection) -> Result<()> {
     {
         conn.execute("DELETE FROM session_bindings", [])?;
     }
+    // 最近一轮的模型；旧库补出来是 NULL，下次命中该绑定时回填。只给后台列看，不参与选号。
+    let _ = conn.execute("ALTER TABLE session_bindings ADD COLUMN last_model TEXT", []);
+    // 会话键自 v0.3.137 起带命名空间与口径版本（`lb:v2:…`，见 `crate::proxy::SESSION_KEY_VERSION`）。
+    // 没有这个前缀的行是旧口径算出来的——v0.3.126 那版按「账号 + 设备指纹」，与现在的「来访
+    // 会话 id / 缓存前缀 + 对话起点」根本不是一回事，却同样是 32 个 hex，留着只会让新旧两种
+    // 语义混在一张表里，把会话数算错、把不相干的对话粘在同一个槽位上。这张表本来就只记最近
+    // 一小时的亲和性（TTL），清掉的代价是那几条对话下一轮重新选号、换一个上游会话 id。
+    // 每次启动都跑：改到 v3 时同一条语句自动把 v2 的行清掉，稳定后条件不命中、代价可忽略。
+    conn.execute(
+        "DELETE FROM session_bindings WHERE session_key NOT LIKE ?1 || '%'",
+        [crate::proxy::SESSION_KEY_VERSION],
+    )
+    .context("failed to drop session bindings from an older key scheme")?;
 
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
@@ -5838,8 +5859,10 @@ impl<'a> Binding<'a> {
 pub struct Select<'a> {
     /// 客户端设备标识；`None` 即裸请求（不绑定、不占设备名额）。
     pub device_id: Option<&'a str>,
-    /// **模拟会话键**：来访走模拟路径且没有设备身份时，代理算出来的这条会话的键（来访自带的
-    /// 会话 id，否则缓存前缀加首条用户消息的指纹）。`Some` 且 `device_id` 为 `None` 时按它粘住账号并占该账号
+    /// **模拟会话键**：来访走模拟路径且没有设备身份时，代理算出来的这条会话的键，形如
+    /// `lb:v2:sid:<来访自带的会话 id>` 或 `lb:v2:pfx:<缓存前缀加首条用户消息的指纹>`——命名空间
+    /// 加口径版本加来源段，取法见 `crate::proxy::session_binding_key`。
+    /// `Some` 且 `device_id` 为 `None` 时按它粘住账号并占该账号
     /// 的**会话名额**（`session_bindings`，上限 `session_limit` / [`DEFAULT_SESSION_LIMIT`]），
     /// 规则与设备绑定逐条相同（TTL、软绑定、改绑、全满时拒——[`SessionLimitReached`]）。
     /// `device_id` 有值时忽略它：带设备身份的已由设备绑定管着，一条请求不占两份名额。
@@ -6169,9 +6192,10 @@ impl CredentialStore {
                                 conn.execute(
                                     "UPDATE session_bindings \
                                         SET slot = ?2, last_seen_at = unixepoch(), \
-                                            request_count = request_count + 1 \
+                                            request_count = request_count + 1, \
+                                            last_model = COALESCE(?3, last_model) \
                                       WHERE session_key = ?1",
-                                    params![key, slot],
+                                    params![key, slot, model],
                                 )?;
                                 Some(slot)
                             }
@@ -6272,11 +6296,13 @@ impl CredentialStore {
                 // has_room，所以上限内必有空位；不限时槽位按需增长、释放后复用。
                 let slot = free_session_slot(&conn, chosen.id, session_ttl_secs, None)?;
                 conn.execute(
-                    "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES (?1, ?2, ?3)
+                    "INSERT INTO session_bindings (session_key, cred_id, slot, last_model) \
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(session_key) DO UPDATE
                         SET cred_id = ?2, slot = ?3, last_seen_at = unixepoch(), \
-                            request_count = request_count + 1",
-                    params![key, chosen.id, slot],
+                            request_count = request_count + 1, \
+                            last_model = COALESCE(?4, last_model)",
+                    params![key, chosen.id, slot, model],
                 )?;
                 Some(slot)
             }
@@ -7554,18 +7580,80 @@ mod tests {
         let n: i64 =
             conn.query_row("SELECT COUNT(*) FROM session_bindings", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "存量行清掉");
+        // 键要带版本前缀，否则会被「清掉旧口径的行」那条语句扫走（见下一条测试）。
         conn.execute(
-            "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES ('new', 1, 3)",
+            "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES ('lb:v2:pfx:new', 1, 3)",
             [],
         )
         .unwrap();
         init_schema(&conn).unwrap();
         let slot: i64 = conn
-            .query_row("SELECT slot FROM session_bindings WHERE session_key = 'new'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT slot FROM session_bindings WHERE session_key = 'lb:v2:pfx:new'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(slot, 3, "列已在就什么都不动");
+    }
+
+    /// 旧口径算出来的会话键（没有 `lb:v2:` 前缀）在开库时清掉，带版本的留着。口径见
+    /// `crate::proxy::session_binding_key`：两版的键都是 32 个 hex，不靠前缀分不出来。
+    #[test]
+    fn session_bindings_from_an_older_key_scheme_are_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO credentials (id, label, access_token, refresh_token, expires_at) \
+             VALUES (1, 'a', 't', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES
+                ('3f9a1c7e5b2d4680a1b2c3d4e5f60718', 1, 0),
+                ('lb:v2:pfx:3f9a1c7e5b2d4680a1b2c3d4e5f60718', 1, 1),
+                ('lb:v2:sid:7fe47444-c834-44e0-b568-d61e07daa35e', 1, 2);",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let keys: Vec<String> = conn
+            .prepare("SELECT session_key FROM session_bindings ORDER BY slot")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                "lb:v2:pfx:3f9a1c7e5b2d4680a1b2c3d4e5f60718".to_string(),
+                "lb:v2:sid:7fe47444-c834-44e0-b568-d61e07daa35e".to_string(),
+            ],
+            "旧口径那条清掉，带版本的两条留着"
+        );
+    }
+
+    /// 绑定行记下最近一轮的模型：**只给后台列**，不参与键也不参与选号——同一条对话换个模型
+    /// 仍是同一条会话、占同一份名额（键里带模型的代价见 `crate::proxy::session_binding_key`）。
+    /// 没带模型的那轮（`count_tokens` 之类）保留上一轮的值。
+    #[test]
+    fn the_session_binding_records_its_latest_model() {
+        let (store, ids) = soft_store(&["a"]);
+        let a = ids[0];
+        let on = |model| Select { model, ..soft_session("s1") };
+        store.select_for_device(on(Some("claude-opus-5"))).unwrap();
+        assert_eq!(store.list_sessions(a).unwrap()[0].last_model.as_deref(), Some("claude-opus-5"));
+        store.select_for_device(on(Some("claude-fable-5-1"))).unwrap();
+        let list = store.list_sessions(a).unwrap();
+        assert_eq!(list.len(), 1, "换模型不另起会话: {list:?}");
+        assert_eq!(list[0].last_model.as_deref(), Some("claude-fable-5-1"), "记最近那轮");
+        store.select_for_device(on(None)).unwrap();
+        assert_eq!(
+            store.list_sessions(a).unwrap()[0].last_model.as_deref(),
+            Some("claude-fable-5-1"),
+            "没带模型的那轮不抹掉上一轮"
+        );
     }
 
     /// 带设备身份的请求即使也带了会话键，只按设备绑定：一条请求不占两份名额。

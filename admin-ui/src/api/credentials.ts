@@ -419,7 +419,10 @@ export async function listCredentials(): Promise<Credential[]> {
 
 /** 一条模拟会话绑定。口径同 `session_count`：只含 TTL 内仍活跃的。 */
 export interface SessionBinding {
-  /** 会话键：来访自带的会话 id，或「缓存前缀（tools + system）+ 首条用户消息」的指纹（32 个 hex 字符）。 */
+  /**
+   * 会话键：`lb:v2:sid:<来访自带的会话 id>` 或 `lb:v2:pfx:<「缓存前缀（tools + system）+ 首条
+   * 用户消息」的指纹>`——命名空间加口径版本加来源段，取法见后端 `session_binding_key`。
+   */
   session_key: string
   /** 在该账号上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。 */
   slot: number
@@ -431,6 +434,11 @@ export interface SessionBinding {
   created_at: number
   /** 最近一次活跃时间（Unix 秒）；TTL 按它算。 */
   last_seen_at: number
+  /**
+   * 最近一轮请求的模型。**不参与键**：同一条对话换模型仍是同一条会话（键里带模型会把它劈成
+   * 两条、占两份名额），这里只是让人一眼看出这条会话在跑什么。旧库补列出来是 null。
+   */
+  last_model: string | null
 }
 
 /** 列出某账号当前活跃的模拟会话（按最近活跃倒序）。 */

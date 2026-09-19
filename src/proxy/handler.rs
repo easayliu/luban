@@ -17,8 +17,8 @@ use super::body::{
     cc_tools_to_inject, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
     extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
     known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
-    remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
-    stream_requested, trusted_cc_version, ua_of,
+    remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
+    sim_session_key, stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -683,9 +683,13 @@ pub(super) async fn handle_inner(
     // 稳定）；没带就用那个指纹。同一个键粘住同一个号（换号会连累 thinking 签名，理由同设备绑定）
     // 并占该号的一个**会话名额**：每个号最多同时活跃多少条模拟会话，与设备上限同一套三态与
     // TTL。一次性会话打一条就走的那类流量（封号复盘里最显眼的形态）在这里被封顶。
-    let session_key: Option<String> = prefix_key
-        .as_ref()
-        .map(|k| incoming_session_id(&headers, body_json.as_ref()).unwrap_or_else(|| k.clone()));
+    // 键带命名空间与口径版本（`lb:v2:sid:<uuid>` / `lb:v2:pfx:<hex>`，见 [`session_binding_key`]）：
+    // 来源那一段是明文，后台不必再靠「是不是 32 个 hex」去猜，改口径时旧行也认得出来。
+    // **只有落库的这个键带前缀**，派生出站会话 id 的 seed 仍是裸的 `prefix_key`（下面的
+    // `SimSessionSeed::Prefix`）——那是哈希的输入，动它会让在途对话的会话 id 全部换一遍。
+    let session_key: Option<String> = prefix_key.as_ref().map(|k| {
+        session_binding_key(incoming_session_id(&headers, body_json.as_ref()).as_deref(), k)
+    });
 
     // 3) 按 device_id（模拟路径没有设备身份时按会话键）粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，

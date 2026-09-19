@@ -856,6 +856,18 @@ function SessionCapacityCard({
   )
 }
 
+/**
+ * 拆开会话键：后端写的是 `lb:v2:<来源>:<值>`（见 `session_binding_key`），来源 `sid` 是来访
+ * 自带的会话 id、`pfx` 是「缓存前缀 + 对话起点」的指纹。
+ *
+ * 认不出前缀的只可能是旧口径的残留（开库时那条迁移会清掉），退回原来那套按长相猜的判法。
+ */
+function parseSessionKey(key: string): { source: 'sid' | 'pfx'; value: string } {
+  const m = /^lb:v\d+:(sid|pfx):([\s\S]*)$/.exec(key)
+  if (m) return { source: m[1] as 'sid' | 'pfx', value: m[2] }
+  return { source: /^[0-9a-f]{32}$/.test(key) ? 'pfx' : 'sid', value: key }
+}
+
 function SessionList({
   credId,
   data,
@@ -990,9 +1002,13 @@ function SessionList({
             const firstBoundFull = formatFullTime(session.created_at, language)
             const lastSeenFull = formatFullTime(session.last_seen_at, language)
             // 主行是上游看到的会话 id（按槽位派生、对话之间复用），槽位号做徽章；对话自己的键
-            // （32 位 hex 是按缓存前缀派生的，uuid 是来访自带的）退到悬浮提示里。
-            const derived = /^[0-9a-f]{32}$/.test(session.session_key)
+            // 退到悬浮提示里，来源直接读键上那一段（`lb:v2:sid:` / `lb:v2:pfx:`），不再靠
+            // 「是不是 32 个 hex」猜——uuid 去掉横线也是 32 个 hex。
+            const { source, value } = parseSessionKey(session.session_key)
+            const derived = source === 'pfx'
             const keyKind = derived ? t('按前缀', 'by prefix') : t('自带 id', 'client id')
+            // 最近一轮的模型：记在绑定行上、不参与键（换模型不另起会话），旧库为空就不占位。
+            const modelLabel = session.last_model ? `${session.last_model} · ` : ''
             return (
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-2">
@@ -1007,7 +1023,7 @@ function SessionList({
                     <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
                       {t(`上游看到的会话 id ${session.session_id}`, `Session id upstream sees: ${session.session_id}`)}
                       <br />
-                      {t(`对话键（${keyKind}）${session.session_key}`, `Conversation key (${keyKind}): ${session.session_key}`)}
+                      {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
                     </TooltipPopup>
                   </Tooltip>
                   <Badge variant="secondary" size="sm">
@@ -1045,14 +1061,14 @@ function SessionList({
                   <Tooltip>
                     <TooltipTrigger render={<span />} className="min-w-0 truncate">
                       {t(
-                        `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
-                        `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
+                        `${modelLabel}首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
+                        `${modelLabel}First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
                       )}
                     </TooltipTrigger>
                     <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
                       {t(
-                        `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
-                        `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
+                        `${modelLabel}首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
+                        `${modelLabel}First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
                       )}
                     </TooltipPopup>
                   </Tooltip>

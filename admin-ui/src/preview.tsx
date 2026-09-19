@@ -838,22 +838,25 @@ queryClient.setQueryData(['proxies'], [
 queryClient.setQueryData(['credential-devices', 1], [])
 queryClient.setQueryData(['credential-sessions', 1], [])
 queryClient.setQueryData(['credential-sessions', 4], [
-  // 来访自带会话 id 的（uuid）与按缓存前缀派生的（32 位 hex）各一条。
+  // 两种来源各一条：来访自带会话 id 的（`lb:v2:sid:`）与按缓存前缀派生的（`lb:v2:pfx:`）；
+  // 后者的 last_model 为 null，演一遍旧库补列后还没回填的样子。
   {
-    session_key: 'd0c1fb05-9b19-4576-9465-e2b8a206dabf',
+    session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf',
     slot: 0,
     session_id: '7c2e4d1a-8b3f-4c5d-9e6f-0a1b2c3d4e5f',
     request_count: 41,
     created_at: now - 2 * 3600,
     last_seen_at: now - 40,
+    last_model: 'claude-opus-5',
   },
   {
-    session_key: '3f9a1c7e5b2d4680a1b2c3d4e5f60718',
+    session_key: 'lb:v2:pfx:3f9a1c7e5b2d4680a1b2c3d4e5f60718',
     slot: 1,
     session_id: 'b4d6f8a0-1c3e-4a5b-8d7e-9f0a1b2c3d4e',
     request_count: 12,
     created_at: now - 50 * 60,
     last_seen_at: now - 9 * 60,
+    last_model: null,
   },
 ])
 queryClient.setQueryData(['credential-devices', 4], [

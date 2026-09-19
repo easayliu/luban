@@ -773,8 +773,8 @@ pub(super) fn sim_device_fingerprint(client_device_id: Option<&str>) -> String {
 /// 每次压缩后一个新会话——那种客户端本来也命不中缓存，见 [`ensure_cc_message_breakpoint`]
 /// 的记述。没有 `tools`、`system`，首条也不是用户消息的请求键恒定——同一账号下这类请求仍是
 /// 一条会话，与原来一样。**这是近似**：两条请求连首条 content 都逐字相同时，协议里没有任何
-/// 信息能分出它们是不是两个对话，后台的会话数与上限都按这个口径算。返回 32 个 hex 字符，
-/// 直接可作 `session_bindings.session_key`。
+/// 信息能分出它们是不是两个对话，后台的会话数与上限都按这个口径算。返回 32 个 hex 字符；
+/// 入库前还要经 [`session_binding_key`] 套上命名空间与口径版本。
 pub(super) fn sim_session_key(v: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -831,6 +831,50 @@ pub(super) fn sim_session_key(v: &serde_json::Value) -> String {
         h.update([0u8]);
     }
     crate::credentials::hex_lower(&h.finalize()[..16])
+}
+
+/// 会话绑定键（`session_bindings.session_key`）的命名空间加口径版本：`lb:v2:`。
+///
+/// **为什么要有版本位**：这张表的键算法已经改过一次——v0.3.126 是「账号 + 设备指纹」，现在
+/// 是「来访自带的会话 id，没带才按缓存前缀 + 对话起点」（[`sim_session_key`]）。两版的键长得
+/// 一模一样（都是 32 个 hex），库里的存量行在新口径下含义已经不同，却没有任何办法分辨、也
+/// 没法按前缀批量清。带上版本之后旧行一眼可辨，启动时按前缀清掉（见 `store` 里建表之后的
+/// 那条迁移），以后再改口径 bump 到 v3 即可，不必动表结构。
+pub(crate) const SESSION_KEY_VERSION: &str = "lb:v2:";
+
+/// 这条请求落在 `session_bindings` 上的键：`lb:v2:<来源>:<值>`。
+///
+/// 来源段是**明文**，两种取值：
+/// - `sid` —— 来访自己带了会话 id（头或 `metadata.user_id`），值就是那个 uuid。键要跨账号
+///   稳定，故取来访原值，而不是出站那个按账号钉住的（`session_id::account_session_id`）。
+/// - `pfx` —— 来访没带，值是 [`sim_session_key`] 那 32 个 hex。
+///
+/// 加这一段之前，两种来源只能靠「是不是 32 个 hex」去猜（后台列表里原来就是这么判的），
+/// 而 uuid 去掉横线也是 32 个 hex，猜法本身站不住。
+///
+/// 为什么只放这一维、不把模型和线程类型也拼进去：这个键的用途是**粘住账号、占会话名额**，
+/// 不是缓存分区。把模型拼进键，同一条对话换个模型就成了两个键——占两份名额，还可能粘到另一
+/// 个号上，于是同一段对话历史出现在两个组织下，正是 `ban/luban-ban-13` 那类形态。
+///
+/// 线程类型（`x-claude-code-request-class`）更是**抓包直接判了死刑**：`cap/2.1.277` 里 47 条
+/// `/v1/messages`，11 条 `main`、26 条 `subagent`、10 条 `auxiliary`，`X-Claude-Code-Session-Id`
+/// 与 `metadata.user_id` 里的 `session_id` **全是同一个 uuid**（`7fe47444-…`，`00049` 起那批
+/// 子代理只是多带 `x-claude-code-agent-id: a842a8d67aeec7a12` 与 `agent-type: custom`）。
+/// 官方口径是「子代理不另起会话，只是父会话里的一条支线」，`agent-id` 是支线号、不是会话身份。
+/// 把 class 或 agent-id 拼进键就会把官方本来一条的会话劈成三条：占三份名额，还可能粘到三个
+/// 号上——同一段历史同时出现在三个组织下，比不劈更像机器人。
+///
+/// **`sid` 优先于 `pfx` 的理由也在这里**：子代理的 `tools` 与 `system` 与主线程不同，光按
+/// 缓存前缀算必然是两个键；来访带了会话 id 就一切以它为准，主线程与子代理自动并回一条，与
+/// 上面那 47 条的形态一致。反过来，**裸客户端自己实现的子代理又不带会话 id** 时协议里没有
+/// 任何父子线索，只能按前缀各算各的——这是 `pfx` 分支已知的近似（见 [`sim_session_key`]）。
+///
+/// 模型与线程类型要看就记在绑定行上（`session_bindings.last_model`）给后台列，不进键。
+pub(super) fn session_binding_key(incoming_session_id: Option<&str>, prefix_key: &str) -> String {
+    match incoming_session_id {
+        Some(sid) => format!("{SESSION_KEY_VERSION}sid:{sid}"),
+        None => format!("{SESSION_KEY_VERSION}pfx:{prefix_key}"),
+    }
 }
 
 /// 键按字典序排好的紧凑 JSON：`preserve_order` 开着时 `to_string` 按客户端发来的键序输出，
@@ -6030,6 +6074,43 @@ mod tests {
             crate::proxy::sim_device_fingerprint(Some("dev-a")),
             crate::proxy::sim_device_fingerprint(Some("dev-b"))
         );
+    }
+
+    /// 会话绑定键的两段来源与版本位，见 [`session_binding_key`]。抓包（`cap/2.1.277`）里
+    /// 主线程、子代理、辅助三类请求共用同一个 `X-Claude-Code-Session-Id`，这条测试把那个
+    /// 口径钉住：带会话 id 的来访，子代理不另起会话。
+    #[test]
+    fn the_binding_key_carries_its_version_and_source() {
+        use super::{SESSION_KEY_VERSION, session_binding_key};
+        let key = |body: &str| super::sim_session_key(&serde_json::from_str(body).unwrap());
+        // 官方一条会话里主线程与子代理的 tools / system 并不相同（`00048` 与 `00049`），
+        // 单看缓存前缀必然是两个键。
+        let main = key(
+            r#"{"system":[{"type":"text","text":"S"}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let sub = key(
+            r#"{"system":[{"type":"text","text":"SUB"}],"tools":[{"name":"Read"}],"messages":[{"role":"user","content":"find it"}]}"#,
+        );
+        assert_ne!(main, sub, "两条支线的缓存前缀本来就不同");
+        // 来访带了会话 id 就一律按它——两条支线并回一条会话、占一份名额。
+        let sid = "7fe47444-c834-44e0-b568-d61e07daa35e";
+        assert_eq!(
+            session_binding_key(Some(sid), &main),
+            session_binding_key(Some(sid), &sub),
+            "同一条来访会话里的主线程与子代理是一条会话"
+        );
+        assert_eq!(session_binding_key(Some(sid), &main), format!("lb:v2:sid:{sid}"));
+        // 没带会话 id 时只能按前缀分，子代理各算各的：`pfx` 分支已知的近似。
+        assert_eq!(session_binding_key(None, &main), format!("lb:v2:pfx:{main}"));
+        assert_ne!(session_binding_key(None, &main), session_binding_key(None, &sub));
+        // 两种来源不会撞：uuid 去掉横线也是 32 个 hex，没有来源段就分不开——后台原先正是
+        // 靠「是不是 32 个 hex」猜的。
+        let flat = sid.replace('-', "");
+        assert_ne!(session_binding_key(Some(&flat), &main), session_binding_key(None, &flat));
+        // 两种来源都带版本前缀：库里的旧行正是靠它被认出来清掉的。
+        for k in [session_binding_key(Some(sid), &main), session_binding_key(None, &main)] {
+            assert!(k.starts_with(SESSION_KEY_VERSION), "{k}");
+        }
     }
 
     /// 模拟路径的会话键 = 缓存前缀 + 对话起点：tools、system、首条用户消息三者相同的请求同一个
