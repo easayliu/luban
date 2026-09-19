@@ -5,6 +5,7 @@ import { getCacheSeries } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
 import {
   bucketCacheSeries,
+  cacheHitRate,
   extractError,
   formatPercent,
   type CacheGranularity,
@@ -27,31 +28,40 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import {
   CacheHitColumns,
   CacheHitTable,
-  aggregateCacheHitRate,
-  cacheTotalsText,
+  cacheSplitText,
 } from '@/components/cache-hit-chart'
+import { UsageBreakdown } from '@/components/usage-breakdown'
 
 export const CACHE_RANGES = {
-  '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity },
-  '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity },
-  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity },
+  '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
+  '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
+  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
 } as const
 
 export type CacheRangeKey = keyof typeof CACHE_RANGES
 
-export const DEFAULT_CACHE_RANGE: CacheRangeKey = '7d'
+/** 默认看近 24 小时：先看今天怎么样，7 天与 30 天是往回翻。 */
+export const DEFAULT_CACHE_RANGE: CacheRangeKey = '24h'
 
 export function useCacheSeries(range: CacheRangeKey, enabled = true) {
   const preset = CACHE_RANGES[range]
   const query = useQuery({
-    queryKey: ['cache-series', preset.hours],
-    queryFn: () => getCacheSeries(preset.hours),
+    queryKey: ['cache-series', preset.hours, preset.bucketSecs],
+    queryFn: () => getCacheSeries({ hours: preset.hours, bucketSecs: preset.bucketSecs }),
     enabled,
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
   })
   const slots = bucketCacheSeries(query.data?.points ?? [], preset.granularity, preset.slots)
-  return { query, slots, granularity: preset.granularity }
+  return {
+    query,
+    slots,
+    granularity: preset.granularity,
+    /** 整个窗口的三段合计。 */
+    summary: query.data?.summary ?? null,
+    /** 近 60 分钟的三段合计。 */
+    recent: query.data?.recent ?? null,
+  }
 }
 
 export function CacheHitTrendDialog({
@@ -65,9 +75,25 @@ export function CacheHitTrendDialog({
   const titleRef = useRef<HTMLHeadingElement>(null)
   const [range, setRange] = useState<CacheRangeKey>(DEFAULT_CACHE_RANGE)
   const [view, setView] = useState<'chart' | 'table'>('chart')
-  const { query, slots, granularity } = useCacheSeries(range, open)
-  const total = aggregateCacheHitRate(slots)
+  const { query, slots, granularity, summary, recent } = useCacheSeries(range, open)
   const hasTraffic = slots.some((s) => s.hasTraffic)
+  const preset = CACHE_RANGES[range]
+  const card = (label: string, p: { input_tokens: number; cached_tokens: number; written_tokens: number } | null) => {
+    const empty = !p || p.input_tokens === 0
+    return (
+      <div className="rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
+        <p className="text-2xs font-medium text-muted-foreground">{label}</p>
+        <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <p className="text-2xl font-semibold leading-none tabular-nums">
+            {empty ? '—' : formatPercent(cacheHitRate(p.input_tokens, p.cached_tokens))}
+          </p>
+          <p className="text-2xs text-muted-foreground tabular-nums">
+            {empty ? t('无请求', 'No requests') : cacheSplitText(p, t)}
+          </p>
+        </div>
+      </div>
+    )
+  }
 
   const rangeLabel: Record<CacheRangeKey, string> = {
     '24h': t('近 24 小时', 'Last 24 hours'),
@@ -141,12 +167,10 @@ export function CacheHitTrendDialog({
             </ToggleGroup>
           </div>
 
-          <section className="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
-            <p className="text-2xs font-medium text-muted-foreground">{rangeLabel[range]}</p>
-            <p className="text-2xl font-semibold leading-none">{formatPercent(total.rate)}</p>
-            <p className="text-2xs text-muted-foreground tabular-nums">
-              {cacheTotalsText(total.cachedTokens, total.inputTokens, t)}
-            </p>
+          {/* 左边整个窗口，右边近 1 小时：「现在」和「基线」并排。 */}
+          <section className="grid gap-2 sm:grid-cols-2">
+            {card(rangeLabel[range], summary)}
+            {card(t('近 1 小时', 'Last hour'), recent)}
           </section>
 
           {query.error ? (
@@ -181,10 +205,12 @@ export function CacheHitTrendDialog({
 
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '命中缓存的输入按十分之一计价。空着的格子是那个时段没有请求——不是命中率掉到 0；柱子的深浅是那一格的 token 体量。请求明细只保留 30 天。',
-              'Cached input bills at a tenth. A gap means no traffic in that period, not a hit rate of zero; a bar\'s opacity reflects that period\'s token volume. Request logs are kept for 30 days.',
+              '一根柱子叠三段：深色是命中（按十分之一计价）、浅色是写入（按 1.25 倍计价）、灰色是裸算。命中率就是深色那段的高度；写入多命中少是前缀每轮在变，两段都少是客户端没标断点。空着的格子是那个时段没有请求；柱子的深浅是那一格的 token 体量。请求明细只保留 30 天。',
+              'Each bar stacks three parts: dark is cached (billed at a tenth), light is written (billed at 1.25×), grey is uncached. The hit rate is the dark part\'s height; lots written but little cached means the prefix changes every turn, little of both means the client sets no breakpoints. A gap means no traffic in that period; a bar\'s opacity reflects its token volume. Request logs are kept for 30 days.',
             )}
           </p>
+
+          <UsageBreakdown hours={preset.hours} kind="cache" />
         </DialogPanel>
       </DialogPopup>
     </Dialog>

@@ -16,15 +16,21 @@ function slotReadout(
   if (!slot.hasTraffic) {
     return { when, axis, rate: '—', detail: t('这个时段没有请求', 'No requests in this period') }
   }
+  const uncached = uncachedTokens(slot)
   return {
     when,
     axis,
     rate: formatPercent(cacheHitRate(slot.inputTokens, slot.cachedTokens)),
     detail: t(
-      `命中 ${slot.cachedTokens.toLocaleString(locale)} / 输入 ${slot.inputTokens.toLocaleString(locale)} token`,
-      `${slot.cachedTokens.toLocaleString(locale)} cached of ${slot.inputTokens.toLocaleString(locale)} input tokens`,
+      `命中 ${slot.cachedTokens.toLocaleString(locale)} · 写入 ${slot.writtenTokens.toLocaleString(locale)} · 裸算 ${uncached.toLocaleString(locale)} token`,
+      `${slot.cachedTokens.toLocaleString(locale)} cached · ${slot.writtenTokens.toLocaleString(locale)} written · ${uncached.toLocaleString(locale)} uncached tokens`,
     ),
   }
+}
+
+/** 三段之外的那部分：既没命中也没写入、按原价算的输入。 */
+function uncachedTokens(slot: { inputTokens: number; cachedTokens: number; writtenTokens: number }): number {
+  return Math.max(0, slot.inputTokens - slot.cachedTokens - slot.writtenTokens)
 }
 
 function tickStep(slots: number): number {
@@ -115,19 +121,23 @@ export function CacheHitColumns({
                         className="relative h-0.5 w-full max-w-6 rounded-full bg-muted-foreground/24"
                       />
                     ) : (
+                      // 一根柱子叠三段：底下深色是命中、中间浅色是写入、顶上灰色是裸算，
+                      // 三段加起来撑满——命中率就是深色那段的高度，写入多命中少一眼能看出来。
                       <span
                         aria-hidden
-                        className="relative w-full max-w-6 rounded-t bg-chart-1"
-                        style={{
-                          height: `max(0.125rem, ${rate * 100}%)`,
-                          opacity: volumeWeight(slot.inputTokens, maxInput),
-                        }}
-                      />
+                        className="relative flex w-full max-w-6 flex-col justify-end overflow-hidden rounded-t"
+                        style={{ height: '100%', opacity: volumeWeight(slot.inputTokens, maxInput) }}
+                      >
+                        <span className="w-full bg-muted-foreground/24" style={{ height: `${(uncachedTokens(slot) / slot.inputTokens) * 100}%` }} />
+                        <span className="w-full bg-chart-1/40" style={{ height: `${(slot.writtenTokens / slot.inputTokens) * 100}%` }} />
+                        <span className="w-full bg-chart-1" style={{ height: `max(0.125rem, ${rate * 100}%)` }} />
+                      </span>
                     )}
                     {dipWorthLabelling && i === dipIndex && (
                       <span
                         aria-hidden
-                        className="absolute whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
+                        // 叠柱撑满整格，这个数字落在浅色 / 灰色段上，垫一层底色才读得清。
+                        className="absolute whitespace-nowrap rounded bg-popover/85 px-0.5 text-2xs text-muted-foreground tabular-nums"
                         style={{ bottom: `calc(max(0.125rem, ${(rate ?? 0) * 100}%) + 0.25rem)` }}
                       >
                         {readouts[i].rate}
@@ -211,8 +221,10 @@ export function CacheHitTable({
               {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}
             </th>
             <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-            <th scope="col" className="text-end">{t('命中 token', 'Cached')}</th>
-            <th scope="col" className="text-end">{t('输入 token', 'Input')}</th>
+            <th scope="col" className="text-end">{t('命中', 'Cached')}</th>
+            <th scope="col" className="text-end">{t('写入', 'Written')}</th>
+            <th scope="col" className="text-end">{t('裸算', 'Uncached')}</th>
+            <th scope="col" className="text-end">{t('输入合计', 'Input total')}</th>
           </tr>
         </thead>
         <tbody>
@@ -222,12 +234,10 @@ export function CacheHitTable({
               <tr key={slot.ts} className="[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0">
                 <td className="whitespace-nowrap tabular-nums">{r.when}</td>
                 <td className="whitespace-nowrap text-end font-medium tabular-nums">{r.rate}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">
-                  {slot.cachedTokens.toLocaleString(locale)}
-                </td>
-                <td className="whitespace-nowrap text-end tabular-nums">
-                  {slot.inputTokens.toLocaleString(locale)}
-                </td>
+                <td className="whitespace-nowrap text-end tabular-nums">{slot.cachedTokens.toLocaleString(locale)}</td>
+                <td className="whitespace-nowrap text-end tabular-nums">{slot.writtenTokens.toLocaleString(locale)}</td>
+                <td className="whitespace-nowrap text-end tabular-nums">{uncachedTokens(slot).toLocaleString(locale)}</td>
+                <td className="whitespace-nowrap text-end tabular-nums text-muted-foreground">{slot.inputTokens.toLocaleString(locale)}</td>
               </tr>
             )
           })}
@@ -260,23 +270,14 @@ export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; cl
   )
 }
 
-export function aggregateCacheHitRate(slots: CacheSlot[]): {
-  rate: number | null
-  inputTokens: number
-  cachedTokens: number
-} {
-  const inputTokens = slots.reduce((sum, s) => sum + s.inputTokens, 0)
-  const cachedTokens = slots.reduce((sum, s) => sum + s.cachedTokens, 0)
-  return { rate: cacheHitRate(inputTokens, cachedTokens), inputTokens, cachedTokens }
-}
-
-export function cacheTotalsText(
-  cachedTokens: number,
-  inputTokens: number,
+/** 三段写全：命中 · 写入 · 裸算。 */
+export function cacheSplitText(
+  p: { input_tokens: number; cached_tokens: number; written_tokens: number },
   t: (zh: string, en: string) => string,
 ): string {
+  const uncached = Math.max(0, p.input_tokens - p.cached_tokens - p.written_tokens)
   return t(
-    `命中 ${formatTokens(cachedTokens)} / 输入 ${formatTokens(inputTokens)}`,
-    `${formatTokens(cachedTokens)} of ${formatTokens(inputTokens)} input`,
+    `命中 ${formatTokens(p.cached_tokens)} · 写入 ${formatTokens(p.written_tokens)} · 裸算 ${formatTokens(uncached)}`,
+    `${formatTokens(p.cached_tokens)} cached · ${formatTokens(p.written_tokens)} written · ${formatTokens(uncached)} uncached`,
   )
 }

@@ -3675,14 +3675,121 @@ pub struct CacheBucket {
     pub input_tokens: i64,
     /// 其中来自缓存的部分（`cache_read_tokens`）。
     pub cached_tokens: i64,
+    /// 其中写进缓存的部分（`cache_creation_tokens`，旧行按 5m + 1h 两段之和）。命中率一个数
+    /// 分不出「没命中」和「没写入」，拆开才知道该查什么：写入多命中少是前缀每轮在变，
+    /// 写入命中都少是客户端根本没标断点。
+    pub written_tokens: i64,
+}
+
+impl CacheBucket {
+    fn empty(ts: i64) -> Self {
+        Self { ts, input_tokens: 0, cached_tokens: 0, written_tokens: 0 }
+    }
 }
 
 /// TTFT（首字时延）趋势里的一个**小时桶**。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TtftBucket {
     pub ts: i64,
+    /// 算术平均，留给老口径对照；偶发的几十秒超时会把它拉高，看 p50 / p95。
     pub avg_ms: i64,
+    /// 中位数（nearest-rank）。
+    pub p50_ms: i64,
+    /// 95 分位（nearest-rank）。
+    pub p95_ms: i64,
+    /// 参与统计的成功请求数（status = 200 且记了 TTFT）。
     pub count: i64,
+    /// 输出吞吐（token / 秒）：`Σ output_tokens / Σ (total_ms − ttft_ms)`，只算两者都有且
+    /// 生成阶段时长为正的请求；没有这样的请求为 `None`。
+    pub tokens_per_sec: Option<f64>,
+}
+
+/// 趋势接口的一次返回：各桶、整窗口合计、近 60 分钟合计。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheReport {
+    pub points: Vec<CacheBucket>,
+    pub summary: CacheBucket,
+    pub recent: CacheBucket,
+}
+
+/// 同上，延迟那份。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TtftReport {
+    pub points: Vec<TtftBucket>,
+    pub summary: TtftBucket,
+    pub recent: TtftBucket,
+}
+
+/// 延迟原始行的查询：WHERE 与 `idx_usage_logs_latency` 的部分谓词逐字相同，规划器才会
+/// 选它；测试里用 EXPLAIN QUERY PLAN 盯着这一点。
+const LATENCY_ROWS_SQL: &str = "SELECT ts, ttft_ms, total_ms, output_tokens
+       FROM usage_logs
+      WHERE ts >= ?1 AND ttft_ms IS NOT NULL AND status = 200";
+
+/// 一条成功请求在延迟统计里要用的几个数，见 [`CredentialStore::ttft_series`]。
+#[derive(Debug, Clone, Copy)]
+struct LatencyRow {
+    ts: i64,
+    ttft_ms: i64,
+    total_ms: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+/// nearest-rank 分位：`sorted` 已升序、非空，`p` 在 (0, 1]。
+fn percentile(sorted: &[i64], p: f64) -> i64 {
+    let rank = ((sorted.len() as f64) * p).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// 把一组成功请求汇总成一个 [`TtftBucket`]；空集返回全零、吞吐 `None`。
+fn summarize_latency(ts: i64, rows: &[LatencyRow]) -> TtftBucket {
+    if rows.is_empty() {
+        return TtftBucket { ts, avg_ms: 0, p50_ms: 0, p95_ms: 0, count: 0, tokens_per_sec: None };
+    }
+    let mut sorted: Vec<i64> = rows.iter().map(|r| r.ttft_ms).collect();
+    sorted.sort_unstable();
+    let sum: i64 = sorted.iter().sum();
+    let (mut out_tokens, mut gen_ms) = (0i64, 0i64);
+    for r in rows {
+        if let (Some(total), Some(out)) = (r.total_ms, r.output_tokens)
+            && total > r.ttft_ms
+            && out > 0
+        {
+            out_tokens += out;
+            gen_ms += total - r.ttft_ms;
+        }
+    }
+    TtftBucket {
+        ts,
+        avg_ms: sum / sorted.len() as i64,
+        p50_ms: percentile(&sorted, 0.5),
+        p95_ms: percentile(&sorted, 0.95),
+        count: sorted.len() as i64,
+        tokens_per_sec: (gen_ms > 0).then(|| out_tokens as f64 * 1000.0 / gen_ms as f64),
+    }
+}
+
+/// 拆分维度，见 [`CredentialStore::usage_breakdown`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownBy {
+    Model,
+    Account,
+}
+
+/// 按模型或按账号拆开的一行：这段时间里它的请求数、延迟分位、吞吐与缓存三段 token。
+/// 池子平均看不出「谁在拖后腿」，这张表就是给这个问题的。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BreakdownRow {
+    /// 模型名，或凭证 id 的十进制串。
+    pub key: String,
+    /// 展示名：模型名本身，或凭证的 label（已删的号是 `#<id>`）。
+    pub label: String,
+    /// 这段时间里的全部请求数（含失败的）。
+    pub requests: i64,
+    /// 延迟统计（只算成功且记了 TTFT 的请求），`ts` 一律是窗口起点。
+    pub latency: TtftBucket,
+    /// 缓存三段 token（所有请求）。
+    pub cache: CacheBucket,
 }
 
 /// 与 [`CredentialStore::query_usage_logs`] 走同一套筛选条件，好让「共 N 条」「合计 $X」
@@ -4212,23 +4319,31 @@ impl CredentialStore {
         Ok(())
     }
 
-    /// 缓存命中率趋势的逐小时桶。回两个原始数，比率由前端算——一个 300 token 的小时
-    /// 里的「命中 0%」与 17K 前缀那种小时里的「命中 94%」是两件事，光看比率判断不了。
+    /// 缓存命中率趋势的桶。回三个原始数（输入、命中、写入），比率由前端算——一个 300 token
+    /// 的小时里的「命中 0%」与 17K 前缀那种小时里的「命中 94%」是两件事，光看比率判断不了。
     ///
-    /// 这里的 `input_tokens` 是全部输入 token（含缓存命中与缓存写入），
-    /// `cached_tokens` 是其中来自缓存的部分（`cache_read_tokens`）。
-    pub fn cache_series(&self, since: i64) -> Result<Vec<CacheBucket>> {
-        const BUCKET_SECS: i64 = 3600;
+    /// `bucket_secs` 是桶宽；`tz_offset_secs` 是本地时区相对 UTC 的偏移，按天分桶时桶边界
+    /// 落在**本地**零点上——前端按本地日期铺格子，后端不按同一套边界切，日桶就会跨两天。
+    /// `input_tokens` 是全部输入 token（含缓存命中与缓存写入）。
+    pub fn cache_series(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        tz_offset_secs: i64,
+    ) -> Result<Vec<CacheBucket>> {
+        let bucket_secs = bucket_secs.max(1);
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT (ts / ?2) * ?2 AS bucket,
+            "SELECT ((ts + ?3) / ?2) * ?2 - ?3 AS bucket,
                     SUM(
                         COALESCE(input_tokens, 0)
                         + COALESCE(cache_creation_tokens,
                                    COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))
                         + COALESCE(cache_read_tokens, 0)
                     ),
-                    COALESCE(SUM(cache_read_tokens), 0)
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(COALESCE(cache_creation_tokens,
+                                          COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))), 0)
                FROM usage_logs
               WHERE ts >= ?1
               GROUP BY bucket
@@ -4240,29 +4355,194 @@ impl CredentialStore {
                      ) > 0
               ORDER BY bucket",
         )?;
-        let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
-            Ok(CacheBucket { ts: r.get(0)?, input_tokens: r.get(1)?, cached_tokens: r.get(2)? })
+        let rows = stmt.query_map(params![since, bucket_secs, tz_offset_secs], |r| {
+            Ok(CacheBucket {
+                ts: r.get(0)?,
+                input_tokens: r.get(1)?,
+                cached_tokens: r.get(2)?,
+                written_tokens: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// TTFT（首字时延）趋势的逐小时桶。只统计成功（status=200）且有 TTFT 记录的请求。
-    pub fn ttft_series(&self, since: i64) -> Result<Vec<TtftBucket>> {
-        const BUCKET_SECS: i64 = 3600;
+    /// 趋势接口一次要的三样：各桶、整窗口合计、近 60 分钟合计。整窗口合计直接把各桶加起来
+    /// （桶是窗口的划分，不必再扫一遍），近 1 小时另走一次 1 小时的小范围扫描。
+    pub fn cache_report(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        tz_offset_secs: i64,
+    ) -> Result<CacheReport> {
+        let points = self.cache_series(since, bucket_secs, tz_offset_secs)?;
+        let summary = points.iter().fold(CacheBucket::empty(since), |mut acc, b| {
+            acc.input_tokens += b.input_tokens;
+            acc.cached_tokens += b.cached_tokens;
+            acc.written_tokens += b.written_tokens;
+            acc
+        });
+        let now: i64 = self.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let recent = self.cache_summary(now - 3600)?;
+        Ok(CacheReport { points, summary, recent })
+    }
+
+    /// `since` 起到现在的缓存三段 token 合计（一个桶），`ts` 是 `since`。给「近 1 小时」与
+    /// 整个窗口的汇总用。
+    pub fn cache_summary(&self, since: i64) -> Result<CacheBucket> {
+        // 桶宽取一个远大于窗口的数，所有行落进同一个桶；偏移取 since 让桶起点等于 since。
+        let mut rows = self.cache_series(since, 1 << 40, -since)?;
+        Ok(rows
+            .pop()
+            .map(|b| CacheBucket { ts: since, ..b })
+            .unwrap_or_else(|| CacheBucket::empty(since)))
+    }
+
+    /// `since` 起的成功请求（status = 200 且记了 TTFT）的延迟原始行，连同 SQLite 此刻的时钟
+    /// （近 1 小时的窗口按它算，与写入侧同源）。WHERE 与 `idx_usage_logs_latency` 的部分谓词
+    /// 逐字对应，整条查询在索引里走完、不回表；不排序——分桶用 BTreeMap，分位数各桶自己排。
+    fn latency_rows(&self, since: i64) -> Result<(i64, Vec<LatencyRow>)> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT (ts / ?2) * ?2 AS bucket,
-                    CAST(AVG(ttft_ms) AS INTEGER),
-                    COUNT(*)
-               FROM usage_logs
-              WHERE ts >= ?1 AND ttft_ms IS NOT NULL AND status = 200
-              GROUP BY bucket
-              ORDER BY bucket",
-        )?;
-        let rows = stmt.query_map(params![since, BUCKET_SECS], |r| {
-            Ok(TtftBucket { ts: r.get(0)?, avg_ms: r.get(1)?, count: r.get(2)? })
+        let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let mut stmt = conn.prepare(LATENCY_ROWS_SQL)?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(LatencyRow {
+                ts: r.get(0)?,
+                ttft_ms: r.get(1)?,
+                total_ms: r.get(2)?,
+                output_tokens: r.get(3)?,
+            })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok((now, rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    /// 趋势接口一次要的三样：各桶、整窗口、近 60 分钟——同一次扫描分三路汇总，不扫三遍。
+    pub fn ttft_report(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        tz_offset_secs: i64,
+    ) -> Result<TtftReport> {
+        let bucket_secs = bucket_secs.max(1);
+        let (now, rows) = self.latency_rows(since)?;
+        let mut buckets: std::collections::BTreeMap<i64, Vec<LatencyRow>> = Default::default();
+        let mut recent_rows = Vec::new();
+        for r in &rows {
+            let bucket =
+                ((r.ts + tz_offset_secs).div_euclid(bucket_secs)) * bucket_secs - tz_offset_secs;
+            buckets.entry(bucket).or_default().push(*r);
+            if r.ts >= now - 3600 {
+                recent_rows.push(*r);
+            }
+        }
+        Ok(TtftReport {
+            points: buckets.into_iter().map(|(ts, rows)| summarize_latency(ts, &rows)).collect(),
+            summary: summarize_latency(since, &rows),
+            recent: summarize_latency(now - 3600, &recent_rows),
+        })
+    }
+
+    /// TTFT（首字时延）趋势的桶：每桶平均、p50、p95、请求数与输出吞吐。分位数没法从更细
+    /// 的桶合并出来，所以桶宽与时区偏移由调用方按前端要画的格子给（同 [`Self::cache_series`]），
+    /// 在 Rust 里对每桶的原始值排序取分位——30 天量级也就十万级整数，没有压力。
+    #[cfg(test)]
+    pub fn ttft_series(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        tz_offset_secs: i64,
+    ) -> Result<Vec<TtftBucket>> {
+        Ok(self.ttft_report(since, bucket_secs, tz_offset_secs)?.points)
+    }
+
+    /// `since` 起到现在的延迟汇总（一个桶），`ts` 是 `since`。线上走 [`Self::ttft_report`]
+    /// 一次拿齐，这个只给测试核对。
+    #[cfg(test)]
+    pub fn ttft_summary(&self, since: i64) -> Result<TtftBucket> {
+        let (_, rows) = self.latency_rows(since)?;
+        Ok(summarize_latency(since, &rows))
+    }
+
+    /// `since` 起按模型或按账号拆开的用量：每组的请求数、延迟分位与吞吐、缓存三段 token，
+    /// 按请求数降序，最多 `limit` 行。一次把窗口内的原始行拉回来在 Rust 里聚合——分位数在
+    /// SQL 里算不了，而这张表只在打开趋势对话框时查一次。
+    pub fn usage_breakdown(
+        &self,
+        since: i64,
+        by: BreakdownBy,
+        limit: usize,
+    ) -> Result<Vec<BreakdownRow>> {
+        struct Group {
+            label: String,
+            requests: i64,
+            latency: Vec<LatencyRow>,
+            cache: CacheBucket,
+        }
+        let conn = self.conn.lock();
+        let key_expr = match by {
+            BreakdownBy::Model => "COALESCE(u.model, '')",
+            BreakdownBy::Account => "COALESCE(CAST(u.cred_id AS TEXT), '')",
+        };
+        let label_expr = match by {
+            BreakdownBy::Model => "COALESCE(u.model, '')",
+            BreakdownBy::Account => {
+                "COALESCE(c.label, '#' || COALESCE(CAST(u.cred_id AS TEXT), '?'))"
+            }
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key_expr}, {label_expr}, u.ts, u.status, u.ttft_ms, u.total_ms, u.output_tokens,
+                    COALESCE(u.input_tokens, 0)
+                        + COALESCE(u.cache_creation_tokens,
+                                   COALESCE(u.cache_5m_tokens, 0) + COALESCE(u.cache_1h_tokens, 0))
+                        + COALESCE(u.cache_read_tokens, 0),
+                    COALESCE(u.cache_read_tokens, 0),
+                    COALESCE(u.cache_creation_tokens,
+                             COALESCE(u.cache_5m_tokens, 0) + COALESCE(u.cache_1h_tokens, 0))
+               FROM usage_logs u
+               LEFT JOIN credentials c ON c.id = u.cred_id
+              WHERE u.ts >= ?1"
+        ))?;
+        let mut groups: std::collections::HashMap<String, Group> = Default::default();
+        let mut rows = stmt.query([since])?;
+        while let Some(r) = rows.next()? {
+            let key: String = r.get(0)?;
+            let label: String = r.get(1)?;
+            let ts: i64 = r.get(2)?;
+            let status: i64 = r.get(3)?;
+            let ttft_ms: Option<i64> = r.get(4)?;
+            let total_ms: Option<i64> = r.get(5)?;
+            let output_tokens: Option<i64> = r.get(6)?;
+            let input: i64 = r.get(7)?;
+            let cached: i64 = r.get(8)?;
+            let written: i64 = r.get(9)?;
+            let g = groups.entry(key).or_insert_with(|| Group {
+                label,
+                requests: 0,
+                latency: Vec::new(),
+                cache: CacheBucket::empty(since),
+            });
+            g.requests += 1;
+            g.cache.input_tokens += input;
+            g.cache.cached_tokens += cached;
+            g.cache.written_tokens += written;
+            if status == 200
+                && let Some(ttft_ms) = ttft_ms
+            {
+                g.latency.push(LatencyRow { ts, ttft_ms, total_ms, output_tokens });
+            }
+        }
+        let mut out: Vec<BreakdownRow> = groups
+            .into_iter()
+            .map(|(key, g)| BreakdownRow {
+                key,
+                label: g.label,
+                requests: g.requests,
+                latency: summarize_latency(since, &g.latency),
+                cache: g.cache,
+            })
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then_with(|| a.key.cmp(&b.key)));
+        out.truncate(limit);
+        Ok(out)
     }
 
     /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。
@@ -5023,9 +5303,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // - (cred_id, id)：按号翻页是 `cred_id = ? AND id <= ? ORDER BY id DESC`，与索引序完全
     //   一致，取页不必再排序；已有的 (cred_id, ts) 是给按时间聚合用的，排序键不同。
     // - (request_id)：按请求 id 精确查——排查时贴一个 id 进来，不能整表扫。
+    // - 延迟趋势只看成功且记了 TTFT 的行、只读三列：**部分覆盖索引**，30 天的扫描全在索引里
+    //   走、不回表（日志行很宽，回表才是大头）；失败行与没记 TTFT 的行不进索引，写入开销只
+    //   落在成功请求上。
+    // - 缓存趋势按 ts 扫全部行、只读五个 token 列，同样做成覆盖索引。
+    // 这两条引用的列（ttft_ms / total_ms / output_tokens / cache_*）在老库上是上面补出来的，
+    // 放进建表那批会在老库上报「no such column」。
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_id ON usage_logs(cred_id, id);
-         CREATE INDEX IF NOT EXISTS idx_usage_logs_request_id ON usage_logs(request_id);",
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_request_id ON usage_logs(request_id);
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_latency
+             ON usage_logs(ts, ttft_ms, total_ms, output_tokens)
+             WHERE status = 200 AND ttft_ms IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_cache
+             ON usage_logs(ts, input_tokens, cache_creation_tokens, cache_5m_tokens,
+                           cache_1h_tokens, cache_read_tokens);",
     )?;
     // ban_events 的出站设备两列是随 device_id_out 一起加的：先建过表的库幂等补上。
     let _ = conn
@@ -7524,6 +7816,168 @@ mod tests {
             a
         );
         assert_eq!(store.device_count(a).unwrap(), 1);
+    }
+
+    /// 延迟与缓存的趋势口径：分位数按桶内原始值算（nearest-rank）、桶边界按时区偏移切、
+    /// 吞吐只算生成阶段、汇总对整窗口算而不是各桶平均；按模型 / 按账号的拆分同一套数。
+    #[test]
+    fn latency_and_cache_series_use_percentiles_and_local_buckets() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+        let rec = |cred: i64,
+                   model: &str,
+                   status: u16,
+                   ttft: i64,
+                   total: i64,
+                   out: i64,
+                   inp: i64,
+                   read: i64,
+                   write: i64| UsageRecord {
+            cred_id: Some(cred),
+            cred_label: if cred == a { "a".into() } else { "b".into() },
+            model: Some(model.into()),
+            status,
+            has_usage: true,
+            input_tokens: Some(inp),
+            output_tokens: Some(out),
+            cache_creation_tokens: Some(write),
+            cache_read_tokens: Some(read),
+            ttft_ms: Some(ttft),
+            total_ms: Some(total),
+            ..Default::default()
+        };
+        // 最近半小时：opus 五条成功（TTFT 100..500，吞吐 1000 token / 1s），一条失败（不进延迟）。
+        for (i, ttft) in [100i64, 200, 300, 400, 500].iter().enumerate() {
+            store
+                .insert_usage_log_at(
+                    &rec(a, "claude-opus-5", 200, *ttft, ttft + 1000, 1000, 100, 60, 20),
+                    Some(now - 600 - i as i64),
+                )
+                .unwrap();
+        }
+        store
+            .insert_usage_log_at(
+                &rec(a, "claude-opus-5", 500, 9000, 9000, 0, 100, 0, 0),
+                Some(now - 500),
+            )
+            .unwrap();
+        // 三小时前：sonnet 在 b 上一条慢的，没有缓存。
+        store
+            .insert_usage_log_at(
+                &rec(b, "claude-sonnet-5", 200, 4000, 4000, 0, 100, 0, 0),
+                Some(now - 3 * 3600),
+            )
+            .unwrap();
+
+        // 分位数：p50 = 300、p95 = 500（nearest-rank：ceil(5×0.95)=5）、平均 300；吞吐 1000 tok/s。
+        let recent = store.ttft_summary(now - 3600).unwrap();
+        assert_eq!((recent.count, recent.p50_ms, recent.p95_ms, recent.avg_ms), (5, 300, 500, 300));
+        assert!(
+            (recent.tokens_per_sec.unwrap() - 1000.0).abs() < 1e-6,
+            "{:?}",
+            recent.tokens_per_sec
+        );
+        // 整窗口（含三小时前那条）：六条，p50 取第 3 个 = 300，p95 取第 6 个 = 4000。
+        let all = store.ttft_summary(now - 6 * 3600).unwrap();
+        assert_eq!((all.count, all.p50_ms, all.p95_ms), (6, 300, 4000));
+        assert_eq!(all.ts, now - 6 * 3600);
+        // 逐小时桶：两个桶，慢的那条在自己的桶里；桶起点按偏移对齐。
+        let hourly = store.ttft_series(now - 6 * 3600, 3600, 0).unwrap();
+        assert_eq!(hourly.len(), 2, "{hourly:?}");
+        assert_eq!(hourly[0].count, 1);
+        assert_eq!(hourly[0].p95_ms, 4000);
+        assert_eq!(hourly[0].tokens_per_sec, None, "没有输出 token 就没有吞吐");
+        assert_eq!(hourly[0].ts % 3600, 0);
+        let tz = 8 * 3600;
+        let shifted = store.ttft_series(now - 6 * 3600, 86400, tz).unwrap();
+        assert!(
+            shifted.iter().all(|b| (b.ts + tz) % 86400 == 0),
+            "日桶边界落在本地零点: {shifted:?}"
+        );
+        // 一次扫描出三样，与分开算的一致。
+        let report = store.ttft_report(now - 6 * 3600, 3600, 0).unwrap();
+        assert_eq!(report.points.len(), 2);
+        assert_eq!((report.summary.count, report.summary.p95_ms), (6, 4000));
+        assert_eq!((report.recent.count, report.recent.p50_ms), (5, 300));
+        // 一个空集：全零、吞吐 None。
+        let none = store.ttft_summary(now + 10).unwrap();
+        assert_eq!((none.count, none.p50_ms), (0, 0));
+        assert_eq!(none.tokens_per_sec, None);
+
+        // 缓存：近一小时六条（含失败那条）输入 6×180 = 1080（100 裸 + 60 命中 + 20 写入 各五条，
+        // 失败那条 100）——五条各 180、一条 100 → 1000；命中 300、写入 100。
+        let cache = store.cache_summary(now - 3600).unwrap();
+        assert_eq!(
+            (cache.input_tokens, cache.cached_tokens, cache.written_tokens),
+            (1000, 300, 100)
+        );
+        assert_eq!(cache.ts, now - 3600);
+        let cache_all = store.cache_summary(now - 6 * 3600).unwrap();
+        assert_eq!(cache_all.input_tokens, 1100);
+        let cache_hourly = store.cache_series(now - 6 * 3600, 3600, 0).unwrap();
+        assert_eq!(cache_hourly.len(), 2);
+        assert_eq!(cache_hourly[1].written_tokens, 100);
+        let cache_none = store.cache_summary(now + 10).unwrap();
+        assert_eq!(cache_none.input_tokens, 0);
+        let cache_report = store.cache_report(now - 6 * 3600, 3600, 0).unwrap();
+        assert_eq!(cache_report.points.len(), 2);
+        assert_eq!(cache_report.summary.input_tokens, 1100, "合计是各桶之和");
+        assert_eq!(cache_report.recent.cached_tokens, 300);
+
+        // 两条趋势查询都要走覆盖索引、不回表：日志行很宽，回表才是 30 天扫描的大头。
+        let plan = |sql: &str| -> String {
+            let conn = store.conn.lock();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map([0i64], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let latency_plan = plan(LATENCY_ROWS_SQL);
+        assert!(
+            latency_plan.contains("COVERING INDEX idx_usage_logs_latency"),
+            "延迟行要走部分覆盖索引: {latency_plan}"
+        );
+        let cache_plan = plan(
+            "SELECT (ts / 3600) * 3600, SUM(COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, \
+                     COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0)) + COALESCE(cache_read_tokens, 0)) \
+               FROM usage_logs WHERE ts >= ?1 GROUP BY 1",
+        );
+        assert!(
+            cache_plan.contains("COVERING INDEX idx_usage_logs_cache"),
+            "缓存序列要走覆盖索引: {cache_plan}"
+        );
+
+        // 拆分：按模型请求数降序（opus 6 条在前），延迟只算成功的；按账号带 label，limit 生效。
+        let by_model = store.usage_breakdown(now - 6 * 3600, BreakdownBy::Model, 10).unwrap();
+        assert_eq!(by_model.len(), 2);
+        assert_eq!(by_model[0].key, "claude-opus-5");
+        assert_eq!(by_model[0].requests, 6);
+        assert_eq!((by_model[0].latency.count, by_model[0].latency.p50_ms), (5, 300));
+        assert_eq!(by_model[0].cache.cached_tokens, 300);
+        assert_eq!(by_model[1].key, "claude-sonnet-5");
+        assert_eq!(by_model[1].latency.p95_ms, 4000);
+        let by_account = store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 10).unwrap();
+        assert_eq!(by_account[0].key, a.to_string());
+        assert_eq!(by_account[0].label, "a");
+        assert_eq!(by_account[1].label, "b");
+        assert_eq!(
+            store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 1).unwrap().len(),
+            1
+        );
+        // 删掉的号：label 退成 #id。
+        assert!(store.delete(b).unwrap());
+        // delete 连带清了 b 的用量日志，所以再插一条无主的来验 label 兜底。
+        store
+            .insert_usage_log_at(
+                &rec(b, "claude-sonnet-5", 200, 10, 20, 1, 1, 0, 0),
+                Some(now - 100),
+            )
+            .unwrap();
+        let orphan = store.usage_breakdown(now - 3600, BreakdownBy::Account, 10).unwrap();
+        assert!(orphan.iter().any(|r| r.label == format!("#{b}")), "{orphan:?}");
     }
 
     fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {

@@ -23,16 +23,8 @@ import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
-import {
-  CacheHitSparkline,
-  aggregateCacheHitRate,
-  cacheTotalsText,
-} from '@/components/cache-hit-chart'
-import {
-  CacheHitTrendDialog,
-  DEFAULT_CACHE_RANGE,
-  useCacheSeries,
-} from '@/components/cache-hit-trend-dialog'
+import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
+import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
 import {
@@ -51,13 +43,13 @@ import {
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import {
-  DEFAULT_TTFT_RANGE,
   TtftSparkline,
   TtftTrendDialog,
-  aggregateTtft,
   formatMs,
+  formatTokensPerSec,
   useTtftSeries,
 } from '@/components/ttft-trend-dialog'
+import type { CacheSeriesPoint, TtftSeriesPoint } from '@/api/metrics'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -89,7 +81,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
-import { cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
+import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -387,12 +379,50 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
   const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: getMetrics, refetchInterval: 10_000 })
-  const cacheSeries = useCacheSeries(DEFAULT_CACHE_RANGE)
-  const poolCache = aggregateCacheHitRate(cacheSeries.slots)
+  // 两枚质量卡片各拉两条线：近 24 小时逐小时（迷你线 + 近 1 小时的主数）与近 7 天（基线）。
+  // 主数是「现在」，基线是「平时」——7 天平均看不出今天有没有变慢，一比就看出来了。
+  const cacheSeries = useCacheSeries('24h')
+  const cacheBaseline = useCacheSeries('7d')
   const [cacheTrendOpen, setCacheTrendOpen] = useState(false)
-  const ttftSeries = useTtftSeries(DEFAULT_TTFT_RANGE)
-  const poolTtft = aggregateTtft(ttftSeries.slots)
+  const ttftSeries = useTtftSeries('24h')
+  const ttftBaseline = useTtftSeries('7d')
   const [ttftTrendOpen, setTtftTrendOpen] = useState(false)
+  // 近 1 小时没请求就退回 24 小时，24 小时也没有再退回 7 天，标签跟着写清是哪个窗口。
+  const cacheNow = (() => {
+    const pick = (p: CacheSeriesPoint | null, label: [string, string]) =>
+      p && p.input_tokens > 0 ? { p, label } : null
+    return (
+      pick(cacheSeries.recent, ['近 1h', 'last 1h'])
+      ?? pick(cacheSeries.summary, ['近 24h', 'last 24h'])
+      ?? pick(cacheBaseline.summary, ['近 7d', 'last 7d'])
+    )
+  })()
+  const cacheRate = cacheNow ? cacheHitRate(cacheNow.p.input_tokens, cacheNow.p.cached_tokens) : null
+  const cacheBase = cacheBaseline.summary && cacheBaseline.summary.input_tokens > 0
+    ? cacheHitRate(cacheBaseline.summary.input_tokens, cacheBaseline.summary.cached_tokens)
+    : null
+  const ttftNow = (() => {
+    const pick = (p: TtftSeriesPoint | null, label: [string, string]) =>
+      p && p.count > 0 ? { p, label } : null
+    return (
+      pick(ttftSeries.recent, ['近 1h', 'last 1h'])
+      ?? pick(ttftSeries.summary, ['近 24h', 'last 24h'])
+      ?? pick(ttftBaseline.summary, ['近 7d', 'last 7d'])
+    )
+  })()
+  const ttftBase = ttftBaseline.summary && ttftBaseline.summary.count > 0 ? ttftBaseline.summary : null
+  // 颜色看「现在比平时慢了多少」：慢一半黄、慢一倍红；没有基线时按绝对值（3s / 8s）。
+  const ttftTone = (() => {
+    if (!ttftNow) return 'neutral' as const
+    const now = ttftNow.p.p50_ms
+    if (ttftBase) {
+      const ratio = now / Math.max(1, ttftBase.p50_ms)
+      if (ratio >= 2 || now > 8000) return 'bad' as const
+      if (ratio >= 1.5 || now > 3000) return 'warn' as const
+      return 'ok' as const
+    }
+    return now <= 3000 ? ('ok' as const) : now <= 8000 ? ('warn' as const) : ('bad' as const)
+  })()
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   const filterItems = useMemo(
@@ -981,42 +1011,55 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 请求质量如何」。摆在实时流量左边：三格都是流量的属性，凑在一起读。 */}
             <OverviewMetric
               className="border-b lg:border-r lg:border-b-0"
-              label={t('缓存命中率 · 7d', 'Cache hit rate · 7d')}
-              value={formatPercent(poolCache.rate)}
+              label={cacheNow
+                ? t(`缓存命中率 · ${cacheNow.label[0]}`, `Cache hit rate · ${cacheNow.label[1]}`)
+                : t('缓存命中率', 'Cache hit rate')}
+              value={formatPercent(cacheRate)}
               trend={
-                poolCache.rate == null ? undefined : (
+                cacheRate == null ? undefined : (
                   <CacheHitSparkline slots={cacheSeries.slots} className="shrink-0" />
                 )
               }
-              status={poolCache.rate == null ? t('暂无用量', 'No usage yet') : undefined}
-              statusHint={poolCache.rate == null
-                ? undefined
-                : t(
-                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)}（按 token 加权，不是各账号命中率的平均）。点开看趋势。`,
-                    `${cacheTotalsText(poolCache.cachedTokens, poolCache.inputTokens, t)} (token-weighted, not an average of per-account rates). Click for the trend.`,
-                  )}
+              status={cacheRate == null
+                ? t('暂无用量', 'No usage yet')
+                : cacheBase == null
+                  ? undefined
+                  : t(`7d ${formatPercent(cacheBase)}`, `7d ${formatPercent(cacheBase)}`)}
+              statusHint={cacheNow
+                ? t(
+                    `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
+                    `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
+                  )
+                : undefined}
               icon={DatabaseZapIcon}
-              tone={poolCache.rate == null ? 'neutral' : poolCache.rate >= 0.5 ? 'ok' : 'warn'}
+              tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
               onClick={() => setCacheTrendOpen(true)}
             />
             <OverviewMetric
               className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
-              label={t('首字时延 · 7d', 'TTFT · 7d')}
-              value={formatMs(poolTtft.avgMs)}
+              label={ttftNow
+                ? t(`首字时延 p50 · ${ttftNow.label[0]}`, `TTFT p50 · ${ttftNow.label[1]}`)
+                : t('首字时延', 'TTFT')}
+              value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
               trend={
-                poolTtft.avgMs == null ? undefined : (
+                ttftNow == null ? undefined : (
                   <TtftSparkline slots={ttftSeries.slots} className="shrink-0" />
                 )
               }
-              status={poolTtft.avgMs == null ? t('暂无数据', 'No data yet') : undefined}
-              statusHint={poolTtft.avgMs == null
-                ? undefined
+              status={ttftNow == null
+                ? t('暂无数据', 'No data yet')
                 : t(
-                    `近 7 天成功请求的平均首字时延，共 ${formatNumber(poolTtft.totalCount)} 次请求。点开看趋势。`,
-                    `Average time to first token over the last 7 days, across ${formatNumber(poolTtft.totalCount)} successful requests. Click for the trend.`,
+                    `p95 ${formatMs(ttftNow.p.p95_ms)}${ttftBase ? ` · 7d ${formatMs(ttftBase.p50_ms)}` : ''}`,
+                    `p95 ${formatMs(ttftNow.p.p95_ms)}${ttftBase ? ` · 7d ${formatMs(ttftBase.p50_ms)}` : ''}`,
                   )}
+              statusHint={ttftNow
+                ? t(
+                    `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
+                    `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
+                  )
+                : undefined}
               icon={TimerIcon}
-              tone={poolTtft.avgMs == null ? 'neutral' : poolTtft.avgMs <= 3000 ? 'ok' : poolTtft.avgMs <= 8000 ? 'warn' : 'bad'}
+              tone={ttftTone}
               onClick={() => setTtftTrendOpen(true)}
             />
             <LiveTrafficMetric

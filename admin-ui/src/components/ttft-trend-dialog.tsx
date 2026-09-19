@@ -19,35 +19,71 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import { UsageBreakdown } from '@/components/usage-breakdown'
+import type { TtftSeriesPoint } from '@/api/metrics'
 
-const TTFT_RANGES = {
-  '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity },
-  '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity },
-  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity },
+/** 汇总条里的一格：p50 大字，p95 / 平均 / 请求数 / 吞吐小字。没有请求时只写「无请求」。 */
+function SummaryCard({
+  label,
+  stats,
+  t,
+  locale,
+}: {
+  label: string
+  stats: TtftSeriesPoint | null
+  t: (zh: string, en: string) => string
+  locale: string
+}) {
+  const empty = !stats || stats.count === 0
+  return (
+    <div className="rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
+      <p className="text-2xs font-medium text-muted-foreground">{label}</p>
+      <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <p className="text-2xl font-semibold leading-none tabular-nums">{empty ? '—' : formatMs(stats.p50_ms)}</p>
+        <p className="text-2xs text-muted-foreground tabular-nums">
+          {empty
+            ? t('无请求', 'No requests')
+            : t(
+                `p95 ${formatMs(stats.p95_ms)} · 平均 ${formatMs(stats.avg_ms)} · ${stats.count.toLocaleString(locale)} 次 · ${formatTokensPerSec(stats.tokens_per_sec)}`,
+                `p95 ${formatMs(stats.p95_ms)} · avg ${formatMs(stats.avg_ms)} · ${stats.count.toLocaleString(locale)} requests · ${formatTokensPerSec(stats.tokens_per_sec)}`,
+              )}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+/** 桶宽随格子走：逐小时一格 3600 秒，逐天一格 86400 秒——分位数没法从更细的桶合并。 */
+export const TTFT_RANGES = {
+  '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
+  '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
+  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
 } as const
 
-type TtftRangeKey = keyof typeof TTFT_RANGES
+export type TtftRangeKey = keyof typeof TTFT_RANGES
 
-export const DEFAULT_TTFT_RANGE: TtftRangeKey = '7d'
+/** 默认看近 24 小时：先看今天怎么样，7 天与 30 天是往回翻。 */
+export const DEFAULT_TTFT_RANGE: TtftRangeKey = '24h'
 
 export function useTtftSeries(range: TtftRangeKey, enabled = true) {
   const preset = TTFT_RANGES[range]
   const query = useQuery({
-    queryKey: ['ttft-series', preset.hours],
-    queryFn: () => getTtftSeries(preset.hours),
+    queryKey: ['ttft-series', preset.hours, preset.bucketSecs],
+    queryFn: () => getTtftSeries({ hours: preset.hours, bucketSecs: preset.bucketSecs }),
     enabled,
     refetchInterval: 60_000,
     placeholderData: keepPreviousData,
   })
   const slots = bucketTtftSeries(query.data?.points ?? [], preset.granularity, preset.slots)
-  return { query, slots, granularity: preset.granularity }
-}
-
-export function aggregateTtft(slots: TtftSlot[]): { avgMs: number | null; totalCount: number } {
-  const totalCount = slots.reduce((sum, s) => sum + s.count, 0)
-  if (totalCount === 0) return { avgMs: null, totalCount: 0 }
-  const weightedSum = slots.reduce((sum, s) => sum + s.avgMs * s.count, 0)
-  return { avgMs: Math.round(weightedSum / totalCount), totalCount }
+  return {
+    query,
+    slots,
+    granularity: preset.granularity,
+    /** 整个窗口的分位与吞吐（后端对整窗口原始值算的，不是各格平均）。 */
+    summary: query.data?.summary ?? null,
+    /** 近 60 分钟。 */
+    recent: query.data?.recent ?? null,
+  }
 }
 
 /** 毫秒 → `842ms` / `4.0s`。 */
@@ -55,6 +91,12 @@ export function formatMs(ms: number | null): string {
   if (ms == null) return '—'
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+/** 吞吐 → `42 tok/s`；没有可算的请求时 `—`。 */
+export function formatTokensPerSec(tps: number | null | undefined): string {
+  if (tps == null) return '—'
+  return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`
 }
 
 function slotReadout(
@@ -74,8 +116,11 @@ function slotReadout(
   return {
     when,
     axis,
-    value: formatMs(slot.avgMs),
-    detail: t(`${slot.count.toLocaleString(locale)} 次请求`, `${slot.count.toLocaleString(locale)} requests`),
+    value: formatMs(slot.p50Ms),
+    detail: t(
+      `p95 ${formatMs(slot.p95Ms)} · 平均 ${formatMs(slot.avgMs)} · ${slot.count.toLocaleString(locale)} 次 · ${formatTokensPerSec(slot.tokensPerSec)}`,
+      `p95 ${formatMs(slot.p95Ms)} · avg ${formatMs(slot.avgMs)} · ${slot.count.toLocaleString(locale)} requests · ${formatTokensPerSec(slot.tokensPerSec)}`,
+    ),
   }
 }
 
@@ -98,8 +143,9 @@ function TtftColumns({
   const [active, setActive] = useState<number | null>(null)
   const step = tickStep(slots.length)
   const readouts = slots.map((s) => slotReadout(s, granularity, t, locale))
-  const maxAvg = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.avgMs))
-  const yMax = maxAvg > 0 ? Math.ceil(maxAvg / 1000) * 1000 : 5000
+  // 纵轴按 p95 定顶，p50 的柱子才不会被 p95 的刻度线顶出图外。
+  const maxP95 = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.p95Ms))
+  const yMax = maxP95 > 0 ? Math.ceil(maxP95 / 1000) * 1000 : 5000
 
   return (
     <div className={cn('transition-opacity', refetching && 'opacity-60', className)}>
@@ -122,8 +168,12 @@ function TtftColumns({
             ))}
             <div className="absolute inset-0 flex items-end">
               {slots.map((slot, i) => {
+                // 柱子是 p50，柱顶上方一道短横线是 p95：两者的距离就是长尾有多长。
                 const heightPct = slot.hasTraffic && yMax > 0
-                  ? Math.min(100, (slot.avgMs / yMax) * 100)
+                  ? Math.min(100, (slot.p50Ms / yMax) * 100)
+                  : null
+                const p95Pct = slot.hasTraffic && yMax > 0
+                  ? Math.min(100, (slot.p95Ms / yMax) * 100)
                   : null
                 return (
                   <div
@@ -155,6 +205,13 @@ function TtftColumns({
                         aria-hidden
                         className="relative w-full max-w-6 rounded-t bg-chart-2"
                         style={{ height: `max(0.125rem, ${heightPct}%)` }}
+                      />
+                    )}
+                    {p95Pct != null && (
+                      <span
+                        aria-hidden
+                        className="absolute left-1/2 h-0.5 w-full max-w-6 -translate-x-1/2 rounded-full bg-chart-2/50"
+                        style={{ bottom: `${p95Pct}%` }}
                       />
                     )}
                   </div>
@@ -230,8 +287,11 @@ function TtftTable({
             <th scope="col" className="text-start">
               {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}
             </th>
-            <th scope="col" className="text-end">{t('平均首字', 'Avg TTFT')}</th>
+            <th scope="col" className="text-end">p50</th>
+            <th scope="col" className="text-end">p95</th>
+            <th scope="col" className="text-end">{t('平均', 'Avg')}</th>
             <th scope="col" className="text-end">{t('请求数', 'Requests')}</th>
+            <th scope="col" className="text-end">{t('吞吐', 'Throughput')}</th>
           </tr>
         </thead>
         <tbody>
@@ -240,10 +300,13 @@ function TtftTable({
             return (
               <tr key={slot.ts} className="[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0">
                 <td className="whitespace-nowrap tabular-nums">{r.when}</td>
-                <td className="whitespace-nowrap text-end font-medium tabular-nums">{r.value}</td>
+                <td className="whitespace-nowrap text-end font-medium tabular-nums">{formatMs(slot.p50Ms)}</td>
+                <td className="whitespace-nowrap text-end tabular-nums">{formatMs(slot.p95Ms)}</td>
+                <td className="whitespace-nowrap text-end tabular-nums text-muted-foreground">{formatMs(slot.avgMs)}</td>
                 <td className="whitespace-nowrap text-end tabular-nums">
                   {slot.count.toLocaleString(locale)}
                 </td>
+                <td className="whitespace-nowrap text-end tabular-nums">{formatTokensPerSec(slot.tokensPerSec)}</td>
               </tr>
             )
           })}
@@ -253,14 +316,14 @@ function TtftTable({
   )
 }
 
-/** 概览那一格里的迷你趋势。 */
+/** 概览那一格里的迷你趋势（p50）。 */
 export function TtftSparkline({ slots, className }: { slots: TtftSlot[]; className?: string }) {
-  const maxAvg = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.avgMs))
+  const maxP50 = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.p50Ms))
   return (
     <span aria-hidden className={cn('flex h-5 items-end gap-px', className)}>
       {slots.map((slot, i) => {
-        const heightPct = slot.hasTraffic && maxAvg > 0
-          ? Math.min(100, (slot.avgMs / maxAvg) * 100)
+        const heightPct = slot.hasTraffic && maxP50 > 0
+          ? Math.min(100, (slot.p50Ms / maxP50) * 100)
           : null
         const last = i === slots.length - 1
         return (
@@ -289,9 +352,9 @@ export function TtftTrendDialog({
   const titleRef = useRef<HTMLHeadingElement>(null)
   const [range, setRange] = useState<TtftRangeKey>(DEFAULT_TTFT_RANGE)
   const [view, setView] = useState<'chart' | 'table'>('chart')
-  const { query, slots, granularity } = useTtftSeries(range, open)
-  const agg = aggregateTtft(slots)
+  const { query, slots, granularity, summary, recent } = useTtftSeries(range, open)
   const hasTraffic = slots.some((s) => s.hasTraffic)
+  const preset = TTFT_RANGES[range]
 
   const rangeLabel: Record<TtftRangeKey, string> = {
     '24h': t('近 24 小时', 'Last 24 hours'),
@@ -317,8 +380,8 @@ export function TtftTrendDialog({
               </div>
               <DialogDescription className="mt-1">
                 {t(
-                  '上游首个 token 到达的平均耗时（仅统计成功请求）。',
-                  'Average time to first token from upstream (successful requests only).',
+                  '上游首个 token 到达的耗时，按 p50 / p95 看（仅统计成功请求）；吞吐是首字之后的输出速度。',
+                  'Time to first token from upstream as p50 / p95 (successful requests only); throughput is the output speed after the first token.',
                 )}
               </DialogDescription>
             </div>
@@ -365,15 +428,20 @@ export function TtftTrendDialog({
             </ToggleGroup>
           </div>
 
-          <section className="flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
-            <p className="text-2xs font-medium text-muted-foreground">{rangeLabel[range]}</p>
-            <p className="text-2xl font-semibold leading-none">{formatMs(agg.avgMs)}</p>
-            <p className="text-2xs text-muted-foreground tabular-nums">
-              {t(
-                `共 ${agg.totalCount.toLocaleString(locale)} 次请求`,
-                `${agg.totalCount.toLocaleString(locale)} requests total`,
-              )}
-            </p>
+          {/* 汇总条：左边整个窗口，右边近 1 小时——「现在」和「基线」并排，一眼看出今天是不是变慢了。 */}
+          <section className="grid gap-2 sm:grid-cols-2">
+            <SummaryCard
+              label={rangeLabel[range]}
+              stats={summary}
+              t={t}
+              locale={locale}
+            />
+            <SummaryCard
+              label={t('近 1 小时', 'Last hour')}
+              stats={recent}
+              t={t}
+              locale={locale}
+            />
           </section>
 
           {query.error ? (
@@ -408,10 +476,12 @@ export function TtftTrendDialog({
 
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '首字时延（TTFT）= 上游返回第一个 token 的耗时。空着的格子是那个时段没有成功请求。请求明细只保留 30 天。',
-              'TTFT = time to first token from upstream. A gap means no successful requests in that period. Request logs are kept for 30 days.',
+              '柱子是 p50，柱顶上方的短横线是 p95，两者的距离就是长尾。空着的格子是那个时段没有成功请求。请求明细只保留 30 天。',
+              'Bars are p50; the short line above each bar is p95, and the gap between them is the tail. A gap means no successful requests in that period. Request logs are kept for 30 days.',
             )}
           </p>
+
+          <UsageBreakdown hours={preset.hours} kind="latency" />
         </DialogPanel>
       </DialogPopup>
     </Dialog>

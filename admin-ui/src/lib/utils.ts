@@ -469,6 +469,7 @@ export interface CacheSlot {
   ts: number
   inputTokens: number
   cachedTokens: number
+  writtenTokens: number
   hasTraffic: boolean
 }
 
@@ -476,7 +477,7 @@ export interface CacheSlot {
  * 把后端那串逐小时的点铺成**连续的**若干格。补齐空格、按本地时区合「天」。
  */
 export function bucketCacheSeries(
-  points: readonly { ts: number; input_tokens: number; cached_tokens: number }[],
+  points: readonly { ts: number; input_tokens: number; cached_tokens: number; written_tokens?: number }[],
   granularity: CacheGranularity,
   slots: number,
   nowMs: number = Date.now(),
@@ -503,6 +504,7 @@ export function bucketCacheSeries(
     ts,
     inputTokens: 0,
     cachedTokens: 0,
+    writtenTokens: 0,
     hasTraffic: false,
   }))
   const indexOf = new Map(starts.map((ts, i) => [ts, i]))
@@ -515,6 +517,7 @@ export function bucketCacheSeries(
     if (i == null) continue
     out[i].inputTokens += p.input_tokens
     out[i].cachedTokens += p.cached_tokens
+    out[i].writtenTokens += p.written_tokens ?? 0
     out[i].hasTraffic = true
   }
   return out
@@ -524,13 +527,27 @@ export function bucketCacheSeries(
 export interface TtftSlot {
   ts: number
   avgMs: number
+  p50Ms: number
+  p95Ms: number
   count: number
+  tokensPerSec: number | null
   hasTraffic: boolean
 }
 
-/** 把后端那串逐小时的 TTFT 点铺成连续的若干格。 */
+/**
+ * 把后端的 TTFT 点铺成连续的若干格。后端已按前端要画的格子切桶（桶宽与时区偏移随请求
+ * 传过去），正常一格只落一个点；真落了两个点（极少，时区切换那天）分位数按请求数加权
+ * 合并——那是近似，只影响那一格。
+ */
 export function bucketTtftSeries(
-  points: readonly { ts: number; avg_ms: number; count: number }[],
+  points: readonly {
+    ts: number
+    avg_ms: number
+    p50_ms?: number
+    p95_ms?: number
+    count: number
+    tokens_per_sec?: number | null
+  }[],
   granularity: CacheGranularity,
   slots: number,
   nowMs: number = Date.now(),
@@ -556,7 +573,10 @@ export function bucketTtftSeries(
   const out: TtftSlot[] = starts.map((ts) => ({
     ts,
     avgMs: 0,
+    p50Ms: 0,
+    p95Ms: 0,
     count: 0,
+    tokensPerSec: null,
     hasTraffic: false,
   }))
   const indexOf = new Map(starts.map((ts, i) => [ts, i]))
@@ -568,9 +588,15 @@ export function bucketTtftSeries(
     const i = indexOf.get(key)
     if (i == null) continue
     const slot = out[i]
-    const prevTotal = slot.avgMs * slot.count
+    const prevCount = slot.count
+    const weighted = (prev: number, next: number) =>
+      slot.count > 0 ? Math.round((prev * prevCount + next * p.count) / slot.count) : 0
     slot.count += p.count
-    slot.avgMs = slot.count > 0 ? Math.round((prevTotal + p.avg_ms * p.count) / slot.count) : 0
+    slot.avgMs = weighted(slot.avgMs, p.avg_ms)
+    slot.p50Ms = weighted(slot.p50Ms, p.p50_ms ?? p.avg_ms)
+    slot.p95Ms = weighted(slot.p95Ms, p.p95_ms ?? p.avg_ms)
+    // 吞吐是比值，两格合并时取后到的那个非空值（正常一格只有一个点）。
+    slot.tokensPerSec = p.tokens_per_sec ?? slot.tokensPerSec
     slot.hasTraffic = true
   }
   return out
