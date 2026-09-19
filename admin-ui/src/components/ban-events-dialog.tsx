@@ -30,7 +30,7 @@ import { toastManager } from '@/components/ui/toast'
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
-import { RequestIdChip, statusVariant } from '@/components/credential-usage-dialog'
+import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 
 /** 冻结流水每页条数可选值。后端上限 1000。 */
 const PAGE_SIZES = [25, 50, 100] as const

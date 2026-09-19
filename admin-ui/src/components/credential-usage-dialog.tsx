@@ -1,21 +1,22 @@
 import { useRef, useState } from 'react'
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CopyIcon, RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
+import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
-  copyText,
   displayCredentialLabel,
   extractError,
   formatFullTime,
   formatUsd,
   parseSessionKey,
 } from '@/lib/utils'
+import { RequestLookupDialog } from '@/components/request-lookup-dialog'
+import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge, type BadgeProps } from '@/components/ui/badge'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -50,7 +51,6 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
-import { toastManager } from '@/components/ui/toast'
 import {
   Table,
   TableBody,
@@ -63,14 +63,6 @@ import {
 
 /** 每页条数可选值。后端上限 200。 */
 const PAGE_SIZES = [25, 50, 100] as const
-
-/** 状态码 → 徽章配色。2xx 成功、429 单独一档（额度问题，不是错误），其余 4xx/5xx 红。 */
-export function statusVariant(status: number): BadgeProps['variant'] {
-  if (status >= 200 && status < 300) return 'success'
-  if (status === 429) return 'warning'
-  if (status >= 400) return 'error'
-  return 'secondary'
-}
 
 /**
  * 流水时间：日期 + 到秒的时钟。
@@ -112,6 +104,13 @@ export function CredentialUsageDialog({
    */
   const anchor = useRef<number | null>(null)
   const wideEnoughForTable = useMediaQuery('(min-width: 64rem)')
+  /**
+   * 点开了哪条请求的查询弹窗（请求 id）。
+   *
+   * 记 id 而不是一个开关：换一条就是换一次挂载，弹窗按初值直接开查，不必再同步内部状态
+   * （见 [RequestLookupDialog] 的 `initialId`）。关掉即置空，不常驻。
+   */
+  const [lookupId, setLookupId] = useState<string | null>(null)
 
   const usage = useQuery({
     queryKey: ['credential-usage', cred.id, page, pageSize],
@@ -254,12 +253,14 @@ export function CredentialUsageDialog({
                   credentialLabel={credentialLabel}
                   descriptionId={retentionNoteId}
                   loading={usage.isFetching}
+                  onLookup={setLookupId}
                 />
               ) : (
                 <UsageCards
                   rows={rows}
                   credentialLabel={credentialLabel}
                   loading={usage.isFetching}
+                  onLookup={setLookupId}
                 />
               )}
 
@@ -345,6 +346,15 @@ export function CredentialUsageDialog({
           <DialogClose render={<Button variant="outline" />}>{t('关闭', 'Close')}</DialogClose>
         </DialogFooter>
       </DialogPopup>
+      {/* 点某一行的请求 id 开出来的查询弹窗：直接查那一条（`initialId`），输入框仍在，看完
+          可以顺手换个 id 或贴一个会话 id 再查。没点过就不挂。 */}
+      {lookupId && (
+        <RequestLookupDialog
+          open
+          initialId={lookupId}
+          onOpenChange={(next) => { if (!next) setLookupId(null) }}
+        />
+      )}
     </Dialog>
   )
 }
@@ -359,10 +369,13 @@ function UsageCards({
   rows,
   credentialLabel,
   loading,
+  onLookup,
 }: {
   rows: UsageLog[]
   credentialLabel: string
   loading: boolean
+  /** 点某一行的请求 id：带着它开请求查询弹窗，见 [CredentialUsageDialog] 里那段。 */
+  onLookup: (id: string) => void
 }) {
   const { t, language, locale } = useI18n()
   const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
@@ -422,7 +435,7 @@ function UsageCards({
                 </span>
               </LogFact>
               <LogFact label={t('请求 ID', 'Request ID')}>
-                <RequestIdChip id={log.request_id} />
+                <RequestIdChip id={log.request_id} onOpen={onLookup} />
               </LogFact>
               {/* 会话：模拟路径且没有设备身份的请求才有对话键，其余退到上游那个 session_id
                   （按槽位派生、对话之间复用），两者都在悬浮提示里。 */}
@@ -461,11 +474,14 @@ function UsageTable({
   credentialLabel,
   descriptionId,
   loading,
+  onLookup,
 }: {
   rows: UsageLog[]
   credentialLabel: string
   descriptionId: string
   loading: boolean
+  /** 点某一行的请求 id：带着它开请求查询弹窗，见 [CredentialUsageDialog] 里那段。 */
+  onLookup: (id: string) => void
 }) {
   const { t, language, locale } = useI18n()
   return (
@@ -623,7 +639,7 @@ function UsageTable({
                 {log.device_id_out?.slice(0, 8) ?? '—'}
               </TableCell>
               <TableCell className="whitespace-nowrap">
-                <RequestIdChip id={log.request_id} />
+                <RequestIdChip id={log.request_id} onOpen={onLookup} />
               </TableCell>
               <UaCell ua={log.ua} uaOut={log.ua_out} />
             </TableRow>
@@ -631,35 +647,6 @@ function UsageTable({
         })}
       </TableBody>
     </Table>
-  )
-}
-
-/**
- * 请求 id：默认只显示尾部 8 位（来访沿用的 id 可能长达 128 位，表格里放不下），完整值在 title 里，
- * 点击复制整串。`full` 时整串显示（查询结果页有的是横向空间）。旧记录没有 id 时显示占位。
- */
-export function RequestIdChip({ id, full = false }: { id: string | null; full?: boolean }) {
-  const { t } = useI18n()
-  if (!id) return <span className="text-muted-foreground">—</span>
-  const shown = full || id.length <= 12 ? id : `…${id.slice(-8)}`
-  const copy = async () => {
-    const ok = await copyText(id)
-    toastManager.add({
-      title: ok ? t('已复制请求 ID', 'Request ID copied') : t('复制失败', 'Copy failed'),
-      description: ok ? id : undefined,
-      type: ok ? 'success' : 'error',
-    })
-  }
-  return (
-    <button
-      type="button"
-      className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere]"
-      title={`${id}\n${t('点击复制', 'Click to copy')}`}
-      onClick={copy}
-    >
-      <span className={full ? '' : 'truncate'}>{shown}</span>
-      <CopyIcon aria-hidden className="size-3 shrink-0 text-muted-foreground" />
-    </button>
   )
 }
 

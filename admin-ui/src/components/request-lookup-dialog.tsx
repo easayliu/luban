@@ -17,7 +17,7 @@ import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
-import { RequestIdChip, statusVariant } from '@/components/credential-usage-dialog'
+import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 
 /**
  * 按请求 id 查一条流水。
@@ -45,15 +45,24 @@ export function RequestLookupDialog({
   open,
   onOpenChange,
   filter,
+  initialId,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   /** 给了就不显示请求 id 的输入框，直接列这个模型 / 账号最近的 50 条。 */
   filter?: UsageDrillFilter
+  /**
+   * 开着就直接查这个 id（请求明细里点某一行的请求 id 带进来的），输入框仍留着，查完还能
+   * 顺手改成别的 id 或会话 id 再查。
+   *
+   * 只当初值读一次：调用方按「要查谁」挂载这个对话框（`{id && <RequestLookupDialog …/>}`），
+   * 换一个 id 就是换一次挂载，不必再拿 effect 去同步。
+   */
+  initialId?: string
 }) {
   const { t, language, locale } = useI18n()
-  const [draft, setDraft] = useState('')
-  const [submitted, setSubmitted] = useState('')
+  const [draft, setDraft] = useState(initialId ?? '')
+  const [submitted, setSubmitted] = useState(initialId ?? '')
   const query = useQuery({
     queryKey: filter
       ? [
