@@ -514,7 +514,10 @@ pub async fn run(
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
-        .route("/credentials/{id}/sessions", get(list_credential_sessions))
+        .route(
+            "/credentials/{id}/sessions",
+            get(list_credential_sessions).delete(clear_credential_sessions),
+        )
         .route("/credentials/{id}/sessions/{session_key}", delete(unbind_credential_session))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
@@ -1039,6 +1042,20 @@ async fn list_credential_sessions(
         return Err(not_found());
     }
     Ok(Json(state.store.list_sessions(id).map_err(internal)?))
+}
+
+/// 一键清掉该凭证的全部模拟会话绑定，返回清掉的条数。同样不是拉黑：名额腾出来，下一条
+/// 请求照常重新选号（多半又落回这个号）。
+async fn clear_credential_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    let removed = state.store.unbind_all_sessions(id).map_err(internal)?;
+    tracing::info!(cred_id = id, removed, "all session bindings removed manually");
+    Ok(Json(serde_json::json!({ "ok": true, "removed": removed })))
 }
 
 /// 手动解除某模拟会话与该凭证的绑定，立即腾出一个会话名额。语义同 [`unbind_credential_device`]：

@@ -5,6 +5,8 @@ import {
   ChevronUpIcon,
   EllipsisIcon,
   GlobeIcon,
+  MessagesSquareIcon,
+  SmartphoneIcon,
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
@@ -192,7 +194,7 @@ export function CredentialListHeader({
           {sortable(t('7d 用量', '7d usage'), 'usage7d')}
         </TableHead>
         <TableHead className={COL.devices} {...sortProps('devices')}>
-          {sortable(t('设备', 'Devices'), 'devices')}
+          {sortable(t('设备 / 会话', 'Devices / Sessions'), 'devices')}
         </TableHead>
         <TableHead className={cn(COL.rpm, 'text-right')} {...sortProps('rpm')}>
           {sortable(t('RPM', 'RPM'), 'rpm', true)}
@@ -245,6 +247,10 @@ export const CredentialRow = memo(function CredentialRow({
   const policy = devicePolicyMeta(cred.device_limit, language)
   // 设备名额占用的配色：满了红、快满了黄、不限中性，与卡片共用 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
+  // 模拟会话名额，同一套判定；与设备名额同一格上下两行、同一个对话框。
+  const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
+  const sessionPolicy = devicePolicyMeta(cred.session_limit, language)
+  const sessionUsage = deviceUsageMeta(cred.session_count, cred.session_limit_effective)
   // 0 = 不限，此时不显示分母也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
   const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
@@ -371,6 +377,21 @@ export const CredentialRow = memo(function CredentialRow({
                   {!policy.isDefault && <span className="text-muted-foreground">{policy.label}</span>}
                 </Button>
               </MobileFact>
+              <MobileFact label={t('模拟会话', 'Sessions')}>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => setDevicesOpen(true)}
+                  title={t(`查看模拟会话 · ${sessionPolicy.label}策略`, `View simulated sessions · ${sessionPolicy.label} policy`)}
+                  aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+                >
+                  <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
+                    {cred.session_count}/{sessionEffectiveLimit}
+                  </Badge>
+                  {!sessionPolicy.isDefault && <span className="text-muted-foreground">{sessionPolicy.label}</span>}
+                </Button>
+              </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
                 <span
                   className={cn('tabular-nums', rpmFull && 'text-warning')}
@@ -491,21 +512,40 @@ export const CredentialRow = memo(function CredentialRow({
           />
         </TableCell>
         <TableCell className={COL.devices}>
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            onClick={() => setDevicesOpen(true)}
-            title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
-            aria-haspopup="dialog"
-          >
-            {/* 计数底色随名额占用走（绿 / 黄 / 红），与卡片同一套判定，见 [deviceUsageMeta]。 */}
-            <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
-              {cred.device_count}/{effectiveLimit}
-            </Badge>
-            {/* 跟随默认那一档不画徽章，见 [devicePolicyMeta]；策略仍写在按钮的悬浮提示里。 */}
-            {!policy.isDefault && <Badge variant={policy.variant} size="sm">{policy.label}</Badge>}
-          </Button>
+          {/* 设备与模拟会话两种名额上下两行、各带自己的图标；两颗按钮开的是同一个对话框。 */}
+          <div className="flex flex-col items-start gap-0.5">
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              onClick={() => setDevicesOpen(true)}
+              title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
+              aria-haspopup="dialog"
+            >
+              <SmartphoneIcon className="size-3.5 text-muted-foreground" aria-hidden />
+              {/* 计数底色随名额占用走（绿 / 黄 / 红），与卡片同一套判定，见 [deviceUsageMeta]。 */}
+              <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+                {cred.device_count}/{effectiveLimit}
+              </Badge>
+              {/* 跟随默认那一档不画徽章，见 [devicePolicyMeta]；策略仍写在按钮的悬浮提示里。 */}
+              {!policy.isDefault && <Badge variant={policy.variant} size="sm">{policy.label}</Badge>}
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              onClick={() => setDevicesOpen(true)}
+              title={t(`查看模拟会话 · ${sessionPolicy.label}策略`, `View simulated sessions · ${sessionPolicy.label} policy`)}
+              aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+              aria-haspopup="dialog"
+            >
+              <MessagesSquareIcon className="size-3.5 text-muted-foreground" aria-hidden />
+              <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
+                {cred.session_count}/{sessionEffectiveLimit}
+              </Badge>
+              {!sessionPolicy.isDefault && <Badge variant={sessionPolicy.variant} size="sm">{sessionPolicy.label}</Badge>}
+            </Button>
+          </div>
         </TableCell>
         <TableCell className={cn(COL.rpm, 'text-right')}>
           {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。

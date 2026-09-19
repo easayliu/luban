@@ -6,6 +6,7 @@ import {
   BanIcon,
   EllipsisIcon,
   GlobeIcon,
+  MessagesSquareIcon,
   SmartphoneIcon,
   TimerOffIcon,
   WalletCardsIcon,
@@ -125,12 +126,35 @@ export const CredentialCard = memo(function CredentialCard({
   // 都是等宽字形，字符数就是宽度。策略退成手机图标的颜色、窄屏又省掉钱包图标之后，
   // 375px 的屏上实测能容下 17 个字符（`2/3` + `$214.60` + `100/120`），再多才折行，
   // 否则尾巴会伸到右边的开关底下。
+  const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
   const footerChars = `${cred.device_count}/${effectiveLimit}`.length
+    + `${cred.session_count}/${sessionEffectiveLimit}`.length
     + formatUsd(cred.cost_total).length
     + `${cred.rpm}${rpmLimit > 0 ? `/${rpmLimit}` : ''}`.length
   const footerStacked = footerChars > 17
   // 设备名额占用的配色与说明：空闲灰 / 健康绿 / 吃紧黄 / 占满红，见 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
+  // 模拟会话名额同一套判定与配色：走模拟路径、没有设备身份的来访按会话占名额，与设备分开计。
+  const sessionUsage = deviceUsageMeta(cred.session_count, cred.session_limit_effective)
+  const sessionPolicy = cred.session_limit === 0
+    ? { label: t('跟随默认', 'Default'), className: 'text-muted-foreground' }
+    : cred.session_limit < 0
+      ? { label: t('不限', 'Unlimited'), className: 'text-foreground' }
+      : { label: t('自定义', 'Custom'), className: 'text-info-foreground' }
+  const sessionUsageHint = cred.session_limit_effective <= 0
+    ? t(
+        `${cred.session_count} 条活跃模拟会话，未设上限。点击查看或清理`,
+        `${cred.session_count} active simulated session(s), no limit set. Click to view or clear`,
+      )
+    : sessionUsage.level === 'critical'
+      ? t(
+          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话会被分到别的账号，全部占满时收到 429。点击查看或清理`,
+          `Session slots are full (${cred.session_count}/${cred.session_limit_effective}): new sessions go to another account, and get a 429 once every account is full. Click to view or clear`,
+        )
+      : t(
+          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、没有设备身份的来访按会话占名额）。点击查看或清理`,
+          `${cred.session_count} of ${cred.session_limit_effective} simulated session slots in use (requests on the simulation path without a device identity take one per session). Click to view or clear`,
+        )
   // 名额策略不再占页脚的横向宽度（那点宽度让给右边的 RPM 数字），改成给前面那枚手机图标上色：
   // 淡灰＝跟随全局默认，蓝＝这个账号单独改过上限，深色＝不限设备数（旁边的分母就是 `∞`）。
   // 三档都躲开绿 / 黄 / 红：那三色紧挨着就是名额占用徽章的语义，同色不同义最容易读错。
@@ -559,6 +583,27 @@ export const CredentialCard = memo(function CredentialCard({
             </TooltipTrigger>
             <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
               {deviceUsageHint}
+            </TooltipPopup>
+          </Tooltip>
+          {/* 模拟会话名额，与设备名额并排、同一个对话框：图标颜色是策略，徽章颜色是占用。 */}
+          <Tooltip>
+            <TooltipTrigger
+              className={cn(
+                buttonVariants({ variant: 'ghost' }),
+                'min-w-0 max-w-full justify-self-start justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+              )}
+              onClick={() => setDevicesOpen(true)}
+              aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+              aria-haspopup="dialog"
+            >
+              <MessagesSquareIcon className={sessionPolicy.className} />
+              <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
+                {cred.session_count}/{sessionEffectiveLimit}
+              </Badge>
+              <span className="sr-only">{sessionPolicy.label}</span>
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+              {sessionUsageHint}
             </TooltipPopup>
           </Tooltip>
 

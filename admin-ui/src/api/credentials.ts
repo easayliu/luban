@@ -490,6 +490,12 @@ export async function unbindCredentialSession(id: number, sessionKey: string): P
   await api.delete(`/credentials/${id}/sessions/${encodeURIComponent(sessionKey)}`)
 }
 
+/** 一键清掉某账号的全部模拟会话绑定，返回清掉的条数。不是拉黑：下一条请求照常重新选号。 */
+export async function clearCredentialSessions(id: number): Promise<number> {
+  const { data } = await api.delete<{ ok: boolean; removed: number }>(`/credentials/${id}/sessions`)
+  return data.removed
+}
+
 /** 删除一条凭证。 */
 export async function deleteCredential(id: number): Promise<void> {
   await api.delete(`/credentials/${id}`)

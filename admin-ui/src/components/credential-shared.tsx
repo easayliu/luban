@@ -3,8 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
   ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  GaugeIcon, GlobeIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon, SmartphoneIcon,
-  TimerOffIcon, Trash2Icon,
+  GaugeIcon, GlobeIcon, MessagesSquareIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
+  SmartphoneIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
@@ -542,7 +542,7 @@ export function isAbnormal(cred: Credential): boolean {
 
 export type SortKey =
   | 'priority' | 'status' | 'name' | 'tier'
-  | 'usage5h' | 'usage7d' | 'devices' | 'cost' | 'recent' | 'created' | 'rpm'
+  | 'usage5h' | 'usage7d' | 'devices' | 'sessions' | 'cost' | 'recent' | 'created' | 'rpm'
 
 export type SortDir = 'asc' | 'desc'
 
@@ -555,6 +555,7 @@ export const SORTS: { key: SortKey; label: string }[] = [
   { key: 'usage5h', label: '5h 使用率' },
   { key: 'usage7d', label: '7d 使用率' },
   { key: 'devices', label: '设备数' },
+  { key: 'sessions', label: '会话数' },
   { key: 'rpm', label: '当前 RPM' },
   { key: 'cost', label: '累计花费' },
   { key: 'recent', label: '最近使用' },
@@ -587,6 +588,7 @@ export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
   usage5h: 'desc',
   usage7d: 'desc',
   devices: 'desc',
+  sessions: 'desc',
   rpm: 'desc',
   cost: 'desc',
   recent: 'desc',
@@ -644,6 +646,8 @@ function sortValue(key: SortKey, credential: Credential, now: number): number | 
       return quotaRiskMeta(credential, now).d7.percentage ?? -1
     case 'devices':
       return credential.device_count
+    case 'sessions':
+      return credential.session_count
     case 'rpm':
       return credential.rpm ?? 0
     case 'cost':
@@ -839,6 +843,11 @@ export function CredentialMenuContent({
       <MenuItem onClick={onDeviceLimit}>
         <SmartphoneIcon />
         {t('设备上限', 'Device limit')}
+      </MenuItem>
+      {/* 与设备上限开的是同一个对话框（会话那一半在下面）：两种名额总是一起看。 */}
+      <MenuItem onClick={onDeviceLimit}>
+        <MessagesSquareIcon />
+        {t('模拟会话上限', 'Session limit')}
       </MenuItem>
       <MenuItem onClick={onRpmLimit}>
         <GaugeIcon />

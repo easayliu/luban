@@ -6,9 +6,11 @@ import {
   PencilIcon,
   RefreshCwIcon,
   SmartphoneIcon,
+  Trash2Icon,
   UnlinkIcon,
 } from 'lucide-react'
 import {
+  clearCredentialSessions,
   listCredentialDevices,
   listCredentialSessions,
   unbindCredentialDevice,
@@ -871,6 +873,24 @@ function SessionList({
       type: 'error',
     }),
   })
+  // 一键清空：会话是 luban 自己派生的键、数量比设备多得多，逐条点没意义。
+  const clearAll = useMutation({
+    mutationFn: () => clearCredentialSessions(credId),
+    onSuccess: (removed) => {
+      toastManager.add({
+        title: t(`已清理 ${removed} 条会话`, `Cleared ${removed} ${removed === 1 ? 'session' : 'sessions'}`),
+        type: 'success',
+      })
+      qc.setQueryData<SessionBinding[]>(queryKey, [])
+      qc.invalidateQueries({ queryKey })
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => toastManager.add({
+      title: t('清理失败', 'Failed to clear sessions'),
+      description: extractError(error, language),
+      type: 'error',
+    }),
+  })
 
   return (
     <section className="space-y-3" aria-labelledby={`active-sessions-${credId}`}>
@@ -883,12 +903,28 @@ function SessionList({
             {t('按最近活跃时间排序', 'Sorted by most recent activity')}
           </p>
         </div>
-        {!isPending && !error && isFetching && (
-          <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-            <Spinner />
-            {t('刷新中', 'Refreshing')}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {!isPending && !error && isFetching && (
+            <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner />
+              {t('刷新中', 'Refreshing')}
+            </span>
+          )}
+          {!isPending && !error && (data?.length ?? 0) > 0 && (
+            <Button
+              type="button"
+              size="xs"
+              variant="destructive-outline"
+              loading={clearAll.isPending}
+              disabled={unbind.isPending}
+              onClick={() => clearAll.mutate()}
+              title={t('清掉这个账号的全部模拟会话绑定（含休眠的）；下一条请求照常重新选号', 'Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
+            >
+              <Trash2Icon />
+              {t('全部清理', 'Clear all')}
+            </Button>
+          )}
+        </div>
       </div>
 
       {isPending ? (

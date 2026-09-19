@@ -1976,6 +1976,14 @@ impl CredentialStore {
         Ok(rows)
     }
 
+    /// 一键清掉该凭证的**全部**模拟会话绑定（含休眠的软绑定），返回删掉的条数。会话比设备
+    /// 多得多、又是 luban 自己派生的键，逐条解绑不现实；清掉只是腾名额、抹亲和性，下一条请求
+    /// 照常重新选号。
+    pub fn unbind_all_sessions(&self, cred_id: i64) -> Result<usize> {
+        let conn = self.conn.lock();
+        Ok(conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [cred_id])?)
+    }
+
     /// 手动解除一条模拟会话绑定，返回是否确有删除。按 `(cred_id, session_key)` 双条件删，
     /// 理由同 [`Self::unbind_device`]。
     pub fn unbind_session(&self, cred_id: i64, session_key: &str) -> Result<bool> {
@@ -6826,6 +6834,16 @@ mod tests {
         assert!(store.unbind_session(a, "s1").unwrap());
         assert!(!store.unbind_session(a, "s1").unwrap());
         assert_eq!(store.select_for_device(soft_session("s3")).unwrap().id, a);
+        // 一键清空：只清这个号的，别的号不动；清完名额全空。
+        assert_eq!(
+            store.select_for_device(soft_session("s4")).unwrap_err().to_string(),
+            SessionLimitReached.to_string()
+        );
+        assert_eq!(store.unbind_all_sessions(a).unwrap(), 1);
+        assert_eq!(store.unbind_all_sessions(a).unwrap(), 0);
+        assert_eq!(store.session_count(a).unwrap(), 0);
+        assert_eq!(store.session_count(b).unwrap(), 1, "b 的不动");
+        assert_eq!(store.select_for_device(soft_session("s4")).unwrap().id, a);
     }
 
     /// 带设备身份的请求即使也带了会话键，只按设备绑定：一条请求不占两份名额。
