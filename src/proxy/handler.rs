@@ -700,7 +700,7 @@ pub(super) async fn handle_inner(
             ..Default::default()
         }
     }
-    let (token, cred) = match store::valid_access_token_for_device(
+    let (token, cred, session_slot) = match store::valid_access_token_for_device(
         &state.store,
         &state.clients,
         select(device_id.as_deref(), session_key.as_deref(), billable, req_model.as_deref(), &[]),
@@ -836,7 +836,7 @@ pub(super) async fn handle_inner(
     //    身份随号变、模拟路径的 session_id 也由账号派生——只换 token 会发出一条自相矛盾的请求。
     //    故首发也走这个循环，不存在「首发与重试形态不一致」的可能。
     let mut tried: Vec<i64> = Vec::new();
-    let (mut token, mut cred) = (token, cred);
+    let (mut token, mut cred, mut session_slot) = (token, cred, session_slot);
     let mut retried = 0usize;
     let max_retry = if flags.rate_limit_retry { state.store.rate_limit_retry_max() } else { 0 };
     // 「套餐不含这个模型」引发的换号次数，与 429 那套 `retried`/`max_retry` **分开计**：那个
@@ -854,17 +854,10 @@ pub(super) async fn handle_inner(
     // 一条 `break` 之前都必经那次赋值。循环之后它会被交给 `ReqLog` 拿着，活到响应流结束。
     let mut route_load: UpstreamRouteGuard;
     let (upstream, resp, sent) = loop {
-        // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定，见
-        // [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、对话
-        // 之间复用。每轮都查——换号重试后是另一个号上的另一个槽位。没占槽位的（带设备身份的
+        // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定并随选号结果一起返回，
+        // 见 [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、
+        // 对话之间复用。换号重试后 `session_slot` 随新号一起换。没占槽位的（带设备身份的
         // 模拟请求）退回按缓存前缀派生。
-        let session_slot = match (&session_key, device_id.is_none()) {
-            (Some(k), true) => state.store.session_slot(cred.id, k).unwrap_or_else(|e| {
-                tracing::warn!(cred_id = cred.id, error = %e, "failed to read the session slot; deriving the session id from the cache prefix instead");
-                None
-            }),
-            _ => None,
-        };
         let slot_seed = session_slot.map(crate::credentials::slot_session_seed);
         let seed = match &slot_seed {
             Some(s) => SimSessionSeed::Slot(s),
@@ -1246,7 +1239,7 @@ pub(super) async fn handle_inner(
                     )
                     .await
                     {
-                        Ok((next_token, next_cred)) => {
+                        Ok((next_token, next_cred, next_slot)) => {
                             tracing::info!(
                                 cred_id = cred.id, cred = %cred.label,
                                 to_cred_id = next_cred.id,
@@ -1254,7 +1247,7 @@ pub(super) async fn handle_inner(
                                 attempt = retried + 1,
                                 "401 credential swap: retrying with another credential"
                             );
-                            (token, cred) = (next_token, next_cred);
+                            (token, cred, session_slot) = (next_token, next_cred, next_slot);
                             retried += 1;
                             continue;
                         }
@@ -1342,7 +1335,7 @@ pub(super) async fn handle_inner(
             )
             .await
             {
-                Ok((next_token, next_cred)) => {
+                Ok((next_token, next_cred, next_slot)) => {
                     tracing::warn!(
                         cred_id = cred.id, cred = %cred.label,
                         to_cred_id = next_cred.id,
@@ -1351,7 +1344,7 @@ pub(super) async fn handle_inner(
                         attempt = denial_swaps + 1,
                         "model not included in this account's plan: retrying with another account"
                     );
-                    (token, cred) = (next_token, next_cred);
+                    (token, cred, session_slot) = (next_token, next_cred, next_slot);
                     denial_swaps += 1;
                     continue;
                 }
@@ -1540,7 +1533,7 @@ pub(super) async fn handle_inner(
         )
         .await
         {
-            Ok((next_token, next_cred)) => {
+            Ok((next_token, next_cred, next_slot)) => {
                 tracing::warn!(
                     cred_id = cred.id,
                     cred = %cred.label,
@@ -1550,7 +1543,7 @@ pub(super) async fn handle_inner(
                     attempt = retried + 1,
                     "upstream 429: credential put on cooldown, retrying with another one"
                 );
-                (token, cred) = (next_token, next_cred);
+                (token, cred, session_slot) = (next_token, next_cred, next_slot);
                 retried += 1;
             }
             // 没有别的号可用（都试过/都停用了）：保留最初那条 429 原样透传，别把它变成 503。

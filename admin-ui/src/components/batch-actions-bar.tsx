@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
   deleteCredentials, setCredentialQuotaPausePcts, setDeviceLimits, setDisabledMany, setPriorities,
-  setProxies, setRpmLimits,
+  setProxies, setRpmLimits, setSessionLimits,
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
@@ -30,6 +30,12 @@ import { Toolbar } from '@/components/ui/toolbar'
 const LIMIT_MODE_ITEMS = [
   { value: 'default', chinese: '跟随默认', english: 'Use default' },
   { value: 'unlimited', chinese: '不限设备', english: 'Unlimited devices' },
+  { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
+] as const
+
+const SESSION_LIMIT_MODE_ITEMS = [
+  { value: 'default', chinese: '跟随默认', english: 'Use default' },
+  { value: 'unlimited', chinese: '不限会话', english: 'Unlimited sessions' },
   { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
 ] as const
 
@@ -111,6 +117,8 @@ export function BatchActionsBar({
   const [priority, setPriority] = useState(0)
   const [limitMode, setLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
   const [customLimit, setCustomLimit] = useState(1)
+  const [sessionLimitMode, setSessionLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
+  const [customSessionLimit, setCustomSessionLimit] = useState(1)
   const [rpmMode, setRpmMode] = useState<'default' | 'unlimited' | 'custom'>('default')
   const [customRpm, setCustomRpm] = useState(60)
   const [quotaShortMode, setQuotaShortMode] = useState<QuotaMode>('default')
@@ -142,6 +150,10 @@ export function BatchActionsBar({
   const formattedTotal = all.length.toLocaleString(locale)
   const englishAccountCount = `${formattedCount} ${n === 1 ? 'account' : 'accounts'}`
   const limitModeItems = LIMIT_MODE_ITEMS.map((item) => ({
+    value: item.value,
+    label: t(item.chinese, item.english),
+  }))
+  const sessionLimitModeItems = SESSION_LIMIT_MODE_ITEMS.map((item) => ({
     value: item.value,
     label: t(item.chinese, item.english),
   }))
@@ -187,6 +199,25 @@ export function BatchActionsBar({
             : t(
               `已把 ${formattedCount} 个账号设为不限设备数`,
               `Set ${englishAccountCount} to unlimited devices`,
+            ),
+      ),
+    onError,
+  })
+  const applySessionLimit = useMutation({
+    mutationFn: (v: number) => setSessionLimits(ids, v),
+    onSuccess: (_r, v) =>
+      notify(
+        v > 0 ? t(
+          `已把 ${formattedCount} 个账号的模拟会话上限设为 ${v.toLocaleString(locale)}`,
+          `Set the session limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
+        )
+          : v === 0 ? t(
+            `已把 ${formattedCount} 个账号改为跟随全局默认会话上限`,
+            `Set ${englishAccountCount} to use the global default session limit`,
+          )
+            : t(
+              `已把 ${formattedCount} 个账号设为不限模拟会话数`,
+              `Set ${englishAccountCount} to unlimited sessions`,
             ),
       ),
     onError,
@@ -255,11 +286,12 @@ export function BatchActionsBar({
   })
 
   const busy =
-    applyPriority.isPending || applyLimit.isPending || applyRpmLimit.isPending ||
+    applyPriority.isPending || applyLimit.isPending || applySessionLimit.isPending || applyRpmLimit.isPending ||
     applyQuotaPause.isPending || applyProxy.isPending || applyDisabled.isPending ||
     applyDelete.isPending
   const allSelected = all.length > 0 && all.every((item) => selected.has(item.id))
   const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
+  const sessionLimit = sessionLimitMode === 'default' ? 0 : sessionLimitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customSessionLimit))
   const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customRpm))
   const quotaPct = quotaPctOf(quotaShortMode, quotaShortCustom)
   const quotaPct7d = quotaPctOf(quotaLongMode, quotaLongCustom)
@@ -364,6 +396,34 @@ export function BatchActionsBar({
                   <NumberFieldGroup>
                     <NumberFieldDecrement />
                     <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
+                    <NumberFieldIncrement />
+                  </NumberFieldGroup>
+                </NumberField>
+              )}
+            </SettingRow>
+
+            <SettingRow
+              title={t('模拟会话上限', 'Session limit')}
+              hint={t('默认、不限或独立上限', 'Default, unlimited, or custom')}
+              action={
+                <Button size="sm" loading={applySessionLimit.isPending} disabled={busy} onClick={() => applySessionLimit.mutate(sessionLimit)}>
+                  {t('应用', 'Apply')}
+                </Button>
+              }
+            >
+              <Select items={sessionLimitModeItems} value={sessionLimitMode} onValueChange={(value) => value && setSessionLimitMode(value as typeof sessionLimitMode)}>
+                <SelectTrigger aria-label={t('批量设置模拟会话上限策略', 'Set session limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                <SelectPopup>
+                  {sessionLimitModeItems.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+              {sessionLimitMode === 'custom' && (
+                <NumberField value={customSessionLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
+                  <NumberFieldGroup>
+                    <NumberFieldDecrement />
+                    <NumberFieldInput aria-label={t('批量设置独立模拟会话上限', 'Set a custom session limit for selected accounts')} />
                     <NumberFieldIncrement />
                   </NumberFieldGroup>
                 </NumberField>

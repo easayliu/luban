@@ -9,6 +9,7 @@ import {
   GaugeIcon,
   KeyRoundIcon,
   LockKeyholeIcon,
+  MessagesSquareIcon,
   SaveIcon,
   Settings2Icon,
   ShieldCheckIcon,
@@ -435,15 +436,25 @@ export function DeviceSettingsContent() {
 
       <SettingsGroup
         icon={GaugeIcon}
-        title={t('绑定与容量', 'Bindings & capacity')}
+        title={t('设备绑定与容量', 'Device bindings & capacity')}
         description={t(
-          '决定设备占用名额多久、多久内优先返回原账号，以及每个账号默认可容纳多少设备。',
-          'Control how long devices hold slots, how long they prefer their original account, and the default capacity per account.',
+          '带设备身份的来访：决定设备占用名额多久、多久内优先返回原账号，以及每个账号默认可容纳多少设备。',
+          'Requests with a device identity: how long a device holds its slot, how long it prefers its original account, and the default device capacity per account.',
         )}
       >
         <DeviceBindingTtl />
         <DeviceBindingRetention />
         <DefaultDeviceLimit />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={MessagesSquareIcon}
+        title={t('模拟会话绑定与容量', 'Simulated session bindings & capacity')}
+        description={t(
+          '走模拟路径、没有设备身份的来访按对话占会话槽位：决定对话闲置多久释放槽位、多久内优先返回原账号，以及每个账号默认有多少个槽位（也就是上游看到的会话 id 数）。',
+          'Requests on the simulation path without a device identity take a session slot per conversation: how long an idle conversation keeps its slot, how long it prefers its original account, and the default number of slots per account (the session ids upstream sees).',
+        )}
+      >
         <SessionBindingTtl />
         <SessionBindingRetention />
         <DefaultSessionLimit />

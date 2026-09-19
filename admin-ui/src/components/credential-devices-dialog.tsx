@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
   CopyIcon,
   MessagesSquareIcon,
@@ -133,6 +133,25 @@ export function CredentialDevicesDialog({
     queryFn: () => listCredentialDevices(cred.id),
     enabled: open,
   })
+  // 会话列表在对话框这一层拉：头部要并排显示两种名额的活跃数，下半段的容量卡与列表也用它。
+  const sessions = useQuery({
+    queryKey: ['credential-sessions', cred.id],
+    queryFn: () => listCredentialSessions(cred.id),
+    enabled: open,
+  })
+  const currentSessionCount = sessions.data?.length ?? cred.session_count
+  const formattedSessionCount = currentSessionCount.toLocaleString(locale)
+  const sessionStatus = sessions.isPending
+    ? { label: t('会话读取中', 'Loading sessions'), variant: 'secondary' as const }
+    : sessions.error
+      ? { label: t('会话读取失败', 'Sessions failed to load'), variant: 'error' as const }
+      : {
+          label: t(
+            `${formattedSessionCount} 条活跃会话`,
+            `${formattedSessionCount} active ${currentSessionCount === 1 ? 'session' : 'sessions'}`,
+          ),
+          variant: 'success' as const,
+        }
 
   // 只数真实绑定：模拟客户端的伪设备也在这个列表里，但它们不写绑定、不占设备名额，
   // 后端的 device_count（卡片上那个数）同样数不到它们。把它们算进来，就会得到
@@ -217,11 +236,13 @@ export function CredentialDevicesDialog({
               <AvatarFallback><SmartphoneIcon /></AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              <DialogTitle>{t('已绑定设备', 'Bound devices')}</DialogTitle>
+              {/* 标题写全两种名额：这个对话框上半段是设备、下半段是模拟会话，头部两枚徽章各报各的活跃数。 */}
+              <DialogTitle>{t('名额：设备与模拟会话', 'Slots: devices & sessions')}</DialogTitle>
               <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
                 <Badge variant={deviceStatus.variant} aria-live="polite">{deviceStatus.label}</Badge>
+                <Badge variant={sessionStatus.variant} aria-live="polite">{sessionStatus.label}</Badge>
               </div>
             </div>
           </div>
@@ -373,7 +394,7 @@ export function CredentialDevicesDialog({
 
             {/* 模拟会话是另一种名额：走模拟路径、没有设备身份的来访按会话键粘住账号。
                 它们与设备名额互不相干（一条请求只占其一），故单独一张容量卡和一份列表。 */}
-            <SessionCapacityCard cred={cred} sessionLimit={sessionLimit} open={open} />
+            <SessionCapacityCard cred={cred} sessionLimit={sessionLimit} sessions={sessions} />
           </DialogPanel>
 
           <DialogFooter>
@@ -659,21 +680,16 @@ function DeviceStat({ label, value, hint }: { label: string; value: string; hint
 function SessionCapacityCard({
   cred,
   sessionLimit,
-  open,
+  sessions,
 }: {
   cred: Credential
   sessionLimit: CredentialActions['sessionLimit']
-  open: boolean
+  sessions: UseQueryResult<SessionBinding[]>
 }) {
   const { t, locale } = useI18n()
   const [editing, setEditing] = useState(false)
   const [policy, setPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.session_limit))
   const [custom, setCustom] = useState(Math.max(1, cred.session_limit))
-  const sessions = useQuery({
-    queryKey: ['credential-sessions', cred.id],
-    queryFn: () => listCredentialSessions(cred.id),
-    enabled: open,
-  })
   const count = sessions.data?.length ?? cred.session_count
   const formattedCount = count.toLocaleString(locale)
   const effective = cred.session_limit_effective

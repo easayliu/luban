@@ -1221,6 +1221,12 @@ impl CredentialStore {
             }
         }
         tx.commit()?;
+        // 与 [`Self::delete`] 同一口径：号没了，它们在内存里的限流窗口与冷却也一并忘掉。
+        for id in ids {
+            self.bare_rate.forget(id);
+            self.rpm_rate.forget(id);
+            self.cooldown.forget(*id);
+        }
         Ok(n)
     }
 
@@ -1990,8 +1996,9 @@ impl CredentialStore {
         Ok(rows)
     }
 
-    /// 这条会话键在该凭证上占的槽位；没绑在这个号上为 `None`。转发路径选完号后查一次，
-    /// 会话 id 由它派生（见 `crate::credentials::slot_session_seed`）。
+    /// 这条会话键在该凭证上占的槽位；没绑在这个号上为 `None`。转发路径不再用它——槽位随
+    /// 选号结果一起返回（[`Self::select_with_slot`]），这里只给测试核对绑定行。
+    #[cfg(test)]
     pub fn session_slot(&self, cred_id: i64, session_key: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -5548,7 +5555,15 @@ impl CredentialStore {
     /// 反过来，**不经选号的那些请求一条都不计**：连通性测试指定打哪个号（不走这里），却照样
     /// 写 `usage_logs`。所以列表里的 RPM 可能比限流器数到的略高一点点——探活是人手点出来的，
     /// 量级上不构成干扰，但对不上时要知道差在哪。
+    #[cfg(test)]
     pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
+        self.select_with_slot(sel).map(|(cred, _)| cred)
+    }
+
+    /// [`Self::select_for_device`] 的完整版：连同这条请求在选中的号上占的**会话槽位**一起返回
+    /// （按会话键绑定时为 `Some`，其余 `None`）。转发路径要用槽位派生会话 id，选号时刚写过
+    /// 绑定行、值就在手上，不必再按键查一遍。
+    pub fn select_with_slot(&self, sel: Select<'_>) -> Result<(Credential, Option<i64>)> {
         let Select {
             device_id,
             session_key,
@@ -5763,17 +5778,21 @@ impl CredentialStore {
                             }
                             .into());
                         }
-                        match b {
-                            // 休眠的会话软绑定回来要重新占槽位：原槽位空着就还用它，被别的对话拿
-                            // 走了就取最小的空位——会话 id 随槽位变，这条对话在上游成了另一条会话。
-                            Binding::Session(key) if !active => {
+                        let slot = match b {
+                            Binding::Session(key) => {
                                 let old: i64 = conn.query_row(
                                     "SELECT slot FROM session_bindings WHERE session_key = ?1",
                                     [key],
                                     |r| r.get(0),
                                 )?;
-                                let slot =
-                                    free_session_slot(&conn, c.id, session_ttl_secs, Some(old))?;
+                                // 活跃绑定续用原槽位；休眠的会话软绑定回来要重新占槽位：原槽位
+                                // 空着就还用它，被别的对话拿走了就取最小的空位——会话 id 随槽位变，
+                                // 这条对话在上游成了另一条会话。
+                                let slot = if active {
+                                    old
+                                } else {
+                                    free_session_slot(&conn, c.id, session_ttl_secs, Some(old))?
+                                };
                                 conn.execute(
                                     "UPDATE session_bindings \
                                         SET slot = ?2, last_seen_at = unixepoch(), \
@@ -5781,25 +5800,24 @@ impl CredentialStore {
                                       WHERE session_key = ?1",
                                     params![key, slot],
                                 )?;
+                                Some(slot)
                             }
-                            _ => {
+                            Binding::Device(did) => {
                                 conn.execute(
-                                    &format!(
-                                        "UPDATE {} SET last_seen_at = unixepoch(), \
-                                                request_count = request_count + 1 \
-                                          WHERE {} = ?1",
-                                        b.table(),
-                                        b.column()
-                                    ),
-                                    [b.key()],
+                                    "UPDATE device_bindings \
+                                        SET last_seen_at = unixepoch(), \
+                                            request_count = request_count + 1 \
+                                      WHERE device_id = ?1",
+                                    [did],
                                 )?;
+                                None
                             }
-                        }
+                        };
                         self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
                         if device_id.is_none() && rate_limited {
                             self.bare_rate.take(c.id, rate_limit, bare_window);
                         }
-                        return Ok(c.clone());
+                        return Ok((c.clone(), slot));
                     }
                 }
                 // 回不去原号（停用/删除/冷却中/本轮已试过/名额已满）：往下重新选择，
@@ -5865,7 +5883,7 @@ impl CredentialStore {
             }
         };
 
-        match binding {
+        let slot = match binding {
             Some(Binding::Device(did)) => {
                 conn.execute(
                     "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
@@ -5874,6 +5892,7 @@ impl CredentialStore {
                             request_count = request_count + 1",
                     params![did, chosen.id],
                 )?;
+                None
             }
             Some(Binding::Session(key)) => {
                 // 新对话（或改绑到别的号的对话）在选中的号上取最小的空槽位。上面刚判过
@@ -5886,9 +5905,10 @@ impl CredentialStore {
                             request_count = request_count + 1",
                     params![key, chosen.id, slot],
                 )?;
+                Some(slot)
             }
-            None => {}
-        }
+            None => None,
+        };
         // 两个窗口都在**选定之后**才记账（而不是边问边记）：一次选号要连过两道窗口，
         // 边问边记的话，过了第一道却卡在第二道的那个号会白扣一个名额。理由详见
         // [`RateWindow::has_room`]——选号全程持着 `conn` 锁，中间插不进第二次选号。
@@ -5896,7 +5916,7 @@ impl CredentialStore {
         if device_id.is_none() && rate_limited {
             self.bare_rate.take(chosen.id, rate_limit, bare_window);
         }
-        Ok(chosen.clone())
+        Ok((chosen.clone(), slot))
     }
 }
 
@@ -5930,7 +5950,7 @@ pub async fn valid_access_token_for_device(
     store: &CredentialStore,
     clients: &crate::clients::ClientPool,
     sel: Select<'_>,
-) -> Result<(String, Credential)> {
+) -> Result<(String, Credential, Option<i64>)> {
     select_with_refresh_failover(store, sel, |cred| {
         Box::pin(async move { ensure_fresh_token(store, clients, &cred).await })
     })
@@ -5997,7 +6017,7 @@ async fn select_with_refresh_failover<'a>(
     store: &CredentialStore,
     sel: Select<'_>,
     attempt: impl Fn(Credential) -> AttemptFut<'a>,
-) -> Result<(String, Credential)> {
+) -> Result<(String, Credential, Option<i64>)> {
     let sel = Select {
         ttl_secs: store.device_binding_ttl(),
         retention_secs: store.device_binding_retention(),
@@ -6008,9 +6028,9 @@ async fn select_with_refresh_failover<'a>(
 
     for round in 0..MAX_REFRESH_FAILOVER {
         // 每轮都重新选：上一轮停用的那个已被排除，且它的设备绑定已清，这里才会换到新号。
-        let cred = store.select_for_device(sel)?;
+        let (cred, slot) = store.select_with_slot(sel)?;
         match attempt(cred.clone()).await? {
-            TokenAttempt::Ready(token) => return Ok((token, cred)),
+            TokenAttempt::Ready(token) => return Ok((token, cred, slot)),
             TokenAttempt::Revoked(reason) => {
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
@@ -7066,9 +7086,18 @@ mod tests {
         let (store, ids) = soft_store(&["a"]);
         let a = ids[0];
         let slot = |k: &str| store.session_slot(a, k).unwrap();
-        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
-        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, a);
-        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        // 选号直接把槽位带回来，与事后按键查的一致；设备绑定与裸请求没有槽位。
+        let (c, s) = store.select_with_slot(soft_session("s1")).unwrap();
+        assert_eq!((c.id, s), (a, Some(0)));
+        let (c, s) = store.select_with_slot(soft_session("s2")).unwrap();
+        assert_eq!((c.id, s), (a, Some(1)));
+        let (c, s) = store.select_with_slot(soft_session("s1")).unwrap();
+        assert_eq!((c.id, s), (a, Some(0)), "续用原槽位也带回来");
+        assert_eq!(store.select_with_slot(soft("dev-1")).unwrap().1, None);
+        assert_eq!(
+            store.select_with_slot(Select { rate_limited: true, ..Default::default() }).unwrap().1,
+            None
+        );
         assert_eq!((slot("s1"), slot("s2")), (Some(0), Some(1)), "按最小空位分，同键续用");
         assert_eq!(slot("nope"), None);
         // s1 休眠，s3 来了拿走槽位 0；s1 回来只能拿 2。
@@ -8502,7 +8531,7 @@ mod tests {
         let tried = std::cell::RefCell::new(Vec::new());
 
         // a、b 的 refresh_token 已作废，c 正常。
-        let (token, cred) = select_with_refresh_failover(
+        let (token, cred, _) = select_with_refresh_failover(
             &store,
             Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
             |c| {

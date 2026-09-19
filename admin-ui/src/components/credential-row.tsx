@@ -4,6 +4,7 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   EllipsisIcon,
+  GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
   SmartphoneIcon,
@@ -110,12 +111,11 @@ const COL = {
   quota5h: 'w-44 2xl:w-48',
   quota7d: 'w-44 2xl:w-48',
   /**
-   * 只剩一枚 `2/5` 名额徽章——「跟随默认」那枚不再画（见 [devicePolicyMeta]），w-32 里有一半
-   * 是空白。收到 w-24：英文表头 `DEVICES` 比同宽的 `LAST USED`、`TOTAL COST` 都短，那两列
-   * 一直是这个宽度。
+   * 设备、模拟会话、RPM 三枚「图标 + 计数徽章」上下叠在一格里，与卡片页脚同一副面孔；
+   * 原来单独的 RPM 列并进来了，它那 w-18 让给这一列：w-28 放得下 `⏱ 120/120` 加一枚
+   * 「自定义」策略徽章（「跟随默认」那枚不画，见 [devicePolicyMeta]）。
    */
-  devices: 'w-24',
-  rpm: 'w-18',
+  devices: 'w-28',
   recent: 'hidden w-22 2xl:table-cell',
   cost: 'w-22',
   action: 'w-10',
@@ -194,10 +194,8 @@ export function CredentialListHeader({
           {sortable(t('7d 用量', '7d usage'), 'usage7d')}
         </TableHead>
         <TableHead className={COL.devices} {...sortProps('devices')}>
-          {sortable(t('设备 / 会话', 'Devices / Sessions'), 'devices')}
-        </TableHead>
-        <TableHead className={cn(COL.rpm, 'text-right')} {...sortProps('rpm')}>
-          {sortable(t('RPM', 'RPM'), 'rpm', true)}
+          {/* 表头只挂设备那一维的排序；会话数与当前 RPM 在工具栏的排序下拉里。 */}
+          {sortable(t('设备 / 会话 / RPM', 'Devices / Sessions / RPM'), 'devices')}
         </TableHead>
         <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable(t('最近使用', 'Last used'), 'recent')}
@@ -253,13 +251,16 @@ export const CredentialRow = memo(function CredentialRow({
   const sessionUsage = deviceUsageMeta(cred.session_count, cred.session_limit_effective)
   // 0 = 不限，此时不显示分母也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
-  const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
+  // RPM 与两枚名额同一套判定与配色：图标颜色是策略，徽章底色是占用（0 灰、有流量绿、快打满黄、打满红）。
+  const rpmEffectiveLimit = rpmLimit > 0 ? rpmLimit : '∞'
+  const rpmPolicy = devicePolicyMeta(cred.rpm_limit, language)
+  const rpmUsage = deviceUsageMeta(cred.rpm, rpmLimit)
   const added = relativeTime(cred.created_at, now, language)
 
   return (
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
-        <TableCell colSpan={12} className="w-full max-w-0 whitespace-normal p-0">
+        <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
           <article className="min-w-0 space-y-3 p-3 sm:space-y-4 sm:p-5">
             <div className="flex items-start gap-3">
               {selectable && (
@@ -393,16 +394,19 @@ export const CredentialRow = memo(function CredentialRow({
                 </Button>
               </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
-                <span
-                  className={cn('tabular-nums', rpmFull && 'text-warning')}
-                  title={t(
-                    '最近 60 秒经这个账号转发的请求数（含失败的）',
-                    'Requests forwarded through this account in the last 60 seconds (failures included)',
-                  )}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => setRpmOpen(true)}
+                  title={t(`调整 RPM 上限 · ${rpmPolicy.label}策略`, `Adjust the RPM limit · ${rpmPolicy.label} policy`)}
+                  aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
                 >
-                  {cred.rpm > 0 ? cred.rpm : '—'}
-                  {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
-                </span>
+                  <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
+                    {cred.rpm}/{rpmEffectiveLimit}
+                  </Badge>
+                  {!rpmPolicy.isDefault && <span className="text-muted-foreground">{rpmPolicy.label}</span>}
+                </Button>
               </MobileFact>
             </dl>
           </article>
@@ -545,35 +549,32 @@ export const CredentialRow = memo(function CredentialRow({
               </Badge>
               {!sessionPolicy.isDefault && <Badge variant={sessionPolicy.variant} size="sm">{sessionPolicy.label}</Badge>}
             </Button>
-          </div>
-        </TableCell>
-        <TableCell className={cn(COL.rpm, 'text-right')}>
-          {/* 闲置账号占了大半，0 一律显示成「—」：一列排开的 0 会把真正有流量的那几行淹掉。
-              配了上限就带上分母——两个数同一个 60 秒窗口，直接比得出还剩多少余量。 */}
-          <Tooltip>
-            <TooltipTrigger
-              render={<span />}
-              className={cn(
-                'tabular-nums text-sm',
-                cred.rpm > 0 ? 'font-medium' : 'text-muted-foreground',
-                rpmFull && 'text-warning',
-              )}
-            >
-              {cred.rpm > 0 ? cred.rpm : '—'}
-              {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {rpmLimit > 0
+            {/* 当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的），分母是生效上限、不限时 ∞；
+                点开 RPM 上限对话框。零值不再写成「—」：三枚并排，同一种读法。 */}
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              onClick={() => setRpmOpen(true)}
+              title={rpmLimit > 0
                 ? t(
-                  `当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）。上限 ${rpmLimit} 条/分钟，打满后新请求分流到别的账号，已绑定的设备收到 429。`,
-                  `Current RPM: requests forwarded through this account in the last 60 seconds (failures included). Limited to ${rpmLimit}/min; once full, new requests spill to another account and already-bound devices get a 429.`,
+                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），打满后新请求分流到别的账号、已绑定的设备收到 429 · ${rpmPolicy.label}策略`,
+                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included); once full, new requests spill to another account and bound devices get a 429 · ${rpmPolicy.label} policy`,
                 )
                 : t(
-                  '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-                  'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
+                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的） · ${rpmPolicy.label}策略`,
+                  `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included) · ${rpmPolicy.label} policy`,
                 )}
-            </TooltipPopup>
-          </Tooltip>
+              aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
+              aria-haspopup="dialog"
+            >
+              <GaugeIcon className="size-3.5 text-muted-foreground" aria-hidden />
+              <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
+                {cred.rpm}/{rpmEffectiveLimit}
+              </Badge>
+              {!rpmPolicy.isDefault && <Badge variant={rpmPolicy.variant} size="sm">{rpmPolicy.label}</Badge>}
+            </Button>
+          </div>
         </TableCell>
         <TableCell className={COL.recent}>
           {cred.last_used != null ? relativeTime(cred.last_used, now, language) : t('未使用', 'Never used')}
