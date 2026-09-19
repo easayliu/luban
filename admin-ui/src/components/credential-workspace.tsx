@@ -1017,7 +1017,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               value={formatPercent(cacheRate)}
               trend={
                 cacheRate == null ? undefined : (
-                  <CacheHitSparkline slots={cacheSeries.slots} className="shrink-0" />
+                  // 手机上一行两格、一格不到 190px，图标加数字加 80px 的迷你线放不下，
+                  // 会压到隔壁；sm 起再画。
+                  <CacheHitSparkline slots={cacheSeries.slots} className="hidden shrink-0 sm:flex" />
                 )
               }
               status={cacheRate == null
@@ -1035,6 +1037,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
               onClick={() => setCacheTrendOpen(true)}
             />
+            {/* 小字只放 7 天基线，与缓存那格的「7d 65%」同一写法；p95 在悬浮提示里——
+                这格宽度放不下两段，截成「p…」谁也读不出来。 */}
             <OverviewMetric
               className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
               label={ttftNow
@@ -1043,15 +1047,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
               trend={
                 ttftNow == null ? undefined : (
-                  <TtftSparkline slots={ttftSeries.slots} className="shrink-0" />
+                  <TtftSparkline slots={ttftSeries.slots} className="hidden shrink-0 sm:flex" />
                 )
               }
               status={ttftNow == null
                 ? t('暂无数据', 'No data yet')
-                : t(
-                    `p95 ${formatMs(ttftNow.p.p95_ms)}${ttftBase ? ` · 7d ${formatMs(ttftBase.p50_ms)}` : ''}`,
-                    `p95 ${formatMs(ttftNow.p.p95_ms)}${ttftBase ? ` · 7d ${formatMs(ttftBase.p50_ms)}` : ''}`,
-                  )}
+                : ttftBase
+                  ? t(`7d ${formatMs(ttftBase.p50_ms)}`, `7d ${formatMs(ttftBase.p50_ms)}`)
+                  : undefined}
               statusHint={ttftNow
                 ? t(
                     `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
