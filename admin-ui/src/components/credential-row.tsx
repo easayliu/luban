@@ -111,11 +111,11 @@ const COL = {
   quota5h: 'w-44 2xl:w-48',
   quota7d: 'w-44 2xl:w-48',
   /**
-   * 设备、模拟会话、RPM 三枚「图标 + 计数徽章」上下叠在一格里，与卡片页脚同一副面孔；
-   * 原来单独的 RPM 列并进来了，它那 w-18 让给这一列：w-28 放得下 `⏱ 120/120` 加一枚
-   * 「自定义」策略徽章（「跟随默认」那枚不画，见 [devicePolicyMeta]）。
+   * 设备、模拟会话、RPM 三行迷你进度条（[SlotMeterRow]），与用量列同一套语言；原来单独的 RPM
+   * 列并进来了，它那 w-18 让给这一列。定宽的只有图标与数字（最宽 `100/1000` 约 77px），
+   * 其余给条，w-32 里条至少还有 30px。
    */
-  devices: 'w-28',
+  devices: 'w-32',
   recent: 'hidden w-22 2xl:table-cell',
   cost: 'w-22',
   action: 'w-10',
@@ -516,64 +516,46 @@ export const CredentialRow = memo(function CredentialRow({
           />
         </TableCell>
         <TableCell className={COL.devices}>
-          {/* 设备与模拟会话两种名额上下两行、各带自己的图标；两颗按钮开的是同一个对话框。 */}
-          <div className="flex flex-col items-start gap-0.5">
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
+          {/* 三行迷你进度条：设备、模拟会话、RPM，与左边用量列同一套语言（标签 · 数字 · 条）。
+              条与文字同一行、高 4px，三行加起来与用量列那块一样高；条是弹性的，数字再长只会把
+              条挤短，不会把列撑宽。不限上限的那行没有分母、不画条。每行整体可点：前两行开名额
+              对话框，第三行开 RPM 上限对话框；策略写在悬浮提示里。 */}
+          <div className="flex flex-col gap-0.5">
+            <SlotMeterRow
+              icon={SmartphoneIcon}
+              count={cred.device_count}
+              limit={cred.device_limit_effective}
+              usage={deviceUsage}
+              title={t(`已绑定设备 ${cred.device_count}/${effectiveLimit} · ${policy.label}策略 · 点击查看`, `Bound devices ${cred.device_count}/${effectiveLimit} · ${policy.label} policy · click to view`)}
+              ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
               onClick={() => setDevicesOpen(true)}
-              title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
-              aria-haspopup="dialog"
-            >
-              <SmartphoneIcon className="size-3.5 text-muted-foreground" aria-hidden />
-              {/* 计数底色随名额占用走（绿 / 黄 / 红），与卡片同一套判定，见 [deviceUsageMeta]。 */}
-              <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
-                {cred.device_count}/{effectiveLimit}
-              </Badge>
-              {/* 跟随默认那一档不画徽章，见 [devicePolicyMeta]；策略仍写在按钮的悬浮提示里。 */}
-              {!policy.isDefault && <Badge variant={policy.variant} size="sm">{policy.label}</Badge>}
-            </Button>
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
+            />
+            <SlotMeterRow
+              icon={MessagesSquareIcon}
+              count={cred.session_count}
+              limit={cred.session_limit_effective}
+              usage={sessionUsage}
+              title={t(`活跃模拟会话 ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label}策略 · 点击查看`, `Active simulated sessions ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label} policy · click to view`)}
+              ariaLabel={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
               onClick={() => setDevicesOpen(true)}
-              title={t(`查看模拟会话 · ${sessionPolicy.label}策略`, `View simulated sessions · ${sessionPolicy.label} policy`)}
-              aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              <MessagesSquareIcon className="size-3.5 text-muted-foreground" aria-hidden />
-              <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
-                {cred.session_count}/{sessionEffectiveLimit}
-              </Badge>
-              {!sessionPolicy.isDefault && <Badge variant={sessionPolicy.variant} size="sm">{sessionPolicy.label}</Badge>}
-            </Button>
-            {/* 当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的），分母是生效上限、不限时 ∞；
-                点开 RPM 上限对话框。零值不再写成「—」：三枚并排，同一种读法。 */}
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
-              onClick={() => setRpmOpen(true)}
+            />
+            <SlotMeterRow
+              icon={GaugeIcon}
+              count={cred.rpm}
+              limit={rpmLimit}
+              usage={rpmUsage}
               title={rpmLimit > 0
                 ? t(
-                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），打满后新请求分流到别的账号、已绑定的设备收到 429 · ${rpmPolicy.label}策略`,
-                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included); once full, new requests spill to another account and bound devices get a 429 · ${rpmPolicy.label} policy`,
+                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），打满后新请求分流到别的账号、已绑定的设备收到 429 · ${rpmPolicy.label}策略 · 点击调整`,
+                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included); once full, new requests spill to another account and bound devices get a 429 · ${rpmPolicy.label} policy · click to adjust`,
                 )
                 : t(
-                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的） · ${rpmPolicy.label}策略`,
-                  `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included) · ${rpmPolicy.label} policy`,
+                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的） · ${rpmPolicy.label}策略 · 点击调整`,
+                  `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included) · ${rpmPolicy.label} policy · click to adjust`,
                 )}
-              aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              <GaugeIcon className="size-3.5 text-muted-foreground" aria-hidden />
-              <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
-                {cred.rpm}/{rpmEffectiveLimit}
-              </Badge>
-              {!rpmPolicy.isDefault && <Badge variant={rpmPolicy.variant} size="sm">{rpmPolicy.label}</Badge>}
-            </Button>
+              ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
+              onClick={() => setRpmOpen(true)}
+            />
           </div>
         </TableCell>
         <TableCell className={COL.recent}>
@@ -1117,6 +1099,64 @@ function ListQuotaDetails({
         </div>
       </div>
     </dl>
+  )
+}
+
+/**
+ * 名额列的一行：图标、`当前/上限`、内联细条。数字按占用配色（0 灰、有量默认色、快满黄、
+ * 满红，见 [deviceUsageMeta]），条同色；不限上限时分母是 ∞、不画条。整行是一颗按钮，
+ * 条只是装饰（aria-hidden），读屏靠 aria-label。条用两个 span 画而不是 Meter 组件：按钮里
+ * 只能放行内内容，Meter 渲染的是带 role 的块级元素。
+ */
+function SlotMeterRow({
+  icon: Icon,
+  count,
+  limit,
+  usage,
+  title,
+  ariaLabel,
+  onClick,
+}: {
+  icon: typeof SmartphoneIcon
+  count: number
+  limit: number
+  usage: ReturnType<typeof deviceUsageMeta>
+  title: string
+  ariaLabel: string
+  onClick: () => void
+}) {
+  const pct = limit > 0 ? Math.min(100, Math.round((count / limit) * 100)) : 0
+  const numberClass = usage.level === 'critical'
+    ? 'text-destructive'
+    : usage.level === 'warning'
+      ? 'text-warning'
+      : usage.level === 'empty'
+        ? 'text-muted-foreground'
+        : 'text-foreground'
+  const barClass = usage.level === 'critical'
+    ? 'bg-destructive'
+    : usage.level === 'warning'
+      ? 'bg-warning'
+      : 'bg-success'
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={ariaLabel}
+      aria-haspopup="dialog"
+      className="flex h-4 w-full min-w-0 items-center gap-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+    >
+      <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+      <span className={cn('shrink-0 tabular-nums', numberClass)}>
+        {count}/{limit > 0 ? limit : '∞'}
+      </span>
+      {limit > 0 && (
+        <span className="block h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted" aria-hidden>
+          <span className={cn('block h-full rounded-full', barClass)} style={{ width: `${pct}%` }} />
+        </span>
+      )}
+    </button>
   )
 }
 
