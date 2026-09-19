@@ -1064,7 +1064,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 cacheRate == null ? undefined : (
                   // 手机上一行两格、一格不到 190px，图标加数字加 80px 的迷你线放不下，
                   // 会压到隔壁；sm 起再画。
-                  <CacheHitSparkline slots={cacheSeries.slots} className="hidden sm:flex" />
+                  <CacheHitSparkline slots={cacheSeries.slots} />
                 )
               }
               status={cacheRate == null
@@ -1092,7 +1092,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
               trend={
                 ttftNow == null ? undefined : (
-                  <TtftSparkline slots={ttftSeries.slots} className="hidden sm:flex" />
+                  <TtftSparkline slots={ttftSeries.slots} />
                 )
               }
               status={ttftNow == null
