@@ -316,11 +316,11 @@ function TtftTable({
   )
 }
 
-/** 概览那一格里的迷你趋势（p50）。 */
+/** 概览那一格里的迷你趋势（p50）。总宽固定、柱子按格数均分，理由见 CacheHitSparkline。 */
 export function TtftSparkline({ slots, className }: { slots: TtftSlot[]; className?: string }) {
   const maxP50 = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.p50Ms))
   return (
-    <span aria-hidden className={cn('flex h-5 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 w-20 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const heightPct = slot.hasTraffic && maxP50 > 0
           ? Math.min(100, (slot.p50Ms / maxP50) * 100)
@@ -329,7 +329,7 @@ export function TtftSparkline({ slots, className }: { slots: TtftSlot[]; classNa
         return (
           <span
             key={slot.ts}
-            className={cn('w-1.5 rounded-t', heightPct == null ? 'bg-muted-foreground/24' : 'bg-chart-2')}
+            className={cn('min-w-0 flex-1 rounded-t', heightPct == null ? 'bg-muted-foreground/24' : 'bg-chart-2')}
             style={{
               height: heightPct == null ? '0.125rem' : `max(0.125rem, ${heightPct}%)`,
               opacity: heightPct == null ? undefined : last ? 1 : 0.4,

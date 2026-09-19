@@ -247,17 +247,21 @@ export function CacheHitTable({
   )
 }
 
+/**
+ * 概览那一格里的迷你趋势。总宽固定 5rem、柱子按格数均分：格数从 7 天的 7 格改成 24 小时的
+ * 24 格之后，每柱定宽会把整条线撑到 170px、压到隔壁那格的图标上。
+ */
 export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; className?: string }) {
   const maxInput = Math.max(0, ...slots.map((s) => s.inputTokens))
   return (
-    <span aria-hidden className={cn('flex h-5 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 w-20 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
         const last = i === slots.length - 1
         return (
           <span
             key={slot.ts}
-            className={cn('w-1.5 rounded-t', rate == null ? 'bg-muted-foreground/24' : 'bg-chart-1')}
+            className={cn('min-w-0 flex-1 rounded-t', rate == null ? 'bg-muted-foreground/24' : 'bg-chart-1')}
             style={{
               height: rate == null ? '0.125rem' : `max(0.125rem, ${rate * 100}%)`,
               opacity:
