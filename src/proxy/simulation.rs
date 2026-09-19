@@ -35,6 +35,17 @@ use super::{
 /// 但**部署后每个模型族的第一条**要按写入价付一次，而且会**改变模型行为**——客户端拿到的
 /// 是一个被告知「你是 Claude Code」的模型，输出风格与工具偏好都会随之偏移。不想要就把
 /// [`store::SIMULATE_CC`] 关掉，代价是这类请求退回「上游直接拒」。
+/// [`Simulation::detect`] 派生会话 id 的来源，见那里的 `session_id` 注释。
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SimSessionSeed<'a> {
+    /// 选号时占到了会话槽位（[`crate::credentials::slot_session_seed`]）：来访自带的会话 id
+    /// 也换成槽位那个（除非不改身份）。
+    Slot(&'a str),
+    /// 没占槽位（带设备身份的模拟请求、测试夹具）：来访自带的按账号钉住，没带才按这个
+    /// 缓存前缀键（[`sim_session_key`]）派生。
+    Prefix(&'a str),
+}
+
 pub(super) struct Simulation {
     /// 按模型族选出的官方基座提示词；模型认不出来时 `None`——基座是逐字节从抓包取的，
     /// 猜错一族（把 sonnet 的 10682 字节发给 opus）比不发更糟。见 [`cc_system_base`]。
@@ -45,10 +56,9 @@ pub(super) struct Simulation {
     /// `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里 `session_id` 的**同一个**取值：
     /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
     ///
-    /// **优先用来访自己那个**（[`incoming_session_id`]）：客户端各开各的会话，折叠成一个
-    /// 就是「一台设备上一个会话打了所有请求」。来访没带才按「账号 + 缓存前缀 + 对话起点」派生
-    /// 一个（[`session_id_for`]）：tools、system、首条用户消息相同的请求同一条会话，任一处变了
-    /// 就是另一条。
+    /// 占了会话槽位的按槽位派生（[`session_id_for`]，每个账号固定一组、对话之间复用）；没占
+    /// 槽位的优先用来访自己那个（[`incoming_session_id`]，按账号钉住），没带才按缓存前缀 +
+    /// 对话起点派生。
     pub(super) session_id: String,
     /// 这条请求在会话链条上的位置：`cc_prompt_id` / `cc_prev_req` /
     /// `diagnostics.previous_message_id` 三个关联字段的取值，见 [`CcSessionLink`]。
@@ -144,20 +154,25 @@ impl Simulation {
         flags: store::ForwardFlags,
         cred: &crate::credentials::Credential,
         device_fp: &str,
-        session_key: &str,
+        seed: SimSessionSeed<'_>,
     ) -> Option<Self> {
         let v = body?;
         let reason = simulation_reason(Some(v), headers, from_cc_client, flags)?;
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
         let profile = cc_profile_for(model);
-        // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个派生 id 上就是
-        // 「一台设备一个会话打了所有请求」——比每请求一个新 id 更假。来访没带才按账号 +
-        // 会话键（缓存前缀 + 对话起点，[`sim_session_key`]）派生：tools、system、首条用户消息
-        // 相同的请求是同一条会话，换了应用、工作区或开了新对话就是另一条。来访那个按账号钉住（[`account_session_id`]）：同一条会话换号后不该
-        // 带着同一个 uuid 出现在另一个组织下；与透传路径同一道闸（`spoof_identity`）。
-        let session_id = incoming_session_id(headers, Some(v))
-            .map(|sid| pin_session_id(cred, sid, flags.spoof_identity))
-            .unwrap_or_else(|| session_id_for(cred, session_key));
+        // 会话 id：**占了槽位的**（[`SimSessionSeed::Slot`]，选号时按会话键写了会话绑定）一律用
+        // 槽位派生的那个——每个账号只有会话上限那么多个会话 id，对话之间复用，上游看到的 id 数
+        // 有界；来访自带会话 id 也不例外，除非 `spoof_identity` 关着（不改身份，原样发）。没占
+        // 槽位的（[`SimSessionSeed::Prefix`]，带设备身份的模拟请求）沿用旧规则：来访自己那个按
+        // 账号钉住（[`account_session_id`]，同一条会话换号后不该带着同一个 uuid 出现在另一个
+        // 组织下），没带才按缓存前缀 + 对话起点（[`sim_session_key`]）派生。
+        let session_id = match (incoming_session_id(headers, Some(v)), seed) {
+            (Some(sid), SimSessionSeed::Prefix(_)) => {
+                pin_session_id(cred, sid, flags.spoof_identity)
+            }
+            (Some(sid), SimSessionSeed::Slot(_)) if !flags.spoof_identity => sid,
+            (_, SimSessionSeed::Slot(s) | SimSessionSeed::Prefix(s)) => session_id_for(cred, s),
+        };
         let link = CcSessionLink::load(
             CcSessionKey { cred_id: cred.id, session_id: &session_id },
             crate::telemetry::last_is_new_prompt_body(v),

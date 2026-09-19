@@ -43,7 +43,7 @@ use super::session_id::{
     bare_session_id, incoming_session_id, outbound_session_id, session_id_conflict,
 };
 use super::session_link::{CcRequestKind, client_session_link};
-use super::simulation::{Simulation, inbound_facts, is_cc_shaped, simulates_cc};
+use super::simulation::{SimSessionSeed, Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
     block_site, error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
     is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
@@ -854,6 +854,22 @@ pub(super) async fn handle_inner(
     // 一条 `break` 之前都必经那次赋值。循环之后它会被交给 `ReqLog` 拿着，活到响应流结束。
     let mut route_load: UpstreamRouteGuard;
     let (upstream, resp, sent) = loop {
+        // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定，见
+        // [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、对话
+        // 之间复用。每轮都查——换号重试后是另一个号上的另一个槽位。没占槽位的（带设备身份的
+        // 模拟请求）退回按缓存前缀派生。
+        let session_slot = match (&session_key, device_id.is_none()) {
+            (Some(k), true) => state.store.session_slot(cred.id, k).unwrap_or_else(|e| {
+                tracing::warn!(cred_id = cred.id, error = %e, "failed to read the session slot; deriving the session id from the cache prefix instead");
+                None
+            }),
+            _ => None,
+        };
+        let slot_seed = session_slot.map(crate::credentials::slot_session_seed);
+        let seed = match &slot_seed {
+            Some(s) => SimSessionSeed::Slot(s),
+            None => SimSessionSeed::Prefix(prefix_key.as_deref().unwrap_or_default()),
+        };
         let sim = Simulation::detect(
             body_json.as_ref(),
             &headers,
@@ -861,7 +877,7 @@ pub(super) async fn handle_inner(
             flags,
             &cred,
             &device_fp,
-            prefix_key.as_deref().unwrap_or_default(),
+            seed,
         );
         // 真实 CC（API-key 模式）来访的会话关联字段：它自己那条 billing header 里没有
         // `cc_prompt_id`/`cc_prev_req`，整条也没有 `diagnostics`，而订阅端官方每条主线程

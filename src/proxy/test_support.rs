@@ -161,7 +161,16 @@ pub(super) fn detect_with(
     // 会话键按代理里那条式子从体算（缓存前缀）：解析不了的体没有键，给个定值即可——那种
     // 体 `detect` 本来就返回 `None`。
     let key = v.as_ref().map(super::sim_session_key).unwrap_or_default();
-    super::Simulation::detect(v.as_ref(), headers, from_cc_client, flags, &test_cred(), "fp", &key)
+    // 夹具不走选号、没有槽位，会话 id 按缓存前缀派生。
+    super::Simulation::detect(
+        v.as_ref(),
+        headers,
+        from_cc_client,
+        flags,
+        &test_cred(),
+        "fp",
+        super::SimSessionSeed::Prefix(&key),
+    )
 }
 
 pub(super) fn detect_for(body: &Bytes, flags: store::ForwardFlags) -> Option<super::Simulation> {

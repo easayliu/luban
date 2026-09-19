@@ -220,7 +220,7 @@ pub async fn probe(
     let flags = store::ForwardFlags::default();
     // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
     // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。
-    let sim = probe_simulation(cred, &device_fp, model);
+    let sim = probe_simulation(cred, model);
     let headers = build_forward_headers_for(
         &HeaderMap::new(),
         &token,
@@ -752,11 +752,7 @@ async fn send_quota_probe(
 ///
 /// 别的模型退回该族的主线程 profile：多花一个基座的写入价（约 300 / 2700 token，且带
 /// `scope:global` 断点，全网共用一份、基本走缓存读价），换一条真实存在的形态。
-pub(super) fn probe_simulation(
-    cred: &crate::credentials::Credential,
-    device_fp: &str,
-    model: &str,
-) -> Simulation {
+pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
     // **逐字比规范名**，不是「名字里带 haiku」：官方那条额度探测恒为
     // `claude-haiku-4-5-20251001`（[`QUOTA_PROBE_MODEL`]），haiku-3 / 3.5 / 将来某个 haiku
     // 都不该套那身皮——它们的连通性测试要走正常主线程探针。
@@ -769,7 +765,9 @@ pub(super) fn probe_simulation(
     Simulation {
         base: if haiku { None } else { cc_system_base(model) },
         profile,
-        session_id: session_id_for(cred, device_fp),
+        // 探测用第 0 个槽位的会话 id：它是 luban 自己发的一条小请求，挂在这个账号固定的那组
+        // 会话 id 之内，不另造一个。
+        session_id: session_id_for(cred, &crate::credentials::slot_session_seed(0)),
         link: CcSessionLink::default(),
         reason: SimulationReason::Probe,
         // 探测不补第四块：它一句 `ping` 就完，没有客户端 system 要安置，多一万字节的前缀只是
@@ -1254,7 +1252,7 @@ mod tests {
     fn probe_request_is_official_shaped() {
         let cred = test_cred();
         const HAIKU: &str = "claude-haiku-4-5-20251001";
-        let sim = crate::proxy::probe_simulation(&cred, "fp", HAIKU);
+        let sim = crate::proxy::probe_simulation(&cred, HAIKU);
         let out =
             rewrite_body(&crate::proxy::probe_body(HAIKU), &cred, "fp", all_on(), Some(&sim), None);
         let s = String::from_utf8(out.to_vec()).unwrap();
@@ -1301,7 +1299,7 @@ mod tests {
         // 「无 system、无 billing header、那一小串 beta」的样子，官方从不产生。
         // 连通性测试恰恰要逐个模型都测一遍，所以这条必须分开。
         for model in ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5"] {
-            let sim = crate::proxy::probe_simulation(&cred, "fp", model);
+            let sim = crate::proxy::probe_simulation(&cred, model);
             assert_ne!(
                 sim.profile.kind,
                 config::CcProfileKind::QuotaProbe,

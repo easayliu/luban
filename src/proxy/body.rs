@@ -752,7 +752,8 @@ pub(super) fn sim_device_fingerprint(client_device_id: Option<&str>) -> String {
     )
 }
 
-/// 模拟路径上**来访没带会话 id** 时用来派生会话 id、也用来做会话绑定的键：**缓存前缀**
+/// 模拟路径上**来访没带会话 id** 时用来做会话绑定的键（占了槽位后会话 id 按槽位派生，见
+/// [`crate::credentials::derive_session_id`]；没占槽位的模拟请求也用它派生会话 id）：**缓存前缀**
 /// （`tools` 整段加 `system` 各块正文，不含 billing header 那一块，口径同 [`cache_prefix_of`]）
 /// 再加**对话起点**（第一条 `role:"user"` 消息的文本），一起 sha256，取前 16 字节的小写 hex。
 ///

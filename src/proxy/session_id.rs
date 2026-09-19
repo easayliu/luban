@@ -155,28 +155,17 @@ pub(super) fn bare_session_id(
     )
 }
 
-/// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 会话键)` 取前 16 字节，
-/// 按 uuid v4 形态格式化。会话键是这条请求的**缓存前缀加对话起点**的指纹（[`sim_session_key`]：
-/// tools、system 正文与首条用户消息），同一账号下同一条对话恒定，换了对话或换了账号即不同。
+/// 模拟用的 session_id：按「账号 + seed」派生，见 [`crate::credentials::derive_session_id`]。
 ///
-/// 此前第二段是设备指纹：同一账号经模拟路径的所有裸请求共用一个会话 id，不同应用、不同
-/// 工作区的对话在上游看来是一条会话打了全部请求。改按前缀派生后，一条会话里 tools 与 system
-/// 稳定、消息逐轮增长，与官方一条会话的形态一致；设备仍是同一台（[`sim_device_fingerprint`]）。
-///
-/// 前缀是为了和 [`crate::credentials::Credential::spoof_device_id`] 分开取值——同样的输入
-/// 派生出两个字段，不加区分前缀就会得到「device_id 与 session_id 的高位相同」这种真实
-/// 客户端不产生的相关性。
-pub(super) fn session_id_for(cred: &crate::credentials::Credential, session_key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"luban-session\0");
-    h.update(cred.account_uuid.as_deref().unwrap_or("").as_bytes());
-    h.update([0u8]);
-    h.update(session_key.as_bytes());
-    let digest = h.finalize();
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&digest[..16]);
-    uuid_from_bytes(b)
+/// seed 正常是**槽位**（[`crate::credentials::slot_session_seed`]）：这条会话在选中的号上占的
+/// 那个槽位，由选号时的会话绑定分配（`session_bindings.slot`），槽位释放后下一个对话复用同一个
+/// 会话 id，上游看到的每个账号只在会话上限那么多个 id 之间轮转。没有槽位的（带设备身份、不写
+/// 会话绑定的模拟请求）退回按缓存前缀（[`sim_session_key`]）派生，与 v0.3.126 相同。
+pub(super) fn session_id_for(cred: &crate::credentials::Credential, seed: &str) -> String {
+    crate::credentials::derive_session_id(
+        &crate::credentials::session_account_key(cred.account_uuid.as_deref(), cred.id),
+        seed,
+    )
 }
 
 /// 来访自带会话 id 时，出站两处（`X-Claude-Code-Session-Id` 与 `metadata.user_id`）落的那个
@@ -229,9 +218,47 @@ pub(super) fn pin_session_id(
 #[cfg(test)]
 mod tests {
     use crate::proxy::test_support::{
-        PLAIN_BODY, all_on, detect_for, detect_with, rewrite_body_with_session, sim_for, test_cred,
+        ACCOUNT_UUID, PLAIN_BODY, all_on, detect_for, detect_with, rewrite_body_with_session,
+        sim_for, test_cred,
     };
     use crate::proxy::{Bytes, HeaderValue, store};
+
+    /// 占了槽位的模拟请求，会话 id 一律是槽位派生的那个（来访自带的也换掉，除非不改身份）；
+    /// 与后台列表算出来的同一个值。
+    #[test]
+    fn slotted_simulation_uses_the_slot_session_id() {
+        const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+        let body = format!(
+            r#"{{"model":"claude-opus-5","max_tokens":8,"messages":[{{"role":"user","content":"hi"}}],"metadata":{{"user_id":"{{\"device_id\":\"\",\"account_uuid\":\"a\",\"session_id\":\"{SID}\"}}"}}}}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let h = crate::proxy::HeaderMap::new();
+        let seed = crate::credentials::slot_session_seed(2);
+        let detect = |flags: store::ForwardFlags, slotted: bool| {
+            let seed = if slotted {
+                crate::proxy::SimSessionSeed::Slot(&seed)
+            } else {
+                crate::proxy::SimSessionSeed::Prefix("prefix")
+            };
+            super::Simulation::detect(Some(&v), &h, false, flags, &test_cred(), "fp", seed)
+                .unwrap()
+                .session_id
+        };
+        let slot2 = crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 2);
+        assert_eq!(detect(all_on(), true), slot2, "占了槽位就用槽位的 id");
+        assert_eq!(detect(all_on(), true), super::session_id_for(&test_cred(), &seed));
+        assert_ne!(detect(all_on(), false), slot2, "没占槽位：来访自带的按账号钉住");
+        assert_eq!(detect(all_on(), false), super::pin_session_id(&test_cred(), SID.into(), true));
+        let mut off = all_on();
+        off.spoof_identity = false;
+        assert_eq!(detect(off, true), SID, "不改身份时原样");
+        assert_ne!(
+            slot2,
+            crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 0),
+            "槽位之间不同"
+        );
+        assert!(super::looks_like_uuid(&slot2));
+    }
 
     /// 来访没带会话 id 时，模拟路径的会话 id 按**缓存前缀 + 对话起点**派生：tools、system、
     /// 首条用户消息相同的请求是同一条会话（后续轮次追加消息不换），任一处变了就是另一条；
@@ -259,15 +286,30 @@ mod tests {
         let key = crate::proxy::sim_session_key(&v);
         let h = crate::proxy::HeaderMap::new();
         // 设备指纹不参与：同一账号换个指纹，会话 id 不变（设备与会话各自派生）。
-        let other_fp =
-            super::Simulation::detect(Some(&v), &h, false, all_on(), &test_cred(), "other", &key)
-                .unwrap();
+        let other_fp = super::Simulation::detect(
+            Some(&v),
+            &h,
+            false,
+            all_on(),
+            &test_cred(),
+            "other",
+            crate::proxy::SimSessionSeed::Prefix(&key),
+        )
+        .unwrap();
         assert_eq!(other_fp.session_id, a1);
         // 换账号即另一条会话。
         let mut cred2 = test_cred();
         cred2.account_uuid = Some("11111111-2222-4333-8444-555555555555".into());
-        let other_acct =
-            super::Simulation::detect(Some(&v), &h, false, all_on(), &cred2, "fp", &key).unwrap();
+        let other_acct = super::Simulation::detect(
+            Some(&v),
+            &h,
+            false,
+            all_on(),
+            &cred2,
+            "fp",
+            crate::proxy::SimSessionSeed::Prefix(&key),
+        )
+        .unwrap();
         assert_ne!(other_acct.session_id, a1);
         // 直接对上派生函数。
         assert_eq!(a1, super::session_id_for(&test_cred(), &key));

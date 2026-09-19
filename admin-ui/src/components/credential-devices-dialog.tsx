@@ -713,8 +713,8 @@ function SessionCapacityCard({
           </CardTitle>
           <CardDescription className="text-xs">
             {t(
-              '走模拟路径、没有设备身份的来访按会话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额；与设备名额互不相干。',
-              'Requests on the simulation path without a device identity bind to this account per session (their session id, else cache prefix + first user message) and take a slot here; independent of device slots.',
+              '走模拟路径、没有设备身份的来访按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位；出站会话 id 按槽位派生、释放后被下一个对话复用，上游看到的会话 id 数就是上限。与设备名额互不相干。',
+              'Requests on the simulation path without a device identity bind to this account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused by the next conversation once freed, so upstream sees at most this many session ids. Independent of device slots.',
             )}
           </CardDescription>
           {!editing && (
@@ -973,18 +973,25 @@ function SessionList({
             const lastSeenRelative = relativeTime(session.last_seen_at, undefined, language)
             const firstBoundFull = formatFullTime(session.created_at, language)
             const lastSeenFull = formatFullTime(session.last_seen_at, language)
-            // 32 位 hex 是按缓存前缀派生的键，uuid 是来访自带的会话 id：一眼分清哪种客户端。
+            // 主行是上游看到的会话 id（按槽位派生、对话之间复用），槽位号做徽章；对话自己的键
+            // （32 位 hex 是按缓存前缀派生的，uuid 是来访自带的）退到悬浮提示里。
             const derived = /^[0-9a-f]{32}$/.test(session.session_key)
+            const keyKind = derived ? t('按前缀', 'by prefix') : t('自带 id', 'client id')
             return (
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-2">
                   <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 id 由它派生，释放后被下一个对话复用', 'Slot: the session id derives from it and is reused by the next conversation once freed')}>
+                    #{session.slot}
+                  </Badge>
                   <Tooltip>
                     <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">
-                      {session.session_key}
+                      {session.session_id}
                     </TooltipTrigger>
-                    <TooltipPopup className="max-w-80 whitespace-normal break-all text-left">
-                      {session.session_key}
+                    <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
+                      {t(`上游看到的会话 id ${session.session_id}`, `Session id upstream sees: ${session.session_id}`)}
+                      <br />
+                      {t(`对话键（${keyKind}）${session.session_key}`, `Conversation key (${keyKind}): ${session.session_key}`)}
                     </TooltipPopup>
                   </Tooltip>
                   <Badge variant="secondary" size="sm">
@@ -993,17 +1000,17 @@ function SessionList({
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`复制会话键 ${session.session_key}`, `Copy session key ${session.session_key}`)}
+                      aria-label={t(`复制会话 id ${session.session_id}`, `Copy session id ${session.session_id}`)}
                       onClick={async () => {
-                        const copied = await copyText(session.session_key)
+                        const copied = await copyText(session.session_id)
                         toastManager.add(copied
-                          ? { title: t('已复制会话键', 'Copied session key'), type: 'success' }
-                          : { title: t('复制失败', 'Copy failed'), description: session.session_key, type: 'error' })
+                          ? { title: t('已复制会话 id', 'Copied session id'), type: 'success' }
+                          : { title: t('复制失败', 'Copy failed'), description: session.session_id, type: 'error' })
                       }}
                     >
                       <CopyIcon />
                     </TooltipTrigger>
-                    <TooltipPopup>{t('复制会话键', 'Copy session key')}</TooltipPopup>
+                    <TooltipPopup>{t('复制会话 id', 'Copy session id')}</TooltipPopup>
                   </Tooltip>
                   <Button
                     size="xs"

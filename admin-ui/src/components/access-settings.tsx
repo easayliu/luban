@@ -981,8 +981,8 @@ function DefaultSessionLimit() {
         <FieldLabel>{t('默认模拟会话上限', 'Default simulated session limit')}</FieldLabel>
         <FieldDescription className="max-w-xl leading-5">
           {t(
-            '走模拟路径、没有设备身份的请求按会话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额，与设备名额分开计；有效期、原账号关联沿用上面两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
-            'Requests on the simulation path without a device identity bind to an account per session (their session id, else cache prefix + first user message) and take a session slot, counted separately from device slots; TTL and affinity follow the two settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
+            '走模拟路径、没有设备身份的请求按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位，出站会话 id 按槽位派生、释放后复用，上游看到的会话 id 数就是这个上限；与设备名额分开计；有效期、原账号关联沿用上面两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
+            'Requests on the simulation path without a device identity bind to an account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused once freed, so upstream sees at most this many session ids per account, counted separately from device slots; TTL and affinity follow the two settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
           )}
         </FieldDescription>
         <Badge variant="secondary" size="sm">

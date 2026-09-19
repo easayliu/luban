@@ -1953,19 +1953,33 @@ impl CredentialStore {
     pub fn list_sessions(&self, cred_id: i64) -> Result<Vec<SessionBinding>> {
         let ttl = self.device_binding_ttl();
         let conn = self.conn.lock();
+        // 会话 id 要账号 uuid 才算得出；凭证不存在时按空 uuid 算（调用方已先判过 404）。
+        let account_uuid: Option<String> = conn
+            .query_row("SELECT account_uuid FROM credentials WHERE id = ?1", [cred_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
         let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
-            "SELECT session_key, request_count, created_at, last_seen_at \
+            "SELECT session_key, slot, request_count, created_at, last_seen_at \
                FROM session_bindings \
               WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, session_key ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &Row| {
+            let slot: i64 = r.get(1)?;
             Ok(SessionBinding {
                 session_key: r.get(0)?,
-                request_count: r.get(1)?,
-                created_at: r.get(2)?,
-                last_seen_at: r.get(3)?,
+                slot,
+                session_id: crate::credentials::sim_slot_session_id(
+                    account_uuid.as_deref(),
+                    cred_id,
+                    slot,
+                ),
+                request_count: r.get(2)?,
+                created_at: r.get(3)?,
+                last_seen_at: r.get(4)?,
             })
         };
         let rows = if ttl > 0 {
@@ -1974,6 +1988,20 @@ impl CredentialStore {
             stmt.query_map([cred_id], map_row)?.collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
+    }
+
+    /// 这条会话键在该凭证上占的槽位；没绑在这个号上为 `None`。转发路径选完号后查一次，
+    /// 会话 id 由它派生（见 `crate::credentials::slot_session_seed`）。
+    pub fn session_slot(&self, cred_id: i64, session_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT slot FROM session_bindings WHERE session_key = ?1 AND cred_id = ?2",
+                params![session_key, cred_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// 一键清掉该凭证的**全部**模拟会话绑定（含休眠的软绑定），返回删掉的条数。会话比设备
@@ -3722,6 +3750,11 @@ pub struct SessionBinding {
     /// 会话键：来访自带的会话 id，或缓存前缀加首条用户消息的指纹（32 个 hex 字符），见
     /// `Select::session_key`。
     pub session_key: String,
+    /// 在该凭证上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。
+    pub slot: i64,
+    /// 上游看到的会话 id（`X-Claude-Code-Session-Id`），按「账号 + 槽位」派生，与转发路径同一个
+    /// 函数（`crate::credentials::sim_slot_session_id`）。
+    pub session_id: String,
     /// 绑定之后再命中的请求数（建行那一轮不计，口径同 `device_bindings.request_count`；
     /// 随绑定行走，解绑即归零）。
     pub request_count: i64,
@@ -4670,9 +4703,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         -- 模拟会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
         -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 里的 session_key）：
         -- 带设备身份的由 device_bindings 管，一条请求不占两份名额。
+        -- slot：这条会话在该凭证上占的槽位（0 起，取活跃绑定里最小的空位），出站会话 id 由
+        -- 「账号 + 槽位」派生——槽位释放后被下一个对话复用，上游看到的会话 id 数有界。
         CREATE TABLE IF NOT EXISTS session_bindings (
             session_key   TEXT    PRIMARY KEY,
             cred_id       INTEGER NOT NULL,
+            slot          INTEGER NOT NULL DEFAULT 0,
             request_count INTEGER NOT NULL DEFAULT 0,
             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
             last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
@@ -5020,6 +5056,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 旧库补出来是 0 = 跟随全局默认 [`DEFAULT_SESSION_LIMIT`]。**同样必须补在重建之后**。
     let _ = conn
         .execute("ALTER TABLE credentials ADD COLUMN session_limit INTEGER NOT NULL DEFAULT 0", []);
+    // v0.3.126 / 127 建的 session_bindings 没有 slot 列。补列时把存量行清掉：它们全落在槽位 0
+    // 上，留着会让好几条活跃会话共用一个会话 id，直到各自 TTL 到期；这张表本来就只记最近一小时
+    // 的亲和性，清掉的代价只是那几条对话下一轮重新选号。补列失败（列已在）什么都不动。
+    if conn
+        .execute("ALTER TABLE session_bindings ADD COLUMN slot INTEGER NOT NULL DEFAULT 0", [])
+        .is_ok()
+    {
+        conn.execute("DELETE FROM session_bindings", [])?;
+    }
 
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
@@ -5294,6 +5339,43 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     })
 }
 
+/// 该凭证当前**空着**的最小会话槽位：活跃（TTL 内）绑定占着的槽位之外，从 0 起最小的那个；
+/// `prefer` 给出的槽位空着就直接用它（休眠的软绑定回来优先回原槽位，会话 id 才不换）。
+/// 休眠绑定占过的槽位算空——它们不占名额，槽位（也就是会话 id）让给活跃的对话复用。
+fn free_session_slot(
+    conn: &Connection,
+    cred_id: i64,
+    ttl_secs: i64,
+    prefer: Option<i64>,
+) -> Result<i64> {
+    let active = if ttl_secs > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT slot FROM session_bindings WHERE cred_id = ?1 {active} ORDER BY slot ASC"
+    ))?;
+    let taken: Vec<i64> = if ttl_secs > 0 {
+        stmt.query_map(params![cred_id, ttl_secs], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        stmt.query_map([cred_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    if let Some(p) = prefer
+        && p >= 0
+        && !taken.contains(&p)
+    {
+        return Ok(p);
+    }
+    let mut slot = 0i64;
+    for t in taken {
+        if t > slot {
+            break;
+        }
+        if t == slot {
+            slot += 1;
+        }
+    }
+    Ok(slot)
+}
+
 /// [`CredentialStore::select_for_device`] 里这条请求按哪张表粘住账号、占哪种名额。
 /// 两张表列名不同、上限字段不同、拒绝的错误类型不同，其余规则逐条相同。
 #[derive(Clone, Copy)]
@@ -5348,6 +5430,9 @@ pub struct Select<'a> {
     /// 规则与设备绑定逐条相同（TTL、软绑定、改绑、全满时拒——[`SessionLimitReached`]）。
     /// `device_id` 有值时忽略它：带设备身份的已由设备绑定管着，一条请求不占两份名额。
     /// 非模拟路径一律 `None`：那些来访要么有设备身份，要么是裸请求，形态没变。
+    ///
+    /// 绑定行还记着这条会话在该号上占的**槽位**（[`free_session_slot`]）：出站会话 id 由
+    /// 「账号 + 槽位」派生，槽位释放后下一个对话复用同一个 id，见 [`CredentialStore::session_slot`]。
     pub session_key: Option<&'a str>,
     /// 设备绑定**占名额**的有效期（秒）；`<= 0` 表示永不过期。
     pub ttl_secs: i64,
@@ -5631,16 +5716,37 @@ impl CredentialStore {
                             }
                             .into());
                         }
-                        conn.execute(
-                            &format!(
-                                "UPDATE {} SET last_seen_at = unixepoch(), \
-                                        request_count = request_count + 1 \
-                                  WHERE {} = ?1",
-                                b.table(),
-                                b.column()
-                            ),
-                            [b.key()],
-                        )?;
+                        match b {
+                            // 休眠的会话软绑定回来要重新占槽位：原槽位空着就还用它，被别的对话拿
+                            // 走了就取最小的空位——会话 id 随槽位变，这条对话在上游成了另一条会话。
+                            Binding::Session(key) if !active => {
+                                let old: i64 = conn.query_row(
+                                    "SELECT slot FROM session_bindings WHERE session_key = ?1",
+                                    [key],
+                                    |r| r.get(0),
+                                )?;
+                                let slot = free_session_slot(&conn, c.id, ttl_secs, Some(old))?;
+                                conn.execute(
+                                    "UPDATE session_bindings \
+                                        SET slot = ?2, last_seen_at = unixepoch(), \
+                                            request_count = request_count + 1 \
+                                      WHERE session_key = ?1",
+                                    params![key, slot],
+                                )?;
+                            }
+                            _ => {
+                                conn.execute(
+                                    &format!(
+                                        "UPDATE {} SET last_seen_at = unixepoch(), \
+                                                request_count = request_count + 1 \
+                                          WHERE {} = ?1",
+                                        b.table(),
+                                        b.column()
+                                    ),
+                                    [b.key()],
+                                )?;
+                            }
+                        }
                         self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
                         if device_id.is_none() && rate_limited {
                             self.bare_rate.take(c.id, rate_limit, bare_window);
@@ -5711,18 +5817,29 @@ impl CredentialStore {
             }
         };
 
-        if let Some(b) = binding {
-            conn.execute(
-                &format!(
-                    "INSERT INTO {t} ({k}, cred_id) VALUES (?1, ?2)
-                     ON CONFLICT({k}) DO UPDATE
+        match binding {
+            Some(Binding::Device(did)) => {
+                conn.execute(
+                    "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
+                     ON CONFLICT(device_id) DO UPDATE
                         SET cred_id = ?2, last_seen_at = unixepoch(), \
                             request_count = request_count + 1",
-                    t = b.table(),
-                    k = b.column()
-                ),
-                params![b.key(), chosen.id],
-            )?;
+                    params![did, chosen.id],
+                )?;
+            }
+            Some(Binding::Session(key)) => {
+                // 新对话（或改绑到别的号的对话）在选中的号上取最小的空槽位。上面刚判过
+                // has_room，所以上限内必有空位；不限时槽位按需增长、释放后复用。
+                let slot = free_session_slot(&conn, chosen.id, ttl_secs, None)?;
+                conn.execute(
+                    "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_key) DO UPDATE
+                        SET cred_id = ?2, slot = ?3, last_seen_at = unixepoch(), \
+                            request_count = request_count + 1",
+                    params![key, chosen.id, slot],
+                )?;
+            }
+            None => {}
         }
         // 两个窗口都在**选定之后**才记账（而不是边问边记）：一次选号要连过两道窗口，
         // 边问边记的话，过了第一道却卡在第二道的那个号会白扣一个名额。理由详见
@@ -6844,6 +6961,113 @@ mod tests {
         assert_eq!(store.session_count(a).unwrap(), 0);
         assert_eq!(store.session_count(b).unwrap(), 1, "b 的不动");
         assert_eq!(store.select_for_device(soft_session("s4")).unwrap().id, a);
+    }
+
+    /// 会话槽位：新对话取该号上最小的空位，同键续用原槽位；休眠后原槽位被别的对话拿走就换
+    /// 最小空位、空着就回原位；解绑腾出的槽位被下一个对话复用；槽位派生的会话 id 恒定且各不同。
+    #[test]
+    fn session_slots_are_reused_by_later_conversations() {
+        let (store, ids) = soft_store(&["a"]);
+        let a = ids[0];
+        let slot = |k: &str| store.session_slot(a, k).unwrap();
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, a);
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert_eq!((slot("s1"), slot("s2")), (Some(0), Some(1)), "按最小空位分，同键续用");
+        assert_eq!(slot("nope"), None);
+        // s1 休眠，s3 来了拿走槽位 0；s1 回来只能拿 2。
+        age_session_binding(&store, "s1", 600);
+        assert_eq!(store.select_for_device(soft_session("s3")).unwrap().id, a);
+        assert_eq!(slot("s3"), Some(0), "休眠绑定的槽位算空位");
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert_eq!(slot("s1"), Some(2), "原槽位被占就取最小空位");
+        // s2 休眠后没人占它的槽位，回来还是 1。
+        age_session_binding(&store, "s2", 600);
+        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, a);
+        assert_eq!(slot("s2"), Some(1), "原槽位空着就回原位");
+        // 解绑 s3，下一个对话复用槽位 0。
+        assert!(store.unbind_session(a, "s3").unwrap());
+        assert_eq!(store.select_for_device(soft_session("s4")).unwrap().id, a);
+        assert_eq!(slot("s4"), Some(0));
+        // 列表带槽位与派生的会话 id：同槽位同 id、不同槽位不同 id、形态是 uuid。
+        let list = store.list_sessions(a).unwrap();
+        let cred = store.get(a).unwrap().unwrap();
+        for s in &list {
+            assert_eq!(
+                s.session_id,
+                crate::credentials::sim_slot_session_id(cred.account_uuid.as_deref(), a, s.slot)
+            );
+            assert_eq!(s.session_id.len(), 36, "{}", s.session_id);
+        }
+        let mut sids: Vec<&str> = list.iter().map(|s| s.session_id.as_str()).collect();
+        sids.sort();
+        sids.dedup();
+        assert_eq!(sids.len(), list.len(), "各槽位的会话 id 互不相同: {list:?}");
+        assert_ne!(
+            crate::credentials::sim_slot_session_id(Some("u"), 1, 0),
+            crate::credentials::sim_slot_session_id(Some("v"), 1, 0),
+            "换账号另一组"
+        );
+        // 没有 account_uuid 的两个号（刚登录还没拉到 profile、或旧库）也不能算出同一组：
+        // 按凭证 id 分；同一个号有没有拉到 uuid 会是两组，那是 uuid 回填那一刻的一次性切换。
+        assert_ne!(
+            crate::credentials::sim_slot_session_id(None, 1, 0),
+            crate::credentials::sim_slot_session_id(None, 2, 0),
+            "两个没有 uuid 的号，同槽位不同 id"
+        );
+        assert_eq!(
+            crate::credentials::sim_slot_session_id(None, 1, 0),
+            crate::credentials::sim_slot_session_id(Some("  "), 1, 0),
+            "空白 uuid 当没有"
+        );
+        // 后台列表对没有 uuid 的号也与转发路径同一口径。
+        let (store2, ids2) = soft_store(&["x", "y"]);
+        assert_eq!(store2.select_for_device(soft_session("k")).unwrap().id, ids2[0]);
+        let listed = store2.list_sessions(ids2[0]).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, crate::credentials::sim_slot_session_id(None, ids2[0], 0));
+        assert_ne!(listed[0].session_id, crate::credentials::sim_slot_session_id(None, ids2[1], 0));
+    }
+
+    /// 没有 slot 列的旧库（v0.3.126 / 127）升上来：补列并清掉存量行，再跑一遍不动。
+    #[test]
+    fn migrating_session_bindings_adds_the_slot_column_and_clears_old_rows() {
+        // 先建齐全库并放一个真实凭证（无主行会被 purge_orphan_rows 扫掉，那不是这里要验的），
+        // 再把 session_bindings 换成 v0.3.126 那张没有 slot 列的表。
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO credentials (id, label, access_token, refresh_token, expires_at) \
+             VALUES (1, 'a', 't', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE session_bindings;
+             CREATE TABLE session_bindings (
+                session_key TEXT PRIMARY KEY, cred_id INTEGER NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_seen_at INTEGER NOT NULL DEFAULT (unixepoch())) STRICT;
+             INSERT INTO session_bindings (session_key, cred_id) VALUES ('old', 1);",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM session_bindings", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "存量行清掉");
+        conn.execute(
+            "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES ('new', 1, 3)",
+            [],
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        let slot: i64 = conn
+            .query_row("SELECT slot FROM session_bindings WHERE session_key = 'new'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(slot, 3, "列已在就什么都不动");
     }
 
     /// 带设备身份的请求即使也带了会话键，只按设备绑定：一条请求不占两份名额。

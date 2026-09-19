@@ -421,6 +421,10 @@ export async function listCredentials(): Promise<Credential[]> {
 export interface SessionBinding {
   /** 会话键：来访自带的会话 id，或「缓存前缀（tools + system）+ 首条用户消息」的指纹（32 个 hex 字符）。 */
   session_key: string
+  /** 在该账号上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。 */
+  slot: number
+  /** 上游看到的会话 id（X-Claude-Code-Session-Id），按「账号 + 槽位」派生。 */
+  session_id: string
   /** 绑定之后再命中的请求数（建行那一轮不计，口径同设备绑定；随绑定行走，解绑即归零）。 */
   request_count: number
   /** 首次绑定时间（Unix 秒）。 */

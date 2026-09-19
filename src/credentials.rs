@@ -141,6 +141,53 @@ impl Credential {
     }
 }
 
+/// 模拟路径的会话 id：`sha256("luban-session" ‖ 账号键 ‖ seed)` 取前 16 字节按 uuid v4
+/// 形态格式化。同一账号同一 seed 恒定，换账号或换 seed 即不同。账号键见
+/// [`session_account_key`]：有 `account_uuid` 用它，没有就用凭证 id——两个都没有 uuid 的号
+/// 不能算出同一组会话 id，否则换号后上游会在两个组织下看到同一个会话 uuid。
+///
+/// seed 正常是**槽位**（[`slot_session_seed`]）：每个账号的模拟会话 id 是一组固定的槽位，
+/// 数量就是会话上限，对话占哪个槽位就用哪个 id，槽位释放后下一个对话**复用**同一个 id——
+/// 上游看到的每个账号只在这几个会话 id 之间轮转，与设备 id 恒定的做法一致，而不是每个对话
+/// 一个新 uuid、时间一长无限增多。没有槽位可占的（带设备身份、不写会话绑定的模拟请求，或
+/// luban 自己发的探测）退回按缓存前缀或固定 seed 派生。
+///
+/// 前缀是为了和 [`Credential::spoof_device_id`] 分开取值——同样的输入派生出两个字段，不加
+/// 区分前缀就会得到「device_id 与 session_id 的高位相同」这种真实客户端不产生的相关性。
+pub fn derive_session_id(account_key: &str, seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"luban-session\0");
+    h.update(account_key.as_bytes());
+    h.update([0u8]);
+    h.update(seed.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    crate::proxy::uuid_from_bytes(b)
+}
+
+/// 派生会话 id 时代表「哪个账号」的键：`account_uuid`（去空白、非空）优先，没有就用
+/// `cred:<凭证 id>`。凭证 id 不复用（AUTOINCREMENT），删号重登也是新的一组会话 id。
+/// 转发路径与后台列表都走这里，两边不会漂开。
+pub fn session_account_key(account_uuid: Option<&str>, cred_id: i64) -> String {
+    match account_uuid.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) => u.to_string(),
+        None => format!("cred:{cred_id}"),
+    }
+}
+
+/// 第 `slot` 个会话槽位的 seed（`slot:<n>`），见 [`derive_session_id`]。
+pub fn slot_session_seed(slot: i64) -> String {
+    format!("slot:{slot}")
+}
+
+/// 第 `slot` 个会话槽位的会话 id，见 [`derive_session_id`]。后台列会话时用它算出上游看到的
+/// 那个 uuid，与转发路径同一个函数，两边不会漂开。
+pub fn sim_slot_session_id(account_uuid: Option<&str>, cred_id: i64, slot: i64) -> String {
+    derive_session_id(&session_account_key(account_uuid, cred_id), &slot_session_seed(slot))
+}
+
 /// 把字节切片编码为小写十六进制字符串。
 pub fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;

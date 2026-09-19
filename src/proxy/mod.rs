@@ -134,6 +134,8 @@ pub(crate) use learned_rules::{
 
 mod simulation;
 #[cfg(test)]
+use simulation::SimSessionSeed;
+#[cfg(test)]
 use simulation::{
     CC_BASE_PROMPT_MIN_LEN, CLIENT_SYSTEM_REMINDER_LEAD, MAX_CACHE_BREAKPOINTS, SimEnv,
     SimulationReason, billing_header_text, cap_system_blocks, cc_identity_well_formed,
@@ -537,7 +539,7 @@ fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
 
 /// 把 16 字节按 uuid v4 的形态格式化（打上 version/variant 位，小写带连字符）。
 /// 随机来源见 [`uuid_v4`]，派生来源见 [`Simulation::session_id`]。
-pub(super) fn uuid_from_bytes(mut b: [u8; 16]) -> String {
+pub(crate) fn uuid_from_bytes(mut b: [u8; 16]) -> String {
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10
     let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
