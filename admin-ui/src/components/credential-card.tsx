@@ -677,6 +677,7 @@ export const CredentialCard = memo(function CredentialCard({
             open={devicesOpen}
             onOpenChange={setDevicesOpen}
             limit={limit}
+            sessionLimit={actions.sessionLimit}
           />
           <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
           <DeleteCredentialDialog

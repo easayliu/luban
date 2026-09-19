@@ -98,6 +98,7 @@ pub(super) fn test_cred() -> crate::credentials::Credential {
         priority: 0,
         disabled: false,
         device_limit: 0,
+        session_limit: 0,
         rpm_limit: 0,
         quota_pause_pct: None,
         quota_pause_pct_7d: None,
@@ -157,7 +158,10 @@ pub(super) fn detect_with(
 ) -> Option<super::Simulation> {
     let v = parsed(body);
     let from_cc_client = super::trusted_cc_version(&super::ua_of(headers)).is_some();
-    super::Simulation::detect(v.as_ref(), headers, from_cc_client, flags, &test_cred(), "fp")
+    // 会话键按代理里那条式子从体算（缓存前缀）：解析不了的体没有键，给个定值即可——那种
+    // 体 `detect` 本来就返回 `None`。
+    let key = v.as_ref().map(super::sim_session_key).unwrap_or_default();
+    super::Simulation::detect(v.as_ref(), headers, from_cc_client, flags, &test_cred(), "fp", &key)
 }
 
 pub(super) fn detect_for(body: &Bytes, flags: store::ForwardFlags) -> Option<super::Simulation> {

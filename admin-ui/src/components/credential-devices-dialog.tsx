@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CopyIcon,
+  MessagesSquareIcon,
   PencilIcon,
   RefreshCwIcon,
   SmartphoneIcon,
@@ -9,9 +10,12 @@ import {
 } from 'lucide-react'
 import {
   listCredentialDevices,
+  listCredentialSessions,
   unbindCredentialDevice,
+  unbindCredentialSession,
   type Credential,
   type DeviceBinding,
+  type SessionBinding,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
@@ -109,11 +113,13 @@ export function CredentialDevicesDialog({
   open,
   onOpenChange,
   limit,
+  sessionLimit,
 }: {
   cred: Credential
   open: boolean
   onOpenChange: (open: boolean) => void
   limit: CredentialActions['limit']
+  sessionLimit: CredentialActions['sessionLimit']
 }) {
   const { t, language, locale } = useI18n()
   const credentialLabel = displayCredentialLabel(cred.label, language)
@@ -362,6 +368,10 @@ export function CredentialDevicesDialog({
               error={devices.error}
               onRetry={() => { void devices.refetch() }}
             />
+
+            {/* 模拟会话是另一种名额：走模拟路径、没有设备身份的来访按会话键粘住账号。
+                它们与设备名额互不相干（一条请求只占其一），故单独一张容量卡和一份列表。 */}
+            <SessionCapacityCard cred={cred} sessionLimit={sessionLimit} open={open} />
           </DialogPanel>
 
           <DialogFooter>
@@ -637,5 +647,365 @@ function DeviceStat({ label, value, hint }: { label: string; value: string; hint
       <TooltipTrigger render={stat} />
       <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{hint}</TooltipPopup>
     </Tooltip>
+  )
+}
+
+/**
+ * 模拟会话容量：占用条 + 生效上限 + 策略徽章，以及自己的编辑态（与设备上限那张卡分开：两者
+ * 各自一个 mutation、各自一套三态，混在一个表单里保存哪一个都说不清）。列表挂在卡片下面。
+ */
+function SessionCapacityCard({
+  cred,
+  sessionLimit,
+  open,
+}: {
+  cred: Credential
+  sessionLimit: CredentialActions['sessionLimit']
+  open: boolean
+}) {
+  const { t, locale } = useI18n()
+  const [editing, setEditing] = useState(false)
+  const [policy, setPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.session_limit))
+  const [custom, setCustom] = useState(Math.max(1, cred.session_limit))
+  const sessions = useQuery({
+    queryKey: ['credential-sessions', cred.id],
+    queryFn: () => listCredentialSessions(cred.id),
+    enabled: open,
+  })
+  const count = sessions.data?.length ?? cred.session_count
+  const formattedCount = count.toLocaleString(locale)
+  const effective = cred.session_limit_effective
+  const policyItems = [
+    { value: 'default' as const, label: t('跟随全局默认', 'Use global default') },
+    { value: 'unlimited' as const, label: t('不限会话数', 'Unlimited sessions') },
+    { value: 'custom' as const, label: t('自定义上限', 'Custom limit') },
+  ]
+  const effectiveLabel = effective > 0
+    ? t(`${effective.toLocaleString(locale)} 条`, `${effective.toLocaleString(locale)} ${effective === 1 ? 'session' : 'sessions'}`)
+    : t('不限', 'Unlimited')
+  const currentPolicy = {
+    label: cred.session_limit === 0
+      ? t('跟随默认', 'Use default')
+      : cred.session_limit < 0
+        ? t('不限', 'Unlimited')
+        : t('自定义', 'Custom'),
+    variant: policyVariant(cred.session_limit),
+  }
+  const reset = () => {
+    setEditing(false)
+    setPolicy(policyFromLimit(cred.session_limit))
+    setCustom(Math.max(1, cred.session_limit))
+  }
+  const save = () => {
+    const normalized = Number.isFinite(custom) ? Math.max(1, Math.floor(custom)) : 1
+    const next = policy === 'default' ? 0 : policy === 'unlimited' ? -1 : normalized
+    sessionLimit.mutate(next, { onSuccess: () => setEditing(false) })
+  }
+
+  return (
+    <div className="space-y-5">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm leading-snug">
+            {editing ? t('模拟会话上限', 'Simulated session limit') : t('模拟会话容量', 'Simulated session capacity')}
+          </CardTitle>
+          <CardDescription className="text-xs">
+            {t(
+              '走模拟路径、没有设备身份的来访按会话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额；与设备名额互不相干。',
+              'Requests on the simulation path without a device identity bind to this account per session (their session id, else cache prefix + first user message) and take a slot here; independent of device slots.',
+            )}
+          </CardDescription>
+          {!editing && (
+            <CardAction>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setPolicy(policyFromLimit(cred.session_limit))
+                  setCustom(Math.max(1, cred.session_limit))
+                  setEditing(true)
+                }}
+              >
+                <PencilIcon />
+                {t('调整上限', 'Adjust limit')}
+              </Button>
+            </CardAction>
+          )}
+        </CardHeader>
+        {editing ? (
+          <CardPanel className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel>{t('上限策略', 'Limit policy')}</FieldLabel>
+                <Select
+                  items={policyItems}
+                  value={policy}
+                  onValueChange={(value) => {
+                    if (value) setPolicy(value as LimitPolicy)
+                  }}
+                >
+                  <SelectTrigger aria-label={t('会话上限策略', 'Session limit policy')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectPopup>
+                    {policyItems.map((item) => (
+                      <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+                <FieldDescription>
+                  {t(
+                    '“默认”会自动应用全局会话上限，不等于不限。',
+                    '“Default” applies the global session limit; it does not mean unlimited.',
+                  )}
+                </FieldDescription>
+              </Field>
+              {policy === 'custom' && (
+                <Field>
+                  <FieldLabel>{t('最多活跃会话', 'Maximum active sessions')}</FieldLabel>
+                  <NumberField
+                    value={custom}
+                    min={1}
+                    step={1}
+                    onValueChange={(value) => setCustom(value ?? 1)}
+                  >
+                    <NumberFieldGroup>
+                      <NumberFieldDecrement />
+                      <NumberFieldInput aria-label={t('自定义会话上限', 'Custom session limit')} />
+                      <NumberFieldIncrement />
+                    </NumberFieldGroup>
+                  </NumberField>
+                  <FieldDescription>
+                    {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
+                  </FieldDescription>
+                </Field>
+              )}
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button type="button" variant="outline" disabled={sessionLimit.isPending} onClick={reset}>
+                {t('取消', 'Cancel')}
+              </Button>
+              <Button type="button" loading={sessionLimit.isPending} onClick={save}>{t('保存', 'Save')}</Button>
+            </div>
+          </CardPanel>
+        ) : (
+          <CardPanel className="space-y-3">
+            {effective > 0 ? (
+              <Meter value={Math.min(count, effective)} max={effective} className="gap-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <MeterLabel className="text-xs text-muted-foreground">
+                    {t('名额占用', 'Slots used')}
+                  </MeterLabel>
+                  <span className="shrink-0 font-medium text-sm tabular-nums">
+                    {formattedCount}
+                    <span className="text-muted-foreground">/{effective.toLocaleString(locale)}</span>
+                  </span>
+                </div>
+                <MeterTrack className="h-1.5">
+                  <MeterIndicator className={count >= effective ? 'bg-warning' : 'bg-success'} />
+                </MeterTrack>
+              </Meter>
+            ) : (
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">{t('名额占用', 'Slots used')}</span>
+                <span className="font-medium text-sm tabular-nums">
+                  {formattedCount}
+                  <span className="text-muted-foreground">/∞</span>
+                </span>
+              </div>
+            )}
+            <dl className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
+              <CapacityStat label={t('生效上限', 'Effective limit')} value={effectiveLabel} />
+              <div className="min-w-0">
+                <dt className="text-xs text-muted-foreground">{t('上限策略', 'Limit policy')}</dt>
+                <dd className="mt-1"><Badge variant={currentPolicy.variant} size="sm">{currentPolicy.label}</Badge></dd>
+              </div>
+            </dl>
+          </CardPanel>
+        )}
+      </Card>
+
+      <SessionList
+        credId={cred.id}
+        data={sessions.data}
+        isPending={sessions.isPending}
+        isFetching={sessions.isFetching}
+        error={sessions.error}
+        onRetry={() => { void sessions.refetch() }}
+      />
+    </div>
+  )
+}
+
+function SessionList({
+  credId,
+  data,
+  isPending,
+  isFetching,
+  error,
+  onRetry,
+}: {
+  credId: number
+  data: SessionBinding[] | undefined
+  isPending: boolean
+  isFetching: boolean
+  error: Error | null
+  onRetry: () => void
+}) {
+  const { t, language, locale } = useI18n()
+  const qc = useQueryClient()
+  const queryKey = ['credential-sessions', credId] as const
+  const unbind = useMutation({
+    mutationFn: (sessionKey: string) => unbindCredentialSession(credId, sessionKey),
+    onSuccess: (_, sessionKey) => {
+      toastManager.add({ title: t('已解绑', 'Session unbound'), type: 'success' })
+      qc.setQueryData<SessionBinding[]>(queryKey, (current) =>
+        current?.filter((session) => session.session_key !== sessionKey))
+      qc.invalidateQueries({ queryKey })
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => toastManager.add({
+      title: t('解绑失败', 'Failed to unbind session'),
+      description: extractError(error, language),
+      type: 'error',
+    }),
+  })
+
+  return (
+    <section className="space-y-3" aria-labelledby={`active-sessions-${credId}`}>
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <h3 id={`active-sessions-${credId}`} className="font-semibold text-sm">
+            {t('活跃模拟会话', 'Active simulated sessions')}
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {t('按最近活跃时间排序', 'Sorted by most recent activity')}
+          </p>
+        </div>
+        {!isPending && !error && isFetching && (
+          <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+            <Spinner />
+            {t('刷新中', 'Refreshing')}
+          </span>
+        )}
+      </div>
+
+      {isPending ? (
+        <div className="space-y-2" role="status" aria-label={t('正在读取会话列表', 'Loading session list')}>
+          {Array.from({ length: 2 }, (_, index) => (
+            <div key={index} className="rounded-lg border bg-card px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Skeleton className="size-4 shrink-0 rounded" />
+                <Skeleton className="h-4 w-2/5" />
+              </div>
+              <div className="mt-1.5 flex items-center justify-between gap-4 pl-6">
+                <Skeleton className="h-3 w-2/5" />
+                <Skeleton className="h-3 w-16 shrink-0" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : error ? (
+        <Alert variant="error">
+          <AlertTitle>{t('会话列表读取失败', 'Failed to load session list')}</AlertTitle>
+          <AlertDescription>
+            <p className="break-words">{extractError(error, language)}</p>
+            <Button type="button" size="sm" variant="destructive-outline" onClick={onRetry}>
+              <RefreshCwIcon />
+              {t('重试', 'Retry')}
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : !data || data.length === 0 ? (
+        <Empty className="py-8">
+          <EmptyHeader>
+            <EmptyMedia variant="icon"><MessagesSquareIcon /></EmptyMedia>
+            <EmptyTitle className="text-base">{t('暂无活跃会话', 'No active sessions')}</EmptyTitle>
+            <EmptyDescription>
+              {t(
+                '走模拟路径且没有设备身份的请求完成一次后会出现在这里。',
+                'A session appears here after a simulated request without a device identity completes.',
+              )}
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        <ul className="space-y-1.5">
+          {data.map((session) => {
+            const firstBoundRelative = relativeTime(session.created_at, undefined, language)
+            const lastSeenRelative = relativeTime(session.last_seen_at, undefined, language)
+            const firstBoundFull = formatFullTime(session.created_at, language)
+            const lastSeenFull = formatFullTime(session.last_seen_at, language)
+            // 32 位 hex 是按缓存前缀派生的键，uuid 是来访自带的会话 id：一眼分清哪种客户端。
+            const derived = /^[0-9a-f]{32}$/.test(session.session_key)
+            return (
+              <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-2">
+                  <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <Tooltip>
+                    <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">
+                      {session.session_key}
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-80 whitespace-normal break-all text-left">
+                      {session.session_key}
+                    </TooltipPopup>
+                  </Tooltip>
+                  <Badge variant="secondary" size="sm">
+                    {derived ? t('按前缀', 'By prefix') : t('自带 id', 'Client id')}
+                  </Badge>
+                  <Tooltip>
+                    <TooltipTrigger
+                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
+                      aria-label={t(`复制会话键 ${session.session_key}`, `Copy session key ${session.session_key}`)}
+                      onClick={async () => {
+                        const copied = await copyText(session.session_key)
+                        toastManager.add(copied
+                          ? { title: t('已复制会话键', 'Copied session key'), type: 'success' }
+                          : { title: t('复制失败', 'Copy failed'), description: session.session_key, type: 'error' })
+                      }}
+                    >
+                      <CopyIcon />
+                    </TooltipTrigger>
+                    <TooltipPopup>{t('复制会话键', 'Copy session key')}</TooltipPopup>
+                  </Tooltip>
+                  <Button
+                    size="xs"
+                    variant="destructive-outline"
+                    className="ml-1 shrink-0"
+                    loading={unbind.isPending && unbind.variables === session.session_key}
+                    disabled={unbind.isPending && unbind.variables !== session.session_key}
+                    onClick={() => unbind.mutate(session.session_key)}
+                    aria-label={t(`解绑会话 ${session.session_key}`, `Unbind session ${session.session_key}`)}
+                  >
+                    <UnlinkIcon />
+                    {t('解绑', 'Unbind')}
+                  </Button>
+                </div>
+                <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
+                  <Tooltip>
+                    <TooltipTrigger render={<span />} className="min-w-0 truncate">
+                      {t(
+                        `首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
+                        `First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
+                      )}
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                      {t(
+                        `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
+                        `First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
+                      )}
+                    </TooltipPopup>
+                  </Tooltip>
+                  <div className="flex shrink-0 items-baseline gap-3 tabular-nums">
+                    <DeviceStat label={t('请求', 'Requests')} value={session.request_count.toLocaleString(locale)} />
+                  </div>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
   )
 }

@@ -9,7 +9,7 @@ import {
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
   setCredentialQuotaPausePct, setDeviceLimit, setDisabled, setLabel, setPriority, setProxy,
-  setRpmLimit,
+  setRpmLimit, setSessionLimit,
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -728,6 +728,15 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onSuccess: () => { onLimitSaved?.(); invalidate() },
     onError: (e) => failure(t('设置设备上限失败', 'Failed to set device limit'), e),
   })
+  // 模拟会话上限同样单独一个 mutation，失败提示才对得上。
+  const sessionLimit = useMutation({
+    mutationFn: (n: number) => setSessionLimit(cred.id, n),
+    onSuccess: () => {
+      toastManager.add({ title: t('已保存会话上限', 'Session limit saved'), type: 'success' })
+      invalidate()
+    },
+    onError: (e) => failure(t('设置会话上限失败', 'Failed to set the session limit'), e),
+  })
   // RPM 上限与设备上限分开两个 mutation：两者的失败提示不一样，共用一个的话，
   // 改 RPM 失败会弹出「设置设备上限失败」。
   const rpmLimit = useMutation({
@@ -773,7 +782,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
-  return { rename, toggle, prio, limit, rpmLimit, quotaPause, proxy, refresh, remove, cooldown }
+  return { rename, toggle, prio, limit, sessionLimit, rpmLimit, quotaPause, proxy, refresh, remove, cooldown }
 }
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>

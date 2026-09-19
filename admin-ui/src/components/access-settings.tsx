@@ -24,6 +24,7 @@ import {
   setBareRateLimit,
   setDefaultDeviceLimit,
   setDefaultRpmLimit,
+  setDefaultSessionLimit,
   setDeviceRetention,
   setDeviceRpmLimit,
   setDeviceTtl,
@@ -441,6 +442,7 @@ export function DeviceSettingsContent() {
         <DeviceBindingTtl />
         <DeviceBindingRetention />
         <DefaultDeviceLimit />
+        <DefaultSessionLimit />
       </SettingsGroup>
 
       <SettingsGroup
@@ -556,13 +558,16 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         : t('永久保留', 'Kept forever'),
     },
     {
+      // 设备与模拟会话两种名额挤在同一格：概览一行六格已经到头，两个值总是一起看的。
       label: t('默认容量', 'Default capacity'),
-      value: settings.default_device_limit > 0
-        ? t(
-            `${settings.default_device_limit.toLocaleString(locale)} 台 / 账号`,
-            `${settings.default_device_limit.toLocaleString(locale)} / account`,
-          )
-        : t('不限', 'Unlimited'),
+      value: [
+        settings.default_device_limit > 0
+          ? t(`${settings.default_device_limit.toLocaleString(locale)} 台`, `${settings.default_device_limit.toLocaleString(locale)} dev`)
+          : t('设备不限', 'dev ∞'),
+        settings.default_session_limit > 0
+          ? t(`${settings.default_session_limit.toLocaleString(locale)} 会话`, `${settings.default_session_limit.toLocaleString(locale)} sess`)
+          : t('会话不限', 'sess ∞'),
+      ].join(' · '),
     },
     {
       // 账号与设备两道 RPM 闸挤在同一格里：概览一行六格已经到头，再加一格窄屏会散架，
@@ -915,6 +920,88 @@ function DefaultDeviceLimit() {
             <NumberFieldIncrement
               aria-label={t('增加默认设备上限', 'Increase default device limit')}
             />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/** 全局默认模拟会话上限：账号未单独配置时套用。只管模拟路径上没有设备身份的来访。 */
+function DefaultSessionLimit() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(data.default_session_limit)
+  }, [data?.default_session_limit])
+
+  const save = useMutation({
+    mutationFn: (limit: number) => setDefaultSessionLimit(limit),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('默认会话上限已更新', 'Default session limit updated'),
+        description: settings.default_session_limit > 0
+          ? t(
+              `每个账号最多同时活跃 ${settings.default_session_limit} 条模拟会话。`,
+              `Each account can keep up to ${settings.default_session_limit} active simulated ${settings.default_session_limit === 1 ? 'session' : 'sessions'}.`,
+            )
+          : t('默认会话上限已取消。', 'The default session limit has been removed.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.default_session_limit ?? 0
+  const parsed = Math.max(0, Math.floor(draft ?? 0))
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('默认模拟会话上限', 'Default simulated session limit')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '走模拟路径、没有设备身份的请求按会话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额，与设备名额分开计；有效期、原账号关联沿用上面两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
+            'Requests on the simulation path without a device identity bind to an account per session (their session id, else cache prefix + first user message) and take a session slot, counted separately from device slots; TTL and affinity follow the two settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
+          )}
+        </FieldDescription>
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(`每个账号最多 ${parsed} 条活跃会话`, `Up to ${parsed} active ${parsed === 1 ? 'session' : 'sessions'} per account`)
+            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+        </Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少默认会话上限', 'Decrease default session limit')} />
+            <NumberFieldInput aria-label={t('默认模拟会话上限', 'Default simulated session limit')} />
+            <NumberFieldIncrement aria-label={t('增加默认会话上限', 'Increase default session limit')} />
           </NumberFieldGroup>
         </NumberField>
         <Button

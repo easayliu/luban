@@ -6,6 +6,8 @@ use axum::http::HeaderMap;
 use crate::store;
 
 use super::body::extract_session_id;
+#[cfg(doc)]
+use super::body::{sim_device_fingerprint, sim_session_key};
 use super::simulation::{Simulation, looks_like_uuid};
 use super::uuid_from_bytes;
 
@@ -153,19 +155,24 @@ pub(super) fn bare_session_id(
     )
 }
 
-/// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 设备指纹)` 取前 16 字节，
-/// 按 uuid v4 形态格式化。同一设备同一账号恒定，换账号或换设备即不同。
+/// 模拟用的 session_id：`sha256("luban-session" ‖ account_uuid ‖ 会话键)` 取前 16 字节，
+/// 按 uuid v4 形态格式化。会话键是这条请求的**缓存前缀加对话起点**的指纹（[`sim_session_key`]：
+/// tools、system 正文与首条用户消息），同一账号下同一条对话恒定，换了对话或换了账号即不同。
+///
+/// 此前第二段是设备指纹：同一账号经模拟路径的所有裸请求共用一个会话 id，不同应用、不同
+/// 工作区的对话在上游看来是一条会话打了全部请求。改按前缀派生后，一条会话里 tools 与 system
+/// 稳定、消息逐轮增长，与官方一条会话的形态一致；设备仍是同一台（[`sim_device_fingerprint`]）。
 ///
 /// 前缀是为了和 [`crate::credentials::Credential::spoof_device_id`] 分开取值——同样的输入
 /// 派生出两个字段，不加区分前缀就会得到「device_id 与 session_id 的高位相同」这种真实
 /// 客户端不产生的相关性。
-pub(super) fn session_id_for(cred: &crate::credentials::Credential, device_fp: &str) -> String {
+pub(super) fn session_id_for(cred: &crate::credentials::Credential, session_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"luban-session\0");
     h.update(cred.account_uuid.as_deref().unwrap_or("").as_bytes());
     h.update([0u8]);
-    h.update(device_fp.as_bytes());
+    h.update(session_key.as_bytes());
     let digest = h.finalize();
     let mut b = [0u8; 16];
     b.copy_from_slice(&digest[..16]);
@@ -225,6 +232,46 @@ mod tests {
         PLAIN_BODY, all_on, detect_for, detect_with, rewrite_body_with_session, sim_for, test_cred,
     };
     use crate::proxy::{Bytes, HeaderValue, store};
+
+    /// 来访没带会话 id 时，模拟路径的会话 id 按**缓存前缀 + 对话起点**派生：tools、system、
+    /// 首条用户消息相同的请求是同一条会话（后续轮次追加消息不换），任一处变了就是另一条；
+    /// 与设备指纹无关；换账号即另一条。
+    #[test]
+    fn simulated_session_id_follows_the_cache_prefix() {
+        let body = |sys: &str, msg: &str| {
+            format!(
+                r#"{{"model":"claude-opus-5","max_tokens":8,"system":"{sys}","messages":[{{"role":"user","content":"{msg}"}}]}}"#
+            )
+        };
+        let a1 = sim_for(&body("S", "hi")).session_id;
+        let a2 = sim_for(
+            r#"{"model":"claude-opus-5","max_tokens":8,"system":"S","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}"#,
+        )
+        .session_id;
+        let b = sim_for(&body("T", "hi")).session_id;
+        let c = sim_for(&body("S", "bye")).session_id;
+        assert_eq!(a1, a2, "同一对话追加消息仍是同一条会话");
+        assert_ne!(a1, b, "system 变了是另一条会话");
+        assert_ne!(a1, c, "同一应用的另一个对话（首条用户消息不同）是另一条会话");
+        assert!(super::looks_like_uuid(&a1), "{a1}");
+
+        let v: serde_json::Value = serde_json::from_str(&body("S", "hi")).unwrap();
+        let key = crate::proxy::sim_session_key(&v);
+        let h = crate::proxy::HeaderMap::new();
+        // 设备指纹不参与：同一账号换个指纹，会话 id 不变（设备与会话各自派生）。
+        let other_fp =
+            super::Simulation::detect(Some(&v), &h, false, all_on(), &test_cred(), "other", &key)
+                .unwrap();
+        assert_eq!(other_fp.session_id, a1);
+        // 换账号即另一条会话。
+        let mut cred2 = test_cred();
+        cred2.account_uuid = Some("11111111-2222-4333-8444-555555555555".into());
+        let other_acct =
+            super::Simulation::detect(Some(&v), &h, false, all_on(), &cred2, "fp", &key).unwrap();
+        assert_ne!(other_acct.session_id, a1);
+        // 直接对上派生函数。
+        assert_eq!(a1, super::session_id_for(&test_cred(), &key));
+    }
 
     /// 模拟路径的会话 id **优先取来访自己那个**：几个客户端各开各的会话，折叠成一个按设备
     /// 派生的 id，在上游看来就是「一台设备上一个会话打了所有请求」。

@@ -17,7 +17,7 @@ use crate::credentials::Credential;
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
      rpm_limit, rate_limit_tier, org_uuid, subscription_created_at, quota_pause_pct, \
-     quota_pause_pct_7d";
+     quota_pause_pct_7d, session_limit";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -82,6 +82,22 @@ impl std::fmt::Display for DeviceLimitReached {
 }
 
 impl std::error::Error for DeviceLimitReached {}
+
+/// 硬性**模拟会话**上限触发：所有启用凭证的会话名额均已占满。
+///
+/// 与 [`DeviceLimitReached`] 是同一件事的另一个粒度：设备上限管带设备身份的来访，这个管
+/// **模拟路径上没有设备身份**的来访——它们按会话键（[`Select::session_key`]）粘住账号并占
+/// 名额。同样经 `anyhow` 上传、代理层映射为 429。
+#[derive(Debug)]
+pub struct SessionLimitReached;
+
+impl std::fmt::Display for SessionLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "all credentials have reached their session limits; no slot is available")
+    }
+}
+
+impl std::error::Error for SessionLimitReached {}
 
 /// 请求的模型在**所有**可调度的号上都已被上游判成「套餐不含」（见
 /// [`CredentialStore::deny_model`]）：不是限流、等多久都没用，换台机器也没用。
@@ -652,6 +668,9 @@ pub struct PortableCredential {
     pub quota_pause_pct: Option<i64>,
     #[serde(default)]
     pub quota_pause_pct_7d: Option<i64>,
+    /// 模拟会话数上限，三态同 `device_limit`；旧导出没有这一项时按 0（跟随全局）。
+    #[serde(default)]
+    pub session_limit: i64,
 }
 
 impl From<&Credential> for PortableCredential {
@@ -676,6 +695,7 @@ impl From<&Credential> for PortableCredential {
             proxy: c.proxy.clone(),
             quota_pause_pct: c.quota_pause_pct,
             quota_pause_pct_7d: c.quota_pause_pct_7d,
+            session_limit: c.session_limit,
         }
     }
 }
@@ -824,6 +844,7 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM usage_logs WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM credential_stats WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM device_costs WHERE cred_id = ?1", [id])?;
         tx.execute("DELETE FROM model_denials WHERE cred_id = ?1", [id])?;
@@ -843,6 +864,7 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM usage_logs", [])?;
         tx.execute("DELETE FROM device_bindings", [])?;
+        tx.execute("DELETE FROM session_bindings", [])?;
         tx.execute("DELETE FROM credential_stats", [])?;
         tx.execute("DELETE FROM device_costs", [])?;
         tx.execute("DELETE FROM model_denials", [])?;
@@ -944,7 +966,7 @@ impl CredentialStore {
                          device_limit = ?10, rpm_limit = ?11, ban_reason = ?12,
                          account_uuid = ?13, resume_at = ?14, proxy = ?15,
                          rate_limit_tier = ?16, org_uuid = ?17, subscription_created_at = ?18,
-                         quota_pause_pct = ?19, quota_pause_pct_7d = ?20,
+                         quota_pause_pct = ?19, quota_pause_pct_7d = ?20, session_limit = ?21,
                          updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
@@ -968,6 +990,7 @@ impl CredentialStore {
                         c.subscription_created_at,
                         c.quota_pause_pct,
                         c.quota_pause_pct_7d,
+                        c.session_limit,
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -979,9 +1002,10 @@ impl CredentialStore {
                          (label, tier, org_type, access_token, refresh_token, expires_at,
                           priority, disabled, device_limit, rpm_limit, ban_reason,
                           account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
-                          subscription_created_at, quota_pause_pct, quota_pause_pct_7d)
+                          subscription_created_at, quota_pause_pct, quota_pause_pct_7d,
+                          session_limit)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19)",
+                             ?16, ?17, ?18, ?19, ?20)",
                     params![
                         c.label,
                         c.tier,
@@ -1002,6 +1026,7 @@ impl CredentialStore {
                         c.subscription_created_at,
                         c.quota_pause_pct,
                         c.quota_pause_pct_7d,
+                        c.session_limit,
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -1042,6 +1067,7 @@ impl CredentialStore {
         let conn = self.conn.lock();
         if disabled {
             conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+            conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
             Ok(conn.execute(
                 "UPDATE credentials SET disabled = 1, resume_at = NULL, updated_at = unixepoch() \
                  WHERE id = ?1",
@@ -1074,6 +1100,7 @@ impl CredentialStore {
     pub fn pause_for_rate_limit(&self, id: i64, reason: &str, resume_at: u64) -> Result<bool> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
         Ok(conn.execute(
             "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = ?3, \
                     updated_at = unixepoch() \
@@ -1178,6 +1205,7 @@ impl CredentialStore {
         {
             let mut logs = tx.prepare("DELETE FROM usage_logs WHERE cred_id = ?1")?;
             let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+            let mut sbinds = tx.prepare("DELETE FROM session_bindings WHERE cred_id = ?1")?;
             let mut stats = tx.prepare("DELETE FROM credential_stats WHERE cred_id = ?1")?;
             let mut costs = tx.prepare("DELETE FROM device_costs WHERE cred_id = ?1")?;
             let mut denials = tx.prepare("DELETE FROM model_denials WHERE cred_id = ?1")?;
@@ -1185,6 +1213,7 @@ impl CredentialStore {
             for id in ids {
                 logs.execute([id])?;
                 binds.execute([id])?;
+                sbinds.execute([id])?;
                 stats.execute([id])?;
                 costs.execute([id])?;
                 denials.execute([id])?;
@@ -1207,6 +1236,7 @@ impl CredentialStore {
         {
             if disabled {
                 let mut binds = tx.prepare("DELETE FROM device_bindings WHERE cred_id = ?1")?;
+                let mut sbinds = tx.prepare("DELETE FROM session_bindings WHERE cred_id = ?1")?;
                 // 同 `set_disabled`：人工操作两个方向都清 `resume_at`，
                 // 限流那套惰性恢复不该越过管理员的决定。
                 let mut stmt = tx.prepare(
@@ -1215,6 +1245,7 @@ impl CredentialStore {
                 )?;
                 for id in ids {
                     binds.execute([id])?;
+                    sbinds.execute([id])?;
                     n += stmt.execute([id])?;
                 }
             } else {
@@ -1268,6 +1299,46 @@ impl CredentialStore {
             .flatten()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(DEFAULT_DEVICE_LIMIT_VALUE)
+            .max(0)
+    }
+
+    /// 批量设置模拟会话数上限（三态语义同 [`Self::set_session_limit`]），返回实际更新的条数。
+    pub fn set_session_limits(&self, ids: &[i64], limit: i64) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET session_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in ids {
+                n += stmt.execute(params![id, limit])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 设置模拟会话数上限，返回是否确有更新。三态同 [`Self::set_device_limit`]：`> 0` 本账号
+    /// 独立上限；`0` 跟随全局默认（[`DEFAULT_SESSION_LIMIT`]）；`< 0` 本账号明确不限。
+    pub fn set_session_limit(&self, id: i64, limit: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE credentials SET session_limit = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, limit],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 全局默认模拟会话数上限；未设置或解析失败时用 [`DEFAULT_SESSION_LIMIT_VALUE`]。
+    pub fn default_session_limit(&self) -> i64 {
+        self.get_setting(DEFAULT_SESSION_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_SESSION_LIMIT_VALUE)
             .max(0)
     }
 
@@ -1834,6 +1905,86 @@ impl CredentialStore {
             out.insert(cid, n);
         }
         Ok(out)
+    }
+
+    /// 单条凭证当前**占名额**的模拟会话数；口径同 [`Self::device_count`]（TTL 内活跃的绑定）。
+    pub fn session_count(&self, cred_id: i64) -> Result<i64> {
+        let ttl = self.device_binding_ttl();
+        let conn = self.conn.lock();
+        let n = if ttl > 0 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_bindings \
+                 WHERE cred_id = ?1 AND last_seen_at >= unixepoch() - ?2",
+                params![cred_id, ttl],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE cred_id = ?1",
+                [cred_id],
+                |r| r.get(0),
+            )?
+        };
+        Ok(n)
+    }
+
+    /// 所有凭证当前**有效**的模拟会话绑定数（cred_id → count）；口径同 [`Self::session_count`]。
+    pub fn session_counts(&self) -> Result<HashMap<i64, i64>> {
+        let ttl = self.device_binding_ttl();
+        let conn = self.conn.lock();
+        let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
+        let sql = format!(
+            "SELECT cred_id, COUNT(*) FROM session_bindings {where_clause} GROUP BY cred_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
+        let rows =
+            if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, n) = row?;
+            out.insert(cid, n);
+        }
+        Ok(out)
+    }
+
+    /// 单条凭证当前**有效**的模拟会话明细，按最近活跃倒序；过滤口径与 [`Self::session_count`]
+    /// 完全一致，否则后台会出现「会话数写着 2、展开却列出 5 条」。
+    pub fn list_sessions(&self, cred_id: i64) -> Result<Vec<SessionBinding>> {
+        let ttl = self.device_binding_ttl();
+        let conn = self.conn.lock();
+        let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
+        let sql = format!(
+            "SELECT session_key, request_count, created_at, last_seen_at \
+               FROM session_bindings \
+              WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, session_key ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row = |r: &Row| {
+            Ok(SessionBinding {
+                session_key: r.get(0)?,
+                request_count: r.get(1)?,
+                created_at: r.get(2)?,
+                last_seen_at: r.get(3)?,
+            })
+        };
+        let rows = if ttl > 0 {
+            stmt.query_map(params![cred_id, ttl], map_row)?.collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map([cred_id], map_row)?.collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
+    /// 手动解除一条模拟会话绑定，返回是否确有删除。按 `(cred_id, session_key)` 双条件删，
+    /// 理由同 [`Self::unbind_device`]。
+    pub fn unbind_session(&self, cred_id: i64, session_key: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM session_bindings WHERE cred_id = ?1 AND session_key = ?2",
+            params![cred_id, session_key],
+        )?;
+        Ok(n > 0)
     }
 
     /// 更新账号等级。
@@ -3076,6 +3227,15 @@ pub const DEFAULT_DEVICE_LIMIT: &str = "default_device_limit";
 /// 并行使用时无限扩张；写入 settings 的值仍优先，账号级 `< 0` 仍可明确不限。
 pub const DEFAULT_DEVICE_LIMIT_VALUE: i64 = 5;
 
+/// 全局默认**模拟会话**数上限的 settings 键名；`<= 0` 表示显式不限。
+/// 账号自身 `session_limit == 0`（默认值）时套用它。语义见 [`Select::session_key`]。
+pub const DEFAULT_SESSION_LIMIT: &str = "default_session_limit";
+
+/// 未写入 `default_session_limit` 时的默认上限。取设备默认的两倍：一台设备上同时开几个
+/// 对话是常态，会话名额本就该比设备名额宽；但仍要封顶——「每条请求一个新会话」那种流量
+/// （封号复盘里最显眼的形态）在这里被挡住。写入 settings 的值仍优先，账号级 `< 0` 仍可明确不限。
+pub const DEFAULT_SESSION_LIMIT_VALUE: i64 = 10;
+
 /// 全局默认账号 RPM 上限的 settings 键名；`<= 0` 表示默认不限。
 /// 账号自身 `rpm_limit == 0`（默认值）时套用它，无需逐个账号配置。
 pub const DEFAULT_RPM_LIMIT: &str = "default_rpm_limit";
@@ -3180,6 +3340,12 @@ pub fn effective_device_limit(cred_limit: i64, default_limit: i64) -> i64 {
         0 => default_limit.max(0),
         _ => 0,
     }
+}
+
+/// 账号实际生效的模拟会话数上限：返回 `0` 表示不限。三态语义与 [`effective_device_limit`]
+/// 逐条对应，直接委托它（理由同 [`effective_rpm_limit`]）。
+pub fn effective_session_limit(cred_limit: i64, default_limit: i64) -> i64 {
+    effective_device_limit(cred_limit, default_limit)
 }
 
 /// 账号实际生效的 RPM 上限：返回 `0` 表示不限。三态语义与
@@ -3539,6 +3705,22 @@ pub struct DeviceBinding {
     pub cost_usd: f64,
     /// 该设备在**所有凭证**上的累计费用（USD）；用来看清换号后仍在烧钱的同一台设备。
     pub cost_usd_all: f64,
+}
+
+/// 一条**模拟会话**绑定（`session_bindings` 的一行），供后台列表用。口径与
+/// [`CredentialStore::session_count`] 一致：只含 TTL 内仍活跃的。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionBinding {
+    /// 会话键：来访自带的会话 id，或缓存前缀加首条用户消息的指纹（32 个 hex 字符），见
+    /// `Select::session_key`。
+    pub session_key: String,
+    /// 绑定之后再命中的请求数（建行那一轮不计，口径同 `device_bindings.request_count`；
+    /// 随绑定行走，解绑即归零）。
+    pub request_count: i64,
+    /// 首次绑定到该凭证的时间（Unix 秒）。
+    pub created_at: i64,
+    /// 最近一次活跃时间（Unix 秒）；TTL 按它算。
+    pub last_seen_at: i64,
 }
 
 /// 5 小时窗口秒数。
@@ -4085,6 +4267,7 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         let ts: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        tx.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
         let updated = tx.execute(
             "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = NULL, \
                     updated_at = unixepoch() \
@@ -4476,6 +4659,19 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_device_bindings_cred
             ON device_bindings(cred_id);
 
+        -- 模拟会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
+        -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 里的 session_key）：
+        -- 带设备身份的由 device_bindings 管，一条请求不占两份名额。
+        CREATE TABLE IF NOT EXISTS session_bindings (
+            session_key   TEXT    PRIMARY KEY,
+            cred_id       INTEGER NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_session_bindings_cred
+            ON session_bindings(cred_id);
+
         -- 每次转发的用量日志：从上游响应里嗅探到的 token 用量（若响应带了 usage）。
         CREATE TABLE IF NOT EXISTS usage_logs (
             id             INTEGER PRIMARY KEY,
@@ -4812,6 +5008,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN quota_pause_pct INTEGER", []);
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN quota_pause_pct_7d INTEGER", []);
 
+    // 该账号最多同时活跃多少条**模拟会话**（三态同 device_limit：>0 独立 / 0 跟随全局 / <0 不限）。
+    // 旧库补出来是 0 = 跟随全局默认 [`DEFAULT_SESSION_LIMIT`]。**同样必须补在重建之后**。
+    let _ = conn
+        .execute("ALTER TABLE credentials ADD COLUMN session_limit INTEGER NOT NULL DEFAULT 0", []);
+
     // 0.2.81 起，socks5 在入库那一刻就归一化成 socks5h（把 DNS 交给代理端解析，理由见
     // [`crate::clients::PROXY_SCHEME_UPGRADES`]）。存量行必须一起改写，否则之前配好的号会一直
     // 本机解析 DNS——正是那个改动要治的故障（住宅代理只回一个 `unexpected EOF`），而网页上没有
@@ -4860,6 +5061,25 @@ fn init_schema(conn: &Connection) -> Result<()> {
              Accounts whose own device_limit is 0 now allow at most {DEFAULT_DEVICE_LIMIT_VALUE} \
              bound devices each; change it under Settings (0 = unlimited), or set a per-account \
              limit (negative = that account is explicitly unlimited)"
+        );
+    }
+
+    // 全局默认模拟会话上限同样落一行，让它在控制台里看得见、改得动；理由与口径同上一段。
+    // 判定不变：`default_session_limit` 在设置缺失时本来就回落到 [`DEFAULT_SESSION_LIMIT_VALUE`]。
+    let session_limit_seeded = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![DEFAULT_SESSION_LIMIT, DEFAULT_SESSION_LIMIT_VALUE.to_string()],
+    )?;
+    if session_limit_seeded > 0 {
+        tracing::warn!(
+            key = DEFAULT_SESSION_LIMIT,
+            value = DEFAULT_SESSION_LIMIT_VALUE,
+            "this database had no global default session limit; wrote {DEFAULT_SESSION_LIMIT_VALUE}. \
+             Accounts whose own session_limit is 0 now allow at most {DEFAULT_SESSION_LIMIT_VALUE} \
+             active simulated sessions each (bare requests on the simulation path, keyed by their \
+             session id, else cache prefix + first user message); change it under Settings \
+             (0 = unlimited), or set a \
+             per-account limit (negative = that account is explicitly unlimited)"
         );
     }
 
@@ -4938,6 +5158,11 @@ fn purge_orphan_rows(conn: &Connection) -> Result<()> {
             [],
         )
         .context("failed to purge orphaned device bindings")?;
+    conn.execute(
+        "DELETE FROM session_bindings WHERE cred_id NOT IN (SELECT id FROM credentials)",
+        [],
+    )
+    .context("failed to purge orphaned session bindings")?;
     // 账本同口径清扫（新表初次上线时是 no-op）。
     conn.execute(
         "DELETE FROM credential_stats WHERE cred_id NOT IN (SELECT id FROM credentials)",
@@ -5030,6 +5255,7 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("subscription_created_at", "TEXT"),
     ("quota_pause_pct", "INTEGER"),
     ("quota_pause_pct_7d", "INTEGER"),
+    ("session_limit", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
@@ -5056,7 +5282,48 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         subscription_created_at: row.get(19)?,
         quota_pause_pct: row.get(20)?,
         quota_pause_pct_7d: row.get(21)?,
+        session_limit: row.get(22)?,
     })
+}
+
+/// [`CredentialStore::select_for_device`] 里这条请求按哪张表粘住账号、占哪种名额。
+/// 两张表列名不同、上限字段不同、拒绝的错误类型不同，其余规则逐条相同。
+#[derive(Clone, Copy)]
+enum Binding<'a> {
+    /// 客户端自带的设备身份，`device_bindings`。
+    Device(&'a str),
+    /// 模拟路径上没有设备身份的来访，按会话键，`session_bindings`。见 [`Select::session_key`]。
+    Session(&'a str),
+}
+
+impl<'a> Binding<'a> {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Device(_) => "device_bindings",
+            Self::Session(_) => "session_bindings",
+        }
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Self::Device(_) => "device_id",
+            Self::Session(_) => "session_key",
+        }
+    }
+
+    fn key(self) -> &'a str {
+        match self {
+            Self::Device(k) | Self::Session(k) => k,
+        }
+    }
+
+    /// 所有可调度的号名额都满了时的拒绝理由。
+    fn limit_error(self) -> anyhow::Error {
+        match self {
+            Self::Device(_) => DeviceLimitReached.into(),
+            Self::Session(_) => SessionLimitReached.into(),
+        }
+    }
 }
 
 /// [`CredentialStore::select_for_device`] 的入参。
@@ -5065,8 +5332,15 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
 /// 位置传参写反了照样编译得过，而那是一个「设备粘性按模型名走」的静默错误。
 #[derive(Default, Clone, Copy)]
 pub struct Select<'a> {
-    /// 客户端设备标识；`None` 即裸请求（不绑定、不占名额）。
+    /// 客户端设备标识；`None` 即裸请求（不绑定、不占设备名额）。
     pub device_id: Option<&'a str>,
+    /// **模拟会话键**：来访走模拟路径且没有设备身份时，代理算出来的这条会话的键（来访自带的
+    /// 会话 id，否则缓存前缀加首条用户消息的指纹）。`Some` 且 `device_id` 为 `None` 时按它粘住账号并占该账号
+    /// 的**会话名额**（`session_bindings`，上限 `session_limit` / [`DEFAULT_SESSION_LIMIT`]），
+    /// 规则与设备绑定逐条相同（TTL、软绑定、改绑、全满时拒——[`SessionLimitReached`]）。
+    /// `device_id` 有值时忽略它：带设备身份的已由设备绑定管着，一条请求不占两份名额。
+    /// 非模拟路径一律 `None`：那些来访要么有设备身份，要么是裸请求，形态没变。
+    pub session_key: Option<&'a str>,
     /// 设备绑定**占名额**的有效期（秒）；`<= 0` 表示永不过期。
     pub ttl_secs: i64,
     /// 软绑定保留期（秒）：绑定行超过 [`Self::ttl_secs`] 后不再占名额，但在这个时长内仍然
@@ -5104,6 +5378,12 @@ impl CredentialStore {
     /// 约束（见 [`Self::bare_rate_limit`]）：已发满的凭证在本轮被跳过，自然分流到其它号；
     /// 所有号都满才返回 [`BareRateLimited`]（代理映射为 429 + `retry-after`）。
     ///
+    /// **例外是带 `session_key` 的**（模拟路径、没有设备身份，见 [`Select::session_key`]）：
+    /// 它们按会话键走与设备绑定**逐条相同**的规则——`session_bindings` 表、`session_limit` /
+    /// [`DEFAULT_SESSION_LIMIT`] 上限、同一套 TTL 与保留期、同样的软绑定与改绑，全满时返回
+    /// [`SessionLimitReached`]。与设备绑定只差一处：它们仍是裸请求，裸请求速率上限照旧管着
+    /// （命中的原号裸窗口打满时当作没位置、往下改选）。
+    ///
     /// **账号 RPM 上限**（见 [`Self::default_rpm_limit`]）是所有分支共同的最后一道门，
     /// 且两个分支的行为**故意不同**：
     ///
@@ -5138,9 +5418,26 @@ impl CredentialStore {
     /// 写 `usage_logs`。所以列表里的 RPM 可能比限流器数到的略高一点点——探活是人手点出来的，
     /// 量级上不构成干扰，但对不上时要知道差在哪。
     pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
-        let Select { device_id, ttl_secs, retention_secs, rate_limited, exclude, model } = sel;
+        let Select {
+            device_id,
+            session_key,
+            ttl_secs,
+            retention_secs,
+            rate_limited,
+            exclude,
+            model,
+        } = sel;
+        // 这条请求按什么粘住账号、占哪种名额：有设备身份按设备；没有设备身份但带会话键（模拟
+        // 路径）按会话；都没有就是裸请求。设备优先——带设备身份的已由设备绑定 + 上限管着，再按
+        // 会话占一份就是一条请求扣两份名额。
+        let binding = match (device_id, session_key) {
+            (Some(d), _) => Some(Binding::Device(d)),
+            (None, Some(k)) => Some(Binding::Session(k)),
+            (None, None) => None,
+        };
         // 这几项须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
         let default_limit = self.default_device_limit();
+        let default_session_limit = self.default_session_limit();
         let (rate_limit, rate_window) = (self.bare_rate_limit(), self.bare_rate_window_secs());
         let default_rpm = self.default_rpm_limit();
         let conn = self.conn.lock();
@@ -5165,6 +5462,10 @@ impl CredentialStore {
         if let Some(retention) = effective_retention(ttl_secs, retention_secs) {
             conn.execute(
                 "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
+                [retention],
+            )?;
+            conn.execute(
+                "DELETE FROM session_bindings WHERE last_seen_at < unixepoch() - ?1",
                 [retention],
             )?;
         }
@@ -5242,13 +5543,13 @@ impl CredentialStore {
             return Err(AllRateLimited { retry_after_secs }.into());
         }
 
-        // 各凭证当前**占名额**的设备数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
-        // （口径与 [`Self::device_counts`] 一致，后台看到的数就是这里用来判上限的数）。
-        let mut counts: HashMap<i64, i64> = HashMap::new();
-        {
+        // 各凭证当前**占名额**的设备数与模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
+        // （口径与 [`Self::device_counts`] / [`Self::session_counts`] 一致，后台看到的数就是这里
+        // 用来判上限的数）。两张表都数：负载均衡按本次绑定的那一种排序，另一种不看。
+        let active_counts = |table: &str| -> Result<HashMap<i64, i64>> {
             let active = if ttl_secs > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
             let mut cstmt = conn.prepare(&format!(
-                "SELECT cred_id, COUNT(*) FROM device_bindings {active} GROUP BY cred_id"
+                "SELECT cred_id, COUNT(*) FROM {table} {active} GROUP BY cred_id"
             ))?;
             let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
             let rows = if ttl_secs > 0 {
@@ -5256,28 +5557,53 @@ impl CredentialStore {
             } else {
                 cstmt.query_map([], map_row)?
             };
+            let mut counts = HashMap::new();
             for row in rows {
                 let (cid, n) = row?;
                 counts.insert(cid, n);
             }
-        }
+            Ok(counts)
+        };
+        let counts = active_counts("device_bindings")?;
+        let session_counts = active_counts("session_bindings")?;
 
-        // 当前占名额的设备数（已排除 TTL 外的休眠绑定）。
-        let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
-        // 生效上限：账号未单独配置（device_limit == 0）时套用全局默认。
-        let limit_of = |c: &Credential| effective_device_limit(c.device_limit, default_limit);
-        // 还塞得下一台设备吗（上限 <= 0 即不限）。
+        // 当前占名额的数（已排除 TTL 外的休眠绑定）：按会话绑定时数会话，其余数设备——裸请求
+        // 不占名额，但负载均衡仍按设备数排，与原来一样。
+        let used = |c: &Credential| match binding {
+            Some(Binding::Session(_)) => session_counts.get(&c.id).copied().unwrap_or(0),
+            _ => counts.get(&c.id).copied().unwrap_or(0),
+        };
+        // 生效上限：账号未单独配置（== 0）时套用对应的全局默认。
+        let limit_of = |c: &Credential| match binding {
+            Some(Binding::Session(_)) => {
+                effective_session_limit(c.session_limit, default_session_limit)
+            }
+            _ => effective_device_limit(c.device_limit, default_limit),
+        };
+        // 还塞得下一台设备 / 一条会话吗（上限 <= 0 即不限）。
         let has_room = |c: &Credential| limit_of(c) <= 0 || used(c) < limit_of(c);
+        // 裸请求速率上限：没有设备身份的都算裸请求，按会话键绑定的也是——那道上限限的是「没有
+        // 设备身份可依据」的流量，会话键是 luban 自己从体里算的，不是客户端的身份。
+        let bare_window = Duration::from_secs(rate_window.max(1) as u64);
+        let bare_ok = |c: &Credential| {
+            device_id.is_some()
+                || !rate_limited
+                || self.bare_rate.has_room(c.id, rate_limit, bare_window)
+        };
 
         // 1/2/3) 命中既有绑定。
-        if let Some(did) = device_id {
+        if let Some(b) = binding {
             // 第二列是「这条绑定还在 TTL 内吗」，交给 SQLite 与清理/计数用同一个 unixepoch()
             // 时钟判定，免得和进程时钟差出一个边界。
             let bound: Option<(i64, bool)> = conn
                 .query_row(
-                    "SELECT cred_id, (?2 <= 0 OR last_seen_at >= unixepoch() - ?2) \
-                       FROM device_bindings WHERE device_id = ?1",
-                    params![did, ttl_secs],
+                    &format!(
+                        "SELECT cred_id, (?2 <= 0 OR last_seen_at >= unixepoch() - ?2) \
+                           FROM {} WHERE {} = ?1",
+                        b.table(),
+                        b.column()
+                    ),
+                    params![b.key(), ttl_secs],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -5285,8 +5611,9 @@ impl CredentialStore {
                 // 原号仍可调度（启用、不在冷却、本轮没试过）时才谈复用。
                 if let Some(c) = creds.iter().find(|c| c.id == cid) {
                     // 活跃绑定本来就占着名额，直接续；休眠的软绑定要重新占一个位置，
-                    // 原号满了就只能改选——否则设备上限形同虚设。
-                    if active || has_room(c) {
+                    // 原号满了就只能改选——否则设备上限形同虚设。按会话绑定的还要过裸请求
+                    // 速率上限：原号的裸窗口打满了就当没位置，往下改选（设备绑定不受这道管）。
+                    if (active || has_room(c)) && bare_ok(c) {
                         // RPM 打满 → **就地拒**，不往下走改选那条路（理由见本函数文档：
                         // 改选会改绑，而改绑会让这条会话每一轮先撞一次 thinking 签名 400）。
                         if !rpm_room(c) {
@@ -5297,12 +5624,19 @@ impl CredentialStore {
                             .into());
                         }
                         conn.execute(
-                            "UPDATE device_bindings
-                                SET last_seen_at = unixepoch(), request_count = request_count + 1
-                              WHERE device_id = ?1",
-                            [did],
+                            &format!(
+                                "UPDATE {} SET last_seen_at = unixepoch(), \
+                                        request_count = request_count + 1 \
+                                  WHERE {} = ?1",
+                                b.table(),
+                                b.column()
+                            ),
+                            [b.key()],
                         )?;
                         self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
+                        if device_id.is_none() && rate_limited {
+                            self.bare_rate.take(c.id, rate_limit, bare_window);
+                        }
                         return Ok(c.clone());
                     }
                 }
@@ -5333,43 +5667,53 @@ impl CredentialStore {
         };
         let mut ordered: Vec<&Credential> = creds.iter().collect();
         ordered.sort_by_key(|c| (c.priority, plan_rank(c), used(c), c.id));
-        let bare_window = Duration::from_secs(rate_window.max(1) as u64);
-        let chosen = if device_id.is_some() {
-            // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
-            // 当前优先级档全满时其成员被过滤掉，自然溢出到下一档；全部满则拒绝。
-            let with_room: Vec<&Credential> =
-                ordered.iter().copied().filter(|c| has_room(c)).collect();
-            if with_room.is_empty() {
-                return Err(DeviceLimitReached.into());
+        let chosen = match binding {
+            Some(b) => {
+                // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
+                // 当前优先级档全满时其成员被过滤掉，自然溢出到下一档；全部满则拒绝。
+                let with_room: Vec<&Credential> =
+                    ordered.iter().copied().filter(|c| has_room(c)).collect();
+                if with_room.is_empty() {
+                    return Err(b.limit_error());
+                }
+                // 按会话绑定的还是裸请求，要过裸请求速率上限（设备绑定的 `bare_ok` 恒真）。
+                let with_bare: Vec<&Credential> =
+                    with_room.iter().copied().filter(|c| bare_ok(c)).collect();
+                if with_bare.is_empty() {
+                    return Err(BareRateLimited { retry_after_secs: rate_window }.into());
+                }
+                // 名额与 RPM 是两回事，故两道门分开判：都过不去时要能说清是哪一道拦的
+                // ——名额满是「换台机器也没用」，RPM 满是「等几秒就好」。
+                match with_bare.iter().copied().find(|c| rpm_room(c)) {
+                    Some(c) => c,
+                    None => return Err(rpm_full(&with_bare)),
+                }
             }
-            // 设备名额与 RPM 是两回事，故两道门分开判：都过不去时要能说清是哪一道拦的
-            // ——设备满是「换台机器也没用」，RPM 满是「等几秒就好」。
-            match with_room.iter().copied().find(|c| rpm_room(c)) {
-                Some(c) => c,
-                None => return Err(rpm_full(&with_room)),
-            }
-        } else {
-            // 无 device_id：不占设备名额，但要过裸请求速率上限。
-            let bare_ok: Vec<&Credential> = ordered
-                .iter()
-                .copied()
-                .filter(|c| !rate_limited || self.bare_rate.has_room(c.id, rate_limit, bare_window))
-                .collect();
-            if bare_ok.is_empty() {
-                return Err(BareRateLimited { retry_after_secs: rate_window }.into());
-            }
-            match bare_ok.iter().copied().find(|c| rpm_room(c)) {
-                Some(c) => c,
-                None => return Err(rpm_full(&bare_ok)),
+            None => {
+                // 无 device_id 也无会话键：不占名额，但要过裸请求速率上限。
+                let with_bare: Vec<&Credential> =
+                    ordered.iter().copied().filter(|c| bare_ok(c)).collect();
+                if with_bare.is_empty() {
+                    return Err(BareRateLimited { retry_after_secs: rate_window }.into());
+                }
+                match with_bare.iter().copied().find(|c| rpm_room(c)) {
+                    Some(c) => c,
+                    None => return Err(rpm_full(&with_bare)),
+                }
             }
         };
 
-        if let Some(did) = device_id {
+        if let Some(b) = binding {
             conn.execute(
-                "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
-                 ON CONFLICT(device_id) DO UPDATE
-                    SET cred_id = ?2, last_seen_at = unixepoch(), request_count = request_count + 1",
-                params![did, chosen.id],
+                &format!(
+                    "INSERT INTO {t} ({k}, cred_id) VALUES (?1, ?2)
+                     ON CONFLICT({k}) DO UPDATE
+                        SET cred_id = ?2, last_seen_at = unixepoch(), \
+                            request_count = request_count + 1",
+                    t = b.table(),
+                    k = b.column()
+                ),
+                params![b.key(), chosen.id],
             )?;
         }
         // 两个窗口都在**选定之后**才记账（而不是边问边记）：一次选号要连过两道窗口，
@@ -5597,6 +5941,37 @@ mod tests {
     // 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
     #![allow(deprecated)]
     use super::*;
+
+    /// 全局默认会话上限的播种：同设备那条——缺失才写、显式值（含 `0`）不动、重复启动不改。
+    #[test]
+    fn seeds_the_default_session_limit_only_when_absent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let read = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![DEFAULT_SESSION_LIMIT],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(read(&conn).as_deref(), Some(DEFAULT_SESSION_LIMIT_VALUE.to_string().as_str()));
+        init_schema(&conn).unwrap();
+        assert_eq!(read(&conn).as_deref(), Some(DEFAULT_SESSION_LIMIT_VALUE.to_string().as_str()));
+        for explicit in ["0", "12"] {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params![DEFAULT_SESSION_LIMIT, explicit],
+            )
+            .unwrap();
+            init_schema(&conn).unwrap();
+            assert_eq!(read(&conn).as_deref(), Some(explicit), "显式配置不该被迁移改写");
+        }
+    }
 
     /// 全局默认设备上限的播种：库里没有这一项才写入 [`DEFAULT_DEVICE_LIMIT_VALUE`]，
     /// 已经有值的（包括显式写的 `0` = 不限）一个字不动，重复启动也不会改回去。
@@ -6398,6 +6773,164 @@ mod tests {
         (store, ids)
     }
 
+    /// 模拟会话的选号入参：与 [`soft`] 同一套 TTL / 保留期，只是键换成会话键、没有设备身份。
+    fn soft_session(key: &str) -> Select<'_> {
+        Select {
+            session_key: Some(key),
+            ttl_secs: 60,
+            retention_secs: 3600,
+            rate_limited: true,
+            ..Default::default()
+        }
+    }
+
+    fn age_session_binding(store: &CredentialStore, key: &str, secs: i64) {
+        let n = store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE session_bindings SET last_seen_at = unixepoch() - ?2 WHERE session_key = ?1",
+                params![key, secs],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "要推的绑定得先存在");
+    }
+
+    /// 模拟路径上没有设备身份的来访按会话键粘住账号并占**会话名额**：同键回同号、名额满了溢到
+    /// 别的号、全满时拒——与设备绑定逐条相同，但走另一张表、另一个上限，设备名额一个不占。
+    #[test]
+    fn session_key_binds_and_limits_simulated_sessions() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.set_setting(DEFAULT_SESSION_LIMIT, "1").unwrap();
+
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a, "同键回同号");
+        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, b, "a 满了溢到 b");
+        let err = store.select_for_device(soft_session("s3")).unwrap_err();
+        assert!(err.downcast_ref::<SessionLimitReached>().is_some(), "全满时拒: {err}");
+        assert!(err.downcast_ref::<DeviceLimitReached>().is_none(), "拒的理由是会话不是设备");
+        // 设备名额一个不占，会话名额各占一个；计数与明细同一口径。
+        assert_eq!(store.device_count(a).unwrap(), 0);
+        assert!(store.list_devices(a).unwrap().is_empty());
+        assert_eq!(store.session_count(a).unwrap(), 1);
+        assert_eq!(store.session_counts().unwrap().get(&b).copied(), Some(1));
+        let list = store.list_sessions(a).unwrap();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].session_key, "s1");
+        // 口径同设备绑定：建行那一轮不计，之后每命中一轮加一（`request_count` 的既有约定，
+        // 见 `dormant_binding_still_steers_the_device_back_to_its_credential` 里的断言）。
+        assert_eq!(list[0].request_count, 1, "第二轮命中既有绑定记一次");
+        assert!(list[0].created_at > 0 && list[0].last_seen_at >= list[0].created_at);
+        // 解绑腾出名额，s3 就能进来；再解一次是空操作。
+        assert!(store.unbind_session(a, "s1").unwrap());
+        assert!(!store.unbind_session(a, "s1").unwrap());
+        assert_eq!(store.select_for_device(soft_session("s3")).unwrap().id, a);
+    }
+
+    /// 带设备身份的请求即使也带了会话键，只按设备绑定：一条请求不占两份名额。
+    #[test]
+    fn device_id_takes_precedence_over_the_session_key() {
+        let (store, ids) = soft_store(&["a"]);
+        let a = ids[0];
+        let sel = Select { device_id: Some("dev-1"), ..soft_session("s1") };
+        assert_eq!(store.select_for_device(sel).unwrap().id, a);
+        assert_eq!(store.device_count(a).unwrap(), 1);
+        assert_eq!(store.session_count(a).unwrap(), 0, "没写会话绑定");
+        assert!(store.list_sessions(a).unwrap().is_empty());
+    }
+
+    /// 会话上限三态同设备上限：`0` 跟随全局、`> 0` 独立上限、`< 0` 明确不限；与设备上限互不
+    /// 影响——设备上限 1 时会话照样能开好几条，会话占满也不妨碍设备绑定。
+    #[test]
+    fn session_limit_tri_state_is_independent_of_the_device_limit() {
+        let (store, ids) = soft_store(&["a"]);
+        let a = ids[0];
+        store.set_setting(DEFAULT_SESSION_LIMIT, "1").unwrap();
+        store.set_setting(DEFAULT_DEVICE_LIMIT, "1").unwrap();
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert!(
+            store
+                .select_for_device(soft_session("s2"))
+                .unwrap_err()
+                .downcast_ref::<SessionLimitReached>()
+                .is_some()
+        );
+        // 账号独立上限 3。
+        assert!(store.set_session_limit(a, 3).unwrap());
+        assert_eq!(store.get(a).unwrap().unwrap().session_limit, 3);
+        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, a);
+        assert_eq!(store.select_for_device(soft_session("s3")).unwrap().id, a);
+        assert!(
+            store
+                .select_for_device(soft_session("s4"))
+                .unwrap_err()
+                .downcast_ref::<SessionLimitReached>()
+                .is_some()
+        );
+        // 明确不限（批量接口）。
+        assert_eq!(store.set_session_limits(&[a], -1).unwrap(), 1);
+        assert_eq!(store.select_for_device(soft_session("s4")).unwrap().id, a);
+        assert_eq!(store.select_for_device(soft_session("s5")).unwrap().id, a);
+        assert_eq!(store.session_count(a).unwrap(), 5);
+        // 设备名额仍是 0/1：会话一个都没占它。
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a);
+        assert!(
+            store
+                .select_for_device(soft("dev-2"))
+                .unwrap_err()
+                .downcast_ref::<DeviceLimitReached>()
+                .is_some(),
+            "设备上限照旧只管设备"
+        );
+        assert_eq!(effective_session_limit(0, 7), 7);
+        assert_eq!(effective_session_limit(-1, 7), 0);
+        assert_eq!(effective_session_limit(2, 7), 2);
+        assert_eq!(store.default_session_limit(), 1);
+    }
+
+    /// 停用 / 封停 / 删除账号都要连带清掉它的会话绑定，否则会话被钉死在坏号上——与设备绑定
+    /// 那条（`banned_credential_releases_its_devices`）同一个道理。
+    #[test]
+    fn disabling_or_deleting_a_credential_releases_its_sessions() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert!(store.set_disabled(a, true).unwrap());
+        assert_eq!(store.session_count(a).unwrap(), 0, "停用清绑定");
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, b, "改选到 b");
+        assert!(store.set_disabled(a, false).unwrap());
+        assert!(store.mark_banned(b, "[401] revoked").unwrap());
+        assert_eq!(store.session_count(b).unwrap(), 0, "封停清绑定");
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        assert!(store.delete(a).unwrap());
+        let n: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM session_bindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "删号不留无主的会话绑定");
+    }
+
+    /// 休眠的会话软绑定：TTL 过了名额还回去，会话再来仍优先回原号；保留期过了才真删、
+    /// 回来就是新会话。
+    #[test]
+    fn dormant_session_binding_steers_the_session_back() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a);
+        age_session_binding(&store, "s1", 600);
+        assert_eq!(store.session_count(a).unwrap(), 0, "休眠不占名额");
+        assert!(store.list_sessions(a).unwrap().is_empty(), "明细口径同计数");
+        assert_eq!(store.select_for_device(soft_session("s2")).unwrap().id, a);
+        // 此刻 a 有 1 条活跃、b 一条没有，纯负载均衡会把 s1 判给 b。
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, a, "软绑定带回 a");
+        assert_eq!(store.session_count(a).unwrap(), 2);
+        // 超过保留期：行被清掉，回来就是新会话，按负载均衡落到 b。
+        age_session_binding(&store, "s1", 7200);
+        assert_eq!(store.select_for_device(soft_session("s1")).unwrap().id, b);
+    }
+
     /// 软绑定：TTL 过了名额就还回去，但设备再来时仍优先回原号——哪怕负载均衡指向别处。
     ///
     /// 这是 thinking 签名能续上的前提：签名跟着账号走，会话隔一小时再续跑要是换了号，
@@ -6661,6 +7194,7 @@ mod tests {
             priority: 2,
             disabled: false,
             device_limit: 3,
+            session_limit: 0,
             rpm_limit: 7,
             quota_pause_pct: None,
             quota_pause_pct_7d: None,
@@ -6750,6 +7284,7 @@ mod tests {
             priority: 4,
             disabled: true,
             device_limit: 6,
+            session_limit: 0,
             rpm_limit: -1,
             quota_pause_pct: Some(95),
             quota_pause_pct_7d: Some(0),

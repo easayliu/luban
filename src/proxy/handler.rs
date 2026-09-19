@@ -16,8 +16,9 @@ use super::body::{
     below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
     cc_tools_to_inject, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
     extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
-    known_latest_release, outbound_carries_fallbacks, outbound_ua, refusal_fallbacks_for,
-    remember_fallback_rejection, sim_device_id, stream_requested, trusted_cc_version, ua_of,
+    known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
+    remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
+    stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -650,21 +651,59 @@ pub(super) async fn handle_inner(
         );
     }
 
-    // 3) 按 device_id 粘性选出凭证的 access_token（必要时刷新）。
+    // 2.5) 转发形态开关一条 SQL 读齐（默认全开 = 加入开关前的既有行为），以及这条请求走不走
+    //      模拟——两者在选号之前就要定下来：模拟路径的会话键参与选号（下面的 `session_key`），
+    //      设备指纹又按走不走模拟取两套。
+    let flags = state.store.forward_flags();
+    // 走不走模拟的判据与 [`Simulation::detect`] 同源（都走 [`simulates_cc`]），不然指纹会把
+    // 一条请求算到另一台设备名下。
+    let simulating = simulates_cc(body_json.as_ref(), &headers, from_cc_client, flags);
+    // 设备指纹用于派生伪装 device_id。归一化开着时只取平台，关着时叠加客户端原始 device_id。
+    // **模拟路径取实际发出去的那套头**（[`sim_device_fingerprint`]）：来访的平台头与 UA 一个
+    // 都不会发出去，同一账号经模拟路径的全部请求是同一台设备；非模拟路径按来访的平台头与
+    // UA 算（[`device_fingerprint`]，一台设备只能有一个客户端版本）。
+    let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
+    let device_fp = if simulating {
+        sim_device_fingerprint(fp_device)
+    } else {
+        device_fingerprint(fp_device, &headers, &client_ua)
+    };
+    // 模拟路径的**会话键**：缓存前缀加对话起点的指纹（[`sim_session_key`]，tools + system +
+    // 首条用户消息），
+    // 来访没带会话 id 时模拟路径用它派生出站的会话 id（[`Simulation::detect`]）。
+    let prefix_key = if simulating { body_json.as_ref().map(sim_session_key) } else { None };
+    // 参与选号的会话键（只在模拟路径、且来访没有设备身份时生效，见 [`store::Select::session_key`]）：
+    // 来访自带合法会话 id 就用它——那正是出站会落的那条会话（按账号钉住之前的原值，键要跨账号
+    // 稳定）；没带就用那个指纹。同一个键粘住同一个号（换号会连累 thinking 签名，理由同设备绑定）
+    // 并占该号的一个**会话名额**：每个号最多同时活跃多少条模拟会话，与设备上限同一套三态与
+    // TTL。一次性会话打一条就走的那类流量（封号复盘里最显眼的形态）在这里被封顶。
+    let session_key: Option<String> = prefix_key
+        .as_ref()
+        .map(|k| incoming_session_id(&headers, body_json.as_ref()).unwrap_or_else(|| k.clone()));
+
+    // 3) 按 device_id（模拟路径没有设备身份时按会话键）粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
     // 免得两处的 device_id/model 哪天漂开。
     fn select<'a>(
         device_id: Option<&'a str>,
+        session_key: Option<&'a str>,
         billable: bool,
         model: Option<&'a str>,
         exclude: &'a [i64],
     ) -> store::Select<'a> {
-        store::Select { device_id, rate_limited: billable, exclude, model, ..Default::default() }
+        store::Select {
+            device_id,
+            session_key,
+            rate_limited: billable,
+            exclude,
+            model,
+            ..Default::default()
+        }
     }
     let (token, cred) = match store::valid_access_token_for_device(
         &state.store,
         &state.clients,
-        select(device_id.as_deref(), billable, req_model.as_deref(), &[]),
+        select(device_id.as_deref(), session_key.as_deref(), billable, req_model.as_deref(), &[]),
     )
     .await
     {
@@ -684,6 +723,8 @@ pub(super) async fn handle_inner(
                 "all-cooling-down"
             } else if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
                 "device-limit"
+            } else if e.downcast_ref::<store::SessionLimitReached>().is_some() {
+                "session-limit"
             } else if e.downcast_ref::<store::ModelUnsupported>().is_some() {
                 "model-unsupported"
             } else {
@@ -716,9 +757,11 @@ pub(super) async fn handle_inner(
             if e.downcast_ref::<store::ModelUnsupported>().is_some() {
                 return error_response(StatusCode::FORBIDDEN, "permission_error", e.to_string());
             }
-            // 设备数达硬上限 → 429（等多久取决于别人什么时候释放，给不出 retry-after，故这条
-            // 不走 [`rate_limit_response`]）；其余（无凭证/刷新失败等）→ 503。
-            let (status, etype) = if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
+            // 设备数 / 模拟会话数达硬上限 → 429（等多久取决于别人什么时候释放，给不出
+            // retry-after，故这条不走 [`rate_limit_response`]）；其余（无凭证/刷新失败等）→ 503。
+            let (status, etype) = if e.downcast_ref::<store::DeviceLimitReached>().is_some()
+                || e.downcast_ref::<store::SessionLimitReached>().is_some()
+            {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
             } else {
                 (StatusCode::SERVICE_UNAVAILABLE, "api_error")
@@ -730,17 +773,8 @@ pub(super) async fn handle_inner(
     // 4) 目标 URL：上游 base + 原路径与查询串。
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
 
-    // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制，
-    //    一条 SQL 读齐（默认全开 = 加入开关前的既有行为）。
-    let flags = state.store.forward_flags();
-    // 设备指纹用于派生伪装 device_id。归一化开着时只取平台（arch/os），关着时叠加客户端
-    // 原始 device_id。头与体两侧都要用它（模拟模式的 session_id 也由它派生），故在装头之前先算好。
-    let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
-    // **出站 UA 也进指纹**：一台设备只能有一个客户端版本，换版本就是换设备。判据与
-    // [`Simulation::detect`] 同源（都走 [`simulates_cc`]），不然指纹会把一条请求算到另一台
-    // 设备名下。理由与代价见 [`device_fingerprint`]。
-    let simulating = simulates_cc(body_json.as_ref(), &headers, from_cc_client, flags);
-    let device_fp = device_fingerprint(fp_device, &headers, outbound_ua(&client_ua, simulating));
+    // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制
+    //    （`flags`，2.5 读的那份）。设备指纹也在那里算好了——头与体两侧都要用它。
     // 6) 转发前改写 body：system 形态对齐（拆/并成官方的 5 块 + 基座标 scope=global）
     //    + 身份伪装（metadata.user_id 的 account_uuid/device_id 换成该凭证自洽身份、
     //    billing header 补 cch）；模拟模式下另外补上官方 system 前缀与 metadata。
@@ -827,6 +861,7 @@ pub(super) async fn handle_inner(
             flags,
             &cred,
             &device_fp,
+            prefix_key.as_deref().unwrap_or_default(),
         );
         // 真实 CC（API-key 模式）来访的会话关联字段：它自己那条 billing header 里没有
         // `cc_prompt_id`/`cc_prev_req`，整条也没有 `diagnostics`，而订阅端官方每条主线程
@@ -1185,7 +1220,13 @@ pub(super) async fn handle_inner(
                     match store::valid_access_token_for_device(
                         &state.store,
                         &state.clients,
-                        select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+                        select(
+                            device_id.as_deref(),
+                            session_key.as_deref(),
+                            billable,
+                            req_model.as_deref(),
+                            &tried,
+                        ),
                     )
                     .await
                     {
@@ -1275,7 +1316,13 @@ pub(super) async fn handle_inner(
             match store::valid_access_token_for_device(
                 &state.store,
                 &state.clients,
-                select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+                select(
+                    device_id.as_deref(),
+                    session_key.as_deref(),
+                    billable,
+                    req_model.as_deref(),
+                    &tried,
+                ),
             )
             .await
             {
@@ -1467,7 +1514,13 @@ pub(super) async fn handle_inner(
         match store::valid_access_token_for_device(
             &state.store,
             &state.clients,
-            select(device_id.as_deref(), billable, req_model.as_deref(), &tried),
+            select(
+                device_id.as_deref(),
+                session_key.as_deref(),
+                billable,
+                req_model.as_deref(),
+                &tried,
+            ),
         )
         .await
         {

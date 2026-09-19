@@ -728,13 +728,127 @@ pub(super) fn device_fingerprint(
     )
 }
 
-/// 这条请求实际发往上游的 UA：模拟路径整套换头，UA 恒为 [`config::CC_USER_AGENT`]
-/// （[`config::CC_SIM_HEADERS`]）；其余路径原样转发来访那份。
+/// **模拟路径**的设备指纹：平台段与 UA 段都取**实际发出去的那套头**（[`config::CC_SIM_HEADERS`]
+/// 里的 `x-stainless-arch` / `x-stainless-os` 与 [`config::CC_USER_AGENT`]），不看来访自己带的。
 ///
-/// 只用于算设备指纹——真正装头的是 [`build_forward_headers_for`]，两处的取值规则必须同源，
-/// 不然指纹会把一条请求算到另一台设备名下。
-pub(super) fn outbound_ua(client_ua: &str, simulated: bool) -> &str {
-    if simulated { config::CC_USER_AGENT } else { client_ua }
+/// 模拟路径整套换头，来访的 `x-stainless-*` 与 UA 一个都不会发出去；此前指纹却照抄来访的
+/// arch/os，于是 Windows 上的裸客户端与 Mac 上的裸客户端派生出两台设备，而上游收到的两条
+/// 请求平台头完全一样（都是 arm64 + MacOS）——「两台设备、同一套平台头」正是
+/// [`device_fingerprint`] 要堵的那类矛盾，只是方向反了。没带平台头的来访（curl、不走 SDK 的
+/// 中转）此前落在 `"||…"` 上，与带头的又是另一台。现在同一账号经模拟路径的全部请求都是
+/// **同一台设备**，与它们在上游呈现的那套头一致；arm64 mac 上的来访指纹与原来逐字相同，
+/// 别的平台与没带头的并到它上面来。
+///
+/// `client_device_id` 仍然参与（归一化关着时）：来访自带设备 id 却被判成非官方客户端的那种，
+/// 各自还是各自的设备。
+pub(super) fn sim_device_fingerprint(client_device_id: Option<&str>) -> String {
+    let sim = |k: &str| config::CC_SIM_HEADERS.iter().find(|(n, _)| *n == k).map_or("", |(_, v)| v);
+    format!(
+        "{}|{}|{}|{}",
+        client_device_id.unwrap_or(""),
+        sim("x-stainless-arch"),
+        sim("x-stainless-os"),
+        config::CC_USER_AGENT,
+    )
+}
+
+/// 模拟路径上**来访没带会话 id** 时用来派生会话 id、也用来做会话绑定的键：**缓存前缀**
+/// （`tools` 整段加 `system` 各块正文，不含 billing header 那一块，口径同 [`cache_prefix_of`]）
+/// 再加**对话起点**（第一条 `role:"user"` 消息的文本），一起 sha256，取前 16 字节的小写 hex。
+///
+/// 为什么按前缀而不是按设备：此前来访没带会话 id 就按「账号 + 设备指纹」派生一个恒定值，
+/// 同一账号经模拟路径的所有裸请求在上游看来是**一台设备上一条会话打了全部请求**，不同应用、
+/// 不同工作区、不同对话混在同一个会话 id 下，消息历史互不为前缀。官方一条会话里 tools 与
+/// system 是稳定的、消息只增不改，所以前缀相同**且对话起点相同**的请求才是同一条会话。
+///
+/// 为什么还要对话起点：同一应用同一工作区里开的几个对话 tools 与 system 完全一样，只按前缀
+/// 它们是一条会话——几个对话只占一个会话名额（上限形同虚设）、粘在同一个号上、在上游共用一个
+/// `X-Claude-Code-Session-Id` 却各发各的历史。第一条用户消息是一条对话里最稳定的东西：之后
+/// 每轮都原样带着它、只在末尾追加。取它的**整段 content**——文本、图片、文档、tool_result
+/// 都算（两个「描述这张图片」的对话差的正是图片），只去掉 `cache_control`（客户端逐轮挪断点）；
+/// 字符串正文与单个 text 块等价，键序不影响。
+///
+/// 代价：客户端每轮都在改 system 或改首条消息的（压缩历史、把环境信息重写进首条），每轮或
+/// 每次压缩后一个新会话——那种客户端本来也命不中缓存，见 [`ensure_cc_message_breakpoint`]
+/// 的记述。没有 `tools`、`system`，首条也不是用户消息的请求键恒定——同一账号下这类请求仍是
+/// 一条会话，与原来一样。**这是近似**：两条请求连首条 content 都逐字相同时，协议里没有任何
+/// 信息能分出它们是不是两个对话，后台的会话数与上限都按这个口径算。返回 32 个 hex 字符，
+/// 直接可作 `session_bindings.session_key`。
+pub(super) fn sim_session_key(v: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"luban-prefix\0");
+    if let Some(tools) = v.get("tools") {
+        h.update(tools.to_string().as_bytes());
+    }
+    h.update([0u8]);
+    match v.get("system") {
+        Some(serde_json::Value::String(s)) => {
+            h.update(s.as_bytes());
+            h.update([0u8]);
+        }
+        Some(serde_json::Value::Array(blocks)) => {
+            for t in blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.starts_with("x-anthropic-billing-header:"))
+            {
+                h.update(t.as_bytes());
+                h.update([0u8]);
+            }
+        }
+        _ => {}
+    }
+    // 对话起点：第一条用户消息的文本。`role:"system"` 之类夹在前面的（litellm 那种，后面会被
+    // 提升进顶层 system）跳过——它们是前缀的一部分，不是对话的起点。
+    h.update(b"\0first-user\0");
+    let first_user = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")));
+    // 整段 content 都算，不只文本：两个「描述这张图片」的对话差的正是图片。字符串正文与单个
+    // text 块等价（客户端第二轮常把首条从字符串改成块数组）；每块去掉 `cache_control` 后按
+    // 键排序序列化（[`canonical_json`]），键序与断点都不影响键。
+    let blocks: Vec<serde_json::Value> = match first_user.and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => {
+            vec![serde_json::json!({"type": "text", "text": s})]
+        }
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .map(|b| {
+                let mut b = b.clone();
+                if let Some(o) = b.as_object_mut() {
+                    o.remove("cache_control");
+                }
+                b
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for b in &blocks {
+        h.update(canonical_json(b).as_bytes());
+        h.update([0u8]);
+    }
+    crate::credentials::hex_lower(&h.finalize()[..16])
+}
+
+/// 键按字典序排好的紧凑 JSON：`preserve_order` 开着时 `to_string` 按客户端发来的键序输出，
+/// 同一内容两种键序会算出两个不同的键。只给 [`sim_session_key`] 用。
+fn canonical_json(v: &serde_json::Value) -> String {
+    fn sort(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                serde_json::Value::Object(
+                    keys.into_iter().map(|k| (k.clone(), sort(&o[k]))).collect(),
+                )
+            }
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(sort).collect()),
+            other => other.clone(),
+        }
+    }
+    sort(v).to_string()
 }
 
 /// 从一组头里取 `User-Agent` 供日志与落库用：没有该头或不是可打印 ASCII 时为 `-`。
@@ -5892,33 +6006,141 @@ mod tests {
         assert_ne!(old, crate::proxy::device_fingerprint(None, &win, UA_OLD));
     }
 
-    /// 指纹里那段 UA 取的是**出站**那份：模拟路径整套换头（UA 恒为
-    /// [`config::CC_USER_AGENT`]），所以被模拟的第三方客户端落在「官方客户端」那台设备上，
-    /// 而不是各自自报的 UA 上——否则指纹与真正发出去的版本又对不上了。
+    /// 模拟路径的指纹只看**实际发出去的那套头**：来访自报什么 UA、什么平台、有没有平台头都
+    /// 落在同一台设备上，而那台设备的平台段与 [`config::CC_SIM_HEADERS`] 一致。
+    /// arm64 mac 的来访指纹与非模拟路径下用官方 UA 算出来的逐字相同（存量设备 id 不变）。
     #[test]
-    fn device_fingerprint_follows_the_outbound_ua() {
-        assert_eq!(crate::proxy::outbound_ua("python-httpx/0.27.0", true), config::CC_USER_AGENT);
-        assert_eq!(crate::proxy::outbound_ua("Go-http-client/2.0", true), config::CC_USER_AGENT);
+    fn simulated_requests_share_one_device_fingerprint() {
+        let sim = crate::proxy::sim_device_fingerprint(None);
         assert_eq!(
-            crate::proxy::outbound_ua("claude-cli/2.1.141 (external, sdk-cli)", false),
-            "claude-cli/2.1.141 (external, sdk-cli)",
-            "非模拟路径原样转发来访那份，指纹也跟着它"
+            sim,
+            crate::proxy::device_fingerprint(None, &platform_headers(None), config::CC_USER_AGENT),
+            "arm64 mac 来访的指纹与原来一样"
         );
+        assert!(sim.ends_with(config::CC_USER_AGENT), "UA 段是模拟路径发出去的那串: {sim}");
+        assert!(sim.contains("|arm64|MacOS|"), "平台段取 CC_SIM_HEADERS 的定值: {sim}");
+        // 与非模拟路径的对照：Windows 来访在非模拟路径是另一台设备，在模拟路径不是。
+        let mut win = crate::proxy::HeaderMap::new();
+        win.insert("x-stainless-arch", HeaderValue::from_static("x64"));
+        win.insert("x-stainless-os", HeaderValue::from_static("Windows"));
+        assert_ne!(sim, crate::proxy::device_fingerprint(None, &win, config::CC_USER_AGENT));
+        // 归一化关着时来访自带的设备 id 仍分开。
+        assert_ne!(
+            crate::proxy::sim_device_fingerprint(Some("dev-a")),
+            crate::proxy::sim_device_fingerprint(Some("dev-b"))
+        );
+    }
 
-        let h = platform_headers(None);
-        assert_eq!(
-            crate::proxy::device_fingerprint(
-                None,
-                &h,
-                crate::proxy::outbound_ua("python-httpx/0.27.0", true)
-            ),
-            crate::proxy::device_fingerprint(
-                None,
-                &h,
-                crate::proxy::outbound_ua("Go-http-client/2.0", true)
-            ),
-            "两个第三方 UA 都被重塑成同一个官方客户端，就是同一台设备"
+    /// 模拟路径的会话键 = 缓存前缀 + 对话起点：tools、system、首条用户消息三者相同的请求同一个
+    /// 键，任一处变了就是另一个；同一对话追加后续消息不变；billing header 那块与 `cache_control`
+    /// 不算；同一应用（同 tools/system）里首条消息不同的两个对话必须是两个键。
+    #[test]
+    fn sim_session_key_follows_the_cache_prefix_and_the_first_user_message() {
+        let key = |body: &str| crate::proxy::sim_session_key(&serde_json::from_str(body).unwrap());
+        let a = key(
+            r#"{"system":[{"type":"text","text":"S"}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"hi"}]}"#,
         );
+        assert_eq!(a.len(), 32, "16 字节 hex: {a}");
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        // 同一对话第二轮：首条不动、末尾追加、断点挪到末条——键不变。
+        assert_eq!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"more","cache_control":{"type":"ephemeral"}}]}]}"#
+            ),
+            "同一对话追加消息、首条改成块数组、断点挪动，仍是同一条会话"
+        );
+        assert_eq!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=1"},{"type":"text","text":"S"}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"hi"}]}"#
+            ),
+            "billing header 那块不进缓存键"
+        );
+        assert_eq!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S"}],"tools":[{"name":"Bash"}],"messages":[{"role":"system","content":"hoisted"},{"role":"user","content":"hi"}]}"#
+            ),
+            "夹在前面的 role:system 消息不算对话起点"
+        );
+        // 同一应用的另一个对话：tools/system 一样、首条用户消息不同，必须是另一个键。
+        assert_ne!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S"}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"bye"}]}"#
+            ),
+            "首条用户消息变了"
+        );
+        assert_ne!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S2"}],"tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"hi"}]}"#
+            ),
+            "system 变了"
+        );
+        assert_ne!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S"}],"tools":[{"name":"Read"}],"messages":[{"role":"user","content":"hi"}]}"#
+            ),
+            "tools 变了"
+        );
+        assert_ne!(
+            a,
+            key(
+                r#"{"system":[{"type":"text","text":"S"}],"messages":[{"role":"user","content":"hi"}]}"#
+            ),
+            "tools 没了"
+        );
+        assert_eq!(
+            a,
+            key(
+                r#"{"system":"S","tools":[{"name":"Bash"}],"messages":[{"role":"user","content":"hi"}]}"#
+            ),
+            "字符串 system 与单块等价"
+        );
+        // 纯聊天：没有 tools 也没有 system，只剩首条消息在分。
+        assert_ne!(
+            key(r#"{"messages":[{"role":"user","content":"a"}]}"#),
+            key(r#"{"messages":[{"role":"user","content":"b"}]}"#)
+        );
+        assert_eq!(
+            key(r#"{"messages":[{"role":"user","content":"a"}]}"#),
+            key(
+                r#"{"messages":[{"role":"user","content":"a"},{"role":"assistant","content":"x"}]}"#
+            )
+        );
+        // 非文本块也算：文本相同、图片不同的两个对话是两个键；同一图片对话追加轮次不变；
+        // 块内键序与断点不影响；纯图片（没有 text）的两个对话也分得开。
+        let img = |data: &str, extra: &str| {
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"描述这张图片"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{data}"}}}}]}}{extra}]}}"#
+            )
+        };
+        let cat = key(&img("Y2F0", ""));
+        assert_ne!(cat, key(&img("ZG9n", "")), "文本相同、图片不同是两个对话");
+        assert_eq!(
+            cat,
+            key(&img(
+                "Y2F0",
+                r#",{"role":"assistant","content":"a cat"},{"role":"user","content":"and this?"}"#
+            )),
+            "同一图片对话追加轮次不变"
+        );
+        assert_eq!(
+            cat,
+            key(
+                r#"{"messages":[{"role":"user","content":[{"text":"描述这张图片","type":"text","cache_control":{"type":"ephemeral"}},{"source":{"data":"Y2F0","media_type":"image/png","type":"base64"},"type":"image"}]}]}"#
+            ),
+            "键序与断点不影响"
+        );
+        let only_img = |data: &str| {
+            format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{data}"}}}}]}}]}}"#
+            )
+        };
+        assert_ne!(key(&only_img("Y2F0")), key(&only_img("ZG9n")), "纯图片对话也分得开");
     }
 
     /// `spoof_device_id` 关掉时只换 account 段，来访自带的 `device_id` 原样保留。

@@ -108,6 +108,15 @@ export interface Credential {
   device_limit_effective: number
   /** 当前已绑定的设备数。 */
   device_count: number
+  /**
+   * 账号自身的模拟会话上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。
+   * 只管模拟路径上没有设备身份的来访：它们按会话键（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额。
+   */
+  session_limit: number
+  /** 实际生效的模拟会话上限（已套用全局默认）；0 表示不限。 */
+  session_limit_effective: number
+  /** 当前活跃（TTL 内）的模拟会话绑定数，口径同 device_count。 */
+  session_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
   ban_reason: string | null
   /** 该号被自动封停过几次（封号事件条数，解封不清零）。见 `listBanEvents`。 */
@@ -408,6 +417,24 @@ export async function listCredentials(): Promise<Credential[]> {
   return data
 }
 
+/** 一条模拟会话绑定。口径同 `session_count`：只含 TTL 内仍活跃的。 */
+export interface SessionBinding {
+  /** 会话键：来访自带的会话 id，或「缓存前缀（tools + system）+ 首条用户消息」的指纹（32 个 hex 字符）。 */
+  session_key: string
+  /** 绑定之后再命中的请求数（建行那一轮不计，口径同设备绑定；随绑定行走，解绑即归零）。 */
+  request_count: number
+  /** 首次绑定时间（Unix 秒）。 */
+  created_at: number
+  /** 最近一次活跃时间（Unix 秒）；TTL 按它算。 */
+  last_seen_at: number
+}
+
+/** 列出某账号当前活跃的模拟会话（按最近活跃倒序）。 */
+export async function listCredentialSessions(id: number): Promise<SessionBinding[]> {
+  const { data } = await api.get<SessionBinding[]>(`/credentials/${id}/sessions`)
+  return data
+}
+
 /** 列出某账号当前绑定的设备（按最近活跃倒序）。 */
 export async function listCredentialDevices(id: number): Promise<DeviceBinding[]> {
   const { data } = await api.get<DeviceBinding[]>(`/credentials/${id}/devices`)
@@ -458,6 +485,11 @@ export async function unbindCredentialDevice(id: number, deviceId: string): Prom
   await api.delete(`/credentials/${id}/devices/${encodeURIComponent(deviceId)}`)
 }
 
+/** 解除某模拟会话与该账号的绑定，立即腾出一个会话名额。语义同 unbindCredentialDevice。 */
+export async function unbindCredentialSession(id: number, sessionKey: string): Promise<void> {
+  await api.delete(`/credentials/${id}/sessions/${encodeURIComponent(sessionKey)}`)
+}
+
 /** 删除一条凭证。 */
 export async function deleteCredential(id: number): Promise<void> {
   await api.delete(`/credentials/${id}`)
@@ -489,6 +521,18 @@ export async function setDeviceLimits(
   const { data } = await api.post<Credential[]>('/credentials/device-limit', {
     ids,
     device_limit: deviceLimit,
+  })
+  return data
+}
+
+/** 批量设置模拟会话数上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
+export async function setSessionLimits(
+  ids: number[],
+  sessionLimit: number,
+): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/session-limit', {
+    ids,
+    session_limit: sessionLimit,
   })
   return data
 }
@@ -550,6 +594,14 @@ export async function setProxy(id: number, proxy: string | null): Promise<Creden
 export async function setDeviceLimit(id: number, deviceLimit: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/device-limit`, {
     device_limit: deviceLimit,
+  })
+  return data
+}
+
+/** 设置模拟会话数上限：>0 独立上限；0 跟随全局默认；-1 明确不限。 */
+export async function setSessionLimit(id: number, sessionLimit: number): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/session-limit`, {
+    session_limit: sessionLimit,
   })
   return data
 }

@@ -3,6 +3,8 @@ use axum::http::HeaderMap;
 use crate::config;
 use crate::store;
 
+#[cfg(doc)]
+use super::body::sim_session_key;
 use super::body::{
     CacheShape, cache_control, cch_value, extract_device_id, extract_session_id, text_block,
     text_block_bare,
@@ -44,8 +46,9 @@ pub(super) struct Simulation {
     /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
     ///
     /// **优先用来访自己那个**（[`incoming_session_id`]）：客户端各开各的会话，折叠成一个
-    /// 就是「一台设备上一个会话打了所有请求」。来访没带才按「账号 + 设备指纹」派生一个
-    /// ——那份是同设备恒定的，代价（真实客户端会随会话轮换）记在 [`session_id_for`]。
+    /// 就是「一台设备上一个会话打了所有请求」。来访没带才按「账号 + 缓存前缀 + 对话起点」派生
+    /// 一个（[`session_id_for`]）：tools、system、首条用户消息相同的请求同一条会话，任一处变了
+    /// 就是另一条。
     pub(super) session_id: String,
     /// 这条请求在会话链条上的位置：`cc_prompt_id` / `cc_prev_req` /
     /// `diagnostics.previous_message_id` 三个关联字段的取值，见 [`CcSessionLink`]。
@@ -141,18 +144,20 @@ impl Simulation {
         flags: store::ForwardFlags,
         cred: &crate::credentials::Credential,
         device_fp: &str,
+        session_key: &str,
     ) -> Option<Self> {
         let v = body?;
         let reason = simulation_reason(Some(v), headers, from_cc_client, flags)?;
         let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
         let profile = cc_profile_for(model);
-        // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个按设备派生的 id
-        // 上，就是「一台设备一个会话打了所有请求」——比每请求一个新 id 更假。来访没带才派生。
-        // 来访那个按账号钉住（[`account_session_id`]）：同一条会话换号后不该带着同一个 uuid
-        // 出现在另一个组织下；与透传路径同一道闸（`spoof_identity`）。
+        // 会话 id **优先用来访自己那个**：客户端各开各的会话，全折叠到一个派生 id 上就是
+        // 「一台设备一个会话打了所有请求」——比每请求一个新 id 更假。来访没带才按账号 +
+        // 会话键（缓存前缀 + 对话起点，[`sim_session_key`]）派生：tools、system、首条用户消息
+        // 相同的请求是同一条会话，换了应用、工作区或开了新对话就是另一条。来访那个按账号钉住（[`account_session_id`]）：同一条会话换号后不该
+        // 带着同一个 uuid 出现在另一个组织下；与透传路径同一道闸（`spoof_identity`）。
         let session_id = incoming_session_id(headers, Some(v))
             .map(|sid| pin_session_id(cred, sid, flags.spoof_identity))
-            .unwrap_or_else(|| session_id_for(cred, device_fp));
+            .unwrap_or_else(|| session_id_for(cred, session_key));
         let link = CcSessionLink::load(
             CcSessionKey { cred_id: cred.id, session_id: &session_id },
             crate::telemetry::last_is_new_prompt_body(v),

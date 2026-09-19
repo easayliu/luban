@@ -7,8 +7,8 @@ use crate::web::AppState;
 
 use super::ban::{detect_account_ban, is_third_party_rejection, parse_upstream_error};
 use super::body::{
-    OutboundIdentity, THINKING_MIN_MAX_TOKENS, device_fingerprint, ensure_beta_query,
-    outbound_identity, rewrite_body, ua_of, with_outbound_identity,
+    OutboundIdentity, THINKING_MIN_MAX_TOKENS, ensure_beta_query, outbound_identity, rewrite_body,
+    sim_device_fingerprint, ua_of, with_outbound_identity,
 };
 use super::headers::{build_forward_headers_for, orig_header_case};
 use super::learned_rules::is_max_plan;
@@ -213,12 +213,10 @@ pub async fn probe(
         cred.access_token.clone()
     };
 
-    // 复用「裸客户端」那份设备指纹，不另造一个：指纹只用于派生伪装 device_id 与 session_id，
-    // 每加一份就等于给这个账号在上游多一台设备，而测试并不需要一个自己的身份。
-    //
-    // UA 那段给 [`config::CC_USER_AGENT`]：这条测试走模拟路径，发出去的就是它。写死空串会让
-    // 这台「设备」的指纹与它自报的版本对不上——正是 [`device_fingerprint`] 要堵的那件事。
-    let device_fp = device_fingerprint(None, &HeaderMap::new(), config::CC_USER_AGENT);
+    // 复用「裸客户端」那份设备指纹，不另造一个：指纹只用于派生伪装 device_id，每加一份就
+    // 等于给这个账号在上游多一台设备，而测试并不需要一个自己的身份。取模拟路径那份
+    // （[`sim_device_fingerprint`]）：这条测试走模拟路径，平台段与 UA 段都是它发出去的那套。
+    let device_fp = sim_device_fingerprint(None);
     let flags = store::ForwardFlags::default();
     // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
     // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。

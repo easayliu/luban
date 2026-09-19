@@ -35,6 +35,10 @@ pub struct Credential {
     pub disabled: bool,
     /// 允许绑定的设备数上限；`<= 0` 表示不限。见 [`crate::store`] 的粘性绑定选择。
     pub device_limit: i64,
+    /// 允许同时活跃的**模拟会话**数上限，三态同 [`Self::device_limit`]：`> 0` 独立上限；`0`
+    /// 跟随全局默认 [`crate::store::DEFAULT_SESSION_LIMIT`]；`< 0` 明确不限。只管模拟路径上
+    /// 没有设备身份的来访，见 `crate::store::Select::session_key`。
+    pub session_limit: i64,
     /// 该账号每分钟最多转发多少条请求（RPM 上限）。三态同 [`Self::device_limit`]：
     /// `> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
     /// 生效值见 [`crate::store::effective_rpm_limit`]，计数窗口见 `crate::store` 里的选号。

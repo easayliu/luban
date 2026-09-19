@@ -497,6 +497,7 @@ pub async fn run(
         .route("/credentials", get(list_credentials))
         .route("/credentials/priority", post(set_priorities))
         .route("/credentials/device-limit", post(set_device_limits))
+        .route("/credentials/session-limit", post(set_session_limits))
         .route("/credentials/rpm-limit", post(set_rpm_limits))
         .route("/credentials/quota-pause-pct", post(set_quota_pause_pcts_many))
         .route("/credentials/disabled", post(set_disabled_many))
@@ -507,11 +508,14 @@ pub async fn run(
         .route("/credentials/{id}/label", post(set_label))
         .route("/credentials/{id}/proxy", post(set_proxy))
         .route("/credentials/{id}/device-limit", post(set_device_limit))
+        .route("/credentials/{id}/session-limit", post(set_session_limit))
         .route("/credentials/{id}/rpm-limit", post(set_rpm_limit))
         .route("/credentials/{id}/quota-pause-pct", post(set_credential_quota_pause_pct))
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
+        .route("/credentials/{id}/sessions", get(list_credential_sessions))
+        .route("/credentials/{id}/sessions/{session_key}", delete(unbind_credential_session))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
@@ -534,6 +538,7 @@ pub async fn run(
         .route("/settings/device-ttl", post(set_device_ttl))
         .route("/settings/device-retention", post(set_device_retention))
         .route("/settings/default-device-limit", post(set_default_device_limit))
+        .route("/settings/default-session-limit", post(set_default_session_limit))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
         .route("/settings/device-rpm-limit", post(set_device_rpm_limit))
         .route("/settings/session-rpm-limit", post(set_session_rpm_limit))
@@ -797,7 +802,7 @@ async fn exchange(
     if proxy.is_some() {
         return view_of(&state, cred.id);
     }
-    Ok(Json(CredentialView::new(&cred, 0, DefaultLimits::of(&state.store))))
+    Ok(Json(CredentialView::new(&cred, 0, 0, DefaultLimits::of(&state.store))))
 }
 
 // ---------- 用量日志 ----------
@@ -948,6 +953,7 @@ async fn list_credentials(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
     let counts = state.store.device_counts().map_err(internal)?;
+    let session_counts = state.store.session_counts().map_err(internal)?;
     let quotas = state.store.latest_quotas().map_err(internal)?;
     let last_used = state.store.last_used().map_err(internal)?;
     let costs = state.store.cost_by_cred().map_err(internal)?;
@@ -958,20 +964,25 @@ async fn list_credentials(
     let views = list
         .iter()
         .map(|c| {
-            CredentialView::new(c, counts.get(&c.id).copied().unwrap_or(0), defaults)
-                .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
-                .with_cooldown(
-                    state.store.rate_limited_secs(c.id),
-                    state.store.rate_limited_models(c.id),
-                )
-                .with_denials(denials.remove(&c.id).unwrap_or_default())
-                .with_stats(
-                    quotas.get(&c.id).cloned(),
-                    last_used.get(&c.id).copied(),
-                    costs.get(&c.id).copied().unwrap_or(0.0),
-                    // 窗口内一条流水都没有的账号不在 map 里，就是 0 RPM。
-                    rpm.get(&c.id).copied().unwrap_or(0),
-                )
+            CredentialView::new(
+                c,
+                counts.get(&c.id).copied().unwrap_or(0),
+                session_counts.get(&c.id).copied().unwrap_or(0),
+                defaults,
+            )
+            .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
+            .with_cooldown(
+                state.store.rate_limited_secs(c.id),
+                state.store.rate_limited_models(c.id),
+            )
+            .with_denials(denials.remove(&c.id).unwrap_or_default())
+            .with_stats(
+                quotas.get(&c.id).cloned(),
+                last_used.get(&c.id).copied(),
+                costs.get(&c.id).copied().unwrap_or(0.0),
+                // 窗口内一条流水都没有的账号不在 map 里，就是 0 RPM。
+                rpm.get(&c.id).copied().unwrap_or(0),
+            )
         })
         .collect();
     Ok(Json(views))
@@ -1012,6 +1023,40 @@ async fn unbind_credential_device(
         ));
     }
     tracing::info!(cred_id = id, device_id = %device_id, "device binding removed manually");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 列出某凭证当前绑定的**模拟会话**明细（按最近活跃倒序）。
+///
+/// 口径与卡片上的「会话 x/y」一致：只含 TTL 内仍活跃的绑定。只有走模拟路径、没有设备身份的
+/// 来访会出现在这里（键是它自带的会话 id，或缓存前缀加首条用户消息的指纹），见
+/// `store::Select::session_key`。
+async fn list_credential_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<store::SessionBinding>>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    Ok(Json(state.store.list_sessions(id).map_err(internal)?))
+}
+
+/// 手动解除某模拟会话与该凭证的绑定，立即腾出一个会话名额。语义同 [`unbind_credential_device`]：
+/// 解绑不是拉黑，下一条请求会重新选号。
+async fn unbind_credential_session(
+    State(state): State<AppState>,
+    Path((id, session_key)): Path<(i64, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    if !state.store.unbind_session(id, &session_key).map_err(internal)? {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "session binding not found (it may have expired or moved to another credential)".into(),
+        ));
+    }
+    tracing::info!(cred_id = id, session_key = %session_key, "session binding removed manually");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1112,6 +1157,25 @@ async fn set_device_limits(
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
     let n = state.store.set_device_limits(&req.ids, limit).map_err(internal)?;
     tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
+    list_credentials(State(state)).await
+}
+
+#[derive(Deserialize)]
+struct SetSessionLimitsReq {
+    ids: Vec<i64>,
+    /// 三态同单账号接口：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    session_limit: i64,
+}
+
+/// 批量设置模拟会话数上限，返回更新后的整份列表。
+async fn set_session_limits(
+    State(state): State<AppState>,
+    Json(req): Json<SetSessionLimitsReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
+    let n = state.store.set_session_limits(&req.ids, limit).map_err(internal)?;
+    tracing::info!(count = n, session_limit = limit, "session limit set in bulk");
     list_credentials(State(state)).await
 }
 
@@ -1229,6 +1293,25 @@ async fn set_device_limit(
     // 负值统一收敛为 -1，避免库里出现各式各样的“不限”取值。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
     if !state.store.set_device_limit(id, limit).map_err(internal)? {
+        return Err(not_found());
+    }
+    view_of(&state, id)
+}
+
+#[derive(Deserialize)]
+struct SetSessionLimitReq {
+    /// 模拟会话数上限三态：`> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
+    session_limit: i64,
+}
+
+/// 设置模拟会话数上限。
+async fn set_session_limit(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetSessionLimitReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
+    if !state.store.set_session_limit(id, limit).map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id)
@@ -1876,6 +1959,7 @@ async fn set_proxies(
 fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     let count = state.store.device_count(id).map_err(internal)?;
+    let session_count = state.store.session_count(id).map_err(internal)?;
     // 单账号视图只查这一个 id：此前调的是三个「全库聚合」再 remove 一条，改一次开关就要把
     // usage_logs 整表聚合三遍。
     let quota = state.store.latest_quota(id).map_err(internal)?;
@@ -1884,7 +1968,7 @@ fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> 
     let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
     let denials = state.store.denied_models(id).map_err(internal)?;
     Ok(Json(
-        CredentialView::new(&cred, count, DefaultLimits::of(&state.store))
+        CredentialView::new(&cred, count, session_count, DefaultLimits::of(&state.store))
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
@@ -1981,6 +2065,9 @@ struct SettingsResp {
     device_binding_retention_secs: i64,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
+    /// 全局默认模拟会话数上限；0 表示默认不限。账号未单独配置时套用它。只管模拟路径上没有
+    /// 设备身份的来访，见 `store::Select::session_key`。
+    default_session_limit: i64,
     /// 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。
     /// 账号未单独配置时套用它。
     default_rpm_limit: i64,
@@ -2177,6 +2264,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let device_binding_retention_secs = state.store.device_binding_retention();
     let default_device_limit = state.store.default_device_limit();
+    let default_session_limit = state.store.default_session_limit();
     let default_rpm_limit = state.store.default_rpm_limit();
     let device_rpm_limit = state.store.device_rpm_limit();
     let session_rpm_limit = state.store.session_rpm_limit();
@@ -2202,6 +2290,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             device_binding_ttl_secs,
             device_binding_retention_secs,
             default_device_limit,
+            default_session_limit,
             default_rpm_limit,
             device_rpm_limit,
             session_rpm_limit,
@@ -2235,6 +2324,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         device_binding_ttl_secs,
         device_binding_retention_secs,
         default_device_limit,
+        default_session_limit,
         default_rpm_limit,
         device_rpm_limit,
         session_rpm_limit,
@@ -2428,6 +2518,25 @@ async fn set_default_device_limit(
     state
         .store
         .set_setting(crate::store::DEFAULT_DEVICE_LIMIT, &limit.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetDefaultSessionLimitReq {
+    /// 全局默认模拟会话数上限；0（或负数）表示默认不限。
+    default_session_limit: i64,
+}
+
+/// 设置全局默认模拟会话数上限（账号自身未单独配置时生效）。
+async fn set_default_session_limit(
+    State(state): State<AppState>,
+    Json(req): Json<SetDefaultSessionLimitReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let limit = req.default_session_limit.max(0);
+    state
+        .store
+        .set_setting(crate::store::DEFAULT_SESSION_LIMIT, &limit.to_string())
         .map_err(internal)?;
     Ok(Json(settings_resp(&state)))
 }
@@ -2902,6 +3011,8 @@ struct ModelCooldown {
 struct DefaultLimits {
     /// 全局默认设备数上限，见 [`store::CredentialStore::default_device_limit`]。
     device: i64,
+    /// 全局默认模拟会话数上限，见 [`store::CredentialStore::default_session_limit`]。
+    session: i64,
     /// 全局默认账号 RPM 上限，见 [`store::CredentialStore::default_rpm_limit`]。
     rpm: i64,
     /// 全局的提前停调度阈值（5h 档），见 [`store::CredentialStore::quota_pause_pct`]。
@@ -2914,6 +3025,7 @@ impl DefaultLimits {
     fn of(store: &store::CredentialStore) -> Self {
         Self {
             device: store.default_device_limit(),
+            session: store.default_session_limit(),
             rpm: store.default_rpm_limit(),
             quota_pct: store.quota_pause_pct(),
             quota_pct_7d: store.quota_pause_pct_7d(),
@@ -2945,6 +3057,13 @@ struct CredentialView {
     device_limit_effective: i64,
     /// 当前已绑定的设备数。
     device_count: i64,
+    /// 账号自身的模拟会话上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    /// 只管模拟路径上没有设备身份的来访，见 `store::Select::session_key`。
+    session_limit: i64,
+    /// 实际生效的模拟会话上限（已套用全局默认）；0 表示不限。
+    session_limit_effective: i64,
+    /// 当前活跃的模拟会话绑定数（TTL 内），口径同 `device_count`。
+    session_count: i64,
     /// 账号自身的 RPM 上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
     rpm_limit: i64,
     /// 实际生效的 RPM 上限（已套用全局默认）；0 表示不限。前端拿它和 `rpm` 一起显示成
@@ -3009,8 +3128,8 @@ struct CredentialView {
 }
 
 impl CredentialView {
-    /// 由凭证 + 已绑定设备数 + 全局默认上限构造视图。
-    fn new(c: &Credential, device_count: i64, defaults: DefaultLimits) -> Self {
+    /// 由凭证 + 已绑定设备数 + 活跃模拟会话数 + 全局默认上限构造视图。
+    fn new(c: &Credential, device_count: i64, session_count: i64, defaults: DefaultLimits) -> Self {
         let secs = c.expires_in_secs();
         Self {
             id: c.id,
@@ -3027,6 +3146,12 @@ impl CredentialView {
             device_limit: c.device_limit,
             device_limit_effective: store::effective_device_limit(c.device_limit, defaults.device),
             device_count,
+            session_limit: c.session_limit,
+            session_limit_effective: store::effective_session_limit(
+                c.session_limit,
+                defaults.session,
+            ),
+            session_count,
             rpm_limit: c.rpm_limit,
             rpm_limit_effective: store::effective_rpm_limit(c.rpm_limit, defaults.rpm),
             quota_pause_pct: c.quota_pause_pct,
