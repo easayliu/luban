@@ -32,7 +32,9 @@ import {
   setMinClientVersion,
   setRequireDeviceId,
   setSessionConcurrencyLimit,
+  setSessionRetention,
   setSessionRpmLimit,
+  setSessionTtl,
   type Settings,
 } from '@/api/settings'
 import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
@@ -442,6 +444,8 @@ export function DeviceSettingsContent() {
         <DeviceBindingTtl />
         <DeviceBindingRetention />
         <DefaultDeviceLimit />
+        <SessionBindingTtl />
+        <SessionBindingRetention />
         <DefaultSessionLimit />
       </SettingsGroup>
 
@@ -546,10 +550,16 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
   const rpmPolicy = rpmParts.length > 0 ? rpmParts.join(' · ') : t('不限', 'Unlimited')
   const items = [
     {
+      // 设备与会话两种名额的有效期挤同一格，与下面「默认容量」那格同一写法。
       label: t('名额有效期', 'Slot lifetime'),
-      value: settings.device_binding_ttl_secs > 0
-        ? formatDuration(settings.device_binding_ttl_secs, language)
-        : t('不自动释放', 'Never released'),
+      value: [
+        settings.device_binding_ttl_secs > 0
+          ? t(`设备 ${formatDuration(settings.device_binding_ttl_secs, language)}`, `dev ${formatDuration(settings.device_binding_ttl_secs, language)}`)
+          : t('设备不释放', 'dev ∞'),
+        settings.session_binding_ttl_secs > 0
+          ? t(`会话 ${formatDuration(settings.session_binding_ttl_secs, language)}`, `sess ${formatDuration(settings.session_binding_ttl_secs, language)}`)
+          : t('会话不释放', 'sess ∞'),
+      ].join(' · '),
     },
     {
       label: t('原账号关联', 'Account affinity'),
@@ -847,6 +857,178 @@ function DeviceBindingRetention() {
   )
 }
 
+/**
+ * 模拟会话绑定有效期：对话超过该时长无请求即释放会话槽位（会话 id 让给下一个对话复用），
+ * 绑定本身按会话保留期留着。与设备那一项分开配：设备是一台机器，会话是一段对话。0 = 永不过期。
+ */
+function SessionBindingTtl() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(toHours(data.session_binding_ttl_secs))
+  }, [data?.session_binding_ttl_secs])
+
+  const save = useMutation({
+    mutationFn: (seconds: number) => setSessionTtl(seconds),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('会话策略已更新', 'Session policy updated'),
+        description: t('模拟会话有效期已保存。', 'The simulated session lifetime has been saved.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.session_binding_ttl_secs ?? 0
+  const parsed = hoursToSecs(draft)
+  const hint = parsed > 0
+    ? t(
+        `对话闲置${formatDuration(parsed, language)}后释放槽位`,
+        `Frees the slot after ${formatDuration(parsed, language)} idle`,
+      )
+    : t('槽位不自动释放', 'Slots are not released automatically')
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('模拟会话有效期', 'Simulated session lifetime')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {t(
+            '走模拟路径、没有设备身份的对话在此时长内没有请求便释放占用的会话槽位，会话 id 让给下一个对话复用；与原账号的关联按下面的保留期保存。与设备有效期分开配：设备是一台机器，会话是一段对话。',
+            'A conversation on the simulation path without a device identity frees its session slot after this much inactivity, and its session id is reused by the next conversation; affinity with the original account follows the retention below. Configured separately from the device lifetime: a device is a machine, a session is one conversation.',
+          )}
+        </FieldDescription>
+        <Badge variant="secondary" size="sm">{hint}</Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          step={1}
+          smallStep={0.25}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少模拟会话有效期', 'Decrease simulated session lifetime')} />
+            <NumberFieldInput aria-label={t('模拟会话有效期（小时）', 'Simulated session lifetime in hours')} />
+            <NumberFieldIncrement aria-label={t('增加模拟会话有效期', 'Increase simulated session lifetime')} />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
+/** 模拟会话的原账号关联保留期：槽位释放后，对话在此期限内回来仍优先回原号。0 = 永久保留。 */
+function SessionBindingRetention() {
+  const qc = useQueryClient()
+  const { language, t } = useI18n()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const [draft, setDraft] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (data) setDraft(toDays(data.session_binding_retention_secs))
+  }, [data?.session_binding_retention_secs])
+
+  const save = useMutation({
+    mutationFn: (seconds: number) => setSessionRetention(seconds),
+    onSuccess: (settings: Settings) => {
+      toastManager.add({
+        title: t('会话策略已更新', 'Session policy updated'),
+        description: t('模拟会话的原账号关联保留期已保存。', 'The simulated session affinity retention has been saved.'),
+        type: 'success',
+      })
+      qc.setQueryData(['settings'], settings)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('保存失败', 'Save failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const current = data?.session_binding_retention_secs ?? 0
+  const ttl = data?.session_binding_ttl_secs ?? 0
+  const parsed = toSecs(draft)
+  const hint = parsed > 0
+    ? t(
+        `优先返回原账号：${formatDuration(parsed, language)}`,
+        `Prefer the original account for ${formatDuration(parsed, language)}`,
+      )
+    : t('永久优先返回原账号', 'Always prefer the original account')
+  const conflict = parsed > 0 && ttl > 0 && parsed < ttl
+
+  return (
+    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
+      <div className="min-w-0 space-y-1.5">
+        <FieldLabel>{t('模拟会话原账号关联保留期', 'Simulated session affinity retention')}</FieldLabel>
+        <FieldDescription className="max-w-xl leading-5">
+          {conflict
+            ? t(
+                '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+                'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+              )
+            : t(
+                '槽位释放后，对话在此期限内回来仍优先使用原账号（原槽位空着就回原位，会话 id 不变）；过期后绑定行清掉，再来算新对话。',
+                'After its slot is freed, a returning conversation still prefers its original account (and its old slot if free, keeping the session id); once past this window the binding is removed and it counts as a new conversation.',
+              )}
+        </FieldDescription>
+        <Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>
+      </div>
+      <div className="flex w-full items-center gap-2 sm:w-auto">
+        <NumberField
+          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+          min={0}
+          step={1}
+          smallStep={0.5}
+          value={draft}
+          onValueChange={setDraft}
+        >
+          <NumberFieldGroup>
+            <NumberFieldDecrement aria-label={t('减少模拟会话关联保留期', 'Decrease simulated session affinity retention')} />
+            <NumberFieldInput aria-label={t('模拟会话关联保留期（天）', 'Simulated session affinity retention in days')} />
+            <NumberFieldIncrement aria-label={t('增加模拟会话关联保留期', 'Increase simulated session affinity retention')} />
+          </NumberFieldGroup>
+        </NumberField>
+        <Button
+          size="sm"
+          loading={save.isPending}
+          disabled={parsed === current}
+          onClick={() => save.mutate(parsed)}
+        >
+          <SaveIcon />
+          {t('保存', 'Save')}
+        </Button>
+      </div>
+    </Field>
+  )
+}
+
 /** 全局默认设备上限：账号未单独配置时套用。 */
 function DefaultDeviceLimit() {
   const qc = useQueryClient()
@@ -981,8 +1163,8 @@ function DefaultSessionLimit() {
         <FieldLabel>{t('默认模拟会话上限', 'Default simulated session limit')}</FieldLabel>
         <FieldDescription className="max-w-xl leading-5">
           {t(
-            '走模拟路径、没有设备身份的请求按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位，出站会话 id 按槽位派生、释放后复用，上游看到的会话 id 数就是这个上限；与设备名额分开计；有效期、原账号关联沿用上面两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
-            'Requests on the simulation path without a device identity bind to an account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused once freed, so upstream sees at most this many session ids per account, counted separately from device slots; TTL and affinity follow the two settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
+            '走模拟路径、没有设备身份的请求按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位，出站会话 id 按槽位派生、释放后复用，上游看到的会话 id 数就是这个上限；与设备名额分开计，有效期与原账号关联用上面会话自己的两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
+            'Requests on the simulation path without a device identity bind to an account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused once freed, so upstream sees at most this many session ids per account, counted separately from device slots; lifetime and affinity use the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
           )}
         </FieldDescription>
         <Badge variant="secondary" size="sm">

@@ -732,6 +732,8 @@ queryClient.setQueryData(['settings'], {
   env_managed: false,
   device_binding_ttl_secs: 86400,
   device_binding_retention_secs: 604800,
+  session_binding_ttl_secs: 1800,
+  session_binding_retention_secs: 86400,
   default_device_limit: 3,
   default_session_limit: 10,
   // 三道 RPM 闸都给上值、版本闸也写满：概览那行最挤的就是这个组合，预览要照着最挤的看。

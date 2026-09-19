@@ -1909,7 +1909,7 @@ impl CredentialStore {
 
     /// 单条凭证当前**占名额**的模拟会话数；口径同 [`Self::device_count`]（TTL 内活跃的绑定）。
     pub fn session_count(&self, cred_id: i64) -> Result<i64> {
-        let ttl = self.device_binding_ttl();
+        let ttl = self.session_binding_ttl();
         let conn = self.conn.lock();
         let n = if ttl > 0 {
             conn.query_row(
@@ -1930,7 +1930,7 @@ impl CredentialStore {
 
     /// 所有凭证当前**有效**的模拟会话绑定数（cred_id → count）；口径同 [`Self::session_count`]。
     pub fn session_counts(&self) -> Result<HashMap<i64, i64>> {
-        let ttl = self.device_binding_ttl();
+        let ttl = self.session_binding_ttl();
         let conn = self.conn.lock();
         let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
         let sql = format!(
@@ -1951,7 +1951,7 @@ impl CredentialStore {
     /// 单条凭证当前**有效**的模拟会话明细，按最近活跃倒序；过滤口径与 [`Self::session_count`]
     /// 完全一致，否则后台会出现「会话数写着 2、展开却列出 5 条」。
     pub fn list_sessions(&self, cred_id: i64) -> Result<Vec<SessionBinding>> {
-        let ttl = self.device_binding_ttl();
+        let ttl = self.session_binding_ttl();
         let conn = self.conn.lock();
         // 会话 id 要账号 uuid 才算得出；凭证不存在时按空 uuid 算（调用方已先判过 404）。
         let account_uuid: Option<String> = conn
@@ -2421,6 +2421,24 @@ impl CredentialStore {
             .unwrap_or(DEFAULT_DEVICE_BINDING_RETENTION_SECS)
     }
 
+    /// 模拟会话绑定有效期（秒）；未设置或解析失败时用默认值。`<= 0` 表示永不过期。
+    pub fn session_binding_ttl(&self) -> i64 {
+        self.get_setting(SESSION_BINDING_TTL)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_SESSION_BINDING_TTL_SECS)
+    }
+
+    /// 模拟会话软绑定保留期（秒）；未设置或解析失败时用默认值。`<= 0` 表示永久保留。
+    pub fn session_binding_retention(&self) -> i64 {
+        self.get_setting(SESSION_BINDING_RETENTION)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(DEFAULT_SESSION_BINDING_RETENTION_SECS)
+    }
+
     /// 一次读齐全部转发形态开关（[`ForwardFlags`]）。
     ///
     /// 走内存缓存（见 `settings` 字段），零查询。任何读不出来的键都退回默认值（= 开启），
@@ -2645,6 +2663,22 @@ pub const DEVICE_BINDING_RETENTION: &str = "device_binding_retention_secs";
 /// 而亲和性没有名额成本——一条绑定行几十字节，多留几天换的是「同一台机器隔夜再开工还是
 /// 原来那个号」，正好覆盖 thinking 签名跨天复用的场景。
 pub const DEFAULT_DEVICE_BINDING_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// 模拟会话绑定有效期（秒）的 settings 键名；`<= 0` 表示永不过期。与设备的那一项分开配：
+/// 设备是一台机器、隔一小时再来还是它，会话是一段对话、几十分钟没动多半已经结束，两者的
+/// 「还占不占名额」不该是同一个时长。
+pub const SESSION_BINDING_TTL: &str = "session_binding_ttl_secs";
+
+/// 模拟会话绑定有效期默认值：30 分钟。比设备的 1 小时短——会话名额（也就是会话 id）要及时
+/// 让给下一个对话复用；代价是隔半小时以上再续的对话会换一个槽位、换一个会话 id。
+pub const DEFAULT_SESSION_BINDING_TTL_SECS: i64 = 30 * 60;
+
+/// 模拟会话软绑定保留期（秒）的 settings 键名；`<= 0` 表示永久保留。
+pub const SESSION_BINDING_RETENTION: &str = "session_binding_retention_secs";
+
+/// 模拟会话软绑定保留期默认值：1 天。对话隔夜再续仍优先回原号（thinking 签名跟着账号走），
+/// 再久的对话基本不会回来，行不必留一周；会话比设备多得多，表也不该无限长。
+pub const DEFAULT_SESSION_BINDING_RETENTION_SECS: i64 = 24 * 3600;
 
 /// 绑定行真正被删除的时限：`None` 表示永不删除。
 ///
@@ -5439,6 +5473,10 @@ pub struct Select<'a> {
     /// 软绑定保留期（秒）：绑定行超过 [`Self::ttl_secs`] 后不再占名额，但在这个时长内仍然
     /// 留着，设备回来时优先回原号。`<= 0` 表示永久保留（只要不被解绑/停号就一直在）。
     pub retention_secs: i64,
+    /// 模拟会话绑定的有效期与保留期，语义同上面两项，只是作用在 `session_bindings` 上、
+    /// 单独配置（[`SESSION_BINDING_TTL`] / [`SESSION_BINDING_RETENTION`]）。
+    pub session_ttl_secs: i64,
+    pub session_retention_secs: i64,
     /// 本次请求是否计入裸请求速率上限（只有真正消耗额度的路径才该计，见
     /// `crate::proxy::is_billable_messages`）。
     pub rate_limited: bool,
@@ -5516,6 +5554,8 @@ impl CredentialStore {
             session_key,
             ttl_secs,
             retention_secs,
+            session_ttl_secs,
+            session_retention_secs,
             rate_limited,
             exclude,
             model,
@@ -5557,6 +5597,8 @@ impl CredentialStore {
                 "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
                 [retention],
             )?;
+        }
+        if let Some(retention) = effective_retention(session_ttl_secs, session_retention_secs) {
             conn.execute(
                 "DELETE FROM session_bindings WHERE last_seen_at < unixepoch() - ?1",
                 [retention],
@@ -5639,7 +5681,7 @@ impl CredentialStore {
         // 各凭证当前**占名额**的设备数与模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
         // （口径与 [`Self::device_counts`] / [`Self::session_counts`] 一致，后台看到的数就是这里
         // 用来判上限的数）。两张表都数：负载均衡按本次绑定的那一种排序，另一种不看。
-        let active_counts = |table: &str| -> Result<HashMap<i64, i64>> {
+        let active_counts = |table: &str, ttl_secs: i64| -> Result<HashMap<i64, i64>> {
             let active = if ttl_secs > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
             let mut cstmt = conn.prepare(&format!(
                 "SELECT cred_id, COUNT(*) FROM {table} {active} GROUP BY cred_id"
@@ -5657,8 +5699,13 @@ impl CredentialStore {
             }
             Ok(counts)
         };
-        let counts = active_counts("device_bindings")?;
-        let session_counts = active_counts("session_bindings")?;
+        let counts = active_counts("device_bindings", ttl_secs)?;
+        let session_counts = active_counts("session_bindings", session_ttl_secs)?;
+        // 这条请求走哪张表，TTL 就用哪张表的：下面判「绑定还在有效期内吗」与分槽位都按它。
+        let binding_ttl = match binding {
+            Some(Binding::Session(_)) => session_ttl_secs,
+            _ => ttl_secs,
+        };
 
         // 当前占名额的数（已排除 TTL 外的休眠绑定）：按会话绑定时数会话，其余数设备——裸请求
         // 不占名额，但负载均衡仍按设备数排，与原来一样。
@@ -5696,7 +5743,7 @@ impl CredentialStore {
                         b.table(),
                         b.column()
                     ),
-                    params![b.key(), ttl_secs],
+                    params![b.key(), binding_ttl],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -5725,7 +5772,8 @@ impl CredentialStore {
                                     [key],
                                     |r| r.get(0),
                                 )?;
-                                let slot = free_session_slot(&conn, c.id, ttl_secs, Some(old))?;
+                                let slot =
+                                    free_session_slot(&conn, c.id, session_ttl_secs, Some(old))?;
                                 conn.execute(
                                     "UPDATE session_bindings \
                                         SET slot = ?2, last_seen_at = unixepoch(), \
@@ -5830,7 +5878,7 @@ impl CredentialStore {
             Some(Binding::Session(key)) => {
                 // 新对话（或改绑到别的号的对话）在选中的号上取最小的空槽位。上面刚判过
                 // has_room，所以上限内必有空位；不限时槽位按需增长、释放后复用。
-                let slot = free_session_slot(&conn, chosen.id, ttl_secs, None)?;
+                let slot = free_session_slot(&conn, chosen.id, session_ttl_secs, None)?;
                 conn.execute(
                     "INSERT INTO session_bindings (session_key, cred_id, slot) VALUES (?1, ?2, ?3)
                      ON CONFLICT(session_key) DO UPDATE
@@ -5953,6 +6001,8 @@ async fn select_with_refresh_failover<'a>(
     let sel = Select {
         ttl_secs: store.device_binding_ttl(),
         retention_secs: store.device_binding_retention(),
+        session_ttl_secs: store.session_binding_ttl(),
+        session_retention_secs: store.session_binding_retention(),
         ..sel
     };
 
@@ -6895,6 +6945,8 @@ mod tests {
         let (store, ids) = store_with(labels);
         store.set_setting(DEVICE_BINDING_TTL, "60").unwrap();
         store.set_setting(DEVICE_BINDING_RETENTION, "3600").unwrap();
+        store.set_setting(SESSION_BINDING_TTL, "60").unwrap();
+        store.set_setting(SESSION_BINDING_RETENTION, "3600").unwrap();
         (store, ids)
     }
 
@@ -6904,9 +6956,53 @@ mod tests {
             session_key: Some(key),
             ttl_secs: 60,
             retention_secs: 3600,
+            session_ttl_secs: 60,
+            session_retention_secs: 3600,
             rate_limited: true,
             ..Default::default()
         }
+    }
+
+    /// 会话绑定的有效期与保留期是**单独**的一对设置：设备那对永不过期时，会话照样按自己的
+    /// TTL 释放名额、按自己的保留期清行；计数与明细读的也是会话那对。
+    #[test]
+    fn session_bindings_expire_on_their_own_ttl() {
+        let (store, ids) = store_with(&["a"]);
+        let a = ids[0];
+        store.set_setting(DEVICE_BINDING_TTL, "0").unwrap();
+        store.set_setting(SESSION_BINDING_TTL, "60").unwrap();
+        store.set_setting(SESSION_BINDING_RETENTION, "600").unwrap();
+        assert_eq!(store.session_binding_ttl(), 60);
+        assert_eq!(store.session_binding_retention(), 600);
+        fn sel(k: &str) -> Select<'_> {
+            Select {
+                session_key: Some(k),
+                ttl_secs: 0,
+                retention_secs: 0,
+                session_ttl_secs: 60,
+                session_retention_secs: 600,
+                rate_limited: true,
+                ..Default::default()
+            }
+        }
+        assert_eq!(store.select_for_device(sel("s1")).unwrap().id, a);
+        assert_eq!(store.session_count(a).unwrap(), 1);
+        // 设备永不过期，会话 61 秒后不占名额；行还在（保留期 600 秒内），回来回原槽位。
+        age_session_binding(&store, "s1", 61);
+        assert_eq!(store.session_count(a).unwrap(), 0, "按会话自己的 TTL 释放");
+        assert!(store.list_sessions(a).unwrap().is_empty());
+        assert_eq!(store.session_slot(a, "s1").unwrap(), Some(0), "行还在");
+        assert_eq!(store.select_for_device(sel("s2")).unwrap().id, a);
+        assert_eq!(store.session_slot(a, "s2").unwrap(), Some(0), "释放了的槽位被复用");
+        // 超过会话保留期：下一次选号时清掉，s1 再来是新会话。
+        age_session_binding(&store, "s1", 601);
+        assert_eq!(store.select_for_device(sel("s3")).unwrap().id, a);
+        assert_eq!(store.session_slot(a, "s1").unwrap(), None, "按会话自己的保留期清行");
+        // 默认值：会话 30 分钟 / 1 天，与设备的 1 小时 / 7 天不同。
+        let (fresh, _) = store_with(&["b"]);
+        assert_eq!(fresh.session_binding_ttl(), DEFAULT_SESSION_BINDING_TTL_SECS);
+        assert_eq!(fresh.session_binding_retention(), DEFAULT_SESSION_BINDING_RETENTION_SECS);
+        assert_ne!(fresh.session_binding_ttl(), fresh.device_binding_ttl());
     }
 
     fn age_session_binding(store: &CredentialStore, key: &str, secs: i64) {

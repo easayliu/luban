@@ -540,6 +540,8 @@ pub async fn run(
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
         .route("/settings/device-retention", post(set_device_retention))
+        .route("/settings/session-ttl", post(set_session_ttl))
+        .route("/settings/session-retention", post(set_session_retention))
         .route("/settings/default-device-limit", post(set_default_device_limit))
         .route("/settings/default-session-limit", post(set_default_session_limit))
         .route("/settings/default-rpm-limit", post(set_default_rpm_limit))
@@ -2080,6 +2082,10 @@ struct SettingsResp {
     /// 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。
     /// 0 表示永久保留。
     device_binding_retention_secs: i64,
+    /// 模拟会话绑定有效期（秒）；0 表示永不过期。与设备的分开配。
+    session_binding_ttl_secs: i64,
+    /// 模拟会话软绑定保留期（秒）；0 表示永久保留。
+    session_binding_retention_secs: i64,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
     /// 全局默认模拟会话数上限；0 表示默认不限。账号未单独配置时套用它。只管模拟路径上没有
@@ -2280,6 +2286,8 @@ fn sync_latest_release_from_store(store: &CredentialStore) {
 fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let device_binding_retention_secs = state.store.device_binding_retention();
+    let session_binding_ttl_secs = state.store.session_binding_ttl();
+    let session_binding_retention_secs = state.store.session_binding_retention();
     let default_device_limit = state.store.default_device_limit();
     let default_session_limit = state.store.default_session_limit();
     let default_rpm_limit = state.store.default_rpm_limit();
@@ -2306,6 +2314,8 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             env_managed: true,
             device_binding_ttl_secs,
             device_binding_retention_secs,
+            session_binding_ttl_secs,
+            session_binding_retention_secs,
             default_device_limit,
             default_session_limit,
             default_rpm_limit,
@@ -2340,6 +2350,8 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         env_managed: false,
         device_binding_ttl_secs,
         device_binding_retention_secs,
+        session_binding_ttl_secs,
+        session_binding_retention_secs,
         default_device_limit,
         default_session_limit,
         default_rpm_limit,
@@ -2516,6 +2528,44 @@ async fn set_device_retention(
     state
         .store
         .set_setting(crate::store::DEVICE_BINDING_RETENTION, &secs.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetSessionTtlReq {
+    /// 模拟会话绑定有效期（秒）；0（或负数）表示永不过期。
+    session_binding_ttl_secs: i64,
+}
+
+/// 设置模拟会话绑定有效期（秒）。
+async fn set_session_ttl(
+    State(state): State<AppState>,
+    Json(req): Json<SetSessionTtlReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let ttl = req.session_binding_ttl_secs.max(0);
+    state
+        .store
+        .set_setting(crate::store::SESSION_BINDING_TTL, &ttl.to_string())
+        .map_err(internal)?;
+    Ok(Json(settings_resp(&state)))
+}
+
+#[derive(Deserialize)]
+struct SetSessionRetentionReq {
+    /// 模拟会话软绑定保留期（秒）；0（或负数）表示永久保留。
+    session_binding_retention_secs: i64,
+}
+
+/// 设置模拟会话软绑定保留期（秒）；与设备那条一样，不在这里校验「必须 >= 有效期」。
+async fn set_session_retention(
+    State(state): State<AppState>,
+    Json(req): Json<SetSessionRetentionReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let secs = req.session_binding_retention_secs.max(0);
+    state
+        .store
+        .set_setting(crate::store::SESSION_BINDING_RETENTION, &secs.to_string())
         .map_err(internal)?;
     Ok(Json(settings_resp(&state)))
 }

@@ -9,6 +9,10 @@ export interface Settings {
   device_binding_ttl_secs: number
   /** 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。0 = 永久保留。 */
   device_binding_retention_secs: number
+  /** 模拟会话绑定有效期（秒）；0 表示永不过期。与设备的分开配。 */
+  session_binding_ttl_secs: number
+  /** 模拟会话软绑定保留期（秒）；0 表示永久保留。 */
+  session_binding_retention_secs: number
   /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
   default_device_limit: number
   /** 全局默认模拟会话数上限；0 表示默认不限。账号未单独配置时套用它。只管模拟路径上没有设备身份的来访（按自带会话 id，否则缓存前缀 + 首条用户消息分会话）。 */
@@ -183,6 +187,22 @@ export async function setDeviceTtl(secs: number): Promise<Settings> {
 export async function setDeviceRetention(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/device-retention', {
     device_binding_retention_secs: secs,
+  })
+  return data
+}
+
+/** 设置模拟会话绑定有效期（秒；0 = 永不过期）。 */
+export async function setSessionTtl(secs: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/session-ttl', {
+    session_binding_ttl_secs: secs,
+  })
+  return data
+}
+
+/** 设置模拟会话软绑定保留期（秒；0 = 永久保留）。 */
+export async function setSessionRetention(secs: number): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/session-retention', {
+    session_binding_retention_secs: secs,
   })
   return data
 }
