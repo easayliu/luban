@@ -1060,50 +1060,35 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 ? t(`缓存命中率 · ${cacheNow.label[0]}`, `Cache hit rate · ${cacheNow.label[1]}`)
                 : t('缓存命中率', 'Cache hit rate')}
               value={formatPercent(cacheRate)}
-              trend={
-                cacheRate == null ? undefined : (
-                  // 手机上一行两格、一格不到 190px，图标加数字加 80px 的迷你线放不下，
-                  // 会压到隔壁；sm 起再画。
-                  <CacheHitSparkline slots={cacheSeries.slots} />
-                )
-              }
-              status={cacheRate == null
-                ? t('暂无用量', 'No usage yet')
-                : cacheBase == null
-                  ? undefined
-                  : t(`7d ${formatPercent(cacheBase)}${cacheDeltaText}`, `7d ${formatPercent(cacheBase)}${cacheDeltaText}`)}
+              // 这一行只放数值与迷你线：一格的内容区约 206px，「数值 52 + 7d 小字 85 + 迷你线 80」
+              // 要 220px 以上，六格并排得到约 1620px 视口才装得下——小字一直被截成「7d 95.6% ↓…」、
+              // 迷你线被压成一条。7 天基线与相对变化搬进悬浮提示（以及点开的趋势图），小字只在
+              // 没用量时留一句说明。
+              trend={cacheRate == null ? undefined : <CacheHitSparkline slots={cacheSeries.slots} />}
+              status={cacheRate == null ? t('暂无用量', 'No usage yet') : undefined}
               statusHint={cacheNow
                 ? t(
-                    `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
-                    `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
+                    `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}${cacheDeltaText}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
+                    `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}${cacheDeltaText}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
                   )
                 : undefined}
               icon={DatabaseZapIcon}
               tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
               onClick={() => setCacheTrendOpen(true)}
             />
-            {/* 小字只放 7 天基线，与缓存那格的「7d 65%」同一写法；p95 在悬浮提示里——
-                这格宽度放不下两段，截成「p…」谁也读不出来。 */}
+            {/* 与缓存那格同一写法：这一行只放数值与迷你线，7 天基线、p95、吞吐都在悬浮提示里。 */}
             <OverviewMetric
               className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
               label={ttftNow
                 ? t(`首字时延 p50 · ${ttftNow.label[0]}`, `TTFT p50 · ${ttftNow.label[1]}`)
                 : t('首字时延', 'TTFT')}
               value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
-              trend={
-                ttftNow == null ? undefined : (
-                  <TtftSparkline slots={ttftSeries.slots} />
-                )
-              }
-              status={ttftNow == null
-                ? t('暂无数据', 'No data yet')
-                : ttftBase
-                  ? t(`7d ${formatMs(ttftBase.p50_ms)}${ttftDeltaText}`, `7d ${formatMs(ttftBase.p50_ms)}${ttftDeltaText}`)
-                  : undefined}
+              trend={ttftNow == null ? undefined : <TtftSparkline slots={ttftSeries.slots} />}
+              status={ttftNow == null ? t('暂无数据', 'No data yet') : undefined}
               statusHint={ttftNow
                 ? t(
-                    `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
-                    `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
+                    `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
+                    `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
                   )
                 : undefined}
               icon={TimerIcon}

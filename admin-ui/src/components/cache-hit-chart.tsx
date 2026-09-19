@@ -255,7 +255,7 @@ export function CacheHitTable({
 export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; className?: string }) {
   const maxInput = Math.max(0, ...slots.map((s) => s.inputTokens))
   return (
-    <span aria-hidden className={cn('flex h-5 w-20 max-w-full shrink-0 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 min-w-0 max-w-20 flex-1 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
         const last = i === slots.length - 1

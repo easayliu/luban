@@ -320,7 +320,7 @@ function TtftTable({
 export function TtftSparkline({ slots, className }: { slots: TtftSlot[]; className?: string }) {
   const maxP50 = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.p50Ms))
   return (
-    <span aria-hidden className={cn('flex h-5 w-20 max-w-full shrink-0 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 min-w-0 max-w-20 flex-1 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const heightPct = slot.hasTraffic && maxP50 > 0
           ? Math.min(100, (slot.p50Ms / maxP50) * 100)

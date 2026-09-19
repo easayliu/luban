@@ -30,11 +30,10 @@ export function OverviewMetric({
       </span>
       <div className="min-w-0 flex-1">
         <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
-        {/* 数值、小字、迷你线一行排；**允许换行**：格子窄到放不下迷你线时它整条落到第二行，
-            而不是被压扁、被截断或干脆藏起来（藏起来手机上就看不到趋势了）。迷你线定宽不收缩，
-            flex 的断行才会在它头上发生；小字仍可截断，但它排在迷你线之前，line 1 装得下。
-            lg 六格并排时两枚质量卡片都会换行，同一行的六格一起长高，看起来是齐的。 */}
-        <div className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+        {/* 一行排数值、小字、迷你线，但这两样不会同时出现：带迷你线的两格不再放小字（三样在
+            任何宽度下都挤不开，见 credential-workspace 那两处注释）。迷你线放最后、按剩余宽度
+            伸缩，手机上一格不到 190px 也缩得进来。 */}
+        <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
             {value}
           </span>
