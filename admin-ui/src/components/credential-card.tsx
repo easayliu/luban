@@ -79,6 +79,17 @@ import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
+ * 页脚三枚名额徽章（设备 / 会话 / RPM）的共用类：定宽 2.75rem、数字左对齐（`justify-start`
+ * 盖掉徽章默认的居中）。
+ *
+ * 徽章若按内容伸缩，`1/10` 与 `0/100` 宽度不同，后面那颗按钮就跟着往左右挪——一排卡片并列时
+ * 会话图标、RPM 图标各在各的位置上，横着扫过去是锯齿状的。定宽之后三颗按钮等宽，卡片之间对齐，
+ * 数字也都从同一处起读。2.75rem 够放 `0/100`（手机上 12px 字号）与 `0/1000`（sm 起 10px 字号）；
+ * 再长才会把徽章撑开。
+ */
+const SLOT_BADGE = 'min-w-11 justify-start tabular-nums'
+
+/**
  * memo 的收益在于「列表本身没变，但父组件重渲染了」这类情况：搜索框每敲一个字、
  * 勾选任意一行、翻页动画，都会重跑一遍工作区。配合稳定的 onSelectedChange 才生效。
  */
@@ -581,8 +592,9 @@ export const CredentialCard = memo(function CredentialCard({
                   让它顺带表态，比再挂一枚徽章省下整整一个词的宽度。 */}
               <SmartphoneIcon className={devicePolicy.className} />
               {/* 计数本身带底色（绿 / 黄 / 红），颜色只看名额占用，见 [deviceUsageMeta]：
-                  页脚这一行全是中性色数字，光靠 `3/5` 得逐个念才知道哪个号快满了。 */}
-              <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+                  页脚这一行全是中性色数字，光靠 `3/5` 得逐个念才知道哪个号快满了。
+                  三枚徽章统一 [SLOT_BADGE]：定宽 2.75rem、数字左对齐。 */}
+              <Badge variant={deviceUsage.variant} size="sm" className={SLOT_BADGE}>
                 {cred.device_count}/{effectiveLimit}
               </Badge>
               <span className="sr-only">{devicePolicy.label}</span>
@@ -603,7 +615,7 @@ export const CredentialCard = memo(function CredentialCard({
               aria-haspopup="dialog"
             >
               <MessagesSquareIcon className={sessionPolicy.className} />
-              <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
+              <Badge variant={sessionUsage.variant} size="sm" className={SLOT_BADGE}>
                 {cred.session_count}/{sessionEffectiveLimit}
               </Badge>
               <span className="sr-only">{sessionPolicy.label}</span>
@@ -627,7 +639,7 @@ export const CredentialCard = memo(function CredentialCard({
               aria-haspopup="dialog"
             >
               <GaugeIcon className={rpmPolicy.className} />
-              <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
+              <Badge variant={rpmUsage.variant} size="sm" className={SLOT_BADGE}>
                 {cred.rpm}/{rpmLimit > 0 ? rpmLimit : '∞'}
               </Badge>
               <span className="sr-only">{t('当前 RPM', 'Current RPM')} · {rpmPolicy.label}</span>
@@ -962,7 +974,7 @@ function QuotaMeter({
   // 窗口重置后上游那份 utilization 就作废了（[evaluateQuotaWindow] 把它抹成 null），此时
   // 这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」。那句话
   // 占着和数据一样大的地方，说的却只是「这里没什么可看」。倒计时同理：没有未来的重置时刻
-  // 就整段不出现，而不是留个「—」占位。
+  // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则 5h 与 7d 两条的尾巴会错开。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
   const indicatorClass = level === 'critical'
@@ -1021,22 +1033,27 @@ function QuotaMeter({
         <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
           <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
         </MeterTrack>
+        {/* 百分比与倒计时都给定宽的一格、文字左对齐：一张卡上下摞着 5h 与 7d 两条，`8%` 与
+            `100%` 宽度不同、倒计时又时有时无，两格若按内容伸缩，两条进度条就一长一短、尾巴
+            错开，看着像两个窗口的用量差别。留白不补，条尾因此永远在同一条竖线上。 */}
         <MeterValue
-          className={cn('shrink-0 font-medium text-xs', valueClass)}
+          className={cn('w-9 shrink-0 text-left font-medium text-xs tabular-nums', valueClass)}
           title={t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}
         >
           {() => `${percentage}%`}
         </MeterValue>
         {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
-            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
-        {reset != null && reset > now && (
-          <span
-            className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
-            title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
-          >
-            {formatCountdown(reset, now)}
-          </span>
-        )}
+            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。
+            没有未来的重置时刻时这一格空着（仍占位），与列表里那格同一处理（见 QuotaCountdown）。 */}
+        <span
+          className="w-9 shrink-0 whitespace-nowrap text-left text-2xs text-muted-foreground tabular-nums"
+          title={reset != null && reset > now
+            ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
+            : undefined}
+          aria-hidden={reset != null && reset > now ? undefined : true}
+        >
+          {reset != null && reset > now ? formatCountdown(reset, now) : ''}
+        </span>
       </div>
     </Meter>
   )

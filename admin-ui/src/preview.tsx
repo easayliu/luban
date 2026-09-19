@@ -820,6 +820,12 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   rewrites: index === 3 ? 'demoted_thinking' : null,
   response_excerpt: null,
   sim_reason: index % 4 === 0 ? (index % 8 === 0 ? 'not_cc_shaped' : 'no_base_prompt') : null,
+  // 走模拟且没有设备身份的那几条才有会话键（`sim:` 开头那批），其余为 null。
+  session_key: index % 4 === 0 ? 'lb:v2:pfx:3f9a1c7e5b2d4680a1b2c3d4e5f60718' : null,
+  // 来访自报的会话 id：走模拟的那几条与出站那个不同（演「客户端知道的 ≠ 上游看到的」）。
+  session_id_in: index % 4 === 0
+    ? '11111111-2222-4333-8444-555555555555'
+    : '7a6d8f9e-0c1b-4a2d-9e3f-5b6c7d8e9f01',
 }))
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   total: 37,

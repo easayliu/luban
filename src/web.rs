@@ -836,6 +836,14 @@ struct UsageQuery {
     /// 只看最近这么多小时；不传为不限（受流水保留期约束）。
     #[serde(default)]
     hours: Option<i64>,
+    /// 只看这条模拟会话的请求（`session_bindings.session_key`，精确匹配，空白视同不筛）；
+    /// 名额对话框里会话那一行点「看请求」带的。
+    #[serde(default)]
+    session_key: Option<String>,
+    /// 只看这个会话 id 的请求：**出站与来访两侧任一命中**（走模拟时两者不是同一个 uuid，
+    /// 见 `store::Forensics::session_id_in`）。请求查询里贴一个 uuid 进来走的就是它。
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// 一页流水 + 整个集合的口径。前端要靠 `total` 算页数、靠 `anchor` 把整轮翻页钉在同一快照上。
@@ -902,6 +910,8 @@ fn usage_page(
         request_id: q.request_id.clone(),
         model: q.model.clone(),
         since,
+        session_key: q.session_key.clone(),
+        session_id: q.session_id.clone(),
     };
     let stats = state.store.usage_log_stats(filter.clone()).map_err(internal)?;
     // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。

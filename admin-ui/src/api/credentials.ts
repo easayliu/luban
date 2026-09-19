@@ -292,8 +292,20 @@ export interface UsageLog {
   simulated: boolean
   /** 出站请求体的结构摘要（JSON 文本，不含用户正文）。 */
   shape: string | null
-  /** 出站身份里的 session_id。 */
+  /** **实际发给上游**的 session_id（按「账号 + 槽位」派生或按账号钉住，对话之间复用）。 */
   session_id: string | null
+  /**
+   * **来访客户端自报**的 session_id。走模拟路径时它会被换成上面那个，两者不是同一个 uuid
+   * ——下游拿着自己这个 id 来查请求，只能靠这一列。本地拒绝的行只有这一个（没到上游）；
+   * 没带或形态不合法、以及 0.3.139 之前的旧记录为 null。
+   */
+  session_id_in: string | null
+  /**
+   * 这条请求落在哪条**模拟会话绑定**上（`lb:v2:sid:…` / `lb:v2:pfx:…`）；带设备身份的来访与
+   * 非模拟路径为 null，0.3.139 之前的旧记录也是 null。名额对话框里会话那一行的「看请求」
+   * 按它筛——它才是这条对话自己的身份，`session_id` 是会被下一个对话复用的槽位 id。
+   */
+  session_key: string | null
   /**
    * **实际发给上游**的 device_id（出站体 `metadata.user_id` 的 device 段）。`device_id` 是来访
    * 客户端的原始 id，上游看到的是按账号派生的另一个值；拿上游侧的 id 回查是哪台机器只能靠它。
@@ -479,6 +491,17 @@ export interface UsageListParams {
   request_id?: string
   model?: string
   hours?: number
+  /**
+   * 只看这条模拟会话的请求（`session_bindings.session_key`，精确匹配）。名额对话框里
+   * 会话那一行点「看请求」带的；与上游看到的 session_id 不是一回事——那个按槽位派生、
+   * 对话之间复用，按它筛会把先后占过同一槽位的几个对话混在一起。
+   */
+  session_key?: string
+  /**
+   * 只看这个会话 id 的请求：**出站与来访两侧任一命中**（走模拟时两者不同）。请求查询里
+   * 贴一个 uuid 进来走的就是它。
+   */
+  session_id?: string
 }
 
 export async function listCredentialUsage(

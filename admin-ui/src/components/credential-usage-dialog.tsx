@@ -11,6 +11,7 @@ import {
   extractError,
   formatFullTime,
   formatUsd,
+  parseSessionKey,
 } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -423,6 +424,13 @@ function UsageCards({
               <LogFact label={t('请求 ID', 'Request ID')}>
                 <RequestIdChip id={log.request_id} />
               </LogFact>
+              {/* 会话：模拟路径且没有设备身份的请求才有对话键，其余退到上游那个 session_id
+                  （按槽位派生、对话之间复用），两者都在悬浮提示里。 */}
+              <LogFact label={t('会话', 'Session')}>
+                <span className="font-mono" title={sessionTitle(log)}>
+                  {sessionShort(log, t)}
+                </span>
+              </LogFact>
             </dl>
             {(log.ua || log.ua_out) && (
               <p
@@ -688,6 +696,21 @@ function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
  * 设备格的悬停全文：来访原始 id 与出站派生 id 各一行。上游侧（工单、封号通知）给出的
  * device_id 对的是第二行——第一行是客户端自己的 id，上游从没见过。
  */
+/** 卡片里那一格会话：有对话键就显示「来源 + 前 8 位」，否则退到上游 session_id，都没有是 '—'。 */
+function sessionShort(log: UsageLog, t: (zh: string, en: string) => string): string {
+  if (log.session_key) {
+    const { source, value } = parseSessionKey(log.session_key)
+    return `${source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${value.slice(0, 8)}`
+  }
+  return log.session_id_in?.slice(0, 8) ?? log.session_id?.slice(0, 8) ?? '—'
+}
+
+/** 悬浮里两者都给全：对话键是这条对话的身份，session_id 是上游看到的那个（槽位会被复用）。 */
+function sessionTitle(log: UsageLog): string | undefined {
+  if (!log.session_key && !log.session_id && !log.session_id_in) return undefined
+  return `key: ${log.session_key ?? '—'}\nin:  ${log.session_id_in ?? '—'}\nout: ${log.session_id ?? '—'}`
+}
+
 function deviceTitle(log: UsageLog): string | undefined {
   if (!log.device_id && !log.device_id_out) return undefined
   return `in:  ${log.device_id ?? '—'}\nout: ${log.device_id_out ?? '—'}`

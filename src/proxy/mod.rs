@@ -199,6 +199,12 @@ pub async fn handle(
         let parsed = log_state.parsed.lock().take();
         let mut rec =
             local_reject_record(&local, parsed, resp.status(), local_error, &request_id, started);
+        rec.forensics.session_key = log_state.session_key.lock().take();
+        // 体解析之后算出来的那个更准（两个来源各自校验过形态）；没走到那一步就用
+        // `local_reject_record` 从头/体里现取的。
+        if let Some(sid) = log_state.session_id_in.lock().take() {
+            rec.forensics.session_id_in = Some(sid);
+        }
         if let Some(tag) = local_replay {
             rec.forensics.rewrites = Some(tag.into());
             rec.cost_usd = Some(0.0);
@@ -283,6 +289,15 @@ struct RequestLogState {
     /// （`rejected_locally:<kind>`），概览按它统计「近 1 小时被谁拒了多少」。没标的仍是裸的
     /// `rejected_locally`（坏形态、鉴权那些）。
     local_reject: parking_lot::Mutex<Option<&'static str>>,
+    /// 这条请求算出来的**模拟会话键**（[`session_binding_key`]），本地拒绝的流水也带上它。
+    ///
+    /// 算得出键的请求才有（走模拟路径、解析得了体）；本地拒绝里最该看见的正是这几条——
+    /// 会话 RPM、账号 RPM 打满的那些发生在键算出来之后，不记的话名额对话框里点「看请求」
+    /// 只看得到成功转发的，被拒的那批凭空消失。
+    session_key: parking_lot::Mutex<Option<String>>,
+    /// 来访自报的会话 id（[`session_id::incoming_session_id`]），同样给早退与本地拒绝的流水用。
+    /// 见 [`store::Forensics::session_id_in`]。
+    session_id_in: parking_lot::Mutex<Option<String>>,
 }
 
 /// 流水 `rewrites` 里标「本地拒绝、未转发」；带原因分类时是 `rejected_locally:<kind>`，
@@ -322,7 +337,9 @@ fn local_reject_record(
 ) -> store::UsageRecord {
     let parsed = parsed.unwrap_or_default();
     let (error_type, error_message) = error.map(|e| (e.etype, e.message)).unwrap_or_default();
-    let session_id = ctx.session_header.clone().or(parsed.session_id);
+    // 本地拒绝没到过上游，故只有**来访**那一侧的会话 id（`session_id` 留空）：把它记进
+    // `session_id` 才是把来访值伪装成上游值，按会话 id 回查时会把两个 uuid 混为一谈。
+    let session_id_in = ctx.session_header.clone().or(parsed.session_id);
     tracing::debug!(
         method = %ctx.method, path = %ctx.path, ua = %ctx.ua,
         status = status.as_u16(), request_id,
@@ -341,7 +358,7 @@ fn local_reject_record(
         total_ms: i64::try_from(started.elapsed().as_millis()).ok(),
         request_id: Some(request_id.to_string()),
         forensics: store::Forensics {
-            session_id,
+            session_id_in,
             error_type,
             error_message,
             rewrites: Some(REWRITE_REJECTED_LOCALLY.into()),
@@ -373,6 +390,11 @@ fn log_early_upstream_failure(
     f: EarlyUpstreamFailure<'_>,
 ) {
     let mut forensics = capture_forensics(upstream, sent, cred);
+    // 到过上游却早退的那几条（401 换不到号、429 判定套餐不含、连接层失败）同样带上会话键，
+    // 否则会话行里点「看请求」看不到这条会话是怎么失败的。不 take：外层补本地流水那一支
+    // 与这里互斥（`logged` 已置真），留着不影响。
+    forensics.session_key = log_state.session_key.lock().clone();
+    forensics.session_id_in = log_state.session_id_in.lock().clone();
     forensics.error_type = f.error_type;
     forensics.error_message = f.error_message;
     forensics.third_party = f.third_party;
@@ -872,10 +894,11 @@ mod tests {
         assert_eq!(rec.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(rec.device_id.as_deref(), Some("abc123"));
         assert_eq!(
-            rec.forensics.session_id.as_deref(),
+            rec.forensics.session_id_in.as_deref(),
             Some("11111111-2222-4333-8444-555555555555"),
             "头上没有就取体里的会话段"
         );
+        assert_eq!(rec.forensics.session_id, None, "没到上游，没有出站会话 id");
         assert_eq!(rec.forensics.error_type.as_deref(), Some("invalid_request_error"));
         assert_eq!(
             rec.forensics.error_message.as_deref(),
@@ -906,8 +929,9 @@ mod tests {
         assert_eq!(rec.device_id, None);
         assert_eq!(rec.ua, None);
         assert_eq!(
-            rec.forensics.session_id.as_deref(),
-            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+            rec.forensics.session_id_in.as_deref(),
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            "头上那个优先"
         );
         assert_eq!(rec.forensics.error_type, None);
     }

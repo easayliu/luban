@@ -5,6 +5,7 @@ import {
   MessagesSquareIcon,
   PencilIcon,
   RefreshCwIcon,
+  ScrollTextIcon,
   SmartphoneIcon,
   Trash2Icon,
   UnlinkIcon,
@@ -27,9 +28,11 @@ import {
   extractError,
   formatFullTime,
   formatUsd,
+  parseSessionKey,
   relativeTime,
 } from '@/lib/utils'
 import { type CredentialActions } from '@/components/credential-shared'
+import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
@@ -630,11 +633,13 @@ function DeviceList({
                     <DeviceStat
                       label={t('本账号', 'This account')}
                       value={formatUsd(device.cost_usd)}
+                      valueClass="w-14"
                       hint={t('这台设备经本账号产生的等价 API 费用', 'Equivalent API cost this device incurred through this account')}
                     />
                     <DeviceStat
                       label={t('全部账号', 'All accounts')}
                       value={formatUsd(device.cost_usd_all)}
+                      valueClass="w-14"
                       hint={t('这台设备在本网关所有账号上的累计花费', "This device's total cost across every account on this gateway")}
                     />
                   </div>
@@ -657,11 +662,27 @@ function CapacityStat({ label, value }: { label: string; value: string }) {
   )
 }
 
-/** 设备条目里的行内统计：`标签 值`，标签退到次要色，值用前景色顶住。 */
-function DeviceStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+/**
+ * 设备行 / 会话行右下角那组统计里的一项：`标签 值`，标签退到次要色，值用前景色顶住，并放在
+ * 定宽的行内块里、左对齐，短值右边留白不补。
+ *
+ * 值若按内容伸缩，整组是右贴的，`$0.00` 与 `$123.45` 一差就把前面两项往左推——同一列的
+ * 「请求」「本账号」「全部账号」在每一行都落在不同的位置，跨行读不成列。定宽之后三项在所有行
+ * 上对齐。宽度按值的字形定：计数走默认的 2.75rem（够 `12,345`），金额传 `w-14`（够 `$0.0042`
+ * 与 `$123.45`）；再长的值把这一格撑开，只影响那一行。
+ */
+function DeviceStat({
+  label,
+  value,
+  hint,
+  valueClass = 'w-11',
+}: { label: string; value: string; hint?: string; valueClass?: string }) {
   const stat = (
     <span className="whitespace-nowrap">
-      {label} <span className="font-medium text-foreground">{value}</span>
+      {label}{' '}
+      <span className={cn('inline-block text-left font-medium text-foreground', valueClass)}>
+        {value}
+      </span>
     </span>
   )
   if (!hint) return stat
@@ -856,18 +877,6 @@ function SessionCapacityCard({
   )
 }
 
-/**
- * 拆开会话键：后端写的是 `lb:v2:<来源>:<值>`（见 `session_binding_key`），来源 `sid` 是来访
- * 自带的会话 id、`pfx` 是「缓存前缀 + 对话起点」的指纹。
- *
- * 认不出前缀的只可能是旧口径的残留（开库时那条迁移会清掉），退回原来那套按长相猜的判法。
- */
-function parseSessionKey(key: string): { source: 'sid' | 'pfx'; value: string } {
-  const m = /^lb:v\d+:(sid|pfx):([\s\S]*)$/.exec(key)
-  if (m) return { source: m[1] as 'sid' | 'pfx', value: m[2] }
-  return { source: /^[0-9a-f]{32}$/.test(key) ? 'pfx' : 'sid', value: key }
-}
-
 function SessionList({
   credId,
   data,
@@ -886,6 +895,8 @@ function SessionList({
   const { t, language, locale } = useI18n()
   const qc = useQueryClient()
   const queryKey = ['credential-sessions', credId] as const
+  // 点「看请求」时带着这条会话的键去查流水；关掉就置空，对话框不常驻。
+  const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
   const unbind = useMutation({
     mutationFn: (sessionKey: string) => unbindCredentialSession(credId, sessionKey),
     onSuccess: (_, sessionKey) => {
@@ -1044,6 +1055,23 @@ function SessionList({
                     </TooltipTrigger>
                     <TooltipPopup>{t('复制会话 id', 'Copy session id')}</TooltipPopup>
                   </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger
+                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
+                      aria-label={t(`看这条会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
+                      // 按**对话键**筛而不是按上游那个 session_id：后者按槽位派生、对话之间
+                      // 复用，按它筛会把先后占过同一槽位的几个对话混成一条。
+                      onClick={() => setDrill({
+                        credId,
+                        sessionKey: session.session_key,
+                        label: t(`会话 #${session.slot}`, `Session #${session.slot}`),
+                        hours: 24,
+                      })}
+                    >
+                      <ScrollTextIcon />
+                    </TooltipTrigger>
+                    <TooltipPopup>{t('看这条会话的请求', 'View this session’s requests')}</TooltipPopup>
+                  </Tooltip>
                   <Button
                     size="xs"
                     variant="destructive-outline"
@@ -1080,6 +1108,14 @@ function SessionList({
             )
           })}
         </ul>
+      )}
+      {/* 「看请求」点开的流水：带这条会话的键，只列它自己的请求。没点过就不挂。 */}
+      {drill && (
+        <RequestLookupDialog
+          open
+          onOpenChange={(open) => { if (!open) setDrill(null) }}
+          filter={drill}
+        />
       )}
     </section>
   )

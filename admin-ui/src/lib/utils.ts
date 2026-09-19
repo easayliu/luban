@@ -6,6 +6,19 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * 拆开模拟会话的绑定键：后端写的是 `lb:v2:<来源>:<值>`（见 `session_binding_key`），来源
+ * `sid` 是来访自带的会话 id、`pfx` 是「缓存前缀 + 对话起点」的指纹。
+ *
+ * 认不出前缀的只可能是旧口径的残留（开库时那条迁移会清掉），退回原来那套按长相猜的判法。
+ * 名额对话框的会话列表与流水明细共用这一份，两边对同一个键的说法不会漂开。
+ */
+export function parseSessionKey(key: string): { source: 'sid' | 'pfx'; value: string } {
+  const m = /^lb:v\d+:(sid|pfx):([\s\S]*)$/.exec(key)
+  if (m) return { source: m[1] as 'sid' | 'pfx', value: m[2] }
+  return { source: /^[0-9a-f]{32}$/.test(key) ? 'pfx' : 'sid', value: key }
+}
+
 // OAuth 未返回可用账号身份且用户未填写备注时，后端会生成这个精确格式的兜底名。
 // 它是展示占位符而非用户数据，所以按当前界面语言显示；其余名称必须原样保留。
 const GENERATED_CREDENTIAL_LABEL = /^(?:账号|Account)\s+(\d+)$/

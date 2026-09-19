@@ -3517,8 +3517,29 @@ pub struct Forensics {
     pub sim_reason: Option<String>,
     /// 出站请求体的结构摘要（JSON 文本，不含用户正文），见 `crate::proxy::shape_summary`。
     pub shape: Option<String>,
-    /// 出站身份里的 session_id（`metadata.user_id` 末段 / `X-Claude-Code-Session-Id`）。
+    /// **实际发给上游**的 session_id（出站体 `metadata.user_id` 末段 / 出站头
+    /// `X-Claude-Code-Session-Id`）。
     pub session_id: Option<String>,
+    /// **来访客户端自报**的 session_id（来访头或来访体里的那个，见
+    /// `crate::proxy::incoming_session_id`）；没带或形态不合法为 `None`。
+    ///
+    /// 与上面那个分开记，理由和 `device_id` / [`Self::device_id_out`] 那一对完全一样：走模拟
+    /// 路径时来访那个会被换成派生值（按槽位派生，或按账号钉住），**上游看到的与客户端自己
+    /// 知道的不是同一个 uuid**。只存出站那个的话，下游拿着自己的会话 id 来查这条请求，在
+    /// 请求查询里一条都查不到——而那恰恰是他手里唯一有的线索。反过来拿上游侧的 id 回查是
+    /// 哪条来访会话，也只有这一对对得上。
+    ///
+    /// 本地拒绝的行只有这一个（没到上游，没有出站值）。0.3.139 之前的旧记录为 `None`。
+    pub session_id_in: Option<String>,
+    /// 这条请求落在哪个**模拟会话绑定**上（`session_bindings.session_key`，形如
+    /// `lb:v2:sid:<uuid>` / `lb:v2:pfx:<hex>`，见 `crate::proxy::session_binding_key`）；
+    /// 带设备身份的来访与非模拟路径为 `None`。
+    ///
+    /// 与上面的 `session_id` 分开记，两者不是一回事：`session_id` 是**上游看到的**那个 uuid，
+    /// 按「账号 + 槽位」派生、槽位释放后被下一个对话复用——按它筛会把先后占过同一个槽位的
+    /// 几个对话混成一条。`session_key` 才是这条对话自己的身份，后台「活跃模拟会话」里那一行
+    /// 点「看请求」筛的就是它。
+    pub session_key: Option<String>,
     /// **实际发给上游**的 device_id（出站体 `metadata.user_id` 里的 device 段）。
     ///
     /// 与流水的 `device_id` 列分开记：那一列是**来访**客户端的原始 id（设备绑定、设备上限都按
@@ -3633,6 +3654,16 @@ pub struct UsageLogQuery {
     pub model: Option<String>,
     /// 只看这个时刻（Unix 秒）之后的；`None` 为不限。
     pub since: Option<i64>,
+    /// 只看这条**模拟会话**的请求（精确匹配 `session_key` 列，见 `Forensics::session_key`）；
+    /// 空白视同 `None`。后台「活跃模拟会话」里那一行点「看请求」用的就是它。
+    pub session_key: Option<String>,
+    /// 只看这个**会话 id** 的请求：`session_id`（出站）与 `session_id_in`（来访）**任一命中**
+    /// 即算；空白视同 `None`。
+    ///
+    /// 两侧一起匹配是这条筛选的全部意义：走模拟路径时两者是两个不同的 uuid（见
+    /// `Forensics::session_id_in`），而来查的人手里只会有其中一个——下游用户知道的是自己
+    /// 那个，从上游侧回查的人拿到的是出站那个，两边都得能查到同一批请求。
+    pub session_id: Option<String>,
 }
 
 impl UsageLogQuery {
@@ -3665,6 +3696,17 @@ impl UsageLogQuery {
         if let Some(s) = self.since {
             params.push(Value::Integer(s));
             clauses.push(format!("ts >= ?{}", params.len()));
+        }
+        if let Some(k) = self.session_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            params.push(Value::Text(k.to_string()));
+            clauses.push(format!("session_key = ?{}", params.len()));
+        }
+        // 出站与来访任一命中。两个 OR 分支各有自己的部分索引，SQLite 会走 MULTI-INDEX OR
+        // （测试里用 EXPLAIN QUERY PLAN 钉住），不会退成整表扫。
+        if let Some(sid) = self.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(Value::Text(sid.to_string()));
+            let n = params.len();
+            clauses.push(format!("(session_id = ?{n} OR session_id_in = ?{n})"));
         }
         let sql = if clauses.is_empty() {
             String::new()
@@ -4233,10 +4275,12 @@ impl CredentialStore {
                  rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
                  request_id, upstream_request_id,
                  proxy, simulated, shape, session_id, error_type, error_message, third_party,
-                 rewrites, device_id_out, response_excerpt, sim_reason)
+                 rewrites, device_id_out, response_excerpt, sim_reason, session_key,
+                 session_id_in)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                     ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44,
+                     ?45)",
             params![
                 ts,
                 rec.cred_id,
@@ -4284,6 +4328,8 @@ impl CredentialStore {
                     .as_deref()
                     .map(|m| head_chars(m, RESPONSE_EXCERPT_MAX)),
                 rec.forensics.sim_reason,
+                rec.forensics.session_key,
+                rec.forensics.session_id_in,
             ],
         )?;
         // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
@@ -4942,7 +4988,7 @@ const USAGE_LOG_COLS: &str = "ts, cred_id, cred_label, device_id, model, path, s
         cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
         request_id, upstream_request_id,
         proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
-        device_id_out, response_excerpt, sim_reason";
+        device_id_out, response_excerpt, sim_reason, session_key, session_id_in";
 
 /// 按 [`USAGE_LOG_COLS`] 的顺序把一行读成 [`UsageLog`]（0 号列是主键）。
 fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
@@ -4992,6 +5038,8 @@ fn usage_log_from_row(r: &Row<'_>) -> rusqlite::Result<UsageLog> {
             device_id_out: r.get(41)?,
             response_excerpt: r.get(42)?,
             sim_reason: r.get(43)?,
+            session_key: r.get(44)?,
+            session_id_in: r.get(45)?,
         },
     })
 }
@@ -5383,6 +5431,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "response_excerpt TEXT",
         // 0.3.99：走模拟路径的原因标签，见 Forensics::sim_reason。
         "sim_reason TEXT",
+        // 0.3.139：这条请求落在哪个模拟会话绑定上，见 Forensics::session_key。
+        "session_key TEXT",
+        // 0.3.139：来访自报的 session_id，见 Forensics::session_id_in。
+        "session_id_in TEXT",
     ] {
         // 冻结表与流水表同列（USAGE_LOG_COLS 逐列照搬），补列必须两张一起补。
         let _ = conn.execute(&format!("ALTER TABLE usage_logs ADD COLUMN {col}"), []);
@@ -5392,6 +5444,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // - (cred_id, id)：按号翻页是 `cred_id = ? AND id <= ? ORDER BY id DESC`，与索引序完全
     //   一致，取页不必再排序；已有的 (cred_id, ts) 是给按时间聚合用的，排序键不同。
     // - (request_id)：按请求 id 精确查——排查时贴一个 id 进来，不能整表扫。
+    // - (session_id, id) / (session_id_in, id)：按会话 id 查要同时匹配出站与来访两侧
+    //   （走模拟时两者不是同一个 uuid），两条部分索引让那个 OR 走 MULTI-INDEX OR。
+    // - (session_key, id)：会话行点「看请求」是 `session_key = ? AND id <= ? ORDER BY id DESC`，
+    //   与 (cred_id, id) 同一个形状；**部分索引**（只收非空的），带设备身份与非模拟路径的
+    //   请求这一列恒为空、占了绝大多数行，不进索引就不付这份写入与体积。
     // - 延迟趋势只看成功且记了 TTFT 的行、只读三列：**部分覆盖索引**，30 天的扫描全在索引里
     //   走、不回表（日志行很宽，回表才是大头）；失败行与没记 TTFT 的行不进索引，写入开销只
     //   落在成功请求上。
@@ -5401,6 +5458,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_id ON usage_logs(cred_id, id);
          CREATE INDEX IF NOT EXISTS idx_usage_logs_request_id ON usage_logs(request_id);
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_session_key
+             ON usage_logs(session_key, id) WHERE session_key IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_session_id
+             ON usage_logs(session_id, id) WHERE session_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_session_id_in
+             ON usage_logs(session_id_in, id) WHERE session_id_in IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_usage_logs_latency
              ON usage_logs(ts, ttft_ms, total_ms, output_tokens)
              WHERE status = 200 AND ttft_ms IS NOT NULL;
@@ -9789,6 +9852,8 @@ mod tests {
                     request_id: None,
                     model: None,
                     since: None,
+                    session_key: None,
+                    session_id: None,
                 })
                 .unwrap()
         };
@@ -9878,6 +9943,139 @@ mod tests {
         assert!(!p.contains("TEMP B-TREE"), "索引序即排序序，不该再排一遍: {p}");
         let p = plan(&by("lb-1"));
         assert!(p.contains("idx_usage_logs_request_id"), "按请求 id 应走索引: {p}");
+    }
+
+    /// 流水按**模拟会话键**筛：名额对话框里会话那一行点「看请求」走的就是它。键落进流水、
+    /// 与按号筛可叠、空白视同不筛，且要走那条部分索引（带设备身份的请求这一列为空、不进索引）。
+    #[test]
+    fn usage_logs_filter_by_session_key_using_a_partial_index() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let log = |cred: i64, key: Option<&str>| {
+            store
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(cred),
+                    forensics: Forensics { session_key: key.map(Into::into), ..Default::default() },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let one = "lb:v2:sid:7fe47444-c834-44e0-b568-d61e07daa35e";
+        let two = "lb:v2:pfx:3f9a1c7e5b2d4680a1b2c3d4e5f60718";
+        log(a, Some(one));
+        log(a, Some(one));
+        log(a, Some(two));
+        log(b, Some(one));
+        log(a, None); // 带设备身份的那类：这一列为空
+
+        let by = |key: &str| UsageLogQuery {
+            session_key: Some(key.into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let hit = store.query_usage_logs(by(one)).unwrap();
+        assert_eq!(hit.len(), 3, "两个号上的同键请求都算");
+        assert!(
+            hit.iter().all(|l| l.forensics.session_key.as_deref() == Some(one)),
+            "键随流水落库"
+        );
+        assert_eq!(store.usage_log_stats(by(one)).unwrap().total, 3, "统计与取页同一套条件");
+        assert_eq!(store.query_usage_logs(by(two)).unwrap().len(), 1);
+        assert!(store.query_usage_logs(by("lb:v2:pfx:nope")).unwrap().is_empty());
+        assert_eq!(store.query_usage_logs(by("  ")).unwrap().len(), 5, "空白视同不筛");
+        // 与按号筛叠加——会话行点进来带的正是这两项。
+        let scoped = UsageLogQuery {
+            cred_id: Some(a),
+            session_key: Some(one.into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(store.query_usage_logs(scoped.clone()).unwrap().len(), 2, "b 上那条不算");
+        assert_eq!(store.usage_log_stats(scoped).unwrap().total, 2);
+
+        // 查询计划：按会话键取页要走 (session_key, id) 那条部分索引，不能整表扫。
+        let (where_sql, params) = by(one).where_clause();
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("idx_usage_logs_session_key"), "应走会话键索引: {plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "索引序即排序序，不该再排一遍: {plan}");
+    }
+
+    /// 按**会话 id** 查：出站与来访两侧任一命中。走模拟路径时两者是两个不同的 uuid，而来查
+    /// 的人手里只会有其中一个（下游用户知道自己那个，从上游侧回查的人拿到出站那个），两边
+    /// 都得能查到同一批请求。两条部分索引要让那个 OR 走 MULTI-INDEX OR，不能退成整表扫。
+    #[test]
+    fn usage_logs_look_up_a_session_id_on_either_side() {
+        let (store, ids) = store_with(&["a"]);
+        let a = ids[0];
+        let log = |out: Option<&str>, inn: Option<&str>| {
+            store
+                .insert_usage_log(&UsageRecord {
+                    cred_id: Some(a),
+                    forensics: Forensics {
+                        session_id: out.map(Into::into),
+                        session_id_in: inn.map(Into::into),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let client = "11111111-2222-4333-8444-555555555555";
+        let upstream = "7fe47444-c834-44e0-b568-d61e07daa35e";
+        log(Some(upstream), Some(client)); // 走模拟：两侧不同
+        log(Some(upstream), Some(client));
+        log(Some(client), Some(client)); // 没改身份：两侧同一个
+        log(None, Some(client)); // 本地拒绝：只有来访那侧
+        log(Some("99999999-9999-4999-8999-999999999999"), None); // luban 自己发的
+
+        let by = |sid: &str| UsageLogQuery {
+            session_id: Some(sid.into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            store.query_usage_logs(by(client)).unwrap().len(),
+            4,
+            "下游拿自己那个 uuid 来查：被改过身份的两条、没改的一条、本地拒绝的一条"
+        );
+        assert_eq!(
+            store.query_usage_logs(by(upstream)).unwrap().len(),
+            2,
+            "从上游侧回查：只有出站是它的那两条"
+        );
+        assert_eq!(store.usage_log_stats(by(client)).unwrap().total, 4, "统计与取页同一套条件");
+        assert!(
+            store.query_usage_logs(by("00000000-0000-4000-8000-000000000000")).unwrap().is_empty()
+        );
+        assert_eq!(store.query_usage_logs(by("  ")).unwrap().len(), 5, "空白视同不筛");
+
+        let (where_sql, params) = by(client).where_clause();
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("idx_usage_logs_session_id"), "出站那侧要走索引: {plan}");
+        assert!(plan.contains("idx_usage_logs_session_id_in"), "来访那侧要走索引: {plan}");
+        assert!(!plan.contains("SCAN usage_logs"), "不能整表扫: {plan}");
     }
 
     /// overage-in-use 标记随快照落账：带限流头的响应写入即更新，后续不带头的响应不得抹掉，

@@ -4,7 +4,7 @@ import { SearchIcon } from 'lucide-react'
 import { listCredentialUsage, listUsage, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
-  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd,
+  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey,
 } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -26,11 +26,17 @@ import { RequestIdChip, statusVariant } from '@/components/credential-usage-dial
  * 上的那个 `req_…`），贴进来直接看到它走的是哪个账号、模型、状态、用量与花费。
  * 不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
  */
-/** 从趋势对话框的拆分表点进来时带的筛选：某个模型或某个账号、最近几小时。 */
+/**
+ * 点进流水时带的筛选：某个模型、某个账号，或某条模拟会话，取最近几小时。
+ *
+ * 三者可叠（会话那条总是连着账号一起传，会话键本来就属于某个号）。
+ */
 export interface UsageDrillFilter {
   model?: string
   credId?: number
-  /** 展示名（模型名或账号 label）。 */
+  /** 只看这条模拟会话的请求（`session_bindings.session_key`），见名额对话框的「看请求」。 */
+  sessionKey?: string
+  /** 展示名（模型名、账号 label，或会话的槽位与 id）。 */
   label: string
   hours: number
 }
@@ -50,13 +56,30 @@ export function RequestLookupDialog({
   const [submitted, setSubmitted] = useState('')
   const query = useQuery({
     queryKey: filter
-      ? ['request-drill', filter.model ?? null, filter.credId ?? null, filter.hours]
+      ? [
+          'request-drill', filter.model ?? null, filter.credId ?? null,
+          filter.sessionKey ?? null, filter.hours,
+        ]
       : ['request-lookup', submitted],
-    queryFn: () => filter
-      ? filter.credId != null
-        ? listCredentialUsage(filter.credId, { model: filter.model, hours: filter.hours, limit: 50 })
-        : listUsage({ model: filter.model, hours: filter.hours, limit: 50 })
-      : listUsage({ request_id: submitted, limit: 50 }),
+    queryFn: () => {
+      // 贴进来的是 uuid 就按**会话 id** 查（出站与来访两侧任一命中，见后端 session_id_in）：
+      // 走模拟路径时上游看到的会话 id 与客户端自己那个不是同一个，而来查的人手里通常只有
+      // 客户端那个。其余按请求 id 精确查。
+      if (!filter) {
+        return looksLikeUuid(submitted)
+          ? listUsage({ session_id: submitted, limit: 50 })
+          : listUsage({ request_id: submitted, limit: 50 })
+      }
+      const params = {
+        model: filter.model,
+        session_key: filter.sessionKey,
+        hours: filter.hours,
+        limit: 50,
+      }
+      return filter.credId != null
+        ? listCredentialUsage(filter.credId, params)
+        : listUsage(params)
+    },
     enabled: open && (filter != null || submitted !== ''),
   })
   const rows = query.data?.logs ?? []
@@ -85,15 +108,17 @@ export function RequestLookupDialog({
             {filter
               ? drillTitle
               : t(
-                  '贴入 luban 回在响应头 X-Request-Id / X-Oneapi-Request-Id 上的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查它在这里的流水。',
-                  'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here.',
+                  '贴入 luban 回在响应头 X-Request-Id / X-Oneapi-Request-Id 上的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查它在这里的流水。也可以贴一个会话 id（uuid）查这条会话的全部请求——客户端自己那个与上游看到的那个都认。',
+                  'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here. You can also paste a session id (uuid) to list that session\'s requests — both the client\'s own id and the one upstream sees are accepted.',
                 )}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
           {!filter && <Form onSubmit={(e) => { e.preventDefault(); submit() }}>
             <Field>
-              <FieldLabel htmlFor="request-lookup-id">{t('请求 ID', 'Request ID')}</FieldLabel>
+              <FieldLabel htmlFor="request-lookup-id">
+                {t('请求 ID 或会话 id', 'Request ID or session id')}
+              </FieldLabel>
               <div className="flex gap-2">
                 <Input
                   id="request-lookup-id"
@@ -111,7 +136,12 @@ export function RequestLookupDialog({
                 </Button>
               </div>
               <FieldDescription>
-                {t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
+                {looksLikeUuid(draft.trim())
+                  ? t(
+                      '按会话 id 查：客户端自报的与上游看到的两侧都匹配，列这条会话最近 50 条。',
+                      'Looking up a session id: matches both the client-reported and the upstream-visible side, listing the latest 50 requests.',
+                    )
+                  : t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
               </FieldDescription>
             </Field>
           </Form>}
@@ -131,8 +161,8 @@ export function RequestLookupDialog({
                 <EmptyTitle className="text-base">{filter ? t('这段时间没有请求', 'No requests in this period') : t('没有找到这条请求', 'No request found')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '确认 id 完整（luban 生成的形如 req_ 加 16 位随机串）；超过 30 天的流水已被裁剪。',
-                    'Check that the id is complete (ids generated by luban look like req_ plus 16 random characters); records older than 30 days have been pruned.',
+                    '确认 id 完整（请求 id 形如 req_ 加 16 位随机串，会话 id 是一个 uuid）；超过 30 天的流水已被裁剪。0.3.139 之前的记录没有来访侧的会话 id，只能用上游那个查。',
+                    'Check that the id is complete (request ids look like req_ plus 16 random characters, a session id is a uuid); records older than 30 days have been pruned. Records from before 0.3.139 have no client-side session id — look those up with the upstream one.',
                   )}
                 </EmptyDescription>
               </EmptyHeader>
@@ -148,6 +178,20 @@ export function RequestLookupDialog({
   )
 }
 
+/** 形态判据与后端 `looks_like_uuid` 同口径：8-4-4-4-12 的十六进制。 */
+function looksLikeUuid(v: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+}
+
+/**
+ * 悬浮里把两侧的会话 id 都给全。走模拟路径时它们是两个不同的 uuid：来访那个是客户端自己
+ * 知道的，出站那个是上游看到的（按槽位派生或按账号钉住）。本地拒绝的只有来访那一侧。
+ */
+function sessionTitle(log: UsageLog): string | undefined {
+  if (!log.session_id && !log.session_id_in) return undefined
+  return `in:  ${log.session_id_in ?? '—'}\nout: ${log.session_id ?? '—'}`
+}
+
 function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
   const { t, language } = useI18n()
   const num = (v: number | null) => (v == null ? '—' : v.toLocaleString(locale))
@@ -155,6 +199,10 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
   const deviceShort = log.device_id
     ? log.device_id.startsWith('sim:') ? `sim:${log.device_id.slice(4, 12)}` : log.device_id.slice(0, 8)
     : '—'
+  // 会话两项是两回事：`session_id` 是上游看到的那个（按「账号 + 槽位」派生、对话之间复用），
+  // `session_key` 才是这条对话自己的身份（名额对话框里点「看请求」筛的就是它）。带设备身份的
+  // 来访与非模拟路径没有键，0.3.139 之前的旧记录也没有。
+  const key = log.session_key ? parseSessionKey(log.session_key) : null
   return (
     <li className="rounded-lg border bg-card p-3 text-xs">
       <div className="flex flex-wrap items-center gap-2">
@@ -184,6 +232,17 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
         <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
         <Fact label={t('路径', 'Path')}><span className="font-mono" title={log.path}>{log.path}</span></Fact>
+        <Fact label={t('会话（来访 → 出站）', 'Session (in → out)')}>
+          <span className="font-mono" title={sessionTitle(log)}>
+            {log.session_id_in?.slice(0, 8) ?? '—'}
+            <span className="text-muted-foreground">→{log.session_id?.slice(0, 8) ?? '—'}</span>
+          </span>
+        </Fact>
+        <Fact label={t('会话键', 'Session key')}>
+          <span className="font-mono" title={log.session_key ?? undefined}>
+            {key ? `${key.source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${key.value.slice(0, 8)}` : '—'}
+          </span>
+        </Fact>
       </dl>
       {(log.ua || log.ua_out) && (
         <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground" title={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : (log.ua ?? undefined)}>

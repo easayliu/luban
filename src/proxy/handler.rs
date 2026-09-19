@@ -687,9 +687,16 @@ pub(super) async fn handle_inner(
     // 来源那一段是明文，后台不必再靠「是不是 32 个 hex」去猜，改口径时旧行也认得出来。
     // **只有落库的这个键带前缀**，派生出站会话 id 的 seed 仍是裸的 `prefix_key`（下面的
     // `SimSessionSeed::Prefix`）——那是哈希的输入，动它会让在途对话的会话 id 全部换一遍。
-    let session_key: Option<String> = prefix_key.as_ref().map(|k| {
-        session_binding_key(incoming_session_id(&headers, body_json.as_ref()).as_deref(), k)
-    });
+    // 来访自报的会话 id（校验过形态，见 [`incoming_session_id`]）：会话键与流水都要用，算一次。
+    // 走模拟时上游看到的是另一个 uuid（按槽位派生或按账号钉住），来访这个不落库就彻底丢了
+    // ——下游拿着自己那个 id 来查请求会一条都查不到，见 [`store::Forensics::session_id_in`]。
+    let inbound_session = incoming_session_id(&headers, body_json.as_ref());
+    let session_key: Option<String> =
+        prefix_key.as_ref().map(|k| session_binding_key(inbound_session.as_deref(), k));
+    // 本地拒绝的流水也要带这两样（见 [`RequestLogState::session_key`]）：下面这些闸拦下的
+    // 请求走不到 `ReqLog`，外层补流水时从这里取。
+    *log_state.session_key.lock() = session_key.clone();
+    *log_state.session_id_in.lock() = inbound_session.clone();
 
     // 3) 按 device_id（模拟路径没有设备身份时按会话键）粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
@@ -1645,7 +1652,15 @@ pub(super) async fn handle_inner(
                 request_id: request_id.to_string(),
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
-                forensics: capture_forensics(&upstream, &sent, &cred),
+                forensics: store::Forensics {
+                    // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
+                    // 「看请求」按它筛，见 [`store::Forensics::session_key`]。
+                    session_key: session_key.clone(),
+                    // 来访自报的会话 id；`capture_forensics` 给的 `session_id` 是**出站**那个，
+                    // 走模拟时两者不同。
+                    session_id_in: inbound_session.clone(),
+                    ..capture_forensics(&upstream, &sent, &cred)
+                },
                 // 只给计费路径备料：**含非 2xx**——失败的请求要报 `tengu_api_error`
                 // （官方客户端对失败请求发的正是它），报不报由 Drop 里再判。
                 telemetry: telemetry_capture(

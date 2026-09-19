@@ -112,8 +112,8 @@ const COL = {
   quota7d: 'w-44 2xl:w-48',
   /**
    * 设备、模拟会话、RPM 三行迷你进度条（[SlotMeterRow]），与用量列同一套语言；原来单独的 RPM
-   * 列并进来了，它那 w-18 让给这一列。定宽的只有图标与数字（最宽 `100/1000` 约 77px），
-   * 其余给条，w-32 里条至少还有 30px。
+   * 列并进来了，它那 w-18 让给这一列。定宽的只有图标与数字（数字列占 44px，够 `0/1000`），
+   * 其余给条，w-32 里条有 30 多 px；数字真到 `100/1000` 那种长度时才多吃几像素。
    */
   devices: 'w-32',
   recent: 'hidden w-22 2xl:table-cell',
@@ -519,8 +519,13 @@ export const CredentialRow = memo(function CredentialRow({
           {/* 三行迷你进度条：设备、模拟会话、RPM，与左边用量列同一套语言（标签 · 数字 · 条）。
               条与文字同一行、高 4px，三行加起来与用量列那块一样高；条是弹性的，数字再长只会把
               条挤短，不会把列撑宽。不限上限的那行没有分母、不画条。每行整体可点：前两行开名额
-              对话框，第三行开 RPM 上限对话框；策略写在悬浮提示里。 */}
-          <div className="flex flex-col gap-0.5">
+              对话框，第三行开 RPM 上限对话框；策略写在悬浮提示里。
+              三行共用一张网格（每行 `grid-cols-subgrid` 接上来），数字列先占住 2.75rem——够放
+              `0/1000` 这种六字符的常见最宽值，文字左对齐贴着图标，右边多出来的空隙留白不补，
+              三条进度条因此从同一个位置起、一样长，且这个位置在整张表的每一行都一样（Cloudflare
+              那种「标签定宽、计量条对齐」的读法）。真超过六字符（`100/1000`）时这一列才会按内容
+              涨，涨的也是三行一起涨，格子里仍然对齐。 */}
+          <div className="grid grid-cols-[auto_minmax(2.75rem,auto)_minmax(0,1fr)] gap-y-0.5">
             <SlotMeterRow
               icon={SmartphoneIcon}
               count={cred.device_count}
@@ -909,7 +914,8 @@ function ListQuotaMeter({
           <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
         </div>
         {/* 两行的排法与有用量时保持一致（见下面那条注释）：第一行说用量，第二行是这个窗口的时间
-            维度——占位条虽然没有数据可画，位置与倒计时的落点仍与隔壁格子对得齐。 */}
+            维度——占位条虽然没有数据可画，长度与落点仍与隔壁格子、上下行对得齐（倒计时那一格
+            定宽，空着也占位）。 */}
         <div className="flex items-center gap-2">
           <div className="h-2 min-w-0 flex-1 bg-input" aria-hidden />
           {!showLabel && <QuotaCountdown reset={reset} now={now} />}
@@ -936,9 +942,10 @@ function ListQuotaMeter({
     // （进度条 + 还有多久重置）。
     //
     // 分法是按实测宽度定的：摘要最长 `1,633 · 245M · $188.30` 要 130px，百分比 28px、倒计时
-    // 44px。倒计时若留在第一行，130 + 8 + 44 = 182px 放不下、摘要必被截断（上一版就是这样）；
-    // 换成百分比同行是 166px，xl 下只有最长的那几条会截掉尾巴、2xl（内容宽 172px）一条都不截。
-    // 进度条这边反而更宽：整行减去倒计时还有 104px（2xl 120px），比没有倒计时之前的 88px 还长。
+    // 36px（定宽，见 [QuotaCountdown]）。倒计时若留在第一行，130 + 8 + 36 = 174px 放不下、摘要
+    // 必被截断（上一版就是这样）；换成百分比同行是 166px，xl 下只有最长的那几条会截掉尾巴、
+    // 2xl（内容宽 172px）一条都不截。进度条这边反而更宽：整行减去倒计时那一格还有 112px
+    // （2xl 128px），比没有倒计时之前的 88px 还长，而且每一行都是这个宽度。
     return (
       <Meter value={percentage} max={100} title={title}>
         <div className="flex min-w-0 items-baseline justify-between gap-2">
@@ -1003,18 +1010,26 @@ function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }
  * 倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；它受本地时钟偏差影响，只适合
  * 看个大概，要对准时刻的场合仍看 title 里的 [formatFullTime]。
  *
- * 已经重置过的窗口（`reset <= now`）不画：那不是「到期时间」而是一段过去，格子右上角的
+ * 已经重置过的窗口（`reset <= now`）不写字：那不是「到期时间」而是一段过去，格子右上角的
  * 「已重置」已经说明了状态，具体时刻在整格的悬浮提示里。上游没报重置时刻的同理留空。
+ *
+ * 不写字，但**这一格的宽度留着**：定宽 2.25rem、文字左对齐，空着也占位。留白是为了让同一列
+ * 里每一行的进度条在同一处结束——倒计时长短不一（`<1m`、`32m`、`4h 12m`、`6d 23h`），有的行
+ * 压根没有；条要是按剩余宽度伸缩，每行条尾都不一样，一列扫下来是锯齿状的，长短差别看着像用量
+ * 差别。2.25rem 够放最长的 `6d 23h`（text-2xs 下约 32px）。
  */
 function QuotaCountdown({ reset, now }: { reset: number | null; now: number }) {
   const { t, language } = useI18n()
-  if (reset == null || reset <= now) return null
+  const pending = reset != null && reset > now
   return (
     <span
-      className="shrink-0 whitespace-nowrap text-2xs text-muted-foreground tabular-nums"
-      title={t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+      className="w-9 shrink-0 whitespace-nowrap text-left text-2xs text-muted-foreground tabular-nums"
+      title={pending
+        ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
+        : undefined}
+      aria-hidden={pending ? undefined : true}
     >
-      {formatCountdown(reset, now)}
+      {pending ? formatCountdown(reset, now) : ''}
     </span>
   )
 }
@@ -1107,6 +1122,8 @@ function ListQuotaDetails({
  * 满红，见 [deviceUsageMeta]），条同色；不限上限时分母是 ∞、不画条。整行是一颗按钮，
  * 条只是装饰（aria-hidden），读屏靠 aria-label。条用两个 span 画而不是 Meter 组件：按钮里
  * 只能放行内内容，Meter 渲染的是带 role 的块级元素。
+ * 行本身是外层网格的 `grid-cols-subgrid`（图标、数字、条三列，数字列有 2.75rem 的下限），
+ * 三行的三条边界因此对齐；没画条的那行也会空出第三列，条位靠 `col-start-3` 钉住。
  */
 function SlotMeterRow({
   icon: Icon,
@@ -1145,14 +1162,14 @@ function SlotMeterRow({
       title={title}
       aria-label={ariaLabel}
       aria-haspopup="dialog"
-      className="flex h-4 w-full min-w-0 items-center gap-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+      className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center gap-x-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
     >
       <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-      <span className={cn('shrink-0 tabular-nums', numberClass)}>
+      <span className={cn('text-left tabular-nums', numberClass)}>
         {count}/{limit > 0 ? limit : '∞'}
       </span>
       {limit > 0 && (
-        <span className="block h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted" aria-hidden>
+        <span className="col-start-3 block h-1 w-full min-w-0 overflow-hidden rounded-full bg-muted" aria-hidden>
           <span className={cn('block h-full rounded-full', barClass)} style={{ width: `${pct}%` }} />
         </span>
       )}
