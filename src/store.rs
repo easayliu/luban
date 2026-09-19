@@ -2277,6 +2277,9 @@ impl CredentialStore {
         if let Some(v) = on(SIMULATE_CC) {
             flags.simulate_cc = v;
         }
+        if let Some(v) = on(SIMULATE_FULL_SYSTEM) {
+            flags.simulate_full_system = v;
+        }
         if let Some(v) = on(FILL_METADATA) {
             flags.fill_metadata = v;
         }
@@ -2532,6 +2535,10 @@ pub const REDACTED_THINKING_RETRY: &str = "redacted_thinking_retry";
 /// 缺省视为开启：关掉的话这类请求会因缺 `You are Claude Code, …` 被上游拒掉，等于不可用。
 pub const SIMULATE_CC: &str = "simulate_cc";
 
+/// 模拟路径是否补齐官方 `system` 第四块的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::simulate_full_system`]。
+pub const SIMULATE_FULL_SYSTEM: &str = "simulate_full_system";
+
 /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，是否补一份官方形态身份的 settings 键名。
 /// 缺省视为开启：官方**每条**请求都带那个字段，缺了就是一处白给的判据。
 pub const FILL_METADATA: &str = "fill_metadata";
@@ -2763,6 +2770,17 @@ pub struct ForwardFlags {
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。
     pub simulate_cc: bool,
+    /// 模拟路径补齐官方 `system` 的**第四块**（基座之后那段一万字节上下的「其余」正文，
+    /// [`crate::config::CC_SYSTEM_REST`] 模板按请求填占位），客户端自己的 system 挪进首条用户
+    /// 消息，`system` 块数与官方逐块相同（[`Self::simulate_cc`] 的子项，它关着这项无从谈起）。
+    ///
+    /// - **开**（默认）：出站 `system` 是 `[billing, 身份, 基座, 其余]`（2.1.277 四族同形），末块是
+    ///   官方那段 harness 提示词，只有记忆目录一处按账号加设备派生假路径。代价是每条模拟请求
+    ///   多约 2700 token 的前缀——带 `ttl:1h` 断点、同一设备同一会话内稳定，基本走缓存读价；
+    ///   以及模型会被这段官方提示词带得更像 Claude Code。
+    /// - **关**：末块放客户端自己的 system（超过 1500 字符搬进首条消息、留一行占位），即此前
+    ///   的形态。
+    pub simulate_full_system: bool,
     /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，补一份官方形态的身份
     /// （见 [`crate::proxy::bare_session_id`]）。
     pub fill_metadata: bool,
@@ -2985,6 +3003,7 @@ impl Default for ForwardFlags {
             thinking_modified_retry: true,
             redacted_thinking_retry: true,
             simulate_cc: true,
+            simulate_full_system: true,
             fill_metadata: true,
             rate_limit_retry: true,
             cache_scope_global: true,
@@ -8597,6 +8616,7 @@ mod tests {
             (ORIG_HEADER_CASE, "0"),
             (THINKING_SIGNATURE_RETRY, "0"),
             (SIMULATE_CC, "0"),
+            (SIMULATE_FULL_SYSTEM, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
@@ -8640,6 +8660,7 @@ mod tests {
                 thinking_modified_retry: false,
                 redacted_thinking_retry: false,
                 simulate_cc: false,
+                simulate_full_system: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,

@@ -63,6 +63,8 @@ export interface Settings {
   redacted_thinking_retry: boolean
   /** 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 + 整套官方头）；官方桌面端预热与 WebSearch 子调用原样放行。 */
   simulate_cc: boolean
+  /** 模拟路径补齐官方 system 第四块（基座之后那段 harness 提示词，按请求填工作目录 / 模型名 / 知识截止），客户端自己的 system 挪进首条用户消息。 */
+  simulate_full_system: boolean
   /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
   fill_metadata: boolean
   /** 上游回 429 时按账号/模型范围冷却并换号重试；关闭时不冷却、直接透传。 */
@@ -131,6 +133,7 @@ export type ForwardingKey =
   | 'thinking_modified_retry'
   | 'redacted_thinking_retry'
   | 'simulate_cc'
+  | 'simulate_full_system'
   | 'fill_metadata'
   | 'rate_limit_retry'
   | 'cache_scope_global'

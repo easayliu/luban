@@ -7,7 +7,7 @@ use axum::response::Response;
 use super::learned_rules::SSE_CONTENT_TYPE;
 use super::simulation::{
     cc_identity_blocks, field_is_empty, is_official_classifier_request, is_official_helper_request,
-    is_official_title_request,
+    is_official_thread_continuation, is_official_title_request,
 };
 use super::{REWRITE_PROBE_REPLY, error_response, is_quota_probe_shaped, request_max_tokens};
 
@@ -206,10 +206,15 @@ pub(super) fn probe_signature(
     // 官方那三种无 tools 请求的**完整**样子，见 [`is_official_helper_request`]、
     // [`is_official_title_request`]、[`is_official_classifier_request`]：system 结构、beta 头、
     // body 取值逐项对，不是「带了某个字段就放」，也不是只对 body 那几个字段。
+    // 第四种是 2.1.277 起 message-threads 的续轮（[`is_official_thread_continuation`]，六项逐项
+    // 对）：只发新增的那一条消息、`system` 只剩 billing header、不带 `tools`（`cap/2.1.277/00051`
+    // 那 25 条子代理续轮全是这个样子）——正是「有 system、没 tools、一条消息」，设备第一次见到时
+    // 会撞上这一刀。
     if max_tokens != Some(1)
         && !is_official_helper_request(v, beta)
         && !is_official_title_request(v, beta)
         && !is_official_classifier_request(v, beta)
+        && !is_official_thread_continuation(v, beta)
         && device_id.is_some()
         && !device_known()
     {

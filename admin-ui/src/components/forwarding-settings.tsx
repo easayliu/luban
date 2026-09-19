@@ -467,6 +467,26 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="simulate_full_system"
+          label={t('补齐官方 system 第四块', 'Fill the official fourth system block')}
+          summary={t(
+            '模拟请求的 system 末块放官方那段 harness 提示词，客户端自己的 system 挪进首条用户消息。',
+            'The last system block of an emulated request carries the official harness prompt; the client’s own system prompt moves into the first user message.',
+          )}
+          requires={{
+            key: 'simulate_cc',
+            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
+          }}
+          description={
+            <>
+              {t(
+                '官方 2.1.277 主线程的 system 是四块：billing、身份句、基座、以及基座之后约一万一千字节的「其余」段——会话指引、记忆说明、模型清单、交付规范等，末尾断点就标在这块上，四个模型族用的是同一份。此前模拟请求的末块放的是客户端自己的提示词，与官方形态差得最远的正是这一块。开启后按 2.1.277 抓包的原文填这一块：唯一随机器变的记忆目录按账号加设备派生一个固定的假路径；客户端自己的 system 整段挪进首条用户消息（挪不动时接在这块末尾），system 块数与官方逐块相同。模板去掉了依赖 ToolSearch 的那段指令，因为模拟不注入 ToolSearch。代价是每条模拟请求多约 2700 token 的前缀，带 1h 断点、同一会话内稳定，基本走缓存读价；模型也会被这段官方提示词带得更像 Claude Code。关掉即回到「末块放客户端 system、超过 1500 字符搬进首条消息」的旧形态。',
+                'The official 2.1.277 main-thread system prompt has four blocks: billing, identity, base, and a roughly 11 KB “rest” section after the base — session guidance, memory instructions, model list, delivery rules — carrying the final cache breakpoint; all four model families share the same text. Emulated requests used to put the client’s own prompt in that last block, which was the largest gap from the official shape. When enabled, this block is filled from the 2.1.277 captures verbatim: the only machine-specific part, the memory directory, is a fixed fake path derived per account and device. The client’s own system prompt moves into the first user message as a whole (appended to this block if that is impossible), so the block count matches the official one exactly. The paragraph that depends on ToolSearch is removed, since emulation does not inject ToolSearch. The cost is roughly 2,700 extra prefix tokens per emulated request, behind a 1h breakpoint and stable within a session, so mostly at cache-read price; the model is also pulled further towards Claude Code behaviour by the official prompt. Disable to return to the old shape (client system in the last block, moved into the first message above 1,500 characters).',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('请求兼容性', 'Request compatibility')}>

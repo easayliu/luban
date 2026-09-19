@@ -737,6 +737,7 @@ queryClient.setQueryData(['settings'], {
   orig_header_case: true,
   thinking_signature_retry: true,
   simulate_cc: true,
+  simulate_full_system: true,
   fill_metadata: true,
   rate_limit_retry: true,
   cache_scope_global: true,

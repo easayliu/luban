@@ -681,6 +681,8 @@ async fn send_quota_probe(
         // 额度探测不在会话链上：官方那条既没有 billing header，也没有 `diagnostics`。
         link: CcSessionLink::default(),
         reason: SimulationReason::Probe,
+        // 官方那条没有 `system`，自然也没有第四块。
+        rest: None,
     };
     let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
@@ -772,6 +774,9 @@ pub(super) fn probe_simulation(
         session_id: session_id_for(cred, device_fp),
         link: CcSessionLink::default(),
         reason: SimulationReason::Probe,
+        // 探测不补第四块：它一句 `ping` 就完，没有客户端 system 要安置，多一万字节的前缀只是
+        // 多付一次写入价；转发路径的形态由 [`Simulation::detect`] 管。
+        rest: None,
     }
 }
 

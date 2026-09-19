@@ -338,6 +338,9 @@ pub(super) fn rewrite_body(
         && display_beta
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
+    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带 `{"effort":"high"}`，
+    // 按 profile 补（[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
+    let effort_filled = sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
     // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），
     // 见 [`ensure_diagnostics`]。只给带 billing header 的 profile 补——额度探测、标题生成
     // 与安全分类官方都不发这个字段。
@@ -550,6 +553,7 @@ pub(super) fn rewrite_body(
         && !thinking_filled
         && !display_filled
         && !ctx_mgmt
+        && !effort_filled
         && !diag
         && !fallbacks_shaped
         && !msg_shape
@@ -1484,6 +1488,40 @@ pub(super) fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     true
 }
 
+/// 模拟路径下按 profile 补顶层 `output_config`：2.1.277 起 opus / fable / sonnet 主线程每条都是
+/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带），haiku
+/// 主线程与全部辅助请求不带（[`config::CcProfile::effort`] 为 `None`，这里什么都不做）。
+///
+/// 客户端自己带了 `output_config`（不论写的是 `effort` 还是 `format`）就不动——那是它自己的
+/// 输出策略，替它改是越权。位置按官方线序落在 `context_management` 之后、`thread` /
+/// `diagnostics` / `stream` 之前（[`config::CC_BODY_ORDER_MAIN_2_1_270`]）。
+///
+/// **`effort` 要配 `effort-2025-11-24` beta**：三个带它的 profile 的 beta 串里都有这一项，
+/// haiku 的没有——这也是 haiku 那行 `effort: None` 的另一层理由，别只看抓包里有没有字段。
+pub(super) fn ensure_output_config(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
+    let Some(effort) = profile.effort else { return false };
+    let Some(obj) = v.as_object() else { return false };
+    if obj.contains_key("output_config") {
+        return false;
+    }
+    insert_top_level(
+        v,
+        "output_config",
+        serde_json::json!({ "effort": effort }),
+        &[
+            "context_management",
+            "thinking",
+            "max_tokens",
+            "metadata",
+            "tools",
+            "system",
+            "messages",
+            "model",
+        ],
+    );
+    true
+}
+
 /// `cch` 的取值：**每请求一个随机的 5 位小写 hex**。
 ///
 /// 真实算法仍未知（同账号内逐请求变化，18 组候选输入 × 6 种摘要均未命中），所以这只是个
@@ -2122,58 +2160,50 @@ pub(super) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
 /// （存在 CC 官方工具声明）仍然缺失。注入之后请求的工具组合是「CC 内建 + MCP 扩展」，
 /// 与真实 CC 接 MCP server 的形态一致（`cap/2.1.258-api/00006`：内建在前，`mcp__*` 在尾）。
 ///
-/// **为什么是 11 个而不是 4 个**：2.1.258（四族）、2.1.260（opus / fable）、2.1.270（sonnet）
-/// 的主线程抓包里没有一条只带四个工具——最少 13 个，其中所有样本共有的是 13 个：
-/// 下面这 11 个真工具，加上 `ToolSearch` 与 `DeferredToolPlaceholder` 那一对延迟加载机制。
-/// 只带 Bash/Edit/Read/Write 是一个官方不产生的组合，与「零个工具」一样是自证。
+/// **为什么是 14 个而不是 4 个**：2.1.277 四族主线程抓包（`cap/2.1.277/00023` / `00031` /
+/// `00046` / `00357`）每条都带 19 或 20 个工具，其中四族共有的内建工具 16 个：下面这 14 个
+/// 真工具，加上 `ToolSearch` 与 `DeferredToolPlaceholder` 那一对延迟加载机制；其余是用户
+/// 自己的 MCP 工具（`mcp__claude_ai_Claude_Docs__*`）与 opus / fable 独有的服务端工具
+/// `advisor`（`type: advisor_20260301`，没有 `input_schema`）。只带 Bash/Edit/Read/Write 是一个
+/// 官方不产生的组合，与「零个工具」一样是自证。
 /// 那一对**故意不注**：`ToolSearch` 被模型调起来时客户端拿到一个自己没声明的
-/// tool_use 且没法执行，而 `DeferredToolPlaceholder` 只是它的占位；两者都不是「工具」。
-/// opus 多出的 Artifact / SendFeedback / ShareOnboardingGuide 是环境相关的，fable 那条
-/// 抓包就没有，也不注。
+/// tool_use 且没法执行，而 `DeferredToolPlaceholder` 只是它的占位；两者都不是「工具」。第四块
+/// 模板里依赖它的那段指令也一并去掉了（[`config::CC_SYSTEM_REST`]）。`advisor` 是服务端在
+/// 模型之外再跑一个模型，要另计费、也改变行为，不替客户端拨这个开关。
 ///
-/// **顺序也是抓包的一部分**：按官方声明序 `Agent → AskUserQuestion → Bash → Edit →
-/// ListAgents → Read → ReportFindings → ScheduleWakeup → Skill → Workflow → Write`，
-/// 不是字母序（`Write` 官方排在 `DeferredToolPlaceholder` 之后、`Workflow` 之后）。
+/// **顺序也是抓包的一部分**：按官方声明序 `Agent → Artifact → AskUserQuestion → Bash → Edit →
+/// ListAgents → Read → ReportFindings → ScheduleWakeup → SendFeedback → ShareOnboardingGuide →
+/// Skill → Workflow → Write`（官方在 `Skill` 与 `Workflow` 之间还有 `ToolSearch`、`Workflow`
+/// 与 `Write` 之间还有 MCP 工具与占位），不是字母序。
 ///
-/// **`eager_input_streaming`**：opus / sonnet / haiku 的 OAuth 主线程每个工具都带
-/// `eager_input_streaming: true`（2.1.258 四族、2.1.260 opus、2.1.270 sonnet），fable 一个
-/// 都不带。资产原样保留，不另加也不剥。客户端改名后的 `mcp__luban__*` 带不带这个键
-/// **没有 OAuth 样本**（`2.1.258-api` 的 `mcp__ide__*` 不带，但那是 API-key 模式，内建也
-/// 全不带），这里不猜。
+/// **`eager_input_streaming`**：2.1.277 四族的 OAuth 主线程每个内建工具都带
+/// `eager_input_streaming: true`——fable 也带了（2.1.260 时一个都不带）。资产原样保留，
+/// 不另加也不剥。客户端改名后的 `mcp__luban__*` 带不带这个键**没有 OAuth 样本**
+/// （`2.1.258-api` 的 `mcp__ide__*` 不带，但那是 API-key 模式；2.1.277 订阅端的 MCP 工具在
+/// 延迟池里带 `eager_input_streaming: true` 加 `defer_loading: true`，与正文声明不是一回事），
+/// 这里不猜。
 ///
 /// **模型会不会调这些工具**：概率低。客户端的 system prompt 会指名自己的工具
 /// （被混淆成 `mcp__luban__*`），模型优先响应 system 的指令。万一调了，客户端收到一个
 /// 自己没声明的 tool_use，按协议返回错误 tool_result 即可，不影响会话继续。
 ///
-/// **同一版本里不同模型族的工具描述并不相同**：opus 与 fable 的 11 个工具 schema
-/// **无一相同**——除 `eager_input_streaming` 之外，opus 的 Bash 多了
-/// `Foreground sleep is blocked; use Monitor with an until-loop` 那句，Read 的换行说明
-/// 也换了写法。原先一份 2.1.258 的资产给所有族用，等于把上一版、别的族的措辞发出去。
-///
-/// **代价**：两份资产各约 29KB，每条模拟主线程请求都带，首轮进 prompt cache 之前按
-/// 输入 token 计费；同一会话后续轮次命中缓存。
-static CC_TOOLS_CORE_OPUS: std::sync::LazyLock<Vec<serde_json::Value>> =
+/// **代价**：资产约 63KB（Artifact 一条就 33KB），每条模拟主线程请求都带，首轮进 prompt cache
+/// 之前按输入 token 计费；同一会话后续轮次命中缓存。
+static CC_TOOLS_CORE: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("../assets/cc_tools_core_opus.json"))
-            .expect("cc_tools_core_opus.json must be a valid JSON array of tool objects")
+        serde_json::from_str(include_str!("../assets/cc_tools_core.json"))
+            .expect("cc_tools_core.json must be a valid JSON array of tool objects")
     });
 
-static CC_TOOLS_CORE_FABLE: std::sync::LazyLock<Vec<serde_json::Value>> =
-    std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("../assets/cc_tools_core_fable.json"))
-            .expect("cc_tools_core_fable.json must be a valid JSON array of tool objects")
-    });
-
-/// 按 profile 取注入用的工具声明。
+/// 注入用的工具声明（2.1.277，`cap/2.1.277/00023` 的 20 条里去掉 `ToolSearch` /
+/// `DeferredToolPlaceholder` 那一对、用户自己的 `mcp__*` 与服务端工具 `advisor` 之后的 14 条）。
 ///
-/// sonnet / haiku 主线程**没有 2.1.260 样本**（同 [`config::CC_PROFILES`] 里那两行外推的
-/// beta），退回 opus 那份：至少版本对得上——发一份 2.1.258 的措辞是「版本混用」，而这里
-/// 只是「同版本里族别可能不对」，后者更小。抓到样本后在这里加一行即可。
-pub(super) fn cc_tools_core(profile: &config::CcProfile) -> &'static [serde_json::Value] {
-    match profile.kind {
-        config::CcProfileKind::MainFable => &CC_TOOLS_CORE_FABLE,
-        _ => &CC_TOOLS_CORE_OPUS,
-    }
+/// 2.1.277 四族主线程的内建工具声明**逐字节相同**（`00023` fable ↔ `00031` sonnet ↔ `00046`
+/// haiku ↔ `00357` opus，含 `eager_input_streaming: true`），故只有一份；2.1.260 时 fable 那份
+/// 不带 eager、措辞也不同，要单独一份，现在不用了。`profile` 仍收着，将来某族再分家时不必
+/// 改调用点。
+pub(super) fn cc_tools_core(_profile: &config::CcProfile) -> &'static [serde_json::Value] {
+    &CC_TOOLS_CORE
 }
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
@@ -3369,8 +3399,9 @@ mod tests {
             .to_string()
             .into()
         };
+        // 2.1.277 四族主线程全带（fable 在 2.1.260 时不带，`cap/2.1.277/00023` 起也带了）。
         for (model, expect) in
-            [("claude-opus-5", true), ("claude-fable-5-1", false), ("claude-sonnet-5", true)]
+            [("claude-opus-5", true), ("claude-fable-5-1", true), ("claude-sonnet-5", true)]
         {
             let b = body(model);
             let sim = sim_for(std::str::from_utf8(&b).unwrap());
@@ -3400,13 +3431,9 @@ mod tests {
                 find("mcp__x__y").get("eager_input_streaming").is_none(),
                 "{model}: 来访自带的 mcp 不猜"
             );
-            // 注入的官方工具与资产一致。
+            // 注入的官方工具与资产一致：2.1.277 的资产四族都带。
             let bash = find("Bash");
-            assert_eq!(
-                bash.get("eager_input_streaming").is_some(),
-                model != "claude-fable-5-1",
-                "{model}: 注入的 Bash"
-            );
+            assert_eq!(bash["eager_input_streaming"], true, "{model}: 注入的 Bash");
         }
     }
 
@@ -3669,6 +3696,7 @@ mod tests {
             thinking_modified_retry: false,
             redacted_thinking_retry: false,
             simulate_cc: false,
+            simulate_full_system: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -4383,6 +4411,7 @@ mod tests {
                 thinking_modified_retry: false,
                 redacted_thinking_retry: false,
                 simulate_cc: false,
+                simulate_full_system: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,
@@ -5031,6 +5060,7 @@ mod tests {
             thinking_modified_retry: false,
             redacted_thinking_retry: false,
             simulate_cc: false,
+            simulate_full_system: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -5156,28 +5186,25 @@ mod tests {
         );
     }
 
-    /// 注入的工具声明**逐 profile 一份**，且是官方主线程恒带的 11 个真工具，不是四个。
+    /// 注入的工具声明是 2.1.277 官方主线程恒带的 14 个真工具，四族同一份，不是四个。
     ///
-    /// 依据：2.1.258 四族、2.1.260 opus / fable、2.1.270 sonnet 的主线程抓包没有一条只带
-    /// 四个工具，全部样本共有的 13 个去掉 `ToolSearch` + `DeferredToolPlaceholder` 那一对
-    /// 延迟加载机制就是这 11 个。`cap/2.1.260-2/00025`（opus）与 `cap/2.1.260/00018`
-    /// （fable）这 11 个的 schema 无一相同——opus 全带 `eager_input_streaming`、fable 全不带，
-    /// 此外 opus 的 Bash 多了 `Foreground sleep is blocked` 那句。
+    /// 依据：`cap/2.1.277` 四族主线程（`00023` fable / `00031` sonnet / `00046` haiku / `00357`
+    /// opus）的内建工具声明逐字节相同，去掉 `ToolSearch` + `DeferredToolPlaceholder` 那一对
+    /// 延迟加载机制、用户自己的 `mcp__*` 与 opus / fable 独有的服务端工具 `advisor` 就是这 14 个。
     #[test]
     fn core_tool_stubs_are_profile_specific() {
         let opus = crate::proxy::cc_tools_core(config::cc_profile(config::CcProfileKind::MainOpus));
-        let fable =
-            crate::proxy::cc_tools_core(config::cc_profile(config::CcProfileKind::MainFable));
         let names = |t: &[serde_json::Value]| -> Vec<String> {
             t.iter().map(|x| x["name"].as_str().unwrap_or("?").to_string()).collect()
         };
-        // **顺序也是抓包的一部分**：所有主线程抓包里这 11 个的相对次序都是官方声明序，
-        // 不是字母序（`Write` 排在 `Workflow` 之后）。资产按字母序或按手写顺序排都会得到
-        // 一个官方不产生的排列，而这种错不会有任何运行期症状。
+        // **顺序也是抓包的一部分**：这 14 个的相对次序是官方声明序，不是字母序（`Write` 排在
+        // `Workflow` 之后）。资产按字母序或按手写顺序排都会得到一个官方不产生的排列，而这种
+        // 错不会有任何运行期症状。
         assert_eq!(
             names(opus),
             [
                 "Agent",
+                "Artifact",
                 "AskUserQuestion",
                 "Bash",
                 "Edit",
@@ -5185,47 +5212,38 @@ mod tests {
                 "Read",
                 "ReportFindings",
                 "ScheduleWakeup",
+                "SendFeedback",
+                "ShareOnboardingGuide",
                 "Skill",
                 "Workflow",
                 "Write",
             ],
-            "官方主线程恒带的 11 个真工具与其次序"
+            "官方主线程恒带的 14 个真工具与其次序（cap/2.1.277/00023）"
         );
-        assert_eq!(names(fable), names(opus), "两族的工具集相同，差的是描述");
-        // 延迟加载那一对与环境相关的三个故意不注。
-        for absent in [
-            "ToolSearch",
-            "DeferredToolPlaceholder",
-            "Artifact",
-            "SendFeedback",
-            "ShareOnboardingGuide",
-        ] {
+        // 延迟加载那一对、服务端工具与 MCP 工具故意不注。
+        for absent in ["ToolSearch", "DeferredToolPlaceholder", "advisor"] {
             assert!(!names(opus).iter().any(|n| n == absent), "{absent} 不该注入");
         }
-        for (a, b) in opus.iter().zip(fable.iter()) {
-            assert_ne!(a, b, "{} 两族的 schema 不该相同", a["name"]);
+        assert!(!names(opus).iter().any(|n| n.starts_with("mcp__")), "用户的 MCP 工具不注");
+        // `eager_input_streaming` 原样保留：2.1.277 四族每个内建工具都带（fable 也带了）。
+        assert!(opus.iter().all(|t| t["eager_input_streaming"] == true), "全带");
+        assert!(opus.iter().all(|t| t.get("defer_loading").is_none()), "正文声明的都不是延迟池的");
+        assert!(opus.iter().all(|t| t.get("type").is_none()), "没有服务端工具");
+        // 四族同一份。
+        for kind in [
+            config::CcProfileKind::MainFable,
+            config::CcProfileKind::MainSonnet,
+            config::CcProfileKind::MainHaiku,
+        ] {
+            assert_eq!(crate::proxy::cc_tools_core(config::cc_profile(kind)), opus, "{kind:?}");
         }
-        // `eager_input_streaming` 原样保留：opus 每个都带（`cap/2.1.260-2/00025`），fable
-        // 一个都不带（`cap/2.1.260/00018`）。加了或剥了都会偏离抓包。
-        assert!(opus.iter().all(|t| t["eager_input_streaming"] == true), "opus 全带");
-        assert!(fable.iter().all(|t| t.get("eager_input_streaming").is_none()), "fable 全不带");
-        // opus 那份里那句 fable 没有的话，是这两份资产真的分开了的最短证据。
+        // 2.1.277 的 Bash 描述里有的那句，是资产真的换到了 2.1.277 的最短证据。
         let bash = opus.iter().find(|t| t["name"] == "Bash").unwrap();
         assert!(
-            bash["description"].as_str().unwrap().contains("Foreground `sleep` is blocked"),
-            "opus 的 Bash 描述取自 cap/2.1.260-2/00025"
+            bash["description"].as_str().unwrap().contains("Interactive flags"),
+            "Bash 描述取自 cap/2.1.277/00023: {}",
+            bash["description"]
         );
-        let fable_bash = fable.iter().find(|t| t["name"] == "Bash").unwrap();
-        assert!(!fable_bash["description"].as_str().unwrap().contains("Foreground `sleep`"));
-
-        // 没有 2.1.260 样本的两族退回 opus 那份（版本对得上优先于族别对得上）。
-        for kind in [config::CcProfileKind::MainSonnet, config::CcProfileKind::MainHaiku] {
-            assert_eq!(
-                crate::proxy::cc_tools_core(config::cc_profile(kind)),
-                opus,
-                "{kind:?} 退回 opus"
-            );
-        }
     }
 
     /// [`cc_tools_to_inject`] 是注入与流水共用的那一份判据：注进去的名单与流水拿去对
@@ -5354,15 +5372,15 @@ mod tests {
         });
         let planned = super::cc_tools_to_inject(&v, profile);
         assert!(!planned.contains(&"Read") && !planned.contains(&"Bash"), "{planned:?}");
-        assert_eq!(planned.len(), 9, "11 个里客户端已有 Read / Bash 两个");
+        assert_eq!(planned.len(), 12, "14 个里客户端已有 Read / Bash 两个");
         assert!(super::inject_cc_tools(&mut v, profile));
         let tools = v["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // 头部是完整的 11 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
+        // 头部是完整的 14 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
         // 工具紧随其后、相对次序不变。
         let all: Vec<&str> = official.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(&names[..11], all.as_slice());
-        assert_eq!(&names[11..], ["my_tool", "TaskCreate"]);
+        assert_eq!(&names[..14], all.as_slice());
+        assert_eq!(&names[14..], ["my_tool", "TaskCreate"]);
         let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
         assert_eq!(read, official_read, "参数表面一致的 Read 整条换成官方声明");
         let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
@@ -5371,8 +5389,8 @@ mod tests {
         assert!(names.contains(&"TaskCreate"), "老版本多出来的不删");
     }
 
-    /// 客户端把 11 个全声明了，但次序不是官方的、其中一条键序不同（内容全同）：出站仍要是
-    /// 按官方序排列的 11 条逐字节官方声明。`Value` 相等忽略键序，按它跳过替换会把客户端键序
+    /// 客户端把 14 个全声明了，但次序不是官方的、其中一条键序不同（内容全同）：出站仍要是
+    /// 按官方序排列的 14 条逐字节官方声明。`Value` 相等忽略键序，按它跳过替换会把客户端键序
     /// 原样发出去；只缺几条时把缺的插头部则会把次序排乱。
     #[test]
     fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
@@ -5403,11 +5421,11 @@ mod tests {
         assert!(super::inject_cc_tools(&mut v, profile), "次序与键序都要改");
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(
-            serde_json::to_string(&tools[..11]).unwrap(),
+            serde_json::to_string(&tools[..14]).unwrap(),
             expected,
-            "11 条逐字节等于资产、按资产序"
+            "14 条逐字节等于资产、按资产序"
         );
-        assert_eq!(tools[11]["name"], "my_tool");
+        assert_eq!(tools[14]["name"], "my_tool");
         // 已经是官方形态的再过一遍什么都不动。
         assert!(!super::inject_cc_tools(&mut v, profile));
     }
@@ -6235,7 +6253,7 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = crate::proxy::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 260)), "官方那串");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 277)), "官方那串");
         assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6359,6 +6377,7 @@ mod tests {
         // 只开流式化这一项，确保观察到的差异只来自它。
         let only_stream = store::ForwardFlags {
             simulate_cc: false,
+            simulate_full_system: false,
             spoof_identity: false,
             system_shape: false,
             billing_cch: false,

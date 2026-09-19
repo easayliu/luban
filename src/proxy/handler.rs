@@ -869,6 +869,7 @@ pub(super) async fn handle_inner(
                     tools = facts.as_ref().map_or(0, |f| f.tools),
                     max_tokens = facts.as_ref().and_then(|f| f.max_tokens).unwrap_or(-1),
                     base_bytes = s.base.map(str::len).unwrap_or(0),
+                    rest_bytes = s.rest.as_ref().map_or(0, String::len),
                     session_id = %s.session_id,
                     "identity path: SIMULATED — rebuilding this request into the official CC shape; reason names the first check it failed (not_cc_client / identity_malformed / not_cc_shaped / no_base_prompt / tools_not_cc)"
                 )

@@ -199,14 +199,15 @@ pub const CC_BETA_MESSAGE_THREADS: &str = "message-threads-2026-08-12";
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（cap/2.1.260）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（`cap/2.1.277`）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
 ///
 /// 动这里必须同时动 [`CC_VERSION_BASE`]（billing header 里的 `cc_version`）、
 /// [`KEEPALIVE_USER_AGENT`] 与 [`CC_BUILD_TIMES`]（遥测里的构建时间），还有
-/// [`CC_PROFILES`] 里那几串 beta：同一个客户端不会一边自称 2.1.260、一边报另一个版本的
-/// cc_version、构建时间或上一版的 beta 集合。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.260 (external, cli)";
+/// [`CC_PROFILES`] 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] / 工具资产：
+/// 同一个客户端不会一边自称 2.1.277、一边报另一个版本的 cc_version、构建时间、上一版的
+/// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.277 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -316,7 +317,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.260";
+pub const CC_VERSION_BASE: &str = "2.1.277";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -329,9 +330,9 @@ pub const CC_VERSION_BASE: &str = "2.1.260";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/2.1.270`（sonnet 主线程 `00017` / `00025`，UA `claude-cli/2.1.270`）。
+/// 依据：`cap/2.1.277`（四族主线程、子代理、标题生成、额度探测，UA `claude-cli/2.1.277`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.270";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.277";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -344,28 +345,46 @@ pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.270";
 /// 按 profile 注入，判据是 [`CcSystemShape::IdentityReporting`]。
 pub const CC_SYSTEM_REPORTING: &str = include_str!("assets/cc_system_reporting.txt");
 
-/// 模拟模式注入的官方系统提示词**基座**（opus-5 / fable-5-1，1214 字节）。
+/// 模拟模式注入的官方系统提示词**基座**（2.1.277，1588 字节，**四族同一份**）。
 ///
-/// 逐字节取自 `cap/2.1.258/00012`（opus-5 直连），与 `00013`（fable-5-1）、`00025`（opus-5）
-/// sha256 相同。与 2.1.251 那份（1156B）只差一行：`<system-reminder>` 那句换成了
-/// mid-conversation system turns 的说法。
-pub const CC_SYSTEM_BASE_OPUS: &str = include_str!("assets/cc_system_base_opus.txt");
-
-/// 模拟模式注入的官方系统提示词基座（sonnet-5，10520 字节）。
+/// 逐字节取自 `cap/2.1.277/00023`（fable-5-1 直连）的 `system[2]`，同目录 sonnet-5（`00031`）、
+/// haiku-4.5（`00046`）、opus-5（`00357`）的主线程 sha256 全部相同。2.1.258 / 2.1.260 时三族
+/// 各有各的基座（opus / fable 1214 字节，sonnet 10520，haiku 10622），2.1.277 收成了一份：
+/// 就是 2.1.258 那份 opus 短基座多了 `<pasted_content>` 那一行 `# Harness` 条目。
 ///
-/// 逐字节取自 `cap/2.1.258/00026`（sonnet-5 直连）。与 2.1.251 那份（10580B）同样只差
-/// `<system-reminder>` 那一行。
-pub const CC_SYSTEM_BASE_SONNET: &str = include_str!("assets/cc_system_base_sonnet.txt");
+/// 只给模拟路径用；透传路径拆块认的是 [`CC_SYSTEM_BASE_ANCHORS`]，不认基座正文。
+pub const CC_SYSTEM_BASE: &str = include_str!("assets/cc_system_base.txt");
 
-/// 模拟模式注入的官方系统提示词基座（haiku-4.5 / opus-4-6[1m]，10622 字节）。
+/// 模拟模式注入的官方 `system` **第四块**（基座之后的「其余」段）模板——2.1.277 主线程，
+/// **四族同一份**，11039 字节。
 ///
-/// 逐字节取自 `cap/2.1.258/00031`（haiku-4.5 直连）。2.1.251 时它与 opus-4-6 那份 sha256
-/// 相同，2.1.258 没有 opus-4-6 的样本，沿用这个映射。
-pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("assets/cc_system_base_haiku.txt");
+/// 取自 `cap/2.1.277/00023` 的 `system[3]`，`00026`（fable 续轮）、`00031` / `00043`（sonnet）、
+/// `00046` / `00050` / `00349`（haiku）、`00357`（opus）sha256 全部相同——含开头那段 Fable
+/// 自我介绍在内，官方给 opus / sonnet / haiku 会话发的也是这一份。会话内逐轮不变，末尾那行
+/// `<total_tokens>15000000 tokens left</total_tokens>` 每份都是这个数。
+///
+/// 与 2.1.260 那三版相比，`# Environment` 一节**不再写**工作目录、git、平台、shell、OS 版本、
+/// 模型名与知识截止，也没有 `# Scratchpad Directory` 一节；随机器变的只剩 `# Memory` 里那条
+/// 记忆目录，换成两个占位由 [`crate::proxy::render_system_rest`] 填：
+///
+/// | 占位 | 官方取值 | 填法 |
+/// |---|---|---|
+/// | `{{home}}` | 记忆目录的 `/Users/<user>` | 按账号 + 设备派生的假环境，见 `SimEnv` |
+/// | `{{cwd_slug}}` | 记忆目录的项目段，cwd 里 `/` 与 `_` 换成 `-`（`-Users-easayliu-Works-easay-opdash`） | 由派生的 cwd 算出 |
+///
+/// 另去掉了末尾 `EndConversation (deferred tool): … Load the full guidance via ToolSearch(…)`
+/// 那一段（233 字节）：模拟路径**不注** `ToolSearch` 与 `DeferredToolPlaceholder`
+/// （[`crate::proxy::cc_tools_core`] 说明了为什么），留着这段就是提示词让模型去调一个工具集里
+/// 没有的工具，提示词与工具集不成套。其余每个字节照抓包。
+///
+/// **为什么要这一块**：官方主线程的 `system` 是 `[billing, 身份, 基座, 其余]`，「其余」这块
+/// 一万字节上下、带末尾断点，上游对末块有内容级检测（见 `proxy::MAX_CLIENT_SYSTEM_CHARS`）。
+/// 此前模拟路径末块放的是客户端自己那段提示词，与官方形态差得最远的正是这一块。
+pub const CC_SYSTEM_REST: &str = include_str!("assets/cc_system_rest.txt");
 
-// ---------- 2.1.260 请求 profile ----------
+// ---------- 请求 profile（2.1.258 / 2.1.260 / 2.1.270 / 2.1.277 各一张表） ----------
 
-/// 一条官方 2.1.260 请求属于哪一类。
+/// 一条官方请求属于哪一类。
 ///
 /// **只按模型族分不够。** 同为 haiku-4.5，SDK 子代理（`cap/2.1.260/00020`）、无工具
 /// helper（`00024`）、会话标题生成（`cap/2.1.260-2/00058`）与额度探测（`00004`）四者的
@@ -373,14 +392,13 @@ pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("assets/cc_system_base_haiku
 /// profile 的键是「模型族 + 请求用途」，不是模型族。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcProfileKind {
-    /// 主线程 opus-5（`cap/2.1.260-2/00013`、`00025`、`00057`）。
+    /// 主线程 opus-5（`cap/2.1.277/00357`；2.1.260 见 `cap/2.1.260-2/00013`、`00025`、`00057`）。
     MainOpus,
-    /// 主线程 fable-5-1（`cap/2.1.260/00018`、`00021`、`00031`）。
+    /// 主线程 fable-5-1（`cap/2.1.277/00023`、`00026`；2.1.260 见 `cap/2.1.260/00018`）。
     MainFable,
-    /// 主线程 sonnet-5：**2.1.260 没有样本**，由 2.1.258 那份按已证规则外推，见
-    /// [`CC_PROFILES`] 的说明。
+    /// 主线程 sonnet-5（`cap/2.1.277/00031`；2.1.260 表里那行是由 2.1.258 外推的）。
     MainSonnet,
-    /// 主线程 haiku-4.5：同样**没有 2.1.260 样本**，外推而来。
+    /// 主线程 haiku-4.5（`cap/2.1.277/00046`；2.1.260 表里那行同样是外推的）。
     MainHaiku,
     /// agent-sdk 子代理 haiku（`cap/2.1.260/00020`、`00025`）：带工具、`cc_is_subagent`。
     SdkSubagentHaiku,
@@ -415,9 +433,14 @@ pub enum CcThinking {
 /// `system` 的固定前缀形态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcSystemShape {
-    /// `[billing, 身份句, 基座, 客户端]`——opus / sonnet / haiku 主线程。
+    /// `[billing, 身份句, 基座, 其余]`——2.1.277 起四族主线程都是这个形态（`cap/2.1.277`）。
+    /// 「其余」是官方第四块（[`CC_SYSTEM_REST`] 模板填出来的），客户端自己的 system 挪进首条
+    /// 用户消息；填不出第四块（认不出的模型族）或开关关着时末块退回客户端原文。
     Identity,
-    /// `[billing, 身份句, # Reporting outcomes, 基座, 客户端]`——fable 主线程。
+    /// `[billing, 身份句, # Reporting outcomes, 基座, 其余]`——**2.1.258 / 2.1.260 的** fable
+    /// 主线程。2.1.277 的 fable 已不带 reporting 块、与其余三族同为四块，2.1.277 表里没有一行用
+    /// 它；留着是给 [`CC_PROFILES_2_1_260`] 那行与透传路径拆 API-key 四块形态
+    /// （[`crate::proxy::align_system_shape`]）用。
     IdentityReporting,
     /// 没有 `system`——额度探测。
     None,
@@ -449,6 +472,15 @@ pub struct CcProfile {
     /// 这个 profile 的官方请求里，每个**非延迟**工具带不带 `eager_input_streaming: true`。
     /// 取值只写抓包证实过的，见 [`CcEagerTools`]。
     pub eager_tools: CcEagerTools,
+    /// 出站头 `x-claude-code-request-class` 的取值。2.1.277 起官方每条 `/v1/messages` 都带
+    /// （`cap/2.1.277`）：主线程与「猜下一句」是 `main`，SDK 子代理是 `subagent`，标题生成与
+    /// 额度探测是 `auxiliary`（无工具 helper 与安全分类没有 2.1.277 样本，按用途归入后两者）。
+    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]。
+    pub request_class: &'static str,
+    /// 顶层 `output_config.effort` 的取值：2.1.277 起 opus / fable / sonnet 主线程恒带
+    /// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`），haiku 主线程与全部辅助
+    /// 请求不带。`None` 即不补，见 [`crate::proxy::ensure_output_config`]。
+    pub effort: Option<&'static str>,
 }
 
 /// 官方请求里工具声明带不带 `eager_input_streaming: true`——按 profile（版本 × 模型 × 用途）
@@ -550,7 +582,204 @@ pub const CC_BODY_ORDER_CLASSIFIER: &[&str] =
 /// 额度探测的顶层键序（`cap/2.1.260-2/00004`、`00021`、`00047`）。
 pub const CC_BODY_ORDER_QUOTA: &[&str] = &["model", "max_tokens", "messages", "metadata"];
 
-/// 2.1.260 的 profile 全表。beta 串逐字取自抓包，去掉 `oauth` 与 `afk-mode`。
+/// 2.1.277 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.277 来访的
+/// beta 参照（[`cc_profile_at`]）。beta 串逐字取自 `cap/2.1.277`，去掉 `oauth` 与动态的 `afk-mode`。
+///
+/// | profile | 抓包 | 后缀 | system | tools | thinking | class |
+/// |---|---|---|---|---:|---|---|
+/// | `MainOpus` | `00357` | `d56` | 4 块 | 20 | adaptive+updates | main |
+/// | `MainFable` | `00023`、`00026` | `d56` | 4 块 | 20 | adaptive+updates | main |
+/// | `MainSonnet` | `00031` | `d56` | 4 块 | 19 | adaptive+updates | main |
+/// | `MainHaiku` | `00046` | `d56` | 4 块 | 19 | enabled+updates | main |
+/// | `SdkSubagentHaiku` | `00049` | `385` | 3 块 | 9 | enabled+updates | subagent |
+/// | `SessionTitleHaiku` | `00022` | `e18` | 3 块 | 0 | disabled | auxiliary |
+/// | `QuotaProbe` | `00005` | — | 无 | — | 无 | auxiliary |
+///
+/// 相对 2.1.260 这一版改了什么（四族主线程逐条核过）：
+///
+/// - **后缀四族统一 `d56`**，不再逐族一个值；子代理 `385`、标题生成 `e18`；
+/// - **fable 不再带 `# Reporting outcomes` 块**，四族都是 `[billing, 身份, 基座, 其余]` 四块，
+///   基座与其余段四族**同一份**（[`CC_SYSTEM_BASE`]、[`CC_SYSTEM_REST`]）；
+/// - billing header 多了 `cc_turn_origin=human`，紧跟 `cc_prompt_id`（有 `cc_prompt_id` 的轮次
+///   才有；工具续轮只有 `cc_prev_req`）；
+/// - 每条请求多一个 `x-claude-code-request-class` 头（[`CcProfile::request_class`]）；
+/// - opus / fable / sonnet 主线程顶层多 `output_config: {"effort":"high"}`（[`CcProfile::effort`]）；
+/// - beta：四族新增 `mid-conversation-system-clear-at` 与 `thinking-binding-controls`，opus / fable
+///   另有 `mid-conversation-tool-changes`；`server-side-fallback` 四族都不发了；opus / sonnet /
+///   haiku 队尾是 `message-threads`（fable 不带）；haiku 主线程与子代理的 `claude-code` 只在
+///   会话首轮（`thread: create`）出现，续轮不带——取首轮那份；
+/// - 主线程工具 20 / 19 个：内建 14 个（[`crate::proxy::cc_tools_core`] 注入的那份）加
+///   `ToolSearch` / `DeferredToolPlaceholder` 那一对延迟机制、用户自己的 MCP 工具，以及 opus /
+///   fable 独有的服务端工具 `advisor`（`type: advisor_20260301`，模拟不注）；内建工具全带
+///   `eager_input_streaming: true`，fable 也带了（2.1.260 时不带）；
+/// - 会话续轮走 **message threads**：`thread: {type: continue, previous_message_id}`，只发新增
+///   消息，`system` 只剩 billing header 一块、不带 `tools`（`00035`、`00051` 等 30 余条）。
+///   模拟路径每轮仍发完整上下文、不写 `thread`；透传路径对这种续轮整条放行，见
+///   [`crate::proxy::is_thread_continuation`]。
+///
+/// 无工具 helper 与安全分类在 2.1.277 里没有样本，不编行：[`cc_profile`] 对这两个 kind 落回
+/// [`CC_PROFILES_2_1_260`]。
+pub const CC_PROFILES: &[CcProfile] = &[
+    CcProfile {
+        kind: CcProfileKind::MainOpus,
+        version: "2.1.277",
+        // `cap/2.1.277/00357`。
+        beta: "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+               thinking-token-count-2026-05-13,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+               mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+               advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+               effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+               thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+               cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+        billing_suffix: "d56",
+        subagent: false,
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::AdaptiveUpdates,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+        eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: Some("high"),
+    },
+    CcProfile {
+        kind: CcProfileKind::MainFable,
+        version: "2.1.277",
+        // `cap/2.1.277/00023`、`00026`（首轮与续轮逐字相同）。仍用 `per-turn-control`，且是四族里
+        // 唯一不带 `message-threads` 的。
+        beta: "claude-code-20250219,interleaved-thinking-2025-05-14,\
+               thinking-token-count-2026-05-13,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+               per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+               advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+               mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+               fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+               thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+               cache-diagnosis-2026-04-07",
+        billing_suffix: "d56",
+        subagent: false,
+        // 2.1.277 的 fable 不再单独带 reporting 块（`00023` 四块）。
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::AdaptiveUpdates,
+        // `00023` / `00026` 都**没有** `fallbacks` 字段，`server-side-fallback` beta 四族也都不发了
+        // ——2.1.277 的官方形态里没有这一项。这里仍留着 2.1.260 那份字面量
+        // （`cap/2.1.260/00018`），只给 `fable_refusal_fallback` 开关（默认关）用：用户主动要
+        // 「fable 拒答时服务端改用 opus-5 重跑」时才写进体里并在头上补 beta，见
+        // [`crate::proxy::refusal_fallbacks_for`]；开关关着一个字节都不发，与官方一致。
+        fallbacks: Some(r#"[{"model":"claude-opus-5"}]"#),
+        body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+        // `00023` 内建 15 个全带（2.1.260 时 fable 不带）。
+        eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: Some("high"),
+    },
+    CcProfile {
+        kind: CcProfileKind::MainSonnet,
+        version: "2.1.277",
+        // `cap/2.1.277/00031`（会话首轮，`thread: create`）。
+        beta: "claude-code-20250219,interleaved-thinking-2025-05-14,\
+               thinking-token-count-2026-05-13,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+               advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+               mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+               fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+               thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+               cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+        billing_suffix: "d56",
+        subagent: false,
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::AdaptiveUpdates,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+        eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: Some("high"),
+    },
+    CcProfile {
+        kind: CcProfileKind::MainHaiku,
+        version: "2.1.277",
+        // `cap/2.1.277/00046`（会话首轮）。haiku 不发 `mid-conversation-*` / `effort`，
+        // `claude-code` 仍在第 5 位；续轮（`00050`、`00349`）连 `claude-code` 都不带。
+        beta: "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+               context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+               claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+               fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+               thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+               cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+        billing_suffix: "d56",
+        subagent: false,
+        system: CcSystemShape::Identity,
+        // `{"budget_tokens":31999,"type":"enabled","display":"updates"}`，`max_tokens` 32000。
+        thinking: CcThinking::EnabledUpdates,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+        eager_tools: CcEagerTools::On,
+        request_class: "main",
+        // haiku 主线程没有 `output_config`。
+        effort: None,
+    },
+    CcProfile {
+        kind: CcProfileKind::SdkSubagentHaiku,
+        version: "2.1.277",
+        // `cap/2.1.277/00049`（子代理首轮，`thread: create`）：相对主线程 haiku 少
+        // `fallback-credit` 与 `extended-cache-ttl`，多不了什么；比 2.1.260 的子代理多了
+        // `advisor-tool` / `advanced-tool-use` / `thinking-binding-controls` / `message-threads`。
+        beta: "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+               context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+               claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+               thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+               cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+        billing_suffix: "385",
+        subagent: true,
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::EnabledUpdates,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
+        // `00049` 的 8 个真工具全带。
+        eager_tools: CcEagerTools::On,
+        request_class: "subagent",
+        effort: None,
+    },
+    CcProfile {
+        kind: CcProfileKind::SessionTitleHaiku,
+        version: "2.1.277",
+        // `cap/2.1.277/00022`：相对 2.1.260 去掉了 `fallback-credit`。
+        beta: "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+               thinking-token-count-2026-05-13,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+               structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        billing_suffix: "e18",
+        subagent: false,
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::Disabled,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_MAIN,
+        eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
+    },
+    CcProfile {
+        kind: CcProfileKind::QuotaProbe,
+        version: "2.1.277",
+        // `cap/2.1.277/00005`，与 2.1.260 / 2.1.270 逐字相同。
+        beta: "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+               thinking-token-count-2026-05-13,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05",
+        billing_suffix: "",
+        subagent: false,
+        system: CcSystemShape::None,
+        thinking: CcThinking::Absent,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_QUOTA,
+        eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
+    },
+];
+
+/// 2.1.260 的 profile 全表。beta 串逐字取自抓包，去掉 `oauth` 与 `afk-mode`。现在只做两件事：
+/// 2.1.260 ~ 2.1.276 来访的 beta 参照（[`cc_profile_at`]），以及 2.1.277 表里没编的 kind
+/// （无工具 helper、安全分类）的兜底（[`cc_profile`]）。
 ///
 /// | profile | 抓包 | 后缀 | system | tools | thinking |
 /// |---|---|---|---|---:|---|
@@ -577,7 +806,7 @@ pub const CC_BODY_ORDER_QUOTA: &[&str] = &["model", "max_tokens", "messages", "m
 /// 时发）。sonnet/haiku 是跟着 opus 一起不发了，还是像 fable 那样留着换了日期，抓包答不
 /// 上。这里取后者——它们在 2.1.258 自己就发这一项，「留着换日期」比「整项消失」离各自的
 /// 上一版更近。抓到样本前这两行都不能算已证。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_260: &[CcProfile] = &[
     CcProfile {
         kind: CcProfileKind::MainOpus,
         version: "2.1.260",
@@ -598,6 +827,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // `cap/2.1.260-2/00013` 等 7 条全带。
         eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainFable,
@@ -623,6 +854,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // `cap/2.1.260/00018` 等 3 条全不带。
         eager_tools: CcEagerTools::Off,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainSonnet,
@@ -646,6 +879,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // 没有样本；模拟路径跟随 opus 那份资产。
         eager_tools: CcEagerTools::Unknown,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainHaiku,
@@ -666,6 +901,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // 没有样本；模拟路径跟随 opus 那份资产。
         eager_tools: CcEagerTools::Unknown,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::SdkSubagentHaiku,
@@ -684,6 +921,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // `cap/2.1.260/00020` 等 4 条全不带。
         eager_tools: CcEagerTools::Off,
+        request_class: "subagent",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::HelperSubagentHaiku,
@@ -700,6 +939,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
         eager_tools: CcEagerTools::Unknown,
+        request_class: "subagent",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::SessionTitleHaiku,
@@ -718,6 +959,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
         eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::SecurityClassifierSonnet,
@@ -736,6 +979,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_CLASSIFIER,
         eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::QuotaProbe,
@@ -752,6 +997,8 @@ pub const CC_PROFILES: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_QUOTA,
         eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
     },
 ];
 
@@ -789,6 +1036,8 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         body_key_order: CC_BODY_ORDER_MAIN,
         // 2.1.258 四族 OAuth 主线程全带（`cap/2.1.258/00012` / `00013` / `00026` / `00031`）。
         eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainFable,
@@ -809,6 +1058,8 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         fallbacks: Some(r#""default""#),
         body_key_order: CC_BODY_ORDER_MAIN,
         eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainSonnet,
@@ -828,6 +1079,8 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
         eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: None,
     },
     CcProfile {
         kind: CcProfileKind::MainHaiku,
@@ -846,13 +1099,15 @@ pub const CC_PROFILES_2_1_258: &[CcProfile] = &[
         fallbacks: None,
         body_key_order: CC_BODY_ORDER_MAIN,
         eager_tools: CcEagerTools::On,
+        request_class: "main",
+        effort: None,
     },
 ];
 
 /// 2.1.270 的 profile，**只有抓到样本的那一行**：主线程 sonnet-5（`cap/2.1.270/00017`、
 /// `00025`，同一会话的首轮与续轮，beta 串逐字相同）。
 ///
-/// 相对 [`CC_PROFILES`] 里那行外推的 2.1.260 sonnet：
+/// 相对 [`CC_PROFILES_2_1_260`] 里那行外推的 2.1.260 sonnet：
 /// - **整项不发** `server-side-fallback` 与 `fallback-credit`——2.1.258 起四族都带的两项，到
 ///   这一版的 sonnet 主线程一个都没有了；
 /// - 队尾新增 [`CC_BETA_MESSAGE_THREADS`]，配 body 顶层的 `thread`（[`CC_BODY_ORDER_MAIN_2_1_270`]）；
@@ -888,12 +1143,35 @@ pub const CC_PROFILES_2_1_270: &[CcProfile] = &[CcProfile {
     body_key_order: CC_BODY_ORDER_MAIN_2_1_270,
     // `cap/2.1.270/00017` / `00025` 全带。
     eager_tools: CcEagerTools::On,
+    request_class: "main",
+    effort: None,
 }];
 
-/// 按 kind 取 **2.1.260** 的 profile。表是常量，查不到即编译期就漏写了一行，故直接兜底到
-/// `MainOpus` 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
+/// 按 kind 取**当前模拟版本**（2.1.277，[`CC_PROFILES`]）的 profile；那张表没编的 kind
+/// （无工具 helper、安全分类，2.1.277 没有样本）落回 [`CC_PROFILES_2_1_260`]。表是常量，
+/// 两张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus` 而不是返回 `Option`——调用点
+/// 没有「没有 profile」这种状态可处理。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
-    CC_PROFILES.iter().find(|p| p.kind == kind).unwrap_or(&CC_PROFILES[0])
+    CC_PROFILES
+        .iter()
+        .chain(CC_PROFILES_2_1_260)
+        .find(|p| p.kind == kind)
+        .unwrap_or(&CC_PROFILES[0])
+}
+
+/// 某 kind 在**恰好**这一版（形如 `2.1.277`）上的 profile 行；没有就 `None`。给
+/// [`crate::proxy::CcRequestKind::billing_suffix_at`] 用：真 CC 来访缺 billing header 时补的
+/// 后缀要按它**自报的**版本取那一版定死的值，取错一版就是把另一版的后缀写进这条请求。
+pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static CcProfile> {
+    cc_profile_tables()
+        .iter()
+        .flat_map(|t| t.iter())
+        .find(|p| p.kind == kind && p.version == version)
+}
+
+/// 四张 profile 表，按版本从旧到新。
+fn cc_profile_tables() -> [&'static [CcProfile]; 4] {
+    [CC_PROFILES_2_1_258, CC_PROFILES_2_1_260, CC_PROFILES_2_1_270, CC_PROFILES]
 }
 
 /// 按 kind **与来访自报的版本**取 profile。
@@ -913,12 +1191,13 @@ pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
 /// `merged_beta_is_idempotent_on_2_1_270_sonnet`。
 pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &'static CcProfile {
     let find = |table: &'static [CcProfile]| table.iter().find(|p| p.kind == kind);
+    // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
+    let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 270) => {
-            find(CC_PROFILES_2_1_270).unwrap_or_else(|| cc_profile(kind))
-        }
-        Some(v) if v >= (2, 1, 260) => cc_profile(kind),
-        _ => find(CC_PROFILES_2_1_258).unwrap_or_else(|| cc_profile(kind)),
+        Some(v) if v >= (2, 1, 277) => find(CC_PROFILES).unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 270) => find(CC_PROFILES_2_1_270).unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 260) => at_260(),
+        _ => find(CC_PROFILES_2_1_258).unwrap_or_else(at_260),
     }
 }
 
@@ -939,12 +1218,12 @@ pub mod cc_2_1_260_missing_samples {}
 ///
 /// 不走 [`cc_profile_at`]：那条会把 2.1.270 的 opus 落到 2.1.260 的行上，beta 参照需要这种
 /// 兜底，eager 的证据不需要——见 [`CcEagerTools`] 的说明。读不出版本同样 Unknown。
+/// 2.1.277 四族主线程与子代理都是 On（`cap/2.1.277` 每条内建工具都带）。
 pub fn cc_eager_tools_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> CcEagerTools {
     let Some(version) = version else { return CcEagerTools::Unknown };
-    CC_PROFILES_2_1_258
+    cc_profile_tables()
         .iter()
-        .chain(CC_PROFILES)
-        .chain(CC_PROFILES_2_1_270)
+        .flat_map(|t| t.iter())
         .find(|p| p.kind == kind && crate::proxy::parse_version(p.version) == Some(version))
         .map_or(CcEagerTools::Unknown, |p| p.eager_tools)
 }
@@ -960,6 +1239,20 @@ pub fn cc_eager_tools_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) 
 /// 3. 子代理 / helper / 安全分类——非主线程豁免让它们照旧只补 `oauth`，但各自的官方串有没有
 ///    变（比如也长出 `message-threads`）没有证据。
 pub mod cc_2_1_270_missing_samples {}
+
+/// **2.1.277 还缺的抓包**（`cap/2.1.277` 有四族主线程、SDK 子代理、标题生成、额度探测，以及
+/// 三十多条 message-threads 续轮）。
+///
+/// 1. **API-key 端**任何一族——不知道 API-key 端的 2.1.277 发不发 `mid-conversation-system-clear-at`
+///    / `thinking-binding-controls` / `message-threads`、发不发 `cc_turn_origin`、走不走 thread
+///    续轮，[`crate::proxy::merge_beta`] 因此对 2.1.277 只沿用 2.1.258 那五项的补法，参照串换成
+///    [`CC_PROFILES`]；`cc_turn_origin` 只在模拟路径写。
+/// 2. 无工具 helper 与安全分类——没有 2.1.277 样本，[`cc_profile`] 落回 2.1.260 那两行。
+/// 3. 2.1.277 的子代理 beta 带 `advisor-tool` / `advanced-tool-use`，
+///    [`crate::proxy::is_official_non_main_beta`] 那条「有 display-updates 却没有主线程标记」的
+///    子代理判据认不出它，一条 API-key 端的 2.1.277 子代理会被当主线程补齐——补进去的是
+///    `fallback-credit` 与 `extended-cache-ttl`。抓到 API-key 端子代理样本前不改判据。
+pub mod cc_2_1_277_missing_samples {}
 
 /// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/2.1.258/00012`（opus-5 直连），
 /// 与 2.1.251 的 `00019` 逐字相同（Stainless SDK 0.112.1、node v26.3.0 都没变）。
@@ -1029,6 +1322,14 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     "anthropic-dangerous-direct-browser-access",
     "anthropic-version",
     "x-app",
+    // 2.1.277 起的四个 `x-claude-code-*` 头（`cap/2.1.277`）：子代理带 `agent-id` / `agent-type`
+    // （`00049`），工具续轮带 `prev-tool-durations`（`00026`），每条都带 `request-class`；四个都
+    // 落在 `x-app` 与 `x-client-request-id` 之间、按这个先后。模拟路径只写 `request-class`
+    // （[`CcProfile::request_class`]），其余三个是真 CC 来访自己带的，列在这里是为了归位。
+    "x-claude-code-agent-id",
+    "x-claude-code-agent-type",
+    "x-claude-code-prev-tool-durations",
+    "x-claude-code-request-class",
     "x-client-request-id",
     // 以下四个由 HTTP 客户端自己追加，官方线序里它们在队尾，不是字母序里的位置。
     "Connection",
@@ -1121,7 +1422,7 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.260";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.277";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。取自
@@ -1551,6 +1852,8 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     ("2.1.258", "2026-09-01T21:54:40Z"),
     // `cap/2.1.260-2/00016` 的 event_logging 批次（`env.build_time`）。
     ("2.1.260", "2026-09-03T19:41:35Z"),
+    // `cap/2.1.277/00028` 的 event_logging 批次（`env.build_time`，`env.version_base` 同为 2.1.277）。
+    ("2.1.277", "2026-09-18T15:34:36Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。
@@ -1671,7 +1974,7 @@ mod tests {
         let v = |s: &str| crate::proxy::parse_version(s).unwrap();
         let latest = v(CC_LATEST_KNOWN_RELEASE);
         assert!(latest >= v(CC_VERSION_BASE), "低于模拟版本 {CC_VERSION_BASE}");
-        for p in CC_PROFILES.iter().chain(CC_PROFILES_2_1_258).chain(CC_PROFILES_2_1_270) {
+        for p in cc_profile_tables().iter().flat_map(|t| t.iter()) {
             assert!(latest >= v(p.version), "{:?} 的 {} 表选不中", p.kind, p.version);
         }
     }
@@ -1697,18 +2000,49 @@ mod tests {
             "外推行记的就是 Unknown"
         );
         assert_eq!(cc_eager_tools_at(MainOpus, None), Unknown);
+        // 2.1.277 四族主线程与子代理全 On，fable 也是（2.1.260 时 Off）。
+        for kind in [MainOpus, MainFable, MainSonnet, MainHaiku, SdkSubagentHaiku] {
+            assert_eq!(cc_eager_tools_at(kind, Some((2, 1, 277))), On, "{kind:?}");
+        }
+        assert_eq!(cc_eager_tools_at(MainFable, Some((2, 1, 276))), Unknown);
         // 对照：beta 参照会落回最近一版，这里不会。
         assert_eq!(cc_profile_at(MainOpus, Some((2, 1, 270))).eager_tools, On);
     }
 
-    /// [`cc_profile_at`] 的三档：<2.1.260 与读不出版本取 2.1.258 表；2.1.260 ~ 2.1.269 取
-    /// 2.1.260 表；≥2.1.270 先查 2.1.270 表，**只有 sonnet 有行**，其余 kind 落回 2.1.260 表
-    /// （没有样本不外推）。
+    /// [`cc_profile_at`] 的四档：<2.1.260 与读不出版本取 2.1.258 表；2.1.260 ~ 2.1.269 取
+    /// 2.1.260 表；2.1.270 ~ 2.1.276 先查 2.1.270 表，**只有 sonnet 有行**；≥2.1.277 查 2.1.277
+    /// 表，helper 与安全分类没行。查不到的 kind 一律落回 2.1.260 表（没有样本不外推）。
     #[test]
     fn cc_profile_at_picks_the_newest_observed_table_per_kind() {
         use CcProfileKind::*;
+        for kind in [
+            MainOpus,
+            MainFable,
+            MainSonnet,
+            MainHaiku,
+            SdkSubagentHaiku,
+            SessionTitleHaiku,
+            QuotaProbe,
+        ] {
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 277))).version, "2.1.277", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.277", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.277", "模拟路径恒用 2.1.277 表: {kind:?}");
+        }
+        for kind in [HelperSubagentHaiku, SecurityClassifierSonnet] {
+            assert_eq!(
+                cc_profile_at(kind, Some((2, 1, 277))).version,
+                "2.1.260",
+                "{kind:?} 没有 2.1.277 样本"
+            );
+            assert_eq!(cc_profile(kind).version, "2.1.260", "{kind:?}");
+        }
+        assert_eq!(cc_profile_exact(MainOpus, "2.1.277").map(|p| p.billing_suffix), Some("d56"));
+        assert_eq!(cc_profile_exact(MainOpus, "2.1.260").map(|p| p.billing_suffix), Some("222"));
+        assert_eq!(cc_profile_exact(MainSonnet, "2.1.270").map(|p| p.billing_suffix), Some("100"));
+        assert!(cc_profile_exact(MainOpus, "2.1.270").is_none(), "那一版只有 sonnet");
+        assert!(cc_profile_exact(MainOpus, "2.1.276").is_none());
         assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 270))).version, "2.1.270");
-        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 300))).version, "2.1.270");
+        assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 276))).version, "2.1.270");
         assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 269))).version, "2.1.260");
         assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 260))).version, "2.1.260");
         assert_eq!(cc_profile_at(MainSonnet, Some((2, 1, 259))).version, "2.1.258");

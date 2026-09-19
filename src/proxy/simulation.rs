@@ -54,6 +54,12 @@ pub(super) struct Simulation {
     /// 进日志与流水的 `sim_reason` 列：光一个「模拟路径」标签看不出是 UA 不可信、身份写错、
     /// 还是形态不完整，排查官方客户端为何被接管时这是唯一线索。
     pub(super) reason: SimulationReason,
+    /// 官方 `system` **第四块**（基座之后的「其余」段）填好占位后的正文，见
+    /// [`render_system_rest`]；`None` 即不补——开关 `simulate_full_system` 关着、模型族认
+    /// 不出来（没有模板或没有那行模型名，[`cc_system_rest`]）、或这个 profile 本来就不带
+    /// `system`。有它时客户端自己的 system 挪进首条用户消息（[`stash_client_system`]），
+    /// `system` 块数与官方逐块相同；没有它时末块退回客户端原文，即此前的形态。
+    pub(super) rest: Option<String>,
 }
 
 /// 一条请求被模拟路径接管的原因：[`simulates_cc`] 要求 UA 可信、身份合法、形态完整三样
@@ -152,9 +158,15 @@ impl Simulation {
             crate::telemetry::last_is_new_prompt_body(v),
             profile.has_billing_header(),
         );
+        // 第四块随会话 id 与账号 + 设备派生的假环境一起填；额度探测那种官方就不发 `system`
+        // 的 profile 不填（[`simulate_system`] 对它一个字节都不加，填了也白填）。
+        let rest = (flags.simulate_full_system && profile.system != config::CcSystemShape::None)
+            .then(|| cc_system_rest(model))
+            .flatten()
+            .map(|template| render_system_rest(template, &sim_env_for(cred, device_fp)));
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
-        Some(Self { base: cc_system_base(model), profile, session_id, link, reason })
+        Some(Self { base: cc_system_base(model), profile, session_id, link, reason, rest })
     }
 }
 
@@ -247,6 +259,15 @@ pub(super) fn simulation_reason(
         return Some(SimulationReason::IdentityMalformed);
     }
     if is_quota_probe_shaped(v) {
+        return None;
+    }
+    // 2.1.277 起的 message-threads **续轮**（[`is_official_thread_continuation`]，六项逐项对）：
+    // 只发新增消息，`system` 只剩 billing header 一块、不带 `tools`，按下面的基座判据会落到
+    // `no_base_prompt`、被重建成一条带基座与工具的完整主线程请求——而上游那边这条线程已经有了
+    // 完整上下文，重建出来的既不是官方形态，也会把 `thread.previous_message_id` 指着的那条线程
+    // 接坏。UA 可信、身份合法到这里已经判过，整条放行透传。只抄了 `thread` 两个字段的过不了
+    // 那六项，照旧按去掉基座的第三方走模拟。
+    if is_official_thread_continuation(v, &inbound_beta_list(headers)) {
         return None;
     }
     // 官方 WebSearch 子调用（[`is_official_web_search_request`]）：没有基座、可能连 billing
@@ -438,26 +459,167 @@ fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 按模型族选官方基座。三族各有各的基座（`cap/2.1.258` 五份对话抓包验证）：
-///
-/// | 模型 | 基座 | 大小 | 来源 |
-/// |---|---|---|---|
-/// | opus-5 / fable-5-1 | [`config::CC_SYSTEM_BASE_OPUS`] | 1214B | 00012/00013/00025 |
-/// | sonnet-5 | [`config::CC_SYSTEM_BASE_SONNET`] | 10520B | 00026 |
-/// | haiku-4.5 / opus-4-6[1m] | [`config::CC_SYSTEM_BASE_HAIKU`] | 10622B | 00031（opus-4-6 沿用 2.1.251 的映射） |
-///
-/// 认不出的模型返回 `None`，只注入身份句。
-pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
+/// 这个模型名是不是 Claude Code 认识的四族（opus / fable / sonnet / haiku）之一。2.1.277 的
+/// 基座与第四块四族**同一份**（[`config::CC_SYSTEM_BASE`]、[`config::CC_SYSTEM_REST`]），故
+/// 只需判「是不是这四族」；2.1.258 / 2.1.260 时三族各有各的基座，那张映射已经不需要了。
+fn is_claude_family(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus-5") || m.contains("fable") {
-        Some(config::CC_SYSTEM_BASE_OPUS)
-    } else if m.contains("sonnet") {
-        Some(config::CC_SYSTEM_BASE_SONNET)
-    } else if m.contains("haiku") || m.contains("opus") {
-        Some(config::CC_SYSTEM_BASE_HAIKU)
-    } else {
-        None
+    ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f))
+}
+
+/// 官方基座（2.1.277 四族同一份）；认不出的模型返回 `None`，只注入身份句——基座是逐字节从
+/// 抓包取的，给一个 `gpt-4o` 补 Claude Code 的基座比不补更糟。
+pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
+    is_claude_family(model).then_some(config::CC_SYSTEM_BASE)
+}
+
+/// 官方第四块里 `You are powered by the model named {name}. The exact model ID is {id}.` 与
+/// 官方第四块的模板（2.1.277 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
+/// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
+/// 知识截止，2.1.277 的第四块不再写这些，只剩记忆目录一处随机器变。
+pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
+    is_claude_family(model).then_some(config::CC_SYSTEM_REST)
+}
+
+/// 这条是不是 2.1.277 起 message-threads 的**官方续轮**（`cap/2.1.277/00035`、`00037`、`00040`、
+/// `00048`、`00051` 等 30 余条，主线程与子代理都有）。官方续轮只发新增消息，`system` 只剩
+/// billing header 一块、不带 `tools`——形态上像「抄了 billing header 却没基座」的第三方，
+/// [`simulation_reason`] 得在基座判据之前放它，[`probe_signature`] 那条「有 system、没 tools、
+/// 一条消息」也得放它。
+///
+/// 正因为它放的是一条**不完整**的请求，判据不能只看 `thread` 两个字段——那两个字段谁都写得
+/// 出来，写上就绕过了基座与工具两道形态检查。这里按抓包逐项对，缺一不算：
+///
+/// 1. `thread.type == "continue"`，`thread.previous_message_id` 是 `msg_` 开头的非空串；
+/// 2. `diagnostics.previous_message_id` 与它**逐字相同**（30 余条无一例外——两处写的是上游回的
+///    同一个 message id）；
+/// 3. `system` 恰好一块，且那一块只有 `type: text` 与 `text` 两个键、正文是**单行**的 billing
+///    header——不带断点，也不许在换行后面藏一段提示词；
+/// 4. 没有 `tools` 键（不是空数组，是整个键都没有）；
+/// 5. 来访 `anthropic-beta` 带 [`config::CC_BETA_MESSAGE_THREADS`]（续轮是这项 beta 的能力，
+///    没声明它却发 `thread` 是官方不产生的组合）；
+/// 6. `messages` 非空。
+///
+/// 第三方要冒充得把这六项全抄对，而抄全了它就**是**一条续轮——透传出去与官方无异，且上游
+/// 会按 `previous_message_id` 校验线程，接不上的自然被拒。`thread.type == "create"` 的首轮是
+/// 完整请求，不在此列，照常过基座与工具判据。
+pub(super) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[String]) -> bool {
+    let Some(thread) = v.get("thread") else { return false };
+    if thread.get("type").and_then(|t| t.as_str()) != Some("continue") {
+        return false;
     }
+    let Some(prev) = thread.get("previous_message_id").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    if !prev.starts_with("msg_") || prev.len() <= "msg_".len() {
+        return false;
+    }
+    if v.get("diagnostics").and_then(|d| d.get("previous_message_id")).and_then(|m| m.as_str())
+        != Some(prev)
+    {
+        return false;
+    }
+    let Some(sys) = v.get("system").and_then(|s| s.as_array()) else { return false };
+    let [only] = sys.as_slice() else { return false };
+    // 那一块官方只有 `type` / `text` 两个键（没有 `cache_control`，也没有别的），`text` 是单行的
+    // billing header——多一个键、多一个换行接一段提示词，就是把一段 system 藏进了 billing 块。
+    let Some(blk) = only.as_object() else { return false };
+    if blk.len() != 2 || blk.get("type").and_then(|t| t.as_str()) != Some("text") {
+        return false;
+    }
+    if !blk.get("text").and_then(|t| t.as_str()).is_some_and(|t| {
+        t.starts_with("x-anthropic-billing-header:") && !t.contains('\n') && !t.contains('\r')
+    }) {
+        return false;
+    }
+    if v.get("tools").is_some() {
+        return false;
+    }
+    if v.get("messages").and_then(|m| m.as_array()).is_none_or(|m| m.is_empty()) {
+        return false;
+    }
+    has_beta(beta, config::CC_BETA_MESSAGE_THREADS)
+}
+
+/// 第四块里那台「机器」的环境：家目录与工作目录。按账号 + 设备派生，见 [`sim_env_for`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SimEnv {
+    /// `/Users/<user>`。
+    pub(super) home: String,
+    /// `/Users/<user>/<parent>/<project>`——那台机器的工作目录。2.1.277 的第四块不再直接写它，
+    /// 只在记忆目录的项目段里以 [`Self::cwd_slug`] 的形态出现。
+    pub(super) cwd: String,
+}
+
+impl SimEnv {
+    /// 官方把 cwd 里的 `/` 与 `_` 换成 `-` 作为项目段（`/Users/easayliu/Works/easay/opdash`
+    /// → `-Users-easayliu-Works-easay-opdash`，`cap/2.1.277/00023`；`_` 换 `-` 见
+    /// `cap/2.1.260-2/00013` 的 `proxy_captures/20260904_170955`），记忆目录用它。
+    pub(super) fn cwd_slug(&self) -> String {
+        self.cwd.replace(['/', '_'], "-")
+    }
+}
+
+/// 派生第四块里的假环境：`sha256("luban-env" ‖ account_uuid ‖ 设备指纹)` 取三个字节，分别在
+/// 用户名、上级目录、项目名三张小表里选一个。同一账号同一设备恒定（真实机器的 cwd 在会话
+/// 之间也大多不变），换账号或换设备即另一台机器的另一个目录。
+///
+/// **这是凭空造的**：抓包机的 `/private/tmp/proxy_captures/…` 与 `/Users/easayliu` 不能照抄
+/// ——那是全网同一个路径，与曾经写死 `cch=00000` 是同一种自证。表里的词都是常见的开发目录
+/// 名，代价是全网只有 24 × 8 × 24 种组合、且每台「机器」永远只在一个目录里干活。
+///
+/// 前缀与 [`session_id_for`]、`spoof_device_id` 都不同，免得三个字段的高位相关。
+pub(super) fn sim_env_for(cred: &crate::credentials::Credential, device_fp: &str) -> SimEnv {
+    const USERS: &[&str] = &[
+        "alex", "sam", "chris", "jordan", "taylor", "morgan", "casey", "jamie", "kai", "lee",
+        "max", "robin", "dev", "ben", "tom", "dan", "eli", "ian", "joe", "kim", "liu", "wang",
+        "chen", "zhang",
+    ];
+    const PARENTS: &[&str] =
+        &["Projects", "Code", "dev", "src", "work", "repos", "workspace", "Developer"];
+    const PROJECTS: &[&str] = &[
+        "api",
+        "backend",
+        "web",
+        "app",
+        "server",
+        "service",
+        "dashboard",
+        "cli",
+        "sdk",
+        "infra",
+        "tools",
+        "data",
+        "core",
+        "platform",
+        "admin",
+        "portal",
+        "gateway",
+        "worker",
+        "bot",
+        "agent",
+        "pipeline",
+        "client",
+        "frontend",
+        "monorepo",
+    ];
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"luban-env\0");
+    h.update(cred.account_uuid.as_deref().unwrap_or("").as_bytes());
+    h.update([0u8]);
+    h.update(device_fp.as_bytes());
+    let d = h.finalize();
+    let pick = |table: &[&'static str], byte: u8| table[usize::from(byte) % table.len()];
+    let home = format!("/Users/{}", pick(USERS, d[0]));
+    let cwd = format!("{home}/{}/{}", pick(PARENTS, d[1]), pick(PROJECTS, d[2]));
+    SimEnv { home, cwd }
+}
+
+/// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
+/// 2.1.277 只剩 `# Memory` 那条记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`。
+pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
+    template.replace("{{cwd_slug}}", &env.cwd_slug()).replace("{{home}}", &env.home)
 }
 
 /// 按模型族选 2.1.260 的**主线程** profile。
@@ -718,7 +880,27 @@ pub(super) fn simulate_system(
     };
     // 客户端可能已经抄了官方的 billing header 和身份声明（`is_cc_shaped` 不再拦截非 CC
     // 客户端的这种请求）。模拟会重新补齐这两块，先剥掉客户端那份以免重复。
-    let client = strip_cc_preamble(client);
+    let mut client = strip_cc_preamble(client);
+    // 有第四块时客户端自己的 system 不再占一块：官方 `system` 到第四块为止、块数固定，多
+    // 一块就不是官方形态。正文挪进首条用户消息（官方的 CLAUDE.md、用户指令本来也在用户轮
+    // 里，见 [`stash_client_system`]）；挪不动（没有消息、`content` 形态不认识）就接在第四块
+    // 末尾——块数照旧、一个字不丢。客户端 system 里有非文本成员时拼不出正文，仍按原样追加。
+    let mut rest = sim.rest.clone();
+    if let Some(rest) = rest.as_mut()
+        && !client.is_empty()
+        && let Some(text) = client_system_text(&client)
+    {
+        if stash_client_system(v, &text) {
+            tracing::info!(
+                chars = text.chars().count(),
+                "moved the client system into messages[0]; the fourth system block takes its slot"
+            );
+        } else {
+            rest.push_str("\n\n");
+            rest.push_str(&text);
+        }
+        client.clear();
+    }
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
     let outside = count_cache_control(v) - v.get("system").map(count_cache_control).unwrap_or(0);
     let used = outside + client.iter().map(count_cache_control).sum::<usize>();
@@ -739,7 +921,17 @@ pub(super) fn simulate_system(
             blocks.push(text_block_bare(base));
         }
     }
-    // 末块补断点：官方在 system 末尾必有一个，但客户端自己标过就不重复标。
+    // 第四块：官方在它上面标末尾断点（`{ttl:1h}`，不带 `scope`，`cap/2.1.260-2/00013`）。
+    if let Some(rest) = rest {
+        if budget > 0 {
+            budget -= 1;
+            blocks.push(text_block(&rest, cache_control(cache.tail())));
+        } else {
+            blocks.push(text_block_bare(&rest));
+        }
+    }
+    // 没有第四块时末块是客户端原文，补断点：官方在 system 末尾必有一个，但客户端自己标过
+    // 就不重复标。
     let tail_open = client.last().is_some_and(|b| b.get("cache_control").is_none());
     blocks.extend(client);
     if tail_open
@@ -753,6 +945,64 @@ pub(super) fn simulate_system(
     true
 }
 
+/// 客户端 `system` 块的正文拼成一段（`\n\n` 相连，空块跳过）；有一块不是文本块就 `None`。
+fn client_system_text(blocks: &[serde_json::Value]) -> Option<String> {
+    let texts: Vec<&str> = blocks.iter().map(|b| b.get("text")?.as_str()).collect::<Option<_>>()?;
+    let text = texts.into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// 官方把 CLAUDE.md 与用户指令塞进首条用户消息时，`<system-reminder>` 块开头那一句
+/// （`cap/2.1.277/00023`、`00031`、`00357` 逐字相同；四族首条用户消息的第一个 text 块都是它）。
+/// 客户端自己的 system 在官方形态里最接近的落点就是这一块：都是「用户这边给的指令」。
+pub(super) const CLIENT_SYSTEM_REMINDER_LEAD: &str = "Codebase and user instructions are shown below. \
+Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior \
+and you MUST follow them exactly as written.";
+
+/// 把客户端自己那段 system 正文裹成官方那种 `<system-reminder>` 块（开头是
+/// [`CLIENT_SYSTEM_REMINDER_LEAD`] 那句、空一行、正文、换行、闭合标签）塞到 `messages[0]` 的
+/// 第一个内容块前面——`cap/2.1.277` 里 44 份带首条用户消息的请求都是这个写法，luban 原先
+/// 自创的 `<system_instructions>` 标签一次都没出现过。`messages[0]` 必须是 user role（API
+/// 约束），官方 CC 也恒为 user 开头，正常情况下不会踩空。
+///
+/// **要么整个写成，要么一个字节都不动**：先确认 `messages[0].content` 是数组或字符串再写，
+/// 落点不可写（`content` 缺失、是数字、messages 为空）返回 `false`，调用方自己决定正文往哪放。
+pub(super) fn stash_client_system(v: &mut serde_json::Value, text: &str) -> bool {
+    let writable = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.first())
+        .and_then(|f| f.get("content"))
+        .is_some_and(|c| c.is_array() || c.is_string());
+    if !writable {
+        tracing::warn!(
+            chars = text.chars().count(),
+            "messages[0].content is not writable, leaving the client system in `system`"
+        );
+        return false;
+    }
+    let wrapped =
+        format!("<system-reminder>\n{CLIENT_SYSTEM_REMINDER_LEAD}\n\n{text}\n</system-reminder>");
+    // 走到这里两步都必定成功：上面刚验过 `content` 是数组或字符串。
+    let Some(first) =
+        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.first_mut())
+    else {
+        return false;
+    };
+    match first.get_mut("content") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
+            true
+        }
+        Some(content @ serde_json::Value::String(_)) => {
+            let s = content.as_str().unwrap_or_default();
+            *content = serde_json::Value::String(format!("{wrapped}\n\n{s}"));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 模拟后 system 末块（客户端自有内容）超过此字符数时，移到 messages 首条用户消息里。
 ///
 /// 上游对末块有内容级检测：非 CC 特征内容超过 ~2000 字符即触发第三方判定。
@@ -761,8 +1011,8 @@ const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 
 /// 把模拟后 system 末块（客户端自有内容）的超长内容搬到 messages 首条用户消息里。
 ///
-/// 搬走后末块换成一行短占位（保持块数形态），内容作为 `<system_instructions>` 标签
-/// 注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
+/// 搬走后末块换成一行短占位（保持块数形态），内容作为官方那种 `<system-reminder>` 块
+/// （[`stash_client_system`]）注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
 /// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
 ///
 /// **要么整个搬成，要么一个字节都不动。** 先确认 `messages[0].content` 是可写的形态，
@@ -770,10 +1020,14 @@ const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 /// 就会得到「末块已经换成 `(see conversation)` 占位、内容却没搬到任何地方」的请求：
 /// 客户端明确下的那段指令**凭空消失**，而调用方只看到一个 `false`，以为什么都没发生。
 pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
-    // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座)。多出来的那一块才是客户端
-    // 自己的 system；块数不多于它就没有可搬的东西。
+    // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座) (+ 第四块)。多出来的那一块
+    // 才是客户端自己的 system；块数不多于它就没有可搬的东西。有第四块时客户端 system 已在
+    // [`simulate_system`] 里整段挪走或并进第四块，这里不会再多出一块。
     let reporting = sim.profile.system == config::CcSystemShape::IdentityReporting;
-    let fixed = 2 + usize::from(reporting) + usize::from(sim.base.is_some());
+    let fixed = 2
+        + usize::from(reporting)
+        + usize::from(sim.base.is_some())
+        + usize::from(sim.rest.is_some());
     let sys = match v.get("system").and_then(|s| s.as_array()) {
         Some(a) if a.len() > fixed => a,
         _ => return false,
@@ -783,35 +1037,9 @@ pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simul
         Some(t) if t.len() > MAX_CLIENT_SYSTEM_CHARS => t.to_string(),
         _ => return false,
     };
-    // 先探路：落点不可写就原地返回，`system` 还没被动过。
-    let writable = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|m| m.first())
-        .and_then(|f| f.get("content"))
-        .is_some_and(|c| c.is_array() || c.is_string());
-    if !writable {
-        tracing::warn!(
-            chars = tail_text.len(),
-            "messages[0].content is not writable, leaving the long client system in place"
-        );
+    // 先写落点：写不进去就原地返回，`system` 还没被动过。
+    if !stash_client_system(v, &tail_text) {
         return false;
-    }
-    let wrapped = format!("<system_instructions>\n{tail_text}\n</system_instructions>");
-    // 走到这里两步都必定成功：上面刚验过 `content` 是数组或字符串。
-    if let Some(first) =
-        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.first_mut())
-    {
-        match first.get_mut("content") {
-            Some(serde_json::Value::Array(arr)) => {
-                arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
-            }
-            Some(content @ serde_json::Value::String(_)) => {
-                let s = content.as_str().unwrap_or_default();
-                *content = serde_json::Value::String(format!("{wrapped}\n\n{s}"));
-            }
-            _ => return false,
-        }
     }
     if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
         let cc = blocks[last].get("cache_control").cloned();
@@ -979,8 +1207,9 @@ pub(super) fn billing_header_text(
 ///   cc_prev_req=req_011CeiBW8Yx9A2uzWiCBsJsU; cc_prompt_id=16d7a19d-…;
 /// ```
 ///
-/// 各段的顺序是抓包序，六个 profile 一致：`cc_version` → `cc_entrypoint` → `cch` →
-/// `cc_is_subagent` → `cc_prev_req` → `cc_prompt_id`。`cch` 在这里就一次写好，不再等
+/// 各段的顺序是抓包序，各 profile 一致：`cc_version` → `cc_entrypoint` → `cch` →
+/// `cc_is_subagent` → `cc_prev_req` → `cc_prompt_id` → `cc_turn_origin`（2.1.277 起，
+/// `cap/2.1.277/00023`：`…cch=X; cc_prompt_id=U; cc_turn_origin=human;`）。`cch` 在这里就一次写好，不再等
 /// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
 ///
 /// 第四段不再走 [`cc_version_suffix`] 那套派生算法：2.1.260 的六个 profile 各有各的固定
@@ -1001,7 +1230,10 @@ fn simulated_billing_header_text(sim: &Simulation) -> String {
         s.push_str(&format!(" cc_prev_req={prev};"));
     }
     if let Some(pid) = &sim.link.prompt_id {
-        s.push_str(&format!(" cc_prompt_id={pid};"));
+        // 2.1.277 起 `cc_prompt_id` 后面跟着这一轮是谁发起的：用户输入是 `human`，后台任务
+        // 通知是 `task_notification`（`cap/2.1.277/00348`）。模拟路径接的都是客户端发来的一轮
+        // 对话，写 `human`；没有 `cc_prompt_id` 的工具续轮官方也不写它（`00050`）。
+        s.push_str(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;"));
     }
     s
 }
@@ -1081,7 +1313,7 @@ mod tests {
     #[test]
     fn simulates_official_system_for_plain_request() {
         let body = Bytes::from(
-            r#"{"model":"claude-sonnet-5","messages":[],"system":"你是助手","max_tokens":8}"#
+            r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"system":"你是助手","max_tokens":8}"#
                 .to_string(),
         );
         let sim = detect_for(&body, all_on()).unwrap();
@@ -1098,63 +1330,96 @@ mod tests {
         assert!(sys[0]["text"].as_str().unwrap().contains("; cch="), "cch 要在 billing 段里");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.260.1e2; cc_entrypoint=cli;"
+                "x-anthropic-billing-header: cc_version=2.1.277.d56; cc_entrypoint=cli;"
             ),
-            "模拟路径的 cc_version 取 profile 的版本与后缀（sonnet 主线程没有 2.1.260 样本，\
-             后缀沿用 2.1.258 那个四族通用值 1e2）: {s}"
+            "模拟路径的 cc_version 取 profile 的版本与后缀（2.1.277 四族主线程都是 d56，\
+             cap/2.1.277/00031）: {s}"
         );
         assert!(
-            sys[0]["text"].as_str().unwrap().contains("cc_prompt_id="),
-            "官方主线程每条都带 cc_prompt_id（cap/2.1.260-2/00013）: {s}"
+            sys[0]["text"].as_str().unwrap().ends_with("; cc_turn_origin=human;"),
+            "官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human\
+             （cap/2.1.277/00023）: {s}"
         );
+        assert!(sys[0]["text"].as_str().unwrap().contains("; cc_prompt_id="), "{s}");
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_SONNET, "sonnet 族应取 sonnet 基座");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "2.1.277 四族同一份基座");
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
-        assert_eq!(sys[3]["text"], "你是助手", "客户端原 system 应原样留在末块");
+        // 第四块是官方「其余」段（模板填好占位），客户端自己的 system 不再占一块。
+        let rest = sys[3]["text"].as_str().unwrap();
+        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块: {rest:.80}");
+        assert!(!unfilled(rest), "占位要全填掉: {rest}");
+        let env = crate::proxy::sim_env_for(&test_cred(), "fp");
+        assert!(
+            rest.contains(&format!(
+                "You have a persistent file-based memory at `{}/.claude/projects/{}/memory/`.",
+                env.home,
+                env.cwd_slug()
+            )),
+            "记忆目录随派生的假环境走: {rest}"
+        );
+        assert!(
+            rest.ends_with("<total_tokens>15000000 tokens left</total_tokens>"),
+            "末尾那行照抓包"
+        );
+        assert_eq!(
+            v["output_config"],
+            serde_json::json!({"effort": "high"}),
+            "sonnet 主线程带 output_config.effort=high（cap/2.1.277/00031）: {s}"
+        );
         assert_eq!(sys[3]["cache_control"]["type"], "ephemeral");
         assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
         assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
         assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
+        // 客户端原 system 整段挪进首条用户消息（模拟路径随后把字符串 content 收成块数组）。
+        let first = v["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            first,
+            format!(
+                "<system-reminder>\n{}\n\n你是助手\n</system-reminder>\n\nhi",
+                crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD
+            ),
+            "客户端 system 裹成官方那种 system-reminder 块放在首条消息正文前: {s}"
+        );
+        assert!(!s.contains("system_instructions"), "自创标签一个都不能有: {s}");
+        assert!(!s.contains("(see conversation)"), "没有占位块: {s}");
 
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            vec!["model", "messages", "system", "metadata", "max_tokens", "diagnostics"],
-            "key 序: {s}"
+            vec![
+                "model",
+                "messages",
+                "system",
+                "metadata",
+                "max_tokens",
+                "output_config",
+                "diagnostics"
+            ],
+            "key 序（output_config 在 context_management / max_tokens 之后、diagnostics 之前）: {s}"
         );
         assert_eq!(
             v["diagnostics"],
             serde_json::json!({"previous_message_id": serde_json::Value::Null}),
-            "会话首条：字段在、值为 null（cap/2.1.260-2/00013）: {s}"
+            "会话首条：字段在、值为 null（cap/2.1.277/00023）: {s}"
         );
 
-        // 换模型族即换基座：三族三份基座。
-        assert_eq!(sim_for(PLAIN_BODY).base, Some(config::CC_SYSTEM_BASE_OPUS), "opus-5 短基座");
-        assert_eq!(
-            sim_for(r#"{"model":"claude-fable-5-1","messages":[]}"#).base,
-            Some(config::CC_SYSTEM_BASE_OPUS),
-            "fable-5-1 与 opus-5 共用短基座（cap/2.1.258/00012 与 00013 sha256 相同）"
-        );
-        assert_eq!(
-            sim_for(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#).base,
-            Some(config::CC_SYSTEM_BASE_HAIKU),
-            "haiku 用旧版长基座"
-        );
-        assert_eq!(
-            sim_for(r#"{"model":"claude-fable-5","messages":[]}"#).base,
-            Some(config::CC_SYSTEM_BASE_OPUS),
-            "fable 与 opus-5 共用短基座"
-        );
-        assert_eq!(
-            sim_for(r#"{"model":"claude-opus-4-6","messages":[]}"#).base,
-            Some(config::CC_SYSTEM_BASE_HAIKU),
-            "opus-4-6 用旧版长基座"
-        );
-        assert!(
-            sim_for(r#"{"model":"gpt-4o","messages":[]}"#).base.is_none(),
-            "认不出的模型不猜基座"
-        );
+        // 2.1.277 四族同一份基座（cap/2.1.277 四份主线程 sha256 相同）；认不出的模型不猜。
+        for m in [
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-6",
+        ] {
+            let sim = sim_for(&format!(r#"{{"model":"{m}","messages":[]}}"#));
+            assert_eq!(sim.base, Some(config::CC_SYSTEM_BASE), "{m}");
+            assert!(sim.rest.is_some(), "{m} 也补第四块");
+        }
+        let alien = sim_for(r#"{"model":"gpt-4o","messages":[]}"#);
+        assert!(alien.base.is_none(), "认不出的模型不猜基座");
+        assert!(alien.rest.is_none(), "也不补第四块");
     }
 
     /// 2.1.260 的 billing 后缀是**逐 profile 定死**的，不能再走那套派生算法。
@@ -1194,6 +1459,25 @@ mod tests {
         // 2.1.258 仍走派生算法——那一版五份抓包全是 `1e2`。
         let old = text("claude-opus-5", "2.1.258", K::Main);
         assert!(old.contains("cc_version=2.1.258.1e2;"), "{old}");
+
+        // 2.1.277：四族主线程统一 `d56`，子代理 `385`，标题 `e18`（cap/2.1.277）；无工具 helper
+        // 与安全分类没有 2.1.277 样本，退回派生算法而不是拿 2.1.260 的值顶上。
+        for m in
+            ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
+        {
+            let got = text(m, "2.1.277", K::Main);
+            assert!(got.contains("cc_version=2.1.277.d56;"), "{m}: {got}");
+        }
+        assert!(text("claude-haiku-4-5-20251001", "2.1.277", K::Subagent).contains("2.1.277.385;"));
+        assert!(text("claude-haiku-4-5-20251001", "2.1.277", K::Title).contains("2.1.277.e18;"));
+        let helper = text("claude-haiku-4-5-20251001", "2.1.277", K::Helper);
+        assert!(
+            !helper.contains(".d95;") && !helper.contains(".d56;"),
+            "没样本不套别版的值: {helper}"
+        );
+        // 2.1.270 只抓到 sonnet：它取那一版的 `100`，opus 退回派生。
+        assert!(text("claude-sonnet-5", "2.1.270", K::Main).contains("2.1.270.100;"));
+        assert!(!text("claude-opus-5", "2.1.270", K::Main).contains(".222;"));
     }
 
     /// uuid 形态校验的边界：只认 `8-4-4-4-12` 的小写 hex。
@@ -1217,9 +1501,13 @@ mod tests {
     /// 原来的实现先把末块换成 `(see conversation)` 占位、再去写 `messages[0]`，落点不可写
     /// 时就直接 `return false`——客户端明确下的那段指令凭空消失，而调用方只看到一个
     /// `false`，以为什么都没发生。
+    ///
+    /// 这条搬运只在**没有第四块**时才有活干（开关关着、或模型族没模板）：有第四块时客户端
+    /// system 已由 [`crate::proxy::simulate_system`] 整段安置好，末块不再是它。
     #[test]
     fn long_client_system_is_relocated_atomically() {
         let long = "指令".repeat(1200); // 远超 MAX_CLIENT_SYSTEM_CHARS
+        let no_rest = store::ForwardFlags { simulate_full_system: false, ..all_on() };
         // messages[0].content 是数字：既不是数组也不是字符串，搬不过去。
         let body = serde_json::json!({
             "model": "claude-opus-5",
@@ -1227,7 +1515,8 @@ mod tests {
             "messages": [{"role": "user", "content": 42}],
             "system": long});
         let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-        let sim = detect_for(&raw, all_on()).expect("该请求应走模拟路径");
+        let sim = detect_for(&raw, no_rest).expect("该请求应走模拟路径");
+        assert!(sim.rest.is_none());
         let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert!(crate::proxy::simulate_system(
             &mut v,
@@ -1257,11 +1546,43 @@ mod tests {
         let tail = v["system"].as_array().unwrap().last().unwrap();
         assert_eq!(tail["text"], "(see conversation)", "末块换成占位");
         let first = v["messages"][0]["content"].as_str().unwrap();
-        assert!(first.starts_with("<system_instructions>"), "内容搬到了首条消息: {first}");
+        assert!(first.starts_with("<system-reminder>\n"), "内容搬到了首条消息: {first}");
         assert!(first.contains("指令"), "内容没丢");
+
+        // 有第四块：simulate_system 自己把客户端 system 挪走，这条搬运无事可做、返回 false。
+        // 搬不动那种（content 是数字）接在第四块末尾，同样不多出一块。
+        let sim = detect_for(&raw, all_on()).unwrap();
+        assert!(sim.rest.is_some());
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(crate::proxy::simulate_system(
+            &mut v,
+            &sim,
+            crate::proxy::CacheShape { global: true, ttl_1h: true }
+        ));
+        assert_eq!(v["system"].as_array().unwrap().len(), 4, "{v}");
+        assert!(v["messages"][0]["content"].as_str().unwrap().contains("指令"), "已挪进首条消息");
+        assert!(!v["system"][3]["text"].as_str().unwrap().contains("指令"), "第四块是官方正文");
+        assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim), "没有多出的块可搬");
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(crate::proxy::simulate_system(
+            &mut v,
+            &sim,
+            crate::proxy::CacheShape { global: true, ttl_1h: true }
+        ));
+        assert_eq!(v["system"].as_array().unwrap().len(), 4, "{v}");
+        assert!(
+            v["system"][3]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("</total_tokens>\n\n{long}")),
+            "挪不动就接在第四块末尾"
+        );
+        assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim));
     }
 
-    /// 没有 system 的请求同样成立：opus 族三块（billing / 身份句 / 基座），末块拿到断点。
+    /// 没有 system 的请求同样成立：opus 族四块（billing / 身份句 / 基座 / 其余），与
+    /// `cap/2.1.260-2/00013` 逐块同形：基座 `{ttl:1h, scope:global}`，第四块 `{ttl:1h}`。
     #[test]
     fn simulates_system_when_client_sent_none() {
         let body = Bytes::from(PLAIN_BODY.to_string());
@@ -1269,13 +1590,100 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 3, "没有客户端 system 就只有前三块: {v}");
+        assert_eq!(sys.len(), 4, "没有客户端 system 也是官方四块: {v}");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
+        let rest = sys[3]["text"].as_str().unwrap();
+        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块");
+        let env = crate::proxy::sim_env_for(&test_cred(), "fp");
+        assert!(
+            rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.cwd_slug())),
+            "记忆目录随派生的 cwd 走: {rest}"
+        );
+        // 2.1.277 的第四块不再写工作目录、模型名、知识截止与 scratchpad。
+        for gone in
+            ["Primary working directory", "powered by the model", "knowledge cutoff", "scratchpad"]
+        {
+            assert!(!rest.contains(gone), "{gone} 在 2.1.277 的第四块里已经没有了: {rest}");
+        }
+        assert!(!unfilled(rest), "{rest}");
+        assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(
+            v["output_config"],
+            serde_json::json!({"effort": "high"}),
+            "opus 主线程带 effort=high（cap/2.1.277/00357）: {v}"
+        );
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let idx =
+            |k: &str| keys.iter().position(|x| *x == k).unwrap_or_else(|| panic!("{k}: {keys:?}"));
+        assert!(idx("context_management") < idx("output_config"), "{keys:?}");
+        assert!(idx("output_config") < idx("diagnostics"), "{keys:?}");
+        assert!(idx("diagnostics") < idx("stream"), "{keys:?}");
+        // haiku 主线程官方不带 output_config（cap/2.1.277/00046）。
+        let haiku = Bytes::from(
+            r#"{"model":"claude-haiku-4-5-20251001","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}"#
+                .to_string(),
+        );
+        let hs = detect_for(&haiku, all_on()).unwrap();
+        let hv: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &haiku,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&hs),
+            None,
+        ))
+        .unwrap();
+        assert!(hv.get("output_config").is_none(), "haiku 不带 output_config: {hv}");
+        assert_eq!(
+            hv["thinking"],
+            serde_json::json!({"budget_tokens": 31999, "type": "enabled", "display": "updates"}),
+            "haiku 的 thinking（cap/2.1.277/00046）: {hv}"
+        );
+        // 客户端自己写了 output_config 就不动。
+        let own = Bytes::from(
+            r#"{"model":"claude-opus-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"low"}}"#
+                .to_string(),
+        );
+        let os = detect_for(&own, all_on()).unwrap();
+        let ov: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &own,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&os),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(ov["output_config"], serde_json::json!({"effort": "low"}), "{ov}");
+        assert_eq!(
+            v["messages"][0]["content"][0]["text"], "hi",
+            "没有客户端 system 就不动首条消息"
+        );
+
+        // 开关关掉：回到「末块是客户端原文」的旧形态，没有客户端 system 就只有前三块。
+        let off = store::ForwardFlags { simulate_full_system: false, ..all_on() };
+        let sim = detect_for(&body, off).unwrap();
+        assert!(sim.rest.is_none());
+        let out = rewrite_body(&body, &test_cred(), "fp", off, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 3, "开关关着只有前三块: {v}");
+        let with_sys = Bytes::from(
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"system":"你是助手"}"#
+                .to_string(),
+        );
+        let sim = detect_for(&with_sys, off).unwrap();
+        let out = rewrite_body(&with_sys, &test_cred(), "fp", off, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 4);
+        assert_eq!(sys[3]["text"], "你是助手", "开关关着客户端原文留在末块");
+        assert_eq!(v["messages"][0]["content"][0]["text"], "hi");
     }
 
-    /// fable 族是 2.1.260 里唯一还带 `# Reporting outcomes` 的（`cap/2.1.260/00018`）：
-    /// 五块 `[billing, 身份句, reporting, 基座, 客户端原文]`，thinking 补成
-    /// `{adaptive, display:"updates"}` 且 `display` 不被 `strip_extra_fields` 剥掉。
+    /// 2.1.277 的 fable 不再单独带 `# Reporting outcomes` 块（`cap/2.1.277/00023`），与其余
+    /// 三族一样是四块 `[billing, 身份句, 基座, 其余]`；thinking 补成 `{adaptive, display:"updates"}`
+    /// 且 `display` 不被 `strip_extra_fields` 剥掉。
     #[test]
     fn simulates_fable_with_reporting_block_and_display_updates() {
         let body = concat!(
@@ -1286,22 +1694,43 @@ mod tests {
             |b: &str| sim_for(b).profile.system == config::CcSystemShape::IdentityReporting;
         let b = Bytes::from(body.to_string());
         let sim = sim_for(body);
-        assert!(reporting(body), "fable 族该带 reporting");
-        assert!(!reporting(PLAIN_BODY), "opus 族不带");
-        assert!(!reporting(r#"{"model":"claude-sonnet-5","messages":[]}"#), "sonnet 族不带");
-        assert!(
-            !reporting(r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#),
-            "haiku 族不带"
-        );
+        for (b, name) in [
+            (body, "fable"),
+            (PLAIN_BODY, "opus"),
+            (r#"{"model":"claude-sonnet-5","messages":[]}"#, "sonnet"),
+            (r#"{"model":"claude-haiku-4-5-20251001","messages":[]}"#, "haiku"),
+        ] {
+            assert!(!reporting(b), "2.1.277 起 {name} 族都不带 reporting 块");
+        }
         let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 5, "fable 族是五块: {v}");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_REPORTING, "第 2 块是 reporting outcomes");
-        assert!(sys[2].get("cache_control").is_none(), "reporting 块不带断点（官方如此）");
-        assert_eq!(sys[3]["text"], config::CC_SYSTEM_BASE_OPUS, "fable 与 opus 共用基座");
-        assert_eq!(sys[3]["cache_control"]["scope"], "global");
-        assert_eq!(sys[4]["text"], "你是助手");
+        assert_eq!(sys.len(), 4, "fable 族也是四块: {v}");
+        assert!(
+            sys.iter().all(|b| b["text"] != config::CC_SYSTEM_REPORTING),
+            "没有 reporting 块: {v}"
+        );
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "四族共用基座");
+        assert_eq!(sys[2]["cache_control"]["scope"], "global");
+        let rest = sys[3]["text"].as_str().unwrap();
+        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块: {rest:.80}");
+        assert!(rest.contains("This iteration of Claude is Claude Fable 5.1"), "{rest}");
+        assert!(!unfilled(rest), "{rest}");
+        assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
+        assert!(
+            sys[0]["text"].as_str().unwrap().starts_with(
+                "x-anthropic-billing-header: cc_version=2.1.277.d56; cc_entrypoint=cli; cch="
+            ),
+            "{v}"
+        );
+        assert!(
+            v["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("<system-reminder>\nCodebase and user instructions are shown below."),
+            "客户端 system 挪进首条消息: {v}"
+        );
         assert_eq!(
             v["thinking"],
             serde_json::json!({"type": "adaptive", "display": "updates"}),
@@ -1732,9 +2161,9 @@ mod tests {
             .filter(|b| b.get("text").and_then(|t| t.as_str()) == Some(config::CC_SYSTEM_IDENTITY))
             .count();
         assert_eq!(id_count, 1, "身份声明只该出现一次: {v}");
-        // 客户端的原始 prompt 不该丢。
+        // 客户端的原始 prompt 不该丢：`messages` 为空挪不进首条消息，接在第四块末尾。
         assert!(
-            sys.iter().any(|b| b.get("text").and_then(|t| t.as_str()) == Some("user prompt")),
+            sys.last().unwrap()["text"].as_str().unwrap().ends_with("\n\nuser prompt"),
             "客户端原始 prompt 应保留: {v}"
         );
 
@@ -1765,38 +2194,67 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(crate::proxy::count_cache_control(&v), 4, "断点数不得超过 4: {v}");
         assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
-        assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE_OPUS);
+        assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE);
+        assert!(v["system"][3].get("cache_control").is_none(), "预算用完时第四块也不带断点");
+        assert!(v["system"][3]["text"].as_str().unwrap().starts_with("Before you start, say"));
     }
 
-    /// 客户端把 `system` 拆成多块时并成官方末块的一块——3+N 块会被上游判第三方应用、
-    /// 改扣超额池（`Third-party apps now draw from your extra usage`）。
+    /// 客户端把 `system` 拆成多块时并成一段——3+N 块会被上游判第三方应用、改扣超额池
+    /// （`Third-party apps now draw from your extra usage`）。有第四块时这一段整体挪进首条
+    /// 用户消息；首条消息不可写（这里 `messages` 为空）就接在第四块末尾，块数照旧是官方的四块。
     ///
-    /// 合并腾出来的断点预算要算进去：客户端那 4 个断点合并后只剩 1 个，基座该拿到断点。
+    /// 客户端那 4 个断点随正文一起走、不再占预算：基座与第四块都该拿到断点。
     #[test]
     fn merges_client_system_blocks_into_official_tail() {
         let blk = |t: &str| {
             format!(r#"{{"type":"text","text":"{t}","cache_control":{{"type":"ephemeral"}}}}"#)
         };
+        let sys_json = format!("[{},{},{},{}]", blk("a"), blk("b"), blk("c"), blk("d"));
         let body = Bytes::from(format!(
-            r#"{{"model":"claude-opus-5","messages":[],"system":[{},{},{},{}]}}"#,
-            blk("a"),
-            blk("b"),
-            blk("c"),
-            blk("d")
+            r#"{{"model":"claude-opus-5","messages":[],"system":{sys_json}}}"#
         ));
         let sim = detect_for(&body, all_on()).unwrap();
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 4, "客户端的 4 块应并成末块一块（opus 族无 reporting）: {v}");
-        assert_eq!(sys[3]["text"], "a\n\nb\n\nc\n\nd", "正文一个字都不该丢");
-        assert_eq!(sys[3]["cache_control"]["type"], "ephemeral", "末块断点取合并前的最后一个");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE_OPUS);
-        assert_eq!(sys[2]["cache_control"]["scope"], "global", "合并腾出的预算该给基座");
+        assert_eq!(sys.len(), 4, "客户端的 4 块并进第四块，仍是官方四块: {v}");
+        let rest = sys[3]["text"].as_str().unwrap();
+        assert!(rest.starts_with("Before you start, say"), "第四块开头是官方正文");
+        assert!(
+            rest.ends_with("</total_tokens>\n\na\n\nb\n\nc\n\nd"),
+            "messages 为空挪不动，客户端正文接在第四块末尾、一个字都不丢: {rest:.0}…{}",
+            &rest[rest.len().saturating_sub(60)..]
+        );
+        assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
+        assert_eq!(sys[2]["cache_control"]["scope"], "global", "客户端断点腾出的预算该给基座");
         assert_eq!(crate::proxy::count_cache_control(&v), 2, "断点数: {v}");
 
-        // 空块并不进来（发一个空文本块上游不收），只剩前三块。
+        // 首条消息可写：并成的一段挪进去，第四块原样；断点是基座、第四块、末条消息各一。
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"system":{sys_json}}}"#
+        ));
+        let sim = detect_for(&body, all_on()).unwrap();
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 4, "{v}");
+        assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "第四块原样");
+        let first = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(first.len(), 2, "客户端 system 作为一个 text 块插在首条消息最前: {v}");
+        assert_eq!(
+            first[0]["text"],
+            format!(
+                "<system-reminder>\n{}\n\na\n\nb\n\nc\n\nd\n</system-reminder>",
+                crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD
+            ),
+            "与官方首条用户消息第一块同形（cap/2.1.277/00023）"
+        );
+        assert_eq!(first[1]["text"], "hi");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3, "基座 + 第四块 + 末条消息: {v}");
+
+        // 空块并不进来（发一个空文本块上游不收），第四块也不用接任何东西。
         let empty = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"system":[{"type":"text","text":""},{"type":"text","text":"  "}]}"#
                 .to_string(),
@@ -1804,7 +2262,9 @@ mod tests {
         let sim = detect_for(&empty, all_on()).unwrap();
         let out = rewrite_body(&empty, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["system"].as_array().unwrap().len(), 3, "全空的块应丢掉: {v}");
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 4, "全空的块应丢掉，只剩官方四块: {v}");
+        assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "{v}");
     }
 
     /// 自称 CC（`system` 里有那句身份声明）却发了 5 块以上的第三方客户端：
@@ -2318,37 +2778,308 @@ mod tests {
     #[test]
     fn system_base_assets_are_verbatim() {
         assert_eq!(
-            config::CC_SYSTEM_BASE_OPUS.len(),
-            1214,
-            "opus/fable 基座字节数（cap/2.1.258/00012）"
-        );
-        assert_eq!(
-            config::CC_SYSTEM_BASE_SONNET.len(),
-            10520,
-            "sonnet 基座字节数（cap/2.1.258/00026）"
-        );
-        assert_eq!(
-            config::CC_SYSTEM_BASE_HAIKU.len(),
-            10622,
-            "haiku 基座字节数（cap/2.1.258/00031）"
+            config::CC_SYSTEM_BASE.len(),
+            1588,
+            "2.1.277 四族同一份基座的字节数（cap/2.1.277/00023）"
         );
         assert_eq!(config::CC_SYSTEM_IDENTITY.len(), 57, "身份句字节数");
         assert_eq!(config::CC_SYSTEM_REPORTING.len(), 911, "reporting 块字节数");
-        for base in [
-            config::CC_SYSTEM_BASE_OPUS,
-            config::CC_SYSTEM_BASE_SONNET,
-            config::CC_SYSTEM_BASE_HAIKU,
-        ] {
-            assert!(
-                base.starts_with("\nYou are an interactive agent"),
-                "开头那个 \\n 是官方就有的"
-            );
-            assert!(!base.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
-        }
+        let base = config::CC_SYSTEM_BASE;
+        assert!(base.starts_with("\nYou are an interactive agent"), "开头那个 \\n 是官方就有的");
+        assert!(!base.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
+        assert!(
+            base.contains("Text inside <pasted_content> tags"),
+            "2.1.277 相对 2.1.258 的 opus 短基座多的正是这一行 Harness 条目"
+        );
         // 基座是「切点之前」那一段，锚点属于其余段，不该出现在基座里。
         for anchor in config::CC_SYSTEM_BASE_ANCHORS {
-            assert!(!config::CC_SYSTEM_BASE_OPUS.contains(anchor), "opus 基座里不该有拆块锚点");
+            assert!(!base.contains(anchor), "基座里不该有拆块锚点: {anchor}");
         }
+        // 2.1.277 第四块的开头就是既有的那条锚点，透传路径拆 API-key 三块形态时能切对。
+        assert!(
+            config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a))
+        );
+    }
+
+    /// 第四块模板里 luban 自己的两个占位。只认这两个名字：官方正文里本来就有
+    /// `{{…}}` 一类的双花括号写法，不能拿 `{{` 当判据。
+    const REST_PLACEHOLDERS: [&str; 2] = ["{{cwd_slug}}", "{{home}}"];
+
+    /// 正文里还剩没填的占位。
+    fn unfilled(text: &str) -> bool {
+        REST_PLACEHOLDERS.iter().any(|ph| text.contains(ph))
+    }
+
+    /// 第四块模板逐字节取自抓包：字节数钉住，占位齐全，抓包机的路径一个都不能留。
+    #[test]
+    fn system_rest_assets_are_verbatim() {
+        let asset = config::CC_SYSTEM_REST;
+        assert_eq!(
+            asset.len(),
+            11039,
+            "2.1.277 第四块模板字节数（11301 去掉 EndConversation 那段与占位差）"
+        );
+        for ph in REST_PLACEHOLDERS {
+            assert_eq!(asset.matches(ph).count(), 1, "占位 {ph} 恰好出现一次（记忆目录那一处）");
+        }
+        assert!(
+            asset.contains("You have a persistent file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
+            "记忆目录那句"
+        );
+        assert!(asset.starts_with("Before you start, say in a line what you're about to do"));
+        assert!(asset.ends_with("<total_tokens>15000000 tokens left</total_tokens>"), "末行");
+        assert!(!asset.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
+        for leak in ["easayliu", "opdash", "proxy_captures"] {
+            assert!(!asset.contains(leak), "模板里不该留抓包机的 {leak}");
+        }
+        // 2.1.277 的第四块不再写这些；有一样在就是把老版本的模板拿来了。
+        for gone in [
+            "Primary working directory",
+            "Is a git repository",
+            "powered by the model",
+            "knowledge cutoff",
+            "# Scratchpad Directory",
+            "Additional working directories",
+        ] {
+            assert!(!asset.contains(gone), "{gone}");
+        }
+        // 模拟路径不注 ToolSearch（见 `cc_tools_core`），依赖它的那段指令不能留：提示词让
+        // 模型去 ToolSearch 一个客户端没声明的工具，是提示词与工具集不成套。
+        assert!(!asset.contains("EndConversation") && !asset.contains("ToolSearch"));
+        // 四族共有的那几节都在。
+        for section in [
+            "# Session-specific guidance",
+            "# Memory",
+            "# Environment",
+            "# Context management",
+            "# Delivering work",
+            "# Writing for the user",
+        ] {
+            assert!(asset.contains(section), "{section}");
+        }
+    }
+
+    /// 四族都选同一份模板，填完一个占位都不剩；按抓包机的取值回填能还原抓包那块的字节数
+    /// （11301 去掉 EndConversation 那段 233 字节 = 11068）。
+    #[test]
+    fn system_rest_renders_every_placeholder() {
+        use crate::proxy::{SimEnv, cc_system_rest, render_system_rest};
+        let cap = SimEnv {
+            home: "/Users/easayliu".into(),
+            cwd: "/Users/easayliu/Works/easay/opdash".into(),
+        };
+        assert_eq!(
+            cap.cwd_slug(),
+            "-Users-easayliu-Works-easay-opdash",
+            "官方的项目段拼法（cap/2.1.277/00023）"
+        );
+        assert_eq!(
+            SimEnv {
+                home: "/Users/x".into(),
+                cwd: "/private/tmp/proxy_captures/20260904_170955".into()
+            }
+            .cwd_slug(),
+            "-private-tmp-proxy-captures-20260904-170955",
+            "下划线也换成横线（cap/2.1.260-2/00013）"
+        );
+        for m in
+            ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
+        {
+            let t = cc_system_rest(m).expect(m);
+            assert_eq!(t, config::CC_SYSTEM_REST, "{m}: 四族同一份");
+            let out = render_system_rest(t, &cap);
+            assert_eq!(out.len(), 11068, "{m}: 按 cap/2.1.277/00023 的取值回填");
+            assert!(!unfilled(&out), "{m} 有占位没填: {out}");
+            assert!(out.contains(
+                "You have a persistent file-based memory at `/Users/easayliu/.claude/projects/-Users-easayliu-Works-easay-opdash/memory/`."
+            ));
+        }
+        // 认不出的模型不补第四块：落回「末块放客户端 system」的旧形态。
+        assert!(cc_system_rest("gpt-4o").is_none());
+        assert!(sim_for(r#"{"model":"gpt-4o","messages":[]}"#).rest.is_none());
+        assert!(sim_for(PLAIN_BODY).rest.is_some());
+    }
+
+    /// message-threads 续轮按 `cap/2.1.277/00035` 六项逐项对：`thread` 两个字段、`diagnostics`
+    /// 同一个 id、单块 billing system、没有 `tools`、`message-threads` beta、messages 非空。
+    /// 只抄 `thread` 两个字段的、缺任何一项的都不算——那是「可信 UA + 合法身份 + 两个字段」
+    /// 就能把一条没基座没工具的请求原样透传的口子。
+    #[test]
+    fn thread_continuation_is_recognized_only_with_a_previous_message() {
+        use crate::proxy::is_official_thread_continuation;
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let threads_beta = vec![config::CC_BETA_MESSAGE_THREADS.to_string()];
+        // 只有 thread 两个字段、别的一样都没有：不算。
+        assert!(!is_official_thread_continuation(
+            &j(
+                r#"{"model":"claude-sonnet-5","thread":{"type":"continue","previous_message_id":"msg_011CfBtz2HLGiHiC4riqiNAA"}}"#
+            ),
+            &threads_beta
+        ));
+
+        // 可信 UA + 合法身份 + 官方续轮形态 → 不模拟，透传。照 cap/2.1.277/00035 的样子造。
+        let mut cc_ua = crate::proxy::HeaderMap::new();
+        cc_ua.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.277 (external, cli)"),
+        );
+        cc_ua.insert(
+            "anthropic-beta",
+            HeaderValue::from_static(
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 message-threads-2026-08-12",
+            ),
+        );
+        let cont = Bytes::from(concat!(
+            r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]},"#,
+            r#"{"role":"system","content":[{"type":"text","text":"<system-reminder>\n<total_tokens>14981508 tokens left</total_tokens>\n</system-reminder>","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"#,
+            r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.277.d56; cc_entrypoint=cli; cch=429dc; cc_prev_req=req_011CfBtz1vkPkP5eC61usqa2; cc_prompt_id=759919ef-90c7-4602-b855-792116e1b7e9; cc_turn_origin=human;"}],"#,
+            r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"7fe47444-c834-44e0-b568-d61e07daa35e\"}"},"#,
+            r#""max_tokens":64000,"thinking":{"type":"adaptive","display":"updates"},"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},"#,
+            r#""output_config":{"effort":"high"},"thread":{"type":"continue","previous_message_id":"msg_011CfBtz2HLGiHiC4riqiNAA"},"diagnostics":{"previous_message_id":"msg_011CfBtz2HLGiHiC4riqiNAA"},"stream":true}"#
+        ));
+        let official: serde_json::Value = serde_json::from_slice(&cont).unwrap();
+        assert!(is_official_thread_continuation(&official, &threads_beta));
+        assert!(detect_with(&cont, &cc_ua, all_on()).is_none(), "官方续轮不该被重建成主线程");
+        // 也不该被当成一次性探针（有 system、没 tools、一条消息、新设备）。
+        assert!(
+            crate::proxy::probe_signature(
+                Some(&official),
+                Some("b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d"),
+                &threads_beta,
+                true,
+                false,
+                || false,
+            )
+            .is_none(),
+            "官方续轮不是探针"
+        );
+
+        // 六项缺任何一项都不算续轮；这些体在可信 UA 下落回「去掉基座的第三方」走模拟。
+        let broken: Vec<(&str, serde_json::Value)> = vec![
+            ("去掉 thread", {
+                let mut v = official.clone();
+                v.as_object_mut().unwrap().remove("thread");
+                v
+            }),
+            ("thread.type 是 create", {
+                let mut v = official.clone();
+                v["thread"] = serde_json::json!({"type": "create"});
+                v
+            }),
+            ("previous_message_id 不是 msg_ 开头", {
+                let mut v = official.clone();
+                v["thread"]["previous_message_id"] = serde_json::json!("abc");
+                v["diagnostics"]["previous_message_id"] = serde_json::json!("abc");
+                v
+            }),
+            ("diagnostics 的 id 与 thread 不一致", {
+                let mut v = official.clone();
+                v["diagnostics"]["previous_message_id"] = serde_json::json!("msg_other");
+                v
+            }),
+            ("没有 diagnostics", {
+                let mut v = official.clone();
+                v.as_object_mut().unwrap().remove("diagnostics");
+                v
+            }),
+            ("system 多了一块", {
+                let mut v = official.clone();
+                v["system"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type": "text", "text": "extra"}));
+                v
+            }),
+            ("system 那块不是 billing header", {
+                let mut v = official.clone();
+                v["system"][0]["text"] = serde_json::json!("You are a helpful assistant");
+                v
+            }),
+            ("system 那块带了断点", {
+                let mut v = official.clone();
+                v["system"][0]["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                v
+            }),
+            ("system 那块多了别的键", {
+                let mut v = official.clone();
+                v["system"][0]["citations"] = serde_json::json!({"enabled": false});
+                v
+            }),
+            ("system 那块 type 不是 text", {
+                let mut v = official.clone();
+                v["system"][0]["type"] = serde_json::json!("document");
+                v
+            }),
+            ("billing header 后面换行藏了一段提示词", {
+                let mut v = official.clone();
+                let t = format!(
+                    "{}\n\nYou are a helpful assistant",
+                    v["system"][0]["text"].as_str().unwrap()
+                );
+                v["system"][0]["text"] = serde_json::json!(t);
+                v
+            }),
+            ("billing header 后面接了 \\r", {
+                let mut v = official.clone();
+                let t = format!("{}\r", v["system"][0]["text"].as_str().unwrap());
+                v["system"][0]["text"] = serde_json::json!(t);
+                v
+            }),
+            ("带了 tools（哪怕是空数组）", {
+                let mut v = official.clone();
+                v["tools"] = serde_json::json!([]);
+                v
+            }),
+            ("messages 为空", {
+                let mut v = official.clone();
+                v["messages"] = serde_json::json!([]);
+                v
+            }),
+        ];
+        for (why, v) in &broken {
+            assert!(!is_official_thread_continuation(v, &threads_beta), "{why}");
+            let raw = Bytes::from(serde_json::to_vec(v).unwrap());
+            let got = detect_with(&raw, &cc_ua, all_on()).map(|s| s.reason);
+            assert!(got.is_some(), "{why}: 该走模拟");
+        }
+        // 头上没有 message-threads beta：体一样也不算。
+        assert!(!is_official_thread_continuation(&official, &[]));
+        let mut no_beta = crate::proxy::HeaderMap::new();
+        no_beta.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.277 (external, cli)"),
+        );
+        assert_eq!(
+            detect_with(&cont, &no_beta, all_on()).map(|s| s.reason),
+            Some(crate::proxy::SimulationReason::NoBasePrompt),
+            "没声明 message-threads 却发 thread，按去掉基座的第三方走模拟"
+        );
+        // UA 不可信的「续轮」照旧走模拟：thread 字段是抄得来的，可信 UA 与合法身份才是前提。
+        assert!(detect_for(&cont, all_on()).is_some(), "非 CC UA 带 thread 也走模拟");
+    }
+
+    /// 假环境按账号 + 设备派生：同输入恒定、形态是 `/Users/<user>/<dir>/<project>`，
+    /// 记忆目录的项目段把 `/` 与 `_` 换成 `-`。
+    #[test]
+    fn sim_env_is_derived_per_account_and_device() {
+        let cred = test_cred();
+        let a = crate::proxy::sim_env_for(&cred, "fp-a");
+        assert_eq!(a, crate::proxy::sim_env_for(&cred, "fp-a"), "同账号同设备恒定");
+        let parts: Vec<&str> = a.cwd.split('/').collect();
+        assert_eq!(parts.len(), 5, "/Users/<user>/<dir>/<project>: {}", a.cwd);
+        assert_eq!(parts[1], "Users");
+        assert_eq!(a.home, format!("/Users/{}", parts[2]));
+        assert!(a.cwd.starts_with(&format!("{}/", a.home)));
+        assert!(!a.cwd.contains("easayliu") && !a.cwd.contains("proxy_captures"));
+        assert_eq!(a.cwd_slug(), a.cwd.replace('/', "-"), "派生路径里没有下划线");
+        let other = crate::credentials::Credential {
+            account_uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            ..cred.clone()
+        };
+        let envs: std::collections::HashSet<String> =
+            (0..64).map(|i| crate::proxy::sim_env_for(&other, &format!("fp-{i}")).cwd).collect();
+        assert!(envs.len() > 8, "64 台设备不该挤在一两个目录里: {envs:?}");
     }
 
     /// cc_version 后缀与官方客户端的算法对齐（逆向自 2.1.251）：

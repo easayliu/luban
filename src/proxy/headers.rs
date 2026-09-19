@@ -459,6 +459,10 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
     if let Ok(v) = HeaderValue::from_str(&sim.session_id) {
         out.insert("x-claude-code-session-id", v);
     }
+    // 2.1.277 起每条都带的请求类别（`main` / `subagent` / `auxiliary`），按 profile 取
+    // （[`config::CcProfile::request_class`]）；线上位置由 [`config::CC_HEADER_ORDER`] 归到
+    // `x-app` 之后。
+    out.insert("x-claude-code-request-class", HeaderValue::from_static(sim.profile.request_class));
     if let Ok(v) = HeaderValue::from_str(&uuid_v4()) {
         out.insert("x-client-request-id", v);
     }
@@ -823,9 +827,10 @@ mod tests {
         assert_eq!(merge_beta(Some(SONNET_00017), Some("claude-sonnet-5"), v270), SONNET_00017);
         assert_eq!(merge_beta(Some(TITLE_00024), haiku, v270), TITLE_00024);
         assert_eq!(merge_beta(Some(QUOTA_00005), haiku, v270), QUOTA_00005);
-        // 更高的、还没抓包的小版本按最近一份已证形态处理，不退回 2.1.260 表。
+        // 2.1.270 与 2.1.277 之间没抓包的小版本按最近一份已证形态（2.1.270 表）处理，不退回
+        // 2.1.260 表；2.1.277 起另有自己的表（`merged_beta_is_idempotent_on_2_1_277_main_threads`）。
         assert_eq!(
-            merge_beta(Some(SONNET_00017), Some("claude-sonnet-5"), Some((2, 1, 299))),
+            merge_beta(Some(SONNET_00017), Some("claude-sonnet-5"), Some((2, 1, 276))),
             SONNET_00017
         );
         // 2.1.270 sonnet 的 profile 行就是这条串去掉 `oauth` 与 `afk-mode`，模拟路径的拼法
@@ -837,7 +842,8 @@ mod tests {
             SONNET_00017.replace(",afk-mode-2026-01-31", "")
         );
         // 其余三族不外推：自报 2.1.270 的 opus 仍拿 2.1.260 的行，完整的 2.1.260 opus 串不动。
-        let opus_260 = config::cc_profile(config::CcProfileKind::MainOpus);
+        let opus_260 = config::cc_profile_at(config::CcProfileKind::MainOpus, Some((2, 1, 260)));
+        assert_eq!(opus_260.version, "2.1.260");
         assert_eq!(
             config::cc_profile_at(config::CcProfileKind::MainOpus, v270).beta,
             opus_260.beta
@@ -1037,6 +1043,7 @@ mod tests {
             thinking_modified_retry: false,
             redacted_thinking_retry: false,
             simulate_cc: false,
+            simulate_full_system: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -1348,59 +1355,60 @@ mod tests {
     }
 
     /// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
-    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.260`
-    /// 与 `cap/2.1.260-2`，去掉动态的 `afk-mode`。
+    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.277`
+    /// 四族主线程的**会话首轮**，去掉动态的 `afk-mode`。
     ///
-    /// 四族分开验：haiku 不发 `mid-conversation-system`/`effort` 且 `claude-code-20250219`
-    /// 在**串中间**；fable 用 `per-turn-control` 换掉了 `advisor-tool`、且带
-    /// `server-side-fallback`；opus 多 `context-1m`、**不发** `server-side-fallback`。
-    /// 共用一份种子串就会给某一族发出真实客户端不产生的排列。
-    ///
-    /// sonnet / haiku 两行是外推值（2.1.260 没有主线程样本），钉在这里是为了让外推本身
-    /// 有个明确的落点——抓到样本后改这两个常量，测试会立刻告诉你哪里对不上。
+    /// 四族分开验：haiku 不发 `mid-conversation-*`/`effort` 且 `claude-code-20250219` 在**串
+    /// 中间**；fable 用 `per-turn-control`、不带 `message-threads`；opus 多 `context-1m`；
+    /// opus / fable 多 `mid-conversation-tool-changes`。共用一份种子串就会给某一族发出真实
+    /// 客户端不产生的排列。2.1.277 四族都有真样本，不再有外推行。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.260-2/00025（opus-5 直连），去掉 afk-mode。
+        // cap/2.1.277/00357（opus-5 直连）。
         const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
              context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,\
-             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-        // cap/2.1.260/00018（fable-5-1 直连），去掉 afk-mode。
+             mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        // cap/2.1.277/00023（fable-5-1 直连），去掉 afk-mode。
         const OFFICIAL_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,\
-             advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             server-side-fallback-2026-06-01,fallback-credit-2026-06-01,\
+             mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
              cache-diagnosis-2026-04-07";
-        // 外推自 cap/2.1.258/00026（sonnet-5 直连），见 config::CC_PROFILES。
-        const DERIVED_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
+        // cap/2.1.277/00031（sonnet-5 直连，会话首轮），去掉 afk-mode。
+        const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,effort-2025-11-24,\
-             server-side-fallback-2026-06-01,fallback-credit-2026-06-01,\
+             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
-             cache-diagnosis-2026-04-07";
-        // 外推自 cap/2.1.258/00031（haiku-4.5 直连）。
-        const DERIVED_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        // cap/2.1.277/00046（haiku-4.5 直连，会话首轮）。
+        const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,server-side-fallback-2026-06-01,\
-             fallback-credit-2026-06-01,thinking-display-updates-2026-08-18,\
-             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
+             advanced-tool-use-2025-11-20,fallback-credit-2026-06-01,\
+             thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+             message-threads-2026-08-12";
 
         for (model, official) in [
-            ("claude-sonnet-5", DERIVED_SONNET),
+            ("claude-sonnet-5", OFFICIAL_SONNET),
             ("claude-opus-5", OFFICIAL_OPUS),
             ("claude-fable-5-1", OFFICIAL_FABLE),
             ("claude-fable-5", OFFICIAL_FABLE), // 没有 fable-5 样本，按族归 fable
-            ("gpt-4o", DERIVED_SONNET),         // 认不出的模型退回 sonnet 主串
-            ("claude-haiku-4-5-20251001", DERIVED_HAIKU),
+            ("gpt-4o", OFFICIAL_SONNET),        // 认不出的模型退回 sonnet 主串
+            ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
         ] {
             let profile = crate::proxy::cc_profile_for(model);
             assert_eq!(crate::proxy::simulated_beta(profile.beta, None), official, "{model}");
@@ -1418,11 +1426,57 @@ mod tests {
         assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
     }
 
-    /// 六个已观察 profile 的 beta 串逐字对上抓包（去掉 `oauth` 与动态的 `afk-mode` 之后）。
-    ///
-    /// 这是 [`config::CC_PROFILES`] 那张表的验收：表里每一行的 `beta` 都必须能与某一份
-    /// 原始抓包对上，外推的两行（`MainSonnet`/`MainHaiku`）不在此列——它们由
-    /// [`simulated_beta_matches_official`] 钉住。
+    /// 2.1.277 三个辅助 profile 的 beta 串逐字对上抓包（去掉 `oauth` 之后；四族主线程由
+    /// [`simulated_beta_matches_official`] 钉住）。
+    #[test]
+    fn profile_betas_match_the_2_1_277_captures() {
+        use config::CcProfileKind::*;
+        let cases: &[(config::CcProfileKind, &str, &str)] = &[
+            (
+                SdkSubagentHaiku,
+                "cap/2.1.277/00049",
+                "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+            ),
+            (
+                SessionTitleHaiku,
+                "cap/2.1.277/00022",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+                 structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+            ),
+            (
+                QuotaProbe,
+                "cap/2.1.277/00005",
+                "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05",
+            ),
+        ];
+        for (kind, cap, official) in cases {
+            let p = config::cc_profile(*kind);
+            assert_eq!(p.version, "2.1.277", "{kind:?}");
+            assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
+        }
+        // 每个 2.1.277 主线程 profile 的 `oauth` 都由 simulated_beta 落到官方位置：以 claude-code
+        // 开头的紧随其后，haiku 排在最前（cap/2.1.277/00046 头两项 `oauth,interleaved`）。
+        assert!(
+            crate::proxy::simulated_beta(config::cc_profile(MainHaiku).beta, None)
+                .starts_with("oauth-2025-04-20,interleaved-thinking-2025-05-14,")
+        );
+        assert!(
+            crate::proxy::simulated_beta(config::cc_profile(MainOpus).beta, None)
+                .starts_with("claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,")
+        );
+    }
+
+    /// 六个已观察的 2.1.260 profile 的 beta 串逐字对上抓包（去掉 `oauth` 与动态的 `afk-mode`
+    /// 之后）。这张表现在只给 2.1.260 ~ 2.1.276 来访的 [`merge_beta`] 做参照，与 2.1.277 表没
+    /// 编的两个 kind 兜底，验收照旧。
     #[test]
     fn profile_betas_match_the_2_1_260_captures() {
         use config::CcProfileKind::*;
@@ -1471,7 +1525,32 @@ mod tests {
             ),
         ];
         for (kind, cap, official) in cases {
-            assert_eq!(config::cc_profile(*kind).beta, *official, "{kind:?}（{cap}）");
+            let p = config::cc_profile_at(*kind, Some((2, 1, 260)));
+            assert_eq!(p.version, "2.1.260", "{kind:?}");
+            assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
+        }
+    }
+
+    /// [`merge_beta`] 对一条**完整的** 2.1.277 订阅端串必须幂等：参照串取 2.1.277 表，
+    /// `server-side-fallback` 四族都不在参照里、不补；`fallback-credit` / `display-updates` /
+    /// `cache-diagnosis` / `extended-cache-ttl` 都已在位。参照选错一版就会把 2.1.260 才有的
+    /// `server-side-fallback` 塞回来。
+    #[test]
+    fn merged_beta_is_idempotent_on_2_1_277_main_threads() {
+        use config::CcProfileKind::*;
+        for (kind, model) in [
+            (MainOpus, "claude-opus-5"),
+            (MainFable, "claude-fable-5-1"),
+            (MainSonnet, "claude-sonnet-5"),
+            (MainHaiku, "claude-haiku-4-5-20251001"),
+        ] {
+            let official = crate::proxy::simulated_beta(config::cc_profile(kind).beta, None);
+            assert_eq!(
+                merge_beta(Some(&official), Some(model), Some((2, 1, 277))),
+                official,
+                "{kind:?}: 完整的 2.1.277 官方串过 merge_beta 不该多一项"
+            );
+            assert!(!official.contains("server-side-fallback"), "{kind:?}");
         }
     }
 
@@ -1506,8 +1585,10 @@ mod tests {
     /// `thinking-display-updates`，照旧要补那两项。
     #[test]
     fn merge_beta_leaves_the_sdk_subagent_alone() {
+        // 2.1.260 的子代理串。2.1.277 的子代理带上了 advisor-tool / advanced-tool-use，这条
+        // 判据认不出它——见 config::cc_2_1_277_missing_samples 第 3 条，没有 API-key 端样本前不改。
         let official = crate::proxy::simulated_beta(
-            config::cc_profile(config::CcProfileKind::SdkSubagentHaiku).beta,
+            config::cc_profile_at(config::CcProfileKind::SdkSubagentHaiku, Some((2, 1, 260))).beta,
             None,
         );
         let api_key_side: Vec<&str> =
@@ -1536,11 +1617,17 @@ mod tests {
     /// `redact-thinking` 与 `thinking-display-updates` 并存。
     #[test]
     fn simulated_beta_rejects_conflicting_client_betas() {
-        let fable = crate::proxy::cc_profile_for("claude-fable-5-1").beta;
-        // 官方 fable 串里是 06-01；客户端带 07-01，不该拼出两条。
-        let out = crate::proxy::simulated_beta(fable, Some("server-side-fallback-2026-07-01"));
+        // 2.1.260 的官方 fable 串里是 06-01；客户端带 07-01，不该拼出两条。（2.1.277 四族都不发
+        // 这一项了，故用 2.1.260 那行做同名不同日期的样本。）
+        let fable_260 =
+            config::cc_profile_at(config::CcProfileKind::MainFable, Some((2, 1, 260))).beta;
+        let out = crate::proxy::simulated_beta(fable_260, Some("server-side-fallback-2026-07-01"));
         assert_eq!(out.matches("server-side-fallback-").count(), 1, "只该有一条: {out}");
         assert!(out.contains("server-side-fallback-2026-06-01"), "留官方那条日期: {out}");
+        // 2.1.277 的 fable 串里没有它：客户端带来的那条照发（不是同名、不是互斥，上游判）。
+        let fable = crate::proxy::cc_profile_for("claude-fable-5-1").beta;
+        let out = crate::proxy::simulated_beta(fable, Some("server-side-fallback-2026-07-01"));
+        assert_eq!(out.matches("server-side-fallback-").count(), 1, "{out}");
 
         // opus 官方串有 thinking-display-updates，客户端带 redact-thinking → 丢。
         let opus = crate::proxy::cc_profile_for("claude-opus-5").beta;
@@ -1586,7 +1673,7 @@ mod tests {
         assert_eq!(
             out,
             crate::proxy::simulated_beta(
-                crate::proxy::cc_profile_for("claude-fable-5-1").beta,
+                config::cc_profile_at(config::CcProfileKind::MainFable, Some((2, 1, 260))).beta,
                 None
             )
         );
