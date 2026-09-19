@@ -463,18 +463,26 @@ export interface UsagePage {
  * 第二页整体往回错、重复吐出第一页的尾巴。首次不传，之后把响应里的 `anchor` 原样带回来，
  * 整轮翻页就钉在同一个快照上——页码、总条数、总花费三者始终自洽。
  */
+/** 流水筛选：`model` 精确匹配、`hours` 只看最近这么多小时——拆分表点进来看明细带的。 */
+export interface UsageListParams {
+  limit?: number
+  offset?: number
+  until?: number
+  request_id?: string
+  model?: string
+  hours?: number
+}
+
 export async function listCredentialUsage(
   id: number,
-  params: { limit?: number; offset?: number; until?: number; request_id?: string } = {},
+  params: UsageListParams = {},
 ): Promise<UsagePage> {
   const { data } = await api.get<UsagePage>(`/credentials/${id}/usage`, { params })
   return data
 }
 
 /** 全部账号的流水（按时间倒序）；`request_id` 精确匹配，用于按请求 id 查一条。 */
-export async function listUsage(
-  params: { limit?: number; offset?: number; until?: number; request_id?: string } = {},
-): Promise<UsagePage> {
+export async function listUsage(params: UsageListParams = {}): Promise<UsagePage> {
   const { data } = await api.get<UsagePage>('/usage', { params })
   return data
 }

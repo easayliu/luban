@@ -537,6 +537,7 @@ pub async fn run(
         .route("/metrics/cache-series", get(get_cache_series))
         .route("/metrics/ttft-series", get(get_ttft_series))
         .route("/metrics/breakdown", get(get_usage_breakdown))
+        .route("/metrics/rejections", get(get_rejections))
         .route("/settings", get(get_settings))
         .route("/settings/api-key", post(set_api_key))
         .route("/settings/device-ttl", post(set_device_ttl))
@@ -829,6 +830,12 @@ struct UsageQuery {
     /// `upstream_request_id`）。精确匹配，空白视同不筛。
     #[serde(default)]
     request_id: Option<String>,
+    /// 只看这个模型（精确匹配）；趋势对话框的拆分表点进来带的。
+    #[serde(default)]
+    model: Option<String>,
+    /// 只看最近这么多小时；不传为不限（受流水保留期约束）。
+    #[serde(default)]
+    hours: Option<i64>,
 }
 
 /// 一页流水 + 整个集合的口径。前端要靠 `total` 算页数、靠 `anchor` 把整轮翻页钉在同一快照上。
@@ -883,12 +890,18 @@ fn usage_page(
 ) -> Result<Json<UsagePage>, ApiError> {
     let limit = q.limit.unwrap_or(default_limit).clamp(1, max_limit);
     let offset = q.offset.unwrap_or(0).max(0);
+    let since = q.hours.map(|h| {
+        let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+        chrono::Utc::now().timestamp() - h.clamp(1, max_hours) * 3600
+    });
     let mut filter = store::UsageLogQuery {
         cred_id,
         until_id: q.until,
         offset,
         limit,
         request_id: q.request_id.clone(),
+        model: q.model.clone(),
+        since,
     };
     let stats = state.store.usage_log_stats(filter.clone()).map_err(internal)?;
     // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
@@ -2159,6 +2172,53 @@ struct BreakdownResp {
     since: i64,
     by: String,
     rows: Vec<store::BreakdownRow>,
+    /// 全部分组（不止返回的前 12 行）缓存省下的钱合计（USD），见 `BreakdownRow::cache_saved_usd`。
+    cache_saved_usd_total: f64,
+}
+
+#[derive(Deserialize)]
+struct RejectionsQuery {
+    #[serde(default = "default_rejections_hours")]
+    hours: i64,
+}
+
+fn default_rejections_hours() -> i64 {
+    1
+}
+
+#[derive(Serialize)]
+struct RejectionKind {
+    kind: String,
+    count: i64,
+}
+
+#[derive(Serialize)]
+struct RejectionsResp {
+    since: i64,
+    total: i64,
+    rows: Vec<RejectionKind>,
+}
+
+/// 近几小时本地拒绝的条数，按原因分类：设备 / 会话 / RPM 三道闸加了之后，被拒的请求只在流水里
+/// 记成本地 429，概览得有个数才知道有号被打满。同样过 20 秒缓存。
+async fn get_rejections(
+    State(state): State<AppState>,
+    Query(q): Query<RejectionsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
+    let hours = q.hours.clamp(1, max_hours);
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    cached_metrics(format!("rejections:{hours}"), || {
+        let rows: Vec<RejectionKind> = state
+            .store
+            .local_rejections(since)
+            .map_err(internal)?
+            .into_iter()
+            .map(|(kind, count)| RejectionKind { kind, count })
+            .collect();
+        let total = rows.iter().map(|r| r.count).sum();
+        Ok(RejectionsResp { since, total, rows })
+    })
 }
 
 /// 这段时间按模型或按账号拆开的延迟与缓存：趋势对话框下面那张「谁在拖后腿」的表。
@@ -2176,8 +2236,11 @@ async fn get_usage_breakdown(
     };
     let by_name = if by == store::BreakdownBy::Account { "account" } else { "model" };
     cached_metrics(format!("breakdown:{hours}:{by_name}"), || {
-        let rows = state.store.usage_breakdown(since, by, 12).map_err(internal)?;
-        Ok(BreakdownResp { since, by: by_name.into(), rows })
+        // 合计要覆盖全部分组，先不截断；前端只拿前 12 行。
+        let mut rows = state.store.usage_breakdown(since, by, usize::MAX).map_err(internal)?;
+        let cache_saved_usd_total = rows.iter().map(|r| r.cache_saved_usd).sum();
+        rows.truncate(12);
+        Ok(BreakdownResp { since, by: by_name.into(), rows, cache_saved_usd_total })
     })
 }
 

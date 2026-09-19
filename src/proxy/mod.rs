@@ -202,6 +202,8 @@ pub async fn handle(
         if let Some(tag) = local_replay {
             rec.forensics.rewrites = Some(tag.into());
             rec.cost_usd = Some(0.0);
+        } else if let Some(kind) = log_state.local_reject.lock().take() {
+            rec.forensics.rewrites = Some(format!("{REWRITE_REJECTED_LOCALLY}:{kind}"));
         }
         spawn_usage_log(store, rec);
     }
@@ -275,8 +277,17 @@ struct RequestLogState {
     /// 这类 200 若不标出来就从流水、请求查询与统计里消失——0.3.98 把本地 403 改成回放 200
     /// 时正是这样漏掉的。有标签的按本地流水补一条：无凭证、无用量、花费 0、`rewrites` 记标签。
     local_replay: parking_lot::Mutex<Option<&'static str>>,
+    /// 本地拒绝的**原因分类**（`device-limit` / `session-limit` / `account-rpm` / `device-rpm` /
+    /// `session-rpm` / `session-concurrency` / `bare-rate-limit` / `all-cooling-down` /
+    /// `no-device-id` …）：拒绝那一处随手放下，[`handle`] 写流水时拼进 `rewrites`
+    /// （`rejected_locally:<kind>`），概览按它统计「近 1 小时被谁拒了多少」。没标的仍是裸的
+    /// `rejected_locally`（坏形态、鉴权那些）。
+    local_reject: parking_lot::Mutex<Option<&'static str>>,
 }
 
+/// 流水 `rewrites` 里标「本地拒绝、未转发」；带原因分类时是 `rejected_locally:<kind>`，
+/// 见 [`RequestLogState::local_reject`]。
+pub(super) const REWRITE_REJECTED_LOCALLY: &str = "rejected_locally";
 /// 流水 `rewrites` 里标「本地回放了学到的上游拒答」（[`known_refused_prompt`] 命中）。
 const REWRITE_REFUSAL_REPLAY: &str = "refusal_replay";
 /// 流水 `rewrites` 里标「本地回放了按应用学到的上游拒答」（[`known_app_refusal`] 命中）。
@@ -333,7 +344,7 @@ fn local_reject_record(
             session_id,
             error_type,
             error_message,
-            rewrites: Some("rejected_locally".into()),
+            rewrites: Some(REWRITE_REJECTED_LOCALLY.into()),
             ..Default::default()
         },
         ..Default::default()

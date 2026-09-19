@@ -130,6 +130,7 @@ pub(super) async fn handle_inner(
     if let Some(sid) = session_from_header.as_deref()
         && let Some(retry) = state.store.take_session_rpm_slot(sid)
     {
+        *log_state.local_reject.lock() = Some("session-rpm");
         return session_rpm_rejection(
             &state.rejection_log,
             &method,
@@ -148,6 +149,7 @@ pub(super) async fn handle_inner(
         match try_acquire_session_concurrency(&state.session_concurrency, sid, concurrency_limit) {
             Ok(guard) => guard,
             Err(current) => {
+                *log_state.local_reject.lock() = Some("session-concurrency");
                 return session_concurrency_rejection(
                     &state.rejection_log,
                     &method,
@@ -299,6 +301,7 @@ pub(super) async fn handle_inner(
     if device_id.is_none() {
         if billable && state.store.require_device_id() {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request has no usable device identity (metadata.user_id missing or unrecognized)");
+            *log_state.local_reject.lock() = Some("no-device-id");
             return error_response(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -316,6 +319,7 @@ pub(super) async fn handle_inner(
         && let Some(sid) = session_id.as_deref()
         && let Some(retry) = state.store.take_session_rpm_slot(sid)
     {
+        *log_state.local_reject.lock() = Some("session-rpm");
         return session_rpm_rejection(
             &state.rejection_log,
             &method,
@@ -334,6 +338,7 @@ pub(super) async fn handle_inner(
         match try_acquire_session_concurrency(&state.session_concurrency, sid, concurrency_limit) {
             Ok(guard) => session_concurrency_guard = guard,
             Err(current) => {
+                *log_state.local_reject.lock() = Some("session-concurrency");
                 return session_concurrency_rejection(
                     &state.rejection_log,
                     &method,
@@ -645,6 +650,7 @@ pub(super) async fn handle_inner(
             let device_short: String = dev.chars().take(8).collect();
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, device = %device_short, retry_after = retry, suppressed, "rejected: this device has reached its RPM limit");
         }
+        *log_state.local_reject.lock() = Some("device-rpm");
         return rate_limit_response(
             retry,
             format!("this device has reached its RPM limit; retry in {retry} seconds"),
@@ -730,6 +736,7 @@ pub(super) async fn handle_inner(
             } else {
                 "unavailable"
             };
+            *log_state.local_reject.lock() = Some(kind);
             // 分桶用设备，没有设备身份就退到会话，都没有才并成一桶——后者本就是「裸请求」，
             // 它们由裸请求上限统一管着，日志上也没有更细的身份可分。
             let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");

@@ -280,7 +280,7 @@ function TtftTable({
   const rows = slots.filter((s) => s.hasTraffic)
 
   return (
-    <div className="max-h-64 overflow-y-auto rounded-xl border">
+    <div className="max-h-64 overflow-auto rounded-xl border">
       <table className="w-full text-xs">
         <thead className="sticky top-0 bg-surface-subtle">
           <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
@@ -320,7 +320,7 @@ function TtftTable({
 export function TtftSparkline({ slots, className }: { slots: TtftSlot[]; className?: string }) {
   const maxP50 = Math.max(0, ...slots.filter((s) => s.hasTraffic).map((s) => s.p50Ms))
   return (
-    <span aria-hidden className={cn('flex h-5 w-20 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 min-w-0 max-w-20 flex-1 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const heightPct = slot.hasTraffic && maxP50 > 0
           ? Math.min(100, (slot.p50Ms / maxP50) * 100)

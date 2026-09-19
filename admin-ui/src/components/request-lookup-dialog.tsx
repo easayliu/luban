@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { SearchIcon } from 'lucide-react'
-import { listUsage, type UsageLog } from '@/api/credentials'
+import { listCredentialUsage, listUsage, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
   cn, displayCredentialLabel, extractError, formatFullTime, formatUsd,
@@ -26,22 +26,46 @@ import { RequestIdChip, statusVariant } from '@/components/credential-usage-dial
  * 上的那个 `req_…`），贴进来直接看到它走的是哪个账号、模型、状态、用量与花费。
  * 不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
  */
+/** 从趋势对话框的拆分表点进来时带的筛选：某个模型或某个账号、最近几小时。 */
+export interface UsageDrillFilter {
+  model?: string
+  credId?: number
+  /** 展示名（模型名或账号 label）。 */
+  label: string
+  hours: number
+}
+
 export function RequestLookupDialog({
   open,
   onOpenChange,
+  filter,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 给了就不显示请求 id 的输入框，直接列这个模型 / 账号最近的 50 条。 */
+  filter?: UsageDrillFilter
 }) {
   const { t, language, locale } = useI18n()
   const [draft, setDraft] = useState('')
   const [submitted, setSubmitted] = useState('')
   const query = useQuery({
-    queryKey: ['request-lookup', submitted],
-    queryFn: () => listUsage({ request_id: submitted, limit: 50 }),
-    enabled: open && submitted !== '',
+    queryKey: filter
+      ? ['request-drill', filter.model ?? null, filter.credId ?? null, filter.hours]
+      : ['request-lookup', submitted],
+    queryFn: () => filter
+      ? filter.credId != null
+        ? listCredentialUsage(filter.credId, { model: filter.model, hours: filter.hours, limit: 50 })
+        : listUsage({ model: filter.model, hours: filter.hours, limit: 50 })
+      : listUsage({ request_id: submitted, limit: 50 }),
+    enabled: open && (filter != null || submitted !== ''),
   })
   const rows = query.data?.logs ?? []
+  const drillTitle = filter
+    ? t(
+        `${filter.label} · 近 ${filter.hours} 小时 · 最近 ${rows.length.toLocaleString(locale)} 条`,
+        `${filter.label} · last ${filter.hours}h · latest ${rows.length.toLocaleString(locale)}`,
+      )
+    : ''
 
   const submit = () => {
     const id = draft.trim()
@@ -56,16 +80,18 @@ export function RequestLookupDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogPopup className="max-w-3xl">
         <DialogHeader>
-          <DialogTitle>{t('请求查询', 'Request lookup')}</DialogTitle>
+          <DialogTitle>{filter ? t('请求明细', 'Request details') : t('请求查询', 'Request lookup')}</DialogTitle>
           <DialogDescription>
-            {t(
-              '贴入 luban 回在响应头 X-Request-Id / X-Oneapi-Request-Id 上的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查它在这里的流水。',
-              'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here.',
-            )}
+            {filter
+              ? drillTitle
+              : t(
+                  '贴入 luban 回在响应头 X-Request-Id / X-Oneapi-Request-Id 上的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查它在这里的流水。',
+                  'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here.',
+                )}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
-          <Form onSubmit={(e) => { e.preventDefault(); submit() }}>
+          {!filter && <Form onSubmit={(e) => { e.preventDefault(); submit() }}>
             <Field>
               <FieldLabel htmlFor="request-lookup-id">{t('请求 ID', 'Request ID')}</FieldLabel>
               <div className="flex gap-2">
@@ -88,9 +114,9 @@ export function RequestLookupDialog({
                 {t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
               </FieldDescription>
             </Field>
-          </Form>
+          </Form>}
 
-          {submitted === '' ? null : query.isPending ? (
+          {!filter && submitted === '' ? null : query.isPending ? (
             <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
               <Spinner />{t('正在查询', 'Searching')}
             </div>
@@ -102,7 +128,7 @@ export function RequestLookupDialog({
           ) : rows.length === 0 ? (
             <Empty className="py-8">
               <EmptyHeader>
-                <EmptyTitle className="text-base">{t('没有找到这条请求', 'No request found')}</EmptyTitle>
+                <EmptyTitle className="text-base">{filter ? t('这段时间没有请求', 'No requests in this period') : t('没有找到这条请求', 'No request found')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
                     '确认 id 完整（luban 生成的形如 req_ 加 16 位随机串）；超过 30 天的流水已被裁剪。',

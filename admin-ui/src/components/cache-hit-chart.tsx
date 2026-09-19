@@ -210,7 +210,8 @@ export function CacheHitTable({
   const rows = slots.filter((s) => s.hasTraffic)
 
   return (
-    <div className="max-h-64 overflow-y-auto rounded-xl border">
+    // 六列在手机宽度上放不下，横向滚动而不是把表撑出对话框。
+    <div className="max-h-64 overflow-auto rounded-xl border">
       <table className="w-full text-xs" aria-describedby={captionId}>
         <caption id={captionId} className="sr-only">
           {t('缓存命中率按时段明细', 'Cache hit rate by period')}
@@ -254,7 +255,7 @@ export function CacheHitTable({
 export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; className?: string }) {
   const maxInput = Math.max(0, ...slots.map((s) => s.inputTokens))
   return (
-    <span aria-hidden className={cn('flex h-5 w-20 items-end gap-px', className)}>
+    <span aria-hidden className={cn('flex h-5 min-w-0 max-w-20 flex-1 items-end gap-px', className)}>
       {slots.map((slot, i) => {
         const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
         const last = i === slots.length - 1

@@ -102,8 +102,12 @@ export interface BreakdownRow {
   key: string
   /** 模型名，或凭证 label（已删的号是 `#<id>`）。 */
   label: string
+  /** 按账号拆时该号的套餐；按模型拆或号已删为 null。 */
+  tier: string | null
   /** 这段时间里的全部请求数（含失败的）。 */
   requests: number
+  /** 缓存给这一组省下的钱（USD）：命中省的减去写入多付的，可能为负。 */
+  cache_saved_usd: number
   /** 延迟（只算成功且记了 TTFT 的请求）。 */
   latency: TtftSeriesPoint
   /** 缓存三段 token（所有请求）。 */
@@ -114,6 +118,28 @@ export interface Breakdown {
   since: number
   by: BreakdownBy
   rows: BreakdownRow[]
+  /** 全部分组（不止前 12 行）缓存省下的钱合计（USD）。 */
+  cache_saved_usd_total: number
+}
+
+// ---------- 本地拒绝 ----------
+
+export interface RejectionKind {
+  /** device-limit / session-limit / account-rpm / device-rpm / session-rpm / session-concurrency / bare-rate-limit / all-cooling-down / no-device-id / model-unsupported / unavailable / other */
+  kind: string
+  count: number
+}
+
+export interface Rejections {
+  since: number
+  total: number
+  rows: RejectionKind[]
+}
+
+/** 近几小时 luban 自己拒掉（没转发）的请求数，按原因分类，按条数降序。 */
+export async function getRejections(hours: number): Promise<Rejections> {
+  const { data } = await api.get<Rejections>('/metrics/rejections', { params: { hours } })
+  return data
 }
 
 /** 这段时间按模型或按账号拆开的延迟与缓存，按请求数降序、最多 12 行。 */

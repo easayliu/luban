@@ -30,19 +30,21 @@ export function OverviewMetric({
       </span>
       <div className="min-w-0 flex-1">
         <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
+        {/* 顺序是数值、小字、迷你线：小字（如「7d 1.2s ↑50%」）是要读的，迷你线是弹性的——
+            放在最后、按剩余宽度伸缩，格子窄的时候被压扁的是它而不是小字被截成「7d 1…」。 */}
         <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
             {value}
           </span>
-          {trend}
           {status && (
             <Tooltip>
-              <TooltipTrigger className="min-w-0 truncate text-2xs text-muted-foreground">
+              <TooltipTrigger className="min-w-0 shrink truncate text-2xs text-muted-foreground">
                 {status}
               </TooltipTrigger>
               <TooltipPopup>{status}</TooltipPopup>
             </Tooltip>
           )}
+          {trend}
         </div>
       </div>
     </div>

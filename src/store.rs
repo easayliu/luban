@@ -3628,6 +3628,10 @@ pub struct UsageLogQuery {
     pub limit: i64,
     /// 只看这一个请求 id（精确匹配，见 [`UsageRecord::request_id`]）；空白视同 `None`。
     pub request_id: Option<String>,
+    /// 只看这个模型（精确匹配 `model` 列）；空白视同 `None`。趋势对话框的拆分表点进来用。
+    pub model: Option<String>,
+    /// 只看这个时刻（Unix 秒）之后的；`None` 为不限。
+    pub since: Option<i64>,
 }
 
 impl UsageLogQuery {
@@ -3652,6 +3656,14 @@ impl UsageLogQuery {
         if let Some(r) = self.request_id.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
             params.push(Value::Text(r.to_string()));
             clauses.push(format!("request_id = ?{}", params.len()));
+        }
+        if let Some(m) = self.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            params.push(Value::Text(m.to_string()));
+            clauses.push(format!("model = ?{}", params.len()));
+        }
+        if let Some(s) = self.since {
+            params.push(Value::Integer(s));
+            clauses.push(format!("ts >= ?{}", params.len()));
         }
         let sql = if clauses.is_empty() {
             String::new()
@@ -3735,6 +3747,38 @@ struct LatencyRow {
     output_tokens: Option<i64>,
 }
 
+/// 一条请求里缓存省下的钱：命中与写入都按原价算一遍减去实际计价。命中省 0.9 倍输入价，
+/// 5 分钟档写入多付 0.25 倍、1 小时档多付 1 倍；模型认不出价目时记 0。
+fn cache_saved_usd(
+    model: Option<&str>,
+    plain: i64,
+    cached: i64,
+    creation: Option<i64>,
+    c5: Option<i64>,
+    c1: Option<i64>,
+) -> f64 {
+    use crate::pricing::{Usage, estimate_usd};
+    let written = creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0));
+    let actual = estimate_usd(Usage {
+        model,
+        input_tokens: Some(plain),
+        cache_read_tokens: Some(cached),
+        cache_creation_total: creation,
+        cache_5m_tokens: c5,
+        cache_1h_tokens: c1,
+        ..Default::default()
+    });
+    let baseline = estimate_usd(Usage {
+        model,
+        input_tokens: Some(plain + cached + written),
+        ..Default::default()
+    });
+    match (actual, baseline) {
+        (Some(a), Some(b)) => b - a,
+        _ => 0.0,
+    }
+}
+
 /// nearest-rank 分位：`sorted` 已升序、非空，`p` 在 (0, 1]。
 fn percentile(sorted: &[i64], p: f64) -> i64 {
     let rank = ((sorted.len() as f64) * p).ceil() as usize;
@@ -3784,8 +3828,15 @@ pub struct BreakdownRow {
     pub key: String,
     /// 展示名：模型名本身，或凭证的 label（已删的号是 `#<id>`）。
     pub label: String,
+    /// 按账号拆时该号的套餐（`Max 5x` / `Pro` …）；按模型拆或号已删为 `None`。Max 号和 Pro 号
+    /// 上游的排队本来就不同，混在一起比延迟没有意义。
+    pub tier: Option<String>,
     /// 这段时间里的全部请求数（含失败的）。
     pub requests: i64,
+    /// 缓存给这一组省下的钱（USD）：把命中与写入都按原价算一遍再减去实际——命中按十分之一
+    /// 计价省下来的，减掉写入按 1.25 倍（1 小时档 2 倍）多付的。可能为负：只写不命中就是亏。
+    /// 模型认不出价目的行不计。
+    pub cache_saved_usd: f64,
     /// 延迟统计（只算成功且记了 TTFT 的请求），`ts` 一律是窗口起点。
     pub latency: TtftBucket,
     /// 缓存三段 token（所有请求）。
@@ -4473,9 +4524,11 @@ impl CredentialStore {
     ) -> Result<Vec<BreakdownRow>> {
         struct Group {
             label: String,
+            tier: Option<String>,
             requests: i64,
             latency: Vec<LatencyRow>,
             cache: CacheBucket,
+            saved_usd: f64,
         }
         let conn = self.conn.lock();
         let key_expr = match by {
@@ -4490,13 +4543,10 @@ impl CredentialStore {
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT {key_expr}, {label_expr}, u.ts, u.status, u.ttft_ms, u.total_ms, u.output_tokens,
-                    COALESCE(u.input_tokens, 0)
-                        + COALESCE(u.cache_creation_tokens,
-                                   COALESCE(u.cache_5m_tokens, 0) + COALESCE(u.cache_1h_tokens, 0))
-                        + COALESCE(u.cache_read_tokens, 0),
+                    COALESCE(u.input_tokens, 0),
                     COALESCE(u.cache_read_tokens, 0),
-                    COALESCE(u.cache_creation_tokens,
-                             COALESCE(u.cache_5m_tokens, 0) + COALESCE(u.cache_1h_tokens, 0))
+                    u.cache_creation_tokens, u.cache_5m_tokens, u.cache_1h_tokens,
+                    u.model, c.tier
                FROM usage_logs u
                LEFT JOIN credentials c ON c.id = u.cred_id
               WHERE u.ts >= ?1"
@@ -4511,19 +4561,27 @@ impl CredentialStore {
             let ttft_ms: Option<i64> = r.get(4)?;
             let total_ms: Option<i64> = r.get(5)?;
             let output_tokens: Option<i64> = r.get(6)?;
-            let input: i64 = r.get(7)?;
+            let plain: i64 = r.get(7)?;
             let cached: i64 = r.get(8)?;
-            let written: i64 = r.get(9)?;
+            let creation: Option<i64> = r.get(9)?;
+            let c5: Option<i64> = r.get(10)?;
+            let c1: Option<i64> = r.get(11)?;
+            let model: Option<String> = r.get(12)?;
+            let tier: Option<String> = r.get(13)?;
+            let written = creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0));
             let g = groups.entry(key).or_insert_with(|| Group {
                 label,
+                tier: if by == BreakdownBy::Account { tier } else { None },
                 requests: 0,
                 latency: Vec::new(),
                 cache: CacheBucket::empty(since),
+                saved_usd: 0.0,
             });
             g.requests += 1;
-            g.cache.input_tokens += input;
+            g.cache.input_tokens += plain + written + cached;
             g.cache.cached_tokens += cached;
             g.cache.written_tokens += written;
+            g.saved_usd += cache_saved_usd(model.as_deref(), plain, cached, creation, c5, c1);
             if status == 200
                 && let Some(ttft_ms) = ttft_ms
             {
@@ -4535,13 +4593,36 @@ impl CredentialStore {
             .map(|(key, g)| BreakdownRow {
                 key,
                 label: g.label,
+                tier: g.tier,
                 requests: g.requests,
+                cache_saved_usd: g.saved_usd,
                 latency: summarize_latency(since, &g.latency),
                 cache: g.cache,
             })
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then_with(|| a.key.cmp(&b.key)));
         out.truncate(limit);
+        Ok(out)
+    }
+
+    /// `since` 起本地拒绝的条数，按原因分类（`rewrites` 里 `rejected_locally:<kind>` 的 kind；
+    /// 没分类的算 `other`），按条数降序。给概览「近 1 小时被拒了多少、为什么」用。
+    pub fn local_rejections(&self, since: i64) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT rewrites, COUNT(*) FROM usage_logs
+              WHERE ts >= ?1 AND rewrites LIKE 'rejected_locally%'
+              GROUP BY rewrites",
+        )?;
+        let mut counts: std::collections::HashMap<String, i64> = Default::default();
+        for row in stmt.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (tag, n) = row?;
+            let kind =
+                tag.split_once(':').map(|(_, k)| k.to_string()).unwrap_or_else(|| "other".into());
+            *counts.entry(kind).or_default() += n;
+        }
+        let mut out: Vec<(String, i64)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(out)
     }
 
@@ -7959,10 +8040,21 @@ mod tests {
         assert_eq!(by_model[0].cache.cached_tokens, 300);
         assert_eq!(by_model[1].key, "claude-sonnet-5");
         assert_eq!(by_model[1].latency.p95_ms, 4000);
+        // 省钱：opus-5 输入 $5/MTok，命中 300 省 0.9×5×300e-6 = 0.00135，写入 100（5m 档）多付
+        // 0.25×5×100e-6 = 0.000125 → 0.001225；sonnet 那组没缓存是 0；按模型拆没有套餐。
+        assert!(
+            (by_model[0].cache_saved_usd - 0.001225).abs() < 1e-9,
+            "{}",
+            by_model[0].cache_saved_usd
+        );
+        assert_eq!(by_model[1].cache_saved_usd, 0.0);
+        assert_eq!(by_model[0].tier, None);
+        let _ = store.set_tier(a, Some("Max 5x"));
         let by_account = store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 10).unwrap();
         assert_eq!(by_account[0].key, a.to_string());
         assert_eq!(by_account[0].label, "a");
         assert_eq!(by_account[1].label, "b");
+        assert_eq!(by_account[1].tier, None);
         assert_eq!(
             store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 1).unwrap().len(),
             1
@@ -7978,6 +8070,54 @@ mod tests {
             .unwrap();
         let orphan = store.usage_breakdown(now - 3600, BreakdownBy::Account, 10).unwrap();
         assert!(orphan.iter().any(|r| r.label == format!("#{b}")), "{orphan:?}");
+
+        // 本地拒绝按原因分类：`rejected_locally:<kind>` 归到 kind，裸的归 other，按条数降序。
+        let reject = |tag: &str| UsageRecord {
+            status: 429,
+            forensics: Forensics { rewrites: Some(tag.into()), ..Default::default() },
+            ..Default::default()
+        };
+        for tag in [
+            "rejected_locally:device-limit",
+            "rejected_locally:device-limit",
+            "rejected_locally:session-limit",
+            "rejected_locally",
+        ] {
+            store.insert_usage_log_at(&reject(tag), Some(now - 60)).unwrap();
+        }
+        store
+            .insert_usage_log_at(&reject("rejected_locally:device-limit"), Some(now - 2 * 3600))
+            .unwrap();
+        let rejections = store.local_rejections(now - 3600).unwrap();
+        assert_eq!(
+            rejections,
+            vec![
+                ("device-limit".to_string(), 2),
+                ("other".to_string(), 1),
+                ("session-limit".to_string(), 1)
+            ]
+        );
+        // 流水按模型与起点筛：拆分表点进来看明细走的就是这两个条件。
+        let logs = store
+            .query_usage_logs(UsageLogQuery {
+                model: Some("claude-sonnet-5".into()),
+                since: Some(now - 6 * 3600),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !logs.is_empty() && logs.iter().all(|l| l.model.as_deref() == Some("claude-sonnet-5"))
+        );
+        let stats = store
+            .usage_log_stats(UsageLogQuery {
+                model: Some("claude-opus-5".into()),
+                since: Some(now - 3600),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stats.total, 6);
     }
 
     fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {
@@ -9559,6 +9699,8 @@ mod tests {
                     offset: n * 3,
                     limit: 3,
                     request_id: None,
+                    model: None,
+                    since: None,
                 })
                 .unwrap()
         };

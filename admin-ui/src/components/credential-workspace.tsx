@@ -49,7 +49,7 @@ import {
   formatTokensPerSec,
   useTtftSeries,
 } from '@/components/ttft-trend-dialog'
-import type { CacheSeriesPoint, TtftSeriesPoint } from '@/api/metrics'
+import { getRejections, type CacheSeriesPoint, type TtftSeriesPoint } from '@/api/metrics'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -411,6 +411,41 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     )
   })()
   const ttftBase = ttftBaseline.summary && ttftBaseline.summary.count > 0 ? ttftBaseline.summary : null
+  // 相对基线的变化，直接写在小字里：读者不必心算 1.8s 比 1.2s 慢了多少。延迟按比例（±5% 以内
+  // 不写），命中率按百分点（±1pt 以内不写）。
+  const ttftDelta = ttftNow && ttftBase && ttftBase.p50_ms > 0
+    ? Math.round((ttftNow.p.p50_ms / ttftBase.p50_ms - 1) * 100)
+    : null
+  const ttftDeltaText = ttftDelta == null || Math.abs(ttftDelta) < 5
+    ? ''
+    : ` ${ttftDelta > 0 ? '↑' : '↓'}${Math.abs(ttftDelta)}%`
+  const cacheDelta = cacheRate != null && cacheBase != null
+    ? Math.round((cacheRate - cacheBase) * 100)
+    : null
+  const cacheDeltaText = cacheDelta == null || Math.abs(cacheDelta) < 1
+    ? ''
+    : ` ${cacheDelta > 0 ? '↑' : '↓'}${Math.abs(cacheDelta)}pt`
+  // 近 1 小时 luban 自己拒掉的请求（设备满、会话满、RPM 满……）：这几道闸加了之后，被拒的只在
+  // 流水里记成本地 429，概览得有个数才知道有号被打满。
+  const rejectionsQuery = useQuery({
+    queryKey: ['rejections', 1],
+    queryFn: () => getRejections(1),
+    refetchInterval: 60_000,
+  })
+  const rejectedTotal = rejectionsQuery.data?.total ?? 0
+  const rejectionKindLabel = (kind: string) => ({
+    'device-limit': t('设备名额满', 'device slots full'),
+    'session-limit': t('会话名额满', 'session slots full'),
+    'account-rpm': t('账号 RPM 满', 'account RPM'),
+    'device-rpm': t('设备 RPM 满', 'device RPM'),
+    'session-rpm': t('会话 RPM 满', 'session RPM'),
+    'session-concurrency': t('会话并发满', 'session concurrency'),
+    'bare-rate-limit': t('裸请求限流', 'bare-request limit'),
+    'all-cooling-down': t('全员冷却', 'all cooling down'),
+    'no-device-id': t('无设备身份', 'no device identity'),
+    'model-unsupported': t('套餐不含模型', 'model not in plan'),
+    'unavailable': t('无可用账号', 'no account available'),
+  } as Record<string, string>)[kind] ?? t('其他', 'other')
   // 颜色看「现在比平时慢了多少」：慢一半黄、慢一倍红；没有基线时按绝对值（3s / 8s）。
   const ttftTone = (() => {
     if (!ttftNow) return 'neutral' as const
@@ -577,6 +612,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
   const bannedCount = metrics.filterCounts.banned
   const tokenInvalidCount = metrics.filterCounts.tokenInvalid
+  const rejectionsHint = rejectedTotal > 0 && rejectionsQuery.data
+    ? t(
+        `近 1 小时本地拒绝 ${formatNumber(rejectedTotal)} 条：${rejectionsQuery.data.rows.map((r) => `${rejectionKindLabel(r.kind)} ${formatNumber(r.count)}`).join('，')}。`,
+        `${formatNumber(rejectedTotal)} rejected locally in the last hour: ${rejectionsQuery.data.rows.map((r) => `${rejectionKindLabel(r.kind)} ${formatNumber(r.count)}`).join(', ')}.`,
+      )
+    : undefined
   const attentionStatus = [
     bannedCount > 0
       ? t(`${formatNumber(bannedCount)} 封禁`, `${formatNumber(bannedCount)} banned`)
@@ -601,6 +642,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       : '',
     metrics.nearLimitCount > 0
       ? t(`${formatNumber(metrics.nearLimitCount)} 将满`, `${formatNumber(metrics.nearLimitCount)} near limit`)
+      : '',
+    rejectedTotal > 0
+      ? t(`${formatNumber(rejectedTotal)} 拒绝/1h`, `${formatNumber(rejectedTotal)} rejected/1h`)
       : '',
   ].filter(Boolean).join(' · ') || undefined
   const quotaRiskStatus = [
@@ -988,10 +1032,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               label={t('需处理', 'Needs attention')}
               value={formatNumber(attentionCount)}
               status={attentionStatus}
+              statusHint={rejectionsHint}
               icon={TriangleAlertIcon}
               tone={bannedCount > 0 || metrics.activeOverageCount > 0
                 ? 'bad'
-                : attentionCount > 0
+                : attentionCount > 0 || rejectedTotal > 0
                   ? 'warn'
                   : 'neutral'}
               active={filter === 'attention'}
@@ -1019,14 +1064,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 cacheRate == null ? undefined : (
                   // 手机上一行两格、一格不到 190px，图标加数字加 80px 的迷你线放不下，
                   // 会压到隔壁；sm 起再画。
-                  <CacheHitSparkline slots={cacheSeries.slots} className="hidden shrink-0 sm:flex" />
+                  <CacheHitSparkline slots={cacheSeries.slots} className="hidden sm:flex" />
                 )
               }
               status={cacheRate == null
                 ? t('暂无用量', 'No usage yet')
                 : cacheBase == null
                   ? undefined
-                  : t(`7d ${formatPercent(cacheBase)}`, `7d ${formatPercent(cacheBase)}`)}
+                  : t(`7d ${formatPercent(cacheBase)}${cacheDeltaText}`, `7d ${formatPercent(cacheBase)}${cacheDeltaText}`)}
               statusHint={cacheNow
                 ? t(
                     `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
@@ -1047,13 +1092,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
               trend={
                 ttftNow == null ? undefined : (
-                  <TtftSparkline slots={ttftSeries.slots} className="hidden shrink-0 sm:flex" />
+                  <TtftSparkline slots={ttftSeries.slots} className="hidden sm:flex" />
                 )
               }
               status={ttftNow == null
                 ? t('暂无数据', 'No data yet')
                 : ttftBase
-                  ? t(`7d ${formatMs(ttftBase.p50_ms)}`, `7d ${formatMs(ttftBase.p50_ms)}`)
+                  ? t(`7d ${formatMs(ttftBase.p50_ms)}${ttftDeltaText}`, `7d ${formatMs(ttftBase.p50_ms)}${ttftDeltaText}`)
                   : undefined}
               statusHint={ttftNow
                 ? t(
