@@ -5,6 +5,7 @@ import {
   ClockIcon,
   BanIcon,
   EllipsisIcon,
+  GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
   SmartphoneIcon,
@@ -73,7 +74,6 @@ import {
   MeterTrack,
   MeterValue,
 } from '@/components/ui/meter'
-import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
@@ -120,18 +120,19 @@ export const CredentialCard = memo(function CredentialCard({
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   // 0 = 不限，此时页脚只显示 RPM 本身，不画分母、也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
-  const rpmFull = rpmLimit > 0 && cred.rpm >= rpmLimit
-  const rpmLive = cred.rpm > 0
-  // 页脚三组数字（设备名额 / 累计费用 / RPM）在窄卡片上排一行还是两行，按字符数定：
-  // 都是等宽字形，字符数就是宽度。策略退成手机图标的颜色、窄屏又省掉钱包图标之后，
-  // 375px 的屏上实测能容下 17 个字符（`2/3` + `$214.60` + `100/120`），再多才折行，
-  // 否则尾巴会伸到右边的开关底下。
+  // RPM 徽章的配色与策略，与设备 / 会话两枚同一套判定，三枚并排读法一致。
+  const rpmUsage = deviceUsageMeta(cred.rpm, rpmLimit)
+  const rpmPolicy = cred.rpm_limit === 0
+    ? { label: t('跟随默认', 'Default'), className: 'text-muted-foreground' }
+    : cred.rpm_limit < 0
+      ? { label: t('不限', 'Unlimited'), className: 'text-foreground' }
+      : { label: t('自定义', 'Custom'), className: 'text-info-foreground' }
+  const rpmPolicyHint = cred.rpm_limit === 0
+    ? t('上限跟随全局默认', 'the limit follows the global default')
+    : cred.rpm_limit < 0
+      ? t('这个账号不限 RPM', 'this account has no RPM limit')
+      : t(`这个账号自定义了上限 ${cred.rpm_limit}`, `this account overrides the limit to ${cred.rpm_limit}`)
   const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
-  const footerChars = `${cred.device_count}/${effectiveLimit}`.length
-    + `${cred.session_count}/${sessionEffectiveLimit}`.length
-    + formatUsd(cred.cost_total).length
-    + `${cred.rpm}${rpmLimit > 0 ? `/${rpmLimit}` : ''}`.length
-  const footerStacked = footerChars > 17
   // 设备名额占用的配色与说明：空闲灰 / 健康绿 / 吃紧黄 / 占满红，见 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
   // 模拟会话名额同一套判定与配色：走模拟路径、没有设备身份的来访按会话占名额，与设备分开计。
@@ -323,6 +324,20 @@ export const CredentialCard = memo(function CredentialCard({
                       <TooltipPopup>
                         {formatFullTime(cred.created_at, language)}
                       </TooltipPopup>
+                    </Tooltip>
+                    {/* 累计费用挂在元信息行：它和「添加于」一样是这个账号的终身属性，不是某个窗口的量；
+                        各窗口的费用在下面的用量区各自有 pill。此前在页脚，加了会话名额后页脚放不下。 */}
+                    <span aria-hidden="true">·</span>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={<span />}
+                        className="inline-flex min-w-0 items-center gap-1"
+                      >
+                        <WalletCardsIcon className="size-3 shrink-0" />
+                        <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
+                        <span className="tabular-nums">{formatUsd(cred.cost_total)}</span>
+                      </TooltipTrigger>
+                      <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
                     </Tooltip>
                   </CardDescription>
                 </div>
@@ -544,28 +559,19 @@ export const CredentialCard = memo(function CredentialCard({
           </section>
         </CardPanel>
 
-        {/* 页脚有两套排布，而不是让一行内容自己折行：折出来的第二行长短随内容而变，
-            开关又浮在两行之间，看着像挤坏了。
-            数字长到窄卡片一行装不下时（见 [footerChars]）：上行「设备 ┄ 开关」，下行「费用 · RPM」，
-            两行从同一条左边线起、开关钉在右上。
-            @sm/card 起（卡片列最小 27rem）宽度够，一律单行、竖线分区。 */}
-        <CardFooter
-          className={cn(
-            'mt-auto items-center border-t bg-muted/32 px-4 py-2.5 sm:py-3 @sm/card:flex @sm/card:gap-4',
-            footerStacked
-              ? 'grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1.5'
-              : 'flex gap-3',
-          )}
-        >
+        {/* 页脚一行：设备名额、模拟会话名额、当前 RPM、启停开关。累计费用挪到了头部元信息行
+            （它是终身属性，不是「此刻」的量），页脚在手机上也放得下，不折行、不砍字。 */}
+        {/* 三枚按钮直接是页脚的子元素、共用同一个 gap：设备、会话、RPM 之间的间隔必须一样，
+            套一层容器就会出现「前两枚挨得近、第三枚离得远」。开关靠 ml-auto 钉在最右。 */}
+        <CardFooter className="mt-auto flex items-center gap-1 border-t bg-muted/32 px-4 py-2.5 sm:py-3 @sm/card:gap-2">
           {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、
               触屏上完全出不来，样式也不受控，和卡片上方的状态提示不是一套东西。 */}
           <Tooltip>
             <TooltipTrigger
               className={cn(
                 buttonVariants({ variant: 'ghost' }),
-                // 窄卡片上按钮的横向 padding 收一半：这颗按钮是页脚最宽的一块，
-                // 挤掉的每一像素都直接给右边的 RPM。
-                'min-w-0 max-w-full justify-self-start justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+                // 窄卡片上按钮的横向 padding 收一半：两颗名额按钮是页脚最宽的一块。
+                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
               )}
               onClick={() => setDevicesOpen(true)}
               aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
@@ -590,7 +596,7 @@ export const CredentialCard = memo(function CredentialCard({
             <TooltipTrigger
               className={cn(
                 buttonVariants({ variant: 'ghost' }),
-                'min-w-0 max-w-full justify-self-start justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
               )}
               onClick={() => setDevicesOpen(true)}
               aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
@@ -606,15 +612,40 @@ export const CredentialCard = memo(function CredentialCard({
               {sessionUsageHint}
             </TooltipPopup>
           </Tooltip>
-
-          {/* 开关在 DOM 里排第二，两行布局才能把它放进第一行右侧；单行布局下 order-last 再把它推到最右
-              （order 不能在两行布局里加：网格是按 DOM 顺序自动填格的，改了顺序开关就掉到第二行去了）。 */}
-          <div
-            className={cn(
-              'flex shrink-0 items-center gap-2 ml-auto @sm/card:order-last',
-              !footerStacked && 'order-last',
-            )}
-          >
+          {/* 当前 RPM 与两枚名额同一副面孔：图标 + 计数徽章的幽灵按钮，点开 RPM 上限对话框。
+              图标颜色是策略（跟随默认 / 自定义 / 不限），徽章底色是占用（同 deviceUsageMeta：
+              0 灰、有流量绿、快打满黄、打满红），分母是生效上限、不限时 ∞——三枚并排读法一致。
+              累计费用挪去了头部元信息行，页脚才放得下它。 */}
+          <Tooltip>
+            <TooltipTrigger
+              className={cn(
+                buttonVariants({ variant: 'ghost' }),
+                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+              )}
+              onClick={() => setRpmOpen(true)}
+              aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
+              aria-haspopup="dialog"
+            >
+              <GaugeIcon className={rpmPolicy.className} />
+              <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
+                {cred.rpm}/{rpmLimit > 0 ? rpmLimit : '∞'}
+              </Badge>
+              <span className="sr-only">{t('当前 RPM', 'Current RPM')} · {rpmPolicy.label}</span>
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+              {rpmLimit > 0
+                ? t(
+                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。打满后新请求分流到别的账号，已绑定的设备收到 429。点击调整`,
+                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once full, new requests spill to another account and already-bound devices get a 429. Click to adjust`,
+                )
+                : t(
+                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的），${rpmPolicyHint}。点击调整`,
+                  `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included); ${rpmPolicyHint.toLowerCase()}. Click to adjust`,
+                )}
+            </TooltipPopup>
+          </Tooltip>
+          {/* 开关钉在最右。 */}
+          <div className="order-last ml-auto flex shrink-0 items-center gap-2">
             {toggle.isPending && <Spinner />}
             <Switch
               checked={!cred.disabled}
@@ -625,76 +656,6 @@ export const CredentialCard = memo(function CredentialCard({
             />
           </div>
 
-          {/* 两行布局下的左内边距对齐上一行按钮的 padding（同一个 --spacing(3)-1px），
-              否则钱包图标比上面的手机图标突出 11px，两行读起来是错开的。 */}
-          <div
-            className={cn(
-              'flex min-w-0 items-center gap-3 @sm/card:gap-4',
-              footerStacked && 'col-span-2 pl-[calc(--spacing(3)-1px)] @sm/card:col-span-1 @sm/card:pl-0',
-            )}
-          >
-            <Separator orientation="vertical" className="hidden h-5 @sm/card:block" />
-            <Tooltip>
-              <TooltipTrigger
-                render={<span />}
-                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
-              >
-                {/* 窄卡片省掉钱包图标：`$` 已经把这串数字标成钱了，省下的宽度留给 RPM。 */}
-                <WalletCardsIcon className="hidden size-3.5 text-muted-foreground @sm/card:inline" aria-hidden />
-                <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
-                <span className="font-medium tabular-nums">{formatUsd(cred.cost_total)}</span>
-              </TooltipTrigger>
-              <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
-            </Tooltip>
-            {/* 常驻：闲置号看不见 RPM 的话，「这个号此刻有没有在跑」就只能靠别处推断。
-                零值不喊人——点不呼吸、数字转灰，位置照占，卡片之间这一列才对得齐。 */}
-            <Separator orientation="vertical" className="h-5" />
-            <Tooltip>
-              <TooltipTrigger
-                render={<span />}
-                className="inline-flex min-w-0 shrink items-center gap-2 whitespace-nowrap text-xs"
-              >
-                {/* 页脚里唯一的实时值（隔壁两个都是累计量），用呼吸点替掉图标把「活的」画出来。
-                    绿色只落在这个 6px 点上：数值本身无好坏之分，颜色留给状态（运行正常 / 冷却）。 */}
-                <span className="relative flex size-1.5 shrink-0" aria-hidden>
-                  {rpmLive && (
-                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-success opacity-60 motion-reduce:hidden" />
-                  )}
-                  <span
-                    className={cn(
-                      'relative inline-flex size-1.5 rounded-full',
-                      rpmLive ? 'bg-success' : 'bg-muted-foreground/32',
-                    )}
-                  />
-                </span>
-                <span className="sr-only">{t('当前 RPM', 'Current RPM')}</span>
-                <span className="inline-flex min-w-0 items-baseline gap-1">
-                  <span
-                    className={cn(
-                      'truncate tabular-nums',
-                      rpmLive ? 'font-medium' : 'text-muted-foreground',
-                      rpmFull && 'text-warning',
-                    )}
-                  >
-                    {cred.rpm}
-                    {rpmLimit > 0 && <span className="text-muted-foreground">/{rpmLimit}</span>}
-                  </span>
-                  <span className="shrink-0 text-2xs text-muted-foreground tracking-wide">RPM</span>
-                </span>
-              </TooltipTrigger>
-              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                {rpmLimit > 0
-                  ? t(
-                    `当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）。上限 ${rpmLimit} 条/分钟，打满后新请求分流到别的账号，已绑定的设备收到 429。`,
-                    `Current RPM: requests forwarded through this account in the last 60 seconds (failures included). Limited to ${rpmLimit}/min; once full, new requests spill to another account and already-bound devices get a 429.`,
-                  )
-                  : t(
-                    '当前 RPM：最近 60 秒经这个账号转发的请求数（含失败的）',
-                    'Current RPM: requests forwarded through this account in the last 60 seconds (failures included)',
-                  )}
-              </TooltipPopup>
-            </Tooltip>
-          </div>
         </CardFooter>
 
         {/* 没点开过任何一个就一个都不挂：账号一多，这些常关的对话框全是白挂的组件树。 */}
