@@ -219,10 +219,19 @@ pub(super) fn body_has_pair(body: &[u8], key: &[u8], value: &[u8]) -> bool {
 /// 新增字段追加在末尾。回归测试见 [`tests::preserves_key_order`]。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
+///
+/// 第二项是**改写后的那份 `Value`**，`Some` 即「它与返回的出站字节同构」。留着它是给
+/// [`crate::proxy::shape_summary_of`] 用的：取证的形态摘要要的正是出站体，此前它拿着字节
+/// 又从头解析了一遍——那是整条请求里第二次解析同一份几 MB 的 JSON，实测 1.8MB 的会话要
+/// 6.7ms，而摘要本身的走查加 sha256 只要 0.6ms。这里顺手交出去，那 6.7ms 整个消失。
+///
+/// `None` 有三种来源，共同点是**出站字节与入参 `body` 逐字节相同**（没改写、不是 JSON、
+/// 或序列化失败原样退回）：调用方此时拿来访那份已解析好的 body 算摘要即可，同样不必重新
+/// 解析，见 [`Upstream::shape_outbound`]。
 // 参数多是有意的：这些全是「一次改写要知道的上下文」，打包成结构体只会多一层间接，
 // 而调用点只有 `Upstream::shape` 一处。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn rewrite_body(
+pub(super) fn rewrite_body_out(
     body: &Bytes,
     cred: &crate::credentials::Credential,
     device_fp: &str,
@@ -251,7 +260,7 @@ pub(super) fn rewrite_body(
     cc_kind: CcRequestKind,
     // 要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`]），`None` 即不补、只归一形态。
     fallbacks: Option<&str>,
-) -> Bytes {
+) -> (Bytes, Option<serde_json::Value>) {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
     let shape = flags.system_shape;
@@ -291,14 +300,14 @@ pub(super) fn rewrite_body(
         && !has_system_role_msg
         && fallbacks.is_none()
     {
-        return body.clone();
+        return (body.clone(), None);
     }
     // 补 metadata 用的 session_id：模拟模式取 Simulation 那份，CC 形态来访取 `bare_session`
     // （见 [`Upstream::bare_session`]）。两者都与出站头上的 `X-Claude-Code-Session-Id` 同值。
     let meta_session = sim.map(|s| s.session_id.as_str()).or(bare_session);
     let mut v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return body.clone(),
+        Err(_) => return (body.clone(), None),
     };
     // 空壳 `role:"system"` 消息：一个内容块都没有的那种，上游恒 400
     // （`messages.N: system content must contain at least one block`）。放在提升之前，
@@ -571,11 +580,13 @@ pub(super) fn rewrite_body(
         && !schemas_flattened
         && !tools_mimicked
     {
-        return body.clone();
+        return (body.clone(), None);
     }
     match serde_json::to_vec(&v) {
-        Ok(bytes) => Bytes::from(preserve_thinking_encoding(body, bytes)),
-        Err(_) => body.clone(),
+        Ok(bytes) => (Bytes::from(preserve_thinking_encoding(body, bytes)), Some(v)),
+        // 序列化失败等于「这份 Value 与将要发出去的字节对不上」，此时必须把它丢掉：
+        // 形态摘要的调用方认的是「Some 即与出站字节同构」，交一份对不上的回去比不交更糟。
+        Err(_) => (body.clone(), None),
     }
 }
 
@@ -2182,6 +2193,11 @@ pub(super) fn align_cc_top_level_order(v: &mut serde_json::Value, order: &[&str]
 /// MCP 形态假名的工具段前缀池。来访原名加 `mcp__hermes__` 后，同一条探测由 400 变为
 /// 200，证明 MCP 命名空间是上游豁免的形态。`manage_bfl00` 之类普通假名仍可被判成
 /// 第三方，故生成的假名统一放在 `mcp__luban__*` 下。
+/// 所有假名共用的命名空间前缀。生成处（[`build_tool_name_map`]）与还原处
+/// （[`ToolNameMap::restore`]）必须是同一个串：还原靠它一趟扫出「可能是假名的位置」，
+/// 两边一旦漂开，回程就一个假名都还原不了，而症状要到客户端拿着假名发下一轮才暴露。
+const FAKE_TOOL_NS: &str = "mcp__luban__";
+
 const FAKE_TOOL_PREFIXES: &[&str] = &[
     "analyze_",
     "compute_",
@@ -2291,7 +2307,7 @@ pub(super) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
             [(seed.wrapping_add(i as u64) % FAKE_TOOL_PREFIXES.len() as u64) as usize];
         // 取真名开头三个 ASCII 字母数字，纯粹为了假名在日志里还认得出是谁。
         let head: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
-        let stem = format!("mcp__luban__{prefix}{head}{i:02}");
+        let stem = format!("{FAKE_TOOL_NS}{prefix}{head}{i:02}");
         let mut fake = stem.clone();
         // 假名撞上任何已声明工具都会让上游分不清该调谁。序号已保证假名之间唯一，
         // 这里再兜住来访本来就声明了同名 MCP 工具的极端情形。
@@ -2828,16 +2844,42 @@ pub(super) fn apply_tool_names(v: &mut serde_json::Value, map: &ToolNameMap) -> 
 }
 
 impl ToolNameMap {
-    /// 回程还原：假名 → 真名。按假名长度倒序逐个替换。
+    /// 回程还原：假名 → 真名。**一趟扫完**，靠所有假名共用的 [`FAKE_TOOL_NS`] 定位。
     ///
     /// **按字节而不是按 `str` 做**：回程是流式的，一个 chunk 可以在任意字节处切断，
     /// `String::from_utf8` 会在半个多字节字符上失败。假名全是 ASCII，字节级替换在 UTF-8 上
     /// 安全（ASCII 不会出现在多字节序列内部）。
+    ///
+    /// **为什么不是「每个假名扫一遍」**：那是这条路原先的写法，代价随工具数线性翻倍，而且
+    /// 每一遍都重新分配一个 `Vec`、还逐字节 `push`。回程的每一个 SSE 块都要过它——实测 2000
+    /// 个事件的一次回答，5 个工具要 7.8ms，20 个要 30ms，50 个要 40ms，全部落在流式转发路径
+    /// 上，直接变成回复的整体延迟。所有假名都以 `mcp__luban__` 开头（[`build_tool_name_map`]
+    /// 唯一的生成处），所以「可能是假名的位置」一趟就能扫出来，命中才逐个比对候选。
+    ///
+    /// 语义与逐个替换完全一致：`reverse` 按假名长度倒序，同一位置上先命中的就是最长的那个。
+    /// 还原后的内容不再被回扫，故也不再依赖「真名里不含假名」这个前提。
     pub(super) fn restore(&self, buf: &[u8]) -> Vec<u8> {
-        let mut out = buf.to_vec();
-        for (fake, real) in &self.reverse {
-            out = replace_bytes(&out, fake.as_bytes(), real.as_bytes());
+        let ns = FAKE_TOOL_NS.as_bytes();
+        let mut out = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        while let Some(rel) = find_sub(&buf[i..], ns) {
+            let at = i + rel;
+            out.extend_from_slice(&buf[i..at]);
+            match self.reverse.iter().find(|(fake, _)| buf[at..].starts_with(fake.as_bytes())) {
+                Some((fake, real)) => {
+                    out.extend_from_slice(real.as_bytes());
+                    i = at + fake.len();
+                }
+                // 命名空间前缀出现了，后面却不是我们发出去的任何一个假名（客户端自己就有
+                // `mcp__luban__*` 工具，或正文里恰好提到）：原样留着往下找。跳过整个前缀是
+                // 安全的——`mcp__luban__` 没有既是前缀又是后缀的真边界，故两处出现不可能重叠。
+                None => {
+                    out.extend_from_slice(ns);
+                    i = at + ns.len();
+                }
+            }
         }
+        out.extend_from_slice(&buf[i..]);
         out
     }
 
@@ -2871,24 +2913,26 @@ impl ToolNameMap {
     }
 }
 
-/// 字节级子串替换。`from` 为空时原样返回（否则会死循环）。
-fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    if from.is_empty() || haystack.len() < from.len() {
-        return haystack.to_vec();
+/// `haystack` 里第一次出现 `needle` 的位置。
+///
+/// 先按首字节筛（`position` 在 `&[u8]` 上是一条紧循环，编译器还能向量化），命中再整段比对。
+/// 回程每个流块都要过一遍，逐字节推进的写法在这里是实打实的热点。
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
-    let mut out = Vec::with_capacity(haystack.len());
+    let last = haystack.len() - needle.len();
+    let first = needle[0];
     let mut i = 0;
-    while i <= haystack.len() - from.len() {
-        if &haystack[i..i + from.len()] == from {
-            out.extend_from_slice(to);
-            i += from.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
+    while i <= last {
+        let off = haystack[i..=last].iter().position(|&b| b == first)?;
+        let at = i + off;
+        if haystack[at..].starts_with(needle) {
+            return Some(at);
         }
+        i = at + 1;
     }
-    out.extend_from_slice(&haystack[i..]);
-    out
+    None
 }
 
 /// 把上游响应流包一层工具名还原。滑动窗口的状态跟着流走，流结束时 flush 尾巴。
@@ -3228,6 +3272,7 @@ pub(super) fn with_outbound_identity(body: Bytes, ident: &OutboundIdentity) -> B
 
 #[cfg(test)]
 mod tests {
+    use super::FAKE_TOOL_NS;
     use crate::proxy::test_support::{
         ACCOUNT_UUID, API_SHAPE_BODY, PLAIN_BODY, all_on, base_block, detect_for, detect_with,
         err_json, parsed, platform_headers, rewrite_body, sim_for, test_cred,
@@ -3350,7 +3395,7 @@ mod tests {
         let body = Bytes::from(
             r#"{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"thinking":{"type":"adaptive"}}"#,
         );
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &body,
             &test_cred(),
             "fp",
@@ -3366,7 +3411,8 @@ mod tests {
             None,
             crate::proxy::CcRequestKind::Main,
             None,
-        );
+        )
+        .0;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             v["thinking"],
@@ -3422,7 +3468,7 @@ mod tests {
         flags: store::ForwardFlags,
         with_identity: bool,
     ) -> serde_json::Value {
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &eager_body(model, with_identity),
             &test_cred(),
             "fp",
@@ -3438,7 +3484,8 @@ mod tests {
             None,
             kind,
             None,
-        );
+        )
+        .0;
         serde_json::from_slice(&out).unwrap()
     }
 
@@ -3922,6 +3969,77 @@ mod tests {
         assert!(!s.contains(r#""scope""#), "关掉后不该标 global: {s}");
     }
 
+    /// [`rewrite_body_out`] 交回来的那份 `Value` 必须与它同时交回的出站字节**同构**。
+    ///
+    /// 取证的形态摘要现在是拿这份 `Value` 算的，不再从出站字节重新解析一遍（一条请求少一次
+    /// 几 MB 的 JSON 解析，见 [`crate::proxy::shape_summary_of`]）。这条等式一旦不成立，
+    /// 流水里的 `shape` 列就开始描述一份**没发出去过**的体——那正是这一列唯一要回答的问题，
+    /// 而且错了没有任何症状。故在这里钉死：两条路算出来的摘要必须逐字相同。
+    ///
+    /// 三种 `None` 也一并验：那几条路出站字节与入参逐字节相同，调用方拿来访那份算摘要，
+    /// 结果同样必须一致。
+    #[test]
+    fn the_returned_value_summarizes_the_same_as_the_bytes_it_sent() {
+        let cases: Vec<(&str, Bytes, store::ForwardFlags)> = vec![
+            (
+                "改写过的模拟主线程",
+                Bytes::from(
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"my_tool","description":"d","input_schema":{"type":"object"}}],"metadata":{"user_id":"{\"device_id\":\"dd\",\"account_uuid\":\"aa\",\"session_id\":\"ss\"}"},"max_tokens":64000}"#,
+                ),
+                all_on(),
+            ),
+            (
+                "开关全关、无可改之处（走 None 那条）",
+                Bytes::from(
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+                ),
+                // 走得进快速路径（连解析都不做）的那一套：这几项正是它检查的开关。
+                store::ForwardFlags {
+                    system_shape: false,
+                    spoof_identity: false,
+                    billing_cch: false,
+                    strip_extra_fields: false,
+                    ..all_on()
+                },
+            ),
+            ("不是 JSON（同样走 None）", Bytes::from_static(b"not json at all"), all_on()),
+        ];
+        for (label, body, flags) in cases {
+            let (sent, value) = crate::proxy::rewrite_body_out(
+                &body,
+                &test_cred(),
+                "fp",
+                flags,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+                true,
+                None,
+                None,
+                super::CcRequestKind::Main,
+                None,
+            );
+            // `None` 的约定是「出站字节与入参逐字节相同」，先把它本身钉住。
+            if value.is_none() {
+                assert_eq!(sent, body, "{label}：没交 Value 就必须是原样透传");
+            }
+            // 调用方的取值顺序：改写那份优先，没有就用来访那份（见 `Upstream::shape_outbound`）。
+            let inbound = serde_json::from_slice::<serde_json::Value>(&body).ok();
+            let from_value = match value.as_ref().or(inbound.as_ref()) {
+                Some(v) => crate::proxy::shape_summary_of(v),
+                None => Default::default(),
+            };
+            assert_eq!(
+                from_value,
+                crate::proxy::shape_summary(&sent),
+                "{label}：借 Value 算的摘要与从出站字节解析出来的必须一致"
+            );
+        }
+    }
+
     /// 改写后 body 的 key 顺序必须与入站逐字节一致，只允许新增字段追加在末尾。
     ///
     /// serde_json 默认 `Map = BTreeMap`，会把整个 body（含嵌套对象）的 key 按字母序重排，
@@ -4206,17 +4324,54 @@ mod tests {
     /// 短假名是长假名的子串时，必须先替长的——否则长假名会被先吃掉一截。
     #[test]
     fn restore_replaces_longer_aliases_first() {
+        let long = format!("{FAKE_TOOL_NS}fetch_abc00_long");
+        let short = format!("{FAKE_TOOL_NS}fetch_abc00");
         let map = crate::proxy::ToolNameMap {
             forward: Default::default(),
             reverse: vec![
-                ("fetch_abc00_long".to_string(), "REAL_LONG".to_string()),
-                ("fetch_abc00".to_string(), "REAL_SHORT".to_string()),
+                (long.clone(), "REAL_LONG".to_string()),
+                (short.clone(), "REAL_SHORT".to_string()),
             ],
-            max_fake: "fetch_abc00_long".len(),
+            max_fake: long.len(),
         };
+        let wire = format!("x {long} y {short} z");
         assert_eq!(
-            String::from_utf8(map.restore(b"x fetch_abc00_long y fetch_abc00 z")).unwrap(),
+            String::from_utf8(map.restore(wire.as_bytes())).unwrap(),
             "x REAL_LONG y REAL_SHORT z"
+        );
+        // 命名空间前缀出现、后面却不是任何一个假名：原样留着，不许吃掉也不许错配。
+        let stray = format!("see {FAKE_TOOL_NS}something_else and {short}");
+        assert_eq!(
+            String::from_utf8(map.restore(stray.as_bytes())).unwrap(),
+            format!("see {FAKE_TOOL_NS}something_else and REAL_SHORT")
+        );
+    }
+
+    /// [`ToolNameMap::restore`] 一趟扫的前提：**每个假名都以 [`FAKE_TOOL_NS`] 开头**。
+    ///
+    /// 这个前提由 [`build_tool_name_map`] 独家保证。哪天那边换了拼法（比如为了缩短假名把
+    /// 命名空间去掉），还原侧会一个都扫不到——而请求照发、响应照回，症状要到客户端拿着假名
+    /// 发下一轮、上游回 400 才暴露。故在这里对着真正的生成结果验一遍，不靠手搓的映射表。
+    #[test]
+    fn every_generated_alias_lives_under_the_shared_namespace() {
+        let body = serde_json::json!({"tools": [
+            {"name": "my_tool", "input_schema": {"type": "object"}},
+            {"name": "另一个工具", "input_schema": {"type": "object"}},
+            {"name": "x", "type": "custom", "input_schema": {"type": "object"}},
+            // 这几类保留原名，不该进映射表。
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {"name": "mcp__ide__getDiagnostics", "input_schema": {"type": "object"}},
+            {"name": "web_search", "type": "web_search_20250305"}]});
+        let map = build_tool_name_map(Some(&body)).expect("有可混淆的工具就该有映射表");
+        assert_eq!(map.reverse.len(), 3, "只混淆那三个 custom tool");
+        for (fake, _) in &map.reverse {
+            assert!(fake.starts_with(FAKE_TOOL_NS), "假名 {fake} 不在共用命名空间下");
+        }
+        assert_eq!(map.max_fake, map.reverse.iter().map(|(f, _)| f.len()).max().unwrap());
+        // 倒序也是还原的前提（同一位置先命中的就得是最长的那个）。
+        assert!(
+            map.reverse.windows(2).all(|w| w[0].0.len() >= w[1].0.len()),
+            "reverse 必须按假名长度倒序"
         );
     }
 
@@ -5248,7 +5403,7 @@ mod tests {
         );
         let plan = crate::proxy::cc_profile_for("claude-fable-5-1").fallbacks.unwrap();
         let shape = |fallbacks: Option<&str>| {
-            crate::proxy::rewrite_body(
+            crate::proxy::rewrite_body_out(
                 &body,
                 &test_cred(),
                 "fp",
@@ -5265,6 +5420,7 @@ mod tests {
                 crate::proxy::CcRequestKind::Main,
                 fallbacks,
             )
+            .0
         };
         // 不补：快路径，体原样。
         assert_eq!(shape(None), body);
@@ -5315,7 +5471,7 @@ mod tests {
         // 经 rewrite_body 走一遍模拟路径：fable 有字面量就补，位置按 profile 键序归位。
         let body = Bytes::from(r#"{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#.to_string());
         let sim = sim_for(std::str::from_utf8(&body).unwrap());
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &body,
             &test_cred(),
             "fp",
@@ -5331,7 +5487,8 @@ mod tests {
             None,
             crate::proxy::CcRequestKind::Main,
             Some(r#"[{"model":"claude-opus-5"}]"#),
-        );
+        )
+        .0;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["fallbacks"], serde_json::json!([{"model": "claude-opus-5"}]), "{v}");
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -5753,7 +5910,7 @@ mod tests {
         let parsed_body = parsed(&body);
         let sim = detect_for(&body, all_on()).expect("该请求应走模拟路径");
         let map = build_tool_name_map(parsed_body.as_ref()).unwrap();
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &body,
             &test_cred(),
             "fp",
@@ -5769,7 +5926,8 @@ mod tests {
             None,
             crate::proxy::CcRequestKind::Main,
             None,
-        );
+        )
+        .0;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
@@ -6688,7 +6846,7 @@ mod tests {
             ..all_on()
         };
         let call = |body: &str| {
-            crate::proxy::rewrite_body(
+            crate::proxy::rewrite_body_out(
                 &Bytes::from(body.to_string()),
                 &test_cred(),
                 "fp",
@@ -6705,6 +6863,7 @@ mod tests {
                 crate::proxy::CcRequestKind::Main,
                 None,
             )
+            .0
         };
 
         // 1) 来访压根没带 `stream`：追加到末尾（官方线序里它就是最后一个）。
@@ -6720,7 +6879,7 @@ mod tests {
         assert_eq!(keys(&out), vec!["model", "stream", "max_tokens"], "已有字段不该挪位置");
 
         // 3) 开关关着：一个字节都不动（哪怕 body 是非流式的）。
-        let untouched = crate::proxy::rewrite_body(
+        let untouched = crate::proxy::rewrite_body_out(
             &Bytes::from(r#"{"model":"claude-opus-5","stream":false}"#.to_string()),
             &test_cred(),
             "fp",
@@ -6736,7 +6895,8 @@ mod tests {
             None,
             crate::proxy::CcRequestKind::Main,
             None,
-        );
+        )
+        .0;
         assert_eq!(
             untouched,
             Bytes::from(r#"{"model":"claude-opus-5","stream":false}"#.to_string())

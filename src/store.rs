@@ -4684,6 +4684,43 @@ impl CredentialStore {
     ///
     /// 分批删：日志表可能积了几百万行，一条大 DELETE 会把写锁按住很久，转发路径的
     /// 落库全得排队。批间放锁，让在线写入插队。
+    /// 删掉「连保留期都过了」的设备绑定与会话绑定，返回两张表各删了多少行。
+    ///
+    /// 这件事此前挂在 [`Self::select_with_slot`] 里、每条转发请求跑一遍，而两条 DELETE 都按
+    /// `last_seen_at` 划线——那一列当时没有索引，于是每请求两次全表扫加两次写事务，全程还
+    /// 压着那把全局 `conn` 锁。现在索引补上了（`idx_*_bindings_seen`），清理本身也挪到了
+    /// 后台定时（见 `web::run`）。
+    ///
+    /// **清理时机不影响选号**：过了保留期、还没被删掉的行在
+    /// [`Self::select_with_slot`] 那侧已被显式滤掉（`bound` 查询上那道保留期条件），
+    /// 故「还在表里」与「已经删了」对选号是同一个结果，这里跑得早跑得晚都一样。
+    ///
+    /// TTL 与保留期都取当前配置：两项都可以在后台改，改小之后下一次清理就按新值收。
+    /// 任一项配成 `<= 0`（永不过期／永久保留）时那张表整张不动，见 [`effective_retention`]。
+    pub fn prune_expired_bindings(&self) -> Result<(usize, usize)> {
+        // 两个 getter 内部各自取锁，parking_lot 不可重入，故都在拿 `conn` 之前读完。
+        let device =
+            effective_retention(self.device_binding_ttl(), self.device_binding_retention());
+        let session =
+            effective_retention(self.session_binding_ttl(), self.session_binding_retention());
+        let conn = self.conn.lock();
+        let devices = match device {
+            Some(secs) => conn.execute(
+                "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
+                [secs],
+            )?,
+            None => 0,
+        };
+        let sessions = match session {
+            Some(secs) => conn.execute(
+                "DELETE FROM session_bindings WHERE last_seen_at < unixepoch() - ?1",
+                [secs],
+            )?,
+            None => 0,
+        };
+        Ok((devices, sessions))
+    }
+
     pub fn prune_usage_logs(&self) -> Result<usize> {
         const BATCH: usize = 5_000;
         let mut total = 0;
@@ -5153,6 +5190,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_device_bindings_cred
             ON device_bindings(cred_id);
+        -- 保留期清理（`prune_expired_bindings`）按 last_seen_at 划线删行。没有这个索引就是
+        -- 整表扫，而那条 DELETE 此前挂在选号路径上、每条转发请求跑一次。
+        CREATE INDEX IF NOT EXISTS idx_device_bindings_seen
+            ON device_bindings(last_seen_at);
 
         -- 模拟会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
         -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 的
@@ -5173,6 +5214,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_session_bindings_cred
             ON session_bindings(cred_id);
+        -- 同 device_bindings：给保留期清理用。这张表还更容易长——键是每条对话一个，
+        -- 默认保留 24 小时，多客户端时攒到几万行不稀奇。
+        CREATE INDEX IF NOT EXISTS idx_session_bindings_seen
+            ON session_bindings(last_seen_at);
 
         -- 每次转发的用量日志：从上游响应里嗅探到的 token 用量（若响应带了 usage）。
         CREATE TABLE IF NOT EXISTS usage_logs (
@@ -6064,20 +6109,17 @@ impl CredentialStore {
             RpmLimited { retry_after_secs, sticky: false }.into()
         };
 
-        // 惰性清理：只删「连保留期都过了」的绑定。TTL 到点的那些不删——它们从这一刻起就不占
-        // 名额了（下面的 counts 按 TTL 过滤），但行还在，设备回来时还能循着它回原号。
-        if let Some(retention) = effective_retention(ttl_secs, retention_secs) {
-            conn.execute(
-                "DELETE FROM device_bindings WHERE last_seen_at < unixepoch() - ?1",
-                [retention],
-            )?;
-        }
-        if let Some(retention) = effective_retention(session_ttl_secs, session_retention_secs) {
-            conn.execute(
-                "DELETE FROM session_bindings WHERE last_seen_at < unixepoch() - ?1",
-                [retention],
-            )?;
-        }
+        // 「连保留期都过了」的绑定行由后台定时清（[`Self::prune_expired_bindings`]，
+        // 挂在 `web::run` 里），**不在这条路上删**：两条 DELETE 都按 last_seen_at 划线，
+        // 而这里是每条转发请求都要走一遍的选号路径，等于每请求两次写事务。
+        //
+        // 清理时机与判定因此解耦：下面命中既有绑定那一步自己按保留期过滤（见 `bound` 的
+        // 查询），所以「行还在但已过保留期」与「行已被删掉」对选号是同一个结果——后台
+        // 什么时候跑都不影响这里选出谁。TTL 到点的那些照旧不删：它们从那一刻起就不占名额
+        //（下面的 counts 按 TTL 过滤），但行还在，设备回来时还能循着它回原号。
+        let device_retention = effective_retention(ttl_secs, retention_secs).unwrap_or(0);
+        let session_retention =
+            effective_retention(session_ttl_secs, session_retention_secs).unwrap_or(0);
 
         // 限流暂停到点的号先放回来，再挑——否则它们要等到有人打开控制台列表才回得了池子。
         Self::resume_due(&conn)?;
@@ -6175,10 +6217,11 @@ impl CredentialStore {
         };
         let counts = active_counts("device_bindings", ttl_secs)?;
         let session_counts = active_counts("session_bindings", session_ttl_secs)?;
-        // 这条请求走哪张表，TTL 就用哪张表的：下面判「绑定还在有效期内吗」与分槽位都按它。
-        let binding_ttl = match binding {
-            Some(Binding::Session(_)) => session_ttl_secs,
-            _ => ttl_secs,
+        // 这条请求走哪张表，TTL 与保留期就都用哪张表的：下面判「绑定还在有效期内吗」与分槽位
+        // 按 TTL，判「这条绑定还算不算数」按保留期。
+        let (binding_ttl, binding_retention) = match binding {
+            Some(Binding::Session(_)) => (session_ttl_secs, session_retention),
+            _ => (ttl_secs, device_retention),
         };
 
         // 当前占名额的数（已排除 TTL 外的休眠绑定）：按会话绑定时数会话，其余数设备——裸请求
@@ -6209,15 +6252,21 @@ impl CredentialStore {
         if let Some(b) = binding {
             // 第二列是「这条绑定还在 TTL 内吗」，交给 SQLite 与清理/计数用同一个 unixepoch()
             // 时钟判定，免得和进程时钟差出一个边界。
+            //
+            // `WHERE` 上那道保留期过滤是**清理挪去后台之后**补的：过了保留期的行在被后台删掉
+            // 之前还留在表里，不滤掉的话它会被当成休眠软绑定续上，设备就回到了一个本该已经
+            // 忘掉的号。滤掉之后，「行还在但过期了」与「行已删」对这里是同一个结果——后台多久
+            // 跑一次都不改变选号结果。走的是主键点查，多一个条件不增加代价。
             let bound: Option<(i64, bool)> = conn
                 .query_row(
                     &format!(
                         "SELECT cred_id, (?2 <= 0 OR last_seen_at >= unixepoch() - ?2) \
-                           FROM {} WHERE {} = ?1",
+                           FROM {} WHERE {} = ?1 \
+                            AND (?3 <= 0 OR last_seen_at >= unixepoch() - ?3)",
                         b.table(),
                         b.column()
                     ),
-                    params![b.key(), binding_ttl],
+                    params![b.key(), binding_ttl, binding_retention],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -6345,12 +6394,22 @@ impl CredentialStore {
 
         let slot = match binding {
             Some(Binding::Device(did)) => {
+                // 过了保留期、后台还没来得及删的那一行会在这里被撞上（此前它已被删掉，
+                // 走的是纯 INSERT）。那是一条**新**绑定，故 created_at 与 request_count 归零
+                // 重来——否则设备明细里会显示一个几天前建立、请求数接着往上加的绑定，
+                // 而那台设备其实刚被重新调度过。`SET` 右侧读的都是冲突前那一行的值
+                // （SQLite 语义），故 CASE 里的 last_seen_at 是旧值，与放在哪一行无关。
                 conn.execute(
                     "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
                      ON CONFLICT(device_id) DO UPDATE
                         SET cred_id = ?2, last_seen_at = unixepoch(), \
-                            request_count = request_count + 1",
-                    params![did, chosen.id],
+                            created_at = CASE WHEN ?3 > 0 \
+                                                AND last_seen_at < unixepoch() - ?3 \
+                                              THEN unixepoch() ELSE created_at END, \
+                            request_count = CASE WHEN ?3 > 0 \
+                                                   AND last_seen_at < unixepoch() - ?3 \
+                                                 THEN 1 ELSE request_count + 1 END",
+                    params![did, chosen.id, device_retention],
                 )?;
                 None
             }
@@ -6363,9 +6422,14 @@ impl CredentialStore {
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(session_key) DO UPDATE
                         SET cred_id = ?2, slot = ?3, last_seen_at = unixepoch(), \
-                            request_count = request_count + 1, \
+                            created_at = CASE WHEN ?5 > 0 \
+                                                AND last_seen_at < unixepoch() - ?5 \
+                                              THEN unixepoch() ELSE created_at END, \
+                            request_count = CASE WHEN ?5 > 0 \
+                                                   AND last_seen_at < unixepoch() - ?5 \
+                                                 THEN 1 ELSE request_count + 1 END, \
                             last_model = COALESCE(?4, last_model)",
-                    params![key, chosen.id, slot, model],
+                    params![key, chosen.id, slot, model, session_retention],
                 )?;
                 Some(slot)
             }
@@ -7476,10 +7540,12 @@ mod tests {
         assert_eq!(store.session_slot(a, "s1").unwrap(), Some(0), "行还在");
         assert_eq!(store.select_for_device(sel("s2")).unwrap().id, a);
         assert_eq!(store.session_slot(a, "s2").unwrap(), Some(0), "释放了的槽位被复用");
-        // 超过会话保留期：下一次选号时清掉，s1 再来是新会话。
+        // 超过会话保留期：选号立刻当它不存在（行还在，由后台按自己的节奏删），s1 再来是新会话。
         age_session_binding(&store, "s1", 601);
         assert_eq!(store.select_for_device(sel("s3")).unwrap().id, a);
-        assert_eq!(store.session_slot(a, "s1").unwrap(), None, "按会话自己的保留期清行");
+        assert_eq!(store.session_slot(a, "s1").unwrap(), Some(0), "行还在，后台还没跑");
+        assert_eq!(store.prune_expired_bindings().unwrap(), (0, 1), "按会话自己的保留期清行");
+        assert_eq!(store.session_slot(a, "s1").unwrap(), None);
         // 默认值：会话 30 分钟 / 1 天，与设备的 1 小时 / 7 天不同。
         let (fresh, _) = store_with(&["b"]);
         assert_eq!(fresh.session_binding_ttl(), DEFAULT_SESSION_BINDING_TTL_SECS);
@@ -7864,26 +7930,81 @@ mod tests {
         assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, b, "改绑后应稳定在 b");
     }
 
-    /// 保留期到点才真删行；删掉之后设备就是台新设备，回不去原号。
+    /// 保留期到点后设备就是台新设备，回不去原号——**与行删没删无关**。
+    ///
+    /// 删行这件事挪去了后台（[`CredentialStore::prune_expired_bindings`]，见那里的记述），
+    /// 故这条用例钉的是两件事：一、行还在表里的时候选号就已经不认它了（否则后台跑之前那段
+    /// 时间里，设备会被送回一个本该忘掉的号）；二、后台真跑的时候那行会被删掉。
     #[test]
-    fn binding_rows_are_dropped_once_the_retention_window_passes() {
+    fn binding_rows_are_forgotten_once_the_retention_window_passes() {
         let (store, ids) = soft_store(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
 
         assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, a);
         age_binding(&store, "dev-1", 7200);
-        // 任一次选号都会顺手清一遍；这次同时让 a 上多一台活跃设备。
+        // 让 a 上多一台活跃设备，好让下面的负载均衡有个明确去向。
         assert_eq!(store.select_for_device(soft("dev-2")).unwrap().id, a);
-        let rows: i64 = store
-            .conn
-            .lock()
-            .query_row("SELECT COUNT(*) FROM device_bindings WHERE device_id = 'dev-1'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(rows, 0, "超过保留期的绑定行应被删除");
 
-        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, b, "已被遗忘，按负载均衡走");
+        let rows = |store: &CredentialStore| -> i64 {
+            store
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM device_bindings WHERE device_id = 'dev-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(rows(&store), 1, "后台还没跑，行还在表里");
+        assert_eq!(
+            store.select_for_device(soft("dev-1")).unwrap().id,
+            b,
+            "行还在也不算数：过了保留期就按负载均衡走"
+        );
+
+        // 上面那一发已经把 dev-1 改绑到 b 并刷新了 last_seen_at，故这行现在是活的、不该被清。
+        assert_eq!(store.prune_expired_bindings().unwrap(), (0, 0), "活着的绑定不动");
+        age_binding(&store, "dev-1", 7200);
+        assert_eq!(store.prune_expired_bindings().unwrap(), (1, 0), "过了保留期的由后台删掉");
+        assert_eq!(rows(&store), 0);
+    }
+
+    /// 后台清理认的是**当前配置**：保留期配成「永久」（`<= 0`）时一行都不许删。
+    #[test]
+    fn pruning_bindings_respects_a_forever_retention() {
+        let (store, ids) = soft_store(&["a"]);
+        assert_eq!(store.select_for_device(soft("dev-1")).unwrap().id, ids[0]);
+        age_binding(&store, "dev-1", 7200);
+        store.set_setting(DEVICE_BINDING_RETENTION, "0").unwrap();
+        assert_eq!(store.prune_expired_bindings().unwrap(), (0, 0), "永久保留即一行不删");
+    }
+
+    /// 后台清理那两条 DELETE 必须走 `last_seen_at` 上的索引，不能退成整表扫。
+    ///
+    /// 钉住它是因为这件事**刚从选号路径上挪下来**：会话绑定表按每条对话一行、默认留 24 小时，
+    /// 多客户端时几万行是常态，而那两条 DELETE 当年就是在整表扫。索引哪天被人顺手删掉，
+    /// 症状只是「后台任务慢一点」，没有任何人会注意到——除非这里拦一道。
+    #[test]
+    fn pruning_bindings_uses_the_last_seen_index() {
+        let (store, _) = soft_store(&["a"]);
+        let conn = store.conn.lock();
+        for table in ["device_bindings", "session_bindings"] {
+            let plan: String = conn
+                .query_row(
+                    &format!(
+                        "EXPLAIN QUERY PLAN \
+                         DELETE FROM {table} WHERE last_seen_at < unixepoch() - 600"
+                    ),
+                    [],
+                    |r| r.get(3),
+                )
+                .unwrap();
+            assert!(
+                plan.contains(&format!("idx_{table}_seen")),
+                "{table} 的保留期清理退成了整表扫：{plan}"
+            );
+        }
     }
 
     #[test]

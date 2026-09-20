@@ -196,6 +196,35 @@ pub async fn run(
         });
     }
 
+    // 每 10 分钟清一次过了保留期的绑定行（设备 + 模拟会话）。
+    //
+    // 这件事此前挂在选号路径上、每条转发请求跑一遍，两条 DELETE 各是一次按 last_seen_at 的
+    // 全表扫加一次写事务，全程压着那把全局 `conn` 锁——会话绑定表默认保留 24 小时，多客户端
+    // 时攒到几万行，实测单是扫一遍就要几毫秒，而它挡在每条请求的选号前面。
+    //
+    // 间隔取 10 分钟而不是跟流水裁剪一样 24 小时：保留期本身可以在后台调到很短（分钟级），
+    // 一天一次的话那种配置下表会一直留着早该删的行。选号侧已按保留期自己过滤，所以这个
+    // 间隔只影响磁盘占用，不影响任何判定——跑得晚一点选出来的号完全一样。
+    // 首个 tick 立即触发，兼作启动清理；同样走 spawn_blocking 不占异步线程。
+    {
+        let store = state.store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let store = store.clone();
+                match tokio::task::spawn_blocking(move || store.prune_expired_bindings()).await {
+                    Ok(Ok((devices, sessions))) if devices + sessions > 0 => {
+                        tracing::info!(devices, sessions, "pruned bindings past their retention")
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to prune expired bindings"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     // 学到的规则每小时按库重建一遍进程内记忆表：7 天保鲜期此前只在**读库**时生效
     // （`learned_rejections_with_time` 顺手删过期行），而请求路径判的是进程内 HashMap，进程
     // 不重启规则就永不过期——一条 7 天前学的拒答提示词能一直本地 403 下去。重建 = 读库

@@ -448,10 +448,13 @@ impl ReqLog {
         if let Some(cap) = &mut self.telemetry {
             cap.body = sent.clone();
         }
-        // 身份三项（session/device）重试前后逐字相同——两发都过同一个 `upstream.shape()`，
-        // 只有 messages 内容不同——故只换形态摘要那一项。
-        let (shape, _, _) = shape_summary(sent);
-        self.forensics.shape = shape;
+        // 只换形态摘要那一项：身份三项（session/device）重试前后逐字相同——两发都过同一个
+        // `upstream.shape()`，只有 messages 内容不同。
+        //
+        // 这条路上只拿得到字节，故要自己解析一遍。主路径不必（改写那一步把 `Value` 顺手交出来
+        // 了，见 [`shape_summary_of`]）；重试是 400 兜底，一条请求最多走一次，不值得为它把
+        // 一份解析态的体从改写那里一路拿到这里。
+        self.forensics.shape = shape_summary(sent).shape;
     }
 
     /// 上游回了 200 却没回答（判据见 [`Drop`] 里的调用处）：响应体开头记进流水的
@@ -688,17 +691,43 @@ pub(super) fn capture_forensics(
     sent: &Bytes,
     cred: &crate::credentials::Credential,
 ) -> store::Forensics {
-    let (shape, session_from_body, device_id_out) = shape_summary(sent);
+    let mut f = capture_forensics_without_body(upstream, cred);
+    fill_shape_forensics(&mut f, shape_summary(sent));
+    f
+}
+
+/// [`capture_forensics`] 里**不看出站体**的那几项。
+///
+/// 转发主路径用这个：形态摘要那三项留空，由调用方拿 [`Upstream::shape_outbound`] 交回来的
+/// [`ShapeBits`] 经 [`fill_shape_forensics`] 填上。那三项是改写那一步顺手算出来的，这里再从
+/// 字节解析一遍就是同一份几 MB 的 JSON 解析两次。
+///
+/// `session_id` 这里先放出站头里的那个：它与体里那个在官方形态下逐字相同，体里没有
+/// `metadata.user_id` 时它也是唯一的来源。体里真有的话，补那一步会用体里的覆盖回来
+/// （与此前 `session_from_body.or_else(header)` 同序）。
+pub(super) fn capture_forensics_without_body(
+    upstream: &Upstream<'_>,
+    cred: &crate::credentials::Credential,
+) -> store::Forensics {
     store::Forensics {
         proxy: cred.proxy.as_deref().map(store::redact_proxy),
         simulated: upstream.sim.is_some(),
         sim_reason: upstream.sim.as_ref().map(|s| s.reason.tag().to_string()),
-        shape,
-        session_id: session_from_body
-            .or_else(|| header_opt(&upstream.headers, "x-claude-code-session-id")),
-        device_id_out,
+        session_id: header_opt(&upstream.headers, "x-claude-code-session-id"),
         ..Default::default()
     }
+}
+
+/// 把出站体的取证三项补进取证字段。
+///
+/// 出站体里取到的 session_id 覆盖已有的（那是出站头里的兜底），取不到就留着原来的——
+/// 与 [`capture_forensics`] 此前 `session_from_body.or_else(header)` 的取舍一致。
+pub(super) fn fill_shape_forensics(f: &mut store::Forensics, bits: ShapeBits) {
+    f.shape = bits.shape;
+    if bits.session_id.is_some() {
+        f.session_id = bits.session_id;
+    }
+    f.device_id_out = bits.device_id_out;
 }
 
 /// 出站请求体的**结构**摘要（不含任何用户正文），落进流水的 `shape` 列。
@@ -716,15 +745,34 @@ pub(super) fn capture_forensics(
 /// - `tools`：数量、名字列表（最多 64 个）与名字串的哈希；
 /// - `messages`：条数、末条角色、各类内容块计数（text/tool_use/tool_result/thinking/image…）；
 /// - 其余顶层参数（model/max_tokens/stream/thinking/temperature/tool_choice/…）原样。
-pub(super) fn shape_summary(sent: &[u8]) -> (Option<String>, Option<String>, Option<String>) {
+pub(super) fn shape_summary(sent: &[u8]) -> ShapeBits {
+    match serde_json::from_slice::<serde_json::Value>(sent) {
+        Ok(v) => shape_summary_of(&v),
+        Err(_) => ShapeBits::default(),
+    }
+}
+
+/// 出站体的取证三项：形态摘要、出站 session_id、出站 device_id。
+///
+/// 三项同源（都从同一份出站 `Value` 上读），故一并算、一并传。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ShapeBits {
+    pub(super) shape: Option<String>,
+    pub(super) session_id: Option<String>,
+    pub(super) device_id_out: Option<String>,
+}
+
+/// [`shape_summary`] 的本体：吃一份**已经解析好**的出站体。
+///
+/// 转发主路径走这个，`Value` 由改写那一步顺手交出来（见 [`rewrite_body_out`]）——同一份几 MB
+/// 的 JSON 一条请求里只解析一次。只拿得到字节的那几条路（重试改写、早退兜底、连通性测试）
+/// 走上面那个包装。
+pub(super) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
     use sha2::{Digest, Sha256};
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(sent) else {
-        return (None, None, None);
-    };
-    let Some(obj) = v.as_object() else { return (None, None, None) };
+    let Some(obj) = v.as_object() else { return ShapeBits::default() };
     // 两种 `metadata.user_id` 格式（内嵌 JSON / 扁平串）都由这两个函数认，别在下面再手写一套。
-    let session = extract_session_id(Some(&v));
-    let device = extract_device_id(Some(&v));
+    let session = extract_session_id(Some(v));
+    let device = extract_device_id(Some(v));
     let sha16 = |text: &str| -> String {
         let d = Sha256::digest(text.as_bytes());
         d.iter().take(8).map(|b| format!("{b:02x}")).collect()
@@ -792,7 +840,11 @@ pub(super) fn shape_summary(sent: &[u8]) -> (Option<String>, Option<String>, Opt
         };
         out.insert(k.clone(), digest);
     }
-    (Some(serde_json::Value::Object(out).to_string()), session, device)
+    ShapeBits {
+        shape: Some(serde_json::Value::Object(out).to_string()),
+        session_id: session,
+        device_id_out: device,
+    }
 }
 
 /// 把一条用量日志交给阻塞线程池落库。
@@ -982,16 +1034,28 @@ impl UsageSniffer {
             }
         }
         if self.is_stream {
-            self.buf.extend_from_slice(chunk);
+            // `buf` 先整个挪出来：待解析的行是它的切片，而 [`Self::parse_line`] 要 `&mut self`,
+            // 借用检查不允许两者同时存在。挪出来之后两个借用就不相干了。
+            //
+            // **逐行 `drain` 换成了「扫完一次性 drain」**：`Vec::drain(..=pos)` 每行都要把余下
+            // 的字节整段前移，`collect()` 每行还要再分配一个 `Vec`。一个 SSE 块里几十行是常
+            // 态，于是块内是 O(行数 × 块长) 的搬运加几十次堆分配——而这段在每个回程流块上都
+            // 跑。现在按下标切片逐行解析，搬运只在末尾发生一次，一行都不用另外分配。
+            let mut buf = std::mem::take(&mut self.buf);
+            buf.extend_from_slice(chunk);
             // 逐个完整行处理，保留最后不完整的一段在 buf 里。
-            while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = self.buf.drain(..=pos).collect();
-                self.parse_line(&line[..line.len() - 1]);
+            let mut start = 0;
+            while let Some(rel) = buf[start..].iter().position(|&b| b == b'\n') {
+                let end = start + rel;
+                self.parse_line(&buf[start..end]);
+                start = end + 1;
             }
+            buf.drain(..start);
             // 防御：异常超长行避免无界增长。
-            if self.buf.len() > 1_000_000 {
-                self.buf.clear();
+            if buf.len() > 1_000_000 {
+                buf.clear();
             }
+            self.buf = buf;
         } else if self.buf.len() < 1_000_000 {
             // 非流式：累积整段响应体（JSON 消息响应通常很小）。
             self.buf.extend_from_slice(chunk);
@@ -1014,7 +1078,11 @@ impl UsageSniffer {
             if self.is_stream
                 && let Some(t) = v.get("type").and_then(|t| t.as_str())
             {
-                self.last_event = Some(t.to_string());
+                // 只在换了类型时才重新分配：一条长回复里连着几千个 `content_block_delta`，
+                // 每个都 `to_string()` 就是几千次一模一样的小分配。
+                if self.last_event.as_deref() != Some(t) {
+                    self.last_event = Some(t.to_string());
+                }
                 self.events += 1;
                 match t {
                     "error" => self.stream_error = Some(v.clone()),
@@ -1306,7 +1374,7 @@ pub(super) fn tool_use_label(block_type: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::proxy::test_support::gzip;
-    use crate::proxy::{UsageSniffer, shape_summary};
+    use crate::proxy::{ShapeBits, UsageSniffer, shape_summary};
 
     /// 上游用了我们没开的编码时，只能跳过嗅探——但不得崩、不得把压缩字节当明文解析。
     #[test]
@@ -1342,7 +1410,7 @@ mod tests {
             "stream": true,
             "thinking": {"type": "enabled", "budget_tokens": 1024}});
         let bytes = serde_json::to_vec(&body).unwrap();
-        let (shape, session, device) = shape_summary(&bytes);
+        let ShapeBits { shape, session_id: session, device_id_out: device } = shape_summary(&bytes);
         let shape = shape.expect("对象体必有摘要");
         assert_eq!(session.as_deref(), Some("9f8e7d6c-0000-1111-2222-333344445555"));
         assert_eq!(device.as_deref(), Some("ab12"), "扁平串的 device 段落进 device_id_out");
@@ -1378,7 +1446,7 @@ mod tests {
             assert!(!shape.contains(leak), "正文/身份不得进摘要: {leak} in {shape}");
         }
         // 非 JSON 体没有摘要，也不 panic。
-        assert_eq!(shape_summary(b"not json"), (None, None, None));
+        assert_eq!(shape_summary(b"not json"), ShapeBits::default());
     }
 
     /// CC 内嵌 JSON 格式的 `metadata.user_id`：device_id / session_id 都要认出来；
@@ -1389,15 +1457,15 @@ mod tests {
             "model": "claude-opus-5",
             "messages": [{"role": "user", "content": "hi"}],
             "metadata": {"user_id": "{\"device_id\":\"d230ce6e1111\",\"account_uuid\":\"acct\",\"session_id\":\"sess-1\"}"}});
-        let (shape, session, device) = shape_summary(&serde_json::to_vec(&body).unwrap());
-        assert!(shape.is_some());
-        assert_eq!(session.as_deref(), Some("sess-1"));
-        assert_eq!(device.as_deref(), Some("d230ce6e1111"));
+        let bits = shape_summary(&serde_json::to_vec(&body).unwrap());
+        assert!(bits.shape.is_some());
+        assert_eq!(bits.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(bits.device_id_out.as_deref(), Some("d230ce6e1111"));
 
         let bare = serde_json::json!({"model": "claude-opus-5", "messages": []});
-        let (shape, session, device) = shape_summary(&serde_json::to_vec(&bare).unwrap());
-        assert!(shape.is_some());
-        assert_eq!((session, device), (None, None));
+        let bits = shape_summary(&serde_json::to_vec(&bare).unwrap());
+        assert!(bits.shape.is_some(), "没带 metadata 也要有摘要");
+        assert_eq!((bits.session_id, bits.device_id_out), (None, None));
     }
 
     /// 嗅探器留下响应体开头：流式非流式都留、封顶不无界、截在多字节字符中间时丢掉半个字。
@@ -1501,6 +1569,60 @@ mod tests {
     /// `toolUseContentLengths`：流式下工具入参是 `input_json_delta` 一片片来的，按内容块
     /// 序号拼回去；同名工具累加；键按首次出现排序；`mcp__*` 归成 `mcp_tool`。
     /// 顺带钉住思考块的识别——`redacted_thinking` 一个字都没有，靠字数判定认不出来。
+    /// 同一条流无论被切成什么样的块，嗅探结果必须逐项相同。
+    ///
+    /// 切行那段改过一次（逐行 `drain` + `collect` 换成扫完一次性 `drain`，见 [`UsageSniffer::feed`]），
+    /// 而它的正确性全压在「跨块的半行要留到下一块再拼」这一条上。这里拿三种切法对同一条流跑：
+    /// 整段一次喂、每行一块、以及**逐字节**喂（每个事件都被切得稀碎，最恶劣的一种）。
+    #[test]
+    fn the_sniffer_is_indifferent_to_how_the_stream_is_chunked() {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":11,"cache_read_input_tokens":22}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            // 多字节正文：按字节切一定会切在半个汉字中间。
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"一二三四五"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":33}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let wire: Vec<u8> =
+            events.iter().flat_map(|e| format!("event: x\ndata: {e}\n\n").into_bytes()).collect();
+
+        let run = |chunks: Vec<&[u8]>| {
+            let mut s = crate::proxy::UsageSniffer::new(true, false);
+            for c in chunks {
+                s.feed(c);
+            }
+            s.finish();
+            s
+        };
+        let whole = run(vec![&wire]);
+        let per_byte = run(wire.chunks(1).collect());
+        // 7 字节一块：与行长互质，故切点会落在行内各处。
+        let ragged = run(wire.chunks(7).collect());
+
+        for (label, got) in [("逐字节", &per_byte), ("7 字节一块", &ragged)] {
+            assert_eq!(got.model, whole.model, "{label}");
+            assert_eq!(got.message_id, whole.message_id, "{label}");
+            assert_eq!(got.input_tokens, whole.input_tokens, "{label}");
+            assert_eq!(got.output_tokens, whole.output_tokens, "{label}");
+            assert_eq!(got.cache_read_tokens, whole.cache_read_tokens, "{label}");
+            assert_eq!(got.stop_reason, whole.stop_reason, "{label}");
+            assert_eq!(got.text_chars, whole.text_chars, "{label}");
+            assert_eq!(got.events, whole.events, "{label}：事件计数");
+            assert_eq!(got.last_event, whole.last_event, "{label}");
+            assert_eq!(got.saw_message_stop, whole.saw_message_stop, "{label}");
+            assert_eq!(got.tool_use_lens(), whole.tool_use_lens(), "{label}：工具入参长度");
+        }
+        // 这条流本身得真的被认出来了，否则上面比的是一堆空值。
+        assert_eq!(whole.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(whole.events, 8);
+        assert_eq!(whole.text_chars, 5, "五个汉字，按 UTF-16 码元数");
+        assert!(whole.saw_message_stop);
+    }
+
     #[test]
     fn the_sniffer_collects_tool_use_input_lengths() {
         let mut s = crate::proxy::UsageSniffer::new(true, false);

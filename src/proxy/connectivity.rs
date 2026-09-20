@@ -7,8 +7,8 @@ use crate::web::AppState;
 
 use super::ban::{detect_account_ban, is_third_party_rejection, parse_upstream_error};
 use super::body::{
-    OutboundIdentity, THINKING_MIN_MAX_TOKENS, ensure_beta_query, outbound_identity, rewrite_body,
-    sim_device_fingerprint, ua_of, with_outbound_identity,
+    OutboundIdentity, THINKING_MIN_MAX_TOKENS, ensure_beta_query, outbound_identity,
+    rewrite_body_out, sim_device_fingerprint, ua_of, with_outbound_identity,
 };
 use super::headers::{build_forward_headers_for, orig_header_case};
 use super::learned_rules::is_max_plan;
@@ -701,7 +701,7 @@ async fn send_quota_probe(
     if let Ok(v) = HeaderValue::from_str(&format!("claude-cli/{version} (external, cli)")) {
         headers.insert(header::USER_AGENT, v);
     }
-    let body = rewrite_body(
+    let body = rewrite_body_out(
         &probe_body(model),
         cred,
         // 身份下面整份覆盖，这里的指纹只是 `ensure_cc_metadata` 的占位。
@@ -719,7 +719,8 @@ async fn send_quota_probe(
         None,
         CcRequestKind::QuotaProbe,
         None,
-    );
+    )
+    .0;
     // **身份与这个会话的主请求逐字相同**：官方那条额度探测与首条 messages 是同一个进程
     // 发的，`metadata.user_id` 里三个字段一模一样。`spoof_device_id` / `spoof_identity`
     // 关掉时主请求发的是客户端自己那份，这里也必须跟着，否则同一会话两条请求在上游看来
@@ -958,13 +959,13 @@ fn log_probe_usage(
                 let (t, m) = parse_upstream_error(bytes);
                 (t, Some(m))
             };
-            let (shape, session_id, device_id_out) = shape_summary(sent);
+            let bits = shape_summary(sent);
             store::Forensics {
                 proxy: cred.proxy.as_deref().map(store::redact_proxy),
                 simulated: true,
-                shape,
-                session_id,
-                device_id_out,
+                shape: bits.shape,
+                session_id: bits.session_id,
+                device_id_out: bits.device_id_out,
                 error_type,
                 error_message,
                 third_party: !status.is_success() && is_third_party_rejection(bytes),

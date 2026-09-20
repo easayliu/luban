@@ -31,7 +31,8 @@ use super::learned_rules::{
     remember_deprecated_field, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 use super::logging::{
-    ReqLog, UsageSniffer, ban_context, capture_forensics, record_early_failure, telemetry_capture,
+    ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
+    record_early_failure, telemetry_capture,
 };
 use super::openai_marker::find_openai_marker;
 use super::probe_detect::{probe_reply, probe_signature};
@@ -871,7 +872,7 @@ pub(super) async fn handle_inner(
     // 逐轮重新赋值（换号后是另一条路线，旧的那格在赋值时归还），不给初值是因为循环体在任何
     // 一条 `break` 之前都必经那次赋值。循环之后它会被交给 `ReqLog` 拿着，活到响应流结束。
     let mut route_load: UpstreamRouteGuard;
-    let (upstream, resp, sent) = loop {
+    let (upstream, resp, sent, sent_bits) = loop {
         // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定并随选号结果一起返回，
         // 见 [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、
         // 对话之间复用。换号重试后 `session_slot` 随新号一起换。没占槽位的（带设备身份的
@@ -1046,7 +1047,10 @@ pub(super) async fn handle_inner(
         };
         // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
         // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
-        let sent = upstream.shape(&body, &cred, &device_fp);
+        // 出站体 + 它的取证摘要一并拿：摘要借改写刚建好的那份 `Value` 算，
+        // 不再为它把同一份 JSON 第二次解析一遍，见 [`Upstream::shape_outbound`]。
+        let (sent, sent_bits) =
+            upstream.shape_outbound(&body, &cred, &device_fp, body_json.as_ref());
         // 新会话的启动握手：**在这条主请求发出之前**开跑（`cap/2.1.260-2` 的时序是
         // 17:10:17 policy_limits …→ 17:10:19.699 第一条 messages）。原先它排在遥测里，等回程
         // 之后再由 5s 一跳的发送循环取走——顺序整个反了。
@@ -1306,7 +1310,7 @@ pub(super) async fn handle_inner(
                 error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
             });
         }
-        let Some(info) = limited else { break (upstream, resp, sent) };
+        let Some(info) = limited else { break (upstream, resp, sent, sent_bits) };
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
         // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
         let scope = rate_limit_scope_for(&info, req_model.as_deref(), is_max_plan(&cred));
@@ -1338,7 +1342,7 @@ pub(super) async fn handle_inner(
                     swaps = denial_swaps,
                     "model-denial swap cap reached, passing the upstream 429 through"
                 );
-                break (upstream, resp, sent);
+                break (upstream, resp, sent, sent_bits);
             }
             match store::valid_access_token_for_device(
                 &state.store,
@@ -1446,7 +1450,7 @@ pub(super) async fn handle_inner(
                         error = %e,
                         "model not included in this account's plan but no account to swap to, passing the 429 through"
                     );
-                    break (upstream, resp, sent);
+                    break (upstream, resp, sent, sent_bits);
                 }
             }
         }
@@ -1477,7 +1481,7 @@ pub(super) async fn handle_inner(
 
         // 冷却与重试同受一个开关：关掉即完全退回「原样透传 429」的既有行为。
         if max_retry == 0 {
-            break (upstream, resp, sent);
+            break (upstream, resp, sent, sent_bits);
         }
         // 裸 429（一个限流头都没带）：完全透传，不打冷却、不改 retry-after、不剥 metadata。
         // 这类 429 来自上游服务端瞬态限流，不跟着账号走——我们干预没有意义，让官方 SDK
@@ -1488,7 +1492,7 @@ pub(super) async fn handle_inner(
                 model = %req_model.as_deref().unwrap_or("-"),
                 "upstream 429 with no rate-limit headers: passing through as-is, letting the client handle retry"
             );
-            break (upstream, resp, sent);
+            break (upstream, resp, sent, sent_bits);
         }
         park_rate_limited(&state.store, &cred, &scope, cooldown, transient_exhausted);
         // 谁的额度都没满（容量/请求速率限制）→ **就此打住，不换号**：这一发 429 不是这个号的
@@ -1524,7 +1528,7 @@ pub(super) async fn handle_inner(
                 retry_after_secs = cooldown.as_secs(),
                 "upstream 429 is not account-specific (no quota window is full): passing it through with a backed-off retry-after instead of swapping credentials"
             );
-            break (upstream, resp, sent);
+            break (upstream, resp, sent, sent_bits);
         }
         tried.push(cred.id);
         if retried >= max_retry {
@@ -1533,7 +1537,7 @@ pub(super) async fn handle_inner(
                 retried,
                 "upstream 429, credential-swap retry cap reached, passing the response through"
             );
-            break (upstream, resp, sent);
+            break (upstream, resp, sent, sent_bits);
         }
 
         // 换一个没试过的号。选号顺带**改绑**这台设备（绑定的号不在候选里时会重选并改绑），
@@ -1571,7 +1575,7 @@ pub(super) async fn handle_inner(
                     error = %e,
                     "upstream 429 but no credential to swap to, passing through as is"
                 );
-                break (upstream, resp, sent);
+                break (upstream, resp, sent, sent_bits);
             }
         }
     };
@@ -1631,6 +1635,30 @@ pub(super) async fn handle_inner(
             // 流结束(或断开)时在 Drop 里记 total、输出一条日志并落库。
             // 从这儿起流水归 ReqLog；告诉外层别再按本地拒绝补一条。
             log_state.logged.store(true, std::sync::atomic::Ordering::Relaxed);
+            // 只给计费路径备料：**含非 2xx**——失败的请求要报 `tengu_api_error`
+            // （官方客户端对失败请求发的正是它），报不报由 Drop 里再判。
+            let telemetry = telemetry_capture(
+                &state,
+                &cred,
+                &upstream,
+                &sent,
+                started,
+                flags,
+                billable,
+                header_opt(up.headers(), "anthropic-organization-id"),
+            );
+            let mut forensics = store::Forensics {
+                // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
+                // 「看请求」按它筛，见 [`store::Forensics::session_key`]。
+                session_key: session_key.clone(),
+                // 来访自报的会话 id；`capture_forensics_without_body` 给的 `session_id` 是
+                // **出站**那个，走模拟时两者不同。
+                session_id_in: inbound_session.clone(),
+                ..capture_forensics_without_body(&upstream, &cred)
+            };
+            // 形态摘要在改写那一步就算好了（`sent_bits`），这里只是把它安上：走查加 sha256
+            // 0.6ms，且不必留着任何东西到收尾——出站体与它的解析态都在改写返回时就散了。
+            fill_shape_forensics(&mut forensics, sent_bits);
             let mut rl = ReqLog {
                 started,
                 ttft_ms: None,
@@ -1652,27 +1680,8 @@ pub(super) async fn handle_inner(
                 request_id: request_id.to_string(),
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
-                forensics: store::Forensics {
-                    // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
-                    // 「看请求」按它筛，见 [`store::Forensics::session_key`]。
-                    session_key: session_key.clone(),
-                    // 来访自报的会话 id；`capture_forensics` 给的 `session_id` 是**出站**那个，
-                    // 走模拟时两者不同。
-                    session_id_in: inbound_session.clone(),
-                    ..capture_forensics(&upstream, &sent, &cred)
-                },
-                // 只给计费路径备料：**含非 2xx**——失败的请求要报 `tengu_api_error`
-                // （官方客户端对失败请求发的正是它），报不报由 Drop 里再判。
-                telemetry: telemetry_capture(
-                    &state,
-                    &cred,
-                    &upstream,
-                    &sent,
-                    started,
-                    flags,
-                    billable,
-                    header_opt(up.headers(), "anthropic-organization-id"),
-                ),
+                forensics,
+                telemetry,
                 // 两条路都要把回程记回去：模拟那条的会话 id 在 `sim` 里，真实 CC 那条在
                 // `client_link` 里（键是客户端自己的会话 id）。
                 cc_session: upstream

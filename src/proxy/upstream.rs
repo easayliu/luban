@@ -8,9 +8,9 @@ use crate::store;
 use crate::web::AppState;
 
 use super::ban::parse_upstream_error;
-use super::body::{ToolNameMap, restore_tool_names_stream, rewrite_body, trusted_cc_version};
+use super::body::{ToolNameMap, restore_tool_names_stream, rewrite_body_out, trusted_cc_version};
 use super::headers::{is_resp_forwardable, orig_header_case};
-use super::logging::{ReqLog, UsageSniffer};
+use super::logging::{ReqLog, ShapeBits, UsageSniffer, shape_summary_of};
 use super::rate_limit::RateLimitInfo;
 use super::session_link::{CcRequestKind, CcSessionLink};
 use super::thinking::preserve_thinking_encoding;
@@ -85,7 +85,33 @@ impl Upstream<'_> {
         cred: &crate::credentials::Credential,
         device_fp: &str,
     ) -> Bytes {
-        self.shape_with(body, cred, device_fp, self.refusal_fallbacks)
+        self.shape_with(body, cred, device_fp, self.refusal_fallbacks).0
+    }
+
+    /// [`Self::shape`] 外加一份**出站体的取证摘要**（[`shape_summary_of`]）。
+    ///
+    /// 转发主路径走这个。摘要在这里算而不是等落库时再从字节解析，是因为改写刚好把出站体的
+    /// `Value` 建在手里（见 [`rewrite_body_out`]）——借它走一趟只要 0.6ms，而从字节重新解析
+    /// 一份 1.8MB 的会话要 6.7ms。两者的产物逐字相同。
+    ///
+    /// `inbound` 是来访体已经解析好的那份（[`handle_inner`] 里的 `body_json`）：改写没动过
+    /// 体的时候出站字节与来访逐字节相同，摘要拿它算即可，同样不必重新解析。
+    ///
+    /// **`Value` 不外泄**：只返回摘要那三个小 String。解析态的 `Value` 通常是字节数的几倍，
+    /// 把它交出去让调用方一路拿着穿过上游那次往返，是拿内存峰值换 CPU——那笔账不划算。
+    pub(super) fn shape_outbound(
+        &self,
+        body: &Bytes,
+        cred: &crate::credentials::Credential,
+        device_fp: &str,
+        inbound: Option<&serde_json::Value>,
+    ) -> (Bytes, ShapeBits) {
+        let (sent, outbound) = self.shape_with(body, cred, device_fp, self.refusal_fallbacks);
+        let bits = match outbound.as_ref().or(inbound) {
+            Some(v) => shape_summary_of(v),
+            None => ShapeBits::default(),
+        };
+        (sent, bits)
     }
 
     /// [`Self::shape`] 指定要不要补 `fallbacks`：重试路径（[`retry_without_fallbacks`]）
@@ -96,7 +122,7 @@ impl Upstream<'_> {
         cred: &crate::credentials::Credential,
         device_fp: &str,
         fallbacks: Option<&'static str>,
-    ) -> Bytes {
+    ) -> (Bytes, Option<serde_json::Value>) {
         if self.billable {
             // body 侧要不要补 `thinking.display:"updates"`，看**实际发出的头**里有没有那项 beta
             // （[`merge_beta`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
@@ -120,7 +146,7 @@ impl Upstream<'_> {
                 .and_then(|v| v.to_str().ok())
                 .and_then(trusted_cc_version)
                 .map(|(a, b, c)| format!("{a}.{b}.{c}"));
-            rewrite_body(
+            rewrite_body_out(
                 body,
                 cred,
                 device_fp,
@@ -138,7 +164,7 @@ impl Upstream<'_> {
                 fallbacks,
             )
         } else {
-            body.clone()
+            (body.clone(), None)
         }
     }
 
@@ -629,7 +655,7 @@ pub(super) async fn retry_without_fallbacks(
     client_body: &Bytes,
     rl: &mut ReqLog,
 ) -> Option<wreq::Response> {
-    let retried = upstream.shape_with(client_body, cred, device_fp, None);
+    let retried = upstream.shape_with(client_body, cred, device_fp, None).0;
     let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,
         Err(e) => {
@@ -1646,8 +1672,10 @@ data: {\"type\":\"message_stop\"}
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: Some("req_first".into()),
+            // 形态摘要建记录时就算好（生产路径同此：改写那一步顺手交出的 `Value`），
+            // `note_retry` 负责换成重试实际发出去的那份。
             forensics: store::Forensics {
-                shape: crate::proxy::shape_summary(&first).0,
+                shape: crate::proxy::shape_summary(&first).shape,
                 ..Default::default()
             },
             telemetry: Some(crate::telemetry::Capture {

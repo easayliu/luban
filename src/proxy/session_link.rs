@@ -922,7 +922,7 @@ mod tests {
         .expect("主线程 CC 请求该补会话链");
         assert_eq!(sid, SID, "键是客户端自己的会话 id");
 
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &body,
             &test_cred(),
             "fp",
@@ -938,7 +938,8 @@ mod tests {
             Some(&link),
             crate::proxy::CcRequestKind::Main,
             None,
-        );
+        )
+        .0;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let billing = v["system"][0]["text"].as_str().unwrap();
         assert!(billing.contains("; cch="), "cch 照旧补: {billing}");
@@ -957,7 +958,7 @@ mod tests {
                 .unwrap()
                 .replace("cc_entrypoint=cli;", "cc_entrypoint=cli; cc_prompt_id=mine;"),
         );
-        let out = crate::proxy::rewrite_body(
+        let out = crate::proxy::rewrite_body_out(
             &own,
             &test_cred(),
             "fp",
@@ -973,7 +974,8 @@ mod tests {
             Some(&link),
             crate::proxy::CcRequestKind::Main,
             None,
-        );
+        )
+        .0;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let billing = v["system"][0]["text"].as_str().unwrap();
         assert!(billing.contains("cc_prompt_id=mine;"), "保留客户端自己那个: {billing}");

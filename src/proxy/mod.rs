@@ -87,7 +87,7 @@ use body::{
     ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
     flatten_tool_schemas, is_billable_messages, is_fallback_rejection, known_latest_release,
     normalize_tool_choice, outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
-    remember_fallback_rejection, replace_json_str_field, rewrite_body, sim_device_fingerprint,
+    remember_fallback_rejection, replace_json_str_field, rewrite_body_out, sim_device_fingerprint,
     sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
     sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
@@ -104,7 +104,7 @@ pub(crate) use upstream::{SessionConcurrency, UpstreamLoad};
 
 mod logging;
 #[cfg(test)]
-use logging::{RESPONSE_EXCERPT_BYTES, ReqLog, shape_summary};
+use logging::{RESPONSE_EXCERPT_BYTES, ReqLog, ShapeBits, shape_summary, shape_summary_of};
 use logging::{UsageSniffer, capture_forensics, spawn_usage_log};
 
 mod connectivity;

@@ -51,7 +51,7 @@ pub(super) fn rewrite_body_with_session(
 ) -> Bytes {
     // 测试默认按「出站头里带了 thinking-display-updates」跑，fable 的 display 才补得上；
     // 头上没有那项 beta 的反例见 `skips_thinking_display_without_the_beta`。
-    super::rewrite_body(
+    super::rewrite_body_out(
         body,
         cred,
         device_fp,
@@ -68,6 +68,7 @@ pub(super) fn rewrite_body_with_session(
         super::CcRequestKind::Main,
         None,
     )
+    .0
 }
 
 /// 抓包 040 里的真实 account_uuid。
