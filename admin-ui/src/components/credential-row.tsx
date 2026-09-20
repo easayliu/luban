@@ -929,11 +929,13 @@ function ListQuotaMeter({
 
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
+  // 常态 marine、吃紧琥珀、打满红，与卡片上的 QuotaMeter 同一口径（改动理由见那边的注）：
+  // 同一条计量条在两个视图里必须是同一种颜色。
   const indicatorClass = level === 'critical'
     ? 'bg-destructive'
     : level === 'warning'
       ? 'bg-warning'
-      : 'bg-success'
+      : 'bg-marine'
 
   const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
   if (!showLabel) {
@@ -1143,10 +1145,12 @@ function SlotMeterRow({
   onClick: () => void
 }) {
   const pct = limit > 0 ? Math.min(100, Math.round((count / limit) * 100)) : 0
+  // 文字用 `-foreground` 那一支：`--destructive` / `--warning` 是给填充用的底色，
+  // 拿来写字在浅底上对比度不够、暗色下又偏暗（见 index.css 里各自的注）。
   const numberClass = usage.level === 'critical'
-    ? 'text-destructive'
+    ? 'text-destructive-foreground'
     : usage.level === 'warning'
-      ? 'text-warning'
+      ? 'text-warning-foreground'
       : usage.level === 'empty'
         ? 'text-muted-foreground'
         : 'text-foreground'

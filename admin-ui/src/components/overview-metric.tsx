@@ -1,10 +1,11 @@
 import type { ElementType, ReactNode } from 'react'
+import { ArrowUpRightIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function OverviewMetric({
-  label, value, status, statusHint, trend, icon: Icon, tone, active = false, onClick, className,
+  label, value, status, statusHint, trend, icon: Icon, tone, active = false, opensDetail = false, onClick, className,
 }: {
   label: string
   value: number | string
@@ -14,32 +15,68 @@ export function OverviewMetric({
   icon: ElementType<{ className?: string }>
   tone: 'ok' | 'bad' | 'warn' | 'neutral'
   active?: boolean
+  /**
+   * 这一格点开的是详情弹窗，而不是筛选列表。
+   *
+   * 六格长得一模一样，点下去却分三种结果：筛选列表、开趋势弹窗、什么都不做。带角标的那几枚
+   * 是「点开看详情」，选中态（左侧竖条 + 淡底）的那几枚是「正在按它筛选」，剩下没反应的那枚
+   * 两样都没有——不用点一遍也能分出来。
+   */
+  opensDetail?: boolean
   onClick?: () => void
   className?: string
 }) {
+  /**
+   * 告警色上在**数值**上，图标只在真出事时才跟着变色。
+   *
+   * 原来反过来：色调只上在左边那枚图标上，`需处理 2` 里的 2 还是普通前景色。可这一排格子里眼睛
+   * 先落到的就是那个大数字，图标是最后才看的——真有 2 个号要处理时，最醒目的位置反而最安静。
+   *
+   * 常态（ok / neutral）一律不着色：概览是用来找异常的，「一切正常」不需要拿颜色来说，否则
+   * 六格里四格都带色，真正该跳出来的那一格就淹了。这也是 5h / 7d 计量条改成常态 marine 的同一条理由。
+   */
   const iconClass = {
-    ok: 'text-success-foreground',
+    ok: 'text-muted-foreground',
     bad: 'text-destructive-foreground',
     warn: 'text-warning-foreground',
     neutral: 'text-muted-foreground',
   }[tone]
+  const valueClass = {
+    ok: 'text-foreground',
+    bad: 'text-destructive-foreground',
+    warn: 'text-warning-foreground',
+    neutral: 'text-foreground',
+  }[tone]
   const content = (
     <div className="flex min-h-16 items-center gap-3 px-3 py-2.5 sm:px-4" title={statusHint}>
-      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+      {/* 图标方块（32px + 12px 间距）在手机上要走 44px 横向，而一格只有半个屏宽：正文被压到
+          约 111px，`99.7%` 加上 80px 的迷你线要 140px，于是迷你线要么换行把整格撑高、要么被压成
+          一条虚线。手机上改成把同一枚图标挂到标签前（14px），正文回到 155px，数值与迷你线一行装得下。
+          sm 起格子宽裕，方块照旧——它是这排概览的视觉锚点。色调仍由图标颜色承担，两种形态共用。 */}
+      <span className="hidden size-8 shrink-0 items-center justify-center rounded-lg bg-muted sm:flex">
         <Icon className={cn('size-4', iconClass)} aria-hidden />
       </span>
       <div className="min-w-0 flex-1">
-        <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
+        <p className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <Icon className={cn('size-3.5 shrink-0 sm:hidden', iconClass)} aria-hidden />
+          <span className="min-w-0 truncate">{label}</span>
+          {opensDetail && <ArrowUpRightIcon className="size-3 shrink-0 opacity-64" aria-hidden />}
+        </p>
         {/* 一行排数值、小字、迷你线，但这两样不会同时出现：带迷你线的两格不再放小字（三样在
             任何宽度下都挤不开，见 credential-workspace 那两处注释）。迷你线放最后、按剩余宽度
-            伸缩，手机上一格不到 190px 也缩得进来。 */}
+            伸缩，手机上一格不到 190px 也缩得进来。
+            小字是 12px 而不是 11px：手机半格正文 155px，最长的「2 暂不可用」在 12px 下约 58px，
+            与 18px 的数值（约 28px）并排仍有富余；11px 只是把字压小，并没有换来位置。 */}
         <div className="mt-1 flex min-w-0 items-baseline gap-2">
-          <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
+          <span className={cn('shrink-0 text-lg font-semibold leading-none tracking-tight tnum', valueClass)}>
             {value}
           </span>
+          {/* 状态小字（「2 暂不可用」「2 封禁」）手机上不出：CF 的移动端概览格只放标签与数值，
+              一格半屏宽，再塞一句解释就要么把数值挤扁、要么被截成半句。完整说法仍在整格的悬浮
+              提示（[statusHint]）与点开的筛选结果里，sm 起照常显示。 */}
           {status && (
             <Tooltip>
-              <TooltipTrigger className="min-w-0 shrink truncate text-2xs text-muted-foreground">
+              <TooltipTrigger className="sr-only min-w-0 shrink truncate text-xs text-muted-foreground sm:not-sr-only sm:block">
                 {status}
               </TooltipTrigger>
               <TooltipPopup>{status}</TooltipPopup>
@@ -54,7 +91,9 @@ export function OverviewMetric({
   const rootClass = cn(
     'min-w-0 text-left transition-colors',
     onClick && 'cursor-pointer hover:bg-muted/40 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
-    active && 'bg-marine/10 hover:bg-marine/14',
+    // 选中不只是淡底：再压一条 2px 的左侧竖条。淡底在深色主题下几乎看不出来，而这三格是
+    // 列表当前的筛选条件，看不出选没选就会对着一份被筛过的列表发愣。
+    active && 'bg-marine/10 shadow-[inset_2px_0_0_0_var(--marine)] hover:bg-marine/14',
     className,
   )
 
@@ -70,11 +109,11 @@ export function OverviewMetric({
 }
 
 /**
- * 概览里的实时格：和 [OverviewMetric] 同一套图标 / 字号，但排布不同。
+ * 概览里的实时格：和 [OverviewMetric] 同一套图标 / 字号 / 排布，区别只在数值后面跟着单位与在途数。
  *
- * 它是唯一一格「此刻代理在干什么」，手机上又占满一整行，照 label 在上、数值在下排就会在右边空出
- * 半行；这里改成标签贴左、数值贴右的横条，把整行用满。sm 起整行宽到两端拉不住，退回和邻居一样的
- * 竖排。数值旁边的单位与在途数一路跟着走，不再挤进那行会被截断的 status 文案里。
+ * 它曾经在手机上占满一整行，于是排成「标签贴左、数值贴右」的横条把整行用满；现在六格在手机上一律
+ * 两列（见 credential-workspace 的概览网格），它也只有半格宽，横条那套就没有意义了——退回竖排，
+ * 与左右邻居的标签、数值落在同一条基线上。
  */
 export function LiveTrafficMetric({
   label, value, unit, detail, live, hint, icon: Icon, className,
@@ -98,17 +137,26 @@ export function LiveTrafficMetric({
           className,
         )}
       >
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
+        {/* 图标的两种形态与 [OverviewMetric] 完全一致，理由见那边的注。 */}
+        <span className="hidden size-8 shrink-0 items-center justify-center rounded-lg bg-muted sm:flex">
           <Icon className={cn('size-4', live ? 'text-success-foreground' : 'text-muted-foreground')} aria-hidden />
         </span>
-        <div className="flex min-w-0 flex-1 flex-wrap items-baseline justify-between gap-x-3 gap-y-1 sm:block">
-          <p className="min-w-0 truncate text-xs font-medium text-muted-foreground">{label}</p>
-          <div className="flex min-w-0 items-baseline gap-1.5 sm:mt-1">
+        <div className="min-w-0 flex-1">
+          <p className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
+            <Icon
+              className={cn('size-3.5 shrink-0 sm:hidden', live ? 'text-success-foreground' : 'text-muted-foreground')}
+              aria-hidden
+            />
+            <span className="min-w-0 truncate">{label}</span>
+          </p>
+          <div className="mt-1 flex min-w-0 items-baseline gap-1.5">
             <span className="shrink-0 text-lg font-semibold leading-none tracking-tight tnum">
               {value}
             </span>
-            <span className="shrink-0 text-2xs text-muted-foreground tracking-wide">{unit}</span>
-            <span className="flex min-w-0 items-baseline gap-1.5 text-2xs text-muted-foreground">
+            <span className="shrink-0 text-xs text-muted-foreground tracking-wide">{unit}</span>
+            {/* 在途数与上面那句状态小字同一处理：手机上只留数值与单位，在途靠呼吸点表达
+                「此刻有没有活」，具体几条在悬浮提示里。静默时连中点也不留，免得行尾吊一个孤点。 */}
+            <span className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
               {/* 有在途时呼吸点就是分隔符本身，再补一个中点只是噪声。 */}
               {live ? (
                 <span className="relative flex size-1.5 shrink-0 translate-y-[-1px]" aria-hidden>
@@ -116,9 +164,9 @@ export function LiveTrafficMetric({
                   <span className="relative inline-flex size-1.5 rounded-full bg-success" />
                 </span>
               ) : (
-                <span aria-hidden>·</span>
+                <span className="hidden sm:inline" aria-hidden>·</span>
               )}
-              <span className="truncate">{detail}</span>
+              <span className="sr-only truncate sm:not-sr-only sm:inline">{detail}</span>
             </span>
           </div>
         </div>
@@ -131,7 +179,7 @@ export function LiveTrafficMetric({
 export function OverviewMetricSkeleton({ className }: { className?: string }) {
   return (
     <div className={cn('flex min-h-16 min-w-0 items-center gap-3 px-3 py-2.5 sm:px-4', className)}>
-      <Skeleton className="size-8 shrink-0 rounded-lg" />
+      <Skeleton className="hidden size-8 shrink-0 rounded-lg sm:block" />
       <div className="min-w-0 flex-1">
         <Skeleton className="h-3 w-20" />
         <div className="mt-1.5 flex items-center gap-2">

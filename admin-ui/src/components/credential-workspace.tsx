@@ -79,6 +79,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useDebounced } from '@/lib/use-debounced'
 import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
@@ -734,13 +735,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             (isLoading || count > 0) && 'xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center',
           )}
         >
-          <div className="flex min-w-0 items-center justify-between gap-3 xl:justify-start">
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 xl:justify-start">
             <div className="flex min-w-0 items-center gap-2.5">
               <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight">
                 {t('账号池', 'Account pool')}
               </h1>
               {!isLoading && (
-                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-2xs font-medium text-muted-foreground">
+                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
                   {t(
                     `${formatNumber(count)} 个账号`,
                     `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
@@ -750,30 +751,39 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
                   是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
               {!isLoading && count > 0 && (
-                <button
-                  type="button"
-                  className={cn(
-                    'inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-2 py-1 text-2xs font-medium text-muted-foreground transition-colors',
-                    'hover:bg-muted/72 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
-                    (filter === 'deviceFull' || filter === 'hasDevice') && 'bg-foreground/8 text-foreground',
-                    fullDeviceCount > 0 && 'text-warning-foreground',
-                  )}
-                  title={deviceStatus}
-                  aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
-                  onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
-                >
-                  <SmartphoneIcon className="size-3" aria-hidden />
-                  <span className="tnum">
-                    {metrics.deviceCapacity > 0 && metrics.unlimitedDeviceAccounts === 0
-                      ? `${formatNumber(metrics.deviceCount)}/${formatNumber(metrics.deviceCapacity)}`
-                      : formatNumber(metrics.deviceCount)}
-                  </span>
-                  <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
-                </button>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<button type="button" />}
+                    className={cn(
+                      'inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground transition-colors',
+                      'hover:bg-muted/72 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
+                      // 选中态与概览格同一套记号：淡底 + 一条左侧竖条。旁边那枚「N 个账号」是纯展示，
+                      // 两枚长得一样就看不出哪个点得动——竖条只会出现在可点且已选中的这一枚上。
+                      (filter === 'deviceFull' || filter === 'hasDevice')
+                        && 'bg-marine/10 text-foreground shadow-[inset_2px_0_0_0_var(--marine)]',
+                      fullDeviceCount > 0 && 'text-warning-foreground',
+                    )}
+                    aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
+                    onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+                  >
+                    <SmartphoneIcon className="size-3" aria-hidden />
+                    <span className="tnum">
+                      {metrics.deviceCapacity > 0 && metrics.unlimitedDeviceAccounts === 0
+                        ? `${formatNumber(metrics.deviceCount)}/${formatNumber(metrics.deviceCapacity)}`
+                        : formatNumber(metrics.deviceCount)}
+                    </span>
+                    <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
+                  </TooltipTrigger>
+                  {/* 原来挂在原生 `title` 上：手机上完全出不来，而这句写的正是「这个数是怎么算的、
+                      点下去会筛出什么」。这是概览这一片最后一处原生 title。 */}
+                  <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                    {deviceStatus}
+                  </TooltipPopup>
+                </Tooltip>
               )}
             </div>
             <div
-              className="flex shrink-0 items-center gap-1.5 text-2xs text-muted-foreground"
+              className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
               aria-live="polite"
               aria-atomic="true"
             >
@@ -1001,14 +1011,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
             <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
             <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-            <OverviewMetricSkeleton className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0" />
-            <OverviewMetricSkeleton className="col-span-2 lg:col-span-1" />
+            <OverviewMetricSkeleton className="border-r" />
+            <OverviewMetricSkeleton />
           </section>
         ) : count > 0 && (
           <section
             aria-label={t('账号池概览', 'Account pool overview')}
             className="grid grid-cols-2 border-t lg:grid-cols-6"
           >
+            {/* 手机上齐整的 2 列 × 3 行，lg 起一字排开六格。
+                原来末两格各带 `col-span-2` 独占一整行——「首字时延 — 暂无数据」右半边整片空着，
+                六格铺成五行，把账号列表一路顶下去。半格宽度对这两格是够的：手机上去掉 32px 图标方块后
+                正文有 155px，「0 RPM · 0 在途」与「— 暂无数据」都装得下，见 overview-metric 里的注。 */}
             <OverviewMetric
               className="border-r border-b lg:border-b-0"
               label={t('可调度账号', 'Schedulable accounts')}
@@ -1074,11 +1088,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 : undefined}
               icon={DatabaseZapIcon}
               tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
+              opensDetail
               onClick={() => setCacheTrendOpen(true)}
             />
             {/* 与缓存那格同一写法：这一行只放数值与迷你线，7 天基线、p95、吞吐都在悬浮提示里。 */}
             <OverviewMetric
-              className="col-span-2 border-b lg:col-span-1 lg:border-r lg:border-b-0"
+              className="border-r"
               label={ttftNow
                 ? t(`首字时延 p50 · ${ttftNow.label[0]}`, `TTFT p50 · ${ttftNow.label[1]}`)
                 : t('首字时延', 'TTFT')}
@@ -1093,10 +1108,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 : undefined}
               icon={TimerIcon}
               tone={ttftTone}
+              opensDetail
               onClick={() => setTtftTrendOpen(true)}
             />
             <LiveTrafficMetric
-              className="col-span-2 lg:col-span-1"
               label={t('实时流量', 'Live traffic')}
               value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
               unit="RPM"

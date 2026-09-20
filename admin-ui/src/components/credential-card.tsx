@@ -1,9 +1,10 @@
-import { memo, useState } from 'react'
+import { memo, useState, type ElementType, type ReactNode } from 'react'
 import {
   CalendarDaysIcon,
   CheckIcon,
   ClockIcon,
   BanIcon,
+  Building2Icon,
   EllipsisIcon,
   GaugeIcon,
   GlobeIcon,
@@ -44,6 +45,7 @@ import {
   tierBadgeVariant,
   unifiedQuotaStatusLabel,
   useCredentialActions,
+  type QuotaLevel,
   type QuotaWindowMeta,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
@@ -51,8 +53,7 @@ import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
 import { CredentialQuotaDialog } from '@/components/credential-quota-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
-import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -79,15 +80,85 @@ import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
- * 页脚三枚名额徽章（设备 / 会话 / RPM）的共用类：定宽 2.75rem、数字左对齐（`justify-start`
- * 盖掉徽章默认的居中）。
+ * 页脚三格名额读数（设备 / 会话 / RPM）的定宽：2.25rem，数字左对齐。
  *
- * 徽章若按内容伸缩，`1/10` 与 `0/100` 宽度不同，后面那颗按钮就跟着往左右挪——一排卡片并列时
- * 会话图标、RPM 图标各在各的位置上，横着扫过去是锯齿状的。定宽之后三颗按钮等宽，卡片之间对齐，
- * 数字也都从同一处起读。2.75rem 够放 `0/100`（手机上 12px 字号）与 `0/1000`（sm 起 10px 字号）；
- * 再长才会把徽章撑开。
+ * 读数若按内容伸缩，`1/10` 与 `0/100` 宽度不同，后面那格就跟着往左右挪——一列卡片叠下来，
+ * 会话图标、RPM 图标各在各的位置上，竖着扫过去是锯齿状的。定宽之后每格等宽，卡片之间对齐，
+ * 数字也都从同一处起读。2.25rem 够放 `0/100`（手机 12px 字号），再长才会把它撑开。
+ * `@xs/card`（卡片窄于 320px）时放弃定宽，让这一行在极窄屏上还能自己收进去。
  */
-const SLOT_BADGE = 'min-w-11 justify-start tabular-nums'
+const SLOT_WIDTH = '@xs/card:min-w-9'
+
+/**
+ * 名额占用 → 数字的颜色。空闲灰、健康绿、吃紧黄、占满红，判定见 [deviceUsageMeta]。
+ *
+ * 这个编码原来由实心徽章的底色承担。改成给数字本身上色是 Cloudflare 那套读数条的做法：
+ * 实心胶囊留给状态（运行正常 / 封禁 / 套餐），计量值只着色不加底板——底板要 padding、要行高，
+ * 四格并排就是页脚换行的直接原因。颜色编码一格没少，吃掉的高度没了。
+ */
+const SLOT_TEXT: Record<QuotaLevel, string> = {
+  empty: 'text-muted-foreground',
+  ok: 'text-success-foreground',
+  warning: 'text-warning-foreground',
+  critical: 'text-destructive-foreground',
+}
+
+/**
+ * 页脚读数条里的一格：图标 + 一串数字，整格可点开对应的对话框。
+ *
+ * 刻意**不做成按钮**。按钮的高度由控件尺寸定（`h-9`＝36px），四格并排又把横向 padding 吃光，
+ * 手机上只能换行——页脚一路涨到 96px，比它上面那块用量区还高。Cloudflare 的同类读数条走另一条路：
+ * 读数是文本，高度由文本行高定，padding 只在容器上给一次；36–44px 的尺寸留给真正的控件
+ * （这里就是最右那枚开关）。照这个口径，手机上页脚从 96px（换行）/ 56px（单行按钮）降到 38px。
+ *
+ * 触控不打折：视觉上是文本，命中区靠 `pointer-coarse:after:*` 以自身为中心撑到 44×44——
+ * 仓库里 Badge / Button / Switch 用的同一套，指针设备上压根不生成，不占位也不挡相邻格。
+ */
+function FooterStat({
+  icon: Icon,
+  iconClassName,
+  valueClassName,
+  value,
+  hint,
+  ariaLabel,
+  srLabel,
+  onClick,
+}: {
+  icon: ElementType<{ className?: string }>
+  /** 图标颜色＝名额策略（跟随默认 / 自定义 / 不限），与数字上的占用色是两回事。 */
+  iconClassName?: string
+  valueClassName?: string
+  value: ReactNode
+  hint: ReactNode
+  ariaLabel: string
+  srLabel?: string
+  onClick: () => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        className={cn(
+          'relative flex min-w-0 shrink items-center gap-1 rounded-sm text-left font-medium text-xs tabular-nums outline-none',
+          'transition-colors hover:underline hover:underline-offset-4 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+          'pointer-coarse:after:absolute pointer-coarse:after:top-1/2 pointer-coarse:after:left-1/2 pointer-coarse:after:size-full pointer-coarse:after:min-h-11 pointer-coarse:after:min-w-11 pointer-coarse:after:-translate-x-1/2 pointer-coarse:after:-translate-y-1/2',
+        )}
+        onClick={onClick}
+        aria-label={ariaLabel}
+        aria-haspopup="dialog"
+      >
+        <Icon className={cn('size-3.5 shrink-0', iconClassName)} />
+        <span className={cn('min-w-0 truncate', valueClassName)}>{value}</span>
+        {srLabel && <span className="sr-only">{srLabel}</span>}
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{hint}</TooltipPopup>
+    </Tooltip>
+  )
+}
+
+/** 分母（`/5`、`/∞`）压成弱色：一眼先读到的该是当前值，上限是背景信息。 */
+function SlotLimit({ limit }: { limit: number | string }) {
+  return <span className="font-normal text-muted-foreground">/{limit}</span>
+}
 
 /**
  * memo 的收益在于「列表本身没变，但父组件重渲染了」这类情况：搜索框每敲一个字、
@@ -123,7 +194,6 @@ export const CredentialCard = memo(function CredentialCard({
   const evaluation = evaluateCredential(cred, now, language)
   const { quota, status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
-  const initial = credentialLabel.trim().charAt(0).toUpperCase() || '?'
   // 只渲染上游真报过的窗口。卡片是弹性布局，没有的那个直接不占位；表格那边列宽固定，
   // 摘不掉，所以改成显式的「无此窗口」，见 credential-row 的 ListQuotaMeter。
   const has5h = quota.h5.reported
@@ -203,6 +273,24 @@ export const CredentialCard = memo(function CredentialCard({
     return t(
       `已占用 ${cred.device_count}/${cred.device_limit_effective} 个设备名额，${devicePolicyHint}。点击查看`,
       `${cred.device_count} of ${cred.device_limit_effective} device slots in use; ${devicePolicyHint.toLowerCase()}. Click to view`,
+    )
+  })()
+  /**
+   * 页脚那枚金额的悬浮提示：主数是累计，后面补上 5h / 7d 两个窗口的费用。
+   *
+   * 页脚只放得下一个数，而「这号一共烧了多少」与「这一阵烧得快不快」是两个问题：前者决定要不要
+   * 再养着它，后者才解释今天为什么慢。累计当主数（任何时候都有值，不依赖上游快照），两个窗口的
+   * 值放进提示里——它们在上面的用量区各自有 pill，这里只是免去上下对照。
+   *
+   * 末尾那句必须留着：这个数是按公开价目表拿 token 估的，不是账单，两者对不上是正常的。
+   */
+  const costHint = (() => {
+    const parts = [t(`累计 ${formatUsd(cred.cost_total)}`, `Total ${formatUsd(cred.cost_total)}`)]
+    if (cred.quota?.cost_5h != null) parts.push(`5h ${formatUsd(cred.quota.cost_5h)}`)
+    if (cred.quota?.cost_7d != null) parts.push(`7d ${formatUsd(cred.quota.cost_7d)}`)
+    return t(
+      `${parts.join(' · ')}。按公开价目表估算的等价 API 费用，不是账单金额。点击查看请求明细`,
+      `${parts.join(' · ')}. Equivalent API cost estimated from the public price list, not a bill. Click to view the request log`,
     )
   })()
   const titleId = `credential-card-title-${cred.id}`
@@ -310,9 +398,6 @@ export const CredentialCard = memo(function CredentialCard({
                     aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
                   />
                 )}
-                <Avatar className="hidden @sm/card:flex" aria-hidden="true">
-                  <AvatarFallback>{initial}</AvatarFallback>
-                </Avatar>
                 <div className="min-w-0 flex-1">
                   <h3
                     id={titleId}
@@ -321,7 +406,7 @@ export const CredentialCard = memo(function CredentialCard({
                   >
                     {credentialLabel}
                   </h3>
-                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs font-normal">
+                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
                     <span aria-hidden="true">·</span>
                     <Tooltip>
@@ -335,20 +420,6 @@ export const CredentialCard = memo(function CredentialCard({
                       <TooltipPopup>
                         {formatFullTime(cred.created_at, language)}
                       </TooltipPopup>
-                    </Tooltip>
-                    {/* 累计费用挂在元信息行：它和「添加于」一样是这个账号的终身属性，不是某个窗口的量；
-                        各窗口的费用在下面的用量区各自有 pill。此前在页脚，加了会话名额后页脚放不下。 */}
-                    <span aria-hidden="true">·</span>
-                    <Tooltip>
-                      <TooltipTrigger
-                        render={<span />}
-                        className="inline-flex min-w-0 items-center gap-1"
-                      >
-                        <WalletCardsIcon className="size-3 shrink-0" />
-                        <span className="sr-only">{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</span>
-                        <span className="tabular-nums">{formatUsd(cred.cost_total)}</span>
-                      </TooltipTrigger>
-                      <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
                     </Tooltip>
                   </CardDescription>
                 </div>
@@ -398,6 +469,7 @@ export const CredentialCard = memo(function CredentialCard({
                   )}
                   aria-live="polite"
                 >
+                  <StatusDot />
                   {status.label}
                 </TooltipTrigger>
                 <TooltipPopup
@@ -413,6 +485,7 @@ export const CredentialCard = memo(function CredentialCard({
                 variant={status.variant}
                 aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
               >
+                <StatusDot />
                 {status.label}
               </Badge>
             )}
@@ -420,26 +493,41 @@ export const CredentialCard = memo(function CredentialCard({
               <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
             )}
             {isOrgAccount(cred) && (
-              <Badge
-                variant="warning"
-                size="sm"
-                title={t(
-                  `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不是一回事`,
-                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
-                )}
-              >
-                {orgBadgeLabel(cred)}
-              </Badge>
+              <Tooltip>
+                <TooltipTrigger
+                  className={cn(badgeVariants({ variant: 'outline', size: 'sm' }), 'cursor-help')}
+                  delay={0}
+                >
+                  {/* 图标不是装饰：org_type 与 tier 常常都叫 `Team`，两枚都成了描边胶囊之后
+                      光看文字分不出哪个是「组织账号」哪个是「套餐档位」。 */}
+                  <Building2Icon className="size-3" />
+                  {orgBadgeLabel(cred)}
+                </TooltipTrigger>
+                <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                  {t(
+                    `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不是一回事`,
+                    `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
+                  )}
+                </TooltipPopup>
+              </Tooltip>
             )}
             {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>}
-            <Badge variant="outline" size="sm" title={t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}>
-              P{cred.priority}
-            </Badge>
+            <Tooltip>
+              <TooltipTrigger
+                className={cn(badgeVariants({ variant: 'outline', size: 'sm' }), 'cursor-help tabular-nums')}
+                delay={0}
+              >
+                P{cred.priority}
+              </TooltipTrigger>
+              <TooltipPopup>
+                {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+              </TooltipPopup>
+            </Tooltip>
             {cred.proxy ? (
               <Tooltip>
                 <TooltipTrigger
                   render={<button type="button" />}
-                  className={cn(badgeVariants({ variant: 'info', size: 'sm' }), 'cursor-pointer gap-1')}
+                  className={cn(badgeVariants({ variant: 'outline', size: 'sm' }), 'cursor-pointer gap-1')}
                   onClick={() => setProxyOpen(true)}
                 >
                   <GlobeIcon className="size-3" />
@@ -455,20 +543,27 @@ export const CredentialCard = memo(function CredentialCard({
               <div className="flex flex-wrap items-center gap-2">
                 <h4 className="font-medium text-xs text-muted-foreground">{t('用量限制', 'Usage limits')}</h4>
                 {secondaryOverage && (
-                  <Badge
-                    variant={secondaryOverage.variant}
-                    size="sm"
-                    title={secondaryOverage.title}
-                  >
-                    {secondaryOverage.label}
-                  </Badge>
+                  <Tooltip>
+                    <TooltipTrigger
+                      className={cn(
+                        badgeVariants({ variant: secondaryOverage.variant, size: 'sm' }),
+                        'cursor-help',
+                      )}
+                      delay={0}
+                    >
+                      {secondaryOverage.label}
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                      {secondaryOverage.title}
+                    </TooltipPopup>
+                  </Tooltip>
                 )}
               </div>
               {cred.quota ? (
                 <Tooltip>
                   <TooltipTrigger
                     render={<span />}
-                    className="inline-flex items-center gap-1 text-2xs text-muted-foreground"
+                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
                   >
                     <ClockIcon className="size-3" />
                     {t(
@@ -479,7 +574,7 @@ export const CredentialCard = memo(function CredentialCard({
                   <TooltipPopup>{formatFullTime(cred.quota.ts, language)}</TooltipPopup>
                 </Tooltip>
               ) : (
-                <span className="text-2xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
+                <span className="text-xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
             </div>
             {cred.quota && (has5h || has7d) ? (
@@ -496,7 +591,6 @@ export const CredentialCard = memo(function CredentialCard({
                     // 标签用 `5h`/`7d` 而不是「5 小时」：这一行现在还挤着进度条、百分比与
                     // 重置时刻，长标签会把进度条压没；完整称呼在读屏文本里。
                     label="5h"
-                    windowVariant="info"
                     util={quota.h5.utilization}
                     reset={cred.quota.rl_5h_reset}
                     cost={cred.quota.cost_5h}
@@ -510,7 +604,6 @@ export const CredentialCard = memo(function CredentialCard({
                   <QuotaMeter
                     credentialLabel={credentialLabel}
                     label="7d"
-                    windowVariant="success"
                     util={quota.d7.utilization}
                     reset={cred.quota.rl_7d_reset}
                     cost={cred.quota.cost_7d}
@@ -526,136 +619,107 @@ export const CredentialCard = memo(function CredentialCard({
             ) : null}
             {quota.extraWindows.length > 0 && <ExtraWindows windows={quota.extraWindows} />}
             {evaluation.modelCooling && (
-              <p
-                className="flex flex-wrap items-center gap-x-1.5 text-warning-foreground text-xs"
-                title={t(
+              <ModelStateLine
+                icon={TimerOffIcon}
+                tone="text-warning-foreground"
+                label={t('模型冷却', 'Model cooldown')}
+                detail={modelCooldownSummary(cred, language)}
+                hint={t(
                   '这些模型的额度池已满（上游 429），暂时不参与选号；该账号的其余模型照常服务。到点自动恢复，也可在菜单里手动解除冷却',
                   'The overage pool for these models is exhausted (upstream 429), so they are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
                 )}
-              >
-                <TimerOffIcon className="size-3" />
-                <span className="font-medium">{t('模型冷却', 'Model cooldown')}</span>
-                <span>{modelCooldownSummary(cred, language)}</span>
-              </p>
+              />
             )}
             {/* 与上面那条**不是**一回事，故分开显示：这一档只是刚撞过一发限速，号仍在调度池里。
                 合并成「模型冷却」会让人以为这个号已经不干活了，从而跑去查一个根本不存在的故障。 */}
             {evaluation.modelThrottled && (
-              <p
-                className="flex flex-wrap items-center gap-x-1.5 text-muted-foreground text-xs"
-                title={t(
+              <ModelStateLine
+                icon={TimerOffIcon}
+                tone="text-muted-foreground"
+                label={t('刚被限速', 'Recently throttled')}
+                detail={modelCooldownSummary(cred, language, false)}
+                hint={t(
                   '这些模型刚被上游限速（容量或请求速率），额度并没有用完。这种限制跟着出口或模型走、不跟着账号走，所以该账号照常参与选号——上游要的是客户端按 retry-after 退避，不是把号停掉',
                   'These models were just throttled upstream (capacity or request rate); no quota was exhausted. That kind of limit follows the egress or the model rather than the account, so this account keeps taking part in selection — what upstream wants is the client backing off per retry-after, not an account being parked',
                 )}
-              >
-                <TimerOffIcon className="size-3" />
-                <span className="font-medium">{t('刚被限速', 'Recently throttled')}</span>
-                <span>{modelCooldownSummary(cred, language, false)}</span>
-              </p>
+              />
             )}
             {/* 第三档：上游说这个套餐压根不含这些模型。它不会自己过去，所以措辞不能是「冷却」。 */}
             {evaluation.modelDenied && (
-              <p
-                className="flex flex-wrap items-center gap-x-1.5 text-muted-foreground text-xs"
-                title={t(
+              <ModelStateLine
+                icon={BanIcon}
+                tone="text-muted-foreground"
+                label={t('套餐不含', 'Not in plan')}
+                detail={modelDenialSummary(cred, language)}
+                hint={t(
                   '上游判定该账号的套餐不含这些模型（回了 429 却没有任何额度窗口、且组织未开 extra usage），选号时这些模型绕开它，其余模型照常。连通性测试通过、等级变化或菜单里手动解除都会清掉这条记录',
                   'Upstream reported that this account’s plan does not include these models (a 429 with no quota window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
                 )}
-              >
-                <BanIcon className="size-3" />
-                <span className="font-medium">{t('套餐不含', 'Not in plan')}</span>
-                <span>{modelDenialSummary(cred, language)}</span>
-              </p>
+              />
             )}
           </section>
         </CardPanel>
 
-        {/* 页脚一行：设备名额、模拟会话名额、当前 RPM、启停开关。累计费用挪到了头部元信息行
-            （它是终身属性，不是「此刻」的量），页脚在手机上也放得下，不折行、不砍字。 */}
-        {/* 三枚按钮直接是页脚的子元素、共用同一个 gap：设备、会话、RPM 之间的间隔必须一样，
-            套一层容器就会出现「前两枚挨得近、第三枚离得远」。开关靠 ml-auto 钉在最右。 */}
-        <CardFooter className="mt-auto flex items-center gap-1 border-t bg-muted/32 px-4 py-2.5 sm:py-3 @sm/card:gap-2">
-          {/* 页脚这几项统一用 Tooltip 组件而不是原生 title：原生提示有约 1 秒延迟、
-              触屏上完全出不来，样式也不受控，和卡片上方的状态提示不是一套东西。 */}
-          <Tooltip>
-            <TooltipTrigger
-              className={cn(
-                buttonVariants({ variant: 'ghost' }),
-                // 窄卡片上按钮的横向 padding 收一半：两颗名额按钮是页脚最宽的一块。
-                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
+        {/* 页脚：设备名额、模拟会话名额、当前 RPM ｜ 累计费用，最右是启停开关。 */}
+        {/* 这是一条**读数条**而不是一排按钮，理由与尺寸账见 [FooterStat]：padding 只由容器给一次
+            （`py-2`），四格之间只留 gap，行高由 text-xs 决定，手机上整条 38px。前三格都带分母、
+            说的是「此刻占了多少」，费用没有分母、说的是「一共烧了多少」——两类量之间隔一道 1px 竖线
+            分组，而不是靠间距暗示。四格加开关在 360px 屏上也是一行，不换行、不砍分母、不藏东西。 */}
+        <CardFooter className="mt-auto flex items-center gap-2 border-t bg-muted/32 px-4 py-2 @sm/card:gap-3">
+          <FooterStat
+            icon={SmartphoneIcon}
+            iconClassName={devicePolicy.className}
+            valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[deviceUsage.level])}
+            value={<>{cred.device_count}<SlotLimit limit={effectiveLimit} /></>}
+            hint={deviceUsageHint}
+            ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
+            srLabel={devicePolicy.label}
+            onClick={() => setDevicesOpen(true)}
+          />
+          {/* 模拟会话名额，与设备名额并排、同一个对话框：图标颜色是策略，数字颜色是占用。 */}
+          <FooterStat
+            icon={MessagesSquareIcon}
+            iconClassName={sessionPolicy.className}
+            valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[sessionUsage.level])}
+            value={<>{cred.session_count}<SlotLimit limit={sessionEffectiveLimit} /></>}
+            hint={sessionUsageHint}
+            ariaLabel={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+            srLabel={sessionPolicy.label}
+            onClick={() => setDevicesOpen(true)}
+          />
+          {/* 当前 RPM 与两格名额同一副面孔，点开的是 RPM 上限对话框。分母是生效上限、不限时 ∞。 */}
+          <FooterStat
+            icon={GaugeIcon}
+            iconClassName={rpmPolicy.className}
+            valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[rpmUsage.level])}
+            value={<>{cred.rpm}<SlotLimit limit={rpmLimit > 0 ? rpmLimit : '∞'} /></>}
+            hint={rpmLimit > 0
+              ? t(
+                `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。打满后新请求分流到别的账号，已绑定的设备收到 429。点击调整`,
+                `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once full, new requests spill to another account and already-bound devices get a 429. Click to adjust`,
+              )
+              : t(
+                `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的），${rpmPolicyHint}。点击调整`,
+                `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included); ${rpmPolicyHint.toLowerCase()}. Click to adjust`,
               )}
-              onClick={() => setDevicesOpen(true)}
-              aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              {/* 手机图标的颜色就是名额策略，见 [devicePolicy]：这块地方本来就要画个图标，
-                  让它顺带表态，比再挂一枚徽章省下整整一个词的宽度。 */}
-              <SmartphoneIcon className={devicePolicy.className} />
-              {/* 计数本身带底色（绿 / 黄 / 红），颜色只看名额占用，见 [deviceUsageMeta]：
-                  页脚这一行全是中性色数字，光靠 `3/5` 得逐个念才知道哪个号快满了。
-                  三枚徽章统一 [SLOT_BADGE]：定宽 2.75rem、数字左对齐。 */}
-              <Badge variant={deviceUsage.variant} size="sm" className={SLOT_BADGE}>
-                {cred.device_count}/{effectiveLimit}
-              </Badge>
-              <span className="sr-only">{devicePolicy.label}</span>
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {deviceUsageHint}
-            </TooltipPopup>
-          </Tooltip>
-          {/* 模拟会话名额，与设备名额并排、同一个对话框：图标颜色是策略，徽章颜色是占用。 */}
-          <Tooltip>
-            <TooltipTrigger
-              className={cn(
-                buttonVariants({ variant: 'ghost' }),
-                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
-              )}
-              onClick={() => setDevicesOpen(true)}
-              aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              <MessagesSquareIcon className={sessionPolicy.className} />
-              <Badge variant={sessionUsage.variant} size="sm" className={SLOT_BADGE}>
-                {cred.session_count}/{sessionEffectiveLimit}
-              </Badge>
-              <span className="sr-only">{sessionPolicy.label}</span>
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {sessionUsageHint}
-            </TooltipPopup>
-          </Tooltip>
-          {/* 当前 RPM 与两枚名额同一副面孔：图标 + 计数徽章的幽灵按钮，点开 RPM 上限对话框。
-              图标颜色是策略（跟随默认 / 自定义 / 不限），徽章底色是占用（同 deviceUsageMeta：
-              0 灰、有流量绿、快打满黄、打满红），分母是生效上限、不限时 ∞——三枚并排读法一致。
-              累计费用挪去了头部元信息行，页脚才放得下它。 */}
-          <Tooltip>
-            <TooltipTrigger
-              className={cn(
-                buttonVariants({ variant: 'ghost' }),
-                'min-w-0 max-w-full justify-start gap-1.5 px-2 @sm/card:gap-2 @sm/card:px-[calc(--spacing(3)-1px)]',
-              )}
-              onClick={() => setRpmOpen(true)}
-              aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
-              aria-haspopup="dialog"
-            >
-              <GaugeIcon className={rpmPolicy.className} />
-              <Badge variant={rpmUsage.variant} size="sm" className={SLOT_BADGE}>
-                {cred.rpm}/{rpmLimit > 0 ? rpmLimit : '∞'}
-              </Badge>
-              <span className="sr-only">{t('当前 RPM', 'Current RPM')} · {rpmPolicy.label}</span>
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-              {rpmLimit > 0
-                ? t(
-                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。打满后新请求分流到别的账号，已绑定的设备收到 429。点击调整`,
-                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once full, new requests spill to another account and already-bound devices get a 429. Click to adjust`,
-                )
-                : t(
-                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的），${rpmPolicyHint}。点击调整`,
-                  `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included); ${rpmPolicyHint.toLowerCase()}. Click to adjust`,
-                )}
-            </TooltipPopup>
-          </Tooltip>
+            ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
+            srLabel={`${t('当前 RPM', 'Current RPM')} · ${rpmPolicy.label}`}
+            onClick={() => setRpmOpen(true)}
+          />
+          {/* 名额与费用之间的分组竖线：1px、与文字同高，不占高度。 */}
+          <span aria-hidden="true" className="h-3 w-px shrink-0 bg-border" />
+          {/* 累计费用：同一副面孔，但**不编占用色**——费用既没有分母也没有阈值，套上绿 / 黄 / 红
+              会被当成告警读。只分「有」与「没有」：0 压成弱色，一列卡片扫下来烧了钱的那几张自己跳出来。 */}
+          <FooterStat
+            icon={WalletCardsIcon}
+            iconClassName="text-muted-foreground"
+            valueClassName={cred.cost_total > 0 ? 'text-foreground' : 'text-muted-foreground'}
+            value={formatUsd(cred.cost_total)}
+            hint={costHint}
+            ariaLabel={t(`查看 ${credentialLabel} 的请求明细`, `View the request log for ${credentialLabel}`)}
+            srLabel={t('累计等价 API 费用', 'Cumulative equivalent API cost')}
+            onClick={() => setUsageOpen(true)}
+          />
           {/* 开关钉在最右。 */}
           <div className="order-last ml-auto flex shrink-0 items-center gap-2">
             {toggle.isPending && <Spinner />}
@@ -786,47 +850,102 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
         const pct = w.percentage
         const badge = windowStatusLabel(w, t)
         return (
-          <span
-            key={w.name}
-            className="inline-flex items-center gap-1"
-            title={[
-              isCapabilityWindow(w)
-                ? t(
-                    `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；它不是用量窗口，所以没有百分比`,
-                    `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
-                  )
-                : t(`用量窗口 ${w.name}`, `Usage limits window ${w.name}`),
-              w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
-              w.resetAt != null && t(
-                `${formatFullTime(w.resetAt, language)} 重置`,
-                `resets ${formatFullTime(w.resetAt, language)}`,
-              ),
-              !isCapabilityWindow(w) && t(
-                '该窗口没有专用的窗口内费用与请求数统计',
-                'this window has no per-window cost or request breakdown',
-              ),
-            ].filter(Boolean).join(' · ')}
-          >
-            <span className="font-medium text-foreground">{w.name}</span>
-            {/* 没有 utilization 的窗口不摆百分比位：一个 `—` 会让人以为「数据缺失」，
-                而开关式窗口本来就没有用量可言。 */}
-            {pct != null && (
-              <span className={cn('tabular-nums', badge?.bad && 'text-destructive-foreground font-medium')}>
-                {pct}%
-              </span>
-            )}
-            {badge && (
-              <span className={badge.bad ? 'text-destructive-foreground' : undefined}>
-                {badge.text}
-              </span>
-            )}
-            {w.resetAt != null && (
-              <span>{t(`· ${formatClockTime(w.resetAt, language)} 重置`, `· resets ${formatClockTime(w.resetAt, language)}`)}</span>
-            )}
-          </span>
+          <Tooltip key={w.name}>
+            <TooltipTrigger
+              render={<span />}
+              delay={0}
+              className="inline-flex cursor-help items-center gap-1"
+            >
+              <span className="font-medium text-foreground">{w.name}</span>
+              {/* 没有 utilization 的窗口不摆百分比位：一个 `—` 会让人以为「数据缺失」，
+                  而开关式窗口本来就没有用量可言。 */}
+              {pct != null && (
+                <span className={cn('tabular-nums', badge?.bad && 'text-destructive-foreground font-medium')}>
+                  {pct}%
+                </span>
+              )}
+              {badge && (
+                <span className={badge.bad ? 'text-destructive-foreground' : undefined}>
+                  {badge.text}
+                </span>
+              )}
+              {w.resetAt != null && (
+                <span>{t(`· ${formatClockTime(w.resetAt, language)} 重置`, `· resets ${formatClockTime(w.resetAt, language)}`)}</span>
+              )}
+            </TooltipTrigger>
+            {/* 这一整段解释原来只挂在原生 `title` 上：手机上完全看不到，而额外窗口是什么、
+                为什么没有百分比、上游原值是哪个词，全在这里。 */}
+            <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+              {[
+                isCapabilityWindow(w)
+                  ? t(
+                      `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；它不是用量窗口，所以没有百分比`,
+                      `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
+                    )
+                  : t(`用量窗口 ${w.name}`, `Usage limits window ${w.name}`),
+                w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
+                w.resetAt != null && t(
+                  `${formatFullTime(w.resetAt, language)} 重置`,
+                  `resets ${formatFullTime(w.resetAt, language)}`,
+                ),
+                !isCapabilityWindow(w) && t(
+                  '该窗口没有专用的窗口内费用与请求数统计',
+                  'this window has no per-window cost or request breakdown',
+                ),
+              ].filter(Boolean).join(' · ')}
+            </TooltipPopup>
+          </Tooltip>
         )
       })}
     </div>
+  )
+}
+
+/**
+ * 状态徽章前面那枚圆点，取徽章自己的文字色（`bg-current`）。
+ *
+ * 一张卡片上最多能同时出现六块胶囊（状态、上游判定、组织、套餐、优先级、代理），彼此形制一样，
+ * 得逐个读文字才知道哪个在说「这号现在怎么样」。圆点是 Cloudflare 那套状态 pill 的记号：
+ * 有点的那一枚才是状态，其余是属性。所以它**只**给主状态徽章用，不外借。
+ */
+function StatusDot() {
+  return <span className="size-1.5 shrink-0 rounded-full bg-current" aria-hidden />
+}
+
+/**
+ * 「模型冷却 / 刚被限速 / 套餐不含」三档共用的一行：图标 + 词 + 受影响的模型，整行悬浮出解释。
+ *
+ * 解释原先挂在原生 `title` 上——要等约一秒才冒出来，触屏上压根不出。而这三行真正的差别
+ * （这个号还在不在调度池里、要不要动手）全写在那段解释里，看不到就等于三行长得一样。
+ * 换成与卡片其余部分同一套 Tooltip，`delay={0}`。
+ */
+function ModelStateLine({
+  icon: Icon,
+  tone,
+  label,
+  detail,
+  hint,
+}: {
+  icon: ElementType<{ className?: string }>
+  /** 整行的文字色：冷却是琥珀（要留意），另外两档是弱色（知会即可）。 */
+  tone: string
+  label: string
+  detail: string
+  hint: string
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<p />}
+        delay={0}
+        className={cn('flex cursor-help flex-wrap items-center gap-x-2 text-xs', tone)}
+      >
+        <Icon className="size-3" />
+        <span className="font-medium">{label}</span>
+        <span>{detail}</span>
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">{hint}</TooltipPopup>
+    </Tooltip>
   )
 }
 
@@ -901,10 +1020,12 @@ function UpstreamVerdict({
 }
 
 /**
- * 额度里的一项事实（请求数、总 token、花费）：浅灰小块，值在前、单位在后。
+ * 额度里的一项事实（请求数、总 token、花费）：值在前、单位在后的一小段文本。
  *
- * 做成块而不是「标签: 值」的文本对——卡片上这行要能一眼扫过去，标签在小字号下只是噪声，
- * 真要确认是什么，悬浮提示与读屏文本都写着全称。
+ * 原来是浅灰实心小块。去掉底色有两个理由：一是这张卡片上实心胶囊已经是**状态**的语言
+ * （运行正常 / 上游已拒 / 套餐），读数借用同一副面孔会让一屏全是色块；二是胶囊自带的左右内边距
+ * 把这行挤得没地方写单位，于是三个数里有两个靠符号猜（`req`、`$`）、`24.8K` 干脆没有量纲。
+ * 省下的内边距正好够把单位写全——数字一律带单位，是 Cloudflare 那套读数的底线。
  *
  * 提示用 `Tooltip` 组件而不是原生 `title`，且 `delay={0}`：原生提示要等约 1 秒才冒出来，
  * 而这三块的提示装的正是「这个数到底是什么、精确值多少」——等一秒才看见，等于没有。
@@ -928,13 +1049,10 @@ function QuotaFact({
       <TooltipTrigger
         render={<div />}
         delay={0}
-        className={cn(
-          badgeVariants({ variant: 'secondary', size: 'sm' }),
-          'min-w-0 gap-0.5 font-normal',
-        )}
+        className="inline-flex min-w-0 cursor-help items-baseline gap-1 text-xs"
       >
         <dt className="sr-only">{label}</dt>
-        <dd className="truncate tabular-nums">{value}</dd>
+        <dd className="truncate font-medium tabular-nums">{value}</dd>
         {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
       </TooltipTrigger>
       <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
@@ -947,7 +1065,6 @@ function QuotaFact({
 function QuotaMeter({
   credentialLabel,
   label,
-  windowVariant,
   util,
   reset,
   cost,
@@ -958,8 +1075,6 @@ function QuotaMeter({
 }: {
   credentialLabel: string
   label: string
-  /** 窗口标签的固定配色（分类色，与占用无关）：5h 一色、7d 一色。 */
-  windowVariant: BadgeProps['variant']
   util: number | null
   reset: number | null
   cost: number | null
@@ -977,24 +1092,29 @@ function QuotaMeter({
   // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则 5h 与 7d 两条的尾巴会错开。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
+  // 常态是 marine（cf-ui 的 UI 蓝，见 index.css），不是绿。用量条的常态不是「成绩好」，
+  // 只是「还没用到该管的程度」；绿色会让 0% 读成一种褒奖，而真到了黄、红时的跳变也就没那么显眼。
+  // 阈值状态照旧：吃紧琥珀、打满红。
   const indicatorClass = level === 'critical'
     ? 'bg-destructive'
     : level === 'warning'
       ? 'bg-warning'
-      : 'bg-success'
+      : 'bg-marine'
 
+  // 文字一律用 `-foreground` 那一支：`--destructive` 是给填充用的底色，拿来写字在浅底上
+  // 对比度不够、暗色下又偏暗（见 index.css 里两支的注）。旁边的 warning 本来就用对了。
   const valueClass = level === 'critical'
-    ? 'text-destructive'
+    ? 'text-destructive-foreground'
     : level === 'warning'
       ? 'text-warning-foreground'
       : 'text-foreground'
 
   return (
-    <Meter value={percentage} max={100} className="gap-1.5">
+    <Meter value={percentage} max={100} className="gap-2">
       {/* 数据先行、进度条随后：请求数与花费是「这个窗口里发生了什么」，百分比是「还剩多少」。
           两组分行排，比原先挤在一行的三列 dl 好扫——那一行里三个标签三个值交替出现，
           眼睛得逐个配对。 */}
-      <dl className="flex min-w-0 flex-wrap items-center gap-1">
+      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
         <QuotaFact
           label={t('请求数', 'Requests')}
           value={requests == null ? '—' : formatCompactNumber(requests, locale)}
@@ -1002,12 +1122,11 @@ function QuotaMeter({
           suffix="req"
         />
         {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
-            重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。
-            不带 `tok` 后缀：`18.4M` 的量纲一眼就是 token（隔壁两项一个带 req、一个带 $），
-            那三个字母只是把这行本就不宽的地方再挤掉一截。全称在读屏文本与悬浮提示里。 */}
+            重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
         <QuotaFact
           label={t('总 token', 'Total tokens')}
           value={tokens == null ? '—' : formatTokens(tokens)}
+          suffix="tok"
           hint={tokens == null
             ? undefined
             : t(
@@ -1020,11 +1139,13 @@ function QuotaMeter({
           value={cost == null ? '—' : formatUsd(cost)}
         />
       </dl>
-      <div className="flex min-w-0 items-center gap-1.5">
-        {/* 窗口名做成固定色的小标签（5h / 7d 各一色）：它是分类而不是状态，配色跟右边那组
-            表示占用的红黄绿分开，两侧各管一件事。 */}
+      <div className="flex min-w-0 items-center gap-2">
+        {/* 窗口名是定宽的弱色文本，不是彩色胶囊：它只是"这条说的是哪个窗口"，一眼要认的是
+            旁边那条的长度与颜色。实心胶囊在这张卡片上已经是状态的语言（运行正常 / 上游已拒），
+            借给分类只会让一张卡片上五六块彩色抢同一份注意力。定宽 1.25rem 让 5h、7d 两条的
+            起点对齐。 */}
         <MeterLabel
-          className={cn(badgeVariants({ variant: windowVariant, size: 'sm' }), 'shrink-0 tabular-nums')}
+          className="w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums"
         >
           <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
           {label}
@@ -1036,24 +1157,38 @@ function QuotaMeter({
         {/* 百分比与倒计时都给定宽的一格、文字左对齐：一张卡上下摞着 5h 与 7d 两条，`8%` 与
             `100%` 宽度不同、倒计时又时有时无，两格若按内容伸缩，两条进度条就一长一短、尾巴
             错开，看着像两个窗口的用量差别。留白不补，条尾因此永远在同一条竖线上。 */}
-        <MeterValue
-          className={cn('w-9 shrink-0 text-left font-medium text-xs tabular-nums', valueClass)}
-          title={t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}
-        >
-          {() => `${percentage}%`}
-        </MeterValue>
+        {/* 百分比说的是「快照那一刻」的占用，快照时刻本身挂在悬浮提示里（原先是原生 `title`，
+            手机上根本出不来——而这个数越接近 100，越需要知道它是几小时前的）。 */}
+        <Tooltip>
+          <TooltipTrigger render={<span />} delay={0} className="shrink-0 cursor-help">
+            <MeterValue className={cn('block w-9 text-left font-medium text-xs tabular-nums', valueClass)}>
+              {() => `${percentage}%`}
+            </MeterValue>
+          </TooltipTrigger>
+          <TooltipPopup>
+            {t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}
+          </TooltipPopup>
+        </Tooltip>
         {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
-            精确到分秒的绝对时刻放在 title 里——倒计时受本地时钟偏差影响，只适合看个大概。
-            没有未来的重置时刻时这一格空着（仍占位），与列表里那格同一处理（见 QuotaCountdown）。 */}
-        <span
-          className="w-9 shrink-0 whitespace-nowrap text-left text-2xs text-muted-foreground tabular-nums"
-          title={reset != null && reset > now
-            ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
-            : undefined}
-          aria-hidden={reset != null && reset > now ? undefined : true}
-        >
-          {reset != null && reset > now ? formatCountdown(reset, now) : ''}
-        </span>
+            精确到分秒的绝对时刻在悬浮提示里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
+        {reset != null && reset > now ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={<span />}
+              delay={0}
+              className="w-12 shrink-0 cursor-help whitespace-nowrap text-left text-xs text-muted-foreground tabular-nums"
+            >
+              {formatCountdown(reset, now)}
+            </TooltipTrigger>
+            <TooltipPopup>
+              {t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)}
+            </TooltipPopup>
+          </Tooltip>
+        ) : (
+          // 没有未来的重置时刻时不写字、也不补「—」，但**宽度留着**：否则 5h 与 7d 两条的
+          // 尾巴会错开，看着像两个窗口的用量差别。与列表里那格同一处理（见 QuotaCountdown）。
+          <span className="w-12 shrink-0" aria-hidden />
+        )}
       </div>
     </Meter>
   )
