@@ -78,7 +78,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
-import { SettingsGroup } from '@/components/settings-group'
+import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 
 export function AccessSettings({
   open,
@@ -91,7 +91,7 @@ export function AccessSettings({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="sm:max-w-2xl">
+      <DialogPopup size="md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings2Icon aria-hidden="true" />
@@ -228,7 +228,7 @@ export function AccessSettingsContent() {
             'Copy the client endpoint and configure the key used to authenticate incoming requests.',
           )}
         >
-          <Field className="p-5">
+          <Field className="p-4 sm:p-5">
             <FieldLabel>
               {t('接入地址', 'Access URL')}
               <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
@@ -249,7 +249,7 @@ export function AccessSettingsContent() {
             </InputGroup>
           </Field>
 
-          <Field className="p-5">
+          <Field className="p-4 sm:p-5">
             <FieldLabel>
               {t('接入 Key', 'Access key')}
               <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
@@ -319,7 +319,7 @@ export function AccessSettingsContent() {
             )}
           </Field>
 
-          <Field className="p-5">
+          <Field className="p-4 sm:p-5">
             <div className="flex w-full min-w-0 items-center justify-between gap-2">
               <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>
               <div className="flex shrink-0 items-center gap-3">
@@ -371,7 +371,7 @@ export function AccessSettingsContent() {
           if (!save.isPending) setClearKeyOpen(nextOpen)
         }}
       >
-        <AlertDialogPopup className="sm:max-w-md">
+        <AlertDialogPopup>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('清除接入 Key', 'Clear access key')}</AlertDialogTitle>
             <AlertDialogDescription>
@@ -629,8 +629,9 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         {items.map((item, index) => (
           <div
             key={item.label}
-            // 六格铺平那档把左右内边距收窄一点：省下来的宽度全给值，少一次换行。
-            className={`min-w-0 px-5 py-4 md:px-4 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
+            // 槽宽分两档（手机 16 / ≥640 20），与设置页每一行、账号页概览条同一套：六格铺平时每格仍有
+            // 放内容，而这里的值都是「2 小时」「1.0.128」这类短串且 whitespace-nowrap，够用。
+            className={`min-w-0 px-4 py-4 sm:px-5 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
           >
             <dt className="text-xs text-muted-foreground">{item.label}</dt>
             <dd className="mt-1 font-semibold text-sm leading-snug whitespace-nowrap">{item.value}</dd>
@@ -699,49 +700,43 @@ function DeviceBindingTtl() {
     : t('名额不自动释放', 'Slots are not released automatically')
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('活跃名额有效期', 'Active slot lifetime')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '设备在此时长内没有请求便释放占用的账号名额；与原账号的关联仍按保留期保存。',
-            'A device releases its account slot after this much inactivity; its affinity with the original account is retained separately.',
-          )}
-        </FieldDescription>
-        <Badge variant="secondary" size="sm">{hint}</Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          step={1}
-          smallStep={0.5}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement
-              aria-label={t('减少活跃名额有效期', 'Decrease active slot lifetime')}
-            />
-            <NumberFieldInput
-              aria-label={t('活跃名额有效期（小时）', 'Active slot lifetime in hours')}
-            />
-            <NumberFieldIncrement
-              aria-label={t('增加活跃名额有效期', 'Increase active slot lifetime')}
-            />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+    <SettingsRow
+      label={t('活跃名额有效期', 'Active slot lifetime')}
+      description={t(
+        '设备在此时长内没有请求便释放占用的账号名额；与原账号的关联仍按保留期保存。',
+        'A device releases its account slot after this much inactivity; its affinity with the original account is retained separately.',
+      )}
+      note={<Badge variant="secondary" size="sm">{hint}</Badge>}
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        step={1}
+        smallStep={0.5}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement
+            aria-label={t('减少活跃名额有效期', 'Decrease active slot lifetime')}
+          />
+          <NumberFieldInput
+            aria-label={t('活跃名额有效期（小时）', 'Active slot lifetime in hours')}
+          />
+          <NumberFieldIncrement
+            aria-label={t('增加活跃名额有效期', 'Increase active slot lifetime')}
+          />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -817,54 +812,48 @@ function DeviceBindingRetention() {
   const conflict = parsed > 0 && ttl > 0 && parsed < ttl
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('原账号关联保留期', 'Account affinity retention')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {conflict
-            ? t(
-                '保留期短于有效期时按有效期处理，等于关闭软绑定。',
-                'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
-              )
-            : t(
-                '名额释放后，设备在此期限内回来仍优先使用原账号，减少 thinking 签名跨账号导致的降级重试。',
-                'After its slot is released, a returning device still prefers its original account, reducing retries caused by account-bound thinking signatures.',
-              )}
-        </FieldDescription>
-        <Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          step={1}
-          smallStep={0.5}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement
-              aria-label={t('减少原账号关联保留期', 'Decrease account affinity retention')}
-            />
-            <NumberFieldInput
-              aria-label={t('原账号关联保留期（天）', 'Account affinity retention in days')}
-            />
-            <NumberFieldIncrement
-              aria-label={t('增加原账号关联保留期', 'Increase account affinity retention')}
-            />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+    <SettingsRow
+      label={t('原账号关联保留期', 'Account affinity retention')}
+      description={conflict
+        ? t(
+            '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+            'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+          )
+        : t(
+            '名额释放后，设备在此期限内回来仍优先使用原账号，减少 thinking 签名跨账号导致的降级重试。',
+            'After its slot is released, a returning device still prefers its original account, reducing retries caused by account-bound thinking signatures.',
+          )}
+      note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        step={1}
+        smallStep={0.5}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement
+            aria-label={t('减少原账号关联保留期', 'Decrease account affinity retention')}
+          />
+          <NumberFieldInput
+            aria-label={t('原账号关联保留期（天）', 'Account affinity retention in days')}
+          />
+          <NumberFieldIncrement
+            aria-label={t('增加原账号关联保留期', 'Increase account affinity retention')}
+          />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -912,43 +901,39 @@ function SessionBindingTtl() {
     : t('槽位不自动释放', 'Slots are not released automatically')
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('模拟会话有效期', 'Simulated session lifetime')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '走模拟路径、没有设备身份的对话在此时长内没有请求便释放占用的会话槽位，会话 id 让给下一个对话复用；与原账号的关联按下面的保留期保存。与设备有效期分开配：设备是一台机器，会话是一段对话。',
-            'A conversation on the simulation path without a device identity frees its session slot after this much inactivity, and its session id is reused by the next conversation; affinity with the original account follows the retention below. Configured separately from the device lifetime: a device is a machine, a session is one conversation.',
-          )}
-        </FieldDescription>
-        <Badge variant="secondary" size="sm">{hint}</Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          step={1}
-          smallStep={0.25}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少模拟会话有效期', 'Decrease simulated session lifetime')} />
-            <NumberFieldInput aria-label={t('模拟会话有效期（小时）', 'Simulated session lifetime in hours')} />
-            <NumberFieldIncrement aria-label={t('增加模拟会话有效期', 'Increase simulated session lifetime')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+    <SettingsRow
+      label={t('模拟会话有效期', 'Simulated session lifetime')}
+      description={
+        <ClampedDescription text={t(
+          '走模拟路径、没有设备身份的对话在此时长内没有请求便释放占用的会话槽位，会话 id 让给下一个对话复用；与原账号的关联按下面的保留期保存。与设备有效期分开配：设备是一台机器，会话是一段对话。',
+          'A conversation on the simulation path without a device identity frees its session slot after this much inactivity, and its session id is reused by the next conversation; affinity with the original account follows the retention below. Configured separately from the device lifetime: a device is a machine, a session is one conversation.',
+        )} />
+      }
+      note={<Badge variant="secondary" size="sm">{hint}</Badge>}
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        step={1}
+        smallStep={0.25}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少模拟会话有效期', 'Decrease simulated session lifetime')} />
+          <NumberFieldInput aria-label={t('模拟会话有效期（小时）', 'Simulated session lifetime in hours')} />
+          <NumberFieldIncrement aria-label={t('增加模拟会话有效期', 'Increase simulated session lifetime')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -995,48 +980,42 @@ function SessionBindingRetention() {
   const conflict = parsed > 0 && ttl > 0 && parsed < ttl
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('模拟会话原账号关联保留期', 'Simulated session affinity retention')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {conflict
-            ? t(
-                '保留期短于有效期时按有效期处理，等于关闭软绑定。',
-                'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
-              )
-            : t(
-                '槽位释放后，对话在此期限内回来仍优先使用原账号（原槽位空着就回原位，会话 id 不变）；过期后绑定行清掉，再来算新对话。',
-                'After its slot is freed, a returning conversation still prefers its original account (and its old slot if free, keeping the session id); once past this window the binding is removed and it counts as a new conversation.',
-              )}
-        </FieldDescription>
-        <Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          step={1}
-          smallStep={0.5}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少模拟会话关联保留期', 'Decrease simulated session affinity retention')} />
-            <NumberFieldInput aria-label={t('模拟会话关联保留期（天）', 'Simulated session affinity retention in days')} />
-            <NumberFieldIncrement aria-label={t('增加模拟会话关联保留期', 'Increase simulated session affinity retention')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+    <SettingsRow
+      label={t('模拟会话原账号关联保留期', 'Simulated session affinity retention')}
+      description={conflict
+        ? t(
+            '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+            'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+          )
+        : t(
+            '槽位释放后，对话在此期限内回来仍优先使用原账号（原槽位空着就回原位，会话 id 不变）；过期后绑定行清掉，再来算新对话。',
+            'After its slot is freed, a returning conversation still prefers its original account (and its old slot if free, keeping the session id); once past this window the binding is removed and it counts as a new conversation.',
+          )}
+      note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        step={1}
+        smallStep={0.5}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少模拟会话关联保留期', 'Decrease simulated session affinity retention')} />
+          <NumberFieldInput aria-label={t('模拟会话关联保留期（天）', 'Simulated session affinity retention in days')} />
+          <NumberFieldIncrement aria-label={t('增加模拟会话关联保留期', 'Increase simulated session affinity retention')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1080,15 +1059,13 @@ function DefaultDeviceLimit() {
   const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('默认设备上限', 'Default device limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '未单独配置的账号使用此上限；账号独立设置优先。',
-            'Accounts without an individual limit use this value; account-specific settings take priority.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('默认设备上限', 'Default device limit')}
+      description={t(
+        '未单独配置的账号使用此上限；账号独立设置优先。',
+        'Accounts without an individual limit use this value; account-specific settings take priority.',
+      )}
+      note={
         <Badge variant="secondary" size="sm">
           {parsed > 0
             ? t(
@@ -1097,35 +1074,33 @@ function DefaultDeviceLimit() {
               )
             : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
         </Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement
-              aria-label={t('减少默认设备上限', 'Decrease default device limit')}
-            />
-            <NumberFieldInput aria-label={t('默认设备上限', 'Default device limit')} />
-            <NumberFieldIncrement
-              aria-label={t('增加默认设备上限', 'Increase default device limit')}
-            />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement
+            aria-label={t('减少默认设备上限', 'Decrease default device limit')}
+          />
+          <NumberFieldInput aria-label={t('默认设备上限', 'Default device limit')} />
+          <NumberFieldIncrement
+            aria-label={t('增加默认设备上限', 'Increase default device limit')}
+          />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1169,45 +1144,41 @@ function DefaultSessionLimit() {
   const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('默认模拟会话上限', 'Default simulated session limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '走模拟路径、没有设备身份的请求按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位，出站会话 id 按槽位派生、释放后复用，上游看到的会话 id 数就是这个上限；与设备名额分开计，有效期与原账号关联用上面会话自己的两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
-            'Requests on the simulation path without a device identity bind to an account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused once freed, so upstream sees at most this many session ids per account, counted separately from device slots; lifetime and affinity use the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('默认模拟会话上限', 'Default simulated session limit')}
+      description={t(
+        '走模拟路径、没有设备身份的请求按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位，出站会话 id 按槽位派生、释放后复用，上游看到的会话 id 数就是这个上限；与设备名额分开计，有效期与原账号关联用上面会话自己的两项。未单独配置的账号使用此上限；账号独立设置优先。打满后新会话分流到别的账号，全部占满时收到 429。',
+        'Requests on the simulation path without a device identity bind to an account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused once freed, so upstream sees at most this many session ids per account, counted separately from device slots; lifetime and affinity use the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once full, new sessions spill to another account and get a 429 once every account is full.',
+      )}
+      note={
         <Badge variant="secondary" size="sm">
           {parsed > 0
             ? t(`每个账号最多 ${parsed} 条活跃会话`, `Up to ${parsed} active ${parsed === 1 ? 'session' : 'sessions'} per account`)
             : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
         </Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少默认会话上限', 'Decrease default session limit')} />
-            <NumberFieldInput aria-label={t('默认模拟会话上限', 'Default simulated session limit')} />
-            <NumberFieldIncrement aria-label={t('增加默认会话上限', 'Increase default session limit')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少默认会话上限', 'Decrease default session limit')} />
+          <NumberFieldInput aria-label={t('默认模拟会话上限', 'Default simulated session limit')} />
+          <NumberFieldIncrement aria-label={t('增加默认会话上限', 'Increase default session limit')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1256,45 +1227,41 @@ function DefaultRpmLimit() {
   const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('默认 RPM 上限', 'Default RPM limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '未单独配置的账号使用此上限；账号独立设置优先。打满后新请求分流到别的账号，已绑定的设备收到 429 与 retry-after。',
-            'Accounts without an individual limit use this value; account-specific settings take priority. Once full, new requests spill to another account and already-bound devices get a 429 with retry-after.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('默认 RPM 上限', 'Default RPM limit')}
+      description={t(
+        '未单独配置的账号使用此上限；账号独立设置优先。打满后新请求分流到别的账号，已绑定的设备收到 429 与 retry-after。',
+        'Accounts without an individual limit use this value; account-specific settings take priority. Once full, new requests spill to another account and already-bound devices get a 429 with retry-after.',
+      )}
+      note={
         <Badge variant="secondary" size="sm">
           {parsed > 0
             ? t(`每个账号每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per account`)
             : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
         </Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少默认 RPM 上限', 'Decrease default RPM limit')} />
-            <NumberFieldInput aria-label={t('默认 RPM 上限', 'Default RPM limit')} />
-            <NumberFieldIncrement aria-label={t('增加默认 RPM 上限', 'Increase default RPM limit')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少默认 RPM 上限', 'Decrease default RPM limit')} />
+          <NumberFieldInput aria-label={t('默认 RPM 上限', 'Default RPM limit')} />
+          <NumberFieldIncrement aria-label={t('增加默认 RPM 上限', 'Increase default RPM limit')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1344,15 +1311,13 @@ function DeviceRpmLimit() {
   const bareAllowed = data?.require_device_id === false
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('设备 RPM 上限', 'Per-device RPM limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '单台设备每分钟最多转发多少条，超了直接 429 并给出 retry-after。不换号：换哪个账号都是同一台机器在刷。0 表示不限。',
-            'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. No credential swap happens — it is the same machine either way. 0 means unlimited.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('设备 RPM 上限', 'Per-device RPM limit')}
+      description={t(
+        '单台设备每分钟最多转发多少条，超了直接 429 并给出 retry-after。不换号：换哪个账号都是同一台机器在刷。0 表示不限。',
+        'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. No credential swap happens — it is the same machine either way. 0 means unlimited.',
+      )}
+      note={
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary" size="sm">
             {parsed > 0
@@ -1365,31 +1330,29 @@ function DeviceRpmLimit() {
             </Badge>
           )}
         </div>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少设备 RPM 上限', 'Decrease per-device RPM limit')} />
-            <NumberFieldInput aria-label={t('设备 RPM 上限', 'Per-device RPM limit')} />
-            <NumberFieldIncrement aria-label={t('增加设备 RPM 上限', 'Increase per-device RPM limit')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少设备 RPM 上限', 'Decrease per-device RPM limit')} />
+          <NumberFieldInput aria-label={t('设备 RPM 上限', 'Per-device RPM limit')} />
+          <NumberFieldIncrement aria-label={t('增加设备 RPM 上限', 'Increase per-device RPM limit')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1444,15 +1407,13 @@ function SessionRpmLimit() {
   const shadowedByDevice = parsed > 0 && deviceLimit > 0 && deviceLimit <= parsed
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('会话 RPM 上限', 'Per-session RPM limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '单个会话每分钟最多转发多少条，超了直接 429 并给出 retry-after。比设备那道细一层：同一台机器上的多个会话各有自己的额度，不再互相挤。0 表示不限。',
-            'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. One level finer than the per-device gate: concurrent sessions on the same machine no longer share one budget. 0 means unlimited.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('会话 RPM 上限', 'Per-session RPM limit')}
+      description={t(
+        '单个会话每分钟最多转发多少条，超了直接 429 并给出 retry-after。比设备那道细一层：同一台机器上的多个会话各有自己的额度，不再互相挤。0 表示不限。',
+        'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. One level finer than the per-device gate: concurrent sessions on the same machine no longer share one budget. 0 means unlimited.',
+      )}
+      note={
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary" size="sm">
             {parsed > 0
@@ -1473,31 +1434,29 @@ function SessionRpmLimit() {
             </Badge>
           )}
         </div>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少会话 RPM 上限', 'Decrease per-session RPM limit')} />
-            <NumberFieldInput aria-label={t('会话 RPM 上限', 'Per-session RPM limit')} />
-            <NumberFieldIncrement aria-label={t('增加会话 RPM 上限', 'Increase per-session RPM limit')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少会话 RPM 上限', 'Decrease per-session RPM limit')} />
+          <NumberFieldInput aria-label={t('会话 RPM 上限', 'Per-session RPM limit')} />
+          <NumberFieldIncrement aria-label={t('增加会话 RPM 上限', 'Increase per-session RPM limit')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1546,15 +1505,13 @@ function SessionConcurrencyLimit() {
   const parsed = Math.max(0, Math.floor(draft ?? 0))
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('会话并发上限', 'Per-session concurrency limit')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '单个会话同时在飞的最大请求数，超了直接 429 并给出 retry-after。用于遏制 Claude Desktop 启动时的 cache 预热脉冲（20+ 条并发），避免打爆上游速率限制。0 表示不限。',
-            'Maximum concurrent in-flight requests per session; beyond that it gets a 429 with retry-after. Tames the cache-warming burst Claude Desktop fires on startup (20+ concurrent requests) to avoid tripping upstream rate limits. 0 means unlimited.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('会话并发上限', 'Per-session concurrency limit')}
+      description={t(
+        '单个会话同时在飞的最大请求数，超了直接 429 并给出 retry-after。用于遏制 Claude Desktop 启动时的 cache 预热脉冲（20+ 条并发），避免打爆上游速率限制。0 表示不限。',
+        'Maximum concurrent in-flight requests per session; beyond that it gets a 429 with retry-after. Tames the cache-warming burst Claude Desktop fires on startup (20+ concurrent requests) to avoid tripping upstream rate limits. 0 means unlimited.',
+      )}
+      note={
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary" size="sm">
             {parsed > 0
@@ -1562,31 +1519,29 @@ function SessionConcurrencyLimit() {
               : t('不限', 'Unlimited')}
           </Badge>
         </div>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <NumberField
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          min={0}
-          value={draft}
-          onValueChange={setDraft}
-        >
-          <NumberFieldGroup>
-            <NumberFieldDecrement aria-label={t('减少会话并发上限', 'Decrease per-session concurrency limit')} />
-            <NumberFieldInput aria-label={t('会话并发上限', 'Per-session concurrency limit')} />
-            <NumberFieldIncrement aria-label={t('增加会话并发上限', 'Increase per-session concurrency limit')} />
-          </NumberFieldGroup>
-        </NumberField>
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={parsed === current}
-          onClick={() => save.mutate(parsed)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t('减少会话并发上限', 'Decrease per-session concurrency limit')} />
+          <NumberFieldInput aria-label={t('会话并发上限', 'Per-session concurrency limit')} />
+          <NumberFieldIncrement aria-label={t('增加会话并发上限', 'Increase per-session concurrency limit')} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={parsed === current}
+        onClick={() => save.mutate(parsed)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1621,37 +1576,31 @@ function RequireDeviceIdToggle() {
   })
 
   return (
-    <Field className="p-5">
-      <div className="flex w-full items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <FieldLabel htmlFor="require-device-id">
-              {t('设备身份校验', 'Device identity checks')}
-            </FieldLabel>
-            <Badge variant={required ? 'success' : 'warning'} size="sm" aria-live="polite">
-              {required ? t('严格模式', 'Strict') : t('兼容模式', 'Compatible')}
-            </Badge>
-          </div>
-          <FieldDescription>
-            {required
-              ? t(
-                  '缺少设备身份的请求会被拒绝。',
-                  'Requests without a device identity will be rejected.',
-                )
-              : t(
-                  '无设备身份的请求将被放行，且不受设备上限限制。',
-                  'Requests without a device identity will be allowed and will not count toward device limits.',
-                )}
-          </FieldDescription>
-        </div>
-        <Switch
-          id="require-device-id"
-          checked={required}
-          disabled={save.isPending}
-          onCheckedChange={(next) => save.mutate(next)}
-        />
-      </div>
-    </Field>
+    <SettingsRow
+      htmlFor="require-device-id"
+      label={t('设备身份校验', 'Device identity checks')}
+      badge={
+        <Badge variant={required ? 'success' : 'warning'} size="sm" aria-live="polite">
+          {required ? t('严格模式', 'Strict') : t('兼容模式', 'Compatible')}
+        </Badge>
+      }
+      description={required
+        ? t(
+            '缺少设备身份的请求会被拒绝。',
+            'Requests without a device identity will be rejected.',
+          )
+        : t(
+            '无设备身份的请求将被放行，且不受设备上限限制。',
+            'Requests without a device identity will be allowed and will not count toward device limits.',
+          )}
+    >
+      <Switch
+        id="require-device-id"
+        checked={required}
+        disabled={save.isPending}
+        onCheckedChange={(next) => save.mutate(next)}
+      />
+    </SettingsRow>
   )
 }
 
@@ -1732,17 +1681,14 @@ function LatestCcRelease() {
   const belowBase = !malformed && value !== '' && base !== '' && compareRelease(value, base) < 0
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel htmlFor="latest-cc-release">
-          {t('官方最新 Claude Code 版本', 'Latest official Claude Code release')}
-        </FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            `User-Agent 里自称高于该版本的 claude-cli 不当官方客户端（走模拟路径）。每 30 分钟从 downloads.claude.ai 自动学一次，只升不降，重启保留。官方刚发新版、自动检查还没轮到时可在这里手动填；删掉则退回基线 ${base || '—'}，等下次自动学。`,
-            `A claude-cli User-Agent claiming a version newer than this is not treated as an official client (it takes the simulated path). Learned automatically from downloads.claude.ai every 30 minutes, never downgraded, kept across restarts. Fill it in by hand when a new release just shipped and the check has not run yet; clearing it falls back to the baseline ${base || '—'} until the next check.`,
-          )}
-        </FieldDescription>
+    <SettingsRow
+      htmlFor="latest-cc-release"
+      label={t('官方最新 Claude Code 版本', 'Latest official Claude Code release')}
+      description={t(
+        `User-Agent 里自称高于该版本的 claude-cli 不当官方客户端（走模拟路径）。每 30 分钟从 downloads.claude.ai 自动学一次，只升不降，重启保留。官方刚发新版、自动检查还没轮到时可在这里手动填；删掉则退回基线 ${base || '—'}，等下次自动学。`,
+        `A claude-cli User-Agent claiming a version newer than this is not treated as an official client (it takes the simulated path). Learned automatically from downloads.claude.ai every 30 minutes, never downgraded, kept across restarts. Fill it in by hand when a new release just shipped and the check has not run yet; clearing it falls back to the baseline ${base || '—'} until the next check.`,
+      )}
+      note={
         <Badge variant={malformed || belowBase ? 'warning' : 'secondary'} size="sm">
           {malformed
             ? t('写法应形如 2.1.260', 'Expected something like 2.1.260')
@@ -1752,37 +1698,34 @@ function LatestCcRelease() {
                 ? t(`当前上限 ${data ? effectiveLatestRelease(data) : current}`, `Current cap ${data ? effectiveLatestRelease(data) : current}`)
                 : t(`尚未学到，按基线 ${base}`, `Not learned yet; using the baseline ${base}`)}
         </Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <Input
-          id="latest-cc-release"
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          placeholder={base || '2.1.260'}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-        />
-        <Button
-          size="sm"
-          loading={save.isPending && save.variables !== ''}
-          disabled={malformed || value === '' || value === current}
-          onClick={() => save.mutate(value)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          loading={save.isPending && save.variables === ''}
-          disabled={current === ''}
-          onClick={() => save.mutate('')}
-          aria-label={t('清除', 'Clear')}
-        >
-          <Trash2Icon />
-          {t('清除', 'Clear')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <Input
+        id="latest-cc-release"
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        placeholder={base || '2.1.260'}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+      />
+      <Button
+        loading={save.isPending && save.variables !== ''}
+        disabled={malformed || value === '' || value === current}
+        onClick={() => save.mutate(value)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+      <Button
+        variant="outline"
+        loading={save.isPending && save.variables === ''}
+        disabled={current === ''}
+        onClick={() => save.mutate('')}
+        aria-label={t('清除', 'Clear')}
+      >
+        <Trash2Icon />
+        {t('清除', 'Clear')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1833,17 +1776,14 @@ function MinClientVersion() {
   const malformed = value !== '' && !VERSION_RE.test(value)
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel htmlFor="min-client-version">
-          {t('最低 Claude Code 版本', 'Minimum Claude Code version')}
-        </FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '低于该版本的 Claude Code 会收到 403 与升级提示。留空表示不限。只认 User-Agent 里的 claude-cli 版本，SDK、浏览器等其它客户端一律放行；UA 可被客户端伪造，只用于引导升级。',
-            'Older Claude Code builds get a 403 with an upgrade hint. Leave empty for no limit. Only the claude-cli version in the User-Agent is checked — SDKs, browsers and other clients always pass; a User-Agent can be forged, so treat this as an upgrade nudge, not a security boundary.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      htmlFor="min-client-version"
+      label={t('最低 Claude Code 版本', 'Minimum Claude Code version')}
+      description={t(
+        '低于该版本的 Claude Code 会收到 403 与升级提示。留空表示不限。只认 User-Agent 里的 claude-cli 版本，SDK、浏览器等其它客户端一律放行；UA 可被客户端伪造，只用于引导升级。',
+        'Older Claude Code builds get a 403 with an upgrade hint. Leave empty for no limit. Only the claude-cli version in the User-Agent is checked — SDKs, browsers and other clients always pass; a User-Agent can be forged, so treat this as an upgrade nudge, not a security boundary.',
+      )}
+      note={
         <Badge variant={malformed ? 'warning' : 'secondary'} size="sm">
           {malformed
             ? t('写法应形如 2.1.220', 'Expected something like 2.1.220')
@@ -1851,26 +1791,24 @@ function MinClientVersion() {
               ? t(`要求 ${value} 及以上`, `Requires ${value} or newer`)
               : t('不限版本', 'Any version')}
         </Badge>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <Input
-          id="min-client-version"
-          className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-          placeholder="2.1.220"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-        />
-        <Button
-          size="sm"
-          loading={save.isPending}
-          disabled={malformed || value === current}
-          onClick={() => save.mutate(value)}
-        >
-          <SaveIcon />
-          {t('保存', 'Save')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <Input
+        id="min-client-version"
+        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
+        placeholder="2.1.220"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+      />
+      <Button
+        loading={save.isPending}
+        disabled={malformed || value === current}
+        onClick={() => save.mutate(value)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1926,109 +1864,102 @@ function BareRateLimit() {
     && win === (data?.bare_rate_window_secs ?? 60)
 
   return (
-    <div className="p-5">
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,0.9fr)] lg:items-start">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="font-medium text-sm">
-              {t(
-                '无设备身份请求上限（每个账号）',
-                'Request limit for requests without a device identity (per account)',
+    <SettingsRow
+      label={t(
+        '无设备身份请求上限（每个账号）',
+        'Request limit for requests without a device identity (per account)',
+      )}
+      badge={
+        <Badge variant={inactive ? 'secondary' : 'info'} size="sm">
+          {inactive ? t('当前不生效', 'Inactive') : t('正在生效', 'Active')}
+        </Badge>
+      }
+      description={inactive
+        ? t(
+            '设备身份校验已开启，无身份请求会先被拒绝；切换到兼容模式后此限制才会生效。',
+            'Identity checks are enabled, so unidentified requests are rejected first; this limit takes effect in compatible mode.',
+          )
+        : t(
+            '限制兼容模式下放行的无身份请求，0 表示不限速。',
+            'Limits unidentified requests allowed in compatible mode; 0 means unlimited.',
+          )}
+      footer={
+        <p className="mt-2 w-full border-t pt-4 text-xs leading-5 text-muted-foreground">
+          {inactive
+            ? t(
+                '当前配置会保留，关闭设备身份校验后自动恢复使用。',
+                'The current configuration is preserved and becomes active automatically when identity checks are disabled.',
+              )
+            : t(
+                '仅统计无设备身份的消息请求，Token 计数接口不计入；单个账号达到上限后自动换号，全部达到上限才拒绝。服务重启后重新计数。',
+                'Only message requests without a device identity are counted; token-counting requests are excluded. The proxy switches accounts when one reaches its limit and rejects only when every account is capped. Counters reset after a service restart.',
               )}
-            </p>
-            <Badge variant={inactive ? 'secondary' : 'info'} size="sm">
-              {inactive ? t('当前不生效', 'Inactive') : t('正在生效', 'Active')}
-            </Badge>
-          </div>
-          <p className="mt-1 max-w-xl text-xs leading-5 text-muted-foreground">
-            {inactive
-              ? t(
-                  '设备身份校验已开启，无身份请求会先被拒绝；切换到兼容模式后此限制才会生效。',
-                  'Identity checks are enabled, so unidentified requests are rejected first; this limit takes effect in compatible mode.',
-                )
-              : t(
-                  '限制兼容模式下放行的无身份请求，0 表示不限速。',
-                  'Limits unidentified requests allowed in compatible mode; 0 means unlimited.',
-                )}
-          </p>
+        </p>
+      }
+    >
+        <div className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] grid-rows-[auto_auto] items-center gap-3 sm:w-88">
+          <Field className="row-span-2 grid grid-rows-subgrid gap-1.5">
+            <FieldLabel>{t('请求数', 'Request count')}</FieldLabel>
+            <NumberField disabled={inactive} min={0} value={draft} onValueChange={setDraft}>
+              <NumberFieldGroup>
+                <NumberFieldDecrement
+                  aria-label={t(
+                    '减少无设备身份请求上限',
+                    'Decrease the request limit for requests without a device identity',
+                  )}
+                />
+                <NumberFieldInput
+                  aria-label={t(
+                    '无设备身份请求上限（条）',
+                    'Request limit for requests without a device identity',
+                  )}
+                />
+                <NumberFieldIncrement
+                  aria-label={t(
+                    '增加无设备身份请求上限',
+                    'Increase the request limit for requests without a device identity',
+                  )}
+                />
+              </NumberFieldGroup>
+            </NumberField>
+          </Field>
+          <Field className="row-span-2 grid grid-rows-subgrid gap-1.5">
+            <FieldLabel>{t('时间窗口（秒）', 'Time window (seconds)')}</FieldLabel>
+            <NumberField disabled={inactive} min={1} value={windowDraft} onValueChange={setWindowDraft}>
+              <NumberFieldGroup>
+                <NumberFieldDecrement
+                  aria-label={t(
+                    '减少无设备身份请求时间窗口',
+                    'Decrease the time window for requests without a device identity',
+                  )}
+                />
+                <NumberFieldInput
+                  aria-label={t(
+                    '无设备身份请求窗口（秒）',
+                    'Time window for requests without a device identity in seconds',
+                  )}
+                />
+                <NumberFieldIncrement
+                  aria-label={t(
+                    '增加无设备身份请求时间窗口',
+                    'Increase the time window for requests without a device identity',
+                  )}
+                />
+              </NumberFieldGroup>
+            </NumberField>
+          </Field>
+          {/* 与转发页那行同理：按钮要和 NumberField 等高，故用默认尺寸而不是 `sm`。 */}
+          <Button
+            className="col-start-3 row-start-2 max-sm:size-9 max-sm:px-0"
+            loading={save.isPending}
+            disabled={inactive || unchanged}
+            onClick={() => save.mutate({ limit, win })}
+          >
+            <SaveIcon />
+            <span className="max-sm:sr-only">{t('保存', 'Save')}</span>
+          </Button>
         </div>
-        <div className="space-y-3">
-          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-end gap-3">
-            <Field>
-              <FieldLabel>{t('请求数', 'Request count')}</FieldLabel>
-              <NumberField disabled={inactive} min={0} value={draft} onValueChange={setDraft}>
-                <NumberFieldGroup>
-                  <NumberFieldDecrement
-                    aria-label={t(
-                      '减少无设备身份请求上限',
-                      'Decrease the request limit for requests without a device identity',
-                    )}
-                  />
-                  <NumberFieldInput
-                    aria-label={t(
-                      '无设备身份请求上限（条）',
-                      'Request limit for requests without a device identity',
-                    )}
-                  />
-                  <NumberFieldIncrement
-                    aria-label={t(
-                      '增加无设备身份请求上限',
-                      'Increase the request limit for requests without a device identity',
-                    )}
-                  />
-                </NumberFieldGroup>
-              </NumberField>
-            </Field>
-            <Field>
-              <FieldLabel>{t('时间窗口（秒）', 'Time window (seconds)')}</FieldLabel>
-              <NumberField disabled={inactive} min={1} value={windowDraft} onValueChange={setWindowDraft}>
-                <NumberFieldGroup>
-                  <NumberFieldDecrement
-                    aria-label={t(
-                      '减少无设备身份请求时间窗口',
-                      'Decrease the time window for requests without a device identity',
-                    )}
-                  />
-                  <NumberFieldInput
-                    aria-label={t(
-                      '无设备身份请求窗口（秒）',
-                      'Time window for requests without a device identity in seconds',
-                    )}
-                  />
-                  <NumberFieldIncrement
-                    aria-label={t(
-                      '增加无设备身份请求时间窗口',
-                      'Increase the time window for requests without a device identity',
-                    )}
-                  />
-                </NumberFieldGroup>
-              </NumberField>
-            </Field>
-            <Button
-              className="max-sm:size-8 max-sm:px-0"
-              size="sm"
-              loading={save.isPending}
-              disabled={inactive || unchanged}
-              onClick={() => save.mutate({ limit, win })}
-            >
-              <SaveIcon />
-              <span className="max-sm:sr-only">{t('保存', 'Save')}</span>
-            </Button>
-          </div>
-        </div>
-      </div>
-      <p className="mt-4 border-t pt-4 text-xs leading-5 text-muted-foreground">
-        {inactive
-          ? t(
-              '当前配置会保留，关闭设备身份校验后自动恢复使用。',
-              'The current configuration is preserved and becomes active automatically when identity checks are disabled.',
-            )
-          : t(
-              '仅统计无设备身份的消息请求，Token 计数接口不计入；单个账号达到上限后自动换号，全部达到上限才拒绝。服务重启后重新计数。',
-              'Only message requests without a device identity are counted; token-counting requests are excluded. The proxy switches accounts when one reaches its limit and rejects only when every account is capped. Counters reset after a service restart.',
-            )}
-      </p>
-    </div>
+    </SettingsRow>
   )
 }
 
@@ -2078,7 +2009,7 @@ function AdminPassword() {
 
   if (authQuery.isPending) {
     return (
-      <Field className="p-5">
+      <Field className="p-4 sm:p-5">
         <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
           <Spinner className="size-3" />
@@ -2090,7 +2021,7 @@ function AdminPassword() {
 
   if (authQuery.isError) {
     return (
-      <Field className="p-5">
+      <Field className="p-4 sm:p-5">
         <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs text-destructive-foreground">
@@ -2111,7 +2042,7 @@ function AdminPassword() {
 
   return (
     <>
-      <Field className="p-5">
+      <Field className="p-4 sm:p-5">
         <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         {envManaged ? (
           <FieldDescription>
@@ -2172,7 +2103,7 @@ function AdminPassword() {
           if (!save.isPending) setClearOpen(nextOpen)
         }}
       >
-        <AlertDialogPopup className="sm:max-w-md">
+        <AlertDialogPopup>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('清除管理密码', 'Clear admin password')}</AlertDialogTitle>
             <AlertDialogDescription>
@@ -2241,7 +2172,7 @@ function CopyButton({
       <Button
         type="button"
         aria-label={copied ? successLabel : idleLabel}
-        className={copied ? 'text-success' : undefined}
+        className={copied ? 'text-success-foreground' : undefined}
         size={size}
         title={copied ? successLabel : idleLabel}
         variant="ghost"

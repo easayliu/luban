@@ -1,6 +1,5 @@
 import { useEffect } from 'react'
 import {
-  ArrowLeftIcon,
   ArrowRightLeftIcon,
   CableIcon,
   GlobeIcon,
@@ -17,10 +16,7 @@ import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
 import { MigrationSettingsContent } from '@/components/migration-settings'
 import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
-import { LanguageSwitcher } from '@/components/language-switcher'
-import { ThemeSwitcher } from '@/components/theme-switcher'
-import { LogoMark } from '@/components/logo-mark'
-import { Button } from '@/components/ui/button'
+import { AppHeader, Breadcrumb, PreferencesMenu } from '@/components/app-header'
 import {
   Select,
   SelectItem,
@@ -48,60 +44,36 @@ export function SettingsPage({
     {
       key: 'access',
       label: t('客户端接入', 'Client access'),
-      description: t(
-        '管理接入地址、身份验证 Key 与 Claude Code 配置。',
-        'Manage the endpoint, authentication key, and Claude Code setup.',
-      ),
       navDescription: t('地址、Key 与配置片段', 'Endpoint, key, and setup'),
       icon: CableIcon,
     },
     {
       key: 'devices',
       label: t('设备策略', 'Device policies'),
-      description: t(
-        '控制设备名额、账号关联，以及无身份请求的处理方式。',
-        'Control device slots, account affinity, and unidentified requests.',
-      ),
       navDescription: t('绑定、容量与身份校验', 'Bindings, capacity, and identity'),
       icon: SmartphoneIcon,
     },
     {
       key: 'proxies',
       label: t('代理池', 'Proxy pool'),
-      description: t(
-        '集中管理可复用的出站代理地址，方便快速分配给账号。',
-        'Manage reusable outbound proxy addresses for quick assignment to accounts.',
-      ),
       navDescription: t('出站代理地址管理', 'Outbound proxy management'),
       icon: GlobeIcon,
     },
     {
       key: 'forwarding',
       label: t('转发策略', 'Forwarding policy'),
-      description: t(
-        '配置登录授权范围、协议兼容、缓存形态、限流与错误恢复。',
-        'Configure login scopes, protocol compatibility, caching, rate limits, and recovery.',
-      ),
       navDescription: t('授权、兼容与错误恢复', 'Scopes, compatibility, and recovery'),
       icon: SlidersHorizontalIcon,
     },
     {
       key: 'migration',
       label: t('迁移', 'Migration'),
-      description: t(
-        '导出这台机器的账号与设置，或导入另一台导出的文件。',
-        'Export this machine\u2019s accounts and settings, or import a file exported from another one.',
-      ),
       navDescription: t('导出与导入账号', 'Export and import accounts'),
       icon: ArrowRightLeftIcon,
     },
     {
       key: 'security',
       label: t('控制台安全', 'Console security'),
-      description: t(
-        '设置管理密码，保护系统设置与账号数据。',
-        'Set an admin password to protect settings and account data.',
-      ),
       navDescription: t('登录与管理密码', 'Sign-in and admin password'),
       icon: LockKeyholeIcon,
     },
@@ -127,45 +99,18 @@ export function SettingsPage({
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <header className="app-header sticky top-0 z-20 border-b bg-background">
-        <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
-          <Button
-            aria-label={t('返回账号页', 'Back to accounts')}
-            className="-ml-2 h-auto min-w-0 justify-start gap-2.5 px-2 py-1.5 sm:gap-3"
-            title={t('返回账号页', 'Back to accounts')}
-            variant="ghost"
-            onClick={onBack}
-          >
-            <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-              <LogoMark className="size-[1.125rem]" />
-            </span>
-            <span className="min-w-0 text-left">
-              <span className="block text-sm font-semibold leading-none tracking-tight">Luban</span>
-              <span className="mt-1 hidden whitespace-nowrap text-xs font-normal text-muted-foreground sm:block">
-                Claude Code Gateway
-              </span>
-            </span>
-          </Button>
-          <div className="flex items-center gap-2">
-            <LanguageSwitcher compact />
-            <ThemeSwitcher compact />
-            <Button
-              aria-label={t('返回账号', 'Back to accounts')}
-              className="max-sm:size-10 max-sm:px-0"
-              size="sm"
-              title={t('返回账号', 'Back to accounts')}
-              variant="outline"
-              onClick={onBack}
-            >
-              <ArrowLeftIcon aria-hidden="true" />
-              <span className="max-sm:sr-only">{t('返回账号', 'Back to accounts')}</span>
-            </Button>
-          </div>
-        </div>
-      </header>
+      <AppHeader actions={<PreferencesMenu />} onNavigateHome={onBack} />
 
       <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
         <div className="space-y-5 sm:space-y-7">
+          {/* 层级线：既交代「我在哪儿」，也是回账号页的入口之一（顶栏那枚 logo 是另一个，
+              两者都是标准做法；撤掉的是右上角那枚与 logo 完全重复的「返回账号」按钮）。 */}
+          <Breadcrumb
+            current={t('系统设置', 'System settings')}
+            parent={t('账号池', 'Account pool')}
+            onNavigateParent={onBack}
+          />
+
           <section aria-labelledby="settings-page-title" className="max-w-2xl">
             <h1
               className="min-w-0 text-xl font-semibold tracking-tight sm:text-2xl"
@@ -240,18 +185,19 @@ export function SettingsPage({
               </TabsList>
             </div>
 
+            {/* 内容列铺满，不要给它封 `max-w-*`。
+                这里试过封到 56rem，想缩短「标签 → 控件」的扫视距离（`page-frame` 的 88rem 是
+                当初为账号列表 12 列定的，见 index.css）。结果是内容右边界比顶栏短了 240px：
+                240(导航) + 32(间距) + 896(内容) = 1168，而顶栏铺满 1408，一眼就看得出没对齐。
+                顶栏是全站 chrome、改不得，所以该让步的是这里。
+                行长的问题另有出路且已经解决——每行说明各自封在 `max-w-xl`（见 SettingsRow），
+                真正难读的是正文行长，不是卡片宽度。 */}
             <div className="min-w-0 flex-1">
-              <header className="mb-5 flex items-start gap-3">
-                <span className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl border bg-background shadow-xs/5">
-                  <ActiveIcon aria-hidden="true" className="size-4 text-muted-foreground" />
-                </span>
-                <div className="min-w-0">
-                  <h2 className="font-semibold text-lg tracking-tight">{active.label}</h2>
-                  <p className="mt-1 max-w-2xl text-sm leading-5 text-muted-foreground">
-                    {active.description}
-                  </p>
-                </div>
-              </header>
+              {/* 分区头只剩一行标题：原来这里是「图标徽章 + 标题 + 一句话」，可同一个图标左边导航
+                  刚画过、同一句话下面第一张卡片又要再说一遍（「代理池」那一区最明显：三个字出现
+                  三次、描述出现两次）。左导航已经交代了「在哪一区」，这里留一个 h2 接住标题层级
+                  与 aria 就够，各区具体讲什么交给卡片头自己说。 */}
+              <h2 className="mb-4 font-semibold text-lg tracking-tight">{active.label}</h2>
 
               <TabsPanel className="min-w-0" value="access">
                 {section === 'access' && <AccessSettingsContent />}

@@ -1377,26 +1377,55 @@ export function orgBadgeLabel(cred: Pick<Credential, 'org_type'>): string {
 }
 
 /**
- * 设备名额占用的配色，走容量类指标那套通行分级：**空闲灰、健康绿、吃紧黄、占满红**。
+ * 名额占用（设备 / 模拟会话 / RPM）的配色：**空闲灰、健康绿、吃紧黄、打满红**。
  *
- * - 一台都没绑（`count == 0`）→ 灰：这是「没在用」，不是「用得很好」，不该和健康色混在一起；
- * - 占用 < 70% → 绿；
- * - 占用 >= 70%，或**只剩最后一个名额** → 黄。后半条是给小分母兜底的：设备上限常是 3、5
- *   这种数字，2/3 按百分比才 66%，可它其实只剩一个位置了；
- * - 占满（`count >= limit`）→ 红。红**只**留给真占满：还能收设备的号涂成红色，和已经收不下
- *   的号看着一样，那就白涂了——所以 90% 那一档在这里仍是黄的。
+ * 阈值直接走 [quotaLevel]——全后台所有计量条共用同一把尺子：**0 灰、<70% 绿、≥70% 黄、≥90% 红**。
+ * 用量窗口（5h / 7d）、列表与卡片的名额、设备对话框的两条容量，现在判定完全一致：同样的占用比例，
+ * 在哪儿看都是同一个颜色。
  *
- * 不限（`limit <= 0`）没有「满」这个状态，有人用就是绿，到不了黄红。
+ * 这里原先自带两条例外，现在都去掉了：一是「红只留给真占满」（90% 那档仍是黄），二是「只剩最后
+ * 一个名额也算黄」（给 2/3 这种小分母兜底）。两条各有道理，但它们让名额条和用量条在同一个百分比上
+ * 显示不同的颜色——同一张页面上两把尺子，比任何一把尺子不够贴切都更费解。
+ *
+ * 一台都没绑（`count == 0`）→ 灰：这是「没在用」，不是「用得很好」，不该和健康色混在一起。
+ * 不限（`limit <= 0`）没有比例可言，有人用就是绿，到不了黄红。
  */
+/**
+ * 计量条的填充色：按阈值分档——健康绿、吃紧琥珀、打满红。五条条（卡片 5h / 7d、列表用量、
+ * 列表名额、设备对话框的名额与容量）共用这一张表，同一个档位在哪儿都是同一个颜色。
+ *
+ * 中间试过 Cloudflare kumo 的口径：`Meter` 组件默认没有 warning / danger 变体，填充永远是品牌蓝，
+ * 连它 `value={100}` 的「Quota reached」演示也是蓝的，告警交给旁边的数字与徽章。照那个口径改过一版，
+ * 实测在这个后台不成立——这张表是拿来**扫出有问题的号**的，一屏十几条同色的蓝条，得逐条去读右边
+ * 那个百分比才知道哪条满了；条的长度本身在 70% 与 95% 之间差别并不显眼。
+ *
+ * 按阈值上色同样在 CF 的体系内：kumo 的 token 文档写着实心语义色（`bg-kumo-success` 等）正是给
+ * 「icons, status dots, and **progress fills**」用的，组件也留了 `indicatorClassName` 这个口子
+ * 让使用方自己接。所以这不是「偏离 CF」，而是在它给出的两条路里选了适合这张表的那条。
+ */
+/** 档位 → 徽章配色。与 [METER_FILL] 是同一套档位的两种呈现（文字块 / 条），要改一起改。 */
+const LEVEL_BADGE: Record<QuotaLevel, BadgeProps['variant']> = {
+  empty: 'secondary',
+  ok: 'success',
+  warning: 'warning',
+  critical: 'error',
+}
+
+export const METER_FILL: Record<QuotaLevel, string> = {
+  empty: 'bg-success',
+  ok: 'bg-success',
+  warning: 'bg-warning',
+  critical: 'bg-destructive',
+}
+
 export function deviceUsageMeta(
   count: number,
   effectiveLimit: number,
 ): { level: QuotaLevel; variant: BadgeProps['variant'] } {
   if (count <= 0) return { level: 'empty', variant: 'secondary' }
   if (effectiveLimit <= 0) return { level: 'ok', variant: 'success' }
-  if (count >= effectiveLimit) return { level: 'critical', variant: 'error' }
-  const tight = quotaLevel(count / effectiveLimit) !== 'ok' || effectiveLimit - count <= 1
-  return tight ? { level: 'warning', variant: 'warning' } : { level: 'ok', variant: 'success' }
+  const level = quotaLevel(count / effectiveLimit)
+  return { level, variant: LEVEL_BADGE[level] }
 }
 
 /**

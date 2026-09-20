@@ -44,6 +44,25 @@ function volumeWeight(inputTokens: number, maxInputTokens: number): number {
 
 const DIP_MIN_VOLUME_SHARE = 0.1
 
+/**
+ * 叠柱里段与段之间那 2px 的留白——「用底色去分隔，而不是给每段描边」。
+ *
+ * 做法是给上面那段加一条 **透明的下边框**，再配 `bg-clip-padding`：背景不画到边框下面，
+ * 于是那 2px 露出的是柱子背后的东西（包括悬浮时那层 `bg-muted/56` 的高亮），
+ * 而不是某个写死的底色。边框走 border-box，占的是这一段自己已经分到的高度，
+ * 三段的百分比之和仍然是 100%，柱子不会因此长高或被裁掉。
+ *
+ * 描边是不行的：那会给图里加进不属于数据的墨。
+ */
+const SEGMENT_GAP = 'border-b-2 border-transparent bg-clip-padding'
+
+/**
+ * 太薄的段不开缝：柱高 `h-40`（160px），4% 约合 6.4px，扣掉 2px 还剩 4.4px 涂色；
+ * 再薄就让它实心——本来也没什么好分隔的，扣完反而把这一段自己抹掉了。
+ */
+const GAP_MIN_PCT = 4
+const segmentGap = (pct: number) => (pct >= GAP_MIN_PCT ? SEGMENT_GAP : undefined)
+
 export function CacheHitColumns({
   slots,
   granularity,
@@ -95,6 +114,10 @@ export function CacheHitColumns({
             <div className="absolute inset-0 flex items-end">
               {slots.map((slot, i) => {
                 const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
+                const share = (tokens: number) =>
+                  slot.inputTokens > 0 ? (tokens / slot.inputTokens) * 100 : 0
+                const uncachedPct = share(uncachedTokens(slot))
+                const writtenPct = share(slot.writtenTokens)
                 return (
                   <div
                     key={slot.ts}
@@ -128,8 +151,15 @@ export function CacheHitColumns({
                         className="relative flex w-full max-w-6 flex-col justify-end overflow-hidden rounded-t"
                         style={{ height: '100%', opacity: volumeWeight(slot.inputTokens, maxInput) }}
                       >
-                        <span className="w-full bg-muted-foreground/24" style={{ height: `${(uncachedTokens(slot) / slot.inputTokens) * 100}%` }} />
-                        <span className="w-full bg-chart-1/40" style={{ height: `${(slot.writtenTokens / slot.inputTokens) * 100}%` }} />
+                        <span
+                          className={cn('w-full bg-muted-foreground/24', segmentGap(uncachedPct))}
+                          style={{ height: `${uncachedPct}%` }}
+                        />
+                        <span
+                          className={cn('w-full bg-chart-1/40', segmentGap(writtenPct))}
+                          style={{ height: `${writtenPct}%` }}
+                        />
+                        {/* 最底下这段坐在基线上，下面没有东西要分隔，不开缝。 */}
                         <span className="w-full bg-chart-1" style={{ height: `max(0.125rem, ${rate * 100}%)` }} />
                       </span>
                     )}

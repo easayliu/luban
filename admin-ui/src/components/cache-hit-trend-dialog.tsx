@@ -30,6 +30,7 @@ import {
   CacheHitTable,
   cacheSplitText,
 } from '@/components/cache-hit-chart'
+import { ChartLegend } from '@/components/chart-legend'
 import { UsageBreakdown } from '@/components/usage-breakdown'
 
 export const CACHE_RANGES = {
@@ -80,17 +81,19 @@ export function CacheHitTrendDialog({
   const preset = CACHE_RANGES[range]
   const card = (label: string, p: { input_tokens: number; cached_tokens: number; written_tokens: number } | null) => {
     const empty = !p || p.input_tokens === 0
+    // 标签 / 数值 / 说明三行堆叠，而不是数值与说明并排 baseline 对齐：并排时两枚块一个装满、
+    // 一个只有「无请求」，同一行的内容长度差把整行拉得参差；堆叠后两枚等高。
+    // 大数字不带 `tabular-nums`——等宽数位是给需要竖向对齐的数字列用的，单独一个大号读数
+    // 用等宽反而显得松散。
     return (
-      <div className="rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
+      <div className="rounded-xl border bg-muted/32 px-4 py-3">
         <p className="text-2xs font-medium text-muted-foreground">{label}</p>
-        <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <p className="text-2xl font-semibold leading-none tabular-nums">
-            {empty ? '—' : formatPercent(cacheHitRate(p.input_tokens, p.cached_tokens))}
-          </p>
-          <p className="text-2xs text-muted-foreground tabular-nums">
-            {empty ? t('无请求', 'No requests') : cacheSplitText(p, t)}
-          </p>
-        </div>
+        <p className="mt-1 text-2xl font-semibold leading-none">
+          {empty ? '—' : formatPercent(cacheHitRate(p.input_tokens, p.cached_tokens))}
+        </p>
+        <p className="mt-1.5 text-2xs text-muted-foreground tabular-nums">
+          {empty ? t('无请求', 'No requests') : cacheSplitText(p, t)}
+        </p>
       </div>
     )
   }
@@ -103,9 +106,14 @@ export function CacheHitTrendDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-3xl" initialFocus={titleRef}>
-        <DialogHeader className="border-b bg-muted/32 p-4 sm:p-5">
-          <div className="flex items-center gap-3 pr-8">
+      <DialogPopup size="lg" initialFocus={titleRef}>
+        <DialogHeader variant="panel">
+          {/* 时间范围放在头部右端，和标题同一行——它影响这个弹窗里的全部内容，是「这张卡看的是
+              哪一段」，不是正文里的某个局部开关。放在正文时它会和「图表/表格」「按模型/按账号」
+              三组同款胶囊竖着排成一摞，谁管什么范围完全读不出来。
+              `pr-12` 给右上角那枚关闭按钮让位（它在 end-2、宽 32px，占掉右边 40px）。 */}
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 pr-12">
+          <div className="flex min-w-0 items-center gap-3">
             <Avatar>
               <AvatarFallback><DatabaseZapIcon /></AvatarFallback>
             </Avatar>
@@ -125,11 +133,8 @@ export function CacheHitTrendDialog({
               </DialogDescription>
             </div>
           </div>
-        </DialogHeader>
-
-        <DialogPanel className="space-y-3 p-4 pt-3 sm:p-5 sm:pt-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
             <ToggleGroup
+              className="shrink-0"
               value={[range]}
               onValueChange={(values) => {
                 const next = values[values.length - 1]
@@ -147,8 +152,36 @@ export function CacheHitTrendDialog({
                 </Fragment>
               ))}
             </ToggleGroup>
+          </div>
+        </DialogHeader>
 
+        <DialogPanel className="space-y-3">
+          {/* 左边整个窗口，右边近 1 小时：「现在」和「基线」并排。 */}
+          <section className="grid gap-2 sm:grid-cols-2">
+            {card(rangeLabel[range], summary)}
+            {card(t('近 1 小时', 'Last hour'), recent)}
+          </section>
+
+          {/* 图例贴着图表上沿，右边是同一份数据的呈现形式切换。
+              图例只在真画了图时出现——换成表格视图时颜色不再承载任何信息。 */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {view === 'chart' && hasTraffic && !query.isPending && !query.error ? (
+              <ChartLegend
+                items={[
+                  { swatch: 'bg-chart-1', label: t('命中 ×0.1', 'Cached ×0.1') },
+                  { swatch: 'bg-chart-1/40', label: t('写入 ×1.25', 'Written ×1.25') },
+                  { swatch: 'bg-muted-foreground/24', label: t('裸算 ×1', 'Uncached ×1') },
+                ]}
+                hint={t(
+                  '命中率就是最深那段的高度。写入多、命中少，是前缀每轮都在变；两段都少，是客户端没标缓存断点。',
+                  'The hit rate is the height of the darkest segment. Much written but little cached means the prefix changes every turn; little of both means the client sets no cache breakpoints.',
+                )}
+              />
+            ) : (
+              <span />
+            )}
             <ToggleGroup
+              className="shrink-0"
               value={[view]}
               onValueChange={(values) => {
                 const next = values[values.length - 1]
@@ -166,12 +199,6 @@ export function CacheHitTrendDialog({
               </ToggleGroupItem>
             </ToggleGroup>
           </div>
-
-          {/* 左边整个窗口，右边近 1 小时：「现在」和「基线」并排。 */}
-          <section className="grid gap-2 sm:grid-cols-2">
-            {card(rangeLabel[range], summary)}
-            {card(t('近 1 小时', 'Last hour'), recent)}
-          </section>
 
           {query.error ? (
             <Alert variant="error">
@@ -203,10 +230,12 @@ export function CacheHitTrendDialog({
             <CacheHitTable slots={slots} granularity={granularity} />
           )}
 
+          {/* 颜色的含义交给图例、计价倍率写进图例标签、诊断提示收进图例末尾那枚 info，
+              这里只剩图例说不了的那两件事。原来这段是 100 字的 10px 灰字，铺满整个弹窗宽度。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '一根柱子叠三段：深色是命中（按十分之一计价）、浅色是写入（按 1.25 倍计价）、灰色是裸算。命中率就是深色那段的高度；写入多命中少是前缀每轮在变，两段都少是客户端没标断点。空着的格子是那个时段没有请求；柱子的深浅是那一格的 token 体量。请求明细只保留 30 天。',
-              'Each bar stacks three parts: dark is cached (billed at a tenth), light is written (billed at 1.25×), grey is uncached. The hit rate is the dark part\'s height; lots written but little cached means the prefix changes every turn, little of both means the client sets no breakpoints. A gap means no traffic in that period; a bar\'s opacity reflects its token volume. Request logs are kept for 30 days.',
+              '空着的格子是那个时段没有请求；柱子的深浅是那一格的 token 体量。请求明细只保留 30 天。',
+              'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 30 days.',
             )}
           </p>
 

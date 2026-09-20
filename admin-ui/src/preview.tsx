@@ -1,15 +1,13 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import {
-  EllipsisVerticalIcon, PlusIcon, SettingsIcon,
-} from 'lucide-react'
+import { SettingsIcon } from 'lucide-react'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
 import { AppFooter } from '@/components/app-footer'
-import { LanguageSwitcher } from '@/components/language-switcher'
+import { AppHeader, PreferencesMenu, scrollToTop } from '@/components/app-header'
 import {
   CREDENTIAL_PAGE_SIZES,
   CredentialWorkspace,
@@ -19,9 +17,7 @@ import {
   type CredentialViewMode,
 } from '@/components/credential-workspace'
 import type { SortDir, SortKey } from '@/components/credential-shared'
-import { LogoMark } from '@/components/logo-mark'
-import { Button, buttonVariants } from '@/components/ui/button'
-import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu'
+import { MenuItem } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
@@ -675,55 +671,17 @@ function PreviewHeader() {
   }, [t])
 
   return (
-    <header className="app-header sticky top-0 z-20 border-b bg-background">
-      <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
-        <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-          <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-            <LogoMark className="size-[1.125rem]" />
-          </div>
-          <div className="min-w-0">
-            <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
-            <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">
-              Claude Code Gateway
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2 sm:hidden">
-          <Button
-            size="icon-lg"
-            aria-label={t('添加账号', 'Add account')}
-            onClick={() => navigatePreview('?dialog=add')}
-          >
-            <PlusIcon />
-          </Button>
-          <LanguageSwitcher compact />
-          <Menu>
-            <MenuTrigger
-              className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
-              aria-label={t('更多操作', 'More actions')}
-            >
-              <EllipsisVerticalIcon />
-            </MenuTrigger>
-            <MenuPopup align="end">
-              <MenuItem onClick={() => navigatePreview('?settings=access')}>
-                <SettingsIcon />{t('系统设置', 'System settings')}
-              </MenuItem>
-            </MenuPopup>
-          </Menu>
-        </div>
-
-        <div className="hidden items-center gap-2 sm:flex">
-          <LanguageSwitcher />
-          <Button size="sm" variant="outline" onClick={() => navigatePreview('?settings=access')}>
-            <SettingsIcon />{t('系统设置', 'Settings')}
-          </Button>
-          <Button size="sm" onClick={() => navigatePreview('?dialog=add')}>
-            <PlusIcon />{t('添加账号', 'Add account')}
-          </Button>
-        </div>
-      </div>
-    </header>
+    <AppHeader
+      homeLabel={t('回到顶部', 'Back to top')}
+      onNavigateHome={scrollToTop}
+      actions={
+        <PreferencesMenu>
+          <MenuItem onClick={() => navigatePreview('?settings=access')}>
+            <SettingsIcon />{t('系统设置', 'System settings')}
+          </MenuItem>
+        </PreferencesMenu>
+      }
+    />
   )
 }
 

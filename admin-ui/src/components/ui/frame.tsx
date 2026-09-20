@@ -25,7 +25,7 @@ export function FramePanel({
   return (
     <div
       className={cn(
-        "relative rounded-xl border bg-background bg-clip-padding p-5 shadow-xs/5 before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-xl)-1px)] before:shadow-[0_1px_var(--bevel)] dark:before:shadow-[0_-1px_var(--bevel)]",
+        "relative rounded-xl border bg-background bg-clip-padding p-4 shadow-xs/5 sm:p-5 before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-xl)-1px)] before:shadow-[0_1px_var(--bevel)] dark:before:shadow-[0_-1px_var(--bevel)]",
         className,
       )}
       data-slot="frame-panel"
@@ -40,7 +40,7 @@ export function FrameHeader({
 }: React.ComponentProps<"header">): React.ReactElement {
   return (
     <header
-      className={cn("flex flex-col px-5 py-4", className)}
+      className={cn("flex flex-col px-4 py-4 sm:px-5", className)}
       data-slot="frame-panel-header"
       {...props}
     />
@@ -79,7 +79,7 @@ export function FrameFooter({
 }: React.ComponentProps<"footer">): React.ReactElement {
   return (
     <footer
-      className={cn("px-5 py-4", className)}
+      className={cn("px-4 py-4 sm:px-5", className)}
       data-slot="frame-panel-footer"
       {...props}
     />

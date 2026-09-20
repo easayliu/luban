@@ -110,7 +110,7 @@ export function ProxyPoolSettingsContent() {
         )}
       >
         <Form
-          className="flex flex-wrap items-end gap-2 p-4"
+          className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5"
           onSubmit={(event) => {
             event.preventDefault()
             if (addLabel.trim() && addUrl.trim() && !create.isPending) create.mutate()
@@ -156,7 +156,7 @@ export function ProxyPoolSettingsContent() {
         {proxies.length > 0 && <Separator />}
 
         {proxies.length === 0 ? (
-          <p className="p-4 text-center text-sm text-muted-foreground">
+          <p className="px-4 py-4 text-center sm:px-5 text-sm text-muted-foreground">
             {t('代理池为空，添加第一条代理地址吧。', 'The pool is empty. Add your first proxy address.')}
           </p>
         ) : (
@@ -209,7 +209,7 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
 
   if (editing) {
     return (
-      <li className="flex flex-wrap items-end gap-2 p-4">
+      <li className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5">
         <div className="min-w-0 flex-1 space-y-1">
           <label className="text-xs font-medium" htmlFor={`proxy-edit-label-${proxy.id}`}>
             {t('名称', 'Name')}
@@ -262,7 +262,7 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
   }
 
   return (
-    <li className="space-y-2 p-4">
+    <li className="space-y-2 px-4 py-4 sm:px-5">
       <div className="flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">

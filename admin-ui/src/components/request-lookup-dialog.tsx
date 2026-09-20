@@ -110,7 +110,7 @@ export function RequestLookupDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-3xl">
+      <DialogPopup size="lg">
         <DialogHeader>
           <DialogTitle>{filter ? t('请求明细', 'Request details') : t('请求查询', 'Request lookup')}</DialogTitle>
           <DialogDescription>

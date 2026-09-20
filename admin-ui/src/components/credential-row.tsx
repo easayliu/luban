@@ -23,6 +23,7 @@ import {
   DeleteCredentialDialog,
   deviceUsageMeta,
   evaluateCredential,
+  METER_FILL,
   proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
@@ -261,7 +262,7 @@ export const CredentialRow = memo(function CredentialRow({
     <>
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
         <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
-          <article className="min-w-0 space-y-3 p-3 sm:space-y-4 sm:p-5">
+          <article className="min-w-0 space-y-3 px-4 py-3 sm:space-y-4 sm:px-5 sm:py-5">
             <div className="flex items-start gap-3">
               {selectable && (
                 <Checkbox
@@ -712,7 +713,7 @@ function RenameCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="sm:max-w-md" showCloseButton={false}>
+      <DialogPopup>
         <Form
           className="contents"
           onSubmit={(event) => {
@@ -929,14 +930,6 @@ function ListQuotaMeter({
 
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
-  // 常态 marine、吃紧琥珀、打满红，与卡片上的 QuotaMeter 同一口径（改动理由见那边的注）：
-  // 同一条计量条在两个视图里必须是同一种颜色。
-  const indicatorClass = level === 'critical'
-    ? 'bg-destructive'
-    : level === 'warning'
-      ? 'bg-warning'
-      : 'bg-marine'
-
   const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
   if (!showLabel) {
     // 表格那格 11rem（内容宽 156px）里要排四样东西，按「谁跟谁是一件事」分两行，而不是按大小塞：
@@ -957,7 +950,7 @@ function ListQuotaMeter({
         </div>
         <div className="flex items-center gap-2">
           <MeterTrack className="min-w-0 flex-1">
-            <MeterIndicator className={indicatorClass} />
+            <MeterIndicator className={METER_FILL[level]} />
           </MeterTrack>
           <QuotaCountdown reset={reset} now={now} />
         </div>
@@ -973,7 +966,7 @@ function ListQuotaMeter({
         <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
       </div>
       <MeterTrack>
-        <MeterIndicator className={indicatorClass} />
+        <MeterIndicator className={METER_FILL[level]} />
       </MeterTrack>
       <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
     </Meter>
@@ -1154,11 +1147,6 @@ function SlotMeterRow({
       : usage.level === 'empty'
         ? 'text-muted-foreground'
         : 'text-foreground'
-  const barClass = usage.level === 'critical'
-    ? 'bg-destructive'
-    : usage.level === 'warning'
-      ? 'bg-warning'
-      : 'bg-success'
   return (
     <button
       type="button"
@@ -1174,7 +1162,7 @@ function SlotMeterRow({
       </span>
       {limit > 0 && (
         <span className="col-start-3 block h-1 w-full min-w-0 overflow-hidden rounded-full bg-muted" aria-hidden>
-          <span className={cn('block h-full rounded-full', barClass)} style={{ width: `${pct}%` }} />
+          <span className={cn('block h-full rounded-full', METER_FILL[usage.level])} style={{ width: `${pct}%` }} />
         </span>
       )}
     </button>

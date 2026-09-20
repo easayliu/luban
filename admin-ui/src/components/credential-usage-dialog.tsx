@@ -165,8 +165,8 @@ export function CredentialUsageDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogPopup className="max-w-6xl" initialFocus={titleRef}>
-        <DialogHeader className="border-b bg-muted/32 p-4 sm:p-5">
+      <DialogPopup size="full" initialFocus={titleRef}>
+        <DialogHeader variant="panel">
           <div className="flex items-center gap-3 pr-8">
             <Avatar>
               <AvatarFallback><ScrollTextIcon /></AvatarFallback>
@@ -186,8 +186,8 @@ export function CredentialUsageDialog({
           </div>
         </DialogHeader>
 
-        <DialogPanel className="space-y-3 p-4 pt-3 sm:p-5 sm:pt-3">
-          <section className="grid gap-2 rounded-xl border bg-muted/32 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-5 sm:px-4">
+        <DialogPanel className="space-y-3">
+          <section className="grid gap-2 rounded-xl border bg-muted/32 px-4 py-3 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-5">
             <div className="flex items-baseline justify-between gap-4 sm:block">
               <p className="text-2xs font-medium text-muted-foreground">
                 {t('近 30 天明细花费', 'Request cost, last 30 days')}
@@ -271,7 +271,10 @@ export function CredentialUsageDialog({
                     `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
                   )}
                 </p>
-                <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+                {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
+                  放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
+                  sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
+                <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
                   <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
                   <Select
                     items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
@@ -331,7 +334,7 @@ export function CredentialUsageDialog({
           )}
         </DialogPanel>
 
-        <DialogFooter className="px-4 py-3 sm:px-5">
+        <DialogFooter>
           <Button
             type="button"
             variant="outline"
@@ -393,7 +396,7 @@ function UsageCards({
             : log.device_id.slice(0, 8)
           : '—'
         return (
-          <li key={log.id} className="rounded-lg border bg-card px-3 py-2.5 text-xs">
+          <li key={log.id} className="rounded-lg border bg-card px-4 py-2.5 text-xs">
             <div className="flex min-w-0 items-center gap-2">
               <span className="shrink-0 font-medium tabular-nums" title={formatFullTime(log.ts, language)}>
                 {logTime(log.ts)}

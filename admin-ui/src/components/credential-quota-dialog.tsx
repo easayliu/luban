@@ -160,7 +160,7 @@ export function CredentialQuotaDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-lg">
+      <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('提前停调度阈值', 'Early pause threshold')}</DialogTitle>
           <DialogDescription className="mt-1 truncate" title={credentialLabel}>

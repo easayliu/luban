@@ -334,15 +334,16 @@ export interface CredentialWorkspaceProps {
 function WorkspaceToolbarSkeleton() {
   return (
     <div
-      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end"
+      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center"
       aria-hidden="true"
     >
-      <Skeleton className="col-span-2 h-9 sm:h-8 sm:min-w-56 sm:flex-1 xl:max-w-64" />
-      <div className="grid min-w-0 grid-cols-2 gap-1 sm:flex">
+      <Skeleton className="h-9 max-sm:col-start-1 max-sm:row-start-1 sm:h-8 sm:min-w-56 sm:flex-1" />
+      <div className="grid min-w-0 grid-cols-3 gap-1 max-sm:col-span-2 max-sm:row-start-2 sm:flex">
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-24" />
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
+        <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
       </div>
-      <Skeleton className="h-9 w-[4.5rem] justify-self-end sm:ml-auto sm:h-8 sm:w-16 xl:ml-0" />
+      <Skeleton className="h-9 w-[4.5rem] justify-self-end max-sm:col-start-2 max-sm:row-start-1 sm:ml-auto sm:h-8 sm:w-16" />
     </div>
   )
 }
@@ -725,412 +726,443 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
   return (
     <div className="space-y-3 sm:space-y-4" data-slot="credential-workspace">
-      <section
-        className="overflow-hidden rounded-xl border bg-card shadow-xs/5"
-        aria-labelledby="page-title"
-      >
-        <div
-          className={cn(
-            'grid gap-3 p-3 sm:p-4',
-            (isLoading || count > 0) && 'xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center',
+      {/* 页面头：标题 + 两枚读数徽章在左，数据新鲜度 + 主动作在右。
+          裸在页面底色上、不套卡片——与设置页那个 `<h1>系统设置</h1>` 同一种读法，也是
+          Cloudflare 的页面头形态。原来这里是「标题 + 徽章 + 刷新 + 搜索 + 三枚筛选 +
+          视图切换 + 添加账号」九组控件挤一行（xl 下还靠 grid 把标题和工具条硬塞进同一行），
+          现在按职责拆成三段：页面头、工具条、指标卡。 */}
+      {/* 页面头。手机上排成两行的显式网格：
+              第一行 [账号池 ················][+ 添加账号]
+              第二行 [3 个账号][0/15 台设备][● 30 秒刷新]
+          标题与主动作同一行是页面头的固定契约（Cloudflare 每个页面头都是这个形状），
+          徽章与数据新鲜度整体落到第二行，读成标题底下的一条元信息。
+          原来是「标题 + 两枚徽章」一簇、「刷新 + 主动作」一簇，两簇各自 flex-wrap——
+          手机上换行后第二行是「刷新 ……一大片空白…… 添加账号」，中间那段空得莫名其妙。
+
+          ≥640px 退回一行：`sm:flex` + 徽章组 `sm:mr-auto`，标题与徽章挨在左边、主动作贴右。 */}
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 sm:mb-1 sm:flex sm:flex-wrap sm:gap-x-2.5">
+        <h1 id="page-title" className="min-w-0 text-xl font-semibold tracking-tight max-sm:col-start-1 max-sm:row-start-1 sm:text-2xl">
+          {t('账号池', 'Account pool')}
+        </h1>
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5 max-sm:col-span-2 max-sm:row-start-2 sm:mr-auto">
+          {!isLoading && (
+            <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
+              {t(
+                `${formatNumber(count)} 个账号`,
+                `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
+              )}
+            </span>
           )}
-        >
-          <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 xl:justify-start">
-            <div className="flex min-w-0 items-center gap-2.5">
-              <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight">
-                {t('账号池', 'Account pool')}
-              </h1>
-              {!isLoading && (
-                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
-                  {t(
-                    `${formatNumber(count)} 个账号`,
-                    `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
-                  )}
+          {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
+              是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
+          {!isLoading && count > 0 && (
+            <Tooltip>
+              <TooltipTrigger
+                render={<button type="button" />}
+                className={cn(
+                  // 这枚是**控件**（点下去筛列表），所以长得像个小号 outline 按钮：白底 + 边框 +
+                  // hover 变底色。旁边那枚「N 个账号」是纯展示的 `bg-muted` 标签，没有边框。
+                  // 原来两枚逐字同样式，谁点得动全靠猜——选中态那条竖条只在点过之后才出现，
+                  // 没法在点之前给提示。
+                  'inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs font-medium text-muted-foreground shadow-xs/5 transition-colors',
+                  'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
+                  // 选中态与概览格同一套记号：淡底 + 一条左侧竖条。
+                  (filter === 'deviceFull' || filter === 'hasDevice')
+                    && 'bg-marine/10 text-foreground shadow-[inset_2px_0_0_0_var(--marine)]',
+                  fullDeviceCount > 0 && 'text-warning-foreground',
+                )}
+                aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
+                onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+              >
+                <SmartphoneIcon className="size-3" aria-hidden />
+                <span className="tnum">
+                  {metrics.deviceCapacity > 0 && metrics.unlimitedDeviceAccounts === 0
+                    ? `${formatNumber(metrics.deviceCount)}/${formatNumber(metrics.deviceCapacity)}`
+                    : formatNumber(metrics.deviceCount)}
                 </span>
-              )}
-              {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
-                  是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
-              {!isLoading && count > 0 && (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={<button type="button" />}
-                    className={cn(
-                      'inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground transition-colors',
-                      'hover:bg-muted/72 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
-                      // 选中态与概览格同一套记号：淡底 + 一条左侧竖条。旁边那枚「N 个账号」是纯展示，
-                      // 两枚长得一样就看不出哪个点得动——竖条只会出现在可点且已选中的这一枚上。
-                      (filter === 'deviceFull' || filter === 'hasDevice')
-                        && 'bg-marine/10 text-foreground shadow-[inset_2px_0_0_0_var(--marine)]',
-                      fullDeviceCount > 0 && 'text-warning-foreground',
-                    )}
-                    aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
-                    onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
-                  >
-                    <SmartphoneIcon className="size-3" aria-hidden />
-                    <span className="tnum">
-                      {metrics.deviceCapacity > 0 && metrics.unlimitedDeviceAccounts === 0
-                        ? `${formatNumber(metrics.deviceCount)}/${formatNumber(metrics.deviceCapacity)}`
-                        : formatNumber(metrics.deviceCount)}
-                    </span>
-                    <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
-                  </TooltipTrigger>
-                  {/* 原来挂在原生 `title` 上：手机上完全出不来，而这句写的正是「这个数是怎么算的、
-                      点下去会筛出什么」。这是概览这一片最后一处原生 title。 */}
-                  <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                    {deviceStatus}
-                  </TooltipPopup>
-                </Tooltip>
-              )}
-            </div>
-            <div
-              className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
-              aria-live="polite"
-              aria-atomic="true"
+                <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
+              </TooltipTrigger>
+              {/* 原来挂在原生 `title` 上：手机上完全出不来，而这句写的正是「这个数是怎么算的、
+                  点下去会筛出什么」。这是概览这一片最后一处原生 title。 */}
+              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                {deviceStatus}
+              </TooltipPopup>
+            </Tooltip>
+          )}
+        <div
+          className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {isRefetchError ? (
+            <>
+              <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
+              <button
+                type="button"
+                className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                onClick={actions.onRetry}
+              >
+                {t('刷新失败，重试', 'Refresh failed. Retry')}
+              </button>
+            </>
+          ) : (
+            // 自动刷新指示器同时是手动刷新入口：等下一轮 30 秒才能确认操作结果，
+            // 是这类常驻列表最常见的抱怨，而这块本来就在讲「数据有多新」。
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
+              onClick={actions.onRetry}
+              disabled={isLoading || isFetching}
+              title={isLoading
+                ? t('正在加载账号数据', 'Loading account data')
+                : t('每 30 秒自动刷新，点击立即刷新', 'Refreshes automatically every 30 seconds. Click to refresh now')}
+              aria-label={t('立即刷新账号数据', 'Refresh account data now')}
             >
-              {isRefetchError ? (
-                <>
-                  <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
-                  <button
-                    type="button"
-                    className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-                    onClick={actions.onRetry}
-                  >
-                    {t('刷新失败，重试', 'Refresh failed. Retry')}
-                  </button>
-                </>
-              ) : (
-                // 自动刷新指示器同时是手动刷新入口：等下一轮 30 秒才能确认操作结果，
-                // 是这类常驻列表最常见的抱怨，而这块本来就在讲「数据有多新」。
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
-                  onClick={actions.onRetry}
-                  disabled={isLoading || isFetching}
-                  title={isLoading
-                    ? t('正在加载账号数据', 'Loading account data')
-                    : t('每 30 秒自动刷新，点击立即刷新', 'Refreshes automatically every 30 seconds. Click to refresh now')}
-                  aria-label={t('立即刷新账号数据', 'Refresh account data now')}
-                >
-                  <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
-                    {isLoading || isFetching ? (
-                      <RefreshCwIcon className="size-3.5 animate-spin" />
-                    ) : (
-                      <span className="size-1.5 rounded-full bg-success" />
-                    )}
-                  </span>
-                  <span className="min-w-14 text-left">
-                    {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
-                  </span>
-                </button>
-              )}
-            </div>
-          </div>
-
-          {isLoading ? (
-            <WorkspaceToolbarSkeleton />
-          ) : count > 0 && (
-            <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
-              <InputGroup className="col-span-2 sm:min-w-56 sm:flex-1 xl:max-w-64">
-                <InputGroupAddon><SearchIcon /></InputGroupAddon>
-                <InputGroupInput
-                  ref={searchRef}
-                  value={query}
-                  onChange={(event) => changeQuery(event.target.value)}
-                  onKeyDown={(event) => {
-                    // Esc 先清空、再退出输入框：清空和失焦是两个不同的意图，一次按键只做一件。
-                    if (event.key !== 'Escape') return
-                    event.preventDefault()
-                    if (query) changeQuery('')
-                    else event.currentTarget.blur()
-                  }}
-                  placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
-                  aria-label={t('搜索账号', 'Search accounts')}
-                />
-                <InputGroupAddon align="inline-end">
-                  {query ? (
-                    <Button
-                      size="icon-xs"
-                      variant="ghost"
-                      onClick={() => changeQuery('')}
-                      aria-label={t('清除搜索', 'Clear search')}
-                    >
-                      <XIcon />
-                    </Button>
-                  ) : (
-                    // 只在指针设备上提示：触屏没有物理按键，画个 kbd 只是噪声。
-                    <kbd
-                      className="pointer-events-none hidden rounded border bg-muted px-1 font-sans text-2xs text-muted-foreground pointer-fine:inline-block"
-                      aria-hidden
-                    >
-                      /
-                    </kbd>
-                  )}
-                </InputGroupAddon>
-              </InputGroup>
-
-              <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
-              <ToolbarGroup className="grid min-w-0 grid-cols-2 sm:flex sm:flex-wrap">
-                <Menu>
-                  <MenuTrigger
-                    aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
-                    className={cn(
-                      buttonVariants({ variant: 'outline' }),
-                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                      filter !== 'all' && ACTIVE_FILTER_CLASS,
-                    )}
-                  >
-                    <ListFilterIcon />
-                    <span className="min-w-0 truncate">
-                      {activeFilterLabel}
-                    </span>
-                  </MenuTrigger>
-                  <MenuPopup align="end" className="w-52">
-                    <MenuRadioGroup value={filter}>
-                      {filterItems.map((item) => (
-                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
-                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                            <span>{item.label}</span>
-                            <span className="tnum text-xs text-muted-foreground">
-                              {formatNumber(metrics.filterCounts[item.key])}
-                            </span>
-                          </span>
-                        </MenuRadioItem>
-                      ))}
-                    </MenuRadioGroup>
-                  </MenuPopup>
-                </Menu>
-
-                <Menu>
-                  <MenuTrigger
-                    aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
-                    className={cn(
-                      buttonVariants({ variant: 'outline' }),
-                      'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                      tier !== 'all' && ACTIVE_FILTER_CLASS,
-                    )}
-                  >
-                    <LayersIcon />
-                    <span className="min-w-0 truncate">
-                      {activeTierLabel}
-                    </span>
-                  </MenuTrigger>
-                  <MenuPopup align="end" className="w-52">
-                    <MenuRadioGroup value={tier}>
-                      {tierItems.map((item) => (
-                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeTier(item.key)}>
-                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                            <span className="min-w-0 truncate">{item.label}</span>
-                            <span className="tnum text-xs text-muted-foreground">
-                              {formatNumber(metrics.tierCounts[item.key])}
-                            </span>
-                          </span>
-                        </MenuRadioItem>
-                      ))}
-                    </MenuRadioGroup>
-                  </MenuPopup>
-                </Menu>
-
-                <Menu>
-                  <MenuTrigger
-                    aria-label={t(
-                      `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
-                      `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
-                    )}
-                    className={cn(
-                      buttonVariants({ variant: 'outline' }),
-                      'w-full min-w-0 justify-between max-sm:col-span-2 max-sm:[&_svg]:hidden sm:w-auto',
-                    )}
-                  >
-                    <ArrowUpDownIcon />
-                    <span className="min-w-0 truncate max-[22rem]:hidden">
-                      {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
-                    </span>
-                    <span className="hidden shrink-0 max-[22rem]:inline">
-                      {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
-                    </span>
-                  </MenuTrigger>
-                  <MenuPopup align="end" className="w-48">
-                    <MenuRadioGroup value={sort}>
-                      {sortItems.map((item) => (
-                        <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
-                          <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                            <span>{item.label}</span>
-                            {sort === item.key && (
-                              <span className="text-xs text-muted-foreground">
-                                {dir === 'asc'
-                                  ? t('升序', 'Ascending')
-                                  : t('降序', 'Descending')}
-                              </span>
-                            )}
-                          </span>
-                        </MenuRadioItem>
-                      ))}
-                    </MenuRadioGroup>
-                  </MenuPopup>
-                </Menu>
-              </ToolbarGroup>
-
-              <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block xl:ml-0" />
-              <ToolbarGroup className="self-center justify-end">
-                <ToggleGroup
-                  value={[view]}
-                  onValueChange={(values) => {
-                    const next = values[values.length - 1]
-                    if (next === 'card' || next === 'list') actions.onViewChange(next)
-                  }}
-                  variant="outline"
-                  aria-label={t('账号视图', 'Account view')}
-                >
-                  <ToggleGroupItem
-                    value="card"
-                    aria-label={t('卡片视图', 'Card view')}
-                    title={t('卡片视图', 'Card view')}
-                  >
-                    <LayoutGridIcon />
-                  </ToggleGroupItem>
-                  <ToggleGroupSeparator />
-                  <ToggleGroupItem
-                    value="list"
-                    aria-label={t('列表视图', 'List view')}
-                    title={t('列表视图', 'List view')}
-                  >
-                    <ListIcon />
-                  </ToggleGroupItem>
-                </ToggleGroup>
-              </ToolbarGroup>
-            </Toolbar>
+              <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
+                {isLoading || isFetching ? (
+                  <RefreshCwIcon className="size-3.5 animate-spin" />
+                ) : (
+                  <span className="size-1.5 rounded-full bg-success" />
+                )}
+              </span>
+              <span className="min-w-14 text-left">
+                {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
+              </span>
+            </button>
           )}
         </div>
+        </div>
+        <Button className="max-sm:col-start-2 max-sm:row-start-1" onClick={actions.onAdd}>
+          <PlusIcon />
+          <span>{t('添加账号', 'Add account')}</span>
+        </Button>
+      </div>
 
-        {isLoading ? (
-          <section
-            aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-6"
-          >
-            <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
-            <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-            <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
-            <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-            <OverviewMetricSkeleton className="border-r" />
-            <OverviewMetricSkeleton />
-          </section>
-        ) : count > 0 && (
-          <section
-            aria-label={t('账号池概览', 'Account pool overview')}
-            className="grid grid-cols-2 border-t lg:grid-cols-6"
-          >
-            {/* 手机上齐整的 2 列 × 3 行，lg 起一字排开六格。
-                原来末两格各带 `col-span-2` 独占一整行——「首字时延 — 暂无数据」右半边整片空着，
-                六格铺成五行，把账号列表一路顶下去。半格宽度对这两格是够的：手机上去掉 32px 图标方块后
-                正文有 155px，「0 RPM · 0 在途」与「— 暂无数据」都装得下，见 overview-metric 里的注。 */}
-            <OverviewMetric
-              className="border-r border-b lg:border-b-0"
-              label={t('可调度账号', 'Schedulable accounts')}
-              value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
-              status={schedulableCount < count
-                ? t(
-                    `${formatNumber(count - schedulableCount)} 暂不可用`,
-                    `${formatNumber(count - schedulableCount)} unavailable`,
-                  )
-                : t(
-                    `${formatNumber(enabledCount)} 已启用`,
-                    `${formatNumber(enabledCount)} enabled`,
-                  )}
-              icon={ShieldCheckIcon}
-              tone={schedulableCount > 0 ? 'ok' : 'bad'}
-              active={filter === 'schedulable'}
-              onClick={() => selectMetric('schedulable')}
+      {/* 工具条：搜索与筛选在左，视图切换在右。同样是裸行，紧挨着它所筛选的那份列表。
+
+          手机上是两行的显式网格，不靠自动排布：
+            第一行 [搜索 ....................][视图切换]
+            第二行 [全部][全部套餐][添加时间]  三等分、撑满
+          原来搜索独占一整行、三枚筛选挤在左半边的两列里（第三枚横跨半屏、右边空着），
+          视图切换被挤到第二行右侧悬在半空。DOM 顺序是搜索→筛选→切换，自动排布排不出
+          这个形状，所以三者的行列都显式钉住。 */}
+      {isLoading ? (
+        <WorkspaceToolbarSkeleton />
+      ) : count > 0 && (
+        <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
+          {/* 搜索框吃掉整行的剩余宽度（`sm:flex-1` 不封顶）。这是 Cloudflare 工具条的形状：
+              一个铺满的搜索框把筛选器顶到右端，整行没有死区。之前给它加过 `sm:max-w-80`，
+              那是它还和标题挤在同一行时留的，拆成独立一行后那个封顶就成了右边那片空白的来源。 */}
+          <InputGroup className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1">
+            <InputGroupAddon><SearchIcon /></InputGroupAddon>
+            <InputGroupInput
+              ref={searchRef}
+              value={query}
+              onChange={(event) => changeQuery(event.target.value)}
+              onKeyDown={(event) => {
+                // Esc 先清空、再退出输入框：清空和失焦是两个不同的意图，一次按键只做一件。
+                if (event.key !== 'Escape') return
+                event.preventDefault()
+                if (query) changeQuery('')
+                else event.currentTarget.blur()
+              }}
+              placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
+              aria-label={t('搜索账号', 'Search accounts')}
             />
-            <OverviewMetric
-              className="border-b lg:border-r lg:border-b-0"
-              label={t('需处理', 'Needs attention')}
-              value={formatNumber(attentionCount)}
-              status={attentionStatus}
-              statusHint={rejectionsHint}
-              icon={TriangleAlertIcon}
-              tone={bannedCount > 0 || metrics.activeOverageCount > 0
-                ? 'bad'
-                : attentionCount > 0 || rejectedTotal > 0
-                  ? 'warn'
-                  : 'neutral'}
-              active={filter === 'attention'}
-              onClick={() => selectMetric('attention')}
-            />
-            <OverviewMetric
-              className="border-r border-b lg:border-b-0"
-              label={t('用量风险', 'Usage risk')}
-              value={formatNumber(quotaRiskCount)}
-              status={quotaRiskStatus}
-              icon={RadioIcon}
-              tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
-              active={filter === 'nearLimit'}
-              onClick={() => selectMetric('nearLimit')}
-            />
-            {/* 缓存命中率与首字时延不来自账号列表，点开是趋势而不是筛选——它们讲的是「转发出去的
-                请求质量如何」。摆在实时流量左边：三格都是流量的属性，凑在一起读。 */}
-            <OverviewMetric
-              className="border-b lg:border-r lg:border-b-0"
-              label={cacheNow
-                ? t(`缓存命中率 · ${cacheNow.label[0]}`, `Cache hit rate · ${cacheNow.label[1]}`)
-                : t('缓存命中率', 'Cache hit rate')}
-              value={formatPercent(cacheRate)}
-              // 这一行只放数值与迷你线：一格的内容区约 206px，「数值 52 + 7d 小字 85 + 迷你线 80」
-              // 要 220px 以上，六格并排得到约 1620px 视口才装得下——小字一直被截成「7d 95.6% ↓…」、
-              // 迷你线被压成一条。7 天基线与相对变化搬进悬浮提示（以及点开的趋势图），小字只在
-              // 没用量时留一句说明。
-              trend={cacheRate == null ? undefined : <CacheHitSparkline slots={cacheSeries.slots} />}
-              status={cacheRate == null ? t('暂无用量', 'No usage yet') : undefined}
-              statusHint={cacheNow
-                ? t(
-                    `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}${cacheDeltaText}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
-                    `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}${cacheDeltaText}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
-                  )
-                : undefined}
-              icon={DatabaseZapIcon}
-              tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
-              opensDetail
-              onClick={() => setCacheTrendOpen(true)}
-            />
-            {/* 与缓存那格同一写法：这一行只放数值与迷你线，7 天基线、p95、吞吐都在悬浮提示里。 */}
-            <OverviewMetric
-              className="border-r"
-              label={ttftNow
-                ? t(`首字时延 p50 · ${ttftNow.label[0]}`, `TTFT p50 · ${ttftNow.label[1]}`)
-                : t('首字时延', 'TTFT')}
-              value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
-              trend={ttftNow == null ? undefined : <TtftSparkline slots={ttftSeries.slots} />}
-              status={ttftNow == null ? t('暂无数据', 'No data yet') : undefined}
-              statusHint={ttftNow
-                ? t(
-                    `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
-                    `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
-                  )
-                : undefined}
-              icon={TimerIcon}
-              tone={ttftTone}
-              opensDetail
-              onClick={() => setTtftTrendOpen(true)}
-            />
-            <LiveTrafficMetric
-              label={t('实时流量', 'Live traffic')}
-              value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
-              unit="RPM"
-              detail={metricsQuery.data
-                ? t(
-                    `${formatNumber(metricsQuery.data.in_flight)} 在途`,
-                    `${formatNumber(metricsQuery.data.in_flight)} in flight`,
-                  )
-                : t('读取中', 'Loading')}
-              live={(metricsQuery.data?.in_flight ?? 0) > 0}
-              hint={t(
-                `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及此刻已进入转发、响应还没走完的在途请求数。每 10 秒刷新。`,
-                `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
+            <InputGroupAddon align="inline-end">
+              {query ? (
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  onClick={() => changeQuery('')}
+                  aria-label={t('清除搜索', 'Clear search')}
+                >
+                  <XIcon />
+                </Button>
+              ) : (
+                // 只在指针设备上提示：触屏没有物理按键，画个 kbd 只是噪声。
+                <kbd
+                  className="pointer-events-none hidden rounded border bg-muted px-1 font-sans text-2xs text-muted-foreground pointer-fine:inline-block"
+                  aria-hidden
+                >
+                  /
+                </kbd>
               )}
-              icon={ActivityIcon}
-            />
-          </section>
-        )}
-      </section>
+            </InputGroupAddon>
+          </InputGroup>
+
+          <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
+          <ToolbarGroup className="grid min-w-0 grid-cols-3 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap">
+            <Menu>
+              <MenuTrigger
+                aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
+                className={cn(
+                  buttonVariants({ variant: 'outline' }),
+                  'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                  filter !== 'all' && ACTIVE_FILTER_CLASS,
+                )}
+              >
+                <ListFilterIcon />
+                <span className="min-w-0 truncate">
+                  {activeFilterLabel}
+                </span>
+              </MenuTrigger>
+              <MenuPopup align="end" className="w-52">
+                <MenuRadioGroup value={filter}>
+                  {filterItems.map((item) => (
+                    <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
+                      <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                        <span>{item.label}</span>
+                        <span className="tnum text-xs text-muted-foreground">
+                          {formatNumber(metrics.filterCounts[item.key])}
+                        </span>
+                      </span>
+                    </MenuRadioItem>
+                  ))}
+                </MenuRadioGroup>
+              </MenuPopup>
+            </Menu>
+
+            <Menu>
+              <MenuTrigger
+                aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
+                className={cn(
+                  buttonVariants({ variant: 'outline' }),
+                  'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                  tier !== 'all' && ACTIVE_FILTER_CLASS,
+                )}
+              >
+                <LayersIcon />
+                <span className="min-w-0 truncate">
+                  {activeTierLabel}
+                </span>
+              </MenuTrigger>
+              <MenuPopup align="end" className="w-52">
+                <MenuRadioGroup value={tier}>
+                  {tierItems.map((item) => (
+                    <MenuRadioItem key={item.key} value={item.key} onClick={() => changeTier(item.key)}>
+                      <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                        <span className="min-w-0 truncate">{item.label}</span>
+                        <span className="tnum text-xs text-muted-foreground">
+                          {formatNumber(metrics.tierCounts[item.key])}
+                        </span>
+                      </span>
+                    </MenuRadioItem>
+                  ))}
+                </MenuRadioGroup>
+              </MenuPopup>
+            </Menu>
+
+            <Menu>
+              <MenuTrigger
+                aria-label={t(
+                  `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
+                  `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
+                )}
+                className={cn(
+                  buttonVariants({ variant: 'outline' }),
+                  // 不要 `max-sm:col-span-2`：那是筛选组还是两列时给的（让排序独占一整行）。
+                  // 组改成三列后它会占掉 3 列中的 2 列、被挤到第二行，右边空一格——
+                  // 就是三枚筛选排成 2 + 1 的原因。三列下它和另外两枚一样，各占一格。
+                  'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                )}
+              >
+                <ArrowUpDownIcon />
+                <span className="min-w-0 truncate max-[22rem]:hidden">
+                  {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
+                </span>
+                <span className="hidden shrink-0 max-[22rem]:inline">
+                  {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
+                </span>
+              </MenuTrigger>
+              <MenuPopup align="end" className="w-48">
+                <MenuRadioGroup value={sort}>
+                  {sortItems.map((item) => (
+                    <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
+                      <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+                        <span>{item.label}</span>
+                        {sort === item.key && (
+                          <span className="text-xs text-muted-foreground">
+                            {dir === 'asc'
+                              ? t('升序', 'Ascending')
+                              : t('降序', 'Descending')}
+                          </span>
+                        )}
+                      </span>
+                    </MenuRadioItem>
+                  ))}
+                </MenuRadioGroup>
+              </MenuPopup>
+            </Menu>
+          </ToolbarGroup>
+
+          {/* `sm:ml-auto` 把视图切换推到整行最右端，与上一行「添加账号」的右边界、
+              以及下面指标卡与列表的右边界落在同一条竖线上。
+              原来这里还带着 `xl:ml-0`：那是配合旧版整条工具条 `xl:justify-end` 用的——
+              两者同时存在时 xl 以上由外层右推、内层就不该再推。拆成独立一行后
+              `xl:justify-end` 去掉了，这个抵消也必须跟着去掉，否则宽屏上整条挤在左边、
+              右边空出一大片。 */}
+          <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block" />
+          <ToolbarGroup className="self-center justify-end max-sm:col-start-2 max-sm:row-start-1">
+            <ToggleGroup
+              value={[view]}
+              onValueChange={(values) => {
+                const next = values[values.length - 1]
+                if (next === 'card' || next === 'list') actions.onViewChange(next)
+              }}
+              variant="outline"
+              aria-label={t('账号视图', 'Account view')}
+            >
+              <ToggleGroupItem
+                value="card"
+                aria-label={t('卡片视图', 'Card view')}
+                title={t('卡片视图', 'Card view')}
+              >
+                <LayoutGridIcon />
+              </ToggleGroupItem>
+              <ToggleGroupSeparator />
+              <ToggleGroupItem
+                value="list"
+                aria-label={t('列表视图', 'List view')}
+                title={t('列表视图', 'List view')}
+              >
+                <ListIcon />
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </ToolbarGroup>
+        </Toolbar>
+      )}
+
+      {/* 指标条独立成一张卡：它讲的是「池子现在什么状态」，和页面头、筛选器不是一件事，
+          原来三者共用一个盒子、靠 border-t 分隔。 */}
+      {isLoading ? (
+        <section
+          aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
+          className="grid grid-cols-2 overflow-hidden rounded-2xl border bg-card shadow-xs/5 lg:grid-cols-6"
+        >
+          <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
+          <OverviewMetricSkeleton className="border-r" />
+          <OverviewMetricSkeleton />
+        </section>
+      ) : count > 0 && (
+        <section
+          aria-label={t('账号池概览', 'Account pool overview')}
+          className="grid grid-cols-2 overflow-hidden rounded-2xl border bg-card shadow-xs/5 lg:grid-cols-6"
+        >
+          {/* 手机上齐整的 2 列 × 3 行，lg 起一字排开六格。
+              原来末两格各带 `col-span-2` 独占一整行——「首字时延 — 暂无数据」右半边整片空着，
+              六格铺成五行，把账号列表一路顶下去。半格宽度对这两格是够的：手机上去掉 32px 图标方块后
+              正文有 155px，「0 RPM · 0 在途」与「— 暂无数据」都装得下，见 overview-metric 里的注。 */}
+          <OverviewMetric
+            className="border-r border-b lg:border-b-0"
+            label={t('可调度账号', 'Schedulable accounts')}
+            value={`${formatNumber(schedulableCount)}/${formatNumber(count)}`}
+            status={schedulableCount < count
+              ? t(
+                  `${formatNumber(count - schedulableCount)} 暂不可用`,
+                  `${formatNumber(count - schedulableCount)} unavailable`,
+                )
+              : t(
+                  `${formatNumber(enabledCount)} 已启用`,
+                  `${formatNumber(enabledCount)} enabled`,
+                )}
+            icon={ShieldCheckIcon}
+            tone={schedulableCount > 0 ? 'ok' : 'bad'}
+            active={filter === 'schedulable'}
+            onClick={() => selectMetric('schedulable')}
+          />
+          <OverviewMetric
+            className="border-b lg:border-r lg:border-b-0"
+            label={t('需处理', 'Needs attention')}
+            value={formatNumber(attentionCount)}
+            status={attentionStatus}
+            statusHint={rejectionsHint}
+            icon={TriangleAlertIcon}
+            tone={bannedCount > 0 || metrics.activeOverageCount > 0
+              ? 'bad'
+              : attentionCount > 0 || rejectedTotal > 0
+                ? 'warn'
+                : 'neutral'}
+            active={filter === 'attention'}
+            onClick={() => selectMetric('attention')}
+          />
+          <OverviewMetric
+            className="border-r border-b lg:border-b-0"
+            label={t('用量风险', 'Usage risk')}
+            value={formatNumber(quotaRiskCount)}
+            status={quotaRiskStatus}
+            icon={RadioIcon}
+            tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
+            active={filter === 'nearLimit'}
+            onClick={() => selectMetric('nearLimit')}
+          />
+          {/* 缓存命中率与首字时延不来自账号列表，点开是趋势而不是筛选——它们讲的是「转发出去的
+              请求质量如何」。摆在实时流量左边：三格都是流量的属性，凑在一起读。 */}
+          <OverviewMetric
+            className="border-b lg:border-r lg:border-b-0"
+            label={cacheNow
+              ? t(`缓存命中率 · ${cacheNow.label[0]}`, `Cache hit rate · ${cacheNow.label[1]}`)
+              : t('缓存命中率', 'Cache hit rate')}
+            value={formatPercent(cacheRate)}
+            // 这一行只放数值与迷你线：一格的内容区约 206px，「数值 52 + 7d 小字 85 + 迷你线 80」
+            // 要 220px 以上，六格并排得到约 1620px 视口才装得下——小字一直被截成「7d 95.6% ↓…」、
+            // 迷你线被压成一条。7 天基线与相对变化搬进悬浮提示（以及点开的趋势图），小字只在
+            // 没用量时留一句说明。
+            trend={cacheRate == null ? undefined : <CacheHitSparkline slots={cacheSeries.slots} />}
+            status={cacheRate == null ? t('暂无用量', 'No usage yet') : undefined}
+            statusHint={cacheNow
+              ? t(
+                  `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}${cacheDeltaText}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
+                  `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}${cacheDeltaText}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
+                )
+              : undefined}
+            icon={DatabaseZapIcon}
+            tone={cacheRate == null ? 'neutral' : cacheRate >= 0.5 ? 'ok' : 'warn'}
+            opensDetail
+            onClick={() => setCacheTrendOpen(true)}
+          />
+          {/* 与缓存那格同一写法：这一行只放数值与迷你线，7 天基线、p95、吞吐都在悬浮提示里。 */}
+          <OverviewMetric
+            className="border-r"
+            label={ttftNow
+              ? t(`首字时延 p50 · ${ttftNow.label[0]}`, `TTFT p50 · ${ttftNow.label[1]}`)
+              : t('首字时延', 'TTFT')}
+            value={formatMs(ttftNow ? ttftNow.p.p50_ms : null)}
+            trend={ttftNow == null ? undefined : <TtftSparkline slots={ttftSeries.slots} />}
+            status={ttftNow == null ? t('暂无数据', 'No data yet') : undefined}
+            statusHint={ttftNow
+              ? t(
+                  `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
+                  `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
+                )
+              : undefined}
+            icon={TimerIcon}
+            tone={ttftTone}
+            opensDetail
+            onClick={() => setTtftTrendOpen(true)}
+          />
+          <LiveTrafficMetric
+            label={t('实时流量', 'Live traffic')}
+            value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
+            unit="RPM"
+            detail={metricsQuery.data
+              ? t(
+                  `${formatNumber(metricsQuery.data.in_flight)} 在途`,
+                  `${formatNumber(metricsQuery.data.in_flight)} in flight`,
+                )
+              : t('读取中', 'Loading')}
+            live={(metricsQuery.data?.in_flight ?? 0) > 0}
+            hint={t(
+              `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及此刻已进入转发、响应还没走完的在途请求数。每 10 秒刷新。`,
+              `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
+            )}
+            icon={ActivityIcon}
+          />
+        </section>
+      )}
 
       <section className="min-w-0" aria-labelledby="account-list-title">
         <h2 id="account-list-title" className="sr-only">{t('账号列表', 'Account list')}</h2>
@@ -1363,7 +1395,10 @@ function AccountPagination({
           </PaginationItem>
         </PaginationContent>
       </CossPagination>
-      <div className="row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
+      {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
+        放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
+        sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
+      <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
         <span className="max-sm:sr-only">{t('每页', 'Per page')}</span>
         <Select
           items={pageSizeItems}

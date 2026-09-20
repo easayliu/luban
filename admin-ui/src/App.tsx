@@ -1,8 +1,6 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  EllipsisVerticalIcon, LogOutIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon,
-} from 'lucide-react'
+import { SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getSettings } from '@/api/settings'
@@ -32,12 +30,10 @@ import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { AppFooter } from '@/components/app-footer'
-import { LanguageSwitcher } from '@/components/language-switcher'
-import { ThemeSwitcher } from '@/components/theme-switcher'
-import { LogoMark } from '@/components/logo-mark'
-import { Button, buttonVariants } from '@/components/ui/button'
+import { AppHeader, Breadcrumb, PreferencesMenu, scrollToTop } from '@/components/app-header'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
+import { MenuItem } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
 
 // 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
@@ -52,32 +48,15 @@ function SettingsPageFallback({ onBack }: { onBack: () => void }) {
   const { t } = useI18n()
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <header className="app-header sticky top-0 z-20 border-b bg-background">
-        <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
-          <Button
-            aria-label={t('返回账号页', 'Back to accounts')}
-            className="-ml-2 h-auto min-w-0 justify-start gap-2.5 px-2 py-1.5 sm:gap-3"
-            variant="ghost"
-            onClick={onBack}
-          >
-            <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-              <LogoMark className="size-[1.125rem]" />
-            </span>
-            <span className="min-w-0 text-left">
-              <span className="block text-sm font-semibold leading-none tracking-tight">Luban</span>
-              <span className="mt-1 hidden whitespace-nowrap text-xs font-normal text-muted-foreground sm:block">
-                Claude Code Gateway
-              </span>
-            </span>
-          </Button>
-          <div className="flex items-center gap-2">
-            <LanguageSwitcher compact />
-            <ThemeSwitcher compact />
-          </div>
-        </div>
-      </header>
+      <AppHeader actions={<PreferencesMenu />} onNavigateHome={onBack} />
       <main aria-busy="true" className="page-frame flex-1 py-5 sm:py-8">
-        <div className="max-w-2xl">
+        {/* 与真设置页同构：面包屑也在骨架里占住位置，chunk 到达时标题不上下跳。 */}
+        <Breadcrumb
+          current={t('系统设置', 'System settings')}
+          parent={t('账号池', 'Account pool')}
+          onNavigateParent={onBack}
+        />
+        <div className="mt-5 max-w-2xl">
           <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
             {t('系统设置', 'System settings')}
           </h1>
@@ -306,115 +285,42 @@ function App() {
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <header className="app-header sticky top-0 z-20 border-b bg-background">
-        <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
-          <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <div className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-              <LogoMark className="size-[1.125rem]" />
-            </div>
-            <div className="min-w-0">
-              <div className="text-sm font-semibold leading-none tracking-tight">Luban</div>
-              <div className="mt-1 hidden whitespace-nowrap text-xs text-muted-foreground sm:block">Claude Code Gateway</div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 sm:hidden">
+      <AppHeader
+        homeLabel={t('回到顶部', 'Back to top')}
+        onNavigateHome={scrollToTop}
+        actions={
+          <>
+            {/* 顶栏只留这一枚主动作（相当于 Cloudflare 顶栏里的全局搜索），其余全部收进菜单。
+                「添加账号」不在这儿了——它是页面级动作，挪到了下面「账号池」标题那一行。 */}
             <Button
-              size="icon-lg"
-              disabled={isBootstrapping}
-              onClick={() => setAdding(true)}
-              aria-label={t('添加账号', 'Add account')}
-            >
-              <PlusIcon />
-            </Button>
-            <LanguageSwitcher compact />
-            <ThemeSwitcher compact />
-            <Menu>
-              <MenuTrigger
-                className={buttonVariants({ size: 'icon-lg', variant: 'outline' })}
-                disabled={isBootstrapping}
-                aria-label={t('更多操作', 'More actions')}
-              >
-                <EllipsisVerticalIcon />
-              </MenuTrigger>
-              <MenuPopup align="end" className="w-44">
-                <MenuItem onClick={() => setLookupOpen(true)}>
-                  <SearchIcon />{t('请求查询', 'Request lookup')}
-                </MenuItem>
-                <MenuItem onClick={() => setBansOpen(true)}>
-                  <ShieldAlertIcon />{t('封号记录', 'Ban events')}
-                </MenuItem>
-                <MenuItem onClick={() => openSettings('access')}>
-                  <SettingsIcon />{t('系统设置', 'System settings')}
-                </MenuItem>
-                {authState?.configured && pw && (
-                  <>
-                    <MenuSeparator />
-                    <MenuItem variant="destructive" onClick={() => { clearPw(); setPwState(null) }}>
-                      <LogOutIcon />{t('退出登录', 'Sign out')}
-                    </MenuItem>
-                  </>
-                )}
-              </MenuPopup>
-            </Menu>
-          </div>
-          <div className="hidden items-center gap-2 sm:flex">
-            <LanguageSwitcher />
-            <ThemeSwitcher />
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={isBootstrapping}
-              onClick={() => setLookupOpen(true)}
-              title={t('按请求 ID 查流水', 'Look up a request by ID')}
               aria-label={t('请求查询', 'Request lookup')}
+              className="max-sm:size-10 max-sm:px-0"
+              disabled={isBootstrapping}
+              size="sm"
+              title={t('按请求 ID 查流水', 'Look up a request by ID')}
+              variant="outline"
+              onClick={() => setLookupOpen(true)}
             >
               <SearchIcon />
-              <span>{t('请求查询', 'Lookup')}</span>
+              <span className="max-sm:sr-only">{t('请求查询', 'Lookup')}</span>
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={isBootstrapping}
-              onClick={() => setBansOpen(true)}
-              title={t('查看自动封停记录与封前流水', 'Review auto-disable events and the traffic before them')}
-              aria-label={t('封号记录', 'Ban events')}
+            <PreferencesMenu
+              onSignOut={
+                authState?.configured && pw
+                  ? () => { clearPw(); setPwState(null) }
+                  : undefined
+              }
             >
-              <ShieldAlertIcon />
-              <span>{t('封号记录', 'Bans')}</span>
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={isBootstrapping}
-              onClick={() => openSettings('access')}
-              title={t('系统设置', 'System settings')}
-              aria-label={t('系统设置', 'System settings')}
-            >
-              <SettingsIcon />
-              <span>{t('系统设置', 'Settings')}</span>
-            </Button>
-            <Button
-              size="sm"
-              disabled={isBootstrapping}
-              onClick={() => setAdding(true)}
-              aria-label={t('添加账号', 'Add account')}
-            >
-              <PlusIcon />
-              <span>{t('添加账号', 'Add account')}</span>
-            </Button>
-            {authState?.configured && pw && (
-              <Button
-                size="sm"
-                variant="ghost"
-                title={t('退出登录', 'Sign out')}
-                aria-label={t('退出登录', 'Sign out')}
-                onClick={() => { clearPw(); setPwState(null) }}>
-                <LogOutIcon />
-              </Button>
-            )}
-          </div>
-        </div>
-      </header>
+              <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
+                <ShieldAlertIcon />{t('封号记录', 'Ban events')}
+              </MenuItem>
+              <MenuItem disabled={isBootstrapping} onClick={() => openSettings('access')}>
+                <SettingsIcon />{t('系统设置', 'System settings')}
+              </MenuItem>
+            </PreferencesMenu>
+          </>
+        }
+      />
 
       <main className="page-frame relative flex-1 py-4 pb-8 sm:py-5 sm:pb-10">
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}

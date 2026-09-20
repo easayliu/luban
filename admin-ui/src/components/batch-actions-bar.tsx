@@ -85,7 +85,7 @@ function SettingRow({
   children: ReactNode
 }) {
   return (
-    <div className="grid gap-x-6 gap-y-2 px-4 py-3 sm:grid-cols-[minmax(10rem,14rem)_minmax(0,1fr)_auto] sm:items-center">
+    <div className="grid gap-x-6 gap-y-2 px-4 py-3 sm:px-5 sm:grid-cols-[minmax(10rem,14rem)_minmax(0,1fr)_auto] sm:items-center">
       <div className="min-w-0">
         <div className="text-xs font-medium">{title}</div>
         <div className="text-xs text-muted-foreground">{hint}</div>
@@ -303,8 +303,8 @@ export function BatchActionsBar({
   ]
 
   return (
-    <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-xl">
-        <div className="flex min-h-14 flex-wrap items-center gap-3 p-3">
+    <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-2xl">
+        <div className="flex min-h-14 flex-wrap items-center gap-3 px-4 py-3 sm:px-5">
           <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs">
             <Checkbox
               checked={allSelected}

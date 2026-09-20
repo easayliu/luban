@@ -10,6 +10,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
  * 趋势对话框下面那张「谁在拖后腿」的表：这段时间按模型或按账号拆开，按请求数降序取前 12。
@@ -42,7 +43,9 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
     <section className="space-y-2" aria-label={t('分维度明细', 'Breakdown')}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <h3 className="text-xs font-medium text-muted-foreground">
+          {/* 提到 text-sm semibold：原来是 text-xs 的灰字，比同一行那两枚胶囊按钮还小还淡，
+              标题被自己的控件压了过去。现在是「区块标题 14px / 表头 10px」两档。 */}
+          <h3 className="text-sm font-semibold tracking-tight">
             {kind === 'latency' ? t('谁在拖慢', 'Who is slow') : t('谁没命中', 'Who misses the cache')}
           </h3>
           {query.isFetching && !query.isPending && <Spinner />}
@@ -73,7 +76,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
       ) : query.isPending ? (
         <Skeleton className="h-32 w-full rounded-xl" />
       ) : rows.length === 0 ? (
-        <p className="rounded-xl border px-3 py-6 text-center text-xs text-muted-foreground">
+        <p className="rounded-xl border px-4 py-6 text-center text-xs text-muted-foreground">
           {t('这段时间没有请求', 'No requests in this period')}
         </p>
       ) : (
@@ -106,21 +109,47 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                 <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={() => openRow(row)} />
               ))}
             </tbody>
+            {/* 合计是表格的一部分，落在 tfoot 里、和「省下」那一列对齐。
+                原来它是表格下面的一句话——数字离它的列有半个表格远，还要在句子里重读一遍列名。
+                怎么算出来的那句话收进悬浮层：它解释的是口径，不是这一格的值。 */}
+            {kind === 'cache' && query.data && (
+              <tfoot>
+                <tr className="[&>*]:border-t [&>*]:bg-surface-subtle [&>*]:px-3 [&>*]:py-1.5 [&>*]:font-medium">
+                  <th className="text-start" scope="row">{t('合计', 'Total')}</th>
+                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 命中 / 写入 / 裸算 / 省下。
+                      合计只有「省下」这一列有值，中间 5 列留空。 */}
+                  <td colSpan={5} />
+                  <td className="text-end">
+                    <Tooltip>
+                      <TooltipTrigger
+                        className={cn(
+                          'cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4',
+                          query.data.cache_saved_usd_total < 0 && 'text-warning-foreground',
+                        )}
+                        render={<span />}
+                      >
+                        {query.data.cache_saved_usd_total >= 0
+                          ? formatUsd(query.data.cache_saved_usd_total)
+                          : `-${formatUsd(-query.data.cache_saved_usd_total)}`}
+                      </TooltipTrigger>
+                      <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                        {query.data.cache_saved_usd_total >= 0
+                          ? t(
+                              '命中按十分之一计价省下的，减去写入按 1.25 倍多付的。',
+                              'Savings from cached input billed at a tenth, minus the premium paid on writes.',
+                            )
+                          : t(
+                              '写入多付的超过了命中省下的，前缀多半每轮都在变。',
+                              'Write premiums exceeded cache savings — the prefix is probably changing every turn.',
+                            )}
+                      </TooltipPopup>
+                    </Tooltip>
+                  </td>
+                </tr>
+              </tfoot>
+            )}
           </table>
         </div>
-      )}
-      {kind === 'cache' && query.data && rows.length > 0 && (
-        <p className="text-2xs leading-4 text-muted-foreground tabular-nums">
-          {query.data.cache_saved_usd_total >= 0
-            ? t(
-                `缓存合计省下 ${formatUsd(query.data.cache_saved_usd_total)}（命中按十分之一计价省的，减去写入多付的）。`,
-                `Caching saved ${formatUsd(query.data.cache_saved_usd_total)} in total (savings from cached input at a tenth, minus the premium paid on writes).`,
-              )
-            : t(
-                `缓存合计多花了 ${formatUsd(-query.data.cache_saved_usd_total)}：写入多付的超过了命中省下的，前缀多半每轮在变。`,
-                `Caching cost an extra ${formatUsd(-query.data.cache_saved_usd_total)}: write premiums exceeded cache savings, the prefix is probably changing every turn.`,
-              )}
-        </p>
       )}
       <RequestLookupDialog
         open={drill != null}

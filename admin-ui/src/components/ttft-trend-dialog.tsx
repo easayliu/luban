@@ -19,6 +19,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import { ChartLegend } from '@/components/chart-legend'
 import { UsageBreakdown } from '@/components/usage-breakdown'
 import type { TtftSeriesPoint } from '@/api/metrics'
 
@@ -35,11 +36,13 @@ function SummaryCard({
   locale: string
 }) {
   const empty = !stats || stats.count === 0
+  // 标签 / 数值 / 说明三行堆叠（与缓存弹窗同一套）：并排 baseline 对齐时，装满的那枚和
+  // 只有「无请求」的那枚长度差极大，整行看着参差。大数字不带 `tabular-nums`。
   return (
-    <div className="rounded-xl border bg-muted/32 px-3 py-2.5 sm:px-4">
+    <div className="rounded-xl border bg-muted/32 px-4 py-3">
       <p className="text-2xs font-medium text-muted-foreground">{label}</p>
-      <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <p className="text-2xl font-semibold leading-none tabular-nums">{empty ? '—' : formatMs(stats.p50_ms)}</p>
+      <p className="mt-1 text-2xl font-semibold leading-none">{empty ? '—' : formatMs(stats.p50_ms)}</p>
+      <div className="mt-1.5">
         <p className="text-2xs text-muted-foreground tabular-nums">
           {empty
             ? t('无请求', 'No requests')
@@ -364,9 +367,12 @@ export function TtftTrendDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-3xl" initialFocus={titleRef}>
-        <DialogHeader className="border-b bg-muted/32 p-4 sm:p-5">
-          <div className="flex items-center gap-3 pr-8">
+      <DialogPopup size="lg" initialFocus={titleRef}>
+        <DialogHeader variant="panel">
+          {/* 时间范围在头部右端，和标题同一行——它管的是整个弹窗看哪一段，不是正文里的局部开关。
+              `pr-12` 给右上角那枚关闭按钮让位。 */}
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 pr-12">
+          <div className="flex min-w-0 items-center gap-3">
             <Avatar>
               <AvatarFallback><TimerIcon /></AvatarFallback>
             </Avatar>
@@ -386,11 +392,8 @@ export function TtftTrendDialog({
               </DialogDescription>
             </div>
           </div>
-        </DialogHeader>
-
-        <DialogPanel className="space-y-3 p-4 pt-3 sm:p-5 sm:pt-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
             <ToggleGroup
+              className="shrink-0"
               value={[range]}
               onValueChange={(values) => {
                 const next = values[values.length - 1]
@@ -408,8 +411,29 @@ export function TtftTrendDialog({
                 </Fragment>
               ))}
             </ToggleGroup>
+          </div>
+        </DialogHeader>
 
+        <DialogPanel className="space-y-3">
+          {/* 图例贴着图表上沿。p95 在图里是柱顶上方一条细横线，图例的记号也用线而不是方块——
+              记号的形状要跟着图里那个标记走。 */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {view === 'chart' && hasTraffic && !query.isPending && !query.error ? (
+              <ChartLegend
+                items={[
+                  { swatch: 'bg-chart-2', label: 'p50' },
+                  { shape: 'line', swatch: 'bg-chart-2/50', label: 'p95' },
+                ]}
+                hint={t(
+                  '柱子是 p50，柱顶上方那条短横线是 p95；两者拉得越开，长尾越重。',
+                  'The bar is p50 and the short line above it is p95; the wider the gap, the heavier the tail.',
+                )}
+              />
+            ) : (
+              <span />
+            )}
             <ToggleGroup
+              className="shrink-0"
               value={[view]}
               onValueChange={(values) => {
                 const next = values[values.length - 1]
@@ -474,10 +498,11 @@ export function TtftTrendDialog({
             <TtftTable slots={slots} granularity={granularity} />
           )}
 
+          {/* p50 / p95 的含义交给图例与它末尾那枚 info，这里只剩图例说不了的两件事。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '柱子是 p50，柱顶上方的短横线是 p95，两者的距离就是长尾。空着的格子是那个时段没有成功请求。请求明细只保留 30 天。',
-              'Bars are p50; the short line above each bar is p95, and the gap between them is the tail. A gap means no successful requests in that period. Request logs are kept for 30 days.',
+              '空着的格子是那个时段没有成功请求。请求明细只保留 30 天。',
+              'A gap means no successful requests in that period. Request logs are kept for 30 days.',
             )}
           </p>
 

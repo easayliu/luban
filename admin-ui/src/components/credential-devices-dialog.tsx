@@ -31,7 +31,7 @@ import {
   parseSessionKey,
   relativeTime,
 } from '@/lib/utils'
-import { type CredentialActions } from '@/components/credential-shared'
+import { deviceUsageMeta, METER_FILL, type CredentialActions } from '@/components/credential-shared'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -232,7 +232,7 @@ export function CredentialDevicesDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogPopup className="max-w-2xl">
+      <DialogPopup size="md">
         <DialogHeader>
           <div className="flex items-start gap-3 pr-8">
             <Avatar>
@@ -359,8 +359,11 @@ export function CredentialDevicesDialog({
                         </span>
                       </div>
                       <MeterTrack className="h-1.5">
+                        {/* 档位走 [deviceUsageMeta]，与卡片页脚的名额读数、列表里的名额条同一套判定：
+                            0 灰、<70% 绿、≥70% 或只剩一个名额 黄、占满 红。原来这里是二分的
+                            （占满才黄、永远不红），同一个 4/5 的号在卡片上是黄的、点进来却是绿的。 */}
                         <MeterIndicator
-                          className={currentDeviceCount >= cred.device_limit_effective ? 'bg-warning' : 'bg-success'}
+                          className={METER_FILL[deviceUsageMeta(currentDeviceCount, cred.device_limit_effective).level]}
                         />
                       </MeterTrack>
                     </Meter>
@@ -842,7 +845,8 @@ function SessionCapacityCard({
                   </span>
                 </div>
                 <MeterTrack className="h-1.5">
-                  <MeterIndicator className={count >= effective ? 'bg-warning' : 'bg-success'} />
+                  {/* 与上面的设备容量条同一套判定，见那边的注。 */}
+                  <MeterIndicator className={METER_FILL[deviceUsageMeta(count, effective).level]} />
                 </MeterTrack>
               </Meter>
             ) : (

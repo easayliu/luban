@@ -69,8 +69,9 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { toastManager } from '@/components/ui/toast'
-import { SettingsGroup } from '@/components/settings-group'
+import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 
 /**
  * 转发形态开关。
@@ -88,7 +89,7 @@ export function ForwardingSettings({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="sm:max-w-3xl">
+      <DialogPopup size="lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <SlidersHorizontalIcon aria-hidden="true" />
@@ -827,15 +828,15 @@ function OAuthScopes() {
       : t('自定义', 'Custom')
 
   return (
-    <Field className="p-5">
+    <Field className="p-4 sm:p-5">
       <div className="w-full space-y-3">
         <div className="min-w-0 space-y-1">
           <FieldLabel htmlFor="oauth-scopes">{t('申请的 scope', 'Requested scopes')}</FieldLabel>
-          <FieldDescription className="max-w-2xl leading-5">
-            {t(
+          <FieldDescription className="max-w-xl leading-5">
+            <ClampedDescription text={t(
               '空格分隔，填什么发什么——这里不校验，认不认由 Claude 的同意页说（例如整个不带 scope 会被回 Missing scope parameter）。留空恢复官方默认那一整套，与官方客户端逐字一致，scope 集合也是指纹的一部分。精简那一档只留 Luban 真正用得上的三项：user:inference 转发要用（去掉这个号就只能登进来看额度）、user:profile 决定邮箱与等级读不读得到、user:file_upload 管走 Files API 的上传。',
               'Space separated, sent verbatim — nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota), user:profile for the email and tier, user:file_upload for uploads through the Files API.',
-            )}
+            )} />
           </FieldDescription>
         </div>
         <Textarea
@@ -898,6 +899,11 @@ function PolicySelect({
   const id = useId()
   const qc = useQueryClient()
 
+  const items = (Object.keys(POLICY_LABELS) as PolicyValue[]).map((k) => ({
+    label: t(POLICY_LABELS[k][0], POLICY_LABELS[k][1]),
+    value: k,
+  }))
+
   const save = useMutation({
     mutationFn: (next: PolicyValue) =>
       settingKey === 'prefill' ? setPrefillPolicy(next) : setSamplingPolicy(next),
@@ -921,27 +927,31 @@ function PolicySelect({
   })
 
   return (
-    <Field className="p-5">
-      <div className="flex w-full items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <FieldLabel htmlFor={id}>{label}</FieldLabel>
-          <FieldDescription className="leading-5">{summary}</FieldDescription>
-        </div>
-        <select
-          id={id}
-          className="h-8 min-w-28 rounded-lg border border-input bg-background px-2 text-sm shadow-xs/5 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64"
-          value={value}
-          disabled={save.isPending}
-          onChange={(e) => save.mutate(e.target.value as PolicyValue)}
-        >
-          {(Object.keys(POLICY_LABELS) as PolicyValue[]).map((k) => (
-            <option key={k} value={k}>
-              {t(POLICY_LABELS[k][0], POLICY_LABELS[k][1])}
-            </option>
+    <SettingsRow
+      htmlFor={id}
+      label={label}
+      description={<ClampedDescription text={summary} />}
+    >
+      {/* 用全站那套 Select，不再手搓原生 <select>：原来这里是一个自己抄了一遍边框样式的
+          原生下拉，高度 h-8 写死，弹出层还是操作系统那一套，和同一页别处的下拉长得是两个东西。 */}
+      <Select
+        items={items}
+        value={value}
+        disabled={save.isPending}
+        onValueChange={(next) => next && save.mutate(next as PolicyValue)}
+      >
+        <SelectTrigger id={id} className="sm:w-40" aria-label={label}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectPopup>
+          {items.map((item) => (
+            <SelectItem key={item.value} value={item.value}>
+              {item.label}
+            </SelectItem>
           ))}
-        </select>
-      </div>
-    </Field>
+        </SelectPopup>
+      </Select>
+    </SettingsRow>
   )
 }
 
@@ -987,50 +997,42 @@ function RetryMax() {
   const enabled = data?.rate_limit_retry ?? true
 
   return (
-    <Field className="p-5">
-      <div className="flex w-full flex-wrap items-end justify-between gap-3">
-        <div className="min-w-0 space-y-1">
-          <FieldLabel>{t('追加重试账号数', 'Additional retry accounts')}</FieldLabel>
-          <FieldDescription>
-            {t(
-              '填 2 时最多尝试 3 个账号（含首次）。',
-              'Set this to 2 to try up to 3 accounts in total, including the first.',
-            )}
-          </FieldDescription>
-        </div>
-        <div className="flex items-center gap-2">
-          <NumberField
-            className="w-32"
-            disabled={!enabled}
-            max={10}
-            min={0}
-            value={draft}
-            onValueChange={setDraft}
-          >
-            <NumberFieldGroup>
-              <NumberFieldDecrement
-                aria-label={t('减少 429 追加重试账号数', 'Decrease additional accounts retried after 429')}
-              />
-              <NumberFieldInput
-                aria-label={t('429 追加重试账号数', 'Additional accounts to retry after 429')}
-              />
-              <NumberFieldIncrement
-                aria-label={t('增加 429 追加重试账号数', 'Increase additional accounts retried after 429')}
-              />
-            </NumberFieldGroup>
-          </NumberField>
-          <Button
-            size="sm"
-            loading={save.isPending}
-            disabled={!enabled || count === (data?.rate_limit_retry_max ?? 2)}
-            onClick={() => save.mutate(count)}
-          >
-            <SaveIcon />
-            {t('保存', 'Save')}
-          </Button>
-        </div>
-      </div>
-    </Field>
+    <SettingsRow
+      label={t('追加重试账号数', 'Additional retry accounts')}
+      description={t(
+        '填 2 时最多尝试 3 个账号（含首次）。',
+        'Set this to 2 to try up to 3 accounts in total, including the first.',
+      )}
+    >
+      <NumberField
+        className="min-w-0 flex-1 sm:w-32 sm:flex-none"
+        disabled={!enabled}
+        max={10}
+        min={0}
+        value={draft}
+        onValueChange={setDraft}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement
+            aria-label={t('减少 429 追加重试账号数', 'Decrease additional accounts retried after 429')}
+          />
+          <NumberFieldInput
+            aria-label={t('429 追加重试账号数', 'Additional accounts to retry after 429')}
+          />
+          <NumberFieldIncrement
+            aria-label={t('增加 429 追加重试账号数', 'Increase additional accounts retried after 429')}
+          />
+        </NumberFieldGroup>
+      </NumberField>
+      <Button
+        loading={save.isPending}
+        disabled={!enabled || count === (data?.rate_limit_retry_max ?? 2)}
+        onClick={() => save.mutate(count)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -1097,78 +1099,88 @@ function QuotaPausePct() {
     pct === (data?.quota_pause_pct ?? 90) && week === (data?.quota_pause_pct_7d ?? 0)
 
   return (
-    <Field className="p-5">
-      <div className="w-full space-y-3">
-        <div className="min-w-0 space-y-1">
-          <FieldLabel>{t('提前停调度阈值', 'Early pause threshold')}</FieldLabel>
-          <FieldDescription className="max-w-xl leading-5">
-            {t(
-              '上游每条响应都带着账号的用量限制使用率；到达阈值就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。两个窗口各配一档，别混用：5 小时窗口停号最多歇几小时就自己回来，7 天窗口停号是歇到下个周重置——一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时一点没用。故 7 天那档默认关（周额度真用光时上游会回 429，账号级冷却照常接手）；要开建议配得比 5 小时那档更高。超额池快满不算在内。停用后按触发的那个窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。填 0 = 该档不停号。这里是全局值；单个账号可在账号菜单「提前停调度阈值」里逐档覆盖（跟随全局 / 这一档不停 / 独立阈值）。',
-              'Every upstream response reports the account’s usage-limit utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold — do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. A nearly full overage pool never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (use global / off for this account / custom threshold).',
-            )}
-          </FieldDescription>
-        </div>
-        <div className="flex flex-wrap items-end gap-4">
-          <div className="space-y-1.5">
-            <FieldDescription>{t('5 小时窗口', '5h window')}</FieldDescription>
-            <NumberField
-              className="w-32"
-              disabled={!enabled}
-              max={100}
-              min={0}
-              value={draft}
-              onValueChange={setDraft}
-            >
-              <NumberFieldGroup>
-                <NumberFieldDecrement
-                  aria-label={t('降低 5 小时窗口阈值', 'Decrease 5h window threshold')}
-                />
-                <NumberFieldInput
-                  aria-label={t('5 小时窗口提前停调度阈值（%）', '5h window early pause threshold (%)')}
-                />
-                <NumberFieldIncrement
-                  aria-label={t('提高 5 小时窗口阈值', 'Increase 5h window threshold')}
-                />
-              </NumberFieldGroup>
-            </NumberField>
-          </div>
-          <div className="space-y-1.5">
-            <FieldDescription>
-              {t('7 天窗口（0 = 不停）', '7d window (0 = off)')}
-            </FieldDescription>
-            <NumberField
-              className="w-32"
-              disabled={!enabled}
-              max={100}
-              min={0}
-              value={weekDraft}
-              onValueChange={setWeekDraft}
-            >
-              <NumberFieldGroup>
-                <NumberFieldDecrement
-                  aria-label={t('降低 7 天窗口阈值', 'Decrease 7d window threshold')}
-                />
-                <NumberFieldInput
-                  aria-label={t('7 天窗口提前停调度阈值（%）', '7d window early pause threshold (%)')}
-                />
-                <NumberFieldIncrement
-                  aria-label={t('提高 7 天窗口阈值', 'Increase 7d window threshold')}
-                />
-              </NumberFieldGroup>
-            </NumberField>
-          </div>
-          <Button
-            size="sm"
-            loading={save.isPending}
-            disabled={!enabled || unchanged}
-            onClick={() => save.mutate({ pct, week })}
+    <SettingsRow
+      label={t('提前停调度阈值', 'Early pause threshold')}
+      description={
+        <ClampedDescription text={t(
+          '上游每条响应都带着账号的用量限制使用率；到达阈值就把账号挪出调度池，不必等下一条请求去撞 429（那一发必定失败）。两个窗口各配一档，别混用：5 小时窗口停号最多歇几小时就自己回来，7 天窗口停号是歇到下个周重置——一个周用量偏高的号会被整段挪出池子，哪怕它这 5 小时一点没用。故 7 天那档默认关（周额度真用光时上游会回 429，账号级冷却照常接手）；要开建议配得比 5 小时那档更高。超额池快满不算在内。停用后按触发的那个窗口的重置时刻自动恢复，也可手动启用或用连通性测试放回。填 0 = 该档不停号。这里是全局值；单个账号可在账号菜单「提前停调度阈值」里逐档覆盖（跟随全局 / 这一档不停 / 独立阈值）。',
+          'Every upstream response reports the account’s usage-limit utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold — do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. A nearly full overage pool never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (use global / off for this account / custom threshold).',
+        )} />
+      }
+    >
+      {/* 两行的网格：第一行是两枚标签，第二行是两个数字框与保存按钮。
+          按钮显式落在第二行第三列（`col-start-3 row-start-2`，列也必须钉——只写行的话，
+          CSS 网格会把「行确定」的项**先于**纯自动项放置，按钮就抢到第二行第一列、跑到数字框左边），
+          于是它和数字框是**同一行带里的兄弟**，
+          上下居中由网格保证——不再取决于「标签 + 输入框」那摞东西有多高。
+          先前用 flex + `items-end` 对不齐：那种排法下按钮的位置要跟着旁边那摞的底边走，
+          差一点点就歪，而这一行恰恰差了几个像素。 */}
+      {/* 手机上两列走 `minmax(0,1fr)` 而不是 `auto`：`auto` 不肯收缩，
+          两个 w-32（128px）加保存按钮要 366px，而 375px 的屏上这一行只有 311px，会横向溢出。
+          ≥640px 退回内容宽（`sm:grid-cols-[auto_auto_auto]`）。与接入页「无身份请求上限」同一套。 */}
+      <div className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] grid-rows-[auto_auto] items-center gap-x-3 gap-y-1.5 sm:w-auto sm:grid-cols-[auto_auto_auto]">
+        <div className="row-span-2 grid grid-rows-subgrid gap-y-1.5">
+          <FieldDescription>{t('5 小时窗口', '5h window')}</FieldDescription>
+          <NumberField
+            className="w-full sm:w-32"
+            disabled={!enabled}
+            max={100}
+            min={0}
+            value={draft}
+            onValueChange={setDraft}
           >
-            <SaveIcon />
-            {t('保存', 'Save')}
-          </Button>
+            <NumberFieldGroup>
+              <NumberFieldDecrement
+                aria-label={t('降低 5 小时窗口阈值', 'Decrease 5h window threshold')}
+              />
+              <NumberFieldInput
+                aria-label={t('5 小时窗口提前停调度阈值（%）', '5h window early pause threshold (%)')}
+              />
+              <NumberFieldIncrement
+                aria-label={t('提高 5 小时窗口阈值', 'Increase 5h window threshold')}
+              />
+            </NumberFieldGroup>
+          </NumberField>
         </div>
+        <div className="row-span-2 grid grid-rows-subgrid gap-y-1.5">
+          <FieldDescription>
+            {t('7 天窗口（0 = 不停）', '7d window (0 = off)')}
+          </FieldDescription>
+          <NumberField
+            className="w-full sm:w-32"
+            disabled={!enabled}
+            max={100}
+            min={0}
+            value={weekDraft}
+            onValueChange={setWeekDraft}
+          >
+            <NumberFieldGroup>
+              <NumberFieldDecrement
+                aria-label={t('降低 7 天窗口阈值', 'Decrease 7d window threshold')}
+              />
+              <NumberFieldInput
+                aria-label={t('7 天窗口提前停调度阈值（%）', '7d window early pause threshold (%)')}
+              />
+              <NumberFieldIncrement
+                aria-label={t('提高 7 天窗口阈值', 'Increase 7d window threshold')}
+              />
+            </NumberFieldGroup>
+          </NumberField>
+        </div>
+        {/* 保存按钮用**默认尺寸**而不是 `sm`：默认高度（h-9 / sm:h-8）与 NumberField 那一组
+            完全相同，两者的边框与字才落在同一条线上；`sm` 矮 4px，就是截图里那个歪。
+            设置页所有「输入框 + 保存」的行现在都是这一档。 */}
+        <Button
+          className="col-start-3 row-start-2 max-sm:size-9 max-sm:px-0"
+          loading={save.isPending}
+          disabled={!enabled || unchanged}
+          onClick={() => save.mutate({ pct, week })}
+        >
+          <SaveIcon />
+          <span className="max-sm:sr-only">{t('保存', 'Save')}</span>
+        </Button>
       </div>
-    </Field>
+    </SettingsRow>
   )
 }
 
@@ -1221,24 +1233,21 @@ function ForwardingToggle({
   })
 
   return (
-    <Field className="p-5" disabled={blocked}>
-      <div className="flex w-full items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <FieldLabel htmlFor={id}>{label}</FieldLabel>
-          <FieldDescription className="leading-5">
-            {blocked
-              ? t(`需先开启「${requires.label}」`, `Enable “${requires.label}” first`)
-              : summary}
-          </FieldDescription>
-        </div>
-        <Switch
-          id={id}
-          checked={enabled && !blocked}
-          disabled={save.isPending || blocked}
-          onCheckedChange={(next) => save.mutate(next)}
-        />
-      </div>
-      {description && (
+    <SettingsRow
+      disabled={blocked}
+      htmlFor={id}
+      label={label}
+      description={
+        blocked
+          ? t(`需先开启「${requires.label}」`, `Enable “${requires.label}” first`)
+          : description
+            // 这一行底下已经挂了「影响与限制」，摘要就不再自带第二个展开器：同一个标签下面
+            // 一枚文字按钮「了解更多」加一个 details「影响与限制」是两套交互、两种长相。
+            // 全部 38 条摘要里只有一条超过收起阈值，多出的那一两行铺开就是了。
+            ? summary
+            : <ClampedDescription text={summary} />
+      }
+      footer={description && (
         <details className="group text-xs text-muted-foreground">
           <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm font-medium transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
             {t('影响与限制', 'Impact & limitations')}
@@ -1247,12 +1256,19 @@ function ForwardingToggle({
               className="size-3 transition-transform group-open:rotate-180"
             />
           </summary>
-          <div className="mt-2 border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
+          <div className="mt-2 max-w-xl border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
             {description}
           </div>
         </details>
       )}
-    </Field>
+    >
+      <Switch
+        id={id}
+        checked={enabled && !blocked}
+        disabled={save.isPending || blocked}
+        onCheckedChange={(next) => save.mutate(next)}
+      />
+    </SettingsRow>
   )
 }
 
@@ -1359,7 +1375,7 @@ function RefusalGroup({
       return next
     })
   return (
-    <li className="px-4 py-3">
+    <li className="px-4 py-3 sm:px-5">
       <div className="flex items-start gap-3">
         <span aria-hidden="true" className={cn('mt-2 size-1.5 shrink-0 rounded-full', RULE_TONES.refusal.dot)} />
         <button
@@ -1376,13 +1392,16 @@ function RefusalGroup({
           <Badge size="sm" variant={RULE_TONES.refusal.badge}>
             {kindLabel('refusal')}
           </Badge>
-          {group.tag && <span className="rounded bg-muted px-1 py-px font-mono text-[10px]">{group.tag}</span>}
+          {group.tag && <span className="rounded bg-muted px-1 py-px font-mono text-xs">{group.tag}</span>}
           <span className="text-xs text-muted-foreground tabular-nums">
             {t(`${total} 条提示词`, `${total} prompt${total === 1 ? '' : 's'}`)}
           </span>
-          <span className="text-[11px] text-muted-foreground" title={formatFullTime(group.latest, language)}>
-            {t('最近学到于', 'Latest')} {relativeTime(group.latest, undefined, language)}
-          </span>
+          <Tooltip>
+            <TooltipTrigger render={<span />} delay={0} className="cursor-help text-xs text-muted-foreground">
+              {t('最近学到于', 'Latest')} {relativeTime(group.latest, undefined, language)}
+            </TooltipTrigger>
+            <TooltipPopup>{formatFullTime(group.latest, language)}</TooltipPopup>
+          </Tooltip>
         </button>
         <Button
           aria-label={t('删除这一组规则', 'Remove this rule group')}
@@ -1403,7 +1422,7 @@ function RefusalGroup({
               const { body } = splitRuleMessage(row.message ?? '')
               const showing = openMessages.has(key)
               return (
-                <li key={key} className="px-3 py-1.5 text-[11px] transition-colors hover:bg-muted/40">
+                <li key={key} className="px-3 py-1.5 text-xs transition-colors hover:bg-muted/40">
                   <div className="flex items-center gap-2">
                     <button
                       aria-expanded={showing}
@@ -1420,12 +1439,26 @@ function RefusalGroup({
                     </button>
                     <code className="min-w-0 shrink-0 font-mono [overflow-wrap:anywhere]">{row.value}</code>
                     <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground">{body}</span>
-                    <span className="shrink-0 whitespace-nowrap text-muted-foreground tabular-nums" title={formatFullTime(row.learned_at, language)}>
-                      {relativeTime(row.learned_at, undefined, language)}
-                    </span>
-                    <span className="hidden shrink-0 whitespace-nowrap text-muted-foreground tabular-nums sm:inline" title={formatFullTime(row.expires_at, language)}>
-                      {expiresIn(row.expires_at)}
-                    </span>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={<span />}
+                        delay={0}
+                        className="shrink-0 cursor-help whitespace-nowrap text-muted-foreground tabular-nums"
+                      >
+                        {relativeTime(row.learned_at, undefined, language)}
+                      </TooltipTrigger>
+                      <TooltipPopup>{formatFullTime(row.learned_at, language)}</TooltipPopup>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={<span />}
+                        delay={0}
+                        className="hidden shrink-0 cursor-help whitespace-nowrap text-muted-foreground tabular-nums sm:inline"
+                      >
+                        {expiresIn(row.expires_at)}
+                      </TooltipTrigger>
+                      <TooltipPopup>{formatFullTime(row.expires_at, language)}</TooltipPopup>
+                    </Tooltip>
                     <Button
                       aria-label={t('删除这条规则', 'Remove this rule')}
                       title={t('删除这条规则', 'Remove this rule')}
@@ -1452,7 +1485,10 @@ function RefusalGroup({
               <p className="min-w-0 text-muted-foreground tabular-nums">
                 {t(`第 ${firstIndex}–${lastIndex} 条，共 ${total} 条`, `${firstIndex}–${lastIndex} of ${total}`)}
               </p>
-              <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+              {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
+                放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
+                sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
+              <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
                 <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
                 <Select
                   items={GROUP_PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
@@ -1640,7 +1676,7 @@ function LearnedRejections() {
     const { tag, body } = splitRuleMessage(row.message ?? '')
     const open = expanded.has(key)
     return (
-      <li className="flex items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/40">
+      <li className="flex items-start gap-3 px-4 py-3 transition-colors sm:px-5 hover:bg-muted/40">
         <span
           aria-hidden="true"
           className={cn('mt-2 size-1.5 shrink-0 rounded-full', tone?.dot ?? 'bg-muted-foreground')}
@@ -1651,7 +1687,7 @@ function LearnedRejections() {
             <Badge size="sm" variant={tone?.badge ?? 'secondary'}>
               {kindLabel(row.kind)}
             </Badge>
-            <code className="inline-flex min-w-0 items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 font-mono text-[11px]">
+            <code className="inline-flex min-w-0 items-center gap-1 rounded border bg-muted/60 px-1.5 py-0.5 font-mono text-xs">
               <span className="text-muted-foreground">{row.field}</span>
               {row.value && (
                 <>
@@ -1674,27 +1710,35 @@ function LearnedRejections() {
                   className={cn('size-3.5 shrink-0 transition-transform', !open && '-rotate-90')}
                 />
                 {tag && (
-                  <span className="shrink-0 rounded bg-muted px-1 py-px font-mono text-[10px]">
+                  <span className="shrink-0 rounded bg-muted px-1 py-px font-mono text-xs">
                     {tag}
                   </span>
                 )}
-                <span className={cn('min-w-0 flex-1 font-mono text-[11px]', !open && 'truncate')}>
+                <span className={cn('min-w-0 flex-1 font-mono text-xs', !open && 'truncate')}>
                   {open ? t('上游当时的回复', 'Upstream reply') : body}
                 </span>
               </button>
               {open && (
-                <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono text-[11px] leading-5 text-muted-foreground [overflow-wrap:anywhere]">
+                <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]">
                   {body}
                 </pre>
               )}
             </div>
           )}
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground tabular-nums">
-            <span title={formatFullTime(row.learned_at, language)}>
-              {t('学到于', 'Learned')} {relativeTime(row.learned_at, undefined, language)}
-            </span>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+            <Tooltip>
+              <TooltipTrigger render={<span />} delay={0} className="cursor-help">
+                {t('学到于', 'Learned')} {relativeTime(row.learned_at, undefined, language)}
+              </TooltipTrigger>
+              <TooltipPopup>{formatFullTime(row.learned_at, language)}</TooltipPopup>
+            </Tooltip>
             <span aria-hidden="true" className="opacity-40">·</span>
-            <span title={formatFullTime(row.expires_at, language)}>{expiresIn(row.expires_at)}</span>
+            <Tooltip>
+              <TooltipTrigger render={<span />} delay={0} className="cursor-help">
+                {expiresIn(row.expires_at)}
+              </TooltipTrigger>
+              <TooltipPopup>{formatFullTime(row.expires_at, language)}</TooltipPopup>
+            </Tooltip>
           </div>
         </div>
         <Button
@@ -1722,13 +1766,13 @@ function LearnedRejections() {
       )}
     >
       {query.isPending ? (
-        <div className="flex items-center gap-2 p-5 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground sm:p-5">
           <Spinner />
           {t('正在加载', 'Loading')}
         </div>
       ) : query.isError ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 p-5 text-sm">
-          <span className="text-destructive">{extractError(query.error, language)}</span>
+        <div className="flex flex-wrap items-center justify-between gap-2 p-4 text-sm sm:p-5">
+          <span className="text-destructive-foreground">{extractError(query.error, language)}</span>
           <Button size="xs" variant="outline" onClick={() => query.refetch()}>
             {t('重试', 'Retry')}
           </Button>
@@ -1753,7 +1797,7 @@ function LearnedRejections() {
       ) : (
         <>
           {/* 工具条：总数 + 按种类筛选 + 清空，动作放顶部，列表本身保持干净 */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 sm:px-5">
             <div className="flex flex-wrap items-center gap-1">
               <FilterChip
                 active={kindFilter === 'all'}
@@ -1806,7 +1850,7 @@ function LearnedRejections() {
             </div>
           </div>
           {visible.length === 0 ? (
-            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm text-muted-foreground">
+            <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm sm:px-5 text-muted-foreground">
               {needle ? t('没有匹配的规则。', 'No matching rules.') : t('这一类下没有规则。', 'No rules of this kind.')}
               <Button size="xs" variant="outline" onClick={() => { setKindFilter('all'); setSearch('') }}>
                 {t('看全部', 'Show all')}

@@ -66,7 +66,7 @@ export function CredentialProxyDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-lg">
+      <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('出站代理', 'Outbound proxy')}</DialogTitle>
           <DialogDescription className="mt-1 truncate" title={credentialLabel}>

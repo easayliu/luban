@@ -264,7 +264,10 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
                 `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
               )}
             </p>
-            <div className="row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+            {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
+              放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
+              sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
+            <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
               <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
               <Select
                 items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
@@ -435,7 +438,7 @@ export function BanEventsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-6xl">
+      <DialogPopup size="full">
         <DialogHeader>
           <DialogTitle>{t('封号记录', 'Ban events')}</DialogTitle>
           <DialogDescription>
@@ -470,7 +473,8 @@ export function BanEventsDialog({
           ) : (
             <div className="overflow-hidden rounded-md border">
               <Table>
-                <TableHeader>
+                {/* 手机上换成堆叠卡片，表头跟着一起藏——7 列的表头配单格的堆叠行没有意义。 */}
+                <TableHeader className="max-lg:hidden">
                   <TableRow>
                     <TableHead className="w-8" />
                     <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
@@ -486,8 +490,45 @@ export function BanEventsDialog({
                     const isOpen = expanded === ev.id
                     return (
                       <React.Fragment key={ev.id}>
+                        {/* 手机到平板：堆叠成一张卡片。7 列的表在 lg 以下只能左右拖，
+                            而这张表每一行都要读「谁、什么时候、为什么」三件事，横滚读不了。
+                            与账号列表的窄屏行同一个做法（见 credential-row 的 `xl:hidden`）。 */}
+                        <TableRow className="cursor-pointer lg:hidden" onClick={() => setExpanded(isOpen ? null : ev.id)}>
+                          <TableCell colSpan={7} className="w-full max-w-0 whitespace-normal p-0">
+                            <article className="flex min-w-0 items-start gap-2 px-4 py-3">
+                              <span className="mt-0.5 shrink-0 text-muted-foreground" aria-hidden>
+                                {isOpen ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
+                              </span>
+                              <div className="min-w-0 flex-1 space-y-1.5">
+                                <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                                  <span className="min-w-0 truncate font-medium text-sm">
+                                    {displayCredentialLabel(ev.cred_label, language)}
+                                  </span>
+                                  <span className="shrink-0 font-mono text-xs text-muted-foreground">#{ev.cred_id}</span>
+                                  {ev.status != null && (
+                                    <Badge size="sm" variant={statusVariant(ev.status)}>{ev.status}</Badge>
+                                  )}
+                                </div>
+                                {/* 表头藏了，所以「封前 7 天」这类列名在这里要自己带上。 */}
+                                <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                                  <span className="tabular-nums">{formatFullTime(ev.ts)}</span>
+                                  <Badge size="sm" variant="outline">{sourceLabel(ev.source, t)}</Badge>
+                                  <span className="tabular-nums">
+                                    {t(
+                                      `封前 7 天 ${ev.requests_7d} 次 / 出站 ${ev.devices_out_7d} 台`,
+                                      `7d before: ${ev.requests_7d} req / ${ev.devices_out_7d} dev out`,
+                                    )}
+                                  </span>
+                                </p>
+                                <p className="line-clamp-2 break-all font-mono text-xs text-muted-foreground">
+                                  {ev.reason}
+                                </p>
+                              </div>
+                            </article>
+                          </TableCell>
+                        </TableRow>
                         <TableRow
-                          className="cursor-pointer"
+                          className="hidden cursor-pointer lg:table-row"
                           onClick={() => setExpanded(isOpen ? null : ev.id)}
                         >
                           <TableCell className="text-muted-foreground">

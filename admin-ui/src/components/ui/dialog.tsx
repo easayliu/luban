@@ -62,15 +62,31 @@ export function DialogViewport({
   );
 }
 
+/**
+ * 弹窗宽度的固定档位。以前每个调用处自己写 `max-w-2xl` / `sm:max-w-3xl` / `max-w-6xl`，
+ * 两种写法混用，还有四处写的就是底座默认值（纯冗余）。档位收进这里，调用处只挑名字。
+ */
+const DIALOG_SIZES = {
+  sm: "max-w-lg",
+  md: "max-w-2xl",
+  lg: "max-w-3xl",
+  xl: "max-w-4xl",
+  full: "max-w-6xl",
+} as const;
+
+export type DialogSize = keyof typeof DIALOG_SIZES;
+
 export function DialogPopup({
   className,
   children,
+  size = "sm",
   showCloseButton = true,
   bottomStickOnMobile = true,
   closeProps,
   portalProps,
   ...props
 }: DialogPrimitive.Popup.Props & {
+  size?: DialogSize;
   showCloseButton?: boolean;
   bottomStickOnMobile?: boolean;
   closeProps?: DialogPrimitive.Close.Props;
@@ -90,6 +106,7 @@ export function DialogPopup({
         <DialogPrimitive.Popup
           className={cn(
             "relative row-start-2 flex max-h-full min-h-0 w-full min-w-0 max-w-lg origin-center flex-col rounded-2xl border bg-popover not-dark:bg-clip-padding text-popover-foreground opacity-[calc(1-var(--nested-dialogs))] shadow-lg outline-none transition-[scale,opacity,translate] duration-200 ease-in-out will-change-transform before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-2xl)-1px)] before:shadow-[0_1px_var(--bevel)] data-ending-style:opacity-0 data-starting-style:opacity-0 sm:scale-[calc(1-0.1*var(--nested-dialogs))] sm:data-ending-style:scale-98 sm:data-starting-style:scale-98 dark:before:shadow-[0_-1px_var(--bevel)]",
+            DIALOG_SIZES[size],
             bottomStickOnMobile &&
               "max-sm:max-w-none max-sm:origin-bottom max-sm:rounded-none max-sm:border-x-0 max-sm:border-t max-sm:border-b-0 max-sm:pb-[env(safe-area-inset-bottom)] max-sm:data-ending-style:translate-y-4 max-sm:data-starting-style:translate-y-4 max-sm:before:hidden max-sm:before:rounded-none",
             className,
@@ -114,17 +131,34 @@ export function DialogPopup({
   );
 }
 
+/**
+ * `panel` 变体：带下分隔线与浅灰底，给的是「头部本身有内容」的那类弹窗——趋势、明细里头部
+ * 放着头像、标题、副标题和时间范围切换，需要和下面的图表分开。
+ *
+ * 以前这三个弹窗各自在 className 里写 `border-b bg-muted/32 p-4 sm:p-5`，连内边距都跟别处
+ * 不一样，等于凭空多出第二套弹窗密度。现在它是底座提供的一个选择，槽宽仍是统一的 24px。
+ */
 export function DialogHeader({
   className,
+  variant = "default",
   render,
   ...props
-}: useRender.ComponentProps<"div">): React.ReactElement {
+}: useRender.ComponentProps<"div"> & {
+  variant?: "default" | "panel";
+}): React.ReactElement {
   const defaultProps = {
     className: cn(
-      "flex flex-col gap-2 p-6 in-[[data-slot=dialog-popup]:has([data-slot=dialog-panel])]:pb-3 max-sm:pb-4",
+      // 槽宽分两档：手机 16px、≥640px 24px。手机上弹窗是整屏的底部抽屉，24px 太肥。
+      "flex flex-col gap-2 p-4 sm:p-6",
+      // 紧挨着 panel 时收一收下边距；panel 变体靠分隔线分隔，不收。
+      variant === "default" &&
+        "in-[[data-slot=dialog-popup]:has([data-slot=dialog-panel])]:pb-3",
+      "max-sm:pb-4",
+      variant === "panel" && "border-b bg-muted/32",
       className,
     ),
     "data-slot": "dialog-header",
+    "data-variant": variant,
   };
 
   return useRender({
@@ -144,7 +178,7 @@ export function DialogFooter({
 }): React.ReactElement {
   const defaultProps = {
     className: cn(
-      "flex flex-col-reverse gap-2 px-6 sm:flex-row sm:justify-end sm:rounded-b-[calc(var(--radius-2xl)-1px)]",
+      "flex flex-col-reverse gap-2 px-4 sm:flex-row sm:justify-end sm:px-6 sm:rounded-b-[calc(var(--radius-2xl)-1px)]",
       variant === "default" && "border-t bg-muted/72 py-4",
       variant === "bare" &&
         "in-[[data-slot=dialog-popup]:has([data-slot=dialog-panel])]:pt-3 pt-4 pb-6",
@@ -202,7 +236,7 @@ export function DialogPanel({
 }): React.ReactElement {
   const defaultProps = {
     className: cn(
-      "p-6 in-[[data-slot=dialog-popup]:has([data-slot=dialog-header])]:pt-1 in-[[data-slot=dialog-popup]:has([data-slot=dialog-footer]:not(.border-t))]:pb-1",
+      "p-4 sm:p-6 in-[[data-slot=dialog-popup]:has([data-slot=dialog-header]:not([data-variant=panel]))]:pt-1 in-[[data-slot=dialog-popup]:has([data-slot=dialog-footer]:not(.border-t))]:pb-1",
       className,
     ),
     "data-slot": "dialog-panel",

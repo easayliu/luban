@@ -14,7 +14,7 @@ import {
   type ImportMode,
   type ImportResult,
 } from '@/api/settings'
-import { SettingsGroup } from '@/components/settings-group'
+import { SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -91,15 +91,13 @@ function ExportPanel() {
   })
 
   return (
-    <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-      <div className="min-w-0 space-y-1.5">
-        <FieldLabel>{t('导出账号与设置', 'Export accounts & settings')}</FieldLabel>
-        <FieldDescription className="max-w-xl leading-5">
-          {t(
-            '把全部账号（含登录凭据）与系统设置存成一个 JSON 文件，拿到新机器上导入即可。用量历史、设备绑定与管理密码不在其中。',
-            'Save every account (including its login credentials) and the system settings to one JSON file, then import it on the new machine. Usage history, device bindings, and the admin password are not included.',
-          )}
-        </FieldDescription>
+    <SettingsRow
+      label={t('导出账号与设置', 'Export accounts & settings')}
+      description={t(
+        '把全部账号（含登录凭据）与系统设置存成一个 JSON 文件，拿到新机器上导入即可。用量历史、设备绑定与管理密码不在其中。',
+        'Save every account (including its login credentials) and the system settings to one JSON file, then import it on the new machine. Usage history, device bindings, and the admin password are not included.',
+      )}
+      note={
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="warning" size="sm">
             <AlertTriangleIcon />
@@ -111,27 +109,26 @@ function ExportPanel() {
             </Badge>
           )}
         </div>
-      </div>
-      <div className="flex w-full items-center gap-2 sm:w-auto">
-        <Button
-          className="w-full sm:w-auto"
-          disabled={locked}
-          loading={run.isPending}
-          title={
-            locked
-              ? t(
-                  '控制台未设密码时，管理接口对任何能连到端口的人都是敞开的，这个文件不能这样发出去。',
-                  'Without an admin password the management API is open to anyone who can reach the port; this file must not be handed out that way.',
-                )
-              : undefined
-          }
-          onClick={() => run.mutate()}
-        >
-          <DownloadIcon />
-          {t('导出文件', 'Export file')}
-        </Button>
-      </div>
-    </Field>
+      }
+    >
+      <Button
+        className="w-full sm:w-auto"
+        disabled={locked}
+        loading={run.isPending}
+        title={
+          locked
+            ? t(
+                '控制台未设密码时，管理接口对任何能连到端口的人都是敞开的，这个文件不能这样发出去。',
+                'Without an admin password the management API is open to anyone who can reach the port; this file must not be handed out that way.',
+              )
+            : undefined
+        }
+        onClick={() => run.mutate()}
+      >
+        <DownloadIcon />
+        {t('导出文件', 'Export file')}
+      </Button>
+    </SettingsRow>
   )
 }
 
@@ -222,34 +219,29 @@ function ImportPanel() {
 
   return (
     <>
-      <Field className="grid gap-4 p-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-x-6">
-        <div className="min-w-0 space-y-1.5">
-          <FieldLabel>{t('导入迁移文件', 'Import a migration file')}</FieldLabel>
-          <FieldDescription className="max-w-xl leading-5">
-            {t(
-              '读入另一台机器导出的文件。同一个账号（按账号 UUID 认，其次是登录凭据）已经在本机时会被文件里的那份覆盖，其余新增。',
-              'Read a file exported from another machine. An account already present here (matched by account UUID, then by its credentials) is overwritten by the one in the file; the rest are added.',
-            )}
-          </FieldDescription>
-        </div>
-        <div className="flex w-full items-center gap-2 sm:w-auto">
-          <input
-            ref={fileRef}
-            accept="application/json,.json"
-            className="hidden"
-            type="file"
-            onChange={(e) => void pick(e.currentTarget)}
-          />
-          <Button
-            className="w-full sm:w-auto"
-            variant="outline"
-            onClick={() => fileRef.current?.click()}
-          >
-            <UploadIcon />
-            {t('选择文件', 'Choose file')}
-          </Button>
-        </div>
-      </Field>
+      <SettingsRow
+        label={t('导入迁移文件', 'Import a migration file')}
+        description={t(
+          '读入另一台机器导出的文件。同一个账号（按账号 UUID 认，其次是登录凭据）已经在本机时会被文件里的那份覆盖，其余新增。',
+          'Read a file exported from another machine. An account already present here (matched by account UUID, then by its credentials) is overwritten by the one in the file; the rest are added.',
+        )}
+      >
+        <input
+          ref={fileRef}
+          accept="application/json,.json"
+          className="hidden"
+          type="file"
+          onChange={(e) => void pick(e.currentTarget)}
+        />
+        <Button
+          className="w-full sm:w-auto"
+          variant="outline"
+          onClick={() => fileRef.current?.click()}
+        >
+          <UploadIcon />
+          {t('选择文件', 'Choose file')}
+        </Button>
+      </SettingsRow>
 
       <Dialog
         open={file !== null}
@@ -257,7 +249,7 @@ function ImportPanel() {
           if (!next && !run.isPending) close()
         }}
       >
-        <DialogPopup className="max-w-lg">
+        <DialogPopup>
           <DialogHeader>
             <DialogTitle>{t('确认导入', 'Confirm import')}</DialogTitle>
             <DialogDescription className="mt-1 flex items-center gap-1.5 truncate" title={filename}>

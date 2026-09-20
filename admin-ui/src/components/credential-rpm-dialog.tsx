@@ -86,7 +86,7 @@ export function CredentialRpmDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogPopup className="max-w-lg">
+      <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('RPM 上限', 'RPM limit')}</DialogTitle>
           <DialogDescription className="mt-1 truncate" title={credentialLabel}>
