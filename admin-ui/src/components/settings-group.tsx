@@ -149,9 +149,11 @@ export function SettingsGroup({
             <h3>{title}</h3>
           </FrameTitle>
         </div>
-        {/* 卡片描述 text-sm、行描述 text-xs：同为 text-xs 时卡片头读起来就是又一行普通说明。 */}
+        {/* 卡片描述 text-sm、行描述 text-xs：同为 text-xs 时卡片头读起来就是又一行普通说明。
+            与标题对齐（让过图标那 24px）只在 sm 起做：窄屏上这 24px 会把本来就要换行的说明
+            再多挤出一行，还带出一道悬挂缩进；手机上让它从卡片槽宽起排。 */}
         {description && (
-          <FrameDescription className={cn('text-sm leading-5', Icon && 'pl-6')}>
+          <FrameDescription className={cn('text-sm leading-5', Icon && 'sm:pl-6')}>
             <ClampedDescription text={description} />
           </FrameDescription>
         )}

@@ -601,14 +601,15 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
       value: bareRequestPolicy,
     },
     {
-      label: t('最低客户端版本', 'Minimum client version'),
-      value: settings.min_client_version
-        ? t(`${settings.min_client_version} 及以上`, `${settings.min_client_version}+`)
-        : t('不限', 'Unlimited'),
-    },
-    {
-      label: t('官方最新版本', 'Latest official release'),
-      value: effectiveLatestRelease(settings),
+      // 最低版本与官方最新版并作一格：它们是下面同一张「客户端版本」卡的两行，
+      // 分两格既把概览挤到第七格，又让人以为是两套互不相干的规则。
+      label: t('客户端版本', 'Client version'),
+      value: [
+        settings.min_client_version
+          ? t(`${settings.min_client_version} 及以上`, `${settings.min_client_version}+`)
+          : t('不限', 'Unlimited'),
+        t(`最新 ${effectiveLatestRelease(settings)}`, `latest ${effectiveLatestRelease(settings)}`),
+      ].join(' · '),
     },
   ]
 
@@ -621,20 +622,23 @@ function DevicePolicyOverview({ settings }: { settings: Settings }) {
         'A summary of the device binding and identity rules currently in effect.',
       )}
     >
-      {/* 窄屏两列、宽屏一行自适应列宽（auto-cols-auto）。边框类按这个布局写死的。 */}
+      {/* 等宽方格：手机 2 列、≥640 起 3 列，六格正好铺满两行、不留半截空格。
+          原来是 `md:grid-flow-col md:auto-cols-auto` 把七格挤成一行——列宽按内容自动分配，
+          结果每格宽窄不一（「无身份请求」那格比「RPM 上限」窄一半），而值又写着 whitespace-nowrap，
+          「设备 1 小时 · 会话 30 分钟」直接压过右边那道竖线。这里改成固定列数 + 值允许换行：
+          格子宽度一致，最长的那串（RPM 四道闸）折成两行也不碰到邻格。
+          分隔线用 `gap-px` + 底色透出来，不再按序号拼 border 类——列数一变就得重算的写法。 */}
       <dl
         aria-label={t('当前设备策略概览', 'Current device policy overview')}
-        className="grid grid-cols-2 md:grid-flow-col md:auto-cols-auto"
+        // 圆角比面板小 1px（面板自己的内圈阴影也是这么算的）：格子底色是实心的，
+        // 不跟着收角就会在卡片四角露出方角，盖住下面那层灰托盘。
+        className="grid grid-cols-2 gap-px overflow-hidden rounded-[calc(var(--radius-xl)-1px)] bg-border sm:grid-cols-3 max-sm:rounded-none"
       >
-        {items.map((item, index) => (
-          <div
-            key={item.label}
-            // 槽宽分两档（手机 16 / ≥640 20），与设置页每一行、账号页概览条同一套：六格铺平时每格仍有
-            // 放内容，而这里的值都是「2 小时」「1.0.128」这类短串且 whitespace-nowrap，够用。
-            className={`min-w-0 px-4 py-4 sm:px-5 ${index >= 2 ? 'border-t md:border-t-0' : ''} ${index % 2 === 1 ? 'border-l' : ''} ${index > 0 ? 'md:border-l' : ''}`}
-          >
+        {items.map((item) => (
+          // 槽宽分两档（手机 16 / ≥640 20），与设置页每一行、账号页概览条同一套。
+          <div key={item.label} className="min-w-0 bg-background px-4 py-4 sm:px-5">
             <dt className="text-xs text-muted-foreground">{item.label}</dt>
-            <dd className="mt-1 font-semibold text-sm leading-snug whitespace-nowrap">{item.value}</dd>
+            <dd className="mt-1 font-semibold text-sm leading-snug">{item.value}</dd>
           </div>
         ))}
       </dl>

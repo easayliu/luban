@@ -118,7 +118,9 @@ export function SettingsPage({
             >
               {t('系统设置', 'System settings')}
             </h1>
-            <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+            {/* 页面描述窄屏收进读屏文本：375px 上它要占两到三行，而它是给第一次进来的人看的，
+                不是每次都要读。移动端的页面头只留标题。 */}
+            <p className="mt-1.5 text-sm leading-6 text-muted-foreground max-sm:sr-only">
               {t(
                 '集中管理 Luban 的客户端接入、设备绑定、转发行为与控制台安全。',
                 'Manage client access, device bindings, forwarding behaviour, and console security.',
@@ -132,7 +134,10 @@ export function SettingsPage({
             value={section}
             onValueChange={changeSection}
           >
-            <div className="settings-tabs-bar sticky z-10 min-w-0 self-start bg-surface-page py-2 lg:top-24 lg:w-60 lg:shrink-0 lg:bg-transparent lg:py-0">
+            {/* `self-start` 只给 lg 那档的侧栏用（收到 15rem 宽、贴顶）。手机上 Tabs 是竖排，
+                  `self-start` 会把这一栏收成内容宽——整页唯一的分类导航缩成一枚小下拉，
+                  既不好点也读不出它是导航。窄屏改 `self-stretch` 铺满。 */}
+            <div className="settings-tabs-bar sticky z-10 min-w-0 self-stretch bg-surface-page py-2 lg:top-24 lg:w-60 lg:shrink-0 lg:self-start lg:bg-transparent lg:py-0">
               <div className="lg:hidden">
                 <label className="sr-only" htmlFor="settings-section-select">
                   {t('设置分类', 'Settings category')}
@@ -197,7 +202,11 @@ export function SettingsPage({
                   刚画过、同一句话下面第一张卡片又要再说一遍（「代理池」那一区最明显：三个字出现
                   三次、描述出现两次）。左导航已经交代了「在哪一区」，这里留一个 h2 接住标题层级
                   与 aria 就够，各区具体讲什么交给卡片头自己说。 */}
-              <h2 className="mb-4 font-semibold text-lg tracking-tight">{active.label}</h2>
+              {/* 窄屏上这个 h2 紧贴在分类下拉底下，是同一个词连说两遍；留给读屏但不占位置。
+                  lg 起侧栏在左、正文在右，它才是正文这一列的标题。 */}
+              <h2 className="font-semibold text-lg tracking-tight max-lg:sr-only lg:mb-4">
+                {active.label}
+              </h2>
 
               <TabsPanel className="min-w-0" value="access">
                 {section === 'access' && <AccessSettingsContent />}

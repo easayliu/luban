@@ -39,6 +39,7 @@ import {
   proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
+  METER_FILL,
   orgBadgeLabel,
   quotaPercentage,
   switchTitle,
@@ -585,6 +586,11 @@ export const CredentialCard = memo(function CredentialCard({
             {cred.quota && (has5h || has7d) ? (
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
               //
+              // 断点回到 `@sm/card`（24rem / 384px），与这套胶囊排法是配套的：
+              // 三枚胶囊「1947 req · 397M · $650.10」约 168px（token 那格不带 `tok` 后缀、
+              // 胶囊自带内边距所以 `gap-x-2` 就够），一列 (384-32-16)/2 = 176px 装得下。
+              // 之前把断点推到 512px，是因为当时那版带 ` tok` 后缀又用 `gap-x-3`，
+              // 一列要 204px；排法换回来之后不必再推，卡片也不会平白高一行。
               <div
                 className={cn(
                   'grid gap-3',
@@ -1015,12 +1021,10 @@ function UpstreamVerdict({
 }
 
 /**
- * 额度里的一项事实（请求数、总 token、花费）：值在前、单位在后的一小段文本。
+ * 额度里的一项事实（请求数、总 token、花费）：浅灰小块，值在前、单位在后。
  *
- * 原来是浅灰实心小块。去掉底色有两个理由：一是这张卡片上实心胶囊已经是**状态**的语言
- * （运行正常 / 上游已拒 / 套餐），读数借用同一副面孔会让一屏全是色块；二是胶囊自带的左右内边距
- * 把这行挤得没地方写单位，于是三个数里有两个靠符号猜（`req`、`$`）、`24.8K` 干脆没有量纲。
- * 省下的内边距正好够把单位写全——数字一律带单位，是 Cloudflare 那套读数的底线。
+ * 做成块而不是「标签: 值」的文本对——卡片上这行要能一眼扫过去，标签在小字号下只是噪声，
+ * 真要确认是什么，悬浮提示与读屏文本都写着全称。
  *
  * 提示用 `Tooltip` 组件而不是原生 `title`，且 `delay={0}`：原生提示要等约 1 秒才冒出来，
  * 而这三块的提示装的正是「这个数到底是什么、精确值多少」——等一秒才看见，等于没有。
@@ -1044,10 +1048,13 @@ function QuotaFact({
       <TooltipTrigger
         render={<div />}
         delay={0}
-        className="inline-flex min-w-0 cursor-help items-baseline gap-1 text-xs"
+        className={cn(
+          badgeVariants({ variant: 'secondary', size: 'sm' }),
+          'min-w-0 gap-0.5 font-normal',
+        )}
       >
         <dt className="sr-only">{label}</dt>
-        <dd className="truncate font-medium tabular-nums">{value}</dd>
+        <dd className="truncate tabular-nums">{value}</dd>
         {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
       </TooltipTrigger>
       <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
@@ -1087,15 +1094,6 @@ function QuotaMeter({
   // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则 5h 与 7d 两条的尾巴会错开。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
-  // 常态是 marine（cf-ui 的 UI 蓝，见 index.css），不是绿。用量条的常态不是「成绩好」，
-  // 只是「还没用到该管的程度」；绿色会让 0% 读成一种褒奖，而真到了黄、红时的跳变也就没那么显眼。
-  // 阈值状态照旧：吃紧琥珀、打满红。
-  const indicatorClass = level === 'critical'
-    ? 'bg-destructive'
-    : level === 'warning'
-      ? 'bg-warning'
-      : 'bg-marine'
-
   // 文字一律用 `-foreground` 那一支：`--destructive` 是给填充用的底色，拿来写字在浅底上
   // 对比度不够、暗色下又偏暗（见 index.css 里两支的注）。旁边的 warning 本来就用对了。
   const valueClass = level === 'critical'
@@ -1109,7 +1107,11 @@ function QuotaMeter({
       {/* 数据先行、进度条随后：请求数与花费是「这个窗口里发生了什么」，百分比是「还剩多少」。
           两组分行排，比原先挤在一行的三列 dl 好扫——那一行里三个标签三个值交替出现，
           眼睛得逐个配对。 */}
-      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+      {/* 进度条上面这一行：三个事实是 `secondary` 胶囊（见 QuotaFact），不是裸文本。
+          胶囊自带内边距，所以间距用 `gap-x-2` 而不是 `gap-x-3`；token 那格也不挂 `tok`
+          后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开，挂上后缀一列要多 24px，
+          `@sm/card` 下（一列 176px）会把第三枚挤到第二行，两条进度条跟着一上一下错开。 */}
+      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <QuotaFact
           label={t('请求数', 'Requests')}
           value={requests == null ? '—' : formatCompactNumber(requests, locale)}
@@ -1121,7 +1123,6 @@ function QuotaMeter({
         <QuotaFact
           label={t('总 token', 'Total tokens')}
           value={tokens == null ? '—' : formatTokens(tokens)}
-          suffix="tok"
           hint={tokens == null
             ? undefined
             : t(
@@ -1147,7 +1148,10 @@ function QuotaMeter({
           <span className="sr-only">{t('用量', 'usage')}</span>
         </MeterLabel>
         <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
-          <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
+          {/* 填充色走共享的 [METER_FILL]：常态绿、吃紧琥珀、打满红，与设备 / 会话那几条
+              计量条同一套档位配色。v0.3.142 曾把这条的常态单独改成 marine 蓝，只有这一处
+              与别处不同，现在归位。 */}
+          <MeterIndicator className={cn(METER_FILL[level], 'rounded-full')} />
         </MeterTrack>
         {/* 百分比与倒计时都给定宽的一格、文字左对齐：一张卡上下摞着 5h 与 7d 两条，`8%` 与
             `100%` 宽度不同、倒计时又时有时无，两格若按内容伸缩，两条进度条就一长一短、尾巴
