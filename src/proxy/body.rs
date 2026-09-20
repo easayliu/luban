@@ -482,7 +482,7 @@ pub(super) fn rewrite_body_out(
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered =
         sim.is_some_and(|sim| align_cc_top_level_order(&mut v, sim.profile.body_key_order));
-    // 模拟路径把官方主线程恒带的 11 个真工具（[`cc_tools_core`]）对齐进工具列表：客户端没
+    // 模拟路径把官方主线程恒带的 14 个真工具（[`cc_tools_core`]）对齐进工具列表：客户端没
     // 声明的补上，声明了的同名工具换成官方那条，其余原样。上游判第三方的信号之一是
     // 「自称 CC 但没有 CC 工具」，光加 mcp__ 前缀不够——零个 CC 工具等于自证不是 CC；而只注
     // 四个也不是官方形态：2.1.258 / 2.1.260 / 2.1.270 的主线程抓包最少 13 个工具。注入的
@@ -2442,7 +2442,7 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
     matches!((surface(client), surface(official)), (Some(a), Some(b)) if a == b)
 }
 
-/// 把该 profile 的 11 个官方主线程工具对齐进 `tools`：出站列表**以这 11 条按官方声明序开头**，
+/// 把该 profile 的 14 个官方主线程工具对齐进 `tools`：出站列表**以这 14 条按官方声明序开头**，
 /// 每一条都是资产里那个对象（客户端没声明的是补的，声明了同名的是换的），客户端其余工具
 /// 跟在后面、相对次序不变。补哪几个由 [`cc_tools_to_inject`] 定，流水那侧对的也是这一份。
 ///
@@ -2454,7 +2454,7 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
 /// 日志，出了事对得上是哪个客户端的哪条工具。
 ///
 /// **为什么不是原位换、缺的插头部**：那样客户端只缺 ListAgents 等四个时，补的四个全排在
-/// Agent 前面，11 条的相对次序就不是官方的了。官方的内建工具是一段固定次序，MCP 工具跟在
+/// Agent 前面，14 条的相对次序就不是官方的了。官方的内建工具是一段固定次序，MCP 工具跟在
 /// 最后（`cap/2.1.258-api/00006`：`Write` 之后才是 `mcp__ide__*`），这里照这个形态排。
 ///
 /// **同名声明里显式写的 `eager_input_streaming` 保留**：那是客户端的设置（true 或 false 都是），
@@ -2463,7 +2463,7 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
 /// 一律取资产的。
 ///
 /// **换不换不看 JSON 值相等**：`Value` 的相等忽略对象键序，客户端一条内容全同、键序不同的
-/// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 11 条一律以资产对象
+/// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 14 条一律以资产对象
 /// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body`] 那条
 /// 「什么都没改就原样透传」的快路。
 fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
@@ -3586,7 +3586,7 @@ mod tests {
     }
 
     /// 模拟路径：按**出站 profile** 判，与来访自报的版本无关。opus（On）给客户端保留的工具补；
-    /// fable（Off）不补；sonnet（Unknown）跟随注入的 opus 资产，也补。注入的 11 个官方工具不受
+    /// fable（Off）不补；sonnet（Unknown）跟随注入的 opus 资产，也补。注入的 14 个官方工具不受
     /// 影响——它们自带取值（opus 全带、fable 全不带）。
     #[test]
     fn simulated_eager_input_streaming_follows_the_outbound_profile() {
@@ -5577,20 +5577,20 @@ mod tests {
         };
         // 没有 tools 键：官方无工具 helper 的形态，一个都不注。
         assert!(super::cc_tools_to_inject(&body(""), profile).is_empty());
-        // 空数组：全部 11 个。
+        // 空数组：全部 14 个。
         assert_eq!(super::cc_tools_to_inject(&body(r#","tools":[]"#), profile), all);
         // 已带部分官方名：只补缺的，顺序仍是官方声明序。
         let partial = body(r#","tools":[{"name":"Skill"},{"name":"Bash"},{"name":"TaskCreate"}]"#);
         let expect: Vec<&str> =
             all.iter().copied().filter(|n| !["Skill", "Bash"].contains(n)).collect();
         assert_eq!(super::cc_tools_to_inject(&partial, profile), expect);
-        // 11 个全声明了：不注。
+        // 14 个全声明了：不注。
         let full = body(&format!(
             r#","tools":[{}]"#,
             all.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
         ));
         assert!(super::cc_tools_to_inject(&full, profile).is_empty());
-        // 只有第三方名：全部 11 个，与真正注进去的一致。
+        // 只有第三方名：全部 14 个，与真正注进去的一致。
         let mut v = body(r#","tools":[{"name":"exec"},{"name":"read_file"}]"#);
         let planned = super::cc_tools_to_inject(&v, profile);
         assert_eq!(planned, all);
@@ -5949,7 +5949,7 @@ mod tests {
             "模拟后顶层键序必须与官方抓包一致: {}",
             String::from_utf8_lossy(&out)
         );
-        // 模拟路径注入了官方主线程的 11 个工具，它们排在前面。
+        // 模拟路径注入了官方主线程的 14 个工具，它们排在前面。
         let tool_names: Vec<&str> = v["tools"]
             .as_array()
             .unwrap()

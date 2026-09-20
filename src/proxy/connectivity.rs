@@ -832,7 +832,7 @@ pub(super) fn probe_body(model: &str) -> Bytes {
         serde_json::json!({
             "model": model,
             "messages": [{ "role": "user", "content": "quota" }],
-            // 空数组由 [`inject_cc_tools`] 填成官方主线程那 11 个；**这个键必须在**，
+            // 空数组由 [`inject_cc_tools`] 填成官方主线程那 14 个；**这个键必须在**，
             // 缺了那个函数就当是「官方无工具 helper」而不补。
             "tools": [],
             "max_tokens": PROBE_MAIN_MAX_TOKENS,

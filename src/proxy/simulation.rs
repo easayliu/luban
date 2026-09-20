@@ -414,7 +414,7 @@ pub(super) const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 /// server tool、`tool_choice` 强制它、`system` 只有一句「You are an assistant for performing a
 /// web search tool use」（57 字节，前面可能还有一块 billing header）。它没有基座、没有身份句，
 /// 按 [`simulation_reason`] 的判据会落到 `no_base_prompt`（带 billing header）或
-/// `not_cc_shaped`（不带），被重建成带基座与 11 个官方工具的主线程体，出站 UA 换成模拟那版、
+/// `not_cc_shaped`（不带），被重建成带基座与 14 个官方工具的主线程体，出站 UA 换成模拟那版、
 /// device_id 与会话 id 也换成模拟派生的——一条 `claude-cli/2.1.220` 的主线程会话中途冒出一台
 /// 2.1.260 的新设备发了一条搜索（`ban/luban-ban-13`、`ban-14` 各 2、3 条，`ban-37` 3 条；出站
 /// system 是 `[billing, 身份, 基座, 57 字节]`，末块正是那句搜索助手提示）。放行后走透传路径：
