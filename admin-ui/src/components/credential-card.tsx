@@ -463,14 +463,15 @@ export const CredentialCard = memo(function CredentialCard({
         </CardHeader>
 
         <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
-          {/* 这一行的徽章统一一档尺寸：kumo 的 Badge 压根没有 size 变体，一律 `text-xs`。
-              我们原来状态用默认档、其余四枚用 `sm`（桌面 10px），一行里大小不齐，而且 10px
-              低于 kumo 字号梯子的下限（`Text` 的 size 只到 xs＝12px）。 */}
+          {/* 这一行的徽章一律 `size="xs"`——整张卡片除标题外都是写死的 12px，不跟视口走，
+              徽章得落在同一档才不会比下面「用量限制」大一号。默认档是 `text-sm sm:text-xs`，
+              按 640px **视口**断点；而这张卡片走的是 `@sm/card` **容器**断点，两套不是一回事，
+              手机或窄窗口下就露馅。`xs` 那档的取舍见 `ui/badge.tsx`。 */}
           <div className="flex flex-wrap items-center gap-2">
             {statusUsesTooltip ? (
               <Tooltip>
                 <TooltipTrigger
-                  className={cn(badgeVariants({ variant: status.variant }), 'cursor-help')}
+                  className={cn(badgeVariants({ size: 'xs', variant: status.variant }), 'cursor-help')}
                   delay={0}
                   aria-label={t(
                     `${credentialLabel}：${status.label}。${status.detail}`,
@@ -490,6 +491,7 @@ export const CredentialCard = memo(function CredentialCard({
               </Tooltip>
             ) : (
               <Badge
+                size="xs"
                 variant={status.variant}
                 aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
               >
@@ -502,7 +504,7 @@ export const CredentialCard = memo(function CredentialCard({
             {isOrgAccount(cred) && (
               <Tooltip>
                 <TooltipTrigger
-                  className={cn(badgeVariants({ variant: 'outline' }), 'cursor-help')}
+                  className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help')}
                   delay={0}
                 >
                   {/* 图标不是装饰：org_type 与 tier 常常都叫 `Team`，两枚都成了描边胶囊之后
@@ -518,10 +520,10 @@ export const CredentialCard = memo(function CredentialCard({
                 </TooltipPopup>
               </Tooltip>
             )}
-            {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+            {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
             <Tooltip>
               <TooltipTrigger
-                className={cn(badgeVariants({ variant: 'outline' }), 'cursor-help tabular-nums')}
+                className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help tabular-nums')}
                 delay={0}
               >
                 P{cred.priority}
@@ -538,7 +540,7 @@ export const CredentialCard = memo(function CredentialCard({
                 <TooltipTrigger
                   render={<button type="button" />}
                   className={cn(
-                    badgeVariants({ variant: 'outline' }),
+                    badgeVariants({ size: 'xs', variant: 'outline' }),
                     'min-w-0 max-w-44 cursor-pointer gap-1 @sm/card:max-w-72',
                   )}
                   onClick={() => setProxyOpen(true)}
@@ -564,7 +566,8 @@ export const CredentialCard = memo(function CredentialCard({
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(
-                        badgeVariants({ variant: secondaryOverage.variant }),
+                        // 同上：它紧挨着 `text-xs` 的「用量限制」标题。
+                        badgeVariants({ size: 'xs', variant: secondaryOverage.variant }),
                         'cursor-help',
                       )}
                       delay={0}
@@ -1010,7 +1013,7 @@ function UpstreamVerdict({
     <Tooltip>
       <TooltipTrigger
         className={cn(
-          badgeVariants({ variant: destructive ? 'error' : 'warning' }),
+          badgeVariants({ size: 'xs', variant: destructive ? 'error' : 'warning' }),
           'cursor-help',
         )}
         delay={0}
@@ -1061,7 +1064,10 @@ function QuotaFact({
         render={<div />}
         delay={0}
         className={cn(
-          badgeVariants({ variant: 'secondary', size: 'sm' }),
+          // `sm` 那档桌面上是 10px，压在 12px 的「用量限制」标题下面矮一截，
+          // 且低于 kumo 字号梯子的下限（`Text` 的 size 只到 xs＝12px）。换成 `xs` 之后
+          // 两端都是 12px，圆角也从 4px 回到 2px，跟上面那行胶囊对齐。
+          badgeVariants({ size: 'xs', variant: 'secondary' }),
           'min-w-0 gap-0.5 font-normal',
         )}
       >

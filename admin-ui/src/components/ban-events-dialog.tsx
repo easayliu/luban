@@ -147,7 +147,9 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Fact label={t('上游原文', 'Upstream message')}>
           <div className="font-mono text-xs">
-            {ev.error_type && <Badge variant="outline" className="mr-1">{ev.error_type}</Badge>}
+            {/* `size="xs"`：这枚是内联嵌在一行 `text-xs` 正文里的，默认档带视口 ramp
+                （手机 14px），会比它夹在中间的文字还大。 */}
+            {ev.error_type && <Badge size="xs" variant="outline" className="mr-1">{ev.error_type}</Badge>}
             {ev.error_message ?? ev.reason}
           </div>
         </Fact>

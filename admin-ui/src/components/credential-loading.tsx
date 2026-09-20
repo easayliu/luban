@@ -59,10 +59,12 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
             </CardHeader>
 
             <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
+              {/* `h-4.5` 对齐真卡片那行徽章的 `size="xs"`（恒定 18px，不随视口变）：
+                  占位比实物高一点点，加载完成的瞬间就会看见整行往上跳。 */}
               <div className="flex flex-wrap items-center gap-2">
-                <Skeleton className="h-5 w-14" />
-                <Skeleton className="h-5 w-16" />
-                <Skeleton className="h-5 w-9" />
+                <Skeleton className="h-4.5 w-14" />
+                <Skeleton className="h-4.5 w-16" />
+                <Skeleton className="h-4.5 w-9" />
               </div>
               <section className="space-y-2">
                 <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1.5">

@@ -19,6 +19,16 @@ export const badgeVariants = cva(
           "h-5.5 min-w-5.5 px-[calc(--spacing(1)-1px)] text-sm sm:h-4.5 sm:min-w-4.5 sm:text-xs",
         lg: "h-6.5 min-w-6.5 px-[calc(--spacing(1.5)-1px)] text-sm sm:h-5.5 sm:min-w-5.5",
         sm: "h-5 min-w-5 rounded-[.25rem] px-[calc(--spacing(1)-1px)] text-xs sm:h-4 sm:min-w-4 sm:text-[.625rem]",
+        // 唯一不带视口 ramp 的一档：固定 12px / 18px 高。
+        //
+        // 上面三档都把「触屏要大一号」挂在 640px 视口断点上，而视口宽度只是触屏的代理变量，
+        // 两头都不准——桌面窗口拖窄到 600px 会平白吃到触屏尺寸；容器查询驱动的卡片里，
+        // 视口有多宽跟这张卡片有多宽更是毫无关系。（点击热区那条 `pointer-coarse:` 才是
+        // 对的轴，见上面 base class。）
+        //
+        // 所以凡是排版尺度自己固定、不跟视口走的地方——典型是 `@container` 卡片内部——
+        // 用这一档，别在调用点拿 `text-xs` 去盖默认档：那是结果对、表达错，不会跟着走。
+        xs: "h-4.5 min-w-4.5 px-[calc(--spacing(1)-1px)] text-xs",
       },
       variant: {
         default:
