@@ -68,18 +68,22 @@ export function OverviewMetric({
         {/* 一行排数值、小字、迷你线，但这两样不会同时出现：带迷你线的两格不再放小字（三样在
             任何宽度下都挤不开，见 credential-workspace 那两处注释）。迷你线放最后、按剩余宽度
             伸缩，手机上一格不到 190px 也缩得进来。
-            小字是 12px 而不是 11px：手机半格正文 155px，最长的「2 暂不可用」在 12px 下约 58px，
-            与 18px 的数值（约 28px）并排仍有富余；11px 只是把字压小，并没有换来位置。 */}
+            小字是 12px 而不是 11px：手机半格正文 139px，最长的「2 暂不可用」在 12px 下约 58px，
+            与 18px 的数值（约 28px）并排共 94px，仍有富余；11px 只是把字压小，并没有换来位置。 */}
         <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span className={cn('shrink-0 text-lg font-semibold leading-none tracking-tight tnum', valueClass)}>
             {value}
           </span>
-          {/* 状态小字（「2 暂不可用」「2 封禁」）手机上不出：CF 的移动端概览格只放标签与数值，
-              一格半屏宽，再塞一句解释就要么把数值挤扁、要么被截成半句。完整说法仍在整格的悬浮
-              提示（[statusHint]）与点开的筛选结果里，sm 起照常显示。 */}
+          {/* 状态小字（「2 暂不可用」「2 封禁」）手机上也显示。v0.3.142 曾把它设成 sr-only，
+              理由是「一格半屏宽再塞一句解释会把数值挤扁」；重算过是装得下的：375px 屏两列、
+              一格 171px，扣掉 `px-4` 得 139px 正文，数值（约 28px）+ 间距 8px + 最长的
+              「2 暂不可用」（12px 下约 58px）= 94px。
+              真放不下时由 `min-w-0 shrink truncate` 截尾，不会把数值挤扁——数值是 `shrink-0`，
+              被截的永远是这句小字；完整说法仍在整格的悬浮提示与点开的筛选结果里。
+              带迷你趋势线的两格本来就不传 status，三样挤一行的问题不存在。 */}
           {status && (
             <Tooltip>
-              <TooltipTrigger className="sr-only min-w-0 shrink truncate text-xs text-muted-foreground sm:not-sr-only sm:block">
+              <TooltipTrigger className="min-w-0 shrink truncate text-xs text-muted-foreground">
                 {status}
               </TooltipTrigger>
               <TooltipPopup>{status}</TooltipPopup>
@@ -157,19 +161,21 @@ export function LiveTrafficMetric({
               {value}
             </span>
             <span className="shrink-0 text-xs text-muted-foreground tracking-wide">{unit}</span>
-            {/* 在途数与上面那句状态小字同一处理：手机上只留数值与单位，在途靠呼吸点表达
-                「此刻有没有活」，具体几条在悬浮提示里。静默时连中点也不留，免得行尾吊一个孤点。 */}
+            {/* 在途数手机上也显示。v0.3.142 曾按「与状态小字同一处理」把它设成 sr-only，
+                只留呼吸点；但算下来它装得下：375px 屏两列、一格 171px，扣掉 `px-4` 得 139px
+                正文，而「0 RPM · 0 在途」约 99px。数大时靠 `min-w-0 truncate` 收尾，
+                不会把格子撑开。整格的悬浮提示里仍有完整说法。
+                静默时补一个中点当分隔；有在途时呼吸点自己就是分隔符，再补中点只是噪声。 */}
             <span className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-              {/* 有在途时呼吸点就是分隔符本身，再补一个中点只是噪声。 */}
               {live ? (
                 <span className="relative flex size-1.5 shrink-0 translate-y-[-1px]" aria-hidden>
                   <span className="absolute inline-flex size-full animate-ping rounded-full bg-success opacity-60 motion-reduce:hidden" />
                   <span className="relative inline-flex size-1.5 rounded-full bg-success" />
                 </span>
               ) : (
-                <span className="hidden sm:inline" aria-hidden>·</span>
+                <span aria-hidden>·</span>
               )}
-              <span className="sr-only truncate sm:not-sr-only sm:inline">{detail}</span>
+              <span className="min-w-0 truncate">{detail}</span>
             </span>
           </div>
         </div>

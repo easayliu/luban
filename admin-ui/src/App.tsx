@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
+import { PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getSettings } from '@/api/settings'
@@ -290,8 +290,19 @@ function App() {
         onNavigateHome={scrollToTop}
         actions={
           <>
-            {/* 顶栏只留这一枚主动作（相当于 Cloudflare 顶栏里的全局搜索），其余全部收进菜单。
-                「添加账号」不在这儿了——它是页面级动作，挪到了下面「账号池」标题那一行。 */}
+            {/* 「添加账号」是顶栏第一枚、也是唯一的实心按钮：这一页的主动作在这儿最好够。
+                窄屏只留一枚橙色 `+`，≥640px 带上文字。 */}
+            <Button
+              aria-label={t('添加账号', 'Add account')}
+              className="max-sm:size-10 max-sm:px-0"
+              disabled={isBootstrapping}
+              size="sm"
+              title={t('添加账号', 'Add account')}
+              onClick={() => setAdding(true)}
+            >
+              <PlusIcon />
+              <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+            </Button>
             <Button
               aria-label={t('请求查询', 'Request lookup')}
               className="max-sm:size-10 max-sm:px-0"

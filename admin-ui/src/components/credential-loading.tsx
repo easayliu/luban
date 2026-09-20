@@ -41,7 +41,7 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
       {Array.from({ length: count }, (_, index) => (
         <li key={index} className="min-w-0 h-full">
           <Card render={<article />} className="@container/card min-h-[17rem] h-full overflow-hidden">
-            <CardHeader className="px-4 pt-4 pb-3 sm:px-5">
+            <CardHeader className="p-4 pb-3">
               <CardTitle className="text-sm leading-snug">
                 <div className="flex items-center gap-3">
                   {selectable && <Skeleton className="size-4 shrink-0" />}
@@ -58,7 +58,7 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
               <CardAction><Skeleton className="size-8" /></CardAction>
             </CardHeader>
 
-            <CardPanel className="space-y-3 px-4 pb-3 sm:px-5 sm:pb-4">
+            <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
               <div className="flex flex-wrap items-center gap-2">
                 <Skeleton className="h-5 w-14" />
                 <Skeleton className="h-5 w-16" />
@@ -76,7 +76,7 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
               </section>
             </CardPanel>
 
-            <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:px-5 sm:py-3">
+            <CardFooter className="mt-auto grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/32 px-4 py-2.5 sm:py-3">
               <div className="grid min-w-0 gap-2 @sm/card:grid-cols-[auto_minmax(0,1fr)] @sm/card:items-center @sm/card:gap-4">
                 <Skeleton className="h-9 w-28 sm:h-8" />
                 <Skeleton className="h-4 w-20" />

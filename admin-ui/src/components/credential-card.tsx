@@ -39,7 +39,6 @@ import {
   proxyDisplayLabel,
   quotaLevel,
   isOrgAccount,
-  METER_FILL,
   orgBadgeLabel,
   quotaPercentage,
   switchTitle,
@@ -347,7 +346,11 @@ export const CredentialCard = memo(function CredentialCard({
           selected && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
         )}
       >
-        <CardHeader className="px-4 pt-4 pb-3 sm:px-5">
+        {/* 账号卡片的槽宽固定 16px，不跟全站那档「手机 16 / ≥640 20」走：
+            这张卡在网格里通常只有 300–600px 宽，里面「5h 1 req 24.8K tok $0.018 … 0%」
+            那一行是逐字算过的，两侧各多 4px 就会把 `$0.018` 挤到第二行。
+            页面级卡片（工作区、设置面板）才用 20px。 */}
+        <CardHeader className="p-4 pb-3">
           <CardTitle className="min-w-0 text-sm leading-snug">
             {editing ? (
               <>
@@ -457,7 +460,7 @@ export const CredentialCard = memo(function CredentialCard({
           )}
         </CardHeader>
 
-        <CardPanel className="space-y-3 px-4 pb-3 sm:px-5 sm:pb-4">
+        <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
           {/* 这一行的徽章统一一档尺寸：kumo 的 Badge 压根没有 size 变体，一律 `text-xs`。
               我们原来状态用默认档、其余四枚用 `sm`（桌面 10px），一行里大小不齐，而且 10px
               低于 kumo 字号梯子的下限（`Text` 的 size 只到 xs＝12px）。 */}
@@ -581,6 +584,7 @@ export const CredentialCard = memo(function CredentialCard({
             </div>
             {cred.quota && (has5h || has7d) ? (
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
+              //
               <div
                 className={cn(
                   'grid gap-3',
@@ -667,7 +671,7 @@ export const CredentialCard = memo(function CredentialCard({
             （`py-2`），四格之间只留 gap，行高由 text-xs 决定，手机上整条 38px。前三格都带分母、
             说的是「此刻占了多少」，费用没有分母、说的是「一共烧了多少」——两类量之间隔一道 1px 竖线
             分组，而不是靠间距暗示。四格加开关在 360px 屏上也是一行，不换行、不砍分母、不藏东西。 */}
-        <CardFooter className="mt-auto flex items-center gap-2 border-t bg-muted/32 px-4 py-2 @sm/card:gap-3 sm:px-5">
+        <CardFooter className="mt-auto flex items-center gap-2 border-t bg-muted/32 px-4 py-2 @sm/card:gap-3">
           <FooterStat
             icon={SmartphoneIcon}
             iconClassName={devicePolicy.className}
@@ -1083,6 +1087,15 @@ function QuotaMeter({
   // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则 5h 与 7d 两条的尾巴会错开。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
+  // 常态是 marine（cf-ui 的 UI 蓝，见 index.css），不是绿。用量条的常态不是「成绩好」，
+  // 只是「还没用到该管的程度」；绿色会让 0% 读成一种褒奖，而真到了黄、红时的跳变也就没那么显眼。
+  // 阈值状态照旧：吃紧琥珀、打满红。
+  const indicatorClass = level === 'critical'
+    ? 'bg-destructive'
+    : level === 'warning'
+      ? 'bg-warning'
+      : 'bg-marine'
+
   // 文字一律用 `-foreground` 那一支：`--destructive` 是给填充用的底色，拿来写字在浅底上
   // 对比度不够、暗色下又偏暗（见 index.css 里两支的注）。旁边的 warning 本来就用对了。
   const valueClass = level === 'critical'
@@ -1096,52 +1109,54 @@ function QuotaMeter({
       {/* 数据先行、进度条随后：请求数与花费是「这个窗口里发生了什么」，百分比是「还剩多少」。
           两组分行排，比原先挤在一行的三列 dl 好扫——那一行里三个标签三个值交替出现，
           眼睛得逐个配对。 */}
-      {/* 两行说完一个窗口，与列表视图那格同一种切法（见 credential-row 的 ListQuotaMeter）：
-          第一行是**用量本身**——窗口名、这窗口里发生了什么（请求数 / token / 费用）、用掉百分之多少；
-          第二行是这个窗口的**时间维度**——进度条与还有多久重置。
-          上一版把标签行与事实行分开排，`5h` 和右端的 `0%` 之间隔着整行宽度、三个数字浮在标签上方
-          没有归属，一个窗口占三行；并进一行后既贴回了它们各自的窗口，又省下一行。 */}
-      <div className="flex min-w-0 items-baseline justify-between gap-3">
-        <div className="flex min-w-0 items-baseline gap-2">
-          {/* 窗口名是弱色文本，不是彩色胶囊：它只是"这条说的是哪个窗口"。实心胶囊在这张卡片上
-              已经是状态的语言（运行正常 / 上游已拒），借给分类只会多一块彩色抢注意力。 */}
-          <MeterLabel className="shrink-0 font-medium text-muted-foreground text-xs tabular-nums">
-            <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
-            {label}
-            <span className="sr-only">{t('用量', 'usage')}</span>
-          </MeterLabel>
-          <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-            <QuotaFact
-              label={t('请求数', 'Requests')}
-              value={requests == null ? '—' : formatCompactNumber(requests, locale)}
-              hint={requests == null ? undefined : requests.toLocaleString(locale)}
-              suffix="req"
-            />
-            {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
-                重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
-            <QuotaFact
-              label={t('总 token', 'Total tokens')}
-              value={tokens == null ? '—' : formatTokens(tokens)}
-              suffix="tok"
-              hint={tokens == null
-                ? undefined
-                : t(
-                  `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
-                  `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
-                )}
-            />
-            <QuotaFact
-              label={t('等价 API 费用', 'Equivalent API cost')}
-              value={cost == null ? '—' : formatUsd(cost)}
-            />
-          </dl>
-        </div>
-        {/* 百分比贴右，与下一行的倒计时上下摞成一列——右侧这一列回答的都是「这个窗口此刻怎么样」
-            （用掉多少、还剩多久）。它说的是「快照那一刻」的占用，快照时刻挂在悬浮提示里
-            ——这个数越接近 100，越需要知道它是几小时前的。字号比左边的标签高一档（kumo 的读数口径）。 */}
+      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-0.5">
+        <QuotaFact
+          label={t('请求数', 'Requests')}
+          value={requests == null ? '—' : formatCompactNumber(requests, locale)}
+          hint={requests == null ? undefined : requests.toLocaleString(locale)}
+          suffix="req"
+        />
+        {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
+            重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
+        <QuotaFact
+          label={t('总 token', 'Total tokens')}
+          value={tokens == null ? '—' : formatTokens(tokens)}
+          suffix="tok"
+          hint={tokens == null
+            ? undefined
+            : t(
+              `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
+              `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+            )}
+        />
+        <QuotaFact
+          label={t('等价 API 费用', 'Equivalent API cost')}
+          value={cost == null ? '—' : formatUsd(cost)}
+        />
+      </dl>
+      <div className="flex min-w-0 items-center gap-2">
+        {/* 窗口名是定宽的弱色文本，不是彩色胶囊：它只是"这条说的是哪个窗口"，一眼要认的是
+            旁边那条的长度与颜色。实心胶囊在这张卡片上已经是状态的语言（运行正常 / 上游已拒），
+            借给分类只会让一张卡片上五六块彩色抢同一份注意力。定宽 1.25rem 让 5h、7d 两条的
+            起点对齐。 */}
+        <MeterLabel
+          className="w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums"
+        >
+          <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
+          {label}
+          <span className="sr-only">{t('用量', 'usage')}</span>
+        </MeterLabel>
+        <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
+          <MeterIndicator className={cn(indicatorClass, 'rounded-full')} />
+        </MeterTrack>
+        {/* 百分比与倒计时都给定宽的一格、文字左对齐：一张卡上下摞着 5h 与 7d 两条，`8%` 与
+            `100%` 宽度不同、倒计时又时有时无，两格若按内容伸缩，两条进度条就一长一短、尾巴
+            错开，看着像两个窗口的用量差别。留白不补，条尾因此永远在同一条竖线上。 */}
+        {/* 百分比说的是「快照那一刻」的占用，快照时刻本身挂在悬浮提示里（原先是原生 `title`，
+            手机上根本出不来——而这个数越接近 100，越需要知道它是几小时前的）。 */}
         <Tooltip>
           <TooltipTrigger render={<span />} delay={0} className="shrink-0 cursor-help">
-            <MeterValue className={cn('font-medium text-sm tabular-nums', valueClass)}>
+            <MeterValue className={cn('block w-9 text-left font-medium text-xs tabular-nums', valueClass)}>
               {() => `${percentage}%`}
             </MeterValue>
           </TooltipTrigger>
@@ -1149,21 +1164,14 @@ function QuotaMeter({
             {t(`快照于 ${formatFullTime(snapshotTs, language)}`, `Snapshot at ${formatFullTime(snapshotTs, language)}`)}
           </TooltipPopup>
         </Tooltip>
-      </div>
-      <div className="flex min-w-0 items-center gap-2">
-        <MeterTrack className="h-2 min-w-6 flex-1 rounded-full">
-          <MeterIndicator className={cn(METER_FILL[level], 'rounded-full')} />
-        </MeterTrack>
-        {/* 距离重置还有多久。靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；精确到分秒的
-            绝对时刻在悬浮提示里——倒计时受本地时钟偏差影响，只适合看个大概。
-            定宽 3rem、没有未来的重置时刻时空着也占位：窄卡片上 5h 与 7d 上下摞着，这一格要是按
-            内容伸缩，两条的尾巴就会错开，看着像两个窗口的用量差别。 */}
+        {/* 距离重置还有多久。倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；
+            精确到分秒的绝对时刻在悬浮提示里——倒计时受本地时钟偏差影响，只适合看个大概。 */}
         {reset != null && reset > now ? (
           <Tooltip>
             <TooltipTrigger
               render={<span />}
               delay={0}
-              className="w-12 shrink-0 cursor-help whitespace-nowrap text-right text-xs text-muted-foreground tabular-nums"
+              className="w-12 shrink-0 cursor-help whitespace-nowrap text-left text-xs text-muted-foreground tabular-nums"
             >
               {formatCountdown(reset, now)}
             </TooltipTrigger>
@@ -1172,6 +1180,8 @@ function QuotaMeter({
             </TooltipPopup>
           </Tooltip>
         ) : (
+          // 没有未来的重置时刻时不写字、也不补「—」，但**宽度留着**：否则 5h 与 7d 两条的
+          // 尾巴会错开，看着像两个窗口的用量差别。与列表里那格同一处理（见 QuotaCountdown）。
           <span className="w-12 shrink-0" aria-hidden />
         )}
       </div>

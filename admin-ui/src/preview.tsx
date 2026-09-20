@@ -1,7 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { SettingsIcon } from 'lucide-react'
+import { PlusIcon, SettingsIcon } from 'lucide-react'
 import { AddAccount } from '@/components/add-account'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
@@ -17,6 +17,7 @@ import {
   type CredentialViewMode,
 } from '@/components/credential-workspace'
 import type { SortDir, SortKey } from '@/components/credential-shared'
+import { Button } from '@/components/ui/button'
 import { MenuItem } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -675,11 +676,23 @@ function PreviewHeader() {
       homeLabel={t('回到顶部', 'Back to top')}
       onNavigateHome={scrollToTop}
       actions={
+        <>
+        <Button
+          aria-label={t('添加账号', 'Add account')}
+          className="max-sm:size-10 max-sm:px-0"
+          size="sm"
+          title={t('添加账号', 'Add account')}
+          onClick={() => navigatePreview('?dialog=add')}
+        >
+          <PlusIcon />
+          <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+        </Button>
         <PreferencesMenu>
           <MenuItem onClick={() => navigatePreview('?settings=access')}>
             <SettingsIcon />{t('系统设置', 'System settings')}
           </MenuItem>
         </PreferencesMenu>
+        </>
       }
     />
   )
