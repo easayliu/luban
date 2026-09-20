@@ -334,16 +334,16 @@ export interface CredentialWorkspaceProps {
 function WorkspaceToolbarSkeleton() {
   return (
     <div
-      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center"
+      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end"
       aria-hidden="true"
     >
-      <Skeleton className="h-9 max-sm:col-start-1 max-sm:row-start-1 sm:h-8 sm:min-w-56 sm:flex-1" />
+      <Skeleton className="h-9 max-sm:col-start-1 max-sm:row-start-1 sm:h-8 sm:min-w-56 sm:flex-1 xl:max-w-64" />
       <div className="grid min-w-0 grid-cols-3 gap-1 max-sm:col-span-2 max-sm:row-start-2 sm:flex">
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-24" />
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
       </div>
-      <Skeleton className="h-9 w-[4.5rem] justify-self-end max-sm:col-start-2 max-sm:row-start-1 sm:ml-auto sm:h-8 sm:w-16" />
+      <Skeleton className="h-9 w-[4.5rem] justify-self-end max-sm:col-start-2 max-sm:row-start-1 sm:ml-auto sm:h-8 sm:w-16 xl:ml-0" />
     </div>
   )
 }
@@ -726,21 +726,26 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
   return (
     <div className="space-y-3 sm:space-y-4" data-slot="credential-workspace">
-      {/* 页面头：标题 + 两枚读数徽章在左，数据新鲜度 + 主动作在右。
-          裸在页面底色上、不套卡片——与设置页那个 `<h1>系统设置</h1>` 同一种读法，也是
-          Cloudflare 的页面头形态。原来这里是「标题 + 徽章 + 刷新 + 搜索 + 三枚筛选 +
-          视图切换 + 添加账号」九组控件挤一行（xl 下还靠 grid 把标题和工具条硬塞进同一行），
-          现在按职责拆成三段：页面头、工具条、指标卡。 */}
-      {/* 页面头 + 工具条 + 指标条同在一张卡片里（用户指定回到这个版式）。
-          标题行：账号池 + 两枚读数徽章在左，数据新鲜度在右。
-          「添加账号」不在这里——它是顶栏上那枚橙色 `+`（见 App.tsx 的 AppHeader actions）。
-          标题与工具条仍是各自一行：合到同一行要在 xl 下塞进九组控件，那是另一回事。 */}
+      {/* 页面头 + 工具条 + 指标条同在一张卡片里，**标题与工具条在宽屏上合成一行**
+          （用户指定回到 v0.3.142 的这个版式）：
+              xl 起  [账号池 13 个账号 7/65 台设备 ● 30 秒刷新][搜索 筛选 排序 | 视图切换]
+              xl 以下 两行，标题行内「刷新」靠 justify-between 推到右端
+          机制就是外层那个 `xl:grid-cols-[auto_minmax(0,1fr)]`：左列按内容宽、右列吃掉剩下的，
+          工具条自己 `xl:justify-end` 靠右。三处 `xl:` 是一套，改一个就得看另两个——
+          `Toolbar` 的 `xl:justify-end`（外层右推）必须配 `ToolbarSeparator` 的 `xl:ml-0`
+          （内层不再重复右推），搜索框也要 `xl:max-w-64` 封顶，否则它会把筛选器挤到屏幕外。
+          「添加账号」不在这里——它是顶栏上那枚橙色 `+`（见 App.tsx 的 AppHeader actions）。 */}
       <section
         className="overflow-hidden rounded-2xl border bg-card shadow-xs/5"
         aria-labelledby="page-title"
       >
-        <div className="space-y-3 px-4 py-4 sm:px-5">
-          <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div
+          className={cn(
+            'grid gap-3 px-4 py-4 sm:px-5',
+            (isLoading || count > 0) && 'xl:grid-cols-[auto_minmax(0,1fr)] xl:items-center',
+          )}
+        >
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2 xl:justify-start">
             <div className="flex min-w-0 flex-wrap items-center gap-2.5">
               <h1 id="page-title" className="min-w-0 text-lg font-semibold tracking-tight">
                 {t('账号池', 'Account pool')}
@@ -836,11 +841,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         {isLoading ? (
           <WorkspaceToolbarSkeleton />
         ) : count > 0 && (
-          <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center">
-            {/* 搜索框吃掉整行的剩余宽度（`sm:flex-1` 不封顶）。这是 Cloudflare 工具条的形状：
-                一个铺满的搜索框把筛选器顶到右端，整行没有死区。之前给它加过 `sm:max-w-80`，
-                那是它还和标题挤在同一行时留的，拆成独立一行后那个封顶就成了右边那片空白的来源。 */}
-            <InputGroup className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1">
+          <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
+            {/* sm–lg（工具条独占一行）时搜索框吃掉剩余宽度，整行没有死区；xl 起与标题同行，
+                必须用 `xl:max-w-64` 封顶——不封顶它会一路撑开，把筛选与视图切换挤出可视区。 */}
+            <InputGroup className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1 xl:max-w-64">
               <InputGroupAddon><SearchIcon /></InputGroupAddon>
               <InputGroupInput
                 ref={searchRef}
@@ -983,13 +987,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </Menu>
             </ToolbarGroup>
 
-            {/* `sm:ml-auto` 把视图切换推到整行最右端，与上一行「添加账号」的右边界、
-                以及下面指标卡与列表的右边界落在同一条竖线上。
-                原来这里还带着 `xl:ml-0`：那是配合旧版整条工具条 `xl:justify-end` 用的——
-                两者同时存在时 xl 以上由外层右推、内层就不该再推。拆成独立一行后
-                `xl:justify-end` 去掉了，这个抵消也必须跟着去掉，否则宽屏上整条挤在左边、
-                右边空出一大片。 */}
-            <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block" />
+            {/* `sm:ml-auto` 把视图切换推到整行最右端，与下面指标卡、列表的右边界落在同一条竖线上。
+                `xl:ml-0` 是给合并成一行的那档用的：那时整条工具条已由 `xl:justify-end` 右推，
+                内层再推一次就会把搜索与筛选之间撑开一大片空白。两者永远成对出现。 */}
+            <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block xl:ml-0" />
             <ToolbarGroup className="self-center justify-end max-sm:col-start-2 max-sm:row-start-1">
               <ToggleGroup
                 value={[view]}

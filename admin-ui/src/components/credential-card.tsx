@@ -36,7 +36,7 @@ import {
   evaluateCredential,
   modelCooldownSummary,
   modelDenialSummary,
-  proxyDisplayLabel,
+  proxyLabelParts,
   quotaLevel,
   isOrgAccount,
   METER_FILL,
@@ -299,6 +299,7 @@ export const CredentialCard = memo(function CredentialCard({
   // 避免同一条状态再渲染一块说明，把异常卡片单独撑高。
   const statusUsesTooltip = status.attention
   const added = relativeTime(cred.created_at, now, language)
+  const proxyLabel = cred.proxy ? proxyLabelParts(cred.proxy) : null
   const quotaSnapshotTime = cred.quota
     ? formatFullTime(cred.quota.ts, language)
     : t('未知时间', 'unknown time')
@@ -529,15 +530,26 @@ export const CredentialCard = memo(function CredentialCard({
                 {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
               </TooltipPopup>
             </Tooltip>
-            {cred.proxy ? (
+            {proxyLabel ? (
               <Tooltip>
+                {/* 手机上这枚最长：`socks5h://…` 连协议带主机常有 190px，胶囊行一挤就自己独占一行。
+                    窄容器下藏掉协议段只留 `host:port`，再给一个上限截断长域名——完整 URL 在
+                    Tooltip 与出站代理对话框里，一点不丢。 */}
                 <TooltipTrigger
                   render={<button type="button" />}
-                  className={cn(badgeVariants({ variant: 'outline' }), 'cursor-pointer gap-1')}
+                  className={cn(
+                    badgeVariants({ variant: 'outline' }),
+                    'min-w-0 max-w-44 cursor-pointer gap-1 @sm/card:max-w-72',
+                  )}
                   onClick={() => setProxyOpen(true)}
                 >
                   <GlobeIcon className="size-3" />
-                  {proxyDisplayLabel(cred.proxy)}
+                  <span className="min-w-0 truncate">
+                    {proxyLabel.scheme ? (
+                      <span className="hidden @sm/card:inline">{proxyLabel.scheme}</span>
+                    ) : null}
+                    {proxyLabel.host}
+                  </span>
                 </TooltipTrigger>
                 <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
               </Tooltip>

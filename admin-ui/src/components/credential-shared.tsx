@@ -1602,6 +1602,20 @@ export function proxyDisplayLabel(proxy: string | null): string | null {
 }
 
 /**
+ * 把显示标签拆成「协议」与「主机:端口」两段。
+ *
+ * 卡片在窄容器（手机）下只留后半段：`socks5h://192.168.1.100:1080` 整枚胶囊要 190px 上下，
+ * 一行放不下就自己占满一整行，而协议名在那儿几乎不带信息——完整 URL 在 Tooltip 里，
+ * 点一下就是出站代理对话框。
+ */
+export function proxyLabelParts(proxy: string): { scheme: string | null; host: string } {
+  const label = proxyDisplayLabel(proxy) ?? proxy
+  const sep = label.indexOf('//')
+  if (sep < 0) return { scheme: null, host: label }
+  return { scheme: label.slice(0, sep + 2), host: label.slice(sep + 2) }
+}
+
+/**
  * 代理 URL 脱敏显示：有认证信息时显示 `protocol://***@host:port`，没有则原样。
  */
 export function proxyMaskedUrl(proxy: string): string {
