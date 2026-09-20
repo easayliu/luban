@@ -601,15 +601,25 @@ export const CredentialCard = memo(function CredentialCard({
             {cred.quota && (has5h || has7d) ? (
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
               //
-              // 断点回到 `@sm/card`（24rem / 384px），与这套胶囊排法是配套的：
-              // 三枚胶囊「1947 req · 397M · $650.10」约 168px（token 那格不带 `tok` 后缀、
-              // 胶囊自带内边距所以 `gap-x-2` 就够），一列 (384-32-16)/2 = 176px 装得下。
-              // 之前把断点推到 512px，是因为当时那版带 ` tok` 后缀又用 `gap-x-3`，
-              // 一列要 204px；排法换回来之后不必再推，卡片也不会平白高一行。
+              // 两列的门槛是 27rem（432px），不是 `@sm/card`（24rem / 384px）。
+              //
+              // 384px 那档是按胶囊 10px 时算的（`QuotaFact` 当时用 Badge 的 `sm` 档）：
+              // 一列 (384-32-16)/2 = 176px，三枚约 168px，刚好。胶囊统一到 `xs`＝12px 之后
+              // 这笔账不成立了——量过现网一张 408px 宽的卡：一列 180px，7d 那行
+              // 「1063 req · 92.7M · $250.66」实测 179px，差 1px 就换行，而换行的代价不是
+              // 高一点，是 5h 与 7d 两条进度条一上一下错开，看着像两个窗口差了一大截。
+              //
+              // 按 12px 重算上界：`9999 req` 60px（中文 locale 到 1 万才转「1.2万」）、
+              // `92.7M` 45px、`$12345.67` 70px，加两道 `gap-x-2` 共 191px；两列要
+              // 191×2 + 16 + 32 = 430px，取 27rem = 432px。
+              //
+              // 27rem 正是 [CREDENTIAL_CARD_GRID_CLASS] 里卡片的最小宽度，两个常量对上了：
+              // 桌面的卡片恒 ≥ 27rem，永远是两列；只有视口窄到卡片撑不到 27rem 的手机上
+              // 才摞成两行——那里本来就该给每个窗口整行宽度，而不是挤成两列再换行。
               <div
                 className={cn(
                   'grid gap-3',
-                  has5h && has7d && '@sm/card:grid-cols-2 @sm/card:gap-4',
+                  has5h && has7d && '@min-[27rem]/card:grid-cols-2 @min-[27rem]/card:gap-4',
                 )}
               >
                 {has5h && (
@@ -1128,7 +1138,8 @@ function QuotaMeter({
       {/* 进度条上面这一行：三个事实是 `secondary` 胶囊（见 QuotaFact），不是裸文本。
           胶囊自带内边距，所以间距用 `gap-x-2` 而不是 `gap-x-3`；token 那格也不挂 `tok`
           后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开，挂上后缀一列要多 24px，
-          `@sm/card` 下（一列 176px）会把第三枚挤到第二行，两条进度条跟着一上一下错开。 */}
+          两列下会把第三枚挤到第二行，两条进度条跟着一上一下错开。一列到底要多宽才不换行，
+          见上面那个 27rem 门槛处的算账。 */}
       <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <QuotaFact
           label={t('请求数', 'Requests')}
