@@ -15,15 +15,21 @@ use super::upstream::{Aggregated, SseAggregator};
 
 /// 请求里那些「上游一旦不认，就会在报错里逐字点名」的取值。
 ///
-/// 两条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
+/// 三条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
 /// ```text
 /// This model does not support effort level 'xhigh'. Supported levels: high, low, max, medium.
 /// role 'system' is not supported on this model
+/// 'claude-fable-5' does not support tool types: computer_20250124. Did you mean one of
+/// advisor_20260301, bash_20250124, browser_toolset_20260801, …
 /// ```
-/// 共同形态是「字段名 + `'取值'`」。故判据取这两半的**共现**：报错里既出现该字段的名字，
-/// 又逐字引用了这次请求里的那个取值——满足才认定「是这个取值把请求打死的」，见
-/// [`remember_shape_rejection`]。单看字段名会误伤（`max_tokens` 那类报错也提字段名），
-/// 单看引号里的串则可能撞上正文里的巧合。
+/// 判据一律是「字段名 + 这次的取值被点名」的**共现**：报错里既出现该字段的名字
+/// （[`ShapeProbe::keyword`]），又确实点了这次请求里的那个取值（[`ShapeProbe::cite`]）——
+/// 两半都满足才认定「是这个取值把请求打死的」，见 [`remember_shape_rejection`]。单看字段名
+/// 会误伤（`max_tokens` 那类报错也提字段名），单看取值串则可能撞上正文里的巧合。
+///
+/// 「被点名」怎么算按样本分两种：前两条点名的形态是 `'取值'`（[`cited_as_quoted`]）；第三条
+/// 不带引号，且后半句还列着一串**合法**类型，裸子串判会把它们一并学成「不支持」，故另有
+/// [`cited_in_tool_type_list`] 只认冒号后那一段。
 pub(super) struct ShapeProbe {
     /// 记忆表里的字段标签，同时用于日志。
     pub(super) field: &'static str,
@@ -31,6 +37,8 @@ pub(super) struct ShapeProbe {
     keyword: &'static str,
     /// 从请求体里取出该字段的全部取值（去重后）。
     values: fn(&serde_json::Value) -> Vec<String>,
+    /// 这句报错有没有**点这个取值的名**：`(报错原文, 请求里的取值)`。
+    cite: fn(&str, &str) -> bool,
 }
 
 /// 「条件句」的引子。命中其一即**不学**这条 400——见 [`remember_shape_rejection`]。
@@ -46,11 +54,17 @@ pub(super) struct ShapeProbe {
 /// 条件句学成无条件，代价是本地长期拒掉一批合法请求，且现象是「换个客户端就好了」，极难查。
 const CONDITIONAL_MARKS: &[&str] = &[" when ", " unless ", " without ", " while ", " if "];
 
-/// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取」，学习与拦截两侧
-/// 都不必改——它们只跟这张表打交道。
+/// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取、怎么算被点名」，学习与
+/// 拦截两侧都不必改——它们只跟这张表打交道。
 pub(super) const SHAPE_PROBES: &[ShapeProbe] = &[
-    ShapeProbe { field: "effort", keyword: "effort", values: effort_values },
-    ShapeProbe { field: "role", keyword: "role", values: role_values },
+    ShapeProbe { field: "effort", keyword: "effort", values: effort_values, cite: cited_as_quoted },
+    ShapeProbe { field: "role", keyword: "role", values: role_values, cite: cited_as_quoted },
+    ShapeProbe {
+        field: "tool_type",
+        keyword: "tool types",
+        values: tool_type_values,
+        cite: cited_in_tool_type_list,
+    },
 ];
 
 /// `output_config.effort`（`"high"`/`"xhigh"` 等），没有则为空。
@@ -60,6 +74,48 @@ fn effort_values(body: &serde_json::Value) -> Vec<String> {
         None => Vec::new(),
     }
 }
+
+/// `tools[].type` 里出现过的取值，去重。没写 `type` 的（普通自定义工具）本就没有取值可点。
+///
+/// **`custom` 不参与**：它是自定义工具的缺省类型，几乎每条 CC 请求都带着一堆；官方不会
+/// 点它的名，留着只是白比对，却平添了「一次误学把该模型的正常请求全拦下」的误伤面。同
+/// [`role_values`] 里排掉 `user`/`assistant` 的理由。
+fn tool_type_values(body: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(tools) = body.get("tools").and_then(|t| t.as_array()) else { return out };
+    for ty in tools.iter().filter_map(|t| t.get("type")?.as_str()) {
+        if ty != "custom" && !out.iter().any(|v| v == ty) {
+            out.push(ty.to_string());
+        }
+    }
+    out
+}
+
+/// 默认的点名判据：上游**逐字引用**了这次请求里的那个取值（`'xhigh'`、`'system'`）。
+fn cited_as_quoted(message: &str, value: &str) -> bool {
+    message.contains(&format!("'{value}'"))
+}
+
+/// 冒号后那一段里点到的名（`does not support tool types:` 与句号之间），逐项精确比。
+///
+/// **不能裸子串判**：这句 400 的后半截是「你是不是想用」的建议清单，列的全是该模型**认**的
+/// 类型，而这次请求多半正带着其中几个（`bash_20250124`、`text_editor_20250728` 都在列）。
+/// 按裸子串学，等于把请求里每个工具类型都学成「这个模型不收」，下一条普通 CC 请求就被本地
+/// 拒死——比多发一趟上游严重得多，故只认被点名那一段。
+fn cited_in_tool_type_list(message: &str, value: &str) -> bool {
+    let hay = message.to_lowercase();
+    let Some(at) = hay.find(TOOL_TYPE_MARK) else { return false };
+    let rest = &hay[at + TOOL_TYPE_MARK.len()..];
+    // 点名段止于句号（`computer_20250124.`）；类型名里不含句号，切了不会伤到取值本身。
+    // 上游万一不写句号，再按建议清单的引子截一刀兜底。
+    let named = rest.split('.').next().unwrap_or(rest);
+    let named = named.split(TOOL_TYPE_SUGGEST).next().unwrap_or(named);
+    named.split(',').any(|t| t.trim().eq_ignore_ascii_case(value))
+}
+
+/// [`cited_in_tool_type_list`] 的两个切点（小写比对）：点名段的起点，与建议清单的引子。
+const TOOL_TYPE_MARK: &str = "does not support tool types:";
+const TOOL_TYPE_SUGGEST: &str = "did you mean";
 
 /// `messages[].role` 里出现过的取值，去重。
 ///
@@ -939,8 +995,8 @@ pub(super) fn remember_shape_rejection(
             continue;
         }
         for value in (probe.values)(body) {
-            // 上游必须**逐字引用**这次请求里的那个取值，才算认定是它的锅。
-            if !message.contains(&format!("'{value}'")) {
+            // 上游必须**点了这个取值的名**，才算认定是它的锅（形态见 [`ShapeProbe::cite`]）。
+            if !(probe.cite)(&message, &value) {
                 continue;
             }
             let mut table = mem.write();
@@ -1197,6 +1253,24 @@ mod tests {
         ))
     }
 
+    /// 实测原文（列表截短）：被点名的类型不带引号，后半截还列着该模型**认**的一串类型。
+    const TOOL_TYPE_400: &str = "'claude-fable-5' does not support tool types: \
+                                 computer_20250124. Did you mean one of advisor_20260301, \
+                                 bash_20250124, browser_toolset_20260801, \
+                                 text_editor_20250728, memory_20250818?";
+
+    /// 请求体：带一组 `tools[].type`。
+    fn tools_req(model: &str, types: &[&str]) -> Option<serde_json::Value> {
+        let tools = types
+            .iter()
+            .map(|t| format!(r#"{{"type":"{t}","name":"{t}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"tools":[{tools}]}}"#
+        ))
+    }
+
     /// 请求体：`messages` 里混了个 `role: system`（litellm 那类客户端会这么发）。
     fn role_req(model: &str, role: &str) -> Option<serde_json::Value> {
         json_body(&format!(
@@ -1245,6 +1319,76 @@ mod tests {
         assert!(hit(&role_req("claude-sonnet-5", "system"), "claude-sonnet-5").is_none());
         // 普通请求（只有 user/assistant、没写 effort）永远不进这张表的判定。
         assert!(hit(&role_req("claude-opus-4-6", "user"), "claude-opus-4-6").is_none());
+    }
+
+    /// 工具类型那条 400：**只学被点名的那一个**，后半截「你是不是想用」列出的合法类型一个
+    /// 都不学。按裸子串判就会把 `bash_20250124`、`text_editor_20250728` 一并学成「这个模型
+    /// 不收」——它们正是该模型认的类型，下一条普通 CC 请求就被本地拒死。
+    #[test]
+    fn learns_the_named_tool_type_but_never_the_suggested_ones() {
+        let mem = crate::proxy::ShapeMemory::default();
+        // 一条带 computer 工具的请求：另外两个类型在建议清单里也列着。
+        let body = tools_req(
+            "claude-fable-5",
+            &["computer_20250124", "bash_20250124", "text_editor_20250728", "custom"],
+        );
+        // 学之前照常放行：第一次还是要发上去，规则是上游那条 400 自己喂出来的。
+        assert!(
+            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref())
+                .is_none()
+        );
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-fable-5"),
+            body.as_ref(),
+            &err_json(TOOL_TYPE_400),
+        );
+        assert_eq!(mem.read().len(), 1, "只该学被点名的 computer_20250124 那一条");
+
+        let (field, value, message) =
+            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref())
+                .expect("第二次该在本地拦下");
+        assert_eq!((field, value.as_str()), ("tool_type", "computer_20250124"));
+        assert_eq!(message, TOOL_TYPE_400, "回放上游那句原话，不自己造文案");
+
+        // 不带那个类型的请求照常放行：建议清单里的两个没被学进去。
+        let others =
+            tools_req("claude-fable-5", &["bash_20250124", "text_editor_20250728", "custom"]);
+        assert!(
+            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), others.as_ref())
+                .is_none()
+        );
+        // 结论也不外溢到别的模型——computer 工具在 opus 上照发。
+        assert!(
+            crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref())
+                .is_none()
+        );
+        // 没有 tools 的请求永远不进这张表的判定。
+        assert!(
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-fable-5"),
+                effort_req("claude-fable-5", "high").as_ref()
+            )
+            .is_none()
+        );
+    }
+
+    /// 点名的是另一个版本号（这次发的是 `computer_20250124`）→ 不学。判据是逐项精确比，
+    /// 不是前缀或子串：`computer_20241022` 与 `computer_20250124` 是两个取值。
+    #[test]
+    fn learns_nothing_when_another_tool_type_is_named() {
+        const OTHER_400: &str = "'claude-fable-5' does not support tool types: computer_20241022. \
+                                 Did you mean one of bash_20250124, computer_20250124?";
+        let mem = crate::proxy::ShapeMemory::default();
+        let body = tools_req("claude-fable-5", &["computer_20250124", "custom"]);
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-fable-5"),
+            body.as_ref(),
+            &err_json(OTHER_400),
+        );
+        assert!(mem.read().is_empty(), "建议清单里出现过也不算被点名");
     }
 
     /// 不该学的几种 400：报错没提这个字段、提了字段但没逐字引用这次的取值、
