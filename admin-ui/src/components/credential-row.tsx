@@ -70,6 +70,7 @@ import {
   displayCredentialLabel,
   formatClockTime,
   formatCountdown,
+  formatCompactNumber,
   formatFullTime,
   formatTokens,
   formatUsd,
@@ -849,11 +850,14 @@ function ListQuotaMeter({
   showLabel?: boolean
 }) {
   const { t, language, locale } = useI18n()
-  // 表格那份摘要（showLabel=false）挤在 8rem 的格子里，三个数只能各留数字：`M`/`K` 标着 token、
-  // `$` 标着钱，唯一没单位的就是最左边的请求数，它的含义写在 title 里（见下面的 summaryTitle）。
+  // 表格那份摘要（showLabel=false）挤在 8rem 的格子里，三个数只能各留数字。请求数与 token 走
+  // **同一套** K/M 缩写（见 [formatCompactNumber]）：不缩的话 `1,177 · 266M` 是一行里两套量纲，
+  // 而且千分位白占两个字符，最后被切掉尾巴的是右边的费用。缩完两者都带单位字母，靠位置与量级
+  // 区分（请求数恒在最左、比 token 小几个数量级，`$` 标着钱），每个数是什么、精确值多少写在
+  // title 里（见下面的 summaryTitle）。卡片上是同一个表达，两种视图切过去不用重新认。
   const usageSummary = requests == null
     ? '—'
-    : `${requests.toLocaleString(locale)} · ${tokens == null ? '—' : formatTokens(tokens)} · ${cost == null ? '—' : formatUsd(cost)}`
+    : `${formatCompactNumber(requests)} · ${tokens == null ? '—' : formatTokens(tokens)} · ${cost == null ? '—' : formatUsd(cost)}`
   const summaryTitle = requests == null
     ? undefined
     : t(
@@ -936,11 +940,13 @@ function ListQuotaMeter({
     // 第一行是用量本身（摘要 + 百分比，两个都在回答「用掉多少」），第二行是这个窗口的时间维度
     // （进度条 + 还有多久重置）。
     //
-    // 分法是按实测宽度定的：摘要最长 `1,633 · 245M · $188.30` 要 130px，百分比 28px、倒计时
-    // 36px（定宽，见 [QuotaCountdown]）。倒计时若留在第一行，130 + 8 + 36 = 174px 放不下、摘要
-    // 必被截断（上一版就是这样）；换成百分比同行是 166px，xl 下只有最长的那几条会截掉尾巴、
-    // 2xl（内容宽 172px）一条都不截。进度条这边反而更宽：整行减去倒计时那一格还有 112px
-    // （2xl 128px），比没有倒计时之前的 88px 还长，而且每一行都是这个宽度。
+    // 分法是按实测宽度定的：摘要按当时未缩写的最长值 `1,633 · 245M · $188.30` 算要 130px，
+    // 百分比 28px、倒计时 36px（定宽，见 [QuotaCountdown]）。倒计时若留在第一行，
+    // 130 + 8 + 36 = 174px 放不下、摘要必被截断（上一版就是这样）；换成百分比同行是 166px，
+    // xl 下只有最长的那几条会截掉尾巴、2xl（内容宽 172px）一条都不截。请求数后来也缩成 K/M
+    // （`1.6K · 245M · $188.30`），摘要只会比这更窄，这套分法的结论只更成立。进度条这边反而更宽：
+    // 整行减去倒计时那一格还有 112px（2xl 128px），比没有倒计时之前的 88px 还长，而且每一行
+    // 都是这个宽度。
     return (
       <Meter value={percentage} max={100} title={title}>
         <div className="flex min-w-0 items-baseline justify-between gap-2">
@@ -974,14 +980,14 @@ function ListQuotaMeter({
 }
 
 /**
- * 表格里那一格的用量摘要（`128 · 18.4M · $6.85`）。
+ * 表格里那一格的用量摘要（`128 · 18.4M · $6.85`、`3.2K · 486M · $91.62`）。
  *
  * 格子只有 8rem，三个数各留数字、还常被 `truncate` 切掉尾巴，所以提示是这里唯一能看到
  * 「哪个数是什么、精确值多少」的地方——必须立刻出（`delay={0}`），原生 `title` 那一秒
  * 等下来就没人再等了。没有摘要可说时（该窗口连请求数都没有）不挂提示，免得冒一个空气泡。
  */
 function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }) {
-  // text-xs：表格那格只有 9rem，比 text-sm 多放约五个字符，`3,218 · 486M · $91.62` 刚好放全。
+  // text-xs：表格那格只有 9rem，比 text-sm 多放约五个字符，`3.2K · 486M · $91.62` 放全还有富余。
   const className = 'min-w-0 truncate font-medium text-foreground text-xs leading-none tabular-nums'
   if (!hint) return <span className={className}>{children}</span>
   return (
@@ -1041,19 +1047,39 @@ function ListQuotaDetails({
   reset: number | null
 }) {
   const { t, language, locale } = useI18n()
+  // 与隔壁 token 同一套缩写、同一种「精确值挂悬浮提示」的处理（见下面那块 Tooltip）：
+  // 这一格虽然不像表格那格那么挤，但两个数并排时量纲得一致，否则 `1,177 次` 配 `266M`
+  // 又是两套读法。
   const formattedRequests = requests == null
     ? '—'
     : t(
-        `${requests.toLocaleString(locale)} 次`,
-        `${requests.toLocaleString(locale)} req`,
+        `${formatCompactNumber(requests)} 次`,
+        `${formatCompactNumber(requests)} req`,
+      )
+  const requestsTitle = requests == null
+    ? t('本周期请求数：暂无数据', 'Requests this period: no data')
+    : t(
+        `本周期 ${requests.toLocaleString(locale)} 次请求`,
+        `${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} this period`,
       )
 
   return (
     <dl className="grid min-w-0 grid-cols-2 gap-x-2 gap-y-1">
       <div className="min-w-0">
         <dt className="sr-only">{t('请求', requests === 1 ? 'Request' : 'Requests')}</dt>
-        <dd className="whitespace-nowrap font-medium text-xs tabular-nums">
-          {formattedRequests}
+        <dd className="min-w-0">
+          <Tooltip>
+            <TooltipTrigger
+              render={<span />}
+              delay={0}
+              className="whitespace-nowrap font-medium text-xs tabular-nums"
+            >
+              {formattedRequests}
+            </TooltipTrigger>
+            <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
+              {requestsTitle}
+            </TooltipPopup>
+          </Tooltip>
         </dd>
       </div>
       <div className="min-w-0 text-right">
