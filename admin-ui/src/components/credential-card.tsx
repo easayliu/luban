@@ -601,25 +601,20 @@ export const CredentialCard = memo(function CredentialCard({
             {cred.quota && (has5h || has7d) ? (
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
               //
-              // 两列的门槛是 27rem（432px），不是 `@sm/card`（24rem / 384px）。
+              // 两个窗口都有时**任何宽度下都是两列**，手机上也不摞成两行：5h 与 7d 是同一
+              // 组数据的两个口径，并排才好比；摞起来后一张卡多出一屏高，翻着翻着就忘了上面那条
+              // 是几。手机上两列挤不下的问题不靠缩成一列解决，也不靠多排几行——那样一张卡的
+              // 用量段落高出一倍，还是占地方；而是在 [QuotaMeter] 里按容器宽度**省宽度**：
+              // 胶囊间距收紧、`req` 后缀隐掉、百分比与倒计时不再定宽，行数与宽版一样是两行。
               //
-              // 384px 那档是按胶囊 10px 时算的（`QuotaFact` 当时用 Badge 的 `sm` 档）：
-              // 一列 (384-32-16)/2 = 176px，三枚约 168px，刚好。胶囊统一到 `xs`＝12px 之后
-              // 这笔账不成立了——量过现网一张 408px 宽的卡：一列 180px，7d 那行
-              // 「1063 req · 92.7M · $250.66」实测 179px，差 1px 就换行，而换行的代价不是
-              // 高一点，是 5h 与 7d 两条进度条一上一下错开，看着像两个窗口差了一大截。
-              //
-              // 按 12px 重算上界：`9999 req` 60px（中文 locale 到 1 万才转「1.2万」）、
-              // `92.7M` 45px、`$12345.67` 70px，加两道 `gap-x-2` 共 191px；两列要
-              // 191×2 + 16 + 32 = 430px，取 27rem = 432px。
-              //
-              // 27rem 正是 [CREDENTIAL_CARD_GRID_CLASS] 里卡片的最小宽度，两个常量对上了：
-              // 桌面的卡片恒 ≥ 27rem，永远是两列；只有视口窄到卡片撑不到 27rem 的手机上
-              // 才摞成两行——那里本来就该给每个窗口整行宽度，而不是挤成两列再换行。
+              // 27rem 这条线的来历：胶囊 `xs`＝12px 时三枚「9999 req · 92.7M · $12345.67」
+              // 上界 191px，两列要 191×2 + 16 + 32 = 430px；它也正是 [CREDENTIAL_CARD_GRID_CLASS]
+              // 里卡片的最小宽度——桌面的卡片恒 ≥ 27rem，走宽版排法；只有手机上卡片被视口压到
+              // 27rem 以下，才切到窄版。列间距跟着走：宽版 16px，窄版 12px 多省 4px 给内容。
               <div
                 className={cn(
                   'grid gap-3',
-                  has5h && has7d && '@min-[27rem]/card:grid-cols-2 @min-[27rem]/card:gap-4',
+                  has5h && has7d && 'grid-cols-2 @min-[27rem]/card:gap-4',
                 )}
               >
                 {has5h && (
@@ -1083,7 +1078,8 @@ function QuotaFact({
       >
         <dt className="sr-only">{label}</dt>
         <dd className="truncate tabular-nums">{value}</dd>
-        {suffix && <span className="text-muted-foreground" aria-hidden>{suffix}</span>}
+        {/* 窄卡上（< 27rem）后缀隐掉省宽度，让三枚仍排得进一行；理由见 QuotaMeter 那处胶囊行的注。 */}
+        {suffix && <span className="text-muted-foreground @max-[27rem]/card:hidden" aria-hidden>{suffix}</span>}
       </TooltipTrigger>
       <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
         {hint ? t(`${label}：${hint}`, `${label}: ${hint}`) : label}
@@ -1137,10 +1133,14 @@ function QuotaMeter({
           眼睛得逐个配对。 */}
       {/* 进度条上面这一行：三个事实是 `secondary` 胶囊（见 QuotaFact），不是裸文本。
           胶囊自带内边距，所以间距用 `gap-x-2` 而不是 `gap-x-3`；token 那格也不挂 `tok`
-          后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开，挂上后缀一列要多 24px，
-          两列下会把第三枚挤到第二行，两条进度条跟着一上一下错开。一列到底要多宽才不换行，
-          见上面那个 27rem 门槛处的算账。 */}
-      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开，挂上后缀一列要多 24px。
+
+          卡片窄于 27rem（只有手机会）时一列只剩约 150px，三枚按宽版排法要 179px 装不下。
+          不改成多行（一枚一行占三行，整段高一倍），而是在同一行里省出这 30px：胶囊间距
+          8→4px 省 8，`req` 后缀连同它前面那道 4px 内距一起隐掉省 26——「1063 · 92.7M · $250.66」
+          三个数靠形态就能分开（整数 / 带单位 / 带 $），悬浮提示与读屏文本里全称照旧。
+          `flex-wrap` 留着只是兜底：`$12345.67` 这种上界值真装不下时宁可折行也别盖到旁边那列。 */}
+      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 @max-[27rem]/card:gap-x-1">
         <QuotaFact
           label={t('请求数', 'Requests')}
           value={requests == null ? '—' : formatCompactNumber(requests, locale)}
@@ -1164,7 +1164,12 @@ function QuotaMeter({
           value={cost == null ? '—' : formatUsd(cost)}
         />
       </dl>
-      <div className="flex min-w-0 items-center gap-2">
+      {/* 进度条这一行宽版是「5h ▬▬▬▬ 37% 2h13m」一行到底，定宽的几格合计 20+36+48 加三道
+          间距 = 128px，进度条吃剩下的。窄于 27rem 时一列约 150px，照这套定宽条只剩二十几像素、
+          375px 的手机上还差几像素放不下。窄版仍是一行，但百分比与倒计时改按内容取宽
+          （`37%` 约 26px、`2h13m` 约 36px）、间距 8→6px，条能拿回约 50px。定宽本是为了上下
+          摞着的两条尾巴对齐；窄版两列并排、尾巴各在各的列里，对不对齐看不出来。 */}
+      <div className="flex min-w-0 items-center gap-2 @max-[27rem]/card:gap-1.5">
         {/* 窗口名是定宽的弱色文本，不是彩色胶囊：它只是"这条说的是哪个窗口"，一眼要认的是
             旁边那条的长度与颜色。实心胶囊在这张卡片上已经是状态的语言（运行正常 / 上游已拒），
             借给分类只会让一张卡片上五六块彩色抢同一份注意力。定宽 1.25rem 让 5h、7d 两条的
@@ -1189,7 +1194,7 @@ function QuotaMeter({
             手机上根本出不来——而这个数越接近 100，越需要知道它是几小时前的）。 */}
         <Tooltip>
           <TooltipTrigger render={<span />} delay={0} className="shrink-0 cursor-help">
-            <MeterValue className={cn('block w-9 text-left font-medium text-xs tabular-nums', valueClass)}>
+            <MeterValue className={cn('block w-9 text-left font-medium text-xs tabular-nums @max-[27rem]/card:w-auto', valueClass)}>
               {() => `${percentage}%`}
             </MeterValue>
           </TooltipTrigger>
@@ -1204,7 +1209,7 @@ function QuotaMeter({
             <TooltipTrigger
               render={<span />}
               delay={0}
-              className="w-12 shrink-0 cursor-help whitespace-nowrap text-left text-xs text-muted-foreground tabular-nums"
+              className="w-12 shrink-0 cursor-help whitespace-nowrap text-left text-xs text-muted-foreground tabular-nums @max-[27rem]/card:w-auto"
             >
               {formatCountdown(reset, now)}
             </TooltipTrigger>
@@ -1215,7 +1220,7 @@ function QuotaMeter({
         ) : (
           // 没有未来的重置时刻时不写字、也不补「—」，但**宽度留着**：否则 5h 与 7d 两条的
           // 尾巴会错开，看着像两个窗口的用量差别。与列表里那格同一处理（见 QuotaCountdown）。
-          <span className="w-12 shrink-0" aria-hidden />
+          <span className="w-12 shrink-0 @max-[27rem]/card:hidden" aria-hidden />
         )}
       </div>
     </Meter>

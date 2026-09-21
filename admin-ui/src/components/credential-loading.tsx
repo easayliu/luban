@@ -71,9 +71,9 @@ function CardSkeletons({ selectable, count }: { selectable: boolean; count: numb
                   <Skeleton className="h-4 w-16" />
                   <Skeleton className="h-4 w-24" />
                 </div>
-                {/* 两列门槛跟着真卡片走（27rem，理由见 credential-card 那处）：
-                    两边不一致的话，加载完成的瞬间这一段会从两列重排成两行。 */}
-                <div className="grid gap-3 @min-[27rem]/card:grid-cols-2 @min-[27rem]/card:gap-4">
+                {/* 跟真卡片一样任何宽度都两列、列间距在 27rem 处 12→16px（理由见 credential-card
+                    那处）：两边不一致的话，加载完成的瞬间这一段会重排一次。 */}
+                <div className="grid grid-cols-2 gap-3 @min-[27rem]/card:gap-4">
                   <QuotaSkeleton />
                   <QuotaSkeleton />
                 </div>
