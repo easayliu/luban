@@ -607,7 +607,7 @@ export const CredentialCard = memo(function CredentialCard({
               // 用量段落高出一倍，还是占地方；而是在 [QuotaMeter] 里按容器宽度**省宽度**：
               // 胶囊间距收紧、`req` 后缀隐掉、百分比与倒计时不再定宽，行数与宽版一样是两行。
               //
-              // 27rem 这条线的来历：胶囊 `xs`＝12px 时三枚「9999 req · 92.7M · $12345.67」
+              // 27rem 这条线的来历：胶囊 `xs`＝12px 时三枚「1.2K req · 92.7M · $12345.67」
               // 上界 191px，两列要 191×2 + 16 + 32 = 430px；它也正是 [CREDENTIAL_CARD_GRID_CLASS]
               // 里卡片的最小宽度——桌面的卡片恒 ≥ 27rem，走宽版排法；只有手机上卡片被视口压到
               // 27rem 以下，才切到窄版。列间距跟着走：宽版 16px，窄版 12px 多省 4px 给内容。
@@ -1143,7 +1143,7 @@ function QuotaMeter({
       <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 @max-[27rem]/card:gap-x-1">
         <QuotaFact
           label={t('请求数', 'Requests')}
-          value={requests == null ? '—' : formatCompactNumber(requests, locale)}
+          value={requests == null ? '—' : formatCompactNumber(requests)}
           hint={requests == null ? undefined : requests.toLocaleString(locale)}
           suffix="req"
         />

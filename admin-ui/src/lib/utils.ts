@@ -399,29 +399,16 @@ export function formatCountdown(targetSecs: number, nowSecs: number): string {
 }
 
 /**
- * 大数字压成一眼可读的短形式：`3542` → `3.5K`（英文）/`3542` → `3542`、`12000` → `1.2万`
- * （中文，随 locale 走）。
+ * 大数字压成一眼可读的短形式：`842` / `3.5K` / `931K` / `1.2M` / `3.4B`，**不随界面语言变**。
  *
- * 只用于空间紧张、量级比精确值更有用的地方（卡片上的请求数）。要对数的场合仍用
- * `toLocaleString`——`3.5K` 看不出到底是 3542 还是 3549。
+ * 刻意不用 `Intl.NumberFormat` 的 `compact`：中文 locale 下它到 1 万才缩、缩出来是「1.2万」，
+ * 于是卡片上请求数写着 `3542`、旁边 token 写着 `92.7M`，同一行两套量纲；而 K/M 在两种语言里
+ * 都读得懂，官方价目表也是按 MTok 计价。同理不做本地化千分位。
+ *
+ * 只用于空间紧张、量级比精确值更有用的地方（卡片上的请求数、token 数）。要对数的场合仍用
+ * `toLocaleString` 放在悬浮提示里——`3.5K` 看不出到底是 3542 还是 3549。
  */
-export function formatCompactNumber(n: number, locale: string): string {
-  return new Intl.NumberFormat(locale, {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(n)
-}
-
-/**
- * Token 数压成 `842` / `931K` / `1.2M` / `3.4B`，**不随界面语言变**。
- *
- * 刻意不走 {@link formatCompactNumber}：中文 locale 下它会给出「121万」，而 token 的量纲
- * 到处都是 K/M——官方价目表按 MTok 计价，卡片上紧挨着的就是那份价目算出来的费用，两个数换算
- * 单位不一致就没法互相印证。同理不做本地化千分位。
- *
- * 精确值放 `title`（用 `toLocaleString`）：`1.2M` 看不出是 1.15M 还是 1.24M。
- */
-export function formatTokens(n: number): string {
+export function formatCompactNumber(n: number): string {
   const abs = Math.abs(n)
   if (abs < 1_000) return String(Math.round(n))
   const units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']] as const
@@ -439,6 +426,15 @@ export function formatTokens(n: number): string {
     return `${value}${unit}`
   }
   return String(Math.round(n))
+}
+
+/**
+ * Token 数压成 `842` / `931K` / `1.2M` / `3.4B`，与 {@link formatCompactNumber} 同一套缩写——
+ * 卡片上紧挨着的费用是按 MTok 价目算的，两个数换算单位一致才能互相印证。
+ * 保留这个名字是让调用点读得出「这是 token」；精确值放悬浮提示（用 `toLocaleString`）。
+ */
+export function formatTokens(n: number): string {
+  return formatCompactNumber(n)
 }
 
 /** 美元金额格式化：极小额多留几位小数，便于看清单次费用。 */
