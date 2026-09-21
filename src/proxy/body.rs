@@ -491,8 +491,14 @@ pub(super) fn rewrite_body_out(
     // **只给主线程 profile 注**：官方的标题生成、安全分类、无工具 helper 与额度探测本来就
     // 一个工具都不发（`tools: []` 或整个字段都没有），给它们塞 Bash 是把一条辅助请求装成
     // 了主线程。判据是 profile，不是「有没有 tools 字段」。
-    let cc_tools_injected =
-        sim.is_some_and(|s| s.profile.has_billing_header() && inject_cc_tools(&mut v, s.profile));
+    let cc_tools_injected = sim.is_some_and(|s| {
+        s.profile.has_billing_header()
+            && inject_cc_tools(
+                &mut v,
+                s.profile,
+                ToolAlignWho { cred_id: cred.id, cred: &cred.label, session: &s.session_id },
+            )
+    });
     // 工具声明的 `eager_input_streaming`：跟在注入之后——注入的官方工具资产自带正确取值
     // （opus 那份带、fable 那份不带），这一步只管客户端自己声明、保留下来的那些。条件来源两条
     // 路径不同（真 CC 看来访版本 × 模型 × 用途，模拟看出站 profile），规则共用，见
@@ -2417,6 +2423,18 @@ pub(super) fn cc_tools_to_inject(
         .collect()
 }
 
+/// 这条请求是谁发的——**只用于日志**，让「某个客户端的 Bash 被换成官方声明了」对得回是谁。
+///
+/// 模拟路径上能拿到的身份就这两项：服务它的凭证，与 luban 给它派生的会话 id（流水里
+/// `cc_session` 记的是同一个串，据此能把那一行日志翻回具体哪条请求）。来访 UA 在这儿拿不到
+/// ——出站头里那个已经是伪装成官方 CC 的那份了。
+#[derive(Clone, Copy)]
+pub(super) struct ToolAlignWho<'a> {
+    pub(super) cred_id: i64,
+    pub(super) cred: &'a str,
+    pub(super) session: &'a str,
+}
+
 /// 客户端自带的同名工具与官方声明的**参数表面**是否一致：`input_schema.properties` 的键集相同、
 /// `required` 的集合相同。
 ///
@@ -2466,7 +2484,11 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
 /// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 14 条一律以资产对象
 /// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body`] 那条
 /// 「什么都没改就原样透传」的快路。
-fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
+fn inject_cc_tools(
+    v: &mut serde_json::Value,
+    profile: &config::CcProfile,
+    who: ToolAlignWho<'_>,
+) -> bool {
     let missing = cc_tools_to_inject(v, profile);
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
@@ -2524,10 +2546,17 @@ fn inject_cc_tools(v: &mut serde_json::Value, profile: &config::CcProfile) -> bo
     }
     *tools = aligned;
 
+    // **warn 而不是 info**：这一行标的是「这条请求换完之后可能执行不了」——模型按官方 schema
+    // 拼的入参，客户端那条声明不一定认。混在下面那条计数 info 里会被当成例行输出刷过去。
     if !surface_differs.is_empty() {
-        tracing::info!(
+        // 模型名到这儿才读：`tools` 的可变借用刚随上一行结束，而这条日志本来就是少数派，
+        // 不必为它在每条模拟请求上都拷一个串。
+        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-");
+        tracing::warn!(
+            cred_id = who.cred_id, cred = %who.cred, session = %who.session, %model,
             tools = %surface_differs.join(","),
-            "replaced same-named client tools whose parameter surface differs from the official one"
+            "replaced same-named client tools whose parameter surface differs from the official one; \
+             the model will fill the official schema, which this client may not accept"
         );
     }
     tracing::info!(
@@ -5562,6 +5591,11 @@ mod tests {
         );
     }
 
+    /// [`inject_cc_tools`] 的身份参数：只进日志，取什么值都不影响这几个用例验的东西。
+    fn who() -> super::ToolAlignWho<'static> {
+        super::ToolAlignWho { cred_id: 1, cred: "t", session: "s" }
+    }
+
     /// [`cc_tools_to_inject`] 是注入与流水共用的那一份判据：注进去的名单与流水拿去对
     /// 回复 tool_use 的名单必须是同一份，否则「模型调了注入工具」会被记错对象。
     #[test]
@@ -5594,7 +5628,7 @@ mod tests {
         let mut v = body(r#","tools":[{"name":"exec"},{"name":"read_file"}]"#);
         let planned = super::cc_tools_to_inject(&v, profile);
         assert_eq!(planned, all);
-        assert!(super::inject_cc_tools(&mut v, profile));
+        assert!(super::inject_cc_tools(&mut v, profile, who()));
         let injected: Vec<&str> = v["tools"]
             .as_array()
             .unwrap()
@@ -5628,7 +5662,7 @@ mod tests {
                     {"name": "Bash", "description": "mine", "input_schema": {"type": "object"}}
                 ]
             });
-            assert!(super::inject_cc_tools(&mut v, profile));
+            assert!(super::inject_cc_tools(&mut v, profile, who()));
             let tools = v["tools"].as_array().unwrap();
             let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
             let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
@@ -5689,7 +5723,7 @@ mod tests {
         let planned = super::cc_tools_to_inject(&v, profile);
         assert!(!planned.contains(&"Read") && !planned.contains(&"Bash"), "{planned:?}");
         assert_eq!(planned.len(), 12, "14 个里客户端已有 Read / Bash 两个");
-        assert!(super::inject_cc_tools(&mut v, profile));
+        assert!(super::inject_cc_tools(&mut v, profile, who()));
         let tools = v["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // 头部是完整的 14 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
@@ -5734,7 +5768,7 @@ mod tests {
         let mut v =
             serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": declared});
         assert!(super::cc_tools_to_inject(&v, profile).is_empty(), "一个都不缺");
-        assert!(super::inject_cc_tools(&mut v, profile), "次序与键序都要改");
+        assert!(super::inject_cc_tools(&mut v, profile, who()), "次序与键序都要改");
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(
             serde_json::to_string(&tools[..14]).unwrap(),
@@ -5743,7 +5777,7 @@ mod tests {
         );
         assert_eq!(tools[14]["name"], "my_tool");
         // 已经是官方形态的再过一遍什么都不动。
-        assert!(!super::inject_cc_tools(&mut v, profile));
+        assert!(!super::inject_cc_tools(&mut v, profile, who()));
     }
 
     /// Windows 那种**扁平** `metadata.user_id` 同样要认，额度探测复用它的**原文**。
