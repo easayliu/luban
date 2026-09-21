@@ -70,8 +70,7 @@ pub(super) struct Simulation {
     /// 官方 `system` **第四块**（基座之后的「其余」段）填好占位后的正文，见
     /// [`render_system_rest`]；`None` 即不补——开关 `simulate_full_system` 关着、模型族认
     /// 不出来（没有模板或没有那行模型名，[`cc_system_rest`]）、或这个 profile 本来就不带
-    /// `system`。有它时客户端自己的 system 挪进首条用户消息（[`stash_client_system`]），
-    /// `system` 块数与官方逐块相同；没有它时末块退回客户端原文，即此前的形态。
+    /// `system`。客户端自己的 system 不掺进这一段，它单独占末块（见 [`simulate_system`]）。
     pub(super) rest: Option<String>,
 }
 
@@ -178,12 +177,16 @@ impl Simulation {
             crate::telemetry::last_is_new_prompt_body(v),
             profile.has_billing_header(),
         );
-        // 第四块随会话 id 与账号 + 设备派生的假环境一起填；额度探测那种官方就不发 `system`
-        // 的 profile 不填（[`simulate_system`] 对它一个字节都不加，填了也白填）。
+        // 第四块随会话 id 与那台「机器」的环境一起填：来访自己写了工作目录就用它那份
+        // （[`client_env`]），没写才按账号 + 设备派生一台（[`sim_env_for`]）。额度探测那种官方
+        // 就不发 `system` 的 profile 不填（[`simulate_system`] 对它一个字节都不加，填了也白填）。
         let rest = (flags.simulate_full_system && profile.system != config::CcSystemShape::None)
             .then(|| cc_system_rest(model))
             .flatten()
-            .map(|template| render_system_rest(template, &sim_env_for(cred, device_fp)));
+            .map(|template| {
+                let env = client_env(v).unwrap_or_else(|| sim_env_for(cred, device_fp));
+                render_system_rest(template, &env)
+            });
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
         Some(Self { base: cc_system_base(model), profile, session_id, link, reason, rest })
@@ -561,27 +564,32 @@ pub(super) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[Str
     has_beta(beta, config::CC_BETA_MESSAGE_THREADS)
 }
 
-/// 第四块里那台「机器」的环境：家目录与工作目录。按账号 + 设备派生，见 [`sim_env_for`]。
+/// 第四块里那台「机器」的环境：家目录，与记忆目录里的项目段。来访自己写了工作目录就用它
+/// 那份（[`client_env`]），没写才按账号 + 设备派生一台（[`sim_env_for`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SimEnv {
     /// `/Users/<user>`。
     pub(super) home: String,
-    /// `/Users/<user>/<parent>/<project>`——那台机器的工作目录。2.1.277 的第四块不再直接写它，
-    /// 只在记忆目录的项目段里以 [`Self::cwd_slug`] 的形态出现。
-    pub(super) cwd: String,
+    /// 记忆目录的项目段：官方把 cwd 里的 `/` 与 `_` 换成 `-`（`/Users/easayliu/Works/easay/opdash`
+    /// → `-Users-easayliu-Works-easay-opdash`，`cap/2.1.277/00023`；`_` 换 `-` 见
+    /// `cap/2.1.260-2/00013` 的 `proxy_captures/20260904_170955`）。
+    ///
+    /// 存的是**换算之后**那一段而不是 cwd 本身：2.1.277 的第四块只写这一段，而来访直接给了
+    /// 记忆目录时（[`env_from_memory_dir`]）它给的也正是这一段——照抄即可，倒推回 cwd 是
+    /// 做不到的，一个 `-` 原来是 `/`、是 `_`、还是本来就是 `-`，分辨不出来。
+    pub(super) slug: String,
 }
 
 impl SimEnv {
-    /// 官方把 cwd 里的 `/` 与 `_` 换成 `-` 作为项目段（`/Users/easayliu/Works/easay/opdash`
-    /// → `-Users-easayliu-Works-easay-opdash`，`cap/2.1.277/00023`；`_` 换 `-` 见
-    /// `cap/2.1.260-2/00013` 的 `proxy_captures/20260904_170955`），记忆目录用它。
-    pub(super) fn cwd_slug(&self) -> String {
-        self.cwd.replace(['/', '_'], "-")
+    /// 按工作目录造：`/` 与 `_` 换成 `-` 就是项目段。
+    pub(super) fn from_cwd(home: impl Into<String>, cwd: &str) -> Self {
+        Self { home: home.into(), slug: cwd.replace(['/', '_'], "-") }
     }
 }
 
 /// 派生第四块里的假环境：`sha256("luban-env" ‖ account_uuid ‖ 设备指纹)` 取三个字节，分别在
-/// 用户名、上级目录、项目名三张小表里选一个。同一账号同一设备恒定（真实机器的 cwd 在会话
+/// 用户名、上级目录、项目名三张小表里选一个。**只在来访什么都没说时用**——它自己写了工作
+/// 目录就以它的为准（[`client_env`]），这里是没得选时的兜底。同一账号同一设备恒定（真实机器的 cwd 在会话
 /// 之间也大多不变），换账号或换设备即另一台机器的另一个目录。
 ///
 /// **这是凭空造的**：抓包机的 `/private/tmp/proxy_captures/…` 与 `/Users/easayliu` 不能照抄
@@ -633,13 +641,153 @@ pub(super) fn sim_env_for(cred: &crate::credentials::Credential, device_fp: &str
     let pick = |table: &[&'static str], byte: u8| table[usize::from(byte) % table.len()];
     let home = format!("/Users/{}", pick(USERS, d[0]));
     let cwd = format!("{home}/{}/{}", pick(PARENTS, d[1]), pick(PROJECTS, d[2]));
-    SimEnv { home, cwd }
+    SimEnv::from_cwd(home, &cwd)
+}
+
+/// 来访自己带的工作目录；没写、或写的东西认不出来时 `None`，由 [`sim_env_for`] 兜底。
+///
+/// **为什么以来访的为准**：派生那份是「没得选时才造一台机器」。客户端自己写了路径就不同了
+/// ——它多半还会照着这个路径读写文件（记忆目录就在它下面），luban 填另一个目录进去，等于让
+/// 模型对着一台不存在的机器干活，那是注入，不是伪装。
+///
+/// 三种来源，按「它说得有多明白」排，命中一条就不再往下看：
+///
+/// 1. 来访自己那条记忆目录（`<home>/.claude/projects/<slug>/memory`，[`env_from_memory_dir`]）
+///    ——要填的两个值它都给全了，逐字照抄；
+/// 2. 带标签的一行（`Working directory:` / `cwd:` 等，[`env_from_labeled_line`]）——官方 CC 把
+///    工作目录写在首条用户消息的 `<env>` 里，各家 SDK 与中转多半照抄这个写法；
+/// 3. `system` 正文里第一条像样的绝对路径（[`env_from_loose_path`]）。
+///
+/// 前两条 `system` 与首条用户消息都扫，第三条**只扫 `system`**：用户问句里出现一个目录
+/// （「为什么 /Users/sam/src/api 跑不起来」）是在提它，不是在说「我在这儿干活」，按它改
+/// 记忆目录会随着用户每句话里提到的路径来回跳。
+pub(super) fn client_env(v: &serde_json::Value) -> Option<SimEnv> {
+    let system = text_blocks(v.get("system"));
+    let first_user = text_blocks(
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|m| m.first())
+            .and_then(|m| m.get("content")),
+    );
+    let both = || system.iter().chain(first_user.iter()).copied();
+    let found = |source, env: Option<SimEnv>| env.map(|env| (source, env));
+    let (source, env) = found("memory-dir", both().find_map(env_from_memory_dir))
+        .or_else(|| found("labeled-line", both().find_map(env_from_labeled_line)))
+        .or_else(|| found("loose-path", system.iter().copied().find_map(env_from_loose_path)))?;
+    // 取到的是来访那台机器的真实用户名与项目名。info 只说命中了哪一条判据，够看出「这条请求
+    // 的记忆目录不是派生的」；路径本身进 debug，要排障时再开。
+    tracing::info!(source, "the client sent its own working directory; the memory path follows it");
+    tracing::debug!(source, home = %env.home, slug = %env.slug, "client working directory");
+    Some(env)
+}
+
+/// `system` 或一条消息 `content` 里的全部文本：字符串形态是它本身，数组形态是每个带 `text`
+/// 的块（图片、工具结果这些没有 `text`，自然落不进来）。
+fn text_blocks(value: Option<&serde_json::Value>) -> Vec<&str> {
+    match value {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 来访自己那条记忆目录：`<home>/.claude/projects/<slug>/memory`。家目录与项目段都在里面，
+/// 原样取出——这条**不能**走 [`env_from_cwd`]，把它当 cwd 会拼出
+/// `-Users-x--claude-projects--Users-x-Works-y-memory` 这种自证是机器拼的东西。
+fn env_from_memory_dir(text: &str) -> Option<SimEnv> {
+    const MARK: &str = "/.claude/projects/";
+    text.match_indices(MARK).find_map(|(at, _)| {
+        // 路径从上一处空白或引号之后开始；整段正文只有这条路径时从头开始。
+        let head = &text[..at];
+        let home = &head[head.rfind(PATH_DELIMS).map_or(0, |p| p + 1)..];
+        let tail = &text[at + MARK.len()..];
+        let slug = tail.split('/').next()?;
+        // `/memory` 之后必须是路径尽头：官方写的是 `…/memory/`（含反引号收尾）。少了这一刀，
+        // `/memory-backup`、`/memory_old` 也算数——而记忆目录的优先级高于明写的工作目录，
+        // 认错了就是拿一个错的项目段压掉真正的 cwd。
+        let after = tail[slug.len()..].strip_prefix("/memory")?;
+        let bounded = after.is_empty() || after.starts_with('/') || after.starts_with(PATH_DELIMS);
+        if !bounded || !is_home(home) || !is_segment(slug) {
+            return None;
+        }
+        Some(SimEnv { home: home.to_owned(), slug: slug.to_owned() })
+    })
+}
+
+/// 明写工作目录的那一行。`Working directory:` 是官方 CC `<env>` 块的写法，`cwd:` 是各家包装
+/// 常见的那种；大小写随意，行首允许有列表符号。
+///
+/// **标签必须是这一行的开头**，不是「这一行里出现过」：`Previous working directory:` 说的是
+/// 别的目录，`not-cwd:` 更不是；旧目录那行排在真正的工作目录之前时，按「出现过」就取了错的
+/// 那条。
+fn env_from_labeled_line(text: &str) -> Option<SimEnv> {
+    const LABELS: [&str; 3] = ["primary working directory:", "working directory:", "cwd:"];
+    text.lines().find_map(|line| {
+        let head = line.trim_start().trim_start_matches(['-', '*', '•', '>', '#', ' ', '\t']);
+        // `to_ascii_lowercase` 不改字节数，剩下多少字节就能从原行上切回来。
+        let lower = head.to_ascii_lowercase();
+        LABELS.iter().find_map(|label| {
+            let rest = lower.strip_prefix(label)?;
+            env_from_cwd(&head[head.len() - rest.len()..])
+        })
+    })
+}
+
+/// 正文里第一条像样的绝对路径。按空白与常见的包裹符切开，逐段试。
+fn env_from_loose_path(text: &str) -> Option<SimEnv> {
+    text.split(PATH_DELIMS).find_map(env_from_cwd)
+}
+
+/// 路径在正文里的边界字符：空白与常见的包裹符。
+const PATH_DELIMS: [char; 14] =
+    [' ', '\t', '\n', '\r', '`', '"', '\'', '(', ')', '<', '>', ',', ';', '*'];
+
+/// [`env_from_cwd`] 认的上限：整条路径 120 字节、家目录之下最多 8 段、每段 64 字节。官方那台
+/// 机器的路径就是普通的项目目录，来访给一条长得离谱的，填进第四块比派生的假环境更显眼。
+const MAX_CLIENT_CWD_BYTES: usize = 120;
+const MAX_CLIENT_CWD_SEGMENTS: usize = 8;
+const MAX_CLIENT_SEGMENT_BYTES: usize = 64;
+
+/// 把一段文字当工作目录校验：`/Users/<user>/…` 或 `/home/<user>/…`，家目录之下至少一段
+/// （家目录本身不是工作目录），段名与长度都规矩。过不了当没给——来访写的是 `C:\Users\…`、
+/// `/tmp/work`、或一句带斜杠的话时，照填比派生的假环境更假。
+///
+/// 记忆目录在这里**要拒**：它由 [`env_from_memory_dir`] 认，当 cwd 会把整条路径塞进项目段。
+fn env_from_cwd(raw: &str) -> Option<SimEnv> {
+    let cwd = raw.trim().trim_end_matches(['.', '/', ':', ',', '`', '"', '\'']);
+    if cwd.len() > MAX_CLIENT_CWD_BYTES || cwd.contains("/.claude/") {
+        return None;
+    }
+    let rest = cwd.strip_prefix("/Users/").or_else(|| cwd.strip_prefix("/home/"))?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    if !(2..=MAX_CLIENT_CWD_SEGMENTS).contains(&segments.len())
+        || !segments.iter().all(|s| is_segment(s))
+    {
+        return None;
+    }
+    Some(SimEnv::from_cwd(&cwd[..cwd.len() - rest.len() + segments[0].len()], cwd))
+}
+
+/// `/Users/<user>` 或 `/home/<user>`：恰好两段，段名规矩（[`is_segment`] 不收 `/`，多一段就不是
+/// 家目录了）。
+fn is_home(s: &str) -> bool {
+    s.strip_prefix("/Users/").or_else(|| s.strip_prefix("/home/")).is_some_and(is_segment)
+}
+
+/// 一段路径名：非空、不超过 [`MAX_CLIENT_SEGMENT_BYTES`]，字符限在字母数字与 `.`/`_`/`-`/`+`/`@`
+/// 内。中日韩目录名（`is_alphanumeric` 收）照认，空格、引号、反斜杠、`/` 都不收。
+fn is_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_CLIENT_SEGMENT_BYTES
+        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@'))
 }
 
 /// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
 /// 2.1.277 只剩 `# Memory` 那条记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`。
 pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
-    template.replace("{{cwd_slug}}", &env.cwd_slug()).replace("{{home}}", &env.home)
+    template.replace("{{cwd_slug}}", &env.slug).replace("{{home}}", &env.home)
 }
 
 /// 按模型族选 2.1.260 的**主线程** profile。
@@ -900,27 +1048,18 @@ pub(super) fn simulate_system(
     };
     // 客户端可能已经抄了官方的 billing header 和身份声明（`is_cc_shaped` 不再拦截非 CC
     // 客户端的这种请求）。模拟会重新补齐这两块，先剥掉客户端那份以免重复。
-    let mut client = strip_cc_preamble(client);
-    // 有第四块时客户端自己的 system 不再占一块：官方 `system` 到第四块为止、块数固定，多
-    // 一块就不是官方形态。正文挪进首条用户消息（官方的 CLAUDE.md、用户指令本来也在用户轮
-    // 里，见 [`stash_client_system`]）；挪不动（没有消息、`content` 形态不认识）就接在第四块
-    // 末尾——块数照旧、一个字不丢。客户端 system 里有非文本成员时拼不出正文，仍按原样追加。
-    let mut rest = sim.rest.clone();
-    if let Some(rest) = rest.as_mut()
-        && !client.is_empty()
-        && let Some(text) = client_system_text(&client)
-    {
-        if stash_client_system(v, &text) {
-            tracing::info!(
-                chars = text.chars().count(),
-                "moved the client system into messages[0]; the fourth system block takes its slot"
-            );
-        } else {
-            rest.push_str("\n\n");
-            rest.push_str(&text);
-        }
-        client.clear();
-    }
+    let client = strip_cc_preamble(client);
+    // 客户端自己的 system **单独占最后一块**（[`merge_system_blocks`] 已经把它并成了一块）：
+    // 官方那几块一个字节都不掺进客户端的内容，客户端那段指令也原样以 system 的身份到达模型。
+    //
+    // 这一版（0.3.154）之前它整段挪进首条用户消息，指令降级成用户轮文本，客户端「我的
+    // system 生效了吗」那类探针因此永远测不到自己那句话；中间短暂拼在第四块末尾，那样官方
+    // 那 11KB 的断点会跟着客户端 system 一起失效，客户端每换一次 system 就按写入价重付一次。
+    //
+    // **代价**：`system` 比官方多一块（`cap/` 37 份抓包的末块恒为官方「其余」段），且末块是
+    // 纯非 CC 内容。上游对末块有内容级检测，超过 [`MAX_CLIENT_SYSTEM_BYTES`] 的由
+    // [`relocate_long_client_system`] 在 [`rewrite_body`] 里挪进首条用户消息、原地留一行占位。
+    let rest = sim.rest.clone();
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
     let outside = count_cache_control(v) - v.get("system").map(count_cache_control).unwrap_or(0);
     let used = outside + client.iter().map(count_cache_control).sum::<usize>();
@@ -963,13 +1102,6 @@ pub(super) fn simulate_system(
 
     insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
     true
-}
-
-/// 客户端 `system` 块的正文拼成一段（`\n\n` 相连，空块跳过）；有一块不是文本块就 `None`。
-fn client_system_text(blocks: &[serde_json::Value]) -> Option<String> {
-    let texts: Vec<&str> = blocks.iter().map(|b| b.get("text")?.as_str()).collect::<Option<_>>()?;
-    let text = texts.into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n\n");
-    (!text.is_empty()).then_some(text)
 }
 
 /// 官方把 CLAUDE.md 与用户指令塞进首条用户消息时，`<system-reminder>` 块开头那一句
@@ -1023,11 +1155,16 @@ pub(super) fn stash_client_system(v: &mut serde_json::Value, text: &str) -> bool
     }
 }
 
-/// 模拟后 system 末块（客户端自有内容）超过此字符数时，移到 messages 首条用户消息里。
+/// 模拟后 system 末块（客户端自有内容）超过此**字节**数时，移到 messages 首条用户消息里。
 ///
-/// 上游对末块有内容级检测：非 CC 特征内容超过 ~2000 字符即触发第三方判定。
-/// 实测 1900 字符安全、2021 字符触发，取 1500 留足余量。
-const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
+/// 上游对末块有内容级检测：非 CC 特征内容超过 ~2000 触发第三方判定，实测 1900 安全、2021
+/// 触发。那次实测的正文是 ASCII，字符数与字节数相等，上游按哪个单位算**没有证据**，这里取
+/// 两者中更保守的字节数——猜错方向的代价是封号，多搬一次只是少一层 system 优先级。
+///
+/// 取值就是实测那条安全线 1900，不再往下留余量（0.3.154 之前是 1500）：留余量保护的是
+/// 「上游按字符算」那种猜错，而那种情形下按字节算本身已经在保守一侧；1500 换来的只是中文
+/// 提示词从约 633 字提前到约 500 字就被搬走，白丢一层 system 优先级。
+pub(super) const MAX_CLIENT_SYSTEM_BYTES: usize = 1900;
 
 /// 把模拟后 system 末块（客户端自有内容）的超长内容搬到 messages 首条用户消息里。
 ///
@@ -1041,8 +1178,8 @@ const MAX_CLIENT_SYSTEM_CHARS: usize = 1500;
 /// 客户端明确下的那段指令**凭空消失**，而调用方只看到一个 `false`，以为什么都没发生。
 pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
     // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座) (+ 第四块)。多出来的那一块
-    // 才是客户端自己的 system；块数不多于它就没有可搬的东西。有第四块时客户端 system 已在
-    // [`simulate_system`] 里整段挪走或并进第四块，这里不会再多出一块。
+    // 才是客户端自己的 system；块数不多于它（来访本来就没发 system）就没有可搬的东西。
+    // 有没有第四块都一样：0.3.154 起客户端 system 恒为独立末块，两种情形都走这里。
     let reporting = sim.profile.system == config::CcSystemShape::IdentityReporting;
     let fixed = 2
         + usize::from(reporting)
@@ -1054,7 +1191,7 @@ pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simul
     };
     let last = sys.len() - 1;
     let tail_text = match sys[last].get("text").and_then(|t| t.as_str()) {
-        Some(t) if t.len() > MAX_CLIENT_SYSTEM_CHARS => t.to_string(),
+        Some(t) if t.len() > MAX_CLIENT_SYSTEM_BYTES => t.to_string(),
         _ => return false,
     };
     // 先写落点：写不进去就原地返回，`system` 还没被动过。
@@ -1072,7 +1209,7 @@ pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simul
         blocks[last] = placeholder;
     }
     tracing::info!(
-        chars = tail_text.len(),
+        bytes = tail_text.len(),
         last,
         "relocated long client system from last block to messages[0]"
     );
@@ -1342,7 +1479,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 4, "sonnet 族应是官方的四块（无 reporting）: {s}");
+        assert_eq!(sys.len(), 5, "官方四块（sonnet 无 reporting）+ 客户端自己那块: {s}");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
             "第 0 块应是 billing header: {s}"
@@ -1373,15 +1510,15 @@ mod tests {
         assert!(
             rest.contains(&format!(
                 "You have a persistent file-based memory at `{}/.claude/projects/{}/memory/`.",
-                env.home,
-                env.cwd_slug()
+                env.home, env.slug
             )),
             "记忆目录随派生的假环境走: {rest}"
         );
         assert!(
             rest.ends_with("<total_tokens>15000000 tokens left</total_tokens>"),
-            "末尾那行照抓包"
+            "第四块末尾那行照抓包，客户端 system 一个字都不掺: {rest}"
         );
+        assert_eq!(sys[4]["text"], "你是助手", "客户端 system 单独占末块（0.3.154）: {s}");
         assert_eq!(
             v["output_config"],
             serde_json::json!({"effort": "high"}),
@@ -1391,15 +1528,13 @@ mod tests {
         assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
         assert_eq!(sys[2]["cache_control"]["ttl"], "1h", "基座该带 ttl: {s}");
         assert_eq!(sys[3]["cache_control"]["ttl"], "1h", "末块也该带 ttl: {s}");
-        // 客户端原 system 整段挪进首条用户消息（模拟路径随后把字符串 content 收成块数组）。
-        let first = v["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(
-            first,
-            format!(
-                "<system-reminder>\n{}\n\n你是助手\n</system-reminder>\n\nhi",
-                crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD
-            ),
-            "客户端 system 裹成官方那种 system-reminder 块放在首条消息正文前: {s}"
+        // 客户端原 system 留在 system 里（单独的末块），首条用户消息一个字都没多。
+        let first = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(first.len(), 1, "首条消息不再被塞东西: {s}");
+        assert_eq!(first[0]["text"], "hi", "首条消息正文原样: {s}");
+        assert!(
+            !s.contains(crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD),
+            "短 system 不该挪进消息: {s}"
         );
         assert!(!s.contains("system_instructions"), "自创标签一个都不能有: {s}");
         assert!(!s.contains("(see conversation)"), "没有占位块: {s}");
@@ -1522,11 +1657,10 @@ mod tests {
     /// 时就直接 `return false`——客户端明确下的那段指令凭空消失，而调用方只看到一个
     /// `false`，以为什么都没发生。
     ///
-    /// 这条搬运只在**没有第四块**时才有活干（开关关着、或模型族没模板）：有第四块时客户端
-    /// system 已由 [`crate::proxy::simulate_system`] 整段安置好，末块不再是它。
+    /// 有没有第四块都一样有活干：客户端 system 恒为独立的末块（0.3.154），超长就搬。
     #[test]
     fn long_client_system_is_relocated_atomically() {
-        let long = "指令".repeat(1200); // 远超 MAX_CLIENT_SYSTEM_CHARS
+        let long = "指令".repeat(1200); // 远超 MAX_CLIENT_SYSTEM_BYTES
         let no_rest = store::ForwardFlags { simulate_full_system: false, ..all_on() };
         // messages[0].content 是数字：既不是数组也不是字符串，搬不过去。
         let body = serde_json::json!({
@@ -1569,8 +1703,7 @@ mod tests {
         assert!(first.starts_with("<system-reminder>\n"), "内容搬到了首条消息: {first}");
         assert!(first.contains("指令"), "内容没丢");
 
-        // 有第四块：simulate_system 自己把客户端 system 挪走，这条搬运无事可做、返回 false。
-        // 搬不动那种（content 是数字）接在第四块末尾，同样不多出一块。
+        // 有第四块时一样：客户端 system 是第 5 块，超长照搬，第四块的官方正文一个字不掺。
         let sim = detect_for(&raw, all_on()).unwrap();
         assert!(sim.rest.is_some());
         let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
@@ -1579,10 +1712,17 @@ mod tests {
             &sim,
             crate::proxy::CacheShape { global: true, ttl_1h: true }
         ));
-        assert_eq!(v["system"].as_array().unwrap().len(), 4, "{v}");
-        assert!(v["messages"][0]["content"].as_str().unwrap().contains("指令"), "已挪进首条消息");
-        assert!(!v["system"][3]["text"].as_str().unwrap().contains("指令"), "第四块是官方正文");
-        assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim), "没有多出的块可搬");
+        assert_eq!(v["system"].as_array().unwrap().len(), 5, "{v}");
+        assert!(v["system"][4]["text"].as_str().unwrap().contains("指令"), "客户端 system 占末块");
+        assert!(
+            v["system"][3]["text"].as_str().unwrap().ends_with("</total_tokens>"),
+            "第四块是官方正文，一个字都没掺"
+        );
+        assert!(crate::proxy::relocate_long_client_system(&mut v, &sim), "超长该搬走");
+        assert_eq!(v["system"][4]["text"], "(see conversation)", "末块换成占位");
+        assert!(v["messages"][0]["content"].as_str().unwrap().contains("指令"), "内容没丢");
+
+        // 落点不可写（content 是数字）：搬不动，末块留着客户端原文，body 一个字节不动。
         let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
         let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert!(crate::proxy::simulate_system(
@@ -1590,15 +1730,11 @@ mod tests {
             &sim,
             crate::proxy::CacheShape { global: true, ttl_1h: true }
         ));
-        assert_eq!(v["system"].as_array().unwrap().len(), 4, "{v}");
-        assert!(
-            v["system"][3]["text"]
-                .as_str()
-                .unwrap()
-                .ends_with(&format!("</total_tokens>\n\n{long}")),
-            "挪不动就接在第四块末尾"
-        );
-        assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim));
+        let before = v.clone();
+        assert_eq!(v["system"].as_array().unwrap().len(), 5, "{v}");
+        assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim), "搬不动就该返回 false");
+        assert_eq!(v, before, "搬不动时 body 必须原样不动");
+        assert!(v["system"][4]["text"].as_str().unwrap().contains("指令"), "客户端那段还在");
     }
 
     /// 没有 system 的请求同样成立：opus 族四块（billing / 身份句 / 基座 / 其余），与
@@ -1617,7 +1753,7 @@ mod tests {
         assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块");
         let env = crate::proxy::sim_env_for(&test_cred(), "fp");
         assert!(
-            rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.cwd_slug())),
+            rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.slug)),
             "记忆目录随派生的 cwd 走: {rest}"
         );
         // 2.1.277 的第四块不再写工作目录、模型名、知识截止与 scratchpad。
@@ -1725,7 +1861,7 @@ mod tests {
         let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 4, "fable 族也是四块: {v}");
+        assert_eq!(sys.len(), 5, "fable 族也是官方四块 + 客户端那块: {v}");
         assert!(
             sys.iter().all(|b| b["text"] != config::CC_SYSTEM_REPORTING),
             "没有 reporting 块: {v}"
@@ -1744,13 +1880,9 @@ mod tests {
             ),
             "{v}"
         );
-        assert!(
-            v["messages"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("<system-reminder>\nCodebase and user instructions are shown below."),
-            "客户端 system 挪进首条消息: {v}"
-        );
+        assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
+        assert_eq!(sys[4]["text"], "你是助手", "客户端 system 单独占末块（0.3.154）");
+        assert_eq!(v["messages"][0]["content"][0]["text"], "hi", "首条消息正文原样");
         assert_eq!(
             v["thinking"],
             serde_json::json!({"type": "adaptive", "display": "updates"}),
@@ -2181,11 +2313,8 @@ mod tests {
             .filter(|b| b.get("text").and_then(|t| t.as_str()) == Some(config::CC_SYSTEM_IDENTITY))
             .count();
         assert_eq!(id_count, 1, "身份声明只该出现一次: {v}");
-        // 客户端的原始 prompt 不该丢：`messages` 为空挪不进首条消息，接在第四块末尾。
-        assert!(
-            sys.last().unwrap()["text"].as_str().unwrap().ends_with("\n\nuser prompt"),
-            "客户端原始 prompt 应保留: {v}"
-        );
+        // 客户端的原始 prompt 不该丢：剥掉抄来的前两块之后，剩下的正文单独占末块。
+        assert_eq!(sys.last().unwrap()["text"], "user prompt", "客户端原始 prompt 应保留: {v}");
 
         // 开关关掉、或 merge_beta 关掉时也不模拟。
         let plain = Bytes::from(PLAIN_BODY.to_string());
@@ -2219,13 +2348,13 @@ mod tests {
         assert!(v["system"][3]["text"].as_str().unwrap().starts_with("Before you start, say"));
     }
 
-    /// 客户端把 `system` 拆成多块时并成一段——3+N 块会被上游判第三方应用、改扣超额池
-    /// （`Third-party apps now draw from your extra usage`）。有第四块时这一段整体挪进首条
-    /// 用户消息；首条消息不可写（这里 `messages` 为空）就接在第四块末尾，块数照旧是官方的四块。
+    /// 客户端把 `system` 拆成多块时并成**一块**——3+N 块会被上游判第三方应用、改扣超额池
+    /// （`Third-party apps now draw from your extra usage`）。并成的那一块跟在官方四块之后，
+    /// 官方那四块的正文一个字都不掺客户端的（0.3.154）。
     ///
-    /// 客户端那 4 个断点随正文一起走、不再占预算：基座与第四块都该拿到断点。
+    /// 客户端那 4 个断点并成一个、不再各占预算：基座与第四块都该拿到断点。
     #[test]
-    fn merges_client_system_blocks_into_official_tail() {
+    fn merges_client_system_blocks_into_one_trailing_block() {
         let blk = |t: &str| {
             format!(r#"{{"type":"text","text":"{t}","cache_control":{{"type":"ephemeral"}}}}"#)
         };
@@ -2238,20 +2367,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
 
-        assert_eq!(sys.len(), 4, "客户端的 4 块并进第四块，仍是官方四块: {v}");
+        assert_eq!(sys.len(), 5, "官方四块 + 并成一块的客户端 system: {v}");
         let rest = sys[3]["text"].as_str().unwrap();
         assert!(rest.starts_with("Before you start, say"), "第四块开头是官方正文");
-        assert!(
-            rest.ends_with("</total_tokens>\n\na\n\nb\n\nc\n\nd"),
-            "messages 为空挪不动，客户端正文接在第四块末尾、一个字都不丢: {rest:.0}…{}",
-            &rest[rest.len().saturating_sub(60)..]
-        );
+        assert!(rest.ends_with("</total_tokens>"), "第四块末尾照抓包，客户端的不掺进来");
+        assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "四块并成一块、一个字都不丢: {v}");
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
         assert_eq!(sys[2]["cache_control"]["scope"], "global", "客户端断点腾出的预算该给基座");
-        assert_eq!(crate::proxy::count_cache_control(&v), 2, "断点数: {v}");
+        assert_eq!(sys[4]["cache_control"]["ttl"], "1h", "末块照官方在 system 末尾标一个断点");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3, "基座 + 第四块 + 末块: {v}");
 
-        // 首条消息可写：并成的一段挪进去，第四块原样；断点是基座、第四块、末条消息各一。
+        // 首条消息可写也不挪：这段不到 MAX_CLIENT_SYSTEM_BYTES，留在自己那一块里。
         let body = Bytes::from(format!(
             r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"system":{sys_json}}}"#
         ));
@@ -2259,22 +2386,39 @@ mod tests {
         let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 4, "{v}");
-        assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "第四块原样");
+        assert_eq!(sys.len(), 5, "{v}");
+        assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "第四块原样: {v}");
+        assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "客户端 system 占末块: {v}");
         let first = v["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(first.len(), 2, "客户端 system 作为一个 text 块插在首条消息最前: {v}");
+        assert_eq!(first.len(), 1, "首条消息不再被塞东西: {v}");
+        assert_eq!(first[0]["text"], "hi");
+
+        // 超过 MAX_CLIENT_SYSTEM_BYTES 的由 relocate_long_client_system 挪进首条消息，
+        // 末块原地留一行占位，整段裹成官方那种 system-reminder 插在首条消息最前。
+        let long = "x".repeat(crate::proxy::MAX_CLIENT_SYSTEM_BYTES + 1);
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"system":"{long}"}}"#
+        ));
+        let sim = detect_for(&body, all_on()).unwrap();
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 5, "{v}");
+        assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "第四块原样");
+        assert_eq!(sys[4]["text"], "(see conversation)", "末块换成占位: {v}");
+        let first = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(first.len(), 2, "长 system 作为一个 text 块插在首条消息最前: {v}");
         assert_eq!(
             first[0]["text"],
             format!(
-                "<system-reminder>\n{}\n\na\n\nb\n\nc\n\nd\n</system-reminder>",
+                "<system-reminder>\n{}\n\n{long}\n</system-reminder>",
                 crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD
             ),
             "与官方首条用户消息第一块同形（cap/2.1.277/00023）"
         );
         assert_eq!(first[1]["text"], "hi");
-        assert_eq!(crate::proxy::count_cache_control(&v), 3, "基座 + 第四块 + 末条消息: {v}");
 
-        // 空块并不进来（发一个空文本块上游不收），第四块也不用接任何东西。
+        // 空块并不进来（发一个空文本块上游不收），也就不多出末块那一块。
         let empty = Bytes::from(
             r#"{"model":"claude-opus-5","messages":[],"system":[{"type":"text","text":""},{"type":"text","text":"  "}]}"#
                 .to_string(),
@@ -2884,21 +3028,13 @@ mod tests {
     #[test]
     fn system_rest_renders_every_placeholder() {
         use crate::proxy::{SimEnv, cc_system_rest, render_system_rest};
-        let cap = SimEnv {
-            home: "/Users/easayliu".into(),
-            cwd: "/Users/easayliu/Works/easay/opdash".into(),
-        };
+        let cap = SimEnv::from_cwd("/Users/easayliu", "/Users/easayliu/Works/easay/opdash");
         assert_eq!(
-            cap.cwd_slug(),
-            "-Users-easayliu-Works-easay-opdash",
+            cap.slug, "-Users-easayliu-Works-easay-opdash",
             "官方的项目段拼法（cap/2.1.277/00023）"
         );
         assert_eq!(
-            SimEnv {
-                home: "/Users/x".into(),
-                cwd: "/private/tmp/proxy_captures/20260904_170955".into()
-            }
-            .cwd_slug(),
+            SimEnv::from_cwd("/Users/x", "/private/tmp/proxy_captures/20260904_170955").slug,
             "-private-tmp-proxy-captures-20260904-170955",
             "下划线也换成横线（cap/2.1.260-2/00013）"
         );
@@ -3086,20 +3222,112 @@ mod tests {
         let cred = test_cred();
         let a = crate::proxy::sim_env_for(&cred, "fp-a");
         assert_eq!(a, crate::proxy::sim_env_for(&cred, "fp-a"), "同账号同设备恒定");
-        let parts: Vec<&str> = a.cwd.split('/').collect();
-        assert_eq!(parts.len(), 5, "/Users/<user>/<dir>/<project>: {}", a.cwd);
-        assert_eq!(parts[1], "Users");
+        let parts: Vec<&str> = a.slug.split('-').collect();
+        assert_eq!(parts.len(), 5, "-Users-<user>-<dir>-<project>: {}", a.slug);
+        assert_eq!((parts[0], parts[1]), ("", "Users"));
         assert_eq!(a.home, format!("/Users/{}", parts[2]));
-        assert!(a.cwd.starts_with(&format!("{}/", a.home)));
-        assert!(!a.cwd.contains("easayliu") && !a.cwd.contains("proxy_captures"));
-        assert_eq!(a.cwd_slug(), a.cwd.replace('/', "-"), "派生路径里没有下划线");
+        assert!(a.slug.starts_with(&a.home.replace('/', "-")));
+        assert!(!a.slug.contains("easayliu") && !a.slug.contains("proxy"));
+        assert!(!a.slug.contains('_'), "派生路径里没有下划线: {}", a.slug);
         let other = crate::credentials::Credential {
             account_uuid: Some("00000000-0000-4000-8000-000000000001".into()),
             ..cred.clone()
         };
         let envs: std::collections::HashSet<String> =
-            (0..64).map(|i| crate::proxy::sim_env_for(&other, &format!("fp-{i}")).cwd).collect();
+            (0..64).map(|i| crate::proxy::sim_env_for(&other, &format!("fp-{i}")).slug).collect();
         assert!(envs.len() > 8, "64 台设备不该挤在一两个目录里: {envs:?}");
+    }
+
+    /// 来访自己写了工作目录时第四块就用它那份，认不出来才退回派生的假环境。
+    #[test]
+    fn client_working_directory_wins_over_the_derived_one() {
+        use crate::proxy::{SimEnv, client_env};
+        let env =
+            |body: &str| client_env(&serde_json::from_str::<serde_json::Value>(body).unwrap());
+
+        // 1. 来访自己那条记忆目录：家目录与项目段照抄，不倒推 cwd。
+        assert_eq!(
+            env(
+                r#"{"system":"memory at `/Users/easayliu/.claude/projects/-Users-easayliu-Works-easay-luban/memory/`"}"#
+            ),
+            Some(SimEnv {
+                home: "/Users/easayliu".into(),
+                slug: "-Users-easayliu-Works-easay-luban".into(),
+            })
+        );
+        // 2. 明写工作目录的那一行（官方 CC 写在首条用户消息的 `<env>` 里）。
+        assert_eq!(
+            env(
+                r#"{"messages":[{"role":"user","content":"<env>\nWorking directory: /Users/sam/src/api\nIs git repo: Yes\n</env>"}]}"#
+            ),
+            Some(SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"))
+        );
+        // 3. system 正文里裸一条路径；下划线按官方写法换成横线。
+        assert_eq!(
+            env(r#"{"system":[{"type":"text","text":"repo lives at /home/dev/work/my_app."}]}"#),
+            Some(SimEnv { home: "/home/dev".into(), slug: "-home-dev-work-my-app".into() })
+        );
+        // 用户问句里提到的目录不算「我在这儿干活」：裸路径只认 system。
+        assert_eq!(
+            env(r#"{"messages":[{"role":"user","content":"why is /Users/sam/src/api broken"}]}"#),
+            None
+        );
+        // `/memory` 后面还有别的：`/memory-backup` 不是记忆目录。这条不认之后整段也没有
+        // 别的来源——裸路径扫描同样不收带 `/.claude/` 的路径。
+        assert_eq!(
+            env(
+                r#"{"system":"at /Users/easayliu/.claude/projects/-Users-easayliu-Works-easay-luban/memory-backup/x"}"#
+            ),
+            None
+        );
+        // 旧目录那行排在前面时不算数：标签必须是行首，`Previous working directory:` 不是。
+        assert_eq!(
+            env(
+                r#"{"system":"Previous working directory: /Users/old/gone\nWorking directory: /Users/sam/src/api"}"#
+            ),
+            Some(SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"))
+        );
+        // 行首的列表符号不挡事（`<env>` 之外各家写法不一）。
+        assert_eq!(
+            env(r#"{"system":" - cwd: /Users/sam/src/api"}"#),
+            Some(SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"))
+        );
+        // 认不出来的一律当没给，由 `sim_env_for` 兜底。
+        for junk in [
+            r#"{"system":"/Users/sam"}"#,
+            r#"{"system":"C:\\Users\\sam\\src"}"#,
+            r#"{"system":"cwd: /tmp/work"}"#,
+            r#"{"system":"and/or, maybe"}"#,
+            // 标签得是行首那个词：`not-cwd:` 不算（首条消息不走裸路径那条，故为 None）。
+            r#"{"messages":[{"role":"user","content":"not-cwd: /Users/sam/src/api"}]}"#,
+            r#"{"system":"/Users/sam/a/b/c/d/e/f/g/h/i"}"#,
+            PLAIN_BODY,
+        ] {
+            assert_eq!(env(junk), None, "{junk}");
+        }
+    }
+
+    /// 整条 detect：来访 system 里那条路径直接落进第四块的记忆目录，派生的那台机器不再出现。
+    #[test]
+    fn simulated_memory_path_follows_the_client_working_directory() {
+        let body = Bytes::from(
+            concat!(
+                r#"{"model":"claude-opus-5","max_tokens":1024,"#,
+                r#""messages":[{"role":"user","content":"hi"}],"#,
+                r#""system":"Working directory: /Users/easayliu/Works/easay/luban"}"#
+            )
+            .to_string(),
+        );
+        let sim = detect_for(&body, all_on()).expect("第三方请求应判为需要模拟");
+        let rest = sim.rest.as_deref().expect("第四块");
+        assert!(
+            rest.contains(
+                "`/Users/easayliu/.claude/projects/-Users-easayliu-Works-easay-luban/memory/`"
+            ),
+            "{rest}"
+        );
+        let derived = crate::proxy::sim_env_for(&test_cred(), "fp");
+        assert!(!rest.contains(&derived.slug), "派生的那台机器不该再出现: {rest}");
     }
 
     /// cc_version 后缀与官方客户端的算法对齐（逆向自 2.1.251）：

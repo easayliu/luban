@@ -137,10 +137,10 @@ mod simulation;
 use simulation::SimSessionSeed;
 #[cfg(test)]
 use simulation::{
-    CC_BASE_PROMPT_MIN_LEN, CLIENT_SYSTEM_REMINDER_LEAD, MAX_CACHE_BREAKPOINTS, SimEnv,
-    SimulationReason, billing_header_text, cap_system_blocks, cc_identity_well_formed,
-    cc_profile_for, cc_system_rest, cc_version_suffix, inbound_facts,
-    is_official_thread_continuation, looks_like_uuid, relocate_long_client_system,
+    CC_BASE_PROMPT_MIN_LEN, CLIENT_SYSTEM_REMINDER_LEAD, MAX_CACHE_BREAKPOINTS,
+    MAX_CLIENT_SYSTEM_BYTES, SimEnv, SimulationReason, billing_header_text, cap_system_blocks,
+    cc_identity_well_formed, cc_profile_for, cc_system_rest, cc_version_suffix, client_env,
+    inbound_facts, is_official_thread_continuation, looks_like_uuid, relocate_long_client_system,
     render_system_rest, sim_env_for, simulate_system, simulates_cc, simulation_reason,
 };
 use simulation::{Simulation, is_cc_shaped};

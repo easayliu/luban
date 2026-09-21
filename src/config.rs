@@ -369,8 +369,8 @@ pub const CC_SYSTEM_BASE: &str = include_str!("assets/cc_system_base.txt");
 ///
 /// | 占位 | 官方取值 | 填法 |
 /// |---|---|---|
-/// | `{{home}}` | 记忆目录的 `/Users/<user>` | 按账号 + 设备派生的假环境，见 `SimEnv` |
-/// | `{{cwd_slug}}` | 记忆目录的项目段，cwd 里 `/` 与 `_` 换成 `-`（`-Users-easayliu-Works-easay-opdash`） | 由派生的 cwd 算出 |
+/// | `{{home}}` | 记忆目录的 `/Users/<user>` | 来访自己写了工作目录就用它的（`crate::proxy::client_env`），没写才按账号 + 设备派生，见 `SimEnv` |
+/// | `{{cwd_slug}}` | 记忆目录的项目段，cwd 里 `/` 与 `_` 换成 `-`（`-Users-easayliu-Works-easay-opdash`） | 同上，由那份环境算出 |
 ///
 /// 另去掉了末尾 `EndConversation (deferred tool): … Load the full guidance via ToolSearch(…)`
 /// 那一段（233 字节）：模拟路径**不注** `ToolSearch` 与 `DeferredToolPlaceholder`
