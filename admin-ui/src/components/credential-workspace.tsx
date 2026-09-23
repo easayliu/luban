@@ -529,6 +529,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       unknown: 0,
     }
     let rateLimitedPauseCount = 0
+    // 「需处理」那一格的小字按**主状态**分项：每个号只落一档（与卡片上显示的那个状态同一个），
+    // 各项加起来恰好等于大数。原先小字拼的是几个互相重叠的筛选计数——「冷却」连只是某个模型
+    // 在冷却、账号照常可调度的号也数进去——于是「6」下面写着「1 Token 失效 · 11 冷却」。
+    const attentionKinds: Record<string, number> = {}
+    // 只有模型级冷却、账号本身没进「需处理」的号：另起一项，不算进大数。
+    let modelOnlyCoolingCount = 0
     let nearLimitCount = 0
     let activeOverageCount = 0
     let unknownOverageCount = 0
@@ -542,7 +548,13 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       tierCounts.all += 1
       tierCounts[planKey(credential.tier)] += 1
       if (evaluation.schedulable) filterCounts.schedulable += 1
-      if (evaluation.needsAttention) filterCounts.attention += 1
+      if (evaluation.needsAttention) {
+        filterCounts.attention += 1
+        const kind = evaluation.status.kind
+        attentionKinds[kind] = (attentionKinds[kind] ?? 0) + 1
+      } else if (!credential.disabled && evaluation.modelCooling) {
+        modelOnlyCoolingCount += 1
+      }
       if (!credential.disabled) filterCounts.enabled += 1
       else if (!credential.ban_reason && credential.resume_at == null) filterCounts.disabled += 1
       if (credential.resume_at != null) rateLimitedPauseCount += 1
@@ -591,6 +603,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     return {
       filterCounts,
       tierCounts,
+      attentionKinds,
+      modelOnlyCoolingCount,
       rateLimitedPauseCount,
       nearLimitCount,
       activeOverageCount,
@@ -605,7 +619,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const total = sorted.length
   const enabledCount = metrics.filterCounts.enabled
   const schedulableCount = metrics.filterCounts.schedulable
-  const cooldownCount = metrics.filterCounts.cooldown
   const attentionCount = metrics.filterCounts.attention
   const quotaRiskCount = metrics.filterCounts.nearLimit
   const fullDeviceCount = metrics.filterCounts.deviceFull
@@ -614,40 +627,37 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
   const bannedCount = metrics.filterCounts.banned
-  const tokenInvalidCount = metrics.filterCounts.tokenInvalid
   const rejectionsHint = rejectedTotal > 0 && rejectionsQuery.data
     ? t(
         `近 1 小时本地拒绝 ${formatNumber(rejectedTotal)} 条：${rejectionsQuery.data.rows.map((r) => `${rejectionKindLabel(r.kind)} ${formatNumber(r.count)}`).join('，')}。`,
         `${formatNumber(rejectedTotal)} rejected locally in the last hour: ${rejectionsQuery.data.rows.map((r) => `${rejectionKindLabel(r.kind)} ${formatNumber(r.count)}`).join(', ')}.`,
       )
     : undefined
+  // 分项顺序与卡片状态的严重程度（`rank`）一致：封禁 → 限流暂停 → Token 失效 → credits → 冷却 → 将满。
+  const attentionKindLabels: [string, string, string][] = [
+    ['banned', '封禁', 'banned'],
+    ['rate-limited', '限流暂停', 'paused'],
+    ['token-invalid', 'Token 失效', 'token expired'],
+    ['overage', '用 credits', 'on credits'],
+    ['overage-unknown', 'credits 待确认', 'credits unconfirmed'],
+    ['cooldown', '冷却', 'cooling down'],
+    ['near-limit', '将满', 'near limit'],
+  ]
   const attentionStatus = [
-    bannedCount > 0
-      ? t(`${formatNumber(bannedCount)} 封禁`, `${formatNumber(bannedCount)} banned`)
-      : '',
-    tokenInvalidCount > 0
-      ? t(`${formatNumber(tokenInvalidCount)} Token 失效`, `${formatNumber(tokenInvalidCount)} token expired`)
-      : '',
-    metrics.activeOverageCount > 0
+    ...attentionKindLabels.map(([kind, zh, en]) => {
+      const n = metrics.attentionKinds[kind] ?? 0
+      return n > 0 ? t(`${formatNumber(n)} ${zh}`, `${formatNumber(n)} ${en}`) : ''
+    }),
+    // 以下两项不是「需处理」的账号，不计入大数：模型级冷却只挡这个号的某几个模型；
+    // 本地拒绝数的是请求条数。
+    metrics.modelOnlyCoolingCount > 0
       ? t(
-          `${formatNumber(metrics.activeOverageCount)} 用 credits`,
-          `${formatNumber(metrics.activeOverageCount)} on credits`,
+          `另 ${formatNumber(metrics.modelOnlyCoolingCount)} 个模型冷却`,
+          `+${formatNumber(metrics.modelOnlyCoolingCount)} model cooldown`,
         )
-      : '',
-    metrics.unknownOverageCount > 0
-      ? t(
-          `${formatNumber(metrics.unknownOverageCount)} credits 待确认`,
-          `${formatNumber(metrics.unknownOverageCount)} credits unconfirmed`,
-        )
-      : '',
-    cooldownCount > 0
-      ? t(`${formatNumber(cooldownCount)} 冷却`, `${formatNumber(cooldownCount)} cooling down`)
-      : '',
-    metrics.nearLimitCount > 0
-      ? t(`${formatNumber(metrics.nearLimitCount)} 将满`, `${formatNumber(metrics.nearLimitCount)} near limit`)
       : '',
     rejectedTotal > 0
-      ? t(`${formatNumber(rejectedTotal)} 拒绝/1h`, `${formatNumber(rejectedTotal)} rejected/1h`)
+      ? t(`${formatNumber(rejectedTotal)} 条拒绝/1h`, `${formatNumber(rejectedTotal)} rejected/1h`)
       : '',
   ].filter(Boolean).join(' · ') || undefined
   const quotaRiskStatus = [
