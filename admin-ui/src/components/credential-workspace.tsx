@@ -444,6 +444,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     'bare-rate-limit': t('裸请求限流', 'bare-request limit'),
     'all-cooling-down': t('全员冷却', 'all cooling down'),
     'no-device-id': t('无设备身份', 'no device identity'),
+    // 已撤掉的「按模型最低客户端版本」闸（v0.3.157 ~ v0.3.160）留下的历史行，只为它们仍显示成中文。
     'model-min-version': t('客户端版本不支持该模型', 'client too old for model'),
     'model-unsupported': t('套餐不含模型', 'model not in plan'),
     'unavailable': t('无可用账号', 'no account available'),

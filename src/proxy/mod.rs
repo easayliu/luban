@@ -82,12 +82,11 @@ use body::ua_of;
 #[cfg(test)]
 use body::{
     CacheShape, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
-    below_min_client_version, below_model_min_cc_version, body_has_pair, body_has_user_id,
-    build_tool_name_map, cc_cli_version, cc_tools_core, client_supplied_fallbacks,
-    device_fingerprint, drop_empty_system_messages, ensure_beta_query, ensure_billing_cch,
-    ensure_fallbacks, extract_device_id, extract_session_id, flatten_tool_schemas,
-    is_billable_messages, is_fallback_rejection, known_latest_release, normalize_tool_choice,
-    outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
+    below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
+    cc_tools_core, client_supplied_fallbacks, device_fingerprint, drop_empty_system_messages,
+    ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
+    flatten_tool_schemas, is_billable_messages, is_fallback_rejection, known_latest_release,
+    normalize_tool_choice, outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
     remember_fallback_rejection, replace_json_str_field, rewrite_body_out, sim_device_fingerprint,
     sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
     sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
@@ -286,7 +285,7 @@ struct RequestLogState {
     local_replay: parking_lot::Mutex<Option<&'static str>>,
     /// 本地拒绝的**原因分类**（`device-limit` / `session-limit` / `account-rpm` / `device-rpm` /
     /// `session-rpm` / `session-concurrency` / `bare-rate-limit` / `all-cooling-down` /
-    /// `no-device-id` / `model-min-version` …）：拒绝那一处随手放下，[`handle`] 写流水时拼进 `rewrites`
+    /// `no-device-id` …）：拒绝那一处随手放下，[`handle`] 写流水时拼进 `rewrites`
     /// （`rejected_locally:<kind>`），概览按它统计「近 1 小时被谁拒了多少」。没标的仍是裸的
     /// `rejected_locally`（坏形态、鉴权那些）。
     local_reject: parking_lot::Mutex<Option<&'static str>>,

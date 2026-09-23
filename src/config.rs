@@ -350,34 +350,6 @@ pub const CC_VERSION_BASE: &str = "2.1.280";
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
 pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.280";
 
-/// 各模型**首个支持它的官方 Claude Code 版本**：`(模型名前缀, 最低版本)`。自报
-/// `claude-cli/<版本>` 低于这里的来访请求该模型时本地拒掉，见
-/// [`crate::proxy::below_model_min_cc_version`]——官方客户端在那之前根本不认识这个模型，
-/// 一条 `claude-cli/2.1.277` + `claude-opus-5-5` 的请求在上游那侧是官方绝不产生的组合。
-///
-/// 按**最长前缀**匹配（`claude-opus-5-5` 同时以 `claude-opus-5` 开头），顺序无所谓。
-/// 依据是官方 CHANGELOG 里各模型的「Added / Introducing」那一行：
-/// - opus-5-5 2.1.280：`Added Claude Opus 5.5 (claude-opus-5-5)`
-/// - fable-5-1 2.1.257：`Added Claude Fable 5.1 (claude-fable-5-1)`；mythos-5-1 同代，按同版本
-/// - opus-5 2.1.219：`Added Claude Opus 5 (claude-opus-5)`
-/// - sonnet-5 2.1.197：`Introducing Claude Sonnet 5 … Update to version 2.1.197 for access`
-/// - fable-5 / mythos-5 2.1.170：`Introducing Claude Fable 5 … Update to version 2.1.170`
-/// - opus-4-8 2.1.154：`Opus 4.8 is here!`
-/// - opus-4-7 2.1.111：`Claude Opus 4.7 xhigh is now available!`
-///
-/// 更老的模型不列：那些版本早就低于任何能跑通 OAuth 的客户端，列了也拦不到人。
-pub const MODEL_MIN_CC_VERSION: &[(&str, &str)] = &[
-    ("claude-opus-5-5", "2.1.280"),
-    ("claude-fable-5-1", "2.1.257"),
-    ("claude-mythos-5-1", "2.1.257"),
-    ("claude-opus-5", "2.1.219"),
-    ("claude-sonnet-5", "2.1.197"),
-    ("claude-fable-5", "2.1.170"),
-    ("claude-mythos-5", "2.1.170"),
-    ("claude-opus-4-8", "2.1.154"),
-    ("claude-opus-4-7", "2.1.111"),
-];
-
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
 /// 逐字节取自 `cap/2.1.251/00019`（opus-4-6 直连）的 `system[2]`，`cap/2.1.258/00013`

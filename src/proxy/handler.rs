@@ -13,12 +13,12 @@ use super::ban::{
     parse_upstream_error,
 };
 use super::body::{
-    below_min_client_version, below_model_min_cc_version, body_has_user_id, build_tool_name_map,
-    cc_cli_version, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
-    extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
-    known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
-    remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
-    sim_session_key, stream_requested, trusted_cc_version, ua_of,
+    below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
+    client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
+    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
+    outbound_carries_fallbacks, refusal_fallbacks_for, remember_fallback_rejection,
+    session_binding_key, sim_device_fingerprint, sim_device_id, sim_session_key, stream_requested,
+    trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -291,29 +291,6 @@ pub(super) async fn handle_inner(
             kind,
             req_model.as_deref(),
             body_json.as_ref().is_some_and(stream_requested),
-        );
-    }
-
-    // 2.1b) 按模型的最低客户端版本闸：自报 `claude-cli/<版本>` 早于该模型首发版本的来访
-    //       （如 2.1.277 请求 `claude-opus-5-5`，官方 2.1.280 才加上它）本地直接拒，判定见
-    //       [`below_model_min_cc_version`]。官方客户端在那之前不认识这个模型，透传出去就是
-    //       一条官方绝不产生的「版本 + 模型」组合。回 400 而非 1.5 那道闸的 403：这只是这一个
-    //       模型用不了，换个模型照常能发，不该让下游中转把整个 key 当成被封摘掉。
-    if let Some(model) = req_model.as_deref()
-        && let Some((got, want)) = below_model_min_cc_version(&client_ua, model)
-    {
-        tracing::warn!(
-            %method, path = %path_and_query, ua = %client_ua, %model, %got, %want,
-            "rejected: client version is older than the first Claude Code release that supports this model"
-        );
-        *log_state.local_reject.lock() = Some("model-min-version");
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!(
-                "Claude Code {got} does not support {model}; upgrade to {want} or newer \
-                 (npm i -g @anthropic-ai/claude-code)"
-            ),
         );
     }
 

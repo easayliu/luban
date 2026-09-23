@@ -1008,22 +1008,6 @@ pub(super) fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(S
     (got < want).then(|| (format!("{}.{}.{}", got.0, got.1, got.2), min.trim().to_string()))
 }
 
-/// 按模型的最低客户端版本闸：来访 UA 自报的 CC 版本低于该模型首个支持它的官方版本
-/// （[`config::MODEL_MIN_CC_VERSION`]，按最长前缀匹配）时，返回 `(自报版本, 要求版本)`；
-/// 放行时返回 `None`。
-///
-/// 与 [`below_min_client_version`] 一样只卡 UA 里带 `claude-cli/` 的来访：非 CC 客户端没有
-/// 版本可比，读不出版本号的也放过；表里没有的模型不设限。同样只是引导升级，不是安全边界。
-pub(super) fn below_model_min_cc_version(ua: &str, model: &str) -> Option<(String, &'static str)> {
-    let m = model.to_ascii_lowercase();
-    let (_, want) = config::MODEL_MIN_CC_VERSION
-        .iter()
-        .filter(|(prefix, _)| m.starts_with(prefix))
-        .max_by_key(|(prefix, _)| prefix.len())?;
-    let got = cc_cli_version(ua)?;
-    (got < parse_version(want)?).then(|| (format!("{}.{}.{}", got.0, got.1, got.2), *want))
-}
-
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
 /// - CC 内嵌 JSON：**字符串级定点替换**这两个字段的值，字段顺序与其余内容原样不动。
 ///   真实 CC 发的是紧凑 JSON `{"device_id":..,"account_uuid":..,"session_id":..}`。外层 body
@@ -7044,36 +7028,6 @@ mod tests {
         assert!(
             crate::proxy::below_min_client_version("claude-cli/2.0.999", Some("2.1")).is_some()
         );
-    }
-
-    /// 按模型的版本闸：低于该模型首发版本的 CC 来访才拦；`opus-5-5` 要按最长前缀落到
-    /// 2.1.280，不能被 `opus-5` 那条 2.1.219 截胡；非 CC、表外模型一律放行。
-    #[test]
-    fn model_min_cc_version_gate() {
-        let gate = crate::proxy::below_model_min_cc_version;
-        let v277 = "claude-cli/2.1.277 (external, cli)";
-        let v280 = "claude-cli/2.1.280 (external, cli)";
-
-        assert_eq!(
-            gate(v277, "claude-opus-5-5"),
-            Some(("2.1.277".to_string(), "2.1.280")),
-            "opus-5-5 最低 2.1.280"
-        );
-        assert!(gate(v277, "claude-opus-5-5[1m]").is_some(), "带 [1m] 后缀同样按前缀认");
-        assert!(gate(v277, "Claude-Opus-5-5").is_some(), "大小写不影响");
-        assert!(gate(v280, "claude-opus-5-5").is_none(), "正好等于首发版本放行");
-        assert!(gate(v277, "claude-opus-5").is_none(), "opus-5 自 2.1.219 起就有");
-        assert!(gate("claude-cli/2.1.256", "claude-fable-5-1").is_some(), "fable-5-1 最低 2.1.257");
-        assert!(gate("claude-cli/2.1.257", "claude-fable-5-1").is_none());
-        assert!(gate("claude-cli/2.1.256", "claude-fable-5").is_none(), "fable-5 自 2.1.170 起");
-        assert!(gate("claude-cli/2.1.169", "claude-fable-5").is_some());
-        assert!(
-            gate("claude-cli/2.1.200", "claude-mythos-5-1").is_some(),
-            "mythos-5-1 与 fable-5-1 同代"
-        );
-        assert!(gate("claude-cli/2.1.100", "claude-haiku-4-5").is_none(), "表外模型不设限");
-        assert!(gate("python-httpx/0.27.0", "claude-opus-5-5").is_none(), "非 CC 客户端不受管");
-        assert!(gate("-", "claude-opus-5-5").is_none(), "没带 UA 放行");
     }
 
     /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API
