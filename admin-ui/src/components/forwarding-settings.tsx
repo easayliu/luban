@@ -1519,7 +1519,7 @@ function RefusalGroup({
                     setPage(0)
                   }}
                 >
-                  <SelectTrigger size="sm" aria-label={t('每页条数', 'Rows per page')}>
+                  <SelectTrigger size="sm" className="w-auto min-w-20" aria-label={t('每页条数', 'Rows per page')}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectPopup>

@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import {
   ArrowUpDownIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
   DatabaseZapIcon,
   LayersIcon,
   LayoutGridIcon,
@@ -72,7 +70,8 @@ import {
   Pagination as CossPagination,
   PaginationContent,
   PaginationItem,
-  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
 } from '@/components/ui/pagination'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -1315,93 +1314,29 @@ function AccountPagination({
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   const pageSizeItems = useMemo(
-    () => PAGE_SIZE_ITEMS.map(({ size, value }) => ({
-      value,
-      label: t(`${numberFormatter.format(size)} 个`, `${numberFormatter.format(size)} items`),
-    })),
-    [numberFormatter, t],
+    () => PAGE_SIZE_ITEMS.map(({ size, value }) => ({ value, label: numberFormatter.format(size) })),
+    [numberFormatter],
   )
   const from = (page - 1) * pageSize + 1
   const to = Math.min(page * pageSize, total)
-  const start = Math.max(1, Math.min(page - 2, pageCount - 4))
-  const pages = Array.from({ length: Math.min(5, pageCount) }, (_, index) => start + index)
-  const navigate = (event: React.MouseEvent<HTMLAnchorElement>, next: number) => {
-    event.preventDefault()
-    if (next >= 1 && next <= pageCount) onPageChange(next)
-  }
 
+  // 与用量明细、封禁记录、学到的规则三处的分页条同一套写法：左计数、中翻页、右每页，`sm` 起
+  // 排成一行、窄屏翻页落到第二行；翻页只有上一页 / 「第 x / y 页」/ 下一页，手机上是两个方形
+  // 图标按钮。此前这里自成一套（`md` 断点、`icon-sm` 小按钮、数字页码、窄屏缩成「1–10 / 29」
+  // 并藏掉「每页」），同一个后台里四条分页条只有它长得不一样。
   return (
-    <div className="grid grid-cols-[1fr_auto] items-center gap-3 text-xs text-muted-foreground md:grid-cols-[1fr_auto_1fr]">
-      <span className="min-w-0">
-        <span className="sm:hidden">
-          <span className="tnum text-foreground">{formatNumber(from)}–{formatNumber(to)}</span>
-          {' / '}
-          <span className="tnum text-foreground">{formatNumber(total)}</span>
-        </span>
-        <span className="hidden sm:inline">
-          {t('第 ', 'Showing ')}
-          <span className="tnum text-foreground">{formatNumber(from)}–{formatNumber(to)}</span>
-          {t(' 个，共 ', ' of ')}
-          <span className="tnum text-foreground">{formatNumber(total)}</span>
-          {t(' 个账号', ` ${total === 1 ? 'account' : 'accounts'}`)}
-        </span>
-      </span>
-      {pageCount > 1 && (
-        <CossPagination className="col-span-2 row-start-2 justify-center md:col-span-1 md:col-start-2 md:row-start-1">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationLink
-                href="#"
-                size="icon-sm"
-                className={cn(page <= 1 && 'pointer-events-none opacity-50')}
-                aria-disabled={page <= 1}
-                aria-label={t('上一页', 'Previous page')}
-                onClick={(event) => navigate(event, page - 1)}
-              >
-                <ChevronLeftIcon />
-              </PaginationLink>
-            </PaginationItem>
-            {pages.map((item) => (
-              <PaginationItem key={item} className="max-sm:hidden">
-                <PaginationLink
-                  href="#"
-                  size="icon-sm"
-                  isActive={item === page}
-                  aria-label={t(
-                    `第 ${formatNumber(item)} 页`,
-                    `Page ${formatNumber(item)}`,
-                  )}
-                  onClick={(event) => navigate(event, item)}
-                >
-                  <span className="tnum">{formatNumber(item)}</span>
-                </PaginationLink>
-              </PaginationItem>
-            ))}
-            <PaginationItem className="sm:hidden">
-              <span className="tnum px-2 text-foreground">
-                {formatNumber(page)} / {formatNumber(pageCount)}
-              </span>
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationLink
-                href="#"
-                size="icon-sm"
-                className={cn(page >= pageCount && 'pointer-events-none opacity-50')}
-                aria-disabled={page >= pageCount}
-                aria-label={t('下一页', 'Next page')}
-                onClick={(event) => navigate(event, page + 1)}
-              >
-                <ChevronRightIcon />
-              </PaginationLink>
-            </PaginationItem>
-          </PaginationContent>
-        </CossPagination>
-      )}
+    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+      <p className="min-w-0 text-muted-foreground tabular-nums">
+        {t(
+          `第 ${formatNumber(from)}–${formatNumber(to)} 个，共 ${formatNumber(total)} 个`,
+          `${formatNumber(from)}–${formatNumber(to)} of ${formatNumber(total)}`,
+        )}
+      </p>
       {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
         放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
         sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
-      <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end md:col-start-3">
-        <span className="whitespace-nowrap max-sm:sr-only">{t('每页', 'Per page')}</span>
+      <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
+        <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
         <Select
           items={pageSizeItems}
           value={String(pageSize)}
@@ -1412,20 +1347,44 @@ function AccountPagination({
             }
           }}
         >
-          <SelectTrigger
-            aria-label={t('每页账号数', 'Accounts per page')}
-            size="sm"
-            className="w-auto min-w-20"
-          >
+          <SelectTrigger size="sm" className="w-auto min-w-20" aria-label={t('每页账号数', 'Accounts per page')}>
             <SelectValue />
           </SelectTrigger>
-          <SelectPopup align="end">
+          <SelectPopup>
             {pageSizeItems.map((item) => (
               <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
             ))}
           </SelectPopup>
         </Select>
       </div>
+      {pageCount > 1 && (
+        <CossPagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+          <PaginationContent>
+            <PaginationItem>
+              <PaginationPrevious
+                render={<Button variant="ghost" disabled={page <= 1} />}
+                aria-disabled={page <= 1}
+                onClick={() => onPageChange(Math.max(1, page - 1))}
+              />
+            </PaginationItem>
+            <PaginationItem>
+              <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
+                {t(
+                  `第 ${formatNumber(page)} / ${formatNumber(pageCount)} 页`,
+                  `Page ${formatNumber(page)} of ${formatNumber(pageCount)}`,
+                )}
+              </span>
+            </PaginationItem>
+            <PaginationItem>
+              <PaginationNext
+                render={<Button variant="ghost" disabled={page >= pageCount} />}
+                aria-disabled={page >= pageCount}
+                onClick={() => onPageChange(Math.min(pageCount, page + 1))}
+              />
+            </PaginationItem>
+          </PaginationContent>
+        </CossPagination>
+      )}
     </div>
   )
 }
