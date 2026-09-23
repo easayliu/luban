@@ -302,6 +302,10 @@ pub struct Identity {
     pub subscription_type: String,
     /// 客户端版本（`2.1.258`），与出站 UA 一致。
     pub version: String,
+    /// 子代理支线号（出站头 `x-claude-code-agent-id`）。只有子代理与它的摘要请求那条链上的
+    /// 事件才带：event_logging 在顶层 `device_id` 之后追 `agent_id` + `agent_type: "subagent"`，
+    /// Datadog 在 `swe_bench_task_id` 之后（`cap/2.1.280` 子代理 a51764… 那一串）。
+    pub agent_id: Option<String>,
 }
 
 /// 逐条事件变化的那几项。
@@ -404,7 +408,7 @@ impl Identity {
         // 那一整串（含 `advanced-tool-use`/`effort`/`afk-mode`…），而同一批里的
         // `tengu_turn_end` 只有会话级那 9 项。一套 ctx 走天下就会把两者报成同一个值。
         let betas = extra.get("betas").and_then(|b| b.as_str()).unwrap_or(ctx.betas);
-        json!({
+        let mut ev = json!({
             "event_type": "ClaudeCodeInternalEvent",
             "event_data": {
                 "event_name": name,
@@ -423,7 +427,12 @@ impl Identity {
                 "event_id": uuid_v4(),
                 "device_id": &self.device_id
             }
-        })
+        });
+        if let Some(agent) = &self.agent_id {
+            ev["event_data"]["agent_id"] = json!(agent);
+            ev["event_data"]["agent_type"] = json!("subagent");
+        }
+        ev
     }
 
     /// 一条 `GrowthbookExperimentEvent`（特性实验曝光，形态取自 `cap/2.1.260-1/00034`）。
@@ -485,19 +494,25 @@ impl Identity {
         // （`cap/2.1.260-2/00062`），opus 没有后缀所以看不出来。
         let short = extra.get("model").and_then(|m| m.as_str()).map(dd_model_short);
         let model = short.as_deref().unwrap_or(model);
-        let provider_tag = extra
-            .get("provider")
-            .and_then(|p| p.as_str())
-            .map(|p| format!("provider:{p},"))
-            .unwrap_or_default();
+        // `event:` 之后的标签按键名字母序：`provider` 落在 platform 与 subscription_type 之间
+        // （api_success），tether 判定的 `decision` / `reason` 分别落在 client_type 之后与
+        // platform 之后（`cap/2.1.280` 的 Datadog 批次）。
+        let extra_tag =
+            |k: &str| extra.get(k).and_then(|p| p.as_str()).map(|v| format!("{k}:{v},"));
+        let provider_tag = extra_tag("provider").unwrap_or_default();
+        let (decision_tag, reason_tag) = if message == "tengu_tether_decision" {
+            (extra_tag("decision").unwrap_or_default(), extra_tag("reason").unwrap_or_default())
+        } else {
+            (String::new(), String::new())
+        };
         let mut m = Map::new();
         m.insert("ddsource".into(), s("nodejs"));
         m.insert(
             "ddtags".into(),
             s(&format!(
-                "event:{message},arch:arm64,client_type:cli,entrypoint:cli,model:{model},\
-                 platform:darwin,{provider_tag}subscription_type:{},user_bucket:15,\
-                 user_type:external,version:{v},version_base:{v}",
+                "event:{message},arch:arm64,client_type:cli,{decision_tag}entrypoint:cli,\
+                 model:{model},platform:darwin,{provider_tag}{reason_tag}subscription_type:{},\
+                 user_bucket:15,user_type:external,version:{v},version_base:{v}",
                 self.subscription_type,
                 v = self.version,
             )),
@@ -522,6 +537,10 @@ impl Identity {
         m.insert("process_metrics".into(), process_metrics(ctx.uptime_secs));
         for k in ["swe_bench_run_id", "swe_bench_instance_id", "swe_bench_task_id"] {
             m.insert(k.into(), s(""));
+        }
+        if let Some(agent) = &self.agent_id {
+            m.insert("agent_id".into(), s(agent));
+            m.insert("agent_type".into(), s("subagent"));
         }
         m.insert("subscription_type".into(), s(&self.subscription_type));
         // 分阶段，见 [`MetaStage`]：启动早期两项都没有，界面起来后只有 `renderer_mode`，
@@ -745,6 +764,20 @@ pub async fn post_metrics(
 
 // ---------- 逐请求：转发路径交过来的一条 API 调用 ----------
 
+/// 出站请求上 2.1.277 起的三个 `x-claude-code-*` 头（`cap/2.1.280/00165`）：子代理带
+/// `agent-id`（支线号，17 位 hex）与 `agent-type`（内置的写类型名如 `Explore`，自定义的写
+/// `custom`），每条都带 `request-class`（`main` / `subagent` / `auxiliary`）。
+///
+/// 遥测靠它们认出子代理与它的摘要请求（`request-class: auxiliary` 且带 `agent-id`），
+/// **只给这两类**的事件顶层写 `agent_id` / `agent_type`——主线程与其余侧查询的事件没有
+/// 这两项。模拟路径只写 `request-class`，另两个只有真 CC 来访才有。
+#[derive(Debug, Clone, Default)]
+pub struct AgentHeaders {
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub request_class: Option<String>,
+}
+
 /// 转发路径在响应流结束时交过来的一条已完成的 `/v1/messages`。
 ///
 /// 请求侧的量都从 `body`（**实际发往上游的那份**）里解析，响应侧的量由
@@ -771,6 +804,8 @@ pub struct ApiCall {
     pub request_id: Option<String>,
     /// 出站的 `x-client-request-id`（官方客户端每请求一个 uuid v4）。失败事件要报它。
     pub client_request_id: Option<String>,
+    /// 出站的 `x-claude-code-*` 头，见 [`AgentHeaders`]。
+    pub agent: AgentHeaders,
     /// 响应里的 `message.id`（`msg_…`）。
     pub message_id: Option<String>,
     pub stop_reason: Option<String>,
@@ -782,6 +817,8 @@ pub struct ApiCall {
     pub cache_creation_tokens: i64,
     /// 响应正文里 text / thinking 的字符数。
     pub text_chars: usize,
+    /// 这条回复按 `inputTextCharLength` 口径的字数，见 [`ThreadBase::reply_chars`]。
+    pub reply_input_chars: usize,
     pub thinking_chars: usize,
     /// 响应里出现过思考块（`redacted_thinking` 与空思考块都算），决定要不要报
     /// `thinkingContentLength`。
@@ -823,6 +860,7 @@ pub struct Capture {
     pub session_header: Option<String>,
     /// 实际发出的 `x-client-request-id`。
     pub client_request_id: Option<String>,
+    pub agent: AgentHeaders,
     pub organization_id: Option<String>,
     pub started_at: SystemTime,
 }
@@ -858,6 +896,7 @@ impl Capture {
             total_ms,
             request_id,
             client_request_id: self.client_request_id,
+            agent: self.agent,
             message_id: None,
             stop_reason: None,
             resp_model: None,
@@ -866,6 +905,7 @@ impl Capture {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             text_chars: 0,
+            reply_input_chars: 0,
             thinking_chars: 0,
             saw_thinking: false,
             tool_use_lens: Vec::new(),
@@ -891,32 +931,57 @@ enum Kind {
     Title,
     /// 其余无工具的辅助调用（未识别的那类）。
     Helper,
+    /// 子代理的摘要请求：子代理跑着的时候客户端隔一阵用它的上下文问一句「在干什么」
+    /// （`cap/2.1.280/00174`、`cap/2.1.277` 五条），算辅助调用，但挂在子代理那条支线上。
+    AgentSummary,
 }
 
 impl Kind {
     fn query_source(self) -> &'static str {
         match self {
             Kind::Main => "repl_main_thread",
-            Kind::Subagent => "agent:general-purpose",
+            Kind::Subagent => "agent:builtin:general-purpose",
             Kind::Suggestion => "prompt_suggestion",
             Kind::Title => "generate_session_title",
             Kind::Helper => "compact",
+            Kind::AgentSummary => "agent_summary",
         }
     }
     fn category(self) -> &'static str {
         match self {
             Kind::Main => "main",
             Kind::Subagent => "subagent",
-            Kind::Suggestion | Kind::Title | Kind::Helper => "auxiliary",
+            Kind::Suggestion | Kind::Title | Kind::Helper | Kind::AgentSummary => "auxiliary",
         }
     }
     /// 带 `queryChainId` / `queryDepth` 的那几类；标题那类查询没有链。
     fn has_chain(self) -> bool {
-        matches!(self, Kind::Main | Kind::Subagent | Kind::Suggestion)
+        matches!(self, Kind::Main | Kind::Subagent | Kind::Suggestion | Kind::AgentSummary)
     }
-    /// 有基座提示词（`tengu_sysprompt_boundary_found`）；侧查询的 system 没有边界标记。
+    /// 带完整系统提示词（`systemPromptSource` / `snapshotHash`、规范化前后的消息数那套算法）。
     fn has_boundary(self) -> bool {
-        matches!(self, Kind::Main | Kind::Subagent | Kind::Suggestion)
+        matches!(self, Kind::Main | Kind::Subagent | Kind::Suggestion | Kind::AgentSummary)
+    }
+    /// 系统提示词里有静态/动态分界（`tengu_sysprompt_boundary_found`）。子代理那份没有：
+    /// 报两条 `tengu_sysprompt_missing_boundary_marker{promptBlockCount: 6}`（`cap/2.1.277`
+    /// 自定义子代理与 `cap/2.1.280` Explore 子代理共 58 次请求，全是 6）。
+    fn has_boundary_marker(self) -> bool {
+        matches!(self, Kind::Main | Kind::Suggestion)
+    }
+    /// 子代理与它的摘要请求：事件挂在子代理那条支线上。
+    fn is_agent(self) -> bool {
+        matches!(self, Kind::Subagent | Kind::AgentSummary)
+    }
+}
+
+/// 子代理请求的 `querySource`：内置的是 `agent:builtin:<类型>`（`cap/2.1.280` Explore），
+/// 自定义的是 `agent:custom`（`cap/2.1.277`，请求头 `agent-type: custom`）。没有请求头
+/// （2.1.277 之前的客户端）按内置的 general-purpose 报。
+fn agent_query_source(agent_type: Option<&str>) -> String {
+    match agent_type.filter(|t| !t.is_empty()) {
+        Some("custom") => "agent:custom".to_string(),
+        Some(t) => format!("agent:builtin:{t}"),
+        None => "agent:builtin:general-purpose".to_string(),
     }
 }
 
@@ -924,6 +989,90 @@ impl Kind {
 fn version_at_least(v: &str, min: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
     parse(v) >= parse(min)
+}
+
+/// billing header 的 `cc_turn_origin` 换成事件里的写法：下划线换连字符
+/// （`task_notification` → `task-notification`，`cap/2.1.280/00180` 与同批事件），
+/// `human` / `peer` 原样。
+fn turn_origin_of(header: &str) -> String {
+    header.replace('_', "-")
+}
+
+/// `tengu_api_success.snapshotHash`：12 位 hex，整个会话恒定、换会话就变（`cap/2.1.277`
+/// 与 `cap/2.1.280` 两个会话 `system[1]`、`system[2]` 逐字相同，hash 却不同，只有末块
+/// 动态段不同）。官方算的是客户端内部那份快照，代理看不到；取动态段的 hash 再加盐派生，
+/// 满足「会话内恒定、会话间不同」，又不与任何一块的原始 sha256 撞上。
+fn snapshot_hash_of(shape: &RequestShape) -> String {
+    sha256_hex(format!("snapshot:{}", shape.dynamic_hash).as_bytes())[..12].to_string()
+}
+
+/// tether 引擎把模型固定成无状态发送的几族（`sentThreadType: "none"`）：`cap/2.1.280` 里
+/// opus-5-5 与 fable 每条都是 `modelHeldStateless: true`，sonnet/haiku 都是 false；
+/// `cap/2.1.277` 里 fable 为 true、opus-5 为 false。
+fn model_held_stateless(model: &str) -> bool {
+    model.starts_with("claude-fable") || model.starts_with("claude-opus-5-5")
+}
+
+/// 按上一条请求判这条的 tether 决策，规则取自 `cap/2.1.277`（主线程 11 条、子代理 26 条）
+/// 与 `cap/2.1.280`（主线程 7 条）：
+///
+/// - 线程里没有上一条 → `create/first_request`，`prevMessageCount` 0；
+/// - 模型 / beta / effort / 工具表 / thinking 任一变了 → `create/config_changed`，对应的
+///   `changed*` 置真，线程轮数归 1、`deltaMessageCount` 0；
+/// - 否则消息只多不少 → `continue/append`，轮数 +1、`deltaMessageCount` = 新增条数。
+///
+/// `changedLatchedHeaders` 只在**切到 haiku** 时为真（两份抓包切到 haiku 三次全是，
+/// 从 haiku 切走两次都不是）；`changedSystem` 抓包里恒为 false（system 的动态段每轮都在
+/// 变，官方显然不把它算进去）。配置没变、消息却变少（回退、压缩）抓包里没见过，按
+/// `create` + `unclaimedHistoryChange` 报，原因名是推测的。
+fn tether_decide(
+    prev: Option<&TetherThread>,
+    shape: &RequestShape,
+    model: &str,
+    betas: &str,
+    is_main: bool,
+) -> Tether {
+    let fresh = |decision, reason, prev_messages| Tether {
+        decision,
+        reason,
+        changed_model: false,
+        changed_tools: false,
+        changed_betas: false,
+        changed_latched: false,
+        changed_thinking: false,
+        changed_effort: false,
+        turns: 1,
+        prev_messages,
+        delta: 0,
+        echo: false,
+    };
+    let Some(p) = prev else { return fresh("create", "first_request", 0) };
+    let changed_model = p.model != model;
+    let changed_tools = p.tools_hash != shape.tools_hash;
+    let changed_betas = p.betas != betas;
+    let changed_thinking = p.thinking_type != shape.thinking_type;
+    let changed_effort = p.effort != shape.effort;
+    if changed_model || changed_tools || changed_betas || changed_thinking || changed_effort {
+        return Tether {
+            changed_model,
+            changed_tools,
+            changed_betas,
+            changed_latched: model.contains("haiku") && !p.model.contains("haiku"),
+            changed_thinking,
+            changed_effort,
+            echo: is_main,
+            ..fresh("create", "config_changed", p.messages)
+        };
+    }
+    if shape.messages_len >= p.messages {
+        return Tether {
+            turns: p.turns + 1,
+            delta: shape.messages_len - p.messages,
+            echo: true,
+            ..fresh("continue", "append", p.messages)
+        };
+    }
+    Tether { echo: is_main, ..fresh("create", "history_changed", p.messages) }
 }
 
 /// 上一条回复里的一次工具调用（续轮请求的倒数第二条 assistant 消息里的 `tool_use` 块）。
@@ -961,6 +1110,9 @@ struct RequestShape {
     /// 两处出自同一个 `requestJournal`。故它是权威源：出站体已经这么发给上游了，遥测
     /// 再从会话状态另算一份，两份不一致时上游把请求体和事件批一 join 就能看出来。
     cc_prev_req: Option<String>,
+    /// billing header 里的 `cc_turn_origin`：这一轮是谁发起的（`human` / `peer` /
+    /// `task_notification`…），见 [`turn_origin_of`]。
+    turn_origin: Option<String>,
     /// 顶层 `diagnostics.previous_message_id`：同理，是这条请求自己声明的上一条 message.id。
     /// 空值（`null`）与字段缺失都记 `None`。
     diag_prev_message_id: Option<String>,
@@ -1009,6 +1161,21 @@ struct RequestShape {
     /// 续轮请求：上一条 assistant 消息里的工具调用，配上末条消息里的 tool_result 大小。
     tool_uses: Vec<ToolUse>,
     assistant_messages: usize,
+    /// 最后一条 assistant 消息之后还有几条消息（没有 assistant 消息记 0）：
+    /// `tengu_tether_live_outcome.deltaMessageCount`（`cap/2.1.277` 主线程续轮报 2、
+    /// 子代理续轮报 1，与这个数逐条相等）。
+    after_last_assistant: usize,
+    /// `system[1..]` 与整个 `tools` 数组各自的紧凑 JSON 长度（UTF-16 计）之和：续用线程时
+    /// 省掉不发的那部分，`tengu_tether_live_outcome.omittedBytes`（`cap/2.1.277/00031`：
+    /// 13184 + 72661 = 85845，与事件逐字节相等）。
+    omitted_bytes: usize,
+    /// system 最后一块（会话级的动态段）的 sha256 前缀，`tengu_api_success.snapshotHash`
+    /// 的来源，见 [`snapshot_hash_of`]。
+    dynamic_hash: String,
+    /// 顶层 `thread.type`（`create` / `continue`），见 [`ThreadBase`]。
+    thread_type: Option<String>,
+    /// 消息里出现过 auto 模式的进入/退出提示（`permission_mode` 是从消息里判的）。
+    auto_marker: bool,
     device_id: Option<String>,
     session_id: Option<String>,
     account_uuid: Option<String>,
@@ -1302,6 +1469,8 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         ..Default::default()
     };
     (shape.device_id, shape.session_id, shape.account_uuid) = parse_user_id(&v);
+    shape.thread_type =
+        v.get("thread").and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(str::to_string);
     // 这条请求自己声明的上一条 message.id（官方主线程每条都带，首轮是 `null`）。
     shape.diag_prev_message_id = v
         .get("diagnostics")
@@ -1335,6 +1504,7 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
                 };
                 shape.cc_prompt_id = field("cc_prompt_id=");
                 shape.cc_prev_req = field("cc_prev_req=");
+                shape.turn_origin = field("cc_turn_origin=");
                 shape.is_subagent = first.contains("cc_is_subagent=true");
             }
         }
@@ -1344,6 +1514,12 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         }
         if let Some(last) = texts.last() {
             shape.dynamic_len = js_len(last);
+            shape.dynamic_hash = sha256_hex(last.as_bytes())[..12].to_string();
+        }
+        if let Value::Array(blocks) = sys
+            && blocks.len() > 1
+        {
+            shape.omitted_bytes += serde_json::to_string(&blocks[1..]).map_or(0, |j| js_len(&j));
         }
         if texts.iter().any(|t| t.contains("auto mode is active")) {
             shape.permission_mode = "auto";
@@ -1359,6 +1535,7 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     let mut lens = Map::new();
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         shape.tools_count = tools.len();
+        shape.omitted_bytes += serde_json::to_string(tools).map_or(0, |j| js_len(&j));
         for t in tools {
             // 延迟加载的占位工具计入 `toolsCount` / `deferredToolsCount`，但不进长度表：官方
             // 16 个工具的表只有 15 项，`toolsCharLength` 也不含它（差的 204 正是占位那条）。
@@ -1385,6 +1562,10 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     // messages：条数、文本量、图片/文档、末条是否新输入、system 角色条数、续轮的工具调用。
     if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
         shape.messages_len = msgs.len();
+        shape.after_last_assistant = msgs
+            .iter()
+            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .map_or(0, |i| msgs.len() - 1 - i);
         for m in msgs {
             if let Some(c) = m.get("content") {
                 walk_content(c, &mut shape);
@@ -1399,11 +1580,15 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         // 与 `cap/2.1.260-1` 六条全部精确相等：14203→4735、14422→4808、15163→5055、17539→5847、
         // 12938→4313、14051→4684；2.1.258 那版会多 1–2，不去模仿旧版）；haiku 按 4 字符一个
         // token 四舍五入（标题那条 221 → 55）。
-        shape.estimated_tokens = if shape.model.contains("haiku") {
-            (shape.input_text_chars as f64 / 4.0).round() as usize
-        } else {
-            shape.input_text_chars.div_ceil(3)
-        };
+        shape.estimated_tokens = estimate_tokens(&shape.model, shape.input_text_chars);
+        // 2.1.280 起 auto 模式的说明不在 system 里，而是作为 system-reminder 挂在消息里，
+        // 退出时再追一条「Exited Auto Mode」；以最后出现的那条为准（`cap/2.1.280`：00021
+        // 只有进入 → auto，00038 / 00065 先进入后退出 → default，与事件里的 permissionMode
+        // 逐条一致）。
+        if let Some(auto) = auto_mode_of_messages(msgs) {
+            shape.permission_mode = if auto { "auto" } else { "default" };
+            shape.auto_marker = true;
+        }
         (shape.new_prompt, shape.prompt_len) = last_is_new_prompt(msgs);
         if !shape.new_prompt {
             shape.tool_uses = tool_uses_of(msgs);
@@ -1438,12 +1623,78 @@ fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     Some(shape)
 }
 
+/// `estimatedInputTokens`，口径见 [`parse_shape`]。
+fn estimate_tokens(model: &str, chars: usize) -> usize {
+    if model.contains("haiku") { (chars as f64 / 4.0).round() as usize } else { chars.div_ceil(3) }
+}
+
+/// 消息里最后一条 auto 模式提示是进入还是退出；一条都没有为 `None`。从末尾往前找，
+/// 通常几条之内就停。
+///
+/// **只认客户端自己注入的那两种位置**（`cap/2.1.277`、`cap/2.1.280` 全部 36 处）：
+/// - `role: system` 的消息（环境说明、附件）——用户正文不会落在这种消息里；
+/// - user 消息里以 `<system-reminder>` 开头、紧跟着就是提示本身的文本块。
+///
+/// 用户正文里引用这段话、工具输出（`tool_result`）里恰好有这段文字、assistant 回复里复述
+/// 它，都不算：否则一条 `cat` 了 Claude Code 文档的 Bash 结果就能把 permissionMode 翻掉，
+/// 连带子代理沿用的模式与 auto 模式那几条事件一起错。
+fn auto_mode_of_messages(msgs: &[Value]) -> Option<bool> {
+    const ENTER: &str = "While auto mode is active:";
+    const EXIT: &str = "## Exited Auto Mode";
+    const REMINDER: &str = "<system-reminder>";
+    // 一段文本里最后出现的是进入还是退出。
+    let last_marker = |t: &str| match (t.rfind(ENTER), t.rfind(EXIT)) {
+        (None, None) => None,
+        (Some(a), Some(e)) => Some(a > e),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+    };
+    // user 消息里的提示块：标签之后（跳过空白）直接就是提示。
+    let reminder_marker = |t: &str| {
+        let rest = t.trim_start().strip_prefix(REMINDER)?.trim_start();
+        if rest.starts_with(ENTER) {
+            Some(true)
+        } else if rest.starts_with(EXIT) {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    for m in msgs.iter().rev() {
+        let role = m.get("role").and_then(|r| r.as_str());
+        let texts: Vec<&str> = match m.get("content") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for t in texts.iter().rev() {
+            let hit = match role {
+                Some("system") => last_marker(t),
+                Some("user") => reminder_marker(t),
+                _ => None,
+            };
+            if hit.is_some() {
+                return hit;
+            }
+        }
+    }
+    None
+}
+
 /// 一个遥测会话（同一凭证 + 同一 `session_id`）跨请求要记住的东西。
 struct Session {
     /// 会话「进程」的起点：首条请求前几秒（客户端启动到第一次提交之间的那段）。
     started_wall: SystemTime,
     last_seen: Instant,
+    /// 用户的第几次输入（事件里的 `prompt_index`）：同伴会话发来的（peer）不占号。
     prompt_index: u32,
+    /// 会话里一共有过几次新输入，**含** peer：判「会话首条」、选首轮模板、推客户端内部的
+    /// 消息条数都用它——peer 那一轮也是客户端里实打实的一次提交与一条消息，只是不编号。
+    prompts_seen: u32,
     prompt_id: String,
     chain_id: String,
     /// 最近一条**主线程**请求的上游 request-id：`previousRequestId` 只串主线程那条链
@@ -1494,6 +1745,184 @@ struct Session {
     /// 扣住等新一轮 prompt id 的侧查询：`(调用, 扣住时的上一条结束时刻, 扣住的时刻)`。
     /// 见 [`config::TELEMETRY_SIDE_QUERY_HOLD_SECS`]。
     deferred: Vec<(ApiCall, Option<SystemTime>, Instant)>,
+    /// 会话的系统提示词快照（`tengu_api_success.snapshotHash`）：首条带边界的请求记下
+    /// （那条报 `systemPromptSource: live_recorded`），之后整个会话都报同一个值、
+    /// `from_snapshot`。
+    snapshot_hash: Option<String>,
+    /// 本会话已经报过 `tengu_sleepy_snowflake_applied` 的模型：官方每个模型只在头一次
+    /// 被用于新输入时报一次（`cap/2.1.280` opus/fable/sonnet/haiku 各一条，再切回来不报）。
+    sleepy_models: Vec<String>,
+    /// 主线程的 tether 线程状态，见 [`TetherThread`]；子代理的各记在 [`AgentState`] 里。
+    tether_main: Option<TetherThread>,
+    /// 每条线程上一条完整请求的形态，键是 `main` 或 `agent:<支线号>`，见 [`ThreadBase`]。
+    thread_bases: HashMap<String, ThreadBase>,
+    /// 会话里的子代理，按支线号（`x-claude-code-agent-id`）分开记。
+    agents: HashMap<String, AgentState>,
+    /// 最近一条回复里调了 `Agent` 工具的主线程请求：随后拉起的子代理首条报它为
+    /// `invokingRequestId`。不能拿「最近一条主线程请求」代替——子代理是异步跑的，它的首条
+    /// 回来之前主线程往往已经又完成了一条（`cap/2.1.280`：主线程 27.020 完成、子代理首条
+    /// 28.759 才完成，而 invokingRequestId 指的是 22.953 那条）。
+    last_spawn_request_id: Option<String>,
+    /// 主线程最近一条的权限模式。子代理的请求体里没有 auto 模式的提示（`cap/2.1.280`
+    /// Explore 七条一条都没有），官方报的却是 `auto`——子代理沿用主线程的模式。
+    main_permission: &'static str,
+    /// 本轮的发起方（事件写法，如 `task-notification`）：新输入时从 billing header 取，
+    /// 同一轮的续轮请求没带就沿用。
+    turn_origin: String,
+}
+
+/// 处理一条子代理请求时从 [`AgentState`] 抄出来的那几项（会话状态随后还要改，不能一直借着）。
+struct AgentView {
+    chain_id: String,
+    steps: u32,
+    last_request_id: Option<String>,
+    last_message_id: Option<String>,
+    prev_total: i64,
+    tools_hash: Option<String>,
+    /// 只有支线首条才有。
+    invoking_request_id: Option<String>,
+}
+
+/// 一个子代理（会话里的一条支线）跨请求要记住的东西。字段取值见 `cap/2.1.280` Explore
+/// 子代理 a51764… 的 6 条请求与它的 1 条摘要请求。
+#[derive(Default)]
+struct AgentState {
+    /// 支线自己的 `queryChainId`：六条请求同一个，摘要请求另起。
+    chain_id: String,
+    /// 已经完成的请求数：`queryDepth` = 2 + 它（2、3、4…），收尾的 `assistant_message_count`。
+    steps: u32,
+    /// 首条请求发出的时刻：收尾 `turn_end.duration_ms` / `agent_tool_completed.duration_ms` 的起点。
+    started: Option<SystemTime>,
+    /// 首条的用户提示字数（`agent_tool_completed.prompt_char_count`，抓包 481）。
+    prompt_chars: usize,
+    /// 各续轮带回来的工具结果数之和（`total_tool_uses`）。
+    tool_uses: u32,
+    /// 上一条的 request-id / message.id / 总 token（`previousRequestId`、工具事件的
+    /// `messageID`、`messageTokens`）。
+    last_request_id: Option<String>,
+    last_message_id: Option<String>,
+    prev_total: i64,
+    /// 支线自己的提示词快照（与主线程的不同，`cap/2.1.280` 为 `7d8050a24c2c`）。
+    snapshot_hash: Option<String>,
+    tether: Option<TetherThread>,
+    /// 首条的 `invokingRequestId`（拉起它的那条主线程请求）。
+    invoking_request_id: Option<String>,
+    /// 工具长度表报过的那份 hash（`tengu_tool_schema_sizes` 每条支线首次报一次）。
+    tools_hash: Option<String>,
+}
+
+/// 一条线程（主线程，或某个子代理）上一条**完整**请求的形态。
+///
+/// 2.1.277 起客户端对 sonnet / haiku 这类不被钉成无状态的模型走消息线程：首条
+/// `thread: {"type":"create"}` 照常带全量，之后 `{"type":"continue", "previous_message_id"}`
+/// 只发增量——system 只剩 billing 头那一块、没有 tools、消息只有上一条回复之后新增的那几条
+/// （上一条 assistant 回复由服务端持有，不再回传）。可客户端自己的遥测报的是**它眼里的**
+/// 整段对话：`cap/2.1.277` sonnet 那条续用请求体里 2 条消息，事件报 `messageCount` 8
+/// （= 上一条的 5 + 体里 2 + 省掉的那条回复），`toolsCount` 照报 19。增量请求的这些量
+/// 从这里补回来；没有它，增量请求会因为「没有工具」被当成辅助调用。
+#[derive(Debug, Clone)]
+struct ThreadBase {
+    tools_count: usize,
+    tools_chars: usize,
+    tools_hash: String,
+    tool_lens: String,
+    deferred_tools: usize,
+    mcp_tools: usize,
+    has_tool_search: bool,
+    system_blocks: usize,
+    system_chars: usize,
+    static_len: usize,
+    dynamic_len: usize,
+    dynamic_hash: String,
+    omitted_bytes: usize,
+    permission_mode: &'static str,
+    messages: usize,
+    assistant_messages: usize,
+    input_text_chars: usize,
+    /// 这条请求的**回复**按 `inputTextCharLength` 口径的字数：下一条增量请求里省掉的正是它，
+    /// 客户端报的输入长度却含它。
+    reply_chars: usize,
+}
+
+impl ThreadBase {
+    fn of(s: &RequestShape, reply_chars: usize) -> Self {
+        ThreadBase {
+            tools_count: s.tools_count,
+            tools_chars: s.tools_chars,
+            tools_hash: s.tools_hash.clone(),
+            tool_lens: s.tool_lens.clone(),
+            deferred_tools: s.deferred_tools,
+            mcp_tools: s.mcp_tools,
+            has_tool_search: s.has_tool_search,
+            system_blocks: s.system_blocks,
+            system_chars: s.system_chars,
+            static_len: s.static_len,
+            dynamic_len: s.dynamic_len,
+            dynamic_hash: s.dynamic_hash.clone(),
+            omitted_bytes: s.omitted_bytes,
+            permission_mode: s.permission_mode,
+            messages: s.messages_len,
+            assistant_messages: s.assistant_messages,
+            input_text_chars: s.input_text_chars,
+            reply_chars,
+        }
+    }
+
+    /// 把一条增量请求的形态补成客户端视角的全量。auto 模式的提示在增量里没出现就沿用上一条的。
+    fn fill(&self, s: &mut RequestShape, auto_in_delta: bool) {
+        s.tools_count = self.tools_count;
+        s.tools_chars = self.tools_chars;
+        s.tools_hash = self.tools_hash.clone();
+        s.tool_lens = self.tool_lens.clone();
+        s.deferred_tools = self.deferred_tools;
+        s.mcp_tools = self.mcp_tools;
+        s.has_tool_search = self.has_tool_search;
+        s.system_blocks = self.system_blocks;
+        s.system_chars = self.system_chars;
+        s.static_len = self.static_len;
+        s.dynamic_len = self.dynamic_len;
+        s.dynamic_hash = self.dynamic_hash.clone();
+        s.omitted_bytes = self.omitted_bytes;
+        if !auto_in_delta {
+            s.permission_mode = self.permission_mode;
+        }
+        s.messages_len += self.messages + 1;
+        s.assistant_messages += self.assistant_messages + 1;
+        s.input_text_chars += self.input_text_chars + self.reply_chars;
+        s.estimated_tokens = estimate_tokens(&s.model, s.input_text_chars);
+    }
+}
+
+/// 客户端 tether 引擎眼里的「上一条请求」：`tengu_tether_decision` 拿这条请求与它比，
+/// 配置一样且消息只多不少就接着用（`continue/append`），配置变了就另起（`create/config_changed`）。
+#[derive(Debug, Clone)]
+struct TetherThread {
+    model: String,
+    betas: String,
+    effort: Option<String>,
+    tools_hash: String,
+    thinking_type: String,
+    messages: usize,
+    turns: u32,
+}
+
+/// 一条请求的 tether 判定结果，事件链里 `tether_decision` / `echo_audit` / `live_outcome`
+/// 三条共用。
+struct Tether {
+    decision: &'static str,
+    reason: &'static str,
+    changed_model: bool,
+    changed_tools: bool,
+    changed_betas: bool,
+    changed_latched: bool,
+    changed_thinking: bool,
+    changed_effort: bool,
+    turns: u32,
+    prev_messages: usize,
+    delta: usize,
+    /// 线程里此前已有请求：只有这种才有 `tengu_tether_echo_audit`（主线程另起线程也算，
+    /// 那是同一会话的回声；子代理只在续用时有）。
+    echo: bool,
 }
 
 /// 一个真实会话的身份快照，给保活复用：空闲的版本检查事件应当从**同一个会话**发出，
@@ -1775,6 +2204,21 @@ impl Telemetry {
         if let Some(org) = call.organization_id.as_deref().filter(|o| !o.is_empty()) {
             st.org_uuid.insert(call.cred_id, org.to_string());
         }
+        // 子代理：billing header 里 `cc_is_subagent=true`，2.1.277 起还有 `x-claude-code-agent-id`。
+        // 每个子代理是会话里的一条支线，状态按支线号分开记（见 [`AgentState`]）。
+        let is_agent = shape.is_subagent || call.agent.agent_id.is_some();
+        let agent_key = call.agent.agent_id.clone().unwrap_or_default();
+        let thread_key = if is_agent { format!("agent:{agent_key}") } else { "main".to_string() };
+        // 线程增量请求先补成客户端视角的全量，再往下判类别（见 [`ThreadBase`]）。
+        if shape.thread_type.as_deref() == Some("continue")
+            && let Some(base) = st
+                .sessions
+                .get(&(call.cred_id, session_id.clone()))
+                .and_then(|s| s.thread_bases.get(&thread_key))
+        {
+            let auto_in_delta = shape.auto_marker;
+            base.fill(&mut shape, auto_in_delta);
+        }
         let identity = Identity {
             session_id: session_id.clone(),
             device_id: device_id.clone(),
@@ -1782,10 +2226,19 @@ impl Telemetry {
             organization_uuid: st.org_uuid.get(&call.cred_id).cloned(),
             subscription_type: subscription_type(call.org_type.as_deref()).to_string(),
             version: version.clone(),
+            agent_id: if is_agent { call.agent.agent_id.clone() } else { None },
         };
+        // 会话级的那份（待发批次、退出收尾、启动模板用）不带支线号。
+        let base_identity = Identity { agent_id: None, ..identity.clone() };
 
-        let kind = if shape.is_subagent {
-            Kind::Subagent
+        let kind = if is_agent {
+            // 子代理的摘要请求（「这个子代理刚才在干什么」）：`request-class: auxiliary`、
+            // 带同一个 `agent-id`（`cap/2.1.280/00174`），事件报 `querySource: agent_summary`。
+            if call.agent.request_class.as_deref() == Some("auxiliary") {
+                Kind::AgentSummary
+            } else {
+                Kind::Subagent
+            }
         } else if shape.suggestion && shape.tools_count > 0 {
             Kind::Suggestion
         } else if shape.title && shape.tools_count == 0 {
@@ -1827,6 +2280,7 @@ impl Telemetry {
             started_wall: call.started_at - Duration::from_millis(3_100),
             last_seen: now,
             prompt_index: 0,
+            prompts_seen: 0,
             prompt_id: String::new(),
             chain_id: String::new(),
             last_main_request_id: None,
@@ -1853,8 +2307,21 @@ impl Telemetry {
             betas: String::new(),
             subscription_type: identity.subscription_type.clone(),
             deferred: Vec::new(),
+            snapshot_hash: None,
+            sleepy_models: Vec::new(),
+            tether_main: None,
+            thread_bases: HashMap::new(),
+            agents: HashMap::new(),
+            last_spawn_request_id: None,
+            main_permission: "default",
+            turn_origin: "human".to_string(),
         });
         sess.last_seen = now;
+        if kind == Kind::Main {
+            sess.main_permission = shape.permission_mode;
+        } else if kind.is_agent() && !shape.auto_marker {
+            shape.permission_mode = sess.main_permission;
+        }
         // 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
         let turn_over = call.stop_reason.as_deref().is_none_or(|s| s != "tool_use");
         // 这条请求客户端那头是失败的：收尾走 `tengu_api_error` 那一串，且没有任何用量。
@@ -1881,9 +2348,23 @@ impl Telemetry {
         // 新一轮用户输入（只有主线程算）：prompt 计数 +1、换 prompt_id（优先用 billing header
         // 里客户端自己的）与 queryChainId、depth 归零。tool_result 续轮沿用上一轮的，depth +1。
         // 侧查询（标题、猜下一句）不动这些计数。
-        let new_prompt = is_main && (shape.new_prompt || sess.prompt_index == 0);
+        let new_prompt = is_main && (shape.new_prompt || sess.prompts_seen == 0);
+        // 本轮发起方：请求自己声明的优先（新输入与续轮都带），没带就沿用本轮的。
+        if let Some(o) = shape.turn_origin.as_deref() {
+            if is_main {
+                sess.turn_origin = turn_origin_of(o);
+            }
+        } else if new_prompt {
+            sess.turn_origin = "human".to_string();
+        }
+        let turn_origin = sess.turn_origin.clone();
         if new_prompt {
-            sess.prompt_index += 1;
+            // 同伴会话发来的一轮（`peer`）不算用户的第几次输入：官方那条 input_prompt 不带
+            // `prompt_index`，下一次输入接着原来的数（`cap/2.1.280`：…2、peer、3）。
+            if turn_origin != "peer" {
+                sess.prompt_index += 1;
+            }
+            sess.prompts_seen += 1;
             sess.chain_id = uuid_v4();
             sess.turn_depth = 0;
             // 换 `turn_started` 之前先把上一轮的提交时刻挪走：`user_secs` 的窗口下界要它。
@@ -1907,9 +2388,37 @@ impl Telemetry {
         // 这里的 `last_main_request_id` 走 [`Telemetry::record`] 那条队列。让遥测复述请求
         // 自己说过的话，两份就不可能对不上；体里没有（会话首轮、没有 billing header 的
         // 来访）才回落到会话状态。
+        // 子代理支线：首条请求建档（链、起点、拉起它的那条主线程请求），之后每条读它。
+        // 摘要请求只读不推进。
+        let agent = kind.is_agent().then(|| {
+            let spawn = sess.last_spawn_request_id.clone();
+            let a = sess.agents.entry(agent_key.clone()).or_default();
+            if a.chain_id.is_empty() {
+                a.chain_id = uuid_v4();
+                a.started = Some(call.started_at);
+                a.prompt_chars = shape.prompt_len;
+                a.invoking_request_id = spawn;
+            }
+            AgentView {
+                chain_id: a.chain_id.clone(),
+                steps: a.steps,
+                last_request_id: a.last_request_id.clone(),
+                last_message_id: a.last_message_id.clone(),
+                prev_total: a.prev_total,
+                tools_hash: a.tools_hash.clone(),
+                invoking_request_id: (a.steps == 0)
+                    .then(|| a.invoking_request_id.clone())
+                    .flatten(),
+            }
+        });
         let previous_request_id = kind
             .has_chain()
-            .then(|| shape.cc_prev_req.clone().or_else(|| sess.last_main_request_id.clone()))
+            .then(|| {
+                shape.cc_prev_req.clone().or_else(|| match &agent {
+                    Some(a) => a.last_request_id.clone(),
+                    None => sess.last_main_request_id.clone(),
+                })
+            })
             .flatten();
         let prev_main_message_id = sess.last_main_message_id.clone();
         let prev_main_depth = sess.last_main_depth;
@@ -1921,7 +2430,11 @@ impl Telemetry {
         let prev_end: Option<SystemTime> = prev_end_override.or(sess.last_call_end);
         let time_since_last =
             prev_end.and_then(|t| this_end.duration_since(t).ok()).map(|d| d.as_millis() as u64);
-        let message_tokens = if kind.has_chain() { sess.prev_total_input } else { 0 };
+        let message_tokens = match &agent {
+            Some(a) => a.prev_total,
+            None if kind.has_chain() => sess.prev_total_input,
+            None => 0,
+        };
         let default_model = sess.default_model.clone();
         // 事件顶层 `model` 与 Datadog 的 `model` 是**会话主模型**（用户设置的那个），侧查询
         // 自己用的 haiku 只出现在 api 事件的 meta 里。
@@ -1931,19 +2444,27 @@ impl Telemetry {
         // 同理：`diagnostics.previous_message_id` 是这条请求自己声明的那个，优先于会话状态。
         let previous_message_id =
             shape.diag_prev_message_id.clone().or_else(|| sess.last_message_id.clone());
-        let tools_slot =
-            if kind.has_boundary() { &sess.tools_hash_main } else { &sess.tools_hash_side };
+        let tools_slot = match &agent {
+            Some(a) => &a.tools_hash,
+            None if kind.has_boundary() => &sess.tools_hash_main,
+            None => &sess.tools_hash_side,
+        };
         let tools_changed = tools_slot.as_deref() != Some(shape.tools_hash.as_str());
         let counted = sess.counted;
         let started_wall = sess.started_wall;
         // queryDepth：主线程本轮第几次请求；猜下一句 = 主线程最后一次 + 2（抓包：0→2、1→3）；
-        // 子代理记 1。
+        // 子代理从 2 起每条 +1、整条支线一个链（`cap/2.1.277` 2…27、`cap/2.1.280` 2…7），
+        // 它的摘要请求恒为 3、链另起（两份抓包 7 条都是）。
         // 主线程当前的链：猜下一句的 fork 统计里引用的是这条父链。
         let main_chain = sess.chain_id.clone();
         let (chain_id, query_depth) = match kind {
             Kind::Main => (sess.chain_id.clone(), sess.turn_depth),
             Kind::Suggestion => (uuid_v4(), sess.last_main_depth + 2),
-            Kind::Subagent => (uuid_v4(), 1),
+            Kind::Subagent => {
+                let a = agent.as_ref().expect("subagent calls carry agent state");
+                (a.chain_id.clone(), 2 + a.steps)
+            }
+            Kind::AgentSummary => (uuid_v4(), 3),
             Kind::Title | Kind::Helper => (String::new(), 0),
         };
         let turn_started: DateTime<Utc> =
@@ -1982,6 +2503,60 @@ impl Telemetry {
             && !sess.shell_snapshot_done
             && shape.tool_uses.iter().any(|t| t.name == "Bash");
         let prompt_index = sess.prompt_index.max(1);
+        let prompt_seq = sess.prompts_seen.max(1);
+
+        // 版本分档。2.1.270 起 `tengu_api_success` 多了 `firstContentMs` / `clientRequestId` /
+        // `snapshotHash`，`systemPromptSource` 分成 `live_recorded`（会话首条）与
+        // `from_snapshot`（之后）；2.1.277 起多 `turn_origin`，没有 effort 的输入（haiku）
+        // 不再报 `effort_level`。tether 那三条、`declared_tool_set_held`、
+        // `sleepy_snowflake_applied` 在 2.1.270–2.1.277 之间键集合还在变（`rh`、
+        // `claimedCollapse`、`drop*` 几项进进出出），只按 `cap/2.1.280` 的布局给 2.1.280 起。
+        let v270 = version_at_least(&version, "2.1.270");
+        let v277 = version_at_least(&version, "2.1.277");
+        let v280 = version_at_least(&version, "2.1.280");
+        // 快照一条线一份：主线程（含猜下一句）一份，每个子代理（含它的摘要请求）各一份
+        // （`cap/2.1.280` 主线程 `b06e…`/`d6bc…`、Explore 子代理 `7d8050a24c2c`，子代理首条
+        // 同样报 `live_recorded`）。
+        let snapshot = (v270 && kind.has_boundary()).then(|| {
+            let slot = if kind.is_agent() {
+                &mut sess.agents.get_mut(&agent_key).expect("agent state exists").snapshot_hash
+            } else {
+                &mut sess.snapshot_hash
+            };
+            let recorded = slot.is_none();
+            let hash = slot.get_or_insert_with(|| snapshot_hash_of(&shape)).clone();
+            (if recorded { "live_recorded" } else { "from_snapshot" }, hash)
+        });
+        let sleepy = v280 && new_prompt && !sess.sleepy_models.contains(&display_model);
+        if sleepy {
+            sess.sleepy_models.push(display_model.clone());
+        }
+        // tether 只管主线程与子代理（摘要、猜下一句、标题这类辅助调用一条都没有），子代理
+        // 每条支线一个线程（`cap/2.1.280` Explore 首条 `create/first_request`、之后 `continue/append`）。
+        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent)).then(|| {
+            let slot = if is_main {
+                &mut sess.tether_main
+            } else {
+                &mut sess.agents.get_mut(&agent_key).expect("agent state exists").tether
+            };
+            let betas = call.betas.clone().unwrap_or_default();
+            let t = tether_decide(slot.as_ref(), &shape, &display_model, &betas, is_main);
+            *slot = Some(TetherThread {
+                model: display_model.clone(),
+                betas,
+                effort: shape.effort.clone(),
+                tools_hash: shape.tools_hash.clone(),
+                thinking_type: shape.thinking_type.clone(),
+                messages: shape.messages_len,
+                turns: t.turns,
+            });
+            t
+        });
+        // 这条线程的全量形态记下来，给下一条增量请求补（见 [`ThreadBase`]）。
+        if matches!(kind, Kind::Main | Kind::Subagent) && shape.tools_count > 0 {
+            sess.thread_bases
+                .insert(thread_key.clone(), ThreadBase::of(&shape, call.reply_input_chars));
+        }
 
         // 更新会话状态给下一条用。
         // 补发的侧查询比后来的主线程请求结束得早，别把「最近一次结束」往回拨。
@@ -2012,9 +2587,34 @@ impl Telemetry {
                 sess.turn_depth += 1;
             }
         }
+        // 拉起子代理的那条主线程请求（回复里调了 `Agent`），见 [`Session::last_spawn_request_id`]。
+        if is_main && call.tool_use_lens.iter().any(|(name, _)| name == "Agent" || name == "Task") {
+            sess.last_spawn_request_id = call.request_id.clone();
+        }
+        // 子代理支线推进一步（摘要请求不算）。
+        let mut agent_done: Option<AgentState> = None;
+        if kind == Kind::Subagent
+            && let Some(a) = sess.agents.get_mut(&agent_key)
+        {
+            a.steps += 1;
+            a.tool_uses += shape.tool_uses.len() as u32;
+            a.last_request_id = call.request_id.clone().or(a.last_request_id.take());
+            a.last_message_id = call.message_id.clone().or(a.last_message_id.take());
+            if !failed {
+                a.prev_total = call.input_tokens
+                    + call.cache_read_tokens
+                    + call.cache_creation_tokens
+                    + call.output_tokens;
+                a.tools_hash = Some(shape.tools_hash.clone());
+            }
+            // `end_turn` 收尾就是子代理跑完了：收尾事件要它的全程统计，档案随之删掉。
+            if turn_over && !failed {
+                agent_done = sess.agents.remove(&agent_key);
+            }
+        }
         // 长度表报过一次就不再重发——但失败那条压根没报（`tengu_tool_schema_sizes` 在官方
         // 那边就长在 `tengu_api_success` 里），别让它把「已报过」的标记占掉。
-        if !failed {
+        if !failed && !kind.is_agent() {
             if kind.has_boundary() {
                 sess.tools_hash_main = Some(shape.tools_hash.clone());
             } else {
@@ -2050,7 +2650,12 @@ impl Telemetry {
                 .unwrap_or(t0);
             (t0 - bt).num_minutes().max(0)
         };
-        let query_source = kind.query_source();
+        let query_source_owned = match kind {
+            Kind::Subagent => agent_query_source(call.agent.agent_type.as_deref()),
+            _ => kind.query_source().to_string(),
+        };
+        let query_source: &str = &query_source_owned;
+        let builtin_agent = call.agent.agent_type.as_deref().filter(|t| *t != "custom");
         let cache_ttl = if shape.cache_ttl_1h { "1h" } else { "5m" };
         let effort = shape.effort.clone();
         let effort_value = effort.clone().unwrap_or_else(|| "high".to_string());
@@ -2081,12 +2686,12 @@ impl Telemetry {
             model_setting: &setting,
             permission_mode: shape.permission_mode,
             resumed,
-            prompt_index,
+            prompt_index: prompt_seq,
             deferred: shape.deferred_tools > 0,
             tool_search: tool_search_decision(&shape, &display_model),
         };
         let mut take_tpl = |tpl: &[TplEvent], anchor: DateTime<Utc>| {
-            let (ev, d) = emit_template(tpl, anchor, &identity, ctx, &dd_model, &subst);
+            let (ev, d) = emit_template(tpl, anchor, &base_identity, ctx, &dd_model, &subst);
             tpl_events.extend(ev);
             tpl_dd.extend(d);
         };
@@ -2095,37 +2700,79 @@ impl Telemetry {
             take_tpl(&TEMPLATE.startup, t0);
         }
         if new_prompt {
-            if prompt_index <= 1 {
+            if prompt_seq <= 1 {
                 take_tpl(&TEMPLATE.prompt, t0);
                 take_tpl(&TEMPLATE.first_prompt, t0);
             } else {
                 take_tpl(&TEMPLATE.prompt_next, t0);
             }
-            push(
-                ms(t0, -15),
-                "tengu_input_prompt",
-                json!({
-                    "is_negative": false,
-                    "is_keep_going": false,
-                    // 会话里第一次输入是把进程从等待里叫醒的那一次（两份抓包都是首次 true）。
-                    "is_wakeup": prompt_index == 1,
-                    "prompt_index": prompt_index,
-                    "prompt_length": shape.prompt_len,
-                    "prompt_source": "typed",
-                    "effort_level": &effort_value
-                }),
-            );
+            // 用户敲的报 `typed`，同伴会话发来的（peer）、后台任务完成的通知
+            // （task-notification）这类由客户端自己注入的报 `system`（`cap/2.1.277` 1 条、
+            // `cap/2.1.280` 2 条）。
+            let typed = turn_origin == "human";
+            let mut input = json!({
+                "is_negative": false,
+                "is_keep_going": false,
+                // 2.1.260 那两份抓包首次输入是 true（把进程从等待里叫醒的那一次）；
+                // 2.1.277 / 2.1.280 的 17 次输入全是 false，含每个会话的第一次。
+                "is_wakeup": prompt_index == 1 && !v277
+            });
+            if !(v277 && turn_origin == "peer") {
+                input["prompt_index"] = json!(prompt_index);
+            }
+            input["prompt_length"] = json!(shape.prompt_len);
+            input["prompt_source"] = json!(if typed { "typed" } else { "system" });
+            // 2.1.277 起没有 effort 的模型（haiku）整个键不出现（`cap/2.1.277`、`cap/2.1.280`
+            // 各两条），之前的版本照旧报默认的 high。
+            if !v277 || effort.is_some() {
+                input["effort_level"] = json!(&effort_value);
+            }
+            if v277 {
+                input["turn_origin"] = json!(&turn_origin);
+            }
+            push(ms(t0, -15), "tengu_input_prompt", input);
+            // 每个模型头一次用于新输入时报一次（值恒为 growthbook / all）。
+            if sleepy {
+                push(
+                    ms(t0, -10),
+                    "tengu_sleepy_snowflake_applied",
+                    json!({ "model": &display_model, "source": "growthbook", "value": "all" }),
+                );
+            }
+            // auto 模式下每次输入先探一次工作区的 git 状态（`cap/2.1.280` 前三次输入是 auto，
+            // 各一条；之后切回 default 就没有了），续轮等其余请求见下面。代理看不见客户端的
+            // 工作目录，结果照抓包报。
+            if v280 && shape.permission_mode == "auto" {
+                push(
+                    ms(t0, -10),
+                    "tengu_auto_mode_git_state_probe",
+                    json!({
+                        "duration_ms": u32::from(!prompt_index.is_multiple_of(3)),
+                        "wait_ms": 0,
+                        "outcome": "not_a_repo",
+                        "truncated": false
+                    }),
+                );
+            }
         }
 
         // 续轮：上一条回复里的工具调用在两次请求之间执行，把权限判定、执行、附件计算那串
         // 补在这条请求之前（`cap/2.1.260-2` 09:43:12–09:43:13）。权限判定发生在上一条回复
         // 流到工具块时，时间戳落在上一条结束之前。
-        if is_main && !new_prompt && !shape.tool_uses.is_empty() {
+        // 子代理每一步之间也是这一串（`cap/2.1.280` Explore：Bash 的权限判定、执行、成功，
+        // 再攒附件），深度与消息 id 取它自己那条支线的上一条。
+        let is_sub = kind == Kind::Subagent;
+        if (is_main || is_sub) && !new_prompt && !shape.tool_uses.is_empty() {
             let prev_end_dt: DateTime<Utc> =
                 prev_end.unwrap_or(call.started_at - Duration::from_secs(1)).into();
             // 工具是上一条主线程回复产生的：事件里的 requestId / messageID 都指上一条。
             let prev_req = previous_request_id.clone().unwrap_or_default();
-            let prev_msg = prev_main_message_id.clone().unwrap_or_default();
+            let prev_msg = if is_sub {
+                agent.as_ref().and_then(|a| a.last_message_id.clone()).unwrap_or_default()
+            } else {
+                prev_main_message_id.clone().unwrap_or_default()
+            };
+            let prev_depth = if is_sub { query_depth.saturating_sub(1) } else { prev_main_depth };
             let n = shape.tool_uses.len() as i64;
             for (i, tu) in shape.tool_uses.iter().enumerate() {
                 let i = i as i64;
@@ -2159,7 +2806,7 @@ impl Telemetry {
                             "messageID": &prev_msg,
                             "toolName": &tu.name,
                             "queryChainId": &chain_id,
-                            "queryDepth": prev_main_depth,
+                            "queryDepth": prev_depth,
                             "requestId": &prev_req
                         }),
                     );
@@ -2169,7 +2816,7 @@ impl Telemetry {
                 let t_done = ms(prev_end_dt, gap * (i + 1) / (n + 1));
                 let duration = (gap / (n + 1) - 12).max(1);
                 if tu.name == "Bash" {
-                    if shell_snapshot_first && i == 0 {
+                    if shell_snapshot_first && is_main && i == 0 {
                         push(ms(t_done, -40), "tengu_feature_ok", feature("shell_snapshot_create"));
                         dd.push(identity.dd_entry(
                             "tengu_feature_ok",
@@ -2218,7 +2865,16 @@ impl Telemetry {
                 let mut success = json!({
                     "messageID": &prev_msg,
                     "toolName": &tu.name,
-                    "isMcp": false,
+                    "isMcp": false
+                });
+                // 子代理里跑的工具多报是哪类子代理（`cap/2.1.280`：`subagent_type: Explore`、
+                // `is_built_in_agent: true`，紧跟 `isMcp`）。
+                if is_sub {
+                    success["subagent_type"] =
+                        json!(call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
+                    success["is_built_in_agent"] = json!(builtin_agent.is_some());
+                }
+                let rest = json!({
                     "effort_level": &effort_value,
                     "durationMs": duration,
                     "rssDeltaBytes": 1_081_344,
@@ -2229,11 +2885,14 @@ impl Telemetry {
                     "toolResultSizeBytes": tu.result_len,
                     "toolInputSizeBytes": tu.input_len
                 });
+                if let (Some(obj), Some(rest)) = (success.as_object_mut(), rest.as_object()) {
+                    obj.extend(rest.clone());
+                }
                 if tu.name == "Bash" {
                     success["bashCommandLen"] = json!(tu.command_len);
                 }
                 success["queryChainId"] = json!(&chain_id);
-                success["queryDepth"] = json!(prev_main_depth);
+                success["queryDepth"] = json!(prev_depth);
                 success["requestId"] = json!(&prev_req);
                 push(t_done, "tengu_tool_use_success", success.clone());
                 dd.push(identity.dd_entry(
@@ -2243,7 +2902,8 @@ impl Telemetry {
                     snake_flat(&success),
                 ));
             }
-            // 工具都跑完，攒附件再发下一条。
+            // 工具都跑完，攒附件再发下一条。这两条的深度仍是上一条的（三个版本的抓包都是
+            // 「下一条 api_query 的深度 − 1」：主线程 0→1、子代理 2→3…）。
             let ta = ms(t0, -4);
             for label in ["agent_pending_messages", "memory_update"] {
                 push(
@@ -2262,7 +2922,7 @@ impl Telemetry {
                     "assistantMessagesCount": shape.assistant_messages,
                     "toolResultsCount": results,
                     "queryChainId": &chain_id,
-                    "queryDepth": query_depth
+                    "queryDepth": prev_depth
                 }),
             );
             push(
@@ -2272,7 +2932,43 @@ impl Telemetry {
                     "totalToolResultsCount": results + 1,
                     "fileChangeAttachmentCount": 0,
                     "queryChainId": &chain_id,
-                    "queryDepth": query_depth
+                    "queryDepth": prev_depth
+                }),
+            );
+        }
+
+        // auto 模式下**每条**带工具的请求发出前都探一次 git 状态，不只是新输入那条
+        // （`cap/2.1.280` 第二个会话：主线程续轮、猜下一句、子代理每一步与它的摘要请求前都有，
+        // 紧跟在攒附件之后）。新输入那条已经在上面报过。
+        if v280 && !new_prompt && shape.permission_mode == "auto" && shape.tools_count > 0 {
+            push(
+                ms(t0, -2),
+                "tengu_auto_mode_git_state_probe",
+                json!({ "duration_ms": query_depth % 2, "wait_ms": 0, "outcome": "not_a_repo", "truncated": false }),
+            );
+        }
+        // 续轮与侧查询在发请求前也判一次工具搜索模式（首次输入的那条在模板里）；它排在
+        // 规范化那串之前（`cap/2.1.260-2` 与 `cap/2.1.280/00048` 都是）。
+        if !new_prompt {
+            push(
+                ms(t0, -1),
+                "tengu_tool_search_mode_decision",
+                tool_search_decision(&shape, &display_model),
+            );
+        }
+        // 每条带工具的请求发出前核一次声明的工具集（主线程、猜下一句、离开摘要、子代理都有，
+        // 标题那类无工具的没有）。`deferredLate` 两份抓包 55 条恒为 3、其余计数恒为 0；
+        // 没有 `ToolSearch` 的形态抓包里没见过，按字段名报 0 与 `toolSearchAbsent: true`。
+        if v280 && shape.tools_count > 0 {
+            push(
+                ms(t0, -1),
+                "tengu_declared_tool_set_held",
+                json!({
+                    "deferredLate": if shape.has_tool_search { 3 } else { 0 },
+                    "redeclared": 0,
+                    "fromRecord": 0,
+                    "queryDepth": query_depth,
+                    "toolSearchAbsent": !shape.has_tool_search
                 }),
             );
         }
@@ -2283,10 +2979,19 @@ impl Telemetry {
         // 「本轮已有的续轮次数」主线程就是这条自己的 depth，猜下一句则是主线程最后一条的
         // depth（它自己的 depth 是 +2 过的，不能拿来算）。侧查询没有这些，pre == post、0。
         let turn_extra = if is_main { query_depth } else { prev_main_depth } as usize;
-        let (pre_count, api_system) = if kind.has_boundary() {
+        let (pre_count, api_system) = if kind.is_agent() {
+            // 子代理：`apiSystemMessageCount` 就是体里 `role: system` 的条数，规范化前比规范化后
+            // 多出 这些 + 8（首条 + 6、摘要请求 + 10）——`cap/2.1.280` Explore 七条里六条逐条相等。
+            let extra = match (kind, agent.as_ref().map_or(0, |a| a.steps)) {
+                (Kind::AgentSummary, _) => 10,
+                (_, 0) => 6,
+                _ => 8,
+            };
+            (shape.messages_len + shape.api_system_messages + extra, shape.api_system_messages)
+        } else if kind.has_boundary() {
             (
-                shape.messages_len + 5 + prompt_index as usize + turn_extra,
-                prompt_index as usize + turn_extra,
+                shape.messages_len + 5 + prompt_seq as usize + turn_extra,
+                prompt_seq as usize + turn_extra,
             )
         } else {
             (shape.messages_len, 0)
@@ -2314,6 +3019,128 @@ impl Telemetry {
             "forkPointPinned": pinned,
             "markerCount": if pinned { 2 } else { 1 }
         });
+        // 发请求前的顺序照 `cap/2.1.280/00036`：边界、首块、边界，然后 tether 判定与回声审计，
+        // 再是缓存断点和 api_query。
+        if kind.has_boundary_marker() && shape.system_blocks >= 2 {
+            let boundary = json!({
+                "blockCount": shape.system_blocks,
+                "staticBlockLength": shape.static_len,
+                "dynamicBlockLength": shape.dynamic_len
+            });
+            push(t0, "tengu_sysprompt_boundary_found", boundary.clone());
+            if shape.sys0_len > 0 {
+                push(
+                    t0,
+                    "tengu_sysprompt_block",
+                    json!({ "length": shape.sys0_len, "hash": &shape.sys0_hash }),
+                );
+            }
+            push(t0, "tengu_sysprompt_boundary_found", boundary);
+        } else if kind.is_agent() {
+            // 子代理：标记缺失、首块、标记缺失，块数恒报 6（见 [`Kind::has_boundary_marker`]）。
+            let missing = json!({ "promptBlockCount": 6 });
+            push(t0, "tengu_sysprompt_missing_boundary_marker", missing.clone());
+            if shape.sys0_len > 0 {
+                push(
+                    t0,
+                    "tengu_sysprompt_block",
+                    json!({ "length": shape.sys0_len, "hash": &shape.sys0_hash }),
+                );
+            }
+            push(t0, "tengu_sysprompt_missing_boundary_marker", missing);
+        } else {
+            if shape.sys0_len > 0 {
+                push(
+                    t0,
+                    "tengu_sysprompt_block",
+                    json!({ "length": shape.sys0_len, "hash": &shape.sys0_hash }),
+                );
+            }
+            if shape.system_blocks > 0 {
+                let missing = json!({ "promptBlockCount": shape.system_blocks });
+                push(t0, "tengu_sysprompt_missing_boundary_marker", missing.clone());
+                push(t0, "tengu_sysprompt_missing_boundary_marker", missing);
+            }
+        }
+        // 三条 tether 事件共用的「无状态」判定：模型被固定成无状态发送，或 auto 模式的分类器
+        // 在跑（`cap/2.1.280`：auto 的三条 true，切回 default 的四条 false）。两者任一为真，
+        // 这条实际就不走线程（`sentThreadType: "none"`）。
+        let model_held = model_held_stateless(&display_model);
+        let classifier_held = shape.permission_mode == "auto";
+        if let Some(t) = &tether {
+            let decision = json!({
+                "decision": t.decision,
+                "reason": t.reason,
+                "sourceCategory": kind.category(),
+                "threadUnsupported": false,
+                "modelHeldStateless": model_held,
+                "relayHeldStateless": false,
+                "classifierHeldStateless": classifier_held,
+                "dropHeldStateless": false,
+                "evictedOther": false,
+                "changedModel": t.changed_model,
+                "changedSystem": false,
+                "changedTools": t.changed_tools,
+                "changedBetas": t.changed_betas,
+                "changedLatchedHeaders": t.changed_latched,
+                "changedThinking": t.changed_thinking,
+                "changedToolChoice": false,
+                "changedEffort": t.changed_effort,
+                "changedExtraBody": false,
+                "turnsInThread": t.turns,
+                "messageCount": shape.messages_len,
+                "prevMessageCount": t.prev_messages,
+                "firstChangedIndex": -1,
+                "deltaMessageCount": t.delta,
+                "claimedCompact": false,
+                "claimedSnip": false,
+                "claimedToolResultClear": false,
+                "claimedRewind": false,
+                "claimedClear": false,
+                "claimedAbortStrip": false,
+                "unclaimedHistoryChange": t.reason == "history_changed"
+            });
+            push(t0, "tengu_tether_decision", decision.clone());
+            dd.push(identity.dd_entry(
+                "tengu_tether_decision",
+                &ctx(t0),
+                &dd_model,
+                snake_flat(&decision),
+            ));
+            // 回声审计：客户端把上游回过来的 assistant 轮次原样带回去了没有。经代理转发的
+            // 历史就是客户端自己拼的那份，按「全部原样」报。
+            if t.echo {
+                let turns = shape.assistant_messages;
+                let echo = json!({
+                    "sourceCategory": kind.category(),
+                    "messageCount": shape.messages_len,
+                    "anchorDiverged": false,
+                    "turnsReceived": turns,
+                    "turnsIdentical": turns,
+                    "turnsDiverged": 0,
+                    "reordered": 0,
+                    "turnSplit": 0,
+                    "turnDropped": 0,
+                    "addedToolUseGettask": 0,
+                    "addedToolUsePoll": 0,
+                    "addedToolUseOther": 0,
+                    "addedOther": 0,
+                    "droppedToolUse": 0,
+                    "droppedThinking": 0,
+                    "droppedText": 0,
+                    "droppedOther": 0,
+                    "toolNameChanged": 0,
+                    "callerDropped": 0
+                });
+                push(t0, "tengu_tether_echo_audit", echo.clone());
+                dd.push(identity.dd_entry(
+                    "tengu_tether_echo_audit",
+                    &ctx(t0),
+                    &dd_model,
+                    snake_flat(&echo),
+                ));
+            }
+        }
         push(t0, "tengu_api_cache_breakpoints", breakpoints.clone());
         let mut query = Map::new();
         query.insert("model".into(), json!(&display_model));
@@ -2334,34 +3161,6 @@ impl Telemetry {
             query.insert("previousRequestId".into(), json!(prev));
         }
         push(t0, "tengu_api_query", Value::Object(query));
-        if shape.sys0_len > 0 {
-            push(
-                t0,
-                "tengu_sysprompt_block",
-                json!({ "length": shape.sys0_len, "hash": &shape.sys0_hash }),
-            );
-        }
-        if kind.has_boundary() && shape.system_blocks >= 2 {
-            let boundary = json!({
-                "blockCount": shape.system_blocks,
-                "staticBlockLength": shape.static_len,
-                "dynamicBlockLength": shape.dynamic_len
-            });
-            push(t0, "tengu_sysprompt_boundary_found", boundary.clone());
-            push(t0, "tengu_sysprompt_boundary_found", boundary);
-        } else if shape.system_blocks > 0 {
-            let missing = json!({ "promptBlockCount": shape.system_blocks });
-            push(t0, "tengu_sysprompt_missing_boundary_marker", missing.clone());
-            push(t0, "tengu_sysprompt_missing_boundary_marker", missing);
-        }
-        // 续轮与侧查询在 api_query 时也判一次工具搜索模式（首次输入的那条在模板里）。
-        if !new_prompt {
-            push(
-                t0,
-                "tengu_tool_search_mode_decision",
-                tool_search_decision(&shape, &display_model),
-            );
-        }
         push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
 
         // 首字节到达。失败那条没有这一条：官方的 `tengu_feature_ok{api_request}` 是请求
@@ -2456,15 +3255,36 @@ impl Telemetry {
             put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
             put("attempt", json!(1));
             put("ttftMs", json!(ttft));
+            // 首个内容块到达：比首字节晚 0–1ms（`cap/2.1.280` 九条里七条 +1、两条 +0）。
+            if v270 {
+                put("firstContentMs", json!(ttft + i64::from(retry_pad % 2)));
+            }
             put("buildAgeMins", json!(build_age_mins));
             put("provider", json!("firstParty"));
             put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
+            if v270 && let Some(crid) = call.client_request_id.as_deref().filter(|c| !c.is_empty())
+            {
+                put("clientRequestId", json!(crid));
+            }
+            // 子代理首条：是哪条主线程请求拉起的它（`cap/2.1.280`：`invokingRequestId` 指回
+            // 调了 Agent 的那条，`invocationKind: spawn`）；之后的各条不带。
+            if let Some(inv) = agent.as_ref().and_then(|a| a.invoking_request_id.as_deref())
+                && kind == Kind::Subagent
+            {
+                put("invokingRequestId", json!(inv));
+                put("invocationKind", json!("spawn"));
+            }
             put("stop_reason", json!(call.stop_reason.as_deref().unwrap_or("end_turn")));
             if let Some(e) = &effort {
                 put("effort_level", json!(e));
             }
-            // 只有主线程（和子代理）报「是不是默认模型/默认 effort」；猜下一句和标题那类不报。
-            if matches!(kind, Kind::Main | Kind::Subagent) {
+            // 只有主线程带（子代理、猜下一句、标题都没有），取值同本轮的 input_prompt。
+            if v277 && is_main {
+                put("turn_origin", json!(&turn_origin));
+            }
+            // 只有主线程报「是不是默认模型/默认 effort」；子代理（`cap/2.1.280` Explore 六条）、
+            // 猜下一句和标题那类都不报。
+            if is_main {
                 put("is_default_model", json!(display_model == default_model));
                 put("default_model", json!(&default_model));
                 if let Some(e) = &effort {
@@ -2486,7 +3306,11 @@ impl Telemetry {
             put("globalCacheStrategy", json!("system_prompt"));
             if shape.has_cache_control {
                 put("prompt_cache_ttl", json!(cache_ttl));
-                put("prompt_cache_ttl_reason", json!("subscriber"));
+                // 订阅用户的 1h 缓存报 `subscriber`；子代理那份是 5m，报 `default`（`cap/2.1.280`）。
+                put(
+                    "prompt_cache_ttl_reason",
+                    json!(if shape.cache_ttl_1h { "subscriber" } else { "default" }),
+                );
             }
             put("textContentLength", json!(call.text_chars));
             // 官方的判据是「这条回复里有没有思考块」（`redacted_thinking` 与空思考块都算）；
@@ -2514,7 +3338,10 @@ impl Telemetry {
             put("inputTextCharLength", json!(shape.input_text_chars));
             put("estimatedInputTokens", json!(shape.estimated_tokens));
             put("systemCharLength", json!(shape.system_chars));
-            if modern && kind.has_boundary() {
+            if let Some((source, hash)) = &snapshot {
+                put("systemPromptSource", json!(source));
+                put("snapshotHash", json!(hash));
+            } else if modern && kind.has_boundary() {
                 put("systemPromptSource", json!("live_unrecorded"));
             }
             put("toolsCharLength", json!(shape.tools_chars));
@@ -2528,17 +3355,83 @@ impl Telemetry {
             if let Some(prev) = &previous_request_id {
                 put("previousRequestId", json!(prev));
             }
+            // 内置子代理多报一项是哪类子代理，排在链字段之后（`cap/2.1.280` Explore 六条都有，
+            // 它的摘要请求没有）。自定义子代理那边报的是触发它的 skill（`attributionSkill`），
+            // 代理这一侧不知道是哪个 skill，不报。
+            if kind == Kind::Subagent
+                && v270
+                && let Some(t) = builtin_agent
+            {
+                put("attributionAgent", json!(t));
+            }
             if let Some(ms_since) = time_since_last {
                 put("timeSinceLastApiCallMs", json!(ms_since));
             }
             let success = Value::Object(success);
+            // tether 收尾排在 api_success 之前、同一毫秒（`cap/2.1.277`、`cap/2.1.280` 全部如此）。
+            // 失败那条抓包里只见过流被中断的 `aborted`，代理这边的失败形态没有样本，不报。
+            if let Some(t) = &tether {
+                // 实际发出去的线程类型以**请求体**为准：模拟路径从不写 `thread`，上游收到的就是
+                // 无线程的全量请求，事件若照判定报 create，一对请求体就对不上。
+                let sent = match shape.thread_type.as_deref() {
+                    Some("create") => "create",
+                    Some("continue") => "continue",
+                    _ => "none",
+                };
+                let stateless = sent == "none";
+                let omitted = sent == "continue";
+                let live = json!({
+                    "requestId": call.request_id.as_deref().unwrap_or(""),
+                    "sentThreadType": sent,
+                    "sourceCategory": kind.category(),
+                    "planReason": if stateless { "none" } else { t.reason },
+                    "engineDecision": t.decision,
+                    "engineReason": t.reason,
+                    "firstThreadError": "none",
+                    "finalOutcome": "ok",
+                    "replayed": false,
+                    "droppedFrom": "none",
+                    "threadUnsupported": false,
+                    "modelHeldStateless": model_held,
+                    "relayHeldStateless": false,
+                    "classifierHeldStateless": classifier_held,
+                    "serverToolHistory": false,
+                    // 抓包里与 `modelHeldStateless` 十四条同真同假（只有 2.1.277 一条 opus-5 例外）。
+                    "toolAdditionHistory": model_held,
+                    "toolRemovalHistory": false,
+                    "toolChangeHistory": false,
+                    "requestScopedStateless": false,
+                    "keptReminderClearAt": false,
+                    "keptReminderScope": "all",
+                    "deltaMessageCount": shape.after_last_assistant,
+                    "messageCount": shape.messages_len,
+                    "turnsInThread": t.turns,
+                    "omittedSystem": omitted,
+                    "omittedTools": omitted,
+                    "omittedBytes": if omitted { shape.omitted_bytes } else { 0 },
+                    "inheritBreakerTripped": false,
+                    "dropArmed": false,
+                    "dropHeldStateless": false,
+                    "continuesSinceDropCreate": -1,
+                    "dropReportUnmatched": false
+                });
+                push(t_end, "tengu_tether_live_outcome", live.clone());
+                dd.push(identity.dd_entry(
+                    "tengu_tether_live_outcome",
+                    &ctx(t_end),
+                    &dd_model,
+                    snake_flat(&live),
+                ));
+            }
             push(t_end, "tengu_api_success", success.clone());
-            dd.push(identity.dd_entry(
-                "tengu_api_success",
-                &ctx(t_end),
-                &dd_model,
-                snake_flat(&success),
-            ));
+            // Datadog 那份比 event_logging 少两项：工具长度表的 hash 与各工具入参长度
+            // （`cap/2.1.260-2`、`2.1.277`、`2.1.280` 三份的 Datadog 批次里一条都没有）。
+            let mut dd_success = snake_flat(&success);
+            if let Some(o) = dd_success.as_object_mut() {
+                o.shift_remove("tool_schemas_hash");
+                o.shift_remove("tool_use_content_lengths");
+            }
+            dd.push(identity.dd_entry("tengu_api_success", &ctx(t_end), &dd_model, dd_success));
 
             // 工具集变了才报一次（无工具的侧查询也算一种：`{}` 那份）。
             if tools_changed {
@@ -2642,7 +3535,7 @@ impl Telemetry {
                 o.insert("error_kind".into(), json!(k));
             }
             o.insert("is_error".into(), json!(error_kind.is_some()));
-            o.insert("is_subagent".into(), json!(kind == Kind::Subagent));
+            o.insert("is_subagent".into(), json!(kind.is_agent()));
             o.insert("goal_active".into(), json!(false));
             o.insert("duration_ms".into(), json!(duration));
             o.insert("query_source".into(), json!(query_source));
@@ -2690,18 +3583,77 @@ impl Telemetry {
             let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
             let hit_rate =
                 if total_in > 0 { call.cache_read_tokens as f64 / total_in as f64 } else { 0.0 };
-            for name in ["hook_stop_handler", "prompt_suggestion_generate", "turn"] {
+            let mut fork = json!({
+                "forkLabel": "prompt_suggestion",
+                "querySource": "prompt_suggestion",
+                "durationMs": total + 7,
+                "messageCount": 1
+            });
+            // 2.1.277 起多一项 `relayEligible`（猜下一句恒 true，子代理摘要恒 false）。
+            if v277 {
+                fork["relayEligible"] = json!(true);
+            }
+            let rest = json!({
+                "inputTokens": call.input_tokens,
+                "outputTokens": call.output_tokens,
+                "cacheReadInputTokens": call.cache_read_tokens,
+                "cacheCreationInputTokens": call.cache_creation_tokens,
+                "serviceTier": "standard",
+                "cacheCreationEphemeral1hTokens": 0,
+                "cacheCreationEphemeral5mTokens": 0,
+                "cacheHitRate": hit_rate,
+                "queryChainId": &main_chain,
+                "queryDepth": prev_main_depth
+            });
+            if let (Some(o), Some(r)) = (fork.as_object_mut(), rest.as_object()) {
+                o.extend(r.clone());
+            }
+            // 2.1.280 的顺序是 stop hook、turn、turn_end、fork 统计，最后才是
+            // `prompt_suggestion_generate`（`cap/2.1.280` 三条逐条如此）；之前的版本三个
+            // feature 连着报在前头。
+            let names: &[&str] = if v280 {
+                &["hook_stop_handler", "turn"]
+            } else {
+                &["hook_stop_handler", "prompt_suggestion_generate", "turn"]
+            };
+            for name in names {
                 push(t1, "tengu_feature_ok", feature(name));
                 dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
             }
+            if v280 {
+                push(t1, "tengu_turn_end", turn_end("completed", total + 7, None));
+                push(t1, "tengu_fork_agent_query", fork);
+                let name = "prompt_suggestion_generate";
+                push(t1, "tengu_feature_ok", feature(name));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+            } else {
+                push(t1, "tengu_fork_agent_query", fork);
+                push(t1, "tengu_turn_end", turn_end("completed", total + 7, None));
+            }
+        }
+
+        // 子代理的摘要请求：同猜下一句，自己算一轮辅助调用，fork 统计挂回子代理那条链、
+        // 深度恒为 1（`cap/2.1.280` 1 条、`cap/2.1.277` 5 条）。
+        if kind == Kind::AgentSummary && !failed {
+            let t1 = ms(t_end, 1);
+            for name in ["hook_stop_handler", "turn"] {
+                push(t1, "tengu_feature_ok", feature(name));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+            }
+            push(t1, "tengu_turn_end", turn_end("completed", total + 5, None));
+            let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
+            let hit_rate =
+                if total_in > 0 { call.cache_read_tokens as f64 / total_in as f64 } else { 0.0 };
+            let agent_chain = agent.as_ref().map(|a| a.chain_id.clone()).unwrap_or_default();
             push(
                 t1,
                 "tengu_fork_agent_query",
                 json!({
-                    "forkLabel": "prompt_suggestion",
-                    "querySource": "prompt_suggestion",
-                    "durationMs": total + 7,
+                    "forkLabel": "agent_summary",
+                    "querySource": "agent_summary",
+                    "durationMs": total + 5,
                     "messageCount": 1,
+                    "relayEligible": false,
                     "inputTokens": call.input_tokens,
                     "outputTokens": call.output_tokens,
                     "cacheReadInputTokens": call.cache_read_tokens,
@@ -2710,11 +3662,63 @@ impl Telemetry {
                     "cacheCreationEphemeral1hTokens": 0,
                     "cacheCreationEphemeral5mTokens": 0,
                     "cacheHitRate": hit_rate,
-                    "queryChainId": &main_chain,
-                    "queryDepth": prev_main_depth
+                    "queryChainId": agent_chain,
+                    "queryDepth": 1
                 }),
             );
-            push(t1, "tengu_turn_end", turn_end("completed", total + 7, None));
+        }
+
+        // 子代理跑完（它自己的 `end_turn`）：stop hook、turn、turn_end，随后是
+        // `agent_tool_completed` 与支线收尾那几条（`cap/2.1.280` 10:16:10.901–.906）。
+        if let Some(done) = &agent_done {
+            let t1 = ms(t_end, 1);
+            for name in ["hook_stop_handler", "turn"] {
+                push(t1, "tengu_feature_ok", feature(name));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+            }
+            let started: DateTime<Utc> = done.started.unwrap_or(call.started_at).into();
+            let elapsed = (t1 - started).num_milliseconds().max(total);
+            push(t1, "tengu_turn_end", turn_end("completed", elapsed, None));
+            let t2 = ms(t1, 4);
+            push(t2, "tengu_feature_ok", feature("lively_waffle"));
+            dd.push(identity.dd_entry(
+                "tengu_feature_ok",
+                &ctx(t2),
+                &dd_model,
+                feature("lively_waffle"),
+            ));
+            push(
+                t2,
+                "tengu_agent_tool_completed",
+                json!({
+                    "agent_type": call.agent.agent_type.as_deref().unwrap_or("general-purpose"),
+                    "model": &display_model,
+                    "prompt_char_count": done.prompt_chars,
+                    "response_char_count": 0,
+                    "assistant_message_count": done.steps,
+                    "total_tool_uses": done.tool_uses,
+                    "duration_ms": elapsed + 16,
+                    "total_tokens": done.prev_total,
+                    "is_built_in_agent": builtin_agent.is_some(),
+                    "is_async": true,
+                    "agent_depth": 1,
+                    "final_model": &display_model,
+                    "model_swapped": false
+                }),
+            );
+            push(
+                t2,
+                "tengu_cache_eviction_hint",
+                json!({
+                    "scope": "subagent_end",
+                    "last_request_id": call.request_id.as_deref().unwrap_or("")
+                }),
+            );
+            let t3 = ms(t2, 1);
+            for name in ["melodic_wolf", "task_local_agent", "subagent_complete"] {
+                push(t3, "tengu_feature_ok", feature(name));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t3), &dd_model, feature(name)));
+            }
         }
 
         // `take_tpl` 借着 `tpl_events`/`tpl_dd`，到这里已经不再用它，可以并进主队列。
@@ -2732,7 +3736,7 @@ impl Telemetry {
         let pending = st.pending.entry((call.cred_id, session_id.clone())).or_default();
         pending.version = version;
         pending.subscription_type = identity.subscription_type.clone();
-        pending.identity = Some(identity.clone());
+        pending.identity = Some(base_identity.clone());
         // **模型 / beta / prompt_id 只跟主线程走**（第一条就是侧查询时先占个位）。
         //
         // 这三项是导出指标时那条 `tengu_feature_ok{internal_metrics_export}` 的上下文，
@@ -2924,6 +3928,7 @@ impl Telemetry {
                 organization_uuid: st.org_uuid.get(&cred_id).cloned(),
                 subscription_type: s.subscription_type,
                 version: s.version.clone(),
+                agent_id: None,
             };
             let model = s.last_model.unwrap_or(s.default_model);
             let dd_model = model.trim_end_matches("[1m]").to_string();
@@ -3242,6 +4247,7 @@ mod tests {
             organization_uuid: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
             subscription_type: "team".into(),
             version: "2.1.258".into(),
+            agent_id: None,
         }
     }
 
@@ -3297,6 +4303,7 @@ mod tests {
             total_ms: 6118,
             request_id: Some(request_id.into()),
             client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
+            agent: AgentHeaders::default(),
             message_id: Some("msg_011Cedjuoa4oBPzoB2CSUNEB".into()),
             stop_reason: Some(stop.into()),
             resp_model: Some("claude-opus-5".into()),
@@ -3305,6 +4312,7 @@ mod tests {
             cache_read_tokens: 26736,
             cache_creation_tokens: 8729,
             text_chars: 87,
+            reply_input_chars: 87,
             thinking_chars: 0,
             saw_thinking: false,
             tool_use_lens: Vec::new(),
@@ -4702,6 +5710,7 @@ mod tests {
             betas: Some("claude-code-20250219,oauth-2025-04-20".into()),
             session_header: None,
             client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
+            agent: AgentHeaders::default(),
             organization_id: None,
             started_at: SystemTime::now() - Duration::from_secs(3),
         };
@@ -4765,6 +5774,7 @@ mod tests {
             betas: None,
             session_header: None,
             client_request_id: None,
+            agent: AgentHeaders::default(),
             organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
             started_at: SystemTime::now() - Duration::from_secs(2),
         }
@@ -5253,5 +6263,606 @@ mod tests {
         assert_eq!(m["metrics"][2]["data_points"].as_array().unwrap().len(), 4);
         assert!(t.take_due(later + Duration::from_secs(1)).is_empty(), "取空后不再有东西");
         assert_eq!(t.org_uuid(7).as_deref(), Some("09520b85-f6b6-432f-97e2-6ecb804a083f"));
+    }
+
+    /// 读一份抓包请求：请求体与出站 `anthropic-beta`。文件不在（打包的源码里没有 `cap/`）返回 `None`。
+    fn cap_request(rel: &str) -> Option<(Vec<u8>, Option<String>)> {
+        let dir = format!("{}/cap/{rel}", env!("CARGO_MANIFEST_DIR"));
+        let (dir, prefix) = dir.rsplit_once('/').unwrap();
+        let path =
+            std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".req.raw"))
+            })?;
+        let raw = std::fs::read(path).ok()?;
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let head = std::str::from_utf8(&raw[..sep]).ok()?;
+        let betas = head
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("anthropic-beta: ").or_else(|| l.strip_prefix("Anthropic-Beta: "))
+            })
+            .map(str::to_string);
+        Some((raw[sep..].to_vec(), betas))
+    }
+
+    /// `omittedBytes` 是 `system[1..]` 与 `tools` 两段 JSON 的长度之和（`cap/2.1.277/00031`
+    /// 那条续用线程报 85845）；末条 assistant 之后的条数即 `deltaMessageCount`。
+    #[test]
+    fn omitted_bytes_match_the_capture_when_it_is_present() {
+        let Some((body, _)) = cap_request("2.1.277/00031_") else {
+            eprintln!("skipped: cap/2.1.277 not present");
+            return;
+        };
+        let s = parse_shape(&body).unwrap();
+        assert_eq!(s.omitted_bytes, 85845);
+        assert_eq!(s.after_last_assistant, 2);
+    }
+
+    /// 回放 `cap/2.1.280` 的七条主线程请求（每轮换一次模型、前三轮 auto 后四轮 default），
+    /// tether 判定、无状态标记、快照来源、每轮输入那几条新事件逐条对官方批次。
+    #[test]
+    fn main_thread_replay_matches_the_2_1_280_capture() {
+        const FILES: [&str; 7] =
+            ["00021_", "00029_", "00033_", "00038_", "00065_", "00068_", "00073_"];
+        let mut reqs = Vec::new();
+        for f in FILES {
+            let Some(r) = cap_request(&format!("2.1.280/{f}")) else {
+                eprintln!("skipped: cap/2.1.280 not present");
+                return;
+            };
+            reqs.push(r);
+        }
+        let session = parse_shape(&reqs[0].0).unwrap().session_id.unwrap();
+        let t = Telemetry::default();
+        let base = SystemTime::now() - Duration::from_secs(600);
+        for (i, (body, betas)) in reqs.into_iter().enumerate() {
+            let model = parse_shape(&body).unwrap().model;
+            let mut c = call(body, &format!("req_{i}"), "end_turn");
+            c.betas = betas;
+            c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+            c.resp_model = Some(model);
+            c.started_at = base + Duration::from_secs(20 * i as u64);
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, session)).expect("queued");
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let col = |v: &[Value], k: &str| -> Vec<Value> { v.iter().map(|m| m[k].clone()).collect() };
+        let b = |xs: &[bool]| -> Vec<Value> { xs.iter().map(|x| json!(x)).collect() };
+
+        let queries = metas("tengu_api_query");
+        assert_eq!(
+            col(&queries, "permissionMode"),
+            ["auto", "auto", "auto", "default", "default", "default", "default"].map(|s| json!(s)),
+            "auto 模式的提示在消息里"
+        );
+
+        let dec = metas("tengu_tether_decision");
+        assert_eq!(dec.len(), 7);
+        assert_eq!(col(&dec, "reason")[0], "first_request");
+        assert!(col(&dec, "reason")[1..].iter().all(|r| r == "config_changed"));
+        assert!(col(&dec, "decision").iter().all(|d| d == "create"));
+        assert_eq!(col(&dec, "messageCount"), [2, 5, 8, 9, 16, 19, 22].map(|n| json!(n)));
+        assert_eq!(col(&dec, "prevMessageCount"), [0, 2, 5, 8, 9, 16, 19].map(|n| json!(n)));
+        assert_eq!(col(&dec, "changedModel"), b(&[false, true, true, true, true, true, true]));
+        assert_eq!(col(&dec, "changedEffort"), b(&[false, true, false, true, true, true, false]));
+        assert_eq!(
+            col(&dec, "changedLatchedHeaders"),
+            b(&[false, false, false, true, false, false, false])
+        );
+        assert!(col(&dec, "changedTools").iter().all(|v| v == false), "延迟工具不进长度表");
+        assert_eq!(
+            col(&dec, "modelHeldStateless"),
+            b(&[true, true, false, false, true, true, false])
+        );
+        assert_eq!(
+            col(&dec, "classifierHeldStateless"),
+            b(&[true, true, true, false, false, false, false])
+        );
+        assert_eq!(metas("tengu_tether_echo_audit").len(), 6, "首条没有回声审计");
+        let live = metas("tengu_tether_live_outcome");
+        assert_eq!(
+            col(&live, "sentThreadType"),
+            ["none", "none", "none", "create", "none", "none", "create"].map(|s| json!(s))
+        );
+        assert!(col(&live, "omittedBytes").iter().all(|v| v == 0), "没有续用线程的");
+
+        let ok = metas("tengu_api_success");
+        assert_eq!(col(&ok, "systemPromptSource")[0], "live_recorded");
+        assert!(col(&ok, "systemPromptSource")[1..].iter().all(|s| s == "from_snapshot"));
+        let hashes = col(&ok, "snapshotHash");
+        assert!(hashes.iter().all(|h| h == &hashes[0] && h.as_str().unwrap().len() == 12));
+        assert!(col(&ok, "turn_origin").iter().all(|o| o == "human"));
+        assert!(ok.iter().all(|m| m["firstContentMs"].as_i64().unwrap() >= 1800));
+        assert!(ok.iter().all(|m| m["clientRequestId"] == "3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e"));
+
+        let inputs = metas("tengu_input_prompt");
+        assert_eq!(inputs.len(), 7);
+        assert!(inputs[3].get("effort_level").is_none(), "haiku 没有 effort");
+        assert_eq!(metas("tengu_sleepy_snowflake_applied").len(), 4, "每个模型一次");
+        assert_eq!(metas("tengu_auto_mode_git_state_probe").len(), 3, "只在 auto 下");
+        assert_eq!(metas("tengu_declared_tool_set_held").len(), 7);
+
+        // Datadog 那份带 tether 三条，判定那条的 ddtags 按字母序多出 decision / reason。
+        let dd_dec: Vec<&Value> =
+            p.dd.iter().filter(|d| d["message"] == "tengu_tether_decision").collect();
+        assert_eq!(dd_dec.len(), 7);
+        assert!(
+            dd_dec[1]["ddtags"]
+                .as_str()
+                .unwrap()
+                .contains("client_type:cli,decision:create,entrypoint:cli")
+        );
+        assert!(
+            dd_dec[1]["ddtags"]
+                .as_str()
+                .unwrap()
+                .contains("platform:darwin,reason:config_changed,subscription_type")
+        );
+        assert_eq!(p.dd.iter().filter(|d| d["message"] == "tengu_tether_live_outcome").count(), 7);
+    }
+
+    /// 同一配置下消息只增不减：`continue/append`；实际走没走线程看请求体。
+    #[test]
+    fn same_config_continuation_continues_the_tether_thread() {
+        // 去掉 auto 模式的提示，免得分类器把它钉成无状态。
+        let plain = |last_user_text| {
+            String::from_utf8(cc_body(last_user_text))
+                .unwrap()
+                .replace("While auto mode is active: rules", "rules")
+                .into_bytes()
+        };
+        let t = Telemetry::default();
+        let mut first = call(plain(true), "req_1", "tool_use");
+        first.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&plain(false)).unwrap();
+        body["messages"].as_array_mut().unwrap().splice(
+            0..0,
+            [
+                json!({"role":"user","content":"earlier"}),
+                json!({"role":"assistant","content":"ok"}),
+            ],
+        );
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+        let expect_omitted = parse_shape(&second.body).unwrap().omitted_bytes;
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let dec = metas("tengu_tether_decision");
+        assert_eq!(
+            (dec[1]["decision"].as_str(), dec[1]["reason"].as_str()),
+            (Some("continue"), Some("append"))
+        );
+        assert_eq!(dec[1]["turnsInThread"], 2);
+        assert_eq!(dec[1]["deltaMessageCount"], 2);
+        // 判定是接着用，但请求体没写 `thread`（模拟路径就是这样）：实际发出的是无线程的全量，
+        // 照请求体报 none、什么都没省。
+        let live = metas("tengu_tether_live_outcome");
+        assert_eq!(live[1]["engineDecision"], "continue");
+        assert_eq!(live[1]["sentThreadType"], "none");
+        assert_eq!(live[1]["planReason"], "none");
+        assert_eq!(live[1]["omittedBytes"], 0);
+        assert!(expect_omitted > 0);
+        assert_eq!(live[1]["deltaMessageCount"], 1);
+        assert_eq!(metas("tengu_tether_echo_audit")[0]["turnsReceived"], 2);
+    }
+
+    /// 旧版本（出站 UA 2.1.258）不带 2.1.270 起才有的字段与事件。
+    #[test]
+    fn older_versions_keep_the_old_layout() {
+        let t = Telemetry::default();
+        t.ingest(call(cc_body(true), "req_1", "end_turn"));
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).unwrap();
+        let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
+        for n in [
+            "tengu_tether_decision",
+            "tengu_declared_tool_set_held",
+            "tengu_sleepy_snowflake_applied",
+        ] {
+            assert!(!names.contains(&n), "{n}");
+        }
+        let ok = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_success").unwrap();
+        let m = meta_of(&ok.1);
+        assert!(m.get("firstContentMs").is_none() && m.get("snapshotHash").is_none());
+        assert!(m.get("turn_origin").is_none());
+    }
+
+    /// 请求头里的一项（大小写不敏感）。
+    fn cap_header(rel: &str, name: &str) -> Option<String> {
+        let dir = format!("{}/cap/{rel}", env!("CARGO_MANIFEST_DIR"));
+        let (dir, prefix) = dir.rsplit_once('/').unwrap();
+        let path =
+            std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".req.raw"))
+            })?;
+        let raw = std::fs::read(path).ok()?;
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+        std::str::from_utf8(&raw[..sep]).ok()?.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+        })
+    }
+
+    /// 回放 `cap/2.1.280` 第二个会话：主线程拉起一个内置 Explore 子代理（6 条请求 + 1 条摘要
+    /// 请求），按官方的完成先后喂进来，子代理那条支线的事件逐项对官方批次。
+    #[test]
+    fn subagent_replay_matches_the_2_1_280_capture() {
+        // (文件, 回复的 stop_reason, 回复里调了哪些工具)
+        const CALLS: [(&str, &str, &[&str]); 11] = [
+            ("00161_", "end_turn", &[]),
+            ("00164_", "tool_use", &["Agent"]),
+            ("00166_", "end_turn", &[]),
+            ("00165_", "tool_use", &["Bash"]),
+            ("00168_", "end_turn", &[]),
+            ("00170_", "tool_use", &["Bash"]),
+            ("00171_", "tool_use", &["Bash"]),
+            ("00173_", "tool_use", &["Bash"]),
+            ("00174_", "end_turn", &[]),
+            ("00175_", "tool_use", &["SubagentHandback"]),
+            ("00178_", "end_turn", &[]),
+        ];
+        const AGENT: &str = "a51764a248f499f13";
+        let t = Telemetry::default();
+        let base = SystemTime::now() - Duration::from_secs(600);
+        let mut session = String::new();
+        for (i, (f, stop, tools)) in CALLS.iter().enumerate() {
+            let rel = format!("2.1.280/{f}");
+            let Some((body, betas)) = cap_request(&rel) else {
+                eprintln!("skipped: cap/2.1.280 not present");
+                return;
+            };
+            let shape = parse_shape(&body).unwrap();
+            session = shape.session_id.clone().unwrap();
+            let mut c = call(body, &format!("req_{f}"), stop);
+            c.betas = betas;
+            c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+            c.resp_model = Some(shape.model.clone());
+            c.message_id = Some(format!("msg_{f}"));
+            c.started_at = base + Duration::from_secs(10 * i as u64);
+            c.tool_use_lens = tools.iter().map(|n| (n.to_string(), 100)).collect();
+            c.client_request_id = cap_header(&rel, "x-client-request-id");
+            c.agent = AgentHeaders {
+                agent_id: cap_header(&rel, "x-claude-code-agent-id"),
+                agent_type: cap_header(&rel, "x-claude-code-agent-type"),
+                request_class: cap_header(&rel, "x-claude-code-request-class"),
+            };
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, session)).expect("queued");
+        let of_agent = |e: &Value| e["event_data"]["agent_id"] == AGENT;
+        let sub = |n: &str| -> Vec<Value> {
+            p.events
+                .iter()
+                .filter(|(_, e)| ev_name(e) == n && of_agent(e))
+                .map(|(_, e)| meta_of(e))
+                .collect()
+        };
+        let col = |v: &[Value], k: &str| -> Vec<Value> { v.iter().map(|m| m[k].clone()).collect() };
+
+        // 只有支线上的事件带 agent_id；主线程那几条一律不带。
+        for (_, e) in &p.events {
+            let d = &e["event_data"];
+            if d.get("agent_id").is_some() {
+                assert_eq!(d["agent_type"], "subagent");
+            }
+        }
+        let main_queries: Vec<&Value> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_query" && !of_agent(e))
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(main_queries.len(), 4, "主线程三条 + 猜下一句");
+        assert!(main_queries.iter().all(|e| e["event_data"].get("agent_id").is_none()));
+
+        let q = sub("tengu_api_query");
+        assert_eq!(
+            col(&q, "querySource"),
+            [
+                "agent:builtin:Explore",
+                "agent:builtin:Explore",
+                "agent:builtin:Explore",
+                "agent:builtin:Explore",
+                "agent_summary",
+                "agent:builtin:Explore",
+                "agent:builtin:Explore"
+            ]
+            .map(|s| json!(s))
+        );
+        assert_eq!(col(&q, "queryDepth"), [2, 3, 4, 5, 3, 6, 7].map(|n| json!(n)));
+        let chains = col(&q, "queryChainId");
+        assert!([0, 1, 2, 3, 5, 6].iter().all(|&i| chains[i] == chains[0]), "整条支线一个链");
+        assert_ne!(chains[4], chains[0], "摘要请求另起链");
+
+        let ok = sub("tengu_api_success");
+        assert_eq!(ok[0]["invokingRequestId"], "req_00164_", "拉起它的是调了 Agent 的那条");
+        assert_eq!(ok[0]["invocationKind"], "spawn");
+        assert!(ok[1].get("invokingRequestId").is_none());
+        assert!(ok.iter().all(|m| m.get("is_default_model").is_none()));
+        assert_eq!(ok[0]["systemPromptSource"], "live_recorded");
+        assert!(ok[1..].iter().all(|m| m["systemPromptSource"] == "from_snapshot"));
+        let main_ok: Vec<Value> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_success" && !of_agent(e))
+            .map(|(_, e)| meta_of(e))
+            .collect();
+        assert_ne!(ok[0]["snapshotHash"], main_ok[0]["snapshotHash"], "支线自己一份快照");
+        let explore: Vec<&Value> =
+            ok.iter().filter(|m| m["querySource"] == "agent:builtin:Explore").collect();
+        assert!(explore.iter().all(|m| m["attributionAgent"] == "Explore"));
+        let summary = ok.iter().find(|m| m["querySource"] == "agent_summary").unwrap();
+        assert!(summary.get("attributionAgent").is_none());
+        assert_eq!(ok[0]["prompt_cache_ttl_reason"], "default");
+        assert_eq!(
+            ok[1]["messageTokens"],
+            ok[0]["inputTokens"].as_i64().unwrap() + 26736 + 8729 + 31
+        );
+
+        // 规范化前后与系统提示词：没有分界标记，块数恒报 6。
+        let pre = col(&sub("tengu_api_before_normalize"), "preNormalizedMessageCount");
+        let post = sub("tengu_api_after_normalize");
+        assert_eq!(pre[..6], [9, 15, 19, 23, 25, 27].map(|n| json!(n)));
+        assert_eq!(
+            col(&post, "postNormalizedMessageCount")[..5],
+            [2, 5, 8, 11, 11].map(|n| json!(n))
+        );
+        assert_eq!(col(&post, "apiSystemMessageCount")[..5], [1, 2, 3, 4, 4].map(|n| json!(n)));
+        assert!(sub("tengu_sysprompt_boundary_found").is_empty());
+        let missing = sub("tengu_sysprompt_missing_boundary_marker");
+        assert_eq!(missing.len(), 14);
+        assert!(missing.iter().all(|m| m["promptBlockCount"] == 6));
+
+        // tether：支线首条另起，之后接着用；摘要请求没有。
+        let dec = sub("tengu_tether_decision");
+        assert_eq!(dec.len(), 6);
+        assert_eq!(dec[0]["reason"], "first_request");
+        assert!(dec[1..].iter().all(|d| d["decision"] == "continue" && d["reason"] == "append"));
+        assert_eq!(col(&dec, "turnsInThread"), [1, 2, 3, 4, 5, 6].map(|n| json!(n)));
+        assert!(dec.iter().all(|d| d["sourceCategory"] == "subagent"));
+        assert_eq!(sub("tengu_tether_echo_audit").len(), 5);
+
+        // 支线里的工具续轮与攒附件：深度是上一条的。
+        let before = sub("tengu_query_before_attachments");
+        assert_eq!(col(&before, "queryDepth")[..3], [2, 3, 4].map(|n| json!(n)));
+        let tool_ok = sub("tengu_tool_use_success");
+        assert!(
+            tool_ok
+                .iter()
+                .all(|m| m["subagent_type"] == "Explore" && m["is_built_in_agent"] == true)
+        );
+        assert_eq!(sub("tengu_auto_mode_git_state_probe").len(), 7, "auto 模式下每条请求前一次");
+
+        // 摘要请求与支线收尾。
+        let ends = sub("tengu_turn_end");
+        assert_eq!(
+            col(&ends, "query_source"),
+            ["agent_summary", "agent:builtin:Explore"].map(|s| json!(s))
+        );
+        assert!(ends.iter().all(|e| e["is_subagent"] == true));
+        assert_eq!(ends[1]["query_source_category"], "subagent");
+        let fork = sub("tengu_fork_agent_query");
+        assert_eq!(fork[0]["forkLabel"], "agent_summary");
+        assert_eq!(fork[0]["queryChainId"], chains[0]);
+        assert_eq!(fork[0]["relayEligible"], false);
+        let done = sub("tengu_agent_tool_completed");
+        assert_eq!(done[0]["assistant_message_count"], 6);
+        assert_eq!(done[0]["total_tool_uses"], 5);
+        assert_eq!(done[0]["agent_type"], "Explore");
+        assert_eq!(sub("tengu_cache_eviction_hint")[0]["scope"], "subagent_end");
+
+        // Datadog：支线条目带 agent_id；api_success 不带工具长度表的 hash。
+        assert!(p.dd.iter().any(|d| d["agent_id"] == AGENT && d["message"] == "tengu_api_success"));
+        assert!(
+            p.dd.iter()
+                .filter(|d| d["message"] == "tengu_api_success")
+                .all(|d| d.get("tool_schemas_hash").is_none())
+        );
+    }
+
+    /// 线程增量请求（`thread.type: continue`，体里没有 tools、只有新增的两条消息）按上一条
+    /// 全量补回客户端视角：`cap/2.1.277` sonnet 那一对，官方报 messageCount 8、toolsCount 19、
+    /// 实际走线程续用、省掉 85845 字节。
+    #[test]
+    fn thread_continuations_are_filled_from_the_thread_base() {
+        let mut calls = Vec::new();
+        for (f, stop) in [("00031_", "tool_use"), ("00035_", "tool_use")] {
+            let rel = format!("2.1.277/{f}");
+            let Some((body, betas)) = cap_request(&rel) else {
+                eprintln!("skipped: cap/2.1.277 not present");
+                return;
+            };
+            let mut c = call(body, &format!("req_{f}"), stop);
+            c.betas = betas;
+            c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+            c.agent.request_class = cap_header(&rel, "x-claude-code-request-class");
+            // 00031 那条回复：正文 38 字 + `Bash` 与入参 242（响应解压后逐块数的）。
+            c.reply_input_chars = 280;
+            calls.push(c);
+        }
+        let session = parse_shape(&calls[0].body).unwrap().session_id.unwrap();
+        assert_eq!(parse_shape(&calls[1].body).unwrap().tools_count, 0, "增量请求体里没有工具");
+        let t = Telemetry::default();
+        for c in calls {
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, session)).unwrap();
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let q = metas("tengu_api_query");
+        assert_eq!(q[1]["querySource"], "repl_main_thread", "不是辅助调用");
+        assert_eq!(q[1]["messagesLength"], 8);
+        let ok = metas("tengu_api_success");
+        assert_eq!(ok[1]["toolsCount"], 19);
+        // 输入长度含服务端持有、体里没有的那条回复。
+        assert_eq!(ok[1]["inputTextCharLength"], 56026);
+        assert_eq!(ok[1]["estimatedInputTokens"], 18676);
+        let live = metas("tengu_tether_live_outcome");
+        assert_eq!(live[0]["sentThreadType"], "create");
+        assert_eq!(live[1]["sentThreadType"], "continue");
+        assert_eq!(live[1]["omittedBytes"], 85845);
+        let dec = metas("tengu_tether_decision");
+        assert_eq!(
+            (dec[1]["decision"].as_str(), dec[1]["deltaMessageCount"].as_u64()),
+            (Some("continue"), Some(3))
+        );
+    }
+
+    /// 这一轮是谁发起的以请求自己的 `cc_turn_origin` 为准：`cap/2.1.280` 00179 是同伴会话
+    /// 发来的（peer）、00180 是后台任务的完成通知（task_notification），官方分别报 `peer` /
+    /// `task-notification`、`prompt_source: system`，peer 那条不带 `prompt_index` 也不占号。
+    #[test]
+    fn turn_origin_follows_the_billing_header() {
+        let t = Telemetry::default();
+        let mut session = String::new();
+        for (i, f) in ["00161_", "00179_", "00180_"].into_iter().enumerate() {
+            let rel = format!("2.1.280/{f}");
+            let Some((body, betas)) = cap_request(&rel) else {
+                eprintln!("skipped: cap/2.1.280 not present");
+                return;
+            };
+            session = parse_shape(&body).unwrap().session_id.unwrap();
+            let mut c = call(body, &format!("req_{f}"), "end_turn");
+            c.betas = betas;
+            c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+            c.agent.request_class = cap_header(&rel, "x-claude-code-request-class");
+            c.started_at = SystemTime::now() - Duration::from_secs(300 - 60 * i as u64);
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, session)).unwrap();
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let inputs = metas("tengu_input_prompt");
+        let col = |k: &str| -> Vec<Value> { inputs.iter().map(|m| m[k].clone()).collect() };
+        assert_eq!(col("turn_origin"), ["human", "peer", "task-notification"].map(|s| json!(s)));
+        assert_eq!(col("prompt_source"), ["typed", "system", "system"].map(|s| json!(s)));
+        assert_eq!(col("prompt_index"), [json!(1), Value::Null, json!(2)], "peer 不占号");
+        assert!(inputs.iter().all(|m| m["is_wakeup"] == false));
+        let ok = metas("tengu_api_success");
+        assert_eq!(
+            ok.iter().map(|m| m["turn_origin"].clone()).collect::<Vec<_>>(),
+            ["human", "peer", "task-notification"].map(|s| json!(s))
+        );
+    }
+
+    /// auto 模式只认客户端注入的两种位置；用户正文里引用、工具输出里恰好有、assistant 复述
+    /// 这段话都不算。
+    #[test]
+    fn auto_mode_markers_are_only_read_from_injected_reminders() {
+        let body = |msgs: Value| {
+            json!({ "model": "claude-sonnet-5", "messages": msgs, "system": [{"type":"text","text":"x"}] })
+                .to_string()
+                .into_bytes()
+        };
+        let mode = |msgs: Value| parse_shape(&body(msgs)).unwrap().permission_mode;
+        let quoted = "文档里写着 While auto mode is active: 你可以……";
+        // 用户引用、工具输出、assistant 复述：都不改模式。
+        assert_eq!(
+            mode(json!([
+                {"role":"user","content":[{"type":"text","text":quoted}]},
+                {"role":"assistant","content":[{"type":"text","text":"While auto mode is active: noted"}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"<system-reminder>\nWhile auto mode is active: x"}]}
+            ])),
+            "default"
+        );
+        // 注入的提示块与 system 消息：算。
+        let enter = json!({"role":"user","content":[
+            {"type":"text","text":"<system-reminder>\nWhile auto mode is active:\n\nrules</system-reminder>"},
+            {"type":"text","text":"hi"}
+        ]});
+        assert_eq!(mode(json!([enter.clone()])), "auto");
+        assert_eq!(
+            mode(
+                json!([{"role":"system","content":"# Environment\n... While auto mode is active: ..."}])
+            ),
+            "auto"
+        );
+        // 进入之后，工具输出里出现退出那段文字：仍是 auto；注入的退出提示才算退出。
+        assert_eq!(
+            mode(json!([
+                enter.clone(),
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"## Exited Auto Mode\nYou have exited"}]}
+            ])),
+            "auto"
+        );
+        assert_eq!(
+            mode(json!([
+                enter,
+                {"role":"user","content":[{"type":"text","text":"<system-reminder>\n## Exited Auto Mode\n\nYou have exited auto mode.</system-reminder>"}]}
+            ])),
+            "default"
+        );
+    }
+
+    /// 会话首轮就是 peer：它不占号（下一次用户输入仍是 1），它的续轮也不再被当成新输入，
+    /// 首轮那串只发一次、跟着真正的首轮走。
+    #[test]
+    fn a_peer_opening_turn_does_not_take_a_prompt_number() {
+        let t = Telemetry::default();
+        let mut session = String::new();
+        let steps = [
+            ("00179_", "tool_use", true),
+            ("00179_", "end_turn", false),
+            ("00161_", "end_turn", true),
+        ];
+        for (i, (f, stop, fresh)) in steps.into_iter().enumerate() {
+            let rel = format!("2.1.280/{f}");
+            let Some((body, betas)) = cap_request(&rel) else {
+                eprintln!("skipped: cap/2.1.280 not present");
+                return;
+            };
+            // 第二步是 peer 那一轮的工具续轮：把末条消息换成 tool_result。
+            let body = if fresh {
+                body
+            } else {
+                let mut v: Value = serde_json::from_slice(&body).unwrap();
+                let msgs = v["messages"].as_array_mut().unwrap();
+                msgs.push(json!({"role":"assistant","content":[{"type":"tool_use","id":"tp","name":"Bash","input":{}}]}));
+                msgs.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"tp","content":"ok"}]}));
+                v.to_string().into_bytes()
+            };
+            session = parse_shape(&body).unwrap().session_id.unwrap();
+            let mut c = call(body, &format!("req_{i}"), stop);
+            c.betas = betas;
+            c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
+            c.started_at = SystemTime::now() - Duration::from_secs(300 - 60 * i as u64);
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, session)).unwrap();
+        let inputs: Vec<Value> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_input_prompt")
+            .map(|(_, e)| meta_of(e))
+            .collect();
+        assert_eq!(inputs.len(), 2, "peer 的续轮不是新输入");
+        assert_eq!(inputs[0]["turn_origin"], "peer");
+        assert!(inputs[0].get("prompt_index").is_none());
+        assert_eq!(inputs[1]["turn_origin"], "human");
+        assert_eq!(inputs[1]["prompt_index"], 1, "peer 不占号");
+        let first_prompt_only = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_policy_limits_cache_state_at_first_prompt")
+            .count();
+        assert_eq!(first_prompt_only, 1, "首轮那串只发一次");
     }
 }

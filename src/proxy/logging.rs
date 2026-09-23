@@ -416,6 +416,7 @@ impl Drop for ReqLog {
                 total_ms: total_ms as u64,
                 request_id: self.upstream_request_id.clone(),
                 client_request_id: cap.client_request_id,
+                agent: cap.agent,
                 message_id: self.sniffer.message_id.clone(),
                 stop_reason: self.sniffer.stop_reason.clone(),
                 resp_model: self.sniffer.model.clone(),
@@ -424,6 +425,7 @@ impl Drop for ReqLog {
                 cache_read_tokens: self.sniffer.cache_read_tokens.unwrap_or(0),
                 cache_creation_tokens: self.sniffer.cache_creation_tokens.unwrap_or(0),
                 text_chars: self.sniffer.text_chars,
+                reply_input_chars: self.sniffer.reply_input_chars(),
                 thinking_chars: self.sniffer.thinking_chars,
                 saw_thinking: self.sniffer.saw_thinking,
                 tool_use_lens: self.sniffer.tool_use_lens(),
@@ -694,6 +696,11 @@ pub(super) fn telemetry_capture(
         betas: header_opt(&upstream.headers, "anthropic-beta"),
         session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
         client_request_id: header_opt(&upstream.headers, "x-client-request-id"),
+        agent: crate::telemetry::AgentHeaders {
+            agent_id: header_opt(&upstream.headers, "x-claude-code-agent-id"),
+            agent_type: header_opt(&upstream.headers, "x-claude-code-agent-type"),
+            request_class: header_opt(&upstream.headers, "x-claude-code-request-class"),
+        },
         organization_id,
         started_at: std::time::SystemTime::now()
             .checked_sub(started.elapsed())
@@ -1305,6 +1312,32 @@ impl UsageSniffer {
         out
     }
 
+    /// 这条回复按 `inputTextCharLength` 的口径有多少字：正文 + 每个 `tool_use` 的「工具名 +
+    /// 入参 JSON」（UTF-16 计，与 [`crate::telemetry`] 解析请求体时同一口径，思考块不计）。
+    ///
+    /// 线程续用时这条回复由服务端持有、下一条请求体里没有，可客户端报的输入长度是含它的
+    /// （`cap/2.1.277` 00031 → 00035：回复正文 38 + `Bash` 与入参 242 = 280，正是事件
+    /// 56026 与请求体可见部分之差）。
+    ///
+    /// 口径必须与请求解析那侧逐项一致：**只算客户端要执行的 `tool_use`**（请求解析不计
+    /// `server_tool_use` / `mcp_tool_use`），**名字用上游回的原名**（`raw_name`）——下一条
+    /// 出站请求历史里写的就是它，而归类名会把 `mcp__ide__getDiagnostics` 缩成 `mcp_tool`，
+    /// 单个工具名就少 16 个字。
+    pub(super) fn reply_input_chars(&self) -> usize {
+        let tools: usize = self
+            .tool_uses
+            .iter()
+            .filter(|b| b.client_side)
+            .map(|b| {
+                let input = serde_json::from_str::<serde_json::Value>(&b.json)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| b.json.clone());
+                b.raw_name.encode_utf16().count() + input.encode_utf16().count()
+            })
+            .sum();
+        self.text_chars + tools
+    }
+
     /// 这条回复里要客户端去执行的 `tool_use` 原名，按首次出现去重。server tool 与
     /// MCP server 那两类不在内：上游自己跑完，客户端拿不到 tool_use。
     pub(super) fn tool_use_names(&self) -> Vec<&str> {
@@ -1760,5 +1793,64 @@ data: {\"type\":\"content_block_start\",\"index\":IDX,\"content_block\":{\"type\
         // 遥测那张表照旧按归类名走，不受影响。
         let lens: Vec<String> = s.tool_use_lens().into_iter().map(|(n, _)| n).collect();
         assert_eq!(lens, ["Bash", "mcp_tool", "web_search"]);
+    }
+
+    /// 回复按 `inputTextCharLength` 口径的字数：原名、只算客户端执行的 `tool_use`。
+    #[test]
+    fn reply_input_chars_counts_raw_client_side_tool_uses() {
+        let mut s = crate::proxy::UsageSniffer::new(true, false);
+        let block = |i: u32, ty: &str, name: &str| -> Vec<u8> {
+            const EV: &str = "event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":IDX,\"content_block\":{\"type\":\"TY\",\"id\":\"tIDX\",\"name\":\"NAME\",\"input\":{\"a\":1}}}
+
+";
+            EV.replace("IDX", &i.to_string()).replace("TY", ty).replace("NAME", name).into_bytes()
+        };
+        s.feed(&block(0, "tool_use", "mcp__ide__getDiagnostics"));
+        s.feed(&block(1, "server_tool_use", "web_search"));
+        s.feed(&block(2, "mcp_tool_use", "mcp__remote__x"));
+        // 客户端那一块按原名 24 字 + `{"a":1}` 7 字；上游自己跑的两块不计。
+        assert_eq!(s.reply_input_chars(), 24 + 7);
+    }
+
+    /// 走真实的嗅探路径：把 `cap/2.1.277/00031` 的响应（chunked + gzip 的 SSE）原样喂进去，
+    /// 得到的正是下一条续用请求少掉的那 280 字（正文 38 + `Bash` 与入参 242，事件 56026 与
+    /// 请求体可见部分之差）。
+    #[test]
+    fn reply_input_chars_matches_the_capture_when_it_is_present() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/cap/2.1.277");
+        let Some(path) = std::fs::read_dir(dir).ok().and_then(|d| {
+            d.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("00031_") && n.ends_with(".resp.raw"))
+            })
+        }) else {
+            eprintln!("skipped: cap/2.1.277 not present");
+            return;
+        };
+        let raw = std::fs::read(path).unwrap();
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        // 去掉 chunked 分块头，再解 gzip。
+        let mut rest = &raw[sep..];
+        let mut gz = Vec::new();
+        loop {
+            let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+            let size_line = std::str::from_utf8(&rest[..eol]).unwrap();
+            let n = usize::from_str_radix(size_line.split(';').next().unwrap().trim(), 16).unwrap();
+            if n == 0 {
+                break;
+            }
+            gz.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+            rest = &rest[eol + 2 + n + 2..];
+        }
+        let mut sse = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut sse).unwrap();
+        let mut s = crate::proxy::UsageSniffer::new(true, false);
+        // 按小块喂，顺带验证跨块拼接。
+        for chunk in sse.chunks(97) {
+            s.feed(chunk);
+        }
+        assert_eq!(s.reply_input_chars(), 280);
     }
 }

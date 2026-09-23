@@ -784,6 +784,7 @@ impl KeepaliveCtx {
             organization_uuid: self.organization_uuid.clone(),
             subscription_type: self.subscription_type.clone(),
             version: self.version.clone(),
+            agent_id: None,
         }
     }
 

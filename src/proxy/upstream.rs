@@ -1719,6 +1719,7 @@ data: {\"type\":\"message_stop\"}
                 betas: None,
                 session_header: None,
                 client_request_id: None,
+                agent: Default::default(),
                 organization_id: None,
                 started_at: std::time::SystemTime::now(),
             }),
