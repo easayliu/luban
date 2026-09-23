@@ -6,7 +6,6 @@ use axum::http::HeaderMap;
 use crate::config;
 use crate::store;
 
-use super::simulation::cc_profile_kind_for;
 use super::{
     Simulation, has_beta, incoming_session_id, is_cc_shaped, is_quota_probe_shaped,
     last_user_text_starts_with, uuid_v4,
@@ -523,31 +522,6 @@ impl CcRequestKind {
     /// 这一类要不要进会话链。三项全不写的（标题、安全分类、额度探测）整条跳过。
     pub(super) fn on_session_chain(self) -> bool {
         self.wants_prompt_id() || self.wants_prev_req() || self.wants_diagnostics()
-    }
-
-    /// 给这一类在 `version` 上补 billing header 时该用的**固定后缀**；这一版没有对应
-    /// profile（或版本更老）时 `None`，由调用方退回 [`cc_version_suffix`] 那套派生算法。
-    ///
-    /// 对抓过包的版本生效（2.1.260 / 2.1.270 / 2.1.277 各自那张表，见 [`config::CC_PROFILES`]）：
-    /// 这几版的后缀是逐 profile 定死的，派生算法在 2.1.260 上已被证否。2.1.258 及更早仍走
-    /// 派生——那一版五份抓包全是 `1e2`，而算法在 `"hi"` 上正好也算出 `1e2`。
-    ///
-    /// 主线程与「猜下一句」是主线程那一档，后缀跟**模型族**走（`222`/`bcd`/…），
-    /// 故还要 `model`。
-    pub(super) fn billing_suffix_at(self, version: &str, model: &str) -> Option<&'static str> {
-        let kind = match self {
-            Self::Subagent => config::CcProfileKind::SdkSubagentHaiku,
-            Self::Helper => config::CcProfileKind::HelperSubagentHaiku,
-            Self::Title => config::CcProfileKind::SessionTitleHaiku,
-            Self::Classifier => config::CcProfileKind::SecurityClassifierSonnet,
-            Self::Main | Self::Suggestion => cc_profile_kind_for(model),
-            // 额度探测压根没有 billing header，走不到这里。
-            Self::QuotaProbe => return None,
-        };
-        // **只认版本逐字相等的那一行**（[`config::cc_profile_exact`]）：2.1.260 的 opus 是 `222`、
-        // 2.1.277 四族都是 `d56`，拿一版的值写进另一版的请求就是官方从不产生的组合；没抓过的
-        // 版本（2.1.261 ~ 2.1.276 的多数 kind）返回 `None`，由调用方退回派生算法。
-        config::cc_profile_exact(kind, version).map(|p| p.billing_suffix).filter(|s| !s.is_empty())
     }
 
     /// 这一类官方**本来就是非流式**，`nonstream_as_sse` 不能把它改成 `stream:true`。

@@ -472,8 +472,8 @@ export function ForwardingSettingsContent() {
           k="simulate_full_system"
           label={t('补齐官方 system 第四块', 'Fill the official fourth system block')}
           summary={t(
-            '模拟请求在基座之后再补官方那段 harness 提示词，约一万一千字节；客户端自己的 system 仍单独占最后一块，但回答会被这段官方提示词带偏。',
-            'Emulated requests get the official harness prompt, roughly 11 KB, after the base block. The client’s own system prompt still occupies the last block on its own, but the official prompt pulls the model’s answers towards its own style.',
+            '模拟请求在基座之后再补官方那段 harness 提示词，约六千七百字节；客户端自己的 system 仍单独占最后一块，但回答会被这段官方提示词带偏。',
+            'Emulated requests get the official harness prompt, roughly 6.7 KB, after the base block. The client’s own system prompt still occupies the last block on its own, but the official prompt pulls the model’s answers towards its own style.',
           )}
           requires={{
             key: 'simulate_cc',
@@ -482,8 +482,28 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '官方 2.1.277 主线程的 system 是四块：billing、身份句、基座、以及基座之后约一万一千字节的「其余」段——会话指引、记忆说明、模型清单、交付规范等，末尾断点就标在这块上，四个模型族用的是同一份。此前模拟请求的末块放的是客户端自己的提示词，与官方形态差得最远的正是这一块。开启后按 2.1.277 抓包的原文填这一块：唯一随机器变的记忆目录优先用来访自己写的工作目录，来访没写才按账号加设备派生一个固定的假路径。客户端自己的 system 两种取值下都单独占最后一块（超过 1900 字节搬进首条消息、原地留一行占位；中文约 633 字），位置不受这项影响；但**回答受影响**——这一块在提示模型自己是 Claude Code。模板去掉了依赖 ToolSearch 的那段指令，因为模拟不注入 ToolSearch。代价是每条模拟请求多约 2700 token 的前缀，带 1h 断点、同一会话内稳定，基本走缓存读价；模型也会被这段官方提示词带得更像 Claude Code。实测客户端 system 要求「只回某个标记、别的都不要说」时，模型照回了那个标记，但后面还会再加一句自我介绍；关掉这一块之后回的就只有那个标记。客户端 system 的块位置没变，变的是它压不压得住官方那段提示词。关掉即不发这一块，system 只剩 billing、身份句、基座，加客户端那块：haiku 上一条请求 385 token，开着是 2978，且不注入任何环境信息。',
-                'The official 2.1.277 main-thread system prompt has four blocks: billing, identity, base, and a roughly 11 KB “rest” section after the base — session guidance, memory instructions, model list, delivery rules — carrying the final cache breakpoint; all four model families share the same text. Emulated requests used to put the client’s own prompt in that last block, which was the largest gap from the official shape. When enabled, this block is filled from the 2.1.277 captures verbatim: the only machine-specific part, the memory directory, follows the working directory the caller wrote itself, falling back to a fixed fake path derived per account and device. The client’s own system prompt occupies the last block on its own either way (moved into the first message above 1,900 bytes, leaving a one-line placeholder); its position is unaffected by this switch, but the model’s answers are not, because this block tells the model it is Claude Code. The paragraph that depends on ToolSearch is removed, since emulation does not inject ToolSearch. The cost is roughly 2,700 extra prefix tokens per emulated request, behind a 1h breakpoint and stable within a session, so mostly at cache-read price; the model is also pulled further towards Claude Code behaviour by the official prompt. In testing, when the client’s system prompt asked for a single marker and nothing else, the model returned the marker but still added a line introducing itself; with this block disabled the reply was the marker alone. The client block keeps its place either way; what changes is whether it outweighs the official prompt. Disable to drop this block: the system prompt is then billing, identity and base plus the client’s block, measured at 385 tokens on haiku versus 2,978 with it on, and no environment details are injected.',
+                '官方 2.1.280 主线程的 system 是四块：billing、身份句、基座、以及基座之后约七千字节的「其余」段——会话指引、记忆说明、模型清单、上下文管理，末尾断点就标在这块上，四个模型族用的是同一份。开启后按 2.1.280 抓包的原文填这一块：唯一随机器变的记忆目录优先用来访自己写的工作目录，来访没写才按账号加设备派生一个固定的假路径；模板去掉了依赖 ToolSearch 的那段指令，因为模拟不注入 ToolSearch。客户端自己的 system 单独占最后一块（超过 1900 字节搬进首条消息、原地留一行占位；中文约 633 字），于是开着时出站是五块、比官方多一块；**回答也受影响**——这一块在提示模型自己是 Claude Code，实测客户端 system 要求「只回某个标记」时，模型照回了那个标记，但后面还会再加一句自我介绍。代价是每条模拟请求多约一千七百 token 的前缀，带 1h 断点、同一会话内稳定，基本走缓存读价。关掉即不发这一块：system 是 billing、身份句、基座加客户端那块，恰好四块，客户端那块落在官方「其余」段的位置上，也不注入任何环境信息。',
+                'The official 2.1.280 main-thread system prompt has four blocks: billing, identity, base, and a roughly 7 KB “rest” section after the base — session guidance, memory instructions, model list, context management — carrying the final cache breakpoint; all four model families share the same text. When enabled, this block is filled from the 2.1.280 captures verbatim: the only machine-specific part, the memory directory, follows the working directory the caller wrote itself, falling back to a fixed fake path derived per account and device; the paragraph that depends on ToolSearch is removed, since emulation does not inject ToolSearch. The client’s own system prompt occupies the last block on its own (moved into the first message above 1,900 bytes, leaving a one-line placeholder), so with this on the request has five blocks, one more than the official shape. **Answers are affected too**: this block tells the model it is Claude Code; in testing, when the client’s system prompt asked for a single marker, the model returned the marker but still added a line introducing itself. The cost is roughly 1,700 extra prefix tokens per emulated request, behind a 1h breakpoint and stable within a session, so mostly at cache-read price. Disable to drop this block: the system prompt is then billing, identity and base plus the client’s block — exactly four blocks, with the client’s block in the official “rest” position — and no environment details are injected.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="fill_absent_tools"
+          label={t('不带工具的请求也补官方工具', 'Add official tools to tool-less requests')}
+          summary={t(
+            '来访整个没带 tools 时，也补上官方主线程那 14 个工具；模型可能去调用它们，而这类客户端多半接不住。',
+            'When a request carries no tools at all, add the 14 official main-thread tools anyway; the model may call them, and such clients usually cannot handle that.',
+          )}
+          requires={{
+            key: 'simulate_cc',
+            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
+          }}
+          description={
+            <>
+              {t(
+                '模拟请求一律装成官方主线程，而官方主线程每条都带工具（2.1.280 抓包恒为 19 或 20 个），「主线程的 beta 与 system、零个工具」是官方不产生的组合。开启后，不带工具的来访（没有 tools、tools 为 null 或空数组）也补上 Agent、Bash、Read 等 14 个官方工具；来访 tool_choice 要求必须调工具（any 或指定工具）时不补。自己带了工具的请求两种取值下都照旧补缺。风险：不带工具的多半是纯聊天客户端，没有工具循环，模型一旦调用注入的工具，客户端拿到的是一个它处理不了的 tool_use，这次回答就坏了——补了工具的请求在流水改写列标 tools_filled，模型真去调了注入工具再标 injected_tool_called，两者一比就是命中率。成本：工具声明约八万字节（约两万 token），每个新会话首轮按写入价付一次，之后走缓存读价。关掉即这类请求一个工具都不注，空数组也原样发出。',
+                'Emulated requests are always shaped as official main-thread requests, and every official main-thread request carries tools (19 or 20 in the 2.1.280 captures); main-thread betas and system prompt with zero tools is a combination the official client never produces. When enabled, requests without tools (no tools field, tools set to null, or an empty array) also get the 14 official tools such as Agent, Bash and Read, unless the request’s tool_choice demands a tool call (any or a named tool). Requests that carry their own tools have missing ones added either way. Risk: tool-less callers are usually plain chat clients without a tool loop, so if the model calls an injected tool the client receives a tool_use it cannot handle and that answer is broken — requests that got the tools are tagged tools_filled in the rewrites column of the request log, and injected_tool_called is added when the model actually called one, so the two together give the hit rate. Cost: the tool declarations are about 80 KB (roughly 20K tokens), paid at write price on the first turn of each new session and at cache-read price afterwards. Disable to inject no tools into such requests; an empty array is sent as is.',
               )}
             </>
           }

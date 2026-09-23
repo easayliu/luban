@@ -347,7 +347,7 @@ pub(super) fn rewrite_body_out(
         && display_beta
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
-    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带 `{"effort":"high"}`，
+    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带（2.1.280 的 opus 是 `medium`），
     // 按 profile 补（[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
     let effort_filled = sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
     // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），
@@ -402,7 +402,7 @@ pub(super) fn rewrite_body_out(
     let prefix_injected = flags.simulate_cc
         && sim.is_none()
         && cc_kind.allows_system_prefix()
-        && ensure_cc_system_prefix(&mut v, client_version, cc_kind);
+        && ensure_cc_system_prefix(&mut v, client_version);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
     // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。
@@ -496,6 +496,7 @@ pub(super) fn rewrite_body_out(
             && inject_cc_tools(
                 &mut v,
                 s.profile,
+                s.fill_absent_tools,
                 ToolAlignWho { cred_id: cred.id, cred: &cred.label, session: &s.session_id },
             )
     });
@@ -1005,6 +1006,22 @@ pub(super) fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(S
     let want = parse_version(min)?;
     let got = cc_cli_version(ua)?;
     (got < want).then(|| (format!("{}.{}.{}", got.0, got.1, got.2), min.trim().to_string()))
+}
+
+/// 按模型的最低客户端版本闸：来访 UA 自报的 CC 版本低于该模型首个支持它的官方版本
+/// （[`config::MODEL_MIN_CC_VERSION`]，按最长前缀匹配）时，返回 `(自报版本, 要求版本)`；
+/// 放行时返回 `None`。
+///
+/// 与 [`below_min_client_version`] 一样只卡 UA 里带 `claude-cli/` 的来访：非 CC 客户端没有
+/// 版本可比，读不出版本号的也放过；表里没有的模型不设限。同样只是引导升级，不是安全边界。
+pub(super) fn below_model_min_cc_version(ua: &str, model: &str) -> Option<(String, &'static str)> {
+    let m = model.to_ascii_lowercase();
+    let (_, want) = config::MODEL_MIN_CC_VERSION
+        .iter()
+        .filter(|(prefix, _)| m.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())?;
+    let got = cc_cli_version(ua)?;
+    (got < parse_version(want)?).then(|| (format!("{}.{}.{}", got.0, got.1, got.2), *want))
 }
 
 /// 把 `metadata.user_id` 里的 `account_uuid`/`device_id` 换成凭证自洽身份，**保持原格式**：
@@ -1665,7 +1682,8 @@ pub(super) fn ensure_context_management(v: &mut serde_json::Value) -> bool {
 }
 
 /// 模拟路径下按 profile 补顶层 `output_config`：2.1.277 起 opus / fable / sonnet 主线程每条都是
-/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带），haiku
+/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带；2.1.280 的
+/// opus 换成 `medium`，`cap/2.1.280/00021`），haiku
 /// 主线程与全部辅助请求不带（[`config::CcProfile::effort`] 为 `None`，这里什么都不做）。
 ///
 /// 客户端自己带了 `output_config`（不论写的是 `effort` 还是 `format`）就不动——那是它自己的
@@ -2389,12 +2407,22 @@ pub(super) fn cc_tools_core(_profile: &config::CcProfile) -> &'static [serde_jso
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
 ///
-/// 判据只写这一份，注入与流水两边共用：注入按它改体，[`ReqLog`] 按它在回复里认「模型调了
-/// 一个客户端没声明的注入工具」。分开写两份判据，早晚有一边漂掉，流水就会把客户端自己的
-/// 工具记成注入的、或反过来。
+/// 只给注入那一步用（[`inject_cc_tools`]，此时 `tool_choice` 已归一）。流水**不**拿它预判：
+/// 那边读的是来访原文，`tool_choice: "required"` 这类方言还没归一，会算错——流水改按实际出站
+/// 体对来访算（[`injected_tools_of`]）。
 ///
-/// 返回空的两种情形：没有 `tools` 键（官方的无工具 helper / 标题 / 分类就是这个样子，别
-/// 凭空造一个）、该 profile 的每个工具名客户端都已声明。
+/// **不带工具的来访**（[`declares_no_tools`]：没有 `tools` 键、`tools: null`、`tools: []` 三种
+/// 一视同仁）只在 `fill_absent`（开关 `fill_absent_tools`，默认开）开着时按全缺算，且来访的
+/// `tool_choice` 是 `any` / 指定工具时不补（[`forces_tool_use`]）。理由：模拟路径只发主线程
+/// profile，而官方主线程一条不带工具的样本都没有（`cap/2.1.280` 主线程恒为 19 / 20 个），「主线程
+/// 的 beta 与 system、零个工具」是官方不产生的组合。已知代价：这类来访多半是没有工具循环的纯
+/// 聊天客户端，模型调了注入的工具时它拿到的是一个处理不了的 `tool_use`（流水 `rewrites` 列打
+/// `injected_tool_called`；补了工具的请求本身打 `tools_filled`；算调用率时分子要数**两个标签都有**
+/// 的——单数 `injected_tool_called` 还混着自带工具、只被补缺的客户端）；每个新
+/// 会话首轮还要按写入价多付约两万 token 的工具声明。
+///
+/// 返回空的情形：不带工具且开关关着或来访强制调用工具、`tools` 是数组以外的怪值、该 profile
+/// 的每个工具名客户端都已声明。
 ///
 /// **客户端已带部分官方名时照样补缺的**。原先「有任何一个官方名就一个都不注」，理由是
 /// 「真 CC 或抄了 CC 声明的中转，别动」——但真 CC 不走模拟路径，会走到这里的是抄了一部分的：
@@ -2411,16 +2439,69 @@ pub(super) fn cc_tools_core(_profile: &config::CcProfile) -> &'static [serde_jso
 pub(super) fn cc_tools_to_inject(
     v: &serde_json::Value,
     profile: &config::CcProfile,
+    fill_absent: bool,
 ) -> Vec<&'static str> {
-    let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else {
+    if declares_no_tools(v) && (!fill_absent || forces_tool_use(v)) {
         return Vec::new();
+    }
+    let declared: Vec<&str> = match v.get("tools") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(tools)) => {
+            tools.iter().filter_map(|t| t.get("name")?.as_str()).collect()
+        }
+        Some(_) => return Vec::new(),
     };
-    let declared: Vec<&str> = tools.iter().filter_map(|t| t.get("name")?.as_str()).collect();
     cc_tools_core(profile)
         .iter()
         .filter_map(|stub| stub.get("name")?.as_str())
         .filter(|name| !declared.contains(name))
         .collect()
+}
+
+/// 模拟路径**实际**注进出站体、来访自己没声明的官方工具名：出站 `tools` 里属于该 profile
+/// 官方资产（[`cc_tools_core`]）的名字，减去来访 `tools` 里已有的名字。
+///
+/// 流水按它记 `injected_tool_called` / `tools_filled`，不再拿来访体预判
+/// （[`cc_tools_to_inject`]）：来访的 `tool_choice: "required"` / `"any"` / OpenAI 的
+/// `{"type":"function"}` 要先被 [`normalize_tool_choice`] 归一成 `any` / `tool`，注入那一步才
+/// 据此不补；读来访原文会把这类请求误记成「补了」。官方工具名不参与假名混淆，出站里认得出。
+pub(super) fn injected_tools_of(
+    inbound: &serde_json::Value,
+    outbound: &serde_json::Value,
+    profile: &config::CcProfile,
+) -> Vec<&'static str> {
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v.get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default()
+    };
+    let (declared, sent) = (names(inbound), names(outbound));
+    cc_tools_core(profile)
+        .iter()
+        .filter_map(|stub| stub.get("name")?.as_str())
+        .filter(|n| sent.iter().any(|s| s == n) && !declared.iter().any(|d| d == n))
+        .collect()
+}
+
+/// 来访一个工具都没声明：没有 `tools` 键、`tools: null` 或 `tools: []`。三种在上游眼里都是
+/// 「没有工具」，开关 `fill_absent_tools` 对它们一视同仁（[`cc_tools_to_inject`]）。
+pub(super) fn declares_no_tools(v: &serde_json::Value) -> bool {
+    match v.get("tools") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// 来访的 `tool_choice` 要求模型**必须**调工具（`any` 或指定某个工具）。配上「一个工具都没
+/// 声明」这条请求本来就不成立（上游 400）；替它补官方工具等于逼模型去调 Bash 之类，把客户端
+/// 自己的错误换成一次它接不住的工具调用。`auto` / `none` 不算。
+fn forces_tool_use(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("tool_choice").and_then(|c| c.get("type")).and_then(|t| t.as_str()),
+        Some("any" | "tool")
+    )
 }
 
 /// 这条请求是谁发的——**只用于日志**，让「某个客户端的 Bash 被换成官方声明了」对得回是谁。
@@ -2487,9 +2568,21 @@ fn same_schema_surface(client: &serde_json::Value, official: &serde_json::Value)
 fn inject_cc_tools(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,
+    fill_absent: bool,
     who: ToolAlignWho<'_>,
 ) -> bool {
-    let missing = cc_tools_to_inject(v, profile);
+    // 不带工具、且开关关着或来访强制调工具：整条不动。闸必须落在这里而不只在
+    // [`cc_tools_to_inject`] 里——下面的对齐不看缺哪几个，只要有 `tools` 数组就把 14 条排到开头，
+    // `tools: []` 会绕过那道判据被补满。
+    if declares_no_tools(v) && (!fill_absent || forces_tool_use(v)) {
+        return false;
+    }
+    let missing = cc_tools_to_inject(v, profile, fill_absent);
+    // 没带 `tools` 键或是 `null`、又要补：先按官方键序放一个空数组（`system` 之后，没有
+    // `system` 就跟 `messages`；`null` 原位换掉），下面照「全缺」对齐。补不出东西时不动。
+    if !missing.is_empty() && v.get("tools").is_none_or(|t| t.is_null()) {
+        insert_top_level(v, "tools", serde_json::json!([]), &["model", "messages", "system"]);
+    }
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
@@ -3077,11 +3170,7 @@ pub(super) fn text_block(text: &str, cache_control: serde_json::Value) -> serde_
 ///
 /// `version` 是这个来访**自报**的客户端版本（从它自己的 UA 里解出），补出来的
 /// `cc_version` 就用它，见 [`billing_header_text`]。
-fn ensure_cc_system_prefix(
-    v: &mut serde_json::Value,
-    version: Option<&str>,
-    kind: CcRequestKind,
-) -> bool {
+fn ensure_cc_system_prefix(v: &mut serde_json::Value, version: Option<&str>) -> bool {
     let has_billing = match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
             b.get("text")
@@ -3103,7 +3192,7 @@ fn ensure_cc_system_prefix(
         Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY_PREFIX),
         _ => false,
     };
-    let mut prefix = vec![text_block_bare(&billing_header_text(v, version, kind))];
+    let mut prefix = vec![text_block_bare(&billing_header_text(v, version))];
     if !has_identity {
         prefix.push(text_block_bare(config::CC_SYSTEM_IDENTITY));
     }
@@ -3932,6 +4021,7 @@ mod tests {
             redacted_thinking_retry: false,
             simulate_cc: false,
             simulate_full_system: false,
+            fill_absent_tools: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -4755,6 +4845,7 @@ mod tests {
                 redacted_thinking_retry: false,
                 simulate_cc: false,
                 simulate_full_system: false,
+                fill_absent_tools: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,
@@ -5404,6 +5495,7 @@ mod tests {
             redacted_thinking_retry: false,
             simulate_cc: false,
             simulate_full_system: false,
+            fill_absent_tools: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -5609,26 +5701,42 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"model":"claude-opus-5","messages":[]{tools}}}"#))
                 .unwrap()
         };
-        // 没有 tools 键：官方无工具 helper 的形态，一个都不注。
-        assert!(super::cc_tools_to_inject(&body(""), profile).is_empty());
-        // 空数组：全部 14 个。
-        assert_eq!(super::cc_tools_to_inject(&body(r#","tools":[]"#), profile), all);
+        // 不带工具的三种写法（没有键、null、空数组）一视同仁：开关关着一个都不注，开着全缺。
+        for tools in ["", r#","tools":null"#, r#","tools":[]"#] {
+            assert!(super::cc_tools_to_inject(&body(tools), profile, false).is_empty(), "{tools}");
+            assert_eq!(super::cc_tools_to_inject(&body(tools), profile, true), all, "{tools}");
+        }
+        // 不带工具却要求必须调工具（any / 指定工具）：不补，别逼模型去调注入的工具。
+        for choice in [r#"{"type":"any"}"#, r#"{"type":"tool","name":"x"}"#] {
+            let v = body(&format!(r#","tool_choice":{choice}"#));
+            assert!(super::cc_tools_to_inject(&v, profile, true).is_empty(), "{choice}");
+        }
+        // auto / none 照补：none 下模型本来就不会调。
+        for choice in [r#"{"type":"auto"}"#, r#"{"type":"none"}"#] {
+            let v = body(&format!(r#","tool_choice":{choice}"#));
+            assert_eq!(super::cc_tools_to_inject(&v, profile, true), all, "{choice}");
+        }
+        // 带了工具的请求与开关无关：照旧补缺。
+        let own = body(r#","tools":[{"name":"exec"}],"tool_choice":{"type":"any"}"#);
+        assert_eq!(super::cc_tools_to_inject(&own, profile, false), all);
+        // 怪值（不是数组也不是 null）不动。
+        assert!(super::cc_tools_to_inject(&body(r#","tools":{}"#), profile, true).is_empty());
         // 已带部分官方名：只补缺的，顺序仍是官方声明序。
         let partial = body(r#","tools":[{"name":"Skill"},{"name":"Bash"},{"name":"TaskCreate"}]"#);
         let expect: Vec<&str> =
             all.iter().copied().filter(|n| !["Skill", "Bash"].contains(n)).collect();
-        assert_eq!(super::cc_tools_to_inject(&partial, profile), expect);
+        assert_eq!(super::cc_tools_to_inject(&partial, profile, false), expect);
         // 14 个全声明了：不注。
         let full = body(&format!(
             r#","tools":[{}]"#,
             all.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
         ));
-        assert!(super::cc_tools_to_inject(&full, profile).is_empty());
+        assert!(super::cc_tools_to_inject(&full, profile, false).is_empty());
         // 只有第三方名：全部 14 个，与真正注进去的一致。
         let mut v = body(r#","tools":[{"name":"exec"},{"name":"read_file"}]"#);
-        let planned = super::cc_tools_to_inject(&v, profile);
+        let planned = super::cc_tools_to_inject(&v, profile, false);
         assert_eq!(planned, all);
-        assert!(super::inject_cc_tools(&mut v, profile, who()));
+        assert!(super::inject_cc_tools(&mut v, profile, false, who()));
         let injected: Vec<&str> = v["tools"]
             .as_array()
             .unwrap()
@@ -5639,6 +5747,127 @@ mod tests {
         assert_eq!(injected, planned, "注进去的名单必须就是判据给出的那份");
         // 客户端自己的工具仍在后面，一个没丢。
         assert_eq!(v["tools"].as_array().unwrap().len(), all.len() + 2);
+    }
+
+    /// 流水的注入统计按**出站**算：`tool_choice` 用 OpenAI 方言（`"required"` / `"any"` /
+    /// `{"type":"function"}`）写的无工具请求，归一成 `any` / `tool` 之后注入那一步不补，统计也
+    /// 必须是「没补」；拿来访原文预判会把它们误记成 `tools_filled`。`"auto"` 归一后照补。
+    #[test]
+    fn injection_stats_follow_the_rewritten_body_not_the_inbound_one() {
+        use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+        let flags = all_on();
+        let stats = |choice: &str| {
+            let raw = Bytes::from(format!(
+                r#"{{"model":"claude-sonnet-5","max_tokens":64,"tool_choice":{choice},"messages":[{{"role":"user","content":"hi"}}]}}"#
+            ));
+            let inbound: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let sim = detect_for(&raw, flags).unwrap();
+            let out: serde_json::Value = serde_json::from_slice(&rewrite_body(
+                &raw,
+                &test_cred(),
+                "fp",
+                flags,
+                Some(&sim),
+                None,
+            ))
+            .unwrap();
+            let injected = super::injected_tools_of(&inbound, &out, sim.profile);
+            (injected.len(), !injected.is_empty() && super::declares_no_tools(&inbound), out)
+        };
+        for choice in [
+            r#""required""#,
+            r#""any""#,
+            r#"{"type":"function"}"#,
+            r#"{"type":"function","function":{"name":"x"}}"#,
+        ] {
+            let (n, filled, out) = stats(choice);
+            assert!(out.get("tools").is_none(), "{choice}: 强制调工具不补: {out}");
+            assert_eq!((n, filled), (0, false), "{choice}: 统计按出站，不记 tools_filled");
+        }
+        let (n, filled, _) = stats(r#""auto""#);
+        assert_eq!((n, filled), (14, true), "auto 归一后照补，统计也记上");
+        // 自带工具只被补缺的：有注入名单，但不是 `tools_filled`。
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":64,"tools":[{"name":"exec","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let inbound: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let sim = detect_for(&raw, flags).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            flags,
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(super::injected_tools_of(&inbound, &out, sim.profile).len(), 14);
+        assert!(!super::declares_no_tools(&inbound));
+    }
+
+    /// 开关 `fill_absent_tools`：来访整个没带 `tools` 时，开着（默认）就在官方键序里
+    /// （`system` 之后）补一个 14 条官方工具的数组，流水那侧的注入名单与之一致；关着则
+    /// 出站没有 `tools` 键。
+    #[test]
+    fn tool_less_requests_get_the_official_tools_only_when_the_switch_is_on() {
+        use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let on = all_on();
+        assert!(on.fill_absent_tools, "测试夹具里这项默认开");
+        let sim = detect_for(&raw, on).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", on, Some(&sim), None))
+                .unwrap();
+        let names: Vec<&str> =
+            v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let all: Vec<&str> = crate::proxy::cc_tools_core(sim.profile)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, all, "按官方声明序补齐 14 个");
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(at("system") < at("tools") && at("tools") < at("metadata"), "官方键序: {keys:?}");
+        assert!(v.get("tool_choice").is_none(), "不补 tool_choice（接受模型会调用的风险）");
+        let body_in: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            super::cc_tools_to_inject(&body_in, sim.profile, sim.fill_absent_tools),
+            all,
+            "流水认注入工具的名单与真正注进去的一致"
+        );
+
+        let off = store::ForwardFlags { fill_absent_tools: false, ..all_on() };
+        let sim = detect_for(&raw, off).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", off, Some(&sim), None))
+                .unwrap();
+        assert!(v.get("tools").is_none(), "关着不凭空造 tools: {v}");
+
+        // `tools: null` 原位换成官方数组；`tools: []` 关着开关时保持空数组。
+        let null = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":null}"#,
+        );
+        let sim = detect_for(&null, on).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&null, &test_cred(), "fp", on, Some(&sim), None))
+                .unwrap();
+        assert_eq!(v["tools"].as_array().map(Vec::len), Some(all.len()), "{v}");
+        let empty = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+        );
+        let sim = detect_for(&empty, off).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &empty,
+            &test_cred(),
+            "fp",
+            off,
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(v["tools"], serde_json::json!([]), "关着时空数组也不补: {v}");
     }
 
     /// 同名替换保留客户端显式写的 `eager_input_streaming`：opus 资产带 true，客户端 Read 写了
@@ -5662,7 +5891,7 @@ mod tests {
                     {"name": "Bash", "description": "mine", "input_schema": {"type": "object"}}
                 ]
             });
-            assert!(super::inject_cc_tools(&mut v, profile, who()));
+            assert!(super::inject_cc_tools(&mut v, profile, false, who()));
             let tools = v["tools"].as_array().unwrap();
             let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
             let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
@@ -5720,10 +5949,10 @@ mod tests {
             "model": "claude-opus-5", "messages": [],
             "tools": [{"name": "my_tool", "input_schema": {"type": "object"}}, client_read, client_bash, {"name": "TaskCreate", "input_schema": {"type": "object"}}]
         });
-        let planned = super::cc_tools_to_inject(&v, profile);
+        let planned = super::cc_tools_to_inject(&v, profile, false);
         assert!(!planned.contains(&"Read") && !planned.contains(&"Bash"), "{planned:?}");
         assert_eq!(planned.len(), 12, "14 个里客户端已有 Read / Bash 两个");
-        assert!(super::inject_cc_tools(&mut v, profile, who()));
+        assert!(super::inject_cc_tools(&mut v, profile, false, who()));
         let tools = v["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // 头部是完整的 14 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
@@ -5767,8 +5996,8 @@ mod tests {
         declared.push(serde_json::json!({"name": "my_tool", "input_schema": {"type": "object"}}));
         let mut v =
             serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": declared});
-        assert!(super::cc_tools_to_inject(&v, profile).is_empty(), "一个都不缺");
-        assert!(super::inject_cc_tools(&mut v, profile, who()), "次序与键序都要改");
+        assert!(super::cc_tools_to_inject(&v, profile, false).is_empty(), "一个都不缺");
+        assert!(super::inject_cc_tools(&mut v, profile, false, who()), "次序与键序都要改");
         let tools = v["tools"].as_array().unwrap();
         assert_eq!(
             serde_json::to_string(&tools[..14]).unwrap(),
@@ -5777,7 +6006,7 @@ mod tests {
         );
         assert_eq!(tools[14]["name"], "my_tool");
         // 已经是官方形态的再过一遍什么都不动。
-        assert!(!super::inject_cc_tools(&mut v, profile, who()));
+        assert!(!super::inject_cc_tools(&mut v, profile, false, who()));
     }
 
     /// Windows 那种**扁平** `metadata.user_id` 同样要认，额度探测复用它的**原文**。
@@ -6749,7 +6978,7 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = crate::proxy::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 277)), "官方那串");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 280)), "官方那串");
         assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6817,6 +7046,36 @@ mod tests {
         );
     }
 
+    /// 按模型的版本闸：低于该模型首发版本的 CC 来访才拦；`opus-5-5` 要按最长前缀落到
+    /// 2.1.280，不能被 `opus-5` 那条 2.1.219 截胡；非 CC、表外模型一律放行。
+    #[test]
+    fn model_min_cc_version_gate() {
+        let gate = crate::proxy::below_model_min_cc_version;
+        let v277 = "claude-cli/2.1.277 (external, cli)";
+        let v280 = "claude-cli/2.1.280 (external, cli)";
+
+        assert_eq!(
+            gate(v277, "claude-opus-5-5"),
+            Some(("2.1.277".to_string(), "2.1.280")),
+            "opus-5-5 最低 2.1.280"
+        );
+        assert!(gate(v277, "claude-opus-5-5[1m]").is_some(), "带 [1m] 后缀同样按前缀认");
+        assert!(gate(v277, "Claude-Opus-5-5").is_some(), "大小写不影响");
+        assert!(gate(v280, "claude-opus-5-5").is_none(), "正好等于首发版本放行");
+        assert!(gate(v277, "claude-opus-5").is_none(), "opus-5 自 2.1.219 起就有");
+        assert!(gate("claude-cli/2.1.256", "claude-fable-5-1").is_some(), "fable-5-1 最低 2.1.257");
+        assert!(gate("claude-cli/2.1.257", "claude-fable-5-1").is_none());
+        assert!(gate("claude-cli/2.1.256", "claude-fable-5").is_none(), "fable-5 自 2.1.170 起");
+        assert!(gate("claude-cli/2.1.169", "claude-fable-5").is_some());
+        assert!(
+            gate("claude-cli/2.1.200", "claude-mythos-5-1").is_some(),
+            "mythos-5-1 与 fable-5-1 同代"
+        );
+        assert!(gate("claude-cli/2.1.100", "claude-haiku-4-5").is_none(), "表外模型不设限");
+        assert!(gate("python-httpx/0.27.0", "claude-opus-5-5").is_none(), "非 CC 客户端不受管");
+        assert!(gate("-", "claude-opus-5-5").is_none(), "没带 UA 放行");
+    }
+
     /// 出站 URL 上那个 `?beta=true`：官方 `cap/raw` 八份抓包的请求行全带，Anthropic 公开 API
     /// 里却没有这个参数——它是 CC 客户端自己的标记，故只在模拟路径上补。
     #[test]
@@ -6874,6 +7133,7 @@ mod tests {
         let only_stream = store::ForwardFlags {
             simulate_cc: false,
             simulate_full_system: false,
+            fill_absent_tools: false,
             spoof_identity: false,
             system_shape: false,
             billing_cch: false,

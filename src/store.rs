@@ -2493,6 +2493,9 @@ impl CredentialStore {
         if let Some(v) = on(SIMULATE_FULL_SYSTEM) {
             flags.simulate_full_system = v;
         }
+        if let Some(v) = on(FILL_ABSENT_TOOLS) {
+            flags.fill_absent_tools = v;
+        }
         if let Some(v) = on(FILL_METADATA) {
             flags.fill_metadata = v;
         }
@@ -2768,6 +2771,10 @@ pub const SIMULATE_CC: &str = "simulate_cc";
 /// 见 [`ForwardFlags::simulate_full_system`]。
 pub const SIMULATE_FULL_SYSTEM: &str = "simulate_full_system";
 
+/// 模拟路径是否给不带 `tools` 的来访也补官方工具的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::fill_absent_tools`]。
+pub const FILL_ABSENT_TOOLS: &str = "fill_absent_tools";
+
 /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，是否补一份官方形态身份的 settings 键名。
 /// 缺省视为开启：官方**每条**请求都带那个字段，缺了就是一处白给的判据。
 pub const FILL_METADATA: &str = "fill_metadata";
@@ -3013,6 +3020,18 @@ pub struct ForwardFlags {
     /// - **关**：这一块不发，出站 `system` 只剩 `[billing, 身份, 基座]` 加客户端那块（haiku 实测
     ///   385 token，开着是 2978），不注入任何环境信息，客户端的 system 也不被官方提示词稀释。
     pub simulate_full_system: bool,
+    /// 模拟路径上来访**一个工具都没声明**（没有 `tools` 键、`tools: null`、`tools: []`）时，也按
+    /// 主线程补齐官方工具（[`Self::simulate_cc`] 的子项）；来访 `tool_choice` 是 `any` / 指定工具
+    /// 时不补。
+    ///
+    /// - **开**（默认）：补上那 14 个官方工具。模拟路径只发主线程 profile，官方主线程一条不带
+    ///   工具的样本都没有（`cap/2.1.280` 恒为 19 / 20 个），「主线程的 beta 与 system、零个工具」
+    ///   是官方不产生的组合。代价两条：这类来访多半是没有工具循环的纯聊天客户端，模型调了注入
+    ///   的工具时它拿到的是一个处理不了的 `tool_use`（流水 `rewrites` 列：补了的打 `tools_filled`，
+    ///   真调了再打 `injected_tool_called`，两者一比是命中率）；每个新会话首轮多付约两万 token 的工具声明写入价，之后走缓存读价。
+    /// - **关**：不带工具的请求一个工具都不注（空数组原样发出）。自己带了工具的两种取值下都补缺。
+    ///   luban 自己的连通性探测不受这项管，恒补。
+    pub fill_absent_tools: bool,
     /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，补一份官方形态的身份
     /// （见 [`crate::proxy::bare_session_id`]）。
     pub fill_metadata: bool,
@@ -3236,6 +3255,7 @@ impl Default for ForwardFlags {
             redacted_thinking_retry: true,
             simulate_cc: true,
             simulate_full_system: true,
+            fill_absent_tools: true,
             fill_metadata: true,
             rate_limit_retry: true,
             cache_scope_global: true,
@@ -10525,6 +10545,7 @@ mod tests {
             (THINKING_SIGNATURE_RETRY, "0"),
             (SIMULATE_CC, "0"),
             (SIMULATE_FULL_SYSTEM, "0"),
+            (FILL_ABSENT_TOOLS, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
@@ -10569,6 +10590,7 @@ mod tests {
                 redacted_thinking_retry: false,
                 simulate_cc: false,
                 simulate_full_system: false,
+                fill_absent_tools: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,

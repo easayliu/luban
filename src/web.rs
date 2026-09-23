@@ -2387,6 +2387,8 @@ struct ForwardingResp {
     simulate_cc: bool,
     /// 模拟路径补齐官方 `system` 第四块（[`Self::simulate_cc`] 的子项）。
     simulate_full_system: bool,
+    /// 模拟路径给不带 `tools` 的来访也补官方工具（[`Self::simulate_cc`] 的子项）。
+    fill_absent_tools: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
     fill_metadata: bool,
     /// 上游回 429 时给该号打冷却并换号重试。
@@ -2450,6 +2452,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             redacted_thinking_retry: f.redacted_thinking_retry,
             simulate_cc: f.simulate_cc,
             simulate_full_system: f.simulate_full_system,
+            fill_absent_tools: f.fill_absent_tools,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
             cache_scope_global: f.cache_scope_global,
@@ -3186,6 +3189,7 @@ struct SetForwardingReq {
     redacted_thinking_retry: Option<bool>,
     simulate_cc: Option<bool>,
     simulate_full_system: Option<bool>,
+    fill_absent_tools: Option<bool>,
     fill_metadata: Option<bool>,
     rate_limit_retry: Option<bool>,
     cache_scope_global: Option<bool>,
@@ -3218,9 +3222,9 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        API_TELEMETRY, EAGER_TOOL_STREAMING, FABLE_REFUSAL_FALLBACK, FILL_CLIENT_HEADERS,
-        FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING,
-        KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
+        API_TELEMETRY, EAGER_TOOL_STREAMING, FABLE_REFUSAL_FALLBACK, FILL_ABSENT_TOOLS,
+        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
+        INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
         OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY,
         REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_PROBES_STRICT,
         REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIMULATE_CC, SIMULATE_FULL_SYSTEM,
@@ -3242,6 +3246,7 @@ async fn set_forwarding(
         (REDACTED_THINKING_RETRY, req.redacted_thinking_retry),
         (SIMULATE_CC, req.simulate_cc),
         (SIMULATE_FULL_SYSTEM, req.simulate_full_system),
+        (FILL_ABSENT_TOOLS, req.fill_absent_tools),
         (FILL_METADATA, req.fill_metadata),
         (RATE_LIMIT_RETRY, req.rate_limit_retry),
         (SYSTEM_CACHE_SCOPE, req.cache_scope_global),

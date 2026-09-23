@@ -1044,6 +1044,7 @@ mod tests {
             redacted_thinking_retry: false,
             simulate_cc: false,
             simulate_full_system: false,
+            fill_absent_tools: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -1334,7 +1335,8 @@ mod tests {
         assert_eq!(beta.matches("server-side-fallback-").count(), 1, "{beta}");
         let idx = |b: &str| beta.split(',').position(|p| p.starts_with(b)).unwrap();
         assert!(idx("effort-") < idx("server-side-fallback-"), "{beta}");
-        assert!(idx("server-side-fallback-") < idx("fallback-credit-"), "{beta}");
+        // 2.1.280 的 opus 不发 `fallback-credit` 了，`effort` 下一格是 `dangerous-tool-use`。
+        assert!(idx("server-side-fallback-") < idx("dangerous-tool-use-"), "{beta}");
         let without = crate::proxy::build_forward_headers_for(
             &crate::proxy::HeaderMap::new(),
             "tok",
@@ -1355,49 +1357,49 @@ mod tests {
     }
 
     /// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
-    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.277`
-    /// 四族主线程的**会话首轮**，去掉动态的 `afk-mode`。
+    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.280`
+    /// 非 auto 模式那段的主线程（haiku 只有 auto 段样本，它在两种模式下形态本就一致）。
     ///
     /// 四族分开验：haiku 不发 `mid-conversation-*`/`effort` 且 `claude-code-20250219` 在**串
-    /// 中间**；fable 用 `per-turn-control`、不带 `message-threads`；opus 多 `context-1m`；
-    /// opus / fable 多 `mid-conversation-tool-changes`。共用一份种子串就会给某一族发出真实
-    /// 客户端不产生的排列。2.1.277 四族都有真样本，不再有外推行。
+    /// 中间**；四族队尾都是 `message-threads`；opus 多 `context-1m`；opus / fable 多 `per-turn-control`
+    /// 与 `mid-conversation-tool-changes`。共用一份种子串就会给某一族发出真实客户端不产生的排列。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.277/00357（opus-5 直连）。
+        // cap/2.1.280/00065（opus-5-5 直连，非 auto 模式）。
         const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
              context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-             mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
-             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+             per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+             mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+             dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
              cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-        // cap/2.1.277/00023（fable-5-1 直连），去掉 afk-mode。
+        // cap/2.1.280/00068（fable-5-1 直连，非 auto 模式）。
         const OFFICIAL_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,\
              mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
              advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
-             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+             effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
-             cache-diagnosis-2026-04-07";
-        // cap/2.1.277/00031（sonnet-5 直连，会话首轮），去掉 afk-mode。
+             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+        // cap/2.1.280/00073（sonnet-5 直连，非 auto 模式，`thread: create`）。
         const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
              interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
              advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
-             effort-2025-11-24,fallback-credit-2026-06-01,thinking-binding-controls-2026-08-01,\
+             effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
              thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
              cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-        // cap/2.1.277/00046（haiku-4.5 直连，会话首轮）。
+        // cap/2.1.280/00038（haiku-4.5 直连，`thread: create`）。
         const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,fallback-credit-2026-06-01,\
+             advanced-tool-use-2025-11-20,dangerous-tool-use-2026-09-03,\
              thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
              extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
              message-threads-2026-08-12";
@@ -1458,12 +1460,15 @@ mod tests {
             ),
         ];
         for (kind, cap, official) in cases {
-            let p = config::cc_profile(*kind);
+            let p = config::cc_profile_at(*kind, Some((2, 1, 277)));
             assert_eq!(p.version, "2.1.277", "{kind:?}");
             assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
         }
-        // 每个 2.1.277 主线程 profile 的 `oauth` 都由 simulated_beta 落到官方位置：以 claude-code
-        // 开头的紧随其后，haiku 排在最前（cap/2.1.277/00046 头两项 `oauth,interleaved`）。
+        // 2.1.280 的额度探测（`cap/2.1.280/00008`）与 2.1.277 逐字相同。
+        let quota = config::cc_profile(QuotaProbe);
+        assert_eq!((quota.version, quota.beta), ("2.1.280", cases[2].2));
+        // 每个 2.1.280 主线程 profile 的 `oauth` 都由 simulated_beta 落到官方位置：以 claude-code
+        // 开头的紧随其后，haiku 排在最前（cap/2.1.280/00038 头两项 `oauth,interleaved`）。
         assert!(
             crate::proxy::simulated_beta(config::cc_profile(MainHaiku).beta, None)
                 .starts_with("oauth-2025-04-20,interleaved-thinking-2025-05-14,")
@@ -1531,26 +1536,31 @@ mod tests {
         }
     }
 
-    /// [`merge_beta`] 对一条**完整的** 2.1.277 订阅端串必须幂等：参照串取 2.1.277 表，
-    /// `server-side-fallback` 四族都不在参照里、不补；`fallback-credit` / `display-updates` /
-    /// `cache-diagnosis` / `extended-cache-ttl` 都已在位。参照选错一版就会把 2.1.260 才有的
-    /// `server-side-fallback` 塞回来。
+    /// [`merge_beta`] 对一条**完整的** 2.1.277 / 2.1.280 订阅端串必须幂等：参照串按来访版本
+    /// 取那一版的表，`server-side-fallback` 四族都不在参照里、不补；2.1.277 的 `fallback-credit`
+    /// 已在位，2.1.280 的参照里没有它、也不补。参照选错一版就会把上一版才有的项塞回来——
+    /// 2.1.280 的串拿 2.1.277 表去补，就会在 `effort` 后面多出一个 `fallback-credit`。
     #[test]
-    fn merged_beta_is_idempotent_on_2_1_277_main_threads() {
+    fn merged_beta_is_idempotent_on_2_1_277_and_2_1_280_main_threads() {
         use config::CcProfileKind::*;
-        for (kind, model) in [
-            (MainOpus, "claude-opus-5"),
-            (MainFable, "claude-fable-5-1"),
-            (MainSonnet, "claude-sonnet-5"),
-            (MainHaiku, "claude-haiku-4-5-20251001"),
-        ] {
-            let official = crate::proxy::simulated_beta(config::cc_profile(kind).beta, None);
-            assert_eq!(
-                merge_beta(Some(&official), Some(model), Some((2, 1, 277))),
-                official,
-                "{kind:?}: 完整的 2.1.277 官方串过 merge_beta 不该多一项"
-            );
-            assert!(!official.contains("server-side-fallback"), "{kind:?}");
+        for version in [(2, 1, 277), (2, 1, 280)] {
+            for (kind, model) in [
+                (MainOpus, "claude-opus-5"),
+                (MainFable, "claude-fable-5-1"),
+                (MainSonnet, "claude-sonnet-5"),
+                (MainHaiku, "claude-haiku-4-5-20251001"),
+            ] {
+                let official = crate::proxy::simulated_beta(
+                    config::cc_profile_at(kind, Some(version)).beta,
+                    None,
+                );
+                assert_eq!(
+                    merge_beta(Some(&official), Some(model), Some(version)),
+                    official,
+                    "{kind:?} {version:?}: 完整的官方串过 merge_beta 不该多一项"
+                );
+                assert!(!official.contains("server-side-fallback"), "{kind:?}");
+            }
         }
     }
 

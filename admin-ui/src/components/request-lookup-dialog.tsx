@@ -336,6 +336,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('剥掉 prefill 重试', 'Retried without prefill')
     case 'injected_tool_called':
       return t('模型调了注入的 CC 工具，客户端未声明', 'Model called an injected CC tool the client never declared')
+    case 'tools_filled':
+      return t('来访不带工具，已补官方工具', 'Request had no tools; official tools were added')
     default:
       return tag
   }

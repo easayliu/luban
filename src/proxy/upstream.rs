@@ -8,7 +8,10 @@ use crate::store;
 use crate::web::AppState;
 
 use super::ban::parse_upstream_error;
-use super::body::{ToolNameMap, restore_tool_names_stream, rewrite_body_out, trusted_cc_version};
+use super::body::{
+    ToolNameMap, declares_no_tools, injected_tools_of, restore_tool_names_stream, rewrite_body_out,
+    trusted_cc_version,
+};
 use super::headers::{is_resp_forwardable, orig_header_case};
 use super::logging::{ReqLog, ShapeBits, UsageSniffer, shape_summary_of};
 use super::rate_limit::RateLimitInfo;
@@ -107,10 +110,15 @@ impl Upstream<'_> {
         inbound: Option<&serde_json::Value>,
     ) -> (Bytes, ShapeBits) {
         let (sent, outbound) = self.shape_with(body, cred, device_fp, self.refusal_fallbacks);
-        let bits = match outbound.as_ref().or(inbound) {
+        let mut bits = match outbound.as_ref().or(inbound) {
             Some(v) => shape_summary_of(v),
             None => ShapeBits::default(),
         };
+        // 注入了哪些工具按**出站**对来访算：改写没动体（`outbound` 为 `None`）就是一个没注。
+        if let (Some(sim), Some(inb), Some(out)) = (self.sim.as_ref(), inbound, outbound.as_ref()) {
+            bits.injected_tools = injected_tools_of(inb, out, sim.profile);
+            bits.tools_filled = !bits.injected_tools.is_empty() && declares_no_tools(inb);
+        }
         (sent, bits)
     }
 
@@ -1113,6 +1121,7 @@ mod tests {
                 app_key: None,
                 empty_replies: Default::default(),
                 injected_tools: Vec::new(),
+                tools_filled: false,
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1204,6 +1213,7 @@ mod tests {
                 app_key: prompt.map(|(m, d)| (m.to_string(), format!("app-{d}"))),
                 empty_replies: mem.clone(),
                 injected_tools: Vec::new(),
+                tools_filled: false,
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1465,6 +1475,7 @@ mod tests {
                 app_key: None,
                 empty_replies: Default::default(),
                 injected_tools: Vec::new(),
+                tools_filled: false,
                 store: store.clone(),
                 _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
                 _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(
@@ -1528,6 +1539,7 @@ mod tests {
             app_key: None,
             empty_replies: Default::default(),
             injected_tools: injected,
+            tools_filled: false,
             store: store.clone(),
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
@@ -1561,14 +1573,34 @@ data: {\"type\":\"message_stop\"}
         let mut rl = build(Vec::new());
         rl.sniffer.feed(&reply("Bash"));
         drop(rl);
+        // 来访没带工具、替它补了（`fill_absent_tools`）：打 `tools_filled`；模型真调了注入的
+        // 工具再加一个 `injected_tool_called`。
+        let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
+        rl.tools_filled = true;
+        rl.sniffer.feed(&reply("mcp__luban__query_bas00"));
+        drop(rl);
+        let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
+        rl.tools_filled = true;
+        rl.sniffer.feed(&reply("Bash"));
+        drop(rl);
 
         let logs = store.list_usage_logs(10).unwrap();
-        assert_eq!(logs.len(), 3);
+        assert_eq!(logs.len(), 5);
         // list 按时间倒序：最后写入的在前。
         let tags: Vec<Option<&str>> =
             logs.iter().rev().map(|l| l.forensics.rewrites.as_deref()).collect();
-        assert_eq!(tags, [Some("injected_tool_called"), None, None], "{tags:?}");
-        assert_eq!(logs[2].status, 200, "标签不改状态码与记账");
+        assert_eq!(
+            tags,
+            [
+                Some("injected_tool_called"),
+                None,
+                None,
+                Some("tools_filled"),
+                Some("injected_tool_called,tools_filled"),
+            ],
+            "{tags:?}"
+        );
+        assert_eq!(logs[4].status, 200, "标签不改状态码与记账");
     }
 
     /// 改口报错：客户端已经收到 200 头，改不动，但**记账**要按真实结果走。
@@ -1609,6 +1641,7 @@ data: {\"type\":\"message_stop\"}
             app_key: None,
             empty_replies: Default::default(),
             injected_tools: Vec::new(),
+            tools_filled: false,
             store: store.clone(),
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
@@ -1695,6 +1728,7 @@ data: {\"type\":\"message_stop\"}
             app_key: None,
             empty_replies: Default::default(),
             injected_tools: Vec::new(),
+            tools_filled: false,
             store: store.clone(),
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
@@ -2154,6 +2188,7 @@ data: {\"type\":\"message_stop\"}
             app_key: None,
             empty_replies: Default::default(),
             injected_tools: Vec::new(),
+            tools_filled: false,
             store,
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),

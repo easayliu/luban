@@ -13,8 +13,8 @@ use super::ban::{
     parse_upstream_error,
 };
 use super::body::{
-    below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
-    cc_tools_to_inject, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
+    below_min_client_version, below_model_min_cc_version, body_has_user_id, build_tool_name_map,
+    cc_cli_version, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
     extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
     known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
     remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
@@ -291,6 +291,29 @@ pub(super) async fn handle_inner(
             kind,
             req_model.as_deref(),
             body_json.as_ref().is_some_and(stream_requested),
+        );
+    }
+
+    // 2.1b) 按模型的最低客户端版本闸：自报 `claude-cli/<版本>` 早于该模型首发版本的来访
+    //       （如 2.1.277 请求 `claude-opus-5-5`，官方 2.1.280 才加上它）本地直接拒，判定见
+    //       [`below_model_min_cc_version`]。官方客户端在那之前不认识这个模型，透传出去就是
+    //       一条官方绝不产生的「版本 + 模型」组合。回 400 而非 1.5 那道闸的 403：这只是这一个
+    //       模型用不了，换个模型照常能发，不该让下游中转把整个 key 当成被封摘掉。
+    if let Some(model) = req_model.as_deref()
+        && let Some((got, want)) = below_model_min_cc_version(&client_ua, model)
+    {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua, %model, %got, %want,
+            "rejected: client version is older than the first Claude Code release that supports this model"
+        );
+        *log_state.local_reject.lock() = Some("model-min-version");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "Claude Code {got} does not support {model}; upgrade to {want} or newer \
+                 (npm i -g @anthropic-ai/claude-code)"
+            ),
         );
     }
 
@@ -1658,6 +1681,11 @@ pub(super) async fn handle_inner(
             };
             // 形态摘要在改写那一步就算好了（`sent_bits`），这里只是把它安上：走查加 sha256
             // 0.6ms，且不必留着任何东西到收尾——出站体与它的解析态都在改写返回时就散了。
+            // 注入了哪些工具、是不是替无工具来访补的：改写那一步按**出站体**对来访算好
+            // （[`Upstream::shape_outbound`]），不在这里拿来访原文预判——`tool_choice:
+            // "required"` 这类方言要先归一才知道补不补。
+            let injected_tools = sent_bits.injected_tools.clone();
+            let tools_filled = sent_bits.tools_filled;
             fill_shape_forensics(&mut forensics, sent_bits);
             let mut rl = ReqLog {
                 started,
@@ -1712,14 +1740,8 @@ pub(super) async fn handle_inner(
                     None
                 },
                 empty_replies: state.empty_replies.clone(),
-                // 只有模拟主线程 profile 会注；判据与 [`inject_cc_tools`] 同源。
-                injected_tools: upstream
-                    .sim
-                    .as_ref()
-                    .filter(|s| s.profile.has_billing_header())
-                    .zip(body_json.as_ref())
-                    .map(|(s, b)| cc_tools_to_inject(b, s.profile))
-                    .unwrap_or_default(),
+                injected_tools,
+                tools_filled,
                 store: state.store.clone(),
                 _in_flight: in_flight,
                 _session_concurrency: session_concurrency_guard,

@@ -681,6 +681,7 @@ async fn send_quota_probe(
         reason: SimulationReason::Probe,
         // 官方那条没有 `system`，自然也没有第四块。
         rest: None,
+        fill_absent_tools: false,
     };
     let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
@@ -774,6 +775,9 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
         // 探测不补第四块：它一句 `ping` 就完，没有客户端 system 要安置，多一万字节的前缀只是
         // 多付一次写入价；转发路径的形态由 [`Simulation::detect`] 管。
         rest: None,
+        // 探测体是 `tools: []`（[`probe_body`]），一直靠注入补齐官方工具、验的正是主线程链路；
+        // 这是 luban 自己发的，不受 `fill_absent_tools` 开关管。
+        fill_absent_tools: true,
     }
 }
 

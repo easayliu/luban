@@ -11,7 +11,7 @@ use super::body::{
 };
 use super::headers::has_beta;
 use super::session_id::{incoming_session_id, pin_session_id, session_id_for};
-use super::session_link::{CcRequestKind, CcSessionKey, CcSessionLink};
+use super::session_link::{CcSessionKey, CcSessionLink};
 use super::{
     QUOTA_PROBE_MODEL, count_cache_control, inbound_beta_list, insert_top_level,
     is_quota_probe_shaped, request_max_tokens,
@@ -72,6 +72,10 @@ pub(super) struct Simulation {
     /// 不出来（没有模板或没有那行模型名，[`cc_system_rest`]）、或这个 profile 本来就不带
     /// `system`。客户端自己的 system 不掺进这一段，它单独占末块（见 [`simulate_system`]）。
     pub(super) rest: Option<String>,
+    /// 来访**整个没带 `tools` 键**时也按主线程补齐官方工具（开关 `fill_absent_tools`，见
+    /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
+    /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
+    pub(super) fill_absent_tools: bool,
 }
 
 /// 一条请求被模拟路径接管的原因：[`simulates_cc`] 要求 UA 可信、身份合法、形态完整三样
@@ -189,7 +193,15 @@ impl Simulation {
             });
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
-        Some(Self { base: cc_system_base(model), profile, session_id, link, reason, rest })
+        Some(Self {
+            base: cc_system_base(model),
+            profile,
+            session_id,
+            link,
+            reason,
+            rest,
+            fill_absent_tools: flags.fill_absent_tools,
+        })
     }
 }
 
@@ -482,7 +494,7 @@ fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 这个模型名是不是 Claude Code 认识的四族（opus / fable / sonnet / haiku）之一。2.1.277 的
+/// 这个模型名是不是 Claude Code 认识的四族（opus / fable / sonnet / haiku）之一。2.1.277 起
 /// 基座与第四块四族**同一份**（[`config::CC_SYSTEM_BASE`]、[`config::CC_SYSTEM_REST`]），故
 /// 只需判「是不是这四族」；2.1.258 / 2.1.260 时三族各有各的基座，那张映射已经不需要了。
 fn is_claude_family(model: &str) -> bool {
@@ -490,14 +502,14 @@ fn is_claude_family(model: &str) -> bool {
     ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f))
 }
 
-/// 官方基座（2.1.277 四族同一份）；认不出的模型返回 `None`，只注入身份句——基座是逐字节从
+/// 官方基座（2.1.277 起四族同一份）；认不出的模型返回 `None`，只注入身份句——基座是逐字节从
 /// 抓包取的，给一个 `gpt-4o` 补 Claude Code 的基座比不补更糟。
 pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
     is_claude_family(model).then_some(config::CC_SYSTEM_BASE)
 }
 
 /// 官方第四块里 `You are powered by the model named {name}. The exact model ID is {id}.` 与
-/// 官方第四块的模板（2.1.277 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
+/// 官方第四块的模板（2.1.280 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
 /// 知识截止，2.1.277 的第四块不再写这些，只剩记忆目录一处随机器变。
 pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
@@ -785,7 +797,7 @@ fn is_segment(s: &str) -> bool {
 }
 
 /// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
-/// 2.1.277 只剩 `# Memory` 那条记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`。
+/// 2.1.277 起只剩记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`（2.1.280 那一节改名 `# auto memory`）。
 pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
     template.replace("{{cwd_slug}}", &env.slug).replace("{{home}}", &env.home)
 }
@@ -1066,7 +1078,7 @@ pub(super) fn simulate_system(
     let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
     let mut blocks = vec![
-        text_block_bare(&simulated_billing_header_text(sim)),
+        text_block_bare(&simulated_billing_header_text(v, sim)),
         text_block_bare(config::CC_SYSTEM_IDENTITY),
     ];
     if sim.profile.system == config::CcSystemShape::IdentityReporting {
@@ -1329,30 +1341,15 @@ pub(super) fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 /// （[`ensure_cc_system_prefix`]）。`cch` 不在这里补——那是 [`ensure_billing_cch`] 的活。
 ///
 /// `cc_version` 的第四段（如 `76b`）由 [`cc_version_suffix`] 从请求 body 动态派生，
-/// 算法逆向自 2.1.251：取第一条用户消息 text 的第 4/7/20 位字符，拼上固定 salt 与
-/// 主版本号后 SHA-256 取前 3 个 hex 字符。模拟路径不走这条，见
-/// [`simulated_billing_header_text`]。
+/// 与模拟路径（[`simulated_billing_header_text`]）同一套算法。
 ///
 /// **主版本取来访自报的那个**（`version`，由调用方从 UA 里解出），不是
 /// [`config::CC_VERSION_BASE`]：给一个 UA 写着 2.1.258 的来访补一条 `cc_version=2.1.260.…`
 /// 的 billing header，就是把两个版本混进了同一条请求。解不出版本（UA 缺失或不是
 /// `claude-cli/x.y.z` 形态）才退回 luban 自己那个。
-pub(super) fn billing_header_text(
-    v: &serde_json::Value,
-    version: Option<&str>,
-    kind: CcRequestKind,
-) -> String {
+pub(super) fn billing_header_text(v: &serde_json::Value, version: Option<&str>) -> String {
     let version = version.unwrap_or(config::CC_VERSION_BASE);
-    // **2.1.260 起用 profile 的固定后缀**，派生算法只留给更老的版本。
-    //
-    // 那套算法逆向自 2.1.251，在 2.1.260 上**已被证否**：六个 profile 各有固定后缀
-    // （`222`/`bcd`/`660`/`d95`/`ced`/`3de`），而算法对主线程样本算出的是 `11d`。给一个
-    // 2.1.260 的来访补一个算出来的后缀，等于发一个上游从没在这个版本上见过的值。
-    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
-    let suffix = match kind.billing_suffix_at(version, model) {
-        Some(fixed) => fixed.to_string(),
-        None => cc_version_suffix(v, version),
-    };
+    let suffix = cc_version_suffix(v, version);
     format!("x-anthropic-billing-header: cc_version={version}.{suffix}; cc_entrypoint=cli;")
 }
 
@@ -1369,15 +1366,16 @@ pub(super) fn billing_header_text(
 /// `cap/2.1.277/00023`：`…cch=X; cc_prompt_id=U; cc_turn_origin=human;`）。`cch` 在这里就一次写好，不再等
 /// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
 ///
-/// 第四段不再走 [`cc_version_suffix`] 那套派生算法：2.1.260 的六个 profile 各有各的固定
-/// 后缀（`222`/`bcd`/`660`/`d95`/`ced`/`3de`），派生算法对主线程样本算出的是 `11d`，
-/// 与哪一个都对不上。
-fn simulated_billing_header_text(sim: &Simulation) -> String {
+/// 第四段按 [`cc_version_suffix`] 从 `v`（此刻还是来访自己的 `messages`，客户端 system 还没
+/// 被 [`relocate_long_client_system`] 挪进首条消息）派生：同一个对话每轮首条消息不变，后缀也
+/// 就整段会话不变，与官方一致。此前写的是抓包那一个会话的值（2.1.277 的 `d56`），经 luban
+/// 的每一个模拟会话后缀都相同，而官方的后缀随会话首句变。
+fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> String {
     let p = sim.profile;
     let mut s = format!(
         "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch={};",
         p.version,
-        p.billing_suffix,
+        cc_version_suffix(v, p.version),
         cch_value(),
     );
     if p.subagent {
@@ -1395,8 +1393,9 @@ fn simulated_billing_header_text(sim: &Simulation) -> String {
     s
 }
 
-/// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251，2.1.258 未复核；模拟路径
-/// 已改为写死，只剩 [`billing_header_text`] 在用）。
+/// 官方 `cc_version` 第四段的派生算法（逆向自 claude-cli/2.1.251），模拟路径
+/// （[`simulated_billing_header_text`]）与给真 CC 补 billing header（[`billing_header_text`]）
+/// 两处共用。
 ///
 /// ```text
 /// salt    = "59cf53e54c78"
@@ -1404,17 +1403,23 @@ fn simulated_billing_header_text(sim: &Simulation) -> String {
 /// suffix  = sha256(salt + chars + VERSION_BASE).hex()[0..3]
 /// ```
 ///
-/// `text` 取的是 `messages` 里**第一条 `role:"user"` 消息**的**第一个 `type:"text"` 块**
-/// 的文本。官方客户端内部会跳过 `isMeta` 消息，但在实际请求 body 里这等价于第一条 user
-/// 消息的第一个 text 块（harness 注入的 system-reminder 也在同一个 user turn 的 content
-/// 数组里，排在用户实际输入之前）。
+/// `text` 取的是 `messages` 里**第一条 `role:"user"` 消息**中**第一个非 meta 的 `type:"text"`
+/// 块**——官方客户端跳过 `isMeta` 消息，落到请求 body 里就是跳过 harness 塞在同一个 user
+/// turn 最前面的 `<system-reminder>…` 与 `<local-command-caveat>…` 块，取用户真正敲的那一句
+/// （[`first_user_text`]）。
 ///
 /// `version` 参与摘要，故它必须是**这条请求自报的**版本，与 `cc_version` 前三段同值。
 ///
-/// 这套算法在 2.1.260 上**已被证否**：六个 profile 的后缀是固定的
-/// （`222`/`bcd`/`660`/`d95`/`ced`/`3de`，见 [`config::CC_PROFILES`]），而算法对主线程样本
-/// 算出 `11d`。它只剩「给 2.1.251 一代的来访补一个形状对的值」这一个用途，比不补强，
-/// 但别再拿它去解释 2.1.260 的抓包。
+/// **它没有被证否。** 2.1.260 ~ 2.1.277 曾以为后缀逐 profile 定死（`222` / `bcd` / `d56` …），
+/// 因为当时拿的是「第一个 text 块」——那恒为 `<system-reminder>` 开头，算出来是 `11d` 之类，
+/// 对不上。跳过 meta 块之后，`cap/` 里 41 条非续轮主线程请求全部命中：`hilew` → 2.1.280 的
+/// `bc5`，`审查下性能优化的问题` → 2.1.277 的 `d56`，`<command-name>/commit-commands:commit…`
+/// → 2.1.260 的 `bcd`；标题生成、安全分类、无工具 helper 与 2.1.260 的子代理同样命中。
+/// 抓包里那几个「固定值」只是同一会话首句相同。
+///
+/// 仍对不上的两类，都不是模拟路径会发的形态：message-threads **续轮**（只发新增消息，首句
+/// 不在体里，后缀沿用会话首轮那个）与 2.1.277 的 workflow 子代理（`385`，恰是对空串算的）。
+/// 真 CC 来访自己带着 billing header，这两类走不到补写。
 pub(super) fn cc_version_suffix(v: &serde_json::Value, version: &str) -> String {
     let text = first_user_text(v);
     let char_at = |i: usize| text.chars().nth(i).unwrap_or('0');
@@ -1429,7 +1434,8 @@ pub(super) fn cc_version_suffix(v: &serde_json::Value, version: &str) -> String 
     format!("{:02x}{:02x}", digest[0], digest[1]).chars().take(3).collect()
 }
 
-/// 从 body 的 `messages` 里取第一条 `role:"user"` 消息的第一个 `type:"text"` 块文本。
+/// 从 body 的 `messages` 里取第一条 `role:"user"` 消息的第一个**非 meta** `type:"text"` 块
+/// 文本（meta 判据见 [`is_meta_text`]）；一个都没有就是空串。
 fn first_user_text(v: &serde_json::Value) -> String {
     let msgs = match v.get("messages").and_then(|m| m.as_array()) {
         Some(a) => a,
@@ -1440,11 +1446,12 @@ fn first_user_text(v: &serde_json::Value) -> String {
             continue;
         }
         match msg.get("content") {
-            Some(serde_json::Value::String(s)) => return s.clone(),
+            Some(serde_json::Value::String(s)) if !is_meta_text(s) => return s.clone(),
             Some(serde_json::Value::Array(blocks)) => {
                 for blk in blocks {
                     if blk.get("type").and_then(|t| t.as_str()) == Some("text")
                         && let Some(t) = blk.get("text").and_then(|t| t.as_str())
+                        && !is_meta_text(t)
                     {
                         return t.to_string();
                     }
@@ -1455,6 +1462,13 @@ fn first_user_text(v: &serde_json::Value) -> String {
         break;
     }
     String::new()
+}
+
+/// harness 注入、官方客户端标成 `isMeta` 的那几种文本块：`<system-reminder>`（CLAUDE.md、
+/// 日期、技能列表……）与 `<local-command-caveat>`（斜杠命令前那句免责）。`<command-name>`
+/// 不算——2.1.260 的 `bcd` 正是对它算的（`cap/2.1.260/00018`）。
+fn is_meta_text(t: &str) -> bool {
+    t.starts_with("<system-reminder>") || t.starts_with("<local-command-caveat>")
 }
 
 #[cfg(test)]
@@ -1487,10 +1501,10 @@ mod tests {
         assert!(sys[0]["text"].as_str().unwrap().contains("; cch="), "cch 要在 billing 段里");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.277.d56; cc_entrypoint=cli;"
+                "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;"
             ),
-            "模拟路径的 cc_version 取 profile 的版本与后缀（2.1.277 四族主线程都是 d56，\
-             cap/2.1.277/00031）: {s}"
+            "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
+             按 `000` 算）: {s}"
         );
         assert!(
             sys[0]["text"].as_str().unwrap().ends_with("; cc_turn_origin=human;"),
@@ -1500,16 +1514,16 @@ mod tests {
         assert!(sys[0]["text"].as_str().unwrap().contains("; cc_prompt_id="), "{s}");
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
-        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "2.1.277 四族同一份基座");
+        assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "2.1.277 起四族同一份基座");
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         // 第四块是官方「其余」段（模板填好占位），客户端自己的 system 不再占一块。
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块: {rest:.80}");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块: {rest:.80}");
         assert!(!unfilled(rest), "占位要全填掉: {rest}");
         let env = crate::proxy::sim_env_for(&test_cred(), "fp");
         assert!(
             rest.contains(&format!(
-                "You have a persistent file-based memory at `{}/.claude/projects/{}/memory/`.",
+                "You have a persistent, file-based memory at `{}/.claude/projects/{}/memory/`.",
                 env.home, env.slug
             )),
             "记忆目录随派生的假环境走: {rest}"
@@ -1522,7 +1536,7 @@ mod tests {
         assert_eq!(
             v["output_config"],
             serde_json::json!({"effort": "high"}),
-            "sonnet 主线程带 output_config.effort=high（cap/2.1.277/00031）: {s}"
+            "sonnet 主线程带 output_config.effort=high（cap/2.1.280/00033）: {s}"
         );
         assert_eq!(sys[3]["cache_control"]["type"], "ephemeral");
         assert!(sys[3]["cache_control"].get("scope").is_none(), "只有基座标 global");
@@ -1546,12 +1560,14 @@ mod tests {
                 "model",
                 "messages",
                 "system",
+                "tools",
                 "metadata",
                 "max_tokens",
                 "output_config",
                 "diagnostics"
             ],
-            "key 序（output_config 在 context_management / max_tokens 之后、diagnostics 之前）: {s}"
+            "key 序（来访没带 tools 也补在 system 之后；output_config 在 max_tokens 之后、\
+             diagnostics 之前）: {s}"
         );
         assert_eq!(
             v["diagnostics"],
@@ -1577,62 +1593,42 @@ mod tests {
         assert!(alien.rest.is_none(), "也不补第四块");
     }
 
-    /// 2.1.260 的 billing 后缀是**逐 profile 定死**的，不能再走那套派生算法。
-    ///
-    /// 算法逆向自 2.1.251，在 2.1.260 上已被证否：六个 profile 各有固定后缀，而算法对
-    /// 主线程样本算出的是 `11d`。更老的版本仍走派生（2.1.258 五份抓包全是 `1e2`，算法
-    /// 在 `"hi"` 上正好也算出 `1e2`）。
+    /// billing 后缀按会话首条**非 meta** 用户文本派生（[`crate::proxy::cc_version_suffix`]），
+    /// 抓包里那几个「固定值」逐个用它们各自会话的首句复算回来：前面塞多少条
+    /// `<system-reminder>` / `<local-command-caveat>` 都不影响，`<command-name>` 不算 meta。
     #[test]
-    fn billing_suffix_is_profile_fixed_on_2_1_260() {
-        use crate::proxy::CcRequestKind as K;
-        let body = |model: &str| {
+    fn billing_suffix_is_derived_from_the_first_real_user_text() {
+        let reminder = "<system-reminder>\nAs you answer the user's questions, you can use the \
+                        following context:\n</system-reminder>";
+        let body = |texts: &[&str]| {
+            let content: Vec<_> =
+                texts.iter().map(|t| serde_json::json!({"type": "text", "text": t})).collect();
             serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "hi"}]})
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": content}]})
         };
-        let text = |model: &str, ver: &str, kind| {
-            crate::proxy::billing_header_text(&body(model), Some(ver), kind)
-        };
+        let text =
+            |texts: &[&str], ver: &str| crate::proxy::billing_header_text(&body(texts), Some(ver));
 
-        // 主线程按模型族：opus `222`、fable `bcd`。
+        // `cap/2.1.280/00021`：会话首句 `hilew`。
+        assert!(text(&[reminder, "hilew"], "2.1.280").contains("cc_version=2.1.280.bc5;"));
+        // `cap/2.1.277/00023`：两条 reminder 之后是 `审查下性能优化的问题`。
         assert!(
-            text("claude-opus-5", "2.1.260", K::Main).contains("cc_version=2.1.260.222;"),
-            "{}",
-            text("claude-opus-5", "2.1.260", K::Main)
+            text(&[reminder, reminder, "审查下性能优化的问题"], "2.1.277")
+                .contains("cc_version=2.1.277.d56;")
         );
-        assert!(text("claude-fable-5-1", "2.1.260", K::Main).contains("2.1.260.bcd;"));
-        // 「猜下一句」跟主线程同一档。
-        assert!(text("claude-opus-5", "2.1.260", K::Suggestion).contains("2.1.260.222;"));
-        // 各辅助 profile 各有各的。
-        for (kind, want) in
-            [(K::Subagent, "660"), (K::Helper, "d95"), (K::Title, "ced"), (K::Classifier, "3de")]
-        {
-            let got = text("claude-haiku-4-5-20251001", "2.1.260", kind);
-            assert!(got.contains(&format!("2.1.260.{want};")), "{kind:?}: {got}");
-        }
-
-        // 2.1.258 仍走派生算法——那一版五份抓包全是 `1e2`。
-        let old = text("claude-opus-5", "2.1.258", K::Main);
-        assert!(old.contains("cc_version=2.1.258.1e2;"), "{old}");
-
-        // 2.1.277：四族主线程统一 `d56`，子代理 `385`，标题 `e18`（cap/2.1.277）；无工具 helper
-        // 与安全分类没有 2.1.277 样本，退回派生算法而不是拿 2.1.260 的值顶上。
-        for m in
-            ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"]
-        {
-            let got = text(m, "2.1.277", K::Main);
-            assert!(got.contains("cc_version=2.1.277.d56;"), "{m}: {got}");
-        }
-        assert!(text("claude-haiku-4-5-20251001", "2.1.277", K::Subagent).contains("2.1.277.385;"));
-        assert!(text("claude-haiku-4-5-20251001", "2.1.277", K::Title).contains("2.1.277.e18;"));
-        let helper = text("claude-haiku-4-5-20251001", "2.1.277", K::Helper);
-        assert!(
-            !helper.contains(".d95;") && !helper.contains(".d56;"),
-            "没样本不套别版的值: {helper}"
-        );
-        // 2.1.270 只抓到 sonnet：它取那一版的 `100`，opus 退回派生。
-        assert!(text("claude-sonnet-5", "2.1.270", K::Main).contains("2.1.270.100;"));
-        assert!(!text("claude-opus-5", "2.1.270", K::Main).contains(".222;"));
+        // `cap/2.1.260/00018`：caveat 是 meta，斜杠命令那块不是。
+        let caveat = "<local-command-caveat>Caveat: The messages below were generated by the \
+                      user while running local commands.</local-command-caveat>";
+        let cmd = "<command-name>/commit-commands:commit</command-name>";
+        assert!(text(&[reminder, caveat, cmd], "2.1.260").contains("cc_version=2.1.260.bcd;"));
+        // 2.1.258 那五份全是 `"hi"` 开头的会话。
+        let hi = serde_json::json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(crate::proxy::billing_header_text(&hi, Some("2.1.258")).contains(".1e2;"));
+        // 同一个首句换个版本，后缀跟着变：版本号参与摘要。
+        assert!(!text(&[reminder, "hilew"], "2.1.277").contains(".bc5;"));
+        // 只有 meta 块的首条消息按空串算（2.1.277 子代理的 `385` 就是空串的值）。
+        assert!(text(&[reminder], "2.1.277").contains("cc_version=2.1.277.385;"));
     }
 
     /// uuid 形态校验的边界：只认 `8-4-4-4-12` 的小写 hex。
@@ -1750,24 +1746,28 @@ mod tests {
         assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块");
         let env = crate::proxy::sim_env_for(&test_cred(), "fp");
         assert!(
             rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.slug)),
             "记忆目录随派生的 cwd 走: {rest}"
         );
-        // 2.1.277 的第四块不再写工作目录、模型名、知识截止与 scratchpad。
-        for gone in
-            ["Primary working directory", "powered by the model", "knowledge cutoff", "scratchpad"]
-        {
-            assert!(!rest.contains(gone), "{gone} 在 2.1.277 的第四块里已经没有了: {rest}");
+        // 2.1.277 起第四块不再写工作目录、模型名、知识截止与 scratchpad 一节（2.1.280 记忆段里
+        // 那句「scratchpad prose」是正文，不是那一节）。
+        for gone in [
+            "Primary working directory",
+            "powered by the model",
+            "knowledge cutoff",
+            "# Scratchpad Directory",
+        ] {
+            assert!(!rest.contains(gone), "{gone} 在 2.1.277 起的第四块里已经没有了: {rest}");
         }
         assert!(!unfilled(rest), "{rest}");
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(
             v["output_config"],
-            serde_json::json!({"effort": "high"}),
-            "opus 主线程带 effort=high（cap/2.1.277/00357）: {v}"
+            serde_json::json!({"effort": "medium"}),
+            "2.1.280 的 opus 主线程是 effort=medium（cap/2.1.280/00021）: {v}"
         );
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         let idx =
@@ -1869,14 +1869,17 @@ mod tests {
         assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "四族共用基座");
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Before you start, say in a line"), "2.1.277 第四块: {rest:.80}");
-        assert!(rest.contains("This iteration of Claude is Claude Fable 5.1"), "{rest}");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块: {rest:.80}");
+        assert!(
+            !rest.contains("This iteration of Claude"),
+            "2.1.280 不再带 Fable 自我介绍: {rest}"
+        );
         assert!(!unfilled(rest), "{rest}");
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.277.d56; cc_entrypoint=cli; cch="
+                "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli; cch="
             ),
             "{v}"
         );
@@ -2345,7 +2348,7 @@ mod tests {
         assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
         assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE);
         assert!(v["system"][3].get("cache_control").is_none(), "预算用完时第四块也不带断点");
-        assert!(v["system"][3]["text"].as_str().unwrap().starts_with("Before you start, say"));
+        assert!(v["system"][3]["text"].as_str().unwrap().starts_with("Write code that reads like"));
     }
 
     /// 客户端把 `system` 拆成多块时并成**一块**——3+N 块会被上游判第三方应用、改扣超额池
@@ -2369,7 +2372,7 @@ mod tests {
 
         assert_eq!(sys.len(), 5, "官方四块 + 并成一块的客户端 system: {v}");
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Before you start, say"), "第四块开头是官方正文");
+        assert!(rest.starts_with("Write code that reads like"), "第四块开头是官方正文");
         assert!(rest.ends_with("</total_tokens>"), "第四块末尾照抓包，客户端的不掺进来");
         assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "四块并成一块、一个字都不丢: {v}");
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
@@ -2980,17 +2983,17 @@ mod tests {
         let asset = config::CC_SYSTEM_REST;
         assert_eq!(
             asset.len(),
-            11039,
-            "2.1.277 第四块模板字节数（11301 去掉 EndConversation 那段与占位差）"
+            6738,
+            "2.1.280 第四块模板字节数（7009 去掉 EndConversation 那段与占位差）"
         );
         for ph in REST_PLACEHOLDERS {
             assert_eq!(asset.matches(ph).count(), 1, "占位 {ph} 恰好出现一次（记忆目录那一处）");
         }
         assert!(
-            asset.contains("You have a persistent file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
+            asset.contains("You have a persistent, file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
             "记忆目录那句"
         );
-        assert!(asset.starts_with("Before you start, say in a line what you're about to do"));
+        assert!(asset.starts_with("Write code that reads like the surrounding code"));
         assert!(asset.ends_with("<total_tokens>15000000 tokens left</total_tokens>"), "末行");
         assert!(!asset.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
         for leak in ["easayliu", "opdash", "proxy_captures"] {
@@ -3013,26 +3016,31 @@ mod tests {
         // 四族共有的那几节都在。
         for section in [
             "# Session-specific guidance",
-            "# Memory",
+            "# auto memory",
+            "## Citing memories",
             "# Environment",
             "# Context management",
-            "# Delivering work",
-            "# Writing for the user",
         ] {
             assert!(asset.contains(section), "{section}");
+        }
+        // 2.1.277 那份才有的几节，2.1.280 整段删了；有一样在就是拿错了模板。
+        for gone in ["# Delivering work", "# Writing for the user", "This iteration of Claude"] {
+            assert!(!asset.contains(gone), "{gone}");
         }
     }
 
     /// 四族都选同一份模板，填完一个占位都不剩；按抓包机的取值回填能还原抓包那块的字节数
-    /// （11301 去掉 EndConversation 那段 233 字节 = 11068）。
+    /// （7009 去掉 EndConversation 那段 233 字节 = 6776）。
     #[test]
     fn system_rest_renders_every_placeholder() {
         use crate::proxy::{SimEnv, cc_system_rest, render_system_rest};
-        let cap = SimEnv::from_cwd("/Users/easayliu", "/Users/easayliu/Works/easay/opdash");
         assert_eq!(
-            cap.slug, "-Users-easayliu-Works-easay-opdash",
+            SimEnv::from_cwd("/Users/easayliu", "/Users/easayliu/Works/easay/opdash").slug,
+            "-Users-easayliu-Works-easay-opdash",
             "官方的项目段拼法（cap/2.1.277/00023）"
         );
+        let cap =
+            SimEnv::from_cwd("/Users/easayliu", "/private/tmp/proxy_captures/20260923_085115");
         assert_eq!(
             SimEnv::from_cwd("/Users/x", "/private/tmp/proxy_captures/20260904_170955").slug,
             "-private-tmp-proxy-captures-20260904-170955",
@@ -3044,10 +3052,10 @@ mod tests {
             let t = cc_system_rest(m).expect(m);
             assert_eq!(t, config::CC_SYSTEM_REST, "{m}: 四族同一份");
             let out = render_system_rest(t, &cap);
-            assert_eq!(out.len(), 11068, "{m}: 按 cap/2.1.277/00023 的取值回填");
+            assert_eq!(out.len(), 6776, "{m}: 按 cap/2.1.280/00029 的取值回填");
             assert!(!unfilled(&out), "{m} 有占位没填: {out}");
             assert!(out.contains(
-                "You have a persistent file-based memory at `/Users/easayliu/.claude/projects/-Users-easayliu-Works-easay-opdash/memory/`."
+                "You have a persistent, file-based memory at `/Users/easayliu/.claude/projects/-private-tmp-proxy-captures-20260923-085115/memory/`."
             ));
         }
         // 认不出的模型不补第四块：落回「末块放客户端 system」的旧形态。

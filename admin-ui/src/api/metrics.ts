@@ -125,7 +125,7 @@ export interface Breakdown {
 // ---------- 本地拒绝 ----------
 
 export interface RejectionKind {
-  /** device-limit / session-limit / account-rpm / device-rpm / session-rpm / session-concurrency / bare-rate-limit / all-cooling-down / no-device-id / model-unsupported / unavailable / other */
+  /** device-limit / session-limit / account-rpm / device-rpm / session-rpm / session-concurrency / bare-rate-limit / all-cooling-down / no-device-id / model-min-version / model-unsupported / unavailable / other */
   kind: string
   count: number
 }

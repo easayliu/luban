@@ -94,12 +94,17 @@ pub(super) struct ReqLog {
     /// 零输出请求类与被拒答提示词的记忆表，收尾时按上游回复的种类往里记，
     /// 见 [`ReqLog::note_unanswered_reply`]。
     pub(super) empty_replies: EmptyReplyMemory,
-    /// 模拟路径替客户端注进去、客户端自己**没声明**的官方工具名（[`cc_tools_to_inject`]）；
+    /// 模拟路径替客户端注进去、客户端自己**没声明**的官方工具名，按实际出站体对来访算
+    /// （[`crate::proxy::injected_tools_of`]）；
     /// 非模拟路径与没注的为空。收尾时与回复里的 `tool_use` 名对一遍：模型若调了其中一个，
     /// 客户端会收到一个自己不认识的工具调用——这是注入策略的已知代价，此前只在文档里写着
     /// 「概率低」，没有任何地方量过。流水的 `shape` 只记 tool_use 的个数不记名字，
     /// `toolUseContentLengths` 那张表又把名字归了类，两处都答不了「调的是不是注入的」。
     pub(super) injected_tools: Vec<&'static str>,
+    /// 来访一个工具都没声明、模拟路径替它补了官方工具（开关 `fill_absent_tools`）。收尾时在
+    /// `rewrites` 列打 [`REWRITE_TOOLS_FILLED`]：与 `injected_tool_called` 一比，就知道这项注入
+    /// 波及了多少请求、其中多少次模型真去调了。
+    pub(super) tools_filled: bool,
     pub(super) store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     pub(super) _in_flight: InFlightGuard,
@@ -228,6 +233,13 @@ impl Drop for ReqLog {
                 tags.push(',');
             }
             tags.push_str(REWRITE_INJECTED_TOOL_CALLED);
+        }
+        if self.tools_filled {
+            let tags = self.forensics.rewrites.get_or_insert_with(String::new);
+            if !tags.is_empty() {
+                tags.push(',');
+            }
+            tags.push_str(REWRITE_TOOLS_FILLED);
         }
         let tool_uses_col =
             if tool_uses.is_empty() { "-".to_string() } else { tool_uses.join(",") };
@@ -576,6 +588,9 @@ const REWRITE_SERVED_BY_FALLBACK: &str = "served_by_fallback";
 /// 流水 `rewrites` 列里标「模型调了模拟路径注入的、客户端没声明的官方工具」的标签，
 /// 见 [`ReqLog::injected_tools`]。
 const REWRITE_INJECTED_TOOL_CALLED: &str = "injected_tool_called";
+/// 流水 `rewrites` 列里标「来访没带工具、模拟路径替它补了官方工具」的标签，见
+/// [`ReqLog::tools_filled`]。
+const REWRITE_TOOLS_FILLED: &str = "tools_filled";
 
 /// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
 pub(super) fn ban_context(
@@ -723,6 +738,8 @@ pub(super) fn capture_forensics_without_body(
 /// 出站体里取到的 session_id 覆盖已有的（那是出站头里的兜底），取不到就留着原来的——
 /// 与 [`capture_forensics`] 此前 `session_from_body.or_else(header)` 的取舍一致。
 pub(super) fn fill_shape_forensics(f: &mut store::Forensics, bits: ShapeBits) {
+    let ShapeBits { shape, session_id, device_id_out, .. } = bits;
+    let bits = ShapeBits { shape, session_id, device_id_out, ..ShapeBits::default() };
     f.shape = bits.shape;
     if bits.session_id.is_some() {
         f.session_id = bits.session_id;
@@ -760,6 +777,13 @@ pub(super) struct ShapeBits {
     pub(super) shape: Option<String>,
     pub(super) session_id: Option<String>,
     pub(super) device_id_out: Option<String>,
+    /// 出站比来访多出来的官方工具名（模拟路径注入的），见 [`crate::proxy::injected_tools_of`]。
+    /// 按**实际改写结果**算，不按来访体预判：`tool_choice: "required"` 之类的方言要先经
+    /// [`crate::proxy::normalize_tool_choice`] 归一才知道补不补，读来访原文会算错。
+    /// 只有 [`crate::proxy::Upstream::shape_outbound`] 填它，其余路径为空。
+    pub(super) injected_tools: Vec<&'static str>,
+    /// 来访一个工具都没声明、出站却带上了注入的官方工具（开关 `fill_absent_tools`）。
+    pub(super) tools_filled: bool,
 }
 
 /// [`shape_summary`] 的本体：吃一份**已经解析好**的出站体。
@@ -844,6 +868,7 @@ pub(super) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
         shape: Some(serde_json::Value::Object(out).to_string()),
         session_id: session,
         device_id_out: device,
+        ..ShapeBits::default()
     }
 }
 
@@ -1410,7 +1435,8 @@ mod tests {
             "stream": true,
             "thinking": {"type": "enabled", "budget_tokens": 1024}});
         let bytes = serde_json::to_vec(&body).unwrap();
-        let ShapeBits { shape, session_id: session, device_id_out: device } = shape_summary(&bytes);
+        let ShapeBits { shape, session_id: session, device_id_out: device, .. } =
+            shape_summary(&bytes);
         let shape = shape.expect("对象体必有摘要");
         assert_eq!(session.as_deref(), Some("9f8e7d6c-0000-1111-2222-333344445555"));
         assert_eq!(device.as_deref(), Some("ab12"), "扁平串的 device 段落进 device_id_out");
