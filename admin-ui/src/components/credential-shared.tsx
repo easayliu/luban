@@ -945,26 +945,64 @@ export function DeleteCredentialDialog({
 }
 
 /**
- * 测试弹窗里的模型选项。取现役四个模型族各一个（基座与 beta 串按族分家，见后端
- * `cc_system_base`/`cc_beta_seed`），这样逐项测试可以覆盖四条不同的模拟路径。
+ * 测试弹窗里打头的四个模型：现役四个模型族各取最新的一个，顺序即下拉顺序。四族走四条不同的
+ * 模拟 profile（beta 串、thinking、effort 各不相同，见后端 `config::CC_PROFILES`），逐项测一遍
+ * 就覆盖了四条路径。haiku 取别名而不是 `claude-haiku-4-5-20251001`：后者在后端会被当成官方
+ * 额度探测（`max_tokens: 1`、无 system），测不到 haiku 主线程那条链路。
  */
 const PROBE_MODELS = [
-  'claude-opus-5',
+  'claude-opus-5-5',
+  'claude-fable-5-1',
   'claude-sonnet-5',
   'claude-haiku-4-5',
-  'claude-fable-5',
 ] as const
 
+/** 价目表其余模型的族序：与 {@link PROBE_MODELS} 同序，mythos 跟在同代的 fable 后面。 */
+const FAMILY_ORDER = ['opus', 'fable', 'mythos', 'sonnet', 'haiku']
+
 /**
- * 下拉的完整选项：四个基准打头（覆盖四条模拟路径），再接客户端最近真实用过的（新模型上线
- * 不必等发版），最后补价目表里其余现役模型。去重、保序。接口没到时只有四个基准。
+ * 价目表里「其余现役模型」的排序键：先按族（{@link FAMILY_ORDER}，认不出的族排最后），族内
+ * 版本新的在前（`opus-5-5` > `opus-5` > `opus-4-8`，逐段按数字比，缺的段当 0），同一版本裸 id
+ * 在前、`[1m]` 变体紧随其后。
  */
-function probeModelOptions(models: ModelsResp | undefined): string[] {
+function listedModelRank(model: string): [number, number[], number] {
+  const m = model.toLowerCase()
+  const oneM = m.endsWith('[1m]') ? 1 : 0
+  const bare = oneM ? m.slice(0, -4) : m
+  const family = FAMILY_ORDER.findIndex((f) => bare.startsWith(`claude-${f}-`))
+  const version = (bare.split('-').slice(2).map(Number).filter((n) => Number.isFinite(n) && n < 1e6))
+  return [family < 0 ? FAMILY_ORDER.length : family, version, oneM]
+}
+
+function compareListed(a: string, b: string): number {
+  const [fa, va, ma] = listedModelRank(a)
+  const [fb, vb, mb] = listedModelRank(b)
+  if (fa !== fb) return fa - fb
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+    const d = (vb[i] ?? 0) - (va[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return ma - mb
+}
+
+/**
+ * 下拉的完整选项，分三段、去重保序：
+ * 1. 四个基准（{@link PROBE_MODELS}），覆盖四条模拟路径；
+ * 2. 客户端最近 30 天真实用过的，按最后出现时刻倒序——新模型上线不必等发版，也最可能是要测的；
+ * 3. 价目表里其余现役模型，按族、再按版本新旧排（{@link compareListed}），不照后端列表的写法。
+ *
+ * 这个号被判过「套餐不含」的模型整体沉到最后（各段内相对次序不变）：测了必败，只白扣一次。
+ * 接口没到时只有四个基准。
+ */
+function probeModelOptions(
+  models: ModelsResp | undefined,
+  isDenied: (model: string) => boolean,
+): string[] {
   const out: string[] = [...PROBE_MODELS]
   const push = (m: string) => { if (m && !out.includes(m)) out.push(m) }
   models?.recent.forEach((r) => push(r.model))
-  models?.listed.forEach(push)
-  return out
+  ;[...(models?.listed ?? [])].sort(compareListed).forEach(push)
+  return [...out.filter((m) => !isDenied(m)), ...out.filter(isDenied)]
 }
 
 /** 一条测试记录：同一个弹窗里连测多次时按时间倒序累积，方便横向比较不同模型。 */
@@ -1021,7 +1059,10 @@ export function ConnectivityTestDialog({
     staleTime: 60_000,
     enabled: open,
   })
-  const probeModels = useMemo(() => probeModelOptions(modelsQuery.data), [modelsQuery.data])
+  const probeModels = useMemo(
+    () => probeModelOptions(modelsQuery.data, (m) => deniedKeys.has(modelDenialKey(m))),
+    [modelsQuery.data, deniedKeys],
+  )
   const [model, setModel] = useState<string>(
     () => PROBE_MODELS.find((m) => !isDenied(m)) ?? PROBE_MODELS[0],
   )
