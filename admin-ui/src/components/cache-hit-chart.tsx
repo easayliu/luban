@@ -22,7 +22,7 @@ function slotReadout(
     axis,
     rate: formatPercent(cacheHitRate(slot.inputTokens, slot.cachedTokens)),
     detail: t(
-      `命中 ${slot.cachedTokens.toLocaleString(locale)} · 写入 ${slot.writtenTokens.toLocaleString(locale)} · 裸算 ${uncached.toLocaleString(locale)} token`,
+      `命中 ${slot.cachedTokens.toLocaleString(locale)} · 写入 ${slot.writtenTokens.toLocaleString(locale)} · 未缓存 ${uncached.toLocaleString(locale)} token`,
       `${slot.cachedTokens.toLocaleString(locale)} cached · ${slot.writtenTokens.toLocaleString(locale)} written · ${uncached.toLocaleString(locale)} uncached tokens`,
     ),
   }
@@ -144,7 +144,7 @@ export function CacheHitColumns({
                         className="relative h-0.5 w-full max-w-6 rounded-full bg-muted-foreground/24"
                       />
                     ) : (
-                      // 一根柱子叠三段：底下深色是命中、中间浅色是写入、顶上灰色是裸算，
+                      // 一根柱子叠三段：底下深色是命中、中间浅色是写入、顶上灰色是未缓存，
                       // 三段加起来撑满——命中率就是深色那段的高度，写入多命中少一眼能看出来。
                       <span
                         aria-hidden
@@ -254,7 +254,7 @@ export function CacheHitTable({
             <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
             <th scope="col" className="text-end">{t('命中', 'Cached')}</th>
             <th scope="col" className="text-end">{t('写入', 'Written')}</th>
-            <th scope="col" className="text-end">{t('裸算', 'Uncached')}</th>
+            <th scope="col" className="text-end">{t('未缓存', 'Uncached')}</th>
             <th scope="col" className="text-end">{t('输入合计', 'Input total')}</th>
           </tr>
         </thead>
@@ -305,14 +305,14 @@ export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; cl
   )
 }
 
-/** 三段写全：命中 · 写入 · 裸算。 */
+/** 三段写全：命中 · 写入 · 未缓存。 */
 export function cacheSplitText(
   p: { input_tokens: number; cached_tokens: number; written_tokens: number },
   t: (zh: string, en: string) => string,
 ): string {
   const uncached = Math.max(0, p.input_tokens - p.cached_tokens - p.written_tokens)
   return t(
-    `命中 ${formatTokens(p.cached_tokens)} · 写入 ${formatTokens(p.written_tokens)} · 裸算 ${formatTokens(uncached)}`,
+    `命中 ${formatTokens(p.cached_tokens)} · 写入 ${formatTokens(p.written_tokens)} · 未缓存 ${formatTokens(uncached)}`,
     `${formatTokens(p.cached_tokens)} cached · ${formatTokens(p.written_tokens)} written · ${formatTokens(uncached)} uncached`,
   )
 }

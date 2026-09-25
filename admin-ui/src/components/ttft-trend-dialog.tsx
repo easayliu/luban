@@ -386,7 +386,7 @@ export function TtftTrendDialog({
               </div>
               <DialogDescription className="mt-1">
                 {t(
-                  '上游首个 token 到达的耗时，按 p50 / p95 看（仅统计成功请求）；吞吐是首字之后的输出速度。',
+                  '上游返回首个 token 的耗时，按 p50 / p95 展示（仅统计成功请求）；吞吐是首字之后的输出速度。',
                   'Time to first token from upstream as p50 / p95 (successful requests only); throughput is the output speed after the first token.',
                 )}
               </DialogDescription>
@@ -400,7 +400,7 @@ export function TtftTrendDialog({
                 if (next && next in TTFT_RANGES) setRange(next as TtftRangeKey)
               }}
               variant="outline"
-              aria-label={t('回看跨度', 'Time range')}
+              aria-label={t('时间范围', 'Time range')}
             >
               {(Object.keys(TTFT_RANGES) as TtftRangeKey[]).map((key, i) => (
                 <Fragment key={key}>
@@ -425,7 +425,7 @@ export function TtftTrendDialog({
                   { shape: 'line', swatch: 'bg-chart-2/50', label: 'p95' },
                 ]}
                 hint={t(
-                  '柱子是 p50，柱顶上方那条短横线是 p95；两者拉得越开，长尾越重。',
+                  '柱子是 p50，柱顶上方的短横线是 p95；两者相差越大，长尾越重。',
                   'The bar is p50 and the short line above it is p95; the wider the gap, the heavier the tail.',
                 )}
               />
@@ -482,7 +482,7 @@ export function TtftTrendDialog({
                 <EmptyTitle>{t('这段时间没有请求', 'No requests in this period')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '换个更长的跨度，或先跑几条请求。',
+                    '换一个更长的时间范围，或先发几条请求。',
                     'Try a longer range, or send some requests first.',
                   )}
                 </EmptyDescription>
@@ -501,7 +501,7 @@ export function TtftTrendDialog({
           {/* p50 / p95 的含义交给图例与它末尾那枚 info，这里只剩图例说不了的两件事。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空着的格子是那个时段没有成功请求。请求明细只保留 30 天。',
+              '空着的格子表示该时段没有成功请求。请求明细只保留 30 天。',
               'A gap means no successful requests in that period. Request logs are kept for 30 days.',
             )}
           </p>

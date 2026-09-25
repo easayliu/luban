@@ -125,8 +125,8 @@ export function CredentialRpmDialog({
               </Select>
               <FieldDescription>
                 {t(
-                  `“跟随默认”套用全局设置，当前为 ${effective}。`,
-                  `“Use default” applies the global setting, currently ${effective}.`,
+                  `「跟随默认」套用全局设置，当前为 ${effective}。`,
+                  `"Use default" applies the global setting, currently ${effective}.`,
                 )}
               </FieldDescription>
             </Field>
@@ -157,8 +157,8 @@ export function CredentialRpmDialog({
             <GaugeIcon />
             <AlertDescription>
               {t(
-                '打满之后：还没定下号的请求会自动分流到别的账号；已经绑定到这个号的设备则直接收到 429 与 retry-after，等窗口滚出名额再继续——中途换号会改绑，那条会话之后每一轮都要先撞一次 thinking 签名 400。计数在服务端内存里，重启即清零。',
-                'Once full: requests not yet pinned to an account spill over to another one, while devices already bound to this account get a 429 with retry-after and resume when the window frees a slot — swapping accounts mid-session rebinds the device, which costs a thinking-signature 400 on every later turn. Counting lives in server memory and resets on restart.',
+                '达到上限后：尚未确定账号的请求会自动分流到其他账号；已绑定到该账号的设备则直接收到 429 与 retry-after，等窗口内腾出名额后再继续（中途换账号会导致改绑，该会话之后每一轮都要先遇到一次 thinking 签名 400）。计数保存在服务端内存中，重启即清零。',
+                'Once the limit is reached: requests not yet pinned to an account spill over to other accounts, while devices already bound to this account get a 429 with retry-after and resume when the window frees a slot (swapping accounts mid-session rebinds the device, which costs a thinking-signature 400 on every later turn of that session). Counts live in server memory and reset on restart.',
               )}
             </AlertDescription>
           </Alert>

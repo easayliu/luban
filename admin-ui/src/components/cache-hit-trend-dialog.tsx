@@ -127,8 +127,8 @@ export function CacheHitTrendDialog({
               </div>
               <DialogDescription className="mt-1">
                 {t(
-                  '全池按 token 加权，不是各账号命中率的平均。',
-                  'Pooled and token-weighted, not an average of per-account rates.',
+                  '整个调度池按 token 加权计算，不是各账号命中率的平均值。',
+                  'Token-weighted across the whole scheduling pool, not an average of per-account rates.',
                 )}
               </DialogDescription>
             </div>
@@ -141,7 +141,7 @@ export function CacheHitTrendDialog({
                 if (next && next in CACHE_RANGES) setRange(next as CacheRangeKey)
               }}
               variant="outline"
-              aria-label={t('回看跨度', 'Time range')}
+              aria-label={t('时间范围', 'Time range')}
             >
               {(Object.keys(CACHE_RANGES) as CacheRangeKey[]).map((key, i) => (
                 <Fragment key={key}>
@@ -170,10 +170,10 @@ export function CacheHitTrendDialog({
                 items={[
                   { swatch: 'bg-chart-1', label: t('命中 ×0.1', 'Cached ×0.1') },
                   { swatch: 'bg-chart-1/40', label: t('写入 ×1.25', 'Written ×1.25') },
-                  { swatch: 'bg-muted-foreground/24', label: t('裸算 ×1', 'Uncached ×1') },
+                  { swatch: 'bg-muted-foreground/24', label: t('未缓存 ×1', 'Uncached ×1') },
                 ]}
                 hint={t(
-                  '命中率就是最深那段的高度。写入多、命中少，是前缀每轮都在变；两段都少，是客户端没标缓存断点。',
+                  '命中率就是颜色最深那一段的高度。写入多、命中少，说明前缀每轮都在变；两段都少，说明客户端没有设置缓存断点。',
                   'The hit rate is the height of the darkest segment. Much written but little cached means the prefix changes every turn; little of both means the client sets no cache breakpoints.',
                 )}
               />
@@ -214,8 +214,8 @@ export function CacheHitTrendDialog({
                 <EmptyTitle>{t('这段时间没有请求', 'No requests in this period')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '命中率要有请求才谈得上。换个更长的跨度，或先跑几条请求。',
-                    'A hit rate needs traffic. Try a longer range, or send some requests first.',
+                    '有请求时命中率才有意义。换一个更长的时间范围，或先发几条请求。',
+                    'A hit rate is only meaningful with traffic. Try a longer range, or send some requests first.',
                   )}
                 </EmptyDescription>
               </EmptyHeader>
@@ -234,7 +234,7 @@ export function CacheHitTrendDialog({
               这里只剩图例说不了的那两件事。原来这段是 100 字的 10px 灰字，铺满整个弹窗宽度。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空着的格子是那个时段没有请求；柱子的深浅是那一格的 token 体量。请求明细只保留 30 天。',
+              '空着的格子表示该时段没有请求；柱子的深浅表示该格的 token 量。请求明细只保留 30 天。',
               'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 30 days.',
             )}
           </p>

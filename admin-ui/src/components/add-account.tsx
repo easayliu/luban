@@ -152,8 +152,8 @@ export function AddAccount({
                 <AlertDescription>
                   <p>
                     {t(
-                      '点击下方链接打开授权页面，或复制链接到其它浏览器/设备上完成授权。',
-                      'Click the link below to open the authorization page, or copy it to another browser or device.',
+                      '点击下方链接打开授权页面，或复制链接，在其他浏览器或设备上完成授权。',
+                      'Click the link below to open the authorization page, or copy it and complete authorization in another browser or on another device.',
                     )}
                   </p>
                   <div className="mt-2 flex items-center gap-2">
@@ -261,8 +261,8 @@ export function AddAccount({
                 />
                 <FieldDescription>
                   {t(
-                    '登录换码和拉取账号信息会走此代理，入库后自动存为该账号的逐账号代理。支持 socks5://、http:// 等，留空表示直连。',
-                    'Token exchange and profile fetch will go through this proxy. It is automatically saved as the per-account proxy after login. Supports socks5://, http://, etc. Leave blank for a direct connection.',
+                    '登录换码和拉取账号信息都经由此代理，账号添加后它会自动保存为该账号的逐账号代理。支持 socks5://、http:// 等，留空表示直连。',
+                    'The token exchange and profile fetch go through this proxy, and once the account is added it is saved as that account’s per-account proxy. Supports socks5://, http://, and more. Leave blank to connect directly.',
                   )}
                 </FieldDescription>
                 <ProxyTestBlock url={proxy.trim()} />

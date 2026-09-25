@@ -101,7 +101,7 @@ function ExportPanel() {
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="warning" size="sm">
             <AlertTriangleIcon />
-            {t('文件含明文登录凭据，等同账号本身', 'The file holds plaintext credentials — treat it as the accounts themselves')}
+            {t('文件含明文登录凭据，等同账号本身', 'The file contains plaintext login credentials, equivalent to the accounts themselves')}
           </Badge>
           {locked && (
             <Badge variant="secondary" size="sm">
@@ -118,8 +118,8 @@ function ExportPanel() {
         title={
           locked
             ? t(
-                '控制台未设密码时，管理接口对任何能连到端口的人都是敞开的，这个文件不能这样发出去。',
-                'Without an admin password the management API is open to anyone who can reach the port; this file must not be handed out that way.',
+                '控制台未设管理密码时，任何能连到端口的人都能访问管理接口，这种状态下不能导出这个文件。',
+                'Without an admin password, anyone who can reach the port can use the management API, so this file cannot be exported in that state.',
               )
             : undefined
         }
@@ -202,7 +202,7 @@ function ImportPanel() {
       setFile(parsed)
     } catch (error) {
       toastManager.add({
-        title: t('读不出这个文件', 'Could not read that file'),
+        title: t('无法读取该文件', 'Could not read that file'),
         description: error instanceof Error ? error.message : String(error),
         type: 'error',
       })
@@ -222,8 +222,8 @@ function ImportPanel() {
       <SettingsRow
         label={t('导入迁移文件', 'Import a migration file')}
         description={t(
-          '读入另一台机器导出的文件。同一个账号（按账号 UUID 认，其次是登录凭据）已经在本机时会被文件里的那份覆盖，其余新增。',
-          'Read a file exported from another machine. An account already present here (matched by account UUID, then by its credentials) is overwritten by the one in the file; the rest are added.',
+          '读入另一台机器导出的文件。本机已有的同一账号（先按账号 UUID 匹配，其次按登录凭据）会被文件中的版本覆盖，其余作为新账号添加。',
+          'Read a file exported from another machine. An account already on this machine (matched by account UUID first, then by its login credentials) is overwritten by the version in the file; the rest are added as new accounts.',
         )}
       >
         <input
@@ -302,11 +302,11 @@ function ImportPanel() {
               <FieldDescription className="leading-5">
                 {mode === 'replace'
                   ? t(
-                      '本机现有的账号会被全部删除（连同它们的用量历史与设备绑定），然后写入文件里的那些。',
-                      'Every account on this machine is deleted first — along with its usage history and device bindings — and then the file is written in.',
+                      '先删除本机现有的全部账号（连同它们的用量历史与设备绑定），再写入文件中的账号。',
+                      'Every account on this machine is deleted first (along with its usage history and device bindings), then the accounts in the file are written.',
                     )
                   : t(
-                      '本机有、文件里没有的账号保持不动。',
+                      '本机有而文件中没有的账号保持不变。',
                       'Accounts on this machine that are absent from the file are left untouched.',
                     )}
               </FieldDescription>
@@ -324,8 +324,8 @@ function ImportPanel() {
                 </span>
                 <span className="block text-xs leading-5 text-muted-foreground">
                   {t(
-                    '含接入 Key、限流与转发开关等；只覆盖文件里有的项，其余保持本机原值。管理密码不在其中。',
-                    'Includes the access key, rate limits, and forwarding switches. Only keys present in the file are overwritten; the rest keep their current values. The admin password is not included.',
+                    '包括接入 Key、限流与转发开关等；只覆盖文件中包含的设置项，其余保持本机原值。管理密码不在其中。',
+                    'Includes the access key, rate limits, forwarding switches, and so on. Only settings present in the file are overwritten; the rest keep their current values. The admin password is not included.',
                   )}
                 </span>
               </span>
@@ -362,8 +362,8 @@ export function MigrationSettingsContent() {
         icon={DownloadIcon}
         title={t('导出', 'Export')}
         description={t(
-          '把账号与设置打包成一个文件，用于换机、重装或留一份底。',
-          'Pack accounts and settings into a single file for a new machine, a reinstall, or a spare copy.',
+          '把账号与设置打包成一个文件，用于换机、重装或留作备份。',
+          'Pack accounts and settings into a single file for moving to a new machine, reinstalling, or keeping a backup.',
         )}
       >
         <ExportPanel />
@@ -373,8 +373,8 @@ export function MigrationSettingsContent() {
         icon={UploadIcon}
         title={t('导入', 'Import')}
         description={t(
-          '读入迁移文件。导入后账号立即参与调度，登录凭据到期时自行刷新。',
-          'Read a migration file. Imported accounts join the rotation immediately and refresh their own credentials when they expire.',
+          '读入迁移文件。导入后账号立即参与调度，登录凭据到期时会自动刷新。',
+          'Read a migration file. Imported accounts join scheduling immediately and refresh their login credentials on their own when they expire.',
         )}
       >
         <ImportPanel />

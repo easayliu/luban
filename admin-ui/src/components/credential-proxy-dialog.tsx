@@ -98,13 +98,13 @@ export function CredentialProxyDialog({
             />
             <p className="text-muted-foreground text-xs leading-relaxed">
               {t(
-                '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码里的特殊字符要 percent-encode，如 # 写成 %23）。留空表示直连。',
+                '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码中的特殊字符需要 percent-encode，如 # 写成 %23）。留空表示直连。',
                 'Supports socks5://, socks5h://, http://, https://, optionally with user:pass@ (percent-encode special characters in the password, e.g. # as %23). Leave empty for a direct connection.',
               )}
             </p>
             <p className="text-muted-foreground text-xs leading-relaxed">
               {t(
-                '填 socks5:// 会在保存时自动改成 socks5h://——让代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你就近的 IP，而且不少住宅代理只接受域名形式、直接断连。socks4/socks4a 不再支持：SOCKS4 协议带不了账号密码，填了会被静默丢掉。',
+                '填写 socks5:// 时，保存会自动改成 socks5h://，由代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你最近的 IP，而且不少住宅代理只接受域名形式，收到 IP 形式的请求会直接断开连接。不再支持 socks4/socks4a：SOCKS4 协议无法携带用户名和密码，填写的认证信息会被静默丢弃。',
                 'socks5:// is rewritten to socks5h:// on save, so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright. socks4/socks4a are no longer supported: the SOCKS4 protocol cannot carry a username and password, so credentials would be silently dropped.',
               )}
             </p>
@@ -116,7 +116,7 @@ export function CredentialProxyDialog({
             <GlobeIcon />
             <AlertDescription>
               {t(
-                '配好之后，这个账号的全部出站流量都走它：转发、token 刷新、账号信息、连通性测试。代理不可用时该账号的请求会直接失败，不会退回直连——那样会把真实 IP 暴露给上游。',
+                '配置后，该账号的全部出站流量都经过此代理：转发、token 刷新、账号信息与连通性测试。代理不可用时，该账号的请求会直接失败，不会退回直连，否则会把真实 IP 暴露给上游。',
                 "Once set, all of this account's outbound traffic goes through it: forwarding, token refresh, profile, and connectivity tests. If the proxy is unusable the account's requests fail outright rather than falling back to a direct connection, which would expose your real IP upstream.",
               )}
             </AlertDescription>
@@ -126,7 +126,7 @@ export function CredentialProxyDialog({
         <DialogFooter>
           <DialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</DialogClose>
           <Button onClick={save} disabled={!dirty || proxy.isPending}>
-            {trimmed === '' ? t('改回直连', 'Use direct') : t('保存', 'Save')}
+            {trimmed === '' ? t('改回直连', 'Switch to direct') : t('保存', 'Save')}
           </Button>
         </DialogFooter>
       </DialogPopup>
@@ -205,7 +205,7 @@ export function ProxyPickerCombobox({
                   <span className="truncate font-medium">{p.label}</span>
                   {p.credential_count > 0 && (
                     <span className="shrink-0 text-xs text-muted-foreground">
-                      {p.credential_count} {t('账号', 'acct')}
+                      {p.credential_count} {t('个账号', 'acct')}
                     </span>
                   )}
                 </div>

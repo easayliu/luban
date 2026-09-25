@@ -123,7 +123,7 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
 
   const tokenEndpoint = message.match(/^(?:token endpoint returned|token 端点返回)\s+(.+?)(?:\s*[:：]\s*(.*))?$/i)
   if (tokenEndpoint) {
-    const prefix = inLanguage(['Token 端点返回', 'Token endpoint returned'], language)
+    const prefix = inLanguage(['token 端点返回', 'Token endpoint returned'], language)
     const status = tokenEndpoint[1].trim()
     const detail = tokenEndpoint[2]?.trim() ?? ''
     return joinBackendDetail(`${prefix} ${status}`, localizeDetail(detail), language)
@@ -132,12 +132,12 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
   const parsedToken = message.match(/^failed to parse the token response\s*\((\d+)\s+bytes\)$/i)
   if (parsedToken) {
     return language === 'zh-CN'
-      ? `无法解析 Token 响应（${parsedToken[1]} 字节）`
+      ? `无法解析 token 响应（${parsedToken[1]} 字节）`
       : `Failed to parse the token response (${parsedToken[1]} bytes)`
   }
   for (const [chinese, english] of [['解析 token 响应失败', 'failed to parse the token response']] as const) {
     const detail = colonDetail(message, chinese) ?? colonDetail(message, english)
-    if (detail != null) return joinBackendDetail(inLanguage(['无法解析 Token 响应', 'Failed to parse the token response'], language), localizeDetail(detail), language)
+    if (detail != null) return joinBackendDetail(inLanguage(['无法解析 token 响应', 'Failed to parse the token response'], language), localizeDetail(detail), language)
   }
 
   const probeTimeout = message.match(/^connectivity test timed out \(overall cap (\d+)s\)(?:\s*:\s*(.*))?$/i)
@@ -178,8 +178,8 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
   if (bareRateLimit) {
     const seconds = bareRateLimit[1]
     return language === 'zh-CN'
-      ? `所有凭证的裸请求速率均已达上限，请 ${seconds} 秒后重试`
-      : `All credentials have reached the bare-request rate limit; retry in ${seconds} seconds`
+      ? `所有账号的无设备身份请求速率均已达上限，请 ${seconds} 秒后重试`
+      : `All accounts have reached the rate limit for requests without a device identity; retry in ${seconds} seconds`
   }
 
   const allRateLimited = message.match(/^all credentials are cooling down after upstream rate limits; retry in (\d+) seconds$/i)
@@ -187,16 +187,16 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
   if (allRateLimited) {
     const seconds = allRateLimited[1]
     return language === 'zh-CN'
-      ? `所有凭证均处于上游限流冷却中，请 ${seconds} 秒后重试`
-      : `All credentials are cooling down after upstream rate limits; retry in ${seconds} seconds`
+      ? `所有账号均处于上游限流冷却中，请 ${seconds} 秒后重试`
+      : `All accounts are cooling down after upstream rate limits; retry in ${seconds} seconds`
   }
 
   const refreshCouldNotDisable = message.match(/^credential #(\d+) refresh failed and could not be disabled\s*:\s*(.*)$/i)
     ?? message.match(/^凭证 #(\d+) 刷新失败且停用未生效\s*[：:]\s*(.*)$/)
   if (refreshCouldNotDisable) {
     const prefix = language === 'zh-CN'
-      ? `凭证 #${refreshCouldNotDisable[1]} 刷新失败且停用未生效`
-      : `Credential #${refreshCouldNotDisable[1]} refresh failed and could not be disabled`
+      ? `账号 #${refreshCouldNotDisable[1]} 刷新失败，且停用未生效`
+      : `Account #${refreshCouldNotDisable[1]} failed to refresh and could not be disabled`
     return joinBackendDetail(prefix, localizeDetail(refreshCouldNotDisable[2].trim()), language)
   }
 
@@ -205,14 +205,14 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
   if (allRefreshAttempts) {
     const count = allRefreshAttempts[1]
     return language === 'zh-CN'
-      ? `连续 ${count} 个凭证刷新失败，暂无可用账号`
-      : `All ${count} credential refresh attempts failed; no credentials are available`
+      ? `连续 ${count} 个账号刷新失败，暂无可用账号`
+      : `All ${count} account refresh attempts failed; no accounts are available`
   }
 
   const refreshBan = message.match(/^\[refresh\s+(\d+)]\s*(.*)$/i)
   if (refreshBan) {
     const prefix = language === 'zh-CN'
-      ? `刷新 Token 失败（HTTP ${refreshBan[1]}）`
+      ? `刷新 token 失败（HTTP ${refreshBan[1]}）`
       : `Token refresh failed (HTTP ${refreshBan[1]})`
     return joinBackendDetail(prefix, localizeDetail(refreshBan[2].trim()), language)
   }

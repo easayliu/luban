@@ -70,8 +70,8 @@ export function RequestIdChip({
           'min-w-0 rounded font-mono text-xs hover:text-foreground hover:underline',
           full ? '[overflow-wrap:anywhere] text-left' : 'truncate',
         )}
-        title={`${id}\n${t('点击查这条请求', 'Click to look up this request')}`}
-        aria-label={t(`查请求 ${id}`, `Look up request ${id}`)}
+        title={`${id}\n${t('点击查看这条请求', 'Click to look up this request')}`}
+        aria-label={t(`查看请求 ${id}`, `Look up request ${id}`)}
         aria-haspopup="dialog"
         onClick={() => onOpen(id)}
       >

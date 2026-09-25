@@ -147,7 +147,7 @@ export function CredentialDevicesDialog({
   const sessionStatus = sessions.isPending
     ? { label: t('会话读取中', 'Loading sessions'), variant: 'secondary' as const }
     : sessions.error
-      ? { label: t('会话读取失败', 'Sessions failed to load'), variant: 'error' as const }
+      ? { label: t('会话读取失败', 'Failed to load sessions'), variant: 'error' as const }
       : {
           label: t(
             `${formattedSessionCount} 条活跃会话`,
@@ -240,7 +240,7 @@ export function CredentialDevicesDialog({
             </Avatar>
             <div className="min-w-0 flex-1">
               {/* 标题写全两种名额：这个对话框上半段是设备、下半段是模拟会话，头部两枚徽章各报各的活跃数。 */}
-              <DialogTitle>{t('名额：设备与模拟会话', 'Slots: devices & sessions')}</DialogTitle>
+              <DialogTitle>{t('名额：设备与模拟会话', 'Slots: devices and simulated sessions')}</DialogTitle>
               <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
@@ -293,8 +293,8 @@ export function CredentialDevicesDialog({
                     </Select>
                     <FieldDescription>
                       {t(
-                        '“默认”会自动应用全局设备上限，不等于不限。',
-                        '“Default” applies the global device limit; it does not mean unlimited.',
+                        '「跟随全局默认」会自动应用全局设备上限，不等于不限设备数。',
+                        '“Use global default” applies the global device limit; it does not mean unlimited.',
                       )}
                     </FieldDescription>
                   </Field>
@@ -550,8 +550,8 @@ function DeviceList({
                 )
             const metaDetail = device.simulated
               ? t(
-                  '非 Claude Code 客户端，按账号派生的身份；不写绑定行，也不占设备名额',
-                  'Third-party client using an account-derived identity; it creates no binding row and uses no device slot',
+                  '非 Claude Code 客户端，使用按账号派生的身份；不写入绑定记录，也不占设备名额',
+                  'Third-party client using an account-derived identity; it creates no binding record and uses no device slot',
                 )
               : t(
                   `首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
@@ -586,7 +586,7 @@ function DeviceList({
                         const copied = await copyText(device.device_id)
                         toastManager.add(copied
                           ? {
-                              title: t('已复制 device_id', 'Copied device_id'),
+                              title: t('已复制设备 ID', 'Device ID copied'),
                               type: 'success',
                             }
                           : {
@@ -753,8 +753,8 @@ function SessionCapacityCard({
           </CardTitle>
           <CardDescription className="text-xs">
             {t(
-              '走模拟路径、没有设备身份的来访按对话（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占一个槽位；出站会话 id 按槽位派生、释放后被下一个对话复用，上游看到的会话 id 数就是上限。与设备名额互不相干。',
-              'Requests on the simulation path without a device identity bind to this account per conversation (their session id, else cache prefix + first user message) and take a slot; the outbound session id derives from the slot and is reused by the next conversation once freed, so upstream sees at most this many session ids. Independent of device slots.',
+              '走模拟路径且没有设备身份的客户端请求按对话固定到账号（有自带的会话 ID 就按它，否则按缓存前缀 + 首条用户消息），每个对话占一个槽位。出站会话 ID 按槽位派生，槽位释放后由下一个对话复用，因此上游看到的会话 ID 数量不会超过这个上限。与设备名额互不相干。',
+              'Client requests on the simulation path without a device identity stick to this account per conversation (by their own session ID if present, otherwise by cache prefix + first user message), each taking a slot. The outbound session ID derives from the slot and is reused by the next conversation once the slot is freed, so upstream sees at most this many session IDs. Independent of device slots.',
             )}
           </CardDescription>
           {!editing && (
@@ -798,8 +798,8 @@ function SessionCapacityCard({
                 </Select>
                 <FieldDescription>
                   {t(
-                    '“默认”会自动应用全局会话上限，不等于不限。',
-                    '“Default” applies the global session limit; it does not mean unlimited.',
+                    '「跟随全局默认」会自动应用全局会话上限，不等于不限会话数。',
+                    '“Use global default” applies the global session limit; it does not mean unlimited.',
                   )}
                 </FieldDescription>
               </Field>
@@ -961,7 +961,7 @@ function SessionList({
               loading={clearAll.isPending}
               disabled={unbind.isPending}
               onClick={() => clearAll.mutate()}
-              title={t('清掉这个账号的全部模拟会话绑定（含休眠的）；下一条请求照常重新选号', 'Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
+              title={t('清除这个账号的全部模拟会话绑定（含休眠的）；下一条请求会照常重新选择账号','Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
             >
               <Trash2Icon />
               {t('全部清理', 'Clear all')}
@@ -1021,14 +1021,14 @@ function SessionList({
             // 「是不是 32 个 hex」猜——uuid 去掉横线也是 32 个 hex。
             const { source, value } = parseSessionKey(session.session_key)
             const derived = source === 'pfx'
-            const keyKind = derived ? t('按前缀', 'by prefix') : t('自带 id', 'client id')
+            const keyKind = derived ? t('按前缀', 'by prefix') : t('自带 ID', 'client ID')
             // 最近一轮的模型：记在绑定行上、不参与键（换模型不另起会话），旧库为空就不占位。
             const modelLabel = session.last_model ? `${session.last_model} · ` : ''
             return (
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-2">
                   <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 id 由它派生，释放后被下一个对话复用', 'Slot: the session id derives from it and is reused by the next conversation once freed')}>
+                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由它派生，释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
                     #{session.slot}
                   </Badge>
                   <Tooltip>
@@ -1036,33 +1036,33 @@ function SessionList({
                       {session.session_id}
                     </TooltipTrigger>
                     <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
-                      {t(`上游看到的会话 id ${session.session_id}`, `Session id upstream sees: ${session.session_id}`)}
+                      {t(`上游看到的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)}
                       <br />
                       {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
                     </TooltipPopup>
                   </Tooltip>
                   <Badge variant="secondary" size="sm">
-                    {derived ? t('按前缀', 'By prefix') : t('自带 id', 'Client id')}
+                    {derived ? t('按前缀', 'By prefix') : t('自带 ID', 'Client ID')}
                   </Badge>
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`复制会话 id ${session.session_id}`, `Copy session id ${session.session_id}`)}
+                      aria-label={t(`复制会话 ID ${session.session_id}`, `Copy session ID ${session.session_id}`)}
                       onClick={async () => {
                         const copied = await copyText(session.session_id)
                         toastManager.add(copied
-                          ? { title: t('已复制会话 id', 'Copied session id'), type: 'success' }
+                          ? { title: t('已复制会话 ID', 'Session ID copied'), type: 'success' }
                           : { title: t('复制失败', 'Copy failed'), description: session.session_id, type: 'error' })
                       }}
                     >
                       <CopyIcon />
                     </TooltipTrigger>
-                    <TooltipPopup>{t('复制会话 id', 'Copy session id')}</TooltipPopup>
+                    <TooltipPopup>{t('复制会话 ID', 'Copy session ID')}</TooltipPopup>
                   </Tooltip>
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`看这条会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
+                      aria-label={t(`查看这条会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
                       // 按**对话键**筛而不是按上游那个 session_id：后者按槽位派生、对话之间
                       // 复用，按它筛会把先后占过同一槽位的几个对话混成一条。
                       onClick={() => setDrill({
@@ -1074,7 +1074,7 @@ function SessionList({
                     >
                       <ScrollTextIcon />
                     </TooltipTrigger>
-                    <TooltipPopup>{t('看这条会话的请求', 'View this session’s requests')}</TooltipPopup>
+                    <TooltipPopup>{t('查看这条会话的请求','View this session’s requests')}</TooltipPopup>
                   </Tooltip>
                   <Button
                     size="xs"

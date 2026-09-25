@@ -157,7 +157,7 @@ export function ProxyPoolSettingsContent() {
 
         {proxies.length === 0 ? (
           <p className="px-4 py-4 text-center sm:px-5 text-sm text-muted-foreground">
-            {t('代理池为空，添加第一条代理地址吧。', 'The pool is empty. Add your first proxy address.')}
+            {t('代理池还没有代理地址。在上方填写名称与地址即可添加第一条。', 'The proxy pool is empty. Enter a name and URL above to add the first proxy.')}
           </p>
         ) : (
           <ul className="divide-y" role="list">
@@ -317,7 +317,7 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
             <AlertDialogDescription>
               {proxy.credential_count > 0
                 ? t(
-                    `当前有 ${proxy.credential_count} 个账号正在使用这条代理。删除后这些账号的代理设置不会改变，但它不再出现在代理池中。`,
+                    `当前有 ${proxy.credential_count} 个账号正在使用这条代理。删除后这些账号的代理设置保持不变，只是这条代理不再出现在代理池中。`,
                     `${proxy.credential_count} account${proxy.credential_count === 1 ? ' is' : 's are'} currently using this proxy. Deleting it won’t change those accounts’ proxy settings, but it will no longer appear in the pool.`,
                   )
                 : t(

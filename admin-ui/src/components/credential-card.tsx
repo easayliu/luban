@@ -231,11 +231,11 @@ export const CredentialCard = memo(function CredentialCard({
       )
     : sessionUsage.level === 'critical'
       ? t(
-          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话会被分到别的账号，全部占满时收到 429。点击查看或清理`,
+          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话会分配到其他账号，所有账号都占满时收到 429。点击查看或清理`,
           `Session slots are full (${cred.session_count}/${cred.session_limit_effective}): new sessions go to another account, and get a 429 once every account is full. Click to view or clear`,
         )
       : t(
-          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、没有设备身份的来访按会话占名额）。点击查看或清理`,
+          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、没有设备身份的客户端请求按会话占用名额）。点击查看或清理`,
           `${cred.session_count} of ${cred.session_limit_effective} simulated session slots in use (requests on the simulation path without a device identity take one per session). Click to view or clear`,
         )
   // 名额策略不再占页脚的横向宽度（那点宽度让给右边的 RPM 数字），改成给前面那枚手机图标上色：
@@ -267,7 +267,7 @@ export const CredentialCard = memo(function CredentialCard({
     }
     if (deviceUsage.level === 'critical') {
       return t(
-        `设备名额已占满（${cred.device_count}/${cred.device_limit_effective}，${devicePolicyHint}）：新设备会被分到别的账号，全部占满时收到 429。点击查看`,
+        `设备名额已占满（${cred.device_count}/${cred.device_limit_effective}，${devicePolicyHint}）：新设备会分配到其他账号，所有账号都占满时收到 429。点击查看`,
         `Device slots are full (${cred.device_count}/${cred.device_limit_effective}; ${devicePolicyHint.toLowerCase()}): new devices go to another account, and get a 429 once every account is full. Click to view`,
       )
     }
@@ -514,7 +514,7 @@ export const CredentialCard = memo(function CredentialCard({
                 </TooltipTrigger>
                 <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
                   {t(
-                    `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不是一回事`,
+                    `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
                     `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
                   )}
                 </TooltipPopup>
@@ -657,8 +657,8 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('模型冷却', 'Model cooldown')}
                 detail={modelCooldownSummary(cred, language)}
                 hint={t(
-                  '这些模型的额度池已满（上游 429），暂时不参与选号；该账号的其余模型照常服务。到点自动恢复，也可在菜单里手动解除冷却',
-                  'The overage pool for these models is exhausted (upstream 429), so they are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically, or you can clear the cooldown from the menu',
+                  '这些模型的额度池已满（上游 429），暂时不参与账号选择；该账号的其余模型照常服务。到点后自动恢复，也可在菜单里手动解除冷却',
+                  'The quota pool for these models is exhausted (upstream 429), so they are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically when due, or you can clear the cooldown from the menu',
                 )}
               />
             )}
@@ -671,8 +671,8 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('刚被限速', 'Recently throttled')}
                 detail={modelCooldownSummary(cred, language, false)}
                 hint={t(
-                  '这些模型刚被上游限速（容量或请求速率），额度并没有用完。这种限制跟着出口或模型走、不跟着账号走，所以该账号照常参与选号——上游要的是客户端按 retry-after 退避，不是把号停掉',
-                  'These models were just throttled upstream (capacity or request rate); no quota was exhausted. That kind of limit follows the egress or the model rather than the account, so this account keeps taking part in selection — what upstream wants is the client backing off per retry-after, not an account being parked',
+                  '这些模型刚被上游限速（容量或请求速率），额度并没有用完。这类限制取决于出口或模型，而不是账号，所以该账号照常参与账号选择。上游期望的是客户端按 retry-after 退避，而不是停用账号',
+                  'These models were just throttled upstream (capacity or request rate); no quota was exhausted. That kind of limit follows the egress or the model rather than the account, so this account keeps taking part in account selection. What upstream expects is the client backing off per retry-after, not the account being disabled',
                 )}
               />
             )}
@@ -684,8 +684,8 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('套餐不含', 'Not in plan')}
                 detail={modelDenialSummary(cred, language)}
                 hint={t(
-                  '上游判定该账号的套餐不含这些模型（回了 429 却没有任何额度窗口、且组织未开 extra usage），选号时这些模型绕开它，其余模型照常。连通性测试通过、等级变化或菜单里手动解除都会清掉这条记录',
-                  'Upstream reported that this account’s plan does not include these models (a 429 with no quota window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
+                  '上游判定该账号的套餐不含这些模型：返回 429 却没有任何用量窗口，且组织未开启超额用量（extra usage）。为这些模型选择账号时会跳过它，其余模型照常。连通性测试通过、套餐等级变化或在菜单里手动解除，都会清除这条记录',
+                  'Upstream reported that this account’s plan does not include these models (a 429 with no usage window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
                 )}
               />
             )}
@@ -727,11 +727,11 @@ export const CredentialCard = memo(function CredentialCard({
             value={<>{cred.rpm}<SlotLimit limit={rpmLimit > 0 ? rpmLimit : '∞'} /></>}
             hint={rpmLimit > 0
               ? t(
-                `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。打满后新请求分流到别的账号，已绑定的设备收到 429。点击调整`,
-                `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once full, new requests spill to another account and already-bound devices get a 429. Click to adjust`,
+                `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败请求），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。达到上限后，新请求会分流到其他账号，已绑定的设备会收到 429。点击调整`,
+                `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once the limit is reached, new requests go to other accounts and already-bound devices get a 429. Click to adjust`,
               )
               : t(
-                `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的），${rpmPolicyHint}。点击调整`,
+                `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败请求），${rpmPolicyHint}。点击调整`,
                 `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included); ${rpmPolicyHint.toLowerCase()}. Click to adjust`,
               )}
             ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
@@ -851,7 +851,7 @@ function windowStatusLabel(
     return null
   }
   if (status === 'rejected' || status === 'rate_limited') {
-    return { text: t('已拒', 'rejected'), bad: true }
+    return { text: t('已拒绝', 'rejected'), bad: true }
   }
   // 用量窗口的 allowed 是常态，不占地方。
   return null
@@ -914,7 +914,7 @@ function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
                       `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；它不是用量窗口，所以没有百分比`,
                       `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
                     )
-                  : t(`用量窗口 ${w.name}`, `Usage limits window ${w.name}`),
+                  : t(`用量窗口 ${w.name}`, `Usage window ${w.name}`),
                 w.status && t(`上游原值 ${w.status}`, `upstream raw value ${w.status}`),
                 w.resetAt != null && t(
                   `${formatFullTime(w.resetAt, language)} 重置`,
@@ -1006,8 +1006,8 @@ function UpstreamVerdict({
       )
   const representativeDetail = quota.rl_representative
     ? t(
-        `上游称当前起约束作用的是 ${quota.rl_representative} 窗口。若它不在 5h / 7d 里，说明这是一个未被记录的窗口（多为超额池），卡片上没有对应的进度条`,
-        `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not among the 5h / 7d windows, it is an unrecorded window (typically the overage pool) and has no meter on this card`,
+        `上游报告当前起约束作用的是 ${quota.rl_representative} 窗口。若它不是 5h / 7d 之一，说明这是一个未被记录的窗口（通常是超额用量窗口），卡片上没有对应的进度条`,
+        `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not one of the 5h / 7d windows, it is an unrecorded window (typically the extra usage window) and has no meter on this card`,
       )
     : null
   const detail = representativeDetail

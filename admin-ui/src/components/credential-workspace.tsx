@@ -150,7 +150,7 @@ const FILTERS: {
   },
   {
     key: 'tokenInvalid',
-    label: ['Token 失效', 'Token expired'],
+    label: ['token 失效', 'Token expired'],
     match: ({ credential }) =>
       !!credential.ban_reason && credential.resume_at == null && !isAccountBan(credential.ban_reason),
   },
@@ -167,7 +167,7 @@ const FILTERS: {
   },
   {
     key: 'hasDevice',
-    label: ['已绑定设备', 'Devices linked'],
+    label: ['已绑定设备', 'Has bound devices'],
     match: ({ credential }) => credential.device_count > 0,
   },
   {
@@ -437,12 +437,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const rejectionKindLabel = (kind: string) => ({
     'device-limit': t('设备名额满', 'device slots full'),
     'session-limit': t('会话名额满', 'session slots full'),
-    'account-rpm': t('账号 RPM 满', 'account RPM'),
-    'device-rpm': t('设备 RPM 满', 'device RPM'),
-    'session-rpm': t('会话 RPM 满', 'session RPM'),
-    'session-concurrency': t('会话并发满', 'session concurrency'),
-    'bare-rate-limit': t('裸请求限流', 'bare-request limit'),
-    'all-cooling-down': t('全员冷却', 'all cooling down'),
+    'account-rpm': t('账号 RPM 满', 'account RPM full'),
+    'device-rpm': t('设备 RPM 满', 'device RPM full'),
+    'session-rpm': t('会话 RPM 满', 'session RPM full'),
+    'session-concurrency': t('会话并发满', 'session concurrency full'),
+    'bare-rate-limit': t('无设备身份限流', 'no-device-identity rate limit'),
+    'all-cooling-down': t('所有账号冷却中', 'all accounts cooling down'),
     'no-device-id': t('无设备身份', 'no device identity'),
     // 已撤掉的「按模型最低客户端版本」闸（v0.3.157 ~ v0.3.160）留下的历史行，只为它们仍显示成中文。
     'model-min-version': t('客户端版本不支持该模型', 'client too old for model'),
@@ -637,8 +637,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const attentionKindLabels: [string, string, string][] = [
     ['banned', '封禁', 'banned'],
     ['rate-limited', '限流暂停', 'paused'],
-    ['token-invalid', 'Token 失效', 'token expired'],
-    ['overage', '用 credits', 'on credits'],
+    ['token-invalid', 'token 失效', 'token expired'],
+    ['overage', '使用 credits', 'on credits'],
     ['overage-unknown', 'credits 待确认', 'credits unconfirmed'],
     ['cooldown', '冷却', 'cooling down'],
     ['near-limit', '将满', 'near limit'],
@@ -652,8 +652,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     // 本地拒绝数的是请求条数。
     metrics.modelOnlyCoolingCount > 0
       ? t(
-          `另 ${formatNumber(metrics.modelOnlyCoolingCount)} 个模型冷却`,
-          `+${formatNumber(metrics.modelOnlyCoolingCount)} model cooldown`,
+          `另 ${formatNumber(metrics.modelOnlyCoolingCount)} 个账号有模型冷却`,
+          `+${formatNumber(metrics.modelOnlyCoolingCount)} with model cooldown`,
         )
       : '',
     rejectedTotal > 0
@@ -663,7 +663,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const quotaRiskStatus = [
     metrics.activeOverageCount > 0
       ? t(
-          `${formatNumber(metrics.activeOverageCount)} 用 credits`,
+          `${formatNumber(metrics.activeOverageCount)} 使用 credits`,
           `${formatNumber(metrics.activeOverageCount)} on credits`,
         )
       : '',
@@ -687,8 +687,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       )
     : metrics.unlimitedDeviceAccounts > 0
       ? t(
-          `${formatNumber(metrics.unlimitedDeviceAccounts)} 个不限额账号`,
-          `${formatNumber(metrics.unlimitedDeviceAccounts)} unlimited ${metrics.unlimitedDeviceAccounts === 1 ? 'account' : 'accounts'}`,
+          `${formatNumber(metrics.unlimitedDeviceAccounts)} 个账号不限设备数`,
+          `${formatNumber(metrics.unlimitedDeviceAccounts)} ${metrics.unlimitedDeviceAccounts === 1 ? 'account' : 'accounts'} with no device limit`,
         )
       : metrics.deviceCapacity > 0
         ? t(
@@ -819,7 +819,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                     onClick={actions.onRetry}
                   >
-                    {t('刷新失败，重试', 'Refresh failed. Retry')}
+                    {t('刷新失败，点击重试', 'Refresh failed. Click to retry')}
                   </button>
                 </>
               ) : (
@@ -1399,8 +1399,8 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
         <EmptyTitle>{t('建立第一个调度账号', 'Add your first schedulable account')}</EmptyTitle>
         <EmptyDescription>
           {t(
-            '完成 Claude OAuth 授权后，账号会加入当前网关的调度池。',
-            'After Claude OAuth authorization, the account joins this gateway’s scheduling pool.',
+            '账号池里还没有账号。完成 Claude OAuth 授权后，账号会加入当前网关的调度池。',
+            'There are no accounts in the pool yet. After Claude OAuth authorization, the account joins this gateway’s scheduling pool.',
           )}
         </EmptyDescription>
       </EmptyHeader>

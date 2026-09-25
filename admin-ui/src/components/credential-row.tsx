@@ -465,7 +465,7 @@ export const CredentialRow = memo(function CredentialRow({
           <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
         </TableCell>
         <TableCell className={COL.priority}>
-          <span className="font-semibold text-sm tabular-nums" title={t('数值越小，调度优先级越高', 'Lower values have higher scheduling priority')}>
+          <span className="font-semibold text-sm tabular-nums" title={t('数值越小，调度优先级越高', 'Lower values are scheduled first')}>
             P{cred.priority}
           </span>
         </TableCell>
@@ -475,8 +475,8 @@ export const CredentialRow = memo(function CredentialRow({
               <Badge
                 variant="warning"
                 title={t(
-                  `组织账号（${cred.org_type}）：用量由整个组织共享`,
-                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation`,
+                  `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
+                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
                 )}
               >
                 {orgBadgeLabel(cred)}
@@ -553,11 +553,11 @@ export const CredentialRow = memo(function CredentialRow({
               usage={rpmUsage}
               title={rpmLimit > 0
                 ? t(
-                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败的），打满后新请求分流到别的账号、已绑定的设备收到 429 · ${rpmPolicy.label}策略 · 点击调整`,
-                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included); once full, new requests spill to another account and bound devices get a 429 · ${rpmPolicy.label} policy · click to adjust`,
+                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败请求）。达到上限后，新请求会分流到其他账号，已绑定的设备会收到 429 · ${rpmPolicy.label}策略 · 点击调整`,
+                  `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included). Once the limit is reached, new requests go to other accounts and already-bound devices get a 429 · ${rpmPolicy.label} policy · click to adjust`,
                 )
                 : t(
-                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败的） · ${rpmPolicy.label}策略 · 点击调整`,
+                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败请求） · ${rpmPolicy.label}策略 · 点击调整`,
                   `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included) · ${rpmPolicy.label} policy · click to adjust`,
                 )}
               ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
@@ -728,7 +728,7 @@ function RenameCredentialDialog({
           <DialogHeader>
             <DialogTitle>{t('重命名账号', 'Rename account')}</DialogTitle>
             <DialogDescription>
-              {t('修改列表中显示的账号名称，不会变更上游凭证。', 'Change the account name shown in the list without modifying the upstream credential.')}
+              {t('修改列表中显示的账号名称，不会改动上游账号本身。', 'Change the account name shown in the list; the upstream account itself is not modified.')}
             </DialogDescription>
           </DialogHeader>
           <DialogPanel>
@@ -861,7 +861,7 @@ function ListQuotaMeter({
   const summaryTitle = requests == null
     ? undefined
     : t(
-        `${label}本周期：${requests.toLocaleString(locale)} 次请求 · ${tokens == null ? '—' : `${tokens.toLocaleString(locale)} token`} · ${cost == null ? '—' : formatUsd(cost)}`,
+        `${label} 本周期：${requests.toLocaleString(locale)} 次请求 · ${tokens == null ? '—' : `${tokens.toLocaleString(locale)} token`} · ${cost == null ? '—' : formatUsd(cost)}`,
         `${label} this period: ${requests.toLocaleString(locale)} ${requests === 1 ? 'request' : 'requests'} · ${tokens == null ? '—' : `${tokens.toLocaleString(locale)} tokens`} · ${cost == null ? '—' : formatUsd(cost)}`,
       )
 
@@ -900,10 +900,10 @@ function ListQuotaMeter({
     const emptyLabel = expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')
     const emptyDetail = expired && reset != null
       ? t(
-          `${label}窗口已于 ${formatFullTime(reset, language)} 重置，之后暂无新请求`,
+          `${label} 窗口已于 ${formatFullTime(reset, language)} 重置，之后暂无新请求`,
           `${label} window reset at ${formatFullTime(reset, language)}; there are no newer requests`,
         )
-      : t(`${label}用量暂无数据`, `No ${label} usage data`)
+      : t(`${label} 用量暂无数据`, `No ${label} usage data`)
     return (
       <div
         className="flex w-full flex-col gap-2"
@@ -934,7 +934,7 @@ function ListQuotaMeter({
 
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
-  const title = t(`${label}用量 ${percentage}%`, `${label} usage ${percentage}%`)
+  const title = t(`${label} 用量 ${percentage}%`, `${label} usage ${percentage}%`)
   if (!showLabel) {
     // 表格那格 11rem（内容宽 156px）里要排四样东西，按「谁跟谁是一件事」分两行，而不是按大小塞：
     // 第一行是用量本身（摘要 + 百分比，两个都在回答「用掉多少」），第二行是这个窗口的时间维度

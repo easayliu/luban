@@ -48,7 +48,7 @@ const RPM_MODE_ITEMS = [
 /** 提前停调度阈值的三态：与后端取值一一对应（null / 0 / 1..100），5h 与 7d 两档各用一份。 */
 const QUOTA_MODE_ITEMS = [
   { value: 'default', chinese: '跟随全局', english: 'Use global' },
-  { value: 'off', chinese: '不停', english: 'Off' },
+  { value: 'off', chinese: '不提前停', english: 'Off' },
   { value: 'custom', chinese: '独立阈值', english: 'Custom' },
 ] as const
 type QuotaMode = (typeof QUOTA_MODE_ITEMS)[number]['value']
@@ -61,7 +61,7 @@ function quotaPctOf(mode: QuotaMode, custom: number): number | null {
 
 function describeQuotaPct(pct: number | null, t: (zh: string, en: string) => string): string {
   if (pct === null) return t('跟随全局', 'global')
-  if (pct <= 0) return t('不停', 'off')
+  if (pct <= 0) return t('不提前停', 'off')
   return `${pct}%`
 }
 
@@ -193,8 +193,8 @@ export function BatchActionsBar({
           `Set the device limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已把 ${formattedCount} 个账号改为跟随全局默认上限`,
-            `Set ${englishAccountCount} to use the global default limit`,
+            `已把 ${formattedCount} 个账号改为跟随全局默认设备上限`,
+            `Set ${englishAccountCount} to use the global default device limit`,
           )
             : t(
               `已把 ${formattedCount} 个账号设为不限设备数`,
@@ -212,7 +212,7 @@ export function BatchActionsBar({
           `Set the session limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已把 ${formattedCount} 个账号改为跟随全局默认会话上限`,
+            `已把 ${formattedCount} 个账号改为跟随全局默认模拟会话上限`,
             `Set ${englishAccountCount} to use the global default session limit`,
           )
             : t(
@@ -298,7 +298,7 @@ export function BatchActionsBar({
   const proxyUrl = proxyMode === 'direct' ? null : proxyMode === 'pool' ? selectedProxyUrl : customProxyUrl.trim()
   const proxyModeItems = [
     { value: 'direct', label: t('直连', 'Direct') },
-    ...(savedProxies.length > 0 ? [{ value: 'pool', label: t('从代理池选', 'From pool') }] : []),
+    ...(savedProxies.length > 0 ? [{ value: 'pool', label: t('从代理池选择', 'From proxy pool') }] : []),
     { value: 'custom', label: t('自定义地址', 'Custom URL') },
   ]
 
@@ -376,7 +376,7 @@ export function BatchActionsBar({
 
             <SettingRow
               title={t('设备上限', 'Device limit')}
-              hint={t('默认、不限或独立上限', 'Default, unlimited, or custom')}
+              hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
               action={
                 <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
                   {t('应用', 'Apply')}
@@ -404,7 +404,7 @@ export function BatchActionsBar({
 
             <SettingRow
               title={t('模拟会话上限', 'Session limit')}
-              hint={t('默认、不限或独立上限', 'Default, unlimited, or custom')}
+              hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
               action={
                 <Button size="sm" loading={applySessionLimit.isPending} disabled={busy} onClick={() => applySessionLimit.mutate(sessionLimit)}>
                   {t('应用', 'Apply')}
@@ -432,7 +432,7 @@ export function BatchActionsBar({
 
             <SettingRow
               title={t('RPM 上限', 'RPM limit')}
-              hint={t('每分钟最多转发多少条', 'Max requests forwarded per minute')}
+              hint={t('每分钟最多转发的请求数', 'Max requests forwarded per minute')}
               action={
                 <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
                   {t('应用', 'Apply')}
@@ -461,7 +461,7 @@ export function BatchActionsBar({
             {/* 提前停调度阈值：5h / 7d 两档各自三态，一次整份覆盖所选账号（覆盖设置页的全局值）。 */}
             <SettingRow
               title={t('提前停调度阈值', 'Early pause threshold')}
-              hint={t('额度用到多少就挪出调度池，两档一起覆盖全局', 'Leave the pool at this utilization; both windows override the global value')}
+              hint={t('使用率达到阈值即移出调度池；两个窗口一起覆盖全局设置', 'Removed from the scheduling pool at this utilization; both windows override the global setting')}
               action={
                 <Button size="sm" loading={applyQuotaPause.isPending} disabled={busy} onClick={() => applyQuotaPause.mutate({ pct: quotaPct, pct7d: quotaPct7d })}>
                   {t('应用', 'Apply')}
@@ -510,7 +510,7 @@ export function BatchActionsBar({
                   {t('出站代理', 'Outbound proxy')}
                 </span>
               )}
-              hint={t('统一设置出站代理或改回直连', 'Set outbound proxy or switch to direct')}
+              hint={t('统一设置出站代理或改回直连', 'Set an outbound proxy or switch back to direct connection')}
               action={
                 <Button
                   size="sm"

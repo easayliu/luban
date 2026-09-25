@@ -98,7 +98,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                     <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
                     <th scope="col" className="text-end">{t('命中', 'Cached')}</th>
                     <th scope="col" className="text-end">{t('写入', 'Written')}</th>
-                    <th scope="col" className="text-end">{t('裸算', 'Uncached')}</th>
+                    <th scope="col" className="text-end">{t('未缓存', 'Uncached')}</th>
                     <th scope="col" className="text-end">{t('省下', 'Saved')}</th>
                   </>
                 )}
@@ -116,7 +116,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
               <tfoot>
                 <tr className="[&>*]:border-t [&>*]:bg-surface-subtle [&>*]:px-3 [&>*]:py-1.5 [&>*]:font-medium">
                   <th className="text-start" scope="row">{t('合计', 'Total')}</th>
-                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 命中 / 写入 / 裸算 / 省下。
+                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 命中 / 写入 / 未缓存 / 省下。
                       合计只有「省下」这一列有值，中间 5 列留空。 */}
                   <td colSpan={5} />
                   <td className="text-end">
@@ -135,12 +135,12 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                       <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
                         {query.data.cache_saved_usd_total >= 0
                           ? t(
-                              '命中按十分之一计价省下的，减去写入按 1.25 倍多付的。',
-                              'Savings from cached input billed at a tenth, minus the premium paid on writes.',
+                              '命中部分按 0.1 倍计价省下的金额，减去写入部分按 1.25 倍多付的金额。',
+                              'Savings from cached input billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
                             )
                           : t(
-                              '写入多付的超过了命中省下的，前缀多半每轮都在变。',
-                              'Write premiums exceeded cache savings — the prefix is probably changing every turn.',
+                              '写入多付的金额超过了命中省下的金额，通常是前缀每轮都在变。',
+                              'The extra paid for cache writes exceeded the cache savings; the prefix is usually changing every turn.',
                             )}
                       </TooltipPopup>
                     </Tooltip>
@@ -179,7 +179,7 @@ function BreakdownTr({
     <tr
       className="cursor-pointer hover:bg-muted/40 [&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0"
       onClick={onOpen}
-      title={t('点击看这一组最近的请求', 'Click to see recent requests of this group')}
+      title={t('点击看这一组最近的请求', 'Click to see recent requests in this group')}
     >
       <td className="max-w-56">
         <span className="flex min-w-0 items-center gap-1.5">

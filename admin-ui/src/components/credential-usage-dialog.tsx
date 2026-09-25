@@ -198,7 +198,7 @@ export function CredentialUsageDialog({
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
               {t(
-                '流水仅保留最近 30 天；卡片累计花费来自终身账本，因此两者无需相等。',
+                '流水仅保留最近 30 天；卡片上的累计花费来自终身账本，因此两者不一定相等。',
                 'Logs are retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
               )}
             </p>
@@ -539,24 +539,24 @@ function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead
             className="whitespace-nowrap"
-            title={t('来访客户端自带的 device_id（设备绑定与设备上限按它算）', 'device_id carried by the incoming client (device bindings and limits use it)')}
+            title={t('客户端请求自带的 device_id（设备绑定与设备上限都按它计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}
           >
-            {t('设备', 'Device')}
+            {t('入站设备', 'Inbound device')}
           </TableHead>
           <TableHead
             className="whitespace-nowrap"
             title={t(
-              '实际发给上游的 device_id（按账号派生）；上游侧给出的设备 id 对的是这一列。旧记录为空',
-              'device_id actually sent upstream (derived per account); an id quoted by upstream matches this column. Empty for older rows',
+              '实际发给上游的 device_id（按账号派生）；上游给出的设备 ID 对应的是这一列。旧记录为空',
+              'device_id actually sent upstream (derived per account); a device ID quoted by upstream corresponds to this column. Empty for older rows',
             )}
           >
-            {t('出站设备', 'Device out')}
+            {t('出站设备', 'Outbound device')}
           </TableHead>
           <TableHead
             className="whitespace-nowrap"
             title={t(
-              'luban 回在响应头 X-Oneapi-Request-Id 上的请求 ID，New API 日志里叫 upstream_request_id；点击复制',
-              'Request ID luban returns in the X-Oneapi-Request-Id header (upstream_request_id in New API logs); click to copy',
+              'luban 在响应头 X-Oneapi-Request-Id 中返回的请求 ID，New API 日志里叫 upstream_request_id；点击 ID 查看这条请求，点击旁边的图标复制',
+              'Request ID luban returns in the X-Oneapi-Request-Id response header (upstream_request_id in New API logs); click the ID to look up the request, or the icon next to it to copy',
             )}
           >
             {t('请求 ID', 'Request ID')}
@@ -566,8 +566,8 @@ function UsageTable({
           <TableHead
             className="min-w-52 whitespace-nowrap"
             title={t(
-              '来访客户端自报的 User-Agent；被改写时另起一行显示实际发给上游的那份',
-              'User-Agent reported by the incoming client; when rewritten, the one actually sent upstream is shown on a second line',
+              '客户端自报的 User-Agent；被改写时，另起一行显示实际发给上游的 User-Agent',
+              'User-Agent reported by the client; when rewritten, the one actually sent upstream is shown on a second line',
             )}
           >
             {t('客户端 UA', 'Client UA')}
@@ -630,7 +630,7 @@ function UsageTable({
                   log.cost_usd == null && 'text-muted-foreground',
                 )}
                 title={log.cost_usd == null
-                  ? t('模型未在价目表内，无法估算', 'Model is not in the price table, cost cannot be estimated')
+                  ? t('模型不在价目表内，无法估算花费', 'Model is not in the price table, so the cost cannot be estimated')
                   : undefined}
               >
                 {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}

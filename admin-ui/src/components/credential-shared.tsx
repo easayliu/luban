@@ -342,10 +342,10 @@ function statusFromQuota(
     }
     return {
       kind: 'token-invalid', variant: 'warning',
-      label: localize(language, 'Token 失效', 'Token expired'),
+      label: localize(language, 'token 失效', 'Token expired'),
       detail: localize(
         language,
-        'Refresh token 已失效，需要重新登录授权',
+        'refresh token 已失效，需要重新登录授权',
         'Refresh token is no longer valid; re-authentication is required',
       ),
       attention: true, rank: 5,
@@ -382,14 +382,14 @@ function statusFromQuota(
       detail: quota.overageUnresolved === 'no-full-window'
         ? localize(
             language,
-            `用量快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等新请求也不会更清楚，做一次连通性测试看上游此刻的原始限流响应头`,
-            `The usage snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this — run a connectivity test to see the upstream's current raw rate limit headers`,
+            `用量快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等待新请求也无法确认，请做一次连通性测试，查看上游此刻的原始限流响应头`,
+            `The usage snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this; run a connectivity test to see the upstream's current raw rate limit headers`,
           )
         : quota.overageUnresolved === 'legacy-snapshot'
           ? localize(
               language,
-              `用量快照（${snapshotTime}）早于「记录全部用量窗口」这次升级，只存了 5h / 7d 两个窗口，吃满的那个（多为超额池）没被存下来。下一条带限流响应头的请求会自动补齐`,
-              `The usage snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the overage pool) was not kept. The next request carrying rate limit headers will fill it in`,
+              `用量快照（${snapshotTime}）早于「记录全部用量窗口」这次升级，只保存了 5h / 7d 两个窗口，已用满的那个窗口（通常是超额用量窗口）没有保存下来。下一条带限流响应头的请求会自动补齐`,
+              `The usage snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the extra usage window) was not kept. The next request carrying rate limit headers will fill it in`,
             )
           : localize(
               language,
@@ -736,17 +736,17 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
   const sessionLimit = useMutation({
     mutationFn: (n: number) => setSessionLimit(cred.id, n),
     onSuccess: () => {
-      toastManager.add({ title: t('已保存会话上限', 'Session limit saved'), type: 'success' })
+      toastManager.add({ title: t('模拟会话上限已保存', 'Session limit saved'), type: 'success' })
       invalidate()
     },
-    onError: (e) => failure(t('设置会话上限失败', 'Failed to set the session limit'), e),
+    onError: (e) => failure(t('设置模拟会话上限失败', 'Failed to set the session limit'), e),
   })
   // RPM 上限与设备上限分开两个 mutation：两者的失败提示不一样，共用一个的话，
   // 改 RPM 失败会弹出「设置设备上限失败」。
   const rpmLimit = useMutation({
     mutationFn: (n: number) => setRpmLimit(cred.id, n),
     onSuccess: () => {
-      toastManager.add({ title: t('已保存 RPM 上限', 'RPM limit saved'), type: 'success' })
+      toastManager.add({ title: t('RPM 上限已保存', 'RPM limit saved'), type: 'success' })
       invalidate()
     },
     onError: (e) => failure(t('设置 RPM 上限失败', 'Failed to set the RPM limit'), e),
@@ -756,7 +756,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     mutationFn: ({ pct, pct7d }: { pct: number | null; pct7d: number | null }) =>
       setCredentialQuotaPausePct(cred.id, pct, pct7d),
     onSuccess: () => {
-      toastManager.add({ title: t('已保存提前停调度阈值', 'Early pause threshold saved'), type: 'success' })
+      toastManager.add({ title: t('提前停调度阈值已保存', 'Early pause threshold saved'), type: 'success' })
       invalidate()
     },
     onError: (e) => failure(t('设置提前停调度阈值失败', 'Failed to set the early pause threshold'), e),
@@ -764,7 +764,7 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
   const proxy = useMutation({
     mutationFn: (url: string | null) => setProxy(cred.id, url),
     onSuccess: () => {
-      toastManager.add({ title: t('已保存出站代理', 'Outbound proxy saved'), type: 'success' })
+      toastManager.add({ title: t('出站代理已保存', 'Outbound proxy saved'), type: 'success' })
       invalidate()
       qc.invalidateQueries({ queryKey: ['proxies'] })
     },
@@ -772,17 +772,17 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
   })
   const refresh = useMutation({
     mutationFn: () => refreshCredential(cred.id),
-    onSuccess: () => { toastManager.add({ title: t('已刷新', 'Refreshed'), type: 'success' }); invalidate() },
-    onError: (e) => failure(t('刷新失败', 'Refresh failed'), e),
+    onSuccess: () => { toastManager.add({ title: t('token 已刷新', 'Token refreshed'), type: 'success' }); invalidate() },
+    onError: (e) => failure(t('刷新 token 失败', 'Token refresh failed'), e),
   })
   const remove = useMutation({
     mutationFn: () => deleteCredential(cred.id),
-    onSuccess: () => { toastManager.add({ title: t('已删除', 'Deleted'), type: 'success' }); invalidate() },
-    onError: (e) => failure(t('删除失败', 'Delete failed'), e),
+    onSuccess: () => { toastManager.add({ title: t('账号已删除', 'Account deleted'), type: 'success' }); invalidate() },
+    onError: (e) => failure(t('删除账号失败', 'Failed to delete account'), e),
   })
   const cooldown = useMutation({
     mutationFn: () => clearCooldown(cred.id),
-    onSuccess: () => { toastManager.add({ title: t('已解除冷却', 'Cooldown cleared'), type: 'success' }); invalidate() },
+    onSuccess: () => { toastManager.add({ title: t('冷却已解除', 'Cooldown cleared'), type: 'success' }); invalidate() },
     onError: (e) => failure(t('解除冷却失败', 'Failed to clear cooldown'), e),
   })
 
@@ -1318,7 +1318,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
         <span
           className="text-destructive-foreground"
           title={t(
-            `上游 retry-after: ${quota.retry_after_secs} 秒`,
+            `上游 retry-after：${quota.retry_after_secs} 秒`,
             `Upstream retry-after: ${quota.retry_after_secs} ${quota.retry_after_secs === 1 ? 'second' : 'seconds'}`,
           )}
         >
@@ -1330,7 +1330,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
         <span
           className="text-destructive-foreground"
           title={t(
-            '本次请求由 Usage credits（上游头里的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
+            '本次请求由 Usage credits（上游响应头里的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
             'This request was served by usage credits (`overage` in the upstream headers): the plan\'s included usage is exhausted and standard API rates now apply',
           )}
         >
@@ -1571,11 +1571,11 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
       }
     }
     return {
-      text: localize(language, 'Token 失效', 'Token expired'),
+      text: localize(language, 'token 失效', 'Token expired'),
       className: 'font-medium text-warning-foreground',
       title: localize(
         language,
-        'Refresh token 已失效，需要重新登录授权',
+        'refresh token 已失效，需要重新登录授权',
         'Refresh token is no longer valid; re-authentication is required',
       ),
     }
@@ -1619,8 +1619,8 @@ export function switchTitle(cred: Credential, language: Language = 'zh-CN'): str
     }
     return localize(
       language,
-      'Refresh token 已失效，需要重新登录授权 · 点击可手动停用',
-      'Refresh token expired; re-authentication required · Click to disable manually',
+      'refresh token 已失效，需要重新登录授权 · 点击可手动停用',
+      'Refresh token is no longer valid; re-authentication is required · Click to disable manually',
     )
   }
   return localize(language, '已启用（点击停用）', 'Enabled (click to disable)')
