@@ -5,7 +5,6 @@ import {
   ClockIcon,
   BanIcon,
   Building2Icon,
-  EllipsisIcon,
   GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
@@ -29,11 +28,14 @@ import {
 } from '@/lib/utils'
 import {
   ConnectivityTestDialog,
-  CredentialMenuContent,
+  credentialDetailHref,
+  CredentialActionsMenu,
   DeferredMount,
   DeleteCredentialDialog,
   deviceUsageMeta,
   evaluateCredential,
+  fablePoolHint,
+  fablePoolWindow,
   modelCooldownSummary,
   modelDenialSummary,
   proxyLabelParts,
@@ -68,7 +70,6 @@ import {
 } from '@/components/ui/card'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Menu, MenuTrigger } from '@/components/ui/menu'
 import {
   Meter,
   MeterIndicator,
@@ -86,9 +87,10 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
  * 读数若按内容伸缩，`1/10` 与 `0/100` 宽度不同，后面那格就跟着往左右挪——一列卡片叠下来，
  * 会话图标、RPM 图标各在各的位置上，竖着扫过去是锯齿状的。定宽之后每格等宽，卡片之间对齐，
  * 数字也都从同一处起读。2.25rem 够放 `0/100`（手机 12px 字号），再长才会把它撑开。
- * `@xs/card`（卡片窄于 320px）时放弃定宽，让这一行在极窄屏上还能自己收进去。
+ * 卡片窄于 22rem（360 那档手机上卡片只有 328px）时放弃定宽：三格各多占的几像素加起来，正好把
+ * 右边的累计费用挤成「$44.…」。窄卡上一列卡片本来也只有一张，竖向对齐无从谈起。
  */
-const SLOT_WIDTH = '@xs/card:min-w-9'
+const SLOT_WIDTH = '@min-[22rem]/card:min-w-9'
 
 /**
  * 名额占用 → 数字的颜色。空闲灰、健康绿、吃紧黄、占满红，判定见 [deviceUsageMeta]。
@@ -199,6 +201,8 @@ export const CredentialCard = memo(function CredentialCard({
   // 摘不掉，所以改成显式的「无此窗口」，见 credential-row 的 ListQuotaMeter。
   const has5h = quota.h5.reported
   const has7d = quota.d7.reported
+  // fable 额度池（7d_oi）挂在 7d 那一列下面：同为 7 天周期，上下对着比；上游没报就不占位。
+  const fablePool = fablePoolWindow(quota)
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
   // 0 = 不限，此时页脚只显示 RPM 本身，不画分母、也不谈「打满」。
   const rpmLimit = cred.rpm_limit_effective
@@ -410,7 +414,10 @@ export const CredentialCard = memo(function CredentialCard({
                     className="block min-w-0 truncate whitespace-nowrap leading-snug"
                     title={credentialLabel}
                   >
-                    {credentialLabel}
+                    {/* 账号名即详情页入口：用真链接而不是按钮，中键 / ⌘ 点击能在新标签页打开。 */}
+                    <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
+                      {credentialLabel}
+                    </a>
                   </h3>
                   <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
@@ -435,14 +442,9 @@ export const CredentialCard = memo(function CredentialCard({
 
           {!editing && (
             <CardAction>
-              <Menu modal={false}>
-                <MenuTrigger
-                  className={buttonVariants({ size: 'icon', variant: 'ghost' })}
-                  aria-label={t(`打开 ${credentialLabel} 菜单`, `Open menu for ${credentialLabel}`)}
-                >
-                  <EllipsisIcon />
-                </MenuTrigger>
-                <CredentialMenuContent
+              <CredentialActionsMenu
+                triggerClassName={buttonVariants({ size: 'icon', variant: 'ghost' })}
+                triggerLabel={t(`打开 ${credentialLabel} 菜单`, `Open menu for ${credentialLabel}`)}
                   cred={cred}
                   actions={actions}
                   onRename={() => {
@@ -456,8 +458,7 @@ export const CredentialCard = memo(function CredentialCard({
                   onUsage={() => setUsageOpen(true)}
                   onTest={() => setTesting(true)}
                   onRequestDelete={() => setConfirmDelete(true)}
-                />
-              </Menu>
+              />
             </CardAction>
           )}
         </CardHeader>
@@ -498,7 +499,9 @@ export const CredentialCard = memo(function CredentialCard({
                 {status.label}
               </Badge>
             )}
-            {cred.quota && (
+            {/* 被拒的那个窗口下面已经画成红条（5h / 7d / fable）时，这枚徽章说的是同一件事，不挂；
+                只在上游点名的窗口没有进度条可看（未知窗口、老快照）时，它才是唯一的解释。 */}
+            {cred.quota && !verdictShownByMeter(cred.quota.rl_representative, has5h, has7d, fablePool != null) && (
               <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
             )}
             {isOrgAccount(cred) && (
@@ -587,10 +590,12 @@ export const CredentialCard = memo(function CredentialCard({
                     className="inline-flex items-center gap-1 text-xs text-muted-foreground"
                   >
                     <ClockIcon className="size-3" />
-                    {t(
-                      `更新于 ${relativeTime(cred.quota.ts, now, language)}`,
-                      `Updated ${relativeTime(cred.quota.ts, now, language)}`,
-                    )}
+                    {/* 窄卡且旁边挂着 Usage credits 徽章时，「用量限制 · 徽章 · 更新于 N 小时前」一行放不下，
+                        时间戳会被挤到下一行单独一行。这时只去掉「更新于」三个字，时钟图标已经说明了它是什么。 */}
+                    <span className={cn(secondaryOverage && '@max-[24rem]/card:hidden')}>
+                      {t('更新于 ', 'Updated ')}
+                    </span>
+                    {relativeTime(cred.quota.ts, now, language)}
                   </TooltipTrigger>
                   <TooltipPopup>{formatFullTime(cred.quota.ts, language)}</TooltipPopup>
                 </Tooltip>
@@ -598,7 +603,7 @@ export const CredentialCard = memo(function CredentialCard({
                 <span className="text-xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
               )}
             </div>
-            {cred.quota && (has5h || has7d) ? (
+            {cred.quota && (has5h || has7d || fablePool) ? (
               // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
               //
               // 两个窗口都有时**任何宽度下都是两列**，手机上也不摞成两行：5h 与 7d 是同一
@@ -614,7 +619,7 @@ export const CredentialCard = memo(function CredentialCard({
               <div
                 className={cn(
                   'grid gap-3',
-                  has5h && has7d && 'grid-cols-2 @min-[27rem]/card:gap-4',
+                  has5h && (has7d || fablePool) && 'grid-cols-2 @min-[27rem]/card:gap-4',
                 )}
               >
                 {has5h && (
@@ -632,18 +637,25 @@ export const CredentialCard = memo(function CredentialCard({
                     now={now}
                   />
                 )}
-                {has7d && (
-                  <QuotaMeter
-                    credentialLabel={credentialLabel}
-                    label="7d"
-                    util={quota.d7.utilization}
-                    reset={cred.quota.rl_7d_reset}
-                    cost={cred.quota.cost_7d}
-                    requests={cred.quota.requests_7d}
-                    tokens={cred.quota.tokens_7d}
-                    snapshotTs={cred.quota.ts}
-                    now={now}
-                  />
+                {(has7d || fablePool) && (
+                  <div className="flex min-w-0 flex-col gap-1.5">
+                    {has7d && (
+                      <QuotaMeter
+                        credentialLabel={credentialLabel}
+                        label="7d"
+                        // 下面挂着 fable 那条时，两条的窗口名格一起放宽到 `fable` 的宽度，条的起点才对齐。
+                        labelClassName={fablePool ? 'w-8' : undefined}
+                        util={quota.d7.utilization}
+                        reset={cred.quota.rl_7d_reset}
+                        cost={cred.quota.cost_7d}
+                        requests={cred.quota.requests_7d}
+                        tokens={cred.quota.tokens_7d}
+                        snapshotTs={cred.quota.ts}
+                        now={now}
+                      />
+                    )}
+                    {fablePool && <FablePoolMeter window={fablePool} now={now} />}
+                  </div>
                 )}
               </div>
             ) : cred.quota ? (
@@ -868,12 +880,17 @@ function windowStatusLabel(
  * **但状态词要按窗口的种类翻译**，见 [`windowStatusLabel`]：同一个 `rejected` 在用量窗口上
  * 是「这个池子满了」，在 `overage` 那个可用性标记上却是「Usage credits 用不了」。
  */
-function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
-  const { t, language } = useI18n()
-  const visibleWindows = windows.filter((w) => (
+/** [ExtraWindows] 实际会画出来的那几个窗口；调用方据此决定要不要给它留一块位置。 */
+export function visibleExtraWindows(windows: QuotaWindowMeta[]): QuotaWindowMeta[] {
+  return windows.filter((w) => (
     w.name.toLowerCase() !== '7d_oi'
     && (!isCapabilityWindow(w) || w.status === 'allowed' || w.status === 'allowed_warning')
   ))
+}
+
+export function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
+  const { t, language } = useI18n()
+  const visibleWindows = visibleExtraWindows(windows)
   if (visibleWindows.length === 0) return null
 
   return (
@@ -971,6 +988,32 @@ function ModelStateLine({
 }
 
 /**
+ * 上游点名的起约束窗口（`representative-claim`）是否已经画成了一条进度条。是的话，红条本身就
+ * 说明了「哪里满了」，[UpstreamVerdict] 那枚徽章再说一遍就是重复。认不出的窗口名一律算没画。
+ */
+export function verdictShownByMeter(
+  representative: string | null,
+  has5h: boolean,
+  has7d: boolean,
+  hasFablePool: boolean,
+): boolean {
+  // 上游的 claim 名（`five_hour`）与窗口名（`5h`）两种写法都认：老快照里存的是哪种没有保证。
+  switch (representative) {
+    case 'five_hour':
+    case '5h':
+      return has5h
+    case 'seven_day':
+    case '7d':
+      return has7d
+    case 'seven_day_overage_included':
+    case '7d_oi':
+      return hasFablePool
+    default:
+      return false
+  }
+}
+
+/**
  * 上游对**这个账号**的整体额度判决（`anthropic-ratelimit-unified-status`），
  * 以及它认为当前是哪个窗口在管事（`representative-claim`）。`allowed` 是常态，不占地方。
  *
@@ -978,12 +1021,15 @@ function ModelStateLine({
  * （实测多为超额池 `7d_oi`）后端只用来判冷却、并不落库，所以卡片上没有它的进度条可看，
  * 但上游的判决与它的名字是在快照里的。缺了这个状态，那种账号在界面上就是「一切正常却在烧钱」。
  */
-function UpstreamVerdict({
+export function UpstreamVerdict({
   quota,
   credentialLabel,
+  size = 'xs',
 }: {
   quota: NonNullable<Credential['quota']>
   credentialLabel: string
+  /** 卡片里是 `xs`（整张卡写死 12px）；详情页页头的徽章是默认档，跟着传进来。 */
+  size?: 'xs' | 'default'
 }) {
   const { t, language } = useI18n()
   const status = quota.unified_status
@@ -1018,7 +1064,7 @@ function UpstreamVerdict({
     <Tooltip>
       <TooltipTrigger
         className={cn(
-          badgeVariants({ size: 'xs', variant: destructive ? 'error' : 'warning' }),
+          badgeVariants({ size, variant: destructive ? 'error' : 'warning' }),
           'cursor-help',
         )}
         delay={0}
@@ -1091,6 +1137,7 @@ function QuotaFact({
 function QuotaMeter({
   credentialLabel,
   label,
+  labelClassName,
   util,
   reset,
   cost,
@@ -1101,6 +1148,8 @@ function QuotaMeter({
 }: {
   credentialLabel: string
   label: string
+  /** 窗口名那一格的宽度，默认 `w-5`；7d 下面挂着 fable 那条时放宽，见调用处。 */
+  labelClassName?: string
   util: number | null
   reset: number | null
   cost: number | null
@@ -1175,7 +1224,7 @@ function QuotaMeter({
             借给分类只会让一张卡片上五六块彩色抢同一份注意力。定宽 1.25rem 让 5h、7d 两条的
             起点对齐。 */}
         <MeterLabel
-          className="w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums"
+          className={cn('w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums', labelClassName)}
         >
           <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
           {label}
@@ -1224,5 +1273,55 @@ function QuotaMeter({
         )}
       </div>
     </Meter>
+  )
+}
+
+/**
+ * fable 额度池（`7d_oi`）那一条：只有进度条这一行，没有上面那排请求数 / token / 费用——上游只给
+ * 使用率与重置时刻，配一排「—」会让人以为是数据缺了。
+ *
+ * 各格宽度与 [QuotaMeter] 的进度条那一行逐一对齐（窗口名 `w-8`、百分比 `w-9`、倒计时 `w-12`，
+ * 窄卡上后两格按内容取宽），挂在 7d 正下方时两条的起点、条尾都在同一条竖线上，长度可以直接比。
+ * 条比上面细一档（h-1）：它是 7d 之下的一个子池，不是与 5h / 7d 平级的第三个窗口。
+ *
+ * 配色走同一套档位，但它满了只挡 fable，不进账号状态（见 [fablePoolWindow]）。
+ */
+function FablePoolMeter({ window: w, now }: { window: QuotaWindowMeta; now: number }) {
+  const { t, language } = useI18n()
+  const percentage = w.percentage ?? 0
+  const level = quotaLevel(w.utilization)
+  const rejected = w.status === 'rejected' || w.status === 'rate_limited'
+  const valueClass = level === 'critical' || rejected
+    ? 'text-destructive-foreground'
+    : level === 'warning'
+      ? 'text-warning-foreground'
+      : 'text-foreground'
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<div />} delay={0} className="cursor-help">
+        <Meter value={percentage} max={100}>
+          <div className="flex min-w-0 items-center gap-2 @max-[27rem]/card:gap-1.5">
+            <MeterLabel className="w-8 shrink-0 font-medium text-muted-foreground text-xs">fable</MeterLabel>
+            <MeterTrack className="h-1 min-w-6 flex-1 rounded-full">
+              <MeterIndicator className={cn(METER_FILL[rejected ? 'critical' : level], 'rounded-full')} />
+            </MeterTrack>
+            <MeterValue className={cn('block w-9 shrink-0 text-left font-medium text-xs tabular-nums @max-[27rem]/card:w-auto', valueClass)}>
+              {() => `${percentage}%`}
+            </MeterValue>
+            {w.resetAt != null && w.resetAt > now ? (
+              <span className="w-12 shrink-0 whitespace-nowrap text-left text-xs text-muted-foreground tabular-nums @max-[27rem]/card:w-auto">
+                {formatCountdown(w.resetAt, now)}
+              </span>
+            ) : (
+              <span className="w-12 shrink-0 @max-[27rem]/card:hidden" aria-hidden />
+            )}
+          </div>
+        </Meter>
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+        {fablePoolHint(w, language)}
+        {rejected && t('。上游已拒绝：fable 暂时不会分配到这个账号', '. Rejected upstream: fable will not be routed to this account for now')}
+      </TooltipPopup>
+    </Tooltip>
   )
 }

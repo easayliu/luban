@@ -1255,6 +1255,7 @@ function ForwardingToggle({
   return (
     <SettingsRow
       disabled={blocked}
+      inlineControl
       htmlFor={id}
       label={label}
       description={
@@ -1396,8 +1397,8 @@ function RefusalGroup({
     })
   return (
     <li className="px-4 py-3 sm:px-5">
+      {/* 行首不再挂种类圆点：同一行里的种类徽章已经带着同一个颜色和文字。圆点只留在上面的筛选条里当图例。 */}
       <div className="flex items-start gap-3">
-        <span aria-hidden="true" className={cn('mt-2 size-1.5 shrink-0 rounded-full', RULE_TONES.refusal.dot)} />
         <button
           aria-expanded={open}
           className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-left"
@@ -1697,10 +1698,6 @@ function LearnedRejections() {
     const open = expanded.has(key)
     return (
       <li className="flex items-start gap-3 px-4 py-3 transition-colors sm:px-5 hover:bg-muted/40">
-        <span
-          aria-hidden="true"
-          className={cn('mt-2 size-1.5 shrink-0 rounded-full', tone?.dot ?? 'bg-muted-foreground')}
-        />
         <div className="min-w-0 flex-1 space-y-1.5">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-sm font-medium [overflow-wrap:anywhere]">{row.model}</span>
@@ -1923,7 +1920,7 @@ function LearnedRejections() {
                       )
                     : confirmClear?.type === 'group'
                       ? t(
-                          `将删除 ${confirmClear.model}${confirmClear.category ? ` 的 ${confirmClear.category} 类` : ''} 共 ${confirmClear.count} 条拒答提示词规则，其他模型、其他类别不动。之后这些提示词逐字重发会再送到上游一次，被拒的话会重新学到。`,
+                          `将删除 ${confirmClear.model}${confirmClear.category ? ` 的 ${confirmClear.category} 类` : ''}共 ${confirmClear.count} 条拒答提示词规则，其他模型、其他类别不动。之后这些提示词逐字重发会再送到上游一次，被拒的话会重新学到。`,
                           `${confirmClear.count} refused-prompt rules for ${confirmClear.model}${confirmClear.category ? ` (${confirmClear.category})` : ''} will be removed; other models and categories are untouched. Resending those prompts verbatim will reach upstream once more and be re-learned if refused.`,
                         )
                       : t(

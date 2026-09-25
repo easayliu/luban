@@ -3,7 +3,6 @@ import {
   CalendarDaysIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  EllipsisIcon,
   GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
@@ -11,6 +10,7 @@ import {
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
+import { useMediaQuery } from '@/lib/use-media-query'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
@@ -18,7 +18,8 @@ import { CredentialQuotaDialog } from '@/components/credential-quota-dialog'
 import { CredentialUsageDialog } from '@/components/credential-usage-dialog'
 import {
   ConnectivityTestDialog,
-  CredentialMenuContent,
+  credentialDetailHref,
+  CredentialActionsMenu,
   DeferredMount,
   DeleteCredentialDialog,
   deviceUsageMeta,
@@ -26,6 +27,8 @@ import {
   METER_FILL,
   proxyDisplayLabel,
   quotaLevel,
+  fablePoolHint,
+  fablePoolWindow,
   isOrgAccount,
   orgBadgeLabel,
   quotaPercentage,
@@ -33,8 +36,12 @@ import {
   tierBadgeVariant,
   useCredentialActions,
   type CredentialActions,
+  type CredentialEvaluation,
+  type CredentialMenuHandlers,
   type CredentialStatusMeta,
+  type QuotaLevel,
   type QuotaFreshness,
+  type QuotaWindowMeta,
   type SortDir,
   type SortKey,
 } from '@/components/credential-shared'
@@ -62,7 +69,6 @@ import {
 } from '@/components/ui/meter'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
-import { Menu, MenuTrigger } from '@/components/ui/menu'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
@@ -240,6 +246,8 @@ export const CredentialRow = memo(function CredentialRow({
   const actions = useCredentialActions(cred)
   const evaluation = evaluateCredential(cred, now, language)
   const { quota } = evaluation
+  // fable 额度池（7d_oi）挂在 7d 那格里、进度条下面多一行；上游没报就不占位，见 [ListFablePoolLine]。
+  const fablePool = fablePoolWindow(quota)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const u5h = quota.h5.utilization
   const u7d = quota.d7.utilization
@@ -258,9 +266,35 @@ export const CredentialRow = memo(function CredentialRow({
   const rpmPolicy = devicePolicyMeta(cred.rpm_limit, language)
   const rpmUsage = deviceUsageMeta(cred.rpm, rpmLimit)
   const added = relativeTime(cred.created_at, now, language)
+  const mobile = useMediaQuery(MOBILE_ROW_QUERY)
+  const menuHandlers = {
+    onRename: () => {
+      setRenameName(cred.label)
+      setRenameOpen(true)
+    },
+    onDeviceLimit: () => setDevicesOpen(true),
+    onRpmLimit: () => setRpmOpen(true),
+    onQuotaPause: () => setQuotaOpen(true),
+    onProxy: () => setProxyOpen(true),
+    onUsage: () => setUsageOpen(true),
+    onTest: () => setTesting(true),
+    onRequestDelete: () => setConfirmDelete(true),
+  }
 
   return (
     <>
+      {mobile ? (
+        <MobileCredentialRow
+          cred={cred}
+          now={now}
+          evaluation={evaluation}
+          actions={actions}
+          selectable={selectable}
+          selected={selected}
+          onSelectedChange={onSelectedChange}
+          menuHandlers={menuHandlers}
+        />
+      ) : (
       <TableRow className="xl:hidden" data-state={selected ? 'selected' : undefined}>
         <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
           <article className="min-w-0 space-y-3 px-4 py-3 sm:space-y-4 sm:px-5 sm:py-5">
@@ -275,10 +309,10 @@ export const CredentialRow = memo(function CredentialRow({
               )}
               <div className="min-w-0 flex-1">
                 <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
-                  {credentialLabel}
+                  <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">{credentialLabel}</a>
                 </h3>
                 <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-                  <CalendarDaysIcon />
+                  <CalendarDaysIcon className="size-3 shrink-0" />
                   <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                   <span aria-hidden="true">·</span>
                   <Tooltip>
@@ -338,18 +372,21 @@ export const CredentialRow = memo(function CredentialRow({
                 hasSnapshot={quota.hasSnapshot}
                 now={now}
               />
-              <ListQuotaMeter
-                label="7d"
-                util={u7d}
-                freshness={quota.d7.freshness}
-                reset={cred.quota?.rl_7d_reset ?? null}
-                cost={cred.quota?.cost_7d ?? null}
-                requests={cred.quota?.requests_7d ?? null}
-                tokens={cred.quota?.tokens_7d ?? null}
-                reported={quota.d7.reported}
-                hasSnapshot={quota.hasSnapshot}
-                now={now}
-              />
+              <div className="flex min-w-0 flex-col gap-2">
+                <ListQuotaMeter
+                  label="7d"
+                  util={u7d}
+                  freshness={quota.d7.freshness}
+                  reset={cred.quota?.rl_7d_reset ?? null}
+                  cost={cred.quota?.cost_7d ?? null}
+                  requests={cred.quota?.requests_7d ?? null}
+                  tokens={cred.quota?.tokens_7d ?? null}
+                  reported={quota.d7.reported}
+                  hasSnapshot={quota.hasSnapshot}
+                  now={now}
+                />
+                {fablePool && <ListFablePoolLine window={fablePool} now={now} />}
+              </div>
             </div>
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
@@ -414,6 +451,7 @@ export const CredentialRow = memo(function CredentialRow({
           </article>
         </TableCell>
       </TableRow>
+      )}
 
       <TableRow className="hidden xl:table-row" data-state={selected ? 'selected' : undefined}>
         <TableCell className={cn(COL.select, selectable ? 'pl-4 pr-0' : 'p-0')}>
@@ -429,9 +467,13 @@ export const CredentialRow = memo(function CredentialRow({
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
               {/* 账号名超出列宽就截断：table-fixed 下不截断会压到相邻列上。全名在 title 里。 */}
-              <span className="block min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
+              <a
+                href={credentialDetailHref(cred.id)}
+                className="block min-w-0 truncate font-semibold text-sm leading-snug rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                title={credentialLabel}
+              >
                 {credentialLabel}
-              </span>
+              </a>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                 <span aria-hidden="true">·</span>
@@ -516,6 +558,7 @@ export const CredentialRow = memo(function CredentialRow({
             now={now}
             showLabel={false}
           />
+          {fablePool && <ListFablePoolLine window={fablePool} now={now} className="mt-1.5" />}
         </TableCell>
         <TableCell className={COL.devices}>
           {/* 三行迷你进度条：设备、模拟会话、RPM，与左边用量列同一套语言（标签 · 数字 · 条）。
@@ -669,15 +712,10 @@ function CredentialRowActionsMenu({
   const { t, language } = useI18n()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   return (
-    <Menu modal={false}>
-      <MenuTrigger
-        className={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
-        aria-label={t(`打开 ${credentialLabel} 操作菜单`, `Open actions for ${credentialLabel}`)}
-        title={t('账号操作', 'Account actions')}
-      >
-        <EllipsisIcon />
-      </MenuTrigger>
-      <CredentialMenuContent
+    <CredentialActionsMenu
+      triggerClassName={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
+      triggerLabel={t(`打开 ${credentialLabel} 操作菜单`, `Open actions for ${credentialLabel}`)}
+      triggerTitle={t('账号操作', 'Account actions')}
         cred={cred}
         actions={actions}
         onRename={onRename}
@@ -688,12 +726,11 @@ function CredentialRowActionsMenu({
         onUsage={onUsage}
         onTest={onTest}
         onRequestDelete={onRequestDelete}
-      />
-    </Menu>
+    />
   )
 }
 
-function RenameCredentialDialog({
+export function RenameCredentialDialog({
   cred,
   actions,
   name,
@@ -790,6 +827,10 @@ function ScheduleControl({
           aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
         />
       </div>
+      {/* 「已停用」与旁边那枚关着的开关是同一句话，不再挂徽章（开关的 aria-label 里照样念得到）。
+          其余状态照挂：「限流暂停」时开关也是关的，但徽章说的是为什么关、什么时候回来。
+          卡片视图不在此列——那边开关在页脚、离徽章隔着一整张卡。 */}
+      {status.kind !== 'disabled' && (
       <Tooltip>
         <TooltipTrigger
           className={cn(
@@ -807,6 +848,7 @@ function ScheduleControl({
         </TooltipTrigger>
         <TooltipPopup className="max-w-72 break-words">{status.detail}</TooltipPopup>
       </Tooltip>
+      )}
     </div>
   )
 }
@@ -976,6 +1018,228 @@ function ListQuotaMeter({
       </MeterTrack>
       <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
     </Meter>
+  )
+}
+
+/** 手机宽度（<40rem）走紧凑行；与 ⋯ 底部面板、详情页页签是同一条线。 */
+const MOBILE_ROW_QUERY = '(max-width: 39.98rem)'
+
+/** 名额占用 → 数字颜色，与卡片页脚那三格同一套（见 credential-card 的 SLOT_TEXT）。 */
+const MOBILE_SLOT_TEXT: Record<QuotaLevel, string> = {
+  empty: 'text-muted-foreground',
+  ok: 'text-success-foreground',
+  warning: 'text-warning-foreground',
+  critical: 'text-destructive-foreground',
+}
+
+/**
+ * 手机上的列表行：一个账号四行、约 120px，整行点进详情页。
+ *
+ * 原来的堆叠行（平板那档）搬到手机上一行要 390px：五格「标签在上、数值在下」的事实大半是空白，
+ * 开关、⋯、状态徽标挤在右上角把账号名压到只剩一半。有了详情页之后，手机上的列表该做的是
+ * **扫一眼、点进去**——这里只留判断「要不要点进去」的东西：名字、状态、两个窗口用了几成、名额与花费。
+ *
+ * 整行可点用的是 Tailwind UI 常见的「拉伸链接」：账号名那个 `<a>` 用 `::after` 铺满整行，
+ * 勾选框、⋯、开关 `relative z-10` 浮在上面各管各的，点它们不会误跳详情。
+ */
+function MobileCredentialRow({
+  cred,
+  now,
+  evaluation,
+  actions,
+  selectable,
+  selected,
+  onSelectedChange,
+  menuHandlers,
+}: {
+  cred: Credential
+  now: number
+  evaluation: CredentialEvaluation
+  actions: CredentialActions
+  selectable: boolean
+  selected: boolean
+  onSelectedChange?: (id: number, next: boolean) => void
+  menuHandlers: CredentialMenuHandlers
+}) {
+  const { t, language, locale } = useI18n()
+  const { quota, status } = evaluation
+  const credentialLabel = displayCredentialLabel(cred.label, language)
+  const fablePool = fablePoolWindow(quota)
+  const { toggle } = actions
+  const slot = (icon: ReactNode, count: number, limit: number, label: string) => (
+    <span className="inline-flex items-center gap-1 tabular-nums" aria-label={label}>
+      {icon}
+      <span>
+        <span className={MOBILE_SLOT_TEXT[deviceUsageMeta(count, limit).level]}>{count.toLocaleString(locale)}</span>
+        <span className="text-muted-foreground">/{limit > 0 ? limit.toLocaleString(locale) : '∞'}</span>
+      </span>
+    </span>
+  )
+  return (
+    <TableRow data-state={selected ? 'selected' : undefined}>
+      <TableCell colSpan={11} className="w-full max-w-0 whitespace-normal p-0">
+        <article className="relative min-w-0 space-y-2.5 px-4 py-3 transition-colors active:bg-accent/40">
+          <div className="flex items-center gap-3">
+            {selectable && (
+              <Checkbox
+                className="relative z-10"
+                checked={selected}
+                onCheckedChange={(checked) => onSelectedChange?.(cred.id, checked)}
+                aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
+              />
+            )}
+            <a
+              href={credentialDetailHref(cred.id)}
+              className="min-w-0 flex-1 truncate font-semibold text-sm leading-snug outline-none after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+              title={credentialLabel}
+            >
+              {credentialLabel}
+            </a>
+            <div className="relative z-10 -my-1 -mr-1.5 shrink-0">
+              <CredentialActionsMenu
+                cred={cred}
+                actions={actions}
+                triggerClassName={buttonVariants({ size: 'icon-sm', variant: 'ghost' })}
+                triggerLabel={t(`打开 ${credentialLabel} 操作菜单`, `Open actions for ${credentialLabel}`)}
+                {...menuHandlers}
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
+            <Badge size="xs" variant={status.variant}>{status.label}</Badge>
+            {isOrgAccount(cred) && <Badge size="xs" variant="outline">{orgBadgeLabel(cred)}</Badge>}
+            {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+            <Badge size="xs" variant="outline" className="tabular-nums">P{cred.priority}</Badge>
+          </div>
+
+          {/* items-start：7d 下面挂着 fable 时右列两行高，5h 要贴着 7d 那一行，而不是在两行之间居中。 */}
+          <div className="grid grid-cols-2 items-start gap-4">
+            <MiniQuotaLine label="5h" window={quota.h5} hasSnapshot={quota.hasSnapshot} />
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <MiniQuotaLine label="7d" window={quota.d7} hasSnapshot={quota.hasSnapshot} />
+              {fablePool && <ListFablePoolLine window={fablePool} now={now} labelClassName="w-6" />}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 text-xs">
+            {slot(<SmartphoneIcon className="size-3.5 text-muted-foreground" />, cred.device_count, cred.device_limit_effective, t('设备', 'Devices'))}
+            {slot(<MessagesSquareIcon className="size-3.5 text-muted-foreground" />, cred.session_count, cred.session_limit_effective, t('模拟会话', 'Sessions'))}
+            {slot(<GaugeIcon className="size-3.5 text-muted-foreground" />, cred.rpm, cred.rpm_limit_effective, t('当前 RPM', 'Current RPM'))}
+            <span className={cn('font-medium tabular-nums', cred.cost_total > 0 ? 'text-foreground' : 'text-muted-foreground')}>
+              {formatUsd(cred.cost_total)}
+            </span>
+            <div className="relative z-10 ml-auto flex shrink-0 items-center gap-2">
+              {toggle.isPending && <Spinner />}
+              <Switch
+                checked={!cred.disabled}
+                onCheckedChange={(enabled) => toggle.mutate(!enabled)}
+                disabled={toggle.isPending}
+                aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
+              />
+            </div>
+          </div>
+        </article>
+      </TableCell>
+    </TableRow>
+  )
+}
+
+/** 手机紧凑行里的一条窗口：「5h ▬▬▬── 15%」，没有摘要与倒计时（那些在详情页）。 */
+function MiniQuotaLine({
+  label,
+  window: w,
+  hasSnapshot,
+}: {
+  label: string
+  window: QuotaWindowMeta
+  hasSnapshot: boolean
+}) {
+  const { t } = useI18n()
+  const reported = w.reported
+  const percentage = w.percentage
+  const level = quotaLevel(w.utilization)
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <span className="w-6 shrink-0 font-medium text-2xs text-muted-foreground">{label}</span>
+      {hasSnapshot && !reported ? (
+        <span className="min-w-0 flex-1 truncate text-2xs text-muted-foreground">{t('无此窗口', 'N/A')}</span>
+      ) : (
+        <>
+          <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-input" aria-hidden>
+            {percentage != null && (
+              <span className={cn('block h-full rounded-full', METER_FILL[level])} style={{ width: `${percentage}%` }} />
+            )}
+          </span>
+          <span
+            className={cn(
+              'w-9 shrink-0 text-left font-medium text-xs tabular-nums',
+              level === 'critical' ? 'text-destructive-foreground' : level === 'warning' ? 'text-warning-foreground' : 'text-foreground',
+              percentage == null && 'text-muted-foreground',
+            )}
+          >
+            {percentage == null ? '—' : `${percentage}%`}
+          </span>
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 7d 那格里挂着的 fable 额度池（`7d_oi`）：一行「fable ▬▬── 41%」，没有摘要那一行——上游只给
+ * 使用率与重置时刻。百分比放进与上面倒计时同宽的 `w-9` 那格，两条进度条的**条尾**落在同一处，
+ * 一列扫下来长短可以直接比；条比 7d 细一档（h-1），读作 7d 下面的子池，不是第三个窗口。
+ * 重置时刻与「满了只挡 fable」的说明在悬浮提示里（delay=0）。
+ */
+function ListFablePoolLine({
+  window: w,
+  now,
+  className,
+  labelClassName,
+}: {
+  window: QuotaWindowMeta
+  now: number
+  className?: string
+  /** 窗口名那一格的宽度；手机紧凑行里与上面 5h / 7d 的标签同宽，条的起点才对齐。 */
+  labelClassName?: string
+}) {
+  const { t, language } = useI18n()
+  const percentage = w.percentage ?? 0
+  const level = quotaLevel(w.utilization)
+  const rejected = w.status === 'rejected' || w.status === 'rate_limited'
+  const pending = w.resetAt != null && w.resetAt > now
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<div />} delay={0} className={cn('cursor-help', className)}>
+        <Meter value={percentage} max={100}>
+          <div className="flex min-w-0 items-center gap-2">
+            <MeterLabel className={cn('shrink-0 font-medium text-2xs text-muted-foreground', labelClassName)}>fable</MeterLabel>
+            <MeterTrack className="h-1 min-w-0 flex-1">
+              <MeterIndicator className={METER_FILL[rejected ? 'critical' : level]} />
+            </MeterTrack>
+            <MeterValue
+              className={cn(
+                'w-9 shrink-0 text-left font-medium text-2xs tabular-nums',
+                rejected || level === 'critical'
+                  ? 'text-destructive-foreground'
+                  : level === 'warning'
+                    ? 'text-warning-foreground'
+                    : 'text-foreground',
+              )}
+            >
+              {() => `${percentage}%`}
+            </MeterValue>
+          </div>
+        </Meter>
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+        {fablePoolHint(w, language)}
+        {pending && ` · ${formatCountdown(w.resetAt!, now)}`}
+        {rejected && t('。上游已拒绝：fable 暂时不会分配到这个账号', '. Rejected upstream: fable will not be routed to this account for now')}
+      </TooltipPopup>
+    </Tooltip>
   )
 }
 

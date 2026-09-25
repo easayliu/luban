@@ -542,6 +542,7 @@ pub async fn run(
         .route("/credentials/{id}/quota-pause-pct", post(set_credential_quota_pause_pct))
         .route("/credentials/{id}/devices", get(list_credential_devices))
         .route("/credentials/{id}/usage", get(list_credential_usage))
+        .route("/credentials/{id}/stats", get(get_credential_stats))
         .route("/credentials/{id}/devices/{device_id}", delete(unbind_credential_device))
         .route(
             "/credentials/{id}/sessions",
@@ -911,6 +912,30 @@ async fn list_credential_usage(
         return Err(not_found());
     }
     usage_page(&state, Some(id), &q, 25, 200)
+}
+
+#[derive(Serialize)]
+struct CredentialStatsResp {
+    since: i64,
+    bucket_secs: i64,
+    #[serde(flatten)]
+    stats: store::CredentialStats,
+}
+
+/// 单个账号的用量统计：按小时 / 按日的时间序列，加按模型、设备、客户端、状态码的拆分。
+/// 参数同趋势接口（`hours` / `bucket_secs` / `tz_offset_secs`）。不进 [`cached_metrics`]：
+/// 只扫一个号的流水，而且只有详情页打开时才会被拉。
+async fn get_credential_stats(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<SeriesQuery>,
+) -> Result<Json<CredentialStatsResp>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    let (since, bucket_secs, tz) = q.normalized();
+    let stats = state.store.credential_stats(id, since, bucket_secs, tz, 20).map_err(internal)?;
+    Ok(Json(CredentialStatsResp { since, bucket_secs, stats }))
 }
 
 /// 两条流水接口共用的取页逻辑：先按 `until`（没有就现取一个）钉住快照，再在同一条件下

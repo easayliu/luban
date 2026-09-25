@@ -21,6 +21,12 @@ import {
 const CLAMP_THRESHOLD = 140
 
 /**
+ * 手机上再低一档：60 字以上就收到两行。375px 上说明一行只放得下二十几个字，60–140 字的说明
+ * 要摞四五行（设备策略页那几条「模拟会话…」都是），而桌面上它们一两行就完了，桌面照旧铺开。
+ */
+const MOBILE_CLAMP_THRESHOLD = 60
+
+/**
  * 长说明的统一处理：收起到两行，末尾挂一枚「了解更多」。分组标题下的说明与**每一行参数**
  * 的说明共用这一套——同一页里不该有两种「文案太长怎么办」。
  *
@@ -33,16 +39,29 @@ export function ClampedDescription({ text, className }: { text: string; classNam
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const clampable = text.length > CLAMP_THRESHOLD
+  // 只在窄屏收起的那一档：收起用 `max-sm:line-clamp-2`、按钮 `sm:hidden`，桌面上既不截也不挂按钮。
+  const mobileOnly = !clampable && text.length > MOBILE_CLAMP_THRESHOLD
 
   return (
     <>
-      <span className={cn('block', className, clampable && !open && 'line-clamp-2')}>{text}</span>
-      {clampable && (
+      <span
+        className={cn(
+          'block',
+          className,
+          !open && (clampable ? 'line-clamp-2' : mobileOnly && 'max-sm:line-clamp-2'),
+        )}
+      >
+        {text}
+      </span>
+      {(clampable || mobileOnly) && (
         <button
           aria-expanded={open}
           // 不写死字号：跟着外面那段说明走（卡片描述 text-sm、行描述 text-xs），
           // 否则卡片头里这枚按钮会比它跟着的那段说明小一号。
-          className="mt-1 inline-flex items-center gap-0.5 text-foreground/70 underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          className={cn(
+            'mt-1 inline-flex items-center gap-0.5 text-foreground/70 underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background',
+            mobileOnly && 'sm:hidden',
+          )}
           type="button"
           onClick={() => setOpen((v) => !v)}
         >
@@ -73,7 +92,12 @@ export function ClampedDescription({ text, className }: { text: string; classNam
  * - `badge` 跟在标签右边（状态类，如「严格模式」）；
  * - `note` 落在说明下面（读数类，如「闲置 2 小时后释放名额」）；
  * - `children` 是右边那一格的控件，窄屏整块落到第二行并撑满；
- * - `footer` 是整行底下的全宽附加块（如「影响与限制」那个折叠）。
+ * - `footer` 是整行底下的全宽附加块（如「影响与限制」那个折叠）；
+ * - `inlineControl`：控件本身很小（开关）时传它，窄屏上也不换行，贴在标题右侧。
+ *
+ * 窄屏默认把控件整块换到说明下面并撑满——输入框、分段选择、保存按钮这样才有地方放。但开关
+ * 照这个规矩会**独占一行**：标题、说明、开关、「影响与限制」四段摞起来，转发页三十多个开关
+ * 每个多占 40px，而且看标题时看不到它开没开。手机设置页的通用做法是开关跟标题同一行、靠右。
  */
 export function SettingsRow({
   label,
@@ -85,6 +109,7 @@ export function SettingsRow({
   footer,
   className,
   disabled,
+  inlineControl = false,
 }: {
   label: ReactNode
   htmlFor?: string
@@ -95,26 +120,36 @@ export function SettingsRow({
   footer?: ReactNode
   className?: string
   disabled?: boolean
+  inlineControl?: boolean
 }) {
   // 槽宽分两档：手机 16px、≥640px 20px。`page-frame` 在手机上已占去两侧各 16px，
   // 卡片再加 20px 正文就只剩 303px；收一档回来给内容。
   return (
     <Field className={cn('p-4 sm:p-5', className)} disabled={disabled}>
-      <div className="flex w-full flex-wrap items-start justify-between gap-x-6 gap-y-3">
-        <div className="min-w-0 flex-1 basis-72 space-y-1.5">
+      <div
+        className={cn(
+          'flex w-full items-start justify-between gap-x-6 gap-y-3',
+          inlineControl ? 'max-sm:gap-x-4' : 'flex-wrap',
+        )}
+      >
+        <div className={cn('min-w-0 flex-1 space-y-1.5', !inlineControl && 'basis-72')}>
           <div className="flex flex-wrap items-center gap-2">
             <FieldLabel htmlFor={htmlFor}>{label}</FieldLabel>
             {badge}
           </div>
           {/* 说明统一封在 max-w-xl：内容列 56rem 的一行放得下 800px 出头的正文，
               一行 80 个中文字读不动，这是设置页说明该有的行长。 */}
+          {/* 纯文字说明走 ClampedDescription（手机上 60 字起收两行）；带 footer 的行（转发页那些
+              挂着「影响与限制」的开关）不再套第二个展开器，原样铺开，理由见 ForwardingToggle。 */}
           {description && (
-            <FieldDescription className="max-w-xl leading-5">{description}</FieldDescription>
+            <FieldDescription className="max-w-xl leading-5">
+              {typeof description === 'string' && !footer ? <ClampedDescription text={description} /> : description}
+            </FieldDescription>
           )}
           {note}
         </div>
         {/* 窄屏 `max-sm:w-full`：控件整块换行并撑满，与原来 `sm:grid-cols-…` 那套的手机形态一致。 */}
-        <div className="flex shrink-0 items-center gap-2 max-sm:w-full">{children}</div>
+        <div className={cn('flex shrink-0 items-center gap-2', !inlineControl && 'max-sm:w-full')}>{children}</div>
       </div>
       {footer}
     </Field>

@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRightIcon, CopyIcon, ExternalLinkIcon } from 'lucide-react'
+import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, RefreshCwIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
 import { ProxyPickerCombobox, ProxyTestBlock } from '@/components/credential-proxy-dialog'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader,
@@ -97,6 +96,8 @@ export function AddAccount({
   const savedProxies = proxiesQuery.data ?? []
 
   const busy = authorize.isPending || exchange.isPending
+  // 选中的是代理池里的一条时，下拉框已经显示着它，手动输入框再摆一份同样的地址就是重复。
+  const pickedFromPool = savedProxies.some((item) => item.url === proxy.trim())
 
   return (
     <Dialog
@@ -109,7 +110,8 @@ export function AddAccount({
       <DialogPopup closeProps={{ disabled: busy }}>
         <DialogHeader>
           <DialogTitle>{t('添加 Claude 账号', 'Add Claude account')}</DialogTitle>
-          <DialogDescription>
+          {/* 不再挂一句「完成授权后粘贴授权结果」：下面的 1、2 两步就是这句话本身。说明留给读屏。 */}
+          <DialogDescription className="sr-only">
             {t(
               '完成 Claude OAuth 授权后，粘贴授权结果以接入订阅账号。',
               'Complete Claude OAuth authorization, then paste the result to connect a subscription account.',
@@ -132,81 +134,76 @@ export function AddAccount({
                   'Authorize with the Claude subscription account you want to connect.',
                 )}
               </FieldDescription>
-              <Button
-                type="button"
-                variant="outline"
-                loading={authorize.isPending}
-                onClick={() => {
-                  authorize.mutate({ session: authorizeSession.current })
-                }}
-              >
-                <ExternalLinkIcon />
-                {t('生成授权链接', 'Generate authorization link')}
-              </Button>
+              {/* 生成之后按钮原地换成「打开 / 复制」，不再另起一块「授权链接已生成」的提示：那块提示的标题、
+                  说明、按钮（「打开授权页面」与本步标题一字不差）说的都是同一件事。 */}
+              {authUrl ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <a href={authUrl} target="_blank" rel="noopener">
+                    <Button type="button" variant="outline">
+                      <ExternalLinkIcon />
+                      {t('打开授权页面', 'Open authorization page')}
+                    </Button>
+                  </a>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    title={t('复制后可在其他浏览器或设备上完成授权', 'Copy it to authorize in another browser or on another device')}
+                    onClick={async () => {
+                      const copied = await copyText(authUrl)
+                      toastManager.add(copied
+                        ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
+                        : {
+                            title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
+                            description: authUrl,
+                            type: 'error',
+                          })
+                    }}
+                  >
+                    <CopyIcon />
+                    {t('复制链接', 'Copy link')}
+                  </Button>
+                  {/* 链接有时效，授权页开久了会过期；关掉弹窗再开也行，这里给个就近的出口。 */}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    loading={authorize.isPending}
+                    onClick={() => authorize.mutate({ session: authorizeSession.current })}
+                  >
+                    <RefreshCwIcon />
+                    {t('重新生成', 'Regenerate')}
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-fit"
+                  loading={authorize.isPending}
+                  onClick={() => {
+                    authorize.mutate({ session: authorizeSession.current })
+                  }}
+                >
+                  <ExternalLinkIcon />
+                  {t('生成授权链接', 'Generate authorization link')}
+                </Button>
+              )}
             </Field>
 
-            {authUrl && (
-              <Alert variant="info">
-                <ExternalLinkIcon aria-hidden />
-                <AlertTitle>{t('授权链接已生成', 'Authorization link ready')}</AlertTitle>
-                <AlertDescription>
-                  <p>
-                    {t(
-                      '点击下方链接打开授权页面，或复制链接，在其他浏览器或设备上完成授权。',
-                      'Click the link below to open the authorization page, or copy it and complete authorization in another browser or on another device.',
-                    )}
-                  </p>
-                  <div className="mt-2 flex items-center gap-2">
-                    <a href={authUrl} target="_blank" rel="noopener">
-                      <Button type="button" size="sm" variant="outline">
-                        <ExternalLinkIcon />
-                        {t('打开授权页面', 'Open authorization page')}
-                      </Button>
-                    </a>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      onClick={async () => {
-                        const copied = await copyText(authUrl)
-                        toastManager.add(copied
-                          ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
-                          : {
-                              title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
-                              description: authUrl,
-                              type: 'error',
-                            })
-                      }}
-                    >
-                      <CopyIcon />
-                      {t('复制链接', 'Copy link')}
-                    </Button>
-                  </div>
-                </AlertDescription>
-              </Alert>
-            )}
-
             <div className="space-y-4">
-              <div className="font-medium text-sm">
-                {t('2. 提交授权结果', '2. Submit the authorization result')}
-              </div>
+              {/* 步骤标题直接当输入框的标签：原来是「2. 提交授权结果」标题 + 「授权结果」标签 + 「请粘贴…
+                  完整内容」说明 + 「粘贴完整的 code#state」占位，一件事说四遍。 */}
               <Field name="code">
-                <FieldLabel htmlFor="oauth-result">{t('授权结果', 'Authorization result')}</FieldLabel>
+                <FieldLabel htmlFor="oauth-result">{t('2. 粘贴授权结果', '2. Paste the authorization result')}</FieldLabel>
                 <Textarea
                   id="oauth-result"
                   name="code"
                   value={code}
                   onChange={(event) => setCode(event.target.value)}
-                  placeholder={t('粘贴完整的 code#state', 'Paste the complete code#state')}
+                  placeholder={t('授权完成后页面上显示的 code#state', 'The code#state shown after authorization')}
                   className="min-h-24"
                   required
                 />
-                <FieldDescription>
-                  {t(
-                    '请粘贴 Claude 授权完成后返回的完整内容。',
-                    'Paste the complete value returned after Claude authorization.',
-                  )}
-                </FieldDescription>
               </Field>
               <Field name="label">
                 <FieldLabel htmlFor="account-label">
@@ -247,22 +244,28 @@ export function AddAccount({
                     </div>
                   </div>
                 )}
-                <Label htmlFor="account-proxy" className="mt-1">
-                  {t('或手动填写地址', 'Or enter an address')}
-                </Label>
-                <Input
-                  id="account-proxy"
-                  name="proxy"
-                  value={proxy}
-                  onChange={(event) => setProxy(event.target.value)}
-                  placeholder="socks5://127.0.0.1:1080"
-                  spellCheck={false}
-                  autoComplete="off"
-                />
+                {!pickedFromPool && (
+                  <>
+                    {savedProxies.length > 0 && (
+                      <Label htmlFor="account-proxy" className="mt-1">
+                        {t('或手动填写地址', 'Or enter an address')}
+                      </Label>
+                    )}
+                    <Input
+                      id="account-proxy"
+                      name="proxy"
+                      value={proxy}
+                      onChange={(event) => setProxy(event.target.value)}
+                      placeholder="socks5://127.0.0.1:1080"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </>
+                )}
                 <FieldDescription>
                   {t(
-                    '登录换码和拉取账号信息都经由此代理，账号添加后它会自动保存为该账号的逐账号代理。支持 socks5://、http:// 等，留空表示直连。',
-                    'The token exchange and profile fetch go through this proxy, and once the account is added it is saved as that account’s per-account proxy. Supports socks5://, http://, and more. Leave blank to connect directly.',
+                    '换码与拉取账号信息都经由此代理，添加后自动设为该账号的出站代理。留空为直连。',
+                    'The token exchange and profile fetch go through this proxy; it becomes the account’s outbound proxy once added. Leave blank to connect directly.',
                   )}
                 </FieldDescription>
                 <ProxyTestBlock url={proxy.trim()} />

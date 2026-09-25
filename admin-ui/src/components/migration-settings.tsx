@@ -209,9 +209,11 @@ function ImportPanel() {
     }
   }
 
+  // 选项只写模式名，含义交给下面那句说明：原来选项里括着「保留本机已有账号」、下面又说「本机有而
+  // 文件中没有的账号保持不变」，清空模式更是选项、说明、按钮三处都在说「先清空再导入」。
   const modeItems = [
-    { label: t('合并（保留本机已有账号）', 'Merge (keep existing accounts)'), value: 'merge' },
-    { label: t('先清空本机，再导入', 'Replace everything on this machine'), value: 'replace' },
+    { label: t('合并', 'Merge'), value: 'merge' },
+    { label: t('清空后导入', 'Replace'), value: 'replace' },
   ]
   const count = file?.credentials.length ?? 0
   const settingsCount = file ? Object.keys(file.settings).length : 0
@@ -252,9 +254,11 @@ function ImportPanel() {
         <DialogPopup>
           <DialogHeader>
             <DialogTitle>{t('确认导入', 'Confirm import')}</DialogTitle>
-            <DialogDescription className="mt-1 flex items-center gap-1.5 truncate" title={filename}>
-              <FileJsonIcon className="size-3.5 shrink-0" />
-              {filename}
+            {/* 文件名完整显示、放不下就折行：这是「确认导入」，用户正要核对导入的是不是这份文件。
+                原来 `truncate` 挂在 flex 容器上，文字节点不吃省略号，窄屏上直接被切掉一截。 */}
+            <DialogDescription className="mt-1 flex items-start gap-1.5" title={filename}>
+              <FileJsonIcon className="mt-0.5 size-3.5 shrink-0" />
+              <span className="min-w-0 [overflow-wrap:anywhere]">{filename}</span>
             </DialogDescription>
           </DialogHeader>
 
@@ -343,7 +347,7 @@ function ImportPanel() {
             >
               {mode === 'replace'
                 ? t('清空并导入', 'Replace and import')
-                : t('确认导入', 'Import')}
+                : t('导入', 'Import')}
             </Button>
           </DialogFooter>
         </DialogPopup>

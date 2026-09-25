@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
@@ -25,6 +25,7 @@ import {
   type CredentialViewMode,
 } from '@/components/credential-workspace'
 import { AddAccount } from '@/components/add-account'
+import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
@@ -123,6 +124,12 @@ function readSettingsRoute(): SettingsSection | null {
   return 'access'
 }
 
+/** `#/accounts/<id>` → 账号 id；其余地址不是详情页。 */
+function readAccountRoute(): number | null {
+  const match = /^#\/accounts\/(\d+)/.exec(window.location.hash)
+  return match ? Number(match[1]) : null
+}
+
 function App() {
   const { t } = useI18n()
   const [adding, setAdding] = useState(false)
@@ -136,6 +143,14 @@ function App() {
   // 只有从账号页主动进入设置时，关闭设置才应该消费这条 history 记录。
   // 直接打开 #/settings/* 的深链接则在原地替换回账号页，避免把用户带离当前站点。
   const enteredSettingsFromAccounts = useRef(false)
+  const [accountRoute, setAccountRoute] = useState<number | null>(readAccountRoute)
+  // 同设置页：从账号列表点进详情才消费 history（返回＝后退），深链接直接打开的原地替换回列表。
+  // 详情入口是 `<a href>`，由浏览器自己压栈，所以「是不是从列表进来的」在 hashchange 里判断。
+  const enteredAccountFromList = useRef(false)
+  // 进详情前列表滚到了哪儿，回来时还原——否则从第三页底部点进去，回来就被扔回顶部。
+  const listScrollY = useRef<number | null>(null)
+  const onList = useRef(false)
+  onList.current = !settingsRoute && accountRoute == null
 
   // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文；
   // 链接里带了同名参数时以链接为准（见 readViewParams）。
@@ -184,7 +199,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (settingsRoute) return
+    if (settingsRoute || accountRoute != null) return
     const params = new URLSearchParams()
     if (query.trim()) params.set('q', query.trim())
     if (filter !== 'all') params.set('filter', filter)
@@ -197,12 +212,23 @@ function App() {
     const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
     if (window.location.href.endsWith(`#/?${params.toString()}`)) return
     window.history.replaceState(null, '', next)
-  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute])
+  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, accountRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
+      const nextAccount = readAccountRoute()
+      // 点一次链接 popstate 与 hashchange 会各来一遍；第一遍处理完就把 onList 放下，
+      // 否则第二遍会把已经滚回顶部的 0 当成列表位置记下来。
+      if (nextAccount != null && onList.current) {
+        onList.current = false
+        enteredAccountFromList.current = true
+        listScrollY.current = window.scrollY
+        window.scrollTo({ top: 0, behavior: 'instant' })
+      }
       setSettingsRoute(next)
+      setAccountRoute(nextAccount)
       if (!next) enteredSettingsFromAccounts.current = false
+      if (nextAccount == null) enteredAccountFromList.current = false
     }
     window.addEventListener('popstate', syncRoute)
     window.addEventListener('hashchange', syncRoute)
@@ -236,6 +262,24 @@ function App() {
     }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
+  const closeAccount = useCallback(() => {
+    setAccountRoute(null)
+    if (enteredAccountFromList.current) {
+      enteredAccountFromList.current = false
+      window.history.back()
+    } else {
+      listScrollY.current = null
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+      window.scrollTo({ top: 0, behavior: 'instant' })
+    }
+  }, [])
+  // 列表重新挂上之后再还原滚动位置：列表数据在缓存里，这一帧就能渲染出原来的高度。
+  useEffect(() => {
+    if (accountRoute != null || listScrollY.current == null) return
+    const top = listScrollY.current
+    listScrollY.current = null
+    requestAnimationFrame(() => window.scrollTo({ top, behavior: 'instant' }))
+  }, [accountRoute])
   const { data: authState, isLoading: authLoading } = useQuery({
     queryKey: ['auth-state'],
     queryFn: getAuthState,
@@ -259,10 +303,10 @@ function App() {
   })
 
   useEffect(() => {
-    if (!needLogin && !settingsRoute) {
+    if (!needLogin && !settingsRoute && accountRoute == null) {
       document.title = t('luban · 授权代理', 'luban · Authorization Proxy')
     }
-  }, [needLogin, settingsRoute, t])
+  }, [needLogin, settingsRoute, accountRoute, t])
 
   const isBootstrapping = authLoading || !authState
   useSettingsPrefetch(!isBootstrapping && !needLogin && !settingsRoute)
@@ -280,6 +324,20 @@ function App() {
           onBack={closeSettings}
         />
       </Suspense>
+    )
+  }
+
+  // 详情页在鉴权就位前就接手渲染（自带骨架），深链接打开时不会先闪一下账号列表。
+  if (accountRoute != null) {
+    return (
+      <CredentialDetailPage
+        id={accountRoute}
+        credentials={isBootstrapping ? undefined : creds}
+        isLoading={isBootstrapping || isLoading}
+        error={isBootstrapping ? null : credentialsError}
+        onRetry={() => { void refetchCredentials() }}
+        onBack={closeAccount}
+      />
     )
   }
 

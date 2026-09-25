@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
-  ActivityIcon, ChevronDownIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon,
-  GaugeIcon, GlobeIcon, MessagesSquareIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
+  ActivityIcon, ArrowUpDownIcon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon, EllipsisIcon,
+  GaugeIcon, GlobeIcon, MessagesSquareIcon, PanelTopOpenIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
   SmartphoneIcon, TimerOffIcon, Trash2Icon,
 } from 'lucide-react'
 import {
@@ -24,7 +24,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import type { BadgeProps } from '@/components/ui/badge'
 import { Badge } from '@/components/ui/badge'
 import {
-  Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
+  Dialog, DialogClose, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,7 +33,8 @@ import {
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
-import { MenuItem, MenuPopup, MenuSeparator, MenuShortcut } from '@/components/ui/menu'
+import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuShortcut, MenuTrigger } from '@/components/ui/menu'
+import { useMediaQuery } from '@/lib/use-media-query'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 
@@ -460,6 +461,35 @@ export function evaluateCredential(
 }
 
 /** 把「套餐不含」的模型列成一句，如「claude-fable-5、claude-fable-5-1」。 */
+/**
+ * fable 专用的额度池（上游窗口名 `7d_oi`，`representative-claim` 叫 `seven_day_overage_included`）。
+ *
+ * 它是 7 天周期、只带使用率与重置时刻，没有 5h 档，也没有按窗口聚合的请求数 / 费用；满了只挡
+ * fable，账号其余模型照常（后端判模型级冷却，见 `rate_limit_scope`），所以**不参与**账号的
+ * 「额度将满」判定（[`isOverageWindow`] 已把它排除在外）。卡片、列表、详情页都把它挂在 7d 下面画，
+ * 取数走这一个函数。上游没报过（Pro 号这类套餐不含 fable）时为 null，界面上不留位置。
+ */
+export function fablePoolWindow(quota: QuotaRiskMeta): QuotaWindowMeta | null {
+  return quota.windows.find((w) => w.name.toLowerCase() === '7d_oi' && w.reported) ?? null
+}
+
+/** fable 额度池那条的悬浮说明：它是什么、满了影响什么、上游原值与重置时刻。 */
+export function fablePoolHint(w: QuotaWindowMeta, language: Language): string {
+  return [
+    localize(
+      language,
+      'fable 专用额度池（上游 7d_oi，7 天周期）：满了只影响 fable，账号其余模型照常服务',
+      'Fable-only pool (upstream 7d_oi, 7-day period): when full only fable is affected; the account keeps serving its other models',
+    ),
+    w.status && localize(language, `上游原值 ${w.status}`, `upstream raw value ${w.status}`),
+    w.resetAt != null && localize(
+      language,
+      `${formatFullTime(w.resetAt, language)} 重置`,
+      `resets ${formatFullTime(w.resetAt, language)}`,
+    ),
+  ].filter(Boolean).join(' · ')
+}
+
 export function modelDenialSummary(cred: Credential, language: Language): string {
   return (cred.denied_models ?? []).map((d) => d.model).join(localize(language, '、', ', '))
 }
@@ -791,18 +821,13 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
 
 export type CredentialActions = ReturnType<typeof useCredentialActions>
 
-/**
- * ⋯ 菜单内容（刷新 / 重命名 / 优先级调整 / 删除），卡片与列表共用。
- *
- * 删除只往外抛意图，确认框由调用方渲染在菜单之外——菜单一关，挂在它里面的弹窗会跟着
- * 卸载，确认框根本来不及显示。
- */
-export function CredentialMenuContent({
-  cred, actions, onRename, onDeviceLimit, onRpmLimit, onQuotaPause, onProxy, onUsage, onTest,
-  onRequestDelete,
-}: {
-  cred: Credential
-  actions: CredentialActions
+/** 账号详情页的地址；App 按这个 hash 路由（见 App.tsx 的 readAccountRoute）。 */
+export function credentialDetailHref(id: number): string {
+  return `#/accounts/${id}`
+}
+
+/** ⋯ 菜单的回调：各视图自己管编辑态与对话框，菜单只往外抛意图。 */
+export interface CredentialMenuHandlers {
   onRename: () => void
   onDeviceLimit: () => void
   onRpmLimit: () => void
@@ -811,85 +836,378 @@ export function CredentialMenuContent({
   onUsage: () => void
   onTest: () => void
   onRequestDelete: () => void
-}) {
+  /** 首项「查看详情」；详情页自己用这份菜单时传 false。 */
+  showDetail?: boolean
+}
+
+interface CredentialMenuItem {
+  key: string
+  icon: ReactNode
+  label: string
+  onSelect: () => void
+  disabled?: boolean
+  shortcut?: string
+  title?: string
+  destructive?: boolean
+}
+
+/**
+ * ⋯ 菜单的条目，按分组排好（组间画分隔线）。桌面下拉菜单与手机底部面板共用这一份，
+ * 两处不会一个有「解除冷却」、另一个没有。
+ */
+function useCredentialMenuGroups(
+  cred: Credential,
+  actions: CredentialActions,
+  h: CredentialMenuHandlers,
+): CredentialMenuItem[][] {
   const { t } = useI18n()
   const { refresh, prio, cooldown } = actions
+  const detail: CredentialMenuItem[] = h.showDetail === false
+    ? []
+    : [{
+        key: 'detail',
+        icon: <PanelTopOpenIcon />,
+        label: t('查看详情', 'View details'),
+        onSelect: () => { window.location.hash = credentialDetailHref(cred.id) },
+      }]
+  // 账号级冷却、模型级冷却、「套餐不含」记录任一存在都该给出口——后端那个接口是三档一起清的。
+  // 刚给组织开了 extra usage 的管理员，靠这一项让号立刻回去试 fable。
+  const hasCooldown = cred.rate_limited_secs > 0
+    || (cred.rate_limited_models?.length ?? 0) > 0
+    || (cred.denied_models?.length ?? 0) > 0
+  const main: CredentialMenuItem[] = [
+    {
+      key: 'refresh',
+      icon: <RefreshCwIcon className={refresh.isPending ? 'animate-spin' : undefined} />,
+      label: t('刷新 token', 'Refresh token'),
+      onSelect: () => refresh.mutate(),
+      disabled: refresh.isPending,
+    },
+    { key: 'test', icon: <ActivityIcon />, label: t('连通性测试', 'Connectivity test'), onSelect: h.onTest },
+    ...(hasCooldown
+      ? [{
+          key: 'cooldown',
+          icon: <TimerOffIcon />,
+          label: (cred.denied_models?.length ?? 0) > 0
+            ? t('解除冷却与模型限制', 'Clear cooldown & model blocks')
+            : t('解除冷却', 'Clear cooldown'),
+          onSelect: () => cooldown.mutate(),
+          disabled: cooldown.isPending,
+        }]
+      : []),
+    { key: 'rename', icon: <PencilIcon />, label: t('重命名', 'Rename'), onSelect: h.onRename },
+    { key: 'device', icon: <SmartphoneIcon />, label: t('设备上限', 'Device limit'), onSelect: h.onDeviceLimit },
+    // 与设备上限开的是同一个对话框（会话那一半在下面）：两种名额总是一起看。
+    { key: 'session', icon: <MessagesSquareIcon />, label: t('模拟会话上限', 'Session limit'), onSelect: h.onDeviceLimit },
+    { key: 'rpm', icon: <GaugeIcon />, label: t('RPM 上限', 'RPM limit'), onSelect: h.onRpmLimit },
+    { key: 'pause', icon: <PercentIcon />, label: t('提前停调度阈值', 'Early pause threshold'), onSelect: h.onQuotaPause },
+    { key: 'proxy', icon: <GlobeIcon />, label: t('出站代理', 'Outbound proxy'), onSelect: h.onProxy },
+    { key: 'usage', icon: <ScrollTextIcon />, label: t('请求明细', 'Request log'), onSelect: h.onUsage },
+  ]
+  const priority: CredentialMenuItem[] = [
+    {
+      key: 'prio-up',
+      icon: <ChevronUpIcon />,
+      label: t('提高优先级', 'Increase priority'),
+      onSelect: () => prio.mutate(cred.priority - 1),
+      disabled: prio.isPending,
+      shortcut: `P${cred.priority - 1}`,
+      title: t('数值越小，调度优先级越高', 'Lower values are scheduled first'),
+    },
+    {
+      key: 'prio-down',
+      icon: <ChevronDownIcon />,
+      label: t('降低优先级', 'Decrease priority'),
+      onSelect: () => prio.mutate(cred.priority + 1),
+      disabled: prio.isPending,
+      shortcut: `P${cred.priority + 1}`,
+      title: t('数值越大，调度优先级越低', 'Higher values are scheduled later'),
+    },
+  ]
+  const danger: CredentialMenuItem[] = [
+    { key: 'delete', icon: <Trash2Icon />, label: t('删除', 'Delete'), onSelect: h.onRequestDelete, destructive: true },
+  ]
+  return [detail, main, priority, danger].filter((g) => g.length > 0)
+}
+
+/**
+ * ⋯ 菜单内容（桌面下拉），卡片与列表共用。手机上走 [CredentialActionsMenu] 的底部面板。
+ *
+ * 删除只往外抛意图，确认框由调用方渲染在菜单之外——菜单一关，挂在它里面的弹窗会跟着
+ * 卸载，确认框根本来不及显示。
+ */
+export function CredentialMenuContent({
+  cred,
+  actions,
+  ...handlers
+}: { cred: Credential; actions: CredentialActions } & CredentialMenuHandlers) {
+  const groups = useCredentialMenuGroups(cred, actions, handlers)
   return (
     <MenuPopup align="end">
-      <MenuItem onClick={() => refresh.mutate()} disabled={refresh.isPending}>
-        <RefreshCwIcon className={refresh.isPending ? 'animate-spin' : undefined} />
-        {t('刷新 token', 'Refresh token')}
-      </MenuItem>
-      <MenuItem onClick={onTest}>
-        <ActivityIcon />
-        {t('连通性测试', 'Connectivity test')}
-      </MenuItem>
-      {/* 账号级冷却、模型级冷却、「套餐不含」记录任一存在都该给出口——后端那个接口是三档一起清的。
-          刚给组织开了 extra usage 的管理员，靠这一项让号立刻回去试 fable。 */}
-      {(cred.rate_limited_secs > 0
-        || (cred.rate_limited_models?.length ?? 0) > 0
-        || (cred.denied_models?.length ?? 0) > 0) && (
-        <MenuItem onClick={() => cooldown.mutate()} disabled={cooldown.isPending}>
-          <TimerOffIcon />
-          {(cred.denied_models?.length ?? 0) > 0
-            ? t('解除冷却与模型限制', 'Clear cooldown & model blocks')
-            : t('解除冷却', 'Clear cooldown')}
-        </MenuItem>
-      )}
-      <MenuItem onClick={onRename}>
-        <PencilIcon />
-        {t('重命名', 'Rename')}
-      </MenuItem>
-      <MenuItem onClick={onDeviceLimit}>
-        <SmartphoneIcon />
-        {t('设备上限', 'Device limit')}
-      </MenuItem>
-      {/* 与设备上限开的是同一个对话框（会话那一半在下面）：两种名额总是一起看。 */}
-      <MenuItem onClick={onDeviceLimit}>
-        <MessagesSquareIcon />
-        {t('模拟会话上限', 'Session limit')}
-      </MenuItem>
-      <MenuItem onClick={onRpmLimit}>
-        <GaugeIcon />
-        {t('RPM 上限', 'RPM limit')}
-      </MenuItem>
-      <MenuItem onClick={onQuotaPause}>
-        <PercentIcon />
-        {t('提前停调度阈值', 'Early pause threshold')}
-      </MenuItem>
-      <MenuItem onClick={onProxy}>
-        <GlobeIcon />
-        {t('出站代理', 'Outbound proxy')}
-      </MenuItem>
-      <MenuItem onClick={onUsage}>
-        <ScrollTextIcon />
-        {t('请求明细', 'Request log')}
-      </MenuItem>
-      <MenuSeparator />
-      <MenuItem
-        onClick={() => prio.mutate(cred.priority - 1)}
-        disabled={prio.isPending}
-        title={t('数值越小，调度优先级越高', 'Lower values are scheduled first')}
-      >
-        <ChevronUpIcon />
-        {t('提高优先级', 'Increase priority')}
-        <MenuShortcut>P{cred.priority - 1}</MenuShortcut>
-      </MenuItem>
-      <MenuItem
-        onClick={() => prio.mutate(cred.priority + 1)}
-        disabled={prio.isPending}
-        title={t('数值越大，调度优先级越低', 'Higher values are scheduled later')}
-      >
-        <ChevronDownIcon />
-        {t('降低优先级', 'Decrease priority')}
-        <MenuShortcut>P{cred.priority + 1}</MenuShortcut>
-      </MenuItem>
-      <MenuSeparator />
-      <MenuItem variant="destructive" onClick={onRequestDelete}>
-        <Trash2Icon />
-        {t('删除', 'Delete')}
-      </MenuItem>
+      {groups.map((group, i) => (
+        <Fragment key={group[0].key}>
+          {i > 0 && <MenuSeparator />}
+          {group.map((item) => (
+            <MenuItem
+              key={item.key}
+              onClick={item.onSelect}
+              disabled={item.disabled}
+              title={item.title}
+              variant={item.destructive ? 'destructive' : undefined}
+            >
+              {item.icon}
+              {item.label}
+              {item.shortcut && <MenuShortcut>{item.shortcut}</MenuShortcut>}
+            </MenuItem>
+          ))}
+        </Fragment>
+      ))}
     </MenuPopup>
+  )
+}
+
+/** 手机与平板竖屏：⋯ 改成底部操作面板。与 Tailwind 的 `sm`（40rem）同一条线，对话框也在这条线上贴底。 */
+const MOBILE_SHEET_QUERY = '(max-width: 39.98rem)'
+
+/**
+ * 账号的 ⋯ 操作入口：桌面是锚在按钮旁的下拉菜单，手机上是**贴底弹出的操作面板**。
+ *
+ * 手机上下拉菜单有三个毛病：一是它锚在按钮上，按钮在屏幕下半截时整张菜单被翻到上面、盖住顶栏，
+ * 离手指很远；二是菜单项 32px 高，拇指点不准，相邻两项（「设备上限」「模拟会话上限」）常误触；
+ * 三是看不出这是哪个号的菜单——一屏好几张卡片，菜单浮在中间。底部面板三件事一起解决：永远
+ * 从拇指那一侧出来、每项 44px 整行可点、头部写明账号名。面板用的是现成对话框的贴底样式
+ * （`bottomStickOnMobile`），与名额、代理那些对话框在手机上是同一副面孔。
+ *
+ * 选一项先关面板再执行：接着要开的对话框（重命名、上限）与面板是两个弹层，叠着开会让返回键
+ * 先关掉底下那个。唯一的例外是优先级升降，见 [CredentialActionSheet]。
+ */
+export function CredentialActionsMenu({
+  cred,
+  actions,
+  triggerClassName,
+  triggerLabel,
+  triggerTitle,
+  ...handlers
+}: {
+  cred: Credential
+  actions: CredentialActions
+  triggerClassName: string
+  triggerLabel: string
+  triggerTitle?: string
+} & CredentialMenuHandlers) {
+  const mobile = useMediaQuery(MOBILE_SHEET_QUERY)
+  const [open, setOpen] = useState(false)
+  if (!mobile) {
+    return (
+      <Menu modal={false}>
+        <MenuTrigger className={triggerClassName} aria-label={triggerLabel} title={triggerTitle}>
+          <EllipsisIcon />
+        </MenuTrigger>
+        <CredentialMenuContent cred={cred} actions={actions} {...handlers} />
+      </Menu>
+    )
+  }
+  return (
+    <>
+      <button
+        type="button"
+        className={triggerClassName}
+        aria-label={triggerLabel}
+        aria-haspopup="dialog"
+        title={triggerTitle}
+        onClick={() => setOpen(true)}
+      >
+        <EllipsisIcon />
+      </button>
+      {/* 没点开过就不挂：一页几十张卡片，每张都背一棵常关的面板树不划算。 */}
+      <DeferredMount open={open}>
+        <CredentialActionSheet cred={cred} actions={actions} open={open} onOpenChange={setOpen} {...handlers} />
+      </DeferredMount>
+    </>
+  )
+}
+
+/**
+ * 手机上的账号操作面板，版式照常见的移动端 Drawer（shadcn / vaul、iOS 分组列表）：
+ *
+ * - 顶部圆角 + 一条拖拽提示条，读得出「这是从底下拉上来的一层」；
+ * - 头部写账号名、`#id` 与状态 / 套餐徽章，一屏几张卡片时不会点错号；
+ * - 高频的四样（详情、测试、刷新、明细）做成一排图标方块，四项只占一行高；
+ * - 设置类每行右侧直接写**当前值**、末尾一枚 ›，像手机「设置」那样不用点进去就知道现状；
+ * - 删除单独一组、标红，与其余操作隔开。
+ *
+ * 条目的文案、图标、回调都来自 [useCredentialMenuGroups]，与桌面下拉菜单同一份，这里只按 key
+ * 重新排版，两处不会一个有「解除冷却」、另一个没有。
+ */
+function CredentialActionSheet({
+  cred,
+  actions,
+  open,
+  onOpenChange,
+  ...handlers
+}: {
+  cred: Credential
+  actions: CredentialActions
+  open: boolean
+  onOpenChange: (open: boolean) => void
+} & CredentialMenuHandlers) {
+  const { t, language, locale } = useI18n()
+  const items = new Map(useCredentialMenuGroups(cred, actions, handlers).flat().map((item) => [item.key, item]))
+  const pick = (keys: string[]) => keys.map((key) => items.get(key)).filter((item): item is CredentialMenuItem => item != null)
+  const credentialLabel = displayCredentialLabel(cred.label, language)
+  const { status } = evaluateCredential(cred, Math.floor(Date.now() / 1000), language)
+  const run = (item: CredentialMenuItem) => {
+    onOpenChange(false)
+    item.onSelect()
+  }
+  const limit = (count: number, effective: number) =>
+    `${count.toLocaleString(locale)}/${effective > 0 ? effective.toLocaleString(locale) : '∞'}`
+  const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('不停', 'off'))
+  /** 设置行右侧的当前值：与详情页读数、调度配置同一口径。 */
+  const valueOf: Record<string, string> = {
+    device: `${limit(cred.device_count, cred.device_limit_effective)} · ${limit(cred.session_count, cred.session_limit_effective)}`,
+    rpm: cred.rpm_limit_effective > 0 ? String(cred.rpm_limit_effective) : t('不限', 'Unlimited'),
+    pause: `${pause(cred.quota_pause_pct_effective)} · ${pause(cred.quota_pause_pct_7d_effective)}`,
+    proxy: cred.proxy ? proxyLabelParts(cred.proxy).host : t('直连', 'Direct'),
+  }
+  const quick = pick(['detail', 'test', 'refresh', 'usage'])
+  const settings = pick(['rename', 'device', 'rpm', 'pause', 'proxy'])
+    .map((item) => (item.key === 'device' ? { ...item, label: t('设备 / 会话上限', 'Device / session limits') } : item))
+  const cooldown = items.get('cooldown')
+  const priority = pick(['prio-up', 'prio-down'])
+  const remove = items.get('delete')
+  const quickLabel: Record<string, string> = {
+    detail: t('详情', 'Details'),
+    test: t('测试', 'Test'),
+    refresh: t('刷新', 'Refresh'),
+    usage: t('明细', 'Logs'),
+  }
+  const groupClass = 'mx-4 overflow-hidden rounded-xl border bg-card'
+  const rowClass = cn(
+    'flex min-h-12 w-full items-center gap-3 px-3.5 text-left text-sm outline-none transition-colors',
+    'active:bg-accent focus-visible:bg-accent disabled:opacity-50 [&_svg]:shrink-0',
+  )
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup
+        showCloseButton={false}
+        className="bg-surface-page max-sm:max-h-[90dvh]"
+      >
+        <div aria-hidden className="mx-auto mt-2 h-1.5 w-10 shrink-0 rounded-full bg-muted-foreground/24" />
+        <DialogHeader className="gap-1.5 px-5 pt-3 pb-4 max-sm:pb-4">
+          <DialogTitle className="truncate text-base" title={credentialLabel}>{credentialLabel}</DialogTitle>
+          {/* 状态与套餐徽章只在卡片 / 列表里打开时挂：那时要靠它们认出点的是哪个号。详情页里打开时
+              （showDetail=false），面板背后的页头就写着账号名、状态与套餐，这里只留 #id。 */}
+          <DialogDescription render={<div />} className="flex flex-wrap items-center gap-1.5 text-xs">
+            <span className="tabular-nums">#{cred.id}</span>
+            {handlers.showDetail !== false && (
+              <>
+                <Badge size="xs" variant={status.variant}>{status.label}</Badge>
+                {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+              </>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="min-h-0 space-y-4 overflow-y-auto overscroll-contain pb-1">
+          <div className={cn('grid gap-2 px-4', quick.length >= 4 ? 'grid-cols-4' : 'grid-cols-3')}>
+            {quick.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                disabled={item.disabled}
+                className={cn(
+                  'flex min-w-0 flex-col items-center gap-1.5 rounded-xl border bg-card px-1 py-3 text-xs outline-none transition-colors',
+                  'active:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 [&_svg]:size-5 [&_svg]:text-muted-foreground',
+                )}
+                aria-label={item.label}
+                onClick={() => run(item)}
+              >
+                {item.icon}
+                <span className="max-w-full truncate">{quickLabel[item.key] ?? item.label}</span>
+              </button>
+            ))}
+          </div>
+
+          {cooldown && (
+            <div className={cn(groupClass, 'border-warning/32 bg-warning/4')}>
+              <button
+                type="button"
+                disabled={cooldown.disabled}
+                className={cn(rowClass, 'text-warning-foreground [&_svg]:size-4.5')}
+                onClick={() => run(cooldown)}
+              >
+                {cooldown.icon}
+                <span className="min-w-0 flex-1 truncate font-medium">{cooldown.label}</span>
+              </button>
+            </div>
+          )}
+
+          <section aria-label={t('设置', 'Settings')} className="space-y-1.5">
+            <h3 className="px-5 text-xs font-medium text-muted-foreground">{t('设置', 'Settings')}</h3>
+            <ul className={cn(groupClass, 'divide-y')}>
+              {settings.map((item) => (
+                <li key={item.key}>
+                  <button
+                    type="button"
+                    disabled={item.disabled}
+                    className={cn(rowClass, '[&_svg]:size-4.5 [&>svg:first-child]:text-muted-foreground')}
+                    onClick={() => run(item)}
+                  >
+                    {item.icon}
+                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    {valueOf[item.key] && (
+                      <span className="max-w-[45%] truncate text-xs text-muted-foreground tabular-nums">{valueOf[item.key]}</span>
+                    )}
+                    <ChevronRightIcon aria-hidden className="size-4 text-muted-foreground/64" />
+                  </button>
+                </li>
+              ))}
+              {priority.length > 0 && (
+                <li className="flex min-h-12 items-center gap-3 px-3.5 text-sm">
+                  <ArrowUpDownIcon aria-hidden className="size-4.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate">{t('调度优先级', 'Priority')}</span>
+                  <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority}</span>
+                  {priority.map((item) => (
+                    <Button
+                      key={item.key}
+                      type="button"
+                      size="icon-sm"
+                      variant="outline"
+                      aria-label={`${item.label} (${item.shortcut})`}
+                      title={item.title}
+                      disabled={item.disabled}
+                      // 升降不关面板：常常要连点几下才到想要的档位，每点一下都关掉就得反复重开。
+                      onClick={item.onSelect}
+                    >
+                      {item.icon}
+                    </Button>
+                  ))}
+                </li>
+              )}
+            </ul>
+          </section>
+
+          {remove && (
+            <div className={groupClass}>
+              <button
+                type="button"
+                className={cn(rowClass, 'text-destructive-foreground [&_svg]:size-4.5')}
+                onClick={() => run(remove)}
+              >
+                {remove.icon}
+                <span className="min-w-0 flex-1 truncate">{t('删除账号', 'Delete account')}</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="p-4 pt-3">
+          <DialogClose render={<Button variant="outline" className="h-11 w-full bg-card" />}>{t('取消', 'Cancel')}</DialogClose>
+        </div>
+      </DialogPopup>
+    </Dialog>
   )
 }
 

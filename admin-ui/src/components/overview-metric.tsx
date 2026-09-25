@@ -5,11 +5,13 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 export function OverviewMetric({
-  label, value, status, statusHint, trend, icon: Icon, tone, active = false, opensDetail = false, onClick, className,
+  label, value, status, statusDetail, statusHint, trend, icon: Icon, tone, active = false, opensDetail = false, onClick, className,
 }: {
   label: string
   value: number | string
   status?: string
+  /** 小字的悬浮提示内容；不传就是小字原文。小字只放得下一两项时，完整分项放这里。 */
+  statusDetail?: ReactNode
   statusHint?: string
   trend?: ReactNode
   icon: ElementType<{ className?: string }>
@@ -86,7 +88,7 @@ export function OverviewMetric({
               <TooltipTrigger className="min-w-0 shrink truncate text-xs text-muted-foreground">
                 {status}
               </TooltipTrigger>
-              <TooltipPopup>{status}</TooltipPopup>
+              <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{statusDetail ?? status}</TooltipPopup>
             </Tooltip>
           )}
           {trend}

@@ -13,7 +13,6 @@ import {
   SaveIcon,
   Settings2Icon,
   ShieldCheckIcon,
-  SmartphoneIcon,
   SparklesIcon,
   TerminalIcon,
   TimerIcon,
@@ -432,8 +431,8 @@ export function DeviceSettingsContent() {
 
   return (
     <div className="space-y-4">
-      <DevicePolicyOverview settings={settingsQuery.data} />
-
+      {/* 这里原有一张「当前策略」汇总卡，把下面各组的已保存值原样再列一遍（每一项下面本来就有输入框
+          和换算后的读数），同一页上同一个值出现三次，已去掉。 */}
       <SettingsGroup
         icon={GaugeIcon}
         title={t('设备绑定与容量', 'Device bindings & capacity')}
@@ -517,132 +516,6 @@ export function SecuritySettingsContent() {
         <AdminPassword />
       </SettingsGroup>
     </div>
-  )
-}
-
-function DevicePolicyOverview({ settings }: { settings: Settings }) {
-  const { language, locale, t } = useI18n()
-  const bareRequestPolicy = settings.require_device_id
-    ? t('直接拒绝', 'Rejected')
-    : settings.bare_rate_limit > 0
-      ? t(
-          `${settings.bare_rate_limit.toLocaleString(locale)} 条 / ${formatDuration(settings.bare_rate_window_secs, language)}`,
-          `${settings.bare_rate_limit.toLocaleString(locale)} / ${formatDuration(settings.bare_rate_window_secs, language)}`,
-        )
-      : t('允许 · 不限速', 'Allowed · unlimited')
-  // 三道 RPM 闸各写各的，都没配才是一句「不限」；只配一部分时只显示配了的那些。
-  const rpmParts = [
-    settings.default_rpm_limit > 0
-      ? t(
-          `账号 ${settings.default_rpm_limit.toLocaleString(locale)}`,
-          `${settings.default_rpm_limit.toLocaleString(locale)}/account`,
-        )
-      : null,
-    settings.device_rpm_limit > 0
-      ? t(
-          `设备 ${settings.device_rpm_limit.toLocaleString(locale)}`,
-          `${settings.device_rpm_limit.toLocaleString(locale)}/device`,
-        )
-      : null,
-    settings.session_rpm_limit > 0
-      ? t(
-          `会话 ${settings.session_rpm_limit.toLocaleString(locale)}`,
-          `${settings.session_rpm_limit.toLocaleString(locale)}/session`,
-        )
-      : null,
-    settings.session_concurrency_limit > 0
-      ? t(
-          `并发 ${settings.session_concurrency_limit}`,
-          `${settings.session_concurrency_limit} concurrent`,
-        )
-      : null,
-  ].filter(Boolean)
-  // 不再缀「条 / 分钟」：RPM 这个词本身就是每分钟条数，标题已经写着，缀上只会把这格挤到换行。
-  const rpmPolicy = rpmParts.length > 0 ? rpmParts.join(' · ') : t('不限', 'Unlimited')
-  const items = [
-    {
-      // 设备与会话两种名额的有效期挤同一格，与下面「默认容量」那格同一写法。
-      label: t('名额有效期', 'Slot lifetime'),
-      value: [
-        settings.device_binding_ttl_secs > 0
-          ? t(`设备 ${formatDuration(settings.device_binding_ttl_secs, language)}`, `dev ${formatDuration(settings.device_binding_ttl_secs, language)}`)
-          : t('设备不释放', 'dev ∞'),
-        settings.session_binding_ttl_secs > 0
-          ? t(`会话 ${formatDuration(settings.session_binding_ttl_secs, language)}`, `sess ${formatDuration(settings.session_binding_ttl_secs, language)}`)
-          : t('会话不释放', 'sess ∞'),
-      ].join(' · '),
-    },
-    {
-      label: t('原账号关联', 'Account affinity'),
-      value: settings.device_binding_retention_secs > 0
-        ? formatDuration(settings.device_binding_retention_secs, language)
-        : t('永久保留', 'Kept forever'),
-    },
-    {
-      // 设备与模拟会话两种名额挤在同一格：概览一行六格已经到头，两个值总是一起看的。
-      label: t('默认容量', 'Default capacity'),
-      value: [
-        settings.default_device_limit > 0
-          ? t(`${settings.default_device_limit.toLocaleString(locale)} 台`, `${settings.default_device_limit.toLocaleString(locale)} dev`)
-          : t('设备不限', 'dev ∞'),
-        settings.default_session_limit > 0
-          ? t(`${settings.default_session_limit.toLocaleString(locale)} 会话`, `${settings.default_session_limit.toLocaleString(locale)} sess`)
-          : t('会话不限', 'sess ∞'),
-      ].join(' · '),
-    },
-    {
-      // 账号与设备两道 RPM 闸挤在同一格里：概览一行六格已经到头，再加一格窄屏会散架，
-      // 而这两个值总是一起看的——「账号 30 · 设备 10」比分两格更省地方也更好读。
-      label: t('RPM 上限', 'RPM limits'),
-      value: rpmPolicy,
-    },
-    {
-      label: t('无设备身份请求', 'Requests without device identity'),
-      value: bareRequestPolicy,
-    },
-    {
-      // 最低版本与官方最新版并作一格：它们是下面同一张「客户端版本」卡的两行，
-      // 分两格既把概览挤到第七格，又让人以为是两套互不相干的规则。
-      label: t('客户端版本', 'Client version'),
-      value: [
-        settings.min_client_version
-          ? t(`${settings.min_client_version} 及以上`, `${settings.min_client_version}+`)
-          : t('不限', 'Unlimited'),
-        t(`最新 ${effectiveLatestRelease(settings)}`, `latest ${effectiveLatestRelease(settings)}`),
-      ].join(' · '),
-    },
-  ]
-
-  return (
-    <SettingsGroup
-      icon={SmartphoneIcon}
-      title={t('当前策略', 'Current policy')}
-      description={t(
-        '下面是当前生效的设备绑定与身份处理摘要。',
-        'A summary of the device binding and identity rules currently in effect.',
-      )}
-    >
-      {/* 等宽方格：手机 2 列、≥640 起 3 列，六格正好铺满两行、不留半截空格。
-          原来是 `md:grid-flow-col md:auto-cols-auto` 把七格挤成一行——列宽按内容自动分配，
-          结果每格宽窄不一（「无身份请求」那格比「RPM 上限」窄一半），而值又写着 whitespace-nowrap，
-          「设备 1 小时 · 会话 30 分钟」直接压过右边那道竖线。这里改成固定列数 + 值允许换行：
-          格子宽度一致，最长的那串（RPM 四道闸）折成两行也不碰到邻格。
-          分隔线用 `gap-px` + 底色透出来，不再按序号拼 border 类——列数一变就得重算的写法。 */}
-      <dl
-        aria-label={t('当前设备策略概览', 'Current device policy overview')}
-        // 圆角比面板小 1px（面板自己的内圈阴影也是这么算的）：格子底色是实心的，
-        // 不跟着收角就会在卡片四角露出方角，盖住下面那层灰托盘。
-        className="grid grid-cols-2 gap-px overflow-hidden rounded-[calc(var(--radius-xl)-1px)] bg-border sm:grid-cols-3 max-sm:rounded-none"
-      >
-        {items.map((item) => (
-          // 槽宽分两档（手机 16 / ≥640 20），与设置页每一行、账号页概览条同一套。
-          <div key={item.label} className="min-w-0 bg-background px-4 py-4 sm:px-5">
-            <dt className="text-xs text-muted-foreground">{item.label}</dt>
-            <dd className="mt-1 font-semibold text-sm leading-snug">{item.value}</dd>
-          </div>
-        ))}
-      </dl>
-    </SettingsGroup>
   )
 }
 
@@ -1581,6 +1454,7 @@ function RequireDeviceIdToggle() {
 
   return (
     <SettingsRow
+      inlineControl
       htmlFor="require-device-id"
       label={t('设备身份校验', 'Device identity checks')}
       badge={
@@ -1880,26 +1754,23 @@ function BareRateLimit() {
       }
       description={inactive
         ? t(
-            '设备身份校验已开启，无设备身份请求会先被拒绝；切换到兼容模式后此限制才会生效。',
-            'Device identity checks are enabled, so requests without device identity are rejected first; this limit takes effect only in compatible mode.',
+            '设备身份校验已开启，无设备身份请求会先被拒绝。当前配置会保留，切换到兼容模式后自动生效。',
+            'Device identity checks are enabled, so requests without device identity are rejected first. The configuration is kept and takes effect automatically in compatible mode.',
           )
         : t(
             '限制兼容模式下放行的无设备身份请求，0 表示不限速。',
             'Limits the requests without device identity that compatible mode allows; 0 means unlimited.',
           )}
-      footer={
+      // 不生效时，「当前不生效」徽章加上面那句说明已经说全了；底部原来再说一遍「配置会保留、
+      // 关闭校验后恢复」，并进了说明里。生效时底部才有东西要补（计数口径）。
+      footer={!inactive && (
         <p className="mt-2 w-full border-t pt-4 text-xs leading-5 text-muted-foreground">
-          {inactive
-            ? t(
-                '当前配置会保留，关闭设备身份校验后自动恢复使用。',
-                'The current configuration is preserved and becomes active automatically when identity checks are disabled.',
-              )
-            : t(
-                '仅统计无设备身份的消息请求，token 计数接口不计入；单个账号达到上限后自动换账号，所有账号都达到上限才拒绝。服务重启后重新计数。',
-                'Only message requests without device identity are counted; token-counting requests are excluded. The proxy switches accounts when one reaches its limit and rejects only when every account is capped. Counters reset after a service restart.',
-              )}
+          {t(
+            '仅统计无设备身份的消息请求，token 计数接口不计入；单个账号达到上限后自动换账号，所有账号都达到上限才拒绝。服务重启后重新计数。',
+            'Only message requests without device identity are counted; token-counting requests are excluded. The proxy switches accounts when one reaches its limit and rejects only when every account is capped. Counters reset after a service restart.',
+          )}
         </p>
-      }
+      )}
     >
         <div className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] grid-rows-[auto_auto] items-center gap-3 sm:w-88">
           <Field className="row-span-2 grid grid-rows-subgrid gap-1.5">

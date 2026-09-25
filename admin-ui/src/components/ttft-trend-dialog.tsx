@@ -6,7 +6,6 @@ import { useI18n } from '@/lib/i18n'
 import { bucketTtftSeries, cn, extractError, type CacheGranularity, type TtftSlot } from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
   DialogDescription,
@@ -381,7 +380,8 @@ export function TtftTrendDialog({
                 <DialogTitle ref={titleRef} tabIndex={-1}>
                   {t('首字时延趋势', 'TTFT trend')}
                 </DialogTitle>
-                <Badge variant="info" aria-live="polite">{rangeLabel[range]}</Badge>
+                {/* 标题旁不再挂「近 24 小时」：右上角的范围切换已经标着选中的那一档，下面汇总卡的标签
+                    又写了一遍，三处说同一个范围。 */}
                 {query.isFetching && !query.isPending && <Spinner />}
               </div>
               <DialogDescription className="mt-1">

@@ -3,6 +3,7 @@ import { PercentIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { displayCredentialLabel } from '@/lib/utils'
+import { ClampedDescription } from '@/components/settings-group'
 import { type CredentialActions } from '@/components/credential-shared'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -191,10 +192,11 @@ export function CredentialQuotaDialog({
           <Alert>
             <PercentIcon />
             <AlertDescription>
-              {t(
+              {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
+              <ClampedDescription text={t(
                 '上游每条响应都会报告该账号的额度使用率，达到阈值就把账号移出调度池，不必等下一条请求触发 429；到触发暂停的那个窗口重置时自动恢复。两个窗口各自覆盖设置页里的全局值：因 5 小时窗口暂停最多持续几小时，因 7 天窗口暂停则要到下一次周重置，所以 7 天窗口的阈值建议设得比 5 小时更高。从下一条带限流响应头的响应起生效。注意：已按旧阈值暂停的账号不会因阈值调高而自动回到调度池，可手动启用或做一次连通性测试来恢复。',
                 'Every upstream response reports this account’s utilization; once it reaches the threshold the account leaves the scheduling pool instead of waiting for the next request to hit a 429, and comes back when the window that triggered the pause resets. Each window overrides the global value on the settings page: a 5h pause lasts a few hours at most, while a 7d pause lasts until the next weekly reset, so set the 7d threshold higher than the 5h one. Takes effect from the next response carrying rate limit headers. Note: an account already paused under the old threshold does not return to the pool by itself when you raise it; re-enable it manually or run a connectivity test.',
-              )}
+              )} />
             </AlertDescription>
           </Alert>
         </DialogPanel>

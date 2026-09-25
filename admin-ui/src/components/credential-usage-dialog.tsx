@@ -174,7 +174,10 @@ export function CredentialUsageDialog({
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <DialogTitle ref={titleRef} tabIndex={-1}>{t('请求明细', 'Request log')}</DialogTitle>
-                <Badge variant={status.variant} aria-live="polite">{status.label}</Badge>
+                {/* 只在读取中 / 失败时挂徽章：「共 N 条」底部分页那行已经写着，标题旁再报一遍是重复。 */}
+                {(usage.isPending || usage.error) && (
+                  <Badge variant={status.variant} aria-live="polite">{status.label}</Badge>
+                )}
                 {usage.isFetching && !usage.isPending && <Spinner />}
               </div>
               <DialogDescription className="mt-1 flex min-w-0 items-center gap-1.5">
@@ -197,9 +200,11 @@ export function CredentialUsageDialog({
               </p>
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
+              {/* 「近 30 天」左边的标签已经写着，这里只说它和累计花费为什么对不上。这个对话框也从详情页
+                  打开，那里没有卡片，所以不说「卡片上的」。 */}
               {t(
-                '流水仅保留最近 30 天；卡片上的累计花费来自终身账本，因此两者不一定相等。',
-                'Logs are retained for 30 days; the card uses the lifetime ledger, so the totals are not expected to match.',
+                '累计花费来自终身账本，与这里的明细合计不一定相等。',
+                'The total cost comes from the lifetime ledger and is not expected to match this sum.',
               )}
             </p>
           </section>
@@ -368,15 +373,18 @@ export function CredentialUsageDialog({
  * 字段顺序按排查时的读法排：先看什么时候、成没成、花了多少，再看模型与 token，
  * 最后才是耗时和来源。UA 只留一行截断——真要看全的场景基本都在桌面端。
  */
-function UsageCards({
+export function UsageCards({
   rows,
   credentialLabel,
   loading,
   onLookup,
+  scroll = true,
 }: {
   rows: UsageLog[]
   credentialLabel: string
   loading: boolean
+  /** 对话框里限高、自己滚；详情页里整页滚，再套一层内滚动在手机上很难滑，传 false。 */
+  scroll?: boolean
   /** 点某一行的请求 id：带着它开请求查询弹窗，见 [CredentialUsageDialog] 里那段。 */
   onLookup: (id: string) => void
 }) {
@@ -385,7 +393,7 @@ function UsageCards({
 
   return (
     <ul
-      className="max-h-[26rem] space-y-2 overflow-y-auto overscroll-contain"
+      className={cn('space-y-2', scroll && 'max-h-[26rem] overflow-y-auto overscroll-contain')}
       aria-label={t(`${credentialLabel} 的请求明细`, `Request log for ${credentialLabel}`)}
       aria-busy={loading}
     >
@@ -472,7 +480,7 @@ function LogFact({ label, children }: { label: string; children: React.ReactNode
   )
 }
 
-function UsageTable({
+export function UsageTable({
   rows,
   credentialLabel,
   descriptionId,

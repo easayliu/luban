@@ -109,6 +109,8 @@ export function ProxyPoolSettingsContent() {
           'Manage reusable outbound proxy addresses. Once added, they can be quickly selected in each account’s proxy settings or assigned to multiple accounts via batch actions.',
         )}
       >
+        {/* 手机上名称独占一行、地址与「添加」同一行：三样硬挤一行时两个输入框各只剩 90 来 px，
+            占位提示都被截断（「如：日本节」「socks5://127.0.0.1:108」）。 */}
         <Form
           className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5"
           onSubmit={(event) => {
@@ -116,7 +118,7 @@ export function ProxyPoolSettingsContent() {
             if (addLabel.trim() && addUrl.trim() && !create.isPending) create.mutate()
           }}
         >
-          <div className="min-w-0 flex-1 space-y-1">
+          <div className="min-w-0 flex-1 space-y-1 max-sm:basis-full">
             <label className="text-xs font-medium" htmlFor="proxy-pool-add-label">
               {t('名称', 'Name')}
             </label>
@@ -210,7 +212,7 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
   if (editing) {
     return (
       <li className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5">
-        <div className="min-w-0 flex-1 space-y-1">
+        <div className="min-w-0 flex-1 space-y-1 max-sm:basis-full">
           <label className="text-xs font-medium" htmlFor={`proxy-edit-label-${proxy.id}`}>
             {t('名称', 'Name')}
           </label>
@@ -267,11 +269,6 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium">{proxy.label}</span>
-            {proxy.credential_count > 0 && (
-              <Badge variant="secondary" size="sm">
-                {t(`${proxy.credential_count} 个账号`, `${proxy.credential_count} account${proxy.credential_count === 1 ? '' : 's'}`)}
-              </Badge>
-            )}
           </div>
           <p className="mt-0.5 truncate text-xs text-muted-foreground" title={proxyMaskedUrl(proxy.url)}>
             {proxyMaskedUrl(proxy.url)}
@@ -300,7 +297,10 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
       </div>
       {proxy.credential_labels.length > 0 && (
         <p className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
-          <span>{t('使用账号：', 'Used by: ')}</span>
+          {/* 数量并进这一行的标签：原来名称旁还挂一枚「2 个账号」徽章，紧接着这里又把两个账号列出来。 */}
+          <span className="tabular-nums">
+            {t(`使用账号（${proxy.credential_count}）：`, `Used by (${proxy.credential_count}): `)}
+          </span>
           {proxy.credential_labels.map((name, i) => (
             <Badge key={i} variant="outline" size="sm">{name}</Badge>
           ))}

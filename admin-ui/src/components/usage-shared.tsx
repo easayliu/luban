@@ -27,6 +27,10 @@ export function statusVariant(status: number): BadgeProps['variant'] {
  * 给了 `onOpen` 就拆成两颗按钮：id 本身点开这条请求的查询弹窗，后面那枚图标仍是复制——
  * 一个格子两种动作，都得是真按钮（键盘逐个 Tab 得到，读屏各念各的）。没给 `onOpen` 时整块
  * 就是复制按钮，与原来一样。
+ *
+ * 触屏上（`pointer-coarse`）两颗按钮都用「内边距撑大、负外边距抵回」放大命中区，布局一像素不动：
+ * id 那颗是 `truncate`（overflow hidden），撑热区的 `::after` 会被自己裁掉，只能走内边距；复制
+ * 那枚图标只有 12px，向上下与右侧各撑 12px，左侧只撑 4px——正好是两颗之间的间隙，不压到 id 上。
  */
 export function RequestIdChip({
   id,
@@ -53,7 +57,7 @@ export function RequestIdChip({
     return (
       <button
         type="button"
-        className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere]"
+        className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere] pointer-coarse:-my-3 pointer-coarse:py-3"
         title={`${id}\n${t('点击复制', 'Click to copy')}`}
         onClick={copy}
       >
@@ -67,7 +71,7 @@ export function RequestIdChip({
       <button
         type="button"
         className={cn(
-          'min-w-0 rounded font-mono text-xs hover:text-foreground hover:underline',
+          'min-w-0 rounded font-mono text-xs hover:text-foreground hover:underline pointer-coarse:-my-3 pointer-coarse:py-3',
           full ? '[overflow-wrap:anywhere] text-left' : 'truncate',
         )}
         title={`${id}\n${t('点击查看这条请求', 'Click to look up this request')}`}
@@ -79,7 +83,7 @@ export function RequestIdChip({
       </button>
       <button
         type="button"
-        className="shrink-0 rounded text-muted-foreground hover:text-foreground"
+        className="shrink-0 rounded text-muted-foreground hover:text-foreground pointer-coarse:-my-3 pointer-coarse:-mr-3 pointer-coarse:-ml-1 pointer-coarse:py-3 pointer-coarse:pr-3 pointer-coarse:pl-1"
         title={`${id}\n${t('点击复制', 'Click to copy')}`}
         aria-label={t(`复制请求 ID ${id}`, `Copy request ID ${id}`)}
         onClick={copy}

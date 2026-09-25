@@ -12,6 +12,7 @@ import {
   cn, copyText, displayCredentialLabel, downloadJson, extractError, fileStamp, formatFullTime,
   formatUsd,
 } from '@/lib/utils'
+import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -36,7 +37,7 @@ import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 const PAGE_SIZES = [25, 50, 100] as const
 
 /** 触发来源 → 人话。 */
-function sourceLabel(source: string, t: (zh: string, en: string) => string): string {
+export function sourceLabel(source: string, t: (zh: string, en: string) => string): string {
   switch (source) {
     case 'forward': return t('转发 4xx', 'Forward 4xx')
     case 'forward_401': return t('转发 401 换账号', 'Forward 401, account switch')
@@ -72,7 +73,7 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
 }
 
 /** 一条事件的详情：账号侧快照 + 冻结流水时间线。 */
-function BanEventDetail({ ev }: { ev: BanEvent }) {
+export function BanEventDetail({ ev }: { ev: BanEvent }) {
   const { t, language, locale } = useI18n()
   const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
   const [page, setPage] = useState(0)
@@ -143,10 +144,11 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
   const ageDays = Math.max(0, Math.floor((ev.ts - ev.account_created_at) / 86400))
 
   return (
-    <div className="space-y-4 border-t bg-muted/30 px-4 py-4">
+    // whitespace-normal：详情挂在表格单元格里，表格默认不折行，长的上游原文会直接压到右边那一格上。
+    <div className="space-y-4 whitespace-normal border-t bg-muted/30 px-4 py-4">
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Fact label={t('上游原文', 'Upstream message')}>
-          <div className="font-mono text-xs">
+          <div className="font-mono text-xs [overflow-wrap:anywhere]">
             {/* `size="xs"`：这枚是内联嵌在一行 `text-xs` 正文里的，默认档带视口 ramp
                 （手机 14px），会比它夹在中间的文字还大。 */}
             {ev.error_type && <Badge size="xs" variant="outline" className="mr-1">{ev.error_type}</Badge>}
@@ -172,10 +174,7 @@ function BanEventDetail({ ev }: { ev: BanEvent }) {
           {t(`${ev.lifetime_requests} 次请求 · ${formatUsd(ev.lifetime_cost_usd)}`,
             `${ev.lifetime_requests} requests · ${formatUsd(ev.lifetime_cost_usd)}`)}
         </Fact>
-        <Fact label={t('封前 7 天', 'Last 7 days')}>
-          {t(`${ev.requests_7d} 次请求 · 入站 ${ev.devices_7d} 台 → 出站 ${ev.devices_out_7d} 台`,
-            `${ev.requests_7d} requests · ${ev.devices_7d} inbound devices → ${ev.devices_out_7d} outbound`)}
-        </Fact>
+        {/* 「封前 7 天」不在这里再列：展开它的那一行已经写着「N 次 · 入站 N → 出站 N 台」。 */}
         <Fact label={t('最后额度状态', 'Last quota status')}>
           {ev.last_unified_status ?? dash}
           {ev.last_overage_in_use && (
@@ -444,10 +443,11 @@ export function BanEventsDialog({
         <DialogHeader>
           <DialogTitle>{t('封号记录', 'Ban events')}</DialogTitle>
           <DialogDescription>
-            {t(
+            {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
+            <ClampedDescription text={t(
               '每次自动封停记录一条：上游原话、触发请求、账号当时的等级 / 代理 / 用量快照，以及封号前 7 天的全部流水（含取证列）。解封、删除账号、清理流水都不会删除这里的记录。',
               'One row per automatic disable: the upstream message, the triggering request, a snapshot of the account’s tier / proxy / usage at the time, and every request from the 7 days before (with forensic columns). Re-enabling or deleting the account, or pruning logs, never removes these records.',
-            )}
+            )} />
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="max-h-[70vh] overflow-y-auto">
@@ -517,8 +517,8 @@ export function BanEventsDialog({
                                   <Badge size="sm" variant="outline">{sourceLabel(ev.source, t)}</Badge>
                                   <span className="tabular-nums">
                                     {t(
-                                      `封前 7 天 ${ev.requests_7d} 次 / 出站 ${ev.devices_out_7d} 台`,
-                                      `7d before: ${ev.requests_7d} req / ${ev.devices_out_7d} dev out`,
+                                      `封前 7 天 ${ev.requests_7d} 次 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
+                                      `7d before: ${ev.requests_7d} req · ${ev.devices_7d} in → ${ev.devices_out_7d} out`,
                                     )}
                                   </span>
                                 </p>
@@ -545,7 +545,19 @@ export function BanEventsDialog({
                           <TableCell>{ev.status == null ? '—' : <Badge variant={statusVariant(ev.status)}>{ev.status}</Badge>}</TableCell>
                           <TableCell className="max-w-md truncate font-mono text-xs" title={ev.reason}>{ev.reason}</TableCell>
                           <TableCell className="whitespace-nowrap text-right tabular-nums">
-                            {t(`${ev.requests_7d} 次 / 出站 ${ev.devices_out_7d} 台`, `${ev.requests_7d} req / ${ev.devices_out_7d} dev out`)}
+                            {/* 表格这一格不折行，写全「入站 3 → 出站 2 台」会把整张表撑宽、挤掉右侧的导出按钮；
+                                这里用「3→2 台」，完整说法在 title 里。窄屏的堆叠行能折行，照写全称。 */}
+                            <span
+                              title={t(
+                                `封前 7 天：入站 ${ev.devices_7d} 台 → 出站 ${ev.devices_out_7d} 台`,
+                                `7 days before: ${ev.devices_7d} inbound → ${ev.devices_out_7d} outbound devices`,
+                              )}
+                            >
+                              {t(
+                                `${ev.requests_7d} 次 · ${ev.devices_7d}→${ev.devices_out_7d} 台`,
+                                `${ev.requests_7d} req · ${ev.devices_7d}→${ev.devices_out_7d} dev`,
+                              )}
+                            </span>
                           </TableCell>
                         </TableRow>
                         {isOpen && (

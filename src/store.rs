@@ -3909,6 +3909,77 @@ pub struct BreakdownRow {
     pub cache: CacheBucket,
 }
 
+/// 单账号用量统计的一格：一个时间桶，或整个窗口的合计（`ts` 是桶起点 / 窗口起点）。
+///
+/// token 四项与官方 `usage` 同口径、互不重叠，**不加权**；费用是写流水时按价目表估的等价 API
+/// 费用，模型认不出价目的记录按 0 计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CredentialStatsBucket {
+    pub ts: i64,
+    /// 全部请求数（含失败与本地拒绝）。
+    pub requests: i64,
+    /// 其中非 2xx 的条数。
+    pub errors: i64,
+    /// 其中 luban 本地拒掉、没发到上游的条数（`rewrites` 以 `rejected_locally` 开头）。
+    pub rejected: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+}
+
+impl CredentialStatsBucket {
+    fn add(&mut self, row: &CredentialStatsBucket) {
+        self.requests += row.requests;
+        self.errors += row.errors;
+        self.rejected += row.rejected;
+        self.input_tokens += row.input_tokens;
+        self.output_tokens += row.output_tokens;
+        self.cache_write_tokens += row.cache_write_tokens;
+        self.cache_read_tokens += row.cache_read_tokens;
+        self.cost_usd += row.cost_usd;
+    }
+}
+
+/// 单账号按某个维度拆开的一组。`key` 是模型名 / device_id / 来访 UA / 状态码的原值，
+/// 缺失时为空串（没带设备身份的裸请求、没带 UA 的来访）。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct CredentialStatsGroup {
+    pub key: String,
+    pub requests: i64,
+    pub errors: i64,
+    /// 四项 token 之和（同 [`CredentialStatsBucket`] 的口径）。
+    pub tokens: i64,
+    pub cost_usd: f64,
+    /// 这一组最近一条请求的时刻（Unix 秒）。
+    pub last_ts: i64,
+}
+
+impl CredentialStatsGroup {
+    fn add(&mut self, row: &CredentialStatsBucket) {
+        self.requests += row.requests;
+        self.errors += row.errors;
+        self.tokens +=
+            row.input_tokens + row.output_tokens + row.cache_write_tokens + row.cache_read_tokens;
+        self.cost_usd += row.cost_usd;
+        self.last_ts = self.last_ts.max(row.ts);
+    }
+}
+
+/// [`CredentialStore::credential_stats`] 的结果。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CredentialStats {
+    /// 有请求的桶（空桶不返回，前端自己补齐）。
+    pub points: Vec<CredentialStatsBucket>,
+    /// 整个窗口的合计。
+    pub summary: CredentialStatsBucket,
+    pub by_model: Vec<CredentialStatsGroup>,
+    pub by_device: Vec<CredentialStatsGroup>,
+    pub by_client: Vec<CredentialStatsGroup>,
+    pub by_status: Vec<CredentialStatsGroup>,
+}
+
 /// 与 [`CredentialStore::query_usage_logs`] 走同一套筛选条件，好让「共 N 条」「合计 $X」
 /// 与实际翻得到的记录是同一个集合——分两处各写一份 WHERE 迟早会漂开。
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -4676,6 +4747,97 @@ impl CredentialStore {
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then_with(|| a.key.cmp(&b.key)));
         out.truncate(limit);
         Ok(out)
+    }
+
+    /// 单个账号 `since` 起的用量统计：按时间分桶（桶宽与时区偏移同 [`Self::ttft_report`]）、
+    /// 整个窗口的合计，以及按模型 / 设备 / 来访客户端 / 状态码四个维度拆开的分组（各自按请求数
+    /// 降序、最多 `group_limit` 组）。一次扫描把这几路都汇总出来——走 `idx_usage_logs_cred_ts`
+    /// 卡住账号与起点，量级是单号 30 天的流水，在 Rust 里聚合比拼五条 GROUP BY 省一半扫描。
+    pub fn credential_stats(
+        &self,
+        cred_id: i64,
+        since: i64,
+        bucket_secs: i64,
+        tz_offset_secs: i64,
+        group_limit: usize,
+    ) -> Result<CredentialStats> {
+        let bucket_secs = bucket_secs.max(1);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ts, status, COALESCE(model, ''), COALESCE(device_id, ''), COALESCE(ua, ''),
+                    COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+                    cache_creation_tokens, cache_5m_tokens, cache_1h_tokens,
+                    COALESCE(cache_read_tokens, 0), COALESCE(cost_usd, 0),
+                    COALESCE(rewrites LIKE 'rejected_locally%', 0)
+               FROM usage_logs
+              WHERE cred_id = ?1 AND ts >= ?2",
+        )?;
+        let mut buckets: std::collections::BTreeMap<i64, CredentialStatsBucket> =
+            Default::default();
+        let mut summary = CredentialStatsBucket { ts: since, ..Default::default() };
+        let mut by_model: std::collections::HashMap<String, CredentialStatsGroup> =
+            Default::default();
+        let mut by_device: std::collections::HashMap<String, CredentialStatsGroup> =
+            Default::default();
+        let mut by_client: std::collections::HashMap<String, CredentialStatsGroup> =
+            Default::default();
+        let mut by_status: std::collections::HashMap<String, CredentialStatsGroup> =
+            Default::default();
+        let mut rows = stmt.query(params![cred_id, since])?;
+        while let Some(r) = rows.next()? {
+            let ts: i64 = r.get(0)?;
+            let status: i64 = r.get(1)?;
+            let model: String = r.get(2)?;
+            let device: String = r.get(3)?;
+            let ua: String = r.get(4)?;
+            let creation: Option<i64> = r.get(7)?;
+            let c5: Option<i64> = r.get(8)?;
+            let c1: Option<i64> = r.get(9)?;
+            let row = CredentialStatsBucket {
+                ts,
+                requests: 1,
+                errors: i64::from(!(200..300).contains(&status)),
+                rejected: r.get(12)?,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                // 同 usage_breakdown：老记录只有细分档没有合计列时，拿两档相加兜底。
+                cache_write_tokens: creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0)),
+                cache_read_tokens: r.get(10)?,
+                cost_usd: r.get(11)?,
+            };
+            let bucket =
+                ((ts + tz_offset_secs).div_euclid(bucket_secs)) * bucket_secs - tz_offset_secs;
+            buckets
+                .entry(bucket)
+                .or_insert(CredentialStatsBucket { ts: bucket, ..Default::default() })
+                .add(&row);
+            summary.add(&row);
+            for (groups, key) in [
+                (&mut by_model, model),
+                (&mut by_device, device),
+                (&mut by_client, ua),
+                (&mut by_status, status.to_string()),
+            ] {
+                groups
+                    .entry(key.clone())
+                    .or_insert_with(|| CredentialStatsGroup { key, ..Default::default() })
+                    .add(&row);
+            }
+        }
+        let ranked = |groups: std::collections::HashMap<String, CredentialStatsGroup>| {
+            let mut out: Vec<_> = groups.into_values().collect();
+            out.sort_by(|a, b| b.requests.cmp(&a.requests).then_with(|| a.key.cmp(&b.key)));
+            out.truncate(group_limit);
+            out
+        };
+        Ok(CredentialStats {
+            points: buckets.into_values().collect(),
+            summary,
+            by_model: ranked(by_model),
+            by_device: ranked(by_device),
+            by_client: ranked(by_client),
+            by_status: ranked(by_status),
+        })
     }
 
     /// `since` 起本地拒绝的条数，按原因分类（`rewrites` 里 `rejected_locally:<kind>` 的 kind；
@@ -8413,6 +8575,105 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stats.total, 6);
+    }
+
+    /// 单账号统计：只算这个号、按起点截断；桶按时区偏移切；四个维度各自按请求数降序；
+    /// 错误与本地拒绝分开数；缓存写在只有细分档的老记录上拿两档相加。
+    #[test]
+    fn credential_stats_buckets_and_groups() {
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let day = 86_400;
+        // 窗口起点取某天 UTC 零点，下面的时刻都相对它算，桶边界才好核对。
+        let base = 20_000 * day;
+        let rec =
+            |cred: i64, model: &str, device: Option<&str>, status: u16, cost: f64| UsageRecord {
+                cred_id: Some(cred),
+                cred_label: "x".into(),
+                model: Some(model.into()),
+                device_id: device.map(Into::into),
+                ua: Some("claude-cli/2.1.280".into()),
+                status,
+                has_usage: true,
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                cache_creation_tokens: Some(3),
+                cache_read_tokens: Some(100),
+                cost_usd: Some(cost),
+                ..Default::default()
+            };
+        let insert = |r: &UsageRecord, ts: i64| store.insert_usage_log_at(r, Some(ts)).unwrap();
+        // 第一天：opus 两条成功（设备 d1）、sonnet 一条 429。
+        insert(&rec(a, "claude-opus-5", Some("d1"), 200, 0.5), base + 3600);
+        insert(&rec(a, "claude-opus-5", Some("d1"), 200, 0.5), base + 7200);
+        insert(&rec(a, "claude-sonnet-5", None, 429, 0.0), base + 7300);
+        // 第二天：一条本地拒绝，一条只有细分档缓存写的老记录。
+        insert(
+            &UsageRecord {
+                cred_id: Some(a),
+                status: 429,
+                forensics: Forensics {
+                    rewrites: Some("rejected_locally:device-limit".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            base + day + 60,
+        );
+        insert(
+            &UsageRecord {
+                cache_creation_tokens: None,
+                cache_5m_tokens: Some(4),
+                cache_1h_tokens: Some(6),
+                ..rec(a, "claude-opus-5", Some("d2"), 200, 1.0)
+            },
+            base + day + 120,
+        );
+        // 别的号、窗口之前的记录都不算。
+        insert(&rec(b, "claude-opus-5", Some("d1"), 200, 9.0), base + 3600);
+        insert(&rec(a, "claude-opus-5", Some("d1"), 200, 9.0), base - 10);
+
+        let s = store.credential_stats(a, base, day, 0, 10).unwrap();
+        assert_eq!(s.summary.requests, 5);
+        assert_eq!(s.summary.errors, 2, "429 两条（含本地拒绝）");
+        assert_eq!(s.summary.rejected, 1);
+        assert!((s.summary.cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(s.summary.cache_write_tokens, 3 * 3 + 10);
+        assert_eq!(
+            s.points.iter().map(|p| (p.ts, p.requests)).collect::<Vec<_>>(),
+            vec![(base, 3), (base + day, 2)]
+        );
+        assert_eq!(s.by_model[0].key, "claude-opus-5");
+        assert_eq!(s.by_model[0].requests, 3);
+        assert_eq!(s.by_model[0].last_ts, base + day + 120);
+        // d1 与空设备（sonnet 那条 + 本地拒绝）都是 2 条，并列按 key 排，空串在前。
+        assert_eq!(
+            s.by_device.iter().map(|g| (g.key.as_str(), g.requests)).collect::<Vec<_>>(),
+            vec![("", 2), ("d1", 2), ("d2", 1)],
+            "没带设备身份的归空串"
+        );
+        assert_eq!(s.by_device[1].tokens, 2 * (10 + 20 + 3 + 100));
+        assert_eq!(s.by_status[0].key, "200");
+        assert_eq!(
+            s.by_status[1],
+            CredentialStatsGroup {
+                key: "429".into(),
+                requests: 2,
+                errors: 2,
+                tokens: 133,
+                cost_usd: 0.0,
+                last_ts: base + day + 60,
+            }
+        );
+        assert_eq!(s.by_client[0].key, "claude-cli/2.1.280");
+
+        // 东八区：UTC 当天 17:00 之后落到本地第二天。
+        let tz = 8 * 3600;
+        insert(&rec(a, "claude-opus-5", Some("d1"), 200, 0.0), base + 17 * 3600);
+        let local = store.credential_stats(a, base, day, tz, 10).unwrap();
+        assert!(local.points.iter().any(|p| p.ts == base + day - tz));
+        // group_limit 生效。
+        assert_eq!(store.credential_stats(a, base, day, 0, 1).unwrap().by_model.len(), 1);
     }
 
     fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {

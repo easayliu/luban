@@ -1,4 +1,5 @@
 import { api } from './client'
+import { localTzOffsetSecs } from './metrics'
 
 /**
  * 上游报告的一个额度窗口。窗口名原样透传（`5h`/`7d`/`7d_oi`/`overage` …），不做白名单。
@@ -515,6 +516,62 @@ export async function listCredentialUsage(
 /** 全部账号的流水（按时间倒序）；`request_id` 精确匹配，用于按请求 id 查一条。 */
 export async function listUsage(params: UsageListParams = {}): Promise<UsagePage> {
   const { data } = await api.get<UsagePage>('/usage', { params })
+  return data
+}
+
+/**
+ * 单账号用量统计的一格：一个时间桶，或整个窗口的合计。token 四项与官方 `usage` 同口径、
+ * 互不重叠、不加权；费用是按价目表估的等价 API 费用（认不出价目的按 0 计）。
+ */
+export interface CredentialStatsBucket {
+  /** 桶起点 / 窗口起点（Unix 秒）。 */
+  ts: number
+  /** 全部请求数（含失败与本地拒绝）。 */
+  requests: number
+  /** 其中非 2xx 的条数。 */
+  errors: number
+  /** 其中 luban 本地拒掉、没发到上游的条数。 */
+  rejected: number
+  input_tokens: number
+  output_tokens: number
+  cache_write_tokens: number
+  cache_read_tokens: number
+  cost_usd: number
+}
+
+/** 单账号按某个维度拆开的一组；`key` 缺失（裸请求没有设备、来访没带 UA）时为空串。 */
+export interface CredentialStatsGroup {
+  key: string
+  requests: number
+  errors: number
+  /** 四项 token 之和。 */
+  tokens: number
+  cost_usd: number
+  /** 这一组最近一条请求的时刻（Unix 秒）。 */
+  last_ts: number
+}
+
+export interface CredentialStats {
+  since: number
+  bucket_secs: number
+  /** 有请求的桶；空桶不返回，前端补齐。 */
+  points: CredentialStatsBucket[]
+  summary: CredentialStatsBucket
+  /** 以下四组各按请求数降序、最多 20 组。 */
+  by_model: CredentialStatsGroup[]
+  by_device: CredentialStatsGroup[]
+  by_client: CredentialStatsGroup[]
+  by_status: CredentialStatsGroup[]
+}
+
+/** 某账号近 `hours` 小时的用量统计，按 `bucketSecs` 分桶（逐小时 3600 / 逐天 86400，按本地时区切天）。 */
+export async function getCredentialStats(
+  id: number,
+  { hours, bucketSecs }: { hours: number; bucketSecs: number },
+): Promise<CredentialStats> {
+  const { data } = await api.get<CredentialStats>(`/credentials/${id}/stats`, {
+    params: { hours, bucket_secs: bucketSecs, tz_offset_secs: localTzOffsetSecs() },
+  })
   return data
 }
 

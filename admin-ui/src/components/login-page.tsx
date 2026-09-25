@@ -63,7 +63,9 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
               <LockKeyholeIcon aria-hidden="true" className="size-4 text-muted-foreground" />
               {t('管理登录', 'Admin sign-in')}
             </CardTitle>
-            <CardDescription>
+            {/* 说明只留给读屏：「输入管理密码以继续访问控制台」与下面的「管理密码」标签、「登录」按钮
+                说的是同一件事。 */}
+            <CardDescription className="sr-only">
               {t('输入管理密码以继续访问控制台。', 'Enter the admin password to continue to the console.')}
             </CardDescription>
           </CardHeader>
@@ -85,7 +87,6 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                     autoFocus
                     aria-invalid={doLogin.isError || undefined}
                     onChange={(event) => setPassword(event.target.value)}
-                    placeholder={t('请输入管理密码', 'Enter the admin password')}
                     type={show ? 'text' : 'password'}
                     value={password}
                   />
@@ -102,7 +103,9 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                     </Button>
                   </InputGroupAddon>
                 </InputGroup>
-                {doLogin.isError && <FieldError>{extractError(doLogin.error, language)}</FieldError>}
+                {/* `match`：Base UI 的 Field.Error 默认只跟着原生表单校验显示，这里的错误来自接口，得显式
+                    打开，否则登录失败时框变红了却看不到原因。 */}
+                {doLogin.isError && <FieldError match>{extractError(doLogin.error, language)}</FieldError>}
               </Field>
               <Button
                 className="w-full"

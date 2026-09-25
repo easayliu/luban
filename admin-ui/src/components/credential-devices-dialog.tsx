@@ -31,6 +31,7 @@ import {
   parseSessionKey,
   relativeTime,
 } from '@/lib/utils'
+import { ClampedDescription } from '@/components/settings-group'
 import { deviceUsageMeta, METER_FILL, type CredentialActions } from '@/components/credential-shared'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -239,13 +240,19 @@ export function CredentialDevicesDialog({
               <AvatarFallback><SmartphoneIcon /></AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              {/* 标题写全两种名额：这个对话框上半段是设备、下半段是模拟会话，头部两枚徽章各报各的活跃数。 */}
+              {/* 标题写全两种名额：这个对话框上半段是设备、下半段是模拟会话。 */}
               <DialogTitle>{t('名额：设备与模拟会话', 'Slots: devices and simulated sessions')}</DialogTitle>
               <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
-                <Badge variant={deviceStatus.variant} aria-live="polite">{deviceStatus.label}</Badge>
-                <Badge variant={sessionStatus.variant} aria-live="polite">{sessionStatus.label}</Badge>
+                {/* 数量徽章只在读取中 / 读取失败时出现：读到了之后，下面两张容量卡的「名额占用 2/3」
+                    「2/10」就是同一组数，头部再报一遍「2 台活跃设备」是重复。 */}
+                {(devices.isPending || devices.error) && (
+                  <Badge variant={deviceStatus.variant} aria-live="polite">{deviceStatus.label}</Badge>
+                )}
+                {(sessions.isPending || sessions.error) && (
+                  <Badge variant={sessionStatus.variant} aria-live="polite">{sessionStatus.label}</Badge>
+                )}
               </div>
             </div>
           </div>
@@ -429,7 +436,7 @@ export function CredentialDevicesDialog({
   )
 }
 
-function DeviceList({
+export function DeviceList({
   credId,
   data,
   isPending,
@@ -752,10 +759,11 @@ function SessionCapacityCard({
             {editing ? t('模拟会话上限', 'Simulated session limit') : t('模拟会话容量', 'Simulated session capacity')}
           </CardTitle>
           <CardDescription className="text-xs">
-            {t(
+            {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
+            <ClampedDescription text={t(
               '走模拟路径且没有设备身份的客户端请求按对话固定到账号（有自带的会话 ID 就按它，否则按缓存前缀 + 首条用户消息），每个对话占一个槽位。出站会话 ID 按槽位派生，槽位释放后由下一个对话复用，因此上游看到的会话 ID 数量不会超过这个上限。与设备名额互不相干。',
               'Client requests on the simulation path without a device identity stick to this account per conversation (by their own session ID if present, otherwise by cache prefix + first user message), each taking a slot. The outbound session ID derives from the slot and is reused by the next conversation once the slot is freed, so upstream sees at most this many session IDs. Independent of device slots.',
-            )}
+            )} />
           </CardDescription>
           {!editing && (
             <CardAction>
@@ -881,7 +889,7 @@ function SessionCapacityCard({
   )
 }
 
-function SessionList({
+export function SessionList({
   credId,
   data,
   isPending,

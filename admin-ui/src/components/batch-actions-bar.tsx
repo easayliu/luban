@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
   deleteCredentials, setCredentialQuotaPausePcts, setDeviceLimits, setDisabledMany, setPriorities,
   setProxies, setRpmLimits, setSessionLimits,
@@ -304,8 +304,11 @@ export function BatchActionsBar({
 
   return (
     <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-2xl">
-        <div className="flex min-h-14 flex-wrap items-center gap-3 px-4 py-3 sm:px-5">
-          <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs">
+        {/* 「清空选择」跟着「已选 N」待在左边，而不是挂在最右端：手机上一行放不下时，最右那枚
+            总是第一个被挤到第二行，孤零零一个 ×。「更多设置」在手机上只留图标，同一个理由。 */}
+        <div className="flex min-h-14 flex-wrap items-center gap-2 px-4 py-3 sm:gap-3 sm:px-5">
+          <div className="mr-auto flex items-center gap-1">
+          <label className="flex cursor-pointer items-center gap-2 text-xs">
             <Checkbox
               checked={allSelected}
               indeterminate={n > 0 && !allSelected}
@@ -317,8 +320,12 @@ export function BatchActionsBar({
               <span className="text-muted-foreground"> / {formattedTotal}</span>
             </span>
           </label>
+          <Button size="icon-sm" variant="ghost" onClick={onClear} title={t('清空选择', 'Clear selection')} aria-label={t('清空选择', 'Clear selection')}>
+            <XIcon />
+          </Button>
+          </div>
 
-          <Toolbar className="gap-3 border-0 bg-transparent p-0 shadow-none">
+          <Toolbar className="gap-2 border-0 bg-transparent p-0 shadow-none sm:gap-3">
             <Button size="sm" variant="outline" aria-label={t('启用所选账号', 'Enable selected accounts')} disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === false} onClick={() => applyDisabled.mutate(false)}>
               <PlayIcon /><span className="max-sm:sr-only">{t('启用', 'Enable')}</span>
             </Button>
@@ -336,13 +343,12 @@ export function BatchActionsBar({
             aria-expanded={advancedOpen}
             aria-controls="batch-advanced-settings"
             onClick={() => setAdvancedOpen((open) => !open)}
+            aria-label={t('更多设置', 'More settings')}
+            title={t('更多设置', 'More settings')}
           >
-            {t('更多设置', 'More settings')}
-            <ChevronDownIcon className={cn('size-4 transition-transform', advancedOpen && 'rotate-180')} />
-          </Button>
-
-          <Button size="icon-sm" variant="ghost" onClick={onClear} title={t('清空选择', 'Clear selection')} aria-label={t('清空选择', 'Clear selection')}>
-            <XIcon />
+            <SlidersHorizontalIcon className="sm:hidden" />
+            <span className="max-sm:sr-only">{t('更多设置', 'More settings')}</span>
+            <ChevronDownIcon className={cn('size-4 transition-transform max-sm:hidden', advancedOpen && 'rotate-180')} />
           </Button>
         </div>
 
@@ -568,8 +574,9 @@ export function BatchActionsBar({
               </AlertDialogTitle>
               <AlertDialogDescription>
                 {t(
-                  `确定删除选中的 ${formattedCount} 个账号？历史用量记录与设备绑定将一并清除，且无法恢复。`,
-                  `Delete the selected ${englishAccountCount}? Usage history and device bindings will also be removed and cannot be recovered.`,
+                  // 数量已在标题（删除 N 个账号）与按钮（删除 N 个）里，说明只讲后果。
+                  '历史用量记录与设备绑定将一并清除，且无法恢复。',
+                  'Usage history and device bindings will also be removed and cannot be recovered.',
                 )}
               </AlertDialogDescription>
             </AlertDialogHeader>

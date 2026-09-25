@@ -223,7 +223,7 @@ export function preferredInitialCredentialView(): CredentialViewMode {
 }
 
 /** 额度 reset 与相对时间都依赖当前时刻；30 秒 tick 与接口刷新节奏一致。 */
-function useNowSeconds(): number {
+export function useNowSeconds(): number {
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
 
   useEffect(() => {
@@ -643,7 +643,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     ['cooldown', '冷却', 'cooling down'],
     ['near-limit', '将满', 'near limit'],
   ]
-  const attentionStatus = [
+  const attentionItems = [
     ...attentionKindLabels.map(([kind, zh, en]) => {
       const n = metrics.attentionKinds[kind] ?? 0
       return n > 0 ? t(`${formatNumber(n)} ${zh}`, `${formatNumber(n)} ${en}`) : ''
@@ -659,8 +659,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     rejectedTotal > 0
       ? t(`${formatNumber(rejectedTotal)} 条拒绝/1h`, `${formatNumber(rejectedTotal)} rejected/1h`)
       : '',
-  ].filter(Boolean).join(' · ') || undefined
-  const quotaRiskStatus = [
+  ].filter(Boolean)
+  const quotaRiskItems = [
     metrics.activeOverageCount > 0
       ? t(
           `${formatNumber(metrics.activeOverageCount)} 使用 credits`,
@@ -679,7 +679,29 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           `${formatNumber(metrics.nearLimitCount)} near limit`,
         )
       : '',
-  ].filter(Boolean).join(' · ') || undefined
+  ].filter(Boolean)
+  /**
+   * 概览格的小字只露**最严重的一项 + 「+N」**，完整分项进悬浮提示、一项一行。
+   *
+   * 原来是把所有分项用「 · 」连成一串：一格的小字只有 120px 上下，「1 token 失效 · 2 使用 credits ·
+   * 1 credits 待确认 · 1 冷却 · …」在任何宽度下都被截断，排在后面的几项平时永远看不见。分项本来
+   * 就按严重程度排（封禁 → 限流暂停 → token 失效 → …），露出来的那一项正是最该先看的。
+   * 用「+N」而不是「· 另 N 项」：桌面上一格小字只有 120px，后者还是会把「2 使用 credits」截掉；
+   * 分项口径不变（按主状态、加起来等于大数），只是从挤在一行改成在提示里列全。
+   */
+  const summarize = (items: string[]) => items.length <= 1
+    ? items[0]
+    : `${items[0]} +${items.length - 1}`
+  const itemList = (items: string[], footer?: string) => items.length > 1 || footer
+    ? (
+        <span className="block space-y-0.5">
+          {items.map((item) => <span key={item} className="block">{item}</span>)}
+          {footer && <span className="mt-1 block text-muted-foreground">{footer}</span>}
+        </span>
+      )
+    : undefined
+  const attentionStatus = summarize(attentionItems)
+  const quotaRiskStatus = summarize(quotaRiskItems)
   const deviceStatus = fullDeviceCount > 0
     ? t(
         `${formatNumber(fullDeviceCount)} 个账号已满`,
@@ -842,7 +864,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       <span className="size-1.5 rounded-full bg-success" />
                     )}
                   </span>
-                  <span className="min-w-14 text-left">
+                  {/* ≤384px（360 那档手机）标题行放不下「账号池 · N 个账号 · N 台设备 · 30 秒刷新」四样，
+                      这一枚会被挤成单独一行、只有四个字。窄屏上只留绿点（它本身就是「在自动刷新」），
+                      文字留给读屏与 title；刷新失败那句照旧整句显示，那是要人处理的。 */}
+                  {/* `min-w-0` 不能省：sr-only 把它变成绝对定位的 1px 盒子，但 `min-w-14` 仍会把它撑回 56px，
+                      落在页头右缘外面，360 的屏上整页因此多出 4px 横向滚动。 */}
+                  <span className="min-w-14 text-left max-[24rem]:sr-only max-[24rem]:min-w-0">
                     {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
                   </span>
                 </button>
@@ -1076,6 +1103,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             label={t('需处理', 'Needs attention')}
             value={formatNumber(attentionCount)}
             status={attentionStatus}
+            statusDetail={itemList(attentionItems, rejectionsHint)}
             statusHint={rejectionsHint}
             icon={TriangleAlertIcon}
             tone={bannedCount > 0 || metrics.activeOverageCount > 0
@@ -1091,6 +1119,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             label={t('用量风险', 'Usage risk')}
             value={formatNumber(quotaRiskCount)}
             status={quotaRiskStatus}
+            statusDetail={itemList(quotaRiskItems)}
             icon={RadioIcon}
             tone={metrics.activeOverageCount > 0 ? 'bad' : quotaRiskCount > 0 ? 'warn' : 'neutral'}
             active={filter === 'nearLimit'}

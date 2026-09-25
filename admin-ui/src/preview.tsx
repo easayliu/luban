@@ -3,6 +3,10 @@ import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { PlusIcon, SettingsIcon } from 'lucide-react'
 import { AddAccount } from '@/components/add-account'
+import { LoginPage } from '@/components/login-page'
+import { BanEventsDialog } from '@/components/ban-events-dialog'
+import { RequestLookupDialog } from '@/components/request-lookup-dialog'
+import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
@@ -23,7 +27,7 @@ import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
 import { initTheme } from '@/lib/theme'
-import type { Credential, UsageLog, UsagePage } from '@/api/credentials'
+import type { BanEvent, Credential, CredentialStats, CredentialStatsBucket, UsageLog, UsagePage } from '@/api/credentials'
 import './index.css'
 
 // 离线预览：覆盖正常、额度风险、冷却、封禁与停用，通过生产共用的 CredentialWorkspace
@@ -148,6 +152,8 @@ const normal: Credential = {
     windows: [
       { name: '5h', status: 'allowed', utilization: 0.15, reset: now + 99 * 60 },
       { name: '7d', status: 'allowed', utilization: 0.63, reset: now + 5 * 24 * 3600 },
+      // fable 额度池用到一半：卡片上不画（满了才由上游判定露面），详情页画成第三条进度条。
+      { name: '7d_oi', status: 'allowed', utilization: 0.41, reset: now + 3 * 24 * 3600 },
     ],
   },
 }
@@ -484,6 +490,15 @@ const cooldown: Credential = {
     { model: 'claude-fable-5', secs: 280, gated: true },
     { model: 'claude-opus-5', secs: 25, gated: false },
   ],
+  // 「套餐不含」样例：上游原话较长，用来检查详情页的模型限制是否默认只露一行。
+  denied_models: [
+    {
+      model: 'claude-mythos-1',
+      reason: '429 rate_limit_error：This organization does not have access to claude-mythos-1 on its current plan; overage-disabled-reason=org_level_disabled，credits-can-purchase=true，credits-has-payment-method=false',
+      learned_at: now - 3 * 3600,
+      expires_at: null,
+    },
+  ],
   resume_at: null,
   ban_count: 0,
   quota: null,
@@ -587,6 +602,34 @@ function syncPreviewLanguage(language: 'zh-CN' | 'en') {
 
 function closePreviewDialog(nextOpen: boolean) {
   if (!nextOpen) navigatePreview()
+}
+
+/** 账号详情页：`?account=<id>` 直接打开，或在工作区里点账号名（`#/accounts/<id>`）。 */
+function readPreviewAccount(): number | null {
+  const match = /^#\/accounts\/(\d+)/.exec(window.location.hash)
+  if (match) return Number(match[1])
+  const param = Number(previewParams.get('account'))
+  return Number.isInteger(param) && param > 0 ? param : null
+}
+
+function PreviewAccountRoute({ children }: { children: React.ReactNode }) {
+  const [account, setAccount] = React.useState<number | null>(readPreviewAccount)
+  React.useEffect(() => {
+    const sync = () => setAccount(readPreviewAccount())
+    window.addEventListener('hashchange', sync)
+    return () => window.removeEventListener('hashchange', sync)
+  }, [])
+  if (account == null) return <>{children}</>
+  return (
+    <CredentialDetailPage
+      id={account}
+      credentials={previewCredentials}
+      isLoading={false}
+      error={null}
+      onRetry={() => undefined}
+      onBack={() => navigatePreview()}
+    />
+  )
 }
 
 function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSection }) {
@@ -750,6 +793,13 @@ queryClient.setQueryData(['settings'], {
   tool_name_mimic: true,
 })
 queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 })
+// 学到的规则：四个种类各一两条，上游原话故意写长，用来检查列表与清空确认框在手机上的样子。
+queryClient.setQueryData(['learned-rejections'], [
+  { kind: 'shape', model: 'claude-haiku-4-5', field: 'output_config.effort', value: 'xhigh', message: "invalid_request_error: output_config.effort: Input should be 'low', 'medium' or 'high' for this model; received 'xhigh'", learned_at: now - 5 * 3600, expires_at: now + 6 * 86400 },
+  { kind: 'deprecated', model: 'claude-opus-5-5', field: 'temperature', value: '', message: 'invalid_request_error: temperature is deprecated for this model and will be ignored; remove it from the request', learned_at: now - 26 * 3600, expires_at: now + 5 * 86400 },
+  { kind: 'empty_reply', model: 'claude-fable-5-1', field: 'max_tokens', value: '1', message: '{"type":"message","content":[],"stop_reason":"max_tokens","usage":{"input_tokens":12,"output_tokens":0}}', learned_at: now - 2 * 3600, expires_at: now + 7 * 86400 - 7200 },
+  { kind: 'refusal', model: 'claude-fable-5-1', field: 'prompt_sha', value: '9f2c7d1a4b8e6f03a5d2c9e17b4f8a60d3e5c2b1a9f7e4d6c8b0a2f4e6d8c0b1', message: '[cyber] stop_details={"category":"cyber","explanation":"The request asks for step-by-step instructions that could facilitate unauthorized access to computer systems"}', learned_at: now - 40 * 60, expires_at: now + 7 * 86400 - 2400 },
+])
 queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,
@@ -799,6 +849,102 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
     ? '11111111-2222-4333-8444-555555555555'
     : '7a6d8f9e-0c1b-4a2d-9e3f-5b6c7d8e9f01',
 }))
+// 详情页的「最近请求」与封号记录：每个预览账号共用同一份流水，封号只给 #1。
+for (const cred of previewCredentials) {
+  queryClient.setQueryData<UsagePage>(['credential-usage-recent', cred.id], {
+    total: 37,
+    total_cost: 1.2846,
+    anchor: previewUsageLogs[0]?.id ?? null,
+    logs: previewUsageLogs.slice(0, 10),
+  })
+  // 封号记录对话框（全部账号）读 ['ban-events']，详情页按账号读带 id 的那份；这里两份共用同一条样例。
+  queryClient.setQueryData<BanEvent[]>(['ban-events', cred.id, cred.ban_count], cred.id === 1
+    ? [{
+        id: 1,
+        ts: now - 26 * 3600,
+        cred_id: 1,
+        cred_label: cred.label,
+        source: 'forward',
+        reason: 'This organization has been disabled.',
+        status: 400,
+        error_type: 'invalid_request_error',
+        error_message: 'This organization has been disabled.',
+        request_id: 'req_7Hs2kLq9Xw3PzR1a',
+        upstream_request_id: 'req_011CT9xyzABCdef',
+        tier: cred.tier,
+        org_type: cred.org_type,
+        proxy: null,
+        account_created_at: cred.created_at,
+        lifetime_requests: 5231,
+        lifetime_cost_usd: 182.4,
+        last_used_at: now - 26 * 3600,
+        requests_7d: 1840,
+        devices_7d: 3,
+        models_7d: [{ value: 'claude-opus-5-5', count: 1200 }, { value: 'claude-sonnet-5', count: 640 }],
+        uas_7d: [{ value: 'claude-cli/2.1.280 (external, cli)', count: 1840 }],
+        proxies_7d: [],
+        last_unified_status: 'allowed',
+        last_overage_in_use: false,
+        frozen_rows: 0,
+        devices_out_7d: 2,
+        device_ids_out_7d: [],
+      }]
+    : [])
+  // 用量统计：三档时间范围各造一份，桶按本地整点 / 零点对齐，数值随时段起伏。
+  for (const [hours, bucketSecs, slots] of [[24, 3600, 24], [168, 86400, 7], [720, 86400, 30]] as const) {
+    const points: CredentialStatsBucket[] = Array.from({ length: slots }, (_, i) => {
+      const d = new Date()
+      if (bucketSecs === 3600) d.setMinutes(0, 0, 0)
+      else d.setHours(0, 0, 0, 0)
+      const ts = Math.floor(d.getTime() / 1000) - (slots - 1 - i) * bucketSecs
+      const wave = 0.5 + 0.5 * Math.sin((i + cred.id) / 2)
+      const requests = i % 5 === 3 ? 0 : Math.round((bucketSecs === 3600 ? 12 : 180) * (0.3 + wave))
+      return {
+        ts,
+        requests,
+        errors: Math.round(requests * (i % 4 === 0 ? 0.12 : 0.02)),
+        rejected: Math.round(requests * 0.01),
+        input_tokens: requests * 1400,
+        output_tokens: requests * 900,
+        cache_write_tokens: requests * 2600,
+        cache_read_tokens: requests * 21000,
+        cost_usd: requests * 0.031,
+      }
+    }).filter((p) => p.requests > 0)
+    const summary = points.reduce<CredentialStatsBucket>((acc, p) => ({
+      ...acc,
+      requests: acc.requests + p.requests,
+      errors: acc.errors + p.errors,
+      rejected: acc.rejected + p.rejected,
+      input_tokens: acc.input_tokens + p.input_tokens,
+      output_tokens: acc.output_tokens + p.output_tokens,
+      cache_write_tokens: acc.cache_write_tokens + p.cache_write_tokens,
+      cache_read_tokens: acc.cache_read_tokens + p.cache_read_tokens,
+      cost_usd: acc.cost_usd + p.cost_usd,
+    }), { ts: now - hours * 3600, requests: 0, errors: 0, rejected: 0, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, cost_usd: 0 })
+    const group = (key: string, share: number, errShare = 0.02) => ({
+      key,
+      requests: Math.round(summary.requests * share),
+      errors: Math.round(summary.requests * share * errShare),
+      tokens: Math.round((summary.input_tokens + summary.output_tokens + summary.cache_write_tokens + summary.cache_read_tokens) * share),
+      cost_usd: summary.cost_usd * share,
+      last_ts: now - Math.round(600 * (1 - share)),
+    })
+    queryClient.setQueryData<CredentialStats>(['credential-stats', cred.id, hours, bucketSecs], {
+      since: now - hours * 3600,
+      bucket_secs: bucketSecs,
+      points,
+      summary,
+      by_model: [group('claude-opus-5-5', 0.58), group('claude-sonnet-5', 0.31), group('claude-haiku-4-5', 0.11)],
+      by_device: [group('user_9fd2b847c21a4e51a98d0e07', 0.52), group('sim:ff813c9166f0d2f3e9c1c7a4b5d80e2f', 0.4), group('', 0.08)],
+      by_client: [group('claude-cli/2.1.280 (external, cli)', 0.72), group('claude-code/2.1.219 (darwin; arm64)', 0.28)],
+      by_status: [group('200', 0.95, 0), group('429', 0.04, 1), group('500', 0.01, 1)],
+    })
+  }
+  queryClient.setQueryData(['credential-devices', cred.id], queryClient.getQueryData(['credential-devices', cred.id]) ?? [])
+  queryClient.setQueryData(['credential-sessions', cred.id], queryClient.getQueryData(['credential-sessions', cred.id]) ?? [])
+}
+queryClient.setQueryData<BanEvent[]>(['ban-events'], queryClient.getQueryData<BanEvent[]>(['ban-events', 1, previewCredentials.find((c) => c.id === 1)?.ban_count ?? 0]) ?? [])
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   total: 37,
   total_cost: 1.2846,
@@ -880,10 +1026,12 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <TooltipProvider>
             <AnchoredToastProvider>
               <div className="relative isolate min-h-dvh">
-            {previewSettings ? (
+            {previewParams.get('page') === 'login' ? (
+              <LoginPage onSuccess={() => navigatePreview()} />
+            ) : previewSettings ? (
               <PreviewSettingsRoute initialSection={previewSettings} />
             ) : (
-              <>
+              <PreviewAccountRoute>
                 <div className="app-shell flex min-h-dvh flex-col text-foreground">
                   <PreviewHeader />
 
@@ -894,9 +1042,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 </div>
 
                 <AddAccount open={previewDialog === 'add'} onOpenChange={closePreviewDialog} />
+                <RequestLookupDialog open={previewDialog === 'lookup'} onOpenChange={closePreviewDialog} />
+                <BanEventsDialog open={previewDialog === 'bans'} onOpenChange={closePreviewDialog} />
                 <AccessSettings open={previewDialog === 'access'} onOpenChange={closePreviewDialog} />
                 <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
-              </>
+              </PreviewAccountRoute>
             )}
               </div>
             </AnchoredToastProvider>

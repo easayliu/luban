@@ -6,6 +6,7 @@ import { useI18n } from '@/lib/i18n'
 import {
   cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey,
 } from '@/lib/utils'
+import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -116,10 +117,10 @@ export function RequestLookupDialog({
           <DialogDescription>
             {filter
               ? drillTitle
-              : t(
+              : <ClampedDescription text={t(
                   '粘贴 luban 在响应头 X-Request-Id / X-Oneapi-Request-Id 中返回的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查看它在这里的流水。也可以粘贴一个会话 ID（uuid），查看该会话的全部请求：客户端自己的会话 ID 和上游看到的会话 ID 都能识别。',
                   'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here. You can also paste a session ID (uuid) to list all of that session\'s requests; both the client\'s own session ID and the one upstream sees are recognized.',
-                )}
+                )} />}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
