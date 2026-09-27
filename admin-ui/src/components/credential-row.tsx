@@ -839,7 +839,7 @@ function ScheduleControl({
             // 「Usage credits 生效中」拆成两行放全；卡片/移动端布局不受列宽约束，照旧单行。
             'min-w-0 max-w-full shrink xl:h-auto xl:whitespace-normal xl:py-0.5 xl:text-left',
           )}
-          delay={status.kind === 'banned' || status.kind === 'token-invalid' ? 0 : undefined}
+          delay={status.kind === 'banned' || status.kind === 'token-invalid' || status.kind === 'subscription-inactive' ? 0 : undefined}
           aria-label={`${status.label}: ${status.detail}`}
           aria-live="polite"
         >

@@ -18,6 +18,7 @@ use crate::auth;
 use crate::credentials::Credential;
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
+use crate::proxy::AccountRejection;
 use crate::store::{self, CredentialStore};
 
 /// 一次登录尝试还没换 token 之前，PKCE 上下文最多留多久。
@@ -329,10 +330,15 @@ pub async fn run(
                         continue;
                     }
                 };
-                // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。已封禁的也
-                // 忘掉：它在下面被跳过，之后若被管理员重新启用，就该像新号一样重新跑一遍
-                // bootstrap，而不是因为停用前那一轮的标记还在而只发 event_logging。
-                seen.retain(|id| creds.iter().any(|c| c.id == *id && !c.is_banned()));
+                // 删掉的凭证不必再记着；同 id 不会复用（自增），忘了也无妨。已封禁的、订阅
+                // 未生效暂停中的也忘掉：它们在下面被跳过（后者只刷 token），之后若被重新启用，
+                // 就该像新号一样重新跑一遍 bootstrap，而不是因为停用前那一轮的标记还在而只发
+                // event_logging。
+                seen.retain(|id| {
+                    creds
+                        .iter()
+                        .any(|c| c.id == *id && !c.is_banned() && !c.is_subscription_paused())
+                });
                 // 这一 tick 拉过 `releases/latest` 没有。它无鉴权、与账号无关，一轮拉一次就够；
                 // 但也**不用直连**——借第一张能建出客户端的凭证的出口发，跟其他出站一个待遇。
                 let mut fetched_latest = false;
@@ -389,6 +395,14 @@ pub async fn run(
                         }
                     };
 
+                    // 订阅未生效暂停中的号：**只刷 token**（上面刚刷过），遥测、握手、策略拉取
+                    // 一概不发。它可能一停几周等续费，refresh_token 得靠这里保住，否则续费后第一次
+                    // 连通性测试刷新失败、号被当成 token 作废封掉；但那些端点它每一发都是 403，
+                    // 照发只会每轮多几条拒绝、每轮重跑一遍启动握手——真实客户端不会这样。
+                    if cred.is_subscription_paused() {
+                        continue;
+                    }
+
                     // token 已就绪才算这张凭证的首次保活：刷新失败被 continue 掉的那轮不算，
                     // 下一轮再补 bootstrap。
                     let is_first = seen.insert(cred.id);
@@ -412,11 +426,16 @@ pub async fn run(
                     let (ev_ok, dd_ok) = if send_telemetry {
                         let ev = oauth::keepalive_event_logging(&http, &access_token, &ctx).await;
                         if let oauth::KeepaliveResult::AuthRejected(rej) = &ev {
-                            handle_keepalive_rejection(&store, &cred, rej);
-                            // 无论停没停成，这一轮的首次握手都没跑完：撤掉标记，下轮（没停成
-                            // 的号）或重新启用后（停成的号）重来一遍。库写失败时号仍是启用
-                            // 的，尤其不能当成「处理完了」。
-                            seen.remove(&cred.id);
+                            // 这一轮的首次握手没跑完：撤掉标记，下轮（没停成的号）或重新启用后
+                            // （停成的号）重来一遍。库写失败时号仍是启用的，尤其不能当成「处理
+                            // 完了」。唯一不撤的是订阅未生效：重来一遍只会再吃同样的 403——停成
+                            // 了的号下一轮只刷 token（且被 `seen.retain` 忘掉），没停成的（人工
+                            // 停用的号，保活照发）也不该每轮重发一遍启动握手。
+                            if handle_keepalive_rejection(&store, &cred, rej)
+                                != KeepaliveRejection::SubscriptionInactive
+                            {
+                                seen.remove(&cred.id);
+                            }
                             continue;
                         }
                         (ev, oauth::keepalive_datadog_logs(&http, &ctx).await)
@@ -443,8 +462,12 @@ pub async fn run(
                         )
                         .await;
                         if let oauth::KeepaliveResult::AuthRejected(rej) = &bo {
-                            handle_keepalive_rejection(&store, &cred, rej);
-                            seen.remove(&cred.id);
+                            // 同上：订阅未生效不撤标记。
+                            if handle_keepalive_rejection(&store, &cred, rej)
+                                != KeepaliveRejection::SubscriptionInactive
+                            {
+                                seen.remove(&cred.id);
+                            }
                             continue;
                         }
                         let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
@@ -3813,40 +3836,70 @@ fn open_in_browser(url: &str) {
     }
 }
 
+/// [`handle_keepalive_rejection`] 怎么处置的这一发 401/403，调用方据此决定要不要撤掉「首次握手
+/// 已跑过」的标记。
+#[derive(Debug, PartialEq, Eq)]
+enum KeepaliveRejection {
+    /// 确实封号了（落库成功）。
+    Banned,
+    /// 订阅未生效：暂停了，或号本就不在池里（人工停用、已处置）。
+    SubscriptionInactive,
+    /// 都没发生：判定不命中、封号落库失败、号已不存在。库写失败时号仍是启用的，调用方不能
+    /// 把它当成处理完了。
+    NotBanned,
+}
+
 /// 保活端点回 401/403：**诊断与停用判定分开**。先把完整上下文（端点、状态码、错误类型与
-/// 文案、上游 request-id）记进日志，再按转发路径同一套 [`proxy::detect_account_ban`] 决定
+/// 文案、上游 request-id）记进日志，再按转发路径同一套 [`proxy::classify_account_rejection`] 决定
 /// 要不要停用——命中账号级特征（401 `authentication_error`、`invalid_grant`、「账号 /
 /// 组织 被停用」之类）才 [`CredentialStore::record_ban`]，事件里带同一份上下文；没命中的
-/// （组织未放开 OAuth、`permission_error`、区域限制、网关页面……）只记日志，凭证留在池里。
+/// （订阅未生效、`permission_error`、区域限制、网关页面……）不封号。
 /// 返回是否停用了。
 ///
 /// 此前这里是「任何 401/403 一律 `mark_banned`」：来源记成 `manual`、原因固定「upstream
 /// 401/403」，状态码、正文、request-id 全丢，且组织权限配置一类**可恢复**的拒绝也被当成
-/// 终态永久停用。转发路径早就不这么判了（见 `detect_account_ban` 的三档说明），保活没理由
+/// 终态永久停用。转发路径早就不这么判了（见 `classify_account_rejection` 的三档说明），保活没理由
 /// 更激进：它发的还是与账号状态无关的遥测/握手端点。
 ///
-/// 不停用的那些该不该临时暂停（比如组织管理员把 OAuth 关了，开回来之前每条真实请求都会
-/// 吃 403）——等这批带类型的诊断日志攒出分布再定，现在先不替用户决定。
+/// 不封号的里面，「订阅未生效」（上游原话是组织不允许 OAuth：付费档到期未续费、Free 档没订阅）
+/// 单独**暂停调度**（[`proxy::park_org_oauth_disallowed`]）：续费 / 订阅之前每条真实请求都会吃
+/// 同一发 403，放着不管等于让粘在它身上的客户端一直报错。
+/// 其余的（`permission_error`、区域限制、网关页面……）仍只记日志。
 ///
-/// 返回值是「**确实停用了**」：判定不命中、库写失败、号已不存在都算 `false`——库写失败时
-/// 号仍是启用的，调用方不能把它当成处理完了。
+/// 返回怎么处置的，见 [`KeepaliveRejection`]。
 fn handle_keepalive_rejection(
     store: &CredentialStore,
     cred: &Credential,
     rej: &oauth::AuthRejection,
-) -> bool {
+) -> KeepaliveRejection {
     let ctx = keepalive_ban_context(rej);
-    let account_level = keepalive_rejection_is_account_level(rej);
-    if !account_level {
-        tracing::warn!(
-            cred_id = cred.id, cred = %cred.label,
-            endpoint = rej.endpoint, status = rej.status,
-            error_type = ctx.error_type.as_deref().unwrap_or("-"),
-            error_message = ctx.error_message.as_deref().unwrap_or("-"),
-            upstream_request_id = ctx.upstream_request_id.as_deref().unwrap_or("-"),
-            "keepalive: upstream rejected the token but it is not an account-level error; leaving the credential enabled"
-        );
-        return false;
+    match keepalive_rejection_verdict(rej) {
+        AccountRejection::Ban(_) => {}
+        // 订阅未生效：不封号，但暂停调度——续费 / 订阅之前真实请求会一条条撞上同一发。
+        // 暂停不会到点自己回来：等人手动启用，或连通性测试通过。停下的那一次由
+        // `park_org_oauth_disallowed` 自己记 warn；已暂停的号保活不再发这些端点（只刷 token），
+        // 走不到这里。
+        AccountRejection::SubscriptionInactive => {
+            if !proxy::park_org_oauth_disallowed(store, cred, rej.status, "keepalive") {
+                tracing::debug!(
+                    cred_id = cred.id, cred = %cred.label,
+                    endpoint = rej.endpoint, status = rej.status,
+                    "keepalive: subscription inactive, but the credential was not paused (it is manually disabled, already out of the pool, gone, or the write failed); leaving it as is"
+                );
+            }
+            return KeepaliveRejection::SubscriptionInactive;
+        }
+        AccountRejection::Other => {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                endpoint = rej.endpoint, status = rej.status,
+                error_type = ctx.error_type.as_deref().unwrap_or("-"),
+                error_message = ctx.error_message.as_deref().unwrap_or("-"),
+                upstream_request_id = ctx.upstream_request_id.as_deref().unwrap_or("-"),
+                "keepalive: upstream rejected the token but it is not an account-level error; not banning the credential"
+            );
+            return KeepaliveRejection::NotBanned;
+        }
     }
     tracing::warn!(
         cred_id = cred.id, cred = %cred.label,
@@ -3857,28 +3910,33 @@ fn handle_keepalive_rejection(
         "keepalive: account-level error from upstream, marking as banned"
     );
     match store.record_ban(cred.id, &ctx) {
-        Ok(true) => true,
+        Ok(true) => KeepaliveRejection::Banned,
         Ok(false) => {
             tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: credential vanished before it could be disabled");
-            false
+            KeepaliveRejection::NotBanned
         }
         Err(e) => {
             tracing::error!(
                 cred_id = cred.id, cred = %cred.label, error = %e,
                 "keepalive: failed to disable the credential; it stays enabled until the next tick or a forwarded request trips the same check"
             );
-            false
+            KeepaliveRejection::NotBanned
         }
     }
 }
 
-/// 保活 401/403 是不是账号级错误：与转发路径共用 [`proxy::detect_account_ban`] 的判据，
-/// 两边对同一条报文给同一个答案，免得保活放行的号下一条真实请求又被转发路径停掉（或反过来）。
-fn keepalive_rejection_is_account_level(rej: &oauth::AuthRejection) -> bool {
+/// 保活 401/403 对账号的结论：与转发路径共用 [`proxy::classify_account_rejection`]，两边对
+/// 同一条报文给同一个答案，免得保活放行的号下一条真实请求又被转发路径停掉（或反过来）。
+fn keepalive_rejection_verdict(rej: &oauth::AuthRejection) -> AccountRejection {
     StatusCode::from_u16(rej.status)
-        .ok()
-        .and_then(|status| proxy::detect_account_ban(status, rej.body.as_bytes()))
-        .is_some()
+        .map(|status| proxy::classify_account_rejection(status, rej.body.as_bytes()))
+        .unwrap_or(AccountRejection::Other)
+}
+
+/// 保活 401/403 是不是账号级错误（该封号）。
+#[cfg(test)]
+fn keepalive_rejection_is_account_level(rej: &oauth::AuthRejection) -> bool {
+    matches!(keepalive_rejection_verdict(rej), AccountRejection::Ban(_))
 }
 
 /// 把保活端点的 401/403 响应整理成封号上下文：`reason` 是 `[keepalive/<端点> <状态码>]
@@ -3979,13 +4037,35 @@ mod tests {
             "permission_error",
             "OAuth authentication is currently not allowed for this organization.",
         );
-        assert!(!handle_keepalive_rejection(&store, &a, &org_policy));
-        assert!(!store.get(a.id).unwrap().unwrap().is_banned());
-        assert!(store.list_ban_events(None, 10).unwrap().is_empty());
+        assert_eq!(
+            handle_keepalive_rejection(&store, &a, &org_policy),
+            KeepaliveRejection::SubscriptionInactive
+        );
+        let got = store.get(a.id).unwrap().unwrap();
+        assert!(store.list_ban_events(None, 10).unwrap().is_empty(), "不是封号，不落封号事件");
+        // 但订阅未生效要暂停调度：不带恢复时刻（等人工或连通性测试），不落封号事件。
+        assert!(got.disabled && got.resume_at.is_none(), "订阅未生效应暂停调度");
+        assert!(got.ban_reason.as_deref().unwrap().contains(store::ORG_OAUTH_SUSPEND_MARKER));
+        // 其它非账号级的 403（权限 / 区域）仍只记日志，号照常启用。
+        let region = rej(403, "permission_error", "This model is not available in your region");
+        assert_eq!(handle_keepalive_rejection(&store, &b, &region), KeepaliveRejection::NotBanned);
+        assert!(!store.get(b.id).unwrap().unwrap().disabled);
+        // 人工停用的号撞上同一句：不改成暂停（保活对它照发），但结论仍是订阅未生效——调用方
+        // 据此不撤握手标记，免得每轮重发一遍启动握手。
+        store.set_disabled(b.id, true).unwrap();
+        assert_eq!(
+            handle_keepalive_rejection(&store, &b, &org_policy),
+            KeepaliveRejection::SubscriptionInactive
+        );
+        let got = store.get(b.id).unwrap().unwrap();
+        assert!(got.disabled && got.ban_reason.is_none(), "人工停用保持原样");
+        store.set_disabled(b.id, false).unwrap();
+        // 恢复 a，下面接着测账号级那档。
+        store.set_disabled(a.id, false).unwrap();
 
         // 账号级：停用、事件带完整上下文。
         let revoked = rej(401, "authentication_error", "OAuth token has been revoked");
-        assert!(handle_keepalive_rejection(&store, &a, &revoked));
+        assert_eq!(handle_keepalive_rejection(&store, &a, &revoked), KeepaliveRejection::Banned);
         let got = store.get(a.id).unwrap().unwrap();
         assert!(got.is_banned());
         assert_eq!(
@@ -4002,7 +4082,7 @@ mod tests {
 
         // 号已经被删：没有主体，`false`，b 不受影响。
         store.delete(a.id).unwrap();
-        assert!(!handle_keepalive_rejection(&store, &a, &revoked));
+        assert_eq!(handle_keepalive_rejection(&store, &a, &revoked), KeepaliveRejection::NotBanned);
         assert!(!store.get(b.id).unwrap().unwrap().is_banned());
     }
 
@@ -4027,7 +4107,7 @@ mod tests {
         ] {
             assert!(keepalive_rejection_is_account_level(&rej(status, &body)), "{status} {body}");
         }
-        // 不该停用：组织没放开 OAuth（管理员开回来就好）、权限 / 能力不足、网关页面、空体。
+        // 不该停用：订阅未生效（续费 / 订阅后就好）、权限 / 能力不足、网关页面、空体。
         for (status, body) in [
             (
                 403,

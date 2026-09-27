@@ -1105,7 +1105,7 @@ impl UsageSniffer {
             return;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-            // 只在流式模式下认：非流式那条路的错误体由 `detect_account_ban` 一侧处理，
+            // 只在流式模式下认：非流式那条路的错误体由 `classify_account_rejection` 一侧处理，
             // 这里再记一份会让同一个 4xx 告警两次。
             if self.is_stream
                 && let Some(t) = v.get("type").and_then(|t| t.as_str())
@@ -1609,7 +1609,7 @@ mod tests {
     }
 
     /// 非流式响应体里的 `{"type":"error"}` 不走流内那套：那条路的 4xx 由
-    /// [`crate::proxy::detect_account_ban`] 一侧处理，这里再记一份会让同一个错误告警两次。
+    /// [`crate::proxy::classify_account_rejection`] 一侧处理，这里再记一份会让同一个错误告警两次。
     /// 但**类型与文案照记**（`body_error`）——`tengu_api_error` 的 `errorType`/`error`
     /// 要它，而 [`crate::proxy::capture_forensics`] 那份只在 400/401/403 与裸 429 上填。
     #[test]

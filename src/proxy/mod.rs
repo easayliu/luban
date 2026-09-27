@@ -27,7 +27,11 @@ mod digest;
 use digest::request_digest;
 
 mod ban;
-pub(crate) use ban::{detect_account_ban, parse_upstream_error};
+#[cfg(test)]
+pub(crate) use ban::detect_account_ban;
+pub(crate) use ban::{
+    AccountRejection, classify_account_rejection, park_org_oauth_disallowed, parse_upstream_error,
+};
 #[cfg(test)]
 use ban::{header_text, is_third_party_rejection};
 

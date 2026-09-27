@@ -777,7 +777,7 @@ export interface ProbeQuota {
 
 /** 一次连通性测试的结果。 */
 export interface ProbeResult {
-  /** 上游是否 2xx。 */
+  /** 测试是否通过：上游 2xx 且拿到完整回复。2xx 之后流里带错误、流断在半路都算失败（此时 status 仍是 200）。 */
   ok: boolean
   /** 上游 HTTP 状态码；**0 表示请求根本没到上游**（取 token 失败/连不上/超时），原因见 error。 */
   status: number

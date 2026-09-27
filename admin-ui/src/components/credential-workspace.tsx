@@ -31,6 +31,7 @@ import {
   SORT_DIR_DEFAULT,
   evaluateCredential,
   isAccountBan,
+  isSubscriptionPause,
   planKey,
   sortCreds,
   type CredentialEvaluation,
@@ -91,6 +92,7 @@ export type CredentialFilterKey =
   | 'disabled'
   | 'banned'
   | 'tokenInvalid'
+  | 'subscriptionInactive'
   | 'nearLimit'
   | 'cooldown'
   | 'hasDevice'
@@ -146,13 +148,21 @@ const FILTERS: {
     key: 'banned',
     label: ['已封禁', 'Banned'],
     match: ({ credential }) =>
-      !!credential.ban_reason && credential.resume_at == null && isAccountBan(credential.ban_reason),
+      !!credential.ban_reason && credential.resume_at == null
+      && !isSubscriptionPause(credential.ban_reason) && isAccountBan(credential.ban_reason),
   },
   {
     key: 'tokenInvalid',
     label: ['token 失效', 'Token expired'],
     match: ({ credential }) =>
-      !!credential.ban_reason && credential.resume_at == null && !isAccountBan(credential.ban_reason),
+      !!credential.ban_reason && credential.resume_at == null
+      && !isSubscriptionPause(credential.ban_reason) && !isAccountBan(credential.ban_reason),
+  },
+  {
+    key: 'subscriptionInactive',
+    label: ['订阅未生效', 'Subscription inactive'],
+    match: ({ credential }) =>
+      !!credential.ban_reason && credential.resume_at == null && isSubscriptionPause(credential.ban_reason),
   },
   { key: 'nearLimit', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
   {
@@ -512,6 +522,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       disabled: 0,
       banned: 0,
       tokenInvalid: 0,
+      subscriptionInactive: 0,
       nearLimit: 0,
       cooldown: 0,
       hasDevice: 0,
@@ -559,7 +570,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       else if (!credential.ban_reason && credential.resume_at == null) filterCounts.disabled += 1
       if (credential.resume_at != null) rateLimitedPauseCount += 1
       if (credential.ban_reason && credential.resume_at == null) {
-        if (isAccountBan(credential.ban_reason)) filterCounts.banned += 1
+        if (isSubscriptionPause(credential.ban_reason)) filterCounts.subscriptionInactive += 1
+        else if (isAccountBan(credential.ban_reason)) filterCounts.banned += 1
         else filterCounts.tokenInvalid += 1
       }
       if (evaluation.quotaRisk) filterCounts.nearLimit += 1
@@ -633,9 +645,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         `${formatNumber(rejectedTotal)} rejected locally in the last hour: ${rejectionsQuery.data.rows.map((r) => `${rejectionKindLabel(r.kind)} ${formatNumber(r.count)}`).join(', ')}.`,
       )
     : undefined
-  // 分项顺序与卡片状态的严重程度（`rank`）一致：封禁 → 限流暂停 → Token 失效 → credits → 冷却 → 将满。
+  // 分项顺序与卡片状态的严重程度（`rank`）一致：封禁 → 订阅未生效 / 限流暂停 → Token 失效 → credits → 冷却 → 将满。
   const attentionKindLabels: [string, string, string][] = [
     ['banned', '封禁', 'banned'],
+    ['subscription-inactive', '订阅未生效', 'subscription inactive'],
     ['rate-limited', '限流暂停', 'paused'],
     ['token-invalid', 'token 失效', 'token expired'],
     ['overage', '使用 credits', 'on credits'],

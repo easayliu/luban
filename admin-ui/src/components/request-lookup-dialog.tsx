@@ -319,6 +319,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('命中探针特征，本地回复最小的 200，未转发', 'Probe signature matched, answered locally with a minimal 200, not forwarded')
     case 'upstream_401':
       return t('上游 401，没有可换的账号', 'Upstream 401, no account to switch to')
+    case 'upstream_403':
+      return t('上游 403，读取响应体失败', 'Upstream 403, failed to read the response body')
     case 'model_unsupported':
       return t('套餐不含该模型，可换的账号已用尽', 'Model not in plan, no accounts left to try')
     case 'connection_error':

@@ -182,6 +182,56 @@ pub struct LearnedReply {
 /// 7 天后丢掉重学，代价是每周每种组合白撞一次 400。
 pub const LEARNED_REJECTION_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// 「订阅未生效」那档暂停写进 `ban_reason` 的原因里的固定片段（上游原话是组织不允许 OAuth）。
+/// 完整原因见 [`crate::proxy::park_org_oauth_disallowed`]，形如
+/// `[subscription-inactive 403] <片段> (…); paused until …`。
+///
+/// 认这一档一律按 luban 自己的格式认：**开头**是 [`SUBSCRIPTION_PAUSE_TAG`] 前缀。不用
+/// `[403] ` 这种开头——封号原因在上游错误没带类型时写的就是 `[403] <上游原话>`，上游哪天的
+/// 措辞恰好以这几个词开头，一个真封号就会被当成可以自动恢复的暂停；其余 luban 写的原因
+/// （`[keepalive/…]`、`[refresh …]`、`[proxy]`）也都拼不出这个开头。三处同一口径、都区分大小写：
+/// [`is_subscription_pause_reason`]、[`SUBSCRIPTION_PAUSE_SQL`]（库里）、前端 `isSubscriptionPause`
+/// （`credential-shared.tsx`）。改文案须三处一起改。
+pub const ORG_OAUTH_SUSPEND_MARKER: &str = "organization does not allow OAuth authentication";
+
+/// 订阅未生效暂停原因的开头标签：`[` + 它 + ` <三位状态码>] `，见 [`ORG_OAUTH_SUSPEND_MARKER`]。
+pub const SUBSCRIPTION_PAUSE_TAG: &str = "subscription-inactive";
+
+/// `ban_reason` 是不是「订阅未生效」那档暂停写的，见 [`ORG_OAUTH_SUSPEND_MARKER`]。
+pub fn is_subscription_pause_reason(reason: &str) -> bool {
+    let Some(rest) = reason.strip_prefix('[').and_then(|r| r.strip_prefix(SUBSCRIPTION_PAUSE_TAG))
+    else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    b.len() > 6
+        && b[0] == b' '
+        && b[1..4].iter().all(u8::is_ascii_digit)
+        && &b[4..6] == b"] "
+        && rest[6..].starts_with(ORG_OAUTH_SUSPEND_MARKER)
+}
+
+/// [`is_subscription_pause_reason`] 的 SQL 版（`ban_reason` 列上的 GLOB 条件，区分大小写）。
+/// `[[]` 是 GLOB 里字面的 `[`；标签与片段里只有字母、连字符与空格，不含 GLOB 元字符。
+const SUBSCRIPTION_PAUSE_SQL: &str = "ban_reason GLOB \
+     '[[]subscription-inactive [0-9][0-9][0-9]] organization does not allow OAuth authentication*'";
+
+/// 人工停用（单个 [`CredentialStore::set_disabled`] 与批量 [`CredentialStore::set_disabled_many`]
+/// 共用）：停用、清 `resume_at`，并清掉两种暂停留下的原因——限流暂停的「几点恢复」、订阅未生效
+/// 的那句——号就是普通的「手动停用」。不清的话，限流那句会在 `resume_at` 清空后被当成封号原因
+/// 显示，订阅那句会让连通性测试通过时把管理员关掉的号又打开。封号原因不动。
+///
+/// SQLite 的 `UPDATE` 里各表达式读的都是改之前的行，`CASE` 看到的 `resume_at` 是旧值。
+fn manual_disable_sql() -> String {
+    format!(
+        "UPDATE credentials SET disabled = 1, resume_at = NULL, \
+                ban_reason = CASE WHEN resume_at IS NOT NULL OR {SUBSCRIPTION_PAUSE_SQL} \
+                                  THEN NULL ELSE ban_reason END, \
+                updated_at = unixepoch() \
+         WHERE id = ?1"
+    )
+}
+
 /// 把模型名归一成「套餐门禁」的粒度：小写、去掉 `[1m]` 上下文后缀与 `-YYYYMMDD` 日期后缀。
 ///
 /// 上游按套餐放不放行看的是模型本身，`claude-fable-5-1[1m]` 与 `claude-fable-5-1` 不会一个
@@ -1068,11 +1118,8 @@ impl CredentialStore {
         if disabled {
             conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
             conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
-            Ok(conn.execute(
-                "UPDATE credentials SET disabled = 1, resume_at = NULL, updated_at = unixepoch() \
-                 WHERE id = ?1",
-                [id],
-            )? > 0)
+            // 两种暂停留下的原因也一并清掉，理由见 [`manual_disable_sql`]。
+            Ok(conn.execute(&manual_disable_sql(), [id])? > 0)
         } else {
             Ok(conn.execute(
                 "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
@@ -1097,15 +1144,67 @@ impl CredentialStore {
     /// 惰性的（选号时顺手扫一遍），而不是挂一个后台定时器。
     ///
     /// `reason` 直接写进 `ban_reason`，后台卡片原样展示，故调用方应带上人话的恢复时刻。
+    ///
+    /// 只动**启用中或已在限流暂停中**的号（见 [`Self::park_row`]）：先回来的那条把号封了 /
+    /// 按订阅停了，后回来的 429 不能把它改写成「到点自己回来」。返回是否确有写入。
     pub fn pause_for_rate_limit(&self, id: i64, reason: &str, resume_at: u64) -> Result<bool> {
+        self.park_row(id, reason, Some(resume_at as i64))
+    }
+
+    /// 两种自动暂停（[`Self::pause_for_rate_limit`]、[`Self::suspend_for_inactive_subscription`]）
+    /// 共用的落库：停用、写原因与恢复时刻（`None` = 不会到点自己回来）、清绑定。
+    ///
+    /// 守卫只在这一处：只动**启用中或已在限流暂停中**的号，封号、人工停用、订阅未生效暂停
+    /// 一概不碰——同一个号常有几条请求同时在飞，先回来的那条已经把号处置了，后回来的不能
+    /// 改写它。返回是否确有写入。
+    fn park_row(&self, id: i64, reason: &str, resume_at: Option<i64>) -> Result<bool> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
-        conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
-        Ok(conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
             "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = ?3, \
                     updated_at = unixepoch() \
-             WHERE id = ?1",
-            params![id, reason, resume_at as i64],
+             WHERE id = ?1 AND (disabled = 0 OR resume_at IS NOT NULL)",
+            params![id, reason, resume_at],
+        )? > 0;
+        if updated {
+            tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+            tx.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// 订阅未生效——付费档到期未续费、Free 档没订阅（见 [`crate::proxy::park_org_oauth_disallowed`]）：停调度、清绑定，
+    /// **不写 `resume_at`**——不会到点自己回来，只有两条路放回池子：控制台手动启用
+    /// （[`Self::set_disabled`]），或连通性测试通过（[`Self::resume_if_subscription_suspended`]）。
+    ///
+    /// 不写恢复时刻是有意的：`resume_at` 非空在选号那边的意思是「等一会就好」，全池都在等时
+    /// 回 429 + 最早恢复时刻（见 [`Self::select_for_device`]）；这里等多久都没用，得有人去
+    /// 续费或订阅，与封号同形（`disabled + ban_reason`，`resume_at` 空）。
+    /// 与封号的区别只在原因文案（含 [`ORG_OAUTH_SUSPEND_MARKER`]）、不落封号事件，以及
+    /// 连通性测试通过能放回来。
+    ///
+    /// 只动**启用中或限时暂停中**的号：人工停用、封禁、已经这样暂停的不碰——保活对人工停用的
+    /// 号照发，不能让一发 403 改掉管理员的决定或覆盖封号原因。额度暂停中的号会被改成这一档：
+    /// 额度回来了，没订阅照样不放行。
+    ///
+    /// 返回是否确有写入；`false` 即号已在池外（或不存在），调用方不必再记一遍。
+    pub fn suspend_for_inactive_subscription(&self, id: i64, reason: &str) -> Result<bool> {
+        self.park_row(id, reason, None)
+    }
+
+    /// 连通性测试通过时调用：若该号是 [`Self::suspend_for_inactive_subscription`] 停下的，当场恢复调度。
+    /// 测试通过说明已经续费 / 订阅。认的是 luban 自己写的原因开头（[`is_subscription_pause_reason`] 同一口径），
+    /// 封号、人工停用不受影响。返回是否确有恢复。
+    pub fn resume_if_subscription_suspended(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            &format!(
+                "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
+                    updated_at = unixepoch() \
+             WHERE id = ?1 AND disabled = 1 AND resume_at IS NULL AND {SUBSCRIPTION_PAUSE_SQL}"
+            ),
+            [id],
         )? > 0)
     }
 
@@ -1245,10 +1344,8 @@ impl CredentialStore {
                 let mut sbinds = tx.prepare("DELETE FROM session_bindings WHERE cred_id = ?1")?;
                 // 同 `set_disabled`：人工操作两个方向都清 `resume_at`，
                 // 限流那套惰性恢复不该越过管理员的决定。
-                let mut stmt = tx.prepare(
-                    "UPDATE credentials SET disabled = 1, resume_at = NULL, \
-                     updated_at = unixepoch() WHERE id = ?1",
-                )?;
+                // 两种暂停留下的原因也一并清掉，理由见 [`manual_disable_sql`]。
+                let mut stmt = tx.prepare(&manual_disable_sql())?;
                 for id in ids {
                     binds.execute([id])?;
                     sbinds.execute([id])?;
@@ -9440,6 +9537,136 @@ mod tests {
         assert_eq!(store.get(a).unwrap().unwrap().resume_at, None, "人工停用不该有恢复时刻");
         assert_eq!(CredentialStore::resume_due(&store.conn.lock()).unwrap(), 0, "没有该恢复的号");
         assert!(store.get(a).unwrap().unwrap().disabled, "惰性恢复不该越过管理员的决定");
+    }
+
+    /// 订阅未生效的暂停：不写恢复时刻、到点不回来；只动启用中 / 限时暂停中的号，
+    /// 人工停用与封禁不碰；连通性测试那条恢复只认这一档，手动启用照常能打开。
+    #[test]
+    fn inactive_subscription_suspension_waits_for_a_human_or_a_passing_probe() {
+        let (store, ids) = store_with(&["a", "b", "c", "d"]);
+        let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+        let pick = || store.select_for_device(Select::default()).map(|c| c.id);
+        let now = crate::credentials::now_secs();
+        let reason = format!("[{SUBSCRIPTION_PAUSE_TAG} 403] {ORG_OAUTH_SUSPEND_MARKER}");
+
+        assert!(store.suspend_for_inactive_subscription(a, &reason).unwrap());
+        let got = store.get(a).unwrap().unwrap();
+        assert!(got.disabled && got.resume_at.is_none());
+        assert_eq!(got.ban_reason.as_deref(), Some(reason.as_str()));
+        // 与封号同形但不算封号：保活 / 遥测照跑，refresh_token 才不会在等续费时过期。
+        assert!(got.is_subscription_paused() && !got.is_banned());
+        assert_ne!(pick().unwrap(), a, "暂停的号不该再被选中");
+        assert_eq!(CredentialStore::resume_due(&store.conn.lock()).unwrap(), 0, "不会到点自己回来");
+        assert!(!store.resume_if_rate_limited(a).unwrap(), "手动解除限流不该放回这一档");
+        assert!(!store.suspend_for_inactive_subscription(a, "again").unwrap(), "已暂停的不重写");
+
+        // 额度暂停中的号：改成这一档（额度回来了没订阅照样不放行）。
+        store.pause_for_rate_limit(b, "quota", now + 3 * 86400).unwrap();
+        assert!(store.suspend_for_inactive_subscription(b, &reason).unwrap());
+        assert_eq!(store.get(b).unwrap().unwrap().resume_at, None);
+
+        // 人工停用 / 封禁：不碰。
+        store.set_disabled(c, true).unwrap();
+        assert!(!store.suspend_for_inactive_subscription(c, &reason).unwrap());
+        assert_eq!(store.get(c).unwrap().unwrap().ban_reason, None);
+        store.mark_banned(d, "封号").unwrap();
+        assert!(!store.suspend_for_inactive_subscription(d, &reason).unwrap());
+        let got = store.get(d).unwrap().unwrap();
+        assert_eq!(got.ban_reason.as_deref(), Some("封号"));
+        assert!(got.is_banned() && !got.is_subscription_paused());
+
+        // 连通性测试通过：只放回这一档。
+        assert!(!store.resume_if_subscription_suspended(c).unwrap());
+        assert!(!store.resume_if_subscription_suspended(d).unwrap());
+        assert!(store.get(d).unwrap().unwrap().is_banned());
+        assert!(store.resume_if_subscription_suspended(a).unwrap());
+        let back = store.get(a).unwrap().unwrap();
+        assert!(!back.disabled && back.ban_reason.is_none());
+        // 手动启用照常能打开。
+        store.set_disabled(b, false).unwrap();
+        assert!(!store.get(b).unwrap().unwrap().disabled);
+
+        // 并发在飞的另一条后回来一发 429：不能把订阅暂停改写成「到点自己回来」。
+        assert!(store.suspend_for_inactive_subscription(b, &reason).unwrap());
+        assert!(!store.pause_for_rate_limit(b, "quota", now + 3600).unwrap());
+        let got = store.get(b).unwrap().unwrap();
+        assert!(got.is_subscription_paused() && got.resume_at.is_none());
+        // 封号、人工停用同样不被 429 改写。
+        assert!(!store.pause_for_rate_limit(d, "quota", now + 3600).unwrap());
+        assert!(store.get(d).unwrap().unwrap().is_banned());
+        assert!(!store.pause_for_rate_limit(c, "quota", now + 3600).unwrap());
+        assert_eq!(store.get(c).unwrap().unwrap().resume_at, None);
+
+        // 管理员把暂停中的号手动关掉：降成普通的手动停用，连通性测试通过也不再打开它。
+        store.set_disabled(b, true).unwrap();
+        let got = store.get(b).unwrap().unwrap();
+        assert!(got.disabled && got.ban_reason.is_none() && !got.is_subscription_paused());
+        assert!(!store.resume_if_subscription_suspended(b).unwrap());
+        assert!(store.get(b).unwrap().unwrap().disabled, "人工停用不该被一次测试打开");
+        // 限流暂停中的号被手动关掉同理：那句「几点恢复」不留下来冒充封号原因。
+        store.set_disabled(b, false).unwrap();
+        store.pause_for_rate_limit(b, "quota", now + 3600).unwrap();
+        store.set_disabled(b, true).unwrap();
+        let got = store.get(b).unwrap().unwrap();
+        assert!(got.disabled && got.ban_reason.is_none() && got.resume_at.is_none());
+        // 封号原因不因手动关而清掉。
+        store.set_disabled(d, true).unwrap();
+        assert_eq!(store.get(d).unwrap().unwrap().ban_reason.as_deref(), Some("封号"));
+    }
+
+    /// 订阅暂停只认 luban 自己写的格式（开头 `[subscription-inactive NNN] ` + 固定片段，区分
+    /// 大小写）：封号原因里抄进来的上游原文——包括上游错误没带类型时 `[403] <原话>` 那种与旧格式
+    /// 同形的——哪怕含同样几个词，也不能被当成可以自动恢复的暂停。库里（GLOB）与内存里同一口径。
+    #[test]
+    fn subscription_pause_is_recognised_only_by_lubans_own_prefix() {
+        let ours = format!(
+            "[{SUBSCRIPTION_PAUSE_TAG} 403] {ORG_OAUTH_SUSPEND_MARKER} (subscription lapsed, or a Free plan without one); paused until enabled manually or a connectivity test passes"
+        );
+        // 上游错误没带类型时封号原因就是 `[403] <原话>`：原话以这几个词开头也不算。
+        let ban = format!("[403] {ORG_OAUTH_SUSPEND_MARKER}; this organization has been disabled");
+        assert!(is_subscription_pause_reason(&ours));
+        assert!(is_subscription_pause_reason(&format!(
+            "[{SUBSCRIPTION_PAUSE_TAG} 401] {ORG_OAUTH_SUSPEND_MARKER}"
+        )));
+        let upper = ours.replace("organization does not", "Organization does not");
+        let mid = format!("[403] permission_error: your {ORG_OAUTH_SUSPEND_MARKER}");
+        for other in [
+            ban.as_str(),
+            mid.as_str(),
+            upper.as_str(),
+            ORG_OAUTH_SUSPEND_MARKER,
+            "[subscription-inactive 40] x",
+            "[subscription-inactive 403]",
+            "",
+        ] {
+            assert!(!is_subscription_pause_reason(other), "{other}");
+        }
+
+        let (store, ids) = store_with(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.suspend_for_inactive_subscription(a, &ours).unwrap();
+        store
+            .record_ban(
+                b,
+                &BanContext { reason: ban.clone(), source: "forward", ..Default::default() },
+            )
+            .unwrap();
+        let got = store.get(b).unwrap().unwrap();
+        assert!(got.is_banned() && !got.is_subscription_paused(), "真封号不该被认成订阅暂停");
+        assert!(!store.resume_if_subscription_suspended(b).unwrap(), "真封号不该被测试打开");
+        assert!(store.resume_if_subscription_suspended(a).unwrap());
+        // 库里的 GLOB 同样区分大小写。
+        store.suspend_for_inactive_subscription(a, &upper).unwrap();
+        assert!(!store.resume_if_subscription_suspended(a).unwrap(), "大小写不同就不是我们写的");
+
+        // 批量停用与单个同口径：清掉暂停原因，之后测试通过也不再打开它。
+        store.set_disabled(a, false).unwrap();
+        store.suspend_for_inactive_subscription(a, &ours).unwrap();
+        assert_eq!(store.set_disabled_many(&[a, b], true).unwrap(), 2);
+        let got = store.get(a).unwrap().unwrap();
+        assert!(got.disabled && got.ban_reason.is_none());
+        assert!(!store.resume_if_subscription_suspended(a).unwrap());
+        assert_eq!(store.get(b).unwrap().unwrap().ban_reason, Some(ban), "封号原因不动");
     }
 
     /// 连通性测试通过 → 自动回调度池；但只对**被限流暂停**的号生效。

@@ -130,9 +130,27 @@ impl Credential {
     }
 
     /// 是否被系统封禁（上游 401/403、refresh_token 撤销、代理异常等）。
-    /// 区别于手动停用（`ban_reason` 为 `None`）和限速暂停（`resume_at` 非空）。
+    /// 区别于手动停用（`ban_reason` 为 `None`）、限速暂停（`resume_at` 非空）和订阅未生效暂停
+    /// （[`Self::is_subscription_paused`]）。
     pub fn is_banned(&self) -> bool {
-        self.disabled && self.ban_reason.is_some() && self.resume_at.is_none()
+        self.disabled
+            && self.ban_reason.is_some()
+            && self.resume_at.is_none()
+            && !self.is_subscription_paused()
+    }
+
+    /// 是否因订阅未生效而暂停（见 [`crate::store::CredentialStore::suspend_for_inactive_subscription`]）。
+    /// 与封号同形（disabled + ban_reason、`resume_at` 空），只能按原因开头的固定格式认
+    /// （[`crate::store::is_subscription_pause_reason`]）。
+    ///
+    /// **不能算进 [`Self::is_banned`]**：保活会整个跳过封禁的号，而这一档往往一停几周
+    /// （等续费）——保活不跑，refresh_token 就在闲置里过期，续费后第一次连通性测试刷新失败，
+    /// 号被当成 token 作废永久封掉。保活对它只刷 token、不发别的端点（那些每一发都是 403），
+    /// 遥测也不发，见 `web.rs` 的保活循环与 `telemetry` 的 flush。
+    pub fn is_subscription_paused(&self) -> bool {
+        self.disabled
+            && self.resume_at.is_none()
+            && self.ban_reason.as_deref().is_some_and(crate::store::is_subscription_pause_reason)
     }
 
     /// 是否已过期或即将过期（进入刷新窗口）。

@@ -209,6 +209,25 @@ pub(super) fn resp_shape(up: &wreq::Response) -> (bool, Option<String>) {
     (is_stream, encoding)
 }
 
+/// 把已经读完体的上游响应原样拼回一个 [`wreq::Response`]：状态码、协议版本、全部响应头
+/// （**不筛**，筛是 [`resp_builder`] 回给客户端时的事）、体。
+///
+/// 用在「先读体判一判、判不中再交给原来那条路」的地方（转发循环里的 403 换号）：下游只读
+/// status / headers / bytes，拼回来的与原件没有区别。丢掉的只有 wreq 自己挂的 extensions
+/// （请求 URL 之类），转发路径不读它们。
+pub(super) fn rebuild_response(
+    status: StatusCode,
+    version: axum::http::Version,
+    headers: HeaderMap,
+    body: Bytes,
+) -> wreq::Response {
+    let mut res = axum::http::Response::new(body);
+    *res.status_mut() = status;
+    *res.version_mut() = version;
+    *res.headers_mut() = headers;
+    wreq::Response::from(res)
+}
+
 /// 拼出回给客户端的响应骨架：上游状态码 + 放行的上游响应头（见 [`is_resp_forwardable`]）。
 pub(super) fn resp_builder(up: &wreq::Response) -> axum::http::response::Builder {
     resp_builder_as(up, None)
@@ -993,6 +1012,26 @@ pub(super) fn upstream_load_snapshot(
 mod tests {
     use crate::proxy::test_support::{gzip, rl_headers};
     use crate::proxy::{Bytes, HeaderValue, UsageSniffer, config, header, store};
+
+    /// 拼回来的响应与原件同形：状态码、版本、头（含不放行给客户端的那些）、体都在。
+    #[tokio::test]
+    async fn rebuild_response_keeps_status_headers_and_body() {
+        let mut h = crate::proxy::HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        h.insert("request-id", HeaderValue::from_static("req_011abc"));
+        let body = Bytes::from_static(br#"{"type":"error"}"#);
+        let up = super::rebuild_response(
+            crate::proxy::StatusCode::FORBIDDEN,
+            axum::http::Version::HTTP_2,
+            h,
+            body.clone(),
+        );
+        assert_eq!(up.status(), crate::proxy::StatusCode::FORBIDDEN);
+        assert_eq!(up.version(), axum::http::Version::HTTP_2);
+        assert_eq!(up.headers()["request-id"], "req_011abc");
+        assert_eq!(super::resp_shape(&up), (false, None));
+        assert_eq!(up.bytes().await.unwrap(), body);
+    }
 
     /// 起一个本地 HTTP 服务，用给定的响应字节应答，并把收到的请求头原样返回。
     fn serve_once(response: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {

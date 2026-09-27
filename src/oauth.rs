@@ -480,7 +480,7 @@ impl TokenEndpointError {
     ///
     /// 判据取 OAuth 2.0 的 `invalid_grant`——refresh_token 被吊销/过期/已轮换作废时的标准
     /// 错误码。刻意**只**认这一个、且只在 400/401 上认：误判会把健康账号停用掉，
-    /// 和 [`crate::proxy::detect_account_ban`] 收紧时是同一个教训。403/429/5xx 以及所有
+    /// 和 [`crate::proxy::classify_account_rejection`] 收紧时是同一个教训。403/429/5xx 以及所有
     /// 网络层错误一律当可重试，不停用。
     ///
     /// 注意：这个端点真实的失败响应形态我们**没有实测样本**，故这里只做保守的字面量匹配，
@@ -491,7 +491,7 @@ impl TokenEndpointError {
             && self.body.to_ascii_lowercase().contains("invalid_grant")
     }
 
-    /// 写入 `ban_reason` 的原因（截断至 200 字符，与 `detect_account_ban` 的口径一致）。
+    /// 写入 `ban_reason` 的原因（截断至 200 字符，与 `classify_account_rejection` 的口径一致）。
     pub fn ban_reason(&self) -> String {
         format!("[refresh {}] {}", self.status.as_u16(), self.body.trim())
             .chars()

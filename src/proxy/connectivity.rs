@@ -5,7 +5,10 @@ use crate::config;
 use crate::store;
 use crate::web::AppState;
 
-use super::ban::{detect_account_ban, is_third_party_rejection, parse_upstream_error};
+use super::ban::{
+    AccountRejection, classify_account_rejection, is_third_party_rejection,
+    park_org_oauth_disallowed, parse_upstream_error,
+};
 use super::body::{
     OutboundIdentity, THINKING_MIN_MAX_TOKENS, ensure_beta_query, outbound_identity,
     rewrite_body_out, sim_device_fingerprint, ua_of, with_outbound_identity,
@@ -35,7 +38,8 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// 一次连通性测试的结果（[`crate::web`] 原样 JSON 回给前端）。
 #[derive(serde::Serialize)]
 pub struct ProbeReport {
-    /// 上游是否 2xx。
+    /// 测试是否通过：上游 2xx **且**拿到了一条完整有效的 Message（见 [`probe_report`]）。
+    /// 2xx 之后流里带错误事件、流断在半路、响应体不是 Message，都算不通过。
     pub ok: bool,
     /// 上游 HTTP 状态码；**`0` 表示请求根本没到上游**（取 token 失败、连不上、超时），
     /// 此时原因在 `error` 里。
@@ -323,8 +327,8 @@ pub async fn probe(
             // 与「要不要管 429」无关）；与转发一样，重试次数配成 0 也视同关闭。
             let probe_scope = (status == StatusCode::TOO_MANY_REQUESTS)
                 .then(|| rate_limit_scope_for(&info, Some(model), is_max_plan(cred)));
-            // 套餐不含这个模型：照转发路径记一条准入记录，之后的选号绕开这一格。学习不看
-            // 429 开关——那个开关管的是限流冷却，这里记的是事实。
+            // 测试通过时要不要照真实判决恢复限流那几档，见下面 `report.ok` 那段。
+            let mut resume_rate_limited = false;
             if let Some(LimitScope::Unsupported(_)) = &probe_scope {
                 let reason = info.plan_denial_reason();
                 tracing::warn!(
@@ -359,41 +363,8 @@ pub async fn probe(
             } else if status.is_success()
                 && !park_if_quota_nearly_exhausted(&state.store, cred, &info)
             {
-                // 对称的另一面：测试成功同样照真实判决恢复——上游此刻放行了「这个账号 +
-                // 这个模型」，不必干等到点（上游的 retry-after 偏保守时，好号会被白白晾着）。
-                //
-                // 两档各恢复各的：账号级那档是**落库的调度开关**，测试通过即重新启用
-                // （只对限流暂停的号生效，人工关掉的不该被一次测试打开）；模型级那档是进程内
-                // 冷却，清账号格 + 被测模型那一格，其它模型不动——sonnet 通了证明不了 fable 通。
-                match state.store.resume_if_rate_limited(cred.id) {
-                    Ok(true) => tracing::info!(
-                        cred_id = cred.id, cred = %cred.label,
-                        model,
-                        "connectivity test passed, credential is back in the pool"
-                    ),
-                    Ok(false) => {}
-                    Err(e) => tracing::error!(
-                        cred_id = cred.id, cred = %cred.label,
-                        error = %e,
-                        "connectivity test passed but persisting the resume failed"
-                    ),
-                }
-                state.store.clear_rate_limited(cred.id, Some(model));
-                // 上游此刻放行了这个号的这个模型，之前学到的「套餐不含」就此作废（开了 extra
-                // usage 或换了套餐都会走到这里）。
-                match state.store.clear_model_denials(cred.id, Some(model)) {
-                    Ok(n) if n > 0 => tracing::info!(
-                        cred_id = cred.id, cred = %cred.label,
-                        model,
-                        "connectivity test passed, the model is no longer marked as excluded from this account's plan"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(
-                        cred_id = cred.id, cred = %cred.label,
-                        error = %e,
-                        "connectivity test passed but clearing the model denial failed"
-                    ),
-                }
+                // 恢复留到整条回复读完、报告确实 ok 之后，见下面 `report.ok` 那段。
+                resume_rate_limited = true;
             }
             match tokio::time::timeout_at(deadline, up.bytes()).await {
                 // 已拿到真实状态码与限流头，只是 body 没有结束；保留这些信息并照样落一条日志。
@@ -431,14 +402,23 @@ pub async fn probe(
                     // SSE。把它攒回一条整段 Message，后面那套读法（封号判定、
                     // [`probe_report`] 解 model/error_type）就不必分两种。攒不出来时退回
                     // 原始字节——错误响应本来就是整段 JSON，不走 SSE。
-                    let bytes = if is_sse { aggregate_probe_sse(&bytes) } else { bytes };
+                    let (bytes, stream_end) = if compressed {
+                        (bytes, ProbeStreamEnd::Undecodable)
+                    } else if is_sse {
+                        aggregate_probe_sse(&bytes)
+                    } else {
+                        (bytes, ProbeStreamEnd::NotStreamed)
+                    };
                     plog.record(status, &bytes, &info, upstream_request_id.as_deref());
                     // 命中封号特征照真实流量停用：判定器与转发共用同一个（含 401 裸响应、
                     // 「端点不支持」豁免那些规则），测试报出「已封禁」的同时卡片也变红，
                     // 而不是弹窗里一个结论、列表里另一个。
-                    if let Some(reason) =
-                        (!compressed).then(|| detect_account_ban(status, &bytes)).flatten()
-                    {
+                    let verdict = if compressed {
+                        AccountRejection::Other
+                    } else {
+                        classify_account_rejection(status, &bytes)
+                    };
+                    if let AccountRejection::Ban(reason) = verdict {
                         tracing::warn!(
                             cred_id = cred.id, cred = %cred.label,
                             status = status.as_u16(),
@@ -456,8 +436,21 @@ pub async fn probe(
                         if let Err(e) = state.store.record_ban(cred.id, &ctx) {
                             tracing::warn!(error = %e, "failed to auto-disable the credential");
                         }
+                    } else if verdict == AccountRejection::SubscriptionInactive {
+                        // 与转发同一口径：订阅还没生效，暂停调度（已暂停的不重写）。
+                        park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "probe");
                     }
-                    probe_report(status, &bytes, started.elapsed().as_millis(), quota)
+                    let report = probe_report(
+                        status,
+                        &bytes,
+                        stream_end,
+                        started.elapsed().as_millis(),
+                        quota,
+                    );
+                    if report.ok {
+                        settle_passing_probe(&state.store, cred, model, &info, resume_rate_limited);
+                    }
+                    report
                 }
             }
         }
@@ -781,20 +774,42 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
     }
 }
 
-/// 把连通性测试收到的 SSE 攒回一条整段 Message；攒不出来就原样交回。
+/// 连通性测试的流式回复是怎么结束的，[`aggregate_probe_sse`] 与 [`probe_report`] 之间传。
+///
+/// 不能只交一段字节了事：错误事件攒出来的是一份错误 JSON、半截流交回的是原始 SSE，两者在
+/// 2xx 状态码下都会被当成「通过」——测试报绿，还顺手把暂停中的号放回池子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeStreamEnd {
+    /// 非流式回复（haiku 额度探测、错误响应）：体就是整段 JSON，由 [`probe_report`] 看它是不是 Message。
+    NotStreamed,
+    /// 收到了 `message_stop`，攒出一条完整 Message。
+    Complete,
+    /// 流里来了 `event: error`：交回的体是那份错误 JSON。
+    UpstreamError,
+    /// 流断在半路（没有 `message_start` / `message_stop`），附上缺的是哪一个。
+    Incomplete(&'static str),
+    /// 响应用了 luban 解不开的 `content-encoding`：体是压缩字节，既看不出成败也取不出错误原文。
+    Undecodable,
+}
+
+/// 把连通性测试收到的 SSE 攒回一条整段 Message，连同**流是怎么结束的**一起交回。
 ///
 /// 与转发那条路共用 [`SseAggregator`]——两边对「什么算一条完整回复」的判断必须是同一套，
-/// 不然会出现「测试说通了、真实请求却是半截流」这种自相矛盾的结论。
-pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> Bytes {
+/// 不然会出现「测试说通了、真实请求却是半截流」这种自相矛盾的结论。错误事件交回那份错误
+/// JSON（[`probe_report`] 从里面取 `error.type` / `error.message`）；半截流原样交回（流水里
+/// 留的是上游实际发了什么）。
+pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
     let mut agg = SseAggregator::default();
     agg.feed(bytes);
+    let to_bytes = |v: &serde_json::Value| {
+        serde_json::to_vec(v).map(Bytes::from).unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
+    };
     match agg.finish() {
-        Aggregated::Message(msg) | Aggregated::UpstreamError(msg) => serde_json::to_vec(&msg)
-            .map(Bytes::from)
-            .unwrap_or_else(|_| Bytes::copy_from_slice(bytes)),
-        // 半截流：原样交回，让 [`probe_report`] 按「解不出 Message」如实报告，而不是
-        // 悄悄报成成功。
-        Aggregated::Incomplete(_) => Bytes::copy_from_slice(bytes),
+        Aggregated::Message(msg) => (to_bytes(&msg), ProbeStreamEnd::Complete),
+        Aggregated::UpstreamError(err) => (to_bytes(&err), ProbeStreamEnd::UpstreamError),
+        Aggregated::Incomplete(why) => {
+            (Bytes::copy_from_slice(bytes), ProbeStreamEnd::Incomplete(why))
+        }
     }
 }
 
@@ -981,38 +996,125 @@ fn log_probe_usage(
     spawn_usage_log((*store).clone(), rec);
 }
 
-/// 把上游响应翻译成一份结果：2xx 取回报的模型名，其余取 `error.type`/`error.message`。
+/// 把上游响应翻译成一份结果。**通过**只有一种：2xx 且拿到一条完整有效的 Message（顶层
+/// `type == "message"`），取它回报的模型名。其余一律失败，并尽量说清为什么：
+/// - 非 2xx：取 `error.type` / `error.message`；
+/// - 2xx 但流里来了错误事件：同上，取那份错误 JSON 里的；
+/// - 2xx 但流断在半路：写明缺的是哪个事件；
+/// - 2xx 但体不是 Message（解析不出、或 `type` 不对）：原样截一段体；
+/// - 响应用了解不开的 `content-encoding`（任何状态码）：写明无从校验，不拿压缩字节当原文。
+///
 /// 限流头由调用方先行解析（读 body 会把响应消费掉），成败两条路都带上。
 fn probe_report(
     status: StatusCode,
     bytes: &[u8],
+    stream_end: ProbeStreamEnd,
     latency_ms: u128,
     quota: Option<ProbeQuota>,
 ) -> ProbeReport {
-    if status.is_success() {
-        let model = serde_json::from_slice::<serde_json::Value>(bytes)
+    // `Ok(回报的模型名)` / `Err((error.type, 原因))`。
+    let verdict: Result<Option<String>, (Option<String>, String)> = if stream_end
+        == ProbeStreamEnd::Undecodable
+    {
+        // 不拿压缩字节去解析：成功与否无从校验，错误原文也只会是一串乱码。
+        Err((
+            None,
+            format!(
+                "the upstream returned {} with a content-encoding luban cannot decode; the reply could not be checked",
+                status.as_u16()
+            ),
+        ))
+    } else if !status.is_success() || stream_end == ProbeStreamEnd::UpstreamError {
+        Err(parse_upstream_error(bytes))
+    } else if let ProbeStreamEnd::Incomplete(why) = stream_end {
+        Err((None, format!("the upstream stream ended before the reply was complete ({why})")))
+    } else {
+        serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
-            .and_then(|v| Some(v.get("model")?.as_str()?.to_string()));
-        return ProbeReport {
-            ok: true,
-            status: status.as_u16(),
-            latency_ms,
-            model,
-            error_type: None,
-            error: None,
-            quota,
-        };
-    }
-    let (error_type, message) = parse_upstream_error(bytes);
-    ProbeReport {
-        ok: false,
-        status: status.as_u16(),
-        latency_ms,
-        model: None,
-        error_type,
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .map(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .ok_or_else(|| {
+                (
+                    None,
+                    format!(
+                        "the upstream returned {} but the body is not a complete Message: {}",
+                        status.as_u16(),
+                        String::from_utf8_lossy(bytes)
+                    ),
+                )
+            })
+    };
+    let (ok, model, error_type, error) = match verdict {
+        Ok(model) => (true, model, None, None),
         // 上游偶尔糊一大坨（HTML 拦截页之类），截断到能看清病因即可。
-        error: Some(message.chars().take(500).collect()),
-        quota,
+        Err((error_type, error)) => {
+            (false, None, error_type, Some(error.chars().take(500).collect()))
+        }
+    };
+    ProbeReport { ok, status: status.as_u16(), latency_ms, model, error_type, error, quota }
+}
+
+/// 连通性测试**通过**之后照真实判决恢复调度，只在 [`ProbeReport::ok`] 为真时调用（整条回复
+/// 读完、拿到完整 Message——只看状态码不够：200 之后流里带错误、流断在半路，号却已经回了池）。
+///
+/// - 限流那几档（`resume_rate_limited` 为真时，即按响应头判过「这一发没撞限流、额度也没快满」）：
+///   上游此刻放行了「这个账号 + 这个模型」，不必干等到点（上游的 retry-after 偏保守时，好号会被
+///   白白晾着）。两档各恢复各的：账号级那档是**落库的调度开关**，只对限流暂停的号生效，人工关掉
+///   的不该被一次测试打开；模型级那档是进程内冷却，清账号格 + 被测模型那一格，其它模型不动——
+///   sonnet 通了证明不了 fable 通。之前学到的「套餐不含这个模型」也作废。
+/// - 订阅未生效暂停：测试通过即已续费 / 订阅，放回池子。放回来之后补过一遍额度那道——按头判的
+///   时候号还停着，那道见号已停用就当「已在池外」什么都没做；真快满了，这里照常按额度再停一次。
+fn settle_passing_probe(
+    store: &store::CredentialStore,
+    cred: &crate::credentials::Credential,
+    model: &str,
+    info: &RateLimitInfo,
+    resume_rate_limited: bool,
+) {
+    if resume_rate_limited {
+        match store.resume_if_rate_limited(cred.id) {
+            Ok(true) => tracing::info!(
+                cred_id = cred.id, cred = %cred.label,
+                model,
+                "connectivity test passed, credential is back in the pool"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                cred_id = cred.id, cred = %cred.label,
+                error = %e,
+                "connectivity test passed but persisting the resume failed"
+            ),
+        }
+        store.clear_rate_limited(cred.id, Some(model));
+        match store.clear_model_denials(cred.id, Some(model)) {
+            Ok(n) if n > 0 => tracing::info!(
+                cred_id = cred.id, cred = %cred.label,
+                model,
+                "connectivity test passed, the model is no longer marked as excluded from this account's plan"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                cred_id = cred.id, cred = %cred.label,
+                error = %e,
+                "connectivity test passed but clearing the model denial failed"
+            ),
+        }
+    }
+    match store.resume_if_subscription_suspended(cred.id) {
+        Ok(true) => {
+            tracing::info!(
+                cred_id = cred.id, cred = %cred.label,
+                model,
+                "connectivity test passed, the subscription is active again; credential is back in the pool"
+            );
+            park_if_quota_nearly_exhausted(store, cred, info);
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            cred_id = cred.id, cred = %cred.label,
+            error = %e,
+            "connectivity test passed but persisting the resume failed"
+        ),
     }
 }
 
@@ -1369,13 +1471,114 @@ mod tests {
             "\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
-        let out = crate::proxy::aggregate_probe_sse(SSE.as_bytes());
+        let (out, end) = crate::proxy::aggregate_probe_sse(SSE.as_bytes());
+        assert_eq!(end, super::ProbeStreamEnd::Complete);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "claude-opus-5", "probe_report 靠这个字段: {v}");
         assert_eq!(v["content"][0]["text"], "ok");
 
-        // 半截流不能悄悄报成功：原样交回，让 probe_report 按「解不出 Message」处理。
+        // 半截流不能悄悄报成功：原样交回，并如实标成 Incomplete。
         let half = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n";
-        assert_eq!(crate::proxy::aggregate_probe_sse(half.as_bytes()), Bytes::from(half));
+        let (out, end) = crate::proxy::aggregate_probe_sse(half.as_bytes());
+        assert_eq!(out, Bytes::from(half));
+        assert!(matches!(end, super::ProbeStreamEnd::Incomplete(_)), "{end:?}");
+
+        // 流里来了错误事件：交回那份错误 JSON，标成 UpstreamError。
+        let err = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","content":[]}}"#,
+            "\n\n",
+            "event: error\n",
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "\n\n",
+        );
+        let (out, end) = crate::proxy::aggregate_probe_sse(err.as_bytes());
+        assert_eq!(end, super::ProbeStreamEnd::UpstreamError);
+        assert_eq!(crate::proxy::parse_upstream_error(&out).1, "Overloaded");
+    }
+
+    /// 通过只有一种：2xx 且拿到完整有效的 Message。200 里的错误事件、半截流、不是 Message 的体
+    /// 都算失败，并说清原因——此前它们一律报 `ok: true`，暂停中的号会被一次坏掉的测试放回池子。
+    #[test]
+    fn probe_report_passes_only_on_a_complete_message() {
+        use super::{ProbeStreamEnd as End, probe_report};
+        let ok = StatusCode::OK;
+        let msg = br#"{"type":"message","model":"claude-opus-5","content":[]}"#;
+        let r = probe_report(ok, msg, End::Complete, 1, None);
+        assert!(r.ok && r.model.as_deref() == Some("claude-opus-5") && r.error.is_none());
+        // 非流式（haiku 额度探测）的 Message 同样算通过。
+        assert!(probe_report(ok, msg, End::NotStreamed, 1, None).ok);
+
+        let err = br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let r = probe_report(ok, err, End::UpstreamError, 1, None);
+        assert!(!r.ok);
+        assert_eq!(r.error_type.as_deref(), Some("overloaded_error"));
+        assert_eq!(r.error.as_deref(), Some("Overloaded"));
+
+        let r = probe_report(
+            ok,
+            b"event: message_start\n",
+            End::Incomplete("no message_stop event"),
+            1,
+            None,
+        );
+        assert!(
+            !r.ok && r.error.as_deref().unwrap().contains("no message_stop event"),
+            "{:?}",
+            r.error
+        );
+
+        for body in [&b"not json"[..], br#"{"type":"error"}"#, br#"{"model":"x"}"#] {
+            let r = probe_report(ok, body, End::NotStreamed, 1, None);
+            assert!(!r.ok, "{}", String::from_utf8_lossy(body));
+        }
+
+        // 解不开的压缩编码：2xx 也不算通过，错误里不出现压缩字节。
+        let r = probe_report(ok, b"\x1f\x8b\x08\x00garbage", End::Undecodable, 1, None);
+        assert!(!r.ok && r.error.as_deref().unwrap().contains("cannot decode"), "{:?}", r.error);
+        assert!(!r.error.as_deref().unwrap().contains("garbage"));
+
+        let r = probe_report(
+            StatusCode::FORBIDDEN,
+            br#"{"error":{"type":"permission_error","message":"no"}}"#,
+            End::NotStreamed,
+            1,
+            None,
+        );
+        assert!(!r.ok && r.error_type.as_deref() == Some("permission_error"));
+    }
+
+    /// 回归：订阅未生效暂停中的号，一次**失败**的测试（200 里带错误事件、半截流）不能把它放回
+    /// 池子；只有完整 Message 那次才恢复。恢复与否只看 `report.ok`，这里把报告与恢复连起来测。
+    #[test]
+    fn broken_probe_does_not_resume_a_subscription_pause() {
+        use super::{ProbeStreamEnd as End, probe_report, settle_passing_probe};
+        let store = store::CredentialStore::open_in_memory().unwrap();
+        let cred = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        assert!(crate::proxy::park_org_oauth_disallowed(&store, &cred, 403, "forward"));
+        let info = super::RateLimitInfo::from_headers(&crate::proxy::HeaderMap::new());
+        let settle = |status, body: &[u8], end| {
+            let report = probe_report(status, body, end, 1, None);
+            if report.ok {
+                settle_passing_probe(&store, &cred, "claude-opus-5", &info, true);
+            }
+            report.ok
+        };
+        let err = br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        assert!(!settle(StatusCode::OK, err, End::UpstreamError));
+        assert!(!settle(
+            StatusCode::OK,
+            b"event: message_start\n",
+            End::Incomplete("no message_stop event")
+        ));
+        assert!(
+            store.get(cred.id).unwrap().unwrap().is_subscription_paused(),
+            "坏掉的测试不该恢复"
+        );
+
+        let msg = br#"{"type":"message","model":"claude-opus-5","content":[]}"#;
+        assert!(settle(StatusCode::OK, msg, End::Complete));
+        let got = store.get(cred.id).unwrap().unwrap();
+        assert!(!got.disabled && got.ban_reason.is_none(), "完整 Message 那次才恢复");
     }
 }

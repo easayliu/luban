@@ -21,25 +21,35 @@ const BAN_SUBJECTS: &[&str] = &["account", "organization", "workspace", "api key
 const BAN_KEYWORDS: &[&str] = &["invalid_grant", "oauth"];
 
 /// 反向豁免：命中其一则**一定不是**账号级问题，无论状态码与特征词如何都不停用。
-/// 用于挡住「特征词碰巧出现在非账号报错里」的误杀，见 [`detect_account_ban`]。
+/// 用于挡住「特征词碰巧出现在非账号报错里」的误杀，见 [`classify_account_rejection`]。
 /// 首项不写死 endpoint/model，是因为两者都出现过同款文案。
 ///
 /// 每一项都是**裸子串**匹配，且一旦命中就把 `oauth` 特征词与 401 `authentication_error`
 /// 两条判据整个作废，所以写得越像上游原话越好——短到只剩「not allowed for this」这种
 /// 片段，任何顺带提到它的真封号文案都会被放过去。「主语 + 状态词」共现不受这里影响，
-/// 见 [`detect_account_ban`]。
+/// 见 [`classify_account_rejection`]。
 ///
-/// 末项取自 `OAuth authentication is currently not allowed for this organization.`：组织
-/// 管理员没放开（或关掉了）Claude Code 的 OAuth 登录，是**组织侧的权限配置**、开回来就
-/// 恢复，不是账号被封；它带 `oauth` 一词，不豁免会被 [`BAN_KEYWORDS`] 命中而永久停用
-/// （保活路径此前正是这么误封的）。只去掉结尾的主语（organization / workspace 都可能），
-/// 前半句整句保留。
-const NOT_ACCOUNT_PHRASES: &[&str] = &[
-    "not supported for this",
-    "does not support",
-    "unsupported model",
-    "oauth authentication is currently not allowed for this",
-];
+/// 首项取自 `OAuth authentication is currently not allowed for this organization.`：这个号
+/// 的**订阅没有生效**——付费档是订阅失效（多为到期没续费），Free 档是从没订阅过、本来就没有
+/// 访问权限。续费 / 订阅之后就恢复，不是账号被封；它带 `oauth` 一词，不豁免会被
+/// [`BAN_KEYWORDS`] 命中而永久停用（保活路径此前正是这么误封的）。只去掉结尾的主语
+/// （organization / workspace 都可能），前半句整句保留。
+///
+/// 它排在**首项**：[`classify_account_rejection`] 靠「豁免命中的是它」认出订阅未生效，与别的
+/// 豁免短语同句时也得是它先被找到。
+const NOT_ACCOUNT_PHRASES: &[&str] =
+    &[ORG_OAUTH_DISALLOWED, "not supported for this", "does not support", "unsupported model"];
+
+/// 订阅未生效时上游的原话（去掉结尾主语、转小写），见 [`NOT_ACCOUNT_PHRASES`] 首项。字面是
+/// 「组织不允许 OAuth」，实际含义是付费订阅失效（需续费）或 Free 账号（需订阅）。
+///
+/// 不停用不等于放着不管：续费 / 订阅之前，这个号的每条真实请求都会吃同一发 401/403，
+/// 而粘性会话与设备绑定会让同一批客户端一直撞在它身上。故单独认出来、**暂停调度**直到人工
+/// 恢复（[`park_org_oauth_disallowed`]），而不是像普通 `permission_error` 那样原样透传了事。
+const ORG_OAUTH_DISALLOWED: &str = "oauth authentication is currently not allowed for this";
+
+/// 暂停落库失败时退回的进程内账号级冷却时长：至少本进程这一小时里不再选它。
+const ORG_OAUTH_FALLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
 /// 取一个响应头的文本值；缺失或非 UTF-8 时返回 `"-"`，与日志里其余缺值字段同形。
@@ -56,18 +66,45 @@ pub(crate) fn parse_upstream_error(body: &[u8]) -> (Option<String>, String) {
     (field("type"), field("message").unwrap_or_else(|| text.to_string()))
 }
 
-/// 依据状态码与响应体判定是否应自动停用该凭证，命中则返回写入 `ban_reason` 的原因
-/// （`[状态码] 类型: 消息`，截断至 200 字符）。
+/// 只要封号那一档的结论（测试用）：生产路径一律走 [`classify_account_rejection`]，判定规则
+/// 也写在那里。
+#[cfg(test)]
+pub(crate) fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
+    match classify_account_rejection(status, body) {
+        AccountRejection::Ban(reason) => Some(reason),
+        _ => None,
+    }
+}
+
+/// 上游 4xx 对**账号**的结论，[`classify_account_rejection`] 一次判完。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AccountRejection {
+    /// 账号级错误：停用（终态），带写进 `ban_reason` 的原因，见 [`classify_account_rejection`]。
+    Ban(String),
+    /// 订阅未生效（上游原话是组织不允许 OAuth）：暂停调度，见 [`park_org_oauth_disallowed`]。
+    SubscriptionInactive,
+    /// 与账号状态无关，原样处理。
+    Other,
+}
+
+/// 把一条上游 4xx 判成 [`AccountRejection`]。转发、连通性测试、保活都走这里，**判定顺序只写
+/// 在这一处**：先判封号，封号优先——「组织被停用 … not allowed for this organization」同句时
+/// 是封号，不能因为带了订阅那句就成了可以自动恢复的暂停。
 ///
-/// 三档都要求响应体确实是 Anthropic 的错误 JSON（能取到 `error.type`）或命中特征词，
-/// 避免把「非账号问题的 4xx」当成封号，把健康账号打成停用：
+/// 封号的判据（命中则停用，原因写 `[状态码] 类型: 消息`，截断至 200 字符）。三档都要求响应体
+/// 确实是 Anthropic 的错误 JSON（能取到 `error.type`）或命中特征词，避免把「非账号问题的 4xx」
+/// 当成封号，把健康账号打成停用：
 /// - 401：`authentication_error` 才停用。裸 401（CDN/网关拦截，无 `error.type`）不停用。
 /// - 403：**仅**命中特征词时停用。普通 `permission_error`（如 Pro 账号请求
 ///   Opus、beta 未开通、区域限制）是能力/权限问题而非封号，原样透传即可。
 /// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。
 ///
 /// 「命中特征词」= [`BAN_KEYWORDS`] 之一，或 [`BAN_SUBJECTS`] 与 [`BAN_STATES`] 各中一项。
-pub(crate) fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<String> {
+///
+/// 订阅未生效 = 401/403 上豁免命中的是 [`ORG_OAUTH_DISALLOWED`]（[`ban_verdict`] 先判「主语 +
+/// 状态词」、再看豁免，封号优先由它保证）。别的状态码上（比如 400）同一句话没人接手暂停，
+/// 按普通报错处理并照常告警。
+pub(crate) fn classify_account_rejection(status: StatusCode, body: &[u8]) -> AccountRejection {
     let (etype, message) = parse_upstream_error(body);
     match ban_verdict(status, etype.as_deref(), &message) {
         BanVerdict::Ban => {
@@ -75,12 +112,16 @@ pub(crate) fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<Stri
                 Some(t) => format!("[{}] {t}: {message}", status.as_u16()),
                 None => format!("[{}] {message}", status.as_u16()),
             };
-            Some(head.chars().take(200).collect())
+            AccountRejection::Ban(head.chars().take(200).collect())
+        }
+        BanVerdict::Exempt { phrase: ORG_OAUTH_DISALLOWED, .. } if is_org_oauth_status(status) => {
+            AccountRejection::SubscriptionInactive
         }
         BanVerdict::Exempt { phrase, overrode_signal: true } => {
             // 豁免改写了结论：没有它这条会被停用。新出现的混合文案（真封号却顺带提到豁免
             // 短语）会先在这里露头，而不是等复盘时才发现漏封。豁免没改写结论的（比如
-            // 400 参数错误里回显了字段名）不记，那是每天都有的正常报错。
+            // 400 参数错误里回显了字段名）不记，那是每天都有的正常报错。订阅未生效那句在
+            // 401/403 上走了上一臂（有专门的去处），不在这里刷屏。
             tracing::warn!(
                 status = status.as_u16(),
                 error_type = etype.as_deref().unwrap_or("-"),
@@ -88,13 +129,13 @@ pub(crate) fn detect_account_ban(status: StatusCode, body: &[u8]) -> Option<Stri
                 message = %message.chars().take(300).collect::<String>(),
                 "account-ban check: an exemption phrase overrode a ban signal; leaving the credential enabled (review if this is a new upstream wording)"
             );
-            None
+            AccountRejection::Other
         }
-        BanVerdict::Exempt { overrode_signal: false, .. } | BanVerdict::Clear => None,
+        BanVerdict::Exempt { .. } | BanVerdict::Clear => AccountRejection::Other,
     }
 }
 
-/// [`detect_account_ban`] 的纯判定部分，拆出来是为了能直接测「豁免有没有改写结论」。
+/// [`classify_account_rejection`] 的纯判定部分，拆出来是为了能直接测「豁免有没有改写结论」。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BanVerdict {
     /// 账号级错误，停用。
@@ -131,13 +172,56 @@ pub(super) fn ban_verdict(status: StatusCode, etype: Option<&str>, message: &str
     {
         return BanVerdict::Ban;
     }
-    // 排除「端点/能力不支持」「组织没放开 OAuth」这类与账号状态无关的报错——它们可能带上
+    // 排除「端点/能力不支持」「订阅未生效（组织不允许 OAuth）」这类与账号状态无关的报错——它们可能带上
     // oauth 等特征词（如 401 `OAuth authentication is currently not supported for this
     // endpoint`），但账号本身是好的，停用了反而白扣一个号。豁免只挡得住上面两条弱判据。
     if let Some(phrase) = NOT_ACCOUNT_PHRASES.iter().find(|p| hay.contains(*p)) {
         return BanVerdict::Exempt { phrase, overrode_signal: weak_signal };
     }
     if weak_signal { BanVerdict::Ban } else { BanVerdict::Clear }
+}
+
+/// 订阅未生效那句只在这两种状态码上认：出现过的就是 401/403。
+fn is_org_oauth_status(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+/// 订阅未生效（付费档到期未续费 / Free 档没订阅）：把号**暂停调度**，不会到点自己回来——
+/// 续费或订阅之后，控制台手动启用或做一次连通性测试（通过即恢复），见
+/// [`crate::store::CredentialStore::suspend_for_inactive_subscription`]（人工停用、封禁、已暂停的号它不碰）。
+/// `source` 只进日志，标明是哪条路撞上的（forward / keepalive / probe）。
+///
+/// 返回是否确有写入；落库失败退回进程内账号级冷却，本进程内至少一段时间不再选它。
+pub(crate) fn park_org_oauth_disallowed(
+    store: &crate::store::CredentialStore,
+    cred: &crate::credentials::Credential,
+    status: u16,
+    source: &str,
+) -> bool {
+    let reason = format!(
+        "[{} {status}] {} (subscription lapsed, or a Free plan without one); paused until enabled manually or a connectivity test passes",
+        crate::store::SUBSCRIPTION_PAUSE_TAG,
+        crate::store::ORG_OAUTH_SUSPEND_MARKER
+    );
+    match store.suspend_for_inactive_subscription(cred.id, &reason) {
+        Ok(true) => {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                status, source,
+                "upstream rejects OAuth for this organization (subscription lapsed, or a Free plan without one): taken out of the pool until it is enabled manually or a connectivity test passes"
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::error!(
+                cred_id = cred.id, cred = %cred.label, error = %e, source,
+                "persisting the org-OAuth pause failed, falling back to an in-process cooldown"
+            );
+            store.mark_rate_limited(cred.id, None, ORG_OAUTH_FALLBACK_COOLDOWN);
+            false
+        }
+    }
 }
 
 /// 「被判成第三方应用」的特征文案。上游原文形如：
@@ -150,7 +234,7 @@ const THIRD_PARTY_PHRASES: &[&str] = &["third-party app", "extra usage"];
 
 /// 上游是否把这条请求判成了第三方应用（额度改扣超额池而非订阅额度）。
 ///
-/// **注意它不会被 [`detect_account_ban`] 误判成封号**：这段文案里既没有 `oauth`/
+/// **注意它不会被 [`classify_account_rejection`] 误判成封号**：这段文案里既没有 `oauth`/
 /// `invalid_grant`，也凑不出「主语 + 状态词」的共现，故不会停用凭证——账号是好的，
 /// 被拒的是请求形态。
 pub(super) fn is_third_party_rejection(body: &[u8]) -> bool {
@@ -350,7 +434,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 err_body("invalid_request_error", "Your account has insufficient credits"),
             ),
-            // 组织没放开 OAuth：组织侧权限配置，管理员开回来就恢复。带 `oauth` 一词，
+            // 订阅未生效（付费档需续费 / Free 档需订阅）：续费 / 订阅后就恢复。带 `oauth` 一词，
             // 不豁免会被特征词命中；401/403 两种状态码都见过同款文案。
             (
                 StatusCode::FORBIDDEN,
@@ -376,9 +460,78 @@ mod tests {
         }
     }
 
+    /// 「订阅未生效」（上游原话是组织不允许 OAuth）要单独认出来（去暂停调度），401/403 都认；别的状态码、别的
+    /// 权限报错不认；与「组织被停用」同句时封号判定优先。
+    #[test]
+    fn detects_org_oauth_disallowed() {
+        use crate::proxy::{AccountRejection, classify_account_rejection};
+        let sub = |status, body: &[u8]| {
+            classify_account_rejection(status, body) == AccountRejection::SubscriptionInactive
+        };
+        let msg = "OAuth authentication is currently not allowed for this organization.";
+        assert!(sub(StatusCode::FORBIDDEN, &err_body("permission_error", msg)));
+        assert!(sub(StatusCode::UNAUTHORIZED, &err_body("authentication_error", msg)));
+        // 非 JSON 体（原文就是那句话）也认。
+        assert!(sub(StatusCode::FORBIDDEN, msg.as_bytes()));
+        // 400 上不认（没人接手暂停），也不封号。
+        assert_eq!(
+            classify_account_rejection(
+                StatusCode::BAD_REQUEST,
+                &err_body("invalid_request_error", msg)
+            ),
+            AccountRejection::Other
+        );
+        for other in [
+            err_body("permission_error", "Your account does not have access to claude-opus-5"),
+            err_body(
+                "authentication_error",
+                "OAuth authentication is currently not supported for this endpoint",
+            ),
+            b"<html>403 Forbidden</html>".to_vec(),
+        ] {
+            assert_eq!(
+                classify_account_rejection(StatusCode::FORBIDDEN, &other),
+                AccountRejection::Other,
+                "不该误认: {}",
+                String::from_utf8_lossy(&other)
+            );
+        }
+        // 同句带「组织被停用」：封号优先，顺序收在 classify_account_rejection 里。
+        let mixed = err_body(
+            "permission_error",
+            "This organization has been disabled; OAuth authentication is currently not allowed for this organization.",
+        );
+        assert!(matches!(
+            classify_account_rejection(StatusCode::FORBIDDEN, &mixed),
+            AccountRejection::Ban(_)
+        ));
+    }
+
+    /// 暂停写进库：号出池、不带恢复时刻、原因可读且带固定片段，不落封号事件；连通性测试
+    /// 那条恢复认得出它。
+    #[test]
+    fn park_org_oauth_disallowed_pauses_until_resumed() {
+        use crate::proxy::park_org_oauth_disallowed;
+        let store = crate::store::CredentialStore::open_in_memory().unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        assert!(park_org_oauth_disallowed(&store, &a, 403, "forward"));
+        let got = store.get(a.id).unwrap().unwrap();
+        assert!(got.disabled && got.resume_at.is_none());
+        assert_eq!(
+            got.ban_reason.as_deref(),
+            Some(
+                "[subscription-inactive 403] organization does not allow OAuth authentication (subscription lapsed, or a Free plan without one); paused until enabled manually or a connectivity test passes"
+            )
+        );
+        assert!(store.list_ban_events(None, 10).unwrap().is_empty(), "暂停不是封号，不落事件");
+        assert!(got.is_subscription_paused() && !got.is_banned());
+        assert!(!park_org_oauth_disallowed(&store, &a, 403, "keepalive"), "已暂停的不重写");
+        assert!(store.resume_if_subscription_suspended(a.id).unwrap());
+    }
+
     /// 「被判成第三方应用」的那条 400 要认出来，普通 400 不能误认。
     ///
-    /// 同一条报文还必须**不**被 [`crate::proxy::detect_account_ban`] 判成封号——账号是好的，
+    /// 同一条报文还必须**不**被 [`detect_account_ban`] 判成封号——账号是好的，
     /// 被拒的是请求形态；误停用等于每撞一次这个 400 就白扣一个号。
     #[test]
     fn detects_third_party_rejection_without_banning() {

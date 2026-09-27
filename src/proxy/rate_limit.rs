@@ -191,11 +191,13 @@ pub(super) fn park_rate_limited(
             human_secs(cooldown)
         );
         match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
-            Ok(_) => tracing::warn!(
+            Ok(true) => tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 resume_at,
                 "account-level rate limit: taken out of the pool, resumes automatically when it expires (or enable it manually / run a connectivity test from the console)"
             ),
+            // 号已经被封 / 人工停用 / 按订阅停了（同一个号并发在飞的另一条先回来了）：不改写。
+            Ok(false) => {}
             // 落库失败不该把这条请求也搭进去：至少退回进程内冷却，本进程内仍不会再选它。
             Err(e) => {
                 tracing::error!(
@@ -282,7 +284,9 @@ pub(super) fn park_if_quota_nearly_exhausted(
         human_secs(cooldown)
     );
     match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
-        Ok(_) => {
+        // 没写入 = 号已经被封 / 人工停用 / 按订阅停了：同样已在池外，只是不必再记一遍。
+        Ok(false) => true,
+        Ok(true) => {
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 window,

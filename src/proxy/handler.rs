@@ -9,8 +9,8 @@ use crate::store;
 use crate::web::AppState;
 
 use super::ban::{
-    detect_account_ban, header_text, is_third_party_rejection, log_third_party_rejection,
-    parse_upstream_error,
+    AccountRejection, classify_account_rejection, header_text, is_third_party_rejection,
+    log_third_party_rejection, park_org_oauth_disallowed, parse_upstream_error,
 };
 use super::body::{
     below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
@@ -54,9 +54,9 @@ use super::thinking::{
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
     has_trailing_assistant, is_prefill_not_supported_error, model_rejects_prefill,
-    note_upstream_send, relay_upstream, resp_builder, resp_shape, retry_without_fallbacks,
-    strip_assistant_prefill, try_acquire_session_concurrency, upstream_error_kind,
-    upstream_load_snapshot,
+    note_upstream_send, rebuild_response, relay_upstream, resp_builder, resp_shape,
+    retry_without_fallbacks, strip_assistant_prefill, try_acquire_session_concurrency,
+    upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
     EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_REPLY,
@@ -1231,21 +1231,33 @@ pub(super) async fn handle_inner(
                     },
                 );
             }
-            if let Some(reason) = detect_account_ban(StatusCode::UNAUTHORIZED, &bytes) {
-                tracing::warn!(
-                    cred_id = cred.id, cred = %cred.label,
-                    reason = %reason,
-                    "401 account-level error, auto-disabling and attempting credential swap"
-                );
-                let ctx = ban_context(
-                    &reason,
-                    "forward_401",
-                    StatusCode::UNAUTHORIZED,
-                    &bytes,
-                    request_id,
-                    up_request_id.as_deref(),
-                );
-                let _ = state.store.record_ban(cred.id, &ctx);
+            // 两种都把号挪出池子、换号重发：账号级错误停用（终态），订阅未生效暂停
+            // （手动启用或连通性测试通过才恢复，见 [`park_org_oauth_disallowed`]）。
+            let out_of_pool = match classify_account_rejection(StatusCode::UNAUTHORIZED, &bytes) {
+                AccountRejection::Ban(reason) => {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        reason = %reason,
+                        "401 account-level error, auto-disabling and attempting credential swap"
+                    );
+                    let ctx = ban_context(
+                        &reason,
+                        "forward_401",
+                        StatusCode::UNAUTHORIZED,
+                        &bytes,
+                        request_id,
+                        up_request_id.as_deref(),
+                    );
+                    let _ = state.store.record_ban(cred.id, &ctx);
+                    true
+                }
+                AccountRejection::SubscriptionInactive => {
+                    park_org_oauth_disallowed(&state.store, &cred, 401, "forward_401");
+                    true
+                }
+                AccountRejection::Other => false,
+            };
+            if out_of_pool {
                 tried.push(cred.id);
                 if retried < max_retry {
                     match store::valid_access_token_for_device(
@@ -1309,6 +1321,169 @@ pub(super) async fn handle_inner(
             return builder.body(Body::from(bytes)).unwrap_or_else(|e| {
                 error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
             });
+        }
+        // 403 里两种与这条请求无关、换个号就能过的：账号级错误（组织 / 账号被停用）与组织
+        // 未放开 OAuth。当场换号重发，客户端不必吃这一发。
+        //
+        // 与 401 那条的区别：403 大多是**请求本身**的权限问题（套餐不含模型、区域限制），
+        // 那些得原样交给下面的 4xx 段（学习、取证、流水都在那儿）。body 读出来以后判不中，
+        // 就把状态码、头、体原样拼回一个 `wreq::Response` 放回 `resp`，下游看不出区别
+        // （那段只读 status / headers / bytes）。
+        //
+        // **先选到下一个号再动库**：换得到才在这里停用 / 暂停并 `continue`；换不到就原样
+        // 交出去，由下面的 4xx 段照旧判定、停用 / 暂停——同一条 403 不会落两次封号事件。
+        if max_retry > 0
+            && retried < max_retry
+            && let Ok(up) = &resp
+            && up.status() == StatusCode::FORBIDDEN
+            && resp_shape(up).1.is_none()
+        {
+            let up = resp.unwrap();
+            let builder = resp_builder(&up);
+            let (version, headers) = (up.version(), up.headers().clone());
+            let up_request_id = header_opt(&headers, "request-id");
+            let up_org_id = header_opt(&headers, "anthropic-organization-id");
+            // 读体失败：与下面 4xx 段、上面 401 那条同一个出路——体已经没了，就地回一个空体的
+            // 403。不拼一个空体的「正常」403 交下去：那样下游会拿空体去判定、学习、取证，流水里
+            // 也只剩一条干净的 403，读失败这件事就被吞了。`ReqLog` 还没建，失败遥测与流水就地补。
+            let bytes = match up.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read the upstream 403 body");
+                    record_early_failure(
+                        &state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        started,
+                        flags,
+                        billable,
+                        up_request_id.as_deref(),
+                        up_org_id,
+                        crate::telemetry::CallFailure {
+                            status: Some(StatusCode::FORBIDDEN.as_u16()),
+                            error_type: None,
+                            message: String::new(),
+                            in_band: false,
+                        },
+                    );
+                    log_early_upstream_failure(
+                        &state,
+                        log_state,
+                        &cred,
+                        &upstream,
+                        &sent,
+                        EarlyUpstreamFailure {
+                            path: &path_and_query,
+                            client_ua: &client_ua,
+                            model: req_model.clone(),
+                            device_id: early_logged_device(
+                                &device_id, &upstream, flags, &cred, &device_fp,
+                            ),
+                            started,
+                            request_id,
+                            upstream_request_id: up_request_id.as_deref(),
+                            status: StatusCode::FORBIDDEN,
+                            error_type: None,
+                            error_message: Some(format!(
+                                "failed to read the upstream 403 body: {e}"
+                            )),
+                            third_party: false,
+                            ratelimit: None,
+                            tag: "upstream_403",
+                        },
+                    );
+                    return builder.body(Body::empty()).unwrap_or_else(|e| {
+                        error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+                    });
+                }
+            };
+            let verdict = classify_account_rejection(StatusCode::FORBIDDEN, &bytes);
+            let next = if verdict != AccountRejection::Other {
+                tried.push(cred.id);
+                store::valid_access_token_for_device(
+                    &state.store,
+                    &state.clients,
+                    select(
+                        device_id.as_deref(),
+                        session_key.as_deref(),
+                        billable,
+                        req_model.as_deref(),
+                        &tried,
+                    ),
+                )
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        error = %e,
+                        "403 but no credential to swap to, passing through as is"
+                    )
+                })
+                .ok()
+            } else {
+                None
+            };
+            if let Some((next_token, next_cred, next_slot)) = next {
+                let (etype, message) = parse_upstream_error(&bytes);
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    status = 403u16,
+                    error_type = %etype.as_deref().unwrap_or("-"),
+                    upstream_message = %message.chars().take(500).collect::<String>(),
+                    "upstream returned 403"
+                );
+                if let AccountRejection::Ban(reason) = &verdict {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        reason = %reason,
+                        "403 account-level error, auto-disabling and swapping credentials"
+                    );
+                    let ctx = ban_context(
+                        reason,
+                        "forward_403",
+                        StatusCode::FORBIDDEN,
+                        &bytes,
+                        request_id,
+                        up_request_id.as_deref(),
+                    );
+                    if let Err(e) = state.store.record_ban(cred.id, &ctx) {
+                        tracing::warn!(error = %e, "failed to auto-disable the credential");
+                    }
+                } else {
+                    park_org_oauth_disallowed(&state.store, &cred, 403, "forward_403");
+                }
+                // 换号出去的这一发绕开了 `ReqLog::drop`，失败遥测就地补，报在吃到 403 的号上；
+                // 与 401 换号同一口径。
+                record_early_failure(
+                    &state,
+                    &cred,
+                    &upstream,
+                    &sent,
+                    started,
+                    flags,
+                    billable,
+                    up_request_id.as_deref(),
+                    up_org_id,
+                    crate::telemetry::CallFailure {
+                        status: Some(StatusCode::FORBIDDEN.as_u16()),
+                        error_type: etype,
+                        message,
+                        in_band: false,
+                    },
+                );
+                tracing::info!(
+                    cred_id = cred.id, cred = %cred.label,
+                    to_cred_id = next_cred.id,
+                    to_cred = %next_cred.label,
+                    attempt = retried + 1,
+                    "403 credential swap: retrying with another credential"
+                );
+                (token, cred, session_slot) = (next_token, next_cred, next_slot);
+                retried += 1;
+                continue;
+            }
+            resp = Ok(rebuild_response(StatusCode::FORBIDDEN, version, headers, bytes));
         }
         let Some(info) = limited else { break (upstream, resp, sent, sent_bits) };
         // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
@@ -1865,9 +2040,12 @@ pub(super) async fn handle_inner(
                         }
                     }
                 }
-                let banned =
-                    (!compressed).then(|| detect_account_ban(status, &err_bytes)).flatten();
-                if let Some(reason) = &banned {
+                let verdict = if compressed {
+                    AccountRejection::Other
+                } else {
+                    classify_account_rejection(status, &err_bytes)
+                };
+                if let AccountRejection::Ban(reason) = &verdict {
                     tracing::warn!(
                         cred_id = cred.id, cred = %cred.label,
                         status = status.as_u16(),
@@ -1885,6 +2063,10 @@ pub(super) async fn handle_inner(
                     if let Err(e) = state.store.record_ban(cred.id, &ctx) {
                         tracing::warn!(error = %e, "failed to auto-disable the credential");
                     }
+                } else if verdict == AccountRejection::SubscriptionInactive {
+                    // 订阅未生效：不是封号，但续费 / 订阅之前这个号的每条请求都会吃同一发：暂停调度、清绑定，
+                    // 下一条请求就改走别的号。这一发已经到了客户端手里，原样透传。
+                    park_org_oauth_disallowed(&state.store, &cred, status.as_u16(), "forward");
                 }
                 // thinking 签名降级重试。
                 if status == StatusCode::BAD_REQUEST

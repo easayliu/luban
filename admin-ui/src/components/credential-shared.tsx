@@ -123,6 +123,7 @@ function isOverageWindow(name: string): boolean {
 export type CredentialStatusKind =
   | 'banned'
   | 'token-invalid'
+  | 'subscription-inactive'
   | 'rate-limited'
   | 'disabled'
   | 'overage'
@@ -312,6 +313,50 @@ export function isAccountBan(banReason: string): boolean {
   return true
 }
 
+/**
+ * `ban_reason` 是否是后端「订阅未生效」那档暂停（见 `proxy::park_org_oauth_disallowed`）：上游回
+ * `OAuth authentication is currently not allowed for this organization`，即付费订阅已失效
+ * （到期未续费）或 Free 账号没有订阅。它与封号同形（disabled + ban_reason、`resume_at` 为空），
+ * 只能按 luban 自己写的格式认：**开头**是 `[subscription-inactive <三位状态码>] ` 紧跟
+ * `store::ORG_OAUTH_SUSPEND_MARKER`，**区分大小写**——与后端 `store::is_subscription_pause_reason`
+ * 及库里的 GLOB 同一口径（封号原因里抄的上游原文不算）。改文案须前后端一起改。
+ */
+export function isSubscriptionPause(banReason: string): boolean {
+  return /^\[subscription-inactive \d{3}] organization does not allow OAuth authentication/.test(banReason)
+}
+
+/**
+ * 「订阅未生效」的说明按套餐分：Free 是从来没订阅，要先订阅；付费档是订阅失效，多为到期没续费。
+ * 档位取的是最后一次看到的，订阅失效后仍显示原来的付费档——正好就是「该续费」的那种。
+ */
+function subscriptionPauseDetail(cred: Credential, language: Language): string {
+  const resume = localize(
+    language,
+    '之后手动启用或做一次连通性测试（通过即恢复）；暂停期间不会自动恢复',
+    'then enable it manually or run a connectivity test (it resumes when the test passes); it will not resume on its own',
+  )
+  const plan = planKey(cred.tier)
+  if (plan === 'free') {
+    return localize(
+      language,
+      `Free 账号没有访问权限（上游拒绝 OAuth 登录），已暂停调度。需要先订阅，${resume}`,
+      `Free accounts have no access (upstream rejects OAuth authentication), so scheduling is paused. Subscribe first, ${resume}`,
+    )
+  }
+  if (plan === 'unknown') {
+    return localize(
+      language,
+      `订阅未生效（上游拒绝 OAuth 登录），已暂停调度：付费订阅需续费，Free 账号需先订阅，${resume}`,
+      `Subscription is not active (upstream rejects OAuth authentication), so scheduling is paused: renew a paid plan or subscribe a Free account, ${resume}`,
+    )
+  }
+  return localize(
+    language,
+    `订阅已失效（上游拒绝 OAuth 登录，多为到期未续费），已暂停调度。需要续费，${resume}`,
+    `Subscription has lapsed (upstream rejects OAuth authentication, usually an expired plan that was not renewed), so scheduling is paused. Renew it, ${resume}`,
+  )
+}
+
 function statusFromQuota(
   cred: Credential,
   quota: QuotaRiskMeta,
@@ -329,6 +374,16 @@ function statusFromQuota(
         `账号用量已达上限，已移出调度池，${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或做一次连通性测试立即恢复`,
         `Usage limit reached; removed from the scheduling pool and resuming automatically at ${formatFullTime(cred.resume_at, language)}. You can also enable it manually or run a connectivity test to restore it now`,
       ),
+      attention: true, rank: 6,
+    }
+  }
+  // 订阅未生效与封号同形（disabled + ban_reason、没有恢复时刻），只能按原因文案认，
+  // 须排在封禁之前：号没废，续费 / 订阅之后手动恢复即可。
+  if (cred.ban_reason && isSubscriptionPause(cred.ban_reason)) {
+    return {
+      kind: 'subscription-inactive', variant: 'warning',
+      label: localize(language, '订阅未生效', 'Subscription inactive'),
+      detail: subscriptionPauseDetail(cred, language),
       attention: true, rank: 6,
     }
   }
@@ -1878,6 +1933,13 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
         `用量已达上限，${formatFullTime(cred.resume_at, language)} 自动恢复调度`,
         `Usage limit reached; scheduling resumes at ${formatFullTime(cred.resume_at, language)}`,
       ),
+    }
+  }
+  if (cred.ban_reason && isSubscriptionPause(cred.ban_reason)) {
+    return {
+      text: localize(language, '订阅未生效', 'Subscription inactive'),
+      className: 'font-medium text-warning-foreground',
+      title: subscriptionPauseDetail(cred, language),
     }
   }
   if (cred.ban_reason) {
