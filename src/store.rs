@@ -1597,6 +1597,25 @@ impl CredentialStore {
         Ok(n > 0)
     }
 
+    /// 批量删除代理池记录，单事务内完成；返回实际删掉的条数（不存在的 id 不计）。
+    /// 与 [Self::delete_proxy] 一样只动代理池，不改凭证上的代理设置。
+    pub fn delete_proxies(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM proxies WHERE id = ?1")?;
+            for id in ids {
+                n += stmt.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// 统计每个代理地址有多少凭证在使用。键是代理 URL，值是使用该 URL 的凭证数量。
     pub fn proxy_usage_counts(&self) -> Result<HashMap<String, i64>> {
         let conn = self.conn.lock();
@@ -7085,6 +7104,19 @@ mod tests {
     // 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
     #![allow(deprecated)]
     use super::*;
+
+    /// 批量删除只删池里的记录，不存在的 id 不计入条数。
+    #[test]
+    fn delete_proxies_removes_only_given_ids() {
+        let store = CredentialStore::open_in_memory().unwrap();
+        let a = store.add_proxy("a", "socks5h://10.0.0.1:1080").unwrap();
+        let b = store.add_proxy("b", "socks5h://10.0.0.2:1080").unwrap();
+        let c = store.add_proxy("c", "socks5h://10.0.0.3:1080").unwrap();
+        assert_eq!(store.delete_proxies(&[a.id, c.id, 9999]).unwrap(), 2);
+        let left: Vec<i64> = store.list_proxies().unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(left, vec![b.id]);
+        assert_eq!(store.delete_proxies(&[]).unwrap(), 0);
+    }
 
     /// 全局默认会话上限的播种：同设备那条——缺失才写、显式值（含 `0`）不动、重复启动不改。
     #[test]

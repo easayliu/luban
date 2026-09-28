@@ -52,3 +52,9 @@ export async function updateProxy(id: number, label: string, url: string): Promi
 export async function deleteProxy(id: number): Promise<void> {
   await api.delete(`/proxies/${id}`)
 }
+
+/** 批量删除代理池记录（单事务，不影响已配置这些地址的凭证），返回实际删掉的条数。 */
+export async function deleteProxies(ids: number[]): Promise<number> {
+  const { data } = await api.post<{ deleted: number }>('/proxies/delete', { ids })
+  return data.deleted
+}

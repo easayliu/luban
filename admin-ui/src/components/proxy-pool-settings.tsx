@@ -5,6 +5,7 @@ import {
   GlobeIcon,
   PencilIcon,
   PlayIcon,
+  FilterIcon,
   PlusIcon,
   RotateCwIcon,
   Trash2Icon,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react'
 import {
   addProxy,
+  deleteProxies,
   deleteProxy,
   listProxies,
   type ProxyTestResult,
@@ -75,6 +77,8 @@ export function ProxyPoolSettingsContent() {
   const [testing, setTesting] = useState<Set<string>>(() => new Set())
   // 记下是哪个批量按钮在跑：两个按钮互斥，但转圈只转被点的那个。
   const [batchRunning, setBatchRunning] = useState<'all' | 'failed' | null>(null)
+  const [onlyFailed, setOnlyFailed] = useState(false)
+  const [confirmDeleteFailed, setConfirmDeleteFailed] = useState(false)
 
   const runTest = useCallback(
     async (url: string): Promise<ProxyTestResult> => {
@@ -137,6 +141,30 @@ export function ProxyPoolSettingsContent() {
     onError: (e) => onError(t('添加代理失败', 'Failed to add proxy'), e),
   })
 
+  const removeFailed = useMutation({
+    mutationFn: (targets: SavedProxy[]) => deleteProxies(targets.map((p) => p.id)),
+    onSuccess: (deleted, targets) => {
+      setResults((prev) => {
+        const next = { ...prev }
+        for (const p of targets) delete next[p.url]
+        return next
+      })
+      setConfirmDeleteFailed(false)
+      // 筛选跟着这批失败项一起结束：不复位的话，下次测出失败会一下子只剩失败项，像是代理被删了。
+      setOnlyFailed(false)
+      invalidate()
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+      toastManager.add({
+        title: t(`已删除 ${deleted} 条代理`, `Deleted ${deleted} prox${deleted === 1 ? 'y' : 'ies'}`),
+        type: 'success',
+      })
+    },
+    onError: (e) => {
+      setConfirmDeleteFailed(false)
+      onError(t('删除代理失败', 'Failed to delete proxies'), e)
+    },
+  })
+
   const testAll = async (urls: string[], kind: 'all' | 'failed') => {
     setBatchRunning(kind)
     const queue = [...urls]
@@ -194,7 +222,13 @@ export function ProxyPoolSettingsContent() {
   const proxies = proxiesQuery.data ?? []
   const testedCount = proxies.filter((p) => results[p.url]).length
   const okCount = proxies.filter((p) => results[p.url]?.ok).length
-  const failedUrls = proxies.filter((p) => results[p.url]?.ok === false).map((p) => p.url)
+  const failedProxies = proxies.filter((p) => results[p.url]?.ok === false)
+  const failedUrls = failedProxies.map((p) => p.url)
+  // 失败项清空后（重测都通了 / 删光了）自动回到全部列表，不留一个空的筛选结果。
+  const filtering = onlyFailed && failedProxies.length > 0
+  const visibleProxies = filtering ? failedProxies : proxies
+  const failedInUse = failedProxies.filter((p) => p.credential_count > 0)
+  const failedInUseAccounts = failedInUse.reduce((n, p) => n + p.credential_count, 0)
 
   return (
     <div className="space-y-4">
@@ -279,19 +313,6 @@ export function ProxyPoolSettingsContent() {
                 : t(`共 ${proxies.length} 条`, `${proxies.length} total`)}
             </p>
             <div className="flex items-center gap-2">
-              {/* 只在有失败结果时出现：修完几条代理后重测不通的那几条，不必把全池再跑一遍。 */}
-              {failedUrls.length > 0 && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  loading={batchRunning === 'failed'}
-                  disabled={batchRunning !== null}
-                  onClick={() => testAll(failedUrls, 'failed')}
-                >
-                  <RotateCwIcon />
-                  {t(`重测失败项（${failedUrls.length}）`, `Retest failed (${failedUrls.length})`)}
-                </Button>
-              )}
               <Button
                 size="sm"
                 variant="outline"
@@ -306,13 +327,99 @@ export function ProxyPoolSettingsContent() {
           </div>
         )}
 
+        {/* 失败项单独一行：筛选、重测、删除都只针对这批，和上面的全池操作分开，免得误删。 */}
+        {failedProxies.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 bg-destructive/5 px-4 py-2.5 sm:px-5">
+            <p className="text-xs font-medium text-destructive-foreground tabular-nums">
+              {t(`${failedProxies.length} 条测试失败`, `${failedProxies.length} failed`)}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant={filtering ? 'secondary' : 'ghost'}
+                aria-pressed={filtering}
+                onClick={() => setOnlyFailed((v) => !v)}
+              >
+                <FilterIcon />
+                {filtering ? t('显示全部', 'Show all') : t('只看失败', 'Only failed')}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                loading={batchRunning === 'failed'}
+                disabled={batchRunning !== null}
+                onClick={() => testAll(failedUrls, 'failed')}
+              >
+                <RotateCwIcon />
+                {t('重测', 'Retest')}
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive-outline"
+                disabled={batchRunning !== null}
+                onClick={() => setConfirmDeleteFailed(true)}
+              >
+                <Trash2Icon />
+                {t('删除', 'Delete')}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <AlertDialog open={confirmDeleteFailed} onOpenChange={setConfirmDeleteFailed}>
+          <AlertDialogPopup>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t(
+                  `删除 ${failedProxies.length} 条测试失败的代理`,
+                  `Delete ${failedProxies.length} failed prox${failedProxies.length === 1 ? 'y' : 'ies'}`,
+                )}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {failedInUse.length > 0
+                  ? t(
+                      `其中 ${failedInUse.length} 条仍被 ${failedInUseAccounts} 个账号使用。删除只是从代理池移除，这些账号的代理设置不变，仍会走这条不通的代理；需要的话先在「使用账号」里把它们换掉。`,
+                      `${failedInUse.length} of them ${failedInUse.length === 1 ? 'is' : 'are'} still used by ${failedInUseAccounts} account${failedInUseAccounts === 1 ? '' : 's'}. Deleting only removes them from the pool; those accounts keep using the unreachable proxy. Reassign them under “Manage accounts” first if needed.`,
+                    )
+                  : t('这些代理没有账号在用，删除后从代理池移除。', 'No accounts use these proxies. They will be removed from the pool.')}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <ul className="max-h-48 space-y-1 overflow-y-auto px-4 pb-4 text-sm sm:px-6" role="list">
+              {failedProxies.map((p) => (
+                <li key={p.id} className="flex items-baseline gap-2">
+                  <span className="truncate">{p.label}</span>
+                  {p.credential_count > 0 && (
+                    <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                      {t(`${p.credential_count} 个账号在用`, `${p.credential_count} in use`)}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <AlertDialogFooter>
+              <AlertDialogClose render={<Button variant="outline" />}>
+                {t('取消', 'Cancel')}
+              </AlertDialogClose>
+              <Button
+                variant="destructive"
+                loading={removeFailed.isPending}
+                // 弹窗开着时单条重测可能把失败项清空，空列表发出去后端会回 400。
+                disabled={failedProxies.length === 0}
+                onClick={() => removeFailed.mutate(failedProxies)}
+              >
+                {t('删除', 'Delete')}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogPopup>
+        </AlertDialog>
+
         {proxies.length === 0 ? (
           <p className="px-4 py-4 text-center sm:px-5 text-sm text-muted-foreground">
             {t('代理池还没有代理地址。在上方填写地址即可添加第一条，名称可留空。', 'The proxy pool is empty. Enter a URL above to add the first proxy; the name is optional.')}
           </p>
         ) : (
           <ul className="divide-y" role="list">
-            {proxies.map((proxy) => (
+            {visibleProxies.map((proxy) => (
               <ProxyRow
                 key={proxy.id}
                 proxy={proxy}

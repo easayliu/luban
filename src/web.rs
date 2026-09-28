@@ -582,6 +582,7 @@ pub async fn run(
         .route("/credentials/proxy", post(set_proxies))
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
         .route("/proxies/test", post(test_proxy))
+        .route("/proxies/delete", post(delete_saved_proxies))
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
         .route("/ban-events", get(list_ban_events))
@@ -2009,6 +2010,24 @@ async fn delete_saved_proxy(
     }
     tracing::info!(proxy_id = id, "proxy deleted from pool");
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteProxiesReq {
+    ids: Vec<i64>,
+}
+
+/// 批量删除代理池记录（不影响已配置这些地址的凭证），返回实际删掉的条数。
+async fn delete_saved_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteProxiesReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(bad_request("select at least one proxy"));
+    }
+    let deleted = state.store.delete_proxies(&req.ids).map_err(internal)?;
+    tracing::info!(requested = req.ids.len(), deleted, "proxies deleted from pool in bulk");
+    Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
 #[derive(Deserialize)]
