@@ -29,7 +29,8 @@ export function displayCredentialLabel(label: string, language: Language = 'zh-C
   return language === 'zh-CN' ? `账号 ${match[1]}` : `Account ${match[1]}`
 }
 
-type LocalizedBackendMessage = readonly [chinese: string, english: string]
+// 第三项是界面显示用的中文：前两项要与后端原文逐字一致才能匹配，措辞改进只能放这里。
+type LocalizedBackendMessage = readonly [chinese: string, english: string, display?: string]
 
 // 管理 API 以前直接返回中文，当前版本改为英文。错误响应仍是纯文本以兼容已有调用方，
 // 因此前端在这里识别两代稳定文案，而不是把服务端输出直接塞进中英文界面。
@@ -39,27 +40,27 @@ const FIXED_BACKEND_MESSAGES: readonly LocalizedBackendMessage[] = [
   ['密码错误', 'wrong password'],
   ['已设置管理密码', 'an admin password is already set'],
   ['密码至少 4 位', 'password must be at least 4 characters'],
-  ['管理密码由环境变量接管，无法在网页修改', 'the admin password is managed by an environment variable and cannot be changed from the web UI'],
+  ['管理密码由环境变量接管，无法在网页修改', 'the admin password is managed by an environment variable and cannot be changed from the web UI', '管理密码由环境变量管理，无法在控制台修改'],
   ['凭证不存在', 'credential not found'],
-  ['设备绑定不存在（可能已过期或已换到其它账号）', 'device binding not found (it may have expired or moved to another credential)'],
+  ['设备绑定不存在（可能已过期或已换到其它账号）', 'device binding not found (it may have expired or moved to another credential)', '设备绑定不存在（可能已过期或已转至其他账号）'],
   ['请至少选择一个账号', 'select at least one credential'],
   ['名称不能为空', 'the name must not be empty'],
   ['请填写要测试的模型名', 'specify the model name to test'],
-  ['接入 Key 已由环境变量 LUBAN_API_KEY 接管，无法在网页修改', 'the inbound key is managed by the LUBAN_API_KEY environment variable and cannot be changed from the web UI'],
-  ['这次登录已过期或未找到，请重新点「添加账号」生成授权链接', 'this login attempt expired or was not found; click \'Add account\' again to generate a new authorization link'],
+  ['接入 Key 已由环境变量 LUBAN_API_KEY 接管，无法在网页修改', 'the inbound key is managed by the LUBAN_API_KEY environment variable and cannot be changed from the web UI', '接入 Key 由环境变量 LUBAN_API_KEY 管理，无法在控制台修改'],
+  ['这次登录已过期或未找到，请重新点「添加账号」生成授权链接', 'this login attempt expired or was not found; click \'Add account\' again to generate a new authorization link', '本次登录已过期或不存在，请重新点击「添加账号」生成授权链接'],
   ['粘贴内容格式应为 `code#state`', 'the pasted value must look like `code#state`'],
-  ['state 不匹配，可能存在 CSRF 或粘贴错误；请重新登录', 'state mismatch, possibly CSRF or a bad paste; please log in again'],
+  ['state 不匹配，可能存在 CSRF 或粘贴错误；请重新登录', 'state mismatch, possibly CSRF or a bad paste; please log in again', 'state 不匹配，可能遭遇 CSRF 攻击或粘贴有误，请重新登录'],
   ['无效的 API Key', 'invalid API key'],
   ['缺少有效的设备身份（metadata.user_id）', 'missing a usable device identity (metadata.user_id)'],
-  ['所有凭证的设备数均已达上限，暂无可用名额', 'all credentials have reached their device limits; no slot is available'],
-  ['没有可用凭证，请先登录', 'no available credentials; add an account first'],
-  ['已试过的凭证之外没有其它可用账号', 'no other available credentials remain after excluding those already tried'],
-  ['token 刷新仍在后台完成', 'the token refresh continues in the background'],
-  ['等待上游响应未完成', 'still waiting on the upstream response'],
+  ['所有凭证的设备数均已达上限，暂无可用名额', 'all credentials have reached their device limits; no slot is available', '所有账号的设备数均已达上限，暂无可用名额'],
+  ['没有可用凭证，请先登录', 'no available credentials; add an account first', '暂无可用账号，请先添加账号'],
+  ['已试过的凭证之外没有其它可用账号', 'no other available credentials remain after excluding those already tried', '除已尝试的账号外，没有其他可用账号'],
+  ['token 刷新仍在后台完成', 'the token refresh continues in the background', 'token 刷新仍在后台进行'],
+  ['等待上游响应未完成', 'still waiting on the upstream response', '仍在等待上游响应'],
 ]
 
-function inLanguage([chinese, english]: LocalizedBackendMessage, language: Language): string {
-  return language === 'zh-CN' ? chinese : english
+function inLanguage([chinese, english, display]: LocalizedBackendMessage, language: Language): string {
+  return language === 'zh-CN' ? (display ?? chinese) : english
 }
 
 function joinBackendDetail(prefix: string, detail: string, language: Language): string {
@@ -100,9 +101,9 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
     ? localizeKnownBackendMessage(detail, language, depth + 1)
     : detail
 
-  for (const [chinese, english] of [
+  for (const entry of [
     ['请求 token 端点失败', 'request to the token endpoint failed'],
-    ['取 token 失败', 'failed to get a token'],
+    ['取 token 失败', 'failed to get a token', '获取 token 失败'],
     ['token 刷新任务异常退出', 'the token refresh task died'],
     ['读取上游响应体失败', 'failed to read the upstream response body'],
     ['无法定位用户主目录', 'could not determine the user home directory'],
@@ -117,8 +118,9 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
     ['清理无主设备费用失败', 'failed to purge orphaned device cost entries'],
     ['迁移 credentials 为 AUTOINCREMENT 失败', 'failed to migrate credentials to AUTOINCREMENT'],
   ] as const) {
+    const [chinese, english] = entry
     const detail = colonDetail(message, chinese) ?? colonDetail(message, english)
-    if (detail != null) return joinBackendDetail(inLanguage([chinese, english], language), localizeDetail(detail), language)
+    if (detail != null) return joinBackendDetail(inLanguage(entry, language), localizeDetail(detail), language)
   }
 
   const tokenEndpoint = message.match(/^(?:token endpoint returned|token 端点返回)\s+(.+?)(?:\s*[:：]\s*(.*))?$/i)

@@ -299,7 +299,7 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
 
           {!hasTraffic ? (
             <p className="rounded-xl border px-4 py-8 text-center text-xs text-muted-foreground">
-              {t('这段时间没有请求，换一个更长的时间范围看看。', 'No requests in this period; try a longer range.')}
+              {t('所选时间范围内没有请求，请尝试选择更长的时间范围。', 'No requests in this period; try a longer range.')}
             </p>
           ) : view === 'chart' ? (
             <StatsColumns slots={slots} metric={metric} granularity={preset.granularity} refetching={refetching} />
@@ -405,7 +405,7 @@ function StatsColumns({
   const step = Math.max(1, Math.ceil(slots.length / 7))
   const labels = slots.map((s) => slotLabel(s.ts, granularity))
   const detailOf = (s: StatsSlot) => {
-    if (!s.hasTraffic) return t('这个时段没有请求', 'No requests in this period')
+    if (!s.hasTraffic) return t('该时段没有请求', 'No requests in this period')
     return t(
       `${s.requests.toLocaleString(locale)} 条（失败 ${s.errors.toLocaleString(locale)}）· ${formatTokens(totalTokens(s))} token · ${formatUsd(s.cost_usd)}`,
       `${s.requests.toLocaleString(locale)} req (${s.errors.toLocaleString(locale)} failed) · ${formatTokens(totalTokens(s))} tokens · ${formatUsd(s.cost_usd)}`,
@@ -626,7 +626,7 @@ function StatsBreakdown({
       </div>
       {rows.length === 0 ? (
         <p className="rounded-xl border px-4 py-6 text-center text-xs text-muted-foreground">
-          {t('这段时间没有请求', 'No requests in this period')}
+          {t('所选时间范围内没有请求', 'No requests in this period')}
         </p>
       ) : (
         <div className={cn('max-h-80 overflow-auto rounded-xl border transition-opacity', refetching && 'opacity-60')}>

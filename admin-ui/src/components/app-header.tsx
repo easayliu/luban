@@ -45,7 +45,7 @@ export function AppHeader({
   onNavigateHome?: () => void
 }) {
   const { t } = useI18n()
-  const label = homeLabel ?? t('回到账号池', 'Back to the account pool')
+  const label = homeLabel ?? t('返回账号池', 'Back to the account pool')
   const brand = (
     <>
       <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
@@ -168,7 +168,7 @@ function ThemeMenuItem() {
 
   return (
     <MenuItem
-      aria-label={t(`外观：${name(mode)}，点击切换到${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)}
+      aria-label={t(`外观：${name(mode)}，点击切换为${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)}
       closeOnClick={false}
       onClick={() => {
         setMode(next)

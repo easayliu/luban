@@ -369,7 +369,7 @@ function App() {
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        homeLabel={t('回到顶部', 'Back to top')}
+        homeLabel={t('返回顶部', 'Back to top')}
         onNavigateHome={scrollToTop}
         actions={
           <>
@@ -391,7 +391,7 @@ function App() {
               className="max-sm:size-10 max-sm:px-0"
               disabled={isBootstrapping}
               size="sm"
-              title={t('按请求 ID 查流水', 'Look up a request by ID')}
+              title={t('按请求 ID 查询请求记录', 'Look up a request by ID')}
               variant="outline"
               onClick={() => setLookupOpen(true)}
             >

@@ -49,7 +49,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
           {/* 提到 text-sm semibold：原来是 text-xs 的灰字，比同一行那两枚胶囊按钮还小还淡，
               标题被自己的控件压了过去。现在是「区块标题 14px / 表头 10px」两档。 */}
           <h3 className="text-sm font-semibold tracking-tight">
-            {kind === 'latency' ? t('谁在拖慢', 'Who is slow') : t('谁没命中', 'Who misses the cache')}
+            {kind === 'latency' ? t('延迟拆分', 'Latency breakdown') : t('缓存命中拆分', 'Cache hit breakdown')}
           </h3>
           {query.isFetching && !query.isPending && <Spinner />}
         </div>
@@ -80,7 +80,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
         <Skeleton className="h-32 w-full rounded-xl" />
       ) : rows.length === 0 ? (
         <p className="rounded-xl border px-4 py-6 text-center text-xs text-muted-foreground">
-          {t('这段时间没有请求', 'No requests in this period')}
+          {t('所选时间范围内没有请求', 'No requests in this period')}
         </p>
       ) : (
         <div className={cn('max-h-64 overflow-auto rounded-xl border transition-opacity', query.isFetching && !query.isPending && 'opacity-60')}>
@@ -99,10 +99,10 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                 ) : (
                   <>
                     <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-                    <th scope="col" className="text-end">{t('命中', 'Cached')}</th>
-                    <th scope="col" className="text-end">{t('写入', 'Written')}</th>
-                    <th scope="col" className="text-end">{t('未缓存', 'Uncached')}</th>
-                    <th scope="col" className="text-end">{t('省下', 'Saved')}</th>
+                    <th scope="col" className="text-end">{t('缓存读', 'Cache read')}</th>
+                    <th scope="col" className="text-end">{t('缓存写', 'Cache write')}</th>
+                    <th scope="col" className="text-end">{t('输入', 'Input')}</th>
+                    <th scope="col" className="text-end">{t('节省', 'Saved')}</th>
                   </>
                 )}
               </tr>
@@ -119,7 +119,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
               <tfoot>
                 <tr className="[&>*]:border-t [&>*]:bg-surface-subtle [&>*]:px-3 [&>*]:py-1.5 [&>*]:font-medium">
                   <th className="text-start" scope="row">{t('合计', 'Total')}</th>
-                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 命中 / 写入 / 未缓存 / 省下。
+                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 缓存读 / 缓存写 / 输入 / 节省。
                       合计只有「省下」这一列有值，中间 5 列留空。 */}
                   <td colSpan={5} />
                   <td className="text-end">
@@ -138,12 +138,12 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                       <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
                         {query.data.cache_saved_usd_total >= 0
                           ? t(
-                              '命中部分按 0.1 倍计价省下的金额，减去写入部分按 1.25 倍多付的金额。',
-                              'Savings from cached input billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
+                              '缓存读按 0.1 倍计价节省的金额，减去缓存写按 1.25 倍计价多付的金额。',
+                              'Savings from cache reads billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
                             )
                           : t(
-                              '写入多付的金额超过了命中省下的金额，通常是前缀每轮都在变。',
-                              'The extra paid for cache writes exceeded the cache savings; the prefix is usually changing every turn.',
+                              '缓存写多付的金额超过了缓存读节省的金额，通常是因为前缀每轮都在变化。',
+                              'The extra paid for cache writes exceeded the savings from cache reads; the prefix is usually changing every turn.',
                             )}
                       </TooltipPopup>
                     </Tooltip>
@@ -182,7 +182,7 @@ function BreakdownTr({
     <tr
       className="cursor-pointer hover:bg-muted/40 [&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0"
       onClick={onOpen}
-      title={t('点击看这一组最近的请求', 'Click to see recent requests in this group')}
+      title={t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
     >
       <td className="max-w-56">
         <span className="flex min-w-0 items-center gap-1.5">

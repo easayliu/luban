@@ -14,7 +14,7 @@ function slotReadout(
   const when = granularity === 'hour' ? `${day} ${p(d.getHours())}:00` : day
   const axis = granularity === 'hour' ? `${p(d.getHours())}:00` : day
   if (!slot.hasTraffic) {
-    return { when, axis, rate: '—', detail: t('这个时段没有请求', 'No requests in this period') }
+    return { when, axis, rate: '—', detail: t('该时段没有请求', 'No requests in this period') }
   }
   const uncached = uncachedTokens(slot)
   return {
@@ -22,8 +22,8 @@ function slotReadout(
     axis,
     rate: formatPercent(cacheHitRate(slot.inputTokens, slot.cachedTokens)),
     detail: t(
-      `命中 ${slot.cachedTokens.toLocaleString(locale)} · 写入 ${slot.writtenTokens.toLocaleString(locale)} · 未缓存 ${uncached.toLocaleString(locale)} token`,
-      `${slot.cachedTokens.toLocaleString(locale)} cached · ${slot.writtenTokens.toLocaleString(locale)} written · ${uncached.toLocaleString(locale)} uncached tokens`,
+      `缓存读 ${slot.cachedTokens.toLocaleString(locale)} · 缓存写 ${slot.writtenTokens.toLocaleString(locale)} · 输入 ${uncached.toLocaleString(locale)} token`,
+      `Cache read ${slot.cachedTokens.toLocaleString(locale)} · Cache write ${slot.writtenTokens.toLocaleString(locale)} · Input ${uncached.toLocaleString(locale)} tokens`,
     ),
   }
 }
@@ -252,9 +252,9 @@ export function CacheHitTable({
               {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}
             </th>
             <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-            <th scope="col" className="text-end">{t('命中', 'Cached')}</th>
-            <th scope="col" className="text-end">{t('写入', 'Written')}</th>
-            <th scope="col" className="text-end">{t('未缓存', 'Uncached')}</th>
+            <th scope="col" className="text-end">{t('缓存读', 'Cache read')}</th>
+            <th scope="col" className="text-end">{t('缓存写', 'Cache write')}</th>
+            <th scope="col" className="text-end">{t('输入', 'Input')}</th>
             <th scope="col" className="text-end">{t('输入合计', 'Input total')}</th>
           </tr>
         </thead>
@@ -305,14 +305,14 @@ export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; cl
   )
 }
 
-/** 三段写全：命中 · 写入 · 未缓存。 */
+/** 三段写全：缓存读 · 缓存写 · 输入。 */
 export function cacheSplitText(
   p: { input_tokens: number; cached_tokens: number; written_tokens: number },
   t: (zh: string, en: string) => string,
 ): string {
   const uncached = Math.max(0, p.input_tokens - p.cached_tokens - p.written_tokens)
   return t(
-    `命中 ${formatTokens(p.cached_tokens)} · 写入 ${formatTokens(p.written_tokens)} · 未缓存 ${formatTokens(uncached)}`,
-    `${formatTokens(p.cached_tokens)} cached · ${formatTokens(p.written_tokens)} written · ${formatTokens(uncached)} uncached`,
+    `缓存读 ${formatTokens(p.cached_tokens)} · 缓存写 ${formatTokens(p.written_tokens)} · 输入 ${formatTokens(uncached)}`,
+    `Cache read ${formatTokens(p.cached_tokens)} · Cache write ${formatTokens(p.written_tokens)} · Input ${formatTokens(uncached)}`,
   )
 }

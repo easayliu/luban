@@ -198,7 +198,7 @@ export function ProxyBatchImportDialog({
         )
       }
       const r = results[item.url]
-      if (r && !r.ok) return <Badge size="sm" variant="error">{t('测试不通过', 'Test failed')}</Badge>
+      if (r && !r.ok) return <Badge size="sm" variant="error">{t('测试未通过', 'Test failed')}</Badge>
       if (r?.ok) return <Badge size="sm" variant="success">{t('可用', 'Working')}</Badge>
     }
     return <Badge size="sm" variant="success">{t('可导入', 'Ready')}</Badge>
@@ -231,7 +231,7 @@ export function ProxyBatchImportDialog({
                   `${importable.length} to import, ${skipped} skipped`,
                 )
               : t(
-                  '一行一条：只写地址，或「名称 地址」（空格、Tab 或逗号隔开）。名称留空自动命名，重复与池中已有的地址会跳过。',
+                  '每行一条，格式为「地址」或「名称 地址」（以空格、Tab 或逗号分隔）。未填写名称时自动命名；重复的地址与代理池中已有的地址将被跳过。',
                   'One per line: a URL, or "name URL" (separated by a space, tab or comma). Empty names are auto-generated; duplicates and addresses already in the pool are skipped.',
                 )}
           </DialogDescription>
@@ -277,11 +277,11 @@ export function ProxyBatchImportDialog({
                 autoComplete="off"
                 rows={10}
                 className="font-mono text-xs"
-                aria-label={t('代理地址，一行一条', 'Proxy URLs, one per line')}
+                aria-label={t('代理地址，每行一条', 'Proxy URLs, one per line')}
               />
               <label className="flex cursor-pointer items-center gap-2 text-sm">
                 <Checkbox checked={testFirst} onCheckedChange={(next) => setTestFirst(next === true)} />
-                {t('导入前先测试，只导入可用的', 'Test before importing and only import working proxies')}
+                {t('导入前先测试，仅导入可用代理', 'Test before importing and only import working proxies')}
               </label>
             </>
           )}

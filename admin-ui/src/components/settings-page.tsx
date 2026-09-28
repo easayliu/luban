@@ -44,7 +44,7 @@ export function SettingsPage({
     {
       key: 'access',
       label: t('客户端接入', 'Client access'),
-      navDescription: t('地址、Key 与配置片段', 'Endpoint, key, and setup'),
+      navDescription: t('地址、Key 与接入片段', 'Endpoint, key, and setup'),
       icon: CableIcon,
     },
     {

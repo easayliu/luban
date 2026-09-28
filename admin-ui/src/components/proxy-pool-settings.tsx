@@ -231,7 +231,7 @@ export function ProxyPoolSettingsContent() {
               id="proxy-pool-add-label"
               value={addLabel}
               onChange={(event) => setAddLabel(event.target.value)}
-              placeholder={t('留空自动命名', 'Auto-named if empty')}
+              placeholder={t('留空则自动命名', 'Auto-named if empty')}
               size="sm"
             />
           </div>
@@ -285,7 +285,7 @@ export function ProxyPoolSettingsContent() {
             <p className="text-xs text-muted-foreground tabular-nums">
               {testedCount > 0
                 ? t(
-                    `共 ${proxies.length} 条 · 已测 ${testedCount} 条，${okCount} 条可用`,
+                    `共 ${proxies.length} 条 · 已测试 ${testedCount} 条，其中 ${okCount} 条可用`,
                     `${proxies.length} total · ${testedCount} tested, ${okCount} working`,
                   )
                 : t(`共 ${proxies.length} 条`, `${proxies.length} total`)}
@@ -319,7 +319,7 @@ export function ProxyPoolSettingsContent() {
                 onClick={() => setOnlyFailed((v) => !v)}
               >
                 <FilterIcon />
-                {filtering ? t('显示全部', 'Show all') : t('只看失败', 'Only failed')}
+                {filtering ? t('显示全部', 'Show all') : t('仅显示失败项', 'Only failed')}
               </Button>
               <Button
                 size="sm"
@@ -365,10 +365,10 @@ export function ProxyPoolSettingsContent() {
               <AlertDialogDescription>
                 {failedInUse.length > 0
                   ? t(
-                      `其中 ${failedInUse.length} 条仍被 ${failedInUseAccounts} 个账号使用。删除只是从代理池移除，这些账号的代理设置不变，仍会走这条不通的代理；需要的话先在「使用账号」里把它们换掉。`,
+                      `其中 ${failedInUse.length} 条仍被 ${failedInUseAccounts} 个账号使用。删除仅会将其从代理池移除，这些账号的代理设置保持不变，仍将使用这些不可用的代理；如需更换，请先在「使用账号」中调整。`,
                       `${failedInUse.length} of them ${failedInUse.length === 1 ? 'is' : 'are'} still used by ${failedInUseAccounts} account${failedInUseAccounts === 1 ? '' : 's'}. Deleting only removes them from the pool; those accounts keep using the unreachable proxy. Reassign them under “Manage accounts” first if needed.`,
                     )
-                  : t('这些代理没有账号在用，删除后从代理池移除。', 'No accounts use these proxies. They will be removed from the pool.')}
+                  : t('这些代理未被任何账号使用，删除后将从代理池移除。', 'No accounts use these proxies. They will be removed from the pool.')}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <ul className="max-h-48 space-y-1 overflow-y-auto px-4 pb-4 text-sm sm:px-6" role="list">
@@ -377,7 +377,7 @@ export function ProxyPoolSettingsContent() {
                   <span className="truncate">{p.label}</span>
                   {p.credential_count > 0 && (
                     <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                      {t(`${p.credential_count} 个账号在用`, `${p.credential_count} in use`)}
+                      {t(`${p.credential_count} 个账号使用中`, `${p.credential_count} in use`)}
                     </span>
                   )}
                 </li>
@@ -402,7 +402,7 @@ export function ProxyPoolSettingsContent() {
 
         {proxies.length === 0 ? (
           <p className="px-4 py-4 text-center sm:px-5 text-sm text-muted-foreground">
-            {t('代理池还没有代理地址。在上方填写地址即可添加第一条，名称可留空。', 'The proxy pool is empty. Enter a URL above to add the first proxy; the name is optional.')}
+            {t('代理池中暂无代理。在上方填写地址即可添加第一条，名称可留空。', 'The proxy pool is empty. Enter a URL above to add the first proxy; the name is optional.')}
           </p>
         ) : (
           <ul className="divide-y" role="list">
@@ -609,11 +609,11 @@ function ProxyRow({
             <AlertDialogDescription>
               {proxy.credential_count > 0
                 ? t(
-                    `当前有 ${proxy.credential_count} 个账号正在使用这条代理。删除后这些账号的代理设置保持不变，只是这条代理不再出现在代理池中。`,
+                    `当前有 ${proxy.credential_count} 个账号正在使用此代理。删除后，这些账号的代理设置保持不变，该代理仅从代理池中移除。`,
                     `${proxy.credential_count} account${proxy.credential_count === 1 ? ' is' : 's are'} currently using this proxy. Deleting it won’t change those accounts’ proxy settings, but it will no longer appear in the pool.`,
                   )
                 : t(
-                    '确定从代理池中删除这条记录？',
+                    '确定从代理池中删除此代理？',
                     'Remove this entry from the proxy pool?',
                   )}
             </AlertDialogDescription>

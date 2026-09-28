@@ -101,7 +101,7 @@ export function ProxyAccountsDialog({
   })
 
   const currentProxyText = (url: string | null) => {
-    if (!url) return t('当前直连', 'Currently direct')
+    if (!url) return t('当前为直连', 'Currently direct')
     const name = pool.find((p) => p.url === url)?.label ?? proxyMaskedUrl(url)
     return t(`当前：${name}`, `Currently: ${name}`)
   }
@@ -130,7 +130,7 @@ export function ProxyAccountsDialog({
             </div>
           ) : creds.length === 0 ? (
             <p className="py-6 text-center text-sm text-muted-foreground">
-              {t('还没有账号。', 'No accounts yet.')}
+              {t('暂无账号。', 'No accounts yet.')}
             </p>
           ) : (
             <>
@@ -185,7 +185,7 @@ export function ProxyAccountsDialog({
                 <Alert>
                   <AlertDescription>
                     {t(
-                      `取消勾选的 ${toRemove.length} 个账号会改回直连，出站流量将使用本机真实 IP。`,
+                      `取消勾选的 ${toRemove.length} 个账号将恢复直连，出站流量将使用本机真实 IP。`,
                       `${toRemove.length} unchecked account${toRemove.length === 1 ? '' : 's'} will switch to a direct connection and use this server’s real IP.`,
                     )}
                   </AlertDescription>

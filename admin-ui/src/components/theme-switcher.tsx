@@ -24,7 +24,7 @@ export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
     light: t('浅色', 'Light'),
     dark: t('深色', 'Dark'),
   })[value]
-  const label = t(`外观：${name(mode)}，点击切换到${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)
+  const label = t(`外观：${name(mode)}，点击切换为${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)
 
   return (
     <Button

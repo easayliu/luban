@@ -48,7 +48,7 @@ const RPM_MODE_ITEMS = [
 /** 提前停调度阈值的三态：与后端取值一一对应（null / 0 / 1..100），5h 与 7d 两档各用一份。 */
 const QUOTA_MODE_ITEMS = [
   { value: 'default', chinese: '跟随全局', english: 'Use global' },
-  { value: 'off', chinese: '不提前停', english: 'Off' },
+  { value: 'off', chinese: '停用', english: 'Off' },
   { value: 'custom', chinese: '独立阈值', english: 'Custom' },
 ] as const
 type QuotaMode = (typeof QUOTA_MODE_ITEMS)[number]['value']
@@ -61,7 +61,7 @@ function quotaPctOf(mode: QuotaMode, custom: number): number | null {
 
 function describeQuotaPct(pct: number | null, t: (zh: string, en: string) => string): string {
   if (pct === null) return t('跟随全局', 'global')
-  if (pct <= 0) return t('不提前停', 'off')
+  if (pct <= 0) return t('停用', 'off')
   return `${pct}%`
 }
 
@@ -181,7 +181,7 @@ export function BatchActionsBar({
   const applyPriority = useMutation({
     mutationFn: (p: number) => setPriorities(ids, p),
     onSuccess: (_r, p) => notify(t(
-      `已把 ${formattedCount} 个账号设为 P${p}`,
+      `已将 ${formattedCount} 个账号设为 P${p}`,
       `Set ${englishAccountCount} to P${p}`,
     )),
     onError,
@@ -191,15 +191,15 @@ export function BatchActionsBar({
     onSuccess: (_r, v) =>
       notify(
         v > 0 ? t(
-          `已把 ${formattedCount} 个账号的设备上限设为 ${v.toLocaleString(locale)}`,
+          `已将 ${formattedCount} 个账号的设备上限设为 ${v.toLocaleString(locale)}`,
           `Set the device limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已把 ${formattedCount} 个账号改为跟随全局默认设备上限`,
+            `已将 ${formattedCount} 个账号改为跟随全局默认设备上限`,
             `Set ${englishAccountCount} to use the global default device limit`,
           )
             : t(
-              `已把 ${formattedCount} 个账号设为不限设备数`,
+              `已将 ${formattedCount} 个账号设为不限设备数`,
               `Set ${englishAccountCount} to unlimited devices`,
             ),
       ),
@@ -210,15 +210,15 @@ export function BatchActionsBar({
     onSuccess: (_r, v) =>
       notify(
         v > 0 ? t(
-          `已把 ${formattedCount} 个账号的模拟会话上限设为 ${v.toLocaleString(locale)}`,
+          `已将 ${formattedCount} 个账号的模拟会话上限设为 ${v.toLocaleString(locale)}`,
           `Set the session limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已把 ${formattedCount} 个账号改为跟随全局默认模拟会话上限`,
+            `已将 ${formattedCount} 个账号改为跟随全局默认模拟会话上限`,
             `Set ${englishAccountCount} to use the global default session limit`,
           )
             : t(
-              `已把 ${formattedCount} 个账号设为不限模拟会话数`,
+              `已将 ${formattedCount} 个账号设为不限模拟会话数`,
               `Set ${englishAccountCount} to unlimited sessions`,
             ),
       ),
@@ -229,15 +229,15 @@ export function BatchActionsBar({
     onSuccess: (_r, v) =>
       notify(
         v > 0 ? t(
-          `已把 ${formattedCount} 个账号的 RPM 上限设为 ${v.toLocaleString(locale)}`,
+          `已将 ${formattedCount} 个账号的 RPM 上限设为 ${v.toLocaleString(locale)}`,
           `Set the RPM limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已把 ${formattedCount} 个账号改为跟随全局默认 RPM 上限`,
+            `已将 ${formattedCount} 个账号改为跟随全局默认 RPM 上限`,
             `Set ${englishAccountCount} to use the global default RPM limit`,
           )
             : t(
-              `已把 ${formattedCount} 个账号设为不限 RPM`,
+              `已将 ${formattedCount} 个账号设为不限 RPM`,
               `Set ${englishAccountCount} to unlimited RPM`,
             ),
       ),
@@ -248,7 +248,7 @@ export function BatchActionsBar({
       setCredentialQuotaPausePcts(ids, pct, pct7d),
     onSuccess: (_r, { pct, pct7d }) =>
       notify(t(
-        `已把 ${formattedCount} 个账号的提前停调度阈值设为：5 小时 ${describeQuotaPct(pct, t)} · 7 天 ${describeQuotaPct(pct7d, t)}`,
+        `已将 ${formattedCount} 个账号的提前暂停调度阈值设为：5 小时 ${describeQuotaPct(pct, t)} · 7 天 ${describeQuotaPct(pct7d, t)}`,
         `Set the early pause threshold for ${englishAccountCount}: 5h ${describeQuotaPct(pct, t)} · 7d ${describeQuotaPct(pct7d, t)}`,
       )),
     onError,
@@ -259,11 +259,11 @@ export function BatchActionsBar({
       notify(
         url
           ? t(
-            `已把 ${formattedCount} 个账号的出站代理设为所选地址`,
+            `已将 ${formattedCount} 个账号的出站代理设为所选地址`,
             `Set the outbound proxy for ${englishAccountCount}`,
           )
           : t(
-            `已把 ${formattedCount} 个账号改回直连`,
+            `已将 ${formattedCount} 个账号改回直连`,
             `Set ${englishAccountCount} to direct connection`,
           ),
       ),
@@ -474,8 +474,8 @@ export function BatchActionsBar({
 
             {/* 提前停调度阈值：5h / 7d 两档各自三态，一次整份覆盖所选账号（覆盖设置页的全局值）。 */}
             <SettingRow
-              title={t('提前停调度阈值', 'Early pause threshold')}
-              hint={t('使用率达到阈值即移出调度池；两个窗口一起覆盖全局设置', 'Removed from the scheduling pool at this utilization; both windows override the global setting')}
+              title={t('提前暂停调度阈值', 'Early pause threshold')}
+              hint={t('使用率达到阈值时移出调度池；两个窗口的设置将一并覆盖全局值', 'Removed from the scheduling pool at this utilization; both windows override the global setting')}
               action={
                 <Button size="sm" loading={applyQuotaPause.isPending} disabled={busy} onClick={() => applyQuotaPause.mutate({ pct: quotaPct, pct7d: quotaPct7d })}>
                   {t('应用', 'Apply')}

@@ -103,7 +103,7 @@ export function CredentialProxyDialog({
             <p className="text-muted-foreground text-xs leading-relaxed">
               {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
               <ClampedDescription text={t(
-                '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码中的特殊字符需要 percent-encode，如 # 写成 %23）。留空表示直连。填写 socks5:// 时，保存会自动改成 socks5h://，由代理端解析域名，而不是在本机解析。本机解析会把上游域名泄露给本地 DNS，解析出的也是离你最近的 IP，而且不少住宅代理只接受域名形式，收到 IP 形式的请求会直接断开连接。不再支持 socks4/socks4a：SOCKS4 协议无法携带用户名和密码，填写的认证信息会被静默丢弃。',
+                '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码中的特殊字符需进行 percent-encode，如 # 写作 %23）。留空表示直连。填写 socks5:// 时，保存时会自动改为 socks5h://，由代理端而非本机解析域名。本机解析会将上游域名泄露给本地 DNS，解析结果也是距离本机最近的 IP；此外，不少住宅代理只接受域名形式的请求，收到 IP 形式的请求会直接断开连接。不再支持 socks4/socks4a：SOCKS4 协议无法携带用户名和密码，填写的认证信息会被静默丢弃。',
                 'Supports socks5://, socks5h://, http://, https://, optionally with user:pass@ (percent-encode special characters in the password, e.g. # as %23). Leave empty for a direct connection. socks5:// is rewritten to socks5h:// on save, so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright. socks4/socks4a are no longer supported: the SOCKS4 protocol cannot carry a username and password, so credentials would be silently dropped.',
               )} />
             </p>
@@ -115,7 +115,7 @@ export function CredentialProxyDialog({
             <GlobeIcon />
             <AlertDescription>
               {t(
-                '配置后，该账号的全部出站流量都经过此代理：转发、token 刷新、账号信息与连通性测试。代理不可用时，该账号的请求会直接失败，不会退回直连，否则会把真实 IP 暴露给上游。',
+                '配置后，该账号的全部出站流量（转发、token 刷新、账号信息与连通性测试）均经由此代理。代理不可用时，该账号的请求将直接失败，而不会回退为直连，以免向上游暴露真实 IP。',
                 "Once set, all of this account's outbound traffic goes through it: forwarding, token refresh, profile, and connectivity tests. If the proxy is unusable the account's requests fail outright rather than falling back to a direct connection, which would expose your real IP upstream.",
               )}
             </AlertDescription>

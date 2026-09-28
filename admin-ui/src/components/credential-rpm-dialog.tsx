@@ -159,7 +159,7 @@ export function CredentialRpmDialog({
             <AlertDescription>
               {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
               <ClampedDescription text={t(
-                '达到上限后：尚未确定账号的请求会自动分流到其他账号；已绑定到该账号的设备则直接收到 429 与 retry-after，等窗口内腾出名额后再继续（中途换账号会导致改绑，该会话之后每一轮都要先遇到一次 thinking 签名 400）。计数保存在服务端内存中，重启即清零。',
+                '达到上限后，尚未分配账号的请求会自动分流到其他账号；已绑定该账号的设备则直接收到 429 及 retry-after，待窗口内释放名额后再继续（若中途更换账号，设备会被改绑，该会话此后的每一轮都会先遇到一次 thinking 签名 400）。计数保存在服务端内存中，重启后清零。',
                 'Once the limit is reached: requests not yet pinned to an account spill over to other accounts, while devices already bound to this account get a 429 with retry-after and resume when the window frees a slot (swapping accounts mid-session rebinds the device, which costs a thinking-signature 400 on every later turn of that session). Counts live in server memory and reset on restart.',
               )} />
             </AlertDescription>

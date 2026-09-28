@@ -64,7 +64,7 @@ import {
   fablePoolWindow,
   isOrgAccount,
   METER_FILL,
-  proxyLabelParts,
+  useProxyName,
   proxyMaskedUrl,
   quotaLevel,
   quotaPercentage,
@@ -149,11 +149,11 @@ function representativeLabel(claim: string, t: Translate): ReactNode {
   }
 }
 
-/** 提前停调度阈值的三态（null 跟随全局、0 不停、1..100 独立）。 */
+/** 提前停调度阈值的三态（null 跟随全局、0 停用、1..100 独立）。 */
 function pausePolicyText(pct: number | null, effective: number, t: Translate): string {
-  const effectiveText = effective > 0 ? `${effective}%` : t('不停', 'off')
+  const effectiveText = effective > 0 ? `${effective}%` : t('停用', 'off')
   if (pct == null) return t(`跟随全局（${effectiveText}）`, `Global (${effectiveText})`)
-  if (pct === 0) return t('不停', 'Off')
+  if (pct === 0) return t('停用', 'Off')
   return t(`${pct}%（自定义）`, `${pct}% (custom)`)
 }
 
@@ -202,7 +202,7 @@ export function CredentialDetailPage({
       <Empty className="py-16">
         <EmptyHeader>
           <EmptyMedia variant="icon"><UserRoundSearchIcon /></EmptyMedia>
-          <EmptyTitle className="text-base">{t('找不到这个账号', 'Account not found')}</EmptyTitle>
+          <EmptyTitle className="text-base">{t('未找到该账号', 'Account not found')}</EmptyTitle>
           <EmptyDescription>
             {t(
               `账号 #${id} 不存在，可能已被删除。`,
@@ -295,7 +295,7 @@ function StatusBanner({ cred, status }: { cred: Credential; status: CredentialSt
           <p>{status.detail}</p>
           {raw && (
             <div className="space-y-1">
-              <p className="text-xs font-medium">{t('上游原话', 'Upstream message')}</p>
+              <p className="text-xs font-medium">{t('上游原始信息', 'Upstream message')}</p>
               <p className="rounded-md bg-muted/64 px-2.5 py-2 font-mono text-xs [overflow-wrap:anywhere]">{raw}</p>
             </div>
           )}
@@ -689,7 +689,7 @@ function StatsRow({
       <OverviewMetric
         label={t('被封停次数', 'Auto-disables')}
         value={cred.ban_count.toLocaleString(locale)}
-        statusHint={t('自动封停的累计次数，解封不清零', 'Cumulative automatic disables; re-enabling does not reset it')}
+        statusHint={t('自动封停的累计次数，解封后不清零', 'Cumulative automatic disables; re-enabling does not reset it')}
         icon={ShieldAlertIcon}
         tone={cred.ban_count > 0 ? 'bad' : 'neutral'}
       />
@@ -740,8 +740,8 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
       panelClassName="lg:flex-1"
       description={snapshot
         ? t('来自上游限流头的最新快照。', 'Latest snapshot from the upstream rate-limit headers.')
-        : t('还没有额度快照：该账号转发过带限流头的请求后才会出现。', 'No usage snapshot yet: it appears once the account forwards a request that carries rate-limit headers.')}
-      mobileDescription={snapshot ? undefined : t('还没有额度快照', 'No usage snapshot yet')}
+        : t('暂无额度快照：该账号转发带限流头的请求后才会生成。', 'No usage snapshot yet: it appears once the account forwards a request that carries rate-limit headers.')}
+      mobileDescription={snapshot ? undefined : t('暂无额度快照', 'No usage snapshot yet')}
       // 更新时刻挂在标题右侧，与卡片「用量限制 … 🕐 更新于 刚刚」同一个位置：它是这一整块数据的
       // 时间戳，不是一句说明。原来在手机上它单独占标题下一整行（四个字），桌面上又埋在一长句说明里。
       action={snapshot ? (
@@ -794,8 +794,8 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
                         <span className="font-mono text-xs font-normal text-muted-foreground">7d_oi</span>
                         <InfoHint>
                           {t(
-                            '上游只报使用率与重置时刻，没有按窗口统计的请求数与费用；fable 的用量看用量统计的按模型拆分。满了只影响 fable，账号其余模型照常。',
-                            'Upstream reports only utilisation and reset, with no per-window request or cost totals; see fable usage in the by-model breakdown. When full only fable is affected.',
+                            '上游仅报告使用率与重置时刻，不提供按窗口统计的请求数与费用；fable 的用量请在用量统计的按模型拆分中查看。额度用尽后仅影响 fable，该账号其余模型不受影响。',
+                            'Upstream reports only utilisation and reset, with no per-window request or cost totals; see fable usage in the by-model breakdown. Once exhausted, only fable is affected.',
                           )}
                         </InfoHint>
                       </span>
@@ -848,7 +848,7 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
                 {/* 解释收进 ⓘ：看懂一次就够了，不必每次都占一行。 */}
                 <InfoHint>
                   {t(
-                    '只影响列出的模型：选号时这些模型绕开该账号，其余模型照常服务。',
+                    '仅影响下列模型：为这些模型选号时将跳过该账号，其余模型照常服务。',
                     'Only the listed models are affected: they skip this account during selection while its other models keep serving.',
                   )}
                 </InfoHint>
@@ -885,14 +885,14 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
                     <span className="font-mono text-xs">{d.model}</span>
                     <Badge size="sm" variant="secondary"><BanIcon className="size-3" />{t('套餐不含', 'Not in plan')}</Badge>
                     <span className="text-xs text-muted-foreground">
-                      {t(`学到于 ${formatFullTime(d.learned_at, language)}`, `Learned ${formatFullTime(d.learned_at, language)}`)}
+                      {t(`记录于 ${formatFullTime(d.learned_at, language)}`, `Learned ${formatFullTime(d.learned_at, language)}`)}
                       {' · '}
                       {d.expires_at
                         ? t(`${formatFullTime(d.expires_at, language)} 自动失效`, `expires ${formatFullTime(d.expires_at, language)}`)
-                        : t('直到手动解除', 'until cleared')}
+                        : t('直至手动解除', 'until cleared')}
                     </span>
                   </div>
-                  <ExpandableText text={d.reason} label={t('原话', 'Raw')} />
+                  <ExpandableText text={d.reason} label={t('原文', 'Raw')} />
                 </li>
               ))}
             </ul>
@@ -1075,7 +1075,7 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
       title={t('最近请求', 'Recent requests')}
       description={usage.data
         ? t(
-            `近 30 天共 ${usage.data.total.toLocaleString(locale)} 条、花费 ${formatUsd(usage.data.total_cost)}；这里显示最新 ${RECENT_USAGE_LIMIT} 条。`,
+            `近 30 天共 ${usage.data.total.toLocaleString(locale)} 条，费用 ${formatUsd(usage.data.total_cost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
             `${usage.data.total.toLocaleString(locale)} requests costing ${formatUsd(usage.data.total_cost)} in the last 30 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
           )
         : t('流水仅保留最近 30 天。', 'Logs are retained for 30 days.')}
@@ -1117,7 +1117,7 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
         </Alert>
       ) : rows.length === 0 ? (
         <p className="py-6 text-center text-sm text-muted-foreground">
-          {t('此账号转发一次请求后就会出现在这里。', 'Requests forwarded through this account will show up here.')}
+          {t('此账号转发请求后，记录将显示在此处。', 'Requests forwarded through this account will show up here.')}
         </p>
       ) : wide ? (
         <UsageTable
@@ -1162,7 +1162,7 @@ function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () =>
       icon={SmartphoneIcon}
       title={t('设备与会话', 'Devices & sessions')}
       description={t(
-        '带设备身份的客户端按设备占名额，走模拟路径、没有设备身份的来访按会话占名额，两者互不相干。',
+        '带设备身份的客户端按设备占用名额；走模拟路径、无设备身份的请求按会话占用名额，两者相互独立。',
         'Clients with a device identity take a device slot; simulated requests without one take a session slot. The two are independent.',
       )}
       action={(
@@ -1210,7 +1210,7 @@ function BanEventsSection({ cred }: { cred: Credential }) {
       icon={ShieldAlertIcon}
       title={t('封号记录', 'Ban events')}
       description={t(
-        '每次自动封停记录一条，解封或删除账号都不会删除。展开可看上游原话与封前 7 天的流水。',
+        '每次自动封停生成一条记录，解封或删除账号均不会删除该记录。展开可查看上游返回的原始信息与封号前 7 天的流水。',
         'One row per automatic disable; re-enabling or deleting the account never removes it. Expand a row for the upstream message and the 7 days of logs before it.',
       )}
     >
@@ -1224,7 +1224,7 @@ function BanEventsSection({ cred }: { cred: Credential }) {
           </Alert>
         </div>
       ) : rows.length === 0 ? (
-        <p className="p-4 text-sm text-muted-foreground sm:p-5">{t('该账号没有被自动封停过。', 'This account has never been auto-disabled.')}</p>
+        <p className="p-4 text-sm text-muted-foreground sm:p-5">{t('该账号从未被自动封停。', 'This account has never been auto-disabled.')}</p>
       ) : (
         <ul className="divide-y">
           {rows.map((ev) => {
@@ -1248,7 +1248,7 @@ function BanEventsSection({ cred }: { cred: Credential }) {
                       {/* 手机上固定单独一行（basis-full），不随宽度在徽章后面随机折行；sm 起跟在徽章后面。 */}
                       <span className="text-xs text-muted-foreground tabular-nums max-sm:basis-full">
                         {t(
-                          `封前 7 天 ${formatCompactNumber(ev.requests_7d)} 次 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
+                          `封号前 7 天 ${formatCompactNumber(ev.requests_7d)} 次 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
                           `7d before: ${formatCompactNumber(ev.requests_7d)} req · ${ev.devices_7d} in → ${ev.devices_out_7d} out`,
                         )}
                       </span>
@@ -1319,6 +1319,7 @@ function ScheduleSection({
   onQuota: () => void
 }) {
   const { t } = useI18n()
+  const proxyName = useProxyName()
   const { prio } = useCredentialActions(cred)
   const mobile = useMediaQuery(MOBILE_QUERY)
   const edit = (onClick: () => void) => (
@@ -1353,7 +1354,7 @@ function ScheduleSection({
   if (mobile) {
     // 手机上 SettingsRow 会把「修改」按钮换到说明下面单独一行，三项配置占掉大半屏。改成与 ⋯ 底部
     // 面板「设置」组同一副面孔：名称在左、当前值在右、末尾一枚 ›，整行可点。
-    const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('不停', 'off'))
+    const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('停用', 'off'))
     const row = (label: string, value: string, onClick: () => void) => (
       <button
         type="button"
@@ -1367,9 +1368,9 @@ function ScheduleSection({
     )
     return (
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>
-        {row(t('出站代理', 'Outbound proxy'), cred.proxy ? proxyLabelParts(cred.proxy).host : t('直连', 'Direct'), onProxy)}
+        {row(t('出站代理', 'Outbound proxy'), proxyName(cred.proxy) ?? t('直连', 'Direct'), onProxy)}
         {row(
-          t('提前停调度', 'Early pause'),
+          t('提前暂停调度', 'Early pause'),
           `5h ${pause(cred.quota_pause_pct_effective)} · 7d ${pause(cred.quota_pause_pct_7d_effective)}`,
           onQuota,
         )}
@@ -1385,7 +1386,7 @@ function ScheduleSection({
     <SettingsGroup
       icon={SlidersHorizontalIcon}
       title={t('调度配置', 'Scheduling')}
-      description={t('设备、会话与 RPM 上限在页头读数里点开调整。', 'Adjust the device, session and RPM limits from the readouts at the top.')}
+      description={t('设备、会话与 RPM 上限可点击页头的对应读数进行调整。', 'Adjust the device, session and RPM limits from the readouts at the top.')}
     >
       <SettingsRow
         label={t('出站代理', 'Outbound proxy')}
@@ -1396,7 +1397,7 @@ function ScheduleSection({
         {edit(onProxy)}
       </SettingsRow>
       <SettingsRow
-        label={t('提前停调度阈值', 'Early pause threshold')}
+        label={t('提前暂停调度阈值', 'Early pause threshold')}
         description={t(
           `5h ${pausePolicyText(cred.quota_pause_pct, cred.quota_pause_pct_effective, t)} · 7d ${pausePolicyText(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective, t)}`,
           `5h ${pausePolicyText(cred.quota_pause_pct, cred.quota_pause_pct_effective, t)} · 7d ${pausePolicyText(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective, t)}`,

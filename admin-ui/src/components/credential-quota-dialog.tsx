@@ -28,7 +28,7 @@ type QuotaPolicy = 'default' | 'off' | 'custom'
 
 const POLICY_ITEMS = [
   { value: 'default', chinese: '跟随全局', english: 'Use global' },
-  { value: 'off', chinese: '该窗口不提前停', english: 'Off for this window' },
+  { value: 'off', chinese: '该窗口停用', english: 'Off for this window' },
   { value: 'custom', chinese: '独立阈值', english: 'Custom threshold' },
 ] as const
 
@@ -97,7 +97,7 @@ export function CredentialQuotaDialog({
   const nextLong = pctFromPolicy(longPolicy, longCustom)
   const dirty = nextShort !== cred.quota_pause_pct || nextLong !== cred.quota_pause_pct_7d
   const describeEffective = (pct: number) =>
-    pct > 0 ? `${pct}%` : t('不提前停', 'off')
+    pct > 0 ? `${pct}%` : t('停用', 'off')
 
   const save = () =>
     quotaPause.mutate({ pct: nextShort, pct7d: nextLong }, { onSuccess: () => onOpenChange(false) })
@@ -163,7 +163,7 @@ export function CredentialQuotaDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogPopup>
         <DialogHeader>
-          <DialogTitle>{t('提前停调度阈值', 'Early pause threshold')}</DialogTitle>
+          <DialogTitle>{t('提前暂停调度阈值', 'Early pause threshold')}</DialogTitle>
           <DialogDescription className="mt-1 truncate" title={credentialLabel}>
             {credentialLabel}
           </DialogDescription>
@@ -194,7 +194,7 @@ export function CredentialQuotaDialog({
             <AlertDescription>
               {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
               <ClampedDescription text={t(
-                '上游每条响应都会报告该账号的额度使用率，达到阈值就把账号移出调度池，不必等下一条请求触发 429；到触发暂停的那个窗口重置时自动恢复。两个窗口各自覆盖设置页里的全局值：因 5 小时窗口暂停最多持续几小时，因 7 天窗口暂停则要到下一次周重置，所以 7 天窗口的阈值建议设得比 5 小时更高。从下一条带限流响应头的响应起生效。注意：已按旧阈值暂停的账号不会因阈值调高而自动回到调度池，可手动启用或做一次连通性测试来恢复。',
+                '上游每条响应都会报告该账号的额度使用率；达到阈值时即将账号移出调度池，无需等到下一条请求触发 429，并在触发暂停的窗口重置后自动恢复。两个窗口分别覆盖设置页中的全局值：因 5 小时窗口暂停最多持续数小时，因 7 天窗口暂停则需等到下一次周重置，因此建议将 7 天窗口的阈值设得高于 5 小时窗口。设置自下一条携带限流响应头的响应起生效。注意：已按旧阈值暂停的账号不会因调高阈值而自动回到调度池，可手动启用或执行一次连通性测试以恢复。',
                 'Every upstream response reports this account’s utilization; once it reaches the threshold the account leaves the scheduling pool instead of waiting for the next request to hit a 429, and comes back when the window that triggered the pause resets. Each window overrides the global value on the settings page: a 5h pause lasts a few hours at most, while a 7d pause lasts until the next weekly reset, so set the 7d threshold higher than the 5h one. Takes effect from the next response carrying rate limit headers. Note: an account already paused under the old threshold does not return to the pool by itself when you raise it; re-enable it manually or run a connectivity test.',
               )} />
             </AlertDescription>

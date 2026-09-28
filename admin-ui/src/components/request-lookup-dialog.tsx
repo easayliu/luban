@@ -118,7 +118,7 @@ export function RequestLookupDialog({
             {filter
               ? drillTitle
               : <ClampedDescription text={t(
-                  '粘贴 luban 在响应头 X-Request-Id / X-Oneapi-Request-Id 中返回的请求 ID（New API 日志里叫 upstream_request_id，报错信息里叫 luban request id），查看它在这里的流水。也可以粘贴一个会话 ID（uuid），查看该会话的全部请求：客户端自己的会话 ID 和上游看到的会话 ID 都能识别。',
+                  '粘贴 luban 在响应头 X-Request-Id / X-Oneapi-Request-Id 中返回的请求 ID（New API 日志中称为 upstream_request_id，报错信息中称为 luban request id），即可查看该请求的流水。也可粘贴会话 ID（uuid），查看该会话的全部请求；客户端自身的会话 ID 与上游看到的会话 ID 均可识别。',
                   'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here. You can also paste a session ID (uuid) to list all of that session\'s requests; both the client\'s own session ID and the one upstream sees are recognized.',
                 )} />}
           </DialogDescription>
@@ -148,7 +148,7 @@ export function RequestLookupDialog({
               <FieldDescription>
                 {looksLikeUuid(draft.trim())
                   ? t(
-                      '按会话 ID 查询：客户端自报的和上游看到的会话 ID 都会匹配，列出该会话最近 50 条请求。',
+                      '按会话 ID 查询：同时匹配客户端自报的会话 ID 与上游看到的会话 ID，列出该会话最近 50 条请求。',
                       'Looking up by session ID: matches both the client-reported and the upstream-visible session ID, listing the session\'s latest 50 requests.',
                     )
                   : t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
@@ -168,10 +168,10 @@ export function RequestLookupDialog({
           ) : rows.length === 0 ? (
             <Empty className="py-8">
               <EmptyHeader>
-                <EmptyTitle className="text-base">{filter ? t('这段时间没有请求', 'No requests in this period') : t('没有找到这条请求', 'No request found')}</EmptyTitle>
+                <EmptyTitle className="text-base">{filter ? t('所选时间范围内没有请求', 'No requests in this period') : t('未找到该请求', 'No request found')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '请确认 ID 完整（请求 ID 形如 req_ 加 16 位随机字符，会话 ID 是一个 uuid）；超过 30 天的流水已被清理。0.3.139 之前的记录没有客户端侧的会话 ID，只能用上游看到的会话 ID 查询。',
+                    '请确认 ID 完整（请求 ID 形如 req_ 加 16 位随机字符，会话 ID 为 uuid）；超过 30 天的流水已被清理。0.3.139 之前的记录没有客户端侧会话 ID，只能用上游看到的会话 ID 查询。',
                     'Check that the ID is complete (request IDs look like req_ plus 16 random characters; a session ID is a uuid). Records older than 30 days have been pruned. Records from before 0.3.139 have no client-side session ID; look those up with the upstream one.',
                   )}
                 </EmptyDescription>
@@ -291,7 +291,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
 function simReasonLabel(reason: string, t: (zh: string, en: string) => string): string {
   switch (reason) {
     case 'not_cc_client':
-      return t('UA 不是可信 CC 版本', 'UA is not a trusted CC version')
+      return t('UA 非可信 CC 版本', 'UA is not a trusted CC version')
     case 'identity_malformed':
       return t('身份字段格式错误', 'Malformed identity fields')
     case 'not_cc_shaped':
@@ -318,7 +318,7 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
     case 'app_refusal_replay':
       return t('本地回放按应用学到的上游拒答，未转发', 'Replayed a learned app-level upstream refusal locally, not forwarded')
     case 'probe_reply':
-      return t('命中探针特征，本地回复最小的 200，未转发', 'Probe signature matched, answered locally with a minimal 200, not forwarded')
+      return t('命中探针特征，本地返回最小 200 响应，未转发', 'Probe signature matched, answered locally with a minimal 200, not forwarded')
     case 'upstream_401':
       return t('上游 401，没有可换的账号', 'Upstream 401, no account to switch to')
     case 'upstream_403':
@@ -328,21 +328,21 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
     case 'connection_error':
       return t('上游连接失败', 'Upstream connection failed')
     case 'empty_reply':
-      return t('上游返回 200 但没有输出', 'Upstream returned 200 with no output')
+      return t('上游返回 200，但无输出', 'Upstream returned 200 with no output')
     case 'refusal':
       return t('上游拒答（refusal）', 'Upstream refusal')
     case 'served_by_fallback':
       return t('拒答后由 fallback 模型作答', 'Refused, then answered by the fallback model')
     case 'no_fallbacks':
-      return t('上游不接受 fallback 目标，去掉后重试', 'Upstream rejected the fallback target; retried without fallbacks')
+      return t('上游不接受 fallback 目标，移除后重试', 'Upstream rejected the fallback target; retried without fallbacks')
     case 'demoted_thinking':
       return t('降级 thinking 后重试', 'Retried with thinking demoted')
     case 'no_prefill':
-      return t('去掉 prefill 后重试', 'Retried without prefill')
+      return t('移除 prefill 后重试', 'Retried without prefill')
     case 'injected_tool_called':
       return t('模型调用了注入的 CC 工具（客户端未声明）', 'Model called an injected CC tool the client never declared')
     case 'tools_filled':
-      return t('客户端请求未带工具，已补上官方工具', 'Client request had no tools; official tools were added')
+      return t('客户端请求未携带工具，已补充官方工具', 'Client request had no tools; official tools were added')
     default:
       return tag
   }

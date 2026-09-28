@@ -203,7 +203,7 @@ export function CredentialUsageDialog({
               {/* 「近 30 天」左边的标签已经写着，这里只说它和累计花费为什么对不上。这个对话框也从详情页
                   打开，那里没有卡片，所以不说「卡片上的」。 */}
               {t(
-                '累计花费来自终身账本，与这里的明细合计不一定相等。',
+                '累计花费取自累计账本，与此处的明细合计不一定相等。',
                 'The total cost comes from the lifetime ledger and is not expected to match this sum.',
               )}
             </p>
@@ -242,7 +242,7 @@ export function CredentialUsageDialog({
                 <EmptyTitle className="text-base">{t('暂无请求记录', 'No requests yet')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '此账号转发一次请求后就会出现在这里。',
+                    '该账号转发请求后，记录将显示在此处。',
                     'Requests forwarded through this account will show up here.',
                   )}
                 </EmptyDescription>
@@ -547,14 +547,14 @@ export function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           <TableHead
             className="whitespace-nowrap"
-            title={t('客户端请求自带的 device_id（设备绑定与设备上限都按它计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}
+            title={t('客户端请求自带的 device_id（设备绑定与设备上限均据此计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}
           >
             {t('入站设备', 'Inbound device')}
           </TableHead>
           <TableHead
             className="whitespace-nowrap"
             title={t(
-              '实际发给上游的 device_id（按账号派生）；上游给出的设备 ID 对应的是这一列。旧记录为空',
+              '实际发给上游的 device_id（按账号派生），上游给出的设备 ID 对应此列；旧记录为空',
               'device_id actually sent upstream (derived per account); a device ID quoted by upstream corresponds to this column. Empty for older rows',
             )}
           >
@@ -563,7 +563,7 @@ export function UsageTable({
           <TableHead
             className="whitespace-nowrap"
             title={t(
-              'luban 在响应头 X-Oneapi-Request-Id 中返回的请求 ID，New API 日志里叫 upstream_request_id；点击 ID 查看这条请求，点击旁边的图标复制',
+              'luban 在响应头 X-Oneapi-Request-Id 中返回的请求 ID，New API 日志中称为 upstream_request_id；点击 ID 可查看该请求，点击旁边的图标可复制',
               'Request ID luban returns in the X-Oneapi-Request-Id response header (upstream_request_id in New API logs); click the ID to look up the request, or the icon next to it to copy',
             )}
           >
@@ -620,7 +620,7 @@ export function UsageTable({
                 className="whitespace-nowrap text-right tabular-nums"
                 title={log.sse_aggregated
                   ? t(
-                      '这条请求本来是非流式，被改成流式发给上游后聚合回整段返回：首字耗时是上游的首字节，客户端则是在末尾一次性收到全部内容。',
+                      '该请求原为非流式，以流式发往上游后再聚合为完整响应返回：首字耗时取自上游首字节，客户端则在结束时一次性收到全部内容。',
                       'This request arrived non-streaming and was sent upstream as a stream, then reassembled into a single response: TTFT is the upstream first byte, while the client received everything at the end.',
                     )
                   : undefined}

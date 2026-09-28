@@ -49,6 +49,7 @@ import {
   useTtftSeries,
 } from '@/components/ttft-trend-dialog'
 import { getRejections, type CacheSeriesPoint, type TtftSeriesPoint } from '@/api/metrics'
+import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -62,9 +63,11 @@ import {
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
 import {
   Menu,
+  MenuGroup,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
+  MenuSeparator,
   MenuTrigger,
 } from '@/components/ui/menu'
 import {
@@ -119,25 +122,35 @@ const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
 
 type LocalizedLabel = readonly [chinese: string, english: string]
 
+/**
+ * 状态筛选按含义分组（调度结论、账号状态、用量、设备），组间只用分隔线隔开，不加组标题：
+ * 与 Linear / GitHub 的下拉一致，十来项的列表靠分隔线就能读出层次，标题只会把菜单撑高。
+ */
+type FilterGroup = 'overview' | 'schedule' | 'status' | 'usage' | 'device'
+
 const FILTERS: {
   key: CredentialFilterKey
+  group: FilterGroup
   label: LocalizedLabel
   match: (evaluation: CredentialEvaluation) => boolean
 }[] = [
-  { key: 'all', label: ['全部', 'All'], match: () => true },
+  { key: 'all', group: 'overview', label: ['全部', 'All'], match: () => true },
   {
     key: 'schedulable',
+    group: 'schedule',
     label: ['可调度', 'Schedulable'],
     match: (evaluation) => evaluation.schedulable,
   },
   {
     key: 'attention',
+    group: 'schedule',
     label: ['需处理', 'Needs attention'],
     match: (evaluation) => evaluation.needsAttention,
   },
-  { key: 'enabled', label: ['启用', 'Enabled'], match: ({ credential }) => !credential.disabled },
+  { key: 'enabled', group: 'status', label: ['已启用', 'Enabled'], match: ({ credential }) => !credential.disabled },
   {
     key: 'disabled',
+    group: 'status',
     label: ['手动停用', 'Manually disabled'],
     // 只匹配人工手动关掉的号：排除封禁、Token 失效（有 ban_reason）和限流暂停（有 resume_at），
     // 那几种各有各的 tab，混在一起会让计数虚高、点开找不到预期的号。
@@ -146,6 +159,7 @@ const FILTERS: {
   },
   {
     key: 'banned',
+    group: 'status',
     label: ['已封禁', 'Banned'],
     match: ({ credential }) =>
       !!credential.ban_reason && credential.resume_at == null
@@ -153,6 +167,7 @@ const FILTERS: {
   },
   {
     key: 'tokenInvalid',
+    group: 'status',
     label: ['token 失效', 'Token expired'],
     match: ({ credential }) =>
       !!credential.ban_reason && credential.resume_at == null
@@ -160,13 +175,15 @@ const FILTERS: {
   },
   {
     key: 'subscriptionInactive',
+    group: 'status',
     label: ['订阅未生效', 'Subscription inactive'],
     match: ({ credential }) =>
       !!credential.ban_reason && credential.resume_at == null && isSubscriptionPause(credential.ban_reason),
   },
-  { key: 'nearLimit', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
+  { key: 'nearLimit', group: 'usage', label: ['用量风险', 'Usage risk'], match: (evaluation) => evaluation.quotaRisk },
   {
     key: 'cooldown',
+    group: 'usage',
     label: ['冷却中', 'Cooling down'],
     // 三档都收：resume_at（额度用尽落库暂停）、rate_limited_secs（进程内账号级冷却）、
     // modelCooling（模型级冷却）。区别由卡片上的状态与提示分别说明。
@@ -177,11 +194,13 @@ const FILTERS: {
   },
   {
     key: 'hasDevice',
+    group: 'device',
     label: ['已绑定设备', 'Has bound devices'],
     match: ({ credential }) => credential.device_count > 0,
   },
   {
     key: 'deviceFull',
+    group: 'device',
     label: ['设备已满', 'Device limit reached'],
     match: ({ credential }) =>
       credential.device_limit_effective > 0
@@ -198,11 +217,14 @@ const TIER_FILTERS: { key: CredentialTierFilterKey; label: LocalizedLabel }[] = 
   { key: 'max20x', label: ['Max 20x', 'Max 20x'] },
   { key: 'max5x', label: ['Max 5x', 'Max 5x'] },
   // 上游偶尔只给 `claude_max` 这种不带倍率的写法，单列一档收着，否则它会掉进「未知」里。
-  { key: 'max', label: ['Max（未标倍率）', 'Max (no multiplier)'] },
+  { key: 'max', label: ['Max（倍率未知）', 'Max (multiplier unknown)'] },
   { key: 'pro', label: ['Pro', 'Pro'] },
   { key: 'free', label: ['Free', 'Free'] },
   { key: 'unknown', label: ['未知', 'Unknown'] },
 ]
+
+/** 套餐下拉在这些档位前加分隔线：全部 | Max 各档 | Pro、Free | 未知。 */
+const TIER_GROUP_STARTS = new Set<CredentialTierFilterKey>(['max20x', 'pro', 'unknown'])
 
 const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   priority: ['优先级', 'Priority'],
@@ -214,14 +236,68 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   devices: ['设备数', 'Devices'],
   sessions: ['模拟会话数', 'Sessions'],
   rpm: ['当前 RPM', 'Current RPM'],
-  cost: ['累计花费', 'Total cost'],
+  cost: ['累计费用', 'Total cost'],
   recent: ['最近使用', 'Last used'],
   created: ['添加时间', 'Date added'],
 }
 
-/** 筛选/套餐触发器在「已生效」时的染色，见 FILTERS 上方的说明。 */
-const ACTIVE_FILTER_CLASS =
-  'border-marine/40 bg-marine/10 text-marine-foreground hover:border-marine/40 hover:bg-marine/16 data-pressed:bg-marine/16'
+/** 排序字段按含义分组：账号属性 / 用量与活跃 / 名额。 */
+const SORT_GROUPS: readonly (readonly SortKey[])[] = [
+  ['priority', 'status', 'name', 'tier', 'created'],
+  ['usage5h', 'usage7d', 'rpm', 'cost', 'recent'],
+  ['devices', 'sessions'],
+]
+
+/**
+ * 筛选触发器的文字：未筛选时只显示维度名（「状态」），筛选后在竖线后附上当前取值的小标签，
+ * 即 shadcn 数据表 faceted filter 的做法——维度名始终可见，一眼能分清「状态」与「套餐」两个按钮。
+ *
+ * 窄屏三等分的格子放不下「维度名 + 小标签」，也容不下按钮里再套一层底色：只留纯文字并可截断，
+ * `mobile` 给出窄屏专用的短写法（排序是「排序 ↑」这类，取值本身已在菜单里勾着）。筛选生效时
+ * 文字前加一枚小圆点，表示这个按钮正在起作用。
+ */
+function FacetTriggerLabel({
+  title,
+  value,
+  mobile,
+  active = value != null,
+}: {
+  title: string
+  value: string | null
+  mobile?: string
+  active?: boolean
+}) {
+  const compact = mobile ?? value ?? title
+  return (
+    <>
+      <span className="flex min-w-0 items-center gap-1.5 sm:hidden">
+        {active && <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-marine" />}
+        <span className="min-w-0 truncate">{compact}</span>
+      </span>
+      <span className="flex min-w-0 items-center gap-1.5 max-sm:hidden">
+        <span className="shrink-0">{title}</span>
+        {value != null && (
+          <>
+            <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
+            <Badge variant="secondary" className="min-w-0 shrink truncate rounded-sm px-1.5 font-normal">
+              {value}
+            </Badge>
+          </>
+        )}
+      </span>
+    </>
+  )
+}
+
+/** 下拉里的一项：名称靠左，计数靠右、弱化，不做染色。 */
+function FacetOption({ label, count }: { label: string; count: string }) {
+  return (
+    <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+      <span className="min-w-0 truncate">{label}</span>
+      <span className="tnum text-xs text-muted-foreground">{count}</span>
+    </span>
+  )
+}
 
 export const CREDENTIAL_FILTER_KEYS = FILTERS.map((filter) => filter.key)
 export const CREDENTIAL_TIER_FILTER_KEYS = TIER_FILTERS.map((item) => item.key)
@@ -445,12 +521,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   })
   const rejectedTotal = rejectionsQuery.data?.total ?? 0
   const rejectionKindLabel = (kind: string) => ({
-    'device-limit': t('设备名额满', 'device slots full'),
-    'session-limit': t('会话名额满', 'session slots full'),
-    'account-rpm': t('账号 RPM 满', 'account RPM full'),
-    'device-rpm': t('设备 RPM 满', 'device RPM full'),
-    'session-rpm': t('会话 RPM 满', 'session RPM full'),
-    'session-concurrency': t('会话并发满', 'session concurrency full'),
+    'device-limit': t('设备名额已满', 'device slots full'),
+    'session-limit': t('会话名额已满', 'session slots full'),
+    'account-rpm': t('账号 RPM 已达上限', 'account RPM full'),
+    'device-rpm': t('设备 RPM 已达上限', 'device RPM full'),
+    'session-rpm': t('会话 RPM 已达上限', 'session RPM full'),
+    'session-concurrency': t('会话并发已达上限', 'session concurrency full'),
     'bare-rate-limit': t('无设备身份限流', 'no-device-identity rate limit'),
     'all-cooling-down': t('所有账号冷却中', 'all accounts cooling down'),
     'no-device-id': t('无设备身份', 'no device identity'),
@@ -478,12 +554,25 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     () => FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
     [t],
   )
+  const filterGroups = useMemo(() => {
+    const groups: (typeof filterItems)[] = []
+    for (const item of filterItems) {
+      const last = groups[groups.length - 1]
+      if (last && last[0].group === item.group) last.push(item)
+      else groups.push([item])
+    }
+    return groups
+  }, [filterItems])
   const tierItems = useMemo(
     () => TIER_FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
     [t],
   )
   const sortItems = useMemo(
     () => SORTS.map(({ key }) => ({ key, label: t(...SORT_LABELS[key]) })),
+    [t],
+  )
+  const sortGroups = useMemo(
+    () => SORT_GROUPS.map((keys) => keys.map((key) => ({ key, label: t(...SORT_LABELS[key]) }))),
     [t],
   )
   const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
@@ -666,7 +755,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     // 本地拒绝数的是请求条数。
     metrics.modelOnlyCoolingCount > 0
       ? t(
-          `另 ${formatNumber(metrics.modelOnlyCoolingCount)} 个账号有模型冷却`,
+          `另有 ${formatNumber(metrics.modelOnlyCoolingCount)} 个账号存在模型冷却`,
           `+${formatNumber(metrics.modelOnlyCoolingCount)} with model cooldown`,
         )
       : '',
@@ -718,7 +807,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const quotaRiskStatus = summarize(quotaRiskItems)
   const deviceStatus = fullDeviceCount > 0
     ? t(
-        `${formatNumber(fullDeviceCount)} 个账号已满`,
+        `${formatNumber(fullDeviceCount)} 个账号设备名额已满`,
         `${formatNumber(fullDeviceCount)} ${fullDeviceCount === 1 ? 'account' : 'accounts'} at limit`,
       )
     : metrics.unlimitedDeviceAccounts > 0
@@ -748,6 +837,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     actions.onTierChange(value)
     actions.onPageChange(1)
     clearSelection()
+  }
+  // 下拉里字段与方向分开选：换字段时用该字段的默认方向，重选当前字段不翻转方向
+  //（翻转是列表表头点击的交互，放进单选菜单里会让「点了已勾选的项」反而改掉排序）。
+  const changeSortKey = (key: SortKey) => {
+    if (key === sort) return
+    actions.onSortChange(key, SORT_DIR_DEFAULT[key])
+    actions.onPageChange(1)
+  }
+  const changeSortDir = (next: SortDir) => {
+    if (next === dir) return
+    actions.onSortChange(sort, next)
+    actions.onPageChange(1)
   }
   const changeSort = (key: SortKey) => {
     actions.onSortChange(
@@ -942,33 +1043,34 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               </InputGroupAddon>
             </InputGroup>
 
-            <ToolbarSeparator orientation="vertical" className="hidden sm:block" />
+            {/* 搜索与两个筛选是同一组「缩小范围」的控件，中间不加分隔线；排序与视图切换属于
+                「怎么展示」，在分隔线之后。与 GitHub / Linear 列表页的工具条排布一致。 */}
             <ToolbarGroup className="grid min-w-0 grid-cols-3 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap">
               <Menu>
                 <MenuTrigger
                   aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
                   className={cn(
                     buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                    filter !== 'all' && ACTIVE_FILTER_CLASS,
+                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
                   )}
                 >
                   <ListFilterIcon />
-                  <span className="min-w-0 truncate">
-                    {activeFilterLabel}
-                  </span>
+                  <FacetTriggerLabel
+                    title={t('状态', 'Status')}
+                    value={filter === 'all' ? null : activeFilterLabel}
+                  />
                 </MenuTrigger>
-                <MenuPopup align="end" className="w-52">
+                <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={filter}>
-                    {filterItems.map((item) => (
-                      <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
-                        <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                          <span>{item.label}</span>
-                          <span className="tnum text-xs text-muted-foreground">
-                            {formatNumber(metrics.filterCounts[item.key])}
-                          </span>
-                        </span>
-                      </MenuRadioItem>
+                    {filterGroups.map((items, index) => (
+                      <MenuGroup key={items[0].key}>
+                        {index > 0 && <MenuSeparator />}
+                        {items.map((item) => (
+                          <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
+                            <FacetOption label={item.label} count={formatNumber(metrics.filterCounts[item.key])} />
+                          </MenuRadioItem>
+                        ))}
+                      </MenuGroup>
                     ))}
                   </MenuRadioGroup>
                 </MenuPopup>
@@ -979,30 +1081,44 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
                   className={cn(
                     buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                    tier !== 'all' && ACTIVE_FILTER_CLASS,
+                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
                   )}
                 >
                   <LayersIcon />
-                  <span className="min-w-0 truncate">
-                    {activeTierLabel}
-                  </span>
+                  <FacetTriggerLabel
+                    title={t('套餐', 'Plan')}
+                    value={tier === 'all' ? null : activeTierLabel}
+                  />
                 </MenuTrigger>
-                <MenuPopup align="end" className="w-52">
+                <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={tier}>
-                    {tierItems.map((item) => (
-                      <MenuRadioItem key={item.key} value={item.key} onClick={() => changeTier(item.key)}>
-                        <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                          <span className="min-w-0 truncate">{item.label}</span>
-                          <span className="tnum text-xs text-muted-foreground">
-                            {formatNumber(metrics.tierCounts[item.key])}
-                          </span>
-                        </span>
-                      </MenuRadioItem>
+                    {tierItems.map((item, index) => (
+                      <MenuGroup key={item.key}>
+                        {TIER_GROUP_STARTS.has(item.key) && index > 0 && <MenuSeparator />}
+                        <MenuRadioItem value={item.key} onClick={() => changeTier(item.key)}>
+                          <FacetOption label={item.label} count={formatNumber(metrics.tierCounts[item.key])} />
+                        </MenuRadioItem>
+                      </MenuGroup>
                     ))}
                   </MenuRadioGroup>
                 </MenuPopup>
               </Menu>
+
+              {(filter !== 'all' || tier !== 'all') && (
+                <Button
+                  variant="ghost"
+                  className="text-muted-foreground max-sm:hidden"
+                  onClick={() => {
+                    changeFilter('all')
+                    changeTier('all')
+                  }}
+                >
+                  {t('重置', 'Reset')}
+                  <XIcon />
+                </Button>
+              )}
+
+              <ToolbarSeparator orientation="vertical" className="mx-1 hidden sm:block" />
 
               <Menu>
                 <MenuTrigger
@@ -1015,33 +1131,38 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     // 不要 `max-sm:col-span-2`：那是筛选组还是两列时给的（让排序独占一整行）。
                     // 组改成三列后它会占掉 3 列中的 2 列、被挤到第二行，右边空一格——
                     // 就是三枚筛选排成 2 + 1 的原因。三列下它和另外两枚一样，各占一格。
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
                   )}
                 >
                   <ArrowUpDownIcon />
-                  <span className="min-w-0 truncate max-[22rem]:hidden">
-                    {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
-                  </span>
-                  <span className="hidden shrink-0 max-[22rem]:inline">
-                    {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
-                  </span>
+                  <FacetTriggerLabel
+                    title={t('排序', 'Sort')}
+                    value={`${activeSortLabel} ${dir === 'asc' ? '↑' : '↓'}`}
+                    mobile={`${activeSortLabel} ${dir === 'asc' ? '↑' : '↓'}`}
+                    active={false}
+                  />
                 </MenuTrigger>
                 <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={sort}>
-                    {sortItems.map((item) => (
-                      <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSort(item.key)}>
-                        <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-                          <span>{item.label}</span>
-                          {sort === item.key && (
-                            <span className="text-xs text-muted-foreground">
-                              {dir === 'asc'
-                                ? t('升序', 'Ascending')
-                                : t('降序', 'Descending')}
-                            </span>
-                          )}
-                        </span>
-                      </MenuRadioItem>
+                    {sortGroups.map((items, index) => (
+                      <MenuGroup key={items[0].key}>
+                        {index > 0 && <MenuSeparator />}
+                        {items.map((item) => (
+                          <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSortKey(item.key)}>
+                            {item.label}
+                          </MenuRadioItem>
+                        ))}
+                      </MenuGroup>
                     ))}
+                  </MenuRadioGroup>
+                  <MenuSeparator />
+                  <MenuRadioGroup value={dir}>
+                    <MenuRadioItem value="asc" onClick={() => changeSortDir('asc')}>
+                      {t('升序', 'Ascending')}
+                    </MenuRadioItem>
+                    <MenuRadioItem value="desc" onClick={() => changeSortDir('desc')}>
+                      {t('降序', 'Descending')}
+                    </MenuRadioItem>
                   </MenuRadioGroup>
                 </MenuPopup>
               </Menu>
@@ -1050,7 +1171,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             {/* `sm:ml-auto` 把视图切换推到整行最右端，与下面指标卡、列表的右边界落在同一条竖线上。
                 `xl:ml-0` 是给合并成一行的那档用的：那时整条工具条已由 `xl:justify-end` 右推，
                 内层再推一次就会把搜索与筛选之间撑开一大片空白。两者永远成对出现。 */}
-            <ToolbarSeparator orientation="vertical" className="hidden sm:ml-auto sm:block xl:ml-0" />
+            <ToolbarSeparator orientation="vertical" className="hidden" />
             <ToolbarGroup className="self-center justify-end max-sm:col-start-2 max-sm:row-start-1">
               <ToggleGroup
                 value={[view]}
@@ -1163,7 +1284,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             status={cacheRate == null ? t('暂无用量', 'No usage yet') : undefined}
             statusHint={cacheNow
               ? t(
-                  `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}${cacheDeltaText}`}。按 token 加权，迷你线是近 24 小时逐小时。点开看趋势与按模型 / 账号的拆分。`,
+                  `${cacheNow.label[0]}：${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `；近 7 天基线 ${formatPercent(cacheBase)}${cacheDeltaText}`}。按 token 加权；迷你线为近 24 小时的逐小时数据。点击查看趋势及按模型 / 账号的拆分。`,
                   `${cacheNow.label[1]}: ${cacheSplitText(cacheNow.p, t)}${cacheBase == null ? '' : `; 7-day baseline ${formatPercent(cacheBase)}${cacheDeltaText}`}. Token-weighted; the sparkline is the last 24 hours by hour. Click for the trend and the per-model / per-account breakdown.`,
                 )
               : undefined}
@@ -1183,7 +1304,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             status={ttftNow == null ? t('暂无数据', 'No data yet') : undefined}
             statusHint={ttftNow
               ? t(
-                  `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线是近 24 小时逐小时的 p50。点开看趋势与按模型 / 账号的拆分。`,
+                  `${ttftNow.label[0]}：p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · 平均 ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} 次成功请求 · 吞吐 ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `；近 7 天基线 p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}。迷你线为近 24 小时逐小时的 p50。点击查看趋势及按模型 / 账号的拆分。`,
                   `${ttftNow.label[1]}: p50 ${formatMs(ttftNow.p.p50_ms)} · p95 ${formatMs(ttftNow.p.p95_ms)} · avg ${formatMs(ttftNow.p.avg_ms)} · ${formatNumber(ttftNow.p.count)} successful requests · throughput ${formatTokensPerSec(ttftNow.p.tokens_per_sec)}${ttftBase ? `; 7-day baseline p50 ${formatMs(ttftBase.p50_ms)}${ttftDeltaText} · p95 ${formatMs(ttftBase.p95_ms)}` : ''}. The sparkline is hourly p50 over the last 24 hours. Click for the trend and the per-model / per-account breakdown.`,
                 )
               : undefined}
@@ -1204,7 +1325,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               : t('读取中', 'Loading')}
             live={(metricsQuery.data?.in_flight ?? 0) > 0}
             hint={t(
-              `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及此刻已进入转发、响应还没走完的在途请求数。每 10 秒刷新。`,
+              `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及当前已进入转发、响应尚未结束的在途请求数。每 10 秒刷新一次。`,
               `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
             )}
             icon={ActivityIcon}
@@ -1450,7 +1571,7 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
         <EmptyTitle>{t('建立第一个调度账号', 'Add your first schedulable account')}</EmptyTitle>
         <EmptyDescription>
           {t(
-            '账号池里还没有账号。完成 Claude OAuth 授权后，账号会加入当前网关的调度池。',
+            '账号池中尚无账号。完成 Claude OAuth 授权后，账号将加入当前网关的调度池。',
             'There are no accounts in the pool yet. After Claude OAuth authorization, the account joins this gateway’s scheduling pool.',
           )}
         </EmptyDescription>

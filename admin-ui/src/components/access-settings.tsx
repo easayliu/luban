@@ -98,7 +98,7 @@ export function AccessSettings({
           </DialogTitle>
           <DialogDescription>
             {t(
-              '配置客户端接入地址、身份验证 Key 和 Claude Code 片段。',
+              '配置客户端接入地址、身份验证 Key 和 Claude Code 接入片段。',
               'Configure the client endpoint, authentication key, and Claude Code setup.',
             )}
           </DialogDescription>
@@ -318,7 +318,7 @@ export function AccessSettingsContent() {
               <FieldDescription>
                 {t('由环境变量', 'Managed by environment variable')}{' '}
                 <code className="font-mono">LUBAN_API_KEY</code>
-                {t(' 接管，网页只读。', '; this page is read-only.')}
+                {t(' 管理，此处只读。', '; this page is read-only.')}
               </FieldDescription>
             )}
           </Field>
@@ -442,7 +442,7 @@ export function DeviceSettingsContent() {
         icon={GaugeIcon}
         title={t('设备绑定与容量', 'Device bindings & capacity')}
         description={t(
-          '针对带设备身份的客户端请求：设置设备占用名额的时长、多久内优先返回原账号，以及每个账号默认可容纳的设备数。',
+          '适用于带设备身份的客户端请求：设置设备占用账号名额的时长、名额释放后优先使用原账号的期限，以及每个账号默认可容纳的设备数。',
           'For client requests with a device identity: how long a device holds its slot, how long it keeps preferring its original account, and how many devices each account holds by default.',
         )}
       >
@@ -455,7 +455,7 @@ export function DeviceSettingsContent() {
         icon={MessagesSquareIcon}
         title={t('模拟会话绑定与容量', 'Simulated session bindings & capacity')}
         description={t(
-          '走模拟路径、没有设备身份的客户端请求按对话占用会话槽位：设置对话闲置多久后释放槽位、多久内优先返回原账号，以及每个账号默认的槽位数（即上游看到的会话 ID 数）。',
+          '经模拟路径转发、没有设备身份的客户端请求按对话占用会话槽位：设置对话闲置多久后释放槽位、槽位释放后优先使用原账号的期限，以及每个账号默认的槽位数（即上游看到的会话 ID 数）。',
           'Client requests on the simulation path without a device identity take one session slot per conversation: how long an idle conversation keeps its slot, how long it keeps preferring its original account, and the default number of slots per account (the number of session IDs upstream sees).',
         )}
       >
@@ -468,7 +468,7 @@ export function DeviceSettingsContent() {
         icon={TimerIcon}
         title={t('转发速率', 'Request rate')}
         description={t(
-          '限制单个账号、单台设备、单个会话每分钟最多转发多少条请求，以及单个会话的最大并发数。RPM 与账号列表中 RPM 列的统计口径一致；并发上限用于防止 Claude Desktop 的 cache 预热脉冲超出上游速率限制。',
+          '限制单个账号、单台设备和单个会话每分钟可转发的请求数，以及单个会话的最大并发数。RPM 与账号列表中 RPM 列的统计口径一致；并发上限用于防止 Claude Desktop 缓存预热时的突发请求超出上游速率限制。',
           'Cap how many requests a single account, device, or session forwards per minute, and the maximum concurrency per session. RPM is counted the same way as the RPM column in the account list; the concurrency cap keeps Claude Desktop\'s cache-warming burst from exceeding upstream rate limits.',
         )}
       >
@@ -494,7 +494,7 @@ export function DeviceSettingsContent() {
         icon={TerminalIcon}
         title={t('客户端版本', 'Client version')}
         description={t(
-          '依据 User-Agent 中自报的 claude-cli 版本判断：拦截过旧的 Claude Code，并把自称比官方最新版还新的客户端识别为非官方；其他客户端不受影响。',
+          '依据 User-Agent 中声明的 claude-cli 版本进行判断：拦截版本过旧的 Claude Code，并将声明版本高于官方最新版的客户端识别为非官方客户端；其他客户端不受影响。',
           'Based on the claude-cli version self-reported in the User-Agent: block outdated Claude Code builds, and treat clients claiming a version newer than the latest official release as unofficial. Other clients are unaffected.',
         )}
       >
@@ -514,7 +514,7 @@ export function SecuritySettingsContent() {
         icon={LockKeyholeIcon}
         title={t('管理密码', 'Admin password')}
         description={t(
-          '控制谁可以登录管理控制台；不会影响客户端通过代理发起请求。',
+          '控制管理控制台的登录权限，不影响客户端通过代理发起的请求。',
           'Control who can sign in to the admin console; this does not affect proxied client requests.',
         )}
       >
@@ -585,7 +585,7 @@ function DeviceBindingTtl() {
     <SettingsRow
       label={t('活跃名额有效期', 'Active slot lifetime')}
       description={t(
-        '设备在此时长内没有请求便释放占用的账号名额；与原账号的关联仍按保留期保存。',
+        '设备在此时长内无请求时，释放其占用的账号名额；与原账号的关联仍按保留期保留。',
         'A device releases its account slot after this much inactivity; its affinity with the original account is still kept for the retention period.',
       )}
       note={<Badge variant="secondary" size="sm">{hint}</Badge>}
@@ -686,10 +686,10 @@ function DeviceBindingRetention() {
   const parsed = toSecs(draft)
   const hint = parsed > 0
     ? t(
-        `优先返回原账号：${formatDuration(parsed, language)}`,
+        `优先使用原账号：${formatDuration(parsed, language)}`,
         `Prefer the original account for ${formatDuration(parsed, language)}`,
       )
-    : t('永久优先返回原账号', 'Always prefer the original account')
+    : t('始终优先使用原账号', 'Always prefer the original account')
   // 保留期短于有效期是自相矛盾的配置，后端会按有效期兜底（等于关掉软绑定），这里先提示一句。
   const conflict = parsed > 0 && ttl > 0 && parsed < ttl
 
@@ -698,7 +698,7 @@ function DeviceBindingRetention() {
       label={t('原账号关联保留期', 'Account affinity retention')}
       description={conflict
         ? t(
-            '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+            '保留期短于有效期时按有效期计算，相当于停用软绑定。',
             'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
           )
         : t(
@@ -787,7 +787,7 @@ function SessionBindingTtl() {
       label={t('模拟会话有效期', 'Simulated session lifetime')}
       description={
         <ClampedDescription text={t(
-          '走模拟路径、没有设备身份的对话在此时长内没有请求，便释放占用的会话槽位，会话 ID 留给下一个对话复用；与原账号的关联按下面的保留期保存。此项与设备有效期分开配置：设备是一台机器，会话是一段对话。',
+          '经模拟路径转发、没有设备身份的对话在此时长内无请求时，释放其占用的会话槽位，会话 ID 留待下一个对话复用；与原账号的关联按下方的保留期保留。此项与设备有效期分别配置：设备对应一台机器，会话对应一段对话。',
           'A conversation on the simulation path without a device identity frees its session slot after this much inactivity, and its session ID is reused by the next conversation; affinity with the original account is kept for the retention period below. This is configured separately from the device lifetime: a device is a machine, a session is one conversation.',
         )} />
       }
@@ -855,10 +855,10 @@ function SessionBindingRetention() {
   const parsed = toSecs(draft)
   const hint = parsed > 0
     ? t(
-        `优先返回原账号：${formatDuration(parsed, language)}`,
+        `优先使用原账号：${formatDuration(parsed, language)}`,
         `Prefer the original account for ${formatDuration(parsed, language)}`,
       )
-    : t('永久优先返回原账号', 'Always prefer the original account')
+    : t('始终优先使用原账号', 'Always prefer the original account')
   const conflict = parsed > 0 && ttl > 0 && parsed < ttl
 
   return (
@@ -866,11 +866,11 @@ function SessionBindingRetention() {
       label={t('模拟会话原账号关联保留期', 'Simulated session affinity retention')}
       description={conflict
         ? t(
-            '保留期短于有效期时按有效期处理，等于关闭软绑定。',
+            '保留期短于有效期时按有效期计算，相当于停用软绑定。',
             'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
           )
         : t(
-            '槽位释放后，对话在此期限内再次请求时仍优先使用原账号（原槽位空闲时回到原槽位，会话 ID 不变）；过期后绑定记录被清除，再来时按新对话处理。',
+            '槽位释放后，对话在此期限内再次请求时仍优先使用原账号（原槽位空闲时回到原槽位，会话 ID 不变）；过期后清除绑定记录，此后的请求按新对话处理。',
             'After its slot is freed, a conversation that returns within this period still prefers its original account (and its old slot if that is free, keeping the same session ID); after this period the binding is removed and the conversation is treated as new.',
           )}
       note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
@@ -1029,7 +1029,7 @@ function DefaultSessionLimit() {
     <SettingsRow
       label={t('默认模拟会话上限', 'Default simulated session limit')}
       description={t(
-        '走模拟路径、没有设备身份的请求按对话绑定账号并占用一个槽位（对话按请求自带的会话 ID 识别，没有时按缓存前缀 + 首条用户消息识别）。出站会话 ID 按槽位派生、释放后复用，所以上游看到的会话 ID 数就是这个上限。槽位与设备名额分开计数，有效期与原账号关联使用上面两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。槽位占满后新会话分流到其他账号，所有账号都占满时收到 429。',
+        '经模拟路径转发、没有设备身份的请求按对话绑定账号，每个对话占用一个槽位（优先按请求自带的会话 ID 识别对话，缺失时按缓存前缀与首条用户消息识别）。出站会话 ID 由槽位派生，释放后复用，因此上游看到的会话 ID 数即为此上限。槽位与设备名额分别计数，有效期与原账号关联保留期沿用上方两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。槽位用尽后，新会话分流到其他账号；所有账号的槽位均用尽时，请求返回 429。',
         'Requests on the simulation path without a device identity bind to an account per conversation and take one slot (a conversation is identified by its own session ID, or failing that by the cache prefix plus the first user message). The outbound session ID is derived from the slot and reused once the slot is freed, so upstream sees at most this many session IDs per account. Slots are counted separately from device slots; their lifetime and affinity follow the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once an account is full, new sessions go to another account; when every account is full they get a 429.',
       )}
       note={
@@ -1196,7 +1196,7 @@ function DeviceRpmLimit() {
     <SettingsRow
       label={t('设备 RPM 上限', 'Per-device RPM limit')}
       description={t(
-        '单台设备每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。超出时不换账号：无论换到哪个账号，持续发请求的都是同一台机器。0 表示不限。',
+        '单台设备每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。超出时不切换账号，因为无论切换到哪个账号，持续发送请求的都是同一台机器。0 表示不限。',
         'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. The request is not moved to another account: whichever account it lands on, it is the same machine sending the requests. 0 means unlimited.',
       )}
       note={
@@ -1292,7 +1292,7 @@ function SessionRpmLimit() {
     <SettingsRow
       label={t('会话 RPM 上限', 'Per-session RPM limit')}
       description={t(
-        '单个会话每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。它比设备 RPM 上限细一层：同一台机器上的多个会话各有自己的额度，不再互相挤占。0 表示不限。',
+        '单个会话每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。此项比设备 RPM 上限粒度更细：同一台机器上的多个会话各自计算额度，互不挤占。0 表示不限。',
         'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. It is one level finer than the per-device limit: sessions on the same machine each get their own budget instead of competing for one. 0 means unlimited.',
       )}
       note={
@@ -1304,13 +1304,13 @@ function SessionRpmLimit() {
           </Badge>
           {noDeviceBackstop && (
             <Badge variant="warning" size="sm">
-              {t('换一个会话 ID 即可绕开，建议同时配置设备上限', 'A new session ID bypasses this; set a per-device limit too')}
+              {t('更换会话 ID 即可绕过此限制，建议同时配置设备 RPM 上限', 'A new session ID bypasses this; set a per-device limit too')}
             </Badge>
           )}
           {shadowedByDevice && (
             <Badge variant="warning" size="sm">
               {t(
-                `设备上限 ${deviceLimit} 总会先触发，此项不会生效`,
+                `设备 RPM 上限（${deviceLimit}）总会先触发，此项不会生效`,
                 `The per-device limit of ${deviceLimit} always trips first, so this limit never applies`,
               )}
             </Badge>
@@ -1390,7 +1390,7 @@ function SessionConcurrencyLimit() {
     <SettingsRow
       label={t('会话并发上限', 'Per-session concurrency limit')}
       description={t(
-        '单个会话同时在途的最大请求数，超出后直接返回 429 并附带 retry-after。用于遏制 Claude Desktop 启动时的 cache 预热脉冲（20+ 条并发），避免超出上游速率限制。0 表示不限。',
+        '单个会话同时在途的最大请求数，超出后直接返回 429 并附带 retry-after。用于抑制 Claude Desktop 启动时缓存预热产生的突发请求（20 条以上并发），避免超出上游速率限制。0 表示不限。',
         'The maximum number of in-flight requests per session; beyond that it gets a 429 with retry-after. This curbs the cache-warming burst Claude Desktop fires on startup (20+ concurrent requests) so it does not exceed upstream rate limits. 0 means unlimited.',
       )}
       note={
@@ -1439,8 +1439,8 @@ function RequireDeviceIdToggle() {
     onSuccess: (settings: Settings) => {
       toastManager.add({
         title: settings.require_device_id
-          ? t('设备身份校验已开启', 'Device identity checks enabled')
-          : t('设备身份校验已关闭', 'Device identity checks disabled'),
+          ? t('设备身份校验已启用', 'Device identity checks enabled')
+          : t('设备身份校验已停用', 'Device identity checks disabled'),
         description: settings.require_device_id
           ? t('缺少设备身份的请求会被拒绝。', 'Requests without a device identity will be rejected.')
           : t('无设备身份的请求将被放行。', 'Requests without a device identity will be allowed.'),
@@ -1536,11 +1536,11 @@ function LatestCcRelease() {
           : t('官方最新版本已清除', 'Latest official release cleared'),
         description: version
           ? t(
-              `自称高于 ${effectiveLatestRelease(settings)} 的客户端将按非官方处理；自动检查获取到更新的版本时会覆盖此值。`,
+              `声明版本高于 ${effectiveLatestRelease(settings)} 的客户端将按非官方客户端处理；自动检查获取到更高版本时会覆盖此值。`,
               `Clients claiming a version newer than ${effectiveLatestRelease(settings)} are treated as unofficial; a newer version fetched by the automatic check will replace this value.`,
             )
           : t(
-              `已退回基线 ${settings.cc_version_base}，下次自动检查（最多 30 分钟内）会重新获取。`,
+              `已恢复为基线 ${settings.cc_version_base}，下次自动检查（30 分钟内）将重新获取。`,
               `Back to the baseline ${settings.cc_version_base}; the next automatic check (within 30 minutes) will fetch it again.`,
             ),
         type: 'success',
@@ -1568,13 +1568,13 @@ function LatestCcRelease() {
       htmlFor="latest-cc-release"
       label={t('官方最新 Claude Code 版本', 'Latest official Claude Code release')}
       description={t(
-        `User-Agent 中自称高于该版本的 claude-cli 不按官方客户端处理（走模拟路径）。该值每 30 分钟从 downloads.claude.ai 自动获取一次，只升不降，重启后保留。官方刚发布新版、自动检查还没执行时，可在这里手动填写；清除后退回基线 ${base || '—'}，等待下次自动获取。`,
+        `User-Agent 中声明版本高于此值的 claude-cli 不按官方客户端处理（改走模拟路径）。该值每 30 分钟从 downloads.claude.ai 自动获取一次，只升不降，重启后保留。官方刚发布新版而自动检查尚未执行时，可在此手动填写；清除后恢复为基线 ${base || '—'}，等待下次自动获取。`,
         `A claude-cli User-Agent claiming a version newer than this is not treated as an official client (it takes the simulation path). The value is fetched automatically from downloads.claude.ai every 30 minutes, never downgraded, and kept across restarts. Fill it in by hand when a new release has just shipped and the automatic check has not run yet; clearing it falls back to the baseline ${base || '—'} until the next automatic check.`,
       )}
       note={
         <Badge variant={malformed || belowBase ? 'warning' : 'secondary'} size="sm">
           {malformed
-            ? t('格式应形如 2.1.260','Expected something like 2.1.260')
+            ? t('格式示例：2.1.260','Expected something like 2.1.260')
             : belowBase
               ? t(`低于基线 ${base}，不会生效`, `Below the baseline ${base}; has no effect`)
               : current
@@ -1663,13 +1663,13 @@ function MinClientVersion() {
       htmlFor="min-client-version"
       label={t('最低 Claude Code 版本', 'Minimum Claude Code version')}
       description={t(
-        '低于该版本的 Claude Code 会收到 403 与升级提示，留空表示不限。只检查 User-Agent 中的 claude-cli 版本，SDK、浏览器等其他客户端一律放行。注意：User-Agent 可被客户端伪造，此项只用于引导升级，不是安全边界。',
+        '低于该版本的 Claude Code 会收到 403 与升级提示，留空表示不限。仅检查 User-Agent 中的 claude-cli 版本，SDK、浏览器等其他客户端一律放行。注意：User-Agent 可被客户端伪造，此项仅用于引导升级，不能作为安全边界。',
         'Claude Code builds older than this get a 403 with an upgrade hint; leave empty for no limit. Only the claude-cli version in the User-Agent is checked, and SDKs, browsers, and other clients always pass. Note: a User-Agent can be forged, so treat this as an upgrade nudge, not a security boundary.',
       )}
       note={
         <Badge variant={malformed ? 'warning' : 'secondary'} size="sm">
           {malformed
-            ? t('格式应形如 2.1.220','Expected something like 2.1.220')
+            ? t('格式示例：2.1.220','Expected something like 2.1.220')
             : value
               ? t(`要求 ${value} 及以上`, `Requires ${value} or newer`)
               : t('不限版本', 'Any version')}
@@ -1759,7 +1759,7 @@ function BareRateLimit() {
       }
       description={inactive
         ? t(
-            '设备身份校验已开启，无设备身份请求会先被拒绝。当前配置会保留，切换到兼容模式后自动生效。',
+            '设备身份校验已启用，无设备身份的请求会直接被拒绝。当前配置将保留，切换到兼容模式后自动生效。',
             'Device identity checks are enabled, so requests without device identity are rejected first. The configuration is kept and takes effect automatically in compatible mode.',
           )
         : t(
@@ -1771,7 +1771,7 @@ function BareRateLimit() {
       footer={!inactive && (
         <p className="mt-2 w-full border-t pt-4 text-xs leading-5 text-muted-foreground">
           {t(
-            '仅统计无设备身份的消息请求，token 计数接口不计入；单个账号达到上限后自动换账号，所有账号都达到上限才拒绝。服务重启后重新计数。',
+            '仅统计无设备身份的消息请求，token 计数接口不计入；单个账号达到上限后自动切换账号，所有账号均达到上限时才拒绝请求。服务重启后重新计数。',
             'Only message requests without device identity are counted; token-counting requests are excluded. The proxy switches accounts when one reaches its limit and rejects only when every account is capped. Counters reset after a service restart.',
           )}
         </p>
@@ -1890,7 +1890,7 @@ function AdminPassword() {
   if (authQuery.isPending) {
     return (
       <Field className="p-4 sm:p-5">
-        <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
+        <FieldLabel>{t('管理密码（登录控制台所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
           <Spinner className="size-3" />
           {t('正在加载', 'Loading')}
@@ -1902,7 +1902,7 @@ function AdminPassword() {
   if (authQuery.isError) {
     return (
       <Field className="p-4 sm:p-5">
-        <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
+        <FieldLabel>{t('管理密码（登录控制台所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs text-destructive-foreground">
             {t('无法读取登录状态', 'Unable to load sign-in status')}
@@ -1923,12 +1923,12 @@ function AdminPassword() {
   return (
     <>
       <Field className="p-4 sm:p-5">
-        <FieldLabel>{t('管理密码（登录网页所需）', 'Admin password (required for sign-in)')}</FieldLabel>
+        <FieldLabel>{t('管理密码（登录控制台所需）', 'Admin password (required for sign-in)')}</FieldLabel>
         {envManaged ? (
           <FieldDescription>
             {t('由环境变量', 'Managed by environment variable')}{' '}
             <code className="font-mono">LUBAN_ADMIN_PASSWORD</code>
-            {t(' 接管，网页只读。', '; this page is read-only.')}
+            {t(' 管理，此处只读。', '; this page is read-only.')}
           </FieldDescription>
         ) : (
           <>
@@ -1968,7 +1968,7 @@ function AdminPassword() {
             {!configured && (
               <FieldDescription>
                 {t(
-                  '未设置密码时，任何能访问控制台的设备都无需登录；对外开放时建议设置。',
+                  '未设置密码时，任何能访问控制台的设备均可直接进入；控制台对外开放时，建议设置密码。',
                   'Without a password, any device that can reach the console can access it without signing in. Set one if the console is publicly accessible.',
                 )}
               </FieldDescription>

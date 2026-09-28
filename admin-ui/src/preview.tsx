@@ -716,7 +716,7 @@ function PreviewHeader() {
 
   return (
     <AppHeader
-      homeLabel={t('回到顶部', 'Back to top')}
+      homeLabel={t('返回顶部', 'Back to top')}
       onNavigateHome={scrollToTop}
       actions={
         <>

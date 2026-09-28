@@ -40,10 +40,10 @@ const PAGE_SIZES = [25, 50, 100] as const
 export function sourceLabel(source: string, t: (zh: string, en: string) => string): string {
   switch (source) {
     case 'forward': return t('转发 4xx', 'Forward 4xx')
-    case 'forward_401': return t('转发 401 换账号', 'Forward 401, account switch')
+    case 'forward_401': return t('转发 401 后换账号', 'Forward 401, account switch')
     case 'probe': return t('连通性测试', 'Connectivity test')
     case 'keepalive': return t('保活端点 401/403', 'Keepalive 401/403')
-    case 'refresh': return t('refresh token 被作废', 'Refresh token revoked')
+    case 'refresh': return t('refresh token 已吊销', 'Refresh token revoked')
     case 'proxy': return t('代理不可用', 'Proxy unusable')
     default: return source
   }
@@ -167,10 +167,10 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
             {t(`账龄 ${ageDays} 天`, `${ageDays} days old`)}
           </span>
         </Fact>
-        <Fact label={t('当时代理', 'Proxy at the time')}>
+        <Fact label={t('当时的代理', 'Proxy at the time')}>
           <span className="font-mono text-xs">{ev.proxy ?? t('直连', 'direct')}</span>
         </Fact>
-        <Fact label={t('终身', 'Lifetime')}>
+        <Fact label={t('累计', 'Lifetime')}>
           {t(`${ev.lifetime_requests} 次请求 · ${formatUsd(ev.lifetime_cost_usd)}`,
             `${ev.lifetime_requests} requests · ${formatUsd(ev.lifetime_cost_usd)}`)}
         </Fact>
@@ -194,21 +194,21 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
         </div>
         <div className="sm:col-span-2 lg:col-span-4">
           <Fact label={t('发给 Anthropic 的设备 ID 分布（7 天）', 'Device IDs sent to Anthropic (7d)')}>
-            <Distribution items={ev.device_ids_out_7d} empty={t('旧记录未记录此项', 'not recorded in older rows')} />
+            <Distribution items={ev.device_ids_out_7d} empty={t('旧记录不含此项', 'not recorded in older rows')} />
           </Fact>
         </div>
         <div className="sm:col-span-2 lg:col-span-4">
           <Fact label={t('出口代理分布（7 天）', 'Proxies (7d)')}>
-            <Distribution items={ev.proxies_7d} empty={t('全部直连，或旧记录未记录此项', 'all direct, or not recorded in older rows')} />
+            <Distribution items={ev.proxies_7d} empty={t('全部直连，或旧记录不含此项', 'all direct, or not recorded in older rows')} />
           </Fact>
         </div>
       </div>
 
       <div className="flex items-center justify-between gap-2">
         <div className="text-sm font-medium">
-          {t('封前流水时间线', 'Traffic timeline before the ban')}
+          {t('封号前流水时间线', 'Traffic timeline before the ban')}
           <span className="ml-2 text-xs text-muted-foreground">
-            {t('封号前 7 天至封号后 10 分钟内到达的请求，含触发封号的那一条请求；表格分页显示，导出的是完整流水', 'Requests that arrived from 7 days before to 10 minutes after the ban, including the triggering one; the table is paginated, while the export includes all of them')}
+            {t('封号前 7 天至封号后 10 分钟内到达的请求，包括触发封号的请求；表格分页显示，导出内容为完整流水', 'Requests that arrived from 7 days before to 10 minutes after the ban, including the triggering one; the table is paginated, while the export includes all of them')}
           </span>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -231,7 +231,7 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
         </Alert>
       ) : total === 0 ? (
         <div className="py-4 text-center text-sm text-muted-foreground">
-          {t('这次封号之前没有留下流水（可能已被清理，或账号刚添加就被封）', 'No traffic was recorded before this ban (it may have been pruned, or the account was banned right after being added)')}
+          {t('本次封号前没有流水记录（可能已被清理，或账号添加后随即被封）', 'No traffic was recorded before this ban (it may have been pruned, or the account was banned right after being added)')}
         </div>
       ) : (
         <>
@@ -445,7 +445,7 @@ export function BanEventsDialog({
           <DialogDescription>
             {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
             <ClampedDescription text={t(
-              '每次自动封停记录一条：上游原话、触发请求、账号当时的等级 / 代理 / 用量快照，以及封号前 7 天的全部流水（含取证列）。解封、删除账号、清理流水都不会删除这里的记录。',
+              '每次自动封停生成一条记录，包含上游原始返回信息、触发请求、账号当时的等级 / 代理 / 用量快照，以及封号前 7 天的全部流水（含取证列）。解封、删除账号或清理流水均不会删除这些记录。',
               'One row per automatic disable: the upstream message, the triggering request, a snapshot of the account’s tier / proxy / usage at the time, and every request from the 7 days before (with forensic columns). Re-enabling or deleting the account, or pruning logs, never removes these records.',
             )} />
           </DialogDescription>
@@ -466,9 +466,9 @@ export function BanEventsDialog({
           ) : events.length === 0 ? (
             <Empty>
               <EmptyHeader>
-                <EmptyTitle>{t('还没有封号记录', 'No ban events yet')}</EmptyTitle>
+                <EmptyTitle>{t('暂无封号记录', 'No ban events yet')}</EmptyTitle>
                 <EmptyDescription>
-                  {t('账号被上游自动封停时，会在这里留下一条记录，之后解封或删除账号也不会消失。', 'When an account is auto-disabled because of an upstream error, a row is added here and stays, even after the account is re-enabled or deleted.')}
+                  {t('账号因上游错误被自动封停时，此处会新增一条记录；此后即使解封或删除该账号，记录仍会保留。', 'When an account is auto-disabled because of an upstream error, a row is added here and stays, even after the account is re-enabled or deleted.')}
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -484,7 +484,7 @@ export function BanEventsDialog({
                     <TableHead>{t('来源', 'Source')}</TableHead>
                     <TableHead>{t('状态', 'Status')}</TableHead>
                     <TableHead>{t('原因', 'Reason')}</TableHead>
-                    <TableHead className="text-right">{t('封前 7 天', '7d')}</TableHead>
+                    <TableHead className="text-right">{t('封号前 7 天', '7d')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -529,7 +529,7 @@ export function BanEventsDialog({
                                   <Badge size="sm" variant="outline">{sourceLabel(ev.source, t)}</Badge>
                                   <span className="tabular-nums">
                                     {t(
-                                      `封前 7 天 ${ev.requests_7d} 次 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
+                                      `封号前 7 天 ${ev.requests_7d} 次请求 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
                                       `7d before: ${ev.requests_7d} req · ${ev.devices_7d} in → ${ev.devices_out_7d} out`,
                                     )}
                                   </span>
@@ -558,7 +558,7 @@ export function BanEventsDialog({
                                 这里用「3→2 台」，完整说法在 title 里。窄屏的堆叠行能折行，照写全称。 */}
                             <span
                               title={t(
-                                `封前 7 天：入站 ${ev.devices_7d} 台 → 出站 ${ev.devices_out_7d} 台`,
+                                `封号前 7 天：入站 ${ev.devices_7d} 台 → 出站 ${ev.devices_out_7d} 台`,
                                 `7 days before: ${ev.devices_7d} inbound → ${ev.devices_out_7d} outbound devices`,
                               )}
                             >

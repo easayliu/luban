@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
+import { listProxies } from '@/api/proxies'
 import {
   ActivityIcon, ArrowUpDownIcon, Building2Icon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon, EllipsisIcon,
   GaugeIcon, GlobeIcon, MessagesSquareIcon, PanelTopOpenIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
@@ -347,14 +348,14 @@ function refreshFailureDetail(banReason: string): string {
 function subscriptionPauseDetail(cred: Credential, language: Language): string {
   const resume = localize(
     language,
-    '之后手动启用或做一次连通性测试（通过即恢复）；暂停期间不会自动恢复',
+    '随后手动启用，或执行一次连通性测试（通过即恢复）；暂停期间不会自动恢复',
     'then enable it manually or run a connectivity test (it resumes when the test passes); it will not resume on its own',
   )
   const plan = planKey(cred.tier)
   if (plan === 'free') {
     return localize(
       language,
-      `Free 账号没有访问权限（上游拒绝 OAuth 登录），已暂停调度。需要先订阅，${resume}`,
+      `Free 账号没有访问权限（上游拒绝 OAuth 登录），已暂停调度。请先订阅，${resume}`,
       `Free accounts have no access (upstream rejects OAuth authentication), so scheduling is paused. Subscribe first, ${resume}`,
     )
   }
@@ -367,7 +368,7 @@ function subscriptionPauseDetail(cred: Credential, language: Language): string {
   }
   return localize(
     language,
-    `订阅已失效（上游拒绝 OAuth 登录，多为到期未续费），已暂停调度。需要续费，${resume}`,
+    `订阅已失效（上游拒绝 OAuth 登录，多为到期未续费），已暂停调度。请续费，${resume}`,
     `Subscription has lapsed (upstream rejects OAuth authentication, usually an expired plan that was not renewed), so scheduling is paused. Renew it, ${resume}`,
   )
 }
@@ -386,7 +387,7 @@ function statusFromQuota(
       label: localize(language, '刷新失败暂停', 'Refresh failed'),
       detail: localize(
         language,
-        `token 刷新失败，已暂停调度，${formatFullTime(cred.resume_at, language)} 自动恢复；多为代理或网络问题，检查代理后可做一次连通性测试立即恢复。原因：${refreshFailureDetail(cred.ban_reason!)}`,
+        `token 刷新失败，已暂停调度，将于 ${formatFullTime(cred.resume_at, language)} 自动恢复；多为代理或网络问题，检查代理后可执行一次连通性测试立即恢复。原因：${refreshFailureDetail(cred.ban_reason!)}`,
         `Token refresh failed, so scheduling is paused until ${formatFullTime(cred.resume_at, language)}. This is usually a proxy or network problem; check the proxy, then run a connectivity test to restore it now. Reason: ${refreshFailureDetail(cred.ban_reason!)}`,
       ),
       attention: true, rank: 6,
@@ -398,7 +399,7 @@ function statusFromQuota(
       label: localize(language, '限流暂停', 'Rate limited'),
       detail: localize(
         language,
-        `账号用量已达上限，已移出调度池，${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或做一次连通性测试立即恢复`,
+        `账号用量已达上限，已移出调度池，将于 ${formatFullTime(cred.resume_at, language)} 自动恢复；也可手动启用或执行一次连通性测试立即恢复`,
         `Usage limit reached; removed from the scheduling pool and resuming automatically at ${formatFullTime(cred.resume_at, language)}. You can also enable it manually or run a connectivity test to restore it now`,
       ),
       attention: true, rank: 6,
@@ -465,13 +466,13 @@ function statusFromQuota(
       detail: quota.overageUnresolved === 'no-full-window'
         ? localize(
             language,
-            `用量快照（${snapshotTime}）显示上游动用了 Usage credits，但它报告的窗口没有一个是满的。等待新请求也无法确认，请做一次连通性测试，查看上游此刻的原始限流响应头`,
+            `用量快照（${snapshotTime}）显示上游已动用 Usage credits，但上游报告的窗口均未用满。等待新请求也无法确认，请执行一次连通性测试，查看上游当前的原始限流响应头`,
             `The usage snapshot (${snapshotTime}) shows the upstream drawing on usage credits, yet none of the windows it reported is full. Waiting for new requests will not clarify this; run a connectivity test to see the upstream's current raw rate limit headers`,
           )
         : quota.overageUnresolved === 'legacy-snapshot'
           ? localize(
               language,
-              `用量快照（${snapshotTime}）早于「记录全部用量窗口」这次升级，只保存了 5h / 7d 两个窗口，已用满的那个窗口（通常是超额用量窗口）没有保存下来。下一条带限流响应头的请求会自动补齐`,
+              `用量快照（${snapshotTime}）早于「记录全部用量窗口」功能上线，仅保存了 5h / 7d 两个窗口，已用尽的窗口（通常是超额用量窗口）未被保存。下一条带限流响应头的请求将自动补齐`,
               `The usage snapshot (${snapshotTime}) predates the full-window recording upgrade and only stored the 5h / 7d windows, so the exhausted one (typically the extra usage window) was not kept. The next request carrying rate limit headers will fill it in`,
             )
           : localize(
@@ -560,8 +561,8 @@ export function fablePoolHint(w: QuotaWindowMeta, language: Language): string {
   return [
     localize(
       language,
-      'fable 专用额度池（上游 7d_oi，7 天周期）：满了只影响 fable，账号其余模型照常服务',
-      'Fable-only pool (upstream 7d_oi, 7-day period): when full only fable is affected; the account keeps serving its other models',
+      'fable 专用额度池（上游 7d_oi，7 天周期）：额度用尽后仅影响 fable，该账号其余模型照常服务',
+      'Fable-only pool (upstream 7d_oi, 7-day period): once exhausted, only fable is affected; the account keeps serving its other models',
     ),
     w.status && localize(language, `上游原值 ${w.status}`, `upstream raw value ${w.status}`),
     w.resetAt != null && localize(
@@ -593,10 +594,10 @@ export function modelCooldownSummary(
       secs >= 60
         ? localize(
             language,
-            `${model} 还有 ${Math.ceil(secs / 60)} 分钟`,
+            `${model} 剩余 ${Math.ceil(secs / 60)} 分钟`,
             `${model} in ${Math.ceil(secs / 60)} min`,
           )
-        : localize(language, `${model} 还有 ${secs} 秒`, `${model} in ${secs}s`),
+        : localize(language, `${model} 剩余 ${secs} 秒`, `${model} in ${secs}s`),
     )
     .join(localize(language, '、', ', '))
 }
@@ -669,7 +670,7 @@ export const SORTS: { key: SortKey; label: string }[] = [
   { key: 'devices', label: '设备数' },
   { key: 'sessions', label: '会话数' },
   { key: 'rpm', label: '当前 RPM' },
-  { key: 'cost', label: '累计花费' },
+  { key: 'cost', label: '累计费用' },
   { key: 'recent', label: '最近使用' },
   { key: 'created', label: '添加时间' },
 ]
@@ -874,10 +875,10 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     mutationFn: ({ pct, pct7d }: { pct: number | null; pct7d: number | null }) =>
       setCredentialQuotaPausePct(cred.id, pct, pct7d),
     onSuccess: () => {
-      toastManager.add({ title: t('提前停调度阈值已保存', 'Early pause threshold saved'), type: 'success' })
+      toastManager.add({ title: t('提前暂停调度阈值已保存', 'Early pause threshold saved'), type: 'success' })
       invalidate()
     },
-    onError: (e) => failure(t('设置提前停调度阈值失败', 'Failed to set the early pause threshold'), e),
+    onError: (e) => failure(t('设置提前暂停调度阈值失败', 'Failed to set the early pause threshold'), e),
   })
   const proxy = useMutation({
     mutationFn: (url: string | null) => setProxy(cred.id, url),
@@ -992,7 +993,7 @@ function useCredentialMenuGroups(
     // 与设备上限开的是同一个对话框（会话那一半在下面）：两种名额总是一起看。
     { key: 'session', icon: <MessagesSquareIcon />, label: t('模拟会话上限', 'Session limit'), onSelect: h.onDeviceLimit },
     { key: 'rpm', icon: <GaugeIcon />, label: t('RPM 上限', 'RPM limit'), onSelect: h.onRpmLimit },
-    { key: 'pause', icon: <PercentIcon />, label: t('提前停调度阈值', 'Early pause threshold'), onSelect: h.onQuotaPause },
+    { key: 'pause', icon: <PercentIcon />, label: t('提前暂停调度阈值', 'Early pause threshold'), onSelect: h.onQuotaPause },
     { key: 'proxy', icon: <GlobeIcon />, label: t('出站代理', 'Outbound proxy'), onSelect: h.onProxy },
     { key: 'usage', icon: <ScrollTextIcon />, label: t('请求明细', 'Request log'), onSelect: h.onUsage },
   ]
@@ -1143,6 +1144,7 @@ function CredentialActionSheet({
   open: boolean
   onOpenChange: (open: boolean) => void
 } & CredentialMenuHandlers) {
+  const proxyName = useProxyName()
   const { t, language, locale } = useI18n()
   const items = new Map(useCredentialMenuGroups(cred, actions, handlers).flat().map((item) => [item.key, item]))
   const pick = (keys: string[]) => keys.map((key) => items.get(key)).filter((item): item is CredentialMenuItem => item != null)
@@ -1154,13 +1156,13 @@ function CredentialActionSheet({
   }
   const limit = (count: number, effective: number) =>
     `${count.toLocaleString(locale)}/${effective > 0 ? effective.toLocaleString(locale) : '∞'}`
-  const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('不停', 'off'))
+  const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('停用', 'off'))
   /** 设置行右侧的当前值：与详情页读数、调度配置同一口径。 */
   const valueOf: Record<string, string> = {
     device: `${limit(cred.device_count, cred.device_limit_effective)} · ${limit(cred.session_count, cred.session_limit_effective)}`,
     rpm: cred.rpm_limit_effective > 0 ? String(cred.rpm_limit_effective) : t('不限', 'Unlimited'),
     pause: `${pause(cred.quota_pause_pct_effective)} · ${pause(cred.quota_pause_pct_7d_effective)}`,
-    proxy: cred.proxy ? proxyLabelParts(cred.proxy).host : t('直连', 'Direct'),
+    proxy: proxyName(cred.proxy) ?? t('直连', 'Direct'),
   }
   const quick = pick(['detail', 'test', 'refresh', 'usage'])
   const settings = pick(['rename', 'device', 'rpm', 'pause', 'proxy'])
@@ -1612,7 +1614,7 @@ export function ConnectivityTestDialog({
               </div>
               <FieldDescription>
                 {t(
-                  '每次测试会消耗少量订阅用量，并计入该账号当前周期的请求数与花费。',
+                  '每次测试会消耗少量订阅用量，并计入该账号当前周期的请求数与费用。',
                   'Each test uses a small amount of subscription usage and counts toward this account’s current-period requests and cost.',
                 )}
               </FieldDescription>
@@ -1625,7 +1627,7 @@ export function ConnectivityTestDialog({
                 <EmptyTitle className="text-base">{t('尚无测试结果', 'No test results yet')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '选择模型并开始测试，结果会显示实时用量或上游错误。',
+                    '选择模型并开始测试，结果将显示实时用量或上游错误。',
                     'Select a model and start a test to see live usage data or upstream errors.',
                   )}
                 </EmptyDescription>
@@ -1740,7 +1742,7 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
         <span
           className="text-destructive-foreground"
           title={t(
-            '本次请求由 Usage credits（上游响应头里的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
+            '本次请求由 Usage credits（上游响应头中的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
             'This request was served by usage credits (`overage` in the upstream headers): the plan\'s included usage is exhausted and standard API rates now apply',
           )}
         >
@@ -1990,7 +1992,7 @@ export function credentialExpiryMeta(
     className: 'text-muted-foreground',
     title: localize(
       language,
-      `${formatFullTime(cred.expires_at, language)} 过期 · 到点自动刷新`,
+      `${formatFullTime(cred.expires_at, language)} 过期 · 到期自动刷新`,
       `Expires ${formatFullTime(cred.expires_at, language)} · Refreshes automatically when due`,
     ),
   }
@@ -2067,7 +2069,7 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
       className: 'font-medium text-warning-foreground',
       title: localize(
         language,
-        '账号级限流冷却中，结束后会自动恢复调度',
+        '账号级限流冷却中，冷却结束后自动恢复调度',
         'Account-level rate-limit cooldown; scheduling resumes automatically when it ends',
       ),
     }
@@ -2124,6 +2126,29 @@ export function proxyLabelParts(proxy: string): { scheme: string | null; host: s
   const sep = label.indexOf('//')
   if (sep < 0) return { scheme: null, host: label }
   return { scheme: label.slice(0, sep + 2), host: label.slice(sep + 2) }
+}
+
+/**
+ * 账号绑定的代理 → 代理池里的名称。账号上只存 URL，名称在代理池；按 URL 全等查找。
+ * 卡片与列表只显示名称，不铺 IP 与端口：
+ * - 池里有且起过名的 → 名称；
+ * - 池里有但名称就是自动生成的 `host:port`（添加时留空）→ 「代理 #id」；
+ * - 不在池里的自定义地址 → 「自定义代理」。
+ * 完整地址（脱敏）仍在 Tooltip 与出站代理对话框里。与代理池共用 `['proxies']` 缓存。
+ */
+export function useProxyName(): (proxy: string | null) => string | null {
+  const { t } = useI18n()
+  const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
+  const byUrl = useMemo(() => new Map((data ?? []).map((p) => [p.url, p])), [data])
+  return (proxy) => {
+    if (!proxy) return null
+    const saved = byUrl.get(proxy)
+    if (!saved) return t('自定义代理', 'Custom proxy')
+    const name = saved.label.trim()
+    const hostPort = proxyLabelParts(proxy).host
+    if (!name || name === hostPort) return t(`代理 #${saved.id}`, `Proxy #${saved.id}`)
+    return name
+  }
 }
 
 /**

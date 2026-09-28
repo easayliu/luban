@@ -274,7 +274,7 @@ export function CredentialDevicesDialog({
                   </CardTitle>
                   <CardDescription className="text-xs">
                     {t(
-                      '明确选择账号是跟随全局设置、不限设备，还是使用独立上限。',
+                      '选择此账号跟随全局默认、不限设备数，或使用独立上限。',
                       'Choose whether this account uses the global default, allows unlimited devices, or has a custom limit.',
                     )}
                   </CardDescription>
@@ -422,7 +422,7 @@ export function CredentialDevicesDialog({
               <>
                 <p className="mr-auto self-center text-xs text-muted-foreground">
                   {t(
-                    '解绑只会释放当前名额；设备下次请求时仍可能重新绑定。',
+                    '解绑仅释放当前名额；该设备下次请求时仍可能重新绑定。',
                     'Unbinding only frees the current slot; the device may bind again on its next request.',
                   )}
                 </p>
@@ -529,7 +529,7 @@ export function DeviceList({
             <EmptyTitle className="text-base">{t('暂无活跃设备', 'No active devices')}</EmptyTitle>
             <EmptyDescription>
               {t(
-                '设备完成一次请求后会出现在这里。',
+                '设备完成一次请求后将显示在此处。',
                 'A device will appear here after it completes a request.',
               )}
             </EmptyDescription>
@@ -644,13 +644,13 @@ export function DeviceList({
                       label={t('本账号', 'This account')}
                       value={formatUsd(device.cost_usd)}
                       valueClass="w-14"
-                      hint={t('这台设备经本账号产生的等价 API 费用', 'Equivalent API cost this device incurred through this account')}
+                      hint={t('该设备经本账号产生的等价 API 费用', 'Equivalent API cost this device incurred through this account')}
                     />
                     <DeviceStat
                       label={t('全部账号', 'All accounts')}
                       value={formatUsd(device.cost_usd_all)}
                       valueClass="w-14"
-                      hint={t('这台设备在本网关所有账号上的累计花费', "This device's total cost across every account on this gateway")}
+                      hint={t('该设备在本网关所有账号上的累计费用', "This device's total cost across every account on this gateway")}
                     />
                   </div>
                 </div>
@@ -761,7 +761,7 @@ function SessionCapacityCard({
           <CardDescription className="text-xs">
             {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
             <ClampedDescription text={t(
-              '走模拟路径且没有设备身份的客户端请求按对话固定到账号（有自带的会话 ID 就按它，否则按缓存前缀 + 首条用户消息），每个对话占一个槽位。出站会话 ID 按槽位派生，槽位释放后由下一个对话复用，因此上游看到的会话 ID 数量不会超过这个上限。与设备名额互不相干。',
+              '走模拟路径且无设备身份的客户端请求按对话固定到账号：请求自带会话 ID 时以其为准，否则按缓存前缀 + 首条用户消息识别。每个对话占用一个槽位。出站会话 ID 由槽位派生，槽位释放后由下一个对话复用，因此上游可见的会话 ID 数量不会超过此上限。该上限与设备名额相互独立。',
               'Client requests on the simulation path without a device identity stick to this account per conversation (by their own session ID if present, otherwise by cache prefix + first user message), each taking a slot. The outbound session ID derives from the slot and is reused by the next conversation once the slot is freed, so upstream sees at most this many session IDs. Independent of device slots.',
             )} />
           </CardDescription>
@@ -969,7 +969,7 @@ export function SessionList({
               loading={clearAll.isPending}
               disabled={unbind.isPending}
               onClick={() => clearAll.mutate()}
-              title={t('清除这个账号的全部模拟会话绑定（含休眠的）；下一条请求会照常重新选择账号','Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
+              title={t('清除此账号的全部模拟会话绑定（含休眠会话）；后续请求将照常重新选择账号','Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
             >
               <Trash2Icon />
               {t('全部清理', 'Clear all')}
@@ -1011,7 +1011,7 @@ export function SessionList({
             <EmptyTitle className="text-base">{t('暂无活跃会话', 'No active sessions')}</EmptyTitle>
             <EmptyDescription>
               {t(
-                '走模拟路径且没有设备身份的请求完成一次后会出现在这里。',
+                '走模拟路径且无设备身份的请求完成一次后，会话将显示在此处。',
                 'A session appears here after a simulated request without a device identity completes.',
               )}
             </EmptyDescription>
@@ -1036,7 +1036,7 @@ export function SessionList({
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-2">
                   <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由它派生，释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
+                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
                     #{session.slot}
                   </Badge>
                   <Tooltip>
@@ -1044,7 +1044,7 @@ export function SessionList({
                       {session.session_id}
                     </TooltipTrigger>
                     <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
-                      {t(`上游看到的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)}
+                      {t(`上游可见的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)}
                       <br />
                       {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
                     </TooltipPopup>
@@ -1070,7 +1070,7 @@ export function SessionList({
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`查看这条会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
+                      aria-label={t(`查看该会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
                       // 按**对话键**筛而不是按上游那个 session_id：后者按槽位派生、对话之间
                       // 复用，按它筛会把先后占过同一槽位的几个对话混成一条。
                       onClick={() => setDrill({
@@ -1082,7 +1082,7 @@ export function SessionList({
                     >
                       <ScrollTextIcon />
                     </TooltipTrigger>
-                    <TooltipPopup>{t('查看这条会话的请求','View this session’s requests')}</TooltipPopup>
+                    <TooltipPopup>{t('查看该会话的请求','View this session’s requests')}</TooltipPopup>
                   </Tooltip>
                   <Button
                     size="xs"

@@ -38,7 +38,8 @@ import {
   fablePoolWindow,
   modelCooldownSummary,
   modelDenialSummary,
-  proxyLabelParts,
+  proxyMaskedUrl,
+  useProxyName,
   quotaLevel,
   METER_FILL,
   quotaPercentage,
@@ -213,8 +214,8 @@ export const CredentialCard = memo(function CredentialCard({
   const rpmPolicyHint = cred.rpm_limit === 0
     ? t('上限跟随全局默认', 'the limit follows the global default')
     : cred.rpm_limit < 0
-      ? t('这个账号不限 RPM', 'this account has no RPM limit')
-      : t(`这个账号自定义了上限 ${cred.rpm_limit}`, `this account overrides the limit to ${cred.rpm_limit}`)
+      ? t('此账号不限 RPM', 'this account has no RPM limit')
+      : t(`此账号自定义上限为 ${cred.rpm_limit}`, `this account overrides the limit to ${cred.rpm_limit}`)
   const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
   // 设备名额占用的配色与说明：空闲灰 / 健康绿 / 吃紧黄 / 占满红，见 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
@@ -232,11 +233,11 @@ export const CredentialCard = memo(function CredentialCard({
       )
     : sessionUsage.level === 'critical'
       ? t(
-          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话会分配到其他账号，所有账号都占满时收到 429。点击查看或清理`,
+          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话将分配到其他账号；所有账号均占满时，客户端将收到 429。点击查看或清理`,
           `Session slots are full (${cred.session_count}/${cred.session_limit_effective}): new sessions go to another account, and get a 429 once every account is full. Click to view or clear`,
         )
       : t(
-          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、没有设备身份的客户端请求按会话占用名额）。点击查看或清理`,
+          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、无设备身份的客户端请求按会话占用名额）。点击查看或清理`,
           `${cred.session_count} of ${cred.session_limit_effective} simulated session slots in use (requests on the simulation path without a device identity take one per session). Click to view or clear`,
         )
   // 名额策略不再占页脚的横向宽度（那点宽度让给右边的 RPM 数字），改成给前面那枚手机图标上色：
@@ -251,12 +252,12 @@ export const CredentialCard = memo(function CredentialCard({
   const devicePolicyHint = cred.device_limit === 0
     ? t('名额上限跟随全局默认', 'The slot limit follows the global default')
     : cred.device_limit < 0
-      ? t('这个账号不限设备数', 'This account has no device limit')
-      : t(`这个账号自定义了上限 ${cred.device_limit}`, `This account overrides the limit to ${cred.device_limit}`)
+      ? t('此账号不限设备数', 'This account has no device limit')
+      : t(`此账号自定义上限为 ${cred.device_limit}`, `This account overrides the limit to ${cred.device_limit}`)
   const deviceUsageHint = (() => {
     if (cred.device_count <= 0) {
       return t(
-        `还没有设备绑定到这个账号，${devicePolicyHint}。点击查看`,
+        `尚无设备绑定到此账号，${devicePolicyHint}。点击查看`,
         `No devices are bound to this account yet; ${devicePolicyHint.toLowerCase()}. Click to view`,
       )
     }
@@ -268,7 +269,7 @@ export const CredentialCard = memo(function CredentialCard({
     }
     if (deviceUsage.level === 'critical') {
       return t(
-        `设备名额已占满（${cred.device_count}/${cred.device_limit_effective}，${devicePolicyHint}）：新设备会分配到其他账号，所有账号都占满时收到 429。点击查看`,
+        `设备名额已占满（${cred.device_count}/${cred.device_limit_effective}，${devicePolicyHint}）：新设备将分配到其他账号；所有账号均占满时，客户端将收到 429。点击查看`,
         `Device slots are full (${cred.device_count}/${cred.device_limit_effective}; ${devicePolicyHint.toLowerCase()}): new devices go to another account, and get a 429 once every account is full. Click to view`,
       )
     }
@@ -291,7 +292,7 @@ export const CredentialCard = memo(function CredentialCard({
     if (cred.quota?.cost_5h != null) parts.push(`5h ${formatUsd(cred.quota.cost_5h)}`)
     if (cred.quota?.cost_7d != null) parts.push(`7d ${formatUsd(cred.quota.cost_7d)}`)
     return t(
-      `${parts.join(' · ')}。按公开价目表估算的等价 API 费用，不是账单金额。点击查看请求明细`,
+      `${parts.join(' · ')}。按公开价目表估算的等价 API 费用，并非账单金额。点击查看请求明细`,
       `${parts.join(' · ')}. Equivalent API cost estimated from the public price list, not a bill. Click to view the request log`,
     )
   })()
@@ -300,7 +301,8 @@ export const CredentialCard = memo(function CredentialCard({
   // 避免同一条状态再渲染一块说明，把异常卡片单独撑高。
   const statusUsesTooltip = status.attention
   const added = relativeTime(cred.created_at, now, language)
-  const proxyLabel = cred.proxy ? proxyLabelParts(cred.proxy) : null
+  const proxyName = useProxyName()
+  const proxyLabel = proxyName(cred.proxy)
   const quotaSnapshotTime = cred.quota
     ? formatFullTime(cred.quota.ts, language)
     : t('未知时间', 'unknown time')
@@ -308,7 +310,7 @@ export const CredentialCard = memo(function CredentialCard({
     if (quota.overage === 'none') return null
     if (cred.disabled) {
       return {
-        label: t('快照有 Usage credits', 'Snapshot used usage credits'),
+        label: t('快照含 Usage credits', 'Snapshot used usage credits'),
         variant: 'warning' as const,
         title: t(
           `账号已停用；${quotaSnapshotTime} 的用量快照记录了 Usage credits，当前不纳入调度风险统计`,
@@ -515,9 +517,8 @@ export const CredentialCard = memo(function CredentialCard({
             </Tooltip>
             {proxyLabel ? (
               <Tooltip>
-                {/* 手机上这枚最长：`socks5h://…` 连协议带主机常有 190px，胶囊行一挤就自己独占一行。
-                    窄容器下藏掉协议段只留 `host:port`，再给一个上限截断长域名——完整 URL 在
-                    Tooltip 与出站代理对话框里，一点不丢。 */}
+                {/* 显示代理池里的名称，不铺 IP 与端口；不在池里的自定义地址才退回 `host:port`。
+                    完整地址（脱敏）在 Tooltip 与出站代理对话框里。 */}
                 <TooltipTrigger
                   render={<button type="button" />}
                   className={cn(
@@ -527,14 +528,9 @@ export const CredentialCard = memo(function CredentialCard({
                   onClick={() => setProxyOpen(true)}
                 >
                   <GlobeIcon className="size-3" />
-                  <span className="min-w-0 truncate">
-                    {proxyLabel.scheme ? (
-                      <span className="hidden @sm/card:inline">{proxyLabel.scheme}</span>
-                    ) : null}
-                    {proxyLabel.host}
-                  </span>
+                  <span className="min-w-0 truncate">{proxyLabel}</span>
                 </TooltipTrigger>
-                <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+                <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy!)}</TooltipPopup>
               </Tooltip>
             ) : null}
           </div>
@@ -647,7 +643,7 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('模型冷却', 'Model cooldown')}
                 detail={modelCooldownSummary(cred, language)}
                 hint={t(
-                  '这些模型的额度池已满（上游 429），暂时不参与账号选择；该账号的其余模型照常服务。到点后自动恢复，也可在菜单里手动解除冷却',
+                  '以下模型的额度池已用尽（上游返回 429），暂不参与账号选择；该账号的其余模型照常服务。冷却到期后自动恢复，也可在菜单中手动解除冷却',
                   'The quota pool for these models is exhausted (upstream 429), so they are temporarily skipped during account selection; this account keeps serving its other models. They recover automatically when due, or you can clear the cooldown from the menu',
                 )}
               />
@@ -661,7 +657,7 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('刚被限速', 'Recently throttled')}
                 detail={modelCooldownSummary(cred, language, false)}
                 hint={t(
-                  '这些模型刚被上游限速（容量或请求速率），额度并没有用完。这类限制取决于出口或模型，而不是账号，所以该账号照常参与账号选择。上游期望的是客户端按 retry-after 退避，而不是停用账号',
+                  '以下模型刚被上游限速（容量或请求速率），额度并未用尽。此类限制取决于出口或模型，而非账号，因此该账号照常参与账号选择。上游期望客户端按 retry-after 退避，而非停用账号',
                   'These models were just throttled upstream (capacity or request rate); no quota was exhausted. That kind of limit follows the egress or the model rather than the account, so this account keeps taking part in account selection. What upstream expects is the client backing off per retry-after, not the account being disabled',
                 )}
               />
@@ -674,7 +670,7 @@ export const CredentialCard = memo(function CredentialCard({
                 label={t('套餐不含', 'Not in plan')}
                 detail={modelDenialSummary(cred, language)}
                 hint={t(
-                  '上游判定该账号的套餐不含这些模型：返回 429 却没有任何用量窗口，且组织未开启超额用量（extra usage）。为这些模型选择账号时会跳过它，其余模型照常。连通性测试通过、套餐等级变化或在菜单里手动解除，都会清除这条记录',
+                  '上游判定该账号的套餐不含以下模型：返回 429 但无任何用量窗口，且组织未开通超额用量（extra usage）。为这些模型选择账号时将跳过该账号，其余模型不受影响。连通性测试通过、套餐等级变化或在菜单中手动解除，均会清除此记录',
                   'Upstream reported that this account’s plan does not include these models (a 429 with no usage window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
                 )}
               />
@@ -717,11 +713,11 @@ export const CredentialCard = memo(function CredentialCard({
             value={<>{cred.rpm}<SlotLimit limit={rpmLimit > 0 ? rpmLimit : '∞'} /></>}
             hint={rpmLimit > 0
               ? t(
-                `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败请求），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。达到上限后，新请求会分流到其他账号，已绑定的设备会收到 429。点击调整`,
+                `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经此账号转发的请求数（含失败请求），上限 ${rpmLimit} 条/分钟（${rpmPolicyHint}）。达到上限后，新请求将分流到其他账号，已绑定的设备将收到 429。点击调整`,
                 `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included), limited to ${rpmLimit}/min (${rpmPolicyHint.toLowerCase()}). Once the limit is reached, new requests go to other accounts and already-bound devices get a 429. Click to adjust`,
               )
               : t(
-                `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败请求），${rpmPolicyHint}。点击调整`,
+                `当前 RPM ${cred.rpm}：最近 60 秒经此账号转发的请求数（含失败请求），${rpmPolicyHint}。点击调整`,
                 `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included); ${rpmPolicyHint.toLowerCase()}. Click to adjust`,
               )}
             ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
@@ -906,7 +902,7 @@ export function ExtraWindows({ windows }: { windows: QuotaWindowMeta[] }) {
               {[
                 isCapabilityWindow(w)
                   ? t(
-                      `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；它不是用量窗口，所以没有百分比`,
+                      `${w.name}：上游明确报告 Usage credits（套餐用量耗尽后的按量计费用量）可用；其并非用量窗口，因此不显示百分比`,
                       `${w.name}: the upstream explicitly reports usage credits (pay-as-you-go beyond the plan's included usage) as available; this is not a usage window, so it has no percentage`,
                     )
                   : t(`用量窗口 ${w.name}`, `Usage window ${w.name}`),
@@ -1030,7 +1026,7 @@ export function UpstreamVerdict({
       )
   const representativeDetail = quota.rl_representative
     ? t(
-        `上游报告当前起约束作用的是 ${quota.rl_representative} 窗口。若它不是 5h / 7d 之一，说明这是一个未被记录的窗口（通常是超额用量窗口），卡片上没有对应的进度条`,
+        `上游报告当前起约束作用的是 ${quota.rl_representative} 窗口。若该窗口不属于 5h / 7d，则为未记录的窗口（通常是超额用量窗口），卡片上不显示对应的进度条`,
         `The upstream reports the ${quota.rl_representative} window as the binding constraint. If it is not one of the 5h / 7d windows, it is an unrecorded window (typically the extra usage window) and has no meter on this card`,
       )
     : null
@@ -1298,7 +1294,7 @@ function FablePoolMeter({ window: w, now }: { window: QuotaWindowMeta; now: numb
       </TooltipTrigger>
       <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
         {fablePoolHint(w, language)}
-        {rejected && t('。上游已拒绝：fable 暂时不会分配到这个账号', '. Rejected upstream: fable will not be routed to this account for now')}
+        {rejected && t('。上游已拒绝：fable 暂不会分配到此账号', '. Rejected upstream: fable will not be routed to this account for now')}
       </TooltipPopup>
     </Tooltip>
   )

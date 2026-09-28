@@ -264,7 +264,7 @@ export function AddAccount({
                 )}
                 <FieldDescription>
                   {t(
-                    '换码与拉取账号信息都经由此代理，添加后自动设为该账号的出站代理。留空为直连。',
+                    '换取授权码与获取账号信息均经由此代理，添加后自动设为该账号的出站代理。留空则直连。',
                     'The token exchange and profile fetch go through this proxy; it becomes the account’s outbound proxy once added. Leave blank to connect directly.',
                   )}
                 </FieldDescription>

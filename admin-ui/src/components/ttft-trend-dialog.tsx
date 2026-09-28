@@ -113,7 +113,7 @@ function slotReadout(
   const when = granularity === 'hour' ? `${day} ${p(d.getHours())}:00` : day
   const axis = granularity === 'hour' ? `${p(d.getHours())}:00` : day
   if (!slot.hasTraffic) {
-    return { when, axis, value: '—', detail: t('这个时段没有请求', 'No requests in this period') }
+    return { when, axis, value: '—', detail: t('该时段没有请求', 'No requests in this period') }
   }
   return {
     when,
@@ -386,7 +386,7 @@ export function TtftTrendDialog({
               </div>
               <DialogDescription className="mt-1">
                 {t(
-                  '上游返回首个 token 的耗时，按 p50 / p95 展示（仅统计成功请求）；吞吐是首字之后的输出速度。',
+                  '上游返回首个 token 的耗时，按 p50 / p95 展示（仅统计成功请求）；吞吐为首字之后的输出速度。',
                   'Time to first token from upstream as p50 / p95 (successful requests only); throughput is the output speed after the first token.',
                 )}
               </DialogDescription>
@@ -425,7 +425,7 @@ export function TtftTrendDialog({
                   { shape: 'line', swatch: 'bg-chart-2/50', label: 'p95' },
                 ]}
                 hint={t(
-                  '柱子是 p50，柱顶上方的短横线是 p95；两者相差越大，长尾越重。',
+                  '柱形表示 p50，柱顶上方的短横线表示 p95；两者差距越大，长尾越明显。',
                   'The bar is p50 and the short line above it is p95; the wider the gap, the heavier the tail.',
                 )}
               />
@@ -479,10 +479,10 @@ export function TtftTrendDialog({
             <Empty>
               <EmptyHeader>
                 <EmptyMedia variant="icon"><TimerIcon /></EmptyMedia>
-                <EmptyTitle>{t('这段时间没有请求', 'No requests in this period')}</EmptyTitle>
+                <EmptyTitle>{t('所选时间范围内没有请求', 'No requests in this period')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '换一个更长的时间范围，或先发几条请求。',
+                    '请选择更长的时间范围，或先发送若干请求。',
                     'Try a longer range, or send some requests first.',
                   )}
                 </EmptyDescription>
@@ -501,7 +501,7 @@ export function TtftTrendDialog({
           {/* p50 / p95 的含义交给图例与它末尾那枚 info，这里只剩图例说不了的两件事。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空着的格子表示该时段没有成功请求。请求明细只保留 30 天。',
+              '空白格表示该时段没有成功请求。请求明细只保留 30 天。',
               'A gap means no successful requests in that period. Request logs are kept for 30 days.',
             )}
           </p>

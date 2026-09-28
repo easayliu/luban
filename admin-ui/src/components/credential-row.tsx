@@ -25,7 +25,8 @@ import {
   deviceUsageMeta,
   evaluateCredential,
   METER_FILL,
-  proxyDisplayLabel,
+  proxyMaskedUrl,
+  useProxyName,
   quotaLevel,
   fablePoolHint,
   fablePoolWindow,
@@ -100,22 +101,22 @@ const COL = {
       168px 才放全，多数行却只有「运行正常」四个字，大半是空白。表格里让徽标换到两行（行高本来
       就是两行：账号名 + 添加时间），列宽收到 144px，状态文字一个不丢，见 ScheduleControl。 */
   schedule: 'w-36',
-  /** 格子里只有 `P0`（约 18px），宽度是英文表头 `PRIORITY` + 排序箭头（约 86px）定的；
-      表头允许越到下一列的内边距里（`TOTAL COST` 一直如此），收到 80px 仍读得全。 */
-  priority: 'w-20',
-  /** 「Max 20x」徽标 58px；组织账号的两枚徽标本来就换行排。 */
-  tier: 'w-20',
+  /** 优先级单独一窄列：它是可排序、要竖着比大小的数值，并进调度格后表头「调度 / 优先级」只按优先级排，
+      读不出来。格子里是与卡片同款的描边胶囊 `P0`（约 20px）；表头「优先级」/`PRIO.` + 箭头约 50px，
+      越进右内边距几像素，56px 够。 */
+  priority: 'w-14',
+  /** 「🏢 Max 20x」（楼 / 人图标 + 档位，见 [AccountTierBadge]）约 72px，内容宽 = 96 − 20 = 76px，
+      两边各留 10px 正常内边距。 */
+  tier: 'w-24',
   /**
    * 一格里排四样：用量摘要（最长 `1,633 · 245M · $188.30` 实测约 140px）、百分比 28px、
    * 进度条、重置倒计时 44px，分两行的依据见 [ListQuotaMeter] 里那段排版注释。
    *
-   * 内容宽 = 列宽 − 20px：w-44 给 156px、2xl 的 w-48 给 172px。2xl 下除最长的那一条外都放得全，
-   * xl 下四位数请求 + 三位美元的几行会截尾——精确值在悬浮提示里（delay=0）。再宽就只能动账号列了，
-   * 那是身份列，不动。多要的 16px 由优先级、账号等级、RPM、累计花费（2xl 再加「最近使用」）
-   * 各让 8px 匀出来，固定列合计不变。
+   * 内容宽 = 列宽 − 20px：w-45 给 160px、2xl 的 w-49 给 176px，最长的那条（约 140px 摘要）
+   * 在 xl 下也放得全。多出的 4px 来自收窄到 56px 的优先级列，固定列合计不变。
    */
-  quota5h: 'w-44 2xl:w-48',
-  quota7d: 'w-44 2xl:w-48',
+  quota5h: 'w-45 2xl:w-49',
+  quota7d: 'w-45 2xl:w-49',
   /**
    * 设备、模拟会话、RPM 三行迷你进度条（[SlotMeterRow]），与用量列同一套语言；原来单独的 RPM
    * 列并进来了，它那 w-18 让给这一列。定宽的只有图标与数字（数字列占 44px，够 `0/1000`），
@@ -188,7 +189,7 @@ export function CredentialListHeader({
         </TableHead>
         <TableHead className={COL.schedule}>{t('调度', 'Scheduling')}</TableHead>
         <TableHead className={COL.priority} {...sortProps('priority')}>
-          {sortable(t('优先级', 'Priority'), 'priority')}
+          {sortable(t('优先级', 'Prio.'), 'priority')}
         </TableHead>
         <TableHead className={COL.tier} {...sortProps('tier')}>
           {sortable(t('账号等级', 'Tier'), 'tier')}
@@ -207,7 +208,7 @@ export function CredentialListHeader({
           {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
         <TableHead className={cn(COL.cost, 'text-right')} {...sortProps('cost')}>
-          {sortable(t('累计花费', 'Total cost'), 'cost', true)}
+          {sortable(t('累计费用', 'Total cost'), 'cost', true)}
         </TableHead>
         <TableHead className={COL.action}>
           <span className="sr-only">{t('操作', 'Actions')}</span>
@@ -232,6 +233,7 @@ export const CredentialRow = memo(function CredentialRow({
   onSelectedChange?: (id: number, next: boolean) => void
 }) {
   const { t, language } = useI18n()
+  const proxyName = useProxyName()
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [proxyOpen, setProxyOpen] = useState(false)
   const [rpmOpen, setRpmOpen] = useState(false)
@@ -331,9 +333,9 @@ export const CredentialRow = memo(function CredentialRow({
                           onClick={() => setProxyOpen(true)}
                         >
                           <GlobeIcon className="size-3 shrink-0" />
-                          <span className="min-w-0 truncate">{proxyDisplayLabel(cred.proxy)}</span>
+                          <span className="min-w-0 truncate">{proxyName(cred.proxy)}</span>
                         </TooltipTrigger>
-                        <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+                        <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy)}</TooltipPopup>
                       </Tooltip>
                     </>
                   )}
@@ -487,9 +489,9 @@ export const CredentialRow = memo(function CredentialRow({
                         onClick={() => setProxyOpen(true)}
                       >
                         <GlobeIcon className="size-3 shrink-0" />
-                        <span className="min-w-0 truncate">{proxyDisplayLabel(cred.proxy)}</span>
+                        <span className="min-w-0 truncate">{proxyName(cred.proxy)}</span>
                       </TooltipTrigger>
-                      <TooltipPopup className="max-w-72 break-all">{cred.proxy}</TooltipPopup>
+                      <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy)}</TooltipPopup>
                     </Tooltip>
                   </>
                 )}
@@ -501,12 +503,20 @@ export const CredentialRow = memo(function CredentialRow({
           <ScheduleControl cred={cred} actions={actions} status={evaluation.status} />
         </TableCell>
         <TableCell className={COL.priority}>
-          <span className="font-semibold text-sm tabular-nums" title={t('数值越小，调度优先级越高', 'Lower values are scheduled first')}>
-            P{cred.priority}
-          </span>
+          <Tooltip>
+            <TooltipTrigger
+              className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help tabular-nums')}
+              delay={0}
+            >
+              P{cred.priority}
+            </TooltipTrigger>
+            <TooltipPopup>
+              {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+            </TooltipPopup>
+          </Tooltip>
         </TableCell>
         <TableCell className={COL.tier}>
-          <AccountTierBadge cred={cred} fallback={<span className="text-muted-foreground">—</span>} />
+          <AccountTierBadge cred={cred} size="xs" fallback={<span className="text-xs text-muted-foreground">—</span>} />
         </TableCell>
         <TableCell className={COL.quota5h}>
           <ListQuotaMeter
@@ -575,11 +585,11 @@ export const CredentialRow = memo(function CredentialRow({
               usage={rpmUsage}
               title={rpmLimit > 0
                 ? t(
-                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经这个账号转发的请求数（含失败请求）。达到上限后，新请求会分流到其他账号，已绑定的设备会收到 429 · ${rpmPolicy.label}策略 · 点击调整`,
+                  `当前 RPM ${cred.rpm}/${rpmLimit}：最近 60 秒经此账号转发的请求数（含失败请求）。达到上限后，新请求将分流到其他账号，已绑定的设备将收到 429 · ${rpmPolicy.label}策略 · 点击调整`,
                   `Current RPM ${cred.rpm}/${rpmLimit}: requests forwarded through this account in the last 60 seconds (failures included). Once the limit is reached, new requests go to other accounts and already-bound devices get a 429 · ${rpmPolicy.label} policy · click to adjust`,
                 )
                 : t(
-                  `当前 RPM ${cred.rpm}：最近 60 秒经这个账号转发的请求数（含失败请求） · ${rpmPolicy.label}策略 · 点击调整`,
+                  `当前 RPM ${cred.rpm}：最近 60 秒经此账号转发的请求数（含失败请求） · ${rpmPolicy.label}策略 · 点击调整`,
                   `Current RPM ${cred.rpm}: requests forwarded through this account in the last 60 seconds (failures included) · ${rpmPolicy.label} policy · click to adjust`,
                 )}
               ariaLabel={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
@@ -587,12 +597,12 @@ export const CredentialRow = memo(function CredentialRow({
             />
           </div>
         </TableCell>
-        <TableCell className={COL.recent}>
+        <TableCell className={cn(COL.recent, 'text-xs')}>
           {cred.last_used != null ? relativeTime(cred.last_used, now, language) : t('未使用', 'Never used')}
         </TableCell>
         <TableCell className={cn(COL.cost, 'text-right')}>
           <Tooltip>
-            <TooltipTrigger render={<span />} className="tabular-nums font-medium text-sm">
+            <TooltipTrigger render={<span />} className="tabular-nums font-medium text-xs">
               {formatUsd(cred.cost_total)}
             </TooltipTrigger>
             <TooltipPopup>{t('累计等价 API 费用', 'Cumulative equivalent API cost')}</TooltipPopup>
@@ -814,7 +824,7 @@ function ScheduleControl({
       <Tooltip>
         <TooltipTrigger
           className={cn(
-            badgeVariants({ size: 'sm', variant: status.variant }),
+            badgeVariants({ size: 'xs', variant: status.variant }),
             // 表格（xl 起）里「调度」列只有 9rem：徽标放开固定高度、允许换行，
             // 「Usage credits 生效中」拆成两行放全；卡片/移动端布局不受列宽约束，照旧单行。
             'min-w-0 max-w-full shrink xl:h-auto xl:whitespace-normal xl:py-0.5 xl:text-left',
@@ -895,7 +905,7 @@ function ListQuotaMeter({
       <div
         className="flex w-full flex-col gap-2"
         title={t(
-          `上游从未为该账号返回 ${label} 窗口，说明它的用量模型里没有这个窗口（不是数据缺失）`,
+          `上游从未为该账号返回 ${label} 窗口，表明其用量模型不含该窗口（并非数据缺失）`,
           `The upstream has never returned a ${label} window for this account, meaning its usage model has no such window (this is not missing data)`,
         )}
       >
@@ -904,8 +914,9 @@ function ListQuotaMeter({
             <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
             <span
               className={cn(
-                'min-w-0 truncate tabular-nums text-muted-foreground',
-                showLabel ? 'text-xs' : 'text-sm leading-none',
+                // 表格里与同列的用量摘要同一档（12px），不单独大一号。
+                'min-w-0 truncate text-xs tabular-nums text-muted-foreground',
+                !showLabel && 'leading-none',
               )}
             >
               —
@@ -922,7 +933,7 @@ function ListQuotaMeter({
     const emptyLabel = expired ? t('已重置', 'Reset') : t('暂无数据', 'No data')
     const emptyDetail = expired && reset != null
       ? t(
-          `${label} 窗口已于 ${formatFullTime(reset, language)} 重置，之后暂无新请求`,
+          `${label} 窗口已于 ${formatFullTime(reset, language)} 重置，此后暂无新请求`,
           `${label} window reset at ${formatFullTime(reset, language)}; there are no newer requests`,
         )
       : t(`${label} 用量暂无数据`, `No ${label} usage data`)
@@ -1218,7 +1229,7 @@ function ListFablePoolLine({
       <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
         {fablePoolHint(w, language)}
         {pending && ` · ${formatCountdown(w.resetAt!, now)}`}
-        {rejected && t('。上游已拒绝：fable 暂时不会分配到这个账号', '. Rejected upstream: fable will not be routed to this account for now')}
+        {rejected && t('。上游已拒绝：fable 暂不会分配到此账号', '. Rejected upstream: fable will not be routed to this account for now')}
       </TooltipPopup>
     </Tooltip>
   )
@@ -1232,7 +1243,7 @@ function ListFablePoolLine({
  * 等下来就没人再等了。没有摘要可说时（该窗口连请求数都没有）不挂提示，免得冒一个空气泡。
  */
 function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }) {
-  // text-xs：表格那格只有 9rem，比 text-sm 多放约五个字符，`3.2K · 486M · $91.62` 放全还有富余。
+  // text-xs：与表格里其余数据同一档（见 [COL.quota5h]），比 text-sm 多放约五个字符。
   const className = 'min-w-0 truncate font-medium text-foreground text-xs leading-none tabular-nums'
   if (!hint) return <span className={className}>{children}</span>
   return (
@@ -1328,7 +1339,7 @@ function ListQuotaDetails({
         </dd>
       </div>
       <div className="min-w-0 text-right">
-        <dt className="sr-only">{t('花费', 'Cost')}</dt>
+        <dt className="sr-only">{t('费用', 'Cost')}</dt>
         <dd className="whitespace-nowrap font-medium text-xs tabular-nums">
           {cost == null ? '—' : formatUsd(cost)}
         </dd>

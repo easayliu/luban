@@ -54,7 +54,7 @@ export function ChartLegend({
         <li className="flex items-center">
           <Tooltip>
             <TooltipTrigger
-              aria-label={t('怎么读这张图', 'How to read this chart')}
+              aria-label={t('图表说明', 'About this chart')}
               className="rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
               render={<button type="button" />}
             >
