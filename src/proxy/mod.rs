@@ -215,6 +215,11 @@ pub async fn handle(
         } else if let Some(kind) = log_state.local_reject.lock().take() {
             rec.forensics.rewrites = Some(format!("{REWRITE_REJECTED_LOCALLY}:{kind}"));
         }
+        if let Some(rf) = log_state.refresh_failed.lock().take() {
+            rec.cred_id = Some(rf.cred_id);
+            rec.cred_label = rf.cred_label;
+            rec.forensics.error_message = Some(rf.detail);
+        }
         spawn_usage_log(store, rec);
     }
     if let Ok(v) = HeaderValue::from_str(&request_id) {
@@ -302,6 +307,10 @@ struct RequestLogState {
     /// 来访自报的会话 id（[`session_id::incoming_session_id`]），同样给早退与本地拒绝的流水用。
     /// 见 [`store::Forensics::session_id_in`]。
     session_id_in: parking_lot::Mutex<Option<String>>,
+    /// 选号时这个号的 token 刷新失败、又换不到别的号（[`store::RefreshFailed`]）：请求没到上游，
+    /// 但失败出在一个具体的号上，本地拒绝那条流水记到它名下，错误文案换成完整错误链——
+    /// 回给客户端的那句不带细节（代理报错里可能有代理地址）。
+    refresh_failed: parking_lot::Mutex<Option<store::RefreshFailed>>,
 }
 
 /// 流水 `rewrites` 里标「本地拒绝、未转发」；带原因分类时是 `rejected_locally:<kind>`，

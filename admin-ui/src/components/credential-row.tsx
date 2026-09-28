@@ -267,6 +267,8 @@ export const CredentialRow = memo(function CredentialRow({
   const rpmUsage = deviceUsageMeta(cred.rpm, rpmLimit)
   const added = relativeTime(cred.created_at, now, language)
   const mobile = useMediaQuery(MOBILE_ROW_QUERY)
+  // 三套布局只建一套：光靠 `xl:hidden` 切换，每行都会把窄屏和宽屏两份 DOM（开关、菜单、Tooltip）全建出来。
+  const wide = useMediaQuery(WIDE_ROW_QUERY)
   const menuHandlers = {
     onRename: () => {
       setRenameName(cred.label)
@@ -283,7 +285,7 @@ export const CredentialRow = memo(function CredentialRow({
 
   return (
     <>
-      {mobile ? (
+      {!wide && (mobile ? (
         <MobileCredentialRow
           cred={cred}
           now={now}
@@ -451,8 +453,9 @@ export const CredentialRow = memo(function CredentialRow({
           </article>
         </TableCell>
       </TableRow>
-      )}
+      ))}
 
+      {wide && (
       <TableRow className="hidden xl:table-row" data-state={selected ? 'selected' : undefined}>
         <TableCell className={cn(COL.select, selectable ? 'pl-4 pr-0' : 'p-0')}>
           {selectable && (
@@ -637,6 +640,7 @@ export const CredentialRow = memo(function CredentialRow({
           />
         </TableCell>
       </TableRow>
+      )}
 
       {/* 与卡片同一套：没点开过就不挂，见 DeferredMount。 */}
       <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || rpmOpen || quotaOpen || testing}>
@@ -1023,6 +1027,8 @@ function ListQuotaMeter({
 
 /** 手机宽度（<40rem）走紧凑行；与 ⋯ 底部面板、详情页页签是同一条线。 */
 const MOBILE_ROW_QUERY = '(max-width: 39.98rem)'
+/** 与 Tailwind 的 `xl` 断点一致（80rem），宽屏表格行从这里起接手。 */
+const WIDE_ROW_QUERY = '(min-width: 80rem)'
 
 /** 名额占用 → 数字颜色，与卡片页脚那三格同一套（见 credential-card 的 SLOT_TEXT）。 */
 const MOBILE_SLOT_TEXT: Record<QuotaLevel, string> = {

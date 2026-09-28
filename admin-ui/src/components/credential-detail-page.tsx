@@ -182,7 +182,8 @@ export function CredentialDetailPage({
 
   let content: ReactNode
   if (cred) {
-    content = <CredentialDetail cred={cred} onDeleted={onBack} />
+    // 按 id 重挂：切到另一个账号时，页签、对话框、草稿不能串过去。
+    content = <CredentialDetail key={cred.id} cred={cred} onDeleted={onBack} />
   } else if (isLoading && !credentials) {
     content = <DetailSkeleton />
   } else if (error && !credentials) {

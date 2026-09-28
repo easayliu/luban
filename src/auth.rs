@@ -43,6 +43,30 @@ pub fn admin_configured(state: &AppState) -> bool {
     admin_hash(state).is_some()
 }
 
+/// 百分号解码（对应前端的 `encodeURIComponent`）；不含 `%`、编码不合法或解出非 UTF-8 时返回 None。
+fn percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// 中间件：未设密码放行；已设则校验 `Authorization: Bearer <password>`。
 pub async fn require_admin(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(hash) = admin_hash(&state) else {
@@ -53,7 +77,12 @@ pub async fn require_admin(State(state): State<AppState>, req: Request, next: Ne
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|pw| sha256_hex(pw.trim()) == hash)
+        .map(|pw| {
+            let pw = pw.trim();
+            // 先按原文比（脚本直接带明文），再按百分号解码后比（网页端为支持非 ASCII 密码会编码）。
+            sha256_hex(pw) == hash
+                || percent_decode(pw).is_some_and(|d| sha256_hex(d.trim()) == hash)
+        })
         .unwrap_or(false);
     if ok {
         next.run(req).await
@@ -183,4 +212,19 @@ pub async fn change_password(
         "admin password changed"
     );
     Ok(ok_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decode_matches_encode_uri_component() {
+        // encodeURIComponent('密码é%') === '%E5%AF%86%E7%A0%81%C3%A9%25'
+        assert_eq!(percent_decode("%E5%AF%86%E7%A0%81%C3%A9%25").as_deref(), Some("密码é%"));
+        assert_eq!(percent_decode("plain"), None);
+        assert_eq!(percent_decode("%zz"), None);
+        assert_eq!(percent_decode("%+1"), None);
+        assert_eq!(percent_decode("abc%2"), None);
+    }
 }

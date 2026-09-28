@@ -1046,7 +1046,7 @@ function RetryMax() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={!enabled || count === (data?.rate_limit_retry_max ?? 2)}
+        disabled={!enabled || draft === null || count === (data?.rate_limit_retry_max ?? 2)}
         onClick={() => save.mutate(count)}
       >
         <SaveIcon />
@@ -1193,7 +1193,7 @@ function QuotaPausePct() {
         <Button
           className="col-start-3 row-start-2 max-sm:size-9 max-sm:px-0"
           loading={save.isPending}
-          disabled={!enabled || unchanged}
+          disabled={!enabled || unchanged || draft === null || weekDraft === null}
           onClick={() => save.mutate({ pct, week })}
         >
           <SaveIcon />

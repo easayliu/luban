@@ -223,15 +223,21 @@ export function ProxyPickerCombobox({
 /** 代理测试按钮 + 结果展示，可复用于代理对话框和添加账号页面。 */
 export function ProxyTestBlock({ url }: { url: string }) {
   const { t, language } = useI18n()
-  const [result, setResult] = useState<ProxyTestResult | null>(null)
+  // 结果记下测的是哪个地址：改了输入框后，上一个地址的「✓」不能挂在新地址下面。
+  const [tested, setTested] = useState<{ url: string; result: ProxyTestResult } | null>(null)
   const test = useMutation({
-    mutationFn: () => testProxy(url),
-    onSuccess: setResult,
-    onError: (e) => setResult({
-      ok: false, ip: null, country: null, city: null, region: null, org: null,
-      latency_ms: 0, error: extractError(e, language),
+    mutationFn: (target: string) => testProxy(target),
+    onSuccess: (result, target) => setTested({ url: target, result }),
+    onError: (e, target) => setTested({
+      url: target,
+      result: {
+        ok: false, ip: null, country: null, city: null, region: null, org: null,
+        latency_ms: 0, error: extractError(e, language),
+      },
     }),
   })
+  const result = tested?.url === url ? tested.result : null
+  const setResult = (next: null) => setTested(next)
 
   if (!url) return null
 
@@ -241,8 +247,8 @@ export function ProxyTestBlock({ url }: { url: string }) {
         type="button"
         size="sm"
         variant="outline"
-        loading={test.isPending}
-        onClick={() => test.mutate()}
+        loading={test.isPending && test.variables === url}
+        onClick={() => test.mutate(url)}
       >
         <PlayIcon />
         {t('测试代理', 'Test proxy')}

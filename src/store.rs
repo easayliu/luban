@@ -325,15 +325,25 @@ impl std::error::Error for RpmLimited {}
 pub struct AllRateLimited {
     /// 建议的重试间隔（秒），取最早解冻的那个号的剩余冷却时间。
     pub retry_after_secs: i64,
+    /// 最早回来的那个号是「token 刷新失败」暂停的（见 [`REFRESH_FAIL_PAUSE_TAG`]）：这时全池
+    /// 在等的不是上游额度，提示不能说成限流；转发那边据此把流水记到这个号名下。
+    pub refresh_failed: Option<RefreshFailed>,
 }
 
 impl std::fmt::Display for AllRateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "all credentials are cooling down after upstream rate limits; retry in {} seconds",
-            self.retry_after_secs
-        )
+        match &self.refresh_failed {
+            Some(rf) => write!(
+                f,
+                "all credentials are paused; credential #{} is paused after a token refresh failure; retry in {} seconds",
+                rf.cred_id, self.retry_after_secs
+            ),
+            None => write!(
+                f,
+                "all credentials are cooling down after upstream rate limits; retry in {} seconds",
+                self.retry_after_secs
+            ),
+        }
     }
 }
 
@@ -6417,18 +6427,22 @@ impl CredentialStore {
             // 一个能用的都没有。若其中有「限流暂停、还没到点」的，这不是配置问题而是限流：
             // 回 429 + 最早那个的恢复时刻，比一句「没有可用凭证，请先登录」诚实得多
             // （后者会把运维引去查登录，而实际上号都在、只是在等额度回血）。
-            let soonest: Option<i64> = conn
+            let soonest: Option<(i64, String, Option<String>, i64)> = conn
                 .query_row(
-                    "SELECT MIN(resume_at) FROM credentials WHERE disabled = 1 \
-                       AND resume_at IS NOT NULL",
+                    "SELECT id, label, ban_reason, resume_at FROM credentials \
+                      WHERE disabled = 1 AND resume_at IS NOT NULL \
+                      ORDER BY resume_at ASC, id ASC LIMIT 1",
                     [],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
-                .optional()?
-                .flatten();
-            if let Some(at) = soonest {
+                .optional()?;
+            if let Some((id, label, reason, at)) = soonest {
                 let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
-                return Err(AllRateLimited { retry_after_secs }.into());
+                let refresh_failed = reason
+                    .as_deref()
+                    .and_then(refresh_pause_detail)
+                    .map(|detail| RefreshFailed::paused(id, label, detail));
+                return Err(AllRateLimited { retry_after_secs, refresh_failed }.into());
             }
             anyhow::bail!("no available credentials; add an account first");
         }
@@ -6450,7 +6464,7 @@ impl CredentialStore {
         {
             if let Some(at) = Self::soonest_paused_resume(&conn, &denied)? {
                 let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
-                return Err(AllRateLimited { retry_after_secs }.into());
+                return Err(AllRateLimited { retry_after_secs, refresh_failed: None }.into());
             }
             return Err(ModelUnsupported { model: m.to_string(), accounts: all.len() }.into());
         }
@@ -6473,7 +6487,7 @@ impl CredentialStore {
                 .min()
                 .unwrap_or(0)
                 .max(1);
-            return Err(AllRateLimited { retry_after_secs }.into());
+            return Err(AllRateLimited { retry_after_secs, refresh_failed: None }.into());
         }
 
         // 各凭证当前**占名额**的设备数与模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
@@ -6734,6 +6748,55 @@ impl CredentialStore {
 /// 免得停用没生效时打成死循环。也顺带给单次请求的耗时封了顶——每一轮都是一次上游往返。
 const MAX_REFRESH_FAILOVER: usize = 5;
 
+/// 刷新没拿到结果（网络 / 代理 / 超时 / 5xx / 非作废的 4xx）后，这个号暂停调度多久。
+///
+/// 这类失败多半是这个号的出口出了问题（代理挂了、过期了），不停的话绑在它上面的设备每条
+/// 请求都要白等一次刷新超时再吃 503。写的是 `resume_at`，与限流暂停同一套恢复：到点
+/// 惰性放回、连通性测试通过当场放回。取得短，网络抖一下的号很快就回来了。
+const REFRESH_FAIL_PAUSE_SECS: u64 = 120;
+
+/// 刷新失败暂停写进 `ban_reason` 的开头标签，前端 `isRefreshFailurePause` 按它认。
+pub const REFRESH_FAIL_PAUSE_TAG: &str = "[refresh-failed]";
+
+/// [`ensure_fresh_token`] 刷新这一步失败、且不是 refresh_token 被作废（那条走
+/// [`TokenAttempt::Revoked`]）。带上是哪个号，转发那边据此把流水记到这个号名下；
+/// `detail` 是完整错误链（`{:#}`），只进日志、流水与后台，不回给客户端——代理报错里
+/// 可能带着代理地址。
+#[derive(Debug, Clone)]
+pub struct RefreshFailed {
+    pub cred_id: i64,
+    pub cred_label: String,
+    pub detail: String,
+    /// 号已经因为刷新失败暂停着（别的请求刚停的），这次没有真去刷：换号循环不再写一遍暂停，
+    /// 免得把恢复时刻一次次往后推。
+    pub already_paused: bool,
+}
+
+impl RefreshFailed {
+    /// 库里已有的刷新失败暂停，`detail` 取暂停原因（去掉标签）。
+    fn paused(cred_id: i64, cred_label: String, detail: &str) -> Self {
+        Self { cred_id, cred_label, detail: detail.to_string(), already_paused: true }
+    }
+}
+
+/// `ban_reason` 是刷新失败暂停写的，就返回标签后面的原因原文。
+fn refresh_pause_detail(reason: &str) -> Option<&str> {
+    reason.strip_prefix(REFRESH_FAIL_PAUSE_TAG).map(str::trim_start)
+}
+
+/// 一次请求里因刷新失败最多换几次号。刷新一次最多等 [`crate::oauth`] 的 15 秒超时，
+/// 本机网络或共用代理挂了的时候每个号都会失败——不封顶的话一条请求要白等
+/// [`MAX_REFRESH_FAILOVER`] 轮、再连带停掉那么多个号。作废（`Revoked`）换号不算在内。
+const MAX_REFRESH_FAIL_SWAPS: usize = 2;
+
+impl std::fmt::Display for RefreshFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "credential #{} token refresh failed: {}", self.cred_id, self.detail)
+    }
+}
+
+impl std::error::Error for RefreshFailed {}
+
 /// 一次「拿到该凭证可用 access_token」的尝试结果。可重试的错误（网络抖动、5xx、限流）
 /// 走 `Err` 直接冒泡，不在这里表达。
 pub enum TokenAttempt {
@@ -6760,7 +6823,7 @@ pub async fn valid_access_token_for_device(
     sel: Select<'_>,
 ) -> Result<(String, Credential, Option<i64>)> {
     select_with_refresh_failover(store, sel, |cred| {
-        Box::pin(async move { ensure_fresh_token(store, clients, &cred).await })
+        Box::pin(async move { fresh_token(store, clients, &cred, true).await })
     })
     .await
 }
@@ -6834,12 +6897,24 @@ async fn select_with_refresh_failover<'a>(
         ..sel
     };
 
+    // 本次请求里最近一次「刷新没拿到结果」的错误：后面换不到号时报它——它才是这条请求
+    // 失败的原因，也带着是哪个号（转发那边据此把流水记到这个号名下）。
+    let mut refresh_failure: Option<anyhow::Error> = None;
+    let mut refresh_fails = 0;
     for round in 0..MAX_REFRESH_FAILOVER {
         // 每轮都重新选：上一轮停用的那个已被排除，且它的设备绑定已清，这里才会换到新号。
-        let (cred, slot) = store.select_with_slot(sel)?;
-        match attempt(cred.clone()).await? {
-            TokenAttempt::Ready(token) => return Ok((token, cred, slot)),
-            TokenAttempt::Revoked(reason) => {
+        let (cred, slot) = match store.select_with_slot(sel) {
+            Ok(v) => v,
+            Err(e) => {
+                let Some(rf) = refresh_failure else { return Err(e) };
+                // 选号那句（刚暂停的号在池外，多半是「全员冷却」）只进日志。
+                tracing::warn!(error = %e, "no other credential to switch to after a token refresh failure");
+                return Err(rf);
+            }
+        };
+        match attempt(cred.clone()).await {
+            Ok(TokenAttempt::Ready(token)) => return Ok((token, cred, slot)),
+            Ok(TokenAttempt::Revoked(reason)) => {
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
                     round,
@@ -6854,9 +6929,44 @@ async fn select_with_refresh_failover<'a>(
                     );
                 }
             }
+            Err(e) => {
+                let Some(rf) = e.downcast_ref::<RefreshFailed>() else { return Err(e) };
+                // 刷新没拿到结果：暂停一小会、换号。号本身可能是好的，所以走限时暂停而不是封号。
+                // 已经暂停着的（别的请求刚停的）不再写，恢复时刻不往后推。
+                if !rf.already_paused {
+                    let reason = format!(
+                        "{REFRESH_FAIL_PAUSE_TAG} {}; scheduling resumes automatically in about {} minutes",
+                        rf.detail,
+                        REFRESH_FAIL_PAUSE_SECS / 60
+                    );
+                    let resume_at = crate::credentials::now_secs() + REFRESH_FAIL_PAUSE_SECS;
+                    // 没写进去（号刚被人工停用 / 封掉）就不再换号，照实报这次失败。
+                    if !store.pause_for_rate_limit(cred.id, &reason, resume_at)? {
+                        return Err(e);
+                    }
+                }
+                refresh_fails += 1;
+                if refresh_fails >= MAX_REFRESH_FAIL_SWAPS {
+                    tracing::warn!(
+                        cred_id = cred.id, cred = %cred.label,
+                        round,
+                        "token refresh failed again, giving up instead of trying more credentials"
+                    );
+                    return Err(e);
+                }
+                tracing::warn!(
+                    cred_id = cred.id, cred = %cred.label,
+                    round,
+                    "token refresh failed, pausing the credential and selecting another"
+                );
+                refresh_failure = Some(e);
+            }
         }
     }
 
+    if let Some(rf) = refresh_failure {
+        return Err(rf);
+    }
     anyhow::bail!(
         "all {MAX_REFRESH_FAILOVER} credential refresh attempts failed; no credentials are available"
     )
@@ -6872,6 +6982,18 @@ pub async fn ensure_fresh_token(
     clients: &crate::clients::ClientPool,
     cred: &Credential,
 ) -> Result<TokenAttempt> {
+    fresh_token(store, clients, cred, false).await
+}
+
+/// [`ensure_fresh_token`] 的实现。`skip_refresh_paused` 只有转发选号那条传 `true`：等锁期间
+/// 别的请求刚刷失败、把号停了，就直接报那次失败，不再白等一次超时。连通性测试与保活传
+/// `false`——测试正是要真刷一次看号回没回来。
+async fn fresh_token(
+    store: &CredentialStore,
+    clients: &crate::clients::ClientPool,
+    cred: &Credential,
+    skip_refresh_paused: bool,
+) -> Result<TokenAttempt> {
     if !cred.needs_refresh() {
         return Ok(TokenAttempt::Ready(cred.access_token.clone()));
     }
@@ -6886,6 +7008,17 @@ pub async fn ensure_fresh_token(
             "credential was refreshed while waiting for the lock, reusing the new token"
         );
         return Ok(TokenAttempt::Ready(cred.access_token));
+    }
+    if skip_refresh_paused
+        && cred.disabled
+        && cred.resume_at.is_some_and(|at| at > crate::credentials::now_secs())
+        && let Some(detail) = cred.ban_reason.as_deref().and_then(refresh_pause_detail)
+    {
+        tracing::debug!(
+            cred_id = cred.id,
+            "credential was paused after a refresh failure while waiting for the lock"
+        );
+        return Err(RefreshFailed::paused(cred.id, cred.label.clone(), detail).into());
     }
 
     tracing::info!(cred_id = cred.id, cred = %cred.label, "credential entered the refresh window, refreshing token");
@@ -6931,11 +7064,19 @@ pub async fn ensure_fresh_token(
 
     // 无论是否判定为永久失效，都把失败原文打出来：这个端点的失败响应形态我们没有实测样本，
     // 线上真出现一次就能据此收紧 `is_grant_revoked`。
-    tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %err, "token refresh failed");
+    tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %format!("{err:#}"), "token refresh failed");
     match err.downcast_ref::<crate::oauth::TokenEndpointError>() {
         Some(te) if te.is_grant_revoked() => Ok(TokenAttempt::Revoked(te.ban_reason())),
         // 网络抖动 / 5xx / 限流 / 非 invalid_grant 的 4xx：凭证本身可能是好的，不停用。
-        _ => Err(err),
+        // 带上完整错误链：最外层只有一句「request to the token endpoint failed」，
+        // 连不上、超时还是代理拒绝全在里层。
+        _ => Err(RefreshFailed {
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            detail: format!("{err:#}"),
+            already_paused: false,
+        }
+        .into()),
     }
 }
 
@@ -9990,6 +10131,120 @@ mod tests {
                 .id,
             ids[0]
         );
+    }
+
+    fn refresh_failed(cred: &Credential) -> anyhow::Error {
+        RefreshFailed {
+            cred_id: cred.id,
+            cred_label: cred.label.clone(),
+            detail: "request to the token endpoint failed: connection refused".into(),
+            already_paused: false,
+        }
+        .into()
+    }
+
+    /// 刷新没拿到结果（网络 / 代理）：这个号限时暂停、原因带完整错误链，当场换下一个号。
+    #[tokio::test]
+    async fn refresh_failure_pauses_the_credential_and_fails_over() {
+        let (store, ids) = store_with(&["a", "b"]);
+
+        let (token, cred, _) = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| {
+                let first = c.id == ids[0];
+                Box::pin(async move {
+                    if first {
+                        Err(refresh_failed(&c))
+                    } else {
+                        Ok(TokenAttempt::Ready("t".into()))
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((token.as_str(), cred.id), ("t", ids[1]));
+        let paused = store.get(ids[0]).unwrap().unwrap();
+        assert!(paused.disabled);
+        assert!(paused.resume_at.is_some(), "限时暂停，不是封号");
+        let reason = paused.ban_reason.unwrap();
+        assert!(reason.starts_with(&format!("{REFRESH_FAIL_PAUSE_TAG} ")), "{reason}");
+        assert!(reason.contains("connection refused"), "原因要带底层错误: {reason}");
+    }
+
+    /// 换不到别的号时报的是那次刷新失败（带号），不是选号那句「全员冷却」。
+    #[tokio::test]
+    async fn refresh_failure_without_another_credential_reports_the_credential() {
+        let (store, ids) = store_with(&["a"]);
+
+        let e = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| Box::pin(async move { Err(refresh_failed(&c)) }),
+        )
+        .await
+        .unwrap_err();
+
+        let rf = e.downcast_ref::<RefreshFailed>().expect("应报 RefreshFailed");
+        assert_eq!(rf.cred_id, ids[0]);
+        assert!(store.get(ids[0]).unwrap().unwrap().resume_at.is_some());
+    }
+
+    /// 刷新失败换号有上限：本机网络挂了时每个号都会失败，不能一条请求挨个试完、停掉一整池。
+    #[tokio::test]
+    async fn refresh_failure_swaps_are_capped() {
+        let (store, ids) = store_with(&["a", "b", "c"]);
+        let tried = std::cell::RefCell::new(Vec::new());
+
+        let e = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| {
+                tried.borrow_mut().push(c.id);
+                Box::pin(async move { Err(refresh_failed(&c)) })
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(e.downcast_ref::<RefreshFailed>().is_some(), "{e}");
+        assert_eq!(tried.borrow().len(), MAX_REFRESH_FAIL_SWAPS);
+        assert!(!store.get(ids[2]).unwrap().unwrap().disabled, "没试到的号不该被停");
+    }
+
+    /// 已经因刷新失败暂停着的号（等锁期间别的请求刚停的）：直接报那次失败、不再真刷，
+    /// 换号循环也不再写暂停，恢复时刻不被往后推。
+    #[tokio::test]
+    async fn refresh_paused_credential_is_not_refreshed_again() {
+        let (store, ids) = store_with(&["a"]);
+        let reason = format!("{REFRESH_FAIL_PAUSE_TAG} connection refused");
+        let resume_at = crate::credentials::now_secs() + 60;
+        assert!(store.pause_for_rate_limit(ids[0], &reason, resume_at).unwrap());
+        let cred = store.get(ids[0]).unwrap().unwrap();
+        let clients = crate::clients::ClientPool::new().unwrap();
+
+        let Err(e) = fresh_token(&store, &clients, &cred, true).await else {
+            panic!("暂停中的号不该再刷")
+        };
+        let rf = e.downcast_ref::<RefreshFailed>().expect("应报 RefreshFailed");
+        assert!(rf.already_paused);
+        assert_eq!(rf.detail, "connection refused");
+
+        let e = select_with_refresh_failover(
+            &store,
+            Select { device_id: Some("dev-1"), rate_limited: true, ..Default::default() },
+            |c| Box::pin(async move { Err(RefreshFailed::paused(c.id, c.label, "x").into()) }),
+        )
+        .await
+        .unwrap_err();
+        // 池里只剩这个暂停的号：选号直接报全池暂停，且认得出是刷新失败停的。
+        let rl = e.downcast_ref::<AllRateLimited>().expect("应报 AllRateLimited");
+        let rf = rl.refresh_failed.as_ref().expect("要带上刷新失败的号");
+        assert_eq!(rf.cred_id, ids[0]);
+        assert!(e.to_string().contains("token refresh failure"), "{e}");
+        assert_eq!(store.get(ids[0]).unwrap().unwrap().resume_at, Some(resume_at));
     }
 
     /// 所有号的 refresh_token 都作废时要报错收场，不能死循环、也不能返回停用的号。

@@ -457,6 +457,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     // 已撤掉的「按模型最低客户端版本」闸（v0.3.157 ~ v0.3.160）留下的历史行，只为它们仍显示成中文。
     'model-min-version': t('客户端版本不支持该模型', 'client too old for model'),
     'model-unsupported': t('套餐不含模型', 'model not in plan'),
+    'refresh-failed': t('token 刷新失败', 'token refresh failed'),
     'unavailable': t('无可用账号', 'no account available'),
   } as Record<string, string>)[kind] ?? t('其他', 'other')
   // 颜色看「现在比平时慢了多少」：慢一半黄、慢一倍红；没有基线时按绝对值（3s / 8s）。
@@ -768,6 +769,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     else next.delete(id)
     onSelectedChangeRef.current(next)
   }, [])
+  // 勾选只保留当前列表里还在的账号：30 秒刷新后离开筛选结果的、或已单独删掉的号，
+  // 不能还留在集合里被批量操作带上。列表没拉到之前不裁，免得加载中把勾选清空。
+  useEffect(() => {
+    if (!credentials || selected.size === 0) return
+    const visible = new Set(sorted.map((item) => item.id))
+    if ([...selected].every((id) => visible.has(id))) return
+    onSelectedChangeRef.current(new Set([...selected].filter((id) => visible.has(id))))
+  }, [credentials, sorted, selected])
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (

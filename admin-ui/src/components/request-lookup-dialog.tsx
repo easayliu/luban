@@ -311,6 +311,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
   switch (tag) {
     case 'rejected_locally':
       return t('本地拒绝，未转发', 'Rejected locally, not forwarded')
+    case 'rejected_locally:refresh-failed':
+      return t('账号 token 刷新失败，未转发', 'Account token refresh failed, not forwarded')
     case 'refusal_replay':
       return t('本地回放已学到的上游拒答，未转发', 'Replayed a learned upstream refusal locally, not forwarded')
     case 'app_refusal_replay':
@@ -359,7 +361,7 @@ function ForensicTags({ log }: { log: UsageLog }) {
       {tags.map((tag) => (
         <Badge
           key={tag}
-          variant={tag === 'rejected_locally' || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
+          variant={tag.startsWith('rejected_locally') || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
           size="sm"
           title={tag}
         >

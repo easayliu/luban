@@ -368,8 +368,12 @@ export function downloadJson(filename: string, data: unknown): void {
   const a = document.createElement('a')
   a.href = url
   a.download = filename
+  // 挂进文档再点、稍后再回收：Safari / 部分 Firefox 对游离节点的点击不触发下载，
+  // 点完立刻 revoke 又可能赶在浏览器读 blob 之前把它作废。
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(url)
+  a.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
 /** Unix 秒 → 文件名里的时间戳：`20260907-021208`，本地时区。 */

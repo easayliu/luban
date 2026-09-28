@@ -490,12 +490,24 @@ export function BanEventsDialog({
                 <TableBody>
                   {events.map((ev) => {
                     const isOpen = expanded === ev.id
+                    // 整行可点之外，键盘也得能展开：Tab 聚焦到行，Enter / 空格切换。
+                    const toggleProps = {
+                      tabIndex: 0,
+                      'aria-expanded': isOpen,
+                      onClick: () => setExpanded(isOpen ? null : ev.id),
+                      onKeyDown: (event: React.KeyboardEvent) => {
+                        if (event.target !== event.currentTarget) return
+                        if (event.key !== 'Enter' && event.key !== ' ') return
+                        event.preventDefault()
+                        setExpanded(isOpen ? null : ev.id)
+                      },
+                    }
                     return (
                       <React.Fragment key={ev.id}>
                         {/* 手机到平板：堆叠成一张卡片。7 列的表在 lg 以下只能左右拖，
                             而这张表每一行都要读「谁、什么时候、为什么」三件事，横滚读不了。
                             与账号列表的窄屏行同一个做法（见 credential-row 的 `xl:hidden`）。 */}
-                        <TableRow className="cursor-pointer lg:hidden" onClick={() => setExpanded(isOpen ? null : ev.id)}>
+                        <TableRow className="cursor-pointer lg:hidden" {...toggleProps}>
                           <TableCell colSpan={7} className="w-full max-w-0 whitespace-normal p-0">
                             <article className="flex min-w-0 items-start gap-2 px-4 py-3">
                               <span className="mt-0.5 shrink-0 text-muted-foreground" aria-hidden>
@@ -529,10 +541,7 @@ export function BanEventsDialog({
                             </article>
                           </TableCell>
                         </TableRow>
-                        <TableRow
-                          className="hidden cursor-pointer lg:table-row"
-                          onClick={() => setExpanded(isOpen ? null : ev.id)}
-                        >
+                        <TableRow className="hidden cursor-pointer lg:table-row" {...toggleProps}>
                           <TableCell className="text-muted-foreground">
                             {isOpen ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
                           </TableCell>

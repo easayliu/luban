@@ -38,7 +38,7 @@ import {
 } from '@/components/ui/select'
 import { toastManager } from '@/components/ui/toast'
 import { useI18n } from '@/lib/i18n'
-import { extractError } from '@/lib/utils'
+import { downloadJson, extractError } from '@/lib/utils'
 
 /** 迁移文件的 kind 标记，与后端 `EXPORT_KIND` 同值。 */
 const EXPORT_KIND = 'luban-export'
@@ -64,14 +64,7 @@ function ExportPanel() {
         .toISOString()
         .slice(0, 19)
         .replace(/[:T]/g, '')
-      const url = URL.createObjectURL(
-        new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }),
-      )
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `luban-export-${stamp}.json`
-      a.click()
-      URL.revokeObjectURL(url)
+      downloadJson(`luban-export-${stamp}.json`, file)
       toastManager.add({
         title: t('导出完成', 'Export ready'),
         description: t(
@@ -175,6 +168,9 @@ function ImportPanel() {
       qc.invalidateQueries({ queryKey: ['credentials'] })
       qc.invalidateQueries({ queryKey: ['settings'] })
       qc.invalidateQueries({ queryKey: ['metrics'] })
+      qc.invalidateQueries({ queryKey: ['proxies'] })
+      // 单账号的设备、会话、用量等缓存：替换模式下原账号都没了，一并作废。
+      qc.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith('credential-') })
       close()
     },
     onError: (error) => {

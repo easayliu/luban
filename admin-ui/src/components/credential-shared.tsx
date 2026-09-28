@@ -326,6 +326,20 @@ export function isSubscriptionPause(banReason: string): boolean {
 }
 
 /**
+ * `ban_reason` 是否是后端「token 刷新失败」那档限时暂停（`store::REFRESH_FAIL_PAUSE_TAG`）：
+ * 刷新没拿到结果（代理 / 网络 / 超时 / 上游 5xx），号本身可能是好的，停一小会、到点自动回来。
+ * 与限流暂停同形（`resume_at` 非空），只能按开头标签认。改文案须前后端一起改。
+ */
+export function isRefreshFailurePause(banReason: string | null | undefined): boolean {
+  return !!banReason && banReason.startsWith('[refresh-failed] ')
+}
+
+/** 刷新失败暂停的原因原文（去掉标签），给状态说明用。 */
+function refreshFailureDetail(banReason: string): string {
+  return banReason.slice('[refresh-failed] '.length)
+}
+
+/**
  * 「订阅未生效」的说明按套餐分：Free 是从来没订阅，要先订阅；付费档是订阅失效，多为到期没续费。
  * 档位取的是最后一次看到的，订阅失效后仍显示原来的付费档——正好就是「该续费」的那种。
  */
@@ -365,6 +379,18 @@ function statusFromQuota(
   // 限流暂停必须排在封禁之前判：两者都是 disabled + ban_reason，只有 resume_at 能区分。
   // 漏了这一档的话，一个只是额度用完、几小时后自己就回来的号会被显示成「已封禁」，
   // 而封禁在这套界面里的含义是「需要人工介入，这个号可能废了」——两回事。
+  if (cred.resume_at != null && isRefreshFailurePause(cred.ban_reason)) {
+    return {
+      kind: 'rate-limited', variant: 'warning',
+      label: localize(language, '刷新失败暂停', 'Refresh failed'),
+      detail: localize(
+        language,
+        `token 刷新失败，已暂停调度，${formatFullTime(cred.resume_at, language)} 自动恢复；多为代理或网络问题，检查代理后可做一次连通性测试立即恢复。原因：${refreshFailureDetail(cred.ban_reason!)}`,
+        `Token refresh failed, so scheduling is paused until ${formatFullTime(cred.resume_at, language)}. This is usually a proxy or network problem; check the proxy, then run a connectivity test to restore it now. Reason: ${refreshFailureDetail(cred.ban_reason!)}`,
+      ),
+      attention: true, rank: 6,
+    }
+  }
   if (cred.resume_at != null) {
     return {
       kind: 'rate-limited', variant: 'warning',
@@ -795,14 +821,20 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     mutationFn: (disabled: boolean) => setDisabled(cred.id, disabled),
     onMutate: async (disabled) => {
       await qc.cancelQueries({ queryKey: ['credentials'] })
-      const previous = qc.getQueryData<Credential[]>(['credentials'])
+      const previous = qc.getQueryData<Credential[]>(['credentials'])?.find((item) => item.id === cred.id)?.disabled
       qc.setQueryData<Credential[]>(['credentials'], (current) => current?.map((item) => (
         item.id === cred.id ? { ...item, disabled } : item
       )))
       return { previous }
     },
     onError: (e, _disabled, context) => {
-      if (context?.previous) qc.setQueryData(['credentials'], context.previous)
+      // 只回滚这一个号：整份快照还原回去会把同一时间切过的其他账号一并翻回去。
+      const previous = context?.previous
+      if (previous !== undefined) {
+        qc.setQueryData<Credential[]>(['credentials'], (current) => current?.map((item) => (
+          item.id === cred.id ? { ...item, disabled: previous } : item
+        )))
+      }
       failure(t('操作失败', 'Operation failed'), e)
     },
     onSettled: () => invalidate(),
@@ -862,7 +894,11 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
   })
   const remove = useMutation({
     mutationFn: () => deleteCredential(cred.id),
-    onSuccess: () => { toastManager.add({ title: t('账号已删除', 'Account deleted'), type: 'success' }); invalidate() },
+    onSuccess: () => {
+      toastManager.add({ title: t('账号已删除', 'Account deleted'), type: 'success' })
+      invalidate()
+      qc.invalidateQueries({ queryKey: ['proxies'] })
+    },
     onError: (e) => failure(t('删除账号失败', 'Failed to delete account'), e),
   })
   const cooldown = useMutation({
@@ -1924,6 +1960,17 @@ export function expiryMeta(cred: Credential, language: Language = 'zh-CN'): {
   title?: string
 } {
   // 同 `statusFromQuota`：限流暂停要排在封禁之前，否则会被显示成「已封禁」。
+  if (cred.resume_at != null && isRefreshFailurePause(cred.ban_reason)) {
+    return {
+      text: localize(language, '刷新失败暂停', 'Refresh failed'),
+      className: 'font-medium text-warning-foreground',
+      title: localize(
+        language,
+        `token 刷新失败，${formatFullTime(cred.resume_at, language)} 自动恢复调度：${refreshFailureDetail(cred.ban_reason!)}`,
+        `Token refresh failed; scheduling resumes at ${formatFullTime(cred.resume_at, language)}: ${refreshFailureDetail(cred.ban_reason!)}`,
+      ),
+    }
+  }
   if (cred.resume_at != null) {
     return {
       text: localize(language, '限流暂停', 'Rate limited'),

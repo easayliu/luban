@@ -737,18 +737,26 @@ pub(super) async fn handle_inner(
                 "bare-rate-limit"
             } else if e.downcast_ref::<store::RpmLimited>().is_some() {
                 "account-rpm"
-            } else if e.downcast_ref::<store::AllRateLimited>().is_some() {
-                "all-cooling-down"
+            } else if let Some(rl) = e.downcast_ref::<store::AllRateLimited>() {
+                if rl.refresh_failed.is_some() { "refresh-failed" } else { "all-cooling-down" }
             } else if e.downcast_ref::<store::DeviceLimitReached>().is_some() {
                 "device-limit"
             } else if e.downcast_ref::<store::SessionLimitReached>().is_some() {
                 "session-limit"
             } else if e.downcast_ref::<store::ModelUnsupported>().is_some() {
                 "model-unsupported"
+            } else if e.downcast_ref::<store::RefreshFailed>().is_some() {
+                "refresh-failed"
             } else {
                 "unavailable"
             };
             *log_state.local_reject.lock() = Some(kind);
+            // 失败出在一个具体的号上（刷新失败，或全池在等的那个号是刷新失败停的）：流水记到它名下。
+            if let Some(rf) = e.downcast_ref::<store::RefreshFailed>().or_else(|| {
+                e.downcast_ref::<store::AllRateLimited>().and_then(|rl| rl.refresh_failed.as_ref())
+            }) {
+                *log_state.refresh_failed.lock() = Some(rf.clone());
+            }
             // 分桶用设备，没有设备身份就退到会话，都没有才并成一桶——后者本就是「裸请求」，
             // 它们由裸请求上限统一管着，日志上也没有更细的身份可分。
             let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
@@ -778,6 +786,14 @@ pub(super) async fn handle_inner(
             }
             // 设备数 / 模拟会话数达硬上限 → 429（等多久取决于别人什么时候释放，给不出
             // retry-after，故这条不走 [`rate_limit_response`]）；其余（无凭证/刷新失败等）→ 503。
+            // 刷新失败：细节（完整错误链）已记进流水与账号状态，回给客户端的只说是哪个号。
+            if let Some(rf) = e.downcast_ref::<store::RefreshFailed>() {
+                let msg = format!(
+                    "token refresh for credential #{} failed; please retry shortly",
+                    rf.cred_id
+                );
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "api_error", msg);
+            }
             let (status, etype) = if e.downcast_ref::<store::DeviceLimitReached>().is_some()
                 || e.downcast_ref::<store::SessionLimitReached>().is_some()
             {

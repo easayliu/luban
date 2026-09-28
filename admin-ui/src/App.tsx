@@ -4,7 +4,7 @@ import { PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-reac
 import { listCredentials } from '@/api/credentials'
 import { getAuthState } from '@/api/auth'
 import { getSettings } from '@/api/settings'
-import { getPw, setPw, clearPw } from '@/api/client'
+import { PW_KEY, UNAUTHORIZED_EVENT, getPw, setPw, clearPw } from '@/api/client'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
   SORT_DIR_DEFAULT,
@@ -114,14 +114,15 @@ function readViewParams(): URLSearchParams {
   return new URLSearchParams(start >= 0 ? hash.slice(start + 1) : '')
 }
 
+// 与 settings-page 的 SettingsSection 保持一致；那边是懒加载的，不从那里 import 以免把它拉进首包。
+const SETTINGS_SECTIONS: readonly SettingsSection[] = ['access', 'devices', 'proxies', 'forwarding', 'security', 'migration']
+
 function readSettingsRoute(): SettingsSection | null {
-  if (!window.location.hash.startsWith('#/settings')) return null
-  if (window.location.hash.includes('/devices')) return 'devices'
-  if (window.location.hash.includes('/forwarding')) return 'forwarding'
-  if (window.location.hash.includes('/security')) return 'security'
-  if (window.location.hash.includes('/migration')) return 'migration'
-  // 兼容旧的 #/settings 与 #/settings/access 深链接。
-  return 'access'
+  const match = /^#\/settings(?:\/([^/?]+))?/.exec(window.location.hash)
+  if (!match) return null
+  const section = match[1] as SettingsSection | undefined
+  // 兼容旧的 #/settings 深链接；认不出的分区也回到「客户端接入」。
+  return section && SETTINGS_SECTIONS.includes(section) ? section : 'access'
 }
 
 /** `#/accounts/<id>` → 账号 id；其余地址不是详情页。 */
@@ -280,10 +281,29 @@ function App() {
     listScrollY.current = null
     requestAnimationFrame(() => window.scrollTo({ top, behavior: 'instant' }))
   }, [accountRoute])
-  const { data: authState, isLoading: authLoading } = useQuery({
+  const {
+    data: authState,
+    isLoading: authLoading,
+    isError: authFailed,
+    refetch: refetchAuthState,
+  } = useQuery({
     queryKey: ['auth-state'],
     queryFn: getAuthState,
   })
+  // 没存密码的请求被 401（别处刚设了密码）→ 重新问一遍鉴权状态，已设密码就会切到登录页。
+  useEffect(() => {
+    const onUnauthorized = () => { void refetchAuthState() }
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+  }, [refetchAuthState])
+  // 别的标签页登录或退出改了密码：整页重载，内存里的状态与缓存一并换掉。
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PW_KEY && event.newValue !== pw) window.location.reload()
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [pw])
 
   const needLogin = authState?.configured && !pw
 
@@ -308,7 +328,12 @@ function App() {
     }
   }, [needLogin, settingsRoute, accountRoute, t])
 
-  const isBootstrapping = authLoading || !authState
+  // 鉴权状态拿不到（后端重启、网络抖动）时不再干等骨架屏：放行到列表，让账号请求的报错与重试按钮接手。
+  const isBootstrapping = authLoading || (!authState && !authFailed)
+  const retry = () => {
+    if (!authState) void refetchAuthState()
+    void refetchCredentials()
+  }
   useSettingsPrefetch(!isBootstrapping && !needLogin && !settingsRoute)
 
   if (!isBootstrapping && needLogin) {
@@ -335,7 +360,7 @@ function App() {
         credentials={isBootstrapping ? undefined : creds}
         isLoading={isBootstrapping || isLoading}
         error={isBootstrapping ? null : credentialsError}
-        onRetry={() => { void refetchCredentials() }}
+        onRetry={retry}
         onBack={closeAccount}
       />
     )
@@ -376,7 +401,8 @@ function App() {
             <PreferencesMenu
               onSignOut={
                 authState?.configured && pw
-                  ? () => { clearPw(); setPwState(null) }
+                  // 重载而不是只清 state：缓存里的账号、设置（含客户端 Key）不能留给下一个登录的人。
+                  ? () => { clearPw(); window.location.reload() }
                   : undefined
               }
             >
@@ -429,7 +455,7 @@ function App() {
             onSelectedChange: setSelected,
             onPageChange: setPage,
             onPageSizeChange: setPageSize,
-            onRetry: () => { void refetchCredentials() },
+            onRetry: retry,
             onAdd: () => setAdding(true),
           }}
         />

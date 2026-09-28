@@ -647,6 +647,7 @@ function StatsBreakdown({
               {rows.map((row) => {
                 const share = total > 0 ? row.requests / total : 0
                 const drillable = by === 'model' && row.key !== ''
+                const drill = () => setDrill({ credId, model: row.key, label: row.key, hours })
                 return (
                   <tr
                     key={row.key}
@@ -654,12 +655,22 @@ function StatsBreakdown({
                       '[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0',
                       drillable && 'cursor-pointer hover:bg-muted/40',
                     )}
-                    onClick={drillable ? () => setDrill({ credId, model: row.key, label: row.key, hours }) : undefined}
+                    onClick={drillable ? drill : undefined}
                     title={drillable ? t('查看该模型的请求', 'View requests for this model') : undefined}
                   >
                     <td className="max-w-80 max-sm:max-w-36">
                       {by === 'status' ? (
                         <Badge size="sm" variant={statusVariant(Number(row.key))}>{row.key}</Badge>
+                      ) : drillable ? (
+                        // 与 UsageBreakdown 同一个做法：名称做成按钮，键盘用户也能钻进去看请求。
+                        <button
+                          type="button"
+                          className="block max-w-full truncate text-start font-mono hover:underline"
+                          title={row.key}
+                          onClick={drill}
+                        >
+                          {row.key}
+                        </button>
                       ) : (
                         <span
                           className={cn('block truncate', by !== 'client' && 'font-mono', !row.key && 'font-sans text-muted-foreground')}

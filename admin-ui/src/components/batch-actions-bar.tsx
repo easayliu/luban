@@ -144,8 +144,9 @@ export function BatchActionsBar({
     }
   }, [savedProxies, selectedProxyUrl])
 
-  const ids = [...selected]
-  const n = selected.size
+  // 只对列表里还在的账号下手：勾选集合可能残留刚离开筛选结果或已删除的 id。
+  const ids = all.filter((item) => selected.has(item.id)).map((item) => item.id)
+  const n = ids.length
   const formattedCount = n.toLocaleString(locale)
   const formattedTotal = all.length.toLocaleString(locale)
   const englishAccountCount = `${formattedCount} ${n === 1 ? 'account' : 'accounts'}`
@@ -165,10 +166,11 @@ export function BatchActionsBar({
     value: item.value,
     label: t(item.chinese, item.english),
   }))
-  const notify = (msg: string, clearSelection = false) => {
+  const notify = (msg: string) => {
     toastManager.add({ title: msg, type: 'success' })
     qc.invalidateQueries({ queryKey: ['credentials'] })
-    if (clearSelection) onSelectedChange(new Set())
+    // 代理池页的使用数与使用者名单也跟着账号走（改代理、删账号都会变）。
+    qc.invalidateQueries({ queryKey: ['proxies'] })
   }
   const onError = (error: unknown) => toastManager.add({
     title: t('批量操作失败', 'Batch operation failed'),
@@ -276,11 +278,17 @@ export function BatchActionsBar({
     onError,
   })
   const applyDelete = useMutation({
-    mutationFn: () => deleteCredentials(ids),
-    // 账号已不存在，留着勾选没有意义，顺手清空。批量条不会随之卸载，确认框得自己关。
-    onSuccess: () => {
+    // 目标 id 随 mutate 传进来：删除进行中用户可能又勾了别的号，提示数量与清勾选都得按这次真正删的算。
+    mutationFn: (targets: number[]) => deleteCredentials(targets),
+    // 账号已不存在，留着勾选没有意义，顺手去掉。批量条不会随之卸载，确认框得自己关。
+    onSuccess: (_r, targets) => {
       setConfirmDelete(false)
-      notify(t(`已删除 ${formattedCount} 个账号`, `Deleted ${englishAccountCount}`), true)
+      const k = targets.length
+      const done = k.toLocaleString(locale)
+      notify(t(`已删除 ${done} 个账号`, `Deleted ${done} ${k === 1 ? 'account' : 'accounts'}`))
+      const next = new Set(selected)
+      for (const id of targets) next.delete(id)
+      onSelectedChange(next)
     },
     onError: (e) => { setConfirmDelete(false); onError(e) },
   })
@@ -582,7 +590,7 @@ export function BatchActionsBar({
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
-              <Button variant="destructive" loading={applyDelete.isPending} onClick={() => applyDelete.mutate()}>
+              <Button variant="destructive" loading={applyDelete.isPending} onClick={() => applyDelete.mutate(ids)}>
                 {t(`删除 ${formattedCount} 个`, `Delete ${formattedCount}`)}
               </Button>
             </AlertDialogFooter>

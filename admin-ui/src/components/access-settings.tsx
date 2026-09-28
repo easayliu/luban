@@ -274,8 +274,12 @@ export function AccessSettingsContent() {
                 >
                   {show ? <EyeOffIcon /> : <EyeIcon />}
                 </Button>
+                {/* 只复制已保存的 Key：生成后没点保存就拿去配客户端，请求会一律 401。 */}
                 <CopyButton
-                  text={draft}
+                  text={currentKey}
+                  disabledReason={draft.trim() !== currentKey
+                    ? t('先保存再复制', 'Save the key before copying it')
+                    : undefined}
                   label={t('复制接入 Key', 'Copy access key')}
                   copiedLabel={t('已复制接入 Key', 'Access key copied')}
                   size="icon-sm"
@@ -291,8 +295,9 @@ export function AccessSettingsContent() {
                 <Button
                   size="sm"
                   loading={save.isPending}
-                  disabled={draft === currentKey}
-                  onClick={() => save.mutate(draft.trim())}
+                  disabled={draft.trim() === currentKey}
+                  // 删空再保存等于清除 Key，同样要过确认框。
+                  onClick={() => (draft.trim() ? save.mutate(draft.trim()) : setClearKeyOpen(true))}
                 >
                   <SaveIcon />
                   {t('保存', 'Save')}
@@ -607,7 +612,7 @@ function DeviceBindingTtl() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -724,7 +729,7 @@ function DeviceBindingRetention() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -804,7 +809,7 @@ function SessionBindingTtl() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -886,7 +891,7 @@ function SessionBindingRetention() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -971,7 +976,7 @@ function DefaultDeviceLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1049,7 +1054,7 @@ function DefaultSessionLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1132,7 +1137,7 @@ function DefaultRpmLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1223,7 +1228,7 @@ function DeviceRpmLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1327,7 +1332,7 @@ function SessionRpmLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1412,7 +1417,7 @@ function SessionConcurrencyLimit() {
       </NumberField>
       <Button
         loading={save.isPending}
-        disabled={parsed === current}
+        disabled={draft === null || parsed === current}
         onClick={() => save.mutate(parsed)}
       >
         <SaveIcon />
@@ -1827,7 +1832,7 @@ function BareRateLimit() {
           <Button
             className="col-start-3 row-start-2 max-sm:size-9 max-sm:px-0"
             loading={save.isPending}
-            disabled={inactive || unchanged}
+            disabled={inactive || unchanged || draft === null || windowDraft === null}
             onClick={() => save.mutate({ limit, win })}
           >
             <SaveIcon />
@@ -2011,9 +2016,12 @@ function CopyButton({
   label,
   copiedLabel,
   copyErrorDescription,
+  disabledReason,
   size = 'icon-xs',
 }: {
   text: string
+  /** 给了就禁用按钮，并把原因放进提示。 */
+  disabledReason?: string
   label?: string
   copiedLabel?: string
   copyErrorDescription?: string
@@ -2046,10 +2054,11 @@ function CopyButton({
     <>
       <Button
         type="button"
-        aria-label={copied ? successLabel : idleLabel}
+        aria-label={copied ? successLabel : disabledReason ?? idleLabel}
         className={copied ? 'text-success-foreground' : undefined}
+        disabled={disabledReason !== undefined}
         size={size}
-        title={copied ? successLabel : idleLabel}
+        title={copied ? successLabel : disabledReason ?? idleLabel}
         variant="ghost"
         onClick={async () => {
           if (!text) return

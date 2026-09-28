@@ -26,11 +26,14 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
     placeholderData: keepPreviousData,
   })
   const rows = query.data?.rows ?? []
+  // 行属于哪个维度以返回数据为准：切换维度后新数据回来前，表里还是旧维度的行
+  // （keepPreviousData），按按钮上的 by 解读会把模型名当账号 id 去查。
+  const rowsBy = query.data?.by ?? by
   // 点某一行 → 打开请求明细，带上模型 / 账号与时间范围：看到某个模型 p95 飙高之后，
   // 排查是两步而不是再去请求日志页翻。
   const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
   const openRow = (row: BreakdownRow) => setDrill(
-    by === 'model'
+    rowsBy === 'model'
       ? { model: row.key, label: row.label || row.key, hours }
       : { credId: Number(row.key), label: row.label, hours },
   )
@@ -84,7 +87,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
           <table className="w-full text-xs">
             <thead className="sticky top-0 bg-surface-subtle">
               <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-                <th scope="col" className="text-start">{by === 'model' ? t('模型', 'Model') : t('账号', 'Account')}</th>
+                <th scope="col" className="text-start">{rowsBy === 'model' ? t('模型', 'Model') : t('账号', 'Account')}</th>
                 <th scope="col" className="text-end">{t('请求', 'Requests')}</th>
                 {kind === 'latency' ? (
                   <>
