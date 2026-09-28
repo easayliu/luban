@@ -3,7 +3,6 @@ import {
   CalendarDaysIcon,
   CheckIcon,
   ClockIcon,
-  BanIcon,
   GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
@@ -37,7 +36,6 @@ import {
   fablePoolHint,
   fablePoolWindow,
   modelCooldownSummary,
-  modelDenialSummary,
   proxyMaskedUrl,
   useProxyName,
   quotaLevel,
@@ -139,7 +137,8 @@ function FooterStat({
     <Tooltip>
       <TooltipTrigger
         className={cn(
-          'relative flex min-w-0 shrink items-center gap-1 rounded-sm text-left font-medium text-xs tabular-nums outline-none',
+          // 图标与数字之间窄卡上收成 2px，理由见页脚处的注。
+          'relative flex min-w-0 shrink items-center gap-0.5 rounded-sm text-left font-medium text-xs tabular-nums outline-none @min-[22rem]/card:gap-1',
           'transition-colors hover:underline hover:underline-offset-4 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
           'pointer-coarse:after:absolute pointer-coarse:after:top-1/2 pointer-coarse:after:left-1/2 pointer-coarse:after:size-full pointer-coarse:after:min-h-11 pointer-coarse:after:min-w-11 pointer-coarse:after:-translate-x-1/2 pointer-coarse:after:-translate-y-1/2',
         )}
@@ -195,8 +194,8 @@ export const CredentialCard = memo(function CredentialCard({
   const evaluation = evaluateCredential(cred, now, language)
   const { quota, status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
-  // 只渲染上游真报过的窗口。卡片是弹性布局，没有的那个直接不占位；表格那边列宽固定，
-  // 摘不掉，所以改成显式的「无此窗口」，见 credential-row 的 ListQuotaMeter。
+  // 上游没报的窗口写「无此窗口」而不是摘掉，与列表视图（credential-row 的 ListQuotaMeter）同一口径，
+  // 两列的位置在每张卡上都一样，见用量网格处的注。
   const has5h = quota.h5.reported
   const has7d = quota.d7.reported
   // fable 额度池（7d_oi）挂在 7d 那一列下面：同为 7 天周期，上下对着比；上游没报就不占位。
@@ -351,11 +350,11 @@ export const CredentialCard = memo(function CredentialCard({
           selected && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
         )}
       >
-        {/* 账号卡片的槽宽固定 16px，不跟全站那档「手机 16 / ≥640 20」走：
-            这张卡在网格里通常只有 300–600px 宽，里面「5h 1 req 24.8K tok $0.018 … 0%」
-            那一行是逐字算过的，两侧各多 4px 就会把 `$0.018` 挤到第二行。
-            页面级卡片（工作区、设置面板）才用 20px。 */}
-        <CardHeader className="p-4 pb-3">
+        {/* 间距按卡片**容器**宽度分两档，不跟全站那档按视口走的「手机 16 / ≥640 20」：
+            窄于 27rem 的卡片（只有手机会）槽宽 16px、行距 12px，每一行都是逐像素算过的，
+            多给就会把读数与页脚挤到截断；≥ 27rem 的卡片（桌面恒是）槽宽 20px、段落之间 16px，
+            读数行已经改成纯文本、不再贴着宽度上限，多出的这点空间用来让各段之间透气。 */}
+        <CardHeader className="p-4 pb-3 @min-[27rem]/card:px-5 @min-[27rem]/card:pt-5">
           <CardTitle className="min-w-0 text-sm leading-snug">
             {editing ? (
               <>
@@ -418,7 +417,7 @@ export const CredentialCard = memo(function CredentialCard({
                       {credentialLabel}
                     </a>
                   </h3>
-                  <CardDescription className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
+                  <CardDescription className="mt-1 flex @min-[27rem]/card:mt-1.5 min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
                     <span aria-hidden="true">·</span>
                     <Tooltip>
@@ -462,174 +461,189 @@ export const CredentialCard = memo(function CredentialCard({
           )}
         </CardHeader>
 
-        <CardPanel className="space-y-3 px-4 pb-3 sm:pb-4">
+        <CardPanel className="space-y-3 px-4 pb-4 @min-[27rem]/card:space-y-4 @min-[27rem]/card:px-5 @min-[27rem]/card:pb-5">
           {/* 这一行的徽章一律 `size="xs"`——整张卡片除标题外都是写死的 12px，不跟视口走，
               徽章得落在同一档才不会比下面「用量限制」大一号。默认档是 `text-sm sm:text-xs`，
               按 640px **视口**断点；而这张卡片走的是 `@sm/card` **容器**断点，两套不是一回事，
               手机或窄窗口下就露馅。`xs` 那档的取舍见 `ui/badge.tsx`。 */}
-          <div className="flex flex-wrap items-center gap-2">
-            {statusUsesTooltip ? (
-              <Tooltip>
-                <TooltipTrigger
-                  className={cn(badgeVariants({ size: 'xs', variant: status.variant }), 'cursor-help')}
-                  delay={0}
-                  aria-label={t(
-                    `${credentialLabel}：${status.label}。${status.detail}`,
-                    `${credentialLabel}: ${status.label}. ${status.detail}`,
-                  )}
-                  aria-live="polite"
+          {/* 徽章在左、可折行；快照时间单独一栏钉在右上角、不参与折行。原先两者同在一个 flex-wrap 里，
+              徽章一多（尤其挂着代理名称时）时间就被挤到第二行最右，单独占一行。 */}
+          <div className="flex items-start gap-2">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              {statusUsesTooltip ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    className={cn(badgeVariants({ size: 'xs', variant: status.variant }), 'cursor-help')}
+                    delay={0}
+                    aria-label={t(
+                      `${credentialLabel}：${status.label}。${status.detail}`,
+                      `${credentialLabel}: ${status.label}. ${status.detail}`,
+                    )}
+                    aria-live="polite"
+                  >
+                    {status.label}
+                  </TooltipTrigger>
+                  <TooltipPopup
+                    side="bottom"
+                    align="start"
+                    className="max-w-80 whitespace-normal break-words text-left leading-5"
+                  >
+                    {status.detail}
+                  </TooltipPopup>
+                </Tooltip>
+              ) : (
+                <Badge
+                  size="xs"
+                  variant={status.variant}
+                  aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
                 >
                   {status.label}
-                </TooltipTrigger>
-                <TooltipPopup
-                  side="bottom"
-                  align="start"
-                  className="max-w-80 whitespace-normal break-words text-left leading-5"
+                </Badge>
+              )}
+              {/* 被拒的那个窗口下面已经画成红条（5h / 7d / fable）时，这枚徽章说的是同一件事，不挂；
+                  只在上游点名的窗口没有进度条可看（未知窗口、老快照）时，它才是唯一的解释。 */}
+              {cred.quota && !verdictShownByMeter(cred.quota.rl_representative, has5h, has7d, fablePool != null) && (
+                <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
+              )}
+              <AccountTierBadge cred={cred} size="xs" />
+              <Tooltip>
+                <TooltipTrigger
+                  className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help tabular-nums')}
+                  delay={0}
                 >
-                  {status.detail}
+                  P{cred.priority}
+                </TooltipTrigger>
+                <TooltipPopup>
+                  {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+                </TooltipPopup>
+              </Tooltip>
+              {secondaryOverage && (
+                <Tooltip>
+                  <TooltipTrigger
+                    className={cn(badgeVariants({ size: 'xs', variant: secondaryOverage.variant }), 'cursor-help')}
+                    delay={0}
+                  >
+                    {secondaryOverage.label}
+                  </TooltipTrigger>
+                  <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                    {secondaryOverage.title}
+                  </TooltipPopup>
+                </Tooltip>
+              )}
+              {proxyLabel ? (
+                // 代理名称排在最后、放在一个能伸缩的外壳里：外壳起步只要 4rem、再吃满这一行剩下的宽度，
+                // 徽章本身按内容取宽、超出外壳才截断。直接把徽章放进 flex-wrap，名字一长它就整枚掉到
+                // 第二行——卡片平白多一行；现在只有前面的徽章把这行占到不足 4rem 时它才折行。
+                <div className="flex min-w-0 max-w-44 grow basis-16 @sm/card:max-w-72">
+                  <Tooltip>
+                    {/* 显示代理池里的名称，不铺 IP 与端口；不在池里的自定义地址才退回 `host:port`。
+                        完整地址（脱敏）在 Tooltip 与出站代理对话框里。 */}
+                    <TooltipTrigger
+                      render={<button type="button" />}
+                      className={cn(
+                        badgeVariants({ size: 'xs', variant: 'outline' }),
+                        'min-w-0 max-w-full cursor-pointer gap-1',
+                      )}
+                      onClick={() => setProxyOpen(true)}
+                    >
+                      <GlobeIcon className="size-3" />
+                      <span className="min-w-0 truncate">{proxyLabel}</span>
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy!)}</TooltipPopup>
+                  </Tooltip>
+                </div>
+              ) : null}
+            </div>
+            {/* 用量快照的时间钉在徽章行最右。原先它独占一行「用量限制 … 更新于」，而下面的 5h / 7d
+                自己就说明了那是什么，那一行只剩这个时间戳，白占 28px。窄卡上去掉「更新于」三个字，
+                时钟图标已经说明它是什么。`h-4.5` 与 xs 徽章同高，徽章折行时它仍对齐第一行。 */}
+            {cred.quota ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={<span />}
+                  className="inline-flex h-4.5 shrink-0 items-center gap-1 whitespace-nowrap text-xs text-muted-foreground"
+                >
+                  <ClockIcon className="size-3" />
+                  <span className="@max-[27rem]/card:hidden">{t('更新于 ', 'Updated ')}</span>
+                  {relativeTime(cred.quota.ts, now, language)}
+                </TooltipTrigger>
+                <TooltipPopup>
+                  {t(`用量快照于 ${formatFullTime(cred.quota.ts, language)}`, `Usage snapshot at ${formatFullTime(cred.quota.ts, language)}`)}
                 </TooltipPopup>
               </Tooltip>
             ) : (
-              <Badge
-                size="xs"
-                variant={status.variant}
-                aria-label={t(`${credentialLabel}：${status.label}`, `${credentialLabel}: ${status.label}`)}
-              >
-                {status.label}
-              </Badge>
+              <span className="inline-flex h-4.5 shrink-0 items-center text-xs text-muted-foreground">{t('暂无用量数据', 'No usage data')}</span>
             )}
-            {/* 被拒的那个窗口下面已经画成红条（5h / 7d / fable）时，这枚徽章说的是同一件事，不挂；
-                只在上游点名的窗口没有进度条可看（未知窗口、老快照）时，它才是唯一的解释。 */}
-            {cred.quota && !verdictShownByMeter(cred.quota.rl_representative, has5h, has7d, fablePool != null) && (
-              <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
-            )}
-            <AccountTierBadge cred={cred} size="xs" />
-            <Tooltip>
-              <TooltipTrigger
-                className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help tabular-nums')}
-                delay={0}
-              >
-                P{cred.priority}
-              </TooltipTrigger>
-              <TooltipPopup>
-                {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
-              </TooltipPopup>
-            </Tooltip>
-            {proxyLabel ? (
-              <Tooltip>
-                {/* 显示代理池里的名称，不铺 IP 与端口；不在池里的自定义地址才退回 `host:port`。
-                    完整地址（脱敏）在 Tooltip 与出站代理对话框里。 */}
-                <TooltipTrigger
-                  render={<button type="button" />}
-                  className={cn(
-                    badgeVariants({ size: 'xs', variant: 'outline' }),
-                    'min-w-0 max-w-44 cursor-pointer gap-1 @sm/card:max-w-72',
-                  )}
-                  onClick={() => setProxyOpen(true)}
-                >
-                  <GlobeIcon className="size-3" />
-                  <span className="min-w-0 truncate">{proxyLabel}</span>
-                </TooltipTrigger>
-                <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy!)}</TooltipPopup>
-              </Tooltip>
-            ) : null}
           </div>
 
-          <section aria-label={t(`${credentialLabel} 的用量限制`, `Usage limits for ${credentialLabel}`)} className="space-y-2">
-            <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <h4 className="font-medium text-xs text-muted-foreground">{t('用量限制', 'Usage limits')}</h4>
-                {secondaryOverage && (
-                  <Tooltip>
-                    <TooltipTrigger
-                      className={cn(
-                        // 同上：它紧挨着 `text-xs` 的「用量限制」标题。
-                        badgeVariants({ size: 'xs', variant: secondaryOverage.variant }),
-                        'cursor-help',
-                      )}
-                      delay={0}
-                    >
-                      {secondaryOverage.label}
-                    </TooltipTrigger>
-                    <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
-                      {secondaryOverage.title}
-                    </TooltipPopup>
-                  </Tooltip>
-                )}
-              </div>
-              {cred.quota ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={<span />}
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                  >
-                    <ClockIcon className="size-3" />
-                    {/* 窄卡且旁边挂着 Usage credits 徽章时，「用量限制 · 徽章 · 更新于 N 小时前」一行放不下，
-                        时间戳会被挤到下一行单独一行。这时只去掉「更新于」三个字，时钟图标已经说明了它是什么。 */}
-                    <span className={cn(secondaryOverage && '@max-[24rem]/card:hidden')}>
-                      {t('更新于 ', 'Updated ')}
-                    </span>
-                    {relativeTime(cred.quota.ts, now, language)}
-                  </TooltipTrigger>
-                  <TooltipPopup>{formatFullTime(cred.quota.ts, language)}</TooltipPopup>
-                </Tooltip>
-              ) : (
-                <span className="text-xs text-muted-foreground">{t('暂无数据', 'No data')}</span>
-              )}
-            </div>
+          <section aria-label={t(`${credentialLabel} 的用量限制`, `Usage limits for ${credentialLabel}`)} className="space-y-2 empty:hidden">
             {cred.quota && (has5h || has7d || fablePool) ? (
-              // 只有一个窗口时不留空半格：分两列却只填一格，看起来像另一半加载失败了。
+              // **任何宽度下都是两列**，手机上也不摞成两行：5h 与 7d 是同一组数据的两个口径，
+              // 并排才好比。只报了一个窗口时另一格也留着、写「无此窗口」（与列表视图同一口径）：
+              // 否则那条进度条铺满整行，跟同一列其他卡片的 5h 条长短、百分比位置全都对不上。
               //
-              // 两个窗口都有时**任何宽度下都是两列**，手机上也不摞成两行：5h 与 7d 是同一
-              // 组数据的两个口径，并排才好比；摞起来后一张卡多出一屏高，翻着翻着就忘了上面那条
-              // 是几。手机上两列挤不下的问题不靠缩成一列解决，也不靠多排几行——那样一张卡的
-              // 用量段落高出一倍，还是占地方；而是在 [QuotaMeter] 里按容器宽度**省宽度**：
-              // 胶囊间距收紧、`req` 后缀隐掉、百分比与倒计时不再定宽，行数与宽版一样是两行。
+              // 排成三行的网格而不是两个各自上下排的列：第一行两组读数、第二行两条进度条、
+              // 第三行 fable 子池（只挂在 7d 下面，5h 那格空着）。同一种东西永远在同一行，
+              // fable 紧贴 7d 那条，两条长度可以直接比。
               //
-              // 27rem 这条线的来历：胶囊 `xs`＝12px 时三枚「1.2K req · 92.7M · $12345.67」
-              // 上界 191px，两列要 191×2 + 16 + 32 = 430px；它也正是 [CREDENTIAL_CARD_GRID_CLASS]
-              // 里卡片的最小宽度——桌面的卡片恒 ≥ 27rem，走宽版排法；只有手机上卡片被视口压到
-              // 27rem 以下，才切到窄版。列间距跟着走：宽版 16px，窄版 12px 多省 4px 给内容。
-              <div
-                className={cn(
-                  'grid gap-3',
-                  has5h && (has7d || fablePool) && 'grid-cols-2 @min-[27rem]/card:gap-4',
+              // 读数在上、进度条在下：请求数 / token / 费用是「这个窗口里发生了什么」，
+              // 进度条是「还剩多少」，先读前者再看后者。
+              //
+              // 27rem 这条线：它正是 [CREDENTIAL_CARD_GRID_CLASS] 里卡片的最小宽度——桌面的卡片
+              // 恒 ≥ 27rem，走宽版排法；只有手机上卡片被视口压到 27rem 以下，才切到窄版
+              // （百分比与倒计时不再定宽、间距收紧，见 [QuotaBar]）。列间距宽版 24px、窄版 12px。
+              <div className="grid grid-cols-2 gap-x-3 gap-y-2 @min-[27rem]/card:gap-x-6">
+                {has5h ? (
+                  <QuotaFacts
+                    requests={cred.quota.requests_5h}
+                    tokens={cred.quota.tokens_5h}
+                    cost={cred.quota.cost_5h}
+                  />
+                ) : (
+                  <span aria-hidden />
                 )}
-              >
-                {has5h && (
-                  <QuotaMeter
+                {has7d ? (
+                  <QuotaFacts
+                    requests={cred.quota.requests_7d}
+                    tokens={cred.quota.tokens_7d}
+                    cost={cred.quota.cost_7d}
+                  />
+                ) : (
+                  <span aria-hidden />
+                )}
+                {has5h ? (
+                  <QuotaBar
                     credentialLabel={credentialLabel}
-                    // 标签用 `5h`/`7d` 而不是「5 小时」：这一行现在还挤着进度条、百分比与
+                    // 标签用 `5h`/`7d` 而不是「5 小时」：这一行还挤着进度条、百分比与
                     // 重置时刻，长标签会把进度条压没；完整称呼在读屏文本里。
                     label="5h"
                     util={quota.h5.utilization}
                     reset={cred.quota.rl_5h_reset}
-                    cost={cred.quota.cost_5h}
-                    requests={cred.quota.requests_5h}
-                    tokens={cred.quota.tokens_5h}
                     snapshotTs={cred.quota.ts}
                     now={now}
                   />
+                ) : (
+                  <QuotaBarAbsent label="5h" />
                 )}
-                {(has7d || fablePool) && (
-                  <div className="flex min-w-0 flex-col gap-1.5">
-                    {has7d && (
-                      <QuotaMeter
-                        credentialLabel={credentialLabel}
-                        label="7d"
-                        // 下面挂着 fable 那条时，两条的窗口名格一起放宽到 `fable` 的宽度，条的起点才对齐。
-                        labelClassName={fablePool ? 'w-8' : undefined}
-                        util={quota.d7.utilization}
-                        reset={cred.quota.rl_7d_reset}
-                        cost={cred.quota.cost_7d}
-                        requests={cred.quota.requests_7d}
-                        tokens={cred.quota.tokens_7d}
-                        snapshotTs={cred.quota.ts}
-                        now={now}
-                      />
-                    )}
-                    {fablePool && <FablePoolMeter window={fablePool} now={now} />}
-                  </div>
+                {has7d ? (
+                  <QuotaBar
+                    credentialLabel={credentialLabel}
+                    label="7d"
+                    // 下面挂着 fable 那条时，两条的窗口名格一起放宽到 `fable` 的宽度，条的起点才对齐。
+                    labelClassName={fablePool ? 'w-8' : undefined}
+                    util={quota.d7.utilization}
+                    reset={cred.quota.rl_7d_reset}
+                    snapshotTs={cred.quota.ts}
+                    now={now}
+                  />
+                ) : (
+                  <QuotaBarAbsent label="7d" labelClassName={fablePool ? 'w-8' : undefined} />
+                )}
+                {fablePool && (
+                  <>
+                    <span aria-hidden />
+                    <FablePoolMeter window={fablePool} now={now} />
+                  </>
                 )}
               </div>
             ) : cred.quota ? (
@@ -662,19 +676,8 @@ export const CredentialCard = memo(function CredentialCard({
                 )}
               />
             )}
-            {/* 第三档：上游说这个套餐压根不含这些模型。它不会自己过去，所以措辞不能是「冷却」。 */}
-            {evaluation.modelDenied && (
-              <ModelStateLine
-                icon={BanIcon}
-                tone="text-muted-foreground"
-                label={t('套餐不含', 'Not in plan')}
-                detail={modelDenialSummary(cred, language)}
-                hint={t(
-                  '上游判定该账号的套餐不含以下模型：返回 429 但无任何用量窗口，且组织未开通超额用量（extra usage）。为这些模型选择账号时将跳过该账号，其余模型不受影响。连通性测试通过、套餐等级变化或在菜单中手动解除，均会清除此记录',
-                  'Upstream reported that this account’s plan does not include these models (a 429 with no usage window at all and extra usage disabled for the org), so they skip this account during selection; its other models keep serving. A passing connectivity test, a tier change, or clearing from the menu removes the mark',
-                )}
-              />
-            )}
+            {/* 「套餐不含」（Pro 号打 fable 那类）不在卡片上显示：那是套餐本身决定的、预期之内的事，
+                不是故障，挂在卡片上只是噪声。记录与解除入口在详情页和菜单里。 */}
           </section>
         </CardPanel>
 
@@ -683,7 +686,10 @@ export const CredentialCard = memo(function CredentialCard({
             （`py-2`），四格之间只留 gap，行高由 text-xs 决定，手机上整条 38px。前三格都带分母、
             说的是「此刻占了多少」，费用没有分母、说的是「一共烧了多少」——两类量之间隔一道 1px 竖线
             分组，而不是靠间距暗示。四格加开关在 360px 屏上也是一行，不换行、不砍分母、不藏东西。 */}
-        <CardFooter className="mt-auto flex items-center gap-2 border-t bg-muted/32 px-4 py-2 @sm/card:gap-3">
+        {/* 窄于 22rem 的卡片（360 那档手机，内容区只剩 294px）上，四格加开关按常规间距排正好顶满，
+            RPM 到三位数或费用上百就被截成「2…」「$214.…」。所以窄卡上省出约 40px：格间距 8→6px、
+            图标与数字间 4→2px，费用满 $100 时不显示分位（精确值在悬浮提示里）。 */}
+        <CardFooter className="mt-auto flex items-center gap-1.5 border-t bg-muted/32 px-4 py-2 @min-[22rem]/card:gap-2 @sm/card:gap-3 @min-[27rem]/card:gap-4 @min-[27rem]/card:px-5 @min-[27rem]/card:py-3">
           <FooterStat
             icon={SmartphoneIcon}
             iconClassName={devicePolicy.className}
@@ -732,7 +738,12 @@ export const CredentialCard = memo(function CredentialCard({
             icon={WalletCardsIcon}
             iconClassName="text-muted-foreground"
             valueClassName={cred.cost_total > 0 ? 'text-foreground' : 'text-muted-foreground'}
-            value={formatUsd(cred.cost_total)}
+            value={cred.cost_total >= 100 ? (
+              <>
+                <span className="@max-[22rem]/card:hidden">{formatUsd(cred.cost_total)}</span>
+                <span className="@min-[22rem]/card:hidden">${Math.round(cred.cost_total)}</span>
+              </>
+            ) : formatUsd(cred.cost_total)}
             hint={costHint}
             ariaLabel={t(`查看 ${credentialLabel} 的请求明细`, `View the request log for ${credentialLabel}`)}
             srLabel={t('累计等价 API 费用', 'Cumulative equivalent API cost')}
@@ -1061,14 +1072,14 @@ export function UpstreamVerdict({
 }
 
 /**
- * 额度里的一项事实（请求数、总 token、花费）：浅灰小块，值在前、单位在后。
+ * 额度里的一项事实（请求数、总 token、花费）：纯文本，值在前、单位在后。
  *
- * 做成块而不是「标签: 值」的文本对——卡片上这行要能一眼扫过去，标签在小字号下只是噪声，
- * 真要确认是什么，悬浮提示与读屏文本都写着全称。
+ * 不再是浅灰胶囊：一张卡上六块灰底小框挤在进度条旁边，读着杂；而且胶囊自带内边距，
+ * 读着杂。改成与页脚读数条同一种读法：计量值只是文字，底板留给状态徽章。
  *
  * 提示用 `Tooltip` 组件而不是原生 `title`，且 `delay={0}`：原生提示要等约 1 秒才冒出来，
- * 而这三块的提示装的正是「这个数到底是什么、精确值多少」——等一秒才看见，等于没有。
- * 触屏上原生 `title` 更是压根不出。理由同页脚那三项，见上面 CardFooter 处的注。
+ * 而这三项的提示装的正是「这个数到底是什么、精确值多少」——等一秒才看见，等于没有。
+ * 触屏上原生 `title` 更是压根不出。
  */
 function QuotaFact({
   label,
@@ -1088,18 +1099,12 @@ function QuotaFact({
       <TooltipTrigger
         render={<div />}
         delay={0}
-        className={cn(
-          // `sm` 那档桌面上是 10px，压在 12px 的「用量限制」标题下面矮一截，
-          // 且低于 kumo 字号梯子的下限（`Text` 的 size 只到 xs＝12px）。换成 `xs` 之后
-          // 两端都是 12px，圆角也从 4px 回到 2px，跟上面那行胶囊对齐。
-          badgeVariants({ size: 'xs', variant: 'secondary' }),
-          'min-w-0 gap-0.5 font-normal',
-        )}
+        className="inline-flex min-w-0 cursor-help items-baseline gap-0.5 whitespace-nowrap"
       >
         <dt className="sr-only">{label}</dt>
-        <dd className="truncate tabular-nums">{value}</dd>
-        {/* 窄卡上（< 27rem）后缀隐掉省宽度，让三枚仍排得进一行；理由见 QuotaMeter 那处胶囊行的注。 */}
-        {suffix && <span className="text-muted-foreground @max-[27rem]/card:hidden" aria-hidden>{suffix}</span>}
+        <dd className="tabular-nums">{value}</dd>
+        {/* 窄卡上（< 27rem，只有手机）后缀隐掉，三项仍排得进一行；理由见 [QuotaFacts]。 */}
+        {suffix && <span className="@max-[27rem]/card:hidden" aria-hidden>{suffix}</span>}
       </TooltipTrigger>
       <TooltipPopup className="max-w-72 whitespace-normal break-words text-left leading-5">
         {hint ? t(`${label}：${hint}`, `${label}: ${hint}`) : label}
@@ -1108,15 +1113,83 @@ function QuotaFact({
   )
 }
 
-function QuotaMeter({
+/**
+ * 进度条上面那行读数：「128 req · 18.4M · $6.85」。
+ *
+ * 整行弱色：一眼要读到的是下面那条进度条的长度与百分比。token 那项不挂
+ * `tok` 后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开。中间的点只是分隔，
+ * 不进读屏。
+ *
+ * 卡片窄于 27rem（只有手机会）时一列约 150px，「128 req · 18.4M · $6.85」要 170px 装不下，
+ * 间距收紧、`req` 后缀隐掉，「128 · 18.4M · $6.85」三个数靠形态就能分开（整数 / 带单位 /
+ * 带 $），悬浮提示与读屏文本里全称照旧。`flex-wrap` 只是兜底：`$12345.67` 这种上界值真装不下
+ * 时宁可折行也别盖到旁边那列。
+ */
+function QuotaFacts({
+  requests,
+  tokens,
+  cost,
+}: {
+  requests: number | null
+  /** 本窗口内用掉的总 token（官方 usage 四项之和，见 Quota.tokens_5h）。 */
+  tokens: number | null
+  cost: number | null
+}) {
+  const { t, locale } = useI18n()
+  const dot = <span aria-hidden className="text-muted-foreground/60">·</span>
+  return (
+    <dl className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground @max-[27rem]/card:gap-x-1">
+      <QuotaFact
+        label={t('请求数', 'Requests')}
+        value={requests == null ? '—' : formatCompactNumber(requests)}
+        hint={requests == null ? undefined : requests.toLocaleString(locale)}
+        suffix="req"
+      />
+      {dot}
+      {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
+          重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
+      <QuotaFact
+        label={t('总 token', 'Total tokens')}
+        value={tokens == null ? '—' : formatTokens(tokens)}
+        hint={tokens == null
+          ? undefined
+          : t(
+            `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
+            `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+          )}
+      />
+      {dot}
+      <QuotaFact
+        label={t('等价 API 费用', 'Equivalent API cost')}
+        value={cost == null ? '—' : formatUsd(cost)}
+      />
+    </dl>
+  )
+}
+
+/** 窗口名那一格：定宽弱色文本，5h、7d、fable 几条的起点靠它对齐。 */
+const QUOTA_LABEL_CLASS = 'w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums'
+
+/**
+ * 上游没报的那个窗口：窗口名照旧占位，后面写「无此窗口」，与列表视图同一口径。
+ * 行高与 [QuotaBar] 一致（都由 text-xs 的行高定），下面的 fable 那行因此不会错位。
+ */
+function QuotaBarAbsent({ label, labelClassName }: { label: string; labelClassName?: string }) {
+  const { t } = useI18n()
+  return (
+    <div className="flex min-w-0 items-center gap-2 text-xs @max-[27rem]/card:gap-1.5">
+      <span className={cn(QUOTA_LABEL_CLASS, labelClassName)}>{label}</span>
+      <span className="min-w-0 truncate text-muted-foreground/70">{t('无此窗口', 'Not applicable')}</span>
+    </div>
+  )
+}
+
+function QuotaBar({
   credentialLabel,
   label,
   labelClassName,
   util,
   reset,
-  cost,
-  requests,
-  tokens,
   snapshotTs,
   now,
 }: {
@@ -1126,19 +1199,15 @@ function QuotaMeter({
   labelClassName?: string
   util: number | null
   reset: number | null
-  cost: number | null
-  requests: number | null
-  /** 本窗口内用掉的总 token（官方 usage 四项之和，见 Quota.tokens_5h）。 */
-  tokens: number | null
   snapshotTs: number
   /** 页面时钟（30 秒一跳），倒计时靠它走，见 [formatCountdown]。 */
   now: number
 }) {
-  const { t, language, locale } = useI18n()
+  const { t, language } = useI18n()
   // 窗口重置后上游那份 utilization 就作废了（[evaluateQuotaWindow] 把它抹成 null），此时
   // 这个窗口的用量确实归了零——直接按 0% 画，不再单独摆一句「已重置 / 暂无数据」。那句话
   // 占着和数据一样大的地方，说的却只是「这里没什么可看」。倒计时同理：没有未来的重置时刻
-  // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则 5h 与 7d 两条的尾巴会错开。
+  // 就不写字，也不留「—」——但那一格的**宽度**留着（空白），否则上下两条的尾巴会错开。
   const percentage = quotaPercentage(util) ?? 0
   const level = quotaLevel(util)
   // 文字一律用 `-foreground` 那一支：`--destructive` 是给填充用的底色，拿来写字在浅底上
@@ -1150,71 +1219,29 @@ function QuotaMeter({
       : 'text-foreground'
 
   return (
-    <Meter value={percentage} max={100} className="gap-2">
-      {/* 数据先行、进度条随后：请求数与花费是「这个窗口里发生了什么」，百分比是「还剩多少」。
-          两组分行排，比原先挤在一行的三列 dl 好扫——那一行里三个标签三个值交替出现，
-          眼睛得逐个配对。 */}
-      {/* 进度条上面这一行：三个事实是 `secondary` 胶囊（见 QuotaFact），不是裸文本。
-          胶囊自带内边距，所以间距用 `gap-x-2` 而不是 `gap-x-3`；token 那格也不挂 `tok`
-          后缀——`397M` 与旁边的 `1947 req`、`$650.10` 靠形态就能分开，挂上后缀一列要多 24px。
-
-          卡片窄于 27rem（只有手机会）时一列只剩约 150px，三枚按宽版排法要 179px 装不下。
-          不改成多行（一枚一行占三行，整段高一倍），而是在同一行里省出这 30px：胶囊间距
-          8→4px 省 8，`req` 后缀连同它前面那道 4px 内距一起隐掉省 26——「1063 · 92.7M · $250.66」
-          三个数靠形态就能分开（整数 / 带单位 / 带 $），悬浮提示与读屏文本里全称照旧。
-          `flex-wrap` 留着只是兜底：`$12345.67` 这种上界值真装不下时宁可折行也别盖到旁边那列。 */}
-      <dl className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 @max-[27rem]/card:gap-x-1">
-        <QuotaFact
-          label={t('请求数', 'Requests')}
-          value={requests == null ? '—' : formatCompactNumber(requests)}
-          hint={requests == null ? undefined : requests.toLocaleString(locale)}
-          suffix="req"
-        />
-        {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
-            重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
-        <QuotaFact
-          label={t('总 token', 'Total tokens')}
-          value={tokens == null ? '—' : formatTokens(tokens)}
-          hint={tokens == null
-            ? undefined
-            : t(
-              `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
-              `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
-            )}
-        />
-        <QuotaFact
-          label={t('等价 API 费用', 'Equivalent API cost')}
-          value={cost == null ? '—' : formatUsd(cost)}
-        />
-      </dl>
-      {/* 进度条这一行宽版是「5h ▬▬▬▬ 37% 2h13m」一行到底，定宽的几格合计 20+36+48 加三道
-          间距 = 128px，进度条吃剩下的。窄于 27rem 时一列约 150px，照这套定宽条只剩二十几像素、
-          375px 的手机上还差几像素放不下。窄版仍是一行，但百分比与倒计时改按内容取宽
-          （`37%` 约 26px、`2h13m` 约 36px）、间距 8→6px，条能拿回约 50px。定宽本是为了上下
-          摞着的两条尾巴对齐；窄版两列并排、尾巴各在各的列里，对不对齐看不出来。 */}
+    <Meter value={percentage} max={100}>
+      {/* 宽版是「5h ▬▬▬▬ 37% 2h13m」一行到底，定宽的几格合计 20+36+48 加三道间距 = 128px，
+          进度条吃剩下的。窄于 27rem 时一列约 150px，照这套定宽条只剩二十几像素，所以窄版的
+          百分比与倒计时改按内容取宽（`37%` 约 26px、`2h13m` 约 36px）、间距 8→6px，条能拿回
+          约 50px。定宽本是为了上下摞着的两条（7d 与 fable）尾巴对齐；窄版上差这几像素看不出来。 */}
       <div className="flex min-w-0 items-center gap-2 @max-[27rem]/card:gap-1.5">
         {/* 窗口名是定宽的弱色文本，不是彩色胶囊：它只是"这条说的是哪个窗口"，一眼要认的是
             旁边那条的长度与颜色。实心胶囊在这张卡片上已经是状态的语言（运行正常 / 上游已拒），
-            借给分类只会让一张卡片上五六块彩色抢同一份注意力。定宽 1.25rem 让 5h、7d 两条的
-            起点对齐。 */}
-        <MeterLabel
-          className={cn('w-5 shrink-0 font-medium text-muted-foreground text-xs tabular-nums', labelClassName)}
-        >
+            借给分类只会让一张卡片上五六块彩色抢同一份注意力。 */}
+        <MeterLabel className={cn(QUOTA_LABEL_CLASS, labelClassName)}>
           <span className="sr-only">{t(`${credentialLabel} 的 `, `${credentialLabel} `)}</span>
           {label}
           <span className="sr-only">{t('用量', 'usage')}</span>
         </MeterLabel>
         <MeterTrack className="h-1.5 min-w-6 flex-1 rounded-full">
           {/* 填充色走共享的 [METER_FILL]：常态绿、吃紧琥珀、打满红，与设备 / 会话那几条
-              计量条同一套档位配色。v0.3.142 曾把这条的常态单独改成 marine 蓝，只有这一处
-              与别处不同，现在归位。 */}
+              计量条同一套档位配色。 */}
           <MeterIndicator className={cn(METER_FILL[level], 'rounded-full')} />
         </MeterTrack>
-        {/* 百分比与倒计时都给定宽的一格、文字左对齐：一张卡上下摞着 5h 与 7d 两条，`8%` 与
-            `100%` 宽度不同、倒计时又时有时无，两格若按内容伸缩，两条进度条就一长一短、尾巴
-            错开，看着像两个窗口的用量差别。留白不补，条尾因此永远在同一条竖线上。 */}
-        {/* 百分比说的是「快照那一刻」的占用，快照时刻本身挂在悬浮提示里（原先是原生 `title`，
-            手机上根本出不来——而这个数越接近 100，越需要知道它是几小时前的）。 */}
+        {/* 百分比与倒计时都给定宽的一格、文字左对齐：`8%` 与 `100%` 宽度不同、倒计时又时有时无，
+            两格若按内容伸缩，一列卡片里的进度条就一长一短、尾巴错开，看着像用量差别。 */}
+        {/* 百分比说的是「快照那一刻」的占用，快照时刻本身挂在悬浮提示里——这个数越接近 100，
+            越需要知道它是几小时前的。 */}
         <Tooltip>
           <TooltipTrigger render={<span />} delay={0} className="shrink-0 cursor-help">
             <MeterValue className={cn('block w-9 text-left font-medium text-xs tabular-nums @max-[27rem]/card:w-auto', valueClass)}>
@@ -1241,8 +1268,8 @@ function QuotaMeter({
             </TooltipPopup>
           </Tooltip>
         ) : (
-          // 没有未来的重置时刻时不写字、也不补「—」，但**宽度留着**：否则 5h 与 7d 两条的
-          // 尾巴会错开，看着像两个窗口的用量差别。与列表里那格同一处理（见 QuotaCountdown）。
+          // 没有未来的重置时刻时不写字、也不补「—」，但**宽度留着**，理由同上。
+          // 与列表里那格同一处理（见 QuotaCountdown）。
           <span className="w-12 shrink-0 @max-[27rem]/card:hidden" aria-hidden />
         )}
       </div>
@@ -1251,10 +1278,10 @@ function QuotaMeter({
 }
 
 /**
- * fable 额度池（`7d_oi`）那一条：只有进度条这一行，没有上面那排请求数 / token / 费用——上游只给
+ * fable 额度池（`7d_oi`）那一条：只有进度条这一行，没有请求数 / token / 费用那排读数——上游只给
  * 使用率与重置时刻，配一排「—」会让人以为是数据缺了。
  *
- * 各格宽度与 [QuotaMeter] 的进度条那一行逐一对齐（窗口名 `w-8`、百分比 `w-9`、倒计时 `w-12`，
+ * 各格宽度与 [QuotaBar]逐一对齐（窗口名 `w-8`、百分比 `w-9`、倒计时 `w-12`，
  * 窄卡上后两格按内容取宽），挂在 7d 正下方时两条的起点、条尾都在同一条竖线上，长度可以直接比。
  * 条比上面细一档（h-1）：它是 7d 之下的一个子池，不是与 5h / 7d 平级的第三个窗口。
  *

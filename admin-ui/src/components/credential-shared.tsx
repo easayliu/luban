@@ -164,11 +164,6 @@ export interface CredentialEvaluation {
    * 一发，仍在服务」，混成一项就没法在界面上如实说了。
    */
   modelThrottled: boolean
-  /**
-   * 是否有模型被上游判成**套餐不含**（Pro 号打 fable 那类）。这一档同样只挡那几个模型、不挡
-   * 账号，但与冷却不同：它不会自己过去，直到连通性测试通过、等级变化或手动解除。
-   */
-  modelDenied: boolean
 }
 
 const currentUnixSeconds = () => Math.floor(Date.now() / 1000)
@@ -528,7 +523,6 @@ export function evaluateCredential(
   const models = cred.rate_limited_models ?? []
   const modelCooling = models.some((m) => m.gated)
   const modelThrottled = models.some((m) => !m.gated)
-  const modelDenied = (cred.denied_models?.length ?? 0) > 0
   return {
     credential: cred,
     quota,
@@ -539,7 +533,6 @@ export function evaluateCredential(
     needsAttention: status.attention,
     modelCooling,
     modelThrottled,
-    modelDenied,
   }
 }
 
@@ -571,10 +564,6 @@ export function fablePoolHint(w: QuotaWindowMeta, language: Language): string {
       `resets ${formatFullTime(w.resetAt, language)}`,
     ),
   ].filter(Boolean).join(' · ')
-}
-
-export function modelDenialSummary(cred: Credential, language: Language): string {
-  return (cred.denied_models ?? []).map((d) => d.model).join(localize(language, '、', ', '))
 }
 
 /**
