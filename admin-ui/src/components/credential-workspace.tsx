@@ -49,7 +49,6 @@ import {
   useTtftSeries,
 } from '@/components/ttft-trend-dialog'
 import { getRejections, type CacheSeriesPoint, type TtftSeriesPoint } from '@/api/metrics'
-import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -248,46 +247,9 @@ const SORT_GROUPS: readonly (readonly SortKey[])[] = [
   ['devices', 'sessions'],
 ]
 
-/**
- * 筛选触发器的文字：未筛选时只显示维度名（「状态」），筛选后在竖线后附上当前取值的小标签，
- * 即 shadcn 数据表 faceted filter 的做法——维度名始终可见，一眼能分清「状态」与「套餐」两个按钮。
- *
- * 窄屏三等分的格子放不下「维度名 + 小标签」，也容不下按钮里再套一层底色：只留纯文字并可截断，
- * `mobile` 给出窄屏专用的短写法（排序是「排序 ↑」这类，取值本身已在菜单里勾着）。筛选生效时
- * 文字前加一枚小圆点，表示这个按钮正在起作用。
- */
-function FacetTriggerLabel({
-  title,
-  value,
-  mobile,
-  active = value != null,
-}: {
-  title: string
-  value: string | null
-  mobile?: string
-  active?: boolean
-}) {
-  const compact = mobile ?? value ?? title
-  return (
-    <>
-      <span className="flex min-w-0 items-center gap-1.5 sm:hidden">
-        {active && <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-marine" />}
-        <span className="min-w-0 truncate">{compact}</span>
-      </span>
-      <span className="flex min-w-0 items-center gap-1.5 max-sm:hidden">
-        <span className="shrink-0">{title}</span>
-        {value != null && (
-          <>
-            <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
-            <Badge variant="secondary" className="min-w-0 shrink truncate rounded-sm px-1.5 font-normal">
-              {value}
-            </Badge>
-          </>
-        )}
-      </span>
-    </>
-  )
-}
+/** 状态 / 套餐触发器在筛选生效时的染色：一眼能看出哪个按钮正在缩小列表。 */
+const ACTIVE_FILTER_CLASS =
+  'border-marine/40 bg-marine/10 text-marine-foreground hover:border-marine/40 hover:bg-marine/16 data-pressed:bg-marine/16'
 
 /** 下拉里的一项：名称靠左，计数靠右、弱化，不做染色。 */
 function FacetOption({ label, count }: { label: string; count: string }) {
@@ -1051,14 +1013,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
                   className={cn(
                     buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
+                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    filter !== 'all' && ACTIVE_FILTER_CLASS,
                   )}
                 >
                   <ListFilterIcon />
-                  <FacetTriggerLabel
-                    title={t('状态', 'Status')}
-                    value={filter === 'all' ? null : activeFilterLabel}
-                  />
+                  <span className="min-w-0 truncate">{activeFilterLabel}</span>
                 </MenuTrigger>
                 <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={filter}>
@@ -1081,14 +1041,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
                   className={cn(
                     buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
+                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+                    tier !== 'all' && ACTIVE_FILTER_CLASS,
                   )}
                 >
                   <LayersIcon />
-                  <FacetTriggerLabel
-                    title={t('套餐', 'Plan')}
-                    value={tier === 'all' ? null : activeTierLabel}
-                  />
+                  <span className="min-w-0 truncate">{activeTierLabel}</span>
                 </MenuTrigger>
                 <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={tier}>
@@ -1131,16 +1089,16 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     // 不要 `max-sm:col-span-2`：那是筛选组还是两列时给的（让排序独占一整行）。
                     // 组改成三列后它会占掉 3 列中的 2 列、被挤到第二行，右边空一格——
                     // 就是三枚筛选排成 2 + 1 的原因。三列下它和另外两枚一样，各占一格。
-                    'w-full min-w-0 justify-start max-sm:[&_svg]:hidden sm:w-auto',
+                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
                   )}
                 >
                   <ArrowUpDownIcon />
-                  <FacetTriggerLabel
-                    title={t('排序', 'Sort')}
-                    value={`${activeSortLabel} ${dir === 'asc' ? '↑' : '↓'}`}
-                    mobile={`${activeSortLabel} ${dir === 'asc' ? '↑' : '↓'}`}
-                    active={false}
-                  />
+                  <span className="min-w-0 truncate max-[22rem]:hidden">
+                    {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
+                  </span>
+                  <span className="hidden shrink-0 max-[22rem]:inline">
+                    {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
+                  </span>
                 </MenuTrigger>
                 <MenuPopup align="end" className="w-48">
                   <MenuRadioGroup value={sort}>
