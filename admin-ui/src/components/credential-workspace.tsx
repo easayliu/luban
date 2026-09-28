@@ -1451,23 +1451,25 @@ function AccountPagination({
   const from = (page - 1) * pageSize + 1
   const to = Math.min(page * pageSize, total)
 
-  // 与用量明细、封禁记录、学到的规则三处的分页条同一套写法：左计数、中翻页、右每页，`sm` 起
-  // 排成一行、窄屏翻页落到第二行；翻页只有上一页 / 「第 x / y 页」/ 下一页，手机上是两个方形
-  // 图标按钮。此前这里自成一套（`md` 断点、`icon-sm` 小按钮、数字页码、窄屏缩成「1–10 / 29」
-  // 并藏掉「每页」），同一个后台里四条分页条只有它长得不一样。
+  // 与用量明细、封禁记录、学到的规则三处的分页条同一套写法：左计数、中翻页、右每页，任何宽度
+  // 都是一行；翻页只有上一页 / 「第 x / y 页」/ 下一页，手机上是两个方形图标按钮。窄屏时计数
+  // 缩成「1–10 / 29」、页码缩成「1 / 3」、藏掉「每页」二字，腾出宽度让三栏并排——原先翻页落到
+  // 第二行，与左右两栏对不上。
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3 text-xs">
       <p className="min-w-0 text-muted-foreground tabular-nums">
-        {t(
-          `第 ${formatNumber(from)}–${formatNumber(to)} 个，共 ${formatNumber(total)} 个`,
-          `${formatNumber(from)}–${formatNumber(to)} of ${formatNumber(total)}`,
-        )}
+        <span className="max-sm:hidden">
+          {t(
+            `第 ${formatNumber(from)}–${formatNumber(to)} 个，共 ${formatNumber(total)} 个`,
+            `${formatNumber(from)}–${formatNumber(to)} of ${formatNumber(total)}`,
+          )}
+        </span>
+        <span className="sm:hidden">{`${formatNumber(from)}–${formatNumber(to)} / ${formatNumber(total)}`}</span>
       </p>
-      {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
-        放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
-        sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
-      <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
-        <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
+      {/* 窄屏也排成一行：计数缩成「1–10 / 29」、翻页只写「1 / 3」、藏掉「每页」二字，
+        三栏放得下，不再把翻页挤到第二行。 */}
+      <div className="col-start-3 row-start-1 flex items-center gap-2 justify-self-end">
+        <span className="whitespace-nowrap text-muted-foreground max-sm:hidden">{t('每页', 'Per page')}</span>
         <Select
           items={pageSizeItems}
           value={String(pageSize)}
@@ -1478,7 +1480,7 @@ function AccountPagination({
             }
           }}
         >
-          <SelectTrigger size="sm" className="w-auto min-w-20" aria-label={t('每页账号数', 'Accounts per page')}>
+          <SelectTrigger size="sm" className="w-auto min-w-16 sm:min-w-20" aria-label={t('每页账号数', 'Accounts per page')}>
             <SelectValue />
           </SelectTrigger>
           <SelectPopup>
@@ -1489,7 +1491,7 @@ function AccountPagination({
         </Select>
       </div>
       {pageCount > 1 && (
-        <CossPagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+        <CossPagination className="col-start-2 row-start-1 justify-center">
           <PaginationContent>
             <PaginationItem>
               <PaginationPrevious
@@ -1500,10 +1502,13 @@ function AccountPagination({
             </PaginationItem>
             <PaginationItem>
               <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
-                {t(
-                  `第 ${formatNumber(page)} / ${formatNumber(pageCount)} 页`,
-                  `Page ${formatNumber(page)} of ${formatNumber(pageCount)}`,
-                )}
+                <span className="max-sm:hidden">
+                  {t(
+                    `第 ${formatNumber(page)} / ${formatNumber(pageCount)} 页`,
+                    `Page ${formatNumber(page)} of ${formatNumber(pageCount)}`,
+                  )}
+                </span>
+                <span className="sm:hidden">{`${formatNumber(page)} / ${formatNumber(pageCount)}`}</span>
               </span>
             </PaginationItem>
             <PaginationItem>

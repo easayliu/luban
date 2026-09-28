@@ -1502,15 +1502,15 @@ function RefusalGroup({
             })}
           </ul>
           {(total > GROUP_PAGE_SIZES[0] || totalPages > 1) && (
-            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t bg-muted/30 px-3 py-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+            <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3 border-t bg-muted/30 px-3 py-2 text-xs">
               <p className="min-w-0 text-muted-foreground tabular-nums">
-                {t(`第 ${firstIndex}–${lastIndex} 条，共 ${total} 条`, `${firstIndex}–${lastIndex} of ${total}`)}
+                <span className="max-sm:hidden">{t(`第 ${firstIndex}–${lastIndex} 条，共 ${total} 条`, `${firstIndex}–${lastIndex} of ${total}`)}</span>
+                <span className="sm:hidden">{`${firstIndex}–${lastIndex} / ${total}`}</span>
               </p>
-              {/* `col-start-2` 不能省：这一格是「行确定、列自动」，而 CSS 网格会把这类项**先于**纯自动项
-                放置（放置算法第 2 步早于第 4 步），不钉列它就会抢到第 1 列、和左边那句计数调个个儿。
-                sm 起三列时它本来就有 `col-start-3`，只有窄屏这一档踩坑。 */}
-              <div className="col-start-2 row-start-1 flex items-center gap-2 justify-self-end sm:col-start-3">
-                <span className="whitespace-nowrap text-muted-foreground">{t('每页', 'Per page')}</span>
+              {/* 窄屏也排成一行：计数缩成「1–10 / 29」、翻页只写「1 / 3」、藏掉「每页」二字，
+                三栏放得下，不再把翻页挤到第二行。 */}
+              <div className="col-start-3 row-start-1 flex items-center gap-2 justify-self-end">
+                <span className="whitespace-nowrap text-muted-foreground max-sm:hidden">{t('每页', 'Per page')}</span>
                 <Select
                   items={GROUP_PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
                   value={pageSize}
@@ -1520,7 +1520,7 @@ function RefusalGroup({
                     setPage(0)
                   }}
                 >
-                  <SelectTrigger size="sm" className="w-auto min-w-20" aria-label={t('每页条数', 'Rows per page')}>
+                  <SelectTrigger size="sm" className="w-auto min-w-16 sm:min-w-20" aria-label={t('每页条数', 'Rows per page')}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectPopup>
@@ -1531,7 +1531,7 @@ function RefusalGroup({
                 </Select>
               </div>
               {totalPages > 1 && (
-                <Pagination className="col-span-2 row-start-2 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+                <Pagination className="col-start-2 row-start-1 justify-center">
                   <PaginationContent>
                     <PaginationItem>
                       <PaginationPrevious
@@ -1542,7 +1542,8 @@ function RefusalGroup({
                     </PaginationItem>
                     <PaginationItem>
                       <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
-                        {t(`第 ${currentPage + 1} / ${totalPages} 页`, `Page ${currentPage + 1} of ${totalPages}`)}
+                        <span className="max-sm:hidden">{t(`第 ${currentPage + 1} / ${totalPages} 页`, `Page ${currentPage + 1} of ${totalPages}`)}</span>
+                        <span className="sm:hidden">{`${currentPage + 1} / ${totalPages}`}</span>
                       </span>
                     </PaginationItem>
                     <PaginationItem>
