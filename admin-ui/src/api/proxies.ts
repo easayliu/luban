@@ -36,7 +36,7 @@ export async function testProxy(url: string): Promise<ProxyTestResult> {
   return data
 }
 
-/** 向代理池中添加一条新记录。 */
+/** 向代理池中添加一条新记录。`label` 留空时由后端按 host:port 自动命名。 */
 export async function addProxy(label: string, url: string): Promise<SavedProxy> {
   const { data } = await api.post<SavedProxy>('/proxies', { label, url })
   return data

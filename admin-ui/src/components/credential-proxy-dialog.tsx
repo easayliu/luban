@@ -220,6 +220,46 @@ export function ProxyPickerCombobox({
   )
 }
 
+/** 请求本身失败（网络错误、400 地址不合法）时，也折成一条失败结果，和代理不通走同一处展示。 */
+export function failedProxyTest(error: string): ProxyTestResult {
+  return {
+    ok: false, ip: null, country: null, city: null, region: null, org: null,
+    latency_ms: 0, error,
+  }
+}
+
+/** 一条测试结果的展示框：成功给出口 IP 与地区，失败给错误原因。代理池页与本组件共用。 */
+export function ProxyTestResultView({
+  result,
+  onDismiss,
+}: {
+  result: ProxyTestResult
+  onDismiss: () => void
+}) {
+  return (
+    <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${result.ok ? 'border-success/30 bg-success/5' : 'border-destructive/30 bg-destructive/5'}`}>
+      <MapPinIcon className="mt-0.5 size-3.5 shrink-0" />
+      {result.ok ? (
+        <div className="min-w-0 space-y-0.5">
+          <p className="font-medium">{result.ip}</p>
+          <p className="text-muted-foreground">
+            {[result.city, result.region, result.country].filter(Boolean).join(', ')}
+            {result.org && ` · ${result.org}`}
+            {` · ${result.latency_ms}ms`}
+          </p>
+        </div>
+      ) : (
+        <p className="min-w-0 break-all text-destructive-foreground">
+          {result.error}{result.latency_ms > 0 && ` · ${result.latency_ms}ms`}
+        </p>
+      )}
+      <Button size="icon-sm" variant="ghost" className="-my-0.5 ml-auto shrink-0" onClick={onDismiss}>
+        <XIcon className="size-3" />
+      </Button>
+    </div>
+  )
+}
+
 /** 代理测试按钮 + 结果展示，可复用于代理对话框和添加账号页面。 */
 export function ProxyTestBlock({ url }: { url: string }) {
   const { t, language } = useI18n()
@@ -228,16 +268,9 @@ export function ProxyTestBlock({ url }: { url: string }) {
   const test = useMutation({
     mutationFn: (target: string) => testProxy(target),
     onSuccess: (result, target) => setTested({ url: target, result }),
-    onError: (e, target) => setTested({
-      url: target,
-      result: {
-        ok: false, ip: null, country: null, city: null, region: null, org: null,
-        latency_ms: 0, error: extractError(e, language),
-      },
-    }),
+    onError: (e, target) => setTested({ url: target, result: failedProxyTest(extractError(e, language)) }),
   })
   const result = tested?.url === url ? tested.result : null
-  const setResult = (next: null) => setTested(next)
 
   if (!url) return null
 
@@ -253,28 +286,7 @@ export function ProxyTestBlock({ url }: { url: string }) {
         <PlayIcon />
         {t('测试代理', 'Test proxy')}
       </Button>
-      {result && (
-        <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${result.ok ? 'border-success/30 bg-success/5' : 'border-destructive/30 bg-destructive/5'}`}>
-          <MapPinIcon className="mt-0.5 size-3.5 shrink-0" />
-          {result.ok ? (
-            <div className="min-w-0 space-y-0.5">
-              <p className="font-medium">{result.ip}</p>
-              <p className="text-muted-foreground">
-                {[result.city, result.region, result.country].filter(Boolean).join(', ')}
-                {result.org && ` · ${result.org}`}
-                {` · ${result.latency_ms}ms`}
-              </p>
-            </div>
-          ) : (
-            <p className="min-w-0 break-all text-destructive-foreground">
-              {result.error}{result.latency_ms > 0 && ` · ${result.latency_ms}ms`}
-            </p>
-          )}
-          <Button size="icon-sm" variant="ghost" className="-my-0.5 ml-auto shrink-0" onClick={() => setResult(null)}>
-            <XIcon className="size-3" />
-          </Button>
-        </div>
-      )}
+      {result && <ProxyTestResultView result={result} onDismiss={() => setTested(null)} />}
     </div>
   )
 }

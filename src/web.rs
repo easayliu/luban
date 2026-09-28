@@ -1894,8 +1894,36 @@ async fn list_saved_proxies(
 
 #[derive(Deserialize)]
 struct AddProxyReq {
+    /// 留空时按地址自动起名，见 [auto_proxy_label]。
+    #[serde(default)]
     label: String,
     url: String,
+}
+
+/// 名称留空时的自动名：`host:port`，与池里已有名称撞了就依次加 ` #2`、` #3`。
+///
+/// 取 `host:port` 而不是「代理 N」：列表里一眼能认出是哪台机器，而且不带 user:pass，
+/// 名称是明文展示的，不能把凭据带出来。同一个网关靠用户名区分线路的（住宅代理常见）
+/// 会撞名，所以要去重。
+fn auto_proxy_label(url: &str, existing: &[String]) -> String {
+    let base = url
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|u| {
+            let host = u.host()?.to_string();
+            Some(match u.port_u16() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "proxy".to_string());
+    if !existing.iter().any(|l| l == &base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} #{n}"))
+        .find(|candidate| !existing.iter().any(|l| l == candidate))
+        .expect("unbounded range always yields a free name")
 }
 
 /// 向代理池中添加一条新记录。
@@ -1903,13 +1931,22 @@ async fn add_saved_proxy(
     State(state): State<AppState>,
     Json(req): Json<AddProxyReq>,
 ) -> Result<Json<SavedProxyView>, ApiError> {
-    let label = req.label.trim();
-    if label.is_empty() {
-        return Err(bad_request("the proxy name must not be empty"));
-    }
     let url =
         crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
-    let p = state.store.add_proxy(label, &url).map_err(internal)?;
+    let label = match req.label.trim() {
+        "" => {
+            let existing: Vec<String> = state
+                .store
+                .list_proxies()
+                .map_err(internal)?
+                .into_iter()
+                .map(|p| p.label)
+                .collect();
+            auto_proxy_label(&url, &existing)
+        }
+        given => given.to_string(),
+    };
+    let p = state.store.add_proxy(&label, &url).map_err(internal)?;
     tracing::info!(proxy_id = p.id, label = %p.label, url = %p.url, "proxy added to pool");
     Ok(Json(SavedProxyView {
         id: p.id,
@@ -3964,6 +4001,15 @@ fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    /// 自动名只取 host:port，不带 user:pass；撞名时依次加序号。
+    #[test]
+    fn auto_proxy_label_uses_host_port_and_dedupes() {
+        let url = "socks5h://user:secret@10.0.0.1:1080";
+        assert_eq!(auto_proxy_label(url, &[]), "10.0.0.1:1080");
+        let existing = vec!["10.0.0.1:1080".to_string(), "10.0.0.1:1080 #2".to_string()];
+        assert_eq!(auto_proxy_label(url, &existing), "10.0.0.1:1080 #3");
+    }
 
     /// 保活 401/403 的封号上下文要能区分「类型」：permission_error 与 authentication_error
     /// 在 reason / error_type 里都得看得见，状态码与上游 request-id 一并带上。

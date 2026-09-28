@@ -1,23 +1,28 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CheckIcon,
   GlobeIcon,
   PencilIcon,
+  PlayIcon,
   PlusIcon,
+  RotateCwIcon,
   Trash2Icon,
+  UsersIcon,
   XIcon,
 } from 'lucide-react'
 import {
   addProxy,
   deleteProxy,
   listProxies,
+  type ProxyTestResult,
   type SavedProxy,
+  testProxy,
   updateProxy,
 } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { proxyMaskedUrl } from '@/components/credential-shared'
-import { ProxyTestBlock } from '@/components/credential-proxy-dialog'
+import { failedProxyTest, ProxyTestResultView } from '@/components/credential-proxy-dialog'
 import { extractError } from '@/lib/utils'
 import {
   AlertDialog,
@@ -32,10 +37,29 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Separator } from '@/components/ui/separator'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
+import { ProxyAccountsDialog } from '@/components/proxy-accounts-dialog'
+
+/** 批量测试的并发数：每条测试最长 15s，全串行几十条要等好几分钟；并发太高又会同时打满 ip-api 的限流。 */
+const BATCH_TEST_CONCURRENCY = 4
+
+/**
+ * 测过且通的地址，名称留空时按出口地区起名（「Japan Tokyo」），比后端兜底的 host:port 好认；
+ * 与池里已有名称撞了就加序号。没测过或不通时返回空串，交给后端按 host:port 起名。
+ */
+function locationLabel(result: ProxyTestResult | undefined, existing: string[]): string {
+  if (!result?.ok) return ''
+  const parts = [result.country, result.city].filter((v): v is string => !!v)
+  const base = [...new Set(parts)].join(' ')
+  if (!base) return ''
+  if (!existing.includes(base)) return base
+  for (let n = 2; ; n++) {
+    const candidate = `${base} #${n}`
+    if (!existing.includes(candidate)) return candidate
+  }
+}
 
 export function ProxyPoolSettingsContent() {
   const { t, language } = useI18n()
@@ -45,24 +69,94 @@ export function ProxyPoolSettingsContent() {
   const [addLabel, setAddLabel] = useState('')
   const [addUrl, setAddUrl] = useState('')
 
+  // 测试结果按地址记，提在页面这一层：添加框、每一行、「全部测试」三处共用一份，
+  // 添加前测过的结果随新行一起带下去，不用再测一遍。
+  const [results, setResults] = useState<Record<string, ProxyTestResult>>({})
+  const [testing, setTesting] = useState<Set<string>>(() => new Set())
+  // 记下是哪个批量按钮在跑：两个按钮互斥，但转圈只转被点的那个。
+  const [batchRunning, setBatchRunning] = useState<'all' | 'failed' | null>(null)
+
+  const runTest = useCallback(
+    async (url: string): Promise<ProxyTestResult> => {
+      setTesting((prev) => new Set(prev).add(url))
+      let result: ProxyTestResult
+      try {
+        result = await testProxy(url)
+      } catch (e) {
+        result = failedProxyTest(extractError(e, language))
+      }
+      setResults((prev) => ({ ...prev, [url]: result }))
+      setTesting((prev) => {
+        const next = new Set(prev)
+        next.delete(url)
+        return next
+      })
+      return result
+    },
+    [language],
+  )
+  const dismissResult = (url: string) =>
+    setResults((prev) => {
+      const next = { ...prev }
+      delete next[url]
+      return next
+    })
+
   const invalidate = () => qc.invalidateQueries({ queryKey: ['proxies'] })
   const onError = (title: string, error: unknown) =>
     toastManager.add({ title, description: extractError(error, language), type: 'error' })
 
+  const trimmedAddUrl = addUrl.trim()
+  const addResult = results[trimmedAddUrl]
+
   const create = useMutation({
-    mutationFn: () => addProxy(addLabel.trim(), addUrl.trim()),
+    mutationFn: () => {
+      const label =
+        addLabel.trim() ||
+        locationLabel(addResult, (proxiesQuery.data ?? []).map((p) => p.label))
+      return addProxy(label, trimmedAddUrl)
+    },
     onSuccess: (p) => {
       toastManager.add({
         title: t('已添加代理', 'Proxy added'),
         description: p.label,
         type: 'success',
       })
+      // 后端可能把地址归一化（如 socks5:// 升成 socks5h://），测试结果改挂到入库后的地址上。
+      if (addResult) {
+        setResults((prev) => {
+          const next = { ...prev, [p.url]: addResult }
+          if (p.url !== trimmedAddUrl) delete next[trimmedAddUrl]
+          return next
+        })
+      }
       setAddLabel('')
       setAddUrl('')
       invalidate()
     },
     onError: (e) => onError(t('添加代理失败', 'Failed to add proxy'), e),
   })
+
+  const testAll = async (urls: string[], kind: 'all' | 'failed') => {
+    setBatchRunning(kind)
+    const queue = [...urls]
+    let ok = 0
+    let failed = 0
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_TEST_CONCURRENCY, queue.length) }, async () => {
+        for (let url = queue.shift(); url !== undefined; url = queue.shift()) {
+          if ((await runTest(url)).ok) ok++
+          else failed++
+        }
+      }),
+    )
+    setBatchRunning(null)
+    toastManager.add({
+      title: t('测试完成', 'Test finished'),
+      description: t(`${ok} 条可用，${failed} 条不可用`, `${ok} working, ${failed} failed`),
+      type: failed === 0 ? 'success' : 'warning',
+    })
+  }
 
   if (proxiesQuery.isPending) {
     return (
@@ -98,6 +192,9 @@ export function ProxyPoolSettingsContent() {
   }
 
   const proxies = proxiesQuery.data ?? []
+  const testedCount = proxies.filter((p) => results[p.url]).length
+  const okCount = proxies.filter((p) => results[p.url]?.ok).length
+  const failedUrls = proxies.filter((p) => results[p.url]?.ok === false).map((p) => p.url)
 
   return (
     <div className="space-y-4">
@@ -115,7 +212,7 @@ export function ProxyPoolSettingsContent() {
           className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5"
           onSubmit={(event) => {
             event.preventDefault()
-            if (addLabel.trim() && addUrl.trim() && !create.isPending) create.mutate()
+            if (trimmedAddUrl && !create.isPending) create.mutate()
           }}
         >
           <div className="min-w-0 flex-1 space-y-1 max-sm:basis-full">
@@ -126,7 +223,7 @@ export function ProxyPoolSettingsContent() {
               id="proxy-pool-add-label"
               value={addLabel}
               onChange={(event) => setAddLabel(event.target.value)}
-              placeholder={t('如：日本节点', 'e.g. Japan node')}
+              placeholder={t('留空自动命名', 'Auto-named if empty')}
               size="sm"
             />
           </div>
@@ -145,26 +242,86 @@ export function ProxyPoolSettingsContent() {
             />
           </div>
           <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={!trimmedAddUrl}
+            loading={testing.has(trimmedAddUrl)}
+            onClick={() => runTest(trimmedAddUrl)}
+          >
+            <PlayIcon />
+            {t('测试', 'Test')}
+          </Button>
+          <Button
             type="submit"
             size="sm"
-            disabled={!addLabel.trim() || !addUrl.trim()}
+            disabled={!trimmedAddUrl}
             loading={create.isPending}
           >
             <PlusIcon />
             {t('添加', 'Add')}
           </Button>
+          {addResult && (
+            <div className="basis-full">
+              <ProxyTestResultView result={addResult} onDismiss={() => dismissResult(trimmedAddUrl)} />
+            </div>
+          )}
         </Form>
 
-        {proxies.length > 0 && <Separator />}
+        {proxies.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-2.5 sm:px-5">
+            <p className="text-xs text-muted-foreground tabular-nums">
+              {testedCount > 0
+                ? t(
+                    `共 ${proxies.length} 条 · 已测 ${testedCount} 条，${okCount} 条可用`,
+                    `${proxies.length} total · ${testedCount} tested, ${okCount} working`,
+                  )
+                : t(`共 ${proxies.length} 条`, `${proxies.length} total`)}
+            </p>
+            <div className="flex items-center gap-2">
+              {/* 只在有失败结果时出现：修完几条代理后重测不通的那几条，不必把全池再跑一遍。 */}
+              {failedUrls.length > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  loading={batchRunning === 'failed'}
+                  disabled={batchRunning !== null}
+                  onClick={() => testAll(failedUrls, 'failed')}
+                >
+                  <RotateCwIcon />
+                  {t(`重测失败项（${failedUrls.length}）`, `Retest failed (${failedUrls.length})`)}
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                loading={batchRunning === 'all'}
+                disabled={batchRunning !== null}
+                onClick={() => testAll(proxies.map((p) => p.url), 'all')}
+              >
+                <PlayIcon />
+                {t('全部测试', 'Test all')}
+              </Button>
+            </div>
+          </div>
+        )}
 
         {proxies.length === 0 ? (
           <p className="px-4 py-4 text-center sm:px-5 text-sm text-muted-foreground">
-            {t('代理池还没有代理地址。在上方填写名称与地址即可添加第一条。', 'The proxy pool is empty. Enter a name and URL above to add the first proxy.')}
+            {t('代理池还没有代理地址。在上方填写地址即可添加第一条，名称可留空。', 'The proxy pool is empty. Enter a URL above to add the first proxy; the name is optional.')}
           </p>
         ) : (
           <ul className="divide-y" role="list">
             {proxies.map((proxy) => (
-              <ProxyRow key={proxy.id} proxy={proxy} />
+              <ProxyRow
+                key={proxy.id}
+                proxy={proxy}
+                pool={proxies}
+                result={results[proxy.url]}
+                testing={testing.has(proxy.url)}
+                onTest={() => runTest(proxy.url)}
+                onDismissResult={() => dismissResult(proxy.url)}
+              />
             ))}
           </ul>
         )}
@@ -173,13 +330,28 @@ export function ProxyPoolSettingsContent() {
   )
 }
 
-function ProxyRow({ proxy }: { proxy: SavedProxy }) {
+function ProxyRow({
+  proxy,
+  pool,
+  result,
+  testing,
+  onTest,
+  onDismissResult,
+}: {
+  proxy: SavedProxy
+  pool: SavedProxy[]
+  result: ProxyTestResult | undefined
+  testing: boolean
+  onTest: () => void
+  onDismissResult: () => void
+}) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const [editing, setEditing] = useState(false)
   const [label, setLabel] = useState(proxy.label)
   const [url, setUrl] = useState(proxy.url)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [accountsOpen, setAccountsOpen] = useState(false)
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['proxies'] })
   const onError = (title: string, error: unknown) =>
@@ -277,6 +449,25 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
         <Button
           size="icon-sm"
           variant="ghost"
+          loading={testing}
+          onClick={onTest}
+          aria-label={t('测试', 'Test')}
+          title={t('测试', 'Test')}
+        >
+          <PlayIcon />
+        </Button>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          onClick={() => setAccountsOpen(true)}
+          aria-label={t('调整使用账号', 'Manage accounts')}
+          title={t('调整使用账号', 'Manage accounts')}
+        >
+          <UsersIcon />
+        </Button>
+        <Button
+          size="icon-sm"
+          variant="ghost"
           onClick={() => {
             setLabel(proxy.label)
             setUrl(proxy.url)
@@ -306,7 +497,14 @@ function ProxyRow({ proxy }: { proxy: SavedProxy }) {
           ))}
         </p>
       )}
-      <ProxyTestBlock url={proxy.url} />
+      {result && <ProxyTestResultView result={result} onDismiss={onDismissResult} />}
+
+      <ProxyAccountsDialog
+        proxy={proxy}
+        pool={pool}
+        open={accountsOpen}
+        onOpenChange={setAccountsOpen}
+      />
 
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogPopup>
