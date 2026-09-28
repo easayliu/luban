@@ -2,9 +2,9 @@ import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from '
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
-  ActivityIcon, ArrowUpDownIcon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon, EllipsisIcon,
+  ActivityIcon, ArrowUpDownIcon, Building2Icon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon, EllipsisIcon,
   GaugeIcon, GlobeIcon, MessagesSquareIcon, PanelTopOpenIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
-  SmartphoneIcon, TimerOffIcon, Trash2Icon,
+  SmartphoneIcon, TimerOffIcon, Trash2Icon, UserIcon,
 } from 'lucide-react'
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
@@ -22,7 +22,8 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import type { BadgeProps } from '@/components/ui/badge'
-import { Badge } from '@/components/ui/badge'
+import { Badge, badgeVariants } from '@/components/ui/badge'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Dialog, DialogClose, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
@@ -1195,7 +1196,7 @@ function CredentialActionSheet({
             {handlers.showDetail !== false && (
               <>
                 <Badge size="xs" variant={status.variant}>{status.label}</Badge>
-                {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+                <AccountTierBadge cred={cred} size="xs" />
               </>
             )}
           </DialogDescription>
@@ -1824,6 +1825,48 @@ export function isOrgAccount(cred: Pick<Credential, 'org_type'>): boolean {
 export function orgBadgeLabel(cred: Pick<Credential, 'org_type'>): string {
   const bare = (cred.org_type?.trim().toLowerCase() ?? '').replace(/^claude_/, '')
   return bare.charAt(0).toUpperCase() + bare.slice(1)
+}
+
+/**
+ * 套餐徽章，组织 / 个人做成徽章里的前缀图标，不再单占一枚胶囊：楼＝组织号（用量全组织共享），
+ * 人＝个人号。org_type 还没拉到（旧号）时不猜，只显示套餐文字；组织号没有档位时退回用组织类型
+ * 当文字，图标照挂。什么都没有时渲染 `fallback`（列表里的「—」）。
+ */
+export function AccountTierBadge({
+  cred,
+  size,
+  fallback = null,
+}: {
+  cred: Pick<Credential, 'tier' | 'org_type'>
+  size?: 'default' | 'sm' | 'xs'
+  fallback?: ReactNode
+}) {
+  const { t } = useI18n()
+  const org = isOrgAccount(cred)
+  if (!cred.tier && !org) return <>{fallback}</>
+  const personal = !org && !!cred.org_type?.trim()
+  const text = cred.tier ?? orgBadgeLabel(cred)
+  const variant = cred.tier ? tierBadgeVariant(cred.tier) : 'outline'
+  if (!org && !personal) return <Badge size={size} variant={variant}>{text}</Badge>
+  const Icon = org ? Building2Icon : UserIcon
+  // xs 档是固定 12px 字号，图标也跟着固定；sm 档字更小，图标收一号。默认档交给 Badge 自己的 svg 尺寸。
+  const iconClass = size === 'xs' ? 'size-3' : size === 'sm' ? 'size-2.5' : undefined
+  return (
+    <Tooltip>
+      <TooltipTrigger className={cn(badgeVariants({ size, variant }), 'cursor-help')} delay={0}>
+        <Icon className={iconClass} aria-hidden />
+        {text}
+      </TooltipTrigger>
+      <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+        {org
+          ? t(
+              `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
+              `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
+            )
+          : t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)}
+      </TooltipPopup>
+    </Tooltip>
+  )
 }
 
 /**

@@ -1580,6 +1580,37 @@ impl CredentialStore {
         .context("failed to read the newly inserted proxy")
     }
 
+    /// 批量添加代理，单事务内完成；返回与入参一一对应的结果，地址已在池里（唯一索引撞了）的
+    /// 那条是 `None`，不报错也不影响其它条。`url` 应已经过 `crate::clients::validate_proxy` 校验。
+    pub fn add_proxies(&self, items: &[(String, String)]) -> Result<Vec<Option<SavedProxy>>> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut out = Vec::with_capacity(items.len());
+        {
+            let mut insert =
+                tx.prepare("INSERT OR IGNORE INTO proxies (label, url) VALUES (?1, ?2)")?;
+            let mut read =
+                tx.prepare("SELECT id, label, url, created_at FROM proxies WHERE id = ?1")?;
+            for (label, url) in items {
+                if insert.execute(params![label, url])? == 0 {
+                    out.push(None);
+                    continue;
+                }
+                let id = tx.last_insert_rowid();
+                out.push(Some(read.query_row([id], |row| {
+                    Ok(SavedProxy {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        url: row.get(2)?,
+                        created_at: row.get::<_, i64>(3)? as u64,
+                    })
+                })?));
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// 更新代理池中一条记录的名称和/或地址。
     pub fn update_proxy(&self, id: i64, label: &str, url: &str) -> Result<bool> {
         let conn = self.conn.lock();
@@ -7116,6 +7147,22 @@ mod tests {
         let left: Vec<i64> = store.list_proxies().unwrap().into_iter().map(|p| p.id).collect();
         assert_eq!(left, vec![b.id]);
         assert_eq!(store.delete_proxies(&[]).unwrap(), 0);
+    }
+
+    /// 批量添加：已在池里的地址返回 None，其余照常写入。
+    #[test]
+    fn add_proxies_skips_urls_already_in_the_pool() {
+        let store = CredentialStore::open_in_memory().unwrap();
+        store.add_proxy("old", "socks5h://10.0.0.1:1080").unwrap();
+        let out = store
+            .add_proxies(&[
+                ("a".into(), "socks5h://10.0.0.1:1080".into()),
+                ("b".into(), "socks5h://10.0.0.2:1080".into()),
+            ])
+            .unwrap();
+        assert!(out[0].is_none());
+        assert_eq!(out[1].as_ref().unwrap().label, "b");
+        assert_eq!(store.list_proxies().unwrap().len(), 2);
     }
 
     /// 全局默认会话上限的播种：同设备那条——缺失才写、显式值（含 `0`）不动、重复启动不改。

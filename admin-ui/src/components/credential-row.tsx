@@ -29,11 +29,9 @@ import {
   quotaLevel,
   fablePoolHint,
   fablePoolWindow,
-  isOrgAccount,
-  orgBadgeLabel,
   quotaPercentage,
   switchTitle,
-  tierBadgeVariant,
+  AccountTierBadge,
   useCredentialActions,
   type CredentialActions,
   type CredentialEvaluation,
@@ -394,14 +392,7 @@ export const CredentialRow = memo(function CredentialRow({
             <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
               <MobileFact label={t('优先级', 'Priority')}><span className="tabular-nums">P{cred.priority}</span></MobileFact>
               <MobileFact label={t('账号等级', 'Tier')}>
-                <span className="flex flex-wrap items-center gap-1">
-                  {isOrgAccount(cred) && (
-                    <Badge variant="warning" size="sm">{orgBadgeLabel(cred)}</Badge>
-                  )}
-                  {cred.tier
-                    ? <Badge variant={tierBadgeVariant(cred.tier)} size="sm">{cred.tier}</Badge>
-                    : !isOrgAccount(cred) && '—'}
-                </span>
+                <AccountTierBadge cred={cred} size="sm" fallback="—" />
               </MobileFact>
               <MobileFact label={t('设备', 'Devices')}>
                 <Button
@@ -515,22 +506,7 @@ export const CredentialRow = memo(function CredentialRow({
           </span>
         </TableCell>
         <TableCell className={COL.tier}>
-          <span className="flex flex-wrap items-center gap-1">
-            {isOrgAccount(cred) && (
-              <Badge
-                variant="warning"
-                title={t(
-                  `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
-                  `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
-                )}
-              >
-                {orgBadgeLabel(cred)}
-              </Badge>
-            )}
-            {cred.tier
-              ? <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>
-              : !isOrgAccount(cred) && <span className="text-muted-foreground">—</span>}
-          </span>
+          <AccountTierBadge cred={cred} fallback={<span className="text-muted-foreground">—</span>} />
         </TableCell>
         <TableCell className={COL.quota5h}>
           <ListQuotaMeter
@@ -1115,8 +1091,7 @@ function MobileCredentialRow({
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
             <Badge size="xs" variant={status.variant}>{status.label}</Badge>
-            {isOrgAccount(cred) && <Badge size="xs" variant="outline">{orgBadgeLabel(cred)}</Badge>}
-            {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+            <AccountTierBadge cred={cred} size="xs" />
             <Badge size="xs" variant="outline" className="tabular-nums">P{cred.priority}</Badge>
           </div>
 

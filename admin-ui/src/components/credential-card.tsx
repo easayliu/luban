@@ -4,7 +4,6 @@ import {
   CheckIcon,
   ClockIcon,
   BanIcon,
-  Building2Icon,
   GaugeIcon,
   GlobeIcon,
   MessagesSquareIcon,
@@ -27,6 +26,7 @@ import {
   relativeTime,
 } from '@/lib/utils'
 import {
+  AccountTierBadge,
   ConnectivityTestDialog,
   credentialDetailHref,
   CredentialActionsMenu,
@@ -40,12 +40,9 @@ import {
   modelDenialSummary,
   proxyLabelParts,
   quotaLevel,
-  isOrgAccount,
   METER_FILL,
-  orgBadgeLabel,
   quotaPercentage,
   switchTitle,
-  tierBadgeVariant,
   unifiedQuotaStatusLabel,
   useCredentialActions,
   type QuotaLevel,
@@ -504,26 +501,7 @@ export const CredentialCard = memo(function CredentialCard({
             {cred.quota && !verdictShownByMeter(cred.quota.rl_representative, has5h, has7d, fablePool != null) && (
               <UpstreamVerdict quota={cred.quota} credentialLabel={credentialLabel} />
             )}
-            {isOrgAccount(cred) && (
-              <Tooltip>
-                <TooltipTrigger
-                  className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help')}
-                  delay={0}
-                >
-                  {/* 图标不是装饰：org_type 与 tier 常常都叫 `Team`，两枚都成了描边胶囊之后
-                      光看文字分不出哪个是「组织账号」哪个是「套餐档位」。 */}
-                  <Building2Icon className="size-3" />
-                  {orgBadgeLabel(cred)}
-                </TooltipTrigger>
-                <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                  {t(
-                    `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
-                    `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
-                  )}
-                </TooltipPopup>
-              </Tooltip>
-            )}
-            {cred.tier && <Badge size="xs" variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+            <AccountTierBadge cred={cred} size="xs" />
             <Tooltip>
               <TooltipTrigger
                 className={cn(badgeVariants({ size: 'xs', variant: 'outline' }), 'cursor-help tabular-nums')}

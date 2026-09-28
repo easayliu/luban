@@ -58,3 +58,33 @@ export async function deleteProxies(ids: number[]): Promise<number> {
   const { data } = await api.post<{ deleted: number }>('/proxies/delete', { ids })
   return data.deleted
 }
+
+/** 批量导入里一条的结果，与入参按下标一一对应。 */
+export interface BatchProxyItem {
+  /** added：可导入（预览）/ 已导入；exists：池里已有；duplicate：与本批前面某条重复；invalid：地址不合法。 */
+  status: 'added' | 'exists' | 'duplicate' | 'invalid'
+  /** 归一化后的地址，invalid 时为 null。 */
+  url: string | null
+  /** 最终名称（留空时已自动起好），只有 added 才有。 */
+  label: string | null
+  error: string | null
+  /** duplicate 时指向本批第一次出现这个地址的下标。 */
+  duplicate_of: number | null
+  /** 真正导入后的记录 id；预览时为 null。 */
+  id: number | null
+}
+
+/**
+ * 批量添加代理。`dryRun` 时只校验、归一化、查重、起名，不写库——导入前的预览就走它，
+ * 与真正导入用的是同一套判据。
+ */
+export async function addProxies(
+  items: { label: string; url: string }[],
+  dryRun: boolean,
+): Promise<BatchProxyItem[]> {
+  const { data } = await api.post<{ items: BatchProxyItem[] }>('/proxies/batch', {
+    items,
+    dry_run: dryRun,
+  })
+  return data.items
+}

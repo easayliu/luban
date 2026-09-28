@@ -6,6 +6,7 @@ import {
   PencilIcon,
   PlayIcon,
   FilterIcon,
+  ListPlusIcon,
   PlusIcon,
   RotateCwIcon,
   Trash2Icon,
@@ -43,25 +44,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
 import { ProxyAccountsDialog } from '@/components/proxy-accounts-dialog'
-
-/** 批量测试的并发数：每条测试最长 15s，全串行几十条要等好几分钟；并发太高又会同时打满 ip-api 的限流。 */
-const BATCH_TEST_CONCURRENCY = 4
-
-/**
- * 测过且通的地址，名称留空时按出口地区起名（「Japan Tokyo」），比后端兜底的 host:port 好认；
- * 与池里已有名称撞了就加序号。没测过或不通时返回空串，交给后端按 host:port 起名。
- */
-function locationLabel(result: ProxyTestResult | undefined, existing: string[]): string {
-  if (!result?.ok) return ''
-  const parts = [result.country, result.city].filter((v): v is string => !!v)
-  const base = [...new Set(parts)].join(' ')
-  if (!base) return ''
-  if (!existing.includes(base)) return base
-  for (let n = 2; ; n++) {
-    const candidate = `${base} #${n}`
-    if (!existing.includes(candidate)) return candidate
-  }
-}
+import { locationLabel, ProxyBatchImportDialog, runConcurrently } from '@/components/proxy-batch-import-dialog'
 
 export function ProxyPoolSettingsContent() {
   const { t, language } = useI18n()
@@ -79,6 +62,7 @@ export function ProxyPoolSettingsContent() {
   const [batchRunning, setBatchRunning] = useState<'all' | 'failed' | null>(null)
   const [onlyFailed, setOnlyFailed] = useState(false)
   const [confirmDeleteFailed, setConfirmDeleteFailed] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
 
   const runTest = useCallback(
     async (url: string): Promise<ProxyTestResult> => {
@@ -167,17 +151,7 @@ export function ProxyPoolSettingsContent() {
 
   const testAll = async (urls: string[], kind: 'all' | 'failed') => {
     setBatchRunning(kind)
-    const queue = [...urls]
-    let ok = 0
-    let failed = 0
-    await Promise.all(
-      Array.from({ length: Math.min(BATCH_TEST_CONCURRENCY, queue.length) }, async () => {
-        for (let url = queue.shift(); url !== undefined; url = queue.shift()) {
-          if ((await runTest(url)).ok) ok++
-          else failed++
-        }
-      }),
-    )
+    const { ok, failed } = await runConcurrently(urls, runTest)
     setBatchRunning(null)
     toastManager.add({
       title: t('测试完成', 'Test finished'),
@@ -295,6 +269,10 @@ export function ProxyPoolSettingsContent() {
             <PlusIcon />
             {t('添加', 'Add')}
           </Button>
+          <Button type="button" size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+            <ListPlusIcon />
+            {t('批量导入', 'Import')}
+          </Button>
           {addResult && (
             <div className="basis-full">
               <ProxyTestResultView result={addResult} onDismiss={() => dismissResult(trimmedAddUrl)} />
@@ -365,6 +343,15 @@ export function ProxyPoolSettingsContent() {
             </div>
           </div>
         )}
+
+        <ProxyBatchImportDialog
+          open={importOpen}
+          onOpenChange={setImportOpen}
+          poolLabels={proxies.map((p) => p.label)}
+          results={results}
+          testing={testing}
+          runTest={runTest}
+        />
 
         <AlertDialog open={confirmDeleteFailed} onOpenChange={setConfirmDeleteFailed}>
           <AlertDialogPopup>

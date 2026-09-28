@@ -583,6 +583,7 @@ pub async fn run(
         .route("/proxies", get(list_saved_proxies).post(add_saved_proxy))
         .route("/proxies/test", post(test_proxy))
         .route("/proxies/delete", post(delete_saved_proxies))
+        .route("/proxies/batch", post(add_saved_proxies))
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
         .route("/ban-events", get(list_ban_events))
@@ -1957,6 +1958,122 @@ async fn add_saved_proxy(
         credential_count: 0,
         credential_labels: vec![],
     }))
+}
+
+/// 一次批量导入最多几条：几千条贴进来多半是贴错了文件，而且单事务持锁太久。
+const MAX_PROXY_BATCH: usize = 1000;
+
+#[derive(Deserialize)]
+struct AddProxiesReq {
+    items: Vec<AddProxyReq>,
+    /// 只校验、归一化、查重并起好名字，不写库——前端导入前的预览就用它，预览与真正导入走的是
+    /// 同一套判据，不会出现「预览说能导、导进去却报错」。
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BatchProxyStatus {
+    /// 可导入（dry_run）/ 已导入。
+    Added,
+    /// 地址已在代理池里。
+    Exists,
+    /// 与本批前面某一条是同一个地址（归一化之后），见 `duplicate_of`。
+    Duplicate,
+    /// 地址校验不通过，见 `error`。
+    Invalid,
+}
+
+#[derive(Serialize)]
+struct BatchProxyItem {
+    status: BatchProxyStatus,
+    /// 归一化后的地址；校验不通过时为空。
+    url: Option<String>,
+    /// 最终名称（留空时已自动起好）；只有 `added` 才有。
+    label: Option<String>,
+    error: Option<String>,
+    /// `duplicate` 时指向本批中第一次出现这个地址的下标。
+    duplicate_of: Option<usize>,
+    /// 真正导入后的记录 id。
+    id: Option<i64>,
+}
+
+/// 批量添加代理：逐条校验、归一化、与代理池及本批内部查重，名称留空的按 [auto_proxy_label] 起名
+/// （本批内自动起的名字也互相去重）。结果与入参按下标一一对应，有问题的条目只跳过，不让整批失败；
+/// 能导入的在一个事务里写入。
+async fn add_saved_proxies(
+    State(state): State<AppState>,
+    Json(req): Json<AddProxiesReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.items.is_empty() {
+        return Err(bad_request("enter at least one proxy"));
+    }
+    if req.items.len() > MAX_PROXY_BATCH {
+        return Err(bad_request(format!("at most {MAX_PROXY_BATCH} proxies per import")));
+    }
+    let pool = state.store.list_proxies().map_err(internal)?;
+    let pool_urls: std::collections::HashSet<&str> = pool.iter().map(|p| p.url.as_str()).collect();
+    let mut labels: Vec<String> = pool.iter().map(|p| p.label.clone()).collect();
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    let mut results = Vec::with_capacity(req.items.len());
+    let mut to_insert: Vec<(usize, String, String)> = Vec::new();
+    for (i, item) in req.items.iter().enumerate() {
+        let url = match crate::clients::validate_proxy(&item.url) {
+            Ok(url) => url,
+            Err(e) => {
+                results.push(BatchProxyItem {
+                    status: BatchProxyStatus::Invalid,
+                    url: None,
+                    label: None,
+                    error: Some(format!("{e:#}")),
+                    duplicate_of: None,
+                    id: None,
+                });
+                continue;
+            }
+        };
+        let (status, duplicate_of, label) = if pool_urls.contains(url.as_str()) {
+            (BatchProxyStatus::Exists, None, None)
+        } else if let Some(&first) = seen.get(&url) {
+            (BatchProxyStatus::Duplicate, Some(first), None)
+        } else {
+            seen.insert(url.clone(), i);
+            let label = match item.label.trim() {
+                "" => auto_proxy_label(&url, &labels),
+                given => given.to_string(),
+            };
+            labels.push(label.clone());
+            to_insert.push((i, label.clone(), url.clone()));
+            (BatchProxyStatus::Added, None, Some(label))
+        };
+        results.push(BatchProxyItem {
+            status,
+            url: Some(url),
+            label,
+            error: None,
+            duplicate_of,
+            id: None,
+        });
+    }
+    if !req.dry_run && !to_insert.is_empty() {
+        let pairs: Vec<(String, String)> =
+            to_insert.iter().map(|(_, l, u)| (l.clone(), u.clone())).collect();
+        let inserted = state.store.add_proxies(&pairs).map_err(internal)?;
+        for ((i, _, _), row) in to_insert.iter().zip(inserted) {
+            match row {
+                Some(p) => results[*i].id = Some(p.id),
+                // 查重之后、写库之前别处加进了同一个地址。
+                None => {
+                    results[*i].status = BatchProxyStatus::Exists;
+                    results[*i].label = None;
+                }
+            }
+        }
+        let added = results.iter().filter(|r| r.id.is_some()).count();
+        tracing::info!(requested = req.items.len(), added, "proxies added to pool in bulk");
+    }
+    Ok(Json(serde_json::json!({ "items": results })))
 }
 
 #[derive(Deserialize)]

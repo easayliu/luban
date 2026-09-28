@@ -3,7 +3,6 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   ActivityIcon,
   BanIcon,
-  Building2Icon,
   ChevronDownIcon,
   ChevronRightIcon,
   ChevronUpIcon,
@@ -65,13 +64,12 @@ import {
   fablePoolWindow,
   isOrgAccount,
   METER_FILL,
-  orgBadgeLabel,
   proxyLabelParts,
   proxyMaskedUrl,
   quotaLevel,
   quotaPercentage,
   switchTitle,
-  tierBadgeVariant,
+  AccountTierBadge,
   unifiedQuotaStatusLabel,
   useCredentialActions,
   type CredentialStatusMeta,
@@ -504,13 +502,7 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
                 说两遍；正常、已停用这类没有提示条的状态才在这里露面。上游判定同理不放页头，
                 用量限制那一块有「上游判定 / 起约束的窗口」，被拒的那条进度条也标着。 */}
             {!status.attention && <Badge variant={status.variant} aria-live="polite">{status.label}</Badge>}
-            {isOrgAccount(cred) && (
-              <Badge variant="outline">
-                <Building2Icon className="size-3" />
-                {orgBadgeLabel(cred)}
-              </Badge>
-            )}
-            {cred.tier && <Badge variant={tierBadgeVariant(cred.tier)}>{cred.tier}</Badge>}
+            <AccountTierBadge cred={cred} />
           </div>
         </div>
         {/* 手机上操作整行铺开：连通性测试拉宽成主按钮，⋯ 与启停开关贴右。 */}
@@ -1282,7 +1274,7 @@ function InfoSection({ cred, now }: { cred: Credential; now: number }) {
     <Section icon={InfoIcon} title={t('账号信息', 'Account')} className="min-w-0 lg:h-full" panelClassName="lg:flex-1">
       <dl className="divide-y">
         {/* 只在组织账号上列：个人号这一格要么是「—」，要么是 claude_max 这类与页头套餐徽章同义的原值；
-            组织号的原值（claude_team / claude_enterprise）比页头那枚「Team」多一层信息。 */}
+            页头套餐徽章只用一个楼形图标标出「组织号」，原值（claude_team / claude_enterprise）在这里看。 */}
         {isOrgAccount(cred) && (
           <InfoRow label={t('组织类型', 'Organisation type')}>
             <span className="font-mono text-xs">{cred.org_type}</span>
