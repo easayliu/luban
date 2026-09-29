@@ -30,6 +30,7 @@ import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
+import { SetupPage } from '@/components/setup-page'
 import { AppFooter } from '@/components/app-footer'
 import { AppHeader, Breadcrumb, PreferencesMenu, scrollToTop } from '@/components/app-header'
 import { Button } from '@/components/ui/button'
@@ -306,6 +307,9 @@ function App() {
   }, [pw])
 
   const needLogin = authState?.configured && !pw
+  // 未设密码、又不是本机打开的控制台（Docker 端口映射、局域网）：先用启动日志里的初始化口令设密码。
+  const needSetup = !!authState?.setup_required
+  const needAuth = needLogin || needSetup
 
   const {
     data: creds,
@@ -319,14 +323,14 @@ function App() {
     queryKey: ['credentials'],
     queryFn: listCredentials,
     refetchInterval: 30_000,
-    enabled: !needLogin && !authLoading, // 未登录时不请求受保护接口
+    enabled: !needAuth && !authLoading, // 未登录时不请求受保护接口
   })
 
   useEffect(() => {
-    if (!needLogin && !settingsRoute && accountRoute == null) {
+    if (!needAuth && !settingsRoute && accountRoute == null) {
       document.title = t('luban · 授权代理', 'luban · Authorization Proxy')
     }
-  }, [needLogin, settingsRoute, accountRoute, t])
+  }, [needAuth, settingsRoute, accountRoute, t])
 
   // 鉴权状态拿不到（后端重启、网络抖动）时不再干等骨架屏：放行到列表，让账号请求的报错与重试按钮接手。
   const isBootstrapping = authLoading || (!authState && !authFailed)
@@ -334,7 +338,19 @@ function App() {
     if (!authState) void refetchAuthState()
     void refetchCredentials()
   }
-  useSettingsPrefetch(!isBootstrapping && !needLogin && !settingsRoute)
+  useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute)
+
+  if (!isBootstrapping && needSetup) {
+    return (
+      <SetupPage
+        onSuccess={(p) => {
+          setPw(p)
+          setPwState(p)
+          void refetchAuthState()
+        }}
+      />
+    )
+  }
 
   if (!isBootstrapping && needLogin) {
     return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />

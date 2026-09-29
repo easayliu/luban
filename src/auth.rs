@@ -1,8 +1,13 @@
-//! 管理界面登录鉴权（可选）。
+//! 管理界面登录鉴权。
 //!
 //! 密码以 sha256 存于 SQLite（`admin_password_sha256`），或由 `LUBAN_ADMIN_PASSWORD`
-//! 环境接管。未设置时中间件放行（本机 dev 友好）；设置后 `/api/*` 管理接口需带
-//! `Authorization: Bearer <password>`。转发代理 `/v1/*` 不走这里。
+//! 环境接管。设置后 `/api/*` 管理接口需带 `Authorization: Bearer <password>`。
+//! 转发代理 `/v1/*` 不走这里。
+//!
+//! **未设密码时只对本机免密**（判定见 [`is_local_request`]）。默认监听 `0.0.0.0`、Docker 也把
+//! 端口发布到所有网卡，此前未设密码等于管理面对网络匿名敞开：谁先连上谁就能设密码、导出全部
+//! 明文 token。远程来访要先设密码，而设密码得带启动日志里打印的一次性初始化口令
+//! （[`AppState::setup_token`]），证明来人能看到这台服务的日志。
 
 use axum::{
     Json,
@@ -67,10 +72,70 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// 中间件：未设密码放行；已设则校验 `Authorization: Bearer <password>`。
+/// 这条请求是不是**本机浏览器直接打开的控制台**：TCP 对端是回环地址，且 `Host` 是
+/// `localhost` 或回环 IP。未设密码时只有这类请求免密。
+///
+/// 两个条件缺一不可：
+/// - 对端地址挡的是网络上的其它机器。只认 TCP 对端，不看 `x-forwarded-for`——那是来访自己
+///   填的。Docker 端口映射进来的请求对端是网桥网关（如 `172.17.0.1`），不算本机，这是有意的：
+///   宿主机外面的人同样经这条路进来，分不出来。
+/// - `Host` 挡的是 **DNS rebinding**：管理员浏览器里的恶意网页把自己的域名重新解析到
+///   127.0.0.1，请求的对端就是回环，页面与控制台还同源，能读写全部接口。这种请求的 `Host`
+///   必然是攻击者的域名，回环 IP 字面量与 `localhost` 它伪造不出来。同机反代（nginx 转到
+///   127.0.0.1）带的是对外域名，同样不算本机——反代后面的人本来就可能来自网络。
+pub(crate) fn is_local_request(
+    peer: Option<std::net::SocketAddr>,
+    headers: &header::HeaderMap,
+) -> bool {
+    let Some(peer) = peer else { return false };
+    if !peer.ip().to_canonical().is_loopback() {
+        return false;
+    }
+    headers.get(header::HOST).and_then(|v| v.to_str().ok()).is_some_and(host_is_loopback)
+}
+
+/// `Host` 头（可带端口）是不是 `localhost`、`*.localhost` 或回环 IP 字面量。
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 字面量：`[::1]` 或 `[::1]:4600`。
+        match rest.split_once(']') {
+            Some((ip, _)) => ip,
+            None => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        return ip.to_canonical().is_loopback();
+    }
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost")
+}
+
+/// 从中间件拿到的请求里取 TCP 对端（`into_make_service_with_connect_info` 放进扩展的）。
+fn peer_of(req: &Request) -> Option<std::net::SocketAddr> {
+    req.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0)
+}
+
+/// 未设密码的远程来访被拒时回的文案，前端据此切到「初始化管理密码」页。
+const SETUP_REQUIRED: &str =
+    "set an admin password first: remote access requires the setup token from the server log";
+
+/// 中间件：已设密码时校验 `Authorization: Bearer <password>`；未设时只放行本机来访
+/// （[`is_local_request`]），其余一律 401。
+///
+/// 回 401 而不是 403：前端的拦截器见 401 就重新拉一次鉴权状态，未设密码的远程来访由此
+/// 落到初始化页，不必再为这一种情况单写一条分支。
 pub async fn require_admin(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(hash) = admin_hash(&state) else {
-        return next.run(req).await;
+        if is_local_request(peer_of(&req), req.headers()) {
+            return next.run(req).await;
+        }
+        return (StatusCode::UNAUTHORIZED, SETUP_REQUIRED).into_response();
     };
     let ok = req
         .headers()
@@ -97,13 +162,21 @@ pub struct StateResp {
     configured: bool,
     /// 是否由环境变量接管（true = 网页不可改）。
     env_managed: bool,
+    /// 未设密码、且这条请求不是本机来访：要先用初始化口令设密码才能进控制台。
+    setup_required: bool,
 }
 
 /// 鉴权状态（公开）。
-pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
+pub async fn state(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
+) -> Json<StateResp> {
+    let configured = admin_hash(&state).is_some();
     Json(StateResp {
-        configured: admin_hash(&state).is_some(),
+        configured,
         env_managed: state.admin_env.is_some(),
+        setup_required: !configured && !is_local_request(Some(peer), &headers),
     })
 }
 
@@ -111,6 +184,40 @@ pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
 pub struct PwReq {
     password: String,
 }
+
+#[derive(Deserialize)]
+pub struct SetupReq {
+    password: String,
+    /// 启动日志里的初始化口令；本机来访可不带。
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// 等长逐字节异或比较：不因第一个不同字节提前返回，免得按响应时间一位一位试出口令。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// 生成初始化口令：16 字节随机数的十六进制（32 位）。
+pub(crate) fn new_setup_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 未设密码时把初始化口令打进日志：远程来访设密码只能靠它。启动时与清除密码后各打一次。
+pub(crate) fn log_setup_token(token: &str) {
+    tracing::warn!(
+        setup_token = %token,
+        "no admin password is set: the console only accepts requests from this machine; \
+         to set a password from another machine (including through Docker port mapping), \
+         open the console and enter this setup token"
+    );
+}
+
+/// 串行化首次设置密码的「查有没有设过 → 写入」：两条并发的 setup 不能都判成「还没设」、
+/// 后写的那条悄悄把先设的密码盖掉。
+static SETUP_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn ok_json() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
@@ -165,24 +272,34 @@ pub async fn login(
     }
 }
 
-/// 首次设置密码（仅未配置时，公开）。
+/// 首次设置密码（仅未配置时，公开）。本机来访直接设；其余须带启动日志里的初始化口令，
+/// 否则谁先连上端口谁就能把密码定下来、接管整个管理面。
 pub async fn setup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: header::HeaderMap,
-    Json(req): Json<PwReq>,
+    Json(req): Json<SetupReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if admin_hash(&state).is_some() {
-        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
+    let ip = client_ip(&headers, peer);
+    let local = is_local_request(Some(peer), &headers);
+    if !local {
+        let given = req.token.as_deref().map(str::trim).unwrap_or("");
+        if !constant_time_eq(given.as_bytes(), state.setup_token.as_bytes()) {
+            tracing::warn!(%ip, "admin password setup rejected: invalid setup token");
+            return Err((StatusCode::FORBIDDEN, "invalid setup token".into()));
+        }
     }
     let pw = req.password.trim();
     if pw.len() < 4 {
         return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
     }
+    let _guard = SETUP_LOCK.lock();
+    if admin_hash(&state).is_some() {
+        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
+    }
     state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
-    // 这个接口在未设密码时是**公开**的，谁先访问到谁就把密码定下来——比任何一项设置变更
-    // 都更该留痕，而其它设置变更全都记了（见 web 里那几条「…变更」）。
-    tracing::info!(ip = %client_ip(&headers, peer), "admin password set for the first time");
+    // 谁在什么时候把密码定下来的，比任何一项设置变更都更该留痕。
+    tracing::info!(%ip, local, "admin password set for the first time");
     Ok(ok_json())
 }
 
@@ -211,12 +328,170 @@ pub async fn change_password(
         cleared,
         "admin password changed"
     );
+    if cleared {
+        // 清掉之后远程来访又得靠初始化口令，把它重新打出来，免得还要翻启动时那一行。
+        log_setup_token(&state.setup_token);
+    }
     Ok(ok_json())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::{constant_time_eq, host_is_loopback, is_local_request, percent_decode};
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    fn with_host(host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        h
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        for host in [
+            "localhost",
+            "localhost:4600",
+            "LOCALHOST.",
+            "app.localhost:1",
+            "127.0.0.1",
+            "127.0.0.1:4600",
+            "127.8.9.10",
+            "[::1]",
+            "[::1]:4600",
+            "[::ffff:127.0.0.1]:4600",
+        ] {
+            assert!(host_is_loopback(host), "{host} 应算本机");
+        }
+        for host in [
+            "evil.example",
+            "evil.example:4600",
+            "localhost.evil.example",
+            "192.168.1.5:4600",
+            "0.0.0.0",
+            "[::]",
+            "[::1",
+            "",
+            "luban.example.com",
+        ] {
+            assert!(!host_is_loopback(host), "{host} 不应算本机");
+        }
+    }
+
+    #[test]
+    fn local_request_needs_loopback_peer_and_host() {
+        let lo: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let mapped: std::net::SocketAddr = "[::ffff:127.0.0.1]:50000".parse().unwrap();
+        let docker: std::net::SocketAddr = "172.17.0.1:50000".parse().unwrap();
+        assert!(is_local_request(Some(lo), &with_host("127.0.0.1:4600")));
+        assert!(is_local_request(Some(mapped), &with_host("localhost:4600")));
+        // DNS rebinding：对端是回环，Host 是攻击者的域名。
+        assert!(!is_local_request(Some(lo), &with_host("evil.example:4600")));
+        // Docker 端口映射 / 局域网：对端不是回环，Host 写什么都不算。
+        assert!(!is_local_request(Some(docker), &with_host("localhost:4600")));
+        assert!(!is_local_request(Some(lo), &HeaderMap::new()), "没有 Host 不算本机");
+        assert!(!is_local_request(None, &with_host("localhost")), "拿不到对端不算本机");
+    }
+
+    fn test_state() -> crate::web::AppState {
+        let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
+        crate::web::AppState::for_test(store)
+    }
+
+    /// 走真实中间件：`ConnectInfo` 手动塞进扩展，对应 `into_make_service_with_connect_info`。
+    async fn protected_status(
+        state: &crate::web::AppState,
+        peer: &str,
+        host: &str,
+        bearer: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use axum::{Router, body::Body, extract::ConnectInfo, http::Request, routing::get};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_admin))
+            .with_state(state.clone());
+        let mut req = Request::builder().uri("/x").header(header::HOST, host);
+        if let Some(pw) = bearer {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {pw}"));
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn unset_password_only_admits_local_requests() {
+        use axum::http::StatusCode;
+        let state = test_state();
+        let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", None).await;
+        assert_eq!(local, StatusCode::OK, "本机直连免密");
+        let docker = protected_status(&state, "172.17.0.1:5000", "localhost:4600", None).await;
+        assert_eq!(docker, StatusCode::UNAUTHORIZED, "Docker 端口映射 / 局域网要先设密码");
+        let rebinding = protected_status(&state, "127.0.0.1:5000", "evil.example:4600", None).await;
+        assert_eq!(rebinding, StatusCode::UNAUTHORIZED, "DNS rebinding 不算本机");
+
+        // 设了密码之后本机也要带密码，带对了远程也能进。
+        state
+            .store
+            .set_setting(crate::store::ADMIN_PASSWORD, &super::sha256_hex("pw1234"))
+            .unwrap();
+        let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", None).await;
+        assert_eq!(local, StatusCode::UNAUTHORIZED);
+        let remote =
+            protected_status(&state, "172.17.0.1:5000", "luban.example", Some("pw1234")).await;
+        assert_eq!(remote, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn remote_setup_requires_the_token() {
+        use axum::{
+            Json,
+            extract::{ConnectInfo, State},
+        };
+        let state = test_state();
+        let remote: std::net::SocketAddr = "172.17.0.1:5000".parse().unwrap();
+        let setup = |token: Option<&str>| {
+            super::setup(
+                State(state.clone()),
+                ConnectInfo(remote),
+                with_host("luban.example:4600"),
+                Json(super::SetupReq { password: "pw1234".into(), token: token.map(Into::into) }),
+            )
+        };
+        assert_eq!(setup(None).await.unwrap_err().0, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(setup(Some("wrong")).await.unwrap_err().0, axum::http::StatusCode::FORBIDDEN);
+        assert!(!super::admin_configured(&state), "口令不对不能落库");
+        setup(Some(state.setup_token.as_str())).await.expect("带对口令应能设密码");
+        assert!(super::admin_configured(&state));
+        let again = setup(Some(state.setup_token.as_str())).await.unwrap_err();
+        assert_eq!(again.0, axum::http::StatusCode::BAD_REQUEST, "设过之后不能再用 setup 覆盖");
+    }
+
+    #[tokio::test]
+    async fn local_setup_needs_no_token() {
+        use axum::{
+            Json,
+            extract::{ConnectInfo, State},
+        };
+        let state = test_state();
+        super::setup(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+            with_host("localhost:4600"),
+            Json(super::SetupReq { password: "pw1234".into(), token: None }),
+        )
+        .await
+        .expect("本机来访设密码不需要口令");
+        assert!(super::admin_configured(&state));
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
 
     #[test]
     fn percent_decode_matches_encode_uri_component() {

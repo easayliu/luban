@@ -53,6 +53,9 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
+    /// 首次设置管理密码的一次性口令：每次启动随机生成，未设密码时打进日志。未设密码的
+    /// 远程来访（含 Docker 端口映射）要带上它才能设密码，见 [`auth::setup`]。
+    pub setup_token: Arc<String>,
     /// 上游拒过的请求形态记忆表，用来在本地拦掉上游已经拒过一次的「模型 + 取值」组合
     /// （`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。写穿落库、启动回填、
     /// 7 天保鲜，见 [`crate::proxy::ShapeMemory`]。
@@ -105,6 +108,7 @@ impl AppState {
             store,
             client_key: None,
             admin_env: None,
+            setup_token: Arc::new("test-setup-token".into()),
             shape_rejections: Arc::default(),
             deprecated_fields: Arc::default(),
             empty_replies: Arc::default(),
@@ -137,6 +141,7 @@ pub async fn run(
         store,
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
+        setup_token: Arc::new(auth::new_setup_token()),
         shape_rejections: Arc::default(),
         deprecated_fields: Arc::default(),
         empty_replies: Arc::default(),
@@ -625,6 +630,9 @@ pub async fn run(
     // 各自记，方法与路径它们看不到，只能在这一层补——两行合起来才定位得到一次失败。
     let api = public.merge(protected).layer(middleware::from_fn(log_api_failures));
 
+    // 未设管理密码时，启动日志里要给出初始化口令（`state` 下面会被 move 进路由）。
+    let setup_token = (!auth::admin_configured(&state)).then(|| state.setup_token.clone());
+
     // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
     let app = Router::new()
         .nest("/api", api)
@@ -661,6 +669,9 @@ pub async fn run(
         None => tracing::info!(
             "Claude Code setup: ANTHROPIC_BASE_URL={base} (no --api-key set, the proxy does not authenticate callers -- keep it local-only)"
         ),
+    }
+    if let Some(token) = &setup_token {
+        auth::log_setup_token(token);
     }
     if open_browser {
         open_in_browser(&url);
@@ -3947,9 +3958,9 @@ const EXPORT_VERSION: u32 = 1;
 
 /// 导出全部账号与设置，供迁移到另一台机器。
 ///
-/// **未设管理密码时拒绝**：这个口子返回的是明文 access/refresh token，等于把全部账号交出去，
-/// 而管理接口在没有密码时是完全敞开的（见 [`auth::require_admin`]）——那种状态下任何能连到
-/// 端口的人都能把号搬走。其余管理接口顶多是改配置，这条不一样，所以它自己确认门锁着。
+/// **未设管理密码时拒绝**：这个口子返回的是明文 access/refresh token，等于把全部账号交出去。
+/// 未设密码时管理接口虽然只对本机开放（见 [`auth::require_admin`]），本机上别的进程照样
+/// 能调；其余管理接口顶多是改配置，这条不一样，所以它自己再确认一次门锁着。
 async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
     if !auth::admin_configured(&state) {
         return Err((

@@ -800,7 +800,7 @@ queryClient.setQueryData(['learned-rejections'], [
   { kind: 'empty_reply', model: 'claude-fable-5-1', field: 'max_tokens', value: '1', message: '{"type":"message","content":[],"stop_reason":"max_tokens","usage":{"input_tokens":12,"output_tokens":0}}', learned_at: now - 2 * 3600, expires_at: now + 7 * 86400 - 7200 },
   { kind: 'refusal', model: 'claude-fable-5-1', field: 'prompt_sha', value: '9f2c7d1a4b8e6f03a5d2c9e17b4f8a60d3e5c2b1a9f7e4d6c8b0a2f4e6d8c0b1', message: '[cyber] stop_details={"category":"cyber","explanation":"The request asks for step-by-step instructions that could facilitate unauthorized access to computer systems"}', learned_at: now - 40 * 60, expires_at: now + 7 * 86400 - 2400 },
 ])
-queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false })
+queryClient.setQueryData(['auth-state'], { configured: true, env_managed: false, setup_required: false })
 const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   id: 1200 - index,
   ts: now - index * 73,
