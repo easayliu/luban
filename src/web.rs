@@ -863,7 +863,7 @@ async fn exchange(
     );
     // 设了代理时从库里重新读——insert 返回的那份还没带 proxy，view_of 会拿到最新状态。
     if proxy.is_some() {
-        return view_of(&state, cred.id);
+        return view_of(&state, cred.id).await;
     }
     Ok(Json(CredentialView::new(&cred, 0, 0, DefaultLimits::of(&state.store))))
 }
@@ -919,7 +919,7 @@ async fn list_usage(
     State(state): State<AppState>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsagePage>, ApiError> {
-    usage_page(&state, None, &q, 100, 1000)
+    blocking(move || usage_page(&state, None, &q, 100, 1000)).await
 }
 
 /// 列出某凭证的请求流水（按时间倒序，页码翻页）。
@@ -937,7 +937,7 @@ async fn list_credential_usage(
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    usage_page(&state, Some(id), &q, 25, 200)
+    blocking(move || usage_page(&state, Some(id), &q, 25, 200)).await
 }
 
 #[derive(Serialize)]
@@ -960,7 +960,10 @@ async fn get_credential_stats(
         return Err(not_found());
     }
     let (since, bucket_secs, tz) = q.normalized();
-    let stats = state.store.credential_stats(id, since, bucket_secs, tz, 20).map_err(internal)?;
+    let stats = blocking(move || {
+        state.store.credential_stats(id, since, bucket_secs, tz, 20).map_err(internal)
+    })
+    .await?;
     Ok(Json(CredentialStatsResp { since, bucket_secs, stats }))
 }
 
@@ -1018,7 +1021,9 @@ async fn list_ban_events(
     Query(q): Query<BanEventsQuery>,
 ) -> Result<Json<Vec<store::BanEvent>>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    Ok(Json(state.store.list_ban_events(q.cred_id, limit).map_err(internal)?))
+    let events =
+        blocking(move || state.store.list_ban_events(q.cred_id, limit).map_err(internal)).await?;
+    Ok(Json(events))
 }
 
 #[derive(Deserialize)]
@@ -1050,7 +1055,9 @@ async fn list_ban_event_logs(
 ) -> Result<Json<FrozenLogPage>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let offset = q.offset.unwrap_or(0).max(0);
-    let (total, logs) = state.store.frozen_usage_logs(id, limit, offset).map_err(internal)?;
+    let (total, logs) =
+        blocking(move || state.store.frozen_usage_logs(id, limit, offset).map_err(internal))
+            .await?;
     Ok(Json(FrozenLogPage { total, logs }))
 }
 
@@ -1060,6 +1067,11 @@ async fn list_ban_event_logs(
 async fn list_credentials(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    blocking(move || credential_views(&state)).await
+}
+
+/// [`list_credentials`] 的同步部分：十几条聚合查询，须在阻塞线程池里跑，见 [`blocking`]。
+fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiError> {
     let list = state.store.list().map_err(internal)?;
     let counts = state.store.device_counts().map_err(internal)?;
     let session_counts = state.store.session_counts().map_err(internal)?;
@@ -1108,7 +1120,8 @@ async fn list_credential_devices(
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    Ok(Json(state.store.list_devices(id).map_err(internal)?))
+    let devices = blocking(move || state.store.list_devices(id).map_err(internal)).await?;
+    Ok(Json(devices))
 }
 
 /// 手动解除某设备与该凭证的绑定，立即腾出一个设备名额。
@@ -1147,7 +1160,8 @@ async fn list_credential_sessions(
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    Ok(Json(state.store.list_sessions(id).map_err(internal)?))
+    let sessions = blocking(move || state.store.list_sessions(id).map_err(internal)).await?;
+    Ok(Json(sessions))
 }
 
 /// 一键清掉该凭证的全部模拟会话绑定，返回清掉的条数。同样不是拉黑：名额腾出来，下一条
@@ -1210,7 +1224,7 @@ async fn set_disabled(
     if !state.store.set_disabled(id, req.disabled).map_err(internal)? {
         return Err(not_found());
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1227,7 +1241,7 @@ async fn set_priority(
     if !state.store.set_priority(id, req.priority).map_err(internal)? {
         return Err(not_found());
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1398,7 +1412,7 @@ async fn set_label(
     if !state.store.set_label(id, label).map_err(internal)? {
         return Err(not_found());
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1418,7 +1432,7 @@ async fn set_device_limit(
     if !state.store.set_device_limit(id, limit).map_err(internal)? {
         return Err(not_found());
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1437,7 +1451,7 @@ async fn set_session_limit(
     if !state.store.set_session_limit(id, limit).map_err(internal)? {
         return Err(not_found());
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1460,7 +1474,7 @@ async fn set_rpm_limit(
         return Err(not_found());
     }
     tracing::info!(cred_id = id, rpm_limit = limit, "rpm limit set");
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1495,7 +1509,7 @@ async fn set_credential_quota_pause_pct(
         quota_pause_pct_7d = ?long,
         "per-account quota-threshold pause changed"
     );
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1538,7 +1552,7 @@ async fn set_proxy(
         proxy = %proxy.as_deref().unwrap_or("<direct>"),
         "credential proxy updated"
     );
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 /// 手动刷新一条凭证的 token。
@@ -1582,7 +1596,7 @@ async fn refresh_credential(
             tracing::warn!(cred_id = id, error = %e, "fetching the profile after refresh failed, profile fields left unchanged");
         }
     }
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 #[derive(Deserialize)]
@@ -1666,7 +1680,7 @@ async fn reauthorize_credential(
         state.store.set_disabled(id, false).map_err(internal)?;
     }
     tracing::info!(cred_id = id, cred = %cred.label, re_enabled = token_pause, "credential reauthorized");
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 /// 停用原因是不是「token 出了问题」——重新授权换好 token 就该回来的那几种：
@@ -1752,7 +1766,7 @@ async fn clear_cooldown(
     state.store.clear_rate_limited(id, None);
     state.store.clear_model_denials(id, None).map_err(internal)?;
     state.store.resume_if_rate_limited(id).map_err(internal)?;
-    view_of(&state, id)
+    view_of(&state, id).await
 }
 
 /// `GET /api/learned-rejections` 的一条：从上游响应学到的规则，见 [`store::LearnedRejection`]。
@@ -2374,8 +2388,14 @@ async fn set_proxies(
     list_credentials(State(state)).await
 }
 
-/// 读取单条并转为脱敏视图（含已绑定设备数）。
-fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
+/// 读取单条并转为脱敏视图（含已绑定设备数）。额度与 RPM 读的是只读连接，故经 [`blocking`]。
+async fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
+    let state = state.clone();
+    blocking(move || credential_view(&state, id)).await
+}
+
+/// [`view_of`] 的同步部分。
+fn credential_view(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
     let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
     let count = state.store.device_count(id).map_err(internal)?;
     let session_count = state.store.session_count(id).map_err(internal)?;
@@ -2414,8 +2434,10 @@ struct MetricsResp {
 /// 读取实时指标。**刻意与账号列表分开**：这两个数几秒就变一次，值得单独用一个便宜的接口
 /// 高频轮询，而账号列表那个响应要跑十几条聚合查询，按同样频率拉只是白烧数据库。
 async fn get_metrics(State(state): State<AppState>) -> Result<Json<MetricsResp>, ApiError> {
+    let store = state.store.clone();
+    let rpm = blocking(move || store.total_rpm().map_err(internal)).await?;
     Ok(Json(MetricsResp {
-        rpm: state.store.total_rpm().map_err(internal)?,
+        rpm,
         in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed).max(0),
         window_secs: store::RPM_WINDOW_SECS,
     }))
@@ -2471,18 +2493,20 @@ const METRICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20
 /// 按键取缓存，没有或过期就算一次并存起来。算的那一步在锁外，几个标签页同时撞上会各算各的，
 /// 但接下来 20 秒都省了。回给 axum 的是 `Value` 的一份克隆：几 KB 的 JSON，比 30 天扫描
 /// 便宜几个数量级；`Arc<Value>` 本身不能直接序列化（serde 的 rc 特性没开）。
-fn cached_metrics<T: Serialize>(
-    key: String,
-    compute: impl FnOnce() -> Result<T, ApiError>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+/// 算的那一步是几十万行的扫描，经 [`blocking`] 放到阻塞线程池里跑。
+async fn cached_metrics<T, F>(key: String, compute: F) -> Result<Json<serde_json::Value>, ApiError>
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
     let now = std::time::Instant::now();
     if let Some((at, v)) = METRICS_CACHE.lock().unwrap().get(&key)
         && now.duration_since(*at) < METRICS_CACHE_TTL
     {
         return Ok(Json((**v).clone()));
     }
-    let value =
-        Arc::new(serde_json::to_value(compute()?).map_err(|e| internal(anyhow::anyhow!(e)))?);
+    let computed = blocking(compute).await?;
+    let value = Arc::new(serde_json::to_value(computed).map_err(|e| internal(anyhow::anyhow!(e)))?);
     let mut cache = METRICS_CACHE.lock().unwrap();
     if cache.len() >= 64 {
         cache.clear();
@@ -2509,11 +2533,12 @@ async fn get_cache_series(
     let (since, bucket_secs, tz) = q.normalized();
     // 键里放小时数而不是 since：since 每秒都在变，放进去缓存永远命不中。
     let key = format!("cache:{}:{bucket_secs}:{tz}", q.hours);
-    cached_metrics(key, || {
+    cached_metrics(key, move || {
         let store::CacheReport { points, summary, recent } =
             state.store.cache_report(since, bucket_secs, tz).map_err(internal)?;
         Ok(CacheSeriesResp { since, bucket_secs, points, summary, recent })
     })
+    .await
 }
 
 #[derive(Serialize)]
@@ -2533,11 +2558,12 @@ async fn get_ttft_series(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (since, bucket_secs, tz) = q.normalized();
     let key = format!("ttft:{}:{bucket_secs}:{tz}", q.hours);
-    cached_metrics(key, || {
+    cached_metrics(key, move || {
         let store::TtftReport { points, summary, recent } =
             state.store.ttft_report(since, bucket_secs, tz).map_err(internal)?;
         Ok(TtftSeriesResp { since, bucket_secs, points, summary, recent })
     })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -2594,7 +2620,7 @@ async fn get_rejections(
     let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
     let hours = q.hours.clamp(1, max_hours);
     let since = chrono::Utc::now().timestamp() - hours * 3600;
-    cached_metrics(format!("rejections:{hours}"), || {
+    cached_metrics(format!("rejections:{hours}"), move || {
         let rows: Vec<RejectionKind> = state
             .store
             .local_rejections(since)
@@ -2605,6 +2631,7 @@ async fn get_rejections(
         let total = rows.iter().map(|r| r.count).sum();
         Ok(RejectionsResp { since, total, rows })
     })
+    .await
 }
 
 /// 这段时间按模型或按账号拆开的延迟与缓存：趋势对话框下面那张「谁在拖后腿」的表。
@@ -2621,13 +2648,14 @@ async fn get_usage_breakdown(
         _ => store::BreakdownBy::Model,
     };
     let by_name = if by == store::BreakdownBy::Account { "account" } else { "model" };
-    cached_metrics(format!("breakdown:{hours}:{by_name}"), || {
+    cached_metrics(format!("breakdown:{hours}:{by_name}"), move || {
         // 合计要覆盖全部分组，先不截断；前端只拿前 12 行。
         let mut rows = state.store.usage_breakdown(since, by, usize::MAX).map_err(internal)?;
         let cache_saved_usd_total = rows.iter().map(|r| r.cache_saved_usd).sum();
         rows.truncate(12);
         Ok(BreakdownResp { since, by: by_name.into(), rows, cache_saved_usd_total })
     })
+    .await
 }
 
 // ---------- 接入设置 ----------
@@ -4112,6 +4140,22 @@ async fn log_api_failures(
     }
     resp
 }
+/// 把一段同步的 store 调用挪到阻塞线程池里跑。
+///
+/// 后台的统计查询走只读连接（`store::CredentialStore::read_conn`），一次可能几百毫秒；
+/// 直接在 handler 里调，占着（或等着那把锁的）就是 tokio 工作线程，恰好驱动定时器与 IO 的
+/// 那个一卡，所有在途的 SSE 都跟着停。**凡是会碰只读连接的 handler 都要经过这里**——
+/// 哪怕它自己的查询很便宜，也可能排在别人的慢查询后面等锁。
+async fn blocking<T, F>(f: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| internal(format!("admin query task failed: {e}")))?
+}
+
 fn internal(e: impl std::fmt::Display) -> ApiError {
     let msg = e.to_string();
     tracing::error!(error = %msg, "admin api internal error");

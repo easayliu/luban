@@ -21,6 +21,19 @@ const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, pr
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
+    /// 后台统计专用的**只读**连接（同一个库文件，WAL 下读不挡写），见 [`Self::read_conn`]。
+    ///
+    /// 控制台的聚合查询（额度快照、趋势、流水翻页等）要扫几十万行流水，一次几十到几百毫秒。
+    /// 它们以前和转发路径共用 `conn`，持锁期间所有选号、落流水都排在后面，而等锁的正是
+    /// tokio 工作线程——整个运行时的 SSE 会跟着一起停。拆成两把锁后转发路径不再等它们。
+    ///
+    /// 内存库（测试）开不出第二条连接去读同一份数据，此时为 `None`，读退回 `conn`。
+    ///
+    /// **必须声明在 `conn` 之前**：字段按声明顺序析构，它得先关。主连接关闭时若只读连接还
+    /// 开着，主连接就不是最后一条，SQLite 会跳过关库时的 checkpoint；只读连接自己又做不了
+    /// checkpoint，于是优雅退出后 `-wal` 留在磁盘上、最近的写入没回写进 `.db`——只拷
+    /// `luban.db` 做备份或迁移的人会漏掉这一段。
+    reader: Option<Mutex<Connection>>,
     conn: Mutex<Connection>,
     /// 每凭证一把刷新锁，串行化 token 刷新，见 [`valid_access_token_for_device`]。
     /// 上游刷新会**轮换 refresh_token**：并发刷新时后完成的那次会把已被作废的 token 写回库，
@@ -782,18 +795,36 @@ impl CredentialStore {
 
     /// 在默认路径打开（或新建）凭证库并初始化 schema。
     pub fn open_default() -> Result<Self> {
-        let path = Self::db_path()?;
+        Self::open_at(&Self::db_path()?)
+    }
+
+    /// 在指定路径打开（或新建）凭证库并初始化 schema，另开一条后台统计用的只读连接。
+    fn open_at(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory: {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let conn = Connection::open(path)
             .with_context(|| format!("failed to open credential database: {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 有了独立的只读连接，自动 checkpoint 可能撞上它的读事务，WAL 那一刻重置不了、只能
+        // 接着往后长（改动前读写同锁串行，没有这个情况）。WAL 本身不会自己缩，这里给个上限：
+        // 下次重置时截回 64MB，一阵连续的慢查询过后磁盘占用能降回来。
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         init_schema(&conn)?;
-        Ok(Self::with_conn(conn))
+        let mut store = Self::with_conn(conn);
+        // schema 已由主连接建好，只读连接不做迁移。开不出来不影响服务：后台读退回主连接，
+        // 只是回到拆分之前的性能。
+        match open_reader(path) {
+            Ok(reader) => store.reader = Some(Mutex::new(reader)),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "failed to open the read-only database connection; admin queries share the main one"
+            ),
+        }
+        Ok(store)
     }
 
     /// 内存库（**仅测试**）：schema 已初始化，进程退出即消失。
@@ -814,6 +845,7 @@ impl CredentialStore {
         let settings = load_settings(&conn).unwrap_or_default();
         Self {
             conn: Mutex::new(conn),
+            reader: None,
             refresh_locks: Mutex::new(HashMap::new()),
             bare_rate: RateWindow::default(),
             rpm_rate: RateWindow::default(),
@@ -822,6 +854,15 @@ impl CredentialStore {
             cooldown: RateLimitCooldown::default(),
             settings: parking_lot::RwLock::new(settings),
         }
+    }
+
+    /// 后台统计用的只读连接（没有就退回主连接）。
+    ///
+    /// **只给纯读、且只由管理接口调用的方法用**：连接以只读方式打开，写语句会直接报错；
+    /// 转发路径也不该用它——它可能正被一条几百毫秒的聚合查询占着。调用方（web 的 handler）
+    /// 要放在 `spawn_blocking` 里跑，等这把锁同样不能占 tokio 工作线程。
+    fn read_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.reader.as_ref().unwrap_or(&self.conn).lock()
     }
 
     /// 取该凭证的刷新锁（不存在则创建）。
@@ -1974,7 +2015,7 @@ impl CredentialStore {
     /// 而不是「本次绑定期间」。同时给出跨账号合计，便于识别换号仍在持续烧钱的同一台设备。
     pub fn list_devices(&self, cred_id: i64) -> Result<Vec<DeviceBinding>> {
         let ttl = self.device_binding_ttl();
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let ttl_clause = if ttl > 0 { "AND b.last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
             "SELECT b.device_id, b.request_count, b.created_at, b.last_seen_at, \
@@ -2053,12 +2094,8 @@ impl CredentialStore {
     /// 排除超过 TTL 未活跃的绑定。TTL `<= 0` 时按全量计。
     pub fn device_counts(&self) -> Result<HashMap<i64, i64>> {
         let ttl = self.device_binding_ttl();
-        let conn = self.conn.lock();
-        let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
-        let sql = format!(
-            "SELECT cred_id, COUNT(*) FROM device_bindings {where_clause} GROUP BY cred_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(&active_counts_sql("device_bindings", ttl))?;
         let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
         let rows =
             if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
@@ -2094,12 +2131,8 @@ impl CredentialStore {
     /// 所有凭证当前**有效**的模拟会话绑定数（cred_id → count）；口径同 [`Self::session_count`]。
     pub fn session_counts(&self) -> Result<HashMap<i64, i64>> {
         let ttl = self.session_binding_ttl();
-        let conn = self.conn.lock();
-        let where_clause = if ttl > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
-        let sql = format!(
-            "SELECT cred_id, COUNT(*) FROM session_bindings {where_clause} GROUP BY cred_id"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(&active_counts_sql("session_bindings", ttl))?;
         let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
         let rows =
             if ttl > 0 { stmt.query_map([ttl], map_row)? } else { stmt.query_map([], map_row)? };
@@ -2115,7 +2148,7 @@ impl CredentialStore {
     /// 完全一致，否则后台会出现「会话数写着 2、展开却列出 5 条」。
     pub fn list_sessions(&self, cred_id: i64) -> Result<Vec<SessionBinding>> {
         let ttl = self.session_binding_ttl();
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         // 会话 id 要账号 uuid 才算得出；凭证不存在时按空 uuid 算（调用方已先判过 404）。
         let account_uuid: Option<String> = conn
             .query_row("SELECT account_uuid FROM credentials WHERE id = ?1", [cred_id], |r| {
@@ -4289,7 +4322,7 @@ impl CredentialStore {
     /// 窗口统计（起点 = 快照的 reset 反推一个窗口时长）仍从流水条件聚合：窗口最长 7 天
     /// 多一点，流水的保留期（见 [`Self::prune_usage_logs`]）覆盖它绰绰有余。
     fn quota_snapshots(&self, only: Option<i64>) -> Result<HashMap<i64, QuotaSnapshot>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
                     s.rl_5h_utilization, s.rl_5h_reset,
@@ -4396,7 +4429,7 @@ impl CredentialStore {
     /// 裸请求（带设备身份的一条都不进），且重启即清零，拿来当 RPM 会系统性地偏小。
     /// 而 60 秒的流水靠 `idx_usage_logs_ts` 只扫一小段范围，比那把锁贵不了多少。
     pub fn recent_rpm(&self) -> Result<HashMap<i64, i64>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         // 时间下界用 SQLite 的时钟，与写入侧（insert_usage_log_at）同源：两边若各取各的
         // 时钟，机器时间稍有偏差就会把刚写进去的那几条数丢或多数。
         let mut stmt = conn.prepare(
@@ -4420,7 +4453,7 @@ impl CredentialStore {
     /// 的那些），所以它恒等于各账号 RPM 之和——两个数摆在同一屏上，对不上会比看不到更让人
     /// 犯疑。代价是没选到号就失败的请求（全员限流、无可用凭证）不计入：它们压根没发出去。
     pub fn total_rpm(&self) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let n = conn.query_row(
             "SELECT COUNT(*) FROM usage_logs WHERE ts >= unixepoch() - ?1 AND cred_id IS NOT NULL",
             [RPM_WINDOW_SECS],
@@ -4431,7 +4464,7 @@ impl CredentialStore {
 
     /// 单个凭证当前的 RPM；口径同 [`Self::recent_rpm`]，无请求时为 0。
     pub fn recent_rpm_of(&self, cred_id: i64) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         // 这条走 idx_usage_logs_cred_ts，直接定位到 (cred_id, 最近 60 秒) 那一小段。
         let n = conn.query_row(
             "SELECT COUNT(*) FROM usage_logs WHERE cred_id = ?1 AND ts >= unixepoch() - ?2",
@@ -4444,7 +4477,7 @@ impl CredentialStore {
     /// 每个凭证最近一次被使用（有转发记录）的时间（cred_id → Unix 秒）。读账本，
     /// 不扫流水——流水会被裁剪，账本才是终身口径（下同，cost_by_cred / cost_of 亦然）。
     pub fn last_used(&self) -> Result<HashMap<i64, i64>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT cred_id, last_used_at FROM credential_stats WHERE last_used_at IS NOT NULL",
         )?;
@@ -4473,7 +4506,7 @@ impl CredentialStore {
 
     /// 每个凭证累计的等价 API 费用（cred_id → USD 合计）。
     pub fn cost_by_cred(&self) -> Result<HashMap<i64, f64>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare("SELECT cred_id, cost_total_usd FROM credential_stats")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
         let mut out = HashMap::new();
@@ -4684,7 +4717,7 @@ impl CredentialStore {
         tz_offset_secs: i64,
     ) -> Result<Vec<CacheBucket>> {
         let bucket_secs = bucket_secs.max(1);
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT ((ts + ?3) / ?2) * ?2 - ?3 AS bucket,
                     SUM(
@@ -4733,7 +4766,7 @@ impl CredentialStore {
             acc.written_tokens += b.written_tokens;
             acc
         });
-        let now: i64 = self.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let now: i64 = self.read_conn().query_row("SELECT unixepoch()", [], |r| r.get(0))?;
         let recent = self.cache_summary(now - 3600)?;
         Ok(CacheReport { points, summary, recent })
     }
@@ -4753,7 +4786,7 @@ impl CredentialStore {
     /// （近 1 小时的窗口按它算，与写入侧同源）。WHERE 与 `idx_usage_logs_latency` 的部分谓词
     /// 逐字对应，整条查询在索引里走完、不回表；不排序——分桶用 BTreeMap，分位数各桶自己排。
     fn latency_rows(&self, since: i64) -> Result<(i64, Vec<LatencyRow>)> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
         let mut stmt = conn.prepare(LATENCY_ROWS_SQL)?;
         let rows = stmt.query_map([since], |r| {
@@ -4831,7 +4864,7 @@ impl CredentialStore {
             cache: CacheBucket,
             saved_usd: f64,
         }
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let key_expr = match by {
             BreakdownBy::Model => "COALESCE(u.model, '')",
             BreakdownBy::Account => "COALESCE(CAST(u.cred_id AS TEXT), '')",
@@ -4919,7 +4952,7 @@ impl CredentialStore {
         group_limit: usize,
     ) -> Result<CredentialStats> {
         let bucket_secs = bucket_secs.max(1);
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT ts, status, COALESCE(model, ''), COALESCE(device_id, ''), COALESCE(ua, ''),
                     COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
@@ -5000,7 +5033,7 @@ impl CredentialStore {
     /// `since` 起本地拒绝的条数，按原因分类（`rewrites` 里 `rejected_locally:<kind>` 的 kind；
     /// 没分类的算 `other`），按条数降序。给概览「近 1 小时被拒了多少、为什么」用。
     pub fn local_rejections(&self, since: i64) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT rewrites, COUNT(*) FROM usage_logs
               WHERE ts >= ?1 AND rewrites LIKE 'rejected_locally%'
@@ -5092,7 +5125,7 @@ impl CredentialStore {
     /// `q` 里的 `limit`/`offset` **不参与**——统计的是整个集合，不是当前这一页。
     pub fn usage_log_stats(&self, q: UsageLogQuery) -> Result<UsageLogStats> {
         let (where_sql, params) = q.where_clause();
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         conn.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id) FROM usage_logs{where_sql}"
@@ -5109,7 +5142,7 @@ impl CredentialStore {
         params.push(rusqlite::types::Value::Integer(q.limit));
         params.push(rusqlite::types::Value::Integer(q.offset));
         let n = params.len();
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT id, {USAGE_LOG_COLS}
                FROM usage_logs{where_sql}
@@ -5266,7 +5299,7 @@ impl CredentialStore {
     /// 封号事件列表（新的在前）。`cred_id` 为 `Some` 时只看那个号（含已删的号：事件按 id 存，
     /// 不随删号消失）。
     pub fn list_ban_events(&self, cred_id: Option<i64>, limit: i64) -> Result<Vec<BanEvent>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let (where_sql, params): (&str, Vec<rusqlite::types::Value>) = match cred_id {
             Some(c) => (" WHERE cred_id = ?1", vec![c.into(), limit.into()]),
             None => ("", vec![limit.into()]),
@@ -5323,7 +5356,7 @@ impl CredentialStore {
 
     /// 每个凭证被自动封停过几次（cred_id → 次数）；没封过的号不出现。
     pub fn ban_counts(&self) -> Result<HashMap<i64, i64>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare("SELECT cred_id, COUNT(*) FROM ban_events GROUP BY cred_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
@@ -5333,7 +5366,8 @@ impl CredentialStore {
     /// 连同该事件冻结的总条数一起给出。
     ///
     /// 一次封号常冻下上千行、几十 MB（每行还带形态摘要 JSON），整份吐给页面既慢又白读，
-    /// 所以这里只给一页。总条数与当页在同一把锁里取：冻结表写完就不再变，两者天然自洽。
+    /// 所以这里只给一页。总条数与当页在同一个读事务里取：封号后的补冻结（见
+    /// `insert_usage_log_at`）还会往冻结表追加行，两条语句若各看各的快照，总数与当页会差一条。
     /// `id` 是冻结表自己的主键；原流水的 id 不返回——它在原表里可能早已被裁掉。
     pub fn frozen_usage_logs(
         &self,
@@ -5341,18 +5375,24 @@ impl CredentialStore {
         limit: i64,
         offset: i64,
     ) -> Result<(i64, Vec<UsageLog>)> {
-        let conn = self.conn.lock();
-        let total: i64 = conn.query_row(
+        let conn = self.read_conn();
+        let tx = conn.unchecked_transaction()?;
+        let total: i64 = tx.query_row(
             "SELECT COUNT(*) FROM usage_logs_frozen WHERE ban_event_id = ?1",
             [ban_event_id],
             |r| r.get(0),
         )?;
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = tx.prepare(&format!(
             "SELECT id, {USAGE_LOG_COLS} FROM usage_logs_frozen
               WHERE ban_event_id = ?1 ORDER BY ts, id LIMIT ?2 OFFSET ?3"
         ))?;
-        let rows = stmt.query_map([ban_event_id, limit, offset], usage_log_from_row)?;
-        Ok((total, rows.collect::<rusqlite::Result<Vec<_>>>()?))
+        let logs = stmt
+            .query_map([ban_event_id, limit, offset], usage_log_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        // 只读事务，提交与回滚等价；显式结束，别等 drop 时静默回滚吞掉错误。
+        tx.commit()?;
+        Ok((total, logs))
     }
 }
 
@@ -5493,6 +5533,41 @@ pub struct BanEvent {
     /// 与 `devices_7d`（来访自报）分开：上游眼里这个号有几台设备，看的是这一对。
     pub devices_out_7d: i64,
     pub device_ids_out_7d: Vec<serde_json::Value>,
+}
+
+/// 按凭证数「TTL 内活跃」绑定的 SQL（`table` 是 `device_bindings` 或 `session_bindings`，
+/// 只由代码里的常量传入）。TTL `<= 0` 时不过滤、按全量计。选号与后台列表共用，口径才一致。
+///
+/// **`GROUP BY +cred_id` 的一元加号不能删**：它让 SQLite 不再拿 `(cred_id)` 索引来分组。
+/// 不加时，没跑过 ANALYZE 的库（luban 从不跑）会选择「按 cred 索引走全表、逐行回表判
+/// last_seen_at」，代价随保留期内的**总行数**线性涨——会话表攒到 3 万行时单次 5–12ms，
+/// 而且是在选号那把全局锁里、每条转发请求一次。加号之后改走 `last_seen_at` 索引，只扫
+/// TTL 内的那一小段（同样 3 万行约 80µs）。不过滤时没有范围可走，保留原样让它扫索引。
+fn active_counts_sql(table: &str, ttl_secs: i64) -> String {
+    if ttl_secs > 0 {
+        format!(
+            "SELECT cred_id, COUNT(*) FROM {table} \
+             WHERE last_seen_at >= unixepoch() - ?1 GROUP BY +cred_id"
+        )
+    } else {
+        format!("SELECT cred_id, COUNT(*) FROM {table} GROUP BY cred_id")
+    }
+}
+
+/// 打开后台统计用的只读连接，见 [`CredentialStore::reader`]。
+///
+/// `SQLITE_OPEN_READ_ONLY`：误把写语句挂到这条连接上会当场报错，而不是悄悄绕开主连接的
+/// 串行化。WAL 模式由主连接设在库文件上，这里不用（也不能）再设；busy_timeout 与主连接
+/// 一致，兜住 checkpoint 等极短的排他窗口。
+fn open_reader(path: &std::path::Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open read-only connection: {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -6540,14 +6615,11 @@ impl CredentialStore {
             return Err(AllRateLimited { retry_after_secs, refresh_failed: None }.into());
         }
 
-        // 各凭证当前**占名额**的设备数与模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
+        // 各凭证当前**占名额**的设备数或模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
         // （口径与 [`Self::device_counts`] / [`Self::session_counts`] 一致，后台看到的数就是这里
-        // 用来判上限的数）。两张表都数：负载均衡按本次绑定的那一种排序，另一种不看。
+        // 用来判上限的数）。只数本次绑定的那一种：名额与负载均衡都只看它，另一张表数了也不用。
         let active_counts = |table: &str, ttl_secs: i64| -> Result<HashMap<i64, i64>> {
-            let active = if ttl_secs > 0 { "WHERE last_seen_at >= unixepoch() - ?1" } else { "" };
-            let mut cstmt = conn.prepare(&format!(
-                "SELECT cred_id, COUNT(*) FROM {table} {active} GROUP BY cred_id"
-            ))?;
+            let mut cstmt = conn.prepare(&active_counts_sql(table, ttl_secs))?;
             let map_row = |r: &Row| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?));
             let rows = if ttl_secs > 0 {
                 cstmt.query_map([ttl_secs], map_row)?
@@ -6561,8 +6633,10 @@ impl CredentialStore {
             }
             Ok(counts)
         };
-        let counts = active_counts("device_bindings", ttl_secs)?;
-        let session_counts = active_counts("session_bindings", session_ttl_secs)?;
+        let counts = match binding {
+            Some(Binding::Session(_)) => active_counts("session_bindings", session_ttl_secs)?,
+            _ => active_counts("device_bindings", ttl_secs)?,
+        };
         // 这条请求走哪张表，TTL 与保留期就都用哪张表的：下面判「绑定还在有效期内吗」与分槽位
         // 按 TTL，判「这条绑定还算不算数」按保留期。
         let (binding_ttl, binding_retention) = match binding {
@@ -6572,10 +6646,7 @@ impl CredentialStore {
 
         // 当前占名额的数（已排除 TTL 外的休眠绑定）：按会话绑定时数会话，其余数设备——裸请求
         // 不占名额，但负载均衡仍按设备数排，与原来一样。
-        let used = |c: &Credential| match binding {
-            Some(Binding::Session(_)) => session_counts.get(&c.id).copied().unwrap_or(0),
-            _ => counts.get(&c.id).copied().unwrap_or(0),
-        };
+        let used = |c: &Credential| counts.get(&c.id).copied().unwrap_or(0);
         // 生效上限：账号未单独配置（== 0）时套用对应的全局默认。
         let limit_of = |c: &Credential| match binding {
             Some(Binding::Session(_)) => {
@@ -10674,6 +10745,104 @@ mod tests {
         assert!(!store.forward_flags().system_shape, "旧键应在新键缺省时生效");
         store.set_setting(SYSTEM_SHAPE, "true").unwrap();
         assert!(store.forward_flags().system_shape, "新键存在就以新键为准");
+    }
+
+    /// 选号与后台列表数「活跃绑定」的那条 SQL 必须走 `last_seen_at` 索引：没跑过 ANALYZE 的库
+    /// 若按 cred 索引分组，会逐行回表扫完保留期内的全部绑定（见 [`active_counts_sql`]）。
+    #[test]
+    fn active_counts_sql_scans_by_last_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        for table in ["device_bindings", "session_bindings"] {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", active_counts_sql(table, 3600)))
+                .unwrap();
+            let plan: Vec<String> = stmt
+                .query_map([3600], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let index = format!("idx_{table}_seen");
+            assert!(
+                plan.iter().any(|d| d.contains(&index) && d.contains("last_seen_at>?")),
+                "{table} 应按 last_seen_at 范围扫描，实际计划：{plan:?}"
+            );
+        }
+    }
+
+    /// 后台统计走的只读连接：看得到主连接刚提交的写入，自己写不进去。
+    #[test]
+    fn reader_sees_committed_writes_and_rejects_writes() {
+        let dir = std::env::temp_dir().join(format!("luban-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("t.db{suffix}")));
+        }
+
+        let store = CredentialStore::open_at(&path).unwrap();
+        assert!(store.reader.is_some(), "文件库应开出独立的只读连接");
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO device_bindings (device_id, cred_id) VALUES ('d1', ?1), ('d2', ?1)",
+                [a],
+            )
+            .unwrap();
+        assert_eq!(store.device_counts().unwrap().get(&a).copied(), Some(2));
+        assert!(
+            store.read_conn().execute("DELETE FROM device_bindings", []).is_err(),
+            "只读连接不应能写"
+        );
+        assert_eq!(store.device_counts().unwrap().get(&a).copied(), Some(2));
+
+        // 所有改走只读连接的方法都在真正的只读连接上跑一遍：内存库测试里 reader 为 None、
+        // 读退回可写主连接，有人往这些方法里加了写语句，只有这里会报出来。
+        store
+            .insert_usage_log(&UsageRecord {
+                cred_id: Some(a),
+                cred_label: "a".into(),
+                status: 200,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.mark_banned(a, "banned").unwrap());
+        let since = 0;
+        store.latest_quotas().unwrap();
+        store.latest_quota(a).unwrap();
+        store.list_devices(a).unwrap();
+        store.list_sessions(a).unwrap();
+        store.session_counts().unwrap();
+        store.recent_rpm().unwrap();
+        store.recent_rpm_of(a).unwrap();
+        store.total_rpm().unwrap();
+        store.last_used().unwrap();
+        store.cost_by_cred().unwrap();
+        store.cache_report(since, 3600, 0).unwrap();
+        store.ttft_report(since, 3600, 0).unwrap();
+        store.usage_breakdown(since, BreakdownBy::Model, 12).unwrap();
+        store.usage_breakdown(since, BreakdownBy::Account, 12).unwrap();
+        store.credential_stats(a, since, 3600, 0, 20).unwrap();
+        store.local_rejections(since).unwrap();
+        let q = UsageLogQuery { limit: 10, ..Default::default() };
+        assert_eq!(store.usage_log_stats(q.clone()).unwrap().total, 1);
+        assert_eq!(store.query_usage_logs(q).unwrap().len(), 1);
+        let ev = store.list_ban_events(None, 10).unwrap().remove(0);
+        assert_eq!(store.ban_counts().unwrap().get(&a).copied(), Some(1));
+        assert_eq!(store.frozen_usage_logs(ev.id, 10, 0).unwrap().0, 1);
+
+        // 只读连接先于主连接关闭，主连接关库时才做得了 checkpoint、删得掉 WAL。
+        drop(store);
+        assert!(
+            std::fs::metadata(dir.join("t.db-wal")).map(|m| m.len() == 0).unwrap_or(true),
+            "关库后 WAL 应已 checkpoint 并删除"
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("t.db{suffix}")));
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// 重开同一个库时，缓存要从库里重新装载（否则重启后设置全部凭空回到默认值）。
