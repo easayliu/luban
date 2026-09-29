@@ -1197,17 +1197,36 @@ async fn unbind_credential_session(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// 删除一条凭证。
+/// 删除一条凭证。流水在后台清，见 [`purge_usage_logs_in_background`]。
 async fn delete_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let removed = state.store.delete(id).map_err(internal)?;
-    if !removed {
+    let store = state.store.clone();
+    let removed = blocking(move || store.remove(&[id]).map_err(internal)).await?;
+    if removed == 0 {
         return Err(not_found());
     }
     tracing::info!(cred_id = id, "credential deleted");
+    purge_usage_logs_in_background(&state, vec![id]);
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 删号后清掉这些账号的用量流水（[`crate::store::CredentialStore::purge_usage_logs_of`]）。
+///
+/// 不让接口等它：一个号 30 天的流水可能几十万行，分批删也要好几秒；账号行已经删了，
+/// 列表和选号里它立即消失，流水晚几秒清完不影响什么。失败只记日志，留下的无主行下次启动时
+/// 由 `store::purge_orphan_rows` 扫掉。
+fn purge_usage_logs_in_background(state: &AppState, ids: Vec<i64>) {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || match store.purge_usage_logs_of(&ids) {
+        Ok(rows) => {
+            tracing::info!(creds = ids.len(), rows, "purged usage logs of deleted credentials")
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "failed to purge usage logs of deleted credentials")
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -1381,7 +1400,7 @@ async fn set_disabled_many(
     list_credentials(State(state)).await
 }
 
-/// 批量删除（连带清历史用量与设备绑定），返回删除后的整份列表。
+/// 批量删除（连带清设备绑定，历史用量在后台清），返回删除后的整份列表。
 ///
 /// 用 POST 而非 DELETE：带请求体的 DELETE 在部分代理/客户端上会被丢掉 body。
 async fn delete_credentials(
@@ -1389,8 +1408,11 @@ async fn delete_credentials(
     Json(req): Json<IdsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
-    let n = state.store.delete_many(&req.ids).map_err(internal)?;
+    let store = state.store.clone();
+    let ids = req.ids.clone();
+    let n = blocking(move || store.remove(&ids).map_err(internal)).await?;
     tracing::info!(count = n, "credentials deleted in bulk");
+    purge_usage_logs_in_background(&state, req.ids);
     list_credentials(State(state)).await
 }
 

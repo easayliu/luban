@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "luban"
-version = "0.3.176"
+version = "0.3.177"
 dependencies = [
  "anyhow",
  "axum",
