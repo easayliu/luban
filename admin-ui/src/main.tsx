@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
+import { ReauthorizeProvider } from '@/components/add-account'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider } from '@/lib/i18n'
@@ -25,7 +26,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <TooltipProvider>
             <AnchoredToastProvider>
               <div className="relative isolate min-h-svh">
-                <App />
+                <ReauthorizeProvider>
+                  <App />
+                </ReauthorizeProvider>
               </div>
             </AnchoredToastProvider>
           </TooltipProvider>

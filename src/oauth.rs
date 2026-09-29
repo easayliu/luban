@@ -112,6 +112,9 @@ pub struct TokenSet {
     pub expires_at: u64,
     /// 账号邮箱（来自交换响应，用作默认显示名的兜底）。
     pub account: Option<String>,
+    /// 账号 UUID（交换响应的 `account.uuid`）；重新授权时 profile 拉不到，靠它核对是不是同一个号。
+    /// 刷新响应通常没有。
+    pub account_uuid: Option<String>,
     /// 组织 UUID（交换响应的 `organization.uuid`）；profile 拉不到时的兜底，
     /// 见 [`crate::credentials::Credential::org_uuid`]。刷新响应通常没有。
     pub organization_uuid: Option<String>,
@@ -204,6 +207,8 @@ struct TokenResponse {
 
 #[derive(Debug, Deserialize)]
 struct Account {
+    #[serde(default)]
+    uuid: Option<String>,
     #[serde(default)]
     email_address: Option<String>,
 }
@@ -583,6 +588,8 @@ fn parse_token_set(text: &str, fallback_refresh: Option<&str>) -> Result<TokenSe
 
     let organization_uuid =
         token.organization.as_ref().and_then(|o| o.uuid.clone()).filter(|s| !s.trim().is_empty());
+    let account_uuid =
+        token.account.as_ref().and_then(|a| a.uuid.clone()).filter(|s| !s.trim().is_empty());
     // 优先用账号邮箱作标识，取不到再用组织名。
     let account = token
         .account
@@ -595,6 +602,7 @@ fn parse_token_set(text: &str, fallback_refresh: Option<&str>) -> Result<TokenSe
         refresh_token,
         expires_at: now_secs() + token.expires_in,
         account,
+        account_uuid,
         organization_uuid,
     })
 }

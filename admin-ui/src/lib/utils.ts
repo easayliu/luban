@@ -48,6 +48,7 @@ const FIXED_BACKEND_MESSAGES: readonly LocalizedBackendMessage[] = [
   ['请填写要测试的模型名', 'specify the model name to test'],
   ['接入 Key 已由环境变量 LUBAN_API_KEY 接管，无法在网页修改', 'the inbound key is managed by the LUBAN_API_KEY environment variable and cannot be changed from the web UI', '接入 Key 由环境变量 LUBAN_API_KEY 管理，无法在控制台修改'],
   ['这次登录已过期或未找到，请重新点「添加账号」生成授权链接', 'this login attempt expired or was not found; click \'Add account\' again to generate a new authorization link', '本次登录已过期或不存在，请重新点击「添加账号」生成授权链接'],
+  ['本次登录已过期或不存在，请重新生成授权链接后再试', 'this login attempt expired or was not found; generate a new authorization link and try again'],
   ['粘贴内容格式应为 `code#state`', 'the pasted value must look like `code#state`'],
   ['state 不匹配，可能存在 CSRF 或粘贴错误；请重新登录', 'state mismatch, possibly CSRF or a bad paste; please log in again', 'state 不匹配，可能遭遇 CSRF 攻击或粘贴有误，请重新登录'],
   ['无效的 API Key', 'invalid API key'],
@@ -200,6 +201,13 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
       ? `账号 #${refreshCouldNotDisable[1]} 刷新失败，且停用未生效`
       : `Account #${refreshCouldNotDisable[1]} failed to refresh and could not be disabled`
     return joinBackendDetail(prefix, localizeDetail(refreshCouldNotDisable[2].trim()), language)
+  }
+
+  const wrongAccount = message.match(/^the authorized account \((.+)\) is not this account; sign in with the original account and try again$/i)
+  if (wrongAccount) {
+    return language === 'zh-CN'
+      ? `授权的账号（${wrongAccount[1]}）与当前账号不一致，请使用原账号登录后重试`
+      : `The authorized account (${wrongAccount[1]}) is not this account; sign in with the original account and try again`
   }
 
   const allRefreshAttempts = message.match(/^all (\d+) credential refresh attempts failed; no credentials are available$/i)

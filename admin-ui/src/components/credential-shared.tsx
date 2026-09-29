@@ -4,7 +4,7 @@ import axios from 'axios'
 import { listProxies } from '@/api/proxies'
 import {
   ActivityIcon, ArrowUpDownIcon, Building2Icon, ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, CircleCheckIcon, CircleXIcon, EllipsisIcon,
-  GaugeIcon, GlobeIcon, MessagesSquareIcon, PanelTopOpenIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
+  GaugeIcon, GlobeIcon, KeyRoundIcon, MessagesSquareIcon, PanelTopOpenIcon, PencilIcon, PercentIcon, RefreshCwIcon, ScrollTextIcon,
   SmartphoneIcon, TimerOffIcon, Trash2Icon, UserIcon,
 } from 'lucide-react'
 import {
@@ -17,6 +17,7 @@ import {
   cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime, localizeBackendMessage,
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
+import { useReauthorize } from '@/lib/reauthorize'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
@@ -944,6 +945,7 @@ function useCredentialMenuGroups(
 ): CredentialMenuItem[][] {
   const { t } = useI18n()
   const { refresh, prio, cooldown } = actions
+  const reauthorize = useReauthorize()
   const detail: CredentialMenuItem[] = h.showDetail === false
     ? []
     : [{
@@ -965,6 +967,15 @@ function useCredentialMenuGroups(
       onSelect: () => refresh.mutate(),
       disabled: refresh.isPending,
     },
+    ...(reauthorize
+      ? [{
+          key: 'reauth',
+          icon: <KeyRoundIcon />,
+          label: t('重新授权', 'Reauthorize'),
+          onSelect: () => reauthorize(cred),
+          title: t('refresh token 失效时重新登录该账号，设置保持不变', 'Sign in again when the refresh token is no longer valid; settings are kept'),
+        }]
+      : []),
     { key: 'test', icon: <ActivityIcon />, label: t('连通性测试', 'Connectivity test'), onSelect: h.onTest },
     ...(hasCooldown
       ? [{
@@ -1154,7 +1165,10 @@ function CredentialActionSheet({
     proxy: proxyName(cred.proxy) ?? t('直连', 'Direct'),
   }
   const quick = pick(['detail', 'test', 'refresh', 'usage'])
-  const settings = pick(['rename', 'device', 'rpm', 'pause', 'proxy'])
+  // token 失效时「重新授权」就是这个号唯一该做的事，提到上面与解除冷却同样醒目；平时排在设置末尾。
+  const reauth = items.get('reauth')
+  const reauthUrgent = reauth != null && status.kind === 'token-invalid'
+  const settings = pick(['rename', 'device', 'rpm', 'pause', 'proxy', ...(reauthUrgent ? [] : ['reauth'])])
     .map((item) => (item.key === 'device' ? { ...item, label: t('设备 / 会话上限', 'Device / session limits') } : item))
   const cooldown = items.get('cooldown')
   const priority = pick(['prio-up', 'prio-down'])
@@ -1212,6 +1226,19 @@ function CredentialActionSheet({
               </button>
             ))}
           </div>
+
+          {reauthUrgent && (
+            <div className={cn(groupClass, 'border-warning/32 bg-warning/4')}>
+              <button
+                type="button"
+                className={cn(rowClass, 'text-warning-foreground [&_svg]:size-4.5')}
+                onClick={() => run(reauth)}
+              >
+                {reauth.icon}
+                <span className="min-w-0 flex-1 truncate font-medium">{reauth.label}</span>
+              </button>
+            </div>
+          )}
 
           {cooldown && (
             <div className={cn(groupClass, 'border-warning/32 bg-warning/4')}>

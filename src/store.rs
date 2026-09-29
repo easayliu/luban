@@ -825,7 +825,7 @@ impl CredentialStore {
     }
 
     /// 取该凭证的刷新锁（不存在则创建）。
-    fn refresh_lock(&self, cred_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn refresh_lock(&self, cred_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.refresh_locks.lock().entry(cred_id).or_default().clone()
     }
 

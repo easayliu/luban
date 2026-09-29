@@ -11,7 +11,7 @@
 //! 故带 `[1m]` 后缀的模型名与裸 id 同价。
 //!
 //! Sonnet 5 的 $2/$10 原为 2026-08-31 截止的引导价，官方已宣布转为永久标准价，
-//! 9-01 不再涨到 $3/$15，故此处不再按时间切换。
+//! 9-01 不再涨到 $3/$15，故此处不再按时间切换。Sonnet 5.5 与 Sonnet 5 同价（$2/$10，缓存读 $0.20）。
 
 /// 缓存写倍率（相对基础输入价），所有模型通用：5 分钟档与 1 小时档。
 const CACHE_WRITE_5M_MULT: f64 = 1.25;
@@ -72,7 +72,8 @@ fn rate_for(model: &str) -> Option<Rate> {
             Some(Rate::new(1.0, 5.0))
         }
     } else if m.contains("sonnet") {
-        // Sonnet 5 为 $2/$10（原引导价已转永久）；Sonnet 4.x 为 $3/$15。
+        // Sonnet 5 / 5.5 为 $2/$10（5 的原引导价已转永久，5.5 同价），缓存读通用 0.10×（$0.20）；
+        // Sonnet 4.x 为 $3/$15。
         if m.contains("sonnet-5") { Some(Rate::new(2.0, 10.0)) } else { Some(Rate::new(3.0, 15.0)) }
     } else {
         None
@@ -178,6 +179,8 @@ pub const LISTED_MODELS: &[&str] = &[
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
     "claude-opus-4-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5-5[1m]",
     "claude-sonnet-5",
     "claude-sonnet-5[1m]",
     "claude-sonnet-4-6",
@@ -242,6 +245,8 @@ mod tests {
         // Sonnet 5 的 $2/$10 已是永久标准价，不再随时间涨回 $3/$15。
         assert_eq!(rate("claude-sonnet-5"), (2.0, 10.0));
         assert_eq!(rate("claude-sonnet-5[1m]"), (2.0, 10.0));
+        assert_eq!(rate("claude-sonnet-5-5"), (2.0, 10.0));
+        assert_eq!(rate("claude-sonnet-5-5[1m]"), (2.0, 10.0));
         assert_eq!(rate("claude-sonnet-4-6"), (3.0, 15.0));
     }
 
@@ -268,6 +273,11 @@ mod tests {
         );
         let s5 = find("claude-sonnet-5");
         assert_eq!((s5.input_per_mtok, s5.output_per_mtok), (2.0, 10.0));
+        let s55 = find("claude-sonnet-5-5[1m]");
+        assert_eq!(
+            (s55.input_per_mtok, s55.output_per_mtok, s55.cache_read_mult),
+            (2.0, 10.0, 0.10)
+        );
         // 列表本身不该有重复条目。
         let mut names: Vec<_> = LISTED_MODELS.to_vec();
         names.sort_unstable();
@@ -288,6 +298,7 @@ mod tests {
         assert_eq!(read("claude-opus-5"), Some(0.5));
         assert_eq!(read("claude-opus-5-5"), Some(0.2), "Opus 5.5 缓存读 $0.20/MTok");
         assert_eq!(read("claude-sonnet-5"), Some(0.2));
+        assert_eq!(read("claude-sonnet-5-5"), Some(0.2), "Sonnet 5.5 缓存读 $0.20/MTok");
         // 缓存写不受特例影响：Fable 5.1 的 5m 写仍是 10 × 1.25 = $12.5。
         assert_eq!(
             estimate_usd(Usage {

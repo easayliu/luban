@@ -748,6 +748,15 @@ export async function refreshCredential(id: number): Promise<Credential> {
   return data
 }
 
+/**
+ * 重新授权：对已有账号重走 OAuth 登录，用新 token 覆盖这一行，优先级、上限、代理与流水保留。
+ * 授权链接同样取自 {@link getAuthorizeUrl}；登的不是原账号时后端拒绝。
+ */
+export async function reauthorizeCredential(id: number, code: string): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/reauthorize`, { code })
+  return data
+}
+
 /** 手动解除限流冷却。冷却只是选号提示：解除错了，下一条请求撞上 429 会重新打上。 */
 export async function clearCooldown(id: number): Promise<Credential> {
   const { data } = await api.delete<Credential>(`/credentials/${id}/cooldown`)

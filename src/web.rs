@@ -573,6 +573,7 @@ pub async fn run(
         )
         .route("/credentials/{id}/sessions/{session_key}", delete(unbind_credential_session))
         .route("/credentials/{id}/refresh", post(refresh_credential))
+        .route("/credentials/{id}/reauthorize", post(reauthorize_credential))
         .route("/credentials/{id}/test", post(test_credential))
         .route("/credentials/{id}/cooldown", delete(clear_cooldown))
         .route("/models", get(list_models))
@@ -1582,6 +1583,131 @@ async fn refresh_credential(
         }
     }
     view_of(&state, id)
+}
+
+#[derive(Deserialize)]
+struct ReauthorizeReq {
+    /// 用户从授权回调页粘贴的 `code#state`，授权链接同样取自 `GET /authorize`。
+    code: String,
+}
+
+/// 重新授权：对**已有**的号重走一遍 OAuth 登录，用新换到的 token 覆盖这一行。
+///
+/// 给 refresh_token 被作废（`invalid_grant`）的号用：删了重加会丢掉优先级、上限、代理、
+/// 用量流水这些，这里只换 token 与 profile，其余原样保留。换码与拉 profile 走这个号自己的
+/// 代理，与刷新同一出口。
+///
+/// 两道把关：
+/// - 持有该号的刷新锁再写——等锁的自动刷新拿锁后会重读库，看到新 token 就直接复用，
+///   不会把旧那一族的结果写回来；
+/// - 账号 UUID（profile 优先，拉不到用交换响应里那个）与库里的对不上就拒绝：登错号会把另一个
+///   账号的 token 塞进这一行，而标签、代理、会话槽位都还是原来那个号的。库里没有 UUID（旧号）
+///   或两处都没给时无从比对，放行。
+///
+/// 号是因为 token 问题被自动停用的（见 [`is_token_pause`]），换好 token 就顺手启用；封号、
+/// 订阅未生效、手动停用、额度暂停与 token 无关，保持原状。
+async fn reauthorize_credential(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<ReauthorizeReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
+
+    // 先拿锁再读号：等锁期间自动刷新可能刚把号停掉、或刚换了代理，下面的启用判断与出口
+    // 都得按拿锁之后的状态来。
+    let lock = state.store.refresh_lock(id);
+    let _guard = lock.lock().await;
+    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    // 代理建不出来放在取挑战之前：挑战取出即作废，代理错了改好再试还能用同一个授权结果。
+    let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
+    let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
+        .ok_or_else(|| bad_request("this login attempt expired or was not found; generate a new authorization link and try again"))?;
+
+    let tokens = oauth::exchange_code(&http, &pkce, &req.code)
+        .await
+        .map_err(|e| bad_request(e.to_string()))?;
+    let profile = match oauth::fetch_profile(&http, &tokens.access_token).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(cred_id = id, error = %e, "reauthorize: fetching the account profile failed, skipping the same-account check");
+            None
+        }
+    };
+    let known = cred.account_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let got =
+        profile.as_ref().and_then(|p| p.account_uuid.as_deref()).or(tokens.account_uuid.as_deref());
+    if let (Some(known), Some(got)) = (known, got)
+        && known != got
+    {
+        let who = profile
+            .as_ref()
+            .and_then(|p| p.email.as_deref())
+            .or(tokens.account.as_deref())
+            .unwrap_or(got);
+        tracing::warn!(cred_id = id, cred = %cred.label, %who, "reauthorize: authorized a different account, rejected");
+        return Err(bad_request(format!(
+            "the authorized account ({who}) is not this account; sign in with the original account and try again"
+        )));
+    }
+
+    state
+        .store
+        .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
+        .map_err(internal)?;
+    if let Some(profile) = &profile
+        && let Err(e) = state.store.apply_profile(id, profile, tokens.organization_uuid.as_deref())
+    {
+        tracing::warn!(cred_id = id, error = %e, "reauthorize: failed to store the profile fields");
+    }
+    let token_pause = cred.disabled
+        && cred.ban_reason.as_deref().is_some_and(|r| is_token_pause(r, cred.resume_at.is_some()));
+    if token_pause {
+        state.store.set_disabled(id, false).map_err(internal)?;
+    }
+    tracing::info!(cred_id = id, cred = %cred.label, re_enabled = token_pause, "credential reauthorized");
+    view_of(&state, id)
+}
+
+/// 停用原因是不是「token 出了问题」——重新授权换好 token 就该回来的那几种：
+///
+/// - `[refresh …]`：刷新被作废（`invalid_grant`），或 `[refresh-failed]` 刷新失败的限时暂停；
+/// - `[proxy]`：代理建不出来——重新授权走的就是这个号的代理，能走到这里说明代理已好；
+/// - 转发 / 保活撞上 401 这类 token 被吊销、过期的报错（`OAuth token has been revoked` 等）。
+///
+/// 最后一条与前端 `isAccountBan` 同口径：带封号特征（账号停用、暂挂、违规）的不算，那是
+/// 号本身废了，换 token 也回不来。其余限时暂停（额度、限流）只看 `[refresh-failed]` 那一档。
+/// 改口径须前后端一起改。
+fn is_token_pause(reason: &str, has_resume_at: bool) -> bool {
+    if reason.starts_with(store::REFRESH_FAIL_PAUSE_TAG) {
+        return true;
+    }
+    if has_resume_at {
+        return false;
+    }
+    if reason.starts_with("[refresh ") || reason.starts_with("[proxy]") {
+        return true;
+    }
+    let l = reason.to_ascii_lowercase();
+    let near = |word: &str, within: usize, targets: &[&str]| {
+        l.match_indices(word).any(|(i, _)| {
+            let tail = &l.as_bytes()[i + word.len()..(i + word.len() + within).min(l.len())];
+            targets.iter().any(|t| tail.windows(t.len()).any(|w| w == t.as_bytes()))
+        })
+    };
+    let account_ban = ["account_on_hold", "violat", "/restricted"].iter().any(|p| l.contains(p))
+        || near(
+            "account",
+            5 + "deactivat".len(),
+            &["suspend", "disable", "ban", "terminat", "deactivat"],
+        );
+    if account_ban {
+        return false;
+    }
+    l.contains("invalid_grant")
+        || ["token", "grant"].iter().any(|w| {
+            near(w, 15 + "not found".len(), &["revoked", "expired", "invalid", "not found"])
+        })
 }
 
 #[derive(Deserialize)]
@@ -4137,6 +4263,35 @@ fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    /// 重新授权后该自动启用的只有 token 那几档；封号、订阅未生效、额度暂停保持原状。
+    #[test]
+    fn token_pause_only_covers_token_problems() {
+        // 刷新作废、刷新失败暂停（带恢复时刻）、代理建不出来。
+        assert!(is_token_pause(r#"[refresh 400] {"error":"invalid_grant"}"#, false));
+        assert!(is_token_pause("[refresh-failed] connection refused", true));
+        assert!(is_token_pause("[proxy] invalid proxy url", false));
+        // 保活 / 转发撞上的 token 吊销。
+        assert!(is_token_pause(
+            "[keepalive/profile 401] authentication_error: OAuth token has been revoked. Please obtain a new token.",
+            false
+        ));
+        assert!(is_token_pause("upstream 401: OAuth token has expired", false));
+
+        // 封号特征优先，哪怕同时提到 token。
+        assert!(!is_token_pause(
+            "[keepalive/profile 403] permission_error: account suspended; token invalid",
+            false
+        ));
+        assert!(!is_token_pause("upstream 400: account_on_hold", false));
+        // 订阅未生效、额度暂停、手动停用（无原因由调用方挡掉）不算。
+        assert!(!is_token_pause(
+            "[subscription-inactive 403] organization does not allow OAuth authentication",
+            false
+        ));
+        assert!(!is_token_pause("5h quota exhausted; token usage 100%, invalid until reset", true));
+        assert!(!is_token_pause("upstream 403: forbidden", false));
+    }
 
     /// 自动名只取 host:port，不带 user:pass；撞名时依次加序号。
     #[test]

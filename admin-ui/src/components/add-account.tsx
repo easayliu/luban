@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, RefreshCwIcon } from 'lucide-react'
-import { getAuthorizeUrl, exchangeCode } from '@/api/credentials'
+import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, KeyRoundIcon, RefreshCwIcon } from 'lucide-react'
+import { getAuthorizeUrl, exchangeCode, reauthorizeCredential, type Credential } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
+import { ReauthorizeContext } from '@/lib/reauthorize'
 import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
 import { ProxyPickerCombobox, ProxyTestBlock } from '@/components/credential-proxy-dialog'
 import { Button } from '@/components/ui/button'
@@ -22,12 +23,18 @@ interface AuthorizeRequest {
   session: number
 }
 
-/** 添加账号弹窗：授权 → 粘贴 code#state → 可选备注 → 新增一条凭证。 */
+/**
+ * 添加账号弹窗：授权 → 粘贴 code#state → 可选备注 → 新增一条凭证。
+ *
+ * 传了 `reauth` 就是「重新授权」：同样两步，但换到的 token 覆盖这个号，不新增；备注与代理
+ * 两栏不出——显示名、代理都沿用原号的，换码也走原号的代理。
+ */
 export function AddAccount({
-  open, onOpenChange,
+  open, onOpenChange, reauth,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  reauth?: Credential | null
 }) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
@@ -70,10 +77,12 @@ export function AddAccount({
   })
 
   const exchange = useMutation({
-    mutationFn: () => exchangeCode(code.trim(), label.trim() || undefined, proxy.trim() || undefined),
+    mutationFn: () => reauth
+      ? reauthorizeCredential(reauth.id, code.trim())
+      : exchangeCode(code.trim(), label.trim() || undefined, proxy.trim() || undefined),
     onSuccess: (cred) => {
       toastManager.add({
-        title: t('已添加账号', 'Account added'),
+        title: reauth ? t('已重新授权', 'Account reauthorized') : t('已添加账号', 'Account added'),
         description: displayCredentialLabel(cred.label, language),
         type: 'success',
       })
@@ -82,7 +91,7 @@ export function AddAccount({
       handleOpenChange(false)
     },
     onError: (error) => toastManager.add({
-      title: t('添加失败', 'Failed to add account'),
+      title: reauth ? t('重新授权失败', 'Reauthorization failed') : t('添加失败', 'Failed to add account'),
       description: extractError(error, language),
       type: 'error',
     }),
@@ -91,7 +100,7 @@ export function AddAccount({
   const proxiesQuery = useQuery({
     queryKey: ['proxies'],
     queryFn: listProxies,
-    enabled: open,
+    enabled: open && !reauth,
   })
   const savedProxies = proxiesQuery.data ?? []
 
@@ -109,14 +118,24 @@ export function AddAccount({
     >
       <DialogPopup closeProps={{ disabled: busy }}>
         <DialogHeader>
-          <DialogTitle>{t('添加 Claude 账号', 'Add Claude account')}</DialogTitle>
-          {/* 不再挂一句「完成授权后粘贴授权结果」：下面的 1、2 两步就是这句话本身。说明留给读屏。 */}
-          <DialogDescription className="sr-only">
-            {t(
-              '完成 Claude OAuth 授权后，粘贴授权结果以接入订阅账号。',
-              'Complete Claude OAuth authorization, then paste the result to connect a subscription account.',
-            )}
-          </DialogDescription>
+          <DialogTitle>{reauth ? t('重新授权账号', 'Reauthorize account') : t('添加 Claude 账号', 'Add Claude account')}</DialogTitle>
+          {/* 不再挂一句「完成授权后粘贴授权结果」：下面的 1、2 两步就是这句话本身。说明留给读屏。
+              重新授权例外：得说清会替换哪个号、哪些设置保留。 */}
+          {reauth ? (
+            <DialogDescription>
+              {t(
+                `授权完成后替换「${displayCredentialLabel(reauth.label, language)}」的 token，优先级、上限、出站代理等设置保持不变。`,
+                `Replaces the token of “${displayCredentialLabel(reauth.label, language)}” once authorized; priority, limits, outbound proxy and other settings are kept.`,
+              )}
+            </DialogDescription>
+          ) : (
+            <DialogDescription className="sr-only">
+              {t(
+                '完成 Claude OAuth 授权后，粘贴授权结果以接入订阅账号。',
+                'Complete Claude OAuth authorization, then paste the result to connect a subscription account.',
+              )}
+            </DialogDescription>
+          )}
         </DialogHeader>
         <Form
           className="contents"
@@ -129,10 +148,15 @@ export function AddAccount({
             <Field>
               <FieldLabel>{t('1. 打开授权页面', '1. Open the authorization page')}</FieldLabel>
               <FieldDescription>
-                {t(
-                  '使用要接入的 Claude 订阅账号完成授权。',
-                  'Authorize with the Claude subscription account you want to connect.',
-                )}
+                {reauth
+                  ? t(
+                      '须使用该账号原本的 Claude 账号登录，登录其他账号将被拒绝。',
+                      'Sign in with this account’s original Claude account; a different account is rejected.',
+                    )
+                  : t(
+                      '使用要接入的 Claude 订阅账号完成授权。',
+                      'Authorize with the Claude subscription account you want to connect.',
+                    )}
               </FieldDescription>
               {/* 生成之后按钮原地换成「打开 / 复制」，不再另起一块「授权链接已生成」的提示：那块提示的标题、
                   说明、按钮（「打开授权页面」与本步标题一字不差）说的都是同一件事。 */}
@@ -205,6 +229,7 @@ export function AddAccount({
                   required
                 />
               </Field>
+              {!reauth && (<>
               <Field name="label">
                 <FieldLabel htmlFor="account-label">
                   {t('账号备注（可选）', 'Account label (optional)')}
@@ -270,6 +295,7 @@ export function AddAccount({
                 </FieldDescription>
                 <ProxyTestBlock url={proxy.trim()} />
               </Field>
+              </>)}
             </div>
           </DialogPanel>
           <DialogFooter>
@@ -281,12 +307,31 @@ export function AddAccount({
               loading={exchange.isPending}
               disabled={!code.trim()}
             >
-              <ArrowRightIcon />
-              {t('添加账号', 'Add account')}
+              {reauth ? <KeyRoundIcon /> : <ArrowRightIcon />}
+              {reauth ? t('重新授权', 'Reauthorize') : t('添加账号', 'Add account')}
             </Button>
           </DialogFooter>
         </Form>
       </DialogPopup>
     </Dialog>
+  )
+}
+
+/**
+ * 在应用根部挂一个「重新授权」对话框，经 {@link ReauthorizeContext} 交给各处 ⋯ 菜单打开。
+ * 关闭时只收起、不清掉账号：清掉的话关闭动画那几帧标题会跳回「添加 Claude 账号」。
+ */
+export function ReauthorizeProvider({ children }: { children: ReactNode }) {
+  const [cred, setCred] = useState<Credential | null>(null)
+  const [open, setOpen] = useState(false)
+  const start = useCallback((next: Credential) => {
+    setCred(next)
+    setOpen(true)
+  }, [])
+  return (
+    <ReauthorizeContext.Provider value={start}>
+      {children}
+      {cred && <AddAccount open={open} onOpenChange={setOpen} reauth={cred} />}
+    </ReauthorizeContext.Provider>
   )
 }
