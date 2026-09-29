@@ -202,20 +202,21 @@ pub async fn run(
         });
     }
 
-    // 每 10 分钟清一次过了保留期的绑定行（设备 + 模拟会话）。
+    // 每分钟清一次过了保留期的绑定行（设备 + 模拟会话）。
     //
     // 这件事此前挂在选号路径上、每条转发请求跑一遍，两条 DELETE 各是一次按 last_seen_at 的
     // 全表扫加一次写事务，全程压着那把全局 `conn` 锁——会话绑定表默认保留 24 小时，多客户端
     // 时攒到几万行，实测单是扫一遍就要几毫秒，而它挡在每条请求的选号前面。
     //
-    // 间隔取 10 分钟而不是跟流水裁剪一样 24 小时：保留期本身可以在后台调到很短（分钟级），
-    // 一天一次的话那种配置下表会一直留着早该删的行。选号侧已按保留期自己过滤，所以这个
-    // 间隔只影响磁盘占用，不影响任何判定——跑得晚一点选出来的号完全一样。
+    // 间隔取 1 分钟：保留期在后台可以按分钟配，清理的粒度要跟得上，否则配了 5 分钟的绑定
+    // 要多挂好几分钟才真正删掉。两条 DELETE 都走 last_seen_at 索引，没有到期行时只是一次
+    // 索引探查，一分钟一次压不到锁。选号侧已按保留期自己过滤，所以这个间隔只影响行什么时候
+    // 真正删掉，不影响任何判定——跑得晚一点选出来的号完全一样。
     // 首个 tick 立即触发，兼作启动清理；同样走 spawn_blocking 不占异步线程。
     {
         let store = state.store.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;

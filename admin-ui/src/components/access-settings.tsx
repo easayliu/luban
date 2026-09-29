@@ -74,6 +74,13 @@ import {
   NumberFieldIncrement,
   NumberFieldInput,
 } from '@/components/ui/number-field'
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
@@ -524,21 +531,109 @@ export function SecuritySettingsContent() {
   )
 }
 
+const SECS_PER_MINUTE = 60
 const SECS_PER_HOUR = 3600
+const SECS_PER_DAY = 86400
 
-/** 秒 → 小时，保留足以原样还原秒数的最短小数位。 */
-function toHours(secs: number): number {
-  const exact = secs / SECS_PER_HOUR
+/**
+ * 秒 → 以 `size` 秒为单位的数值，取能**原样还原**的最短小数位。
+ *
+ * 604800 按天给 7、43200 按天给 0.5；而除不尽的（只可能来自接口直接改的库）任何短写法都
+ * 还原不回去，就照实给完整小数——宁可难看，也不能让用户一按保存就把一个自己没动过的值
+ * 悄悄改掉。
+ */
+function secsIn(secs: number, size: number): number {
+  const exact = secs / size
   for (const digits of [0, 1, 2, 3]) {
     const rounded = Number(exact.toFixed(digits))
-    if (Math.round(rounded * SECS_PER_HOUR) === secs) return rounded
+    if (Math.round(rounded * size) === secs) return rounded
   }
   return exact
 }
 
-/** 小时 → 秒；空值与负数按 0 = 不自动释放。 */
-function hoursToSecs(hours: number | null): number {
-  return Math.max(0, Math.round((hours ?? 0) * SECS_PER_HOUR))
+type DurationUnit = 'minute' | 'hour' | 'day'
+
+const UNIT_SECS: Record<DurationUnit, number> = {
+  minute: SECS_PER_MINUTE,
+  hour: SECS_PER_HOUR,
+  day: SECS_PER_DAY,
+}
+
+/**
+ * 秒 → 输入框里的「数值 + 单位」：取能整除的最大单位（3600 显示成 1 小时、1800 显示成
+ * 30 分钟）；连分钟都除不尽的落到分钟带小数。0 没有「合适的单位」，用这一项惯常的量级。
+ */
+function splitDuration(secs: number, fallback: DurationUnit): { value: number; unit: DurationUnit } {
+  if (secs <= 0) return { value: 0, unit: fallback }
+  const unit = (['day', 'hour', 'minute'] as const).find((u) => secs % UNIT_SECS[u] === 0) ?? 'minute'
+  return { value: secsIn(secs, UNIT_SECS[unit]), unit }
+}
+
+/** 「数值 + 单位」→ 秒；空值与负数按 0。 */
+function joinDuration(value: number | null, unit: DurationUnit): number {
+  return Math.max(0, Math.round((value ?? 0) * UNIT_SECS[unit]))
+}
+
+/**
+ * 带单位切换的时长输入：数值框 + 分钟 / 小时 / 天。切换单位只换单位、不换算数值
+ * （30 分钟切到小时就是 30 小时），旁边的读数徽章会跟着显示换算后的时长。
+ * `label` 传当前语言下的名称，英文用小写开头，会拼进「减少 / 增加」的读屏标签里。
+ */
+function DurationField({
+  label,
+  value,
+  unit,
+  onValueChange,
+  onUnitChange,
+}: {
+  label: string
+  value: number | null
+  unit: DurationUnit
+  onValueChange: (value: number | null) => void
+  onUnitChange: (unit: DurationUnit) => void
+}) {
+  const { t } = useI18n()
+  const units: { value: DurationUnit; label: string }[] = [
+    { value: 'minute', label: t('分钟', 'Minutes') },
+    { value: 'hour', label: t('小时', 'Hours') },
+    { value: 'day', label: t('天', 'Days') },
+  ]
+
+  return (
+    <>
+      <NumberField
+        className="min-w-0 flex-1 sm:w-32 sm:flex-none"
+        min={0}
+        step={1}
+        smallStep={0.5}
+        value={value}
+        onValueChange={onValueChange}
+      >
+        <NumberFieldGroup>
+          <NumberFieldDecrement aria-label={t(`减少${label}`, `Decrease ${label}`)} />
+          <NumberFieldInput aria-label={label} />
+          <NumberFieldIncrement aria-label={t(`增加${label}`, `Increase ${label}`)} />
+        </NumberFieldGroup>
+      </NumberField>
+      <Select
+        items={units}
+        value={unit}
+        onValueChange={(next) => {
+          if (next) onUnitChange(next)
+        }}
+      >
+        <SelectTrigger className="w-auto min-w-20 shrink-0" aria-label={t(`${label}单位`, `${label} unit`)}>
+          <SelectValue />
+        </SelectTrigger>
+        {/* 默认的 alignItemWithTrigger 会把选中项叠到触发框上，弹层整块盖住左边的数值框；这里改成在下方展开。 */}
+        <SelectPopup alignItemWithTrigger={false}>
+          {units.map((u) => (
+            <SelectItem key={u.value} value={u.value}>{u.label}</SelectItem>
+          ))}
+        </SelectPopup>
+      </Select>
+    </>
+  )
 }
 
 /** 设备绑定有效期：设备超过该时长无请求即释放名额（绑定本身按保留期留着）。0 = 永不过期。 */
@@ -547,9 +642,13 @@ function DeviceBindingTtl() {
   const { language, t } = useI18n()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const [draft, setDraft] = useState<number | null>(null)
+  const [unit, setUnit] = useState<DurationUnit>('hour')
 
   useEffect(() => {
-    if (data) setDraft(toHours(data.device_binding_ttl_secs))
+    if (!data) return
+    const d = splitDuration(data.device_binding_ttl_secs, 'hour')
+    setDraft(d.value)
+    setUnit(d.unit)
   }, [data?.device_binding_ttl_secs])
 
   const save = useMutation({
@@ -573,7 +672,7 @@ function DeviceBindingTtl() {
   })
 
   const current = data?.device_binding_ttl_secs ?? 0
-  const parsed = hoursToSecs(draft)
+  const parsed = joinDuration(draft, unit)
   const hint = parsed > 0
     ? t(
         `闲置 ${formatDuration(parsed, language)} 后释放名额`,
@@ -590,26 +689,13 @@ function DeviceBindingTtl() {
       )}
       note={<Badge variant="secondary" size="sm">{hint}</Badge>}
     >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        step={1}
-        smallStep={0.5}
+      <DurationField
+        label={t('活跃名额有效期', 'active slot lifetime')}
         value={draft}
+        unit={unit}
         onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement
-            aria-label={t('减少活跃名额有效期', 'Decrease active slot lifetime')}
-          />
-          <NumberFieldInput
-            aria-label={t('活跃名额有效期（小时）', 'Active slot lifetime in hours')}
-          />
-          <NumberFieldIncrement
-            aria-label={t('增加活跃名额有效期', 'Increase active slot lifetime')}
-          />
-        </NumberFieldGroup>
-      </NumberField>
+        onUnitChange={setUnit}
+      />
       <Button
         loading={save.isPending}
         disabled={draft === null || parsed === current}
@@ -622,29 +708,6 @@ function DeviceBindingTtl() {
   )
 }
 
-const SECS_PER_DAY = 86400
-
-/**
- * 秒 → 天，取能**原样还原**的最短小数位。
- *
- * 604800 给 7、43200 给 0.5；而 3600 这种不是整天数的（只可能来自接口直接改的库）
- * 任何短写法都还原不回去，就照实给完整小数——宁可难看，也不能让用户一按保存就把
- * 一个自己没动过的值悄悄改掉。
- */
-function toDays(secs: number): number {
-  const exact = secs / SECS_PER_DAY
-  for (const digits of [0, 1, 2, 3]) {
-    const rounded = Number(exact.toFixed(digits))
-    if (Math.round(rounded * SECS_PER_DAY) === secs) return rounded
-  }
-  return exact
-}
-
-/** 天 → 秒（接口收的单位）；空值与负数一律按 0 = 永久保留。 */
-function toSecs(days: number | null): number {
-  return Math.max(0, Math.round((days ?? 0) * SECS_PER_DAY))
-}
-
 /**
  * 软绑定保留期：绑定超过有效期后不再占名额，但在这段时间内设备再来仍优先回原账号
  * （原账号还得有空位）。0 = 永久保留。
@@ -653,12 +716,16 @@ function DeviceBindingRetention() {
   const qc = useQueryClient()
   const { language, t } = useI18n()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  // 按天填：保留期是「几天几周」这个量级的，写成 604800 秒没人一眼看得出来。
-  // 接口仍收秒，天数只是这一格的输入单位（允许小数，0.5 天 = 12 小时）。
+  // 默认按天填：保留期通常是「几天几周」这个量级；要调到分钟级（比如设备频繁换号、希望
+  // 绑定尽快清掉）就切单位。接口仍收秒，单位只是这一格的输入方式。
   const [draft, setDraft] = useState<number | null>(null)
+  const [unit, setUnit] = useState<DurationUnit>('day')
 
   useEffect(() => {
-    if (data) setDraft(toDays(data.device_binding_retention_secs))
+    if (!data) return
+    const d = splitDuration(data.device_binding_retention_secs, 'day')
+    setDraft(d.value)
+    setUnit(d.unit)
   }, [data?.device_binding_retention_secs])
 
   const save = useMutation({
@@ -683,7 +750,7 @@ function DeviceBindingRetention() {
 
   const current = data?.device_binding_retention_secs ?? 0
   const ttl = data?.device_binding_ttl_secs ?? 0
-  const parsed = toSecs(draft)
+  const parsed = joinDuration(draft, unit)
   const hint = parsed > 0
     ? t(
         `优先使用原账号：${formatDuration(parsed, language)}`,
@@ -707,26 +774,13 @@ function DeviceBindingRetention() {
           )}
       note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
     >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        step={1}
-        smallStep={0.5}
+      <DurationField
+        label={t('原账号关联保留期', 'account affinity retention')}
         value={draft}
+        unit={unit}
         onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement
-            aria-label={t('减少原账号关联保留期', 'Decrease account affinity retention')}
-          />
-          <NumberFieldInput
-            aria-label={t('原账号关联保留期（天）', 'Account affinity retention in days')}
-          />
-          <NumberFieldIncrement
-            aria-label={t('增加原账号关联保留期', 'Increase account affinity retention')}
-          />
-        </NumberFieldGroup>
-      </NumberField>
+        onUnitChange={setUnit}
+      />
       <Button
         loading={save.isPending}
         disabled={draft === null || parsed === current}
@@ -748,9 +802,13 @@ function SessionBindingTtl() {
   const { language, t } = useI18n()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const [draft, setDraft] = useState<number | null>(null)
+  const [unit, setUnit] = useState<DurationUnit>('minute')
 
   useEffect(() => {
-    if (data) setDraft(toHours(data.session_binding_ttl_secs))
+    if (!data) return
+    const d = splitDuration(data.session_binding_ttl_secs, 'minute')
+    setDraft(d.value)
+    setUnit(d.unit)
   }, [data?.session_binding_ttl_secs])
 
   const save = useMutation({
@@ -774,7 +832,7 @@ function SessionBindingTtl() {
   })
 
   const current = data?.session_binding_ttl_secs ?? 0
-  const parsed = hoursToSecs(draft)
+  const parsed = joinDuration(draft, unit)
   const hint = parsed > 0
     ? t(
         `对话闲置 ${formatDuration(parsed, language)} 后释放槽位`,
@@ -793,20 +851,13 @@ function SessionBindingTtl() {
       }
       note={<Badge variant="secondary" size="sm">{hint}</Badge>}
     >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        step={1}
-        smallStep={0.25}
+      <DurationField
+        label={t('模拟会话有效期', 'simulated session lifetime')}
         value={draft}
+        unit={unit}
         onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少模拟会话有效期', 'Decrease simulated session lifetime')} />
-          <NumberFieldInput aria-label={t('模拟会话有效期（小时）', 'Simulated session lifetime in hours')} />
-          <NumberFieldIncrement aria-label={t('增加模拟会话有效期', 'Increase simulated session lifetime')} />
-        </NumberFieldGroup>
-      </NumberField>
+        onUnitChange={setUnit}
+      />
       <Button
         loading={save.isPending}
         disabled={draft === null || parsed === current}
@@ -825,9 +876,13 @@ function SessionBindingRetention() {
   const { language, t } = useI18n()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const [draft, setDraft] = useState<number | null>(null)
+  const [unit, setUnit] = useState<DurationUnit>('day')
 
   useEffect(() => {
-    if (data) setDraft(toDays(data.session_binding_retention_secs))
+    if (!data) return
+    const d = splitDuration(data.session_binding_retention_secs, 'day')
+    setDraft(d.value)
+    setUnit(d.unit)
   }, [data?.session_binding_retention_secs])
 
   const save = useMutation({
@@ -852,7 +907,7 @@ function SessionBindingRetention() {
 
   const current = data?.session_binding_retention_secs ?? 0
   const ttl = data?.session_binding_ttl_secs ?? 0
-  const parsed = toSecs(draft)
+  const parsed = joinDuration(draft, unit)
   const hint = parsed > 0
     ? t(
         `优先使用原账号：${formatDuration(parsed, language)}`,
@@ -875,20 +930,13 @@ function SessionBindingRetention() {
           )}
       note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
     >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        step={1}
-        smallStep={0.5}
+      <DurationField
+        label={t('模拟会话原账号关联保留期', 'simulated session affinity retention')}
         value={draft}
+        unit={unit}
         onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少模拟会话原账号关联保留期','Decrease simulated session affinity retention')} />
-          <NumberFieldInput aria-label={t('模拟会话原账号关联保留期（天）','Simulated session affinity retention in days')} />
-          <NumberFieldIncrement aria-label={t('增加模拟会话原账号关联保留期','Increase simulated session affinity retention')} />
-        </NumberFieldGroup>
-      </NumberField>
+        onUnitChange={setUnit}
+      />
       <Button
         loading={save.isPending}
         disabled={draft === null || parsed === current}
