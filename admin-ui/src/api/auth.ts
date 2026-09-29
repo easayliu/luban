@@ -5,7 +5,7 @@ export interface AuthState {
   configured: boolean
   /** 是否由环境变量接管（true = 网页不可改）。 */
   env_managed: boolean
-  /** 未设密码且不是本机访问：须先用启动日志里的初始化口令设置管理密码。 */
+  /** 未设密码：须先用启动日志里的初始化口令设置管理密码（本机访问也一样）。 */
   setup_required: boolean
 }
 
@@ -20,9 +20,9 @@ export async function login(password: string): Promise<void> {
   await api.post('/auth/login', { password })
 }
 
-/** 首次设置管理密码。非本机访问须带启动日志里的初始化口令（token）。 */
-export async function setup(password: string, token?: string): Promise<void> {
-  await api.post('/auth/setup', token ? { password, token } : { password })
+/** 首次设置管理密码，须带启动日志里的初始化口令（token）。 */
+export async function setup(password: string, token: string): Promise<void> {
+  await api.post('/auth/setup', { password, token })
 }
 
 /** 修改/清除管理密码（空串=清除，已鉴权）。 */

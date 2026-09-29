@@ -105,7 +105,7 @@ ${BOLD}${GREEN}✓ luban 安装完成${RESET}
 
 后续步骤（浏览器打开上面的网页）:
   1. 首次打开需设置管理密码，页面要求的「初始化口令」见日志：
-     ${BOLD}docker compose logs luban | grep setup_token${RESET}
+     ${BOLD}docker logs luban 2>&1 | grep setup_token${RESET}
   2. 「添加账号」用 Claude 订阅账号授权登录（可加多个）
   3. 「接入设置」生成/填写接入 Key（或用 LUBAN_API_KEY 环境变量）
 

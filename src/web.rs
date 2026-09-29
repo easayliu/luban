@@ -53,8 +53,8 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
-    /// 首次设置管理密码的一次性口令：每次启动随机生成，未设密码时打进日志。未设密码的
-    /// 远程来访（含 Docker 端口映射）要带上它才能设密码，见 [`auth::setup`]。
+    /// 首次设置管理密码的初始化口令：每次启动随机生成、重启前不变，未设密码时打进日志。
+    /// 设密码必须带上它，本机也一样，见 [`auth::setup`]。
     pub setup_token: Arc<String>,
     /// 上游拒过的请求形态记忆表，用来在本地拦掉上游已经拒过一次的「模型 + 取值」组合
     /// （`effort: 'xhigh'`、`role: 'system'` 之类），不再白发一次。写穿落库、启动回填、
@@ -672,9 +672,16 @@ pub async fn run(
     }
     if let Some(token) = &setup_token {
         auth::log_setup_token(token);
+        tracing::info!("or open {url}#setup_token={token} to have it filled in");
     }
     if open_browser {
-        open_in_browser(&url);
+        // 还没设密码：口令带在 `#` 后面，初始化页自动填好，本机开箱不用去翻日志。片段不会
+        // 发给服务端，进不了访问日志；页面读完就把它从地址栏抹掉。
+        let open_url = match &setup_token {
+            Some(token) => format!("{url}#setup_token={token}"),
+            None => url.clone(),
+        };
+        open_in_browser(&open_url);
         tracing::info!(url = %url, "tried to open the browser; if nothing appeared, open the url manually");
     }
 
@@ -3959,8 +3966,8 @@ const EXPORT_VERSION: u32 = 1;
 /// 导出全部账号与设置，供迁移到另一台机器。
 ///
 /// **未设管理密码时拒绝**：这个口子返回的是明文 access/refresh token，等于把全部账号交出去。
-/// 未设密码时管理接口虽然只对本机开放（见 [`auth::require_admin`]），本机上别的进程照样
-/// 能调；其余管理接口顶多是改配置，这条不一样，所以它自己再确认一次门锁着。
+/// 未设密码时 [`auth::require_admin`] 已经拦下所有管理接口，这里是兜底：其余管理接口顶多
+/// 是改配置，这条不一样，所以它自己再确认一次门锁着。
 async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
     if !auth::admin_configured(&state) {
         return Err((

@@ -36,7 +36,8 @@ struct Cli {
     #[arg(long, env = "LUBAN_API_KEY")]
     api_key: Option<String>,
     /// Admin console password; also available through LUBAN_ADMIN_PASSWORD.
-    /// Once set, admin APIs require authentication. A CLI or environment value takes precedence and makes the web setting read-only.
+    /// Admin APIs reject every request until a password is set, either here or in the console with the setup token printed in the log.
+    /// A CLI or environment value takes precedence and makes the web setting read-only.
     #[arg(long, env = "LUBAN_ADMIN_PASSWORD")]
     admin_password: Option<String>,
     /// Open a browser after startup (off by default).

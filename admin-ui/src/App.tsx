@@ -307,7 +307,7 @@ function App() {
   }, [pw])
 
   const needLogin = authState?.configured && !pw
-  // 未设密码、又不是本机打开的控制台（Docker 端口映射、局域网）：先用启动日志里的初始化口令设密码。
+  // 未设密码：管理接口一律拒绝（本机也一样），先用启动日志里的初始化口令设密码。
   const needSetup = !!authState?.setup_required
   const needAuth = needLogin || needSetup
 

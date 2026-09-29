@@ -4,10 +4,16 @@
 //! 环境接管。设置后 `/api/*` 管理接口需带 `Authorization: Bearer <password>`。
 //! 转发代理 `/v1/*` 不走这里。
 //!
-//! **未设密码时只对本机免密**（判定见 [`is_local_request`]）。默认监听 `0.0.0.0`、Docker 也把
-//! 端口发布到所有网卡，此前未设密码等于管理面对网络匿名敞开：谁先连上谁就能设密码、导出全部
-//! 明文 token。远程来访要先设密码，而设密码得带启动日志里打印的一次性初始化口令
-//! （[`AppState::setup_token`]），证明来人能看到这台服务的日志。
+//! **未设密码时管理接口一律拒绝**，本机也不例外。默认监听 `0.0.0.0`、Docker 也把端口发布到
+//! 所有网卡，此前未设密码等于管理面对网络匿名敞开：谁先连上谁就能设密码、导出全部明文 token。
+//! 现在要先设密码，而设密码得带启动日志里打印的初始化口令（[`AppState::setup_token`]），
+//! 证明来人能看到这台服务的日志。
+//!
+//! 不给本机开免密口子：服务端分不出「本机浏览器」和「同机反代转进来的外部请求」。nginx 默认
+//! 把 `Host` 改写成 `proxy_pass` 的地址（`$proxy_host`），`proxy_pass http://127.0.0.1:4600`
+//! 转进来的请求对端与 `Host` 都是回环，按对端 + `Host` 判本机的话，公网上的人经反代就能免密
+//! 进来、不带口令抢先设密码。本机用起来的补偿：`--open` 打开浏览器时把口令带在地址的
+//! `#setup_token=` 里，初始化页自动填好。
 
 use axum::{
     Json,
@@ -41,9 +47,9 @@ fn admin_hash(state: &AppState) -> Option<String> {
 
 /// 是否已启用管理鉴权（环境接管或库里存了哈希）。
 ///
-/// 给那些「开着鉴权才允许」的接口用：管理接口在未设密码时是**完全敞开**的
-/// （见 [`require_admin`]），而个别接口给出去的东西比「能改配置」更重
-/// （如导出含明文 token 的迁移文件），它们得自己确认这道门锁着。
+/// 给那些「开着鉴权才允许」的接口用。未设密码时 [`require_admin`] 已经一律拒绝，这层是
+/// 兜底：个别接口给出去的东西比「能改配置」更重（如导出含明文 token 的迁移文件），不把
+/// 安全全押在中间件的装配上，它们自己再确认一次这道门锁着。
 pub fn admin_configured(state: &AppState) -> bool {
     admin_hash(state).is_some()
 }
@@ -72,69 +78,17 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// 这条请求是不是**本机浏览器直接打开的控制台**：TCP 对端是回环地址，且 `Host` 是
-/// `localhost` 或回环 IP。未设密码时只有这类请求免密。
-///
-/// 两个条件缺一不可：
-/// - 对端地址挡的是网络上的其它机器。只认 TCP 对端，不看 `x-forwarded-for`——那是来访自己
-///   填的。Docker 端口映射进来的请求对端是网桥网关（如 `172.17.0.1`），不算本机，这是有意的：
-///   宿主机外面的人同样经这条路进来，分不出来。
-/// - `Host` 挡的是 **DNS rebinding**：管理员浏览器里的恶意网页把自己的域名重新解析到
-///   127.0.0.1，请求的对端就是回环，页面与控制台还同源，能读写全部接口。这种请求的 `Host`
-///   必然是攻击者的域名，回环 IP 字面量与 `localhost` 它伪造不出来。同机反代（nginx 转到
-///   127.0.0.1）带的是对外域名，同样不算本机——反代后面的人本来就可能来自网络。
-pub(crate) fn is_local_request(
-    peer: Option<std::net::SocketAddr>,
-    headers: &header::HeaderMap,
-) -> bool {
-    let Some(peer) = peer else { return false };
-    if !peer.ip().to_canonical().is_loopback() {
-        return false;
-    }
-    headers.get(header::HOST).and_then(|v| v.to_str().ok()).is_some_and(host_is_loopback)
-}
-
-/// `Host` 头（可带端口）是不是 `localhost`、`*.localhost` 或回环 IP 字面量。
-fn host_is_loopback(host: &str) -> bool {
-    let host = host.trim();
-    let name = if let Some(rest) = host.strip_prefix('[') {
-        // IPv6 字面量：`[::1]` 或 `[::1]:4600`。
-        match rest.split_once(']') {
-            Some((ip, _)) => ip,
-            None => return false,
-        }
-    } else {
-        match host.rsplit_once(':') {
-            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
-            _ => host,
-        }
-    };
-    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
-        return ip.to_canonical().is_loopback();
-    }
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    name == "localhost" || name.ends_with(".localhost")
-}
-
-/// 从中间件拿到的请求里取 TCP 对端（`into_make_service_with_connect_info` 放进扩展的）。
-fn peer_of(req: &Request) -> Option<std::net::SocketAddr> {
-    req.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0)
-}
-
-/// 未设密码的远程来访被拒时回的文案，前端据此切到「初始化管理密码」页。
+/// 未设密码时管理接口回的文案，前端据此切到「初始化管理密码」页。
 const SETUP_REQUIRED: &str =
-    "set an admin password first: remote access requires the setup token from the server log";
+    "set an admin password first, using the setup token from the server log";
 
-/// 中间件：已设密码时校验 `Authorization: Bearer <password>`；未设时只放行本机来访
-/// （[`is_local_request`]），其余一律 401。
+/// 中间件：已设密码时校验 `Authorization: Bearer <password>`；未设时一律 401（本机也不
+/// 放行，原因见模块说明）。
 ///
-/// 回 401 而不是 403：前端的拦截器见 401 就重新拉一次鉴权状态，未设密码的远程来访由此
-/// 落到初始化页，不必再为这一种情况单写一条分支。
+/// 回 401 而不是 403：前端的拦截器见 401 就重新拉一次鉴权状态，未设密码的来访由此落到
+/// 初始化页，不必再为这一种情况单写一条分支。
 pub async fn require_admin(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(hash) = admin_hash(&state) else {
-        if is_local_request(peer_of(&req), req.headers()) {
-            return next.run(req).await;
-        }
         return (StatusCode::UNAUTHORIZED, SETUP_REQUIRED).into_response();
     };
     let ok = req
@@ -162,21 +116,18 @@ pub struct StateResp {
     configured: bool,
     /// 是否由环境变量接管（true = 网页不可改）。
     env_managed: bool,
-    /// 未设密码、且这条请求不是本机来访：要先用初始化口令设密码才能进控制台。
+    /// 未设密码：要先用初始化口令设密码才能进控制台。恒等于 `!configured`，单列一个字段
+    /// 是让前端不必自己推这层语义。
     setup_required: bool,
 }
 
 /// 鉴权状态（公开）。
-pub async fn state(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: header::HeaderMap,
-) -> Json<StateResp> {
+pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
     let configured = admin_hash(&state).is_some();
     Json(StateResp {
         configured,
         env_managed: state.admin_env.is_some(),
-        setup_required: !configured && !is_local_request(Some(peer), &headers),
+        setup_required: !configured,
     })
 }
 
@@ -188,7 +139,7 @@ pub struct PwReq {
 #[derive(Deserialize)]
 pub struct SetupReq {
     password: String,
-    /// 启动日志里的初始化口令；本机来访可不带。
+    /// 启动日志里的初始化口令。
     #[serde(default)]
     token: Option<String>,
 }
@@ -205,13 +156,15 @@ pub(crate) fn new_setup_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 未设密码时把初始化口令打进日志：远程来访设密码只能靠它。启动时与清除密码后各打一次。
+/// 未设密码时把初始化口令打进日志：设密码只能靠它。启动时与清除密码后各打一次。
+///
+/// 口令每次启动随机生成、重启前不变（不是用一次就作废）：它只在未设密码时起作用，设上密码
+/// 之后 `setup` 直接拒绝，用过的口令也就没有用处了。
 pub(crate) fn log_setup_token(token: &str) {
     tracing::warn!(
         setup_token = %token,
-        "no admin password is set: the console only accepts requests from this machine; \
-         to set a password from another machine (including through Docker port mapping), \
-         open the console and enter this setup token"
+        "no admin password is set: the console rejects every request until one is set; \
+         open the console and enter this setup token to set it"
     );
 }
 
@@ -272,8 +225,10 @@ pub async fn login(
     }
 }
 
-/// 首次设置密码（仅未配置时，公开）。本机来访直接设；其余须带启动日志里的初始化口令，
-/// 否则谁先连上端口谁就能把密码定下来、接管整个管理面。
+/// 首次设置密码（仅未配置时，公开）。须带启动日志里的初始化口令，否则谁先连上端口谁就能
+/// 把密码定下来、接管整个管理面。
+///
+/// 先判「已设过」再验口令：设过密码之后来的请求该看到的是「已设置」，而不是一句口令不对。
 pub async fn setup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -281,25 +236,22 @@ pub async fn setup(
     Json(req): Json<SetupReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ip = client_ip(&headers, peer);
-    let local = is_local_request(Some(peer), &headers);
-    if !local {
-        let given = req.token.as_deref().map(str::trim).unwrap_or("");
-        if !constant_time_eq(given.as_bytes(), state.setup_token.as_bytes()) {
-            tracing::warn!(%ip, "admin password setup rejected: invalid setup token");
-            return Err((StatusCode::FORBIDDEN, "invalid setup token".into()));
-        }
+    let _guard = SETUP_LOCK.lock();
+    if admin_hash(&state).is_some() {
+        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
+    }
+    let given = req.token.as_deref().map(str::trim).unwrap_or("");
+    if !constant_time_eq(given.as_bytes(), state.setup_token.as_bytes()) {
+        tracing::warn!(%ip, "admin password setup rejected: invalid setup token");
+        return Err((StatusCode::FORBIDDEN, "invalid setup token".into()));
     }
     let pw = req.password.trim();
     if pw.len() < 4 {
         return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
     }
-    let _guard = SETUP_LOCK.lock();
-    if admin_hash(&state).is_some() {
-        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
-    }
     state.store.set_setting(store::ADMIN_PASSWORD, &sha256_hex(pw)).map_err(internal)?;
     // 谁在什么时候把密码定下来的，比任何一项设置变更都更该留痕。
-    tracing::info!(%ip, local, "admin password set for the first time");
+    tracing::info!(%ip, "admin password set for the first time");
     Ok(ok_json())
 }
 
@@ -329,7 +281,7 @@ pub async fn change_password(
         "admin password changed"
     );
     if cleared {
-        // 清掉之后远程来访又得靠初始化口令，把它重新打出来，免得还要翻启动时那一行。
+        // 清掉之后又得靠初始化口令才能进来，把它重新打出来，免得还要翻启动时那一行。
         log_setup_token(&state.setup_token);
     }
     Ok(ok_json())
@@ -337,59 +289,13 @@ pub async fn change_password(
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, host_is_loopback, is_local_request, percent_decode};
+    use super::{constant_time_eq, percent_decode};
     use axum::http::{HeaderMap, HeaderValue, header};
 
     fn with_host(host: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(header::HOST, HeaderValue::from_str(host).unwrap());
         h
-    }
-
-    #[test]
-    fn loopback_hosts() {
-        for host in [
-            "localhost",
-            "localhost:4600",
-            "LOCALHOST.",
-            "app.localhost:1",
-            "127.0.0.1",
-            "127.0.0.1:4600",
-            "127.8.9.10",
-            "[::1]",
-            "[::1]:4600",
-            "[::ffff:127.0.0.1]:4600",
-        ] {
-            assert!(host_is_loopback(host), "{host} 应算本机");
-        }
-        for host in [
-            "evil.example",
-            "evil.example:4600",
-            "localhost.evil.example",
-            "192.168.1.5:4600",
-            "0.0.0.0",
-            "[::]",
-            "[::1",
-            "",
-            "luban.example.com",
-        ] {
-            assert!(!host_is_loopback(host), "{host} 不应算本机");
-        }
-    }
-
-    #[test]
-    fn local_request_needs_loopback_peer_and_host() {
-        let lo: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
-        let mapped: std::net::SocketAddr = "[::ffff:127.0.0.1]:50000".parse().unwrap();
-        let docker: std::net::SocketAddr = "172.17.0.1:50000".parse().unwrap();
-        assert!(is_local_request(Some(lo), &with_host("127.0.0.1:4600")));
-        assert!(is_local_request(Some(mapped), &with_host("localhost:4600")));
-        // DNS rebinding：对端是回环，Host 是攻击者的域名。
-        assert!(!is_local_request(Some(lo), &with_host("evil.example:4600")));
-        // Docker 端口映射 / 局域网：对端不是回环，Host 写什么都不算。
-        assert!(!is_local_request(Some(docker), &with_host("localhost:4600")));
-        assert!(!is_local_request(Some(lo), &HeaderMap::new()), "没有 Host 不算本机");
-        assert!(!is_local_request(None, &with_host("localhost")), "拿不到对端不算本机");
     }
 
     fn test_state() -> crate::web::AppState {
@@ -419,70 +325,74 @@ mod tests {
         app.oneshot(req).await.unwrap().status()
     }
 
+    /// 未设密码一律拒，本机也不放行——同机 nginx 默认把 `Host` 改写成 `127.0.0.1:4600`，
+    /// 转进来的外部请求与本机直连长得一模一样。
     #[tokio::test]
-    async fn unset_password_only_admits_local_requests() {
+    async fn unset_password_rejects_every_request() {
         use axum::http::StatusCode;
         let state = test_state();
-        let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", None).await;
-        assert_eq!(local, StatusCode::OK, "本机直连免密");
-        let docker = protected_status(&state, "172.17.0.1:5000", "localhost:4600", None).await;
-        assert_eq!(docker, StatusCode::UNAUTHORIZED, "Docker 端口映射 / 局域网要先设密码");
-        let rebinding = protected_status(&state, "127.0.0.1:5000", "evil.example:4600", None).await;
-        assert_eq!(rebinding, StatusCode::UNAUTHORIZED, "DNS rebinding 不算本机");
+        for (peer, host) in [
+            ("127.0.0.1:5000", "127.0.0.1:4600"),
+            ("[::1]:5000", "localhost:4600"),
+            ("172.17.0.1:5000", "luban.example"),
+        ] {
+            let status = protected_status(&state, peer, host, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{peer} / {host}");
+        }
 
-        // 设了密码之后本机也要带密码，带对了远程也能进。
+        // 设了密码之后带对了才能进，本机远程一个口径。
         state
             .store
             .set_setting(crate::store::ADMIN_PASSWORD, &super::sha256_hex("pw1234"))
             .unwrap();
         let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", None).await;
         assert_eq!(local, StatusCode::UNAUTHORIZED);
+        let local =
+            protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", Some("pw1234")).await;
+        assert_eq!(local, StatusCode::OK);
         let remote =
             protected_status(&state, "172.17.0.1:5000", "luban.example", Some("pw1234")).await;
         assert_eq!(remote, StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn remote_setup_requires_the_token() {
+    async fn setup_requires_the_token_even_from_loopback() {
         use axum::{
             Json,
             extract::{ConnectInfo, State},
+            http::StatusCode,
         };
         let state = test_state();
-        let remote: std::net::SocketAddr = "172.17.0.1:5000".parse().unwrap();
-        let setup = |token: Option<&str>| {
+        let setup = |peer: &str, token: Option<&str>, password: &str| {
             super::setup(
                 State(state.clone()),
-                ConnectInfo(remote),
-                with_host("luban.example:4600"),
-                Json(super::SetupReq { password: "pw1234".into(), token: token.map(Into::into) }),
+                ConnectInfo(peer.parse().unwrap()),
+                with_host("127.0.0.1:4600"),
+                Json(super::SetupReq { password: password.into(), token: token.map(Into::into) }),
             )
         };
-        assert_eq!(setup(None).await.unwrap_err().0, axum::http::StatusCode::FORBIDDEN);
-        assert_eq!(setup(Some("wrong")).await.unwrap_err().0, axum::http::StatusCode::FORBIDDEN);
-        assert!(!super::admin_configured(&state), "口令不对不能落库");
-        setup(Some(state.setup_token.as_str())).await.expect("带对口令应能设密码");
-        assert!(super::admin_configured(&state));
-        let again = setup(Some(state.setup_token.as_str())).await.unwrap_err();
-        assert_eq!(again.0, axum::http::StatusCode::BAD_REQUEST, "设过之后不能再用 setup 覆盖");
-    }
+        let lo = "127.0.0.1:5000";
+        assert_eq!(setup(lo, None, "pw1234").await.unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(setup(lo, Some("wrong"), "pw1234").await.unwrap_err().0, StatusCode::FORBIDDEN);
+        let token = state.setup_token.to_string();
+        assert_eq!(
+            setup(lo, Some(&token), "pw").await.unwrap_err().0,
+            StatusCode::BAD_REQUEST,
+            "口令对、密码太短"
+        );
+        assert!(!super::admin_configured(&state), "失败的请求不能落库");
 
-    #[tokio::test]
-    async fn local_setup_needs_no_token() {
-        use axum::{
-            Json,
-            extract::{ConnectInfo, State},
-        };
-        let state = test_state();
-        super::setup(
-            State(state.clone()),
-            ConnectInfo("127.0.0.1:5000".parse().unwrap()),
-            with_host("localhost:4600"),
-            Json(super::SetupReq { password: "pw1234".into(), token: None }),
-        )
-        .await
-        .expect("本机来访设密码不需要口令");
+        let _ = setup("172.17.0.1:5000", Some(&format!(" {token} ")), "pw1234")
+            .await
+            .expect("带对口令应能设密码（首尾空白忽略）");
         assert!(super::admin_configured(&state));
+
+        // 设过之后：带不带口令都回「已设置」，而不是一句口令不对。
+        for t in [None, Some(token.as_str())] {
+            let again = setup(lo, t, "pw5678").await.unwrap_err();
+            assert_eq!(again.0, StatusCode::BAD_REQUEST, "设过之后不能再用 setup 覆盖");
+            assert_eq!(again.1, "an admin password is already set");
+        }
     }
 
     #[test]

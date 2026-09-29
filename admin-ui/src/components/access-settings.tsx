@@ -37,7 +37,7 @@ import {
   setSessionTtl,
   type Settings,
 } from '@/api/settings'
-import { changePassword, getAuthState, setup as setupPassword } from '@/api/auth'
+import { changePassword, getAuthState } from '@/api/auth'
 import { clearPw, setPw } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
 import { copyText, extractError, formatDuration } from '@/lib/utils'
@@ -1843,7 +1843,12 @@ function BareRateLimit() {
   )
 }
 
-/** 管理密码：未设置→设置；已设置→修改/清除（环境接管时只读）。 */
+/**
+ * 管理密码：修改/清除（环境接管时只读）。
+ *
+ * 没有「首次设置」这一支：未设密码时管理接口一律拒绝，进不到设置页，首次设置只在初始化页
+ * （`SetupPage`）做，且要带启动日志里的初始化口令。
+ */
 function AdminPassword() {
   const { language, t } = useI18n()
   const authQuery = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
@@ -1852,10 +1857,7 @@ function AdminPassword() {
   const [clearOpen, setClearOpen] = useState(false)
 
   const save = useMutation({
-    mutationFn: async (nextPassword: string) => {
-      if (data?.configured) await changePassword(nextPassword)
-      else await setupPassword(nextPassword)
-    },
+    mutationFn: changePassword,
     onSuccess: (_result, nextPassword) => {
       setClearOpen(false)
       if (nextPassword) {
@@ -1869,7 +1871,10 @@ function AdminPassword() {
         clearPw()
         toastManager.add({
           title: t('管理密码已清除', 'Admin password cleared'),
-          description: t('控制台将不再要求登录。', 'The console will no longer require sign-in.'),
+          description: t(
+            '控制台已停用，须使用服务日志中的初始化口令重新设置密码。',
+            'The console is locked until a new password is set with the setup token from the server log.',
+          ),
           type: 'success',
         })
       }
@@ -1885,7 +1890,6 @@ function AdminPassword() {
   })
 
   const envManaged = data?.env_managed ?? false
-  const configured = data?.configured ?? false
 
   if (authQuery.isPending) {
     return (
@@ -1934,13 +1938,9 @@ function AdminPassword() {
           <>
             <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
               <Input
-                aria-label={configured
-                  ? t('新管理密码', 'New admin password')
-                  : t('管理密码', 'Admin password')}
+                aria-label={t('新管理密码', 'New admin password')}
                 onChange={(event) => setPassword(event.target.value)}
-                placeholder={configured
-                  ? t('输入新密码', 'Enter a new password')
-                  : t('至少 4 位', 'At least 4 characters')}
+                placeholder={t('输入新密码', 'Enter a new password')}
                 type="password"
                 value={password}
               />
@@ -1951,28 +1951,18 @@ function AdminPassword() {
                 onClick={() => save.mutate(password.trim())}
               >
                 <KeyRoundIcon />
-                {configured ? t('修改', 'Change') : t('设置', 'Set')}
+                {t('修改', 'Change')}
               </Button>
-              {configured && (
-                <Button
-                  size="sm"
-                  variant="destructive-outline"
-                  disabled={save.isPending}
-                  onClick={() => setClearOpen(true)}
-                >
-                  <Trash2Icon />
-                  {t('清除', 'Clear')}
-                </Button>
-              )}
+              <Button
+                size="sm"
+                variant="destructive-outline"
+                disabled={save.isPending}
+                onClick={() => setClearOpen(true)}
+              >
+                <Trash2Icon />
+                {t('清除', 'Clear')}
+              </Button>
             </div>
-            {!configured && (
-              <FieldDescription>
-                {t(
-                  '未设置密码时，任何能访问控制台的设备均可直接进入；控制台对外开放时，建议设置密码。',
-                  'Without a password, any device that can reach the console can access it without signing in. Set one if the console is publicly accessible.',
-                )}
-              </FieldDescription>
-            )}
           </>
         )}
       </Field>
@@ -1988,8 +1978,8 @@ function AdminPassword() {
             <AlertDialogTitle>{t('清除管理密码', 'Clear admin password')}</AlertDialogTitle>
             <AlertDialogDescription>
               {t(
-                '清除后，控制台将不再要求登录。',
-                'After clearing it, the console will no longer require sign-in.',
+                '清除后控制台立即停用，包括本机访问；须使用服务日志中的初始化口令重新设置密码后才能再次进入。',
+                'After clearing it, the console is locked for everyone, including this machine, until a new password is set with the setup token from the server log.',
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>

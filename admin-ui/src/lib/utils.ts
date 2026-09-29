@@ -41,7 +41,7 @@ const FIXED_BACKEND_MESSAGES: readonly LocalizedBackendMessage[] = [
   ['已设置管理密码', 'an admin password is already set'],
   ['密码至少 4 位', 'password must be at least 4 characters'],
   ['初始化口令不正确', 'invalid setup token'],
-  ['请先设置管理密码：非本机访问须使用服务日志中的初始化口令', 'set an admin password first: remote access requires the setup token from the server log'],
+  ['请先使用服务日志中的初始化口令设置管理密码', 'set an admin password first, using the setup token from the server log'],
   ['管理密码由环境变量接管，无法在网页修改', 'the admin password is managed by an environment variable and cannot be changed from the web UI', '管理密码由环境变量管理，无法在控制台修改'],
   ['凭证不存在', 'credential not found'],
   ['设备绑定不存在（可能已过期或已换到其它账号）', 'device binding not found (it may have expired or moved to another credential)', '设备绑定不存在（可能已过期或已转至其他账号）'],

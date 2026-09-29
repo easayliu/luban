@@ -21,15 +21,27 @@ import { useI18n } from '@/lib/i18n'
 /** 与后端 `auth::setup` 的下限一致。 */
 const MIN_PASSWORD_LENGTH = 4
 
+/** 地址栏里 `#setup_token=` 带来的初始化口令（`luban --open` 打开浏览器时附上的）。 */
+function tokenFromHash(): string {
+  return new URLSearchParams(window.location.hash.slice(1)).get('setup_token')?.trim() ?? ''
+}
+
 /**
- * 初始化管理密码页：未设密码、且不是本机打开控制台时展示（Docker 端口映射、局域网访问）。
+ * 初始化管理密码页：未设密码时展示，本机访问也一样。
  *
  * 这种情况下管理接口一律拒绝，设密码须带服务启动日志里的初始化口令——证明来人能看到这台
  * 服务的日志，而不是恰好先连上端口的陌生人。设置成功回调 onSuccess(password)。
  */
 export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void }) {
   const { t, language } = useI18n()
-  const [token, setToken] = useState('')
+  const [token, setToken] = useState(tokenFromHash)
+
+  // 口令读进输入框后就从地址栏抹掉：免得留在浏览历史里，或随截图、复制链接带出去。
+  useEffect(() => {
+    if (window.location.hash.includes('setup_token=')) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search)
+    }
+  }, [])
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
 
@@ -73,8 +85,8 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
             </CardTitle>
             <CardDescription>
               {t(
-                '尚未设置管理密码，非本机访问须先设置密码才能使用控制台。',
-                'No admin password is set. Set one before using the console from another machine.',
+                '尚未设置管理密码，须先设置密码才能使用控制台。',
+                'No admin password is set. Set one before using the console.',
               )}
             </CardDescription>
           </CardHeader>
@@ -91,7 +103,7 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
                 <Input
                   id="setup-token"
                   autoComplete="off"
-                  autoFocus
+                  autoFocus={!token}
                   className="font-mono"
                   onChange={(event) => setToken(event.target.value)}
                   spellCheck={false}
@@ -99,8 +111,8 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
                 />
                 <FieldDescription>
                   {t(
-                    '见服务启动日志中的 setup_token 一项；Docker 部署可执行 docker logs luban 查看。',
-                    'Find setup_token in the server startup log; for Docker, run docker logs luban.',
+                    '见服务启动日志中的 setup_token 一项；Docker 部署可执行 docker logs luban 2>&1 | grep setup_token 查看。',
+                    'Find setup_token in the server startup log; for Docker, run docker logs luban 2>&1 | grep setup_token.',
                   )}
                 </FieldDescription>
               </Field>
@@ -110,6 +122,7 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
                   <InputGroupInput
                     id="setup-password"
                     autoComplete="new-password"
+                    autoFocus={!!token}
                     aria-invalid={tooShort || doSetup.isError || undefined}
                     onChange={(event) => setPassword(event.target.value)}
                     type={show ? 'text' : 'password'}
