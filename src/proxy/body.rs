@@ -9,7 +9,8 @@ use crate::store;
 use super::ban::parse_upstream_error;
 use super::learned_rules::{DeprecatedFieldMemory, LEARNED_KIND_DEPRECATED, SHAPE_MEMORY_CAP};
 use super::session_link::{
-    CachePrefix, CcRequestKind, CcSessionKey, CcSessionLink, cache_prefix_stable,
+    CachePrefix, CcRequestKind, CcSessionKey, CcSessionLink, REPLY_TEXT_FP_INIT, ReplyFp,
+    ThreadDecision, ThreadMsg, cache_prefix_stable, reply_text_fp, thread_decision,
 };
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, Simulation, billing_header_text, cap_system_blocks, cc_profile_for,
@@ -194,6 +195,29 @@ pub(super) fn body_has_pair(body: &[u8], key: &[u8], value: &[u8]) -> bool {
     })
 }
 
+/// 体里有没有 `ttl:"1h"` 的缓存断点：只看 API 认 `cache_control` 的那几处——顶层、`system[]`、
+/// `tools[]`、`messages[].content[]` 各块，以及 `tool_result.content[]` 里的块。按字节扫
+/// `"ttl":"1h"` 会把工具入参（`tool_use.input.ttl`）或 schema 里的同名字段当成断点，平白补上
+/// `extended-cache-ttl`，而出站体里一个 1h 断点都没有。
+pub(crate) fn has_cache_ttl_1h(v: &serde_json::Value) -> bool {
+    let is_1h = |x: &serde_json::Value| {
+        x.get("cache_control").and_then(|c| c.get("ttl")).and_then(|t| t.as_str()) == Some("1h")
+    };
+    fn blocks(c: Option<&serde_json::Value>) -> impl Iterator<Item = &serde_json::Value> {
+        c.and_then(|c| c.as_array()).into_iter().flatten()
+    }
+    is_1h(v)
+        || blocks(v.get("system")).any(is_1h)
+        || blocks(v.get("tools")).any(is_1h)
+        || blocks(v.get("messages")).any(|m| {
+            blocks(m.get("content")).any(|b| {
+                is_1h(b)
+                    || (b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        && blocks(b.get("content")).any(is_1h))
+            })
+        })
+}
+
 /// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
 /// 请求体逐字节原样转发）：
 ///
@@ -347,7 +371,7 @@ pub(super) fn rewrite_body_out(
         && display_beta
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
-    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带（2.1.280 的 opus 是 `medium`），
+    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带（模拟路径三族都按 `high`），
     // 按 profile 补（[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
     let effort_filled = sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
     // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），
@@ -413,7 +437,16 @@ pub(super) fn rewrite_body_out(
         if !has_billing_header(&v) {
             return false;
         }
-        let billing = append_billing_link(&mut v, l);
+        // 主线程（含工具续轮与 thread 续轮）的 `cc_prompt_id` 后面还跟着 `cc_turn_origin`
+        // （2.1.277 起）与会话里的第几轮（2.1.285 起，`cap/2.1.285/00113`、`00115`）；子代理与
+        // helper 只有 `cc_prompt_id`（`00120`、`00125`）。按来访自报的版本给，版本读不出不补。
+        let ver = client_version.and_then(parse_version);
+        let main = cc_kind == CcRequestKind::Main;
+        let turn = TurnFields {
+            origin: main && ver.is_some_and(|v| v >= (2, 1, 277)),
+            index: main && ver.is_some_and(|v| v >= (2, 1, 285)),
+        };
+        let billing = append_billing_link(&mut v, l, turn);
         // `diagnostics` 同样是订阅端才有的（`cap/2.1.258-api` 六份一个都没有）。
         let diag = l.diagnostics && ensure_diagnostics(&mut v, l);
         billing || diag
@@ -520,6 +553,10 @@ pub(super) fn rewrite_body_out(
     let schemas_flattened = flags.flatten_tool_schemas && flatten_tool_schemas(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
+    // message thread 排在所有改写之后：判「能不能接上上一轮」比的是**最终出站**的历史
+    // （工具名已混淆、断点已落位），切增量也得切这一份。见 [`apply_sim_thread`]。
+    let threaded =
+        flags.sim_message_threads && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id));
     tracing::debug!(
         empty_system_dropped,
         system_hoisted,
@@ -552,6 +589,7 @@ pub(super) fn rewrite_body_out(
         empty_thinking_stripped,
         schemas_flattened,
         tools_mimicked,
+        threaded,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
@@ -586,6 +624,7 @@ pub(super) fn rewrite_body_out(
         && !empty_thinking_stripped
         && !schemas_flattened
         && !tools_mimicked
+        && !threaded
     {
         return (body.clone(), None);
     }
@@ -594,6 +633,327 @@ pub(super) fn rewrite_body_out(
         // 序列化失败等于「这份 Value 与将要发出去的字节对不上」，此时必须把它丢掉：
         // 形态摘要的调用方认的是「Some 即与出站字节同构」，交一份对不上的回去比不交更糟。
         Err(_) => (body.clone(), None),
+    }
+}
+
+/// 模拟路径的 message thread（`message-threads-2026-08-12`），规则见
+/// [`super::session_link::ThreadState`]：
+///
+/// - 会话里这段对话的第一条，或历史接不上上一轮（客户端改了历史、重新生成、自己裁剪了上下文，
+///   换了模型 / effort / system / tools，上一条失败或被取消）：`thread: {type: create}`，完整上下文。
+///   `diagnostics` 照旧由 [`ensure_diagnostics`] 写会话上一条回复——与官方切模型后那条 `create`
+///   同形（`cap/auto-2.1.285-20260930/00243`）。
+/// - 接得上：`thread: {type: continue, previous_message_id}`，`messages` 只留新增的那几条，
+///   `system` 只剩 billing header 一块（去掉断点，官方那块只有 `type` / `text`），去掉 `tools`，
+///   `diagnostics.previous_message_id` 改成同一个 id（`00033`）。billing header 的 `cc_version`
+///   后缀此前已按完整历史算好，与官方「续轮沿用首轮后缀」一致。
+///
+/// 只给官方会发 `thread` 的主线程：2.1.285 的 opus / sonnet / haiku 各代与 fable-5 都发，
+/// **fable-5-1 一条都不发**（auto、非 auto、`-p` 都是，`00383`、`00554`，`cap/2.1.285/00039`），
+/// 见 [`super::simulation::sim_uses_threads`]。来访指定了 `tool_choice` 的只 `create`：续轮不带
+/// `tools`，`tool_choice` 没有落脚处。
+///
+/// 这一轮的结论（等回程提交的那份）挂到 `sim` 上，由 `ReqLog` 取走（[`Simulation::take_thread`]）。
+fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred_id: i64) -> bool {
+    if !super::simulation::sim_is_main_thread(sim) {
+        return false;
+    }
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    let threads = super::simulation::sim_uses_threads(sim, model);
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    if msgs.is_empty() {
+        return false;
+    }
+    // 指纹在插 `<total_tokens>` 提醒**之前**算：客户端下一轮带回来的历史里没有这条提醒（它只进了
+    // 上游线程），把它算进去，下一轮的前缀就永远对不上。
+    let fps: Vec<ThreadMsg> = msgs.iter().map(thread_msg_of).collect();
+    let regular_prompt = crate::telemetry::last_is_new_prompt_body(v);
+    let key = CcSessionKey { cred_id, session_id: &sim.session_id };
+    let (mut decision, pending, tokens_left) =
+        thread_decision(key, thread_shape_of(v), &fps, regular_prompt);
+    let has_tool_choice = v.get("tool_choice").is_some_and(|c| !c.is_null());
+    if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
+        decision = ThreadDecision::Create;
+    }
+    let pending = match &decision {
+        ThreadDecision::Create => pending.into_create(),
+        ThreadDecision::Continue { .. } => pending,
+    };
+    let Some(obj) = v.as_object_mut() else { return false };
+    match decision {
+        ThreadDecision::Create if !threads => {}
+        ThreadDecision::Create => {
+            obj.insert("thread".into(), serde_json::json!({ "type": "create" }));
+        }
+        ThreadDecision::Continue { from, previous_message_id } => {
+            if let Some(serde_json::Value::Array(m)) = obj.get_mut("messages") {
+                m.drain(..from);
+            }
+            let billing = obj
+                .get("system")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .filter(|t| t.starts_with("x-anthropic-billing-header:"))
+                .map(str::to_string);
+            match billing {
+                Some(text) => {
+                    obj.insert(
+                        "system".into(),
+                        serde_json::json!([{ "type": "text", "text": text }]),
+                    );
+                }
+                None => {
+                    obj.remove("system");
+                }
+            }
+            obj.remove("tools");
+            obj.insert(
+                "thread".into(),
+                serde_json::json!({ "type": "continue", "previous_message_id": previous_message_id }),
+            );
+            obj.insert(
+                "diagnostics".into(),
+                serde_json::json!({ "previous_message_id": previous_message_id }),
+            );
+        }
+    }
+    insert_total_tokens_reminder(
+        v,
+        tokens_left,
+        regular_prompt,
+        super::simulation::sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM),
+    );
+    align_cc_top_level_order(v, sim.profile.body_key_order);
+    sim.set_thread(pending);
+    true
+}
+
+/// 官方主线程每条请求末尾的 `<total_tokens>N tokens left</total_tokens>` 提醒（数怎么算见
+/// [`super::session_link::TotalTokens`]），只跟在 user 消息（新输入或工具结果）后面。落法随
+/// `mid-conversation-system` beta 分两种：
+///
+/// - **带那项 beta**（opus / sonnet / fable）：追加一条独立的 `role: system` 消息，末条消息的
+///   缓存断点挪到它身上（`cap/auto-2.1.285-20260930/00033`、`00036`、`00405`）；
+/// - **不带**（haiku）：写成 `<system-reminder>`——工具续轮拼在最后一个 `tool_result` 正文的
+///   末尾（`00412`），新输入则作为一个文本块插在用户那句话前面（`00411`）。
+///
+/// 官方首轮那条会把它与环境说明、日期并进同一条 system 消息（`00032`、`00349`），那是首轮附件
+/// 整体的形态，这里只补单独这一条。
+fn insert_total_tokens_reminder(
+    v: &mut serde_json::Value,
+    tokens_left: u64,
+    regular_prompt: bool,
+    mid_conversation_system: bool,
+) {
+    let text = format!("<total_tokens>{tokens_left} tokens left</total_tokens>");
+    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
+    let Some(last) = msgs.last_mut() else { return };
+    if last.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return;
+    }
+    if mid_conversation_system {
+        let mut block = serde_json::json!({ "type": "text", "text": text });
+        if let Some(cc) = take_last_cache_control(last) {
+            block["cache_control"] = cc;
+        }
+        msgs.push(serde_json::json!({ "role": "system", "content": [block] }));
+        return;
+    }
+    let wrapped = format!("<system-reminder>\n{text}\n</system-reminder>");
+    let content = last.get_mut("content");
+    let Some(content) = content else { return };
+    if let serde_json::Value::String(s) = content {
+        let s = std::mem::take(s);
+        *content = serde_json::json!([{ "type": "text", "text": s }]);
+    }
+    let Some(blocks) = content.as_array_mut() else { return };
+    let ty = |b: &serde_json::Value| b.get("type").and_then(|t| t.as_str()).map(str::to_string);
+    if regular_prompt {
+        let at = blocks.iter().rposition(|b| ty(b).as_deref() == Some("text")).unwrap_or(0);
+        blocks.insert(at, serde_json::json!({ "type": "text", "text": format!("{wrapped}\n") }));
+    } else if let Some(tr) =
+        blocks.iter_mut().rev().find(|b| ty(b).as_deref() == Some("tool_result"))
+    {
+        match tr.get_mut("content") {
+            Some(serde_json::Value::String(s)) => {
+                s.push_str("\n\n");
+                s.push_str(&wrapped);
+            }
+            Some(serde_json::Value::Array(parts)) => {
+                parts.push(serde_json::json!({ "type": "text", "text": wrapped }));
+            }
+            _ => {
+                tr["content"] = serde_json::Value::String(wrapped);
+            }
+        }
+    }
+}
+
+/// 摘下一条消息里最后一个缓存断点并交出来（没有就 `None`）。官方的断点在末条消息上，追加一条
+/// system 提醒之后末条换成了它，断点跟着挪过去，总数不变。
+fn take_last_cache_control(m: &mut serde_json::Value) -> Option<serde_json::Value> {
+    let blocks = m.get_mut("content")?.as_array_mut()?;
+    blocks.iter_mut().rev().find_map(|b| b.as_object_mut().and_then(|o| o.remove("cache_control")))
+}
+
+/// 出站一条消息的线程指纹，见 [`ThreadMsg`]。
+pub(super) fn thread_msg_of(m: &serde_json::Value) -> ThreadMsg {
+    let assistant = m.get("role").and_then(|r| r.as_str()) == Some("assistant");
+    let tool_use_ids = if assistant {
+        m.get("content")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .filter_map(|b| b.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // 回复指纹与回程嗅探器同一个算法（[`ReplyFp`]），按块序喂；字符串形态的 content 即一个
+    // text 块。只有 assistant 要比，user 留缺省值。
+    let mut reply = ReplyFp::default();
+    if assistant {
+        match m.get("content") {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {
+                reply.text(reply_text_fp(REPLY_TEXT_FP_INIT, s), &[]);
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                for b in blocks {
+                    let field = |k: &str| b.get(k).and_then(|t| t.as_str()).unwrap_or_default();
+                    match b.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            let citations = b
+                                .get("citations")
+                                .and_then(|c| c.as_array())
+                                .map_or(&[][..], |c| &c[..]);
+                            if !field("text").is_empty() || !citations.is_empty() {
+                                reply.text(
+                                    reply_text_fp(REPLY_TEXT_FP_INIT, field("text")),
+                                    citations,
+                                );
+                            }
+                        }
+                        Some("tool_use") => reply.tool_use(
+                            field("id"),
+                            field("name"),
+                            b.get("input").unwrap_or(&serde_json::Value::Null),
+                        ),
+                        Some("thinking") => reply
+                            .thinking(false, reply_text_fp(REPLY_TEXT_FP_INIT, field("thinking"))),
+                        Some("redacted_thinking") => {
+                            reply.thinking(true, reply_text_fp(REPLY_TEXT_FP_INIT, field("data")))
+                        }
+                        Some("fallback") => {}
+                        _ => reply.block(b),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ThreadMsg { fp: message_fingerprint(m), assistant, tool_use_ids, reply }
+}
+
+/// 一条消息的线程指纹：去掉 `cache_control`，且字符串形态的 `content` 与等价的单个 `text` 块
+/// 同指纹——[`align_message_shape`] 给末条消息补断点时会把字符串改成块数组，同一条消息在上一轮
+/// 是末条（块数组）、这一轮不是（仍是字符串），不能因此判成历史变了。
+fn message_fingerprint(m: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Some(obj) = m.as_object() else { return fingerprint_without_cache_control(m) };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (k, x) in obj {
+        if k == "cache_control" {
+            continue;
+        }
+        k.hash(&mut h);
+        match (k.as_str(), x) {
+            ("content", serde_json::Value::String(s)) => hash_without_cache_control(
+                &serde_json::json!([{ "type": "text", "text": s }]),
+                &mut h,
+            ),
+            _ => hash_without_cache_control(x, &mut h),
+        }
+    }
+    h.finish()
+}
+
+/// 线程形态指纹：模型、system 正文（billing header 那块除外——`cch` 与会话链字段每条都变）、
+/// `tools`、`thinking`、`output_config`。全部去掉 `cache_control` 再算，见
+/// [`super::session_link::ThreadPending`] 的 `shape`。
+fn thread_shape_of(v: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.get("model").and_then(|m| m.as_str()).unwrap_or_default().hash(&mut h);
+    match v.get("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            for b in blocks {
+                let billing = b
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"));
+                if !billing {
+                    hash_without_cache_control(b, &mut h);
+                }
+            }
+        }
+        Some(other) => hash_without_cache_control(other, &mut h),
+        None => {}
+    }
+    for key in ["tools", "thinking", "output_config"] {
+        key.hash(&mut h);
+        if let Some(x) = v.get(key) {
+            hash_without_cache_control(x, &mut h);
+        }
+    }
+    h.finish()
+}
+
+fn fingerprint_without_cache_control(v: &serde_json::Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_without_cache_control(v, &mut h);
+    h.finish()
+}
+
+/// 按结构哈希一个 JSON 值，跳过所有 `cache_control` 键：断点每轮都挪到最后一条消息上，同一条
+/// 消息这轮有、下轮没有，不能因此判成历史变了。
+fn hash_without_cache_control<H: std::hash::Hasher>(v: &serde_json::Value, h: &mut H) {
+    use std::hash::Hash;
+    match v {
+        serde_json::Value::Null => 0u8.hash(h),
+        serde_json::Value::Bool(b) => {
+            1u8.hash(h);
+            b.hash(h);
+        }
+        serde_json::Value::Number(n) => {
+            2u8.hash(h);
+            n.to_string().hash(h);
+        }
+        serde_json::Value::String(s) => {
+            3u8.hash(h);
+            s.hash(h);
+        }
+        serde_json::Value::Array(a) => {
+            4u8.hash(h);
+            a.len().hash(h);
+            for x in a {
+                hash_without_cache_control(x, h);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            5u8.hash(h);
+            for (k, x) in o {
+                if k == "cache_control" {
+                    continue;
+                }
+                k.hash(h);
+                hash_without_cache_control(x, h);
+            }
+            6u8.hash(h);
+        }
     }
 }
 
@@ -1225,6 +1585,15 @@ pub(super) fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
     }
 }
 
+/// 真 CC 主线程的 billing header 在 `cc_prompt_id` 之后还要补哪几项，见 [`append_billing_link`]。
+#[derive(Debug, Clone, Copy, Default)]
+struct TurnFields {
+    /// `cc_turn_origin=human`（2.1.277 起）。
+    origin: bool,
+    /// `cc_prompt_index=N; cc_turn_index=N;`（2.1.285 起）。
+    index: bool,
+}
+
 /// `system[0]` 是不是一条 billing header。
 pub(super) fn has_billing_header(v: &serde_json::Value) -> bool {
     v.get("system")
@@ -1243,7 +1612,12 @@ pub(super) fn has_billing_header(v: &serde_json::Value) -> bool {
 /// [`client_session_link`] 判，这里只管拼串。
 ///
 /// 客户端**自己已经写了**哪一项就不动那一项——它比我们更清楚自己的链。
-fn append_billing_link(v: &mut serde_json::Value, link: &CcSessionLink) -> bool {
+///
+/// `turn` 决定 `cc_prompt_id` 之后再补不补 `cc_turn_origin=human` 与
+/// `cc_prompt_index` / `cc_turn_index`，见 [`TurnFields`]。只在这条已经有 `cc_prompt_id`（客户端
+/// 自己的或刚补的）时补：官方这几项与它同条件出现。`cc_turn_origin` 恒写 `human`——后台任务
+/// 通知那种轮次（`task_notification`，`cap/2.1.285/00149`）代理分辨不出。
+fn append_billing_link(v: &mut serde_json::Value, link: &CcSessionLink, turn: TurnFields) -> bool {
     let blk = match v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut()) {
         Some(b) => b,
         None => return false,
@@ -1271,6 +1645,17 @@ fn append_billing_link(v: &mut serde_json::Value, link: &CcSessionLink) -> bool 
     {
         s.push_str(&format!(" cc_prompt_id={pid};"));
         changed = true;
+    }
+    if s.contains("cc_prompt_id=") {
+        if turn.origin && !s.contains("cc_turn_origin=") {
+            s.push_str(" cc_turn_origin=human;");
+            changed = true;
+        }
+        if turn.index && link.prompt_index > 0 && !s.contains("cc_prompt_index=") {
+            let n = link.prompt_index;
+            s.push_str(&format!(" cc_prompt_index={n}; cc_turn_index={n};"));
+            changed = true;
+        }
     }
     if !changed {
         return false;
@@ -1580,10 +1965,10 @@ pub(super) fn normalize_fallbacks(v: &mut serde_json::Value, profile: &config::C
 /// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body`] 的 `display_beta`）：`updates`
 /// 是 beta 才认的取值，头上没声明时上游回 400 `Input should be 'summarized', 'omitted'`。
 /// 2026-09-02 一条 `claude-vscode, agent-sdk/0.3.258` 的 fable-5-1 请求就是这样被拒的——它的
-/// beta 串没有 `advisor-tool`，[`merge_beta`] 按老世代处理不补，体里却写了。
+/// beta 串没有 `advisor-tool`，[`merge_beta_for`] 按老世代处理不补，体里却写了。
 ///
 /// 那个前提也是**唯一**的门槛：本函数不再自己按模型族判一遍。哪一族在哪一版发这项 beta
-/// 是 [`merge_beta`] 的事（它按来访自报的版本查 [`config::cc_profile_at`]），在这里再判
+/// 是 [`merge_beta_for`] 的事（它按来访自报的版本查 [`config::cc_profile_at`]），在这里再判
 /// 一次只会两处口径分头漂移——2.1.260 起 opus 主线程也发 `display:"updates"`，
 /// 原来那句「只有 fable」的判断当场就成了错的。
 pub(super) fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
@@ -1666,8 +2051,9 @@ pub(super) fn ensure_context_management(v: &mut serde_json::Value) -> bool {
 }
 
 /// 模拟路径下按 profile 补顶层 `output_config`：2.1.277 起 opus / fable / sonnet 主线程每条都是
-/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带；2.1.280 的
-/// opus 换成 `medium`，`cap/2.1.280/00021`），haiku
+/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带；opus-5-5 与
+/// sonnet-5-5 的官方默认是 `medium`，`cap/2.1.280/00021`、`cap/2.1.285/00045`，模拟路径照旧按
+/// `high` 发），haiku
 /// 主线程与全部辅助请求不带（[`config::CcProfile::effort`] 为 `None`，这里什么都不做）。
 ///
 /// 客户端自己带了 `output_config`（不论写的是 `effort` 还是 `format`）就不动——那是它自己的
@@ -3482,7 +3868,7 @@ mod tests {
     /// 客户端自己写了 `display` 的不动；`merge_beta` 关着就不补。
     ///
     /// **判据只有一个**：出站头里有没有那项 beta（这里的 `display_beta` 参数恒为 true）。
-    /// 哪一族在哪一版发它由 [`crate::proxy::merge_beta`] 决定，见
+    /// 哪一族在哪一版发它由 [`crate::proxy::merge_beta_for`] 决定，见
     /// [`skips_thinking_display_without_the_beta`]。模拟路径不走这条（它由
     /// `ensure_thinking` 直接产出完整形态）。
     #[test]
@@ -4038,6 +4424,7 @@ mod tests {
             simulate_cc: false,
             simulate_full_system: false,
             fill_absent_tools: false,
+            sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -4914,6 +5301,7 @@ mod tests {
                 simulate_cc: false,
                 simulate_full_system: false,
                 fill_absent_tools: false,
+                sim_message_threads: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,
@@ -5564,6 +5952,7 @@ mod tests {
             simulate_cc: false,
             simulate_full_system: false,
             fill_absent_tools: false,
+            sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -7046,7 +7435,7 @@ mod tests {
     #[test]
     fn reads_the_cc_version_from_the_user_agent() {
         let v = crate::proxy::cc_cli_version;
-        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 280)), "官方那串");
+        assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 285)), "官方那串");
         assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
         assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
         assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -7233,5 +7622,403 @@ mod tests {
             untouched,
             Bytes::from(r#"{"model":"claude-opus-5","stream":false}"#.to_string())
         );
+    }
+
+    /// message thread 测试的一轮：按模拟路径改写，返回出站体与等回程提交的那份。
+    fn thread_turn(
+        body: &serde_json::Value,
+        flags: store::ForwardFlags,
+    ) -> (serde_json::Value, Option<crate::proxy::session_link::ThreadPending>) {
+        let raw = body.to_string();
+        let sim = sim_for(&raw);
+        let out = rewrite_body(&Bytes::from(raw), &test_cred(), "fp", flags, Some(&sim), None);
+        (serde_json::from_slice(&out).unwrap(), sim.take_thread())
+    }
+
+    /// 上游回了 `content` 这样一条回复时的回复指纹：来访原样带回它就对得上（两边同一算法，
+    /// 回程那侧见 `logging` 里嗅探器的测试）。
+    fn reply_of(content: serde_json::Value) -> crate::proxy::session_link::ReplyFp {
+        super::thread_msg_of(&serde_json::json!({ "role": "assistant", "content": content }))
+            .reply
+            .as_upstream()
+    }
+
+    fn bash_use(id: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "tool_use", "id": id, "name": "Bash", "input": { "command": command } })
+    }
+
+    /// 同一会话槽里两段开场相同的对话（同样的首句）：纯文本回复两边 tool_use id 都是空的，只比
+    /// id 会让第一段接上第二段的回复。正文指纹对不上就只能 `create`。
+    #[test]
+    fn sim_threads_do_not_continue_onto_another_conversations_text_reply() {
+        use crate::proxy::session_link::CcSessionLink;
+        let user1 = serde_json::json!({ "role": "user", "content": "线程测试·串线 hi" });
+        let first = thread_body("claude-opus-5-5", serde_json::json!([user1]));
+        let (_, pa) = thread_turn(&first, all_on());
+        CcSessionLink::record_thread(
+            &pa.unwrap(),
+            "msg_r1",
+            Vec::new(),
+            reply_of("你好，A".into()),
+            100,
+        );
+        // 第二段对话：同一个开场，create 提交后替掉了第一段那条状态。
+        let (_, pb) = thread_turn(&first, all_on());
+        CcSessionLink::record_thread(
+            &pb.unwrap(),
+            "msg_r2",
+            Vec::new(),
+            reply_of("你好，B".into()),
+            100,
+        );
+
+        let follow = |reply: &str| {
+            thread_body(
+                "claude-opus-5-5",
+                serde_json::json!([
+                    user1,
+                    { "role": "assistant", "content": reply },
+                    { "role": "user", "content": "继续" },
+                ]),
+            )
+        };
+        let (v, _) = thread_turn(&follow("你好，A"), all_on());
+        assert_eq!(v["thread"], serde_json::json!({ "type": "create" }), "第一段不能接 r2: {v}");
+        let (v, _) = thread_turn(&follow("你好，B"), all_on());
+        assert_eq!(v["thread"]["previous_message_id"], "msg_r2", "第二段照常接上: {v}");
+    }
+
+    /// 客户端把上一条回复改了再发下一条：正文 A 改成 B、工具入参改了（id 不变）、thinking 改了，
+    /// 都得 `create`——`continue` 会让上游沿用存档里的 A，改动被静默丢掉。原样带回照常
+    /// `continue`；把 thinking 整块丢掉也算原样（上游线程里那份本来就在）。
+    #[test]
+    fn sim_threads_create_when_the_client_edited_the_last_reply() {
+        use crate::proxy::session_link::CcSessionLink;
+        let user1 = serde_json::json!({ "role": "user", "content": "线程测试·改回复 hi" });
+        let reply = |thinking: Option<&str>, text: &str, command: &str| {
+            let mut blocks = Vec::new();
+            if let Some(t) = thinking {
+                blocks.push(
+                    serde_json::json!({ "type": "thinking", "thinking": t, "signature": "s" }),
+                );
+            }
+            blocks.push(serde_json::json!({ "type": "text", "text": text }));
+            blocks.push(bash_use("toolu_e", command));
+            serde_json::Value::Array(blocks)
+        };
+        let (_, p) =
+            thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+        CcSessionLink::record_thread(
+            &p.unwrap(),
+            "msg_E",
+            vec!["toolu_e".into()],
+            reply_of(reply(Some("先看"), "我看一下", "ls")),
+            100,
+        );
+        let follow = |content: serde_json::Value| {
+            thread_body(
+                "claude-opus-5-5",
+                serde_json::json!([
+                    user1,
+                    { "role": "assistant", "content": content },
+                    { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_e", "content": "a.txt" },
+                    ] },
+                ]),
+            )
+        };
+        let create = serde_json::json!({ "type": "create" });
+        for (label, content) in [
+            ("改了正文", reply(Some("先看"), "我改过了", "ls")),
+            ("改了工具入参", reply(Some("先看"), "我看一下", "pwd")),
+            ("改了 thinking", reply(Some("改过"), "我看一下", "ls")),
+        ] {
+            let (v, _) = thread_turn(&follow(content), all_on());
+            assert_eq!(v["thread"], create, "{label}: {v}");
+        }
+        for (label, content) in [
+            ("原样带回", reply(Some("先看"), "我看一下", "ls")),
+            ("丢掉 thinking", reply(None, "我看一下", "ls")),
+        ] {
+            let (v, _) = thread_turn(&follow(content), all_on());
+            assert_eq!(v["thread"]["previous_message_id"], "msg_E", "{label}: {v}");
+        }
+    }
+
+    fn thread_body(model: &str, messages: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "model": model, "messages": messages, "max_tokens": 32000 })
+    }
+
+    /// 官方 2.1.285 同一会话（`cap/auto-2.1.285-20260930/00032` → `00033` → `00036`）：首条
+    /// `create` 带完整上下文；接得上的续轮 `continue`，只发新增消息，`system` 只剩 billing 一块、
+    /// 不带 `tools`，`thread` 与 `diagnostics` 同指上一条回复；键序同 `00244`。
+    #[test]
+    fn sim_threads_create_then_continue_with_only_new_messages() {
+        use crate::proxy::session_link::CcSessionLink;
+        let user1 = serde_json::json!({ "role": "user", "content": "线程测试·续轮 第一问" });
+        let (v1, p1) =
+            thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+        assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{v1}");
+        assert!(v1["tools"].as_array().is_some_and(|t| !t.is_empty()));
+        let tail = v1["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            tail,
+            &serde_json::json!({ "role": "system", "content": [{
+                "type": "text",
+                "text": "<total_tokens>15000000 tokens left</total_tokens>",
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }] }),
+            "新输入之后一条 1500 万整的提醒，断点挪到它身上（00033）"
+        );
+        let user_tail = &v1["messages"][0]["content"];
+        assert!(
+            user_tail
+                .as_array()
+                .is_some_and(|b| b.iter().all(|x| x.get("cache_control").is_none())),
+            "原末条的断点摘掉了: {v1}"
+        );
+        // 首轮回复 usage 共 40232（00032 那条），下一轮倒数从这里算。
+        CcSessionLink::record_thread(
+            &p1.expect("create 也要等回程提交"),
+            "msg_A",
+            vec!["toolu_1".into()],
+            reply_of(serde_json::json!([
+                { "type": "text", "text": "我看一下" },
+                bash_use("toolu_1", "ls"),
+            ])),
+            40232,
+        );
+
+        let assistant = serde_json::json!({ "role": "assistant", "content": [
+            { "type": "text", "text": "我看一下" },
+            { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } },
+        ] });
+        let result = serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt" },
+        ] });
+        let msgs2 = serde_json::json!([user1, assistant, result]);
+        let (v2, p2) = thread_turn(&thread_body("claude-opus-5-5", msgs2.clone()), all_on());
+        assert_eq!(
+            v2["thread"],
+            serde_json::json!({ "type": "continue", "previous_message_id": "msg_A" }),
+            "{v2}"
+        );
+        assert_eq!(v2["diagnostics"], serde_json::json!({ "previous_message_id": "msg_A" }));
+        let delta = v2["messages"].as_array().unwrap();
+        assert_eq!(delta.len(), 2, "只发新增的那条加提醒: {v2}");
+        assert_eq!(delta[0]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(
+            delta[1]["content"][0]["text"], "<total_tokens>14959768 tokens left</total_tokens>",
+            "对话首轮锚点是 0，工具续轮减去整段上下文（同 00276 的 40880）"
+        );
+        let sys = v2["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0].as_object().unwrap().len(), 2, "billing 块只有 type / text: {v2}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert!(v2.get("tools").is_none());
+        let keys: Vec<&str> = v2.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "model",
+                "messages",
+                "system",
+                "metadata",
+                "max_tokens",
+                "thinking",
+                "context_management",
+                "output_config",
+                "thread",
+                "diagnostics",
+            ],
+            "键序同官方续轮 00244"
+        );
+
+        // 再一轮：接着 continue 那条回复（纯文本、没有 tool_use）。
+        let p2 = p2.expect("continue 也要提交");
+        CcSessionLink::record_thread(
+            &p2,
+            "msg_B",
+            Vec::new(),
+            reply_of("只有 a.txt".into()),
+            40436,
+        );
+        let mut msgs3 = msgs2.as_array().unwrap().clone();
+        msgs3.push(serde_json::json!({ "role": "assistant", "content": "只有 a.txt" }));
+        msgs3.push(serde_json::json!({ "role": "user", "content": "好，下一步" }));
+        let (v3, p3) = thread_turn(&thread_body("claude-opus-5-5", msgs3.clone().into()), all_on());
+        assert_eq!(v3["thread"]["previous_message_id"], "msg_B", "{v3}");
+        assert_eq!(v3["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v3["messages"][1]["content"][0]["text"],
+            "<total_tokens>15000000 tokens left</total_tokens>",
+            "新输入重新锚定（00039）"
+        );
+
+        // 新输入锚在 40436 上；接下来两次工具续轮：40606 → 用 170，41114 → 用 678（00040、00041
+        // 的算法），上下文回落时只减不增。
+        CcSessionLink::record_thread(
+            &p3.unwrap(),
+            "msg_C",
+            vec!["toolu_2".into()],
+            reply_of(serde_json::json!([bash_use("toolu_2", "pwd")])),
+            40606,
+        );
+        let mut msgs4 = msgs3.clone();
+        msgs4.push(serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_2", "name": "Bash", "input": { "command": "pwd" } },
+        ] }));
+        msgs4.push(serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_2", "content": "/tmp" },
+        ] }));
+        let (v4, p4) = thread_turn(&thread_body("claude-opus-5-5", msgs4.clone().into()), all_on());
+        assert_eq!(
+            v4["messages"][1]["content"][0]["text"],
+            "<total_tokens>14999830 tokens left</total_tokens>"
+        );
+        CcSessionLink::record_thread(
+            &p4.unwrap(),
+            "msg_D",
+            vec!["toolu_3".into()],
+            reply_of(serde_json::json!([bash_use("toolu_3", "ls")])),
+            40000,
+        );
+        let mut msgs5 = msgs4;
+        msgs5.push(serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_3", "name": "Bash", "input": { "command": "ls" } },
+        ] }));
+        msgs5.push(serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_3", "content": "x" },
+        ] }));
+        let (v5, _) = thread_turn(&thread_body("claude-opus-5-5", msgs5.into()), all_on());
+        assert_eq!(
+            v5["messages"][1]["content"][0]["text"],
+            "<total_tokens>14999830 tokens left</total_tokens>",
+            "上下文回落不回涨（00244）"
+        );
+    }
+
+    /// haiku 不带 `mid-conversation-system`：提醒写成 `<system-reminder>`——新输入插在用户那句
+    /// 前面（`cap/auto-2.1.285-20260930/00411`），工具续轮拼进 `tool_result` 正文末尾（`00412`）。
+    #[test]
+    fn sim_total_tokens_reminder_is_a_system_reminder_on_haiku() {
+        use crate::proxy::session_link::CcSessionLink;
+        let user1 = serde_json::json!({ "role": "user", "content": "线程测试·haiku 第一问" });
+        let (v1, p1) = thread_turn(
+            &thread_body("claude-haiku-4-5-20251001", serde_json::json!([user1])),
+            all_on(),
+        );
+        let blocks = v1["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(v1["messages"].as_array().unwrap().len(), 1, "不追加 system 消息: {v1}");
+        assert_eq!(
+            blocks[0]["text"],
+            "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>\n"
+        );
+        assert_eq!(blocks[1]["text"], "线程测试·haiku 第一问");
+        assert!(blocks[1].get("cache_control").is_some(), "断点仍在用户那句上");
+        CcSessionLink::record_thread(
+            &p1.unwrap(),
+            "msg_H",
+            vec!["toolu_h".into()],
+            reply_of(serde_json::json!([bash_use("toolu_h", "ls")])),
+            30000,
+        );
+
+        let msgs = serde_json::json!([
+            user1,
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_h", "name": "Bash", "input": { "command": "ls" } },
+            ] },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_h", "content": "a.txt" },
+            ] },
+        ]);
+        let (v2, _) = thread_turn(&thread_body("claude-haiku-4-5-20251001", msgs), all_on());
+        assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+        let delta = v2["messages"].as_array().unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(
+            delta[0]["content"][0]["content"],
+            "a.txt\n\n<system-reminder>\n<total_tokens>14970000 tokens left</total_tokens>\n</system-reminder>"
+        );
+    }
+
+    /// 接不上的一律 `create`：回复的 tool_use id 对不上、重新生成（历史与上一轮一样长）、改了更早的
+    /// 历史、换了模型、来访指定了 `tool_choice`、上一条 `continue` 失败（线程作废）。
+    #[test]
+    fn sim_threads_fall_back_to_create_when_the_history_does_not_follow() {
+        use crate::proxy::session_link::CcSessionLink;
+        let user1 = serde_json::json!({ "role": "user", "content": "线程测试·回退 第一问" });
+        let first = thread_body("claude-sonnet-5-5", serde_json::json!([user1]));
+        let (_, p1) = thread_turn(&first, all_on());
+        CcSessionLink::record_thread(
+            &p1.unwrap(),
+            "msg_R1",
+            vec!["toolu_real".into()],
+            reply_of(serde_json::json!([bash_use("toolu_real", "ls")])),
+            1000,
+        );
+        let assistant = |id: &str| {
+            serde_json::json!({ "role": "assistant", "content": [
+                { "type": "tool_use", "id": id, "name": "Bash", "input": { "command": "ls" } },
+            ] })
+        };
+        let result = |id: &str| {
+            serde_json::json!({ "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": id, "content": "x" },
+            ] })
+        };
+        let create = serde_json::json!({ "type": "create" });
+
+        let wrong_id = serde_json::json!([user1, assistant("toolu_other"), result("toolu_other")]);
+        let (v, _) = thread_turn(&thread_body("claude-sonnet-5-5", wrong_id), all_on());
+        assert_eq!(v["thread"], create, "tool_use id 对不上: {v}");
+
+        let (v, _) = thread_turn(&first, all_on());
+        assert_eq!(v["thread"], create, "重新生成");
+
+        let good = serde_json::json!([user1, assistant("toolu_real"), result("toolu_real")]);
+        let (v, _) = thread_turn(&thread_body("claude-opus-5-5", good.clone()), all_on());
+        assert_eq!(v["thread"], create, "换了模型");
+
+        let mut forced = thread_body("claude-sonnet-5-5", good.clone());
+        forced["tool_choice"] = serde_json::json!({ "type": "tool", "name": "Bash" });
+        let (v, p) = thread_turn(&forced, all_on());
+        assert_eq!(v["thread"], create, "指定了 tool_choice: {v}");
+        assert!(p.is_some_and(|p| !p.is_continue()), "按 create 提交");
+
+        let edited = serde_json::json!([
+            { "role": "user", "content": "线程测试·回退 改过的第一问" },
+            assistant("toolu_real"),
+            result("toolu_real"),
+        ]);
+        let (v, _) = thread_turn(&thread_body("claude-sonnet-5-5", edited), all_on());
+        assert_eq!(v["thread"], create, "改了更早的历史");
+
+        let (v, p) = thread_turn(&thread_body("claude-sonnet-5-5", good.clone()), all_on());
+        assert_eq!(v["thread"]["type"], "continue", "对照组接得上: {v}");
+        CcSessionLink::drop_thread(&p.unwrap());
+        let (v, _) = thread_turn(&thread_body("claude-sonnet-5-5", good), all_on());
+        assert_eq!(v["thread"], create, "上一条 continue 失败后线程作废");
+    }
+
+    /// fable-5-1 官方一条 `thread` 都不发（`cap/auto-2.1.285-20260930/00383`、`00554`），
+    /// `<total_tokens>` 提醒照带；开关关着时两样都不写。
+    #[test]
+    fn sim_threads_skip_fable_5_1_and_respect_the_switch() {
+        let msgs = serde_json::json!([{ "role": "user", "content": "线程测试·豁免" }]);
+        let (v, p) = thread_turn(&thread_body("claude-fable-5-1", msgs.clone()), all_on());
+        assert!(v.get("thread").is_none(), "{v}");
+        assert_eq!(
+            v["messages"][1]["content"][0]["text"],
+            "<total_tokens>15000000 tokens left</total_tokens>",
+            "不写 thread 也带提醒（00383）"
+        );
+        assert!(p.is_some_and(|p| !p.is_continue()), "倒数状态照记");
+        let (v, _) = thread_turn(&thread_body("claude-fable-5", msgs.clone()), all_on());
+        assert_eq!(v["thread"]["type"], "create", "fable-5 发: {v}");
+        let off = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+        let (v, p) = thread_turn(&thread_body("claude-opus-5-5", msgs), off);
+        assert!(v.get("thread").is_none() && p.is_none(), "{v}");
     }
 }

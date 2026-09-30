@@ -73,6 +73,8 @@ export interface Settings {
   simulate_full_system: boolean
   /** 模拟路径给整个不带 tools 的来访也补官方主线程工具；关闭时这类请求一个工具都不注。 */
   fill_absent_tools: boolean
+  /** 模拟路径的主线程按官方 message threads 形态写 thread：首轮 create，接得上的续轮 continue 只发增量（fable-5-1 除外）；并在末尾补官方的 total_tokens 提醒。 */
+  sim_message_threads: boolean
   /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
   fill_metadata: boolean
   /** 上游回 429 时按账号/模型范围冷却并换号重试；关闭时不冷却、直接透传。 */
@@ -143,6 +145,7 @@ export type ForwardingKey =
   | 'simulate_cc'
   | 'simulate_full_system'
   | 'fill_absent_tools'
+  | 'sim_message_threads'
   | 'fill_metadata'
   | 'rate_limit_retry'
   | 'cache_scope_global'

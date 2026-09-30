@@ -508,6 +508,26 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="sim_message_threads"
+          label={t('按官方 message threads 形态续轮', 'Follow the official message-threads shape')}
+          summary={t(
+            '模拟的主线程请求携带 thread 字段：一段对话的首轮为 create，此后能与上一轮衔接的续轮为 continue，只发送新增消息；无法衔接时重新 create（fable-5-1 不携带 thread）。每条请求末尾同时补上官方的 total_tokens 剩余量提醒。',
+            'Emulated main-thread requests carry a thread field: create on the first turn of a conversation, then continue with only the new messages whenever a turn follows on from the previous one, falling back to create otherwise (fable-5-1 carries no thread). Each request also ends with the official total_tokens remaining reminder.',
+          )}
+          requires={{
+            key: 'simulate_cc',
+            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
+          }}
+          description={
+            <>
+              {t(
+                '官方 2.1.285 的 opus、sonnet、haiku 主线程每条请求都带 thread：会话首条为 create 并携带完整上下文；此后无论工具续轮还是新的用户输入，都是 continue，只发送新增消息，system 仅保留 billing 一块、不带 tools，由上游按上一条回复的 message id 接续。只有切换模型或 effort、压缩上下文、中断后重发、恢复会话时才重新 create。启用后，模拟请求按同样的规则发送：客户端这一轮的历史恰好是「上一轮 + 上游那条回复 + 新消息」时发 continue，只发新增部分；客户端改动了历史、重新生成、自行裁剪上下文，或模型、effort、system、tools 有变化，以及上一条失败或被取消时，一律重新 create。fable-5-1 的官方请求从不携带 thread，保持原样。注意：continue 时模型看到的是上游保存的那条回复，而非客户端手中的版本，因此衔接判断会逐条比对历史与工具调用 id，稍有不符即退回 create。此外，官方每条主线程请求末尾都有一条「<total_tokens>N tokens left</total_tokens>」提醒：新的用户输入时 N 为 15,000,000，工具续轮时减去本轮以来上下文的增长量（按上一条回复的用量计算，只减不增）；opus、sonnet、fable 以独立的 system 消息发送，haiku 写成 system-reminder。启用后按同一算法补上这条提醒。停用后不写 thread、不补提醒，每轮都发送完整上下文。',
+                'In the official 2.1.285 client every opus, sonnet and haiku main-thread request carries a thread field: the first request of a session is create with the full context; after that every request, whether a tool round or a new user turn, is continue with only the new messages, a system prompt reduced to the billing block and no tools, chained to the previous reply’s message id upstream. It only goes back to create after switching model or effort, compacting, retrying after an interrupt or resuming a session. When enabled, emulated requests follow the same rules: when the client’s history is exactly the previous turn plus the upstream reply plus new messages, continue is sent with only the new part; if the client changed its history, regenerated, trimmed the context itself, changed the model, effort, system prompt or tools, or the previous request failed or was cancelled, create is sent again. Official fable-5-1 requests never carry thread and are left as they are. Note: on continue the model sees the reply stored upstream rather than the client’s copy, so the check compares every earlier message and the tool call ids and falls back to create on any mismatch. In addition, every official main-thread request ends with a “<total_tokens>N tokens left</total_tokens>” reminder: N is 15,000,000 on a new user turn and, on tool rounds, drops by how much the context has grown since that turn began (measured from the previous reply’s usage, never going back up); opus, sonnet and fable send it as a separate system message, haiku as a system-reminder. When enabled, this reminder is added using the same calculation. Disable to omit thread and the reminder and send the full context on every turn.',
+              )}
+            </>
+          }
+        />
       </SettingsGroup>
 
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('请求兼容性', 'Request compatibility')}>

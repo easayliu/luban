@@ -793,6 +793,7 @@ impl KeepaliveCtx {
             subscription_type: self.subscription_type.clone(),
             version: self.version.clone(),
             agent_id: None,
+            ..Default::default()
         }
     }
 
@@ -1290,9 +1291,14 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
     last
 }
 
-/// `GET /v1/mcp_servers?limit=1000`（claude.ai 侧配置的 MCP 连接器）；`cap/2.1.260-1/00024`。
+/// `GET /v1/mcp_servers?limit=1000&include_additional_installs=true`（claude.ai 侧配置的 MCP
+/// 连接器）；`cap/2.1.260-1/00024`。2.1.277 起查询串多了 `include_additional_installs=true`
+/// （`cap/2.1.277`、`2.1.280`、`2.1.285` 的 `00021` 等都是），其余头逐字未变。
 async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
-    let url = format!("{}/v1/mcp_servers?limit=1000", config::UPSTREAM_BASE_URL);
+    let url = format!(
+        "{}/v1/mcp_servers?limit=1000&include_additional_installs=true",
+        config::UPSTREAM_BASE_URL
+    );
     let resp = axios(
         client
             .get(&url)

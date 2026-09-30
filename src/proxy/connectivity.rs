@@ -233,6 +233,7 @@ pub async fn probe(
         None,
         Some(model),
         false,
+        super::headers::BetaCtx::MAIN,
     );
     // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
     // Upstream 之前取，取值规则与转发路径同一套。
@@ -668,6 +669,7 @@ async fn send_quota_probe(
     let sim = Simulation {
         base: None,
         profile: config::cc_profile(config::CcProfileKind::QuotaProbe),
+        beta: config::cc_profile(config::CcProfileKind::QuotaProbe).beta.into(),
         session_id: session_id.to_string(),
         // 额度探测不在会话链上：官方那条既没有 billing header，也没有 `diagnostics`。
         link: CcSessionLink::default(),
@@ -675,6 +677,7 @@ async fn send_quota_probe(
         // 官方那条没有 `system`，自然也没有第四块。
         rest: None,
         fill_absent_tools: false,
+        thread: Default::default(),
     };
     let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
@@ -684,6 +687,7 @@ async fn send_quota_probe(
         None,
         Some(model),
         false,
+        super::headers::BetaCtx::MAIN,
     );
     // **UA 跟着这个会话的版本走**，不是 luban 自己那个。
     //
@@ -760,6 +764,7 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
     Simulation {
         base: if haiku { None } else { cc_system_base(model) },
         profile,
+        beta: config::cc_model_beta(profile, model),
         // 探测用第 0 个槽位的会话 id：它是 luban 自己发的一条小请求，挂在这个账号固定的那组
         // 会话 id 之内，不另造一个。
         session_id: session_id_for(cred, &crate::credentials::slot_session_seed(0)),
@@ -771,6 +776,7 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
         // 探测体是 `tools: []`（[`probe_body`]），一直靠注入补齐官方工具、验的正是主线程链路；
         // 这是 luban 自己发的，不受 `fill_absent_tools` 开关管。
         fill_absent_tools: true,
+        thread: Default::default(),
     }
 }
 
@@ -1427,7 +1433,7 @@ mod tests {
                 "{model}: 主线程形态要带 billing header"
             );
             assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "{model}: 身份声明");
-            let beta = crate::proxy::simulated_beta(sim.profile.beta, None);
+            let beta = crate::proxy::simulated_beta(&sim.beta, None);
             assert!(beta.contains(config::CC_BETA_CLAUDE_CODE), "{model}: 主线程串带 claude-code");
 
             // **不能只换 profile**：`max_tokens:1` 的体配主线程的 system/beta，会得到一条

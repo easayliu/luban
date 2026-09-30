@@ -11,7 +11,7 @@ use super::body::{
 };
 use super::headers::has_beta;
 use super::session_id::{incoming_session_id, pin_session_id, session_id_for};
-use super::session_link::{CcSessionKey, CcSessionLink};
+use super::session_link::{CcSessionKey, CcSessionLink, ThreadPending};
 use super::{
     QUOTA_PROBE_MODEL, count_cache_control, inbound_beta_list, insert_top_level,
     is_quota_probe_shaped, request_max_tokens,
@@ -53,6 +53,11 @@ pub(super) struct Simulation {
     /// 这条请求要装成哪一类官方请求：beta 串、billing 后缀、`system` 块形态、`thinking`
     /// 形态、`fallbacks` 与顶层键序全在里面，见 [`config::CcProfile`]。
     pub(super) profile: &'static config::CcProfile,
+    /// 出站 `anthropic-beta` 的官方那一段（不含 `oauth`，由 [`crate::proxy::simulated_beta`] 落位）：
+    /// `profile.beta` 按模型代际去掉那一代不发的项，见 [`config::cc_model_beta`]。2.1.285 起
+    /// 同一族的老模型（opus-4-6、sonnet-4-6……）比最新一代少几项，只按族取 `profile.beta` 会给
+    /// 它们发一串那个模型的官方请求里从不出现的 beta。
+    pub(super) beta: std::borrow::Cow<'static, str>,
     /// `X-Claude-Code-Session-Id` 与 `metadata.user_id` 里 `session_id` 的**同一个**取值：
     /// 官方两处逐字相同，只对上一处等于自己造一个新判据。
     ///
@@ -76,6 +81,50 @@ pub(super) struct Simulation {
     /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
     /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
     pub(super) fill_absent_tools: bool,
+    /// 出站体按 message thread 改写后，等回程提交的那份（[`ThreadPending`]）：由
+    /// [`crate::proxy::rewrite_body_out`] 写（[`Self::set_thread`]），`ReqLog` 取走
+    /// （[`Self::take_thread`]）。放在这里而不是改写的返回值里，是因为改写那个函数有十几处调用点，
+    /// 只有转发主路径用得上它。同一条请求重新改写（签名降级重试之类）会覆盖成最后发出的那份。
+    pub(super) thread: parking_lot::Mutex<Option<ThreadPending>>,
+}
+
+impl Simulation {
+    pub(super) fn set_thread(&self, pending: ThreadPending) {
+        *self.thread.lock() = Some(pending);
+    }
+
+    pub(super) fn take_thread(&self) -> Option<ThreadPending> {
+        self.thread.lock().take()
+    }
+}
+
+/// 模拟路径这条请求写不写 `thread`（[`crate::proxy::rewrite_body_out`] 里的 message thread 一步）：
+/// 只给主线程 profile、出站 beta 里有 [`config::CC_BETA_MESSAGE_THREADS`] 的，且不是 fable-5-1——
+/// 2.1.285 官方 opus / sonnet / haiku 各代与 fable-5 的主线程每条都带 `thread`，唯独 fable-5-1
+/// 一条都不带（`cap/auto-2.1.285-20260930/00383`、`00554`，`cap/2.1.285/00039`）。
+pub(super) fn sim_uses_threads(sim: &Simulation, model: &str) -> bool {
+    sim_is_main_thread(sim)
+        && sim_has_beta(sim, config::CC_BETA_MESSAGE_THREADS)
+        && !model.to_ascii_lowercase().contains("fable-5-1")
+}
+
+/// 这条模拟请求是不是主线程 profile：`<total_tokens>` 提醒（[`crate::proxy::rewrite_body_out`]
+/// 里 message thread 那一步）四族主线程都带，fable-5-1 不写 `thread` 也照带
+/// （`cap/auto-2.1.285-20260930/00383`）。
+pub(super) fn sim_is_main_thread(sim: &Simulation) -> bool {
+    matches!(
+        sim.profile.kind,
+        config::CcProfileKind::MainOpus
+            | config::CcProfileKind::MainSonnet
+            | config::CcProfileKind::MainHaiku
+            | config::CcProfileKind::MainFable
+    )
+}
+
+/// 出站 beta 里有没有这一项；`<total_tokens>` 提醒按它选落法，见 [`crate::proxy::rewrite_body_out`]。
+pub(super) fn sim_has_beta(sim: &Simulation, name: &str) -> bool {
+    let parts: Vec<String> = sim.beta.split(',').map(|b| b.trim().to_string()).collect();
+    has_beta(&parts, name)
 }
 
 /// 一条请求被模拟路径接管的原因：[`simulates_cc`] 要求 UA 可信、身份合法、形态完整三样
@@ -196,11 +245,13 @@ impl Simulation {
         Some(Self {
             base: cc_system_base(model),
             profile,
+            beta: config::cc_model_beta(profile, model),
             session_id,
             link,
             reason,
             rest,
             fill_absent_tools: flags.fill_absent_tools,
+            thread: Default::default(),
         })
     }
 }
@@ -296,6 +347,12 @@ pub(super) fn simulation_reason(
     if is_quota_probe_shaped(v) {
         return None;
     }
+    // 官方 `count_tokens`（[`is_official_count_tokens`]）：没有 system、没有 `max_tokens`，按下面
+    // 的形态判据会落到 `not_cc_shaped`、被补成一条主线程体。它不计费、上游也不会拿它的体去
+    // 比对会话，重建只会平白多一种官方不发的形态。
+    if is_official_count_tokens(v, &inbound_beta_list(headers)) {
+        return None;
+    }
     // 2.1.277 起的 message-threads **续轮**（[`is_official_thread_continuation`]，六项逐项对）：
     // 只发新增消息，`system` 只剩 billing header 一块、不带 `tools`，按下面的基座判据会落到
     // `no_base_prompt`、被重建成一条带基座与工具的完整主线程请求——而上游那边这条线程已经有了
@@ -334,6 +391,7 @@ pub(super) fn simulation_reason(
     }
     if !(prewarm
         || is_official_helper_request(v, &inbound_beta_list(headers))
+        || is_official_title_request(v, &inbound_beta_list(headers))
         || has_cc_base_prompt(v))
     {
         return Some(SimulationReason::NoBasePrompt);
@@ -396,28 +454,37 @@ fn has_cc_base_prompt(v: &serde_json::Value) -> bool {
 /// 后来补了 system 与 body，仍没看 beta 头：抄两块 system 加五个字段就够。现在三层都要对，
 /// 而三层都抄全了它就**是**一条官方 Helper。带长提示词的 SDK 子代理（`00020`，第三块 29465
 /// 字节）不走这里，它过的是基座阈值。
+///
+/// **主线程也发同一种 helper**（2.1.285 主线程直接调 WebFetch 后的页面处理，
+/// `cap/auto-2.1.285-20260930/00064`）：body 与 beta 同上，只是第 2、3 条换成主线程那一套——
+/// billing header **不带** `cc_is_subagent`、第二块逐字是 CC 身份句。两套各自成对才算，
+/// 子代理标记配 CC 身份句、或主线程 billing 配 SDK 身份句都不认。
 pub(super) fn is_official_helper_request(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
     if blocks.len() != 2 {
         return false;
     }
     let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    let subagent = text(0).contains("cc_is_subagent=true");
+    let identity =
+        if subagent { config::CC_SDK_AGENT_IDENTITY } else { config::CC_SYSTEM_IDENTITY };
     text(0).starts_with("x-anthropic-billing-header:")
-        && text(0).contains("cc_is_subagent=true")
-        && text(1) == config::CC_SDK_AGENT_IDENTITY
+        && text(1) == identity
         && is_official_helper_shape(v)
         && has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku)
 }
 
-/// 来访的 `anthropic-beta` 是否带齐了某个官方 profile 的**每一项** beta（多带不算错——
+/// 来访的 `anthropic-beta` 是否带齐了某个官方 profile **任一版**的每一项 beta（多带不算错——
 /// 来访那串还有 `oauth`/`afk-mode` 之类 profile 表里刻意去掉的项）。
+///
+/// 按「任一版」而不是「最新一版」：官方各版本的串不是逐版加项，2.1.285 的 helper
+/// （`cap/2.1.285/00125`）去掉了 2.1.260 那行的 `server-side-fallback` / `fallback-credit`。只认
+/// 某一版，另一版的官方请求就会被当成仿冒——此前只认 2.1.260 那行，2.1.285 的 helper 被送进
+/// 模拟（`no_base_prompt`），新设备上还会被当一次性会话探针拒掉。
 fn has_profile_betas(beta: &[String], kind: config::CcProfileKind) -> bool {
-    config::cc_profile(kind)
-        .beta
-        .split(',')
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .all(|b| has_beta(beta, b))
+    config::cc_profile_rows(kind).any(|p| {
+        p.beta.split(',').map(str::trim).filter(|b| !b.is_empty()).all(|b| has_beta(beta, b))
+    })
 }
 
 /// [`has_cc_base_prompt`] 的阈值：1000 字节。官方最短的基座是 opus 那份 1214 字节，留两成
@@ -440,12 +507,12 @@ pub(super) const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 /// 1. `tools` 恰好一个，`type` 以 `web_search_` 开头且 `name` 是 `web_search`；
 /// 2. `tool_choice` 是 `{"type":"tool","name":"web_search"}`；
 /// 3. `messages` 恰好一条且是用户消息；
-/// 4. `system` 去掉 billing header 后恰好一块，不到 [`CC_BASE_PROMPT_MIN_LEN`] 字节、不含 CC
+/// 4. `system` 去掉 billing header（与 2.1.285 起跟在它后面的那句逐字 CC 身份句）后恰好一块，不到 [`CC_BASE_PROMPT_MIN_LEN`] 字节、不含 CC
 ///    身份句、且提到 web search（字符串形态的 `system` 一并认）。
 ///
 /// 第三方要冒充得把这四项全抄对，而抄全了它就**是**一条 WebSearch 子调用——透传出去的形态
 /// 与官方无异，比重建成主线程体更接近真实。
-fn is_official_web_search_request(v: &serde_json::Value) -> bool {
+pub(super) fn is_official_web_search_request(v: &serde_json::Value) -> bool {
     let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else { return false };
     let [tool] = tools.as_slice() else { return false };
     let ty = tool.get("type").and_then(|t| t.as_str()).unwrap_or_default();
@@ -471,11 +538,32 @@ fn is_official_web_search_request(v: &serde_json::Value) -> bool {
         Some(serde_json::Value::String(s)) => vec![s.as_str()],
         _ => return false,
     };
-    let mut prompts = texts.iter().filter(|t| !t.starts_with("x-anthropic-billing-header:"));
+    // 2.1.285 起 billing header 之后还跟一句逐字的 CC 身份句（`cap/auto-2.1.285-20260930/00056`：
+    // `[billing, 身份句, 57 字节搜索提示]`），与 billing header 一样不算提示词。
+    let mut prompts = texts.iter().filter(|t| {
+        !t.starts_with("x-anthropic-billing-header:") && **t != config::CC_SYSTEM_IDENTITY
+    });
     let (Some(prompt), None) = (prompts.next(), prompts.next()) else { return false };
     prompt.len() < CC_BASE_PROMPT_MIN_LEN
         && !prompt.contains(config::CC_SYSTEM_IDENTITY_PREFIX)
         && prompt.to_ascii_lowercase().contains("web search")
+}
+
+/// 这条是不是官方 **`count_tokens`**（`cap/auto-2.1.285-20260930/00104`–`00139`，ToolSearch 给
+/// 延迟工具、MCP 说明数 token）：顶层只有 `model` / `messages` / `tools` 三个键（一个都不多，
+/// `messages` 非空），来访 beta 带 [`config::CC_BETA_TOKEN_COUNTING`]。
+///
+/// 路径不在判据里：判据只看体与头，两边都得能用（[`simulation_reason`] 与 [`CcRequestKind`]）。
+/// 这个形态本身就自证——没有 `max_tokens` 的 `/v1/messages` 上游直接 400，能被上游接的只有
+/// `count_tokens`；而它不计费、不出 usage，抄全了透传出去也不过是一次数 token。
+///
+/// [`CcRequestKind`]: super::CcRequestKind
+pub(super) fn is_official_count_tokens(v: &serde_json::Value, beta: &[String]) -> bool {
+    let Some(obj) = v.as_object() else { return false };
+    obj.keys().all(|k| matches!(k.as_str(), "model" | "messages" | "tools"))
+        && obj.get("model").is_some_and(|m| m.is_string())
+        && obj.get("messages").and_then(|m| m.as_array()).is_some_and(|m| !m.is_empty())
+        && has_beta(beta, config::CC_BETA_TOKEN_COUNTING)
 }
 
 /// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
@@ -509,7 +597,7 @@ pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
 }
 
 /// 官方第四块里 `You are powered by the model named {name}. The exact model ID is {id}.` 与
-/// 官方第四块的模板（2.1.280 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
+/// 官方第四块的模板（2.1.285 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
 /// 知识截止，2.1.277 的第四块不再写这些，只剩记忆目录一处随机器变。
 pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
@@ -530,7 +618,11 @@ pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
 ///    同一个 message id）；
 /// 3. `system` 恰好一块，且那一块只有 `type: text` 与 `text` 两个键、正文是**单行**的 billing
 ///    header——不带断点，也不许在换行后面藏一段提示词；
-/// 4. 没有 `tools` 键（不是空数组，是整个键都没有）；
+/// 4. 没有 `tools` 键（不是空数组，是整个键都没有）——**除非这一轮工具集变了**
+///    （[`thread_tools_changed`]）：ToolSearch 刚载入延迟工具（新增消息里有 `tool_reference`
+///    的工具结果，`cap/auto-2.1.285-20260930/00054`、`00061`、`00164`），或 MCP 工具中途上线
+///    （`role:system` 消息里的 `tool_addition` 块，`00795`）。这时官方把完整 `tools` 重发一遍，
+///    要非空、含官方工具名，且来访 beta 带 [`config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES`]；
 /// 5. 来访 `anthropic-beta` 带 [`config::CC_BETA_MESSAGE_THREADS`]（续轮是这项 beta 的能力，
 ///    没声明它却发 `thread` 是官方不产生的组合）；
 /// 6. `messages` 非空。
@@ -567,13 +659,41 @@ pub(super) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[Str
     }) {
         return false;
     }
-    if v.get("tools").is_some() {
-        return false;
+    if let Some(tools) = v.get("tools") {
+        let resent = tools.as_array().is_some_and(|t| !t.is_empty())
+            && has_cc_tool_profile(v)
+            && thread_tools_changed(v)
+            && has_beta(beta, config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES);
+        if !resent {
+            return false;
+        }
     }
     if v.get("messages").and_then(|m| m.as_array()).is_none_or(|m| m.is_empty()) {
         return false;
     }
     has_beta(beta, config::CC_BETA_MESSAGE_THREADS)
+}
+
+/// 续轮新增的消息里有没有「工具集变了」的标记：用户消息里某个 `tool_result` 的内容带
+/// `tool_reference` 块（ToolSearch 载入了延迟工具），或 `role:system` 消息里有 `tool_addition`
+/// 块（MCP 工具上线）。官方只在这两种时候给续轮重发 `tools`，见 [`is_official_thread_continuation`]。
+fn thread_tools_changed(v: &serde_json::Value) -> bool {
+    fn ty(b: &serde_json::Value) -> Option<&str> {
+        b.get("type").and_then(|t| t.as_str())
+    }
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    msgs.iter().any(|m| {
+        let system = m.get("role").and_then(|r| r.as_str()) == Some("system");
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else { return false };
+        blocks.iter().any(|b| match ty(b) {
+            Some("tool_result") => b
+                .get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|c| c.iter().any(|x| ty(x) == Some("tool_reference"))),
+            Some("tool_addition") => system,
+            _ => false,
+        })
+    })
 }
 
 /// 第四块里那台「机器」的环境：家目录，与记忆目录里的项目段。来访自己写了工作目录就用它
@@ -797,7 +917,8 @@ fn is_segment(s: &str) -> bool {
 }
 
 /// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
-/// 2.1.277 起只剩记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`（2.1.280 那一节改名 `# auto memory`）。
+/// 2.1.277 起只剩记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`（2.1.280 那一节叫 `# auto memory`，
+/// 2.1.285 又改回 `# Memory`）。
 pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
     template.replace("{{cwd_slug}}", &env.slug).replace("{{home}}", &env.home)
 }
@@ -818,7 +939,7 @@ pub(super) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
     config::cc_profile(cc_profile_kind_for(model))
 }
 
-/// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta`] 也用它（再按来访自报的
+/// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta_for`] 也用它（再按来访自报的
 /// 版本经 [`config::cc_profile_at`] 取对应那一版的行）。
 pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
     let m = model.to_ascii_lowercase();
@@ -853,9 +974,16 @@ fn is_official_helper_shape(v: &serde_json::Value) -> bool {
         && v.get("stream").and_then(|b| b.as_bool()) == Some(true)
 }
 
+/// [`is_official_title_request`] 第三块的下限：官方最短的是会话起名那份 380 字节，留两成余量。
+/// 仿冒者抄的那两块（billing header + 身份句）不算在内，第三块它们要么没有、要么只有几十字节。
+const TITLE_PROMPT_MIN_LEN: usize = 300;
+
 /// 官方**标题生成**（`cap/2.1.260-2/00058`）的完整样子：[`is_official_helper_shape`] 的 body
-/// 取值，加 system 恰好三块——billing header、CC 身份句、不短于 1000 字节的标题提示词
-/// （抓包 3059）——加 `structured-outputs` beta。
+/// 取值，加 system 恰好三块——billing header、CC 身份句、不短于 [`TITLE_PROMPT_MIN_LEN`] 字节的
+/// 标题提示词——加 `structured-outputs` beta。
+///
+/// 同一形态还有**会话起名**（2.1.285 规划模式收尾时，`cap/auto-2.1.285-20260930/00166`）：提示词
+/// 换成 380 字节的 kebab-case 起名说明。标题那份 3059 字节，阈值按两者里短的那个定。
 ///
 /// 它与 Helper 是两种请求：Helper 是子代理（SDK 身份句、两块），标题生成是主线程身份（CC
 /// 身份句、带长提示词）。两条都在第三条判据的豁免里，见 [`probe_signature`] 里标题生成为什么
@@ -868,7 +996,7 @@ pub(super) fn is_official_title_request(v: &serde_json::Value, beta: &[String]) 
     let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
     text(0).starts_with("x-anthropic-billing-header:")
         && text(1) == config::CC_SYSTEM_IDENTITY
-        && text(2).len() >= CC_BASE_PROMPT_MIN_LEN
+        && text(2).len() >= TITLE_PROMPT_MIN_LEN
         && has_beta(beta, config::CC_BETA_STRUCTURED_OUTPUTS)
         && is_official_helper_shape(v)
 }
@@ -1363,7 +1491,8 @@ pub(super) fn billing_header_text(v: &serde_json::Value, version: Option<&str>) 
 ///
 /// 各段的顺序是抓包序，各 profile 一致：`cc_version` → `cc_entrypoint` → `cch` →
 /// `cc_is_subagent` → `cc_prev_req` → `cc_prompt_id` → `cc_turn_origin`（2.1.277 起，
-/// `cap/2.1.277/00023`：`…cch=X; cc_prompt_id=U; cc_turn_origin=human;`）。`cch` 在这里就一次写好，不再等
+/// `cap/2.1.277/00023`：`…cch=X; cc_prompt_id=U; cc_turn_origin=human;`）→ `cc_prompt_index` →
+/// `cc_turn_index`（2.1.285 起）。`cch` 在这里就一次写好，不再等
 /// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
 ///
 /// 第四段按 [`cc_version_suffix`] 从 `v`（此刻还是来访自己的 `messages`，客户端 system 还没
@@ -1389,6 +1518,18 @@ fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> Str
         // 通知是 `task_notification`（`cap/2.1.277/00348`）。模拟路径接的都是客户端发来的一轮
         // 对话，写 `human`；没有 `cc_prompt_id` 的工具续轮官方也不写它（`00050`）。
         s.push_str(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;"));
+        // 2.1.285 起紧跟着这一轮在会话里的位置（`cap/2.1.285/00030`：`…cc_turn_origin=human;
+        // cc_prompt_index=1; cc_turn_index=1;`，之后每换一个模型问一句各加一）。官方与
+        // `cc_prompt_id` / `cc_turn_origin` 同条件写：2.1.285 的工具续轮同样带着 `cc_prompt_id`，
+        // 这几项也跟着写、沿用本轮的数（`cap/2.1.285/00115`、`00121`，见
+        // [`config::cc_2_1_285_missing_samples`] 第 1 条），这里跟着 `cc_prompt_id` 走。模拟的每一轮
+        // 都是 human 发起，`promptIndex` 与 `turnIndex` 同步加一，恒等。
+        if sim.link.prompt_index > 0
+            && super::parse_version(p.version).is_some_and(|v| v >= (2, 1, 285))
+        {
+            let n = sim.link.prompt_index;
+            s.push_str(&format!(" cc_prompt_index={n}; cc_turn_index={n};"));
+        }
     }
     s
 }
@@ -1501,16 +1642,19 @@ mod tests {
         assert!(sys[0]["text"].as_str().unwrap().contains("; cch="), "cch 要在 billing 段里");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli;"
+                "x-anthropic-billing-header: cc_version=2.1.285.bc6; cc_entrypoint=cli;"
             ),
             "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
         );
-        assert!(
-            sys[0]["text"].as_str().unwrap().ends_with("; cc_turn_origin=human;"),
-            "官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human\
-             （cap/2.1.277/00023）: {s}"
-        );
+        // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
+        // （cap/2.1.277/00023），2.1.285 起再跟会话里的第几轮（cap/2.1.285/00030）。几条用例
+        // 共用同一张会话表、同一个会话 id，轮次不一定从 1 起，只钉形态：两个数相等且不小于 1。
+        let billing = sys[0]["text"].as_str().unwrap();
+        let (_, tail) = billing.split_once("; cc_turn_origin=human; cc_prompt_index=").expect(&s);
+        let (prompt, turn) = tail.split_once("; cc_turn_index=").expect(&s);
+        assert_eq!(Some(prompt), turn.strip_suffix(';'), "{s}");
+        assert!(prompt.parse::<u32>().is_ok_and(|n| n >= 1), "{s}");
         assert!(sys[0]["text"].as_str().unwrap().contains("; cc_prompt_id="), "{s}");
         assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "第 1 块必须是那句身份声明");
         assert!(sys[1].get("cache_control").is_none(), "身份句不带断点（官方如此）");
@@ -1518,12 +1662,12 @@ mod tests {
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         // 第四块是官方「其余」段（模板填好占位），客户端自己的 system 不再占一块。
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块: {rest:.80}");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块: {rest:.80}");
         assert!(!unfilled(rest), "占位要全填掉: {rest}");
         let env = crate::proxy::sim_env_for(&test_cred(), "fp");
         assert!(
             rest.contains(&format!(
-                "You have a persistent, file-based memory at `{}/.claude/projects/{}/memory/`.",
+                "You have a persistent file-based memory at `{}/.claude/projects/{}/memory/`.",
                 env.home, env.slug
             )),
             "记忆目录随派生的假环境走: {rest}"
@@ -1564,6 +1708,7 @@ mod tests {
                 "metadata",
                 "max_tokens",
                 "output_config",
+                "thread",
                 "diagnostics"
             ],
             "key 序（来访没带 tools 也补在 system 之后；output_config 在 max_tokens 之后、\
@@ -1746,7 +1891,7 @@ mod tests {
         assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块");
         let env = crate::proxy::sim_env_for(&test_cred(), "fp");
         assert!(
             rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.slug)),
@@ -1766,8 +1911,8 @@ mod tests {
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(
             v["output_config"],
-            serde_json::json!({"effort": "medium"}),
-            "2.1.280 的 opus 主线程是 effort=medium（cap/2.1.280/00021）: {v}"
+            serde_json::json!({"effort": "high"}),
+            "模拟路径 opus 按 high 发（官方默认 medium，见 config::CC_PROFILES）: {v}"
         );
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         let idx =
@@ -1869,17 +2014,17 @@ mod tests {
         assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "四族共用基座");
         assert_eq!(sys[2]["cache_control"]["scope"], "global");
         let rest = sys[3]["text"].as_str().unwrap();
-        assert!(rest.starts_with("Write code that reads like"), "2.1.280 第四块: {rest:.80}");
+        assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块: {rest:.80}");
         assert!(
             !rest.contains("This iteration of Claude"),
-            "2.1.280 不再带 Fable 自我介绍: {rest}"
+            "2.1.280 起不再带 Fable 自我介绍: {rest}"
         );
         assert!(!unfilled(rest), "{rest}");
         assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
         assert!(
             sys[0]["text"].as_str().unwrap().starts_with(
-                "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=cli; cch="
+                "x-anthropic-billing-header: cc_version=2.1.285.bc6; cc_entrypoint=cli; cch="
             ),
             "{v}"
         );
@@ -1908,10 +2053,12 @@ mod tests {
     /// 顺带把裸字符串 `content` 收成官方那样的块数组，否则断点无处可挂。
     #[test]
     fn simulated_body_carries_official_message_breakpoint() {
+        // 只验断点落位：`<total_tokens>` 提醒会把末条的断点挪到它身上（另有用例），这里关掉它。
+        let on = crate::store::ForwardFlags { sim_message_threads: false, ..all_on() };
         // 字符串 content：要转成块数组，断点落在末块。
         let body = Bytes::from(PLAIN_BODY.to_string());
         let sim = sim_for(PLAIN_BODY);
-        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&body, &test_cred(), "fp", on, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let blocks = v["messages"][0]["content"].as_array().expect("content 该收成块数组");
         assert_eq!(blocks[0]["type"], "text", "转出来的该是官方那种文本块");
@@ -1932,7 +2079,7 @@ mod tests {
         );
         let b = Bytes::from(multi.to_string());
         let sim = sim_for(multi);
-        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
@@ -1953,7 +2100,7 @@ mod tests {
         );
         let b = Bytes::from(mine.to_string());
         let sim = sim_for(mine);
-        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             v["messages"][0]["content"][0]["cache_control"],
@@ -2000,7 +2147,7 @@ mod tests {
         );
         let b = Bytes::from(tool_loop.to_string());
         let sim = sim_for(tool_loop);
-        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let msgs = v["messages"].as_array().unwrap();
         let last = msgs.last().unwrap()["content"].as_array().unwrap().last().unwrap();
@@ -2037,7 +2184,7 @@ mod tests {
             );
             let b = Bytes::from(body.clone());
             let sim = sim_for(&body);
-            let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
             let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
             let last = v["messages"].as_array().unwrap().last().unwrap();
             let blk = last["content"].as_array().unwrap().last().unwrap();
@@ -2051,7 +2198,7 @@ mod tests {
         );
         let b = Bytes::from(empty.to_string());
         let sim = sim_for(empty);
-        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"][1]["content"], "", "空串不该被转成空 text 块: {v}");
     }
@@ -2968,6 +3115,442 @@ mod tests {
         );
     }
 
+    /// **对着 `cap/2.1.285` 逐项核**：11 个模型各造一条第三方请求（只有一句 `hi` 和一段客户端
+    /// system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
+    /// `context_management`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
+    ///
+    /// 刻意不比的几项（各有出处）：`effort`（模拟三族一律 high）、动态的 `afk-mode` 与 auto 模式才有的 `safeguards`、
+    /// 官方只在 sonnet / haiku 等首轮写的 `thread`、`max_tokens`（来访自己的）、`stream`。
+    /// 抓包目录不在仓库里（`.gitignore`），没有就跳过。
+    #[test]
+    fn simulated_main_threads_match_the_2_1_285_captures() {
+        let dir = format!("{}/cap/2.1.285", env!("CARGO_MANIFEST_DIR"));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipped: cap/2.1.285 not present");
+            return;
+        };
+        let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
+        let cases = [
+            "00030", "00039", "00045", "00051", "00055", "00061", "00067", "00072", "00077",
+            "00083", "00088",
+        ];
+        for n in cases {
+            let path = files
+                .iter()
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| f.starts_with(n) && f.ends_with(".req.raw"))
+                })
+                .unwrap_or_else(|| panic!("{n}"));
+            let raw = std::fs::read(path).unwrap();
+            let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = std::str::from_utf8(&raw[..sep]).unwrap();
+            let official: serde_json::Value = serde_json::from_slice(&raw[sep + 4..]).unwrap();
+            let model = official["model"].as_str().unwrap();
+            let header = |name: &str| {
+                head.lines().find_map(|l| l.strip_prefix(&format!("{name}: ")[..])).unwrap()
+            };
+
+            let body = Bytes::from(format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"system":"你是助手","max_tokens":32000}}"#
+            ));
+            let sim = detect_for(&body, all_on()).unwrap();
+            let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let h = crate::proxy::build_forward_headers_for(
+                &crate::proxy::HeaderMap::new(),
+                "tok",
+                all_on(),
+                Some(&sim),
+                None,
+                Some(model),
+                false,
+                crate::proxy::BetaCtx::MAIN,
+            );
+
+            // beta：官方串去掉动态的 afk-mode。
+            let want: Vec<&str> = header("anthropic-beta")
+                .split(',')
+                .filter(|b| !b.starts_with("afk-mode-"))
+                .collect();
+            assert_eq!(h["anthropic-beta"], want.join(","), "{model}（{n}）beta");
+            assert_eq!(h["anthropic-dispatch-id"], header("anthropic-dispatch-id"), "{model}");
+            assert_eq!(h["x-claude-code-request-class"], "main", "{model}");
+            let billing = v["system"][0]["text"].as_str().unwrap();
+            let pid = h["x-claude-code-prompt-id"].to_str().unwrap();
+            assert!(
+                billing.contains(&format!("cc_prompt_id={pid};")),
+                "{model}: 头与 billing 同值"
+            );
+            assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
+
+            // `thread`：官方有就是首轮 `create`（opus / sonnet / haiku 各代与 fable-5），fable-5-1
+            // 一条都没有（`00039`），模拟出站与之逐条一致。
+            assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
+            // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
+            let skip = ["safeguards", "stream"];
+            let official_keys: Vec<&str> = official
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !skip.contains(k))
+                .collect();
+            let out_keys: Vec<&str> = v
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !skip.contains(k))
+                .collect();
+            assert_eq!(out_keys, official_keys, "{model}（{n}）键序");
+            assert_eq!(v["thinking"], official["thinking"], "{model} thinking");
+            assert_eq!(v["context_management"], official["context_management"], "{model}");
+            assert_eq!(
+                v["output_config"].get("effort").is_some(),
+                official["output_config"].get("effort").is_some(),
+                "{model}: 带不带 effort 跟官方走（haiku 不带）"
+            );
+
+            // system：billing / 身份 / 基座 / 第四块，第五块是客户端自己的。
+            let sys = v["system"].as_array().unwrap();
+            let osys = official["system"].as_array().unwrap();
+            assert_eq!(sys.len(), 5, "{model}");
+            let billing = sys[0]["text"].as_str().unwrap();
+            assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.285."));
+            assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
+            for i in 1..=2 {
+                assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
+                assert_eq!(sys[i]["cache_control"], osys[i]["cache_control"], "{model} [{i}]");
+            }
+            assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
+            let cap_env = crate::proxy::SimEnv::from_cwd(
+                "/Users/easayliu",
+                "/private/tmp/proxy_captures/20260930_143352",
+            );
+            let official_rest = osys[3]["text"].as_str().unwrap();
+            let end = official_rest.find("EndConversation (deferred tool)").unwrap();
+            let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
+            let official_rest = format!("{}{}", &official_rest[..end], &official_rest[end_to..]);
+            assert_eq!(
+                crate::proxy::render_system_rest(config::CC_SYSTEM_REST, &cap_env),
+                official_rest,
+                "{model}: 第四块按抓包机的环境回填后逐字节相同"
+            );
+
+            // 工具：注入的 14 个内建工具与官方那 14 个逐字节相同（顺序是官方的名字序）。
+            let tools = v["tools"].as_array().unwrap();
+            let otools = official["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 14, "{model}");
+            for t in tools {
+                let name = t["name"].as_str().unwrap();
+                let o =
+                    otools.iter().find(|o| o["name"] == name).unwrap_or_else(|| panic!("{name}"));
+                assert_eq!(t, o, "{model}: {name}");
+            }
+        }
+    }
+
+    /// 一个抓包目录里的全部 `/v1/messages`（含 `count_tokens`）当真 CC 来访过一遍：被送进模拟、
+    /// 被当探针、merge_beta 改了官方串的逐条记下，另给出每条的请求分类。目录不在返回 `None`。
+    #[allow(clippy::type_complexity)]
+    fn official_passthrough_report(
+        sub: &str,
+    ) -> Option<(usize, Vec<String>, Vec<(String, crate::proxy::CcRequestKind)>)> {
+        let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
+        let entries = std::fs::read_dir(&dir).ok()?;
+        let mut files: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| Some(e.ok()?.path()))
+            .filter(|p| p.to_str().is_some_and(|f| f.ends_with(".req.raw")))
+            .collect();
+        files.sort();
+        let mut seen = 0;
+        let mut bad = Vec::new();
+        let mut kinds = Vec::new();
+        for path in files {
+            let raw = std::fs::read(&path).unwrap();
+            let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = std::str::from_utf8(&raw[..sep]).unwrap();
+            if !head.lines().next().unwrap().contains("/v1/messages") {
+                continue;
+            }
+            seen += 1;
+            let name = path.file_name().unwrap().to_str().unwrap()[..5].to_string();
+            let v: serde_json::Value = serde_json::from_slice(&raw[sep + 4..]).unwrap();
+            let mut headers = crate::proxy::HeaderMap::new();
+            for l in head.lines().skip(1) {
+                let Some((k, val)) = l.split_once(": ") else { continue };
+                if let (Ok(k), Ok(val)) = (
+                    crate::proxy::HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes()),
+                    HeaderValue::from_str(val),
+                ) {
+                    headers.insert(k, val);
+                }
+            }
+            let beta_raw = headers
+                .get("anthropic-beta")
+                .and_then(|b| b.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let beta = crate::proxy::inbound_beta_list(&headers);
+            let model = v["model"].as_str().unwrap_or_default();
+            let reason = crate::proxy::simulation_reason(Some(&v), &headers, true, all_on());
+            if let Some(r) = reason {
+                bad.push(format!("{name} {model}: 被送进模拟（{}）", r.tag()));
+            }
+            let probe = crate::proxy::probe_signature(
+                Some(&v),
+                crate::proxy::extract_device_id(Some(&v)).as_deref(),
+                &beta,
+                true,
+                false,
+                || false,
+            );
+            if let Some(p) = probe {
+                bad.push(format!("{name} {model}: 被当探针（{p:?}）"));
+            }
+            // 与 handler 同一条路：请求分类与体里那几项事实决定 merge_beta 补哪些。
+            let kind = crate::proxy::CcRequestKind::of(&v, &beta);
+            kinds.push((name.clone(), kind));
+            let merged = crate::proxy::merge_beta_for(
+                Some(&beta_raw),
+                Some(model),
+                Some((2, 1, 285)),
+                crate::proxy::BetaCtx::of(kind, &raw[sep + 4..], Some(&v)),
+            );
+            if !beta_raw.is_empty() && merged != beta_raw {
+                bad.push(format!(
+                    "{name} {model}: merge_beta 改了官方串\n  官方 {beta_raw}\n  合并 {merged}"
+                ));
+            }
+        }
+        Some((seen, bad, kinds))
+    }
+
+    /// **2.1.285 官方各类请求当真 CC 来访过一遍**（`cap/2.1.285` 的全部 `/v1/messages`：主线程
+    /// 首轮与 thread 续轮、task 通知轮、SDK 子代理首轮与续轮、无工具 helper、子代理摘要、主线程
+    /// 分叉的 auxiliary、标题生成、额度探测）：都得原样透传（不进模拟）、不被当探针拒，
+    /// merge_beta 对官方那串一项不多。抓包目录不在仓库里就跳过。
+    #[test]
+    fn every_2_1_285_official_request_passes_through() {
+        let Some((seen, bad, kinds)) = official_passthrough_report("2.1.285") else {
+            eprintln!("skipped: cap/2.1.285 not present");
+            return;
+        };
+        assert!(seen >= 30, "{seen}");
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        // 请求分类：两种 thread 续轮不能落进「无工具 = helper」。
+        use crate::proxy::CcRequestKind::*;
+        let kind_of = |n: &str| kinds.iter().find(|(k, _)| k == n).map(|(_, k)| *k);
+        for (n, want) in [
+            ("00017", QuotaProbe),
+            ("00038", Title),
+            ("00113", Main),
+            ("00115", Main),     // 主线程 thread 续轮
+            ("00149", Main),     // task 通知那一轮，也是续轮
+            ("00120", Subagent), // 子代理首轮
+            ("00127", Subagent), // 子代理 thread 续轮
+            ("00125", Helper),   // 无工具 helper
+            ("00135", Subagent), // 子代理进度摘要：带工具、`cc_is_subagent`
+        ] {
+            assert_eq!(kind_of(n), Some(want), "{n}");
+        }
+    }
+
+    /// **2.1.285 各种用法的官方请求**（`cap/auto-2.1.285-20260930`：auto / default / plan 权限
+    /// 模式、`-p` 打印模式、`--continue`、`/compact`、fast、各档 effort、1M、fable / sonnet /
+    /// haiku 主线程、Explore / general-purpose / Plan 子代理、WebSearch、`count_tokens`……）
+    /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。
+    #[test]
+    fn every_auto_2_1_285_official_request_passes_through() {
+        let Some((seen, bad, _)) = official_passthrough_report("auto-2.1.285-20260930") else {
+            eprintln!("skipped: cap/auto-2.1.285-20260930 not present");
+            return;
+        };
+        assert!(seen >= 100, "{seen}");
+        assert!(bad.is_empty(), "{} 条：\n{}", bad.len(), bad.join("\n"));
+    }
+
+    /// **2.1.285 新认的几种官方形态**，不靠抓包目录（它不进仓库，CI 上上面两条回放会跳过）：
+    /// 每种按 `cap/auto-2.1.285-20260930` 里的样子造最小的一条，正反各一。
+    #[test]
+    fn auto_2_1_285_official_shapes_are_recognized() {
+        use super::{
+            is_official_count_tokens, is_official_helper_request, is_official_thread_continuation,
+            is_official_title_request, is_official_web_search_request, simulation_reason,
+        };
+        use crate::proxy::CcRequestKind::{self, *};
+        use crate::proxy::{BetaCtx, merge_beta_for};
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let beta = |s: &str| s.split(',').map(str::to_string).collect::<Vec<_>>();
+        let mut cc = crate::proxy::HeaderMap::new();
+        cc.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("claude-cli/2.1.285 (external, cli)"),
+        );
+        let with_beta = |b: &'static str| {
+            let mut h = cc.clone();
+            h.insert("anthropic-beta", HeaderValue::from_static(b));
+            h
+        };
+        let billing =
+            "x-anthropic-billing-header: cc_version=2.1.285.989; cc_entrypoint=cli; cch=821a0;";
+        let identity = config::CC_SYSTEM_IDENTITY;
+
+        // count_tokens：只有三个键 + token-counting beta → 透传、只补 oauth；多一个 max_tokens 就不是。
+        let ct_beta = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                       context-management-2025-06-27,token-counting-2024-11-01";
+        let ct = j(
+            r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"foo"}],"tools":[]}"#,
+        );
+        assert_eq!(simulation_reason(Some(&ct), &with_beta(ct_beta), true, all_on()), None);
+        assert_eq!(CcRequestKind::of(&ct, &beta(ct_beta)), CountTokens);
+        let merged = merge_beta_for(
+            Some(ct_beta),
+            Some("claude-opus-5-5"),
+            Some((2, 1, 285)),
+            BetaCtx::of(CountTokens, ct.to_string().as_bytes(), Some(&ct)),
+        );
+        assert_eq!(merged, ct_beta, "count_tokens 那串一项不多");
+        let mut not_ct = ct.clone();
+        not_ct["max_tokens"] = serde_json::json!(1024);
+        assert!(!is_official_count_tokens(&not_ct, &beta(ct_beta)));
+        assert!(!is_official_count_tokens(&ct, &[]), "没有 token-counting beta 不算");
+
+        // 续轮重发 tools：新增消息里有 tool_reference（ToolSearch 载入）+ mid-conversation-tool-changes。
+        let threads = beta("message-threads-2026-08-12,mid-conversation-tool-changes-2026-07-01");
+        let cont = |msg: &str| {
+            j(&format!(
+                r#"{{"model":"claude-opus-5-5","messages":[{msg}],"system":[{{"type":"text","text":"{billing}"}}],
+                "tools":[{{"name":"Bash","description":"x","input_schema":{{}}}}],
+                "thread":{{"type":"continue","previous_message_id":"msg_01A"}},"diagnostics":{{"previous_message_id":"msg_01A"}}}}"#
+            ))
+        };
+        let loaded = cont(
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"tool_reference","tool_name":"WebSearch"}]},{"type":"text","text":"Tool loaded."}]}"#,
+        );
+        assert!(is_official_thread_continuation(&loaded, &threads));
+        assert!(!is_official_thread_continuation(&loaded, &threads[..1]), "没声明 tool-changes");
+        let mcp = cont(
+            r#"{"role":"system","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"mcp__x__y"}}]}"#,
+        );
+        assert!(is_official_thread_continuation(&mcp, &threads), "MCP 工具中途上线");
+        let plain = cont(
+            r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}"#,
+        );
+        assert!(!is_official_thread_continuation(&plain, &threads), "工具集没变却带 tools");
+
+        // WebSearch 子调用：billing 后面多一句 CC 身份句也认；归 Auxiliary，不进主线程链。
+        let ws = j(&format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":[{{"role":"user","content":"Perform a web search for the query: x"}}],
+            "system":[{{"type":"text","text":"{billing}"}},{{"type":"text","text":"{identity}"}},
+            {{"type":"text","text":"You are an assistant for performing a web search tool use"}}],
+            "tools":[{{"type":"web_search_20250305","name":"web_search"}}],"tool_choice":{{"type":"tool","name":"web_search"}}}}"#
+        ));
+        assert!(is_official_web_search_request(&ws));
+        assert_eq!(CcRequestKind::of(&ws, &[]), Auxiliary);
+
+        // 主线程 WebFetch 页面处理：[不带子代理标记的 billing, CC 身份句] + helper 的 body 与 beta。
+        let helper_beta = config::cc_profile_rows(config::CcProfileKind::HelperSubagentHaiku)
+            .last()
+            .unwrap()
+            .beta;
+        let fetch = j(&format!(
+            r#"{{"model":"claude-haiku-4-5-20251001","messages":[{{"role":"user","content":"\nWeb page content:\n---\nExample"}}],
+            "system":[{{"type":"text","text":"{billing}"}},{{"type":"text","text":"{identity}"}}],
+            "tools":[],"max_tokens":32000,"thinking":{{"type":"disabled"}},"temperature":1,"stream":true}}"#
+        ));
+        assert!(is_official_helper_request(&fetch, &beta(helper_beta)));
+        assert_eq!(CcRequestKind::of(&fetch, &beta(helper_beta)), Auxiliary);
+
+        // 会话起名：380 字节的提示词也算标题一类；几十字节的不算。
+        let naming = |prompt: &str| {
+            j(&format!(
+                r#"{{"model":"claude-haiku-4-5-20251001","messages":[{{"role":"user","content":"<conversation>x</conversation>"}}],
+                "system":[{{"type":"text","text":"{billing}"}},{{"type":"text","text":"{identity}"}},{{"type":"text","text":"{prompt}"}}],
+                "tools":[],"max_tokens":32000,"thinking":{{"type":"disabled"}},"stream":true}}"#
+            ))
+        };
+        let so = beta(config::CC_BETA_STRUCTURED_OUTPUTS);
+        assert!(is_official_title_request(&naming(&"k".repeat(380)), &so));
+        assert!(!is_official_title_request(&naming("Generate a short name."), &so));
+
+        // 分叉与预热的请求分类。
+        let fork = |last: &str| {
+            j(&format!(
+                r#"{{"model":"claude-opus-5-5","messages":[{{"role":"user","content":[{{"type":"text","text":"{last}"}}]}}],
+                "system":[{{"type":"text","text":"{billing}"}}],"tools":[{{"name":"Bash"}}]}}"#
+            ))
+        };
+        assert_eq!(
+            CcRequestKind::of(
+                &fork("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."),
+                &[]
+            ),
+            Fork
+        );
+        assert_eq!(
+            CcRequestKind::of(
+                &fork("<system-reminder>This is a side question from the user.</system-reminder>"),
+                &[]
+            ),
+            Fork
+        );
+        assert_eq!(
+            CcRequestKind::of(&fork("The user stepped away and is coming back. Recap"), &[]),
+            Fork
+        );
+        assert_eq!(CcRequestKind::of(&fork("fix the bug"), &[]), Main);
+        let hi = j(&format!(
+            r#"{{"model":"claude-opus-5-5","max_tokens":1,"system":[{{"type":"text","text":"{billing}"}},{{"type":"text","text":"{identity}"}}],
+            "messages":[{{"role":"user","content":[{{"type":"text","text":"Hi","cache_control":{{"type":"ephemeral"}}}}]}}]}}"#
+        ));
+        assert_eq!(CcRequestKind::of(&hi, &[]), Prewarm);
+        let hi_beta = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                       context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+        assert_eq!(
+            merge_beta_for(
+                Some(hi_beta),
+                Some("claude-opus-5-5"),
+                Some((2, 1, 285)),
+                BetaCtx::of(Prewarm, hi.to_string().as_bytes(), Some(&hi))
+            ),
+            hi_beta,
+            "/model 预热只补 oauth"
+        );
+
+        // extended-cache-ttl 跟着体里的 1h 走；display=omitted 不补 thinking-display-updates。
+        let main_beta = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                         effort-2025-11-24,advanced-tool-use-2025-11-20,cache-diagnosis-2026-04-07";
+        let no_ttl = BetaCtx { ttl_1h: false, ..BetaCtx::MAIN };
+        let merged =
+            merge_beta_for(Some(main_beta), Some("claude-opus-5-5"), Some((2, 1, 285)), no_ttl);
+        assert!(!merged.contains("extended-cache-ttl"), "{merged}");
+        assert!(
+            merge_beta_for(
+                Some(main_beta),
+                Some("claude-opus-5-5"),
+                Some((2, 1, 285)),
+                BetaCtx::MAIN
+            )
+            .contains("extended-cache-ttl")
+        );
+        assert_eq!(
+            crate::proxy::ensure_cache_ttl_beta(&merged),
+            merged.replace("cache-diagnosis", "extended-cache-ttl-2025-04-11,cache-diagnosis"),
+            "改写补出 1h 之后再补回原位"
+        );
+        let omitted = j(
+            r#"{"thinking":{"type":"adaptive","display":"omitted"},"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
+        );
+        let ctx = BetaCtx::of(Main, omitted.to_string().as_bytes(), Some(&omitted));
+        assert_eq!(ctx, BetaCtx { display_omitted: true, ..BetaCtx::MAIN });
+        let fable =
+            merge_beta_for(Some(main_beta), Some("claude-fable-5-1"), Some((2, 1, 285)), ctx);
+        assert!(!fable.contains("thinking-display-updates"), "{fable}");
+    }
+
     /// 第四块模板里 luban 自己的两个占位。只认这两个名字：官方正文里本来就有
     /// `{{…}}` 一类的双花括号写法，不能拿 `{{` 当判据。
     const REST_PLACEHOLDERS: [&str; 2] = ["{{cwd_slug}}", "{{home}}"];
@@ -2983,14 +3566,14 @@ mod tests {
         let asset = config::CC_SYSTEM_REST;
         assert_eq!(
             asset.len(),
-            6738,
-            "2.1.280 第四块模板字节数（7009 去掉 EndConversation 那段与占位差）"
+            4922,
+            "2.1.285 第四块模板字节数（cap/2.1.285/00039 的 5193 去掉 EndConversation 那段 233 与占位差 38）"
         );
         for ph in REST_PLACEHOLDERS {
             assert_eq!(asset.matches(ph).count(), 1, "占位 {ph} 恰好出现一次（记忆目录那一处）");
         }
         assert!(
-            asset.contains("You have a persistent, file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
+            asset.contains("You have a persistent file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
             "记忆目录那句"
         );
         assert!(asset.starts_with("Write code that reads like the surrounding code"));
@@ -3014,23 +3597,27 @@ mod tests {
         // 模型去 ToolSearch 一个客户端没声明的工具，是提示词与工具集不成套。
         assert!(!asset.contains("EndConversation") && !asset.contains("ToolSearch"));
         // 四族共有的那几节都在。
-        for section in [
-            "# Session-specific guidance",
-            "# auto memory",
-            "## Citing memories",
-            "# Environment",
-            "# Context management",
-        ] {
+        for section in
+            ["# Session-specific guidance", "# Memory", "# Environment", "# Context management"]
+        {
             assert!(asset.contains(section), "{section}");
         }
-        // 2.1.277 那份才有的几节，2.1.280 整段删了；有一样在就是拿错了模板。
-        for gone in ["# Delivering work", "# Writing for the user", "This iteration of Claude"] {
+        // 2.1.277 那份才有的几节，2.1.280 整段删了；2.1.280 那份记忆一节的写法（`# auto memory`、
+        // `pinned`、`## Citing memories`），2.1.285 又换掉了。有一样在就是拿错了模板。
+        for gone in [
+            "# Delivering work",
+            "# Writing for the user",
+            "This iteration of Claude",
+            "# auto memory",
+            "## Citing memories",
+            "pinned",
+        ] {
             assert!(!asset.contains(gone), "{gone}");
         }
     }
 
     /// 四族都选同一份模板，填完一个占位都不剩；按抓包机的取值回填能还原抓包那块的字节数
-    /// （7009 去掉 EndConversation 那段 233 字节 = 6776）。
+    /// （`cap/2.1.285/00039` 的 5193 去掉 EndConversation 那段 233 字节 = 4960）。
     #[test]
     fn system_rest_renders_every_placeholder() {
         use crate::proxy::{SimEnv, cc_system_rest, render_system_rest};
@@ -3040,7 +3627,7 @@ mod tests {
             "官方的项目段拼法（cap/2.1.277/00023）"
         );
         let cap =
-            SimEnv::from_cwd("/Users/easayliu", "/private/tmp/proxy_captures/20260923_085115");
+            SimEnv::from_cwd("/Users/easayliu", "/private/tmp/proxy_captures/20260930_143352");
         assert_eq!(
             SimEnv::from_cwd("/Users/x", "/private/tmp/proxy_captures/20260904_170955").slug,
             "-private-tmp-proxy-captures-20260904-170955",
@@ -3052,10 +3639,10 @@ mod tests {
             let t = cc_system_rest(m).expect(m);
             assert_eq!(t, config::CC_SYSTEM_REST, "{m}: 四族同一份");
             let out = render_system_rest(t, &cap);
-            assert_eq!(out.len(), 6776, "{m}: 按 cap/2.1.280/00029 的取值回填");
+            assert_eq!(out.len(), 4960, "{m}: 按 cap/2.1.285/00039 的取值回填");
             assert!(!unfilled(&out), "{m} 有占位没填: {out}");
             assert!(out.contains(
-                "You have a persistent, file-based memory at `/Users/easayliu/.claude/projects/-private-tmp-proxy-captures-20260923-085115/memory/`."
+                "You have a persistent file-based memory at `/Users/easayliu/.claude/projects/-private-tmp-proxy-captures-20260930-143352/memory/`."
             ));
         }
         // 认不出的模型不补第四块：落回「末块放客户端 system」的旧形态。

@@ -74,10 +74,26 @@ use super::uuid_from_bytes;
 /// 2.1.220 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；
 /// 2.1.258 四族以 API-key 端原始请求头为输入，同样逐字节还原订阅端官方串。回归测试见 [`tests::merged_beta_matches_official_order`] 与
 /// [`tests::merged_beta_matches_2_1_258_official_order`]。
-pub(super) fn merge_beta(
+///
+/// **SDK 子代理由调用方告知**（[`BetaCtx::only_oauth`]）：子代理光看 beta 串认不出来：2.1.277 起它带 `advisor-tool`，[`is_official_non_main_beta`]
+/// 那条「有 display-updates 却没有主线程标记」的判据放它过去，于是被当主线程补上
+/// `advanced-tool-use` 与 `extended-cache-ttl`——`cap/2.1.285` 的子代理（claude-code-guide，
+/// `00120` 首轮、`00127` 等五条续轮）两样都不发（[`config::cc_2_1_277_missing_samples`] 第 3 条
+/// 记的正是这个缺口）。调用方从请求体判得出来（billing header 里的 `cc_is_subagent=true`），
+/// 判出来就与其余非主线程 profile 一样只补 `oauth`。`/model` 预热与 `count_tokens` 同理
+/// （[`super::session_link::CcRequestKind::beta_only_oauth`]）。
+///
+/// **`extended-cache-ttl` 只在出站体真写了 `ttl:"1h"` 时补**（[`BetaCtx::ttl_1h`]）：
+/// `cap/auto-2.1.285-20260930` 的 137 条 `/v1/messages` 里，这项 beta 在与不在和体里有没有
+/// `"ttl":"1h"` 一一对应——`/compact`、`/btw` 那两条分叉体里一个 1h 断点都没有，头上也就没有它。
+///
+/// **`thinking.display:"omitted"` 的不补 `thinking-display-updates`**（[`BetaCtx::display_omitted`]）：
+/// `-p` 打印模式四族都写 `omitted`（`00441`、`00554` 等），官方串里就没有这一项。
+pub(super) fn merge_beta_for(
     incoming: Option<&str>,
     model: Option<&str>,
     version: Option<(u64, u64, u64)>,
+    ctx: BetaCtx,
 ) -> String {
     let mut parts: Vec<String> = incoming
         .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
@@ -86,10 +102,20 @@ pub(super) fn merge_beta(
     let pos = |parts: &[String], beta: &str| find_beta(parts, beta);
 
     // 官方非主线程 profile：只保证 `oauth` 在，别的一项都不补。
-    if is_official_non_main_beta(&parts) {
+    if ctx.only_oauth || is_official_non_main_beta(&parts) {
         if !has(&parts, config::OAUTH_BETA_HEADER) {
             let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
             parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
+        }
+        // SDK 子代理订阅端比 API-key 端多的不只 `oauth`：2.1.251 起的子代理带
+        // `cache-diagnosis`（`cap/2.1.285/00120`、`00127`，排在 `message-threads` 之前），API-key
+        // 端不发。`advanced-tool-use` / `extended-cache-ttl` 子代理确实不发，照旧不补。
+        if ctx.subagent
+            && has(&parts, config::CC_BETA_ADVISOR_TOOL)
+            && !has(&parts, config::CC_BETA_CACHE_DIAGNOSIS)
+        {
+            let at = pos(&parts, config::CC_BETA_MESSAGE_THREADS).unwrap_or(parts.len());
+            parts.insert(at, config::CC_BETA_CACHE_DIAGNOSIS.to_string());
         }
         return parts.join(",");
     }
@@ -162,7 +188,7 @@ pub(super) fn merge_beta(
             parts.insert(at, config::CC_BETA_FALLBACK_CREDIT.to_string());
         }
         if seed_has(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
-            if !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
+            if !ctx.display_omitted && !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
                 // 官方位置紧跟 `fallback-credit`（2.1.258 fable、2.1.260 四族）。2.1.270 的
                 // sonnet 不发 `fallback-credit` 了，它就紧跟 `effort`（`cap/2.1.270/00017`：
                 // `…effort,thinking-display-updates,afk-mode…`）。锚点链与上面补
@@ -188,16 +214,87 @@ pub(super) fn merge_beta(
             parts.insert(at, config::CC_BETA_CACHE_DIAGNOSIS.to_string());
         }
     }
-    if !has(&parts, config::CC_BETA_EXTENDED_CACHE_TTL) {
-        let at = pos(&parts, config::CC_BETA_CACHE_DIAGNOSIS).unwrap_or(parts.len());
-        parts.insert(at, config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
+    if ctx.ttl_1h {
+        insert_extended_cache_ttl(&mut parts);
     }
     parts.join(",")
 }
 
+/// `extended-cache-ttl` 不在就补到官方位置：有 `cache-diagnosis` 插它前面，没有追加队尾。
+fn insert_extended_cache_ttl(parts: &mut Vec<String>) {
+    if !has_beta(parts, config::CC_BETA_EXTENDED_CACHE_TTL) {
+        let at = find_beta(parts, config::CC_BETA_CACHE_DIAGNOSIS).unwrap_or(parts.len());
+        parts.insert(at, config::CC_BETA_EXTENDED_CACHE_TTL.to_string());
+    }
+}
+
+/// 出站体改写之后再对一次 `extended-cache-ttl`：头是在改写**之前**建的（改写要看头上有哪些
+/// beta），[`merge_beta_for`] 那时只能按来访体判 [`BetaCtx::ttl_1h`]。API-key 端的三块形态被
+/// 整形时断点会被补成 `ttl:"1h"`（[`super::rewrite_body`] 里的 `fill_cache_ttl`），来访体没有、
+/// 出站体有——这时头上得跟着补，否则上游按 5 分钟算、还是「体里写了字段头上没声明」。
+/// 反过来不删：luban 从不去掉体里已有的 1h，来访有、出站就有。
+pub(super) fn ensure_cache_ttl_beta(beta: &str) -> String {
+    let mut parts: Vec<String> =
+        beta.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+    insert_extended_cache_ttl(&mut parts);
+    parts.join(",")
+}
+
+/// [`merge_beta_for`] 要的那几项**请求事实**：它自己只看得到 beta 串，这几样得从请求体与请求
+/// 分类里来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BetaCtx {
+    /// 只补 `oauth`、别的一项不动（[`super::session_link::CcRequestKind::beta_only_oauth`]）。
+    pub(super) only_oauth: bool,
+    /// 出站体里有 `ttl:"1h"` 的断点：只有这时才补 `extended-cache-ttl`。
+    pub(super) ttl_1h: bool,
+    /// `thinking.display` 是 `"omitted"`：不补 `thinking-display-updates`。
+    pub(super) display_omitted: bool,
+    /// SDK 子代理：只补 `oauth` 之外还要补 `cache-diagnosis`，见 [`merge_beta_for`]。
+    pub(super) subagent: bool,
+}
+
+impl BetaCtx {
+    /// 主线程、体里带 1h 断点、不压思考——订阅端主线程最常见的那一种，也是测试里按 API-key
+    /// 端残缺串还原官方串时默认的前提。
+    pub(super) const MAIN: Self =
+        Self { only_oauth: false, ttl_1h: true, display_omitted: false, subagent: false };
+
+    /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份。1h 断点先按字节粗筛
+    /// （[`super::body::body_has_pair`]），命中再按解析好的体逐个断点核（[`super::body::has_cache_ttl_1h`]）
+    /// ——工具入参里的 `ttl:"1h"` 不算。转发循环外算一次，换号重试沿用。
+    pub(super) fn of(
+        kind: super::session_link::CcRequestKind,
+        raw: &[u8],
+        body: Option<&serde_json::Value>,
+    ) -> Self {
+        Self {
+            only_oauth: kind.beta_only_oauth(),
+            ttl_1h: super::body::body_has_pair(raw, b"\"ttl\"", b"\"1h\"")
+                && body.is_some_and(super::body::has_cache_ttl_1h),
+            display_omitted: body
+                .and_then(|v| v.get("thinking"))
+                .and_then(|t| t.get("display"))
+                .and_then(|d| d.as_str())
+                == Some("omitted"),
+            subagent: kind == super::session_link::CcRequestKind::Subagent,
+        }
+    }
+}
+
+/// [`merge_beta_for`] 的测试简写：主线程（[`BetaCtx::MAIN`]）。
+#[cfg(test)]
+pub(super) fn merge_beta(
+    incoming: Option<&str>,
+    model: Option<&str>,
+    version: Option<(u64, u64, u64)>,
+) -> String {
+    merge_beta_for(incoming, model, version, BetaCtx::MAIN)
+}
+
 /// 出站体带 `fallbacks` 时头上必须有 `server-side-fallback`：串里没有（按名字比、不比
 /// 日期）就补 2.1.260 那个日期（[`config::CC_BETA_SERVER_SIDE_FALLBACK_JUN`]，数组形态的
-/// `fallbacks` 只认它），位置照 [`merge_beta`]：`effort` 之后，没有则 `advanced-tool-use`
+/// `fallbacks` 只认它），位置照 [`merge_beta_for`]：`effort` 之后，没有则 `advanced-tool-use`
 /// 之后，都没有追加在末尾。已经带了（fable 的官方串、2.1.258 的客户端）一个字不动。
 pub(super) fn ensure_fallback_beta(beta: String) -> String {
     let mut parts: Vec<String> =
@@ -216,7 +313,7 @@ pub(super) fn ensure_fallback_beta(beta: String) -> String {
 ///
 /// `beta` 传的是含日期的全名（常量都是那个形态），比较时只取到最后一个 `-` 之前的名字段：
 /// `server-side-fallback-2026-07-01` 与 `server-side-fallback-2026-06-01` 是同一项换了
-/// 日期，不是两项。逐字相等地判会让 [`merge_beta`] 给一个已经带新日期的来访再插一条旧的。
+/// 日期，不是两项。逐字相等地判会让 [`merge_beta_for`] 给一个已经带新日期的来访再插一条旧的。
 pub(super) fn has_beta(parts: &[String], beta: &str) -> bool {
     find_beta(parts, beta).is_some()
 }
@@ -241,7 +338,7 @@ fn beta_name(beta: &str) -> &str {
 }
 
 /// 这串 beta 是不是官方**非主线程** profile 那几套之一（SDK 子代理、无工具 helper、
-/// 标题生成、安全分类、额度探测）。命中即 [`merge_beta`] 只补 `oauth`、别的一项都不动。
+/// 标题生成、安全分类、额度探测）。命中即 [`merge_beta_for`] 只补 `oauth`、别的一项都不动。
 ///
 /// 它们各自的 beta 集合都比主线程短得多，把主线程那几项（`advanced-tool-use` /
 /// `server-side-fallback` / `extended-cache-ttl` / `cache-diagnosis`）补进去，拼出来的是
@@ -261,7 +358,7 @@ fn beta_name(beta: &str) -> &str {
 ///    `advisor-tool`（2.1.258/2.1.260 的 haiku 主线程）；2.1.220 那代的 haiku
 ///    （[`tests::BETA_PAIRS`]）压根没有 `thinking-display-updates`。
 ///
-/// 走到 [`merge_beta`] 的只有 CC 形态的来访（非 CC 形态的走模拟路径），所以「没有
+/// 走到 [`merge_beta_for`] 的只有 CC 形态的来访（非 CC 形态的走模拟路径），所以「没有
 /// claude-code beta」在这里是个可用的信号，而不是「随便哪个第三方客户端」。
 pub(super) fn is_official_non_main_beta(parts: &[String]) -> bool {
     // 一项都没带不算：官方每个 profile 至少五项。压根没有 `anthropic-beta` 头的来访要走
@@ -287,7 +384,7 @@ pub(super) fn is_official_non_main_beta(parts: &[String]) -> bool {
 /// **头序**：`HeaderMap` 按插入序迭代，hyper 也按这个顺序写到线上，所以来访客户端的头序
 /// 默认是保住的。但「先在 [`is_forwardable`] 里剥离、之后再 `insert`」会把那些头从原位摘走、
 /// 追加到队尾（`anthropic-beta`/`anthropic-version`/`authorization` 都是），得到官方客户端
-/// 不会产生的排列——和 [`merge_beta`] 要解决的问题同类，只是从「值内顺序」变成「头之间顺序」。
+/// 不会产生的排列——和 [`merge_beta_for`] 要解决的问题同类，只是从「值内顺序」变成「头之间顺序」。
 /// 故这里让它们照常转发，再用 `insert` 覆盖：`insert` 命中已有 key 时原位替换值，位置不动。
 ///
 /// 只在客户端没带时才补的头（`accept-encoding`、`x-client-request-id`）没有原位可循，
@@ -311,12 +408,13 @@ pub(super) fn build_forward_headers(
     sim: Option<&Simulation>,
     session_id: Option<&str>,
 ) -> HeaderMap {
-    build_forward_headers_for(headers, token, flags, sim, session_id, None, false)
+    build_forward_headers_for(headers, token, flags, sim, session_id, None, false, BetaCtx::MAIN)
 }
 
-/// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta`] 做族相关的两条
+/// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta_for`] 做族相关的两条
 /// 规则（fable 的 `thinking-display-updates` / `redact-thinking`）。转发路径与探测都知道模型，
 /// 走这个；不带模型的那个留给测试与无 body 的场景。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_forward_headers_for(
     headers: &HeaderMap,
     token: &str,
@@ -327,6 +425,8 @@ pub(super) fn build_forward_headers_for(
     // 出站体会带 `fallbacks`（[`refusal_fallbacks_for`]）：头上必须有 `server-side-fallback`
     // beta，否则是「体里写了字段、头上没声明」的自相矛盾，见 [`ensure_fallback_beta`]。
     fallback_beta: bool,
+    // 喂给 [`merge_beta_for`] 的请求事实（只补 `oauth` 的几类、体里有没有 1h 断点……）。
+    beta_ctx: BetaCtx,
 ) -> HeaderMap {
     let mut out = match sim {
         // 模拟模式：来访那套头一个不留，整体换成官方的（见 [`official_headers`]）。
@@ -367,17 +467,17 @@ pub(super) fn build_forward_headers_for(
     }
     // anthropic-beta：两条路各走各的。
     //
-    // - 模拟路径：整串由 profile 直接给出（[`simulated_beta`]），**不过** [`merge_beta`]。
+    // - 模拟路径：整串由 profile 直接给出（[`simulated_beta`]），**不过** [`merge_beta_for`]。
     //   那套增量规则是拿来补 API-key 端残缺串的，对一份已经完整的官方串只会往里插上一版
     //   才发的项。
-    // - CC 形态来访：仍走 [`merge_beta`]，按经验规则把订阅端多出来的几项补回官方位置。
+    // - CC 形态来访：仍走 [`merge_beta_for`]，按经验规则把订阅端多出来的几项补回官方位置。
     let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
     let beta = match sim {
-        Some(sim) => Some(simulated_beta(sim.profile.beta, incoming)),
+        Some(sim) => Some(simulated_beta(&sim.beta, incoming)),
         None if flags.merge_beta => {
-            // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta`]。
+            // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta_for`]。
             let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-            Some(merge_beta(incoming, model, version.and_then(trusted_cc_version)))
+            Some(merge_beta_for(incoming, model, version.and_then(trusted_cc_version), beta_ctx))
         }
         None => None,
     };
@@ -463,6 +563,20 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
     // （[`config::CcProfile::request_class`]）；线上位置由 [`config::CC_HEADER_ORDER`] 归到
     // `x-app` 之后。
     out.insert("x-claude-code-request-class", HeaderValue::from_static(sim.profile.request_class));
+    // 2.1.285 起每条 messages 都带（[`config::CC_DISPATCH_ID`]），额度探测那条不带
+    // （`cap/2.1.285/00017`）。线上位置由 [`config::CC_HEADER_ORDER`] 归到
+    // `anthropic-dangerous-direct-browser-access` 之后。
+    if sim.profile.kind != config::CcProfileKind::QuotaProbe {
+        out.insert("anthropic-dispatch-id", HeaderValue::from_static(config::CC_DISPATCH_ID));
+    }
+    // 2.1.285 起与 billing header 里的 `cc_prompt_id` 同值同现（见 [`config::CC_HEADER_ORDER`]
+    // 里那一项的出处）。
+    if super::parse_version(sim.profile.version).is_some_and(|v| v >= (2, 1, 285))
+        && let Some(pid) = sim.link.prompt_id.as_deref()
+        && let Ok(v) = HeaderValue::from_str(pid)
+    {
+        out.insert("x-claude-code-prompt-id", v);
+    }
     if let Ok(v) = HeaderValue::from_str(&uuid_v4()) {
         out.insert("x-client-request-id", v);
     }
@@ -472,18 +586,20 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
 /// 模拟模式的 `anthropic-beta`：profile 那串（[`config::CcProfile::beta`]，逐字取自抓包）
 /// 打底，补上 `oauth` 的官方位置，来访客户端自己带的项去重后**追加在后面**。
 ///
-/// **不再过 [`merge_beta`]。** 那套增量落位规则的输入是 API-key 端的**残缺**串，作用是把
+/// **不再过 [`merge_beta_for`]。** 那套增量落位规则的输入是 API-key 端的**残缺**串，作用是把
 /// 订阅端多出来的几项补回官方位置；而 profile 里那串本来就是完整的订阅端官方串，再过一遍
 /// 只会按 2.1.258 的规则往里插 `server-side-fallback` 之类 2.1.260 已经不发的项——补出一个
 /// 两个版本的混合体。
 ///
 /// 追加而非插空：客户端带的多半是官方不发的项（`output-128k` 之类），本来就没有「官方位置」
 /// 可言，硬塞进官方串中间反而造出一个官方不产生的排列。丢掉它们更不行——那是客户端明确要的
-/// 能力，丢了它的请求就直接变了语义。
+/// 能力，丢了它的请求就直接变了语义。例外是 [`config::CC_BETA_CONTEXT_1M`]：官方 1M 会话也发，
+/// 位置有抓包可依——紧跟开头的 `claude-code` / `oauth`（`cap/auto-2.1.285-20260930/00235`）。
+/// 来访不带就不注入，普通 200K 请求照旧没有它。
 ///
 /// `oauth` 的落位：官方串以 `claude-code-20250219` 开头时紧随其后（opus / fable / sonnet），
 /// 否则排在最前（haiku 三个 profile 的 `claude-code` 在串中间，`oauth` 在队首）。这两种
-/// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta`] 用的同一条规则。
+/// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta_for`] 用的同一条规则。
 pub(super) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
     let mut parts: Vec<&str> = seed.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let at = usize::from(parts.first() == Some(&config::CC_BETA_CLAUDE_CODE));
@@ -523,6 +639,15 @@ pub(super) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
                 beta = p,
                 "forwarding a client beta luban does not recognize; upstream decides"
             );
+        }
+        if beta_name(p) == beta_name(config::CC_BETA_CONTEXT_1M) {
+            let head = [config::CC_BETA_CLAUDE_CODE, config::OAUTH_BETA_HEADER];
+            let at = parts
+                .iter()
+                .take_while(|q| head.iter().any(|h| beta_name(q) == beta_name(h)))
+                .count();
+            parts.insert(at, p);
+            continue;
         }
         parts.push(p);
     }
@@ -792,7 +917,7 @@ mod tests {
         assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
     }
 
-    /// 2.1.270 的**完整订阅端串**经 [`merge_beta`] 必须一个字不动。
+    /// 2.1.270 的**完整订阅端串**经 [`merge_beta_for`] 必须一个字不动。
     ///
     /// `cap/2.1.270/00017` / `00025`（sonnet-5 直连，同一会话首轮与续轮，beta 逐字相同）：
     /// 这一版 sonnet 主线程**不发** `server-side-fallback` 与 `fallback-credit`，队尾多了
@@ -1045,6 +1170,7 @@ mod tests {
             simulate_cc: false,
             simulate_full_system: false,
             fill_absent_tools: false,
+            sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
             cache_scope_global: false,
@@ -1287,6 +1413,49 @@ mod tests {
         assert_eq!(appended, ["content-length", "host"], "\n{raw}");
     }
 
+    /// 2.1.285 起模拟的 messages 请求带 `anthropic-dispatch-id: v2d`，额度探测不带
+    /// （`cap/2.1.285/00030` / `00017`）；线上位置在 `anthropic-dangerous-direct-browser-access`
+    /// 与 `anthropic-version` 之间。SDK 版本头跟着升到 0.127.0。
+    #[test]
+    fn simulated_messages_carry_the_dispatch_id() {
+        let sim = sim_for(PLAIN_BODY);
+        let out = build_forward_headers(
+            &crate::proxy::HeaderMap::new(),
+            "tok",
+            all_on(),
+            Some(&sim),
+            None,
+        );
+        assert_eq!(out["anthropic-dispatch-id"], config::CC_DISPATCH_ID);
+        assert_eq!(out["x-stainless-package-version"], "0.127.0");
+        // 与 billing header 里的 `cc_prompt_id` 同值。
+        let pid = sim.link.prompt_id.as_deref().expect("主线程有 prompt id");
+        assert_eq!(out["x-claude-code-prompt-id"], pid);
+        let probe = crate::proxy::probe_simulation(
+            &crate::proxy::test_support::test_cred(),
+            "claude-haiku-4-5-20251001",
+        );
+        assert_eq!(probe.profile.kind, config::CcProfileKind::QuotaProbe);
+        let out = build_forward_headers(
+            &crate::proxy::HeaderMap::new(),
+            "tok",
+            all_on(),
+            Some(&probe),
+            None,
+        );
+        assert!(out.get("anthropic-dispatch-id").is_none(), "额度探测官方不带");
+        assert!(out.get("x-claude-code-prompt-id").is_none(), "没有 cc_prompt_id 就不带");
+        let order = config::CC_HEADER_ORDER;
+        let at = |h: &str| order.iter().position(|x| *x == h).unwrap();
+        assert_eq!(
+            at("anthropic-dispatch-id"),
+            at("anthropic-dangerous-direct-browser-access") + 1
+        );
+        assert_eq!(at("anthropic-version"), at("anthropic-dispatch-id") + 1);
+        assert_eq!(at("x-claude-code-prompt-id"), at("x-claude-code-prev-tool-durations") + 1);
+        assert_eq!(at("x-claude-code-request-class"), at("x-claude-code-prompt-id") + 1);
+    }
+
     /// 补齐的 x-client-request-id 是标准 uuid v4 形态。
     #[test]
     fn generates_uuid_v4() {
@@ -1330,6 +1499,7 @@ mod tests {
             None,
             Some("claude-opus-5"),
             true,
+            crate::proxy::BetaCtx::MAIN,
         );
         let beta = with.get("anthropic-beta").unwrap().to_str().unwrap().to_string();
         assert_eq!(beta.matches("server-side-fallback-").count(), 1, "{beta}");
@@ -1345,6 +1515,7 @@ mod tests {
             None,
             Some("claude-opus-5"),
             false,
+            crate::proxy::BetaCtx::MAIN,
         );
         assert!(
             !without
@@ -1357,64 +1528,158 @@ mod tests {
     }
 
     /// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
-    /// [`config::CC_PROFILES`] 里几串 beta 唯一的正确性依据。官方串取自 `cap/2.1.280`
-    /// 非 auto 模式那段的主线程（haiku 只有 auto 段样本，它在两种模式下形态本就一致）。
+    /// [`config::CC_PROFILES`] 里几串 beta 与 [`config::cc_model_beta`] 按代际去项的唯一正确性
+    /// 依据。官方串逐字取自 `cap/2.1.285`（同一会话里 `/model` 切了 11 个模型，各一轮主线程），
+    /// 去掉动态的 `afk-mode`。
     ///
-    /// 四族分开验：haiku 不发 `mid-conversation-*`/`effort` 且 `claude-code-20250219` 在**串
-    /// 中间**；四族队尾都是 `message-threads`；opus 多 `context-1m`；opus / fable 多 `per-turn-control`
-    /// 与 `mid-conversation-tool-changes`。共用一份种子串就会给某一族发出真实客户端不产生的排列。
     #[test]
     fn simulated_beta_matches_official() {
-        // cap/2.1.280/00065（opus-5-5 直连，非 auto 模式）。
-        const OFFICIAL_OPUS: &str = "claude-code-20250219,oauth-2025-04-20,\
-             context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
-             thinking-token-count-2026-05-13,context-management-2025-06-27,\
-             prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
-             per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
-             advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
-             mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
-             dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
-             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
-             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-        // cap/2.1.280/00068（fable-5-1 直连，非 auto 模式）。
-        const OFFICIAL_FABLE: &str = "claude-code-20250219,oauth-2025-04-20,\
-             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,\
-             mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
-             effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
-             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
-             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-        // cap/2.1.280/00073（sonnet-5 直连，非 auto 模式，`thread: create`）。
-        const OFFICIAL_SONNET: &str = "claude-code-20250219,oauth-2025-04-20,\
-             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
-             effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
-             thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
-             cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-        // cap/2.1.280/00038（haiku-4.5 直连，`thread: create`）。
-        const OFFICIAL_HAIKU: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
-             thinking-token-count-2026-05-13,context-management-2025-06-27,\
-             prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
-             advanced-tool-use-2025-11-20,dangerous-tool-use-2026-09-03,\
-             thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
-             extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
-             message-threads-2026-08-12";
-
-        for (model, official) in [
-            ("claude-sonnet-5", OFFICIAL_SONNET),
-            ("claude-opus-5", OFFICIAL_OPUS),
-            ("claude-fable-5-1", OFFICIAL_FABLE),
-            ("claude-fable-5", OFFICIAL_FABLE), // 没有 fable-5 样本，按族归 fable
-            ("gpt-4o", OFFICIAL_SONNET),        // 认不出的模型退回 sonnet 主串
-            ("claude-haiku-4-5-20251001", OFFICIAL_HAIKU),
-        ] {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "00030",
+                "claude-opus-5-5",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+                 advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+                 mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+                 dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
+                 thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+                 cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+            ),
+            (
+                "00039",
+                "claude-fable-5-1",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+                 advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+                 mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+                 dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
+                 thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+                 cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+            ),
+            (
+                "00045",
+                "claude-sonnet-5-5",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 per-turn-control-2026-07-01,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+                 effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00051",
+                "claude-haiku-4-5-20251001",
+                "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00055",
+                "claude-sonnet-5",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+                 mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+                 dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
+                 thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+                 cache-diagnosis-2026-04-07,message-threads-2026-08-12",
+            ),
+            (
+                "00061",
+                "claude-opus-5",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+                 effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00067",
+                "claude-fable-5",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+                 effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00072",
+                "claude-opus-4-8",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 mid-conversation-tool-changes-2026-07-01,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+                 effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00077",
+                "claude-opus-4-7",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00083",
+                "claude-opus-4-6",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+            (
+                "00088",
+                "claude-sonnet-4-6",
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+                 advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+                 thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+                 extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,\
+                 message-threads-2026-08-12",
+            ),
+        ];
+        for (cap, model, official) in cases {
             let profile = crate::proxy::cc_profile_for(model);
-            assert_eq!(crate::proxy::simulated_beta(profile.beta, None), official, "{model}");
+            let beta = config::cc_model_beta(profile, model);
+            assert_eq!(crate::proxy::simulated_beta(&beta, None), *official, "{model}（{cap}）");
         }
+        // 认不出的模型退回 sonnet 族全集。
+        assert_eq!(
+            config::cc_model_beta(crate::proxy::cc_profile_for("gpt-4o"), "gpt-4o"),
+            cases[2].2.replacen("oauth-2025-04-20,", "", 1)
+        );
 
         // 客户端自己要的 beta 不丢，去重后追加在官方串之后。
         let with_client = crate::proxy::simulated_beta(
@@ -1426,6 +1691,23 @@ mod tests {
             "客户端的 beta 被丢了: {with_client}"
         );
         assert_eq!(with_client.matches("effort-2025-11-24").count(), 1, "重复项: {with_client}");
+
+        // `context-1m` 有官方位置：`oauth` 之后、`interleaved-thinking` 之前
+        // （`cap/auto-2.1.285-20260930/00235`）；不带就不注入。
+        let opus = crate::proxy::cc_profile_for("claude-opus-5-5");
+        let one_m = crate::proxy::simulated_beta(
+            opus.beta,
+            Some("output-128k-2025-02-19,context-1m-2025-08-07"),
+        );
+        assert!(
+            one_m.starts_with(
+                "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,\
+                 interleaved-thinking-2025-05-14,"
+            ),
+            "{one_m}"
+        );
+        assert!(one_m.ends_with(",output-128k-2025-02-19"), "其余客户端项仍追加在队尾: {one_m}");
+        assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
     }
 
     /// 2.1.277 三个辅助 profile 的 beta 串逐字对上抓包（去掉 `oauth` 之后；四族主线程由
@@ -1464,23 +1746,33 @@ mod tests {
             assert_eq!(p.version, "2.1.277", "{kind:?}");
             assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
         }
-        // 2.1.280 的额度探测（`cap/2.1.280/00008`）与 2.1.277 逐字相同。
+        // 2.1.285 的额度探测（`cap/2.1.285/00017`）与 2.1.277 逐字相同。
         let quota = config::cc_profile(QuotaProbe);
-        assert_eq!((quota.version, quota.beta), ("2.1.280", cases[2].2));
-        // 每个 2.1.280 主线程 profile 的 `oauth` 都由 simulated_beta 落到官方位置：以 claude-code
-        // 开头的紧随其后，haiku 排在最前（cap/2.1.280/00038 头两项 `oauth,interleaved`）。
+        assert_eq!((quota.version, quota.beta), ("2.1.285", cases[2].2));
+        // 2.1.285 的标题生成（`cap/2.1.285/00038`）比 2.1.277 多 `dangerous-tool-use` 与队尾的
+        // `message-threads`。
+        assert_eq!(
+            config::cc_profile(SessionTitleHaiku).beta,
+            "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\
+             structured-outputs-2025-12-15,dangerous-tool-use-2026-09-03,\
+             cache-diagnosis-2026-04-07,message-threads-2026-08-12"
+        );
+        // 每个主线程 profile 的 `oauth` 都由 simulated_beta 落到官方位置：以 claude-code
+        // 开头的紧随其后，haiku 排在最前（cap/2.1.285/00051 头两项 `oauth,interleaved`）。
         assert!(
             crate::proxy::simulated_beta(config::cc_profile(MainHaiku).beta, None)
                 .starts_with("oauth-2025-04-20,interleaved-thinking-2025-05-14,")
         );
         assert!(
             crate::proxy::simulated_beta(config::cc_profile(MainOpus).beta, None)
-                .starts_with("claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,")
+                .starts_with("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-")
         );
     }
 
     /// 六个已观察的 2.1.260 profile 的 beta 串逐字对上抓包（去掉 `oauth` 与动态的 `afk-mode`
-    /// 之后）。这张表现在只给 2.1.260 ~ 2.1.276 来访的 [`merge_beta`] 做参照，与 2.1.277 表没
+    /// 之后）。这张表现在只给 2.1.260 ~ 2.1.276 来访的 [`merge_beta_for`] 做参照，与 2.1.277 表没
     /// 编的两个 kind 兜底，验收照旧。
     #[test]
     fn profile_betas_match_the_2_1_260_captures() {
@@ -1536,7 +1828,7 @@ mod tests {
         }
     }
 
-    /// [`merge_beta`] 对一条**完整的** 2.1.277 / 2.1.280 订阅端串必须幂等：参照串按来访版本
+    /// [`merge_beta_for`] 对一条**完整的** 2.1.277 / 2.1.280 / 2.1.285 订阅端串必须幂等：参照串按来访版本
     /// 取那一版的表，`server-side-fallback` 四族都不在参照里、不补；2.1.277 的 `fallback-credit`
     /// 已在位，2.1.280 的参照里没有它、也不补。参照选错一版就会把上一版才有的项塞回来——
     /// 2.1.280 的串拿 2.1.277 表去补，就会在 `effort` 后面多出一个 `fallback-credit`。
@@ -1562,9 +1854,36 @@ mod tests {
                 assert!(!official.contains("server-side-fallback"), "{kind:?}");
             }
         }
+        // 2.1.285：11 个模型各自的官方串（族全集按代际去项，[`config::cc_model_beta`]）过
+        // merge_beta 同样一项不多——它只按族补缺，老模型少的那几项（`mid-conversation-system`
+        // 一系、`per-turn-control`）不会被补回来。
+        for model in [
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        ] {
+            let version = Some((2, 1, 285));
+            let profile = config::cc_profile_at(super::cc_profile_kind_for(model), version);
+            assert_eq!(profile.version, "2.1.285", "{model}");
+            let official =
+                crate::proxy::simulated_beta(&config::cc_model_beta(profile, model), None);
+            assert_eq!(
+                merge_beta(Some(&official), Some(model), version),
+                official,
+                "{model}: 完整的 2.1.285 官方串过 merge_beta 不该多一项"
+            );
+        }
     }
 
-    /// 官方辅助请求经 [`merge_beta`] 之后**一项都不多**：它们各有一套更短的 beta 集合，
+    /// 官方辅助请求经 [`merge_beta_for`] 之后**一项都不多**：它们各有一套更短的 beta 集合，
     /// 主线程那几项（`advanced-tool-use`/`server-side-fallback`/`extended-cache-ttl`…）
     /// 补进去就是一个官方从不产生的串。API-key 端不发 `oauth`，那一项要补。
     #[test]
@@ -1747,5 +2066,39 @@ mod tests {
         for (name, _) in config::CC_SIM_HEADERS {
             assert!(out.contains_key(*name), "缺头 {name}");
         }
+    }
+
+    /// `extended-cache-ttl` 只认真断点上的 `cache_control.ttl`：历史工具入参里的 `ttl:"1h"`
+    /// （以 `cap/auto-2.1.285-20260930/00175` 那种体为底）、schema 里的同名字段都不算；
+    /// 消息块与 `tool_result` 内层块上的 1h 断点照认。
+    #[test]
+    fn only_real_cache_breakpoints_count_as_ttl_1h() {
+        let ctx = |body: serde_json::Value| {
+            let raw = body.to_string();
+            super::BetaCtx::of(crate::proxy::CcRequestKind::Main, raw.as_bytes(), Some(&body))
+                .ttl_1h
+        };
+        let tool_input = serde_json::json!({
+            "system": [{ "type": "text", "text": "x", "cache_control": { "type": "ephemeral" } }],
+            "tools": [{ "name": "Cache", "input_schema": { "properties": { "ttl": { "const": "1h" } } } }],
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Cache",
+                      "input": { "ttl": "1h", "cache_control": { "ttl": "1h" } } },
+                ] },
+            ],
+        });
+        assert!(!ctx(tool_input), "工具入参与 schema 里的 ttl 不是断点");
+        let on_block = serde_json::json!({ "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "hi", "cache_control": { "type": "ephemeral", "ttl": "1h" } },
+        ] }] });
+        assert!(ctx(on_block));
+        let in_result = serde_json::json!({ "messages": [{ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "t1", "content": [
+                { "type": "text", "text": "ok", "cache_control": { "type": "ephemeral", "ttl": "1h" } },
+            ] },
+        ] }] });
+        assert!(ctx(in_result));
     }
 }

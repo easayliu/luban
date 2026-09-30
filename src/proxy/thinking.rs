@@ -74,7 +74,12 @@ pub(super) async fn retry_demoted_thinking(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry("demoted_thinking", up.headers(), &retried);
+    rl.note_retry(
+        "demoted_thinking",
+        up.headers(),
+        &retried,
+        upstream.sim.as_ref().and_then(|s| s.take_thread()),
+    );
     Some(up)
 }
 
@@ -205,7 +210,12 @@ pub(super) async fn retry_without_prefill(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry("no_prefill", up.headers(), &retried);
+    rl.note_retry(
+        "no_prefill",
+        up.headers(),
+        &retried,
+        upstream.sim.as_ref().and_then(|s| s.take_thread()),
+    );
     Some(up)
 }
 

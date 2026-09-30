@@ -783,6 +783,7 @@ queryClient.setQueryData(['settings'], {
   simulate_cc: true,
   simulate_full_system: true,
   fill_absent_tools: true,
+  sim_message_threads: true,
   fill_metadata: true,
   rate_limit_retry: true,
   cache_scope_global: true,

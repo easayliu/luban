@@ -2685,6 +2685,9 @@ impl CredentialStore {
         if let Some(v) = on(FILL_ABSENT_TOOLS) {
             flags.fill_absent_tools = v;
         }
+        if let Some(v) = on(SIM_MESSAGE_THREADS) {
+            flags.sim_message_threads = v;
+        }
         if let Some(v) = on(FILL_METADATA) {
             flags.fill_metadata = v;
         }
@@ -2964,6 +2967,10 @@ pub const SIMULATE_FULL_SYSTEM: &str = "simulate_full_system";
 /// 见 [`ForwardFlags::fill_absent_tools`]。
 pub const FILL_ABSENT_TOOLS: &str = "fill_absent_tools";
 
+/// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
+/// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。
+pub const SIM_MESSAGE_THREADS: &str = "sim_message_threads";
+
 /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，是否补一份官方形态身份的 settings 键名。
 /// 缺省视为开启：官方**每条**请求都带那个字段，缺了就是一处白给的判据。
 pub const FILL_METADATA: &str = "fill_metadata";
@@ -3221,6 +3228,18 @@ pub struct ForwardFlags {
     /// - **关**：不带工具的请求一个工具都不注（空数组原样发出）。自己带了工具的两种取值下都补缺。
     ///   luban 自己的连通性探测不受这项管，恒补。
     pub fill_absent_tools: bool,
+    /// 模拟路径的主线程按官方 2.1.285 的 message threads 形态写 `thread`（[`Self::simulate_cc`]
+    /// 的子项，fable-5-1 除外——官方那一代不发）。
+    ///
+    /// - **开**（默认）：会话里一段对话的第一条写 `thread: {type: create}`；之后来访的历史若正好是
+    ///   「上一轮 + 上游那条回复 + 新消息」，写 `thread: {type: continue}`、只发新增消息，接不上
+    ///   （改了历史、重新生成、换了模型 / effort / system / tools、上一条失败）就再 `create`。
+    ///   官方 opus / sonnet / haiku 主线程每条都带 `thread`，同一会话里除首轮与上述事件外全是
+    ///   `continue`（`cap/auto-2.1.285-20260930`）。每条主线程请求（含 fable-5-1）末尾同时补上
+    ///   官方的 `<total_tokens>N tokens left</total_tokens>` 提醒，N 按官方倒数算法（新输入重置为
+    ///   1500 万，工具续轮减去本轮上下文的增量）。
+    /// - **关**：不写 `thread`、不补提醒，每轮发完整上下文（2.1.280 非 auto 模式 opus / fable 的形态）。
+    pub sim_message_threads: bool,
     /// 已是 CC 形态、但不带 `metadata.user_id` 的请求，补一份官方形态的身份
     /// （见 [`crate::proxy::bare_session_id`]）。
     pub fill_metadata: bool,
@@ -3446,6 +3465,7 @@ impl Default for ForwardFlags {
             simulate_cc: true,
             simulate_full_system: true,
             fill_absent_tools: true,
+            sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,
             cache_scope_global: true,
@@ -11537,6 +11557,7 @@ mod tests {
             (SIMULATE_CC, "0"),
             (SIMULATE_FULL_SYSTEM, "0"),
             (FILL_ABSENT_TOOLS, "0"),
+            (SIM_MESSAGE_THREADS, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
             (SYSTEM_CACHE_SCOPE, "0"),
@@ -11582,6 +11603,7 @@ mod tests {
                 simulate_cc: false,
                 simulate_full_system: false,
                 fill_absent_tools: false,
+                sim_message_threads: false,
                 fill_metadata: false,
                 rate_limit_retry: false,
                 cache_scope_global: false,

@@ -8,7 +8,7 @@ use crate::store;
 
 use super::{
     Simulation, has_beta, incoming_session_id, is_cc_shaped, is_quota_probe_shaped,
-    last_user_text_starts_with, uuid_v4,
+    last_user_text_contains, last_user_text_starts_with, request_max_tokens, uuid_v4,
 };
 
 /// 一条模拟请求在会话链条上的位置：三个**指向别的请求**的字段。
@@ -51,6 +51,11 @@ pub(crate) struct CcSessionLink {
     /// `diagnostics`（`cap/2.1.260/00024`），「猜下一句」两个都没有（`2.1.260-2/00063`）。
     /// 一个开关管两件事就会给它们各补出一个官方没有的字段。判在 [`CcRequestKind`]。
     pub(super) diagnostics: bool,
+    /// 这是本会话的第几次用户输入（从 1 起），写进 2.1.285 起 billing header 的
+    /// `cc_prompt_index` / `cc_turn_index`。官方的 `promptIndex` 只在 `turn_origin=human` 的新
+    /// 输入上加一，`turnIndex` 每个新 turn 加一（可执行文件里的 `OQt`）；模拟路径的每一轮都是
+    /// human，两者恒等。0 即不在会话链上（额度探测、连通性测试），不写。
+    pub(super) prompt_index: u32,
 }
 
 impl CcSessionLink {
@@ -64,9 +69,373 @@ impl CcSessionLink {
 /// 按会话 id 索引的模拟会话链条状态。
 struct CcSessionEntry {
     prompt_id: String,
+    /// 见 [`CcSessionLink::prompt_index`]：换一轮 prompt id 就加一。
+    prompt_index: u32,
     prev_req: Option<String>,
     prev_message_id: Option<String>,
+    /// 这一轮是本地命令起的头（`!` 跑的 shell 命令、`/init` 这类提示词型斜杠命令，见
+    /// [`starts_local_turn`]）：官方整轮（含工具续轮）都不写 `cc_prompt_id`，`cc_prompt_index`
+    /// 照样加一（`cap/auto-2.1.285-20260930/00191`、`00266`–`00268`）。
+    local_turn: bool,
+    /// 模拟路径在这个会话里开过的 message thread，见 [`ThreadState`]。同一个会话 id 下可能有
+    /// 好几段对话（会话槽位按账号复用，[`super::Simulation::detect`]），各占一条。
+    threads: Vec<ThreadState>,
     last_seen: std::time::Instant,
+}
+
+/// 一个会话里最多记几条 thread。超了按最久未用淘汰——淘汰掉的那段对话下一轮退回 `create`，
+/// 与官方切模型后的形态相同，不会出错。
+const MAX_THREADS_PER_SESSION: usize = 8;
+
+/// 模拟路径的一条 **message thread**（`message-threads-2026-08-12`）在上游那边的状态。
+///
+/// 官方 2.1.285 的主线程（opus / sonnet / haiku，`cap/auto-2.1.285-20260930` 的会话
+/// `bcb4d47a`）：会话首条 `thread: {type: create}` 带完整上下文；此后**每一条**——工具续轮与
+/// 新的用户输入都是——`thread: {type: continue, previous_message_id}`，`messages` 只放新增的
+/// 那几条，`system` 只剩 billing header、不带 `tools`，`previous_message_id` 与
+/// `diagnostics.previous_message_id` 同为这条线程上一条回复的 `message.id`（`00033` 起五十余条
+/// 一环扣一环）。切 effort / 模型、compact 之后、中断重发、`--continue` 恢复时重新 `create`，
+/// 带完整历史，`diagnostics` 指回上一条（`00094`、`00178`、`00243`、`00264`、`00314`）。
+///
+/// 模拟路径的来访（非 CC 客户端）每轮都发完整历史，要切出增量就得知道上游这条线程里已经有
+/// 什么：`msgs` 是上一次发出去的完整上下文逐条的指纹，上游在它后面接了一条回复
+/// （`last_message_id`，其中要客户端执行的 `tool_use` 按序是 `tool_use_ids`）。下一轮来访的
+/// 出站历史若恰好是「`msgs` + 那条回复 + 新增的 user 消息」，就只发新增部分；对不上一律
+/// `create`（[`thread_decision`]）。
+#[derive(Debug, Clone)]
+struct ThreadState {
+    /// 首条消息的指纹：同一个会话 id 下区分不同对话的第一道筛。
+    root: u64,
+    /// 线程形态指纹（[`ThreadPending::shape`]）：变了即官方会重新 `create` 的那类变化。
+    shape: u64,
+    msgs: Vec<u64>,
+    last_message_id: String,
+    tool_use_ids: Vec<String>,
+    /// 那条回复的内容指纹（[`ReplyFp`]）。只比 tool_use id 不够：纯文本回复两边 id 都是空的，
+    /// 同一会话槽里两段开场相同的对话会互相接上对方的回复；客户端改了正文或工具入参（id 不变）
+    /// 也照样接上，改动被静默丢掉。
+    reply_fp: ReplyFp,
+    /// 那条回复 usage 的总量（input + cache 写 + cache 读 + output）：官方 `<total_tokens>` 倒数
+    /// 里的「当前上下文」（可执行文件里的 `xz(messages)`），见 [`TotalTokens`]。
+    ctx_tokens: u64,
+    /// 这段对话 `<total_tokens>` 倒数的锚点与已用量，见 [`TotalTokens`]。
+    budget: TotalTokens,
+    seen: std::time::Instant,
+}
+
+/// 官方 `<total_tokens>N tokens left</total_tokens>` 提醒（`totalTokensReminder`，缺省
+/// `padded-countdown`、预算 1500 万）的倒数状态，逆向自 2.1.285 可执行文件（`zEt` 与 `wnr`）：
+///
+/// - 每次**普通用户输入**重新锚定：`anchor = 当前上下文`，`used = 0`，这一轮的提醒是 1500 万整；
+/// - 其余请求（工具结果之后的续轮）`used = max(上次的 used, 当前上下文 − anchor)`，提醒写
+///   `1500 万 − used`——只减不增，上下文变小（切到 haiku 之类）也不回涨。
+///
+/// 「当前上下文」是这段对话**上一条回复** usage 的总量。`cap/auto-2.1.285-20260930` 逐条核过：
+/// `00036` 的 14999796 = 1500 万 −（`00033` 回复 40436 − 锚在 `00033` 时的 40232），`00041`、
+/// `00148`、`00154`、`00267`、`00276` 同样对得上。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TotalTokens {
+    anchor: u64,
+    used: u64,
+}
+
+/// 官方 `totalTokensReminder` 的缺省预算（可执行文件里的 `GEt`）。
+pub(super) const TOTAL_TOKENS_BUDGET: u64 = 15_000_000;
+
+/// 出站 `messages` 里一条消息的线程指纹，见 [`thread_decision`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ThreadMsg {
+    /// 去掉全部 `cache_control` 之后的消息指纹：断点每轮挪到最后一条上，不能让它把前缀判成变了。
+    pub(super) fp: u64,
+    pub(super) assistant: bool,
+    /// assistant 消息里 `type: tool_use` 块的 id，按序。
+    pub(super) tool_use_ids: Vec<String>,
+    /// assistant 消息的回复指纹（[`ReplyFp`]），与上游那条回复的比对；user 消息是缺省值。
+    pub(super) reply: ReplyFp,
+}
+
+/// 回复指纹的初值（FNV-1a 64 位偏移基）。
+pub(crate) const REPLY_TEXT_FP_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 把一段正文续进回复正文指纹（FNV-1a）：按字节流累加，分几段喂与整段一次喂结果相同——
+/// 回程流式的 `text_delta` 一段段来，来访那条 assistant 是整段的，两边要算出同一个数。
+pub(crate) fn reply_text_fp(h: u64, text: &str) -> u64 {
+    fnv_bytes(h, text.as_bytes())
+}
+
+fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 把一段 JSON 按规范形态续进指纹：对象键排序后逐个喂，每种值带类型标记。来访常把工具入参
+/// 重新序列化一遍，键序、空白都不可信，只认内容。
+fn fnv_json(mut h: u64, v: &serde_json::Value) -> u64 {
+    use serde_json::Value;
+    match v {
+        Value::Null => fnv_bytes(h, b"n"),
+        Value::Bool(b) => fnv_bytes(h, if *b { b"t" } else { b"f" }),
+        Value::Number(n) => {
+            h = fnv_bytes(h, b"#");
+            fnv_bytes(h, n.to_string().as_bytes())
+        }
+        Value::String(s) => {
+            h = fnv_bytes(h, b"\"");
+            h = fnv_bytes(h, &(s.len() as u64).to_le_bytes());
+            fnv_bytes(h, s.as_bytes())
+        }
+        Value::Array(a) => {
+            h = fnv_bytes(h, b"[");
+            h = fnv_bytes(h, &(a.len() as u64).to_le_bytes());
+            a.iter().fold(h, fnv_json)
+        }
+        Value::Object(o) => {
+            h = fnv_bytes(h, b"{");
+            h = fnv_bytes(h, &(o.len() as u64).to_le_bytes());
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            for k in keys {
+                h = fnv_bytes(h, &(k.len() as u64).to_le_bytes());
+                h = fnv_bytes(h, k.as_bytes());
+                h = fnv_json(h, &o[k]);
+            }
+            h
+        }
+    }
+}
+
+/// 一条 assistant 回复的内容指纹。模拟路径拿它核对下一轮来访带回的那条 assistant 是不是上游
+/// 线程里那条回复：客户端把回复 A 改成 B（或改了工具入参、id 不变）再发下一条，`continue` 会让
+/// 上游沿用存档里的 A、B 被静默丢掉，所以对不上一律 `create`（[`find_continuable`]）。
+///
+/// 回程嗅探器按 SSE 块攒（`UsageSniffer::reply_fp`），来访那条按 content 块算
+/// （`body::thread_msg_of`），两边按块序、同一算法喂：
+///
+/// - `content`：`text` 块的正文与 `citations`（引用 URL、引文都算），客户端 `tool_use` 的 id、
+///   名字（出站那份已是混淆名，与上游回的一致）、入参（[`fnv_json`] 规范形态），以及其余各种块
+///   （`server_tool_use`、`web_search_tool_result` 之类服务端工具的调用与结果）去掉 `cache_control`
+///   后的整块规范形态。空 `text` 块（也没有引用）不算——改写那一步会把它剥掉；`fallback` 块两边都不算。
+/// - `unverifiable`：回程出现了认不出的增量类型，拼不出这条回复的原貌，一律不接、退回 `create`。
+/// - `thinking`：`thinking` 正文与 `redacted_thinking` 的 `data`，按块序。来访一块都没带时是
+///   `None`、不比——客户端丢掉 thinking 很常见，上游线程里那份本来就在；带了就得逐块对上。
+///   回程那份总是 `Some`（没有 thinking 块即初值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplyFp {
+    content: u64,
+    thinking: Option<u64>,
+    unverifiable: bool,
+}
+
+impl Default for ReplyFp {
+    fn default() -> Self {
+        Self { content: REPLY_TEXT_FP_INIT, thinking: None, unverifiable: false }
+    }
+}
+
+impl ReplyFp {
+    /// 回程那份：thinking 一侧从初值起算，没有 thinking 块也是 `Some`。
+    pub(crate) fn upstream() -> Self {
+        Self { thinking: Some(REPLY_TEXT_FP_INIT), ..Self::default() }
+    }
+
+    /// 一个 `text` 块（正文非空或带引用）；`block_fp` 是它全文的 [`reply_text_fp`]（从初值起算），
+    /// `citations` 是它的引用，按序。
+    pub(crate) fn text(&mut self, block_fp: u64, citations: &[serde_json::Value]) {
+        let mut h = fnv_bytes(fnv_bytes(self.content, b"T"), &block_fp.to_le_bytes());
+        h = fnv_bytes(h, &(citations.len() as u64).to_le_bytes());
+        self.content = citations.iter().fold(h, fnv_json);
+    }
+
+    /// 其余各种块（服务端工具的调用与结果等）：去掉 `cache_control` 后整块按规范形态喂。
+    pub(crate) fn block(&mut self, b: &serde_json::Value) {
+        let h = fnv_bytes(self.content, b"B");
+        self.content = match b.as_object() {
+            Some(o) if o.contains_key("cache_control") => {
+                let mut o = o.clone();
+                o.shift_remove("cache_control");
+                fnv_json(h, &serde_json::Value::Object(o))
+            }
+            _ => fnv_json(h, b),
+        };
+    }
+
+    /// 回程拼不出原貌（认不出的增量类型）：这条回复不给接。
+    pub(crate) fn mark_unverifiable(&mut self) {
+        self.unverifiable = true;
+    }
+
+    /// 一个客户端 `tool_use` 块。
+    pub(crate) fn tool_use(&mut self, id: &str, name: &str, input: &serde_json::Value) {
+        let mut h = fnv_bytes(self.content, b"U");
+        h = fnv_bytes(h, &(id.len() as u64).to_le_bytes());
+        h = fnv_bytes(h, id.as_bytes());
+        h = fnv_bytes(h, &(name.len() as u64).to_le_bytes());
+        h = fnv_bytes(h, name.as_bytes());
+        self.content = fnv_json(h, input);
+    }
+
+    /// 一个 `thinking`（`redacted == false`，`block_fp` 是正文的 [`reply_text_fp`]）或
+    /// `redacted_thinking`（`block_fp` 是 `data` 的）块。
+    pub(crate) fn thinking(&mut self, redacted: bool, block_fp: u64) {
+        let h = self.thinking.unwrap_or(REPLY_TEXT_FP_INIT);
+        let h = fnv_bytes(h, if redacted { b"R" } else { b"K" });
+        self.thinking = Some(fnv_bytes(h, &block_fp.to_le_bytes()));
+    }
+
+    /// 测试里拿来访那条的算法冒充回程那份：thinking 一侧补成回程的样子（没带即初值）。
+    #[cfg(test)]
+    pub(crate) fn as_upstream(self) -> Self {
+        Self { thinking: self.thinking.or(Some(REPLY_TEXT_FP_INIT)), ..self }
+    }
+
+    /// 来访那条（`self`）是不是上游这条回复（`upstream`），规则见 [`ReplyFp`]。
+    fn matches(&self, upstream: &ReplyFp) -> bool {
+        !upstream.unverifiable
+            && self.content == upstream.content
+            && self.thinking.is_none_or(|t| upstream.thinking == Some(t))
+    }
+}
+
+/// 这一轮线程怎么写，见 [`thread_decision`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ThreadDecision {
+    /// `thread: {type: create}`，完整上下文。
+    Create,
+    /// `thread: {type: continue, previous_message_id}`，`messages` 只留下标 `from` 起的那几条。
+    Continue { from: usize, previous_message_id: String },
+}
+
+/// 一条已经按线程改写、等上游回话的请求：回程拿到 `message.id` 才提交成 [`ThreadState`]
+/// （[`CcSessionLink::record_thread`]），失败就把它接的那条线程作废
+/// （[`CcSessionLink::drop_thread`]）。挂在 [`super::Simulation`] 上，由 `ReqLog` 取走。
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadPending {
+    cred_id: i64,
+    session_id: String,
+    root: u64,
+    /// 会进上游线程、且官方一变就重新 `create` 的那几样的指纹：模型、system 正文（billing header
+    /// 那块除外）、`tools`、`thinking`、`output_config`（effort）。`continue` 不发 system 与 tools，
+    /// 它们一变，上游线程里的还是旧的，只能重开。
+    shape: u64,
+    /// 这一轮**完整**上下文的逐条指纹（发 `continue` 时也是完整的那份）。
+    msgs: Vec<u64>,
+    /// 这一轮接的是哪条回复（`continue` 才有）；失败时按它作废那条线程。
+    continued_from: Option<String>,
+    /// 这一轮算完之后的 `<total_tokens>` 倒数状态，提交时存进 [`ThreadState::budget`]。
+    budget: TotalTokens,
+}
+
+impl ThreadPending {
+    /// 这一轮发的是 `continue`（接着某条回复）。它失败时转发循环当场改发 `create`
+    /// （[`super::upstream::retry_thread_as_create`]）。
+    pub(super) fn is_continue(&self) -> bool {
+        self.continued_from.is_some()
+    }
+
+    /// 本来接得上、调用方另有理由改发 `create` 时（来访指定了 `tool_choice`）：不再算接了哪条。
+    pub(super) fn into_create(self) -> Self {
+        Self { continued_from: None, ..self }
+    }
+}
+
+/// 在 `threads` 里找能接上这一轮的那条：同一个 `root` 与 `shape`，它的 `msgs` 是这一轮出站
+/// 历史的前缀，紧跟着的正好是它那条回复（assistant，`tool_use` id 逐个对上），再往后至少一条
+/// 新消息、且新增部分里没有 assistant（官方续轮只发 user / system）。几条都能接时取最长的——
+/// 客户端从中间某轮分叉重来的，短的那条是分叉前的旧线。
+fn find_continuable<'a>(
+    threads: &'a [ThreadState],
+    root: u64,
+    shape: u64,
+    msgs: &[ThreadMsg],
+) -> Option<&'a ThreadState> {
+    threads
+        .iter()
+        .filter(|t| t.root == root && t.shape == shape)
+        .filter(|t| {
+            let n = t.msgs.len();
+            let Some(reply) = msgs.get(n) else { return false };
+            n + 1 < msgs.len()
+                && msgs[..n].iter().map(|m| m.fp).eq(t.msgs.iter().copied())
+                && reply.assistant
+                && reply.tool_use_ids == t.tool_use_ids
+                && reply.reply.matches(&t.reply_fp)
+                && msgs[n + 1..].iter().all(|m| !m.assistant)
+        })
+        .max_by_key(|t| t.msgs.len())
+}
+
+/// 这一轮历史所在的那段对话最近一条线程状态：同一个 `root`，`msgs` 是这一轮历史的前缀、后面
+/// 跟着它那条回复。不看形态与 tool_use id——只为取「上一条回复的上下文量」与倒数锚点，换了
+/// 模型、改了工具照样是同一段对话（官方切模型后倒数也不重置，`cap/auto-2.1.285-20260930/00244`）。
+fn find_lineage<'a>(
+    threads: &'a [ThreadState],
+    root: u64,
+    msgs: &[ThreadMsg],
+) -> Option<&'a ThreadState> {
+    threads
+        .iter()
+        .filter(|t| t.root == root)
+        .filter(|t| {
+            let n = t.msgs.len();
+            msgs.get(n).is_some_and(|m| m.assistant)
+                && msgs[..n].iter().map(|m| m.fp).eq(t.msgs.iter().copied())
+        })
+        .max_by_key(|t| t.msgs.len())
+}
+
+/// 这一轮的 `<total_tokens>` 倒数，规则见 [`TotalTokens`]。`lineage` 是 [`find_lineage`] 找到的
+/// 上一条；找不到（对话第一轮、状态已过期）时当前上下文按 0 算，与官方新会话首轮一致。
+fn total_tokens_for(lineage: Option<&ThreadState>, regular_prompt: bool) -> (TotalTokens, u64) {
+    let ctx = lineage.map_or(0, |t| t.ctx_tokens);
+    let budget = if regular_prompt {
+        TotalTokens { anchor: ctx, used: 0 }
+    } else {
+        let prev = lineage.map(|t| t.budget).unwrap_or_default();
+        TotalTokens { anchor: prev.anchor, used: prev.used.max(ctx.saturating_sub(prev.anchor)) }
+    };
+    (budget, TOTAL_TOKENS_BUDGET.saturating_sub(budget.used))
+}
+
+/// 决定这一轮发 `create` 还是 `continue`，并把「等回程提交」的那份交出去。
+///
+/// 会话表里还没有这个会话（[`CcSessionLink::load`] 没跑过，只在测试里出现）时照样 `create`，
+/// 回程提交时也就找不到条目、什么都不记。
+///
+/// 第三个返回值是这一轮 `<total_tokens>` 提醒该写的数（[`TotalTokens`]）；`regular_prompt` 即末条
+/// 是一次新的用户输入（而非工具结果）。
+pub(super) fn thread_decision(
+    key: CcSessionKey<'_>,
+    shape: u64,
+    msgs: &[ThreadMsg],
+    regular_prompt: bool,
+) -> (ThreadDecision, ThreadPending, u64) {
+    let root = msgs.first().map_or(0, |m| m.fp);
+    let (found, (budget, left)) = {
+        let map = CC_SESSIONS.lock();
+        let threads = map.get(&key.owned()).map_or(&[][..], |e| &e.threads[..]);
+        (
+            find_continuable(threads, root, shape, msgs)
+                .map(|t| (t.msgs.len() + 1, t.last_message_id.clone())),
+            total_tokens_for(find_lineage(threads, root, msgs), regular_prompt),
+        )
+    };
+    let pending = ThreadPending {
+        cred_id: key.cred_id,
+        session_id: key.session_id.to_string(),
+        root,
+        shape,
+        msgs: msgs.iter().map(|m| m.fp).collect(),
+        continued_from: found.as_ref().map(|(_, id)| id.clone()),
+        budget,
+    };
+    let decision = match found {
+        Some((from, previous_message_id)) => ThreadDecision::Continue { from, previous_message_id },
+        None => ThreadDecision::Create,
+    };
+    (decision, pending, left)
 }
 
 /// 全表，键是 **`(凭证 id, 会话 id)`**。
@@ -369,6 +738,23 @@ impl CcSessionLink {
     /// `wants_prompt_id` 为假时不写 `cc_prompt_id`，但**会话状态照样推进**——官方那条
     /// 「猜下一句」请求也在同一条链上，只是自己不写这个字段。
     pub(super) fn load(key: CcSessionKey<'_>, new_prompt: bool, wants_prompt_id: bool) -> Self {
+        Self::load_turn(key, new_prompt, false, wants_prompt_id, None)
+    }
+
+    /// [`Self::load`] 外加 `local_turn`：`new_prompt` 为真时，这一轮是不是本地命令起的头
+    /// （[`starts_local_turn`]）。是的话这一轮直到下一次新输入都不写 `cc_prompt_id`。
+    ///
+    /// `client_prompt_id` 是来访自己在 `x-claude-code-prompt-id` 头里报的这一轮 id：有就以它为准
+    /// 并记进会话（同一轮后面没带头的续轮也沿用它）。2.1.285 起这个头与 billing header 里的
+    /// `cc_prompt_id` 同值同现（[`config::CC_HEADER_ORDER`]），luban 补 billing header 时另造一个
+    /// 就是一条请求里两个不同的 prompt id。
+    pub(super) fn load_turn(
+        key: CcSessionKey<'_>,
+        new_prompt: bool,
+        local_turn: bool,
+        wants_prompt_id: bool,
+        client_prompt_id: Option<&str>,
+    ) -> Self {
         let now = std::time::Instant::now();
         let mut map = CC_SESSIONS.lock();
         map.retain(|_, e| now.duration_since(e.last_seen) < CC_SESSION_IDLE);
@@ -376,23 +762,34 @@ impl CcSessionLink {
         let known = map.contains_key(&key);
         let entry = map.entry(key).or_insert_with(|| CcSessionEntry {
             prompt_id: uuid_v4(),
+            prompt_index: 1,
             prev_req: None,
             prev_message_id: None,
+            local_turn: false,
+            threads: Vec::new(),
             last_seen: now,
         });
         // 新建的那份 id 就是这一轮的，别再换一次。
         if known && new_prompt {
             entry.prompt_id = uuid_v4();
+            entry.prompt_index = entry.prompt_index.saturating_add(1);
+        }
+        if new_prompt || !known {
+            entry.local_turn = new_prompt && local_turn;
+        }
+        if let Some(id) = client_prompt_id {
+            entry.prompt_id = id.to_string();
         }
         entry.last_seen = now;
         Self {
-            prompt_id: wants_prompt_id.then(|| entry.prompt_id.clone()),
+            prompt_id: (wants_prompt_id && !entry.local_turn).then(|| entry.prompt_id.clone()),
             prev_req: entry.prev_req.clone(),
             prev_message_id: entry.prev_message_id.clone(),
             first_seen: !known,
             // 缺省写：模拟路径只造主线程 profile，它是要 diagnostics 的。真实 CC 那条路由
             // [`CcSessionLink::with_diagnostics`] 按 [`CcRequestKind`] 覆写。
             diagnostics: true,
+            prompt_index: entry.prompt_index,
         }
     }
 
@@ -412,6 +809,62 @@ impl CcSessionLink {
             entry.prev_message_id = Some(m.to_string());
         }
         entry.last_seen = std::time::Instant::now();
+    }
+
+    /// 一条按线程改写的请求**完整成功**（有 `message.id`）后，把它记成这段对话最新的线程状态：
+    /// 下一轮据此判能不能 `continue`。它接替的旧状态（同一个 `root`、`msgs` 是它的前缀）一并
+    /// 删掉——那些是这条线程更早的样子，或客户端分叉前的旧线，都接不上了。
+    ///
+    /// `reply_fp` 是这条回复的内容指纹（[`ReplyFp`]），`ctx_tokens` 是它 usage 的
+    /// 总量——下一轮 `<total_tokens>` 倒数的「当前上下文」（[`TotalTokens`]）。
+    pub(super) fn record_thread(
+        pending: &ThreadPending,
+        message_id: &str,
+        tool_use_ids: Vec<String>,
+        reply_fp: ReplyFp,
+        ctx_tokens: u64,
+    ) {
+        let now = std::time::Instant::now();
+        let mut map = CC_SESSIONS.lock();
+        let Some(entry) = map.get_mut(&(pending.cred_id, pending.session_id.clone())) else {
+            return;
+        };
+        entry.threads.retain(|t| {
+            !(t.root == pending.root
+                && t.msgs.len() <= pending.msgs.len()
+                && pending.msgs[..t.msgs.len()] == t.msgs[..])
+        });
+        while entry.threads.len() >= MAX_THREADS_PER_SESSION {
+            let Some(oldest) =
+                entry.threads.iter().enumerate().min_by_key(|(_, t)| t.seen).map(|(i, _)| i)
+            else {
+                break;
+            };
+            entry.threads.remove(oldest);
+        }
+        entry.threads.push(ThreadState {
+            root: pending.root,
+            shape: pending.shape,
+            msgs: pending.msgs.clone(),
+            last_message_id: message_id.to_string(),
+            tool_use_ids,
+            reply_fp,
+            ctx_tokens,
+            budget: pending.budget,
+            seen: now,
+        });
+        entry.last_seen = now;
+    }
+
+    /// 一条 `continue` 失败（上游报错、流断在半截）：它接的那条线程作废，下一轮退回 `create`。
+    /// 线程过期、`previous_message_id` 对不上这类错误，接着 `continue` 只会一直错下去。
+    /// `create` 失败不用管——它本来就没接任何线程。
+    pub(super) fn drop_thread(pending: &ThreadPending) {
+        let Some(from) = &pending.continued_from else { return };
+        let mut map = CC_SESSIONS.lock();
+        if let Some(entry) = map.get_mut(&(pending.cred_id, pending.session_id.clone())) {
+            entry.threads.retain(|t| &t.last_message_id != from);
+        }
     }
 }
 
@@ -451,8 +904,26 @@ pub(crate) enum CcRequestKind {
     Subagent,
     /// 「猜下一句」：带工具，末条用户消息以 `[SUGGESTION MODE:` 开头。
     Suggestion,
-    /// 无工具的辅助调用。
+    /// 子代理那条无工具的辅助调用（billing header 带 `cc_is_subagent=true`）。
     Helper,
+    /// 主线程另发的一次性辅助调用：WebSearch 子调用（`tools` 只有 `web_search`）、主线程直接调
+    /// WebFetch 后的页面处理（无工具、billing header 不带子代理标记）。2.1.285 这两种的 billing
+    /// header 只有 `cc_version` / `cc_entrypoint` / `cch`、也没有 `diagnostics`
+    /// （`cap/auto-2.1.285-20260930/00056`、`00064`），三项会话链字段一项不写；当成主线程还会
+    /// 按末条那句新的用户消息换一轮 `cc_prompt_id`，把后面整条主线程链接歪。
+    Auxiliary,
+    /// 主线程分叉：`/compact`（末条用户消息以「CRITICAL: Respond with TEXT ONLY」开头）、`/btw`
+    /// 插问（用户消息里有「This is a side question from the user」那段提醒）与离开回来时的回顾
+    /// （「The user stepped away and is coming back.」，`cap/2.1.285/00097`、`00158`）。带完整
+    /// system 与工具，只写 `cc_prev_req` 与 `diagnostics`、不写 `cc_prompt_id`（`00175`、`00238`），
+    /// 也不换轮。
+    Fork,
+    /// `/model` 选完模型后那条「Hi」预热：`max_tokens:1`、有 `system`（billing + 身份句）、没有
+    /// `tools` 也没有 `stream`（`00230`、`00239`）。不进会话链，beta 只补 `oauth`。
+    Prewarm,
+    /// `count_tokens`（[`super::simulation::is_official_count_tokens`]）：不计费，不进会话链，beta
+    /// 只补 `oauth`。
+    CountTokens,
     /// 标题生成：无工具、`structured-outputs` beta、**流式**。
     Title,
     /// 安全分类：`auto-mode-classifier` beta、`max_tokens:64`、**非流式**。
@@ -470,16 +941,19 @@ impl CcRequestKind {
         if is_quota_probe_shaped(v) {
             return Self::QuotaProbe;
         }
+        if super::simulation::is_official_count_tokens(v, beta) {
+            return Self::CountTokens;
+        }
+        let no_tools = super::simulation::field_is_empty(v.get("tools"));
+        if request_max_tokens(Some(v)) == Some(1) && v.get("system").is_some() && no_tools {
+            return Self::Prewarm;
+        }
         // 标题生成（`structured-outputs`）与安全分类（`auto-mode-classifier`）各有独有 beta。
         if has_beta(beta, config::CC_BETA_STRUCTURED_OUTPUTS) {
             return Self::Title;
         }
         if has_beta(beta, config::CC_BETA_AUTO_MODE_CLASSIFIER) {
             return Self::Classifier;
-        }
-        let tools = v.get("tools").and_then(|t| t.as_array()).map_or(0, |t| t.len());
-        if tools == 0 {
-            return Self::Helper;
         }
         // 子代理：billing header 里那个 `cc_is_subagent=true`。
         let subagent = v
@@ -489,11 +963,30 @@ impl CcRequestKind {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str())
             .is_some_and(|t| t.contains("cc_is_subagent=true"));
+        // message-threads 续轮（[`super::is_official_thread_continuation`]）不带 `tools` 键，得在
+        // 「无工具 = helper」之前认：`cap/2.1.285` 主线程续轮（`00115`、`00121`）照带 `cc_prev_req`
+        // / `cc_prompt_id` / `diagnostics`，子代理续轮（`00127` 等五条）的 beta 是子代理那串。
+        // 判成 helper 的话，前者的会话链字段补不全，后者会被 merge_beta 当主线程补项。
+        if super::simulation::is_official_thread_continuation(v, beta) {
+            return if subagent { Self::Subagent } else { Self::Main };
+        }
+        if no_tools {
+            return if subagent { Self::Helper } else { Self::Auxiliary };
+        }
         if subagent {
             return Self::Subagent;
         }
+        if super::simulation::is_official_web_search_request(v) {
+            return Self::Auxiliary;
+        }
         if last_user_text_starts_with(v, "[SUGGESTION MODE:") {
             return Self::Suggestion;
+        }
+        if last_user_text_starts_with(v, "CRITICAL: Respond with TEXT ONLY")
+            || last_user_text_starts_with(v, "The user stepped away and is coming back.")
+            || last_user_text_contains(v, "This is a side question from the user")
+        {
+            return Self::Fork;
         }
         Self::Main
     }
@@ -512,16 +1005,22 @@ impl CcRequestKind {
     /// （`cap/2.1.260/00024`、`00027`，后者排在一堆请求之后，仍然没有）；
     /// 「猜下一句」正相反，带 `cc_prev_req` 却不带 `cc_prompt_id`（`2.1.260-2/00063`）。
     fn wants_prev_req(self) -> bool {
-        matches!(self, Self::Main | Self::Subagent | Self::Suggestion)
+        matches!(self, Self::Main | Self::Subagent | Self::Suggestion | Self::Fork)
     }
 
-    fn wants_diagnostics(self) -> bool {
-        matches!(self, Self::Main | Self::Subagent)
+    /// 「猜下一句」2.1.280 起也写 `diagnostics`（`cap/2.1.280`、`cap/auto-2.1.285-20260930/00037`；
+    /// 2.1.277 及以前不写），按来访自报的版本给，读不出版本按老的不写。
+    fn wants_diagnostics(self, version: Option<(u64, u64, u64)>) -> bool {
+        match self {
+            Self::Main | Self::Subagent | Self::Fork => true,
+            Self::Suggestion => version.is_some_and(|v| v >= (2, 1, 280)),
+            _ => false,
+        }
     }
 
     /// 这一类要不要进会话链。三项全不写的（标题、安全分类、额度探测）整条跳过。
     pub(super) fn on_session_chain(self) -> bool {
-        self.wants_prompt_id() || self.wants_prev_req() || self.wants_diagnostics()
+        self.wants_prompt_id() || self.wants_prev_req() || self.wants_diagnostics(None)
     }
 
     /// 这一类官方**本来就是非流式**，`nonstream_as_sse` 不能把它改成 `stream:true`。
@@ -531,7 +1030,15 @@ impl CcRequestKind {
     /// 对这两类恰好相反：把它们改成流式才是官方不产生的形态。其余（含标题生成）官方确实
     /// 是 `stream:true`，照改。
     pub(super) fn keeps_nonstream(self) -> bool {
-        matches!(self, Self::Classifier | Self::QuotaProbe)
+        matches!(self, Self::Classifier | Self::QuotaProbe | Self::Prewarm)
+    }
+
+    /// `anthropic-beta` 只补 `oauth`、别的一项不动（[`super::merge_beta_for`]）：SDK 子代理、
+    /// `/model` 预热（`00230` 官方那串没有 `advanced-tool-use` 与 `extended-cache-ttl`）与
+    /// `count_tokens`（`00104` 等只有五项）。其余非主线程 profile 靠 beta 串自己认得出来，见
+    /// [`super::is_official_non_main_beta`]。
+    pub(super) fn beta_only_oauth(self) -> bool {
+        matches!(self, Self::Subagent | Self::Prewarm | Self::CountTokens)
     }
 
     /// 这一类能不能补 `system` 前缀（billing header + 身份句）。
@@ -539,7 +1046,7 @@ impl CcRequestKind {
     /// 额度探测**没有 `system`**，连 billing header 都没有。给它补一份，就把一条
     /// `max_tokens:1` 的探测改成了「带身份声明的请求」——官方从不产生。
     pub(super) fn allows_system_prefix(self) -> bool {
-        self != Self::QuotaProbe
+        !matches!(self, Self::QuotaProbe | Self::CountTokens)
     }
 }
 
@@ -597,21 +1104,71 @@ pub(super) fn client_session_link(
     // 「猜下一句」与子代理的末条也常常是一句全新的 user 消息，照它判就会把整个会话的
     // prompt id 带偏。
     let new_prompt = kind.rotates_prompt() && crate::telemetry::last_is_new_prompt_body(v);
-    let mut link = CcSessionLink::load(
+    let client_prompt_id = headers
+        .get("x-claude-code-prompt-id")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|h| super::simulation::looks_like_uuid(h));
+    let mut link = CcSessionLink::load_turn(
         CcSessionKey { cred_id: cred.id, session_id: &session_id },
         new_prompt,
+        starts_local_turn(v),
         kind.wants_prompt_id(),
+        client_prompt_id,
     );
     if !kind.wants_prev_req() {
         link.prev_req = None;
     }
-    Some((session_id, link.with_diagnostics(kind.wants_diagnostics())))
+    let version = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .and_then(super::body::trusted_cc_version);
+    Some((session_id, link.with_diagnostics(kind.wants_diagnostics(version))))
+}
+
+/// 末条用户消息是不是本地命令起的一轮：`!` 跑的 shell 命令（`<bash-input>`）或提示词型斜杠
+/// 命令（`<command-message>`，如 `/init`）。`/model` 这类纯本地命令的回显（`<local-command-caveat>`
+/// 打头）官方照写 `cc_prompt_id`，不在此列。
+fn starts_local_turn(v: &serde_json::Value) -> bool {
+    last_user_text_starts_with(v, "<bash-input>")
+        || last_user_text_starts_with(v, "<command-message>")
 }
 
 #[cfg(test)]
 mod tests {
     use crate::proxy::test_support::{all_on, base_block, detect_with, parsed, test_cred};
     use crate::proxy::{Bytes, HeaderValue, config, header};
+
+    /// `cc_prompt_index` 的计数（[`super::CcSessionLink::prompt_index`]）：会话第一条是 1，
+    /// 工具续轮沿用，新输入加一；换一张凭证就是另一条链，从 1 起。
+    #[test]
+    fn prompt_index_counts_new_prompts_per_credential_session() {
+        use super::{CcSessionKey, CcSessionLink};
+        let sid = crate::proxy::uuid_v4();
+        let key = CcSessionKey { cred_id: 41, session_id: &sid };
+        assert_eq!(CcSessionLink::load(key, true, true).prompt_index, 1, "会话第一条");
+        assert_eq!(CcSessionLink::load(key, false, true).prompt_index, 1, "工具续轮沿用");
+        assert_eq!(CcSessionLink::load(key, true, true).prompt_index, 2, "新输入加一");
+        let other = CcSessionKey { cred_id: 42, session_id: &sid };
+        assert_eq!(CcSessionLink::load(other, true, true).prompt_index, 1, "另一张凭证另起");
+        assert_eq!(CcSessionLink::default().prompt_index, 0, "不在链上的不写");
+    }
+
+    /// 来访头上的 `x-claude-code-prompt-id` 就是这一轮的 prompt id：补出来的 `cc_prompt_id` 沿用它，
+    /// 同一轮后面没带头的续轮也沿用；下一次新输入没带头就另起一个。
+    #[test]
+    fn client_prompt_id_header_is_adopted() {
+        use super::{CcSessionKey, CcSessionLink};
+        let sid = crate::proxy::uuid_v4();
+        let key = CcSessionKey { cred_id: 43, session_id: &sid };
+        let pid = "6f5a49b5-5795-46a3-815b-05b2b4f52d2e";
+        let first = CcSessionLink::load_turn(key, true, false, true, Some(pid));
+        assert_eq!(first.prompt_id.as_deref(), Some(pid));
+        let cont = CcSessionLink::load_turn(key, false, false, true, None);
+        assert_eq!(cont.prompt_id.as_deref(), Some(pid), "续轮沿用这一轮的");
+        let next = CcSessionLink::load_turn(key, true, false, true, None);
+        assert!(next.prompt_id.is_some_and(|p| p != pid), "新输入换一个");
+    }
 
     /// 前缀差异日志靠 [`super::text_diff`] 找出两轮 system 块里变的那一段：只剩中段、
     /// 切点在字符边界上；[`super::cache_prefix_stable`] 变了回 `false`、没变回 `true`。
@@ -954,6 +1511,43 @@ mod tests {
         let billing = v["system"][0]["text"].as_str().unwrap();
         assert!(billing.contains("cc_prompt_id=mine;"), "保留客户端自己那个: {billing}");
         assert_eq!(billing.matches("cc_prompt_id=").count(), 1, "别补第二个: {billing}");
+
+        // 来访自报 2.1.285：主线程在 `cc_prompt_id` 之后再补 `cc_turn_origin` 与会话里的第几轮
+        // （`cap/2.1.285/00113`）；子代理只有 `cc_prompt_id`（`00120`）。版本读不出（上面几次）
+        // 两样都不补。
+        let rewrite = |kind| {
+            let out = crate::proxy::rewrite_body_out(
+                &body,
+                &test_cred(),
+                "fp",
+                all_on(),
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+                true,
+                Some("2.1.285"),
+                Some(&link),
+                kind,
+                None,
+            )
+            .0;
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            v["system"][0]["text"].as_str().unwrap().to_string()
+        };
+        let main = rewrite(crate::proxy::CcRequestKind::Main);
+        let n = link.prompt_index;
+        assert!(n >= 1);
+        assert!(
+            main.ends_with(&format!(
+                "; cc_turn_origin=human; cc_prompt_index={n}; cc_turn_index={n};"
+            )),
+            "{main}"
+        );
+        let sub = rewrite(crate::proxy::CcRequestKind::Subagent);
+        assert!(sub.contains("cc_prompt_id=") && !sub.contains("cc_turn_origin"), "{sub}");
     }
 
     /// 三个关联字段**逐类给**，不能一刀切成主线程：官方六个 profile 在这三项上各不相同。
@@ -1211,5 +1805,100 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert!(crate::proxy::is_official_non_main_beta(&sdk), "beta 不该被补主线程项");
+    }
+
+    /// **各类请求写哪几项会话链字段，与官方抓包逐条对**（`cap/2.1.285`、
+    /// `cap/auto-2.1.285-20260930` 全部带 billing header 的 `/v1/messages`）：`cc_prompt_id` 写不写、
+    /// `diagnostics` 写不写两边必须一致；`cc_prev_req` 官方写了的，这一类就得是要写的（会话第一条
+    /// 官方也不写，反过来不能要求）。分错一类——WebSearch 子调用当主线程、`/compact` 当主线程——
+    /// 就会在这里多出或少掉一项。抓包目录不在就跳过。
+    #[test]
+    fn link_fields_follow_official_captures() {
+        use super::CcRequestKind;
+        let mut seen = 0;
+        let mut bad = Vec::new();
+        for sub in ["2.1.285", "auto-2.1.285-20260930"] {
+            let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut files: Vec<_> = entries
+                .filter_map(|e| Some(e.ok()?.path()))
+                .filter(|p| p.to_str().is_some_and(|f| f.ends_with(".req.raw")))
+                .collect();
+            files.sort();
+            for path in files {
+                let raw = std::fs::read(&path).unwrap();
+                let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let head = std::str::from_utf8(&raw[..sep]).unwrap();
+                if !head.lines().next().unwrap().contains("/v1/messages") {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_slice(&raw[sep + 4..]).unwrap();
+                let Some(billing) = v
+                    .get("system")
+                    .and_then(|s| s.as_array())
+                    .and_then(|s| s.first())
+                    .and_then(|b| b.get("text"))
+                    .and_then(|t| t.as_str())
+                    .filter(|t| t.starts_with("x-anthropic-billing-header:"))
+                else {
+                    continue;
+                };
+                seen += 1;
+                let beta: Vec<String> = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("anthropic-beta: "))
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::to_string)
+                    .collect();
+                let kind = CcRequestKind::of(&v, &beta);
+                let name = format!("{sub}/{}", &path.file_name().unwrap().to_str().unwrap()[..5]);
+                let has_prompt = billing.contains("cc_prompt_id=");
+                let has_prev = billing.contains("cc_prev_req=");
+                let has_diag = v.get("diagnostics").is_some();
+                // 按抓包顺序过一遍会话链：本地命令起头的那一轮整轮不写，只看分类判不出来。
+                let sid = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("X-Claude-Code-Session-Id: "))
+                    .unwrap_or_default()
+                    .to_string();
+                let key = super::CcSessionKey { cred_id: -4285, session_id: &sid };
+                let header_pid = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("x-claude-code-prompt-id: "))
+                    .map(str::trim);
+                let link = super::CcSessionLink::load_turn(
+                    key,
+                    kind.rotates_prompt() && crate::telemetry::last_is_new_prompt_body(&v),
+                    super::starts_local_turn(&v),
+                    kind.wants_prompt_id(),
+                    header_pid,
+                );
+                if link.prompt_id.is_some() != has_prompt {
+                    bad.push(format!("{name} {kind:?}: cc_prompt_id 官方 {has_prompt}"));
+                }
+                // 来访头上报了 prompt id 的，补出来的 `cc_prompt_id` 与它逐字相同——官方两处本来就同值。
+                let billed = billing
+                    .split(';')
+                    .find_map(|f| f.trim().strip_prefix("cc_prompt_id="))
+                    .map(str::trim);
+                if header_pid.is_some() && billed.is_some() && link.prompt_id.as_deref() != billed {
+                    bad.push(format!(
+                        "{name} {kind:?}: cc_prompt_id 与 x-claude-code-prompt-id 不同"
+                    ));
+                }
+                if has_prev && !kind.wants_prev_req() {
+                    bad.push(format!("{name} {kind:?}: 官方写了 cc_prev_req"));
+                }
+                if kind.wants_diagnostics(Some((2, 1, 285))) != has_diag {
+                    bad.push(format!("{name} {kind:?}: diagnostics 官方 {has_diag}"));
+                }
+            }
+        }
+        if seen == 0 {
+            eprintln!("skipped: captures not present");
+            return;
+        }
+        assert!(bad.is_empty(), "{} 条：\n{}", bad.len(), bad.join("\n"));
     }
 }

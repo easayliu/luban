@@ -38,8 +38,9 @@ use ban::{header_text, is_third_party_rejection};
 mod headers;
 #[cfg(test)]
 use headers::{
-    build_forward_headers, build_forward_headers_for, ensure_fallback_beta,
-    is_official_non_main_beta, merge_beta, orig_header_case, simulated_beta,
+    BetaCtx, build_forward_headers, build_forward_headers_for, ensure_cache_ttl_beta,
+    ensure_fallback_beta, is_official_non_main_beta, merge_beta, merge_beta_for, orig_header_case,
+    simulated_beta,
 };
 use headers::{has_beta, uuid_v4};
 
@@ -95,7 +96,7 @@ use body::{
     sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
     sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
-pub(crate) use body::{SESSION_KEY_VERSION, parse_version};
+pub(crate) use body::{SESSION_KEY_VERSION, has_cache_ttl_1h, parse_version};
 
 mod upstream;
 use upstream::Upstream;
@@ -666,6 +667,24 @@ pub(super) fn last_user_text_starts_with(v: &serde_json::Value, prefix: &str) ->
         _ => None,
     };
     text.is_some_and(|t| t.trim_start().starts_with(prefix))
+}
+
+/// 末条 `role:"user"` 消息里是否有某个 text 块（或字符串 content）包含 `needle`。
+pub(super) fn last_user_text_contains(v: &serde_json::Value, needle: &str) -> bool {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let Some(last) =
+        msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return false;
+    };
+    match last.get("content") {
+        Some(serde_json::Value::String(s)) => s.contains(needle),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.contains(needle)),
+        _ => false,
+    }
 }
 
 /// 写入一个顶层字段，并把**新增**的那个放到官方 key 序里该在的位置：`after` 里最靠后的

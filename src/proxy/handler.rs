@@ -13,7 +13,7 @@ use super::ban::{
     log_third_party_rejection, park_org_oauth_disallowed, parse_upstream_error,
 };
 use super::body::{
-    below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
+    below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
     client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
     extract_session_id, hoists_system_role, is_billable_messages, is_fallback_rejection,
     known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
@@ -22,7 +22,7 @@ use super::body::{
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
-use super::headers::build_forward_headers_for;
+use super::headers::{BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta};
 use super::learned_rules::{
     MODEL_DENIAL_MAX_SWAPS, RejectionLog, TRANSIENT_MAX_ATTEMPTS, app_system_digest,
     empty_reply_class, has_deprecated_sampling_field, has_learned_deprecated_field, is_max_plan,
@@ -55,8 +55,8 @@ use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
     has_trailing_assistant, is_prefill_not_supported_error, model_rejects_prefill,
     note_upstream_send, rebuild_response, relay_upstream, resp_builder, resp_shape,
-    retry_without_fallbacks, strip_assistant_prefill, try_acquire_session_concurrency,
-    upstream_error_kind, upstream_load_snapshot,
+    retry_thread_as_create, retry_without_fallbacks, strip_assistant_prefill,
+    try_acquire_session_concurrency, upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
     EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_REPLY,
@@ -844,6 +844,8 @@ pub(super) async fn handle_inner(
         .as_ref()
         .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
         .unwrap_or(CcRequestKind::Main);
+    // `merge_beta_for` 要的那几项请求事实：来访体不变，转发循环外算一次，换号重试沿用。
+    let beta_ctx = BetaCtx::of(cc_kind, &body, body_json.as_ref());
     let upgrade_stream = billable
         && flags.nonstream_as_sse
         && !cc_kind.keeps_nonstream()
@@ -1015,6 +1017,7 @@ pub(super) async fn handle_inner(
             session_out.as_deref(),
             req_model.as_deref(),
             refusal_fallbacks.is_some() || (billable && client_fallbacks),
+            beta_ctx,
         );
         // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
         // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
@@ -1047,7 +1050,7 @@ pub(super) async fn handle_inner(
                 );
             }
         };
-        let upstream = Upstream {
+        let mut upstream = Upstream {
             _state: std::marker::PhantomData,
             client,
             method: method.clone(),
@@ -1070,6 +1073,20 @@ pub(super) async fn handle_inner(
         // 不再为它把同一份 JSON 第二次解析一遍，见 [`Upstream::shape_outbound`]。
         let (sent, sent_bits) =
             upstream.shape_outbound(&body, &cred, &device_fp, body_json.as_ref());
+        // `extended-cache-ttl` 跟着**出站体**走（[`ensure_cache_ttl_beta`]）：头建在改写之前，
+        // 那时只看得到来访体；整形补出来的 1h 断点要在这里补上它的 beta。模拟路径的串由
+        // profile 整条给出，不在此列。
+        if upstream.sim.is_none()
+            && flags.merge_beta
+            && sent.as_ptr() != body.as_ptr()
+            && body_has_pair(&sent, b"\"ttl\"", b"\"1h\"")
+            && serde_json::from_slice::<serde_json::Value>(&sent)
+                .is_ok_and(|v| crate::proxy::has_cache_ttl_1h(&v))
+            && let Some(beta) = upstream.headers.get("anthropic-beta").and_then(|b| b.to_str().ok())
+            && let Ok(fixed) = HeaderValue::from_str(&ensure_cache_ttl_beta(beta))
+        {
+            upstream.headers.insert("anthropic-beta", fixed);
+        }
         // 新会话的启动握手：**在这条主请求发出之前**开跑（`cap/2.1.260-2` 的时序是
         // 17:10:17 policy_limits …→ 17:10:19.699 第一条 messages）。原先它排在遥测里，等回程
         // 之后再由 5s 一跳的发送循环取走——顺序整个反了。
@@ -1876,6 +1893,7 @@ pub(super) async fn handle_inner(
                 req_model: req_model.clone(),
                 ratelimit,
                 stream_broke: None,
+                upstream_done: false,
                 request_id: request_id.to_string(),
                 client_request_id: client_request_id.clone(),
                 upstream_request_id: header_opt(up.headers(), "request-id"),
@@ -1888,6 +1906,8 @@ pub(super) async fn handle_inner(
                     .as_ref()
                     .map(|s| s.session_id.clone())
                     .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone())),
+                // 按 message thread 改写过的，回程据回复提交或作废线程状态，见 [`ReqLog::cc_thread`]。
+                cc_thread: upstream.sim.as_ref().and_then(|s| s.take_thread()),
                 // 只给计费路径分类：count_tokens 之流没有「回复」可言。
                 empty_reply_key: if billable {
                     empty_reply_class(req_model.as_deref(), body_json.as_ref())
@@ -1918,6 +1938,17 @@ pub(super) async fn handle_inner(
                 _session_concurrency: session_concurrency_guard,
                 _route_load: route_load,
             };
+
+            // 模拟路径的 `thread: continue` 被拒（上游线程过期、接不上）：当场改发 `create` 重试一次，
+            // 见 [`retry_thread_as_create`]。放在 400 那段缓冲之前——原响应体不读，重试也失败时
+            // 下面照旧处理它。
+            if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
+                && rl.cc_thread.as_ref().is_some_and(|p| p.is_continue())
+                && let Some(up) =
+                    retry_thread_as_create(&upstream, &cred, &device_fp, &body, &mut rl).await
+            {
+                return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
+            }
 
             // 400/401/403：先缓冲响应体做账号级错误判定，命中则自动停用该凭证并清空其
             // 设备绑定。401 账号级错误（token revoked 等）会换号重试而非直接透传。

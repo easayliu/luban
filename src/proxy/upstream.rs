@@ -133,7 +133,7 @@ impl Upstream<'_> {
     ) -> (Bytes, Option<serde_json::Value>) {
         if self.billable {
             // body 侧要不要补 `thinking.display:"updates"`，看**实际发出的头**里有没有那项 beta
-            // （[`merge_beta`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
+            // （[`merge_beta_for`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
             // 的串没有 `advisor-tool`，头上不补，体里就也不能写，否则上游 400：
             // `thinking.adaptive.display: Input should be 'summarized', 'omitted'`）。
             let has_beta = |name: &str| {
@@ -290,20 +290,28 @@ fn stream_upstream(
     tool_names: Option<std::sync::Arc<ToolNameMap>>,
 ) -> Response {
     let builder = resp_builder(&up);
-    let stream = up.bytes_stream().map(move |chunk| {
-        if rl.ttft_ms.is_none() {
-            rl.ttft_ms = Some(rl.started.elapsed().as_millis());
-        }
-        match &chunk {
-            Ok(bytes) => rl.sniffer.feed(bytes),
-            // 上游把流掐了。错误照旧原样交给 axum（客户端拿到的行为不变），但要留个痕
-            // 给收尾时的日志——否则这条请求在服务端侧只剩一行 `forwarded status=200`。
-            Err(e) => {
-                rl.stream_broke = Some(format!("[{}] {e}", upstream_error_kind(e)));
+    // 末尾接一个哨兵：上游读到头时记下 `upstream_done`。客户端先断开的话 axum 丢掉响应体，
+    // 哨兵永远走不到——收尾时据此分出「客户端取消」与「上游半截 EOF」，见 [`ReqLog::upstream_done`]。
+    let stream = up.bytes_stream().map(Some).chain(futures_util::stream::iter([None])).filter_map(
+        move |chunk| {
+            let Some(chunk) = chunk else {
+                rl.upstream_done = true;
+                return std::future::ready(None);
+            };
+            if rl.ttft_ms.is_none() {
+                rl.ttft_ms = Some(rl.started.elapsed().as_millis());
             }
-        }
-        chunk
-    });
+            match &chunk {
+                Ok(bytes) => rl.sniffer.feed(bytes),
+                // 上游把流掐了。错误照旧原样交给 axum（客户端拿到的行为不变），但要留个痕
+                // 给收尾时的日志——否则这条请求在服务端侧只剩一行 `forwarded status=200`。
+                Err(e) => {
+                    rl.stream_broke = Some(format!("[{}] {e}", upstream_error_kind(e)));
+                }
+            }
+            std::future::ready(Some(chunk))
+        },
+    );
     // 用量嗅探喂的是**还原前**的字节（`usage` 里没有工具名，两者等价），还原只包在最外层。
     let body = match tool_names {
         Some(map) => Body::from_stream(restore_tool_names_stream(stream, map)),
@@ -704,7 +712,63 @@ pub(super) async fn retry_without_fallbacks(
     rl.ttft_ms = None;
     rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
     rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry("no_fallbacks", up.headers(), &retried);
+    rl.note_retry(
+        "no_fallbacks",
+        up.headers(),
+        &retried,
+        upstream.sim.as_ref().and_then(|s| s.take_thread()),
+    );
+    Some(up)
+}
+
+/// 模拟路径的一条 `thread: continue` 被上游拒了（400 / 404：线程过期、`previous_message_id`
+/// 对不上……）：作废它接的那条线程，同一个号、同一份客户端体**改发 `create`**（完整上下文）
+/// 再发一次。本地线程状态最长留 [`super::session_link`] 里那三个小时，上游那边可能早就忘了；
+/// 官方客户端遇到这种事当场重建线程，用户看不到失败，这里也不该把这一发原样甩给客户端。
+///
+/// 成了按重试那次记账，标签 `thread_create`；没成（发不出去或也被拒）返回 `None`，调用方照旧
+/// 处理原来那条响应。
+pub(super) async fn retry_thread_as_create(
+    upstream: &Upstream<'_>,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    client_body: &Bytes,
+    rl: &mut ReqLog,
+) -> Option<wreq::Response> {
+    let failed = rl.cc_thread.take()?;
+    CcSessionLink::drop_thread(&failed);
+    let retried = upstream.shape_with(client_body, cred, device_fp, upstream.refusal_fallbacks).0;
+    let up = match upstream.send(retried.clone()).await {
+        Ok(up) => up,
+        Err(e) => {
+            tracing::warn!(error = %error_chain(&e), "the thread create retry could not be sent, passing the failed continue through");
+            return None;
+        }
+    };
+    let status = up.status();
+    if !status.is_success() {
+        tracing::warn!(
+            cred_id = cred.id, cred = %cred.label,
+            status = status.as_u16(),
+            "the thread create retry was rejected too, passing the failed continue through"
+        );
+        return None;
+    }
+    tracing::info!(
+        cred_id = cred.id, cred = %cred.label,
+        "upstream rejected a message-thread continue; resent the turn as create"
+    );
+    let (is_stream, encoding) = resp_shape(&up);
+    rl.status = status.as_u16();
+    rl.ttft_ms = None;
+    rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
+    rl.ratelimit = RateLimitInfo::from_headers(up.headers());
+    rl.note_retry(
+        "thread_create",
+        up.headers(),
+        &retried,
+        upstream.sim.as_ref().and_then(|s| s.take_thread()),
+    );
     Some(up)
 }
 
@@ -1149,12 +1213,14 @@ mod tests {
                 req_model: Some("claude-opus-5".into()),
                 ratelimit: rl_headers(&[]),
                 stream_broke: None,
+                upstream_done: false,
                 request_id: "lb-test".into(),
                 client_request_id: None,
                 upstream_request_id: None,
                 forensics: Default::default(),
                 telemetry: None,
                 cc_session: None,
+                cc_thread: None,
                 empty_reply_key: None,
                 prompt_key: None,
                 app_key: None,
@@ -1240,12 +1306,14 @@ mod tests {
                 req_model: Some("claude-fable-5".into()),
                 ratelimit: rl_headers(&[]),
                 stream_broke: None,
+                upstream_done: false,
                 request_id: "lb-test".into(),
                 client_request_id: None,
                 upstream_request_id: None,
                 forensics: Default::default(),
                 telemetry: None,
                 cc_session: None,
+                cc_thread: None,
                 empty_reply_key: key.map(|(m, n)| (m.to_string(), n)),
                 prompt_key: prompt.map(|(m, d)| (m.to_string(), d.to_string())),
                 // 与提示词哈希同源的 system 哈希：按应用学的那条与按提示词学的那条一起验。
@@ -1503,12 +1571,14 @@ mod tests {
                 req_model: None,
                 ratelimit: rl_headers(&[]),
                 stream_broke: None,
+                upstream_done: false,
                 request_id: "lb-test".into(),
                 client_request_id: None,
                 upstream_request_id: None,
                 forensics: Default::default(),
                 telemetry: None,
                 cc_session: None,
+                cc_thread: None,
                 empty_reply_key: None,
                 prompt_key: None,
                 app_key: None,
@@ -1567,12 +1637,14 @@ mod tests {
             req_model: Some("claude-opus-5".into()),
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            upstream_done: false,
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: None,
             forensics: Default::default(),
             telemetry: None,
             cc_session: None,
+            cc_thread: None,
             empty_reply_key: None,
             prompt_key: None,
             app_key: None,
@@ -1669,12 +1741,14 @@ data: {\"type\":\"message_stop\"}
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            upstream_done: false,
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: None,
             forensics: Default::default(),
             telemetry: None,
             cc_session: None,
+            cc_thread: None,
             empty_reply_key: None,
             prompt_key: None,
             app_key: None,
@@ -1741,6 +1815,7 @@ data: {\"type\":\"message_stop\"}
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            upstream_done: false,
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: Some("req_first".into()),
@@ -1763,6 +1838,7 @@ data: {\"type\":\"message_stop\"}
                 started_at: std::time::SystemTime::now(),
             }),
             cc_session: None,
+            cc_thread: None,
             empty_reply_key: None,
             prompt_key: None,
             app_key: None,
@@ -1781,7 +1857,7 @@ data: {\"type\":\"message_stop\"}
         // 重试成功那一步：调用方换了响应侧，`note_retry` 负责把请求侧一并换过来。
         let mut h = crate::proxy::HeaderMap::new();
         h.insert("request-id", HeaderValue::from_static("req_retry"));
-        rl.note_retry("no_prefill", &h, &retried);
+        rl.note_retry("no_prefill", &h, &retried, None);
         assert_eq!(rl.upstream_request_id.as_deref(), Some("req_retry"));
         drop(rl);
 
@@ -2217,12 +2293,14 @@ data: {\"type\":\"message_stop\"}
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
+            upstream_done: false,
             request_id: "lb-test".into(),
             client_request_id: None,
             upstream_request_id: None,
             forensics: Default::default(),
             telemetry: None,
             cc_session: None,
+            cc_thread: None,
             empty_reply_key: None,
             prompt_key: None,
             app_key: None,

@@ -10,7 +10,9 @@ use super::learned_rules::{
     remember_refused_prompt,
 };
 use super::rate_limit::RateLimitInfo;
-use super::session_link::{CcSessionKey, CcSessionLink};
+use super::session_link::{
+    CcSessionKey, CcSessionLink, REPLY_TEXT_FP_INIT, ReplyFp, ThreadPending, reply_text_fp,
+};
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_status,
 };
@@ -63,6 +65,13 @@ pub(super) struct ReqLog {
     /// [`stream_upstream`] 里这个分支是 `if let Ok` 的隐式丢弃——错误原样交给 axum，
     /// 客户端拿到一条截断的流，服务端侧一行日志都没有。
     pub(super) stream_broke: Option<String>,
+    /// 上游的流读到了头（`bytes_stream` 返回了 `None`），见 [`stream_upstream`]。
+    ///
+    /// 流式回复没等到 `message_stop`、上游没报错也没断连，这一条若还是 `false`，就是**客户端
+    /// 先走了**——axum 在对端断开时丢掉响应体，转发那条流连同这个标记一起没读到头。Claude
+    /// Code 里按 Esc 打断、猜下一句被新输入顶掉，都是这个样子（遥测报 `aborted_streaming`）；
+    /// 为 `true` 则是上游半截 EOF，那一类照旧不报。
+    pub(super) upstream_done: bool,
     /// luban 给这条入站请求发的 id，见 [`handle`]。
     pub(super) request_id: String,
     /// 来访请求头里带的 id（若有），见 [`client_request_id`]。
@@ -82,6 +91,10 @@ pub(super) struct ReqLog {
     /// 非模拟路径为 `None`：真实 CC 来访自己维护这条链，luban 不该替它记，更不该拿自己
     /// 记的那份去覆盖。
     pub(super) cc_session: Option<String>,
+    /// 模拟路径这条请求按 message thread 改写后等回程提交的那份（[`ThreadPending`]）：完整成功
+    /// 才记成线程状态，失败把它接的那条线程作废。取自 [`super::Simulation::take_thread`]；
+    /// 非模拟路径与没写 `thread` 的为 `None`。
+    pub(super) cc_thread: Option<ThreadPending>,
     /// 这条请求所属的「零输出请求类」（模型 + `max_tokens`），见 [`empty_reply_class`]；
     /// `None` 即不属于任何一类（带 tools、多轮、非计费路径……），收尾时不学。
     pub(super) empty_reply_key: Option<(String, i64)>,
@@ -348,17 +361,6 @@ impl Drop for ReqLog {
         };
         spawn_usage_log(self.store.clone(), rec);
 
-        // 模拟路径的会话链条：把这一条的上游 request-id 与回复 message.id 记回去，
-        // 同会话的下一条据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。
-        // 失败的那些照记 request-id——官方那条链上并不跳过报错的请求。
-        if let Some(sid) = &self.cc_session {
-            CcSessionLink::record(
-                CcSessionKey { cred_id: self.cred_id, session_id: sid },
-                self.upstream_request_id.as_deref(),
-                self.sniffer.message_id.as_deref(),
-            );
-        }
-
         // 官方客户端只对**成功拿到用量**的请求发 `tengu_api_success`：中途断流、上游报错、
         // 没有 usage 的一律不报。流式还要看见 `message_stop`：半截流的 `message_start` 也带
         // usage，但客户端那边这条是失败的，不会有 success 事件。聚合路径
@@ -398,8 +400,51 @@ impl Drop for ReqLog {
                 in_band: in_band_error,
             }
         });
+        // 客户端自己把流掐了（见 [`Self::upstream_done`]）：官方那头这条既不是 success 也不是
+        // error，而是一次取消，照报。
+        let aborted = self.sniffer.is_stream
+            && !self.sniffer.saw_message_stop
+            && !self.sse_aggregated
+            && !self.upstream_done
+            && stream_broke.is_none()
+            && self.status == StatusCode::OK.as_u16()
+            && failure.is_none();
+
+        // 模拟路径的会话链条：把这一条的上游 request-id 与回复 message.id 记回去，
+        // 同会话的下一条据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。
+        // 失败的那些照记 request-id——官方那条链上并不跳过报错的请求。**被客户端取消的不记**：
+        // 官方下一条的 `cc_prev_req` 仍指取消之前那条（`cap/auto-2.1.285-20260930/00264` 指回
+        // `00252`，跳过了按 Esc 打断的 `00261`）。
+        if let Some(sid) = &self.cc_session
+            && !aborted
+        {
+            CcSessionLink::record(
+                CcSessionKey { cred_id: self.cred_id, session_id: sid },
+                self.upstream_request_id.as_deref(),
+                self.sniffer.message_id.as_deref(),
+            );
+        }
+        // message thread：只有完整成功、拿到 `message.id` 的才能被下一轮接着 `continue`；上游报错
+        // 或断流的把它接的那条线程作废（线程过期之类的错接着 `continue` 只会一直错）。被客户端
+        // 取消的两样都不做：官方下一轮对取消的那条是重新 `create`（`00264`），而这里不记它，
+        // 下一轮的历史就接不上、自然落到 `create`。
+        if let Some(pending) = self.cc_thread.take()
+            && !aborted
+        {
+            match self.sniffer.message_id.as_deref() {
+                Some(mid) if ok => CcSessionLink::record_thread(
+                    &pending,
+                    mid,
+                    self.sniffer.client_tool_use_ids(),
+                    self.sniffer.reply_fp(),
+                    self.sniffer.context_tokens(),
+                ),
+                _ if failure.is_some() => CcSessionLink::drop_thread(&pending),
+                _ => {}
+            }
+        }
         if let Some(cap) = self.telemetry.take()
-            && (ok || failure.is_some())
+            && (ok || failure.is_some() || aborted)
         {
             let sink = cap.sink.clone();
             sink.record(crate::telemetry::ApiCall {
@@ -429,9 +474,11 @@ impl Drop for ReqLog {
                 thinking_chars: self.sniffer.thinking_chars,
                 saw_thinking: self.sniffer.saw_thinking,
                 tool_use_lens: self.sniffer.tool_use_lens(),
+                tool_calls: self.sniffer.tool_calls(),
                 cost_usd,
                 speed,
                 failure,
+                aborted,
             });
         }
     }
@@ -450,7 +497,18 @@ impl ReqLog {
     /// 请求**，而同一条事件里的 requestId 与 token 来自另一条。prefill 那条尤其明显：
     /// [`strip_assistant_prefill`] 直接弹掉末尾的 assistant 轮，`messageCount` 是真的变了。
     /// 取证的 `shape` 列同理——它要回答的是「发出去的到底长什么样」。
-    pub(super) fn note_retry(&mut self, tag: &str, headers: &HeaderMap, sent: &Bytes) {
+    ///
+    /// `thread` 同理，是重试那次改写交出的 message thread 那份（`Simulation::take_thread`）：
+    /// 首发那份记的是首发的历史，而上游线程里存的是重试发出去的（降级成文本的 thinking、剥掉的
+    /// prefill）。拿首发那份提交，下一轮客户端带回原历史时会错接 `continue`，或白白 `create`。
+    pub(super) fn note_retry(
+        &mut self,
+        tag: &str,
+        headers: &HeaderMap,
+        sent: &Bytes,
+        thread: Option<ThreadPending>,
+    ) {
+        self.cc_thread = thread;
         let tags = self.forensics.rewrites.get_or_insert_with(String::new);
         if !tags.is_empty() {
             tags.push(',');
@@ -655,6 +713,11 @@ pub(super) fn record_early_failure(
             up_request_id,
             None,
         );
+    }
+    // 这一发接着某条线程 `continue` 却失败了：那条线程作废，下一轮退回 `create`，见
+    // [`CcSessionLink::drop_thread`]。
+    if let Some(pending) = upstream.sim.as_ref().and_then(|s| s.take_thread()) {
+        CcSessionLink::drop_thread(&pending);
     }
     let Some(cap) =
         telemetry_capture(state, cred, upstream, sent, started, flags, billable, organization_id)
@@ -994,6 +1057,14 @@ pub(super) struct UsageSniffer {
     /// `toolUseContentLengths` 报的是「这条回复里每个工具的入参 JSON 长度之和」，流式下
     /// 入参是 `input_json_delta` 一片片来的，得按内容块序号拼回去。
     tool_uses: Vec<ToolUseBlock>,
+    /// 回复里的 `text` / `thinking` / `redacted_thinking` 块，各自的正文指纹按到达顺序累加。
+    /// 与 `tool_uses` 一起按块序拼成回复指纹（[`Self::reply_fp`]），模拟路径拿它核对下一轮来访
+    /// 带回的那条 assistant 是不是这条回复，见 [`CcSessionLink::record_thread`]。
+    reply_blocks: Vec<ReplyBlock>,
+    /// 回复拼不出原貌：出现了认不出的增量类型，或块数、入参超了上限被截掉。模拟路径不接这条。
+    reply_unverifiable: bool,
+    /// `safeguard_results` 里每个 `tool_use` 的判决：`(tool_use.id, not_flagged / flagged / skipped)`。
+    safeguard_verdicts: Vec<(String, String)>,
     /// 响应体本身就是一份错误 JSON（`{"type":"error","error":{...}}`）时的类型与文案。
     ///
     /// 非流式 4xx/5xx 的整段体本来就攒在 `buf` 里、`finish` 时会解析一次，顺手记下——
@@ -1023,10 +1094,38 @@ pub(super) struct UsageSniffer {
 /// `message_start` + `message_delta` + `message_stop` 三段也装得下。
 pub(super) const RESPONSE_EXCERPT_BYTES: usize = 8 * 1024;
 
+/// 回复里一个 `text` / `thinking` / `redacted_thinking` 块的指纹，见 [`UsageSniffer::reply_fp`]。
+#[derive(Debug, Clone)]
+struct ReplyBlock {
+    index: i64,
+    kind: ReplyBlockKind,
+    /// 正文（`redacted_thinking` 是 `data`）的 [`reply_text_fp`]，从初值起算、按增量续上。
+    fp: u64,
+    /// 一个字都还没有：空 `text` 块（也没有引用）不进回复指纹（出站改写会把它剥掉）。
+    empty: bool,
+    /// `text` 块的引用：非流式在块里，流式由 `citations_delta` 一条条来。
+    citations: Vec<serde_json::Value>,
+    /// [`ReplyBlockKind::Other`] 的整块（`content_block_start` 那份；工具类块的 `input` 在
+    /// [`UsageSniffer::reply_fp`] 里换成拼好的入参）。
+    raw: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyBlockKind {
+    Text,
+    Thinking,
+    RedactedThinking,
+    /// 其余各种块：`server_tool_use`、`web_search_tool_result` 之类服务端工具的调用与结果。
+    Other,
+}
+
 /// 回复里一个 `tool_use` 块：内容块序号、工具名、`input` 的 JSON 串。
 #[derive(Default, Clone)]
 struct ToolUseBlock {
     index: i64,
+    /// `tool_use.id`（`toolu_…`）：下一条请求的 `tool_result.tool_use_id` 指回它，响应里
+    /// `safeguard_results` 的判决也按它记。
+    id: String,
     /// 遥测用的归类名（[`tool_use_label`]：`mcp__*` 归 `mcp_tool`、`skill__*` 归 `skill_tool`）。
     name: String,
     /// 上游回的原名，一字不改——回答「模型到底调了哪个」用的是它，归类名答不了。
@@ -1176,6 +1275,33 @@ impl UsageSniffer {
                 self.thinking_chars += t.encode_utf16().count();
             }
         }
+        // auto 模式的服务端分类判决（`message_delta.delta.safeguard_results`，非流式在顶层）：
+        // 每个 `tool_use` 一条，`evaluated` + `outcome` 或 `skipped`（`cap/auto-2.1.285-20260930`
+        // 80 条响应）。遥测的 `tengu_auto_mode_decision` 按它报。
+        if let Some(results) = v
+            .get("delta")
+            .and_then(|d| d.get("safeguard_results"))
+            .or_else(|| v.get("safeguard_results"))
+            .and_then(|r| r.as_array())
+        {
+            for r in results {
+                let Some(uses) =
+                    r.get("status").and_then(|s| s.get("tool_uses")).and_then(|t| t.as_object())
+                else {
+                    continue;
+                };
+                for (id, verdict) in uses {
+                    let ty = verdict.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let label = match verdict.get("outcome").and_then(|o| o.as_str()) {
+                        Some(o) => o.to_string(),
+                        None => ty.to_string(),
+                    };
+                    if self.safeguard_verdicts.len() < 256 {
+                        self.safeguard_verdicts.push((id.clone(), label));
+                    }
+                }
+            }
+        }
         // 块的类型与工具入参：流式靠 `content_block_start` 开头、`input_json_delta` 续上。
         match v.get("type").and_then(|t| t.as_str()) {
             Some("content_block_start") => {
@@ -1185,12 +1311,46 @@ impl UsageSniffer {
                 }
             }
             Some("content_block_delta") => {
+                let index = v.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
+                let delta = v.get("delta");
+                let piece = delta
+                    .and_then(|d| d.get("text").or_else(|| d.get("thinking")))
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty());
+                if let Some(t) = piece
+                    && let Some(b) = self.reply_blocks.iter_mut().rev().find(|b| b.index == index)
+                {
+                    b.fp = reply_text_fp(b.fp, t);
+                    b.empty = false;
+                }
+                // 认得的增量才拼得出原貌；别的一律记成拼不出，那条回复不给 `continue` 接。
+                match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
+                    Some(
+                        "text_delta" | "thinking_delta" | "signature_delta" | "input_json_delta",
+                    ) => {}
+                    Some("citations_delta") => {
+                        let block = self.reply_blocks.iter_mut().rev().find(|b| b.index == index);
+                        match (delta.and_then(|d| d.get("citation")), block) {
+                            (Some(c), Some(b)) if b.citations.len() < 1024 => {
+                                b.citations.push(c.clone());
+                                b.empty = false;
+                            }
+                            _ => self.reply_unverifiable = true,
+                        }
+                    }
+                    _ => self.reply_unverifiable = true,
+                }
                 if let Some(pj) =
                     v.get("delta").and_then(|d| d.get("partial_json")).and_then(|p| p.as_str())
                 {
                     let index = v.get("index").and_then(|i| i.as_i64()).unwrap_or(-1);
-                    if let Some(b) = self.tool_uses.iter_mut().find(|b| b.index == index) {
-                        // `content_block_start` 里那个 `input` 是空 `{}` 占位，增量一来就作废。
+                    // 空增量不算数：零参数的工具（`cap/auto-2.1.285-20260930/00164` 的 ExitPlanMode）
+                    // 只来一条 `partial_json: ""`，真拿它作废占位的 `{}`，入参就成了空串、解析不了，
+                    // 这条回复被记成拼不出原貌，官方照常 `continue` 的下一轮（`00167`）只能 `create`。
+                    if let Some(b) = self.tool_uses.iter_mut().find(|b| b.index == index)
+                        && !pj.is_empty()
+                    {
+                        // `content_block_start` 里那个 `input` 是空 `{}` 占位，非空增量一来就作废。
                         if !b.from_delta {
                             b.json.clear();
                             b.from_delta = true;
@@ -1265,6 +1425,35 @@ impl UsageSniffer {
         if ty != Some("fallback") {
             self.saw_output_block = true;
         }
+        let kind = match ty {
+            Some("text") => Some((ReplyBlockKind::Text, "text")),
+            Some("thinking") => Some((ReplyBlockKind::Thinking, "thinking")),
+            Some("redacted_thinking") => Some((ReplyBlockKind::RedactedThinking, "data")),
+            // 客户端 `tool_use` 在 `tool_uses` 里按 id / 名字 / 入参比；`fallback` 两边都不算。
+            Some("tool_use" | "fallback") => None,
+            _ => Some((ReplyBlockKind::Other, "")),
+        };
+        if let Some((kind, field)) = kind {
+            if self.reply_blocks.len() >= 1024 {
+                self.reply_unverifiable = true;
+            } else {
+                let body = cb.get(field).and_then(|t| t.as_str()).unwrap_or_default();
+                let citations = match kind {
+                    ReplyBlockKind::Text => {
+                        cb.get("citations").and_then(|c| c.as_array()).cloned().unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                self.reply_blocks.push(ReplyBlock {
+                    index,
+                    kind,
+                    fp: reply_text_fp(REPLY_TEXT_FP_INIT, body),
+                    empty: body.is_empty() && citations.is_empty(),
+                    citations,
+                    raw: (kind == ReplyBlockKind::Other).then(|| cb.clone()),
+                });
+            }
+        }
         match ty {
             Some("thinking" | "redacted_thinking") => self.saw_thinking = true,
             Some("fallback") => {
@@ -1276,11 +1465,13 @@ impl UsageSniffer {
             Some(ty @ ("tool_use" | "server_tool_use" | "mcp_tool_use")) => {
                 // 防御：一条回复里的工具块数有上限，别让畸形流把内存撑爆。
                 if self.tool_uses.len() >= 256 {
+                    self.reply_unverifiable = true;
                     return;
                 }
                 let name = cb.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 self.tool_uses.push(ToolUseBlock {
                     index,
+                    id: cb.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
                     name: tool_use_label(ty, name),
                     raw_name: name.to_string(),
                     client_side: ty == "tool_use",
@@ -1290,6 +1481,26 @@ impl UsageSniffer {
             }
             _ => {}
         }
+    }
+
+    /// 这条回复里客户端要执行的每个 `tool_use`：id、原名、入参（能解析就是紧凑 JSON）、服务端
+    /// 分类判决。遥测拿它补下一条请求前那串工具事件（入参字节数、Bash 那组字段、auto 模式的
+    /// 判决），thread 续轮的增量体里看不到上一条回复，只能从这里来。
+    pub(super) fn tool_calls(&self) -> Vec<crate::telemetry::ToolCall> {
+        self.tool_uses
+            .iter()
+            .filter(|b| b.client_side)
+            .map(|b| crate::telemetry::ToolCall {
+                id: b.id.clone(),
+                name: b.raw_name.clone(),
+                input: serde_json::from_str(&b.json).unwrap_or(serde_json::Value::Null),
+                verdict: self
+                    .safeguard_verdicts
+                    .iter()
+                    .find(|(id, _)| *id == b.id)
+                    .map(|(_, v)| v.clone()),
+            })
+            .collect()
     }
 
     /// `toolUseContentLengths` 那张表：工具名 → 入参 JSON 的字符数之和，按首次出现排序。
@@ -1348,6 +1559,72 @@ impl UsageSniffer {
             }
         }
         out
+    }
+
+    /// 这条回复的内容指纹（[`ReplyFp`]）：`text`（含引用）/ thinking 块、客户端 `tool_use`（id、
+    /// 原样的混淆名、解析后的入参）与其余各种块（服务端工具的调用与结果，入参换成拼好的那份）
+    /// 按块序喂。下一轮来访回传的那条 assistant 得与它对上，模拟路径才敢接着这条回复发
+    /// `thread: continue`（[`CcSessionLink::record_thread`]）。入参解析不了、见过认不出的增量或
+    /// 超了上限的，记成拼不出原貌——那条不给接，落到 `create`。
+    pub(super) fn reply_fp(&self) -> ReplyFp {
+        enum Item<'a> {
+            Block(&'a ReplyBlock),
+            Tool(&'a ToolUseBlock),
+        }
+        let mut items: Vec<(i64, Item<'_>)> = self
+            .reply_blocks
+            .iter()
+            .map(|b| (b.index, Item::Block(b)))
+            .chain(
+                self.tool_uses.iter().filter(|t| t.client_side).map(|t| (t.index, Item::Tool(t))),
+            )
+            .collect();
+        items.sort_by_key(|(i, _)| *i);
+        let mut fp = ReplyFp::upstream();
+        if self.reply_unverifiable {
+            fp.mark_unverifiable();
+        }
+        for (_, item) in items {
+            match item {
+                Item::Block(b) => match b.kind {
+                    ReplyBlockKind::Text if !b.empty => fp.text(b.fp, &b.citations),
+                    ReplyBlockKind::Text => {}
+                    ReplyBlockKind::Thinking => fp.thinking(false, b.fp),
+                    ReplyBlockKind::RedactedThinking => fp.thinking(true, b.fp),
+                    ReplyBlockKind::Other => {
+                        let Some(mut raw) = b.raw.clone() else { continue };
+                        // 服务端工具的入参与客户端的一样是 `input_json_delta` 拼的。
+                        if let Some(t) = self.tool_uses.iter().find(|t| t.index == b.index) {
+                            match serde_json::from_str::<serde_json::Value>(&t.json) {
+                                Ok(input) => raw["input"] = input,
+                                Err(_) => fp.mark_unverifiable(),
+                            }
+                        }
+                        fp.block(&raw);
+                    }
+                },
+                Item::Tool(t) => match serde_json::from_str(&t.json) {
+                    Ok(input) => fp.tool_use(&t.id, &t.raw_name, &input),
+                    Err(_) => fp.mark_unverifiable(),
+                },
+            }
+        }
+        fp
+    }
+
+    /// 回复里要客户端执行的 `tool_use` 的 id，按出现顺序。下一轮来访回传的那条 assistant 消息
+    /// 得逐个对上它，模拟路径才敢接着这条回复发 `thread: continue`（[`CcSessionLink::record_thread`]）。
+    pub(super) fn client_tool_use_ids(&self) -> Vec<String> {
+        self.tool_uses.iter().filter(|b| b.client_side).map(|b| b.id.clone()).collect()
+    }
+
+    /// 这条回复 usage 的总量：input + cache 写 + cache 读 + output。官方 `<total_tokens>` 倒数
+    /// 拿它当「当前上下文」（可执行文件里的 `xz`），见 [`super::session_link::TotalTokens`]。
+    pub(super) fn context_tokens(&self) -> u64 {
+        [self.input_tokens, self.cache_creation_tokens, self.cache_read_tokens, self.output_tokens]
+            .iter()
+            .map(|t| t.unwrap_or(0).max(0) as u64)
+            .sum()
     }
 
     /// 收尾：非流式模式在此解析累积的整段 JSON。
@@ -1670,6 +1947,7 @@ mod tests {
             assert_eq!(got.cache_read_tokens, whole.cache_read_tokens, "{label}");
             assert_eq!(got.stop_reason, whole.stop_reason, "{label}");
             assert_eq!(got.text_chars, whole.text_chars, "{label}");
+            assert_eq!(got.reply_fp(), whole.reply_fp(), "{label}：回复指纹");
             assert_eq!(got.events, whole.events, "{label}：事件计数");
             assert_eq!(got.last_event, whole.last_event, "{label}");
             assert_eq!(got.saw_message_stop, whole.saw_message_stop, "{label}");
@@ -1680,6 +1958,147 @@ mod tests {
         assert_eq!(whole.events, 8);
         assert_eq!(whole.text_chars, 5, "五个汉字，按 UTF-16 码元数");
         assert!(whole.saw_message_stop);
+    }
+
+    /// 回复指纹：流式的 `text_delta` / `thinking_delta` / `input_json_delta` 分几段来，与客户端
+    /// 下一轮带回的那条 assistant（入参重新序列化过、键序变了）按同一算法算出同一个数
+    /// （[`crate::proxy::session_link::ReplyFp`]）；非流式整段 `content[]` 也一样。改了正文、
+    /// 工具入参（id 不变）或 thinking 的都对不上。
+    #[test]
+    fn the_sniffer_fingerprints_the_reply_like_the_client_copy() {
+        let wire = [
+            r#"data: {"type":"message_start","message":{"id":"msg_x","usage":{"input_tokens":1}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先看"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"目录"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"我看"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"一下"}}"#,
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"ls\","}}"#,
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":" \"timeout\": 5}"}}"#,
+            r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"。"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]
+        .join("\n\n")
+            + "\n\n";
+        let mut s = crate::proxy::UsageSniffer::new(true, false);
+        s.feed(wire.as_bytes());
+        s.finish();
+        let client = |content: serde_json::Value| {
+            crate::proxy::body::thread_msg_of(
+                &serde_json::json!({ "role": "assistant", "content": content }),
+            )
+            .reply
+        };
+        let blocks = |thinking: &str, text: &str, command: &str| {
+            serde_json::json!([
+                { "type": "thinking", "thinking": thinking, "signature": "sig" },
+                { "type": "text", "text": text },
+                { "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                  "input": { "timeout": 5, "command": command } },
+                { "type": "text", "text": "。" },
+            ])
+        };
+        assert_eq!(s.reply_fp(), client(blocks("先看目录", "我看一下", "ls")));
+        assert_eq!(s.client_tool_use_ids(), vec!["toolu_1".to_string()]);
+        assert_ne!(s.reply_fp(), client(blocks("先看目录", "我改过了", "ls")), "改了正文");
+        assert_ne!(s.reply_fp(), client(blocks("先看目录", "我看一下", "rm -rf x")), "改了入参");
+        assert_ne!(s.reply_fp(), client(blocks("改过的推理", "我看一下", "ls")), "改了 thinking");
+
+        let body = r#"{"id":"msg_y","type":"message","content":[{"type":"thinking","thinking":"先看目录","signature":"sig"},{"type":"text","text":"我看一下"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls","timeout":5}},{"type":"text","text":"。"}]}"#;
+        let mut n = crate::proxy::UsageSniffer::new(false, false);
+        n.feed(body.as_bytes());
+        n.finish();
+        assert_eq!(n.reply_fp(), s.reply_fp(), "非流式同一个数");
+    }
+
+    /// 服务端工具与引用也进回复指纹（形态照 `cap/auto-2.1.285-20260930/00056`：`server_tool_use`
+    /// 入参走 `input_json_delta`、`web_search_tool_result` 整块在 `content_block_start` 里、引用走
+    /// `citations_delta`）。正文不变、只改搜索结果 / 服务端工具入参 / 引用 URL 的都对不上；见过
+    /// 认不出的增量类型的，这条回复记成拼不出原貌，与谁都对不上。
+    #[test]
+    fn the_reply_fingerprint_covers_server_tools_and_citations() {
+        let result = serde_json::json!({ "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": [{ "type": "web_search_result", "title": "CPython", "url": "https://a.example/",
+                          "encrypted_content": "Et8Q", "page_age": null }] });
+        let citation = serde_json::json!({ "type": "web_search_result_location", "cited_text": "Guido",
+            "url": "https://a.example/", "title": "CPython", "encrypted_index": "Eo8B" });
+        let events = |extra: &str| {
+            let mut e = vec![
+                r#"{"type":"message_start","message":{"id":"msg_s","usage":{"input_tokens":1}}}"#.to_string(),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#.to_string(),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\": "}}"#.to_string(),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"cpython\"}"}}"#.to_string(),
+                format!(r#"{{"type":"content_block_start","index":1,"content_block":{result}}}"#),
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#.to_string(),
+                format!(r#"{{"type":"content_block_delta","index":2,"delta":{{"type":"citations_delta","citation":{citation}}}}}"#),
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"作者是 Guido"}}"#.to_string(),
+            ];
+            if !extra.is_empty() {
+                e.push(extra.to_string());
+            }
+            e.push(r#"{"type":"message_stop"}"#.to_string());
+            e.iter().map(|x| format!("data: {x}\n\n")).collect::<String>()
+        };
+        let sniff = |wire: String| {
+            let mut s = crate::proxy::UsageSniffer::new(true, false);
+            s.feed(wire.as_bytes());
+            s.finish();
+            s.reply_fp()
+        };
+        let client = |query: &str, url: &str, cite_url: &str| {
+            let mut r = result.clone();
+            r["content"][0]["url"] = url.into();
+            let mut c = citation.clone();
+            c["url"] = cite_url.into();
+            crate::proxy::body::thread_msg_of(&serde_json::json!({ "role": "assistant", "content": [
+                { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": query } },
+                r,
+                { "type": "text", "text": "作者是 Guido", "citations": [c] },
+            ] }))
+            .reply
+            .as_upstream()
+        };
+        let a = "https://a.example/";
+        let got = sniff(events(""));
+        assert_eq!(got, client("cpython", a, a), "原样带回对得上");
+        assert_ne!(got, client("pypy", a, a), "改了服务端工具入参");
+        assert_ne!(got, client("cpython", "https://evil.example/", a), "改了搜索结果");
+        assert_ne!(got, client("cpython", a, "https://evil.example/"), "改了引用 URL");
+        let odd = sniff(events(
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"future_delta","x":1}}"#,
+        ));
+        assert_ne!(odd, client("cpython", a, a), "认不出的增量：拼不出原貌，不给接");
+    }
+
+    /// 零参数工具（`cap/auto-2.1.285-20260930/00164` 的 ExitPlanMode）：`content_block_start` 的
+    /// `input: {}` 之后只来一条空的 `partial_json`。空增量不作废占位，入参仍是 `{}`，客户端原样
+    /// 带回照常对得上（官方下一轮 `00167` 就是接着它 `continue` 的）。
+    #[test]
+    fn an_empty_json_delta_keeps_the_placeholder_input() {
+        let wire = [
+            r#"data: {"type":"message_start","message":{"id":"msg_p","usage":{"input_tokens":1}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_p","name":"ExitPlanMode","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]
+        .join("\n\n")
+            + "\n\n";
+        let mut s = crate::proxy::UsageSniffer::new(true, false);
+        s.feed(wire.as_bytes());
+        s.finish();
+        let client = crate::proxy::body::thread_msg_of(
+            &serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_p", "name": "ExitPlanMode", "input": {} },
+        ] }),
+        )
+        .reply
+        .as_upstream();
+        assert_eq!(s.reply_fp(), client);
     }
 
     #[test]
