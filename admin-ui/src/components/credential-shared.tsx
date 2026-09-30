@@ -794,7 +794,17 @@ export function sortCreds(
  * 卡片视图与列表视图共用的写操作。各视图自行管理编辑态（重命名、设备上限输入框），
  * 这里只封装请求与失败提示，避免两处重复维护同一套 mutation。
  */
-export function useCredentialActions(cred: Credential, onRenamed?: () => void, onLimitSaved?: () => void) {
+/**
+ * `onRemoved` 在删号成功、把这个号从列表缓存里拿掉**之前**同步调用。详情页靠它跳回账号池：
+ * 详情页的账号就是从这份缓存里挑的，缓存一拿掉页面当场变成「未找到该账号」，挂在详情组件
+ * 上等 `isSuccess` 的 effect 跟着卸载、根本跑不到。
+ */
+export function useCredentialActions(
+  cred: Credential,
+  onRenamed?: () => void,
+  onLimitSaved?: () => void,
+  onRemoved?: () => void,
+) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['credentials'] })
@@ -888,6 +898,10 @@ export function useCredentialActions(cred: Credential, onRenamed?: () => void, o
     mutationFn: () => deleteCredential(cred.id),
     onSuccess: () => {
       toastManager.add({ title: t('账号已删除', 'Account deleted'), type: 'success' })
+      onRemoved?.()
+      // 再从缓存里拿掉这个号，卡片 / 行当场消失，不必等列表重新拉取回来。随后的 invalidate
+      // 会取消在途的旧请求再拉一次，删除前发出、还带着这个号的响应不会把它放回来。
+      qc.setQueryData<Credential[]>(['credentials'], (list) => list?.filter((c) => c.id !== cred.id))
       invalidate()
       qc.invalidateQueries({ queryKey: ['proxies'] })
     },
@@ -1354,7 +1368,10 @@ export function DeleteCredentialDialog({
           <AlertDialogDescription>
             {t('删除', 'Deleting ')}
             {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{credentialLabel}</span>{t('」后，', '" will ')}
-            {t('历史用量与设备绑定将一并清除，且无法恢复。', 'permanently remove its usage history and device bindings. This cannot be undone.')}
+            {t(
+              '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 30 天保留期到期后自动清除。',
+              'remove its device bindings immediately. This cannot be undone. Its request log is not deleted right away; entries are cleared automatically once they pass the 30-day retention period.',
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
@@ -1362,7 +1379,9 @@ export function DeleteCredentialDialog({
           <Button
             variant="destructive"
             loading={actions.remove.isPending}
-            onClick={() => actions.remove.mutate()}
+            // 成功即关：此前只等所在的卡片随列表刷新被卸载时连带消失，刷新一慢，确认框就
+            // 带着可点的「删除」一直留着，再点一次只会得到「账号不存在」。
+            onClick={() => actions.remove.mutate(undefined, { onSuccess: () => onOpenChange(false) })}
           >
             {t('删除', 'Delete')}
           </Button>

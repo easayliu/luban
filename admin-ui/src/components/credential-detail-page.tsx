@@ -442,16 +442,12 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
 
-  const actions = useCredentialActions(cred, () => setRenaming(false))
-  const { toggle, remove } = actions
+  // 删掉之后这一页就没有对象了，直接回账号池，而不是停在一张「找不到这个账号」上。
+  const actions = useCredentialActions(cred, () => setRenaming(false), undefined, onDeleted)
+  const { toggle } = actions
   const evaluation = evaluateCredential(cred, now, language)
   const { status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
-
-  // 删掉之后这一页就没有对象了，直接回账号池，而不是停在一张「找不到这个账号」上。
-  useEffect(() => {
-    if (remove.isSuccess) onDeleted()
-  }, [remove.isSuccess, onDeleted])
 
   useEffect(() => {
     const previousTitle = document.title

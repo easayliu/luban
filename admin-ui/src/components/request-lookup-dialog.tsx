@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { SearchIcon } from 'lucide-react'
-import { listCredentialUsage, listUsage, type UsageLog } from '@/api/credentials'
+import { listUsage, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
   cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey,
@@ -80,15 +80,15 @@ export function RequestLookupDialog({
           ? listUsage({ session_id: submitted, limit: 50 })
           : listUsage({ request_id: submitted, limit: 50 })
       }
-      const params = {
+      // 按账号也走全局接口带 cred_id：拆分表里可能是已删的号（流水留到保留期满），按号的
+      // 接口对它给 404。
+      return listUsage({
         model: filter.model,
         session_key: filter.sessionKey,
         hours: filter.hours,
+        cred_id: filter.credId,
         limit: 50,
-      }
-      return filter.credId != null
-        ? listCredentialUsage(filter.credId, params)
-        : listUsage(params)
+      })
     },
     enabled: open && (filter != null || submitted !== ''),
   })

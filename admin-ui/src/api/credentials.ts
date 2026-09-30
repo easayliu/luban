@@ -503,6 +503,11 @@ export interface UsageListParams {
    * 贴一个 uuid 进来走的就是它。
    */
   session_id?: string
+  /**
+   * 只看这个账号的流水；仅 {@link listUsage} 认它。与 {@link listCredentialUsage} 的区别：
+   * 那个在账号已删时给 404，这个照样查得到已删账号留到保留期满的流水。
+   */
+  cred_id?: number
 }
 
 export async function listCredentialUsage(

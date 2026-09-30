@@ -889,8 +889,14 @@ async fn exchange(
 
 // ---------- 用量日志 ----------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct UsageQuery {
+    /// 只看这个账号的流水；仅全局的 `/usage` 认它（按号的 `/credentials/{id}/usage` 以路径为准）。
+    ///
+    /// 与按号接口分开存在，是因为那个接口在账号不存在时给 404，而已删账号的流水会留到保留期满
+    /// （见 [`CredentialStore::remove`]）：趋势拆分表里点已删账号那一行，得走这里才看得到。
+    #[serde(default)]
+    cred_id: Option<i64>,
     /// 返回条数上限（默认 100，最多 1000；按号查时默认 25、最多 200）。
     #[serde(default)]
     limit: Option<i64>,
@@ -938,7 +944,7 @@ async fn list_usage(
     State(state): State<AppState>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsagePage>, ApiError> {
-    blocking(move || usage_page(&state, None, &q, 100, 1000)).await
+    blocking(move || usage_page(&state, q.cred_id, &q, 100, 1000)).await
 }
 
 /// 列出某凭证的请求流水（按时间倒序，页码翻页）。
@@ -1216,7 +1222,7 @@ async fn unbind_credential_session(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// 删除一条凭证。流水在后台清，见 [`purge_usage_logs_in_background`]。
+/// 删除一条凭证。用量流水不删，随 30 天保留期自然裁掉，理由见 [`CredentialStore::remove`]。
 async fn delete_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1227,25 +1233,7 @@ async fn delete_credential(
         return Err(not_found());
     }
     tracing::info!(cred_id = id, "credential deleted");
-    purge_usage_logs_in_background(&state, vec![id]);
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// 删号后清掉这些账号的用量流水（[`crate::store::CredentialStore::purge_usage_logs_of`]）。
-///
-/// 不让接口等它：一个号 30 天的流水可能几十万行，分批删也要好几秒；账号行已经删了，
-/// 列表和选号里它立即消失，流水晚几秒清完不影响什么。失败只记日志，留下的无主行下次启动时
-/// 由 `store::purge_orphan_rows` 扫掉。
-fn purge_usage_logs_in_background(state: &AppState, ids: Vec<i64>) {
-    let store = state.store.clone();
-    tokio::task::spawn_blocking(move || match store.purge_usage_logs_of(&ids) {
-        Ok(rows) => {
-            tracing::info!(creds = ids.len(), rows, "purged usage logs of deleted credentials")
-        }
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "failed to purge usage logs of deleted credentials")
-        }
-    });
 }
 
 #[derive(Deserialize)]
@@ -1419,7 +1407,7 @@ async fn set_disabled_many(
     list_credentials(State(state)).await
 }
 
-/// 批量删除（连带清设备绑定，历史用量在后台清），返回删除后的整份列表。
+/// 批量删除（连带清设备绑定；用量流水不删，随保留期自然裁掉），返回删除后的整份列表。
 ///
 /// 用 POST 而非 DELETE：带请求体的 DELETE 在部分代理/客户端上会被丢掉 body。
 async fn delete_credentials(
@@ -1428,10 +1416,8 @@ async fn delete_credentials(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let store = state.store.clone();
-    let ids = req.ids.clone();
-    let n = blocking(move || store.remove(&ids).map_err(internal)).await?;
+    let n = blocking(move || store.remove(&req.ids).map_err(internal)).await?;
     tracing::info!(count = n, "credentials deleted in bulk");
-    purge_usage_logs_in_background(&state, req.ids);
     list_credentials(State(state)).await
 }
 
@@ -4348,6 +4334,38 @@ fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    /// 已删账号的流水留到保留期满：按号接口对它给 404（账号自己的明细弹框靠这个区分「号没了」
+    /// 与「没有请求」），全局接口带 `cred_id` 照样查得到——趋势拆分表里点已删账号那一行走的
+    /// 就是这条，别再把它导到按号接口去。
+    #[tokio::test]
+    async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id() {
+        let store = Arc::new(CredentialStore::open_in_memory().unwrap());
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+        for cid in [a.id, a.id, b.id] {
+            let rec = store::UsageRecord {
+                cred_id: Some(cid),
+                cred_label: "x".into(),
+                ..Default::default()
+            };
+            store.insert_usage_log(&rec).unwrap();
+        }
+        assert!(store.delete(a.id).unwrap());
+        let state = AppState::for_test(store.clone());
+
+        let err =
+            list_credential_usage(State(state.clone()), Path(a.id), Query(UsageQuery::default()))
+                .await
+                .err()
+                .expect("按号接口对已删账号给 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let q = UsageQuery { cred_id: Some(a.id), ..Default::default() };
+        let page = list_usage(State(state), Query(q)).await.unwrap().0;
+        assert_eq!(page.total, 2, "已删账号的两条流水都还在");
+        assert!(page.logs.iter().all(|l| l.cred_id == Some(a.id)), "只给这个号的");
+    }
 
     /// 重新授权后该自动启用的只有 token 那几档；封号、订阅未生效、额度暂停保持原状。
     #[test]

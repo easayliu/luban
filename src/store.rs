@@ -935,17 +935,10 @@ impl CredentialStore {
             })
     }
 
-    /// 删除一条，返回是否确有删除。连带清除其设备绑定与历史用量日志。
-    ///
-    /// 用量日志一并清掉：账号已不存在，其历史记录既无处归属（后台按 cred_id 关联展示
-    /// 费用/额度/最近使用），留着只会在请求日志里堆积无主行、并让费用统计包含已删账号。
-    /// 分两步走，见 [`Self::remove`] 与 [`Self::purge_usage_logs_of`]；后台接口只做第一步、
-    /// 流水放到后台清，这里是两步都做完才返回的同步版本（仅测试用）。
+    /// 删除一条，返回是否确有删除。口径同 [`Self::remove`]（仅测试用）。
     #[cfg(test)]
     pub fn delete(&self, id: i64) -> Result<bool> {
-        let n = self.remove(&[id])?;
-        self.purge_usage_logs_of(&[id])?;
-        Ok(n > 0)
+        Ok(self.remove(&[id])? > 0)
     }
 
     /// 清空所有凭证，返回删除条数。连带清空设备绑定与全部用量日志（口径同
@@ -1333,24 +1326,25 @@ impl CredentialStore {
         Ok(n)
     }
 
-    /// 批量删除：口径同 [`Self::delete`]，返回实际删除的条数（仅测试用）。
+    /// 批量删除：口径同 [`Self::remove`]，返回实际删除的条数（仅测试用）。
     #[cfg(test)]
     pub fn delete_many(&self, ids: &[i64]) -> Result<usize> {
-        let n = self.remove(ids)?;
-        self.purge_usage_logs_of(ids)?;
-        Ok(n)
+        self.remove(ids)
     }
 
-    /// 删号的第一步：账号行与挂在它上面的小表（绑定、账本、设备费用、模型拒绝）在同一个
-    /// 短事务里删掉，返回实际删除的账号数。**不碰用量流水**，调用方随后必须接着调
-    /// [`Self::purge_usage_logs_of`]。
+    /// 删号：账号行与挂在它上面的小表（绑定、账本、设备费用、模型拒绝）在同一个短事务里
+    /// 删掉，返回实际删除的账号数。
     ///
-    /// 流水不放进这个事务：一个号 30 天的流水动辄几万到几十万行，表又宽、挂着十来条索引，
-    /// 一个事务删完要好几秒，全程压着 `conn` 这把锁——选号、落流水、刷 token 全排在后面，
-    /// 整个转发跟着停。拆开后这里只是几条按主键/索引的小删除，账号立即从列表和选号里消失。
-    /// 代价：流水清完之前，全局口径的统计（总览、请求日志、按账号拆分等直接扫流水的）
-    /// 仍会带上这些行，账号列表不受影响（按现存账号取）；清到一半失败或进程退出留下的无主行，
-    /// 下次启动由 `purge_orphan_rows` 扫掉，最迟也随 [`Self::prune_usage_logs`] 到期裁掉。
+    /// **用量流水不删**，留给 [`Self::prune_usage_logs`] 按 30 天保留期自然裁掉。此前删号时
+    /// 顺手把这个号的流水也清掉，一个号 30 天的流水动辄几十万行，表又宽、挂着十来条索引，
+    /// 分批删也要连着几分钟和转发抢 `conn` 这把锁，删号期间整个后台和转发都跟着慢。而留着
+    /// 这些行并没有害处：
+    /// - 账号 id 自增不复用（见 migrates_and_stops_id_reuse），不会被记到新号头上；
+    /// - 每行自带 `cred_label`，请求日志、按账号拆分照样显示得出是哪个号；
+    /// - 账号列表的费用/最近使用走账本（这里一并删了），选号与 RPM 只看在册账号。
+    ///
+    /// 全局口径的统计（总览、请求日志、按账号拆分）因此会带上已删账号那 30 天的用量——
+    /// 那些请求确实发生过、钱也确实花了，算进去才对得上账。
     pub fn remove(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -1383,35 +1377,6 @@ impl CredentialStore {
             self.cooldown.forget(*id);
         }
         Ok(n)
-    }
-
-    /// 删号的第二步：清掉这些账号的用量流水，返回删除的行数。
-    ///
-    /// 与 [`Self::prune_usage_logs`] 同一个思路：每批一个短事务、批与批之间放锁，转发路径
-    /// 能插在中间拿到 `conn`，不会被一次大删除整段挡住。按 `(cred_id, id)` 覆盖索引取批。
-    ///
-    /// 批量取 1000 而不是裁剪那边的 5000：一个号的流水和别的号交错着落在各页上，每行都要改
-    /// 十来条索引，实测 5000 行一批要持锁 0.3 秒上下，1000 行约 70ms。放锁用 `unlock_fair`
-    /// 直接交给排队的转发请求——普通放锁时这个线程马上又会抢回去，等的人还得再等一批。
-    pub fn purge_usage_logs_of(&self, ids: &[i64]) -> Result<usize> {
-        const BATCH: usize = 1_000;
-        let mut total = 0;
-        for id in ids {
-            loop {
-                let conn = self.conn.lock();
-                let n = conn.execute(
-                    "DELETE FROM usage_logs WHERE id IN (
-                         SELECT id FROM usage_logs WHERE cred_id = ?1 LIMIT ?2)",
-                    params![id, BATCH as i64],
-                )?;
-                parking_lot::MutexGuard::unlock_fair(conn);
-                total += n;
-                if n < BATCH {
-                    break;
-                }
-            }
-        }
-        Ok(total)
     }
 
     /// 批量启停：语义与 [`Self::set_disabled`] 一致（停用时清设备绑定使其立即改选其它
@@ -3887,7 +3852,8 @@ pub struct UsageLog {
 pub struct UsageLogQuery {
     /// 只看这个凭证的流水；`None` 为全部。
     ///
-    /// 已删账号的记录 `cred_id` 为 NULL（见 `prune_orphan_usage_logs`），按号筛时自然落选。
+    /// 已删账号的流水保留原 `cred_id` 直到保留期满（见 [`CredentialStore::remove`]），按号筛
+    /// 照样筛得出；后台的账号下拉只列在册账号，所以平时筛不到它们。
     pub cred_id: Option<i64>,
     /// 翻页锚点：只取 id **小于等于**它的记录；`None` 为不设上界（即含最新写入的那些）。
     pub until_id: Option<i64>,
@@ -4906,7 +4872,8 @@ impl CredentialStore {
         let label_expr = match by {
             BreakdownBy::Model => "COALESCE(u.model, '')",
             BreakdownBy::Account => {
-                "COALESCE(c.label, '#' || COALESCE(CAST(u.cred_id AS TEXT), '?'))"
+                // 已删账号的流水留到保留期满（见 remove），账号表里没它了就退回流水自带的名字。
+                "COALESCE(c.label, NULLIF(u.cred_label, ''), '#' || COALESCE(CAST(u.cred_id AS TEXT), '?'))"
             }
         };
         let mut stmt = conn.prepare(&format!(
@@ -6184,22 +6151,13 @@ fn backfill_ledger(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 清扫 cred_id 已指向不存在账号的行（用量日志 + 设备绑定）。
+/// 清扫 cred_id 已指向不存在账号的小表行（绑定、账本、设备费用）。删号本来就在同一个
+/// 事务里清了它们（[`CredentialStore::remove`]），这里兜的是更早版本留下的欠账。
 ///
-/// 旧版删号不清 `usage_logs`，被删账号的历史记录会一直留在库里：后台请求日志里显示为
-/// 无主行、费用/额度统计也仍会按 cred_id 聚合到它们。开机时做一次清扫补上这段历史欠账。
-/// 现在的删号路径在后台分批清流水（[`CredentialStore::purge_usage_logs_of`]），正常情况下
-/// 这里是 no-op；清到一半进程退出时，剩下的由这里兜底。
-///
-/// `cred_id IS NULL` 的日志（尚未选到凭证就失败的请求）不属于任何账号，保留。
+/// **用量流水不在这里清**：已删账号的流水按设计留着，随 30 天保留期自然裁掉，理由见
+/// [`CredentialStore::remove`]。这里若一条语句删掉所有无主流水，删过几个大号的库每次开机
+/// 都要先删上几十万行、全程占着写锁。
 fn purge_orphan_rows(conn: &Connection) -> Result<()> {
-    let logs = conn
-        .execute(
-            "DELETE FROM usage_logs
-              WHERE cred_id IS NOT NULL AND cred_id NOT IN (SELECT id FROM credentials)",
-            [],
-        )
-        .context("failed to purge orphaned usage logs")?;
     let binds = conn
         .execute(
             "DELETE FROM device_bindings WHERE cred_id NOT IN (SELECT id FROM credentials)",
@@ -6219,11 +6177,10 @@ fn purge_orphan_rows(conn: &Connection) -> Result<()> {
     .context("failed to purge orphaned credential ledger entries")?;
     conn.execute("DELETE FROM device_costs WHERE cred_id NOT IN (SELECT id FROM credentials)", [])
         .context("failed to purge orphaned device cost entries")?;
-    if logs > 0 || binds > 0 {
+    if binds > 0 {
         tracing::info!(
-            usage_logs = logs,
             device_bindings = binds,
-            "cleaned up history left behind by deleted credentials"
+            "cleaned up bindings left behind by deleted credentials"
         );
     }
     Ok(())
@@ -7519,9 +7476,10 @@ mod tests {
         assert!(!c.profile_incomplete(), "四列齐了就不再拉");
     }
 
-    /// 开机清扫：被删账号遗留的用量日志/设备绑定被清掉，在册账号与无主(NULL)日志保留。
+    /// 开机清扫：被删账号遗留的设备绑定被清掉；用量流水一律不动（已删账号的流水按设计
+    /// 留到保留期满，见 `remove`）。
     #[test]
-    fn purges_history_of_deleted_credentials() {
+    fn startup_sweep_drops_orphan_bindings_but_keeps_usage_logs() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn.execute(
@@ -7551,7 +7509,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(logs, vec![Some(1), None], "只应清掉已删账号(2)的日志");
+        assert_eq!(logs, vec![Some(1), Some(2), None], "流水一条不删，含已删账号(2)的");
         let binds: Vec<i64> = conn
             .prepare("SELECT cred_id FROM device_bindings")
             .unwrap()
@@ -7562,9 +7520,9 @@ mod tests {
         assert_eq!(binds, vec![1]);
     }
 
-    /// 删号连带清掉该账号的用量日志与设备绑定，其它账号的历史不受影响。
+    /// 删号清掉设备绑定，但用量流水留着（随保留期自然裁掉），其它账号不受影响。
     #[test]
-    fn delete_cascades_usage_logs() {
+    fn delete_keeps_usage_logs_but_drops_bindings() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
@@ -7592,48 +7550,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(logs, vec![b.id], "被删账号的用量日志应一并清掉");
+        assert_eq!(logs, vec![a.id, b.id], "删号不删流水");
         let binds: i64 =
             conn.query_row("SELECT COUNT(*) FROM device_bindings", [], |r| r.get(0)).unwrap();
         assert_eq!(binds, 0);
-    }
-
-    /// 后台删号只做 `remove`：账号与绑定立即没了、流水还在；`purge_usage_logs_of` 分批清完
-    /// （跨过一个批次的边界），其它账号的流水不动。
-    #[test]
-    fn remove_then_purge_usage_logs_in_batches() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let store = CredentialStore::with_conn(conn);
-        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
-        let count = |cid: i64| -> i64 {
-            store
-                .conn
-                .lock()
-                .query_row("SELECT COUNT(*) FROM usage_logs WHERE cred_id = ?1", [cid], |r| {
-                    r.get(0)
-                })
-                .unwrap()
-        };
-        {
-            let conn = store.conn.lock();
-            conn.execute_batch(&format!(
-                "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 12000)
-                 INSERT INTO usage_logs (cred_id) SELECT CASE WHEN i % 4 = 0 THEN {} ELSE {} END FROM c;",
-                b.id, a.id
-            ))
-            .unwrap();
-        }
-
-        assert_eq!(store.remove(&[a.id]).unwrap(), 1);
-        assert!(store.get(a.id).unwrap().is_none());
-        assert_eq!(count(a.id), 9000, "remove 不碰流水");
-
-        assert_eq!(store.purge_usage_logs_of(&[a.id]).unwrap(), 9000);
-        assert_eq!(count(a.id), 0);
-        assert_eq!(count(b.id), 3000, "其它账号的流水保留");
-        assert_eq!(store.remove(&[a.id]).unwrap(), 0, "删过的号再删是 0");
     }
 
     /// 设备上限三态：账号独立值覆盖全局，0 跟随全局，负值明确不限。
@@ -7674,7 +7594,7 @@ mod tests {
         let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
         let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
         let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
-        // 给 a、b 各造一条设备绑定与用量日志，验证连带清理。
+        // 给 a、b 各造一条设备绑定与用量日志：删号要清绑定、留流水。
         {
             let conn = store.conn.lock();
             for (did, cid) in [("d1", a.id), ("d2", b.id)] {
@@ -7715,7 +7635,7 @@ mod tests {
         assert_eq!((m[&a.id].device_limit, m[&c.id].device_limit), (5, 5));
         assert_eq!(m[&b.id].device_limit, 0, "未选中的账号不应被改动");
 
-        // 批量删除：连带清用量日志，未选中的账号及其日志保留。
+        // 批量删除：账号没了，流水留着（随保留期自然裁掉）。
         assert_eq!(store.delete_many(&[a.id]).unwrap(), 1);
         let m = by_id(&store);
         assert!(!m.contains_key(&a.id) && m.contains_key(&b.id) && m.contains_key(&c.id));
@@ -7728,7 +7648,7 @@ mod tests {
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
-            assert_eq!(logs, vec![b.id], "只应清掉被删账号的用量日志");
+            assert_eq!(logs, vec![a.id, b.id], "批量删号同样不删流水");
         }
 
         // 空列表一律 no-op，不误伤全表。
@@ -8977,17 +8897,23 @@ mod tests {
             store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 1).unwrap().len(),
             1
         );
-        // 删掉的号：label 退成 #id。
+        // 删掉的号：流水还在，label 退回流水自带的账号名。
         assert!(store.delete(b).unwrap());
-        // delete 连带清了 b 的用量日志，所以再插一条无主的来验 label 兜底。
+        let deleted = store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 10).unwrap();
+        assert!(deleted.iter().any(|r| r.key == b.to_string() && r.label == "b"), "{deleted:?}");
+        // 流水里也没名字（极老的行）才退成 #id。
+        let ghost = b + 100;
         store
             .insert_usage_log_at(
-                &rec(b, "claude-sonnet-5", 200, 10, 20, 1, 1, 0, 0),
+                &UsageRecord {
+                    cred_label: String::new(),
+                    ..rec(ghost, "claude-sonnet-5", 200, 10, 20, 1, 1, 0, 0)
+                },
                 Some(now - 100),
             )
             .unwrap();
         let orphan = store.usage_breakdown(now - 3600, BreakdownBy::Account, 10).unwrap();
-        assert!(orphan.iter().any(|r| r.label == format!("#{b}")), "{orphan:?}");
+        assert!(orphan.iter().any(|r| r.label == format!("#{ghost}")), "{orphan:?}");
 
         // 本地拒绝按原因分类：`rejected_locally:<kind>` 归到 kind，裸的归 other，按条数降序。
         let reject = |tag: &str| UsageRecord {
