@@ -315,12 +315,12 @@ pub(super) fn rewrite_body_out(
     // 与 CC 形态那道豁免管。
     let empty_system_dropped = drop_empty_system_messages(&mut v);
     // role:"system" 提升：litellm 等第三方客户端把 system 放在 messages 里，
-    // 上游不支持该 role，提前挪到顶层 system 字段。必须在 simulate_system 之前——
-    // 后者和 align_system_shape 都只读顶层 system。
+    // 上游对开头那段恒 400、老模型对中途的也 400，提前挪到顶层 system 字段。必须在
+    // simulate_system 之前——后者和 align_system_shape 都只读顶层 system。
     // CC 形态的请求跳过：CC 在 messages 里合法使用 role:"system"（如 deferred tools），
-    // 强行提升会破坏形态。
+    // 强行提升会破坏形态。严格检查开着时也跳过，见 [`hoists_system_role`]。
     let system_hoisted =
-        flags.hoist_system_role && !is_cc_shaped(&v) && hoist_system_role_messages(&mut v);
+        hoists_system_role(&flags, is_cc_shaped(&v)) && hoist_system_role_messages(&mut v);
     // 来访自己是不是 CC 形态要在模拟之前看——模拟一跑，body 就都是 CC 形态了。
     // 只喂给 `strip_extra_fields` 判 `thinking.display` 该不该剥。
     let cc_inbound = is_cc_shaped(&v);
@@ -2821,10 +2821,42 @@ pub(super) fn drop_empty_system_messages(v: &mut serde_json::Value) -> bool {
     true
 }
 
+/// `messages` 里首条 user/assistant 的下标（一条都没有时为长度）。
+///
+/// 在它之前的 `role:"system"` 是 OpenAI 那种开头系统提示词，上游恒 400（`messages.0: use the
+/// top-level 'system' parameter for the initial system prompt`）；在它之后的上游是认的
+/// （2026-09-30 实测：新模型 200，老模型回 `role 'system' is not supported on this model`）。
+/// 判定（[`find_openai_marker`]）与形态记忆（`learned_rules::role_values`）共用这一条，
+/// 口径不许分叉。
+pub(super) fn first_turn_index(msgs: &[serde_json::Value]) -> usize {
+    msgs.iter()
+        .position(|m| matches!(m.get("role").and_then(|r| r.as_str()), Some("user" | "assistant")))
+        .unwrap_or(msgs.len())
+}
+
+/// 出站前 [`hoist_system_role_messages`] 会不会跑：`hoist_system_role` 开着、`reject_openai_shape`
+/// **关着**、且来访不是 CC 形态。
+///
+/// 严格检查开着时提升整个不跑：开头那段 system 在入口就被 [`find_openai_marker`] 拒了，能走到
+/// 这里的只剩对话中途的，那是上游认的原生 system 消息（带着 `clear_at`、消息级 `output_config`
+/// 这类只在原位才有意义的字段，作用范围也从它所在的位置起算），挪到顶层就改了语义。
+///
+/// 改写（[`rewrite_body_out`]）与入口处的形态记忆豁免（`known_shape_rejection` 的
+/// `system_hoisted`）都从这里取，口径不许分叉；后者另外还要叠上 billable——非计费路径
+/// （`count_tokens` 等）出站根本不改写。
+pub(super) fn hoists_system_role(flags: &store::ForwardFlags, cc_shaped: bool) -> bool {
+    flags.hoist_system_role && !flags.reject_openai_shape && !cc_shaped
+}
+
 /// 把 `messages` 里 `role:"system"` 的消息提升到顶层 `system` 字段。
 ///
 /// litellm 等第三方客户端采用 OpenAI 格式，把 system 指令放在 `messages` 数组里
-/// （`{"role":"system","content":"..."}`），Anthropic API 不认这个 role（直接 400）。
+/// （`{"role":"system","content":"..."}`）。上游对开头那段恒 400（见 [`first_turn_index`]），
+/// 跟在 user 之后的新模型认、老模型不认（`role 'system' is not supported on this model`）。
+///
+/// **对话中途的也一并提升**：挪到开头会改变它的位置，但那是修补路径本来的取舍——留在原位，
+/// 老模型上就是一条修得好却没修的 400，还会被 [`remember_shape_rejection`] 学成规则，
+/// 之后同模型带 system 的请求全在本地拒掉。
 ///
 /// 处理逻辑：
 /// 1. 从 `messages` 里找出所有 `role:"system"` 的消息，按原序收集其 content。
@@ -4729,6 +4761,58 @@ mod tests {
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(!s.contains(r#""role":"system""#), "缩进过的体里的空壳也该被丢掉: {s}");
         assert!(s.contains(r#""content":"hi""#), "用户消息要留着: {s}");
+    }
+
+    /// 提升跑不跑只看这一处：严格检查开着时不跑（放行的中途 system 是原生消息，原样出站），
+    /// CC 形态不跑，`hoist_system_role` 关掉不跑。
+    #[test]
+    fn hoisting_is_off_while_the_strict_check_is_on() {
+        let on = all_on();
+        assert!(on.hoist_system_role && on.reject_openai_shape, "默认两个都开");
+        assert!(!super::hoists_system_role(&on, false), "严格检查开着：不提升");
+        let repair = store::ForwardFlags { reject_openai_shape: false, ..all_on() };
+        assert!(super::hoists_system_role(&repair, false));
+        assert!(!super::hoists_system_role(&repair, true), "CC 形态不提升");
+        let off = store::ForwardFlags { hoist_system_role: false, ..repair };
+        assert!(!super::hoists_system_role(&off, false));
+
+        // 走完整条改写：默认开关下中途那条 system 连同它自带的字段原样出站；关掉严格检查才提升。
+        let body = Bytes::from(
+            r#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief","clear_at":"x"}]}"#,
+        );
+        let kept: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", on, None, None))
+                .unwrap();
+        assert_eq!(kept["messages"][1]["role"], "system");
+        assert_eq!(kept["messages"][1]["clear_at"], "x", "消息级字段不能丢");
+        let hoisted: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", repair, None, None))
+                .unwrap();
+        assert_eq!(hoisted["messages"].as_array().unwrap().len(), 1);
+        assert!(hoisted["system"].to_string().contains("be brief"));
+    }
+
+    /// 开头与对话中途的 `role:"system"` 一并提升：中途那条老模型不认，留着就是一条修得好
+    /// 却没修的 400。顺序按原序，客户端原有的顶层 system 排在后面。
+    #[test]
+    fn all_system_role_messages_are_hoisted() {
+        let mut v = serde_json::json!({
+            "system": "orig",
+            "messages": [
+                {"role": "system", "content": "a"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "go on"},
+                {"role": "system", "content": [{"type": "text", "text": "mid"}]}
+            ]
+        });
+        assert!(crate::proxy::body::hoist_system_role_messages(&mut v));
+        let texts: Vec<_> =
+            v["system"].as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, ["a", "mid", "orig"]);
+        let roles: Vec<_> =
+            v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
     }
 
     /// 空壳 `role:"system"` 消息在出站前被丢掉：五种空形态都算（空数组、空串、`null`、

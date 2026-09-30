@@ -3319,20 +3319,21 @@ pub struct ForwardFlags {
     pub strip_empty_text: bool,
     /// 将 messages 里的 `role:"system"` 消息提升到顶层 `system` 字段。
     ///
-    /// Anthropic API 不支持 messages 数组里出现 `role:"system"`（直接 400），但 litellm
-    /// 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把这些
-    /// 消息的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
+    /// 上游对首条 user/assistant 之前的 `role:"system"` 直接 400，老模型对对话中途的也 400；
+    /// litellm 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把
+    /// 这些消息（不论位置）的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
     ///
     /// **CC 形态的请求整个跳过**：官方自己在 messages 里合法使用 `role:"system"`
     /// （deferred tools），硬提升会破坏形态。唯一的例外是**空壳**（content 为空数组 / 空串 /
     /// `null` / 缺失 / 整条只有空 text 块）：不论这个开关与来访形态，一律在出站前丢掉，见
     /// `proxy::drop_empty_system_messages`——上游对它恒回 400，而它一个内容块都没有。
     pub hoist_system_role: bool,
-    /// 本地拒绝带 OpenAI 格式转换残留的请求（messages 里的 `role:"system"`、`call_` 前缀的
+    /// 本地拒绝带 OpenAI 格式转换残留的请求（messages 开头的 `role:"system"`、`call_` 前缀的
     /// 工具调用 id、OpenAI 方言的 `tool_choice` / `tools`、`n` / `stop` / `user` 等 OpenAI 专属
     /// 顶层字段），不修补、不转发，见 `proxy::find_openai_marker`。
     ///
-    /// 开着时 `hoist_system_role` 对这类请求不再有机会生效（入口就拒了）；关掉才退回修补。
+    /// 开着时 `hoist_system_role` 整个不跑：开头的 system 入口就拒了，能放行的只剩对话中途的
+    /// 原生 system 消息，原样出站（见 `proxy::hoists_system_role`）；关掉才退回修补。
     /// 模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
     pub reject_openai_shape: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。

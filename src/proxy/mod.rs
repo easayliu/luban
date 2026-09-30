@@ -777,11 +777,13 @@ pub(super) fn request_max_tokens(body: Option<&serde_json::Value>) -> Option<i64
 /// 按 Anthropic 的错误体形态打一份 JSON（`{"type":"error","error":{...}}`）。
 ///
 /// 本地拒绝也要长成上游那副样子，客户端才认得——它只会去读 `error.message`。
-/// **不带 `request_id`**：这次请求根本没出去，编一个只会把人引去查一条不存在的记录。
+/// **`request_id` 恒为 `null`**：这次请求根本没出去，编一个只会把人引去查一条不存在的记录；
+/// 但键要在——官方自己没有 id 时（如坏 key 的 401）回的就是 `"request_id":null`，照抄这个形态。
 fn error_body(etype: &str, message: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "type": "error",
-        "error": {"type": etype, "message": message}}))
+        "error": {"type": etype, "message": message},
+        "request_id": null}))
     .unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec())
 }
 

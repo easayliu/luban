@@ -624,8 +624,8 @@ pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAs
 /// 闸之前，而少跑一次就是把一条本可救回的会话判死。
 ///
 /// **必须传出站体**（`sent`），不能传客户端原件。哪几条消息挨在一起是 [`rewrite_body`] 之后
-/// 才定下来的：[`hoist_system_role_messages`] 与 [`drop_empty_system_messages`] 会把
-/// `messages` 里的 `role:"system"` 整条摘走，于是
+/// 才定下来的：[`hoist_system_role_messages`]（修补模式，见 [`hoists_system_role`]）与
+/// [`drop_empty_system_messages`] 会把 `messages` 里的 `role:"system"` 整条摘走，于是
 /// `assistant(thinking) → system → assistant(tool_use)` 出站时变成两条挨着的 assistant、
 /// 被上游并成一轮。拿原件判，那条 system 还夹在中间，串就只剩最后一条、看着没有思考块，
 /// 于是跳过一次**本该跑**的重试。出站体是上游真正看到并拒掉的那一份，不必去复刻改写规则。
@@ -1415,8 +1415,8 @@ mod tests {
         );
 
         // 夹着一条 `role:"system"` 的两条 assistant：**按这份体**它们不相邻，串就只有最后
-        // 那一条，判「没有」是对的。但 rewrite_body 会把这条 system 整条摘走
-        // （hoist_system_role_messages / drop_empty_system_messages），出站时两条 assistant
+        // 那一条，判「没有」是对的。但 rewrite_body 可能把这条 system 整条摘走（修补模式的
+        // hoist_system_role_messages / drop_empty_system_messages），出站时两条 assistant
         // 挨在一起、被上游并成一轮，那一轮是带思考块的——所以调用处必须传出站体。
         // 下面两条断言钉的就是这个差别：同一段历史，改写前后结论相反。
         let separated = br#"{"messages":[

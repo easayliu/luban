@@ -15,10 +15,10 @@ use super::ban::{
 use super::body::{
     below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
     client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
-    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
-    outbound_carries_fallbacks, refusal_fallbacks_for, remember_fallback_rejection,
-    session_binding_key, sim_device_fingerprint, sim_device_id, sim_session_key, stream_requested,
-    trusted_cc_version, ua_of,
+    extract_session_id, hoists_system_role, is_billable_messages, is_fallback_rejection,
+    known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
+    remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
+    sim_session_key, stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -403,9 +403,12 @@ pub(super) async fn handle_inner(
     //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
     //      账号状态无关的 4xx。规则不是写死的，是上游那条 400 自己喂出来的，回给客户端的
     //      也是它当初那句原话，见 [`remember_shape_rejection`]。
-    if let Some((field, value, message)) =
-        known_shape_rejection(&state.shape_rejections, req_model.as_deref(), body_json.as_ref())
-    {
+    if let Some((field, value, message)) = known_shape_rejection(
+        &state.shape_rejections,
+        req_model.as_deref(),
+        body_json.as_ref(),
+        billable && hoists_system_role(&state.store.forward_flags(), cc_shaped),
+    ) {
         tracing::warn!(
             %method, path = %path_and_query, ua = %client_ua,
             model = %req_model.as_deref().unwrap_or("-"), %field, %value,

@@ -564,7 +564,7 @@ mod tests {
     }
 
     /// 本地拒绝回出去的那份体，形态与上游的错误体一致（客户端只读 `error.message`），
-    /// 且不编造 `request_id`——这次请求根本没出去。
+    /// 且不编造 `request_id`——这次请求根本没出去，与官方没有 id 时一样回 `null`。
     #[test]
     fn local_error_body_matches_the_upstream_shape() {
         let raw = crate::proxy::error_body("invalid_request_error", ROLE_400);
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["message"], ROLE_400);
-        assert!(v.get("request_id").is_none());
+        assert_eq!(v.get("request_id"), Some(&serde_json::Value::Null));
         // 上游那份也能被 parse_upstream_error 原样读回来，两侧口径一致。
         assert_eq!(crate::proxy::parse_upstream_error(&raw).1, ROLE_400);
     }

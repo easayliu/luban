@@ -5,7 +5,7 @@ use axum::response::Response;
 use crate::store;
 
 use super::ban::parse_upstream_error;
-use super::body::FALLBACKS_FIELD;
+use super::body::{FALLBACKS_FIELD, first_turn_index};
 use super::probe_detect::message_to_sse;
 use super::rate_limit::MAX_TRANSIENT_COOLDOWN_SECS;
 use super::request_max_tokens;
@@ -121,10 +121,20 @@ const TOOL_TYPE_SUGGEST: &str = "did you mean";
 ///
 /// **`user`/`assistant` 不参与**：官方永远不会点名这两个，留着只是白比对，还平添了
 /// 「报错正文里恰好出现 `'user'` 就把整个模型的普通请求全拦下」的误伤面。
+///
+/// **开头那段 `system` 也不参与**（[`first_turn_index`] 之前的）：上游对它回的是另一句
+/// （`messages.0: use the top-level 'system' parameter …`，2026-09-30 实测，新老模型都是），
+/// 从不回 `role 'system' is not supported on this model`——后者说的只是对话中途那条。
+/// 拿它去拦只有开头 system 的请求，拦下的就是一条上游会给出另一个原因的请求。
 fn role_values(body: &serde_json::Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else { return out };
-    for role in msgs.iter().filter_map(|m| m.get("role")?.as_str()) {
+    let first_turn = first_turn_index(msgs);
+    for (i, msg) in msgs.iter().enumerate() {
+        let Some(role) = msg.get("role").and_then(|r| r.as_str()) else { continue };
+        if role == "system" && i < first_turn {
+            continue;
+        }
         if !matches!(role, "user" | "assistant") && !out.iter().any(|v| v == role) {
             out.push(role.to_string());
         }
@@ -1171,10 +1181,15 @@ pub(super) fn maybe_strip_deprecated(
 ///
 /// 只有「同一个模型、同一个字段、同一个取值确实被上游拒过一次」才返回 `Some`。没学过的
 /// 组合一律照常往上游发——这张表只用来挡住确定无疑的重复失败，绝不替上游做没有依据的判断。
+///
+/// `system_hoisted`：这条请求出站前 `role:"system"` 会被 [`hoist_system_role_messages`] 整条
+/// 挪到顶层（billable 且 [`hoists_system_role`]）。这里查的是入站原件，而上游根本看不到
+/// 这个 role，学到的 `role 'system'` 就管不着它——拿它去拦，拦下的是一条修补后本来能过的请求。
 pub(super) fn known_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
+    system_hoisted: bool,
 ) -> Option<(&'static str, String, String)> {
     let (model, body) = (model?, body?);
     let table = mem.read();
@@ -1183,6 +1198,9 @@ pub(super) fn known_shape_rejection(
     }
     SHAPE_PROBES.iter().find_map(|probe| {
         (probe.values)(body).into_iter().find_map(|value| {
+            if system_hoisted && probe.field == "role" && value == "system" {
+                return None;
+            }
             let message = table.get(&(model.to_string(), probe.field, value.clone()))?;
             Some((probe.field, value, message.clone()))
         })
@@ -1272,10 +1290,53 @@ mod tests {
     }
 
     /// 请求体：`messages` 里混了个 `role: system`（litellm 那类客户端会这么发）。
+    /// 那条 role 跟在 user 之后：上游只对**对话中途**的 `role:"system"` 回 `ROLE_400`，
+    /// 开头那段回的是另一句（`use the top-level 'system' parameter`），见 `first_turn_index`。
     fn role_req(model: &str, role: &str) -> Option<serde_json::Value> {
         json_body(&format!(
-            r#"{{"model":"{model}","messages":[{{"role":"{role}","content":"you are…"}},{{"role":"user","content":"hi"}}]}}"#
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}},{{"role":"{role}","content":"you are…"}}]}}"#
         ))
+    }
+
+    /// 学到的 `role 'system'` 只拦对话中途带 system、且出站时还留着它的请求：只在开头带
+    /// system 的（上游回的是另一句），以及出站前会被整条提升的，都不能跟着一起在本地拒掉。
+    #[test]
+    fn learned_system_role_does_not_block_leading_system_prompts() {
+        let mem = crate::proxy::ShapeMemory::default();
+        let mid = role_req("claude-haiku-4-5", "system");
+        let learned = crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            mid.as_ref(),
+            &err_json(ROLE_400),
+        );
+        assert_eq!(learned.len(), 1, "中途那条该学到");
+        let leading = json_body(
+            r#"{"model":"claude-haiku-4-5","messages":[{"role":"system","content":"you are…"},{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-haiku-4-5"),
+                leading.as_ref(),
+                false
+            )
+            .is_none()
+        );
+        assert!(
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-haiku-4-5"),
+                mid.as_ref(),
+                false
+            )
+            .is_some()
+        );
+        // 出站前会被整条提升（hoist 开着、非 CC 形态）：上游看不到这个 role，不拦。
+        assert!(
+            crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), mid.as_ref(), true)
+                .is_none()
+        );
     }
 
     /// 学一次之后，同款「模型 + 取值」在本地就被拦下，回给客户端的是上游那句原话。
@@ -1284,7 +1345,7 @@ mod tests {
     fn rejects_a_learned_request_shape_locally() {
         let mem = crate::proxy::ShapeMemory::default();
         let hit = |body: &Option<serde_json::Value>, model: &str| {
-            crate::proxy::known_shape_rejection(&mem, Some(model), body.as_ref())
+            crate::proxy::known_shape_rejection(&mem, Some(model), body.as_ref(), false)
         };
 
         // 学之前一律放行：这张表只挡确定无疑的重复失败，不替上游做没有依据的判断。
@@ -1334,7 +1395,7 @@ mod tests {
         );
         // 学之前照常放行：第一次还是要发上去，规则是上游那条 400 自己喂出来的。
         assert!(
-            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref())
+            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref(), false)
                 .is_none()
         );
         crate::proxy::remember_shape_rejection(
@@ -1346,7 +1407,7 @@ mod tests {
         assert_eq!(mem.read().len(), 1, "只该学被点名的 computer_20250124 那一条");
 
         let (field, value, message) =
-            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref())
+            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), body.as_ref(), false)
                 .expect("第二次该在本地拦下");
         assert_eq!((field, value.as_str()), ("tool_type", "computer_20250124"));
         assert_eq!(message, TOOL_TYPE_400, "回放上游那句原话，不自己造文案");
@@ -1355,12 +1416,17 @@ mod tests {
         let others =
             tools_req("claude-fable-5", &["bash_20250124", "text_editor_20250728", "custom"]);
         assert!(
-            crate::proxy::known_shape_rejection(&mem, Some("claude-fable-5"), others.as_ref())
-                .is_none()
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-fable-5"),
+                others.as_ref(),
+                false
+            )
+            .is_none()
         );
         // 结论也不外溢到别的模型——computer 工具在 opus 上照发。
         assert!(
-            crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref())
+            crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref(), false)
                 .is_none()
         );
         // 没有 tools 的请求永远不进这张表的判定。
@@ -1368,7 +1434,8 @@ mod tests {
             crate::proxy::known_shape_rejection(
                 &mem,
                 Some("claude-fable-5"),
-                effort_req("claude-fable-5", "high").as_ref()
+                effort_req("claude-fable-5", "high").as_ref(),
+                false
             )
             .is_none()
         );
@@ -1415,7 +1482,8 @@ mod tests {
             );
             assert!(mem.read().is_empty(), "不该学: {msg}");
             assert!(
-                crate::proxy::known_shape_rejection(&mem, Some(model), body.as_ref()).is_none()
+                crate::proxy::known_shape_rejection(&mem, Some(model), body.as_ref(), false)
+                    .is_none()
             );
         }
 
@@ -1444,7 +1512,7 @@ mod tests {
         assert!(mem.read().is_empty(), "条件句不该进表: {COND_400}");
         // 于是开着 thinking 的那条请求照常放行，不会被本地误拒。
         assert!(
-            crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref())
+            crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), body.as_ref(), false)
                 .is_none()
         );
 
@@ -1903,8 +1971,9 @@ mod tests {
         assert!(
             crate::proxy::known_empty_reply(&empty2, Some("claude-fable-5"), Some(&ping)).is_none()
         );
-        let hit = crate::proxy::known_shape_rejection(&shape2, Some("claude-opus-5"), Some(&body))
-            .expect("形态规则应已回填");
+        let hit =
+            crate::proxy::known_shape_rejection(&shape2, Some("claude-opus-5"), Some(&body), false)
+                .expect("形态规则应已回填");
         assert_eq!((hit.0, hit.1.as_str()), ("effort", "xhigh"));
         assert!(crate::proxy::has_learned_deprecated_field(
             &dep2,

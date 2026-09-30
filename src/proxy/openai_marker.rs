@@ -1,3 +1,5 @@
+use super::body::first_turn_index;
+
 /// 请求体里一处 OpenAI 格式转换残留，见 [`find_openai_marker`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OpenAiMarker {
@@ -101,7 +103,7 @@ const OPENAI_CONTENT_TYPES: &[&str] = &[
 /// |---|---|---|
 /// | `image_url` | 内容块 `type:"image_url"`（含 tool_result 内嵌） | `{"type":"image","source":{…}}` |
 /// | `content_type` | 内容块 type 在 [`OPENAI_CONTENT_TYPES`] | `text` / `image` / `document`… |
-/// | `system_role` | `messages[i].role == "system"` | 顶层 `system` 字段 |
+/// | `system_role` | 首条 user/assistant 之前的 `role:"system"` | 顶层 `system` 字段 |
 /// | `foreign_role` | `role` 是 `tool` / `function` / `developer` | `user` 轮里的 `tool_result` 块 / 顶层 `system` |
 /// | `message_field` | 消息上有 `name` / `tool_calls` / `tool_call_id` / `function_call` | `tool_use` / `tool_result` 内容块 |
 /// | `tool_call_id` | `tool_use.id` / `tool_result.tool_use_id` 以 `call_` 开头 | 上游签发的 `toolu_…` |
@@ -112,13 +114,18 @@ const OPENAI_CONTENT_TYPES: &[&str] = &[
 /// `image_url` 一项**无条件**查（上游恒 400，本地拒省一次往返，是加开关之前就有的行为）；
 /// 其余全部由 `strict` 拨——对应网页上的 `reject_openai_shape` 开关。
 ///
-/// 两处放宽：
+/// 各条判据对照官方实测（2026-09-30，直连 api.anthropic.com）：
+/// - 上游的 messages 认 `user` / `assistant` / `system` 三种 role。`system` 只在**首条
+///   user/assistant 之前**被拒（`messages.0: use the top-level 'system' parameter for the
+///   initial system prompt`）；跟在 user 之后的在新模型上是 200，那是地道的 Anthropic 请求，
+///   不能拿来当 OpenAI 残留。「开头」怎么算见 [`first_turn_index`]，与修补那侧共用。
 /// - `cc_shaped`（`system` 里有 CC 身份声明）的请求**不查** `system_role`：CC 自己在
 ///   messages 里合法使用 `role:"system"`（deferred tools），见 [`hoist_system_role_messages`]
 ///   调用处的同一取舍。
-/// - `tool_call_id` 只认 `call_` 前缀。上游对 id 的要求只是 `^[a-zA-Z0-9_-]+$`，`call_x` 本身
-///   能过，所以这一条不是「省一次 400」，是纯粹的转换指纹：Anthropic 侧签发的 id 恒为
-///   `toolu_` 开头，`call_` 只可能来自 OpenAI 的 `tool_calls[].id` 被原样回填。
+/// - `tool_call_id` 只认 `call_` 前缀，且是**唯一一条上游会放行的**：实测 `call_` id 上游
+///   回 200。所以这一条不是「省一次 400」，是纯粹的转换指纹：Anthropic 侧签发的 id 恒为
+///   `toolu_` 开头，`call_` 只可能来自 OpenAI 的 `tool_calls[].id` 被原样回填。其余各条上游
+///   同样回 400，本地拒只是省一次往返、把原因说清楚。
 pub(super) fn find_openai_marker(
     body: Option<&serde_json::Value>,
     cc_shaped: bool,
@@ -148,25 +155,33 @@ pub(super) fn find_openai_marker(
     };
 
     if let Some(msgs) = obj.get("messages").and_then(|m| m.as_array()) {
+        let first_turn = first_turn_index(msgs);
         for (mi, msg) in msgs.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
             if strict {
-                if role == "system" && !cc_shaped {
+                if role == "system" && mi < first_turn && !cc_shaped {
                     return Some(OpenAiMarker::new(
                         format!("messages.{mi}.role"),
                         "system_role",
-                        "role 'system' is not a valid message role in the Anthropic API; put \
-                         system instructions in the top-level 'system' field",
+                        "a 'system' message before the first user or assistant message is the \
+                         OpenAI way of \
+                         passing the system prompt; the Anthropic API takes the initial system \
+                         prompt in the top-level 'system' field",
                     ));
                 }
                 if matches!(role, "tool" | "function" | "developer") {
+                    let hint = if role == "developer" {
+                        "developer instructions go in the top-level 'system' field"
+                    } else {
+                        "tool results go in a 'tool_result' block of a 'user' turn"
+                    };
                     return Some(OpenAiMarker::new(
                         format!("messages.{mi}.role"),
                         "foreign_role",
                         format!(
-                            "role '{role}' is an OpenAI message role; the Anthropic API only has \
-                             'user' and 'assistant' (tool results go in a 'tool_result' block of a \
-                             'user' turn)"
+                            "role '{role}' is an OpenAI message role; Anthropic messages take \
+                             'user' and 'assistant' turns, plus 'system' only after a user turn \
+                             ({hint})"
                         ),
                     ));
                 }
@@ -205,8 +220,9 @@ pub(super) fn find_openai_marker(
                             OpenAiMarker::new(
                                 format!("{loc}.{k}"),
                                 "tool_call_id",
-                                "tool call id starts with 'call_', the OpenAI tool_calls id form; \
-                                 Anthropic tool_use ids are issued by the API as 'toolu_...'",
+                                "tool call id starts with 'call_', the id form of OpenAI's \
+                                 tool_calls; the Anthropic API itself accepts it, but ids it issues \
+                                 are 'toolu_...', so this history went through an OpenAI converter",
                             )
                             .with_sample(id),
                         );
@@ -431,6 +447,37 @@ mod tests {
             assert!(msg.starts_with(&format!("{loc}: ")), "{msg}");
             assert!(msg.contains("OpenAI Chat Completions"), "{msg}");
         }
+    }
+
+    /// 上游只拒首条 user/assistant 之前的 `role:"system"`；跟在 user 之后的上游收
+    /// （2026-09-30 实测），不算残留。
+    #[test]
+    fn openai_marker_system_role_only_before_the_first_turn() {
+        let leading = serde_json::json!({"messages": [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "hi"}
+        ]});
+        let m = find_openai_marker(Some(&leading), false, true).unwrap();
+        assert_eq!((m.kind, m.location.as_str()), ("system_role", "messages.0.role"));
+
+        let mid = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "go on"},
+            {"role": "system", "content": "be brief"}
+        ]});
+        assert_eq!(find_openai_marker(Some(&mid), false, true), None);
+    }
+
+    /// `foreign_role` 那句话得与上游口径一致：上游认 `system`（只在 user 之后），不能说
+    /// 「只有 user 与 assistant」，也不能让人以为放在开头也行。
+    #[test]
+    fn foreign_role_message_lists_the_roles_upstream_accepts() {
+        let body = serde_json::json!({"messages": [{"role": "tool", "content": "x"}]});
+        let msg = find_openai_marker(Some(&body), false, true).unwrap().message();
+        assert!(msg.contains("'system' only after a user turn"), "{msg}");
+        assert!(msg.contains("tool_result"), "{msg}");
     }
 
     #[test]
