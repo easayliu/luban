@@ -17,7 +17,7 @@ use super::simulation::{
     cc_profile_kind_for, is_cc_shaped, relocate_long_client_system, simulate_system,
 };
 use super::thinking::{preserve_thinking_encoding, strip_empty_thinking_blocks};
-use super::{count_cache_control, ensure_cc_metadata, insert_top_level};
+use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
 
 /// 该路径是否会消耗订阅额度——设备身份校验、出站体改写、裸请求限流计数都只对它生效。
 ///
@@ -725,9 +725,57 @@ fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred_id: i64) -
         regular_prompt,
         super::simulation::sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM),
     );
+    if threads {
+        cap_thread_breakpoints(v);
+    }
     align_cc_top_level_order(v, sim.profile.body_key_order);
     sim.set_thread(pending);
     true
+}
+
+/// 带 `thread` 时一条请求最多 3 个缓存断点：第 4 个名额留给上游自己标在对话末尾的那个，多了整条
+/// 拒（`thread: a maximum of 3 blocks with cache_control may be provided when `thread` is set`）。
+/// 官方 `create` 恒为 3 个（基座、其余、末条消息），`continue` 恒为 1 个
+/// （`cap/auto-2.1.285-20260930` 里 25 条 `create`、55 条 `continue` 逐条数过）。
+const MAX_THREAD_CACHE_BREAKPOINTS: usize = 3;
+
+/// 把断点裁到 [`MAX_THREAD_CACHE_BREAKPOINTS`] 以内。前面那几步按 [`MAX_CACHE_BREAKPOINTS`]
+/// 分配预算：来访自带 system 时 [`super::simulate_system`] 在第五块（客户端那段）上也标一个，
+/// 加上基座、其余与末条消息正好 4 个；来访自己在工具定义、历史消息上标的也会凑满。按「摘了最
+/// 不心疼」的顺序摘：
+///
+/// 1. `tools` 上的：缓存前缀按 tools → system → messages 排，system 上有断点就已经盖住了它；
+/// 2. 顶层的（自动缓存）：它标的正是对话末尾，与上游预留的那个重复；
+/// 3. `messages` 里除最后一个之外的，从前往后；
+/// 4. `system` 里的，**从后往前**：官方只标基座与其余两块，先摘第五块那个；
+/// 5. 仍超（只剩末条消息上那个）才摘它。
+///
+/// 计数与摘除只看 API 认 `cache_control` 的位置（[`cache_slots`]）：工具 schema 里叫
+/// `cache_control` 的参数、`tool_use.input` 里的同名字段都是业务数据，算进去会把它们当断点
+/// 摘掉，schema 从此 `required` 了一个不存在的属性。
+///
+/// 返回摘掉了几个。
+fn cap_thread_breakpoints(v: &mut serde_json::Value) -> usize {
+    let slots = cache_slots(v);
+    let excess = slots.len().saturating_sub(MAX_THREAD_CACHE_BREAKPOINTS);
+    if excess == 0 {
+        return 0;
+    }
+    let of = |pick: fn(&CacheSlot) -> bool| slots.iter().copied().filter(pick);
+    let mut msgs: Vec<CacheSlot> = of(|s| matches!(s, CacheSlot::Message(..))).collect();
+    let last_msg = msgs.pop();
+    let order = of(|s| matches!(s, CacheSlot::Tool(_)))
+        .chain(of(|s| matches!(s, CacheSlot::Top)))
+        .chain(msgs)
+        .chain(of(|s| matches!(s, CacheSlot::System(_))).collect::<Vec<_>>().into_iter().rev())
+        .chain(last_msg);
+    let doomed: Vec<CacheSlot> = order.take(excess).collect();
+    for slot in &doomed {
+        if let Some(o) = slot.resolve(v) {
+            o.shift_remove("cache_control");
+        }
+    }
+    doomed.len()
 }
 
 /// 官方主线程每条请求末尾的 `<total_tokens>N tokens left</total_tokens>` 提醒（数怎么算见
@@ -2345,7 +2393,7 @@ pub(super) fn cache_prefix_of(v: &serde_json::Value) -> CachePrefix {
 ///   路径同一口径。
 pub(super) fn ensure_cc_message_breakpoint(v: &mut serde_json::Value) -> bool {
     let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
-    if msgs.is_empty() || msgs.iter().map(count_cache_control).sum::<usize>() > 0 {
+    if msgs.is_empty() || cache_slots(v).iter().any(|s| matches!(s, CacheSlot::Message(..))) {
         return false;
     }
     if count_cache_control(v) >= MAX_CACHE_BREAKPOINTS {
@@ -3508,38 +3556,34 @@ where
 ///
 /// 键序按官方 `type` → `ttl` → `scope` **重建**而非追加：客户端若已写了 `scope`，
 /// 直接追加会得到 `{type,scope,ttl}` 这个官方不产生的排列。
+///
+/// 只走 API 认 `cache_control` 的位置（[`cache_slots`]）：工具 schema 里叫 `cache_control` 的
+/// 参数定义、`tool_use.input` 里的同名字段是业务数据，补上 `ttl` 就改了来访的 schema / 入参。
 fn fill_cache_ttl(v: &mut serde_json::Value) -> bool {
     let mut changed = false;
-    match v {
-        serde_json::Value::Object(map) => {
-            if let Some(cc) = map.get_mut("cache_control").and_then(|c| c.as_object_mut())
-                && cc.get("ttl").and_then(|t| t.as_str()) != Some("1h")
-            {
-                let mut rebuilt = serde_json::Map::new();
-                if let Some(t) = cc.get("type") {
-                    rebuilt.insert("type".into(), t.clone());
-                }
-                rebuilt.insert("ttl".into(), "1h".into());
-                for (k, val) in cc.iter() {
-                    if k != "type" && k != "ttl" {
-                        rebuilt.insert(k.clone(), val.clone());
-                    }
-                }
-                *cc = rebuilt;
-                changed = true;
-            }
-            for (k, val) in map.iter_mut() {
-                if k != "cache_control" {
-                    changed |= fill_cache_ttl(val);
-                }
+    for slot in cache_slots(v) {
+        let Some(cc) = slot
+            .resolve(v)
+            .and_then(|o| o.get_mut("cache_control"))
+            .and_then(|c| c.as_object_mut())
+        else {
+            continue;
+        };
+        if cc.get("ttl").and_then(|t| t.as_str()) == Some("1h") {
+            continue;
+        }
+        let mut rebuilt = serde_json::Map::new();
+        if let Some(t) = cc.get("type") {
+            rebuilt.insert("type".into(), t.clone());
+        }
+        rebuilt.insert("ttl".into(), "1h".into());
+        for (k, val) in cc.iter() {
+            if k != "type" && k != "ttl" {
+                rebuilt.insert(k.clone(), val.clone());
             }
         }
-        serde_json::Value::Array(items) => {
-            for it in items.iter_mut() {
-                changed |= fill_cache_ttl(it);
-            }
-        }
-        _ => {}
+        *cc = rebuilt;
+        changed = true;
     }
     changed
 }
@@ -5749,20 +5793,20 @@ mod tests {
         // 会话第一轮：没有上一轮可比，不标。
         let sid = crate::proxy::uuid_v4();
         let v = once(&body(&system("5m"), tool_loop), all_on(), Some(&sid));
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "第一轮不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "第一轮不标: {v}");
         // 第二轮同一份前缀 → 标。
         let v = once(&body(&system("5m"), tool_loop), all_on(), Some(&sid));
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1, "第二轮该标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 1, "第二轮该标: {v}");
         // 第三轮 system 尾块变了（现网那种每轮长 51 字节）→ 不标：前缀变了，标了也是未命中。
         let grown = system("5m").replace(
             r#""text":"tail""#,
             r#""text":"tail\n\n<total_tokens>1 tokens left</total_tokens>""#,
         );
         let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "尾块变了不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "尾块变了不标: {v}");
         // 第四轮尾块又稳住 → 再标。
         let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1, "稳住后再标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 1, "稳住后再标: {v}");
         // tools 变了是另一条谱系，对它是第一轮 → 不标。
         let with_tools = body(&grown, tool_loop);
         let with_tools = Bytes::from(String::from_utf8(with_tools.to_vec()).unwrap().replace(
@@ -5770,7 +5814,7 @@ mod tests {
             r#""tools":[{"name":"Read","input_schema":{"type":"object"}}],"max_tokens":64000"#,
         ));
         let v = once(&with_tools, all_on(), Some(&sid));
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "tools 变了不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "tools 变了不标: {v}");
         // 只有 billing header 变（cch / cc_prev_req 逐轮不同）不算前缀变。
         let cch = body(&grown, tool_loop);
         let cch = Bytes::from(
@@ -5782,19 +5826,19 @@ mod tests {
         // 中间夹的另一套 tools 不算这条谱系的「上一轮」）。
         let v = once(&body(&grown, tool_loop), all_on(), Some(&sid));
         assert_eq!(
-            crate::proxy::count_cache_control(&v["messages"]),
+            crate::proxy::count_cache_control_in(&v["messages"]),
             1,
             "tools 换回去，旧谱系仍稳定: {v}"
         );
         let v = once(&cch, all_on(), Some(&sid));
         assert_eq!(
-            crate::proxy::count_cache_control(&v["messages"]),
+            crate::proxy::count_cache_control_in(&v["messages"]),
             1,
             "只有 billing header 变仍算稳定: {v}"
         );
         // 没有会话 id 可作键 → 不标。
         let v = once(&body(&system("5m"), tool_loop), all_on(), None);
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "没有会话键不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "没有会话键不标: {v}");
 
         // 正例：末块 tool_result 拿到断点，ttl 抄 system 的 5m 而不是开关的 1h，不带 scope；
         // 字符串形态的旧 reminder 不被转成块数组；总数正好 4。
@@ -5829,7 +5873,7 @@ mod tests {
             v["messages"][3]["content"][0].get("cache_control").is_none(),
             "客户端自己标过就不再标: {v}"
         );
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 1);
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 1);
 
         // 反例二：末条是字符串 content → 不转、不标（官方 CLI 自己就混着发）。
         let str_tail = concat!(
@@ -5839,7 +5883,7 @@ mod tests {
         );
         let v = run(&body(&system("5m"), str_tail), all_on());
         assert!(v["messages"][2]["content"].is_string(), "末条字符串不该被转: {v}");
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0);
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0);
 
         // 反例三：预算满（system 里 4 个断点）→ 不标。
         let full = system("5m").replace(
@@ -5847,7 +5891,7 @@ mod tests {
             r#"{"type":"text","text":"env","cache_control":{"type":"ephemeral","ttl":"5m"}}"#,
         );
         let v = run(&body(&full, tool_loop), all_on());
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "预算满不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "预算满不标: {v}");
         assert_eq!(crate::proxy::count_cache_control(&v), 4);
 
         // 反例四：末块是 thinking → 不标。
@@ -5856,19 +5900,19 @@ mod tests {
             r#"{"role":"assistant","content":[{"type":"thinking","thinking":"想","signature":"AAAA"}]}]"#
         );
         let v = run(&body(&system("5m"), thinking_tail), all_on());
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "{v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "{v}");
 
         // 反例五：system_shape 开关关着 → 不标。
         let mut off = all_on();
         off.system_shape = false;
         let v = run(&body(&system("5m"), tool_loop), off);
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "开关关着不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "开关关着不标: {v}");
 
         // 反例六：非 CC 形态（没有身份句、没有 billing header）走非模拟路径 → 不标，
         // 这一步只给真 CC 补。
         let plain_sys = r#"[{"type":"text","text":"You are a helpful bot.","cache_control":{"type":"ephemeral"}}]"#;
         let v = run(&body(plain_sys, tool_loop), all_on());
-        assert_eq!(crate::proxy::count_cache_control(&v["messages"]), 0, "非 CC 形态不标: {v}");
+        assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "非 CC 形态不标: {v}");
     }
 
     /// 体侧 `ensure_fallbacks`：没写的补在 `context_management` 之后、`output_config` 之前
@@ -5930,6 +5974,48 @@ mod tests {
         assert!(crate::proxy::align_system_shape(&mut official, shape), "净 0，这道闸不该拦它");
         assert_eq!(crate::proxy::count_cache_control(&official), 4, "拆完还是 4");
         assert!(official["system"][1].get("cache_control").is_none(), "身份句那个该被去掉");
+
+        // 工具 schema 的参数名、工具入参里的同名字段不是断点：真断点 1 + 1 = 2，递归去数会是 4，
+        // 拆完算成 5、整形被拦。
+        let mut business = mk(1);
+        business["tools"] = serde_json::json!([{ "name": "t", "input_schema": {
+            "type": "object", "properties": { "cache_control": { "type": "string" } },
+        } }]);
+        business["messages"].as_array_mut().unwrap().push(serde_json::json!({
+            "role": "assistant",
+            "content": [{ "type": "tool_use", "id": "x", "name": "t",
+                "input": { "cache_control": { "type": "ephemeral" } } }],
+        }));
+        assert_eq!(crate::proxy::count_cache_control(&business), 2);
+        assert!(crate::proxy::align_system_shape(&mut business, shape), "业务字段不占预算");
+        assert_eq!(crate::proxy::count_cache_control(&business), 3);
+    }
+
+    /// 真 CC 路径：历史里 `tool_use.input.cache_control` 不是「消息已有断点」，schema 参数名也
+    /// 不占预算——末条照常补上断点。
+    #[test]
+    fn cc_message_breakpoint_ignores_business_cache_control_fields() {
+        let cc = serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
+        let mut v = serde_json::json!({
+            "tools": [{ "name": "t", "input_schema": {
+                "type": "object", "properties": { "cache_control": { "type": "string" } },
+            } }],
+            "system": [
+                { "type": "text", "text": "a", "cache_control": cc },
+                { "type": "text", "text": "b", "cache_control": cc },
+            ],
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                { "role": "assistant", "content": [{ "type": "tool_use", "id": "x", "name": "t",
+                    "input": { "cache_control": { "type": "ephemeral" } } }] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "x", "content": "ok" },
+                ] },
+            ],
+        });
+        assert!(super::ensure_cc_message_breakpoint(&mut v), "{v}");
+        assert_eq!(v["messages"][2]["content"][0]["cache_control"], cc, "{v}");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3);
     }
 
     /// `rewrite_body` 的「全关且不模拟」快路径不能吞掉 `fallbacks`：头上按同一个判断补了
@@ -7743,6 +7829,173 @@ mod tests {
             let (v, _) = thread_turn(&follow(content), all_on());
             assert_eq!(v["thread"]["previous_message_id"], "msg_E", "{label}: {v}");
         }
+    }
+
+    /// 来访自己在工具定义和历史消息上标了断点：前面几步按 4 个分预算，带 `thread` 时上游只收 3 个
+    /// （`Found 4` 那条 400）。先摘 tools 上的、再摘历史消息上的，system 两个与末条那个留着。
+    #[test]
+    fn sim_threads_cap_breakpoints_at_three() {
+        let cc = serde_json::json!({ "type": "ephemeral" });
+        let mut body = thread_body(
+            "claude-opus-5-5",
+            serde_json::json!([
+                { "role": "user", "content": [{ "type": "text", "text": "线程测试·断点 第一问", "cache_control": cc }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "好" }] },
+                { "role": "user", "content": [{ "type": "text", "text": "第二问", "cache_control": cc }] },
+            ]),
+        );
+        body["tools"] = serde_json::json!([{
+            "name": "lookup",
+            "description": "d",
+            "input_schema": { "type": "object" },
+            "cache_control": cc,
+        }]);
+        let (v, _) = thread_turn(&body, all_on());
+        assert_eq!(v["thread"], serde_json::json!({ "type": "create" }), "{v}");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3, "{v}");
+        assert!(
+            v["tools"].as_array().unwrap().iter().all(|t| t.get("cache_control").is_none()),
+            "tools 上的先摘: {v}"
+        );
+        let msgs = v["messages"].as_array().unwrap();
+        assert!(
+            msgs.last().unwrap()["content"][0].get("cache_control").is_some(),
+            "末条那个留着: {v}"
+        );
+
+        // 来访只带自己的 system、一个断点都没标：基座、其余、第五块、末条正好 4 个，摘第五块那个。
+        let mut plain = thread_body(
+            "claude-opus-5-5",
+            serde_json::json!([{ "role": "user", "content": "线程测试·断点 只带 system" }]),
+        );
+        plain["system"] = "你是助手".into();
+        let (v, _) = thread_turn(&plain, all_on());
+        assert_eq!(v["thread"], serde_json::json!({ "type": "create" }), "{v}");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3, "{v}");
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 5, "{v}");
+        assert!(sys[2].get("cache_control").is_some(), "基座留着: {v}");
+        assert!(sys[3].get("cache_control").is_some(), "其余留着: {v}");
+        assert!(sys[4].get("cache_control").is_none(), "第五块的摘掉: {v}");
+    }
+
+    /// 工具 schema 里叫 `cache_control` 的参数、`tool_use.input` 里的同名字段都是业务数据：既不算
+    /// 断点，也不能被摘。按递归计数会把参数定义当成第 4 个断点摘掉，schema 只剩
+    /// `required:["cache_control"]` 加 `additionalProperties:false`，再也满足不了。
+    #[test]
+    fn sim_threads_cap_leaves_business_cache_control_fields_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "cache_control": { "type": "string" } },
+            "required": ["cache_control"],
+            "additionalProperties": false,
+        });
+        let mut body = thread_body(
+            "claude-opus-5-5",
+            serde_json::json!([
+                { "role": "user", "content": "线程测试·断点 业务字段" },
+                { "role": "assistant", "content": [{
+                    "type": "tool_use", "id": "toolu_cc", "name": "set_cache",
+                    "input": { "cache_control": "no-store" },
+                }] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_cc", "content": "ok" },
+                ] },
+            ]),
+        );
+        body["tools"] = serde_json::json!([{
+            "name": "set_cache",
+            "description": "d",
+            "input_schema": schema,
+        }]);
+        let (v, _) = thread_turn(&body, all_on());
+        assert_eq!(v["thread"], serde_json::json!({ "type": "create" }), "{v}");
+        let tool = v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "set_cache");
+        assert_eq!(tool.unwrap()["input_schema"], schema, "schema 原样: {v}");
+        assert_eq!(v["messages"][1]["content"][0]["input"]["cache_control"], "no-store", "{v}");
+        let sys = v["system"].as_array().unwrap();
+        assert!(sys.iter().filter(|b| b.get("cache_control").is_some()).count() == 2, "{v}");
+        // 末条（`<total_tokens>` 提醒）照常带断点：业务字段不占预算，消息断点不该被跳过。
+        let last = v["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "system", "{v}");
+        assert!(last["content"][0].get("cache_control").is_some(), "末条该补断点: {v}");
+        assert_eq!(crate::proxy::count_cache_control(&v), 3, "{v}");
+
+        // 直接裁：3 个真断点 + 2 处业务字段，一个都不摘。
+        let cc = serde_json::json!({ "type": "ephemeral" });
+        let mut w = serde_json::json!({
+            "tools": [{ "name": "t", "input_schema": {
+                "type": "object", "properties": { "cache_control": { "type": "string" } },
+            } }],
+            "system": [{ "type": "text", "text": "a", "cache_control": cc }],
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "x", "name": "t", "input": { "cache_control": cc } },
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "x", "content": [
+                        { "type": "text", "text": "r", "cache_control": cc },
+                    ] },
+                    { "type": "text", "text": "y", "cache_control": cc },
+                ] },
+            ],
+        });
+        let before = w.clone();
+        assert_eq!(super::cap_thread_breakpoints(&mut w), 0);
+        assert_eq!(w, before);
+    }
+
+    /// 只摘超出的那几个；一个都不超时原样。顺序：tools → 顶层 → 非末尾消息 → system（从后往前）→ 末条。
+    #[test]
+    fn cap_thread_breakpoints_strips_in_order() {
+        let cc = serde_json::json!({ "type": "ephemeral" });
+        let mut v = serde_json::json!({
+            "cache_control": cc,
+            "system": [{ "type": "text", "text": "a", "cache_control": cc }],
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t", "content": [
+                        { "type": "text", "text": "x", "cache_control": cc },
+                    ] },
+                ] },
+                { "role": "user", "content": [{ "type": "text", "text": "y", "cache_control": cc }] },
+            ],
+        });
+        let untouched = v.clone();
+        let mut three = v.clone();
+        three.as_object_mut().unwrap().shift_remove("cache_control");
+        assert_eq!(super::cap_thread_breakpoints(&mut three), 0);
+
+        assert_eq!(super::cap_thread_breakpoints(&mut v), 1);
+        assert!(v.get("cache_control").is_none(), "顶层先摘: {v}");
+        assert_eq!(v["system"], untouched["system"]);
+        assert_eq!(v["messages"], untouched["messages"]);
+
+        // 再多两个：历史消息上的（含嵌套在 tool_result 里的）先走，末条留着。
+        v["messages"][0]["content"][0]["cache_control"] = cc.clone();
+        v["messages"][1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({ "type": "text", "text": "z", "cache_control": cc }));
+        assert_eq!(crate::proxy::count_cache_control(&v), 5);
+        assert_eq!(super::cap_thread_breakpoints(&mut v), 2);
+        assert!(v["messages"][0]["content"][0].get("cache_control").is_none(), "{v}");
+        assert!(v["messages"][0]["content"][0]["content"][0].get("cache_control").is_none(), "{v}");
+        assert!(v["messages"][1]["content"][0].get("cache_control").is_some(), "{v}");
+        assert!(v["messages"][1]["content"][1].get("cache_control").is_some(), "末条留着: {v}");
+        assert_eq!(v["system"], untouched["system"]);
+        v["messages"][1]["content"][0].as_object_mut().unwrap().shift_remove("cache_control");
+
+        // 历史上没得摘了才动 system，从后往前；末条始终留着。
+        v["system"] = serde_json::json!([
+            { "type": "text", "text": "a", "cache_control": cc },
+            { "type": "text", "text": "b", "cache_control": cc },
+            { "type": "text", "text": "c", "cache_control": cc },
+        ]);
+        assert_eq!(super::cap_thread_breakpoints(&mut v), 1);
+        assert!(v["system"][1].get("cache_control").is_some(), "{v}");
+        assert!(v["system"][2].get("cache_control").is_none(), "system 从后往前摘: {v}");
+        assert!(v["messages"][1]["content"][1].get("cache_control").is_some(), "末条留着: {v}");
     }
 
     fn thread_body(model: &str, messages: serde_json::Value) -> serde_json::Value {

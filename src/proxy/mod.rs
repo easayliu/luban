@@ -712,16 +712,88 @@ pub(super) fn insert_top_level(
     };
 }
 
-/// 递归数出 body 里现有的 `cache_control` 个数（上游按整条请求算，不只是 `system`）。
+/// 数出 body 里现有的缓存断点个数（上游按整条请求算，不只是 `system`）。只数 API 认
+/// `cache_control` 的位置（[`cache_slots`]）：工具 schema 里叫 `cache_control` 的参数、
+/// `tool_use.input` 里的同名字段是业务数据，递归去数会把它们算成断点，预算被白白占掉——
+/// 末条消息该补的断点不补、system 该拆的块不拆。
 pub(super) fn count_cache_control(v: &serde_json::Value) -> usize {
+    cache_slots(v).len()
+}
+
+/// 测试里数一段局部（`messages`、某个块）里的 `cache_control`，不分是不是 API 认的位置。
+#[cfg(test)]
+pub(super) fn count_cache_control_in(v: &serde_json::Value) -> usize {
     match v {
         serde_json::Value::Object(map) => {
             let here = usize::from(map.contains_key("cache_control"));
-            here + map.values().map(count_cache_control).sum::<usize>()
+            here + map.values().map(count_cache_control_in).sum::<usize>()
         }
-        serde_json::Value::Array(items) => items.iter().map(count_cache_control).sum(),
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control_in).sum(),
         _ => 0,
     }
+}
+
+/// API 认 `cache_control` 的一处：顶层、`tools[i]`、`system[i]`、`messages[m].content[b]`，以及
+/// `tool_result` 块里的 `content[c]`（`Message(m, b, Some(c))`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CacheSlot {
+    Top,
+    Tool(usize),
+    System(usize),
+    Message(usize, usize, Option<usize>),
+}
+
+impl CacheSlot {
+    fn resolve(
+        self,
+        v: &mut serde_json::Value,
+    ) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        let x = match self {
+            CacheSlot::Top => Some(v),
+            CacheSlot::Tool(i) => v.get_mut("tools")?.get_mut(i),
+            CacheSlot::System(i) => v.get_mut("system")?.get_mut(i),
+            CacheSlot::Message(m, b, inner) => {
+                let block = v.get_mut("messages")?.get_mut(m)?.get_mut("content")?.get_mut(b)?;
+                match inner {
+                    Some(c) => block.get_mut("content")?.get_mut(c),
+                    None => Some(block),
+                }
+            }
+        };
+        x?.as_object_mut()
+    }
+}
+
+/// 带断点的每一处，按文档序（`tool_result` 里的块紧跟在它之后）。只看 API 认 `cache_control`
+/// 的位置，口径与 [`body::has_cache_ttl_1h`] 一致，不进 `input_schema`、`tool_use.input` 这类业务数据。
+pub(super) fn cache_slots(v: &serde_json::Value) -> Vec<CacheSlot> {
+    fn blocks(c: Option<&serde_json::Value>) -> impl Iterator<Item = (usize, &serde_json::Value)> {
+        c.and_then(|c| c.as_array()).into_iter().flatten().enumerate()
+    }
+    let marked = |x: &serde_json::Value| x.get("cache_control").is_some();
+    let mut out = Vec::new();
+    if marked(v) {
+        out.push(CacheSlot::Top);
+    }
+    out.extend(blocks(v.get("tools")).filter(|(_, t)| marked(t)).map(|(i, _)| CacheSlot::Tool(i)));
+    out.extend(
+        blocks(v.get("system")).filter(|(_, b)| marked(b)).map(|(i, _)| CacheSlot::System(i)),
+    );
+    for (m, msg) in blocks(v.get("messages")) {
+        for (b, block) in blocks(msg.get("content")) {
+            if marked(block) {
+                out.push(CacheSlot::Message(m, b, None));
+            }
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                out.extend(
+                    blocks(block.get("content"))
+                        .filter(|(_, x)| marked(x))
+                        .map(|(c, _)| CacheSlot::Message(m, b, Some(c))),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// 给没有 `metadata.user_id` 的请求造一个官方形态的身份（键序与 CC 一致：

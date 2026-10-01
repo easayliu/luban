@@ -13,7 +13,7 @@ use super::headers::has_beta;
 use super::session_id::{incoming_session_id, pin_session_id, session_id_for};
 use super::session_link::{CcSessionKey, CcSessionLink, ThreadPending};
 use super::{
-    QUOTA_PROBE_MODEL, count_cache_control, inbound_beta_list, insert_top_level,
+    CacheSlot, QUOTA_PROBE_MODEL, cache_slots, inbound_beta_list, insert_top_level,
     is_quota_probe_shaped, request_max_tokens,
 };
 
@@ -1201,8 +1201,8 @@ pub(super) fn simulate_system(
     // [`relocate_long_client_system`] 在 [`rewrite_body`] 里挪进首条用户消息、原地留一行占位。
     let rest = sim.rest.clone();
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
-    let outside = count_cache_control(v) - v.get("system").map(count_cache_control).unwrap_or(0);
-    let used = outside + client.iter().map(count_cache_control).sum::<usize>();
+    let outside = cache_slots(v).iter().filter(|s| !matches!(s, CacheSlot::System(_))).count();
+    let used = outside + client.iter().filter(|b| b.get("cache_control").is_some()).count();
     let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(used);
 
     let mut blocks = vec![
@@ -2121,8 +2121,8 @@ mod tests {
         let out = rewrite_body(&cc, &test_cred(), "fp", all_on(), None, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
-            crate::proxy::count_cache_control(&v["messages"]),
-            crate::proxy::count_cache_control(&before["messages"]),
+            crate::proxy::count_cache_control_in(&v["messages"]),
+            crate::proxy::count_cache_control_in(&before["messages"]),
             "非模拟路径不该给 messages 新加断点: {v}"
         );
         assert_eq!(
@@ -2164,7 +2164,7 @@ mod tests {
             "前一条的 tool_use 不该被标: {v}"
         );
         assert_eq!(
-            crate::proxy::count_cache_control(&v["messages"]),
+            crate::proxy::count_cache_control_in(&v["messages"]),
             1,
             "messages 里恰好一个断点: {v}"
         );
