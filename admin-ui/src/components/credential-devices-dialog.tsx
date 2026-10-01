@@ -21,6 +21,7 @@ import {
   type SessionBinding,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import {
   cn,
   copyText,
@@ -128,6 +129,7 @@ export function CredentialDevicesDialog({
   sessionLimit: CredentialActions['sessionLimit']
 }) {
   const { t, language, locale } = useI18n()
+  const readOnly = useReadOnly()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitPolicy, setLimitPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.device_limit))
@@ -340,12 +342,14 @@ export function CredentialDevicesDialog({
                       'Controls how many active device bindings this account can keep at once.',
                     )}
                   </CardDescription>
-                  <CardAction>
-                    <Button type="button" size="sm" variant="outline" onClick={startEditingLimit}>
-                      <PencilIcon />
-                      {t('调整上限', 'Adjust limit')}
-                    </Button>
-                  </CardAction>
+                  {!readOnly && (
+                    <CardAction>
+                      <Button type="button" size="sm" variant="outline" onClick={startEditingLimit}>
+                        <PencilIcon />
+                        {t('调整上限', 'Adjust limit')}
+                      </Button>
+                    </CardAction>
+                  )}
                 </CardHeader>
                 <CardPanel className="space-y-3">
                   {/* 「4 台 / 上限 10 台」这种关系，一条占用条比两个并排的数字直观得多；
@@ -452,6 +456,7 @@ export function DeviceList({
   onRetry: () => void
 }) {
   const { t, language, locale } = useI18n()
+  const readOnly = useReadOnly()
   const qc = useQueryClient()
   const queryKey = ['credential-devices', credId] as const
   const unbind = useMutation({
@@ -608,7 +613,7 @@ export function DeviceList({
                     <TooltipPopup>{t('复制设备 ID', 'Copy device ID')}</TooltipPopup>
                   </Tooltip>
                   {/* 模拟伪设备没有绑定行可删，故不给解绑按钮——点了也只会是一次空操作。 */}
-                  {!device.simulated && (
+                  {!device.simulated && !readOnly && (
                     <Button
                       size="xs"
                       variant="destructive-outline"
@@ -718,6 +723,7 @@ function SessionCapacityCard({
   sessions: UseQueryResult<SessionBinding[]>
 }) {
   const { t, locale } = useI18n()
+  const readOnly = useReadOnly()
   const [editing, setEditing] = useState(false)
   const [policy, setPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.session_limit))
   const [custom, setCustom] = useState(Math.max(1, cred.session_limit))
@@ -765,7 +771,7 @@ function SessionCapacityCard({
               'Client requests on the simulation path without a device identity stick to this account per conversation (by their own session ID if present, otherwise by cache prefix + first user message), each taking a slot. The outbound session ID derives from the slot and is reused by the next conversation once the slot is freed, so upstream sees at most this many session IDs. Independent of device slots.',
             )} />
           </CardDescription>
-          {!editing && (
+          {!editing && !readOnly && (
             <CardAction>
               <Button
                 type="button"
@@ -905,6 +911,7 @@ export function SessionList({
   onRetry: () => void
 }) {
   const { t, language, locale } = useI18n()
+  const readOnly = useReadOnly()
   const qc = useQueryClient()
   const queryKey = ['credential-sessions', credId] as const
   // 点「看请求」时带着这条会话的键去查流水；关掉就置空，对话框不常驻。
@@ -961,7 +968,7 @@ export function SessionList({
               {t('刷新中', 'Refreshing')}
             </span>
           )}
-          {!isPending && !error && (data?.length ?? 0) > 0 && (
+          {!readOnly && !isPending && !error && (data?.length ?? 0) > 0 && (
             <Button
               type="button"
               size="xs"
@@ -1084,18 +1091,20 @@ export function SessionList({
                     </TooltipTrigger>
                     <TooltipPopup>{t('查看该会话的请求','View this session’s requests')}</TooltipPopup>
                   </Tooltip>
-                  <Button
-                    size="xs"
-                    variant="destructive-outline"
-                    className="ml-1 shrink-0"
-                    loading={unbind.isPending && unbind.variables === session.session_key}
-                    disabled={unbind.isPending && unbind.variables !== session.session_key}
-                    onClick={() => unbind.mutate(session.session_key)}
-                    aria-label={t(`解绑会话 ${session.session_key}`, `Unbind session ${session.session_key}`)}
-                  >
-                    <UnlinkIcon />
-                    {t('解绑', 'Unbind')}
-                  </Button>
+                  {!readOnly && (
+                    <Button
+                      size="xs"
+                      variant="destructive-outline"
+                      className="ml-1 shrink-0"
+                      loading={unbind.isPending && unbind.variables === session.session_key}
+                      disabled={unbind.isPending && unbind.variables !== session.session_key}
+                      onClick={() => unbind.mutate(session.session_key)}
+                      aria-label={t(`解绑会话 ${session.session_key}`, `Unbind session ${session.session_key}`)}
+                    >
+                      <UnlinkIcon />
+                      {t('解绑', 'Unbind')}
+                    </Button>
+                  )}
                 </div>
                 <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
                   <Tooltip>

@@ -40,6 +40,11 @@ struct Cli {
     /// A CLI or environment value takes precedence and makes the web setting read-only.
     #[arg(long, env = "LUBAN_ADMIN_PASSWORD")]
     admin_password: Option<String>,
+    /// Read-only viewer password; also available through LUBAN_VIEWER_PASSWORD.
+    /// Viewers can browse the console but cannot change anything. Only takes effect once an admin password is set.
+    /// A CLI or environment value takes precedence and makes the web setting read-only.
+    #[arg(long, env = "LUBAN_VIEWER_PASSWORD")]
+    viewer_password: Option<String>,
     /// Open a browser after startup (off by default).
     #[arg(long)]
     open: bool,
@@ -66,7 +71,9 @@ async fn main() -> Result<()> {
         None => {
             let api_key = cli.api_key.filter(|k| !k.trim().is_empty());
             let admin_password = cli.admin_password.filter(|k| !k.trim().is_empty());
-            web::run(&cli.host, cli.port, cli.open, store, api_key, admin_password).await
+            let viewer_password = cli.viewer_password.filter(|k| !k.trim().is_empty());
+            web::run(&cli.host, cli.port, cli.open, store, api_key, admin_password, viewer_password)
+                .await
         }
         Some(Command::Status) => status(&store),
         Some(Command::Logout) => logout(&store),

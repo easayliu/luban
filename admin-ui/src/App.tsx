@@ -37,6 +37,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { MenuItem } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
+import { useConfirmedViewer, useReadOnly } from '@/lib/role'
 
 // 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
 // 拆成单独 chunk 后首屏少解析一截。但 chunk 有 120 多 KB，远程访问时点进去要先白屏
@@ -306,6 +307,15 @@ function App() {
     return () => window.removeEventListener('storage', onStorage)
   }, [pw])
 
+  const readOnly = useReadOnly()
+  // 系统设置对访客整页不开放（后端也拒 `/settings`）：深链接、书签进来的落回账号池。
+  // 只对确认过的访客清路由；身份未明时下面只是先不渲染设置页，查回是管理员就照常打开。
+  const confirmedViewer = useConfirmedViewer()
+  useEffect(() => {
+    if (!confirmedViewer || !settingsRoute) return
+    window.history.replaceState(null, '', '#/')
+    setSettingsRoute(null)
+  }, [confirmedViewer, settingsRoute])
   const needLogin = authState?.configured && !pw
   // 未设密码：管理接口一律拒绝（本机也一样），先用启动日志里的初始化口令设密码。
   const needSetup = !!authState?.setup_required
@@ -338,7 +348,7 @@ function App() {
     if (!authState) void refetchAuthState()
     void refetchCredentials()
   }
-  useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute)
+  useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute && !readOnly)
 
   if (!isBootstrapping && needSetup) {
     return (
@@ -356,7 +366,7 @@ function App() {
     return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
   }
 
-  if (!isBootstrapping && settingsRoute) {
+  if (!isBootstrapping && settingsRoute && !readOnly) {
     return (
       <Suspense fallback={<SettingsPageFallback onBack={closeSettings} />}>
         <SettingsPage
@@ -391,17 +401,19 @@ function App() {
           <>
             {/* 「添加账号」是顶栏第一枚、也是唯一的实心按钮：这一页的主动作在这儿最好够。
                 窄屏只留一枚橙色 `+`，≥640px 带上文字。 */}
-            <Button
-              aria-label={t('添加账号', 'Add account')}
-              className="max-sm:size-10 max-sm:px-0"
-              disabled={isBootstrapping}
-              size="sm"
-              title={t('添加账号', 'Add account')}
-              onClick={() => setAdding(true)}
-            >
-              <PlusIcon />
-              <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
-            </Button>
+            {!readOnly && (
+              <Button
+                aria-label={t('添加账号', 'Add account')}
+                className="max-sm:size-10 max-sm:px-0"
+                disabled={isBootstrapping}
+                size="sm"
+                title={t('添加账号', 'Add account')}
+                onClick={() => setAdding(true)}
+              >
+                <PlusIcon />
+                <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+              </Button>
+            )}
             <Button
               aria-label={t('请求查询', 'Request lookup')}
               className="max-sm:size-10 max-sm:px-0"
@@ -425,9 +437,11 @@ function App() {
               <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
                 <ShieldAlertIcon />{t('封号记录', 'Ban events')}
               </MenuItem>
-              <MenuItem disabled={isBootstrapping} onClick={() => openSettings('access')}>
-                <SettingsIcon />{t('系统设置', 'System settings')}
-              </MenuItem>
+              {!readOnly && (
+                <MenuItem disabled={isBootstrapping} onClick={() => openSettings('access')}>
+                  <SettingsIcon />{t('系统设置', 'System settings')}
+                </MenuItem>
+              )}
             </PreferencesMenu>
           </>
         }

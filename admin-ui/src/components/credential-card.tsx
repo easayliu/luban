@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import {
   cn,
   displayCredentialLabel,
@@ -189,6 +190,7 @@ export const CredentialCard = memo(function CredentialCard({
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
 
+  const readOnly = useReadOnly()
   const actions = useCredentialActions(cred, () => setEditing(false))
   const { rename, toggle, limit } = actions
   const evaluation = evaluateCredential(cred, now, language)
@@ -301,7 +303,7 @@ export const CredentialCard = memo(function CredentialCard({
   const statusUsesTooltip = status.attention
   const added = relativeTime(cred.created_at, now, language)
   const proxyName = useProxyName()
-  const proxyLabel = proxyName(cred.proxy)
+  const proxyLabel = proxyName(cred)
   const quotaSnapshotTime = cred.quota
     ? formatFullTime(cred.quota.ts, language)
     : t('未知时间', 'unknown time')
@@ -755,7 +757,7 @@ export const CredentialCard = memo(function CredentialCard({
             <Switch
               checked={!cred.disabled}
               onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-              disabled={toggle.isPending}
+              disabled={readOnly || toggle.isPending}
               title={switchTitle(cred, language)}
               aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
             />

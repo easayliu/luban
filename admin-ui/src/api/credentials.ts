@@ -126,9 +126,11 @@ export interface Credential {
    * 该账号专用的出站代理（`socks5://`/`http://` 等）；null 表示直连。
    *
    * 配了之后这个号的**全部**出站流量都走它——转发、token 刷新、profile、连通性测试。
-   * 后端不脱敏原样返回：串里可能带账号密码，但打了码就没法确认自己配的是哪一条。
+   * 后端对管理员不脱敏原样返回（访客拿到的已去掉密码）：串里可能带账号密码，但打了码就没法确认自己配的是哪一条。
    */
   proxy: string | null
+  /** `proxy` 在代理池里对应那条的 id；不在池里或直连为 null。查代理名称用它，不要按 URL 查。 */
+  proxy_id?: number | null
   token_hint: string
   /** 最新一次的订阅额度快照；无请求记录时为 null。 */
   quota: Quota | null

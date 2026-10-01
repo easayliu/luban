@@ -28,6 +28,7 @@ import {
   type Credential,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
@@ -445,6 +446,7 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
   // 删掉之后这一页就没有对象了，直接回账号池，而不是停在一张「找不到这个账号」上。
   const actions = useCredentialActions(cred, () => setRenaming(false), undefined, onDeleted)
   const { toggle } = actions
+  const readOnly = useReadOnly()
   const evaluation = evaluateCredential(cred, now, language)
   const { status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
@@ -480,17 +482,19 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
             <span className="shrink-0 text-sm text-muted-foreground tabular-nums max-sm:hidden">#{cred.id}</span>
             {/* 名称与 ID 就是页标题本身，账号信息里不再重复列；重命名入口跟着标题走。
                 手机上藏掉：标题常折成两行，铅笔被挤到右上角孤零零一枚，而 ⋯ 面板里就有「重命名」。 */}
-            <Button
-              type="button"
-              size="icon-xs"
-              variant="ghost"
-              className="shrink-0 self-center max-sm:hidden"
-              aria-label={t('重命名', 'Rename')}
-              title={t('重命名', 'Rename')}
-              onClick={openRename}
-            >
-              <PencilIcon />
-            </Button>
+            {!readOnly && (
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                className="shrink-0 self-center max-sm:hidden"
+                aria-label={t('重命名', 'Rename')}
+                title={t('重命名', 'Rename')}
+                onClick={openRename}
+              >
+                <PencilIcon />
+              </Button>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm text-muted-foreground tabular-nums sm:hidden">#{cred.id}</span>
@@ -503,10 +507,13 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
         </div>
         {/* 手机上操作整行铺开：连通性测试拉宽成主按钮，⋯ 与启停开关贴右。 */}
         <div className="flex shrink-0 items-center gap-2 max-sm:w-full">
-          <Button type="button" variant="outline" className="max-sm:flex-1" onClick={() => setTesting(true)}>
-            <ActivityIcon />
-            {t('连通性测试', 'Connectivity test')}
-          </Button>
+          {/* 访客不给：测试会真发一条请求、耗额度，后端也一定回 403。 */}
+          {!readOnly && (
+            <Button type="button" variant="outline" className="max-sm:flex-1" onClick={() => setTesting(true)}>
+              <ActivityIcon />
+              {t('连通性测试', 'Connectivity test')}
+            </Button>
+          )}
           <CredentialActionsMenu
             triggerClassName={buttonVariants({ size: 'icon', variant: 'outline' })}
             triggerLabel={t(`打开 ${credentialLabel} 菜单`, `Open menu for ${credentialLabel}`)}
@@ -528,7 +535,7 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
             <Switch
               checked={!cred.disabled}
               onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-              disabled={toggle.isPending}
+              disabled={readOnly || toggle.isPending}
               title={switchTitle(cred, language)}
               aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
             />
@@ -722,6 +729,7 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
   const cooldowns = cred.rate_limited_models ?? []
   const denials = cred.denied_models ?? []
   const clear = useCredentialActions(cred).cooldown
+  const readOnly = useReadOnly()
   const overageText = snapshot?.overage_in_use == null
     ? t('未知', 'Unknown')
     : snapshot.overage_in_use
@@ -849,18 +857,20 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
                   )}
                 </InfoHint>
               </h3>
-              <Button
-                type="button"
-                size="xs"
-                variant="outline"
-                loading={clear.isPending}
-                onClick={() => clear.mutate()}
-              >
-                <TimerOffIcon />
-                {denials.length > 0
-                  ? t('解除冷却与模型限制', 'Clear cooldown & model blocks')
-                  : t('解除冷却', 'Clear cooldown')}
-              </Button>
+              {!readOnly && (
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  loading={clear.isPending}
+                  onClick={() => clear.mutate()}
+                >
+                  <TimerOffIcon />
+                  {denials.length > 0
+                    ? t('解除冷却与模型限制', 'Clear cooldown & model blocks')
+                    : t('解除冷却', 'Clear cooldown')}
+                </Button>
+              )}
             </div>
             <ul className="space-y-1.5">
               {cooldowns.map((m) => (
@@ -1143,6 +1153,7 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
  */
 function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () => void }) {
   const { t } = useI18n()
+  const readOnly = useReadOnly()
   const devices = useQuery({
     queryKey: ['credential-devices', cred.id],
     queryFn: () => listCredentialDevices(cred.id),
@@ -1161,7 +1172,7 @@ function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () =>
         '带设备身份的客户端按设备占用名额；走模拟路径、无设备身份的请求按会话占用名额，两者相互独立。',
         'Clients with a device identity take a device slot; simulated requests without one take a session slot. The two are independent.',
       )}
-      action={(
+      action={readOnly ? undefined : (
         <Button type="button" size="sm" variant="outline" onClick={onManage}>
           {t('调整上限', 'Adjust limits')}
         </Button>
@@ -1318,10 +1329,12 @@ function ScheduleSection({
   const proxyName = useProxyName()
   const { prio } = useCredentialActions(cred)
   const mobile = useMediaQuery(MOBILE_QUERY)
-  const edit = (onClick: () => void) => (
+  // 访客：「修改」与优先级升降都不给。手机上那几行整行可点，点开的对话框是只读的，照常留着。
+  const readOnly = useReadOnly()
+  const edit = (onClick: () => void) => readOnly ? null : (
     <Button type="button" size="sm" variant="outline" onClick={onClick}>{t('修改', 'Edit')}</Button>
   )
-  const priorityButtons = (
+  const priorityButtons = readOnly ? null : (
     <>
       <Button
         type="button"
@@ -1364,7 +1377,7 @@ function ScheduleSection({
     )
     return (
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>
-        {row(t('出站代理', 'Outbound proxy'), proxyName(cred.proxy) ?? t('直连', 'Direct'), onProxy)}
+        {row(t('出站代理', 'Outbound proxy'), proxyName(cred) ?? t('直连', 'Direct'), onProxy)}
         {row(
           t('提前暂停调度', 'Early pause'),
           `5h ${pause(cred.quota_pause_pct_effective)} · 7d ${pause(cred.quota_pause_pct_7d_effective)}`,

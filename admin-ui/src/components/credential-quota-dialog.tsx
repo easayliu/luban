@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { PercentIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { displayCredentialLabel } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { type CredentialActions } from '@/components/credential-shared'
@@ -66,6 +67,7 @@ export function CredentialQuotaDialog({
   quotaPause: CredentialActions['quotaPause']
 }) {
   const { t, language } = useI18n()
+  const readOnly = useReadOnly()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [shortPolicy, setShortPolicy] = useState<QuotaPolicy>(() => policyFromPct(cred.quota_pause_pct))
   const [shortCustom, setShortCustom] = useState(() =>
@@ -116,6 +118,7 @@ export function CredentialQuotaDialog({
         <FieldLabel>{label}</FieldLabel>
         <Select
           items={policyItems}
+          disabled={readOnly}
           value={policy}
           onValueChange={(value) => { if (value) setPolicy(value as QuotaPolicy) }}
         >
@@ -139,6 +142,7 @@ export function CredentialQuotaDialog({
         <Field>
           <FieldLabel>{t('使用率阈值（%）', 'Utilization threshold (%)')}</FieldLabel>
           <NumberField
+            disabled={readOnly}
             value={custom}
             min={1}
             max={100}
@@ -202,10 +206,14 @@ export function CredentialQuotaDialog({
         </DialogPanel>
 
         <DialogFooter>
-          <DialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</DialogClose>
-          <Button onClick={save} disabled={!dirty || quotaPause.isPending} loading={quotaPause.isPending}>
-            {t('保存', 'Save')}
-          </Button>
+          <DialogClose render={<Button variant="outline" />}>
+            {readOnly ? t('关闭', 'Close') : t('取消', 'Cancel')}
+          </DialogClose>
+          {!readOnly && (
+            <Button onClick={save} disabled={!dirty || quotaPause.isPending} loading={quotaPause.isPending}>
+              {t('保存', 'Save')}
+            </Button>
+          )}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

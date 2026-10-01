@@ -1000,7 +1000,9 @@ impl CredentialStore {
     /// 迁移后不跟着走，所有客户端都得重配一遍。
     pub fn settings_snapshot(&self) -> HashMap<String, String> {
         let mut out = self.settings.read().clone();
-        out.remove(ADMIN_PASSWORD);
+        for k in CONSOLE_AUTH_KEYS {
+            out.remove(*k);
+        }
         out
     }
 
@@ -1129,7 +1131,7 @@ impl CredentialStore {
     pub fn import_settings(&self, settings: &HashMap<String, String>) -> Result<usize> {
         let mut n = 0;
         for (k, v) in settings {
-            if k == ADMIN_PASSWORD {
+            if CONSOLE_AUTH_KEYS.contains(&k.as_str()) {
                 continue;
             }
             self.set_setting(k, v)?;
@@ -2850,6 +2852,18 @@ pub const CLIENT_API_KEY: &str = "client_api_key";
 
 /// 管理密码（sha256 hex）的 settings 键名。
 pub const ADMIN_PASSWORD: &str = "admin_password_sha256";
+
+/// 只读访客密码（sha256 hex）的 settings 键名。与管理密码一样属于部署本身，不随迁移走。
+pub const VIEWER_PASSWORD: &str = "viewer_password_sha256";
+
+/// 两个密码各自「规范形」（反复百分号解码到底）的 sha256 hex，判两者会不会被认混用，
+/// 见 `crate::auth::canonical`。与密码本身一样不随迁移走。
+pub const ADMIN_PASSWORD_CANONICAL: &str = "admin_password_canonical_sha256";
+pub const VIEWER_PASSWORD_CANONICAL: &str = "viewer_password_canonical_sha256";
+
+/// 控制台登录相关的 settings 键：属于部署本身，导出不带、导入不认。
+pub const CONSOLE_AUTH_KEYS: &[&str] =
+    &[ADMIN_PASSWORD, VIEWER_PASSWORD, ADMIN_PASSWORD_CANONICAL, VIEWER_PASSWORD_CANONICAL];
 
 /// 设备绑定有效期（秒）的 settings 键名；`<= 0` 表示永不过期。
 pub const DEVICE_BINDING_TTL: &str = "device_binding_ttl_secs";

@@ -83,6 +83,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
 import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
@@ -401,6 +402,8 @@ function WorkspaceToolbarSkeleton() {
  */
 export function CredentialWorkspace({ data, state, actions }: CredentialWorkspaceProps) {
   const { language, locale, t } = useI18n()
+  // 访客不给勾选：勾了只能接批量操作，而批量操作全是改动。
+  const readOnly = useReadOnly()
   const {
     credentials,
     isLoading,
@@ -1309,7 +1312,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         </p>
         <div className="min-w-0 space-y-3 sm:space-y-4">
 
-          {count > 0 && selected.size > 0 && (
+          {!readOnly && count > 0 && selected.size > 0 && (
             <div className="relative">
               <BatchActionsBar
                 all={sorted}
@@ -1322,7 +1325,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
           {isLoading ? (
             <div className="relative">
-              <CredentialLoadingState view={view} selectable count={pageSize} />
+              <CredentialLoadingState view={view} selectable={!readOnly} count={pageSize} />
             </div>
           ) : isError && !credentials ? (
             <Card><ErrorState error={error} onRetry={actions.onRetry} /></Card>
@@ -1362,7 +1365,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             <Table variant="card" className="table-fixed">
               <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
               <CredentialListHeader
-                selectable
+                selectable={!readOnly}
                 sort={sort}
                 dir={dir}
                 onSortChange={changeSort}
@@ -1377,7 +1380,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     key={item.id}
                     cred={item}
                     now={now}
-                    selectable
+                    selectable={!readOnly}
                     selected={selected.has(item.id)}
                     onSelectedChange={toggleSelected}
                   />
@@ -1392,7 +1395,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                   key={item.id}
                   cred={item}
                   now={now}
-                  selectable
+                  selectable={!readOnly}
                   selected={selected.has(item.id)}
                   onSelectedChange={toggleSelected}
                 />
@@ -1527,6 +1530,7 @@ function AccountPagination({
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
   const { t } = useI18n()
+  const readOnly = useReadOnly()
   return (
     <Empty>
       <EmptyHeader>
@@ -1539,12 +1543,14 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
           )}
         </EmptyDescription>
       </EmptyHeader>
-      <EmptyContent>
-        <Button onClick={onAdd}>
-          <PlusIcon />
-          {t('添加第一个账号', 'Add first account')}
-        </Button>
-      </EmptyContent>
+      {!readOnly && (
+        <EmptyContent>
+          <Button onClick={onAdd}>
+            <PlusIcon />
+            {t('添加第一个账号', 'Add first account')}
+          </Button>
+        </EmptyContent>
+      )}
     </Empty>
   )
 }

@@ -18,6 +18,7 @@ import {
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
+import { useReadOnly } from '@/lib/role'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
@@ -960,6 +961,7 @@ function useCredentialMenuGroups(
   const { t } = useI18n()
   const { refresh, prio, cooldown } = actions
   const reauthorize = useReauthorize()
+  const readOnly = useReadOnly()
   const detail: CredentialMenuItem[] = h.showDetail === false
     ? []
     : [{
@@ -1034,6 +1036,8 @@ function useCredentialMenuGroups(
   const danger: CredentialMenuItem[] = [
     { key: 'delete', icon: <Trash2Icon />, label: t('删除', 'Delete'), onSelect: h.onRequestDelete, destructive: true },
   ]
+  // 访客只留看的两项。连通性测试也不给：它会真发一条请求、耗额度、可能把号打进冷却。
+  if (readOnly) return [detail, main.filter((item) => item.key === 'usage')].filter((g) => g.length > 0)
   return [detail, main, priority, danger].filter((g) => g.length > 0)
 }
 
@@ -1176,7 +1180,7 @@ function CredentialActionSheet({
     device: `${limit(cred.device_count, cred.device_limit_effective)} · ${limit(cred.session_count, cred.session_limit_effective)}`,
     rpm: cred.rpm_limit_effective > 0 ? String(cred.rpm_limit_effective) : t('不限', 'Unlimited'),
     pause: `${pause(cred.quota_pause_pct_effective)} · ${pause(cred.quota_pause_pct_7d_effective)}`,
-    proxy: proxyName(cred.proxy) ?? t('直连', 'Direct'),
+    proxy: proxyName(cred) ?? t('直连', 'Direct'),
   }
   const quick = pick(['detail', 'test', 'refresh', 'usage'])
   // token 失效时「重新授权」就是这个号唯一该做的事，提到上面与解除冷却同样醒目；平时排在设置末尾。
@@ -2164,20 +2168,21 @@ export function proxyLabelParts(proxy: string): { scheme: string | null; host: s
 }
 
 /**
- * 账号绑定的代理 → 代理池里的名称。账号上只存 URL，名称在代理池；按 URL 全等查找。
+ * 账号绑定的代理 → 代理池里的名称。按后端给的 `proxy_id` 查，不按 URL：访客拿到的 URL 已去掉
+ * 密码，只差密码的两条代理打码后一模一样，按 URL 建表后一条会盖掉前一条，名称就串了位。
  * 卡片与列表只显示名称，不铺 IP 与端口：
  * - 池里有且起过名的 → 名称；
  * - 池里有但名称就是自动生成的 `host:port`（添加时留空）→ 「代理 #id」；
  * - 不在池里的自定义地址 → 「自定义代理」。
  * 完整地址（脱敏）仍在 Tooltip 与出站代理对话框里。与代理池共用 `['proxies']` 缓存。
  */
-export function useProxyName(): (proxy: string | null) => string | null {
+export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id'>) => string | null {
   const { t } = useI18n()
   const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
-  const byUrl = useMemo(() => new Map((data ?? []).map((p) => [p.url, p])), [data])
-  return (proxy) => {
+  const byId = useMemo(() => new Map((data ?? []).map((p) => [p.id, p])), [data])
+  return ({ proxy, proxy_id }) => {
     if (!proxy) return null
-    const saved = byUrl.get(proxy)
+    const saved = proxy_id == null ? undefined : byId.get(proxy_id)
     if (!saved) return t('自定义代理', 'Custom proxy')
     const name = saved.label.trim()
     const hostPort = proxyLabelParts(proxy).host

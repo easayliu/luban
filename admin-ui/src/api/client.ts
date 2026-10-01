@@ -4,9 +4,15 @@ export const PW_KEY = 'luban_admin_pw'
 /** 没带密码的请求被 401 时派发，App 收到后重新拉鉴权状态。 */
 export const UNAUTHORIZED_EVENT = 'luban:unauthorized'
 
+/** 上次登录认出的身份，只用来在 `/auth/me` 回来之前不闪一下按钮；真正的权限在后端。 */
+export const ROLE_KEY = 'luban_role'
+
 export const getPw = () => localStorage.getItem(PW_KEY)
 export const setPw = (pw: string) => localStorage.setItem(PW_KEY, pw)
-export const clearPw = () => localStorage.removeItem(PW_KEY)
+export const clearPw = () => {
+  localStorage.removeItem(PW_KEY)
+  localStorage.removeItem(ROLE_KEY)
+}
 
 /** 全局 axios 实例：自动带上管理密码，401 时清除并回登录。 */
 export const api = axios.create({

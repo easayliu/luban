@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { GaugeIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { displayCredentialLabel } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { type CredentialActions } from '@/components/credential-shared'
@@ -56,6 +57,7 @@ export function CredentialRpmDialog({
   rpmLimit: CredentialActions['rpmLimit']
 }) {
   const { t, language, locale } = useI18n()
+  const readOnly = useReadOnly()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [policy, setPolicy] = useState<RpmPolicy>(() => policyFromLimit(cred.rpm_limit))
   // 自定义值的初值：本来就是独立上限就沿用它，否则拿生效值起步（多半就是想在它附近调），
@@ -112,6 +114,7 @@ export function CredentialRpmDialog({
               <FieldLabel>{t('上限策略', 'Limit policy')}</FieldLabel>
               <Select
                 items={policyItems}
+                disabled={readOnly}
                 value={policy}
                 onValueChange={(value) => { if (value) setPolicy(value as RpmPolicy) }}
               >
@@ -136,6 +139,7 @@ export function CredentialRpmDialog({
               <Field>
                 <FieldLabel>{t('每分钟最多请求数', 'Maximum requests per minute')}</FieldLabel>
                 <NumberField
+                  disabled={readOnly}
                   value={custom}
                   min={1}
                   step={1}
@@ -167,10 +171,14 @@ export function CredentialRpmDialog({
         </DialogPanel>
 
         <DialogFooter>
-          <DialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</DialogClose>
-          <Button onClick={save} disabled={!dirty || rpmLimit.isPending} loading={rpmLimit.isPending}>
-            {t('保存', 'Save')}
-          </Button>
+          <DialogClose render={<Button variant="outline" />}>
+            {readOnly ? t('关闭', 'Close') : t('取消', 'Cancel')}
+          </DialogClose>
+          {!readOnly && (
+            <Button onClick={save} disabled={!dirty || rpmLimit.isPending} loading={rpmLimit.isPending}>
+              {t('保存', 'Save')}
+            </Button>
+          )}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

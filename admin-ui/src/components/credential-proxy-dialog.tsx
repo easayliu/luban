@@ -4,6 +4,7 @@ import { GlobeIcon, MapPinIcon, PlayIcon, XIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { listProxies, testProxy, type ProxyTestResult, type SavedProxy } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { displayCredentialLabel, extractError } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { proxyMaskedUrl, type CredentialActions } from '@/components/credential-shared'
@@ -41,6 +42,7 @@ export function CredentialProxyDialog({
   proxy: CredentialActions['proxy']
 }) {
   const { t, language } = useI18n()
+  const readOnly = useReadOnly()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [value, setValue] = useState(cred.proxy ?? '')
 
@@ -76,7 +78,7 @@ export function CredentialProxyDialog({
         </DialogHeader>
 
         <DialogPanel className="space-y-4">
-          {savedProxies.length > 0 && (
+          {!readOnly && savedProxies.length > 0 && (
             <div className="space-y-2">
               <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
               <ProxyPickerCombobox proxies={savedProxies} value={trimmed} onPick={setValue} />
@@ -89,6 +91,7 @@ export function CredentialProxyDialog({
             <Input
               id="cred-proxy"
               value={value}
+              readOnly={readOnly}
               onChange={(event) => setValue(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && dirty && !proxy.isPending) save()
@@ -109,7 +112,8 @@ export function CredentialProxyDialog({
             </p>
           </div>
 
-          <ProxyTestBlock url={trimmed} />
+          {/* 测试会经这条代理出网，访客不给。 */}
+          {!readOnly && <ProxyTestBlock url={trimmed} />}
 
           <Alert>
             <GlobeIcon />
@@ -123,10 +127,14 @@ export function CredentialProxyDialog({
         </DialogPanel>
 
         <DialogFooter>
-          <DialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</DialogClose>
-          <Button onClick={save} disabled={!dirty || proxy.isPending}>
-            {trimmed === '' ? t('改回直连', 'Switch to direct') : t('保存', 'Save')}
-          </Button>
+          <DialogClose render={<Button variant="outline" />}>
+            {readOnly ? t('关闭', 'Close') : t('取消', 'Cancel')}
+          </DialogClose>
+          {!readOnly && (
+            <Button onClick={save} disabled={!dirty || proxy.isPending}>
+              {trimmed === '' ? t('改回直连', 'Switch to direct') : t('保存', 'Save')}
+            </Button>
+          )}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowRightIcon, EyeIcon, EyeOffIcon, LockKeyholeIcon } from 'lucide-react'
-import { login } from '@/api/auth'
+import { getAuthState, login } from '@/api/auth'
 import { setPw } from '@/api/client'
+import { rememberRole } from '@/lib/role'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
@@ -23,19 +24,23 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
   const { t, language } = useI18n()
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
+  // App 已拉过这份鉴权状态，这里直接命中缓存。
+  const { data: authState } = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
+  const viewerEnabled = authState?.viewer_enabled ?? false
 
   useEffect(() => {
     const previousTitle = document.title
-    document.title = t('管理登录 · Luban', 'Admin sign-in · Luban')
+    document.title = viewerEnabled ? t('控制台登录 · Luban', 'Console sign-in · Luban') : t('管理登录 · Luban', 'Admin sign-in · Luban')
     return () => {
       document.title = previousTitle
     }
-  }, [t])
+  }, [t, viewerEnabled])
 
   const doLogin = useMutation({
     mutationFn: () => login(password),
-    onSuccess: () => {
+    onSuccess: (role) => {
       setPw(password)
+      rememberRole(role)
       onSuccess(password)
     },
   })
@@ -61,12 +66,14 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base leading-tight">
               <LockKeyholeIcon aria-hidden="true" className="size-4 text-muted-foreground" />
-              {t('管理登录', 'Admin sign-in')}
+              {viewerEnabled ? t('控制台登录', 'Console sign-in') : t('管理登录', 'Admin sign-in')}
             </CardTitle>
             {/* 说明只留给读屏：「输入管理密码以继续访问控制台」与下面的「管理密码」标签、「登录」按钮
                 说的是同一件事。 */}
             <CardDescription className="sr-only">
-              {t('输入管理密码以继续访问控制台。', 'Enter the admin password to continue to the console.')}
+              {viewerEnabled
+                ? t('输入管理密码或访客密码以继续访问控制台。', 'Enter the admin or viewer password to continue to the console.')
+                : t('输入管理密码以继续访问控制台。', 'Enter the admin password to continue to the console.')}
             </CardDescription>
           </CardHeader>
           <CardPanel>
@@ -79,7 +86,7 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
             >
               <Field invalid={doLogin.isError}>
                 <FieldLabel htmlFor="admin-password">
-                  {t('管理密码', 'Admin password')}
+                  {viewerEnabled ? t('管理密码或访客密码', 'Admin or viewer password') : t('管理密码', 'Admin password')}
                 </FieldLabel>
                 <InputGroup>
                   <InputGroupInput
@@ -106,6 +113,11 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                 {/* `match`：Base UI 的 Field.Error 默认只跟着原生表单校验显示，这里的错误来自接口，得显式
                     打开，否则登录失败时框变红了却看不到原因。 */}
                 {doLogin.isError && <FieldError match>{extractError(doLogin.error, language)}</FieldError>}
+                {viewerEnabled && !doLogin.isError && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('用访客密码登录只能查看，不能修改。', 'Signing in with the viewer password gives view-only access.')}
+                  </p>
+                )}
               </Field>
               <Button
                 className="w-full"

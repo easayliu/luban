@@ -53,6 +53,8 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
+    /// 只读访客密码（环境接管，明文；None 表示未由环境设置）。见 [`auth::Role::Viewer`]。
+    pub viewer_env: Option<Arc<String>>,
     /// 首次设置管理密码的初始化口令：每次启动随机生成、重启前不变，未设密码时打进日志。
     /// 设密码必须带上它，本机也一样，见 [`auth::setup`]。
     pub setup_token: Arc<String>,
@@ -108,6 +110,7 @@ impl AppState {
             store,
             client_key: None,
             admin_env: None,
+            viewer_env: None,
             setup_token: Arc::new("test-setup-token".into()),
             shape_rejections: Arc::default(),
             deprecated_fields: Arc::default(),
@@ -132,6 +135,7 @@ pub async fn run(
     store: Arc<CredentialStore>,
     api_key: Option<String>,
     admin_password: Option<String>,
+    viewer_password: Option<String>,
 ) -> Result<()> {
     let client_key = api_key.map(Arc::new);
     let clients = std::sync::Arc::new(crate::clients::ClientPool::new()?);
@@ -141,6 +145,7 @@ pub async fn run(
         store,
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
+        viewer_env: viewer_password.map(Arc::new),
         setup_token: Arc::new(auth::new_setup_token()),
         shape_rejections: Arc::default(),
         deprecated_fields: Arc::default(),
@@ -548,7 +553,7 @@ pub async fn run(
         .route("/pricing", get(get_pricing))
         .route("/ratio_config", get(get_ratio_config));
 
-    // 需管理鉴权的接口（未设密码时中间件放行）。
+    // 需管理鉴权的接口（未设密码时一律 401）。只读访客只能打其中的 GET，见 [`auth::Role`]。
     let protected = Router::new()
         .route("/authorize", get(authorize))
         .route("/exchange", post(exchange))
@@ -625,11 +630,15 @@ pub async fn run(
         .route("/export", get(export))
         .route("/import", post(import))
         .route("/auth/password", post(auth::change_password))
+        .route("/auth/me", get(auth::me))
+        .route("/auth/viewer-password", post(auth::set_viewer_password))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
 
     // 失败的请求补一行「哪个方法打了哪条路径、回了几」。错误详情由 `internal`/`bad_request`
     // 各自记，方法与路径它们看不到，只能在这一层补——两行合起来才定位得到一次失败。
     let api = public.merge(protected).layer(middleware::from_fn(log_api_failures));
+
+    auth::warn_if_viewer_inactive(&state);
 
     // 未设管理密码时，启动日志里要给出初始化口令（`state` 下面会被 move 进路由）。
     let setup_token = (!auth::admin_configured(&state)).then(|| state.setup_token.clone());
@@ -1107,6 +1116,7 @@ fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiEr
     let mut denials = state.store.all_model_denials().map_err(internal)?;
     let bans = state.store.ban_counts().map_err(internal)?;
     let defaults = DefaultLimits::of(&state.store);
+    let proxy_ids = saved_proxy_ids(state)?;
     let views = list
         .iter()
         .map(|c| {
@@ -1117,6 +1127,7 @@ fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiEr
                 defaults,
             )
             .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
+            .with_proxy_ids(&proxy_ids)
             .with_cooldown(
                 state.store.rate_limited_secs(c.id),
                 state.store.rate_limited_models(c.id),
@@ -1132,6 +1143,11 @@ fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiEr
         })
         .collect();
     Ok(Json(views))
+}
+
+/// 代理池 URL → id。
+fn saved_proxy_ids(state: &AppState) -> Result<std::collections::HashMap<String, i64>, ApiError> {
+    Ok(state.store.list_proxies().map_err(internal)?.into_iter().map(|p| (p.url, p.id)).collect())
 }
 
 /// 列出某凭证当前绑定的设备明细（按最近活跃倒序）。
@@ -2038,6 +2054,8 @@ struct SavedProxyView {
 }
 
 /// 列出代理池中所有记录，附带每条代理的使用量与使用者。
+///
+/// 访客看到的地址由鉴权中间件统一去掉密码，见 [`auth::redact_url_credentials`]。
 async fn list_saved_proxies(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SavedProxyView>>, ApiError> {
@@ -2435,6 +2453,7 @@ fn credential_view(state: &AppState, id: i64) -> Result<Json<CredentialView>, Ap
     let denials = state.store.denied_models(id).map_err(internal)?;
     Ok(Json(
         CredentialView::new(&cred, count, session_count, DefaultLimits::of(&state.store))
+            .with_proxy_ids(&saved_proxy_ids(state)?)
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
@@ -3775,7 +3794,11 @@ struct CredentialView {
     ban_reason: Option<String>,
     /// 该账号专用的出站代理；`None` 表示直连。**原样返回、不脱敏**：代理串里可能带账号密码，
     /// 但这是个已经过管理鉴权的接口，而把它打码会让人没法确认自己配的到底是哪一条。
+    /// 访客看到的由鉴权中间件统一去掉密码，见 [`auth::redact_url_credentials`]。
     proxy: Option<String>,
+    /// `proxy` 在代理池里对应那条的 id（按 URL 全等），不在池里或直连为 `None`。前端按它查
+    /// 代理名称：访客拿到的 URL 已去掉密码，只差密码的两条代理打码后长得一样，按 URL 查会串位。
+    proxy_id: Option<i64>,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
     /// 最新一次的订阅额度快照（无请求记录时为 None）。
@@ -3859,6 +3882,7 @@ impl CredentialView {
             ),
             ban_reason: c.ban_reason.clone(),
             proxy: c.proxy.clone(),
+            proxy_id: None,
             token_hint: mask_token(&c.refresh_token),
             quota: None,
             last_used: None,
@@ -3878,6 +3902,12 @@ impl CredentialView {
     }
 
     /// 附加「套餐不含」的模型记录（落库的，没有就是空）。
+    /// 附加代理池 id，见 [`Self::proxy_id`]。
+    fn with_proxy_ids(mut self, ids: &std::collections::HashMap<String, i64>) -> Self {
+        self.proxy_id = self.proxy.as_ref().and_then(|url| ids.get(url).copied());
+        self
+    }
+
     fn with_denials(mut self, denials: Vec<store::ModelDenial>) -> Self {
         self.denied_models = denials;
         self
@@ -4339,6 +4369,28 @@ fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    /// 两条只差密码的代理，给访客打码后 URL 一模一样；账号视图带上代理池 id，前端按 id 查名称
+    /// 才不会串位。
+    #[tokio::test]
+    async fn credential_view_carries_the_exact_proxy_id() {
+        let store = Arc::new(CredentialStore::open_in_memory().unwrap());
+        let pa = store.add_proxy("A", "http://u:one@h:1").unwrap();
+        let pb = store.add_proxy("B", "http://u:two@h:1").unwrap();
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+        let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
+        store.set_proxy(a.id, Some("http://u:one@h:1")).unwrap();
+        store.set_proxy(b.id, Some("http://u:two@h:1")).unwrap();
+        store.set_proxy(c.id, Some("http://u:other@h:9")).unwrap();
+        let state = AppState::for_test(store);
+        let views = list_credentials(State(state.clone())).await.unwrap().0;
+        let id_of = |id: i64| views.iter().find(|v| v.id == id).unwrap().proxy_id;
+        assert_eq!(id_of(a.id), Some(pa.id));
+        assert_eq!(id_of(b.id), Some(pb.id));
+        assert_eq!(id_of(c.id), None, "不在池里的自定义地址");
+        assert_eq!(credential_view(&state, a.id).unwrap().0.proxy_id, Some(pa.id));
+    }
 
     /// 已删账号的流水留到保留期满：按号接口对它给 404（账号自己的明细弹框靠这个区分「号没了」
     /// 与「没有请求」），全局接口带 `cred_id` 照样查得到——趋势拆分表里点已删账号那一行走的

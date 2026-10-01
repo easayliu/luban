@@ -37,9 +37,10 @@ import {
   setSessionTtl,
   type Settings,
 } from '@/api/settings'
-import { changePassword, getAuthState } from '@/api/auth'
+import { changePassword, getAuthState, setViewerPassword } from '@/api/auth'
 import { clearPw, setPw } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
+import { useMe } from '@/lib/role'
 import { copyText, extractError, formatDuration } from '@/lib/utils'
 import {
   AlertDialog,
@@ -526,6 +527,16 @@ export function SecuritySettingsContent() {
         )}
       >
         <AdminPassword />
+      </SettingsGroup>
+      <SettingsGroup
+        icon={EyeIcon}
+        title={t('访客密码', 'Viewer password')}
+        description={t(
+          '用访客密码登录的人可以查看控制台的全部页面，但不能做任何修改；接入 Key 与代理密码对访客打码显示，也不能导出数据。',
+          'People who sign in with the viewer password can see every page of the console but cannot change anything. The client key and proxy passwords are masked for them, and export is unavailable.',
+        )}
+      >
+        <ViewerPassword />
       </SettingsGroup>
     </div>
   )
@@ -2041,6 +2052,147 @@ function AdminPassword() {
               onClick={() => save.mutate('')}
             >
               {t('确认清除', 'Clear password')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </>
+  )
+}
+
+/** 只读访客密码：设置 / 修改 / 停用。 */
+function ViewerPassword() {
+  const { language, t } = useI18n()
+  const qc = useQueryClient()
+  const me = useMe()
+  const [password, setPassword] = useState('')
+  const [clearOpen, setClearOpen] = useState(false)
+
+  const save = useMutation({
+    mutationFn: setViewerPassword,
+    onSuccess: (_result, nextPassword) => {
+      setClearOpen(false)
+      setPassword('')
+      toastManager.add({
+        title: nextPassword
+          ? t('访客密码已设置', 'Viewer password set')
+          : t('访客访问已停用', 'Viewer access turned off'),
+        description: nextPassword
+          ? t('访客可用该密码以只读身份登录。', 'Viewers can now sign in read-only with this password.')
+          : t('已登录的访客将在下次请求时退出。', 'Signed-in viewers are signed out on their next request.'),
+        type: 'success',
+      })
+      void qc.invalidateQueries({ queryKey: ['auth-me'] })
+    },
+    onError: (error) => {
+      toastManager.add({
+        title: t('操作失败', 'Operation failed'),
+        description: extractError(error, language),
+        type: 'error',
+      })
+    },
+  })
+
+  const label = t('访客密码（只读登录）', 'Viewer password (read-only sign-in)')
+  // 占位数据是登录时记下的身份，读不出是否已设；等真数据回来再画，免得「停用」按钮闪一下。
+  if (me.isPending || me.isPlaceholderData) {
+    return (
+      <Field className="p-4 sm:p-5">
+        <FieldLabel>{label}</FieldLabel>
+        <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
+          <Spinner className="size-3" />
+          {t('正在加载', 'Loading')}
+        </span>
+      </Field>
+    )
+  }
+  const configured = me.data?.viewer_configured ?? false
+
+  return (
+    <>
+      <Field className="p-4 sm:p-5">
+        <FieldLabel>{label}</FieldLabel>
+        {me.data?.viewer_env_managed ? (
+          <FieldDescription>
+            {t('由环境变量', 'Managed by environment variable')}{' '}
+            <code className="font-mono">LUBAN_VIEWER_PASSWORD</code>
+            {t(' 管理，此处只读。', '; this page is read-only.')}
+            {me.data?.viewer_inactive && t(
+              '当前未生效：它与管理密码经 URL 编码或解码后相同。',
+              ' It is currently inactive: it matches the admin password after URL encoding or decoding.',
+            )}
+          </FieldDescription>
+        ) : (
+          <>
+            <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+              <Input
+                aria-label={t('新访客密码', 'New viewer password')}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={configured ? t('输入新密码', 'Enter a new password') : t('设置访客密码', 'Set a viewer password')}
+                type="password"
+                value={password}
+              />
+              <Button
+                size="sm"
+                loading={save.isPending}
+                disabled={password.trim().length < 4}
+                onClick={() => save.mutate(password.trim())}
+              >
+                <KeyRoundIcon />
+                {configured ? t('修改', 'Change') : t('设置', 'Set')}
+              </Button>
+              {configured && (
+                <Button
+                  size="sm"
+                  variant="destructive-outline"
+                  disabled={save.isPending}
+                  onClick={() => setClearOpen(true)}
+                >
+                  <Trash2Icon />
+                  {t('停用', 'Turn off')}
+                </Button>
+              )}
+            </div>
+            <FieldDescription>
+              {configured && me.data?.viewer_inactive
+                ? t(
+                    '访客密码已设置但未生效：与管理密码经 URL 编码或解码后相同，请换一个访客密码。',
+                    'The viewer password is set but inactive: it matches the admin password after URL encoding or decoding. Choose a different one.',
+                  )
+                : configured
+                ? t('访客访问已启用。须与管理密码不同，至少 4 个字符。', 'Viewer access is on. It must differ from the admin password and be at least 4 characters.')
+                : t('尚未设置，访客访问处于停用状态。须与管理密码不同，至少 4 个字符。', 'Not set; viewer access is off. It must differ from the admin password and be at least 4 characters.')}
+            </FieldDescription>
+          </>
+        )}
+      </Field>
+
+      <AlertDialog
+        open={clearOpen}
+        onOpenChange={(nextOpen) => {
+          if (!save.isPending) setClearOpen(nextOpen)
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('停用访客访问', 'Turn off viewer access')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                '清除访客密码后，已登录的访客会在下次请求时被退出，之后无法再以访客身份登录，直到重新设置。',
+                'Clearing the viewer password signs out any viewer on their next request, and nobody can sign in as a viewer until a new one is set.',
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
+              {t('取消', 'Cancel')}
+            </AlertDialogClose>
+            <Button
+              loading={save.isPending}
+              variant="destructive"
+              onClick={() => save.mutate('')}
+            >
+              {t('确认停用', 'Turn off')}
             </Button>
           </AlertDialogFooter>
         </AlertDialogPopup>

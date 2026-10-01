@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
@@ -333,7 +334,7 @@ export const CredentialRow = memo(function CredentialRow({
                           onClick={() => setProxyOpen(true)}
                         >
                           <GlobeIcon className="size-3 shrink-0" />
-                          <span className="min-w-0 truncate">{proxyName(cred.proxy)}</span>
+                          <span className="min-w-0 truncate">{proxyName(cred)}</span>
                         </TooltipTrigger>
                         <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy)}</TooltipPopup>
                       </Tooltip>
@@ -489,7 +490,7 @@ export const CredentialRow = memo(function CredentialRow({
                         onClick={() => setProxyOpen(true)}
                       >
                         <GlobeIcon className="size-3 shrink-0" />
-                        <span className="min-w-0 truncate">{proxyName(cred.proxy)}</span>
+                        <span className="min-w-0 truncate">{proxyName(cred)}</span>
                       </TooltipTrigger>
                       <TooltipPopup className="max-w-72 break-all">{proxyMaskedUrl(cred.proxy)}</TooltipPopup>
                     </Tooltip>
@@ -803,6 +804,7 @@ function ScheduleControl({
 }) {
   const { language } = useI18n()
   const { toggle } = actions
+  const readOnly = useReadOnly()
   const credentialLabel = displayCredentialLabel(cred.label, language)
 
   return (
@@ -812,7 +814,7 @@ function ScheduleControl({
         <Switch
           checked={!cred.disabled}
           onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-          disabled={toggle.isPending}
+          disabled={readOnly || toggle.isPending}
           title={switchTitle(cred, language)}
           aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
         />
@@ -1059,6 +1061,7 @@ function MobileCredentialRow({
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const fablePool = fablePoolWindow(quota)
   const { toggle } = actions
+  const readOnly = useReadOnly()
   const slot = (icon: ReactNode, count: number, limit: number, label: string) => (
     <span className="inline-flex items-center gap-1 tabular-nums" aria-label={label}>
       {icon}
@@ -1127,7 +1130,7 @@ function MobileCredentialRow({
               <Switch
                 checked={!cred.disabled}
                 onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-                disabled={toggle.isPending}
+                disabled={readOnly || toggle.isPending}
                 aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
               />
             </div>

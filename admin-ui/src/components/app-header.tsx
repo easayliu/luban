@@ -9,6 +9,7 @@ import {
   SunIcon,
 } from 'lucide-react'
 import { LogoMark } from '@/components/logo-mark'
+import { Badge } from '@/components/ui/badge'
 import { buttonVariants } from '@/components/ui/button'
 import {
   Menu,
@@ -18,6 +19,7 @@ import {
   MenuTrigger,
 } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
+import { useReadOnly } from '@/lib/role'
 import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/lib/theme'
 
 /**
@@ -45,6 +47,7 @@ export function AppHeader({
   onNavigateHome?: () => void
 }) {
   const { t } = useI18n()
+  const readOnly = useReadOnly()
   const label = homeLabel ?? t('返回账号池', 'Back to the account pool')
   const brand = (
     <>
@@ -54,10 +57,21 @@ export function AppHeader({
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight">Luban</span>
     </>
   )
+  // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。
+  const readOnlyBadge = readOnly && (
+    <Badge
+      className="shrink-0"
+      title={t('访客身份登录，只能查看，不能修改', 'Signed in as a viewer: you can look but not change anything')}
+      variant="warning"
+    >
+      {t('只读', 'Read-only')}
+    </Badge>
+  )
 
   return (
     <header className="app-header sticky top-0 z-20 border-b bg-background">
       <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
+        <div className="flex min-w-0 items-center gap-2">
         {onNavigateHome ? (
           <button
             aria-label={label}
@@ -71,6 +85,8 @@ export function AppHeader({
         ) : (
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">{brand}</div>
         )}
+        {readOnlyBadge}
+        </div>
         {actions && <div className="flex items-center gap-2">{actions}</div>}
       </div>
     </header>
