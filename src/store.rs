@@ -21,19 +21,25 @@ const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, pr
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
-    /// 后台统计专用的**只读**连接（同一个库文件，WAL 下读不挡写），见 [`Self::read_conn`]。
+    /// 后台统计专用的**只读**连接池（同一个库文件，WAL 下读不挡写），见 [`Self::read_conn`]。
     ///
     /// 控制台的聚合查询（额度快照、趋势、流水翻页等）要扫几十万行流水，一次几十到几百毫秒。
     /// 它们以前和转发路径共用 `conn`，持锁期间所有选号、落流水都排在后面，而等锁的正是
     /// tokio 工作线程——整个运行时的 SSE 会跟着一起停。拆成两把锁后转发路径不再等它们。
     ///
-    /// 内存库（测试）开不出第二条连接去读同一份数据，此时为 `None`，读退回 `conn`。
+    /// 不止一条：概览页同时在拉账号列表（30s）、实时指标（10s）、24h/7d 两组趋势，只有一条
+    /// 只读连接时它们互相排队，账号列表要等前面那几条 7 天扫描跑完才轮到。WAL 下多条读连接
+    /// 各读各的快照、真正并行，条数见 [`READER_POOL_SIZE`]。
     ///
-    /// **必须声明在 `conn` 之前**：字段按声明顺序析构，它得先关。主连接关闭时若只读连接还
+    /// 内存库（测试）开不出第二条连接去读同一份数据，此时为空，读退回 `conn`。
+    ///
+    /// **必须声明在 `conn` 之前**：字段按声明顺序析构，它们得先关。主连接关闭时若只读连接还
     /// 开着，主连接就不是最后一条，SQLite 会跳过关库时的 checkpoint；只读连接自己又做不了
     /// checkpoint，于是优雅退出后 `-wal` 留在磁盘上、最近的写入没回写进 `.db`——只拷
     /// `luban.db` 做备份或迁移的人会漏掉这一段。
-    reader: Option<Mutex<Connection>>,
+    readers: Vec<Mutex<Connection>>,
+    /// 只读连接全忙时下一个去排队的下标，轮着排，别都挤在第一条上。
+    next_reader: std::sync::atomic::AtomicUsize,
     conn: Mutex<Connection>,
     /// 每凭证一把刷新锁，串行化 token 刷新，见 [`valid_access_token_for_device`]。
     /// 上游刷新会**轮换 refresh_token**：并发刷新时后完成的那次会把已被作废的 token 写回库，
@@ -815,14 +821,23 @@ impl CredentialStore {
         conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         init_schema(&conn)?;
         let mut store = Self::with_conn(conn);
-        // schema 已由主连接建好，只读连接不做迁移。开不出来不影响服务：后台读退回主连接，
-        // 只是回到拆分之前的性能。
-        match open_reader(path) {
-            Ok(reader) => store.reader = Some(Mutex::new(reader)),
-            Err(e) => tracing::warn!(
-                error = %format!("{e:#}"),
-                "failed to open the read-only database connection; admin queries share the main one"
-            ),
+        // schema 已由主连接建好，只读连接不做迁移。开不出来不影响服务：少几条就少几条并行，
+        // 一条都没有时后台读退回主连接，只是回到拆分之前的性能。
+        for _ in 0..READER_POOL_SIZE {
+            match open_reader(path) {
+                Ok(reader) => store.readers.push(Mutex::new(reader)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        opened = store.readers.len(),
+                        "failed to open a read-only database connection"
+                    );
+                    break;
+                }
+            }
+        }
+        if store.readers.is_empty() {
+            tracing::warn!("no read-only database connection; admin queries share the main one");
         }
         Ok(store)
     }
@@ -845,7 +860,8 @@ impl CredentialStore {
         let settings = load_settings(&conn).unwrap_or_default();
         Self {
             conn: Mutex::new(conn),
-            reader: None,
+            readers: Vec::new(),
+            next_reader: std::sync::atomic::AtomicUsize::new(0),
             refresh_locks: Mutex::new(HashMap::new()),
             bare_rate: RateWindow::default(),
             rpm_rate: RateWindow::default(),
@@ -861,8 +877,17 @@ impl CredentialStore {
     /// **只给纯读、且只由管理接口调用的方法用**：连接以只读方式打开，写语句会直接报错；
     /// 转发路径也不该用它——它可能正被一条几百毫秒的聚合查询占着。调用方（web 的 handler）
     /// 要放在 `spawn_blocking` 里跑，等这把锁同样不能占 tokio 工作线程。
+    ///
+    /// 先挑一条空闲的；全忙才排队，排哪条轮着来。
     fn read_conn(&self) -> parking_lot::MutexGuard<'_, Connection> {
-        self.reader.as_ref().unwrap_or(&self.conn).lock()
+        if self.readers.is_empty() {
+            return self.conn.lock();
+        }
+        if let Some(guard) = self.readers.iter().find_map(|r| r.try_lock()) {
+            return guard;
+        }
+        let i = self.next_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.readers[i % self.readers.len()].lock()
     }
 
     /// 取该凭证的刷新锁（不存在则创建）。
@@ -4338,6 +4363,67 @@ pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// RPM（每分钟请求数）的统计窗口：最近 60 秒。
 pub const RPM_WINDOW_SECS: i64 = 60;
 
+/// 额度快照 + 窗口统计的那条 SQL，见 [`CredentialStore::quota_snapshots`]。拎成常量是为了让
+/// 测试能对它跑 EXPLAIN QUERY PLAN，钉住「流水那一侧只走覆盖索引、不回表」。
+const QUOTA_SNAPSHOTS_SQL: &str = "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
+            s.rl_5h_utilization, s.rl_5h_reset,
+            s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative, s.overage_in_use,
+            s.windows,
+            CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
+            END,
+            CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN u.cost_usd END), 0)
+            END,
+            CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN 1 ELSE 0 END)
+            END,
+            CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN 1 ELSE 0 END)
+            END,
+            -- 窗口内的总 token（口径见 QuotaSnapshot::tokens_5h）。四项逐个 COALESCE 成 0
+            -- 再相加：没嗅探到 usage 的那些行（4xx/429）各列都是 NULL，而 NULL + x 在
+            -- SQLite 里是 NULL，会把整条流水的 token 抹掉。
+            -- 缓存写取合计列，它为空时退回 5m/1h 两档之和——同 crate::pricing 的兜底。
+            CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
+                COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1
+                    THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
+                       + COALESCE(u.cache_creation_tokens,
+                                  COALESCE(u.cache_5m_tokens, 0)
+                                + COALESCE(u.cache_1h_tokens, 0))
+                       + COALESCE(u.cache_read_tokens, 0)
+                END), 0)
+            END,
+            CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
+                COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2
+                    THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
+                       + COALESCE(u.cache_creation_tokens,
+                                  COALESCE(u.cache_5m_tokens, 0)
+                                + COALESCE(u.cache_1h_tokens, 0))
+                       + COALESCE(u.cache_read_tokens, 0)
+                END), 0)
+            END
+       FROM credential_stats s
+       LEFT JOIN usage_logs u
+              ON u.cred_id = s.cred_id
+             -- 只连**可能落进某个窗口**的流水。没有这个下界，索引
+             -- idx_usage_logs_cred_usage 只能按 cred_id 定位，然后把该账号 30 天
+             -- （保留期）的全部流水逐行走一遍、靠上面的 CASE 过滤——而窗口最长才 7 天。
+             -- 账号列表每次刷新都要跑一遍这条 SQL。
+             -- 下界引用外层的 s，故 SQLite 能把它压成 (cred_id=? AND ts>=?) 的范围扫描；
+             -- 上面读的 u.* 列都在那条索引里，整段扫描不回表（见 init_schema 的注）。
+             --
+             -- 取两个窗口起点里更早的那个。COALESCE 的第二个参数是给「只有一个窗口
+             -- 有 reset」准备的：min(NULL, x) 在 SQLite 里是 NULL，会把条件变成假、
+             -- 一行都连不上，那就把窗口费用算成 0 了。两个都没有时退化为 0（无下界），
+             -- 此时两个 CASE 本来就恒为 NULL，多连的行不影响结果。
+             AND u.ts >= MIN(
+                   COALESCE(s.rl_5h_reset - ?1, s.rl_7d_reset - ?2, 0),
+                   COALESCE(s.rl_7d_reset - ?2, s.rl_5h_reset - ?1, 0))
+      WHERE s.snapshot_ts IS NOT NULL
+        AND (?3 IS NULL OR s.cred_id = ?3)
+      GROUP BY s.cred_id";
+
 impl CredentialStore {
     /// 每个凭证「最新一条带限流信息」的额度快照（cred_id → 快照），
     /// 并附带当前 5h / 7d 窗口内的累计费用与请求数。
@@ -4358,65 +4444,7 @@ impl CredentialStore {
     /// 多一点，流水的保留期（见 [`Self::prune_usage_logs`]）覆盖它绰绰有余。
     fn quota_snapshots(&self, only: Option<i64>) -> Result<HashMap<i64, QuotaSnapshot>> {
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(
-            "SELECT s.cred_id, s.snapshot_ts, s.unified_status,
-                    s.rl_5h_utilization, s.rl_5h_reset,
-                    s.rl_7d_utilization, s.rl_7d_reset, s.rl_representative, s.overage_in_use,
-                    s.windows,
-                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN u.cost_usd END), 0)
-                    END,
-                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN u.cost_usd END), 0)
-                    END,
-                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
-                        SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1 THEN 1 ELSE 0 END)
-                    END,
-                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
-                        SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2 THEN 1 ELSE 0 END)
-                    END,
-                    -- 窗口内的总 token（口径见 QuotaSnapshot::tokens_5h）。四项逐个 COALESCE 成 0
-                    -- 再相加：没嗅探到 usage 的那些行（4xx/429）各列都是 NULL，而 NULL + x 在
-                    -- SQLite 里是 NULL，会把整条流水的 token 抹掉。
-                    -- 缓存写取合计列，它为空时退回 5m/1h 两档之和——同 crate::pricing 的兜底。
-                    CASE WHEN s.rl_5h_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_5h_reset - ?1
-                            THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
-                               + COALESCE(u.cache_creation_tokens,
-                                          COALESCE(u.cache_5m_tokens, 0)
-                                        + COALESCE(u.cache_1h_tokens, 0))
-                               + COALESCE(u.cache_read_tokens, 0)
-                        END), 0)
-                    END,
-                    CASE WHEN s.rl_7d_reset IS NULL THEN NULL ELSE
-                        COALESCE(SUM(CASE WHEN u.ts >= s.rl_7d_reset - ?2
-                            THEN COALESCE(u.input_tokens, 0) + COALESCE(u.output_tokens, 0)
-                               + COALESCE(u.cache_creation_tokens,
-                                          COALESCE(u.cache_5m_tokens, 0)
-                                        + COALESCE(u.cache_1h_tokens, 0))
-                               + COALESCE(u.cache_read_tokens, 0)
-                        END), 0)
-                    END
-               FROM credential_stats s
-               LEFT JOIN usage_logs u
-                      ON u.cred_id = s.cred_id
-                     -- 只连**可能落进某个窗口**的流水。没有这个下界，索引
-                     -- idx_usage_logs_cred_ts 只能按 cred_id 定位，然后把该账号 30 天
-                     -- （保留期）的全部流水逐行走一遍、靠上面的 CASE 过滤——而窗口最长才 7 天。
-                     -- 账号列表每次刷新都要跑一遍这条 SQL，且全程持着那把全局 conn 锁。
-                     -- 下界引用外层的 s，故 SQLite 能把它压成 (cred_id=? AND ts>=?) 的范围扫描。
-                     --
-                     -- 取两个窗口起点里更早的那个。COALESCE 的第二个参数是给「只有一个窗口
-                     -- 有 reset」准备的：min(NULL, x) 在 SQLite 里是 NULL，会把条件变成假、
-                     -- 一行都连不上，那就把窗口费用算成 0 了。两个都没有时退化为 0（无下界），
-                     -- 此时两个 CASE 本来就恒为 NULL，多连的行不影响结果。
-                     AND u.ts >= MIN(
-                           COALESCE(s.rl_5h_reset - ?1, s.rl_7d_reset - ?2, 0),
-                           COALESCE(s.rl_7d_reset - ?2, s.rl_5h_reset - ?1, 0))
-              WHERE s.snapshot_ts IS NOT NULL
-                AND (?3 IS NULL OR s.cred_id = ?3)
-              GROUP BY s.cred_id",
-        )?;
+        let mut stmt = conn.prepare(QUOTA_SNAPSHOTS_SQL)?;
         // LEFT JOIN：快照在账本里长存，而窗口内的流水可能已被裁剪清空（此时窗口统计为 0，
         // 语义正确——窗口比保留期短，裁掉的必然是窗口外的行；真正空窗口就该是 0）。
         let rows = stmt.query_map(params![WINDOW_5H_SECS, WINDOW_7D_SECS, only], |r| {
@@ -4500,7 +4528,7 @@ impl CredentialStore {
     /// 单个凭证当前的 RPM；口径同 [`Self::recent_rpm`]，无请求时为 0。
     pub fn recent_rpm_of(&self, cred_id: i64) -> Result<i64> {
         let conn = self.read_conn();
-        // 这条走 idx_usage_logs_cred_ts，直接定位到 (cred_id, 最近 60 秒) 那一小段。
+        // 这条走 idx_usage_logs_cred_usage 的 (cred_id, ts) 前缀，直接定位到该号最近 60 秒那一小段。
         let n = conn.query_row(
             "SELECT COUNT(*) FROM usage_logs WHERE cred_id = ?1 AND ts >= unixepoch() - ?2",
             params![cred_id, RPM_WINDOW_SECS],
@@ -4977,7 +5005,7 @@ impl CredentialStore {
 
     /// 单个账号 `since` 起的用量统计：按时间分桶（桶宽与时区偏移同 [`Self::ttft_report`]）、
     /// 整个窗口的合计，以及按模型 / 设备 / 来访客户端 / 状态码四个维度拆开的分组（各自按请求数
-    /// 降序、最多 `group_limit` 组）。一次扫描把这几路都汇总出来——走 `idx_usage_logs_cred_ts`
+    /// 降序、最多 `group_limit` 组）。一次扫描把这几路都汇总出来——走 `idx_usage_logs_cred_usage` 的前缀
     /// 卡住账号与起点，量级是单号 30 天的流水，在 Rust 里聚合比拼五条 GROUP BY 省一半扫描。
     pub fn credential_stats(
         &self,
@@ -5590,7 +5618,11 @@ fn active_counts_sql(table: &str, ttl_secs: i64) -> String {
     }
 }
 
-/// 打开后台统计用的只读连接，见 [`CredentialStore::reader`]。
+/// 后台统计只读连接的条数，见 [`CredentialStore::readers`]。控制台同一时刻在跑的重查询也就
+/// 三四条（账号列表、实时指标、两组趋势）；再多只是多占几份页缓存和文件句柄。
+const READER_POOL_SIZE: usize = 3;
+
+/// 打开后台统计用的只读连接，见 [`CredentialStore::readers`]。
 ///
 /// `SQLITE_OPEN_READ_ONLY`：误把写语句挂到这条连接上会当场报错，而不是悄悄绕开主连接的
 /// 串行化。WAL 模式由主连接设在库文件上，这里不用（也不能）再设；busy_timeout 与主连接
@@ -5720,10 +5752,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             sse_aggregated     INTEGER NOT NULL DEFAULT 0 CHECK (sse_aggregated IN (0,1))
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_usage_logs_ts   ON usage_logs(ts);
-        -- 账号列表的每一项统计（最近使用 MAX(ts)、累计费用、额度窗口内费用）都是
-        -- 「按 cred_id 分组、按 ts 卡窗口」。带上 ts 后这些聚合只扫索引，不必回表逐行看时间；
-        -- 旧的单列 idx_usage_logs_cred 是它的前缀，留着只是白占写入开销，随迁移删掉。
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_ts ON usage_logs(cred_id, ts);
+        -- 按 cred_id 分组、按 ts 卡窗口的那条索引（idx_usage_logs_cred_usage）引用的费用 /
+        -- token 列在老库上是后补的，建在补列之后，见下面的迁移。旧的单列 idx_usage_logs_cred
+        -- 是它的前缀，留着只是白占写入开销，随迁移删掉。
         DROP INDEX IF EXISTS idx_usage_logs_cred;
         -- 设备明细要按 device_id 汇总费用（含跨账号合计）；日志表只会越攒越多，
         -- 没这条索引时展开一次卡片就是一次全表扫描。
@@ -5951,7 +5982,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     //   走、不回表（日志行很宽，回表才是大头）；失败行与没记 TTFT 的行不进索引，写入开销只
     //   落在成功请求上。
     // - 缓存趋势按 ts 扫全部行、只读五个 token 列，同样做成覆盖索引。
-    // 这两条引用的列（ttft_ms / total_ms / output_tokens / cache_*）在老库上是上面补出来的，
+    // - 账号列表每次刷新都要按号聚合额度窗口（最长 7 天多）内的费用、条数与 token，见
+    //   QUOTA_SNAPSHOTS_SQL：(cred_id, ts) 后面带上它读的那几列，整段范围扫描不回表。40 个号、
+    //   7 天 40 万条流水的规模下，回表那版要读 GB 级的宽行，覆盖之后约快 10 倍。它的
+    //   (cred_id, ts) 前缀照样服务按号按时间卡窗口的其它查询，原来那条 idx_usage_logs_cred_ts
+    //   就是多余的写入开销，随之删掉。
+    // 这几条引用的列（ttft_ms / total_ms / output_tokens / cache_*）在老库上是上面补出来的，
     // 放进建表那批会在老库上报「no such column」。
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_id ON usage_logs(cred_id, id);
@@ -5967,7 +6003,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
              WHERE status = 200 AND ttft_ms IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_usage_logs_cache
              ON usage_logs(ts, input_tokens, cache_creation_tokens, cache_5m_tokens,
-                           cache_1h_tokens, cache_read_tokens);",
+                           cache_1h_tokens, cache_read_tokens);
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_usage
+             ON usage_logs(cred_id, ts, cost_usd, input_tokens, output_tokens,
+                           cache_creation_tokens, cache_5m_tokens, cache_1h_tokens,
+                           cache_read_tokens);
+         DROP INDEX IF EXISTS idx_usage_logs_cred_ts;",
     )?;
     // ban_events 的出站设备两列是随 device_id_out 一起加的：先建过表的库幂等补上。
     let _ = conn
@@ -10815,7 +10856,13 @@ mod tests {
         }
 
         let store = CredentialStore::open_at(&path).unwrap();
-        assert!(store.reader.is_some(), "文件库应开出独立的只读连接");
+        assert_eq!(store.readers.len(), READER_POOL_SIZE, "文件库应开出独立的只读连接池");
+        {
+            // 一条只读连接被长查询占着时，下一条后台读拿另一条，不排队。parking_lot 的锁
+            // 不可重入：池子退化成一条的话，这里会直接卡死而不是悄悄通过。
+            let _busy = store.read_conn();
+            let _other = store.read_conn();
+        }
         let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
         store
             .conn
@@ -11716,13 +11763,14 @@ mod tests {
         assert!(f.opus_refusal_fallback, "opus 显式开才开");
     }
 
-    /// 旧库上的单列 idx_usage_logs_cred 会被换成 (cred_id, ts) 复合索引：前缀相同，
-    /// 两条并存只是多一份写入开销。
+    /// 旧库上的单列 idx_usage_logs_cred、(cred_id, ts) 两条都会被换成以 (cred_id, ts) 开头的
+    /// 覆盖索引：前缀相同，并存只是多一份写入开销。
     #[test]
     fn migration_replaces_cred_index_with_composite() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         conn.execute("CREATE INDEX idx_usage_logs_cred ON usage_logs(cred_id)", []).unwrap();
+        conn.execute("CREATE INDEX idx_usage_logs_cred_ts ON usage_logs(cred_id, ts)", []).unwrap();
         init_schema(&conn).unwrap();
 
         let names: Vec<String> = conn
@@ -11734,8 +11782,36 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert!(names.iter().any(|n| n == "idx_usage_logs_cred_ts"), "复合索引应建好: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "idx_usage_logs_cred_usage"),
+            "覆盖索引应建好: {names:?}"
+        );
         assert!(!names.iter().any(|n| n == "idx_usage_logs_cred"), "旧单列索引应删掉: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "idx_usage_logs_cred_ts"),
+            "旧复合索引应删掉: {names:?}"
+        );
+    }
+
+    /// 账号列表的额度窗口聚合：流水那一侧要按 (cred_id, ts) 范围扫、且只走覆盖索引。日志行
+    /// 很宽，回表是这条 SQL 在线上的大头（40 个号、7 天 40 万条流水时近 1 秒，覆盖后 0.08 秒）。
+    #[test]
+    fn quota_snapshots_sql_uses_covering_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {QUOTA_SNAPSHOTS_SQL}")).unwrap();
+        let plan = stmt
+            .query_map(params![WINDOW_5H_SECS, WINDOW_7D_SECS, None::<i64>], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("COVERING INDEX idx_usage_logs_cred_usage (cred_id=? AND ts>?)"),
+            "额度窗口要走覆盖索引的范围扫描: {plan}"
+        );
     }
 
     /// 迁移是幂等的：对已是 AUTOINCREMENT 的库再次 init_schema 不改动、不报错。
