@@ -3420,6 +3420,106 @@ struct Pending {
     export_at: Option<DateTime<Utc>>,
 }
 
+/// `process` 前半段推出来、后半段拼事件与入队要用的那些量，与原先的局部变量一一对应。
+struct TurnFacts {
+    device_id: String,
+    session_id: String,
+    account_uuid: String,
+    version: String,
+    now: Instant,
+    continued_from: Option<(String, SystemTime)>,
+    cleared_from: Option<String>,
+    cleared_prev: Option<(Option<String>, Option<SystemTime>, SystemTime, usize)>,
+    identity: Identity,
+    base_identity: Identity,
+    kind: Kind,
+    has_1m: bool,
+    display_model: String,
+    resp_model: String,
+    key: (i64, String),
+    is_new_session: bool,
+    resumed: bool,
+    continued: bool,
+    device_key: (i64, String),
+    git_outcome: &'static str,
+    turn_over: bool,
+    failed: bool,
+    aborted: bool,
+    emit_first_turn: bool,
+    is_main: bool,
+    new_prompt: bool,
+    turn_skill: Option<String>,
+    post_compaction: bool,
+    turn_origin: String,
+    prev_turn: (String, u32, Option<SystemTime>),
+    rejected_calls: Vec<(ToolCall, ToolResultInfo)>,
+    user_turn: bool,
+    notification_base: u32,
+    notifications: Vec<usize>,
+    prev_main_end: Option<SystemTime>,
+    prompt_id: String,
+    agent: Option<AgentView>,
+    previous_request_id: Option<String>,
+    prev_main_message_id: Option<String>,
+    prev_main_request_id: Option<String>,
+    prev_main_depth: u32,
+    prev_end: Option<SystemTime>,
+    time_since_last: Option<u64>,
+    message_tokens: i64,
+    default_model: String,
+    device_default_update: Option<String>,
+    model_changed: bool,
+    previous_message_id: Option<String>,
+    tools_changed: bool,
+    counted: bool,
+    started_wall: SystemTime,
+    main_chain: String,
+    chain_id: String,
+    query_depth: u32,
+    turn_started: DateTime<Utc>,
+    first_text_in_turn: bool,
+    first_text_interrupted: bool,
+    tool_calls_before: u32,
+    user_secs: f64,
+    shell_snapshot_first: bool,
+    prompt_index: u32,
+    prompt_seq: u32,
+    v270: bool,
+    v277: bool,
+    v280: bool,
+    v285: bool,
+    injected: bool,
+    first_prompt_tpl: bool,
+    background: std::ops::Range<usize>,
+    first_main: bool,
+    snapshot: Option<(&'static str, String)>,
+    sleepy: bool,
+    tether: Option<Tether>,
+    usage_before: [i64; 4],
+    ignored_suggestion: Option<(String, SystemTime, usize)>,
+    interrupted_message_id: Option<String>,
+    handback: Option<ToolCall>,
+    agent_done: Option<AgentState>,
+    ctx_model: String,
+    dd_model: String,
+    sess_turn_tools: u32,
+    sess_turn_api_calls: u32,
+    sess_turn_api_ms: i64,
+    session_cwd: Option<String>,
+    betas_full: String,
+    betas_own: String,
+    thread_step: Option<u32>,
+    betas_session: String,
+}
+
+/// [`Telemetry::build_events`] 的产出。
+struct BuiltEvents {
+    events: Vec<(DateTime<Utc>, Value)>,
+    dd: Vec<Value>,
+    /// `--continue` 接上旧会话时，挂在启动探测那个临时会话上的那一串。
+    probe_side: Option<(Identity, TplOutput)>,
+}
+
 impl Pending {
     /// 追加一串事件与 Datadog 条目，两路各记下最早攒进来的时刻。
     fn push_batch(&mut self, (events, dd): TplOutput, now: Instant) {
@@ -4476,18 +4576,6 @@ impl Telemetry {
         let sess_turn_tools = sess.turn_tool_calls;
         let (sess_turn_api_calls, sess_turn_api_ms) = (sess.turn_api_calls, sess.turn_api_ms);
         let session_cwd = sess.cwd.clone();
-
-        // ---- 事件链 ----
-        let t0: DateTime<Utc> = call.started_at.into();
-        let ms = |dt: DateTime<Utc>, d: i64| dt + chrono::Duration::milliseconds(d);
-        let ttft = call.ttft_ms.unwrap_or(call.total_ms.min(1_500)) as i64;
-        let total = call.total_ms as i64;
-        let t_first = ms(t0, ttft);
-        let t_end = ms(t0, total);
-        let uptime = |dt: DateTime<Utc>| -> f64 {
-            let start: DateTime<Utc> = started_wall.into();
-            ((dt - start).num_milliseconds().max(0) as f64) / 1000.0
-        };
         let betas_full = call.betas.clone().unwrap_or_default();
         let betas_own = session_betas(&betas_full);
         // 子代理支线上的事件顶层 `betas` 报**主线程**那份，只有它自己的 `api_query` /
@@ -4512,10 +4600,305 @@ impl Telemetry {
         } else {
             betas_own.clone()
         };
+
+        let facts = TurnFacts {
+            device_id,
+            session_id,
+            account_uuid,
+            version,
+            now,
+            continued_from,
+            cleared_from,
+            cleared_prev,
+            identity,
+            base_identity,
+            kind,
+            has_1m,
+            display_model,
+            resp_model,
+            key,
+            is_new_session,
+            resumed,
+            continued,
+            device_key,
+            git_outcome,
+            turn_over,
+            failed,
+            aborted,
+            emit_first_turn,
+            is_main,
+            new_prompt,
+            turn_skill,
+            post_compaction,
+            turn_origin,
+            prev_turn,
+            rejected_calls,
+            user_turn,
+            notification_base,
+            notifications,
+            prev_main_end,
+            prompt_id,
+            agent,
+            previous_request_id,
+            prev_main_message_id,
+            prev_main_request_id,
+            prev_main_depth,
+            prev_end,
+            time_since_last,
+            message_tokens,
+            default_model,
+            device_default_update,
+            model_changed,
+            previous_message_id,
+            tools_changed,
+            counted,
+            started_wall,
+            main_chain,
+            chain_id,
+            query_depth,
+            turn_started,
+            first_text_in_turn,
+            first_text_interrupted,
+            tool_calls_before,
+            user_secs,
+            shell_snapshot_first,
+            prompt_index,
+            prompt_seq,
+            v270,
+            v277,
+            v280,
+            v285,
+            injected,
+            first_prompt_tpl,
+            background,
+            first_main,
+            snapshot,
+            sleepy,
+            tether,
+            usage_before,
+            ignored_suggestion,
+            interrupted_message_id,
+            handback,
+            agent_done,
+            ctx_model,
+            dd_model,
+            sess_turn_tools,
+            sess_turn_api_calls,
+            sess_turn_api_ms,
+            session_cwd,
+            betas_full,
+            betas_own,
+            thread_step,
+            betas_session,
+        };
+        let BuiltEvents { events, dd, probe_side } =
+            Self::build_events(&call, &shape, &facts, &mut file_sizes);
+        let TurnFacts {
+            device_id,
+            session_id,
+            account_uuid,
+            version,
+            now,
+            identity,
+            base_identity,
+            kind,
+            display_model,
+            key,
+            is_new_session,
+            resumed,
+            continued,
+            device_key,
+            turn_over,
+            failed,
+            aborted,
+            is_main,
+            prompt_id,
+            device_default_update,
+            counted,
+            started_wall,
+            user_secs,
+            v285,
+            betas_session,
+            ..
+        } = facts;
+
+        // 启动握手**不在这里排队**。这里是回程（`ReqLog` 收尾之后），排在这儿等于让上游
+        // 先看到一条 messages、几秒后才看到这个「会话」的启动流量——顺序整个反了。
+        // 现在由转发路径在**首条请求发出之前**直接开跑，见
+        // [`crate::proxy::spawn_session_handshake`]；那里还能分辨模拟与真实 CC，后者自己
+        // 会打这一串，luban 不该重复。
+        let _ = is_new_session;
+
+        if let Some(m) = device_default_update {
+            st.device_default_model.insert(device_key, (m, now));
+        }
+        if let Some((probe_identity, out)) = probe_side {
+            let p =
+                st.pending.entry((call.cred_id, probe_identity.session_id.clone())).or_default();
+            p.version = version.clone();
+            p.subscription_type = probe_identity.subscription_type.clone();
+            p.model = display_model.clone();
+            p.betas = betas_session.clone();
+            p.identity = Some(probe_identity);
+            p.push_batch(out, now);
+        }
+        if let Some(sess) = st.sessions.get_mut(&key) {
+            sess.file_sizes = file_sizes;
+        }
+
+        // ---- 入队 ----
+        let pending = st.pending.entry((call.cred_id, session_id.clone())).or_default();
+        pending.version = version;
+        pending.subscription_type = identity.subscription_type.clone();
+        if let Some(vcs) = identity.vcs {
+            pending.backfill_vcs(vcs);
+        }
+        pending.identity = Some(base_identity.clone());
+        // **模型 / beta / prompt_id 只跟主线程走**（第一条就是侧查询时先占个位）。
+        //
+        // 这三项是导出指标时那条 `tengu_feature_ok{internal_metrics_export}` 的上下文，
+        // 代表的是「这个会话」。被一条标题生成（haiku + structured-outputs、且没有
+        // `cc_prompt_id`）覆盖之后，导出事件报的就成了 haiku 与标题那套 beta——而同一批
+        // 指标里的 `model` 属性仍是会话主模型，自相矛盾。
+        if is_main || pending.model.is_empty() {
+            pending.model = display_model.clone();
+            pending.betas = betas_session.clone();
+            pending.prompt_id = prompt_id.clone();
+        }
+        pending.started_wall = Some(started_wall);
+        pending.push_batch((events, dd), now);
+        pending.metrics_since.get_or_insert(now);
+        pending.metrics.push(CallMetric {
+            session_id,
+            device_id,
+            account_uuid,
+            model: display_model,
+            category: kind.category(),
+            effort: shape.effort.clone(),
+            agent_name: (v285 && kind == Kind::Subagent)
+                .then(|| call.agent.agent_type.clone())
+                .flatten()
+                .filter(|t| !t.is_empty()),
+            cost: call.cost_usd.unwrap_or(0.0),
+            input: call.input_tokens,
+            output: call.output_tokens,
+            cache_read: call.cache_read_tokens,
+            cache_creation: call.cache_creation_tokens,
+            cli_secs: if is_main && turn_over { call.total_ms as f64 / 1000.0 } else { 0.0 },
+            user_secs,
+            new_session: is_new_session && !counted,
+            resumed: resumed || continued,
+            continued,
+            usage: !failed && !aborted,
+        });
+
+        // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去。
+        if is_main {
+            Self::replay_deferred(st, &key);
+        }
+    }
+
+    /// 拼这条调用的事件链：只读 [`TurnFacts`]，不碰会话状态。
+    fn build_events(
+        call: &ApiCall,
+        shape: &RequestShape,
+        f: &TurnFacts,
+        file_sizes: &mut HashMap<String, usize>,
+    ) -> BuiltEvents {
+        let version = &f.version;
+        let continued_from = &f.continued_from;
+        let cleared_from = &f.cleared_from;
+        let cleared_prev = &f.cleared_prev;
+        let identity = &f.identity;
+        let base_identity = &f.base_identity;
+        let kind = f.kind;
+        let has_1m = f.has_1m;
+        let display_model = &f.display_model;
+        let resp_model = &f.resp_model;
+        let is_new_session = f.is_new_session;
+        let resumed = f.resumed;
+        let git_outcome = f.git_outcome;
+        let turn_over = f.turn_over;
+        let failed = f.failed;
+        let aborted = f.aborted;
+        let emit_first_turn = f.emit_first_turn;
+        let is_main = f.is_main;
+        let new_prompt = f.new_prompt;
+        let turn_skill = &f.turn_skill;
+        let post_compaction = f.post_compaction;
+        let turn_origin = &f.turn_origin;
+        let prev_turn = &f.prev_turn;
+        let rejected_calls = &f.rejected_calls;
+        let user_turn = f.user_turn;
+        let notification_base = f.notification_base;
+        let notifications = &f.notifications;
+        let prev_main_end = f.prev_main_end;
+        let prompt_id = &f.prompt_id;
+        let agent = &f.agent;
+        let previous_request_id = &f.previous_request_id;
+        let prev_main_message_id = &f.prev_main_message_id;
+        let prev_main_request_id = &f.prev_main_request_id;
+        let prev_main_depth = f.prev_main_depth;
+        let prev_end = f.prev_end;
+        let time_since_last = f.time_since_last;
+        let message_tokens = f.message_tokens;
+        let default_model = &f.default_model;
+        let model_changed = f.model_changed;
+        let previous_message_id = &f.previous_message_id;
+        let tools_changed = f.tools_changed;
+        let started_wall = f.started_wall;
+        let main_chain = &f.main_chain;
+        let chain_id = &f.chain_id;
+        let query_depth = f.query_depth;
+        let turn_started = f.turn_started;
+        let first_text_in_turn = f.first_text_in_turn;
+        let first_text_interrupted = f.first_text_interrupted;
+        let tool_calls_before = f.tool_calls_before;
+        let shell_snapshot_first = f.shell_snapshot_first;
+        let prompt_index = f.prompt_index;
+        let prompt_seq = f.prompt_seq;
+        let v270 = f.v270;
+        let v277 = f.v277;
+        let v280 = f.v280;
+        let v285 = f.v285;
+        let injected = f.injected;
+        let first_prompt_tpl = f.first_prompt_tpl;
+        let background = &f.background;
+        let first_main = f.first_main;
+        let snapshot = &f.snapshot;
+        let sleepy = f.sleepy;
+        let tether = &f.tether;
+        let usage_before = f.usage_before;
+        let ignored_suggestion = &f.ignored_suggestion;
+        let interrupted_message_id = &f.interrupted_message_id;
+        let handback = &f.handback;
+        let agent_done = &f.agent_done;
+        let ctx_model = &f.ctx_model;
+        let dd_model = &f.dd_model;
+        let sess_turn_tools = f.sess_turn_tools;
+        let sess_turn_api_calls = f.sess_turn_api_calls;
+        let sess_turn_api_ms = f.sess_turn_api_ms;
+        let session_cwd = &f.session_cwd;
+        let betas_full = &f.betas_full;
+        let betas_own = &f.betas_own;
+        let thread_step = f.thread_step;
+        let betas_session = &f.betas_session;
+
+        // ---- 事件链 ----
+        let t0: DateTime<Utc> = call.started_at.into();
+        let ms = |dt: DateTime<Utc>, d: i64| dt + chrono::Duration::milliseconds(d);
+        let ttft = call.ttft_ms.unwrap_or(call.total_ms.min(1_500)) as i64;
+        let total = call.total_ms as i64;
+        let t_first = ms(t0, ttft);
+        let t_end = ms(t0, total);
+        let uptime = |dt: DateTime<Utc>| -> f64 {
+            let start: DateTime<Utc> = started_wall.into();
+            ((dt - start).num_milliseconds().max(0) as f64) / 1000.0
+        };
         let ctx = |dt: DateTime<Utc>| EventCtx {
-            model: &ctx_model,
-            betas: &betas_session,
-            prompt_id: &prompt_id,
+            model: ctx_model,
+            betas: betas_session,
+            prompt_id,
             uptime_secs: uptime(dt),
         };
         let build_age_mins = {
@@ -4537,7 +4920,7 @@ impl Telemetry {
         let effort = shape.effort.clone();
         let effort_value = effort.clone().unwrap_or_else(|| "high".to_string());
         // 2.1.260 起 `tengu_api_success` 多了 `systemPromptSource`。
-        let modern = version_at_least(&version, "2.1.260");
+        let modern = version_at_least(version, "2.1.260");
         // 链路字段的写法：有链的带 chain/depth，没链的一律不带。
         let chain_fields = |obj: &mut Map<String, Value>| {
             if kind.has_chain() {
@@ -4578,25 +4961,25 @@ impl Telemetry {
         // 静态模板那几串攒在这里，最后再并进 `events`/`dd`（`push` 闭包还借着它们）。
         let mut tpl_events: Vec<(DateTime<Utc>, Value)> = Vec::new();
         let mut tpl_dd: Vec<Value> = Vec::new();
-        let setting = model_setting(&display_model);
+        let setting = model_setting(display_model);
         let subst = Subst {
-            version: &version,
-            model: &display_model,
+            version,
+            model: display_model,
             model_setting: &setting,
             permission_mode: shape.permission_mode,
             resumed,
             prompt_index: prompt_seq,
             deferred: shape.deferred_tools > 0,
-            tool_search: tool_search_decision(&shape, &display_model, kind.is_agent()),
+            tool_search: tool_search_decision(shape, display_model, kind.is_agent()),
             sdk: shape.sdk,
         };
         let mut take_tpl = |tpl: &[TplEvent], anchor: DateTime<Utc>| {
-            let (ev, d) = emit_template(tpl, anchor, &base_identity, ctx, &dd_model, &subst);
+            let (ev, d) = emit_template(tpl, anchor, base_identity, ctx, dd_model, &subst);
             tpl_events.extend(ev);
             tpl_dd.extend(d);
         };
         // 新会话：进程启动那串（120 多条），锚在首条 api_query 前 1.3s 起。
-        let tpl = template_for(&version, shape.sdk);
+        let tpl = template_for(version, shape.sdk);
         // 新进程 `--continue` 接上旧会话：启动那串报在进程启动时那个临时会话 id 上，随后在这个
         // 会话上报接续那三条（`cap/auto-2.1.285-20260930` 08:03:54.947，比启动探测早 250ms 上下）。
         let mut probe_side: Option<(Identity, TplOutput)> = None;
@@ -4609,7 +4992,7 @@ impl Telemetry {
                 ..base_identity.clone()
             };
             let (ev, d) =
-                emit_template(&tpl.startup, t_res, &probe_identity, ctx, &dd_model, &subst);
+                emit_template(&tpl.startup, t_res, &probe_identity, ctx, dd_model, &subst);
             probe_side = Some((probe_identity, (ev, d)));
             push(
                 t_res,
@@ -4661,7 +5044,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_feature_ok",
                     &ctx(ms(tc, off)),
-                    &dd_model,
+                    dd_model,
                     feature(name),
                 ));
             }
@@ -4687,7 +5070,7 @@ impl Telemetry {
             let t_rej = ms(shown, wait);
             let prev_req = prev_main_request_id.clone().unwrap_or_default();
             let prev_msg = prev_main_message_id.clone().unwrap_or_default();
-            for (c, _) in &rejected_calls {
+            for (c, _) in rejected_calls {
                 let bash = c.name == "Bash";
                 push(
                     shown,
@@ -4705,7 +5088,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_feature_ok",
                     &ctx(t_rej),
-                    &dd_model,
+                    dd_model,
                     feature("permission_user_deny"),
                 ));
                 push(t_rej, "tengu_permission_request_escape", json!({}));
@@ -4740,13 +5123,13 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_tool_use_rejected_in_prompt",
                     &ctx(t_rej),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&rejected),
                 ));
             }
             let t2 = ms(t_rej, 2);
             push(t2, "tengu_feature_ok", feature("turn"));
-            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), &dd_model, feature("turn")));
+            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), dd_model, feature("turn")));
             let started: DateTime<Utc> = prev_turn.2.unwrap_or(call.started_at).into();
             push(
                 t2,
@@ -4770,7 +5153,7 @@ impl Telemetry {
                     "wait_ms": 3_655
                 });
                 push(tn, "tengu_feature_ok", queued.clone());
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(tn), &dd_model, queued));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(tn), dd_model, queued));
                 let mut input = json!({
                     "is_negative": false,
                     "is_keep_going": false,
@@ -4800,17 +5183,12 @@ impl Telemetry {
                 }
                 queued["wait_ms"] = json!(6);
                 push(ms(t0, -12), "tengu_feature_ok", queued.clone());
-                dd.push(identity.dd_entry(
-                    "tengu_feature_ok",
-                    &ctx(ms(t0, -12)),
-                    &dd_model,
-                    queued,
-                ));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(ms(t0, -12)), dd_model, queued));
                 // 模板那段不套，工具搜索判定照有（`cap/2.1.285` 06:57:29.600）。
                 push(
                     ms(t0, -1),
                     "tengu_tool_search_mode_decision",
-                    tool_search_decision(&shape, &display_model, kind.is_agent()),
+                    tool_search_decision(shape, display_model, kind.is_agent()),
                 );
             } else if first_prompt_tpl {
                 take_tpl(&tpl.prompt, t0);
@@ -4896,7 +5274,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_bash_tool_command_executed",
                         &ctx(ms(t0, -6)),
-                        &dd_model,
+                        dd_model,
                         snake_flat(&meta),
                     ));
                 }
@@ -4986,7 +5364,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_auto_mode_decision",
                         &ctx(td),
-                        &dd_model,
+                        dd_model,
                         snake_flat(&decision),
                     ));
                 }
@@ -5071,7 +5449,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_tool_use_granted_in_prompt_temporary",
                             &ctx(tp),
-                            &dd_model,
+                            dd_model,
                             snake_flat(&grant),
                         ));
                     }
@@ -5079,7 +5457,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_feature_ok",
                         &ctx(tp),
-                        &dd_model,
+                        dd_model,
                         feature("permission_user_grant"),
                     ));
                     push(
@@ -5112,7 +5490,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_feature_ok",
                         &ctx(ms(tg, 1)),
-                        &dd_model,
+                        dd_model,
                         feature("permission_auto_approve_config"),
                     ));
                     push(
@@ -5145,7 +5523,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_feature_ok",
                             &ctx(ms(t_done, -40)),
-                            &dd_model,
+                            dd_model,
                             feature("shell_snapshot_create"),
                         ));
                     }
@@ -5175,7 +5553,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_bash_tool_command_failed",
                             &ctx(t_done),
-                            &dd_model,
+                            dd_model,
                             snake_flat(&bash),
                         ));
                         let sad = json!({ "feature_name": "tool_bash", "error_code": "tool_shell_error" });
@@ -5183,7 +5561,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_feature_sad",
                             &ctx(t_done),
-                            &dd_model,
+                            dd_model,
                             sad,
                         ));
                     } else {
@@ -5191,14 +5569,14 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_bash_tool_command_executed",
                             &ctx(t_done),
-                            &dd_model,
+                            dd_model,
                             snake_flat(&bash),
                         ));
                         push(t_done, "tengu_feature_ok", feature("tool_bash"));
                         dd.push(identity.dd_entry(
                             "tengu_feature_ok",
                             &ctx(t_done),
-                            &dd_model,
+                            dd_model,
                             feature("tool_bash"),
                         ));
                     }
@@ -5236,7 +5614,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_feature_ok",
                             &ctx(t_done),
-                            &dd_model,
+                            dd_model,
                             feature(name),
                         ));
                     }
@@ -5292,7 +5670,7 @@ impl Telemetry {
                 if let (Some(obj), Some(rest)) = (success.as_object_mut(), rest.as_object()) {
                     obj.extend(rest.clone());
                 }
-                tool_success_extras(&mut success, tu, &mut file_sizes);
+                tool_success_extras(&mut success, tu, file_sizes);
                 success["queryChainId"] = json!(&chain_id);
                 success["queryDepth"] = json!(prev_depth);
                 success["requestId"] = json!(&prev_req);
@@ -5330,7 +5708,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_tool_use_error",
                         &ctx(t_done),
-                        &dd_model,
+                        dd_model,
                         snake_flat(&err),
                     ));
                 } else {
@@ -5338,7 +5716,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_tool_use_success",
                         &ctx(t_done),
-                        &dd_model,
+                        dd_model,
                         snake_flat(&success),
                     ));
                 }
@@ -5358,12 +5736,7 @@ impl Telemetry {
             }
             let mut attachments = json!({ "attachment_types": ["total_tokens_reminder"] });
             if v285 {
-                fill_attachment_estimates(
-                    &mut attachments,
-                    query_source,
-                    shape.sdk,
-                    &display_model,
-                );
+                fill_attachment_estimates(&mut attachments, query_source, shape.sdk, display_model);
             }
             let results = shape.tool_uses.len();
             // 先 `query_before_attachments`、再攒附件、再 `query_after_attachments`（`cap/2.1.277`
@@ -5413,7 +5786,7 @@ impl Telemetry {
             push(
                 ms(t0, -1),
                 "tengu_tool_search_mode_decision",
-                tool_search_decision(&shape, &display_model, kind.is_agent()),
+                tool_search_decision(shape, display_model, kind.is_agent()),
             );
         }
         // 2.1.285：每条线程的头两条请求前，客户端把上下文宣告、提醒折叠、工具入参回显这几样
@@ -5450,7 +5823,7 @@ impl Telemetry {
                 "resolved_model": &shape.model
             });
             push(ts, "tengu_feature_ok", resolve.clone());
-            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(ts), &dd_model, resolve));
+            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(ts), dd_model, resolve));
         }
         // `/compact`、`/btw` 也是一次输入：挂着的建议在提交那一刻算 ignored（`07:57:01.971`）。
         if matches!(kind, Kind::Compact | Kind::SideQuestion)
@@ -5488,7 +5861,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_feature_ok",
                     &ctx(tr),
-                    &dd_model,
+                    dd_model,
                     feature("context_git_detect"),
                 ));
                 for (kind_name, tokens) in [("session_context", 82), ("date", 9)] {
@@ -5682,7 +6055,7 @@ impl Telemetry {
         // 三条 tether 事件共用的「无状态」判定：模型被固定成无状态发送，或 auto 模式的分类器
         // 在跑（`cap/2.1.280`：auto 的三条 true，切回 default 的四条 false）。两者任一为真，
         // 这条实际就不走线程（`sentThreadType: "none"`）。
-        let model_held = model_held_stateless(&display_model);
+        let model_held = model_held_stateless(display_model);
         // 2.1.285 起 auto 模式不再钉成无状态：前三轮 auto 的 `classifierHeldStateless` 全是
         // false，请求照带 `message-threads` 并建线程（`cap/2.1.285/00030`、`00040` 批次）。
         let classifier_held = !v285 && shape.permission_mode == "auto";
@@ -5731,7 +6104,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_tether_decision",
                 &ctx(t0),
-                &dd_model,
+                dd_model,
                 snake_flat(&decision),
             ));
             // 回声审计：客户端把上游回过来的 assistant 轮次原样带回去了没有。经代理转发的
@@ -5763,7 +6136,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_tether_echo_audit",
                     &ctx(t0),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&echo),
                 ));
             }
@@ -5797,7 +6170,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
                 &ctx(t_first),
-                &dd_model,
+                dd_model,
                 feature("api_request"),
             ));
             // 会话首条主线程请求的首字节处，客户端头一回用上这几项能力各报一次，与 beta 一一
@@ -5815,7 +6188,7 @@ impl Telemetry {
                         dd.push(identity.dd_entry(
                             "tengu_feature_ok",
                             &ctx(t_first),
-                            &dd_model,
+                            dd_model,
                             feature(name),
                         ));
                     }
@@ -6085,12 +6458,12 @@ impl Telemetry {
             if is_main {
                 // `[1m]` 不算换了模型：`/model opus[1m]` 之后官方照报 true（`cap/auto-2.1.285-20260930/00235`）。
                 let bare = |m: &str| m.trim_end_matches("[1m]").to_string();
-                put("is_default_model", json!(bare(&display_model) == bare(&default_model)));
+                put("is_default_model", json!(bare(display_model) == bare(default_model)));
                 put("default_model", json!(&default_model));
                 if let Some(e) = &effort {
                     // 2.1.280 起按模型的默认 effort 比（`cap/2.1.285/00040`、`00079`，
                     // `cap/2.1.280/00167`）；更老的版本没有样本，照旧报「就是默认」。
-                    let default = if v280 { default_effort_of(&display_model) } else { e.as_str() };
+                    let default = if v280 { default_effort_of(display_model) } else { e.as_str() };
                     put("is_default_effort", json!(e == default));
                     put("default_effort_level", json!(default));
                 }
@@ -6189,7 +6562,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_tether_live_outcome",
                     &ctx(t_end),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&live),
                 ));
             }
@@ -6201,7 +6574,7 @@ impl Telemetry {
                 o.shift_remove("tool_schemas_hash");
                 o.shift_remove("tool_use_content_lengths");
             }
-            dd.push(identity.dd_entry("tengu_api_success", &ctx(t_end), &dd_model, dd_success));
+            dd.push(identity.dd_entry("tengu_api_success", &ctx(t_end), dd_model, dd_success));
 
             // 工具集变了才报一次（无工具的侧查询也算一种：`{}` 那份）。
             if tools_changed {
@@ -6260,7 +6633,7 @@ impl Telemetry {
             let code = api_request_error_code(fail);
             let bad = json!({ "feature_name": "api_request", "error_code": code });
             push(t_end, "tengu_feature_bad", bad.clone());
-            dd.push(identity.dd_entry("tengu_feature_bad", &ctx(t_end), &dd_model, bad));
+            dd.push(identity.dd_entry("tengu_feature_bad", &ctx(t_end), dd_model, bad));
 
             let mut err = Map::new();
             let mut put = |k: &str, v: Value| {
@@ -6319,7 +6692,7 @@ impl Telemetry {
             }
             let err = Value::Object(err);
             push(t_end, "tengu_api_error", err.clone());
-            dd.push(identity.dd_entry("tengu_api_error", &ctx(t_end), &dd_model, snake_flat(&err)));
+            dd.push(identity.dd_entry("tengu_api_error", &ctx(t_end), dd_model, snake_flat(&err)));
             error_kind_name = kind_name;
         }
 
@@ -6362,14 +6735,14 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_tether_live_outcome",
                     &ctx(ms(t_end, 2)),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&live),
                 ));
             }
             let t3 = ms(t_end, 3);
             for name in ["shoji_engine", "turn"] {
                 push(t3, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t3), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t3), dd_model, feature(name)));
             }
             push(
                 t3,
@@ -6398,7 +6771,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_feature_ok",
                     &ctx(t5),
-                    &dd_model,
+                    dd_model,
                     feature("repl_rewind_conversation"),
                 ));
             }
@@ -6495,10 +6868,10 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
                 &ctx(t1),
-                &dd_model,
+                dd_model,
                 feature("hook_stop_handler"),
             ));
-            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), &dd_model, feature("turn")));
+            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), dd_model, feature("turn")));
         }
         // 猜下一句：自己就是一轮（`cap/2.1.260-2` 09:43:21），收尾多一条 fork 统计，没有 tips。
         // 失败的那条只有上面的错误串（fork 统计报的是这一发的用量，没有用量就没有它）。
@@ -6570,14 +6943,14 @@ impl Telemetry {
             };
             for name in names {
                 push(t1, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
             }
             if v280 {
                 push(t1, "tengu_turn_end", turn_end("completed", total + 7, None));
                 push(t1, "tengu_fork_agent_query", fork);
                 let name = "prompt_suggestion_generate";
                 push(t1, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
                 // 回来的正文是空的：没有建议可出（`07:50:09.353`，紧跟 `prompt_suggestion_generate`）。
                 if v285 && call.text_chars == 0 {
                     push(
@@ -6626,7 +6999,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
                 &ctx(t1),
-                &dd_model,
+                dd_model,
                 feature("hook_stop_handler"),
             ));
             if !compact && let Some(rid) = &call.request_id {
@@ -6648,7 +7021,7 @@ impl Telemetry {
             }
             let t2 = ms(t1, 1);
             push(t2, "tengu_feature_ok", feature("turn"));
-            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), &dd_model, feature("turn")));
+            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), dd_model, feature("turn")));
             let elapsed = total + if compact { 9 } else { 36 };
             if compact {
                 push(t2, "tengu_turn_end", turn_end("completed", elapsed, None));
@@ -6667,7 +7040,7 @@ impl Telemetry {
                     dd.push(identity.dd_entry(
                         "tengu_feature_ok",
                         &ctx(t3),
-                        &dd_model,
+                        dd_model,
                         feature(name),
                     ));
                 }
@@ -6689,7 +7062,7 @@ impl Telemetry {
             let t1 = ms(t_end, 1);
             for name in ["hook_stop_handler", "turn"] {
                 push(t1, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
             }
             push(t1, "tengu_turn_end", turn_end("completed", total + 6, None));
             let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
@@ -6718,7 +7091,7 @@ impl Telemetry {
             );
             let name = "away_summary_generate";
             push(t1, "tengu_feature_ok", feature(name));
-            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+            dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
         }
 
         // 子代理的摘要请求：同猜下一句，自己算一轮辅助调用，fork 统计挂回子代理那条链、
@@ -6727,7 +7100,7 @@ impl Telemetry {
             let t1 = ms(t_end, 1);
             for name in ["hook_stop_handler", "turn"] {
                 push(t1, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
             }
             push(t1, "tengu_turn_end", turn_end("completed", total + 5, None));
             let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
@@ -6784,7 +7157,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_auto_mode_decision",
                     &ctx(th),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&decision),
                 ));
             }
@@ -6793,7 +7166,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
                 &ctx(tg),
-                &dd_model,
+                dd_model,
                 feature("permission_auto_approve_config"),
             ));
             push(
@@ -6817,7 +7190,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_feature_ok",
                 &ctx(td),
-                &dd_model,
+                dd_model,
                 feature("tool_subagent_handback"),
             ));
             let mut ok = json!({
@@ -6853,7 +7226,7 @@ impl Telemetry {
             dd.push(identity.dd_entry(
                 "tengu_tool_use_success",
                 &ctx(td),
-                &dd_model,
+                dd_model,
                 snake_flat(&ok),
             ));
         }
@@ -6864,7 +7237,7 @@ impl Telemetry {
                 if handback.is_some() { &["turn"] } else { &["hook_stop_handler", "turn"] };
             for name in names {
                 push(t1, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t1), dd_model, feature(name)));
             }
             if handback.is_some() {
                 push(
@@ -6885,14 +7258,14 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_feature_ok",
                     &ctx(t2),
-                    &dd_model,
+                    dd_model,
                     feature("agent_handback_pointer_notice"),
                 ));
             }
             if !v285 || handback.is_some() {
                 let lively = json!({ "feature_name": "lively_waffle", "flagged": false });
                 push(t2, "tengu_feature_ok", lively.clone());
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), &dd_model, lively));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t2), dd_model, lively));
             }
             push(
                 t2,
@@ -6926,7 +7299,7 @@ impl Telemetry {
             let t3 = ms(t2, 1);
             for name in ["melodic_wolf", "task_local_agent", "subagent_complete"] {
                 push(t3, "tengu_feature_ok", feature(name));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t3), &dd_model, feature(name)));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t3), dd_model, feature(name)));
             }
         }
 
@@ -6973,7 +7346,7 @@ impl Telemetry {
                 dd.push(identity.dd_entry(
                     "tengu_api_success",
                     &ctx(t_end),
-                    &dd_model,
+                    dd_model,
                     snake_flat(&ok),
                 ));
             }
@@ -6981,81 +7354,7 @@ impl Telemetry {
         events.extend(tpl_events);
         events.extend(main_side);
         dd.extend(tpl_dd);
-
-        // 启动握手**不在这里排队**。这里是回程（`ReqLog` 收尾之后），排在这儿等于让上游
-        // 先看到一条 messages、几秒后才看到这个「会话」的启动流量——顺序整个反了。
-        // 现在由转发路径在**首条请求发出之前**直接开跑，见
-        // [`crate::proxy::spawn_session_handshake`]；那里还能分辨模拟与真实 CC，后者自己
-        // 会打这一串，luban 不该重复。
-        let _ = is_new_session;
-
-        if let Some(m) = device_default_update {
-            st.device_default_model.insert(device_key, (m, now));
-        }
-        if let Some((probe_identity, out)) = probe_side {
-            let p =
-                st.pending.entry((call.cred_id, probe_identity.session_id.clone())).or_default();
-            p.version = version.clone();
-            p.subscription_type = probe_identity.subscription_type.clone();
-            p.model = display_model.clone();
-            p.betas = betas_session.clone();
-            p.identity = Some(probe_identity);
-            p.push_batch(out, now);
-        }
-        if let Some(sess) = st.sessions.get_mut(&key) {
-            sess.file_sizes = file_sizes;
-        }
-
-        // ---- 入队 ----
-        let pending = st.pending.entry((call.cred_id, session_id.clone())).or_default();
-        pending.version = version;
-        pending.subscription_type = identity.subscription_type.clone();
-        if let Some(vcs) = identity.vcs {
-            pending.backfill_vcs(vcs);
-        }
-        pending.identity = Some(base_identity.clone());
-        // **模型 / beta / prompt_id 只跟主线程走**（第一条就是侧查询时先占个位）。
-        //
-        // 这三项是导出指标时那条 `tengu_feature_ok{internal_metrics_export}` 的上下文，
-        // 代表的是「这个会话」。被一条标题生成（haiku + structured-outputs、且没有
-        // `cc_prompt_id`）覆盖之后，导出事件报的就成了 haiku 与标题那套 beta——而同一批
-        // 指标里的 `model` 属性仍是会话主模型，自相矛盾。
-        if is_main || pending.model.is_empty() {
-            pending.model = display_model.clone();
-            pending.betas = betas_session.clone();
-            pending.prompt_id = prompt_id.clone();
-        }
-        pending.started_wall = Some(started_wall);
-        pending.push_batch((events, dd), now);
-        pending.metrics_since.get_or_insert(now);
-        pending.metrics.push(CallMetric {
-            session_id,
-            device_id,
-            account_uuid,
-            model: display_model,
-            category: kind.category(),
-            effort: shape.effort.clone(),
-            agent_name: (v285 && kind == Kind::Subagent)
-                .then(|| call.agent.agent_type.clone())
-                .flatten()
-                .filter(|t| !t.is_empty()),
-            cost: call.cost_usd.unwrap_or(0.0),
-            input: call.input_tokens,
-            output: call.output_tokens,
-            cache_read: call.cache_read_tokens,
-            cache_creation: call.cache_creation_tokens,
-            cli_secs: if is_main && turn_over { call.total_ms as f64 / 1000.0 } else { 0.0 },
-            user_secs,
-            new_session: is_new_session && !counted,
-            resumed: resumed || continued,
-            continued,
-            usage: !failed && !aborted,
-        });
-
-        // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去。
-        if is_main {
-            Self::replay_deferred(st, &key);
-        }
+        BuiltEvents { events, dd, probe_side }
     }
 
     /// 把某会话扣住的侧查询按顺序补发（主线程请求到了，或扣得太久）。
