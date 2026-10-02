@@ -1362,15 +1362,15 @@ impl CredentialStore {
     /// 删号：账号行与挂在它上面的小表（绑定、账本、设备费用、模型拒绝）在同一个短事务里
     /// 删掉，返回实际删除的账号数。
     ///
-    /// **用量流水不删**，留给 [`Self::prune_usage_logs`] 按 30 天保留期自然裁掉。此前删号时
-    /// 顺手把这个号的流水也清掉，一个号 30 天的流水动辄几十万行，表又宽、挂着十来条索引，
+    /// **用量流水不删**，留给 [`Self::prune_usage_logs`] 按保留期自然裁掉。此前删号时
+    /// 顺手把这个号的流水也清掉，一个号保留期内的流水动辄几万行，表又宽、挂着十来条索引，
     /// 分批删也要连着几分钟和转发抢 `conn` 这把锁，删号期间整个后台和转发都跟着慢。而留着
     /// 这些行并没有害处：
     /// - 账号 id 自增不复用（见 migrates_and_stops_id_reuse），不会被记到新号头上；
     /// - 每行自带 `cred_label`，请求日志、按账号拆分照样显示得出是哪个号；
     /// - 账号列表的费用/最近使用走账本（这里一并删了），选号与 RPM 只看在册账号。
     ///
-    /// 全局口径的统计（总览、请求日志、按账号拆分）因此会带上已删账号那 30 天的用量——
+    /// 全局口径的统计（总览、请求日志、按账号拆分）因此会带上已删账号保留期内的用量——
     /// 那些请求确实发生过、钱也确实花了，算进去才对得上账。
     pub fn remove(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() {
@@ -2542,10 +2542,30 @@ impl CredentialStore {
 
     /// 最近 `days` 天流水里出现过的模型（去重），附最后一次出现的时刻，按时刻倒序。
     /// 连通性测试自己打的那些（`device_id = 'probe'`）不算——它们是人挑的，不是客户端在用的。
+    ///
+    /// 不按 ts 扫窗口再 GROUP BY：那样要把窗口内的全部流水逐行回表读 model / device_id，线上
+    /// 规模（30 天保留期时 180 万行、5GB 多）实测 12 秒，而且这里以前持的是转发主连接的锁。改成在
+    /// `idx_usage_logs_model_ts` 上跳着走：先逐个取下一个不同的模型名，再对每个模型从最新一条
+    /// 往回找第一条非 probe 的——模型就十来个，整条查询亚毫秒。
     pub fn recent_models(&self, days: i64) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT model, MAX(ts) AS last_ts FROM usage_logs              WHERE model IS NOT NULL AND model != ''                AND ts >= unixepoch() - ?1 * 86400                AND (device_id IS NULL OR device_id != 'probe')              GROUP BY model ORDER BY last_ts DESC",
+            "WITH RECURSIVE m(model) AS (
+                 SELECT MIN(model) FROM usage_logs WHERE model > ''
+                 UNION ALL
+                 SELECT (SELECT MIN(model) FROM usage_logs WHERE model > m.model)
+                   FROM m WHERE m.model IS NOT NULL
+             )
+             SELECT model, last_ts FROM (
+                 SELECT model,
+                        (SELECT MAX(ts) FROM usage_logs u
+                          WHERE u.model = m.model
+                            AND u.ts >= unixepoch() - ?1 * 86400
+                            AND (u.device_id IS NULL OR u.device_id != 'probe')) AS last_ts
+                   FROM m WHERE model IS NOT NULL
+             )
+             WHERE last_ts IS NOT NULL
+             ORDER BY last_ts DESC",
         )?;
         let rows = stmt.query_map([days], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -3943,7 +3963,7 @@ impl UsageLogQuery {
     /// 把筛选条件拼成 `WHERE …`（可能为空串）与对应的绑定参数。
     ///
     /// **按条件动态拼而不是写 `(?1 IS NULL OR col = ?1)`**：那种写法 SQLite 用不上索引，每翻
-    /// 一页都是整表扫；流水 30 天动辄几十万行，按号翻页与按请求 id 查都得走索引才像样
+    /// 一页都是整表扫；流水保留期内动辄几十万行，按号翻页与按请求 id 查都得走索引才像样
     /// （`idx_usage_logs_cred_id` / `idx_usage_logs_request_id`）。统计与取页共用这一份，
     /// 「共 N 条」与翻得到的记录永远是同一个集合。
     fn where_clause(&self) -> (String, Vec<rusqlite::types::Value>) {
@@ -4357,11 +4377,38 @@ pub struct SessionBinding {
 const WINDOW_5H_SECS: i64 = 5 * 3600;
 /// 7 天窗口秒数。
 const WINDOW_7D_SECS: i64 = 7 * 24 * 3600;
-/// 用量日志流水的保留时长：30 天。必须显著大于最长的统计窗口（7 天），
-/// 否则窗口内的流水会被裁掉、cost_7d 平白变小；30 天同时给请求日志页留够翻看余量。
-pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
+/// 用量日志流水的保留时长：8 天。必须大于最长的统计窗口（7 天）：7d 窗口起点是 reset 往前推
+/// 7 天，封号取证要回看 7 天加 10 分钟（[`FREEZE_WINDOW_SECS`]），正好 7 天会在边界上少算，
+/// cost_7d 平白变小。再往前的流水没人看——终身口径都在账本里——留着只是让表、索引和每条
+/// 按时间扫的查询跟着变大（线上 30 天时 180 万行、5GB 多）。
+pub const USAGE_LOG_RETENTION_SECS: i64 = 8 * 24 * 3600;
 /// RPM（每分钟请求数）的统计窗口：最近 60 秒。
 pub const RPM_WINDOW_SECS: i64 = 60;
+
+/// 流水统计（条数、花费合计、最大 id）的 SQL，见 [`CredentialStore::usage_log_stats`]。
+/// 拎成函数是为了让测试对**实际执行的这条**跑 EXPLAIN QUERY PLAN。
+fn usage_log_stats_sql(where_sql: &str) -> String {
+    format!("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id) FROM usage_logs{where_sql}")
+}
+
+/// 流水取页的 SQL，见 [`CredentialStore::query_usage_logs`]。`n` 是参数个数，最后两个是
+/// LIMIT / OFFSET。
+///
+/// **分两步**：子查询只按筛选取出这一页的 id，外层再按 id 读整行。子查询只碰 id，各条筛选
+/// 索引都能覆盖它，不回表；一步到位的写法里，规划器若按 `(model, ts)` 圈窗口，就得先把窗口
+/// 内每一行整行读出来排序再丢掉，一页 50 条要几百毫秒。OFFSET 跳过的那些行同理，只在
+/// 索引里跳。外层的 `id IN (…)` 按主键逐条取，IN 列表本身有序，不再排序。
+fn usage_log_page_sql(where_sql: &str, n: usize) -> String {
+    format!(
+        "SELECT id, {USAGE_LOG_COLS}
+           FROM usage_logs
+          WHERE id IN (SELECT id FROM usage_logs{where_sql}
+                        ORDER BY id DESC LIMIT ?{} OFFSET ?{})
+          ORDER BY id DESC",
+        n - 1,
+        n
+    )
+}
 
 /// 额度快照 + 窗口统计的那条 SQL，见 [`CredentialStore::quota_snapshots`]。拎成常量是为了让
 /// 测试能对它跑 EXPLAIN QUERY PLAN，钉住「流水那一侧只走覆盖索引、不回表」。
@@ -4407,7 +4454,7 @@ const QUOTA_SNAPSHOTS_SQL: &str = "SELECT s.cred_id, s.snapshot_ts, s.unified_st
        LEFT JOIN usage_logs u
               ON u.cred_id = s.cred_id
              -- 只连**可能落进某个窗口**的流水。没有这个下界，索引
-             -- idx_usage_logs_cred_usage 只能按 cred_id 定位，然后把该账号 30 天
+             -- idx_usage_logs_cred_usage 只能按 cred_id 定位，然后把该账号保留期内
              -- （保留期）的全部流水逐行走一遍、靠上面的 CASE 过滤——而窗口最长才 7 天。
              -- 账号列表每次刷新都要跑一遍这条 SQL。
              -- 下界引用外层的 s，故 SQLite 能把它压成 (cred_id=? AND ts>=?) 的范围扫描；
@@ -4891,7 +4938,7 @@ impl CredentialStore {
 
     /// TTFT（首字时延）趋势的桶：每桶平均、p50、p95、请求数与输出吞吐。分位数没法从更细
     /// 的桶合并出来，所以桶宽与时区偏移由调用方按前端要画的格子给（同 [`Self::cache_series`]），
-    /// 在 Rust 里对每桶的原始值排序取分位——30 天量级也就十万级整数，没有压力。
+    /// 在 Rust 里对每桶的原始值排序取分位——保留期量级也就几十万个整数，没有压力。
     #[cfg(test)]
     pub fn ttft_series(
         &self,
@@ -5006,7 +5053,7 @@ impl CredentialStore {
     /// 单个账号 `since` 起的用量统计：按时间分桶（桶宽与时区偏移同 [`Self::ttft_report`]）、
     /// 整个窗口的合计，以及按模型 / 设备 / 来访客户端 / 状态码四个维度拆开的分组（各自按请求数
     /// 降序、最多 `group_limit` 组）。一次扫描把这几路都汇总出来——走 `idx_usage_logs_cred_usage` 的前缀
-    /// 卡住账号与起点，量级是单号 30 天的流水，在 Rust 里聚合比拼五条 GROUP BY 省一半扫描。
+    /// 卡住账号与起点，量级是单号保留期内的流水，在 Rust 里聚合比拼五条 GROUP BY 省一半扫描。
     pub fn credential_stats(
         &self,
         cred_id: i64,
@@ -5115,14 +5162,6 @@ impl CredentialStore {
         Ok(out)
     }
 
-    /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。
-    ///
-    /// 流水裁剪不影响任何终身口径——最近使用/累计费用/最新快照都在账本里
-    /// （credential_stats / device_costs，写时落账）；还要读流水的只剩两处：
-    /// 5h/7d 窗口统计（最多回看 7 天多）和请求日志页（只翻近期），30 天都覆盖得住。
-    ///
-    /// 分批删：日志表可能积了几百万行，一条大 DELETE 会把写锁按住很久，转发路径的
-    /// 落库全得排队。批间放锁，让在线写入插队。
     /// 删掉「连保留期都过了」的设备绑定与会话绑定，返回两张表各删了多少行。
     ///
     /// 这件事此前挂在 [`Self::select_with_slot`] 里、每条转发请求跑一遍，而两条 DELETE 都按
@@ -5160,8 +5199,22 @@ impl CredentialStore {
         Ok((devices, sessions))
     }
 
+    /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。
+    ///
+    /// 流水裁剪不影响任何终身口径——最近使用/累计费用/最新快照都在账本里
+    /// （credential_stats / device_costs，写时落账）；还要读流水的只剩两处：
+    /// 5h/7d 窗口统计（最多回看 7 天多）和请求日志页（只翻近期），8 天都覆盖得住。
+    ///
+    /// 分批删：日志表可能积了几百万行，一条大 DELETE 会把写锁按住很久，转发路径的
+    /// 落库全得排队。批间放锁、歇一下，让在线写入插队。
+    ///
+    /// 一批 500 行：每行 3KB 上下、挂着十来条索引，删一行要动的页不少。线上规模实测一批
+    /// 5000 行持锁近 2 秒（每天一次、连着十几批），500 行约 0.1 秒。
+    ///
+    /// 会睡眠，只能在阻塞线程里调（见 `web::run` 的 `spawn_blocking`）。
     pub fn prune_usage_logs(&self) -> Result<usize> {
-        const BATCH: usize = 5_000;
+        const BATCH: usize = 500;
+        const PAUSE: Duration = Duration::from_millis(50);
         let mut total = 0;
         loop {
             let n = self.conn.lock().execute(
@@ -5173,6 +5226,7 @@ impl CredentialStore {
             if n < BATCH {
                 break;
             }
+            std::thread::sleep(PAUSE);
         }
         Ok(total)
     }
@@ -5190,30 +5244,19 @@ impl CredentialStore {
     pub fn usage_log_stats(&self, q: UsageLogQuery) -> Result<UsageLogStats> {
         let (where_sql, params) = q.where_clause();
         let conn = self.read_conn();
-        conn.query_row(
-            &format!(
-                "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), MAX(id) FROM usage_logs{where_sql}"
-            ),
-            rusqlite::params_from_iter(params),
-            |r| Ok(UsageLogStats { total: r.get(0)?, cost_usd: r.get(1)?, max_id: r.get(2)? }),
-        )
+        conn.query_row(&usage_log_stats_sql(&where_sql), rusqlite::params_from_iter(params), |r| {
+            Ok(UsageLogStats { total: r.get(0)?, cost_usd: r.get(1)?, max_id: r.get(2)? })
+        })
         .map_err(Into::into)
     }
 
-    /// 按条件查用量流水，恒按 `id` 倒序。见 [`UsageLogQuery`]。
+    /// 按条件查用量流水，恒按 `id` 倒序。见 [`UsageLogQuery`] 与 [`usage_log_page_sql`]。
     pub fn query_usage_logs(&self, q: UsageLogQuery) -> Result<Vec<UsageLog>> {
         let (where_sql, mut params) = q.where_clause();
         params.push(rusqlite::types::Value::Integer(q.limit));
         params.push(rusqlite::types::Value::Integer(q.offset));
-        let n = params.len();
         let conn = self.read_conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, {USAGE_LOG_COLS}
-               FROM usage_logs{where_sql}
-              ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
-            n - 1,
-            n
-        ))?;
+        let mut stmt = conn.prepare(&usage_log_page_sql(&where_sql, params.len()))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), usage_log_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -5224,7 +5267,7 @@ impl CredentialStore {
     /// [`FREEZE_WINDOW_SECS`] 的流水冻结进 `usage_logs_frozen`。
     ///
     /// 事件与冻结流水都是取证材料：解封不清、删号不删、裁剪不碰（对比 `credentials.ban_reason`
-    /// 会在重新启用时被清空、`usage_logs` 会随删号级联删除并只留 30 天）。
+    /// 会在重新启用时被清空、`usage_logs` 会随删号级联删除并只留保留期内的）。
     ///
     /// 事件里除了上游给的那几句，还**当场快照**一组账号侧读数（等级、组织类型、代理、账龄、
     /// 终身请求数与费用、封前 7 天的请求数/设备数/模型/客户端）：这些在事后从别处凑不齐——
@@ -5978,7 +6021,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // - (session_key, id)：会话行点「看请求」是 `session_key = ? AND id <= ? ORDER BY id DESC`，
     //   与 (cred_id, id) 同一个形状；**部分索引**（只收非空的），带设备身份与非模拟路径的
     //   请求这一列恒为空、占了绝大多数行，不进索引就不付这份写入与体积。
-    // - 延迟趋势只看成功且记了 TTFT 的行、只读三列：**部分覆盖索引**，30 天的扫描全在索引里
+    // - 延迟趋势只看成功且记了 TTFT 的行、只读三列：**部分覆盖索引**，整段扫描全在索引里
     //   走、不回表（日志行很宽，回表才是大头）；失败行与没记 TTFT 的行不进索引，写入开销只
     //   落在成功请求上。
     // - 缓存趋势按 ts 扫全部行、只读五个 token 列，同样做成覆盖索引。
@@ -5987,6 +6030,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
     //   7 天 40 万条流水的规模下，回表那版要读 GB 级的宽行，覆盖之后约快 10 倍。它的
     //   (cred_id, ts) 前缀照样服务按号按时间卡窗口的其它查询，原来那条 idx_usage_logs_cred_ts
     //   就是多余的写入开销，随之删掉。
+    // - (model, ts)：按模型下钻流水（`model = ? AND ts >= ?`）直接圈出窗口。统计（条数、费用）
+    //   只扫窗口内的行；取页那条分两步、子查询只取 id，在这条索引里就能拿齐，不回表（见
+    //   usage_log_page_sql）。「近 7 天出现过的模型」也靠它跳着取不同的模型名、各取最近一条
+    //   （见 recent_models）。
+    //   **不用 (model, id)**：取页是快了（倒着走够 n 条就停），但统计只能按模型把整个保留期
+    //   逐行回表再按时间过滤，24 小时窗口的统计慢好几倍，而统计每次翻页都要跑。预发版建过它
+    //   的库在这里删掉。
     // 这几条引用的列（ttft_ms / total_ms / output_tokens / cache_*）在老库上是上面补出来的，
     // 放进建表那批会在老库上报「no such column」。
     conn.execute_batch(
@@ -6008,7 +6058,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
              ON usage_logs(cred_id, ts, cost_usd, input_tokens, output_tokens,
                            cache_creation_tokens, cache_5m_tokens, cache_1h_tokens,
                            cache_read_tokens);
-         DROP INDEX IF EXISTS idx_usage_logs_cred_ts;",
+         DROP INDEX IF EXISTS idx_usage_logs_cred_ts;
+         CREATE INDEX IF NOT EXISTS idx_usage_logs_model_ts ON usage_logs(model, ts);
+         DROP INDEX IF EXISTS idx_usage_logs_model_id;",
     )?;
     // ban_events 的出站设备两列是随 device_id_out 一起加的：先建过表的库幂等补上。
     let _ = conn
@@ -6017,7 +6069,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // credential_stats 是 0.2.37 加的表，这两列都在其后才有：同样幂等补列。
     let _ = conn.execute("ALTER TABLE credential_stats ADD COLUMN overage_in_use INTEGER", []);
     // device_costs 的终身请求数是后加的：老库补出来是 0，之后的请求照常累加。
-    // 不回填——`usage_logs` 只留 30 天，拿它回填会得到一个「看着像终身、其实只有 30 天」的数，
+    // 不回填——`usage_logs` 只留保留期内的，拿它回填会得到一个「看着像终身、其实只有几天」的数，
     // 比从 0 开始更误导。
     let _ = conn.execute(
         "ALTER TABLE device_costs ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0",
@@ -6230,7 +6282,7 @@ fn backfill_ledger(conn: &Connection) -> Result<()> {
 /// 清扫 cred_id 已指向不存在账号的小表行（绑定、账本、设备费用）。删号本来就在同一个
 /// 事务里清了它们（[`CredentialStore::remove`]），这里兜的是更早版本留下的欠账。
 ///
-/// **用量流水不在这里清**：已删账号的流水按设计留着，随 30 天保留期自然裁掉，理由见
+/// **用量流水不在这里清**：已删账号的流水按设计留着，随保留期自然裁掉，理由见
 /// [`CredentialStore::remove`]。这里若一条语句删掉所有无主流水，删过几个大号的库每次开机
 /// 都要先删上几十万行、全程占着写锁。
 fn purge_orphan_rows(conn: &Connection) -> Result<()> {
@@ -8920,7 +8972,7 @@ mod tests {
         assert_eq!(cache_report.summary.input_tokens, 1100, "合计是各桶之和");
         assert_eq!(cache_report.recent.cached_tokens, 300);
 
-        // 两条趋势查询都要走覆盖索引、不回表：日志行很宽，回表才是 30 天扫描的大头。
+        // 两条趋势查询都要走覆盖索引、不回表：日志行很宽，回表才是按时间扫描的大头。
         let plan = |sql: &str| -> String {
             let conn = store.conn.lock();
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -11136,19 +11188,7 @@ mod tests {
         assert!(store.query_usage_logs(both).unwrap().is_empty(), "lb-3 是 b 的");
 
         // 查询计划必须走索引：按号翻页走 (cred_id, id)，按请求 id 走 request_id 索引。
-        let plan = |q: &UsageLogQuery| -> String {
-            let (where_sql, params) = q.where_clause();
-            let conn = store.conn.lock();
-            let mut stmt = conn
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
-                ))
-                .unwrap();
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
-                .unwrap();
-            rows.map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
-        };
+        let plan = |q: &UsageLogQuery| usage_page_plan(&store, q);
         let p = plan(&UsageLogQuery {
             cred_id: Some(a),
             until_id: Some(100),
@@ -11159,6 +11199,30 @@ mod tests {
         assert!(!p.contains("TEMP B-TREE"), "索引序即排序序，不该再排一遍: {p}");
         let p = plan(&by("lb-1"));
         assert!(p.contains("idx_usage_logs_request_id"), "按请求 id 应走索引: {p}");
+        // 按模型下钻（拆分表点一行）：统计不带锚点、翻页时带锚点，取页恒带锚点。统计只扫
+        // 窗口内的行；取页的子查询只取 id，(model, ts) 覆盖得住，不回表读整行。
+        for until_id in [None, Some(100)] {
+            let q = UsageLogQuery {
+                model: Some("claude-opus-5".into()),
+                since: Some(0),
+                until_id,
+                limit: 10,
+                ..Default::default()
+            };
+            let p = usage_stats_plan(&store, &q);
+            assert!(
+                p.contains("idx_usage_logs_model_ts (model=? AND ts>?)"),
+                "按模型统计应按 (model, ts) 圈窗口: {p}"
+            );
+            let p = plan(&q);
+            assert!(
+                p.contains("COVERING INDEX idx_usage_logs_model_ts"),
+                "按模型取页的子查询应只在索引里取 id: {p}"
+            );
+        }
+        // 按号统计（详情页首屏）走覆盖索引，费用列也在索引里。
+        let p = usage_stats_plan(&store, &UsageLogQuery { cred_id: Some(a), ..Default::default() });
+        assert!(p.contains("COVERING INDEX"), "按号统计不该回表: {p}");
     }
 
     /// 流水按**模拟会话键**筛：名额对话框里会话那一行点「看请求」走的就是它。键落进流水、
@@ -11210,19 +11274,7 @@ mod tests {
         assert_eq!(store.usage_log_stats(scoped).unwrap().total, 2);
 
         // 查询计划：按会话键取页要走 (session_key, id) 那条部分索引，不能整表扫。
-        let (where_sql, params) = by(one).where_clause();
-        let conn = store.conn.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
-            ))
-            .unwrap();
-        let plan = stmt
-            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>()
-            .join(" | ");
+        let plan = usage_page_plan(&store, &by(one));
         assert!(plan.contains("idx_usage_logs_session_key"), "应走会话键索引: {plan}");
         assert!(!plan.contains("TEMP B-TREE"), "索引序即排序序，不该再排一遍: {plan}");
     }
@@ -11276,19 +11328,7 @@ mod tests {
         );
         assert_eq!(store.query_usage_logs(by("  ")).unwrap().len(), 5, "空白视同不筛");
 
-        let (where_sql, params) = by(client).where_clause();
-        let conn = store.conn.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN SELECT id FROM usage_logs{where_sql} ORDER BY id DESC LIMIT 10"
-            ))
-            .unwrap();
-        let plan = stmt
-            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>()
-            .join(" | ");
+        let plan = usage_page_plan(&store, &by(client));
         assert!(plan.contains("idx_usage_logs_session_id"), "出站那侧要走索引: {plan}");
         assert!(plan.contains("idx_usage_logs_session_id_in"), "来访那侧要走索引: {plan}");
         assert!(!plan.contains("SCAN usage_logs"), "不能整表扫: {plan}");
@@ -11791,6 +11831,64 @@ mod tests {
             !names.iter().any(|n| n == "idx_usage_logs_cred_ts"),
             "旧复合索引应删掉: {names:?}"
         );
+    }
+
+    /// 「近 N 天出现过的模型」：空 / NULL 模型名不算，只被连通性测试打过的不算，窗口外的不算；
+    /// 最新几条是 probe 的，退回它之前那条客户端流水的时刻。按时刻倒序。
+    #[test]
+    fn recent_models_skips_probe_empty_and_stale() {
+        let store = CredentialStore::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let log = |model: Option<&str>, device: Option<&str>, ts: i64| {
+            store
+                .insert_usage_log_at(
+                    &UsageRecord {
+                        model: model.map(Into::into),
+                        device_id: device.map(Into::into),
+                        ..Default::default()
+                    },
+                    Some(ts),
+                )
+                .unwrap();
+        };
+        log(Some("opus"), Some("d1"), now - 300);
+        // 最新那几条是连通性测试打的：退回它之前那条客户端流水的时刻。
+        log(Some("opus"), Some("probe"), now - 10);
+        log(Some("sonnet"), None, now - 100);
+        log(Some("probe-only"), Some("probe"), now - 50);
+        log(Some("stale"), Some("d1"), now - 8 * 86400);
+        log(Some(""), Some("d1"), now - 20);
+        log(None, Some("d1"), now - 20);
+
+        assert_eq!(
+            store.recent_models(7).unwrap(),
+            vec![("sonnet".to_string(), now - 100), ("opus".to_string(), now - 300)]
+        );
+    }
+
+    /// 对**实际执行的**流水取页 SQL（[`usage_log_page_sql`]）跑 EXPLAIN QUERY PLAN，各行用
+    /// ` | ` 连起来。
+    fn usage_page_plan(store: &CredentialStore, q: &UsageLogQuery) -> String {
+        let (where_sql, mut params) = q.where_clause();
+        params.push(rusqlite::types::Value::Integer(q.limit));
+        params.push(rusqlite::types::Value::Integer(q.offset));
+        explain(store, &usage_log_page_sql(&where_sql, params.len()), params)
+    }
+
+    /// 同上，对流水统计 SQL（[`usage_log_stats_sql`]）。
+    fn usage_stats_plan(store: &CredentialStore, q: &UsageLogQuery) -> String {
+        let (where_sql, params) = q.where_clause();
+        explain(store, &usage_log_stats_sql(&where_sql), params)
+    }
+
+    fn explain(store: &CredentialStore, sql: &str, params: Vec<rusqlite::types::Value>) -> String {
+        let conn = store.conn.lock();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(rusqlite::params_from_iter(params), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     /// 账号列表的额度窗口聚合：流水那一侧要按 (cred_id, ts) 范围扫、且只走覆盖索引。日志行

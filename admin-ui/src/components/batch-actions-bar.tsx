@@ -583,8 +583,8 @@ export function BatchActionsBar({
               <AlertDialogDescription>
                 {t(
                   // 数量已在标题（删除 N 个账号）与按钮（删除 N 个）里，说明只讲后果。
-                  '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 30 天保留期到期后自动清除。',
-                  'Device bindings are removed immediately and cannot be recovered. Request logs are not deleted right away; entries are cleared automatically once they pass the 30-day retention period.',
+                  '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 8 天保留期到期后自动清除。',
+                  'Device bindings are removed immediately and cannot be recovered. Request logs are not deleted right away; entries are cleared automatically once they pass the 8-day retention period.',
                 )}
               </AlertDialogDescription>
             </AlertDialogHeader>

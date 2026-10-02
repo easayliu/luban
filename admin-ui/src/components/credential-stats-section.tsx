@@ -27,11 +27,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 
-/** 时间范围与粒度：与缓存 / 延迟趋势对话框同一套三档（24h 逐小时，7d / 30d 逐天）。 */
+/** 时间范围与粒度：与缓存 / 延迟趋势对话框同一套两档（24h 逐小时，7d 逐天）。流水只留 8 天，再长就是空格子。 */
 const RANGES = {
   '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
   '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
-  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
 }
 type RangeKey = keyof typeof RANGES
 
@@ -199,7 +198,6 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
   const rangeLabel: Record<RangeKey, string> = {
     '24h': t('近 24 小时', 'Last 24 hours'),
     '7d': t('近 7 天', 'Last 7 days'),
-    '30d': t('近 30 天', 'Last 30 days'),
   }
   const metricLabel: Record<Metric, string> = {
     requests: t('请求数', 'Requests'),
@@ -212,8 +210,8 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
       icon={ChartColumnIcon}
       title={t('用量统计', 'Usage statistics')}
       description={t(
-        `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 30 天。`,
-        `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 30 days.`,
+        `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 8 天。`,
+        `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 8 days.`,
       )}
       action={(
         <>

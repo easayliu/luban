@@ -59,12 +59,11 @@ function SummaryCard({
 export const TTFT_RANGES = {
   '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
   '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
-  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
 } as const
 
 export type TtftRangeKey = keyof typeof TTFT_RANGES
 
-/** 默认看近 24 小时：先看今天怎么样，7 天与 30 天是往回翻。 */
+/** 默认看近 24 小时：先看今天怎么样，7 天是往回翻。 */
 export const DEFAULT_TTFT_RANGE: TtftRangeKey = '24h'
 
 export function useTtftSeries(range: TtftRangeKey, enabled = true) {
@@ -361,7 +360,6 @@ export function TtftTrendDialog({
   const rangeLabel: Record<TtftRangeKey, string> = {
     '24h': t('近 24 小时', 'Last 24 hours'),
     '7d': t('近 7 天', 'Last 7 days'),
-    '30d': t('近 30 天', 'Last 30 days'),
   }
 
   return (
@@ -501,8 +499,8 @@ export function TtftTrendDialog({
           {/* p50 / p95 的含义交给图例与它末尾那枚 info，这里只剩图例说不了的两件事。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空白格表示该时段没有成功请求。请求明细只保留 30 天。',
-              'A gap means no successful requests in that period. Request logs are kept for 30 days.',
+              '空白格表示该时段没有成功请求。请求明细只保留 8 天。',
+              'A gap means no successful requests in that period. Request logs are kept for 8 days.',
             )}
           </p>
 

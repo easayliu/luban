@@ -1238,7 +1238,7 @@ async fn unbind_credential_session(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// 删除一条凭证。用量流水不删，随 30 天保留期自然裁掉，理由见 [`CredentialStore::remove`]。
+/// 删除一条凭证。用量流水不删，随保留期自然裁掉，理由见 [`CredentialStore::remove`]。
 async fn delete_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -2016,7 +2016,7 @@ async fn clear_learned_rejections(
 struct ModelsResp {
     /// 价目表里列出的现役模型（见 [`crate::pricing::LISTED_MODELS`]），前端不再抄一份。
     listed: Vec<&'static str>,
-    /// 最近 30 天客户端真实请求过的模型（去重、按最后出现时刻倒序）。客户端在用什么就列什么，
+    /// 最近 7 天客户端真实请求过的模型（去重、按最后出现时刻倒序）。客户端在用什么就列什么，
     /// 新模型上线不必等 luban 发版。
     recent: Vec<RecentModel>,
 }
@@ -2029,10 +2029,8 @@ struct RecentModel {
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Json<ModelsResp>, ApiError> {
-    let recent = state
-        .store
-        .recent_models(30)
-        .map_err(internal)?
+    let recent = blocking(move || state.store.recent_models(7).map_err(internal))
+        .await?
         .into_iter()
         .map(|(model, last_ts)| RecentModel { model, last_ts })
         .collect();
@@ -2525,7 +2523,7 @@ impl SeriesQuery {
 }
 
 /// 趋势接口的短期响应缓存：键是接口名加规整后的参数，20 秒内同一份问题直接回上次的答案。
-/// 概览页每分钟拉四条趋势（缓存 / 延迟各 24h 与 7d），多开几个后台标签页就是成倍的 30 天
+/// 概览页每分钟拉四条趋势（缓存 / 延迟各 24h 与 7d），多开几个后台标签页就是成倍的 7 天
 /// 扫描；而这些数一分钟内本来也不会变到值得重算。条目按参数组合计，超过 64 条整个清掉
 /// （参数都钳过范围，正常只有几种组合）。
 type MetricsCacheMap =
@@ -2537,7 +2535,7 @@ static METRICS_CACHE: std::sync::LazyLock<std::sync::Mutex<MetricsCacheMap>> =
 const METRICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 按键取缓存，没有或过期就算一次并存起来。算的那一步在锁外，几个标签页同时撞上会各算各的，
-/// 但接下来 20 秒都省了。回给 axum 的是 `Value` 的一份克隆：几 KB 的 JSON，比 30 天扫描
+/// 但接下来 20 秒都省了。回给 axum 的是 `Value` 的一份克隆：几 KB 的 JSON，比整段扫描
 /// 便宜几个数量级；`Arc<Value>` 本身不能直接序列化（serde 的 rc 特性没开）。
 /// 算的那一步是几十万行的扫描，经 [`blocking`] 放到阻塞线程池里跑。
 async fn cached_metrics<T, F>(key: String, compute: F) -> Result<Json<serde_json::Value>, ApiError>

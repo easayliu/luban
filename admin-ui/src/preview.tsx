@@ -892,7 +892,7 @@ for (const cred of previewCredentials) {
       }]
     : [])
   // 用量统计：三档时间范围各造一份，桶按本地整点 / 零点对齐，数值随时段起伏。
-  for (const [hours, bucketSecs, slots] of [[24, 3600, 24], [168, 86400, 7], [720, 86400, 30]] as const) {
+  for (const [hours, bucketSecs, slots] of [[24, 3600, 24], [168, 86400, 7]] as const) {
     const points: CredentialStatsBucket[] = Array.from({ length: slots }, (_, i) => {
       const d = new Date()
       if (bucketSecs === 3600) d.setMinutes(0, 0, 0)

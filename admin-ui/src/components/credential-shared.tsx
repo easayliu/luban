@@ -1373,8 +1373,8 @@ export function DeleteCredentialDialog({
             {t('删除', 'Deleting ')}
             {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{credentialLabel}</span>{t('」后，', '" will ')}
             {t(
-              '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 30 天保留期到期后自动清除。',
-              'remove its device bindings immediately. This cannot be undone. Its request log is not deleted right away; entries are cleared automatically once they pass the 30-day retention period.',
+              '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 8 天保留期到期后自动清除。',
+              'remove its device bindings immediately. This cannot be undone. Its request log is not deleted right away; entries are cleared automatically once they pass the 8-day retention period.',
             )}
           </AlertDialogDescription>
         </AlertDialogHeader>
@@ -1439,7 +1439,7 @@ function compareListed(a: string, b: string): number {
 /**
  * 下拉的完整选项，分三段、去重保序：
  * 1. 四个基准（{@link PROBE_MODELS}），覆盖四条模拟路径；
- * 2. 客户端最近 30 天真实用过的，按最后出现时刻倒序——新模型上线不必等发版，也最可能是要测的；
+ * 2. 客户端最近 7 天真实用过的，按最后出现时刻倒序——新模型上线不必等发版，也最可能是要测的；
  * 3. 价目表里其余现役模型，按族、再按版本新旧排（{@link compareListed}），不照后端列表的写法。
  *
  * 这个号被判过「套餐不含」的模型整体沉到最后（各段内相对次序不变）：测了必败，只白扣一次。

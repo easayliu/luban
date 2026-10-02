@@ -35,12 +35,11 @@ import { UsageBreakdown } from '@/components/usage-breakdown'
 export const CACHE_RANGES = {
   '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
   '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
-  '30d': { hours: 30 * 24, slots: 30, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
 } as const
 
 export type CacheRangeKey = keyof typeof CACHE_RANGES
 
-/** 默认看近 24 小时：先看今天怎么样，7 天与 30 天是往回翻。 */
+/** 默认看近 24 小时：先看今天怎么样，7 天是往回翻。 */
 export const DEFAULT_CACHE_RANGE: CacheRangeKey = '24h'
 
 export function useCacheSeries(range: CacheRangeKey, enabled = true) {
@@ -100,7 +99,6 @@ export function CacheHitTrendDialog({
   const rangeLabel: Record<CacheRangeKey, string> = {
     '24h': t('近 24 小时', 'Last 24 hours'),
     '7d': t('近 7 天', 'Last 7 days'),
-    '30d': t('近 30 天', 'Last 30 days'),
   }
 
   return (
@@ -234,8 +232,8 @@ export function CacheHitTrendDialog({
               这里只剩图例说不了的那两件事。原来这段是 100 字的 10px 灰字，铺满整个弹窗宽度。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空白格表示该时段没有请求；柱形深浅表示该时段的 token 量。请求明细只保留 30 天。',
-              'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 30 days.',
+              '空白格表示该时段没有请求；柱形深浅表示该时段的 token 量。请求明细只保留 8 天。',
+              'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 8 days.',
             )}
           </p>
 

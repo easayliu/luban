@@ -1081,14 +1081,14 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
       title={t('最近请求', 'Recent requests')}
       description={usage.data
         ? t(
-            `近 30 天共 ${usage.data.total.toLocaleString(locale)} 条，费用 ${formatUsd(usage.data.total_cost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
-            `${usage.data.total.toLocaleString(locale)} requests costing ${formatUsd(usage.data.total_cost)} in the last 30 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
+            `近 8 天共 ${usage.data.total.toLocaleString(locale)} 条，费用 ${formatUsd(usage.data.total_cost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
+            `${usage.data.total.toLocaleString(locale)} requests costing ${formatUsd(usage.data.total_cost)} in the last 8 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
           )
-        : t('流水仅保留最近 30 天。', 'Logs are retained for 30 days.')}
+        : t('流水仅保留最近 8 天。', 'Logs are retained for 8 days.')}
       mobileDescription={usage.data
         ? t(
-            `近 30 天 ${usage.data.total.toLocaleString(locale)} 条 · ${formatUsd(usage.data.total_cost)}`,
-            `${usage.data.total.toLocaleString(locale)} in 30 days · ${formatUsd(usage.data.total_cost)}`,
+            `近 8 天 ${usage.data.total.toLocaleString(locale)} 条 · ${formatUsd(usage.data.total_cost)}`,
+            `${usage.data.total.toLocaleString(locale)} in 8 days · ${formatUsd(usage.data.total_cost)}`,
           )
         : undefined}
       action={(

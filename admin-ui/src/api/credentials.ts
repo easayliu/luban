@@ -227,7 +227,7 @@ export interface DeviceBinding {
 /**
  * 一条请求流水（`usage_logs` 的一行）。
  *
- * **与卡片上的累计值不同源**：卡片读的是终身账本，流水只保留近 30 天，所以明细逐条加起来
+ * **与卡片上的累计值不同源**：卡片读的是终身账本，流水只保留近 8 天，所以明细逐条加起来
  * 通常小于卡片上的累计花费——不是哪一边算错了。
  */
 export interface UsageLog {
@@ -837,7 +837,7 @@ export async function probeCredential(
 export interface ModelsResp {
   /** 价目表里的现役模型（后端单一真源，前端不再抄）。 */
   listed: string[]
-  /** 最近 30 天客户端真实请求过的模型，按最后出现时刻倒序。 */
+  /** 最近 7 天客户端真实请求过的模型，按最后出现时刻倒序。 */
   recent: { model: string; last_ts: number }[]
 }
 
