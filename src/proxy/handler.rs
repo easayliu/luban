@@ -16,7 +16,7 @@ use super::body::{
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
     client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
     extract_session_id, hoists_system_role, is_billable_messages, is_fallback_rejection,
-    known_latest_release, outbound_carries_fallbacks, refusal_fallbacks_for,
+    known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
     remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
     sim_session_key, stream_requested, trusted_cc_version, ua_of,
 };
@@ -403,11 +403,12 @@ pub(super) async fn handle_inner(
     //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
     //      账号状态无关的 4xx。规则不是写死的，是上游那条 400 自己喂出来的，回给客户端的
     //      也是它当初那句原话，见 [`remember_shape_rejection`]。
+    let system_hoisted = billable && hoists_system_role(&state.store.forward_flags(), cc_shaped);
     if let Some((field, value, message)) = known_shape_rejection(
         &state.shape_rejections,
         req_model.as_deref(),
         body_json.as_ref(),
-        billable && hoists_system_role(&state.store.forward_flags(), cc_shaped),
+        system_hoisted,
     ) {
         tracing::warn!(
             %method, path = %path_and_query, ua = %client_ua,
@@ -415,6 +416,23 @@ pub(super) async fn handle_inner(
             "rejected locally: upstream has already rejected this request shape"
         );
         return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+    }
+
+    // 2.3') 对话中途的 `role:"system"` 摆错位置（一段 system 之后紧跟 user）→ 本地直接拒，
+    //       回上游那句原话，见 [`misplaced_system_role`]。规则是上游报错里写明的，不靠学：
+    //       0.3.188 之前它被形态记忆学成「这个模型不收 system」，之后同模型带中途 system 的
+    //       请求不论位置对错全被本地拒掉。出站会被整条提升的不判（上游看不到这个位置）；
+    //       只判计费路径，`count_tokens` 等原样交给上游。
+    if billable
+        && !system_hoisted
+        && let Some(message) = misplaced_system_role(body_json.as_ref())
+    {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), cc_shaped,
+            "rejected locally: a mid-conversation system message is not followed by an assistant message"
+        );
+        return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
 
     // 2.3a) OpenAI 格式转换残留 → 本地直接拒，不修补，见 [`find_openai_marker`]。

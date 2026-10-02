@@ -2256,6 +2256,17 @@ pub(super) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -
     true
 }
 
+/// 补消息级缓存断点时算作「最后一条」的消息：从尾部往前跳过指令式 system
+/// （[`is_system_directive`]）。
+///
+/// 指令式那条 `content` 是空数组，挂不上断点；以前它被当空壳丢掉，前一条自然成了末条，
+/// 现在原样留着，不跳过的话 [`align_message_shape`] / [`ensure_cc_message_breakpoint`] 摸到
+/// 空数组就直接返回，前面整段历史失去自动缓存。断点落在它前一条上，缓存前缀覆盖的内容与
+/// 丢掉它时一样；指令本身留在原位，不挪。
+fn last_cacheable_message_mut(msgs: &mut [serde_json::Value]) -> Option<&mut serde_json::Value> {
+    msgs.iter_mut().rev().find(|m| !is_system_directive(m))
+}
+
 /// 把 `messages` 对齐到官方形态：内容一律块数组，并给**最后一条消息的最后一块**补上官方那
 /// 第三个缓存断点。返回是否改动过。
 ///
@@ -2311,7 +2322,7 @@ pub(super) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) 
     let last = v
         .get_mut("messages")
         .and_then(|m| m.as_array_mut())
-        .and_then(|a| a.last_mut())
+        .and_then(|a| last_cacheable_message_mut(a))
         .and_then(|m| m.get_mut("content"))
         .and_then(|c| c.as_array_mut())
         .and_then(|blocks| blocks.last_mut())
@@ -2418,7 +2429,7 @@ pub(super) fn ensure_cc_message_breakpoint(v: &mut serde_json::Value) -> bool {
     let last = v
         .get_mut("messages")
         .and_then(|m| m.as_array_mut())
-        .and_then(|a| a.last_mut())
+        .and_then(|a| last_cacheable_message_mut(a))
         .and_then(|m| m.get_mut("content"))
         .and_then(|c| c.as_array_mut())
         .and_then(|blocks| blocks.last_mut())
@@ -3212,47 +3223,117 @@ pub(super) fn strip_empty_text_blocks(v: &mut serde_json::Value) -> bool {
 ///
 /// **只碰 `role:"system"`**：空 content 的 user / assistant 消息同样会被上游拒，但删掉它们会
 /// 改变轮次交替（末轮变成 assistant、整个 messages 变空……），那是另一回事，不在这里处理。
+///
+/// **指令式写法不算空壳**（[`is_system_directive`]）：`content: []` 带消息级 `output_config`，
+/// 2.1.285 官方就这么发（`{"role":"system","output_config":{"effort":"high"},"content":[]}`），
+/// 上游明说它「放在任何位置都收」。删掉它就是把客户端中途调的 effort 一并删了。
 pub(super) fn drop_empty_system_messages(v: &mut serde_json::Value) -> bool {
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return false;
     };
     let total = msgs.len();
     let mut dropped: Vec<String> = Vec::new();
-    let is_empty_shell = |msg: &serde_json::Value| {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
-            return false;
-        }
-        match msg.get("content") {
-            // 字段缺失或写成 null。
-            None | Some(serde_json::Value::Null) => true,
-            // 空串。**不 trim**：一个空格在上游那边是合法的非空文本，判它为空就是替客户端
-            // 删掉一条它认为有内容的消息。
-            Some(serde_json::Value::String(s)) => s.is_empty(),
-            // 空数组，或整条只有空 `text` 块——后者 `strip_empty_text_blocks` 按约定不会去剥
-            // （剥完会变空），留下来同样是一次 400。
-            Some(serde_json::Value::Array(arr)) => arr.iter().all(|blk| {
-                blk.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && blk.get("text").and_then(|t| t.as_str()).is_some_and(str::is_empty)
-            }),
-            // 别的形态（对象、数字……）不是本函数的事，交给上游去说。
-            Some(_) => false,
-        }
-    };
     for (i, msg) in msgs.iter().enumerate() {
-        if is_empty_shell(msg) {
+        if is_empty_system_shell(msg) {
             dropped.push(format!("{i}/{total}"));
         }
     }
     if dropped.is_empty() {
         return false;
     }
-    msgs.retain(|msg| !is_empty_shell(msg));
+    msgs.retain(|msg| !is_empty_system_shell(msg));
     tracing::info!(
         count = dropped.len(),
         at = %dropped.join(", "),
         "dropped empty role:\"system\" messages: upstream rejects a system message with no content blocks"
     );
     true
+}
+
+/// 出站时会被 [`drop_empty_system_messages`] 丢掉的那种 `role:"system"` 空壳：`content` 缺失、
+/// `null`、空串、空数组，或整条只有空 `text` 块；[`is_system_directive`] 除外。
+pub(super) fn is_empty_system_shell(msg: &serde_json::Value) -> bool {
+    if msg.get("role").and_then(|r| r.as_str()) != Some("system") || is_system_directive(msg) {
+        return false;
+    }
+    match msg.get("content") {
+        // 字段缺失或写成 null。
+        None | Some(serde_json::Value::Null) => true,
+        // 空串。**不 trim**：一个空格在上游那边是合法的非空文本，判它为空就是替客户端
+        // 删掉一条它认为有内容的消息。
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        // 空数组，或整条只有空 `text` 块——后者 `strip_empty_text_blocks` 按约定不会去剥
+        // （剥完会变空），留下来同样是一次 400。
+        Some(serde_json::Value::Array(arr)) => arr.iter().all(|blk| {
+            blk.get("type").and_then(|t| t.as_str()) == Some("text")
+                && blk.get("text").and_then(|t| t.as_str()).is_some_and(str::is_empty)
+        }),
+        // 别的形态（对象、数字……）不是本函数的事，交给上游去说。
+        Some(_) => false,
+    }
+}
+
+/// 指令式 `role:"system"`：`content` 恰为空数组、且带消息级 `output_config`。
+///
+/// 上游原话（2026-10-02 线上 400）：`the directive-only form (content: [] with output_config)
+/// is accepted at any position`。口径逐字照搬——空串、缺 content 的不算，上游没说收。
+pub(super) fn is_system_directive(msg: &serde_json::Value) -> bool {
+    msg.get("role").and_then(|r| r.as_str()) == Some("system")
+        && msg.get("content").and_then(|c| c.as_array()).is_some_and(|a| a.is_empty())
+        && msg.get("output_config").is_some()
+}
+
+/// 对话中途 `role:"system"` 摆错位置时上游那句 400 的原话，`{}` 处是消息下标。
+///
+/// 2026-10-02 线上实测（`claude-opus-5-5`）：
+/// ```text
+/// messages.1: role 'system' must precede an 'assistant' message or end the array; the
+/// directive-only form (content: [] with output_config) is accepted at any position
+/// ```
+fn misplaced_system_message(index: usize) -> String {
+    format!(
+        "messages.{index}: role 'system' must precede an 'assistant' message or end the array; \
+         the directive-only form (content: [] with output_config) is accepted at any position"
+    )
+}
+
+/// 对话中途的 `role:"system"` 摆错了位置 → 上游那句原话（见 [`misplaced_system_message`]）。
+///
+/// 规则是上游报错自己写明的：中途的 system 必须紧挨在 assistant 之前，或者是数组最后一条；
+/// 指令式写法（[`is_system_directive`]）放哪儿都行。官方抓包（2.1.260–2.1.285，七百余条中途
+/// system）与之吻合，并补了一条：**连续几条 system 算一段**——`user → system →
+/// system(clear_at) → assistant` 官方常发、上游收，所以判的是「这一段之后的第一条非 system」。
+///
+/// **只拒确定无疑的**：段后紧跟的是 `user` 才算错（`tool` 之类别的 role 交给上游去说）；段里
+/// 夹着指令式 system 时不拒——「普通 system → 指令 → user」上游收不收没有实测，宁可放过去
+/// 让上游判。出站会被丢掉的空壳（[`is_empty_system_shell`]）不算数，它们到不了上游。
+///
+/// 首条 user/assistant 之前的不归这里（[`first_turn_index`]）：上游回的是另一句，由
+/// [`find_openai_marker`] 或提升（[`hoist_system_role_messages`]）处理。
+pub(super) fn misplaced_system_role(body: Option<&serde_json::Value>) -> Option<String> {
+    let msgs = body?.get("messages")?.as_array()?;
+    let role = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()).map(str::to_owned);
+    let mut i = first_turn_index(msgs);
+    while i < msgs.len() {
+        if role(&msgs[i]).as_deref() != Some("system") {
+            i += 1;
+            continue;
+        }
+        // 这一段连续 system 是 [i, end)。
+        let end = (i..msgs.len())
+            .find(|&j| role(&msgs[j]).as_deref() != Some("system"))
+            .unwrap_or(msgs.len());
+        let run = &msgs[i..end];
+        let followed_by_user = end < msgs.len() && role(&msgs[end]).as_deref() == Some("user");
+        if followed_by_user && !run.iter().any(is_system_directive) {
+            // 点名段里第一条会真正送到上游的；整段全是空壳则出站后这段不存在。
+            if let Some(k) = run.iter().position(|m| !is_empty_system_shell(m)) {
+                return Some(misplaced_system_message(i + k));
+            }
+        }
+        i = end;
+    }
+    None
 }
 
 /// `messages` 里首条 user/assistant 的下标（一条都没有时为长度）。
@@ -5252,6 +5333,110 @@ mod tests {
     /// 最后一段走完整条 `rewrite_body`：**CC 形态的请求同样会丢**——`hoist_system_role` 的
     /// 「CC 形态跳过」保的是官方带内容的那条 `role:"system"`（deferred tools），不是空壳；
     /// 实跑里正是一条 agent-sdk 的 CC 请求带着空壳换回一次 400（`req_grlwDAtQQpqvf54d`）。
+    /// 指令式 system（`content: []` + 消息级 `output_config`）不是空壳：2.1.285 官方就这么发，
+    /// 上游放哪儿都收；当空壳丢掉等于把客户端中途调的 effort 删了。
+    #[test]
+    fn system_directive_is_not_dropped_as_an_empty_shell() {
+        let directive = serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": [] });
+        let user = serde_json::json!({ "role": "user", "content": "hi" });
+        let mut v = serde_json::json!({ "messages": [user.clone(), directive.clone()] });
+        assert!(!crate::proxy::drop_empty_system_messages(&mut v));
+        assert_eq!(v["messages"], serde_json::json!([user.clone(), directive]));
+
+        // 口径逐字照上游：只有空数组算指令式，空串 / 缺 content 带 output_config 照旧当空壳。
+        for shell in [
+            serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": "" }),
+            serde_json::json!({ "role": "system", "output_config": { "effort": "high" } }),
+        ] {
+            let mut v = serde_json::json!({ "messages": [user.clone(), shell.clone()] });
+            assert!(crate::proxy::drop_empty_system_messages(&mut v), "这条该算空壳: {shell}");
+        }
+    }
+
+    /// 末尾是指令式 system 时，消息断点补在它前一条上，指令留在原位、不挂断点。
+    /// 两条补断点的路（模拟路径 [`align_message_shape`]、真 CC [`ensure_cc_message_breakpoint`]）都验。
+    #[test]
+    fn trailing_system_directive_does_not_block_the_message_breakpoint() {
+        let directive = serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": [] });
+        let body = || {
+            serde_json::json!({
+                "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral", "ttl": "1h" } }],
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                    { "role": "assistant", "content": [{ "type": "text", "text": "ok" }] },
+                    { "role": "user", "content": [{ "type": "text", "text": "go on" }] },
+                    directive.clone(),
+                ]
+            })
+        };
+
+        let mut v = body();
+        assert!(crate::proxy::body::ensure_cc_message_breakpoint(&mut v));
+        assert_eq!(v["messages"][2]["content"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(v["messages"][3], directive, "指令原样留在末尾");
+
+        let mut v = body();
+        assert!(crate::proxy::body::align_message_shape(
+            &mut v,
+            crate::proxy::CacheShape { global: false, ttl_1h: false }
+        ));
+        assert!(v["messages"][2]["content"][0].get("cache_control").is_some());
+        assert_eq!(v["messages"][3], directive, "指令原样留在末尾");
+    }
+
+    /// 对话中途 system 的位置：照上游原话判，连续几条算一段（官方抓包里的几种形态全放行）。
+    #[test]
+    fn misplaced_mid_conversation_system_is_rejected_with_the_upstream_wording() {
+        let check = |msgs: serde_json::Value| {
+            crate::proxy::misplaced_system_role(Some(&serde_json::json!({ "messages": msgs })))
+        };
+        let u = serde_json::json!({ "role": "user", "content": "hi" });
+        let a = serde_json::json!({ "role": "assistant", "content": "ok" });
+        let s = serde_json::json!({ "role": "system", "content": "be brief" });
+        let clear = serde_json::json!({ "role": "system", "content": "x", "clear_at": "t" });
+        let directive = serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": [] });
+        let shell = serde_json::json!({ "role": "system", "content": "" });
+
+        // 官方实际发的几种（2.1.260–2.1.285 抓包）：后面跟 assistant、在末尾、连续两条再跟
+        // assistant / 在末尾、指令式跟 assistant。
+        for ok in [
+            serde_json::json!([u, s, a]),
+            serde_json::json!([u, s]),
+            serde_json::json!([u, s, clear, a]),
+            serde_json::json!([u, a, u, s, clear]),
+            serde_json::json!([u, directive, a]),
+        ] {
+            assert_eq!(check(ok.clone()), None, "官方形态不该拦: {ok}");
+        }
+
+        // 跟着 user：拒，下标与原话照上游。
+        let msg = check(serde_json::json!([u, s, u])).expect("system 后跟 user 该拒");
+        assert_eq!(
+            msg,
+            "messages.1: role 'system' must precede an 'assistant' message or end the array; \
+             the directive-only form (content: [] with output_config) is accepted at any position"
+        );
+        // 连续一段后跟 user：点名段里第一条。
+        assert!(
+            check(serde_json::json!([u, a, u, s, clear, u])).unwrap().starts_with("messages.3:")
+        );
+        // 前面的空壳出站会被丢掉，不算数；点名的是第一条会送到上游的。
+        assert!(check(serde_json::json!([u, shell, s, u])).unwrap().starts_with("messages.2:"));
+
+        // 拿不准的一律放过，交给上游：指令式本身、段里夹着指令式、整段都是空壳、
+        // 后面跟的不是 user（别的 role 交给上游去说）、开头那段（另一条路管）。
+        for unsure in [
+            serde_json::json!([u, directive, u]),
+            serde_json::json!([u, s, directive, u]),
+            serde_json::json!([u, shell, u]),
+            serde_json::json!([u, s, { "role": "tool", "content": "x" }]),
+            serde_json::json!([s, u]),
+        ] {
+            assert_eq!(check(unsure.clone()), None, "拿不准的不该本地拒: {unsure}");
+        }
+        assert_eq!(crate::proxy::misplaced_system_role(None), None);
+    }
+
     #[test]
     fn empty_system_messages_are_dropped_before_going_out() {
         let sys = |content: Option<serde_json::Value>| match content {

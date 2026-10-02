@@ -54,6 +54,25 @@ pub(super) struct ShapeProbe {
 /// 条件句学成无条件，代价是本地长期拒掉一批合法请求，且现象是「换个客户端就好了」，极难查。
 const CONDITIONAL_MARKS: &[&str] = &[" when ", " unless ", " without ", " while ", " if "];
 
+/// 「位置约束」的说法。同 [`CONDITIONAL_MARKS`]，命中即**不学**。
+///
+/// 2026-10-02 线上（`claude-opus-5-5`）：
+/// ```text
+/// messages.1: role 'system' must precede an 'assistant' message or end the array; the
+/// directive-only form (content: [] with output_config) is accepted at any position
+/// ```
+/// 字段名 `role` 与取值 `'system'` 都在，又不含条件词，于是被学成「这个模型不收 system」，
+/// 之后同模型带中途 system 的请求不论位置对错全在本地拒掉。它说的是**摆在哪儿**不行，不是
+/// 这个取值不行；该拦的那部分由入口的 [`super::body::misplaced_system_role`] 按原话精确判。
+const POSITIONAL_MARKS: &[&str] = &[" must precede ", " must follow ", " at any position"];
+
+/// 这句 400 是不是「有前提」的（条件句或位置约束），是则不能学成「这个取值一律拒」。
+/// 学的时候（[`remember_shape_rejection`]）与从库里回填时（[`seed_tables`]）共用。
+fn is_qualified_rejection(message: &str) -> bool {
+    let hay = message.to_lowercase();
+    CONDITIONAL_MARKS.iter().chain(POSITIONAL_MARKS).any(|m| hay.contains(m))
+}
+
 /// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取、怎么算被点名」，学习与
 /// 拦截两侧都不必改——它们只跟这张表打交道。
 pub(super) const SHAPE_PROBES: &[ShapeProbe] = &[
@@ -236,12 +255,13 @@ pub struct SeededMemories {
     pub empty_reply: usize,
     pub refusal: usize,
     pub app_refusal: usize,
-    /// 按新逻辑不该存在的旧行：不回填，交给调用方从库里删掉，免得下次启动再撞一遍。两种：
+    /// 按新逻辑不该存在的旧行：不回填，交给调用方从库里删掉，免得下次启动再撞一遍。三种：
     /// - v0.3.89 那版把上游拒答（`stop_reason: "refusal"`）也学成了「请求类」——一条触发
     ///   拒答的内容把同形态的所有正常请求一起拦掉。判据是 `message`（当时截的上游回复）里带
     ///   `"stop_reason":"refusal"`（去空白比）；
     /// - 0.3.98 之前学的拒答规则没存上游那次的响应体（[`store::LearnedRejection::reply`]），
-    ///   命中回的是 luban 自己造的 403；现在要原样回放上游的响应，没有体的删掉重学。
+    ///   命中回的是 luban 自己造的 403；现在要原样回放上游的响应，没有体的删掉重学；
+    /// - 0.3.188 之前把「位置约束」的 400 也学成了形态规则（[`POSITIONAL_MARKS`]）。
     pub stale: Vec<store::LearnedRejection>,
 }
 
@@ -302,6 +322,12 @@ fn seed_tables(
                 let Some(probe) = SHAPE_PROBES.iter().find(|p| p.field == r.field) else {
                     continue;
                 };
+                // 旧版本按老判据学进库里的「有前提」的那种（0.3.188 之前的位置约束）：不回填、
+                // 从库里删掉，否则升级后它还要在本地误拒到 7 天保鲜期满。
+                if is_qualified_rejection(&r.message) {
+                    out.stale.push(r);
+                    continue;
+                }
                 if shape_table.len() >= SHAPE_MEMORY_CAP {
                     continue;
                 }
@@ -995,11 +1021,11 @@ pub(super) fn remember_shape_rejection(
     // 认不出模型名、或请求体不是 JSON：这条 400 照常透传给客户端，只是学不到东西。
     let (Some(model), Some(body)) = (model, body) else { return learned };
     let (_, message) = parse_upstream_error(err);
-    let hay = message.to_lowercase();
-    // 条件句一律不学：这条 400 说的是「在某某前提下不行」，不是「这个取值不行」。
-    if CONDITIONAL_MARKS.iter().any(|m| hay.contains(m)) {
+    // 条件句、位置约束一律不学：这条 400 说的是「在某某前提下不行」，不是「这个取值不行」。
+    if is_qualified_rejection(&message) {
         return learned;
     }
+    let hay = message.to_lowercase();
     for probe in SHAPE_PROBES {
         if !hay.contains(probe.keyword) {
             continue;
@@ -1336,6 +1362,72 @@ mod tests {
         assert!(
             crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), mid.as_ref(), true)
                 .is_none()
+        );
+    }
+
+    /// 2026-10-02 线上原文（逐字）：说的是 system **摆在哪儿**，不是这个模型不收 system。
+    const SYSTEM_POSITION_400: &str = "messages.1: role 'system' must precede an 'assistant' \
+        message or end the array; the directive-only form (content: [] with output_config) is \
+        accepted at any position";
+
+    /// 位置约束的 400 不学：学了就是同模型带中途 system 的请求全被本地拒掉，位置对的也一样。
+    /// 库里旧版本学进去的同款，回填时不进表、交给调用方删掉。
+    #[test]
+    fn positional_system_400_is_not_learned_and_stale_rows_are_dropped() {
+        let mem = crate::proxy::ShapeMemory::default();
+        let body = role_req("claude-opus-5-5", "system");
+        let learned = crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-opus-5-5"),
+            body.as_ref(),
+            &err_json(SYSTEM_POSITION_400),
+        );
+        assert!(learned.is_empty(), "位置约束不该学成形态规则");
+        assert!(
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-opus-5-5"),
+                body.as_ref(),
+                false
+            )
+            .is_none()
+        );
+
+        // 无条件的那句照学，两者互不干扰。
+        let learned = crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            role_req("claude-haiku-4-5", "system").as_ref(),
+            &err_json(ROLE_400),
+        );
+        assert_eq!(learned.len(), 1);
+
+        let row = |model: &str, message: &str| store::LearnedRejection {
+            kind: "shape".into(),
+            model: model.into(),
+            field: "role".into(),
+            value: "system".into(),
+            message: message.into(),
+            reply: None,
+        };
+        let (dep, empty) = Default::default();
+        let seeded = crate::proxy::resync_learned_memories(
+            &mem,
+            &dep,
+            &empty,
+            vec![row("claude-opus-5-5", SYSTEM_POSITION_400), row("claude-haiku-4-5", ROLE_400)],
+        );
+        assert_eq!(seeded.shape, 1, "只回填无条件的那条");
+        assert_eq!(seeded.stale.len(), 1);
+        assert_eq!(seeded.stale[0].model, "claude-opus-5-5");
+        assert!(
+            crate::proxy::known_shape_rejection(
+                &mem,
+                Some("claude-opus-5-5"),
+                body.as_ref(),
+                false
+            )
+            .is_none()
         );
     }
 
