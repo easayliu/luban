@@ -3361,6 +3361,7 @@ pub struct SessionSnapshot {
 }
 
 /// 指标累积的最小单位：一条 API 调用。导出时按属性聚合。
+#[cfg_attr(test, derive(Debug))]
 struct CallMetric {
     session_id: String,
     device_id: String,
@@ -3417,6 +3418,33 @@ struct Pending {
     /// 退出收尾时指定的导出事件时间戳（排在 `lsp_shutdown` 之后、`cache_eviction_hint`
     /// 之前）；平时为 `None`，导出时取当下。
     export_at: Option<DateTime<Utc>>,
+}
+
+impl Pending {
+    /// 追加一串事件与 Datadog 条目，两路各记下最早攒进来的时刻。
+    fn push_batch(&mut self, (events, dd): TplOutput, now: Instant) {
+        self.events_since.get_or_insert(now);
+        self.events.extend(events);
+        self.dd_since.get_or_insert(now);
+        self.dd.extend(dd);
+    }
+
+    /// 会话的头一条常是标题生成那种不带环境段的侧查询，那时还不知道工作目录是不是 git 仓库；
+    /// 等主线程那条说了，把还没发出去的那些补上 `vcs`（官方同一会话每条都带）。
+    fn backfill_vcs(&mut self, vcs: &'static str) {
+        for (_, e) in self.events.iter_mut() {
+            if let Some(env) = e.get_mut("event_data").and_then(|d| d.get_mut("env"))
+                && env.get("vcs").is_none()
+            {
+                insert_after(env, "is_local_agent_mode", vec![("vcs", json!(vcs))]);
+            }
+        }
+        for d in self.dd.iter_mut() {
+            if d.get("vcs").is_none() && d.get("deployment_environment").is_some() {
+                insert_after(d, "deployment_environment", vec![("vcs", json!(vcs))]);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3597,6 +3625,7 @@ impl Telemetry {
     fn ingest(&self, call: ApiCall) {
         let mut st = self.0.state.lock();
         Self::process(&mut st, call, true, None);
+        tests::dump_pending(&st);
     }
 
     /// 把一条调用变成事件入队。`allow_defer` 为真时，侧查询会先扣住等同会话的下一条主线程
@@ -6963,7 +6992,7 @@ impl Telemetry {
         if let Some(m) = device_default_update {
             st.device_default_model.insert(device_key, (m, now));
         }
-        if let Some((probe_identity, (ev, d))) = probe_side {
+        if let Some((probe_identity, out)) = probe_side {
             let p =
                 st.pending.entry((call.cred_id, probe_identity.session_id.clone())).or_default();
             p.version = version.clone();
@@ -6971,10 +7000,7 @@ impl Telemetry {
             p.model = display_model.clone();
             p.betas = betas_session.clone();
             p.identity = Some(probe_identity);
-            p.events_since.get_or_insert(now);
-            p.events.extend(ev);
-            p.dd_since.get_or_insert(now);
-            p.dd.extend(d);
+            p.push_batch(out, now);
         }
         if let Some(sess) = st.sessions.get_mut(&key) {
             sess.file_sizes = file_sizes;
@@ -6984,21 +7010,8 @@ impl Telemetry {
         let pending = st.pending.entry((call.cred_id, session_id.clone())).or_default();
         pending.version = version;
         pending.subscription_type = identity.subscription_type.clone();
-        // 会话的头一条常是标题生成那种不带环境段的侧查询，那时还不知道工作目录是不是 git 仓库；
-        // 等主线程那条说了，把还没发出去的那些补上 `vcs`（官方同一会话每条都带）。
         if let Some(vcs) = identity.vcs {
-            for (_, e) in pending.events.iter_mut() {
-                if let Some(env) = e.get_mut("event_data").and_then(|d| d.get_mut("env"))
-                    && env.get("vcs").is_none()
-                {
-                    insert_after(env, "is_local_agent_mode", vec![("vcs", json!(vcs))]);
-                }
-            }
-            for d in pending.dd.iter_mut() {
-                if d.get("vcs").is_none() && d.get("deployment_environment").is_some() {
-                    insert_after(d, "deployment_environment", vec![("vcs", json!(vcs))]);
-                }
-            }
+            pending.backfill_vcs(vcs);
         }
         pending.identity = Some(base_identity.clone());
         // **模型 / beta / prompt_id 只跟主线程走**（第一条就是侧查询时先占个位）。
@@ -7013,10 +7026,7 @@ impl Telemetry {
             pending.prompt_id = prompt_id.clone();
         }
         pending.started_wall = Some(started_wall);
-        pending.events_since.get_or_insert(now);
-        pending.events.extend(events);
-        pending.dd_since.get_or_insert(now);
-        pending.dd.extend(dd);
+        pending.push_batch((events, dd), now);
         pending.metrics_since.get_or_insert(now);
         pending.metrics.push(CallMetric {
             session_id,
@@ -7044,14 +7054,16 @@ impl Telemetry {
 
         // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去。
         if is_main {
-            let deferred = st
-                .sessions
-                .get_mut(&key)
-                .map(|s| std::mem::take(&mut s.deferred))
-                .unwrap_or_default();
-            for (c, prev_end, _) in deferred {
-                Self::process(st, c, false, prev_end);
-            }
+            Self::replay_deferred(st, &key);
+        }
+    }
+
+    /// 把某会话扣住的侧查询按顺序补发（主线程请求到了，或扣得太久）。
+    fn replay_deferred(st: &mut State, key: &(i64, String)) {
+        let deferred =
+            st.sessions.get_mut(key).map(|s| std::mem::take(&mut s.deferred)).unwrap_or_default();
+        for (c, prev_end, _) in deferred {
+            Self::process(st, c, false, prev_end);
         }
     }
 
@@ -7165,14 +7177,7 @@ impl Telemetry {
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {
-            let deferred = st
-                .sessions
-                .get_mut(&k)
-                .map(|s| std::mem::take(&mut s.deferred))
-                .unwrap_or_default();
-            for (c, prev_end, _) in deferred {
-                Self::process(&mut st, c, false, prev_end);
-            }
+            Self::replay_deferred(&mut st, &k);
         }
         let expired: Vec<((i64, String), Session)> = {
             let keys: Vec<(i64, String)> = st
@@ -7548,6 +7553,153 @@ fn report(
 mod tests {
     use super::*;
 
+    // ---- 重构对照 ----
+    //
+    // 设了 `LUBAN_TELEMETRY_DUMP=<目录>` 时，每次 `ingest` 之后把全部待发批次规范化后追加到
+    // `<目录>/<测试名>.txt`：随机 uuid 按首次出现编号，时间戳换成相对测试起点的毫秒。改动
+    // `process` 这类大段代码前后各跑一遍、diff 两个目录，就能确认产出的事件逐字没变。
+    // 测试里的「当前时刻」统一走 [`frozen_now`]，否则两次运行之间的微秒抖动会让毫秒级字段跳 1。
+
+    thread_local! {
+        /// 每个测试线程首次取时定下、取整到秒，之后不再走。
+        static FROZEN: SystemTime = {
+            let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+        };
+        static DUMP_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static DUMP_UUIDS: std::cell::RefCell<HashMap<String, usize>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    fn frozen_now() -> SystemTime {
+        FROZEN.with(|t| *t)
+    }
+
+    pub(super) fn dump_pending(st: &State) {
+        use std::fmt::Write as _;
+        let Some(dir) = std::env::var_os("LUBAN_TELEMETRY_DUMP") else { return };
+        let name = std::thread::current().name().unwrap_or("main").replace("::", "-");
+        let seq = DUMP_SEQ.with(|c| c.replace(c.get() + 1));
+        let ts = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut out = format!("== ingest {seq}\n");
+        let mut keys: Vec<_> = st.pending.keys().collect();
+        keys.sort();
+        for k in keys {
+            let p = &st.pending[k];
+            let _ = writeln!(
+                out,
+                "-- {k:?} version={} sub={} model={} betas={} prompt={} started={:?} export_at={:?}",
+                p.version,
+                p.subscription_type,
+                p.model,
+                p.betas,
+                p.prompt_id,
+                p.started_wall.map(|t| ts(t.into())),
+                p.export_at.map(ts),
+            );
+            let _ = writeln!(out, "identity {:?}", p.identity);
+            for (t, e) in &p.events {
+                let _ = writeln!(out, "ev {} {e}", ts(*t));
+            }
+            for d in &p.dd {
+                let _ = writeln!(out, "dd {d}");
+            }
+            for m in &p.metrics {
+                let _ = writeln!(out, "metric {m:?}");
+            }
+        }
+        let text = DUMP_UUIDS.with(|u| normalize_dump(&out, &mut u.borrow_mut()));
+        let path = std::path::Path::new(&dir).join(format!("{name}.txt"));
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut f, text.as_bytes()).unwrap();
+    }
+
+    /// uuid → `<uN>`（按首次出现编号），一天以内的 RFC3339 时间戳 → `T+毫秒`（相对
+    /// [`frozen_now`]；`build_time` 那种固定时刻原样留着），base64 的 JSON 串先解开再处理，
+    /// 随真实日期走的 `build_age_mins` 抹掉。
+    fn normalize_dump(s: &str, uuids: &mut HashMap<String, usize>) -> String {
+        let s = &decode_b64_strings(s);
+        let base: DateTime<Utc> = frozen_now().into();
+        let b = s.as_bytes();
+        let is_uuid = |w: &[u8]| {
+            w.len() == 36
+                && w.iter().enumerate().all(|(i, c)| match i {
+                    8 | 13 | 18 | 23 => *c == b'-',
+                    _ => c.is_ascii_digit() || (b'a'..=b'f').contains(c),
+                })
+        };
+        let is_ts_head = |w: &[u8]| {
+            w.len() >= 11
+                && w[..4].iter().all(u8::is_ascii_digit)
+                && w[4] == b'-'
+                && w[7] == b'-'
+                && w[10] == b'T'
+        };
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < b.len() {
+            let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            if boundary && i + 36 <= b.len() && is_uuid(&b[i..i + 36]) {
+                let next = uuids.len() + 1;
+                let n = *uuids.entry(s[i..i + 36].to_string()).or_insert(next);
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("<u{n}>"));
+                i += 36;
+                continue;
+            }
+            if boundary && is_ts_head(&b[i..b.len().min(i + 11)]) {
+                let end = b[i..]
+                    .iter()
+                    .position(|c| !(c.is_ascii_digit() || b"-:T.Z+".contains(c)))
+                    .map_or(b.len(), |p| i + p);
+                if let Ok(t) = DateTime::parse_from_rfc3339(&s[i..end])
+                    && (t.with_timezone(&Utc) - base).num_hours().abs() < 24
+                {
+                    let ms = (t.with_timezone(&Utc) - base).num_milliseconds();
+                    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("T{ms:+}"));
+                    i = end;
+                    continue;
+                }
+            }
+            for key in ["\"build_age_mins\":", "\"buildAgeMins\":"] {
+                if s[i..].starts_with(key) {
+                    let digits =
+                        b[i + key.len()..].iter().take_while(|c| c.is_ascii_digit()).count();
+                    out.push_str(key);
+                    out.push('N');
+                    i += key.len() + digits;
+                }
+            }
+            let Some(ch) = s[i..].chars().next() else { break };
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// `"eyJ…"` 这种 base64 编码的 JSON 串换成 `b64:{…}`，好让里面的 uuid 与时间戳也被规范化。
+    fn decode_b64_strings(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(p) = rest.find("\"eyJ") {
+            out.push_str(&rest[..p + 1]);
+            rest = &rest[p + 1..];
+            let len = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || b"+/=".contains(c))
+                .count();
+            match STANDARD.decode(&rest[..len]).ok().and_then(|v| String::from_utf8(v).ok()) {
+                Some(json) if rest[len..].starts_with('"') => {
+                    out.push_str("b64:");
+                    out.push_str(&json);
+                    rest = &rest[len..];
+                }
+                _ => {}
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     fn identity() -> Identity {
         Identity {
             session_id: "111e3644-948f-43fb-9bc2-cac60e65fd32".into(),
@@ -7608,7 +7760,7 @@ mod tests {
             session_header: None,
             ua_out: "claude-cli/2.1.258 (external, cli)".into(),
             organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
-            started_at: SystemTime::now() - Duration::from_secs(8),
+            started_at: frozen_now() - Duration::from_secs(8),
             ttft_ms: Some(1800),
             total_ms: 6118,
             request_id: Some(request_id.into()),
@@ -7805,7 +7957,7 @@ mod tests {
 
         // 同一会话第二轮：有输入串、没有启动串与首轮那串。
         let mut second = call(cc_body(true), "req_2", "end_turn");
-        second.started_at = SystemTime::now();
+        second.started_at = frozen_now();
         t.ingest(second);
         let st = t.0.state.lock();
         let names: Vec<&str> = st.pending[&key()].events.iter().map(|(_, e)| ev_name(e)).collect();
@@ -7926,7 +8078,7 @@ mod tests {
         // 一分钟前发的：首轮那串版本检查（api_success 后 6.9s）得落在「退出」之前，真实
         // 情形下退出离最后一条请求至少 3 小时。
         let mut last = call(cc_body(true), "req_last", "end_turn");
-        last.started_at = SystemTime::now() - Duration::from_secs(60);
+        last.started_at = frozen_now() - Duration::from_secs(60);
         t.ingest(last);
         let now = Instant::now();
         t.gc(now);
@@ -7991,7 +8143,7 @@ mod tests {
         assert_eq!(t.take_due(after_idle).len(), 1, "退出那批发掉");
 
         let mut back = call(cc_body(false), "req_2", "end_turn");
-        back.started_at = SystemTime::now();
+        back.started_at = frozen_now();
         t.ingest(back);
         let flush_at = after_idle + Duration::from_secs(config::TELEMETRY_METRICS_FLUSH_SECS + 1);
         let due = t.take_due(flush_at);
@@ -8021,7 +8173,7 @@ mod tests {
         t.gc(again);
         t.take_due(again);
         let mut third = call(cc_body(true), "req_3", "end_turn");
-        third.started_at = SystemTime::now();
+        third.started_at = frozen_now();
         t.ingest(third);
         let due = t.take_due(again + Duration::from_secs(config::TELEMETRY_METRICS_FLUSH_SECS + 1));
         assert_eq!(
@@ -8240,14 +8392,14 @@ mod tests {
         // 第一条 tool_use 收尾、没有正文。
         let mut first = call(cc_body(true), "req_1", "tool_use");
         first.text_chars = 0;
-        first.started_at = SystemTime::now() - Duration::from_secs(20);
+        first.started_at = frozen_now() - Duration::from_secs(20);
         t.ingest(first);
         // 续轮：上一条 assistant 是 Bash 调用，末条是 tool_result。
         let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
         body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la","description":"list"}}]});
         body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"total 8\nfile"}]});
         let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
-        second.started_at = SystemTime::now() - Duration::from_secs(10);
+        second.started_at = frozen_now() - Duration::from_secs(10);
         second.ua_out = "claude-cli/2.1.260 (external, cli)".into();
         t.ingest(second);
 
@@ -8334,7 +8486,7 @@ mod tests {
     fn prompt_suggestion_is_its_own_auxiliary_turn() {
         let t = Telemetry::default();
         let mut main = call(cc_body(true), "req_main", "end_turn");
-        main.started_at = SystemTime::now() - Duration::from_secs(20);
+        main.started_at = frozen_now() - Duration::from_secs(20);
         t.ingest(main);
         let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
         body["messages"][2] = json!({"role":"user","content":"[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nFIRST: ..."});
@@ -8342,7 +8494,7 @@ mod tests {
             "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=b6499; cc_prev_req=req_main;"
         );
         let mut sugg = call(body.to_string().into_bytes(), "req_sugg", "end_turn");
-        sugg.started_at = SystemTime::now() - Duration::from_secs(5);
+        sugg.started_at = frozen_now() - Duration::from_secs(5);
         sugg.ua_out = "claude-cli/2.1.260 (external, cli)".into();
         t.ingest(sugg);
         let st = t.0.state.lock();
@@ -8420,7 +8572,7 @@ mod tests {
     fn session_title_generation_is_a_chainless_side_query() {
         let t = Telemetry::default();
         let mut main = call(cc_body(true), "req_main", "end_turn");
-        main.started_at = SystemTime::now() - Duration::from_secs(20);
+        main.started_at = frozen_now() - Duration::from_secs(20);
         t.ingest(main);
         let body = json!({
             "model": "claude-haiku-4-5-20251001",
@@ -8436,7 +8588,7 @@ mod tests {
             "metadata": {"user_id": "{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}"}
         });
         let mut title = call(body.to_string().into_bytes(), "req_title", "end_turn");
-        title.started_at = SystemTime::now() - Duration::from_secs(5);
+        title.started_at = frozen_now() - Duration::from_secs(5);
         title.resp_model = Some("claude-haiku-4-5-20251001".into());
         // haiku 那条不带 context-1m，也就没有 `[1m]` 展示名。
         title.betas =
@@ -8536,7 +8688,7 @@ mod tests {
             "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=f850a; cc_prev_req=req_main; cc_prompt_id=16d7a19d-7939-4638-9703-b31d2fc92661;"
         );
         let mut third = call(body.to_string().into_bytes(), "req_main2", "end_turn");
-        third.started_at = SystemTime::now() - Duration::from_secs(2);
+        third.started_at = frozen_now() - Duration::from_secs(2);
         t.ingest(third);
         let st = t.0.state.lock();
         let n = st.pending[&key()]
@@ -8571,7 +8723,7 @@ mod tests {
         // 第二次输入带尾部 system：是新输入，chain 换、depth 归零、input_prompt 计到 2。
         let t = Telemetry::default();
         let mut first = call(cc_body(true), "req_1", "end_turn");
-        first.started_at = SystemTime::now() - Duration::from_secs(30);
+        first.started_at = frozen_now() - Duration::from_secs(30);
         t.ingest(first);
         let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
         body["system"][0]["text"] = json!(
@@ -8582,7 +8734,7 @@ mod tests {
             .unwrap()
             .push(json!({"role":"system","content":[{"type":"text","text":"reminder"}]}));
         let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
-        second.started_at = SystemTime::now() - Duration::from_secs(10);
+        second.started_at = frozen_now() - Duration::from_secs(10);
         t.ingest(second);
         let st = t.0.state.lock();
         let p = &st.pending[&key()];
@@ -8633,10 +8785,10 @@ mod tests {
         }
         let t = Telemetry::default();
         let mut first = call(cc_body(true), "req_1", "end_turn");
-        first.started_at = SystemTime::now() - Duration::from_secs(30);
+        first.started_at = frozen_now() - Duration::from_secs(30);
         t.ingest(first);
         let mut title = call(title_body(), "req_title", "end_turn");
-        title.started_at = SystemTime::now() - Duration::from_secs(12);
+        title.started_at = frozen_now() - Duration::from_secs(12);
         title.betas = Some("claude-code-20250219,oauth-2025-04-20".into());
         t.ingest(title);
         {
@@ -8655,7 +8807,7 @@ mod tests {
             "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=f850a; cc_prev_req=req_1; cc_prompt_id=16d7a19d-7939-4638-9703-b31d2fc92661;"
         );
         let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
-        second.started_at = SystemTime::now() - Duration::from_secs(11);
+        second.started_at = frozen_now() - Duration::from_secs(11);
         t.ingest(second);
         {
             let st = t.0.state.lock();
@@ -9029,7 +9181,7 @@ mod tests {
             client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
             agent: AgentHeaders::default(),
             organization_id: None,
-            started_at: SystemTime::now() - Duration::from_secs(3),
+            started_at: frozen_now() - Duration::from_secs(3),
         };
         // 连接层就失败：没有状态码、没有上游 request-id。
         cap(t.clone()).record_failure(
@@ -9093,7 +9245,7 @@ mod tests {
             client_request_id: None,
             agent: AgentHeaders::default(),
             organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
-            started_at: SystemTime::now() - Duration::from_secs(2),
+            started_at: frozen_now() - Duration::from_secs(2),
         }
         .record_failure(
             7,
@@ -9204,12 +9356,12 @@ mod tests {
         };
         // 第一轮：3 个字（`hii`），窗口是进程起点到提交那 3.085s → 0.8 + 0.3 = 1.1。
         let mut first = call(prompt("hii"), "req_1", "end_turn");
-        first.started_at = SystemTime::now() - Duration::from_millis(9_800);
+        first.started_at = frozen_now() - Duration::from_millis(9_800);
         first.total_ms = 3_779;
         t.ingest(first);
         // 第二轮：20 个字，两次提交相隔 6.06s，估算 0.8 + 2.0 = 2.8 < 6.06，取估算值。
         let mut second = call(prompt("hilele what can u do"), "req_2", "end_turn");
-        second.started_at = SystemTime::now() - Duration::from_millis(9_800 - 6_060);
+        second.started_at = frozen_now() - Duration::from_millis(9_800 - 6_060);
         second.total_ms = 6_338;
         t.ingest(second);
 
@@ -9243,7 +9395,7 @@ mod tests {
         let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
         v["messages"] = json!([{"role":"user","content":[{"type":"text","text":"x".repeat(500)}]}]);
         let mut c = call(serde_json::to_vec(&v).unwrap(), "req_paste", "end_turn");
-        c.started_at = SystemTime::now() - Duration::from_secs(5);
+        c.started_at = frozen_now() - Duration::from_secs(5);
         t.ingest(c);
         let st = t.0.state.lock();
         let p = st.pending.get(&key()).unwrap();
@@ -9544,7 +9696,7 @@ mod tests {
         // 续轮：tool_result 收尾，end_turn → turn_end；previousRequestId 串上一条。
         // 第二条在第一条结束之后才发出（第一条 8s 前发、跑了 6.1s）。
         let mut second = call(cc_body(false), "req_2", "end_turn");
-        second.started_at = SystemTime::now();
+        second.started_at = frozen_now();
         t.ingest(second);
         let st = t.0.state.lock();
         let p = st.pending.get(&key()).unwrap();
@@ -9709,7 +9861,7 @@ mod tests {
         }
         let session = parse_shape(&reqs[0].0).unwrap().session_id.unwrap();
         let t = Telemetry::default();
-        let base = SystemTime::now() - Duration::from_secs(600);
+        let base = frozen_now() - Duration::from_secs(600);
         for (i, (body, betas)) in reqs.into_iter().enumerate() {
             let model = parse_shape(&body).unwrap().model;
             let mut c = call(body, &format!("req_{i}"), "end_turn");
@@ -9819,7 +9971,7 @@ mod tests {
         }
         let session = parse_shape(&reqs[0].0).unwrap().session_id.unwrap();
         let t = Telemetry::default();
-        let base = SystemTime::now() - Duration::from_secs(900);
+        let base = frozen_now() - Duration::from_secs(900);
         for (i, (body, betas)) in reqs.into_iter().enumerate() {
             let model = parse_shape(&body).unwrap().model;
             let mut c = call(body, &format!("req_{i}"), "end_turn");
@@ -9992,7 +10144,7 @@ mod tests {
             ("00158", "end_turn", &[]),
         ];
         let t = Telemetry::default();
-        let base = SystemTime::now() - Duration::from_secs(900);
+        let base = frozen_now() - Duration::from_secs(900);
         let mut session = String::new();
         for (i, (f, stop, tools)) in FILES.iter().enumerate() {
             let rel = format!("2.1.285/{f}_");
@@ -10397,7 +10549,7 @@ mod tests {
         ];
         const AGENT: &str = "a51764a248f499f13";
         let t = Telemetry::default();
-        let base = SystemTime::now() - Duration::from_secs(600);
+        let base = frozen_now() - Duration::from_secs(600);
         let mut session = String::new();
         for (i, (f, stop, tools)) in CALLS.iter().enumerate() {
             let rel = format!("2.1.280/{f}");
@@ -10623,7 +10775,7 @@ mod tests {
             c.betas = betas;
             c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
             c.agent.request_class = cap_header(&rel, "x-claude-code-request-class");
-            c.started_at = SystemTime::now() - Duration::from_secs(300 - 60 * i as u64);
+            c.started_at = frozen_now() - Duration::from_secs(300 - 60 * i as u64);
             t.ingest(c);
         }
         let st = t.0.state.lock();
@@ -10724,7 +10876,7 @@ mod tests {
             let mut c = call(body, &format!("req_{i}"), stop);
             c.betas = betas;
             c.ua_out = "claude-cli/2.1.280 (external, cli)".into();
-            c.started_at = SystemTime::now() - Duration::from_secs(300 - 60 * i as u64);
+            c.started_at = frozen_now() - Duration::from_secs(300 - 60 * i as u64);
             t.ingest(c);
         }
         let st = t.0.state.lock();
