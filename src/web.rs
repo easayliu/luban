@@ -3752,6 +3752,8 @@ struct CredentialView {
     /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
     /// 团队号是组织下的一个席位，跟个人号不是一回事。
     org_type: Option<String>,
+    /// 额度档原值（`default_claude_max_5x`/`default_raven`…）。团队号的徽章颜色看它。
+    rate_limit_tier: Option<String>,
     /// profile 里只给后台看的几项：组织名称、席位档原值、订阅状态原值、超额用量开关。
     org_name: Option<String>,
     seat_tier: Option<String>,
@@ -3855,6 +3857,7 @@ impl CredentialView {
             label: c.label.clone(),
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
+            rate_limit_tier: c.rate_limit_tier.clone(),
             org_name: c.org_name.clone(),
             seat_tier: c.seat_tier.clone(),
             subscription_status: c.subscription_status.clone(),

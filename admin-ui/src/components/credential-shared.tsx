@@ -1885,6 +1885,21 @@ function orgTierText(cred: Pick<Credential, 'tier' | 'org_type'>): string {
 }
 
 /**
+ * 额度档原值能直接读出的档位（`default_claude_max_5x` → `Max 5x`），读不出（`default_raven`）为 null。
+ * 团队号的徽章颜色按它定：席位名（`team_tier_1`）本身不说明档位，额度档才是上游实际给的量。
+ */
+const RATE_LIMIT_LABEL: Partial<Record<PlanKey, string>> = {
+  max20x: 'Max 20x',
+  max5x: 'Max 5x',
+  max: 'Max',
+  pro: 'Pro',
+}
+
+function rateLimitLabel(raw: string | null): string | null {
+  return raw ? (RATE_LIMIT_LABEL[planKey(raw)] ?? null) : null
+}
+
+/**
  * 套餐徽章，组织 / 个人做成徽章里的前缀图标，不再单占一枚胶囊：楼＝组织号（团队 / 企业席位），
  * 人＝个人号。org_type 还没拉到（旧号）时不猜，只显示套餐文字；组织号没有档位时退回用组织类型
  * 当文字，图标照挂。什么都没有时渲染 `fallback`（列表里的「—」）。
@@ -1894,7 +1909,7 @@ export function AccountTierBadge({
   size,
   fallback = null,
 }: {
-  cred: Pick<Credential, 'tier' | 'org_type' | 'org_name'>
+  cred: Pick<Credential, 'tier' | 'org_type' | 'org_name' | 'rate_limit_tier'>
   size?: 'default' | 'sm' | 'xs'
   fallback?: ReactNode
 }) {
@@ -1903,7 +1918,10 @@ export function AccountTierBadge({
   if (!cred.tier && !org) return <>{fallback}</>
   const personal = !org && !!cred.org_type?.trim()
   const text = org ? orgTierText(cred) : (cred.tier ?? '')
-  const variant = cred.tier ? tierBadgeVariant(cred.tier) : 'outline'
+  const quota = org ? rateLimitLabel(cred.rate_limit_tier) : null
+  const variant = cred.tier
+    ? (quota ? tierBadgeVariant(quota) : tierBadgeVariant(cred.tier))
+    : 'outline'
   if (!org && !personal) return <Badge size={size} variant={variant}>{text}</Badge>
   const Icon = org ? Building2Icon : UserIcon
   // xs 档是固定 12px 字号，图标也跟着固定；sm 档字更小，图标收一号。默认档交给 Badge 自己的 svg 尺寸。
@@ -1918,7 +1936,10 @@ export function AccountTierBadge({
         {org ? (
           <>
             <span className="block font-medium">{cred.org_name ?? t('组织账号', 'Organisation account')}</span>
-            <span className="block opacity-70">{cred.tier ?? orgBadgeLabel(cred)}</span>
+            <span className="block opacity-70">
+              {cred.tier ?? orgBadgeLabel(cred)}
+              {quota && ` · ${t('额度', 'Quota')} ${quota}`}
+            </span>
           </>
         ) : (
           t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)

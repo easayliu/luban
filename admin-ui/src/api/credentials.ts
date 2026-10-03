@@ -90,6 +90,8 @@ export interface Credential {
    * 团队号是组织下的一个席位（额度按席位算），跟个人号不是一回事，界面上单独打标。
    */
   org_type: string | null
+  /** 额度档原值（`default_claude_max_5x`/`default_raven`…），拉不到时为 null。 */
+  rate_limit_tier: string | null
   /** 组织名称（profile 的 `organization.name`），拉不到时为 null。 */
   org_name: string | null
   /** 席位档原值（`team_standard`/`team_premium`…）；个人号没有，为 null。 */
