@@ -1885,7 +1885,7 @@ function orgTierText(cred: Pick<Credential, 'tier' | 'org_type'>): string {
 }
 
 /**
- * 套餐徽章，组织 / 个人做成徽章里的前缀图标，不再单占一枚胶囊：楼＝组织号（用量全组织共享），
+ * 套餐徽章，组织 / 个人做成徽章里的前缀图标，不再单占一枚胶囊：楼＝组织号（团队 / 企业席位），
  * 人＝个人号。org_type 还没拉到（旧号）时不猜，只显示套餐文字；组织号没有档位时退回用组织类型
  * 当文字，图标照挂。什么都没有时渲染 `fallback`（列表里的「—」）。
  */
@@ -1894,7 +1894,7 @@ export function AccountTierBadge({
   size,
   fallback = null,
 }: {
-  cred: Pick<Credential, 'tier' | 'org_type'>
+  cred: Pick<Credential, 'tier' | 'org_type' | 'org_name'>
   size?: 'default' | 'sm' | 'xs'
   fallback?: ReactNode
 }) {
@@ -1915,12 +1915,14 @@ export function AccountTierBadge({
         {text}
       </TooltipTrigger>
       <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-        {org
-          ? t(
-              `组织账号（${cred.org_type}）：用量由整个组织共享，与同档位的个人账号不同`,
-              `Organisation account (${cred.org_type}): the usage is shared across the whole organisation, unlike a personal account on the same tier`,
-            )
-          : t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)}
+        {org ? (
+          <>
+            <span className="block font-medium">{cred.org_name ?? t('组织账号', 'Organisation account')}</span>
+            <span className="block opacity-70">{cred.tier ?? orgBadgeLabel(cred)}</span>
+          </>
+        ) : (
+          t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)
+        )}
       </TooltipPopup>
     </Tooltip>
   )

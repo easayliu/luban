@@ -127,7 +127,7 @@ pub struct Profile {
     pub name: Option<String>,
     pub tier: Option<String>,
     /// 组织类型原值（`claude_team`/`claude_enterprise`/`claude_max`…），团队号与个人号
-    /// 在调度与额度上完全不同（团队额度是整个组织共享的席位额度），故单独留一列供前端标记。
+    /// 不是一回事（团队号是组织下的一个席位，额度按席位算），故单独留一列供前端标记。
     pub org_type: Option<String>,
     /// 额度档**原值**（`default_claude_max_5x` 之类），来自 `organization.rate_limit_tier`。
     ///

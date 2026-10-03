@@ -3750,7 +3750,7 @@ struct CredentialView {
     label: String,
     tier: Option<String>,
     /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
-    /// 团队额度是整个组织共享的，跟同名档位的个人号不是一回事。
+    /// 团队号是组织下的一个席位，跟个人号不是一回事。
     org_type: Option<String>,
     /// profile 里只给后台看的几项：组织名称、席位档原值、订阅状态原值、超额用量开关。
     org_name: Option<String>,
