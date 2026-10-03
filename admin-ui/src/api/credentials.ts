@@ -90,6 +90,14 @@ export interface Credential {
    * 团队号的额度是整个组织共享的席位额度，跟同档位的个人号不是一回事，界面上单独打标。
    */
   org_type: string | null
+  /** 组织名称（profile 的 `organization.name`），拉不到时为 null。 */
+  org_name: string | null
+  /** 席位档原值（`team_standard`/`team_premium`…）；个人号没有，为 null。 */
+  seat_tier: string | null
+  /** 订阅状态原值（`active`…），拉不到时为 null。 */
+  subscription_status: string | null
+  /** 组织是否开了超额用量；拉不到时为 null。 */
+  extra_usage_enabled: boolean | null
   priority: number
   disabled: boolean
   expires_in: number

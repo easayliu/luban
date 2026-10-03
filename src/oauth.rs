@@ -142,6 +142,15 @@ pub struct Profile {
     /// 订阅创建时刻原串（`organization.subscription_created_at`，ISO 8601）。
     /// 见 [`crate::credentials::Credential::subscription_created_at`]。
     pub subscription_created_at: Option<String>,
+    /// 组织名称（`organization.name`）。
+    pub org_name: Option<String>,
+    /// 席位档原值（`organization.seat_tier`，团队号如 `team_standard` / `team_premium`）；
+    /// 个人号没有。团队号的 [`Self::tier`] 由它推导。
+    pub seat_tier: Option<String>,
+    /// 订阅状态原值（`organization.subscription_status`，如 `active`）。
+    pub subscription_status: Option<String>,
+    /// 组织是否开了超额用量（`organization.has_extra_usage_enabled`）。
+    pub extra_usage_enabled: Option<bool>,
 }
 
 /// 一次登录尝试的 PKCE 上下文，需在交换 token 时回传。
@@ -251,6 +260,16 @@ struct ProfileAccount {
 
 #[derive(Debug, Deserialize)]
 struct ProfileOrg {
+    #[serde(default)]
+    name: Option<String>,
+    /// 团队号的席位档，如 `team_standard` / `team_premium`；个人号没有这一项。
+    #[serde(default)]
+    seat_tier: Option<String>,
+    /// 如 `active`。
+    #[serde(default)]
+    subscription_status: Option<String>,
+    #[serde(default)]
+    has_extra_usage_enabled: Option<bool>,
     /// 如 `claude_max` / `claude_pro` / `claude_free`。
     #[serde(default)]
     organization_type: Option<String>,
@@ -313,11 +332,16 @@ async fn fetch_profile_from(
     let p: ProfileResponse = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse the profile response ({} bytes)", text.len()))?;
 
+    let org_str = |f: fn(&ProfileOrg) -> &Option<String>| {
+        p.organization.as_ref().and_then(|o| f(o).clone()).filter(|s| !s.trim().is_empty())
+    };
+    let seat_tier = org_str(|o| &o.seat_tier);
     let tier = tier_from(
         p.account.as_ref().and_then(|a| a.has_claude_max),
         p.account.as_ref().and_then(|a| a.has_claude_pro),
         p.organization.as_ref().and_then(|o| o.organization_type.as_deref()),
         p.organization.as_ref().and_then(|o| o.rate_limit_tier.as_deref()),
+        seat_tier.as_deref(),
     );
     let email = p.account.as_ref().and_then(|a| a.email.clone());
     let name = p.account.as_ref().and_then(|a| {
@@ -326,41 +350,30 @@ async fn fetch_profile_from(
     let account_uuid =
         p.account.as_ref().and_then(|a| a.uuid.clone()).filter(|s| !s.trim().is_empty());
 
-    let org_type = p
-        .organization
-        .as_ref()
-        .and_then(|o| o.organization_type.clone())
-        .filter(|s| !s.trim().is_empty());
-    let rate_limit_tier = p
-        .organization
-        .as_ref()
-        .and_then(|o| o.rate_limit_tier.clone())
-        .filter(|s| !s.trim().is_empty());
-    let org_uuid =
-        p.organization.as_ref().and_then(|o| o.uuid.clone()).filter(|s| !s.trim().is_empty());
-    let subscription_created_at = p
-        .organization
-        .as_ref()
-        .and_then(|o| o.subscription_created_at.clone())
-        .filter(|s| !s.trim().is_empty());
     Ok(Profile {
         email,
         name,
         tier,
-        org_type,
-        rate_limit_tier,
+        org_type: org_str(|o| &o.organization_type),
+        rate_limit_tier: org_str(|o| &o.rate_limit_tier),
         account_uuid,
-        org_uuid,
-        subscription_created_at,
+        org_uuid: org_str(|o| &o.uuid),
+        subscription_created_at: org_str(|o| &o.subscription_created_at),
+        org_name: org_str(|o| &o.name),
+        seat_tier,
+        subscription_status: org_str(|o| &o.subscription_status),
+        extra_usage_enabled: p.organization.as_ref().and_then(|o| o.has_extra_usage_enabled),
     })
 }
 
 /// 由订阅标志推导账号等级：Max > Pro > Free；Max 附带倍数档（如 `Max 5x`）。
+/// 组织号有席位档时按席位显示（`team_standard` → `Team Standard`）。
 fn tier_from(
     has_max: Option<bool>,
     has_pro: Option<bool>,
     org_type: Option<&str>,
     rate_limit_tier: Option<&str>,
+    seat_tier: Option<&str>,
 ) -> Option<String> {
     let mult = multiplier(rate_limit_tier); // 如 "5x" / "20x"
     if has_max == Some(true) {
@@ -370,6 +383,11 @@ fn tier_from(
         return Some("Pro".into());
     }
     if let Some(t) = org_type.map(str::trim).filter(|s| !s.is_empty()) {
+        // 团队号的 `rate_limit_tier` 是 `default_raven` 这类内部代号，读不出档位；
+        // 席位档才是买的那一档（实测 `claude_team` + `team_standard`）。
+        if let Some(seat) = seat_tier.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(humanize_seat(seat));
+        }
         // 团队/企业号的席位**不体现在 account 的 has_claude_max/pro 上**（实测两个都是
         // false），额度档只能从 `rate_limit_tier` 读——`default_claude_max_5x` 说明这个
         // 组织拿的是 Max 5x 的量。此前这里直接返回 `humanize_tier("claude_team") = "team"`，
@@ -412,6 +430,18 @@ fn with_mult(base: &str, mult: Option<String>) -> String {
         Some(m) => format!("{} {}", base, m),
         None => base.to_string(),
     }
+}
+
+/// 席位档原值美化：`team_standard` → `Team Standard`。
+fn humanize_seat(raw: &str) -> String {
+    raw.split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 把 `claude_max` 之类的原始类型美化成 `Max`。
@@ -2298,29 +2328,74 @@ mod tests {
     #[test]
     fn team_tier_comes_from_the_rate_limit_field() {
         assert_eq!(
-            tier_from(Some(false), Some(false), Some("claude_team"), Some("default_claude_max_5x")),
+            tier_from(
+                Some(false),
+                Some(false),
+                Some("claude_team"),
+                Some("default_claude_max_5x"),
+                None
+            ),
             Some("Max 5x".into())
         );
         // 企业号同理。
         assert_eq!(
-            tier_from(None, None, Some("claude_enterprise"), Some("default_claude_max_20x")),
+            tier_from(None, None, Some("claude_enterprise"), Some("default_claude_max_20x"), None),
             Some("Max 20x".into())
         );
         // 读不出档位时退回组织类型，但首字母大写，别在界面上混着小写词。
-        assert_eq!(tier_from(None, None, Some("claude_team"), None), Some("Team".into()));
-        assert_eq!(tier_from(None, None, Some("claude_team"), Some("weird")), Some("Team".into()));
+        assert_eq!(tier_from(None, None, Some("claude_team"), None, None), Some("Team".into()));
+        assert_eq!(
+            tier_from(None, None, Some("claude_team"), Some("weird"), None),
+            Some("Team".into())
+        );
+    }
+
+    /// 团队号有席位档时按席位显示：实测 `claude_team` 的 `rate_limit_tier` 是 `default_raven`
+    /// （读不出档位），`seat_tier` 是 `team_standard`。席位档优先于 `rate_limit_tier`。
+    #[test]
+    fn team_tier_prefers_the_seat_tier() {
+        let team =
+            |rate, seat| tier_from(Some(false), Some(false), Some("claude_team"), rate, seat);
+        assert_eq!(
+            team(Some("default_raven"), Some("team_standard")),
+            Some("Team Standard".into())
+        );
+        assert_eq!(team(Some("default_raven"), Some("team_premium")), Some("Team Premium".into()));
+        assert_eq!(
+            team(Some("default_claude_max_5x"), Some("team_premium")),
+            Some("Team Premium".into())
+        );
+        assert_eq!(
+            team(Some("default_raven"), Some(" ")),
+            Some("Team".into()),
+            "空席位档退回组织类型"
+        );
+        // 个人号就算带了席位档也不看。
+        assert_eq!(
+            tier_from(
+                Some(true),
+                None,
+                Some("claude_max"),
+                Some("default_claude_max_5x"),
+                Some("x")
+            ),
+            Some("Max 5x".into())
+        );
     }
 
     /// 个人号的判定顺序不变：`has_claude_max`/`has_claude_pro` 比组织字段更权威。
     #[test]
     fn personal_tier_still_wins_over_the_org_fields() {
         assert_eq!(
-            tier_from(Some(true), None, Some("claude_team"), Some("default_claude_max_20x")),
+            tier_from(Some(true), None, Some("claude_team"), Some("default_claude_max_20x"), None),
             Some("Max 20x".into())
         );
-        assert_eq!(tier_from(None, Some(true), Some("claude_team"), None), Some("Pro".into()));
-        assert_eq!(tier_from(Some(false), Some(false), None, None), Some("Free".into()));
-        assert_eq!(tier_from(None, None, None, None), None);
+        assert_eq!(
+            tier_from(None, Some(true), Some("claude_team"), None, None),
+            Some("Pro".into())
+        );
+        assert_eq!(tier_from(Some(false), Some(false), None, None, None), Some("Free".into()));
+        assert_eq!(tier_from(None, None, None, None, None), None);
     }
 
     fn err(status: StatusCode, body: &str) -> TokenEndpointError {
@@ -2614,7 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn profile_request_wire_shape_is_axios() {
         let (addr, server) = serve_once(
-            r#"{"account":{"uuid":"9922ef8e-7945-4f5a-ab4f-cf5f521531df","email":"a@b.c"},"organization":{"uuid":"09520b85-f6b6-432f-97e2-6ecb804a083f","organization_type":"claude_team","rate_limit_tier":"default_claude_max_5x","subscription_created_at":"2026-04-15T13:03:55.239Z"}}"#,
+            r#"{"account":{"uuid":"9922ef8e-7945-4f5a-ab4f-cf5f521531df","email":"a@b.c","has_claude_max":false,"has_claude_pro":false},"organization":{"uuid":"09520b85-f6b6-432f-97e2-6ecb804a083f","name":"Acme","organization_type":"claude_team","billing_type":"stripe_subscription","rate_limit_tier":"default_raven","seat_tier":"team_standard","has_extra_usage_enabled":false,"subscription_status":"active","subscription_created_at":"2026-04-15T13:03:55.239Z"}}"#,
         );
         let client = crate::clients::upstream_client(None).unwrap();
         let profile = super::fetch_profile_from(
@@ -2627,8 +2702,13 @@ mod tests {
         assert_eq!(profile.account_uuid.as_deref(), Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df"));
         assert_eq!(profile.org_uuid.as_deref(), Some("09520b85-f6b6-432f-97e2-6ecb804a083f"));
         assert_eq!(profile.subscription_created_at.as_deref(), Some("2026-04-15T13:03:55.239Z"));
-        assert_eq!(profile.rate_limit_tier.as_deref(), Some("default_claude_max_5x"));
+        assert_eq!(profile.rate_limit_tier.as_deref(), Some("default_raven"));
         assert_eq!(profile.org_type.as_deref(), Some("claude_team"));
+        assert_eq!(profile.tier.as_deref(), Some("Team Standard"));
+        assert_eq!(profile.org_name.as_deref(), Some("Acme"));
+        assert_eq!(profile.seat_tier.as_deref(), Some("team_standard"));
+        assert_eq!(profile.subscription_status.as_deref(), Some("active"));
+        assert_eq!(profile.extra_usage_enabled, Some(false));
 
         let raw = server.join().unwrap();
         let (line, names, values, body) = split_raw(&raw);

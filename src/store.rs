@@ -17,7 +17,8 @@ use crate::credentials::Credential;
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
      rpm_limit, rate_limit_tier, org_uuid, subscription_created_at, quota_pause_pct, \
-     quota_pause_pct_7d, session_limit";
+     quota_pause_pct_7d, session_limit, org_name, seat_tier, subscription_status, \
+     extra_usage_enabled";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -737,6 +738,15 @@ pub struct PortableCredential {
     pub org_uuid: Option<String>,
     #[serde(default)]
     pub subscription_created_at: Option<String>,
+    /// 组织名称、席位档、订阅状态、超额用量开关：只给后台看，带上免得迁移后到下次刷新前空着。
+    #[serde(default)]
+    pub org_name: Option<String>,
+    #[serde(default)]
+    pub seat_tier: Option<String>,
+    #[serde(default)]
+    pub subscription_status: Option<String>,
+    #[serde(default)]
+    pub extra_usage_enabled: Option<bool>,
     #[serde(default)]
     pub resume_at: Option<u64>,
     #[serde(default)]
@@ -770,6 +780,10 @@ impl From<&Credential> for PortableCredential {
             account_uuid: c.account_uuid.clone(),
             org_uuid: c.org_uuid.clone(),
             subscription_created_at: c.subscription_created_at.clone(),
+            org_name: c.org_name.clone(),
+            seat_tier: c.seat_tier.clone(),
+            subscription_status: c.subscription_status.clone(),
+            extra_usage_enabled: c.extra_usage_enabled,
             resume_at: c.resume_at,
             proxy: c.proxy.clone(),
             quota_pause_pct: c.quota_pause_pct,
@@ -1078,7 +1092,8 @@ impl CredentialStore {
                          account_uuid = ?13, resume_at = ?14, proxy = ?15,
                          rate_limit_tier = ?16, org_uuid = ?17, subscription_created_at = ?18,
                          quota_pause_pct = ?19, quota_pause_pct_7d = ?20, session_limit = ?21,
-                         updated_at = unixepoch()
+                         org_name = ?22, seat_tier = ?23, subscription_status = ?24,
+                         extra_usage_enabled = ?25, updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
                         id,
@@ -1102,6 +1117,10 @@ impl CredentialStore {
                         c.quota_pause_pct,
                         c.quota_pause_pct_7d,
                         c.session_limit,
+                        c.org_name,
+                        c.seat_tier,
+                        c.subscription_status,
+                        c.extra_usage_enabled.map(i64::from),
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -1114,9 +1133,10 @@ impl CredentialStore {
                           priority, disabled, device_limit, rpm_limit, ban_reason,
                           account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
                           subscription_created_at, quota_pause_pct, quota_pause_pct_7d,
-                          session_limit)
+                          session_limit, org_name, seat_tier, subscription_status,
+                          extra_usage_enabled)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19, ?20)",
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                     params![
                         c.label,
                         c.tier,
@@ -1138,6 +1158,10 @@ impl CredentialStore {
                         c.quota_pause_pct,
                         c.quota_pause_pct_7d,
                         c.session_limit,
+                        c.org_name,
+                        c.seat_tier,
+                        c.subscription_status,
+                        c.extra_usage_enabled.map(i64::from),
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -2297,6 +2321,22 @@ impl CredentialStore {
         }
         if profile.subscription_created_at.is_some() {
             self.set_subscription_created_at(id, profile.subscription_created_at.as_deref())?;
+        }
+        // 只给后台看的几列：拉到就整组覆盖（席位档个人号本来就没有，缺了要写回空）。
+        // 至少拿到组织名称才算这一组有效，免得一份残缺的响应把已有的值清掉。
+        if profile.org_name.is_some() {
+            self.conn.lock().execute(
+                "UPDATE credentials SET org_name = ?2, seat_tier = ?3, subscription_status = ?4,
+                        extra_usage_enabled = ?5, updated_at = unixepoch()
+                  WHERE id = ?1",
+                params![
+                    id,
+                    profile.org_name,
+                    profile.seat_tier,
+                    profile.subscription_status,
+                    profile.extra_usage_enabled.map(i64::from),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -6132,6 +6172,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 旧库补出来是 0 = 跟随全局默认 [`DEFAULT_SESSION_LIMIT`]。**同样必须补在重建之后**。
     let _ = conn
         .execute("ALTER TABLE credentials ADD COLUMN session_limit INTEGER NOT NULL DEFAULT 0", []);
+    // profile 里只给后台看的几列：组织名称、席位档、订阅状态、超额用量开关（0/1）。旧库为空，
+    // 下次刷新回填（组织名称计入 `profile_incomplete`）。**同样必须补在重建之后**。
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN org_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN seat_tier TEXT", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN subscription_status TEXT", []);
+    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN extra_usage_enabled INTEGER", []);
     // v0.3.126 / 127 建的 session_bindings 没有 slot 列。补列时把存量行清掉：它们全落在槽位 0
     // 上，留着会让好几条活跃会话共用一个会话 id，直到各自 TTL 到期；这张表本来就只记最近一小时
     // 的亲和性，清掉的代价只是那几条对话下一轮重新选号。补列失败（列已在）什么都不动。
@@ -6389,6 +6435,10 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("quota_pause_pct", "INTEGER"),
     ("quota_pause_pct_7d", "INTEGER"),
     ("session_limit", "INTEGER NOT NULL DEFAULT 0"),
+    ("org_name", "TEXT"),
+    ("seat_tier", "TEXT"),
+    ("subscription_status", "TEXT"),
+    ("extra_usage_enabled", "INTEGER"),
 ];
 
 fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
@@ -6416,6 +6466,10 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         quota_pause_pct: row.get(20)?,
         quota_pause_pct_7d: row.get(21)?,
         session_limit: row.get(22)?,
+        org_name: row.get(23)?,
+        seat_tier: row.get(24)?,
+        subscription_status: row.get(25)?,
+        extra_usage_enabled: row.get::<_, Option<i64>>(26)?.map(|v| v != 0),
     })
 }
 
@@ -6878,7 +6932,7 @@ impl CredentialStore {
         // (priority, 设备数, id) 是唯一的排序口径；两个分支都从这一份有序表里挑，
         // 逐道门过滤，第一个全过的即中。
         // fable/mythos 这类只有高档套餐才含的模型，同一优先级档内 Max 号排前面，等级未知的
-        // 其次，Pro/Free 垫底。**只排序不剔除**：准入以上游的判决为准（见上面的 denied），
+        // 与团队/企业席位（`Team Standard` 之类，含不含这些模型说不准）其次，Pro/Free 垫底。**只排序不剔除**：准入以上游的判决为准（见上面的 denied），
         // 这里猜错也只是多换一次号；而排在前面能让绝大多数请求第一发就落在能用的号上。
         let premium = model.is_some_and(premium_model);
         let plan_rank = |c: &Credential| -> u8 {
@@ -6888,6 +6942,7 @@ impl CredentialStore {
             match c.tier.as_deref() {
                 Some(t) if t.starts_with("Max") => 0,
                 None => 1,
+                Some(t) if t.starts_with("Team") || t.starts_with("Enterprise") => 1,
                 Some(_) => 2,
             }
         };
@@ -7589,6 +7644,10 @@ mod tests {
         let full = crate::oauth::Profile {
             org_uuid: Some("org-from-profile".into()),
             subscription_created_at: Some("2026-04-15T13:03:55.239Z".into()),
+            org_name: Some("Acme".into()),
+            seat_tier: Some("team_standard".into()),
+            subscription_status: Some("active".into()),
+            extra_usage_enabled: Some(true),
             ..Default::default()
         };
         store.apply_profile(id, &full, Some("org-from-token")).unwrap();
@@ -7601,7 +7660,24 @@ mod tests {
         assert_eq!(c.subscription_created_at.as_deref(), Some("2026-04-15T13:03:55.239Z"));
         assert_eq!(c.tier.as_deref(), Some("Max 5x"), "这次 profile 没给的项不能被清掉");
         assert_eq!(c.account_uuid.as_deref(), Some("acct"));
-        assert!(!c.profile_incomplete(), "四列齐了就不再拉");
+        assert_eq!(c.org_name.as_deref(), Some("Acme"));
+        assert_eq!(c.seat_tier.as_deref(), Some("team_standard"));
+        assert_eq!(c.subscription_status.as_deref(), Some("active"));
+        assert_eq!(c.extra_usage_enabled, Some(true));
+        assert!(!c.profile_incomplete(), "五列齐了就不再拉");
+
+        // 换成个人号（没有席位档）：组织那一组整组覆盖，席位档清空；没给组织名称的残缺响应不动它们。
+        let personal = crate::oauth::Profile {
+            org_name: Some("someone's Organization".into()),
+            subscription_status: Some("active".into()),
+            ..Default::default()
+        };
+        store.apply_profile(id, &personal, None).unwrap();
+        let c = store.get(id).unwrap().unwrap();
+        assert!(c.seat_tier.is_none() && c.extra_usage_enabled.is_none());
+        store.apply_profile(id, &crate::oauth::Profile::default(), None).unwrap();
+        let c = store.get(id).unwrap().unwrap();
+        assert_eq!(c.org_name.as_deref(), Some("someone's Organization"));
     }
 
     /// 开机清扫：被删账号遗留的设备绑定被清掉；用量流水一律不动（已删账号的流水按设计
@@ -9234,6 +9310,10 @@ mod tests {
             account_uuid: Some("uuid-1".into()),
             org_uuid: None,
             subscription_created_at: None,
+            org_name: None,
+            seat_tier: None,
+            subscription_status: None,
+            extra_usage_enabled: None,
             resume_at: None,
             proxy: None,
         };
@@ -9324,6 +9404,10 @@ mod tests {
             account_uuid: Some("uuid".into()),
             org_uuid: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
             subscription_created_at: Some("2026-04-15T13:03:55.239Z".into()),
+            org_name: Some("Acme".into()),
+            seat_tier: Some("team_standard".into()),
+            subscription_status: Some("active".into()),
+            extra_usage_enabled: Some(false),
             resume_at: Some(1_900_000_000),
             proxy: Some("socks5://127.0.0.1:1080".into()),
         };
@@ -9337,6 +9421,10 @@ mod tests {
         assert_eq!(back.label, full.label);
         assert_eq!(back.tier, full.tier);
         assert_eq!(back.org_type, full.org_type);
+        assert_eq!(back.org_name, full.org_name);
+        assert_eq!(back.seat_tier, full.seat_tier);
+        assert_eq!(back.subscription_status, full.subscription_status);
+        assert_eq!(back.extra_usage_enabled, full.extra_usage_enabled);
         // 额度档原值也要跟着走：迁移后到下一次成功拉 profile 之前，statsig eval 的
         // `rateLimitTier` 全靠它。
         assert_eq!(back.rate_limit_tier, full.rate_limit_tier);

@@ -709,10 +709,12 @@ export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
  * 取值是**子串匹配**而非全等：上游的写法不统一（`max_20x`/`Max 20x`/`claude_max` 都见过），
  * 见 [`crate::oauth::tier_from_rate_limit`]。认不出来的非空值与 `null` 一并归 `unknown`。
  */
-export type PlanKey = 'max20x' | 'max5x' | 'max' | 'pro' | 'free' | 'unknown'
+export type PlanKey = 'max20x' | 'max5x' | 'max' | 'team' | 'pro' | 'free' | 'unknown'
 
 export function planKey(tier: string | null): PlanKey {
   const t = (tier ?? '').toLowerCase()
+  // 团队 / 企业号按席位显示（`Team Standard`/`Team Premium`），见 `crate::oauth::tier_from`。
+  if (t.includes('team') || t.includes('enterprise')) return 'team'
   if (t.includes('20x')) return 'max20x'
   if (t.includes('5x')) return 'max5x'
   if (t.includes('max')) return 'max'
@@ -723,9 +725,10 @@ export function planKey(tier: string | null): PlanKey {
 
 /** 档位序号（越大越高档）。按容量排而非字母序，`max_20x` 才会排在 `pro` 前面。 */
 const PLAN_RANK: Record<PlanKey, number> = {
-  max20x: 5,
-  max5x: 4,
-  max: 3,
+  max20x: 6,
+  max5x: 5,
+  max: 4,
+  team: 3,
   pro: 2,
   free: 1,
   unknown: 0,
@@ -1869,6 +1872,19 @@ export function orgBadgeLabel(cred: Pick<Credential, 'org_type'>): string {
 }
 
 /**
+ * 组织号徽章上的套餐文字：楼形图标已经说明是组织号，等级里重复的组织类型前缀就去掉
+ * （`Team Standard` → `Standard`），列里放得下。只是显示——库里的等级仍是全称，筛选、
+ * 排序、调度靠它认出团队号。等级就是组织类型本身（`Team`）或为空时显示组织类型。
+ */
+function orgTierText(cred: Pick<Credential, 'tier' | 'org_type'>): string {
+  const label = orgBadgeLabel(cred)
+  const tier = cred.tier?.trim()
+  if (!tier) return label
+  const prefix = `${label} `
+  return label && tier.startsWith(prefix) && tier.length > prefix.length ? tier.slice(prefix.length) : tier
+}
+
+/**
  * 套餐徽章，组织 / 个人做成徽章里的前缀图标，不再单占一枚胶囊：楼＝组织号（用量全组织共享），
  * 人＝个人号。org_type 还没拉到（旧号）时不猜，只显示套餐文字；组织号没有档位时退回用组织类型
  * 当文字，图标照挂。什么都没有时渲染 `fallback`（列表里的「—」）。
@@ -1886,7 +1902,7 @@ export function AccountTierBadge({
   const org = isOrgAccount(cred)
   if (!cred.tier && !org) return <>{fallback}</>
   const personal = !org && !!cred.org_type?.trim()
-  const text = cred.tier ?? orgBadgeLabel(cred)
+  const text = org ? orgTierText(cred) : (cred.tier ?? '')
   const variant = cred.tier ? tierBadgeVariant(cred.tier) : 'outline'
   if (!org && !personal) return <Badge size={size} variant={variant}>{text}</Badge>
   const Icon = org ? Building2Icon : UserIcon
@@ -1975,13 +1991,17 @@ const PLAN_BADGE: Record<PlanKey, BadgeProps['variant']> = {
   max20x: 'planHigh',
   max5x: 'plan',
   max: 'plan',
+  team: 'info',
   pro: 'info',
   free: 'outline',
   unknown: 'outline',
 }
 
 export function tierBadgeVariant(tier: string): BadgeProps['variant'] {
-  return PLAN_BADGE[planKey(tier)]
+  const key = planKey(tier)
+  // 团队 / 企业号同属一档，Premium 席位用 Max 的颜色，与 Standard 一眼分开。
+  if (key === 'team' && tier.toLowerCase().includes('premium')) return 'plan'
+  return PLAN_BADGE[key]
 }
 
 /** 凭证综合状态；access_token 到期不参与判色，因为下次调度会自动刷新。 */

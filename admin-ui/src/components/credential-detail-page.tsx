@@ -1280,11 +1280,32 @@ function InfoSection({ cred, now }: { cred: Credential; now: number }) {
   return (
     <Section icon={InfoIcon} title={t('账号信息', 'Account')} className="min-w-0 lg:h-full" panelClassName="lg:flex-1">
       <dl className="divide-y">
-        {/* 只在组织账号上列：个人号这一格要么是「—」，要么是 claude_max 这类与页头套餐徽章同义的原值；
-            页头套餐徽章只用一个楼形图标标出「组织号」，原值（claude_team / claude_enterprise）在这里看。 */}
+        {/* 组织名称 / 类型 / 席位 / 超额用量只在组织账号上列：个人号这几格要么是「—」，要么与页头套餐
+            徽章同义；页头套餐徽章只用一个楼形图标标出「组织号」，原值（claude_team / team_standard）在这里看。 */}
         {isOrgAccount(cred) && (
-          <InfoRow label={t('组织类型', 'Organisation type')}>
-            <span className="font-mono text-xs">{cred.org_type}</span>
+          <>
+            {cred.org_name && <InfoRow label={t('组织名称', 'Organisation')}>{cred.org_name}</InfoRow>}
+            <InfoRow label={t('组织类型', 'Organisation type')}>
+              <span className="font-mono text-xs">{cred.org_type}</span>
+            </InfoRow>
+            {cred.seat_tier && (
+              <InfoRow label={t('席位', 'Seat')}>
+                <span className="font-mono text-xs">{cred.seat_tier}</span>
+              </InfoRow>
+            )}
+            {cred.extra_usage_enabled !== null && (
+              <InfoRow label={t('超额用量', 'Extra usage')}>
+                {cred.extra_usage_enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}
+              </InfoRow>
+            )}
+          </>
+        )}
+        {/* 订阅状态：组织号总是列出；个人号只在不是 active 时列（active 是常态，列出来只是噪音）。 */}
+        {cred.subscription_status && (isOrgAccount(cred) || cred.subscription_status !== 'active') && (
+          <InfoRow label={t('订阅状态', 'Subscription')}>
+            <Badge size="sm" variant={cred.subscription_status === 'active' ? 'success' : 'warning'}>
+              <span className="font-mono">{cred.subscription_status}</span>
+            </Badge>
           </InfoRow>
         )}
         <InfoRow label={t('添加时间', 'Added')}>

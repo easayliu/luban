@@ -218,13 +218,14 @@ const TIER_FILTERS: { key: CredentialTierFilterKey; label: LocalizedLabel }[] = 
   { key: 'max5x', label: ['Max 5x', 'Max 5x'] },
   // 上游偶尔只给 `claude_max` 这种不带倍率的写法，单列一档收着，否则它会掉进「未知」里。
   { key: 'max', label: ['Max（倍率未知）', 'Max (multiplier unknown)'] },
+  { key: 'team', label: ['Team / Enterprise', 'Team / Enterprise'] },
   { key: 'pro', label: ['Pro', 'Pro'] },
   { key: 'free', label: ['Free', 'Free'] },
   { key: 'unknown', label: ['未知', 'Unknown'] },
 ]
 
-/** 套餐下拉在这些档位前加分隔线：全部 | Max 各档 | Pro、Free | 未知。 */
-const TIER_GROUP_STARTS = new Set<CredentialTierFilterKey>(['max20x', 'pro', 'unknown'])
+/** 套餐下拉在这些档位前加分隔线：全部 | Max 各档 | 团队 / 企业 | Pro、Free | 未知。 */
+const TIER_GROUP_STARTS = new Set<CredentialTierFilterKey>(['max20x', 'team', 'pro', 'unknown'])
 
 const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   priority: ['优先级', 'Priority'],
@@ -590,6 +591,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       max20x: 0,
       max5x: 0,
       max: 0,
+      team: 0,
       pro: 0,
       free: 0,
       unknown: 0,

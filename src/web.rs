@@ -3752,6 +3752,11 @@ struct CredentialView {
     /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
     /// 团队额度是整个组织共享的，跟同名档位的个人号不是一回事。
     org_type: Option<String>,
+    /// profile 里只给后台看的几项：组织名称、席位档原值、订阅状态原值、超额用量开关。
+    org_name: Option<String>,
+    seat_tier: Option<String>,
+    subscription_status: Option<String>,
+    extra_usage_enabled: Option<bool>,
     priority: i64,
     disabled: bool,
     expires_in: u64,
@@ -3850,6 +3855,10 @@ impl CredentialView {
             label: c.label.clone(),
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
+            org_name: c.org_name.clone(),
+            seat_tier: c.seat_tier.clone(),
+            subscription_status: c.subscription_status.clone(),
+            extra_usage_enabled: c.extra_usage_enabled,
             priority: c.priority,
             disabled: c.disabled,
             expires_in: secs,

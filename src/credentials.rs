@@ -67,6 +67,14 @@ pub struct Credential {
     /// 订阅创建时刻，profile 的 `organization.subscription_created_at` **原串**（ISO 8601）。
     /// eval 的 `subscriptionCreatedAt` 发它换算成的毫秒数；`None` 表示还没拉到，那一项不发。
     pub subscription_created_at: Option<String>,
+    /// 组织名称（profile 的 `organization.name`）。只给后台看。
+    pub org_name: Option<String>,
+    /// 席位档原值（`organization.seat_tier`，团队号如 `team_standard`）；个人号为空。
+    pub seat_tier: Option<String>,
+    /// 订阅状态原值（`organization.subscription_status`，如 `active`）。只给后台看。
+    pub subscription_status: Option<String>,
+    /// 组织是否开了超额用量（`organization.has_extra_usage_enabled`）；`None` 为还没拉到。
+    pub extra_usage_enabled: Option<bool>,
     /// 被上游限流自动停用后，**到点自动重新启用**的 Unix 时间戳（秒）；`None` 表示不自动
     /// 恢复（人工停用、封号，或压根没停用）。
     ///
@@ -87,7 +95,7 @@ pub struct Credential {
 }
 
 impl Credential {
-    /// profile 那几列还有没拉到的：账号 UUID、额度档原值、组织 UUID、订阅创建时刻。
+    /// profile 那几列还有没拉到的：账号 UUID、额度档原值、组织 UUID、订阅创建时刻、组织名称。
     /// [`crate::store::ensure_fresh_token`] 据此决定刷新后要不要顺手拉一次 profile。
     /// `tier` / `org_type` 不算——它们在 profile 里也可能就是空的（免费号），拿它们判会让
     /// 那类号每次刷新都多一次往返。
@@ -97,6 +105,7 @@ impl Credential {
             || missing(&self.rate_limit_tier)
             || missing(&self.org_uuid)
             || missing(&self.subscription_created_at)
+            || missing(&self.org_name)
     }
 
     /// 距离过期的剩余秒数（已过期返回 0）。
