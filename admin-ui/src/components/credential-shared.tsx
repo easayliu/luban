@@ -1909,13 +1909,19 @@ export function AccountTierBadge({
   size,
   fallback = null,
 }: {
-  cred: Pick<Credential, 'tier' | 'org_type' | 'org_name' | 'rate_limit_tier'>
+  cred: Pick<Credential, 'tier' | 'org_type' | 'org_name' | 'rate_limit_tier' | 'subscription_created_at'>
   size?: 'default' | 'sm' | 'xs'
   fallback?: ReactNode
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const org = isOrgAccount(cred)
   if (!cred.tier && !org) return <>{fallback}</>
+  const subscribedMs = cred.subscription_created_at ? Date.parse(cred.subscription_created_at) : NaN
+  const subscribed = Number.isFinite(subscribedMs) && (
+    <span className="block opacity-70">
+      {t('订阅开始', 'Subscribed')} {formatFullTime(Math.floor(subscribedMs / 1000), language)}
+    </span>
+  )
   const personal = !org && !!cred.org_type?.trim()
   const text = org ? orgTierText(cred) : (cred.tier ?? '')
   const quota = org ? rateLimitLabel(cred.rate_limit_tier) : null
@@ -1940,9 +1946,13 @@ export function AccountTierBadge({
               {cred.tier ?? orgBadgeLabel(cred)}
               {quota && ` · ${t('额度', 'Quota')} ${quota}`}
             </span>
+            {subscribed}
           </>
         ) : (
-          t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)
+          <>
+            <span className="block">{t(`个人账号（${cred.org_type}）`, `Personal account (${cred.org_type})`)}</span>
+            {subscribed}
+          </>
         )}
       </TooltipPopup>
     </Tooltip>

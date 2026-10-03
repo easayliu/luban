@@ -1642,6 +1642,63 @@ async fn refresh_credential(
     view_of(&state, id).await
 }
 
+/// 重新授权拿到的身份与这一行对不上的情形，见 [`reauth_mismatch`]。括号里是给人看的名字
+/// （邮箱 / 组织名，拉不到就用 UUID）。
+#[derive(Debug, PartialEq, Eq)]
+enum ReauthMismatch {
+    Account(String),
+    Organization(String),
+}
+
+impl ReauthMismatch {
+    /// 前端 `localizeBackendMessage` 按原文匹配这两句，改措辞要同步。
+    fn message(&self) -> String {
+        match self {
+            Self::Account(who) => format!(
+                "the authorized account ({who}) is not this account; sign in with the original account and try again"
+            ),
+            Self::Organization(org) => format!(
+                "the authorized organization ({org}) is not this account's organization; sign in and choose the original organization, then try again"
+            ),
+        }
+    }
+}
+
+/// 重新授权的同号校验：先比账号 UUID，再比组织 UUID。
+///
+/// 这次拿到的值 profile 优先，拉不到用交换响应里那个。两边都有且不等才算对不上；任一边缺
+/// （旧号还没回填、profile 与交换响应都没给）无从比对，放行。组织要单独比：同一个人可以既有
+/// 个人订阅又占一个团队席位，账号 UUID 相同，登录时选错组织就会把另一个订阅的 token 塞进来。
+fn reauth_mismatch(
+    known_account: Option<&str>,
+    known_org: Option<&str>,
+    profile: Option<&oauth::Profile>,
+    tokens: &oauth::TokenSet,
+) -> Option<ReauthMismatch> {
+    fn present(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let got_account =
+        present(profile.and_then(|p| p.account_uuid.as_deref()).or(tokens.account_uuid.as_deref()));
+    if let (Some(known), Some(got)) = (present(known_account), got_account)
+        && known != got
+    {
+        let who =
+            profile.and_then(|p| p.email.as_deref()).or(tokens.account.as_deref()).unwrap_or(got);
+        return Some(ReauthMismatch::Account(who.to_string()));
+    }
+    let got_org = present(
+        profile.and_then(|p| p.org_uuid.as_deref()).or(tokens.organization_uuid.as_deref()),
+    );
+    if let (Some(known), Some(got)) = (present(known_org), got_org)
+        && known != got
+    {
+        let org = profile.and_then(|p| p.org_name.as_deref()).unwrap_or(got);
+        return Some(ReauthMismatch::Organization(org.to_string()));
+    }
+    None
+}
+
 #[derive(Deserialize)]
 struct ReauthorizeReq {
     /// 用户从授权回调页粘贴的 `code#state`，授权链接同样取自 `GET /authorize`。
@@ -1657,9 +1714,8 @@ struct ReauthorizeReq {
 /// 两道把关：
 /// - 持有该号的刷新锁再写——等锁的自动刷新拿锁后会重读库，看到新 token 就直接复用，
 ///   不会把旧那一族的结果写回来；
-/// - 账号 UUID（profile 优先，拉不到用交换响应里那个）与库里的对不上就拒绝：登错号会把另一个
-///   账号的 token 塞进这一行，而标签、代理、会话槽位都还是原来那个号的。库里没有 UUID（旧号）
-///   或两处都没给时无从比对，放行。
+/// - 账号 UUID、组织 UUID 与库里的对不上就拒绝（见 [`reauth_mismatch`]）：登错号或选错组织会把
+///   另一个账号 / 订阅的 token 塞进这一行，而标签、代理、会话槽位都还是原来那个号的。
 ///
 /// 号是因为 token 问题被自动停用的（见 [`is_token_pause`]），换好 token 就顺手启用；封号、
 /// 订阅未生效、手动停用、额度暂停与 token 无关，保持原状。
@@ -1691,21 +1747,14 @@ async fn reauthorize_credential(
             None
         }
     };
-    let known = cred.account_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let got =
-        profile.as_ref().and_then(|p| p.account_uuid.as_deref()).or(tokens.account_uuid.as_deref());
-    if let (Some(known), Some(got)) = (known, got)
-        && known != got
-    {
-        let who = profile
-            .as_ref()
-            .and_then(|p| p.email.as_deref())
-            .or(tokens.account.as_deref())
-            .unwrap_or(got);
-        tracing::warn!(cred_id = id, cred = %cred.label, %who, "reauthorize: authorized a different account, rejected");
-        return Err(bad_request(format!(
-            "the authorized account ({who}) is not this account; sign in with the original account and try again"
-        )));
+    if let Some(mismatch) = reauth_mismatch(
+        cred.account_uuid.as_deref(),
+        cred.org_uuid.as_deref(),
+        profile.as_ref(),
+        &tokens,
+    ) {
+        tracing::warn!(cred_id = id, cred = %cred.label, ?mismatch, "reauthorize: authorized a different account or organization, rejected");
+        return Err(bad_request(mismatch.message()));
     }
 
     state
@@ -3754,6 +3803,8 @@ struct CredentialView {
     org_type: Option<String>,
     /// 额度档原值（`default_claude_max_5x`/`default_raven`…）。团队号的徽章颜色看它。
     rate_limit_tier: Option<String>,
+    /// 订阅创建时刻原串（`organization.subscription_created_at`，ISO 8601），徽章提示里显示。
+    subscription_created_at: Option<String>,
     /// profile 里只给后台看的几项：组织名称、席位档原值、订阅状态原值、超额用量开关。
     org_name: Option<String>,
     seat_tier: Option<String>,
@@ -3858,6 +3909,7 @@ impl CredentialView {
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
             rate_limit_tier: c.rate_limit_tier.clone(),
+            subscription_created_at: c.subscription_created_at.clone(),
             org_name: c.org_name.clone(),
             seat_tier: c.seat_tier.clone(),
             subscription_status: c.subscription_status.clone(),
@@ -4379,6 +4431,106 @@ fn keepalive_ban_context(rej: &oauth::AuthRejection) -> store::BanContext {
 mod tests {
     use super::*;
     use crate::oauth::PkceChallenge;
+
+    fn tokens(account: Option<&str>, org: Option<&str>) -> oauth::TokenSet {
+        oauth::TokenSet {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at: 0,
+            account: Some("from-token@example.com".into()),
+            account_uuid: account.map(Into::into),
+            organization_uuid: org.map(Into::into),
+        }
+    }
+
+    /// 重新授权的同号校验：同一个人、同一个账号 UUID，选错组织（个人订阅 vs 团队席位）要拒绝。
+    #[test]
+    fn reauth_rejects_a_different_org_of_the_same_account() {
+        let team = oauth::Profile {
+            account_uuid: Some("acct".into()),
+            org_uuid: Some("org-team".into()),
+            org_name: Some("Pkspa".into()),
+            ..Default::default()
+        };
+        let personal = oauth::Profile {
+            org_uuid: Some("org-personal".into()),
+            org_name: Some("x's Organization".into()),
+            ..team.clone()
+        };
+        let t = tokens(None, None);
+
+        assert_eq!(reauth_mismatch(Some("acct"), Some("org-team"), Some(&team), &t), None);
+        assert_eq!(
+            reauth_mismatch(Some("acct"), Some("org-team"), Some(&personal), &t),
+            Some(ReauthMismatch::Organization("x's Organization".into()))
+        );
+        // profile 没拉到：用交换响应里的组织 UUID 比，名字退回 UUID。
+        assert_eq!(
+            reauth_mismatch(
+                Some("acct"),
+                Some("org-team"),
+                None,
+                &tokens(Some("acct"), Some("org-personal"))
+            ),
+            Some(ReauthMismatch::Organization("org-personal".into()))
+        );
+        assert_eq!(
+            reauth_mismatch(
+                Some("acct"),
+                Some("org-team"),
+                None,
+                &tokens(Some("acct"), Some("org-team"))
+            ),
+            None
+        );
+    }
+
+    /// 缺一边无从比对就放行；账号不对先报账号。
+    #[test]
+    fn reauth_mismatch_skips_missing_sides_and_checks_account_first() {
+        let p = oauth::Profile {
+            account_uuid: Some("other".into()),
+            email: Some("other@example.com".into()),
+            org_uuid: Some("org-b".into()),
+            ..Default::default()
+        };
+        let t = tokens(None, None);
+        assert_eq!(
+            reauth_mismatch(Some("acct"), Some("org-a"), Some(&p), &t),
+            Some(ReauthMismatch::Account("other@example.com".into()))
+        );
+        let same_acct = oauth::Profile { account_uuid: Some("acct".into()), ..p.clone() };
+        assert_eq!(
+            reauth_mismatch(Some("acct"), None, Some(&same_acct), &t),
+            None,
+            "库里没有组织 UUID（旧号）"
+        );
+        assert_eq!(
+            reauth_mismatch(Some("acct"), Some(" "), Some(&same_acct), &t),
+            None,
+            "空串当没有"
+        );
+        let no_org = oauth::Profile { org_uuid: None, ..same_acct.clone() };
+        assert_eq!(
+            reauth_mismatch(Some("acct"), Some("org-a"), Some(&no_org), &t),
+            None,
+            "这次没拿到组织 UUID"
+        );
+        assert_eq!(reauth_mismatch(None, None, Some(&p), &t), None);
+    }
+
+    /// 前端按原文匹配这两句做中文化（`localizeBackendMessage`），措辞不能悄悄变。
+    #[test]
+    fn reauth_mismatch_messages_match_the_frontend_patterns() {
+        assert_eq!(
+            ReauthMismatch::Account("a@b.c".into()).message(),
+            "the authorized account (a@b.c) is not this account; sign in with the original account and try again"
+        );
+        assert_eq!(
+            ReauthMismatch::Organization("Pkspa".into()).message(),
+            "the authorized organization (Pkspa) is not this account's organization; sign in and choose the original organization, then try again"
+        );
+    }
 
     /// 两条只差密码的代理，给访客打码后 URL 一模一样；账号视图带上代理池 id，前端按 id 查名称
     /// 才不会串位。

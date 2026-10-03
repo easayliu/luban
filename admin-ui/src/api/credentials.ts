@@ -92,6 +92,8 @@ export interface Credential {
   org_type: string | null
   /** 额度档原值（`default_claude_max_5x`/`default_raven`…），拉不到时为 null。 */
   rate_limit_tier: string | null
+  /** 订阅创建时刻原串（ISO 8601，如 `2026-08-03T19:31:30.341259Z`），拉不到时为 null。 */
+  subscription_created_at: string | null
   /** 组织名称（profile 的 `organization.name`），拉不到时为 null。 */
   org_name: string | null
   /** 席位档原值（`team_standard`/`team_premium`…）；个人号没有，为 null。 */

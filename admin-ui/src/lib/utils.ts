@@ -212,6 +212,13 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
       : `The authorized account (${wrongAccount[1]}) is not this account; sign in with the original account and try again`
   }
 
+  const wrongOrg = message.match(/^the authorized organization \((.+)\) is not this account's organization; sign in and choose the original organization, then try again$/i)
+  if (wrongOrg) {
+    return language === 'zh-CN'
+      ? `授权的组织（${wrongOrg[1]}）与当前账号不一致，请登录后选择原来的组织再试`
+      : `The authorized organization (${wrongOrg[1]}) is not this account's organization; sign in and choose the original organization, then try again`
+  }
+
   const allRefreshAttempts = message.match(/^all (\d+) credential refresh attempts failed; no credentials are available$/i)
     ?? message.match(/^连续 (\d+) 个凭证刷新失败，暂无可用账号$/)
   if (allRefreshAttempts) {

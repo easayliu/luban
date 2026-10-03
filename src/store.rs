@@ -1045,12 +1045,50 @@ impl CredentialStore {
         out
     }
 
+    /// 导入时按账号找目标行：同一个账号 UUID 下按组织 UUID 认。
+    ///
+    /// - 组织 UUID 两边都有且相等 → 就是它；
+    /// - 导入的有组织 UUID、库里没有同组织的 → 退回库里这个账号下**唯一一条**组织 UUID 还空着的
+    ///   行（旧号还没回填），有多条说不清是哪个就不认；
+    /// - 导入的没有组织 UUID → 库里这个账号只有一行才认它，多行（个人 + 团队）说不清就不认。
+    ///
+    /// 不认的交给调用方按 refresh_token 兜底，再不中就新增——宁可多一行，也不要拿一个订阅的
+    /// 状态覆盖掉另一个订阅。
+    fn match_import_target(
+        tx: &rusqlite::Transaction<'_>,
+        account_uuid: &str,
+        org_uuid: Option<&str>,
+    ) -> Result<Option<i64>> {
+        let mut stmt = tx.prepare(
+            "SELECT id, NULLIF(TRIM(COALESCE(org_uuid, '')), '') FROM credentials
+              WHERE account_uuid = ?1",
+        )?;
+        let rows: Vec<(i64, Option<String>)> = stmt
+            .query_map([account_uuid], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let only = |v: Vec<i64>| if v.len() == 1 { Some(v[0]) } else { None };
+        Ok(match org_uuid {
+            Some(org) => {
+                if let Some((id, _)) = rows.iter().find(|(_, o)| o.as_deref() == Some(org)) {
+                    Some(*id)
+                } else {
+                    only(rows.iter().filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect())
+                }
+            }
+            None => only(rows.iter().map(|(id, _)| *id).collect()),
+        })
+    }
+
     /// 导入一条凭证：目标库已有这个账号就整行覆盖，没有就新增。
     ///
-    /// **匹配顺序是 `account_uuid` 优先、`refresh_token` 兜底**，这个先后有实际后果：同一个
+    /// **匹配顺序是「账号 UUID + 组织 UUID」优先、`refresh_token` 兜底**，这个先后有实际后果：同一个
     /// 账号在源站重新授权过之后 refresh_token 已经是新值，只按 token 匹配会把它当成一个新
     /// 账号插进去，目标库里同一个账号出现两行（两行还会各自去刷新同一个上游账号）。反过来，
     /// 老库里可能有 `account_uuid` 还没拉到的号（profile 没取成功），故 token 这条兜底不能去。
+    ///
+    /// 只按账号 UUID 不够：同一个人可以既有个人订阅、又在团队里占一个席位，两次授权拿到的是
+    /// **同一个** `account_uuid`、不同的 `org_uuid`，在库里是两行。只认账号的话，导入时后一行会
+    /// 把前一行整行覆盖掉。见 [`Self::match_import_target`]。
     ///
     /// 命中后是**整行覆盖**而不是只更新 token：迁移文件是源站此刻的完整状态，优先级、设备
     /// 上限、代理这些都是操作者在源站上调好的。想保留目标站自己的调法，就别对已有的号做导入
@@ -1061,27 +1099,24 @@ impl CredentialStore {
         }
         // 空串的 uuid 当没有：老库里存过空串，拿它去匹配会把所有这类号连成一个。
         let uuid = c.account_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let org = c.org_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let proxy = c.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
-        let existing: Option<i64> = uuid
-            .and_then(|u| {
-                tx.query_row("SELECT id FROM credentials WHERE account_uuid = ?1", [u], |r| {
-                    r.get(0)
-                })
-                .optional()
-                .transpose()
-            })
-            .or_else(|| {
-                tx.query_row(
+        let by_account = match uuid {
+            Some(u) => Self::match_import_target(&tx, u, org)?,
+            None => None,
+        };
+        let existing: Option<i64> = match by_account {
+            Some(id) => Some(id),
+            None => tx
+                .query_row(
                     "SELECT id FROM credentials WHERE refresh_token = ?1",
                     [&c.refresh_token],
                     |r| r.get(0),
                 )
-                .optional()
-                .transpose()
-            })
-            .transpose()?;
+                .optional()?,
+        };
         let outcome = match existing {
             Some(id) => {
                 tx.execute(
@@ -9349,6 +9384,76 @@ mod tests {
         // 空 token 的记录直接报错：让调用方把它计进 failed，而不是写一行用不了的号进去。
         let empty = PortableCredential { access_token: "".into(), ..base.clone() };
         assert!(store.import_credential(&empty).is_err());
+    }
+
+    /// 同一个人既有个人订阅又占一个团队席位：同一个账号 UUID、两个组织 UUID，导入后得是两行，
+    /// 各自按组织认回自己那一行；组织 UUID 说不清时不乱认。
+    #[test]
+    fn import_matches_by_account_and_org_uuid() {
+        let (store, _) = store_with(&[]);
+        let personal = PortableCredential {
+            label: "personal".into(),
+            tier: Some("Max 20x".into()),
+            org_type: Some("claude_max".into()),
+            rate_limit_tier: None,
+            access_token: "at-p".into(),
+            refresh_token: "rt-p".into(),
+            expires_at: 100,
+            priority: 0,
+            disabled: false,
+            device_limit: 0,
+            session_limit: 0,
+            rpm_limit: 0,
+            quota_pause_pct: None,
+            quota_pause_pct_7d: None,
+            ban_reason: None,
+            account_uuid: Some("acct".into()),
+            org_uuid: Some("org-personal".into()),
+            subscription_created_at: None,
+            org_name: None,
+            seat_tier: None,
+            subscription_status: None,
+            extra_usage_enabled: None,
+            resume_at: None,
+            proxy: None,
+        };
+        let team = PortableCredential {
+            label: "team".into(),
+            tier: Some("Team Standard".into()),
+            org_type: Some("claude_team".into()),
+            access_token: "at-t".into(),
+            refresh_token: "rt-t".into(),
+            org_uuid: Some("org-team".into()),
+            ..personal.clone()
+        };
+        assert_eq!(store.import_credential(&personal).unwrap(), ImportOutcome::Added);
+        assert_eq!(
+            store.import_credential(&team).unwrap(),
+            ImportOutcome::Added,
+            "另一个组织是另一行"
+        );
+
+        // 团队那行在源站重新授权过（新 refresh_token），按组织认回团队那行，个人那行不动。
+        let team2 = PortableCredential { refresh_token: "rt-t2".into(), ..team.clone() };
+        assert_eq!(store.import_credential(&team2).unwrap(), ImportOutcome::Updated);
+        let rows = store.list().unwrap();
+        assert_eq!(rows.len(), 2);
+        let by_label = |l: &str| rows.iter().find(|c| c.label == l).unwrap().clone();
+        assert_eq!(by_label("team").refresh_token, "rt-t2");
+        assert_eq!(by_label("personal").refresh_token, "rt-p");
+
+        // 没带组织 UUID、账号下又有两行：说不清是哪个，不认，新增一行。
+        let ambiguous =
+            PortableCredential { org_uuid: None, refresh_token: "rt-x".into(), ..team.clone() };
+        assert_eq!(store.import_credential(&ambiguous).unwrap(), ImportOutcome::Added);
+
+        // 库里是还没回填组织 UUID 的旧号：账号下只有它一条空着的，认它。
+        let (old, _) = store_with(&[]);
+        let legacy = PortableCredential { org_uuid: None, ..personal.clone() };
+        assert_eq!(old.import_credential(&legacy).unwrap(), ImportOutcome::Added);
+        let fresh = PortableCredential { refresh_token: "rt-new".into(), ..personal.clone() };
+        assert_eq!(old.import_credential(&fresh).unwrap(), ImportOutcome::Updated);
+        assert_eq!(old.list().unwrap().len(), 1);
     }
 
     /// 导出的设置快照与导入都**绕开管理密码**：那是目标机器自己的门锁，不该被一次导入换掉。

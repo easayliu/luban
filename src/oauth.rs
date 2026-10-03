@@ -331,6 +331,9 @@ async fn fetch_profile_from(
     // 会一路走到日志与后台页面。serde 的报错自带字段名与行列，定位足够了。
     let p: ProfileResponse = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse the profile response ({} bytes)", text.len()))?;
+    // 原样留一份：上游的席位 / 额度档取值没有文档（`team_standard`、`team_tier_1`、`default_raven`…），
+    // 新冒出来的写法只能靠这行看。含邮箱姓名，只进本地日志。
+    tracing::info!(body = %text, "oauth profile raw response");
 
     let org_str = |f: fn(&ProfileOrg) -> &Option<String>| {
         p.organization.as_ref().and_then(|o| f(o).clone()).filter(|s| !s.trim().is_empty())
@@ -376,25 +379,33 @@ fn tier_from(
     seat_tier: Option<&str>,
 ) -> Option<String> {
     let mult = multiplier(rate_limit_tier); // 如 "5x" / "20x"
+    let org_type = org_type.map(str::trim).filter(|s| !s.is_empty());
+
+    // 组织号（团队 / 企业）只看组织那边的字段。`has_claude_max`/`has_claude_pro` 是**账号级**的，
+    // 跟着人走、不跟组织：同一个人自己买了 Max 又被拉进团队时，登进团队组织那份 profile 里
+    // `has_claude_max` 也是 true（实测 `claude_team` + `team_standard` + `default_raven`），
+    // 先看它就会把团队席位判成个人 Max。
+    if let Some(t) = org_type.filter(|t| !PERSONAL_ORG_TYPES.contains(t)) {
+        // 团队号的 `rate_limit_tier` 是 `default_raven` 这类内部代号，读不出档位；
+        // 席位档才是买的那一档（实测 `team_standard` / `team_tier_1`）。
+        if let Some(seat) = seat_tier.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(humanize_seat(seat));
+        }
+        // 没有席位档时额度档只能从 `rate_limit_tier` 读——`default_claude_max_5x` 说明这个
+        // 组织拿的是 Max 5x 的量。
+        if let Some(from_rate) = tier_from_rate_limit(rate_limit_tier) {
+            return Some(from_rate);
+        }
+        return Some(humanize_tier(t));
+    }
+
     if has_max == Some(true) {
         return Some(with_mult("Max", mult));
     }
     if has_pro == Some(true) {
         return Some("Pro".into());
     }
-    if let Some(t) = org_type.map(str::trim).filter(|s| !s.is_empty()) {
-        // 团队号的 `rate_limit_tier` 是 `default_raven` 这类内部代号，读不出档位；
-        // 席位档才是买的那一档（实测 `claude_team` + `team_standard`）。
-        if let Some(seat) = seat_tier.map(str::trim).filter(|s| !s.is_empty()) {
-            return Some(humanize_seat(seat));
-        }
-        // 团队/企业号的席位**不体现在 account 的 has_claude_max/pro 上**（实测两个都是
-        // false），额度档只能从 `rate_limit_tier` 读——`default_claude_max_5x` 说明这个
-        // 组织拿的是 Max 5x 的量。此前这里直接返回 `humanize_tier("claude_team") = "team"`，
-        // 既把额度档整个丢了，大小写也和 `Max`/`Pro` 不一致。
-        if let Some(from_rate) = tier_from_rate_limit(rate_limit_tier) {
-            return Some(from_rate);
-        }
+    if let Some(t) = org_type {
         let base = humanize_tier(t);
         // 组织类型是 max 时也带上倍数。
         return Some(if base == "Max" { with_mult("Max", mult) } else { base });
@@ -404,6 +415,10 @@ fn tier_from(
     }
     None
 }
+
+/// 个人组织的类型；其余（`claude_team`/`claude_enterprise`/没见过的）一律当组织号，
+/// 与前端 `isOrgAccount` 同一口径。
+const PERSONAL_ORG_TYPES: [&str; 3] = ["claude_max", "claude_pro", "claude_free"];
 
 /// 从 `rate_limit_tier` 读出额度档，如 `default_claude_max_5x` → `Max 5x`。
 ///
@@ -2383,19 +2398,41 @@ mod tests {
         );
     }
 
-    /// 个人号的判定顺序不变：`has_claude_max`/`has_claude_pro` 比组织字段更权威。
+    /// 个人组织里 `has_claude_max`/`has_claude_pro` 最权威。
     #[test]
-    fn personal_tier_still_wins_over_the_org_fields() {
+    fn personal_tier_comes_from_the_account_flags() {
         assert_eq!(
-            tier_from(Some(true), None, Some("claude_team"), Some("default_claude_max_20x"), None),
+            tier_from(Some(true), None, Some("claude_max"), Some("default_claude_max_20x"), None),
             Some("Max 20x".into())
         );
+        assert_eq!(tier_from(None, Some(true), Some("claude_pro"), None, None), Some("Pro".into()));
         assert_eq!(
-            tier_from(None, Some(true), Some("claude_team"), None, None),
-            Some("Pro".into())
+            tier_from(Some(true), None, None, Some("default_claude_max_5x"), None),
+            Some("Max 5x".into())
         );
         assert_eq!(tier_from(Some(false), Some(false), None, None, None), Some("Free".into()));
         assert_eq!(tier_from(None, None, None, None, None), None);
+    }
+
+    /// 账号级的 `has_claude_max` 跟着人走：同一个人有个人 Max、又在团队里占一个席位时，
+    /// 团队组织那份 profile 里它也是 true（实测）。组织号不能看它，否则团队席位被判成 `Max`。
+    #[test]
+    fn org_tier_ignores_the_account_flags() {
+        let team = |max, seat| {
+            tier_from(max, Some(false), Some("claude_team"), Some("default_raven"), seat)
+        };
+        assert_eq!(team(Some(true), Some("team_standard")), Some("Team Standard".into()));
+        assert_eq!(team(Some(true), None), Some("Team".into()));
+        assert_eq!(
+            tier_from(
+                None,
+                Some(true),
+                Some("claude_enterprise"),
+                Some("default_claude_max_20x"),
+                None
+            ),
+            Some("Max 20x".into())
+        );
     }
 
     fn err(status: StatusCode, body: &str) -> TokenEndpointError {
