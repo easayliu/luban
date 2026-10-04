@@ -4,6 +4,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
 
+/// 调度优先级的取值范围：数值小者优先，P1 最先调度。
+pub const PRIORITY_MIN: i64 = 1;
+pub const PRIORITY_MAX: i64 = 100;
+/// 新账号落在中间档 P50：要优先就往小调、要垫底就往大调，都不用动其余账号。
+/// 同档内按设备数负载均衡，新号加进来立刻参与分摊。
+pub const PRIORITY_DEFAULT: i64 = 50;
+/// 老口径（默认 P0、可为负数）换算到现口径要加的偏移：老 P0 对上新默认 P50，顺序不变。
+pub const LEGACY_PRIORITY_SHIFT: i64 = PRIORITY_DEFAULT;
+
+/// 老口径的优先级换算到现口径，截在 [`PRIORITY_MIN`]..=[`PRIORITY_MAX`]。
+pub fn priority_from_legacy(p: i64) -> i64 {
+    p.saturating_add(LEGACY_PRIORITY_SHIFT).clamp(PRIORITY_MIN, PRIORITY_MAX)
+}
+
 /// 一条 Claude OAuth 凭证（对应 SQLite 一行）。
 #[derive(Debug, Clone)]
 pub struct Credential {
@@ -29,7 +43,7 @@ pub struct Credential {
     pub refresh_token: String,
     /// access_token 过期的 Unix 时间戳（秒）。
     pub expires_at: u64,
-    /// 优先级：数值小者优先（供后续代理轮换选择）。
+    /// 调度优先级：数值小者优先，取值 [`PRIORITY_MIN`]..=[`PRIORITY_MAX`]。
     pub priority: i64,
     /// 是否停用（停用的凭证不参与转发）。
     pub disabled: bool,
@@ -228,4 +242,19 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 /// 当前 Unix 时间戳（秒）。
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    /// 老口径换算：P0 对上新默认 P50，负数往前、正数往后，越界截到 1..=100。
+    #[test]
+    fn legacy_priority_maps_p0_to_default() {
+        assert_eq!(priority_from_legacy(0), PRIORITY_DEFAULT);
+        assert_eq!(priority_from_legacy(-1), 49);
+        assert_eq!(priority_from_legacy(3), 53);
+        assert_eq!(priority_from_legacy(-500), PRIORITY_MIN);
+        assert_eq!(priority_from_legacy(i64::MAX), PRIORITY_MAX);
+    }
 }

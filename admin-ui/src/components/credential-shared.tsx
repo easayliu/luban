@@ -10,7 +10,7 @@ import {
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
   setCredentialQuotaPausePct, setDeviceLimit, setDisabled, setLabel, setPriority, setProxy,
-  setRpmLimit, setSessionLimit,
+  setRpmLimit, setSessionLimit, PRIORITY_MAX, PRIORITY_MIN,
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -681,7 +681,7 @@ export const CREDENTIAL_CARD_GRID_CLASS =
 
 /**
  * 各维度首次选中时的默认方向——按「用户多半想先看什么」定：
- * 优先级/名称是升序（P0 在前、A→Z），其余都是降序（最严重、用得最多、最贵、最近的排前面）。
+ * 优先级/名称是升序（P1 在前、A→Z），其余都是降序（最严重、用得最多、最贵、最近的排前面）。
  * 再次点击同一维度会翻转方向，此处只决定初值。
  */
 export const SORT_DIR_DEFAULT: Record<SortKey, SortDir> = {
@@ -1022,7 +1022,7 @@ function useCredentialMenuGroups(
       icon: <ChevronUpIcon />,
       label: t('提高优先级', 'Increase priority'),
       onSelect: () => prio.mutate(cred.priority - 1),
-      disabled: prio.isPending,
+      disabled: prio.isPending || cred.priority <= PRIORITY_MIN,
       shortcut: `P${cred.priority - 1}`,
       title: t('数值越小，调度优先级越高', 'Lower values are scheduled first'),
     },
@@ -1031,7 +1031,7 @@ function useCredentialMenuGroups(
       icon: <ChevronDownIcon />,
       label: t('降低优先级', 'Decrease priority'),
       onSelect: () => prio.mutate(cred.priority + 1),
-      disabled: prio.isPending,
+      disabled: prio.isPending || cred.priority >= PRIORITY_MAX,
       shortcut: `P${cred.priority + 1}`,
       title: t('数值越大，调度优先级越低', 'Higher values are scheduled later'),
     },

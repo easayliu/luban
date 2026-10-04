@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::credentials::Credential;
+use crate::credentials::{
+    Credential, LEGACY_PRIORITY_SHIFT, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN,
+};
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
@@ -719,8 +721,9 @@ pub struct PortableCredential {
     pub refresh_token: String,
     #[serde(default)]
     pub expires_at: u64,
+    /// 缺省（`None`）落默认档 [`PRIORITY_DEFAULT`]，不能让 serde 填 0 再被截成最高档 P1。
     #[serde(default)]
-    pub priority: i64,
+    pub priority: Option<i64>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
@@ -772,7 +775,7 @@ impl From<&Credential> for PortableCredential {
             access_token: c.access_token.clone(),
             refresh_token: c.refresh_token.clone(),
             expires_at: c.expires_at,
-            priority: c.priority,
+            priority: Some(c.priority),
             disabled: c.disabled,
             device_limit: c.device_limit,
             rpm_limit: c.rpm_limit,
@@ -924,12 +927,14 @@ impl CredentialStore {
         org_type: Option<&str>,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
-        // 新凭证一律落在默认档 P0：同档内按设备数负载均衡，新账号立刻参与分摊。
+        // 新凭证一律落在默认档 P50：同档内按设备数负载均衡，新账号立刻参与分摊。
         // 需要瀑布式（榨干一个再用下一个）时，手动/批量把账号调到不同优先级即可。
+        // 显式写 priority：老库的列默认值还是 0，不能指望它。
         conn.execute(
             "INSERT INTO credentials
-                 (label, tier, access_token, refresh_token, expires_at, account_uuid, org_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (label, tier, access_token, refresh_token, expires_at, account_uuid, org_type,
+                  priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 label,
                 tier,
@@ -937,7 +942,8 @@ impl CredentialStore {
                 refresh_token,
                 expires_at as i64,
                 account_uuid,
-                org_type
+                org_type,
+                PRIORITY_DEFAULT
             ],
         )
         .context("failed to insert credential (the refresh_token may already exist)")?;
@@ -1101,6 +1107,7 @@ impl CredentialStore {
         let uuid = c.account_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let org = c.org_uuid.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let proxy = c.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let priority = c.priority.map_or(PRIORITY_DEFAULT, |p| p.clamp(PRIORITY_MIN, PRIORITY_MAX));
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         let by_account = match uuid {
@@ -1138,7 +1145,7 @@ impl CredentialStore {
                         c.access_token,
                         c.refresh_token,
                         c.expires_at as i64,
-                        c.priority,
+                        priority,
                         c.disabled as i64,
                         c.device_limit,
                         c.rpm_limit,
@@ -1179,7 +1186,7 @@ impl CredentialStore {
                         c.access_token,
                         c.refresh_token,
                         c.expires_at as i64,
-                        c.priority,
+                        priority,
                         c.disabled as i64,
                         c.device_limit,
                         c.rpm_limit,
@@ -1383,7 +1390,7 @@ impl CredentialStore {
         )
     }
 
-    /// 设置优先级。
+    /// 设置优先级。范围由调用方（admin API）校验，这里不再截断。
     pub fn set_priority(&self, id: i64, priority: i64) -> Result<bool> {
         self.update_one(
             "UPDATE credentials SET priority = ?2, updated_at = unixepoch() WHERE id = ?1",
@@ -1406,6 +1413,33 @@ impl CredentialStore {
             )?;
             for id in ids {
                 n += stmt.execute(params![id, priority])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 批量平移优先级：`ids` 里的账号各自在原值上加 `delta`（负数 = 提高），超出
+    /// [`PRIORITY_MIN`]..=[`PRIORITY_MAX`] 的截到边界。选中账号之间的先后顺序不变
+    /// （碰到边界的除外）。单事务，返回实际更新的条数。`ids` 里重复的只平移一次。
+    pub fn shift_priorities(&self, ids: &[i64], delta: i64) -> Result<usize> {
+        // 平移不是幂等的：同一个 id 出现两次就会被加两次 delta，先去重。
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE credentials SET priority = MIN(MAX(priority + ?2, ?3), ?4),
+                     updated_at = unixepoch() WHERE id = ?1",
+            )?;
+            for id in &ids {
+                n += stmt.execute(params![id, delta, PRIORITY_MIN, PRIORITY_MAX])?;
             }
         }
         tx.commit()?;
@@ -5766,7 +5800,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             access_token  TEXT    NOT NULL,
             refresh_token TEXT    NOT NULL,
             expires_at    INTEGER NOT NULL,
-            priority      INTEGER NOT NULL DEFAULT 0,
+            priority      INTEGER NOT NULL DEFAULT 50,
             disabled      INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
@@ -6310,6 +6344,40 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     purge_orphan_rows(conn)?;
     backfill_ledger(conn)?;
+    migrate_priority_scale(conn)?;
+    Ok(())
+}
+
+/// 标记优先级已换到 1..=100、默认 P50 的口径；有这一行就不再平移。
+const PRIORITY_SCALE_MIGRATED: &str = "priority_scale_p50";
+
+/// 优先级换口径：老版本新号默认 P0、还能调成负数，现口径是 P1..=P100、默认 P50。
+/// 整体加 [`LEGACY_PRIORITY_SHIFT`]（老 P0 → P50，-1 → P49，3 → P53），顺序不变，越界的截到边界。
+/// **只跑一次**：平移不是幂等的，靠 settings 里的标记挡住重复执行；新库空表上跑一遍只是落下标记。
+fn migrate_priority_scale(conn: &Connection) -> Result<()> {
+    let done: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [PRIORITY_SCALE_MIGRATED], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "UPDATE credentials SET priority = MIN(MAX(priority + ?1, ?2), ?3)",
+        params![LEGACY_PRIORITY_SHIFT, PRIORITY_MIN, PRIORITY_MAX],
+    )?;
+    tx.execute("INSERT INTO settings (key, value) VALUES (?1, '1')", [PRIORITY_SCALE_MIGRATED])?;
+    tx.commit()?;
+    if n > 0 {
+        tracing::warn!(
+            shift = LEGACY_PRIORITY_SHIFT,
+            count = n,
+            "moved account priorities to the P{PRIORITY_MIN}..P{PRIORITY_MAX} scale \
+             (old P0 is now P{PRIORITY_DEFAULT}); relative order kept"
+        );
+    }
     Ok(())
 }
 
@@ -6454,7 +6522,7 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("access_token", "TEXT NOT NULL"),
     ("refresh_token", "TEXT NOT NULL"),
     ("expires_at", "INTEGER NOT NULL"),
-    ("priority", "INTEGER NOT NULL DEFAULT 0"),
+    ("priority", "INTEGER NOT NULL DEFAULT 50"),
     ("disabled", "INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1))"),
     ("created_at", "INTEGER NOT NULL DEFAULT (unixepoch())"),
     ("updated_at", "INTEGER NOT NULL DEFAULT (unixepoch())"),
@@ -7804,24 +7872,94 @@ mod tests {
         assert_eq!(effective_device_limit(-1, 5), 0, "账号明确不限，忽略全局默认");
     }
 
-    /// 新增账号一律落在 P0；批量改优先级把选中的账号统一调档、其余不动。
+    /// 新增账号一律落在 P50；批量改优先级把选中的账号统一调档、其余不动。
     #[test]
-    fn insert_defaults_to_p0_and_batch_priority() {
+    fn insert_defaults_to_p50_and_batch_priority() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let store = CredentialStore::with_conn(conn);
         let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
         let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
         let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
-        assert_eq!((a.priority, b.priority, c.priority), (0, 0, 0), "新账号都应是 P0");
+        assert_eq!((a.priority, b.priority, c.priority), (50, 50, 50), "新账号都应是 P50");
 
-        assert_eq!(store.set_priorities(&[a.id, c.id], 2).unwrap(), 2);
+        assert_eq!(store.set_priorities(&[a.id, c.id], 3).unwrap(), 2);
         let by_id: HashMap<i64, i64> =
             store.list().unwrap().into_iter().map(|x| (x.id, x.priority)).collect();
-        assert_eq!(by_id[&a.id], 2);
-        assert_eq!(by_id[&c.id], 2);
-        assert_eq!(by_id[&b.id], 0, "未选中的账号不应被改动");
+        assert_eq!(by_id[&a.id], 3);
+        assert_eq!(by_id[&c.id], 3);
+        assert_eq!(by_id[&b.id], 50, "未选中的账号不应被改动");
         assert_eq!(store.set_priorities(&[], 9).unwrap(), 0, "空列表为 no-op");
+    }
+
+    /// 批量平移：各自加减、保留相对顺序，越界截到 1..=100，未选中的不动。
+    #[test]
+    fn shift_priorities_keeps_order_and_clamps() {
+        let (store, ids) = store_with(&["a", "b", "c"]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        store.set_priority(a, 2).unwrap();
+        store.set_priority(b, 5).unwrap();
+        store.set_priority(c, 99).unwrap();
+        let prio = |id| store.get(id).unwrap().unwrap().priority;
+
+        assert_eq!(store.shift_priorities(&[a, b], 3).unwrap(), 2);
+        assert_eq!((prio(a), prio(b), prio(c)), (5, 8, 99), "只动选中的，各自 +3");
+        store.shift_priorities(&[a, b, c], -6).unwrap();
+        assert_eq!((prio(a), prio(b), prio(c)), (1, 2, 93), "提高到顶截在 P1");
+        store.shift_priorities(&[c], 50).unwrap();
+        assert_eq!(prio(c), 100, "降低到底截在 P100");
+        assert_eq!(store.shift_priorities(&[b, b], 1).unwrap(), 1);
+        assert_eq!(prio(b), 3, "重复的 id 只平移一次");
+    }
+
+    /// 导入时缺 priority 落默认档 P50，不被当成 0 截到 P1；带了的截在 1..=100。
+    #[test]
+    fn import_without_priority_lands_on_default() {
+        let (store, _) = store_with(&[]);
+        let raw = |rt: &str, extra: &str| -> PortableCredential {
+            serde_json::from_str(&format!(
+                r#"{{"access_token":"at-{rt}","refresh_token":"{rt}"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        store.import_credential(&raw("rt-a", "")).unwrap();
+        store.import_credential(&raw("rt-b", r#","priority":0"#)).unwrap();
+        store.import_credential(&raw("rt-c", r#","priority":7"#)).unwrap();
+        let by_rt: HashMap<String, i64> =
+            store.list().unwrap().into_iter().map(|c| (c.refresh_token, c.priority)).collect();
+        assert_eq!(by_rt["rt-a"], PRIORITY_DEFAULT);
+        assert_eq!(by_rt["rt-b"], PRIORITY_MIN);
+        assert_eq!(by_rt["rt-c"], 7);
+    }
+
+    /// 老库整体 +50、越界截到边界、顺序不变；标记落下后再跑不会二次平移。
+    #[test]
+    fn migrate_priority_scale_shifts_once() {
+        let (store, ids) = store_with(&["a", "b", "c", "d", "e"]);
+        {
+            let conn = store.conn.lock();
+            conn.execute("DELETE FROM settings WHERE key = ?1", [PRIORITY_SCALE_MIGRATED]).unwrap();
+            for (id, p) in ids.iter().zip([-80, -1, 0, 3, 500]) {
+                conn.execute("UPDATE credentials SET priority = ?2 WHERE id = ?1", params![id, p])
+                    .unwrap();
+            }
+            migrate_priority_scale(&conn).unwrap();
+            migrate_priority_scale(&conn).unwrap();
+        }
+        let got: Vec<i64> =
+            ids.iter().map(|&id| store.get(id).unwrap().unwrap().priority).collect();
+        assert_eq!(got, vec![1, 49, 50, 53, 100]);
+    }
+
+    /// 新库建好就带着标记：新号直接落 P50，不会在下次启动被再加 50。
+    #[test]
+    fn fresh_db_is_already_on_the_new_scale() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let store = CredentialStore::with_conn(conn);
+        let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+        migrate_priority_scale(&store.conn.lock()).unwrap();
+        assert_eq!(store.get(a.id).unwrap().unwrap().priority, PRIORITY_DEFAULT);
     }
 
     /// 批量启停 / 设备上限 / 删除：只作用于选中的 id，且各自保持单账号接口的语义。
@@ -9334,7 +9472,7 @@ mod tests {
             access_token: "at-1".into(),
             refresh_token: "rt-1".into(),
             expires_at: 100,
-            priority: 2,
+            priority: Some(2),
             disabled: false,
             device_limit: 3,
             session_limit: 0,
@@ -9359,7 +9497,7 @@ mod tests {
         let reauthed = PortableCredential {
             refresh_token: "rt-2".into(),
             label: "acct-renamed".into(),
-            priority: 5,
+            priority: Some(5),
             ..base.clone()
         };
         assert_eq!(store.import_credential(&reauthed).unwrap(), ImportOutcome::Updated);
@@ -9399,7 +9537,7 @@ mod tests {
             access_token: "at-p".into(),
             refresh_token: "rt-p".into(),
             expires_at: 100,
-            priority: 0,
+            priority: Some(0),
             disabled: false,
             device_limit: 0,
             session_limit: 0,
@@ -9498,7 +9636,7 @@ mod tests {
             access_token: "at".into(),
             refresh_token: "rt".into(),
             expires_at: 1_800_000_000,
-            priority: 4,
+            priority: Some(4),
             disabled: true,
             device_limit: 6,
             session_limit: 0,
@@ -10077,7 +10215,7 @@ mod tests {
         store.set_disabled(max, true).unwrap();
         assert_eq!(pick("claude-fable-5-1"), unknown, "Max 不在时等级未知的排在 Pro 前面");
         store.set_disabled(max, false).unwrap();
-        store.set_priority(pro, -1).unwrap();
+        store.set_priority(pro, 49).unwrap();
         assert_eq!(pick("claude-fable-5-1"), pro, "优先级是主键，等级只在同档内排");
     }
 

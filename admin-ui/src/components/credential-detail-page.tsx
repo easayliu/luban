@@ -25,6 +25,8 @@ import {
   listCredentialDevices,
   listCredentialSessions,
   listCredentialUsage,
+  PRIORITY_MAX,
+  PRIORITY_MIN,
   type Credential,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
@@ -1361,7 +1363,7 @@ function ScheduleSection({
         type="button"
         size="icon-sm"
         variant="outline"
-        disabled={prio.isPending}
+        disabled={prio.isPending || cred.priority <= PRIORITY_MIN}
         aria-label={t('提高优先级', 'Increase priority')}
         title={t(`提高到 P${cred.priority - 1}`, `Raise to P${cred.priority - 1}`)}
         onClick={() => prio.mutate(cred.priority - 1)}
@@ -1372,7 +1374,7 @@ function ScheduleSection({
         type="button"
         size="icon-sm"
         variant="outline"
-        disabled={prio.isPending}
+        disabled={prio.isPending || cred.priority >= PRIORITY_MAX}
         aria-label={t('降低优先级', 'Decrease priority')}
         title={t(`降低到 P${cred.priority + 1}`, `Lower to P${cred.priority + 1}`)}
         onClick={() => prio.mutate(cred.priority + 1)}

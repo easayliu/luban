@@ -626,15 +626,27 @@ export async function setDisabled(id: number, disabled: boolean): Promise<Creden
   return data
 }
 
+/** 调度优先级取值范围，与后端 `PRIORITY_MIN` / `PRIORITY_MAX` 一致；数值越小越优先。 */
+export const PRIORITY_MIN = 1
+export const PRIORITY_MAX = 100
+/** 新账号的默认档，与后端 `PRIORITY_DEFAULT` 一致。 */
+export const PRIORITY_DEFAULT = 50
+
 /** 设置优先级。 */
 export async function setPriority(id: number, priority: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/priority`, { priority })
   return data
 }
 
-/** 批量把多个账号统一设为同一优先级，返回更新后的整份列表。 */
-export async function setPriorities(ids: number[], priority: number): Promise<Credential[]> {
-  const { data } = await api.post<Credential[]>('/credentials/priority', { ids, priority })
+/**
+ * 批量调整优先级，返回更新后的整份列表。`priority` 把选中账号统一设为同一档；
+ * `delta` 让各自在原值上平移（负数 = 提高），保留相对顺序，越界截到边界。
+ */
+export async function setPriorities(
+  ids: number[],
+  change: { priority: number } | { delta: number },
+): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/priority', { ids, ...change })
   return data
 }
 

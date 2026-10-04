@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::auth;
-use crate::credentials::Credential;
+use crate::credentials::{Credential, PRIORITY_MAX, PRIORITY_MIN, priority_from_legacy};
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
 use crate::proxy::AccountRejection;
@@ -1280,28 +1280,56 @@ async fn set_priority(
     Path(id): Path<i64>,
     Json(req): Json<SetPriorityReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
+    check_priority(req.priority)?;
     if !state.store.set_priority(id, req.priority).map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
 }
 
+/// 优先级只收 [`PRIORITY_MIN`]..=[`PRIORITY_MAX`]，越界直接拒，不悄悄截断。
+fn check_priority(priority: i64) -> Result<(), ApiError> {
+    if !(PRIORITY_MIN..=PRIORITY_MAX).contains(&priority) {
+        return Err(bad_request(format!(
+            "priority must be between {PRIORITY_MIN} and {PRIORITY_MAX}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct SetPrioritiesReq {
     /// 待调整的账号 id 列表。
     ids: Vec<i64>,
-    /// 统一设置的优先级（数值小者优先）。
-    priority: i64,
+    /// 统一设置的优先级（数值小者优先）。与 `delta` 二选一。
+    priority: Option<i64>,
+    /// 各自在原值上平移的档数（负数 = 提高），越界截到边界。与 `priority` 二选一。
+    delta: Option<i64>,
 }
 
-/// 批量设置优先级：把选中的账号统一调到同一档，返回更新后的整份列表。
+/// 批量调整优先级：统一调到同一档（`priority`），或各自平移若干档（`delta`，保留
+/// 选中账号之间的先后顺序）。返回更新后的整份列表。
 async fn set_priorities(
     State(state): State<AppState>,
     Json(req): Json<SetPrioritiesReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
-    let n = state.store.set_priorities(&req.ids, req.priority).map_err(internal)?;
-    tracing::info!(count = n, priority = req.priority, "priority set in bulk");
+    match (req.priority, req.delta) {
+        (Some(priority), None) => {
+            check_priority(priority)?;
+            let n = state.store.set_priorities(&req.ids, priority).map_err(internal)?;
+            tracing::info!(count = n, priority, "priority set in bulk");
+        }
+        (None, Some(delta)) => {
+            let span = PRIORITY_MAX - PRIORITY_MIN;
+            if delta == 0 || !(-span..=span).contains(&delta) {
+                return Err(bad_request(format!("delta must be non-zero and within ±{span}")));
+            }
+            let n = state.store.shift_priorities(&req.ids, delta).map_err(internal)?;
+            tracing::info!(count = n, delta, "priority shifted in bulk");
+        }
+        _ => return Err(bad_request("provide exactly one of priority or delta")),
+    }
     list_credentials(State(state)).await
 }
 
@@ -4045,7 +4073,10 @@ struct ExportFile {
 const EXPORT_KIND: &str = "luban-export";
 /// 迁移文件的格式版本。加字段不必动它（导入侧全字段 `#[serde(default)]`）；
 /// 只有**改变已有字段含义**时才需要 +1。
-const EXPORT_VERSION: u32 = 1;
+///
+/// - 2：`priority` 换到 1..=100、默认 P50 的口径；1 版文件导入时按
+///   [`priority_from_legacy`] 换算（老 P0 → P50）。
+const EXPORT_VERSION: u32 = 2;
 
 /// 导出全部账号与设置，供迁移到另一台机器。
 ///
@@ -4188,7 +4219,19 @@ async fn import(
             }
         }
     }
+    let legacy_priority = req.payload.version < 2;
     for (i, c) in req.payload.credentials.iter().enumerate() {
+        let converted;
+        let c = if legacy_priority {
+            converted = store::PortableCredential {
+                // 缺字段的留 None，导入时落默认档：老口径缺省本来就是 P0，换算过来同样是 P50。
+                priority: c.priority.map(priority_from_legacy),
+                ..c.clone()
+            };
+            &converted
+        } else {
+            c
+        };
         match state.store.import_credential(c) {
             Ok(store::ImportOutcome::Added) => resp.added += 1,
             Ok(store::ImportOutcome::Updated) => resp.updated += 1,
