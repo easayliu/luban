@@ -8,7 +8,7 @@ import {
   MessagesSquareIcon,
   SmartphoneIcon,
 } from 'lucide-react'
-import { type Credential } from '@/api/credentials'
+import { priorityTierName, type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
@@ -103,8 +103,8 @@ const COL = {
       就是两行：账号名 + 添加时间），列宽收到 144px，状态文字一个不丢，见 ScheduleControl。 */
   schedule: 'w-36',
   /** 优先级单独一窄列：它是可排序、要竖着比大小的数值，并进调度格后表头「调度 / 优先级」只按优先级排，
-      读不出来。格子里是与卡片同款的描边胶囊 `P50`（最宽 `P100` 约 32px）；表头「优先级」/`PRIO.` + 箭头约 50px，
-      越进右内边距几像素，56px 够。 */
+      读不出来。格子里是与卡片同款的描边胶囊 `P2`（只有一位数，约 24px）；表头「优先级」/`PRIO.` + 箭头约 50px，
+      56px 够。 */
   priority: 'w-14',
   /** 「🏢 Max 20x」（楼 / 人图标 + 档位，见 [AccountTierBadge]）约 72px，内容宽 = 96 − 20 = 76px，
       两边各留 10px 正常内边距。 */
@@ -393,7 +393,7 @@ export const CredentialRow = memo(function CredentialRow({
             </div>
 
             <dl className="grid grid-cols-2 gap-3 border-t pt-3 sm:grid-cols-3 sm:gap-4 sm:pt-4">
-              <MobileFact label={t('优先级', 'Priority')}><span className="tabular-nums">P{cred.priority}</span></MobileFact>
+              <MobileFact label={t('优先级', 'Priority')}><span className="tabular-nums">P{cred.priority} {priorityTierName(cred.priority, t)}</span></MobileFact>
               <MobileFact label={t('账号等级', 'Tier')}>
                 <AccountTierBadge cred={cred} size="sm" fallback="—" />
               </MobileFact>
@@ -512,7 +512,7 @@ export const CredentialRow = memo(function CredentialRow({
               P{cred.priority}
             </TooltipTrigger>
             <TooltipPopup>
-              {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+              {t(`调度优先级 P${cred.priority} ${priorityTierName(cred.priority, t)}：同档分摊，跨档按先后顺序用尽`, `Priority P${cred.priority} ${priorityTierName(cred.priority, t)}: the same tier shares load, tiers are used up in order`)}
             </TooltipPopup>
           </Tooltip>
         </TableCell>

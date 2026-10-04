@@ -5,7 +5,6 @@ import {
   BanIcon,
   ChevronDownIcon,
   ChevronRightIcon,
-  ChevronUpIcon,
   ClockIcon,
   GaugeIcon,
   InfoIcon,
@@ -25,10 +24,11 @@ import {
   listCredentialDevices,
   listCredentialSessions,
   listCredentialUsage,
-  PRIORITY_MAX,
-  PRIORITY_MIN,
+  PRIORITY_TIERS,
+  priorityTierName,
   type Credential,
 } from '@/api/credentials'
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
@@ -1279,35 +1279,52 @@ function BanEventsSection({ cred }: { cred: Credential }) {
 function InfoSection({ cred, now }: { cred: Credential; now: number }) {
   const { t, language } = useI18n()
   const expiry = credentialExpiryMeta(cred, language)
+  // 订阅开始时刻是 ISO 原串，解析失败（格式不认）就当没有。
+  const subscribedMs = cred.subscription_created_at ? Date.parse(cred.subscription_created_at) : NaN
+  const subscribedAt = Number.isFinite(subscribedMs) ? Math.floor(subscribedMs / 1000) : null
   return (
     <Section icon={InfoIcon} title={t('账号信息', 'Account')} className="min-w-0 lg:h-full" panelClassName="lg:flex-1">
       <dl className="divide-y">
-        {/* 组织名称 / 类型 / 席位 / 超额用量只在组织账号上列：个人号这几格要么是「—」，要么与页头套餐
-            徽章同义；页头套餐徽章只用一个楼形图标标出「组织号」，原值（claude_team / team_standard）在这里看。 */}
-        {isOrgAccount(cred) && (
-          <>
-            {cred.org_name && <InfoRow label={t('组织名称', 'Organisation')}>{cred.org_name}</InfoRow>}
-            <InfoRow label={t('组织类型', 'Organisation type')}>
-              <span className="font-mono text-xs">{cred.org_type}</span>
-            </InfoRow>
-            {cred.seat_tier && (
-              <InfoRow label={t('席位', 'Seat')}>
-                <span className="font-mono text-xs">{cred.seat_tier}</span>
-              </InfoRow>
-            )}
-            {cred.extra_usage_enabled !== null && (
-              <InfoRow label={t('超额用量', 'Extra usage')}>
-                {cred.extra_usage_enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}
-              </InfoRow>
-            )}
-          </>
+        {/* 组织名称与席位只在组织账号上列：个人号的组织名就是「<邮箱>'s Organization」，没有席位。
+            其余资料（组织类型、额度档、超额用量、订阅）个人号也列，拉不到的项不列。 */}
+        {isOrgAccount(cred) && cred.org_name && <InfoRow label={t('组织名称', 'Organisation')}>{cred.org_name}</InfoRow>}
+        {cred.org_type && (
+          <InfoRow label={t('组织类型', 'Organisation type')}>
+            <span className="font-mono text-xs">{cred.org_type}</span>
+          </InfoRow>
         )}
-        {/* 订阅状态：组织号总是列出；个人号只在不是 active 时列（active 是常态，列出来只是噪音）。 */}
-        {cred.subscription_status && (isOrgAccount(cred) || cred.subscription_status !== 'active') && (
-          <InfoRow label={t('订阅状态', 'Subscription')}>
-            <Badge size="sm" variant={cred.subscription_status === 'active' ? 'success' : 'warning'}>
-              <span className="font-mono">{cred.subscription_status}</span>
-            </Badge>
+        {isOrgAccount(cred) && cred.seat_tier && (
+          <InfoRow label={t('席位', 'Seat')}>
+            <span className="font-mono text-xs">{cred.seat_tier}</span>
+          </InfoRow>
+        )}
+        {cred.rate_limit_tier && (
+          <InfoRow label={t('额度档', 'Rate limit tier')}>
+            <span className="font-mono text-xs">{cred.rate_limit_tier}</span>
+          </InfoRow>
+        )}
+        {cred.extra_usage_enabled !== null && (
+          <InfoRow label={t('超额用量', 'Extra usage')}>
+            {cred.extra_usage_enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}
+          </InfoRow>
+        )}
+        {(cred.subscription_status || subscribedAt !== null) && (
+          <InfoRow label={t('订阅', 'Subscription')}>
+            {/* 第一行开始时刻，第二行相对时间加状态徽章，与「添加时间」同一副面孔；侧栏窄，时刻后面再挂
+                徽章会把徽章挤到单独一行。 */}
+            {subscribedAt !== null && (
+              <span className="block whitespace-nowrap tabular-nums">{formatFullTime(subscribedAt, language)}</span>
+            )}
+            <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+              {subscribedAt !== null && (
+                <span>{t(`${relativeTime(subscribedAt, now, language)}开始`, `Started ${relativeTime(subscribedAt, now, language).toLowerCase()}`)}</span>
+              )}
+              {cred.subscription_status && (
+                <Badge size="sm" variant={cred.subscription_status === 'active' ? 'success' : 'warning'}>
+                  <span className="font-mono">{cred.subscription_status}</span>
+                </Badge>
+              )}
+            </span>
           </InfoRow>
         )}
         <InfoRow label={t('添加时间', 'Added')}>
@@ -1326,7 +1343,7 @@ function InfoSection({ cred, now }: { cred: Credential; now: number }) {
 
 function InfoRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="grid grid-cols-[6.5rem_minmax(0,1fr)] items-baseline gap-3 px-4 py-2.5 text-sm sm:px-5">
+    <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] items-baseline gap-3 px-4 py-2 text-sm sm:grid-cols-[6.5rem_minmax(0,1fr)] sm:px-5">
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="min-w-0">{children}</dd>
     </div>
@@ -1352,36 +1369,29 @@ function ScheduleSection({
   const proxyName = useProxyName()
   const { prio } = useCredentialActions(cred)
   const mobile = useMediaQuery(MOBILE_QUERY)
-  // 访客：「修改」与优先级升降都不给。手机上那几行整行可点，点开的对话框是只读的，照常留着。
+  // 访客：「修改」与优先级下拉都不给。手机上那几行整行可点，点开的对话框是只读的，照常留着。
   const readOnly = useReadOnly()
   const edit = (onClick: () => void) => readOnly ? null : (
     <Button type="button" size="sm" variant="outline" onClick={onClick}>{t('修改', 'Edit')}</Button>
   )
-  const priorityButtons = readOnly ? null : (
-    <>
-      <Button
-        type="button"
-        size="icon-sm"
-        variant="outline"
-        disabled={prio.isPending || cred.priority <= PRIORITY_MIN}
-        aria-label={t('提高优先级', 'Increase priority')}
-        title={t(`提高到 P${cred.priority - 1}`, `Raise to P${cred.priority - 1}`)}
-        onClick={() => prio.mutate(cred.priority - 1)}
-      >
-        <ChevronUpIcon />
-      </Button>
-      <Button
-        type="button"
-        size="icon-sm"
-        variant="outline"
-        disabled={prio.isPending || cred.priority >= PRIORITY_MAX}
-        aria-label={t('降低优先级', 'Decrease priority')}
-        title={t(`降低到 P${cred.priority + 1}`, `Lower to P${cred.priority + 1}`)}
-        onClick={() => prio.mutate(cred.priority + 1)}
-      >
-        <ChevronDownIcon />
-      </Button>
-    </>
+  const priorityItems = PRIORITY_TIERS.map((_, p) => ({ value: String(p), label: `P${p} ${priorityTierName(p, t)}` }))
+  // 访客只看档位，不给下拉。
+  const priorityControl = readOnly ? (
+    <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority} {priorityTierName(cred.priority, t)}</span>
+  ) : (
+    <Select
+      items={priorityItems}
+      value={String(cred.priority)}
+      onValueChange={(value) => value && Number(value) !== cred.priority && prio.mutate(Number(value))}
+      disabled={prio.isPending}
+    >
+      <SelectTrigger aria-label={t('调度优先级', 'Priority')} size="sm" className="w-36"><SelectValue /></SelectTrigger>
+      <SelectPopup>
+        {priorityItems.map((item) => (
+          <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+        ))}
+      </SelectPopup>
+    </Select>
   )
   if (mobile) {
     // 手机上 SettingsRow 会把「修改」按钮换到说明下面单独一行，三项配置占掉大半屏。改成与 ⋯ 底部
@@ -1408,8 +1418,7 @@ function ScheduleSection({
         )}
         <div className="flex min-h-12 items-center gap-3 px-4 text-sm">
           <span className="min-w-0 flex-1 font-medium">{t('调度优先级', 'Priority')}</span>
-          <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority}</span>
-          {priorityButtons}
+          {priorityControl}
         </div>
       </SettingsGroup>
     )
@@ -1439,9 +1448,9 @@ function ScheduleSection({
       </SettingsRow>
       <SettingsRow
         label={t('调度优先级', 'Priority')}
-        description={t(`当前 P${cred.priority}，数值越小越优先`, `Currently P${cred.priority}; lower values are scheduled first`)}
+        description={t('数值越小越优先；同档分摊，跨档按先后顺序用尽', 'Lower tiers go first; the same tier shares load, tiers are used up in order')}
       >
-        {priorityButtons}
+        {priorityControl}
       </SettingsRow>
     </SettingsGroup>
   )

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
   deleteCredentials, setCredentialQuotaPausePcts, setDeviceLimits, setDisabledMany, setPriorities,
-  setProxies, setRpmLimits, setSessionLimits, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN,
+  setProxies, setRpmLimits, setSessionLimits, PRIORITY_DEFAULT, PRIORITY_TIERS, priorityTierName,
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
@@ -27,11 +27,11 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/c
 import { toastManager } from '@/components/ui/toast'
 import { Toolbar } from '@/components/ui/toolbar'
 
-/** 批量调优先级的三种方式：统一设为某档，或各自提高 / 降低若干档（保留相对顺序）。 */
+/** 批量调优先级的三种方式：统一设为某档，或各自提高 / 降低一档（保留相对顺序）。 */
 const PRIORITY_MODE_ITEMS = [
   { value: 'set', chinese: '统一设为', english: 'Set to' },
-  { value: 'raise', chinese: '各自提高', english: 'Raise by' },
-  { value: 'lower', chinese: '各自降低', english: 'Lower by' },
+  { value: 'raise', chinese: '各自提高一档', english: 'Raise one tier' },
+  { value: 'lower', chinese: '各自降低一档', english: 'Lower one tier' },
 ] as const
 type PriorityMode = (typeof PRIORITY_MODE_ITEMS)[number]['value']
 
@@ -159,8 +159,6 @@ export function BatchActionsBar({
   const formattedCount = n.toLocaleString(locale)
   const formattedTotal = all.length.toLocaleString(locale)
   const englishAccountCount = `${formattedCount} ${n === 1 ? 'account' : 'accounts'}`
-  // 统一设为：取 1..100；提高 / 降低：按档数取 1..99，越界由后端截到边界。
-  const priorityInputMax = priorityMode === 'set' ? PRIORITY_MAX : PRIORITY_MAX - PRIORITY_MIN
   const selectedPriorities = all.filter((item) => selected.has(item.id)).map((item) => item.priority)
   const priorityLow = selectedPriorities.length > 0 ? Math.min(...selectedPriorities) : null
   const priorityHigh = selectedPriorities.length > 0 ? Math.max(...selectedPriorities) : null
@@ -169,6 +167,10 @@ export function BatchActionsBar({
   const priorityModeItems = PRIORITY_MODE_ITEMS.map((item) => ({
     value: item.value,
     label: t(item.chinese, item.english),
+  }))
+  const priorityTierItems = PRIORITY_TIERS.map((_, p) => ({
+    value: String(p),
+    label: `P${p} ${priorityTierName(p, t)}`,
   }))
   const limitModeItems = LIMIT_MODE_ITEMS.map((item) => ({
     value: item.value,
@@ -201,18 +203,18 @@ export function BatchActionsBar({
   const applyPriority = useMutation({
     mutationFn: ({ mode, value }: { mode: PriorityMode; value: number }) => setPriorities(
       ids,
-      mode === 'set' ? { priority: value } : { delta: mode === 'raise' ? -value : value },
+      mode === 'set' ? { priority: value } : { delta: mode === 'raise' ? -1 : 1 },
     ),
     onSuccess: (_r, { mode, value }) => notify(
       mode === 'set' ? t(
-        `已将 ${formattedCount} 个账号设为 P${value}`,
-        `Set ${englishAccountCount} to P${value}`,
+        `已将 ${formattedCount} 个账号设为 P${value} ${priorityTierName(value, t)}`,
+        `Set ${englishAccountCount} to P${value} ${priorityTierName(value, t)}`,
       ) : mode === 'raise' ? t(
-        `已将 ${formattedCount} 个账号各自提高 ${value} 档`,
-        `Raised ${englishAccountCount} by ${value}`,
+        `已将 ${formattedCount} 个账号各自提高一档`,
+        `Raised ${englishAccountCount} by one tier`,
       ) : t(
-        `已将 ${formattedCount} 个账号各自降低 ${value} 档`,
-        `Lowered ${englishAccountCount} by ${value}`,
+        `已将 ${formattedCount} 个账号各自降低一档`,
+        `Lowered ${englishAccountCount} by one tier`,
       ),
     ),
     onError,
@@ -396,17 +398,14 @@ export function BatchActionsBar({
             <SettingRow
               title={t('调度优先级', 'Scheduling priority')}
               hint={priorityRange === null
-                ? t(`P${PRIORITY_MIN}~P${PRIORITY_MAX}，数值越小越优先`, `P${PRIORITY_MIN}–P${PRIORITY_MAX}; lower values go first`)
-                : t(`数值越小越优先，选中账号当前 ${priorityRange}`, `Lower values go first; selected are ${priorityRange}`)}
+                ? t('同档分摊，跨档按先后顺序用尽', 'Same tier shares load; tiers are used up in order')
+                : t(`同档分摊，跨档按先后顺序用尽；选中账号当前 ${priorityRange}`, `Same tier shares load; tiers are used up in order. Selected are ${priorityRange}`)}
               action={
                 <Button
                   size="sm"
                   loading={applyPriority.isPending}
                   disabled={busy}
-                  onClick={() => applyPriority.mutate({
-                    mode: priorityMode,
-                    value: Math.min(priorityInputMax, Math.max(1, priorityValue)),
-                  })}
+                  onClick={() => applyPriority.mutate({ mode: priorityMode, value: priorityValue })}
                 >
                   {t('应用', 'Apply')}
                 </Button>
@@ -415,12 +414,7 @@ export function BatchActionsBar({
               <Select
                 items={priorityModeItems}
                 value={priorityMode}
-                onValueChange={(value) => {
-                  if (!value) return
-                  // 换方式时数值跟着回到该方式的常用起点：统一设为回到默认档，平移回到 1 档。
-                  setPriorityMode(value as PriorityMode)
-                  setPriorityValue(value === 'set' ? PRIORITY_DEFAULT : 1)
-                }}
+                onValueChange={(value) => value && setPriorityMode(value as PriorityMode)}
               >
                 <SelectTrigger aria-label={t('批量调整优先级方式', 'How to change priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup>
@@ -429,22 +423,20 @@ export function BatchActionsBar({
                   ))}
                 </SelectPopup>
               </Select>
-              <NumberField
-                id="batch-priority"
-                value={priorityValue}
-                min={1}
-                max={priorityInputMax}
-                step={1}
-                size="sm"
-                className="w-32"
-                onValueChange={(value) => setPriorityValue(Math.min(priorityInputMax, Math.max(1, Math.floor(value ?? 1))))}
-              >
-                <NumberFieldGroup>
-                  <NumberFieldDecrement />
-                  <NumberFieldInput aria-label={t('批量设置优先级', 'Set priority for selected accounts')} />
-                  <NumberFieldIncrement />
-                </NumberFieldGroup>
-              </NumberField>
+              {priorityMode === 'set' && (
+                <Select
+                  items={priorityTierItems}
+                  value={String(priorityValue)}
+                  onValueChange={(value) => value && setPriorityValue(Number(value))}
+                >
+                  <SelectTrigger aria-label={t('批量设置优先级', 'Set priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                  <SelectPopup>
+                    {priorityTierItems.map((item) => (
+                      <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+              )}
             </SettingRow>
 
             <SettingRow

@@ -222,7 +222,7 @@ mod tests {
             access_token: "a".into(),
             refresh_token: "r".into(),
             expires_at: 0,
-            priority: 50,
+            priority: 2,
             disabled: false,
             device_limit: 0,
             session_limit: 0,

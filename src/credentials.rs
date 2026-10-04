@@ -1,21 +1,36 @@
 //! 凭证记录模型与刷新判定。持久化在 SQLite，见 [`crate::store`]。
 
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config;
 
-/// 调度优先级的取值范围：数值小者优先，P1 最先调度。
-pub const PRIORITY_MIN: i64 = 1;
-pub const PRIORITY_MAX: i64 = 100;
-/// 新账号落在中间档 P50：要优先就往小调、要垫底就往大调，都不用动其余账号。
+/// 调度优先级的取值范围：P0..=P4，数值小者优先，P0 最先调度。档位少而各有含义
+/// （见 admin-ui 的档位名）：同档内按设备数负载均衡，跨档按先后顺序用尽。
+pub const PRIORITY_MIN: i64 = 0;
+pub const PRIORITY_MAX: i64 = 4;
+/// 新账号落在中间档 P2（常规）：要优先就往小调、要垫底就往大调，都不用动其余账号。
 /// 同档内按设备数负载均衡，新号加进来立刻参与分摊。
-pub const PRIORITY_DEFAULT: i64 = 50;
-/// 老口径（默认 P0、可为负数）换算到现口径要加的偏移：老 P0 对上新默认 P50，顺序不变。
-pub const LEGACY_PRIORITY_SHIFT: i64 = PRIORITY_DEFAULT;
+pub const PRIORITY_DEFAULT: i64 = 2;
 
-/// 老口径的优先级换算到现口径，截在 [`PRIORITY_MIN`]..=[`PRIORITY_MAX`]。
-pub fn priority_from_legacy(p: i64) -> i64 {
-    p.saturating_add(LEGACY_PRIORITY_SHIFT).clamp(PRIORITY_MIN, PRIORITY_MAX)
+/// 把旧口径的一组优先级按名次压到 P0..=P4，返回「旧值 → 新档」。`mid` 是旧口径的默认档
+/// （最早是 0，后来 P1..=P100 时是 50）：等于它的落 P2；比它小的里最靠近的一个值落 P1、
+/// 其余落 P0；比它大的里最靠近的一个值落 P3、其余落 P4。先后顺序不变，档位多于 5 个时
+/// 两头的会并档。
+pub fn priority_tiers_by_rank(
+    values: impl IntoIterator<Item = i64>,
+    mid: i64,
+) -> HashMap<i64, i64> {
+    let distinct: BTreeSet<i64> = values.into_iter().collect();
+    let mut map = HashMap::from([(mid, PRIORITY_DEFAULT)]);
+    for (i, &p) in distinct.range(..mid).rev().enumerate() {
+        map.insert(p, if i == 0 { PRIORITY_DEFAULT - 1 } else { PRIORITY_MIN });
+    }
+    for (i, &p) in distinct.range((Bound::Excluded(mid), Bound::Unbounded)).enumerate() {
+        map.insert(p, if i == 0 { PRIORITY_DEFAULT + 1 } else { PRIORITY_MAX });
+    }
+    map
 }
 
 /// 一条 Claude OAuth 凭证（对应 SQLite 一行）。
@@ -248,13 +263,15 @@ pub fn now_secs() -> u64 {
 mod priority_tests {
     use super::*;
 
-    /// 老口径换算：P0 对上新默认 P50，负数往前、正数往后，越界截到 1..=100。
+    /// 按名次压档：默认档落 P2，两侧最靠近的各占 P1/P3，再往外的并进 P0/P4。
     #[test]
-    fn legacy_priority_maps_p0_to_default() {
-        assert_eq!(priority_from_legacy(0), PRIORITY_DEFAULT);
-        assert_eq!(priority_from_legacy(-1), 49);
-        assert_eq!(priority_from_legacy(3), 53);
-        assert_eq!(priority_from_legacy(-500), PRIORITY_MIN);
-        assert_eq!(priority_from_legacy(i64::MAX), PRIORITY_MAX);
+    fn tiers_by_rank_keeps_order_and_merges_extremes() {
+        let map = priority_tiers_by_rank([1, 30, 49, 50, 50, 51, 77, 100], 50);
+        let got: Vec<i64> = [1, 30, 49, 50, 51, 77, 100].iter().map(|p| map[p]).collect();
+        assert_eq!(got, vec![0, 0, 1, 2, 3, 4, 4]);
+
+        let legacy = priority_tiers_by_rank([-3, 0, 2], 0);
+        assert_eq!((legacy[&-3], legacy[&0], legacy[&2]), (1, 2, 3), "最早的口径默认 P0");
+        assert_eq!(priority_tiers_by_rank([], 50)[&50], PRIORITY_DEFAULT);
     }
 }

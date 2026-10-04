@@ -626,11 +626,29 @@ export async function setDisabled(id: number, disabled: boolean): Promise<Creden
   return data
 }
 
-/** 调度优先级取值范围，与后端 `PRIORITY_MIN` / `PRIORITY_MAX` 一致；数值越小越优先。 */
-export const PRIORITY_MIN = 1
-export const PRIORITY_MAX = 100
-/** 新账号的默认档，与后端 `PRIORITY_DEFAULT` 一致。 */
-export const PRIORITY_DEFAULT = 50
+/**
+ * 调度优先级取值范围 P0~P4，与后端 `PRIORITY_MIN` / `PRIORITY_MAX` 一致；数值越小越优先。
+ * 同档内按设备数分摊，跨档按先后顺序用尽。
+ */
+export const PRIORITY_MIN = 0
+export const PRIORITY_MAX = 4
+/** 新账号的默认档 P2（常规），与后端 `PRIORITY_DEFAULT` 一致。 */
+export const PRIORITY_DEFAULT = 2
+
+/** 各档的名称，下标即档位。 */
+export const PRIORITY_TIERS = [
+  { chinese: '首选', english: 'Preferred' },
+  { chinese: '优先', english: 'High' },
+  { chinese: '常规', english: 'Normal' },
+  { chinese: '次选', english: 'Low' },
+  { chinese: '备用', english: 'Fallback' },
+] as const
+
+/** 档位名，取值越界时（理论上不会）退回只显示 `P{n}`。 */
+export function priorityTierName(priority: number, t: (chinese: string, english: string) => string): string {
+  const tier = PRIORITY_TIERS[priority]
+  return tier ? t(tier.chinese, tier.english) : `P${priority}`
+}
 
 /** 设置优先级。 */
 export async function setPriority(id: number, priority: number): Promise<Credential> {
@@ -640,7 +658,7 @@ export async function setPriority(id: number, priority: number): Promise<Credent
 
 /**
  * 批量调整优先级，返回更新后的整份列表。`priority` 把选中账号统一设为同一档；
- * `delta` 让各自在原值上平移（负数 = 提高），保留相对顺序，越界截到边界。
+ * `delta` 让各自升降若干档（负数 = 提高），保留相对顺序，越界截到 P0 / P4。
  */
 export async function setPriorities(
   ids: number[],

@@ -10,7 +10,7 @@ import {
 import {
   clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
   setCredentialQuotaPausePct, setDeviceLimit, setDisabled, setLabel, setPriority, setProxy,
-  setRpmLimit, setSessionLimit, PRIORITY_MAX, PRIORITY_MIN,
+  setRpmLimit, setSessionLimit, PRIORITY_MAX, PRIORITY_MIN, priorityTierName,
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
@@ -1024,7 +1024,7 @@ function useCredentialMenuGroups(
       onSelect: () => prio.mutate(cred.priority - 1),
       disabled: prio.isPending || cred.priority <= PRIORITY_MIN,
       shortcut: `P${cred.priority - 1}`,
-      title: t('数值越小，调度优先级越高', 'Lower values are scheduled first'),
+      title: t(`提高到 P${cred.priority - 1} ${priorityTierName(cred.priority - 1, t)}`, `Raise to P${cred.priority - 1} ${priorityTierName(cred.priority - 1, t)}`),
     },
     {
       key: 'prio-down',
@@ -1033,7 +1033,7 @@ function useCredentialMenuGroups(
       onSelect: () => prio.mutate(cred.priority + 1),
       disabled: prio.isPending || cred.priority >= PRIORITY_MAX,
       shortcut: `P${cred.priority + 1}`,
-      title: t('数值越大，调度优先级越低', 'Higher values are scheduled later'),
+      title: t(`降低到 P${cred.priority + 1} ${priorityTierName(cred.priority + 1, t)}`, `Lower to P${cred.priority + 1} ${priorityTierName(cred.priority + 1, t)}`),
     },
   ]
   const danger: CredentialMenuItem[] = [
@@ -1299,7 +1299,7 @@ function CredentialActionSheet({
                 <li className="flex min-h-12 items-center gap-3 px-3.5 text-sm">
                   <ArrowUpDownIcon aria-hidden className="size-4.5 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1 truncate">{t('调度优先级', 'Priority')}</span>
-                  <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority}</span>
+                  <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority} {priorityTierName(cred.priority, t)}</span>
                   {priority.map((item) => (
                     <Button
                       key={item.key}

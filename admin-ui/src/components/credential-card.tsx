@@ -11,7 +11,7 @@ import {
   WalletCardsIcon,
   XIcon,
 } from 'lucide-react'
-import { type Credential } from '@/api/credentials'
+import { priorityTierName, type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import {
@@ -516,7 +516,7 @@ export const CredentialCard = memo(function CredentialCard({
                   P{cred.priority}
                 </TooltipTrigger>
                 <TooltipPopup>
-                  {t('调度优先级，数值越小越优先', 'Scheduling priority; lower values are scheduled first')}
+                  {t(`调度优先级 P${cred.priority} ${priorityTierName(cred.priority, t)}：同档分摊，跨档按先后顺序用尽`, `Priority P${cred.priority} ${priorityTierName(cred.priority, t)}: the same tier shares load, tiers are used up in order`)}
                 </TooltipPopup>
               </Tooltip>
               {secondaryOverage && (

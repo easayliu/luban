@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::auth;
-use crate::credentials::{Credential, PRIORITY_MAX, PRIORITY_MIN, priority_from_legacy};
+use crate::credentials::{Credential, PRIORITY_MAX, PRIORITY_MIN, priority_tiers_by_rank};
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
 use crate::proxy::AccountRejection;
@@ -1303,12 +1303,12 @@ struct SetPrioritiesReq {
     ids: Vec<i64>,
     /// 统一设置的优先级（数值小者优先）。与 `delta` 二选一。
     priority: Option<i64>,
-    /// 各自在原值上平移的档数（负数 = 提高），越界截到边界。与 `priority` 二选一。
+    /// 各自升降的档数（负数 = 提高），越界截到边界。与 `priority` 二选一。
     delta: Option<i64>,
 }
 
-/// 批量调整优先级：统一调到同一档（`priority`），或各自平移若干档（`delta`，保留
-/// 选中账号之间的先后顺序）。返回更新后的整份列表。
+/// 批量调整优先级：统一调到同一档（`priority`），或各自升降若干档（`delta`，保留
+/// 选中账号之间的先后顺序，碰到 P0/P4 的截住）。返回更新后的整份列表。
 async fn set_priorities(
     State(state): State<AppState>,
     Json(req): Json<SetPrioritiesReq>,
@@ -4074,9 +4074,10 @@ const EXPORT_KIND: &str = "luban-export";
 /// 迁移文件的格式版本。加字段不必动它（导入侧全字段 `#[serde(default)]`）；
 /// 只有**改变已有字段含义**时才需要 +1。
 ///
-/// - 2：`priority` 换到 1..=100、默认 P50 的口径；1 版文件导入时按
-///   [`priority_from_legacy`] 换算（老 P0 → P50）。
-const EXPORT_VERSION: u32 = 2;
+/// - 2：`priority` 换到 1..=100、默认 P50 的口径。
+/// - 3：`priority` 换到 P0..=P4、默认 P2 的档位口径；1、2 版文件导入时按
+///   [`priority_tiers_by_rank`] 在文件内按名次压档（旧默认档 → P2）。
+const EXPORT_VERSION: u32 = 3;
 
 /// 导出全部账号与设置，供迁移到另一台机器。
 ///
@@ -4219,18 +4220,27 @@ async fn import(
             }
         }
     }
-    let legacy_priority = req.payload.version < 2;
+    // 旧版文件的优先级按名次压到 5 档：1 版默认档是 0，2 版是 50。
+    let legacy_tiers = match req.payload.version {
+        0 | 1 => Some(0),
+        2 => Some(50),
+        _ => None,
+    }
+    .map(|mid| {
+        priority_tiers_by_rank(req.payload.credentials.iter().filter_map(|c| c.priority), mid)
+    });
     for (i, c) in req.payload.credentials.iter().enumerate() {
         let converted;
-        let c = if legacy_priority {
-            converted = store::PortableCredential {
-                // 缺字段的留 None，导入时落默认档：老口径缺省本来就是 P0，换算过来同样是 P50。
-                priority: c.priority.map(priority_from_legacy),
-                ..c.clone()
-            };
-            &converted
-        } else {
-            c
+        let c = match &legacy_tiers {
+            Some(tiers) => {
+                converted = store::PortableCredential {
+                    // 缺字段的留 None，导入时落默认档 P2。
+                    priority: c.priority.map(|p| tiers[&p]),
+                    ..c.clone()
+                };
+                &converted
+            }
+            None => c,
         };
         match state.store.import_credential(c) {
             Ok(store::ImportOutcome::Added) => resp.added += 1,

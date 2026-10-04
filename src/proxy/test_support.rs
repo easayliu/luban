@@ -96,7 +96,7 @@ pub(super) fn test_cred() -> crate::credentials::Credential {
         access_token: "a".into(),
         refresh_token: "r".into(),
         expires_at: u64::MAX,
-        priority: 50,
+        priority: 2,
         disabled: false,
         device_limit: 0,
         session_limit: 0,
