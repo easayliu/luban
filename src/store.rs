@@ -9121,6 +9121,12 @@ mod tests {
         let (store, ids) = store_with(&["a", "b"]);
         let (a, b) = (ids[0], ids[1]);
         let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+        // 最近那批记录（[last-104, last]）必须落在同一个小时桶里、又在真实时间的近一小时内
+        // （`*_report` 的 recent 按 unixepoch() 往前一小时算，不能把 now 挪走）。整点后十来分钟内
+        // 照 now-600 写会跨过整点、被拆成两个桶，桶数断言随钟点时红时绿；那时就整批放到上一个
+        // 小时的末尾。
+        let hour_start = now - now.rem_euclid(3600);
+        let last = if now - hour_start >= 700 { now - 500 } else { hour_start - 1 };
         let rec = |cred: i64,
                    model: &str,
                    status: u16,
@@ -9148,14 +9154,14 @@ mod tests {
             store
                 .insert_usage_log_at(
                     &rec(a, "claude-opus-5", 200, *ttft, ttft + 1000, 1000, 100, 60, 20),
-                    Some(now - 600 - i as i64),
+                    Some(last - 100 - i as i64),
                 )
                 .unwrap();
         }
         store
             .insert_usage_log_at(
                 &rec(a, "claude-opus-5", 500, 9000, 9000, 0, 100, 0, 0),
-                Some(now - 500),
+                Some(last),
             )
             .unwrap();
         // 三小时前：sonnet 在 b 上一条慢的，没有缓存。

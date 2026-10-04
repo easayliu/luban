@@ -448,9 +448,20 @@ fn with_mult(base: &str, mult: Option<String>) -> String {
 }
 
 /// 席位档原值美化：`team_standard` → `Team Standard`。
+///
+/// 中间夹了变体段的写法（实测 `team_labs_premium`）认得出档位词时收成「组织类型 + 档位」
+/// （→ `Team Premium`），与普通席位同一口径，徽章、筛选不用再认一种新写法；原值仍在
+/// `seat_tier` 里，详情页看得到。认不出档位词的（`team_tier_1`）照原样逐段美化。
 fn humanize_seat(raw: &str) -> String {
-    raw.split('_')
-        .filter(|w| !w.is_empty())
+    let words: Vec<&str> = raw.split('_').filter(|w| !w.is_empty()).collect();
+    let level =
+        words.iter().skip(1).rev().find(|w| SEAT_LEVELS.contains(&w.to_ascii_lowercase().as_str()));
+    let words = match (words.first(), level) {
+        (Some(org), Some(level)) => vec![*org, *level],
+        _ => words,
+    };
+    words
+        .into_iter()
         .map(|w| {
             let mut c = w.chars();
             c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
@@ -458,6 +469,9 @@ fn humanize_seat(raw: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// 席位档里表示档位的词，见 [`humanize_seat`]。
+const SEAT_LEVELS: [&str; 2] = ["standard", "premium"];
 
 /// 把 `claude_max` 之类的原始类型美化成 `Max`。
 fn humanize_tier(raw: &str) -> String {
@@ -2380,6 +2394,12 @@ mod tests {
             team(Some("default_claude_max_5x"), Some("team_premium")),
             Some("Team Premium".into())
         );
+        // 夹了变体段的席位（实测 `team_labs_premium` + `default_claude_max_5x`）收成普通档位名。
+        assert_eq!(
+            team(Some("default_claude_max_5x"), Some("team_labs_premium")),
+            Some("Team Premium".into())
+        );
+        assert_eq!(team(Some("default_raven"), Some("team_tier_1")), Some("Team Tier 1".into()));
         assert_eq!(
             team(Some("default_raven"), Some(" ")),
             Some("Team".into()),
