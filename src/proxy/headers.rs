@@ -1160,6 +1160,8 @@ mod tests {
             spoof_device_id: false,
             normalize_device_fp: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             fill_client_headers: false,
             merge_beta: false,
             system_shape: false,

@@ -233,6 +233,8 @@ pub(crate) fn has_cache_ttl_1h(v: &serde_json::Value) -> bool {
 ///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
 ///    本来就是同一件事。
 /// 3. **cch**（`billing_cch`）：给 `x-anthropic-billing-header` 补订阅模式独有的 `cch`。
+///    取值另有两项独立策略：真实 CC 来访按 `cch_real_recompute`、模拟请求按 `cch_sim_compute`，
+///    见 [`finalize_cch`]。
 /// 4. **流式化**（`force_stream`，由 `nonstream_as_sse` 拨）：把 `stream` 置成 `true`。
 ///    官方 CC 恒为 `true`，回程由 [`aggregate_sse`] 聚合回整段 JSON，客户端无感。
 ///
@@ -323,6 +325,7 @@ pub(super) fn rewrite_body_out(
         && !may_have_empty_text
         && !has_system_role_msg
         && fallbacks.is_none()
+        && !real_cch_stale(body, sim, flags)
     {
         return (body.clone(), None);
     }
@@ -625,11 +628,27 @@ pub(super) fn rewrite_body_out(
         && !schemas_flattened
         && !tools_mimicked
         && !threaded
+        // 排在最后：前面任何一项为真都不会走到这里，只有「看似没改」的体才多算一次哈希。
+        && !real_cch_stale(body, sim, flags)
     {
         return (body.clone(), None);
     }
     match serde_json::to_vec(&v) {
-        Ok(bytes) => (Bytes::from(preserve_thinking_encoding(body, bytes)), Some(v)),
+        Ok(bytes) => {
+            // cch 排在最后：它对**最终出站字节**（含 `cch=00000;` 占位符）算 xxHash64。
+            // 一切改写与 `preserve_thinking_encoding` 都落定之后再原地回填，才与官方出口层
+            // 的时序一致（见 [`apply_cch`]）。
+            let mut out = preserve_thinking_encoding(body, bytes);
+            // 回填的值也写回 `v` 的 billing header：调用方拿 `Some(v)` 算形态摘要，
+            // 这份 Value 必须与出站字节同构，否则 cch 那一块的 sha 会对不上。
+            // 模拟请求与真实来访各走各的策略开关；`ours` 即 cch 是 luban 自己落的占位符。
+            let compute =
+                if sim.is_some() { flags.cch_sim_compute } else { flags.cch_real_recompute };
+            if let Some(cch) = finalize_cch(&mut out, compute, sim.is_some() || cch_added) {
+                sync_value_cch(&mut v, &cch);
+            }
+            (Bytes::from(out), Some(v))
+        }
         // 序列化失败等于「这份 Value 与将要发出去的字节对不上」，此时必须把它丢掉：
         // 形态摘要的调用方认的是「Some 即与出站字节同构」，交一份对不上的回去比不交更糟。
         Err(_) => (body.clone(), None),
@@ -2134,23 +2153,501 @@ pub(super) fn ensure_output_config(v: &mut serde_json::Value, profile: &config::
     true
 }
 
-/// `cch` 的取值：**每请求一个随机的 5 位小写 hex**。
+/// `cch` 先写进 billing header 的**占位符**：五个 `0`。真值不在这里取，而是等整条 body
+/// 的全部改写都落定、序列化成最终出站字节之后，由 [`apply_cch`] 原地算出来替换掉。
 ///
-/// 真实算法仍未知（同账号内逐请求变化，18 组候选输入 × 6 种摘要均未命中），所以这只是个
-/// **形态模拟值**——形状对了，语义没有对齐，别当成已经对齐来读。
+/// **为什么是占位符而不是在这里算**：`cch` 是官方 Bun HTTP 出口层对**最终出站 body**
+/// （含 `cch=00000` 占位符本身）算的 xxHash64 取低 20 位（见 [`compute_cch`]）。它依赖
+/// 工具注入、工具名混淆、message thread 等所有后续改写的结果，而这个函数在改写链的中段
+/// （[`ensure_billing_cch`] / [`simulated_billing_header_text`]）就被调用，那时 body 还没定型，
+/// 算不出正确值。于是这里只落占位符，把真正的计算推到全部改写之后。
 ///
-/// 从原先那个跨账号恒定的 `00000` 改成随机，是因为恒定值本身
-/// 就是判据：所有经由 luban 的请求都带同一个真实客户端从不产生的 `cch`，上游一按此聚类
-/// 就把所有账号串成一串。而抓包里同一账号相邻两条请求是 `993e1`、`e2d04`、`b504f`……
-/// 每条都不同（`cap/2.1.260-2`）。
-///
-/// **不会打爆 prompt cache**：这一点是抓包证出来的，不是推的。`cap/2.1.260-2` 的 00057 →
-/// 00059 是同一会话的连续两条，`system[0]` 的 cch 与 `cc_prompt_id` 都变了，00059 的
-/// `cache_creation_input_tokens` 仍只有 81（首条是 8482），也就是前缀照样命中。上游显然
-/// 不把 billing header 那一块算进缓存键——否则官方客户端自己也一次都缓存不上。
+/// **不会打爆 prompt cache**：`cap/2.1.260-2` 的 00057 → 00059 是同一会话连续两条，
+/// `system[0]` 的 cch 与 `cc_prompt_id` 都变了，00059 的 `cache_creation_input_tokens` 仍只有
+/// 81（首条 8482），前缀照样命中。上游不把 billing header 那一块算进缓存键——否则官方客户端
+/// 自己也一次都缓存不上。
 pub(super) fn cch_value() -> String {
+    CCH_PLACEHOLDER.to_string()
+}
+
+/// [`cch_value`] 落进 billing header 的占位值。真值由 [`apply_cch`] 在出站字节里（以
+/// `x-anthropic-billing-header:` 为锚，见 [`billing_cch_region`]）算出后回填——不靠这五个 `0`
+/// 本身定位，所以 billing header 里即便已是别的值（真实 CC 自带的真值）也照样会被重算。
+const CCH_PLACEHOLDER: &str = "00000";
+
+/// `cch` 的 xxHash64 种子，逆向自 `claude-cli/2.1.289` 的 Bun HTTP 出口层（原生段里
+/// 以 `movk` 序列加载的 `0x4d659218e32a3268`，紧接 strip 预处理之后作为 `XXH64` init 的
+/// seed）。跨版本一致：用 2.1.289 的运行时去算 2.1.258–2.1.285 九组抓包里**他机他版本**
+/// 客户端自己写的 cch，263 条全中。
+pub(super) const CCH_SEED: u64 = 0x4d65_9218_e32a_3268;
+
+/// 给出站字节里 billing header 的 `cch` 填上（或重算成）真值：把那一段**先归零**成
+/// `cch=00000;`、对整条 body 做 [`compute_cch`]、再把结果写回那 5 位。回填成功返回那个 cch，
+/// body 里没有 billing header 的 cch 时返回 `None`（没改）。
+///
+/// **只认 billing header 那一个 cch，按 JSON 结构定位**：257/263 抓包的 `messages` 排在
+/// `system` 之前，用户正文里若含 `cch=…;` 甚至整条 `x-anthropic-billing-header:` 都会更早出现
+/// ——所以不能按内容全局搜。[`billing_cch_region`] 顺着顶层对象定位到 `system[0].text` 这个
+/// 字段本身（用户正文里的引号在序列化后是 `\"`，冒充不了键结构），再在字段边界内完整校验
+/// `cch=<5 hex>;` 才认，绝不越界覆盖收尾引号或 JSON 结构。
+///
+/// **占位符与自带真值一视同仁**：luban 自己补的是 `cch=00000;` 占位符，而真实 CC 订阅端
+/// 来访自带的是它对**自己那份** body 算好的真值；一旦 luban 改写了 body（身份伪装、工具注入/
+/// 混淆等，凡走到这里就意味着 body 变过），那份自带真值就对不上**改写后**的字节了。所以这里
+/// 不管原来是零还是真值，统一先归零、按最终字节重算、回填——与官方「对含 `00000` 占位符的
+/// body 算 xxHash64」同序，结果就是这份出站 body 该有的 cch。
+pub(super) fn apply_cch(bytes: &mut [u8]) -> Option<String> {
+    let (start, end) = billing_cch_region(bytes)?;
+    // 先把这 5 位归零成占位态，再对整条 body 算——官方就是对含 `00000` 的 body 哈希的。
+    bytes[start..end].copy_from_slice(b"00000");
+    let cch = compute_cch(bytes);
+    bytes[start..end].copy_from_slice(cch.as_bytes());
+    Some(cch)
+}
+
+/// 真实来访的 billing header `cch` 与这份 body **对不上**（且 `cch_real_recompute` 开着）。
+///
+/// [`rewrite_body_out`] 自己没改任何东西时会原样放行，但进来的 `body` 未必还是客户端发的那份：
+/// 主动剥 prefill、弃用字段剥除、thinking 降级 / 剥 prefill 的重试，都在改写之前先动过 body。
+/// 官方客户端自带的 cch 恒等于对它自己那份 body 的 [`compute_cch`]（`cap/` 263 条全中），
+/// 所以「对不上」就说明前置改写动过 body（或者来访写的本就不是真值），这时不能早退，
+/// 得走完整路径让 [`finalize_cch`] 按出站字节重算。没有 billing cch 时返回 `false`。
+fn real_cch_stale(body: &[u8], sim: Option<&Simulation>, flags: store::ForwardFlags) -> bool {
+    if sim.is_some() || !flags.cch_real_recompute {
+        return false;
+    }
+    let Some((start, end)) = billing_cch_region(body) else {
+        return false;
+    };
+    let mut zeroed = body.to_vec();
+    zeroed[start..end].copy_from_slice(CCH_PLACEHOLDER.as_bytes());
+    compute_cch(&zeroed).as_bytes() != &body[start..end]
+}
+
+/// 出站字节定型后按策略处理 billing header 的 `cch`，改了就返回填进去的值，没动返回 `None`。
+///
+/// - `compute`（真实来访看 `cch_real_recompute`、模拟看 `cch_sim_compute`）：按 [`apply_cch`]
+///   算真值回填，来访自带的与 luban 补的占位一并重算。
+/// - 不 `compute` 且 `ours`（cch 是 luban 落的占位符：模拟请求，或替真实来访补的那条）：填一个
+///   随机的 5 位小写 hex。不能留着 `00000`——那是跨账号恒定值，上游一按它聚类就把所有账号
+///   串成一串。
+/// - 不 `compute` 且不是 `ours`：来访自带的 `cch` 原样保留。
+fn finalize_cch(bytes: &mut [u8], compute: bool, ours: bool) -> Option<String> {
+    if compute {
+        return apply_cch(bytes);
+    }
+    if !ours {
+        return None;
+    }
+    let (start, end) = billing_cch_region(bytes)?;
     let n: u32 = rand::rng().random_range(0..0x10_0000);
-    format!("{n:05x}")
+    let cch = format!("{n:05x}");
+    bytes[start..end].copy_from_slice(cch.as_bytes());
+    Some(cch)
+}
+
+/// 在出站字节里定位 billing header 的 `cch` **值**那 5 个字节，返回 `[start, end)`。
+///
+/// **按 JSON 结构定位、不做全局内容搜索**：先用 [`system0_text_range`] 顺着顶层对象找到
+/// `system[0].text` 这个字符串值的区间——用户正文里即便原样引用了 `x-anthropic-billing-header:`
+/// 甚至整条 header，它在序列化后处于别的字符串值里、引号是 `\"`，冒充不了真正的键结构，不会
+/// 被误认。拿到该字段区间后，才在**区间之内**找 `cch=`，并且**完整校验** `cch=<5 位小写 hex>;`
+/// 才认（`i + 10 <= text.len()` 保证那个 `;` 也落在字段内，5 位值绝不会越过收尾引号去覆盖
+/// JSON 结构）。字段不是 billing header、或没有合法的 cch 段，返回 `None`。
+fn billing_cch_region(bytes: &[u8]) -> Option<(usize, usize)> {
+    let (ts, te) = system0_text_range(bytes)?;
+    let text = &bytes[ts..te];
+    if !text.starts_with(b"x-anthropic-billing-header:") {
+        return None;
+    }
+    let mut i = 0;
+    while i + 10 <= text.len() {
+        if &text[i..i + 4] == b"cch="
+            && text[i + 9] == b';'
+            && text[i + 4..i + 9].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        {
+            return Some((ts + i + 4, ts + i + 9));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 顺着序列化好的请求体字节，按 JSON 结构找到**顶层** `system` 数组第 0 个元素的 `text`
+/// 字符串**值**（两个引号之间的内容）的字节区间 `[start, end)`，找不到返回 `None`。
+///
+/// 全程区分「真·结构引号」与「字符串内容里被转义的 `\"`」：扫到的 `"system"` / `"text"` 必须
+/// 是顶层对象 / 元素对象里真正的键，用户正文里出现的同名串其引号在序列化后是 `\"`、不会被当成
+/// 键。这样 cch 的定位就只认 body 结构里那个 billing header 字段，与正文内容无关。
+fn system0_text_range(bytes: &[u8]) -> Option<(usize, usize)> {
+    let n = bytes.len();
+    let mut i = skip_ws(bytes, 0);
+    if i >= n || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    // 扫顶层对象的成员，找键 `system`。
+    loop {
+        i = skip_ws(bytes, i);
+        if i >= n || bytes[i] != b'"' {
+            return None;
+        }
+        let (ks, ke, after) = read_json_string(bytes, i)?;
+        i = skip_ws(bytes, after);
+        if i >= n || bytes[i] != b':' {
+            return None;
+        }
+        i = skip_ws(bytes, i + 1);
+        if &bytes[ks..ke] == b"system" {
+            // 期待数组、首元素对象，在其中找键 `text`。
+            if i >= n || bytes[i] != b'[' {
+                return None;
+            }
+            i = skip_ws(bytes, i + 1);
+            if i >= n || bytes[i] != b'{' {
+                return None;
+            }
+            i = skip_ws(bytes, i + 1);
+            loop {
+                if i >= n || bytes[i] != b'"' {
+                    return None;
+                }
+                let (ks2, ke2, after2) = read_json_string(bytes, i)?;
+                i = skip_ws(bytes, after2);
+                if i >= n || bytes[i] != b':' {
+                    return None;
+                }
+                i = skip_ws(bytes, i + 1);
+                if &bytes[ks2..ke2] == b"text" {
+                    if i >= n || bytes[i] != b'"' {
+                        return None;
+                    }
+                    let (vs, ve, _) = read_json_string(bytes, i)?;
+                    return Some((vs, ve));
+                }
+                i = skip_json_value(bytes, i)?;
+                i = skip_ws(bytes, i);
+                if i < n && bytes[i] == b',' {
+                    i = skip_ws(bytes, i + 1);
+                    continue;
+                }
+                return None; // 首元素里没有 text
+            }
+        }
+        i = skip_json_value(bytes, i)?;
+        i = skip_ws(bytes, i);
+        if i < n && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        return None;
+    }
+}
+
+/// 跳过从 `i` 起的 JSON 空白，返回第一个非空白字节的下标（或 `bytes.len()`）。
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// `bytes[i]` 是开引号，读完这个 JSON 字符串。返回（内容起、内容止、收尾引号之后的下标）。
+/// 处理 `\` 转义（含 `\"`），不解码——只按边界扫。
+fn read_json_string(bytes: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let start = i + 1;
+    let mut j = start;
+    let mut esc = false;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == b'"' {
+            return Some((start, j, j + 1));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 跳过从 `i` 起的一个 JSON 值（字符串 / 对象 / 数组 / 数字 / true / false / null），返回其后
+/// 的下标。对象与数组按 `{}` `[]` 深度配平，字符串内的括号与引号不计。
+fn skip_json_value(bytes: &[u8], i: usize) -> Option<usize> {
+    let n = bytes.len();
+    match bytes.get(i)? {
+        b'"' => read_json_string(bytes, i).map(|(_, _, after)| after),
+        b'{' | b'[' => {
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut esc = false;
+            let mut j = i;
+            while j < n {
+                let c = bytes[j];
+                j += 1;
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(j);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        // 数字 / true / false / null：读到分隔符为止。
+        _ => {
+            let mut j = i;
+            while j < n && !matches!(bytes[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
+/// 把回填到出站字节里的 cch 真值同步写回 `v` 的 billing header（`system[0]` 文本里的
+/// `cch=<原值>;` → `cch=<真值>;`，原值可能是 `00000` 占位符或自带真值）。保证返回的 `Value`
+/// 与出站字节逐字节同构——调用方拿它算形态摘要。`system[0]` 不是 billing header 时不动。
+fn sync_value_cch(v: &mut serde_json::Value, cch: &str) {
+    let Some(b) = v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut())
+    else {
+        return;
+    };
+    let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
+        return;
+    };
+    if !text.starts_with("x-anthropic-billing-header:") {
+        return;
+    }
+    // 只替换 billing header 里的 `cch=<5 hex>;`（首个即是，billing 串里只有这一个）。
+    let replaced = replace_billing_cch(text, cch);
+    b["text"] = serde_json::Value::String(replaced);
+}
+
+/// 把 billing header 文本里 `cch=<5 位小写 hex>;` 的那 5 位换成 `cch`，只换第一处。
+/// 没有匹配就原样返回。
+fn replace_billing_cch(text: &str, cch: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 10 <= bytes.len() {
+        if &bytes[i..i + 4] == b"cch="
+            && bytes[i + 9] == b';'
+            && bytes[i + 4..i + 9].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        {
+            return format!("{}cch={cch};{}", &text[..i], &text[i + 10..]);
+        }
+        i += 1;
+    }
+    text.to_string()
+}
+
+/// 按官方算法算 billing header 的 `cch`：对**规范化后**的整条出站 body 做 xxHash64
+/// （种子 [`CCH_SEED`]），取结果低 20 位，输出 5 位小写 hex。
+///
+/// 规范化（[`normalize_for_cch`]）复刻官方出口层在哈希前做的那遍预处理：清空所有
+/// `"model"` 的字符串值、剥掉 `"max_tokens"` / `"fallbacks"` / `"fallback_credit_token"`
+/// 三个字段。
+pub(super) fn compute_cch(body: &[u8]) -> String {
+    let norm = normalize_for_cch(body);
+    let h = xxhash_rust::xxh64::xxh64(&norm, CCH_SEED);
+    format!("{:05x}", h & 0xf_ffff)
+}
+
+/// `cch` 哈希前的 body 规范化，逐字节复刻官方出口层那段预处理（逆向自 2.1.289，原生函数
+/// `0x1018bf7bc` 做字段定位与逗号消解、`0x1018b7700` 串流喂 xxHash）：
+///
+/// 1. 把**每一处** `"model":"<字符串>"` 的值清空成 `"model":""`（`"model":{…}` 这种值不是
+///    字符串的不动——工具 schema 里的 `model` 参数就是对象，保留）。抓包里主线程体顶层的
+///    `model` 与 advisor 工具声明里的 `model` 都是字符串、都被清空，故全局处理。
+/// 2. 删掉 `"max_tokens":<数字>`、`"fallbacks":[<数组>]`、`"fallback_credit_token":"<串>"`
+///    三个字段连同一个相邻逗号。详见 [`strip_cch_fields`]。
+///
+/// 这几个字段是官方故意排除在 cch 之外的——`max_tokens` / `fallbacks` /
+/// `fallback_credit_token` 逐请求会变（上游下发的额度与回退名单），`model` 的值在重试回退时
+/// 会被改写，算进去就会让同一轮的 cch 不稳定。
+fn normalize_for_cch(body: &[u8]) -> Vec<u8> {
+    strip_cch_fields(&empty_model_values(body))
+}
+
+/// 把 body 里每一处 `"model":"<字符串>"` 的值清空成 `"model":""`，其余字节原样。
+/// `"model":` 后面不是 `"`（如 `"model":{…}`）的不动。
+fn empty_model_values(body: &[u8]) -> Vec<u8> {
+    const KEY: &[u8] = b"\"model\":\"";
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i..].starts_with(KEY) {
+            // 写入 `"model":"`，跳过原值内容到配对收尾引号，留下一对空引号。
+            out.extend_from_slice(KEY);
+            let mut j = i + KEY.len();
+            let mut esc = false;
+            while j < body.len() {
+                let c = body[j];
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    break;
+                }
+                j += 1;
+            }
+            // `j` 停在收尾引号（或 body 末尾）。写入该引号，i 跳到其后。
+            if j < body.len() {
+                out.push(b'"');
+                i = j + 1;
+            } else {
+                i = j;
+            }
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 单趟从左到右扫一遍 body，删掉遇到的每一处被剥字段连同一个相邻逗号。
+///
+/// **匹配模式含值的开头定界符**（逆向自原生：strip 函数搜的就是 `"fallbacks":[` 与
+/// `"fallback_credit_token":"` 这种带 `[` / `"` 的整串）：所以只有 `"fallbacks":[数组]`、
+/// `"fallback_credit_token":"串"` 这种形态会被剥；`"fallbacks":"default"`（值是字符串而非
+/// 数组，重试回退那一路会这么下发）不匹配 `"fallbacks":[`，原样留在哈希里。`"max_tokens":`
+/// 则要求冒号后紧跟数字，否则不当作匹配。
+///
+/// **逗号消解**：先看值后面是不是 `,`，是就连那个后逗号一起删；否则看字段前面是不是一个
+/// **还没被前一个剥除区间吃掉的** `,`，是就把它也删掉（`prev_end` 记上一个区间的终点，拦住
+/// 相邻两个被剥字段去重复吃它们中间那一个逗号）。两个被剥字段贴在一起、且后面紧跟 `}` 时，
+/// 中间那个逗号归前一个字段当后逗号吃掉，末尾就会剩下一个 `,}`——这正是官方出口层的产物
+/// （`cap` 里多字段相邻的体据此 263/263 对齐）。
+fn strip_cch_fields(body: &[u8]) -> Vec<u8> {
+    // (匹配前缀含定界符, 值形态)。顺序不影响结果：扫描按位置推进，命中哪个算哪个。
+    const SPECS: &[(&[u8], CchFieldVal)] = &[
+        (b"\"max_tokens\":", CchFieldVal::Number),
+        (b"\"fallbacks\":[", CchFieldVal::Array),
+        (b"\"fallback_credit_token\":\"", CchFieldVal::String),
+    ];
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut i = 0;
+    // 上一个被剥区间的终点（body 下标）。初值 0：body[−1] 不存在，首个字段也就吃不到前逗号。
+    let mut prev_end = 0usize;
+    while i < body.len() {
+        let hit = SPECS.iter().find(|(key, _)| body[i..].starts_with(key));
+        let Some(&(key, val)) = hit else {
+            out.push(body[i]);
+            i += 1;
+            continue;
+        };
+        let value_start = i + key.len();
+        let Some(value_end) = cch_value_end(body, value_start, val) else {
+            // 定界符对上了但值不成形（如 `"max_tokens":` 后面不是数字）：不当匹配，照常逐字节走。
+            out.push(body[i]);
+            i += 1;
+            continue;
+        };
+        let end = if value_end < body.len() && body[value_end] == b',' {
+            // 值后面是逗号：连后逗号一起删。
+            value_end + 1
+        } else {
+            // 否则：前面那个逗号若还没被上一个区间吃掉，就把已写进 out 的它删掉。
+            if i > prev_end && body[i - 1] == b',' {
+                out.pop();
+            }
+            value_end
+        };
+        prev_end = end;
+        i = end;
+    }
+    out
+}
+
+/// [`strip_cch_fields`] 里被剥字段的值形态，决定从定界符之后怎么找到值的末尾。
+#[derive(Clone, Copy)]
+enum CchFieldVal {
+    /// 十进制数字串，如 `"max_tokens":128000`；一个数字都没有则返回 `None`（不算匹配）。
+    Number,
+    /// JSON 数组，开头的 `[` 已在匹配前缀里，从其后按括号深度（初值 1）配平到收尾 `]`。
+    Array,
+    /// JSON 字符串，开头的 `"` 已在匹配前缀里，从其后读到配对收尾 `"`（`\` 转义的不算）。
+    String,
+}
+
+/// 从 `start`（定界符之后的第一个字节）出发，按值形态找到值的末尾（返回末尾的下一位）。
+/// `Number` 在没有任何数字时返回 `None`。
+fn cch_value_end(body: &[u8], start: usize, val: CchFieldVal) -> Option<usize> {
+    let mut i = start;
+    match val {
+        CchFieldVal::Number => {
+            while i < body.len() && body[i].is_ascii_digit() {
+                i += 1;
+            }
+            (i > start).then_some(i)
+        }
+        CchFieldVal::String => {
+            // 开引号已在匹配前缀里，这里从引号内第一个字节读到配对收尾引号。
+            let mut esc = false;
+            while i < body.len() {
+                let c = body[i];
+                i += 1;
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    break;
+                }
+            }
+            Some(i)
+        }
+        CchFieldVal::Array => {
+            // 开头的 `[` 已在匹配前缀里，深度从 1 起，配平到收尾 `]`；字符串内的括号不计。
+            let mut depth = 1i32;
+            let mut in_str = false;
+            let mut esc = false;
+            while i < body.len() {
+                let c = body[i];
+                i += 1;
+                if esc {
+                    esc = false;
+                } else if in_str {
+                    if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'[' {
+                    depth += 1;
+                } else if c == b']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            Some(i)
+        }
+    }
 }
 
 /// 把 API-key 模式的 3 块 `system` 改写成订阅模式的 4 块，并把全部缓存断点对齐到官方形态。
@@ -2780,19 +3277,20 @@ pub(super) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
     Some(ToolNameMap { forward, reverse, max_fake })
 }
 
-/// 模拟路径下注入的官方主线程工具声明，**逐 profile 一份**：opus 逐字节取自
-/// `cap/2.1.260-2/00025`，fable 取自 `cap/2.1.260/00018`。
+/// 模拟路径下注入的官方主线程工具声明：14 条，与 `cap/2.1.285` 里 11 个模型的主线程
+/// （`00030` opus-5-5 ↔ `00039` fable-5-1 ↔ `00045` sonnet-5-5 ↔ `00051` haiku-4-5 ……）逐字节相同。
 ///
 /// **为什么要注入**：上游判第三方的信号之一是「自称 CC 但没有 CC 工具」。光把客户端自有
 /// 工具名加 `mcp__` 前缀不够——那只是消去负面信号（被 blocklist 的名字），而正面信号
 /// （存在 CC 官方工具声明）仍然缺失。注入之后请求的工具组合是「CC 内建 + MCP 扩展」，
 /// 与真实 CC 接 MCP server 的形态一致（`cap/2.1.258-api/00006`：内建在前，`mcp__*` 在尾）。
 ///
-/// **为什么是 14 个而不是 4 个**：2.1.277 四族主线程抓包（`cap/2.1.277/00023` / `00031` /
-/// `00046` / `00357`）每条都带 19 或 20 个工具，其中四族共有的内建工具 16 个：下面这 14 个
-/// 真工具，加上 `ToolSearch` 与 `DeferredToolPlaceholder` 那一对延迟加载机制；其余是用户
-/// 自己的 MCP 工具（`mcp__claude_ai_Claude_Docs__*`）与 opus / fable 独有的服务端工具
-/// `advisor`（`type: advisor_20260301`，没有 `input_schema`）。只带 Bash/Edit/Read/Write 是一个
+/// **为什么是 14 个而不是 4 个**：2.1.285 四族主线程抓包（`cap/2.1.285/00030` / `00039` /
+/// `00045` / `00051`）每条都带 19 或 20 个工具，其中四族共有的内建工具 15 个：下面这 14 个
+/// 真工具，加上 `ToolSearch`；其余是延迟池里的 `DeferredToolPlaceholder` 占位、用户自己的
+/// MCP 工具（`mcp__claude_ai_Claude_Docs__*`）与 opus 独有的服务端工具 `advisor`
+/// （`type: advisor_20260301`，没有 `input_schema`）。`TaskStop` 等其余内建工具在延迟清单里，
+/// 不在正文声明中。只带 Bash/Edit/Read/Write 是一个
 /// 官方不产生的组合，与「零个工具」一样是自证。
 /// 那一对**故意不注**：`ToolSearch` 被模型调起来时客户端拿到一个自己没声明的
 /// tool_use 且没法执行，而 `DeferredToolPlaceholder` 只是它的占位；两者都不是「工具」。第四块
@@ -2804,8 +3302,8 @@ pub(super) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
 /// Skill → Workflow → Write`（官方在 `Skill` 与 `Workflow` 之间还有 `ToolSearch`、`Workflow`
 /// 与 `Write` 之间还有 MCP 工具与占位），不是字母序。
 ///
-/// **`eager_input_streaming`**：2.1.277 四族的 OAuth 主线程每个内建工具都带
-/// `eager_input_streaming: true`——fable 也带了（2.1.260 时一个都不带）。资产原样保留，
+/// **`eager_input_streaming`**：2.1.277 起四族的 OAuth 主线程每个内建工具都带
+/// `eager_input_streaming: true`——fable 也带（2.1.260 时一个都不带），2.1.285 仍如此。资产原样保留，
 /// 不另加也不剥。客户端改名后的 `mcp__luban__*` 带不带这个键**没有 OAuth 样本**
 /// （`2.1.258-api` 的 `mcp__ide__*` 不带，但那是 API-key 模式；2.1.277 订阅端的 MCP 工具在
 /// 延迟池里带 `eager_input_streaming: true` 加 `defer_loading: true`，与正文声明不是一回事），
@@ -2823,12 +3321,12 @@ static CC_TOOLS_CORE: std::sync::LazyLock<Vec<serde_json::Value>> =
             .expect("cc_tools_core.json must be a valid JSON array of tool objects")
     });
 
-/// 注入用的工具声明（2.1.277，`cap/2.1.277/00023` 的 20 条里去掉 `ToolSearch` /
+/// 注入用的工具声明（2.1.285，`cap/2.1.285/00030` 的 20 条里去掉 `ToolSearch` /
 /// `DeferredToolPlaceholder` 那一对、用户自己的 `mcp__*` 与服务端工具 `advisor` 之后的 14 条）。
 ///
-/// 2.1.277 四族主线程的内建工具声明**逐字节相同**（`00023` fable ↔ `00031` sonnet ↔ `00046`
-/// haiku ↔ `00357` opus，含 `eager_input_streaming: true`），故只有一份；2.1.260 时 fable 那份
-/// 不带 eager、措辞也不同，要单独一份，现在不用了。`profile` 仍收着，将来某族再分家时不必
+/// 2.1.285 各族主线程的内建工具声明**逐字节相同**（`cap/2.1.285` 的 11 个模型，含
+/// `eager_input_streaming: true`），故只有一份；2.1.277 / 2.1.280 的 `Artifact`、`Bash` 措辞与
+/// 这份不同。2.1.260 时 fable 那份不带 eager、措辞也不同，要单独一份，现在不用了。`profile` 仍收着，将来某族再分家时不必
 /// 改调用点。
 pub(super) fn cc_tools_core(_profile: &config::CcProfile) -> &'static [serde_json::Value] {
     &CC_TOOLS_CORE
@@ -4507,14 +5005,19 @@ mod tests {
     }
 
     /// 客户端本来就是订阅形态（四块）时不动 `system`——它已经是目标形态了。
+    /// cch 取这份 body 的真值：随手写的值对不上 body，`cch_real_recompute` 会把它重算掉。
     #[test]
     fn leaves_official_four_block_shape_alone() {
-        let raw = Bytes::from(
-            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli; cch=0848d;"},
+        let mut raw = (
+            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_entrypoint=cli; cch=00000;"},
                           {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
                           {"type":"text","text":"base","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}},
-                          {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
-        );
+                          {"type":"text","text":"Write code that reads like the surrounding code: match its comment density, naming, and idiom.","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#
+        )
+            .as_bytes()
+            .to_vec();
+        super::apply_cch(&mut raw).unwrap();
+        let raw = Bytes::from(raw);
         let out = rewrite_body(&raw, &test_cred(), "fp", all_on(), None, None);
         assert_eq!(out, raw, "四块形态应原样返回");
     }
@@ -4539,6 +5042,8 @@ mod tests {
             spoof_device_id: false,
             normalize_device_fp: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             fill_client_headers: false,
             merge_beta: false,
             system_shape: false,
@@ -4645,6 +5150,8 @@ mod tests {
                     system_shape: false,
                     spoof_identity: false,
                     billing_cch: false,
+                    cch_real_recompute: false,
+                    cch_sim_compute: false,
                     strip_extra_fields: false,
                     ..all_on()
                 },
@@ -4747,42 +5254,16 @@ mod tests {
         serde_json::json!({"system": [{"type": "text", "text": text}]})
     }
 
-    /// 补出的 billing header 与订阅模式的真实形态一致（抓包 040 的 `; cch=…;` 形态）：
-    /// 追加在末尾、**5 位小写 hex**、每请求都不一样。
-    ///
-    /// 钉「每次不同」是有理由的：原先补的是常量 `00000`，跨账号恒定，上游一按它聚类就把
-    /// 所有账号串成一串。抓包里同账号相邻请求是 `993e1`/`e2d04`/`b504f`，各不相同。
+    /// `ensure_billing_cch` 先把 `cch=00000;` 占位符追加到 billing header 末尾（真值由出站
+    /// 字节定型后的 [`apply_cch`] 回填，见 [`cch_matches_official_egress`]）：形态是
+    /// `; cch=00000;`，紧跟在原前缀之后、不动前缀。
     #[test]
-    fn adds_cch_in_official_shape() {
+    fn adds_cch_placeholder_in_official_shape() {
         const HEAD: &str = "x-anthropic-billing-header: cc_version=2.1.218.0b9; cc_entrypoint=cli;";
-        let cch_of = |v: &serde_json::Value| -> String {
-            let text = v["system"][0]["text"].as_str().unwrap().to_string();
-            let rest = text.strip_prefix(HEAD).unwrap_or_else(|| panic!("前缀不该被动: {text}"));
-            let cch = rest
-                .strip_prefix(" cch=")
-                .and_then(|s| s.strip_suffix(';'))
-                .unwrap_or_else(|| panic!("cch 段形态不对: {text}"));
-            assert_eq!(cch.len(), 5, "5 位: {text}");
-            assert!(
-                cch.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-                "小写 hex: {text}"
-            );
-            cch.to_string()
-        };
-
         let mut v = body_with_system0(HEAD);
         assert!(ensure_billing_cch(&mut v));
-        let first = cch_of(&v);
-
-        // 连补 20 次，不该 20 次都一样——恒定值正是要消灭的那个判据。
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(first);
-        for _ in 0..20 {
-            let mut v = body_with_system0(HEAD);
-            assert!(ensure_billing_cch(&mut v));
-            seen.insert(cch_of(&v));
-        }
-        assert!(seen.len() > 1, "cch 该逐请求变化，20 次全同说明又写死了: {seen:?}");
+        let text = v["system"][0]["text"].as_str().unwrap();
+        assert_eq!(text, format!("{HEAD} cch=00000;"), "占位符追加在前缀之后: {text}");
     }
 
     /// 已带 cch（订阅模式客户端）不重复追加；非 billing 块不动。
@@ -5213,6 +5694,8 @@ mod tests {
             system_shape: false,
             spoof_identity: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             strip_extra_fields: false,
             flatten_tool_schemas: false,
             strip_empty_text: false,
@@ -5258,6 +5741,8 @@ mod tests {
             system_shape: false,
             spoof_identity: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             strip_extra_fields: false,
             flatten_tool_schemas: false,
             strip_empty_text: false,
@@ -5520,6 +6005,8 @@ mod tests {
                 spoof_device_id: false,
                 normalize_device_fp: false,
                 billing_cch: false,
+                cch_real_recompute: false,
+                cch_sim_compute: false,
                 fill_client_headers: false,
                 merge_beta: false,
                 system_shape: false,
@@ -6213,6 +6700,8 @@ mod tests {
             spoof_device_id: false,
             normalize_device_fp: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             fill_client_headers: false,
             merge_beta: false,
             system_shape: false,
@@ -7835,6 +8324,8 @@ mod tests {
             spoof_identity: false,
             system_shape: false,
             billing_cch: false,
+            cch_real_recompute: false,
+            cch_sim_compute: false,
             ..all_on()
         };
         let call = |body: &str| {
@@ -8458,5 +8949,319 @@ mod tests {
         let off = store::ForwardFlags { sim_message_threads: false, ..all_on() };
         let (v, p) = thread_turn(&thread_body("claude-opus-5-5", msgs), off);
         assert!(v.get("thread").is_none() && p.is_none(), "{v}");
+    }
+
+    /// `cch` 真值算法的回归锚点：这些 `(body, cch)` 对取自 `claude-cli/2.1.289` 的 Bun HTTP
+    /// 出口层（把带 `cch=00000;` 占位符的 body 真正发一遍、读它回填的值），是独立于我们实现
+    /// 的权威真值。每条各打一个规范化规则：
+    /// - `max_tokens` 在中段、`fallbacks`、`fallback_credit_token` 剥干净后都回到 `plain`；
+    /// - `max_tokens` 在队尾（后无逗号、吃前逗号）与「本就没 model」同值；
+    /// - `all_fields` 三个字段都剥、`stream` 留下；`two_models` 顶层与 advisor 两处 model 值都清空。
+    #[test]
+    fn cch_matches_official_egress() {
+        let bh = "x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch=00000;";
+        let sys = format!("[{{\"type\":\"text\",\"text\":\"{bh}\"}}]");
+        let msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+        let cases: &[(&str, String)] = &[
+            (
+                "1ee24",
+                format!("{{\"model\":\"claude-opus-5-5\",\"system\":{sys},\"messages\":{msgs}}}"),
+            ),
+            (
+                "1ee24",
+                format!(
+                    "{{\"model\":\"claude-opus-5-5\",\"max_tokens\":128000,\"system\":{sys},\"messages\":{msgs}}}"
+                ),
+            ),
+            ("bc961", format!("{{\"system\":{sys},\"messages\":{msgs},\"max_tokens\":64000}}")),
+            (
+                "1ee24",
+                format!(
+                    "{{\"model\":\"claude-opus-5-5\",\"system\":{sys},\"messages\":{msgs},\"fallbacks\":[\"claude-sonnet-5-5\"]}}"
+                ),
+            ),
+            (
+                "1ee24",
+                format!(
+                    "{{\"model\":\"claude-opus-5-5\",\"fallback_credit_token\":\"tok_abc123\",\"system\":{sys},\"messages\":{msgs}}}"
+                ),
+            ),
+            (
+                "389a3",
+                format!(
+                    "{{\"model\":\"claude-opus-5-5\",\"max_tokens\":32000,\"system\":{sys},\"messages\":{msgs},\"stream\":true,\"fallbacks\":[\"claude-sonnet-5-5\"],\"fallback_credit_token\":\"tok_x\"}}"
+                ),
+            ),
+            (
+                "9164d",
+                format!(
+                    "{{\"model\":\"claude-opus-5-5\",\"system\":{sys},\"tools\":[{{\"type\":\"advisor_20260301\",\"name\":\"advisor\",\"model\":\"claude-opus-5-5\"}}],\"messages\":{msgs}}}"
+                ),
+            ),
+            ("bc961", format!("{{\"system\":{sys},\"messages\":{msgs}}}")),
+        ];
+        for (want, body) in cases {
+            assert_eq!(&super::compute_cch(body.as_bytes()), want, "body={body}");
+        }
+    }
+
+    /// [`apply_cch`] 限定在 billing header 里定位并回填 cch：占位符与自带真值都重算，
+    /// billing header 之外（用户正文）的 `cch=…` 一律不碰，没有 billing header 时不动。
+    #[test]
+    fn apply_cch_scoped_to_billing_header() {
+        // messages 排在 system 之前、且用户正文里恰好含 cch=00000;（257/263 抓包是这个键序）。
+        let user = "cch=00000; 这是用户正文不该被动";
+        // billing header 的 cch 取不同初值，body 其余部分完全一致。
+        let body_with = |billing_cch: &str| {
+            format!(
+                "{{\"model\":\"claude-opus-5-5\",\"messages\":[{{\"role\":\"user\",\"content\":\"{user}\"}}],\"system\":[{{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch={billing_cch};\"}}]}}"
+            )
+        };
+
+        let mut bytes = body_with("00000").into_bytes();
+        let cch = super::apply_cch(&mut bytes).expect("billing header 里有 cch");
+        let out = String::from_utf8(bytes).unwrap();
+        assert_ne!(cch, "00000", "billing cch 被算成真值");
+        // billing header 的 cch 被填成真值；用户正文里的 cch=00000; 原样保留。
+        assert!(out.contains(&format!("cch={cch};")), "billing 回填: {out}");
+        assert!(out.contains(user), "用户正文未被动: {out}");
+        assert_eq!(out.matches("cch=00000;").count(), 1, "只剩用户正文那一处占位: {out}");
+
+        // billing 自带真值（非 00000）时，body 其余一致，重算应得到同一个 cch。
+        let mut rb = body_with("dde8e").into_bytes();
+        assert_eq!(super::apply_cch(&mut rb).as_deref(), Some(cch.as_str()), "自带真值被重算");
+
+        // 没有 billing header 时不动（真实 CC 非订阅、或 billing 关着）。
+        let mut nobh = br#"{"messages":[{"role":"user","content":"cch=00000; x"}]}"#.to_vec();
+        assert!(super::apply_cch(&mut nobh).is_none(), "无 billing header 则不改");
+    }
+
+    /// [`finalize_cch`] 三档策略：算真值（与 [`apply_cch`] 同值）；不算且是 luban 的占位符时
+    /// 填随机值（不留 `00000`）；不算且是来访自带的则原样保留。
+    #[test]
+    fn finalize_cch_strategies() {
+        let body_with = |cch: &str| {
+            format!(
+                "{{\"system\":[{{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch={cch};\"}}],\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+            )
+        };
+        let mut want = body_with("00000").into_bytes();
+        let real = super::apply_cch(&mut want).unwrap();
+
+        // 开：自带值与占位符都按出站字节重算。
+        for (init, ours) in [("dde8e", false), ("00000", true)] {
+            let mut b = body_with(init).into_bytes();
+            assert_eq!(super::finalize_cch(&mut b, true, ours).as_deref(), Some(real.as_str()));
+            assert_eq!(b, want);
+        }
+
+        // 关、来访自带：原样保留。
+        let mut b = body_with("dde8e").into_bytes();
+        assert!(super::finalize_cch(&mut b, false, false).is_none());
+        assert_eq!(b, body_with("dde8e").into_bytes());
+
+        // 关、luban 的占位符：随机值，形状合法且逐请求变化。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let mut b = body_with("00000").into_bytes();
+            let cch = super::finalize_cch(&mut b, false, true).unwrap();
+            assert!(String::from_utf8(b).unwrap().contains(&format!("cch={cch};")));
+            seen.insert(cch);
+        }
+        assert!(seen.len() > 1, "随机值不该 20 次全同: {seen:?}");
+    }
+
+    /// 前置改写（剥 prefill、thinking 降级等）动过 body、[`rewrite_body_out`] 自己又没改任何东西时，
+    /// 来访自带的 cch 已与 body 不符：`cch_real_recompute` 开着必须重算，不能原样早退；关着则原样
+    /// 放行。自带值本就对得上的体照旧零改写早退。
+    #[test]
+    fn rewrite_recomputes_stale_real_cch() {
+        let body_with = |cch: &str, content: &str| {
+            format!(
+                "{{\"model\":\"claude-opus-5-5\",\"system\":[{{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch={cch};\"}}],\"messages\":[{{\"role\":\"user\",\"content\":\"{content}\"}}]}}"
+            )
+        };
+        // 客户端那份（cch 是它自己的真值），以及被前置改写动过内容、cch 没跟着变的那份。
+        let mut orig = body_with("00000", "hi").into_bytes();
+        let client_cch = super::apply_cch(&mut orig).unwrap();
+        let mut want = body_with("00000", "hi there").into_bytes();
+        let fresh = super::apply_cch(&mut want).unwrap();
+        assert_ne!(client_cch, fresh);
+        let stale = Bytes::from(body_with(&client_cch, "hi there"));
+
+        let cred = test_cred();
+        let off = store::ForwardFlags {
+            spoof_identity: false,
+            billing_cch: false,
+            cch_real_recompute: false,
+            strip_extra_fields: false,
+            system_shape: false,
+            eager_tool_streaming: false,
+            flatten_tool_schemas: false,
+            strip_empty_text: false,
+            ..store::ForwardFlags::default()
+        };
+        let run = |body: &Bytes, flags: store::ForwardFlags| {
+            super::rewrite_body_out(
+                body,
+                &cred,
+                "fp",
+                flags,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                None,
+                None,
+                crate::proxy::CcRequestKind::Main,
+                None,
+            )
+        };
+
+        let on = store::ForwardFlags { cch_real_recompute: true, ..off };
+        let (out, v) = run(&stale, on);
+        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), String::from_utf8(want).unwrap());
+        assert!(v.is_some(), "重算过就交回与出站字节同构的 Value");
+
+        // 关着：原样放行（自带值保留）。
+        let (out, _) = run(&stale, off);
+        assert_eq!(out, stale);
+
+        // 自带值本就对得上：开着也零改写早退。
+        let intact = Bytes::from(orig);
+        let (out, v) = run(&intact, on);
+        assert_eq!(out, intact);
+        assert!(v.is_none());
+    }
+
+    /// 用户正文里原样引用**整条** `x-anthropic-billing-header: …cch=00000;…`（在 system 之前）
+    /// 也不会被误认：按 JSON 结构定位只认 `system[0].text` 那个真字段，正文里那段引号是 `\"`、
+    /// 不是键结构。回填只落在 billing header，正文原样保留。
+    #[test]
+    fn apply_cch_ignores_quoted_header_in_user_text() {
+        // 用户把一条看起来一模一样的 billing header 塞进正文（system 之前）。
+        let spoof =
+            "x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch=00000;";
+        let body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"看这个 {spoof} 冒充\"}}],\"system\":[{{\"type\":\"text\",\"text\":\"{spoof}\"}}]}}"
+        );
+        let mut bytes = body.into_bytes();
+        let cch = super::apply_cch(&mut bytes).expect("定位到 system[0] 的 billing header");
+        let out = String::from_utf8(bytes).unwrap();
+        // 正文里那条保持 cch=00000;，只有 system[0] 的被填成真值。
+        assert_eq!(out.matches("cch=00000;").count(), 1, "正文那条占位符未被动: {out}");
+        assert!(out.contains(&format!("看这个 {spoof} 冒充")), "正文整体未被改: {out}");
+        let sys_pos = out.find("\"system\"").unwrap();
+        assert!(out[sys_pos..].contains(&format!("cch={cch};")), "真 billing 被回填: {out}");
+    }
+
+    /// billing header 文本里出现裸 `cch=`（后面不是合法的 `<5 位 hex>;`，例如紧跟字符串收尾
+    /// 引号）时，绝不越界写那 5 位去破坏 JSON——没有合法 cch 段就当没有，返回 `None`。
+    #[test]
+    fn apply_cch_rejects_malformed_cch_segment() {
+        // billing header 以裸 `cch=` 结尾（随即是字符串的收尾引号），后面没有 5 位 hex + 分号。
+        let bh = "x-anthropic-billing-header: cc_version=2.1.289.a; cc_entrypoint=cli; cch=";
+        let body = format!(
+            "{{\"system\":[{{\"type\":\"text\",\"text\":\"{bh}\"}}],\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+        );
+        let original = body.clone();
+        let mut bytes = body.into_bytes();
+        assert!(super::apply_cch(&mut bytes).is_none(), "无合法 cch 段则不动");
+        assert_eq!(String::from_utf8(bytes).unwrap(), original, "字节逐字节未变，JSON 未被破坏");
+
+        // 短到 `cch=12;`（只有 2 位）也不认——必须恰好 5 位 hex 加分号。
+        let bh2 = "x-anthropic-billing-header: cc_version=2.1.289.a; cch=12;";
+        let body2 = format!(
+            "{{\"system\":[{{\"type\":\"text\",\"text\":\"{bh2}\"}}],\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}"
+        );
+        let orig2 = body2.clone();
+        let mut b2 = body2.into_bytes();
+        assert!(super::apply_cch(&mut b2).is_none(), "非 5 位不认");
+        assert_eq!(String::from_utf8(b2).unwrap(), orig2, "未破坏");
+    }
+
+    /// 全量回归：遍历本机 `cap/` 下所有抓包，对每条 `/v1/messages` 请求体**原样**跑一遍
+    /// [`apply_cch`]（它内部把 billing header 的 cch 归零、按整条 body 重算、回填），得到的值必须
+    /// 等于客户端自己写的那个真实 cch。这同时压到了 billing header 定位（而非全局搜索）与重算。
+    ///
+    /// **`#[ignore]`：只在本地带着抓包手动跑**（`cargo test cch_matches_all_captures --
+    /// --ignored`）。`cap/` 不随仓库走（`.gitignore`），CI 上拿不到，常规 `cargo test` 不碰它；
+    /// 跨 CI 一致的真值锚点在 [`cch_matches_official_egress`]。
+    #[test]
+    #[ignore = "依赖本机 cap/ 抓包，本地手动跑"]
+    fn cch_matches_all_captures() {
+        use std::path::Path;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("cap");
+        if !root.is_dir() {
+            eprintln!("cap/ 不在，跳过全量 cch 回归");
+            return;
+        }
+        let re = regex_cch();
+        let (mut matched, mut total) = (0usize, 0usize);
+        let mut fails: Vec<String> = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                    continue;
+                }
+                if !p.to_string_lossy().ends_with(".req.raw") {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read(&p) else { continue };
+                let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = &raw[..sep];
+                let first = head.split(|&b| b == b'\r').next().unwrap_or(b"");
+                if !first.windows(13).any(|w| w == b"/v1/messages?" || w == b"/v1/messages ")
+                    || first.windows(12).any(|w| w == b"count_tokens")
+                {
+                    continue;
+                }
+                let body = &raw[sep + 4..];
+                let Some((_, real)) = re(body) else { continue };
+                total += 1;
+                // 原样跑 apply_cch（内部归零+重算+回填），结果应等于客户端写的真实 cch。
+                let mut out = body.to_vec();
+                let got = super::apply_cch(&mut out);
+                if got.as_deref().map(str::as_bytes) == Some(real.as_slice()) {
+                    matched += 1;
+                } else if fails.len() < 8 {
+                    fails.push(format!(
+                        "{}: real={} got={}",
+                        p.file_name().unwrap().to_string_lossy(),
+                        String::from_utf8_lossy(&real),
+                        got.as_deref().unwrap_or("<None>")
+                    ));
+                }
+            }
+        }
+        assert!(total > 0, "cap/ 存在但没扫到任何带 cch 的 /v1/messages");
+        assert_eq!(matched, total, "{matched}/{total} 命中；前几条失败：\n{}", fails.join("\n"));
+    }
+
+    /// 在 body 里找第一个 `cch=<5 位小写 hex>;`，返回（那 5 位的起始下标，那 5 位字节）。
+    fn regex_cch() -> impl Fn(&[u8]) -> Option<(usize, Vec<u8>)> {
+        |body: &[u8]| {
+            let needle = b"cch=";
+            let mut i = 0;
+            while i + 10 <= body.len() {
+                if &body[i..i + 4] == needle {
+                    let hex = &body[i + 4..i + 9];
+                    if body[i + 9] == b';'
+                        && hex.iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                    {
+                        return Some((i + 4, hex.to_vec()));
+                    }
+                }
+                i += 1;
+            }
+            None
+        }
     }
 }

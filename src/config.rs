@@ -258,15 +258,18 @@ pub const CC_USER_AGENT: &str = "claude-cli/2.1.285 (external, cli)";
 /// 免得 luban 自身的刷新/profile 请求被解压中间件补上一个非官方取值。
 pub const CC_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
-/// `x-anthropic-billing-header` 里的 `cch`：**取值不在这里**，见 [`crate::proxy::cch_value`]。
+/// `x-anthropic-billing-header` 里的 `cch`：**取值不在这里**，算法见 `proxy::body::compute_cch`、
+/// 回填见 `proxy::body::apply_cch`。
 ///
 /// 官方客户端仅在**订阅(OAuth)模式**下发送 `cch=<5 位小写 hex>`；API-key 模式（即接入
 /// luban 的形态）不发。于是「OAuth token + 无 cch」是一个确定性判据，得补。
 ///
-/// 曾经补的是常量 `00000`。那是个**跨账号恒定**的值：所有经由 luban 的请求都带同一个真实
-/// 客户端从不产生的 `cch`，上游一按此聚类就把所有账号串成一串。现在改成每请求随机的 5 位
-/// 小写 hex——形状与抓包一致，语义仍未知，别当成已经对齐。
-pub mod billing_cch_is_a_shape_not_a_value {}
+/// 曾经补的是常量 `00000`（跨账号恒定，上游一按它聚类就把所有账号串成一串），后来退一步
+/// 改成每请求随机值（形状对、语义不对）。现在**语义也对齐了**：`cch` 是官方 Bun HTTP 出口层
+/// 对最终出站 body 做的 xxHash64 取低 20 位（种子 `proxy::body::CCH_SEED`），
+/// luban 按同一算法算真值——`cap/` 九组抓包 263 条 `/v1/messages` 全部命中。真实来访与模拟
+/// 请求各有一项独立策略（`cch_real_recompute` / `cch_sim_compute`，关掉即退回旧做法）。
+pub mod billing_cch_is_computed_not_random {}
 
 /// 官方订阅客户端把系统提示词切成 4 块，第二刀落在**基座结束处**。本表是切点之后那一段的
 /// 开头，用来在 API-key 模式的合并块里定位这一刀——**每个模型族的基座不同，各有各的锚点**。
@@ -1972,10 +1975,10 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    00002（经 luban）与 00006（直连）同为 `2.1.220.04c`，003/004 那对也同为 `2.1.218.d82`。
 ///    后缀确实会变，但与鉴权模式无关，luban 原样转发即可。
 ///
-/// 5. **`cch` 的算法仍未知**（形状已对齐）。官方每次请求都不同（`0848d`、`5cb85`…），
-///    luban 现在也每请求发一个随机的 5 位小写 hex，见 [`crate::proxy::cch_value`]。
-///    形状对上了，语义没有——别把它当成已经对齐的一项。原先那个跨账号恒定的 `00000`
-///    更糟：上游一按它聚类就把所有账号串成一串。
+/// ~~5. `cch` 的算法~~ —— **已对齐**。官方每次请求都不同（`0848d`、`5cb85`…），因为它是
+///    出口层对最终出站 body 做的 xxHash64 取低 20 位（种子 `proxy::body::CCH_SEED`，
+///    哈希前把 `model` 值清空、剥掉 `max_tokens`/`fallbacks`/`fallback_credit_token`）。
+///    luban 按同一算法回填真值，见 `proxy::body::apply_cch`；`cap/` 263 条全中。
 ///
 /// ~~6. `system` 块的切分与缓存 TTL~~ —— **已对齐**，见 [`crate::proxy::align_system_shape`]
 ///    与 [`CC_SYSTEM_BASE_ANCHORS`]。四个模型族的 raw 抓包逐字节验过。剩余风险只有锚点会随

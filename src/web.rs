@@ -2865,6 +2865,10 @@ struct ForwardingResp {
     normalize_device_fp: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     billing_cch: bool,
+    /// 真实 CC 来访的 body 被改写后按最终出站字节重算 `cch`。
+    cch_real_recompute: bool,
+    /// 模拟请求的 `cch` 按出站字节算真值（关则随机值）。
+    cch_sim_compute: bool,
     /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
     fill_client_headers: bool,
     /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
@@ -2941,6 +2945,8 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             spoof_device_id: f.spoof_device_id,
             normalize_device_fp: f.normalize_device_fp,
             billing_cch: f.billing_cch,
+            cch_real_recompute: f.cch_real_recompute,
+            cch_sim_compute: f.cch_sim_compute,
             fill_client_headers: f.fill_client_headers,
             merge_beta: f.merge_beta,
             system_shape: f.system_shape,
@@ -3679,6 +3685,8 @@ struct SetForwardingReq {
     spoof_device_id: Option<bool>,
     normalize_device_fp: Option<bool>,
     billing_cch: Option<bool>,
+    cch_real_recompute: Option<bool>,
+    cch_sim_compute: Option<bool>,
     fill_client_headers: Option<bool>,
     merge_beta: Option<bool>,
     system_shape: Option<bool>,
@@ -3722,21 +3730,24 @@ async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        API_TELEMETRY, EAGER_TOOL_STREAMING, FABLE_REFUSAL_FALLBACK, FILL_ABSENT_TOOLS,
-        FILL_CLIENT_HEADERS, FILL_METADATA, FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE,
-        INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
-        OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY,
-        REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_PROBES_STRICT,
-        REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIM_MESSAGE_THREADS, SIMULATE_CC,
-        SIMULATE_FULL_SYSTEM, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED,
-        STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE, SYSTEM_CACHE_TTL, SYSTEM_SHAPE,
-        THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
+        API_TELEMETRY, CCH_REAL_RECOMPUTE, CCH_SIM_COMPUTE, EAGER_TOOL_STREAMING,
+        FABLE_REFUSAL_FALLBACK, FILL_ABSENT_TOOLS, FILL_CLIENT_HEADERS, FILL_METADATA,
+        FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
+        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
+        RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY, REJECT_EMPTY_REPLIES, REJECT_OPENAI_SHAPE,
+        REJECT_PROBES, REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT,
+        SIM_MESSAGE_THREADS, SIMULATE_CC, SIMULATE_FULL_SYSTEM, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
+        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
+        TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
         (SPOOF_DEVICE_ID, req.spoof_device_id),
         (NORMALIZE_DEVICE_FP, req.normalize_device_fp),
         (SPOOF_BILLING_CCH, req.billing_cch),
+        (CCH_REAL_RECOMPUTE, req.cch_real_recompute),
+        (CCH_SIM_COMPUTE, req.cch_sim_compute),
         (FILL_CLIENT_HEADERS, req.fill_client_headers),
         (MERGE_BETA, req.merge_beta),
         (SYSTEM_SHAPE, req.system_shape),

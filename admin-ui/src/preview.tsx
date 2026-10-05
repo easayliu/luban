@@ -829,6 +829,8 @@ queryClient.setQueryData(['settings'], {
   spoof_identity: true,
   spoof_device_id: true,
   billing_cch: true,
+  cch_real_recompute: true,
+  cch_sim_compute: true,
   fill_client_headers: true,
   merge_beta: true,
   system_shape: true,

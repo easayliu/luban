@@ -2814,6 +2814,12 @@ impl CredentialStore {
         if let Some(v) = on(SPOOF_BILLING_CCH) {
             flags.billing_cch = v;
         }
+        if let Some(v) = on(CCH_REAL_RECOMPUTE) {
+            flags.cch_real_recompute = v;
+        }
+        if let Some(v) = on(CCH_SIM_COMPUTE) {
+            flags.cch_sim_compute = v;
+        }
         if let Some(v) = on(FILL_CLIENT_HEADERS) {
             flags.fill_client_headers = v;
         }
@@ -3092,6 +3098,14 @@ pub const SYSTEM_CACHE_TTL: &str = "system_cache_ttl";
 /// 是否给 `x-anthropic-billing-header` 补 `cch`（订阅模式独有字段）。
 pub const SPOOF_BILLING_CCH: &str = "spoof_billing_cch";
 
+/// 真实 CC 来访的 body 被改写后，是否按最终出站字节重算 billing header 的 `cch` 的
+/// settings 键名。缺省视为开启，见 [`ForwardFlags::cch_real_recompute`]。
+pub const CCH_REAL_RECOMPUTE: &str = "cch_real_recompute";
+
+/// 模拟请求的 billing header `cch` 是否按出站字节算真值的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::cch_sim_compute`]。
+pub const CCH_SIM_COMPUTE: &str = "cch_sim_compute";
+
 /// 是否替客户端补齐它没带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
 pub const FILL_CLIENT_HEADERS: &str = "fill_client_headers";
 
@@ -3349,6 +3363,19 @@ pub struct ForwardFlags {
     pub normalize_device_fp: bool,
     /// 给 `x-anthropic-billing-header` 补 `cch`。
     pub billing_cch: bool,
+    /// 真实 CC 来访的 `cch` 策略（与 [`Self::billing_cch`] 互相独立）。`cch` 是官方出口层对
+    /// 最终出站 body 算的 xxHash64（见 `proxy::body::compute_cch`），luban 一改写 body，
+    /// 来访自带的那个就对不上了。
+    ///
+    /// - **开**（默认）：body 被改写过就按最终出站字节重算（来访自带的真值与 luban 补的占位
+    ///   一视同仁）；没改写的原样透传，自带值本来就对。
+    /// - **关**：来访自带的 `cch` 原样保留（改写后与 body 不符）；luban 替它补的那条填随机值。
+    pub cch_real_recompute: bool,
+    /// 模拟请求的 `cch` 策略（[`Self::simulate_cc`] 的子项）。
+    ///
+    /// - **开**（默认）：按最终出站字节算真值，与官方出口层同一算法。
+    /// - **关**：每请求填一个随机的 5 位小写 hex（形状对、语义不对的旧做法）。
+    pub cch_sim_compute: bool,
     /// 补齐客户端未携带的 `accept-encoding`/`anthropic-version`/`x-client-request-id`。
     pub fill_client_headers: bool,
     /// 合并并按官方顺序重排 `anthropic-beta`（含塞入 oauth beta）。
@@ -3623,6 +3650,8 @@ impl Default for ForwardFlags {
             spoof_device_id: true,
             normalize_device_fp: true,
             billing_cch: true,
+            cch_real_recompute: true,
+            cch_sim_compute: true,
             fill_client_headers: true,
             merge_beta: true,
             system_shape: true,
@@ -12110,6 +12139,8 @@ mod tests {
             (SPOOF_DEVICE_ID, "0"),
             (NORMALIZE_DEVICE_FP, "0"),
             (SPOOF_BILLING_CCH, "false"),
+            (CCH_REAL_RECOMPUTE, "0"),
+            (CCH_SIM_COMPUTE, "0"),
             (FILL_CLIENT_HEADERS, " FALSE "),
             (MERGE_BETA, "False"),
             (SYSTEM_SHAPE, "0"),
@@ -12154,6 +12185,8 @@ mod tests {
                 spoof_device_id: false,
                 normalize_device_fp: false,
                 billing_cch: false,
+                cch_real_recompute: false,
+                cch_sim_compute: false,
                 fill_client_headers: false,
                 merge_beta: false,
                 system_shape: false,

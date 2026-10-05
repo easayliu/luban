@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "luban"
-version = "0.3.198"
+version = "0.3.199"
 dependencies = [
  "anyhow",
  "axum",
@@ -1109,6 +1109,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wreq",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2195,6 +2196,12 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

@@ -1,6 +1,6 @@
 [package]
 name = "luban"
-version = "0.3.198"
+version = "0.3.199"
 edition = "2024"
 
 [dependencies]
@@ -26,6 +26,10 @@ tokio = { version = "1.53.1", features = ["full"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
+# billing header 的 `cch` 是官方 Bun HTTP 出口层对**最终出站 body** 算的 xxHash64 取低 20 位
+# （逆向自 claude-cli 2.1.289，种子 [`proxy::body::CCH_SEED`]）。只用 xxh64 这一个算法，
+# 其余 feature 不开。见 [`proxy::body::compute_cch`]。
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 # wreq 取代 reqwest：**逐头指定大小写**（`OrigHeaderMap`）是 hyper/reqwest 给不出的能力
 # ——hyper 1.x 的 `ext::HeaderCaseMap` 与 reqwest 的 `Request::extensions_mut` 都是
 # `pub(crate)`，两半都够不着，而官方客户端发的是「标准头首字母大写 + SDK 自定义头全小写」

@@ -141,6 +141,19 @@ export function ForwardingSettingsContent() {
     )
   }
 
+  // 模拟的各子项：「模拟 Claude Code」自己又依赖 Beta 标记（后端 merge_beta 关着即不模拟），
+  // 两层都得列上，否则 Beta 一关，子项仍拨得动却不生效。
+  const simulateRequires = [
+    {
+      key: 'simulate_cc' as const,
+      label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
+    },
+    {
+      key: 'merge_beta' as const,
+      label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+    },
+  ]
+
   return (
     <div className="space-y-4">
       <Alert variant="info">
@@ -263,6 +276,22 @@ export function ForwardingSettingsContent() {
             '补齐订阅客户端所需的计费标识。',
             'Add the billing identifier required by subscription clients.',
           )}
+        />
+        <ForwardingToggle
+          k="cch_real_recompute"
+          label={t('官方客户端 · 重算计费校验值', 'Official clients · Recompute billing checksum')}
+          summary={t(
+            '官方客户端的请求体被改写后，按最终发出的请求体重新计算计费标识中的 cch。',
+            'When an official client’s request body has been rewritten, recompute the cch in the billing identifier from the body actually sent.',
+          )}
+          description={
+            <>
+              {t(
+                'cch 是官方客户端在发出请求前，对整条请求体计算的校验值（xxHash64 取低 20 位），请求体改动一个字节它就随之改变。官方客户端自带的 cch 对应的是它自己发出的那份请求体；luban 一旦改写请求体（身份一致性、工具补齐、工具名混淆等），这个值就与实际发往上游的请求体对不上。启用后，请求体被改写过的请求会按最终发出的字节重新计算 cch，luban 替客户端补上的计费标识同样按此计算；未经改写的请求原样转发，自带值本来就是对的。停用后，客户端自带的 cch 原样保留（改写后与请求体不符），luban 补上的那条填入随机值。',
+                'cch is a checksum the official client computes over the whole request body just before sending (the low 20 bits of xxHash64), so it changes whenever a single byte of the body does. The cch an official client sends matches the body it produced; once luban rewrites the body (identity consistency, tool filling, tool name mimicry and so on) that value no longer matches what is actually sent upstream. When enabled, rewritten requests get their cch recomputed from the final outgoing bytes, and the billing identifier luban adds for a client is computed the same way; requests that were not rewritten are forwarded as is, since their own value is already correct. When disabled, the client’s own cch is kept unchanged (no longer matching the rewritten body), and the one luban adds is filled with a random value.',
+              )}
+            </>
+          }
         />
       </SettingsGroup>
 
@@ -475,10 +504,7 @@ export function ForwardingSettingsContent() {
             '模拟请求在基座之后再补上官方的 harness 提示词（约 6,700 字节）；客户端自己的 system 仍单独占最后一块，但回答会受这段官方提示词影响，风格可能随之偏离。',
             'Emulated requests get the official harness prompt, roughly 6.7 KB, after the base block. The client’s own system prompt still occupies the last block on its own, but the official prompt pulls the model’s answers towards its own style.',
           )}
-          requires={{
-            key: 'simulate_cc',
-            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
-          }}
+          requires={simulateRequires}
           description={
             <>
               {t(
@@ -495,10 +521,7 @@ export function ForwardingSettingsContent() {
             '客户端请求完全未携带 tools 时，同样补齐官方主线程的 14 个工具；模型可能调用这些工具，而此类客户端通常无法处理。',
             'When a request carries no tools at all, add the 14 official main-thread tools anyway; the model may call them, and such clients usually cannot handle that.',
           )}
-          requires={{
-            key: 'simulate_cc',
-            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
-          }}
+          requires={simulateRequires}
           description={
             <>
               {t(
@@ -509,16 +532,22 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="cch_sim_compute"
+          label={t('模拟请求计算计费校验值', 'Compute billing checksum for emulated requests')}
+          summary={t(
+            '模拟请求计费标识中的 cch 按最终发出的请求体计算，与官方客户端算法一致；停用时每条请求填入随机值。',
+            'The cch in the billing identifier of emulated requests is computed from the body actually sent, using the official client’s algorithm; when disabled, each request gets a random value.',
+          )}
+          requires={simulateRequires}
+        />
+        <ForwardingToggle
           k="sim_message_threads"
           label={t('按官方 message threads 形态续轮', 'Follow the official message-threads shape')}
           summary={t(
             '模拟的主线程请求携带 thread 字段：一段对话的首轮为 create，此后能与上一轮衔接的续轮为 continue，只发送新增消息；无法衔接时重新 create（fable-5-1 不携带 thread）。每条请求末尾同时补上官方的 total_tokens 剩余量提醒。',
             'Emulated main-thread requests carry a thread field: create on the first turn of a conversation, then continue with only the new messages whenever a turn follows on from the previous one, falling back to create otherwise (fable-5-1 carries no thread). Each request also ends with the official total_tokens remaining reminder.',
           )}
-          requires={{
-            key: 'simulate_cc',
-            label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
-          }}
+          requires={simulateRequires}
           description={
             <>
               {t(
@@ -1224,6 +1253,9 @@ function QuotaPausePct() {
   )
 }
 
+/** 开关的一项前置条件：它关着时本项不生效。 */
+type ForwardingRequire = { key: ForwardingKey; label: string }
+
 /** 单个开关：读写都走 ['settings']，改完让账号列表也失效。 */
 function ForwardingToggle({
   k,
@@ -1241,14 +1273,18 @@ function ForwardingToggle({
    * 故置灰并改写副标题，把这层依赖摆到界面上——否则就是个拨得动、却一动不动的开关。
    * 存储值不动，前置开关一开回来，本项还是原来那个状态。
    */
-  requires?: { key: ForwardingKey; label: string }
+  requires?: ForwardingRequire | ForwardingRequire[]
 }) {
   const { language, t } = useI18n()
   const id = useId()
   const qc = useQueryClient()
   const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const enabled = data?.[k] ?? true
-  const blocked = requires != null && data?.[requires.key] === false
+  // 多层依赖（如模拟子项 → 模拟 → Beta 标记）逐层判，提示第一个关着的。
+  const blockedBy = (Array.isArray(requires) ? requires : requires ? [requires] : []).find(
+    (r) => data?.[r.key] === false,
+  )
+  const blocked = blockedBy != null
 
   const save = useMutation({
     mutationFn: (next: boolean) => setForwarding(k, next),
@@ -1280,7 +1316,7 @@ function ForwardingToggle({
       label={label}
       description={
         blocked
-          ? t(`需先启用「${requires.label}」`, `Enable “${requires.label}” first`)
+          ? t(`需先启用「${blockedBy.label}」`, `Enable “${blockedBy.label}” first`)
           : description
             // 这一行底下已经挂了「影响与限制」，摘要就不再自带第二个展开器：同一个标签下面
             // 一枚文字按钮「了解更多」加一个 details「影响与限制」是两套交互、两种长相。

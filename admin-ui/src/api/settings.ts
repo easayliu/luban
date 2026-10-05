@@ -53,6 +53,10 @@ export interface Settings {
   spoof_identity: boolean
   /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
   billing_cch: boolean
+  /** 真实 CC 来访的 body 被改写后，按最终出站字节重算 cch；关闭时来访自带的 cch 原样保留，luban 补的那条填随机值。 */
+  cch_real_recompute: boolean
+  /** 模拟请求的 cch 按最终出站字节算真值；关闭时每请求填随机值。 */
+  cch_sim_compute: boolean
   /** 补齐客户端未携带的 accept-encoding / anthropic-version / x-client-request-id。 */
   fill_client_headers: boolean
   /** 合并并按官方顺序重排 anthropic-beta（含塞入 oauth-2025-04-20）。 */
@@ -135,6 +139,8 @@ export type ForwardingKey =
   | 'spoof_device_id'
   | 'normalize_device_fp'
   | 'billing_cch'
+  | 'cch_real_recompute'
+  | 'cch_sim_compute'
   | 'fill_client_headers'
   | 'merge_beta'
   | 'system_shape'
