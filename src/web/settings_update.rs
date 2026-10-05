@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// 写一项非负整数设置（负数按 0 存，0 一律表示「不限 / 永不过期」），返回实际写入的值。
+fn save_nonneg(state: &AppState, key: &str, value: i64) -> Result<i64, ApiError> {
+    let value = value.max(0);
+    state.store.set_setting(key, &value.to_string()).map_err(internal)?;
+    Ok(value)
+}
+
 #[derive(Deserialize)]
 pub(super) struct SetApiKeyReq {
     /// 新 key；空串表示清除（关闭鉴权）。
@@ -38,11 +45,7 @@ pub(super) async fn set_device_ttl(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceTtlReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let ttl = req.device_binding_ttl_secs.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEVICE_BINDING_TTL, &ttl.to_string())
-        .map_err(internal)?;
+    save_nonneg(&state, crate::store::DEVICE_BINDING_TTL, req.device_binding_ttl_secs)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -60,11 +63,7 @@ pub(super) async fn set_device_retention(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceRetentionReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let secs = req.device_binding_retention_secs.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEVICE_BINDING_RETENTION, &secs.to_string())
-        .map_err(internal)?;
+    save_nonneg(&state, crate::store::DEVICE_BINDING_RETENTION, req.device_binding_retention_secs)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -79,11 +78,7 @@ pub(super) async fn set_session_ttl(
     State(state): State<AppState>,
     Json(req): Json<SetSessionTtlReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let ttl = req.session_binding_ttl_secs.max(0);
-    state
-        .store
-        .set_setting(crate::store::SESSION_BINDING_TTL, &ttl.to_string())
-        .map_err(internal)?;
+    save_nonneg(&state, crate::store::SESSION_BINDING_TTL, req.session_binding_ttl_secs)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -98,11 +93,11 @@ pub(super) async fn set_session_retention(
     State(state): State<AppState>,
     Json(req): Json<SetSessionRetentionReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let secs = req.session_binding_retention_secs.max(0);
-    state
-        .store
-        .set_setting(crate::store::SESSION_BINDING_RETENTION, &secs.to_string())
-        .map_err(internal)?;
+    save_nonneg(
+        &state,
+        crate::store::SESSION_BINDING_RETENTION,
+        req.session_binding_retention_secs,
+    )?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -117,11 +112,7 @@ pub(super) async fn set_default_device_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultDeviceLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.default_device_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEFAULT_DEVICE_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    save_nonneg(&state, crate::store::DEFAULT_DEVICE_LIMIT, req.default_device_limit)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -136,11 +127,7 @@ pub(super) async fn set_default_session_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultSessionLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.default_session_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEFAULT_SESSION_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    save_nonneg(&state, crate::store::DEFAULT_SESSION_LIMIT, req.default_session_limit)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -155,11 +142,7 @@ pub(super) async fn set_default_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.default_rpm_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEFAULT_RPM_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    let limit = save_nonneg(&state, crate::store::DEFAULT_RPM_LIMIT, req.default_rpm_limit)?;
     tracing::info!(limit, "default rpm limit changed");
     Ok(Json(settings_resp(&state)))
 }
@@ -177,11 +160,7 @@ pub(super) async fn set_device_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.device_rpm_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::DEVICE_RPM_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    let limit = save_nonneg(&state, crate::store::DEVICE_RPM_LIMIT, req.device_rpm_limit)?;
     tracing::info!(limit, "per-device rpm limit changed");
     Ok(Json(settings_resp(&state)))
 }
@@ -201,11 +180,7 @@ pub(super) async fn set_session_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetSessionRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.session_rpm_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::SESSION_RPM_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    let limit = save_nonneg(&state, crate::store::SESSION_RPM_LIMIT, req.session_rpm_limit)?;
     tracing::info!(limit, "per-session rpm limit changed");
     Ok(Json(settings_resp(&state)))
 }
@@ -219,11 +194,11 @@ pub(super) async fn set_session_concurrency_limit(
     State(state): State<AppState>,
     Json(req): Json<SetSessionConcurrencyLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = req.session_concurrency_limit.max(0);
-    state
-        .store
-        .set_setting(crate::store::SESSION_CONCURRENCY_LIMIT, &limit.to_string())
-        .map_err(internal)?;
+    let limit = save_nonneg(
+        &state,
+        crate::store::SESSION_CONCURRENCY_LIMIT,
+        req.session_concurrency_limit,
+    )?;
     tracing::info!(limit, "per-session concurrency limit changed");
     Ok(Json(settings_resp(&state)))
 }
@@ -406,6 +381,28 @@ pub(super) async fn set_latest_cc_release(
     Ok(Json(settings_resp(&state)))
 }
 
+/// prefill / sampling 两项策略共用的写法：`strip`（含空串）是默认值，删键即回到默认；
+/// `reject` / `off` 照存；其余回 400。`field` 是请求里的字段名，报错与日志都用它。
+fn save_strip_policy(state: &AppState, key: &str, field: &str, raw: &str) -> Result<(), ApiError> {
+    let value = raw.trim().to_ascii_lowercase();
+    // 日志沿用原来的口径：`prefill policy` 而非字段名 `prefill_policy`。
+    let label = field.replace('_', " ");
+    match value.as_str() {
+        "" | "strip" => {
+            state.store.delete_setting(key).map_err(internal)?;
+            tracing::info!("{label} reset to default (strip)");
+        }
+        "reject" | "off" => {
+            state.store.set_setting(key, &value).map_err(internal)?;
+            tracing::info!(policy = %value, "{label} changed");
+        }
+        _ => {
+            return Err(bad_request(format!(r#"{field} must be "strip", "reject", or "off""#)));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub(super) struct SetPrefillPolicyReq {
     /// `"strip"` / `"reject"` / `"off"`；空串或缺省回到默认的 `"strip"`。
@@ -416,20 +413,7 @@ pub(super) async fn set_prefill_policy(
     State(state): State<AppState>,
     Json(req): Json<SetPrefillPolicyReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let value = req.prefill_policy.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "" | "strip" => {
-            state.store.delete_setting(crate::store::PREFILL_POLICY).map_err(internal)?;
-            tracing::info!("prefill policy reset to default (strip)");
-        }
-        "reject" | "off" => {
-            state.store.set_setting(crate::store::PREFILL_POLICY, &value).map_err(internal)?;
-            tracing::info!(policy = %value, "prefill policy changed");
-        }
-        _ => {
-            return Err(bad_request(r#"prefill_policy must be "strip", "reject", or "off""#));
-        }
-    }
+    save_strip_policy(&state, crate::store::PREFILL_POLICY, "prefill_policy", &req.prefill_policy)?;
     Ok(Json(settings_resp(&state)))
 }
 
@@ -443,20 +427,12 @@ pub(super) async fn set_sampling_policy(
     State(state): State<AppState>,
     Json(req): Json<SetSamplingPolicyReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let value = req.sampling_policy.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "" | "strip" => {
-            state.store.delete_setting(crate::store::SAMPLING_POLICY).map_err(internal)?;
-            tracing::info!("sampling policy reset to default (strip)");
-        }
-        "reject" | "off" => {
-            state.store.set_setting(crate::store::SAMPLING_POLICY, &value).map_err(internal)?;
-            tracing::info!(policy = %value, "sampling policy changed");
-        }
-        _ => {
-            return Err(bad_request(r#"sampling_policy must be "strip", "reject", or "off""#));
-        }
-    }
+    save_strip_policy(
+        &state,
+        crate::store::SAMPLING_POLICY,
+        "sampling_policy",
+        &req.sampling_policy,
+    )?;
     Ok(Json(settings_resp(&state)))
 }
 

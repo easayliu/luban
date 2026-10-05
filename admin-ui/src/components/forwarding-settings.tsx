@@ -20,7 +20,6 @@ import {
   clearLearnedRejections,
   forgetLearnedGroup,
   forgetLearnedRejection,
-  getSettings,
   listLearnedRejections,
   setForwarding,
   setOauthScopes,
@@ -31,7 +30,6 @@ import {
   type ForwardingKey,
   type LearnedRejection,
   type PolicyValue,
-  type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError, formatFullTime, relativeTime } from '@/lib/utils'
@@ -72,6 +70,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { toastManager } from '@/components/ui/toast'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
+import { useSettingsQuery, useSettingsSave } from '@/components/setting-controls'
 
 /**
  * 转发形态开关。
@@ -112,7 +111,7 @@ export function ForwardingSettings({
 
 export function ForwardingSettingsContent() {
   const { t } = useI18n()
-  const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const settingsQuery = useSettingsQuery()
 
   if (settingsQuery.isPending) {
     return (
@@ -848,40 +847,27 @@ export function ForwardingSettingsContent() {
  * 拦一道就等于把它唯一的用途拦掉；认不认由同意页说。
  */
 function OAuthScopes() {
-  const { language, t } = useI18n()
-  const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState('')
 
   useEffect(() => {
     if (data) setDraft(data.oauth_scopes)
   }, [data?.oauth_scopes])
 
-  const save = useMutation({
-    mutationFn: (scopes: string) => setOauthScopes(scopes),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('登录授权范围已更新', 'Login authorization scopes updated'),
-        description: settings.oauth_scopes === settings.oauth_scopes_default
-          ? t(
-              '已恢复官方默认范围；下次添加账号时生效。',
-              'Restored the official default scopes; effective the next time an account is added.',
-            )
-          : t(
-              `下次添加账号时按这 ${settings.oauth_scopes.split(' ').length} 项申请。`,
-              `The next account added will request these ${settings.oauth_scopes.split(' ').length} scopes.`,
-            ),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((scopes: string) => setOauthScopes(scopes), {
+    success: (settings) => ({
+      title: t('登录授权范围已更新', 'Login authorization scopes updated'),
+      description: settings.oauth_scopes === settings.oauth_scopes_default
+        ? t(
+            '已恢复官方默认范围；下次添加账号时生效。',
+            'Restored the official default scopes; effective the next time an account is added.',
+          )
+        : t(
+            `下次添加账号时按这 ${settings.oauth_scopes.split(' ').length} 项申请。`,
+            `The next account added will request these ${settings.oauth_scopes.split(' ').length} scopes.`,
+          ),
+    }),
   })
 
   const current = data?.oauth_scopes ?? ''
@@ -964,36 +950,28 @@ function PolicySelect({
   value: PolicyValue
   settingKey: PolicyKey
 }) {
-  const { language, t } = useI18n()
+  const { t } = useI18n()
   const id = useId()
-  const qc = useQueryClient()
 
   const items = (Object.keys(POLICY_LABELS) as PolicyValue[]).map((k) => ({
     label: t(POLICY_LABELS[k][0], POLICY_LABELS[k][1]),
     value: k,
   }))
 
-  const save = useMutation({
-    mutationFn: (next: PolicyValue) =>
+  const save = useSettingsSave(
+    (next: PolicyValue) =>
       settingKey === 'prefill' ? setPrefillPolicy(next) : setSamplingPolicy(next),
-    onSuccess: (settings: Settings) => {
-      const v = settingKey === 'prefill' ? settings.prefill_policy : settings.sampling_policy
-      const [zh, en] = POLICY_LABELS[v as PolicyValue] ?? ['', '']
-      toastManager.add({
-        title: t(`${label}：${zh}`, `${label}: ${en}`),
-        description: summary,
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
+    {
+      success: (settings) => {
+        const v = settingKey === 'prefill' ? settings.prefill_policy : settings.sampling_policy
+        const [zh, en] = POLICY_LABELS[v as PolicyValue] ?? ['', '']
+        return {
+          title: t(`${label}：${zh}`, `${label}: ${en}`),
+          description: summary,
+        }
+      },
     },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
+  )
 
   return (
     <SettingsRow
@@ -1026,40 +1004,27 @@ function PolicySelect({
 
 /** 429 后追加尝试的账号数（不含首次请求；0 = 不重试；后端限制在 0~10）。 */
 function RetryMax() {
-  const { language, t } = useI18n()
-  const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState<number | null>(null)
 
   useEffect(() => {
     if (data) setDraft(data.rate_limit_retry_max)
   }, [data?.rate_limit_retry_max])
 
-  const save = useMutation({
-    mutationFn: (count: number) => setRateLimitRetryMax(count),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('429 重试策略已更新', '429 retry policy updated'),
-        description: settings.rate_limit_retry_max > 0
-          ? t(
-              `最多追加尝试 ${settings.rate_limit_retry_max} 个账号。`,
-              `Try up to ${settings.rate_limit_retry_max} additional ${settings.rate_limit_retry_max === 1 ? 'account' : 'accounts'}.`,
-            )
-          : t(
-              '429 将直接透传，不冷却、不换账号。',
-              '429 responses will pass through unchanged, without cooldown or account switching.',
-            ),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((count: number) => setRateLimitRetryMax(count), {
+    success: (settings) => ({
+      title: t('429 重试策略已更新', '429 retry policy updated'),
+      description: settings.rate_limit_retry_max > 0
+        ? t(
+            `最多追加尝试 ${settings.rate_limit_retry_max} 个账号。`,
+            `Try up to ${settings.rate_limit_retry_max} additional ${settings.rate_limit_retry_max === 1 ? 'account' : 'accounts'}.`,
+          )
+        : t(
+            '429 将直接透传，不冷却、不换账号。',
+            '429 responses will pass through unchanged, without cooldown or account switching.',
+          ),
+    }),
   })
 
   const count = Math.min(10, Math.max(0, Math.floor(draft ?? 0)))
@@ -1111,9 +1076,8 @@ function RetryMax() {
  * 判定用的是上游每条响应都带的基础额度窗口使用率，只看 5h/7d 这类基础窗口，不看超额池。
  */
 function QuotaPausePct() {
-  const { language, t } = useI18n()
-  const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState<number | null>(null)
   const [weekDraft, setWeekDraft] = useState<number | null>(null)
 
@@ -1124,41 +1088,35 @@ function QuotaPausePct() {
     }
   }, [data?.quota_pause_pct, data?.quota_pause_pct_7d])
 
-  const save = useMutation({
-    mutationFn: ({ pct, week }: { pct: number; week: number }) => setQuotaPausePct(pct, week),
-    onSuccess: (settings: Settings) => {
-      const parts = [
-        settings.quota_pause_pct > 0
-          ? t(`5 小时窗口 ${settings.quota_pause_pct}%`, `5h window ${settings.quota_pause_pct}%`)
-          : t('5 小时窗口停用', '5h window off'),
-        settings.quota_pause_pct_7d > 0
-          ? t(
-              `7 天窗口 ${settings.quota_pause_pct_7d}%`,
-              `7d window ${settings.quota_pause_pct_7d}%`,
-            )
-          : t('7 天窗口停用', '7d window off'),
-      ]
-      toastManager.add({
-        title: t('提前暂停调度阈值已更新', 'Early pause threshold updated'),
-        description: settings.quota_pause_pct > 0 || settings.quota_pause_pct_7d > 0
-          ? t(`${parts.join(' · ')}。`, `${parts.join(' · ')}.`)
-          : t(
-              '两档均已停用：账号将持续参与调度，直至实际收到 429。',
-              'Both thresholds are off: accounts keep taking traffic until they actually get a 429.',
-            ),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
+  const save = useSettingsSave(
+    ({ pct, week }: { pct: number; week: number }) =>
+      setQuotaPausePct(pct, week),
+    {
+      invalidateCredentials: true,
+      success: (settings) => {
+        const parts = [
+          settings.quota_pause_pct > 0
+            ? t(`5 小时窗口 ${settings.quota_pause_pct}%`, `5h window ${settings.quota_pause_pct}%`)
+            : t('5 小时窗口停用', '5h window off'),
+          settings.quota_pause_pct_7d > 0
+            ? t(
+                `7 天窗口 ${settings.quota_pause_pct_7d}%`,
+                `7d window ${settings.quota_pause_pct_7d}%`,
+              )
+            : t('7 天窗口停用', '7d window off'),
+        ]
+        return {
+          title: t('提前暂停调度阈值已更新', 'Early pause threshold updated'),
+          description: settings.quota_pause_pct > 0 || settings.quota_pause_pct_7d > 0
+            ? t(`${parts.join(' · ')}。`, `${parts.join(' · ')}.`)
+            : t(
+                '两档均已停用：账号将持续参与调度，直至实际收到 429。',
+                'Both thresholds are off: accounts keep taking traffic until they actually get a 429.',
+              ),
+        }
+      },
     },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
+  )
 
   const clamp = (v: number | null) => Math.min(100, Math.max(0, Math.floor(v ?? 0)))
   const pct = clamp(draft)
@@ -1275,10 +1233,9 @@ function ForwardingToggle({
    */
   requires?: ForwardingRequire | ForwardingRequire[]
 }) {
-  const { language, t } = useI18n()
+  const { t } = useI18n()
   const id = useId()
-  const qc = useQueryClient()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { data } = useSettingsQuery()
   const enabled = data?.[k] ?? true
   // 多层依赖（如模拟子项 → 模拟 → Beta 标记）逐层判，提示第一个关着的。
   const blockedBy = (Array.isArray(requires) ? requires : requires ? [requires] : []).find(
@@ -1286,26 +1243,14 @@ function ForwardingToggle({
   )
   const blocked = blockedBy != null
 
-  const save = useMutation({
-    mutationFn: (next: boolean) => setForwarding(k, next),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: settings[k]
-          ? t(`${label}已启用`, `${label} enabled`)
-          : t(`${label}已停用`, `${label} disabled`),
-        description: summary,
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((next: boolean) => setForwarding(k, next), {
+    invalidateCredentials: true,
+    success: (settings) => ({
+      title: settings[k]
+        ? t(`${label}已启用`, `${label} enabled`)
+        : t(`${label}已停用`, `${label} disabled`),
+      description: summary,
+    }),
   })
 
   return (

@@ -19,7 +19,6 @@ import {
   Trash2Icon,
 } from 'lucide-react'
 import {
-  getSettings,
   setApiKey,
   setBareRateLimit,
   setDefaultDeviceLimit,
@@ -75,17 +74,16 @@ import {
   NumberFieldIncrement,
   NumberFieldInput,
 } from '@/components/ui/number-field'
-import {
-  Select,
-  SelectItem,
-  SelectPopup,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
+import {
+  DurationSetting,
+  NumericSetting,
+  useSettingsQuery,
+  useSettingsSave,
+} from '@/components/setting-controls'
 
 export function AccessSettings({
   open,
@@ -120,9 +118,8 @@ export function AccessSettings({
 }
 
 export function AccessSettingsContent() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const settingsQuery = useSettingsQuery()
   const { data } = settingsQuery
 
   const [draft, setDraft] = useState('')
@@ -136,28 +133,18 @@ export function AccessSettingsContent() {
     setRevealedSnippetKey(null)
   }, [data?.api_key])
 
-  const save = useMutation({
-    mutationFn: (key: string) => setApiKey(key),
-    onSuccess: (settings: Settings) => {
+  const save = useSettingsSave((key: string) => setApiKey(key), {
+    onSuccess: () => {
       setClearKeyOpen(false)
-      toastManager.add({
-        title: settings.api_key
-          ? t('接入 Key 已保存', 'Access key saved')
-          : t('接入 Key 已清除', 'Access key cleared'),
-        description: settings.api_key
-          ? t('新的客户端接入 Key 已生效。', 'The new client access key is now active.')
-          : t('代理将不再校验客户端请求。', 'The proxy will no longer authenticate client requests.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
     },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+    success: (settings) => ({
+      title: settings.api_key
+        ? t('接入 Key 已保存', 'Access key saved')
+        : t('接入 Key 已清除', 'Access key cleared'),
+      description: settings.api_key
+        ? t('新的客户端接入 Key 已生效。', 'The new client access key is now active.')
+        : t('代理将不再校验客户端请求。', 'The proxy will no longer authenticate client requests.'),
+    }),
   })
 
   const baseUrl = window.location.origin
@@ -413,7 +400,7 @@ export function AccessSettingsContent() {
 
 export function DeviceSettingsContent() {
   const { t } = useI18n()
-  const settingsQuery = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const settingsQuery = useSettingsQuery()
 
   if (settingsQuery.isPending) {
     return (
@@ -543,181 +530,41 @@ export function SecuritySettingsContent() {
   )
 }
 
-const SECS_PER_MINUTE = 60
-const SECS_PER_HOUR = 3600
-const SECS_PER_DAY = 86400
-
-/**
- * 秒 → 以 `size` 秒为单位的数值，取能**原样还原**的最短小数位。
- *
- * 604800 按天给 7、43200 按天给 0.5；而除不尽的（只可能来自接口直接改的库）任何短写法都
- * 还原不回去，就照实给完整小数——宁可难看，也不能让用户一按保存就把一个自己没动过的值
- * 悄悄改掉。
- */
-function secsIn(secs: number, size: number): number {
-  const exact = secs / size
-  for (const digits of [0, 1, 2, 3]) {
-    const rounded = Number(exact.toFixed(digits))
-    if (Math.round(rounded * size) === secs) return rounded
-  }
-  return exact
-}
-
-type DurationUnit = 'minute' | 'hour' | 'day'
-
-const UNIT_SECS: Record<DurationUnit, number> = {
-  minute: SECS_PER_MINUTE,
-  hour: SECS_PER_HOUR,
-  day: SECS_PER_DAY,
-}
-
-/**
- * 秒 → 输入框里的「数值 + 单位」：取能整除的最大单位（3600 显示成 1 小时、1800 显示成
- * 30 分钟）；连分钟都除不尽的落到分钟带小数。0 没有「合适的单位」，用这一项惯常的量级。
- */
-function splitDuration(secs: number, fallback: DurationUnit): { value: number; unit: DurationUnit } {
-  if (secs <= 0) return { value: 0, unit: fallback }
-  const unit = (['day', 'hour', 'minute'] as const).find((u) => secs % UNIT_SECS[u] === 0) ?? 'minute'
-  return { value: secsIn(secs, UNIT_SECS[unit]), unit }
-}
-
-/** 「数值 + 单位」→ 秒；空值与负数按 0。 */
-function joinDuration(value: number | null, unit: DurationUnit): number {
-  return Math.max(0, Math.round((value ?? 0) * UNIT_SECS[unit]))
-}
-
-/**
- * 带单位切换的时长输入：数值框 + 分钟 / 小时 / 天。切换单位只换单位、不换算数值
- * （30 分钟切到小时就是 30 小时），旁边的读数徽章会跟着显示换算后的时长。
- * `label` 传当前语言下的名称，英文用小写开头，会拼进「减少 / 增加」的读屏标签里。
- */
-function DurationField({
-  label,
-  value,
-  unit,
-  onValueChange,
-  onUnitChange,
-}: {
-  label: string
-  value: number | null
-  unit: DurationUnit
-  onValueChange: (value: number | null) => void
-  onUnitChange: (unit: DurationUnit) => void
-}) {
-  const { t } = useI18n()
-  const units: { value: DurationUnit; label: string }[] = [
-    { value: 'minute', label: t('分钟', 'Minutes') },
-    { value: 'hour', label: t('小时', 'Hours') },
-    { value: 'day', label: t('天', 'Days') },
-  ]
-
-  return (
-    <>
-      <NumberField
-        className="min-w-0 flex-1 sm:w-32 sm:flex-none"
-        min={0}
-        step={1}
-        smallStep={0.5}
-        value={value}
-        onValueChange={onValueChange}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t(`减少${label}`, `Decrease ${label}`)} />
-          <NumberFieldInput aria-label={label} />
-          <NumberFieldIncrement aria-label={t(`增加${label}`, `Increase ${label}`)} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Select
-        items={units}
-        value={unit}
-        onValueChange={(next) => {
-          if (next) onUnitChange(next)
-        }}
-      >
-        <SelectTrigger className="w-auto min-w-20 shrink-0" aria-label={t(`${label}单位`, `${label} unit`)}>
-          <SelectValue />
-        </SelectTrigger>
-        {/* 默认的 alignItemWithTrigger 会把选中项叠到触发框上，弹层整块盖住左边的数值框；这里改成在下方展开。 */}
-        <SelectPopup alignItemWithTrigger={false}>
-          {units.map((u) => (
-            <SelectItem key={u.value} value={u.value}>{u.label}</SelectItem>
-          ))}
-        </SelectPopup>
-      </Select>
-    </>
-  )
-}
-
 /** 设备绑定有效期：设备超过该时长无请求即释放名额（绑定本身按保留期留着）。0 = 永不过期。 */
 function DeviceBindingTtl() {
-  const qc = useQueryClient()
   const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-  const [unit, setUnit] = useState<DurationUnit>('hour')
-
-  useEffect(() => {
-    if (!data) return
-    const d = splitDuration(data.device_binding_ttl_secs, 'hour')
-    setDraft(d.value)
-    setUnit(d.unit)
-  }, [data?.device_binding_ttl_secs])
-
-  const save = useMutation({
-    mutationFn: (seconds: number) => setDeviceTtl(seconds),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('设备策略已更新', 'Device policy updated'),
-        description: t('设备绑定有效期已保存。', 'The device binding lifetime has been saved.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.device_binding_ttl_secs ?? 0
-  const parsed = joinDuration(draft, unit)
-  const hint = parsed > 0
-    ? t(
-        `闲置 ${formatDuration(parsed, language)} 后释放名额`,
-        `Releases the slot after ${formatDuration(parsed, language)} idle`,
-      )
-    : t('名额不自动释放', 'Slots are not released automatically')
-
   return (
-    <SettingsRow
+    <DurationSetting
+      field="device_binding_ttl_secs"
+      save={setDeviceTtl}
+      defaultUnit="hour"
+      invalidateCredentials
       label={t('活跃名额有效期', 'Active slot lifetime')}
       description={t(
         '设备在此时长内无请求时，释放其占用的账号名额；与原账号的关联仍按保留期保留。',
         'A device releases its account slot after this much inactivity; its affinity with the original account is still kept for the retention period.',
       )}
-      note={<Badge variant="secondary" size="sm">{hint}</Badge>}
-    >
-      <DurationField
-        label={t('活跃名额有效期', 'active slot lifetime')}
-        value={draft}
-        unit={unit}
-        onValueChange={setDraft}
-        onUnitChange={setUnit}
-      />
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      note={(parsed) => (
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(
+                `闲置 ${formatDuration(parsed, language)} 后释放名额`,
+                `Releases the slot after ${formatDuration(parsed, language)} idle`,
+              )
+            : t('名额不自动释放', 'Slots are not released automatically')}
+        </Badge>
+      )}
+      success={() => ({
+        title: t('设备策略已更新', 'Device policy updated'),
+        description: t('设备绑定有效期已保存。', 'The device binding lifetime has been saved.'),
+      })}
+    />
   )
+}
+
+/** 保留期短于有效期是自相矛盾的配置，后端会按有效期兜底（等于关掉软绑定），界面先提示一句。 */
+function retentionConflict(retention: number, ttl: number): boolean {
+  return retention > 0 && ttl > 0 && retention < ttl
 }
 
 /**
@@ -725,83 +572,44 @@ function DeviceBindingTtl() {
  * （原账号还得有空位）。0 = 永久保留。
  */
 function DeviceBindingRetention() {
-  const qc = useQueryClient()
   const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   // 默认按天填：保留期通常是「几天几周」这个量级；要调到分钟级（比如设备频繁换号、希望
   // 绑定尽快清掉）就切单位。接口仍收秒，单位只是这一格的输入方式。
-  const [draft, setDraft] = useState<number | null>(null)
-  const [unit, setUnit] = useState<DurationUnit>('day')
-
-  useEffect(() => {
-    if (!data) return
-    const d = splitDuration(data.device_binding_retention_secs, 'day')
-    setDraft(d.value)
-    setUnit(d.unit)
-  }, [data?.device_binding_retention_secs])
-
-  const save = useMutation({
-    mutationFn: (seconds: number) => setDeviceRetention(seconds),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  return (
+    <DurationSetting
+      field="device_binding_retention_secs"
+      save={setDeviceRetention}
+      defaultUnit="day"
+      invalidateCredentials
+      label={t('原账号关联保留期', 'Account affinity retention')}
+      description={(parsed, data) =>
+        retentionConflict(parsed, data?.device_binding_ttl_secs ?? 0)
+          ? t(
+              '保留期短于有效期时按有效期计算，相当于停用软绑定。',
+              'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+            )
+          : t(
+              '名额释放后，设备在此期限内再次请求时仍优先使用原账号，以减少 thinking 签名跨账号导致的降级重试。',
+              'After its slot is released, a device that returns within this period still prefers its original account, reducing downgrade retries caused by thinking signatures crossing accounts.',
+            )}
+      note={(parsed, data) => (
+        <Badge
+          variant={retentionConflict(parsed, data?.device_binding_ttl_secs ?? 0) ? 'warning' : 'secondary'}
+          size="sm"
+        >
+          {parsed > 0
+            ? t(
+                `优先使用原账号：${formatDuration(parsed, language)}`,
+                `Prefer the original account for ${formatDuration(parsed, language)}`,
+              )
+            : t('始终优先使用原账号', 'Always prefer the original account')}
+        </Badge>
+      )}
+      success={() => ({
         title: t('设备策略已更新', 'Device policy updated'),
         description: t('原账号关联保留期已保存。', 'The account affinity retention has been saved.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.device_binding_retention_secs ?? 0
-  const ttl = data?.device_binding_ttl_secs ?? 0
-  const parsed = joinDuration(draft, unit)
-  const hint = parsed > 0
-    ? t(
-        `优先使用原账号：${formatDuration(parsed, language)}`,
-        `Prefer the original account for ${formatDuration(parsed, language)}`,
-      )
-    : t('始终优先使用原账号', 'Always prefer the original account')
-  // 保留期短于有效期是自相矛盾的配置，后端会按有效期兜底（等于关掉软绑定），这里先提示一句。
-  const conflict = parsed > 0 && ttl > 0 && parsed < ttl
-
-  return (
-    <SettingsRow
-      label={t('原账号关联保留期', 'Account affinity retention')}
-      description={conflict
-        ? t(
-            '保留期短于有效期时按有效期计算，相当于停用软绑定。',
-            'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
-          )
-        : t(
-            '名额释放后，设备在此期限内再次请求时仍优先使用原账号，以减少 thinking 签名跨账号导致的降级重试。',
-            'After its slot is released, a device that returns within this period still prefers its original account, reducing downgrade retries caused by thinking signatures crossing accounts.',
-          )}
-      note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
-    >
-      <DurationField
-        label={t('原账号关联保留期', 'account affinity retention')}
-        value={draft}
-        unit={unit}
-        onValueChange={setDraft}
-        onUnitChange={setUnit}
-      />
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
@@ -810,50 +618,13 @@ function DeviceBindingRetention() {
  * 绑定本身按会话保留期留着。与设备那一项分开配：设备是一台机器，会话是一段对话。0 = 永不过期。
  */
 function SessionBindingTtl() {
-  const qc = useQueryClient()
   const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-  const [unit, setUnit] = useState<DurationUnit>('minute')
-
-  useEffect(() => {
-    if (!data) return
-    const d = splitDuration(data.session_binding_ttl_secs, 'minute')
-    setDraft(d.value)
-    setUnit(d.unit)
-  }, [data?.session_binding_ttl_secs])
-
-  const save = useMutation({
-    mutationFn: (seconds: number) => setSessionTtl(seconds),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('会话策略已更新', 'Session policy updated'),
-        description: t('会话有效期已保存。', 'The session lifetime has been saved.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.session_binding_ttl_secs ?? 0
-  const parsed = joinDuration(draft, unit)
-  const hint = parsed > 0
-    ? t(
-        `对话闲置 ${formatDuration(parsed, language)} 后释放槽位`,
-        `Frees the slot after ${formatDuration(parsed, language)} idle`,
-      )
-    : t('槽位不自动释放', 'Slots are not released automatically')
-
   return (
-    <SettingsRow
+    <DurationSetting
+      field="session_binding_ttl_secs"
+      save={setSessionTtl}
+      defaultUnit="minute"
+      invalidateCredentials
       label={t('会话有效期', 'Session lifetime')}
       description={
         <ClampedDescription text={t(
@@ -861,153 +632,79 @@ function SessionBindingTtl() {
           'A conversation frees its session slot after this much inactivity; on the simulation path its session ID is then reused by the next conversation. Affinity with the original account is kept for the retention period below. This is configured separately from the device lifetime: a device is a machine, a session is one conversation.',
         )} />
       }
-      note={<Badge variant="secondary" size="sm">{hint}</Badge>}
-    >
-      <DurationField
-        label={t('会话有效期', 'session lifetime')}
-        value={draft}
-        unit={unit}
-        onValueChange={setDraft}
-        onUnitChange={setUnit}
-      />
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      note={(parsed) => (
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(
+                `对话闲置 ${formatDuration(parsed, language)} 后释放槽位`,
+                `Frees the slot after ${formatDuration(parsed, language)} idle`,
+              )
+            : t('槽位不自动释放', 'Slots are not released automatically')}
+        </Badge>
+      )}
+      success={() => ({
+        title: t('会话策略已更新', 'Session policy updated'),
+        description: t('会话有效期已保存。', 'The session lifetime has been saved.'),
+      })}
+    />
   )
 }
 
 /** 模拟会话的原账号关联保留期：槽位释放后，对话在此期限内回来仍优先回原号。0 = 永久保留。 */
 function SessionBindingRetention() {
-  const qc = useQueryClient()
   const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-  const [unit, setUnit] = useState<DurationUnit>('day')
-
-  useEffect(() => {
-    if (!data) return
-    const d = splitDuration(data.session_binding_retention_secs, 'day')
-    setDraft(d.value)
-    setUnit(d.unit)
-  }, [data?.session_binding_retention_secs])
-
-  const save = useMutation({
-    mutationFn: (seconds: number) => setSessionRetention(seconds),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  return (
+    <DurationSetting
+      field="session_binding_retention_secs"
+      save={setSessionRetention}
+      defaultUnit="day"
+      invalidateCredentials
+      label={t('会话原账号关联保留期', 'Session affinity retention')}
+      description={(parsed, data) =>
+        retentionConflict(parsed, data?.session_binding_ttl_secs ?? 0)
+          ? t(
+              '保留期短于有效期时按有效期计算，相当于停用软绑定。',
+              'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
+            )
+          : t(
+              '名额释放后，对话在此期限内再次请求时仍优先使用原账号（经模拟路径的对话在原槽位空闲时回到原槽位，会话 ID 不变）；过期后清除绑定记录，此后的请求按新对话处理。',
+              'After its slot is freed, a conversation that returns within this period still prefers its original account (on the simulation path it also gets its old slot back if that is free, keeping the same session ID); after this period the binding is removed and the conversation is treated as new.',
+            )}
+      note={(parsed, data) => (
+        <Badge
+          variant={retentionConflict(parsed, data?.session_binding_ttl_secs ?? 0) ? 'warning' : 'secondary'}
+          size="sm"
+        >
+          {parsed > 0
+            ? t(
+                `优先使用原账号：${formatDuration(parsed, language)}`,
+                `Prefer the original account for ${formatDuration(parsed, language)}`,
+              )
+            : t('始终优先使用原账号', 'Always prefer the original account')}
+        </Badge>
+      )}
+      success={() => ({
         title: t('会话策略已更新', 'Session policy updated'),
         description: t('会话的原账号关联保留期已保存。', 'The session affinity retention has been saved.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.session_binding_retention_secs ?? 0
-  const ttl = data?.session_binding_ttl_secs ?? 0
-  const parsed = joinDuration(draft, unit)
-  const hint = parsed > 0
-    ? t(
-        `优先使用原账号：${formatDuration(parsed, language)}`,
-        `Prefer the original account for ${formatDuration(parsed, language)}`,
-      )
-    : t('始终优先使用原账号', 'Always prefer the original account')
-  const conflict = parsed > 0 && ttl > 0 && parsed < ttl
-
-  return (
-    <SettingsRow
-      label={t('会话原账号关联保留期', 'Session affinity retention')}
-      description={conflict
-        ? t(
-            '保留期短于有效期时按有效期计算，相当于停用软绑定。',
-            'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
-          )
-        : t(
-            '名额释放后，对话在此期限内再次请求时仍优先使用原账号（经模拟路径的对话在原槽位空闲时回到原槽位，会话 ID 不变）；过期后清除绑定记录，此后的请求按新对话处理。',
-            'After its slot is freed, a conversation that returns within this period still prefers its original account (on the simulation path it also gets its old slot back if that is free, keeping the same session ID); after this period the binding is removed and the conversation is treated as new.',
-          )}
-      note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
-    >
-      <DurationField
-        label={t('会话原账号关联保留期', 'session affinity retention')}
-        value={draft}
-        unit={unit}
-        onValueChange={setDraft}
-        onUnitChange={setUnit}
-      />
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
 /** 全局默认设备上限：账号未单独配置时套用。 */
 function DefaultDeviceLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.default_device_limit)
-  }, [data?.default_device_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setDefaultDeviceLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('默认设备上限已更新', 'Default device limit updated'),
-        description: settings.default_device_limit > 0
-          ? t(
-              `每个账号最多绑定 ${settings.default_device_limit} 台设备。`,
-              `Each account can bind up to ${settings.default_device_limit} ${settings.default_device_limit === 1 ? 'device' : 'devices'}.`,
-            )
-          : t('默认设备上限已取消。', 'The default device limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.default_device_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-
+  const { t } = useI18n()
   return (
-    <SettingsRow
+    <NumericSetting
+      field="default_device_limit"
+      save={setDefaultDeviceLimit}
+      invalidateCredentials
       label={t('默认设备上限', 'Default device limit')}
       description={t(
         '未单独配置的账号使用此上限；账号独立设置优先。',
         'Accounts without an individual limit use this value; account-specific settings take priority.',
       )}
-      note={
+      note={(parsed) => (
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary" size="sm">
             {parsed > 0
@@ -1018,51 +715,41 @@ function DefaultDeviceLimit() {
               : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
           </Badge>
         </div>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement
-            aria-label={t('减少默认设备上限', 'Decrease default device limit')}
-          />
-          <NumberFieldInput aria-label={t('默认设备上限', 'Default device limit')} />
-          <NumberFieldIncrement
-            aria-label={t('增加默认设备上限', 'Increase default device limit')}
-          />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      )}
+      success={(settings) => ({
+        title: t('默认设备上限已更新', 'Default device limit updated'),
+        description: settings.default_device_limit > 0
+          ? t(
+              `每个账号最多绑定 ${settings.default_device_limit} 台设备。`,
+              `Each account can bind up to ${settings.default_device_limit} ${settings.default_device_limit === 1 ? 'device' : 'devices'}.`,
+            )
+          : t('默认设备上限已取消。', 'The default device limit has been removed.'),
+      })}
+    />
   )
 }
 
 /** 全局默认会话上限：账号未单独配置时套用。设备上限不生效时的真实客户端与模拟路径上没有设备身份的来访都按它算。 */
 function DefaultSessionLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.default_session_limit)
-  }, [data?.default_session_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setDefaultSessionLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  const { t } = useI18n()
+  return (
+    <NumericSetting
+      field="default_session_limit"
+      save={setDefaultSessionLimit}
+      invalidateCredentials
+      label={t('默认会话上限', 'Default session limit')}
+      description={t(
+        '每个对话绑定一个账号并占用一个名额。真实客户端按其自带的会话 ID 识别对话，同一台设备的新会话优先使用该设备上次的账号；Claude Code 启动时的额度探测不占名额。经模拟路径、没有设备身份的请求优先按自带的会话 ID 识别对话，缺失时按缓存前缀与首条用户消息识别，其出站会话 ID 由槽位派生、释放后复用。有效期与原账号关联保留期沿用上方两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。名额用尽后，新会话分流到其他账号；所有账号均用尽时，请求返回 429。',
+        'Each conversation binds to an account and takes one slot. Real clients are identified by their own session ID, and a device\'s new sessions prefer the account it used last; the quota probe Claude Code sends at startup takes no slot. Requests on the simulation path without a device identity are identified by their own session ID, or failing that by the cache prefix plus the first user message; their outbound session ID is derived from the slot and reused once it is freed. Lifetime and affinity follow the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once an account is full, new sessions go to another account; when every account is full they get a 429.',
+      )}
+      note={(parsed) => (
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(`每个账号最多 ${parsed} 条活跃会话`, `Up to ${parsed} active ${parsed === 1 ? 'session' : 'sessions'} per account`)
+            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+        </Badge>
+      )}
+      success={(settings) => ({
         title: t('默认会话上限已更新', 'Default session limit updated'),
         description: settings.default_session_limit > 0
           ? t(
@@ -1070,59 +757,8 @@ function DefaultSessionLimit() {
               `Each account can keep up to ${settings.default_session_limit} active ${settings.default_session_limit === 1 ? 'session' : 'sessions'}.`,
             )
           : t('默认会话上限已取消。', 'The default session limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.default_session_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-
-  return (
-    <SettingsRow
-      label={t('默认会话上限', 'Default session limit')}
-      description={t(
-        '每个对话绑定一个账号并占用一个名额。真实客户端按其自带的会话 ID 识别对话，同一台设备的新会话优先使用该设备上次的账号；Claude Code 启动时的额度探测不占名额。经模拟路径、没有设备身份的请求优先按自带的会话 ID 识别对话，缺失时按缓存前缀与首条用户消息识别，其出站会话 ID 由槽位派生、释放后复用。有效期与原账号关联保留期沿用上方两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。名额用尽后，新会话分流到其他账号；所有账号均用尽时，请求返回 429。',
-        'Each conversation binds to an account and takes one slot. Real clients are identified by their own session ID, and a device\'s new sessions prefer the account it used last; the quota probe Claude Code sends at startup takes no slot. Requests on the simulation path without a device identity are identified by their own session ID, or failing that by the cache prefix plus the first user message; their outbound session ID is derived from the slot and reused once it is freed. Lifetime and affinity follow the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once an account is full, new sessions go to another account; when every account is full they get a 429.',
-      )}
-      note={
-        <Badge variant="secondary" size="sm">
-          {parsed > 0
-            ? t(`每个账号最多 ${parsed} 条活跃会话`, `Up to ${parsed} active ${parsed === 1 ? 'session' : 'sessions'} per account`)
-            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
-        </Badge>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少默认会话上限', 'Decrease default session limit')} />
-          <NumberFieldInput aria-label={t('默认会话上限', 'Default session limit')} />
-          <NumberFieldIncrement aria-label={t('增加默认会话上限', 'Increase default session limit')} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
@@ -1133,19 +769,25 @@ function DefaultSessionLimit() {
  * 所以「上限 30」和「当前 12」可以直接比。
  */
 function DefaultRpmLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.default_rpm_limit)
-  }, [data?.default_rpm_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setDefaultRpmLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  const { t } = useI18n()
+  return (
+    <NumericSetting
+      field="default_rpm_limit"
+      save={setDefaultRpmLimit}
+      invalidateCredentials
+      label={t('默认 RPM 上限', 'Default RPM limit')}
+      description={t(
+        '未单独配置的账号使用此上限；账号独立设置优先。达到上限后新请求分流到其他账号，已绑定的设备收到 429 与 retry-after。',
+        'Accounts without an individual limit use this value; account-specific settings take priority. Once the limit is reached, new requests go to another account and already-bound devices get a 429 with retry-after.',
+      )}
+      note={(parsed) => (
+        <Badge variant="secondary" size="sm">
+          {parsed > 0
+            ? t(`每个账号每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per account`)
+            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+        </Badge>
+      )}
+      success={(settings) => ({
         title: t('默认 RPM 上限已更新', 'Default RPM limit updated'),
         description: settings.default_rpm_limit > 0
           ? t(
@@ -1153,59 +795,8 @@ function DefaultRpmLimit() {
               `Each account forwards at most ${settings.default_rpm_limit} requests per minute.`,
             )
           : t('默认 RPM 上限已取消。', 'The default RPM limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-      qc.invalidateQueries({ queryKey: ['credentials'] })
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.default_rpm_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-
-  return (
-    <SettingsRow
-      label={t('默认 RPM 上限', 'Default RPM limit')}
-      description={t(
-        '未单独配置的账号使用此上限；账号独立设置优先。达到上限后新请求分流到其他账号，已绑定的设备收到 429 与 retry-after。',
-        'Accounts without an individual limit use this value; account-specific settings take priority. Once the limit is reached, new requests go to another account and already-bound devices get a 429 with retry-after.',
-      )}
-      note={
-        <Badge variant="secondary" size="sm">
-          {parsed > 0
-            ? t(`每个账号每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per account`)
-            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
-        </Badge>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少默认 RPM 上限', 'Decrease default RPM limit')} />
-          <NumberFieldInput aria-label={t('默认 RPM 上限', 'Default RPM limit')} />
-          <NumberFieldIncrement aria-label={t('增加默认 RPM 上限', 'Increase default RPM limit')} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
@@ -1216,19 +807,35 @@ function DefaultRpmLimit() {
  * 其他设备的额度挤没」。两道都配了的话一条请求要先过设备、再过账号。
  */
 function DeviceRpmLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.device_rpm_limit)
-  }, [data?.device_rpm_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setDeviceRpmLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  const { t } = useI18n()
+  return (
+    <NumericSetting
+      field="device_rpm_limit"
+      save={setDeviceRpmLimit}
+      label={t('设备 RPM 上限', 'Per-device RPM limit')}
+      description={t(
+        '单台设备每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。超出时不切换账号，因为无论切换到哪个账号，持续发送请求的都是同一台机器。0 表示不限。',
+        'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. The request is not moved to another account: whichever account it lands on, it is the same machine sending the requests. 0 means unlimited.',
+      )}
+      note={(parsed, data) => {
+        // 关掉设备身份校验后，裸请求没有 device_id，落不进设备的桶——这时只有裸请求速率上限管得着。
+        const bareAllowed = data?.require_device_id === false
+        return (
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="secondary" size="sm">
+              {parsed > 0
+                ? t(`每台设备每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per device`)
+                : t('不限', 'Unlimited')}
+            </Badge>
+            {parsed > 0 && bareAllowed && (
+              <Badge variant="warning" size="sm">
+                {t('无设备身份请求不受此上限约束', 'Requests without device identity bypass this limit')}
+              </Badge>
+            )}
+          </div>
+        )
+      }}
+      success={(settings) => ({
         title: t('设备 RPM 上限已更新', 'Per-device RPM limit updated'),
         description: settings.device_rpm_limit > 0
           ? t(
@@ -1236,67 +843,8 @@ function DeviceRpmLimit() {
               `Each device forwards at most ${settings.device_rpm_limit} requests per minute.`,
             )
           : t('设备 RPM 上限已取消。', 'The per-device RPM limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.device_rpm_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-  // 关掉设备身份校验后，裸请求没有 device_id，落不进设备的桶——这时只有裸请求速率上限管得着。
-  const bareAllowed = data?.require_device_id === false
-
-  return (
-    <SettingsRow
-      label={t('设备 RPM 上限', 'Per-device RPM limit')}
-      description={t(
-        '单台设备每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。超出时不切换账号，因为无论切换到哪个账号，持续发送请求的都是同一台机器。0 表示不限。',
-        'How many requests a single device may forward per minute; beyond that it gets a 429 with retry-after. The request is not moved to another account: whichever account it lands on, it is the same machine sending the requests. 0 means unlimited.',
-      )}
-      note={
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="secondary" size="sm">
-            {parsed > 0
-              ? t(`每台设备每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per device`)
-              : t('不限', 'Unlimited')}
-          </Badge>
-          {parsed > 0 && bareAllowed && (
-            <Badge variant="warning" size="sm">
-              {t('无设备身份请求不受此上限约束', 'Requests without device identity bypass this limit')}
-            </Badge>
-          )}
-        </div>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少设备 RPM 上限', 'Decrease per-device RPM limit')} />
-          <NumberFieldInput aria-label={t('设备 RPM 上限', 'Per-device RPM limit')} />
-          <NumberFieldIncrement aria-label={t('增加设备 RPM 上限', 'Increase per-device RPM limit')} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
@@ -1308,19 +856,47 @@ function DeviceRpmLimit() {
  * 所以它替代不了设备闸——两道一起配，会话给贴合单个对话节奏的值，设备给它的几倍兜总量。
  */
 function SessionRpmLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.session_rpm_limit)
-  }, [data?.session_rpm_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setSessionRpmLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  const { t } = useI18n()
+  return (
+    <NumericSetting
+      field="session_rpm_limit"
+      save={setSessionRpmLimit}
+      label={t('会话 RPM 上限', 'Per-session RPM limit')}
+      description={t(
+        '单个会话每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。此项比设备 RPM 上限粒度更细：同一台机器上的多个会话各自计算额度，互不挤占。0 表示不限。',
+        'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. It is one level finer than the per-device limit: sessions on the same machine each get their own budget instead of competing for one. 0 means unlimited.',
+      )}
+      note={(parsed, data) => {
+        const deviceLimit = data?.device_rpm_limit ?? 0
+        // 两种配错法各提示一句，都不代为改数字：改与不改是运维的判断，替他改比让他看见更糟。
+        // 1) 设备闸没配：客户端换个会话 id 就是满血的新桶，这道闸等于没有护栏。
+        const noDeviceBackstop = parsed > 0 && deviceLimit === 0
+        // 2) 设备上限不比会话大：设备的桶总是先满，会话这道永远轮不到判定，等于白配。
+        const shadowedByDevice = parsed > 0 && deviceLimit > 0 && deviceLimit <= parsed
+        return (
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="secondary" size="sm">
+              {parsed > 0
+                ? t(`每个会话每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per session`)
+                : t('不限', 'Unlimited')}
+            </Badge>
+            {noDeviceBackstop && (
+              <Badge variant="warning" size="sm">
+                {t('更换会话 ID 即可绕过此限制，建议同时配置设备 RPM 上限', 'A new session ID bypasses this; set a per-device limit too')}
+              </Badge>
+            )}
+            {shadowedByDevice && (
+              <Badge variant="warning" size="sm">
+                {t(
+                  `设备 RPM 上限（${deviceLimit}）总会先触发，此项不会生效`,
+                  `The per-device limit of ${deviceLimit} always trips first, so this limit never applies`,
+                )}
+              </Badge>
+            )}
+          </div>
+        )
+      }}
+      success={(settings) => ({
         title: t('会话 RPM 上限已更新', 'Per-session RPM limit updated'),
         description: settings.session_rpm_limit > 0
           ? t(
@@ -1328,79 +904,8 @@ function SessionRpmLimit() {
               `Each session forwards at most ${settings.session_rpm_limit} requests per minute.`,
             )
           : t('会话 RPM 上限已取消。', 'The per-session RPM limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.session_rpm_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-  const deviceLimit = data?.device_rpm_limit ?? 0
-  // 两种配错法各提示一句，都不代为改数字：改与不改是运维的判断，替他改比让他看见更糟。
-  // 1) 设备闸没配：客户端换个会话 id 就是满血的新桶，这道闸等于没有护栏。
-  const noDeviceBackstop = parsed > 0 && deviceLimit === 0
-  // 2) 设备上限不比会话大：设备的桶总是先满，会话这道永远轮不到判定，等于白配。
-  const shadowedByDevice = parsed > 0 && deviceLimit > 0 && deviceLimit <= parsed
-
-  return (
-    <SettingsRow
-      label={t('会话 RPM 上限', 'Per-session RPM limit')}
-      description={t(
-        '单个会话每分钟最多转发的请求数，超出后直接返回 429 并附带 retry-after。此项比设备 RPM 上限粒度更细：同一台机器上的多个会话各自计算额度，互不挤占。0 表示不限。',
-        'How many requests a single session may forward per minute; beyond that it gets a 429 with retry-after. It is one level finer than the per-device limit: sessions on the same machine each get their own budget instead of competing for one. 0 means unlimited.',
-      )}
-      note={
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="secondary" size="sm">
-            {parsed > 0
-              ? t(`每个会话每分钟最多 ${parsed} 条`, `Up to ${parsed} requests per minute per session`)
-              : t('不限', 'Unlimited')}
-          </Badge>
-          {noDeviceBackstop && (
-            <Badge variant="warning" size="sm">
-              {t('更换会话 ID 即可绕过此限制，建议同时配置设备 RPM 上限', 'A new session ID bypasses this; set a per-device limit too')}
-            </Badge>
-          )}
-          {shadowedByDevice && (
-            <Badge variant="warning" size="sm">
-              {t(
-                `设备 RPM 上限（${deviceLimit}）总会先触发，此项不会生效`,
-                `The per-device limit of ${deviceLimit} always trips first, so this limit never applies`,
-              )}
-            </Badge>
-          )}
-        </div>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少会话 RPM 上限', 'Decrease per-session RPM limit')} />
-          <NumberFieldInput aria-label={t('会话 RPM 上限', 'Per-session RPM limit')} />
-          <NumberFieldIncrement aria-label={t('增加会话 RPM 上限', 'Increase per-session RPM limit')} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      })}
+    />
   )
 }
 
@@ -1412,50 +917,17 @@ function SessionRpmLimit() {
  * 把脉冲拉平。
  */
 function SessionConcurrencyLimit() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const [draft, setDraft] = useState<number | null>(null)
-
-  useEffect(() => {
-    if (data) setDraft(data.session_concurrency_limit)
-  }, [data?.session_concurrency_limit])
-
-  const save = useMutation({
-    mutationFn: (limit: number) => setSessionConcurrencyLimit(limit),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: t('会话并发上限已更新', 'Per-session concurrency limit updated'),
-        description: settings.session_concurrency_limit > 0
-          ? t(
-              `每个会话最多同时有 ${settings.session_concurrency_limit} 条请求在途。`,
-              `Each session may have at most ${settings.session_concurrency_limit} requests in flight.`,
-            )
-          : t('会话并发上限已取消。', 'The per-session concurrency limit has been removed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
-
-  const current = data?.session_concurrency_limit ?? 0
-  const parsed = Math.max(0, Math.floor(draft ?? 0))
-
+  const { t } = useI18n()
   return (
-    <SettingsRow
+    <NumericSetting
+      field="session_concurrency_limit"
+      save={setSessionConcurrencyLimit}
       label={t('会话并发上限', 'Per-session concurrency limit')}
       description={t(
         '单个会话同时在途的最大请求数，超出后直接返回 429 并附带 retry-after。用于抑制 Claude Desktop 启动时缓存预热产生的突发请求（20 条以上并发），避免超出上游速率限制。0 表示不限。',
         'The maximum number of in-flight requests per session; beyond that it gets a 429 with retry-after. This curbs the cache-warming burst Claude Desktop fires on startup (20+ concurrent requests) so it does not exceed upstream rate limits. 0 means unlimited.',
       )}
-      note={
+      note={(parsed) => (
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary" size="sm">
             {parsed > 0
@@ -1463,60 +935,35 @@ function SessionConcurrencyLimit() {
               : t('不限', 'Unlimited')}
           </Badge>
         </div>
-      }
-    >
-      <NumberField
-        className="min-w-0 flex-1 sm:w-40 sm:flex-none"
-        min={0}
-        value={draft}
-        onValueChange={setDraft}
-      >
-        <NumberFieldGroup>
-          <NumberFieldDecrement aria-label={t('减少会话并发上限', 'Decrease per-session concurrency limit')} />
-          <NumberFieldInput aria-label={t('会话并发上限', 'Per-session concurrency limit')} />
-          <NumberFieldIncrement aria-label={t('增加会话并发上限', 'Increase per-session concurrency limit')} />
-        </NumberFieldGroup>
-      </NumberField>
-      <Button
-        loading={save.isPending}
-        disabled={draft === null || parsed === current}
-        onClick={() => save.mutate(parsed)}
-      >
-        <SaveIcon />
-        {t('保存', 'Save')}
-      </Button>
-    </SettingsRow>
+      )}
+      success={(settings) => ({
+        title: t('会话并发上限已更新', 'Per-session concurrency limit updated'),
+        description: settings.session_concurrency_limit > 0
+          ? t(
+              `每个会话最多同时有 ${settings.session_concurrency_limit} 条请求在途。`,
+              `Each session may have at most ${settings.session_concurrency_limit} requests in flight.`,
+            )
+          : t('会话并发上限已取消。', 'The per-session concurrency limit has been removed.'),
+      })}
+    />
   )
 }
 
 /** 设备身份校验开关：关掉后放行无 metadata.user_id 的裸请求。 */
 function RequireDeviceIdToggle() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const required = data?.require_device_id ?? true
 
-  const save = useMutation({
-    mutationFn: (next: boolean) => setRequireDeviceId(next),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: settings.require_device_id
-          ? t('设备身份校验已启用', 'Device identity checks enabled')
-          : t('设备身份校验已停用', 'Device identity checks disabled'),
-        description: settings.require_device_id
-          ? t('缺少设备身份的请求会被拒绝。', 'Requests without a device identity will be rejected.')
-          : t('无设备身份的请求将被放行。', 'Requests without a device identity will be allowed.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((next: boolean) => setRequireDeviceId(next), {
+    success: (settings) => ({
+      title: settings.require_device_id
+        ? t('设备身份校验已启用', 'Device identity checks enabled')
+        : t('设备身份校验已停用', 'Device identity checks disabled'),
+      description: settings.require_device_id
+        ? t('缺少设备身份的请求会被拒绝。', 'Requests without a device identity will be rejected.')
+        : t('无设备身份的请求将被放行。', 'Requests without a device identity will be allowed.'),
+    }),
   })
 
   return (
@@ -1580,42 +1027,29 @@ function effectiveLatestRelease(settings: Settings): string {
  * 自动检查还没轮到时）或删掉（退回基线、等下次自动学）。
  */
 function LatestCcRelease() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState('')
 
   useEffect(() => {
     if (data) setDraft(data.latest_cc_release)
   }, [data?.latest_cc_release])
 
-  const save = useMutation({
-    mutationFn: (version: string) => setLatestCcRelease(version),
-    onSuccess: (settings: Settings, version: string) => {
-      toastManager.add({
-        title: version
-          ? t('官方最新版本已更新', 'Latest official release updated')
-          : t('官方最新版本已清除', 'Latest official release cleared'),
-        description: version
-          ? t(
-              `声明版本高于 ${effectiveLatestRelease(settings)} 的客户端将按非官方客户端处理；自动检查获取到更高版本时会覆盖此值。`,
-              `Clients claiming a version newer than ${effectiveLatestRelease(settings)} are treated as unofficial; a newer version fetched by the automatic check will replace this value.`,
-            )
-          : t(
-              `已恢复为基线 ${settings.cc_version_base}，下次自动检查（30 分钟内）将重新获取。`,
-              `Back to the baseline ${settings.cc_version_base}; the next automatic check (within 30 minutes) will fetch it again.`,
-            ),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((version: string) => setLatestCcRelease(version), {
+    success: (settings, version: string) => ({
+      title: version
+        ? t('官方最新版本已更新', 'Latest official release updated')
+        : t('官方最新版本已清除', 'Latest official release cleared'),
+      description: version
+        ? t(
+            `声明版本高于 ${effectiveLatestRelease(settings)} 的客户端将按非官方客户端处理；自动检查获取到更高版本时会覆盖此值。`,
+            `Clients claiming a version newer than ${effectiveLatestRelease(settings)} are treated as unofficial; a newer version fetched by the automatic check will replace this value.`,
+          )
+        : t(
+            `已恢复为基线 ${settings.cc_version_base}，下次自动检查（30 分钟内）将重新获取。`,
+            `Back to the baseline ${settings.cc_version_base}; the next automatic check (within 30 minutes) will fetch it again.`,
+          ),
+    }),
   })
 
   const value = draft.trim()
@@ -1680,39 +1114,26 @@ function LatestCcRelease() {
  * 只是引导升级用的闸，不是安全边界——UA 是客户端自报的，改一个头就能绕过。
  */
 function MinClientVersion() {
-  const qc = useQueryClient()
-  const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState('')
 
   useEffect(() => {
     if (data) setDraft(data.min_client_version)
   }, [data?.min_client_version])
 
-  const save = useMutation({
-    mutationFn: (version: string) => setMinClientVersion(version),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
-        title: settings.min_client_version
-          ? t('最低客户端版本已更新', 'Minimum client version updated')
-          : t('最低客户端版本已取消', 'Minimum client version removed'),
-        description: settings.min_client_version
-          ? t(
-              `低于 ${settings.min_client_version} 的 Claude Code 将被拒绝。`,
-              `Claude Code older than ${settings.min_client_version} will be rejected.`,
-            )
-          : t('不再按版本拦截客户端。', 'Clients are no longer filtered by version.'),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
-    },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
+  const save = useSettingsSave((version: string) => setMinClientVersion(version), {
+    success: (settings) => ({
+      title: settings.min_client_version
+        ? t('最低客户端版本已更新', 'Minimum client version updated')
+        : t('最低客户端版本已取消', 'Minimum client version removed'),
+      description: settings.min_client_version
+        ? t(
+            `低于 ${settings.min_client_version} 的 Claude Code 将被拒绝。`,
+            `Claude Code older than ${settings.min_client_version} will be rejected.`,
+          )
+        : t('不再按版本拦截客户端。', 'Clients are no longer filtered by version.'),
+    }),
   })
 
   const value = draft.trim()
@@ -1759,9 +1180,8 @@ function MinClientVersion() {
 
 /** 裸请求速率上限：单个账号在窗口内最多接收的无设备身份请求。 */
 function BareRateLimit() {
-  const qc = useQueryClient()
   const { language, t } = useI18n()
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const { data } = useSettingsQuery()
   const [draft, setDraft] = useState<number | null>(null)
   const [windowDraft, setWindowDraft] = useState<number | null>(null)
 
@@ -1772,10 +1192,11 @@ function BareRateLimit() {
     }
   }, [data?.bare_rate_limit, data?.bare_rate_window_secs])
 
-  const save = useMutation({
-    mutationFn: ({ limit, win }: { limit: number; win: number }) => setBareRateLimit(limit, win),
-    onSuccess: (settings: Settings) => {
-      toastManager.add({
+  const save = useSettingsSave(
+    ({ limit, win }: { limit: number; win: number }) =>
+      setBareRateLimit(limit, win),
+    {
+      success: (settings) => ({
         title: t(
           '无设备身份请求策略已更新',
           'Policy for requests without device identity updated',
@@ -1789,18 +1210,9 @@ function BareRateLimit() {
               '无设备身份请求的速率限制已取消。',
               'The rate limit for requests without a device identity has been removed.',
             ),
-        type: 'success',
-      })
-      qc.setQueryData(['settings'], settings)
+      }),
     },
-    onError: (error) => {
-      toastManager.add({
-        title: t('保存失败', 'Save failed'),
-        description: extractError(error, language),
-        type: 'error',
-      })
-    },
-  })
+  )
 
   const limit = Math.max(0, Math.floor(draft ?? 0))
   const win = Math.max(1, Math.floor(windowDraft ?? 60))
