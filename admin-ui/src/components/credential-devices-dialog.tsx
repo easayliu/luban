@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type MouseEvent } from 'react'
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
   ChevronDownIcon,
@@ -733,7 +733,7 @@ function SessionDetails({
     [t('来源', 'Source'), source === 'pfx' ? t('按缓存前缀识别', 'By cache prefix') : t('客户端自带会话 ID', 'Client session ID')],
     [t('来访会话 ID', 'Inbound session ID'), source === 'sid' ? value : '—'],
     [t('上游会话 ID', 'Upstream session ID'), session.session_id || '—'],
-    [t('槽位', 'Slot'), passthrough ? t('不占槽位（沿用来访 ID）', 'None (keeps the inbound ID)') : `#${session.slot}`],
+    [t('槽位', 'Slot'), passthrough ? t('无（沿用来访 ID，仍占名额）', 'None (keeps the inbound ID; still counts toward the limit)') : `#${session.slot}`],
     [t('最近模型', 'Last model'), session.last_model ?? '—'],
     [t('首次绑定', 'First bound'), formatFullTime(session.created_at, language)],
     [t('最近活跃', 'Last active'), formatFullTime(session.last_seen_at, language)],
@@ -853,10 +853,23 @@ function shortKey(key: string, t: T): string {
   return `${source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${value.slice(0, 8)}`
 }
 
+/**
+ * 点会话行的标题区（按钮之外）也能展开 / 收起，等同于点右侧的箭头：找到这一行的箭头替它点一下，
+ * 开合状态仍由折叠组件自己管。拖选文字（复制 ID）时不算点击；键盘操作走箭头按钮本身。
+ */
+function toggleSessionRow(e: MouseEvent<HTMLElement>) {
+  if ((e.target as HTMLElement).closest('button, a, input, [role="button"]')) return
+  if (window.getSelection()?.toString()) return
+  e.currentTarget
+    .closest('li')
+    ?.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')
+    ?.click()
+}
+
 function eventDetail(e: SessionEvent, t: T, language: Language): string {
   const account = (id: number | null, label: string | null) =>
     id == null ? '—' : label ? displayCredentialLabel(label, language) : t(`账号 #${id}（已删除）`, `Account #${id} (removed)`)
-  const slot = (n: number | null) => (n == null ? '—' : n < 0 ? t('不占槽位', 'no slot') : `#${n}`)
+  const slot = (n: number | null) => (n == null ? '—' : n < 0 ? t('沿用来访 ID', 'inbound ID') : `#${n}`)
   const idle = e.idle_secs != null ? t(`闲置 ${formatDuration(e.idle_secs, language)}`, `idle ${formatDuration(e.idle_secs, language)}`) : null
   const here = `${account(e.cred_id, e.cred_label)} · ${slot(e.slot)}`
   const parts: (string | null)[] = (() => {
@@ -1252,10 +1265,10 @@ export function SessionList({
             return (
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <Collapsible>
-                  <div className="flex min-w-0 items-center gap-2">
+                  <div className="flex min-w-0 cursor-pointer items-center gap-2" onClick={toggleSessionRow}>
                     <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                     {passthrough ? (
-                      <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用客户端自带的会话 ID（按账号转换后发往上游），不占槽位', 'A real client session: it keeps the client’s own session ID (converted per account before going upstream) and takes no slot')}>
+                      <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用自带的会话 ID（按账号转换后发往上游），占名额、不分配槽位', 'A real client session: keeps its own session ID (converted per account before going upstream); counts toward the limit but gets no slot')}>
                         {t('真实', 'Real')}
                       </Badge>
                     ) : (
@@ -1330,7 +1343,10 @@ export function SessionList({
                       </Button>
                     )}
                   </div>
-                  <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
+                  <div
+                    className="mt-1 flex cursor-pointer flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs"
+                    onClick={toggleSessionRow}
+                  >
                     <Tooltip>
                       <TooltipTrigger render={<span />} className="min-w-0 truncate">
                         {t(
