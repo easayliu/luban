@@ -114,6 +114,9 @@ pub struct AppState {
     /// 由后台任务按官方节奏攒批发出（见 [`crate::telemetry`]）。保活也从它取该凭证最近一次
     /// 见到的 `anthropic-organization-id`。
     pub telemetry: crate::telemetry::Telemetry,
+    /// 转发 `/v1/*` 的上游地址（不带末尾 `/`）。线上恒为 [`crate::config::UPSTREAM_BASE_URL`]；
+    /// 做成字段只为端到端测试能把它指到本地起的模拟上游，见 `proxy::handler` 的测试。
+    pub upstream_base: Arc<str>,
 }
 
 impl AppState {
@@ -143,6 +146,7 @@ impl AppState {
             session_concurrency: Arc::default(),
             in_flight: Arc::default(),
             telemetry: Default::default(),
+            upstream_base: crate::config::UPSTREAM_BASE_URL.into(),
         }
     }
 }
@@ -178,6 +182,7 @@ pub async fn run(
         session_concurrency: Arc::default(),
         in_flight: Arc::default(),
         telemetry: Default::default(),
+        upstream_base: crate::config::UPSTREAM_BASE_URL.into(),
     };
 
     spawn_background_tasks(&state);

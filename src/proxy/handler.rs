@@ -872,7 +872,7 @@ pub(super) async fn handle_inner(
     };
 
     // 4) 目标 URL：上游 base + 原路径与查询串。
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, path_and_query);
+    let url = format!("{}{}", state.upstream_base, path_and_query);
 
     // 5) 组装转发头：复制安全头，注入鉴权与 beta。形态类改动逐项受网页开关控制
     //    （`flags`，2.5 读的那份）。设备指纹也在那里算好了——头与体两侧都要用它。
@@ -2520,3 +2520,6 @@ fn session_concurrency_rejection(
         ),
     )
 }
+
+#[cfg(test)]
+mod tests;
