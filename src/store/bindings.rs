@@ -262,6 +262,7 @@ impl CredentialStore {
     /// 照常重新选号。
     pub fn unbind_all_sessions(&self, cred_id: i64) -> Result<usize> {
         let conn = self.conn.lock();
+        log_removed(&conn, "unbound", Some("clear"), "cred_id = ?1", [cred_id])?;
         Ok(conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [cred_id])?)
     }
 
@@ -269,6 +270,13 @@ impl CredentialStore {
     /// 理由同 [`Self::unbind_device`]。
     pub fn unbind_session(&self, cred_id: i64, session_key: &str) -> Result<bool> {
         let conn = self.conn.lock();
+        log_removed(
+            &conn,
+            "unbound",
+            Some("manual"),
+            "cred_id = ?1 AND session_key = ?2",
+            params![cred_id, session_key],
+        )?;
         let n = conn.execute(
             "DELETE FROM session_bindings WHERE cred_id = ?1 AND session_key = ?2",
             params![cred_id, session_key],
@@ -356,12 +364,21 @@ impl CredentialStore {
             None => 0,
         };
         let sessions = match session {
-            Some(secs) => conn.execute(
-                "DELETE FROM session_bindings WHERE last_seen_at < unixepoch() - ?1",
-                [secs],
-            )?,
+            Some(secs) => {
+                // 记事件与删行共用同一个截止时刻：两条语句各算一次 unixepoch()，跨秒时会删掉
+                // 没记 expired 的行。
+                let cutoff: i64 =
+                    conn.query_row("SELECT unixepoch() - ?1", [secs], |r| r.get(0))?;
+                log_removed(&conn, "expired", None, "last_seen_at < ?1", [cutoff])?;
+                conn.execute("DELETE FROM session_bindings WHERE last_seen_at < ?1", [cutoff])?
+            }
             None => 0,
         };
+        // 会话历史事件保留 7 天，与绑定的保留期无关。
+        conn.execute(
+            "DELETE FROM session_binding_events WHERE ts < unixepoch() - ?1",
+            [SESSION_EVENT_RETENTION_SECS],
+        )?;
         Ok((devices, sessions))
     }
 }

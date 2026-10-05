@@ -5,7 +5,7 @@ use axum::http::HeaderMap;
 
 use crate::store;
 
-use super::body::{extract_session_id, session_binding_key};
+use super::body::{anon_session_key, extract_session_id, session_binding_key};
 #[cfg(doc)]
 use super::body::{sim_device_fingerprint, sim_session_key};
 use super::simulation::{Simulation, looks_like_uuid};
@@ -96,6 +96,12 @@ pub(super) struct SessionPlan {
     pub per_session: bool,
     /// 出站沿用来访会话 id（不走模拟），不占派生槽位，见 [`store::Select::passthrough_session`]。
     pub passthrough: bool,
+    /// 匿名侧查询：按 `key` 只**跟随**已有的活跃绑定、跟不上就分散，不写绑定、不占名额，见
+    /// [`store::Select::follow_only`]。
+    pub follow_only: bool,
+    /// 流水上记的键（`usage_logs.session_key`）：一般就是 `key`，匿名侧查询换成带类别的
+    /// [`anon_session_key`]。
+    pub log_key: Option<String>,
 }
 
 /// 这条请求按什么占名额、会话键是什么。
@@ -122,19 +128,37 @@ pub(super) struct SessionPlan {
 /// 抓包（`cap/auto-2.1.285-20260930` 的 C 段）：`--continue` 恢复的对话沿用原会话 id（`00314`
 /// 与退出前的 `00277` 同一个），回来仍落在原号上；`/clear` 才换新 id、算一条新会话。
 ///
-/// **额度探测不占会话名额**（`binds` 为假）：CC 每次启动都发一条，`--continue` 时它带的是加载
-/// 历史之前的临时会话 id（同上抓包的 `00292`），之后再也不出现，占了就要白白空占一个名额到
-/// TTL。它只按设备亲和选号。
+/// **额度探测与不计费路径不占会话名额**（`no_bind`，`binds` 为假）：CC 每次启动都发一条额度
+/// 探测，`--continue` 时它带的是加载历史之前的临时会话 id（同上抓包的 `00292`），之后再也不
+/// 出现，占了就要白白空占一个名额到 TTL；`count_tokens` 不产生对话，只有 `/v1/messages` 才算
+/// 一条会话。它们只按设备亲和选号。
+///
+/// **匿名侧查询不占会话名额**（`follow_only`）：没有设备身份的来访（模拟路径），标题生成、安全
+/// 分类、预热、额度探测、WebSearch / WebFetch 辅助调用这些一次性请求（`side_class`，见
+/// [`super::CcRequestKind::is_side_query`]）没有设备亲和可依，主线程落在哪个号上只能凭会话键
+/// 去找：同一个键有活跃绑定就跟过去（官方同一会话本来就在同一个号上），找不到（来访没带会话
+/// id、前缀指纹与主线程不同，或主线程那条已过期）就分散到负载最低的号，**不新建绑定**——否则每条
+/// 侧查询各占一份名额、白占到 TTL。流水上的键换成带类别的 [`anon_session_key`]，后台据此把这类
+/// 用量与真正的对话分开。
+///
+/// **没有设备身份、不走模拟、但带了合法会话 id 的**（`anon_sid`）也按会话键：真 CC 的
+/// `count_tokens` 恒不带 `metadata`（`cap/auto-2.1.285-20260930` 34 条全是，会话头都在），
+/// 不按键就只能裸请求按负载选号，同一会话的 token 计数散到一圈号上；按键之后它是侧查询，跟着
+/// 主线程走。带会话头却不带 `metadata` 的 `/v1/messages`（v0.3.12 记过 CC Desktop 有这种）也
+/// 走这里：多轮对话会话内粘住，不再每轮换号。出站会话 id 沿用来访那个（[`bare_session_id`]
+/// 按账号钉住），不占派生槽位（`passthrough`）。
 pub(super) fn session_plan(
     flags: store::ForwardFlags,
     simulating: bool,
     has_device: bool,
     inbound_session: Option<&str>,
     prefix_key: Option<&str>,
-    quota_probe: bool,
+    no_bind: bool,
+    side_class: Option<&str>,
 ) -> SessionPlan {
     let device_by_session = has_device && flags.devices_by_session();
-    let key = if simulating || device_by_session {
+    let anon_sid = !has_device && !simulating && inbound_session.is_some();
+    let key = if simulating || device_by_session || anon_sid {
         match (inbound_session, prefix_key) {
             (Some(sid), _) => Some(session_binding_key(Some(sid), "")),
             (None, Some(k)) => Some(session_binding_key(None, k)),
@@ -144,11 +168,18 @@ pub(super) fn session_plan(
         None
     };
     let per_session = device_by_session && key.is_some();
+    let anon_side = if has_device { None } else { side_class };
+    let log_key = match (&key, anon_side) {
+        (Some(k), Some(class)) => Some(anon_session_key(k, class)),
+        _ => key.clone(),
+    };
     SessionPlan {
-        binds: key.is_some() && !(per_session && quota_probe),
+        binds: key.is_some() && !(per_session && no_bind),
+        follow_only: key.is_some() && anon_side.is_some(),
+        log_key,
         key,
         per_session,
-        passthrough: per_session && !simulating,
+        passthrough: (per_session || anon_sid) && !simulating,
     }
 }
 

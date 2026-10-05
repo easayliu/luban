@@ -4,7 +4,7 @@ import { SearchIcon } from 'lucide-react'
 import { listUsage, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
-  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey,
+  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey, sideClassLabel,
 } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -251,6 +251,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         <Fact label={t('会话键', 'Session key')}>
           <span className="font-mono" title={log.session_key ?? undefined}>
             {key ? `${key.source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${key.value.slice(0, 8)}` : '—'}
+            {key?.sideClass && <span className="text-muted-foreground"> · {sideClassLabel(key.sideClass, language)}</span>}
           </span>
         </Fact>
       </dl>

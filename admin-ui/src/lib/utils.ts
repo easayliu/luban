@@ -13,10 +13,33 @@ export function cn(...inputs: ClassValue[]) {
  * 认不出前缀的只可能是旧口径的残留（开库时那条迁移会清掉），退回原来那套按长相猜的判法。
  * 名额对话框的会话列表与流水明细共用这一份，两边对同一个键的说法不会漂开。
  */
-export function parseSessionKey(key: string): { source: 'sid' | 'pfx'; value: string } {
+export function parseSessionKey(key: string): {
+  source: 'sid' | 'pfx'
+  value: string
+  sideClass?: string
+} {
+  // 匿名侧查询只进流水的键：`lb:v2:anon:<来源>:<值>:<类别>`（见后端 `anon_session_key`）。
+  const anon = /^lb:v\d+:anon:(sid|pfx):([^:]*):([a-z_]+)$/.exec(key)
+  if (anon) return { source: anon[1] as 'sid' | 'pfx', value: anon[2], sideClass: anon[3] }
   const m = /^lb:v\d+:(sid|pfx):([\s\S]*)$/.exec(key)
   if (m) return { source: m[1] as 'sid' | 'pfx', value: m[2] }
   return { source: /^[0-9a-f]{32}$/.test(key) ? 'pfx' : 'sid', value: key }
+}
+
+// 匿名侧查询的类别段（后端 `CcRequestKind::tag`）在界面上的叫法；认不出的原样显示。
+const SIDE_CLASS_LABELS: Record<string, readonly [chinese: string, english: string]> = {
+  title: ['标题生成', 'title'],
+  classifier: ['安全分类', 'classifier'],
+  prewarm: ['模型预热', 'prewarm'],
+  quota_probe: ['额度探测', 'quota probe'],
+  count_tokens: ['token 计数', 'token count'],
+  auxiliary: ['辅助调用', 'auxiliary'],
+}
+
+export function sideClassLabel(cls: string, language: Language = 'zh-CN'): string {
+  const label = SIDE_CLASS_LABELS[cls]
+  if (!label) return cls
+  return language === 'zh-CN' ? label[0] : label[1]
 }
 
 // OAuth 未返回可用账号身份且用户未填写备注时，后端会生成这个精确格式的兜底名。

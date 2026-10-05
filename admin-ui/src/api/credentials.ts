@@ -470,6 +470,48 @@ export interface SessionBinding {
   last_model: string | null
 }
 
+/**
+ * 会话绑定的一条历史事件（后端 `store::SessionEvent`）。只在绑定状态变化时记，保留 7 天：
+ * `bound` 新建、`slot_taken` 接手休眠绑定的槽位、`evicted` 槽位被接手、`resumed` 休眠后恢复、
+ * `rebound` 改绑、`unbound` 解绑、`expired` 过期清理。
+ */
+export interface SessionEvent {
+  id: number
+  /** 发生时间（Unix 秒）。 */
+  ts: number
+  session_key: string
+  event: string
+  /** 当前（或新落）的账号；账号已删时名称为 null。 */
+  cred_id: number | null
+  cred_label: string | null
+  /** 改绑前的账号（`rebound`），休眠后恢复时同 `cred_id`。 */
+  prev_cred_id: number | null
+  prev_cred_label: string | null
+  /** 槽位；-1 是沿用来访会话 ID、不占槽位。 */
+  slot: number | null
+  prev_slot: number | null
+  /** `slot_taken` 的前任会话键、`evicted` 的接手者会话键。 */
+  other_key: string | null
+  /** 那条绑定闲置了多久（秒）。 */
+  idle_secs: number | null
+  /** `rebound` 的原因、`unbound` 的方式。 */
+  reason: string | null
+}
+
+/** 一条会话的历史事件（最近的在前，最多 100 条）。 */
+export async function listSessionEvents(id: number, sessionKey: string): Promise<SessionEvent[]> {
+  const { data } = await api.get<SessionEvent[]>(
+    `/credentials/${id}/sessions/${encodeURIComponent(sessionKey)}/events`,
+  )
+  return data
+}
+
+/** 某账号某槽位（即某个上游会话 ID）先后被哪些会话用过（最近的在前，最多 100 条）。 */
+export async function listSlotEvents(id: number, slot: number): Promise<SessionEvent[]> {
+  const { data } = await api.get<SessionEvent[]>(`/credentials/${id}/slots/${slot}/events`)
+  return data
+}
+
 /** 列出某账号当前活跃的会话（按最近活跃倒序）。 */
 export async function listCredentialSessions(id: number): Promise<SessionBinding[]> {
   const { data } = await api.get<SessionBinding[]>(`/credentials/${id}/sessions`)

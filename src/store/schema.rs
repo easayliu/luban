@@ -51,6 +51,8 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         -- 真实客户端的会话沿用来访 id 出站，slot 记 -1（PASSTHROUGH_SLOT）。
         -- slot：这条会话在该凭证上占的槽位（0 起，取活跃绑定里最小的空位），出站会话 id 由
         -- 「账号 + 槽位」派生——槽位释放后被下一个对话复用，上游看到的会话 id 数有界。
+        -- slot_lost：休眠期间槽位已被别的会话接手（记过 evicted），重新拿到槽位时清零；找
+        -- 「这次让出槽位的前任」只认还没丢的那条（`store::session_events::note_slot_takeover`）。
         -- last_model：最近一轮请求的模型，**只记不参与键**（键里带模型会把同一条对话换模型
         -- 的那一轮劈成两条会话、占两份名额，见 `session_binding_key` 的记述）；给后台列。
         CREATE TABLE IF NOT EXISTS session_bindings (
@@ -59,6 +61,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
             slot          INTEGER NOT NULL DEFAULT 0,
             request_count INTEGER NOT NULL DEFAULT 0,
             last_model    TEXT,
+            slot_lost     INTEGER NOT NULL DEFAULT 0,
             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
             last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
@@ -68,6 +71,35 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         -- 默认保留 24 小时，多客户端时攒到几万行不稀奇。
         CREATE INDEX IF NOT EXISTS idx_session_bindings_seen
             ON session_bindings(last_seen_at);
+
+        -- 会话绑定的历史事件（`store::session_events`）：只在状态变化时记，保留 7 天。
+        -- event：bound 新建 / slot_taken 接手休眠绑定的槽位 / evicted 槽位被接手 /
+        --        resumed 休眠后恢复 / rebound 改绑 / unbound 解绑 / expired 过期清理。
+        -- cred_id/slot：当前（或新落）的账号与槽位；prev_cred_id/prev_slot：改绑或恢复前的。
+        -- other_key：slot_taken 的前任会话键、evicted 的接手者；idle_secs：那条绑定闲置了多久；
+        -- reason：rebound 的原因、unbound 的方式。
+        CREATE TABLE IF NOT EXISTS session_binding_events (
+            id            INTEGER PRIMARY KEY,
+            ts            INTEGER NOT NULL DEFAULT (unixepoch()),
+            session_key   TEXT    NOT NULL,
+            event         TEXT    NOT NULL,
+            cred_id       INTEGER,
+            prev_cred_id  INTEGER,
+            slot          INTEGER,
+            prev_slot     INTEGER,
+            other_key     TEXT,
+            idle_secs     INTEGER,
+            reason        TEXT
+        ) STRICT;
+        -- 会话详情按键看历史；槽位历史按「账号 + 槽位」看，离开的那一侧记在 prev 两列上。
+        CREATE INDEX IF NOT EXISTS idx_session_events_key
+            ON session_binding_events(session_key, id);
+        CREATE INDEX IF NOT EXISTS idx_session_events_slot
+            ON session_binding_events(cred_id, slot, id);
+        CREATE INDEX IF NOT EXISTS idx_session_events_prev_slot
+            ON session_binding_events(prev_cred_id, prev_slot, id) WHERE prev_cred_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_session_events_ts
+            ON session_binding_events(ts);
 
         -- 每次转发的用量日志：从上游响应里嗅探到的 token 用量（若响应带了 usage）。
         CREATE TABLE IF NOT EXISTS usage_logs (
@@ -471,6 +503,14 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     }
     // 最近一轮的模型；旧库补出来是 NULL，下次命中该绑定时回填。只给后台列看，不参与选号。
     let _ = conn.execute("ALTER TABLE session_bindings ADD COLUMN last_model TEXT", []);
+    // 槽位被接手的标记（见建表处）。补列成功（旧库第一次升级）时按现有数据初始化归属，见
+    // [`init_slot_owners`]；列已在什么都不动。
+    if conn
+        .execute("ALTER TABLE session_bindings ADD COLUMN slot_lost INTEGER NOT NULL DEFAULT 0", [])
+        .is_ok()
+    {
+        init_slot_owners(conn)?;
+    }
     // 会话键自 v0.3.137 起带命名空间与口径版本（`lb:v2:…`，见 `crate::proxy::SESSION_KEY_VERSION`）。
     // 没有这个前缀的行是旧口径算出来的——v0.3.126 那版按「账号 + 设备指纹」，与现在的「来访
     // 会话 id / 缓存前缀 + 对话起点」根本不是一回事，却同样是 32 个 hex，留着只会让新旧两种
@@ -780,3 +820,27 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("subscription_status", "TEXT"),
     ("extra_usage_enabled", "INTEGER"),
 ];
+
+/// 旧库补 `session_bindings.slot_lost` 列之后初始化槽位归属：同一账号同一槽位上有好几条绑定时
+/// （休眠绑定的槽位会被新对话接手，被接手的那条行还留着、记着原槽位号），只有**最近活跃**的
+/// 那条是当前持有者，其余标成已丢槽位。全标 0 的话，解绑当前持有者之后再分给别人，会把早就
+/// 被接手过的那条认成前任，记出一条错的「接手」。
+///
+/// 「最近活跃 = 当前持有者」成立的理由：活跃绑定的槽位不会被分出去，两条活跃绑定不可能共用
+/// 一个槽位；丢了槽位的绑定只有重新选号拿到槽位时才会刷新 `last_seen_at`，那时它就是新的
+/// 持有者。同一秒的并列按会话键取一条，结果确定。沿用来访 ID 的（`slot = -1`）不占槽位，不动。
+pub(super) fn init_slot_owners(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE session_bindings SET slot_lost = 1 \
+          WHERE slot >= 0 AND EXISTS ( \
+                SELECT 1 FROM session_bindings o \
+                 WHERE o.cred_id = session_bindings.cred_id \
+                   AND o.slot = session_bindings.slot \
+                   AND o.session_key <> session_bindings.session_key \
+                   AND (o.last_seen_at > session_bindings.last_seen_at \
+                        OR (o.last_seen_at = session_bindings.last_seen_at \
+                            AND o.session_key > session_bindings.session_key)))",
+        [],
+    )?;
+    Ok(())
+}

@@ -42,6 +42,8 @@ pub(super) fn router(state: AppState) -> Router {
             get(list_credential_sessions).delete(clear_credential_sessions),
         )
         .route("/credentials/{id}/sessions/{session_key}", delete(unbind_credential_session))
+        .route("/credentials/{id}/sessions/{session_key}/events", get(list_session_events))
+        .route("/credentials/{id}/slots/{slot}/events", get(list_slot_events))
         .route("/credentials/{id}/refresh", post(refresh_credential))
         .route("/credentials/{id}/reauthorize", post(reauthorize_credential))
         .route("/credentials/{id}/test", post(test_credential))

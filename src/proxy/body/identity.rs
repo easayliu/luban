@@ -213,6 +213,18 @@ pub(in crate::proxy) fn session_binding_key(
     }
 }
 
+/// 匿名侧查询在流水上记的键：`lb:v2:anon:<来源>:<值>:<类别>`，由它本来的会话键
+/// （[`session_binding_key`]）插上 `anon` 段、末尾接请求类别（[`super::CcRequestKind::tag`]）。
+///
+/// **只进流水，从不落 `session_bindings`**：这类请求没有设备身份，主线程落在哪个号上只能凭
+/// 会话键碰运气，碰到了就跟过去、碰不到就分散到别的号，都不写绑定、不占会话名额（见
+/// [`super::session_id::session_plan`]）。类别段让后台把标题、分类、探测这些用量与真正的对话
+/// 分开看；保留来源与值，按会话 id 查流水仍查得到它。
+pub(in crate::proxy) fn anon_session_key(binding_key: &str, class: &str) -> String {
+    let rest = binding_key.strip_prefix(SESSION_KEY_VERSION).unwrap_or(binding_key);
+    format!("{SESSION_KEY_VERSION}anon:{rest}:{class}")
+}
+
 /// 键按字典序排好的紧凑 JSON：`preserve_order` 开着时 `to_string` 按客户端发来的键序输出，
 /// 同一内容两种键序会算出两个不同的键。只给 [`sim_session_key`] 用。
 fn canonical_json(v: &serde_json::Value) -> String {

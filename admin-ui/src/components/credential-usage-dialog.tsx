@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
 import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Language } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
@@ -11,6 +11,7 @@ import {
   formatFullTime,
   formatUsd,
   parseSessionKey,
+  sideClassLabel,
 } from '@/lib/utils'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { RequestIdChip, statusVariant } from '@/components/usage-shared'
@@ -457,7 +458,7 @@ export function UsageCards({
                   （按槽位派生、对话之间复用），两者都在悬浮提示里。 */}
               <LogFact label={t('会话', 'Session')}>
                 <span className="font-mono" title={sessionTitle(log)}>
-                  {sessionShort(log, t)}
+                  {sessionShort(log, t, language)}
                 </span>
               </LogFact>
             </dl>
@@ -699,11 +700,16 @@ function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
  * 设备格的悬停全文：来访原始 id 与出站派生 id 各一行。上游侧（工单、封号通知）给出的
  * device_id 对的是第二行——第一行是客户端自己的 id，上游从没见过。
  */
-/** 卡片里那一格会话：有对话键就显示「来源 + 前 8 位」，否则退到上游 session_id，都没有是 '—'。 */
-function sessionShort(log: UsageLog, t: (zh: string, en: string) => string): string {
+/** 卡片里那一格会话：有对话键就显示「来源 + 前 8 位」（匿名侧查询再接类别），否则退到上游 session_id，都没有是 '—'。 */
+function sessionShort(
+  log: UsageLog,
+  t: (zh: string, en: string) => string,
+  language: Language,
+): string {
   if (log.session_key) {
-    const { source, value } = parseSessionKey(log.session_key)
-    return `${source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${value.slice(0, 8)}`
+    const { source, value, sideClass } = parseSessionKey(log.session_key)
+    const short = `${source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${value.slice(0, 8)}`
+    return sideClass ? `${short} · ${sideClassLabel(sideClass, language)}` : short
   }
   return log.session_id_in?.slice(0, 8) ?? log.session_id?.slice(0, 8) ?? '—'
 }

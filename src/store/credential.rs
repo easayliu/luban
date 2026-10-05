@@ -135,6 +135,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM usage_logs", [])?;
         tx.execute("DELETE FROM device_bindings", [])?;
         tx.execute("DELETE FROM session_bindings", [])?;
+        tx.execute("DELETE FROM session_binding_events", [])?;
         tx.execute("DELETE FROM credential_stats", [])?;
         tx.execute("DELETE FROM device_costs", [])?;
         tx.execute("DELETE FROM model_denials", [])?;
@@ -156,6 +157,7 @@ impl CredentialStore {
         let conn = self.conn.lock();
         if disabled {
             conn.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+            log_removed(&conn, "unbound", Some("account_disabled"), "cred_id = ?1", [id])?;
             conn.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
             // 两种暂停留下的原因也一并清掉，理由见 [`manual_disable_sql`]。
             Ok(conn.execute(&manual_disable_sql(), [id])? > 0)
@@ -207,6 +209,7 @@ impl CredentialStore {
         )? > 0;
         if updated {
             tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+            log_removed(&tx, "unbound", Some("account_paused"), "cred_id = ?1", [id])?;
             tx.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
         }
         tx.commit()?;
@@ -393,6 +396,7 @@ impl CredentialStore {
             let mut cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
             for id in ids {
                 binds.execute([id])?;
+                log_removed(&tx, "unbound", Some("account_removed"), "cred_id = ?1", [id])?;
                 sbinds.execute([id])?;
                 stats.execute([id])?;
                 costs.execute([id])?;
@@ -430,6 +434,7 @@ impl CredentialStore {
                 let mut stmt = tx.prepare(&manual_disable_sql())?;
                 for id in ids {
                     binds.execute([id])?;
+                    log_removed(&tx, "unbound", Some("account_disabled"), "cred_id = ?1", [id])?;
                     sbinds.execute([id])?;
                     n += stmt.execute([id])?;
                 }

@@ -1050,6 +1050,19 @@ queryClient.setQueryData(['credential-sessions', 4], [
     last_model: null,
   },
 ])
+// 会话历史事件：4 号账号槽位 0 先被一条前缀会话占过、休眠后被这条自带 ID 的会话接手；
+// 这条会话之前在 2 号账号上，上游失败后改绑过来。
+queryClient.setQueryData(['session-events', 4, 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf'], [
+  { id: 13, ts: now - 2 * 3600 + 5, session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', event: 'slot_taken', cred_id: 4, cred_label: 'Account 4', prev_cred_id: null, prev_cred_label: null, slot: 0, prev_slot: null, other_key: 'lb:v2:pfx:9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d', idle_secs: 18727, reason: null },
+  { id: 12, ts: now - 2 * 3600 + 5, session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', event: 'rebound', cred_id: 4, cred_label: 'Account 4', prev_cred_id: 2, prev_cred_label: 'Account 2', slot: 0, prev_slot: 3, other_key: null, idle_secs: null, reason: 'retried' },
+  { id: 7, ts: now - 2 * 3600, session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', event: 'bound', cred_id: 2, cred_label: 'Account 2', prev_cred_id: null, prev_cred_label: null, slot: 3, prev_slot: null, other_key: null, idle_secs: null, reason: null },
+])
+queryClient.setQueryData(['slot-events', 4, 0], [
+  { id: 14, ts: now - 2 * 3600 + 5, session_key: 'lb:v2:pfx:9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d', event: 'evicted', cred_id: 4, cred_label: 'Account 4', prev_cred_id: null, prev_cred_label: null, slot: 0, prev_slot: null, other_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', idle_secs: 18727, reason: null },
+  { id: 13, ts: now - 2 * 3600 + 5, session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', event: 'slot_taken', cred_id: 4, cred_label: 'Account 4', prev_cred_id: null, prev_cred_label: null, slot: 0, prev_slot: null, other_key: 'lb:v2:pfx:9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d', idle_secs: 18727, reason: null },
+  { id: 12, ts: now - 2 * 3600 + 5, session_key: 'lb:v2:sid:d0c1fb05-9b19-4576-9465-e2b8a206dabf', event: 'rebound', cred_id: 4, cred_label: 'Account 4', prev_cred_id: 2, prev_cred_label: 'Account 2', slot: 0, prev_slot: 3, other_key: null, idle_secs: null, reason: 'retried' },
+  { id: 2, ts: now - 7 * 3600, session_key: 'lb:v2:pfx:9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d', event: 'bound', cred_id: 4, cred_label: 'Account 4', prev_cred_id: null, prev_cred_label: null, slot: 0, prev_slot: null, other_key: null, idle_secs: null, reason: null },
+])
 queryClient.setQueryData(['credential-devices', 4], [
   {
     device_id: 'user_9fd2b847c21a4e51a98d0e07',

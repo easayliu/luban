@@ -722,18 +722,29 @@ pub(super) async fn handle_inner(
         .as_ref()
         .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
         .unwrap_or(CcRequestKind::Main);
+    // 一次性侧查询（标题、分类、探测……）：匿名来访的这几类只跟随、不占名额，见 [`session_plan`]。
+    // **只有 `/v1/messages` 占会话**：`count_tokens` 这类不计费路径按路径认，不看体长什么样——
+    // 体形态只认得出官方那一种（[`CcRequestKind::CountTokens`]），第三方的会被当成主线程去占名额。
+    let side_class = if billable {
+        body_json.as_ref().filter(|v| cc_kind.is_side_query(v)).map(|_| cc_kind.tag())
+    } else {
+        Some(CcRequestKind::CountTokens.tag())
+    };
     let plan = session_plan(
         flags,
         simulating,
         device_id.is_some(),
         inbound_session.as_deref(),
         prefix_key.as_deref(),
-        cc_kind == CcRequestKind::QuotaProbe,
+        cc_kind == CcRequestKind::QuotaProbe || !billable,
+        side_class,
     );
     let session_key = plan.key.clone();
+    // 流水上记的键：匿名侧查询带类别（`lb:v2:anon:…`），其余就是会话键。
+    let log_session_key = plan.log_key.clone();
     // 本地拒绝的流水也要带这两样（见 [`RequestLogState::session_key`]）：下面这些闸拦下的
     // 请求走不到 `ReqLog`，外层补流水时从这里取。
-    *log_state.session_key.lock() = session_key.clone();
+    *log_state.session_key.lock() = log_session_key.clone();
     *log_state.session_id_in.lock() = inbound_session.clone();
     /// [`SessionPlan`] 借出来给选号用的那一份：换号重试要反复构 `Select`，捆成 `Copy` 的一份
     /// 免得那几处漏传哪一项。
@@ -742,11 +753,13 @@ pub(super) async fn handle_inner(
         key: Option<&'a str>,
         per_session: bool,
         passthrough: bool,
+        follow_only: bool,
     }
     let session_sel = SessionSel {
         key: session_key.as_deref().filter(|_| plan.binds),
         per_session: plan.per_session,
         passthrough: plan.passthrough,
+        follow_only: plan.follow_only,
     };
 
     // 3) 按 device_id（或会话键，见 [`SessionSel`]）粘性选出凭证的 access_token（必要时刷新）。
@@ -764,6 +777,7 @@ pub(super) async fn handle_inner(
             session_key: session.key,
             per_session: session.per_session,
             passthrough_session: session.passthrough,
+            follow_only: session.follow_only,
             rate_limited: billable,
             exclude,
             model,
@@ -1894,7 +1908,7 @@ pub(super) async fn handle_inner(
             let mut forensics = store::Forensics {
                 // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
                 // 「看请求」按它筛，见 [`store::Forensics::session_key`]。
-                session_key: session_key.clone(),
+                session_key: log_session_key.clone(),
                 // 来访自报的会话 id；`capture_forensics_without_body` 给的 `session_id` 是
                 // **出站**那个，走模拟时两者不同。
                 session_id_in: inbound_session.clone(),

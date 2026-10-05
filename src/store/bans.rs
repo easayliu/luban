@@ -19,6 +19,7 @@ impl CredentialStore {
         let tx = conn.unchecked_transaction()?;
         let ts: i64 = tx.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
         tx.execute("DELETE FROM device_bindings WHERE cred_id = ?1", [id])?;
+        log_removed(&tx, "unbound", Some("account_banned"), "cred_id = ?1", [id])?;
         tx.execute("DELETE FROM session_bindings WHERE cred_id = ?1", [id])?;
         let updated = tx.execute(
             "UPDATE credentials SET disabled = 1, ban_reason = ?2, resume_at = NULL, \

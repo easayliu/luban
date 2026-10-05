@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
+  ChevronDownIcon,
   CopyIcon,
   MessagesSquareIcon,
   PencilIcon,
@@ -14,19 +15,23 @@ import {
   clearCredentialSessions,
   listCredentialDevices,
   listCredentialSessions,
+  listSessionEvents,
+  listSlotEvents,
   unbindCredentialDevice,
   unbindCredentialSession,
   type Credential,
   type DeviceBinding,
   type SessionBinding,
+  type SessionEvent,
 } from '@/api/credentials'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Language } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import {
   cn,
   copyText,
   displayCredentialLabel,
   extractError,
+  formatDuration,
   formatFullTime,
   formatUsd,
   parseSessionKey,
@@ -39,6 +44,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   Card,
   CardAction,
@@ -693,6 +699,193 @@ function CapacityStat({ label, value }: { label: string; value: string }) {
  * 上对齐。宽度按值的字形定：计数走默认的 2.75rem（够 `12,345`），金额传 `w-14`（够 `$0.0042`
  * 与 `$123.45`）；再长的值把这一格撑开，只影响那一行。
  */
+/**
+ * 会话行展开后的明细：完整会话键直接摆出来（悬浮提示里看不全、也没法选中复制），连同来访与上游
+ * 两侧的会话 ID、槽位、模型和完整时间，下面是这条会话的历史事件。列表只含 TTL 内的绑定（后端
+ * `list_sessions` 与名额计数同一口径），所以状态恒为活跃。面板收起时不挂载，事件在展开时才拉。
+ */
+function SessionDetails({
+  credId,
+  session,
+  source,
+  value,
+  passthrough,
+}: {
+  credId: number
+  session: SessionBinding
+  source: 'sid' | 'pfx'
+  value: string
+  passthrough: boolean
+}) {
+  const { t, language } = useI18n()
+  const [showSlot, setShowSlot] = useState(false)
+  const events = useQuery({
+    queryKey: ['session-events', credId, session.session_key],
+    queryFn: () => listSessionEvents(credId, session.session_key),
+  })
+  const slotEvents = useQuery({
+    queryKey: ['slot-events', credId, session.slot],
+    queryFn: () => listSlotEvents(credId, session.slot),
+    enabled: showSlot && !passthrough,
+  })
+  const rows: [string, string][] = [
+    [t('状态', 'Status'), t('活跃', 'Active')],
+    [t('来源', 'Source'), source === 'pfx' ? t('按缓存前缀识别', 'By cache prefix') : t('客户端自带会话 ID', 'Client session ID')],
+    [t('来访会话 ID', 'Inbound session ID'), source === 'sid' ? value : '—'],
+    [t('上游会话 ID', 'Upstream session ID'), session.session_id || '—'],
+    [t('槽位', 'Slot'), passthrough ? t('不占槽位（沿用来访 ID）', 'None (keeps the inbound ID)') : `#${session.slot}`],
+    [t('最近模型', 'Last model'), session.last_model ?? '—'],
+    [t('首次绑定', 'First bound'), formatFullTime(session.created_at, language)],
+    [t('最近活跃', 'Last active'), formatFullTime(session.last_seen_at, language)],
+  ]
+  return (
+    <div className="mt-2 space-y-2 border-t pt-2 pl-6 text-xs">
+      <pre className="whitespace-pre-wrap break-all rounded-md bg-muted px-2.5 py-1.5 font-mono text-muted-foreground select-all">
+        {session.session_key}
+      </pre>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+        {rows.map(([label, text]) => (
+          <div key={label} className="contents">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="min-w-0 break-all font-mono">{text}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="space-y-1 border-t pt-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground">{t('历史事件', 'History')}</span>
+          {!passthrough && (
+            <Button size="xs" variant="ghost" onClick={() => setShowSlot((v) => !v)} aria-expanded={showSlot}>
+              {showSlot ? t('收起槽位历史', 'Hide slot history') : t(`槽位 #${session.slot} 历史`, `Slot #${session.slot} history`)}
+            </Button>
+          )}
+        </div>
+        <EventList query={events} language={language} />
+      </div>
+      {showSlot && !passthrough && (
+        <div className="space-y-1 border-t pt-2">
+          <span className="text-muted-foreground">
+            {t(
+              `槽位 #${session.slot}（上游会话 ID ${session.session_id.slice(0, 8)}）先后被哪些会话使用`,
+              `Sessions that used slot #${session.slot} (upstream session ID ${session.session_id.slice(0, 8)})`,
+            )}
+          </span>
+          <EventList query={slotEvents} language={language} showKey />
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 事件列表：时间、事件名、明细一行；`showKey` 时每行再带是哪条会话（槽位历史用）。 */
+function EventList({
+  query,
+  language,
+  showKey = false,
+}: {
+  query: UseQueryResult<SessionEvent[]>
+  language: Language
+  showKey?: boolean
+}) {
+  const { t } = useI18n()
+  if (query.isPending) return <Skeleton className="h-4 w-3/5" />
+  if (query.error) {
+    return <p className="text-destructive-foreground">{extractError(query.error, language)}</p>
+  }
+  if (!query.data || query.data.length === 0) {
+    return <p className="text-muted-foreground">{t('7 天内没有记录', 'Nothing recorded in the last 7 days')}</p>
+  }
+  return (
+    <ul className="space-y-0.5">
+      {query.data.map((e) => (
+        <li key={e.id} className="grid grid-cols-[5.5rem_6rem_1fr] gap-x-3">
+          <span className="text-muted-foreground" title={formatFullTime(e.ts, language)}>
+            {relativeTime(e.ts, undefined, language)}
+          </span>
+          <span>{eventLabel(e.event, t)}</span>
+          <span className="min-w-0 break-all text-muted-foreground">
+            {showKey && <span className="font-mono text-foreground">{shortKey(e.session_key, t)} · </span>}
+            {eventDetail(e, t, language)}
+          </span>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+type T = (zh: string, en: string) => string
+
+function eventLabel(event: string, t: T): string {
+  switch (event) {
+    case 'bound': return t('新建绑定', 'Bound')
+    case 'slot_taken': return t('接手槽位', 'Took slot')
+    case 'evicted': return t('槽位被接手', 'Slot taken over')
+    case 'resumed': return t('休眠后恢复', 'Resumed')
+    case 'reslotted': return t('换槽位', 'Changed slot')
+    case 'rebound': return t('改绑', 'Rebound')
+    case 'unbound': return t('解绑', 'Unbound')
+    case 'expired': return t('过期清理', 'Expired')
+    default: return event
+  }
+}
+
+function reasonLabel(reason: string, t: T): string {
+  switch (reason) {
+    case 'disabled': return t('账号停用或已删除', 'account disabled or removed')
+    case 'model_denied': return t('套餐不含该模型', 'model not in plan')
+    case 'retried': return t('上游失败换号', 'switched after upstream failure')
+    case 'cooling': return t('账号冷却中', 'account cooling down')
+    case 'full': return t('名额已满', 'session limit reached')
+    case 'bare_limit': return t('裸请求速率已满', 'bare request rate limit reached')
+    case 'manual': return t('手动解绑', 'unbound manually')
+    case 'clear': return t('一键清空', 'cleared all')
+    case 'account_disabled': return t('账号停用', 'account disabled')
+    case 'account_paused': return t('账号自动暂停', 'account paused automatically')
+    case 'account_banned': return t('账号自动封停', 'account banned automatically')
+    case 'account_removed': return t('账号删除', 'account removed')
+    default: return reason
+  }
+}
+
+/** 会话键的短写：来源加值的前 8 位，与流水那一格同一种写法。 */
+function shortKey(key: string, t: T): string {
+  const { source, value } = parseSessionKey(key)
+  return `${source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${value.slice(0, 8)}`
+}
+
+function eventDetail(e: SessionEvent, t: T, language: Language): string {
+  const account = (id: number | null, label: string | null) =>
+    id == null ? '—' : label ? displayCredentialLabel(label, language) : t(`账号 #${id}（已删除）`, `Account #${id} (removed)`)
+  const slot = (n: number | null) => (n == null ? '—' : n < 0 ? t('不占槽位', 'no slot') : `#${n}`)
+  const idle = e.idle_secs != null ? t(`闲置 ${formatDuration(e.idle_secs, language)}`, `idle ${formatDuration(e.idle_secs, language)}`) : null
+  const here = `${account(e.cred_id, e.cred_label)} · ${slot(e.slot)}`
+  const parts: (string | null)[] = (() => {
+    switch (e.event) {
+      case 'slot_taken':
+        return [here, e.other_key ? t(`前任 ${shortKey(e.other_key, t)}`, `previous ${shortKey(e.other_key, t)}`) : null, idle]
+      case 'evicted':
+        return [here, e.other_key ? t(`接手者 ${shortKey(e.other_key, t)}`, `taken by ${shortKey(e.other_key, t)}`) : null, idle]
+      case 'resumed':
+      case 'reslotted':
+        return [e.prev_slot != null && e.prev_slot !== e.slot
+          ? `${account(e.cred_id, e.cred_label)} · ${slot(e.prev_slot)} → ${slot(e.slot)}`
+          : here]
+      case 'rebound':
+        return [
+          `${account(e.prev_cred_id, e.prev_cred_label)} ${slot(e.prev_slot)} → ${account(e.cred_id, e.cred_label)} ${slot(e.slot)}`,
+          e.reason ? reasonLabel(e.reason, t) : null,
+        ]
+      case 'unbound':
+        return [here, e.reason ? reasonLabel(e.reason, t) : null, idle]
+      case 'expired':
+        return [here, idle]
+      default:
+        return [here]
+    }
+  })()
+  return parts.filter(Boolean).join(' · ')
+}
+
 function DeviceStat({
   label,
   value,
@@ -921,6 +1114,14 @@ export function SessionList({
   const readOnly = useReadOnly()
   const qc = useQueryClient()
   const queryKey = ['credential-sessions', credId] as const
+  // 展开着的会话详情里的历史事件跟着会话列表走：列表每拉完一次（刷新、解绑、窗口回到前台），
+  // 这个号的会话事件与槽位历史一并失效重拉，详情开着也能看到新事件。放在列表这一层而不是
+  // 外面的对话框：账号详情页也直接用这个列表，对话框在那里根本没挂载。
+  useEffect(() => {
+    if (isFetching) return
+    qc.invalidateQueries({ queryKey: ['session-events', credId] })
+    qc.invalidateQueries({ queryKey: ['slot-events', credId] })
+  }, [isFetching, credId, qc])
   // 点「看请求」时带着这条会话的键去查流水；关掉就置空，对话框不常驻。
   const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
   const unbind = useMutation({
@@ -1050,103 +1251,114 @@ export function SessionList({
             const modelLabel = session.last_model ? `${session.last_model} · ` : ''
             return (
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
-                <div className="flex min-w-0 items-center gap-2">
-                  <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  {passthrough ? (
-                    <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用客户端自带的会话 ID（按账号转换后发往上游），不占槽位', 'A real client session: it keeps the client’s own session ID (converted per account before going upstream) and takes no slot')}>
-                      {t('真实', 'Real')}
+                <Collapsible>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                    {passthrough ? (
+                      <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用客户端自带的会话 ID（按账号转换后发往上游），不占槽位', 'A real client session: it keeps the client’s own session ID (converted per account before going upstream) and takes no slot')}>
+                        {t('真实', 'Real')}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
+                        #{session.slot}
+                      </Badge>
+                    )}
+                    <Tooltip>
+                      <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">
+                        {session.session_id || '—'}
+                      </TooltipTrigger>
+                      <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
+                        {/* 真实客户端没带会话 ID（按前缀分会话）时出站也没有，后端给空串。 */}
+                        {session.session_id
+                          ? t(`上游可见的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)
+                          : t('客户端未携带会话 ID，按缓存前缀与首条用户消息识别对话', 'The client sent no session ID; the conversation is identified by cache prefix and first user message')}
+                        <br />
+                        {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
+                      </TooltipPopup>
+                    </Tooltip>
+                    <Badge variant="secondary" size="sm">
+                      {derived ? t('按前缀', 'By prefix') : t('自带 ID', 'Client ID')}
                     </Badge>
-                  ) : (
-                    <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
-                      #{session.slot}
-                    </Badge>
-                  )}
-                  <Tooltip>
-                    <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">
-                      {session.session_id || '—'}
-                    </TooltipTrigger>
-                    <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
-                      {/* 真实客户端没带会话 ID（按前缀分会话）时出站也没有，后端给空串。 */}
-                      {session.session_id
-                        ? t(`上游可见的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)
-                        : t('客户端未携带会话 ID，按缓存前缀与首条用户消息识别对话', 'The client sent no session ID; the conversation is identified by cache prefix and first user message')}
-                      <br />
-                      {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
-                    </TooltipPopup>
-                  </Tooltip>
-                  <Badge variant="secondary" size="sm">
-                    {derived ? t('按前缀', 'By prefix') : t('自带 ID', 'Client ID')}
-                  </Badge>
-                  {session.session_id && (
-                  <Tooltip>
-                    <TooltipTrigger
-                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`复制会话 ID ${session.session_id}`, `Copy session ID ${session.session_id}`)}
-                      onClick={async () => {
-                        const copied = await copyText(session.session_id)
-                        toastManager.add(copied
-                          ? { title: t('已复制会话 ID', 'Session ID copied'), type: 'success' }
-                          : { title: t('复制失败', 'Copy failed'), description: session.session_id, type: 'error' })
-                      }}
-                    >
-                      <CopyIcon />
-                    </TooltipTrigger>
-                    <TooltipPopup>{t('复制会话 ID', 'Copy session ID')}</TooltipPopup>
-                  </Tooltip>
-                  )}
-                  <Tooltip>
-                    <TooltipTrigger
-                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(`查看该会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
-                      // 按**对话键**筛而不是按上游那个 session_id：后者按槽位派生、对话之间
-                      // 复用，按它筛会把先后占过同一槽位的几个对话混成一条。
-                      onClick={() => setDrill({
-                        credId,
-                        sessionKey: session.session_key,
-                        label: passthrough
-                          ? t(`会话 ${(session.session_id || value).slice(0, 8)}`, `Session ${(session.session_id || value).slice(0, 8)}`)
-                          : t(`会话 #${session.slot}`, `Session #${session.slot}`),
-                        hours: 24,
-                      })}
-                    >
-                      <ScrollTextIcon />
-                    </TooltipTrigger>
-                    <TooltipPopup>{t('查看该会话的请求','View this session’s requests')}</TooltipPopup>
-                  </Tooltip>
-                  {!readOnly && (
-                    <Button
-                      size="xs"
-                      variant="destructive-outline"
-                      className="ml-1 shrink-0"
-                      loading={unbind.isPending && unbind.variables === session.session_key}
-                      disabled={unbind.isPending && unbind.variables !== session.session_key}
-                      onClick={() => unbind.mutate(session.session_key)}
-                      aria-label={t(`解绑会话 ${session.session_key}`, `Unbind session ${session.session_key}`)}
-                    >
-                      <UnlinkIcon />
-                      {t('解绑', 'Unbind')}
-                    </Button>
-                  )}
-                </div>
-                <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
-                  <Tooltip>
-                    <TooltipTrigger render={<span />} className="min-w-0 truncate">
-                      {t(
-                        `${modelLabel}首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
-                        `${modelLabel}First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
-                      )}
-                    </TooltipTrigger>
-                    <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
-                      {t(
-                        `${modelLabel}首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
-                        `${modelLabel}First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
-                      )}
-                    </TooltipPopup>
-                  </Tooltip>
-                  <div className="flex shrink-0 items-baseline gap-3 tabular-nums">
-                    <DeviceStat label={t('请求', 'Requests')} value={session.request_count.toLocaleString(locale)} />
+                    {session.session_id && (
+                    <Tooltip>
+                      <TooltipTrigger
+                        className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
+                        aria-label={t(`复制会话 ID ${session.session_id}`, `Copy session ID ${session.session_id}`)}
+                        onClick={async () => {
+                          const copied = await copyText(session.session_id)
+                          toastManager.add(copied
+                            ? { title: t('已复制会话 ID', 'Session ID copied'), type: 'success' }
+                            : { title: t('复制失败', 'Copy failed'), description: session.session_id, type: 'error' })
+                        }}
+                      >
+                        <CopyIcon />
+                      </TooltipTrigger>
+                      <TooltipPopup>{t('复制会话 ID', 'Copy session ID')}</TooltipPopup>
+                    </Tooltip>
+                    )}
+                    <Tooltip>
+                      <TooltipTrigger
+                        className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
+                        aria-label={t(`查看该会话的请求 ${session.session_id}`, `View requests for session ${session.session_id}`)}
+                        // 按**对话键**筛而不是按上游那个 session_id：后者按槽位派生、对话之间
+                        // 复用，按它筛会把先后占过同一槽位的几个对话混成一条。
+                        onClick={() => setDrill({
+                          credId,
+                          sessionKey: session.session_key,
+                          label: passthrough
+                            ? t(`会话 ${(session.session_id || value).slice(0, 8)}`, `Session ${(session.session_id || value).slice(0, 8)}`)
+                            : t(`会话 #${session.slot}`, `Session #${session.slot}`),
+                          hours: 24,
+                        })}
+                      >
+                        <ScrollTextIcon />
+                      </TooltipTrigger>
+                      <TooltipPopup>{t('查看该会话的请求','View this session’s requests')}</TooltipPopup>
+                    </Tooltip>
+                    {!readOnly && (
+                      <Button
+                        size="xs"
+                        variant="destructive-outline"
+                        className="ml-1 shrink-0"
+                        loading={unbind.isPending && unbind.variables === session.session_key}
+                        disabled={unbind.isPending && unbind.variables !== session.session_key}
+                        onClick={() => unbind.mutate(session.session_key)}
+                        aria-label={t(`解绑会话 ${session.session_key}`, `Unbind session ${session.session_key}`)}
+                      >
+                        <UnlinkIcon />
+                        {t('解绑', 'Unbind')}
+                      </Button>
+                    )}
                   </div>
-                </div>
+                  <div className="mt-1 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 pl-6 text-muted-foreground text-xs">
+                    <Tooltip>
+                      <TooltipTrigger render={<span />} className="min-w-0 truncate">
+                        {t(
+                          `${modelLabel}首次绑定 ${firstBoundRelative} · 最近活跃 ${lastSeenRelative}`,
+                          `${modelLabel}First bound ${firstBoundRelative} · Last active ${lastSeenRelative}`,
+                        )}
+                      </TooltipTrigger>
+                      <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                        {t(
+                          `${modelLabel}首次绑定 ${firstBoundFull} · 最近活跃 ${lastSeenFull}`,
+                          `${modelLabel}First bound ${firstBoundFull} · Last active ${lastSeenFull}`,
+                        )}
+                      </TooltipPopup>
+                    </Tooltip>
+                    <div className="flex shrink-0 items-center gap-3 tabular-nums">
+                      <DeviceStat label={t('请求', 'Requests')} value={session.request_count.toLocaleString(locale)} />
+                      <CollapsibleTrigger
+                        className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'group shrink-0')}
+                        aria-label={t('展开会话详情', 'Expand session details')}
+                      >
+                        <ChevronDownIcon className="transition-transform group-data-panel-open:rotate-180" />
+                      </CollapsibleTrigger>
+                    </div>
+                  </div>
+                  <CollapsiblePanel>
+                    <SessionDetails credId={credId} session={session} source={source} value={value} passthrough={passthrough} />
+                  </CollapsiblePanel>
+                </Collapsible>
               </li>
             )
           })}

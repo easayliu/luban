@@ -991,6 +991,66 @@ impl CcRequestKind {
         Self::Main
     }
 
+    /// 一次性侧查询：不带对话历史、没有要续的 thinking 签名，落在哪个号上都不连累主线程。
+    /// 匿名来访（没有设备身份）的这几类不占会话名额，见 [`super::session_id::session_plan`]。
+    ///
+    /// **判据比 [`Self::of`] 严得多**：那边的类别还管 beta 与会话链字段，标题只凭
+    /// `structured-outputs` beta、辅助调用只凭「无工具」——第三方客户端开着结构化输出的多轮
+    /// 对话、不带工具的普通多轮对话都会落进去，当成侧查询就丢了会话亲和、绕过了会话名额。这里
+    /// 要求**只有一条消息**，且命中官方那一类独有的内容（全部抓包里的侧查询逐条核过，都是一条
+    /// 消息）：
+    ///
+    /// | 类别 | 内容特征 |
+    /// |---|---|
+    /// | 额度探测 / 预热 | `max_tokens:1`（[`Self::of`] 已判），一个 token 撑不起对话 |
+    /// | 标题 / 起名 | system 里有「You are naming a coding session」/「Generate a short kebab-case name」 |
+    /// | 安全分类 | system 里有「You are a security monitor for autonomous AI coding agents」 |
+    /// | WebFetch 页面处理 | 无工具，消息以「Web page content:」开头（主线程发起的是 `Auxiliary`，子代理发起的是 `Helper`） |
+    /// | WebSearch 子调用 | [`super::simulation::is_official_web_search_request`] |
+    ///
+    /// `count_tokens` 按路径认、不在这里判（调用方对不计费路径直接给类别）：它本来就不占会话。
+    pub(super) fn is_side_query(self, v: &serde_json::Value) -> bool {
+        let single = v.get("messages").and_then(|m| m.as_array()).is_some_and(|m| {
+            m.len() == 1 && m[0].get("role").and_then(|r| r.as_str()) == Some("user")
+        });
+        if !single {
+            return false;
+        }
+        match self {
+            Self::QuotaProbe | Self::Prewarm => true,
+            Self::Title => {
+                system_contains(v, "You are naming a coding session")
+                    || system_contains(v, "Generate a short kebab-case name")
+            }
+            Self::Classifier => {
+                system_contains(v, "You are a security monitor for autonomous AI coding agents")
+            }
+            Self::Auxiliary | Self::Helper => {
+                super::simulation::is_official_web_search_request(v)
+                    || (super::simulation::field_is_empty(v.get("tools"))
+                        && last_user_text_starts_with(v, "Web page content:"))
+            }
+            _ => false,
+        }
+    }
+
+    /// 写进匿名侧查询会话键的类别段（[`super::body::anon_session_key`]）。
+    pub(super) fn tag(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Subagent => "subagent",
+            Self::Suggestion => "suggestion",
+            Self::Helper => "helper",
+            Self::Auxiliary => "auxiliary",
+            Self::Fork => "fork",
+            Self::Prewarm => "prewarm",
+            Self::CountTokens => "count_tokens",
+            Self::Title => "title",
+            Self::Classifier => "classifier",
+            Self::QuotaProbe => "quota_probe",
+        }
+    }
+
     /// 只有主线程会换新一轮 `cc_prompt_id`；其余都挂在会话现有那一轮上。
     fn rotates_prompt(self) -> bool {
         self == Self::Main
@@ -1124,6 +1184,18 @@ pub(super) fn client_session_link(
         .and_then(|v| v.to_str().ok())
         .and_then(super::body::trusted_cc_version);
     Some((session_id, link.with_diagnostics(kind.wants_diagnostics(version))))
+}
+
+/// `system` 里（块数组的任一 text 块，或字符串形态的整段）是否包含 `needle`。
+fn system_contains(v: &serde_json::Value, needle: &str) -> bool {
+    match v.get("system") {
+        Some(serde_json::Value::String(s)) => s.contains(needle),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.contains(needle)),
+        _ => false,
+    }
 }
 
 /// 末条用户消息是不是本地命令起的一轮：`!` 跑的 shell 命令（`<bash-input>`）或提示词型斜杠

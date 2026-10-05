@@ -225,6 +225,11 @@ pub struct Select<'a> {
     /// 这条会话出站沿用来访自己的会话 id（真实客户端，不走模拟），不分配派生用的槽位：
     /// 绑定行 `slot` 记 `-1`，后台列会话时据此按来访 id 算上游看到的那个。
     pub passthrough_session: bool,
+    /// 匿名侧查询（标题、分类、探测这类一次性请求，见 `crate::proxy::session_plan`）：按
+    /// [`Self::session_key`] 只**跟随**——那个键有活跃绑定、原号可调度就落到原号并沿用它的
+    /// 槽位（出站会话 id 与主线程一致），否则当裸请求按负载选号。两种情况都**不写绑定、不占
+    /// 会话名额**，原号 RPM 满了也不就地拒、直接分散（没有要续的 thinking 签名）。
+    pub follow_only: bool,
     /// 设备绑定**占名额**的有效期（秒）；`<= 0` 表示永不过期。
     pub ttl_secs: i64,
     /// 软绑定保留期（秒）：绑定行超过 [`Self::ttl_secs`] 后不再占名额，但在这个时长内仍然
@@ -319,6 +324,7 @@ impl CredentialStore {
             session_key,
             per_session,
             passthrough_session,
+            follow_only,
             ttl_secs,
             retention_secs,
             session_ttl_secs,
@@ -428,6 +434,9 @@ impl CredentialStore {
             return Err(ModelUnsupported { model: m.to_string(), accounts: all.len() }.into());
         }
         // 本次请求已经试过的号（上游 429 换号重试时传进来）直接出局——重试再撞同一个号毫无意义。
+        // 改绑事件要分清原号为什么回不去（见下面命中既有绑定那一步），停用/删除的号此后就不在
+        // 池子里了，先记下启用的全集。
+        let enabled: HashSet<i64> = all.iter().map(|c| c.id).collect();
         let mut pool = all;
         pool.retain(|c| !exclude.contains(&c.id) && !denied.contains(&c.id));
         if pool.is_empty() {
@@ -448,6 +457,43 @@ impl CredentialStore {
                 .max(1);
             return Err(AllRateLimited { retry_after_secs, refresh_failed: None }.into());
         }
+
+        // 裸请求速率上限：没有设备身份的都算裸请求，按会话键绑定的也是——那道上限限的是「没有
+        // 设备身份可依据」的流量，会话键是 luban 自己从体里算的，不是客户端的身份。
+        let bare_window = Duration::from_secs(rate_window.max(1) as u64);
+        let bare_ok = |c: &Credential| {
+            device_id.is_some()
+                || !rate_limited
+                || self.bare_rate.has_room(c.id, rate_limit, bare_window)
+        };
+
+        // 匿名侧查询先找主线程（[`Select::follow_only`]）：同一个会话键有活跃绑定、原号还能调度
+        // 就跟过去，绑定行一个字不动；跟不上就当裸请求往下按负载选，同样不写绑定。
+        if follow_only && let Some(Binding::Session(key)) = binding {
+            let bound: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT cred_id, slot FROM session_bindings WHERE session_key = ?1 \
+                        AND (?2 <= 0 OR last_seen_at >= unixepoch() - ?2)",
+                    params![key, session_ttl_secs],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((cid, slot)) = bound
+                && let Some(c) = creds.iter().find(|c| c.id == cid)
+                && bare_ok(c)
+                && rpm_room(c)
+            {
+                if let Some(did) = affinity_device {
+                    upsert_device_binding(&conn, did, c.id, device_retention)?;
+                }
+                self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
+                if device_id.is_none() && rate_limited {
+                    self.bare_rate.take(c.id, rate_limit, bare_window);
+                }
+                return Ok((c.clone(), (slot >= 0).then_some(slot)));
+            }
+        }
+        let binding = binding.filter(|_| !follow_only);
 
         // 各凭证当前**占名额**的设备数或模拟会话数：只数 TTL 内活跃的绑定，休眠的软绑定不占位
         // （口径与 [`Self::device_counts`] / [`Self::session_counts`] 一致，后台看到的数就是这里
@@ -490,16 +536,9 @@ impl CredentialStore {
         };
         // 还塞得下一台设备 / 一条会话吗（上限 <= 0 即不限）。
         let has_room = |c: &Credential| limit_of(c) <= 0 || used(c) < limit_of(c);
-        // 裸请求速率上限：没有设备身份的都算裸请求，按会话键绑定的也是——那道上限限的是「没有
-        // 设备身份可依据」的流量，会话键是 luban 自己从体里算的，不是客户端的身份。
-        let bare_window = Duration::from_secs(rate_window.max(1) as u64);
-        let bare_ok = |c: &Credential| {
-            device_id.is_some()
-                || !rate_limited
-                || self.bare_rate.has_room(c.id, rate_limit, bare_window)
-        };
 
-        // 1/2/3) 命中既有绑定。
+        // 1/2/3) 命中既有绑定。会话绑定回不去原号、往下改选时，记下原号与原因，改绑事件用。
+        let mut rebind_from: Option<(i64, i64, &'static str)> = None;
         if let Some(b) = binding {
             // 第二列是「这条绑定还在 TTL 内吗」，交给 SQLite 与清理/计数用同一个 unixepoch()
             // 时钟判定，免得和进程时钟差出一个边界。
@@ -555,9 +594,27 @@ impl CredentialStore {
                                 } else {
                                     free_session_slot(&conn, c.id, session_ttl_secs, Some(old))?
                                 };
+                                // 休眠后回来记一条恢复（槽位变没变都记）；活跃中换了槽位（沿用
+                                // 来访 ID 与派生槽位之间切换，0 ↔ -1）记一条换槽位。新拿的槽位若是
+                                // 从别的休眠绑定手里接过来的，再记一对接手事件。
+                                if !active || slot != old {
+                                    log_event(
+                                        &conn,
+                                        NewEvent {
+                                            key,
+                                            event: if active { "reslotted" } else { "resumed" },
+                                            cred_id: Some(c.id),
+                                            prev_cred_id: Some(c.id),
+                                            slot: Some(slot),
+                                            prev_slot: Some(old),
+                                            ..Default::default()
+                                        },
+                                    )?;
+                                    note_slot_takeover(&conn, c.id, slot, key, session_ttl_secs)?;
+                                }
                                 conn.execute(
                                     "UPDATE session_bindings \
-                                        SET slot = ?2, last_seen_at = unixepoch(), \
+                                        SET slot = ?2, slot_lost = 0, last_seen_at = unixepoch(), \
                                             request_count = request_count + 1, \
                                             last_model = COALESCE(?3, last_model) \
                                       WHERE session_key = ?1",
@@ -585,6 +642,24 @@ impl CredentialStore {
                         }
                         return Ok((c.clone(), slot));
                     }
+                }
+                if let Binding::Session(key) = b {
+                    // 判定顺序与上面过滤候选的顺序一致：停用/删除 → 模型不支持 → 本轮已试过 →
+                    // 冷却 → 名额 → 裸请求速率。
+                    let reason = match creds.iter().find(|c| c.id == cid) {
+                        _ if !enabled.contains(&cid) => "disabled",
+                        _ if denied.contains(&cid) => "model_denied",
+                        _ if exclude.contains(&cid) => "retried",
+                        None => "cooling",
+                        Some(c) if !(active || has_room(c)) => "full",
+                        Some(_) => "bare_limit",
+                    };
+                    let old: i64 = conn.query_row(
+                        "SELECT slot FROM session_bindings WHERE session_key = ?1",
+                        [key],
+                        |r| r.get(0),
+                    )?;
+                    rebind_from = Some((cid, old, reason));
                 }
                 // 回不去原号（停用/删除/冷却中/本轮已试过/名额已满）：往下重新选择，
                 // 选中谁就**改绑**到谁（`INSERT … ON CONFLICT DO UPDATE cred_id`）。
@@ -683,11 +758,31 @@ impl CredentialStore {
                 } else {
                     free_session_slot(&conn, chosen.id, session_ttl_secs, None)?
                 };
+                // 原号回不去而改选的记改绑（带原号、原槽位与原因），其余是新建；拿到的槽位若是
+                // 从休眠绑定手里接过来的，另记一对接手事件。
+                let (event, prev_cred_id, prev_slot, reason) = match rebind_from {
+                    Some((cid, old, reason)) => ("rebound", Some(cid), Some(old), Some(reason)),
+                    None => ("bound", None, None, None),
+                };
+                log_event(
+                    &conn,
+                    NewEvent {
+                        key,
+                        event,
+                        cred_id: Some(chosen.id),
+                        prev_cred_id,
+                        slot: Some(slot),
+                        prev_slot,
+                        reason,
+                        ..Default::default()
+                    },
+                )?;
+                note_slot_takeover(&conn, chosen.id, slot, key, session_ttl_secs)?;
                 conn.execute(
                     "INSERT INTO session_bindings (session_key, cred_id, slot, last_model) \
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(session_key) DO UPDATE
-                        SET cred_id = ?2, slot = ?3, last_seen_at = unixepoch(), \
+                        SET cred_id = ?2, slot = ?3, slot_lost = 0, last_seen_at = unixepoch(), \
                             created_at = CASE WHEN ?5 > 0 \
                                                 AND last_seen_at < unixepoch() - ?5 \
                                               THEN unixepoch() ELSE created_at END, \

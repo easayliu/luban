@@ -1235,6 +1235,38 @@ fn passthrough_sessions_do_not_take_derived_slots() {
     assert_eq!(store.session_count(a).unwrap(), 3, "真实会话照样占名额");
 }
 
+/// 匿名侧查询（[`Select::follow_only`]）：会话键有活跃绑定就跟到原号、带回原槽位，名额满了
+/// 也照跟；找不到或已休眠就按负载选号。两种情况都不写绑定、不占名额，原绑定行一个字不动。
+#[test]
+fn follow_only_side_queries_never_bind() {
+    let (store, ids) = soft_store(&["a", "b"]);
+    let (a, b) = (ids[0], ids[1]);
+    store.set_setting(DEFAULT_SESSION_LIMIT, "1").unwrap();
+    let side = |key| Select { follow_only: true, ..soft_session(key) };
+
+    let (c, slot) = store.select_with_slot(soft_session("s1")).unwrap();
+    assert_eq!((c.id, slot), (a, Some(0)));
+    let before = store.list_sessions(a).unwrap();
+    // a 的名额已满，侧查询照样跟过去，带回主线程那个槽位。
+    let (c, slot) = store.select_with_slot(side("s1")).unwrap();
+    assert_eq!((c.id, slot), (a, Some(0)), "跟随主线程");
+    assert_eq!(
+        store.list_sessions(a).unwrap()[0].request_count,
+        before[0].request_count,
+        "不动绑定行"
+    );
+    // 没有主线程的键：不建绑定、不占名额，也不因名额满被拒。
+    let (_, slot) = store.select_with_slot(side("lost")).unwrap();
+    assert_eq!(slot, None);
+    assert_eq!(store.session_slot(a, "lost").unwrap(), None);
+    assert_eq!(store.session_slot(b, "lost").unwrap(), None);
+    assert_eq!(store.session_counts().unwrap().get(&b).copied(), None, "b 一个名额都没占");
+    // 主线程休眠：不跟（槽位可能已让给别的对话），按负载选、槽位不带回。
+    age_session_binding(&store, "s1", 600);
+    assert_eq!(store.select_with_slot(side("s1")).unwrap().1, None);
+    assert_eq!(store.session_count(a).unwrap(), 0, "休眠的那条没被侧查询续上");
+}
+
 /// 会话槽位：新对话取该号上最小的空位，同键续用原槽位；休眠后原槽位被别的对话拿走就换
 /// 最小空位、空着就回原位；解绑腾出的槽位被下一个对话复用；槽位派生的会话 id 恒定且各不同。
 #[test]
@@ -4905,4 +4937,179 @@ fn migration_normalizes_stored_socks_schemes() {
     init_schema(&conn).unwrap();
     assert_eq!(got(1).as_deref(), Some("socks5h://u:p@example.com:1080"));
     assert_eq!(got(2).as_deref(), Some("socks4://10.0.0.1:1080"));
+}
+
+/// 会话绑定的历史事件：新建、接手休眠绑定的槽位（新键 `slot_taken`、前任 `evicted`）、休眠后
+/// 恢复（换了槽位）、上游失败换号改绑、手动解绑、停用账号、过期清理，以及槽位历史与 7 天清理。
+#[test]
+fn session_binding_events_follow_state_changes() {
+    let (store, ids) = soft_store(&["a", "b"]);
+    let (a, b) = (ids[0], ids[1]);
+    let kinds = |key: &str| -> Vec<String> {
+        store.session_events(key).unwrap().into_iter().rev().map(|e| e.event).collect()
+    };
+
+    // 新建；同键续用不再记。
+    store.select_for_device(soft_session("s1")).unwrap();
+    store.select_for_device(soft_session("s1")).unwrap();
+    assert_eq!(kinds("s1"), ["bound"]);
+    let e = &store.session_events("s1").unwrap()[0];
+    assert_eq!((e.cred_id, e.slot, e.cred_label.as_deref()), (Some(a), Some(0), Some("a")));
+
+    // s1 休眠，s2 接手槽位 0；s1 回来换到槽位 1。
+    age_session_binding(&store, "s1", 600);
+    store.select_for_device(soft_session("s2")).unwrap();
+    assert_eq!(kinds("s2"), ["bound", "slot_taken"]);
+    let taken = &store.session_events("s2").unwrap()[0];
+    assert_eq!(taken.other_key.as_deref(), Some("s1"));
+    assert!(taken.idle_secs.is_some_and(|s| s >= 600), "{taken:?}");
+    store.select_for_device(soft_session("s1")).unwrap();
+    assert_eq!(kinds("s1"), ["bound", "evicted", "resumed"]);
+    let resumed = &store.session_events("s1").unwrap()[0];
+    assert_eq!((resumed.prev_slot, resumed.slot), (Some(0), Some(1)));
+    // 槽位 0 的历史：s1 建、s2 建并接手、s1 被接手、s1 从这里离开。
+    let slot0: Vec<(String, String)> = store
+        .slot_events(a, 0)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .map(|e| (e.session_key, e.event))
+        .collect();
+    assert_eq!(
+        slot0,
+        [
+            ("s1".into(), "bound".into()),
+            ("s2".into(), "bound".into()),
+            ("s2".into(), "slot_taken".into()),
+            ("s1".into(), "evicted".into()),
+            ("s1".into(), "resumed".into()),
+        ]
+    );
+
+    // 上游失败换号：原号在本轮已试过，改绑到 b，带原号、原槽位与原因。
+    let tried = [a];
+    let sel = Select { exclude: &tried, ..soft_session("s2") };
+    assert_eq!(store.select_for_device(sel).unwrap().id, b);
+    let rebound = &store.session_events("s2").unwrap()[0];
+    assert_eq!(rebound.event, "rebound");
+    assert_eq!(
+        (rebound.prev_cred_id, rebound.prev_slot, rebound.cred_id, rebound.reason.as_deref()),
+        (Some(a), Some(0), Some(b), Some("retried"))
+    );
+
+    // 手动解绑与停用账号各记一条解绑，带方式。
+    assert!(store.unbind_session(b, "s2").unwrap());
+    assert_eq!(store.session_events("s2").unwrap()[0].reason.as_deref(), Some("manual"));
+    store.set_disabled(a, true).unwrap();
+    let e = &store.session_events("s1").unwrap()[0];
+    assert_eq!((e.event.as_str(), e.reason.as_deref()), ("unbound", Some("account_disabled")));
+
+    // 过期清理记 expired；7 天前的事件被清掉。
+    store.select_for_device(soft_session("s3")).unwrap();
+    age_session_binding(&store, "s3", 7200);
+    store
+        .conn
+        .lock()
+        .execute(
+            "UPDATE session_binding_events SET ts = ts - 8 * 86400 WHERE session_key = 's1'",
+            [],
+        )
+        .unwrap();
+    store.prune_expired_bindings().unwrap();
+    assert_eq!(kinds("s3"), ["bound", "expired"]);
+    assert!(store.session_events("s1").unwrap().is_empty(), "超过 7 天的事件清掉");
+}
+
+/// 历史事件的几处边界：同一秒里槽位来回被接手（按占用轮次去重，不靠事件时间戳）、活跃中在
+/// 沿用来访 ID 与派生槽位之间切换（`reslotted`）、自动封停连带清掉的绑定记解绑。
+#[test]
+fn session_binding_events_edge_cases() {
+    let (store, ids) = soft_store(&["a", "b"]);
+    let (a, b) = (ids[0], ids[1]);
+    let count = |key: &str, event: &str| {
+        store.session_events(key).unwrap().iter().filter(|e| e.event == event).count()
+    };
+
+    // x 占槽位 0 后休眠，y 接手；y 休眠，x 回来又拿回 0（接手 y）；x 再休眠，z 接手。全在同一秒，
+    // x 两次被接手都要记上，前任也不能认错。
+    store.select_for_device(soft_session("x")).unwrap();
+    age_session_binding(&store, "x", 600);
+    store.select_for_device(soft_session("y")).unwrap();
+    age_session_binding(&store, "y", 600);
+    assert_eq!(store.select_with_slot(soft_session("x")).unwrap().1, Some(0));
+    age_session_binding(&store, "x", 600);
+    store.select_for_device(soft_session("z")).unwrap();
+    assert_eq!(count("x", "evicted"), 2, "{:?}", store.session_events("x").unwrap());
+    assert_eq!(count("y", "evicted"), 1);
+    let z = &store.session_events("z").unwrap()[0];
+    assert_eq!((z.event.as_str(), z.other_key.as_deref()), ("slot_taken", Some("x")));
+
+    // 活跃中从派生槽位切到沿用来访 ID，再切回来：各记一条换槽位，带原槽位（p 落在空着的 b 上，
+    // 槽位 0）。
+    store.select_for_device(soft_session("p")).unwrap();
+    let pass = Select { passthrough_session: true, ..soft_session("p") };
+    assert_eq!(store.select_with_slot(pass).unwrap().1, None);
+    let e = &store.session_events("p").unwrap()[0];
+    assert_eq!((e.event.as_str(), e.prev_slot, e.slot), ("reslotted", Some(0), Some(-1)));
+    store.select_for_device(soft_session("p")).unwrap();
+    assert_eq!(count("p", "reslotted"), 2);
+    // 续用不换槽位不记。
+    store.select_for_device(soft_session("p")).unwrap();
+    assert_eq!(count("p", "reslotted"), 2);
+
+    // 自动封停：连带清掉的绑定记解绑。
+    let bound_to_b = Select { exclude: &[a], ..soft_session("q") };
+    assert_eq!(store.select_for_device(bound_to_b).unwrap().id, b);
+    assert!(store.record_ban(b, &BanContext { reason: "x".into(), ..Default::default() }).unwrap());
+    let e = &store.session_events("q").unwrap()[0];
+    assert_eq!((e.event.as_str(), e.reason.as_deref()), ("unbound", Some("account_banned")));
+}
+
+/// 旧库第一次补 `slot_lost` 列时按现有数据初始化槽位归属：同槽位上早已被接手的旧绑定 A 标成
+/// 已丢槽位，当前持有者 B 不动。之后解绑 B、槽位分给 C，C 不能被记成「接手 A」。
+#[test]
+fn upgrade_initializes_slot_owners() {
+    // 键要带新口径前缀，否则建表迁移会把它们当旧口径的行清掉。
+    const KA: &str = "lb:v2:sid:A";
+    const KB: &str = "lb:v2:sid:B";
+    const KC: &str = "lb:v2:sid:C";
+    const KP: &str = "lb:v2:sid:P";
+    let (store, ids) = soft_store(&["a"]);
+    let a = ids[0];
+    {
+        let conn = store.conn.lock();
+        for (key, idle) in [(KA, 7200), (KB, 600), (KP, 9000)] {
+            let slot = if key == KP { -1 } else { 0 };
+            conn.execute(
+                "INSERT INTO session_bindings (session_key, cred_id, slot, last_seen_at) \
+                 VALUES (?1, ?2, ?3, unixepoch() - ?4)",
+                params![key, a, slot, idle],
+            )
+            .unwrap();
+        }
+        // 模拟旧库：去掉这一列再走一遍建表迁移，补列那一步就会触发初始化。
+        conn.execute("ALTER TABLE session_bindings DROP COLUMN slot_lost", []).unwrap();
+        init_schema(&conn).unwrap();
+        let lost = |k: &str| -> i64 {
+            conn.query_row(
+                "SELECT slot_lost FROM session_bindings WHERE session_key = ?1",
+                [k],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!((lost(KA), lost(KB), lost(KP)), (1, 0, 0));
+        // 再跑一遍（列已在）不改动。
+        conn.execute("UPDATE session_bindings SET slot_lost = 0", []).unwrap();
+        init_schema(&conn).unwrap();
+        assert_eq!(lost(KA), 0, "列已在时不重新初始化");
+        conn.execute("UPDATE session_bindings SET slot_lost = 1 WHERE session_key = ?1", [KA])
+            .unwrap();
+    }
+    assert!(store.unbind_session(a, KB).unwrap());
+    assert_eq!(store.select_with_slot(soft_session(KC)).unwrap().1, Some(0));
+    let events: Vec<String> =
+        store.session_events(KC).unwrap().into_iter().map(|e| e.event).collect();
+    assert_eq!(events, ["bound"], "C 不该被记成接手 A");
+    assert!(store.session_events(KA).unwrap().is_empty());
 }

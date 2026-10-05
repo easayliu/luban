@@ -112,6 +112,33 @@ pub(super) async fn list_credential_sessions(
     Ok(Json(sessions))
 }
 
+/// 一条会话的历史事件（最近的在前，最多 100 条，保留 7 天）。事件跨账号：改绑之后记在新账号
+/// 上，按会话键查全部列出，路径上的账号只用来判存在。
+pub(super) async fn list_session_events(
+    State(state): State<AppState>,
+    Path((id, session_key)): Path<(i64, String)>,
+) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    let events =
+        blocking(move || state.store.session_events(&session_key).map_err(internal)).await?;
+    Ok(Json(events))
+}
+
+/// 某账号某槽位（即某个上游会话 id）先后被哪些会话用过：这个槽位上的事件，以及从它离开的
+/// 改绑与换槽位，最近的在前。
+pub(super) async fn list_slot_events(
+    State(state): State<AppState>,
+    Path((id, slot)): Path<(i64, i64)>,
+) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    let events = blocking(move || state.store.slot_events(id, slot).map_err(internal)).await?;
+    Ok(Json(events))
+}
+
 /// 一键清掉该凭证的全部模拟会话绑定，返回清掉的条数。同样不是拉黑：名额腾出来，下一条
 /// 请求照常重新选号（多半又落回这个号）。
 pub(super) async fn clear_credential_sessions(

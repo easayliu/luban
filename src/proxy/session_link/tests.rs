@@ -757,3 +757,106 @@ fn link_fields_follow_official_captures() {
     }
     assert!(bad.is_empty(), "{} 条：\n{}", bad.len(), bad.join("\n"));
 }
+
+/// 侧查询判定（[`super::CcRequestKind::is_side_query`]）与官方抓包逐条对：标题、起名、安全
+/// 分类、预热、额度探测、WebFetch 页面处理（主线程与子代理发起的）、WebSearch 子调用全算；
+/// 主线程、子代理（含摘要）、猜下一句、分叉一条都不算。抓包目录不在就跳过。
+#[test]
+fn side_queries_match_official_captures() {
+    use super::CcRequestKind as K;
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/cap");
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        eprintln!("skipped: captures not present");
+        return;
+    };
+    let mut side = 0;
+    let mut bad = Vec::new();
+    for d in dirs.flatten() {
+        for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
+            let path = f.path();
+            if !path.to_str().is_some_and(|p| p.ends_with(".req.raw")) {
+                continue;
+            }
+            let raw = std::fs::read(&path).unwrap();
+            let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = std::str::from_utf8(&raw[..sep]).unwrap();
+            // count_tokens 按路径认，不走体判据。
+            if !head.lines().next().unwrap().starts_with("POST /v1/messages?")
+                && !head.lines().next().unwrap().starts_with("POST /v1/messages ")
+            {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw[sep + 4..]) else {
+                continue;
+            };
+            let beta: Vec<String> = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case("anthropic-beta").then(|| v.trim().to_string())
+                })
+                .unwrap_or_default()
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let kind = K::of(&v, &beta);
+            let got = kind.is_side_query(&v);
+            let want = matches!(
+                kind,
+                K::Title | K::Classifier | K::Prewarm | K::QuotaProbe | K::Helper | K::Auxiliary
+            );
+            side += usize::from(got);
+            if got != want {
+                bad.push(format!("{} {kind:?}: 侧查询 {got}", path.display()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} 条：\n{}", bad.len(), bad.join("\n"));
+    assert!(side >= 40, "抓包里的侧查询少了：{side}");
+}
+
+/// 第三方的普通多轮对话不能被当成侧查询：开着结构化输出的多轮对话（[`super::CcRequestKind::of`]
+/// 判成标题）、不带工具的多轮对话（判成辅助调用）、首轮只有一条消息的普通提问，都要照常占会话。
+#[test]
+fn ordinary_conversations_are_not_side_queries() {
+    use super::CcRequestKind as K;
+    let structured = vec![config::CC_BETA_STRUCTURED_OUTPUTS.to_string()];
+    let turns = |n: usize| -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                serde_json::json!({"role": role, "content": format!("turn {i}")})
+            })
+            .collect()
+    };
+    for n in [1, 3, 5] {
+        let v = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": "You are a helpful assistant.",
+            "messages": turns(n),
+            "max_tokens": 1024
+        });
+        let kind = K::of(&v, &structured);
+        assert_eq!(kind, K::Title, "前提：结构化输出 beta 被判成标题");
+        assert!(!kind.is_side_query(&v), "结构化输出对话 {n} 条消息");
+        let kind = K::of(&v, &[]);
+        assert_eq!(kind, K::Auxiliary, "前提：无工具被判成辅助调用");
+        assert!(!kind.is_side_query(&v), "无工具对话 {n} 条消息");
+    }
+    // 真的标题生成但带了历史（不是官方形态）：也不算。
+    let v = serde_json::json!({
+        "model": "claude-haiku-4-5",
+        "system": "You are naming a coding session so the user can pick it out",
+        "messages": turns(3),
+        "max_tokens": 32000
+    });
+    assert!(!K::of(&v, &structured).is_side_query(&v));
+    // 官方那条：一条消息 + 标题提示词。
+    let v = serde_json::json!({
+        "model": "claude-haiku-4-5",
+        "system": "You are naming a coding session so the user can pick it out",
+        "messages": turns(1),
+        "max_tokens": 32000
+    });
+    assert!(K::of(&v, &structured).is_side_query(&v));
+}

@@ -515,21 +515,23 @@ fn session_plan_picks_sessions_only_when_device_identity_collapses() {
 
     // 真实客户端，默认开关：按会话、沿用来访 id。
     assert_eq!(
-        session_plan(on, false, true, Some(SID), None, false),
+        session_plan(on, false, true, Some(SID), None, false, None),
         SessionPlan {
             key: key(&format!("sid:{SID}")),
             binds: true,
             per_session: true,
-            passthrough: true
+            passthrough: true,
+            follow_only: false,
+            log_key: key(&format!("sid:{SID}")),
         }
     );
     // 额度探测：键照记（流水要用），但不写绑定。
-    let probe = session_plan(on, false, true, Some(SID), None, true);
+    let probe = session_plan(on, false, true, Some(SID), None, true, None);
     assert!(probe.per_session && !probe.binds);
     // 没带会话 id：不退回按设备，按前缀指纹分会话（调用方此时会算出指纹）。
     assert!(needs_prefix_key(on, false, true, None));
     assert!(!needs_prefix_key(on, false, true, Some(SID)), "带了会话 id 不必算");
-    let no_sid = session_plan(on, false, true, None, Some("abc"), false);
+    let no_sid = session_plan(on, false, true, None, Some("abc"), false, None);
     assert_eq!((no_sid.key, no_sid.per_session), (key("pfx:abc"), true));
     // 三个开关任一关着：出站保留客户端原始 device_id，每台真实设备在上游都独立，按设备。
     for flags in [
@@ -537,24 +539,105 @@ fn session_plan_picks_sessions_only_when_device_identity_collapses() {
         store::ForwardFlags { spoof_device_id: false, ..on },
         store::ForwardFlags { spoof_identity: false, ..on },
     ] {
-        let p = session_plan(flags, false, true, Some(SID), None, false);
+        let p = session_plan(flags, false, true, Some(SID), None, false, None);
         assert_eq!((p.key, p.per_session), (None, false), "{flags:?}");
         assert!(!needs_prefix_key(flags, false, true, None), "{flags:?}");
         // 模拟路径带设备也一样：身份伪装关着时模拟请求同样保留原始 device_id，键照算（模拟
         // 本来就要），但按设备占名额。
-        let sim = session_plan(flags, true, true, Some(SID), Some("abc"), false);
+        let sim = session_plan(flags, true, true, Some(SID), Some("abc"), false, None);
         assert_eq!((sim.key, sim.per_session), (key(&format!("sid:{SID}")), false), "{flags:?}");
     }
     // 模拟路径带设备、开关都开：按会话，但出站会话 id 由槽位派生（不 passthrough）。
-    let sim_dev = session_plan(on, true, true, None, Some("abc"), false);
+    let sim_dev = session_plan(on, true, true, None, Some("abc"), false, None);
     assert_eq!(
         sim_dev,
-        SessionPlan { key: key("pfx:abc"), binds: true, per_session: true, passthrough: false }
+        SessionPlan {
+            key: key("pfx:abc"),
+            binds: true,
+            per_session: true,
+            passthrough: false,
+            follow_only: false,
+            log_key: key("pfx:abc"),
+        }
     );
-    // 模拟路径没设备：与原来一样按会话键，探测也照旧占（那条路不在本次改动范围内）。
-    let sim_bare = session_plan(on, true, false, None, Some("abc"), true);
+    // 模拟路径没设备、不是侧查询（调用方没给类别）：与原来一样按会话键占名额。
+    let sim_bare = session_plan(on, true, false, None, Some("abc"), true, None);
     assert_eq!(
         sim_bare,
-        SessionPlan { key: key("pfx:abc"), binds: true, per_session: false, passthrough: false }
+        SessionPlan {
+            key: key("pfx:abc"),
+            binds: true,
+            per_session: false,
+            passthrough: false,
+            follow_only: false,
+            log_key: key("pfx:abc"),
+        }
     );
+}
+
+/// 匿名侧查询（没有设备身份 + 给了类别）：键照算、只跟随不占名额，流水换成带类别的
+/// `lb:v2:anon:…`；带设备的侧查询不受影响，与主线程共用一个会话键。
+#[test]
+fn anonymous_side_queries_follow_without_binding() {
+    use super::{SessionPlan, session_plan};
+    const SID: &str = "11111111-1111-4111-8111-111111111111";
+    let on = all_on();
+
+    let title = session_plan(on, true, false, Some(SID), Some("abc"), false, Some("title"));
+    assert_eq!(
+        title,
+        SessionPlan {
+            key: Some(format!("lb:v2:sid:{SID}")),
+            binds: true,
+            per_session: false,
+            passthrough: false,
+            follow_only: true,
+            log_key: Some(format!("lb:v2:anon:sid:{SID}:title")),
+        }
+    );
+    let probe = session_plan(on, true, false, None, Some("abc"), true, Some("quota_probe"));
+    assert!(probe.follow_only);
+    assert_eq!(probe.log_key.as_deref(), Some("lb:v2:anon:pfx:abc:quota_probe"));
+
+    // 带设备：类别不进键，照旧按会话占名额。
+    let dev = session_plan(on, false, true, Some(SID), None, false, Some("title"));
+    assert!(!dev.follow_only && dev.binds);
+    assert_eq!(dev.log_key, dev.key);
+}
+
+/// 没有设备身份、不走模拟、带会话头（真 CC 的 `count_tokens`、不带 metadata 的客户端）：按会话
+/// 键、沿用来访 id；侧查询只跟随。没带会话头的裸请求照旧不要键。
+#[test]
+fn anonymous_real_client_with_session_header_gets_a_key() {
+    use super::session_plan;
+    const SID: &str = "11111111-1111-4111-8111-111111111111";
+    let on = all_on();
+
+    let main = session_plan(on, false, false, Some(SID), None, false, None);
+    assert_eq!(main.key, Some(format!("lb:v2:sid:{SID}")));
+    assert!(main.binds && main.passthrough && !main.per_session && !main.follow_only);
+
+    let count = session_plan(on, false, false, Some(SID), None, false, Some("count_tokens"));
+    assert!(count.follow_only, "count_tokens 跟着主线程");
+    assert_eq!(count.log_key, Some(format!("lb:v2:anon:sid:{SID}:count_tokens")));
+
+    let bare = session_plan(on, false, false, None, None, false, None);
+    assert_eq!((bare.key, bare.binds), (None, false));
+}
+
+/// 只有 `/v1/messages` 占会话：`count_tokens`（调用方按路径给 `no_bind` 与类别）带设备时不写
+/// 绑定、只按亲和选号；匿名时（模拟路径或只带会话头）只跟随。
+#[test]
+fn count_tokens_never_takes_a_session() {
+    use super::session_plan;
+    const SID: &str = "11111111-1111-4111-8111-111111111111";
+    let on = all_on();
+    let ct = Some("count_tokens");
+
+    let dev = session_plan(on, false, true, Some(SID), None, true, ct);
+    assert!(dev.per_session && !dev.binds, "带设备：不写会话绑定");
+    for (simulating, prefix) in [(true, Some("abc")), (false, None)] {
+        let anon = session_plan(on, simulating, false, Some(SID), prefix, true, ct);
+        assert!(anon.follow_only, "匿名：只跟随 simulating={simulating}");
+    }
 }
