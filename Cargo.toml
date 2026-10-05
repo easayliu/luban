@@ -1,6 +1,6 @@
 [package]
 name = "luban"
-version = "0.3.201"
+version = "0.3.202"
 edition = "2024"
 
 [dependencies]
