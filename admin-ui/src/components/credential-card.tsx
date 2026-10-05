@@ -220,7 +220,7 @@ export const CredentialCard = memo(function CredentialCard({
   const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
   // 设备名额占用的配色与说明：空闲灰 / 健康绿 / 吃紧黄 / 占满红，见 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
-  // 模拟会话名额同一套判定与配色：走模拟路径、没有设备身份的来访按会话占名额，与设备分开计。
+  // 会话名额同一套判定与配色：按会话占名额的来访（设备上限不生效时的真实客户端、模拟路径上没有设备身份的）每个对话占一个，与设备分开计。
   const sessionUsage = deviceUsageMeta(cred.session_count, cred.session_limit_effective)
   const sessionPolicy = cred.session_limit === 0
     ? { label: t('跟随默认', 'Default'), className: 'text-muted-foreground' }
@@ -229,17 +229,17 @@ export const CredentialCard = memo(function CredentialCard({
       : { label: t('自定义', 'Custom'), className: 'text-info-foreground' }
   const sessionUsageHint = cred.session_limit_effective <= 0
     ? t(
-        `${cred.session_count} 条活跃模拟会话，未设上限。点击查看或清理`,
-        `${cred.session_count} active simulated session(s), no limit set. Click to view or clear`,
+        `${cred.session_count} 条活跃会话，未设上限。点击查看或清理`,
+        `${cred.session_count} active session(s), no limit set. Click to view or clear`,
       )
     : sessionUsage.level === 'critical'
       ? t(
-          `模拟会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话将分配到其他账号；所有账号均占满时，客户端将收到 429。点击查看或清理`,
+          `会话名额已占满（${cred.session_count}/${cred.session_limit_effective}）：新会话将分配到其他账号；所有账号均占满时，客户端将收到 429。点击查看或清理`,
           `Session slots are full (${cred.session_count}/${cred.session_limit_effective}): new sessions go to another account, and get a 429 once every account is full. Click to view or clear`,
         )
       : t(
-          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个模拟会话名额（走模拟路径、无设备身份的客户端请求按会话占用名额）。点击查看或清理`,
-          `${cred.session_count} of ${cred.session_limit_effective} simulated session slots in use (requests on the simulation path without a device identity take one per session). Click to view or clear`,
+          `已占用 ${cred.session_count}/${cred.session_limit_effective} 个会话名额（每个对话占用一个名额）。点击查看或清理`,
+          `${cred.session_count} of ${cred.session_limit_effective} session slots in use (each conversation takes one). Click to view or clear`,
         )
   // 名额策略不再占页脚的横向宽度（那点宽度让给右边的 RPM 数字），改成给前面那枚手机图标上色：
   // 淡灰＝跟随全局默认，蓝＝这个账号单独改过上限，深色＝不限设备数（旁边的分母就是 `∞`）。
@@ -683,7 +683,7 @@ export const CredentialCard = memo(function CredentialCard({
           </section>
         </CardPanel>
 
-        {/* 页脚：设备名额、模拟会话名额、当前 RPM ｜ 累计费用，最右是启停开关。 */}
+        {/* 页脚：设备名额、会话名额、当前 RPM ｜ 累计费用，最右是启停开关。 */}
         {/* 这是一条**读数条**而不是一排按钮，理由与尺寸账见 [FooterStat]：padding 只由容器给一次
             （`py-2`），四格之间只留 gap，行高由 text-xs 决定，手机上整条 38px。前三格都带分母、
             说的是「此刻占了多少」，费用没有分母、说的是「一共烧了多少」——两类量之间隔一道 1px 竖线
@@ -692,24 +692,27 @@ export const CredentialCard = memo(function CredentialCard({
             RPM 到三位数或费用上百就被截成「2…」「$214.…」。所以窄卡上省出约 40px：格间距 8→6px、
             图标与数字间 4→2px，费用满 $100 时不显示分位（精确值在悬浮提示里）。 */}
         <CardFooter className="mt-auto flex items-center gap-1.5 border-t bg-muted/32 px-4 py-2 @min-[22rem]/card:gap-2 @sm/card:gap-3 @min-[27rem]/card:gap-4 @min-[27rem]/card:px-5 @min-[27rem]/card:py-3">
-          <FooterStat
-            icon={SmartphoneIcon}
-            iconClassName={devicePolicy.className}
-            valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[deviceUsage.level])}
-            value={<>{cred.device_count}<SlotLimit limit={effectiveLimit} /></>}
-            hint={deviceUsageHint}
-            ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-            srLabel={devicePolicy.label}
-            onClick={() => setDevicesOpen(true)}
-          />
-          {/* 模拟会话名额，与设备名额并排、同一个对话框：图标颜色是策略，数字颜色是占用。 */}
+          {/* 设备按会话占名额时设备上限不生效，这一格不出现。 */}
+          {cred.device_limit_applies && (
+            <FooterStat
+              icon={SmartphoneIcon}
+              iconClassName={devicePolicy.className}
+              valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[deviceUsage.level])}
+              value={<>{cred.device_count}<SlotLimit limit={effectiveLimit} /></>}
+              hint={deviceUsageHint}
+              ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
+              srLabel={devicePolicy.label}
+              onClick={() => setDevicesOpen(true)}
+            />
+          )}
+          {/* 会话名额，与设备名额并排、同一个对话框：图标颜色是策略，数字颜色是占用。 */}
           <FooterStat
             icon={MessagesSquareIcon}
             iconClassName={sessionPolicy.className}
             valueClassName={cn(SLOT_WIDTH, SLOT_TEXT[sessionUsage.level])}
             value={<>{cred.session_count}<SlotLimit limit={sessionEffectiveLimit} /></>}
             hint={sessionUsageHint}
-            ariaLabel={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+            ariaLabel={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
             srLabel={sessionPolicy.label}
             onClick={() => setDevicesOpen(true)}
           />

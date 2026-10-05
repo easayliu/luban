@@ -35,6 +35,7 @@ import {
   switchTitle,
   AccountTierBadge,
   useCredentialActions,
+  useDevicesBySession,
   type CredentialActions,
   type CredentialEvaluation,
   type CredentialMenuHandlers,
@@ -119,7 +120,7 @@ const COL = {
   quota5h: 'w-45 2xl:w-49',
   quota7d: 'w-45 2xl:w-49',
   /**
-   * 设备、模拟会话、RPM 三行迷你进度条（[SlotMeterRow]），与用量列同一套语言；原来单独的 RPM
+   * 设备、会话、RPM 三行迷你进度条（[SlotMeterRow]），与用量列同一套语言；原来单独的 RPM
    * 列并进来了，它那 w-18 让给这一列。定宽的只有图标与数字（数字列占 44px，够 `0/1000`），
    * 其余给条，w-32 里条有 30 多 px；数字真到 `100/1000` 那种长度时才多吃几像素。
    */
@@ -145,6 +146,7 @@ export function CredentialListHeader({
   onSelectAll?: (next: boolean) => void
 }) {
   const { t } = useI18n()
+  const devicesBySession = useDevicesBySession()
   // 数值列表头跟着单元格右对齐：数字右对齐后个位数落在同一条线上，
   // 一列扫下来能直接比大小，这也是表格里数值列的通行排法。
   const sortable = (label: string, key: SortKey, numeric = false) => {
@@ -201,10 +203,17 @@ export function CredentialListHeader({
         <TableHead className={COL.quota7d} {...sortProps('usage7d')}>
           {sortable(t('7d 用量', '7d usage'), 'usage7d')}
         </TableHead>
-        <TableHead className={COL.devices} {...sortProps('devices')}>
-          {/* 表头只挂设备那一维的排序；会话数与当前 RPM 在工具栏的排序下拉里。 */}
-          {sortable(t('设备 / 会话 / RPM', 'Devices / Sessions / RPM'), 'devices')}
-        </TableHead>
+        {devicesBySession ? (
+          // 设备按会话占名额时没有设备那一行，表头挂会话的排序。
+          <TableHead className={COL.devices} {...sortProps('sessions')}>
+            {sortable(t('会话 / RPM', 'Sessions / RPM'), 'sessions')}
+          </TableHead>
+        ) : (
+          <TableHead className={COL.devices} {...sortProps('devices')}>
+            {/* 表头只挂设备那一维的排序；会话数与当前 RPM 在工具栏的排序下拉里。 */}
+            {sortable(t('设备 / 会话 / RPM', 'Devices / Sessions / RPM'), 'devices')}
+          </TableHead>
+        )}
         <TableHead className={COL.recent} {...sortProps('recent')}>
           {sortable(t('最近使用', 'Last used'), 'recent')}
         </TableHead>
@@ -253,10 +262,12 @@ export const CredentialRow = memo(function CredentialRow({
   const u5h = quota.h5.utilization
   const u7d = quota.d7.utilization
   const effectiveLimit = cred.device_limit_effective > 0 ? cred.device_limit_effective : '∞'
+  // 设备按会话占名额时设备上限不生效：设备那一格整个不出现（绑定只是亲和记录，不是名额）。
+  const deviceLimited = cred.device_limit_applies
   const policy = devicePolicyMeta(cred.device_limit, language)
   // 设备名额占用的配色：满了红、快满了黄、不限中性，与卡片共用 [deviceUsageMeta]。
   const deviceUsage = deviceUsageMeta(cred.device_count, cred.device_limit_effective)
-  // 模拟会话名额，同一套判定；与设备名额同一格上下两行、同一个对话框。
+  // 会话名额，同一套判定；与设备名额同一格上下两行、同一个对话框。
   const sessionEffectiveLimit = cred.session_limit_effective > 0 ? cred.session_limit_effective : '∞'
   const sessionPolicy = devicePolicyMeta(cred.session_limit, language)
   const sessionUsage = deviceUsageMeta(cred.session_count, cred.session_limit_effective)
@@ -397,6 +408,7 @@ export const CredentialRow = memo(function CredentialRow({
               <MobileFact label={t('账号等级', 'Tier')}>
                 <AccountTierBadge cred={cred} size="sm" fallback="—" />
               </MobileFact>
+              {deviceLimited && (
               <MobileFact label={t('设备', 'Devices')}>
                 <Button
                   type="button"
@@ -413,14 +425,15 @@ export const CredentialRow = memo(function CredentialRow({
                   {!policy.isDefault && <span className="text-muted-foreground">{policy.label}</span>}
                 </Button>
               </MobileFact>
-              <MobileFact label={t('模拟会话', 'Sessions')}>
+              )}
+              <MobileFact label={t('会话', 'Sessions')}>
                 <Button
                   type="button"
                   size="xs"
                   variant="ghost"
                   onClick={() => setDevicesOpen(true)}
-                  title={t(`查看模拟会话 · ${sessionPolicy.label}策略`, `View simulated sessions · ${sessionPolicy.label} policy`)}
-                  aria-label={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+                  title={t(`查看会话 · ${sessionPolicy.label}策略`, `View sessions · ${sessionPolicy.label} policy`)}
+                  aria-label={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
                 >
                   <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
                     {cred.session_count}/{sessionEffectiveLimit}
@@ -551,7 +564,7 @@ export const CredentialRow = memo(function CredentialRow({
           {fablePool && <ListFablePoolLine window={fablePool} now={now} className="mt-1.5" />}
         </TableCell>
         <TableCell className={COL.devices}>
-          {/* 三行迷你进度条：设备、模拟会话、RPM，与左边用量列同一套语言（标签 · 数字 · 条）。
+          {/* 三行迷你进度条：设备、会话、RPM，与左边用量列同一套语言（标签 · 数字 · 条）。
               条与文字同一行、高 4px，三行加起来与用量列那块一样高；条是弹性的，数字再长只会把
               条挤短，不会把列撑宽。不限上限的那行没有分母、不画条。每行整体可点：前两行开名额
               对话框，第三行开 RPM 上限对话框；策略写在悬浮提示里。
@@ -561,22 +574,24 @@ export const CredentialRow = memo(function CredentialRow({
               那种「标签定宽、计量条对齐」的读法）。真超过六字符（`100/1000`）时这一列才会按内容
               涨，涨的也是三行一起涨，格子里仍然对齐。 */}
           <div className="grid grid-cols-[auto_minmax(2.75rem,auto)_minmax(0,1fr)] gap-y-0.5">
-            <SlotMeterRow
-              icon={SmartphoneIcon}
-              count={cred.device_count}
-              limit={cred.device_limit_effective}
-              usage={deviceUsage}
-              title={t(`已绑定设备 ${cred.device_count}/${effectiveLimit} · ${policy.label}策略 · 点击查看`, `Bound devices ${cred.device_count}/${effectiveLimit} · ${policy.label} policy · click to view`)}
-              ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-              onClick={() => setDevicesOpen(true)}
-            />
+            {deviceLimited && (
+              <SlotMeterRow
+                icon={SmartphoneIcon}
+                count={cred.device_count}
+                limit={cred.device_limit_effective}
+                usage={deviceUsage}
+                title={t(`已绑定设备 ${cred.device_count}/${effectiveLimit} · ${policy.label}策略 · 点击查看`, `Bound devices ${cred.device_count}/${effectiveLimit} · ${policy.label} policy · click to view`)}
+                ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
+                onClick={() => setDevicesOpen(true)}
+              />
+            )}
             <SlotMeterRow
               icon={MessagesSquareIcon}
               count={cred.session_count}
               limit={cred.session_limit_effective}
               usage={sessionUsage}
-              title={t(`活跃模拟会话 ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label}策略 · 点击查看`, `Active simulated sessions ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label} policy · click to view`)}
-              ariaLabel={t(`查看 ${credentialLabel} 的模拟会话`, `View simulated sessions for ${credentialLabel}`)}
+              title={t(`活跃会话 ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label}策略 · 点击查看`, `Active sessions ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label} policy · click to view`)}
+              ariaLabel={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
               onClick={() => setDevicesOpen(true)}
             />
             <SlotMeterRow
@@ -1119,8 +1134,9 @@ function MobileCredentialRow({
           </div>
 
           <div className="flex items-center gap-3 text-xs">
-            {slot(<SmartphoneIcon className="size-3.5 text-muted-foreground" />, cred.device_count, cred.device_limit_effective, t('设备', 'Devices'))}
-            {slot(<MessagesSquareIcon className="size-3.5 text-muted-foreground" />, cred.session_count, cred.session_limit_effective, t('模拟会话', 'Sessions'))}
+            {/* 设备按会话占名额时设备上限不生效，这一格不出现。 */}
+            {cred.device_limit_applies && slot(<SmartphoneIcon className="size-3.5 text-muted-foreground" />, cred.device_count, cred.device_limit_effective, t('设备', 'Devices'))}
+            {slot(<MessagesSquareIcon className="size-3.5 text-muted-foreground" />, cred.session_count, cred.session_limit_effective, t('会话', 'Sessions'))}
             {slot(<GaugeIcon className="size-3.5 text-muted-foreground" />, cred.rpm, cred.rpm_limit_effective, t('当前 RPM', 'Current RPM'))}
             <span className={cn('font-medium tabular-nums', cred.cost_total > 0 ? 'text-foreground' : 'text-muted-foreground')}>
               {formatUsd(cred.cost_total)}

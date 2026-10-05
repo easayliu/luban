@@ -20,6 +20,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
+import { getSettings } from '@/api/settings'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
 import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
@@ -235,7 +236,7 @@ const SORT_LABELS: Record<SortKey, LocalizedLabel> = {
   usage5h: ['5h 使用率', '5h usage'],
   usage7d: ['7d 使用率', '7d usage'],
   devices: ['设备数', 'Devices'],
-  sessions: ['模拟会话数', 'Sessions'],
+  sessions: ['会话数', 'Sessions'],
   rpm: ['当前 RPM', 'Current RPM'],
   cost: ['累计费用', 'Total cost'],
   recent: ['最近使用', 'Last used'],
@@ -516,9 +517,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   })()
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
+  // 设备按会话占名额时设备上限不生效：设备那组筛选、按设备数排序、概览里的设备数都不出现。
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const devicesBySession = settings?.devices_by_session ?? false
   const filterItems = useMemo(
-    () => FILTERS.map((item) => ({ ...item, label: t(...item.label) })),
-    [t],
+    () => FILTERS
+      .filter((item) => !(devicesBySession && item.group === 'device'))
+      .map((item) => ({ ...item, label: t(...item.label) })),
+    [t, devicesBySession],
   )
   const filterGroups = useMemo(() => {
     const groups: (typeof filterItems)[] = []
@@ -538,8 +544,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     [t],
   )
   const sortGroups = useMemo(
-    () => SORT_GROUPS.map((keys) => keys.map((key) => ({ key, label: t(...SORT_LABELS[key]) }))),
-    [t],
+    () => SORT_GROUPS.map((keys) => keys
+      .filter((key) => !(devicesBySession && key === 'devices'))
+      .map((key) => ({ key, label: t(...SORT_LABELS[key]) }))),
+    [t, devicesBySession],
   )
   const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
     ?? t(...FILTERS[0].label)
@@ -883,7 +891,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               )}
               {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
                   是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
-              {!isLoading && count > 0 && (
+              {!isLoading && count > 0 && !devicesBySession && (
                 <Tooltip>
                   <TooltipTrigger
                     render={<button type="button" />}

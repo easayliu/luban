@@ -9,14 +9,16 @@ export interface Settings {
   device_binding_ttl_secs: number
   /** 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。0 = 永久保留。 */
   device_binding_retention_secs: number
-  /** 模拟会话绑定有效期（秒）；0 表示永不过期。与设备的分开配。 */
+  /** 会话绑定有效期（秒）；0 表示永不过期。与设备的分开配。 */
   session_binding_ttl_secs: number
-  /** 模拟会话软绑定保留期（秒）；0 表示永久保留。 */
+  /** 会话软绑定保留期（秒）；0 表示永久保留。 */
   session_binding_retention_secs: number
   /** 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。 */
   default_device_limit: number
-  /** 全局默认模拟会话数上限；0 表示默认不限。账号未单独配置时套用它。只管模拟路径上没有设备身份的来访（按自带会话 id，否则缓存前缀 + 首条用户消息分会话）。 */
+  /** 全局默认会话数上限；0 表示默认不限。账号未单独配置时套用它。管设备上限不生效时的真实客户端（按自带会话 id），以及模拟路径上没有设备身份的来访（按自带会话 id，否则缓存前缀 + 首条用户消息分会话）。 */
   default_session_limit: number
+  /** 带设备身份的来访按会话占名额、设备上限不生效（转发设置里设备指纹归一化与伪装设备 ID 均开着）。 */
+  devices_by_session: boolean
   /** 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。账号未单独配置时套用它。 */
   default_rpm_limit: number
   /** 每设备 RPM 上限（单台设备最近 60 秒最多转发多少条）；0 表示不限。全局一个值。 */
@@ -203,7 +205,7 @@ export async function setDeviceRetention(secs: number): Promise<Settings> {
   return data
 }
 
-/** 设置模拟会话绑定有效期（秒；0 = 永不过期）。 */
+/** 设置会话绑定有效期（秒；0 = 永不过期）。 */
 export async function setSessionTtl(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/session-ttl', {
     session_binding_ttl_secs: secs,
@@ -211,7 +213,7 @@ export async function setSessionTtl(secs: number): Promise<Settings> {
   return data
 }
 
-/** 设置模拟会话软绑定保留期（秒；0 = 永久保留）。 */
+/** 设置会话软绑定保留期（秒；0 = 永久保留）。 */
 export async function setSessionRetention(secs: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/session-retention', {
     session_binding_retention_secs: secs,
@@ -227,7 +229,7 @@ export async function setDefaultDeviceLimit(limit: number): Promise<Settings> {
   return data
 }
 
-/** 设置全局默认模拟会话数上限（0 表示默认不限）。 */
+/** 设置全局默认会话数上限（0 表示默认不限）。 */
 export async function setDefaultSessionLimit(limit: number): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/default-session-limit', {
     default_session_limit: limit,

@@ -7,6 +7,7 @@ import {
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
+import { getSettings } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError } from '@/lib/utils'
 import {
@@ -140,6 +141,8 @@ export function BatchActionsBar({
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
+  // 设备按会话占名额时设备上限不生效，批量设置设备上限那一行一并隐去。
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const proxiesQuery = useQuery({
     queryKey: ['proxies'],
     queryFn: listProxies,
@@ -243,15 +246,15 @@ export function BatchActionsBar({
     onSuccess: (_r, v) =>
       notify(
         v > 0 ? t(
-          `已将 ${formattedCount} 个账号的模拟会话上限设为 ${v.toLocaleString(locale)}`,
+          `已将 ${formattedCount} 个账号的会话上限设为 ${v.toLocaleString(locale)}`,
           `Set the session limit for ${englishAccountCount} to ${v.toLocaleString(locale)}`,
         )
           : v === 0 ? t(
-            `已将 ${formattedCount} 个账号改为跟随全局默认模拟会话上限`,
+            `已将 ${formattedCount} 个账号改为跟随全局默认会话上限`,
             `Set ${englishAccountCount} to use the global default session limit`,
           )
             : t(
-              `已将 ${formattedCount} 个账号设为不限模拟会话数`,
+              `已将 ${formattedCount} 个账号设为不限会话数`,
               `Set ${englishAccountCount} to unlimited sessions`,
             ),
       ),
@@ -439,6 +442,7 @@ export function BatchActionsBar({
               )}
             </SettingRow>
 
+            {!settings?.devices_by_session && (
             <SettingRow
               title={t('设备上限', 'Device limit')}
               hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
@@ -466,9 +470,10 @@ export function BatchActionsBar({
                 </NumberField>
               )}
             </SettingRow>
+            )}
 
             <SettingRow
-              title={t('模拟会话上限', 'Session limit')}
+              title={t('会话上限', 'Session limit')}
               hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
               action={
                 <Button size="sm" loading={applySessionLimit.isPending} disabled={busy} onClick={() => applySessionLimit.mutate(sessionLimit)}>
@@ -477,7 +482,7 @@ export function BatchActionsBar({
               }
             >
               <Select items={sessionLimitModeItems} value={sessionLimitMode} onValueChange={(value) => value && setSessionLimitMode(value as typeof sessionLimitMode)}>
-                <SelectTrigger aria-label={t('批量设置模拟会话上限策略', 'Set session limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                <SelectTrigger aria-label={t('批量设置会话上限策略', 'Set session limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup>
                   {sessionLimitModeItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
@@ -488,7 +493,7 @@ export function BatchActionsBar({
                 <NumberField value={customSessionLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
                   <NumberFieldGroup>
                     <NumberFieldDecrement />
-                    <NumberFieldInput aria-label={t('批量设置独立模拟会话上限', 'Set a custom session limit for selected accounts')} />
+                    <NumberFieldInput aria-label={t('批量设置独立会话上限', 'Set a custom session limit for selected accounts')} />
                     <NumberFieldIncrement />
                   </NumberFieldGroup>
                 </NumberField>

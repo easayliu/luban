@@ -19,6 +19,7 @@ import {
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
 import { useReadOnly } from '@/lib/role'
+import { getSettings } from '@/api/settings'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
@@ -855,14 +856,14 @@ export function useCredentialActions(
     onSuccess: () => { onLimitSaved?.(); invalidate() },
     onError: (e) => failure(t('设置设备上限失败', 'Failed to set device limit'), e),
   })
-  // 模拟会话上限同样单独一个 mutation，失败提示才对得上。
+  // 会话上限同样单独一个 mutation，失败提示才对得上。
   const sessionLimit = useMutation({
     mutationFn: (n: number) => setSessionLimit(cred.id, n),
     onSuccess: () => {
-      toastManager.add({ title: t('模拟会话上限已保存', 'Session limit saved'), type: 'success' })
+      toastManager.add({ title: t('会话上限已保存', 'Session limit saved'), type: 'success' })
       invalidate()
     },
-    onError: (e) => failure(t('设置模拟会话上限失败', 'Failed to set the session limit'), e),
+    onError: (e) => failure(t('设置会话上限失败', 'Failed to set the session limit'), e),
   })
   // RPM 上限与设备上限分开两个 mutation：两者的失败提示不一样，共用一个的话，
   // 改 RPM 失败会弹出「设置设备上限失败」。
@@ -1008,9 +1009,12 @@ function useCredentialMenuGroups(
         }]
       : []),
     { key: 'rename', icon: <PencilIcon />, label: t('重命名', 'Rename'), onSelect: h.onRename },
-    { key: 'device', icon: <SmartphoneIcon />, label: t('设备上限', 'Device limit'), onSelect: h.onDeviceLimit },
+    // 设备按会话占名额时设备上限不生效，入口一并隐去（对话框里设备那半也只读）。
+    ...(cred.device_limit_applies
+      ? [{ key: 'device', icon: <SmartphoneIcon />, label: t('设备上限', 'Device limit'), onSelect: h.onDeviceLimit }]
+      : []),
     // 与设备上限开的是同一个对话框（会话那一半在下面）：两种名额总是一起看。
-    { key: 'session', icon: <MessagesSquareIcon />, label: t('模拟会话上限', 'Session limit'), onSelect: h.onDeviceLimit },
+    { key: 'session', icon: <MessagesSquareIcon />, label: t('会话上限', 'Session limit'), onSelect: h.onDeviceLimit },
     { key: 'rpm', icon: <GaugeIcon />, label: t('RPM 上限', 'RPM limit'), onSelect: h.onRpmLimit },
     { key: 'pause', icon: <PercentIcon />, label: t('提前暂停调度阈值', 'Early pause threshold'), onSelect: h.onQuotaPause },
     { key: 'proxy', icon: <GlobeIcon />, label: t('出站代理', 'Outbound proxy'), onSelect: h.onProxy },
@@ -1087,7 +1091,7 @@ const MOBILE_SHEET_QUERY = '(max-width: 39.98rem)'
  * 账号的 ⋯ 操作入口：桌面是锚在按钮旁的下拉菜单，手机上是**贴底弹出的操作面板**。
  *
  * 手机上下拉菜单有三个毛病：一是它锚在按钮上，按钮在屏幕下半截时整张菜单被翻到上面、盖住顶栏，
- * 离手指很远；二是菜单项 32px 高，拇指点不准，相邻两项（「设备上限」「模拟会话上限」）常误触；
+ * 离手指很远；二是菜单项 32px 高，拇指点不准，相邻两项（「设备上限」「会话上限」）常误触；
  * 三是看不出这是哪个号的菜单——一屏好几张卡片，菜单浮在中间。底部面板三件事一起解决：永远
  * 从拇指那一侧出来、每项 44px 整行可点、头部写明账号名。面板用的是现成对话框的贴底样式
  * （`bottomStickOnMobile`），与名额、代理那些对话框在手机上是同一副面孔。
@@ -1181,6 +1185,7 @@ function CredentialActionSheet({
   /** 设置行右侧的当前值：与详情页读数、调度配置同一口径。 */
   const valueOf: Record<string, string> = {
     device: `${limit(cred.device_count, cred.device_limit_effective)} · ${limit(cred.session_count, cred.session_limit_effective)}`,
+    session: limit(cred.session_count, cred.session_limit_effective),
     rpm: cred.rpm_limit_effective > 0 ? String(cred.rpm_limit_effective) : t('不限', 'Unlimited'),
     pause: `${pause(cred.quota_pause_pct_effective)} · ${pause(cred.quota_pause_pct_7d_effective)}`,
     proxy: proxyName(cred) ?? t('直连', 'Direct'),
@@ -1189,7 +1194,8 @@ function CredentialActionSheet({
   // token 失效时「重新授权」就是这个号唯一该做的事，提到上面与解除冷却同样醒目；平时排在设置末尾。
   const reauth = items.get('reauth')
   const reauthUrgent = reauth != null && status.kind === 'token-invalid'
-  const settings = pick(['rename', 'device', 'rpm', 'pause', 'proxy', ...(reauthUrgent ? [] : ['reauth'])])
+  // 设备上限生效时「设备 / 会话上限」合成一行；不生效时只剩会话那一行。
+  const settings = pick(['rename', cred.device_limit_applies ? 'device' : 'session', 'rpm', 'pause', 'proxy', ...(reauthUrgent ? [] : ['reauth'])])
     .map((item) => (item.key === 'device' ? { ...item, label: t('设备 / 会话上限', 'Device / session limits') } : item))
   const cooldown = items.get('cooldown')
   const priority = pick(['prio-up', 'prio-down'])
@@ -1960,7 +1966,16 @@ export function AccountTierBadge({
 }
 
 /**
- * 名额占用（设备 / 模拟会话 / RPM）的配色：**空闲灰、健康绿、吃紧黄、打满红**。
+ * 设备是否按会话占名额（转发设置里设备指纹归一化与改写设备 ID 都开着）：此时设备上限不生效，
+ * 汇总视图（列表表头、排序、筛选、概览）不再出现设备。单个账号上直接看 `device_limit_applies`。
+ */
+export function useDevicesBySession(): boolean {
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  return data?.devices_by_session ?? false
+}
+
+/**
+ * 名额占用（设备 / 会话 / RPM）的配色：**空闲灰、健康绿、吃紧黄、打满红**。
  *
  * 阈值直接走 [quotaLevel]——全后台所有计量条共用同一把尺子：**0 灰、<70% 绿、≥70% 黄、≥90% 红**。
  * 用量窗口（5h / 7d）、列表与卡片的名额、设备对话框的两条容量，现在判定完全一致：同样的占用比例，

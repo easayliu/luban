@@ -5,11 +5,10 @@ use axum::http::HeaderMap;
 
 use crate::store;
 
-use super::body::extract_session_id;
+use super::body::{extract_session_id, session_binding_key};
 #[cfg(doc)]
 use super::body::{sim_device_fingerprint, sim_session_key};
 use super::simulation::{Simulation, looks_like_uuid};
-use super::uuid_from_bytes;
 
 /// 来访自己带的会话 id，**头和体都看**，且必须是合法的 uuid 形态。
 ///
@@ -83,6 +82,86 @@ pub(super) fn session_id_conflict(
     // 否则那一类客户端的头体冲突永远检测不到。
     let b = extract_session_id(body).filter(|s| looks_like_uuid(s))?;
     (h != b).then_some((h, b))
+}
+
+/// 选号时这条请求的会话那一侧，见 [`session_plan`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionPlan {
+    /// 这条请求的会话键（`session_bindings` 与流水的 `session_key` 列），取法见
+    /// [`session_binding_key`]。
+    pub key: Option<String>,
+    /// 选号时按 `key` 写会话绑定、占会话名额；额度探测为假（见下）。
+    pub binds: bool,
+    /// 带设备身份也按会话占名额，见 [`store::Select::per_session`]。
+    pub per_session: bool,
+    /// 出站沿用来访会话 id（不走模拟），不占派生槽位，见 [`store::Select::passthrough_session`]。
+    pub passthrough: bool,
+}
+
+/// 这条请求按什么占名额、会话键是什么。
+///
+/// **会话键**：来访带合法会话 id 就用它，没带用缓存前缀 + 首条用户消息的指纹（`prefix_key`，
+/// [`sim_session_key`]）。模拟路径一律要键；不走模拟的只在下面按会话占名额时才要。
+///
+/// **带设备身份的按会话占名额**（`per_session`）的前提是出站 device_id 确实被改写成收敛后的值：
+/// [`store::ForwardFlags::devices_by_session`]（设备指纹归一化、身份伪装、改写设备 ID 三项都开）。
+/// 那时一个号在上游只呈现「平台 × 客户端版本」那几台设备，绑了几台真实机器上游看不见，看得见的
+/// 是同时活跃几条会话，名额就该按它算。模拟路径也一样——身份伪装关着时模拟请求同样保留客户端
+/// 原始 device_id，不能只凭「走模拟」就当成已收敛。任一开关关着，每台真实设备在上游都是一台独立
+/// 设备，仍按设备占名额。
+///
+/// 这里只看开关、不看会落到哪个号：派生 device_id 还要账号有 `account_uuid`
+/// （[`crate::credentials::Credential::spoof_device_id`]），而正常的号都有——加号时就拉了 profile，
+/// 缺了的（[`crate::credentials::Credential::profile_incomplete`]）下次刷新 token 时顺手补上。
+/// 为这个过渡态在选号里逐号切换「按设备 / 按会话」两套名额，代价远大于收益，故不做。
+///
+/// 按会话占名额时**没有退回按设备那条路**：来访没带会话 id 就按前缀指纹分会话（device_id 取自
+/// 体，有设备就一定解析得出体，指纹总算得出来）。否则这类请求会悄悄受设备上限管，而后台在这个
+/// 模式下根本不展示设备上限。
+///
+/// 抓包（`cap/auto-2.1.285-20260930` 的 C 段）：`--continue` 恢复的对话沿用原会话 id（`00314`
+/// 与退出前的 `00277` 同一个），回来仍落在原号上；`/clear` 才换新 id、算一条新会话。
+///
+/// **额度探测不占会话名额**（`binds` 为假）：CC 每次启动都发一条，`--continue` 时它带的是加载
+/// 历史之前的临时会话 id（同上抓包的 `00292`），之后再也不出现，占了就要白白空占一个名额到
+/// TTL。它只按设备亲和选号。
+pub(super) fn session_plan(
+    flags: store::ForwardFlags,
+    simulating: bool,
+    has_device: bool,
+    inbound_session: Option<&str>,
+    prefix_key: Option<&str>,
+    quota_probe: bool,
+) -> SessionPlan {
+    let device_by_session = has_device && flags.devices_by_session();
+    let key = if simulating || device_by_session {
+        match (inbound_session, prefix_key) {
+            (Some(sid), _) => Some(session_binding_key(Some(sid), "")),
+            (None, Some(k)) => Some(session_binding_key(None, k)),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
+    let per_session = device_by_session && key.is_some();
+    SessionPlan {
+        binds: key.is_some() && !(per_session && quota_probe),
+        key,
+        per_session,
+        passthrough: per_session && !simulating,
+    }
+}
+
+/// 不走模拟、按会话占名额的来访要不要算前缀指纹（[`session_plan`] 的 `prefix_key`）：只有没带
+/// 会话 id 的才要——带了就以它为准，指纹是整份 tools + system 的哈希，能省则省。模拟路径另算
+/// （它派生出站会话 id 也要用指纹）。
+pub(super) fn needs_prefix_key(
+    flags: store::ForwardFlags,
+    simulating: bool,
+    has_device: bool,
+    inbound_session: Option<&str>,
+) -> bool {
+    simulating || (has_device && flags.devices_by_session() && inbound_session.is_none())
 }
 
 /// 这条请求**出站**时该落在 `X-Claude-Code-Session-Id` 头与 `metadata.user_id` 两处的
@@ -189,17 +268,7 @@ pub(super) fn account_session_id(
     cred: &crate::credentials::Credential,
     client_session: &str,
 ) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let account = cred.account_uuid.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
-    let mut h = Sha256::new();
-    h.update(b"luban-session-pin\0");
-    h.update(account.as_bytes());
-    h.update([0u8]);
-    h.update(client_session.as_bytes());
-    let digest = h.finalize();
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&digest[..16]);
-    Some(uuid_from_bytes(b))
+    crate::credentials::pinned_session_id(cred.account_uuid.as_deref(), client_session)
 }
 
 /// [`account_session_id`] 的开关版：`pin` 为真（[`store::ForwardFlags::spoof_identity`]）时按账号
@@ -731,5 +800,70 @@ mod tests {
         // 6) 本功能自己的开关关着。
         let no_fill = store::ForwardFlags { fill_metadata: false, ..all_on() };
         assert!(call(no_fill, None, true, false, &test_cred()).is_none());
+    }
+
+    /// 按会话还是按设备占名额：默认开关下真实客户端按会话（沿用来访 id），归一化或伪装 device
+    /// 任一关着退回按设备；没带会话 id 也退回按设备；额度探测有键但不写绑定；模拟路径带设备
+    /// 也按会话但走派生槽位；模拟路径没设备照旧按会话键。
+    #[test]
+    fn session_plan_picks_sessions_only_when_device_identity_collapses() {
+        use super::{SessionPlan, needs_prefix_key, session_plan};
+        const SID: &str = "11111111-1111-4111-8111-111111111111";
+        let key = |v: &str| Some(format!("lb:v2:{v}"));
+        let on = all_on();
+
+        // 真实客户端，默认开关：按会话、沿用来访 id。
+        assert_eq!(
+            session_plan(on, false, true, Some(SID), None, false),
+            SessionPlan {
+                key: key(&format!("sid:{SID}")),
+                binds: true,
+                per_session: true,
+                passthrough: true
+            }
+        );
+        // 额度探测：键照记（流水要用），但不写绑定。
+        let probe = session_plan(on, false, true, Some(SID), None, true);
+        assert!(probe.per_session && !probe.binds);
+        // 没带会话 id：不退回按设备，按前缀指纹分会话（调用方此时会算出指纹）。
+        assert!(needs_prefix_key(on, false, true, None));
+        assert!(!needs_prefix_key(on, false, true, Some(SID)), "带了会话 id 不必算");
+        let no_sid = session_plan(on, false, true, None, Some("abc"), false);
+        assert_eq!((no_sid.key, no_sid.per_session), (key("pfx:abc"), true));
+        // 三个开关任一关着：出站保留客户端原始 device_id，每台真实设备在上游都独立，按设备。
+        for flags in [
+            store::ForwardFlags { normalize_device_fp: false, ..on },
+            store::ForwardFlags { spoof_device_id: false, ..on },
+            store::ForwardFlags { spoof_identity: false, ..on },
+        ] {
+            let p = session_plan(flags, false, true, Some(SID), None, false);
+            assert_eq!((p.key, p.per_session), (None, false), "{flags:?}");
+            assert!(!needs_prefix_key(flags, false, true, None), "{flags:?}");
+            // 模拟路径带设备也一样：身份伪装关着时模拟请求同样保留原始 device_id，键照算（模拟
+            // 本来就要），但按设备占名额。
+            let sim = session_plan(flags, true, true, Some(SID), Some("abc"), false);
+            assert_eq!(
+                (sim.key, sim.per_session),
+                (key(&format!("sid:{SID}")), false),
+                "{flags:?}"
+            );
+        }
+        // 模拟路径带设备、开关都开：按会话，但出站会话 id 由槽位派生（不 passthrough）。
+        let sim_dev = session_plan(on, true, true, None, Some("abc"), false);
+        assert_eq!(
+            sim_dev,
+            SessionPlan { key: key("pfx:abc"), binds: true, per_session: true, passthrough: false }
+        );
+        // 模拟路径没设备：与原来一样按会话键，探测也照旧占（那条路不在本次改动范围内）。
+        let sim_bare = session_plan(on, true, false, None, Some("abc"), true);
+        assert_eq!(
+            sim_bare,
+            SessionPlan {
+                key: key("pfx:abc"),
+                binds: true,
+                per_session: false,
+                passthrough: false
+            }
+        );
     }
 }

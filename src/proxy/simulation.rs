@@ -41,7 +41,7 @@ pub(super) enum SimSessionSeed<'a> {
     /// 选号时占到了会话槽位（[`crate::credentials::slot_session_seed`]）：来访自带的会话 id
     /// 也换成槽位那个（除非不改身份）。
     Slot(&'a str),
-    /// 没占槽位（带设备身份的模拟请求、测试夹具）：来访自带的按账号钉住，没带才按这个
+    /// 没占槽位（按设备占名额的模拟请求、额度探测、测试夹具）：来访自带的按账号钉住，没带才按这个
     /// 缓存前缀键（[`sim_session_key`]）派生。
     Prefix(&'a str),
 }
@@ -215,7 +215,7 @@ impl Simulation {
         // 会话 id：**占了槽位的**（[`SimSessionSeed::Slot`]，选号时按会话键写了会话绑定）一律用
         // 槽位派生的那个——每个账号只有会话上限那么多个会话 id，对话之间复用，上游看到的 id 数
         // 有界；来访自带会话 id 也不例外，除非 `spoof_identity` 关着（不改身份，原样发）。没占
-        // 槽位的（[`SimSessionSeed::Prefix`]，带设备身份的模拟请求）沿用旧规则：来访自己那个按
+        // 槽位的（[`SimSessionSeed::Prefix`]，按设备占名额的、额度探测）沿用旧规则：来访自己那个按
         // 账号钉住（[`account_session_id`]，同一条会话换号后不该带着同一个 uuid 出现在另一个
         // 组织下），没带才按缓存前缀 + 对话起点（[`sim_session_key`]）派生。
         let session_id = match (incoming_session_id(headers, Some(v)), seed) {

@@ -28,14 +28,14 @@ import { RequestIdChip, statusVariant } from '@/components/usage-shared'
  * 不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
  */
 /**
- * 点进流水时带的筛选：某个模型、某个账号，或某条模拟会话，取最近几小时。
+ * 点进流水时带的筛选：某个模型、某个账号，或某条会话，取最近几小时。
  *
  * 三者可叠（会话那条总是连着账号一起传，会话键本来就属于某个号）。
  */
 export interface UsageDrillFilter {
   model?: string
   credId?: number
-  /** 只看这条模拟会话的请求（`session_bindings.session_key`），见名额对话框的「看请求」。 */
+  /** 只看这条会话的请求（`session_bindings.session_key`），见名额对话框的「看请求」。 */
   sessionKey?: string
   /** 展示名（模型名、账号 label，或会话的槽位与 id）。 */
   label: string

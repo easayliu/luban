@@ -2798,9 +2798,12 @@ struct SettingsResp {
     session_binding_retention_secs: i64,
     /// 全局默认设备数上限；0 表示默认不限。账号未单独配置时套用它。
     default_device_limit: i64,
-    /// 全局默认模拟会话数上限；0 表示默认不限。账号未单独配置时套用它。只管模拟路径上没有
-    /// 设备身份的来访，见 `store::Select::session_key`。
+    /// 全局默认会话数上限；0 表示默认不限。账号未单独配置时套用它。见
+    /// `store::Select::per_session`。
     default_session_limit: i64,
+    /// 带设备身份的来访按会话占名额、设备上限不生效（由转发设置里的设备指纹归一化与身份伪装
+    /// 决定，见 [`store::ForwardFlags::devices_by_session`]），设置页据此提示。
+    devices_by_session: bool,
     /// 全局默认账号 RPM 上限（最近 60 秒最多转发多少条）；0 表示默认不限。
     /// 账号未单独配置时套用它。
     default_rpm_limit: i64,
@@ -3012,6 +3015,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
     let session_binding_retention_secs = state.store.session_binding_retention();
     let default_device_limit = state.store.default_device_limit();
     let default_session_limit = state.store.default_session_limit();
+    let devices_by_session = state.store.forward_flags().devices_by_session();
     let default_rpm_limit = state.store.default_rpm_limit();
     let device_rpm_limit = state.store.device_rpm_limit();
     let session_rpm_limit = state.store.session_rpm_limit();
@@ -3040,6 +3044,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
             session_binding_retention_secs,
             default_device_limit,
             default_session_limit,
+            devices_by_session,
             default_rpm_limit,
             device_rpm_limit,
             session_rpm_limit,
@@ -3076,6 +3081,7 @@ fn settings_resp(state: &AppState) -> SettingsResp {
         session_binding_retention_secs,
         default_device_limit,
         default_session_limit,
+        devices_by_session,
         default_rpm_limit,
         device_rpm_limit,
         session_rpm_limit,
@@ -3815,6 +3821,8 @@ struct DefaultLimits {
     rpm: i64,
     /// 全局的提前停调度阈值（5h 档），见 [`store::CredentialStore::quota_pause_pct`]。
     quota_pct: i64,
+    /// 带设备身份的来访按会话占名额、设备上限不生效，见 [`store::ForwardFlags::devices_by_session`]。
+    devices_by_session: bool,
     /// 同上，7d 档，见 [`store::CredentialStore::quota_pause_pct_7d`]。
     quota_pct_7d: i64,
 }
@@ -3826,6 +3834,7 @@ impl DefaultLimits {
             session: store.default_session_limit(),
             rpm: store.default_rpm_limit(),
             quota_pct: store.quota_pause_pct(),
+            devices_by_session: store.forward_flags().devices_by_session(),
             quota_pct_7d: store.quota_pause_pct_7d(),
         }
     }
@@ -3860,16 +3869,20 @@ struct CredentialView {
     updated_at: u64,
     /// 账号自身的设备上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
     device_limit: i64,
-    /// 实际生效的设备上限（已套用全局默认）；0 表示不限。
+    /// 实际生效的设备上限（已套用全局默认）；0 表示不限。设备按会话占名额时
+    /// （[`store::ForwardFlags::devices_by_session`]）设备不再受限，恒为 0。
     device_limit_effective: i64,
+    /// 设备上限是否生效：设备按会话占名额时为假，前端据此隐藏设备上限的配置与「占满」提示。
+    device_limit_applies: bool,
     /// 当前已绑定的设备数。
     device_count: i64,
-    /// 账号自身的模拟会话上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
-    /// 只管模拟路径上没有设备身份的来访，见 `store::Select::session_key`。
+    /// 账号自身的会话上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
+    /// 管模拟路径上没有设备身份的来访，以及按会话占名额时的带设备来访，见
+    /// `store::Select::per_session`。
     session_limit: i64,
-    /// 实际生效的模拟会话上限（已套用全局默认）；0 表示不限。
+    /// 实际生效的会话上限（已套用全局默认）；0 表示不限。
     session_limit_effective: i64,
-    /// 当前活跃的模拟会话绑定数（TTL 内），口径同 `device_count`。
+    /// 当前活跃的会话绑定数（TTL 内），口径同 `device_count`。
     session_count: i64,
     /// 账号自身的 RPM 上限设置：`> 0` 独立上限；`0` 跟随全局默认；`< 0` 明确不限。
     rpm_limit: i64,
@@ -3961,7 +3974,12 @@ impl CredentialView {
             created_at: c.created_at,
             updated_at: c.updated_at,
             device_limit: c.device_limit,
-            device_limit_effective: store::effective_device_limit(c.device_limit, defaults.device),
+            device_limit_effective: if defaults.devices_by_session {
+                0
+            } else {
+                store::effective_device_limit(c.device_limit, defaults.device)
+            },
+            device_limit_applies: !defaults.devices_by_session,
             device_count,
             session_limit: c.session_limit,
             session_limit_effective: store::effective_session_limit(

@@ -17,8 +17,8 @@ use super::body::{
     client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
     extract_session_id, hoists_system_role, is_billable_messages, is_fallback_rejection,
     known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
-    remember_fallback_rejection, session_binding_key, sim_device_fingerprint, sim_device_id,
-    sim_session_key, stream_requested, trusted_cc_version, ua_of,
+    remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
+    stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
 use super::digest::{redact_headers, request_digest};
@@ -41,7 +41,8 @@ use super::rate_limit::{
     rate_limit_scope_for,
 };
 use super::session_id::{
-    bare_session_id, incoming_session_id, outbound_session_id, session_id_conflict,
+    bare_session_id, incoming_session_id, needs_prefix_key, outbound_session_id,
+    session_id_conflict, session_plan,
 };
 use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{SimSessionSeed, Simulation, inbound_facts, is_cc_shaped, simulates_cc};
@@ -696,11 +697,18 @@ pub(super) async fn handle_inner(
     } else {
         device_fingerprint(fp_device, &headers, &client_ua)
     };
-    // 模拟路径的**会话键**：缓存前缀加对话起点的指纹（[`sim_session_key`]，tools + system +
-    // 首条用户消息），
-    // 来访没带会话 id 时模拟路径用它派生出站的会话 id（[`Simulation::detect`]）。
-    let prefix_key = if simulating { body_json.as_ref().map(sim_session_key) } else { None };
-    // 参与选号的会话键（只在模拟路径、且来访没有设备身份时生效，见 [`store::Select::session_key`]）：
+    // 来访自报的会话 id（校验过形态，见 [`incoming_session_id`]）：会话键与流水都要用，算一次。
+    // 走模拟时上游看到的是另一个 uuid（按槽位派生或按账号钉住），来访这个不落库就彻底丢了
+    // ——下游拿着自己那个 id 来查请求会一条都查不到，见 [`store::Forensics::session_id_in`]。
+    let inbound_session = incoming_session_id(&headers, body_json.as_ref());
+    // 缓存前缀加对话起点的指纹（[`sim_session_key`]，tools + system + 首条用户消息）：来访没带
+    // 会话 id 时模拟路径用它派生出站的会话 id（[`Simulation::detect`]），按会话占名额而没带会话
+    // id 的真实客户端也用它来分会话，见 [`needs_prefix_key`]。
+    let prefix_key =
+        needs_prefix_key(flags, simulating, device_id.is_some(), inbound_session.as_deref())
+            .then(|| body_json.as_ref().map(sim_session_key))
+            .flatten();
+    // 参与选号的会话键（模拟路径，以及按会话占名额的带设备来访，见 [`session_plan`]）：
     // 来访自带合法会话 id 就用它——那正是出站会落的那条会话（按账号钉住之前的原值，键要跨账号
     // 稳定）；没带就用那个指纹。同一个键粘住同一个号（换号会连累 thinking 签名，理由同设备绑定）
     // 并占该号的一个**会话名额**：每个号最多同时活跃多少条模拟会话，与设备上限同一套三态与
@@ -709,30 +717,53 @@ pub(super) async fn handle_inner(
     // 来源那一段是明文，后台不必再靠「是不是 32 个 hex」去猜，改口径时旧行也认得出来。
     // **只有落库的这个键带前缀**，派生出站会话 id 的 seed 仍是裸的 `prefix_key`（下面的
     // `SimSessionSeed::Prefix`）——那是哈希的输入，动它会让在途对话的会话 id 全部换一遍。
-    // 来访自报的会话 id（校验过形态，见 [`incoming_session_id`]）：会话键与流水都要用，算一次。
-    // 走模拟时上游看到的是另一个 uuid（按槽位派生或按账号钉住），来访这个不落库就彻底丢了
-    // ——下游拿着自己那个 id 来查请求会一条都查不到，见 [`store::Forensics::session_id_in`]。
-    let inbound_session = incoming_session_id(&headers, body_json.as_ref());
-    let session_key: Option<String> =
-        prefix_key.as_ref().map(|k| session_binding_key(inbound_session.as_deref(), k));
+    // 这条请求的会话键，以及选号时按设备还是按会话占名额，见 [`session_plan`]。
+    let cc_kind = body_json
+        .as_ref()
+        .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
+        .unwrap_or(CcRequestKind::Main);
+    let plan = session_plan(
+        flags,
+        simulating,
+        device_id.is_some(),
+        inbound_session.as_deref(),
+        prefix_key.as_deref(),
+        cc_kind == CcRequestKind::QuotaProbe,
+    );
+    let session_key = plan.key.clone();
     // 本地拒绝的流水也要带这两样（见 [`RequestLogState::session_key`]）：下面这些闸拦下的
     // 请求走不到 `ReqLog`，外层补流水时从这里取。
     *log_state.session_key.lock() = session_key.clone();
     *log_state.session_id_in.lock() = inbound_session.clone();
+    /// [`SessionPlan`] 借出来给选号用的那一份：换号重试要反复构 `Select`，捆成 `Copy` 的一份
+    /// 免得那几处漏传哪一项。
+    #[derive(Clone, Copy)]
+    struct SessionSel<'a> {
+        key: Option<&'a str>,
+        per_session: bool,
+        passthrough: bool,
+    }
+    let session_sel = SessionSel {
+        key: session_key.as_deref().filter(|_| plan.binds),
+        per_session: plan.per_session,
+        passthrough: plan.passthrough,
+    };
 
-    // 3) 按 device_id（模拟路径没有设备身份时按会话键）粘性选出凭证的 access_token（必要时刷新）。
+    // 3) 按 device_id（或会话键，见 [`SessionSel`]）粘性选出凭证的 access_token（必要时刷新）。
     // 首发与换号重试用同一份选号入参，只有「已试过哪些号」不同——写成函数而不是就地各构一份，
     // 免得两处的 device_id/model 哪天漂开。
     fn select<'a>(
         device_id: Option<&'a str>,
-        session_key: Option<&'a str>,
+        session: SessionSel<'a>,
         billable: bool,
         model: Option<&'a str>,
         exclude: &'a [i64],
     ) -> store::Select<'a> {
         store::Select {
             device_id,
-            session_key,
+            session_key: session.key,
+            per_session: session.per_session,
+            passthrough_session: session.passthrough,
             rate_limited: billable,
             exclude,
             model,
@@ -742,7 +773,7 @@ pub(super) async fn handle_inner(
     let (token, cred, session_slot) = match store::valid_access_token_for_device(
         &state.store,
         &state.clients,
-        select(device_id.as_deref(), session_key.as_deref(), billable, req_model.as_deref(), &[]),
+        select(device_id.as_deref(), session_sel, billable, req_model.as_deref(), &[]),
     )
     .await
     {
@@ -858,10 +889,6 @@ pub(super) async fn handle_inner(
     // **官方本来就非流式的那两类不改**（安全分类、额度探测，见
     // [`CcRequestKind::keeps_nonstream`]）：这个开关的本意是「官方恒为流式，非流式请求
     // 一看就不是 CC」，对它们恰好相反——改成流式才是官方不产生的形态。
-    let cc_kind = body_json
-        .as_ref()
-        .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
-        .unwrap_or(CcRequestKind::Main);
     // `merge_beta_for` 要的那几项请求事实：来访体不变，转发循环外算一次，换号重试沿用。
     let beta_ctx = BetaCtx::of(cc_kind, &body, body_json.as_ref());
     let upgrade_stream = billable
@@ -1319,7 +1346,7 @@ pub(super) async fn handle_inner(
                         &state.clients,
                         select(
                             device_id.as_deref(),
-                            session_key.as_deref(),
+                            session_sel,
                             billable,
                             req_model.as_deref(),
                             &tried,
@@ -1460,7 +1487,7 @@ pub(super) async fn handle_inner(
                     &state.clients,
                     select(
                         device_id.as_deref(),
-                        session_key.as_deref(),
+                        session_sel,
                         billable,
                         req_model.as_deref(),
                         &tried,
@@ -1576,13 +1603,7 @@ pub(super) async fn handle_inner(
             match store::valid_access_token_for_device(
                 &state.store,
                 &state.clients,
-                select(
-                    device_id.as_deref(),
-                    session_key.as_deref(),
-                    billable,
-                    req_model.as_deref(),
-                    &tried,
-                ),
+                select(device_id.as_deref(), session_sel, billable, req_model.as_deref(), &tried),
             )
             .await
             {
@@ -1774,13 +1795,7 @@ pub(super) async fn handle_inner(
         match store::valid_access_token_for_device(
             &state.store,
             &state.clients,
-            select(
-                device_id.as_deref(),
-                session_key.as_deref(),
-                billable,
-                req_model.as_deref(),
-                &tried,
-            ),
+            select(device_id.as_deref(), session_sel, billable, req_model.as_deref(), &tried),
         )
         .await
         {

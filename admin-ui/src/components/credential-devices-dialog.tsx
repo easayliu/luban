@@ -239,17 +239,21 @@ export function CredentialDevicesDialog({
         <DialogHeader>
           <div className="flex items-start gap-3 pr-8">
             <Avatar>
-              <AvatarFallback><SmartphoneIcon /></AvatarFallback>
+              <AvatarFallback>{cred.device_limit_applies ? <SmartphoneIcon /> : <MessagesSquareIcon />}</AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              {/* 标题写全两种名额：这个对话框上半段是设备、下半段是模拟会话。 */}
-              <DialogTitle>{t('名额：设备与模拟会话', 'Slots: devices and simulated sessions')}</DialogTitle>
+              {/* 标题写全两种名额：这个对话框上半段是设备、下半段是会话。 */}
+              <DialogTitle>
+                {cred.device_limit_applies
+                  ? t('名额：设备与会话', 'Slots: devices and sessions')
+                  : t('会话名额', 'Session slots')}
+              </DialogTitle>
               <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
                 {/* 数量徽章只在读取中 / 读取失败时出现：读到了之后，下面两张容量卡的「名额占用 2/3」
                     「2/10」就是同一组数，头部再报一遍「2 台活跃设备」是重复。 */}
-                {(devices.isPending || devices.error) && (
+                {cred.device_limit_applies && (devices.isPending || devices.error) && (
                   <Badge variant={deviceStatus.variant} aria-live="polite">{deviceStatus.label}</Badge>
                 )}
                 {(sessions.isPending || sessions.error) && (
@@ -268,6 +272,8 @@ export function CredentialDevicesDialog({
           }}
         >
           <DialogPanel className="space-y-5">
+            {/* 设备按会话占名额时设备上限不生效：设备那半（容量卡与设备列表）整个不出现，只剩会话。 */}
+            {cred.device_limit_applies && (<>
             {editingLimit ? (
               <Card>
                 <CardHeader>
@@ -408,9 +414,10 @@ export function CredentialDevicesDialog({
               error={devices.error}
               onRetry={() => { void devices.refetch() }}
             />
+            </>)}
 
-            {/* 模拟会话是另一种名额：走模拟路径、没有设备身份的来访按会话键粘住账号。
-                它们与设备名额互不相干（一条请求只占其一），故单独一张容量卡和一份列表。 */}
+            {/* 会话是另一种名额：设备上限不生效时的真实客户端、模拟路径上没有设备身份的来访按会话键
+                粘住账号。它们与设备名额互不相干（一条请求只占其一），故单独一张容量卡和一份列表。 */}
             <SessionCapacityCard cred={cred} sessionLimit={sessionLimit} sessions={sessions} />
           </DialogPanel>
 
@@ -710,7 +717,7 @@ function DeviceStat({
 }
 
 /**
- * 模拟会话容量：占用条 + 生效上限 + 策略徽章，以及自己的编辑态（与设备上限那张卡分开：两者
+ * 会话容量：占用条 + 生效上限 + 策略徽章，以及自己的编辑态（与设备上限那张卡分开：两者
  * 各自一个 mutation、各自一套三态，混在一个表单里保存哪一个都说不清）。列表挂在卡片下面。
  */
 function SessionCapacityCard({
@@ -762,13 +769,13 @@ function SessionCapacityCard({
       <Card>
         <CardHeader>
           <CardTitle className="text-sm leading-snug">
-            {editing ? t('模拟会话上限', 'Simulated session limit') : t('模拟会话容量', 'Simulated session capacity')}
+            {editing ? t('会话上限', 'Session limit') : t('会话容量', 'Session capacity')}
           </CardTitle>
           <CardDescription className="text-xs">
             {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
             <ClampedDescription text={t(
-              '走模拟路径且无设备身份的客户端请求按对话固定到账号：请求自带会话 ID 时以其为准，否则按缓存前缀 + 首条用户消息识别。每个对话占用一个槽位。出站会话 ID 由槽位派生，槽位释放后由下一个对话复用，因此上游可见的会话 ID 数量不会超过此上限。该上限与设备名额相互独立。',
-              'Client requests on the simulation path without a device identity stick to this account per conversation (by their own session ID if present, otherwise by cache prefix + first user message), each taking a slot. The outbound session ID derives from the slot and is reused by the next conversation once the slot is freed, so upstream sees at most this many session IDs. Independent of device slots.',
+              '客户端请求按对话固定到账号，每个对话占用一个名额。真实客户端以其自带的会话 ID 识别对话（设备上限不生效时）；经模拟路径、无设备身份的请求自带会话 ID 时以其为准，否则按缓存前缀 + 首条用户消息识别，其出站会话 ID 由槽位派生，槽位释放后由下一个对话复用。该上限与设备名额相互独立。',
+              'Client requests stick to this account per conversation, each conversation taking one slot. Real clients are identified by their own session ID (when the device limit does not apply); requests on the simulation path without a device identity use their own session ID if present, otherwise cache prefix + first user message, and their outbound session ID derives from a slot that is reused by the next conversation once freed. Independent of device slots.',
             )} />
           </CardDescription>
           {!editing && !readOnly && (
@@ -955,7 +962,7 @@ export function SessionList({
       <div className="flex items-end justify-between gap-3">
         <div>
           <h3 id={`active-sessions-${credId}`} className="font-semibold text-sm">
-            {t('活跃模拟会话', 'Active simulated sessions')}
+            {t('活跃会话', 'Active sessions')}
           </h3>
           <p className="text-xs text-muted-foreground">
             {t('按最近活跃时间排序', 'Sorted by most recent activity')}
@@ -976,7 +983,7 @@ export function SessionList({
               loading={clearAll.isPending}
               disabled={unbind.isPending}
               onClick={() => clearAll.mutate()}
-              title={t('清除此账号的全部模拟会话绑定（含休眠会话）；后续请求将照常重新选择账号','Remove every simulated session binding on this account (dormant ones too); the next request selects an account as usual')}
+              title={t('清除此账号的全部会话绑定（含休眠会话）；后续请求将照常重新选择账号','Remove every session binding on this account (dormant ones too); the next request selects an account as usual')}
             >
               <Trash2Icon />
               {t('全部清理', 'Clear all')}
@@ -1018,8 +1025,8 @@ export function SessionList({
             <EmptyTitle className="text-base">{t('暂无活跃会话', 'No active sessions')}</EmptyTitle>
             <EmptyDescription>
               {t(
-                '走模拟路径且无设备身份的请求完成一次后，会话将显示在此处。',
-                'A session appears here after a simulated request without a device identity completes.',
+                '有请求按会话占用名额后，会话将显示在此处。',
+                'A session appears here once a request takes a session slot on this account.',
               )}
             </EmptyDescription>
           </EmptyHeader>
@@ -1031,11 +1038,13 @@ export function SessionList({
             const lastSeenRelative = relativeTime(session.last_seen_at, undefined, language)
             const firstBoundFull = formatFullTime(session.created_at, language)
             const lastSeenFull = formatFullTime(session.last_seen_at, language)
-            // 主行是上游看到的会话 id（按槽位派生、对话之间复用），槽位号做徽章；对话自己的键
+            // 主行是上游看到的会话 id（模拟会话按槽位派生、对话之间复用，真实客户端的是它自带 id
+            // 按账号钉住后的值），槽位号做徽章（真实客户端不占槽位，记 -1）；对话自己的键
             // 退到悬浮提示里，来源直接读键上那一段（`lb:v2:sid:` / `lb:v2:pfx:`），不再靠
             // 「是不是 32 个 hex」猜——uuid 去掉横线也是 32 个 hex。
             const { source, value } = parseSessionKey(session.session_key)
             const derived = source === 'pfx'
+            const passthrough = session.slot < 0
             const keyKind = derived ? t('按前缀', 'by prefix') : t('自带 ID', 'client ID')
             // 最近一轮的模型：记在绑定行上、不参与键（换模型不另起会话），旧库为空就不占位。
             const modelLabel = session.last_model ? `${session.last_model} · ` : ''
@@ -1043,15 +1052,24 @@ export function SessionList({
               <li key={session.session_key} className="rounded-lg border bg-card px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-2">
                   <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
-                    #{session.slot}
-                  </Badge>
+                  {passthrough ? (
+                    <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用客户端自带的会话 ID（按账号转换后发往上游），不占槽位', 'A real client session: it keeps the client’s own session ID (converted per account before going upstream) and takes no slot')}>
+                      {t('真实', 'Real')}
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
+                      #{session.slot}
+                    </Badge>
+                  )}
                   <Tooltip>
                     <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">
-                      {session.session_id}
+                      {session.session_id || '—'}
                     </TooltipTrigger>
                     <TooltipPopup className="max-w-80 whitespace-normal break-all text-left leading-5">
-                      {t(`上游可见的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)}
+                      {/* 真实客户端没带会话 ID（按前缀分会话）时出站也没有，后端给空串。 */}
+                      {session.session_id
+                        ? t(`上游可见的会话 ID ${session.session_id}`, `Session ID upstream sees: ${session.session_id}`)
+                        : t('客户端未携带会话 ID，按缓存前缀与首条用户消息识别对话', 'The client sent no session ID; the conversation is identified by cache prefix and first user message')}
                       <br />
                       {t(`对话键（${keyKind}）${value}`, `Conversation key (${keyKind}): ${value}`)}
                     </TooltipPopup>
@@ -1059,6 +1077,7 @@ export function SessionList({
                   <Badge variant="secondary" size="sm">
                     {derived ? t('按前缀', 'By prefix') : t('自带 ID', 'Client ID')}
                   </Badge>
+                  {session.session_id && (
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
@@ -1074,6 +1093,7 @@ export function SessionList({
                     </TooltipTrigger>
                     <TooltipPopup>{t('复制会话 ID', 'Copy session ID')}</TooltipPopup>
                   </Tooltip>
+                  )}
                   <Tooltip>
                     <TooltipTrigger
                       className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
@@ -1083,7 +1103,9 @@ export function SessionList({
                       onClick={() => setDrill({
                         credId,
                         sessionKey: session.session_key,
-                        label: t(`会话 #${session.slot}`, `Session #${session.slot}`),
+                        label: passthrough
+                          ? t(`会话 ${(session.session_id || value).slice(0, 8)}`, `Session ${(session.session_id || value).slice(0, 8)}`)
+                          : t(`会话 #${session.slot}`, `Session #${session.slot}`),
                         hours: 24,
                       })}
                     >

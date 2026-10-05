@@ -117,18 +117,20 @@ export interface Credential {
   updated_at: number
   /** 账号自身的设备上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。 */
   device_limit: number
-  /** 实际生效的设备上限（已套用全局默认）；0 表示不限。 */
+  /** 实际生效的设备上限（已套用全局默认）；0 表示不限。设备按会话占名额时（`Settings.devices_by_session`）恒为 0。 */
   device_limit_effective: number
+  /** 设备上限是否生效：设备按会话占名额时为 false，设备上限的配置与「占满」提示一律隐藏。 */
+  device_limit_applies: boolean
   /** 当前已绑定的设备数。 */
   device_count: number
   /**
-   * 账号自身的模拟会话上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。
-   * 只管模拟路径上没有设备身份的来访：它们按会话键（自带的会话 id，否则缓存前缀 + 首条用户消息）粘住账号并占名额。
+   * 账号自身的会话上限设置：>0 独立上限；0 跟随全局默认；<0 明确不限。
+   * 管设备上限不生效时的真实客户端（按自带会话 id），以及模拟路径上没有设备身份的来访（自带的会话 id，否则缓存前缀 + 首条用户消息），它们按会话键粘住账号并占名额。
    */
   session_limit: number
-  /** 实际生效的模拟会话上限（已套用全局默认）；0 表示不限。 */
+  /** 实际生效的会话上限（已套用全局默认）；0 表示不限。 */
   session_limit_effective: number
-  /** 当前活跃（TTL 内）的模拟会话绑定数，口径同 device_count。 */
+  /** 当前活跃（TTL 内）的会话绑定数，口径同 device_count。 */
   session_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
   ban_reason: string | null
@@ -316,8 +318,8 @@ export interface UsageLog {
    */
   session_id_in: string | null
   /**
-   * 这条请求落在哪条**模拟会话绑定**上（`lb:v2:sid:…` / `lb:v2:pfx:…`）；带设备身份的来访与
-   * 非模拟路径为 null，0.3.139 之前的旧记录也是 null。名额对话框里会话那一行的「看请求」
+   * 这条请求落在哪条**会话绑定**上（`lb:v2:sid:…` / `lb:v2:pfx:…`）；按设备占名额的来访为
+   * null，0.3.139 之前的旧记录也是 null。名额对话框里会话那一行的「看请求」
    * 按它筛——它才是这条对话自己的身份，`session_id` 是会被下一个对话复用的槽位 id。
    */
   session_key: string | null
@@ -444,16 +446,16 @@ export async function listCredentials(): Promise<Credential[]> {
   return data
 }
 
-/** 一条模拟会话绑定。口径同 `session_count`：只含 TTL 内仍活跃的。 */
+/** 一条会话绑定。口径同 `session_count`：只含 TTL 内仍活跃的。 */
 export interface SessionBinding {
   /**
    * 会话键：`lb:v2:sid:<来访自带的会话 id>` 或 `lb:v2:pfx:<「缓存前缀（tools + system）+ 首条
    * 用户消息」的指纹>`——命名空间加口径版本加来源段，取法见后端 `session_binding_key`。
    */
   session_key: string
-  /** 在该账号上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。 */
+  /** 在该账号上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。-1 是真实客户端的会话：沿用自带会话 id，不占槽位。 */
   slot: number
-  /** 上游看到的会话 id（X-Claude-Code-Session-Id），按「账号 + 槽位」派生。 */
+  /** 上游看到的会话 id（X-Claude-Code-Session-Id）：模拟会话按「账号 + 槽位」派生，真实客户端的是自带 id 按账号钉住后的值；真实客户端没带会话 id 时为空串。 */
   session_id: string
   /** 绑定之后再命中的请求数（建行那一轮不计，口径同设备绑定；随绑定行走，解绑即归零）。 */
   request_count: number
@@ -468,7 +470,7 @@ export interface SessionBinding {
   last_model: string | null
 }
 
-/** 列出某账号当前活跃的模拟会话（按最近活跃倒序）。 */
+/** 列出某账号当前活跃的会话（按最近活跃倒序）。 */
 export async function listCredentialSessions(id: number): Promise<SessionBinding[]> {
   const { data } = await api.get<SessionBinding[]>(`/credentials/${id}/sessions`)
   return data
@@ -507,7 +509,7 @@ export interface UsageListParams {
   model?: string
   hours?: number
   /**
-   * 只看这条模拟会话的请求（`session_bindings.session_key`，精确匹配）。名额对话框里
+   * 只看这条会话的请求（`session_bindings.session_key`，精确匹配）。名额对话框里
    * 会话那一行点「看请求」带的；与上游看到的 session_id 不是一回事——那个按槽位派生、
    * 对话之间复用，按它筛会把先后占过同一槽位的几个对话混在一起。
    */
@@ -604,12 +606,12 @@ export async function unbindCredentialDevice(id: number, deviceId: string): Prom
   await api.delete(`/credentials/${id}/devices/${encodeURIComponent(deviceId)}`)
 }
 
-/** 解除某模拟会话与该账号的绑定，立即腾出一个会话名额。语义同 unbindCredentialDevice。 */
+/** 解除某会话与该账号的绑定，立即腾出一个会话名额。语义同 unbindCredentialDevice。 */
 export async function unbindCredentialSession(id: number, sessionKey: string): Promise<void> {
   await api.delete(`/credentials/${id}/sessions/${encodeURIComponent(sessionKey)}`)
 }
 
-/** 一键清掉某账号的全部模拟会话绑定，返回清掉的条数。不是拉黑：下一条请求照常重新选号。 */
+/** 一键清掉某账号的全部会话绑定，返回清掉的条数。不是拉黑：下一条请求照常重新选号。 */
 export async function clearCredentialSessions(id: number): Promise<number> {
   const { data } = await api.delete<{ ok: boolean; removed: number }>(`/credentials/${id}/sessions`)
   return data.removed
@@ -680,7 +682,7 @@ export async function setDeviceLimits(
   return data
 }
 
-/** 批量设置模拟会话数上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
+/** 批量设置会话数上限（三态同单账号接口：>0 独立上限；0 跟随全局默认；-1 不限）。 */
 export async function setSessionLimits(
   ids: number[],
   sessionLimit: number,
@@ -753,7 +755,7 @@ export async function setDeviceLimit(id: number, deviceLimit: number): Promise<C
   return data
 }
 
-/** 设置模拟会话数上限：>0 独立上限；0 跟随全局默认；-1 明确不限。 */
+/** 设置会话数上限：>0 独立上限；0 跟随全局默认；-1 明确不限。 */
 export async function setSessionLimit(id: number, sessionLimit: number): Promise<Credential> {
   const { data } = await api.post<Credential>(`/credentials/${id}/session-limit`, {
     session_limit: sessionLimit,

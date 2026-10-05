@@ -635,10 +635,16 @@ function StatsRow({
   const { t, language, locale } = useI18n()
   const ratio = (count: number, limit: number) =>
     `${count.toLocaleString(locale)}/${limit > 0 ? limit.toLocaleString(locale) : '∞'}`
+  // 设备按会话占名额时设备上限不生效，设备那格不出现：剩五格，桌面一行五列，手机两列、
+  // 最后一格横跨两列。下面几格的边框按有没有设备那格分两套。
+  const devices = cred.device_limit_applies
   return (
     <section
       aria-label={t('账号概览', 'Account overview')}
-      className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5 lg:grid-cols-6"
+      className={cn(
+        'grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5',
+        devices ? 'lg:grid-cols-6' : 'lg:grid-cols-5',
+      )}
     >
       <OverviewMetric
         className="border-r border-b lg:border-b-0"
@@ -651,6 +657,7 @@ function StatsRow({
         opensDetail
         onClick={onRpm}
       />
+      {devices && (
       <OverviewMetric
         className="border-b lg:border-r lg:border-b-0"
         label={t('设备', 'Devices')}
@@ -662,19 +669,20 @@ function StatsRow({
         opensDetail
         onClick={onDevices}
       />
+      )}
       <OverviewMetric
-        className="border-r border-b lg:border-b-0"
-        label={t('模拟会话', 'Sessions')}
+        className={devices ? 'border-r border-b lg:border-b-0' : 'border-b lg:border-r lg:border-b-0'}
+        label={t('会话', 'Sessions')}
         value={ratio(cred.session_count, cred.session_limit_effective)}
         status={limitPolicyLabel(cred.session_limit, t)}
-        statusHint={t('活跃模拟会话 / 生效上限。点击查看会话或调整上限', 'Active simulated sessions / effective limit. Click to view sessions or adjust the limit')}
+        statusHint={t('活跃会话 / 生效上限。点击查看会话或调整上限', 'Active sessions / effective limit. Click to view sessions or adjust the limit')}
         icon={MessagesSquareIcon}
         tone={levelTone(deviceUsageMeta(cred.session_count, cred.session_limit_effective).level)}
         opensDetail
         onClick={onDevices}
       />
       <OverviewMetric
-        className="border-b lg:border-r lg:border-b-0"
+        className={devices ? 'border-b lg:border-r lg:border-b-0' : 'border-r border-b lg:border-b-0'}
         label={t('累计费用', 'Total cost')}
         value={formatUsd(cred.cost_total)}
         statusHint={t('按公开价目表估算的等价 API 费用，不是账单金额。点击查看请求明细', 'Equivalent API cost estimated from the public price list, not a bill. Click to view the request log')}
@@ -684,7 +692,7 @@ function StatsRow({
         onClick={onUsage}
       />
       <OverviewMetric
-        className="border-r"
+        className={devices ? 'border-r' : 'border-b lg:border-r lg:border-b-0'}
         label={t('最近使用', 'Last used')}
         value={cred.last_used ? relativeTime(cred.last_used, now, language) : t('从未使用', 'Never')}
         statusHint={cred.last_used ? formatFullTime(cred.last_used, language) : undefined}
@@ -692,6 +700,7 @@ function StatsRow({
         tone="neutral"
       />
       <OverviewMetric
+        className={devices ? undefined : 'col-span-2 lg:col-span-1'}
         label={t('被封停次数', 'Auto-disables')}
         value={cred.ban_count.toLocaleString(locale)}
         statusHint={t('自动封停的累计次数，解封后不清零', 'Cumulative automatic disables; re-enabling does not reset it')}
@@ -1150,7 +1159,7 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
 }
 
 /**
- * 设备与模拟会话两份列表直接摊在页面上。查询键与名额对话框共用，
+ * 设备与会话两份列表直接摊在页面上。查询键与名额对话框共用，
  * 在这里解绑或在对话框里解绑，两边读的是同一份缓存。
  */
 function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () => void }) {

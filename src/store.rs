@@ -2283,15 +2283,26 @@ impl CredentialStore {
         );
         let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &Row| {
+            let session_key: String = r.get(0)?;
             let slot: i64 = r.get(1)?;
+            // 真实客户端的会话键带来访会话 id 时（`lb:v2:sid:<id>`）取最后一段按账号钉住；钉不出来
+            // （号没有 account_uuid）时上游收到的就是来访原值。按前缀指纹分的（`…:pfx:…`）来访
+            // 根本没带会话 id，出站也就没有，留空。
+            let session_id = if slot < 0 {
+                match session_key.rsplit_once(':') {
+                    Some((head, sid)) if head.ends_with(":sid") => {
+                        crate::credentials::pinned_session_id(account_uuid.as_deref(), sid)
+                            .unwrap_or_else(|| sid.to_string())
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                crate::credentials::sim_slot_session_id(account_uuid.as_deref(), cred_id, slot)
+            };
             Ok(SessionBinding {
-                session_key: r.get(0)?,
+                session_key,
                 slot,
-                session_id: crate::credentials::sim_slot_session_id(
-                    account_uuid.as_deref(),
-                    cred_id,
-                    slot,
-                ),
+                session_id,
                 request_count: r.get(2)?,
                 created_at: r.get(3)?,
                 last_seen_at: r.get(4)?,
@@ -3643,6 +3654,15 @@ pub struct ForwardFlags {
     pub opus_refusal_fallback: bool,
 }
 
+impl ForwardFlags {
+    /// 真实客户端（不走模拟）带设备身份时**按会话**占名额、设备上限不生效：设备指纹归一化开着、
+    /// 身份伪装连同 device 一起换，出站 device_id 只剩「账号 + 平台 + 客户端版本」那几种，绑了
+    /// 几台真实机器上游看不见。见 [`Select::per_session`] 与 `crate::proxy::session_plan`。
+    pub fn devices_by_session(self) -> bool {
+        self.normalize_device_fp && self.spoof_identity && self.spoof_device_id
+    }
+}
+
 impl Default for ForwardFlags {
     fn default() -> Self {
         Self {
@@ -4495,9 +4515,12 @@ pub struct SessionBinding {
     /// 见 `crate::proxy::session_binding_key` 与 `Select::session_key`。
     pub session_key: String,
     /// 在该凭证上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。
+    /// [`PASSTHROUGH_SLOT`]（`-1`）表示真实客户端的会话：沿用来访自己的会话 id，不占槽位。
     pub slot: i64,
-    /// 上游看到的会话 id（`X-Claude-Code-Session-Id`），按「账号 + 槽位」派生，与转发路径同一个
-    /// 函数（`crate::credentials::sim_slot_session_id`）。
+    /// 上游看到的会话 id（`X-Claude-Code-Session-Id`）。模拟会话按「账号 + 槽位」派生
+    /// （`crate::credentials::sim_slot_session_id`），真实客户端的会话是来访 id 按账号钉住后的值
+    /// （`crate::credentials::pinned_session_id`），都与转发路径同一个函数。真实客户端没带会话 id
+    /// （按前缀指纹分会话）时为空串：出站也没有。
     pub session_id: String,
     /// 绑定之后再命中的请求数（建行那一轮不计，口径同 `device_bindings.request_count`；
     /// 随绑定行走，解绑即归零）。
@@ -5861,10 +5884,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_device_bindings_seen
             ON device_bindings(last_seen_at);
 
-        -- 模拟会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
-        -- 只有走模拟路径、且来访没有设备身份的请求写它（键的取法见 proxy 的
-        -- `session_binding_key`：`lb:v2:sid:<来访会话 id>` 或 `lb:v2:pfx:<缓存前缀指纹>`）：
-        -- 带设备身份的由 device_bindings 管，一条请求不占两份名额。
+        -- 会话→凭证的粘性绑定：同一会话键始终命中同一凭证，并占该凭证的**会话名额**。
+        -- 走模拟路径且没有设备身份的请求写它；设备身份在上游已收敛时（`Select::per_session`）
+        -- 带设备身份的来访也写它（键的取法见 proxy 的 `session_binding_key`：
+        -- `lb:v2:sid:<来访会话 id>` 或 `lb:v2:pfx:<缓存前缀指纹>`）。一条请求只占一份名额。
+        -- 真实客户端的会话沿用来访 id 出站，slot 记 -1（PASSTHROUGH_SLOT）。
         -- slot：这条会话在该凭证上占的槽位（0 起，取活跃绑定里最小的空位），出站会话 id 由
         -- 「账号 + 槽位」派生——槽位释放后被下一个对话复用，上游看到的会话 id 数有界。
         -- last_model：最近一轮请求的模型，**只记不参与键**（键里带模型会把同一条对话换模型
@@ -6628,6 +6652,38 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
     })
 }
 
+/// 写一条设备绑定（新建或改绑到 `cred_id`）。按设备占名额的选号与按会话占名额时的设备亲和
+/// 记录（[`Select::per_session`]）共用这一份。
+///
+/// 过了保留期、后台还没来得及删的那一行会在这里被撞上（此前它已被删掉，走的是纯 INSERT）。
+/// 那是一条**新**绑定，故 created_at 与 request_count 归零重来——否则设备明细里会显示一个
+/// 几天前建立、请求数接着往上加的绑定，而那台设备其实刚被重新调度过。`SET` 右侧读的都是
+/// 冲突前那一行的值（SQLite 语义），故 CASE 里的 last_seen_at 是旧值，与放在哪一行无关。
+fn upsert_device_binding(
+    conn: &Connection,
+    device_id: &str,
+    cred_id: i64,
+    retention_secs: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
+         ON CONFLICT(device_id) DO UPDATE
+            SET cred_id = ?2, last_seen_at = unixepoch(), \
+                created_at = CASE WHEN ?3 > 0 \
+                                    AND last_seen_at < unixepoch() - ?3 \
+                                  THEN unixepoch() ELSE created_at END, \
+                request_count = CASE WHEN ?3 > 0 \
+                                       AND last_seen_at < unixepoch() - ?3 \
+                                     THEN 1 ELSE request_count + 1 END",
+        params![device_id, cred_id, retention_secs],
+    )?;
+    Ok(())
+}
+
+/// 沿用来访会话 id、不派生的会话绑定（[`Select::passthrough_session`]）在 `slot` 列记的值。
+/// 不占槽位：[`free_session_slot`] 只从 0 起找空位，负数永远不与之相撞。
+pub const PASSTHROUGH_SLOT: i64 = -1;
+
 /// 该凭证当前**空着**的最小会话槽位：活跃（TTL 内）绑定占着的槽位之外，从 0 起最小的那个；
 /// `prefer` 给出的槽位空着就直接用它（休眠的软绑定回来优先回原槽位，会话 id 才不换）。
 /// 休眠绑定占过的槽位算空——它们不占名额，槽位（也就是会话 id）让给活跃的对话复用。
@@ -6719,12 +6775,24 @@ pub struct Select<'a> {
     /// `Some` 且 `device_id` 为 `None` 时按它粘住账号并占该账号
     /// 的**会话名额**（`session_bindings`，上限 `session_limit` / [`DEFAULT_SESSION_LIMIT`]），
     /// 规则与设备绑定逐条相同（TTL、软绑定、改绑、全满时拒——[`SessionLimitReached`]）。
-    /// `device_id` 有值时忽略它：带设备身份的已由设备绑定管着，一条请求不占两份名额。
-    /// 非模拟路径一律 `None`：那些来访要么有设备身份，要么是裸请求，形态没变。
+    /// `device_id` 有值时只在 [`Self::per_session`] 下才用它，否则按设备绑定，一条请求不占两份
+    /// 名额。非模拟路径只有 `per_session` 时才有值（真实客户端自带的会话 id，没带时按前缀指纹）。
     ///
     /// 绑定行还记着这条会话在该号上占的**槽位**（[`free_session_slot`]）：出站会话 id 由
     /// 「账号 + 槽位」派生，槽位释放后下一个对话复用同一个 id，见 [`CredentialStore::session_slot`]。
     pub session_key: Option<&'a str>,
+    /// 带设备身份的来访也**按会话**占名额（[`Self::session_key`] 那张表与 `session_limit`），
+    /// 设备上限不再生效。代理在「上游看到的设备身份已经收敛」时置真：设备指纹归一化开着、
+    /// 出站 device_id 由「账号 + 平台 + 客户端版本」派生，同一个号在上游只呈现寥寥几台设备，
+    /// 绑了几台真实机器上游根本看不见，看得见的是每台设备下同时活跃几条会话。
+    ///
+    /// 设备绑定行照写，但只当**亲和记录**用：同一台设备新开的会话优先落在它上次那个号上，
+    /// 一个人的活不会被均衡到一圈号上去。置真而 `session_key` 为 `None`（额度探测那类不该占
+    /// 名额的请求）时只按亲和选号，不写会话绑定、不受任何名额约束。
+    pub per_session: bool,
+    /// 这条会话出站沿用来访自己的会话 id（真实客户端，不走模拟），不分配派生用的槽位：
+    /// 绑定行 `slot` 记 `-1`，后台列会话时据此按来访 id 算上游看到的那个。
+    pub passthrough_session: bool,
     /// 设备绑定**占名额**的有效期（秒）；`<= 0` 表示永不过期。
     pub ttl_secs: i64,
     /// 软绑定保留期（秒）：绑定行超过 [`Self::ttl_secs`] 后不再占名额，但在这个时长内仍然
@@ -6817,6 +6885,8 @@ impl CredentialStore {
         let Select {
             device_id,
             session_key,
+            per_session,
+            passthrough_session,
             ttl_secs,
             retention_secs,
             session_ttl_secs,
@@ -6825,14 +6895,17 @@ impl CredentialStore {
             exclude,
             model,
         } = sel;
-        // 这条请求按什么粘住账号、占哪种名额：有设备身份按设备；没有设备身份但带会话键（模拟
-        // 路径）按会话；都没有就是裸请求。设备优先——带设备身份的已由设备绑定 + 上限管着，再按
-        // 会话占一份就是一条请求扣两份名额。
+        // 这条请求按什么粘住账号、占哪种名额：有设备身份按设备（`per_session` 时改按会话）；
+        // 没有设备身份但带会话键（模拟路径）按会话；都没有就是裸请求。一条请求只占一份名额。
+        // `per_session` 而没有会话键的（额度探测）不绑定，只按下面的设备亲和选号。
         let binding = match (device_id, session_key) {
-            (Some(d), _) => Some(Binding::Device(d)),
-            (None, Some(k)) => Some(Binding::Session(k)),
-            (None, None) => None,
+            (Some(d), _) if !per_session => Some(Binding::Device(d)),
+            (_, Some(k)) => Some(Binding::Session(k)),
+            (_, None) => None,
         };
+        // 按会话占名额的带设备来访，设备绑定行只当亲和记录：选号时优先它指的那个号，选完改写
+        // 成这次落的号（见 [`Select::per_session`]）。
+        let affinity_device = device_id.filter(|_| per_session);
         // 这几项须在取锁前读（内部自己会取锁，parking_lot 不可重入）。
         let default_limit = self.default_device_limit();
         let default_session_limit = self.default_session_limit();
@@ -7041,8 +7114,11 @@ impl CredentialStore {
                                 )?;
                                 // 活跃绑定续用原槽位；休眠的会话软绑定回来要重新占槽位：原槽位
                                 // 空着就还用它，被别的对话拿走了就取最小的空位——会话 id 随槽位变，
-                                // 这条对话在上游成了另一条会话。
-                                let slot = if active {
+                                // 这条对话在上游成了另一条会话。沿用来访会话 id 的不占槽位（-1）；
+                                // 原来记的是 -1 而这次要派生的，也得新取一个。
+                                let slot = if passthrough_session {
+                                    PASSTHROUGH_SLOT
+                                } else if active && old >= 0 {
                                     old
                                 } else {
                                     free_session_slot(&conn, c.id, session_ttl_secs, Some(old))?
@@ -7055,7 +7131,7 @@ impl CredentialStore {
                                       WHERE session_key = ?1",
                                     params![key, slot, model],
                                 )?;
-                                Some(slot)
+                                (slot >= 0).then_some(slot)
                             }
                             Binding::Device(did) => {
                                 conn.execute(
@@ -7068,6 +7144,9 @@ impl CredentialStore {
                                 None
                             }
                         };
+                        if let Some(did) = affinity_device {
+                            upsert_device_binding(&conn, did, c.id, device_retention)?;
+                        }
                         self.rpm_rate.take(c.id, rpm_limit_of(c), rpm_window);
                         if device_id.is_none() && rate_limited {
                             self.bare_rate.take(c.id, rate_limit, bare_window);
@@ -7103,6 +7182,25 @@ impl CredentialStore {
         };
         let mut ordered: Vec<&Credential> = creds.iter().collect();
         ordered.sort_by_key(|c| (c.priority, plan_rank(c), used(c), c.id));
+        // 设备亲和（按会话占名额的带设备来访，见 [`Select::per_session`]）：这台设备上次落的号
+        // 提到最前，新会话跟着它走——一台机器的活集中在一个号上，才像一个真实用户。它照样要过
+        // 下面的名额与 RPM 两道门，过不去就按原顺序溢出。premium 模型下不越过档次更高的号：
+        // 亲和是软偏好，不该把一条 fable 请求从 Max 号拉到 Pro 号上去撞。
+        if let Some(did) = affinity_device
+            && let Some(home) = conn
+                .query_row(
+                    "SELECT cred_id FROM device_bindings WHERE device_id = ?1 \
+                        AND (?2 <= 0 OR last_seen_at >= unixepoch() - ?2)",
+                    params![did, device_retention],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+            && let Some(pos) = ordered.iter().position(|c| c.id == home)
+            && ordered.first().is_some_and(|f| plan_rank(ordered[pos]) <= plan_rank(f))
+        {
+            let c = ordered.remove(pos);
+            ordered.insert(0, c);
+        }
         let chosen = match binding {
             Some(b) => {
                 // 硬限制：仅在仍有名额者（生效上限 <=0 不限，或 used<上限）中选；
@@ -7141,29 +7239,18 @@ impl CredentialStore {
 
         let slot = match binding {
             Some(Binding::Device(did)) => {
-                // 过了保留期、后台还没来得及删的那一行会在这里被撞上（此前它已被删掉，
-                // 走的是纯 INSERT）。那是一条**新**绑定，故 created_at 与 request_count 归零
-                // 重来——否则设备明细里会显示一个几天前建立、请求数接着往上加的绑定，
-                // 而那台设备其实刚被重新调度过。`SET` 右侧读的都是冲突前那一行的值
-                // （SQLite 语义），故 CASE 里的 last_seen_at 是旧值，与放在哪一行无关。
-                conn.execute(
-                    "INSERT INTO device_bindings (device_id, cred_id) VALUES (?1, ?2)
-                     ON CONFLICT(device_id) DO UPDATE
-                        SET cred_id = ?2, last_seen_at = unixepoch(), \
-                            created_at = CASE WHEN ?3 > 0 \
-                                                AND last_seen_at < unixepoch() - ?3 \
-                                              THEN unixepoch() ELSE created_at END, \
-                            request_count = CASE WHEN ?3 > 0 \
-                                                   AND last_seen_at < unixepoch() - ?3 \
-                                                 THEN 1 ELSE request_count + 1 END",
-                    params![did, chosen.id, device_retention],
-                )?;
+                upsert_device_binding(&conn, did, chosen.id, device_retention)?;
                 None
             }
             Some(Binding::Session(key)) => {
                 // 新对话（或改绑到别的号的对话）在选中的号上取最小的空槽位。上面刚判过
-                // has_room，所以上限内必有空位；不限时槽位按需增长、释放后复用。
-                let slot = free_session_slot(&conn, chosen.id, session_ttl_secs, None)?;
+                // has_room，所以上限内必有空位；不限时槽位按需增长、释放后复用。沿用来访
+                // 会话 id 的不派生、不占槽位。
+                let slot = if passthrough_session {
+                    PASSTHROUGH_SLOT
+                } else {
+                    free_session_slot(&conn, chosen.id, session_ttl_secs, None)?
+                };
                 conn.execute(
                     "INSERT INTO session_bindings (session_key, cred_id, slot, last_model) \
                      VALUES (?1, ?2, ?3, ?4)
@@ -7178,10 +7265,13 @@ impl CredentialStore {
                             last_model = COALESCE(?4, last_model)",
                     params![key, chosen.id, slot, model, session_retention],
                 )?;
-                Some(slot)
+                (slot >= 0).then_some(slot)
             }
             None => None,
         };
+        if let Some(did) = affinity_device {
+            upsert_device_binding(&conn, did, chosen.id, device_retention)?;
+        }
         // 两个窗口都在**选定之后**才记账（而不是边问边记）：一次选号要连过两道窗口，
         // 边问边记的话，过了第一道却卡在第二道的那个号会白扣一个名额。理由详见
         // [`RateWindow::has_room`]——选号全程持着 `conn` 锁，中间插不进第二次选号。
@@ -8700,6 +8790,96 @@ mod tests {
         assert_eq!(store.session_count(a).unwrap(), 0);
         assert_eq!(store.session_count(b).unwrap(), 1, "b 的不动");
         assert_eq!(store.select_for_device(soft_session("s4")).unwrap().id, a);
+    }
+
+    /// 设备身份在上游已收敛时（[`Select::per_session`]）带设备来访的选号入参：真实客户端，
+    /// 沿用来访会话 id，同 [`soft_session`] 的 TTL / 保留期。
+    fn per_session<'a>(device: &'a str, key: Option<&'a str>) -> Select<'a> {
+        Select {
+            device_id: Some(device),
+            session_key: key,
+            per_session: true,
+            passthrough_session: true,
+            ttl_secs: 60,
+            retention_secs: 3600,
+            session_ttl_secs: 60,
+            session_retention_secs: 3600,
+            rate_limited: true,
+            ..Default::default()
+        }
+    }
+
+    /// 按会话占名额的带设备来访：名额只看会话上限，设备上限不再生效；同一台设备的新会话跟着
+    /// 设备亲和落在上次那个号上（而不是被均衡到会话更少的号），那个号满了才溢出，亲和随之
+    /// 改到新号；真实客户端的会话不占派生槽位，后台列出的会话 id 就是来访那个。
+    #[test]
+    fn per_session_devices_are_limited_by_sessions_and_stick_to_their_home() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        store.set_setting(DEFAULT_DEVICE_LIMIT, "1").unwrap();
+        store.set_setting(DEFAULT_SESSION_LIMIT, "2").unwrap();
+        let sid1 = "lb:v2:sid:11111111-1111-4111-8111-111111111111";
+
+        let (c, slot) = store.select_with_slot(per_session("d1", Some(sid1))).unwrap();
+        assert_eq!((c.id, slot), (a, None), "沿用来访 id 的会话不带槽位回来");
+        assert_eq!(store.session_slot(a, sid1).unwrap(), Some(PASSTHROUGH_SLOT));
+        // 均衡会把 s2 放到会话更少的 b 上；亲和把它留在 d1 的号 a 上。
+        assert_eq!(store.select_for_device(per_session("d1", Some("s2"))).unwrap().id, a);
+        // 设备上限是 1，但不再生效：另一台设备照样进得来（a 满了，落到 b）。
+        assert_eq!(store.select_for_device(per_session("d2", Some("s3"))).unwrap().id, b);
+        // d1 的第三条会话：a 满了溢到 b，亲和跟着改到 b。
+        assert_eq!(store.select_for_device(per_session("d1", Some("s4"))).unwrap().id, b);
+        let home: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT cred_id FROM device_bindings WHERE device_id = 'd1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(home, b);
+        // 已有会话不受亲和影响，仍回原号。
+        assert_eq!(store.select_for_device(per_session("d1", Some(sid1))).unwrap().id, a);
+        // 全满时拒的是会话。
+        let err = store.select_for_device(per_session("d3", Some("s5"))).unwrap_err();
+        assert!(err.downcast_ref::<SessionLimitReached>().is_some(), "{err}");
+        // 后台：真实会话的槽位是 -1，会话 id 是来访那个（这个号没有 account_uuid，钉不住）。
+        let list = store.list_sessions(a).unwrap();
+        let real = list.iter().find(|s| s.session_key == sid1).unwrap();
+        assert_eq!(real.slot, PASSTHROUGH_SLOT);
+        assert_eq!(real.session_id, "11111111-1111-4111-8111-111111111111");
+        // 没带会话 id、按前缀指纹分的真实会话：出站没有会话 id，后台留空而不是把指纹当成 id。
+        let pfx = "lb:v2:pfx:0123456789abcdef0123456789abcdef";
+        assert!(store.unbind_session(a, sid1).unwrap());
+        assert_eq!(store.select_for_device(per_session("d9", Some(pfx))).unwrap().id, a);
+        let list = store.list_sessions(a).unwrap();
+        assert_eq!(list.iter().find(|s| s.session_key == pfx).unwrap().session_id, "");
+    }
+
+    /// 按会话占名额而没有会话键的（额度探测）：按设备亲和选号，不写会话绑定、不占名额，
+    /// 名额全满时照样放行。
+    #[test]
+    fn per_session_probe_follows_device_home_without_taking_a_slot() {
+        let (store, ids) = soft_store(&["a", "b"]);
+        let b = ids[1];
+        store.set_setting(DEFAULT_SESSION_LIMIT, "1").unwrap();
+        // d1 的家在 b（a 先被别的设备占满）。
+        assert_eq!(store.select_for_device(per_session("d0", Some("s0"))).unwrap().id, ids[0]);
+        assert_eq!(store.select_for_device(per_session("d1", Some("s1"))).unwrap().id, b);
+        // 两个号都满了，探测仍按亲和落到 b，且一条会话绑定都不写。
+        assert_eq!(store.select_for_device(per_session("d1", None)).unwrap().id, b);
+        assert_eq!(store.session_count(b).unwrap(), 1);
+        assert_eq!(store.session_counts().unwrap().values().sum::<i64>(), 2);
+    }
+
+    /// 槽位分配里混着真实会话（-1）时，模拟会话照样从 0 起取最小空位。
+    #[test]
+    fn passthrough_sessions_do_not_take_derived_slots() {
+        let (store, ids) = soft_store(&["a"]);
+        let a = ids[0];
+        assert_eq!(store.select_with_slot(per_session("d1", Some("real"))).unwrap().1, None);
+        assert_eq!(store.select_with_slot(soft_session("sim1")).unwrap().1, Some(0));
+        assert_eq!(store.select_with_slot(soft_session("sim2")).unwrap().1, Some(1));
+        assert_eq!(store.session_count(a).unwrap(), 3, "真实会话照样占名额");
     }
 
     /// 会话槽位：新对话取该号上最小的空位，同键续用原槽位；休眠后原槽位被别的对话拿走就换

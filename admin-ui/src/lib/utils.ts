@@ -7,7 +7,7 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
- * 拆开模拟会话的绑定键：后端写的是 `lb:v2:<来源>:<值>`（见 `session_binding_key`），来源
+ * 拆开会话的绑定键：后端写的是 `lb:v2:<来源>:<值>`（见 `session_binding_key`），来源
  * `sid` 是来访自带的会话 id、`pfx` 是「缓存前缀 + 对话起点」的指纹。
  *
  * 认不出前缀的只可能是旧口径的残留（开库时那条迁移会清掉），退回原来那套按长相猜的判法。

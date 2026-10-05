@@ -62,11 +62,13 @@ pub struct Credential {
     pub priority: i64,
     /// 是否停用（停用的凭证不参与转发）。
     pub disabled: bool,
-    /// 允许绑定的设备数上限；`<= 0` 表示不限。见 [`crate::store`] 的粘性绑定选择。
+    /// 允许绑定的设备数上限；`<= 0` 表示不限。见 [`crate::store`] 的粘性绑定选择。设备指纹
+    /// 归一化开着（默认）时带设备来访改按会话占名额，这一项不生效，见 [`Self::session_limit`]。
     pub device_limit: i64,
-    /// 允许同时活跃的**模拟会话**数上限，三态同 [`Self::device_limit`]：`> 0` 独立上限；`0`
-    /// 跟随全局默认 [`crate::store::DEFAULT_SESSION_LIMIT`]；`< 0` 明确不限。只管模拟路径上
-    /// 没有设备身份的来访，见 `crate::store::Select::session_key`。
+    /// 允许同时活跃的**会话**数上限，三态同 [`Self::device_limit`]：`> 0` 独立上限；`0`
+    /// 跟随全局默认 [`crate::store::DEFAULT_SESSION_LIMIT`]；`< 0` 明确不限。管模拟路径上没有
+    /// 设备身份的来访，以及设备身份在上游已收敛时的全部带设备来访（此时 [`Self::device_limit`]
+    /// 不生效），见 `crate::store::Select::per_session`。
     pub session_limit: i64,
     /// 该账号每分钟最多转发多少条请求（RPM 上限）。三态同 [`Self::device_limit`]：
     /// `> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
@@ -205,7 +207,7 @@ impl Credential {
 /// seed 正常是**槽位**（[`slot_session_seed`]）：每个账号的模拟会话 id 是一组固定的槽位，
 /// 数量就是会话上限，对话占哪个槽位就用哪个 id，槽位释放后下一个对话**复用**同一个 id——
 /// 上游看到的每个账号只在这几个会话 id 之间轮转，与设备 id 恒定的做法一致，而不是每个对话
-/// 一个新 uuid、时间一长无限增多。没有槽位可占的（带设备身份、不写会话绑定的模拟请求，或
+/// 一个新 uuid、时间一长无限增多。没有槽位可占的（按设备占名额、不写会话绑定的模拟请求，或
 /// luban 自己发的探测）退回按缓存前缀或固定 seed 派生。
 ///
 /// 前缀是为了和 [`Credential::spoof_device_id`] 分开取值——同样的输入派生出两个字段，不加
@@ -242,6 +244,24 @@ pub fn slot_session_seed(slot: i64) -> String {
 /// 那个 uuid，与转发路径同一个函数，两边不会漂开。
 pub fn sim_slot_session_id(account_uuid: Option<&str>, cred_id: i64, slot: i64) -> String {
     derive_session_id(&session_account_key(account_uuid, cred_id), &slot_session_seed(slot))
+}
+
+/// 来访会话 id 在某个账号上**钉住**后的出站会话 id（`crate::proxy::account_session_id` 的本体）：
+/// `sha256("luban-session-pin" ‖ account_uuid ‖ 来访会话 id)` 取前 16 字节按 uuid v4 格式化。
+/// 没有 `account_uuid` 时为 `None`。放在这里是因为后台列会话（沿用来访 id 的那些）也要算它，
+/// 与转发路径同一个函数，两边不会漂开。
+pub fn pinned_session_id(account_uuid: Option<&str>, client_session: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let account = account_uuid.map(str::trim).filter(|u| !u.is_empty())?;
+    let mut h = Sha256::new();
+    h.update(b"luban-session-pin\0");
+    h.update(account.as_bytes());
+    h.update([0u8]);
+    h.update(client_session.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    Some(crate::proxy::uuid_from_bytes(b))
 }
 
 /// 把字节切片编码为小写十六进制字符串。

@@ -450,21 +450,22 @@ export function DeviceSettingsContent() {
         icon={GaugeIcon}
         title={t('设备绑定与容量', 'Device bindings & capacity')}
         description={t(
-          '适用于带设备身份的客户端请求：设置设备占用账号名额的时长、名额释放后优先使用原账号的期限，以及每个账号默认可容纳的设备数。',
-          'For client requests with a device identity: how long a device holds its slot, how long it keeps preferring its original account, and how many devices each account holds by default.',
+          '适用于带设备身份的客户端请求：设置设备占用账号名额的时长、名额释放后优先使用原账号的期限，以及每个账号默认可容纳的设备数。转发设置中「设备指纹归一化」与「改写设备 ID」均启用时，上游看到的设备数已经收敛，名额改按会话计算，设备上限不生效；设备绑定只用于让同一台设备的新会话优先使用原账号。',
+          'For client requests with a device identity: how long a device holds its slot, how long it keeps preferring its original account, and how many devices each account holds by default. When both "Normalize device fingerprint" and "Rewrite device ID" are on in forwarding settings, upstream sees only a few devices per account, so slots are counted per session and the device limit does not apply; device bindings then only steer a device\'s new sessions back to its original account.',
         )}
       >
         <DeviceBindingTtl />
         <DeviceBindingRetention />
-        <DefaultDeviceLimit />
+        {/* 设备按会话占名额时设备上限不生效，这一行隐去；关掉归一化或改写设备 ID 后回来。 */}
+        {!settingsQuery.data?.devices_by_session && <DefaultDeviceLimit />}
       </SettingsGroup>
 
       <SettingsGroup
         icon={MessagesSquareIcon}
-        title={t('模拟会话绑定与容量', 'Simulated session bindings & capacity')}
+        title={t('会话绑定与容量', 'Session bindings & capacity')}
         description={t(
-          '经模拟路径转发、没有设备身份的客户端请求按对话占用会话槽位：设置对话闲置多久后释放槽位、槽位释放后优先使用原账号的期限，以及每个账号默认的槽位数（即上游看到的会话 ID 数）。',
-          'Client requests on the simulation path without a device identity take one session slot per conversation: how long an idle conversation keeps its slot, how long it keeps preferring its original account, and the default number of slots per account (the number of session IDs upstream sees).',
+          '客户端请求按对话占用会话名额：设备上限不生效时的真实客户端，以及经模拟路径、没有设备身份的请求。设置对话闲置多久后释放名额、名额释放后优先使用原账号的期限，以及每个账号默认可同时活跃的会话数。',
+          'Client requests take one session slot per conversation: real clients whenever the device limit does not apply, and requests on the simulation path without a device identity. Set how long an idle conversation keeps its slot, how long it keeps preferring its original account, and how many sessions each account may keep active by default.',
         )}
       >
         <SessionBindingTtl />
@@ -827,7 +828,7 @@ function SessionBindingTtl() {
     onSuccess: (settings: Settings) => {
       toastManager.add({
         title: t('会话策略已更新', 'Session policy updated'),
-        description: t('模拟会话有效期已保存。', 'The simulated session lifetime has been saved.'),
+        description: t('会话有效期已保存。', 'The session lifetime has been saved.'),
         type: 'success',
       })
       qc.setQueryData(['settings'], settings)
@@ -853,17 +854,17 @@ function SessionBindingTtl() {
 
   return (
     <SettingsRow
-      label={t('模拟会话有效期', 'Simulated session lifetime')}
+      label={t('会话有效期', 'Session lifetime')}
       description={
         <ClampedDescription text={t(
-          '经模拟路径转发、没有设备身份的对话在此时长内无请求时，释放其占用的会话槽位，会话 ID 留待下一个对话复用；与原账号的关联按下方的保留期保留。此项与设备有效期分别配置：设备对应一台机器，会话对应一段对话。',
-          'A conversation on the simulation path without a device identity frees its session slot after this much inactivity, and its session ID is reused by the next conversation; affinity with the original account is kept for the retention period below. This is configured separately from the device lifetime: a device is a machine, a session is one conversation.',
+          '对话在此时长内无请求时，释放其占用的会话名额；经模拟路径的对话，其会话 ID 留待下一个对话复用。与原账号的关联按下方的保留期保留。此项与设备有效期分别配置：设备对应一台机器，会话对应一段对话。',
+          'A conversation frees its session slot after this much inactivity; on the simulation path its session ID is then reused by the next conversation. Affinity with the original account is kept for the retention period below. This is configured separately from the device lifetime: a device is a machine, a session is one conversation.',
         )} />
       }
       note={<Badge variant="secondary" size="sm">{hint}</Badge>}
     >
       <DurationField
-        label={t('模拟会话有效期', 'simulated session lifetime')}
+        label={t('会话有效期', 'session lifetime')}
         value={draft}
         unit={unit}
         onValueChange={setDraft}
@@ -901,7 +902,7 @@ function SessionBindingRetention() {
     onSuccess: (settings: Settings) => {
       toastManager.add({
         title: t('会话策略已更新', 'Session policy updated'),
-        description: t('模拟会话的原账号关联保留期已保存。', 'The simulated session affinity retention has been saved.'),
+        description: t('会话的原账号关联保留期已保存。', 'The session affinity retention has been saved.'),
         type: 'success',
       })
       qc.setQueryData(['settings'], settings)
@@ -929,20 +930,20 @@ function SessionBindingRetention() {
 
   return (
     <SettingsRow
-      label={t('模拟会话原账号关联保留期', 'Simulated session affinity retention')}
+      label={t('会话原账号关联保留期', 'Session affinity retention')}
       description={conflict
         ? t(
             '保留期短于有效期时按有效期计算，相当于停用软绑定。',
             'A retention shorter than the lifetime is treated as the lifetime, which effectively disables soft binding.',
           )
         : t(
-            '槽位释放后，对话在此期限内再次请求时仍优先使用原账号（原槽位空闲时回到原槽位，会话 ID 不变）；过期后清除绑定记录，此后的请求按新对话处理。',
-            'After its slot is freed, a conversation that returns within this period still prefers its original account (and its old slot if that is free, keeping the same session ID); after this period the binding is removed and the conversation is treated as new.',
+            '名额释放后，对话在此期限内再次请求时仍优先使用原账号（经模拟路径的对话在原槽位空闲时回到原槽位，会话 ID 不变）；过期后清除绑定记录，此后的请求按新对话处理。',
+            'After its slot is freed, a conversation that returns within this period still prefers its original account (on the simulation path it also gets its old slot back if that is free, keeping the same session ID); after this period the binding is removed and the conversation is treated as new.',
           )}
       note={<Badge variant={conflict ? 'warning' : 'secondary'} size="sm">{hint}</Badge>}
     >
       <DurationField
-        label={t('模拟会话原账号关联保留期', 'simulated session affinity retention')}
+        label={t('会话原账号关联保留期', 'session affinity retention')}
         value={draft}
         unit={unit}
         onValueChange={setDraft}
@@ -1007,14 +1008,16 @@ function DefaultDeviceLimit() {
         'Accounts without an individual limit use this value; account-specific settings take priority.',
       )}
       note={
-        <Badge variant="secondary" size="sm">
-          {parsed > 0
-            ? t(
-                `每个账号最多 ${parsed} 台设备`,
-                `Up to ${parsed} ${parsed === 1 ? 'device' : 'devices'} per account`,
-              )
-            : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
-        </Badge>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" size="sm">
+            {parsed > 0
+              ? t(
+                  `每个账号最多 ${parsed} 台设备`,
+                  `Up to ${parsed} ${parsed === 1 ? 'device' : 'devices'} per account`,
+                )
+              : t('不限（不设默认上限）', 'Unlimited (no default limit)')}
+          </Badge>
+        </div>
       }
     >
       <NumberField
@@ -1045,7 +1048,7 @@ function DefaultDeviceLimit() {
   )
 }
 
-/** 全局默认模拟会话上限：账号未单独配置时套用。只管模拟路径上没有设备身份的来访。 */
+/** 全局默认会话上限：账号未单独配置时套用。设备上限不生效时的真实客户端与模拟路径上没有设备身份的来访都按它算。 */
 function DefaultSessionLimit() {
   const qc = useQueryClient()
   const { language, t } = useI18n()
@@ -1063,8 +1066,8 @@ function DefaultSessionLimit() {
         title: t('默认会话上限已更新', 'Default session limit updated'),
         description: settings.default_session_limit > 0
           ? t(
-              `每个账号最多同时活跃 ${settings.default_session_limit} 条模拟会话。`,
-              `Each account can keep up to ${settings.default_session_limit} active simulated ${settings.default_session_limit === 1 ? 'session' : 'sessions'}.`,
+              `每个账号最多同时活跃 ${settings.default_session_limit} 条会话。`,
+              `Each account can keep up to ${settings.default_session_limit} active ${settings.default_session_limit === 1 ? 'session' : 'sessions'}.`,
             )
           : t('默认会话上限已取消。', 'The default session limit has been removed.'),
         type: 'success',
@@ -1086,10 +1089,10 @@ function DefaultSessionLimit() {
 
   return (
     <SettingsRow
-      label={t('默认模拟会话上限', 'Default simulated session limit')}
+      label={t('默认会话上限', 'Default session limit')}
       description={t(
-        '经模拟路径转发、没有设备身份的请求按对话绑定账号，每个对话占用一个槽位（优先按请求自带的会话 ID 识别对话，缺失时按缓存前缀与首条用户消息识别）。出站会话 ID 由槽位派生，释放后复用，因此上游看到的会话 ID 数即为此上限。槽位与设备名额分别计数，有效期与原账号关联保留期沿用上方两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。槽位用尽后，新会话分流到其他账号；所有账号的槽位均用尽时，请求返回 429。',
-        'Requests on the simulation path without a device identity bind to an account per conversation and take one slot (a conversation is identified by its own session ID, or failing that by the cache prefix plus the first user message). The outbound session ID is derived from the slot and reused once the slot is freed, so upstream sees at most this many session IDs per account. Slots are counted separately from device slots; their lifetime and affinity follow the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once an account is full, new sessions go to another account; when every account is full they get a 429.',
+        '每个对话绑定一个账号并占用一个名额。真实客户端按其自带的会话 ID 识别对话，同一台设备的新会话优先使用该设备上次的账号；Claude Code 启动时的额度探测不占名额。经模拟路径、没有设备身份的请求优先按自带的会话 ID 识别对话，缺失时按缓存前缀与首条用户消息识别，其出站会话 ID 由槽位派生、释放后复用。有效期与原账号关联保留期沿用上方两项会话设置。未单独配置的账号使用此上限；账号独立设置优先。名额用尽后，新会话分流到其他账号；所有账号均用尽时，请求返回 429。',
+        'Each conversation binds to an account and takes one slot. Real clients are identified by their own session ID, and a device\'s new sessions prefer the account it used last; the quota probe Claude Code sends at startup takes no slot. Requests on the simulation path without a device identity are identified by their own session ID, or failing that by the cache prefix plus the first user message; their outbound session ID is derived from the slot and reused once it is freed. Lifetime and affinity follow the two session settings above. Accounts without an individual limit use this value; account-specific settings take priority. Once an account is full, new sessions go to another account; when every account is full they get a 429.',
       )}
       note={
         <Badge variant="secondary" size="sm">
@@ -1107,7 +1110,7 @@ function DefaultSessionLimit() {
       >
         <NumberFieldGroup>
           <NumberFieldDecrement aria-label={t('减少默认会话上限', 'Decrease default session limit')} />
-          <NumberFieldInput aria-label={t('默认模拟会话上限', 'Default simulated session limit')} />
+          <NumberFieldInput aria-label={t('默认会话上限', 'Default session limit')} />
           <NumberFieldIncrement aria-label={t('增加默认会话上限', 'Increase default session limit')} />
         </NumberFieldGroup>
       </NumberField>
