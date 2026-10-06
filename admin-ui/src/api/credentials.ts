@@ -468,6 +468,8 @@ export interface SessionBinding {
    * 两条、占两份名额），这里只是让人一眼看出这条会话在跑什么。旧库补列出来是 null。
    */
   last_model: string | null
+  /** 来访设备 ID（客户端 metadata 里的原始 device_id）；模拟路径没有设备身份时为 null。 */
+  device_id: string | null
 }
 
 /**

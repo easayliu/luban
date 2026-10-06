@@ -616,9 +616,10 @@ impl CredentialStore {
                                     "UPDATE session_bindings \
                                         SET slot = ?2, slot_lost = 0, last_seen_at = unixepoch(), \
                                             request_count = request_count + 1, \
-                                            last_model = COALESCE(?3, last_model) \
+                                            last_model = COALESCE(?3, last_model), \
+                                            device_id = COALESCE(?4, device_id) \
                                       WHERE session_key = ?1",
-                                    params![key, slot, model],
+                                    params![key, slot, model, device_id],
                                 )?;
                                 (slot >= 0).then_some(slot)
                             }
@@ -779,8 +780,8 @@ impl CredentialStore {
                 )?;
                 note_slot_takeover(&conn, chosen.id, slot, key, session_ttl_secs)?;
                 conn.execute(
-                    "INSERT INTO session_bindings (session_key, cred_id, slot, last_model) \
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO session_bindings (session_key, cred_id, slot, last_model, device_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?6)
                      ON CONFLICT(session_key) DO UPDATE
                         SET cred_id = ?2, slot = ?3, slot_lost = 0, last_seen_at = unixepoch(), \
                             created_at = CASE WHEN ?5 > 0 \
@@ -789,8 +790,9 @@ impl CredentialStore {
                             request_count = CASE WHEN ?5 > 0 \
                                                    AND last_seen_at < unixepoch() - ?5 \
                                                  THEN 1 ELSE request_count + 1 END, \
-                            last_model = COALESCE(?4, last_model)",
-                    params![key, chosen.id, slot, model, session_retention],
+                            last_model = COALESCE(?4, last_model), \
+                            device_id = COALESCE(?6, device_id)",
+                    params![key, chosen.id, slot, model, session_retention, device_id],
                 )?;
                 (slot >= 0).then_some(slot)
             }

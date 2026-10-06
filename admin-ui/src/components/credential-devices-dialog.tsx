@@ -734,6 +734,7 @@ function SessionDetails({
     [t('来访会话 ID', 'Inbound session ID'), source === 'sid' ? value : '—'],
     [t('上游会话 ID', 'Upstream session ID'), session.session_id || '—'],
     [t('槽位', 'Slot'), passthrough ? t('无（沿用来访 ID，仍占名额）', 'None (keeps the inbound ID; still counts toward the limit)') : `#${session.slot}`],
+    [t('来访设备', 'Device ID'), session.device_id ?? '—'],
     [t('最近模型', 'Last model'), session.last_model ?? '—'],
     [t('首次绑定', 'First bound'), formatFullTime(session.created_at, language)],
     [t('最近活跃', 'Last active'), formatFullTime(session.last_seen_at, language)],

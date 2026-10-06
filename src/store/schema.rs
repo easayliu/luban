@@ -497,6 +497,8 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     }
     // 最近一轮的模型；旧库补出来是 NULL，下次命中该绑定时回填。只给后台列看，不参与选号。
     let _ = conn.execute("ALTER TABLE session_bindings ADD COLUMN last_model TEXT", []);
+    // 来访设备 ID；旧绑定补出来是 NULL，下次命中回填。只给后台列看，不参与选号。
+    let _ = conn.execute("ALTER TABLE session_bindings ADD COLUMN device_id TEXT", []);
     // 槽位被接手的标记（见建表处）。补列成功（旧库第一次升级）时按现有数据初始化归属，见
     // [`init_slot_owners`]；列已在什么都不动。
     if conn

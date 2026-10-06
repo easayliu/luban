@@ -202,7 +202,7 @@ impl CredentialStore {
             .flatten();
         let ttl_clause = if ttl > 0 { "AND last_seen_at >= unixepoch() - ?2" } else { "" };
         let sql = format!(
-            "SELECT session_key, slot, request_count, created_at, last_seen_at, last_model \
+            "SELECT session_key, slot, request_count, created_at, last_seen_at, last_model, device_id \
                FROM session_bindings \
               WHERE cred_id = ?1 {ttl_clause} ORDER BY last_seen_at DESC, session_key ASC"
         );
@@ -232,6 +232,7 @@ impl CredentialStore {
                 created_at: r.get(3)?,
                 last_seen_at: r.get(4)?,
                 last_model: r.get(5)?,
+                device_id: r.get(6)?,
             })
         };
         let rows = if ttl > 0 {
@@ -333,6 +334,9 @@ pub struct SessionBinding {
     /// 最近一轮请求的模型；**不参与键**（理由见 `crate::proxy::session_binding_key`），只用来
     /// 在后台一眼看出这条会话在跑什么。旧库补列出来是 `None`，下次命中即回填。
     pub last_model: Option<String>,
+    /// 来访设备 ID（客户端 `metadata.user_id` 里的原始 device_id）。模拟路径没有设备身份
+    /// 时为 `None`；旧绑定补列出来也是 `None`，下次命中该绑定即回填。
+    pub device_id: Option<String>,
 }
 
 impl CredentialStore {
