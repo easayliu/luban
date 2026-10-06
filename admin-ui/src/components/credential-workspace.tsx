@@ -945,32 +945,36 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               ) : (
                 // 自动刷新指示器同时是手动刷新入口：等下一轮 30 秒才能确认操作结果，
                 // 是这类常驻列表最常见的抱怨，而这块本来就在讲「数据有多新」。
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
-                  onClick={actions.onRetry}
-                  disabled={isLoading || isFetching}
-                  title={isLoading
-                    ? t('正在加载账号数据', 'Loading account data')
-                    : t('每 30 秒自动刷新，点击立即刷新', 'Refreshes automatically every 30 seconds. Click to refresh now')}
-                  aria-label={t('立即刷新账号数据', 'Refresh account data now')}
-                >
-                  <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
-                    {isLoading || isFetching ? (
-                      <RefreshCwIcon className="size-3.5 animate-spin" />
-                    ) : (
-                      <span className="size-1.5 rounded-full bg-success" />
-                    )}
-                  </span>
-                  {/* ≤384px（360 那档手机）标题行放不下「账号池 · N 个账号 · N 台设备 · 30 秒刷新」四样，
-                      这一枚会被挤成单独一行、只有四个字。窄屏上只留绿点（它本身就是「在自动刷新」），
-                      文字留给读屏与 title；刷新失败那句照旧整句显示，那是要人处理的。 */}
-                  {/* `min-w-0` 不能省：sr-only 把它变成绝对定位的 1px 盒子，但 `min-w-14` 仍会把它撑回 56px，
-                      落在页头右缘外面，360 的屏上整页因此多出 4px 横向滚动。 */}
-                  <span className="min-w-14 text-left max-[24rem]:sr-only max-[24rem]:min-w-0">
-                    {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
-                  </span>
-                </button>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<button type="button" />}
+                    className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
+                    onClick={actions.onRetry}
+                    disabled={isLoading || isFetching}
+                    aria-label={t('立即刷新账号数据', 'Refresh account data now')}
+                  >
+                    <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
+                      {isLoading || isFetching ? (
+                        <RefreshCwIcon className="size-3.5 animate-spin" />
+                      ) : (
+                        <span className="size-1.5 rounded-full bg-success" />
+                      )}
+                    </span>
+                    {/* ≤384px（360 那档手机）标题行放不下「账号池 · N 个账号 · N 台设备 · 30 秒刷新」四样，
+                        这一枚会被挤成单独一行、只有四个字。窄屏上只留绿点（它本身就是「在自动刷新」），
+                        文字留给读屏；刷新失败那句照旧整句显示，那是要人处理的。 */}
+                    {/* `min-w-0` 不能省：sr-only 把它变成绝对定位的 1px 盒子，但 `min-w-14` 仍会把它撑回 56px，
+                        落在页头右缘外面，360 的屏上整页因此多出 4px 横向滚动。 */}
+                    <span className="min-w-14 text-left max-[24rem]:sr-only max-[24rem]:min-w-0">
+                      {isLoading ? t('正在加载', 'Loading') : t('30 秒刷新', '30s refresh')}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipPopup>
+                    {isLoading
+                      ? t('正在加载账号数据', 'Loading account data')
+                      : t('每 30 秒自动刷新，点击立即刷新', 'Refreshes automatically every 30 seconds. Click to refresh now')}
+                  </TooltipPopup>
+                </Tooltip>
               )}
             </div>
           </div>

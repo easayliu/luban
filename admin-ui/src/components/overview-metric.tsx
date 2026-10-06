@@ -50,7 +50,7 @@ export function OverviewMetric({
     neutral: 'text-foreground',
   }[tone]
   const content = (
-    <div className="flex min-h-16 items-center gap-3 px-4 py-2.5 sm:px-5" title={statusHint}>
+    <>
       {/* 图标方块（32px + 12px 间距）在手机上要走 44px 横向，而一格只有半个屏宽：正文被压到
           约 103px，`99.7%` 加上 80px 的迷你线要 140px，于是迷你线要么换行把整格撑高、要么被压成
           一条虚线。手机上改成把同一枚图标挂到标签前（14px），正文回到 147px，数值（约 28px）
@@ -94,8 +94,10 @@ export function OverviewMetric({
           {trend}
         </div>
       </div>
-    </div>
+    </>
   )
+
+  const cellClass = 'flex min-h-16 items-center gap-3 px-4 py-2.5 sm:px-5'
 
   const rootClass = cn(
     'min-w-0 text-left transition-colors',
@@ -106,15 +108,30 @@ export function OverviewMetric({
     className,
   )
 
+  if (statusHint) {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={onClick ? <button type="button" aria-pressed={active} /> : <div />}
+          className={cn(rootClass, cellClass)}
+          onClick={onClick}
+        >
+          {content}
+        </TooltipTrigger>
+        <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{statusHint}</TooltipPopup>
+      </Tooltip>
+    )
+  }
+
   if (onClick) {
     return (
-      <button type="button" className={rootClass} onClick={onClick} aria-pressed={active}>
+      <button type="button" className={cn(rootClass, cellClass)} onClick={onClick} aria-pressed={active}>
         {content}
       </button>
     )
   }
 
-  return <div className={rootClass}>{content}</div>
+  return <div className={cn(rootClass, cellClass)}>{content}</div>
 }
 
 /**

@@ -135,6 +135,7 @@ function readAccountRoute(): number | null {
 
 function App() {
   const { t } = useI18n()
+  const queryClient = useQueryClient()
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
   const [bansOpen, setBansOpen] = useState(false)
@@ -328,7 +329,6 @@ function App() {
     isRefetchError,
     isFetching,
     error: credentialsError,
-    refetch: refetchCredentials,
   } = useQuery({
     queryKey: ['credentials'],
     queryFn: listCredentials,
@@ -346,7 +346,7 @@ function App() {
   const isBootstrapping = authLoading || (!authState && !authFailed)
   const retry = () => {
     if (!authState) void refetchAuthState()
-    void refetchCredentials()
+    void queryClient.invalidateQueries()
   }
   useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute && !readOnly)
 
