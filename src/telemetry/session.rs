@@ -98,6 +98,9 @@ pub(super) struct Session {
     /// 的时间锚点（`cap/auto-2.1.291-20261006-full/00354`：取消那条之后重建线程，idle 从取消那条
     /// 收尾算起）。与 [`Self::last_main_end`]、工具锚点（上一条有效回复里的工具调用）分开记。
     pub(super) last_main_anchor_end: Option<SystemTime>,
+    /// 主线程最近一条**有效**（没被取消的）回复里有没有工具调用：`anchorHasToolCall` 的工具锚点。
+    /// 与上面的时间锚点分开记；两样都只在本会话里算，`/clear` 换出来的新会话从空白起。
+    pub(super) main_anchor_tool_call: bool,
     /// 刚做完一次 `/compact`，下一条主线程请求是压缩之后的第一条。
     pub(super) post_compact: bool,
     /// `default_model`：用户设置里的默认模型，取会话启动时那台设备的
@@ -644,7 +647,7 @@ impl Session {
                             3_100
                         })
                 },
-                |p| p.2,
+                |p| p.started_wall,
             ),
             last_seen: now,
             prompt_index: 0,
@@ -667,7 +670,7 @@ impl Session {
             main_requests: 0,
             first_prompt_tpl_done: false,
             // `/clear` 换的是会话不是进程：运行时长与后台任务的进度接着上一个会话的算。
-            background_done: cleared_prev.map_or(0, |p| p.3),
+            background_done: cleared_prev.map_or(0, |p| p.background_done),
             recent_ends: VecDeque::new(),
             last_call_end: None,
             prev_total_input: 0,
@@ -710,13 +713,28 @@ impl Session {
             interrupted_message_id: None,
             post_compact: false,
             last_main_end: None,
+            // `/clear` 换出来的会话也从空白起：首条没有锚点（`00356`：-1 / false）。
             last_main_anchor_end: None,
+            main_anchor_tool_call: false,
         }
     }
 }
 
 /// `/clear` 换掉的那个会话留下的：最后一条主线程请求、最后结束时刻、进程起点、后台进度。
-pub(super) type ClearedPrev = (Option<String>, Option<SystemTime>, SystemTime, usize);
+#[derive(Clone, Debug)]
+pub(super) struct ClearedPrev {
+    /// 旧会话最后一条主线程请求的 request-id（清空那几条事件报它）。
+    pub(super) last_main_request_id: Option<String>,
+    /// 旧会话最后一次请求完成的时刻。
+    pub(super) last_call_end: Option<SystemTime>,
+    /// 进程启动的时刻：`/clear` 不换进程，新会话沿用。
+    pub(super) started_wall: SystemTime,
+    /// 进程里已经补发过的后台任务数，新会话接着算。
+    pub(super) background_done: usize,
+    // tether 的两个锚点**不**从旧会话接：`/clear` 之后新会话的第一条主线程请求报
+    // `create/no_continue_pointer`、`threadIdleMs: -1`、`anchorHasToolCall: false`
+    // （`cap/auto-2.1.291-20261006-full/00356`，会话 `271f3652`）。
+}
 
 /// 这个会话与同一进程、同一设备上其他会话的关系，见 [`State::resolve_lineage`]。
 pub(super) struct Lineage {
@@ -805,12 +823,12 @@ impl State {
         let cleared_prev = cleared_from.as_ref().and_then(|prev| {
             let p = self.sessions.get_mut(&(call.cred_id, prev.clone()))?;
             p.cleared = true;
-            Some((
-                p.last_main_request_id.clone(),
-                p.last_call_end,
-                p.started_wall,
-                p.background_done,
-            ))
+            Some(ClearedPrev {
+                last_main_request_id: p.last_main_request_id.clone(),
+                last_call_end: p.last_call_end,
+                started_wall: p.started_wall,
+                background_done: p.background_done,
+            })
         });
         let parent_session_id = cleared_from
             .clone()

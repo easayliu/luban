@@ -3861,3 +3861,36 @@ fn keeping_an_artifact_sub_tool_means_artifact_is_not_off() {
     let data = first_turn_2_1_291(v.to_string().into_bytes());
     assert!(!has(&data, "tengu_artifact_disabled_session"), "延迟声明的 ArtifactData 也算留着");
 }
+
+/// `/clear` 之后新会话的第一条主线程请求**不**接旧会话的 tether 锚点：报 `threadIdleMs: -1`、
+/// `anchorHasToolCall: false`（`cap/auto-2.1.291-20261006-full/00356`，`create/no_continue_pointer`），
+/// 哪怕旧会话最后一条回复带了工具调用、或者刚取消过一条。
+#[test]
+fn tether_anchors_do_not_carry_over_a_clear() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let s2 = "44444444-4444-4444-8444-444444444444";
+    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
+    let mut with_tools = main_call(SESSION, "req_1", "msg_1", base + Duration::from_secs(5));
+    with_tools.tool_calls =
+        vec![ToolCall { id: "t5".into(), name: "Bash".into(), input: json!({}), verdict: None }];
+    t.ingest(with_tools);
+    // 旧会话最后一条被 Esc 取消：旧会话里两个锚点都有值，新会话也不接。
+    let mut cancelled = main_call(SESSION, "req_2", "msg_2", base + Duration::from_secs(20));
+    cancelled.aborted = true;
+    cancelled.total_ms = 1_000;
+    t.ingest(cancelled);
+    t.ingest(main_call(s2, "req_3", "msg_3", base + Duration::from_secs(30)));
+    let st = t.0.state.lock();
+    let p = st.pending.get(&(7, s2.to_string())).expect("queued");
+    let live: Vec<Value> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_tether_live_outcome")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0]["threadIdleMs"], -1, "新会话首条没有锚点");
+    assert_eq!(live[0]["threadIdleMonotonicMs"], -1);
+    assert_eq!(live[0]["anchorHasToolCall"], false, "不看旧会话的回复");
+}

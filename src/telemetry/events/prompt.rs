@@ -61,8 +61,10 @@ impl EventBuilder<'_> {
         } else if let Some(prev) = &cleared_from {
             // 同一进程里 `/clear`：没有启动那一串，只有清空那几条（08:02:27.765–.771，第一句输入前
             // 5 秒上下），之后这个会话的每条事件都带 `parent_session_id`。
-            let (prev_req, prev_end) =
-                cleared_prev.clone().map(|(r, e, _, _)| (r, e)).unwrap_or_default();
+            let (prev_req, prev_end) = cleared_prev
+                .clone()
+                .map(|p| (p.last_main_request_id, p.last_call_end))
+                .unwrap_or_default();
             let floor: DateTime<Utc> = prev_end.map_or(ms(t0, -5_400), |e| {
                 DateTime::<Utc>::from(e) + chrono::Duration::milliseconds(500)
             });

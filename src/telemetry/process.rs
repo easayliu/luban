@@ -183,6 +183,7 @@ impl Telemetry {
             notifications,
             prev_main_end,
             prev_main_anchor_end,
+            prev_main_anchor_tool_call,
             prompt_id,
         } = sess.advance_turn(&call, &shape, flags, &version, &prev_reply_calls);
         // 主线程与猜下一句走 `previousRequestId` 链；标题那类没有。
@@ -440,7 +441,12 @@ impl Telemetry {
             v285,
             v291,
             main_effort: sess.main_effort.clone(),
-            anchor_tool_call: !prev_reply_calls.is_empty(),
+            // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
+            anchor_tool_call: if is_main {
+                prev_main_anchor_tool_call
+            } else {
+                !prev_reply_calls.is_empty()
+            },
             anchor_end,
             injected,
             first_prompt_tpl,
@@ -616,6 +622,7 @@ struct TurnStart {
     notifications: Vec<usize>,
     prev_main_end: Option<SystemTime>,
     prev_main_anchor_end: Option<SystemTime>,
+    prev_main_anchor_tool_call: bool,
     prompt_id: String,
 }
 
@@ -814,8 +821,12 @@ impl Session {
         }
         // tether 的时间锚点：被取消的主线程请求也算它的收尾时刻（见 [`Session::last_main_anchor_end`]）。
         let prev_main_anchor_end = self.last_main_anchor_end;
+        let prev_main_anchor_tool_call = self.main_anchor_tool_call;
         if is_main {
             self.last_main_anchor_end = Some(this_end_wall(call));
+            if !aborted {
+                self.main_anchor_tool_call = !call.tool_calls.is_empty();
+            }
         }
         if new_prompt {
             // 同伴会话发来的一轮（`peer`）不算用户的第几次输入：官方那条 input_prompt 不带
@@ -855,6 +866,7 @@ impl Session {
             notifications,
             prev_main_end,
             prev_main_anchor_end,
+            prev_main_anchor_tool_call,
             prompt_id,
         }
     }
