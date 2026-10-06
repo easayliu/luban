@@ -22,6 +22,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 
 /**
  * 在代理池里直接调整「哪些账号走这条代理」。
@@ -117,9 +118,11 @@ export function ProxyAccountsDialog({
       <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('使用账号', 'Accounts using this proxy')}</DialogTitle>
-          <DialogDescription className="mt-1 truncate" title={proxy.label}>
-            {proxy.label}
-          </DialogDescription>
+          <Hint label={proxy.label}>
+            <DialogDescription className="mt-1 truncate">
+              {proxy.label}
+            </DialogDescription>
+          </Hint>
         </DialogHeader>
 
         <DialogPanel className="space-y-3">

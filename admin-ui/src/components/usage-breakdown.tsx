@@ -10,7 +10,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
  * 趋势对话框下面那张「谁在拖后腿」的表：这段时间按模型或按账号拆开，按请求数降序取前 12。
@@ -182,13 +182,19 @@ function BreakdownTr({
     <tr
       className="cursor-pointer hover:bg-muted/40 [&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0"
       onClick={onOpen}
-      title={t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
     >
       <td className="max-w-56">
         <span className="flex min-w-0 items-center gap-1.5">
-          <button type="button" className="min-w-0 truncate text-start hover:underline" onClick={onOpen}>
-            {row.label || '—'}
-          </button>
+          {/* 「点击查看该组最近的请求」原先挂在整行上；行里不再套提示，并到这枚名称按钮上，顺带补上被截断的全名。 */}
+          <Hint
+            label={row.label
+              ? `${row.label}\n${t('点击查看该组最近的请求', 'Click to view recent requests in this group')}`
+              : t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
+          >
+            <button type="button" className="min-w-0 truncate text-start hover:underline" onClick={onOpen}>
+              {row.label || '—'}
+            </button>
+          </Hint>
           {/* 按账号拆时带套餐：Max 号和 Pro 号上游的排队本来就不同，混着比延迟没有意义。 */}
           {row.tier && <Badge variant="outline" size="sm" className="shrink-0">{row.tier}</Badge>}
         </span>

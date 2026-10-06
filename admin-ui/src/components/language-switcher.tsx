@@ -1,5 +1,6 @@
 import { LanguagesIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import { useI18n } from '@/lib/i18n'
 
 export function LanguageSwitcher({ compact = false }: { compact?: boolean }) {
@@ -8,16 +9,17 @@ export function LanguageSwitcher({ compact = false }: { compact?: boolean }) {
   const label = switchingToEnglish ? '切换至英文界面' : 'Switch interface to Chinese'
 
   return (
-    <Button
-      type="button"
-      size={compact ? 'icon-lg' : 'sm'}
-      variant="outline"
-      onClick={toggleLanguage}
-      aria-label={label}
-      title={label}
-    >
-      <LanguagesIcon />
-      {!compact && <span>{switchingToEnglish ? 'EN' : '中文'}</span>}
-    </Button>
+    <Hint label={label}>
+      <Button
+        type="button"
+        size={compact ? 'icon-lg' : 'sm'}
+        variant="outline"
+        onClick={toggleLanguage}
+        aria-label={label}
+      >
+        <LanguagesIcon />
+        {!compact && <span>{switchingToEnglish ? 'EN' : '中文'}</span>}
+      </Button>
+    </Hint>
   )
 }

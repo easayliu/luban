@@ -42,6 +42,7 @@ import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 import { SettingsGroup } from '@/components/settings-group'
 import { ProxyAccountsDialog } from '@/components/proxy-accounts-dialog'
 import { locationLabel, ProxyBatchImportDialog, runConcurrently } from '@/components/proxy-batch-import-dialog'
@@ -536,29 +537,33 @@ function ProxyRow({
           <div className="flex items-center gap-2">
             <span className="truncate text-sm font-medium">{proxy.label}</span>
           </div>
-          <p className="mt-0.5 truncate text-xs text-muted-foreground" title={proxyMaskedUrl(proxy.url)}>
-            {proxyMaskedUrl(proxy.url)}
-          </p>
+          <Hint label={proxyMaskedUrl(proxy.url)}>
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">
+              {proxyMaskedUrl(proxy.url)}
+            </p>
+          </Hint>
         </div>
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          loading={testing}
-          onClick={onTest}
-          aria-label={t('测试', 'Test')}
-          title={t('测试', 'Test')}
-        >
-          <PlayIcon />
-        </Button>
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          onClick={() => setAccountsOpen(true)}
-          aria-label={t('调整使用账号', 'Manage accounts')}
-          title={t('调整使用账号', 'Manage accounts')}
-        >
-          <UsersIcon />
-        </Button>
+        <Hint label={t('测试', 'Test')}>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            loading={testing}
+            onClick={onTest}
+            aria-label={t('测试', 'Test')}
+          >
+            <PlayIcon />
+          </Button>
+        </Hint>
+        <Hint label={t('调整使用账号', 'Manage accounts')}>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            onClick={() => setAccountsOpen(true)}
+            aria-label={t('调整使用账号', 'Manage accounts')}
+          >
+            <UsersIcon />
+          </Button>
+        </Hint>
         <Button
           size="icon-sm"
           variant="ghost"

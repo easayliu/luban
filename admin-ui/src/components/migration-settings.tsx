@@ -37,6 +37,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 import { useI18n } from '@/lib/i18n'
 import { downloadJson, extractError } from '@/lib/utils'
 
@@ -104,23 +105,28 @@ function ExportPanel() {
         </div>
       }
     >
-      <Button
-        className="w-full sm:w-auto"
-        disabled={locked}
-        loading={run.isPending}
-        title={
-          locked
-            ? t(
-                '控制台未设置管理密码时，任何能连接到该端口的人都可以访问管理接口，因此在此状态下不允许导出。',
-                'Without an admin password, anyone who can reach the port can use the management API, so this file cannot be exported in that state.',
-              )
-            : undefined
-        }
-        onClick={() => run.mutate()}
+      {/* 提示挂在外层 span 上：禁用的 Button 带 pointer-events-none，挂在它自己身上时
+          「为什么不能导出」那句悬停不出来。 */}
+      <Hint
+        label={locked
+          ? t(
+              '控制台未设置管理密码时，任何能连接到该端口的人都可以访问管理接口，因此在此状态下不允许导出。',
+              'Without an admin password, anyone who can reach the port can use the management API, so this file cannot be exported in that state.',
+            )
+          : undefined}
       >
-        <DownloadIcon />
-        {t('导出文件', 'Export file')}
-      </Button>
+        <span className="flex w-full sm:inline-flex sm:w-auto">
+          <Button
+            className="w-full sm:w-auto"
+            disabled={locked}
+            loading={run.isPending}
+            onClick={() => run.mutate()}
+          >
+            <DownloadIcon />
+            {t('导出文件', 'Export file')}
+          </Button>
+        </span>
+      </Hint>
     </SettingsRow>
   )
 }
@@ -252,10 +258,12 @@ function ImportPanel() {
             <DialogTitle>{t('确认导入', 'Confirm import')}</DialogTitle>
             {/* 文件名完整显示、放不下就折行：这是「确认导入」，用户正要核对导入的是不是这份文件。
                 原来 `truncate` 挂在 flex 容器上，文字节点不吃省略号，窄屏上直接被切掉一截。 */}
-            <DialogDescription className="mt-1 flex items-start gap-1.5" title={filename}>
-              <FileJsonIcon className="mt-0.5 size-3.5 shrink-0" />
-              <span className="min-w-0 [overflow-wrap:anywhere]">{filename}</span>
-            </DialogDescription>
+            <Hint label={filename}>
+              <DialogDescription className="mt-1 flex items-start gap-1.5">
+                <FileJsonIcon className="mt-0.5 size-3.5 shrink-0" />
+                <span className="min-w-0 [overflow-wrap:anywhere]">{filename}</span>
+              </DialogDescription>
+            </Hint>
           </DialogHeader>
 
           <DialogPanel className="space-y-4">

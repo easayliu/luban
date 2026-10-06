@@ -18,6 +18,7 @@ import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
+import { Hint } from '@/components/ui/tooltip'
 import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 
 /**
@@ -228,7 +229,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         <span className="ml-auto tabular-nums text-muted-foreground">{formatFullTime(log.ts, language)}</span>
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
-        <Fact label={t('模型', 'Model')}><span title={log.model ?? undefined}>{log.model ?? '—'}</span></Fact>
+        <Fact label={t('模型', 'Model')}><Hint label={log.model}><span>{log.model ?? '—'}</span></Hint></Fact>
         <Fact label={t('输入 / 输出', 'In / out')}>{num(log.input_tokens)} / {num(log.output_tokens)}</Fact>
         <Fact label={t('缓存写 / 读', 'Cache w/r')}>{num(log.cache_creation_tokens)} / {num(log.cache_read_tokens)}</Fact>
         <Fact label={t('首字 / 总耗时', 'TTFT / total')}>{ms(log.ttft_ms)} / {ms(log.total_ms)}</Fact>
@@ -237,28 +238,34 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
             {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
           </span>
         </Fact>
-        <Fact label={t('设备（入站）', 'Device (inbound)')}><span className="font-mono" title={log.device_id ?? undefined}>{deviceShort}</span></Fact>
-        <Fact label={t('设备（出站）', 'Device (outbound)')}><span className="font-mono" title={log.device_id_out ?? undefined}>{log.device_id_out?.slice(0, 8) ?? '—'}</span></Fact>
+        <Fact label={t('设备（入站）', 'Device (inbound)')}><Hint label={log.device_id}><span className="font-mono">{deviceShort}</span></Hint></Fact>
+        <Fact label={t('设备（出站）', 'Device (outbound)')}><Hint label={log.device_id_out}><span className="font-mono">{log.device_id_out?.slice(0, 8) ?? '—'}</span></Hint></Fact>
         <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
         <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
-        <Fact label={t('路径', 'Path')}><span className="font-mono" title={log.path}>{log.path}</span></Fact>
+        <Fact label={t('路径', 'Path')}><Hint label={log.path}><span className="font-mono">{log.path}</span></Hint></Fact>
         <Fact label={t('会话（入站 → 出站）', 'Session (inbound → outbound)')}>
-          <span className="font-mono" title={sessionTitle(log)}>
-            {log.session_id_in?.slice(0, 8) ?? '—'}
-            <span className="text-muted-foreground">→{log.session_id?.slice(0, 8) ?? '—'}</span>
-          </span>
+          <Hint label={sessionTitle(log)}>
+            <span className="font-mono">
+              {log.session_id_in?.slice(0, 8) ?? '—'}
+              <span className="text-muted-foreground">→{log.session_id?.slice(0, 8) ?? '—'}</span>
+            </span>
+          </Hint>
         </Fact>
         <Fact label={t('会话键', 'Session key')}>
-          <span className="font-mono" title={log.session_key ?? undefined}>
-            {key ? `${key.source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${key.value.slice(0, 8)}` : '—'}
-            {key?.sideClass && <span className="text-muted-foreground"> · {sideClassLabel(key.sideClass, language)}</span>}
-          </span>
+          <Hint label={log.session_key}>
+            <span className="font-mono">
+              {key ? `${key.source === 'pfx' ? t('前缀', 'prefix') : t('自带', 'client')} ${key.value.slice(0, 8)}` : '—'}
+              {key?.sideClass && <span className="text-muted-foreground"> · {sideClassLabel(key.sideClass, language)}</span>}
+            </span>
+          </Hint>
         </Fact>
       </dl>
       {(log.ua || log.ua_out) && (
-        <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground" title={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : (log.ua ?? undefined)}>
-          {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
-        </p>
+        <Hint label={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : log.ua}>
+          <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground">
+            {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
+          </p>
+        </Hint>
       )}
       <ForensicTags log={log} />
       {log.response_excerpt && (
@@ -360,26 +367,30 @@ function ForensicTags({ log }: { log: UsageLog }) {
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5">
       {tags.map((tag) => (
-        <Badge
-          key={tag}
-          variant={tag.startsWith('rejected_locally') || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
-          size="sm"
-          title={tag}
-        >
-          {rewriteLabel(tag, t)}
-        </Badge>
+        <Hint key={tag} label={tag}>
+          <Badge
+            variant={tag.startsWith('rejected_locally') || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
+            size="sm"
+          >
+            {rewriteLabel(tag, t)}
+          </Badge>
+        </Hint>
       ))}
       {log.simulated && (
-        <Badge variant="info" size="sm" title={log.sim_reason ?? undefined}>
-          {t('模拟路径', 'Simulated')}
-          {log.sim_reason ? ` · ${simReasonLabel(log.sim_reason, t)}` : ''}
-        </Badge>
+        <Hint label={log.sim_reason}>
+          <Badge variant="info" size="sm">
+            {t('模拟路径', 'Simulated')}
+            {log.sim_reason ? ` · ${simReasonLabel(log.sim_reason, t)}` : ''}
+          </Badge>
+        </Hint>
       )}
       {log.third_party && <Badge variant="error" size="sm">{t('上游判为第三方', 'Flagged as third-party')}</Badge>}
       {log.proxy && (
-        <span className="truncate font-mono text-2xs text-muted-foreground" title={log.proxy}>
-          {t('出口', 'Egress')} {log.proxy}
-        </span>
+        <Hint label={log.proxy}>
+          <span className="truncate font-mono text-2xs text-muted-foreground">
+            {t('出口', 'Egress')} {log.proxy}
+          </span>
+        </Hint>
       )}
     </div>
   )

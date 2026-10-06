@@ -24,6 +24,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import { Hint } from '@/components/ui/tooltip'
 import {
   CacheHitColumns,
   CacheHitTable,
@@ -188,13 +189,17 @@ export function CacheHitTrendDialog({
               variant="outline"
               aria-label={t('图表 / 表格', 'Chart or table')}
             >
-              <ToggleGroupItem value="chart" aria-label={t('图表', 'Chart')} title={t('图表', 'Chart')}>
-                <BarChart3Icon />
-              </ToggleGroupItem>
+              <Hint label={t('图表', 'Chart')}>
+                <ToggleGroupItem value="chart" aria-label={t('图表', 'Chart')}>
+                  <BarChart3Icon />
+                </ToggleGroupItem>
+              </Hint>
               <ToggleGroupSeparator />
-              <ToggleGroupItem value="table" aria-label={t('表格', 'Table')} title={t('表格', 'Table')}>
-                <TableIcon />
-              </ToggleGroupItem>
+              <Hint label={t('表格', 'Table')}>
+                <ToggleGroupItem value="table" aria-label={t('表格', 'Table')}>
+                  <TableIcon />
+                </ToggleGroupItem>
+              </Hint>
             </ToggleGroup>
           </div>
 

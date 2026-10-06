@@ -93,7 +93,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 
@@ -254,7 +254,9 @@ export function CredentialDevicesDialog({
                   ? t('名额：设备与会话', 'Slots: devices and sessions')
                   : t('会话名额', 'Session slots')}
               </DialogTitle>
-              <DialogDescription className="mt-1 truncate" title={credentialLabel}>{credentialLabel}</DialogDescription>
+              <Hint label={credentialLabel}>
+                <DialogDescription className="mt-1 truncate">{credentialLabel}</DialogDescription>
+              </Hint>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <Badge variant="outline">#{cred.id}</Badge>
                 {/* 数量徽章只在读取中 / 读取失败时出现：读到了之后，下面两张容量卡的「名额占用 2/3」
@@ -685,7 +687,9 @@ function CapacityStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-1 whitespace-nowrap font-semibold text-sm tabular-nums" title={value}>{value}</dd>
+      <Hint label={value}>
+        <dd className="mt-1 whitespace-nowrap font-semibold text-sm tabular-nums">{value}</dd>
+      </Hint>
     </div>
   )
 }
@@ -800,9 +804,11 @@ function EventList({
     <ul className="space-y-0.5">
       {query.data.map((e) => (
         <li key={e.id} className="grid grid-cols-[5.5rem_6rem_1fr] gap-x-3">
-          <span className="text-muted-foreground" title={formatFullTime(e.ts, language)}>
-            {relativeTime(e.ts, undefined, language)}
-          </span>
+          <Hint label={formatFullTime(e.ts, language)}>
+            <span className="text-muted-foreground">
+              {relativeTime(e.ts, undefined, language)}
+            </span>
+          </Hint>
           <span>{eventLabel(e.event, t)}</span>
           <span className="min-w-0 break-all text-muted-foreground">
             {showKey && <span className="font-mono text-foreground">{shortKey(e.session_key, t)} · </span>}
@@ -1191,18 +1197,19 @@ export function SessionList({
             </span>
           )}
           {!readOnly && !isPending && !error && (data?.length ?? 0) > 0 && (
-            <Button
-              type="button"
-              size="xs"
-              variant="destructive-outline"
-              loading={clearAll.isPending}
-              disabled={unbind.isPending}
-              onClick={() => clearAll.mutate()}
-              title={t('清除此账号的全部会话绑定（含休眠会话）；后续请求将照常重新选择账号','Remove every session binding on this account (dormant ones too); the next request selects an account as usual')}
-            >
-              <Trash2Icon />
-              {t('全部清理', 'Clear all')}
-            </Button>
+            <Hint label={t('清除此账号的全部会话绑定（含休眠会话）；后续请求将照常重新选择账号','Remove every session binding on this account (dormant ones too); the next request selects an account as usual')}>
+              <Button
+                type="button"
+                size="xs"
+                variant="destructive-outline"
+                loading={clearAll.isPending}
+                disabled={unbind.isPending}
+                onClick={() => clearAll.mutate()}
+              >
+                <Trash2Icon />
+                {t('全部清理', 'Clear all')}
+              </Button>
+            </Hint>
           )}
         </div>
       </div>
@@ -1269,13 +1276,17 @@ export function SessionList({
                   <div className="flex min-w-0 cursor-pointer items-center gap-2" onClick={toggleSessionRow}>
                     <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                     {passthrough ? (
-                      <Badge variant="outline" size="sm" className="shrink-0" title={t('真实客户端的会话：沿用自带的会话 ID（按账号转换后发往上游），占名额、不分配槽位', 'A real client session: keeps its own session ID (converted per account before going upstream); counts toward the limit but gets no slot')}>
-                        {t('真实', 'Real')}
-                      </Badge>
+                      <Hint label={t('真实客户端的会话：沿用自带的会话 ID（按账号转换后发往上游），占名额、不分配槽位', 'A real client session: keeps its own session ID (converted per account before going upstream); counts toward the limit but gets no slot')}>
+                        <Badge variant="outline" size="sm" className="shrink-0">
+                          {t('真实', 'Real')}
+                        </Badge>
+                      </Hint>
                     ) : (
-                      <Badge variant="outline" size="sm" className="shrink-0 tabular-nums" title={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
-                        #{session.slot}
-                      </Badge>
+                      <Hint label={t('槽位：会话 ID 由槽位派生，槽位释放后由下一个对话复用', 'Slot: the session ID derives from it and is reused by the next conversation once freed')}>
+                        <Badge variant="outline" size="sm" className="shrink-0 tabular-nums">
+                          #{session.slot}
+                        </Badge>
+                      </Hint>
                     )}
                     <Tooltip>
                       <TooltipTrigger render={<span />} className="min-w-0 flex-1 truncate font-mono text-xs">

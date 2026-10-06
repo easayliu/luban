@@ -11,6 +11,7 @@ import {
 import { LogoMark } from '@/components/logo-mark'
 import { Badge } from '@/components/ui/badge'
 import { buttonVariants } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import {
   Menu,
   MenuItem,
@@ -59,13 +60,11 @@ export function AppHeader({
   )
   // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。
   const readOnlyBadge = readOnly && (
-    <Badge
-      className="shrink-0"
-      title={t('访客身份登录，只能查看，不能修改', 'Signed in as a viewer: you can look but not change anything')}
-      variant="warning"
-    >
-      {t('只读', 'Read-only')}
-    </Badge>
+    <Hint label={t('访客身份登录，只能查看，不能修改', 'Signed in as a viewer: you can look but not change anything')}>
+      <Badge className="shrink-0" variant="warning">
+        {t('只读', 'Read-only')}
+      </Badge>
+    </Hint>
   )
 
   return (
@@ -73,15 +72,16 @@ export function AppHeader({
       <div className="page-frame flex h-14 items-center justify-between gap-3 sm:h-16">
         <div className="flex min-w-0 items-center gap-2">
         {onNavigateHome ? (
-          <button
-            aria-label={label}
-            className="-mx-2 flex min-w-0 cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background sm:gap-3"
-            title={label}
-            type="button"
-            onClick={onNavigateHome}
-          >
-            {brand}
-          </button>
+          <Hint label={label}>
+            <button
+              aria-label={label}
+              className="-mx-2 flex min-w-0 cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background sm:gap-3"
+              type="button"
+              onClick={onNavigateHome}
+            >
+              {brand}
+            </button>
+          </Hint>
         ) : (
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">{brand}</div>
         )}
@@ -122,13 +122,14 @@ export function PreferencesMenu({
 
   return (
     <Menu>
-      <MenuTrigger
-        aria-label={t('更多操作', 'More actions')}
-        className={buttonVariants({ size: 'sm', variant: 'outline', className: 'max-sm:size-10 max-sm:px-0' })}
-        title={t('更多操作', 'More actions')}
-      >
-        <EllipsisVerticalIcon />
-      </MenuTrigger>
+      <Hint label={t('更多操作', 'More actions')}>
+        <MenuTrigger
+          aria-label={t('更多操作', 'More actions')}
+          className={buttonVariants({ size: 'sm', variant: 'outline', className: 'max-sm:size-10 max-sm:px-0' })}
+        >
+          <EllipsisVerticalIcon />
+        </MenuTrigger>
+      </Hint>
       <MenuPopup align="end" className="w-52">
         {children}
         {children && <MenuSeparator />}

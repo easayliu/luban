@@ -101,7 +101,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /** 详情页里「最近请求」只取一页的这么多条；要翻页看全量走请求明细对话框。 */
 const RECENT_USAGE_LIMIT = 10
@@ -276,7 +276,9 @@ function StatusBanner({ cred, status }: { cred: Credential; status: CredentialSt
       <div className="flex min-w-0 items-center gap-2">
         <AlertTitle className="shrink-0">{status.label}</AlertTitle>
         {!open && (
-          <span ref={detailRef} className="min-w-0 flex-1 truncate text-muted-foreground" title={status.detail}>{status.detail}</span>
+          <Hint label={status.detail}>
+            <span ref={detailRef} className="min-w-0 flex-1 truncate text-muted-foreground">{status.detail}</span>
+          </Hint>
         )}
         {expandable && (
           <Button
@@ -473,29 +475,31 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
       <section aria-labelledby="credential-detail-title" className="flex flex-wrap items-start justify-between gap-x-6 gap-y-4">
         <div className="min-w-0 flex-1 basis-80 space-y-2.5">
           <div className="flex min-w-0 items-baseline gap-2">
-            <h1
-              // 窄屏上折行显示全名（邮箱常有 30 多个字符，截断就认不出是哪个号）；sm 起一行放得下，照常截断。
-              className="min-w-0 text-xl font-semibold tracking-tight [overflow-wrap:anywhere] sm:truncate sm:text-2xl"
-              id="credential-detail-title"
-              title={credentialLabel}
-            >
-              <BreakableLabel label={credentialLabel} />
-            </h1>
+            <Hint label={credentialLabel}>
+              <h1
+                // 窄屏上折行显示全名（邮箱常有 30 多个字符，截断就认不出是哪个号）；sm 起一行放得下，照常截断。
+                className="min-w-0 text-xl font-semibold tracking-tight [overflow-wrap:anywhere] sm:truncate sm:text-2xl"
+                id="credential-detail-title"
+              >
+                <BreakableLabel label={credentialLabel} />
+              </h1>
+            </Hint>
             <span className="shrink-0 text-sm text-muted-foreground tabular-nums max-sm:hidden">#{cred.id}</span>
             {/* 名称与 ID 就是页标题本身，账号信息里不再重复列；重命名入口跟着标题走。
                 手机上藏掉：标题常折成两行，铅笔被挤到右上角孤零零一枚，而 ⋯ 面板里就有「重命名」。 */}
             {!readOnly && (
-              <Button
-                type="button"
-                size="icon-xs"
-                variant="ghost"
-                className="shrink-0 self-center max-sm:hidden"
-                aria-label={t('重命名', 'Rename')}
-                title={t('重命名', 'Rename')}
-                onClick={openRename}
-              >
-                <PencilIcon />
-              </Button>
+              <Hint label={t('重命名', 'Rename')}>
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  className="shrink-0 self-center max-sm:hidden"
+                  aria-label={t('重命名', 'Rename')}
+                  onClick={openRename}
+                >
+                  <PencilIcon />
+                </Button>
+              </Hint>
             )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -534,13 +538,14 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
           {/* 启停开关与卡片页脚同一处理：钉在最右，旁边只在切换中挂一枚 Spinner。 */}
           <div className="flex items-center gap-2 pl-1">
             {toggle.isPending && <Spinner />}
-            <Switch
-              checked={!cred.disabled}
-              onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-              disabled={readOnly || toggle.isPending}
-              title={switchTitle(cred, language)}
-              aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
-            />
+            <Hint label={switchTitle(cred, language)}>
+              <Switch
+                checked={!cred.disabled}
+                onCheckedChange={(enabled) => toggle.mutate(!enabled)}
+                disabled={readOnly || toggle.isPending}
+                aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
+              />
+            </Hint>
           </div>
         </div>
       </section>
@@ -839,7 +844,9 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
               </Fact>
               <Fact label={t('起约束的窗口', 'Binding window')}>
                 {snapshot.rl_representative ? (
-                  <span title={snapshot.rl_representative}>{representativeLabel(snapshot.rl_representative, t)}</span>
+                  <Hint label={snapshot.rl_representative}>
+                    <span>{representativeLabel(snapshot.rl_representative, t)}</span>
+                  </Hint>
                 ) : '—'}
               </Fact>
               </>
@@ -968,17 +975,19 @@ function WindowDetail({
         <MeterIndicator className={cn(METER_FILL[level], 'rounded-full')} />
       </MeterTrack>
       {/* 重置时刻跟在条下面一行说完：「16:54 重置 · 1h 39m」。原来它是右下角一格事实，完整日期
-          加倒计时在窄屏上要折两行，三个窗口叠起来每个都高出一截；日期到分钟的精确值放 title。 */}
+          加倒计时在窄屏上要折两行，三个窗口叠起来每个都高出一截；日期到分钟的精确值放悬浮提示。 */}
       {/* 上游没给重置时刻就不写这一行；已经过了的写「已重置」，不再摆一句「没有待到的重置时刻」。 */}
       {reset != null && (
-      <p className="text-xs text-muted-foreground tabular-nums" title={formatFullTime(reset, language)}>
-        {resetDue
-          ? t(
-              `${formatClockTime(reset, language)} 重置 · ${formatCountdown(reset, now)}`,
-              `Resets ${formatClockTime(reset, language)} · ${formatCountdown(reset, now)}`,
-            )
-          : t(`${formatClockTime(reset, language)} 已重置`, `Reset at ${formatClockTime(reset, language)}`)}
-      </p>
+      <Hint label={formatFullTime(reset, language)}>
+        <p className="text-xs text-muted-foreground tabular-nums">
+          {resetDue
+            ? t(
+                `${formatClockTime(reset, language)} 重置 · ${formatCountdown(reset, now)}`,
+                `Resets ${formatClockTime(reset, language)} · ${formatCountdown(reset, now)}`,
+              )
+            : t(`${formatClockTime(reset, language)} 已重置`, `Reset at ${formatClockTime(reset, language)}`)}
+        </p>
+      </Hint>
       )}
       {hasFacts && (
         <dl className="grid grid-cols-3 gap-x-3 text-sm">
@@ -987,7 +996,9 @@ function WindowDetail({
           </Fact>
           <Fact label="Token">
             {tokens == null ? '—' : (
-              <span title={tokens.toLocaleString(locale)}>{formatTokens(tokens)}</span>
+              <Hint label={tokens.toLocaleString(locale)}>
+                <span>{formatTokens(tokens)}</span>
+              </Hint>
             )}
           </Fact>
           <Fact label={t('费用', 'Cost')}>
@@ -1037,16 +1048,17 @@ function ExpandableText({ text, label }: { text: string; label: string }) {
   }, [text, open])
   return (
     <div className="flex min-w-0 items-start gap-2">
-      <p
-        ref={ref}
-        className={cn(
-          'min-w-0 flex-1 font-mono text-xs text-muted-foreground',
-          open ? '[overflow-wrap:anywhere]' : 'truncate',
-        )}
-        title={open ? undefined : text}
-      >
-        {text}
-      </p>
+      <Hint label={open ? undefined : text}>
+        <p
+          ref={ref}
+          className={cn(
+            'min-w-0 flex-1 font-mono text-xs text-muted-foreground',
+            open ? '[overflow-wrap:anywhere]' : 'truncate',
+          )}
+        >
+          {text}
+        </p>
+      </Hint>
       {(truncated || open) && (
         <button
           type="button"
@@ -1342,7 +1354,9 @@ function InfoSection({ cred, now }: { cred: Credential; now: number }) {
         </InfoRow>
         <InfoRow label={t('最近更新', 'Updated')}>{formatFullTime(cred.updated_at, language)}</InfoRow>
         <InfoRow label="access token">
-          <span title={expiry.title}>{expiry.text}</span>
+          <Hint label={expiry.title}>
+            <span>{expiry.text}</span>
+          </Hint>
           <span className="mt-0.5 block font-mono text-xs text-muted-foreground">{cred.token_hint}</span>
         </InfoRow>
       </dl>

@@ -23,6 +23,7 @@ import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement, NumberFieldInput,
 } from '@/components/ui/number-field'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Hint } from '@/components/ui/tooltip'
 
 /** 三态策略；与后端的 `rpm_limit` 取值一一对应（0 / -1 / 正数）。 */
 type RpmPolicy = 'default' | 'unlimited' | 'custom'
@@ -92,9 +93,11 @@ export function CredentialRpmDialog({
       <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('RPM 上限', 'RPM limit')}</DialogTitle>
-          <DialogDescription className="mt-1 truncate" title={credentialLabel}>
-            {credentialLabel}
-          </DialogDescription>
+          <Hint label={credentialLabel}>
+            <DialogDescription className="mt-1 truncate">
+              {credentialLabel}
+            </DialogDescription>
+          </Hint>
         </DialogHeader>
 
         <DialogPanel className="space-y-4">

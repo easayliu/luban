@@ -26,6 +26,7 @@ import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
+import { Hint } from '@/components/ui/tooltip'
 
 /** 时间范围与粒度：与缓存 / 延迟趋势对话框同一套两档（24h 逐小时，7d 逐天）。流水只留 8 天，再长就是空格子。 */
 const RANGES = {
@@ -285,13 +286,17 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
               variant="outline"
               aria-label={t('图表 / 表格', 'Chart or table')}
             >
-              <ToggleGroupItem value="chart" aria-label={t('图表', 'Chart')} title={t('图表', 'Chart')}>
-                <BarChart3Icon />
-              </ToggleGroupItem>
+              <Hint label={t('图表', 'Chart')}>
+                <ToggleGroupItem value="chart" aria-label={t('图表', 'Chart')}>
+                  <BarChart3Icon />
+                </ToggleGroupItem>
+              </Hint>
               <ToggleGroupSeparator />
-              <ToggleGroupItem value="table" aria-label={t('表格', 'Table')} title={t('表格', 'Table')}>
-                <TableIcon />
-              </ToggleGroupItem>
+              <Hint label={t('表格', 'Table')}>
+                <ToggleGroupItem value="table" aria-label={t('表格', 'Table')}>
+                  <TableIcon />
+                </ToggleGroupItem>
+              </Hint>
             </ToggleGroup>
           </div>
 
@@ -654,28 +659,30 @@ function StatsBreakdown({
                       drillable && 'cursor-pointer hover:bg-muted/40',
                     )}
                     onClick={drillable ? drill : undefined}
-                    title={drillable ? t('查看该模型的请求', 'View requests for this model') : undefined}
                   >
                     <td className="max-w-80 max-sm:max-w-36">
                       {by === 'status' ? (
                         <Badge size="sm" variant={statusVariant(Number(row.key))}>{row.key}</Badge>
                       ) : drillable ? (
                         // 与 UsageBreakdown 同一个做法：名称做成按钮，键盘用户也能钻进去看请求。
-                        <button
-                          type="button"
-                          className="block max-w-full truncate text-start font-mono hover:underline"
-                          title={row.key}
-                          onClick={drill}
-                        >
-                          {row.key}
-                        </button>
+                        // 「查看该模型的请求」原先挂在整行上，并进这枚按钮的提示，不再在行里套一层提示。
+                        <Hint label={`${row.key}\n${t('查看该模型的请求', 'View requests for this model')}`}>
+                          <button
+                            type="button"
+                            className="block max-w-full truncate text-start font-mono hover:underline"
+                            onClick={drill}
+                          >
+                            {row.key}
+                          </button>
+                        </Hint>
                       ) : (
-                        <span
-                          className={cn('block truncate', by !== 'client' && 'font-mono', !row.key && 'font-sans text-muted-foreground')}
-                          title={row.key || undefined}
-                        >
-                          {row.key || emptyKey[by]}
-                        </span>
+                        <Hint label={row.key}>
+                          <span
+                            className={cn('block truncate', by !== 'client' && 'font-mono', !row.key && 'font-sans text-muted-foreground')}
+                          >
+                            {row.key || emptyKey[by]}
+                          </span>
+                        </Hint>
                       )}
                     </td>
                     <td>
@@ -692,7 +699,9 @@ function StatsBreakdown({
                     <td className={cn('whitespace-nowrap text-end tabular-nums', row.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>
                       {row.errors.toLocaleString(locale)}
                     </td>
-                    <td className="whitespace-nowrap text-end tabular-nums max-sm:hidden" title={row.tokens.toLocaleString(locale)}>{formatTokens(row.tokens)}</td>
+                    <Hint label={row.tokens.toLocaleString(locale)}>
+                      <td className="whitespace-nowrap text-end tabular-nums max-sm:hidden">{formatTokens(row.tokens)}</td>
+                    </Hint>
                     <td className="whitespace-nowrap text-end tabular-nums">{formatUsd(row.cost_usd)}</td>
                     <td className="whitespace-nowrap text-end text-muted-foreground max-sm:hidden">{relativeTime(row.last_ts, now, language)}</td>
                   </tr>

@@ -23,6 +23,7 @@ import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement, NumberFieldInput,
 } from '@/components/ui/number-field'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Hint } from '@/components/ui/tooltip'
 
 /** 三态策略；与后端的取值一一对应：跟随全局 = null，不停 = 0，独立阈值 = 1..100。 */
 type QuotaPolicy = 'default' | 'off' | 'custom'
@@ -168,9 +169,11 @@ export function CredentialQuotaDialog({
       <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('提前暂停调度阈值', 'Early pause threshold')}</DialogTitle>
-          <DialogDescription className="mt-1 truncate" title={credentialLabel}>
-            {credentialLabel}
-          </DialogDescription>
+          <Hint label={credentialLabel}>
+            <DialogDescription className="mt-1 truncate">
+              {credentialLabel}
+            </DialogDescription>
+          </Hint>
         </DialogHeader>
 
         <DialogPanel className="space-y-4">

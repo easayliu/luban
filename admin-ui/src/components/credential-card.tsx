@@ -76,7 +76,7 @@ import {
 } from '@/components/ui/meter'
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
 /**
  * 页脚三格名额读数（设备 / 会话 / RPM）的定宽：2.25rem，数字左对齐。
@@ -409,16 +409,17 @@ export const CredentialCard = memo(function CredentialCard({
                   />
                 )}
                 <div className="min-w-0 flex-1">
-                  <h3
-                    id={titleId}
-                    className="block min-w-0 truncate whitespace-nowrap leading-snug"
-                    title={credentialLabel}
-                  >
-                    {/* 账号名即详情页入口：用真链接而不是按钮，中键 / ⌘ 点击能在新标签页打开。 */}
-                    <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
-                      {credentialLabel}
-                    </a>
-                  </h3>
+                  <Hint label={credentialLabel}>
+                    <h3
+                      id={titleId}
+                      className="block min-w-0 truncate whitespace-nowrap leading-snug"
+                    >
+                      {/* 账号名即详情页入口：用真链接而不是按钮，中键 / ⌘ 点击能在新标签页打开。 */}
+                      <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
+                        {credentialLabel}
+                      </a>
+                    </h3>
+                  </Hint>
                   <CardDescription className="mt-1 flex @min-[27rem]/card:mt-1.5 min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
                     <span aria-hidden="true">·</span>
@@ -757,13 +758,14 @@ export const CredentialCard = memo(function CredentialCard({
           {/* 开关钉在最右。 */}
           <div className="order-last ml-auto flex shrink-0 items-center gap-2">
             {toggle.isPending && <Spinner />}
-            <Switch
-              checked={!cred.disabled}
-              onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-              disabled={readOnly || toggle.isPending}
-              title={switchTitle(cred, language)}
-              aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
-            />
+            <Hint label={switchTitle(cred, language)}>
+              <Switch
+                checked={!cred.disabled}
+                onCheckedChange={(enabled) => toggle.mutate(!enabled)}
+                disabled={readOnly || toggle.isPending}
+                aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
+              />
+            </Hint>
           </div>
 
         </CardFooter>

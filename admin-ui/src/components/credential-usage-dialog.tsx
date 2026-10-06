@@ -52,6 +52,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { Hint } from '@/components/ui/tooltip'
 import {
   Table,
   TableBody,
@@ -182,7 +183,7 @@ export function CredentialUsageDialog({
                 {usage.isFetching && !usage.isPending && <Spinner />}
               </div>
               <DialogDescription className="mt-1 flex min-w-0 items-center gap-1.5">
-                <span className="truncate" title={credentialLabel}>{credentialLabel}</span>
+                <Hint label={credentialLabel}><span className="truncate">{credentialLabel}</span></Hint>
                 <span aria-hidden="true">·</span>
                 <span className="shrink-0 tabular-nums">#{cred.id}</span>
               </DialogDescription>
@@ -346,17 +347,18 @@ export function CredentialUsageDialog({
         </DialogPanel>
 
         <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            className="mr-auto"
-            disabled={usage.isFetching}
-            onClick={reload}
-            title={t('回到第一页并拉取最新记录', 'Jump back to the first page and fetch the newest records')}
-          >
-            <RefreshCwIcon className={usage.isFetching ? 'animate-spin' : undefined} />
-            {t('刷新', 'Refresh')}
-          </Button>
+          <Hint label={t('回到第一页并拉取最新记录', 'Jump back to the first page and fetch the newest records')}>
+            <Button
+              type="button"
+              variant="outline"
+              className="mr-auto"
+              disabled={usage.isFetching}
+              onClick={reload}
+            >
+              <RefreshCwIcon className={usage.isFetching ? 'animate-spin' : undefined} />
+              {t('刷新', 'Refresh')}
+            </Button>
+          </Hint>
           <DialogClose render={<Button variant="outline" />}>{t('关闭', 'Close')}</DialogClose>
         </DialogFooter>
       </DialogPopup>
@@ -412,9 +414,11 @@ export function UsageCards({
         return (
           <li key={log.id} className="rounded-lg border bg-card px-4 py-2.5 text-xs">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="shrink-0 font-medium tabular-nums" title={formatFullTime(log.ts, language)}>
-                {logTime(log.ts)}
-              </span>
+              <Hint label={formatFullTime(log.ts, language)}>
+                <span className="shrink-0 font-medium tabular-nums">
+                  {logTime(log.ts)}
+                </span>
+              </Hint>
               <Badge variant={statusVariant(log.status)} size="sm" className="tabular-nums">
                 {log.status}
               </Badge>
@@ -427,9 +431,11 @@ export function UsageCards({
                 {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
               </span>
             </div>
-            <p className="mt-1 truncate text-muted-foreground" title={log.model ?? undefined}>
-              {log.model ?? '—'}
-            </p>
+            <Hint label={log.model}>
+              <p className="mt-1 truncate text-muted-foreground">
+                {log.model ?? '—'}
+              </p>
+            </Hint>
             <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5">
               <LogFact label={t('输入 / 输出', 'In / out')}>
                 {num(log.input_tokens, locale)} / {num(log.output_tokens, locale)}
@@ -446,10 +452,12 @@ export function UsageCards({
                 )}
               </LogFact>
               <LogFact label={t('设备', 'Device')}>
-                <span className="font-mono" title={deviceTitle(log)}>
-                  {deviceShort}
-                  {log.device_id_out && <span className="text-muted-foreground">→{log.device_id_out.slice(0, 8)}</span>}
-                </span>
+                <Hint label={deviceTitle(log)}>
+                  <span className="font-mono">
+                    {deviceShort}
+                    {log.device_id_out && <span className="text-muted-foreground">→{log.device_id_out.slice(0, 8)}</span>}
+                  </span>
+                </Hint>
               </LogFact>
               <LogFact label={t('请求 ID', 'Request ID')}>
                 <RequestIdChip id={log.request_id} onOpen={onLookup} />
@@ -457,18 +465,19 @@ export function UsageCards({
               {/* 会话：模拟路径且没有设备身份的请求才有对话键，其余退到上游那个 session_id
                   （按槽位派生、对话之间复用），两者都在悬浮提示里。 */}
               <LogFact label={t('会话', 'Session')}>
-                <span className="font-mono" title={sessionTitle(log)}>
-                  {sessionShort(log, t, language)}
-                </span>
+                <Hint label={sessionTitle(log)}>
+                  <span className="font-mono">
+                    {sessionShort(log, t, language)}
+                  </span>
+                </Hint>
               </LogFact>
             </dl>
             {(log.ua || log.ua_out) && (
-              <p
-                className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground"
-                title={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : (log.ua ?? undefined)}
-              >
-                {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
-              </p>
+              <Hint label={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : log.ua}>
+                <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground">
+                  {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
+                </p>
+              </Hint>
             )}
           </li>
         )
@@ -551,41 +560,43 @@ export function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('缓存写/读', 'Cache w/r')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
-          <TableHead
-            className="whitespace-nowrap"
-            title={t('客户端请求自带的 device_id（设备绑定与设备上限均据此计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}
-          >
-            {t('入站设备', 'Inbound device')}
-          </TableHead>
-          <TableHead
-            className="whitespace-nowrap"
-            title={t(
+          <Hint label={t('客户端请求自带的 device_id（设备绑定与设备上限均据此计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}>
+            <TableHead className="whitespace-nowrap">
+              {t('入站设备', 'Inbound device')}
+            </TableHead>
+          </Hint>
+          <Hint
+            label={t(
               '实际发给上游的 device_id（按账号派生），上游给出的设备 ID 对应此列；旧记录为空',
               'device_id actually sent upstream (derived per account); a device ID quoted by upstream corresponds to this column. Empty for older rows',
             )}
           >
-            {t('出站设备', 'Outbound device')}
-          </TableHead>
-          <TableHead
-            className="whitespace-nowrap"
-            title={t(
+            <TableHead className="whitespace-nowrap">
+              {t('出站设备', 'Outbound device')}
+            </TableHead>
+          </Hint>
+          <Hint
+            label={t(
               'luban 在响应头 X-Oneapi-Request-Id 中返回的请求 ID，New API 日志中称为 upstream_request_id；点击 ID 可查看该请求，点击旁边的图标可复制',
               'Request ID luban returns in the X-Oneapi-Request-Id response header (upstream_request_id in New API logs); click the ID to look up the request, or the icon next to it to copy',
             )}
           >
-            {t('请求 ID', 'Request ID')}
-          </TableHead>
+            <TableHead className="whitespace-nowrap">
+              {t('请求 ID', 'Request ID')}
+            </TableHead>
+          </Hint>
           {/* 两份 UA 合在一列：绝大多数请求原样转发，两者是同一串，占两列纯浪费宽度。
               只在被改写时才多显示一行出站那份，见 UaCell。 */}
-          <TableHead
-            className="min-w-52 whitespace-nowrap"
-            title={t(
+          <Hint
+            label={t(
               '客户端自报的 User-Agent；被改写时，另起一行显示实际发给上游的 User-Agent',
               'User-Agent reported by the client; when rewritten, the one actually sent upstream is shown on a second line',
             )}
           >
-            {t('客户端 UA', 'Client UA')}
-          </TableHead>
+            <TableHead className="min-w-52 whitespace-nowrap">
+              {t('客户端 UA', 'Client UA')}
+            </TableHead>
+          </Hint>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -599,20 +610,21 @@ export function UsageTable({
           const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
           return (
             <TableRow key={log.id} className="[&>td]:px-2.5 [&>td]:py-2">
-              <TableCell
-                className="whitespace-nowrap tabular-nums"
-                title={`${formatFullTime(log.ts, language)} · ${log.path}`}
-              >
-                {logTime(log.ts)}
-              </TableCell>
+              <Hint label={`${formatFullTime(log.ts, language)} · ${log.path}`}>
+                <TableCell className="whitespace-nowrap tabular-nums">
+                  {logTime(log.ts)}
+                </TableCell>
+              </Hint>
               <TableCell>
                 <Badge variant={statusVariant(log.status)} size="sm" className="tabular-nums">
                   {log.status}
                 </Badge>
               </TableCell>
-              <TableCell className="max-w-40 truncate" title={log.model ?? undefined}>
-                {log.model ?? '—'}
-              </TableCell>
+              <Hint label={log.model}>
+                <TableCell className="max-w-40 truncate">
+                  {log.model ?? '—'}
+                </TableCell>
+              </Hint>
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {num(log.input_tokens, locale)}
               </TableCell>
@@ -622,39 +634,47 @@ export function UsageTable({
               <TableCell className="whitespace-nowrap text-right tabular-nums">
                 {num(log.cache_creation_tokens, locale)} / {num(log.cache_read_tokens, locale)}
               </TableCell>
-              <TableCell
-                className="whitespace-nowrap text-right tabular-nums"
-                title={log.sse_aggregated
+              <Hint
+                label={log.sse_aggregated
                   ? t(
                       '该请求原为非流式，以流式发往上游后再聚合为完整响应返回：首字耗时取自上游首字节，客户端则在结束时一次性收到全部内容。',
                       'This request arrived non-streaming and was sent upstream as a stream, then reassembled into a single response: TTFT is the upstream first byte, while the client received everything at the end.',
                     )
                   : undefined}
               >
-                {ms(log.ttft_ms)} / {ms(log.total_ms)}
-                {log.sse_aggregated && (
-                  <div className="text-muted-foreground text-[10px] font-normal">
-                    {t('非流转流', 'stream-upgraded')}
-                  </div>
-                )}
-              </TableCell>
-              <TableCell
-                className={cn(
-                  'whitespace-nowrap text-right tabular-nums',
-                  log.cost_usd == null && 'text-muted-foreground',
-                )}
-                title={log.cost_usd == null
+                <TableCell className="whitespace-nowrap text-right tabular-nums">
+                  {ms(log.ttft_ms)} / {ms(log.total_ms)}
+                  {log.sse_aggregated && (
+                    <div className="text-muted-foreground text-[10px] font-normal">
+                      {t('非流转流', 'stream-upgraded')}
+                    </div>
+                  )}
+                </TableCell>
+              </Hint>
+              <Hint
+                label={log.cost_usd == null
                   ? t('模型不在价目表内，无法估算花费', 'Model is not in the price table, so the cost cannot be estimated')
                   : undefined}
               >
-                {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
-              </TableCell>
-              <TableCell className="whitespace-nowrap font-mono text-xs" title={log.device_id ?? undefined}>
-                {deviceShort}
-              </TableCell>
-              <TableCell className="whitespace-nowrap font-mono text-xs" title={log.device_id_out ?? undefined}>
-                {log.device_id_out?.slice(0, 8) ?? '—'}
-              </TableCell>
+                <TableCell
+                  className={cn(
+                    'whitespace-nowrap text-right tabular-nums',
+                    log.cost_usd == null && 'text-muted-foreground',
+                  )}
+                >
+                  {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
+                </TableCell>
+              </Hint>
+              <Hint label={log.device_id}>
+                <TableCell className="whitespace-nowrap font-mono text-xs">
+                  {deviceShort}
+                </TableCell>
+              </Hint>
+              <Hint label={log.device_id_out}>
+                <TableCell className="whitespace-nowrap font-mono text-xs">
+                  {log.device_id_out?.slice(0, 8) ?? '—'}
+                </TableCell>
+              </Hint>
               <TableCell className="whitespace-nowrap">
                 <RequestIdChip id={log.request_id} onOpen={onLookup} />
               </TableCell>
@@ -671,7 +691,7 @@ export function UsageTable({
  * UA 单元格：来访那份为主，被改写时另起一行显示实际发给上游的那份。
  *
  * 真实 UA 动辄六七十字符。表格内最多展示两行，避免一条长 UA 把整行撑高；完整内容保留在
- * title 里。被改写时第二行显示实际发给上游的值。
+ * 悬浮提示里。被改写时第二行显示实际发给上游的值。
  *
  * 两者相同（原样转发）时只显示一份——绝大多数请求都是这种，重复显示等于白占半屏。
  * 都为空的是 0.2.60 之前的旧记录，不是「没有客户端」。
@@ -683,16 +703,18 @@ function UaCell({ ua, uaOut }: { ua: string | null; uaOut: string | null }) {
     ? t('无（luban 自身发起）', 'None (sent by luban itself)')
     : '—')
   return (
-    <TableCell className="align-top leading-4" title={rewritten ? `${incoming}\n→ ${uaOut}` : incoming}>
-      <span className={cn('block truncate', !ua && 'text-muted-foreground')}>
-        {incoming}
-      </span>
-      {rewritten && (
-        <span className="mt-0.5 block truncate text-muted-foreground">
-          → {uaOut}
+    <Hint label={rewritten ? `${incoming}\n→ ${uaOut}` : incoming}>
+      <TableCell className="align-top leading-4">
+        <span className={cn('block truncate', !ua && 'text-muted-foreground')}>
+          {incoming}
         </span>
-      )}
-    </TableCell>
+        {rewritten && (
+          <span className="mt-0.5 block truncate text-muted-foreground">
+            → {uaOut}
+          </span>
+        )}
+      </TableCell>
+    </Hint>
   )
 }
 

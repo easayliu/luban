@@ -6,6 +6,7 @@ import { setPw } from '@/api/client'
 import { rememberRole } from '@/lib/role'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
 import { Field, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
@@ -98,16 +99,17 @@ export function LoginPage({ onSuccess }: { onSuccess: (password: string) => void
                     value={password}
                   />
                   <InputGroupAddon align="inline-end">
-                    <Button
-                      aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                      size="icon-xs"
-                      title={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                      type="button"
-                      variant="ghost"
-                      onClick={() => setShow((visible) => !visible)}
-                    >
-                      {show ? <EyeOffIcon /> : <EyeIcon />}
-                    </Button>
+                    <Hint label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}>
+                      <Button
+                        aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => setShow((visible) => !visible)}
+                      >
+                        {show ? <EyeOffIcon /> : <EyeIcon />}
+                      </Button>
+                    </Hint>
                   </InputGroupAddon>
                 </InputGroup>
                 {/* `match`：Base UI 的 Field.Error 默认只跟着原生表单校验显示，这里的错误来自接口，得显式

@@ -27,7 +27,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import type { BadgeProps } from '@/components/ui/badge'
 import { Badge, badgeVariants } from '@/components/ui/badge'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Dialog, DialogClose, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
@@ -1066,17 +1066,17 @@ export function CredentialMenuContent({
         <Fragment key={group[0].key}>
           {i > 0 && <MenuSeparator />}
           {group.map((item) => (
-            <MenuItem
-              key={item.key}
-              onClick={item.onSelect}
-              disabled={item.disabled}
-              title={item.title}
-              variant={item.destructive ? 'destructive' : undefined}
-            >
-              {item.icon}
-              {item.label}
-              {item.shortcut && <MenuShortcut>{item.shortcut}</MenuShortcut>}
-            </MenuItem>
+            <Hint key={item.key} label={item.title} side="left">
+              <MenuItem
+                onClick={item.onSelect}
+                disabled={item.disabled}
+                variant={item.destructive ? 'destructive' : undefined}
+              >
+                {item.icon}
+                {item.label}
+                {item.shortcut && <MenuShortcut>{item.shortcut}</MenuShortcut>}
+              </MenuItem>
+            </Hint>
           ))}
         </Fragment>
       ))}
@@ -1118,25 +1118,28 @@ export function CredentialActionsMenu({
   if (!mobile) {
     return (
       <Menu modal={false}>
-        <MenuTrigger className={triggerClassName} aria-label={triggerLabel} title={triggerTitle}>
-          <EllipsisIcon />
-        </MenuTrigger>
+        <Hint label={triggerTitle}>
+          <MenuTrigger className={triggerClassName} aria-label={triggerLabel}>
+            <EllipsisIcon />
+          </MenuTrigger>
+        </Hint>
         <CredentialMenuContent cred={cred} actions={actions} {...handlers} />
       </Menu>
     )
   }
   return (
     <>
-      <button
-        type="button"
-        className={triggerClassName}
-        aria-label={triggerLabel}
-        aria-haspopup="dialog"
-        title={triggerTitle}
-        onClick={() => setOpen(true)}
-      >
-        <EllipsisIcon />
-      </button>
+      <Hint label={triggerTitle}>
+        <button
+          type="button"
+          className={triggerClassName}
+          aria-label={triggerLabel}
+          aria-haspopup="dialog"
+          onClick={() => setOpen(true)}
+        >
+          <EllipsisIcon />
+        </button>
+      </Hint>
       {/* 没点开过就不挂：一页几十张卡片，每张都背一棵常关的面板树不划算。 */}
       <DeferredMount open={open}>
         <CredentialActionSheet cred={cred} actions={actions} open={open} onOpenChange={setOpen} {...handlers} />
@@ -1220,7 +1223,9 @@ function CredentialActionSheet({
       >
         <div aria-hidden className="mx-auto mt-2 h-1.5 w-10 shrink-0 rounded-full bg-muted-foreground/24" />
         <DialogHeader className="gap-1.5 px-5 pt-3 pb-4 max-sm:pb-4">
-          <DialogTitle className="truncate text-base" title={credentialLabel}>{credentialLabel}</DialogTitle>
+          <Hint label={credentialLabel}>
+            <DialogTitle className="truncate text-base">{credentialLabel}</DialogTitle>
+          </Hint>
           {/* 状态与套餐徽章只在卡片 / 列表里打开时挂：那时要靠它们认出点的是哪个号。详情页里打开时
               （showDetail=false），面板背后的页头就写着账号名、状态与套餐，这里只留 #id。 */}
           <DialogDescription render={<div />} className="flex flex-wrap items-center gap-1.5 text-xs">
@@ -1307,19 +1312,19 @@ function CredentialActionSheet({
                   <span className="min-w-0 flex-1 truncate">{t('调度优先级', 'Priority')}</span>
                   <span className="text-xs text-muted-foreground tabular-nums">P{cred.priority} {priorityTierName(cred.priority, t)}</span>
                   {priority.map((item) => (
-                    <Button
-                      key={item.key}
-                      type="button"
-                      size="icon-sm"
-                      variant="outline"
-                      aria-label={`${item.label} (${item.shortcut})`}
-                      title={item.title}
-                      disabled={item.disabled}
-                      // 升降不关面板：常常要连点几下才到想要的档位，每点一下都关掉就得反复重开。
-                      onClick={item.onSelect}
-                    >
-                      {item.icon}
-                    </Button>
+                    <Hint key={item.key} label={item.title}>
+                      <Button
+                        type="button"
+                        size="icon-sm"
+                        variant="outline"
+                        aria-label={`${item.label} (${item.shortcut})`}
+                        disabled={item.disabled}
+                        // 升降不关面板：常常要连点几下才到想要的档位，每点一下都关掉就得反复重开。
+                        onClick={item.onSelect}
+                      >
+                        {item.icon}
+                      </Button>
+                    </Hint>
                   ))}
                 </li>
               )}
@@ -1704,18 +1709,19 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
       <Alert variant={result.ok ? 'success' : 'error'}>
         <Icon aria-hidden />
         <AlertTitle className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="min-w-0 [overflow-wrap:anywhere]" title={model}>{model}</span>
+          <Hint label={model}>
+            <span className="min-w-0 [overflow-wrap:anywhere]">{model}</span>
+          </Hint>
           <Badge variant={result.ok ? 'success' : 'error'} size="sm">
             {result.status > 0 ? `HTTP ${result.status}` : t('未送达上游', 'Not sent upstream')}
           </Badge>
           <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
           {result.model && result.model !== model && (
-            <span
-              className="min-w-0 font-normal text-muted-foreground [overflow-wrap:anywhere]"
-              title={t(`上游实际使用的模型：${result.model}`, `Model actually used upstream: ${result.model}`)}
-            >
-              → {result.model}
-            </span>
+            <Hint label={t(`上游实际使用的模型：${result.model}`, `Model actually used upstream: ${result.model}`)}>
+              <span className="min-w-0 font-normal text-muted-foreground [overflow-wrap:anywhere]">
+                → {result.model}
+              </span>
+            </Hint>
           )}
         </AlertTitle>
         <AlertDescription>
@@ -1746,27 +1752,28 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
     if (util == null && reset == null) return null
     const pct = quotaPercentage(util)
     return (
-      <span
+      <Hint
         key={label}
-        className="tnum"
-        title={reset != null
+        label={reset != null
           ? t(
               `${label} 窗口 ${formatFullTime(reset, language)} 重置`,
               `${label} window resets at ${formatFullTime(reset, language)}`,
             )
           : undefined}
       >
-        {label}{' '}
-        {pct == null ? (
-          '—'
-        ) : (
-          <span className={cn('font-medium', quotaToneClass(util))}>{pct}%</span>
-        )}
-        {reset != null && t(
-          ` · ${formatClockTime(reset, language)} 重置`,
-          ` · resets ${formatClockTime(reset, language)}`,
-        )}
-      </span>
+        <span className="tnum">
+          {label}{' '}
+          {pct == null ? (
+            '—'
+          ) : (
+            <span className={cn('font-medium', quotaToneClass(util))}>{pct}%</span>
+          )}
+          {reset != null && t(
+            ` · ${formatClockTime(reset, language)} 重置`,
+            ` · resets ${formatClockTime(reset, language)}`,
+          )}
+        </span>
+      </Hint>
     )
   }
   return (
@@ -1775,37 +1782,34 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
       {win('7d', quota.rl_7d_utilization, quota.rl_7d_reset)}
       {/* 429 才有。它是上游对**这次**拒绝给出的等待时间，比窗口 reset 更直接。 */}
       {quota.retry_after_secs != null && (
-        <span
-          className="text-destructive-foreground"
-          title={t(
+        <Hint
+          label={t(
             `上游 retry-after：${quota.retry_after_secs} 秒`,
             `Upstream retry-after: ${quota.retry_after_secs} ${quota.retry_after_secs === 1 ? 'second' : 'seconds'}`,
           )}
         >
-          {t('需等待', 'Wait')} {formatWait(quota.retry_after_secs, language)}
-        </span>
+          <span className="text-destructive-foreground">
+            {t('需等待', 'Wait')} {formatWait(quota.retry_after_secs, language)}
+          </span>
+        </Hint>
       )}
       {/* 套餐用量已满但上游动用 Usage credits 放行：不 429、请求照常成功，只有这里能看出在花钱。 */}
       {quota.overage_in_use && (
-        <span
-          className="text-destructive-foreground"
-          title={t(
+        <Hint
+          label={t(
             '本次请求由 Usage credits（上游响应头中的 overage）放行：套餐包含的用量已用完，正按标准 API 价计费',
             'This request was served by usage credits (`overage` in the upstream headers): the plan\'s included usage is exhausted and standard API rates now apply',
           )}
         >
-          {t('Usage credits 放行', 'Served by usage credits')}
-        </span>
+          <span className="text-destructive-foreground">
+            {t('Usage credits 放行', 'Served by usage credits')}
+          </span>
+        </Hint>
       )}
       {/* allowed 是常态，不占地方；warning/rejected 才值得说一句。 */}
       {quota.unified_status && quota.unified_status !== 'allowed' && (
-        <span
-          className={cn(
-            quota.unified_status === 'rejected' || quota.unified_status === 'rate_limited'
-              ? 'text-destructive-foreground'
-              : 'text-warning-foreground',
-          )}
-          title={
+        <Hint
+          label={
             quota.rl_representative
               ? t(
                   `上游整体用量状态（当前由 ${quota.rl_representative} 窗口决定）`,
@@ -1814,8 +1818,16 @@ function ProbeQuotaLine({ quota }: { quota: ProbeQuota }) {
               : t('上游整体用量状态', 'Overall upstream usage status')
           }
         >
-          {unifiedQuotaStatusLabel(quota.unified_status, language)}
-        </span>
+          <span
+            className={cn(
+              quota.unified_status === 'rejected' || quota.unified_status === 'rate_limited'
+                ? 'text-destructive-foreground'
+                : 'text-warning-foreground',
+            )}
+          >
+            {unifiedQuotaStatusLabel(quota.unified_status, language)}
+          </span>
+        </Hint>
       )}
     </div>
   )
@@ -2062,7 +2074,7 @@ export function statusMeta(
 }
 
 /**
- * 凭证自身的到期时间 → 元信息行的文案、配色与 title。
+ * 凭证自身的到期时间 → 元信息行的文案、配色与悬浮提示（`title` 字段）。
  *
  * 正常态给的是过期时刻而非「剩余 x 小时 y 分钟」：倒计时不自己走就是个假数字，
  * 而 token 到点会自动刷新，用户真正要判断的是「几点」，不是还剩多久。

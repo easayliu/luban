@@ -24,7 +24,7 @@ import type { SortDir, SortKey } from '@/components/credential-shared'
 import { Button } from '@/components/ui/button'
 import { MenuItem } from '@/components/ui/menu'
 import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
-import { TooltipProvider } from '@/components/ui/tooltip'
+import { Hint, TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
 import { initTheme } from '@/lib/theme'
 import type { BanEvent, Credential, CredentialStats, CredentialStatsBucket, UsageLog, UsagePage } from '@/api/credentials'
@@ -783,16 +783,17 @@ function PreviewHeader() {
       onNavigateHome={scrollToTop}
       actions={
         <>
-        <Button
-          aria-label={t('添加账号', 'Add account')}
-          className="max-sm:size-10 max-sm:px-0"
-          size="sm"
-          title={t('添加账号', 'Add account')}
-          onClick={() => navigatePreview('?dialog=add')}
-        >
-          <PlusIcon />
-          <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
-        </Button>
+        <Hint label={t('添加账号', 'Add account')}>
+          <Button
+            aria-label={t('添加账号', 'Add account')}
+            className="max-sm:size-10 max-sm:px-0"
+            size="sm"
+            onClick={() => navigatePreview('?dialog=add')}
+          >
+            <PlusIcon />
+            <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+          </Button>
+        </Hint>
         <PreferencesMenu>
           <MenuItem onClick={() => navigatePreview('?settings=access')}>
             <SettingsIcon />{t('系统设置', 'System settings')}

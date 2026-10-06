@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Hint } from '@/components/ui/tooltip'
 
 export function CredentialProxyDialog({
   cred,
@@ -72,9 +73,11 @@ export function CredentialProxyDialog({
       <DialogPopup>
         <DialogHeader>
           <DialogTitle>{t('出站代理', 'Outbound proxy')}</DialogTitle>
-          <DialogDescription className="mt-1 truncate" title={credentialLabel}>
-            {credentialLabel}
-          </DialogDescription>
+          <Hint label={credentialLabel}>
+            <DialogDescription className="mt-1 truncate">
+              {credentialLabel}
+            </DialogDescription>
+          </Hint>
         </DialogHeader>
 
         <DialogPanel className="space-y-4">
@@ -200,26 +203,26 @@ export function ProxyPickerCombobox({
           const p = byId(id)
           if (!p) return null
           return (
-            <ComboboxItem
-              key={p.id}
-              value={p.id}
-              title={p.credential_labels.length > 0
-                ? `${p.url}\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}`
-                : p.url}
-            >
-              <div className="min-w-0">
-                <div className="flex items-baseline gap-2">
-                  <span className="truncate font-medium">{p.label}</span>
-                  {p.credential_count > 0 && (
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {p.credential_count} {t('个账号', 'acct')}
-                    </span>
-                  )}
+            <ComboboxItem key={p.id} value={p.id}>
+              <Hint
+                label={p.credential_labels.length > 0
+                  ? `${p.url}\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}`
+                  : p.url}
+              >
+                <div className="min-w-0">
+                  <div className="flex items-baseline gap-2">
+                    <span className="truncate font-medium">{p.label}</span>
+                    {p.credential_count > 0 && (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {p.credential_count} {t('个账号', 'acct')}
+                      </span>
+                    )}
+                  </div>
+                  <div className="truncate font-mono text-xs text-muted-foreground">
+                    {proxyMaskedUrl(p.url)}
+                  </div>
                 </div>
-                <div className="truncate font-mono text-xs text-muted-foreground">
-                  {proxyMaskedUrl(p.url)}
-                </div>
-              </div>
+              </Hint>
             </ComboboxItem>
           )
         }}

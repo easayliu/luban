@@ -3,6 +3,7 @@ import { useI18n } from '@/lib/i18n'
 import { cn, copyText } from '@/lib/utils'
 import { type BadgeProps } from '@/components/ui/badge'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 
 /**
  * 流水表格与请求查询共用的两件小东西。
@@ -21,8 +22,8 @@ export function statusVariant(status: number): BadgeProps['variant'] {
 }
 
 /**
- * 请求 id：默认只显示尾部 8 位（来访沿用的 id 可能长达 128 位，表格里放不下），完整值在 title
- * 里。`full` 时整串显示（查询结果页有的是横向空间）。旧记录没有 id 时显示占位。
+ * 请求 id：默认只显示尾部 8 位（来访沿用的 id 可能长达 128 位，表格里放不下），完整值在悬浮
+ * 提示里（触屏长按）。`full` 时整串显示（查询结果页有的是横向空间）。旧记录没有 id 时显示占位。
  *
  * 给了 `onOpen` 就拆成两颗按钮：id 本身点开这条请求的查询弹窗，后面那枚图标仍是复制——
  * 一个格子两种动作，都得是真按钮（键盘逐个 Tab 得到，读屏各念各的）。没给 `onOpen` 时整块
@@ -55,41 +56,44 @@ export function RequestIdChip({
   }
   if (!onOpen) {
     return (
-      <button
-        type="button"
-        className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere] pointer-coarse:-my-3 pointer-coarse:py-3"
-        title={`${id}\n${t('点击复制', 'Click to copy')}`}
-        onClick={copy}
-      >
-        <span className={full ? '' : 'truncate'}>{shown}</span>
-        <CopyIcon aria-hidden className="size-3 shrink-0 text-muted-foreground" />
-      </button>
+      <Hint label={`${id}\n${t('点击复制', 'Click to copy')}`}>
+        <button
+          type="button"
+          className="inline-flex max-w-full items-center gap-1 rounded font-mono text-xs hover:text-foreground hover:underline [overflow-wrap:anywhere] pointer-coarse:-my-3 pointer-coarse:py-3"
+          onClick={copy}
+        >
+          <span className={full ? '' : 'truncate'}>{shown}</span>
+          <CopyIcon aria-hidden className="size-3 shrink-0 text-muted-foreground" />
+        </button>
+      </Hint>
     )
   }
   return (
     <span className="inline-flex max-w-full items-center gap-1">
-      <button
-        type="button"
-        className={cn(
-          'min-w-0 rounded font-mono text-xs hover:text-foreground hover:underline pointer-coarse:-my-3 pointer-coarse:py-3',
-          full ? '[overflow-wrap:anywhere] text-left' : 'truncate',
-        )}
-        title={`${id}\n${t('点击查看这条请求', 'Click to look up this request')}`}
-        aria-label={t(`查看请求 ${id}`, `Look up request ${id}`)}
-        aria-haspopup="dialog"
-        onClick={() => onOpen(id)}
-      >
-        {shown}
-      </button>
-      <button
-        type="button"
-        className="shrink-0 rounded text-muted-foreground hover:text-foreground pointer-coarse:-my-3 pointer-coarse:-mr-3 pointer-coarse:-ml-1 pointer-coarse:py-3 pointer-coarse:pr-3 pointer-coarse:pl-1"
-        title={`${id}\n${t('点击复制', 'Click to copy')}`}
-        aria-label={t(`复制请求 ID ${id}`, `Copy request ID ${id}`)}
-        onClick={copy}
-      >
-        <CopyIcon aria-hidden className="size-3" />
-      </button>
+      <Hint label={`${id}\n${t('点击查看这条请求', 'Click to look up this request')}`}>
+        <button
+          type="button"
+          className={cn(
+            'min-w-0 rounded font-mono text-xs hover:text-foreground hover:underline pointer-coarse:-my-3 pointer-coarse:py-3',
+            full ? '[overflow-wrap:anywhere] text-left' : 'truncate',
+          )}
+          aria-label={t(`查看请求 ${id}`, `Look up request ${id}`)}
+          aria-haspopup="dialog"
+          onClick={() => onOpen(id)}
+        >
+          {shown}
+        </button>
+      </Hint>
+      <Hint label={`${id}\n${t('点击复制', 'Click to copy')}`}>
+        <button
+          type="button"
+          className="shrink-0 rounded text-muted-foreground hover:text-foreground pointer-coarse:-my-3 pointer-coarse:-mr-3 pointer-coarse:-ml-1 pointer-coarse:py-3 pointer-coarse:pr-3 pointer-coarse:pl-1"
+          aria-label={t(`复制请求 ID ${id}`, `Copy request ID ${id}`)}
+          onClick={copy}
+        >
+          <CopyIcon aria-hidden className="size-3" />
+        </button>
+      </Hint>
     </span>
   )
 }

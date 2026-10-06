@@ -34,6 +34,7 @@ import { SetupPage } from '@/components/setup-page'
 import { AppFooter } from '@/components/app-footer'
 import { AppHeader, Breadcrumb, PreferencesMenu, scrollToTop } from '@/components/app-header'
 import { Button } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
 import { MenuItem } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
@@ -402,30 +403,32 @@ function App() {
             {/* 「添加账号」是顶栏第一枚、也是唯一的实心按钮：这一页的主动作在这儿最好够。
                 窄屏只留一枚橙色 `+`，≥640px 带上文字。 */}
             {!readOnly && (
+              <Hint label={t('添加账号', 'Add account')}>
+                <Button
+                  aria-label={t('添加账号', 'Add account')}
+                  className="max-sm:size-10 max-sm:px-0"
+                  disabled={isBootstrapping}
+                  size="sm"
+                  onClick={() => setAdding(true)}
+                >
+                  <PlusIcon />
+                  <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+                </Button>
+              </Hint>
+            )}
+            <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
               <Button
-                aria-label={t('添加账号', 'Add account')}
+                aria-label={t('请求查询', 'Request lookup')}
                 className="max-sm:size-10 max-sm:px-0"
                 disabled={isBootstrapping}
                 size="sm"
-                title={t('添加账号', 'Add account')}
-                onClick={() => setAdding(true)}
+                variant="outline"
+                onClick={() => setLookupOpen(true)}
               >
-                <PlusIcon />
-                <span className="max-sm:sr-only">{t('添加账号', 'Add account')}</span>
+                <SearchIcon />
+                <span className="max-sm:sr-only">{t('请求查询', 'Lookup')}</span>
               </Button>
-            )}
-            <Button
-              aria-label={t('请求查询', 'Request lookup')}
-              className="max-sm:size-10 max-sm:px-0"
-              disabled={isBootstrapping}
-              size="sm"
-              title={t('按请求 ID 查询请求记录', 'Look up a request by ID')}
-              variant="outline"
-              onClick={() => setLookupOpen(true)}
-            >
-              <SearchIcon />
-              <span className="max-sm:sr-only">{t('请求查询', 'Lookup')}</span>
-            </Button>
+            </Hint>
             <PreferencesMenu
               onSignOut={
                 authState?.configured && pw

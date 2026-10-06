@@ -4,6 +4,7 @@ import { EyeIcon, EyeOffIcon, KeyRoundIcon, ShieldCheckIcon } from 'lucide-react
 import { setup } from '@/api/auth'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
@@ -129,16 +130,17 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
                     value={password}
                   />
                   <InputGroupAddon align="inline-end">
-                    <Button
-                      aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                      size="icon-xs"
-                      title={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                      type="button"
-                      variant="ghost"
-                      onClick={() => setShow((visible) => !visible)}
-                    >
-                      {show ? <EyeOffIcon /> : <EyeIcon />}
-                    </Button>
+                    <Hint label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}>
+                      <Button
+                        aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => setShow((visible) => !visible)}
+                      >
+                        {show ? <EyeOffIcon /> : <EyeIcon />}
+                      </Button>
+                    </Hint>
                   </InputGroupAddon>
                 </InputGroup>
                 {/* `match`：错误来自前端校验或接口，不是原生表单校验，得显式打开才显示。 */}

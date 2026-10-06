@@ -77,6 +77,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 import {
   DurationSetting,
@@ -258,17 +259,18 @@ export function AccessSettingsContent() {
                 value={draft}
               />
               <InputGroupAddon className="gap-4" align="inline-end">
-                <Button
-                  aria-label={show
-                    ? t('隐藏接入 Key', 'Hide access key')
-                    : t('显示接入 Key', 'Show access key')}
-                  size="icon-sm"
-                  title={show ? t('隐藏', 'Hide') : t('显示', 'Show')}
-                  variant="ghost"
-                  onClick={() => setShow((visible) => !visible)}
-                >
-                  {show ? <EyeOffIcon /> : <EyeIcon />}
-                </Button>
+                <Hint label={show ? t('隐藏', 'Hide') : t('显示', 'Show')}>
+                  <Button
+                    aria-label={show
+                      ? t('隐藏接入 Key', 'Hide access key')
+                      : t('显示接入 Key', 'Show access key')}
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={() => setShow((visible) => !visible)}
+                  >
+                    {show ? <EyeOffIcon /> : <EyeIcon />}
+                  </Button>
+                </Hint>
                 {/* 只复制已保存的 Key：生成后没点保存就拿去配客户端，请求会一律 401。 */}
                 <CopyButton
                   text={currentKey}
@@ -323,22 +325,21 @@ export function AccessSettingsContent() {
               <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>
               <div className="flex shrink-0 items-center gap-3">
                 {currentKey && (
-                  <Button
-                    type="button"
-                    aria-label={showSnippetKey
-                      ? t('隐藏接入片段中的 Key', 'Hide the key in the setup snippet')
-                      : t('显示接入片段中的 Key', 'Show the key in the setup snippet')}
-                    size="icon"
-                    title={showSnippetKey
-                      ? t('隐藏 Key', 'Hide key')
-                      : t('显示 Key', 'Show key')}
-                    variant="ghost"
-                    onClick={() => setRevealedSnippetKey((revealed) => (
-                      revealed === currentKey ? null : currentKey
-                    ))}
-                  >
-                    {showSnippetKey ? <EyeOffIcon /> : <EyeIcon />}
-                  </Button>
+                  <Hint label={showSnippetKey ? t('隐藏 Key', 'Hide key') : t('显示 Key', 'Show key')}>
+                    <Button
+                      type="button"
+                      aria-label={showSnippetKey
+                        ? t('隐藏接入片段中的 Key', 'Hide the key in the setup snippet')
+                        : t('显示接入片段中的 Key', 'Show the key in the setup snippet')}
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setRevealedSnippetKey((revealed) => (
+                        revealed === currentKey ? null : currentKey
+                      ))}
+                    >
+                      {showSnippetKey ? <EyeOffIcon /> : <EyeIcon />}
+                    </Button>
+                  </Hint>
                 )}
                 <CopyButton
                   text={snippet}
@@ -1657,41 +1658,46 @@ function CopyButton({
 
   return (
     <>
-      <Button
-        type="button"
-        aria-label={copied ? successLabel : disabledReason ?? idleLabel}
-        className={copied ? 'text-success-foreground' : undefined}
-        disabled={disabledReason !== undefined}
-        size={size}
-        title={copied ? successLabel : disabledReason ?? idleLabel}
-        variant="ghost"
-        onClick={async () => {
-          if (!text) return
-          const attempt = ++copyAttemptRef.current
-          const copiedSuccessfully = await copyText(text)
-          if (attempt !== copyAttemptRef.current) return
-
-          if (copiedSuccessfully) {
-            if (resetTimerRef.current !== null) {
-              window.clearTimeout(resetTimerRef.current)
-            }
-            setCopied(true)
-            resetTimerRef.current = window.setTimeout(() => {
-              setCopied(false)
-              resetTimerRef.current = null
-            }, 1200)
-            return
-          }
-          toastManager.add({
-            title: t('复制失败', 'Copy failed'),
-            description: copyErrorDescription
-              ?? t('请手动选择并复制内容。', 'Select the content and copy it manually.'),
-            type: 'error',
-          })
-        }}
-      >
-        {copied ? <CheckIcon /> : <ClipboardIcon />}
-      </Button>
+      {/* 提示挂在外层 span 上：禁用的 Button 带 pointer-events-none，挂在它自己身上时
+          「为什么不能复制」那句永远悬停不出来。 */}
+      <Hint label={copied ? successLabel : disabledReason ?? idleLabel}>
+        <span className="inline-flex">
+          <Button
+            type="button"
+            aria-label={copied ? successLabel : disabledReason ?? idleLabel}
+            className={copied ? 'text-success-foreground' : undefined}
+            disabled={disabledReason !== undefined}
+            size={size}
+            variant="ghost"
+            onClick={async () => {
+              if (!text) return
+              const attempt = ++copyAttemptRef.current
+              const copiedSuccessfully = await copyText(text)
+              if (attempt !== copyAttemptRef.current) return
+    
+              if (copiedSuccessfully) {
+                if (resetTimerRef.current !== null) {
+                  window.clearTimeout(resetTimerRef.current)
+                }
+                setCopied(true)
+                resetTimerRef.current = window.setTimeout(() => {
+                  setCopied(false)
+                  resetTimerRef.current = null
+                }, 1200)
+                return
+              }
+              toastManager.add({
+                title: t('复制失败', 'Copy failed'),
+                description: copyErrorDescription
+                  ?? t('请手动选择并复制内容。', 'Select the content and copy it manually.'),
+                type: 'error',
+              })
+            }}
+          >
+            {copied ? <CheckIcon /> : <ClipboardIcon />}
+          </Button>
+        </span>
+      </Hint>
       <span className="sr-only" role="status" aria-live="polite">
         {copied ? successLabel : ''}
       </span>

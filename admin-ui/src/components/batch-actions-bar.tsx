@@ -27,6 +27,7 @@ import {
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { toastManager } from '@/components/ui/toast'
 import { Toolbar } from '@/components/ui/toolbar'
+import { Hint } from '@/components/ui/tooltip'
 
 /** 批量调优先级的三种方式：统一设为某档，或各自提高 / 降低一档（保留相对顺序）。 */
 const PRIORITY_MODE_ITEMS = [
@@ -364,9 +365,11 @@ export function BatchActionsBar({
               <span className="text-muted-foreground"> / {formattedTotal}</span>
             </span>
           </label>
-          <Button size="icon-sm" variant="ghost" onClick={onClear} title={t('清空选择', 'Clear selection')} aria-label={t('清空选择', 'Clear selection')}>
-            <XIcon />
-          </Button>
+          <Hint label={t('清空选择', 'Clear selection')}>
+            <Button size="icon-sm" variant="ghost" onClick={onClear} aria-label={t('清空选择', 'Clear selection')}>
+              <XIcon />
+            </Button>
+          </Hint>
           </div>
 
           <Toolbar className="gap-2 border-0 bg-transparent p-0 shadow-none sm:gap-3">
@@ -381,19 +384,20 @@ export function BatchActionsBar({
             </Button>
           </Toolbar>
 
-          <Button
-            size="sm"
-            variant="outline"
-            aria-expanded={advancedOpen}
-            aria-controls="batch-advanced-settings"
-            onClick={() => setAdvancedOpen((open) => !open)}
-            aria-label={t('更多设置', 'More settings')}
-            title={t('更多设置', 'More settings')}
-          >
-            <SlidersHorizontalIcon className="sm:hidden" />
-            <span className="max-sm:sr-only">{t('更多设置', 'More settings')}</span>
-            <ChevronDownIcon className={cn('size-4 transition-transform max-sm:hidden', advancedOpen && 'rotate-180')} />
-          </Button>
+          <Hint label={t('更多设置', 'More settings')}>
+            <Button
+              size="sm"
+              variant="outline"
+              aria-expanded={advancedOpen}
+              aria-controls="batch-advanced-settings"
+              onClick={() => setAdvancedOpen((open) => !open)}
+              aria-label={t('更多设置', 'More settings')}
+            >
+              <SlidersHorizontalIcon className="sm:hidden" />
+              <span className="max-sm:sr-only">{t('更多设置', 'More settings')}</span>
+              <ChevronDownIcon className={cn('size-4 transition-transform max-sm:hidden', advancedOpen && 'rotate-180')} />
+            </Button>
+          </Hint>
         </div>
 
         {advancedOpen && (

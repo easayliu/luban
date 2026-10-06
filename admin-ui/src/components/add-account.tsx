@@ -18,6 +18,7 @@ import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 
 interface AuthorizeRequest {
   session: number
@@ -168,24 +169,25 @@ export function AddAccount({
                       {t('打开授权页面', 'Open authorization page')}
                     </Button>
                   </a>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    title={t('复制后可在其他浏览器或设备上完成授权', 'Copy it to authorize in another browser or on another device')}
-                    onClick={async () => {
-                      const copied = await copyText(authUrl)
-                      toastManager.add(copied
-                        ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
-                        : {
-                            title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
-                            description: authUrl,
-                            type: 'error',
-                          })
-                    }}
-                  >
-                    <CopyIcon />
-                    {t('复制链接', 'Copy link')}
-                  </Button>
+                  <Hint label={t('复制后可在其他浏览器或设备上完成授权', 'Copy it to authorize in another browser or on another device')}>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={async () => {
+                        const copied = await copyText(authUrl)
+                        toastManager.add(copied
+                          ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
+                          : {
+                              title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
+                              description: authUrl,
+                              type: 'error',
+                            })
+                      }}
+                    >
+                      <CopyIcon />
+                      {t('复制链接', 'Copy link')}
+                    </Button>
+                  </Hint>
                   {/* 链接有时效，授权页开久了会过期；关掉弹窗再开也行，这里给个就近的出口。 */}
                   <Button
                     type="button"

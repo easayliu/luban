@@ -31,6 +31,7 @@ import { toastManager } from '@/components/ui/toast'
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
+import { Hint } from '@/components/ui/tooltip'
 import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 
 /** 冻结流水每页条数可选值。后端上限 1000。 */
@@ -54,10 +55,12 @@ function Distribution({ items, empty }: { items: ValueCount[]; empty: string }) 
   return (
     <div className="flex flex-wrap gap-1">
       {items.map((it) => (
-        <Badge key={it.value} variant="outline" className="max-w-72 font-mono text-[11px]" title={it.value}>
-          <span className="truncate">{it.value}</span>
-          <span className="ml-1 text-muted-foreground">×{it.count}</span>
-        </Badge>
+        <Hint key={it.value} label={it.value}>
+          <Badge variant="outline" className="max-w-72 font-mono text-[11px]">
+            <span className="truncate">{it.value}</span>
+            <span className="ml-1 text-muted-foreground">×{it.count}</span>
+          </Badge>
+        </Hint>
       ))}
     </div>
   )
@@ -348,13 +351,15 @@ function FrozenRow({ log, trigger }: { log: UsageLog; trigger: boolean }) {
           {trigger && <Badge variant="error" className="ml-1">{t('触发', 'trigger')}</Badge>}
         </TableCell>
         <TableCell><Badge variant={statusVariant(log.status)}>{log.status}</Badge></TableCell>
-        <TableCell className="max-w-36 truncate" title={log.model ?? undefined}>{log.model ?? '—'}</TableCell>
-        <TableCell className="whitespace-nowrap font-mono" title={deviceTitle(log)}>
-          {log.device_id?.slice(0, 8) ?? '—'}
-          <span className="text-muted-foreground">→{log.device_id_out?.slice(0, 8) ?? '—'}</span>
-        </TableCell>
-        <TableCell className="max-w-44 truncate font-mono" title={log.ua ?? undefined}>{log.ua ?? '—'}</TableCell>
-        <TableCell className="max-w-40 truncate font-mono" title={log.proxy ?? undefined}>{log.proxy ?? t('直连', 'direct')}</TableCell>
+        <Hint label={log.model}><TableCell className="max-w-36 truncate">{log.model ?? '—'}</TableCell></Hint>
+        <Hint label={deviceTitle(log)}>
+          <TableCell className="whitespace-nowrap font-mono">
+            {log.device_id?.slice(0, 8) ?? '—'}
+            <span className="text-muted-foreground">→{log.device_id_out?.slice(0, 8) ?? '—'}</span>
+          </TableCell>
+        </Hint>
+        <Hint label={log.ua}><TableCell className="max-w-44 truncate font-mono">{log.ua ?? '—'}</TableCell></Hint>
+        <Hint label={log.proxy}><TableCell className="max-w-40 truncate font-mono">{log.proxy ?? t('直连', 'direct')}</TableCell></Hint>
         <TableCell>
           <div className="flex flex-wrap gap-1">
             {flags.map((f) => <Badge key={f} variant="outline">{f}</Badge>)}
@@ -368,10 +373,12 @@ function FrozenRow({ log, trigger }: { log: UsageLog; trigger: boolean }) {
         </TableCell>
         <TableCell className="max-w-64">
           {log.error_type || log.error_message ? (
-            <span className="font-mono" title={log.error_message ?? undefined}>
-              {log.error_type && <span className="text-muted-foreground">{log.error_type}: </span>}
-              <span className="line-clamp-2">{log.error_message}</span>
-            </span>
+            <Hint label={log.error_message}>
+              <span className="font-mono">
+                {log.error_type && <span className="text-muted-foreground">{log.error_type}: </span>}
+                <span className="line-clamp-2">{log.error_message}</span>
+              </span>
+            </Hint>
           ) : '—'}
         </TableCell>
         <TableCell>
@@ -555,21 +562,25 @@ export function BanEventsDialog({
                           </TableCell>
                           <TableCell className="whitespace-nowrap"><Badge variant="outline">{sourceLabel(ev.source, t)}</Badge></TableCell>
                           <TableCell>{ev.status == null ? '—' : <Badge variant={statusVariant(ev.status)}>{ev.status}</Badge>}</TableCell>
-                          <TableCell className="max-w-md truncate font-mono text-xs" title={ev.reason}>{ev.reason}</TableCell>
+                          <Hint label={ev.reason}>
+                            <TableCell className="max-w-md truncate font-mono text-xs">{ev.reason}</TableCell>
+                          </Hint>
                           <TableCell className="whitespace-nowrap text-right tabular-nums">
                             {/* 表格这一格不折行，写全「入站 3 → 出站 2 台」会把整张表撑宽、挤掉右侧的导出按钮；
-                                这里用「3→2 台」，完整说法在 title 里。窄屏的堆叠行能折行，照写全称。 */}
-                            <span
-                              title={t(
+                                这里用「3→2 台」，完整说法在悬浮提示里。窄屏的堆叠行能折行，照写全称。 */}
+                            <Hint
+                              label={t(
                                 `封号前 7 天：入站 ${ev.devices_7d} 台 → 出站 ${ev.devices_out_7d} 台`,
                                 `7 days before: ${ev.devices_7d} inbound → ${ev.devices_out_7d} outbound devices`,
                               )}
                             >
-                              {t(
-                                `${ev.requests_7d} 次 · ${ev.devices_7d}→${ev.devices_out_7d} 台`,
-                                `${ev.requests_7d} req · ${ev.devices_7d}→${ev.devices_out_7d} dev`,
-                              )}
-                            </span>
+                              <span>
+                                {t(
+                                  `${ev.requests_7d} 次 · ${ev.devices_7d}→${ev.devices_out_7d} 台`,
+                                  `${ev.requests_7d} req · ${ev.devices_7d}→${ev.devices_out_7d} dev`,
+                                )}
+                              </span>
+                            </Hint>
                           </TableCell>
                         </TableRow>
                         {isOpen && (

@@ -82,7 +82,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
@@ -918,8 +918,8 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                     </span>
                     <span>{t('台设备', metrics.deviceCount === 1 ? 'device' : 'devices')}</span>
                   </TooltipTrigger>
-                  {/* 原来挂在原生 `title` 上：手机上完全出不来，而这句写的正是「这个数是怎么算的、
-                      点下去会筛出什么」。这是概览这一片最后一处原生 title。 */}
+                  {/* 原来挂在原生 `title` 上，手机上完全出不来，而这句写的正是「这个数是怎么算的、
+                      点下去会筛出什么」。换成 Tooltip 后桌面悬停可见；这枚是按钮，触屏上长按弹出。 */}
                   <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
                     {deviceStatus}
                   </TooltipPopup>
@@ -947,10 +947,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 // 是这类常驻列表最常见的抱怨，而这块本来就在讲「数据有多新」。
                 <Tooltip>
                   <TooltipTrigger
-                    render={<button type="button" />}
+                    // disabled 必须写在 render 的按钮上：写在 TooltipTrigger 上只会禁用提示，按钮照样能点。
+                    render={<button type="button" disabled={isLoading || isFetching} />}
                     className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
                     onClick={actions.onRetry}
-                    disabled={isLoading || isFetching}
                     aria-label={t('立即刷新账号数据', 'Refresh account data now')}
                   >
                     <span className="flex size-3.5 shrink-0 items-center justify-center" aria-hidden>
@@ -1157,21 +1157,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 variant="outline"
                 aria-label={t('账号视图', 'Account view')}
               >
-                <ToggleGroupItem
-                  value="card"
-                  aria-label={t('卡片视图', 'Card view')}
-                  title={t('卡片视图', 'Card view')}
-                >
-                  <LayoutGridIcon />
-                </ToggleGroupItem>
+                <Hint label={t('卡片视图', 'Card view')}>
+                  <ToggleGroupItem value="card" aria-label={t('卡片视图', 'Card view')}>
+                    <LayoutGridIcon />
+                  </ToggleGroupItem>
+                </Hint>
                 <ToggleGroupSeparator />
-                <ToggleGroupItem
-                  value="list"
-                  aria-label={t('列表视图', 'List view')}
-                  title={t('列表视图', 'List view')}
-                >
-                  <ListIcon />
-                </ToggleGroupItem>
+                <Hint label={t('列表视图', 'List view')}>
+                  <ToggleGroupItem value="list" aria-label={t('列表视图', 'List view')}>
+                    <ListIcon />
+                  </ToggleGroupItem>
+                </Hint>
               </ToggleGroup>
             </ToolbarGroup>
           </Toolbar>

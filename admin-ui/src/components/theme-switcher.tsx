@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { MonitorIcon, MoonIcon, SunIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Hint } from '@/components/ui/tooltip'
 import { useI18n } from '@/lib/i18n'
 import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/lib/theme'
 
@@ -27,18 +28,19 @@ export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
   const label = t(`外观：${name(mode)}，点击切换为${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)
 
   return (
-    <Button
-      type="button"
-      size={compact ? 'icon-lg' : 'icon-sm'}
-      variant="outline"
-      onClick={() => {
-        setMode(next)
-        writeThemeMode(next)
-      }}
-      aria-label={label}
-      title={label}
-    >
-      <Icon />
-    </Button>
+    <Hint label={label}>
+      <Button
+        type="button"
+        size={compact ? 'icon-lg' : 'icon-sm'}
+        variant="outline"
+        onClick={() => {
+          setMode(next)
+          writeThemeMode(next)
+        }}
+        aria-label={label}
+      >
+        <Icon />
+      </Button>
+    </Hint>
   )
 }

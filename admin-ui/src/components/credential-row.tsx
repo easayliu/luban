@@ -71,7 +71,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   cn,
   displayCredentialLabel,
@@ -154,22 +154,25 @@ export function CredentialListHeader({
     const Arrow = active && dir === 'asc' ? ChevronUpIcon : ChevronDownIcon
 
     return (
-      <Button
-        type="button"
-        size="xs"
-        variant="ghost"
-        onClick={() => onSortChange(key)}
-        className={cn(
-          'w-full px-0 text-2xs font-semibold uppercase tracking-[0.06em] sm:text-2xs',
-          numeric ? 'justify-end text-right' : 'justify-start text-left',
-        )}
-        title={active
+      <Hint
+        label={active
           ? t(`按${label}排序（点击切换升降序）`, `Sort by ${label} (click to reverse direction)`)
           : t(`按${label}排序`, `Sort by ${label}`)}
       >
-        {label}
-        <Arrow className={cn(!active && 'opacity-0')} />
-      </Button>
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost"
+          onClick={() => onSortChange(key)}
+          className={cn(
+            'w-full px-0 text-2xs font-semibold uppercase tracking-[0.06em] sm:text-2xs',
+            numeric ? 'justify-end text-right' : 'justify-start text-left',
+          )}
+        >
+          {label}
+          <Arrow className={cn(!active && 'opacity-0')} />
+        </Button>
+      </Hint>
     )
   }
   const sortProps = (key: SortKey) =>
@@ -322,9 +325,11 @@ export const CredentialRow = memo(function CredentialRow({
                 />
               )}
               <div className="min-w-0 flex-1">
-                <h3 className="min-w-0 truncate font-semibold text-sm leading-snug" title={credentialLabel}>
-                  <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">{credentialLabel}</a>
-                </h3>
+                <Hint label={credentialLabel}>
+                  <h3 className="min-w-0 truncate font-semibold text-sm leading-snug">
+                    <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">{credentialLabel}</a>
+                  </h3>
+                </Hint>
                 <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                   <CalendarDaysIcon className="size-3 shrink-0" />
                   <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
@@ -410,51 +415,54 @@ export const CredentialRow = memo(function CredentialRow({
               </MobileFact>
               {deviceLimited && (
               <MobileFact label={t('设备', 'Devices')}>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => setDevicesOpen(true)}
-                  title={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}
-                  aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-                >
-                  <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
-                    {cred.device_count}/{effectiveLimit}
-                  </Badge>
-                  {/* 同上：跟随默认不占这一行的宽度，见 [devicePolicyMeta]。 */}
-                  {!policy.isDefault && <span className="text-muted-foreground">{policy.label}</span>}
-                </Button>
+                <Hint label={t(`查看已绑定设备 · ${policy.label}策略`, `View bound devices · ${policy.label} policy`)}>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => setDevicesOpen(true)}
+                    aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
+                  >
+                    <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
+                      {cred.device_count}/{effectiveLimit}
+                    </Badge>
+                    {/* 同上：跟随默认不占这一行的宽度，见 [devicePolicyMeta]。 */}
+                    {!policy.isDefault && <span className="text-muted-foreground">{policy.label}</span>}
+                  </Button>
+                </Hint>
               </MobileFact>
               )}
               <MobileFact label={t('会话', 'Sessions')}>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => setDevicesOpen(true)}
-                  title={t(`查看会话 · ${sessionPolicy.label}策略`, `View sessions · ${sessionPolicy.label} policy`)}
-                  aria-label={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
-                >
-                  <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
-                    {cred.session_count}/{sessionEffectiveLimit}
-                  </Badge>
-                  {!sessionPolicy.isDefault && <span className="text-muted-foreground">{sessionPolicy.label}</span>}
-                </Button>
+                <Hint label={t(`查看会话 · ${sessionPolicy.label}策略`, `View sessions · ${sessionPolicy.label} policy`)}>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => setDevicesOpen(true)}
+                    aria-label={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
+                  >
+                    <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
+                      {cred.session_count}/{sessionEffectiveLimit}
+                    </Badge>
+                    {!sessionPolicy.isDefault && <span className="text-muted-foreground">{sessionPolicy.label}</span>}
+                  </Button>
+                </Hint>
               </MobileFact>
               <MobileFact label={t('当前 RPM', 'Current RPM')}>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => setRpmOpen(true)}
-                  title={t(`调整 RPM 上限 · ${rpmPolicy.label}策略`, `Adjust the RPM limit · ${rpmPolicy.label} policy`)}
-                  aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
-                >
-                  <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
-                    {cred.rpm}/{rpmEffectiveLimit}
-                  </Badge>
-                  {!rpmPolicy.isDefault && <span className="text-muted-foreground">{rpmPolicy.label}</span>}
-                </Button>
+                <Hint label={t(`调整 RPM 上限 · ${rpmPolicy.label}策略`, `Adjust the RPM limit · ${rpmPolicy.label} policy`)}>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => setRpmOpen(true)}
+                    aria-label={t(`调整 ${credentialLabel} 的 RPM 上限`, `Adjust the RPM limit for ${credentialLabel}`)}
+                  >
+                    <Badge variant={rpmUsage.variant} size="sm" className="tabular-nums">
+                      {cred.rpm}/{rpmEffectiveLimit}
+                    </Badge>
+                    {!rpmPolicy.isDefault && <span className="text-muted-foreground">{rpmPolicy.label}</span>}
+                  </Button>
+                </Hint>
               </MobileFact>
             </dl>
           </article>
@@ -476,14 +484,15 @@ export const CredentialRow = memo(function CredentialRow({
         <TableCell className={cn(COL.account, 'overflow-hidden')}>
           <div className="flex min-w-0 items-center">
             <div className="min-w-0 flex-1">
-              {/* 账号名超出列宽就截断：table-fixed 下不截断会压到相邻列上。全名在 title 里。 */}
-              <a
-                href={credentialDetailHref(cred.id)}
-                className="block min-w-0 truncate font-semibold text-sm leading-snug rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                title={credentialLabel}
-              >
-                {credentialLabel}
-              </a>
+              {/* 账号名超出列宽就截断：table-fixed 下不截断会压到相邻列上。全名在悬浮提示里。 */}
+              <Hint label={credentialLabel}>
+                <a
+                  href={credentialDetailHref(cred.id)}
+                  className="block min-w-0 truncate font-semibold text-sm leading-snug rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  {credentialLabel}
+                </a>
+              </Hint>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                 <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
                 <span aria-hidden="true">·</span>
@@ -826,13 +835,14 @@ function ScheduleControl({
     <div className="flex shrink-0 flex-col items-end gap-3 xl:min-w-0 xl:flex-row xl:items-center xl:gap-2">
       <div className="flex shrink-0 items-center gap-2">
         {toggle.isPending && <Spinner />}
-        <Switch
-          checked={!cred.disabled}
-          onCheckedChange={(enabled) => toggle.mutate(!enabled)}
-          disabled={readOnly || toggle.isPending}
-          title={switchTitle(cred, language)}
-          aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
-        />
+        <Hint label={switchTitle(cred, language)}>
+          <Switch
+            checked={!cred.disabled}
+            onCheckedChange={(enabled) => toggle.mutate(!enabled)}
+            disabled={readOnly || toggle.isPending}
+            aria-label={`${credentialLabel}: ${switchTitle(cred, language)}`}
+          />
+        </Hint>
       </div>
       {/* 「已停用」与旁边那枚关着的开关是同一句话，不再挂徽章（开关的 aria-label 里照样念得到）。
           其余状态照挂：「限流暂停」时开关也是关的，但徽章说的是为什么关、什么时候回来。
@@ -903,7 +913,7 @@ function ListQuotaMeter({
   // **同一套** K/M 缩写（见 [formatCompactNumber]）：不缩的话 `1,177 · 266M` 是一行里两套量纲，
   // 而且千分位白占两个字符，最后被切掉尾巴的是右边的费用。缩完两者都带单位字母，靠位置与量级
   // 区分（请求数恒在最左、比 token 小几个数量级，`$` 标着钱），每个数是什么、精确值多少写在
-  // title 里（见下面的 summaryTitle）。卡片上是同一个表达，两种视图切过去不用重新认。
+  // 悬浮提示里（见下面的 summaryTitle）。卡片上是同一个表达，两种视图切过去不用重新认。
   const usageSummary = requests == null
     ? '—'
     : `${formatCompactNumber(requests)} · ${tokens == null ? '—' : formatTokens(tokens)} · ${cost == null ? '—' : formatUsd(cost)}`
@@ -919,29 +929,30 @@ function ListQuotaMeter({
   // 而不是留一条和「还没跑过请求」长得一模一样的空进度条。
   if (hasSnapshot && !reported) {
     return (
-      <div
-        className="flex w-full flex-col gap-2"
-        title={t(
+      <Hint
+        label={t(
           `上游从未为该账号返回 ${label} 窗口，表明其用量模型不含该窗口（并非数据缺失）`,
           `The upstream has never returned a ${label} window for this account, meaning its usage model has no such window (this is not missing data)`,
         )}
       >
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-baseline gap-1.5">
-            <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
-            <span
-              className={cn(
-                // 表格里与同列的用量摘要同一档（12px），不单独大一号。
-                'min-w-0 truncate text-xs tabular-nums text-muted-foreground',
-                !showLabel && 'leading-none',
-              )}
-            >
-              —
-            </span>
+        <div className="flex w-full flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-baseline gap-1.5">
+              <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
+              <span
+                className={cn(
+                  // 表格里与同列的用量摘要同一档（12px），不单独大一号。
+                  'min-w-0 truncate text-xs tabular-nums text-muted-foreground',
+                  !showLabel && 'leading-none',
+                )}
+              >
+                —
+              </span>
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground">{t('无此窗口', 'Not applicable')}</span>
           </div>
-          <span className="shrink-0 text-xs text-muted-foreground">{t('无此窗口', 'Not applicable')}</span>
         </div>
-      </div>
+      </Hint>
     )
   }
 
@@ -955,30 +966,29 @@ function ListQuotaMeter({
         )
       : t(`${label} 用量暂无数据`, `No ${label} usage data`)
     return (
-      <div
-        className="flex w-full flex-col gap-2"
-        title={emptyDetail}
-      >
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 items-baseline gap-1.5">
-            <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
-            {!showLabel && (
-              <SummaryValue hint={summaryTitle}>{expired ? '—' : usageSummary}</SummaryValue>
-            )}
+      <Hint label={emptyDetail}>
+        <div className="flex w-full flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-baseline gap-1.5">
+              <span className={cn('font-medium text-sm', !showLabel && 'sr-only')}>{label}</span>
+              {!showLabel && (
+                <SummaryValue hint={summaryTitle}>{expired ? '—' : usageSummary}</SummaryValue>
+              )}
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
           </div>
-          <span className="shrink-0 text-xs text-muted-foreground">{emptyLabel}</span>
+          {/* 两行的排法与有用量时保持一致（见下面那条注释）：第一行说用量，第二行是这个窗口的时间
+              维度——占位条虽然没有数据可画，长度与落点仍与隔壁格子、上下行对得齐（倒计时那一格
+              定宽，空着也占位）。 */}
+          <div className="flex items-center gap-2">
+            <div className="h-2 min-w-0 flex-1 bg-input" aria-hidden />
+            {!showLabel && <QuotaCountdown reset={reset} now={now} />}
+          </div>
+          {showLabel && !expired && (requests != null || cost != null || tokens != null || reset != null) && (
+            <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
+          )}
         </div>
-        {/* 两行的排法与有用量时保持一致（见下面那条注释）：第一行说用量，第二行是这个窗口的时间
-            维度——占位条虽然没有数据可画，长度与落点仍与隔壁格子、上下行对得齐（倒计时那一格
-            定宽，空着也占位）。 */}
-        <div className="flex items-center gap-2">
-          <div className="h-2 min-w-0 flex-1 bg-input" aria-hidden />
-          {!showLabel && <QuotaCountdown reset={reset} now={now} />}
-        </div>
-        {showLabel && !expired && (requests != null || cost != null || tokens != null || reset != null) && (
-          <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
-        )}
-      </div>
+      </Hint>
     )
   }
 
@@ -998,34 +1008,38 @@ function ListQuotaMeter({
     // 整行减去倒计时那一格还有 112px（2xl 128px），比没有倒计时之前的 88px 还长，而且每一行
     // 都是这个宽度。
     return (
-      <Meter value={percentage} max={100} title={title}>
-        <div className="flex min-w-0 items-baseline justify-between gap-2">
-          <MeterLabel className="sr-only">{label}</MeterLabel>
-          <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>
-          <MeterValue className="shrink-0 font-medium text-xs leading-none">{() => `${percentage}%`}</MeterValue>
-        </div>
-        <div className="flex items-center gap-2">
-          <MeterTrack className="min-w-0 flex-1">
-            <MeterIndicator className={METER_FILL[level]} />
-          </MeterTrack>
-          <QuotaCountdown reset={reset} now={now} />
-        </div>
-      </Meter>
+      <Hint label={title}>
+        <Meter value={percentage} max={100}>
+          <div className="flex min-w-0 items-baseline justify-between gap-2">
+            <MeterLabel className="sr-only">{label}</MeterLabel>
+            <SummaryValue hint={summaryTitle}>{usageSummary}</SummaryValue>
+            <MeterValue className="shrink-0 font-medium text-xs leading-none">{() => `${percentage}%`}</MeterValue>
+          </div>
+          <div className="flex items-center gap-2">
+            <MeterTrack className="min-w-0 flex-1">
+              <MeterIndicator className={METER_FILL[level]} />
+            </MeterTrack>
+            <QuotaCountdown reset={reset} now={now} />
+          </div>
+        </Meter>
+      </Hint>
     )
   }
   return (
-    <Meter value={percentage} max={100} title={title}>
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-baseline gap-1.5">
-          <MeterLabel>{label}</MeterLabel>
+    <Hint label={title}>
+      <Meter value={percentage} max={100}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <MeterLabel>{label}</MeterLabel>
+          </div>
+          <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
         </div>
-        <MeterValue className="font-medium leading-none">{() => `${percentage}%`}</MeterValue>
-      </div>
-      <MeterTrack>
-        <MeterIndicator className={METER_FILL[level]} />
-      </MeterTrack>
-      <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
-    </Meter>
+        <MeterTrack>
+          <MeterIndicator className={METER_FILL[level]} />
+        </MeterTrack>
+        <ListQuotaDetails requests={requests} cost={cost} tokens={tokens} reset={reset} />
+      </Meter>
+    </Hint>
   )
 }
 
@@ -1099,13 +1113,14 @@ function MobileCredentialRow({
                 aria-label={t(`选择 ${credentialLabel}`, `Select ${credentialLabel}`)}
               />
             )}
-            <a
-              href={credentialDetailHref(cred.id)}
-              className="min-w-0 flex-1 truncate font-semibold text-sm leading-snug outline-none after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
-              title={credentialLabel}
-            >
-              {credentialLabel}
-            </a>
+            <Hint label={credentialLabel}>
+              <a
+                href={credentialDetailHref(cred.id)}
+                className="min-w-0 flex-1 truncate font-semibold text-sm leading-snug outline-none after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+              >
+                {credentialLabel}
+              </a>
+            </Hint>
             <div className="relative z-10 -my-1 -mr-1.5 shrink-0">
               <CredentialActionsMenu
                 cred={cred}
@@ -1279,12 +1294,12 @@ function SummaryValue({ hint, children }: { hint?: string; children: ReactNode }
 
 /**
  * 「还有多久重置」——与卡片上那枚倒计时同一个表达（见 credential-card 里的同一段）：`text-2xs`
- * 的次要色、同一套 [formatCountdown] 缩写，精确到分的绝对时刻放在 title 里。两种视图看同一个数
+ * 的次要色、同一套 [formatCountdown] 缩写，精确到分的绝对时刻放在悬浮提示里。两种视图看同一个数
  * 时长得一样，从卡片切到表格不用重新认一遍。位置两边不同：卡片宽，进度条、百分比、倒计时三样
  * 挤一行仍留得下进度条；表格那格只有 11rem，百分比跟摘要走、倒计时跟进度条走，见那段排版注释。
  *
  * 倒计时靠页面那个 30 秒 tick 走（见 useNowSeconds），不会冻住；它受本地时钟偏差影响，只适合
- * 看个大概，要对准时刻的场合仍看 title 里的 [formatFullTime]。
+ * 看个大概，要对准时刻的场合仍看悬浮提示里的 [formatFullTime]。
  *
  * 已经重置过的窗口（`reset <= now`）不写字：那不是「到期时间」而是一段过去，格子右上角的
  * 「已重置」已经说明了状态，具体时刻在整格的悬浮提示里。上游没报重置时刻的同理留空。
@@ -1298,15 +1313,18 @@ function QuotaCountdown({ reset, now }: { reset: number | null; now: number }) {
   const { t, language } = useI18n()
   const pending = reset != null && reset > now
   return (
-    <span
-      className="w-9 shrink-0 whitespace-nowrap text-left text-2xs text-muted-foreground tabular-nums"
-      title={pending
+    <Hint
+      label={pending
         ? t(`${formatFullTime(reset, language)} 重置`, `Resets ${formatFullTime(reset, language)}`)
         : undefined}
-      aria-hidden={pending ? undefined : true}
     >
-      {pending ? formatCountdown(reset, now) : ''}
-    </span>
+      <span
+        className="w-9 shrink-0 whitespace-nowrap text-left text-2xs text-muted-foreground tabular-nums"
+        aria-hidden={pending ? undefined : true}
+      >
+        {pending ? formatCountdown(reset, now) : ''}
+      </span>
+    </Hint>
   )
 }
 
@@ -1449,24 +1467,25 @@ function SlotMeterRow({
         ? 'text-muted-foreground'
         : 'text-foreground'
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      aria-label={ariaLabel}
-      aria-haspopup="dialog"
-      className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center gap-x-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
-    >
-      <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-      <span className={cn('text-left tabular-nums', numberClass)}>
-        {count}/{limit > 0 ? limit : '∞'}
-      </span>
-      {limit > 0 && (
-        <span className="col-start-3 block h-1 w-full min-w-0 overflow-hidden rounded-full bg-muted" aria-hidden>
-          <span className={cn('block h-full rounded-full', METER_FILL[usage.level])} style={{ width: `${pct}%` }} />
+    <Hint label={title}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={ariaLabel}
+        aria-haspopup="dialog"
+        className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center gap-x-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+      >
+        <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <span className={cn('text-left tabular-nums', numberClass)}>
+          {count}/{limit > 0 ? limit : '∞'}
         </span>
-      )}
-    </button>
+        {limit > 0 && (
+          <span className="col-start-3 block h-1 w-full min-w-0 overflow-hidden rounded-full bg-muted" aria-hidden>
+            <span className={cn('block h-full rounded-full', METER_FILL[usage.level])} style={{ width: `${pct}%` }} />
+          </span>
+        )}
+      </button>
+    </Hint>
   )
 }
 

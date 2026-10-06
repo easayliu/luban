@@ -67,7 +67,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { toastManager } from '@/components/ui/toast'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { useSettingsQuery, useSettingsSave } from '@/components/setting-controls'
@@ -1425,16 +1425,17 @@ function RefusalGroup({
             <TooltipPopup>{formatFullTime(group.latest, language)}</TooltipPopup>
           </Tooltip>
         </button>
-        <Button
-          aria-label={t('删除这一组规则', 'Remove this rule group')}
-          title={t('删除这一组规则', 'Remove this rule group')}
-          size="icon"
-          variant="ghost"
-          className="shrink-0 text-muted-foreground hover:text-foreground"
-          onClick={onDeleteGroup}
-        >
-          <Trash2Icon />
-        </Button>
+        <Hint label={t('删除这一组规则', 'Remove this rule group')}>
+          <Button
+            aria-label={t('删除这一组规则', 'Remove this rule group')}
+            size="icon"
+            variant="ghost"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={onDeleteGroup}
+          >
+            <Trash2Icon />
+          </Button>
+        </Hint>
       </div>
       {open && (
         <div className="mt-2 ms-4 overflow-hidden rounded-md border">
@@ -1481,17 +1482,18 @@ function RefusalGroup({
                       </TooltipTrigger>
                       <TooltipPopup>{formatFullTime(row.expires_at, language)}</TooltipPopup>
                     </Tooltip>
-                    <Button
-                      aria-label={t('删除这条规则', 'Remove this rule')}
-                      title={t('删除这条规则', 'Remove this rule')}
-                      size="icon-xs"
-                      variant="ghost"
-                      className="shrink-0 text-muted-foreground hover:text-foreground"
-                      disabled={forgetPending}
-                      onClick={() => onForget(row)}
-                    >
-                      <Trash2Icon />
-                    </Button>
+                    <Hint label={t('删除这条规则', 'Remove this rule')}>
+                      <Button
+                        aria-label={t('删除这条规则', 'Remove this rule')}
+                        size="icon-xs"
+                        variant="ghost"
+                        className="shrink-0 text-muted-foreground hover:text-foreground"
+                        disabled={forgetPending}
+                        onClick={() => onForget(row)}
+                      >
+                        <Trash2Icon />
+                      </Button>
+                    </Hint>
                   </div>
                   {showing && body && (
                     <pre className="mt-1.5 max-h-52 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/50 p-2 font-mono leading-5 text-muted-foreground [overflow-wrap:anywhere]">
@@ -1760,17 +1762,18 @@ function LearnedRejections() {
             </Tooltip>
           </div>
         </div>
-        <Button
-          aria-label={t('删除这条规则', 'Remove this rule')}
-          title={t('删除这条规则', 'Remove this rule')}
-          size="icon"
-          variant="ghost"
-          className="shrink-0 text-muted-foreground hover:text-foreground"
-          disabled={forget.isPending}
-          onClick={() => forget.mutate(row)}
-        >
-          <Trash2Icon />
-        </Button>
+        <Hint label={t('删除这条规则', 'Remove this rule')}>
+          <Button
+            aria-label={t('删除这条规则', 'Remove this rule')}
+            size="icon"
+            variant="ghost"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            disabled={forget.isPending}
+            onClick={() => forget.mutate(row)}
+          >
+            <Trash2Icon />
+          </Button>
+        </Hint>
       </li>
     )
   }

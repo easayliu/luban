@@ -20,6 +20,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
+import { Hint } from '@/components/ui/tooltip'
 
 /** 批量测试的并发数：每条测试最长 15s，全串行几十条要等好几分钟；并发太高又会同时打满 ip-api 的限流。 */
 export const BATCH_TEST_CONCURRENCY = 4
@@ -251,9 +252,11 @@ export function ProxyBatchImportDialog({
                     </span>
                     <div className="min-w-0 flex-1">
                       {name && <p className="truncate text-sm">{name}</p>}
-                      <p className="truncate text-xs text-muted-foreground" title={item.url ? proxyMaskedUrl(item.url) : parsed.url}>
-                        {item.url ? proxyMaskedUrl(item.url) : parsed.url}
-                      </p>
+                      <Hint label={item.url ? proxyMaskedUrl(item.url) : parsed.url}>
+                        <p className="truncate text-xs text-muted-foreground">
+                          {item.url ? proxyMaskedUrl(item.url) : parsed.url}
+                        </p>
+                      </Hint>
                       {info && (
                         <p
                           className={`break-all text-xs ${item.status === 'invalid' || (item.url && results[item.url]?.ok === false) ? 'text-destructive-foreground' : 'text-muted-foreground'}`}
