@@ -33,8 +33,9 @@ pub(super) async fn get_metrics(
 // ---------- 缓存 & TTFT 趋势 ----------
 
 /// 趋势接口的查询串：回看多少小时、桶宽、本地时区偏移。桶宽与偏移由前端按它要画的格子
-/// 给（逐小时一格给 3600，逐天一格给 86400 加本地零点的偏移）：分位数没法从更细的桶合并，
-/// 后端得按前端的格子切；偏移限在 ±14 小时内，桶宽限在 1 分钟到整个保留期。
+/// 给（逐小时一格给 3600，逐天一格给 86400 加本地零点的偏移）。数据来自 15 分钟一格的预聚合，
+/// 故桶宽向上取整到 15 分钟的整数倍、偏移对齐到 15 分钟、窗口起点向上对齐到 15 分钟（见
+/// [`store::series_grid`]）；响应里的 `since` / `bucket_secs` 回的是规整之后实际用的值。
 #[derive(Deserialize)]
 pub(super) struct SeriesQuery {
     #[serde(default = "default_series_hours")]
@@ -54,14 +55,14 @@ fn default_bucket_secs() -> i64 {
 }
 
 impl SeriesQuery {
-    /// `(since, bucket_secs, tz_offset_secs)`，各自钳到合法范围。
+    /// `(since, bucket_secs, tz_offset_secs)`：先钳到合法范围，再规整成预聚合拼得出的网格。
     pub(super) fn normalized(&self) -> (i64, i64, i64) {
         let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
         let hours = self.hours.clamp(1, max_hours);
         let since = chrono::Utc::now().timestamp() - hours * 3600;
         let bucket = self.bucket_secs.clamp(60, store::USAGE_LOG_RETENTION_SECS);
         let tz = self.tz_offset_secs.clamp(-14 * 3600, 14 * 3600);
-        (since, bucket, tz)
+        store::series_grid(since, bucket, tz)
     }
 }
 
@@ -112,7 +113,7 @@ struct CacheSeriesResp {
     points: Vec<store::CacheBucket>,
     /// 整个窗口的合计。
     summary: store::CacheBucket,
-    /// 近 60 分钟的合计（不按桶对齐）。
+    /// 近 60 分钟的合计（起点向上对齐到 15 分钟）。
     recent: store::CacheBucket,
 }
 
@@ -136,7 +137,7 @@ struct TtftSeriesResp {
     since: i64,
     bucket_secs: i64,
     points: Vec<store::TtftBucket>,
-    /// 整个窗口的分位与吞吐（对整窗口的原始值算，不是各桶的平均）。
+    /// 整个窗口的分位与吞吐（合并整窗口的延迟分布再取分位，不是各桶的平均）。
     summary: store::TtftBucket,
     /// 近 60 分钟的分位与吞吐。
     recent: store::TtftBucket,

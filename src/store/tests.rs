@@ -1822,8 +1822,15 @@ fn unbind_device_frees_slot_and_is_scoped_to_credential() {
     assert_eq!(store.device_count(a).unwrap(), 1);
 }
 
-/// 延迟与缓存的趋势口径：分位数按桶内原始值算（nearest-rank）、桶边界按时区偏移切、
+/// 分位数来自指数直方图（OTel scale 5）：与 nearest-rank 精确值的相对误差在 1.1% 以内。
+fn assert_close(est: i64, exact: i64) {
+    let tol = (exact as f64 * 0.011).max(1.0);
+    assert!((est - exact).abs() as f64 <= tol, "估计 {est} 偏离精确值 {exact} 超过 1.1%");
+}
+
+/// 延迟与缓存的趋势口径：分位数 nearest-rank（直方图近似）、桶边界按时区偏移切、
 /// 吞吐只算生成阶段、汇总对整窗口算而不是各桶平均；按模型 / 按账号的拆分同一套数。
+/// 全部读预聚合（usage_rollup），不扫流水。
 #[test]
 fn latency_and_cache_series_use_percentiles_and_local_buckets() {
     let (store, ids) = store_with(&["a", "b"]);
@@ -1879,17 +1886,21 @@ fn latency_and_cache_series_use_percentiles_and_local_buckets() {
 
     // 分位数：p50 = 300、p95 = 500（nearest-rank：ceil(5×0.95)=5）、平均 300；吞吐 1000 tok/s。
     let recent = store.ttft_summary(now - 3600).unwrap();
-    assert_eq!((recent.count, recent.p50_ms, recent.p95_ms, recent.avg_ms), (5, 300, 500, 300));
+    assert_eq!((recent.count, recent.avg_ms), (5, 300), "条数与平均是精确累加的");
+    assert_close(recent.p50_ms, 300);
+    assert_close(recent.p95_ms, 500);
     assert!((recent.tokens_per_sec.unwrap() - 1000.0).abs() < 1e-6, "{:?}", recent.tokens_per_sec);
     // 整窗口（含三小时前那条）：六条，p50 取第 3 个 = 300，p95 取第 6 个 = 4000。
     let all = store.ttft_summary(now - 6 * 3600).unwrap();
-    assert_eq!((all.count, all.p50_ms, all.p95_ms), (6, 300, 4000));
+    assert_eq!(all.count, 6);
+    assert_close(all.p50_ms, 300);
+    assert_close(all.p95_ms, 4000);
     assert_eq!(all.ts, now - 6 * 3600);
     // 逐小时桶：两个桶，慢的那条在自己的桶里；桶起点按偏移对齐。
     let hourly = store.ttft_series(now - 6 * 3600, 3600, 0).unwrap();
     assert_eq!(hourly.len(), 2, "{hourly:?}");
     assert_eq!(hourly[0].count, 1);
-    assert_eq!(hourly[0].p95_ms, 4000);
+    assert_close(hourly[0].p95_ms, 4000);
     assert_eq!(hourly[0].tokens_per_sec, None, "没有输出 token 就没有吞吐");
     assert_eq!(hourly[0].ts % 3600, 0);
     let tz = 8 * 3600;
@@ -1898,8 +1909,9 @@ fn latency_and_cache_series_use_percentiles_and_local_buckets() {
     // 一次扫描出三样，与分开算的一致。
     let report = store.ttft_report(now - 6 * 3600, 3600, 0).unwrap();
     assert_eq!(report.points.len(), 2);
-    assert_eq!((report.summary.count, report.summary.p95_ms), (6, 4000));
-    assert_eq!((report.recent.count, report.recent.p50_ms), (5, 300));
+    assert_eq!((report.summary.count, report.recent.count), (6, 5));
+    assert_close(report.summary.p95_ms, 4000);
+    assert_close(report.recent.p50_ms, 300);
     // 一个空集：全零、吞吐 None。
     let none = store.ttft_summary(now + 10).unwrap();
     assert_eq!((none.count, none.p50_ms), (0, 0));
@@ -1922,40 +1934,33 @@ fn latency_and_cache_series_use_percentiles_and_local_buckets() {
     assert_eq!(cache_report.summary.input_tokens, 1100, "合计是各桶之和");
     assert_eq!(cache_report.recent.cached_tokens, 300);
 
-    // 两条趋势查询都要走覆盖索引、不回表：日志行很宽，回表才是按时间扫描的大头。
-    let plan = |sql: &str| -> String {
+    // 趋势与拆分都读预聚合，按主键（维度 + 桶）范围扫描，不碰流水表。
+    let plan = {
         let conn = store.conn.lock();
-        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        stmt.query_map([0i64], |r| r.get::<_, String>(3))
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT bucket, key, label, requests, ttft_hist \
+                   FROM usage_rollup WHERE dim = ?1 AND bucket >= ?2 ORDER BY bucket",
+            )
+            .unwrap();
+        stmt.query_map(params!["model", 0i64], |r| r.get::<_, String>(3))
             .unwrap()
             .map(|r| r.unwrap())
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    let latency_plan = plan(LATENCY_ROWS_SQL);
-    assert!(
-        latency_plan.contains("COVERING INDEX idx_usage_logs_latency"),
-        "延迟行要走部分覆盖索引: {latency_plan}"
-    );
-    let cache_plan = plan(
-        "SELECT (ts / 3600) * 3600, SUM(COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, \
-                     COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0)) + COALESCE(cache_read_tokens, 0)) \
-               FROM usage_logs WHERE ts >= ?1 GROUP BY 1",
-    );
-    assert!(
-        cache_plan.contains("COVERING INDEX idx_usage_logs_cache"),
-        "缓存序列要走覆盖索引: {cache_plan}"
-    );
+    assert!(plan.contains("SEARCH usage_rollup USING PRIMARY KEY (dim=? AND bucket>?)"), "{plan}");
 
     // 拆分：按模型请求数降序（opus 6 条在前），延迟只算成功的；按账号带 label，limit 生效。
     let by_model = store.usage_breakdown(now - 6 * 3600, BreakdownBy::Model, 10).unwrap();
     assert_eq!(by_model.len(), 2);
     assert_eq!(by_model[0].key, "claude-opus-5");
     assert_eq!(by_model[0].requests, 6);
-    assert_eq!((by_model[0].latency.count, by_model[0].latency.p50_ms), (5, 300));
+    assert_eq!(by_model[0].latency.count, 5);
+    assert_close(by_model[0].latency.p50_ms, 300);
     assert_eq!(by_model[0].cache.cached_tokens, 300);
     assert_eq!(by_model[1].key, "claude-sonnet-5");
-    assert_eq!(by_model[1].latency.p95_ms, 4000);
+    assert_close(by_model[1].latency.p95_ms, 4000);
     // 省钱：opus-5 输入 $5/MTok，命中 300 省 0.9×5×300e-6 = 0.00135，写入 100（5m 档）多付
     // 0.25×5×100e-6 = 0.000125 → 0.001225；sonnet 那组没缓存是 0；按模型拆没有套餐。
     assert!(
@@ -5112,4 +5117,327 @@ fn upgrade_initializes_slot_owners() {
         store.session_events(KC).unwrap().into_iter().map(|e| e.event).collect();
     assert_eq!(events, ["bound"], "C 不该被记成接手 A");
     assert!(store.session_events(KA).unwrap().is_empty());
+}
+
+// ---------- 用量预聚合（usage_rollup） ----------
+
+/// 桶下标按 OpenTelemetry 指数直方图的约定：下标 i 收 (b^i, b^(i+1)]，b = 2^(2^-5)。
+/// 2 的整数次幂恰好落在桶的上边界上。
+#[test]
+fn latency_hist_follows_otel_exponential_buckets() {
+    assert_eq!(LatencyHist::index(1), -1, "1 = b^0 是 (b^-1, b^0] 的上边界");
+    assert_eq!(LatencyHist::index(2), 31);
+    assert_eq!(LatencyHist::index(1024), 10 * 32 - 1);
+    assert_eq!(LatencyHist::index(3), 50, "log2(3)·32 = 50.7 → ceil 51 → 50");
+    assert_eq!(LatencyHist::index(0), -1, "0 ms 按 1 ms 记");
+    let mut h = LatencyHist::default();
+    for v in [1, 3, 3, 250, 1024, 60_000] {
+        h.record(v);
+    }
+    let bytes = h.encode();
+    assert_eq!(LatencyHist::decode(&bytes), Some(h.clone()), "编码往返");
+    assert_eq!(LatencyHist::decode(&bytes[..bytes.len() - 1]), None, "截断的数据不认");
+    assert_eq!(LatencyHist::decode(&[]), None);
+    assert_eq!(LatencyHist::default().percentile(0.5), 0, "空直方图");
+}
+
+/// 一个确定性的伪随机序列（xorshift），测试数据可复现。
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// 分位数估计与 nearest-rank 精确值的相对误差不超过 (b-1)/(b+1) ≈ 1.08%（再加 1 ms 取整）。
+#[test]
+fn latency_hist_percentiles_stay_within_relative_error() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15;
+    let mut values: Vec<i64> = (0..20_000)
+        .map(|_| {
+            // 对数均匀地铺在 50 ms ～ 120 s：TTFT 实际落的范围。
+            let u = (xorshift(&mut seed) % 1_000_000) as f64 / 1_000_000.0;
+            (50.0 * (120_000.0f64 / 50.0).powf(u)).round() as i64
+        })
+        .collect();
+    let mut h = LatencyHist::default();
+    for &v in &values {
+        h.record(v);
+    }
+    values.sort_unstable();
+    for p in [0.5, 0.95, 0.99] {
+        let rank = ((values.len() as f64 * p).ceil() as usize).clamp(1, values.len());
+        let exact = values[rank - 1];
+        let est = h.percentile(p);
+        let rel = (est - exact).abs() as f64 / exact as f64;
+        assert!(
+            rel <= 0.0109 || (est - exact).abs() <= 1,
+            "p{p}: 估计 {est}，精确 {exact}，相对误差 {rel}"
+        );
+    }
+}
+
+/// 随机写一批流水，汇总读出来的拆分表与趋势合计要与从原始行精确算出来的一致：可累加的各项
+/// 逐一相等，分位数在 1.1% 以内。
+#[test]
+fn rollup_matches_aggregates_computed_from_raw_logs() {
+    let (store, ids) = store_with(&["a", "b", "c"]);
+    let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+    // 窗口起点对齐到 15 分钟，免得边缘那一桶的取舍影响比对。
+    let since = first_bucket(now - 6 * 3600);
+    let models = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+    let mut seed = 42u64;
+    let mut raw = Vec::new();
+    for _ in 0..3000 {
+        let r = xorshift(&mut seed);
+        let cred = ids[(r % 3) as usize];
+        let model = models[(r / 3 % 3) as usize];
+        let status: u16 = if r.is_multiple_of(10) { 529 } else { 200 };
+        let ttft = 100 + (xorshift(&mut seed) % 20_000) as i64;
+        let rec = UsageRecord {
+            cred_id: Some(cred),
+            cred_label: format!("label-{cred}"),
+            model: Some(model.into()),
+            status,
+            has_usage: true,
+            input_tokens: Some((r % 5000) as i64),
+            output_tokens: Some((r % 3000) as i64),
+            cache_creation_tokens: (!r.is_multiple_of(7)).then_some((r % 900) as i64),
+            cache_5m_tokens: Some((r % 400) as i64),
+            cache_1h_tokens: Some((r % 300) as i64),
+            cache_read_tokens: Some((r % 20_000) as i64),
+            ttft_ms: (!r.is_multiple_of(13)).then_some(ttft),
+            total_ms: Some(ttft + (r % 30_000) as i64),
+            ..Default::default()
+        };
+        let ts = since + (xorshift(&mut seed) % (now - since).max(1) as u64) as i64;
+        store.insert_usage_log_at(&rec, Some(ts)).unwrap();
+        raw.push(rec);
+    }
+
+    // 从原始行精确算：按模型分组的请求数、token、省下的钱、延迟平均 / 吞吐 / 分位。
+    struct Exact {
+        requests: i64,
+        input: i64,
+        cached: i64,
+        written: i64,
+        saved: f64,
+        ttft: Vec<i64>,
+        gen_tokens: i64,
+        gen_ms: i64,
+    }
+    let mut exact: HashMap<String, Exact> = HashMap::new();
+    for rec in &raw {
+        let e = exact.entry(rec.model.clone().unwrap()).or_insert(Exact {
+            requests: 0,
+            input: 0,
+            cached: 0,
+            written: 0,
+            saved: 0.0,
+            ttft: vec![],
+            gen_tokens: 0,
+            gen_ms: 0,
+        });
+        let plain = rec.input_tokens.unwrap_or(0);
+        let cached = rec.cache_read_tokens.unwrap_or(0);
+        let written = rec
+            .cache_creation_tokens
+            .unwrap_or(rec.cache_5m_tokens.unwrap_or(0) + rec.cache_1h_tokens.unwrap_or(0));
+        e.requests += 1;
+        e.input += plain + written + cached;
+        e.cached += cached;
+        e.written += written;
+        e.saved += cache_saved_usd(
+            rec.model.as_deref(),
+            plain,
+            cached,
+            rec.cache_creation_tokens,
+            rec.cache_5m_tokens,
+            rec.cache_1h_tokens,
+        );
+        if rec.status == 200
+            && let Some(t) = rec.ttft_ms
+        {
+            e.ttft.push(t);
+            if let (Some(total), Some(out)) = (rec.total_ms, rec.output_tokens)
+                && total > t
+                && out > 0
+            {
+                e.gen_tokens += out;
+                e.gen_ms += total - t;
+            }
+        }
+    }
+    let nearest = |sorted: &[i64], p: f64| {
+        sorted[((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1]
+    };
+    let rows = store.usage_breakdown(since, BreakdownBy::Model, 10).unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        let e = exact.get_mut(&row.key).unwrap();
+        e.ttft.sort_unstable();
+        assert_eq!(row.requests, e.requests);
+        assert_eq!(
+            (row.cache.input_tokens, row.cache.cached_tokens, row.cache.written_tokens),
+            (e.input, e.cached, e.written)
+        );
+        assert!(
+            (row.cache_saved_usd - e.saved).abs() < 1e-9,
+            "{} vs {}",
+            row.cache_saved_usd,
+            e.saved
+        );
+        assert_eq!(row.latency.count, e.ttft.len() as i64);
+        assert_eq!(row.latency.avg_ms, e.ttft.iter().sum::<i64>() / e.ttft.len() as i64);
+        let tps = e.gen_tokens as f64 * 1000.0 / e.gen_ms as f64;
+        assert!((row.latency.tokens_per_sec.unwrap() - tps).abs() < 1e-9);
+        assert_close(row.latency.p50_ms, nearest(&e.ttft, 0.5));
+        assert_close(row.latency.p95_ms, nearest(&e.ttft, 0.95));
+    }
+    // 按账号拆与整窗口合计：请求数加起来等于总数，缓存合计与按模型的一致。
+    let by_cred = store.usage_breakdown(since, BreakdownBy::Account, 10).unwrap();
+    assert_eq!(by_cred.iter().map(|r| r.requests).sum::<i64>(), 3000);
+    let mut labels: Vec<&str> = by_cred.iter().map(|r| r.label.as_str()).collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["a", "b", "c"], "号还在，名字取账号表的");
+    let cache = store.cache_report(since, 3600, 0).unwrap();
+    assert_eq!(cache.summary.input_tokens, exact.values().map(|e| e.input).sum::<i64>());
+    let ttft = store.ttft_report(since, 3600, 0).unwrap();
+    assert_eq!(ttft.summary.count, exact.values().map(|e| e.ttft.len() as i64).sum::<i64>());
+    assert_eq!(
+        ttft.points.iter().map(|b| b.count).sum::<i64>(),
+        ttft.summary.count,
+        "各桶之和等于合计"
+    );
+}
+
+/// 汇总表一行里比对用的几列：维度、桶、键、名字、请求数、输入 token、直方图。
+type RollupRowSnapshot = (String, i64, String, String, i64, i64, Option<Vec<u8>>);
+
+/// 老库升级时的回填与写入时逐条累加，得到的汇总逐格相同。
+#[test]
+fn rollup_backfill_equals_live_accumulation() {
+    let (store, ids) = store_with(&["a", "b"]);
+    let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+    let mut seed = 7u64;
+    for i in 0..500 {
+        let r = xorshift(&mut seed);
+        let rec = UsageRecord {
+            cred_id: if i % 50 == 0 { None } else { Some(ids[(r % 2) as usize]) },
+            cred_label: if r.is_multiple_of(2) { "a".into() } else { "b".into() },
+            model: (i % 40 != 0).then(|| "claude-sonnet-5".into()),
+            status: if r.is_multiple_of(9) { 400 } else { 200 },
+            input_tokens: Some((r % 900) as i64),
+            cache_read_tokens: Some((r % 5000) as i64),
+            ttft_ms: Some(50 + (r % 9000) as i64),
+            total_ms: Some(10_000),
+            output_tokens: Some((r % 700) as i64),
+            ..Default::default()
+        };
+        store.insert_usage_log_at(&rec, Some(now - (r % 30_000) as i64)).unwrap();
+    }
+    let snapshot = |store: &CredentialStore| -> Vec<RollupRowSnapshot> {
+        let conn = store.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT dim, bucket, key, label, requests, input_tokens, ttft_hist
+                   FROM usage_rollup ORDER BY dim, bucket, key",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    };
+    let live = snapshot(&store);
+    assert!(!live.is_empty());
+    store.conn.lock().execute("DELETE FROM usage_rollup", []).unwrap();
+    backfill_rollup(&store.conn.lock()).unwrap();
+    assert_eq!(snapshot(&store), live, "回填与逐条累加一致");
+    // 汇总不空时不再回填（不会重复计）。
+    backfill_rollup(&store.conn.lock()).unwrap();
+    assert_eq!(snapshot(&store), live);
+}
+
+/// 汇总保留 90 天，随流水裁剪一起裁；清空库时一起清掉。
+#[test]
+fn rollup_is_pruned_after_ninety_days_and_cleared_with_the_store() {
+    let (store, ids) = store_with(&["a"]);
+    let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
+    let rec = UsageRecord { cred_id: Some(ids[0]), status: 200, ..Default::default() };
+    store.insert_usage_log_at(&rec, Some(now - 91 * 86400)).unwrap();
+    store.insert_usage_log_at(&rec, Some(now - 89 * 86400)).unwrap();
+    store.insert_usage_log_at(&rec, Some(now - 100)).unwrap();
+    let count = |store: &CredentialStore| -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM usage_rollup WHERE dim = 'all'", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(&store), 3);
+    store.prune_usage_logs().unwrap();
+    assert_eq!(count(&store), 2, "超过 90 天的那一桶裁掉，89 天前的还在（流水只留 8 天）");
+    store.clear().unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+/// 两个进程同时首次升级：A 已在回填（拿着写锁、尚未提交），B 再来回填必须等 A 提交，然后看到
+/// 汇总已不空、跳过——不能各自回填一遍把历史累加两次。用两条连接打开同一个文件库确定性复现。
+#[test]
+fn concurrent_backfills_do_not_double_count() {
+    let path = std::env::temp_dir().join(format!(
+        "luban-rollup-backfill-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let open = || {
+        let c = Connection::open(&path).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.busy_timeout(Duration::from_secs(5)).unwrap();
+        c
+    };
+    let a = open();
+    init_schema(&a).unwrap();
+    // 两条流水直接写进表（绕过写入时累加），模拟升级前的老库：有流水、没有汇总。
+    a.execute_batch(
+        "INSERT INTO usage_logs (ts, status) VALUES (1000, 200), (2000, 200);
+         DELETE FROM usage_rollup;",
+    )
+    .unwrap();
+    // A 正在回填：拿着写锁，已写下一格、还没提交。
+    a.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT INTO usage_rollup (dim, bucket, key, requests) VALUES ('all', 900, '', 2);",
+    )
+    .unwrap();
+    let b = open();
+    let backfill = std::thread::spawn(move || backfill_rollup(&b));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!backfill.is_finished(), "B 必须等 A 的写锁，不能先读到「空」");
+    a.execute_batch("COMMIT").unwrap();
+    backfill.join().unwrap().expect("等到 A 提交后正常返回");
+    let total: i64 = a
+        .query_row("SELECT SUM(requests) FROM usage_rollup WHERE dim = 'all'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 2, "只有 A 那一份，B 看到不空就跳过了");
+    drop(a);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+/// 趋势接口的网格：桶宽向上取整到 15 分钟的整数倍、偏移对齐到 15 分钟、窗口起点向上对齐。
+#[test]
+fn series_grid_reports_the_granularity_actually_used() {
+    assert_eq!(series_grid(0, 60, 0), (0, 900, 0), "比汇总桶细的桶宽拼不出来，取一个汇总桶");
+    assert_eq!(series_grid(0, 1000, 0).1, 1800, "不是整倍数的向上取整");
+    assert_eq!(series_grid(0, 3600, 0).1, 3600);
+    assert_eq!(series_grid(0, 86400, 0).1, 86400);
+    assert_eq!(series_grid(0, 86400, 5 * 3600 + 1800).2, 19800, "UTC+5:30 本身就对齐");
+    assert_eq!(series_grid(0, 86400, 1000).2, 900, "不对齐的偏移取最近的 15 分钟");
+    assert_eq!(series_grid(901, 3600, 0).0, 1800, "窗口起点向上对齐");
+    assert_eq!(series_grid(900, 3600, 0).0, 900);
 }

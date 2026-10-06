@@ -443,6 +443,8 @@ impl CredentialStore {
                 rec.forensics.session_id_in,
             ],
         )?;
+        // 预聚合：延迟 / 缓存趋势与拆分表读它，不再按时间扫流水，见 `rollup` 模块。
+        rollup_record(&tx, ts, rec)?;
         // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
         // 在途的几发）要等响应流结束才落库，冻结时还不存在。故封后 FREEZE_TAIL_SECS 内到达
         // 的这个号的流水，写入时顺手补进冻结表——不然最要紧的那一条恰好缺席。
@@ -560,6 +562,8 @@ impl CredentialStore {
             }
             std::thread::sleep(PAUSE);
         }
+        // 汇总另有保留期（90 天，比流水长），随这里一起裁。
+        self.prune_rollup()?;
         Ok(total)
     }
 

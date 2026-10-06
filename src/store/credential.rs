@@ -133,6 +133,7 @@ impl CredentialStore {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM usage_logs", [])?;
+        tx.execute("DELETE FROM usage_rollup", [])?;
         tx.execute("DELETE FROM device_bindings", [])?;
         tx.execute("DELETE FROM session_bindings", [])?;
         tx.execute("DELETE FROM session_binding_events", [])?;

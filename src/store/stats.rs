@@ -60,24 +60,9 @@ pub struct TtftReport {
     pub recent: TtftBucket,
 }
 
-/// 延迟原始行的查询：WHERE 与 `idx_usage_logs_latency` 的部分谓词逐字相同，规划器才会
-/// 选它；测试里用 EXPLAIN QUERY PLAN 盯着这一点。
-pub(super) const LATENCY_ROWS_SQL: &str = "SELECT ts, ttft_ms, total_ms, output_tokens
-       FROM usage_logs
-      WHERE ts >= ?1 AND ttft_ms IS NOT NULL AND status = 200";
-
-/// 一条成功请求在延迟统计里要用的几个数，见 [`CredentialStore::ttft_series`]。
-#[derive(Debug, Clone, Copy)]
-struct LatencyRow {
-    ts: i64,
-    ttft_ms: i64,
-    total_ms: Option<i64>,
-    output_tokens: Option<i64>,
-}
-
 /// 一条请求里缓存省下的钱：命中与写入都按原价算一遍减去实际计价。命中省 0.9 倍输入价，
 /// 5 分钟档写入多付 0.25 倍、1 小时档多付 1 倍；模型认不出价目时记 0。
-fn cache_saved_usd(
+pub(super) fn cache_saved_usd(
     model: Option<&str>,
     plain: i64,
     cached: i64,
@@ -104,40 +89,6 @@ fn cache_saved_usd(
     match (actual, baseline) {
         (Some(a), Some(b)) => b - a,
         _ => 0.0,
-    }
-}
-
-/// nearest-rank 分位：`sorted` 已升序、非空，`p` 在 (0, 1]。
-fn percentile(sorted: &[i64], p: f64) -> i64 {
-    let rank = ((sorted.len() as f64) * p).ceil() as usize;
-    sorted[rank.clamp(1, sorted.len()) - 1]
-}
-
-/// 把一组成功请求汇总成一个 [`TtftBucket`]；空集返回全零、吞吐 `None`。
-fn summarize_latency(ts: i64, rows: &[LatencyRow]) -> TtftBucket {
-    if rows.is_empty() {
-        return TtftBucket { ts, avg_ms: 0, p50_ms: 0, p95_ms: 0, count: 0, tokens_per_sec: None };
-    }
-    let mut sorted: Vec<i64> = rows.iter().map(|r| r.ttft_ms).collect();
-    sorted.sort_unstable();
-    let sum: i64 = sorted.iter().sum();
-    let (mut out_tokens, mut gen_ms) = (0i64, 0i64);
-    for r in rows {
-        if let (Some(total), Some(out)) = (r.total_ms, r.output_tokens)
-            && total > r.ttft_ms
-            && out > 0
-        {
-            out_tokens += out;
-            gen_ms += total - r.ttft_ms;
-        }
-    }
-    TtftBucket {
-        ts,
-        avg_ms: sum / sorted.len() as i64,
-        p50_ms: percentile(&sorted, 0.5),
-        p95_ms: percentile(&sorted, 0.95),
-        count: sorted.len() as i64,
-        tokens_per_sec: (gen_ms > 0).then(|| out_tokens as f64 * 1000.0 / gen_ms as f64),
     }
 }
 
@@ -357,50 +308,23 @@ impl CredentialStore {
     ///
     /// `bucket_secs` 是桶宽；`tz_offset_secs` 是本地时区相对 UTC 的偏移，按天分桶时桶边界
     /// 落在**本地**零点上——前端按本地日期铺格子，后端不按同一套边界切，日桶就会跨两天。
-    /// `input_tokens` 是全部输入 token（含缓存命中与缓存写入）。
+    /// 两者都规整到 15 分钟的整数倍（见 [`display_grid`]）。读预聚合，见 `rollup` 模块。
     pub fn cache_series(
         &self,
         since: i64,
         bucket_secs: i64,
         tz_offset_secs: i64,
     ) -> Result<Vec<CacheBucket>> {
-        let bucket_secs = bucket_secs.max(1);
-        let conn = self.read_conn();
-        let mut stmt = conn.prepare(
-            "SELECT ((ts + ?3) / ?2) * ?2 - ?3 AS bucket,
-                    SUM(
-                        COALESCE(input_tokens, 0)
-                        + COALESCE(cache_creation_tokens,
-                                   COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))
-                        + COALESCE(cache_read_tokens, 0)
-                    ),
-                    COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(COALESCE(cache_creation_tokens,
-                                          COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))), 0)
-               FROM usage_logs
-              WHERE ts >= ?1
-              GROUP BY bucket
-              HAVING SUM(
-                        COALESCE(input_tokens, 0)
-                        + COALESCE(cache_creation_tokens,
-                                   COALESCE(cache_5m_tokens, 0) + COALESCE(cache_1h_tokens, 0))
-                        + COALESCE(cache_read_tokens, 0)
-                     ) > 0
-              ORDER BY bucket",
-        )?;
-        let rows = stmt.query_map(params![since, bucket_secs, tz_offset_secs], |r| {
-            Ok(CacheBucket {
-                ts: r.get(0)?,
-                input_tokens: r.get(1)?,
-                cached_tokens: r.get(2)?,
-                written_tokens: r.get(3)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let cells = self.rollup_cells(RollupDim::All, since)?;
+        Ok(regroup(&cells, bucket_secs, tz_offset_secs)
+            .into_iter()
+            .filter(|(_, agg)| agg.input_tokens > 0)
+            .map(|(ts, agg)| agg.cache(ts))
+            .collect())
     }
 
     /// 趋势接口一次要的三样：各桶、整窗口合计、近 60 分钟合计。整窗口合计直接把各桶加起来
-    /// （桶是窗口的划分，不必再扫一遍），近 1 小时另走一次 1 小时的小范围扫描。
+    /// （桶是窗口的划分），近 1 小时按 SQLite 的时钟另取一段（与写入侧同源）。
     pub fn cache_report(
         &self,
         since: i64,
@@ -419,64 +343,37 @@ impl CredentialStore {
         Ok(CacheReport { points, summary, recent })
     }
 
-    /// `since` 起到现在的缓存三段 token 合计（一个桶），`ts` 是 `since`。给「近 1 小时」与
-    /// 整个窗口的汇总用。
+    /// `since` 起到现在的缓存三段 token 合计（一个桶），`ts` 是 `since`。
     pub fn cache_summary(&self, since: i64) -> Result<CacheBucket> {
-        // 桶宽取一个远大于窗口的数，所有行落进同一个桶；偏移取 since 让桶起点等于 since。
-        let mut rows = self.cache_series(since, 1 << 40, -since)?;
-        Ok(rows
-            .pop()
-            .map(|b| CacheBucket { ts: since, ..b })
-            .unwrap_or_else(|| CacheBucket::empty(since)))
+        Ok(total(&self.rollup_cells(RollupDim::All, since)?).cache(since))
     }
 
-    /// `since` 起的成功请求（status = 200 且记了 TTFT）的延迟原始行，连同 SQLite 此刻的时钟
-    /// （近 1 小时的窗口按它算，与写入侧同源）。WHERE 与 `idx_usage_logs_latency` 的部分谓词
-    /// 逐字对应，整条查询在索引里走完、不回表；不排序——分桶用 BTreeMap，分位数各桶自己排。
-    fn latency_rows(&self, since: i64) -> Result<(i64, Vec<LatencyRow>)> {
-        let conn = self.read_conn();
-        let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
-        let mut stmt = conn.prepare(LATENCY_ROWS_SQL)?;
-        let rows = stmt.query_map([since], |r| {
-            Ok(LatencyRow {
-                ts: r.get(0)?,
-                ttft_ms: r.get(1)?,
-                total_ms: r.get(2)?,
-                output_tokens: r.get(3)?,
-            })
-        })?;
-        Ok((now, rows.collect::<rusqlite::Result<Vec<_>>>()?))
-    }
-
-    /// 趋势接口一次要的三样：各桶、整窗口、近 60 分钟——同一次扫描分三路汇总，不扫三遍。
+    /// 趋势接口一次要的三样：各桶、整窗口、近 60 分钟——读一次，分三路汇总。
     pub fn ttft_report(
         &self,
         since: i64,
         bucket_secs: i64,
         tz_offset_secs: i64,
     ) -> Result<TtftReport> {
-        let bucket_secs = bucket_secs.max(1);
-        let (now, rows) = self.latency_rows(since)?;
-        let mut buckets: std::collections::BTreeMap<i64, Vec<LatencyRow>> = Default::default();
-        let mut recent_rows = Vec::new();
-        for r in &rows {
-            let bucket =
-                ((r.ts + tz_offset_secs).div_euclid(bucket_secs)) * bucket_secs - tz_offset_secs;
-            buckets.entry(bucket).or_default().push(*r);
-            if r.ts >= now - 3600 {
-                recent_rows.push(*r);
-            }
-        }
+        let now: i64 = self.read_conn().query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+        let recent_since = now - 3600;
+        // 近 1 小时通常落在窗口里；窗口比它还短时多读那一段，再按各自的起点分开。
+        let cells = self.rollup_cells(RollupDim::All, since.min(recent_since))?;
+        let window: Vec<&RollupCell> =
+            cells.iter().filter(|c| c.bucket >= first_bucket(since)).collect();
+        let recent = cells.iter().filter(|c| c.bucket >= first_bucket(recent_since));
         Ok(TtftReport {
-            points: buckets.into_iter().map(|(ts, rows)| summarize_latency(ts, &rows)).collect(),
-            summary: summarize_latency(since, &rows),
-            recent: summarize_latency(now - 3600, &recent_rows),
+            points: regroup(window.iter().copied(), bucket_secs, tz_offset_secs)
+                .into_iter()
+                .filter(|(_, agg)| agg.lat_count > 0)
+                .map(|(ts, agg)| agg.latency(ts))
+                .collect(),
+            summary: total(window.iter().copied()).latency(since),
+            recent: total(recent).latency(recent_since),
         })
     }
 
-    /// TTFT（首字时延）趋势的桶：每桶平均、p50、p95、请求数与输出吞吐。分位数没法从更细
-    /// 的桶合并出来，所以桶宽与时区偏移由调用方按前端要画的格子给（同 [`Self::cache_series`]），
-    /// 在 Rust 里对每桶的原始值排序取分位——保留期量级也就几十万个整数，没有压力。
+    /// TTFT（首字时延）趋势的桶：每桶平均、p50、p95、请求数与输出吞吐。
     #[cfg(test)]
     pub fn ttft_series(
         &self,
@@ -491,96 +388,58 @@ impl CredentialStore {
     /// 一次拿齐，这个只给测试核对。
     #[cfg(test)]
     pub fn ttft_summary(&self, since: i64) -> Result<TtftBucket> {
-        let (_, rows) = self.latency_rows(since)?;
-        Ok(summarize_latency(since, &rows))
+        Ok(total(&self.rollup_cells(RollupDim::All, since)?).latency(since))
     }
 
     /// `since` 起按模型或按账号拆开的用量：每组的请求数、延迟分位与吞吐、缓存三段 token，
-    /// 按请求数降序，最多 `limit` 行。一次把窗口内的原始行拉回来在 Rust 里聚合——分位数在
-    /// SQL 里算不了，而这张表只在打开趋势对话框时查一次。
+    /// 按请求数降序，最多 `limit` 行。读对应那一维的预聚合，见 `rollup` 模块。
     pub fn usage_breakdown(
         &self,
         since: i64,
         by: BreakdownBy,
         limit: usize,
     ) -> Result<Vec<BreakdownRow>> {
-        struct Group {
-            label: String,
-            tier: Option<String>,
-            requests: i64,
-            latency: Vec<LatencyRow>,
-            cache: CacheBucket,
-            saved_usd: f64,
-        }
-        let conn = self.read_conn();
-        let key_expr = match by {
-            BreakdownBy::Model => "COALESCE(u.model, '')",
-            BreakdownBy::Account => "COALESCE(CAST(u.cred_id AS TEXT), '')",
+        let dim = match by {
+            BreakdownBy::Model => RollupDim::Model,
+            BreakdownBy::Account => RollupDim::Cred,
         };
-        let label_expr = match by {
-            BreakdownBy::Model => "COALESCE(u.model, '')",
-            BreakdownBy::Account => {
-                // 已删账号的流水留到保留期满（见 remove），账号表里没它了就退回流水自带的名字。
-                "COALESCE(c.label, NULLIF(u.cred_label, ''), '#' || COALESCE(CAST(u.cred_id AS TEXT), '?'))"
-            }
+        // 账号名与套餐档：账号表就几十行，一次读进来。
+        let creds: HashMap<String, (String, Option<String>)> = if by == BreakdownBy::Account {
+            let conn = self.read_conn();
+            let mut stmt = conn.prepare("SELECT id, label, tier FROM credentials")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?.to_string(), (r.get(1)?, r.get(2)?))))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        } else {
+            HashMap::new()
         };
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {key_expr}, {label_expr}, u.ts, u.status, u.ttft_ms, u.total_ms, u.output_tokens,
-                    COALESCE(u.input_tokens, 0),
-                    COALESCE(u.cache_read_tokens, 0),
-                    u.cache_creation_tokens, u.cache_5m_tokens, u.cache_1h_tokens,
-                    u.model, c.tier
-               FROM usage_logs u
-               LEFT JOIN credentials c ON c.id = u.cred_id
-              WHERE u.ts >= ?1"
-        ))?;
-        let mut groups: std::collections::HashMap<String, Group> = Default::default();
-        let mut rows = stmt.query([since])?;
-        while let Some(r) = rows.next()? {
-            let key: String = r.get(0)?;
-            let label: String = r.get(1)?;
-            let ts: i64 = r.get(2)?;
-            let status: i64 = r.get(3)?;
-            let ttft_ms: Option<i64> = r.get(4)?;
-            let total_ms: Option<i64> = r.get(5)?;
-            let output_tokens: Option<i64> = r.get(6)?;
-            let plain: i64 = r.get(7)?;
-            let cached: i64 = r.get(8)?;
-            let creation: Option<i64> = r.get(9)?;
-            let c5: Option<i64> = r.get(10)?;
-            let c1: Option<i64> = r.get(11)?;
-            let model: Option<String> = r.get(12)?;
-            let tier: Option<String> = r.get(13)?;
-            let written = creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0));
-            let g = groups.entry(key).or_insert_with(|| Group {
-                label,
-                tier: if by == BreakdownBy::Account { tier } else { None },
-                requests: 0,
-                latency: Vec::new(),
-                cache: CacheBucket::empty(since),
-                saved_usd: 0.0,
-            });
-            g.requests += 1;
-            g.cache.input_tokens += plain + written + cached;
-            g.cache.cached_tokens += cached;
-            g.cache.written_tokens += written;
-            g.saved_usd += cache_saved_usd(model.as_deref(), plain, cached, creation, c5, c1);
-            if status == 200
-                && let Some(ttft_ms) = ttft_ms
-            {
-                g.latency.push(LatencyRow { ts, ttft_ms, total_ms, output_tokens });
-            }
+        // 键 → (窗口内最早那一桶记下的名字, 汇总)。格子按桶升序来，第一次见到的就是最早的。
+        let mut groups: HashMap<String, (String, RollupAgg)> = HashMap::new();
+        for c in self.rollup_cells(dim, since)? {
+            groups.entry(c.key).or_insert_with(|| (c.label, RollupAgg::default())).1.add(&c.agg);
         }
         let mut out: Vec<BreakdownRow> = groups
             .into_iter()
-            .map(|(key, g)| BreakdownRow {
-                key,
-                label: g.label,
-                tier: g.tier,
-                requests: g.requests,
-                cache_saved_usd: g.saved_usd,
-                latency: summarize_latency(since, &g.latency),
-                cache: g.cache,
+            .map(|(key, (recorded, agg))| {
+                let (label, tier) = match by {
+                    BreakdownBy::Model => (key.clone(), None),
+                    BreakdownBy::Account => match creds.get(&key) {
+                        Some((label, tier)) => (label.clone(), tier.clone()),
+                        // 已删账号的流水留到保留期满（见 remove），账号表里没它了就退回汇总里记下
+                        // 的名字（窗口内最早那一桶第一条流水的），那也没有就记 `#id`。
+                        None if !recorded.is_empty() => (recorded, None),
+                        None => (format!("#{}", if key.is_empty() { "?" } else { &key }), None),
+                    },
+                };
+                BreakdownRow {
+                    label,
+                    tier,
+                    requests: agg.requests,
+                    cache_saved_usd: agg.saved_usd,
+                    latency: agg.latency(since),
+                    cache: agg.cache(since),
+                    key,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then_with(|| a.key.cmp(&b.key)));
@@ -699,4 +558,27 @@ impl CredentialStore {
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(out)
     }
+}
+
+/// 把汇总格子按展示桶（桶宽与时区偏移见 [`display_grid`]）合并，按时间升序。
+fn regroup<'a>(
+    cells: impl IntoIterator<Item = &'a RollupCell>,
+    bucket_secs: i64,
+    tz_offset_secs: i64,
+) -> std::collections::BTreeMap<i64, RollupAgg> {
+    let (bucket_secs, tz_offset_secs) = display_grid(bucket_secs, tz_offset_secs);
+    let mut out: std::collections::BTreeMap<i64, RollupAgg> = Default::default();
+    for c in cells {
+        out.entry(display_bucket(c.bucket, bucket_secs, tz_offset_secs)).or_default().add(&c.agg);
+    }
+    out
+}
+
+/// 一组格子的合计。
+fn total<'a>(cells: impl IntoIterator<Item = &'a RollupCell>) -> RollupAgg {
+    let mut out = RollupAgg::default();
+    for c in cells {
+        out.add(&c.agg);
+    }
+    out
 }

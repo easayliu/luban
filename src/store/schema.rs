@@ -375,10 +375,8 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     // - (session_key, id)：会话行点「看请求」是 `session_key = ? AND id <= ? ORDER BY id DESC`，
     //   与 (cred_id, id) 同一个形状；**部分索引**（只收非空的），带设备身份与非模拟路径的
     //   请求这一列恒为空、占了绝大多数行，不进索引就不付这份写入与体积。
-    // - 延迟趋势只看成功且记了 TTFT 的行、只读三列：**部分覆盖索引**，整段扫描全在索引里
-    //   走、不回表（日志行很宽，回表才是大头）；失败行与没记 TTFT 的行不进索引，写入开销只
-    //   落在成功请求上。
-    // - 缓存趋势按 ts 扫全部行、只读五个 token 列，同样做成覆盖索引。
+    // - 延迟 / 缓存趋势与拆分表不再按时间扫流水，读预聚合 usage_rollup（见 `rollup` 模块），
+    //   原来给它们建的两条覆盖索引（idx_usage_logs_latency / idx_usage_logs_cache）随之删掉。
     // - 账号列表每次刷新都要按号聚合额度窗口（最长 7 天多）内的费用、条数与 token，见
     //   QUOTA_SNAPSHOTS_SQL：(cred_id, ts) 后面带上它读的那几列，整段范围扫描不回表。40 个号、
     //   7 天 40 万条流水的规模下，回表那版要读 GB 级的宽行，覆盖之后约快 10 倍。它的
@@ -402,12 +400,8 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
              ON usage_logs(session_id, id) WHERE session_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_usage_logs_session_id_in
              ON usage_logs(session_id_in, id) WHERE session_id_in IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS idx_usage_logs_latency
-             ON usage_logs(ts, ttft_ms, total_ms, output_tokens)
-             WHERE status = 200 AND ttft_ms IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS idx_usage_logs_cache
-             ON usage_logs(ts, input_tokens, cache_creation_tokens, cache_5m_tokens,
-                           cache_1h_tokens, cache_read_tokens);
+         DROP INDEX IF EXISTS idx_usage_logs_latency;
+         DROP INDEX IF EXISTS idx_usage_logs_cache;
          CREATE INDEX IF NOT EXISTS idx_usage_logs_cred_usage
              ON usage_logs(cred_id, ts, cost_usd, input_tokens, output_tokens,
                            cache_creation_tokens, cache_5m_tokens, cache_1h_tokens,
@@ -598,6 +592,29 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     purge_orphan_rows(conn)?;
     backfill_ledger(conn)?;
     migrate_priority_tiers(conn)?;
+    // 用量预聚合：15 分钟 × 维度（all / model / cred）一行，见 `rollup` 模块。主键把维度放在最前，
+    // 每种查询都是一个维度里按桶的连续范围扫描。WITHOUT ROWID：表只按主键访问，省掉一层 rowid。
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_rollup (
+             dim            TEXT    NOT NULL CHECK (dim IN ('all', 'model', 'cred')),
+             bucket         INTEGER NOT NULL,
+             key            TEXT    NOT NULL,
+             label          TEXT    NOT NULL DEFAULT '',
+             requests       INTEGER NOT NULL DEFAULT 0,
+             input_tokens   INTEGER NOT NULL DEFAULT 0,
+             cached_tokens  INTEGER NOT NULL DEFAULT 0,
+             written_tokens INTEGER NOT NULL DEFAULT 0,
+             saved_usd      REAL    NOT NULL DEFAULT 0,
+             lat_count      INTEGER NOT NULL DEFAULT 0,
+             ttft_sum       INTEGER NOT NULL DEFAULT 0,
+             gen_tokens     INTEGER NOT NULL DEFAULT 0,
+             gen_ms         INTEGER NOT NULL DEFAULT 0,
+             ttft_hist      BLOB,
+             PRIMARY KEY (dim, bucket, key)
+         ) STRICT, WITHOUT ROWID;",
+    )
+    .context("failed to create the usage rollup table")?;
+    backfill_rollup(conn)?;
     Ok(())
 }
 

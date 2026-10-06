@@ -501,3 +501,23 @@ async fn strip_policies_store_reset_and_reject_the_same_way() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(msg, r#"sampling_policy must be "strip", "reject", or "off""#);
 }
+
+/// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
+#[tokio::test]
+async fn series_endpoints_report_the_bucket_width_actually_used() {
+    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
+    let state = AppState::for_test(store);
+    for (asked, used) in [(60, 900), (1000, 1800), (3600, 3600)] {
+        let q = |hours: i64| {
+            Query(
+                serde_json::from_value(serde_json::json!({ "hours": hours, "bucket_secs": asked }))
+                    .unwrap(),
+            )
+        };
+        let ttft = get_ttft_series(State(state.clone()), q(24)).await.unwrap().0;
+        assert_eq!(ttft["bucket_secs"], used, "ttft 请求 {asked}");
+        assert_eq!(ttft["since"].as_i64().unwrap() % 900, 0, "窗口起点对齐到 15 分钟");
+        let cache = get_cache_series(State(state.clone()), q(25)).await.unwrap().0;
+        assert_eq!(cache["bucket_secs"], used, "cache 请求 {asked}");
+    }
+}
