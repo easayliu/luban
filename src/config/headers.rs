@@ -4,7 +4,8 @@ use super::*;
 
 /// 模拟模式下整套重建的固定请求头，取值逐字节取自 `cap/2.1.258/00012`（opus-5 直连），
 /// 与 2.1.251 的 `00019` 逐字相同。2.1.285（`cap/2.1.285/00030`）起 Stainless SDK 升到 0.127.0
-/// （2.1.251 ~ 2.1.280 一直是 0.112.1），node 仍是 v26.3.0。
+/// （2.1.251 ~ 2.1.280 一直是 0.112.1），2.1.291（`cap/auto-2.1.291-20261006-full`，每条 messages）
+/// 再升到 0.128.0，node 仍是 v26.3.0。
 ///
 /// 表里**只有固定值**；随请求变的几个不在此列，由 [`crate::proxy::official_headers`] 另外
 /// 塞：`Authorization`（凭证）、`X-Claude-Code-Session-Id`（每设备派生）、
@@ -23,7 +24,7 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
     ("x-stainless-arch", "arm64"),
     ("x-stainless-lang", "js"),
     ("x-stainless-os", "MacOS"),
-    ("x-stainless-package-version", "0.127.0"),
+    ("x-stainless-package-version", "0.128.0"),
     ("x-stainless-retry-count", "0"),
     ("x-stainless-runtime", "node"),
     ("x-stainless-runtime-version", "v26.3.0"),
@@ -35,6 +36,25 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
     ("accept-encoding", CC_ACCEPT_ENCODING),
 ];
 
+/// 某个版本的官方客户端发的 `X-Stainless-Package-Version`（[`CC_SIM_HEADERS`] 里那项只是当前模拟
+/// 版本的值）：2.1.251 ~ 2.1.280 是 0.112.1（`cap/2.1.251/00019`、`cap/2.1.258/00012`、`cap/2.1.280`），
+/// 2.1.285 是 0.127.0（`cap/2.1.285/00030`），2.1.288 起 0.128.0——2.1.288 / 2.1.289 / 2.1.290 /
+/// 2.1.291 四个可执行文件里 SDK 的版本常量都是 `"0.128.0"`，2.1.291 另有抓包
+/// （`cap/auto-2.1.291-20261006-full`）。2.1.286 / 2.1.287 两个可执行文件手上没有，按 2.1.285 算。
+/// 更早的或读不出版本的没有样本，返回 `None`，调用方保留表里的值。
+///
+/// 给「随会话版本发」的请求用（[`crate::proxy::send_quota_probe`] 那条补发的额度探测：UA 跟着会话
+/// 版本，SDK 版本也得跟着，否则会出现 `claude-cli/2.1.285` 配 0.128.0 这种官方不产生的组合）。
+pub fn cc_stainless_version(version: &str) -> Option<&'static str> {
+    let v = crate::proxy::parse_version(version)?;
+    match v {
+        v if v >= (2, 1, 288) => Some("0.128.0"),
+        v if v >= (2, 1, 285) => Some("0.127.0"),
+        v if v >= (2, 1, 251) => Some("0.112.1"),
+        _ => None,
+    }
+}
+
 /// `anthropic-dispatch-id` 的取值（`cap/2.1.285` 每条 messages 都是 `v2d`，额度探测 `00017` 不带）。
 ///
 /// 可执行文件里它有三个取值：服务端特性开关 `tengu_dreamy_frost` 开着时所有请求（含标题生成
@@ -45,6 +65,25 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
 ///
 /// 真 CC 来访自己带着这个头，原样转发（[`CC_HEADER_ORDER`] 给它归位）。
 pub const CC_DISPATCH_ID: &str = "v2d";
+
+/// 「额度用尽后的宽限」请求头：`anthropic-usage-limit: extended`（2.1.291 起）。
+///
+/// 可执行文件里（2.1.291，`function Far`）它只在这几项**同时**成立时写上：
+///
+/// 1. 不是这一轮的第一条请求——`queryTracking.depth > 0`，即同一次用户输入之后、带着工具结果的
+///    续轮（`cap/auto-2.1.291-20261006-full` 里每轮首条 `00032`、`00033` 不带，`00036` 起的续轮都带）；
+///    **或者**这一轮是后台任务通知（`v7n`：末条用户消息是会话任务的通知，`00174`、`00564`）；
+/// 2. 请求用途是主线程、子代理或 compact——标题生成、helper 这类 `auxiliary` 一律不带；
+/// 3. claude.ai 订阅登录（OAuth、first-party）；
+/// 4. 账号的额外用量是**停用**的——上游响应头 `anthropic-ratelimit-unified-overage-disabled-reason`
+///    有值（抓包那个号是 `org_level_disabled`）；额外用量开着的号，服务端开关 `tengu_smooth_harbor`
+///    开着也算；
+/// 5. 服务端开关 `tengu_lantern_spool` 开着——按账号分流的实验（eval 响应里 `"source":"experiment"`，
+///    实验名 `cc-grace-launch-team-1`），不是每个号都有。
+///
+/// 模拟路径照这几条写：第 4、5 两项按凭证记（`crate::proxy::usage_grace`），没见过的不算成立——
+/// 宁可少一个头，也不给一个没进实验的号发实验头。
+pub const CC_USAGE_LIMIT_HEADER: (&str, &str) = ("anthropic-usage-limit", "extended");
 
 /// 官方客户端请求头的**拼写与顺序**，逐字节取自 `cap/raw/00006`（claude-cli/2.1.220 直连
 /// api.anthropic.com，CONNECT 隧道里的原始报文头）。
@@ -82,6 +121,9 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     "anthropic-dangerous-direct-browser-access",
     // 2.1.285 起（`cap/2.1.285/00030` 等），落在上一项与 `anthropic-version` 之间，见 [`CC_DISPATCH_ID`]。
     "anthropic-dispatch-id",
+    // 2.1.291 起（`cap/auto-2.1.291-20261006-full/00036` 等），落在上一项与 `anthropic-version`
+    // 之间，见 [`CC_USAGE_LIMIT_HEADER`]。
+    "anthropic-usage-limit",
     "anthropic-version",
     "x-app",
     // 2.1.277 起的四个 `x-claude-code-*` 头（`cap/2.1.277`）：子代理带 `agent-id` / `agent-type`

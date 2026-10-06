@@ -15,8 +15,9 @@ use super::*;
 ///   后缀此前已按完整历史算好，与官方「续轮沿用首轮后缀」一致。
 ///
 /// 只给官方会发 `thread` 的主线程：2.1.285 的 opus / sonnet / haiku 各代与 fable-5 都发，
-/// **fable-5-1 一条都不发**（auto、非 auto、`-p` 都是，`00383`、`00554`，`cap/2.1.285/00039`），
-/// 见 [`crate::proxy::simulation::sim_uses_threads`]。来访指定了 `tool_choice` 的只 `create`：续轮不带
+/// **fable-5-1 一条都不发**（auto、非 auto、`-p` 都是，`00383`、`00554`，`cap/2.1.285/00039`）；
+/// 2.1.291 起 fable-5-1 也发（`cap/auto-2.1.291-20261006-full/00464`），见
+/// [`crate::proxy::simulation::sim_uses_threads`]。来访指定了 `tool_choice` 的只 `create`：续轮不带
 /// `tools`，`tool_choice` 没有落脚处。
 ///
 /// 这一轮的结论（等回程提交的那份）挂到 `sim` 上，由 `ReqLog` 取走（[`Simulation::take_thread`]）。

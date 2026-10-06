@@ -107,8 +107,20 @@ pub struct ForwardFlags {
     /// - **关**：不带工具的请求一个工具都不注（空数组原样发出）。自己带了工具的两种取值下都补缺。
     ///   luban 自己的连通性探测不受这项管，恒补。
     pub fill_absent_tools: bool,
-    /// 模拟路径的主线程按官方 2.1.285 的 message threads 形态写 `thread`（[`Self::simulate_cc`]
-    /// 的子项，fable-5-1 除外——官方那一代不发）。
+    /// 模拟路径注入的官方工具去掉 `Artifact` / `ListAgents` / `SendFeedback` 三条（[`Self::simulate_cc`]
+    /// 的子项），见 [`crate::proxy::cc_tools_core`]。
+    ///
+    /// - **开**（默认）：注入 11 条。官方客户端里这三条都能由用户自己关掉（环境变量
+    ///   `CLAUDE_CODE_DISABLE_ARTIFACT=1`、`CLAUDE_CODE_HARBOR_KITE=0`、`CLAUDE_CODE_SEND_FEEDBACK=0`），
+    ///   关掉后主线程正文正好少这三条、其余工具与 system 逐字节不变（`cap/auto-2.1.291-20261006`
+    ///   四族各一对）；遥测照关掉后的样子报——`tengu_startup_telemetry.set_env_vars` 列出这三个
+    ///   变量名、多一条 `tengu_artifact_disabled_session{mechanism: env}`、少几条 artifact 与跨会话
+    ///   消息的事件、工具计数跟着变。省下约 41KB 工具声明（Artifact 一条就 34KB），新分词器下每个
+    ///   新会话首轮约少 1.4 万 token 的写入。
+    /// - **关**：注入完整的 14 条，与官方默认配置相同。
+    pub sim_trim_tools: bool,
+    /// 模拟路径的主线程按官方的 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项；
+    /// 2.1.285 的 fable-5-1 除外——官方那一版不发，2.1.291 起发）。
     ///
     /// - **开**（默认）：会话里一段对话的第一条写 `thread: {type: create}`；之后来访的历史若正好是
     ///   「上一轮 + 上游那条回复 + 新消息」，写 `thread: {type: continue}`、只发新增消息，接不上
@@ -355,6 +367,7 @@ impl Default for ForwardFlags {
             simulate_cc: true,
             simulate_full_system: true,
             fill_absent_tools: true,
+            sim_trim_tools: true,
             sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,

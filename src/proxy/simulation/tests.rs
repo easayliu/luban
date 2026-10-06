@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.285.bc6; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.291.926; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -102,7 +102,7 @@ fn simulates_official_system_for_plain_request() {
         "会话首条：字段在、值为 null（cap/2.1.277/00023）: {s}"
     );
 
-    // 2.1.277 四族同一份基座（cap/2.1.277 四份主线程 sha256 相同）；认不出的模型不猜。
+    // 2.1.291：opus / sonnet / fable 同一份基座，haiku 换成长的那份；认不出的模型不猜。
     for m in [
         "claude-opus-5",
         "claude-fable-5-1",
@@ -112,7 +112,9 @@ fn simulates_official_system_for_plain_request() {
         "claude-opus-4-6",
     ] {
         let sim = sim_for(&format!(r#"{{"model":"{m}","messages":[]}}"#));
-        assert_eq!(sim.base, Some(config::CC_SYSTEM_BASE), "{m}");
+        let want =
+            if m.contains("haiku") { config::CC_SYSTEM_BASE_HAIKU } else { config::CC_SYSTEM_BASE };
+        assert_eq!(sim.base, Some(want), "{m}");
         assert!(sim.rest.is_some(), "{m} 也补第四块");
     }
     let alien = sim_for(r#"{"model":"gpt-4o","messages":[]}"#);
@@ -383,14 +385,20 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE, "四族共用基座");
     assert_eq!(sys[2]["cache_control"]["scope"], "global");
     let rest = sys[3]["text"].as_str().unwrap();
-    assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块: {rest:.80}");
-    assert!(!rest.contains("This iteration of Claude"), "2.1.280 起不再带 Fable 自我介绍: {rest}");
+    assert!(
+        rest.starts_with("Before you start, say in a line"),
+        "2.1.291 fable 第四块: {rest:.80}"
+    );
+    assert!(
+        rest.contains("This iteration of Claude is Claude Fable 5.1"),
+        "2.1.291 fable 又带自我介绍"
+    );
     assert!(!unfilled(rest), "{rest}");
     assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.285.bc6; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.291.926; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1437,26 +1445,24 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/2.1.285` 逐项核**：11 个模型各造一条第三方请求（只有一句 `hi` 和一段客户端
-/// system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
-/// `context_management`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
+/// **对着 `cap/auto-2.1.291-20261006-full` 逐项核**：四族各造一条第三方请求（只有一句 `hi` 和一段
+/// 客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
+/// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
+/// opus / sonnet / haiku 取默认权限模式的首轮（`00340`、`00253`、`00303`）；fable 只有 auto 模式的
+/// （`00464`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与 `dangerous-tool-use`、Bash 不比（auto
+/// 那版少一句）。
 ///
-/// 刻意不比的几项（各有出处）：`effort`（模拟三族一律 high）、动态的 `afk-mode` 与 auto 模式才有的 `safeguards`、
-/// 官方只在 sonnet / haiku 等首轮写的 `thread`、`max_tokens`（来访自己的）、`stream`。
-/// 抓包目录不在仓库里（`.gitignore`），没有就跳过。
+/// 刻意不比的几项（各有出处）：`effort`（模拟三族一律 high）、auto 模式才有的 `safeguards`、
+/// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_285_captures() {
-    let dir = format!("{}/cap/2.1.285", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_291_captures() {
+    let dir = format!("{}/cap/auto-2.1.291-20261006-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/2.1.285 not present");
+        eprintln!("skipped: cap/auto-2.1.291-20261006-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
-    let cases = [
-        "00030", "00039", "00045", "00051", "00055", "00061", "00067", "00072", "00077", "00083",
-        "00088",
-    ];
-    for n in cases {
+    for (n, auto_mode) in [("00340", false), ("00253", false), ("00303", false), ("00464", true)] {
         let path = files
             .iter()
             .find(|p| {
@@ -1477,13 +1483,15 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
         let body = Bytes::from(format!(
             r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"system":"你是助手","max_tokens":32000}}"#
         ));
-        let sim = detect_for(&body, all_on()).unwrap();
-        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        // 对照的是官方默认配置的抓包（14 个工具），关掉默认开着的精简。
+        let full_tools = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
+        let sim = detect_for(&body, full_tools).unwrap();
+        let out = rewrite_body(&body, &test_cred(), "fp", full_tools, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let h = crate::proxy::build_forward_headers_for(
             &crate::proxy::HeaderMap::new(),
             "tok",
-            all_on(),
+            full_tools,
             Some(&sim),
             None,
             Some(model),
@@ -1491,9 +1499,13 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
             crate::proxy::BetaCtx::MAIN,
         );
 
-        // beta：官方串去掉动态的 afk-mode。
-        let want: Vec<&str> =
-            header("anthropic-beta").split(',').filter(|b| !b.starts_with("afk-mode-")).collect();
+        // beta：auto 模式那条去掉 auto 模式才有的两项。
+        let want: Vec<&str> = header("anthropic-beta")
+            .split(',')
+            .filter(|b| {
+                !(auto_mode && (b.starts_with("afk-mode-") || b.starts_with("dangerous-tool-use-")))
+            })
+            .collect();
         assert_eq!(h["anthropic-beta"], want.join(","), "{model}（{n}）beta");
         assert_eq!(h["anthropic-dispatch-id"], header("anthropic-dispatch-id"), "{model}");
         assert_eq!(h["x-claude-code-request-class"], "main", "{model}");
@@ -1502,8 +1514,7 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：官方有就是首轮 `create`（opus / sonnet / haiku 各代与 fable-5），fable-5-1
-        // 一条都没有（`00039`），模拟出站与之逐条一致。
+        // `thread`：2.1.291 四族首轮都是 `create`（fable-5-1 也是了），模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1535,7 +1546,7 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.285."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.291."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1544,14 +1555,19 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/proxy_captures/20260930_143352",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/0bf28fc4-0424-4927-8ef6-0ccf4214a28d/scratchpad/calc",
         );
-        let official_rest = osys[3]["text"].as_str().unwrap();
-        let end = official_rest.find("EndConversation (deferred tool)").unwrap();
-        let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
-        let official_rest = format!("{}{}", &official_rest[..end], &official_rest[end_to..]);
+        // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与末尾 WebSearch 那段。
+        let mut official_rest = osys[3]["text"].as_str().unwrap().to_string();
+        if let Some(end) = official_rest.find("EndConversation (deferred tool)") {
+            let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
+            official_rest.replace_range(end..end_to, "");
+        }
+        let ws = official_rest.find("\n\nWebSearch takes a `mode`").unwrap();
+        official_rest.truncate(ws);
+        let template = super::cc_system_rest(model).unwrap();
         assert_eq!(
-            crate::proxy::render_system_rest(config::CC_SYSTEM_REST, &cap_env),
+            crate::proxy::render_system_rest(template, &cap_env),
             official_rest,
             "{model}: 第四块按抓包机的环境回填后逐字节相同"
         );
@@ -1562,8 +1578,15 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
         assert_eq!(tools.len(), 14, "{model}");
         for t in tools {
             let name = t["name"].as_str().unwrap();
+            if auto_mode && name == "Bash" {
+                continue;
+            }
             let o = otools.iter().find(|o| o["name"] == name).unwrap_or_else(|| panic!("{name}"));
-            assert_eq!(t, o, "{model}: {name}");
+            assert_eq!(
+                serde_json::to_string(t).unwrap(),
+                serde_json::to_string(o).unwrap(),
+                "{model}: {name}"
+            );
         }
     }
 }
@@ -1573,6 +1596,15 @@ fn simulated_main_threads_match_the_2_1_285_captures() {
 #[allow(clippy::type_complexity)]
 fn official_passthrough_report(
     sub: &str,
+) -> Option<(usize, Vec<String>, Vec<(String, crate::proxy::CcRequestKind)>)> {
+    official_passthrough_report_at(sub, (2, 1, 285))
+}
+
+/// 同上，来访自报的版本按 `version` 喂给 merge_beta。
+#[allow(clippy::type_complexity)]
+fn official_passthrough_report_at(
+    sub: &str,
+    version: (u64, u64, u64),
 ) -> Option<(usize, Vec<String>, Vec<(String, crate::proxy::CcRequestKind)>)> {
     let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
     let entries = std::fs::read_dir(&dir).ok()?;
@@ -1632,7 +1664,7 @@ fn official_passthrough_report(
         let merged = crate::proxy::merge_beta_for(
             Some(&beta_raw),
             Some(model),
-            Some((2, 1, 285)),
+            Some(version),
             crate::proxy::BetaCtx::of(kind, &raw[sep + 4..], Some(&v)),
         );
         if !beta_raw.is_empty() && merged != beta_raw {
@@ -1686,6 +1718,22 @@ fn every_auto_2_1_285_official_request_passes_through() {
     };
     assert!(seen >= 100, "{seen}");
     assert!(bad.is_empty(), "{} 条：\n{}", bad.len(), bad.join("\n"));
+}
+
+/// **2.1.291 各种用法的官方请求**（`cap/auto-2.1.291-20261006-full`：auto / default / plan、`-p`、
+/// `--continue`、`/compact`、各档 effort、1M、四族主线程、三种子代理、WebSearch / WebFetch、
+/// `count_tokens`；`cap/auto-2.1.291-20261006`：四族关掉 Artifact 等三个工具前后）同样一条不进模拟、
+/// 不被当探针、merge_beta 一项不多。
+#[test]
+fn every_auto_2_1_291_official_request_passes_through() {
+    for sub in ["auto-2.1.291-20261006-full", "auto-2.1.291-20261006"] {
+        let Some((seen, bad, _)) = official_passthrough_report_at(sub, (2, 1, 291)) else {
+            eprintln!("skipped: cap/{sub} not present");
+            continue;
+        };
+        assert!(seen >= 8, "{sub}: {seen}");
+        assert!(bad.is_empty(), "{sub} {} 条：\n{}", bad.len(), bad.join("\n"));
+    }
 }
 
 /// **2.1.285 新认的几种官方形态**，不靠抓包目录（它不进仓库，CI 上上面两条回放会跳过）：
@@ -1861,64 +1909,81 @@ fn unfilled(text: &str) -> bool {
     REST_PLACEHOLDERS.iter().any(|ph| text.contains(ph))
 }
 
-/// 第四块模板逐字节取自抓包：字节数钉住，占位齐全，抓包机的路径一个都不能留。
+/// 第四块模板逐字节取自抓包：字节数钉住，占位齐全，抓包机的路径一个都不能留。2.1.291 有三份：
+/// opus / sonnet（[`config::CC_SYSTEM_REST`]）、fable、haiku。
 #[test]
 fn system_rest_assets_are_verbatim() {
-    let asset = config::CC_SYSTEM_REST;
-    assert_eq!(
-        asset.len(),
-        4922,
-        "2.1.285 第四块模板字节数（cap/2.1.285/00039 的 5193 去掉 EndConversation 那段 233 与占位差 38）"
-    );
-    for ph in REST_PLACEHOLDERS {
-        assert_eq!(asset.matches(ph).count(), 1, "占位 {ph} 恰好出现一次（记忆目录那一处）");
-    }
-    assert!(
-            asset.contains("You have a persistent file-based memory at `{{home}}/.claude/projects/{{cwd_slug}}/memory/`."),
-            "记忆目录那句"
-        );
-    assert!(asset.starts_with("Write code that reads like the surrounding code"));
-    assert!(asset.ends_with("<total_tokens>15000000 tokens left</total_tokens>"), "末行");
-    assert!(!asset.ends_with('\n'), "结尾多出的换行是编辑器加的，官方没有");
-    for leak in ["easayliu", "opdash", "proxy_captures"] {
-        assert!(!asset.contains(leak), "模板里不该留抓包机的 {leak}");
-    }
-    // 2.1.277 的第四块不再写这些；有一样在就是把老版本的模板拿来了。
-    for gone in [
-        "Primary working directory",
-        "Is a git repository",
-        "powered by the model",
-        "knowledge cutoff",
-        "# Scratchpad Directory",
-        "Additional working directories",
+    // （模板，字节数，开头）：抓包原文去掉 EndConversation 那段（haiku 那份本来就没有）与
+    // `<total_tokens>` 之后的 WebSearch 那段，再把记忆目录换成两个占位。
+    for (asset, len, head) in [
+        (config::CC_SYSTEM_REST, 4700, "Write code that reads like the surrounding code"),
+        (
+            config::CC_SYSTEM_REST_FABLE,
+            10794,
+            "Before you start, say in a line what you're about to do",
+        ),
+        (config::CC_SYSTEM_REST_HAIKU, 16720, "# Text output (does not apply to tool calls)"),
     ] {
-        assert!(!asset.contains(gone), "{gone}");
+        assert_eq!(asset.len(), len, "{head}");
+        assert!(asset.starts_with(head), "{head}");
+        for ph in REST_PLACEHOLDERS {
+            assert_eq!(
+                asset.matches(ph).count(),
+                1,
+                "{head}: 占位 {ph} 恰好出现一次（记忆目录那一处）"
+            );
+        }
+        assert!(
+            asset.contains("{{home}}/.claude/projects/{{cwd_slug}}/memory/`"),
+            "{head}: 记忆目录"
+        );
+        assert!(
+            asset.ends_with("<total_tokens>15000000 tokens left</total_tokens>"),
+            "{head}: 末行"
+        );
+        for leak in ["easayliu", "opdash", "proxy_captures", "scratchpad"] {
+            assert!(!asset.contains(leak), "{head}: 模板里不该留抓包机的 {leak}");
+        }
+        // 模拟路径不注 ToolSearch 与延迟池里的 WebSearch（见 `cc_tools_core`），依赖它们的那两段
+        // 指令不能留：提示词让模型去调一个客户端没声明的工具，是提示词与工具集不成套。
+        assert!(!asset.contains("EndConversation") && !asset.contains("ToolSearch"), "{head}");
+        assert!(!asset.contains("WebSearch takes a `mode`"), "{head}");
+        for gone in ["Primary working directory", "powered by the model", "knowledge cutoff"] {
+            assert!(!asset.contains(gone), "{head}: {gone}");
+        }
+        for section in ["# Session-specific guidance", "# Environment", "# Context management"] {
+            assert!(asset.contains(section), "{head}: {section}");
+        }
     }
-    // 模拟路径不注 ToolSearch（见 `cc_tools_core`），依赖它的那段指令不能留：提示词让
-    // 模型去 ToolSearch 一个客户端没声明的工具，是提示词与工具集不成套。
-    assert!(!asset.contains("EndConversation") && !asset.contains("ToolSearch"));
-    // 四族共有的那几节都在。
-    for section in
-        ["# Session-specific guidance", "# Memory", "# Environment", "# Context management"]
+    let opus = config::CC_SYSTEM_REST;
+    // 2.1.291 opus / sonnet 那份：记忆一节是 2.1.285 那种写法，少了 `<cc-memory>` 引用那句。
+    assert!(opus.contains("# Memory") && !opus.contains("<cc-memory"));
+    for gone in
+        ["# Delivering work", "# Writing for the user", "This iteration of Claude", "# auto memory"]
     {
-        assert!(asset.contains(section), "{section}");
+        assert!(!opus.contains(gone), "{gone}");
     }
-    // 2.1.277 那份才有的几节，2.1.280 整段删了；2.1.280 那份记忆一节的写法（`# auto memory`、
-    // `pinned`、`## Citing memories`），2.1.285 又换掉了。有一样在就是拿错了模板。
-    for gone in [
+    // fable 那份换回带自我介绍与两节写作说明的写法。
+    let fable = config::CC_SYSTEM_REST_FABLE;
+    for kept in [
+        "This iteration of Claude is Claude Fable 5.1",
         "# Delivering work",
         "# Writing for the user",
-        "This iteration of Claude",
-        "# auto memory",
-        "## Citing memories",
-        "pinned",
     ] {
-        assert!(!asset.contains(gone), "{gone}");
+        assert!(fable.contains(kept), "{kept}");
     }
+    // haiku 那份配长基座，记忆一节是 `# auto memory` 长写法。
+    assert!(config::CC_SYSTEM_REST_HAIKU.contains("# auto memory"));
+    assert_eq!(
+        config::CC_SYSTEM_BASE_HAIKU.chars().count(),
+        11050,
+        "cap/auto-2.1.291-20261006-full/00303"
+    );
+    assert!(!config::CC_SYSTEM_BASE_HAIKU.contains("easayliu"));
 }
 
-/// 四族都选同一份模板，填完一个占位都不剩；按抓包机的取值回填能还原抓包那块的字节数
-/// （`cap/2.1.285/00039` 的 5193 去掉 EndConversation 那段 233 字节 = 4960）。
+/// 各族选各自那份模板，填完一个占位都不剩；按抓包机的取值回填，字节数是模板多 38（两个占位
+/// 换成 `/Users/easayliu` 与那串 43 字节的项目段）。
 #[test]
 fn system_rest_renders_every_placeholder() {
     use crate::proxy::{SimEnv, cc_system_rest, render_system_rest};
@@ -1933,15 +1998,41 @@ fn system_rest_renders_every_placeholder() {
         "-private-tmp-proxy-captures-20260904-170955",
         "下划线也换成横线（cap/2.1.260-2/00013）"
     );
-    for m in ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"] {
+    for (m, template) in [
+        ("claude-opus-5", config::CC_SYSTEM_REST),
+        ("claude-sonnet-5-5", config::CC_SYSTEM_REST),
+        ("claude-fable-5-1", config::CC_SYSTEM_REST_FABLE),
+        ("claude-haiku-4-5-20251001", config::CC_SYSTEM_REST_HAIKU),
+    ] {
         let t = cc_system_rest(m).expect(m);
-        assert_eq!(t, config::CC_SYSTEM_REST, "{m}: 四族同一份");
+        assert_eq!(t, template, "{m}");
         let out = render_system_rest(t, &cap);
-        assert_eq!(out.len(), 4960, "{m}: 按 cap/2.1.285/00039 的取值回填");
+        assert_eq!(out.len(), template.len() + 38, "{m}");
         assert!(!unfilled(&out), "{m} 有占位没填: {out}");
-        assert!(out.contains(
-                "You have a persistent file-based memory at `/Users/easayliu/.claude/projects/-private-tmp-proxy-captures-20260930-143352/memory/`."
-            ));
+        assert!(
+            out.contains("/Users/easayliu/.claude/projects/-private-tmp-proxy-captures-20260930-143352/memory/`"),
+            "{m}"
+        );
+    }
+    // fable-5 不能拿到「我是 Fable 5.1」：只把自我介绍段换成 Fable 5 那段，其余与 5.1 那份相同
+    // （2.1.291 `function qIo` 按规范名挑这一段）。
+    let fable5 = cc_system_rest("claude-fable-5").unwrap();
+    assert!(fable5.contains(config::CC_FABLE_5_IDENTITY));
+    assert!(!fable5.contains("Claude Fable 5.1"), "fable-5 的提示词里不该出现 5.1");
+    assert_eq!(
+        fable5.replacen(config::CC_FABLE_5_IDENTITY, config::CC_FABLE_5_1_IDENTITY, 1),
+        config::CC_SYSTEM_REST_FABLE
+    );
+    for m in ["claude-fable-5-1", "claude-fable-5-1[1m]"] {
+        assert_eq!(cc_system_rest(m), Some(config::CC_SYSTEM_REST_FABLE), "{m}");
+    }
+    // 基座：haiku 那份长的，其余三族同一份。
+    assert_eq!(
+        super::cc_system_base("claude-haiku-4-5-20251001"),
+        Some(config::CC_SYSTEM_BASE_HAIKU)
+    );
+    for m in ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"] {
+        assert_eq!(super::cc_system_base(m), Some(config::CC_SYSTEM_BASE), "{m}");
     }
     // 认不出的模型不补第四块：落回「末块放客户端 system」的旧形态。
     assert!(cc_system_rest("gpt-4o").is_none());

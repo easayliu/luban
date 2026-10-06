@@ -319,7 +319,7 @@ impl EventBuilder<'_> {
             if shape.permission_mode == "auto"
                 && let Some(verdict) = tu.verdict.as_deref()
             {
-                let decision = auto_mode_decision_meta(
+                let mut decision = auto_mode_decision_meta(
                     &tu,
                     verdict,
                     None,
@@ -329,6 +329,9 @@ impl EventBuilder<'_> {
                     tu.id.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b))),
                     session_cwd.as_deref(),
                 );
+                if env.f.v291 {
+                    auto_mode_decision_v291(&mut decision);
+                }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
             let tg = ms(t_end, -3);

@@ -130,6 +130,9 @@ pub(super) struct ReqLog {
 impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
+        // 「额度宽限」头要的按账号事实之一（[`config::CC_USAGE_LIMIT_HEADER`]）：限流器跑过的
+        // 响应里额外用量停没停。
+        super::note_overage(self.cred_id, &self.ratelimit);
         // 下面两个分支会把 `stream_broke` take 掉；遥测那一步要知道这条有没有断，先记下。
         let stream_broke = self.stream_broke.clone();
         // 流内错误（`event: error` 裹在 200 里）：客户端拿到的是 200 + 错误负载，SDK 那头
@@ -469,6 +472,8 @@ impl Drop for ReqLog {
                 output_tokens: self.sniffer.output_tokens.unwrap_or(0),
                 cache_read_tokens: self.sniffer.cache_read_tokens.unwrap_or(0),
                 cache_creation_tokens: self.sniffer.cache_creation_tokens.unwrap_or(0),
+                cache_creation_5m_tokens: self.sniffer.cache_creation_5m,
+                cache_creation_1h_tokens: self.sniffer.cache_creation_1h,
                 text_chars: self.sniffer.text_chars,
                 reply_input_chars: self.sniffer.reply_input_chars(),
                 thinking_chars: self.sniffer.thinking_chars,

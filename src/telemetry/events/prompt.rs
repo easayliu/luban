@@ -242,6 +242,7 @@ impl EventBuilder<'_> {
             v277,
             v280,
             v285,
+            v291,
             injected,
             first_prompt_tpl,
             sleepy,
@@ -367,16 +368,21 @@ impl EventBuilder<'_> {
             // 各一条；之后切回 default 就没有了），续轮等其余请求见下面。代理看不见客户端的
             // 工作目录，结果照抓包报。
             if v280 && shape.permission_mode == "auto" {
-                self.push(
-                    ms(t0, -10),
-                    "tengu_auto_mode_git_state_probe",
-                    json!({
+                self.push(ms(t0, -10), "tengu_auto_mode_git_state_probe", {
+                    let mut probe = json!({
                         "duration_ms": u32::from(!prompt_index.is_multiple_of(3)),
                         "wait_ms": 0,
                         "outcome": git_outcome,
                         "truncated": false
-                    }),
-                );
+                    });
+                    // 2.1.291 多两项：会话第一次输入那条是进程里头一回探（`cap/auto-2.1.291-
+                    // 20261006-full` 8 个会话各一条 true，其余 67 条 false）。
+                    if v291 {
+                        probe["first_in_process"] = json!(prompt_index == 1);
+                        probe["repo_visibility_lookup"] = json!("none");
+                    }
+                    probe
+                });
             }
         }
     }

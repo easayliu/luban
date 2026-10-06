@@ -243,8 +243,17 @@ impl<'a> EventEnv<'a> {
     /// tether 收尾那条的写法，成功与被取消的两条路共用（取消报 `finalOutcome: aborted`，
     /// `cap/auto-2.1.285-20260930` 08:01:42.632）。
     pub(super) fn live_outcome(&self, final_outcome: &str) -> Option<Value> {
-        let EventEnv { call, shape, model_held, classifier_held, .. } = *self;
-        let TurnFacts { kind, v285, ref tether, ref betas_full, .. } = *self.f;
+        let EventEnv { call, shape, model_held, classifier_held, t0, .. } = *self;
+        let TurnFacts {
+            kind,
+            v285,
+            v291,
+            anchor_tool_call,
+            anchor_end,
+            ref tether,
+            ref betas_full,
+            ..
+        } = *self.f;
         let t = tether.as_ref()?;
         let sent = match shape.thread_type.as_deref() {
             Some("create") => "create",
@@ -302,6 +311,27 @@ impl<'a> EventEnv<'a> {
                 ],
             );
         }
+        // 2.1.291：队尾多四项线程计时（`cap/auto-2.1.291-20261006-full` 每条都有）。时间锚点是同一条线
+        // 上一条请求的收尾（[`TurnFacts::anchor_end`]：主线程含被 Esc 取消的那条，子代理看它自己那条
+        // 支线）：`threadIdleMs` 是它收尾到这条发出隔了多久，与这条续用还是另起线程无关——
+        // `create/config_changed` 那条也报 44369；没有锚点（会话第一条、子代理首条）报 -1。
+        // `anchorHasToolCall` 是上一条**有效回复**里有没有工具调用（被用户回答的 AskUserQuestion 之后
+        // 的新输入也是 true），不是「这条是工具续轮」。`threadLifetimeMs` 抓包里恒 -1。
+        if v291 {
+            let idle = anchor_end.map_or(-1, |end| {
+                let end: DateTime<Utc> = end.into();
+                (t0 - end).num_milliseconds().max(0)
+            });
+            if let Some(o) = live.as_object_mut() {
+                o.insert("threadIdleMs".into(), json!(idle));
+                o.insert("threadIdleMonotonicMs".into(), json!(idle));
+                o.insert("threadLifetimeMs".into(), json!(-1));
+                o.insert(
+                    "anchorHasToolCall".into(),
+                    json!(anchor_end.is_some() && anchor_tool_call),
+                );
+            }
+        }
         Some(live)
     }
 
@@ -317,6 +347,8 @@ impl<'a> EventEnv<'a> {
             deferred: self.shape.deferred_tools > 0,
             tool_search: tool_search_decision(self.shape, &f.display_model, f.kind.is_agent()),
             sdk: self.shape.sdk,
+            haiku: self.shape.model.contains("haiku"),
+            tools_off: self.shape.tools_off,
         }
     }
 }
@@ -365,8 +397,12 @@ impl<'a> EventBuilder<'a> {
         }
     }
 
-    pub(super) fn push(&mut self, dt: DateTime<Utc>, name: &str, extra: Value) {
+    /// 发一条事件。服务端下发的抽样配置在这里统一过一遍（[`sample_event`]），抽掉的不发。
+    pub(super) fn push(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
+        if !sample_event(name, &env.f.version, &mut extra) {
+            return;
+        }
         self.events.push((dt, env.f.identity.event(name, dt, &env.ctx(dt), extra)));
     }
 

@@ -31,6 +31,7 @@ impl EventBuilder<'_> {
             v277,
             v280,
             v285,
+            v291,
             first_main,
             ref snapshot,
             ref dd_model,
@@ -84,6 +85,18 @@ impl EventBuilder<'_> {
             put("outputTokens", json!(call.output_tokens));
             put("cachedInputTokens", json!(call.cache_read_tokens));
             put("uncachedInputTokens", json!(call.cache_creation_tokens));
+            // 2.1.291：缓存写入按 ttl 拆开报（`cap/auto-2.1.291-20261006-full` 主线程每条都有，
+            // 两项之和等于 `uncachedInputTokens`）。上游没给拆分时按这条请求的断点 ttl 归到一边。
+            if v291 {
+                let (m5, h1) = match (call.cache_creation_5m_tokens, call.cache_creation_1h_tokens)
+                {
+                    (Some(a), Some(b)) => (a, b),
+                    _ if shape.cache_ttl_1h => (0, call.cache_creation_tokens),
+                    _ => (call.cache_creation_tokens, 0),
+                };
+                put("cache_creation_5m_input_tokens", json!(m5));
+                put("cache_creation_1h_input_tokens", json!(h1));
+            }
             // 2.1.285：缓存没盖住的尾段，即最后一条带断点的消息之后那几条（[`tail_tokens_est`] 估
             // token）。`cap/2.1.285` 与 `cap/auto-2.1.285-20260930` 里五种取值：
             //
@@ -439,6 +452,7 @@ impl EventBuilder<'_> {
             prompt_seq,
             v280,
             v285,
+            v291,
             ref dd_model,
             sess_turn_tools,
             sess_turn_api_calls,
@@ -569,6 +583,17 @@ impl EventBuilder<'_> {
             // 报 `early_conversation`（auto 模式那个会话的首轮仍是 `cache_cold`）；其余的轮次客户端
             // 会发那条请求，这里不报，等它的结果——正文为空报 `empty`、被新输入顶掉报 `aborted`、
             // 出了建议则在下一次输入时报 `ignored`（见 [`ignored_suggestion_meta`]）。`-p` 模式不猜。
+            // 2.1.291：每轮收尾、猜下一句那条之前多一条消息展示钩子的统计（交互式才有，`-p` 没有；
+            // `cap/auto-2.1.291-20261006-full` 46 条，flushCount 绝大多数是 1，耗时 1 ~ 8ms、
+            // 只刷一次时 total 与 max 相同）。
+            if v291 && !shape.sdk {
+                let d = 2 + i64::from(env.req_hash % 6);
+                self.push(
+                    t1,
+                    "tengu_message_display_hooks",
+                    json!({ "flushCount": 1, "errorCount": 0, "totalDurationMs": d, "maxDurationMs": d }),
+                );
+            }
             if v280 && !shape.sdk {
                 let cold = call.cache_creation_tokens * 10 > call.cache_read_tokens;
                 let early = v285 && prompt_seq == 1 && shape.permission_mode != "auto";

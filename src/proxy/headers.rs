@@ -569,6 +569,12 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
     if sim.profile.kind != config::CcProfileKind::QuotaProbe {
         out.insert("anthropic-dispatch-id", HeaderValue::from_static(config::CC_DISPATCH_ID));
     }
+    // 2.1.291 起主线程工具续轮的「额度宽限」头，条件见 [`config::CC_USAGE_LIMIT_HEADER`]；线上位置
+    // 由 [`config::CC_HEADER_ORDER`] 归到 `anthropic-dispatch-id` 之后。
+    if sim.usage_limit {
+        let (name, value) = config::CC_USAGE_LIMIT_HEADER;
+        out.insert(name, HeaderValue::from_static(value));
+    }
     // 2.1.285 起与 billing header 里的 `cc_prompt_id` 同值同现（见 [`config::CC_HEADER_ORDER`]
     // 里那一项的出处）。
     if super::parse_version(sim.profile.version).is_some_and(|v| v >= (2, 1, 285))

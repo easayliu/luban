@@ -1294,6 +1294,16 @@ pub async fn keepalive_eval(
         .send()
         .await;
     match resp {
+        // 成功时读体：里面的服务端开关 `tengu_lantern_spool` 决定模拟请求带不带
+        // `anthropic-usage-limit`（[`crate::proxy::note_eval_features`]）。体按 `Content-Encoding`
+        // 由客户端解压（官方回的是 br）；读不出来就当没拉到，那个头照旧不写。
+        Ok(r) if r.status().is_success() => {
+            let status = r.status().as_u16();
+            if let Ok(body) = r.bytes().await {
+                crate::proxy::note_eval_features(ctx.cred_id, &body);
+            }
+            KeepaliveResult::from_status(status)
+        }
         Ok(r) => KeepaliveResult::from_response(r, "eval").await,
         Err(_) => KeepaliveResult::Failed,
     }

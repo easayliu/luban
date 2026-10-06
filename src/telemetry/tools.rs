@@ -442,6 +442,17 @@ pub(super) fn auto_mode_decision_meta(
     Value::Object(m)
 }
 
+/// 2.1.291 的 `tengu_auto_mode_decision` 多两项（`cap/auto-2.1.291-20261006-full` 每条都有）：
+/// `mcpRemoteSessionAllowOverride` 紧跟 `mcpAlwaysAllowOverride`，`fromTurnHandoff` 紧跟 `agentMsgId`。
+pub(super) fn auto_mode_decision_v291(v: &mut Value) {
+    insert_after(
+        v,
+        "mcpAlwaysAllowOverride",
+        vec![("mcpRemoteSessionAllowOverride", json!(false))],
+    );
+    insert_after(v, "agentMsgId", vec![("fromTurnHandoff", json!(false))]);
+}
+
 /// 路径的扩展名（不带点）；没有的为空。
 pub(super) fn file_ext(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);

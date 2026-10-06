@@ -617,6 +617,7 @@ fn body_flags_off_passes_through_byte_for_byte() {
         simulate_cc: false,
         simulate_full_system: false,
         fill_absent_tools: false,
+        sim_trim_tools: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -1562,6 +1563,7 @@ fn strip_extra_fields_is_wired_and_switchable() {
             simulate_cc: false,
             simulate_full_system: false,
             fill_absent_tools: false,
+            sim_trim_tools: false,
             sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -2236,6 +2238,7 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         simulate_cc: false,
         simulate_full_system: false,
         fill_absent_tools: false,
+        sim_trim_tools: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -2364,64 +2367,121 @@ fn ensure_fallbacks_inserts_at_the_official_position_and_keeps_client_arrays() {
     );
 }
 
-/// 注入的工具声明是 2.1.277 官方主线程恒带的 14 个真工具，四族同一份，不是四个。
+/// 注入的工具声明是 2.1.291 官方主线程恒带的 14 个真工具：opus / sonnet / fable 一份，haiku 一份
+/// （名字与先后相同、六条描述是长版），不是四个。
 ///
-/// 依据：`cap/2.1.277` 四族主线程（`00023` fable / `00031` sonnet / `00046` haiku / `00357`
-/// opus）的内建工具声明逐字节相同，去掉 `ToolSearch` + `DeferredToolPlaceholder` 那一对
-/// 延迟加载机制、用户自己的 `mcp__*` 与 opus / fable 独有的服务端工具 `advisor` 就是这 14 个。
+/// 依据：`cap/auto-2.1.291-20261006-full` 默认权限模式的主线程（`00340` opus / `00253` sonnet /
+/// `00303` haiku），去掉 `ToolSearch` + `DeferredToolPlaceholder` 那一对延迟加载机制、用户自己的
+/// `mcp__*` 与服务端工具 `advisor` 就是这 14 个。
 #[test]
 fn core_tool_stubs_are_profile_specific() {
-    let opus = crate::proxy::cc_tools_core(config::cc_profile(config::CcProfileKind::MainOpus));
+    use config::CcProfileKind::*;
+    let opus = crate::proxy::cc_tools_core(config::cc_profile(MainOpus), false);
+    let haiku = crate::proxy::cc_tools_core(config::cc_profile(MainHaiku), false);
     let names = |t: &[serde_json::Value]| -> Vec<String> {
         t.iter().map(|x| x["name"].as_str().unwrap_or("?").to_string()).collect()
     };
     // **顺序也是抓包的一部分**：这 14 个的相对次序是官方声明序，不是字母序（`Write` 排在
     // `Workflow` 之后）。资产按字母序或按手写顺序排都会得到一个官方不产生的排列，而这种
     // 错不会有任何运行期症状。
-    assert_eq!(
-        names(opus),
-        [
-            "Agent",
-            "Artifact",
-            "AskUserQuestion",
-            "Bash",
-            "Edit",
-            "ListAgents",
-            "Read",
-            "ReportFindings",
-            "ScheduleWakeup",
-            "SendFeedback",
-            "ShareOnboardingGuide",
-            "Skill",
-            "Workflow",
-            "Write",
-        ],
-        "官方主线程恒带的 14 个真工具与其次序（cap/2.1.277/00023）"
-    );
-    // 延迟加载那一对、服务端工具与 MCP 工具故意不注。
-    for absent in ["ToolSearch", "DeferredToolPlaceholder", "advisor"] {
-        assert!(!names(opus).iter().any(|n| n == absent), "{absent} 不该注入");
+    let expected = [
+        "Agent",
+        "Artifact",
+        "AskUserQuestion",
+        "Bash",
+        "Edit",
+        "ListAgents",
+        "Read",
+        "ReportFindings",
+        "ScheduleWakeup",
+        "SendFeedback",
+        "ShareOnboardingGuide",
+        "Skill",
+        "Workflow",
+        "Write",
+    ];
+    assert_eq!(names(opus), expected, "官方主线程恒带的 14 个真工具与其次序");
+    assert_eq!(names(haiku), expected, "haiku 名字与先后同一份");
+    for asset in [opus, haiku] {
+        // 延迟加载那一对、服务端工具与 MCP 工具故意不注。
+        for absent in ["ToolSearch", "DeferredToolPlaceholder", "advisor"] {
+            assert!(!names(asset).iter().any(|n| n == absent), "{absent} 不该注入");
+        }
+        assert!(!names(asset).iter().any(|n| n.starts_with("mcp__")), "用户的 MCP 工具不注");
+        // `eager_input_streaming` 原样保留：四族每个内建工具都带。
+        assert!(asset.iter().all(|t| t["eager_input_streaming"] == true), "全带");
+        assert!(asset.iter().all(|t| t.get("defer_loading").is_none()), "正文声明的都不是延迟池的");
+        assert!(asset.iter().all(|t| t.get("type").is_none()), "没有服务端工具");
     }
-    assert!(!names(opus).iter().any(|n| n.starts_with("mcp__")), "用户的 MCP 工具不注");
-    // `eager_input_streaming` 原样保留：2.1.277 四族每个内建工具都带（fable 也带了）。
-    assert!(opus.iter().all(|t| t["eager_input_streaming"] == true), "全带");
-    assert!(opus.iter().all(|t| t.get("defer_loading").is_none()), "正文声明的都不是延迟池的");
-    assert!(opus.iter().all(|t| t.get("type").is_none()), "没有服务端工具");
-    // 四族同一份。
-    for kind in [
-        config::CcProfileKind::MainFable,
-        config::CcProfileKind::MainSonnet,
-        config::CcProfileKind::MainHaiku,
-    ] {
-        assert_eq!(crate::proxy::cc_tools_core(config::cc_profile(kind)), opus, "{kind:?}");
+    // opus / sonnet / fable 同一份。
+    for kind in [MainFable, MainSonnet] {
+        assert_eq!(crate::proxy::cc_tools_core(config::cc_profile(kind), false), opus, "{kind:?}");
     }
-    // 2.1.277 的 Bash 描述里有的那句，是资产真的换到了 2.1.277 的最短证据。
+    // haiku 那份六条是长描述，其余八条与 opus 逐字节相同。
+    let d = |a: &[serde_json::Value], n: &str| {
+        serde_json::to_string(a.iter().find(|t| t["name"] == n).unwrap()).unwrap()
+    };
+    for n in ["Agent", "AskUserQuestion", "Bash", "Edit", "Read", "Write"] {
+        assert_ne!(d(opus, n), d(haiku, n), "{n}");
+    }
+    for n in ["Artifact", "ListAgents", "ReportFindings", "ScheduleWakeup", "SendFeedback"] {
+        assert_eq!(d(opus, n), d(haiku, n), "{n}");
+    }
+    // Bash 取的是默认权限模式那版（多一句别用 Bash 跑 cat 那类命令），是资产真的换到了 2.1.291
+    // 默认模式的最短证据；auto 模式那版（2707 字节）没有这一句。
     let bash = opus.iter().find(|t| t["name"] == "Bash").unwrap();
     assert!(
-        bash["description"].as_str().unwrap().contains("Interactive flags"),
-        "Bash 描述取自 cap/2.1.277/00023: {}",
+        bash["description"].as_str().unwrap().contains("Avoid using this tool to run `cat`"),
+        "Bash 描述取自 cap/auto-2.1.291-20261006-full/00340: {}",
         bash["description"]
     );
+    assert_eq!(d(opus, "Bash").chars().count(), 3018);
+    assert_eq!(d(opus, "Artifact").chars().count(), 34399);
+    assert_eq!(d(haiku, "Bash").chars().count(), 11913);
+}
+
+/// 开关 `sim_trim_tools`：注入的官方工具去掉 Artifact / ListAgents / SendFeedback，剩 11 条、先后
+/// 不变、其余逐字节同完整那份；四族都是（`cap/auto-2.1.291-20261006` 关前 / 关后各一对）。整条模拟
+/// 路径开着这项时出站也正好是这 11 条。
+#[test]
+fn trim_switch_drops_exactly_the_three_user_switchable_tools() {
+    use config::CcProfileKind::*;
+    for kind in [MainOpus, MainFable, MainSonnet, MainHaiku] {
+        let profile = config::cc_profile(kind);
+        let full = crate::proxy::cc_tools_core(profile, false);
+        let trim = crate::proxy::cc_tools_core(profile, true);
+        let kept: Vec<&serde_json::Value> = full
+            .iter()
+            .filter(|t| {
+                !["Artifact", "ListAgents", "SendFeedback"].contains(&t["name"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(trim.len(), 11, "{kind:?}");
+        assert_eq!(trim.iter().collect::<Vec<_>>(), kept, "{kind:?}: 其余 11 条逐条相同、先后不变");
+    }
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let raw = Bytes::from_static(
+        br#"{"model":"claude-opus-5-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let flags = store::ForwardFlags { sim_trim_tools: true, ..all_on() };
+    let sim = detect_for(&raw, flags).unwrap();
+    assert!(sim.trim_tools);
+    let v: serde_json::Value =
+        serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", flags, Some(&sim), None))
+            .unwrap();
+    let names: Vec<&str> =
+        v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 11, "{names:?}");
+    assert!(!names.iter().any(|n| ["Artifact", "ListAgents", "SendFeedback"].contains(n)));
+    // 默认开着；关掉是完整的 14 条。
+    assert!(all_on().sim_trim_tools, "默认启用");
+    let off = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
+    let sim = detect_for(&raw, off).unwrap();
+    assert!(!sim.trim_tools);
+    let v: serde_json::Value =
+        serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", off, Some(&sim), None))
+            .unwrap();
+    assert_eq!(v["tools"].as_array().unwrap().len(), 14);
 }
 
 /// [`inject_cc_tools`] 的身份参数：只进日志，取什么值都不影响这几个用例验的东西。
@@ -2434,48 +2494,53 @@ fn who() -> super::ToolAlignWho<'static> {
 #[test]
 fn cc_tools_to_inject_names_exactly_what_gets_injected() {
     let profile = config::cc_profile(config::CcProfileKind::MainOpus);
-    let all: Vec<&str> =
-        crate::proxy::cc_tools_core(profile).iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let all: Vec<&str> = crate::proxy::cc_tools_core(profile, false)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     let body = |tools: &str| -> serde_json::Value {
         serde_json::from_str(&format!(r#"{{"model":"claude-opus-5","messages":[]{tools}}}"#))
             .unwrap()
     };
     // 不带工具的三种写法（没有键、null、空数组）一视同仁：开关关着一个都不注，开着全缺。
     for tools in ["", r#","tools":null"#, r#","tools":[]"#] {
-        assert!(super::cc_tools_to_inject(&body(tools), profile, false).is_empty(), "{tools}");
-        assert_eq!(super::cc_tools_to_inject(&body(tools), profile, true), all, "{tools}");
+        assert!(
+            super::cc_tools_to_inject(&body(tools), profile, false, false).is_empty(),
+            "{tools}"
+        );
+        assert_eq!(super::cc_tools_to_inject(&body(tools), profile, true, false), all, "{tools}");
     }
     // 不带工具却要求必须调工具（any / 指定工具）：不补，别逼模型去调注入的工具。
     for choice in [r#"{"type":"any"}"#, r#"{"type":"tool","name":"x"}"#] {
         let v = body(&format!(r#","tool_choice":{choice}"#));
-        assert!(super::cc_tools_to_inject(&v, profile, true).is_empty(), "{choice}");
+        assert!(super::cc_tools_to_inject(&v, profile, true, false).is_empty(), "{choice}");
     }
     // auto / none 照补：none 下模型本来就不会调。
     for choice in [r#"{"type":"auto"}"#, r#"{"type":"none"}"#] {
         let v = body(&format!(r#","tool_choice":{choice}"#));
-        assert_eq!(super::cc_tools_to_inject(&v, profile, true), all, "{choice}");
+        assert_eq!(super::cc_tools_to_inject(&v, profile, true, false), all, "{choice}");
     }
     // 带了工具的请求与开关无关：照旧补缺。
     let own = body(r#","tools":[{"name":"exec"}],"tool_choice":{"type":"any"}"#);
-    assert_eq!(super::cc_tools_to_inject(&own, profile, false), all);
+    assert_eq!(super::cc_tools_to_inject(&own, profile, false, false), all);
     // 怪值（不是数组也不是 null）不动。
-    assert!(super::cc_tools_to_inject(&body(r#","tools":{}"#), profile, true).is_empty());
+    assert!(super::cc_tools_to_inject(&body(r#","tools":{}"#), profile, true, false).is_empty());
     // 已带部分官方名：只补缺的，顺序仍是官方声明序。
     let partial = body(r#","tools":[{"name":"Skill"},{"name":"Bash"},{"name":"TaskCreate"}]"#);
     let expect: Vec<&str> =
         all.iter().copied().filter(|n| !["Skill", "Bash"].contains(n)).collect();
-    assert_eq!(super::cc_tools_to_inject(&partial, profile, false), expect);
+    assert_eq!(super::cc_tools_to_inject(&partial, profile, false, false), expect);
     // 14 个全声明了：不注。
     let full = body(&format!(
         r#","tools":[{}]"#,
         all.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
     ));
-    assert!(super::cc_tools_to_inject(&full, profile, false).is_empty());
+    assert!(super::cc_tools_to_inject(&full, profile, false, false).is_empty());
     // 只有第三方名：全部 14 个，与真正注进去的一致。
     let mut v = body(r#","tools":[{"name":"exec"},{"name":"read_file"}]"#);
-    let planned = super::cc_tools_to_inject(&v, profile, false);
+    let planned = super::cc_tools_to_inject(&v, profile, false, false);
     assert_eq!(planned, all);
-    assert!(super::inject_cc_tools(&mut v, profile, false, who()));
+    assert!(super::inject_cc_tools(&mut v, profile, false, false, who()));
     let injected: Vec<&str> = v["tools"]
         .as_array()
         .unwrap()
@@ -2524,7 +2589,8 @@ fn injection_stats_follow_the_rewritten_body_not_the_inbound_one() {
         assert_eq!((n, filled), (0, false), "{choice}: 统计按出站，不记 tools_filled");
     }
     let (n, filled, _) = stats(r#""auto""#);
-    assert_eq!((n, filled), (14, true), "auto 归一后照补，统计也记上");
+    // 默认开着 `sim_trim_tools`：注的是 11 条。
+    assert_eq!((n, filled), (11, true), "auto 归一后照补，统计也记上");
     // 自带工具只被补缺的：有注入名单，但不是 `tools_filled`。
     let raw = Bytes::from_static(
             br#"{"model":"claude-sonnet-5","max_tokens":64,"tools":[{"name":"exec","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}"#,
@@ -2534,7 +2600,7 @@ fn injection_stats_follow_the_rewritten_body_not_the_inbound_one() {
     let out: serde_json::Value =
         serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", flags, Some(&sim), None))
             .unwrap();
-    assert_eq!(super::injected_tools_of(&inbound, &out, sim.profile).len(), 14);
+    assert_eq!(super::injected_tools_of(&inbound, &out, sim.profile).len(), 11);
     assert!(!super::declares_no_tools(&inbound));
 }
 
@@ -2555,18 +2621,19 @@ fn tool_less_requests_get_the_official_tools_only_when_the_switch_is_on() {
             .unwrap();
     let names: Vec<&str> =
         v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    let all: Vec<&str> = crate::proxy::cc_tools_core(sim.profile)
+    let all: Vec<&str> = crate::proxy::cc_tools_core(sim.profile, sim.trim_tools)
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, all, "按官方声明序补齐 14 个");
+    assert!(sim.trim_tools, "默认开着精简");
+    assert_eq!(names, all, "按官方声明序补齐（默认精简后 11 个）");
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
     assert!(at("system") < at("tools") && at("tools") < at("metadata"), "官方键序: {keys:?}");
     assert!(v.get("tool_choice").is_none(), "不补 tool_choice（接受模型会调用的风险）");
     let body_in: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(
-        super::cc_tools_to_inject(&body_in, sim.profile, sim.fill_absent_tools),
+        super::cc_tools_to_inject(&body_in, sim.profile, sim.fill_absent_tools, sim.trim_tools),
         all,
         "流水认注入工具的名单与真正注进去的一致"
     );
@@ -2608,7 +2675,7 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
         (config::CcProfileKind::MainFable, "claude-fable-5-1", true),
     ] {
         let profile = config::cc_profile(kind);
-        let asset = crate::proxy::cc_tools_core(profile);
+        let asset = crate::proxy::cc_tools_core(profile, false);
         let asset_read = asset.iter().find(|t| t["name"] == "Read").unwrap();
         let asset_bash = asset.iter().find(|t| t["name"] == "Bash").unwrap();
         let mut v = serde_json::json!({
@@ -2618,7 +2685,7 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
                 {"name": "Bash", "description": "mine", "input_schema": {"type": "object"}}
             ]
         });
-        assert!(super::inject_cc_tools(&mut v, profile, false, who()));
+        assert!(super::inject_cc_tools(&mut v, profile, false, false, who()));
         let tools = v["tools"].as_array().unwrap();
         let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
         let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
@@ -2659,7 +2726,7 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
 #[test]
 fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
     let profile = config::cc_profile(config::CcProfileKind::MainOpus);
-    let official = crate::proxy::cc_tools_core(profile);
+    let official = crate::proxy::cc_tools_core(profile, false);
     let official_read = official.iter().find(|t| t["name"] == "Read").unwrap();
     let official_bash = official.iter().find(|t| t["name"] == "Bash").unwrap();
     // Read：抄了参数表面（同一组 properties / required），自己写的描述 → 换。
@@ -2675,10 +2742,10 @@ fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
         "model": "claude-opus-5", "messages": [],
         "tools": [{"name": "my_tool", "input_schema": {"type": "object"}}, client_read, client_bash, {"name": "TaskCreate", "input_schema": {"type": "object"}}]
     });
-    let planned = super::cc_tools_to_inject(&v, profile, false);
+    let planned = super::cc_tools_to_inject(&v, profile, false, false);
     assert!(!planned.contains(&"Read") && !planned.contains(&"Bash"), "{planned:?}");
     assert_eq!(planned.len(), 12, "14 个里客户端已有 Read / Bash 两个");
-    assert!(super::inject_cc_tools(&mut v, profile, false, who()));
+    assert!(super::inject_cc_tools(&mut v, profile, false, false, who()));
     let tools = v["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     // 头部是完整的 14 条、按官方声明序（客户端的 Read / Bash 被挪进这一段）；客户端其余
@@ -2700,7 +2767,7 @@ fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
 #[test]
 fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     let profile = config::cc_profile(config::CcProfileKind::MainOpus);
-    let official = crate::proxy::cc_tools_core(profile);
+    let official = crate::proxy::cc_tools_core(profile, false);
     let expected = serde_json::to_string(official).unwrap();
     // 倒序声明，并把第一条（Write）的键序打乱：input_schema 提到 name 之前。
     let mut declared: Vec<serde_json::Value> = official.iter().rev().cloned().collect();
@@ -2721,8 +2788,8 @@ fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     declared[0] = scrambled;
     declared.push(serde_json::json!({"name": "my_tool", "input_schema": {"type": "object"}}));
     let mut v = serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": declared});
-    assert!(super::cc_tools_to_inject(&v, profile, false).is_empty(), "一个都不缺");
-    assert!(super::inject_cc_tools(&mut v, profile, false, who()), "次序与键序都要改");
+    assert!(super::cc_tools_to_inject(&v, profile, false, false).is_empty(), "一个都不缺");
+    assert!(super::inject_cc_tools(&mut v, profile, false, false, who()), "次序与键序都要改");
     let tools = v["tools"].as_array().unwrap();
     assert_eq!(
         serde_json::to_string(&tools[..14]).unwrap(),
@@ -2731,7 +2798,7 @@ fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     );
     assert_eq!(tools[14]["name"], "my_tool");
     // 已经是官方形态的再过一遍什么都不动。
-    assert!(!super::inject_cc_tools(&mut v, profile, false, who()));
+    assert!(!super::inject_cc_tools(&mut v, profile, false, false, who()));
 }
 
 /// Windows 那种**扁平** `metadata.user_id` 同样要认，额度探测复用它的**原文**。
@@ -3673,7 +3740,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 285)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 291)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -4383,18 +4450,19 @@ fn sim_threads_fall_back_to_create_when_the_history_does_not_follow() {
     assert_eq!(v["thread"], create, "上一条 continue 失败后线程作废");
 }
 
-/// fable-5-1 官方一条 `thread` 都不发（`cap/auto-2.1.285-20260930/00383`、`00554`），
-/// `<total_tokens>` 提醒照带；开关关着时两样都不写。
+/// fable-5-1 在 2.1.285 一条 `thread` 都不发（`cap/auto-2.1.285-20260930/00383`、`00554`），2.1.291 起
+/// 也发了（`cap/auto-2.1.291-20261006-full/00464` 首轮 `create`）——模拟路径用 2.1.291 表，跟着写；
+/// `<total_tokens>` 提醒两版都带；开关关着时两样都不写。
 #[test]
-fn sim_threads_skip_fable_5_1_and_respect_the_switch() {
+fn sim_threads_follow_the_version_for_fable_5_1_and_respect_the_switch() {
     let msgs = serde_json::json!([{ "role": "user", "content": "线程测试·豁免" }]);
     let (v, p) = thread_turn(&thread_body("claude-fable-5-1", msgs.clone()), all_on());
-    assert!(v.get("thread").is_none(), "{v}");
+    assert_eq!(v["thread"]["type"], "create", "2.1.291 的 fable-5-1 发: {v}");
     assert_eq!(
         v["messages"][1]["content"][0]["text"], "<total_tokens>15000000 tokens left</total_tokens>",
-        "不写 thread 也带提醒（00383）"
+        "提醒照带"
     );
-    assert!(p.is_some_and(|p| !p.is_continue()), "倒数状态照记");
+    assert!(p.is_some_and(|p| !p.is_continue()), "按 create 提交");
     let (v, _) = thread_turn(&thread_body("claude-fable-5", msgs.clone()), all_on());
     assert_eq!(v["thread"]["type"], "create", "fable-5 发: {v}");
     let off = store::ForwardFlags { sim_message_threads: false, ..all_on() };

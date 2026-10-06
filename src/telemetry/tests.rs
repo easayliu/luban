@@ -217,6 +217,8 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             output_tokens: 31,
             cache_read_tokens: 26736,
             cache_creation_tokens: 8729,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             text_chars: 87,
             reply_input_chars: 87,
             thinking_chars: 0,
@@ -3272,4 +3274,590 @@ fn a_peer_opening_turn_does_not_take_a_prompt_number() {
         .filter(|(_, e)| ev_name(e) == "tengu_policy_limits_cache_state_at_first_prompt")
         .count();
     assert_eq!(first_prompt_only, 1, "首轮那串只发一次");
+}
+
+/// 正文换成给定的几个工具（各带 `input_schema`），其余同 [`cc_body`]。
+fn body_with_tools(names: &[&str]) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+    v["tools"] = Value::Array(
+        names
+            .iter()
+            .map(|n| json!({"name": n, "description": "d", "input_schema": {"type": "object"}}))
+            .collect(),
+    );
+    v.to_string().into_bytes()
+}
+
+/// 一个 2.1.291 会话的首轮：返回事件链（名字 + meta）。
+fn first_turn_2_1_291(body: Vec<u8>) -> Vec<(String, Value)> {
+    let t = Telemetry::default();
+    let mut c = call(body, "req_291", "end_turn");
+    c.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    c.cache_creation_5m_tokens = Some(0);
+    c.cache_creation_1h_tokens = Some(8729);
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    p.events
+        .iter()
+        .map(|(_, e)| {
+            let name = e["event_data"]["event_name"]
+                .as_str()
+                .or_else(|| e["event_data"]["experiment_id"].as_str())
+                .unwrap_or("?")
+                .to_string();
+            let meta = if e["event_data"]["additional_metadata"].is_string() {
+                meta_of(e)
+            } else {
+                Value::Null
+            };
+            (name, meta)
+        })
+        .collect()
+}
+
+/// 2.1.291 的遥测（`cap/auto-2.1.291-20261006-full`）：服务端抽样配置下 `api_before/after_normalize`、
+/// `query_before/after_attachments` 不发；收尾多一条 `message_display_hooks`；会话首条多一条
+/// `session_transcript_write`；`api_success` 多按 ttl 拆开的缓存写入；实验曝光换成
+/// `tengu_ochre_wren-agnostic-intro`；模板里 `signed_cache_shadow` 多 `verify_micros`。
+#[test]
+fn version_2_1_291_telemetry_shape() {
+    let ev = first_turn_2_1_291(cc_body(true));
+    let has = |n: &str| ev.iter().any(|(x, _)| x == n);
+    for gone in [
+        "tengu_api_before_normalize",
+        "tengu_api_after_normalize",
+        "tengu_query_before_attachments",
+        "tengu_query_after_attachments",
+        "tengu_time_shell",
+        "tengu_sleepy_shore_v1",
+    ] {
+        assert!(!has(gone), "{gone}");
+    }
+    for n in ["tengu_message_display_hooks", "tengu_ochre_wren-agnostic-intro"] {
+        assert!(has(n), "{n}");
+    }
+    assert!(
+        ev.iter().any(
+            |(n, m)| n == "tengu_feature_ok" && m["feature_name"] == "session_transcript_write"
+        ),
+        "会话首条写会话记录"
+    );
+    // 抽中的 1% 带 `sample_rate`，没抽中的整条不发；带着就得是 0.01。
+    for (n, m) in &ev {
+        if n == "tengu_api_cache_breakpoints" || n.starts_with("tengu_sysprompt_") {
+            assert_eq!(m["sample_rate"], json!(0.01), "{n}");
+        }
+    }
+    let success = &ev.iter().find(|(n, _)| n == "tengu_api_success").unwrap().1;
+    let keys: Vec<&str> = success.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+    assert_eq!(at("cache_creation_5m_input_tokens"), at("uncachedInputTokens") + 1);
+    assert_eq!(at("cache_creation_1h_input_tokens"), at("uncachedInputTokens") + 2);
+    assert_eq!(success["cache_creation_1h_input_tokens"], 8729);
+    let shadow = &ev.iter().find(|(n, _)| n == "tengu_signed_cache_shadow").unwrap().1;
+    assert!(shadow.get("verify_micros").is_some(), "{shadow}");
+}
+
+/// 开关 `sim_trim_tools` 的遥测侧：正文里有官方工具却没有 Artifact / ListAgents / SendFeedback
+/// 时，按官方用户用环境变量关掉这三项的样子报（`cap/auto-2.1.291-20261006` 关前 / 关后对照）。
+#[test]
+fn trimmed_tools_are_reported_like_the_env_switches() {
+    let full = first_turn_2_1_291(body_with_tools(&[
+        "Agent",
+        "Artifact",
+        "Bash",
+        "ListAgents",
+        "Read",
+        "SendFeedback",
+    ]));
+    let trimmed = first_turn_2_1_291(body_with_tools(&["Agent", "Bash", "Read"]));
+    let meta =
+        |ev: &[(String, Value)], n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone());
+    let has = |ev: &[(String, Value)], n: &str| ev.iter().any(|(x, _)| x == n);
+
+    let env_vars = |ev: &[(String, Value)]| meta(ev, "tengu_startup_telemetry").unwrap();
+    assert_eq!(env_vars(&full)["set_env_vars"], "CLAUDE_CODE_SSE_PORT");
+    let t = env_vars(&trimmed);
+    assert_eq!(
+        t["set_env_vars"],
+        "CLAUDE_CODE_DISABLE_ARTIFACT,CLAUDE_CODE_HARBOR_KITE,CLAUDE_CODE_SEND_FEEDBACK,CLAUDE_CODE_SSE_PORT",
+        "按名字排序"
+    );
+    assert_eq!(t["set_env_var_count"], 4);
+
+    assert!(!has(&full, "tengu_artifact_disabled_session"));
+    let disabled = meta(&trimmed, "tengu_artifact_disabled_session").expect("关掉的会话有这一条");
+    assert_eq!(disabled["mechanism"], "env");
+    assert_eq!(disabled["session_interactivity"], "interactive");
+    let timer =
+        trimmed.iter().position(|(n, m)| n == "tengu_timer" && m["event"] == "startup").unwrap();
+    assert_eq!(trimmed[timer + 1].0, "tengu_artifact_disabled_session", "紧跟启动计时");
+
+    for n in [
+        "tengu_artifact_five_class_asks",
+        "tengu_artifact_inherited_type_grant",
+        "tengu_artifact_text_variant",
+        "tengu_uds_startup_bind",
+    ] {
+        assert!(has(&full, n), "{n}");
+        assert!(!has(&trimmed, n), "{n}");
+    }
+    assert!(has(&trimmed, "tengu_artifact_toolset"), "官方关掉后这条照发（on 仍为 true）");
+
+    let ctx = |ev: &[(String, Value)]| {
+        let m = meta(ev, "tengu_context_size").unwrap();
+        (m["non_mcp_tools_count"].clone(), m["non_mcp_tools_tokens"].clone())
+    };
+    assert_eq!(ctx(&full), (json!(34), json!(13834)));
+    assert_eq!(ctx(&trimmed), (json!(29), json!(6983)));
+}
+
+/// [`cc_body`] 换模型与 effort（`None` 即去掉 `output_config.effort`，haiku 那样）。
+fn body_for(model: &str, effort: Option<&str>, last_user_text: bool) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&cc_body(last_user_text)).unwrap();
+    v["model"] = json!(model);
+    match effort {
+        Some(e) => v["output_config"] = json!({ "effort": e }),
+        None => {
+            v.as_object_mut().unwrap().remove("output_config");
+        }
+    }
+    v.to_string().into_bytes()
+}
+
+/// 2.1.291 子代理那条 `agent_tool_selected` 的 `session_effort` / `subagent_effort`：有才报，各取各的
+/// ——opus 主线程起的 opus Explore 两项都是 high，haiku 主线程起的 haiku Explore 两项都不在
+/// （`cap/auto-2.1.291-20261006-full` A0 与 E4 会话）。
+#[test]
+fn agent_tool_selected_reports_only_the_efforts_that_exist() {
+    for (model, effort) in [("claude-opus-5-5", Some("high")), ("claude-haiku-4-5-20251001", None)]
+    {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let mut main = call(body_for(model, effort, true), "req_main", "tool_use");
+        main.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+        main.started_at = base;
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input: json!({}),
+            verdict: None,
+        }];
+        t.ingest(main);
+        let mut sub = call(body_for(model, effort, true), "req_sub", "end_turn");
+        sub.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+        sub.started_at = base + Duration::from_secs(5);
+        sub.agent = AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("Explore".into()),
+            request_class: Some("subagent".into()),
+        };
+        t.ingest(sub);
+        let st = t.0.state.lock();
+        let p = st.pending.get(&key()).expect("queued");
+        let selected = p
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|(_, e)| meta_of(e))
+            .unwrap_or_else(|| panic!("{model}: 没有 agent_tool_selected"));
+        match effort {
+            Some(e) => {
+                assert_eq!(selected["session_effort"], e, "{model}");
+                assert_eq!(selected["subagent_effort"], e, "{model}");
+                let keys: Vec<&str> =
+                    selected.as_object().unwrap().keys().map(String::as_str).collect();
+                let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+                assert_eq!(at("session_effort"), at("is_fork") + 1);
+            }
+            None => {
+                assert!(selected.get("session_effort").is_none(), "{model}: {selected}");
+                assert!(selected.get("subagent_effort").is_none(), "{model}: {selected}");
+            }
+        }
+    }
+}
+
+/// 2.1.291 `tether_live_outcome` 的线程计时看锚点（同一条线上一条回复），不看这条是续用还是另起：
+/// 会话第一条 -1 / false；换了 effort 另起线程（`create/config_changed`）的那条照样报离上一条回复
+/// 收尾的毫秒数，上一条回复带了工具调用就是 `anchorHasToolCall: true`
+/// （`cap/auto-2.1.291-20261006-full` A0 那条 config_changed 报 44369）。
+#[test]
+fn tether_thread_timing_follows_the_anchor_not_the_thread_type() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut first = call(body_for("claude-opus-5-5", Some("high"), true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    first.started_at = base;
+    first.total_ms = 2_000;
+    first.tool_calls =
+        vec![ToolCall { id: "t9".into(), name: "Bash".into(), input: json!({}), verdict: None }];
+    t.ingest(first);
+    // effort 换了：tether 另起线程。
+    let mut second = call(body_for("claude-opus-5-5", Some("low"), true), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    second.started_at = base + Duration::from_secs(30);
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    let live: Vec<Value> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_tether_live_outcome")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    assert_eq!(live.len(), 2);
+    assert_eq!(live[0]["threadIdleMs"], -1);
+    assert_eq!(live[0]["anchorHasToolCall"], false);
+    assert_eq!(live[1]["engineDecision"], "create", "{}", live[1]);
+    let idle = live[1]["threadIdleMs"].as_i64().unwrap();
+    assert!((27_000..=29_000).contains(&idle), "离上一条收尾约 28s: {idle}");
+    assert_eq!(live[1]["threadIdleMonotonicMs"], idle);
+    assert_eq!(live[1]["anchorHasToolCall"], true, "上一条回复带了工具调用");
+    assert_eq!(live[1]["threadLifetimeMs"], -1);
+}
+
+/// 某个会话里 tether 收尾那几条的 meta，按 `sourceCategory` 筛。
+fn live_outcomes(t: &Telemetry, category: &str) -> Vec<Value> {
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    p.events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_tether_live_outcome")
+        .map(|(_, e)| meta_of(e))
+        .filter(|m| m["sourceCategory"] == category)
+        .collect()
+}
+
+/// 子代理的时间锚点是它自己那条支线：首条没有锚点报 -1（`cap/auto-2.1.291-20261006-full` 的
+/// `00073`、`00087`、`00172` 等子代理首条都是），第二条从它自己第一条收尾算起，与主线程无关。
+#[test]
+fn subagent_tether_idle_is_anchored_on_its_own_branch() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    main.started_at = base;
+    main.total_ms = 2_000;
+    main.tool_calls =
+        vec![ToolCall { id: "t1".into(), name: "Agent".into(), input: json!({}), verdict: None }];
+    t.ingest(main);
+    let sub = |rid: &str, at: u64, last_user_text: bool, stop: &str| {
+        let mut c = call(body_for("claude-opus-5-5", Some("high"), last_user_text), rid, stop);
+        c.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+        c.started_at = base + Duration::from_secs(at);
+        c.total_ms = 3_000;
+        c.agent = AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("Explore".into()),
+            request_class: Some("subagent".into()),
+        };
+        c
+    };
+    let mut first = sub("req_sub_1", 10, true, "tool_use");
+    first.tool_calls =
+        vec![ToolCall { id: "t2".into(), name: "Read".into(), input: json!({}), verdict: None }];
+    t.ingest(first);
+    t.ingest(sub("req_sub_2", 20, false, "end_turn"));
+    let live = live_outcomes(&t, "subagent");
+    assert_eq!(live.len(), 2, "{live:?}");
+    assert_eq!(live[0]["threadIdleMs"], -1, "子代理首条没有锚点");
+    assert_eq!(live[0]["anchorHasToolCall"], false);
+    let idle = live[1]["threadIdleMs"].as_i64().unwrap();
+    assert!((6_500..=7_500).contains(&idle), "从它自己第一条收尾（13s）算到 20s: {idle}");
+    assert_eq!(live[1]["anchorHasToolCall"], true);
+}
+
+/// 主线程被 Esc 取消的那条也是时间锚点：之后重建线程的那条 idle 从取消那条收尾算起
+/// （`cap/auto-2.1.291-20261006-full/00354` 报 9539），工具锚点仍看上一条有效回复。
+#[test]
+fn cancelled_main_request_still_anchors_the_tether_idle() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut ok = call(body_for("claude-opus-5-5", Some("high"), true), "req_1", "tool_use");
+    ok.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    ok.started_at = base;
+    ok.total_ms = 2_000;
+    ok.tool_calls =
+        vec![ToolCall { id: "t3".into(), name: "Bash".into(), input: json!({}), verdict: None }];
+    t.ingest(ok);
+    let mut cancelled = call(body_for("claude-opus-5-5", Some("high"), true), "req_2", "end_turn");
+    cancelled.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    cancelled.started_at = base + Duration::from_secs(10);
+    cancelled.total_ms = 2_000;
+    cancelled.aborted = true;
+    t.ingest(cancelled);
+    let mut next = call(body_for("claude-opus-5-5", Some("low"), true), "req_3", "end_turn");
+    next.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    next.started_at = base + Duration::from_secs(20);
+    t.ingest(next);
+    let live = live_outcomes(&t, "main");
+    let last = live.last().unwrap();
+    let idle = last["threadIdleMs"].as_i64().unwrap();
+    assert!((7_500..=8_500).contains(&idle), "从取消那条收尾（12s）算到 20s，不是 18s: {idle}");
+    assert_eq!(last["anchorHasToolCall"], true, "工具锚点是上一条有效回复");
+}
+
+/// 新会话的标题生成先于主线程那条完成（`cap/auto-2.1.291-20261006` 四族：`00064`→`00066` 等）：会话
+/// 不能由标题请求建——那样启动模板按「没有工具」出，精简状态（禁用的环境变量、
+/// `artifact_disabled_session`）就补不上了。标题先扣着，主线程那条建好会话后再补发。
+#[test]
+fn a_title_finishing_first_does_not_start_the_session_untrimmed() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(30);
+    let title_body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 32000,
+        "stream": true,
+        "thinking": {"type": "disabled"},
+        "system": [
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.291.ced; cc_entrypoint=cli; cch=b1b2c;"},
+            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions."}
+        ],
+        "messages": [{"role":"user","content":[{"type":"text","text":"<session>\nhi\n</session>\n\nWrite the title"}]}],
+        "metadata": {"user_id": "{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}"}
+    });
+    let mut title = call(title_body.to_string().into_bytes(), "req_title", "end_turn");
+    title.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    title.started_at = base;
+    title.total_ms = 900;
+    title.resp_model = Some("claude-haiku-4-5-20251001".into());
+    t.ingest(title);
+    assert!(!t.0.state.lock().pending.contains_key(&key()), "标题先扣着，会话还没建");
+    let mut main = call(body_with_tools(&["Agent", "Bash", "Read"]), "req_main", "end_turn");
+    main.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    main.started_at = base - Duration::from_millis(200);
+    t.ingest(main);
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    let named = |n: &str| {
+        p.events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == n)
+            .map(|(_, e)| meta_of(e))
+            .collect::<Vec<_>>()
+    };
+    let startup = named("tengu_startup_telemetry");
+    assert_eq!(startup.len(), 1);
+    assert_eq!(
+        startup[0]["set_env_vars"],
+        "CLAUDE_CODE_DISABLE_ARTIFACT,CLAUDE_CODE_HARBOR_KITE,CLAUDE_CODE_SEND_FEEDBACK,CLAUDE_CODE_SSE_PORT"
+    );
+    assert_eq!(named("tengu_artifact_disabled_session").len(), 1);
+    // 标题那条也补发了。
+    assert!(
+        named("tengu_api_success").iter().any(|m| m["querySource"] == "generate_session_title"),
+        "标题的 api_success 补上了"
+    );
+}
+
+/// 三个工具逐项判：客户端自己留着 ListAgents（开关开着时它照样出站）就只算另两个关了；Artifact
+/// 以延迟声明出现也算开着——判据是完整的工具数组，不是去掉延迟声明后的长度表。
+#[test]
+fn tools_off_are_judged_per_tool_from_the_full_tool_array() {
+    let only_list_agents =
+        first_turn_2_1_291(body_with_tools(&["Agent", "Bash", "ListAgents", "Read"]));
+    let meta =
+        |ev: &[(String, Value)], n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone());
+    let has = |ev: &[(String, Value)], n: &str| ev.iter().any(|(x, _)| x == n);
+    let env = meta(&only_list_agents, "tengu_startup_telemetry").unwrap();
+    assert_eq!(
+        env["set_env_vars"],
+        "CLAUDE_CODE_DISABLE_ARTIFACT,CLAUDE_CODE_SEND_FEEDBACK,CLAUDE_CODE_SSE_PORT",
+        "ListAgents 还在，不列 HARBOR_KITE"
+    );
+    assert!(has(&only_list_agents, "tengu_uds_startup_bind"), "ListAgents 开着，套接字照绑");
+    assert!(has(&only_list_agents, "tengu_artifact_disabled_session"));
+    assert!(!has(&only_list_agents, "tengu_artifact_text_variant"));
+    let ctx = meta(&only_list_agents, "tengu_context_size").unwrap();
+    assert_eq!(ctx["non_mcp_tools_count"], 30, "34 - Artifact 一家 3 - SendFeedback 1");
+
+    // Artifact 延迟声明着：算开着。
+    let mut v: Value =
+        serde_json::from_slice(&body_with_tools(&["Agent", "Bash", "Read"])).unwrap();
+    v["tools"].as_array_mut().unwrap().push(
+        json!({"name": "Artifact", "description": "d", "input_schema": {"type": "object"}, "defer_loading": true}),
+    );
+    let deferred = first_turn_2_1_291(v.to_string().into_bytes());
+    assert!(!has(&deferred, "tengu_artifact_disabled_session"), "延迟声明的 Artifact 不算关");
+    assert!(has(&deferred, "tengu_artifact_text_variant"));
+    let env = meta(&deferred, "tengu_startup_telemetry").unwrap();
+    assert_eq!(
+        env["set_env_vars"],
+        "CLAUDE_CODE_HARBOR_KITE,CLAUDE_CODE_SEND_FEEDBACK,CLAUDE_CODE_SSE_PORT"
+    );
+    let ctx = meta(&deferred, "tengu_context_size").unwrap();
+    assert_eq!(ctx["non_mcp_tools_count"], 32, "34 - ListAgents 1 - SendFeedback 1");
+}
+
+/// [`cc_body`] 系列的体换一个会话 id（同一台设备、同一个账号）。
+fn in_session(body: Vec<u8>, sid: &str) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&body).unwrap();
+    v["metadata"]["user_id"] = json!(format!(
+        "{{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"{sid}\"}}"
+    ));
+    v.to_string().into_bytes()
+}
+
+/// 某会话的标题生成请求（2.1.291，会话起名那份提示词）。
+fn title_call(sid: &str, message_id: &str, started_at: SystemTime) -> ApiCall {
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 32000,
+        "stream": true,
+        "thinking": {"type": "disabled"},
+        "system": [
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.291.ced; cc_entrypoint=cli; cch=b1b2c;"},
+            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions."}
+        ],
+        "messages": [{"role":"user","content":[{"type":"text","text":"<session>\nhi\n</session>\n\nWrite the title"}]}],
+        "metadata": {"user_id": "x"}
+    });
+    let mut c = call(in_session(body.to_string().into_bytes(), sid), "req_title", "end_turn");
+    c.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    c.started_at = started_at;
+    c.total_ms = 900;
+    c.message_id = Some(message_id.into());
+    c.resp_model = Some("claude-haiku-4-5-20251001".into());
+    c
+}
+
+/// 新进程启动时那条额度探测（只记一个启动标记，见 [`State::process_starts`]）。
+fn quota_probe_call(sid: &str, at: SystemTime) -> ApiCall {
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role":"user","content":"quota"}],
+        "metadata": {"user_id": "x"}
+    });
+    let mut c = call(in_session(body.to_string().into_bytes(), sid), "req_q", "max_tokens");
+    c.started_at = at;
+    c
+}
+
+/// 一条 2.1.291 主线程请求（默认精简的工具形态）。
+fn main_call(sid: &str, rid: &str, message_id: &str, started_at: SystemTime) -> ApiCall {
+    let mut c = call(in_session(body_with_tools(&["Agent", "Bash", "Read"]), sid), rid, "end_turn");
+    c.ua_out = "claude-cli/2.1.291 (external, cli)".into();
+    c.started_at = started_at;
+    c.total_ms = 4_000;
+    c.message_id = Some(message_id.into());
+    c
+}
+
+fn events_of(t: &Telemetry, sid: &str) -> Vec<(String, Value, Value)> {
+    let st = t.0.state.lock();
+    st.pending
+        .get(&(7, sid.to_string()))
+        .map(|p| {
+            p.events
+                .iter()
+                .map(|(_, e)| {
+                    let meta = if e["event_data"]["additional_metadata"].is_string() {
+                        meta_of(e)
+                    } else {
+                        Value::Null
+                    };
+                    (ev_name(e).to_string(), meta, e["event_data"].clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `/clear` 之后新会话的标题先完成：标题扣住时不能先去判会话来历（那一步会把旧会话标成已清），
+/// 主线程那条到了照样认出是从旧会话 `/clear` 过来的；它的 `timeSinceLastApiCallMs` 量到标题完成。
+#[test]
+fn a_title_first_after_clear_keeps_the_lineage_and_the_gap() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let s2 = "22222222-2222-4222-8222-222222222222";
+    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
+    t.ingest(main_call(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
+    let title_at = base + Duration::from_secs(60);
+    t.ingest(title_call(s2, "msg_title", title_at));
+    t.ingest(main_call(s2, "req_2", "msg_2", title_at - Duration::from_millis(200)));
+    let ev = events_of(&t, s2);
+    // `/clear` 是同一个进程里换会话：不再出启动串，事件带着旧会话的 id 当 `parent_session_id`。
+    assert!(!ev.iter().any(|(n, _, _)| n == "tengu_startup_telemetry"));
+    assert!(!ev.is_empty());
+    // （GrowthBook 曝光事件没有这个字段，只看一方事件。）
+    for (n, _, d) in ev.iter().filter(|(_, _, d)| d.get("event_name").is_some()) {
+        assert_eq!(d["parent_session_id"], SESSION, "{n}: 认出是从旧会话 /clear 过来的");
+    }
+    let main_success = ev
+        .iter()
+        .find(|(n, m, _)| n == "tengu_api_success" && m["querySource"] != "generate_session_title")
+        .unwrap();
+    // 主线程 200ms 后发、跑 4s；标题 900ms 完成：量到标题完成是 4000 - 200 - 900 = 2900。
+    assert_eq!(main_success.1["timeSinceLastApiCallMs"], 2900, "{}", main_success.1);
+    assert!(
+        ev.iter()
+            .any(|(n, m, _)| n == "tengu_api_success"
+                && m["querySource"] == "generate_session_title"),
+        "标题补发了"
+    );
+    // 标题比主线程早完成：补发它不能把消息锚点拨回标题那条。
+    let st = t.0.state.lock();
+    assert_eq!(st.sessions[&(7, s2.to_string())].last_message_id.as_deref(), Some("msg_2"));
+}
+
+/// `--continue` 的新进程里标题先完成：旧会话还在会话表里，但它属于「会话还没有」——标题扣住时
+/// 不能先触发接续（那一步会删掉旧会话与启动标记），主线程那条到了照样按接续起新进程。
+#[test]
+fn a_title_first_after_continue_keeps_the_lineage() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    t.ingest(main_call(SESSION, "req_1", "msg_1", base));
+    let restart = base + Duration::from_secs(120);
+    t.ingest(quota_probe_call("33333333-3333-4333-8333-333333333333", restart));
+    let title_at = restart + Duration::from_secs(10);
+    t.ingest(title_call(SESSION, "msg_title", title_at));
+    t.ingest(main_call(SESSION, "req_2", "msg_2", title_at - Duration::from_millis(200)));
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    // 指标依次是：第一个进程的主线程、第二个进程的主线程（按接续起）、补发的标题。
+    let marks: Vec<(bool, bool)> = p.metrics.iter().map(|m| (m.new_session, m.continued)).collect();
+    assert_eq!(marks, [(true, false), (true, true), (false, false)], "第二个进程按 --continue 起");
+    let startups = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_startup_telemetry")
+        .map(|(_, e)| meta_of(e))
+        .collect::<Vec<_>>();
+    // 待发批次里留着的是第二个进程那串（第一个进程那串随它的会话一起收掉了）；它由主线程那条出，
+    // 带着精简状态，而不是由先完成的标题按「没有工具」出。
+    let last = startups.last().expect("第二个进程有启动串");
+    assert!(
+        last["set_env_vars"].as_str().unwrap().contains("CLAUDE_CODE_DISABLE_ARTIFACT"),
+        "{last}"
+    );
+    assert_eq!(st.sessions[&key()].last_message_id.as_deref(), Some("msg_2"));
+}
+
+/// Artifact 一整组判：客户端留着 `ArtifactComments` 或延迟声明的 `ArtifactData`，都不算关掉
+/// Artifact——不报禁用、不列那个环境变量、计数不扣那一组。
+#[test]
+fn keeping_an_artifact_sub_tool_means_artifact_is_not_off() {
+    let has = |ev: &[(String, Value)], n: &str| ev.iter().any(|(x, _)| x == n);
+    let meta =
+        |ev: &[(String, Value)], n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone());
+    let comments =
+        first_turn_2_1_291(body_with_tools(&["Agent", "ArtifactComments", "Bash", "Read"]));
+    assert!(!has(&comments, "tengu_artifact_disabled_session"));
+    assert!(has(&comments, "tengu_artifact_text_variant"));
+    let env = meta(&comments, "tengu_startup_telemetry").unwrap();
+    assert!(!env["set_env_vars"].as_str().unwrap().contains("DISABLE_ARTIFACT"), "{env}");
+    assert_eq!(meta(&comments, "tengu_context_size").unwrap()["non_mcp_tools_count"], 32);
+
+    let mut v: Value =
+        serde_json::from_slice(&body_with_tools(&["Agent", "Bash", "Read"])).unwrap();
+    v["tools"].as_array_mut().unwrap().push(
+        json!({"name": "ArtifactData", "description": "d", "input_schema": {"type": "object"}, "defer_loading": true}),
+    );
+    let data = first_turn_2_1_291(v.to_string().into_bytes());
+    assert!(!has(&data, "tengu_artifact_disabled_session"), "延迟声明的 ArtifactData 也算留着");
 }

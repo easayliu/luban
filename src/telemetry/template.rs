@@ -96,12 +96,33 @@ pub(super) static TEMPLATE_2_1_285_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_285_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.285 起用 [`TEMPLATE_2_1_285`]（`-p` 打印模式用
-/// [`TEMPLATE_2_1_285_SDK`]），之前的仍是 2.1.260 那份。
+/// 2.1.291 的两份模板（交互式 / `-p`）：以 2.1.285 那两份为底，按
+/// `cap/auto-2.1.291-20261006-full` 补齐 meta 键、换掉过期的实验曝光（整理规则见文件顶部的
+/// `_comment`，生成脚本是同目录 `_driver/build_tpl_291.py`）。事件条目与先后没变，变的是十几条
+/// 事件的 meta：`signed_cache_shadow` 多 `verify_micros`、`tengu_init` 多一串 `has_*` 项目画像、
+/// `model_catalog_primary` 去掉等待计时、插件那几条多了来源与改名前的标识、两个工具池变化事件
+/// 多了回收保留的计数等。
+pub(super) static TEMPLATE_2_1_291: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_291.json"))
+            .expect("assets/cc_telemetry_template_2_1_291.json must parse")
+    });
+
+/// 2.1.291 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_291`]。
+pub(super) static TEMPLATE_2_1_291_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_291_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_291_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.291 起用 [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用
+/// [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
-    match (version_at_least(version, "2.1.285"), sdk) {
-        (true, true) => &TEMPLATE_2_1_285_SDK,
-        (true, false) => &TEMPLATE_2_1_285,
+    match (version_at_least(version, "2.1.291"), version_at_least(version, "2.1.285"), sdk) {
+        (true, _, true) => &TEMPLATE_2_1_291_SDK,
+        (true, _, false) => &TEMPLATE_2_1_291,
+        (false, true, true) => &TEMPLATE_2_1_285_SDK,
+        (false, true, false) => &TEMPLATE_2_1_285,
         _ => &TEMPLATE,
     }
 }
@@ -142,6 +163,50 @@ pub(super) fn dd_listed(name: &str, version: &str) -> bool {
             ))
 }
 
+/// 服务端下发的事件抽样配置（eval 的 `tengu_event_sampling_config`，`"source":"force"`，即对
+/// 所有账号生效；`cap/auto-2.1.291-20261006-full/00017` 那份响应）：
+///
+/// | 抽样率 | 事件 |
+/// |---|---|
+/// | 0（不发） | `api_before_normalize`、`api_after_normalize`、`query_before_attachments`、`query_after_attachments`、`skill_file_changed` |
+/// | 0.01 | `api_cache_breakpoints`、`sysprompt_block`、`sysprompt_boundary_found`、`sysprompt_missing_boundary_marker`、`session_file_read`、`plugin_name_collision` |
+///
+/// 官方客户端按它在发事件前抽：抽中的那条 meta 末尾多一项 `sample_rate`（同一批抓包里
+/// `api_cache_breakpoints` 一个会话 73 次请求只剩 1 条，带着 `"sample_rate":0.01`），没抽中的
+/// 整条不发。2.1.285 的抓包（2026-09-30）里这几条每次都发，那时还没下发这份配置——这里只给
+/// 2.1.291 起的出站版本用，旧版本的回放与模板不受影响。
+const EVENT_SAMPLING_2_1_291: &[(&str, f64)] = &[
+    ("tengu_plugin_name_collision", 0.01),
+    ("tengu_session_file_read", 0.01),
+    ("tengu_skill_file_changed", 0.0),
+    ("tengu_api_before_normalize", 0.0),
+    ("tengu_api_after_normalize", 0.0),
+    ("tengu_query_before_attachments", 0.0),
+    ("tengu_query_after_attachments", 0.0),
+    ("tengu_api_cache_breakpoints", 0.01),
+    ("tengu_sysprompt_block", 0.01),
+    ("tengu_sysprompt_boundary_found", 0.01),
+    ("tengu_sysprompt_missing_boundary_marker", 0.01),
+];
+
+/// 按 [`EVENT_SAMPLING_2_1_291`] 抽这一条：`false` 即不发；抽中且在表里的，meta 末尾补上
+/// `sample_rate`。不在表里的、或出站版本早于 2.1.291 的原样放行。
+pub(super) fn sample_event(name: &str, version: &str, meta: &mut Value) -> bool {
+    if !version_at_least(version, "2.1.291") {
+        return true;
+    }
+    let Some(&(_, rate)) = EVENT_SAMPLING_2_1_291.iter().find(|(n, _)| *n == name) else {
+        return true;
+    };
+    if rate <= 0.0 || rand::random::<f64>() >= rate {
+        return false;
+    }
+    if let Some(o) = meta.as_object_mut() {
+        o.insert("sample_rate".into(), json!(rate));
+    }
+    true
+}
+
 /// 模板占位符的取值。
 pub(super) struct Subst<'a> {
     pub(super) version: &'a str,
@@ -165,6 +230,74 @@ pub(super) struct Subst<'a> {
     /// `-p` 打印模式（SDK 模板）：附件的 `query_source` 与估算按 SDK 那套报，见
     /// [`fill_attachment_estimates`]。
     pub(super) sdk: bool,
+    /// 这个会话的模型是 haiku：2.1.291 起它的工具是长描述那一套，`tengu_context_size` 的工具
+    /// 计数与其余三族不同（[`context_tool_counts`]）。
+    pub(super) haiku: bool,
+    /// 正文里关着的那几个用户可关的工具（[`RequestShape::tools_off`]）。`-p` 不看它：打印模式本来就
+    /// 不带 Artifact / SendFeedback（不是用户关的），也没有关掉之后的样本。
+    pub(super) tools_off: ToolsOff,
+}
+
+/// 2.1.291 `tengu_context_size` 里的 `non_mcp_tools_count` / `non_mcp_tools_tokens`：客户端本地
+/// 按全部内建工具（含延迟池里的）估的，随模型族与用户关掉的工具变
+/// （`cap/auto-2.1.291-20261006-full` 各会话、`cap/auto-2.1.291-20261006` 关前 / 关后各四个会话）。
+/// `-p`（`sdk`）本来就不带 Artifact / SendFeedback，没有关掉之后的样本，照不关的报。
+///
+/// 三个全关：数 34 → 29（Artifact 连带 `ArtifactComments` / `ArtifactData` 少 3 个，另两个各 1 个），
+/// token 13834 → 6983，少 6851；haiku 37 → 32、14305 → 7454，少的同样是 6851。只关其中几个没有
+/// 样本，token 按三家工具声明的字符数分摊那 6851（Artifact 一家 34399 + 7438 + 12241，ListAgents
+/// 1180，SendFeedback 5537，`cap/auto-2.1.291-20261006-full` 里的声明），三个全关时正好等于抓包值。
+fn context_tool_counts(sdk: bool, haiku: bool, off: ToolsOff) -> (u64, u64) {
+    let (count, tokens) = match (sdk, haiku) {
+        (true, false) => return (26, 6399),
+        (true, true) => return (30, 6900),
+        (false, false) => (34u64, 13834u64),
+        (false, true) => (37, 14305),
+    };
+    const ARTIFACT: u64 = 6094;
+    const LIST_AGENTS: u64 = 133;
+    const SEND_FEEDBACK: u64 = 6851 - ARTIFACT - LIST_AGENTS;
+    let (mut c, mut t) = (count, tokens);
+    if off.artifact {
+        c -= 3;
+        t -= ARTIFACT;
+    }
+    if off.list_agents {
+        c -= 1;
+        t -= LIST_AGENTS;
+    }
+    if off.send_feedback {
+        c -= 1;
+        t -= SEND_FEEDBACK;
+    }
+    (c, t)
+}
+
+/// 官方用户关掉某个工具用的环境变量，`set_env_vars` 里按名字排序与已有的并在一起。
+fn off_env_vars(off: ToolsOff) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if off.artifact {
+        v.push("CLAUDE_CODE_DISABLE_ARTIFACT");
+    }
+    if off.list_agents {
+        v.push("CLAUDE_CODE_HARBOR_KITE");
+    }
+    if off.send_feedback {
+        v.push("CLAUDE_CODE_SEND_FEEDBACK");
+    }
+    v
+}
+
+/// 关掉某个工具之后不再发的启动 / 首次输入事件（`cap/auto-2.1.291-20261006` 四族关前 / 关后对照）：
+/// Artifact 那三条，与跨会话消息（ListAgents 那一套）的本地套接字绑定。
+fn dropped_by(off: ToolsOff, name: &str) -> bool {
+    match name {
+        "tengu_artifact_five_class_asks"
+        | "tengu_artifact_inherited_type_grant"
+        | "tengu_artifact_text_variant" => off.artifact,
+        "tengu_uds_startup_bind" => off.list_agents,
+        _ => false,
+    }
 }
 
 /// `tengu_tool_search_mode_decision` 的 meta，**跟着正文里实际启用的能力走**。
@@ -317,8 +450,63 @@ where
             {
                 obj.insert("snapshotCount".into(), Value::from(subst.prompt_index));
             }
+            let v291 = version_at_least(subst.version, "2.1.291");
+            let off = if subst.sdk { ToolsOff::default() } else { subst.tools_off };
+            if v291 && dropped_by(off, &e.name) {
+                continue;
+            }
+            if v291
+                && e.name == "tengu_context_size"
+                && let Some(o) = meta.as_object_mut()
+            {
+                let (count, tokens) = context_tool_counts(subst.sdk, subst.haiku, off);
+                o.insert("non_mcp_tools_count".into(), json!(count));
+                o.insert("non_mcp_tools_tokens".into(), json!(tokens));
+            }
+            // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
+            // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关
+            // 的四个会话正是这三个名字），关了哪个列哪个。
+            if v291
+                && off.any()
+                && e.name == "tengu_startup_telemetry"
+                && let Some(o) = meta.as_object_mut()
+            {
+                let mut names: Vec<String> = o
+                    .get("set_env_vars")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect())
+                    .unwrap_or_default();
+                names.extend(off_env_vars(off).into_iter().map(str::to_string));
+                names.sort();
+                names.dedup();
+                o.insert("set_env_var_count".into(), json!(names.len()));
+                o.insert("set_env_vars".into(), json!(names.join(",")));
+            }
+            if !sample_event(&e.name, subst.version, &mut meta) {
+                continue;
+            }
             let c = ctx(t);
             events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
+            // 关掉 Artifact 的会话，启动计时那条之后紧跟一条「本会话 Artifact 已停用」（四族关掉的
+            // 会话各一条，`mechanism: env`）。
+            if v291
+                && off.artifact
+                && e.name == "tengu_timer"
+                && meta.get("event").and_then(|x| x.as_str()) == Some("startup")
+            {
+                let disabled =
+                    json!({ "mechanism": "env", "session_interactivity": "interactive" });
+                events.push((
+                    t,
+                    id.event_at(
+                        MetaStage::Startup,
+                        "tengu_artifact_disabled_session",
+                        t,
+                        &c,
+                        disabled,
+                    ),
+                ));
+            }
             if dd_listed(&e.name, subst.version) {
                 let mut flat = snake_flat(&meta);
                 // Datadog 那份与事件那份差几项（`cap/2.1.280`、`cap/2.1.285`）：MCP 连接不带服务

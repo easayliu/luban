@@ -115,6 +115,8 @@ struct ForwardingResp {
     simulate_full_system: bool,
     /// 模拟路径给不带 `tools` 的来访也补官方工具（[`Self::simulate_cc`] 的子项）。
     fill_absent_tools: bool,
+    /// 模拟路径注入的官方工具去掉 Artifact / ListAgents / SendFeedback（[`Self::simulate_cc`] 的子项）。
+    sim_trim_tools: bool,
     /// 模拟路径的主线程按官方 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项）。
     sim_message_threads: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
@@ -183,6 +185,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             simulate_cc: f.simulate_cc,
             simulate_full_system: f.simulate_full_system,
             fill_absent_tools: f.fill_absent_tools,
+            sim_trim_tools: f.sim_trim_tools,
             sim_message_threads: f.sim_message_threads,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,

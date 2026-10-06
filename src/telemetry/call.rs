@@ -53,6 +53,10 @@ pub struct ApiCall {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// 缓存写入按 ttl 拆开的两份（usage 里的 `cache_creation.ephemeral_5m_input_tokens` /
+    /// `ephemeral_1h_input_tokens`）。上游没给拆分时是 `None`，见 2.1.291 的 `tengu_api_success`。
+    pub cache_creation_5m_tokens: Option<i64>,
+    pub cache_creation_1h_tokens: Option<i64>,
     /// 响应正文里 text / thinking 的字符数。
     pub text_chars: usize,
     /// 这条回复按 `inputTextCharLength` 口径的字数，见 [`ThreadBase::reply_chars`]。
@@ -160,6 +164,8 @@ impl Capture {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
             text_chars: 0,
             reply_input_chars: 0,
             thinking_chars: 0,

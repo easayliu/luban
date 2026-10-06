@@ -105,6 +105,10 @@ pub(super) struct RequestShape {
     /// 正文里声明了 `ToolSearch` 这个工具（非延迟）。它是延迟加载真正能用的前提：模型要靠它
     /// 把 `defer_loading` 的工具搜出来。只有占位声明、没有它，搜索无处发起。
     pub(super) has_tool_search: bool,
+    /// 官方用户能用环境变量关掉的那三个工具，这条请求里哪几个是关着的（模拟路径开关
+    /// `sim_trim_tools`，见 `crate::proxy::cc_tools_core`）。逐项判，遥测也逐项照关掉之后的样子报，
+    /// 见 [`ToolsOff`] 与 [`super::template::emit_template`]。
+    pub(super) tools_off: ToolsOff,
     pub(super) input_text_chars: usize,
     /// `estimatedInputTokens`，见 [`parse_shape`] 里的口径说明。
     pub(super) estimated_tokens: usize,
@@ -645,6 +649,41 @@ pub(super) fn parse_user_id(v: &Value) -> (Option<String>, Option<String>, Optio
     (pick("device_id"), pick("session_id"), pick("account_uuid"))
 }
 
+/// `Artifact` / `ListAgents` / `SendFeedback` 三个工具各自关没关（`tools_off`）。
+///
+/// 判据是**完整的** `tools` 数组（含 `defer_loading` 的延迟声明）：数组里有官方工具（`Agent` 与
+/// `Read` 都在，不然无从谈起「关掉了几个官方工具」），而这个名字一处都没出现，才算关了。客户端
+/// 自己留着其中一条（开关开着时，客户端自带的同名工具照样出站）就算开着；延迟声明着也算开着。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ToolsOff {
+    /// 关了 `Artifact`（官方是 `CLAUDE_CODE_DISABLE_ARTIFACT=1`，连带 `ArtifactComments` /
+    /// `ArtifactData` 两个延迟工具一起没了）。
+    pub(super) artifact: bool,
+    /// 关了 `ListAgents`（`CLAUDE_CODE_HARBOR_KITE=0`，跨会话消息那一套）。
+    pub(super) list_agents: bool,
+    /// 关了 `SendFeedback`（`CLAUDE_CODE_SEND_FEEDBACK=0`）。
+    pub(super) send_feedback: bool,
+}
+
+impl ToolsOff {
+    /// 从完整的工具名单判（含延迟声明的）。
+    pub(super) fn of(names: &[&str]) -> Self {
+        let official = names.contains(&"Agent") && names.contains(&"Read");
+        let off = |n: &str| official && !names.contains(&n);
+        ToolsOff {
+            // 一整组：官方关掉 Artifact 时 `ArtifactComments` / `ArtifactData` 两个延迟工具一起没了，
+            // 客户端留着其中任何一个（含延迟声明）都不算关。
+            artifact: off("Artifact") && off("ArtifactComments") && off("ArtifactData"),
+            list_agents: off("ListAgents"),
+            send_feedback: off("SendFeedback"),
+        }
+    }
+
+    pub(super) fn any(self) -> bool {
+        self.artifact || self.list_agents || self.send_feedback
+    }
+}
+
 pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let mut shape = RequestShape {
@@ -756,6 +795,11 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     }
     // `toolsCharLength` 是各工具长度之和（不含数组的方括号与逗号）：`cap/2.1.260-2` 74633。
     shape.tools_chars = lens.values().filter_map(|v| v.as_u64()).sum::<u64>() as usize;
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        let names: Vec<&str> =
+            tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+        shape.tools_off = ToolsOff::of(&names);
+    }
     shape.tool_lens = Value::Object(lens).to_string();
     shape.tools_hash = sha256_hex(shape.tool_lens.as_bytes())[..12].to_string();
 

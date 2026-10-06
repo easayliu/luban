@@ -1,9 +1,14 @@
-//! 2.1.285 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.285 的 profile 表（≥2.1.285 来访的 beta 参照；模拟路径已换到 2.1.291），及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.285 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.285 来访的
-/// beta 参照（[`cc_profile_at`]）。beta 串逐字取自 `cap/2.1.285`，去掉 `oauth` 与动态的 `afk-mode`。
+/// 2.1.285 的 profile 表——2.1.285 ~ 2.1.290 来访的 beta 参照（[`cc_profile_at`]），也是 2.1.291
+/// 表没编的 kind 的兜底。模拟路径已换到 2.1.291（[`CC_PROFILES`]）。beta 串逐字取自
+/// `cap/2.1.285`，去掉 `oauth` 与动态的 `afk-mode`。
+///
+/// 注意这一版四族主线程的串取自 **auto 模式**的会话（`dangerous-tool-use` 只在 auto 模式下发，
+/// `cap/auto-2.1.285-20260930` 的默认权限模式主线程 `00178` 等一条都不带），而模拟请求不带
+/// `safeguards` / `afk-mode`、遥测报的也是 `default`——2.1.291 表改按默认模式的抓包定。
 ///
 /// 这批抓包是**同一个会话里用 `/model` 轮流切了 11 个模型**，每个模型一轮主线程：
 ///
@@ -52,7 +57,7 @@ use super::*;
 /// 透传时由 [`crate::proxy::merge_beta_for`] 原样留着（前者不带 `claude-code`、后者参照串里
 /// 没有那两项，都不补不删）。安全分类仍没有样本，[`cc_profile`] 落回 2.1.260 表。模拟路径只发
 /// 主线程四族，不受影响。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_285: &[CcProfile] = &[
     CcProfile {
         kind: CcProfileKind::MainOpus,
         version: "2.1.285",
@@ -242,7 +247,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
 /// 3. **非 auto 模式**——opus-5-5 / fable-5-1 / sonnet-5-5 三条是 auto 模式（`afk-mode`、
 ///    `safeguards`），其余八个模型没有 auto 模式可选。2.1.280 已证非 auto 与 auto 只差这两样。
 /// 4. 安全分类与 API-key 端任何一族，理由同 [`cc_2_1_280_missing_samples`]。SDK 子代理与无工具
-///    helper 第二批抓包补上了（[`CC_PROFILES`]）。
+///    helper 第二批抓包补上了（[`CC_PROFILES_2_1_285`]）。
 /// 5. 更老的模型（opus-4-5、sonnet-4-5 及以前）——[`cc_model_tier`] 把它们归进 `Legacy`，
 ///    是按 4.6 那一代外推的。
 pub mod cc_2_1_285_missing_samples {}

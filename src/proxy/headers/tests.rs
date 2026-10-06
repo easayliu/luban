@@ -384,6 +384,7 @@ fn all_flags_off_only_injects_auth() {
         simulate_cc: false,
         simulate_full_system: false,
         fill_absent_tools: false,
+        sim_trim_tools: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -628,14 +629,16 @@ async fn wire_bytes_fall_back_to_lowercase_when_off() {
 
 /// 2.1.285 起模拟的 messages 请求带 `anthropic-dispatch-id: v2d`，额度探测不带
 /// （`cap/2.1.285/00030` / `00017`）；线上位置在 `anthropic-dangerous-direct-browser-access`
-/// 与 `anthropic-version` 之间。SDK 版本头跟着升到 0.127.0。
+/// 与 `anthropic-version` 之间。SDK 版本头 2.1.291 起是 0.128.0。
 #[test]
 fn simulated_messages_carry_the_dispatch_id() {
     let sim = sim_for(PLAIN_BODY);
     let out =
         build_forward_headers(&crate::proxy::HeaderMap::new(), "tok", all_on(), Some(&sim), None);
     assert_eq!(out["anthropic-dispatch-id"], config::CC_DISPATCH_ID);
-    assert_eq!(out["x-stainless-package-version"], "0.127.0");
+    assert_eq!(out["x-stainless-package-version"], "0.128.0");
+    // 新输入那条不带额度宽限头（[`config::CC_USAGE_LIMIT_HEADER`]）。
+    assert!(out.get("anthropic-usage-limit").is_none());
     // 与 billing header 里的 `cc_prompt_id` 同值。
     let pid = sim.link.prompt_id.as_deref().expect("主线程有 prompt id");
     assert_eq!(out["x-claude-code-prompt-id"], pid);
@@ -651,7 +654,9 @@ fn simulated_messages_carry_the_dispatch_id() {
     let order = config::CC_HEADER_ORDER;
     let at = |h: &str| order.iter().position(|x| *x == h).unwrap();
     assert_eq!(at("anthropic-dispatch-id"), at("anthropic-dangerous-direct-browser-access") + 1);
-    assert_eq!(at("anthropic-version"), at("anthropic-dispatch-id") + 1);
+    // 2.1.291 的额度宽限头夹在 dispatch-id 与 anthropic-version 之间（`cap/auto-2.1.291-20261006-full/00036`）。
+    assert_eq!(at("anthropic-usage-limit"), at("anthropic-dispatch-id") + 1);
+    assert_eq!(at("anthropic-version"), at("anthropic-usage-limit") + 1);
     assert_eq!(at("x-claude-code-prompt-id"), at("x-claude-code-prev-tool-durations") + 1);
     assert_eq!(at("x-claude-code-request-class"), at("x-claude-code-prompt-id") + 1);
 }
@@ -705,8 +710,9 @@ fn fallback_beta_is_added_once_after_effort() {
     assert_eq!(beta.matches("server-side-fallback-").count(), 1, "{beta}");
     let idx = |b: &str| beta.split(',').position(|p| p.starts_with(b)).unwrap();
     assert!(idx("effort-") < idx("server-side-fallback-"), "{beta}");
-    // 2.1.280 的 opus 不发 `fallback-credit` 了，`effort` 下一格是 `dangerous-tool-use`。
-    assert!(idx("server-side-fallback-") < idx("dangerous-tool-use-"), "{beta}");
+    // 2.1.291 默认权限模式的 opus 串里 `effort` 下一格是 `thinking-binding-controls`
+    // （`dangerous-tool-use` 只在 auto 模式下发）。
+    assert!(idx("server-side-fallback-") < idx("thinking-binding-controls-"), "{beta}");
     let without = crate::proxy::build_forward_headers_for(
         &crate::proxy::HeaderMap::new(),
         "tok",
@@ -722,10 +728,10 @@ fn fallback_beta_is_added_once_after_effort() {
     );
 }
 
-/// 模拟路径产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
-/// [`config::CC_PROFILES`] 里几串 beta 与 [`config::cc_model_beta`] 按代际去项的唯一正确性
+/// 按 2.1.285 表产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
+/// [`config::CC_PROFILES_2_1_285`] 里几串 beta 与 [`config::cc_model_beta`] 按代际去项的唯一正确性
 /// 依据。官方串逐字取自 `cap/2.1.285`（同一会话里 `/model` 切了 11 个模型，各一轮主线程），
-/// 去掉动态的 `afk-mode`。
+/// 去掉动态的 `afk-mode`。模拟路径现在用的 2.1.291 表见 [`simulated_beta_matches_2_1_291`]。
 ///
 #[test]
 fn simulated_beta_matches_official() {
@@ -865,14 +871,18 @@ fn simulated_beta_matches_official() {
                  message-threads-2026-08-12",
         ),
     ];
+    let at_285 = |model: &str| {
+        config::cc_profile_at(crate::proxy::cc_profile_for(model).kind, Some((2, 1, 285)))
+    };
     for (cap, model, official) in cases {
-        let profile = crate::proxy::cc_profile_for(model);
+        let profile = at_285(model);
+        assert_eq!(profile.version, "2.1.285");
         let beta = config::cc_model_beta(profile, model);
         assert_eq!(crate::proxy::simulated_beta(&beta, None), *official, "{model}（{cap}）");
     }
     // 认不出的模型退回 sonnet 族全集。
     assert_eq!(
-        config::cc_model_beta(crate::proxy::cc_profile_for("gpt-4o"), "gpt-4o"),
+        config::cc_model_beta(at_285("gpt-4o"), "gpt-4o"),
         cases[2].2.replacen("oauth-2025-04-20,", "", 1)
     );
 
@@ -900,6 +910,40 @@ fn simulated_beta_matches_official() {
     );
     assert!(one_m.ends_with(",output-128k-2025-02-19"), "其余客户端项仍追加在队尾: {one_m}");
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
+}
+
+/// 模拟路径（2.1.291 表）四族主线程的 `anthropic-beta` 逐字节等于 2.1.291 **默认权限模式**的官方
+/// 串（`cap/auto-2.1.291-20261006-full`：`00340` opus-5-5、`00253` sonnet-5-5、`00303` haiku-4.5；
+/// fable 默认模式没样本，与 opus 同串，见 [`config::CC_PROFILES`]）。auto 模式那串多
+/// `dangerous-tool-use` 与 `afk-mode`，模拟请求不带 `safeguards`，两项都不该出现。
+#[test]
+fn simulated_beta_matches_2_1_291() {
+    let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         thinking-token-count-2026-05-13,context-management-2025-06-27,\
+         prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+         per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+         advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+         mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+         thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+         extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let haiku = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+         context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,\
+         advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,\
+         thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+         extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    for (cap, model, official) in [
+        ("00340", "claude-opus-5-5", opus),
+        ("00253", "claude-sonnet-5-5", opus),
+        ("00464 同串", "claude-fable-5-1", opus),
+        ("00303", "claude-haiku-4-5-20251001", haiku),
+    ] {
+        let profile = crate::proxy::cc_profile_for(model);
+        assert_eq!(profile.version, "2.1.291");
+        let beta = config::cc_model_beta(profile, model);
+        let out = crate::proxy::simulated_beta(&beta, None);
+        assert_eq!(out, official, "{model}（{cap}）");
+        assert!(!out.contains("dangerous-tool-use") && !out.contains("afk-mode"), "{model}");
+    }
 }
 
 /// 2.1.277 三个辅助 profile 的 beta 串逐字对上抓包（去掉 `oauth` 之后；四族主线程由
@@ -938,13 +982,16 @@ fn profile_betas_match_the_2_1_277_captures() {
         assert_eq!(p.version, "2.1.277", "{kind:?}");
         assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
     }
-    // 2.1.285 的额度探测（`cap/2.1.285/00017`）与 2.1.277 逐字相同。
+    // 2.1.291 的额度探测（`cap/auto-2.1.291-20261006-full/00018`）与 2.1.277 逐字相同。
     let quota = config::cc_profile(QuotaProbe);
-    assert_eq!((quota.version, quota.beta), ("2.1.285", cases[2].2));
-    // 2.1.285 的标题生成（`cap/2.1.285/00038`）比 2.1.277 多 `dangerous-tool-use` 与队尾的
-    // `message-threads`。
+    assert_eq!((quota.version, quota.beta), ("2.1.291", cases[2].2));
+    // 2.1.291 的标题生成（默认模式下 13 条）与 2.1.277 逐字相同。
+    let title = config::cc_profile(SessionTitleHaiku);
+    assert_eq!((title.version, title.beta), ("2.1.291", cases[1].2));
+    // 2.1.285 的标题生成（`cap/2.1.285/00038`，auto 模式会话）比 2.1.277 多 `dangerous-tool-use`
+    // 与队尾的 `message-threads`。
     assert_eq!(
-        config::cc_profile(SessionTitleHaiku).beta,
+        config::cc_profile_at(SessionTitleHaiku, Some((2, 1, 285))).beta,
         "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,\

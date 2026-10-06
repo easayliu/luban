@@ -38,7 +38,7 @@ pub(super) fn eager_tools_wanted(
                 On => true,
                 Off => false,
                 Unknown => {
-                    let asset = cc_tools_core(profile);
+                    let asset = cc_tools_core(profile, false);
                     !asset.is_empty()
                         && asset.iter().all(|t| {
                             t.get("eager_input_streaming").and_then(|e| e.as_bool()) == Some(true)
@@ -92,16 +92,18 @@ pub(in crate::proxy) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
     changed
 }
 
-/// 模拟路径下注入的官方主线程工具声明：14 条，与 `cap/2.1.285` 里 11 个模型的主线程
-/// （`00030` opus-5-5 ↔ `00039` fable-5-1 ↔ `00045` sonnet-5-5 ↔ `00051` haiku-4-5 ……）逐字节相同。
+/// 模拟路径下注入的官方主线程工具声明（opus / sonnet / fable）：14 条，与
+/// `cap/auto-2.1.291-20261006-full` 默认权限模式的主线程（`00340` / `00216` opus-5-5 ↔ `00253`
+/// sonnet-5-5）逐字节相同。haiku 那份见 [`CC_TOOLS_CORE_HAIKU`]。
 ///
 /// **为什么要注入**：上游判第三方的信号之一是「自称 CC 但没有 CC 工具」。光把客户端自有
 /// 工具名加 `mcp__` 前缀不够——那只是消去负面信号（被 blocklist 的名字），而正面信号
 /// （存在 CC 官方工具声明）仍然缺失。注入之后请求的工具组合是「CC 内建 + MCP 扩展」，
 /// 与真实 CC 接 MCP server 的形态一致（`cap/2.1.258-api/00006`：内建在前，`mcp__*` 在尾）。
 ///
-/// **为什么是 14 个而不是 4 个**：2.1.285 四族主线程抓包（`cap/2.1.285/00030` / `00039` /
-/// `00045` / `00051`）每条都带 19 或 20 个工具，其中四族共有的内建工具 15 个：下面这 14 个
+/// **为什么是 14 个而不是 4 个**：2.1.285 / 2.1.291 四族主线程抓包（`cap/2.1.285/00030` / `00039` /
+/// `00045` / `00051`、`cap/auto-2.1.291-20261006-full/00340` / `00303`）每条都带 16 ~ 20 个工具，
+/// 其中四族共有的内建工具 15 个：下面这 14 个
 /// 真工具，加上 `ToolSearch`；其余是延迟池里的 `DeferredToolPlaceholder` 占位、用户自己的
 /// MCP 工具（`mcp__claude_ai_Claude_Docs__*`）与 opus 独有的服务端工具 `advisor`
 /// （`type: advisor_20260301`，没有 `input_schema`）。`TaskStop` 等其余内建工具在延迟清单里，
@@ -117,8 +119,13 @@ pub(in crate::proxy) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
 /// Skill → Workflow → Write`（官方在 `Skill` 与 `Workflow` 之间还有 `ToolSearch`、`Workflow`
 /// 与 `Write` 之间还有 MCP 工具与占位），不是字母序。
 ///
+/// **Bash 取默认权限模式那版**（3018 字节）：同一版里 auto 模式会话的 opus / fable 发的是少一句
+/// 「别用 Bash 跑 cat/head/tail……」的 2707 字节那版（`00032`、`00464`），默认模式（`00340`、
+/// `00216`）与 sonnet 两种模式下都是 3018 那版。模拟请求不带 `safeguards` / `afk-mode`、遥测报
+/// `default`，工具描述跟着默认模式走（2.1.285 的资产取的是 auto 模式那版，这一版改正）。
+///
 /// **`eager_input_streaming`**：2.1.277 起四族的 OAuth 主线程每个内建工具都带
-/// `eager_input_streaming: true`——fable 也带（2.1.260 时一个都不带），2.1.285 仍如此。资产原样保留，
+/// `eager_input_streaming: true`——fable 也带（2.1.260 时一个都不带），2.1.291 仍如此。资产原样保留，
 /// 不另加也不剥。客户端改名后的 `mcp__luban__*` 带不带这个键**没有 OAuth 样本**
 /// （`2.1.258-api` 的 `mcp__ide__*` 不带，但那是 API-key 模式；2.1.277 订阅端的 MCP 工具在
 /// 延迟池里带 `eager_input_streaming: true` 加 `defer_loading: true`，与正文声明不是一回事），
@@ -128,25 +135,68 @@ pub(in crate::proxy) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
 /// （被混淆成 `mcp__luban__*`），模型优先响应 system 的指令。万一调了，客户端收到一个
 /// 自己没声明的 tool_use，按协议返回错误 tool_result 即可，不影响会话继续。
 ///
-/// **代价**：资产约 63KB（Artifact 一条就 33KB），每条模拟主线程请求都带，首轮进 prompt cache
-/// 之前按输入 token 计费；同一会话后续轮次命中缓存。
+/// **代价**：资产约 71KB（Artifact 一条就 34KB），每条模拟主线程请求都带，首轮进 prompt cache
+/// 之前按输入 token 计费；同一会话后续轮次命中缓存。开关 `sim_trim_tools` 去掉其中三条
+/// （[`CC_TRIMMED_TOOLS`]），约剩 29KB。
 static CC_TOOLS_CORE: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("../../assets/cc_tools_core.json"))
             .expect("cc_tools_core.json must be a valid JSON array of tool objects")
     });
 
-/// 注入用的工具声明（2.1.285，`cap/2.1.285/00030` 的 20 条里去掉 `ToolSearch` /
-/// `DeferredToolPlaceholder` 那一对、用户自己的 `mcp__*` 与服务端工具 `advisor` 之后的 14 条）。
+/// haiku 主线程的 14 条（2.1.291 起与另外三族分家）：`cap/auto-2.1.291-20261006-full/00303`、`00553`
+/// 逐字节相同，配 [`config::CC_SYSTEM_BASE_HAIKU`] 那套长提示词——`Agent` / `Bash` / `Edit` /
+/// `Read` / `Write` / `AskUserQuestion` 六条是长描述（`Bash` 11913 字节），其余八条与
+/// [`CC_TOOLS_CORE`] 逐字节相同。名字与先后同那份（官方 haiku 的 `DeferredToolPlaceholder` 夹在
+/// `Workflow` 与 `Write` 之间，注入时本来就不带它）。
+static CC_TOOLS_CORE_HAIKU: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../../assets/cc_tools_core_haiku.json"))
+            .expect("cc_tools_core_haiku.json must be a valid JSON array of tool objects")
+    });
+
+/// 开关 `sim_trim_tools` 打开时不注的三条：官方客户端里它们都能由**用户自己**关掉，关掉之后
+/// 主线程正文少的正是这三条、其余 11 条与 system 逐字节不变（`cap/auto-2.1.291-20261006` 四族
+/// 关前 / 关后各一条：`00031` ↔ `00066`、`00100` ↔ `00136`、`00172` ↔ `00205`、`00242` ↔ `00276`）：
 ///
-/// 2.1.285 各族主线程的内建工具声明**逐字节相同**（`cap/2.1.285` 的 11 个模型，含
-/// `eager_input_streaming: true`），故只有一份；2.1.277 / 2.1.280 的 `Artifact`、`Bash` 措辞与
-/// 这份不同。2.1.260 时 fable 那份不带 eager、措辞也不同，要单独一份，现在不用了。`profile` 仍收着，将来某族再分家时不必
-/// 改调用点。
+/// | 工具 | 字节 | 官方怎么关 |
+/// |---|---:|---|
+/// | `Artifact` | 34399 | 环境变量 `CLAUDE_CODE_DISABLE_ARTIFACT=1`，或设置 `enableArtifact: false` |
+/// | `ListAgents` | 1180 | 环境变量 `CLAUDE_CODE_HARBOR_KITE=0` |
+/// | `SendFeedback` | 5537 | 环境变量 `CLAUDE_CODE_SEND_FEEDBACK=0`，或设置 `feedbackDrafts: "off"` |
+///
+/// 只收用户侧能关的：`ReportFindings` 无条件进工具表，`ShareOnboardingGuide` 只能由组织策略与
+/// 服务端开关关，`TaskStop` 进不进正文也由服务端开关定——这几样少了是「服务端没给这个号下发」，
+/// 而服务端知道它给每个号下发了什么，模拟不了。遥测那侧照官方关掉后的形态改，见
+/// `crate::telemetry` 的 `trimmed_tools`。
+pub(in crate::proxy) const CC_TRIMMED_TOOLS: &[&str] = &["Artifact", "ListAgents", "SendFeedback"];
+
+static CC_TOOLS_CORE_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE));
+static CC_TOOLS_CORE_HAIKU_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE_HAIKU));
+
+fn trimmed(all: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    all.iter()
+        .filter(|t| !t["name"].as_str().is_some_and(|n| CC_TRIMMED_TOOLS.contains(&n)))
+        .cloned()
+        .collect()
+}
+
+/// 注入用的工具声明（2.1.291，主线程 20 / 16 条里去掉 `ToolSearch` / `DeferredToolPlaceholder`
+/// 那一对、用户自己的 `mcp__*` 与服务端工具 `advisor` 之后的 14 条）：haiku 一份
+/// （[`CC_TOOLS_CORE_HAIKU`]），其余三族同一份（[`CC_TOOLS_CORE`]）。`trim` 是开关
+/// `sim_trim_tools`，开着去掉 [`CC_TRIMMED_TOOLS`] 那三条、剩 11 条，先后不变。
 pub(in crate::proxy) fn cc_tools_core(
-    _profile: &config::CcProfile,
+    profile: &config::CcProfile,
+    trim: bool,
 ) -> &'static [serde_json::Value] {
-    &CC_TOOLS_CORE
+    match (profile.kind == config::CcProfileKind::MainHaiku, trim) {
+        (true, false) => &CC_TOOLS_CORE_HAIKU,
+        (true, true) => &CC_TOOLS_CORE_HAIKU_TRIM,
+        (false, false) => &CC_TOOLS_CORE,
+        (false, true) => &CC_TOOLS_CORE_TRIM,
+    }
 }
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
@@ -184,6 +234,7 @@ pub(in crate::proxy) fn cc_tools_to_inject(
     v: &serde_json::Value,
     profile: &config::CcProfile,
     fill_absent: bool,
+    trim: bool,
 ) -> Vec<&'static str> {
     if declares_no_tools(v) && (!fill_absent || forces_tool_use(v)) {
         return Vec::new();
@@ -195,7 +246,7 @@ pub(in crate::proxy) fn cc_tools_to_inject(
         }
         Some(_) => return Vec::new(),
     };
-    cc_tools_core(profile)
+    cc_tools_core(profile, trim)
         .iter()
         .filter_map(|stub| stub.get("name")?.as_str())
         .filter(|name| !declared.contains(name))
@@ -221,7 +272,8 @@ pub(in crate::proxy) fn injected_tools_of(
             .unwrap_or_default()
     };
     let (declared, sent) = (names(inbound), names(outbound));
-    cc_tools_core(profile)
+    // 取完整那份：开关 `sim_trim_tools` 开着时出站里没有那三条，按完整的数也一样。
+    cc_tools_core(profile, false)
         .iter()
         .filter_map(|stub| stub.get("name")?.as_str())
         .filter(|n| sent.iter().any(|s| s == n) && !declared.iter().any(|d| d == n))
@@ -316,6 +368,7 @@ pub(super) fn inject_cc_tools(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,
     fill_absent: bool,
+    trim: bool,
     who: ToolAlignWho<'_>,
 ) -> bool {
     // 不带工具、且开关关着或来访强制调工具：整条不动。闸必须落在这里而不只在
@@ -324,7 +377,7 @@ pub(super) fn inject_cc_tools(
     if declares_no_tools(v) && (!fill_absent || forces_tool_use(v)) {
         return false;
     }
-    let missing = cc_tools_to_inject(v, profile, fill_absent);
+    let missing = cc_tools_to_inject(v, profile, fill_absent, trim);
     // 没带 `tools` 键或是 `null`、又要补：先按官方键序放一个空数组（`system` 之后，没有
     // `system` 就跟 `messages`；`null` 原位换掉），下面照「全缺」对齐。补不出东西时不动。
     if !missing.is_empty() && v.get("tools").is_none_or(|t| t.is_null()) {
@@ -333,7 +386,7 @@ pub(super) fn inject_cc_tools(
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
-    let stubs = cc_tools_core(profile);
+    let stubs = cc_tools_core(profile, trim);
     let official_names: Vec<&str> =
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
     let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);

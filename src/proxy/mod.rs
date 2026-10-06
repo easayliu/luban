@@ -75,12 +75,16 @@ use thinking::{
 
 mod rate_limit;
 use rate_limit::RateLimitInfo;
+
+mod usage_grace;
 #[cfg(test)]
 use rate_limit::{
     DEFAULT_MODEL_COOLDOWN_SECS, LimitScope, MAX_RATE_LIMIT_COOLDOWN_SECS,
     MAX_TRANSIENT_COOLDOWN_SECS, park_if_quota_nearly_exhausted, park_rate_limited,
     rate_limit_scope, rate_limit_scope_for,
 };
+pub(crate) use usage_grace::note_eval_features;
+use usage_grace::{note_overage, usage_limit_wanted};
 
 mod body;
 use body::ua_of;

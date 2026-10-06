@@ -16,6 +16,8 @@ impl EventBuilder<'_> {
             query_depth,
             v280,
             v285,
+            v291,
+            ref main_effort,
             ref ignored_suggestion,
             thread_step,
             ..
@@ -34,7 +36,15 @@ impl EventBuilder<'_> {
             self.push(
                 ms(t0, -2),
                 "tengu_auto_mode_git_state_probe",
-                json!({ "duration_ms": query_depth % 2, "wait_ms": 0, "outcome": git_outcome, "truncated": false }),
+                {
+                    let mut probe = json!({ "duration_ms": query_depth % 2, "wait_ms": 0, "outcome": git_outcome, "truncated": false });
+                    // 2.1.291 多两项：进程里头一回探才是 true（每次输入那条在前头，这里恒 false）。
+                    if v291 {
+                        probe["first_in_process"] = json!(false);
+                        probe["repo_visibility_lookup"] = json!("none");
+                    }
+                    probe
+                },
             );
         }
         // 续轮与侧查询在发请求前也判一次工具搜索模式（首次输入的那条在模板里）；它排在
@@ -66,6 +76,21 @@ impl EventBuilder<'_> {
                 "agent_depth": 1,
                 "agent_system_prompt_chars": shape.system_chars
             });
+            // 2.1.291 在 `is_fork` 后面多报主会话与子代理各自的 effort，**没有就不报**：opus 主线程起
+            // 的 Explore 两项都是 high，haiku 主线程起的 haiku Explore 两项都不在
+            // （`cap/auto-2.1.291-20261006-full` 的 E4 会话）。主会话那项取主线程最近一条，子代理那项
+            // 取子代理这条请求自己的。
+            let mut selected = selected;
+            if v291 {
+                let mut pairs = Vec::new();
+                if let Some(e) = main_effort.as_deref() {
+                    pairs.push(("session_effort", json!(e)));
+                }
+                if let Some(e) = shape.effort.as_deref() {
+                    pairs.push(("subagent_effort", json!(e)));
+                }
+                insert_after(&mut selected, "is_fork", pairs);
+            }
             self.main_side.push((
                 ts,
                 base_identity.event("tengu_agent_tool_selected", ts, &env.ctx(ts), selected),
@@ -201,6 +226,8 @@ impl EventBuilder<'_> {
             ref display_model,
             ref previous_request_id,
             v285,
+            v291,
+            first_main,
             ref tether,
             ref betas_full,
             ..
@@ -396,6 +423,11 @@ impl EventBuilder<'_> {
         }
         self.push(t0, "tengu_api_query", Value::Object(query));
         self.push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
+        // 2.1.291：会话首条主线程请求发出后约 40 ~ 120ms 头一回写会话记录（交互式与 `-p` 都有，
+        // `cap/auto-2.1.291-20261006-full` 每个会话恰好一条，`/clear` 之后的新会话再一条）。
+        if v291 && first_main {
+            self.push_dd(ms(t0, 80), "tengu_feature_ok", feature("session_transcript_write"));
+        }
     }
 
     /// 首字节、首段正文与模型切换。

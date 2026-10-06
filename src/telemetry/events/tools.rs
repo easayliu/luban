@@ -130,7 +130,7 @@ impl EventBuilder<'_> {
             && let Some(verdict) = tu.verdict.as_deref()
         {
             let td = ms(tg, -1);
-            let decision = auto_mode_decision_meta(
+            let mut decision = auto_mode_decision_meta(
                 tu,
                 verdict,
                 profile.as_ref(),
@@ -140,6 +140,9 @@ impl EventBuilder<'_> {
                 tu.id.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b))),
                 session_cwd.as_deref(),
             );
+            if env.f.v291 {
+                auto_mode_decision_v291(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`
@@ -273,8 +276,8 @@ impl EventBuilder<'_> {
     pub(super) fn emit_tool_result(&mut self, step: &ToolStep, i: i64, tu: &ToolUse) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
-        let TurnFacts { is_main, ref chain_id, shell_snapshot_first, v285, .. } = *env.f;
-        let EventEnv { t0, builtin_agent, ref effort, ref effort_value, .. } = *env;
+        let TurnFacts { is_main, ref chain_id, shell_snapshot_first, v285, v291, .. } = *env.f;
+        let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
         let ToolStep { is_sub, prev_end_dt, ref prev_req, ref prev_msg, prev_depth, n, .. } = *step;
         // 工具执行：按调用数把上一条结束到这条发出之间的时间均分。
         let gap = (t0 - prev_end_dt).num_milliseconds().max(50);
@@ -290,7 +293,12 @@ impl EventBuilder<'_> {
         let bash_failed = tu.name == "Bash" && tu.is_error;
         if tu.name == "Bash" {
             if shell_snapshot_first && is_main && i == 0 {
-                self.push_dd(ms(t_done, -40), "tengu_feature_ok", feature("shell_snapshot_create"));
+                let mut snap = feature("shell_snapshot_create");
+                // 2.1.291 起多报这次快照花了多久（`cap/auto-2.1.291-20261006-full`：1237、722ms）。
+                if v291 {
+                    snap["duration_ms"] = json!(700 + i64::from(req_hash % 600));
+                }
+                self.push_dd(ms(t_done, -40), "tengu_feature_ok", snap);
             }
             let command = tu.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
             let backgrounded =
@@ -433,8 +441,17 @@ impl EventBuilder<'_> {
             err["requestId"] = json!(&prev_req);
             err["error"] = json!("ShellError");
             err["error_message_hash"] = json!(&sha256_hex(tu.result_head.as_bytes())[..12]);
-            err["error_stack_hash"] = json!("739abbe6a843");
-            err["error_top_frame"] = json!("chunk-59zy4j10.js:3389:5792");
+            // 栈的摘要与顶帧随每个版本的打包产物变：2.1.285 那份取自 `cap/auto-2.1.285-20260930`，
+            // 2.1.291 取自 `cap/auto-2.1.291-20261006-full`（B4 那条失败的 Bash），后者还多了异常的
+            // 构造器名（压缩后的类名）。
+            if v291 {
+                err["error_constructor"] = json!("Yj");
+                err["error_stack_hash"] = json!("bfd227038d85");
+                err["error_top_frame"] = json!("chunk-v1gtm86q.js:3481:5962");
+            } else {
+                err["error_stack_hash"] = json!("739abbe6a843");
+                err["error_top_frame"] = json!("chunk-59zy4j10.js:3389:5792");
+            }
             err["errorCode"] = json!("ShellError");
             err["rssDeltaBytes"] = json!(1_081_344);
             err["heapUsedDeltaBytes"] = json!(0);

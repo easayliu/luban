@@ -16,6 +16,7 @@ mod v2_1_270;
 mod v2_1_277;
 mod v2_1_280;
 mod v2_1_285;
+mod v2_1_291;
 
 pub use betas::*;
 pub use client::*;
@@ -30,6 +31,7 @@ pub use v2_1_270::*;
 pub use v2_1_277::*;
 pub use v2_1_280::*;
 pub use v2_1_285::*;
+pub use v2_1_291::*;
 
 #[cfg(test)]
 mod tests {
@@ -59,6 +61,30 @@ mod tests {
         for unverified in ["REPL", "JavaScript", "TeamCreate", "SuggestConnectors"] {
             assert!(!CC_TOOL_NAMES.contains(&unverified), "{unverified} 未证实，不该在白名单");
         }
+    }
+
+    /// 补发的额度探测跟着会话版本：SDK 版本头也得是那一版的（2.1.285 的会话里是 0.127.0，不是
+    /// 当前模拟版本的 0.128.0）。
+    #[test]
+    fn stainless_version_follows_the_client_version() {
+        assert_eq!(cc_stainless_version("2.1.291"), Some("0.128.0"));
+        assert_eq!(cc_stainless_version("2.1.300"), Some("0.128.0"));
+        assert_eq!(cc_stainless_version("2.1.285"), Some("0.127.0"));
+        assert_eq!(
+            cc_stainless_version("2.1.290"),
+            Some("0.128.0"),
+            "2.1.288 起的可执行文件都是它"
+        );
+        assert_eq!(cc_stainless_version("2.1.288"), Some("0.128.0"));
+        assert_eq!(cc_stainless_version("2.1.287"), Some("0.127.0"));
+        assert_eq!(cc_stainless_version("2.1.280"), Some("0.112.1"));
+        assert_eq!(cc_stainless_version("2.1.251"), Some("0.112.1"));
+        assert_eq!(cc_stainless_version("2.1.250"), None, "没样本的不猜");
+        assert_eq!(cc_stainless_version("x"), None);
+        // 模拟路径那张表里的值就是当前版本的。
+        let table =
+            CC_SIM_HEADERS.iter().find(|(k, _)| *k == "x-stainless-package-version").unwrap().1;
+        assert_eq!(Some(table), cc_stainless_version(CC_VERSION_BASE));
     }
 
     /// [`CC_LATEST_KNOWN_RELEASE`] 是可信版本的下限：低于模拟版本会把 luban 自己发出去的
@@ -140,26 +166,42 @@ mod tests {
         for kind in [SdkSubagentHaiku, SessionTitleHaiku] {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 280))).version, "2.1.277", "{kind:?}");
         }
-        // 2.1.285 表多一行标题生成；模拟路径只发主线程，恒为 2.1.285。
+        // 2.1.285 表多一行标题生成；2.1.285 ~ 2.1.290 查它。
         for kind in [MainOpus, MainFable, MainSonnet, MainHaiku, SessionTitleHaiku, QuotaProbe] {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 285))).version, "2.1.285", "{kind:?}");
-            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.285", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.285", "模拟路径用 2.1.285 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 290))).version, "2.1.285", "{kind:?}");
         }
-        // 第二批抓包补了子代理与 helper。
+        // 2.1.291 表：主线程四族、标题、helper、额度探测；模拟路径用它。
+        for kind in [
+            MainOpus,
+            MainFable,
+            MainSonnet,
+            MainHaiku,
+            SessionTitleHaiku,
+            HelperSubagentHaiku,
+            QuotaProbe,
+        ] {
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 291))).version, "2.1.291", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.291", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.291", "模拟路径用 2.1.291 表: {kind:?}");
+        }
+        // 第二批抓包补了子代理与 helper；子代理 2.1.291 没样本，落回 2.1.285。
         for kind in [SdkSubagentHaiku, HelperSubagentHaiku] {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 285))).version, "2.1.285", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.285", "{kind:?}");
         }
+        assert_eq!(cc_profile_at(SdkSubagentHaiku, Some((2, 1, 291))).version, "2.1.285");
+        assert_eq!(cc_profile(SdkSubagentHaiku).version, "2.1.285");
         assert_eq!(cc_profile_at(HelperSubagentHaiku, Some((2, 1, 280))).version, "2.1.260");
         for kind in [SecurityClassifierSonnet] {
-            for v in [(2, 1, 277), (2, 1, 280), (2, 1, 285)] {
+            for v in [(2, 1, 277), (2, 1, 280), (2, 1, 285), (2, 1, 291)] {
                 assert_eq!(cc_profile_at(kind, Some(v)).version, "2.1.260", "{kind:?} {v:?}");
             }
             assert_eq!(cc_profile(kind).version, "2.1.260", "{kind:?}");
         }
         assert!(cc_profile_exact(MainOpus, "2.1.280").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.285").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.291").is_some());
+        assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.285").is_some(), "cap/2.1.285/00120");
         assert!(cc_profile_exact(MainOpus, "2.1.270").is_none(), "那一版只有 sonnet");

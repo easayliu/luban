@@ -324,6 +324,15 @@ impl Telemetry {
         for k in stale {
             Self::replay_deferred(&mut st, &k);
         }
+        let stale_pre: Vec<(i64, String)> = st
+            .presession
+            .iter()
+            .filter(|(_, v)| v.iter().any(|(_, at)| now.duration_since(*at) >= hold))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_pre {
+            Self::replay_presession(&mut st, &k);
+        }
         let expired: Vec<((i64, String), Session)> = {
             let keys: Vec<(i64, String)> = st
                 .sessions

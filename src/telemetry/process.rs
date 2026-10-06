@@ -63,6 +63,21 @@ impl Telemetry {
             let auto_in_delta = shape.auto_marker || shape.permission_declared;
             base.fill(&mut shape, auto_in_delta);
         }
+        // 会话还没有：标题生成先扣住，等这个会话的主线程请求来建会话（见 [`State::presession`]）。
+        // 必须在判会话来历（`resolve_lineage`）之前扣：那一步会把 `/clear` 的旧会话标成已清、把
+        // `--continue` 的旧会话与启动标记删掉，标题拿走了，主线程那条就认不出来历了。只扣标题：
+        // 它是新会话首次输入时与主线程那条同时发的，主线程请求紧随其后必到；无工具 helper 没有
+        // 这个保证。
+        // `--continue` 的新进程也算「会话还没有」：旧会话在会话表里，但主线程那条一到就会被
+        // `resolve_lineage` 删掉重建（这里只判、不改）。
+        if allow_defer
+            && classify_kind(&call, &shape, is_agent) == Kind::Title
+            && (!st.sessions.contains_key(&(call.cred_id, session_id.clone()))
+                || st.continue_marker(&call, &shape, &session_id, &device_id).is_some())
+        {
+            st.presession.entry((call.cred_id, session_id)).or_default().push((call, now));
+            return;
+        }
         let Lineage { continued_from, cleared_from, cleared_prev, parent_session_id } =
             st.resolve_lineage(&call, &shape, &session_id, &device_id);
         let identity = Identity {
@@ -130,6 +145,21 @@ impl Telemetry {
             )
         });
         sess.last_seen = now;
+        // 会话建起来之前扣住的标题（[`State::presession`]）：主线程请求到了，并进会话自己的侧查询
+        // 队列，照那条路补发（这条处理完就补）。**并之前先记下它们的完成时刻**：标题比主线程那条
+        // 早完成，主线程那条的 `timeSinceLastApiCallMs` 量的正是到标题完成的距离（2.1.291 四族首条
+        // 主线程请求报 2825 / 6138 / 2469 / 2305ms）。
+        if kind == Kind::Main
+            && let Some(parked) = st.presession.remove(&key)
+        {
+            for (c, at) in parked {
+                let prev_end = sess.last_call_end;
+                let this_end = c.started_at + Duration::from_millis(c.total_ms);
+                sess.last_call_end = Some(prev_end.map_or(this_end, |e| e.max(this_end)));
+                sess.recent_ends.push_back(this_end);
+                sess.deferred.push((c, prev_end, at));
+            }
+        }
         let (prev_reply_calls, git_outcome) =
             sess.absorb_request(&call, &mut shape, kind, &thread_key, &agent_key);
         // 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
@@ -152,6 +182,7 @@ impl Telemetry {
             notification_base,
             notifications,
             prev_main_end,
+            prev_main_anchor_end,
             prompt_id,
         } = sess.advance_turn(&call, &shape, flags, &version, &prev_reply_calls);
         // 主线程与猜下一句走 `previousRequestId` 链；标题那类没有。
@@ -250,6 +281,11 @@ impl Telemetry {
         // `queryOverheadMs`、`requestPrepareMs`），tether 两条多 `creditRetryStateless` /
         // `toolResultClearingHeldStateless`，auto 模式不再把请求钉成无状态（`cap/2.1.285`）。
         let v285 = version_at_least(&version, "2.1.285");
+        // 2.1.291：`tengu_api_success` 多 `cache_creation_1h/5m_input_tokens`，`tether_live_outcome` 多
+        // 四项线程闲置 / 存活计时，每轮收尾多一条 `tengu_message_display_hooks`，会话首条请求多一条
+        // `session_transcript_write`，`tool_use_error` 多 `error_constructor`
+        // （`cap/auto-2.1.291-20261006-full`）。
+        let v291 = version_at_least(&version, "2.1.291");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -327,6 +363,14 @@ impl Telemetry {
             betas_own.clone()
         };
 
+        // tether 的时间锚点：主线程含被取消的那条，子代理看它自己那条支线，其余看会话上一条。
+        let anchor_end = if is_main {
+            prev_main_anchor_end
+        } else if kind == Kind::Subagent {
+            agent.as_ref().and_then(|a| a.last_end)
+        } else {
+            prev_end
+        };
         let facts = TurnFacts {
             device_id,
             session_id,
@@ -394,6 +438,10 @@ impl Telemetry {
             v277,
             v280,
             v285,
+            v291,
+            main_effort: sess.main_effort.clone(),
+            anchor_tool_call: !prev_reply_calls.is_empty(),
+            anchor_end,
             injected,
             first_prompt_tpl,
             background,
@@ -518,9 +566,18 @@ impl Telemetry {
             usage: !failed && !aborted,
         });
 
-        // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去。
+        // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去（会话建起来
+        // 之前就扣住的标题已经并进这个队列）。
         if is_main {
             Self::replay_deferred(st, &key);
+        }
+    }
+
+    /// 扣太久（[`Telemetry::gc`]）还没等到主线程请求的标题（[`State::presession`]）：照旧由第一条
+    /// 自己建会话、按它自己的样子发。
+    pub(super) fn replay_presession(st: &mut State, key: &(i64, String)) {
+        for (c, _) in st.presession.remove(key).unwrap_or_default() {
+            Self::process(st, c, false, None);
         }
     }
 
@@ -558,6 +615,7 @@ struct TurnStart {
     notification_base: u32,
     notifications: Vec<usize>,
     prev_main_end: Option<SystemTime>,
+    prev_main_anchor_end: Option<SystemTime>,
     prompt_id: String,
 }
 
@@ -640,6 +698,7 @@ impl Session {
         }
         if kind == Kind::Main {
             self.main_permission = shape.permission_mode;
+            self.main_effort = shape.effort.clone();
         } else if kind == Kind::WebSearchTool
             || (kind.is_agent() && !shape.auto_marker && !shape.permission_declared)
         {
@@ -753,6 +812,11 @@ impl Session {
         if is_main && !aborted {
             self.last_main_end = Some(this_end_wall(call));
         }
+        // tether 的时间锚点：被取消的主线程请求也算它的收尾时刻（见 [`Session::last_main_anchor_end`]）。
+        let prev_main_anchor_end = self.last_main_anchor_end;
+        if is_main {
+            self.last_main_anchor_end = Some(this_end_wall(call));
+        }
         if new_prompt {
             // 同伴会话发来的一轮（`peer`）不算用户的第几次输入：官方那条 input_prompt 不带
             // `prompt_index`，下一次输入接着原来的数（`cap/2.1.280`：…2、peer、3）。
@@ -790,6 +854,7 @@ impl Session {
             notification_base,
             notifications,
             prev_main_end,
+            prev_main_anchor_end,
             prompt_id,
         }
     }
@@ -816,6 +881,7 @@ impl Session {
             prev_total: a.prev_total,
             tools_hash: a.tools_hash.clone(),
             invoking_request_id: (a.steps == 0).then(|| a.invoking_request_id.clone()).flatten(),
+            last_end: a.last_end,
         }
     }
 
@@ -973,8 +1039,14 @@ impl Session {
         self.last_call_end = Some(self.last_call_end.map_or(this_end, |e| e.max(this_end)));
         // 被取消的那条不进链：官方下一条的 `previousRequestId` / `previousMessageId` 仍指它之前
         // 那条（`cap/auto-2.1.285-20260930/00264`）。
-        if !aborted {
-            self.last_message_id = call.message_id.clone().or(self.last_message_id.take());
+        // 补发的侧查询（扣住的标题）比后来的主线程请求结束得早：只有比现有锚点晚结束的才换，
+        // 不然下一条没带 `diagnostics.previous_message_id` 的请求会回头引用那条标题。
+        if !aborted
+            && call.message_id.is_some()
+            && self.last_message_end.is_none_or(|e| this_end >= e)
+        {
+            self.last_message_id = call.message_id.clone();
+            self.last_message_end = Some(this_end);
         }
         // 「猜下一句」出的建议：有正文就挂着，等用户下一次输入（或 `/compact`、`/btw` 这类斜杠
         // 命令）时报 ignored；这条输入把它消费掉。
@@ -1048,6 +1120,7 @@ impl Session {
             && let Some(a) = self.agents.get_mut(agent_key)
         {
             a.steps += 1;
+            a.last_end = Some(this_end_wall(call));
             a.tool_uses += shape.tool_uses.len() as u32;
             a.last_request_id = call.request_id.clone().or(a.last_request_id.take());
             a.last_message_id = call.message_id.clone().or(a.last_message_id.take());

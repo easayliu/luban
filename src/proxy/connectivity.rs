@@ -677,6 +677,8 @@ async fn send_quota_probe(
         // 官方那条没有 `system`，自然也没有第四块。
         rest: None,
         fill_absent_tools: false,
+        trim_tools: false,
+        usage_limit: false,
         thread: Default::default(),
     };
     let mut headers = build_forward_headers_for(
@@ -698,6 +700,11 @@ async fn send_quota_probe(
     // `claude-cli/2.1.260` 的额度探测——同一会话里混了两个版本。
     if let Ok(v) = HeaderValue::from_str(&format!("claude-cli/{version} (external, cli)")) {
         headers.insert(header::USER_AGENT, v);
+    }
+    // SDK 版本头同理：同一个 Stainless 客户端发出来的，跟着会话版本（2.1.285 的会话里是 0.127.0，
+    // 不是 luban 当前模拟版本的 0.128.0），见 [`config::cc_stainless_version`]。
+    if let Some(sdk) = config::cc_stainless_version(version) {
+        headers.insert("x-stainless-package-version", HeaderValue::from_static(sdk));
     }
     let body = rewrite_body_out(
         &probe_body(model),
@@ -776,6 +783,10 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
         // 探测体是 `tools: []`（[`probe_body`]），一直靠注入补齐官方工具、验的正是主线程链路；
         // 这是 luban 自己发的，不受 `fill_absent_tools` 开关管。
         fill_absent_tools: true,
+        // 连通性探测验的是完整的主线程链路，按官方默认那 14 条发，不跟 `sim_trim_tools`。
+        trim_tools: false,
+        // 探测是一句新输入，不是工具续轮。
+        usage_limit: false,
         thread: Default::default(),
     }
 }

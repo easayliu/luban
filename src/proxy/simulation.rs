@@ -81,6 +81,12 @@ pub(super) struct Simulation {
     /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
     /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
     pub(super) fill_absent_tools: bool,
+    /// 注入的官方工具去掉 Artifact / ListAgents / SendFeedback 三条（开关 `sim_trim_tools`，见
+    /// [`crate::store::ForwardFlags::sim_trim_tools`] 与 [`crate::proxy::cc_tools_core`]）。
+    pub(super) trim_tools: bool,
+    /// 这条要不要带 `anthropic-usage-limit: extended`（[`config::CC_USAGE_LIMIT_HEADER`]）：主线程
+    /// 的工具续轮，且这个号进了那个实验、额外用量停用着，见 [`usage_limit_wanted`]。
+    pub(super) usage_limit: bool,
     /// 出站体按 message thread 改写后，等回程提交的那份（[`ThreadPending`]）：由
     /// [`crate::proxy::rewrite_body_out`] 写（[`Self::set_thread`]），`ReqLog` 取走
     /// （[`Self::take_thread`]）。放在这里而不是改写的返回值里，是因为改写那个函数有十几处调用点，
@@ -99,17 +105,20 @@ impl Simulation {
 }
 
 /// 模拟路径这条请求写不写 `thread`（[`crate::proxy::rewrite_body_out`] 里的 message thread 一步）：
-/// 只给主线程 profile、出站 beta 里有 [`config::CC_BETA_MESSAGE_THREADS`] 的，且不是 fable-5-1——
-/// 2.1.285 官方 opus / sonnet / haiku 各代与 fable-5 的主线程每条都带 `thread`，唯独 fable-5-1
-/// 一条都不带（`cap/auto-2.1.285-20260930/00383`、`00554`，`cap/2.1.285/00039`）。
+/// 只给主线程 profile、出站 beta 里有 [`config::CC_BETA_MESSAGE_THREADS`] 的。2.1.285 的 fable-5-1
+/// 除外——那一版官方 opus / sonnet / haiku 各代与 fable-5 的主线程每条都带 `thread`，唯独 fable-5-1
+/// 一条都不带（`cap/auto-2.1.285-20260930/00383`、`00554`，`cap/2.1.285/00039`）；2.1.291 起
+/// fable-5-1 也带了（`cap/auto-2.1.291-20261006-full/00464` 首轮 `create`、`00465` 起 `continue`）。
 pub(super) fn sim_uses_threads(sim: &Simulation, model: &str) -> bool {
+    let fable_5_1_without_threads = model.to_ascii_lowercase().contains("fable-5-1")
+        && super::parse_version(sim.profile.version).is_some_and(|v| v < (2, 1, 291));
     sim_is_main_thread(sim)
         && sim_has_beta(sim, config::CC_BETA_MESSAGE_THREADS)
-        && !model.to_ascii_lowercase().contains("fable-5-1")
+        && !fable_5_1_without_threads
 }
 
 /// 这条模拟请求是不是主线程 profile：`<total_tokens>` 提醒（[`crate::proxy::rewrite_body_out`]
-/// 里 message thread 那一步）四族主线程都带，fable-5-1 不写 `thread` 也照带
+/// 里 message thread 那一步）四族主线程都带，2.1.285 的 fable-5-1 不写 `thread` 也照带
 /// （`cap/auto-2.1.285-20260930/00383`）。
 pub(super) fn sim_is_main_thread(sim: &Simulation) -> bool {
     matches!(
@@ -251,6 +260,8 @@ impl Simulation {
             reason,
             rest,
             fill_absent_tools: flags.fill_absent_tools,
+            trim_tools: flags.sim_trim_tools,
+            usage_limit: super::usage_limit_wanted(v, profile, cred.id),
             thread: Default::default(),
         })
     }
@@ -582,27 +593,58 @@ fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 这个模型名是不是 Claude Code 认识的四族（opus / fable / sonnet / haiku）之一。2.1.277 起
-/// 基座与第四块四族**同一份**（[`config::CC_SYSTEM_BASE`]、[`config::CC_SYSTEM_REST`]），故
-/// 只需判「是不是这四族」；2.1.258 / 2.1.260 时三族各有各的基座，那张映射已经不需要了。
+/// 这个模型名是不是 Claude Code 认识的四族（opus / fable / sonnet / haiku）之一。2.1.277 ~ 2.1.285
+/// 基座与第四块四族**同一份**；2.1.291 起 fable 的第四块、haiku 的基座与第四块各换了一份
+/// （[`config::CC_SYSTEM_REST_FABLE`]、[`config::CC_SYSTEM_BASE_HAIKU`]、
+/// [`config::CC_SYSTEM_REST_HAIKU`]），按 [`cc_profile_kind_for`] 那套族名判挑哪份。
 fn is_claude_family(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f))
 }
 
-/// 官方基座（2.1.277 起四族同一份）；认不出的模型返回 `None`，只注入身份句——基座是逐字节从
-/// 抓包取的，给一个 `gpt-4o` 补 Claude Code 的基座比不补更糟。
+/// 官方基座（2.1.291：haiku 一份长的，其余三族同一份）；认不出的模型返回 `None`，只注入身份句
+/// ——基座是逐字节从抓包取的，给一个 `gpt-4o` 补 Claude Code 的基座比不补更糟。
 pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
-    is_claude_family(model).then_some(config::CC_SYSTEM_BASE)
+    if !is_claude_family(model) {
+        return None;
+    }
+    Some(match cc_profile_kind_for(model) {
+        config::CcProfileKind::MainHaiku => config::CC_SYSTEM_BASE_HAIKU,
+        _ => config::CC_SYSTEM_BASE,
+    })
 }
 
-/// 官方第四块里 `You are powered by the model named {name}. The exact model ID is {id}.` 与
-/// 官方第四块的模板（2.1.285 四族同一份，[`config::CC_SYSTEM_REST`]）；认不出的模型 `None`、
+/// 官方第四块的模板（2.1.291：opus / sonnet 一份，fable、haiku 各一份）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
-/// 知识截止，2.1.277 的第四块不再写这些，只剩记忆目录一处随机器变。
+/// 知识截止，2.1.277 起的第四块不再写这些，只剩记忆目录一处随机器变。
 pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
-    is_claude_family(model).then_some(config::CC_SYSTEM_REST)
+    if !is_claude_family(model) {
+        return None;
+    }
+    Some(match cc_profile_kind_for(model) {
+        config::CcProfileKind::MainHaiku => config::CC_SYSTEM_REST_HAIKU,
+        config::CcProfileKind::MainFable if is_fable_5_1(model) => config::CC_SYSTEM_REST_FABLE,
+        config::CcProfileKind::MainFable => CC_SYSTEM_REST_FABLE_5.as_str(),
+        _ => config::CC_SYSTEM_REST,
+    })
 }
+
+/// 规范名是不是 `claude-fable-5-1`（带日期、`[1m]` 之类后缀照认）。
+fn is_fable_5_1(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let bare = m.trim_end_matches("[1m]");
+    bare == "claude-fable-5-1" || bare.starts_with("claude-fable-5-1-") || bare == "fable-5-1"
+}
+
+/// fable-5 的第四块：fable 那份模板只把自我介绍段换成 Fable 5 那段（可执行文件按模型挑这一段，
+/// 见 [`config::CC_FABLE_5_IDENTITY`]）。给 fable-5 发「我是 Fable 5.1」是模型与提示词对不上。
+static CC_SYSTEM_REST_FABLE_5: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    config::CC_SYSTEM_REST_FABLE.replacen(
+        config::CC_FABLE_5_1_IDENTITY,
+        config::CC_FABLE_5_IDENTITY,
+        1,
+    )
+});
 
 /// 这条是不是 2.1.277 起 message-threads 的**官方续轮**（`cap/2.1.277/00035`、`00037`、`00040`、
 /// `00048`、`00051` 等 30 余条，主线程与子代理都有）。官方续轮只发新增消息，`system` 只剩
@@ -918,7 +960,7 @@ fn is_segment(s: &str) -> bool {
 
 /// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
 /// 2.1.277 起只剩记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`（2.1.280 那一节叫 `# auto memory`，
-/// 2.1.285 又改回 `# Memory`）。
+/// 2.1.285 又改回 `# Memory`；2.1.291 的 haiku 那份仍是 `# auto memory`）。三份模板占位相同。
 pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
     template.replace("{{cwd_slug}}", &env.slug).replace("{{home}}", &env.home)
 }

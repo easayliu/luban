@@ -360,6 +360,7 @@ pub(super) fn rewrite_body_out(
                 &mut v,
                 s.profile,
                 s.fill_absent_tools,
+                s.trim_tools,
                 ToolAlignWho { cred_id: cred.id, cred: &cred.label, session: &s.session_id },
             )
     });

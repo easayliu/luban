@@ -2,7 +2,7 @@
 
 use super::*;
 
-// ---------- 请求 profile（2.1.258 / 2.1.260 / 2.1.270 / 2.1.277 / 2.1.280 各一张表） ----------
+// ---------- 请求 profile（2.1.258 / 2.1.260 / 2.1.270 / 2.1.277 / 2.1.280 / 2.1.285 / 2.1.291 各一张表） ----------
 
 /// 一条官方请求属于哪一类。
 ///
@@ -97,7 +97,7 @@ pub struct CcProfile {
     /// 出站头 `x-claude-code-request-class` 的取值。2.1.277 起官方每条 `/v1/messages` 都带
     /// （`cap/2.1.277`）：主线程与「猜下一句」是 `main`，SDK 子代理是 `subagent`，标题生成与
     /// 额度探测是 `auxiliary`（无工具 helper 与安全分类没有 2.1.277 样本，按用途归入后两者）。
-    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]。
+    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.291）。
     pub request_class: &'static str,
     /// 顶层 `output_config.effort` 的取值：2.1.277 起 opus / fable / sonnet 主线程恒带
     /// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`），2.1.280 的 opus 变成
@@ -324,15 +324,16 @@ pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'stat
     )
 }
 
-/// 按 kind 取**当前模拟版本**（2.1.285，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
-/// 落回 [`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`]（SDK 子代理）与 [`CC_PROFILES_2_1_260`]
-/// （无工具 helper、安全分类）。表是常量，三张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus`
+/// 按 kind 取**当前模拟版本**（2.1.291，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
+/// 落回 [`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
+/// [`CC_PROFILES_2_1_260`]（安全分类）。表是常量，三张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus`
 /// 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
 ///
-/// 模拟路径只发主线程四族，这四行在 2.1.285 表里都有；落回旧表的 kind 只用作认来访形态的参照。
+/// 模拟路径只发主线程四族，这四行在 2.1.291 表里都有；落回旧表的 kind 只用作认来访形态的参照。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
     CC_PROFILES
         .iter()
+        .chain(CC_PROFILES_2_1_285)
         .chain(CC_PROFILES_2_1_280)
         .chain(CC_PROFILES_2_1_277)
         .chain(CC_PROFILES_2_1_260)
@@ -355,14 +356,15 @@ pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static C
         .find(|p| p.kind == kind && p.version == version)
 }
 
-/// 六张 profile 表，按版本从旧到新。
-pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 6] {
+/// 七张 profile 表，按版本从旧到新。
+pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
     [
         CC_PROFILES_2_1_258,
         CC_PROFILES_2_1_260,
         CC_PROFILES_2_1_270,
         CC_PROFILES_2_1_277,
         CC_PROFILES_2_1_280,
+        CC_PROFILES_2_1_285,
         CC_PROFILES,
     ]
 }
@@ -372,7 +374,8 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 6] {
 /// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。分档：
 /// - 低于 2.1.260 取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的
 ///   客户端还不是 2.1.260，猜新的一版等于给它们集体换一套形态；
-/// - 2.1.285 及以上查 [`CC_PROFILES`]，没行的 kind 依次再查 2.1.280、2.1.277 表；
+/// - 2.1.291 及以上查 [`CC_PROFILES`]，没行的 kind（SDK 子代理）依次再查 2.1.285、2.1.280、2.1.277 表；
+/// - 2.1.285 ~ 2.1.290 查 [`CC_PROFILES_2_1_285`]，没行的 kind 依次再查 2.1.280、2.1.277 表；
 /// - 2.1.280 ~ 2.1.284 查 [`CC_PROFILES_2_1_280`]，没行的 kind（子代理、标题）再查 2.1.277 表；
 /// - 2.1.277 ~ 2.1.279 查 [`CC_PROFILES_2_1_277`]；
 /// - 2.1.270 ~ 2.1.276 先查 [`CC_PROFILES_2_1_270`]，那张表里只有抓到样本的 kind；
@@ -390,7 +393,12 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
     // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
     let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 285) => find(CC_PROFILES)
+        Some(v) if v >= (2, 1, 291) => find(CC_PROFILES)
+            .or_else(|| find(CC_PROFILES_2_1_285))
+            .or_else(|| find(CC_PROFILES_2_1_280))
+            .or_else(|| find(CC_PROFILES_2_1_277))
+            .unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 285) => find(CC_PROFILES_2_1_285)
             .or_else(|| find(CC_PROFILES_2_1_280))
             .or_else(|| find(CC_PROFILES_2_1_277))
             .unwrap_or_else(at_260),

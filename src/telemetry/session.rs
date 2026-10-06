@@ -94,6 +94,10 @@ pub(super) struct Session {
     pub(super) interrupted_message_id: Option<String>,
     /// 上一条主线程请求结束的时刻（夹带的后台任务通知就是那时送到的）。
     pub(super) last_main_end: Option<SystemTime>,
+    /// 上一条主线程请求结束的时刻，**被 Esc 取消的也算**：2.1.291 `tether_live_outcome.threadIdleMs`
+    /// 的时间锚点（`cap/auto-2.1.291-20261006-full/00354`：取消那条之后重建线程，idle 从取消那条
+    /// 收尾算起）。与 [`Self::last_main_end`]、工具锚点（上一条有效回复里的工具调用）分开记。
+    pub(super) last_main_anchor_end: Option<SystemTime>,
     /// 刚做完一次 `/compact`，下一条主线程请求是压缩之后的第一条。
     pub(super) post_compact: bool,
     /// `default_model`：用户设置里的默认模型，取会话启动时那台设备的
@@ -104,6 +108,8 @@ pub(super) struct Session {
     pub(super) default_model: String,
     pub(super) main_model_seen: bool,
     pub(super) last_message_id: Option<String>,
+    /// [`Self::last_message_id`] 那条请求的完成时刻：补发的、更早完成的请求不往回拨它。
+    pub(super) last_message_end: Option<SystemTime>,
     pub(super) last_model: Option<String>,
     /// 上次报过的工具长度表 hash，主线程一组、侧查询一组各记各的：官方整个会话只有两条
     /// `tengu_tool_schema_sizes`（主线程 16 个工具一条、标题生成空表一条），第二轮主线程
@@ -145,6 +151,9 @@ pub(super) struct Session {
     /// 主线程最近一条的权限模式。子代理的请求体里没有 auto 模式的提示（`cap/2.1.280`
     /// Explore 七条一条都没有），官方报的却是 `auto`——子代理沿用主线程的模式。
     pub(super) main_permission: &'static str,
+    /// 主线程最近一条的 `output_config.effort`（haiku 没有）。子代理那条 `agent_tool_selected`
+    /// 的 `session_effort` 报的是它（2.1.291）。
+    pub(super) main_effort: Option<String>,
     /// 本轮的发起方（事件写法，如 `task-notification`）：新输入时从 billing header 取，
     /// 同一轮的续轮请求没带就沿用。
     pub(super) turn_origin: String,
@@ -160,6 +169,8 @@ pub(super) struct AgentView {
     pub(super) tools_hash: Option<String>,
     /// 只有支线首条才有。
     pub(super) invoking_request_id: Option<String>,
+    /// 这条支线上一条请求结束的时刻，见 [`AgentState::last_end`]。
+    pub(super) last_end: Option<SystemTime>,
 }
 
 /// 一个子代理（会话里的一条支线）跨请求要记住的东西。字段取值见 `cap/2.1.280` Explore
@@ -172,6 +183,8 @@ pub(super) struct AgentState {
     pub(super) steps: u32,
     /// 首条请求发出的时刻：收尾 `turn_end.duration_ms` / `agent_tool_completed.duration_ms` 的起点。
     pub(super) started: Option<SystemTime>,
+    /// 这条支线上一条请求结束的时刻（`tether_live_outcome.threadIdleMs` 的锚点）；首条没有。
+    pub(super) last_end: Option<SystemTime>,
     /// 首条的用户提示字数（`agent_tool_completed.prompt_char_count`，抓包 481）。
     pub(super) prompt_chars: usize,
     /// 各续轮带回来的工具结果数之和（`total_tool_uses`）。
@@ -211,6 +224,7 @@ pub(super) struct ThreadBase {
     pub(super) deferred_tools: usize,
     pub(super) mcp_tools: usize,
     pub(super) has_tool_search: bool,
+    pub(super) tools_off: ToolsOff,
     pub(super) system_blocks: usize,
     pub(super) system_chars: usize,
     pub(super) static_len: usize,
@@ -243,6 +257,7 @@ impl ThreadBase {
             deferred_tools: s.deferred_tools,
             mcp_tools: s.mcp_tools,
             has_tool_search: s.has_tool_search,
+            tools_off: s.tools_off,
             system_blocks: s.system_blocks,
             system_chars: s.system_chars,
             static_len: s.static_len,
@@ -270,6 +285,7 @@ impl ThreadBase {
             s.deferred_tools = self.deferred_tools;
             s.mcp_tools = self.mcp_tools;
             s.has_tool_search = self.has_tool_search;
+            s.tools_off = self.tools_off;
         }
         s.system_blocks = self.system_blocks;
         s.system_chars = self.system_chars;
@@ -510,6 +526,15 @@ pub(super) struct TurnFacts {
     pub(super) v277: bool,
     pub(super) v280: bool,
     pub(super) v285: bool,
+    pub(super) v291: bool,
+    /// 会话主线程最近一条的 effort，见 [`Session::main_effort`]。
+    pub(super) main_effort: Option<String>,
+    /// 同一条线（主线程 / 这个子代理）上一条回复里有工具调用（`tether_live_outcome.anchorHasToolCall`）。
+    pub(super) anchor_tool_call: bool,
+    /// 同一条线上一条请求结束的时刻（`tether_live_outcome.threadIdleMs`）：主线程含被取消的那条
+    /// （[`Session::last_main_anchor_end`]），子代理是它自己那条支线的（[`AgentState::last_end`]），
+    /// 首条没有。
+    pub(super) anchor_end: Option<SystemTime>,
     pub(super) injected: bool,
     pub(super) first_prompt_tpl: bool,
     pub(super) background: std::ops::Range<usize>,
@@ -564,6 +589,12 @@ impl Pending {
 #[derive(Default)]
 pub(super) struct State {
     pub(super) sessions: HashMap<(i64, String), Session>,
+    /// 会话还没建起来就先完成的侧查询（标题生成之类，`cap/auto-2.1.291-20261006` 四族的
+    /// `00064`→`00066`、`00135`→`00136`、`00204`→`00205`、`00274`→`00276`：标题先回来）。会话由
+    /// 它建的话，启动模板就按一条没有工具的请求出，开关 `sim_trim_tools` 那几样（禁用的环境变量、
+    /// `artifact_disabled_session`）再也补不上。先扣在这里，等这个会话第一条主线程请求把会话建好
+    /// 再补发；扣太久（[`config::TELEMETRY_SIDE_QUERY_HOLD_SECS`]）没等到就照旧按它自己建会话。
+    pub(super) presession: HashMap<(i64, String), Vec<(ApiCall, Instant)>>,
     /// 待发批次按 `(凭证, session_id)` 分开攒：真实客户端一个进程一个会话，各自往上报，
     /// **一个批次里只会有一个 `session_id` / `device_id`**。同一张凭证被几台设备同时用时，
     /// 合在一个 POST 里就是官方不会产生的混合批次。
@@ -643,6 +674,7 @@ impl Session {
             default_model: device_default.clone().unwrap_or_else(|| display_model.to_string()),
             main_model_seen: device_default.is_some(),
             last_message_id: None,
+            last_message_end: None,
             last_model: None,
             tools_hash_main: None,
             tools_hash_side: None,
@@ -661,6 +693,7 @@ impl Session {
             agents: HashMap::new(),
             last_spawn_request_id: None,
             main_permission: "default",
+            main_effort: None,
             turn_origin: "human".to_string(),
             turn_skill: None,
             first_call_at: call.started_at,
@@ -677,6 +710,7 @@ impl Session {
             interrupted_message_id: None,
             post_compact: false,
             last_main_end: None,
+            last_main_anchor_end: None,
         }
     }
 }
@@ -696,13 +730,15 @@ pub(super) struct Lineage {
 
 impl State {
     /// 会话形态：`/clear` 与 `--continue`，见 [`State::process_starts`]。
-    pub(super) fn resolve_lineage(
-        &mut self,
+    /// 这条请求是不是 `--continue` 接上旧会话的新进程（只判，不改状态），见 [`Self::resolve_lineage`]。
+    /// 返回启动探测那个临时会话 id 与探测时刻。
+    pub(super) fn continue_marker(
+        &self,
         call: &ApiCall,
         shape: &RequestShape,
         session_id: &str,
         device_id: &str,
-    ) -> Lineage {
+    ) -> Option<(String, SystemTime)> {
         let skey = (call.cred_id, session_id.to_string());
         let dkey = (call.cred_id, device_id.to_string());
         let marker = self.process_starts.get(&dkey).cloned();
@@ -710,7 +746,7 @@ impl State {
         // 探测不能把正在跑的会话当成 `--continue`。三样都满足才算：这个会话最后一次活动在探测之前、
         // 这一条不是 thread 续轮（新进程接不上旧进程的线程，`--continue` 之后首条是 create）、探测
         // 那个临时会话 id 没有自己发过请求（另一个进程会接着用它自己的 id）。
-        let continued_from = marker.as_ref().and_then(|(probe_sid, at)| {
+        marker.as_ref().and_then(|(probe_sid, at)| {
             let seen_before = self
                 .sessions
                 .get(&skey)
@@ -724,7 +760,20 @@ impl State {
                 && shape.thread_type.as_deref() != Some("continue")
                 && !probe_has_own_session)
                 .then(|| (probe_sid.clone(), *at))
-        });
+        })
+    }
+
+    pub(super) fn resolve_lineage(
+        &mut self,
+        call: &ApiCall,
+        shape: &RequestShape,
+        session_id: &str,
+        device_id: &str,
+    ) -> Lineage {
+        let skey = (call.cred_id, session_id.to_string());
+        let dkey = (call.cred_id, device_id.to_string());
+        let marker = self.process_starts.get(&dkey).cloned();
+        let continued_from = self.continue_marker(call, shape, session_id, device_id);
         if continued_from.is_some() {
             // 新进程接上旧会话：会话里的一切从头来（与退出后 `--resume` 一样），指标报 `continue`。
             self.sessions.remove(&skey);
