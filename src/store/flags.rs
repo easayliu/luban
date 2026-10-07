@@ -232,6 +232,12 @@ pub struct ForwardFlags {
     /// 上游对首条 user/assistant 之前的 `role:"system"` 直接 400，老模型对对话中途的也 400；
     /// litellm 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把
     /// 这些消息（不论位置）的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
+    /// 几种例外：指令式（`content: []` 带 `output_config`）、对话中途只管一轮的
+    /// （`clear_at: "next_user_message"`）、带非文本块的（`tool_addition` / `tool_removal`）
+    /// 整条留在原位；带正文又带 `output_config` 的拆成「正文提升 + 原位留指令」，见
+    /// `proxy::hoist_system_role_messages`。
+    ///
+    /// 只在 `reject_openai_shape` 关着时生效，那个开关默认开着。
     ///
     /// **CC 形态的请求整个跳过**：官方自己在 messages 里合法使用 `role:"system"`
     /// （deferred tools），硬提升会破坏形态。唯一的例外是**空壳**（content 为空数组 / 空串 /

@@ -22,7 +22,8 @@ pub(in crate::proxy) const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 ///
 /// 三种情况不补：
 /// - 客户端自己带了 `thinking`（`disabled`/`null`/`enabled` 都算——那是它自己的选择）；
-/// - `tool_choice` 强制工具调用（上游不允许两者并存）；
+/// - `tool_choice` 强制工具调用（`tool` 或 `any`：haiku 那种手动预算的 thinking 上游不允许与它
+///   并存，2026-10-07 实测 400；adaptive 的几族本来也不该替客户端在强制工具时多开思考）；
 /// - `max_tokens` 太小（< 1024）：thinking 本身要消耗 token 预算，探测级请求不值得加。
 pub(in crate::proxy) fn ensure_thinking(
     v: &mut serde_json::Value,
@@ -32,13 +33,13 @@ pub(in crate::proxy) fn ensure_thinking(
     if obj.contains_key("thinking") {
         return false;
     }
-    // tool_choice 强制工具调用时上游不允许 thinking，不注入。
+    // tool_choice 强制工具调用（`tool` / `any`）时不注入。
     // 客户端明确要强制工具，thinking 是我们补的，客户端优先。
     if obj
         .get("tool_choice")
         .and_then(|tc| tc.get("type"))
         .and_then(|t| t.as_str())
-        .is_some_and(|t| t == "tool")
+        .is_some_and(|t| matches!(t, "tool" | "any"))
     {
         return false;
     }
@@ -48,6 +49,9 @@ pub(in crate::proxy) fn ensure_thinking(
     }
     let value = match profile.thinking {
         config::CcThinking::Enabled | config::CcThinking::EnabledUpdates => {
+            // `max_tokens == 1024` 时这里是 1023，随后 [`strip_extra_fields`] 抬到下限 1024，与
+            // `max_tokens` 相等。文档写预算须小于 `max_tokens`，但 2026-10-07 实测 haiku-4-5 这一
+            // 组合上游 200（出站带 interleaved-thinking，那时预算可以不小于 `max_tokens`），不改。
             let budget = max_tokens.saturating_sub(1).max(1);
             // 官方 key 序是 `budget_tokens` → `type` → `display`，手工插入以保住顺序
             // （`cap/2.1.260/00020`）。

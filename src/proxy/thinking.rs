@@ -318,8 +318,12 @@ pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
     // [`strip_empty_thinking_blocks`]）——下标一移，按 `(msg, blk)` 配对就会把 A 块的原始字节
     // 盖到 B 块上，历史与签名一起错乱。所以带 `signature` / `data` 的按那个值配（base64，
     // 改写前后逐字相同），只有两侧的 `(msg, blk)` 完全对齐时才退回按位置配。
+    //
+    // 「对齐」比的是 assistant 序号而不是消息下标：模拟路径会在历史里插 `role: system` 消息
+    // （环境说明、换模型说明），只要没动 assistant 那几轮，块还是同一批块，重复签名的块照样
+    // 能按位置配回去。
     let aligned = orig_blocks.len() == rw_blocks.len()
-        && orig_blocks.iter().zip(&rw_blocks).all(|(o, r)| o.msg == r.msg && o.blk == r.blk);
+        && orig_blocks.iter().zip(&rw_blocks).all(|(o, r)| o.turn == r.turn && o.blk == r.blk);
     let unique = |list: &[ThinkingBlockRef], key: &str| {
         list.iter().filter(|b| b.key.as_deref() == Some(key)).count() == 1
     };
@@ -332,7 +336,7 @@ pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
             }
             // 没有签名的块只在完全对齐时按位置配。错位时宁可不还原：它没有签名，上游无从
             // 按字节校验，重新编码一遍无害，而配错了就是把历史改乱。
-            _ if aligned => rw_blocks.iter().find(|r| r.msg == ob.msg && r.blk == ob.blk),
+            _ if aligned => rw_blocks.iter().find(|r| r.turn == ob.turn && r.blk == ob.blk),
             _ => None,
         };
         if let Some(rb) = rb {
@@ -360,6 +364,8 @@ pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
 
 struct ThinkingBlockRef {
     msg: usize,
+    /// 所在消息是第几条 assistant（从 0 数）：插删非 assistant 消息不改它。
+    turn: usize,
     blk: usize,
     span: std::ops::Range<usize>,
     /// 这个块的**稳定身份**：`thinking` 的 `signature`、`redacted_thinking` 的 `data`。
@@ -388,10 +394,12 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
     let Ok(body) = serde_json::from_str::<B<'_>>(json) else { return vec![] };
     let base = json.as_ptr() as usize;
     let mut out = Vec::new();
+    let mut turn = 0;
     for (mi, m) in body.messages.iter().enumerate() {
         if m.role != Some("assistant") {
             continue;
         }
+        turn += 1;
         let Some(raw_content) = m.content else { continue };
         let content_str = raw_content.get();
         // content 是字符串形态时跳过
@@ -421,7 +429,13 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
                     .iter()
                     .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
             });
-            out.push(ThinkingBlockRef { msg: mi, blk: bi, span: start..start + s.len(), key });
+            out.push(ThinkingBlockRef {
+                msg: mi,
+                turn: turn - 1,
+                blk: bi,
+                span: start..start + s.len(),
+                key,
+            });
         }
     }
     out

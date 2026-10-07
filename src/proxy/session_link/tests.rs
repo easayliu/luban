@@ -389,7 +389,7 @@ fn api_key_cc_gets_the_oauth_session_chain() {
             None,
             true,
             true,
-            Some("2.1.285"),
+            Some(crate::proxy::CcClient { version: "2.1.285", entrypoint: "cli" }),
             Some(&link),
             kind,
             None,

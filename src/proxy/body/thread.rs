@@ -21,23 +21,40 @@ use super::*;
 /// `tools`，`tool_choice` 没有落脚处。
 ///
 /// 这一轮的结论（等回程提交的那份）挂到 `sim` 上，由 `ReqLog` 取走（[`Simulation::take_thread`]）。
-pub(super) fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred_id: i64) -> bool {
+///
+/// `env_note` 带这一轮换了模型时新模型那行（[`EnvNoted::model_notice`]）、更早一轮换过模型要在
+/// 历史原位重现的那条（[`EnvNoted::historical_switch`]），以及这一轮的落位（`mid_conv_sys`）。
+/// 落位按**当前**模型自带的 beta——跨模型族时切回不支持 `mid-conversation-system` 的旧模型，
+/// 按这一轮的 beta 自然就落成提醒块，不会给上游发它拒绝的 `role: system` 消息。
+///
+/// `raw_fps` 是**插环境说明之前**的 `messages` 指纹（见 [`rewrite_body`] 里采样）。线程前缀匹配
+/// 要用这份，形态随模型漂来漂去也不打断上一轮的链路。续轮（`continue`）上游线程里仍留着
+/// 历史切换说明，这里不重补；`create` 把完整历史重发，得补上。模型说明与 `<total_tokens>`
+/// 同在指纹算完之后才补。
+pub(super) fn apply_sim_thread(
+    v: &mut serde_json::Value,
+    sim: &Simulation,
+    cred_id: i64,
+    env_note: &EnvNoted,
+    raw_fps: &[ThreadMsg],
+) -> bool {
     if !crate::proxy::simulation::sim_is_main_thread(sim) {
         return false;
     }
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
     let threads = crate::proxy::simulation::sim_uses_threads(sim, model);
     let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
-    if msgs.is_empty() {
+    if msgs.is_empty() || raw_fps.is_empty() {
         return false;
     }
-    // 指纹在插 `<total_tokens>` 提醒**之前**算：客户端下一轮带回来的历史里没有这条提醒（它只进了
-    // 上游线程），把它算进去，下一轮的前缀就永远对不上。
-    let fps: Vec<ThreadMsg> = msgs.iter().map(thread_msg_of).collect();
+    // 指纹用插环境说明之前的那份（`raw_fps`，调用方算好）：当前这轮的消息、历史里存的那条
+    // 都按客户端真正发出的 `messages` 算，环境说明与历史切换说明进不去指纹。换了模型族形态
+    // 跟着变也不会打断前缀匹配，`<total_tokens>` 倒数也接着上一轮。
+    let fps = raw_fps;
     let regular_prompt = crate::telemetry::last_is_new_prompt_body(v);
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
     let (mut decision, pending, tokens_left) =
-        thread_decision(key, thread_shape_of(v), &fps, regular_prompt);
+        thread_decision(key, thread_shape_of(v), fps, regular_prompt);
     let has_tool_choice = v.get("tool_choice").is_some_and(|c| !c.is_null());
     if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
         decision = ThreadDecision::Create;
@@ -46,6 +63,7 @@ pub(super) fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred
         ThreadDecision::Create => pending.into_create(),
         ThreadDecision::Continue { .. } => pending,
     };
+    let is_create = matches!(decision, ThreadDecision::Create);
     let Some(obj) = v.as_object_mut() else { return false };
     match decision {
         ThreadDecision::Create if !threads => {}
@@ -53,8 +71,12 @@ pub(super) fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred
             obj.insert("thread".into(), serde_json::json!({ "type": "create" }));
         }
         ThreadDecision::Continue { from, previous_message_id } => {
+            // `from` 是按 raw 指纹数的（见 `raw_fps` 的注释）；出站 `messages` 比它多了环境说明
+            // 塞进去的那条（`mid_conv_sys` 分支）/ 不多（haiku 分支），drain 要加这个偏移。
+            // 续轮不走 `insert_historical_switch`（上游线程里仍留着那条），不必再算它。
+            let drop = from + env_note.added_msgs;
             if let Some(serde_json::Value::Array(m)) = obj.get_mut("messages") {
-                m.drain(..from);
+                m.drain(..drop.min(m.len()));
             }
             let billing = obj
                 .get("system")
@@ -86,12 +108,17 @@ pub(super) fn apply_sim_thread(v: &mut serde_json::Value, sim: &Simulation, cred
             );
         }
     }
-    insert_total_tokens_reminder(
-        v,
-        tokens_left,
-        regular_prompt,
-        crate::proxy::simulation::sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM),
-    );
+    // 续轮上游线程里仍留着历史里那几条换模型说明（它们已经作为前几轮的回复附近记录），这一轮
+    // 的完整上下文只有新增那几条消息，不必补。`create` 把完整历史整发一遍，缺的那几条就得补回去。
+    let placed = !is_create
+        || insert_historical_switch(v, env_note.historical_switch.as_ref(), env_note.mid_conv_sys);
+    let model_notice = env_note.model_notice_after(placed);
+    let mcs = env_note.mid_conv_sys;
+    let model_notice = model_notice.as_deref();
+    if let Some(notice) = model_notice.filter(|_| !mcs) {
+        place_model_notice(v, notice, false, regular_prompt);
+    }
+    insert_total_tokens_reminder(v, tokens_left, regular_prompt, mcs, model_notice.filter(|_| mcs));
     if threads {
         cap_thread_breakpoints(v);
     }
@@ -154,29 +181,68 @@ pub(super) fn cap_thread_breakpoints(v: &mut serde_json::Value) -> usize {
 /// - **不带**（haiku）：写成 `<system-reminder>`——工具续轮拼在最后一个 `tool_result` 正文的
 ///   末尾（`00412`），新输入则作为一个文本块插在用户那句话前面（`00411`）。
 ///
-/// 官方首轮那条会把它与环境说明、日期并进同一条 system 消息（`00032`、`00349`），那是首轮附件
-/// 整体的形态，这里只补单独这一条。
+/// 官方首轮那条会把它与环境说明、日期并进同一条 system 消息（`00032`、`00349`），那一份由
+/// [`insert_env_note`] 补：带 beta 的首轮末条是那条 system 消息、这里不再追加；haiku 首条用户消息里
+/// 已有一块 `<total_tokens>` 提醒，这里同样跳过。
 fn insert_total_tokens_reminder(
     v: &mut serde_json::Value,
     tokens_left: u64,
     regular_prompt: bool,
     mid_conversation_system: bool,
+    model_notice: Option<&str>,
 ) {
     let text = format!("<total_tokens>{tokens_left} tokens left</total_tokens>");
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
+    // 带 beta：落在末尾那段指令与临时 system（`clear_at`）之前，它们原样留在最后——官方的
+    // `<total_tokens>` 也排在 `clear_at` 那条前面、断点在它身上（`cap/auto-2.1.291-20261006-full/00465`），
+    // 见 [`sticky_tail_start`]。那之前一条是 system（来访连发几条 user，环境说明或历史换模型说明
+    // 只能落在末尾；或来访自己以普通 system 收尾）就并进去，环境说明里本来就有 `<total_tokens>`，
+    // 只补模型说明；是 user 就另起一条，断点从它身上挪过来。
+    if mid_conversation_system {
+        let at = sticky_tail_start(msgs);
+        let Some(prev) = at.checked_sub(1).map(|i| &mut msgs[i]) else { return };
+        let with_notice = |t: String| match model_notice {
+            Some(notice) => format!("{notice}\n\n{t}"),
+            None => t,
+        };
+        match prev.get("role").and_then(|r| r.as_str()) {
+            Some("system") => {
+                let text = match (is_env_note_msg(prev), model_notice) {
+                    (true, Some(notice)) => notice.to_string(),
+                    (true, None) => return,
+                    (false, _) => with_notice(text),
+                };
+                if !append_to_system(prev, &text) {
+                    msgs.insert(at, system_text_msg(&text));
+                }
+            }
+            Some("user") => {
+                let mut block = serde_json::json!({ "type": "text", "text": with_notice(text) });
+                if let Some(cc) = take_last_cache_control(prev) {
+                    block["cache_control"] = cc;
+                }
+                msgs.insert(at, serde_json::json!({ "role": "system", "content": [block] }));
+            }
+            _ => {}
+        }
+        return;
+    }
     let Some(last) = msgs.last_mut() else { return };
     if last.get("role").and_then(|r| r.as_str()) != Some("user") {
         return;
     }
-    if mid_conversation_system {
-        let mut block = serde_json::json!({ "type": "text", "text": text });
-        if let Some(cc) = take_last_cache_control(last) {
-            block["cache_control"] = cc;
-        }
-        msgs.push(serde_json::json!({ "role": "system", "content": [block] }));
+    let wrapped = format!("<system-reminder>\n{text}\n</system-reminder>");
+    // 首轮那份环境说明（[`insert_env_note`]）已经把这条并进了首条用户消息，不再补第二条。
+    let has_one = last.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.starts_with("<system-reminder>\n<total_tokens>"))
+        })
+    });
+    if has_one {
         return;
     }
-    let wrapped = format!("<system-reminder>\n{text}\n</system-reminder>");
     let content = last.get_mut("content");
     let Some(content) = content else { return };
     if let serde_json::Value::String(s) = content {
@@ -211,6 +277,35 @@ fn insert_total_tokens_reminder(
 fn take_last_cache_control(m: &mut serde_json::Value) -> Option<serde_json::Value> {
     let blocks = m.get_mut("content")?.as_array_mut()?;
     blocks.iter_mut().rev().find_map(|b| b.as_object_mut().and_then(|o| o.remove("cache_control")))
+}
+
+/// 插环境说明之前那份 `messages` 的线程指纹（[`apply_sim_thread`] 的 `raw_fps`）。
+///
+/// 环境说明不进指纹，但 [`rewrite_body`] 后面对历史消息本身做的几步要先在快照上做一遍，与
+/// 最终出站一致——回复指纹记的是上游看到的那份：
+///
+/// - 剥空 `text` 块（开关 `strip_empty_text`，[`strip_empty_text_blocks`]）；
+/// - 剥无签名的空 thinking 块（无条件，[`strip_empty_thinking_blocks`]）；
+/// - 工具名混淆（[`apply_tool_names`]）。
+///
+/// 三步都只看块本身，与中间别的步骤无关，在快照上先做就与出站一致。剥块那两步自己会打 info
+/// 日志，出站那一遍已经打过，快照这一遍静音。
+pub(super) fn thread_snapshot(
+    messages: &serde_json::Value,
+    tool_names: Option<&ToolNameMap>,
+    strip_empty_text: bool,
+) -> Vec<ThreadMsg> {
+    let mut snap = serde_json::json!({ "messages": messages });
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        strip_empty_thinking_blocks(&mut snap);
+        if strip_empty_text {
+            strip_empty_text_blocks(&mut snap);
+        }
+    });
+    if let Some(map) = tool_names {
+        apply_tool_names(&mut snap, map);
+    }
+    snap["messages"].as_array().map_or_else(Vec::new, |m| m.iter().map(thread_msg_of).collect())
 }
 
 /// 出站一条消息的线程指纹，见 [`ThreadMsg`]。
@@ -333,9 +428,18 @@ fn fingerprint_without_cache_control(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-/// 按结构哈希一个 JSON 值，跳过所有 `cache_control` 键：断点每轮都挪到最后一条消息上，同一条
+/// 按结构哈希一个 JSON 值，跳过 `cache_control` 键：断点每轮都挪到最后一条消息上，同一条
 /// 消息这轮有、下轮没有，不能因此判成历史变了。
+///
+/// 只跳过 API 认断点的那几层（消息、内容块、工具定义，见 [`cache_slots`]）。`tool_use.input`
+/// 与工具的 `input_schema` 里叫 `cache_control` 的是业务数据：客户端改了历史里某次调用的这个
+/// 参数，跳过它就认不出历史变了，续轮把改过的那条切掉，上游接着用旧的。进了这两个键就整棵
+/// 原样哈希。
 fn hash_without_cache_control<H: std::hash::Hasher>(v: &serde_json::Value, h: &mut H) {
+    hash_json(v, h, true);
+}
+
+fn hash_json<H: std::hash::Hasher>(v: &serde_json::Value, h: &mut H, strip: bool) {
     use std::hash::Hash;
     match v {
         serde_json::Value::Null => 0u8.hash(h),
@@ -355,17 +459,17 @@ fn hash_without_cache_control<H: std::hash::Hasher>(v: &serde_json::Value, h: &m
             4u8.hash(h);
             a.len().hash(h);
             for x in a {
-                hash_without_cache_control(x, h);
+                hash_json(x, h, strip);
             }
         }
         serde_json::Value::Object(o) => {
             5u8.hash(h);
             for (k, x) in o {
-                if k == "cache_control" {
+                if strip && k == "cache_control" {
                     continue;
                 }
                 k.hash(h);
-                hash_without_cache_control(x, h);
+                hash_json(x, h, strip && !matches!(k.as_str(), "input" | "input_schema"));
             }
             6u8.hash(h);
         }

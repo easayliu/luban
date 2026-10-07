@@ -136,8 +136,9 @@ fn billing_suffix_is_derived_from_the_first_real_user_text() {
                 "model": "claude-opus-5-5",
                 "messages": [{"role": "user", "content": content}]})
     };
-    let text =
-        |texts: &[&str], ver: &str| crate::proxy::billing_header_text(&body(texts), Some(ver));
+    let text = |texts: &[&str], ver: &str| {
+        crate::proxy::billing_header_text(&body(texts), Some(ver), None)
+    };
 
     // `cap/2.1.280/00021`：会话首句 `hilew`。
     assert!(text(&[reminder, "hilew"], "2.1.280").contains("cc_version=2.1.280.bc5;"));
@@ -153,11 +154,15 @@ fn billing_suffix_is_derived_from_the_first_real_user_text() {
     assert!(text(&[reminder, caveat, cmd], "2.1.260").contains("cc_version=2.1.260.bcd;"));
     // 2.1.258 那五份全是 `"hi"` 开头的会话。
     let hi = serde_json::json!({"model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]});
-    assert!(crate::proxy::billing_header_text(&hi, Some("2.1.258")).contains(".1e2;"));
+    assert!(crate::proxy::billing_header_text(&hi, Some("2.1.258"), None).contains(".1e2;"));
     // 同一个首句换个版本，后缀跟着变：版本号参与摘要。
     assert!(!text(&[reminder, "hilew"], "2.1.277").contains(".bc5;"));
     // 只有 meta 块的首条消息按空串算（2.1.277 子代理的 `385` 就是空串的值）。
     assert!(text(&[reminder], "2.1.277").contains("cc_version=2.1.277.385;"));
+    // entrypoint 跟来访自报的走，读不出才写 `cli`。
+    let sdk = crate::proxy::billing_header_text(&hi, Some("2.1.291"), Some("sdk-cli"));
+    assert!(sdk.ends_with("; cc_entrypoint=sdk-cli;"), "{sdk}");
+    assert!(text(&[reminder, "hilew"], "2.1.280").ends_with("; cc_entrypoint=cli;"));
 }
 
 /// uuid 形态校验的边界：只认 `8-4-4-4-12` 的小写 hex。
@@ -437,6 +442,12 @@ fn simulated_body_carries_official_message_breakpoint() {
     let blocks = v["messages"][0]["content"].as_array().expect("content 该收成块数组");
     assert_eq!(blocks[0]["type"], "text", "转出来的该是官方那种文本块");
     assert_eq!(blocks[0]["text"], "hi", "正文一个字都不该变");
+    // 首轮末条是补上的环境说明（`role: system`），断点落在它身上；首条用户消息不再标。
+    assert!(blocks.iter().all(|b| b.get("cache_control").is_none()), "{v}");
+    let msgs = v["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "首条之后补一条环境说明: {v}");
+    assert_eq!(msgs[1]["role"], "system");
+    let blocks = msgs[1]["content"].as_array().unwrap();
     assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral", "末块该有断点");
     // 消息这个断点不带 `scope`（官方只在基座标），但跟着开关带 `ttl`。
     assert!(blocks.last().unwrap()["cache_control"].get("scope").is_none(), "只有基座标 global");
@@ -453,12 +464,12 @@ fn simulated_body_carries_official_message_breakpoint() {
     let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     let msgs = v["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs.len(), 4, "环境说明插在首条之后: {v}");
     for (i, m) in msgs.iter().enumerate() {
         let last = m["content"].as_array().unwrap().last().unwrap();
         assert_eq!(
             last.get("cache_control").is_some(),
-            i == 2,
+            i == 3,
             "断点只该在最后一条消息上，第 {i} 条不对: {v}"
         );
     }
@@ -571,7 +582,8 @@ fn simulated_body_carries_official_message_breakpoint() {
     let sim = sim_for(empty);
     let out = rewrite_body(&b, &test_cred(), "fp", on, Some(&sim), None);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(v["messages"][1]["content"], "", "空串不该被转成空 text 块: {v}");
+    // `messages[1]` 是补上的环境说明。
+    assert_eq!(v["messages"][2]["content"], "", "空串不该被转成空 text 块: {v}");
 }
 
 /// 已经是 CC 形态的请求一个字节都不该多改——判据是 `system` 里那句身份声明，
@@ -2232,8 +2244,24 @@ fn client_working_directory_wins_over_the_derived_one() {
         Some(SimEnv {
             home: "/Users/easayliu".into(),
             slug: "-Users-easayliu-Works-easay-luban".into(),
+            cwd: "/Users/easayliu/Works/easay/luban".into(),
         })
     );
+    // 记忆目录与明写的工作目录都在：项目段照记忆目录，工作目录照明写的那条，不按项目段倒推
+    // （倒推会把 `my-api` 写成 `my/api`）。
+    let both = env(
+        r#"{"system":"memory at `/Users/sam/.claude/projects/-Users-sam-src-my-api/memory/`\nWorking directory: /Users/sam/src/my-api"}"#,
+    )
+    .unwrap();
+    assert_eq!(both.slug, "-Users-sam-src-my-api");
+    assert_eq!(both.cwd, "/Users/sam/src/my-api");
+    // 明写那条把路径包在反引号或引号里也照认，不退回倒推的 `my/api`。
+    for wrapped in ["`/Users/sam/src/my-api`", "\\\"/Users/sam/src/my-api\\\""] {
+        let body = format!(
+            r#"{{"system":"memory at `/Users/sam/.claude/projects/-Users-sam-src-my-api/memory/`\nWorking directory: {wrapped}"}}"#
+        );
+        assert_eq!(env(&body).unwrap().cwd, "/Users/sam/src/my-api", "{wrapped}");
+    }
     // 2. 明写工作目录的那一行（官方 CC 写在首条用户消息的 `<env>` 里）。
     assert_eq!(
         env(
@@ -2244,7 +2272,7 @@ fn client_working_directory_wins_over_the_derived_one() {
     // 3. system 正文里裸一条路径；下划线按官方写法换成横线。
     assert_eq!(
         env(r#"{"system":[{"type":"text","text":"repo lives at /home/dev/work/my_app."}]}"#),
-        Some(SimEnv { home: "/home/dev".into(), slug: "-home-dev-work-my-app".into() })
+        Some(SimEnv::from_cwd("/home/dev", "/home/dev/work/my_app"))
     );
     // 用户问句里提到的目录不算「我在这儿干活」：裸路径只认 system。
     assert_eq!(
@@ -2284,6 +2312,20 @@ fn client_working_directory_wins_over_the_derived_one() {
     ] {
         assert_eq!(env(junk), None, "{junk}");
     }
+    // 记忆目录命中后，正文里只有裸路径不该压 cwd——`Read /Users/sam/.config/app/settings.json`
+    // 这种指令是在提某个配置文件，不是在说「我在这儿干活」。cwd 仍从记忆目录倒推。
+    let only_loose = env(
+        r#"{"system":"memory at `/Users/sam/.claude/projects/-Users-sam-src-api/memory/`","messages":[{"role":"user","content":"Read /Users/sam/.config/app/settings.json"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(only_loose.slug, "-Users-sam-src-api");
+    assert_eq!(only_loose.cwd, "/Users/sam/src/api", "裸路径不算明写的 cwd");
+    // 带标签那条才是明写的 cwd，裸路径同时出现也以标签那条为准。
+    let labeled_wins = env(
+        r#"{"system":"memory at `/Users/sam/.claude/projects/-Users-sam-src-my-api/memory/`\nWorking directory: /Users/sam/src/my-api\nRead /Users/sam/.config/app/settings.json"}"#,
+    )
+    .unwrap();
+    assert_eq!(labeled_wins.cwd, "/Users/sam/src/my-api");
 }
 
 /// 整条 detect：来访 system 里那条路径直接落进第四块的记忆目录，派生的那台机器不再出现。

@@ -90,16 +90,16 @@ mod body;
 use body::ua_of;
 #[cfg(test)]
 use body::{
-    CacheShape, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
+    CacheShape, CcClient, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
-    cc_tools_core, client_supplied_fallbacks, device_fingerprint, drop_empty_system_messages,
-    ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
-    flatten_tool_schemas, is_billable_messages, is_fallback_rejection, known_latest_release,
-    misplaced_system_role, normalize_tool_choice, outbound_carries_fallbacks, outbound_identity,
-    refusal_fallbacks_for, remember_fallback_rejection, replace_json_str_field, rewrite_body_out,
-    sim_device_fingerprint, sim_device_id, sim_session_key, stream_requested,
-    strip_empty_text_blocks, strip_extra_fields, sync_metadata_session, trusted_cc_version,
-    trusted_cc_version_against, with_outbound_identity,
+    cc_tools_core, cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint,
+    drop_empty_system_messages, ensure_beta_query, ensure_billing_cch, ensure_fallbacks,
+    extract_device_id, extract_session_id, flatten_tool_schemas, is_billable_messages,
+    is_fallback_rejection, known_latest_release, misplaced_system_role, normalize_tool_choice,
+    outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
+    remember_fallback_rejection, replace_json_str_field, rewrite_body_out, sim_device_fingerprint,
+    sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
+    sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
 pub(crate) use body::{SESSION_KEY_VERSION, has_cache_ttl_1h, parse_version};
 

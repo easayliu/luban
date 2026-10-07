@@ -121,6 +121,79 @@ fn learned_system_role_does_not_block_leading_system_prompts() {
         crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), mid.as_ref(), true)
             .is_none()
     );
+    // 指令式 system 提升不动它，照样送到上游：豁免不成立，照拦。
+    let directive = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","output_config":{"effort":"low"},"content":[]}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            directive.as_ref(),
+            true
+        )
+        .is_some()
+    );
+    // 只管一轮的 system：开头那条会被提升走，出站没有 system 了，照常豁免；中途那条留在原位，
+    // 不豁免。判据与提升本身共用。
+    let leading_scoped = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"system","clear_at":"next_user_message","content":"tmp"},{"role":"user","content":"hi"},{"role":"system","content":"you are…"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            leading_scoped.as_ref(),
+            true
+        )
+        .is_none()
+    );
+    let mid_scoped = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","clear_at":"next_user_message","content":"tmp"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            mid_scoped.as_ref(),
+            true
+        )
+        .is_some()
+    );
+    // 严格模式（不提升）下中途只有一条空壳：出站前一律丢掉，上游看不到 system，不拦。
+    let only_shell = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","content":[]}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            only_shell.as_ref(),
+            false
+        )
+        .is_none()
+    );
+    // 空壳在提升之前就被丢掉，带着 `clear_at` 也不算留下来的 system：照常豁免。
+    let shell_scoped = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","clear_at":"next_user_message","content":[]},{"role":"system","content":"you are…"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            shell_scoped.as_ref(),
+            true
+        )
+        .is_none()
+    );
+    // 带正文又带 `output_config` 的会拆出一条指令留在原位，同样不豁免。
+    let split = json_body(
+        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","output_config":{"effort":"low"},"content":"be brief"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), split.as_ref(), true)
+            .is_some()
+    );
 }
 
 /// 2026-10-02 线上原文（逐字）：说的是 system **摆在哪儿**，不是这个模型不收 system。

@@ -77,6 +77,13 @@ pub(super) struct Simulation {
     /// 不出来（没有模板或没有那行模型名，[`cc_system_rest`]）、或这个 profile 本来就不带
     /// `system`。客户端自己的 system 不掺进这一段，它单独占末块（见 [`simulate_system`]）。
     pub(super) rest: Option<String>,
+    /// 那台「机器」（[`SimEnv`]）：第四块的记忆目录与首轮环境说明
+    /// （[`crate::proxy::body::insert_env_note`]）都照它写。环境说明落在 `messages` 里，不跟第四块的
+    /// 开关 `simulate_full_system`；只有官方不发 `system` 的 profile（额度探测）为 `None`。
+    pub(super) env: Option<SimEnv>,
+    /// 来访头上带着 `context-1m`：出站同样带它（[`crate::proxy::headers::simulated_beta`]），环境说明的模型
+    /// 行随之写 `(1M context)` 与 `[1m]`（`cap/auto-2.1.291-20261006-full/00216`）。
+    pub(super) context_1m: bool,
     /// 来访**整个没带 `tools` 键**时也按主线程补齐官方工具（开关 `fill_absent_tools`，见
     /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
     /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
@@ -239,16 +246,15 @@ impl Simulation {
             crate::telemetry::last_is_new_prompt_body(v),
             profile.has_billing_header(),
         );
-        // 第四块随会话 id 与那台「机器」的环境一起填：来访自己写了工作目录就用它那份
-        // （[`client_env`]），没写才按账号 + 设备派生一台（[`sim_env_for`]）。额度探测那种官方
-        // 就不发 `system` 的 profile 不填（[`simulate_system`] 对它一个字节都不加，填了也白填）。
-        let rest = (flags.simulate_full_system && profile.system != config::CcSystemShape::None)
-            .then(|| cc_system_rest(model))
-            .flatten()
-            .map(|template| {
-                let env = client_env(v).unwrap_or_else(|| sim_env_for(cred, device_fp));
-                render_system_rest(template, &env)
-            });
+        // 那台「机器」：来访自己写了工作目录就用它那份（[`client_env`]），没写才按账号 + 设备派生
+        // 一台（[`sim_env_for`]）。第四块的记忆目录与首轮环境说明（在 `messages` 里，不受第四块开关
+        // 管）都照它写。额度探测那种官方就不发 `system` 的 profile 两样都不补，不算。
+        let env = (profile.system != config::CcSystemShape::None)
+            .then(|| client_env(v).unwrap_or_else(|| sim_env_for(cred, device_fp)));
+        let rest = env.as_ref().filter(|_| flags.simulate_full_system).and_then(|env| {
+            cc_system_rest(model).map(|template| render_system_rest(template, env))
+        });
+        let context_1m = has_beta(&inbound_beta_list(headers), config::CC_BETA_CONTEXT_1M);
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
         Some(Self {
@@ -259,6 +265,8 @@ impl Simulation {
             link,
             reason,
             rest,
+            env,
+            context_1m,
             fill_absent_tools: flags.fill_absent_tools,
             trim_tools: flags.sim_trim_tools,
             usage_limit: super::usage_limit_wanted(v, profile, cred.id),
@@ -752,12 +760,30 @@ pub(super) struct SimEnv {
     /// 记忆目录时（[`env_from_memory_dir`]）它给的也正是这一段——照抄即可，倒推回 cwd 是
     /// 做不到的，一个 `-` 原来是 `/`、是 `_`、还是本来就是 `-`，分辨不出来。
     pub(super) slug: String,
+    /// 工作目录本身，写进首轮环境说明的 `Primary working directory`（[`crate::proxy::body::insert_env_note`]）。
+    /// 由 [`Self::from_memory_dir`] 造的是从项目段倒推的一条（见那里），换算回去仍是同一个 `slug`。
+    pub(super) cwd: String,
 }
 
 impl SimEnv {
     /// 按工作目录造：`/` 与 `_` 换成 `-` 就是项目段。
     pub(super) fn from_cwd(home: impl Into<String>, cwd: &str) -> Self {
-        Self { home: home.into(), slug: cwd.replace(['/', '_'], "-") }
+        Self { home: home.into(), slug: cwd.replace(['/', '_'], "-"), cwd: cwd.to_owned() }
+    }
+
+    /// 来访只给了记忆目录（家目录 + 项目段）时：工作目录从项目段倒推，`-` 一律当 `/`。原名里的
+    /// `-` / `_` 分辨不出来，但倒推出的路径换算回去恰是同一个项目段，记忆目录与工作目录自洽。
+    /// 倒推不出家目录之下的一条规矩路径（项目段不以家目录开头、有连续的 `-`）时，退回
+    /// `<home>/<项目段最后一截>`。
+    pub(super) fn from_memory_dir(home: &str, slug: &str) -> Self {
+        let guess = slug.replace('-', "/");
+        let cwd = if guess.starts_with(&format!("{home}/")) && !guess.contains("//") {
+            guess
+        } else {
+            let tail = slug.rsplit('-').find(|p| !p.is_empty()).unwrap_or("project");
+            format!("{home}/{tail}")
+        };
+        Self { home: home.to_owned(), slug: slug.to_owned(), cwd }
     }
 }
 
@@ -835,19 +861,37 @@ pub(super) fn sim_env_for(cred: &crate::credentials::Credential, device_fp: &str
 /// 前两条 `system` 与首条用户消息都扫，第三条**只扫 `system`**：用户问句里出现一个目录
 /// （「为什么 /Users/sam/src/api 跑不起来」）是在提它，不是在说「我在这儿干活」，按它改
 /// 记忆目录会随着用户每句话里提到的路径来回跳。
+///
+/// 记忆目录与裸路径同时出现时**不让裸路径压 cwd**：裸路径只是提到一个绝对路径（`Read
+/// /Users/sam/.config/app/settings.json` 之类的指令里就是一条），谈不上「我在这儿干活」；只有
+/// 带标签那条才算明写了工作目录，才有资格盖掉记忆目录倒推的 cwd。
 pub(super) fn client_env(v: &serde_json::Value) -> Option<SimEnv> {
     let system = text_blocks(v.get("system"));
     let first_user = text_blocks(
         v.get("messages")
             .and_then(|m| m.as_array())
-            .and_then(|m| m.first())
+            .and_then(|m| m.iter().find(|m| !crate::proxy::body::is_system_directive(m)))
             .and_then(|m| m.get("content")),
     );
     let both = || system.iter().chain(first_user.iter()).copied();
-    let found = |source, env: Option<SimEnv>| env.map(|env| (source, env));
-    let (source, env) = found("memory-dir", both().find_map(env_from_memory_dir))
-        .or_else(|| found("labeled-line", both().find_map(env_from_labeled_line)))
-        .or_else(|| found("loose-path", system.iter().copied().find_map(env_from_loose_path)))?;
+    let explicit = || {
+        both().find_map(env_from_labeled_line).map(|env| ("labeled-line", env)).or_else(|| {
+            system.iter().copied().find_map(env_from_loose_path).map(|e| ("loose-path", e))
+        })
+    };
+    // 记忆目录给的家目录与项目段照抄；工作目录则以明写的为准——项目段倒推回去分不清 `-` 原来是
+    // `/` 还是 `-`（`my-api` 会变成 `my/api`），只有来访没写工作目录时才用倒推的那条。两者指向
+    // 不同目录也照各自的写（官方的记忆目录跟的是项目根，cwd 可以是它下面的子目录）。只有带标签
+    // 的 cwd 才算明写——裸路径压不动它。
+    let (source, env) = match both().find_map(env_from_memory_dir) {
+        Some(mut env) => {
+            if let Some(stated) = both().find_map(env_from_labeled_line) {
+                env.cwd = stated.cwd;
+            }
+            ("memory-dir", env)
+        }
+        None => explicit()?,
+    };
     // 取到的是来访那台机器的真实用户名与项目名。info 只说命中了哪一条判据，够看出「这条请求
     // 的记忆目录不是派生的」；路径本身进 debug，要排障时再开。
     tracing::info!(source, "the client sent its own working directory; the memory path follows it");
@@ -886,7 +930,7 @@ fn env_from_memory_dir(text: &str) -> Option<SimEnv> {
         if !bounded || !is_home(home) || !is_segment(slug) {
             return None;
         }
-        Some(SimEnv { home: home.to_owned(), slug: slug.to_owned() })
+        Some(SimEnv::from_memory_dir(home, slug))
     })
 }
 
@@ -930,7 +974,11 @@ const MAX_CLIENT_SEGMENT_BYTES: usize = 64;
 ///
 /// 记忆目录在这里**要拒**：它由 [`env_from_memory_dir`] 认，当 cwd 会把整条路径塞进项目段。
 fn env_from_cwd(raw: &str) -> Option<SimEnv> {
-    let cwd = raw.trim().trim_end_matches(['.', '/', ':', ',', '`', '"', '\'']);
+    // 前面也要剥引号：带标签那行常把路径整个包在反引号或引号里。
+    let cwd = raw
+        .trim()
+        .trim_start_matches(['`', '"', '\''])
+        .trim_end_matches(['.', '/', ':', ',', '`', '"', '\'']);
     if cwd.len() > MAX_CLIENT_CWD_BYTES || cwd.contains("/.claude/") {
         return None;
     }
@@ -1230,7 +1278,15 @@ pub(super) fn simulate_system(
     };
     // 客户端可能已经抄了官方的 billing header 和身份声明（`is_cc_shaped` 不再拦截非 CC
     // 客户端的这种请求）。模拟会重新补齐这两块，先剥掉客户端那份以免重复。
-    let client = strip_cc_preamble(client);
+    let mut client = strip_cc_preamble(client);
+    // `citations` 上游不收在 system 里：2026-10-07 实测回 400 `system: Found citations in system
+    // content. Citations are only allowed on top-level messages text blocks.`。多块那条路
+    // （[`merge_system_blocks`]）本来就只留正文与断点，单块那条原样交回、会把它带出去，这里统一去掉。
+    for b in &mut client {
+        if let Some(o) = b.as_object_mut() {
+            o.shift_remove("citations");
+        }
+    }
     // 客户端自己的 system **单独占最后一块**（[`merge_system_blocks`] 已经把它并成了一块）：
     // 官方那几块一个字节都不掺进客户端的内容，客户端那段指令也原样以 system 的身份到达模型。
     //
@@ -1294,32 +1350,36 @@ Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE 
 and you MUST follow them exactly as written.";
 
 /// 把客户端自己那段 system 正文裹成官方那种 `<system-reminder>` 块（开头是
-/// [`CLIENT_SYSTEM_REMINDER_LEAD`] 那句、空一行、正文、换行、闭合标签）塞到 `messages[0]` 的
+/// [`CLIENT_SYSTEM_REMINDER_LEAD`] 那句、空一行、正文、换行、闭合标签）塞到首条用户消息的
 /// 第一个内容块前面——`cap/2.1.277` 里 44 份带首条用户消息的请求都是这个写法，luban 原先
-/// 自创的 `<system_instructions>` 标签一次都没出现过。`messages[0]` 必须是 user role（API
-/// 约束），官方 CC 也恒为 user 开头，正常情况下不会踩空。
+/// 自创的 `<system_instructions>` 标签一次都没出现过。
 ///
-/// **要么整个写成，要么一个字节都不动**：先确认 `messages[0].content` 是数组或字符串再写，
+/// 首条用户消息通常就是 `messages[0]`，但开头可以夹着指令式 system（`content: []` 带
+/// `output_config`，[`crate::proxy::body::is_system_directive`]，提升不动它）：往那条里塞字，
+/// 它就成了一条开头的普通 system，上游必拒，客户端调的 effort 也跟着变了味。所以跳过它们；
+/// 跳过之后第一条不是 user 就当落点不可写。
+///
+/// **要么整个写成，要么一个字节都不动**：先确认落点的 `content` 是数组或字符串再写，
 /// 落点不可写（`content` 缺失、是数字、messages 为空）返回 `false`，调用方自己决定正文往哪放。
 pub(super) fn stash_client_system(v: &mut serde_json::Value, text: &str) -> bool {
-    let writable = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|m| m.first())
-        .and_then(|f| f.get("content"))
-        .is_some_and(|c| c.is_array() || c.is_string());
-    if !writable {
+    let at = v.get("messages").and_then(|m| m.as_array()).and_then(|m| {
+        m.iter().position(|x| !crate::proxy::body::is_system_directive(x)).filter(|&i| {
+            m[i].get("role").and_then(|r| r.as_str()) == Some("user")
+                && m[i].get("content").is_some_and(|c| c.is_array() || c.is_string())
+        })
+    });
+    let Some(at) = at else {
         tracing::warn!(
             chars = text.chars().count(),
-            "messages[0].content is not writable, leaving the client system in `system`"
+            "the first user message is not writable, leaving the client system in `system`"
         );
         return false;
-    }
+    };
     let wrapped =
         format!("<system-reminder>\n{CLIENT_SYSTEM_REMINDER_LEAD}\n\n{text}\n</system-reminder>");
     // 走到这里两步都必定成功：上面刚验过 `content` 是数组或字符串。
     let Some(first) =
-        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.first_mut())
+        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.get_mut(at))
     else {
         return false;
     };
@@ -1517,10 +1577,21 @@ pub(super) fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 /// [`config::CC_VERSION_BASE`]：给一个 UA 写着 2.1.258 的来访补一条 `cc_version=2.1.260.…`
 /// 的 billing header，就是把两个版本混进了同一条请求。解不出版本（UA 缺失或不是
 /// `claude-cli/x.y.z` 形态）才退回 luban 自己那个。
-pub(super) fn billing_header_text(v: &serde_json::Value, version: Option<&str>) -> String {
+///
+/// `entrypoint` 同理取 UA 括号里第二段（[`super::body::cc_ua_entrypoint`]）：官方
+/// `cc_entrypoint` 与它同源，`(external, sdk-cli)` 的来访补一条 `cc_entrypoint=cli` 就是 UA 与
+/// billing 自相矛盾。读不出才写 `cli`。
+pub(super) fn billing_header_text(
+    v: &serde_json::Value,
+    version: Option<&str>,
+    entrypoint: Option<&str>,
+) -> String {
     let version = version.unwrap_or(config::CC_VERSION_BASE);
+    let entrypoint = entrypoint.unwrap_or("cli");
     let suffix = cc_version_suffix(v, version);
-    format!("x-anthropic-billing-header: cc_version={version}.{suffix}; cc_entrypoint=cli;")
+    format!(
+        "x-anthropic-billing-header: cc_version={version}.{suffix}; cc_entrypoint={entrypoint};"
+    )
 }
 
 /// 模拟路径的 billing header 正文，整条由 profile 与会话链条拼出。官方形态

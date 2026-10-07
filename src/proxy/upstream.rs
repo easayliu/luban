@@ -9,8 +9,8 @@ use crate::web::AppState;
 
 use super::ban::parse_upstream_error;
 use super::body::{
-    ToolNameMap, declares_no_tools, injected_tools_of, restore_tool_names_stream, rewrite_body_out,
-    trusted_cc_version,
+    CcClient, ToolNameMap, cc_ua_entrypoint, declares_no_tools, injected_tools_of,
+    restore_tool_names_stream, rewrite_body_out, trusted_cc_version,
 };
 use super::headers::{is_resp_forwardable, orig_header_case};
 use super::logging::{ReqLog, ShapeBits, UsageSniffer, shape_summary_of};
@@ -146,14 +146,15 @@ impl Upstream<'_> {
             // 同理，工具声明上的 `eager_input_streaming` 只在出站头带了 `advanced-tool-use`
             // 时才补：带 eager 的官方请求头上都有它，见 [`config::CcEagerTools`]。
             let adv_beta = has_beta(config::CC_BETA_ADVANCED_TOOL_USE);
-            // 给真实 CC 补 billing header 时写的是**它自报的**版本，不是 luban 自己那个：
-            // 见 [`billing_header_text`]。模拟路径不看这个值（那条路的版本在 profile 里）。
-            let client_version = self
-                .headers
-                .get(header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .and_then(trusted_cc_version)
-                .map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            // 给真实 CC 补 billing header 时写的是**它自报的**版本与 entrypoint，不是 luban
+            // 自己那份：见 [`billing_header_text`]。模拟路径不看这个值（那条路的版本在 profile 里）。
+            let ua = self.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+            let client_version =
+                ua.and_then(trusted_cc_version).map(|(a, b, c)| format!("{a}.{b}.{c}"));
+            let client = client_version.as_deref().map(|version| CcClient {
+                version,
+                entrypoint: ua.and_then(cc_ua_entrypoint).unwrap_or("cli"),
+            });
             rewrite_body_out(
                 body,
                 cred,
@@ -166,7 +167,7 @@ impl Upstream<'_> {
                 self.tool_names.as_deref(),
                 display_beta,
                 adv_beta,
-                client_version.as_deref(),
+                client,
                 self.client_link.as_ref().map(|(_, l)| l),
                 self.cc_kind,
                 fallbacks,
@@ -290,6 +291,7 @@ fn stream_upstream(
     tool_names: Option<std::sync::Arc<ToolNameMap>>,
 ) -> Response {
     let builder = resp_builder(&up);
+    let (sse, _) = resp_shape(&up);
     // 末尾接一个哨兵：上游读到头时记下 `upstream_done`。客户端先断开的话 axum 丢掉响应体，
     // 哨兵永远走不到——收尾时据此分出「客户端取消」与「上游半截 EOF」，见 [`ReqLog::upstream_done`]。
     let stream = up.bytes_stream().map(Some).chain(futures_util::stream::iter([None])).filter_map(
@@ -314,7 +316,7 @@ fn stream_upstream(
     );
     // 用量嗅探喂的是**还原前**的字节（`usage` 里没有工具名，两者等价），还原只包在最外层。
     let body = match tool_names {
-        Some(map) => Body::from_stream(restore_tool_names_stream(stream, map)),
+        Some(map) => Body::from_stream(restore_tool_names_stream(stream, map, sse)),
         None => Body::from_stream(stream),
     };
     builder
@@ -361,7 +363,7 @@ pub(super) async fn aggregate_sse(
             // 聚合完再还原：整段都在内存里，不必操心分块边界。
             Ok(body) => builder
                 .body(Body::from(match tool_names {
-                    Some(map) => map.restore(&body),
+                    Some(map) => map.restore_json_body(&body),
                     None => body,
                 }))
                 .unwrap_or_else(|e| {
@@ -390,7 +392,11 @@ pub(super) async fn aggregate_sse(
             // 同一份 error 事件也进了 sniffer（两者都在 feed 同一条流）。这条路已经就地
             // 告警并把状态码换给了客户端，留着它只会让 `ReqLog::drop` 再报一次同样的事。
             rl.sniffer.stream_error = None;
-            match serde_json::to_vec(&payload) {
+            // 报错正文里可能回显假工具名，同别的错误一路全文还原。
+            match serde_json::to_vec(&payload).map(|b| match tool_names {
+                Some(map) => map.restore(&b),
+                None => b,
+            }) {
                 Ok(body) => builder.status(status).body(Body::from(body)).unwrap_or_else(|e| {
                     error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
                 }),

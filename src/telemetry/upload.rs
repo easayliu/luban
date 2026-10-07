@@ -221,7 +221,7 @@ pub(super) fn metrics_body(
             "service.name": "claude-code",
             "service.version": version,
             "os.type": "darwin",
-            "os.version": "27.0.0",
+            "os.version": crate::config::CC_OS_RELEASE,
             "host.arch": "arm64",
             "aggregation.temporality": "delta",
             "user.customer_type": "claude_ai",

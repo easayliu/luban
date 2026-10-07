@@ -1,4 +1,4 @@
-use super::body::first_turn_index;
+use super::body::{first_turn_index, is_system_directive};
 
 /// 请求体里一处 OpenAI 格式转换残留，见 [`find_openai_marker`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +159,9 @@ pub(super) fn find_openai_marker(
         for (mi, msg) in msgs.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
             if strict {
-                if role == "system" && mi < first_turn && !cc_shaped {
+                // 指令式 system（`content: []` 带 `output_config`）不是 OpenAI 的开头系统提示词，
+                // 上游对它「放在任何位置都收」，见 [`is_system_directive`]。
+                if role == "system" && mi < first_turn && !cc_shaped && !is_system_directive(msg) {
                     return Some(OpenAiMarker::new(
                         format!("messages.{mi}.role"),
                         "system_role",
@@ -460,6 +462,13 @@ mod tests {
         ]});
         let m = find_openai_marker(Some(&leading), false, true).unwrap();
         assert_eq!((m.kind, m.location.as_str()), ("system_role", "messages.0.role"));
+
+        // 指令式那种（`content: []` 带 `output_config`）不是开头系统提示词，上游哪儿都收。
+        let directive = serde_json::json!({"messages": [
+            {"role": "system", "output_config": {"effort": "low"}, "content": []},
+            {"role": "user", "content": "hi"}
+        ]});
+        assert_eq!(find_openai_marker(Some(&directive), false, true), None);
 
         let mid = serde_json::json!({"messages": [
             {"role": "user", "content": "hi"},

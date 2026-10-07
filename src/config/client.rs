@@ -235,6 +235,62 @@ pub const CC_FABLE_5_IDENTITY: &str = "This iteration of Claude is Claude Fable 
 /// 长写法。没有 EndConversation 那段；`WebSearch takes a mode` 那段同样去掉。占位同 [`CC_SYSTEM_REST`]。
 pub const CC_SYSTEM_REST_HAIKU: &str = include_str!("../assets/cc_system_rest_haiku.txt");
 
+// ---------- 首轮环境说明（`# Environment` 那条） ----------
+
+/// 模拟的那台机器的 Darwin 内核版本：环境说明的 `OS Version: Darwin …` 与遥测 OTel 资源属性
+/// `os.version` 同一个值（抓包机 `cap/auto-2.1.291-20261006-full` 两处都是 `27.0.0`）。
+pub const CC_OS_RELEASE: &str = "27.0.0";
+
+/// 2.1.291 首轮环境说明的**开头一段**模板（`# Environment` 到「Downloaded files…」那条）。
+///
+/// 官方首轮把环境、模型、Agent 类型、技能清单、`<total_tokens>` 与日期拼成一份：opus / sonnet /
+/// fable（带 `mid-conversation-system`）是首条用户消息之后一条 `role: system` 消息、各段空一行
+/// （`cap/auto-2.1.291-20261006-full/00340`、`00253`、`00464`）；haiku 与老一代模型每段各裹一个
+/// `<system-reminder>`，排在首条用户消息最前面（`00303`、`00553`）。拼法见
+/// `proxy::body::insert_env_note`。
+///
+/// 占位：`{{cwd}}` 工作目录、`{{os_release}}`（[`CC_OS_RELEASE`]）、`{{scratchpad}}`——不精简工具时
+/// 是整行 `Scratchpad directory`（含行尾换行），精简（`sim_trim_tools`）时为空：同一台机器加那三个
+/// 环境变量后官方这一行也没了（`cap/auto-2.1.291-20261006/00031` 对 `00066`）。`Is a git
+/// repository` 恒写 `true`，`Platform` / `Shell` 与请求头的 MacOS 成套。
+pub const CC_ENV_HEAD: &str = include_str!("../assets/cc_env_head.txt");
+
+/// 环境说明里的 Agent 类型一段（opus / sonnet / fable，2703 字节），逐字节取自
+/// `cap/auto-2.1.291-20261006-full/00340`；精简与否、三族之间都相同（`00066`、`00136`、`00205`）。
+/// 六个都是内建 Agent，抓包机没有自定义 Agent。
+pub const CC_ENV_AGENTS: &str = include_str!("../assets/cc_env_agents.txt");
+
+/// haiku 那份 Agent 类型（2910 字节，`00303`、`cap/auto-2.1.291-20261006/00276`）：只有 Explore 的
+/// 描述换了一版，其余逐字相同。
+pub const CC_ENV_AGENTS_HAIKU: &str = include_str!("../assets/cc_env_agents_haiku.txt");
+
+/// 环境说明里的技能清单，**只留内建技能**（17 个，7473 字节）：抓包机那份里带 `:` 的
+/// （`commit-commands:*` 等插件、`anthropic-skills:*` 账号同步的）是那台机器自己装的，去掉。
+/// 内建那部分在四族之间逐字相同，haiku 预算不够时砍的也只是非内建那几条的描述（`00303`）。
+/// 精简工具时官方少了 [`CC_ENV_TRIMMED_SKILLS`] 三条（`cap/auto-2.1.291-20261006/00066`）。
+pub const CC_ENV_SKILLS: &str = include_str!("../assets/cc_env_skills.txt");
+
+/// 精简工具（关掉 Artifact）时技能清单里随之消失的三条。
+pub const CC_ENV_TRIMMED_SKILLS: &[&str] =
+    &["artifact-design", "artifact-diagramming", "artifact-capabilities"];
+
+/// 环境说明里「You are powered by the model named …」那行的模型名与知识截止，逐条取自抓包
+/// （`cap/` 各版本的环境说明）。键是去掉日期与 `[1m]` 的规范名；表里没有的模型按官方的兜底写法
+/// 只写模型 id，见 `proxy::body::insert_env_note`。
+pub const CC_MODEL_IDENTITIES: &[(&str, &str, &str)] = &[
+    ("claude-opus-5-5", "Opus 5.5", "June 2026"),
+    ("claude-fable-5-1", "Fable 5.1", "June 2026"),
+    ("claude-sonnet-5-5", "Sonnet 5.5", "June 2026"),
+    ("claude-haiku-4-5", "Haiku 4.5", "February 2025"),
+    ("claude-opus-5", "Opus 5", "May 2026"),
+    ("claude-fable-5", "Fable 5", "January 2026"),
+    ("claude-sonnet-5", "Sonnet 5", "January 2026"),
+    ("claude-opus-4-8", "Opus 4.8", "January 2026"),
+    ("claude-opus-4-7", "Opus 4.7", "January 2026"),
+    ("claude-opus-4-6", "Opus 4.6", "May 2025"),
+    ("claude-sonnet-4-6", "Sonnet 4.6", "August 2025"),
+];
+
 // ---------- 官方 CC 工具名白名单 ----------
 
 /// 官方 Claude Code 客户端声明过的全部工具名（含 deferred 展开后的名字与老版本的旧名）。

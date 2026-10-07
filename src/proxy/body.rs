@@ -13,8 +13,9 @@ use super::session_link::{
     ThreadDecision, ThreadMsg, cache_prefix_stable, reply_text_fp, thread_decision,
 };
 use super::simulation::{
-    MAX_CACHE_BREAKPOINTS, Simulation, billing_header_text, cap_system_blocks, cc_profile_for,
-    cc_profile_kind_for, is_cc_shaped, relocate_long_client_system, simulate_system,
+    MAX_CACHE_BREAKPOINTS, SimEnv, Simulation, billing_header_text, cap_system_blocks,
+    cc_profile_for, cc_profile_kind_for, is_cc_shaped, relocate_long_client_system,
+    simulate_system,
 };
 use super::thinking::{preserve_thinking_encoding, strip_empty_thinking_blocks};
 use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
@@ -22,6 +23,7 @@ use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, ins
 mod billing;
 mod cache;
 mod cch;
+mod env_note;
 mod fallbacks;
 mod identity;
 mod inspect;
@@ -35,6 +37,7 @@ mod version;
 pub(super) use billing::*;
 pub(crate) use cache::*;
 pub(super) use cch::*;
+pub(super) use env_note::*;
 pub(super) use fallbacks::*;
 pub(crate) use identity::*;
 pub(crate) use inspect::*;
@@ -102,9 +105,9 @@ pub(super) fn rewrite_body_out(
     // 出站头里已经带了 `advanced-tool-use` beta（同样由调用方从实际发出的头上判定）。
     // 真 CC 路径只有它为真才给工具补 `eager_input_streaming`，见 [`eager_tools_wanted`]。
     adv_beta: bool,
-    // 来访**自报**的客户端版本（`claude-cli/x.y.z`，解不出为 `None`）。只用在给真实 CC
-    // 补 billing header 时，见 [`ensure_cc_system_prefix`]。
-    client_version: Option<&str>,
+    // 来访**自报**的客户端身份（`claude-cli/x.y.z (external, <entrypoint>)`，版本解不出为
+    // `None`）。给真实 CC 补 billing header（[`ensure_cc_system_prefix`]）与按版本取舍字段时用。
+    client: Option<CcClient<'_>>,
     // 真实 CC 来访要补的会话关联字段（`cc_prev_req` / `cc_prompt_id` /
     // `diagnostics.previous_message_id`）；模拟路径为 `None`，它的链在 `sim.link` 里。
     // 判据见 [`client_session_link`]。
@@ -183,6 +186,47 @@ pub(super) fn rewrite_body_out(
     // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，末块只留
     // 一个短占位，绕过内容检测且不丢失指令语义。
     let sys_relocated = simulated && sim.is_some_and(|s| relocate_long_client_system(&mut v, s));
+    // 消息线程指纹按**环境说明插入之前**的 `messages` 算：换了模型族时环境说明从 `role: system`
+    // 消息变成用户正文里的提醒块（或反之），插入后的 `fps` 自然就对不上上一轮的记录，但两种
+    // 形态对应的是同一段对话——用来访真正发出的那份算指纹，前缀匹配就不被这种形态变化打断。
+    // 顺序挑在 `insert_env_note` 之前、`insert_historical_switch` / `place_model_notice` 之前：
+    // 都算在这条快照之后、不该进指纹。
+    //
+    // 但后面那几步对历史消息本身的改动要按**出站**的算：上一轮回复的指纹记的是上游看到的那份
+    // （混淆后的工具名、剥掉了空块），这里不跟着做，客户端原样带回来的那条 assistant 就永远对
+    // 不上，每个工具续轮都退回 `create`。见 [`thread_snapshot`]。
+    let raw_fps: Vec<crate::proxy::session_link::ThreadMsg> = sim
+        .filter(|_| simulated && flags.sim_message_threads)
+        .and_then(|_| v.get("messages"))
+        .map(|m| thread_snapshot(m, tool_names, flags.strip_empty_text))
+        .unwrap_or_default();
+    // 官方首轮那份环境说明（工作目录、模型、Agent 类型、技能、日期），每轮在同一位置补同一份，
+    // 见 [`insert_env_note`]。跟在挪客户端 system 之后：haiku 那种写法里客户端那块要排在环境各段
+    // 之后、日期之前；在补末条断点之前：首轮它就是末条，断点要落在它身上。
+    let env_note = match sim {
+        Some(s) if simulated => insert_env_note(&mut v, s, cred.id),
+        _ => EnvNoted::default(),
+    };
+    // 换模型那一轮的模型说明：开着 message thread 时交给 [`apply_sim_thread`] 与 `<total_tokens>`
+    // 并成一条，关着时没有那条提醒，就在这里单独补；落位按首轮钉住的那份而非这一轮 sim 的 beta，
+    // 换了模型族（opus→haiku）才不会把历史从 role:system 消息改成用户正文里的提醒块。
+    // 更早几轮换过模型要在历史原位重现的那几条，这条路关着线程、每轮重发完整历史，也在这里补。
+    let no_threads = !flags.sim_message_threads && sim.is_some() && env_note.inserted;
+    let model_notice = if no_threads {
+        env_note.model_notice_after(insert_historical_switch(
+            &mut v,
+            env_note.historical_switch.as_ref(),
+            env_note.mid_conv_sys,
+        ))
+    } else {
+        None
+    };
+    let model_noticed = no_threads
+        && model_notice.as_deref().is_some_and(|notice| {
+            let regular_prompt = crate::telemetry::last_is_new_prompt_body(&v);
+            place_model_notice(&mut v, notice, env_note.mid_conv_sys, regular_prompt)
+        });
+    let env_noted = env_note.inserted || model_noticed;
     // `context_management` 只补在模拟路径上：声明它的 `context-management-2025-06-27` 出自模拟
     // seed，而 [`Simulation::detect`] 本身就要求 `merge_beta` 开着，故「体里有 `edits`、头上没
     // 声明」这个反向矛盾在这条路上构造不出来——不必像 `scope_global` 那样再叠一次 `merge_beta`。
@@ -256,7 +300,7 @@ pub(super) fn rewrite_body_out(
     let prefix_injected = flags.simulate_cc
         && sim.is_none()
         && cc_kind.allows_system_prefix()
-        && ensure_cc_system_prefix(&mut v, client_version);
+        && ensure_cc_system_prefix(&mut v, client);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
     // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。
@@ -270,7 +314,7 @@ pub(super) fn rewrite_body_out(
         // 主线程（含工具续轮与 thread 续轮）的 `cc_prompt_id` 后面还跟着 `cc_turn_origin`
         // （2.1.277 起）与会话里的第几轮（2.1.285 起，`cap/2.1.285/00113`、`00115`）；子代理与
         // helper 只有 `cc_prompt_id`（`00120`、`00125`）。按来访自报的版本给，版本读不出不补。
-        let ver = client_version.and_then(parse_version);
+        let ver = client.and_then(|c| parse_version(c.version));
         let main = cc_kind == CcRequestKind::Main;
         let turn = TurnFields {
             origin: main && ver.is_some_and(|v| v >= (2, 1, 277)),
@@ -369,7 +413,7 @@ pub(super) fn rewrite_body_out(
     // 路径不同（真 CC 看来访版本 × 模型 × 用途，模拟看出站 profile），规则共用，见
     // [`eager_tools_wanted`] 与 [`fill_eager_tools`]。
     let eager_filled = flags.eager_tool_streaming
-        && eager_tools_wanted(&v, sim, cc_inbound, cc_kind, client_version, adv_beta)
+        && eager_tools_wanted(&v, sim, cc_inbound, cc_kind, client.map(|c| c.version), adv_beta)
         && fill_eager_tools(&mut v);
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
     // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
@@ -386,13 +430,14 @@ pub(super) fn rewrite_body_out(
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     // message thread 排在所有改写之后：判「能不能接上上一轮」比的是**最终出站**的历史
     // （工具名已混淆、断点已落位），切增量也得切这一份。见 [`apply_sim_thread`]。
-    let threaded =
-        flags.sim_message_threads && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id));
+    let threaded = flags.sim_message_threads
+        && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps));
     tracing::debug!(
         empty_system_dropped,
         system_hoisted,
         simulated,
         sys_relocated,
+        env_noted,
         sim_meta,
         shaped,
         capped,
@@ -434,6 +479,7 @@ pub(super) fn rewrite_body_out(
         && !link_added
         && !simulated
         && !sys_relocated
+        && !env_noted
         && !sim_meta
         && !thinking_filled
         && !display_filled

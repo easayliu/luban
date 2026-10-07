@@ -60,11 +60,21 @@ pub(in crate::proxy) fn strip_extra_fields(v: &mut serde_json::Value, keep_displ
         obj.remove("thinking");
         changed = true;
     }
-    // tool_choice 强制工具调用时 thinking 必须关——上游硬限制 400。客户端同时发了两者时
-    // 删 thinking 保 tool_choice：强制工具是客户端明确要的语义，thinking 可缺省。
-    let forces_tool = obj.get("tool_choice").and_then(|tc| tc.get("type")).and_then(|t| t.as_str())
-        == Some("tool");
-    if forces_tool && obj.contains_key("thinking") {
+    // tool_choice 强制工具调用（`tool` / `any`）时上游不收**手动预算**那种 thinking：2026-10-07
+    // 实测 haiku-4-5 `enabled` + `any` 回 400 `Thinking may not be enabled when tool_choice forces
+    // tool use.`。客户端同时发了两者时删 thinking 保 tool_choice：强制工具是客户端明确要的
+    // 语义，thinking 可缺省。
+    //
+    // `adaptive` 不删：官方文档写明 Claude API 上强制工具不要求关思考（只有 Bedrock 要求配
+    // `disabled`），Opus 4.7 / 4.8 / Opus 5 / Sonnet 5 上它是合法组合，删了等于替客户端关了思考。
+    // Opus 5.5 / Sonnet 5.5 / Fable 5.1 本来就不收强制工具，删不删 thinking 都是 400。
+    let forces_tool = matches!(
+        obj.get("tool_choice").and_then(|tc| tc.get("type")).and_then(|t| t.as_str()),
+        Some("tool" | "any")
+    );
+    let manual_thinking =
+        obj.get("thinking").and_then(|t| t.get("type")).and_then(|t| t.as_str()) == Some("enabled");
+    if forces_tool && manual_thinking {
         obj.remove("thinking");
         changed = true;
     }
@@ -314,6 +324,48 @@ pub(in crate::proxy) fn is_system_directive(msg: &serde_json::Value) -> bool {
         && msg.get("output_config").is_some()
 }
 
+/// 只管一轮的 system（`clear_at: "next_user_message"`，beta `mid-conversation-system-clear-at`）：
+/// 下一条 user 一出现它就不再渲染，但仍留在历史里。官方文档的限制：只能是文本、**不能带
+/// `cache_control`**（断点放在它前一条上）。官方抓包里它恒为一段字符串，断点与 `<total_tokens>`
+/// 都落在它前一条上（`cap/auto-2.1.291-20261006-full/00465`、`00471`）。
+///
+/// 往它里面并东西，并进去的也只活一轮；把它提升到顶层 system，它就成了永久指令。
+pub(in crate::proxy) fn is_turn_scoped_system(msg: &serde_json::Value) -> bool {
+    msg.get("role").and_then(|r| r.as_str()) == Some("system")
+        && msg.get("clear_at").and_then(|c| c.as_str()) == Some("next_user_message")
+}
+
+/// 提升（[`hoist_system_role_messages`]）整条不动的 system：指令、带非文本块的、对话中途
+/// （`mid`：首条 user/assistant 之后）只管一轮的。
+fn hoisting_skips(msg: &serde_json::Value, mid: bool) -> bool {
+    is_system_directive(msg) || has_non_text_blocks(msg) || (mid && is_turn_scoped_system(msg))
+}
+
+/// 提升之后 `messages` 里还留不留 `role:"system"`：整条不动的（[`hoisting_skips`]），或带
+/// `output_config`、拆出一条指令留在原位的。形态记忆的豁免（`known_shape_rejection`）与提升本身
+/// 共用这一条，位置条件也一样——开头那条只管一轮的会被提升走，中途的不会。
+///
+/// 判的是入站原件，所以先排除出站前就会被丢掉的空壳（[`is_empty_system_shell`]，
+/// [`drop_empty_system_messages`] 在提升之前跑）；位置也按丢掉空壳之后的算。
+pub(in crate::proxy) fn system_survives_hoisting(msgs: &[serde_json::Value]) -> bool {
+    let kept: Vec<&serde_json::Value> = msgs.iter().filter(|m| !is_empty_system_shell(m)).collect();
+    let first_turn = kept
+        .iter()
+        .position(|m| matches!(m.get("role").and_then(|r| r.as_str()), Some("user" | "assistant")))
+        .unwrap_or(kept.len());
+    kept.iter().enumerate().any(|(i, m)| {
+        m.get("role").and_then(|r| r.as_str()) == Some("system")
+            && (hoisting_skips(m, i >= first_turn) || m.get("output_config").is_some())
+    })
+}
+
+/// `content` 里有不是 `text` 的块：`tool_addition` / `tool_removal` 之类只能待在消息里的东西。
+pub(in crate::proxy) fn has_non_text_blocks(msg: &serde_json::Value) -> bool {
+    msg.get("content").and_then(|c| c.as_array()).is_some_and(|blocks| {
+        blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) != Some("text"))
+    })
+}
+
 /// 对话中途 `role:"system"` 摆错位置时上游那句 400 的原话，`{}` 处是消息下标。
 ///
 /// 2026-10-02 线上实测（`claude-opus-5-5`）：
@@ -404,10 +456,29 @@ pub(in crate::proxy) fn hoists_system_role(flags: &store::ForwardFlags, cc_shape
 /// 老模型上就是一条修得好却没修的 400，还会被 [`remember_shape_rejection`] 学成规则，
 /// 之后同模型带 system 的请求全在本地拒掉。
 ///
+/// **指令式写法不提升**（[`is_system_directive`]）：它的 `content` 是空数组，全部意义在消息级
+/// 的 `output_config` 上，提升只搬 content，等于把整条连同客户端中途调的 effort 一起删了。
+/// 上游对它「放在任何位置都收」（[`misplaced_system_message`] 那句原话），留在原位即可。
+///
+/// **带正文又带 `output_config` 的拆成两半**：正文照常提升，原位留一条只有 `output_config` 的
+/// 指令（`content: []`）。整条提升会把 effort 一起丢掉；整条留在原位，开头的那种上游必拒。
+/// 两半的形态都实测过（2026-10-07，claude-sonnet-5-5）：开头的指令 200，提升出去的正文 200。
+/// 别的消息级字段（`clear_at` 之类）不跟着留：只剩它们的空壳上游恒 400，带着它们的指令没实测过。
+///
+/// **只管一轮的也不提升**（[`is_turn_scoped_system`]）：提升上去就成了永久指令。首条
+/// user/assistant 之前的那种除外——那个位置上游本来就不收，只能照旧提升。
+///
+/// **带非文本块的整条不提升**（[`has_non_text_blocks`]）：顶层 `system` 只收文本块，
+/// `tool_addition` / `tool_removal`（工具中途上下线）这类只能待在消息的 `content` 里，搬上去
+/// 就是一条必拒的请求。文本与它们混在一条里的也整条留着，拆开会改变它们的相对位置。
+///
+/// 这一步只在严格检查（`reject_openai_shape`）**关着**时才跑（[`hoists_system_role`]）。严格
+/// 检查默认开着，那时开头的 system 在入口就被拒，中途的原样转发，字段本来就不会丢。
+///
 /// 处理逻辑：
-/// 1. 从 `messages` 里找出所有 `role:"system"` 的消息，按原序收集其 content。
+/// 1. 从 `messages` 里找出所有 `role:"system"` 的消息（上面那几种例外除外），按原序收集其 content。
 /// 2. 将收集到的 content 块**前置**到顶层 `system`（已有则合并，没有则新建）。
-/// 3. 从 `messages` 里移除这些消息。
+/// 3. 从 `messages` 里移除这些消息；带 `output_config` 的换成原位的那条指令。
 ///
 /// content 的形态：OpenAI 格式通常是纯字符串（`"content":"You are a helpful assistant"`），
 /// 也可能是 Anthropic 格式的内容块数组。两种都处理。
@@ -417,11 +488,22 @@ pub(in crate::proxy) fn hoist_system_role_messages(v: &mut serde_json::Value) ->
     };
     let mut hoisted_blocks: Vec<serde_json::Value> = Vec::new();
     let mut indices_to_remove: Vec<usize> = Vec::new();
+    // 拆出来留在原位的指令：（下标，那条指令）。
+    let mut directives: Vec<(usize, serde_json::Value)> = Vec::new();
+    let first_turn = first_turn_index(msgs);
     for (i, msg) in msgs.iter().enumerate() {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("system")
+            || hoisting_skips(msg, i >= first_turn)
+        {
             continue;
         }
-        indices_to_remove.push(i);
+        match msg.get("output_config") {
+            Some(oc) => directives.push((
+                i,
+                serde_json::json!({ "role": "system", "output_config": oc, "content": [] }),
+            )),
+            None => indices_to_remove.push(i),
+        }
         match msg.get("content") {
             Some(serde_json::Value::String(s)) => {
                 if !s.is_empty() {
@@ -434,11 +516,14 @@ pub(in crate::proxy) fn hoist_system_role_messages(v: &mut serde_json::Value) ->
             _ => {}
         }
     }
-    if indices_to_remove.is_empty() {
+    if indices_to_remove.is_empty() && directives.is_empty() {
         return false;
     }
-    // 从 messages 里移除（倒序，避免索引偏移）。
+    // 先原位换成指令（下标不变），再移除其余的（倒序，避免索引偏移）。
     let msgs = v.get_mut("messages").and_then(|m| m.as_array_mut()).unwrap();
+    for (i, directive) in &directives {
+        msgs[*i] = directive.clone();
+    }
     for &i in indices_to_remove.iter().rev() {
         msgs.remove(i);
     }
@@ -462,6 +547,7 @@ pub(in crate::proxy) fn hoist_system_role_messages(v: &mut serde_json::Value) ->
     }
     tracing::info!(
         removed = indices_to_remove.len(),
+        split = directives.len(),
         "hoisted role:system messages to top-level system field"
     );
     true

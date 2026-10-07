@@ -189,7 +189,7 @@ fn run_eager(
         None,
         true,
         adv_beta,
-        version,
+        version.map(|version| crate::proxy::CcClient { version, entrypoint: "cli" }),
         None,
         kind,
         None,
@@ -985,21 +985,20 @@ fn restores_tool_names_across_chunk_boundaries() {
     ]});
     let map = build_tool_name_map(Some(&body)).unwrap();
     let fake = map.forward["skill_manage"].clone();
-    let wire = format!(r#"data: {{"type":"tool_use","name":"{fake}"}}"#) + "\n\n";
+    let wire = format!(
+        r#"data: {{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"t","name":"{fake}","input":{{}}}}}}"#
+    ) + "\n\n";
 
     // 一次性还原。
-    assert_eq!(
-        String::from_utf8(map.restore(wire.as_bytes())).unwrap(),
-        wire.replace(&fake, "skill_manage")
-    );
+    assert_eq!(sse_restore(&map, wire.as_bytes(), wire.len()), wire.replace(&fake, "skill_manage"));
 
-    // 逐字节喂（最坏的分块），滑动窗口必须拼回同样的结果，且尾巴要 flush 出来。
+    // 逐字节喂（最坏的分块），必须拼回同样的结果，且尾巴要 flush 出来。
     let mut pending = Vec::new();
     let mut out = Vec::new();
     for b in wire.as_bytes() {
-        out.extend_from_slice(&map.feed(&mut pending, &[*b]));
+        out.extend_from_slice(&map.feed(&mut pending, &[*b], true));
     }
-    out.extend_from_slice(&map.flush(&mut pending));
+    out.extend_from_slice(&map.flush(&mut pending, true));
     assert_eq!(
         String::from_utf8(out).unwrap(),
         wire.replace(&fake, "skill_manage"),
@@ -1018,7 +1017,6 @@ fn restore_replaces_longer_aliases_first() {
             (long.clone(), "REAL_LONG".to_string()),
             (short.clone(), "REAL_SHORT".to_string()),
         ],
-        max_fake: long.len(),
     };
     let wire = format!("x {long} y {short} z");
     assert_eq!(
@@ -1053,7 +1051,6 @@ fn every_generated_alias_lives_under_the_shared_namespace() {
     for (fake, _) in &map.reverse {
         assert!(fake.starts_with(FAKE_TOOL_NS), "假名 {fake} 不在共用命名空间下");
     }
-    assert_eq!(map.max_fake, map.reverse.iter().map(|(f, _)| f.len()).max().unwrap());
     // 倒序也是还原的前提（同一位置先命中的就得是最长的那个）。
     assert!(
         map.reverse.windows(2).all(|w| w[0].0.len() >= w[1].0.len()),
@@ -3748,6 +3745,23 @@ fn reads_the_cc_version_from_the_user_agent() {
     assert_eq!(v("claude-cli/next (external, cli)"), None, "版本位不是数字");
 }
 
+/// UA 里的 entrypoint：括号里第二段，与官方 billing header 的 `cc_entrypoint` 同源。
+#[test]
+fn reads_the_cc_entrypoint_from_the_user_agent() {
+    let e = crate::proxy::cc_ua_entrypoint;
+    assert_eq!(e(config::CC_USER_AGENT), Some("cli"));
+    assert_eq!(e("claude-cli/2.1.291 (external, sdk-cli)"), Some("sdk-cli"));
+    assert_eq!(
+        e("claude-cli/2.1.273 (external, claude-vscode, agent-sdk/0.3.273)"),
+        Some("claude-vscode"),
+        "第三段起不算"
+    );
+    assert_eq!(e("claude-cli/2.1.251"), None, "没有括号");
+    assert_eq!(e("claude-cli/2.1.251 (external)"), None, "只有一段");
+    assert_eq!(e("claude-cli/2.1.251 (external, Bad;Value)"), None, "不规矩的段不收");
+    assert_eq!(e("python-httpx/0.27.0 (external, cli)"), None, "非 CC 客户端");
+}
+
 /// 自报版本高于官方最新发布版的 UA 不算官方客户端；等于或更低的照认。
 #[test]
 fn a_cc_version_newer_than_the_latest_release_is_not_trusted() {
@@ -4115,7 +4129,8 @@ fn sim_threads_cap_leaves_business_cache_control_fields_alone() {
     assert_eq!(v["thread"], serde_json::json!({ "type": "create" }), "{v}");
     let tool = v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "set_cache");
     assert_eq!(tool.unwrap()["input_schema"], schema, "schema 原样: {v}");
-    assert_eq!(v["messages"][1]["content"][0]["input"]["cache_control"], "no-store", "{v}");
+    // `messages[1]` 是首轮补的环境说明，assistant 那条在它之后。
+    assert_eq!(v["messages"][2]["content"][0]["input"]["cache_control"], "no-store", "{v}");
     let sys = v["system"].as_array().unwrap();
     assert!(sys.iter().filter(|b| b.get("cache_control").is_some()).count() == 2, "{v}");
     // 末条（`<total_tokens>` 提醒）照常带断点：业务字段不占预算，消息断点不该被跳过。
@@ -4216,15 +4231,21 @@ fn sim_threads_create_then_continue_with_only_new_messages() {
         thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
     assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{v1}");
     assert!(v1["tools"].as_array().is_some_and(|t| !t.is_empty()));
-    let tail = v1["messages"].as_array().unwrap().last().unwrap();
+    let msgs1 = v1["messages"].as_array().unwrap();
+    assert_eq!(msgs1.len(), 2, "首轮只有用户那句与环境说明，不另追加提醒: {v1}");
+    let tail = msgs1.last().unwrap();
+    assert_eq!(tail["role"], "system");
+    let block = &tail["content"][0];
+    let text = block["text"].as_str().unwrap();
+    assert!(text.starts_with("# Environment\n"), "{text}");
+    assert!(
+        text.contains("<total_tokens>15000000 tokens left</total_tokens>\n\nToday's date is "),
+        "首轮的 1500 万整提醒并在环境说明里（00340）: {text}"
+    );
     assert_eq!(
-        tail,
-        &serde_json::json!({ "role": "system", "content": [{
-                "type": "text",
-                "text": "<total_tokens>15000000 tokens left</total_tokens>",
-                "cache_control": { "type": "ephemeral", "ttl": "1h" },
-            }] }),
-        "新输入之后一条 1500 万整的提醒，断点挪到它身上（00033）"
+        block["cache_control"],
+        serde_json::json!({ "type": "ephemeral", "ttl": "1h" }),
+        "断点落在环境说明上"
     );
     let user_tail = &v1["messages"][0]["content"];
     assert!(
@@ -4358,12 +4379,19 @@ fn sim_total_tokens_reminder_is_a_system_reminder_on_haiku() {
     );
     let blocks = v1["messages"][0]["content"].as_array().unwrap();
     assert_eq!(v1["messages"].as_array().unwrap().len(), 1, "不追加 system 消息: {v1}");
+    // 首轮：环境说明各段、`<total_tokens>`、日期，都是提醒块，排在用户那句前面（00303）；
+    // 提醒只有环境说明里那一份。
+    assert_eq!(blocks.len(), 7, "{v1}");
+    assert!(blocks[0]["text"].as_str().unwrap().starts_with("<system-reminder>\n# Environment\n"));
     assert_eq!(
-        blocks[0]["text"],
-        "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>\n"
+        blocks[4]["text"],
+        "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>"
     );
-    assert_eq!(blocks[1]["text"], "线程测试·haiku 第一问");
-    assert!(blocks[1].get("cache_control").is_some(), "断点仍在用户那句上");
+    let tokens = blocks.iter().filter(|b| b["text"].as_str().unwrap().contains("<total_tokens>"));
+    assert_eq!(tokens.count(), 1, "{v1}");
+    assert!(blocks[5]["text"].as_str().unwrap().starts_with("<system-reminder>\nToday's date is "));
+    assert_eq!(blocks[6]["text"], "线程测试·haiku 第一问");
+    assert!(blocks[6].get("cache_control").is_some(), "断点仍在用户那句上");
     CcSessionLink::record_thread(
         &p1.unwrap(),
         "msg_H",
@@ -4458,9 +4486,11 @@ fn sim_threads_follow_the_version_for_fable_5_1_and_respect_the_switch() {
     let msgs = serde_json::json!([{ "role": "user", "content": "线程测试·豁免" }]);
     let (v, p) = thread_turn(&thread_body("claude-fable-5-1", msgs.clone()), all_on());
     assert_eq!(v["thread"]["type"], "create", "2.1.291 的 fable-5-1 发: {v}");
-    assert_eq!(
-        v["messages"][1]["content"][0]["text"], "<total_tokens>15000000 tokens left</total_tokens>",
-        "提醒照带"
+    let note = v["messages"][1]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        note.starts_with("# Environment\n")
+            && note.contains("<total_tokens>15000000 tokens left</total_tokens>"),
+        "首轮提醒并在环境说明里照带: {note}"
     );
     assert!(p.is_some_and(|p| !p.is_continue()), "按 create 提交");
     let (v, _) = thread_turn(&thread_body("claude-fable-5", msgs.clone()), all_on());
@@ -4781,4 +4811,1307 @@ fn regex_cch() -> impl Fn(&[u8]) -> Option<(usize, Vec<u8>)> {
         }
         None
     }
+}
+
+/// 首轮环境说明的模型行：名字与知识截止按规范名查表，带日期的 id 照认；1M 会话名字加
+/// `(1M context)`、id 加 `[1m]`（`cap/auto-2.1.291-20261006-full/00216`）；表外的只写 id；
+/// 模型名里有空白之类的不补。
+#[test]
+fn env_note_model_line_follows_the_captured_table() {
+    let line = super::env_model_line;
+    assert_eq!(
+        line("claude-opus-5-5", false).unwrap(),
+        "You are powered by the model named Opus 5.5. The exact model ID is claude-opus-5-5. \
+         Assistant knowledge cutoff is June 2026."
+    );
+    let one_m = "You are powered by the model named Opus 5.5 (1M context). The exact model ID is \
+                 claude-opus-5-5[1m]. Assistant knowledge cutoff is June 2026.";
+    assert_eq!(line("claude-opus-5-5", true).unwrap(), one_m, "头上带 context-1m");
+    assert_eq!(line("claude-opus-5-5[1m]", false).unwrap(), one_m, "模型名自带 [1m]");
+    assert_eq!(
+        line("claude-haiku-4-5-20251001", false).unwrap(),
+        "You are powered by the model named Haiku 4.5. The exact model ID is \
+         claude-haiku-4-5-20251001. Assistant knowledge cutoff is February 2025."
+    );
+    assert!(line("claude-opus-5", false).unwrap().contains("named Opus 5. "), "不被 opus-5-5 截胡");
+    assert!(line("claude-sonnet-5", false).unwrap().ends_with("cutoff is January 2026."));
+    assert_eq!(
+        line("claude-next-9", false).unwrap(),
+        "You are powered by the model claude-next-9."
+    );
+    assert_eq!(line("claude opus\n", false), None);
+    assert_eq!(line("", false), None);
+}
+
+/// opus 那族：首条用户消息之后一条 `role: system`，各段次序同 `00340`；精简工具时没有
+/// scratchpad 一行与 artifact 三个技能（`cap/auto-2.1.291-20261006/00066`）；同一条再补一遍不重复。
+#[test]
+fn env_note_is_a_system_message_after_the_first_prompt() {
+    let body = r#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·opus"}]}"#;
+    let mut sim = crate::proxy::test_support::sim_for(body);
+    sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
+    // 精简与否随首轮钉住，两种各用一张凭证，算两段对话。
+    for (trim, cred) in [(false, 4242), (true, 4245)] {
+        sim.trim_tools = trim;
+        let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(super::insert_env_note(&mut v, &sim, cred).inserted);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "system");
+        let text = msgs[1]["content"][0]["text"].as_str().unwrap();
+        let order = [
+            "# Environment\nYou have been invoked in the following environment: \n - Primary \
+             working directory: /Users/sam/src/api\n - Is a git repository: true\n - Platform: \
+             darwin\n - Shell: zsh\n - OS Version: Darwin 27.0.0\n",
+            "\n\nYou are powered by the model named Opus 5.5.",
+            "\n\nAvailable agent types for the Agent tool:\n",
+            "\n\nWhen you launch multiple agents",
+            "\n\nThe following skills are available for use with the Skill tool:\n\n- dataviz:",
+            "\n- security-review: Complete a security review of the pending changes on the current \
+             branch\n\n<total_tokens>15000000 tokens left</total_tokens>\n\nToday's date is ",
+        ];
+        let mut at = 0;
+        for part in order {
+            let found = text[at..].find(part).unwrap_or_else(|| panic!("缺「{part}」: {text}"));
+            at += found + part.len();
+        }
+        let scratch = format!(
+            "Scratchpad directory: /private/tmp/claude-501/-Users-sam-src-api/{}/scratchpad",
+            sim.session_id
+        );
+        assert_eq!(text.contains(&scratch), !trim, "trim={trim}: {text}");
+        assert_eq!(text.contains("- artifact-design:"), !trim, "trim={trim}");
+        assert!(text.contains("- update-config:") && !text.contains("commit-commands:"));
+        assert!(!text.contains("ToolSearch") && !text.contains("# MCP Server"), "{text}");
+        let again = v.clone();
+        assert!(!super::insert_env_note(&mut v, &sim, cred).inserted, "已有一份就不再补");
+        assert_eq!(v, again);
+    }
+}
+
+/// haiku 那族：每段一个提醒块排在最前，客户端 system 挪进来的那块在它们之后、日期之前，日期
+/// 紧贴用户正文（`cap/auto-2.1.291-20261006-full/00553`）；Explore 用 haiku 那版描述。
+#[test]
+fn env_note_on_haiku_is_reminders_before_the_prompt() {
+    let body = r#"{"model":"claude-haiku-4-5-20251001","max_tokens":16,"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nCodebase and user instructions are shown below.\n</system-reminder>"},{"type":"text","text":"环境说明·haiku"}]}]}"#;
+    let mut sim = crate::proxy::test_support::sim_for(body);
+    sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
+    let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(super::insert_env_note(&mut v, &sim, 4243).inserted);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 1, "不追加 system 消息");
+    let texts: Vec<&str> = v["messages"][0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["text"].as_str().unwrap())
+        .collect();
+    let heads = [
+        "<system-reminder>\n# Environment\n",
+        "<system-reminder>\nYou are powered by the model named Haiku 4.5.",
+        "<system-reminder>\nAvailable agent types for the Agent tool:\n",
+        "<system-reminder>\nThe following skills are available",
+        "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>",
+        "<system-reminder>\nCodebase and user instructions",
+        "<system-reminder>\nToday's date is ",
+        "环境说明·haiku",
+    ];
+    assert_eq!(texts.len(), heads.len(), "{texts:?}");
+    for (t, h) in texts.iter().zip(heads) {
+        assert!(t.starts_with(h), "「{h}」: {t}");
+    }
+    assert!(texts[2].contains("Explore: Fast read-only search agent"), "haiku 的 Explore 描述");
+    assert!(texts[6].ends_with(".\n</system-reminder>\n"), "日期块末尾多一个换行: {:?}", texts[6]);
+}
+
+/// 同一段对话每轮补的是同一份：后续轮次它作为历史留在首条之后，与首轮逐字节相同，缓存与
+/// message thread 的前缀才对得上。
+#[test]
+fn env_note_is_identical_on_every_turn() {
+    let first = r#"{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·逐轮"}]}"#;
+    let later = r#"{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·逐轮"},{"role":"assistant","content":"好"},{"role":"user","content":"再来"}]}"#;
+    let mut sim = crate::proxy::test_support::sim_for(first);
+    sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
+    let note = |body: &str| {
+        let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(super::insert_env_note(&mut v, &sim, 4244).inserted);
+        v["messages"][1].clone()
+    };
+    let a = note(first);
+    let b = note(later);
+    assert_eq!(a, b);
+}
+
+/// 来访只给了记忆目录时，工作目录从项目段倒推，换算回去仍是同一个项目段；倒推不出家目录之下的
+/// 路径就退回 `<home>/<最后一截>`。
+#[test]
+fn env_cwd_from_memory_dir_round_trips_to_the_same_slug() {
+    use crate::proxy::SimEnv;
+    let e = SimEnv::from_memory_dir("/Users/sam", "-Users-sam-src-my-api");
+    assert_eq!(e.cwd, "/Users/sam/src/my/api");
+    assert_eq!(SimEnv::from_cwd("/Users/sam", &e.cwd).slug, e.slug);
+    assert_eq!(SimEnv::from_memory_dir("/Users/sam", "-private-tmp-x").cwd, "/Users/sam/x");
+    assert_eq!(
+        SimEnv::from_memory_dir("/Users/sam", "-Users-sam--hidden").cwd,
+        "/Users/sam/hidden"
+    );
+}
+
+/// 环境说明在 `messages` 里，不跟 system 第四块的开关：`simulate_full_system` 关掉时第四块没了，
+/// 环境说明照补。不注官方工具的请求（一个工具都没声明、`fill_absent_tools` 关着）整段不补——
+/// 它列的 Agent 类型与技能离不开那两个工具。
+#[test]
+fn env_note_follows_tool_injection_not_the_full_system_switch() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let run = |body: &str, flags: store::ForwardFlags| {
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let has_note = |v: &serde_json::Value| {
+        v["messages"][1]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("# Environment\n"))
+    };
+    let body = r#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·开关"}]}"#;
+    let no_rest = store::ForwardFlags { simulate_full_system: false, ..all_on() };
+    let v = run(body, no_rest);
+    assert!(has_note(&v), "第四块关着也补: {v}");
+    assert_eq!(v["system"].as_array().unwrap().len(), 3, "第四块确实没补: {v}");
+
+    let no_fill = store::ForwardFlags { fill_absent_tools: false, ..all_on() };
+    let v = run(body, no_fill);
+    assert!(v.get("tools").is_none() && !has_note(&v), "不注工具就不补: {v}");
+    let with_tools = r#"{"model":"claude-opus-5-5","max_tokens":16,"tools":[{"name":"t","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"环境说明·开关"}]}"#;
+    assert!(has_note(&run(with_tools, no_fill)), "自己带了工具照补");
+}
+
+/// 中途切模型：首轮那份环境说明原样留在历史里（模型行仍写首轮的模型），切换那一轮另起一条
+/// 模型说明，与这一轮的 `<total_tokens>` 并在一条 system 消息里（`cap/auto-2.1.285-20260930/00243`）。
+/// 历史不变，倒数也接着上一轮算，不重置。
+#[test]
+fn env_note_survives_a_model_switch() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "环境说明·切模型 第一问" });
+    let (v1, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    let note1 = v1["messages"][1].clone();
+    assert!(note1["content"][0]["text"].as_str().unwrap().contains("named Opus 5.5."));
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_S1",
+        vec!["toolu_s".into()],
+        reply_of(serde_json::json!([bash_use("toolu_s", "ls")])),
+        40232,
+    );
+    let msgs = serde_json::json!([
+        user1,
+        { "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_s", "name": "Bash", "input": { "command": "ls" } },
+        ] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_s", "content": "a.txt" },
+        ] },
+    ]);
+    let (v2, _) = thread_turn(&thread_body("claude-sonnet-5-5", msgs), all_on());
+    assert_eq!(v2["thread"]["type"], "create", "换了模型重新 create: {v2}");
+    let out = v2["messages"].as_array().unwrap();
+    let mut note2 = out[1].clone();
+    note2["content"][0].as_object_mut().unwrap().shift_remove("cache_control");
+    let mut want = note1.clone();
+    want["content"][0].as_object_mut().unwrap().shift_remove("cache_control");
+    assert_eq!(note2, want, "首轮那份逐字节不变");
+    let tail = out.last().unwrap();
+    assert_eq!(tail["role"], "system");
+    assert_eq!(
+        tail["content"][0]["text"],
+        "You are powered by the model named Sonnet 5.5. The exact model ID is claude-sonnet-5-5. \
+         Assistant knowledge cutoff is June 2026.\n\n<total_tokens>14959768 tokens left</total_tokens>",
+        "模型说明与倒数并在一条里，倒数接着上一轮: {v2}"
+    );
+}
+
+/// 不开 message thread 时没有 `<total_tokens>` 那条，模型说明在换模型那一轮单独补一条 system
+/// 消息；再往后几轮完整历史整发一遍，上游线程里没留着那条，得在历史里原位重现——跳过的话，
+/// 后面每一轮都只剩首轮那份、变成「切完模型又切回首轮那个模型」。
+#[test]
+fn model_notice_without_threads_is_its_own_message_on_the_switch_turn() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let run = |model: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let text = |m: &serde_json::Value| m["content"][0]["text"].as_str().unwrap().to_string();
+    let u1 = serde_json::json!({ "role": "user", "content": "模型说明·无线程 第一问" });
+    let v1 = run("claude-opus-5-5", serde_json::json!([u1]));
+    assert!(text(&v1["messages"][1]).contains("named Opus 5.5."));
+
+    let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+    let u2 = serde_json::json!({ "role": "user", "content": "第二问" });
+    let v2 = run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2]));
+    let out = v2["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 5, "{v2}");
+    assert!(text(&out[1]).contains("named Opus 5.5."), "首轮那份不改");
+    assert_eq!(out[4]["role"], "system");
+    assert_eq!(
+        text(&out[4]),
+        "You are powered by the model named Sonnet 5.5. The exact model ID is claude-sonnet-5-5. \
+         Assistant knowledge cutoff is June 2026."
+    );
+
+    // 第三轮：完整历史重发，切换说明必须补回原位——u2 之后、a2 之前。首轮那份仍写 Opus。
+    let a2 = serde_json::json!({ "role": "assistant", "content": "好的" });
+    let u3 = serde_json::json!({ "role": "user", "content": "第三问" });
+    let v3 = run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2, a2, u3]));
+    let out = v3["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 7, "历史切换说明回到原位: {v3}");
+    assert!(text(&out[1]).contains("named Opus 5.5."), "首轮那份不改");
+    assert_eq!(out[2]["role"], "assistant", "a1 位置不动");
+    assert_eq!(out[3]["role"], "user", "u2 位置不动");
+    assert_eq!(out[4]["role"], "system", "u2 后面原位插切换说明");
+    assert!(text(&out[4]).contains("named Sonnet 5.5."), "历史切换说明仍写 Sonnet");
+    assert_eq!(out[5]["role"], "assistant", "切换说明之后是 a2");
+    assert_eq!(out[6]["role"], "user", "末条是 u3");
+}
+
+/// haiku 那种不带 `mid-conversation-system` 的：模型说明裹成提醒块，新输入放在那条消息最前面
+/// （`cap/auto-2.1.285-20260930/00411`），工具结果放在末尾（`tool_result` 得排最前）。
+#[test]
+fn model_notice_without_system_messages_is_a_reminder() {
+    let mut v = serde_json::json!({ "messages": [{ "role": "user", "content": "问" }] });
+    assert!(super::place_model_notice(&mut v, "M", false, true));
+    assert_eq!(
+        v["messages"][0]["content"],
+        serde_json::json!([
+            { "type": "text", "text": "<system-reminder>\nM\n</system-reminder>" },
+            { "type": "text", "text": "问" },
+        ])
+    );
+    let mut v = serde_json::json!({ "messages": [{ "role": "user", "content": [
+        { "type": "tool_result", "tool_use_id": "t", "content": "ok" },
+    ] }] });
+    assert!(super::place_model_notice(&mut v, "M", false, false));
+    assert_eq!(v["messages"][0]["content"][0]["type"], "tool_result");
+    assert_eq!(v["messages"][0]["content"][1]["text"], "<system-reminder>\nM\n</system-reminder>");
+    let mut v = serde_json::json!({ "messages": [{ "role": "assistant", "content": "答" }] });
+    assert!(!super::place_model_notice(&mut v, "M", true, true), "末条不是 user 不补");
+}
+
+/// 跨模型族切模型：形态按**本轮**模型自带的 beta 走——首轮 Opus（带 `mid-conversation-system`）
+/// 落 `role: system`，切到 Haiku（不带）跟着切成用户正文里的提醒块；首轮那份照 role:system
+/// 原样发给 Haiku 会被上游 400 拒。两种形态之间 `<total_tokens>` 倒数不该重置：线程指纹按
+/// 客户端真正发出的 `messages`（raw）算，与环境说明的形态无关。
+#[test]
+fn env_note_follows_the_current_models_form_across_family_switches() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "环境说明·跨族切 第一问" });
+    let (v1, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    assert_eq!(v1["messages"][1]["role"], "system", "首轮 Opus 的环境说明是 role:system");
+    assert!(v1["messages"][1]["content"][0]["text"].as_str().unwrap().contains("named Opus 5.5."));
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_hx1",
+        vec!["toolu_hx".into()],
+        reply_of(serde_json::json!([bash_use("toolu_hx", "ls")])),
+        40232,
+    );
+    let msgs = serde_json::json!([
+        user1,
+        { "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_hx", "name": "Bash", "input": { "command": "ls" } },
+        ] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_hx", "content": "a.txt" },
+        ] },
+    ]);
+    // 切到 Haiku：形态跟当前模型，环境说明走提醒块、不发 `role: system` 消息。
+    let (v2, _) = thread_turn(&thread_body("claude-haiku-4-5-20251001", msgs), all_on());
+    let m2 = v2["messages"].as_array().unwrap();
+    for m in m2 {
+        if m["role"] == "system" {
+            let t = m["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(!t.starts_with("# Environment"), "Haiku 不该再出现 role:system 环境说明: {v2}");
+        }
+    }
+    let first_text = m2[0]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        first_text.starts_with("<system-reminder>\n# Environment"),
+        "环境说明塞进首条用户正文、是 Haiku 自己的形态: {first_text}",
+    );
+    // `<total_tokens>` 倒数接着上一轮算（14959768），形态变化不打断线程指纹。Haiku 没有合并
+    // 到独立 system 消息里，倒数塞在末条用户的最后一个 `tool_result` 正文里（规则见
+    // [`insert_total_tokens_reminder`]）；只要整条请求里找得到这个数就行。
+    let dump = serde_json::to_string(&v2).unwrap();
+    assert!(
+        dump.contains("<total_tokens>14959768 tokens left"),
+        "倒数接着上一轮，形态变化不该重置: {v2}",
+    );
+    assert!(dump.contains("named Haiku 4.5"), "末尾合并上切换说明: {v2}");
+}
+
+/// 关着 message thread 的那条路：切模型发生过之后再来一轮，完整历史重发时切换说明必须在
+/// 原位重现——跳过的话，模型只看到首轮那份身份说明，等于告诉 Haiku 「你是 Opus」。
+#[test]
+fn historical_switch_notice_reappears_without_threads() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let run = |model: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let u1 = serde_json::json!({ "role": "user", "content": "历史切换·无线程 1" });
+    let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+    let u2 = serde_json::json!({ "role": "user", "content": "历史切换·无线程 2" });
+    let a2 = serde_json::json!({ "role": "assistant", "content": "好的" });
+    let u3 = serde_json::json!({ "role": "user", "content": "历史切换·无线程 3" });
+    let _ = run("claude-opus-5-5", serde_json::json!([u1.clone()]));
+    let _ = run("claude-sonnet-5-5", serde_json::json!([u1.clone(), a1.clone(), u2.clone()]));
+    let v3 = run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2, a2, u3]));
+    let out = v3["messages"].as_array().unwrap();
+    let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        vec!["user", "system", "assistant", "user", "system", "assistant", "user"],
+        "切换说明回到 u2 之后 a2 之前: {v3}",
+    );
+    assert!(
+        out[1]["content"][0]["text"].as_str().unwrap().contains("named Opus 5.5."),
+        "首轮那份仍写 Opus",
+    );
+    assert!(
+        out[4]["content"][0]["text"].as_str().unwrap().contains("named Sonnet 5.5."),
+        "历史切换说明写 Sonnet",
+    );
+}
+
+/// 新旧模型切换：Opus 5.5（带 `mid-conversation-system`）→ 旧 Opus（不带）后，环境说明得随
+/// 当前模型切成提醒块，不能再往出站 body 里塞 `role: system` 消息——塞了上游会 400 拒。
+#[test]
+fn env_note_drops_role_system_when_switching_to_an_older_model() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let run = |model: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, all_on()).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let u1 = serde_json::json!({ "role": "user", "content": "跨 beta·旧 Opus" });
+    let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+    let u2 = serde_json::json!({ "role": "user", "content": "继续" });
+    let _ = run("claude-opus-5-5", serde_json::json!([u1.clone()]));
+    // 旧 Opus（无 `mid-conversation-system` beta）这一轮：环境说明按本轮形态走，不是 role:system。
+    let v2 = run("claude-opus-4-6", serde_json::json!([u1, a1, u2]));
+    let m2 = v2["messages"].as_array().unwrap();
+    for m in m2 {
+        if m["role"] == "system" {
+            let t = m["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                !t.starts_with("# Environment") && !t.starts_with("You are powered by"),
+                "旧模型这一轮不该出现 role:system 的环境说明 / 模型说明: {v2}",
+            );
+        }
+    }
+    let first_text = m2[0]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        first_text.starts_with("<system-reminder>\n# Environment"),
+        "环境说明塞进首条用户正文: {first_text}",
+    );
+}
+
+/// 连续两条 user 消息（`[user, user]`）：环境说明不能插在它们中间——`role: system` 必须紧挨
+/// assistant 之前或排在数组末尾，夹在两条 user 之间上游会 400。[`system_insert_pos`] 应把它推到
+/// 数组末尾（没有 assistant 时的唯一合法位置）。
+#[test]
+fn env_note_lands_at_the_end_when_the_prompt_is_two_users_in_a_row() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let body = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 16,
+        "messages": [
+            { "role": "user", "content": "连续 user·第一条" },
+            { "role": "user", "content": "连续 user·第二条" },
+        ],
+    });
+    let b = Bytes::from(body.to_string());
+    let sim = detect_for(&b, all_on()).expect("走模拟");
+    let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let m = v["messages"].as_array().unwrap();
+    assert!(m.len() >= 3, "环境说明至少让 messages 长 3 条: {v}");
+    assert_eq!(m[0]["role"], "user");
+    assert_eq!(m[1]["role"], "user", "两条 user 不该被 system 切开: {v}");
+    // 环境说明落在最后一条 user 之后（或再被 `<total_tokens>` 这类后续插入推到更后面都算合法）。
+    let any_env = m.iter().any(|x| {
+        x["role"] == "system"
+            && x["content"][0]["text"].as_str().is_some_and(|t| t.starts_with("# Environment"))
+    });
+    assert!(any_env, "环境说明仍要补、只是落在末尾: {v}");
+    let env_idx = m
+        .iter()
+        .position(|x| {
+            x["role"] == "system"
+                && x["content"][0]["text"].as_str().is_some_and(|t| t.starts_with("# Environment"))
+        })
+        .unwrap();
+    assert!(env_idx >= 2, "环境说明不在两条 user 之间: {v}");
+}
+
+/// 历史被裁短（compact / summarize）后，`pin.switch.turn` 可能大于当前 `msgs.len()`——原位重现
+/// 无从插起，`pin_env` 把它当成「这一轮刚换了模型」处理（补一条当前模型说明到末尾），不该两种
+/// 说明都丢、让 Sonnet 只收到首轮的 Opus 身份说明。
+#[test]
+fn compacted_history_still_carries_the_current_model_notice() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let run = |model: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let u1 = serde_json::json!({ "role": "user", "content": "压缩·第一问" });
+    let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+    let u2 = serde_json::json!({ "role": "user", "content": "压缩·第二问" });
+    let a2 = serde_json::json!({ "role": "assistant", "content": "好的" });
+    let u3 = serde_json::json!({ "role": "user", "content": "压缩·第三问" });
+    let _ = run("claude-opus-5-5", serde_json::json!([u1.clone()]));
+    // 第二轮在 msgs.len()=3 时换到 Sonnet；pin.switch 记成 (3, Sonnet)。
+    let _ = run("claude-sonnet-5-5", serde_json::json!([u1.clone(), a1.clone(), u2.clone()]));
+    let _ = run(
+        "claude-sonnet-5-5",
+        serde_json::json!([u1.clone(), a1.clone(), u2.clone(), a2.clone(), u3.clone()]),
+    );
+    // 第四轮客户端做了压缩，`msgs.len()` 回到 1：切换位置（3）已经超出当前消息数。
+    let compacted = serde_json::json!({ "role": "user", "content": "压缩后汇总的首条" });
+    let v = run("claude-sonnet-5-5", serde_json::json!([compacted]));
+    let dump = serde_json::to_string(&v).unwrap();
+    assert!(
+        dump.contains("named Sonnet 5.5."),
+        "压缩后仍要让当前模型看到自己的 Sonnet 身份说明，而不是只剩首轮的 Opus 身份: {v}",
+    );
+}
+
+/// 历史里同一个签名块出现了两次（客户端把同一段贴了两遍），模拟路径又在前面插了一条环境说明：
+/// 消息下标整体后移，但 assistant 那几轮没动，两块仍要各按位置还原成原始字节，JSON 转义
+/// （反斜杠 u003c）不能被 serde 往返改成字面的 `<`。
+#[test]
+fn duplicate_signed_blocks_keep_their_encoding_after_a_system_message_is_inserted() {
+    // 转义序列在运行时拼出来：源码里直接写，经过某些编辑工具会被提前解码成 `<`。
+    let escaped = format!("a {}u003c b", '\\');
+    let thinking = format!(r#"{{"type":"thinking","thinking":"{escaped}","signature":"SIGDUP"}}"#);
+    let original = format!(
+        r#"{{"messages":[{{"role":"user","content":"q1"}},{{"role":"assistant","content":[{thinking},{{"type":"text","text":"x"}}]}},{{"role":"user","content":"q2"}},{{"role":"assistant","content":[{thinking},{{"type":"text","text":"y"}}]}},{{"role":"user","content":"q3"}}]}}"#
+    );
+    let mut v: serde_json::Value = serde_json::from_str(&original).unwrap();
+    v["messages"].as_array_mut().unwrap().insert(
+        1,
+        serde_json::json!({ "role": "system", "content": [{ "type": "text", "text": "env" }] }),
+    );
+    let out =
+        super::preserve_thinking_encoding(original.as_bytes(), serde_json::to_vec(&v).unwrap());
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(out.matches(escaped.as_str()).count(), 2, "{out}");
+    assert!(!out.contains("a < b"), "{out}");
+}
+
+/// 开着工具名混淆：上一轮回复的指纹记的是上游看到的假名，客户端下一轮带回来的是真名。线程
+/// 指纹得按换过名的算，工具续轮才接得上（`continue`），不然每轮都退回 `create` 重发整段上下文。
+#[test]
+fn sim_threads_continue_through_obfuscated_tool_names() {
+    use crate::proxy::session_link::CcSessionLink;
+    let tools = serde_json::json!([{
+        "name": "lookup",
+        "description": "look something up",
+        "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
+    }]);
+    let map = super::build_tool_name_map(Some(&serde_json::json!({ "tools": tools })))
+        .expect("自定义工具要混淆");
+    let fake = map.forward["lookup"].clone();
+    let turn = |msgs: serde_json::Value| {
+        let body = serde_json::json!({
+            "model": "claude-opus-5-5", "max_tokens": 32000, "tools": tools, "messages": msgs,
+        });
+        let raw = Bytes::from(body.to_string());
+        let sim = sim_for(&body.to_string());
+        let out = super::rewrite_body_out(
+            &raw,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&sim),
+            None,
+            None,
+            false,
+            Some(&map),
+            true,
+            true,
+            None,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0;
+        (serde_json::from_slice::<serde_json::Value>(&out).unwrap(), sim.take_thread())
+    };
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·混淆工具名" });
+    let (v1, p1) = turn(serde_json::json!([user1]));
+    assert_eq!(v1["thread"]["type"], "create", "{v1}");
+    let call = |name: &str| serde_json::json!({ "type": "tool_use", "id": "toolu_lk", "name": name, "input": { "q": "x" } });
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_LK",
+        vec!["toolu_lk".into()],
+        reply_of(serde_json::json!([call(&fake)])),
+        1000,
+    );
+    let (v2, _) = turn(serde_json::json!([
+        user1,
+        { "role": "assistant", "content": [call("lookup")] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_lk", "content": "ok" },
+        ] },
+    ]));
+    assert_eq!(
+        v2["thread"],
+        serde_json::json!({ "type": "continue", "previous_message_id": "msg_LK" }),
+        "{v2}"
+    );
+}
+
+/// Opus 开场后换 Sonnet、这一轮是连着两条 user：环境说明只能落在末尾，换模型说明并进那一条，
+/// 不能因为末条是 system 就丢掉——丢了 Sonnet 只看到首轮的 Opus 身份。线程开与关两条路都要有。
+#[test]
+fn model_notice_merges_into_a_trailing_env_note() {
+    use crate::proxy::test_support::{detect_for, rewrite_body};
+    for threads in [false, true] {
+        let flags = store::ForwardFlags { sim_message_threads: threads, ..all_on() };
+        let run = |model: &str, msgs: serde_json::Value| {
+            let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+            let b = Bytes::from(body.to_string());
+            let sim = detect_for(&b, flags).expect("走模拟");
+            let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+        };
+        let u1 =
+            serde_json::json!({ "role": "user", "content": format!("连发换模型·{threads} 1") });
+        let u2 = serde_json::json!({ "role": "user", "content": "连发换模型 2" });
+        let _ = run("claude-opus-5-5", serde_json::json!([u1]));
+        let v = run("claude-sonnet-5-5", serde_json::json!([u1, u2]));
+        let out = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "user", "system"], "threads={threads}: {v}");
+        let text = out[2]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("# Environment") && text.contains("named Opus 5.5."), "{text}");
+        assert!(
+            text.ends_with(
+                "\n\nYou are powered by the model named Sonnet 5.5. The exact model ID is \
+                 claude-sonnet-5-5. Assistant knowledge cutoff is June 2026."
+            ),
+            "threads={threads}: {text}"
+        );
+    }
+}
+
+/// 换过模型之后客户端删改了历史：按旧消息条数算的下标会指到别的消息上。仍找得到换模型那条
+/// 用户消息就在它后面重现；找不到就当这一轮刚换，补在末尾——两种都不能悄悄丢掉。
+#[test]
+fn historical_switch_survives_edited_history() {
+    use crate::proxy::test_support::{detect_for, rewrite_body};
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let run = |model: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let text = |m: &serde_json::Value| m["content"][0]["text"].as_str().unwrap().to_string();
+    let sonnet = "named Sonnet 5.5.";
+    for (tag, edit) in [("删掉 a1", 0), ("换掉 u2", 1)] {
+        let u1 = serde_json::json!({ "role": "user", "content": format!("删改历史·{tag} 1") });
+        let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+        let u2 = serde_json::json!({ "role": "user", "content": "删改历史 2" });
+        let a2 = serde_json::json!({ "role": "assistant", "content": "好的" });
+        let u3 = serde_json::json!({ "role": "user", "content": "删改历史 3" });
+        let _ = run("claude-opus-5-5", serde_json::json!([u1]));
+        let _ = run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2]));
+        if edit == 0 {
+            // [u1, u2, a2, u3]：旧下标 2 现在是 a2。u2 仍在，说明跟在它后面（并进紧随的环境说明）。
+            let v = run("claude-sonnet-5-5", serde_json::json!([u1, u2, a2, u3]));
+            let out = v["messages"].as_array().unwrap();
+            let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+            assert_eq!(roles, ["user", "user", "system", "assistant", "user"], "{v}");
+            assert!(text(&out[2]).contains("named Opus 5.5.") && text(&out[2]).ends_with(&format!(
+                "{sonnet} The exact model ID is claude-sonnet-5-5. Assistant knowledge cutoff is \
+                 June 2026."
+            )), "{v}");
+        } else {
+            // [u1, a1, ux, ax, u3]：u2 已经不在，补在末尾。
+            let ux = serde_json::json!({ "role": "user", "content": "改过的第二问" });
+            let v = run("claude-sonnet-5-5", serde_json::json!([u1, a1, ux, a2, u3]));
+            let out = v["messages"].as_array().unwrap();
+            let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+            assert_eq!(
+                roles,
+                ["user", "system", "assistant", "user", "assistant", "user", "system"]
+            );
+            assert!(text(&out[6]).contains(sonnet), "{v}");
+            assert!(!text(&out[1]).contains(sonnet) && !text(&out[3]).contains(sonnet));
+        }
+    }
+}
+
+/// 客户端回传的历史里夹着无签名的空 thinking 块：出站会剥掉它（上游必拒），上游那条回复里也
+/// 从来没有它。线程指纹得按剥过的算，正常的工具续轮才接得上。
+#[test]
+fn sim_threads_continue_when_the_client_adds_an_empty_thinking_block() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·空 thinking" });
+    let (_, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_ET",
+        vec!["toolu_et".into()],
+        reply_of(serde_json::json!([bash_use("toolu_et", "ls")])),
+        1000,
+    );
+    let msgs = serde_json::json!([
+        user1,
+        { "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "" },
+            { "type": "text", "text": "" },
+            bash_use("toolu_et", "ls"),
+        ] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_et", "content": "a.txt" },
+        ] },
+    ]);
+    let (v2, _) = thread_turn(&thread_body("claude-opus-5-5", msgs), all_on());
+    assert_eq!(
+        v2["thread"],
+        serde_json::json!({ "type": "continue", "previous_message_id": "msg_ET" }),
+        "{v2}"
+    );
+}
+
+/// 换模型那一轮来访以 `role: system` 收尾：指令式写法（`content: []` 带 `output_config`）原样
+/// 留在最后、模型说明另起一条排在它前面；字符串形态的普通 system 就并进去。两条路都不能丢说明。
+#[test]
+fn model_notice_survives_a_trailing_client_system_message() {
+    use crate::proxy::test_support::{detect_for, rewrite_body};
+    let directive = serde_json::json!({
+        "role": "system", "output_config": { "effort": "low" }, "content": [],
+    });
+    let plain = serde_json::json!({ "role": "system", "content": "客户端收尾的 system" });
+    let notice = "You are powered by the model named Sonnet 5.5. The exact model ID is \
+                  claude-sonnet-5-5. Assistant knowledge cutoff is June 2026.";
+    for threads in [false, true] {
+        for (tag, tail) in [("指令", &directive), ("字符串", &plain)] {
+            let flags = store::ForwardFlags {
+                sim_message_threads: threads,
+                hoist_system_role: false,
+                ..all_on()
+            };
+            let run = |model: &str, msgs: serde_json::Value| {
+                let body =
+                    serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
+                let b = Bytes::from(body.to_string());
+                let sim = detect_for(&b, flags).expect("走模拟");
+                let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+                serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+            };
+            let u1 = serde_json::json!({
+                "role": "user", "content": format!("收尾 system·{tag}·{threads} 1"),
+            });
+            let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+            let u2 = serde_json::json!({ "role": "user", "content": "收尾 system 2" });
+            let _ = run("claude-opus-5-5", serde_json::json!([u1]));
+            let v = run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2, tail]));
+            let out = v["messages"].as_array().unwrap();
+            let last = out.last().unwrap();
+            let ctx = format!("{tag} threads={threads}: {v}");
+            if tag == "指令" {
+                assert_eq!(last["content"], serde_json::json!([]), "指令原样留在最后: {ctx}");
+                assert_eq!(last["output_config"], directive["output_config"], "{ctx}");
+                let text = out[out.len() - 2]["content"][0]["text"].as_str().unwrap();
+                assert!(text.starts_with(notice), "说明另起一条、排在指令前: {ctx}");
+            } else {
+                // 末条断点会把字符串形态改成块数组，两种都认。
+                let text = last["content"]
+                    .as_str()
+                    .or_else(|| last["content"][0]["text"].as_str())
+                    .unwrap();
+                assert!(text.starts_with("客户端收尾的 system\n\n"), "{ctx}");
+                assert!(text.contains(notice), "说明并进去: {ctx}");
+            }
+        }
+    }
+}
+
+/// 提升只搬普通 system：指令式那条（`content: []` 带 `output_config`）的意义全在消息级字段上，
+/// 搬过去只剩一个空数组，等于连同客户端中途调的 effort 一起删了。它留在原位，上游哪儿都收；
+/// 带正文的拆开，正文提升、`output_config` 留成原位的指令。
+#[test]
+fn hoisting_leaves_system_directives_in_place() {
+    let directive = serde_json::json!({
+        "role": "system", "output_config": { "effort": "low" }, "content": [],
+    });
+    let mut v = serde_json::json!({ "messages": [
+        { "role": "system", "content": "be brief" },
+        { "role": "user", "content": "hi" },
+        directive,
+        { "role": "assistant", "content": "ok" },
+        { "role": "user", "content": "go on" },
+    ] });
+    assert!(super::hoist_system_role_messages(&mut v));
+    assert_eq!(v["system"], serde_json::json!([{ "type": "text", "text": "be brief" }]));
+    let msgs = v["messages"].as_array().unwrap();
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "system", "assistant", "user"], "{v}");
+    assert_eq!(msgs[1], directive, "指令原样留着");
+
+    // 带正文又带 `output_config` 的拆成两半：正文提升，原位留一条只有 `output_config` 的指令。
+    // 别的消息级字段不跟着留。
+    let mut split = serde_json::json!({ "messages": [
+        { "role": "system", "output_config": { "effort": "low" }, "clear_at": 3, "content": "be brief" },
+        { "role": "user", "content": "hi" },
+    ] });
+    assert!(super::hoist_system_role_messages(&mut split));
+    assert_eq!(split["system"], serde_json::json!([{ "type": "text", "text": "be brief" }]));
+    assert_eq!(
+        split["messages"][0],
+        serde_json::json!({ "role": "system", "output_config": { "effort": "low" }, "content": [] }),
+        "{split}"
+    );
+    assert_eq!(split["messages"][1]["role"], "user");
+
+    let mut only =
+        serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }, directive] });
+    let before = only.clone();
+    assert!(!super::hoist_system_role_messages(&mut only), "只有指令时什么都不搬");
+    assert_eq!(only, before);
+}
+
+/// 模拟路径上开头夹着一条指令：客户端那段长 system 要挪进首条**用户**消息、环境说明跟在它后面，
+/// 指令本身一个字节都不动。不跳过它的话，正文会塞进指令里，指令就成了一条开头的普通 system。
+/// 严格检查开（默认，不提升）与关（提升）两种都要成立。
+#[test]
+fn simulation_skips_a_leading_system_directive() {
+    use crate::proxy::test_support::{detect_for, rewrite_body};
+    let directive = serde_json::json!({
+        "role": "system", "output_config": { "effort": "low" }, "content": [],
+    });
+    for strict in [true, false] {
+        let flags = store::ForwardFlags { reject_openai_shape: strict, ..all_on() };
+        let body = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 16,
+            "system": [{ "type": "text", "text": "客户端规则。".repeat(400) }],
+            "messages": [directive, { "role": "user", "content": format!("开头指令·{strict}") }],
+        });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let ctx = format!("strict={strict}: {v}");
+        assert_eq!(msgs[0], directive, "指令原样: {ctx}");
+        assert_eq!(msgs[1]["role"], "user", "{ctx}");
+        let first = msgs[1]["content"][0]["text"].as_str().unwrap();
+        assert!(first.contains("客户端规则。"), "长 system 进了首条用户消息: {ctx}");
+        assert!(
+            msgs[2]["content"][0]["text"].as_str().unwrap().starts_with("# Environment"),
+            "环境说明跟在首条用户消息后面: {ctx}"
+        );
+    }
+}
+
+/// 走一遍模拟改写，返回出站体。
+fn sim_run(
+    model: &str,
+    messages: serde_json::Value,
+    flags: store::ForwardFlags,
+) -> serde_json::Value {
+    use crate::proxy::test_support::{detect_for, rewrite_body};
+    let body = serde_json::json!({ "model": model, "max_tokens": 32, "messages": messages });
+    let b = Bytes::from(body.to_string());
+    let sim = detect_for(&b, flags).expect("走模拟");
+    serde_json::from_slice(&rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None)).unwrap()
+}
+
+/// 只管一轮的 system（`clear_at: "next_user_message"`）在修补模式下留在原位：提升上去就成了
+/// 永久指令。开头那种上游本来就不收，照旧提升。
+#[test]
+fn hoisting_keeps_turn_scoped_system_messages_in_place() {
+    let scoped = serde_json::json!({
+        "role": "system", "content": "临时提醒", "clear_at": "next_user_message",
+    });
+    let flags = store::ForwardFlags { reject_openai_shape: false, ..all_on() };
+    let out = sim_run(
+        "claude-sonnet-5-5",
+        serde_json::json!([{ "role": "user", "content": "临时 system·提升" }, scoped]),
+        flags,
+    );
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.last().unwrap(), &scoped, "原样留在最后: {out}");
+    assert!(!out["system"].to_string().contains("临时提醒"), "没进顶层 system");
+
+    let mut leading =
+        serde_json::json!({ "messages": [scoped, { "role": "user", "content": "hi" }] });
+    assert!(super::hoist_system_role_messages(&mut leading));
+    assert_eq!(leading["messages"].as_array().unwrap().len(), 1, "开头那种照旧提升");
+}
+
+/// 换模型说明与 `<total_tokens>` 不并进只管一轮的 system：并进去下一轮就跟着失效，模型只剩
+/// 首轮的 Opus 身份。官方是单独一条排在它前面，断点也在那一条上，`clear_at` 那条仍是末条、
+/// 字符串正文、不带断点（`cap/auto-2.1.291-20261006-full/00465`）。线程开与关都一样。
+#[test]
+fn notices_stay_out_of_turn_scoped_system_messages() {
+    for threads in [false, true] {
+        let flags = store::ForwardFlags { sim_message_threads: threads, ..all_on() };
+        let u1 = serde_json::json!({ "role": "user", "content": format!("临时 system·换模型·{threads}") });
+        let a1 = serde_json::json!({ "role": "assistant", "content": "a1" });
+        let u2 = serde_json::json!({ "role": "user", "content": "u2" });
+        let scoped = serde_json::json!({
+            "role": "system", "content": "临时提醒", "clear_at": "next_user_message",
+        });
+        let _ = sim_run("claude-opus-5-5", serde_json::json!([u1]), flags);
+        let v = sim_run("claude-sonnet-5-5", serde_json::json!([u1, a1, u2, scoped]), flags);
+        let msgs = v["messages"].as_array().unwrap();
+        let ctx = format!("threads={threads}: {v}");
+        assert_eq!(msgs.last().unwrap(), &scoped, "临时那条原样、仍是末条: {ctx}");
+        let before = &msgs[msgs.len() - 2];
+        assert_eq!(before["role"], "system", "{ctx}");
+        assert!(before.get("clear_at").is_none(), "{ctx}");
+        assert!(before.to_string().contains("named Sonnet 5.5"), "说明在它前面那条里: {ctx}");
+        if threads {
+            assert!(before.to_string().contains("<total_tokens>"), "{ctx}");
+            assert!(before["content"][0].get("cache_control").is_some(), "断点在它身上: {ctx}");
+        }
+    }
+}
+
+/// 只管一轮的 system 上游不许带断点：末条消息的断点落在它前一条上。
+#[test]
+fn turn_scoped_system_never_gets_a_cache_breakpoint() {
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let out = sim_run(
+        "claude-sonnet-5-5",
+        serde_json::json!([
+            { "role": "user", "content": "临时 system·断点" },
+            { "role": "assistant", "content": "ready" },
+            { "role": "user", "content": "next" },
+            { "role": "system", "content": "临时提醒", "clear_at": "next_user_message" },
+        ]),
+        flags,
+    );
+    let msgs = out["messages"].as_array().unwrap();
+    let scoped = msgs.last().unwrap();
+    assert_eq!(scoped["clear_at"], "next_user_message");
+    assert_eq!(scoped["content"], "临时提醒", "正文仍是字符串、没挂断点: {out}");
+    let prev = &msgs[msgs.len() - 2];
+    assert!(prev["content"].as_array().unwrap().last().unwrap().get("cache_control").is_some());
+}
+
+/// 工具参数里叫 `cache_control` 的是业务数据：客户端改了历史里那次调用的这个参数，线程得认出
+/// 历史变了、重新 `create`，不能接着 `continue` 把改过的那条切掉。
+#[test]
+fn sim_threads_see_edits_to_a_business_cache_control_argument() {
+    use crate::proxy::session_link::CcSessionLink;
+    let tools = serde_json::json!([{
+        "name": "mcp__audit__set_cache",
+        "description": "set policy",
+        "input_schema": { "type": "object", "properties": { "cache_control": { "type": "string" } } },
+    }]);
+    let run = |messages: serde_json::Value| {
+        let body = serde_json::json!({
+            "model": "claude-opus-5-5", "max_tokens": 32, "tools": tools, "messages": messages,
+        });
+        let raw = body.to_string();
+        let sim = sim_for(&raw);
+        let out = rewrite_body(&Bytes::from(raw), &test_cred(), "fp", all_on(), Some(&sim), None);
+        (serde_json::from_slice::<serde_json::Value>(&out).unwrap(), sim.take_thread())
+    };
+    let call = |value: &str| {
+        serde_json::json!({ "type": "tool_use", "id": "toolu_biz", "name": "mcp__audit__set_cache",
+            "input": { "cache_control": value } })
+    };
+    let u1 = serde_json::json!({ "role": "user", "content": "线程测试·业务 cache_control" });
+    let result = serde_json::json!({ "role": "user", "content": [
+        { "type": "tool_result", "tool_use_id": "toolu_biz", "content": "ok" },
+    ] });
+    let (_, p1) = run(serde_json::json!([u1]));
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_biz1",
+        vec!["toolu_biz".into()],
+        reply_of(serde_json::json!([call("no-store")])),
+        1000,
+    );
+    let (v2, p2) = run(
+        serde_json::json!([u1, { "role": "assistant", "content": [call("no-store")] }, result]),
+    );
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+    CcSessionLink::record_thread(
+        &p2.unwrap(),
+        "msg_biz2",
+        Vec::new(),
+        reply_of("ready".into()),
+        2000,
+    );
+    let (edited, _) = run(serde_json::json!([
+        u1,
+        { "role": "assistant", "content": [call("max-age=3600")] },
+        result,
+        { "role": "assistant", "content": "ready" },
+        { "role": "user", "content": "next" },
+    ]));
+    assert_eq!(edited["thread"]["type"], "create", "改过的历史得整段重发: {edited}");
+}
+
+/// 客户端 system 文本块带的 `citations` 出站前去掉：上游不收在 system 里（2026-10-07 实测 400
+/// `Citations are only allowed on top-level messages text blocks.`）。单块、多块合并、长文本挪进
+/// 首条用户消息三条路都一样，用户消息里那份文档不动。
+#[test]
+fn system_citations_are_dropped() {
+    let citations = serde_json::json!([{
+        "type": "char_location", "cited_text": "abc", "document_index": 0, "document_title": "T",
+        "start_char_index": 0, "end_char_index": 3,
+    }]);
+    let run = |system: serde_json::Value| {
+        let body = serde_json::json!({ "model": "claude-opus-5-5", "max_tokens": 32, "system": system,
+            "messages": [{ "role": "user", "content": [
+                { "type": "document", "source": { "type": "text", "media_type": "text/plain", "data": "abc" },
+                  "citations": { "enabled": true } },
+                { "type": "text", "text": "引用测试" },
+            ] }] });
+        let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+        let b = Bytes::from(body.to_string());
+        let sim = crate::proxy::test_support::detect_for(&b, flags).unwrap();
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    for system in [
+        serde_json::json!([{ "type": "text", "text": "abc", "citations": citations }]),
+        serde_json::json!([
+            { "type": "text", "text": "abc", "citations": citations },
+            { "type": "text", "text": "另一段指令" },
+        ]),
+        serde_json::json!([
+            { "type": "text", "text": format!("abc{}", "x".repeat(2000)), "citations": citations },
+        ]),
+    ] {
+        let v = run(system);
+        assert!(!v["system"].to_string().contains("char_location"), "{v}");
+        let first = &v["messages"][0]["content"];
+        assert!(!first.to_string().contains("char_location"), "{v}");
+        assert_eq!(first.as_array().unwrap().iter().filter(|b| b["type"] == "document").count(), 1);
+    }
+}
+
+/// 强制工具时只删手动预算那种 thinking（上游实测 400）；adaptive 在 Claude API 上是合法组合，
+/// 留着。`any` 与 `tool` 同等对待。
+#[test]
+fn forced_tool_choice_only_drops_manual_thinking() {
+    let tools = serde_json::json!([{ "name": "Bash", "input_schema": { "type": "object" } }]);
+    let mut adaptive = serde_json::json!({ "model": "claude-opus-4-8", "thinking": { "type": "adaptive" },
+        "tool_choice": { "type": "tool", "name": "Bash" }, "tools": tools, "messages": [] });
+    super::strip_extra_fields(&mut adaptive, true);
+    assert_eq!(adaptive["thinking"]["type"], "adaptive");
+    for choice in [
+        serde_json::json!({ "type": "any" }),
+        serde_json::json!({ "type": "tool", "name": "Bash" }),
+    ] {
+        let mut manual = serde_json::json!({ "model": "claude-haiku-4-5",
+            "thinking": { "type": "enabled", "budget_tokens": 2000 },
+            "tool_choice": choice, "tools": tools, "messages": [] });
+        assert!(super::strip_extra_fields(&mut manual, true));
+        assert!(manual.get("thinking").is_none(), "{manual}");
+    }
+}
+
+/// `tool_choice: any` 同样不补 thinking：haiku 补出来的是手动预算那种，上游实测 400
+/// `Thinking may not be enabled when tool_choice forces tool use.`
+#[test]
+fn any_tool_choice_gets_no_injected_thinking() {
+    let body = serde_json::json!({ "model": "claude-haiku-4-5-20251001", "max_tokens": 2048,
+        "tool_choice": { "type": "any" },
+        "tools": [{ "name": "mcp__audit__lookup", "input_schema": { "type": "object" } }],
+        "messages": [{ "role": "user", "content": "强制任意工具" }] });
+    let raw = body.to_string();
+    let sim = sim_for(&raw);
+    let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+        &Bytes::from(raw),
+        &test_cred(),
+        "fp",
+        all_on(),
+        Some(&sim),
+        None,
+    ))
+    .unwrap();
+    assert!(v.get("thinking").is_none(), "{v}");
+}
+
+/// haiku `max_tokens: 1024` 时补出来的预算抬到下限 1024、与 `max_tokens` 相等。文档说预算须小于
+/// `max_tokens`，但 2026-10-07 实测这一组合上游 200（出站带 interleaved-thinking），照此固定。
+#[test]
+fn haiku_budget_at_the_floor_matches_the_live_result() {
+    let raw = serde_json::json!({ "model": "claude-haiku-4-5-20251001", "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "预算下限" }] })
+    .to_string();
+    let sim = sim_for(&raw);
+    let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+        &Bytes::from(raw),
+        &test_cred(),
+        "fp",
+        all_on(),
+        Some(&sim),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(v["thinking"]["budget_tokens"], 1024, "{v}");
+    assert_eq!(v["max_tokens"], 1024);
+}
+
+/// 带 `tool_addition` / `tool_removal` 的 system 整条留在原位：顶层 `system` 只收文本块。文本与
+/// 工具变更混在一条里的也一样。
+#[test]
+fn hoisting_leaves_tool_change_messages_in_place() {
+    let removal = serde_json::json!({ "role": "system", "content": [
+        { "type": "tool_removal", "name": "lookup" },
+    ] });
+    let mixed = serde_json::json!({ "role": "system", "content": [
+        { "type": "text", "text": "工具有变化" },
+        { "type": "tool_addition", "tool": { "name": "lookup", "input_schema": { "type": "object" } } },
+    ] });
+    let mut v = serde_json::json!({ "messages": [
+        { "role": "user", "content": "hi" },
+        removal,
+        { "role": "assistant", "content": "ok" },
+        { "role": "user", "content": "go on" },
+        mixed,
+    ] });
+    let before = v.clone();
+    assert!(!super::hoist_system_role_messages(&mut v), "没有能提升的");
+    assert_eq!(v, before);
+}
+
+/// 工具声明换了假名，按名字指它的协议位置也得跟着换：`tool_addition` / `tool_removal` 的
+/// `tool_reference.name`、inline-tools 的 `tool_definition.definition.name`、ToolSearch 结果里的
+/// `tool_reference.tool_name`、服务端工具搜索结果的 `tool_references[*].tool_name`。官方名不动；`input_schema` 的 `enum` / `default` 和工具结果正文里
+/// 长得一样的对象是业务数据，不动。
+#[test]
+fn tool_references_follow_the_obfuscated_names() {
+    let literal = serde_json::json!({ "type": "tool_reference", "name": "lookup" });
+    let mut v = serde_json::json!({
+        "tools": [
+            { "name": "lookup", "input_schema": { "type": "object", "properties": {
+                "target": { "enum": [literal], "default": literal },
+            } } },
+            { "name": "Bash" },
+        ],
+        "messages": [
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "content": [
+                    { "type": "tool_reference", "tool_name": "lookup" },
+                    { "type": "tool_reference", "tool_name": "Bash" },
+                ] },
+                { "type": "text", "text": "正文", "data": literal },
+            ] },
+            { "role": "assistant", "content": [
+                { "type": "tool_search_tool_result", "tool_use_id": "srv1", "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [
+                        { "type": "tool_reference", "tool_name": "lookup" },
+                        { "type": "tool_reference", "tool_name": "Bash" },
+                    ],
+                } },
+            ] },
+            { "role": "system", "content": [
+                { "type": "tool_addition", "tool": { "type": "tool_reference", "name": "lookup" } },
+                { "type": "tool_addition", "tool": { "type": "tool_definition", "definition": {
+                    "name": "lookup", "description": "新版",
+                    "input_schema": { "type": "object", "properties": { "x": { "default": literal } } },
+                } } },
+                { "type": "tool_removal", "tool": { "type": "tool_reference", "name": "lookup" } },
+            ] },
+        ],
+    });
+    let map = build_tool_name_map(Some(&v)).unwrap();
+    let fake = map.forward["lookup"].clone();
+    assert!(super::apply_tool_names(&mut v, &map));
+    assert_eq!(v["tools"][0]["name"], fake);
+    let props = &v["tools"][0]["input_schema"]["properties"]["target"];
+    assert_eq!(props["enum"][0], literal, "schema 字面量不动");
+    assert_eq!(props["default"], literal);
+    let refs = &v["messages"][0]["content"][0]["content"];
+    assert_eq!(refs[0]["tool_name"], fake);
+    assert_eq!(refs[1]["tool_name"], "Bash", "官方名不混淆");
+    assert_eq!(v["messages"][0]["content"][1]["data"], literal, "正文里的不动");
+    let server = &v["messages"][1]["content"][0]["content"]["tool_references"];
+    assert_eq!(server[0]["tool_name"], fake, "服务端工具搜索的结果也换");
+    assert_eq!(server[1]["tool_name"], "Bash");
+    let changes = &v["messages"][2]["content"];
+    assert_eq!(changes[0]["tool"]["name"], fake);
+    let def = &changes[1]["tool"]["definition"];
+    assert_eq!(def["name"], fake);
+    assert_eq!(def["input_schema"]["properties"]["x"]["default"], literal);
+    assert_eq!(changes[2]["tool"]["name"], fake);
+}
+
+/// 按 `chunk` 字节一块地喂 SSE 还原，收尾 flush，拼出客户端拿到的全部字节。
+fn sse_restore(map: &crate::proxy::ToolNameMap, wire: &[u8], chunk: usize) -> String {
+    let mut pending = Vec::new();
+    let mut out = Vec::new();
+    for c in wire.chunks(chunk) {
+        out.extend_from_slice(&map.feed(&mut pending, c, true));
+    }
+    out.extend_from_slice(&map.flush(&mut pending, true));
+    String::from_utf8(out).unwrap()
+}
+
+/// 回程只还原协议字段（`tool_use.name`、服务端搜索结果的 `tool_references[*].tool_name`）：
+/// `server_tool_use.input` 的搜索模式、正文增量里提到的假名原样留着——客户端会把它们原样带回，
+/// 请求侧换不回去。`error` 事件全文还原。逐字节分块喂与整段一致。
+#[test]
+fn restore_only_touches_protocol_name_fields() {
+    let map =
+        build_tool_name_map(Some(&serde_json::json!({ "tools": [{ "name": "lookup" }] }))).unwrap();
+    let fake = map.forward["lookup"].clone();
+    let wire = [
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv1","name":"tool_search_tool_regex","input":{}}}"#.to_string(),
+        format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{{\"pattern\": \"{fake}\"}}"}}}}"#),
+        format!(r#"data: {{"type":"content_block_start","index":1,"content_block":{{"type":"tool_search_tool_result","tool_use_id":"srv1","content":{{"type":"tool_search_tool_search_result","tool_references":[{{"type":"tool_reference","tool_name":"{fake}"}}]}}}}}}"#),
+        format!(r#"data: {{"type":"content_block_delta","index":2,"delta":{{"type":"text_delta","text":"I will call {fake} now"}}}}"#),
+        format!(r#"data: {{"type":"content_block_start","index":3,"content_block":{{"type":"tool_use","id":"toolu_1","name":"{fake}","input":{{}}}}}}"#),
+        "event: error".to_string(),
+        format!(r#"data: {{"type":"error","error":{{"type":"invalid_request_error","message":"tool {fake} is broken"}}}}"#),
+    ]
+    .join("\n\n")
+        + "\n\n";
+    let whole = sse_restore(&map, wire.as_bytes(), wire.len());
+    assert!(whole.contains(r#""tool_name":"lookup""#), "{whole}");
+    assert!(whole.contains(r#""name":"lookup","input""#), "{whole}");
+    assert!(whole.contains(&format!(r#"\"pattern\": \"{fake}\""#)), "搜索输入不动: {whole}");
+    assert!(whole.contains(&format!("I will call {fake} now")), "正文不动: {whole}");
+    assert!(whole.contains("tool lookup is broken"), "error 事件全文还原: {whole}");
+    assert_eq!(sse_restore(&map, wire.as_bytes(), 1), whole, "分块还原与整段一致");
+}
+
+/// 整段 JSON（非流式透传、聚合出来的）按块还原：`tool_use.name` 换回真名，`input` 里恰好叫
+/// `name` / `tool_name`、值等于假名的业务参数不动——流式下它走转义过的参数增量，本来也不动，
+/// 两条路得一致。error 体全文还原；不含假名的原样交回。
+#[test]
+fn json_body_restore_keeps_tool_arguments() {
+    let map =
+        build_tool_name_map(Some(&serde_json::json!({ "tools": [{ "name": "lookup" }] }))).unwrap();
+    let fake = map.forward["lookup"].clone();
+    let msg = serde_json::json!({ "type": "message", "role": "assistant", "content": [
+        { "type": "tool_use", "id": "toolu_1", "name": fake,
+          "input": { "name": fake, "tool_name": fake } },
+    ] });
+    let body = serde_json::to_vec(&msg).unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&map.restore_json_body(&body)).unwrap();
+    assert_eq!(out["content"][0]["name"], "lookup");
+    assert_eq!(out["content"][0]["input"], msg["content"][0]["input"], "参数不动");
+    let err = serde_json::json!({ "type": "error", "error": { "message": format!("tool {fake} failed") } });
+    let out = String::from_utf8(map.restore_json_body(&serde_json::to_vec(&err).unwrap())).unwrap();
+    assert!(out.contains("tool lookup failed"), "{out}");
+    let plain = br#"{"type":"message","content":[]}"#;
+    assert_eq!(map.restore_json_body(plain), plain.to_vec());
+    // 非 SSE 时 feed 攒着，flush 一次处理。
+    let mut pending = Vec::new();
+    assert!(map.feed(&mut pending, &body, false).is_empty());
+    let flushed: serde_json::Value =
+        serde_json::from_slice(&map.flush(&mut pending, false)).unwrap();
+    assert_eq!(flushed["content"][0]["name"], "lookup");
+}
+
+/// 端到端：上游回了一段带服务端工具搜索（输入里有假名）与工具调用的回复，客户端拿到还原后的
+/// 那份、原样带回下一轮——线程照样接得上。
+#[test]
+fn sim_threads_continue_after_a_server_tool_search_reply() {
+    use crate::proxy::session_link::CcSessionLink;
+    let tools = serde_json::json!([{
+        "name": "lookup", "description": "look up", "defer_loading": true,
+        "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
+    }]);
+    let map = super::build_tool_name_map(Some(&serde_json::json!({ "tools": tools }))).unwrap();
+    let fake = map.forward["lookup"].clone();
+    let turn = |msgs: serde_json::Value| {
+        let body = serde_json::json!({
+            "model": "claude-opus-5-5", "max_tokens": 32000, "tools": tools, "messages": msgs,
+        });
+        let raw = Bytes::from(body.to_string());
+        let sim = sim_for(&body.to_string());
+        let out = super::rewrite_body_out(
+            &raw,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&sim),
+            None,
+            None,
+            false,
+            Some(&map),
+            true,
+            true,
+            None,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0;
+        (serde_json::from_slice::<serde_json::Value>(&out).unwrap(), sim.take_thread())
+    };
+    let upstream_reply = serde_json::json!([
+        { "type": "server_tool_use", "id": "srv1", "name": "tool_search_tool_regex",
+          "input": { "pattern": fake } },
+        { "type": "tool_search_tool_result", "tool_use_id": "srv1", "content": {
+            "type": "tool_search_tool_search_result",
+            "tool_references": [{ "type": "tool_reference", "tool_name": fake }],
+        } },
+        { "type": "tool_use", "id": "toolu_s", "name": fake, "input": { "q": "x" } },
+    ]);
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·服务端搜索" });
+    let (_, p1) = turn(serde_json::json!([user1]));
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_SRV",
+        vec!["toolu_s".into()],
+        reply_of(upstream_reply.clone()),
+        1000,
+    );
+    // 客户端收到的是回程还原过的那份（非流式：整段 Message 按块还原）。
+    let message =
+        serde_json::json!({ "type": "message", "role": "assistant", "content": upstream_reply });
+    let restored: serde_json::Value =
+        serde_json::from_slice(&map.restore_json_body(&serde_json::to_vec(&message).unwrap()))
+            .unwrap();
+    let restored = restored["content"].clone();
+    assert_eq!(restored[2]["name"], "lookup");
+    assert_eq!(restored[0]["input"]["pattern"], fake.as_str());
+    let (v2, _) = turn(serde_json::json!([
+        user1,
+        { "role": "assistant", "content": restored },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_s", "content": "ok" },
+        ] },
+    ]));
+    assert_eq!(
+        v2["thread"],
+        serde_json::json!({ "type": "continue", "previous_message_id": "msg_SRV" }),
+        "{v2}"
+    );
 }

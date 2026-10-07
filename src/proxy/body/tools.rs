@@ -340,6 +340,13 @@ pub(super) fn same_schema_surface(
     matches!((surface(client), surface(official)), (Some(a), Some(b)) if a == b)
 }
 
+/// [`inject_cc_tools`] 会不会给这条补官方工具：声明了工具就补；一个都没声明（[`declares_no_tools`]）
+/// 时看开关 `fill_absent_tools`，且来访没有强制调某个工具。首轮环境说明（[`insert_env_note`]）按同一个判据
+/// 决定补不补——它列的 Agent 类型与技能离不开那两个工具。
+pub(super) fn injects_cc_tools(v: &serde_json::Value, fill_absent: bool) -> bool {
+    !(declares_no_tools(v) && (!fill_absent || forces_tool_use(v)))
+}
+
 /// 把该 profile 的 14 个官方主线程工具对齐进 `tools`：出站列表**以这 14 条按官方声明序开头**，
 /// 每一条都是资产里那个对象（客户端没声明的是补的，声明了同名的是换的），客户端其余工具
 /// 跟在后面、相对次序不变。补哪几个由 [`cc_tools_to_inject`] 定，流水那侧对的也是这一份。
@@ -374,7 +381,7 @@ pub(super) fn inject_cc_tools(
     // 不带工具、且开关关着或来访强制调工具：整条不动。闸必须落在这里而不只在
     // [`cc_tools_to_inject`] 里——下面的对齐不看缺哪几个，只要有 `tools` 数组就把 14 条排到开头，
     // `tools: []` 会绕过那道判据被补满。
-    if declares_no_tools(v) && (!fill_absent || forces_tool_use(v)) {
+    if !injects_cc_tools(v, fill_absent) {
         return false;
     }
     let missing = cc_tools_to_inject(v, profile, fill_absent, trim);

@@ -106,14 +106,15 @@ pub(in crate::proxy) fn align_system_shape(v: &mut serde_json::Value, cache: Cac
 }
 
 /// 补消息级缓存断点时算作「最后一条」的消息：从尾部往前跳过指令式 system
-/// （[`is_system_directive`]）。
+/// （[`is_system_directive`]）与只管一轮的 system（[`is_turn_scoped_system`]，上游不许它带
+/// `cache_control`，官方把断点放在它前一条上）。
 ///
 /// 指令式那条 `content` 是空数组，挂不上断点；以前它被当空壳丢掉，前一条自然成了末条，
 /// 现在原样留着，不跳过的话 [`align_message_shape`] / [`ensure_cc_message_breakpoint`] 摸到
 /// 空数组就直接返回，前面整段历史失去自动缓存。断点落在它前一条上，缓存前缀覆盖的内容与
 /// 丢掉它时一样；指令本身留在原位，不挪。
 fn last_cacheable_message_mut(msgs: &mut [serde_json::Value]) -> Option<&mut serde_json::Value> {
-    msgs.iter_mut().rev().find(|m| !is_system_directive(m))
+    msgs.iter_mut().rev().find(|m| !is_system_directive(m) && !is_turn_scoped_system(m))
 }
 
 /// 把 `messages` 对齐到官方形态：内容一律块数组，并给**最后一条消息的最后一块**补上官方那
@@ -153,6 +154,11 @@ pub(in crate::proxy) fn align_message_shape(v: &mut serde_json::Value, shape: Ca
     let mut changed = false;
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return false };
     for m in msgs.iter_mut() {
+        // 只管一轮的 system 不转：官方抓包里它恒为字符串（`cap/auto-2.1.291-20261006-full/00465`），
+        // 它也不挂断点，转了没用处。
+        if is_turn_scoped_system(m) {
+            continue;
+        }
         let Some(content) = m.get_mut("content") else { continue };
         // 空串不转：`{"type":"text","text":""}` 是个上游会拒的块，而原样的 `""` 至少还是
         // 客户端自己发出来的形态——改写不该把一条请求的失败方式换个花样。
@@ -376,9 +382,12 @@ pub(in crate::proxy) fn text_block(
 /// 最前面插 billing header；官方序本来就是 billing 在身份句之前，客户端的身份句连同它自己的
 /// `cache_control` 原样留在第二块。
 ///
-/// `version` 是这个来访**自报**的客户端版本（从它自己的 UA 里解出），补出来的
-/// `cc_version` 就用它，见 [`billing_header_text`]。
-pub(super) fn ensure_cc_system_prefix(v: &mut serde_json::Value, version: Option<&str>) -> bool {
+/// `client` 是这个来访**自报**的身份（从它自己的 UA 里解出），补出来的 `cc_version` 与
+/// `cc_entrypoint` 就用它，见 [`billing_header_text`]。
+pub(super) fn ensure_cc_system_prefix(
+    v: &mut serde_json::Value,
+    client: Option<CcClient<'_>>,
+) -> bool {
     let has_billing = match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
             b.get("text")
@@ -400,7 +409,11 @@ pub(super) fn ensure_cc_system_prefix(v: &mut serde_json::Value, version: Option
         Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY_PREFIX),
         _ => false,
     };
-    let mut prefix = vec![text_block_bare(&billing_header_text(v, version))];
+    let mut prefix = vec![text_block_bare(&billing_header_text(
+        v,
+        client.map(|c| c.version),
+        client.map(|c| c.entrypoint),
+    ))];
     if !has_identity {
         prefix.push(text_block_bare(config::CC_SYSTEM_IDENTITY));
     }

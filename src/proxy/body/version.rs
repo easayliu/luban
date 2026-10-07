@@ -48,6 +48,33 @@ pub(in crate::proxy) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
     parse_version(&rest[..end])
 }
 
+/// 从 `User-Agent` 里抠出 Claude Code 的 entrypoint：括号里第二段。
+/// `claude-cli/2.1.291 (external, cli)` → `cli`，`(external, sdk-cli)` → `sdk-cli`，
+/// `(external, claude-vscode, agent-sdk/0.3.273)` → `claude-vscode`。
+///
+/// 官方 billing header 的 `cc_entrypoint` 与 UA 这一段同源，`cap/` 里 433 条带 billing 的
+/// 请求逐条成对（418 条 `cli` ↔ `cli`、15 条 `sdk-cli` ↔ `sdk-cli`）。段名只认小写字母、
+/// 数字与 `-`，最长 32 字节；读不出或不规矩时返回 `None`，调用方按 `cli` 处理。
+pub(in crate::proxy) fn cc_ua_entrypoint(ua: &str) -> Option<&str> {
+    let rest = ua.split_once("claude-cli/")?.1;
+    let inner = rest.split_once('(')?.1.split_once(')')?.0;
+    let ep = inner.split(',').nth(1)?.trim();
+    (!ep.is_empty()
+        && ep.len() <= 32
+        && ep.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+    .then_some(ep)
+}
+
+/// 真实 CC 来访**自报**的身份，供补 billing header 等处沿用：版本取自
+/// [`trusted_cc_version`]，entrypoint 取自 [`cc_ua_entrypoint`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::proxy) struct CcClient<'a> {
+    /// `x.y.z`。
+    pub version: &'a str,
+    /// UA 括号里第二段；读不出时为 `cli`。
+    pub entrypoint: &'a str,
+}
+
 /// 官方已发布的最新 Claude Code 版本：从 `downloads.claude.ai/claude-code-releases/latest`
 /// 学来的（[`crate::oauth::latest_release`]）与写死的 [`config::CC_LATEST_KNOWN_RELEASE`]
 /// 取大者。

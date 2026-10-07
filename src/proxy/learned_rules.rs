@@ -5,7 +5,9 @@ use axum::response::Response;
 use crate::store;
 
 use super::ban::parse_upstream_error;
-use super::body::{FALLBACKS_FIELD, first_turn_index};
+use super::body::{
+    FALLBACKS_FIELD, first_turn_index, is_empty_system_shell, system_survives_hoisting,
+};
 use super::probe_detect::message_to_sse;
 use super::rate_limit::MAX_TRANSIENT_COOLDOWN_SECS;
 use super::request_max_tokens;
@@ -151,7 +153,9 @@ fn role_values(body: &serde_json::Value) -> Vec<String> {
     let first_turn = first_turn_index(msgs);
     for (i, msg) in msgs.iter().enumerate() {
         let Some(role) = msg.get("role").and_then(|r| r.as_str()) else { continue };
-        if role == "system" && i < first_turn {
+        // 开头那段不算（见上）；空壳也不算：出站前不论开关一律丢掉（`drop_empty_system_messages`），
+        // 上游根本看不到它。
+        if role == "system" && (i < first_turn || is_empty_system_shell(msg)) {
             continue;
         }
         if !matches!(role, "user" | "assistant") && !out.iter().any(|v| v == role) {
@@ -1211,6 +1215,8 @@ pub(super) fn maybe_strip_deprecated(
 /// `system_hoisted`：这条请求出站前 `role:"system"` 会被 [`hoist_system_role_messages`] 整条
 /// 挪到顶层（billable 且 [`hoists_system_role`]）。这里查的是入站原件，而上游根本看不到
 /// 这个 role，学到的 `role 'system'` 就管不着它——拿它去拦，拦下的是一条修补后本来能过的请求。
+/// 提升之后仍留着 system 的除外（[`system_survives_hoisting`]，与提升共用判据）：那条照样送到
+/// 上游，豁免不成立。
 pub(super) fn known_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
@@ -1222,9 +1228,14 @@ pub(super) fn known_shape_rejection(
     if table.is_empty() {
         return None;
     }
+    let all_hoisted = system_hoisted
+        && !body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .is_some_and(|m| system_survives_hoisting(m));
     SHAPE_PROBES.iter().find_map(|probe| {
         (probe.values)(body).into_iter().find_map(|value| {
-            if system_hoisted && probe.field == "role" && value == "system" {
+            if all_hoisted && probe.field == "role" && value == "system" {
                 return None;
             }
             let message = table.get(&(model.to_string(), probe.field, value.clone()))?;
