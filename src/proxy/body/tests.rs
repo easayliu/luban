@@ -2425,15 +2425,16 @@ fn core_tool_stubs_are_profile_specific() {
         assert_eq!(d(opus, n), d(haiku, n), "{n}");
     }
     // Bash 取的是默认权限模式那版（多一句别用 Bash 跑 cat 那类命令），是资产真的换到了 2.1.291
-    // 默认模式的最短证据；auto 模式那版（2707 字节）没有这一句。
+    // 默认模式的最短证据；auto 模式那版（2707 字节）没有这一句。2.1.293 的 Bash 逐字未变。
     let bash = opus.iter().find(|t| t["name"] == "Bash").unwrap();
     assert!(
         bash["description"].as_str().unwrap().contains("Avoid using this tool to run `cat`"),
-        "Bash 描述取自 cap/auto-2.1.291-20261006-full/00340: {}",
+        "Bash 描述取自 cap/auto-2.1.293-20261008-full/00419: {}",
         bash["description"]
     );
     assert_eq!(d(opus, "Bash").chars().count(), 3018);
-    assert_eq!(d(opus, "Artifact").chars().count(), 34399);
+    // 2.1.293 的 Artifact 改了一段措辞（2.1.291 是 34399）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 34605);
     assert_eq!(d(haiku, "Bash").chars().count(), 11913);
 }
 
@@ -3737,7 +3738,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 291)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 293)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -4845,6 +4846,85 @@ fn env_note_model_line_follows_the_captured_table() {
 
 /// opus 那族：首条用户消息之后一条 `role: system`，各段次序同 `00340`；精简工具时没有
 /// scratchpad 一行与 artifact 三个技能（`cap/auto-2.1.291-20261006/00066`）；同一条再补一遍不重复。
+/// **对着 `cap/auto-2.1.293-20261008-full` 逐段核首轮环境说明**：opus / sonnet / haiku-5-5 三个
+/// 带 `mid-conversation-system` 的主线程（`00419`、`00256`、`00344`），按抓包机的 cwd 补一份，与官方
+/// 那条 `role: system` 消息去掉模拟路径不注的几段后逐字节相同。不比的：MCP 那几段（2.1.293 新增的
+/// 「tools just became available」、MCP 说明）、延迟工具那段、插件技能（名字带 `:` 的那几行）；
+/// scratchpad 那行里的会话 id 与日期换成模拟这边的。抓包目录不在仓库里就跳过。
+#[test]
+fn env_note_matches_the_2_1_293_captures() {
+    let dir = format!("{}/cap/auto-2.1.293-20261008-full", env!("CARGO_MANIFEST_DIR"));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("skipped: cap/auto-2.1.293-20261008-full not present");
+        return;
+    };
+    let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
+    let cwd = "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/32e92005-bbe2-45cf-9aac-d4f538716b03/scratchpad/calc";
+    for (cred, n) in [(5301, "00419"), (5302, "00256"), (5303, "00344")] {
+        let path = files
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|f| f.starts_with(n) && f.ends_with(".req.raw"))
+            })
+            .unwrap_or_else(|| panic!("{n}"));
+        let raw = std::fs::read(path).unwrap();
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let official: serde_json::Value = serde_json::from_slice(&raw[sep + 4..]).unwrap();
+        let model = official["model"].as_str().unwrap();
+        let session = official["metadata"]["user_id"].as_str().unwrap();
+        let session: serde_json::Value = serde_json::from_str(session).unwrap();
+        let session = session["session_id"].as_str().unwrap();
+        let otext = official["messages"][1]["content"][0]["text"].as_str().unwrap();
+
+        let body = format!(
+            r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"环境说明·{n}"}}]}}"#
+        );
+        let mut sim = crate::proxy::test_support::sim_for(&body);
+        sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/easayliu", cwd));
+        sim.trim_tools = false;
+        let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(super::insert_env_note(&mut v, &sim, cred).inserted, "{model}");
+        assert_eq!(v["messages"][1]["role"], "system", "{model}");
+        let text = v["messages"][1]["content"][0]["text"].as_str().unwrap();
+
+        // 官方那份去掉模拟不注的段落：MCP 两种、延迟工具；技能清单只留内建的（不带 `:` 的）。
+        let mut keep = Vec::new();
+        let mut in_mcp = false;
+        for para in otext.split("\n\n") {
+            if para.starts_with("# MCP Server Instructions") {
+                in_mcp = true;
+            }
+            if para.starts_with("The following skills are available") {
+                in_mcp = false;
+            }
+            if in_mcp
+                || para.starts_with("The following tools just became available")
+                || para.starts_with("The following deferred tools are now available")
+            {
+                continue;
+            }
+            // 插件技能形如 `- commit-commands:commit: …`，名字里带 `:`。
+            let plugin = |l: &str| {
+                l.strip_prefix("- ")
+                    .and_then(|s| s.split_once(": "))
+                    .is_some_and(|(name, _)| name.contains(':'))
+            };
+            let para: Vec<&str> = para.lines().filter(|l| !plugin(l)).collect();
+            keep.push(para.join("\n"));
+        }
+        let want = keep
+            .join("\n\n")
+            .replace(session, &sim.session_id)
+            .replace("Today's date is 2026-10-08.", "");
+        let got = text.split("Today's date is ").next().unwrap().to_string();
+        assert_eq!(got, want, "{model}（{n}）");
+        let line = config::CC_MODEL_IDENTITIES.iter().find(|(id, ..)| *id == model).unwrap().1;
+        assert!(got.contains(&format!("You are powered by the model named {line}.")), "{model}");
+    }
+}
+
 #[test]
 fn env_note_is_a_system_message_after_the_first_prompt() {
     let body = r#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·opus"}]}"#;

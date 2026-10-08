@@ -161,7 +161,7 @@ static CC_TOOLS_CORE_HAIKU: std::sync::LazyLock<Vec<serde_json::Value>> =
 ///
 /// | 工具 | 字节 | 官方怎么关 |
 /// |---|---:|---|
-/// | `Artifact` | 34399 | 环境变量 `CLAUDE_CODE_DISABLE_ARTIFACT=1`，或设置 `enableArtifact: false` |
+/// | `Artifact` | 34399（2.1.293 改了一段措辞，34605） | 环境变量 `CLAUDE_CODE_DISABLE_ARTIFACT=1`，或设置 `enableArtifact: false` |
 /// | `ListAgents` | 1180 | 环境变量 `CLAUDE_CODE_HARBOR_KITE=0` |
 /// | `SendFeedback` | 5537 | 环境变量 `CLAUDE_CODE_SEND_FEEDBACK=0`，或设置 `feedbackDrafts: "off"` |
 ///
@@ -183,9 +183,11 @@ fn trimmed(all: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// 注入用的工具声明（2.1.291，主线程 20 / 16 条里去掉 `ToolSearch` / `DeferredToolPlaceholder`
-/// 那一对、用户自己的 `mcp__*` 与服务端工具 `advisor` 之后的 14 条）：haiku 一份
-/// （[`CC_TOOLS_CORE_HAIKU`]），其余三族同一份（[`CC_TOOLS_CORE`]）。`trim` 是开关
+/// 注入用的工具声明（2.1.293，主线程 17 / 16 条里去掉 `ToolSearch` / `DeferredToolPlaceholder`
+/// 那一对与服务端工具 `advisor` 之后的 14 条；MCP 工具 2.1.293 起已不在 `tools` 里）：haiku-4.5 一份
+/// （[`CC_TOOLS_CORE_HAIKU`]），其余——含 haiku-5-5——同一份（[`CC_TOOLS_CORE`]，
+/// `cap/auto-2.1.293-20261008-full/00344` 与 `00419` 的工具逐字节相同）。2.1.293 的 `Agent` 多了
+/// `effort` 参数，`Artifact` 改了一段措辞，其余逐字未变。`trim` 是开关
 /// `sim_trim_tools`，开着去掉 [`CC_TRIMMED_TOOLS`] 那三条、剩 11 条，先后不变。
 pub(in crate::proxy) fn cc_tools_core(
     profile: &config::CcProfile,

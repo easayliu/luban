@@ -2,7 +2,7 @@
 
 use super::*;
 
-// ---------- 请求 profile（2.1.258 / 2.1.260 / 2.1.270 / 2.1.277 / 2.1.280 / 2.1.285 / 2.1.291 各一张表） ----------
+// ---------- 请求 profile（2.1.258 / 2.1.260 / 2.1.270 / 2.1.277 / 2.1.280 / 2.1.285 / 2.1.291 / 2.1.293 各一张表） ----------
 
 /// 一条官方请求属于哪一类。
 ///
@@ -20,6 +20,10 @@ pub enum CcProfileKind {
     MainSonnet,
     /// 主线程 haiku-4.5（`cap/2.1.277/00046`；2.1.260 表里那行同样是外推的）。
     MainHaiku,
+    /// 主线程 haiku-5-5（2.1.293 起，`cap/auto-2.1.293-20261008-full/00344`）。与 haiku-4.5 不是
+    /// 一个形态：短基座、短工具描述、adaptive thinking、带 effort，与 opus / sonnet 同一套，只是
+    /// beta 顺序与第四块不同。老版本的表里没有这一行，[`cc_profile_at`] 落回 [`Self::MainHaiku`]。
+    MainHaiku55,
     /// agent-sdk 子代理 haiku（`cap/2.1.260/00020`、`00025`）：带工具、`cc_is_subagent`。
     SdkSubagentHaiku,
     /// 无工具的 haiku 辅助请求（`cap/2.1.260/00024`、`00027`）：`thinking:disabled`。
@@ -97,7 +101,7 @@ pub struct CcProfile {
     /// 出站头 `x-claude-code-request-class` 的取值。2.1.277 起官方每条 `/v1/messages` 都带
     /// （`cap/2.1.277`）：主线程与「猜下一句」是 `main`，SDK 子代理是 `subagent`，标题生成与
     /// 额度探测是 `auxiliary`（无工具 helper 与安全分类没有 2.1.277 样本，按用途归入后两者）。
-    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.291）。
+    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.293）。
     pub request_class: &'static str,
     /// 顶层 `output_config.effort` 的取值：2.1.277 起 opus / fable / sonnet 主线程恒带
     /// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`），2.1.280 的 opus 变成
@@ -267,26 +271,10 @@ impl CcModelTier {
 /// `Latest`。读不出版本的一律 `Latest`——与此前「按族一份串」的行为相同，比猜成老一代少一项
 /// 更接近新模型的实情。
 pub fn cc_model_tier(model: &str) -> CcModelTier {
-    let m = model.to_ascii_lowercase();
-    let tokens: Vec<&str> = m.split(['-', '_', '.', '@', '[', '/']).collect();
-    let Some(at) = tokens.iter().position(|t| matches!(*t, "opus" | "fable" | "sonnet" | "haiku"))
-    else {
+    let Some((family, version)) = cc_model_family_version(model) else {
         return CcModelTier::Latest;
     };
-    // 一段版本号：1~2 位纯数字（日期段八位，不算）。
-    let num = |t: &str| (!t.is_empty() && t.len() <= 2).then(|| t.parse::<u32>().ok()).flatten();
-    let after: Vec<u32> = tokens[at + 1..].iter().map_while(|t| num(t)).take(2).collect();
-    let before: Vec<u32> = tokens[..at].iter().rev().map_while(|t| num(t)).collect();
-    let version = if !after.is_empty() {
-        (after[0], after.get(1).copied().unwrap_or(0))
-    } else if !before.is_empty() {
-        let mut b = before;
-        b.reverse();
-        (b[0], b.get(1).copied().unwrap_or(0))
-    } else {
-        return CcModelTier::Latest;
-    };
-    let (latest, gen5) = match tokens[at] {
+    let (latest, gen5) = match family {
         "opus" => ((5, 5), (4, 8)),
         "fable" => ((5, 1), (0, 0)),
         "sonnet" => ((5, 5), (5, 0)),
@@ -299,6 +287,41 @@ pub fn cc_model_tier(model: &str) -> CcModelTier {
     } else {
         CcModelTier::Legacy
     }
+}
+
+/// 模型名里的族名与版本号（`claude-opus-4-8` → `("opus", (4, 8))`、`claude-3-7-sonnet-…` →
+/// `("sonnet", (3, 7))`）：版本号取族名后面的 1~2 位数字段（八位日期段不算），族名在后的老写法取
+/// 族名前面的。认不出族名或读不出版本时 `None`。
+fn cc_model_family_version(model: &str) -> Option<(&'static str, (u32, u32))> {
+    let m = model.to_ascii_lowercase();
+    let tokens: Vec<&str> = m.split(['-', '_', '.', '@', '[', '/']).collect();
+    let (at, family) = tokens.iter().enumerate().find_map(|(i, t)| {
+        ["opus", "fable", "sonnet", "haiku"].into_iter().find(|f| f == t).map(|f| (i, f))
+    })?;
+    // 一段版本号：1~2 位纯数字（日期段八位，不算）。
+    let num = |t: &str| (!t.is_empty() && t.len() <= 2).then(|| t.parse::<u32>().ok()).flatten();
+    let after: Vec<u32> = tokens[at + 1..].iter().map_while(|t| num(t)).take(2).collect();
+    let before: Vec<u32> = tokens[..at].iter().rev().map_while(|t| num(t)).collect();
+    let version = if !after.is_empty() {
+        (after[0], after.get(1).copied().unwrap_or(0))
+    } else if !before.is_empty() {
+        let mut b = before;
+        b.reverse();
+        (b[0], b.get(1).copied().unwrap_or(0))
+    } else {
+        return None;
+    };
+    Some((family, version))
+}
+
+/// 这个 haiku 是不是 5.5 那一代的形态（[`CcProfileKind::MainHaiku55`]）：haiku 5.5 及以上，以及
+/// 读不出版本的 haiku——2.1.293 起官方 `haiku` 别名指向 haiku-5-5，与「读不出版本按最新算」同一口径。
+/// haiku-4.5、3.5、3 是 [`CcProfileKind::MainHaiku`] 那套。不是 haiku 的模型返回 `false`。
+pub fn cc_haiku_is_5_5_family(model: &str) -> bool {
+    if !model.to_ascii_lowercase().contains("haiku") {
+        return false;
+    }
+    cc_model_family_version(model).is_none_or(|(_, v)| v >= (5, 5))
 }
 
 /// 模拟路径给这个模型发的 beta 串：`profile.beta` 按 [`cc_model_tier`] 去掉那一代不发的项。
@@ -324,15 +347,16 @@ pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'stat
     )
 }
 
-/// 按 kind 取**当前模拟版本**（2.1.291，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
-/// 落回 [`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
+/// 按 kind 取**当前模拟版本**（2.1.293，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
+/// 落回 [`CC_PROFILES_2_1_291`]、[`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
 /// [`CC_PROFILES_2_1_260`]（安全分类）。表是常量，三张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus`
 /// 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
 ///
-/// 模拟路径只发主线程四族，这四行在 2.1.291 表里都有；落回旧表的 kind 只用作认来访形态的参照。
+/// 模拟路径只发主线程五行（四族，haiku 分 4.5 与 5.5），2.1.293 表里都有；落回旧表的 kind 只用作认来访形态的参照。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
     CC_PROFILES
         .iter()
+        .chain(CC_PROFILES_2_1_291)
         .chain(CC_PROFILES_2_1_285)
         .chain(CC_PROFILES_2_1_280)
         .chain(CC_PROFILES_2_1_277)
@@ -356,8 +380,8 @@ pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static C
         .find(|p| p.kind == kind && p.version == version)
 }
 
-/// 七张 profile 表，按版本从旧到新。
-pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
+/// 八张 profile 表，按版本从旧到新。
+pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 8] {
     [
         CC_PROFILES_2_1_258,
         CC_PROFILES_2_1_260,
@@ -365,6 +389,7 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
         CC_PROFILES_2_1_277,
         CC_PROFILES_2_1_280,
         CC_PROFILES_2_1_285,
+        CC_PROFILES_2_1_291,
         CC_PROFILES,
     ]
 }
@@ -374,7 +399,8 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
 /// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。分档：
 /// - 低于 2.1.260 取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的
 ///   客户端还不是 2.1.260，猜新的一版等于给它们集体换一套形态；
-/// - 2.1.291 及以上查 [`CC_PROFILES`]，没行的 kind（SDK 子代理）依次再查 2.1.285、2.1.280、2.1.277 表；
+/// - 2.1.293 及以上查 [`CC_PROFILES`]，没行的 kind（SDK 子代理）依次再查 2.1.291、2.1.285、2.1.280、2.1.277 表；
+/// - 2.1.291 ~ 2.1.292 查 [`CC_PROFILES_2_1_291`]，没行的 kind 依次再查 2.1.285、2.1.280、2.1.277 表；
 /// - 2.1.285 ~ 2.1.290 查 [`CC_PROFILES_2_1_285`]，没行的 kind 依次再查 2.1.280、2.1.277 表；
 /// - 2.1.280 ~ 2.1.284 查 [`CC_PROFILES_2_1_280`]，没行的 kind（子代理、标题）再查 2.1.277 表；
 /// - 2.1.277 ~ 2.1.279 查 [`CC_PROFILES_2_1_277`]；
@@ -382,6 +408,8 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
 /// - 其余（2.1.260 ~ 2.1.269，以及各版本表里没有样本的 kind）取 [`CC_PROFILES_2_1_260`]。
 ///
 /// 只有主线程四族有 2.1.258 行、只有 sonnet 有 2.1.270 行，其余 kind 一律落回 2.1.260 那张表。
+/// [`CcProfileKind::MainHaiku55`] 只有 2.1.293 起的表里有：更老的版本（手动 `--model claude-haiku-5-5`
+/// 的 2.1.291 之类）查不到它，按 [`CcProfileKind::MainHaiku`] 再查一遍那一版的 haiku 行。
 ///
 /// 「2.1.270 及以上」而不是「恰为 2.1.270」：抓不到每一个小版本，新客户端来了先按最近一份
 /// 已证的形态处理，比退回两版之前的表离真相更近。此前所有 ≥2.1.260 都套 2.1.260 表也是这个
@@ -389,11 +417,20 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 7] {
 /// 又补回了一条**完整的**订阅端请求——见 [`crate::proxy::merge_beta_for`] 的测试
 /// `merged_beta_is_idempotent_on_2_1_270_sonnet`。
 pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &'static CcProfile {
+    if kind == CcProfileKind::MainHaiku55 && version.is_none_or(|v| v < (2, 1, 293)) {
+        return cc_profile_at(CcProfileKind::MainHaiku, version);
+    }
     let find = |table: &'static [CcProfile]| table.iter().find(|p| p.kind == kind);
     // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
     let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 291) => find(CC_PROFILES)
+        Some(v) if v >= (2, 1, 293) => find(CC_PROFILES)
+            .or_else(|| find(CC_PROFILES_2_1_291))
+            .or_else(|| find(CC_PROFILES_2_1_285))
+            .or_else(|| find(CC_PROFILES_2_1_280))
+            .or_else(|| find(CC_PROFILES_2_1_277))
+            .unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 291) => find(CC_PROFILES_2_1_291)
             .or_else(|| find(CC_PROFILES_2_1_285))
             .or_else(|| find(CC_PROFILES_2_1_280))
             .or_else(|| find(CC_PROFILES_2_1_277))

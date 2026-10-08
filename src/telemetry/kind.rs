@@ -186,8 +186,13 @@ pub(super) fn fill_attachment_estimates(
         .and_then(|t| t.as_array())
         .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
-    let haiku = model.contains("haiku");
-    let model_estimate = if haiku {
+    // haiku-5-5（2.1.293）的附件与 opus 同一套（`cap/auto-2.1.293-20261008-full` 的 haiku-5-5 会话：
+    // 延迟工具 / 子代理 / 技能清单都与 opus 相同），只有模型那条是它自己的 63；长描述那套只剩 haiku-4.5。
+    let haiku_5_5 = crate::config::cc_haiku_is_5_5_family(model);
+    let haiku = model.contains("haiku") && !haiku_5_5;
+    let model_estimate = if haiku_5_5 {
+        "63"
+    } else if haiku {
         "70"
     } else if model.contains("opus") && model.ends_with("[1m]") {
         "71"
@@ -243,11 +248,15 @@ pub(super) fn fill_attachment_estimates(
     obj.insert("query_source".into(), json!(query_source));
 }
 
-/// 模型的默认 effort（`tengu_api_success.default_effort_level`）：opus-5-5 与 sonnet-5-5 是
-/// `medium`，opus-4-7 是 `xhigh`，其余带 effort 的都是 `high`（`cap/2.1.285` 11 个模型、
-/// `cap/2.1.280` 的 opus-5-5[1m]）。
+/// 模型的默认 effort（`tengu_api_success.default_effort_level`）：opus-5-5、sonnet-5-5 与 haiku-5-5
+/// 是 `medium`，opus-4-7 是 `xhigh`，其余带 effort 的都是 `high`（`cap/2.1.285` 11 个模型、
+/// `cap/2.1.280` 的 opus-5-5[1m]；haiku-5-5 见 `cap/auto-2.1.293-20261008-full` 18 条 `medium` /
+/// `is_default_effort: true`）。模拟请求自己发的是 high，那是另一回事，这里只报模型的默认档。
 pub(super) fn default_effort_of(model: &str) -> &'static str {
-    if model.starts_with("claude-opus-5-5") || model.starts_with("claude-sonnet-5-5") {
+    if model.starts_with("claude-opus-5-5")
+        || model.starts_with("claude-sonnet-5-5")
+        || model.starts_with("claude-haiku-5-5")
+    {
         "medium"
     } else if model.starts_with("claude-opus-4-7") {
         "xhigh"

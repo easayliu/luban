@@ -1,9 +1,9 @@
-//! 2.1.291 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.291 的 profile 表（2.1.291 ~ 2.1.292 来访的 beta 参照；模拟路径已换到 2.1.293），及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.291 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.291 来访的
-/// beta 参照（[`cc_profile_at`]）。beta 串逐字取自 `cap/auto-2.1.291-20261006-full`，去掉 `oauth`。
+/// 2.1.291 的 profile 表——2.1.291 ~ 2.1.292 来访的 beta 参照（[`cc_profile_at`]），也是 2.1.293
+/// 表没编的 kind 的兜底。模拟路径已换到 2.1.293（[`CC_PROFILES`]）。beta 串逐字取自 `cap/auto-2.1.291-20261006-full`，去掉 `oauth`。
 ///
 /// 这一版的四族主线程按**默认权限模式**的抓包定（`00340` opus-5-5、`00253` sonnet-5-5、`00303`
 /// haiku-4.5，三条都不带 `safeguards`；同批 auto 会话里进规划模式的 `00163` 也是这串）：模拟请求从来不写 `safeguards` / `afk-mode`，遥测报的
@@ -37,7 +37,7 @@ use super::*;
 ///   a mode` 的说明（模拟路径不注 WebSearch，不收，理由同 EndConversation 那段）；
 /// - **工具**：`Artifact` 改了一句（34386 → 34399 字节），`Bash` 默认模式那版 3303 → 3018；
 ///   延迟池里的 `WebSearch` / `WebFetch` 也改了（模拟路径不注它们）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_291: &[CcProfile] = &[
     CcProfile {
         kind: CcProfileKind::MainOpus,
         version: "2.1.291",
@@ -188,7 +188,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
 /// WebSearch / WebFetch、`/compact`、`-p`；`cap/auto-2.1.291-20261006`：四族主线程用环境变量
 /// 关掉 Artifact / ListAgents / SendFeedback 前后各一条）。
 ///
-/// 1. **fable 的默认权限模式主线程**——按 opus 那串记（见 [`CC_PROFILES`] 表头注 ²）。
+/// 1. **fable 的默认权限模式主线程**——按 opus 那串记（见 [`CC_PROFILES_2_1_291`] 表头注 ²）。
 /// 2. **SDK 子代理（claude-code-guide）**——这一版没触发；Explore 子代理在 haiku 主线程下
 ///    （`00558`）比 2.1.285 的 claude-code-guide 多 `advanced-tool-use` 与 `extended-cache-ttl`
 ///    以外的项都一样，但不是同一种子代理，[`cc_profile_at`] 对 `SdkSubagentHaiku` 仍落回 2.1.285。

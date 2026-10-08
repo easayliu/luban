@@ -58,7 +58,7 @@ impl Prepared {
         // [`CcRequestKind::keeps_nonstream`]）：这个开关的本意是「官方恒为流式，非流式请求
         // 一看就不是 CC」，对它们恰好相反——改成流式才是官方不产生的形态。
         // `merge_beta_for` 要的那几项请求事实：来访体不变，转发循环外算一次，换号重试沿用。
-        let beta_ctx = BetaCtx::of(cc_kind, body, body_json.as_ref());
+        let beta_ctx = BetaCtx::of(cc_kind, body, body_json.as_ref(), &inbound_beta_list(headers));
         let upgrade_stream = billable
             && flags.nonstream_as_sse
             && !cc_kind.keeps_nonstream()

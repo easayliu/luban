@@ -17,6 +17,7 @@ mod v2_1_277;
 mod v2_1_280;
 mod v2_1_285;
 mod v2_1_291;
+mod v2_1_293;
 
 pub use betas::*;
 pub use client::*;
@@ -32,6 +33,7 @@ pub use v2_1_277::*;
 pub use v2_1_280::*;
 pub use v2_1_285::*;
 pub use v2_1_291::*;
+pub use v2_1_293::*;
 
 #[cfg(test)]
 mod tests {
@@ -68,6 +70,7 @@ mod tests {
     #[test]
     fn stainless_version_follows_the_client_version() {
         assert_eq!(cc_stainless_version("2.1.291"), Some("0.128.0"));
+        assert_eq!(cc_stainless_version("2.1.293"), Some("0.128.0"), "可执行文件里仍是 0.128.0");
         assert_eq!(cc_stainless_version("2.1.300"), Some("0.128.0"));
         assert_eq!(cc_stainless_version("2.1.285"), Some("0.127.0"));
         assert_eq!(
@@ -171,7 +174,7 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 285))).version, "2.1.285", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 290))).version, "2.1.285", "{kind:?}");
         }
-        // 2.1.291 表：主线程四族、标题、helper、额度探测；模拟路径用它。
+        // 2.1.291 表：主线程四族、标题、helper、额度探测；2.1.291 ~ 2.1.292 查它。
         for kind in [
             MainOpus,
             MainFable,
@@ -182,8 +185,18 @@ mod tests {
             QuotaProbe,
         ] {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 291))).version, "2.1.291", "{kind:?}");
-            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.291", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.291", "模拟路径用 2.1.291 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 292))).version, "2.1.291", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 293))).version, "2.1.293", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.293", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.293", "模拟路径用 2.1.293 表: {kind:?}");
+        }
+        // haiku-5-5 只有 2.1.293 起的表里有；更老的版本（或读不出版本）落回那一版的 haiku-4.5 行。
+        assert_eq!(cc_profile(MainHaiku55).kind, MainHaiku55);
+        assert_eq!(cc_profile_at(MainHaiku55, Some((2, 1, 293))).kind, MainHaiku55);
+        for v in [Some((2, 1, 291)), Some((2, 1, 285)), Some((2, 1, 260)), None] {
+            let p = cc_profile_at(MainHaiku55, v);
+            assert_eq!(p.kind, MainHaiku, "{v:?}");
+            assert_eq!(p.version, cc_profile_at(MainHaiku, v).version, "{v:?}");
         }
         // 第二批抓包补了子代理与 helper；子代理 2.1.291 没样本，落回 2.1.285。
         for kind in [SdkSubagentHaiku, HelperSubagentHaiku] {
@@ -201,6 +214,8 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.280").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.285").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.291").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.293").is_some());
+        assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.285").is_some(), "cap/2.1.285/00120");
@@ -252,6 +267,23 @@ mod tests {
             ("gpt-4o", Latest),
         ] {
             assert_eq!(cc_model_tier(model), tier, "{model}");
+        }
+        // haiku 族按 5.5 分两套形态（[`cc_haiku_is_5_5_family`]）：5.5 及以上与读不出版本的是新的
+        // 那套（2.1.293 起 `haiku` 别名就是 haiku-5-5），4.5 / 3.5 / 3 是老的那套；别的族一律不是。
+        for (model, h55) in [
+            ("claude-haiku-5-5", true),
+            ("claude-haiku-5-5[1m]", true),
+            ("haiku", true),
+            ("claude-haiku", true),
+            ("claude-haiku-6", true),
+            ("claude-haiku-4-5", false),
+            ("claude-haiku-4-5-20251001", false),
+            ("claude-3-5-haiku-20241022", false),
+            ("claude-3-haiku-20240307", false),
+            ("claude-opus-5-5", false),
+            ("gpt-4o", false),
+        ] {
+            assert_eq!(cc_haiku_is_5_5_family(model), h55, "{model}");
         }
         // haiku 与非主线程 profile 不去项。
         let haiku = cc_profile(CcProfileKind::MainHaiku);

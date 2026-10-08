@@ -1096,7 +1096,7 @@ impl CcRequestKind {
     /// `anthropic-beta` 只补 `oauth`、别的一项不动（[`super::merge_beta_for`]）：SDK 子代理、
     /// `/model` 预热（`00230` 官方那串没有 `advanced-tool-use` 与 `extended-cache-ttl`）与
     /// `count_tokens`（`00104` 等只有五项）。其余非主线程 profile 靠 beta 串自己认得出来，见
-    /// [`super::is_official_non_main_beta`]。
+    /// [`super::is_official_non_main_beta`]；主线程的一次性辅助调用要看体，见 [`super::BetaCtx::of`]。
     pub(super) fn beta_only_oauth(self) -> bool {
         matches!(self, Self::Subagent | Self::Prewarm | Self::CountTokens)
     }

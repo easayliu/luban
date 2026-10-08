@@ -1846,6 +1846,48 @@ fn tool_input_helpers_follow_the_official_values() {
     );
     assert_eq!(exit_code_of("Exit code 2\nboom"), 2);
     assert_eq!(exit_code_of("boom"), 1);
+    // 2.1.293 的 `zsh_nomatch_error`：结果里有 zsh「no matches found」才是 true（`cap/auto-2.1.293-
+    // 20261008-full/00071` 那条），紧跟 `executor_shell_overridden`。
+    let zsh = |head: &str| {
+        let mut m = bash_executed_meta(
+            &bash_profile("grep -rn x --include=*.py ."),
+            44,
+            None,
+            false,
+            false,
+            "auto",
+        );
+        bash_meta_v293(&mut m, head);
+        let keys: Vec<String> = m.as_object().unwrap().keys().cloned().collect();
+        let at = keys.iter().position(|k| k == "zsh_nomatch_error").unwrap();
+        assert_eq!(keys[at - 1], "executor_shell_overridden");
+        m["zsh_nomatch_error"].clone()
+    };
+    assert_eq!(zsh("Exit code 1\n(eval):1: no matches found: --include=*.py"), json!(true));
+    assert_eq!(zsh("Exit code 1\nboom"), json!(false));
+    assert_eq!(zsh(""), json!(false));
+    // 官方判据 `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: no matches found: /m` 认的几种：
+    for head in [
+        "Exit code 1\nzsh: no matches found: *.foo",
+        "Exit code 1\nzsh:3: no matches found: *.foo",
+        "Exit code 1\nscan_py: no matches found: *.py",
+        "Exit code 1\nscan-py:12: no matches found: *.py",
+        "Exit code 1\n(eval): no matches found: x",
+        "Exit code 1\r(eval):1: no matches found: x",
+    ] {
+        assert_eq!(zsh(head), json!(true), "{head}");
+    }
+    // 命令自己的输出里出现这几个字不算：得是整行的 shell 诊断格式。
+    for head in [
+        "Exit code 1\nsearch: no matches found in index",
+        "Exit code 1\n  (eval):1: no matches found: x",
+        "Exit code 1\n(eval):1: no matches found",
+        "Exit code 1\n1scan: no matches found: x",
+        "Exit code 1\nscan py: no matches found: x",
+        "Exit code 1\nzsh:x: no matches found: x",
+    ] {
+        assert_eq!(zsh(head), json!(false), "{head}");
+    }
     assert_eq!(read_content_bytes("     1\tab\n     2\tcd"), 5);
     assert_eq!(file_ext("/a/b/calc.py"), "py");
     assert_eq!(file_ext("/a/.env"), "");
@@ -2750,6 +2792,8 @@ fn dump_telemetry_replay() {
         a.output_tokens = c["output_tokens"].as_i64().unwrap_or(0);
         a.cache_read_tokens = c["cache_read"].as_i64().unwrap_or(0);
         a.cache_creation_tokens = c["cache_creation"].as_i64().unwrap_or(0);
+        a.cache_creation_5m_tokens = c["cache_5m"].as_i64();
+        a.cache_creation_1h_tokens = c["cache_1h"].as_i64();
         a.text_chars = c["text_chars"].as_u64().unwrap_or(0) as usize;
         a.reply_input_chars = a.text_chars;
         a.thinking_chars = c["thinking_chars"].as_u64().unwrap_or(0) as usize;
@@ -3357,6 +3401,111 @@ fn version_2_1_291_telemetry_shape() {
     assert_eq!(success["cache_creation_1h_input_tokens"], 8729);
     let shadow = &ev.iter().find(|(n, _)| n == "tengu_signed_cache_shadow").unwrap().1;
     assert!(shadow.get("verify_micros").is_some(), "{shadow}");
+}
+
+/// 一个 2.1.293 会话的首轮（模型、出站 beta 由调用方给）：返回事件链（名字 + meta + 顶层 betas）。
+fn first_turn_2_1_293(
+    model: &str,
+    effort: Option<&str>,
+    betas: &str,
+) -> Vec<(String, Value, Value)> {
+    let t = Telemetry::default();
+    let mut c = call(body_for(model, effort, true), "req_293", "end_turn");
+    c.ua_out = "claude-cli/2.1.293 (external, cli)".into();
+    c.betas = Some(betas.into());
+    c.resp_model = Some(model.into());
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let p = st.pending.get(&key()).expect("queued");
+    p.events
+        .iter()
+        .map(|(_, e)| {
+            let d = &e["event_data"];
+            let name = d["event_name"].as_str().or_else(|| d["experiment_id"].as_str());
+            let meta = if d["additional_metadata"].is_string() { meta_of(e) } else { Value::Null };
+            (name.unwrap_or("?").to_string(), meta, d["betas"].clone())
+        })
+        .collect()
+}
+
+/// 2.1.293 的遥测（`cap/auto-2.1.293-20261008-full`，交互式默认模式的单轮会话）：
+/// - 实验曝光 `tengu_ochre_wren-agnostic-intro` 没了（改成强制开）；启动段多 `org_config_gate_shadow`
+///   与 `frontmatter_shadow_unknown_key`；
+/// - `wire_shape_recorded.inlineTools` 随 `inline-tools` beta 为 true，haiku-4.5 会话不报这条；
+/// - 会话级 `betas` 止于 `mid-conversation-system-2026-04-07`，不带 `-clear-at` 那项；
+/// - `context_size` 的工具计数：opus 34 / 13942、haiku-5-5 33 / 13912、haiku-4.5 37 / 14413；
+/// - haiku-5-5 会话首次输入前多一条 `heron_brook_applied`；haiku-4.5 当主模型时模型目录那条
+///   不带 `default_output_match` / `default_effort_match`。
+#[test]
+fn version_2_1_293_telemetry_shape() {
+    let opus_betas = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+        thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+        mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,\
+        mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
+        advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+        thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+        extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let h55_betas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+        context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+        mid-conversation-system-2026-04-07,claude-code-20250219,per-turn-control-2026-07-01,\
+        mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
+        advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+        thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+        extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let h45_betas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+        context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,\
+        advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,\
+        thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+        cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let opus = first_turn_2_1_293("claude-opus-5-5", Some("high"), opus_betas);
+    let h55 = first_turn_2_1_293("claude-haiku-5-5", Some("high"), h55_betas);
+    let h45 = first_turn_2_1_293("claude-haiku-4-5-20251001", None, h45_betas);
+    let has = |ev: &[(String, Value, Value)], n: &str| ev.iter().any(|(x, ..)| x == n);
+    let meta = |ev: &[(String, Value, Value)], n: &str| {
+        ev.iter().find(|(x, ..)| x == n).map(|(_, m, _)| m.clone()).unwrap_or(Value::Null)
+    };
+
+    for ev in [&opus, &h55, &h45] {
+        assert!(!has(ev, "tengu_ochre_wren-agnostic-intro"));
+        for n in ["tengu_org_config_gate_shadow", "tengu_frontmatter_shadow_unknown_key"] {
+            assert!(has(ev, n), "{n}");
+        }
+        // 会话级 betas 里没有 `-clear-at`。
+        for (n, _, b) in ev.iter() {
+            if let Some(b) = b.as_str() {
+                let session_level = !b.contains("effort-2025") && !b.contains("structured-outputs");
+                if session_level {
+                    assert!(!b.contains("clear-at"), "{n}: {b}");
+                }
+            }
+        }
+    }
+    assert_eq!(meta(&opus, "tengu_wire_shape_recorded")["inlineTools"], true);
+    assert_eq!(meta(&h55, "tengu_wire_shape_recorded")["inlineTools"], true);
+    assert!(!has(&h45, "tengu_wire_shape_recorded"), "haiku-4.5 没有 mid-conversation-system");
+
+    let ctx = |ev: &[(String, Value, Value)]| {
+        let m = meta(ev, "tengu_context_size");
+        (m["non_mcp_tools_count"].clone(), m["non_mcp_tools_tokens"].clone())
+    };
+    assert_eq!(ctx(&opus), (json!(34), json!(13942)));
+    assert_eq!(ctx(&h55), (json!(33), json!(13912)));
+    assert_eq!(ctx(&h45), (json!(37), json!(14413)));
+
+    // haiku-5-5 的默认档是 medium：模拟发的 high 报成「不是默认」（官方会话里 medium 那 18 条是 true）。
+    let success = meta(&h55, "tengu_api_success");
+    assert_eq!(success["default_effort_level"], "medium");
+    assert_eq!(success["is_default_effort"], false);
+    assert!(has(&h55, "tengu_heron_brook_applied"));
+    assert!(!has(&opus, "tengu_heron_brook_applied") && !has(&h45, "tengu_heron_brook_applied"));
+    let heron = h55.iter().position(|(n, ..)| n == "tengu_heron_brook_applied").unwrap();
+    assert_eq!(h55[heron + 1].0, "tengu_sleepy_snowflake_applied", "紧挨在 sleepy 前");
+
+    let catalog = |ev: &[(String, Value, Value)]| meta(ev, "tengu_model_catalog_compare");
+    assert!(catalog(&opus).get("default_output_match").is_some());
+    assert!(catalog(&h45).get("default_output_match").is_none());
+    assert!(catalog(&h45).get("default_effort_match").is_none());
+    assert!(catalog(&opus)["picker_old"].as_str().unwrap().ends_with("claude-haiku-5-5"));
 }
 
 /// 开关 `sim_trim_tools` 的遥测侧：正文里有官方工具却没有 Artifact / ListAgents / SendFeedback

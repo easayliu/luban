@@ -347,7 +347,7 @@ impl<'a> EventEnv<'a> {
             deferred: self.shape.deferred_tools > 0,
             tool_search: tool_search_decision(self.shape, &f.display_model, f.kind.is_agent()),
             sdk: self.shape.sdk,
-            haiku: self.shape.model.contains("haiku"),
+            tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
         }
     }

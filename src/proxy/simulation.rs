@@ -133,6 +133,7 @@ pub(super) fn sim_is_main_thread(sim: &Simulation) -> bool {
         config::CcProfileKind::MainOpus
             | config::CcProfileKind::MainSonnet
             | config::CcProfileKind::MainHaiku
+            | config::CcProfileKind::MainHaiku55
             | config::CcProfileKind::MainFable
     )
 }
@@ -490,8 +491,23 @@ pub(super) fn is_official_helper_request(v: &serde_json::Value, beta: &[String])
     text(0).starts_with("x-anthropic-billing-header:")
         && text(1) == identity
         && is_official_helper_shape(v)
-        && has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku)
+        && (has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku)
+            || API_KEY_HELPER_BETAS.iter().all(|b| has_beta(beta, b)))
 }
+
+/// API 密钥模式下官方 helper 的 beta（`cap/auto-2.1.293-20261008-api/00045`、`00096`，2.1.291 的 `00206`
+/// 同一串，opus 那两条另在开头多一项 `claude-code`）：没有订阅端的 `oauth`、`dangerous-tool-use`、
+/// `cache-diagnosis`、`message-threads`。这里只要求各版本、各模型都有的那几项加 `effort`
+/// （`output_config.effort` 要它认）；更新一代多出来的（`mid-conversation-*`、`inline-tools`……）不强求，
+/// 免得每升一版、每换一个老模型就漏认一次。
+const API_KEY_HELPER_BETAS: &[&str] = &[
+    "interleaved-thinking-2025-05-14",
+    config::CC_BETA_REDACT_THINKING,
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    config::CC_BETA_PROMPT_CACHING_SCOPE,
+    config::CC_BETA_EFFORT,
+];
 
 /// 来访的 `anthropic-beta` 是否带齐了某个官方 profile **任一版**的每一项 beta（多带不算错——
 /// 来访那串还有 `oauth`/`afk-mode` 之类 profile 表里刻意去掉的项）。
@@ -524,7 +540,7 @@ pub(super) const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 ///
 /// 逐项对，缺一不算：
 /// 1. `tools` 恰好一个，`type` 以 `web_search_` 开头且 `name` 是 `web_search`；
-/// 2. `tool_choice` 是 `{"type":"tool","name":"web_search"}`；
+/// 2. `tool_choice` 是 `{"type":"tool","name":"web_search"}`，或 2.1.293 起的 `{"type":"auto"}`；
 /// 3. `messages` 恰好一条且是用户消息；
 /// 4. `system` 去掉 billing header（与 2.1.285 起跟在它后面的那句逐字 CC 身份句）后恰好一块，不到 [`CC_BASE_PROMPT_MIN_LEN`] 字节、不含 CC
 ///    身份句、且提到 web search（字符串形态的 `system` 一并认）。
@@ -539,10 +555,14 @@ pub(super) fn is_official_web_search_request(v: &serde_json::Value) -> bool {
     if !ty.starts_with("web_search_") || name != "web_search" {
         return false;
     }
+    // 2.1.293 起这条换成 haiku-5-5，它不收强制工具，`tool_choice` 改成 `{"type":"auto"}`
+    // （`cap/auto-2.1.293-20261008-full/00054`）；此前恒为强制 `web_search`。
     let Some(choice) = v.get("tool_choice") else { return false };
-    if choice.get("type").and_then(|t| t.as_str()) != Some("tool")
-        || choice.get("name").and_then(|n| n.as_str()) != Some("web_search")
-    {
+    let forced = choice.get("type").and_then(|t| t.as_str()) == Some("tool")
+        && choice.get("name").and_then(|n| n.as_str()) == Some("web_search");
+    let auto = choice.as_object().is_some_and(|c| c.len() == 1)
+        && choice.get("type").and_then(|t| t.as_str()) == Some("auto");
+    if !forced && !auto {
         return false;
     }
     let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
@@ -610,7 +630,7 @@ fn is_claude_family(model: &str) -> bool {
     ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f))
 }
 
-/// 官方基座（2.1.291：haiku 一份长的，其余三族同一份）；认不出的模型返回 `None`，只注入身份句
+/// 官方基座（2.1.293：haiku-4.5 一份长的，其余——含 haiku-5-5——同一份）；认不出的模型返回 `None`，只注入身份句
 /// ——基座是逐字节从抓包取的，给一个 `gpt-4o` 补 Claude Code 的基座比不补更糟。
 pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
     if !is_claude_family(model) {
@@ -622,7 +642,7 @@ pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
     })
 }
 
-/// 官方第四块的模板（2.1.291：opus / sonnet 一份，fable、haiku 各一份）；认不出的模型 `None`、
+/// 官方第四块的模板（2.1.293：opus / sonnet 一份，fable、haiku-4.5、haiku-5-5 各一份）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
 /// 知识截止，2.1.277 起的第四块不再写这些，只剩记忆目录一处随机器变。
 pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
@@ -631,6 +651,7 @@ pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
     }
     Some(match cc_profile_kind_for(model) {
         config::CcProfileKind::MainHaiku => config::CC_SYSTEM_REST_HAIKU,
+        config::CcProfileKind::MainHaiku55 => config::CC_SYSTEM_REST_HAIKU_5_5,
         config::CcProfileKind::MainFable if is_fable_5_1(model) => config::CC_SYSTEM_REST_FABLE,
         config::CcProfileKind::MainFable => CC_SYSTEM_REST_FABLE_5.as_str(),
         _ => config::CC_SYSTEM_REST,
@@ -1033,7 +1054,9 @@ pub(super) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
 /// 版本经 [`config::cc_profile_at`] 取对应那一版的行）。
 pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
     let m = model.to_ascii_lowercase();
-    if m.contains("haiku") {
+    if config::cc_haiku_is_5_5_family(&m) {
+        config::CcProfileKind::MainHaiku55
+    } else if m.contains("haiku") {
         config::CcProfileKind::MainHaiku
     } else if m.contains("fable") {
         config::CcProfileKind::MainFable
@@ -1054,13 +1077,31 @@ pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
 /// 那批（opus-5、`max_tokens=10240`、`tools: []`、每台新设备同样四道题）就是被上一版「thinking
 /// 对象 + max_tokens >= 4096」的宽豁免放过去的。
 ///
+/// **2.1.293 起换成了 haiku-5-5**（`cap/auto-2.1.293-20261008-full/00030` 标题、`00063` helper、
+/// `00156` 会话起名）：模型是 `claude-haiku-5-5`（额度探测仍是 haiku-4.5）、**没有** `thinking` 字段、`max_tokens` 恰为
+/// 128000、`output_config.effort` 恰为 `medium`，`tools: []` 与流式照旧。两套各自成套才算，混搭的
+/// （haiku-5-5 配 `thinking:disabled`、haiku-4.5 配 128000）都不是官方写法。
+///
+/// **API 密钥模式**（`ANTHROPIC_BASE_URL` 指向 luban、`ANTHROPIC_AUTH_TOKEN` 认证——luban 的真实来访
+/// 都是这个模式）下用的是**会话的主模型**，不是 haiku（`cap/auto-2.1.293-20261008-api`：2.1.293 opus
+/// `00037` 标题 / `00045` helper、haiku-5-5 `00096`，2.1.291 opus `00201` / `00206`）：同样没有
+/// `thinking`、`effort` 是 `medium`，`max_tokens` 是那个模型的默认上限。故新形态这一支只要求模型是
+/// Claude 四族之一、`max_tokens` 是 128000 或 64000（fable / 老一代的上限）。
+///
 /// **只是 body 那一半**：单独用它放行不够（抄五个字段就够了），要配上 system 结构与 beta 头，
 /// 见 [`is_official_helper_request`] 与 [`is_official_title_request`]。
 fn is_official_helper_shape(v: &serde_json::Value) -> bool {
-    v.get("model").and_then(|m| m.as_str()) == Some(QUOTA_PROBE_MODEL)
-        && v.get("tools").is_some_and(|t| t.as_array().is_some_and(|a| a.is_empty()))
+    let model = v.get("model").and_then(|m| m.as_str());
+    let legacy = model == Some(QUOTA_PROBE_MODEL)
         && thinking_type(v) == Some("disabled")
-        && request_max_tokens(Some(v)) == Some(32000)
+        && request_max_tokens(Some(v)) == Some(32000);
+    let effort_medium = model.is_some_and(is_claude_family)
+        && v.get("thinking").is_none()
+        && matches!(request_max_tokens(Some(v)), Some(128000 | 64000))
+        && v.get("output_config").and_then(|o| o.get("effort")).and_then(|e| e.as_str())
+            == Some("medium");
+    (legacy || effort_medium)
+        && v.get("tools").is_some_and(|t| t.as_array().is_some_and(|a| a.is_empty()))
         && v.get("stream").and_then(|b| b.as_bool()) == Some(true)
 }
 

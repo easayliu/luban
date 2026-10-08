@@ -1,0 +1,4383 @@
+{
+"_comment": "官方 Claude Code 2.1.293 一个会话的静态事件模板：以 2.1.291 那份为底（2.1.291 那份又以 2.1.285 的 cap/2.1.285/00040 为底），按 cap/auto-2.1.293-20261008-full 的交互式会话补齐 2.1.293 的 meta 键（新增键取抓包值、去掉的键删掉、键序照新版；IDE 那个 MCP 连接与随用户设置变的 startup_manual_model_config 不动），去掉改成强制开、不再曝光的 tengu_ochre_wren-agnostic-intro，启动段加 org_config_gate_shadow 与 frontmatter_shadow_unknown_key 各一条（inline 宣告 MCP 工具那两条随 claude.ai 连接器一并不收），model_catalog_compare 的选择器换成带 haiku-5-5 的那份。由 cap/auto-2.1.293-20261008-full/_driver/build_tpl_293.py 生成。off 是相对锚点的毫秒偏移：startup / prompt / first_prompt / prompt_next 相对该次输入的主线程 tengu_api_query，turn / first_turn 相对 tengu_api_success。type=growth 是 GrowthbookExperimentEvent。meta 里的 {{version}} / {{model}} / {{permission_mode}} 由代码按会话替换。整理：那次是在新目录首次启动，去掉了信任对话框（trust_dialog_*、按键、onboarding_trust_dialog）与对话框之后重复的一轮插件加载，并把对话框之后的事件前移、补上对话框占掉的时长；去掉了本机用户级的两个 http MCP 服务与 claude.ai 连接器的连接/列工具事件（tengu_mcp_servers.global、tengu_mcp_tools_commands_loaded.tools_count 随之归零，instructions 池只剩 1 个），只留 IDE 那个；去掉机器时钟相关的 tengu_fleet_nudge_state；早批（Bun fetch）那三条不在其中。代码自己发的事件（api_* / tether_* / sysprompt_* / input_prompt / prompt_suggestion / 首条请求的几个 feature 等）不进模板。background 是会话跑久了才有的后台任务（进程启动后约 7 分钟的插件自动更新检查、约 20 分钟的保留期清理），off 相对进程启动，会话里后来的请求越过那个时刻才补发。 版本检查（native_auto_updater_* / version_check_success / update_check / native_cleanup_versions）不跟第一次输入走，而是进程启动后约 9.7s 一次、约 5 分 18 秒再一次（cap/auto-2.1.285-20260930 的 bcb4 会话 07:49:01.586 / 07:54:10.339），归进 background、相对进程启动。",
+"startup": [
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_managed_settings_os_read",
+"meta": {
+"is_wsl": false,
+"await_ms": 0
+},
+"stage": "startup"
+},
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"cert_count": 144,
+"store_bundled": true,
+"store_system": true,
+"extra_configured": false,
+"feature_name": "ca_certs_load"
+},
+"stage": "startup"
+},
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_cli_flags",
+"meta": {
+"flag_count": 0,
+"flags": ""
+},
+"stage": "startup"
+},
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_managed_config_ready",
+"meta": {
+"trigger": "both_resolved",
+"emitted_ms": 262,
+"is_default_command": true,
+"settled_ms": 260,
+"barrier_crossed_ms": 262,
+"settings_source": "cache",
+"settings_had_cache": true,
+"settings_awaited": false,
+"settings_settled_ms": 260,
+"settings_barrier": "not_awaited",
+"settings_barrier_wait_ms": 0,
+"policy_source": "cache",
+"policy_had_cache": true,
+"policy_awaited": false,
+"policy_settled_ms": 241,
+"policy_barrier": "not_awaited",
+"policy_barrier_wait_ms": 0,
+"policy_eligible_if_base_url_gate_removed": true,
+"policy_cache_age_ms": 2217771,
+"policy_would_fail_closed": false,
+"policy_live_verdict": false,
+"policy_load_state": "in_flight",
+"policy_has_auth_token": false,
+"policy_has_api_key_helper": false,
+"policy_has_custom_base_url": false,
+"policy_api_provider": "firstParty"
+},
+"stage": "startup"
+},
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_signed_cache_shadow",
+"meta": {
+"cache": "policy-limits",
+"result": "unsigned",
+"verify_micros": 7,
+"has_org_uuid": true,
+"has_account_uuid": true,
+"has_workspace_uuid": false,
+"ws_unanchored": false,
+"identity_state": "pending"
+},
+"stage": "startup"
+},
+{
+"off": -6178,
+"type": "event",
+"name": "tengu_signed_cache_shadow",
+"meta": {
+"cache": "managed-settings",
+"result": "unsigned",
+"verify_micros": 7,
+"has_org_uuid": true,
+"has_account_uuid": true,
+"has_workspace_uuid": false,
+"ws_unanchored": false,
+"identity_state": "pending"
+},
+"stage": "startup"
+},
+{
+"off": -6158,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "skill_load_dir"
+},
+"stage": "startup"
+},
+{
+"type": "event",
+"name": "tengu_frontmatter_shadow_unknown_key",
+"meta": {
+"surface": "skill",
+"detail": "compatibility"
+},
+"off": -6158
+},
+{
+"off": -6157,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"found": 0,
+"feature_name": "workflow_discover"
+},
+"stage": "startup"
+},
+{
+"off": -6157,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 32,
+"managedFilesFound": 0,
+"userFilesFound": 0,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "agents"
+},
+"stage": "startup"
+},
+{
+"off": -6156,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 21,
+"managedFilesFound": 0,
+"userFilesFound": 0,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "commands"
+},
+"stage": "startup"
+},
+{
+"off": -6156,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "skill_load_commands_dir"
+},
+"stage": "startup"
+},
+{
+"off": -6155,
+"type": "event",
+"name": "tengu_plugin_skills_dir_loaded",
+"meta": {
+"count": 0,
+"user_count": 0,
+"project_count": 0,
+"project_suppressed_count": 0,
+"error_count": 0
+},
+"stage": "startup"
+},
+{
+"off": -6154,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_manifest"
+},
+"stage": "startup"
+},
+{
+"off": -6153,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_manifest"
+},
+"stage": "startup"
+},
+{
+"off": -6153,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_manifest"
+},
+"stage": "startup"
+},
+{
+"off": -6150,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_settings"
+},
+"stage": "startup"
+},
+{
+"type": "event",
+"name": "tengu_org_config_gate_shadow",
+"meta": {
+"decision": "blocked",
+"decision_reason": "unavailable_pending",
+"decision_resource": "settings",
+"surface": "startup",
+"blocked_ms": 0,
+"candidate_if_armed": true,
+"candidate_now": false,
+"exclusion_now": "flag_off",
+"flag_enabled": false,
+"flag_source": "fallback",
+"flag_percent": 0,
+"grace_ttl_hours": 96,
+"tier": "team",
+"credential_shape": "stored_login",
+"policy_reason": "unavailable_pending",
+"policy_has_cache": true,
+"policy_cache_age_ms": 264521,
+"settings_reason": "unavailable_pending",
+"settings_has_cache": true
+},
+"off": -6150
+},
+{
+"off": -6146,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "skill_load_dir"
+},
+"stage": "startup"
+},
+{
+"off": -6145,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_settings"
+},
+"stage": "startup"
+},
+{
+"off": -6144,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_settings"
+},
+"stage": "startup"
+},
+{
+"off": -6141,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_all"
+},
+"stage": "startup"
+},
+{
+"off": -6141,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_workflows"
+},
+"stage": "startup"
+},
+{
+"off": -6140,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_agents"
+},
+"stage": "startup"
+},
+{
+"off": -6136,
+"type": "event",
+"name": "tengu_node_warning",
+"meta": {
+"is_internal": 0,
+"occurrence_count": 1,
+"classname": "Warning"
+},
+"stage": "startup"
+},
+{
+"off": -6135,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_commands"
+},
+"stage": "startup"
+},
+{
+"off": -6133,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_skills"
+},
+"stage": "startup"
+},
+{
+"off": -6131,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "agents_cross_session_inbox"
+},
+"stage": "startup"
+},
+{
+"off": -6131,
+"type": "event",
+"name": "tengu_uds_startup_bind",
+"meta": {
+"durationMs": 59,
+"bound": true
+},
+"stage": "startup"
+},
+{
+"off": -6129,
+"type": "event",
+"name": "tengu_shell_set_cwd",
+"meta": {
+"success": true
+},
+"stage": "startup"
+},
+{
+"off": -6129,
+"type": "event",
+"name": "tengu_started",
+"meta": {
+"worktree_flag": false,
+"tmux_flag": false,
+"in_tmux_worktree": false,
+"tengu_quizzical_giraffe": "unset"
+},
+"stage": "startup"
+},
+{
+"off": -6120,
+"type": "event",
+"name": "tengu_version_lock_failed",
+"meta": {
+"is_pid_based": true,
+"is_lifetime_lock": true
+},
+"stage": "startup"
+},
+{
+"off": -6103,
+"type": "event",
+"name": "tengu_artifact_toolset",
+"meta": {
+"on": true
+},
+"stage": "startup"
+},
+{
+"off": -6102,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "cmd_load"
+},
+"stage": "startup"
+},
+{
+"off": -5255,
+"type": "event",
+"name": "tengu_signed_cache_identity",
+"meta": {
+"cache": "policy-limits",
+"identity_state": "resolved",
+"identity_latency_ms": 929,
+"identity_disagrees_with_config": false,
+"bearer_kind": "claude_ai_oauth"
+},
+"stage": "startup"
+},
+{
+"off": -5255,
+"type": "event",
+"name": "tengu_signed_cache_identity",
+"meta": {
+"cache": "managed-settings",
+"identity_state": "resolved",
+"identity_latency_ms": 929,
+"identity_disagrees_with_config": false,
+"bearer_kind": "claude_ai_oauth"
+},
+"stage": "startup"
+},
+{
+"off": -5208,
+"type": "event",
+"name": "tengu_remote_settings_fetch",
+"meta": {
+"duration_ms": 982,
+"ms_since_startup": 1172,
+"success": true,
+"attempts": 1,
+"had_cache": true,
+"is_load": true,
+"awaited": false,
+"auth_type": "oauth",
+"token_source": "claude.ai",
+"credential_origin": "stored_login",
+"has_custom_base_url": false,
+"token_refresh_outcome": "not_needed",
+"retried_after_401": false,
+"outcome_reason": "none_configured",
+"response_kind": "none_configured",
+"request_id_present": true,
+"response_content_type": "json",
+"prefetched": true,
+"hedged": false
+},
+"stage": "startup"
+},
+{
+"off": -5202,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"status": "no_content",
+"feature_name": "remote_managed_settings_pull"
+},
+"stage": "startup"
+},
+{
+"off": -4987,
+"type": "event",
+"name": "tengu_policy_limits_fetch",
+"meta": {
+"duration_ms": 1221,
+"ms_since_startup": 1393,
+"success": true,
+"had_cache": true,
+"cache_stamp": "match",
+"cache_age_ms": 2217750,
+"attempts": 1,
+"prefetched": true,
+"hedged": false,
+"restrictions_denied_count": 2,
+"compliance_taint_count": 0,
+"is_load": true,
+"awaited": false,
+"auth_type": "oauth",
+"token_source": "claude.ai",
+"has_custom_base_url": false,
+"via_unix_socket": false,
+"has_unix_socket": false,
+"has_auth_token": false,
+"has_api_key_helper": false,
+"api_key_prefix": "none",
+"retried_after_401": false,
+"outcome_reason": "not_modified",
+"response_kind": "not_modified",
+"fetch_trigger": "load",
+"verdictless_retry_scheduled": false,
+"proxy_in_use": true,
+"proxy_is_loopback": true
+},
+"stage": "startup"
+},
+{
+"off": -4983,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "policy_limits_load"
+},
+"stage": "startup"
+},
+{
+"off": -4945,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "claudeai_marketplaces_sync"
+},
+"stage": "startup"
+},
+{
+"off": -4696,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"account_opt_in": true,
+"duration_ms": 1418,
+"feature_name": "plugins_sync_round"
+},
+"stage": "startup"
+},
+{
+"off": -4626,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"account_opt_in": true,
+"idle": false,
+"woken": false,
+"trigger": "startup",
+"duration_ms": 1489,
+"suspended_ms": 0,
+"no_changes": true,
+"feature_name": "skills_sync_round"
+},
+"stage": "startup"
+},
+{
+"off": -4617,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"decision": "served",
+"route": "org",
+"credential": "oauth",
+"auth_kind": "claudeai_login",
+"feature_name": "model_catalog_primary"
+},
+"stage": "startup"
+},
+{
+"off": -4617,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "startup_resolve_model"
+},
+"stage": "startup"
+},
+{
+"off": -4610,
+"type": "event",
+"name": "tengu_nonblocking_stdout",
+"meta": {
+"result": "installed"
+},
+"stage": "startup"
+},
+{
+"off": -4610,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "terminal_nonblocking_stdout"
+},
+"stage": "startup"
+},
+{
+"off": -4610,
+"type": "event",
+"name": "tengu_timer",
+"meta": {
+"event": "startup",
+"durationMs": 1841,
+"resumed": false
+},
+"stage": "startup"
+},
+{
+"off": -4596,
+"type": "event",
+"name": "tengu_prompt_suggestion_init",
+"meta": {
+"enabled": true,
+"source": "setting"
+},
+"stage": "startup"
+},
+{
+"off": -4596,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "keybinding_load_user_config"
+},
+"stage": "startup"
+},
+{
+"off": -4595,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "keybinding_watcher_init"
+},
+"stage": "startup"
+},
+{
+"off": -4570,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"provenance": "builtin",
+"plugin_id_hash": "edea695a220b6dd7",
+"plugin_scope": "default-bundle",
+"plugin_name_redacted": "cc-plugin-sec-default",
+"marketplace_name_redacted": "builtin",
+"is_official_plugin": true,
+"plugin_name_previous": "sec-default",
+"plugin_id_hash_previous": "1ed0b2a7832ab05b",
+"feature_name": "plugin_function_hooks_load"
+},
+"stage": "startup"
+},
+{
+"off": -4568,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"provenance": "builtin",
+"plugin_id_hash": "edea695a220b6dd7",
+"plugin_scope": "default-bundle",
+"plugin_name_redacted": "cc-plugin-sec-default",
+"marketplace_name_redacted": "builtin",
+"is_official_plugin": true,
+"plugin_name_previous": "sec-default",
+"plugin_id_hash_previous": "1ed0b2a7832ab05b",
+"feature_name": "plugin_function_hooks_load"
+},
+"stage": "startup"
+},
+{
+"off": -4565,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_hooks"
+},
+"stage": "startup"
+},
+{
+"off": -4558,
+"type": "event",
+"name": "tengu_org_memory_connected_mode",
+"meta": {
+"active": false
+},
+"stage": "startup"
+},
+{
+"off": -4558,
+"type": "event",
+"name": "tengu_org_memory_decision",
+"meta": {
+"outcome": "off",
+"cause": "gates_closed"
+},
+"stage": "startup"
+},
+{
+"off": -4527,
+"type": "event",
+"name": "tengu_startup_manual_model_config",
+"meta": {
+"settings_file": "opus",
+"settings_source": "userSettings",
+"subscriptionType": "team"
+},
+"stage": "startup"
+},
+{
+"off": -4527,
+"type": "event",
+"name": "tengu_rc_autostart_resolved",
+"meta": {
+"explicit_setting": "unset",
+"explicit_source": "none",
+"default_value": false,
+"default_source": "org_policy",
+"mirror": false,
+"remote_control_flag": false,
+"env_remote": false,
+"thin_client": false,
+"reattach": false,
+"result": "off"
+},
+"stage": "startup"
+},
+{
+"off": -4525,
+"type": "event",
+"name": "tengu_timer",
+"meta": {
+"event": "plugins_init",
+"durationMs": 17,
+"headless": false
+},
+"stage": "startup"
+},
+{
+"off": -4505,
+"type": "event",
+"name": "tengu_init",
+"meta": {
+"entrypoint": "claude",
+"bootstrap_entry": "cli",
+"hasInitialPrompt": false,
+"hasStdin": false,
+"verbose": false,
+"focusView": false,
+"debug": false,
+"debugToStderr": false,
+"print": false,
+"outputFormat": "text",
+"inputFormat": "text",
+"numAllowedTools": 0,
+"numDisallowedTools": 0,
+"restricted": false,
+"mcpClientCount": 2,
+"has_mcp_stdio": false,
+"has_mcp_managed": false,
+"has_mcp_localhost": false,
+"has_mcp_private_network": false,
+"has_mcp_public": true,
+"has_mcp_other": false,
+"worktree": false,
+"githubActionInputsPresent": false,
+"dangerouslySkipPermissionsPassed": false,
+"permissionMode": "{{permission_mode}}",
+"modeIsBypass": false,
+"inProtectedNamespace": false,
+"apiKeySource": "none",
+"allowDangerouslySkipPermissionsPassed": false,
+"thinkingType": "adaptive",
+"rendererEntryPath": "settings_off",
+"autoUpdatesChannel": "latest",
+"model_definition_source": "compiled_catalog",
+"model_setting_source": "served_default",
+"autoModeAvailable": true,
+"autoModeDisabledByTrustedPolicy": false,
+"autoModeEnabledState": "enabled",
+"autoModeEnabledStateSource": "gb",
+"autoModeCircuitBroken": false,
+"autoModeFromFallback": true,
+"is_git": false,
+"has_remote": false,
+"remote_host_class": "none",
+"has_dockerfile": false,
+"has_compose": false,
+"has_devcontainer": false,
+"has_nix": false,
+"has_bazel": false,
+"lockfile_family": "none",
+"has_env_file": false,
+"has_ci_config": false,
+"has_private_registry": false,
+"private_registry_host_class": "none",
+"has_secrets_manager_refs": false,
+"has_xcode_project": false,
+"has_ios_app_project": false,
+"has_android_project": false,
+"has_android_app_project": false,
+"os_locked_toolchain": "none"
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_voice_init_gate",
+"meta": {
+"user_intent_store": false,
+"user_intent_disk": false,
+"has_voice_auth": true,
+"voice_mode_allowed": true,
+"auth_version": 0
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_monitors"
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "auth_api_key_verify"
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_bridge_repl_evaluated",
+"meta": {
+"would_auto_on": false,
+"repl_bridge_enabled": false
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_arm_monitor"
+},
+"stage": "startup"
+},
+{
+"off": -4403,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "context_git_detect"
+},
+"stage": "startup"
+},
+{
+"off": -4402,
+"type": "event",
+"name": "tengu_mcp_sdk_generation",
+"meta": {
+"generation": "v2",
+"source": "growthbook"
+},
+"stage": "startup"
+},
+{
+"off": -4402,
+"type": "event",
+"name": "tengu_shell_allow_rules_at_init",
+"meta": {
+"total_shell_allow_rules": 0
+},
+"stage": "startup"
+},
+{
+"off": -4402,
+"type": "event",
+"name": "tengu_model_catalog_compare",
+"meta": {
+"mode": "primary",
+"surface": "cc",
+"catalog_source": "served",
+"route": "org",
+"credential": "oauth",
+"auth_kind": "claudeai_login",
+"fetch_status": "cache_fresh",
+"cache_age_s": 2,
+"served": true,
+"served_row_count": 12,
+"served_selectable_count": 12,
+"served_confidential_count": 0,
+"served_has_default": true,
+"served_has_runtime": false,
+"selection_source": "global_default",
+"compare_failed": false,
+"main_loop_model": "{{model}}",
+"behaves_as_applied": false,
+"behaves_as_source": "none",
+"unknown_unmapped": false,
+"served_offered_count": 12,
+"served_mapped_count": 0,
+"served_not_offered_count": 0,
+"served_capability_count": 0,
+"served_family_default_count": 0,
+"picker_match": false,
+"picker_set_match": true,
+"picker_added_count": 0,
+"picker_removed_count": 0,
+"picker_full_match": false,
+"served_overflow_count": 8,
+"default_match": true,
+"opus_match": true,
+"sonnet_match": true,
+"haiku_match": true,
+"default_output_match": true,
+"served_has_default_output": false,
+"default_effort_match": true,
+"served_has_default_effort": false,
+"picker_old": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5",
+"picker_new": "claude-opus-5-5,claude-sonnet-5-5,claude-fable-5-1,claude-haiku-5-5,claude-haiku-4-5-20251001,claude-sonnet-5,claude-opus-5,claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-opus-4-6,claude-sonnet-4-6",
+"picker_old_count": 4,
+"picker_new_count": 12,
+"picker_base_old": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5",
+"picker_main_new": "claude-opus-5-5,claude-sonnet-5-5,claude-fable-5-1,claude-haiku-5-5",
+"picker_base_old_count": 4,
+"picker_main_new_count": 4
+},
+"stage": "startup"
+},
+{
+"off": -4394,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "provider_route"
+},
+"stage": "startup"
+},
+{
+"off": -4391,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "lsp_config_load"
+},
+"stage": "startup"
+},
+{
+"off": -4391,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "lsp_init"
+},
+"stage": "startup"
+},
+{
+"off": -4391,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "lsp_diagnostics_register"
+},
+"stage": "startup"
+},
+{
+"off": -4376,
+"type": "event",
+"name": "tengu_claudemd__initial_load",
+"meta": {
+"file_count": 0,
+"total_content_length": 0,
+"instructions_content_length": 0,
+"max_file_content_length": 0,
+"user_count": 0,
+"project_count": 0,
+"local_count": 0,
+"managed_count": 0,
+"automem_count": 0,
+"agents_md_count": 0,
+"duration_ms": 108
+},
+"stage": "startup"
+},
+{
+"off": -4376,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "context_claude_md_load"
+},
+"stage": "startup"
+},
+{
+"off": -4374,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "native_check_install"
+},
+"stage": "startup"
+},
+{
+"off": -4373,
+"type": "event",
+"name": "tengu_concurrent_sessions",
+"meta": {
+"num_sessions": 1
+},
+"stage": "startup"
+},
+{
+"off": -4360,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_themes"
+},
+"stage": "startup"
+},
+{
+"off": -4360,
+"type": "event",
+"name": "tengu_plugins_loaded",
+"meta": {
+"enabled_count": 5,
+"disabled_count": 0,
+"inline_count": 0,
+"synced_count": 0,
+"marketplace_count": 5,
+"error_count": 0,
+"skill_count": 3,
+"agent_count": 0,
+"hook_count": 0,
+"mcp_count": 0,
+"lsp_count": 1,
+"theme_count": 0,
+"has_custom_plugin_cache_dir": false
+},
+"stage": "startup"
+},
+{
+"off": -4353,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_monitors"
+},
+"stage": "startup"
+},
+{
+"off": -4353,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_arm_monitor"
+},
+"stage": "startup"
+},
+{
+"off": -4350,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_workflows"
+},
+"stage": "startup"
+},
+{
+"off": -4350,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "cmd_load"
+},
+"stage": "startup"
+},
+{
+"off": -4329,
+"type": "event",
+"name": "tengu_ripgrep_availability",
+"meta": {
+"working": 1,
+"using_system": 0
+},
+"stage": "startup"
+},
+{
+"off": -4329,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 21,
+"managedFilesFound": 0,
+"userFilesFound": 0,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "routines"
+},
+"stage": "startup"
+},
+{
+"off": -4329,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 21,
+"managedFilesFound": 0,
+"userFilesFound": 0,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "workflows"
+},
+"stage": "startup"
+},
+{
+"off": -4329,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 21,
+"managedFilesFound": 0,
+"userFilesFound": 0,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "output-styles"
+},
+"stage": "startup"
+},
+{
+"off": -4326,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"found": 0,
+"feature_name": "workflow_discover"
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_kind": "workflow",
+"skill_budget": 30000,
+"skill_content_chars": 24499,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "plugin",
+"skill_budget": 30000,
+"skill_content_chars": 1685,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false,
+"plugin_id_hash": "73d5be783a1a15ad",
+"plugin_scope": "official",
+"plugin_name_redacted": "commit-commands",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "plugin",
+"skill_budget": 30000,
+"skill_content_chars": 604,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": true,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false,
+"plugin_id_hash": "73d5be783a1a15ad",
+"plugin_scope": "official",
+"plugin_name_redacted": "commit-commands",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "plugin",
+"skill_budget": 30000,
+"skill_content_chars": 511,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": true,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false,
+"plugin_id_hash": "73d5be783a1a15ad",
+"plugin_scope": "official",
+"plugin_name_redacted": "commit-commands",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_name_hash": "06f26e34545c5f8e",
+"skill_source": "plugin",
+"skill_loaded_from": "plugin",
+"skill_budget": 30000,
+"skill_content_chars": 10536,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false,
+"plugin_id_hash": "330879dd79d1d28c",
+"plugin_scope": "official",
+"plugin_name_redacted": "claude-code-setup",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4319,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "bundled",
+"skill_loaded_from": "bundled",
+"skill_budget": 30000,
+"skill_content_chars": 0,
+"model_invocable": false,
+"is_conditional": false,
+"has_name": false,
+"has_description": false,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 202,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 6573,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": true,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 12872,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 10433,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 17570,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 7512,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": true,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 20622,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": true,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 32806,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": false,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_skill_loaded",
+"meta": {
+"skill_source": "userSettings",
+"skill_loaded_from": "syncedSkills",
+"skill_budget": 30000,
+"skill_content_chars": 7503,
+"model_invocable": true,
+"is_conditional": false,
+"has_name": true,
+"has_description": true,
+"has_model": false,
+"has_allowed_tools": false,
+"has_disallowed_tools": false,
+"has_argument_hint": false,
+"has_arguments": false,
+"has_disable_model_invocation": false,
+"has_user_invocable": false,
+"has_effort": false,
+"has_shell": false,
+"has_version": false,
+"has_when_to_use": false,
+"has_paths": false,
+"has_hooks": false,
+"has_context": false,
+"has_agent": false,
+"has_background": false,
+"has_fallback": false,
+"has_created_by": false,
+"has_improved_by": false,
+"has_mcp_servers": false,
+"has_lsp_servers": false,
+"has_agents": false,
+"has_output_styles": false,
+"has_themes": false,
+"has_workflows": false,
+"has_channels": false,
+"has_monitors": false,
+"has_settings": false,
+"has_user_config": false,
+"has_default_enabled": false,
+"has_experimental": false,
+"has_dependencies": false,
+"has_metadata": false,
+"has_display_name": false,
+"has_author": false,
+"has_homepage": false,
+"has_repository": false,
+"has_license": true,
+"has_keywords": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_plugin_enabled_for_session",
+"meta": {
+"plugin_id_hash": "330879dd79d1d28c",
+"plugin_scope": "official",
+"plugin_name_redacted": "claude-code-setup",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true,
+"enabled_via": "user-install",
+"skill_path_count": 1,
+"command_path_count": 0,
+"agent_path_count": 0,
+"skill_name_hash_count": 1,
+"skill_name_hashes": "06f26e34545c5f8e",
+"has_mcp": false,
+"host_owned_mcp": false,
+"has_lsp": false,
+"has_hooks": false,
+"has_settings": false,
+"sessions_since_last_use": 412,
+"days_since_last_use": 49,
+"safe_mode": false,
+"version": "1.0.0"
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_plugin_enabled_for_session",
+"meta": {
+"plugin_id_hash": "5de2da3204573e62",
+"plugin_scope": "official",
+"plugin_name_redacted": "rust-analyzer-lsp",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true,
+"enabled_via": "user-install",
+"skill_path_count": 0,
+"command_path_count": 0,
+"agent_path_count": 0,
+"skill_name_hash_count": 0,
+"has_mcp": false,
+"host_owned_mcp": false,
+"has_lsp": true,
+"has_hooks": false,
+"has_settings": false,
+"sessions_since_last_use": 411,
+"days_since_last_use": 49,
+"safe_mode": false,
+"version": "1.0.0"
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_plugin_enabled_for_session",
+"meta": {
+"plugin_id_hash": "73d5be783a1a15ad",
+"plugin_scope": "official",
+"plugin_name_redacted": "commit-commands",
+"marketplace_name_redacted": "claude-plugins-official",
+"is_official_plugin": true,
+"enabled_via": "user-install",
+"skill_path_count": 0,
+"command_path_count": 1,
+"agent_path_count": 0,
+"skill_name_hash_count": 0,
+"has_mcp": false,
+"host_owned_mcp": false,
+"has_lsp": false,
+"has_hooks": false,
+"has_settings": false,
+"sessions_since_last_use": 1,
+"days_since_last_use": 0,
+"safe_mode": false,
+"plugin_version_sha": "2a8ad9f74633d10e3d9bb0660a03bfc6e50584b1"
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_plugin_enabled_for_session",
+"meta": {
+"plugin_id_hash": "da63145d0acbb62d",
+"plugin_scope": "default-bundle",
+"plugin_name_redacted": "cc-plugin-agents-md",
+"marketplace_name_redacted": "builtin",
+"is_official_plugin": true,
+"plugin_name_previous": "agents-md",
+"plugin_id_hash_previous": "0426e5d92e22a851",
+"enabled_via": "default-enable",
+"skill_path_count": 0,
+"command_path_count": 0,
+"agent_path_count": 0,
+"has_mcp": false,
+"host_owned_mcp": false,
+"has_lsp": false,
+"has_hooks": false,
+"has_settings": false,
+"sessions_since_last_use": 112,
+"days_since_last_use": 11,
+"safe_mode": false
+},
+"stage": "startup"
+},
+{
+"off": -4318,
+"type": "event",
+"name": "tengu_plugin_enabled_for_session",
+"meta": {
+"plugin_id_hash": "0452636910a73fd4",
+"plugin_scope": "default-bundle",
+"plugin_name_redacted": "cc-plugin-telemetry",
+"marketplace_name_redacted": "builtin",
+"is_official_plugin": true,
+"plugin_name_previous": "telemetry",
+"plugin_id_hash_previous": "38eab4bbc65110ea",
+"enabled_via": "default-enable",
+"skill_path_count": 0,
+"command_path_count": 0,
+"agent_path_count": 0,
+"has_mcp": false,
+"host_owned_mcp": false,
+"has_lsp": false,
+"has_hooks": false,
+"has_settings": false,
+"sessions_since_last_use": 63,
+"days_since_last_use": 7,
+"safe_mode": false
+},
+"stage": "startup"
+},
+{
+"off": -4306,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_marketplace_bg_install"
+},
+"stage": "startup"
+},
+{
+"off": -4304,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"found": true,
+"feature_name": "ide_detect"
+},
+"stage": "startup"
+},
+{
+"off": -4297,
+"type": "event",
+"name": "tengu_file_suggestions_ripgrep",
+"meta": {
+"file_count": 15,
+"duration_ms": 52
+},
+"stage": "startup"
+},
+{
+"off": -4269,
+"type": "event",
+"name": "tengu_mcp_ide_server_connection_succeeded",
+"meta": {
+"connectionDurationMs": 22,
+"serverVersion": "{{version}}"
+},
+"stage": "startup"
+},
+{
+"off": -4268,
+"type": "event",
+"name": "tengu_mcp_server_connection_succeeded",
+"meta": {
+"connectionDurationMs": 22,
+"instructionsLength": 0,
+"instructionsTruncated": false,
+"transportType": "ws-ide",
+"negotiatedLegacySse": false,
+"sdkGeneration": "v2",
+"negotiationMode": "legacy",
+"scope": "dynamic",
+"protocolEra": "legacy",
+"negotiatedProtocolVersion": "2025-11-25",
+"bareElicitationRetry": false,
+"listingPriorBurned": false,
+"listenSuppressed": false,
+"negotiationDenylisted": false,
+"isPlugin": false,
+"totalServers": 1,
+"stdioCount": 0,
+"sseCount": 0,
+"httpCount": 0,
+"sseIdeCount": 0,
+"wsIdeCount": 1,
+"mcpServerBaseUrl": "79a89207c79a",
+"mcpServerKeyHash": "7deb7a951ec3"
+},
+"stage": "startup"
+},
+{
+"off": -4268,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "mcp_connect"
+},
+"stage": "startup"
+},
+{
+"off": -4264,
+"type": "event",
+"name": "tengu_mcp_tools_listed",
+"meta": {
+"transportType": "ws-ide",
+"listDurationMs": 4,
+"toolCount": 2,
+"alwaysLoadCount": 0,
+"descriptionTotalLength": 825,
+"descriptionMaxLength": 363,
+"descriptionMeanLength": 69,
+"descriptionOverLimitCount": 0,
+"discoverySource": "live",
+"mcpServerBaseUrl": "79a89207c79a",
+"mcpServerKeyHash": "7deb7a951ec3"
+},
+"stage": "startup"
+},
+{
+"off": -4264,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "mcp_list_tools"
+},
+"stage": "startup"
+},
+{
+"off": -4212,
+"type": "event",
+"name": "tengu_dir_search",
+"meta": {
+"durationMs": 196,
+"managedFilesFound": 0,
+"userFilesFound": 66,
+"projectFilesFound": 0,
+"projectDirsSearched": 0,
+"subdir": "skills"
+},
+"stage": "startup"
+},
+{
+"off": -4133,
+"type": "event",
+"name": "tengu_startup_telemetry",
+"meta": {
+"is_git": false,
+"worktree_count": 0,
+"model_definition_source": "compiled_catalog",
+"model_setting_source": "served_default",
+"warm_spare_claimed": false,
+"gh_auth_status": "authenticated",
+"sandbox_enabled": false,
+"are_unsandboxed_commands_allowed": true,
+"is_auto_bash_allowed_if_sandbox_enabled": true,
+"auto_updater_disabled": false,
+"prefers_reduced_motion": false,
+"precompute_compaction_setting_enabled": true,
+"precompute_compaction_setting_source": "default",
+"theme": "auto",
+"set_env_var_count": 1,
+"set_env_vars": "CLAUDE_CODE_SSE_PORT",
+"nondefault_setting_count": 3,
+"nondefault_settings": "agentPushNotifEnabled,autoCompactEnabled,theme",
+"set_user_settings_count": 2,
+"set_user_settings": "effortLevel,switchModelsOnFlag",
+"auto_mode_allow_rule_count": 0,
+"auto_mode_soft_deny_rule_count": 0,
+"auto_mode_hard_deny_rule_count": 0,
+"auto_mode_environment_rule_count": 24,
+"auto_mode_rule_word_count": 266
+},
+"stage": "startup"
+},
+{
+"off": -4021,
+"type": "event",
+"name": "tengu_mcp_tools_commands_loaded",
+"meta": {
+"tools_count": 0,
+"commands_count": 0,
+"commands_metadata_length": 0
+},
+"stage": "startup"
+},
+{
+"off": -4021,
+"type": "event",
+"name": "tengu_fork_subagent_enabled",
+"meta": {
+"source": "default"
+},
+"stage": "startup"
+},
+{
+"off": -4021,
+"type": "event",
+"name": "tengu_context_size",
+"meta": {
+"git_status_size": 0,
+"claude_md_size": 0,
+"has_user_email": true,
+"total_context_size": 0,
+"project_file_count_rounded": 20,
+"mcp_tools_count": 51,
+"mcp_servers_count": 2,
+"mcp_tools_tokens": 7915,
+"non_mcp_tools_count": 34,
+"non_mcp_tools_tokens": 13717
+},
+"stage": "startup"
+},
+{
+"off": -3985,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "settings_watcher_start"
+},
+"stage": "startup"
+},
+{
+"off": -3958,
+"type": "event",
+"name": "tengu_terminal_probe",
+"meta": {
+"xtversion": "xterm.js(6.1.0-beta.304)",
+"term_program_version": "1.139.1",
+"is_ssh": false,
+"multiplexer": "none",
+"term_rows": 30,
+"term_cols": 203,
+"dec2026_allowlist": true,
+"renderer_entry_path": "settings_off",
+"mouse_mode": "full",
+"linux_clipboard_tool": "not_linux",
+"vte_terminal": false
+},
+"stage": "renderer"
+},
+{
+"off": -3789,
+"type": "event",
+"name": "tengu_ext_installed",
+"meta": {
+"ide_type": "vscode",
+"installed_version": "{{version}}"
+},
+"stage": "renderer"
+},
+{
+"off": -3789,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "ide_extension_install"
+},
+"stage": "renderer"
+},
+{
+"off": -3787,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"found": true,
+"feature_name": "ide_detect"
+},
+"stage": "renderer"
+},
+{
+"off": -3470,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_workflows"
+},
+"stage": "renderer"
+},
+{
+"off": -3469,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "cmd_load"
+},
+"stage": "renderer"
+},
+{
+"off": -3461,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"found": 0,
+"feature_name": "workflow_discover"
+},
+"stage": "renderer"
+},
+{
+"off": -3103,
+"type": "event",
+"name": "tengu_claudeai_mcp_eligibility",
+"meta": {
+"state": "eligible"
+},
+"stage": "renderer"
+},
+{
+"off": -3103,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "mcp_claudeai_fetch_configs"
+},
+"stage": "renderer"
+},
+{
+"off": -3022,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "api_bootstrap_fetch"
+},
+"stage": "renderer"
+},
+{
+"off": -3022,
+"type": "event",
+"name": "tengu_client_data_cache_key",
+"meta": {
+"slot_hit": true,
+"slot_changed": false,
+"legacy_fallback": false,
+"slot_stale": false
+},
+"stage": "renderer"
+},
+{
+"off": -2998,
+"type": "event",
+"name": "tengu_claudeai_mcp_eligibility",
+"meta": {
+"state": "eligible"
+},
+"stage": "renderer"
+},
+{
+"off": -2997,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "mcp_claudeai_fetch_configs"
+},
+"stage": "renderer"
+},
+{
+"off": -2997,
+"type": "event",
+"name": "tengu_mcp_servers",
+"meta": {
+"enterprise": 0,
+"global": 0,
+"project": 0,
+"user": 0,
+"plugin": 1,
+"agent": 0,
+"claudeai": 8
+},
+"stage": "renderer"
+},
+{
+"off": -1620,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "mcp_registry_fetch"
+},
+"stage": "renderer"
+},
+{
+"off": -1620,
+"type": "event",
+"name": "tengu_mcp_registry_fetch",
+"meta": {
+"source": "legacy",
+"success": true,
+"url_count": 294,
+"duration_ms": 2806
+},
+"stage": "renderer"
+}
+],
+"prompt": [
+{
+"off": -50,
+"type": "event",
+"name": "tengu_render_glyph_cardinality",
+"meta": {
+"stylepool_styles": 10,
+"stylepool_overflowed": false,
+"atlas_glyph_keys": 177,
+"atlas_keys_saturated": false,
+"term_program": "vscode",
+"is_xtermjs": true,
+"session_age_bucket": "lt_5m",
+"proactive_reset_count": 0,
+"proactive_reset_last_reason": "none"
+},
+"stage": "renderer"
+},
+{
+"off": -50,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "render_stylepool"
+},
+"stage": "renderer"
+},
+{
+"off": -50,
+"type": "event",
+"name": "tengu_paste_text",
+"meta": {
+"pastedTextCount": 0,
+"pastedTextBytes": 0
+},
+"stage": "renderer"
+},
+{
+"off": -50,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "prompt_submit"
+},
+"stage": "renderer"
+},
+{
+"off": -39,
+"type": "event",
+"name": "tengu_attachment_compute_duration",
+"meta": {
+"label": "at_mentioned_files",
+"duration_ms": 0,
+"attachment_size_bytes": 0,
+"attachment_count": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_deferred_tools_pool_change",
+"meta": {
+"addedCount": 95,
+"readdedCount": 0,
+"unlistedCount": 95,
+"resurfacedCount": 0,
+"removedCount": 0,
+"retractionHoldEnabled": false,
+"returnedAfterHoldCount": 0,
+"wireHiddenCount": 0,
+"pendingChanged": false,
+"pendingCount": 0,
+"pendingUnmentionedCount": 0,
+"saidNothing": false,
+"lastPendingCount": 0,
+"needsAuthChanged": false,
+"needsAuthCount": 0,
+"lastNeedsAuthCount": 0,
+"failedChanged": false,
+"failedCount": 0,
+"lastFailedCount": 0,
+"retractedCount": 0,
+"restoredCount": 0,
+"priorAnnouncedCount": 0,
+"toolSearchAbsent": false,
+"messagesLength": 0,
+"attachmentCount": 0,
+"dtdCount": 0,
+"callSite": "attachments_main",
+"querySource": "repl_main_thread",
+"attachmentTypesSeen": ""
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_mcp_instructions_pool_change",
+"meta": {
+"addedCount": 1,
+"removedCount": 0,
+"departedWhileConnectingCount": 0,
+"retractionHoldEnabled": false,
+"priorAnnouncedCount": 0,
+"clientSideCount": 1,
+"messagesLength": 0,
+"attachmentCount": 0,
+"midCount": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_attachment_compute_duration",
+"meta": {
+"label": "sandbox_instructions",
+"duration_ms": 10,
+"attachment_size_bytes": 0,
+"attachment_count": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "output_style_load"
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_attachment_compute_duration",
+"meta": {
+"label": "ultrathink_effort",
+"duration_ms": 9,
+"attachment_size_bytes": 0,
+"attachment_count": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_attachment_compute_duration",
+"meta": {
+"label": "auto_mode_exit",
+"duration_ms": 2,
+"attachment_size_bytes": 0,
+"attachment_count": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_attachment_compute_duration",
+"meta": {
+"label": "todo_reminders",
+"duration_ms": 2,
+"attachment_size_bytes": 0,
+"attachment_count": 0
+}
+},
+{
+"off": -37,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_load_output_styles"
+}
+},
+{
+"off": -36,
+"type": "event",
+"name": "tengu_attachments",
+"meta": {
+"attachment_types": [
+"environment",
+"model",
+"deferred_tools_delta",
+"agent_listing_delta",
+"mcp_instructions_delta",
+"skill_listing",
+"auto_mode",
+"total_tokens_reminder"
+],
+"attachment_token_estimates": [
+"103",
+"62",
+"1542",
+"714",
+"1576",
+"3690",
+"31",
+"23"
+],
+"skill_listing_is_full": true,
+"query_source": "repl_main_thread"
+}
+},
+{
+"off": -30,
+"type": "event",
+"name": "tengu_file_history_snapshot_success",
+"meta": {
+"trackedFilesCount": 0,
+"snapshotCount": 1
+}
+},
+{
+"off": -29,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "memory_load_prompt"
+}
+},
+{
+"off": -23,
+"type": "event",
+"name": "tengu_context_announcement",
+"meta": {
+"announcement_type": "session_context",
+"token_estimate": 82,
+"updates_copy": false,
+"query_source": "repl_main_thread"
+}
+},
+{
+"off": -23,
+"type": "event",
+"name": "tengu_context_announcement",
+"meta": {
+"announcement_type": "date",
+"token_estimate": 9,
+"updates_copy": false,
+"query_source": "repl_main_thread"
+}
+},
+{
+"off": -21,
+"type": "event",
+"name": "tengu_reminder_fold_recorded",
+"meta": {
+"recorded": true,
+"fold": false,
+"carriedForward": false,
+"inherited": false,
+"cached": false,
+"cachedSource": "payload"
+}
+},
+{
+"off": -21,
+"type": "event",
+"name": "tengu_wire_tool_input_echo_recorded",
+"meta": {
+"recorded": true,
+"echo": true,
+"carriedForward": false,
+"inherited": false,
+"cached": true,
+"cachedSource": "payload"
+}
+},
+{
+"off": -21,
+"type": "event",
+"name": "tengu_context_rendering_recorded",
+"meta": {
+"rendering": "announced",
+"carriedForward": false
+}
+},
+{
+"off": -18,
+"type": "event",
+"name": "tengu_reminder_fold_replayed",
+"meta": {
+"fold": false,
+"cached": false,
+"matched": true,
+"cachedSource": "payload"
+}
+},
+{
+"off": -16,
+"type": "event",
+"name": "tengu_artifact_five_class_asks",
+"meta": {
+"on": true
+}
+},
+{
+"off": -16,
+"type": "event",
+"name": "tengu_artifact_inherited_type_grant",
+"meta": {
+"on": false
+}
+},
+{
+"off": -6,
+"type": "event",
+"name": "tengu_tool_search_mode_decision",
+"meta": {
+"enabled": true,
+"mode": "tst",
+"reason": "tst_enabled",
+"checkedModel": "{{model}}",
+"mcpToolCount": 75,
+"mcpNonBlocking": false,
+"userType": "external"
+}
+},
+{
+"off": -6,
+"type": "event",
+"name": "tengu_wire_tool_input_echo_replayed",
+"meta": {
+"echo": true,
+"cached": true,
+"matched": true,
+"cachedSource": "payload"
+}
+},
+{
+"off": -6,
+"type": "event",
+"name": "tengu_artifact_text_variant",
+"meta": {
+"variant": "v0"
+}
+},
+{
+"off": -1,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "api_keep_thinking_on_upgrade"
+}
+},
+{
+"off": 0,
+"type": "event",
+"name": "tengu_memdir_loaded",
+"meta": {
+"memory_type": "auto",
+"prompt_variant": "base",
+"memory_access_mode": "files",
+"total_file_count": 0,
+"total_subdir_count": 0
+}
+},
+{
+"off": 17,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "history_save"
+}
+}
+],
+"prompt_next": [
+{
+"off": -17,
+"type": "event",
+"name": "tengu_render_glyph_cardinality",
+"meta": {
+"stylepool_styles": 37,
+"stylepool_overflowed": false,
+"atlas_glyph_keys": 575,
+"atlas_keys_saturated": false,
+"term_program": "vscode",
+"is_xtermjs": true,
+"session_age_bucket": "5m_30m",
+"proactive_reset_count": 7,
+"proactive_reset_last_reason": "focus"
+}
+},
+{
+"off": -17,
+"type": "event",
+"name": "tengu_paste_text",
+"meta": {
+"pastedTextCount": 0,
+"pastedTextBytes": 0
+}
+},
+{
+"off": -17,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "prompt_submit"
+}
+},
+{
+"off": -13,
+"type": "event",
+"name": "tengu_attachments",
+"meta": {
+"attachment_types": [
+"total_tokens_reminder"
+],
+"attachment_token_estimates": [
+"23"
+],
+"query_source": "repl_main_thread"
+}
+},
+{
+"off": -11,
+"type": "event",
+"name": "tengu_file_history_snapshot_success",
+"meta": {
+"trackedFilesCount": 0,
+"snapshotCount": 20
+}
+},
+{
+"off": 0,
+"type": "event",
+"name": "tengu_tool_search_mode_decision",
+"meta": {
+"enabled": true,
+"mode": "tst",
+"reason": "tst_enabled",
+"checkedModel": "{{model}}",
+"mcpToolCount": 75,
+"mcpNonBlocking": false,
+"userType": "external"
+}
+},
+{
+"off": 44,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "history_save"
+}
+}
+],
+"first_prompt": [
+{
+"off": -30,
+"type": "event",
+"name": "tengu_policy_limits_cache_state_at_first_prompt",
+"meta": {
+"eligible": true,
+"eligible_if_base_url_gate_removed": true,
+"has_cache": true,
+"cache_age_ms": 6746,
+"would_fail_closed": false,
+"live_verdict": true,
+"token_source": "claude.ai",
+"has_custom_base_url": false,
+"via_unix_socket": false,
+"has_unix_socket": false,
+"has_auth_token": false,
+"has_api_key_helper": false,
+"api_key_prefix": "none",
+"ms_since_startup": 8143,
+"load_state": "succeeded",
+"outcome_reason": "not_modified",
+"startup_await_result": "not_awaited",
+"error_reporting_gate": "allowed_taints_clean"
+}
+}
+],
+"turn": [
+{
+"off": 4,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "shoji_engine"
+}
+}
+],
+"first_turn": [
+{
+"off": -1,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "api_midconv_cache_proxy"
+}
+}
+],
+"background": [
+{
+"off": 9698,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"duration_ms": 0,
+"first_in_process": false,
+"installation_type": "native",
+"feature_name": "update_detection"
+}
+},
+{
+"off": 9700,
+"type": "event",
+"name": "tengu_native_auto_updater_start",
+"meta": {}
+},
+{
+"off": 10895,
+"type": "event",
+"name": "tengu_version_check_success",
+"meta": {
+"latency_ms": 1195,
+"attempt": 1
+}
+},
+{
+"off": 10895,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "update_check"
+}
+},
+{
+"off": 10905,
+"type": "event",
+"name": "tengu_native_update_complete",
+"meta": {
+"latency_ms": 1205,
+"was_new_install": false,
+"was_force_reinstall": false,
+"was_already_running": true
+}
+},
+{
+"off": 10905,
+"type": "event",
+"name": "tengu_native_auto_updater_up_to_date",
+"meta": {
+"latency_ms": 1205
+}
+},
+{
+"off": 10915,
+"type": "event",
+"name": "tengu_native_version_cleanup",
+"meta": {
+"total_count": 3,
+"deleted_count": 0,
+"protected_count": 1,
+"retained_count": 2,
+"lock_failed_count": 0,
+"error_count": 0
+}
+},
+{
+"off": 10916,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "native_cleanup_versions"
+}
+},
+{
+"off": 318475,
+"type": "event",
+"name": "tengu_native_auto_updater_start",
+"meta": {}
+},
+{
+"off": 319670,
+"type": "event",
+"name": "tengu_version_check_success",
+"meta": {
+"latency_ms": 1195,
+"attempt": 1
+}
+},
+{
+"off": 319670,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "update_check"
+}
+},
+{
+"off": 319680,
+"type": "event",
+"name": "tengu_native_update_complete",
+"meta": {
+"latency_ms": 1205,
+"was_new_install": false,
+"was_force_reinstall": false,
+"was_already_running": true
+}
+},
+{
+"off": 319680,
+"type": "event",
+"name": "tengu_native_auto_updater_up_to_date",
+"meta": {
+"latency_ms": 1205
+}
+},
+{
+"off": 319690,
+"type": "event",
+"name": "tengu_native_version_cleanup",
+"meta": {
+"total_count": 3,
+"deleted_count": 0,
+"protected_count": 1,
+"retained_count": 2,
+"lock_failed_count": 0,
+"error_count": 0
+}
+},
+{
+"off": 319691,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "native_cleanup_versions"
+}
+},
+{
+"off": 416755,
+"type": "event",
+"name": "tengu_plugin_remote_fetch",
+"meta": {
+"source": "marketplace_gcs",
+"host": "downloads.claude.ai",
+"is_official": true,
+"outcome": "noop",
+"duration_ms": 621,
+"sha": "2a8ad9f74633d10e3d9bb0660a03bfc6e50584b1"
+}
+},
+{
+"off": 416755,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "plugin_official_marketplace_fetch"
+}
+},
+{
+"off": 416792,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"already_up_to_date": true,
+"version_unknown": false,
+"is_directory": false,
+"pin_changed": false,
+"no_clone_short_circuit": false,
+"not_checked": false,
+"feature_name": "plugin_update_op"
+}
+},
+{
+"off": 416792,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"already_up_to_date": true,
+"version_unknown": false,
+"is_directory": false,
+"pin_changed": false,
+"no_clone_short_circuit": false,
+"not_checked": false,
+"feature_name": "plugin_update_op"
+}
+},
+{
+"off": 416792,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"already_up_to_date": true,
+"version_unknown": false,
+"is_directory": false,
+"pin_changed": false,
+"no_clone_short_circuit": false,
+"not_checked": false,
+"feature_name": "plugin_update_op"
+}
+},
+{
+"off": 416792,
+"type": "event",
+"name": "tengu_plugin_autoupdate_pass",
+"meta": {
+"outcome": "ok",
+"marketplaces_refreshed": 1,
+"marketplace_refresh_failed": 0,
+"marketplace_refresh_policy_skipped": 0,
+"plugins_updated": 0,
+"plugin_update_failed": 0,
+"plugins_blocked_by_pin": 0,
+"plugins_helper_deferred": 0,
+"plugins_policy_blocked": 0,
+"command_plugins_refreshed": 0,
+"command_plugin_refresh_failed": 0,
+"directory_updated": 0,
+"directory_update_failed": 0,
+"directory_update_stuck": 0,
+"directory_identity_changed": 0,
+"duration_ms": 660
+}
+},
+{
+"off": 1212912,
+"type": "event",
+"name": "tengu_retention_sweep",
+"meta": {
+"phase": "start"
+}
+},
+{
+"off": 1213073,
+"type": "event",
+"name": "tengu_feature_ok",
+"meta": {
+"feature_name": "job_sweep_drafts"
+}
+},
+{
+"off": 1213094,
+"type": "event",
+"name": "tengu_retention_sweep",
+"meta": {
+"phase": "complete",
+"skipped": false,
+"transcriptsDeleted": 2,
+"transcriptsExemptedDesktop": 0,
+"sessionFilesDeleted": 7,
+"artifactsDeleted": 8,
+"filesRetainedFresh": 622,
+"filesPastCutoff": 0,
+"errors": 0,
+"historyEntriesPruned": 0,
+"periodDays": 30,
+"usedDefault": true
+}
+}
+]
+}

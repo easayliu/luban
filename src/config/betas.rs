@@ -127,6 +127,13 @@ pub const CC_BETA_MESSAGE_THREADS: &str = "message-threads-2026-08-12";
 /// [`crate::proxy::is_official_thread_continuation`]。
 pub const CC_BETA_MID_CONVERSATION_TOOL_CHANGES: &str = "mid-conversation-tool-changes-2026-07-01";
 
+/// `inline-tools-2026-09-15`：2.1.293 新增，opus / sonnet / fable / haiku-5-5 主线程、子代理、标题生成与
+/// helper 都发（`cap/auto-2.1.293-20261008-full/00419` 等），紧跟
+/// [`CC_BETA_MID_CONVERSATION_TOOL_CHANGES`]。配套的变化是 MCP 工具不再进 `tools`，改写成首轮
+/// 那条 `role: system` 消息里的 `tool_addition` 块（`00419` 的 `messages[1]`）。haiku-4.5 主线程与
+/// 额度探测不发。
+pub const CC_BETA_INLINE_TOOLS: &str = "inline-tools-2026-09-15";
+
 /// `messages` 中途允许 `role: system` 消息。2.1.285 的 opus / sonnet / fable 主线程带它，把
 /// `<total_tokens>` 提醒这类附件写成独立的 system 消息（`cap/auto-2.1.285-20260930/00036`）；
 /// haiku 不带，同样的附件落成 user 消息里的 `<system-reminder>`（`00411`、`00412`）。

@@ -15,7 +15,11 @@ pub const TELEMETRY_SESSION_BETA_PREFIXES: &[&str] = &[
     "thinking-token-count-",
     "context-management-",
     "prompt-caching-scope-",
-    "mid-conversation-system-",
+    // 带日期那一项本身（`mid-conversation-system-2026-04-07`）。不能只写到 `-`：2.1.285 起出站头里
+    // 还有 `mid-conversation-system-clear-at-2026-08-21`，官方会话级那份从不带它（`cap/auto-2.1.291-
+    // 20261006-full`、`cap/auto-2.1.293-20261008-full` 的 opus / sonnet / haiku-5-5 会话都止于
+    // `mid-conversation-system-2026-04-07`），按 `-` 前缀会把它一并筛进来。
+    "mid-conversation-system-2",
 ];
 
 /// event_logging 批次的攒批时长：真实客户端每 ~30s 把攒下的事件一次发出

@@ -276,7 +276,8 @@ impl EventBuilder<'_> {
     pub(super) fn emit_tool_result(&mut self, step: &ToolStep, i: i64, tu: &ToolUse) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
-        let TurnFacts { is_main, ref chain_id, shell_snapshot_first, v285, v291, .. } = *env.f;
+        let TurnFacts { is_main, ref chain_id, shell_snapshot_first, v285, v291, v293, .. } =
+            *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
         let ToolStep { is_sub, prev_end_dt, ref prev_req, ref prev_msg, prev_depth, n, .. } = *step;
         // 工具执行：按调用数把上一条结束到这条发出之间的时间均分。
@@ -314,6 +315,9 @@ impl EventBuilder<'_> {
                 false,
                 shape.permission_mode,
             );
+            if v293 {
+                bash_meta_v293(&mut bash, &tu.result_head);
+            }
             if bash_failed {
                 // 非零退出（`cap/auto-2.1.285-20260930` 07:58:12.123）：同一份画像报
                 // `command_failed`，退出码取结果开头的 `Exit code N`，没有 `was_backgrounded`；
@@ -323,7 +327,12 @@ impl EventBuilder<'_> {
                     o.insert("exit_code".into(), json!(exit_code_of(&tu.result_head)));
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_failed", bash);
-                let sad = json!({ "feature_name": "tool_bash", "error_code": "tool_shell_error" });
+                let mut sad =
+                    json!({ "feature_name": "tool_bash", "error_code": "tool_shell_error" });
+                // 2.1.293 末尾多一项实验标记（`tengu_started` 也多了同一项）。
+                if v293 {
+                    sad["tengu_quizzical_giraffe"] = json!("unset");
+                }
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
@@ -443,8 +452,12 @@ impl EventBuilder<'_> {
             err["error_message_hash"] = json!(&sha256_hex(tu.result_head.as_bytes())[..12]);
             // 栈的摘要与顶帧随每个版本的打包产物变：2.1.285 那份取自 `cap/auto-2.1.285-20260930`，
             // 2.1.291 取自 `cap/auto-2.1.291-20261006-full`（B4 那条失败的 Bash），后者还多了异常的
-            // 构造器名（压缩后的类名）。
-            if v291 {
+            // 构造器名（压缩后的类名）；2.1.293（`cap/auto-2.1.293-20261008-full` 的两条失败 Bash）
+            // 又没有构造器名了。
+            if v293 {
+                err["error_stack_hash"] = json!("2e671ed03fc0");
+                err["error_top_frame"] = json!("chunk-nwqfvmza.js:3493:5989");
+            } else if v291 {
                 err["error_constructor"] = json!("Yj");
                 err["error_stack_hash"] = json!("bfd227038d85");
                 err["error_top_frame"] = json!("chunk-v1gtm86q.js:3481:5962");

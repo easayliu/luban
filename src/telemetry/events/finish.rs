@@ -317,12 +317,15 @@ impl EventBuilder<'_> {
                 );
             }
             // 首条主线程请求收尾时记一次这个会话发出去的请求形态（`cap/2.1.285/00040`
-            // 06:34:21.881，2.1.280 没有）：system 角色消息、工具变更头、保留提醒这三项跟着对应的
-            // beta 走。
-            // `-p` 的只在带 `mid-conversation-system` 的模型上记（fable / opus 那两条有、haiku 那条没有）。
+            // 06:34:21.881，2.1.280 没有）：system 角色消息、工具变更头、保留提醒、inline 工具这几项
+            // 跟着对应的 beta 走（`inlineTools` 2.1.293 起随 `inline-tools` 为 true，此前恒 false）。
+            // `-p` 的只在带 `mid-conversation-system` 的模型上记（fable / opus 那两条有、haiku 那条没有）；
+            // 2.1.291 起交互式也是——haiku-4.5 的会话一条都没有（`cap/auto-2.1.291-20261006-full` B3 / E4，
+            // `cap/auto-2.1.293-20261008-full` 的 haiku-4-5 会话），带它的 haiku-5-5 有。
+            let v291 = version_at_least(&env.f.version, "2.1.291");
             if first_main
                 && v285
-                && (!shape.sdk || betas_full.contains("mid-conversation-system-2"))
+                && (!(shape.sdk || v291) || betas_full.contains("mid-conversation-system-2"))
             {
                 let has = |p: &str| betas_full.split(',').any(|b| b.trim().starts_with(p));
                 self.push(
@@ -331,7 +334,8 @@ impl EventBuilder<'_> {
                     json!({
                         "systemTurns": has("mid-conversation-system-2"),
                         "toolChangeHeader": has("mid-conversation-tool-changes-"),
-                        "inlineTools": false,
+                        "inlineTools": has(config::CC_BETA_INLINE_TOOLS
+                            .trim_end_matches(|c: char| c.is_ascii_digit() || c == '-')),
                         "keptReminders": has("mid-conversation-system-clear-at-"),
                         "overwrote": false
                     }),

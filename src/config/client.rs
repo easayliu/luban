@@ -4,15 +4,15 @@
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（`cap/auto-2.1.291-20261006-full`）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（`cap/auto-2.1.293-20261008-full`）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
 ///
 /// 动这里必须同时动 [`CC_VERSION_BASE`]（billing header 里的 `cc_version`）、
 /// [`KEEPALIVE_USER_AGENT`](super::KEEPALIVE_USER_AGENT) 与 [`CC_BUILD_TIMES`]（遥测里的构建时间），还有
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
-/// 同一个客户端不会一边自称 2.1.291、一边报另一个版本的 cc_version、构建时间、上一版的
+/// 同一个客户端不会一边自称 2.1.293、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.291 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.293 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -124,7 +124,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.291";
+pub const CC_VERSION_BASE: &str = "2.1.293";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -137,10 +137,10 @@ pub const CC_VERSION_BASE: &str = "2.1.291";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.291-20261006-full`（四族主线程、子代理、标题生成、额度探测、`-p`，UA
-/// `claude-cli/2.1.291`）。
+/// 依据：`cap/auto-2.1.293-20261008-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
+/// UA `claude-cli/2.1.293`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.291";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.293";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -153,8 +153,13 @@ pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.291";
 /// 按 profile 注入，判据是 [`CcSystemShape::IdentityReporting`](super::CcSystemShape::IdentityReporting)。
 pub const CC_SYSTEM_REPORTING: &str = include_str!("../assets/cc_system_reporting.txt");
 
-/// 模拟模式注入的官方系统提示词**基座**（2.1.277 起，1588 字节；2.1.291 起只剩 opus / sonnet /
-/// fable 三族用它，haiku 换成了 [`CC_SYSTEM_BASE_HAIKU`]）。
+/// 模拟模式注入的官方系统提示词**基座**（2.1.277 起，1588 字节；2.1.291 起 haiku-4.5 换成了
+/// [`CC_SYSTEM_BASE_HAIKU`]，opus / sonnet / fable 与 2.1.293 的 haiku-5-5 用它）。
+///
+/// 2.1.293 只改了首句：`You are an interactive agent that helps users with software engineering
+/// tasks.` → `You are an agent working with the user toward their goals, using your own judgment
+/// along the way.`（`cap/auto-2.1.293-20261008-full/00419`、`00256`、`00546`、`00344` 的 `system[2]`
+/// 逐字节相同）。
 ///
 /// 逐字节取自 `cap/2.1.277/00023`（fable-5-1 直连）的 `system[2]`，同目录 sonnet-5（`00031`）、
 /// haiku-4.5（`00046`）、opus-5（`00357`）的主线程 sha256 全部相同。2.1.258 / 2.1.260 时三族
@@ -168,11 +173,13 @@ pub const CC_SYSTEM_REPORTING: &str = include_str!("../assets/cc_system_reportin
 pub const CC_SYSTEM_BASE: &str = include_str!("../assets/cc_system_base.txt");
 
 /// 2.1.291 haiku 主线程的**基座**（11050 字节）：`cap/auto-2.1.291-20261006-full/00303`（默认模式）
-/// 与 `00553` 的 `system[2]` 逐字节相同，`cap/auto-2.1.291-20261006` 的 `00242` 也是。
+/// 与 `00553` 的 `system[2]` 逐字节相同，`cap/auto-2.1.291-20261006` 的 `00242` 也是。2.1.293 起只给
+/// haiku-4.5 用（haiku-5-5 用 [`CC_SYSTEM_BASE`]），首句同 [`CC_SYSTEM_BASE`] 换了一句
+/// （`cap/auto-2.1.293-20261008-full/00383`）。
 ///
 /// 2.1.291 起 haiku 不再走 opus / sonnet / fable 那套「短基座 + 工具说明挪进第四块」的写法，
 /// 而是回到长基座（`# Doing tasks`、`# Using your tools` 等整节都在这里）配长版工具描述
-/// （[`crate::proxy::cc_tools_core`]：Agent 8451、Bash 11913 字节）——与 2.1.285 的 `-p` 打印模式
+/// （[`crate::proxy::cc_tools_core`]：Agent 8451（2.1.293 多了 `effort` 参数）、Bash 11913 字节）——与 2.1.285 的 `-p` 打印模式
 /// 同一路（`cap/auto-2.1.285-20260930/00441`）。可执行文件按模型挑这一套（`AV(model)` 不成立的
 /// 模型），不是账号开关。逐字照抄，没有随机器变的内容。
 pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("../assets/cc_system_base_haiku.txt");
@@ -184,6 +191,11 @@ pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("../assets/cc_system_base_ha
 /// auto 模式（`00032`）与 sonnet-5-5（`00253`）sha256 全部相同。末尾那行
 /// `<total_tokens>15000000 tokens left</total_tokens>` 与 2.1.277 同一个数。fable 与 haiku 2.1.291
 /// 起各有一份（[`CC_SYSTEM_REST_FABLE`]、[`CC_SYSTEM_REST_HAIKU`]）。
+///
+/// 2.1.293（`cap/auto-2.1.293-20261008-full/00419`、`00256`）只改了 `# Environment` 那行模型列表：
+/// `The most recent Claude models are the Claude 5 family and Haiku 4.5.` 去掉 `and Haiku 4.5`，
+/// `Haiku 4.5: 'claude-haiku-4-5-20251001'` 换成 `Haiku 5.5: 'claude-haiku-5-5'`。fable 与 haiku-4.5
+/// 那两份同一处同样改了。
 ///
 /// 相对 2.1.285 那份：记忆一节末尾去掉了「引用记忆时整句包进 `<cc-memory filenames=…>`」那句，
 /// 其余逐字未变；末尾 `<total_tokens>` 之后多了一段 `WebSearch takes a mode…`（见下）。
@@ -235,6 +247,15 @@ pub const CC_FABLE_5_IDENTITY: &str = "This iteration of Claude is Claude Fable 
 /// 长写法。没有 EndConversation 那段；`WebSearch takes a mode` 那段同样去掉。占位同 [`CC_SYSTEM_REST`]。
 pub const CC_SYSTEM_REST_HAIKU: &str = include_str!("../assets/cc_system_rest_haiku.txt");
 
+/// 2.1.293 haiku-5-5 主线程的第四块模板：`cap/auto-2.1.293-20261008-full/00344`（`--model
+/// claude-haiku-5-5`）与 `00305`（`--model haiku`）的 `system[3]`（7979 字节）逐字节相同。就是
+/// [`CC_SYSTEM_REST`] 那份把 EndConversation 那段换成五段说明（effort 只管想多少、不管做完多少；
+/// 结束一轮之前先把能做的做完；什么时候才该先问；工作区里的改动不算难以撤回；卡住一处不停整件
+/// 事）——可执行文件按模型能力 `haiku_5_5_early_stopping_guidance` 挑这几段。haiku-5-5 的首轮
+/// 环境说明里也没有 EndConversation 那个延迟工具。占位与去掉的 `WebSearch takes a mode` 那段同
+/// [`CC_SYSTEM_REST`]。
+pub const CC_SYSTEM_REST_HAIKU_5_5: &str = include_str!("../assets/cc_system_rest_haiku_5_5.txt");
+
 // ---------- 首轮环境说明（`# Environment` 那条） ----------
 
 /// 模拟的那台机器的 Darwin 内核版本：环境说明的 `OS Version: Darwin …` 与遥测 OTel 资源属性
@@ -281,6 +302,8 @@ pub const CC_MODEL_IDENTITIES: &[(&str, &str, &str)] = &[
     ("claude-opus-5-5", "Opus 5.5", "June 2026"),
     ("claude-fable-5-1", "Fable 5.1", "June 2026"),
     ("claude-sonnet-5-5", "Sonnet 5.5", "June 2026"),
+    // `cap/auto-2.1.293-20261008-full/00344`。
+    ("claude-haiku-5-5", "Haiku 5.5", "June 2026"),
     ("claude-haiku-4-5", "Haiku 4.5", "February 2025"),
     ("claude-opus-5", "Opus 5", "May 2026"),
     ("claude-fable-5", "Fable 5", "January 2026"),
@@ -415,6 +438,11 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.291-20261006-full/00028` 起的 event_logging 批次（`env.build_time`，
     // `env.version_base` 同为 2.1.291）。
     ("2.1.291", "2026-10-06T02:24:19Z"),
+    // 2.1.292 没有抓包，取自可执行文件里的 `BUILD_TIME` 常量。
+    ("2.1.292", "2026-10-06T05:25:12Z"),
+    // `cap/auto-2.1.293-20261008-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.293", "2026-10-07T06:36:42Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

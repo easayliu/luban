@@ -245,9 +245,11 @@ impl EventBuilder<'_> {
             v280,
             v285,
             v291,
+            v293,
             injected,
             first_prompt_tpl,
             sleepy,
+            heron,
             ref ignored_suggestion,
             ref interrupted_message_id,
             ..
@@ -345,7 +347,7 @@ impl EventBuilder<'_> {
                 );
                 // 那条命令当场在本机跑完（`07:58:39.375`，比输入晚 50ms）。
                 if let Some((cmd, out)) = &shape.bash_typed {
-                    let meta = bash_executed_meta(
+                    let mut meta = bash_executed_meta(
                         &bash_profile(cmd),
                         *out + 1,
                         None,
@@ -353,10 +355,20 @@ impl EventBuilder<'_> {
                         true,
                         shape.permission_mode,
                     );
+                    if v293 {
+                        bash_meta_v293(&mut meta, "");
+                    }
                     self.push_dd_snake(ms(t0, -6), "tengu_bash_tool_command_executed", meta);
                 }
             } else {
                 self.push(ms(t0, input_at), "tengu_input_prompt", input);
+            }
+            if heron {
+                self.push(
+                    ms(t0, sdk_announce.map_or(-11, |off| off + 3)),
+                    "tengu_heron_brook_applied",
+                    json!({ "len": 2790, "fromClientData": true }),
+                );
             }
             // 每个模型头一次用于新输入时报一次（值恒为 growthbook / all）。
             if sleepy {

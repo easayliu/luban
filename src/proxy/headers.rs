@@ -260,16 +260,32 @@ impl BetaCtx {
     pub(super) const MAIN: Self =
         Self { only_oauth: false, ttl_1h: true, display_omitted: false, subagent: false };
 
-    /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份。1h 断点先按字节粗筛
-    /// （[`super::body::body_has_pair`]），命中再按解析好的体逐个断点核（[`super::body::has_cache_ttl_1h`]）
-    /// ——工具入参里的 `ttl:"1h"` 不算。转发循环外算一次，换号重试沿用。
+    /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份，`beta` 是来访自己那串。
+    /// 1h 断点先按字节粗筛（[`super::body::body_has_pair`]），命中再按解析好的体逐个断点核
+    /// （[`super::body::has_cache_ttl_1h`]）——工具入参里的 `ttl:"1h"` 不算。转发循环外算一次，
+    /// 换号重试沿用。
+    ///
+    /// **认出来的主线程辅助调用也只补 `oauth`**：官方 helper（[`super::simulation::is_official_helper_request`]，
+    /// WebFetch 的页面处理）与 WebSearch 子调用（[`super::simulation::is_official_web_search_request`]）。订阅端
+    /// 它们的串不带 `claude-code`、靠串自己就认得出；API 密钥模式下主模型不是 haiku 时串里**带着**
+    /// `claude-code` 与 `effort`（`cap/auto-2.1.293-20261008-api/00045`、`00206`），只看串会被当成主线程
+    /// ——删掉 `redact-thinking`、补进 `advanced-tool-use` 与 `thinking-display-updates`，同一形态的
+    /// haiku-5-5 那条（`00096`）却原样只补 `oauth`。只认这两种认得出的形态，不按 `Auxiliary` 整类豁免：
+    /// 那一类还装着别的无工具对话，它们照主线程补（体里补了 `scope: global` 断点，头上就得有
+    /// `prompt-caching-scope`）。
     pub(super) fn of(
         kind: super::session_link::CcRequestKind,
         raw: &[u8],
         body: Option<&serde_json::Value>,
+        beta: &[String],
     ) -> Self {
+        let official_aux = kind == super::session_link::CcRequestKind::Auxiliary
+            && body.is_some_and(|v| {
+                super::simulation::is_official_helper_request(v, beta)
+                    || super::simulation::is_official_web_search_request(v)
+            });
         Self {
-            only_oauth: kind.beta_only_oauth(),
+            only_oauth: kind.beta_only_oauth() || official_aux,
             ttl_1h: super::body::body_has_pair(raw, b"\"ttl\"", b"\"1h\"")
                 && body.is_some_and(super::body::has_cache_ttl_1h),
             display_omitted: body
@@ -709,6 +725,8 @@ fn is_known_beta(beta: &str) -> bool {
         "auto-mode-classifier-",
         "server-side-fallback-",
         "fallback-credit-",
+        // 2.1.293 起，见 [`config::CC_BETA_INLINE_TOOLS`]。
+        "inline-tools-",
     ];
     KNOWN_PREFIXES.iter().any(|prefix| beta.starts_with(prefix))
 }

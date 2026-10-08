@@ -138,8 +138,11 @@ pub(super) struct Session {
     /// `from_snapshot`。
     pub(super) snapshot_hash: Option<String>,
     /// 本会话已经报过 `tengu_sleepy_snowflake_applied` 的模型：官方每个模型只在头一次
-    /// 被用于新输入时报一次（`cap/2.1.280` opus/fable/sonnet/haiku 各一条，再切回来不报）。
+    /// 被用于新输入时报一次（`cap/2.1.280` opus/fable/sonnet/haiku 各一条，再切回来不报）；
+    /// 2.1.293 起标题生成（haiku-5-5）头一次也报，与主线程共用这张表。
     pub(super) sleepy_models: Vec<String>,
+    /// 本会话已经报过 `tengu_heron_brook_applied`（haiku-5-5 主线程会话一条）。
+    pub(super) heron_done: bool,
     /// 主线程的 tether 线程状态，见 [`TetherThread`]；子代理的各记在 [`AgentState`] 里。
     pub(super) tether_main: Option<TetherThread>,
     /// 每条线程上一条完整请求的形态，键是 `main` 或 `agent:<支线号>`，见 [`ThreadBase`]。
@@ -530,6 +533,7 @@ pub(super) struct TurnFacts {
     pub(super) v280: bool,
     pub(super) v285: bool,
     pub(super) v291: bool,
+    pub(super) v293: bool,
     /// 会话主线程最近一条的 effort，见 [`Session::main_effort`]。
     pub(super) main_effort: Option<String>,
     /// 同一条线（主线程 / 这个子代理）上一条回复里有工具调用（`tether_live_outcome.anchorHasToolCall`）。
@@ -544,6 +548,8 @@ pub(super) struct TurnFacts {
     pub(super) first_main: bool,
     pub(super) snapshot: Option<(&'static str, String)>,
     pub(super) sleepy: bool,
+    /// 这条前面报一条 `tengu_heron_brook_applied`（2.1.293 haiku-5-5 会话的首次输入）。
+    pub(super) heron: bool,
     pub(super) tether: Option<Tether>,
     pub(super) usage_before: [i64; 4],
     pub(super) ignored_suggestion: Option<(String, SystemTime, usize)>,
@@ -691,6 +697,7 @@ impl Session {
             deferred: Vec::new(),
             snapshot_hash: None,
             sleepy_models: Vec::new(),
+            heron_done: false,
             tether_main: None,
             thread_bases: HashMap::new(),
             agents: HashMap::new(),

@@ -287,6 +287,9 @@ impl Telemetry {
         // `session_transcript_write`，`tool_use_error` 多 `error_constructor`
         // （`cap/auto-2.1.291-20261006-full`）。
         let v291 = version_at_least(&version, "2.1.291");
+        // 2.1.293：标题生成换成 haiku-5-5，它头一次用也报 `sleepy_snowflake_applied`；haiku-5-5 的
+        // 会话多一条 `heron_brook_applied`（`cap/auto-2.1.293-20261008-full`）。
+        let v293 = version_at_least(&version, "2.1.293");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -305,9 +308,24 @@ impl Telemetry {
         // 同样报 `live_recorded`）。
         let snapshot =
             (v270 && kind.has_boundary()).then(|| sess.snapshot_for(kind, &agent_key, &shape));
-        let sleepy = v280 && new_prompt && !sess.sleepy_models.contains(&display_model);
+        // 2.1.293 的标题生成那条也报（`cap/auto-2.1.293-20261008-full` 每个会话的标题请求前都有一条
+        // `model: claude-haiku-5-5`；主线程也是 haiku-5-5 的会话里，主线程那次就不再报）。
+        let sleepy = v280
+            && (new_prompt || (v293 && kind == Kind::Title))
+            && !sess.sleepy_models.contains(&display_model);
         if sleepy {
             sess.sleepy_models.push(display_model.clone());
+        }
+        // haiku-5-5 会话一条（`len: 2790`，`fromClientData: true`），官方落在会话头一条请求之前——
+        // 有标题请求时是标题那条，紧挨它的 `sleepy_snowflake_applied`。标题请求里看不出主线程是哪个
+        // 模型（opus 会话的标题同样是 haiku-5-5，却没有这一条），这里挂在主线程的首次输入上。
+        let heron = v293
+            && is_main
+            && new_prompt
+            && !sess.heron_done
+            && crate::config::cc_haiku_is_5_5_family(&display_model);
+        if heron {
+            sess.heron_done = true;
         }
         // tether 只管主线程与子代理（摘要、猜下一句、标题这类辅助调用一条都没有），子代理
         // 每条支线一个线程（`cap/2.1.280` Explore 首条 `create/first_request`、之后 `continue/append`）。
@@ -440,6 +458,7 @@ impl Telemetry {
             v280,
             v285,
             v291,
+            v293,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
             anchor_tool_call: if is_main {
@@ -454,6 +473,7 @@ impl Telemetry {
             first_main,
             snapshot,
             sleepy,
+            heron,
             tether,
             usage_before,
             ignored_suggestion,

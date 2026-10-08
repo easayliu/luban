@@ -55,6 +55,15 @@ impl EventBuilder<'_> {
                 "tengu_tool_search_mode_decision",
                 tool_search_decision(shape, display_model, kind.is_agent()),
             );
+            // 2.1.293 标题生成（haiku-5-5）头一次用这个模型：紧跟工具搜索判定（同一毫秒，
+            // `cap/auto-2.1.293-20261008-full` B0 会话 -20ms 那组）。
+            if env.f.sleepy && kind == Kind::Title {
+                self.push(
+                    ms(t0, -1),
+                    "tengu_sleepy_snowflake_applied",
+                    json!({ "model": display_model, "source": "growthbook", "value": "all" }),
+                );
+            }
         }
         // 2.1.285：每条线程的头两条请求前，客户端把上下文宣告、提醒折叠、工具入参回显这几样
         // 记一次、回放一次（`cap/2.1.285`：主线程首条那串在模板里，第二条只有两条 `*_replayed`；

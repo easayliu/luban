@@ -115,14 +115,37 @@ pub(super) static TEMPLATE_2_1_291_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_291_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.291 起用 [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用
-/// [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK 那份），之前的仍是 2.1.260 那份。
+/// 2.1.293 的两份模板（交互式 / `-p`）：以 2.1.291 那两份为底，按 `cap/auto-2.1.293-20261008-full`
+/// 补齐 meta 键（生成脚本是同目录 `_driver/build_tpl_293.py`）。相对 2.1.291：`tengu_ochre_wren` 改成
+/// 强制开、那条实验曝光没了；启动段多了 `org_config_gate_shadow`（组织配置那道闸的影子判定）与
+/// `frontmatter_shadow_unknown_key` 各一条；`remote_settings_fetch` / `policy_limits_fetch` 多了
+/// 预取与对冲那几项、`managed_config_ready` 多了四项策略画像、`tengu_started` 多一项实验标记；
+/// `model_catalog_compare` 的选择器里多了 haiku-5-5（行数 11 → 12）。
+pub(super) static TEMPLATE_2_1_293: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_293.json"))
+            .expect("assets/cc_telemetry_template_2_1_293.json must parse")
+    });
+
+/// 2.1.293 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_293`]。
+pub(super) static TEMPLATE_2_1_293_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_293_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_293_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.293 起用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
+/// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
-    match (version_at_least(version, "2.1.291"), version_at_least(version, "2.1.285"), sdk) {
-        (true, _, true) => &TEMPLATE_2_1_291_SDK,
-        (true, _, false) => &TEMPLATE_2_1_291,
-        (false, true, true) => &TEMPLATE_2_1_285_SDK,
-        (false, true, false) => &TEMPLATE_2_1_285,
+    let at = |v: &str| version_at_least(version, v);
+    match (at("2.1.293"), at("2.1.291"), at("2.1.285"), sdk) {
+        (true, _, _, true) => &TEMPLATE_2_1_293_SDK,
+        (true, _, _, false) => &TEMPLATE_2_1_293,
+        (false, true, _, true) => &TEMPLATE_2_1_291_SDK,
+        (false, true, _, false) => &TEMPLATE_2_1_291,
+        (false, false, true, true) => &TEMPLATE_2_1_285_SDK,
+        (false, false, true, false) => &TEMPLATE_2_1_285,
         _ => &TEMPLATE,
     }
 }
@@ -230,37 +253,69 @@ pub(super) struct Subst<'a> {
     /// `-p` 打印模式（SDK 模板）：附件的 `query_source` 与估算按 SDK 那套报，见
     /// [`fill_attachment_estimates`]。
     pub(super) sdk: bool,
-    /// 这个会话的模型是 haiku：2.1.291 起它的工具是长描述那一套，`tengu_context_size` 的工具
-    /// 计数与其余三族不同（[`context_tool_counts`]）。
-    pub(super) haiku: bool,
+    /// 这个会话的模型属于哪一套工具声明，`tengu_context_size` 的工具计数随它变（[`context_tool_counts`]）。
+    pub(super) tool_family: ToolFamily,
     /// 正文里关着的那几个用户可关的工具（[`RequestShape::tools_off`]）。`-p` 不看它：打印模式本来就
     /// 不带 Artifact / SendFeedback（不是用户关的），也没有关掉之后的样本。
     pub(super) tools_off: ToolsOff,
 }
 
-/// 2.1.291 `tengu_context_size` 里的 `non_mcp_tools_count` / `non_mcp_tools_tokens`：客户端本地
-/// 按全部内建工具（含延迟池里的）估的，随模型族与用户关掉的工具变
-/// （`cap/auto-2.1.291-20261006-full` 各会话、`cap/auto-2.1.291-20261006` 关前 / 关后各四个会话）。
-/// `-p`（`sdk`）本来就不带 Artifact / SendFeedback，没有关掉之后的样本，照不关的报。
+/// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
+/// 只是延迟池里没有 EndConversation，2.1.293 起），其余模型一套。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolFamily {
+    Main,
+    HaikuLong,
+    Haiku55,
+}
+
+impl ToolFamily {
+    pub(super) fn of(model: &str) -> Self {
+        if crate::config::cc_haiku_is_5_5_family(model) {
+            Self::Haiku55
+        } else if model.to_ascii_lowercase().contains("haiku") {
+            Self::HaikuLong
+        } else {
+            Self::Main
+        }
+    }
+}
+
+/// `tengu_context_size` 里的 `non_mcp_tools_count` / `non_mcp_tools_tokens`：客户端本地按全部内建
+/// 工具（含延迟池里的）估的，随版本、模型族与用户关掉的工具变。`-p`（`sdk`）本来就不带 Artifact /
+/// SendFeedback，没有关掉之后的样本，照不关的报。
 ///
-/// 三个全关：数 34 → 29（Artifact 连带 `ArtifactComments` / `ArtifactData` 少 3 个，另两个各 1 个），
-/// token 13834 → 6983，少 6851；haiku 37 → 32、14305 → 7454，少的同样是 6851。只关其中几个没有
-/// 样本，token 按三家工具声明的字符数分摊那 6851（Artifact 一家 34399 + 7438 + 12241，ListAgents
-/// 1180，SendFeedback 5537，`cap/auto-2.1.291-20261006-full` 里的声明），三个全关时正好等于抓包值。
-fn context_tool_counts(sdk: bool, haiku: bool, off: ToolsOff) -> (u64, u64) {
-    let (count, tokens) = match (sdk, haiku) {
-        (true, false) => return (26, 6399),
-        (true, true) => return (30, 6900),
-        (false, false) => (34u64, 13834u64),
-        (false, true) => (37, 14305),
+/// 2.1.291（`cap/auto-2.1.291-20261006-full` 各会话、`cap/auto-2.1.291-20261006` 关前 / 关后各四个
+/// 会话）：opus 等 34 / 13834，haiku-4.5 37 / 14305，`-p` 26 / 6399、haiku 30 / 6900。三个全关：数
+/// 34 → 29（Artifact 连带 `ArtifactComments` / `ArtifactData` 少 3 个，另两个各 1 个），token 少 6851，
+/// haiku 同样少 6851。只关其中几个没有样本，token 按三家工具声明的字符数分摊那 6851（Artifact 一家
+/// 34399 + 7438 + 12241，ListAgents 1180，SendFeedback 5537），三个全关时正好等于抓包值。
+///
+/// 2.1.293（`cap/auto-2.1.293-20261008-full`）：`Agent` 多了 `effort` 参数、`Artifact` 改了措辞，
+/// opus 等 34 / 13942、haiku-4.5 37 / 14413（都多 108），`-p` 26 / 6490（多 91——`-p` 没有 Artifact，
+/// 这 91 全是 Agent，余下 17 记在 Artifact 头上）；haiku-5-5 是 33 / 13912，比 opus 少一个工具
+/// （EndConversation）、30 token；`-p` 的 haiku 也是 haiku-5-5，同 `-p` 那份。`-p` 的 haiku-4.5 没有
+/// 样本，按 2.1.291 那份加 Agent 的 91 估。
+fn context_tool_counts(v293: bool, sdk: bool, family: ToolFamily, off: ToolsOff) -> (u64, u64) {
+    use ToolFamily::*;
+    let (count, tokens) = match (v293, sdk, family) {
+        (false, true, HaikuLong) => return (30, 6900),
+        (false, true, _) => return (26, 6399),
+        (false, false, HaikuLong) => (37, 14305),
+        (false, false, _) => (34u64, 13834u64),
+        (true, true, HaikuLong) => return (30, 6900 + 91),
+        (true, true, _) => return (26, 6490),
+        (true, false, HaikuLong) => (37, 14413),
+        (true, false, Haiku55) => (33, 13912),
+        (true, false, Main) => (34, 13942),
     };
-    const ARTIFACT: u64 = 6094;
+    let artifact: u64 = if v293 { 6094 + 17 } else { 6094 };
     const LIST_AGENTS: u64 = 133;
-    const SEND_FEEDBACK: u64 = 6851 - ARTIFACT - LIST_AGENTS;
+    let send_feedback: u64 = 6851 - 6094 - LIST_AGENTS;
     let (mut c, mut t) = (count, tokens);
     if off.artifact {
         c -= 3;
-        t -= ARTIFACT;
+        t -= artifact;
     }
     if off.list_agents {
         c -= 1;
@@ -268,7 +323,7 @@ fn context_tool_counts(sdk: bool, haiku: bool, off: ToolsOff) -> (u64, u64) {
     }
     if off.send_feedback {
         c -= 1;
-        t -= SEND_FEEDBACK;
+        t -= send_feedback;
     }
     (c, t)
 }
@@ -459,9 +514,20 @@ where
                 && e.name == "tengu_context_size"
                 && let Some(o) = meta.as_object_mut()
             {
-                let (count, tokens) = context_tool_counts(subst.sdk, subst.haiku, off);
+                let v293 = version_at_least(subst.version, "2.1.293");
+                let (count, tokens) = context_tool_counts(v293, subst.sdk, subst.tool_family, off);
                 o.insert("non_mcp_tools_count".into(), json!(count));
                 o.insert("non_mcp_tools_tokens".into(), json!(tokens));
+            }
+            // 2.1.293 起 haiku-4.5 当主模型时模型目录那条不带这两项（haiku 的默认档换成了 haiku-5-5，
+            // `cap/auto-2.1.293-20261008-full` 的 haiku-4-5 会话只剩 `default_match`；2.1.291 时它还带着）。
+            if e.name == "tengu_model_catalog_compare"
+                && subst.tool_family == ToolFamily::HaikuLong
+                && version_at_least(subst.version, "2.1.293")
+                && let Some(o) = meta.as_object_mut()
+            {
+                o.shift_remove("default_output_match");
+                o.shift_remove("default_effort_match");
             }
             // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
             // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关

@@ -218,6 +218,45 @@ pub(super) fn bash_executed_meta(
     Value::Object(m)
 }
 
+/// 2.1.293 的 Bash 执行事件在 `executor_shell_overridden` 之后多一项 `zsh_nomatch_error`
+/// （`cap/auto-2.1.293-20261008-full` 全部 Bash 执行 / 失败事件都带）：zsh 把没匹配上的通配符当错误
+/// 时为 true——那条的工具结果开头是 `Exit code 1\n(eval):1: no matches found: --include=*.py`
+/// （A0 会话 `00071`），其余都是 false。`result_head` 是工具结果正文的开头，看不到的（`!` 直接
+/// 跑的那种）传空串。判法见 [`zsh_nomatch_line`]。
+pub(super) fn bash_meta_v293(meta: &mut Value, result_head: &str) {
+    let nomatch = result_head.split(['\n', '\r', '\u{2028}', '\u{2029}']).any(zsh_nomatch_line);
+    insert_after(meta, "executor_shell_overridden", vec![("zsh_nomatch_error", json!(nomatch))]);
+}
+
+/// 一行是不是 zsh 的「通配符没匹配上」诊断，照 2.1.293 可执行文件里的判据逐字实现：
+/// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: no matches found: /m`——行首是 `(eval)` 或一个名字
+/// （`zsh`、报错的函数名 `scan_py` 之类），可带 `:行号`，紧跟 `: no matches found: `。只看子串会把
+/// 命令自己的输出（`search: no matches found in index`）也算进去。按 JS 的 `m` 标志，`\n`、`\r`、
+/// `\u{2028}`、`\u{2029}` 之后都算行首。
+pub(super) fn zsh_nomatch_line(line: &str) -> bool {
+    let rest = if let Some(r) = line.strip_prefix("(eval)") {
+        r
+    } else {
+        let mut chars = line.char_indices();
+        match chars.next() {
+            Some((_, c)) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        let end = chars
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+            .map_or(line.len(), |(i, _)| i);
+        &line[end..]
+    };
+    let rest = match rest.strip_prefix(':') {
+        Some(r) => {
+            let digits = r.chars().take_while(char::is_ascii_digit).count();
+            if digits > 0 && r[digits..].starts_with(':') { &r[digits..] } else { rest }
+        }
+        None => rest,
+    };
+    rest.starts_with(": no matches found: ")
+}
+
 /// [`tool_success_extras`] 的文件表里记「上一份计划的 Write 入参长度」用的键（不会是真路径）。
 pub(super) const PLAN_INPUT_KEY: &str = "\0plan";
 

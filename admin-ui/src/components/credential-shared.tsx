@@ -1412,14 +1412,15 @@ export function DeleteCredentialDialog({
 /**
  * 测试弹窗里打头的四个模型：现役四个模型族各取最新的一个，顺序即下拉顺序。四族走四条不同的
  * 模拟 profile（beta 串、thinking、effort 各不相同，见后端 `config::CC_PROFILES`），逐项测一遍
- * 就覆盖了四条路径。haiku 取别名而不是 `claude-haiku-4-5-20251001`：后者在后端会被当成官方
- * 额度探测（`max_tokens: 1`、无 system），测不到 haiku 主线程那条链路。
+ * 就覆盖了四条路径。haiku 取 2.1.293 起 `haiku` 别名指向的 haiku-5-5（它与 opus 同一套短基座与工具，
+ * 和 haiku-4.5 那套长描述是两条链路，后者仍在下面的价目表模型里）；别用 `claude-haiku-4-5-20251001`：
+ * 那个名字在后端会被当成官方额度探测（`max_tokens: 1`、无 system），测不到 haiku 主线程那条链路。
  */
 const PROBE_MODELS = [
   'claude-opus-5-5',
   'claude-fable-5-1',
   'claude-sonnet-5',
-  'claude-haiku-4-5',
+  'claude-haiku-5-5',
 ] as const
 
 /** 价目表其余模型的族序：与 {@link PROBE_MODELS} 同序，mythos 跟在同代的 fable 后面。 */
