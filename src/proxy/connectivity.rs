@@ -591,6 +591,7 @@ pub(super) async fn spawn_session_handshake(
     let cred_for_task = cred.clone();
     let session_id = start.session_id.to_string();
     let probe_version = start.version.clone();
+    let probe_flags = state.store.forward_flags();
     tokio::spawn(async move {
         handshake_sequence(
             runner.lead(&client_for_task, &token_for_task),
@@ -601,6 +602,7 @@ pub(super) async fn spawn_session_handshake(
                 &ident,
                 &probe_version,
                 &session_id,
+                probe_flags,
             ),
             runner.rest(&client_for_task, &token_for_task),
             probe_done,
@@ -660,6 +662,9 @@ pub(super) async fn handshake_sequence(
 /// 连这条一起管。
 ///
 /// 结果只记 debug：这条既不是客户端流量，也不该影响任何转发判定，失败了就当没发过。
+///
+/// `flags` 用后台的真实配置，与同会话的主请求一致：用户关掉的（身份伪装、原始头大小写……）
+/// 这条也不做，否则同一会话里只有它还带着 luban 派生的身份或官方的头大小写。
 async fn send_quota_probe(
     client: &wreq::Client,
     token: &str,
@@ -667,9 +672,9 @@ async fn send_quota_probe(
     ident: &OutboundIdentity,
     version: &str,
     session_id: &str,
+    flags: store::ForwardFlags,
 ) {
     let model = QUOTA_PROBE_MODEL;
-    let flags = store::ForwardFlags::default();
     let sim = Simulation {
         base: None,
         profile: config::cc_profile(config::CcProfileKind::QuotaProbe),
@@ -738,8 +743,9 @@ async fn send_quota_probe(
     // 来自两台设备。
     let body = with_outbound_identity(body, ident);
     let url = ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL));
-    let sent =
-        client.post(&url).headers(headers).orig_headers(orig_header_case()).body(body).send().await;
+    let req = client.post(&url).headers(headers);
+    let req = if flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
+    let sent = req.body(body).send().await;
     match sent {
         Ok(r) => tracing::debug!(
             cred_id = cred.id,

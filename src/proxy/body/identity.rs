@@ -520,8 +520,9 @@ pub(in crate::proxy) fn outbound_identity(
 /// 相同——**包括编码形态**。所以这里复用原文而不是拿字段重拼：客户端可能用的是 Windows
 /// 那种扁平串，重拼成 JSON 就成了「同一会话一条扁平一条 JSON」。
 ///
-/// 主请求没发身份（`raw_user_id` 为 `None`）时原样交回：那种情况下探测体里
-/// [`ensure_cc_metadata`] 造的那份就是它唯一能有的身份，换掉反而更不一致。
+/// 主请求没发身份（`raw_user_id` 为 `None`）时原样交回：身份伪装开着时探测体里
+/// [`ensure_cc_metadata`] 造的那份就是它唯一能有的身份，换掉反而更不一致；关着时探测体里
+/// 本来就没有（探测用后台的真实开关改写），与主请求一样不带。
 pub(in crate::proxy) fn with_outbound_identity(body: Bytes, ident: &OutboundIdentity) -> Bytes {
     let Some(raw) = ident.raw_user_id.as_deref() else { return body };
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return body };

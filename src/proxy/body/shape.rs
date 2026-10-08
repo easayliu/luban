@@ -9,7 +9,7 @@ use super::*;
 /// 恒为 `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
 /// output_config, stream`，多一个就是白送的判据。
 ///
-/// 目前三项：
+/// 目前六项（前三项是「官方从不发」，后三项是「与 thinking 冲突、上游必回 400」的修补）：
 ///
 /// 1. **`tool_choice`**：官方两份抓包里这个键**压根不存在**。但只删**等价于默认值**的那一种
 ///    （恰好只有 `{"type":"auto"}` 一个键）——`{"type":"tool", "name":…}`/`{"type":"any"}`
@@ -35,6 +35,16 @@ use super::*;
 ///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
 ///    功能不坏（块还在、签名照旧），只是看不到内容。拿「一条 400 直接打不通」换「思考摘要看不
 ///    到」是划算的，但划算不等于无损，故写在这里，并由开关兜底——不接受这个代价就关掉它。
+///
+/// 4. **强制工具 + 手动预算 thinking**：`tool_choice` 为 `tool` / `any` 时删掉 `enabled` 那种
+///    thinking（adaptive 不删），见函数体里的说明。
+///
+/// 5. **`budget_tokens` 不足 1024**：抬到 1024。
+///
+/// 6. **`temperature` / `top_p` 与 thinking 冲突**：见 [`drop_sampling_conflicting_with_thinking`]。
+///    luban 自己注入的 thinking 由 [`ensure_thinking`] 自己剥，不经过这里；这里只管客户端自己
+///    写的 thinking。不看 `sampling_policy`：那个开关管的是模型废弃的采样参数，这里是参数与
+///    thinking 的组合冲突，两回事。
 ///
 /// **对真实 CC**：前两项本来就是空操作（官方不发 `tool_choice`、不发 `disabled`），第三项
 /// 由调用方传 `keep_display = true` 跳过——2.1.258 起 `display` 是官方形态的一部分。
@@ -92,25 +102,37 @@ pub(in crate::proxy) fn strip_extra_fields(v: &mut serde_json::Value, keep_displ
             changed = true;
         }
     }
-    // thinking 开着时 temperature 必须是 1（上游强制），客户端设了别的值直接 400。
-    // 删掉即可——默认值就是 1。判据同 ensure_context_management 那里的口径。
+    drop_sampling_conflicting_with_thinking(obj) || changed
+}
+
+/// thinking 开着时剥掉与它冲突的采样参数，返回是否改动过。客户端自己写的 thinking 由
+/// [`strip_extra_fields`] 调（随它的开关），luban 注入的由 [`ensure_thinking`] 自己调——
+/// 那是 luban 造出来的冲突，不能指望另一个开关开着来收拾。
+///
+/// - `temperature`：thinking 开着时上游强制为 1，别的值直接 400。删掉即可——默认值就是 1。
+/// - `top_p`：上游要求「不传或 >= 0.95」（`top_p must be greater than or equal to 0.95 or
+///   unset when thinking is enabled or in adaptive mode`）。这条是条件句，学习机制有意不学
+///   （见 `CONDITIONAL_MARKS`），只能在这里静态兜住。>= 0.95 的照发；非数字的取值也剥：
+///   上游一样 400，留着只是换一种死法。
+pub(in crate::proxy) fn drop_sampling_conflicting_with_thinking(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    // 判据同 ensure_context_management 那里的口径。
     let thinking_on = obj
         .get("thinking")
         .and_then(|t| t.get("type"))
         .and_then(|t| t.as_str())
         .is_some_and(|t| matches!(t, "enabled" | "adaptive"));
-    if thinking_on
-        && obj.get("temperature").and_then(|t| t.as_f64()) != Some(1.0)
+    if !thinking_on {
+        return false;
+    }
+    let mut changed = false;
+    if obj.get("temperature").and_then(|t| t.as_f64()) != Some(1.0)
         && obj.remove("temperature").is_some()
     {
         changed = true;
     }
-    // 同理 top_p：thinking 开着时上游要求「不传或 >= 0.95」（`top_p must be greater than or
-    // equal to 0.95 or unset when thinking is enabled or in adaptive mode`）。这条是条件句，
-    // 学习机制有意不学（见 `CONDITIONAL_MARKS`），只能在这里静态兜住。>= 0.95 的照发。
-    // 非数字的取值也剥：上游一样 400，留着只是换一种死法。
-    if thinking_on
-        && obj.get("top_p").is_some_and(|p| !p.as_f64().is_some_and(|p| p >= 0.95))
+    if obj.get("top_p").is_some_and(|p| !p.as_f64().is_some_and(|p| p >= 0.95))
         && obj.remove("top_p").is_some()
     {
         changed = true;

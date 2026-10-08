@@ -1882,8 +1882,8 @@ fn outbound_carries_fallbacks_sees_client_arrays_and_luban_padding() {
     let mut with_arr = main.clone();
     with_arr["fallbacks"] = serde_json::json!([{"model": "claude-opus-4-8"}]);
     assert!(carries(&with_arr, "claude-sonnet-5", off));
-    // 字符串 "default"：有计划时会被换成计划 → 带；没计划时原样出站、头上不补 beta，
-    // 上游不会换模型重跑 → 不算带，命中已学到的拒答就本地回放。
+    // 字符串 "default"：有计划时会被换成计划 → 带；没计划时不算带（见函数文档），命中已学到的
+    // 拒答就本地回放。
     let mut with_default = main.clone();
     with_default["fallbacks"] = serde_json::json!("default");
     assert!(carries(&with_default, "claude-fable-5-1", fable_on));
@@ -3054,6 +3054,79 @@ fn injects_thinking_shape_per_model_family() {
         s.contains(r#""thinking":{"budget_tokens":31999,"type":"enabled","display":"updates"}"#),
         "haiku 的 thinking 逐字节对齐官方: {s}"
     );
+}
+
+/// luban 注入的 thinking 自己收拾它造成的冲突，不靠 `strip_extra_fields` 开着：客户端的
+/// `temperature≠1` / `top_p<0.95` 剥掉，`max_tokens == 1024` 时预算直接是 1024，不是 1023。
+#[test]
+fn injected_thinking_cleans_its_own_conflicts_without_strip_extra_fields() {
+    let flags = store::ForwardFlags { strip_extra_fields: false, ..all_on() };
+    let run = |body: &str| -> serde_json::Value {
+        let b = Bytes::from(body.to_string());
+        let sim = sim_for(body);
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice(&out).unwrap()
+    };
+    let opus = run(
+        r#"{"model":"claude-opus-5","max_tokens":64000,"temperature":0.5,"top_p":0.5,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(opus["thinking"]["type"], "adaptive", "{opus}");
+    assert!(opus.get("temperature").is_none() && opus.get("top_p").is_none(), "{opus}");
+    // temperature 恰为 1、top_p >= 0.95 不冲突，照发。
+    let keep = run(
+        r#"{"model":"claude-opus-5","max_tokens":64000,"temperature":1,"top_p":0.99,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(keep["temperature"], 1, "{keep}");
+    assert_eq!(keep["top_p"], 0.99, "{keep}");
+    let haiku = run(
+        r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(haiku["thinking"]["budget_tokens"], 1024, "{haiku}");
+}
+
+/// OpenAI 写法的强制工具（`"required"`、`{"type":"function",…}`）要先归一再判注入 thinking：
+/// 否则注入时剥掉的 `temperature` / `top_p`，在 thinking 因强制工具被删之后就找不回来了；
+/// 「移除多余字段」关着时更会把「手动预算 thinking + 强制工具」这对上游必拒的组合发出去。
+#[test]
+fn openai_forced_tool_choice_blocks_thinking_injection() {
+    for strip in [true, false] {
+        let flags = store::ForwardFlags {
+            strip_extra_fields: strip,
+            reject_openai_shape: false,
+            ..all_on()
+        };
+        for tc in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "Bash"}}),
+        ] {
+            let body = serde_json::json!({
+                "model": "claude-haiku-4-5-20251001", "max_tokens": 32000,
+                "temperature": 0.5, "top_p": 0.5, "tool_choice": tc,
+                "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            .to_string();
+            let b = Bytes::from(body.clone());
+            let sim = sim_for(&body);
+            let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert!(v.get("thinking").is_none(), "strip={strip}: 强制工具不该注入 thinking: {v}");
+            assert_eq!(v["temperature"], 0.5, "strip={strip}: {v}");
+            assert_eq!(v["top_p"], 0.5, "strip={strip}: {v}");
+        }
+    }
+}
+
+/// 族开关关着（没计划）时，客户端的字符串 `fallbacks:"default"` 在模拟路径上归一成官方数组：
+/// 新日期的 `server-side-fallback` 下上游只收数组（2026-10-08 实测字符串回 400）。
+#[test]
+fn string_fallbacks_normalized_without_a_plan() {
+    let body = r#"{"model":"claude-fable-5-1","fallbacks":"default","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
+    let b = Bytes::from(body.to_string());
+    let sim = sim_for(body);
+    let out = rewrite_body(&b, &test_cred(), "fp", all_on(), Some(&sim), None);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["fallbacks"], serde_json::json!([{"model": "claude-opus-5"}]), "{v}");
 }
 
 /// 模拟路径要补 `context_management`：`cap/raw` 八份抓包逐字节相同，而声明它的

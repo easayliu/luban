@@ -49,8 +49,8 @@ pub(in crate::proxy) fn refusal_fallbacks_for(
 
 /// 客户端自己带了**数组形态**的 `fallbacks`（[`ensure_fallbacks`] 对它一个字不动）。有则
 /// luban 不算补过：`refusal_fallbacks` 留 `None`，上游 400 拒它时不学、不剥掉重试。字符串
-/// `"default"` 不算——那一份会被 luban 换成数组（[`ensure_fallbacks`] / [`normalize_fallbacks`]），
-/// 出站的是 luban 的字面量。
+/// `"default"` 不算——luban 有计划时它会被换成计划（[`ensure_fallbacks`]），模拟路径上没计划时
+/// 归一成官方数组（[`normalize_fallbacks`]），出站的都是 luban 的字面量。
 pub(in crate::proxy) fn client_supplied_fallbacks(body: Option<&serde_json::Value>) -> bool {
     body.and_then(|v| v.get("fallbacks")).is_some_and(|f| !f.is_string())
 }
@@ -60,12 +60,12 @@ pub(in crate::proxy) fn client_supplied_fallbacks(body: Option<&serde_json::Valu
 /// （[`refusal_fallbacks_for`]）。带的请求上游拒答后会自己换模型重跑，本地的「已拒答提示词」
 /// 规则（[`known_refused_prompt`]）不该拦它。
 ///
-/// **字符串形态一律不算**，与 [`client_supplied_fallbacks`] 同口径。2.1.258 那种 `"default"`
-/// （`cap/2.1.258/00013`）在 luban 有计划时会被 [`ensure_fallbacks`] 换成计划（上面那条已经
-/// 算进去了）；没计划时它原样出站，而头那侧按「客户端没带」处理、不补 `server-side-fallback`
-/// beta，是「体里有字段、头上没声明」的形态，上游不会为它换模型重跑——放行只是白送一次拒答，
-/// 该本地回放上游那次的 200。此前这里把没计划的 `"default"` 也当成「带了」，门禁与实际出站
-/// 体不一致。空串或别的字面量上游一定 400，同样不算。
+/// **字符串形态只在有计划时算**，与 [`client_supplied_fallbacks`] 同口径。2.1.258 那种
+/// `"default"`（`cap/2.1.258/00013`）在 luban 有计划时会被 [`ensure_fallbacks`] 换成计划（上面
+/// 那条已经算进去了）。没计划时：模拟路径上 profile 带官方字面量的（fable）会被
+/// [`normalize_fallbacks`] 归一成数组，别的族原样出站，而新日期的 `server-side-fallback` 下
+/// 上游只收数组（2026-10-08 实测回 400）。这里不区分这两种、一律不算——判错的代价只是命中
+/// 已学到的拒答时本地回放，而不是放上去让上游换模型重跑。空串或别的字面量上游一定 400，同样不算。
 /// `cc_kind` 在这里按体与 beta 头现算：调用点在 `handle_inner` 早于主流程算 `cc_kind` 的
 /// 位置，而 [`CcRequestKind::of`] 是纯函数。
 pub(in crate::proxy) fn outbound_carries_fallbacks(
@@ -170,11 +170,15 @@ pub(in crate::proxy) fn ensure_fallbacks(v: &mut serde_json::Value, plan: &str) 
     true
 }
 
-/// `fallbacks` 的**形态**归一（该族的 refusal fallback 开关关着时走这条）：2.1.258 的官方 fable 发
-/// 字符串 `"default"`，2.1.260 换成了数组 `[{"model":"claude-opus-5"}]`（`cap/2.1.260/00018`）。
+/// `fallbacks` 的**形态**归一（模拟路径上没有计划时走这条：族开关关着，或学到过该模型不收）：
+/// 2.1.258 的官方 fable 发字符串 `"default"`（配 `server-side-fallback-2026-07-01`），2.1.260
+/// 起换成数组 `[{"model":"claude-opus-5"}]`（`cap/2.1.260/00018`，配 `-06-01`）。模拟出来的是
+/// 新版本，头上那项 beta 也是新日期，而 2026-10-08 实测新日期下上游只收数组：字符串原样送出
+/// 回 400 `fallbacks: Input should be a valid array`。
 ///
-/// 只在客户端自己已经要了 fallback 时改形态，不替它凭空开——开关关着即用户明确不要
-/// luban 替他换模型跑。客户端已经发了数组形态时原样不动。
+/// 只在客户端自己已经要了 fallback 时改形态，不替它凭空开——开关关着即用户明确不要 luban
+/// 替他换模型跑，但客户端自己要的照样给它，只是换成上游认的写法。客户端已经发了数组形态时
+/// 原样不动。
 pub(in crate::proxy) fn normalize_fallbacks(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,

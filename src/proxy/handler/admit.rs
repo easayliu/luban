@@ -656,9 +656,8 @@ fn shape_gates(
     }
 
     // 2.3a) OpenAI 格式转换残留 → 本地直接拒，不修补，见 [`find_openai_marker`]。
-    //       `image_url` 一项无条件拒（Anthropic API 不认这个 type，送上去恒为 400）；其余
-    //       残留（messages 里的 `role:"system"`、`call_` 前缀的工具调用 id、OpenAI 专属顶层
-    //       字段……）由 `reject_openai_shape` 拨：开着一律拒，关着退回旧的修补路径
+    //       全部由 `reject_openai_shape` 拨（`image_url` 也是：上游对它恒 400，关着照样原样
+    //       送上去）：开着一律拒，关着退回旧的修补路径
     //       （`hoist_system_role` 挪 system、[`normalize_tool_choice`] 翻译 tool_choice）。
     //       模拟路径不受影响：它只接管**本来就是 Anthropic 形态**的非 CC 请求。
     let reject_openai_shape = state.store.forward_flags().reject_openai_shape;

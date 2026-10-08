@@ -209,8 +209,11 @@ pub(super) async fn prepare<'a>(
     // 留 `None`，上游若以 400 拒了它，那是客户端的字段、原样回给客户端，不进「从上游学到
     // 的规则」、不剥掉重试（此前只看开关，客户端的目标被拒会被当成 luban 的学下来，
     // 该模型 7 天内不再补——污染的是全局规则）。头上的 beta 另算：体里只要有这个字段
-    // （客户端带的或 luban 补的），头上就得有 `server-side-fallback`。
+    // （客户端带的或 luban 补的），头上就得有 `server-side-fallback`。字符串 `"default"` 在
+    // 没计划时原样出站，同样要声明：2026-10-08 实测 2.1.293 fable 形态的头上没有这项时，
+    // 上游回 400 `fallbacks: Extra inputs are not permitted`。
     let client_fallbacks = client_supplied_fallbacks(body_json.as_ref());
+    let body_has_fallbacks = body_json.as_ref().is_some_and(|v| v.get("fallbacks").is_some());
     let refusal_fallbacks = if client_fallbacks {
         None
     } else {
@@ -229,7 +232,7 @@ pub(super) async fn prepare<'a>(
         sim.as_ref(),
         session_out.as_deref(),
         req_model.as_deref(),
-        refusal_fallbacks.is_some() || (billable && client_fallbacks),
+        refusal_fallbacks.is_some() || (billable && body_has_fallbacks),
         beta_ctx,
     );
     // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：

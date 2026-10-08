@@ -166,6 +166,14 @@ pub(super) fn rewrite_body_out(
         Ok(v) => v,
         Err(_) => return (body.clone(), None),
     };
+    // OpenAI 风格的 `tool_choice`（字符串 `"auto"`/`"none"`/`"required"`、`null`，或
+    // `{"type":"function","function":{"name":…}}`）归一成 Anthropic 的对象形态——上游对非对象
+    // 直接 400 `tool_choice: Input should be an object`。**无条件做**：这种形态在 Anthropic 这边
+    // 永远无效，没有「保留原样」的价值。放在最前：后面判「是不是强制工具」的几步（注入
+    // thinking、环境说明、补官方工具）都只认对象形态，看到 `"required"` 会当成没强制——注入
+    // thinking 时顺手剥掉的采样参数，在 thinking 因强制工具被删之后就找不回来了。归一出来的
+    // `{"type":"auto"}` 由 [`strip_extra_fields`] 按缺省剥掉。
+    let tool_choice_normalized = normalize_tool_choice(&mut v);
     // 空壳 `role:"system"` 消息：一个内容块都没有的那种，上游恒 400
     // （`messages.N: system content must contain at least one block`）。放在提升之前，
     // 两条路都要过它——见 [`drop_empty_system_messages`] 里为什么不受 `hoist_system_role`
@@ -253,8 +261,8 @@ pub(super) fn rewrite_body_out(
     // 与安全分类官方都不发这个字段。
     let diag =
         sim.is_some_and(|s| s.profile.has_billing_header() && ensure_diagnostics(&mut v, &s.link));
-    // `fallbacks`：调用方给了字面量就补（[`ensure_fallbacks`]），没给只归一形态
-    // （[`normalize_fallbacks`]）。
+    // `fallbacks`：调用方给了字面量就补（[`ensure_fallbacks`]）；没给（族开关关着，或学到过
+    // 该模型不收）只在模拟路径上把客户端自带的字符串归一成官方数组（[`normalize_fallbacks`]）。
     let fallbacks_shaped = match fallbacks {
         Some(plan) => ensure_fallbacks(&mut v, plan),
         None => sim.is_some_and(|s| normalize_fallbacks(&mut v, s.profile)),
@@ -374,12 +382,6 @@ pub(super) fn rewrite_body_out(
     // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
-    // OpenAI 风格的 `tool_choice`（字符串 `"auto"`/`"none"`/`"required"`、`null`，或
-    // `{"type":"function","function":{"name":…}}`）归一成 Anthropic 的对象形态——上游对非对象
-    // 直接 400 `tool_choice: Input should be an object`。**无条件做**：这种形态在 Anthropic 这边
-    // 永远无效，没有「保留原样」的价值。放在剥字段之前：归一出来的 `{"type":"auto"}` 正好由
-    // 下一步按缺省剥掉。
-    let tool_choice_normalized = normalize_tool_choice(&mut v);
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
     // `display` 的去留：来访本来就是 CC 形态，或 `thinking` 整个是刚按官方形态补的，都留。

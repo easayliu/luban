@@ -111,8 +111,8 @@ const OPENAI_CONTENT_TYPES: &[&str] = &[
 /// | `tool_schema` | `tools[i]` 带 `function` / `parameters`，或 `type:"function"` | `{"name","description","input_schema"}` |
 /// | `top_level_field` | 顶层键在 [`OPENAI_TOP_LEVEL_FIELDS`] | 各有各的（`stop`→`stop_sequences`…） |
 ///
-/// `image_url` 一项**无条件**查（上游恒 400，本地拒省一次往返，是加开关之前就有的行为）；
-/// 其余全部由 `strict` 拨——对应网页上的 `reject_openai_shape` 开关。
+/// 全部由 `strict` 拨——对应网页上的 `reject_openai_shape` 开关。`image_url` 曾经无条件查
+/// （上游恒 400，本地拒省一次往返），0.3.214 起也跟开关走：关掉就是原样送上去。
 ///
 /// 各条判据对照官方实测（2026-09-30，直连 api.anthropic.com）：
 /// - 上游的 messages 认 `user` / `assistant` / `system` 三种 role。`system` 只在**首条
@@ -131,10 +131,15 @@ pub(super) fn find_openai_marker(
     cc_shaped: bool,
     strict: bool,
 ) -> Option<OpenAiMarker> {
+    // 全部判据都由 `strict`（`reject_openai_shape`）拨，`image_url` 也是：上游对它恒 400，
+    // 关着照样原样送上去——关掉就是不处理。
+    if !strict {
+        return None;
+    }
     let v = body?;
     let obj = v.as_object()?;
 
-    // 1) 内容块 type：`image_url` 无条件；其余 OpenAI type 仅 strict。
+    // 1) 内容块 type。
     let content_type_marker = |ty: &str, loc: String| -> Option<OpenAiMarker> {
         if ty == "image_url" {
             return Some(OpenAiMarker::new(
@@ -145,7 +150,7 @@ pub(super) fn find_openai_marker(
                  or {\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"...\"}}",
             ));
         }
-        (strict && OPENAI_CONTENT_TYPES.contains(&ty)).then(|| {
+        OPENAI_CONTENT_TYPES.contains(&ty).then(|| {
             OpenAiMarker::new(
                 loc,
                 "content_type",
@@ -158,47 +163,45 @@ pub(super) fn find_openai_marker(
         let first_turn = first_turn_index(msgs);
         for (mi, msg) in msgs.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-            if strict {
-                // 指令式 system（`content: []` 带 `output_config`）不是 OpenAI 的开头系统提示词，
-                // 上游对它「放在任何位置都收」，见 [`is_system_directive`]。
-                if role == "system" && mi < first_turn && !cc_shaped && !is_system_directive(msg) {
+            // 指令式 system（`content: []` 带 `output_config`）不是 OpenAI 的开头系统提示词，
+            // 上游对它「放在任何位置都收」，见 [`is_system_directive`]。
+            if role == "system" && mi < first_turn && !cc_shaped && !is_system_directive(msg) {
+                return Some(OpenAiMarker::new(
+                    format!("messages.{mi}.role"),
+                    "system_role",
+                    "a 'system' message before the first user or assistant message is the \
+                     OpenAI way of \
+                     passing the system prompt; the Anthropic API takes the initial system \
+                     prompt in the top-level 'system' field",
+                ));
+            }
+            if matches!(role, "tool" | "function" | "developer") {
+                let hint = if role == "developer" {
+                    "developer instructions go in the top-level 'system' field"
+                } else {
+                    "tool results go in a 'tool_result' block of a 'user' turn"
+                };
+                return Some(OpenAiMarker::new(
+                    format!("messages.{mi}.role"),
+                    "foreign_role",
+                    format!(
+                        "role '{role}' is an OpenAI message role; Anthropic messages take \
+                         'user' and 'assistant' turns, plus 'system' only after a user turn \
+                         ({hint})"
+                    ),
+                ));
+            }
+            for key in ["name", "tool_calls", "tool_call_id", "function_call"] {
+                if msg.get(key).is_some() {
                     return Some(OpenAiMarker::new(
-                        format!("messages.{mi}.role"),
-                        "system_role",
-                        "a 'system' message before the first user or assistant message is the \
-                         OpenAI way of \
-                         passing the system prompt; the Anthropic API takes the initial system \
-                         prompt in the top-level 'system' field",
-                    ));
-                }
-                if matches!(role, "tool" | "function" | "developer") {
-                    let hint = if role == "developer" {
-                        "developer instructions go in the top-level 'system' field"
-                    } else {
-                        "tool results go in a 'tool_result' block of a 'user' turn"
-                    };
-                    return Some(OpenAiMarker::new(
-                        format!("messages.{mi}.role"),
-                        "foreign_role",
+                        format!("messages.{mi}.{key}"),
+                        "message_field",
                         format!(
-                            "role '{role}' is an OpenAI message role; Anthropic messages take \
-                             'user' and 'assistant' turns, plus 'system' only after a user turn \
-                             ({hint})"
+                            "'{key}' is an OpenAI message field; Anthropic messages carry only \
+                             'role' and 'content' (tool calls are 'tool_use' / 'tool_result' \
+                             content blocks)"
                         ),
                     ));
-                }
-                for key in ["name", "tool_calls", "tool_call_id", "function_call"] {
-                    if msg.get(key).is_some() {
-                        return Some(OpenAiMarker::new(
-                            format!("messages.{mi}.{key}"),
-                            "message_field",
-                            format!(
-                                "'{key}' is an OpenAI message field; Anthropic messages carry only \
-                                 'role' and 'content' (tool calls are 'tool_use' / 'tool_result' \
-                                 content blocks)"
-                            ),
-                        ));
-                    }
                 }
             }
             let Some(content) = msg.get("content").and_then(|c| c.as_array()) else { continue };
@@ -208,27 +211,25 @@ pub(super) fn find_openai_marker(
                 if let Some(m) = content_type_marker(ty, loc.clone()) {
                     return Some(m);
                 }
-                if strict {
-                    let id_key = match ty {
-                        "tool_use" => Some("id"),
-                        "tool_result" => Some("tool_use_id"),
-                        _ => None,
-                    };
-                    if let Some(k) = id_key
-                        && let Some(id) =
-                            block.get(k).and_then(|i| i.as_str()).filter(|i| i.starts_with("call_"))
-                    {
-                        return Some(
-                            OpenAiMarker::new(
-                                format!("{loc}.{k}"),
-                                "tool_call_id",
-                                "tool call id starts with 'call_', the id form of OpenAI's \
-                                 tool_calls; the Anthropic API itself accepts it, but ids it issues \
-                                 are 'toolu_...', so this history went through an OpenAI converter",
-                            )
-                            .with_sample(id),
-                        );
-                    }
+                let id_key = match ty {
+                    "tool_use" => Some("id"),
+                    "tool_result" => Some("tool_use_id"),
+                    _ => None,
+                };
+                if let Some(k) = id_key
+                    && let Some(id) =
+                        block.get(k).and_then(|i| i.as_str()).filter(|i| i.starts_with("call_"))
+                {
+                    return Some(
+                        OpenAiMarker::new(
+                            format!("{loc}.{k}"),
+                            "tool_call_id",
+                            "tool call id starts with 'call_', the id form of OpenAI's \
+                             tool_calls; the Anthropic API itself accepts it, but ids it issues \
+                             are 'toolu_...', so this history went through an OpenAI converter",
+                        )
+                        .with_sample(id),
+                    );
                 }
                 // tool_result 内嵌的 content 数组也要扫。
                 if ty == "tool_result"
@@ -244,10 +245,6 @@ pub(super) fn find_openai_marker(
                 }
             }
         }
-    }
-
-    if !strict {
-        return None;
     }
 
     // 2) tool_choice 的 OpenAI 方言。
@@ -324,7 +321,7 @@ mod tests {
     use crate::proxy::{config, find_openai_marker};
     /// 剥字段走的是 [`crate::proxy::rewrite_body`] 这条统一路径，且开关关掉即原样透传。
     #[test]
-    fn openai_marker_image_url_is_unconditional() {
+    fn openai_marker_image_url_follows_strict() {
         let body = serde_json::json!({
             "model": "claude-sonnet-5", "max_tokens": 10,
             "messages": [{"role": "user", "content": [
@@ -332,11 +329,10 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
             ]}]
         });
-        for strict in [false, true] {
-            let m = find_openai_marker(Some(&body), false, strict).expect("image_url rejected");
-            assert_eq!(m.kind, "image_url");
-            assert_eq!(m.location, "messages.0.content.1");
-        }
+        let m = find_openai_marker(Some(&body), false, true).expect("image_url rejected");
+        assert_eq!(m.kind, "image_url");
+        assert_eq!(m.location, "messages.0.content.1");
+        assert!(find_openai_marker(Some(&body), false, false).is_none(), "关着不拦");
         // tool_result 内嵌的也查。
         let nested = serde_json::json!({
             "messages": [{"role": "user", "content": [
@@ -345,7 +341,7 @@ mod tests {
                 ]}
             ]}]
         });
-        let m = find_openai_marker(Some(&nested), false, false).unwrap();
+        let m = find_openai_marker(Some(&nested), false, true).unwrap();
         assert_eq!(m.location, "messages.0.content.0.content.0");
     }
 
@@ -525,6 +521,6 @@ mod tests {
         let img = serde_json::json!({"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
-        assert_eq!(find_openai_marker(Some(&img), false, false).unwrap().sample, None);
+        assert_eq!(find_openai_marker(Some(&img), false, true).unwrap().sample, None);
     }
 }

@@ -25,6 +25,10 @@ pub(in crate::proxy) const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 /// - `tool_choice` 强制工具调用（`tool` 或 `any`：haiku 那种手动预算的 thinking 上游不允许与它
 ///   并存，2026-10-07 实测 400；adaptive 的几族本来也不该替客户端在强制工具时多开思考）；
 /// - `max_tokens` 太小（< 1024）：thinking 本身要消耗 token 预算，探测级请求不值得加。
+///
+/// 补上之后客户端带的 `temperature` / `top_p` 若与 thinking 冲突，一并剥掉
+/// （[`drop_sampling_conflicting_with_thinking`]）：冲突是注入造成的，收拾也归注入这一步，
+/// 不依赖 `strip_extra_fields` 开着。
 pub(in crate::proxy) fn ensure_thinking(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,
@@ -49,10 +53,11 @@ pub(in crate::proxy) fn ensure_thinking(
     }
     let value = match profile.thinking {
         config::CcThinking::Enabled | config::CcThinking::EnabledUpdates => {
-            // `max_tokens == 1024` 时这里是 1023，随后 [`strip_extra_fields`] 抬到下限 1024，与
-            // `max_tokens` 相等。文档写预算须小于 `max_tokens`，但 2026-10-07 实测 haiku-4-5 这一
-            // 组合上游 200（出站带 interleaved-thinking，那时预算可以不小于 `max_tokens`），不改。
-            let budget = max_tokens.saturating_sub(1).max(1);
+            // 上游要求 `budget_tokens >= 1024`：`max_tokens == 1024` 时 `max_tokens - 1` 是 1023，
+            // 这里直接抬到下限 1024，与 `max_tokens` 相等——不能指望 [`strip_extra_fields`] 开着
+            // 来抬。文档写预算须小于 `max_tokens`，但 2026-10-07 实测 haiku-4-5 这一组合上游 200
+            // （出站带 interleaved-thinking，那时预算可以不小于 `max_tokens`），不改。
+            let budget = max_tokens.saturating_sub(1).max(1024);
             // 官方 key 序是 `budget_tokens` → `type` → `display`，手工插入以保住顺序
             // （`cap/2.1.260/00020`）。
             let mut m = serde_json::Map::new();
@@ -77,6 +82,10 @@ pub(in crate::proxy) fn ensure_thinking(
         value,
         &["max_tokens", "metadata", "tools", "system", "messages", "model"],
     );
+    // 注入的 thinking 与客户端的 `temperature` / `top_p` 冲突时，冲突是 luban 造的，就地剥掉。
+    if let Some(obj) = v.as_object_mut() {
+        drop_sampling_conflicting_with_thinking(obj);
+    }
     true
 }
 

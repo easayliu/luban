@@ -366,14 +366,14 @@ export function ForwardingSettingsContent() {
           k="strip_extra_fields"
           label={t('移除多余字段', 'Strip extra fields')}
           summary={t(
-            '删除官方客户端从不发送的请求字段，仅限语义上等同于默认值的字段。',
-            'Remove request fields the official client never sends, limited to those equivalent to their defaults.',
+            '删除官方客户端从不发送的请求字段，并修补与 thinking 冲突、上游必定拒绝的参数组合。',
+            'Remove request fields the official client never sends, and repair parameter combinations that conflict with thinking and that upstream always rejects.',
           )}
           description={
             <>
               {t(
-                '官方客户端的对话请求字段是固定的一套，多出的字段会构成一处稳定特征，可能导致请求被判为第三方应用而改扣超额用量。开启后，luban 会删除两项：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时保持不变）；二是 thinking 里的 display 字段。代价：删除 display 后上游不再返回思考摘要，客户端的「思考过程」将显示为空，但功能本身不受影响。真实的官方客户端本来就不发送这两项，开启本项对其没有任何影响。',
-                'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes two things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), and the display field inside thinking. Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. The real official client never sends either field, so enabling this is a no-op for it.',
+                '官方客户端的对话请求字段是固定的一套，多出的字段会构成一处稳定特征，可能导致请求被判为第三方应用而改扣超额用量。开启后，luban 会删除三项：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时保持不变）；二是 thinking 里的 display 字段；三是 fable 族不支持的 thinking: disabled（删除后上游按默认的 adaptive 处理）。代价：删除 display 后上游不再返回思考摘要，客户端的「思考过程」将显示为空，但功能本身不受影响。此外还会修补客户端自己写的、与 thinking 冲突的组合，这些组合原样发出必定返回 400：强制指定工具时删除手动预算的 thinking；budget_tokens 不足 1024 时抬到 1024；thinking 开启时删除不等于 1 的 temperature 和小于 0.95 的 top_p。luban 自己注入的 thinking 引起的冲突由注入那一步自行处理，不依赖本项。真实的官方客户端本来就不发送这些，开启本项对其基本没有影响。',
+                'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes three things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), the display field inside thinking, and thinking: disabled on the fable family, which does not support it (upstream then falls back to its adaptive default). Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. It also repairs client-written combinations that conflict with thinking and always come back as a 400: with a forced tool choice, a manually budgeted thinking is removed; a budget_tokens below 1024 is raised to 1024; with thinking on, a temperature other than 1 and a top_p below 0.95 are removed. Conflicts caused by thinking that luban injects itself are cleaned up by the injection step and do not depend on this switch. The real official client never sends any of these, so enabling this is essentially a no-op for it.',
               )}
             </>
           }

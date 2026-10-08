@@ -244,7 +244,13 @@ pub async fn run_flusher(
         tick.tick().await;
         let now = Instant::now();
         t.gc(now);
-        for f in t.take_due(now) {
+        let due = t.take_due(now);
+        // `api_telemetry` 关掉之后，队列里攒着的那批也不发：关掉就是不发，不等它排空。
+        // 队列里只有逐请求的 API 遥测（保活那一半不走这里）。
+        if !store.forward_flags().api_telemetry {
+            continue;
+        }
+        for f in due {
             let Ok(Some(cred)) = store.get(f.cred_id) else { continue };
             // 订阅未生效暂停中的号同样不发：上游对它每一发都是 403。
             if cred.is_banned() || cred.is_subscription_paused() {

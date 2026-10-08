@@ -192,14 +192,17 @@ pub struct ForwardFlags {
     ///
     /// 依据是两份直连抓包（`cap/raw/00006` opus-5、`00009` sonnet-5）的顶层键完全一致：
     /// `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
-    /// output_config, stream`。多出来的键都是官方不产生的形态。目前剥两样：
-    /// 等价于缺省的 `tool_choice:{"type":"auto"}`，以及 `thinking.display`。
+    /// output_config, stream`。多出来的键都是官方不产生的形态。剥的有：等价于缺省的
+    /// `tool_choice:{"type":"auto"}`、`thinking.display`、fable 族的 `thinking:disabled`。
+    /// 另外顺手修补客户端自己写的、与 thinking 冲突必回 400 的组合：强制工具时删手动预算的
+    /// thinking、`budget_tokens` 抬到 1024、剥掉 thinking 开着时的 `temperature≠1` 与
+    /// `top_p<0.95`。luban 自己注入的 thinking 不靠本项收拾，见 `proxy::ensure_thinking`。
     ///
     /// **`thinking.display` 那项有代价**：剥掉后回程的 `thinking` 块文本为空，客户端看不到
     /// 思考摘要（功能不坏，只是没内容）。默认仍开——被判成第三方应用是**整条请求打不通**，
     /// 拿摘要换连通性划算；不接受这个代价就关掉本项。
     ///
-    /// 对真实 CC 是空操作：它本来就不发这两样。
+    /// 对真实 CC 基本是空操作：它本来就不发这些。
     pub strip_extra_fields: bool,
     /// 把上游会判成第三方应用的工具名换成假名转发，回程再还原（见
     /// [`crate::proxy::ToolNameMap`]）。
