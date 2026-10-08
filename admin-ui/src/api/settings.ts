@@ -123,6 +123,8 @@ export interface Settings {
   reject_refusals: boolean
   /** 本地拒绝上游回过 200 却零输出的请求类（403）。 */
   reject_empty_replies: boolean
+  /** 上游以 400 拒过的「模型 + 某个取值」组合，同样的请求再来时本地拒绝；关掉即不学也不拦。 */
+  reject_learned_shapes: boolean
   /** 替每条转发的 /v1/messages 上报官方客户端形态的遥测（事件链、Datadog 日志、OTel 指标）。 */
   api_telemetry: boolean
   /** 保活循环里的空闲遥测（版本检查事件 + Datadog 日志 + GrowthBook 画像）。 */
@@ -175,6 +177,7 @@ export type ForwardingKey =
   | 'reject_probes_strict'
   | 'reject_refusals'
   | 'reject_empty_replies'
+  | 'reject_learned_shapes'
   | 'api_telemetry'
   | 'keepalive_telemetry'
   | 'fable_refusal_fallback'

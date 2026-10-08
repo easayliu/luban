@@ -261,10 +261,13 @@ pub(super) fn park_if_quota_nearly_exhausted(
     info: &RateLimitInfo,
 ) -> bool {
     // 与 429 那一档同受「限流冷却/换号重试」这个总开关：关掉它的人要的是**完全**不干预调度、
-    // 原样把上游的判决交给客户端，那时按使用率自动停号只会是个惊吓。要单独关本机制，把阈值
-    // 配成 0 即可。
+    // 原样把上游的判决交给客户端，那时按使用率自动停号只会是个惊吓。重试次数配 0 同样视为
+    // 关闭（与转发、连通性测试口径一致）。要单独关本机制，把阈值配成 0 即可。
     let thresholds = QuotaPauseThresholds::for_credential(store, cred);
-    if thresholds.all_off() || !store.forward_flags().rate_limit_retry {
+    if thresholds.all_off()
+        || !store.forward_flags().rate_limit_retry
+        || store.rate_limit_retry_max() == 0
+    {
         return false;
     }
     let Some((window, used)) = info.saturated_base_window(&thresholds) else {

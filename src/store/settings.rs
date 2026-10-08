@@ -315,6 +315,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_EMPTY_REPLIES).or_else(|| on(REJECT_PROBES)) {
             flags.reject_empty_replies = v;
         }
+        if let Some(v) = on(REJECT_LEARNED_SHAPES) {
+            flags.reject_learned_shapes = v;
+        }
         if let Some(v) = on(API_TELEMETRY) {
             flags.api_telemetry = v;
         }
@@ -648,6 +651,10 @@ pub const REJECT_REFUSALS: &str = "reject_refusals";
 /// 见 [`ForwardFlags::reject_empty_replies`] 与 `proxy::known_empty_reply`。
 pub const REJECT_EMPTY_REPLIES: &str = "reject_empty_replies";
 
+/// 是否从上游 400 里学请求形态错误、并在本地拒掉同样的组合（`kind = "shape"`）。默认开；
+/// 关掉即不学也不拦。见 [`ForwardFlags::reject_learned_shapes`]。
+pub const REJECT_LEARNED_SHAPES: &str = "reject_learned_shapes";
+
 /// 探针拒绝的**严格模式**：ping 不再要求无 tools，并新增「短开场」判据（无 system、无 tools、
 /// 一条几个字的用户消息）。默认关——会误伤真人用裸聊天客户端发的第一句「你好」。
 /// 见 [`ForwardFlags::reject_probes_strict`] 与 `proxy::probe_signature`。
@@ -687,7 +694,7 @@ pub const LATEST_CC_RELEASE: &str = "latest_cc_release";
 /// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
 ///
 /// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
-/// 400 拒绝、不转发；`"off"` = 不做任何处理，交给上游（被动重试兜底）。
+/// 400 拒绝、不转发；`"off"` = 不做任何处理：原样转发，上游的 400 也不重试。
 pub const PREFILL_POLICY: &str = "prefill_policy";
 
 /// 4.6+ 模型收到 assistant message prefill 时的处理策略。
@@ -697,7 +704,7 @@ pub enum PrefillPolicy {
     Strip,
     /// 本地直接 400 拒绝，不转发。
     Reject,
-    /// 不做任何处理，让上游的 400 触发被动重试兜底。
+    /// 不做任何处理：原样转发，上游的 400 原样回给客户端。
     Off,
 }
 
@@ -720,7 +727,7 @@ impl std::fmt::Display for PrefillPolicy {
 /// 4.7+ 模型不支持 sampling 参数（`temperature`/`top_p`/`top_k`）时的处理策略的 settings 键名。
 ///
 /// 取值与 [`PREFILL_POLICY`] 相同：`"strip"`（默认）= 主动剥掉后转发；`"reject"` = 本地
-/// 直接 400 拒绝；`"off"` = 不做任何处理，交给运行时学习兜底。
+/// 直接 400 拒绝；`"off"` = 不做任何处理：原样转发，上游的 400 也不学。
 pub const SAMPLING_POLICY: &str = "sampling_policy";
 
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座

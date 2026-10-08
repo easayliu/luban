@@ -1165,19 +1165,17 @@ pub(super) fn model_rejects_sampling(model: &str) -> bool {
 /// 除了运行时学到的 [`DeprecatedFieldMemory`]，还按官方文档预置了已知模型的 deprecated
 /// 字段（[`model_rejects_sampling`]），避免冷启动第一条请求白撞一次 400。
 ///
-/// `use_static_list`：是否启用静态预置名单。`sampling_policy=off` 时传 `false`，
-/// 关掉主动剥离但保留运行时学习兜底。
+/// `sampling_policy=off` 时调用方根本不进这里：不处理就是原样转发，学到的也不用。
 pub(super) fn maybe_strip_deprecated(
     mem: &DeprecatedFieldMemory,
     model: Option<&str>,
     body_json: Option<&serde_json::Value>,
     body: Bytes,
-    use_static_list: bool,
 ) -> Bytes {
     let Some(model) = model else { return body };
     let Some(bj) = body_json else { return body };
     let Some(obj) = bj.as_object() else { return body };
-    let static_reject = use_static_list && model_rejects_sampling(model);
+    let static_reject = model_rejects_sampling(model);
     let table = mem.read();
     let to_strip: Vec<&str> = DEPRECATABLE_FIELDS
         .iter()

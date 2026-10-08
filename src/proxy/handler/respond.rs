@@ -193,13 +193,14 @@ async fn relay_ok(
             .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone())),
         // 按 message thread 改写过的，回程据回复提交或作废线程状态，见 [`ReqLog::cc_thread`]。
         cc_thread: upstream.sim.as_ref().and_then(|s| s.take_thread()),
-        // 只给计费路径分类：count_tokens 之流没有「回复」可言。
-        empty_reply_key: if billable {
+        // 只给计费路径分类：count_tokens 之流没有「回复」可言。三把键各自跟着拦截开关走：
+        // 开关关着不学，免得关着期间攒下的规则在打开那一刻全部生效。
+        empty_reply_key: if billable && flags.reject_empty_replies {
             empty_reply_class(req_model.as_deref(), body_json.as_ref())
         } else {
             None
         },
-        prompt_key: if billable {
+        prompt_key: if billable && flags.reject_refusals {
             req_model
                 .as_deref()
                 .zip(body_json.as_ref().and_then(prompt_digest))
@@ -207,7 +208,7 @@ async fn relay_ok(
         } else {
             None
         },
-        app_key: if billable && session_less {
+        app_key: if billable && session_less && flags.reject_refusals {
             req_model
                 .as_deref()
                 .zip(body_json.as_ref().and_then(app_system_digest))
@@ -315,18 +316,25 @@ async fn client_error(
         rl.forensics.third_party = is_third_party_rejection(&err_bytes);
     }
     if !compressed && status == StatusCode::BAD_REQUEST {
-        let mut learned = remember_shape_rejection(
-            &state.shape_rejections,
-            req_model.as_deref(),
-            body_json.as_ref(),
-            &err_bytes,
-        );
-        learned.extend(remember_deprecated_field(
-            &state.deprecated_fields,
-            req_model.as_deref(),
-            body_json.as_ref(),
-            &err_bytes,
-        ));
+        // 各自的开关关着就不学：关掉的意思是不处理，学了只会在开关打开那一刻冒出来。
+        let mut learned = Vec::new();
+        if flags.reject_learned_shapes {
+            learned.extend(remember_shape_rejection(
+                &state.shape_rejections,
+                req_model.as_deref(),
+                body_json.as_ref(),
+                &err_bytes,
+            ));
+        }
+        // `sampling_policy=off` 是「不处理」：上游的 deprecated 400 原样回给客户端，不学。
+        if state.store.sampling_policy() != store::PrefillPolicy::Off {
+            learned.extend(remember_deprecated_field(
+                &state.deprecated_fields,
+                req_model.as_deref(),
+                body_json.as_ref(),
+                &err_bytes,
+            ));
+        }
         // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
         if let Err(e) = state.store.remember_rejections(&learned) {
             tracing::warn!(error = %e, "persisting learned rejections failed (kept in memory)");
@@ -523,8 +531,10 @@ async fn client_error(
         }
     }
     // assistant prefill 不支持时，剥掉末尾 assistant 轮后重试一次。
+    // `prefill_policy=off` 是「不处理」：上游的 400 原样回给客户端，不重试。
     if status == StatusCode::BAD_REQUEST
         && !compressed
+        && state.store.prefill_policy() != store::PrefillPolicy::Off
         && is_prefill_not_supported_error(&err_bytes)
         && let Some(up) = retry_without_prefill(upstream, cred, device_fp, body, &mut rl).await
     {

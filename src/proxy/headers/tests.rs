@@ -404,6 +404,7 @@ fn all_flags_off_only_injects_auth() {
         reject_probes_strict: false,
         reject_refusals: false,
         reject_empty_replies: false,
+        reject_learned_shapes: false,
         api_telemetry: false,
         keepalive_telemetry: false,
         fable_refusal_fallback: false,

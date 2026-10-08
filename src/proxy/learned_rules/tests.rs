@@ -1184,7 +1184,7 @@ fn strips_sampling_for_known_models_without_learning() {
     ] {
         let body = temp_req(model);
         let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out = crate::proxy::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw, true);
+        let out = crate::proxy::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("temperature").is_none(), "{model}: temperature 应该被主动剥掉");
         assert!(v.get("model").is_some(), "{model}: 不该动别的字段");
@@ -1198,13 +1198,8 @@ fn does_not_strip_sampling_for_old_models() {
     for model in &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
         let body = temp_req(model);
         let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out = crate::proxy::maybe_strip_deprecated(
-            &mem,
-            Some(model),
-            body.as_ref(),
-            raw.clone(),
-            true,
-        );
+        let out =
+            crate::proxy::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw.clone());
         assert_eq!(out, raw, "{model}: 不该主动剥");
     }
 }
@@ -1223,7 +1218,6 @@ fn strips_deprecated_field_after_learning() {
         Some("claude-opus-4-6"),
         body.as_ref(),
         raw.clone(),
-        true,
     );
     assert_eq!(out, raw, "学之前应该原样返回");
 
@@ -1237,13 +1231,8 @@ fn strips_deprecated_field_after_learning() {
     assert_eq!(mem.read().len(), 1);
 
     // 学过之后剥掉。
-    let out = crate::proxy::maybe_strip_deprecated(
-        &mem,
-        Some("claude-opus-4-6"),
-        body.as_ref(),
-        raw,
-        true,
-    );
+    let out =
+        crate::proxy::maybe_strip_deprecated(&mem, Some("claude-opus-4-6"), body.as_ref(), raw);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(v.get("temperature").is_none(), "temperature 应该被剥掉: {v}");
     assert!(v.get("model").is_some(), "不该动别的字段: {v}");
@@ -1257,7 +1246,6 @@ fn strips_deprecated_field_after_learning() {
         Some("claude-sonnet-4-6"),
         other_body.as_ref(),
         other_raw.clone(),
-        true,
     );
     assert_eq!(out, other_raw, "不同模型不该被剥");
 }
@@ -1294,13 +1282,8 @@ fn learns_top_p_deprecated() {
     );
     assert_eq!(mem.read().len(), 1);
     let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-    let out = crate::proxy::maybe_strip_deprecated(
-        &mem,
-        Some("claude-fable-5"),
-        body.as_ref(),
-        raw,
-        true,
-    );
+    let out =
+        crate::proxy::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(v.get("top_p").is_none(), "top_p 应该被剥掉: {v}");
 }
@@ -1322,7 +1305,7 @@ fn graceful_on_missing_model_or_body() {
     assert!(mem.read().is_empty());
     // 剥也一样安全。
     let raw = Bytes::from_static(b"{}");
-    assert_eq!(crate::proxy::maybe_strip_deprecated(&mem, None, None, raw.clone(), true), raw);
+    assert_eq!(crate::proxy::maybe_strip_deprecated(&mem, None, None, raw.clone()), raw);
 }
 
 /// [`record_app_request`]：按比例学——拒答至少 3 条且占该应用请求数三成以上才学；风暴应用

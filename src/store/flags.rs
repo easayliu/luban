@@ -306,6 +306,11 @@ pub struct ForwardFlags {
     /// 上游收了输入的钱、一个字没回，每条都是一次白白留下的「一台设备只问一句话」记录。
     /// 规则随其他学到的规则落库、7 天到期、控制台可删。默认开。
     pub reject_empty_replies: bool,
+    /// 是否从上游 400 里**学请求形态错误**并在本地拒掉同样的组合（`effort: 'xhigh'`、
+    /// `role: 'system'`、某个 tool type 之类；`kind = "shape"`，见 `proxy::remember_shape_rejection`
+    /// 与 `proxy::known_shape_rejection`）。关掉即两头都停：不学，已学到的也不拦，400 照常
+    /// 交给上游。规则随其他学到的规则落库、7 天到期、控制台可删。默认开。
+    pub reject_learned_shapes: bool,
     /// 替每条转发成功的 `/v1/messages` 上报官方客户端会发的那串遥测：一方事件
     /// （`tengu_api_query` → `tengu_api_success` → `tengu_turn_end`，带上游 `request-id`、
     /// 逐项 token 与花费）、Datadog 日志、OTel 指标，身份取实际发往上游的那份，节奏照
@@ -393,6 +398,7 @@ impl Default for ForwardFlags {
             reject_probes_strict: false,
             reject_refusals: true,
             reject_empty_replies: true,
+            reject_learned_shapes: true,
             api_telemetry: true,
             keepalive_telemetry: true,
             fable_refusal_fallback: false,

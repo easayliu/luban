@@ -710,8 +710,8 @@ export function ForwardingSettingsContent() {
           k="reject_refusals"
           label={t('拒绝已拒答的提示词', 'Reject refused prompts')}
           summary={t(
-            '上游分类器拒答过的提示词，逐字相同地重发时不再发往上游，由本地原样回放上游那次的响应（200 加同一段 stop_reason refusal 响应体）；无法识别会话的客户端（既不带会话 ID 也不带 device_id 的中转）另按「模型 + system」学习，拒答至少 3 条且占该应用请求 30% 以上才形成规则，此后同一应用的请求一律回放；出站带 fallbacks 的请求不拦截，由上游换用其他模型重新生成。',
-            'A prompt the upstream classifier has already refused is not forwarded when resent verbatim; luban replays upstream\'s own refusal (200 with the same stop_reason refusal body). Session-less clients (relays sending neither a session ID nor a device_id) are additionally learned per model + system prompt once at least 3 refusals make up 30% or more of that app\'s requests, and every further request of that app is replayed. Requests that go out with fallbacks are not blocked, so upstream can rerun them on another model.',
+            '上游分类器拒答过的提示词，逐字相同地重发时不再发往上游，由本地原样回放上游那次的响应（200 加同一段 stop_reason refusal 响应体）；无法识别会话的客户端（既不带会话 ID 也不带 device_id 的中转）另按「模型 + system」学习，拒答至少 3 条且占该应用请求 30% 以上才形成规则，此后同一应用的请求一律回放；出站带 fallbacks 的请求不拦截，由上游换用其他模型重新生成。停用时既不拦截也不学习。',
+            'A prompt the upstream classifier has already refused is not forwarded when resent verbatim; luban replays upstream\'s own refusal (200 with the same stop_reason refusal body). Session-less clients (relays sending neither a session ID nor a device_id) are additionally learned per model + system prompt once at least 3 refusals make up 30% or more of that app\'s requests, and every further request of that app is replayed. Requests that go out with fallbacks are not blocked, so upstream can rerun them on another model. Turned off, nothing is blocked and nothing is learned.',
           )}
           description={
             <>
@@ -726,14 +726,30 @@ export function ForwardingSettingsContent() {
           k="reject_empty_replies"
           label={t('拒绝零输出请求类', 'Reject empty-reply request classes')}
           summary={t(
-            '某模型对「无 tools 单条消息 + 某个 max_tokens」返回过 200 却零输出之后，同类请求在本地直接返回 403，不限 UA。',
-            'Once a model has answered a tool-less single-message request with a given max_tokens with 200 and zero output, that request class is rejected locally with 403, regardless of UA.',
+            '某模型对「无 tools 单条消息 + 某个 max_tokens」返回过 200 却零输出之后，同类请求在本地直接返回 403，不限 UA。停用时既不拦截也不学习。',
+            'Once a model has answered a tool-less single-message request with a given max_tokens with 200 and zero output, that request class is rejected locally with 403, regardless of UA. Turned off, nothing is blocked and nothing is learned.',
           )}
           description={
             <>
               {t(
                 '这条规则从响应中学习，不限 UA：某模型对「无 tools 的单条消息 + 某个 max_tokens」返回过 200 却零输出（有 usage、output_tokens 为 0，即上游收取了输入费用但未返回任何内容）之后，同类请求在本地返回 403；上游当时回复的开头记录在流水的对应记录与「从上游学到的规则」中。带 tools、多轮或换了 max_tokens 的请求不受影响。类别划分较窄，倾向于放行。封号复盘中，这样的记录在 13 小时里每 37 秒出现一条，每条在上游看来都是「一台设备只问一句话、什么都没得到」的探活式痕迹。模拟路径重建的是身份，改变不了「单句请求、上游零输出」这一事实，所以不限 UA。规则 7 天后到期，可手动删除。',
                 'This rule is learned from responses, regardless of UA: once a model has answered a tool-less single-message request with a given max_tokens with 200 and zero output tokens (usage present, output_tokens 0: upstream billed the input and returned nothing), that request class is rejected locally with 403; the start of that upstream reply is kept on the usage record and under “Rules learned from upstream”. Requests with tools, multi-turn conversations, or a different max_tokens are unaffected; the class is deliberately narrow, erring on the side of letting requests through. The ban post-mortem had one such record every 37 seconds for 13 hours, each one a probe-like trace of "one device asking one question and getting nothing" on the upstream side; the simulation path rebuilds identity but cannot change that, hence no UA limit. Rules expire after 7 days and can be removed by hand.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="reject_learned_shapes"
+          label={t('拒绝已学到的形态错误', 'Reject learned shape errors')}
+          summary={t(
+            '上游以 400 拒过的「模型 + 某个取值」组合（如 effort: xhigh、role: system、某种 tool type），同样的请求再来时在本地直接返回 400。停用时既不拦截也不学习。',
+            'A model + value combination upstream has rejected with a 400 (such as effort: xhigh, role: system, or a tool type) is rejected locally with 400 when it comes again. Turned off, nothing is blocked and nothing is learned.',
+          )}
+          description={
+            <>
+              {t(
+                '这是纯粹的请求形态错误：换哪个账号发送都是同一条 400，发往上游只会白占一次请求配额，并在上游留下一条与账号状态无关的 4xx。规则由上游的 400 学习而来，本地拒绝时返回的也是上游当时的原话。中途的 system 消息若会被「System Role 提升」整条移到顶层，则不受学到的 role: system 规则拦截。规则记录在「从上游学到的规则」中，7 天后到期，也可手动删除。停用后，这类请求原样发往上游，由上游返回 400，停用期间不会积累新规则。',
+                'These are pure request-shape errors: whichever account sends it gets the same 400, so forwarding it only wastes a request and leaves a 4xx upstream that has nothing to do with the account. Rules are learned from upstream 400s, and a local rejection returns upstream’s original message. A mid-conversation system message that “System role hoisting” will move to the top level is not blocked by a learned role: system rule. Rules live under “Rules learned from upstream”, expire after 7 days and can be removed by hand. Turned off, such requests go upstream as is and upstream answers with the 400; no new rules are learned meanwhile.',
               )}
             </>
           }
@@ -789,6 +805,10 @@ export function ForwardingSettingsContent() {
                 'When an account’s usage is exhausted, the entire account is cooled down; when only the current model is limited, only that model is cooled down. The defaults are 60 / 30 seconds respectively, with the upstream wait time taking precedence. Switching accounts rebinds requests that carry a device identity and may also reduce the cache hit rate. When the retry limit is reached or no other account is available, return',
               )}{' '}
               <code className="font-mono tabular-nums">429</code>{t('。', '.')}
+              {t(
+                '停用时 429 原样透传：不冷却、不换账号，也不记录「套餐不含该模型」。',
+                ' Turned off, 429s pass through as is: no cooldown, no account switching, and no “model not in plan” record.',
+              )}
             </>
           }
         />

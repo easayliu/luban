@@ -29,9 +29,9 @@ pub(super) struct Swaps {
     pub(super) tried: Vec<i64>,
     pub(super) retried: usize,
     pub(super) max_retry: usize,
-    /// 「套餐不含这个模型」引发的换号次数，与 429 那套 `retried`/`max_retry` **分开计**：那个
-    /// 开关管的是限流，关掉表示「429 原样透传」；而这一档是确定性失败，换号一定有意义，不受
-    /// 那个开关约束，见 [`LimitScope::Unsupported`]。
+    /// 「套餐不含这个模型」引发的换号次数，与 429 那套 `retried`/`max_retry` **分开计**：这一档
+    /// 是确定性失败，换号一定有意义，不该吃限流重试的次数。但仍受那个开关约束：关掉（或次数
+    /// 配 0）表示「429 原样透传」，这一档也不学、不换号，见 [`LimitScope::Unsupported`]。
     pub(super) denial_swaps: usize,
 }
 
@@ -520,10 +520,19 @@ async fn on_429(
     // 基础窗口真耗尽 → 停调度整个账号；超额池（7d_oi）满 → 只冷却这个模型、换号仍有意义；
     // 谁的额度都没满（容量/请求速率）→ 只冷却这个模型且**不换号**，见 [`LimitScope`]。
     let scope = rate_limit_scope_for(&info, req_model.as_deref(), is_max_plan(cred));
-    // 套餐不含这个模型：记准入、换号重发。学习不设条件——记录是对的就该记；换号有次数上限，
-    // 免得一条请求把整池的 Pro 号挨个点一遍。换不到号时若是「全被判过」就回 403 让客户端
-    // 换模型，其余原因（都在冷却等）保留上游那发 429 原样透传。
+    // 套餐不含这个模型：记准入、换号重发。换号有次数上限，免得一条请求把整池的 Pro 号挨个
+    // 点一遍。换不到号时若是「全被判过」就回 403 让客户端换模型，其余原因（都在冷却等）保留
+    // 上游那发 429 原样透传。429 开关关着（或次数配 0）时原样透传，不学也不换号。
     if let LimitScope::Unsupported(model) = &scope {
+        if swaps.max_retry == 0 {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                model = %model,
+                ratelimit = %info.raw,
+                "upstream 429 with no quota window for this model (plan does not include it); rate-limit handling is off, passing through as-is"
+            );
+            return Flow::Done(resp, upstream_limit);
+        }
         let reason = info.plan_denial_reason();
         tracing::warn!(
             cred_id = cred.id, cred = %cred.label,

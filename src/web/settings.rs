@@ -156,6 +156,8 @@ struct ForwardingResp {
     reject_refusals: bool,
     /// 本地拒绝上游回过 200 却零输出的请求类（403）。
     reject_empty_replies: bool,
+    /// 从上游 400 学请求形态错误并在本地拒掉同样的组合；关掉即不学也不拦。
+    reject_learned_shapes: bool,
     /// 替每条转发的 `/v1/messages` 上报官方客户端形态的遥测。
     api_telemetry: bool,
     /// 保活循环里的空闲遥测（版本检查事件 + Datadog + GrowthBook 画像）。
@@ -205,6 +207,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_probes_strict: f.reject_probes_strict,
             reject_refusals: f.reject_refusals,
             reject_empty_replies: f.reject_empty_replies,
+            reject_learned_shapes: f.reject_learned_shapes,
             api_telemetry: f.api_telemetry,
             keepalive_telemetry: f.keepalive_telemetry,
             fable_refusal_fallback: f.fable_refusal_fallback,

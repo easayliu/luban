@@ -330,7 +330,11 @@ pub async fn probe(
                 .then(|| rate_limit_scope_for(&info, Some(model), is_max_plan(cred)));
             // 测试通过时要不要照真实判决恢复限流那几档，见下面 `report.ok` 那段。
             let mut resume_rate_limited = false;
-            if let Some(LimitScope::Unsupported(_)) = &probe_scope {
+            let rate_limit_handling = state.store.forward_flags().rate_limit_retry
+                && state.store.rate_limit_retry_max() > 0;
+            if let Some(LimitScope::Unsupported(_)) = &probe_scope
+                && rate_limit_handling
+            {
                 let reason = info.plan_denial_reason();
                 tracing::warn!(
                     cred_id = cred.id, cred = %cred.label,
@@ -343,8 +347,8 @@ pub async fn probe(
                     tracing::error!(cred_id = cred.id, error = %e, "persisting the model denial failed");
                 }
             } else if let Some(scope) = probe_scope
-                && state.store.forward_flags().rate_limit_retry
-                && state.store.rate_limit_retry_max() > 0
+                && !matches!(scope, LimitScope::Unsupported(_))
+                && rate_limit_handling
             {
                 let cooldown = info.cooldown_for(&scope);
                 tracing::warn!(

@@ -559,9 +559,9 @@ fn prefill_gate(
     //       上游会返回 400。策略由 `prefill_policy` 控制：
     //       - strip（默认）：主动剥掉末尾 assistant 轮后转发，省去白跑一趟。
     //       - reject：本地直接 400 拒绝，不往上游送。
-    //       - off：不做任何处理，交给上游（被动重试兜底）。
-    //       后面那条被动重试（[`is_prefill_not_supported_error`] → [`retry_without_prefill`]）
-    //       仍保留作为兜底：万一新模型不在列表里、或者上游的拒绝消息换了措辞。
+    //       - off：不做任何处理，原样转发，上游的 400 也原样回给客户端。
+    //       strip / reject 下后面那条被动重试（[`is_prefill_not_supported_error`] →
+    //       [`retry_without_prefill`]）仍作兜底：万一新模型不在列表里、或者上游的拒绝消息换了措辞。
     let body = if req_model.as_deref().is_some_and(model_rejects_prefill)
         && has_trailing_assistant(body_json.as_ref())
     {
@@ -619,14 +619,17 @@ fn shape_gates(
     //      `role: 'system'` 之类）→ 本地直接拒，不往上游送。这是纯粹的请求形态错误：
     //      换哪个号发都是同一条 400，送上去只会白占一次请求配额，并在日志里留下一条与
     //      账号状态无关的 4xx。规则不是写死的，是上游那条 400 自己喂出来的，回给客户端的
-    //      也是它当初那句原话，见 [`remember_shape_rejection`]。
-    let system_hoisted = billable && hoists_system_role(&state.store.forward_flags(), cc_shaped);
-    if let Some((field, value, message)) = known_shape_rejection(
-        &state.shape_rejections,
-        req_model.as_deref(),
-        body_json.as_ref(),
-        system_hoisted,
-    ) {
+    //      也是它当初那句原话，见 [`remember_shape_rejection`]。`reject_learned_shapes` 关掉时不拦。
+    let flags = state.store.forward_flags();
+    let system_hoisted = billable && hoists_system_role(&flags, cc_shaped);
+    if flags.reject_learned_shapes
+        && let Some((field, value, message)) = known_shape_rejection(
+            &state.shape_rejections,
+            req_model.as_deref(),
+            body_json.as_ref(),
+            system_hoisted,
+        )
+    {
         tracing::warn!(
             %method, path = %path_and_query, ua = %client_ua,
             model = %req_model.as_deref().unwrap_or("-"), %field, %value,
@@ -851,9 +854,12 @@ fn sampling_gate(
     let Facts { ref body_json, ref req_model, .. } = *facts;
     // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
     //       策略由 `sampling_policy` 控制：strip（默认）= 剥掉后转发，reject = 本地 400，
-    //       off = 不做静态预置处理（运行时学习仍兜底）。
+    //       off = 原样转发——静态名单和学到的都不用，上游 400 也不学（见 respond 里的学习入口）。
     //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
     let sampling_policy = state.store.sampling_policy();
+    if sampling_policy == store::PrefillPolicy::Off {
+        return Ok(body);
+    }
     // reject 策略下静态名单与学到的组合一视同仁：都是「这个模型不收这个参数」的既定事实。
     let body = if sampling_policy == store::PrefillPolicy::Reject
         && ((req_model.as_deref().is_some_and(model_rejects_sampling)
@@ -879,7 +885,6 @@ fn sampling_gate(
             req_model.as_deref(),
             body_json.as_ref(),
             body,
-            sampling_policy != store::PrefillPolicy::Off,
         )
     };
     Ok(body)
