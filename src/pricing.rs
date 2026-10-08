@@ -2,16 +2,18 @@
 //!
 //! 订阅账号本身按订阅计费，此处仅用于「等价 API 费用」的参考统计。
 //! 价目对齐官方 <https://platform.claude.com/docs/en/about-claude/pricing>
-//! （每百万 token，MTok，美元；最后核对 2026-09-23）。相对基础输入价的倍率：
+//! （每百万 token，MTok，美元；最后核对 2026-10-08）。相对基础输入价的倍率：
 //! - 缓存写（5 分钟）：×1.25；缓存写（1 小时）：×2.0——所有模型通用。
 //! - 缓存读：×0.10 通用；**Fable 5.1 / Mythos 5.1 例外为 ×0.025**（$0.25/MTok），
-//!   **Opus 5.5 例外为 ×0.05**（$0.20/MTok）。
+//!   **Opus 5.5 / Sonnet 5.5 例外为 ×0.05**（$0.20 / $0.10 每 MTok）。
 //!
 //! 不做 >200K 长上下文加价——官方明确 4.6 及以后模型含 1M 上下文按标准价计，
-//! 故带 `[1m]` 后缀的模型名与裸 id 同价。
+//! 故带 `[1m]` 后缀的模型名与裸 id 同价。**唯一例外是 Haiku 5.5**：按提示长度分两档，
+//! 提示（输入 + 缓存写 + 缓存读）超过 100K 时整条请求按 $0.50/$2.50 计，否则 $0.10/$0.50。
 //!
 //! Sonnet 5 的 $2/$10 原为 2026-08-31 截止的引导价，官方已宣布转为永久标准价，
-//! 9-01 不再涨到 $3/$15，故此处不再按时间切换。Sonnet 5.5 与 Sonnet 5 同价（$2/$10，缓存读 $0.20）。
+//! 9-01 不再涨到 $3/$15，故此处不再按时间切换。Sonnet 5.5 输入/输出与 Sonnet 5 同价（$2/$10），
+//! 缓存读后来降到 ×0.05（$0.10/MTok），Sonnet 5 仍是 ×0.10（$0.20/MTok）。
 
 /// 缓存写倍率（相对基础输入价），所有模型通用：5 分钟档与 1 小时档。
 const CACHE_WRITE_5M_MULT: f64 = 1.25;
@@ -20,12 +22,19 @@ const CACHE_WRITE_1H_MULT: f64 = 2.0;
 const CACHE_READ_MULT: f64 = 0.10;
 /// Fable 5.1 / Mythos 5.1 的缓存读倍率——官方特例。
 const CACHE_READ_MULT_FABLE_5_1: f64 = 0.025;
-/// Opus 5.5 的缓存读倍率——官方特例（$0.20 / $4）。
-const CACHE_READ_MULT_OPUS_5_5: f64 = 0.05;
+/// Opus 5.5 / Sonnet 5.5 的缓存读倍率——官方特例（Opus $0.20 / $4，Sonnet $0.10 / $2）。
+const CACHE_READ_MULT_5_5: f64 = 0.05;
+/// Haiku 5.5 的长提示档门槛：提示超过这么多 token 时整条请求按长提示价计。
+const HAIKU_5_5_LONG_PROMPT_TOKENS: f64 = 100_000.0;
 
 /// 是否 Opus 5.5。`opus-5-5` 也含 `opus-5`，凡按 `opus-5` 匹配的地方都得先判它。
 fn is_opus_5_5(m: &str) -> bool {
     m.contains("opus-5-5") || m.contains("opus-5.5")
+}
+
+/// 是否 Haiku 5.5——现役模型里唯一按提示长度分档计价的。
+fn is_haiku_5_5(m: &str) -> bool {
+    m.contains("haiku-5-5") || m.contains("haiku-5.5")
 }
 
 /// 每百万 token 的基础价（美元）。缓存写价由基础输入价按通用倍率派生，
@@ -42,7 +51,8 @@ impl Rate {
     }
 }
 
-/// 按模型名匹配价目（未知模型返回 None）。价格对齐官方定价表。
+/// 按模型名匹配价目（未知模型返回 None）。价格对齐官方定价表；Haiku 5.5 这里给的是
+/// 100K 以内的短提示档，长提示档见 [`estimate_usd`]。
 fn rate_for(model: &str) -> Option<Rate> {
     let m = model.to_ascii_lowercase();
     if m.contains("fable") || m.contains("mythos") {
@@ -55,7 +65,7 @@ fn rate_for(model: &str) -> Option<Rate> {
         })
     } else if is_opus_5_5(&m) {
         // Opus 5.5 降到 $4/$20，缓存读 $0.20（0.05×）；1M 同样是默认档、不加价。
-        Some(Rate { cache_read_mult: CACHE_READ_MULT_OPUS_5_5, ..Rate::new(4.0, 20.0) })
+        Some(Rate { cache_read_mult: CACHE_READ_MULT_5_5, ..Rate::new(4.0, 20.0) })
     } else if m.contains("opus") {
         // 老 Opus（3 / 4.0 / 4.1）为 $15/$75；Opus 4.5 及以后（含 Opus 5）统一 $5/$25。
         // Opus 5 的 1M 上下文是默认档、不加价，故 `claude-opus-5[1m]` 与裸 id 同价。
@@ -64,6 +74,9 @@ fn rate_for(model: &str) -> Option<Rate> {
         } else {
             Some(Rate::new(5.0, 25.0))
         }
+    } else if is_haiku_5_5(&m) {
+        // Haiku 5.5 短提示档 $0.10/$0.50，缓存读通用 0.10×（$0.01）。
+        Some(Rate::new(0.10, 0.50))
     } else if m.contains("haiku") {
         // Haiku 3.5 更便宜；Haiku 4.5 为 1/5。
         if m.contains("haiku-3") || m.contains("3-5-haiku") || m.contains("3.5") {
@@ -72,9 +85,15 @@ fn rate_for(model: &str) -> Option<Rate> {
             Some(Rate::new(1.0, 5.0))
         }
     } else if m.contains("sonnet") {
-        // Sonnet 5 / 5.5 为 $2/$10（5 的原引导价已转永久，5.5 同价），缓存读通用 0.10×（$0.20）；
-        // Sonnet 4.x 为 $3/$15。
-        if m.contains("sonnet-5") { Some(Rate::new(2.0, 10.0)) } else { Some(Rate::new(3.0, 15.0)) }
+        // Sonnet 5 / 5.5 为 $2/$10（5 的原引导价已转永久，5.5 同价）；缓存读 5.5 是 0.05×（$0.10），
+        // 5 是通用 0.10×（$0.20）。Sonnet 4.x 为 $3/$15。
+        if m.contains("sonnet-5-5") || m.contains("sonnet-5.5") {
+            Some(Rate { cache_read_mult: CACHE_READ_MULT_5_5, ..Rate::new(2.0, 10.0) })
+        } else if m.contains("sonnet-5") {
+            Some(Rate::new(2.0, 10.0))
+        } else {
+            Some(Rate::new(3.0, 15.0))
+        }
     } else {
         None
     }
@@ -86,7 +105,7 @@ fn rate_for(model: &str) -> Option<Rate> {
 /// 其它模型即便请求里带了 `speed`，上游也不会按 fast 计费，故返回 None 走标准价。
 fn fast_rate_for(m: &str) -> Option<Rate> {
     if is_opus_5_5(m) {
-        Some(Rate { cache_read_mult: CACHE_READ_MULT_OPUS_5_5, ..Rate::new(8.0, 40.0) })
+        Some(Rate { cache_read_mult: CACHE_READ_MULT_5_5, ..Rate::new(8.0, 40.0) })
     } else if m.contains("opus-5") || m.contains("opus-4-8") {
         Some(Rate::new(10.0, 50.0))
     } else {
@@ -124,13 +143,14 @@ pub struct Usage<'a> {
 ///
 /// `speed` 为 `"fast"` 且模型支持快速模式时按溢价计，其余按标准价。缓存写区分 5 分钟 /
 /// 1 小时两档；若上游未返回细分，则将 `cache_creation_total` 整体按 5 分钟档计。
-/// 缓存读倍率按模型取（通用 0.10，Fable 5.1 / Mythos 5.1 为 0.025，Opus 5.5 为 0.05）。
+/// 缓存读倍率按模型取（通用 0.10，Fable 5.1 / Mythos 5.1 为 0.025，Opus 5.5 / Sonnet 5.5
+/// 为 0.05）。Haiku 5.5 的提示（输入 + 缓存写 + 缓存读）超过 100K 时整条按长提示档计。
 /// 模型未知返回 None（不计入）。
 pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
     let model = u.model?;
+    let m = model.to_ascii_lowercase();
     // fast 档只对支持的模型生效；不支持时回落标准价，避免凭请求字段虚高。
-    let rate = match is_fast(u.speed).then(|| fast_rate_for(&model.to_ascii_lowercase())).flatten()
-    {
+    let mut rate = match is_fast(u.speed).then(|| fast_rate_for(&m)).flatten() {
         Some(r) => r,
         None => rate_for(model)?,
     };
@@ -143,6 +163,11 @@ pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
         (None, None) => (f(u.cache_creation_total), 0.0),
         (a, b) => (f(a), f(b)),
     };
+
+    // Haiku 5.5 长提示档：五项单价都是短提示档的 5 倍，倍率不变。
+    if is_haiku_5_5(&m) && inp + c5 + c1 + cr > HAIKU_5_5_LONG_PROMPT_TOKENS {
+        rate = Rate::new(0.50, 2.50);
+    }
 
     const PER: f64 = 1_000_000.0;
     let cost = inp * rate.input
@@ -159,6 +184,9 @@ pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
 /// 带 `[1m]` 后缀的是 Claude Code 请求 1M 上下文时的写法，与裸 id 同价；New API 按模型名
 /// 精确匹配倍率，所以要作为独立条目列出，否则带后缀的请求在它那边就没价。Haiku 4.5 只有
 /// 200K 上下文，没有 `[1m]` 变体。
+///
+/// Haiku 5.5 按提示长度分两档，New API 只能表达一档，这里公开的是 100K 以内的短提示档
+/// （$0.10/$0.50）；本地统计（[`estimate_usd`]）按实际提示长度分档。
 pub const LISTED_MODELS: &[&str] = &[
     "claude-fable-5-1",
     "claude-fable-5-1[1m]",
@@ -186,6 +214,8 @@ pub const LISTED_MODELS: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-sonnet-4-6[1m]",
     "claude-sonnet-4-5",
+    "claude-haiku-5-5",
+    "claude-haiku-5-5[1m]",
     "claude-haiku-4-5",
 ];
 
@@ -248,6 +278,9 @@ mod tests {
         assert_eq!(rate("claude-sonnet-5-5"), (2.0, 10.0));
         assert_eq!(rate("claude-sonnet-5-5[1m]"), (2.0, 10.0));
         assert_eq!(rate("claude-sonnet-4-6"), (3.0, 15.0));
+        // Haiku 5.5 的基础价目是短提示档；Haiku 4.5 不受影响。
+        assert_eq!(rate("claude-haiku-5-5"), (0.10, 0.50));
+        assert_eq!(rate("claude-haiku-5-5[1m]"), (0.10, 0.50));
     }
 
     /// 公开价目列表里的每个模型都必须能匹配到价目——列表是手写的，防止加了新 id 却忘了
@@ -276,7 +309,13 @@ mod tests {
         let s55 = find("claude-sonnet-5-5[1m]");
         assert_eq!(
             (s55.input_per_mtok, s55.output_per_mtok, s55.cache_read_mult),
-            (2.0, 10.0, 0.10)
+            (2.0, 10.0, 0.05)
+        );
+        assert_eq!(find("claude-sonnet-5").cache_read_mult, 0.10);
+        let h55 = find("claude-haiku-5-5");
+        assert_eq!(
+            (h55.input_per_mtok, h55.output_per_mtok, h55.cache_read_mult),
+            (0.10, 0.50, 0.10)
         );
         // 列表本身不该有重复条目。
         let mut names: Vec<_> = LISTED_MODELS.to_vec();
@@ -285,7 +324,8 @@ mod tests {
         assert_eq!(names.len(), LISTED_MODELS.len(), "LISTED_MODELS 有重复");
     }
 
-    /// 缓存读倍率：Fable 5.1 / Mythos 5.1 为 0.025×（$0.25/MTok），其余模型（含 Fable 5）0.10×。
+    /// 缓存读倍率：Fable 5.1 / Mythos 5.1 为 0.025×（$0.25/MTok），Opus 5.5 / Sonnet 5.5 为 0.05×，
+    /// 其余模型（含 Fable 5、Sonnet 5）0.10×。
     #[test]
     fn fable_5_1_cache_read_discount() {
         let read =
@@ -298,7 +338,8 @@ mod tests {
         assert_eq!(read("claude-opus-5"), Some(0.5));
         assert_eq!(read("claude-opus-5-5"), Some(0.2), "Opus 5.5 缓存读 $0.20/MTok");
         assert_eq!(read("claude-sonnet-5"), Some(0.2));
-        assert_eq!(read("claude-sonnet-5-5"), Some(0.2), "Sonnet 5.5 缓存读 $0.20/MTok");
+        assert_eq!(read("claude-sonnet-5-5"), Some(0.1), "Sonnet 5.5 缓存读 $0.10/MTok");
+        assert_eq!(read("claude-sonnet-5-5[1m]"), Some(0.1));
         // 缓存写不受特例影响：Fable 5.1 的 5m 写仍是 10 × 1.25 = $12.5。
         assert_eq!(
             estimate_usd(Usage {
@@ -307,6 +348,33 @@ mod tests {
             }),
             Some(12.5)
         );
+    }
+
+    /// Haiku 5.5 按提示长度分档：输入 + 缓存写 + 缓存读超过 100K 时整条请求按 $0.50/$2.50 计，
+    /// 正好 100K 仍是短提示档；输出不计入提示长度。
+    #[test]
+    fn haiku_5_5_long_prompt_tier() {
+        let est = |u: Usage<'_>| estimate_usd(u).unwrap();
+        let base = Usage { output_tokens: Some(1_000_000), ..usage("claude-haiku-5-5", None) };
+        // 短提示：10 万输入 × $0.10 + 100 万输出 × $0.50。
+        let short = est(Usage { input_tokens: Some(100_000), ..base });
+        assert!((short - (0.01 + 0.50)).abs() < 1e-9, "{short}");
+        // 多 1 个 token 就跨档，整条按长提示价：100_001 × $0.50 + 100 万输出 × $2.50。
+        let long = est(Usage { input_tokens: Some(100_001), ..base });
+        assert!((long - (100_001.0 * 0.50 / 1e6 + 2.50)).abs() < 1e-9, "{long}");
+        // 提示长度含缓存读与缓存写：1K 输入 + 60K 缓存读 + 40K 缓存写(5m) 已过 100K。
+        let mixed = est(Usage {
+            input_tokens: Some(1_000),
+            cache_read_tokens: Some(60_000),
+            cache_5m_tokens: Some(40_000),
+            output_tokens: Some(0),
+            ..base
+        });
+        let want = (1_000.0 * 0.50 + 60_000.0 * 0.05 + 40_000.0 * 0.625) / 1e6;
+        assert!((mixed - want).abs() < 1e-12, "{mixed} vs {want}");
+        // 输出再多也不算提示长度。
+        let out_only = est(Usage { input_tokens: Some(10), ..base });
+        assert!((out_only - (10.0 * 0.10 / 1e6 + 0.50)).abs() < 1e-12, "{out_only}");
     }
 
     /// 老 Opus（3 / 4.0 / 4.1）仍是 $15/$75，不能被新 Opus 的 $5/$25 覆盖。
