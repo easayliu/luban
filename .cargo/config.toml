@@ -1,0 +1,8 @@
+# `#[sqlx::test]` 从 DATABASE_URL 找一个 PostgreSQL，在上面给每个测试建一个临时库
+# （测完删掉；失败的留着排查，下次跑同一个测试时先清掉）。这里给本机默认值：
+# Homebrew 装的 postgresql@17，以 postgres 超级用户免密连接（与官方镜像的默认用户一致）。
+# 环境里已经设了 DATABASE_URL 的（CI、换了端口的机器）以环境为准，见 force = false。
+#
+# 只影响测试：服务本身读的是 LUBAN_DATABASE_URL，不认这个变量。
+[env]
+DATABASE_URL = { value = "postgres://postgres@localhost/postgres", force = false }

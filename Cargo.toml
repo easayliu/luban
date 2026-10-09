@@ -16,6 +16,10 @@ parking_lot = "0.12.5"
 rand = "0.10.2"
 rusqlite = { version = "0.34", features = ["bundled"] }
 rust-embed = "8"
+# PostgreSQL 驱动。只用运行时查询（`sqlx::query`），不用 `query!` 这类编译期检查的宏：
+# 编译时不必连库，CI 与 Docker 构建都不受影响。`macros` 只是为了 `sqlx::migrate!`
+# 把 migrations/ 下的 SQL 编进二进制。
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate"] }
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order：Map 换成 IndexMap，保留 JSON 对象的原始 key 顺序。
 # 转发前改写请求体要原样重新序列化，默认的 BTreeMap 会把整个 body 的 key 按字母序重排

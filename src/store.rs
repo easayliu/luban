@@ -19,6 +19,7 @@ mod bans;
 mod billing;
 mod bindings;
 mod credential;
+pub mod db;
 mod flags;
 mod groups;
 mod learned;
