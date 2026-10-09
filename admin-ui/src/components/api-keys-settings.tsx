@@ -151,7 +151,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
           <p className="mt-1 text-xs text-muted-foreground">
             {t(
               '供外部系统对接使用。可绑定账号分组：仅从所绑定分组的账号中调度，靠前的分组优先；未绑定时可使用全部账号。',
-              'For external systems. Bind pool groups to restrict which accounts a key uses (earlier groups first); unbound keys can use every account.',
+              'For external systems. A key bound to account groups only uses accounts in those groups, earlier groups first; an unbound key can use every account.',
             )}
           </p>
         </div>
@@ -238,11 +238,11 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
             {required
               ? t(
                   '当前没有可用的接入 Key：所有转发请求都将被拒绝。新建 Key 后即可恢复。',
-                  'There is no access key: every forwarded request is rejected until you create one.',
+                  'There is no usable access key: every forwarded request is rejected. Create a key to restore access.',
                 )
               : t(
                   '尚未配置接入 Key：转发不校验来访身份，任何客户端均可使用全部账号。',
-                  'No access key is configured: forwarding does not authenticate callers, and anyone can use every account.',
+                  'No access key is configured: forwarding does not authenticate callers, and any client can use every account.',
                 )}
           </div>
         )}

@@ -99,7 +99,7 @@ export function GroupSettingsContent() {
         title={t('账号分组', 'Account groups')}
         description={t(
           '账号可同时属于多个分组。接入 Key 绑定分组后，仅从这些分组的账号中调度。默认分组对所有成员开放；其余分组可开放给代理（其下属用户自动继承）或管理员直属的用户。',
-          'An account can be in several groups. An access key bound to groups only picks accounts from them. The default group is open to everyone; other groups can be opened to agents (their users inherit them) or users directly under the admin.',
+          'An account can belong to several groups. An access key bound to groups only schedules accounts from those groups. The default group is open to all members; other groups can be opened to agents (their users inherit them) or users directly under the admin.',
         )}
       >
         <div className="divide-y">

@@ -300,7 +300,7 @@ export function SecuritySettingsContent() {
         title={t('访客密码', 'Viewer password')}
         description={t(
           '以访客密码登录后可查看控制台的全部页面，但无法进行任何修改；接入 Key 与代理密码对访客打码显示，且不可导出数据。',
-          'People who sign in with the viewer password can see every page of the console but cannot change anything. The client key and proxy passwords are masked for them, and export is unavailable.',
+          'Signing in with the viewer password gives read-only access to every page of the console; nothing can be changed. Access keys and proxy passwords are masked for viewers, and export is unavailable.',
         )}
       >
         <ViewerPassword />

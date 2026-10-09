@@ -54,7 +54,7 @@ export function SettingsPage({
     {
       key: 'groups',
       label: t('账号分组', 'Account groups'),
-      navDescription: t('分组与开放名单', 'Groups and who can use them'),
+      navDescription: t('分组与开放名单', 'Groups and access lists'),
       icon: FolderIcon,
     },
     {
