@@ -38,6 +38,8 @@ pub(super) struct ReqLog {
     /// 这条走没走模拟——只存一份的话，要么看不见真实客户端是谁，要么看不见上游收到的是什么。
     pub(super) ua_out: String,
     pub(super) cred_id: i64,
+    /// 来访用的哪把接入 Key，见 [`store::UsageRecord::key_id`]。
+    pub(crate) key_id: Option<i64>,
     pub(super) cred_label: String,
     /// 完整 device_id；日志里只展示前 8 位（脱敏）。
     pub(super) device_id: Option<String>,
@@ -327,6 +329,7 @@ impl Drop for ReqLog {
 
         let rec = store::UsageRecord {
             cred_id: Some(self.cred_id),
+            key_id: self.key_id,
             cred_label: self.cred_label.clone(),
             device_id: self.device_id.clone(),
             model,

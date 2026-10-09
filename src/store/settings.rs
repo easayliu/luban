@@ -417,6 +417,7 @@ pub const DEPLOYMENT_ONLY_KEYS: &[&str] = &[
     ADMIN_ENV_PASSWORD_VERSION,
     VIEWER_ENV_PASSWORD_HASH,
     VIEWER_ENV_PASSWORD_VERSION,
+    "billing_backfilled",
 ];
 
 /// 控制台登录相关的 settings 键：属于部署本身，导出不带、导入不认。

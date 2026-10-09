@@ -18,8 +18,8 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
             updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
 
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_token
-            ON credentials(refresh_token);
+        -- refresh_token 存的是密文，唯一约束挂在它的指纹列上（uq_credentials_refresh_hash），
+        -- 指纹列补上之后在 secret::encrypt_plaintext_tokens 里建。
         CREATE INDEX IF NOT EXISTS idx_credentials_priority
             ON credentials(priority, id);
 
@@ -592,6 +592,9 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     migrate_users(conn)?;
+    encrypt_plaintext_tokens(conn)?;
+    migrate_groups(conn)?;
+    migrate_billing(conn)?;
     purge_orphan_rows(conn)?;
     backfill_ledger(conn)?;
     migrate_priority_tiers(conn)?;
@@ -795,8 +798,6 @@ fn migrate_credentials_autoincrement(conn: &Connection) -> Result<()> {
          INSERT INTO credentials_new ({cols}) SELECT {cols} FROM credentials;
          DROP TABLE credentials;
          ALTER TABLE credentials_new RENAME TO credentials;
-         CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_token
-             ON credentials(refresh_token);
          CREATE INDEX IF NOT EXISTS idx_credentials_priority
              ON credentials(priority, id);
          COMMIT;",
@@ -840,6 +841,7 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("subscription_status", "TEXT"),
     ("extra_usage_enabled", "INTEGER"),
     ("owner_id", "INTEGER"),
+    ("refresh_token_hash", "TEXT"),
 ];
 
 /// 旧库补 `session_bindings.slot_lost` 列之后初始化槽位归属：同一账号同一槽位上有好几条绑定时

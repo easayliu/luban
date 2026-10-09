@@ -149,6 +149,8 @@ export interface Credential {
   proxy: string | null
   /** `proxy` 在代理池里对应那条的 id；不在池里或直连为 null。查代理名称用它，不要按 URL 查。 */
   proxy_id?: number | null
+  /** 所在的号池分组 id（升序）。 */
+  groups: number[]
   token_hint: string
   /** 最新一次的订阅额度快照；无请求记录时为 null。 */
   quota: Quota | null
@@ -439,8 +441,26 @@ export async function getAuthorizeUrl(): Promise<{ url: string }> {
 }
 
 /** 用粘贴的 code#state 交换并新增一条凭证。 */
-export async function exchangeCode(code: string, label?: string, proxy?: string): Promise<Credential> {
-  const { data } = await api.post<Credential>('/exchange', { code, label, proxy })
+/** 粘回授权结果换 token、新增一个号。`groupIds` 是放进哪些号池分组（空 = 默认分组）。 */
+export async function exchangeCode(
+  code: string,
+  label?: string,
+  proxy?: string,
+  groupIds: number[] = [],
+): Promise<Credential> {
+  const { data } = await api.post<Credential>('/exchange', { code, label, proxy, group_ids: groupIds })
+  return data
+}
+
+/** 改一个号所在的分组（整体替换，至少一个）。 */
+export async function setCredentialGroups(id: number, groupIds: number[]): Promise<Credential> {
+  const { data } = await api.post<Credential>(`/credentials/${id}/groups`, { group_ids: groupIds })
+  return data
+}
+
+/** 批量改分组。 */
+export async function setCredentialsGroups(ids: number[], groupIds: number[]): Promise<Credential[]> {
+  const { data } = await api.post<Credential[]>('/credentials/groups', { ids, group_ids: groupIds })
   return data
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronDownIcon, GlobeIcon, PauseIcon, PlayIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { ChevronDownIcon, FolderIcon, GlobeIcon, PauseIcon, PlayIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
   deleteCredentials, setCredentialQuotaPausePcts, setDeviceLimits, setDisabledMany, setPriorities,
   setProxies, setRpmLimits, setSessionLimits, PRIORITY_DEFAULT, PRIORITY_TIERS, priorityTierName,
@@ -8,6 +8,7 @@ import {
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
 import { useDevicesBySession } from '@/components/credential-shared'
+import { SetGroupsDialog } from '@/components/group-picker'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError } from '@/lib/utils'
 import {
@@ -124,6 +125,7 @@ export function BatchActionsBar({
 }) {
   const { t, language, locale } = useI18n()
   const qc = useQueryClient()
+  const [groupsOpen, setGroupsOpen] = useState(false)
   const [priorityMode, setPriorityMode] = useState<PriorityMode>('set')
   const [priorityValue, setPriorityValue] = useState(PRIORITY_DEFAULT)
   const [limitMode, setLimitMode] = useState<'default' | 'unlimited' | 'custom'>('default')
@@ -378,6 +380,9 @@ export function BatchActionsBar({
             </Button>
             <Button size="sm" variant="outline" aria-label={t('停用所选账号', 'Disable selected accounts')} disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === true} onClick={() => applyDisabled.mutate(true)}>
               <PauseIcon /><span className="max-sm:sr-only">{t('停用', 'Disable')}</span>
+            </Button>
+            <Button size="sm" variant="outline" aria-label={t('设置所选账号的号池分组', 'Set pool groups of the selected accounts')} disabled={busy} onClick={() => setGroupsOpen(true)}>
+              <FolderIcon /><span className="max-sm:sr-only">{t('分组', 'Groups')}</span>
             </Button>
             <Button size="sm" variant="destructive-outline" aria-label={t('删除所选账号', 'Delete selected accounts')} disabled={busy} onClick={() => setConfirmDelete(true)}>
               <Trash2Icon /><span className="max-sm:sr-only">{t('删除', 'Delete')}</span>
@@ -634,6 +639,7 @@ export function BatchActionsBar({
           </div>
         )}
 
+        <SetGroupsDialog ids={ids} open={groupsOpen} onOpenChange={setGroupsOpen} />
         <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
           <AlertDialogPopup>
             <AlertDialogHeader>

@@ -49,6 +49,7 @@ import {
   type QuotaWindowMeta,
   CredentialOwner,
 } from '@/components/credential-shared'
+import { GroupBadges } from '@/components/group-picker'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
 import { CredentialRpmDialog } from '@/components/credential-rpm-dialog'
@@ -425,6 +426,7 @@ export const CredentialCard = memo(function CredentialCard({
                     <span className="tabular-nums">#{cred.id}</span>
                     {cred.owner && cred.owner !== 'admin' && <span aria-hidden="true">·</span>}
                     <CredentialOwner cred={cred} />
+                    <GroupBadges ids={cred.groups} />
                     <span aria-hidden="true">·</span>
                     <Tooltip>
                       <TooltipTrigger

@@ -169,6 +169,7 @@ async fn relay_ok(
         // 取最终那一轮的出站头——换过号的话，实际发出去的就是那份（同 logged_device）。
         ua_out: ua_of(&upstream.headers),
         cred_id: cred.id,
+        key_id: *log_state.key_id.lock(),
         cred_label: cred.label.clone(),
         device_id: logged_device,
         status: status.as_u16(),

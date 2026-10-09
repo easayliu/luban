@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import {
   ArrowRightLeftIcon,
   CableIcon,
+  FolderIcon,
   GlobeIcon,
   LockKeyholeIcon,
   SlidersHorizontalIcon,
@@ -14,6 +15,7 @@ import {
 } from '@/components/access-settings'
 import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
+import { GroupSettingsContent } from '@/components/group-settings'
 import { MigrationSettingsContent } from '@/components/migration-settings'
 import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
 import { AppHeader, Breadcrumb, PreferencesMenu } from '@/components/app-header'
@@ -28,7 +30,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
 import { useMediaQuery } from '@/lib/use-media-query'
 
-export type SettingsSection = 'access' | 'devices' | 'proxies' | 'forwarding' | 'security' | 'migration'
+export type SettingsSection = 'access' | 'groups' | 'devices' | 'proxies' | 'forwarding' | 'security' | 'migration'
 
 export function SettingsPage({
   section,
@@ -44,8 +46,14 @@ export function SettingsPage({
     {
       key: 'access',
       label: t('客户端接入', 'Client access'),
-      navDescription: t('地址、Key 与接入片段', 'Endpoint, key, and setup'),
+      navDescription: t('地址、接入 Key 与接入片段', 'Endpoint, access keys, and setup'),
       icon: CableIcon,
+    },
+    {
+      key: 'groups',
+      label: t('号池分组', 'Pool groups'),
+      navDescription: t('分组与开放名单', 'Groups and who can use them'),
+      icon: FolderIcon,
     },
     {
       key: 'devices',
@@ -210,6 +218,9 @@ export function SettingsPage({
 
               <TabsPanel className="min-w-0" value="access">
                 {section === 'access' && <AccessSettingsContent />}
+              </TabsPanel>
+              <TabsPanel className="min-w-0" value="groups">
+                {section === 'groups' && <GroupSettingsContent />}
               </TabsPanel>
               <TabsPanel className="min-w-0" value="devices">
                 {section === 'devices' && <DeviceSettingsContent />}

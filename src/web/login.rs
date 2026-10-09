@@ -72,6 +72,10 @@ pub(super) struct ExchangeReq {
     /// 可选的出站代理——登录换码和拉 profile 都走它，入库后自动存为该凭证的逐账号代理。
     #[serde(default)]
     proxy: Option<String>,
+    /// 放进哪些号池分组（至少一个）。不传或为空时放进默认分组。代理和用户只能选开放给
+    /// 自己的分组。
+    #[serde(default)]
+    group_ids: Vec<i64>,
 }
 
 /// 用粘贴的 `code#state` 交换 token，并新增一条凭证。
@@ -82,6 +86,13 @@ pub(super) async fn exchange(
 ) -> Result<Json<CredentialView>, ApiError> {
     // 先从粘贴内容里取出 state，据此找到**它自己那次**登录的挑战——不能拿「最后一次生成的
     // 那个」，否则并发登录会互相顶掉（见 [`AppState::pkce`]）。取出即移除：一次挑战只能用一次。
+    // 分组先核对：换码会作废这次授权，等换完才发现分组选错了就得让用户重新授权一遍。
+    let group_ids = if req.group_ids.is_empty() {
+        vec![state.store.default_group_id().map_err(internal)?]
+    } else {
+        check_selectable(&state, &actor, &req.group_ids)?;
+        req.group_ids.clone()
+    };
     let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
     let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
         .ok_or_else(|| bad_request("this login attempt expired or was not found; click 'Add account' again to generate a new authorization link"))?;
@@ -153,6 +164,18 @@ pub(super) async fn exchange(
             }
         })?;
 
+    // 新号落库时先进了默认分组（触发器），这里换成所选的分组。分组在核对之后被删了的话
+    // 号就留在默认分组里，不回滚这次上号。
+    match state.store.set_credential_groups(&[cred.id], &group_ids) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(cred_id = cred.id, error = %e, "add credential: kept in the default group")
+        }
+        Err(e) => {
+            tracing::warn!(cred_id = cred.id, error = %e, "add credential: failed to set its groups")
+        }
+    }
+
     // 额度档原值、组织 UUID、订阅创建时刻不在 `insert` 的参数里（那串已经够长了），入库后
     // 走与刷新同一份 `apply_profile` 写；profile 拉不到时组织 id 退回交换响应里那个
     // （官方也是这个兜底次序：profile → tokenAccount）。
@@ -178,9 +201,6 @@ pub(super) async fn exchange(
         proxy = %proxy.as_deref().unwrap_or("<direct>"),
         "credential added"
     );
-    // 设了代理时从库里重新读——insert 返回的那份还没带 proxy，view_of 会拿到最新状态。
-    if proxy.is_some() {
-        return view_of(&state, cred.id).await;
-    }
-    Ok(Json(CredentialView::new(&cred, 0, 0, DefaultLimits::of(&state.store))))
+    // 从库里重新读：insert 返回的那份还没带代理与分组。
+    view_of(&state, cred.id).await
 }

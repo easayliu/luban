@@ -56,6 +56,8 @@ pub(super) struct CredentialView {
     owner_id: Option<i64>,
     /// 主人的用户名：只有 admin / 访客的列表里填，代理和用户只看得到自己的号，用不着。
     owner: Option<String>,
+    /// 所在的号池分组（升序）。
+    groups: Vec<i64>,
     tier: Option<String>,
     /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
     /// 团队号是组织下的一个席位，跟个人号不是一回事。
@@ -176,6 +178,7 @@ impl CredentialView {
             label: c.label.clone(),
             owner_id: c.owner_id,
             owner: None,
+            groups: Vec::new(),
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
             rate_limit_tier: c.rate_limit_tier.clone(),
@@ -246,6 +249,12 @@ impl CredentialView {
     ) -> Self {
         let owner = self.owner_id.unwrap_or(0);
         self.proxy_id = self.proxy.as_ref().and_then(|url| ids.get(&(owner, url.clone())).copied());
+        self
+    }
+
+    /// 带上所在的分组。
+    pub(super) fn with_groups(mut self, groups: Vec<i64>) -> Self {
+        self.groups = groups;
         self
     }
 

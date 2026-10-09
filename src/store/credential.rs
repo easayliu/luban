@@ -80,18 +80,19 @@ impl CredentialStore {
         conn.execute(
             "INSERT INTO credentials
                  (label, tier, access_token, refresh_token, expires_at, account_uuid, org_type,
-                  priority, owner_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  priority, owner_id, refresh_token_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 label,
                 tier,
-                access_token,
-                refresh_token,
+                seal(access_token),
+                seal(refresh_token),
                 expires_at as i64,
                 account_uuid,
                 org_type,
                 PRIORITY_DEFAULT,
-                owner_id
+                owner_id,
+                token_fingerprint(refresh_token)
             ],
         )
         .context("failed to insert credential (the refresh_token may already exist)")?;
@@ -154,6 +155,7 @@ impl CredentialStore {
         tx.execute("DELETE FROM credential_stats", [])?;
         tx.execute("DELETE FROM device_costs", [])?;
         tx.execute("DELETE FROM model_denials", [])?;
+        tx.execute("DELETE FROM credential_groups", [])?;
         let n = tx.execute("DELETE FROM credentials", [])?;
         tx.commit()?;
         Ok(n)
@@ -408,6 +410,7 @@ impl CredentialStore {
             let mut stats = tx.prepare("DELETE FROM credential_stats WHERE cred_id = ?1")?;
             let mut costs = tx.prepare("DELETE FROM device_costs WHERE cred_id = ?1")?;
             let mut denials = tx.prepare("DELETE FROM model_denials WHERE cred_id = ?1")?;
+            let mut groups = tx.prepare("DELETE FROM credential_groups WHERE cred_id = ?1")?;
             let mut cred = tx.prepare("DELETE FROM credentials WHERE id = ?1")?;
             for id in ids {
                 binds.execute([id])?;
@@ -416,6 +419,7 @@ impl CredentialStore {
                 stats.execute([id])?;
                 costs.execute([id])?;
                 denials.execute([id])?;
+                groups.execute([id])?;
                 n += cred.execute([id])?;
             }
         }
@@ -734,7 +738,7 @@ impl CredentialStore {
         )
     }
 
-    /// 刷新后回写新的 token 三元组（单行 UPDATE）。
+    /// 刷新后回写新的 token 三元组（单行 UPDATE，加密落库、同步更新 refresh_token 指纹）。
     pub fn update_tokens(
         &self,
         id: i64,
@@ -744,9 +748,16 @@ impl CredentialStore {
     ) -> Result<bool> {
         self.update_one(
             "UPDATE credentials
-                SET access_token = ?2, refresh_token = ?3, expires_at = ?4, updated_at = unixepoch()
+                SET access_token = ?2, refresh_token = ?3, expires_at = ?4,
+                    refresh_token_hash = ?5, updated_at = unixepoch()
               WHERE id = ?1",
-            params![id, access_token, refresh_token, expires_at as i64],
+            params![
+                id,
+                seal(access_token),
+                seal(refresh_token),
+                expires_at as i64,
+                token_fingerprint(refresh_token)
+            ],
         )
     }
 }
