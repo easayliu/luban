@@ -33,6 +33,8 @@ pub(super) struct Inbound {
     pub(super) prefix_key: Option<String>,
     pub(super) cc_kind: CcRequestKind,
     pub(super) plan: SessionPlan,
+    /// 来访的接入 Key 能用哪些号（它绑定的分组，按优先顺序；空 = 全部号）。
+    pub(super) key_access: store::KeyAccess,
 }
 
 impl Inbound {
@@ -79,7 +81,8 @@ pub(super) fn admit(
     // 在途计数：入口就 +1，随后 move 进 ReqLog 活到响应流结束，见 [`InFlightGuard`]。
     let in_flight = InFlightGuard::new(state.in_flight.clone());
 
-    client_gates(state, &method, &path_and_query, &client_ua, &headers)?;
+    let key_access = client_gates(state, &method, &path_and_query, &client_ua, &headers)?;
+    *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
     let facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
@@ -205,30 +208,40 @@ pub(super) fn admit(
             prefix_key,
             cc_kind,
             plan,
+            key_access,
         },
         Guards { in_flight, session_concurrency: session_concurrency_guard },
     ))
 }
 
-/// 1～1.5：来访 API key 与最低客户端版本，只看头。
+/// 1～1.5：来访 API key 与最低客户端版本，只看头。回这把 Key 能用哪些号。
 fn client_gates(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
     client_ua: &str,
     headers: &HeaderMap,
-) -> Result<(), Response> {
-    // 1) 校验来访 API Key（未配置则放行）。生效 key：环境覆盖优先，否则用库中配置。
-    if let Some(expected) = effective_client_key(state)
-        && !client_authorized(headers, &expected)
-    {
-        tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "invalid API key",
-        ));
-    }
+) -> Result<store::KeyAccess, Response> {
+    // 1) 校验来访 API Key（一把都没配则放行），见 [`client_access`]。
+    let access = match client_access(state, headers) {
+        Ok(Some(access)) => access,
+        Ok(None) => {
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "invalid API key",
+            ));
+        }
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "failed to look up the inbound API key");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "failed to verify the API key",
+            ));
+        }
+    };
 
     // 1.5) 最低客户端版本闸：只卡 UA 自报 `claude-cli/<版本>` 的请求，其余一律放行，
     //      判定见 [`below_min_client_version`]。放在这里是因为它只看一个头——比解析 body、
@@ -246,7 +259,7 @@ fn client_gates(
             ),
         ));
     }
-    Ok(())
+    Ok(access)
 }
 
 /// 1.6～1.7：头上带会话 id 的，先按会话限 RPM 与并发。返回头上的会话 id、并发上限与

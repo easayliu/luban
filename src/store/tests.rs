@@ -2320,7 +2320,10 @@ fn admin_password_never_travels_with_settings() {
         Some("hash-of-target-box"),
         "目标机器的管理密码不该被导入改掉"
     );
-    assert_eq!(target.get_setting(CLIENT_API_KEY).unwrap().as_deref(), Some("key-from-source"));
+    // 旧版文件里的全局接入 Key 导进来变成一把不绑定分组的接入 Key，设置项本身不再落库。
+    assert_eq!(target.get_setting(CLIENT_API_KEY).unwrap(), None);
+    let access = target.api_key_access("key-from-source").unwrap().expect("转成了接入 Key");
+    assert!(access.groups.is_empty(), "不绑定分组，用全部号");
 }
 
 /// 导出的每一项都要能原样导回来：迁移文件就是「导出的响应原样喂给导入」，
@@ -5642,4 +5645,310 @@ fn credentials_need_a_living_owner_to_be_inserted_and_scheduled() {
     assert_eq!(default_owned.owner_id, Some(admin));
     let picked = store.select_for_device(Select::default()).unwrap();
     assert_eq!(picked.id, default_owned.id, "无主的号不进调度");
+}
+
+/// 加解密往返；没有前缀的按明文原样读出；每次密文都不同。
+#[test]
+fn sealed_values_round_trip_and_plaintext_passes_through() {
+    let a = secret::seal("sk-ant-ort01-abc");
+    let b = secret::seal("sk-ant-ort01-abc");
+    assert!(a.starts_with(secret::SEALED_PREFIX) && a != b, "随机 nonce，两次密文不同");
+    assert_eq!(secret::open(&a).unwrap(), "sk-ant-ort01-abc");
+    assert_eq!(secret::open("plain-token").unwrap(), "plain-token");
+    assert!(secret::open("enc1:not-base64!").is_err());
+}
+
+/// 启动迁移：存量明文 token 加密落库、补指纹，读出来照旧是明文；查重靠指纹。
+#[test]
+fn plaintext_tokens_are_encrypted_at_startup() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO credentials (access_token, refresh_token, expires_at) VALUES ('at-1', 'rt-1', 0)",
+        [],
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    let (at, rt, hash): (String, String, String) = conn
+        .query_row(
+            "SELECT access_token, refresh_token, refresh_token_hash FROM credentials",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(at.starts_with("enc1:") && rt.starts_with("enc1:"), "库里只剩密文");
+    assert_eq!(hash, secret::token_fingerprint("rt-1"));
+    let store = CredentialStore::with_conn(conn);
+    let cred = store.list().unwrap().remove(0);
+    assert_eq!((cred.access_token.as_str(), cred.refresh_token.as_str()), ("at-1", "rt-1"));
+    // 同一个 refresh_token 再插一次撞指纹的唯一约束。
+    let admin = store.admin_user().unwrap().id;
+    assert!(store.insert("dup", None, "at-2", "rt-1", 0, None, None, admin).is_err());
+    // 刷新回写同样加密、同步指纹。
+    store.update_tokens(cred.id, "at-3", "rt-3", 0).unwrap();
+    assert_eq!(store.get(cred.id).unwrap().unwrap().refresh_token, "rt-3");
+    let hash: String = store
+        .conn
+        .lock()
+        .query_row("SELECT refresh_token_hash FROM credentials", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(hash, secret::token_fingerprint("rt-3"));
+}
+
+/// 解不开的密文（密钥不对）：启动迁移直接报错，不带着错密钥跑起来。
+#[test]
+fn undecryptable_tokens_refuse_to_start() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO credentials (access_token, refresh_token, expires_at) \
+         VALUES ('enc1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'enc1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 0)",
+        [],
+    )
+    .unwrap();
+    let err = init_schema(&conn).unwrap_err();
+    assert!(format!("{err:#}").contains("secret key does not match"), "{err:#}");
+}
+
+/// 老库升级：建默认分组、存量号进默认分组；旧的全局接入 Key 迁成一把不绑分组的 Key。
+#[test]
+fn groups_and_keys_migrate_from_a_legacy_database() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+         INSERT INTO settings VALUES ('client_api_key', 'legacy-key');",
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO credentials (access_token, refresh_token, expires_at) VALUES ('a', 'r', 0)",
+        [],
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    let store = CredentialStore::with_conn(conn);
+    let default = store.default_group_id().unwrap();
+    let cred = store.list().unwrap()[0].id;
+    assert_eq!(store.credential_groups(cred).unwrap(), vec![default]);
+    assert_eq!(store.get_setting(CLIENT_API_KEY).unwrap(), None);
+    let access = store.api_key_access("legacy-key").unwrap().unwrap();
+    assert!(access.groups.is_empty());
+    assert!(store.api_key_access("wrong").unwrap().is_none());
+}
+
+/// 分组可见范围：默认分组人人可见；开放给代理的，代理和它名下的用户都能用；admin 直属用户
+/// 只看开放给自己的；用户不能单独被开放（只能开放给代理或 admin 直属用户）。
+#[test]
+fn group_visibility_follows_grants_and_inheritance() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let default = store.default_group_id().unwrap();
+    let agent = store.create_user("agent", "", UserRole::Agent, admin).unwrap().unwrap().id;
+    let sub = store.create_user("sub", "", UserRole::User, agent).unwrap().unwrap().id;
+    let direct = store.create_user("direct", "", UserRole::User, admin).unwrap().unwrap().id;
+    let g1 = store.create_group("g1", "").unwrap().unwrap();
+    let g2 = store.create_group("g2", "").unwrap().unwrap();
+    assert_eq!(store.create_group("G1", "").unwrap(), Err(GroupError::NameTaken));
+    store.set_group_grants(g1, &[agent]).unwrap().unwrap();
+    store.set_group_grants(g2, &[direct]).unwrap().unwrap();
+    assert_eq!(store.set_group_grants(g2, &[sub]).unwrap(), Err(GroupError::InvalidGrantee));
+    assert_eq!(store.set_group_grants(default, &[agent]).unwrap(), Err(GroupError::DefaultGroup));
+    let vis = |id: i64| {
+        let u = store.user_by_id(id).unwrap().unwrap();
+        let mut v: Vec<i64> = store.visible_group_ids(&u).unwrap().into_iter().collect();
+        v.sort();
+        v
+    };
+    assert_eq!(vis(agent), vec![default, g1]);
+    assert_eq!(vis(sub), vec![default, g1], "代理名下的用户继承代理的分组");
+    assert_eq!(vis(direct), vec![default, g2]);
+}
+
+/// 删分组：默认分组删不了；只剩这一个分组的号挪进默认分组，还有别的分组的不动；Key 上的
+/// 绑定一并清掉。
+#[test]
+fn deleting_a_group_rehomes_its_only_members() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let default = store.default_group_id().unwrap();
+    let g1 = store.create_group("g1", "").unwrap().unwrap();
+    let g2 = store.create_group("g2", "").unwrap().unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, admin).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, admin).unwrap().id;
+    store.set_credential_groups(&[a], &[g1]).unwrap().unwrap();
+    store.set_credential_groups(&[b], &[g1, g2]).unwrap().unwrap();
+    assert_eq!(store.set_credential_groups(&[a], &[]).unwrap(), Err(GroupError::Empty));
+    assert_eq!(store.set_credential_groups(&[a], &[9999]).unwrap(), Err(GroupError::UnknownGroup));
+    let key = store.create_api_key("k", "key-1", &[g1, g2]).unwrap().unwrap();
+    assert_eq!(store.delete_group(default).unwrap(), Err(GroupError::DefaultGroup));
+    store.delete_group(g1).unwrap().unwrap();
+    assert_eq!(store.credential_groups(a).unwrap(), vec![default]);
+    assert_eq!(store.credential_groups(b).unwrap(), vec![g2]);
+    assert_eq!(store.api_key_access("key-1").unwrap().unwrap().groups, vec![g2]);
+    assert_eq!(store.list_api_keys().unwrap()[0].id, key);
+}
+
+/// 选号按 Key 绑定的分组：只在这些分组里选，排在前面的分组优先，前面的用不了才溢出；
+/// 粘住的号不在这些分组里时改选；分组里一个号都没有时报错。
+#[test]
+fn selection_honours_key_groups_and_their_order() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let g1 = store.create_group("g1", "").unwrap().unwrap();
+    let g2 = store.create_group("g2", "").unwrap().unwrap();
+    let empty = store.create_group("empty", "").unwrap().unwrap();
+    let far = u64::MAX;
+    let a = store.insert("a", None, "ta", "ra", far, None, None, admin).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", far, None, None, admin).unwrap().id;
+    store.set_credential_groups(&[a], &[g1]).unwrap().unwrap();
+    store.set_credential_groups(&[b], &[g2]).unwrap().unwrap();
+    let pick = |groups: &[i64], device: Option<&str>| {
+        store
+            .select_for_device(Select {
+                groups: Some(groups),
+                device_id: device,
+                ..Default::default()
+            })
+            .map(|c| c.id)
+    };
+    assert_eq!(pick(&[g2, g1], None).unwrap(), b, "排在前面的分组优先");
+    assert_eq!(pick(&[g1, g2], None).unwrap(), a);
+    assert_eq!(pick(&[g1], Some("dev-1")).unwrap(), a);
+    // 同一台设备换一把只绑 g2 的 Key 来：粘住的 a 不在范围里，改选到 b。
+    assert_eq!(pick(&[g2], Some("dev-1")).unwrap(), b);
+    store.set_disabled(b, true).unwrap();
+    assert_eq!(pick(&[g2, g1], None).unwrap(), a, "前面分组的号用不了就溢出到后面的");
+    assert!(pick(&[empty], None).is_err());
+    assert_eq!(pick(&[], None).unwrap(), a, "不绑分组用全部号");
+}
+
+/// 停用的 Key 认不出来；库里有 Key 时 `has_api_keys` 为真（停用的也算，不会因此变成放行）。
+#[test]
+fn disabled_api_keys_are_rejected() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    assert!(!store.has_api_keys().unwrap());
+    let id = store.create_api_key("k", "key-x", &[]).unwrap().unwrap();
+    assert!(store.api_key_access("key-x").unwrap().is_some());
+    store.update_api_key(id, "k", true, &[]).unwrap().unwrap();
+    assert!(store.api_key_access("key-x").unwrap().is_none());
+    assert!(store.has_api_keys().unwrap());
+    assert_eq!(store.reveal_api_key(id).unwrap().as_deref(), Some("key-x"));
+    let sealed: String = store
+        .conn
+        .lock()
+        .query_row("SELECT key_sealed FROM api_keys WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap();
+    assert!(sealed.starts_with("enc1:"), "库里存的是密文");
+}
+
+fn billing_rec(cred: i64, key: Option<i64>, model: &str, cost: f64) -> UsageRecord {
+    UsageRecord {
+        cred_id: Some(cred),
+        key_id: key,
+        model: Some(model.into()),
+        path: "/v1/messages".into(),
+        status: 200,
+        has_usage: true,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_creation_tokens: Some(3),
+        cache_read_tokens: Some(2),
+        cost_usd: Some(cost),
+        ..Default::default()
+    }
+}
+
+/// 费用汇总：号主在写入那一刻定死（号后来换了主人，历史不跟着走）；分组按 Key 的顺序取第一个
+/// 含这个号的，没绑分组的 Key 取号所在 id 最小的分组；Key 为空记 0。
+#[test]
+fn billing_attribution_is_fixed_at_write_time() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let u = store.create_user("u", "", UserRole::User, admin).unwrap().unwrap().id;
+    let default = store.default_group_id().unwrap();
+    let g1 = store.create_group("g1", "").unwrap().unwrap();
+    let g2 = store.create_group("g2", "").unwrap().unwrap();
+    let cred = store.insert("a", None, "t", "r", 0, None, None, u).unwrap().id;
+    store.set_credential_groups(&[cred], &[g1, g2]).unwrap().unwrap();
+    let key = store.create_api_key("k", "key-b", &[g2, g1]).unwrap().unwrap();
+    let t0 = 1_800_000_000;
+    store.insert_usage_log_at(&billing_rec(cred, Some(key), "m1", 1.5), Some(t0)).unwrap();
+    store.insert_usage_log_at(&billing_rec(cred, None, "m2", 0.5), Some(t0 + 10)).unwrap();
+    // 号转给 admin 之后的费用记到 admin 名下，之前的仍归 u。
+    store
+        .conn
+        .lock()
+        .execute("UPDATE credentials SET owner_id = ?1 WHERE id = ?2", [admin, cred])
+        .unwrap();
+    store.insert_usage_log_at(&billing_rec(cred, None, "m2", 2.0), Some(t0 + 20)).unwrap();
+
+    let all = BillingFilter { since: t0 - 3600, until: t0 + 3600, ..Default::default() };
+    let by = |dim: BillingDim, f: &BillingFilter| -> Vec<(String, f64, i64)> {
+        store
+            .billing_breakdown(f, dim)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.key, r.cost_usd, r.requests))
+            .collect()
+    };
+    assert_eq!(
+        by(BillingDim::Owner, &all),
+        vec![(admin.to_string(), 2.0, 1), (u.to_string(), 2.0, 2)]
+    );
+    // 经 Key 来的那条算进 Key 顺序里第一个含这个号的 g2；没 Key 的取 id 最小的 g1。
+    let groups = by(BillingDim::Group, &all);
+    assert_eq!(groups, vec![(g1.to_string(), 2.5, 2), (g2.to_string(), 1.5, 1)]);
+    assert!(!groups.iter().any(|(k, _, _)| *k == default.to_string()));
+    assert_eq!(by(BillingDim::Key, &all), vec![("0".into(), 2.5, 2), (key.to_string(), 1.5, 1)]);
+    let only_u = BillingFilter { owners: Some(vec![u]), ..all.clone() };
+    assert_eq!(by(BillingDim::Model, &only_u), vec![("m1".into(), 1.5, 1), ("m2".into(), 0.5, 1)]);
+    let row = &store.billing_breakdown(&only_u, BillingDim::Cred).unwrap()[0];
+    assert_eq!(
+        (row.input_tokens, row.output_tokens, row.cache_write_tokens, row.cache_read_tokens),
+        (20, 10, 6, 4)
+    );
+}
+
+/// 按日拆：以给定时区的本地零点切日界。
+#[test]
+fn billing_days_follow_the_timezone() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let cred = store.insert("a", None, "t", "r", 0, None, None, admin).unwrap().id;
+    // UTC 2027-01-14 23:30 = 东八区 2027-01-15 07:30。
+    let ts = 1_800_005_400 - (1_800_005_400 % 86400) + 23 * 3600 + 1800;
+    store.insert_usage_log_at(&billing_rec(cred, None, "m", 1.0), Some(ts)).unwrap();
+    let f = |tz| BillingFilter {
+        since: ts - 86400,
+        until: ts + 86400,
+        tz_offset_secs: tz,
+        ..Default::default()
+    };
+    let day = |tz| {
+        store.billing_breakdown(&f(tz), BillingDim::Day).unwrap()[0].key.parse::<i64>().unwrap()
+    };
+    let utc_day = ts - ts % 86400;
+    assert_eq!(day(0), utc_day);
+    assert_eq!(day(8 * 3600), utc_day + 86400 - 8 * 3600, "东八区已是第二天");
+}
+
+/// 升级时把存量流水回填进费用汇总一次，之后不再重复回填。
+#[test]
+fn billing_backfills_existing_usage_logs_once() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO credentials (id, access_token, refresh_token, expires_at) VALUES (5, 'a', 'r', 0);
+         INSERT INTO usage_logs (ts, cred_id, model, path, cost_usd, input_tokens)
+         VALUES (1800000000, 5, 'm', '/v1/messages', 0.25, 7), (1800000100, 5, 'm', '/v1/messages', 0.75, 3);
+         DELETE FROM billing_hourly; DELETE FROM settings WHERE key = 'billing_backfilled';",
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    init_schema(&conn).unwrap();
+    let store = CredentialStore::with_conn(conn);
+    let f = BillingFilter { since: 1_799_990_000, until: 1_800_010_000, ..Default::default() };
+    let rows = store.billing_breakdown(&f, BillingDim::Cred).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].requests, rows[0].cost_usd, rows[0].input_tokens), (2, 1.0, 10));
 }

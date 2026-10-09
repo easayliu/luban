@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, KeyRoundIcon, RefreshCwIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode, reauthorizeCredential, type Credential } from '@/api/credentials'
+import { GroupPicker, defaultGroupId, useGroups } from '@/components/group-picker'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { ReauthorizeContext } from '@/lib/reauthorize'
@@ -43,12 +44,16 @@ export function AddAccount({
   const [code, setCode] = useState('')
   const [label, setLabel] = useState('')
   const [proxy, setProxy] = useState('')
+  // 放进哪些号池分组：打开时预选默认分组（上号必选至少一个）。
+  const groupsQuery = useGroups(open && !reauth)
+  const [groupIds, setGroupIds] = useState<number[]>([])
   const authorizeSession = useRef(0)
 
   const reset = () => {
     setCode('')
     setLabel('')
     setProxy('')
+    setGroupIds([])
     setAuthUrl(null)
   }
   const handleOpenChange = (next: boolean) => {
@@ -60,6 +65,11 @@ export function AddAccount({
     authorizeSession.current += 1
     if (open) reset()
   }, [open])
+  // 分组拉回来之后预选默认分组（只在还一个都没选时）。
+  const defaultGroup = defaultGroupId(groupsQuery.data)
+  useEffect(() => {
+    if (open && defaultGroup != null) setGroupIds((ids) => (ids.length ? ids : [defaultGroup]))
+  }, [open, defaultGroup])
 
   const authorize = useMutation({
     mutationFn: (_request: AuthorizeRequest) => getAuthorizeUrl(),
@@ -80,7 +90,7 @@ export function AddAccount({
   const exchange = useMutation({
     mutationFn: () => reauth
       ? reauthorizeCredential(reauth.id, code.trim())
-      : exchangeCode(code.trim(), label.trim() || undefined, proxy.trim() || undefined),
+      : exchangeCode(code.trim(), label.trim() || undefined, proxy.trim() || undefined, groupIds),
     onSuccess: (cred) => {
       toastManager.add({
         title: reauth ? t('已重新授权', 'Account reauthorized') : t('已添加账号', 'Account added'),
@@ -232,6 +242,20 @@ export function AddAccount({
                 />
               </Field>
               {!reauth && (<>
+              <Field name="groups">
+                <FieldLabel>{t('号池分组', 'Pool groups')}</FieldLabel>
+                {groupsQuery.data ? (
+                  <GroupPicker groups={groupsQuery.data} value={groupIds} onChange={setGroupIds} />
+                ) : (
+                  <p className="text-sm text-muted-foreground">{t('正在加载分组', 'Loading groups')}</p>
+                )}
+                <FieldDescription>
+                  {t(
+                    '至少选择一个。接入 Key 绑定了分组时，只会用到这些分组里的号。',
+                    'Pick at least one. An access key bound to groups only uses the accounts in those groups.',
+                  )}
+                </FieldDescription>
+              </Field>
               <Field name="label">
                 <FieldLabel htmlFor="account-label">
                   {t('账号备注（可选）', 'Account label (optional)')}
@@ -307,7 +331,7 @@ export function AddAccount({
             <Button
               type="submit"
               loading={exchange.isPending}
-              disabled={!code.trim()}
+              disabled={!code.trim() || (!reauth && groupIds.length === 0)}
             >
               {reauth ? <KeyRoundIcon /> : <ArrowRightIcon />}
               {reauth ? t('重新授权', 'Reauthorize') : t('添加账号', 'Add account')}

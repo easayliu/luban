@@ -199,6 +199,10 @@ impl<'a> Binding<'a> {
 /// 位置传参写反了照样编译得过，而那是一个「设备粘性按模型名走」的静默错误。
 #[derive(Default, Clone, Copy)]
 pub struct Select<'a> {
+    /// 接入 Key 绑定的分组，按优先顺序；`None` 或空 = 全部号。只在这些分组的号里选，号在越
+    /// 靠前的分组里越优先（排序第一键，排在优先级之前）；前面分组的号都用不了才溢出到后面的。
+    /// 粘住的号不在这些分组里时，按「原号不可用」改选。
+    pub groups: Option<&'a [i64]>,
     /// 客户端设备标识；`None` 即裸请求（不绑定、不占设备名额）。
     pub device_id: Option<&'a str>,
     /// **模拟会话键**：来访走模拟路径且没有设备身份时，代理算出来的这条会话的键，形如
@@ -310,6 +314,25 @@ impl CredentialStore {
     /// 反过来，**不经选号的那些请求一条都不计**：连通性测试指定打哪个号（不走这里），却照样
     /// 写 `usage_logs`。所以列表里的 RPM 可能比限流器数到的略高一点点——探活是人手点出来的，
     /// 量级上不构成干扰，但对不上时要知道差在哪。
+    /// 号 → 它所在的、在 `groups`（按优先顺序）里最靠前的那个分组的名次。
+    fn group_ranks(conn: &Connection, groups: &[i64]) -> Result<HashMap<i64, usize>> {
+        let order: HashMap<i64, usize> = groups.iter().enumerate().map(|(i, g)| (*g, i)).collect();
+        let placeholders = vec!["?"; groups.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT cred_id, group_id FROM credential_groups WHERE group_id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(groups), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out: HashMap<i64, usize> = HashMap::new();
+        for row in rows {
+            let (cred, group) = row?;
+            let rank = order[&group];
+            out.entry(cred).and_modify(|r| *r = (*r).min(rank)).or_insert(rank);
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     pub fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {
         self.select_with_slot(sel).map(|(cred, _)| cred)
@@ -332,6 +355,7 @@ impl CredentialStore {
             rate_limited,
             exclude,
             model,
+            groups,
         } = sel;
         // 这条请求按什么粘住账号、占哪种名额：有设备身份按设备（`per_session` 时改按会话）；
         // 没有设备身份但带会话键（模拟路径）按会话；都没有就是裸请求。一条请求只占一份名额。
@@ -386,9 +410,22 @@ impl CredentialStore {
             "SELECT {COLS} FROM credentials WHERE disabled = 0 AND {OWNER_ACTIVE} \
              ORDER BY priority ASC, id ASC"
         ))?;
-        let all: Vec<Credential> =
+        let mut all: Vec<Credential> =
             stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
+        // 接入 Key 绑定了分组：只留这些分组里的号，并记下每个号所在的最靠前的分组名次。
+        let group_rank: Option<HashMap<i64, usize>> = match groups {
+            Some(gs) if !gs.is_empty() => Some(Self::group_ranks(&conn, gs)?),
+            _ => None,
+        };
+        if let Some(rank) = &group_rank {
+            all.retain(|c| rank.contains_key(&c.id));
+            if all.is_empty() {
+                anyhow::bail!("no available credentials in the groups bound to this API key");
+            }
+        }
+        let rank_of =
+            |c: &Credential| group_rank.as_ref().and_then(|m| m.get(&c.id).copied()).unwrap_or(0);
         if all.is_empty() {
             // 一个能用的都没有。若其中有「限流暂停、还没到点」的，这不是配置问题而是限流：
             // 回 429 + 最早那个的恢复时刻，比一句「没有可用凭证，请先登录」诚实得多
@@ -690,7 +727,7 @@ impl CredentialStore {
             }
         };
         let mut ordered: Vec<&Credential> = creds.iter().collect();
-        ordered.sort_by_key(|c| (c.priority, plan_rank(c), used(c), c.id));
+        ordered.sort_by_key(|c| (rank_of(c), c.priority, plan_rank(c), used(c), c.id));
         // 设备亲和（按会话占名额的带设备来访，见 [`Select::per_session`]）：这台设备上次落的号
         // 提到最前，新会话跟着它走——一台机器的活集中在一个号上，才像一个真实用户。它照样要过
         // 下面的名额与 RPM 两道门，过不去就按原顺序溢出。premium 模型下不越过档次更高的号：
@@ -705,7 +742,9 @@ impl CredentialStore {
                 )
                 .optional()?
             && let Some(pos) = ordered.iter().position(|c| c.id == home)
-            && ordered.first().is_some_and(|f| plan_rank(ordered[pos]) <= plan_rank(f))
+            && ordered.first().is_some_and(|f| {
+                rank_of(ordered[pos]) <= rank_of(f) && plan_rank(ordered[pos]) <= plan_rank(f)
+            })
         {
             let c = ordered.remove(pos);
             ordered.insert(0, c);

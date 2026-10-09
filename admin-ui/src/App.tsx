@@ -32,9 +32,10 @@ import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { SetupPage } from '@/components/setup-page'
 import { UsersPage } from '@/components/users-page'
+import { BillingPage } from '@/components/billing-page'
 import { ChangePasswordDialog } from '@/components/change-password-dialog'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, Breadcrumb, MainNav, PreferencesMenu, scrollToTop } from '@/components/app-header'
+import { AppHeader, Breadcrumb, MainNav, PreferencesMenu, scrollToTop, type MainSection } from '@/components/app-header'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -127,7 +128,7 @@ function readViewParams(): URLSearchParams {
 }
 
 // 与 settings-page 的 SettingsSection 保持一致；那边是懒加载的，不从那里 import 以免把它拉进首包。
-const SETTINGS_SECTIONS: readonly SettingsSection[] = ['access', 'devices', 'proxies', 'forwarding', 'security', 'migration']
+const SETTINGS_SECTIONS: readonly SettingsSection[] = ['access', 'groups', 'devices', 'proxies', 'forwarding', 'security', 'migration']
 
 function readSettingsRoute(): SettingsSection | null {
   const match = /^#\/settings(?:\/([^/?]+))?/.exec(window.location.hash)
@@ -137,9 +138,12 @@ function readSettingsRoute(): SettingsSection | null {
   return section && SETTINGS_SECTIONS.includes(section) ? section : 'access'
 }
 
-/** `#/users` → 用户管理页。 */
-function readUsersRoute(): boolean {
-  return /^#\/users(?:[/?]|$)/.test(window.location.hash)
+/** 与账号池平级的一级页面（`#/users`、`#/billing`）。 */
+type MainPage = 'users' | 'billing'
+
+function readMainRoute(): MainPage | null {
+  const match = /^#\/(users|billing)(?:[/?]|$)/.exec(window.location.hash)
+  return match ? (match[1] as MainPage) : null
 }
 
 /** `#/accounts/<id>` → 账号 id；其余地址不是详情页。 */
@@ -155,9 +159,9 @@ function App() {
   const [lookupOpen, setLookupOpen] = useState(false)
   const [bansOpen, setBansOpen] = useState(false)
   const [passwordOpen, setPasswordOpen] = useState(false)
-  const [usersRoute, setUsersRoute] = useState(readUsersRoute)
+  const [mainRoute, setMainRoute] = useState<MainPage | null>(readMainRoute)
   // 同设置页：从账号页点进来的，返回时消费 history；深链接直接打开的原地替换回账号页。
-  const enteredUsersFromAccounts = useRef(false)
+  const enteredMainFromAccounts = useRef(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
   const [session, setSession] = useState<string | null>(getToken())
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -173,7 +177,7 @@ function App() {
   // 进详情前列表滚到了哪儿，回来时还原——否则从第三页底部点进去，回来就被扔回顶部。
   const listScrollY = useRef<number | null>(null)
   const onList = useRef(false)
-  onList.current = !settingsRoute && !usersRoute && accountRoute == null
+  onList.current = !settingsRoute && !mainRoute && accountRoute == null
 
   // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文；
   // 链接里带了同名参数时以链接为准（见 readViewParams）。
@@ -222,7 +226,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (settingsRoute || usersRoute || accountRoute != null) return
+    if (settingsRoute || mainRoute || accountRoute != null) return
     const params = new URLSearchParams()
     if (query.trim()) params.set('q', query.trim())
     if (filter !== 'all') params.set('filter', filter)
@@ -235,7 +239,7 @@ function App() {
     const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
     if (window.location.href.endsWith(`#/?${params.toString()}`)) return
     window.history.replaceState(null, '', next)
-  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, usersRoute, accountRoute])
+  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, mainRoute, accountRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
@@ -250,9 +254,9 @@ function App() {
       }
       setSettingsRoute(next)
       setAccountRoute(nextAccount)
-      const nextUsers = readUsersRoute()
-      setUsersRoute(nextUsers)
-      if (!nextUsers) enteredUsersFromAccounts.current = false
+      const nextMain = readMainRoute()
+      setMainRoute(nextMain)
+      if (!nextMain) enteredMainFromAccounts.current = false
       if (!next) enteredSettingsFromAccounts.current = false
       if (nextAccount == null) enteredAccountFromList.current = false
     }
@@ -288,20 +292,30 @@ function App() {
     }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
-  const openUsers = () => {
-    window.history.pushState(null, '', '#/users')
-    enteredUsersFromAccounts.current = true
-    setUsersRoute(true)
-    window.scrollTo({ top: 0, behavior: 'instant' })
-  }
-  const closeUsers = () => {
-    setUsersRoute(false)
-    if (enteredUsersFromAccounts.current) {
-      enteredUsersFromAccounts.current = false
+  const closeMain = () => {
+    setMainRoute(null)
+    if (enteredMainFromAccounts.current) {
+      enteredMainFromAccounts.current = false
       window.history.back()
     } else {
       window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
     }
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
+  // 主导航：账号池、费用、用户管理三者平级。从账号池进去压一层历史（后退回账号池），
+  // 一级页面之间互切原地替换，不在历史里越积越深。
+  const navigateMain = (section: MainSection) => {
+    if (section === 'pool') {
+      closeMain()
+      return
+    }
+    if (mainRoute) {
+      window.history.replaceState(null, '', `#/${section}`)
+    } else {
+      window.history.pushState(null, '', `#/${section}`)
+      enteredMainFromAccounts.current = true
+    }
+    setMainRoute(section)
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
   const closeAccount = useCallback(() => {
@@ -360,11 +374,11 @@ function App() {
       window.history.replaceState(null, '', '#/')
       setSettingsRoute(null)
     }
-    if (usersRoute && confirmedRole !== 'admin' && confirmedRole !== 'agent') {
+    if (mainRoute === 'users' && confirmedRole !== 'admin' && confirmedRole !== 'agent') {
       window.history.replaceState(null, '', '#/')
-      setUsersRoute(false)
+      setMainRoute(null)
     }
-  }, [confirmedRole, settingsRoute, usersRoute])
+  }, [confirmedRole, settingsRoute, mainRoute])
   const needLogin = authState?.configured && !session
   // 未设密码：管理接口一律拒绝（本机也一样），先用启动日志里的初始化口令设密码。
   const needSetup = !!authState?.setup_required
@@ -423,8 +437,12 @@ function App() {
     return <LoginPage onSuccess={setSession} />
   }
 
-  if (!isBootstrapping && usersRoute && canManageUsers) {
-    return <UsersPage onBack={closeUsers} onSignOut={signOut} />
+  if (!isBootstrapping && mainRoute === 'users' && canManageUsers) {
+    return <UsersPage onNavigate={navigateMain} onSignOut={signOut} />
+  }
+
+  if (!isBootstrapping && mainRoute === 'billing') {
+    return <BillingPage onNavigate={navigateMain} onSignOut={signOut} />
   }
 
   if (!isBootstrapping && settingsRoute && isAdmin) {
@@ -457,9 +475,7 @@ function App() {
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
         homeLabel={t('返回顶部', 'Back to top')}
-        nav={canManageUsers
-          ? <MainNav current="pool" onNavigate={(section) => { if (section === 'users') openUsers() }} />
-          : undefined}
+        nav={<MainNav current="pool" onNavigate={navigateMain} />}
         onNavigateHome={scrollToTop}
         actions={
           <>

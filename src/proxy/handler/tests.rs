@@ -557,7 +557,7 @@ async fn assert_local_reject(
 async fn gate_invalid_api_key() {
     let mock = MockUpstream::start(vec![]).await;
     let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::CLIENT_API_KEY, "the-right-key").unwrap();
+    store.create_api_key("k", "the-right-key", &[]).unwrap().unwrap();
     let req = cc_request(serde_json::json!({}));
     assert_local_reject(
         &mock,
@@ -826,4 +826,29 @@ async fn no_credential_is_a_503() {
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(mock.seen().is_empty());
+}
+
+/// 接入 Key 绑定了分组：转发只落在这些分组的号上（上游收到的是组里那个号的 token）；
+/// 分组里没有号时本地拒掉，一发上游都不打。
+#[tokio::test]
+async fn api_key_groups_route_to_their_accounts() {
+    let mock = MockUpstream::start(vec![sse_ok("ok")]).await;
+    let (store, state, ids) = setup(2, &mock.base);
+    let vip = store.create_group("vip", "").unwrap().unwrap();
+    let empty = store.create_group("empty", "").unwrap().unwrap();
+    store.set_credential_groups(&[ids[1]], &[vip]).unwrap().unwrap();
+    store.create_api_key("vip", "key-vip", &[vip]).unwrap().unwrap();
+    store.create_api_key("empty", "key-empty", &[empty]).unwrap().unwrap();
+
+    let mut req = cc_request(serde_json::json!({}));
+    req.0.insert("x-api-key", HeaderValue::from_static("key-vip"));
+    let (status, _, body) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), vec!["tok-1"]);
+
+    let mut req = cc_request(serde_json::json!({}));
+    req.0.insert("x-api-key", HeaderValue::from_static("key-empty"));
+    let (status, _, body) = send(&state, req).await;
+    assert_ne!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 1, "分组里没有号，不该再打上游");
 }

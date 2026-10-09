@@ -430,6 +430,9 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/credentials/disabled", Owned::CredentialIds),
     ("/credentials/delete", Owned::CredentialIds),
     ("/credentials/proxy", Owned::CredentialIds),
+    ("/credentials/groups", Owned::CredentialIds),
+    // 分组列表：handler 按身份收窄；增删改在 handler 里再要求 admin。
+    ("/groups", Owned::Nothing),
     ("/proxies", Owned::Nothing),
     ("/proxies/test", Owned::Nothing),
     ("/proxies/batch", Owned::Nothing),
@@ -440,6 +443,8 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/ban-events/{id}/logs", Owned::BanEventPath),
     // 请求流水：handler 把结果强制限定在本人名下的号上。
     ("/usage", Owned::Nothing),
+    // 分层账单：handler 按身份收窄可见的号主与拆分维度。
+    ("/billing", Owned::Nothing),
 ];
 
 /// 路由的访问级别，默认只给 admin。
@@ -463,9 +468,10 @@ fn access_of(path: &str) -> Access {
 /// - `/settings`、`/learned-rejections`：只有系统设置页用，而系统设置整页不对访客开放
 ///   （`/settings` 还带着明文接入 key）。`/proxies` 不在此列：账号页要靠它显示代理名称，
 ///   地址里的密码由 [`redact_url_credentials`] 遮掉；
-/// - `/users`：访客是来看号池的，用不着控制台账号名单。
+/// - `/users`：访客是来看号池的，用不着控制台账号名单；
+/// - `/api-keys`：带着查看明文的接口，看到就等于能用。
 const VIEWER_DENIED: &[&str] =
-    &["/authorize", "/export", "/settings", "/learned-rejections", "/users"];
+    &["/authorize", "/export", "/settings", "/learned-rejections", "/users", "/api-keys"];
 
 /// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
 /// `POST`，但只作废访客自己的会话，不放行的话访客点「退出」只清得掉本地 token。
@@ -750,6 +756,11 @@ pub struct SetupReq {
 /// 等长逐字节异或比较：不因第一个不同字节提前返回，免得按响应时间一位一位试出口令。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// [`constant_time_eq`] 给别的模块用（转发入口比对环境变量里的接入 Key）。
+pub(crate) fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
+    constant_time_eq(a, b)
 }
 
 /// 生成初始化口令：16 字节随机数的十六进制（32 位）。

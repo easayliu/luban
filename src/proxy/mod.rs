@@ -317,6 +317,8 @@ struct RequestLogState {
     /// 但失败出在一个具体的号上，本地拒绝那条流水记到它名下，错误文案换成完整错误链——
     /// 回给客户端的那句不带细节（代理报错里可能有代理地址）。
     refresh_failed: parking_lot::Mutex<Option<store::RefreshFailed>>,
+    /// 来访用的哪把接入 Key（认身份那一步放下），流水与费用汇总按它记账。
+    key_id: parking_lot::Mutex<Option<i64>>,
 }
 
 /// 流水 `rewrites` 里标「本地拒绝、未转发」；带原因分类时是 `rejected_locally:<kind>`，
@@ -421,6 +423,7 @@ fn log_early_upstream_failure(
     let ratelimit = f.ratelimit.cloned().unwrap_or_default();
     let rec = store::UsageRecord {
         cred_id: Some(cred.id),
+        key_id: *log_state.key_id.lock(),
         cred_label: cred.label.clone(),
         device_id: f.device_id,
         model: f.model,
@@ -566,27 +569,46 @@ pub(super) fn header_opt(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
-/// 生效的接入 key：启动时 `--api-key`/env 覆盖优先，否则用库中网页配置的值。
-fn effective_client_key(state: &AppState) -> Option<String> {
-    if let Some(k) = &state.client_key {
-        return Some(k.to_string());
-    }
-    state.store.get_setting(store::CLIENT_API_KEY).ok().flatten().filter(|s| !s.trim().is_empty())
+/// 来访带的接入 Key：`x-api-key: <key>` 或 `Authorization: Bearer <key>`。
+fn presented_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        })
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
 }
 
-/// 校验来访身份：`x-api-key: <key>` 或 `Authorization: Bearer <key>`。
-fn client_authorized(headers: &HeaderMap, expected: &str) -> bool {
-    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
-        && v == expected
+/// 认来访身份，回它能用哪些号（[`store::KeyAccess`]）；`None` = 拒绝。
+///
+/// - `--api-key` / `LUBAN_API_KEY` 设的那把：用全部号；
+/// - 库里启用中的接入 Key：用它绑定的分组（没绑 = 全部号）；
+/// - 两边都没有配置任何 Key：不校验，用全部号——与老版本「没配接入 Key 就放行」一致。
+fn client_access(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<store::KeyAccess>> {
+    let all = || store::KeyAccess { key_id: None, groups: Vec::new() };
+    let key = presented_key(headers);
+    if let (Some(env), Some(k)) = (&state.client_key, key)
+        && crate::auth::secrets_equal(env.as_bytes(), k.as_bytes())
     {
-        return true;
+        return Ok(Some(all()));
     }
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
-        && v.strip_prefix("Bearer ").map(str::trim) == Some(expected)
+    if let Some(k) = key
+        && let Some(access) = state.store.api_key_access(k)?
     {
-        return true;
+        return Ok(Some(access));
     }
-    false
+    if state.client_key.is_none() && !state.store.has_api_keys()? {
+        return Ok(Some(all()));
+    }
+    Ok(None)
 }
 
 /// 把 16 字节按 uuid v4 的形态格式化（打上 version/variant 位，小写带连字符）。

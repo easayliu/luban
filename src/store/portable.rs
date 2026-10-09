@@ -16,6 +16,17 @@ impl From<&SavedProxy> for PortableProxy {
     }
 }
 
+/// 迁移用的一把接入 Key：名称、明文、停用状态。分组绑定不带——分组 id 由目标库自己发，
+/// 导进去的 Key 一律不绑定分组（用全部号），需要的话在目标站重新绑。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PortableApiKey {
+    #[serde(default)]
+    pub label: String,
+    pub key: String,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
 /// 迁移用的一条凭证：导出与导入**共用同一个形态**，导出的文件原样喂回来就是导入的入参。
 ///
 /// 刻意不带的三类字段：
@@ -252,8 +263,8 @@ impl CredentialStore {
             Some(id) => Some(id),
             None => tx
                 .query_row(
-                    "SELECT id FROM credentials WHERE refresh_token = ?1",
-                    [&c.refresh_token],
+                    "SELECT id FROM credentials WHERE refresh_token_hash = ?1",
+                    [token_fingerprint(&c.refresh_token)],
                     |r| r.get(0),
                 )
                 .optional()?,
@@ -269,15 +280,16 @@ impl CredentialStore {
                          rate_limit_tier = ?16, org_uuid = ?17, subscription_created_at = ?18,
                          quota_pause_pct = ?19, quota_pause_pct_7d = ?20, session_limit = ?21,
                          org_name = ?22, seat_tier = ?23, subscription_status = ?24,
-                         extra_usage_enabled = ?25, updated_at = unixepoch()
+                         extra_usage_enabled = ?25, refresh_token_hash = ?26,
+                         updated_at = unixepoch()
                      WHERE id = ?1",
                     params![
                         id,
                         c.label,
                         c.tier,
                         c.org_type,
-                        c.access_token,
-                        c.refresh_token,
+                        seal(&c.access_token),
+                        seal(&c.refresh_token),
                         c.expires_at as i64,
                         priority,
                         c.disabled as i64,
@@ -297,6 +309,7 @@ impl CredentialStore {
                         c.seat_tier,
                         c.subscription_status,
                         c.extra_usage_enabled.map(i64::from),
+                        token_fingerprint(&c.refresh_token),
                     ],
                 )
                 .context("failed to update the existing credential")?;
@@ -310,16 +323,16 @@ impl CredentialStore {
                           account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
                           subscription_created_at, quota_pause_pct, quota_pause_pct_7d,
                           session_limit, org_name, seat_tier, subscription_status,
-                          extra_usage_enabled, owner_id)
+                          extra_usage_enabled, refresh_token_hash, owner_id)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
                              (SELECT id FROM users WHERE role = 'admin'))",
                     params![
                         c.label,
                         c.tier,
                         c.org_type,
-                        c.access_token,
-                        c.refresh_token,
+                        seal(&c.access_token),
+                        seal(&c.refresh_token),
                         c.expires_at as i64,
                         priority,
                         c.disabled as i64,
@@ -339,6 +352,7 @@ impl CredentialStore {
                         c.seat_tier,
                         c.subscription_status,
                         c.extra_usage_enabled.map(i64::from),
+                        token_fingerprint(&c.refresh_token),
                     ],
                 )
                 .context("failed to insert the credential (its refresh_token may already exist)")?;
@@ -361,9 +375,57 @@ impl CredentialStore {
             {
                 continue;
             }
+            // 旧版导出文件里的全局接入 Key：转成一把不绑定分组的接入 Key（设置项本身已不再使用）。
+            if k == CLIENT_API_KEY {
+                if !v.trim().is_empty() {
+                    let key = PortableApiKey {
+                        label: "导入的 Key".into(),
+                        key: v.trim().into(),
+                        disabled: false,
+                    };
+                    self.import_api_key(&key)?;
+                    n += 1;
+                }
+                continue;
+            }
             self.set_setting(k, v)?;
             n += 1;
         }
         Ok(n)
+    }
+
+    /// 导出全部接入 Key（含明文）。
+    pub fn export_api_keys(&self) -> Result<Vec<PortableApiKey>> {
+        self.list_api_keys()?
+            .into_iter()
+            .map(|k| {
+                let key = self.reveal_api_key(k.id)?.unwrap_or_default();
+                Ok(PortableApiKey { label: k.label, key, disabled: k.disabled })
+            })
+            .collect()
+    }
+
+    /// 导入一把接入 Key：同一把（明文相同）已在就跳过，回 `Updated`；否则新增、不绑定分组。
+    pub fn import_api_key(&self, k: &PortableApiKey) -> Result<ImportOutcome> {
+        anyhow::ensure!(!k.key.trim().is_empty(), "API key must not be empty");
+        let exists: bool = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM api_keys WHERE key_hash = ?1)",
+                [token_fingerprint(k.key.trim())],
+                |r| r.get(0),
+            )?
+        };
+        if exists {
+            return Ok(ImportOutcome::Updated);
+        }
+        let id = self
+            .create_api_key(k.label.trim(), k.key.trim(), &[])?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if k.disabled {
+            self.update_api_key(id, k.label.trim(), true, &[])?
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(ImportOutcome::Added)
     }
 }

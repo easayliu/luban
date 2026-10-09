@@ -1,9 +1,9 @@
 import { api } from './client'
 
 export interface Settings {
-  /** 当前接入 key（null = 未设置，不校验来访）。 */
+  /** `LUBAN_API_KEY` 设的接入 Key（只在 `env_managed` 时有值）。网页上建的 Key 见 `/api-keys`。 */
   api_key: string | null
-  /** 是否由环境变量接管（true 时网页只读）。 */
+  /** 是否设了 `LUBAN_API_KEY`。 */
   env_managed: boolean
   /** 设备绑定有效期（秒）；0 表示永不过期。 */
   device_binding_ttl_secs: number
@@ -192,11 +192,6 @@ export async function getSettings(): Promise<Settings> {
   return data
 }
 
-/** 设置/清除接入 key（空串清除）。 */
-export async function setApiKey(api_key: string): Promise<Settings> {
-  const { data } = await api.post<Settings>('/settings/api-key', { api_key })
-  return data
-}
 
 /** 设置设备绑定有效期（秒；0 表示永不过期）。 */
 export async function setDeviceTtl(secs: number): Promise<Settings> {

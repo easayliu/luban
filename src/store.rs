@@ -16,9 +16,11 @@ use crate::credentials::{
 };
 
 mod bans;
+mod billing;
 mod bindings;
 mod credential;
 mod flags;
+mod groups;
 mod learned;
 mod limits;
 mod portable;
@@ -27,6 +29,7 @@ mod quota;
 mod refresh;
 mod rollup;
 mod schema;
+mod secret;
 mod select;
 mod session_events;
 mod settings;
@@ -35,9 +38,12 @@ mod usage;
 mod users;
 
 pub use bans::*;
+use billing::*;
+pub use billing::{BillingDim, BillingFilter, BillingRow};
 pub use bindings::*;
 pub use credential::*;
 pub use flags::*;
+pub use groups::*;
 pub use learned::*;
 pub use limits::*;
 pub use portable::*;
@@ -47,6 +53,8 @@ pub use refresh::*;
 pub use rollup::series_grid;
 use rollup::*;
 use schema::*;
+pub use secret::init_key;
+use secret::*;
 pub use select::*;
 use session_events::*;
 pub use session_events::{SESSION_EVENT_RETENTION_SECS, SessionEvent};
@@ -163,6 +171,8 @@ impl CredentialStore {
         // 接着往后长（改动前读写同锁串行，没有这个情况）。WAL 本身不会自己缩，这里给个上限：
         // 下次重置时截回 64MB，一阵连续的慢查询过后磁盘占用能降回来。
         conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
+        // 密钥要在建表迁移之前就位：迁移会把存量明文 token 加密（见 `secret`）。
+        init_key(path.parent().unwrap_or(std::path::Path::new(".")))?;
         init_schema(&conn)?;
         let mut store = Self::with_conn(conn);
         // schema 已由主连接建好，只读连接不做迁移。开不出来不影响服务：少几条就少几条并行，
@@ -271,8 +281,8 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         id: row.get(0)?,
         label: row.get(1)?,
         tier: row.get(2)?,
-        access_token: row.get(3)?,
-        refresh_token: row.get(4)?,
+        access_token: open_column(row.get(3)?, 3)?,
+        refresh_token: open_column(row.get(4)?, 4)?,
         expires_at: row.get::<_, i64>(5)? as u64,
         priority: row.get(6)?,
         disabled: row.get::<_, i64>(7)? != 0,

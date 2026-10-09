@@ -85,6 +85,7 @@ import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-me
 import { SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { DetailSection as Section } from '@/components/detail-section'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
+import { GroupBadges, SetGroupsDialog, useGroups } from '@/components/group-picker'
 import { statusVariant } from '@/components/usage-shared'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
@@ -1394,6 +1395,14 @@ function ScheduleSection({
   const proxyName = useProxyName()
   const { prio } = useCredentialActions(cred)
   const mobile = useMediaQuery(MOBILE_QUERY)
+  // 号池分组的修改框只在这一节里用，状态就放在这儿，不必经页面层层传。
+  const [groupsOpen, setGroupsOpen] = useState(false)
+  const { data: groups } = useGroups()
+  const groupNames = cred.groups
+    .map((id) => groups?.find((g) => g.id === id)?.name)
+    .filter(Boolean)
+    .join('、') || '—'
+  const groupsDialog = <SetGroupsDialog cred={cred} open={groupsOpen} onOpenChange={setGroupsOpen} />
   // 访客：「修改」与优先级下拉都不给。手机上那几行整行可点，点开的对话框是只读的，照常留着。
   const readOnly = useReadOnly()
   const edit = (onClick: () => void) => readOnly ? null : (
@@ -1435,6 +1444,8 @@ function ScheduleSection({
     )
     return (
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>
+        {row(t('号池分组', 'Pool groups'), groupNames, () => { if (!readOnly) setGroupsOpen(true) })}
+        {groupsDialog}
         {row(t('出站代理', 'Outbound proxy'), proxyName(cred) ?? t('直连', 'Direct'), onProxy)}
         {row(
           t('提前暂停调度', 'Early pause'),
@@ -1454,6 +1465,15 @@ function ScheduleSection({
       title={t('调度配置', 'Scheduling')}
       description={t('设备、会话与 RPM 上限可点击页头的对应读数进行调整。', 'Adjust the device, session and RPM limits from the readouts at the top.')}
     >
+      <SettingsRow
+        label={t('号池分组', 'Pool groups')}
+        description={cred.groups.length
+          ? <GroupBadges ids={cred.groups} />
+          : t('不在任何分组里', 'Not in any group')}
+      >
+        {edit(() => setGroupsOpen(true))}
+      </SettingsRow>
+      {groupsDialog}
       <SettingsRow
         label={t('出站代理', 'Outbound proxy')}
         description={cred.proxy

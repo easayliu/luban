@@ -21,6 +21,7 @@ fn credential_views(state: &AppState, scope: Scope) -> Result<Json<Vec<Credentia
         Scope::All => Some(state.store.owner_names().map_err(internal)?),
         Scope::Owner(_) => None,
     };
+    let mut groups = state.store.credential_group_map().map_err(internal)?;
     let counts = state.store.device_counts().map_err(internal)?;
     let session_counts = state.store.session_counts().map_err(internal)?;
     let quotas = state.store.latest_quotas().map_err(internal)?;
@@ -43,6 +44,7 @@ fn credential_views(state: &AppState, scope: Scope) -> Result<Json<Vec<Credentia
             .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
             .with_proxy_ids(&proxy_ids)
             .with_owner_name(owners.as_ref())
+            .with_groups(groups.remove(&c.id).unwrap_or_default())
             .with_cooldown(
                 state.store.rate_limited_secs(c.id),
                 state.store.rate_limited_models(c.id),
@@ -636,9 +638,11 @@ pub(super) fn credential_view(state: &AppState, id: i64) -> Result<Json<Credenti
     let cost_total = state.store.cost_of(id).map_err(internal)?;
     let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
     let denials = state.store.denied_models(id).map_err(internal)?;
+    let groups = state.store.credential_groups(id).map_err(internal)?;
     Ok(Json(
         CredentialView::new(&cred, count, session_count, DefaultLimits::of(&state.store))
             .with_proxy_ids(&saved_proxy_ids(state)?)
+            .with_groups(groups)
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
                 state.store.rate_limited_models(cred.id),
@@ -646,4 +650,52 @@ pub(super) fn credential_view(state: &AppState, id: i64) -> Result<Json<Credenti
             .with_denials(denials)
             .with_stats(quota, last_used, cost_total, rpm),
     ))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SetGroupsReq {
+    group_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SetGroupsManyReq {
+    ids: Vec<i64>,
+    group_ids: Vec<i64>,
+}
+
+/// 改一个号所在的分组（整体替换，至少一个）。代理和用户只能选开放给自己的分组，admin 随便选。
+pub(super) async fn set_credential_groups(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetGroupsReq>,
+) -> Result<Json<CredentialView>, ApiError> {
+    if state.store.get(id).map_err(internal)?.is_none() {
+        return Err(not_found());
+    }
+    check_selectable(&state, &actor, &req.group_ids)?;
+    state
+        .store
+        .set_credential_groups(&[id], &req.group_ids)
+        .map_err(internal)?
+        .map_err(group_error)?;
+    tracing::info!(cred_id = id, groups = ?req.group_ids, by = %actor.username, "credential groups updated");
+    view_of(&state, id).await
+}
+
+/// 批量改分组：口径同 [`set_credential_groups`]。
+pub(super) async fn set_credentials_groups(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Json(req): Json<SetGroupsManyReq>,
+) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    check_ids(&req.ids)?;
+    check_selectable(&state, &actor, &req.group_ids)?;
+    state
+        .store
+        .set_credential_groups(&req.ids, &req.group_ids)
+        .map_err(internal)?
+        .map_err(group_error)?;
+    tracing::info!(count = req.ids.len(), groups = ?req.group_ids, by = %actor.username, "credential groups updated in bulk");
+    list_credentials(State(state), Extension(actor)).await
 }

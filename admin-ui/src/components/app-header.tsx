@@ -4,6 +4,7 @@ import {
   EllipsisVerticalIcon,
   LanguagesIcon,
   LayersIcon,
+  ReceiptIcon,
   LogOutIcon,
   MonitorIcon,
   MoonIcon,
@@ -22,7 +23,7 @@ import {
   MenuTrigger,
 } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
-import { useMe, useReadOnly } from '@/lib/role'
+import { useCanManageUsers, useMe, useReadOnly } from '@/lib/role'
 import { cn } from '@/lib/utils'
 import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/lib/theme'
 
@@ -49,7 +50,7 @@ export function AppHeader({
   actions?: ReactNode
   /** logo 的无障碍名与悬浮提示；不给就按「回到账号池」。 */
   homeLabel?: string
-  /** 品牌右侧的主导航（见 [MainNav]），只有管理员与代理有。 */
+  /** 品牌右侧的主导航（见 [MainNav]）。 */
   nav?: ReactNode
   onNavigateHome?: () => void
 }) {
@@ -113,12 +114,12 @@ export function AppHeader({
   )
 }
 
-/** 顶栏主导航的两个一级页面。 */
-export type MainSection = 'pool' | 'users'
+/** 顶栏主导航的一级页面。 */
+export type MainSection = 'pool' | 'billing' | 'users'
 
 /**
- * 顶栏主导航：账号池与用户管理是平级的两个一级页面，不是谁挂在谁下面。只给管理员与代理
- * （用户没有用户管理，只剩一项就不必画导航）。窄屏只留图标，文字留给读屏与悬浮提示。
+ * 顶栏主导航：账号池、费用、用户管理是平级的一级页面，不是谁挂在谁下面。用户管理只给管理员
+ * 与代理。窄屏只留图标，文字留给读屏与悬浮提示。
  */
 export function MainNav({
   current,
@@ -128,9 +129,11 @@ export function MainNav({
   onNavigate: (section: MainSection) => void
 }) {
   const { t } = useI18n()
+  const canManageUsers = useCanManageUsers()
   const items = [
     { key: 'pool' as const, label: t('账号池', 'Accounts'), icon: LayersIcon },
-    { key: 'users' as const, label: t('用户管理', 'Users'), icon: UsersIcon },
+    { key: 'billing' as const, label: t('费用', 'Billing'), icon: ReceiptIcon },
+    ...(canManageUsers ? [{ key: 'users' as const, label: t('用户管理', 'Users'), icon: UsersIcon }] : []),
   ]
   return (
     <nav aria-label={t('主导航', 'Main navigation')} className="flex shrink-0 items-center gap-0.5">

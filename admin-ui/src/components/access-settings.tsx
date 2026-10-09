@@ -5,7 +5,6 @@ import {
   CheckIcon,
   ClipboardIcon,
   EyeIcon,
-  EyeOffIcon,
   GaugeIcon,
   KeyRoundIcon,
   LockKeyholeIcon,
@@ -13,13 +12,11 @@ import {
   SaveIcon,
   Settings2Icon,
   ShieldCheckIcon,
-  SparklesIcon,
   TerminalIcon,
   TimerIcon,
   Trash2Icon,
 } from 'lucide-react'
 import {
-  setApiKey,
   setBareRateLimit,
   setDefaultDeviceLimit,
   setDefaultRpmLimit,
@@ -40,6 +37,7 @@ import { changePassword, getAuthState, setViewerPassword } from '@/api/auth'
 import { clearToken } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
 import { useMe } from '@/lib/role'
+import { ApiKeysSettings } from '@/components/api-keys-settings'
 import { copyText, extractError, formatDuration } from '@/lib/utils'
 import {
   AlertDialog,
@@ -123,67 +121,11 @@ export function AccessSettingsContent() {
   const settingsQuery = useSettingsQuery()
   const { data } = settingsQuery
 
-  const [draft, setDraft] = useState('')
-  const [show, setShow] = useState(false)
-  const [revealedSnippetKey, setRevealedSnippetKey] = useState<string | null>(null)
-  const [clearKeyOpen, setClearKeyOpen] = useState(false)
-
-  useEffect(() => {
-    setDraft(data?.api_key ?? '')
-    setShow(false)
-    setRevealedSnippetKey(null)
-  }, [data?.api_key])
-
-  const save = useSettingsSave((key: string) => setApiKey(key), {
-    onSuccess: () => {
-      setClearKeyOpen(false)
-    },
-    success: (settings) => ({
-      title: settings.api_key
-        ? t('接入 Key 已保存', 'Access key saved')
-        : t('接入 Key 已清除', 'Access key cleared'),
-      description: settings.api_key
-        ? t('新的客户端接入 Key 已生效。', 'The new client access key is now active.')
-        : t('代理将不再校验客户端请求。', 'The proxy will no longer authenticate client requests.'),
-    }),
-  })
-
   const baseUrl = window.location.origin
-  const envManaged = data?.env_managed ?? false
-  const currentKey = data?.api_key ?? ''
-  const showSnippetKey = currentKey !== '' && revealedSnippetKey === currentKey
-
-  const generate = () => {
-    const bytes = new Uint8Array(24)
-    crypto.getRandomValues(bytes)
-    const hex = Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('')
-    setDraft(`luban-${hex}`)
-    setShow(true)
-  }
-
-  const snippet =
-    `export ANTHROPIC_BASE_URL=${baseUrl}\n` +
-    (currentKey
-      ? `export ANTHROPIC_AUTH_TOKEN=${currentKey}`
-      : t(
-          '# 未设置 Key，无需 ANTHROPIC_AUTH_TOKEN',
-          '# No key configured; ANTHROPIC_AUTH_TOKEN is not required',
-        ))
-  const visibleSnippet = currentKey && !showSnippetKey
-    ? `export ANTHROPIC_BASE_URL=${baseUrl}\nexport ANTHROPIC_AUTH_TOKEN=${t('[已隐藏]', '[hidden]')}`
-    : snippet
-  const snippetCopyLabel = currentKey
-    ? t('复制完整接入片段（含 Key）', 'Copy the full setup snippet (includes the key)')
-    : t('复制接入片段', 'Copy setup snippet')
-  const snippetCopyErrorDescription = currentKey && !showSnippetKey
-    ? t(
-        '复制失败；请先显示 Key，再手动选择完整片段。',
-        'Copy failed; reveal the key before selecting the full snippet manually.',
-      )
-    : t(
-        '复制失败；请手动选择并复制接入片段。',
-        'Copy failed; select and copy the setup snippet manually.',
-      )
+  // `api_key` 只在 `LUBAN_API_KEY` 接管时有值：那把 Key 只读列在接入 Key 列表最上面。
+  const envKey = data?.env_managed ? (data.api_key ?? null) : null
+  const keyPlaceholder = t('<接入 Key>', '<access key>')
+  const snippet = `export ANTHROPIC_BASE_URL=${baseUrl}\nexport ANTHROPIC_AUTH_TOKEN=${keyPlaceholder}`
 
   if (settingsQuery.isPending) {
     return (
@@ -213,189 +155,52 @@ export function AccessSettingsContent() {
   }
 
   return (
-    <>
-      <div className="space-y-4">
-        <SettingsGroup
-          icon={CableIcon}
-          title={t('连接与认证', 'Connection & authentication')}
-          description={t(
-            '复制客户端接入地址，并配置代理用来验证客户端请求的 Key。',
-            'Copy the client endpoint and configure the key the proxy uses to authenticate client requests.',
-          )}
-        >
-          <Field className="p-4 sm:p-5">
-            <FieldLabel>
-              {t('接入地址', 'Access URL')}
-              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
-            </FieldLabel>
-            <InputGroup>
-              <InputGroupInput
-                aria-label={t('接入地址', 'Access URL')}
-                readOnly
-                value={baseUrl}
-              />
-              <InputGroupAddon align="inline-end">
-                <CopyButton
-                  text={baseUrl}
-                  label={t('复制接入地址', 'Copy access URL')}
-                  copiedLabel={t('已复制接入地址', 'Access URL copied')}
-                />
-              </InputGroupAddon>
-            </InputGroup>
-          </Field>
-
-          <Field className="p-4 sm:p-5">
-            <FieldLabel>
-              {t('接入 Key', 'Access key')}
-              <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
-            </FieldLabel>
-            <InputGroup>
-              <InputGroupInput
-                aria-label={t('接入 Key', 'Access key')}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder={envManaged ? '' : t('留空则不校验客户端请求', 'Leave blank to disable client authentication')}
-                readOnly={envManaged}
-                type={show ? 'text' : 'password'}
-                value={draft}
-              />
-              <InputGroupAddon className="gap-4" align="inline-end">
-                <Hint label={show ? t('隐藏', 'Hide') : t('显示', 'Show')}>
-                  <Button
-                    aria-label={show
-                      ? t('隐藏接入 Key', 'Hide access key')
-                      : t('显示接入 Key', 'Show access key')}
-                    size="icon-sm"
-                    variant="ghost"
-                    onClick={() => setShow((visible) => !visible)}
-                  >
-                    {show ? <EyeOffIcon /> : <EyeIcon />}
-                  </Button>
-                </Hint>
-                {/* 只复制已保存的 Key：生成后没点保存就拿去配客户端，请求会一律 401。 */}
-                <CopyButton
-                  text={currentKey}
-                  disabledReason={draft.trim() !== currentKey
-                    ? t('先保存再复制', 'Save the key before copying it')
-                    : undefined}
-                  label={t('复制接入 Key', 'Copy access key')}
-                  copiedLabel={t('已复制接入 Key', 'Access key copied')}
-                  size="icon-sm"
-                />
-              </InputGroupAddon>
-            </InputGroup>
-            {!envManaged && (
-              <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" variant="outline" onClick={generate}>
-                  <SparklesIcon />
-                  {t('生成', 'Generate')}
-                </Button>
-                <Button
-                  size="sm"
-                  loading={save.isPending}
-                  disabled={draft.trim() === currentKey}
-                  // 删空再保存等于清除 Key，同样要过确认框。
-                  onClick={() => (draft.trim() ? save.mutate(draft.trim()) : setClearKeyOpen(true))}
-                >
-                  <SaveIcon />
-                  {t('保存', 'Save')}
-                </Button>
-                {currentKey && (
-                  <Button
-                    size="sm"
-                    variant="destructive-outline"
-                    onClick={() => setClearKeyOpen(true)}
-                  >
-                    <Trash2Icon />
-                    {t('清空', 'Clear')}
-                  </Button>
-                )}
-              </div>
-            )}
-            {envManaged && (
-              <FieldDescription>
-                {t('由环境变量', 'Managed by environment variable')}{' '}
-                <code className="font-mono">LUBAN_API_KEY</code>
-                {t(' 管理，此处只读。', '; this page is read-only.')}
-              </FieldDescription>
-            )}
-          </Field>
-
-          <Field className="p-4 sm:p-5">
-            <div className="flex w-full min-w-0 items-center justify-between gap-2">
-              <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>
-              <div className="flex shrink-0 items-center gap-3">
-                {currentKey && (
-                  <Hint label={showSnippetKey ? t('隐藏 Key', 'Hide key') : t('显示 Key', 'Show key')}>
-                    <Button
-                      type="button"
-                      aria-label={showSnippetKey
-                        ? t('隐藏接入片段中的 Key', 'Hide the key in the setup snippet')
-                        : t('显示接入片段中的 Key', 'Show the key in the setup snippet')}
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => setRevealedSnippetKey((revealed) => (
-                        revealed === currentKey ? null : currentKey
-                      ))}
-                    >
-                      {showSnippetKey ? <EyeOffIcon /> : <EyeIcon />}
-                    </Button>
-                  </Hint>
-                )}
-                <CopyButton
-                  text={snippet}
-                  label={snippetCopyLabel}
-                  copiedLabel={t('已复制接入片段', 'Setup snippet copied')}
-                  copyErrorDescription={snippetCopyErrorDescription}
-                  size="icon"
-                />
-              </div>
-            </div>
-            <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5">
-              {visibleSnippet}
-            </pre>
-            {currentKey && (
-              <FieldDescription>
-                {t(
-                  '为避免截图或录屏泄露，Key 默认隐藏；显示或复制都需要主动操作。',
-                  'The key stays hidden by default to prevent screenshot or screen-recording leaks; revealing or copying it requires an explicit action.',
-                )}
-              </FieldDescription>
-            )}
-          </Field>
-        </SettingsGroup>
-      </div>
-
-      <AlertDialog
-        open={clearKeyOpen}
-        onOpenChange={(nextOpen) => {
-          if (!save.isPending) setClearKeyOpen(nextOpen)
-        }}
+    <div className="space-y-4">
+      <SettingsGroup
+        icon={CableIcon}
+        title={t('连接与认证', 'Connection & authentication')}
+        description={t(
+          '复制客户端接入地址，并管理对接系统使用的接入 Key。',
+          'Copy the client endpoint and manage the access keys used by calling systems.',
+        )}
       >
-        <AlertDialogPopup>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t('清除接入 Key', 'Clear access key')}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {t(
-                '清除后，代理将不再校验客户端身份。',
-                'After clearing it, the proxy will no longer authenticate clients.',
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
-              {t('取消', 'Cancel')}
-            </AlertDialogClose>
-            <Button
-              loading={save.isPending}
-              variant="destructive"
-              onClick={() => save.mutate('')}
-            >
-              {t('确认清除', 'Clear key')}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogPopup>
-      </AlertDialog>
-    </>
+        <Field className="p-4 sm:p-5">
+          <FieldLabel>
+            {t('接入地址', 'Access URL')}
+            <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_BASE_URL</code>
+          </FieldLabel>
+          <InputGroup>
+            <InputGroupInput
+              aria-label={t('接入地址', 'Access URL')}
+              readOnly
+              value={baseUrl}
+            />
+            <InputGroupAddon align="inline-end">
+              <CopyButton
+                text={baseUrl}
+                label={t('复制接入地址', 'Copy access URL')}
+                copiedLabel={t('已复制接入地址', 'Access URL copied')}
+              />
+            </InputGroupAddon>
+          </InputGroup>
+        </Field>
+
+        <ApiKeysSettings envKey={envKey} />
+
+        <Field className="p-4 sm:p-5">
+          <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>
+          <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5">
+            {snippet}
+          </pre>
+          <FieldDescription>
+            {t(
+              '把占位符换成上面任意一把接入 Key；在 Key 的「查看与复制」里可以直接复制带 Key 的完整片段。',
+              'Replace the placeholder with any access key above; “View & copy” on a key copies the full snippet with the key filled in.',
+            )}
+          </FieldDescription>
+        </Field>
+      </SettingsGroup>
+    </div>
   )
 }
 

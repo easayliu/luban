@@ -524,3 +524,113 @@ async fn series_endpoints_report_the_bucket_width_actually_used() {
         assert_eq!(cache["bucket_secs"], used, "cache 请求 {asked}");
     }
 }
+
+/// 代理和用户只能把号放进开放给自己的分组（不能选的按不存在回）；建分组只有 admin。
+#[tokio::test]
+async fn members_can_only_use_groups_opened_to_them() {
+    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
+    let admin = store.admin_user().unwrap();
+    let user_id = store.create_user("u1", "", store::UserRole::User, admin.id).unwrap().unwrap().id;
+    let user = store.user_by_id(user_id).unwrap().unwrap();
+    let cred = store.insert("c", None, "t", "r", 0, None, None, user_id).unwrap().id;
+    let opened = store.create_group("opened", "").unwrap().unwrap();
+    let closed = store.create_group("closed", "").unwrap().unwrap();
+    store.set_group_grants(opened, &[user_id]).unwrap().unwrap();
+    let state = AppState::for_test(store.clone());
+    let as_user = || Extension(Actor::from(user.clone()));
+
+    let set = |ids: Vec<i64>| {
+        set_credential_groups(
+            State(state.clone()),
+            as_user(),
+            Path(cred),
+            Json(serde_json::from_value(serde_json::json!({ "group_ids": ids })).unwrap()),
+        )
+    };
+    assert_eq!(set(vec![closed]).await.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST));
+    let view = set(vec![opened]).await.unwrap().0;
+    assert_eq!(serde_json::to_value(&view).unwrap()["groups"], serde_json::json!([opened]));
+
+    let visible = list_groups(State(state.clone()), as_user()).await.unwrap().0;
+    let names: Vec<_> = visible.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, vec!["默认分组", "opened"], "看不到没开放给自己的分组");
+    assert!(visible.iter().all(|g| g.credential_count.is_none() && g.grants.is_none()));
+
+    let create = create_group(
+        State(state.clone()),
+        as_user(),
+        Json(serde_json::from_value(serde_json::json!({ "name": "mine" })).unwrap()),
+    )
+    .await;
+    assert_eq!(create.err().map(|e| e.0), Some(StatusCode::FORBIDDEN));
+}
+
+/// 账单可见范围：用户只看自己、不能按人拆；代理默认看自己与下属的人头汇总，看下属只到人这
+/// 一级（只能按日），看不到别的代理名下的人；admin 看全部。
+#[tokio::test]
+async fn billing_scope_follows_the_hierarchy() {
+    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
+    let admin = store.admin_user().unwrap();
+    let agent = store.create_user("ag", "", store::UserRole::Agent, admin.id).unwrap().unwrap();
+    let other = store.create_user("ag2", "", store::UserRole::Agent, admin.id).unwrap().unwrap();
+    let sub = store.create_user("sub", "", store::UserRole::User, agent.id).unwrap().unwrap();
+    for (i, owner) in [admin.id, agent.id, other.id, sub.id].into_iter().enumerate() {
+        let c = store
+            .insert(&format!("c{i}"), None, "t", &format!("r{i}"), 0, None, None, owner)
+            .unwrap()
+            .id;
+        store
+            .insert_usage_log(&store::UsageRecord {
+                cred_id: Some(c),
+                model: Some("m".into()),
+                cost_usd: Some(1.0 + i as f64),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let state = AppState::for_test(store.clone());
+    let q = |by: &str, owner: Option<i64>| {
+        let mut s = format!("by={by}");
+        if let Some(o) = owner {
+            s.push_str(&format!("&owner_id={o}"));
+        }
+        Query(serde_urlencoded_query(&s))
+    };
+    let call = |who: &store::User, by: &str, owner: Option<i64>| {
+        get_billing(State(state.clone()), Extension(Actor::from(who.clone())), q(by, owner))
+    };
+    let owners = |resp: Json<BillingResp>| {
+        let v = serde_json::to_value(&resp.0).unwrap();
+        let mut keys: Vec<String> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["key"].as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+    let mut mine = vec![agent.id.to_string(), sub.id.to_string()];
+    mine.sort();
+    assert_eq!(owners(call(&agent, "owner", None).await.unwrap()), mine);
+    assert_eq!(
+        call(&agent, "cred", Some(sub.id)).await.err().map(|e| e.0),
+        Some(StatusCode::FORBIDDEN)
+    );
+    assert!(call(&agent, "day", Some(sub.id)).await.is_ok());
+    assert!(call(&agent, "cred", Some(agent.id)).await.is_ok());
+    assert_eq!(
+        call(&agent, "day", Some(other.id)).await.err().map(|e| e.0),
+        Some(StatusCode::NOT_FOUND)
+    );
+    assert_eq!(call(&agent, "key", None).await.err().map(|e| e.0), Some(StatusCode::FORBIDDEN));
+    assert_eq!(call(&sub, "owner", None).await.err().map(|e| e.0), Some(StatusCode::FORBIDDEN));
+    assert_eq!(owners(call(&sub, "cred", None).await.unwrap()).len(), 1);
+    assert_eq!(owners(call(&admin, "owner", None).await.unwrap()).len(), 4);
+}
+
+/// 测试用：把查询串解析成 [`BillingQuery`]。
+fn serde_urlencoded_query(s: &str) -> BillingQuery {
+    let uri: axum::http::Uri = format!("/billing?{s}").parse().unwrap();
+    axum::extract::Query::<BillingQuery>::try_from_uri(&uri).unwrap().0
+}

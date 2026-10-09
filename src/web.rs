@@ -21,7 +21,9 @@ use crate::proxy;
 use crate::proxy::AccountRejection;
 use crate::store::{self, CredentialStore, Scope, UserRole};
 
+mod billing;
 mod credentials;
+mod groups;
 mod keepalive;
 mod learned;
 mod login;
@@ -38,7 +40,9 @@ mod usage;
 mod users;
 mod views;
 
+use billing::*;
 use credentials::*;
+use groups::*;
 use keepalive::*;
 use learned::*;
 use login::*;

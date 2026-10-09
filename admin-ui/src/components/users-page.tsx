@@ -29,7 +29,7 @@ import { useI18n } from '@/lib/i18n'
 import { useMe } from '@/lib/role'
 import { cn, copyText, extractError, formatFullTime } from '@/lib/utils'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, MainNav, PreferencesMenu } from '@/components/app-header'
+import { AppHeader, MainNav, PreferencesMenu, type MainSection } from '@/components/app-header'
 import { ChangePasswordDialog } from '@/components/change-password-dialog'
 import {
   AlertDialog,
@@ -79,7 +79,13 @@ type Pending =
  * 代理看不到下属的号，这里也就不出现号数；停用代理会连带停用它名下的用户（登录不了、名下的号
  * 不接流量）。删除前要先清空：代理名下还有用户、或账号名下还有号时后端拒绝。
  */
-export function UsersPage({ onBack, onSignOut }: { onBack: () => void; onSignOut: () => void }) {
+export function UsersPage({
+  onNavigate,
+  onSignOut,
+}: {
+  onNavigate: (section: MainSection) => void
+  onSignOut: () => void
+}) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const me = useMe().data
@@ -145,8 +151,8 @@ export function UsersPage({ onBack, onSignOut }: { onBack: () => void; onSignOut
             )}
           </PreferencesMenu>
         }
-        nav={<MainNav current="users" onNavigate={(section) => { if (section === 'pool') onBack() }} />}
-        onNavigateHome={onBack}
+        nav={<MainNav current="users" onNavigate={onNavigate} />}
+        onNavigateHome={() => onNavigate('pool')}
       />
       <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
 

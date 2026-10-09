@@ -969,6 +969,8 @@ fn log_probe_usage(
     });
     let rec = store::UsageRecord {
         cred_id: Some(cred.id),
+        // 连通性测试是 luban 自己发的，不经任何接入 Key。
+        key_id: None,
         cred_label: cred.label.clone(),
         device_id: Some(PROBE_DEVICE_ID.into()),
         model: Some(model),

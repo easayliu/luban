@@ -10,31 +10,6 @@ fn save_nonneg(state: &AppState, key: &str, value: i64) -> Result<i64, ApiError>
 }
 
 #[derive(Deserialize)]
-pub(super) struct SetApiKeyReq {
-    /// 新 key；空串表示清除（关闭鉴权）。
-    api_key: String,
-}
-
-/// 设置/清除接入 key（环境接管时禁止）。
-pub(super) async fn set_api_key(
-    State(state): State<AppState>,
-    Json(req): Json<SetApiKeyReq>,
-) -> Result<Json<SettingsResp>, ApiError> {
-    if state.client_key.is_some() {
-        return Err(bad_request(
-            "the inbound key is managed by the LUBAN_API_KEY environment variable and cannot be changed from the web UI",
-        ));
-    }
-    let key = req.api_key.trim();
-    if key.is_empty() {
-        state.store.delete_setting(crate::store::CLIENT_API_KEY).map_err(internal)?;
-    } else {
-        state.store.set_setting(crate::store::CLIENT_API_KEY, key).map_err(internal)?;
-    }
-    Ok(Json(settings_resp(&state)))
-}
-
-#[derive(Deserialize)]
 pub(super) struct SetDeviceTtlReq {
     /// 设备绑定有效期（秒）；0（或负数）表示永不过期。
     device_binding_ttl_secs: i64,

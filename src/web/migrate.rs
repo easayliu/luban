@@ -33,6 +33,10 @@ struct ExportFile {
     /// 旧版导出文件没有此字段，`#[serde(default)]` 让导入侧拿到空 Vec，不会坏。
     #[serde(default)]
     proxies: Vec<store::PortableProxy>,
+    /// 接入 Key（含明文，不含分组绑定）。随「导入设置」一起导入：它同样立刻决定客户端能不能
+    /// 连上。旧版导出文件没有此字段（接入 Key 在 `settings` 里，导入时自动转换）。
+    #[serde(default)]
+    api_keys: Vec<store::PortableApiKey>,
 }
 
 /// 迁移文件的 `kind` 标记。
@@ -61,6 +65,7 @@ pub(super) async fn export(State(state): State<AppState>) -> Result<Response, Ap
     }
     let credentials = state.store.export_credentials().map_err(internal)?;
     let proxies = state.store.export_proxies().map_err(internal)?;
+    let api_keys = state.store.export_api_keys().map_err(internal)?;
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -73,6 +78,7 @@ pub(super) async fn export(State(state): State<AppState>) -> Result<Response, Ap
         credentials,
         settings: state.store.settings_snapshot().into_iter().collect(),
         proxies,
+        api_keys,
     };
     tracing::info!(
         credentials = file.credentials.len(),
@@ -219,11 +225,20 @@ pub(super) async fn import(
         }
     }
     if req.import_settings {
+        for (i, k) in req.payload.api_keys.iter().enumerate() {
+            match state.store.import_api_key(k) {
+                Ok(store::ImportOutcome::Added) => resp.settings_applied += 1,
+                Ok(store::ImportOutcome::Updated) => {}
+                Err(e) => {
+                    tracing::warn!(index = i, error = %format!("{e:#}"), "import: API key failed")
+                }
+            }
+        }
         let settings: std::collections::HashMap<String, String> =
             req.payload.settings.into_iter().collect();
         // 文件里带 `latest_cc_release` 时，整个导入放进缓存的串行锁里做，写完再以库为准同步缓存：
         // 否则库是一个数、进程里认另一个（重启才暴露），或者后台一笔迟到的落库把刚导入的盖掉。
-        resp.settings_applied = if settings.contains_key(store::LATEST_CC_RELEASE) {
+        resp.settings_applied += if settings.contains_key(store::LATEST_CC_RELEASE) {
             let mut applied = 0;
             oauth::LATEST_RELEASE
                 .sync_from_store(|| {

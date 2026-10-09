@@ -70,10 +70,9 @@ use super::upstream::{
 };
 use super::{
     EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_REPLY,
-    REWRITE_REFUSAL_REPLAY, RequestLogState, client_authorized, client_request_id,
-    effective_client_key, error_response, header_opt, inbound_beta_list,
-    log_early_upstream_failure, rate_limit_response, request_max_tokens, request_model,
-    request_speed,
+    REWRITE_REFUSAL_REPLAY, RequestLogState, client_access, client_request_id, error_response,
+    header_opt, inbound_beta_list, log_early_upstream_failure, rate_limit_response,
+    request_max_tokens, request_model, request_speed,
 };
 
 mod admit;
