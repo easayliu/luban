@@ -76,7 +76,7 @@ function rangeOf(key: RangeKey): { from: number; to: number; days: number } {
   }
 }
 
-/** 正在查看的那个人（从「按人」下钻）。 */
+/** 正在查看的成员（从「按成员」下钻）。 */
 interface Focus {
   id: number
   name: string
@@ -87,10 +87,10 @@ interface Focus {
  * 工具条与概览指标条（复用账号池的 [OverviewMetric]），下面是同款卡片表格。
  *
  * 可看的范围由后端按身份收窄，这里只决定给哪些拆分方式：
- * - 管理员 / 访客：按人、号、模型、接入 Key、分组、日；点某个人下钻看他一个人的；
- * - 代理：默认按人看自己与名下用户；点自己能拆到号、模型、分组；点下属只看按日走势
- *   （代理看不到下属的号）；
- * - 用户：只看自己，按号、模型、分组、日。
+ * - 管理员 / 访客：按成员、账号、模型、接入 Key、分组、日；点某位成员下钻看其明细；
+ * - 代理：默认按成员看自己与下属用户；点自己能拆到账号、模型、分组；点下属只看按日走势
+ *   （代理看不到下属的账号）；
+ * - 用户：只看自己，按账号、模型、分组、日。
  */
 export function BillingPage({
   onNavigate,
@@ -141,16 +141,16 @@ export function BillingPage({
   const number = (n: number) => n.toLocaleString(locale)
 
   const dimLabel: Record<BillingDim, string> = {
-    owner: t('按人', 'By person'),
-    cred: t('按号', 'By account'),
+    owner: t('按成员', 'By member'),
+    cred: t('按账号', 'By account'),
     model: t('按模型', 'By model'),
     key: t('按接入 Key', 'By access key'),
     group: t('按分组', 'By group'),
     day: t('按日', 'By day'),
   }
   const columnLabel: Record<BillingDim, string> = {
-    owner: t('人', 'Person'),
-    cred: t('号', 'Account'),
+    owner: t('成员', 'Member'),
+    cred: t('账号', 'Account'),
     model: t('模型', 'Model'),
     key: t('接入 Key', 'Access key'),
     group: t('分组', 'Group'),
@@ -172,9 +172,9 @@ export function BillingPage({
   const nameOf = (row: BillingRow): string => {
     switch (activeDim) {
       case 'owner':
-        return row.key === '0' ? t('未归属', 'Unassigned') : (row.label ?? t(`已删除的账号 #${row.key}`, `Deleted account #${row.key}`))
+        return row.key === '0' ? t('未归属', 'Unassigned') : (row.label ?? t(`已删除的成员 #${row.key}`, `Deleted member #${row.key}`))
       case 'cred':
-        return row.label ?? t(`已删除的号 #${row.key}`, `Deleted account #${row.key}`)
+        return row.label ?? t(`已删除的账号 #${row.key}`, `Deleted account #${row.key}`)
       case 'key':
         return row.key === '0'
           ? t('环境变量 / 未配置 Key', 'Environment / no key')
@@ -254,7 +254,7 @@ export function BillingPage({
     return parts.join(' · ')
   }
 
-  // 「按人」那一表点一行下钻：管理员 / 访客谁都能点，代理能点自己与下属。
+  // 「按成员」那一表点一行下钻：管理员 / 访客每行都能点，代理能点自己与下属。
   const canDrill = activeDim === 'owner' && !focus
   const drill = (row: BillingRow) => {
     if (!canDrill || row.key === '0') return
@@ -268,9 +268,9 @@ export function BillingPage({
   const totalInput = total ? total.input_tokens + total.cache_write_tokens + total.cache_read_tokens : 0
   const hitRate = total ? cacheHitRate(totalInput, total.cache_read_tokens) : null
   const description = role === 'agent'
-    ? t('按官方 API 价格折算的等价费用。你和名下用户的费用汇总在这里，下属用户只显示到人。', 'Equivalent cost at official API prices for you and your users; your users are shown per person only.')
+    ? t('按官方 API 价格折算的等价费用，涵盖你本人与下属用户；下属用户仅显示汇总。', 'Equivalent cost at official API prices for you and your users; your users are shown as totals only.')
     : role === 'user'
-      ? t('按官方 API 价格折算的等价费用，统计你名下的号。', 'Equivalent cost at official API prices for the accounts you added.')
+      ? t('按官方 API 价格折算的等价费用，统计你添加的账号。', 'Equivalent cost at official API prices for the accounts you added.')
       : t('按官方 API 价格折算的等价费用。只计费，不扣费。', 'Equivalent cost at official API prices. Metered only; nothing is charged.')
 
   return (
@@ -423,10 +423,10 @@ export function BillingPage({
                   <EmptyHeader>
                     <EmptyMedia variant="icon">{needle ? <SearchIcon /> : <ReceiptIcon />}</EmptyMedia>
                     <EmptyTitle>
-                      {needle ? t('没有符合条件的记录', 'No matching rows') : t('这段时间没有费用', 'No usage in this period')}
+                      {needle ? t('没有符合条件的记录', 'No matching rows') : t('所选时间范围内暂无费用', 'No usage in this period')}
                     </EmptyTitle>
                     <EmptyDescription>
-                      {needle ? t('尝试清除搜索关键字。', 'Try clearing the search.') : t('换个时间范围看看。', 'Try another time range.')}
+                      {needle ? t('请尝试清除搜索关键字。', 'Try clearing the search.') : t('请尝试调整时间范围。', 'Try another time range.')}
                     </EmptyDescription>
                   </EmptyHeader>
                   {needle && (
@@ -503,7 +503,7 @@ export function BillingPage({
               </Table>
             )}
             {canDrill && rows.length > 0 && (
-              <p className="mt-2 text-xs text-muted-foreground">{t('点击某个人查看他的明细。', 'Click a person to see their details.')}</p>
+              <p className="mt-2 text-xs text-muted-foreground">{t('点击成员可查看其明细。', 'Click a member to see their details.')}</p>
             )}
           </section>
         </div>

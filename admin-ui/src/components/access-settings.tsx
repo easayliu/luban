@@ -179,7 +179,7 @@ export function AccessSettingsContent() {
           <SnippetBlock text={setupSnippet(keyPlaceholder)} />
           <FieldDescription>
             {t(
-              '把占位符换成上面任意一把接入 Key；在 Key 的「查看与复制」里可以直接复制带 Key 的完整片段。',
+              '请将占位符替换为上方任一接入 Key；也可在 Key 的「查看与复制」中直接复制已填入 Key 的完整片段。',
               'Replace the placeholder with any access key above; “View & copy” on a key copies the full snippet with the key filled in.',
             )}
           </FieldDescription>
@@ -299,7 +299,7 @@ export function SecuritySettingsContent() {
         icon={EyeIcon}
         title={t('访客密码', 'Viewer password')}
         description={t(
-          '用访客密码登录的人可以查看控制台的全部页面，但不能做任何修改；接入 Key 与代理密码对访客打码显示，也不能导出数据。',
+          '以访客密码登录后可查看控制台的全部页面，但无法进行任何修改；接入 Key 与代理密码对访客打码显示，且不可导出数据。',
           'People who sign in with the viewer password can see every page of the console but cannot change anything. The client key and proxy passwords are masked for them, and export is unavailable.',
         )}
       >

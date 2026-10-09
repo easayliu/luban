@@ -228,7 +228,7 @@ export function AddAccount({
               </Field>
               {!reauth && (<>
               <Field name="groups">
-                <FieldLabel>{t('号池分组', 'Pool groups')}</FieldLabel>
+                <FieldLabel>{t('账号分组', 'Account groups')}</FieldLabel>
                 {groupsQuery.data ? (
                   <GroupPicker groups={groupsQuery.data} value={groupIds} onChange={setGroupIds} />
                 ) : (
@@ -236,7 +236,7 @@ export function AddAccount({
                 )}
                 <FieldDescription>
                   {t(
-                    '至少选择一个。接入 Key 绑定了分组时，只会用到这些分组里的号。',
+                    '至少选择一个。接入 Key 绑定分组后，仅调度这些分组中的账号。',
                     'Pick at least one. An access key bound to groups only uses the accounts in those groups.',
                   )}
                 </FieldDescription>

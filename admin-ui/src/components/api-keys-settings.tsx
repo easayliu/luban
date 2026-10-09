@@ -150,7 +150,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             {t(
-              '给外部系统对接用。可绑定号池分组：只在这些分组的号里选号，排在前面的分组优先；不绑定则可用全部号。',
+              '供外部系统对接使用。可绑定账号分组：仅从所绑定分组的账号中调度，靠前的分组优先；未绑定时可使用全部账号。',
               'For external systems. Bind pool groups to restrict which accounts a key uses (earlier groups first); unbound keys can use every account.',
             )}
           </p>
@@ -168,7 +168,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
               <div className="font-medium">
                 {t('环境变量', 'Environment variable')} <code className="font-mono text-xs">LUBAN_API_KEY</code>
               </div>
-              <div className="text-xs text-muted-foreground">{t('可用全部号，此处只读。', 'Uses every account; read-only here.')}</div>
+              <div className="text-xs text-muted-foreground">{t('可使用全部账号，此处只读。', 'Uses every account; read-only here.')}</div>
             </div>
             <CopyButton label={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(envKey)} />
           </div>
@@ -194,7 +194,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
               </div>
               <div className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
                 {k.all_groups
-                  ? t('全部号', 'All accounts')
+                  ? t('全部账号', 'All accounts')
                   : k.groups.length === 0
                     ? (
                         <Badge size="xs" variant="warning">
@@ -237,11 +237,11 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
           <div className="px-3 py-3 text-xs text-warning-foreground">
             {required
               ? t(
-                  '当前没有可用的接入 Key：所有转发请求都会被拒绝。新建一把 Key 后恢复。',
+                  '当前没有可用的接入 Key：所有转发请求都将被拒绝。新建 Key 后即可恢复。',
                   'There is no access key: every forwarded request is rejected until you create one.',
                 )
               : t(
-                  '尚未配置接入 Key：转发不校验来访身份，任何人都能使用全部号。',
+                  '尚未配置接入 Key：转发不校验来访身份，任何客户端均可使用全部账号。',
                   'No access key is configured: forwarding does not authenticate callers, and anyone can use every account.',
                 )}
           </div>
@@ -266,7 +266,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
               {revealed?.title || t('接入 Key', 'Access key')}
             </DialogTitle>
             <DialogDescription>
-              {t('把 Key 或接入片段配置到对接系统。请勿截图外传。', 'Configure the key or the snippet in the calling system. Do not share screenshots of it.')}
+              {t('请将 Key 或接入片段配置到对接系统，切勿截图外传。', 'Configure the key or the snippet in the calling system. Do not share screenshots of it.')}
             </DialogDescription>
           </DialogHeader>
           <DialogPanel>{revealed && <KeyReveal secret={revealed.secret} />}</DialogPanel>
@@ -280,7 +280,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
           <AlertDialogHeader>
             <AlertDialogTitle>{t('删除接入 Key', 'Delete access key')}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t('删除后，使用这把 Key 的系统会立即收到 401。', 'Systems using this key get 401 immediately after it is deleted.')}
+              {t('删除后，使用该 Key 的系统将立即收到 401。', 'Systems using this key get 401 immediately after it is deleted.')}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -357,7 +357,7 @@ function KeyEditDialog({
           <DialogTitle>{apiKey === 'new' ? t('新建接入 Key', 'New access key') : t('编辑接入 Key', 'Edit access key')}</DialogTitle>
           <DialogDescription>
             {apiKey === 'new'
-              ? t('Key 由系统生成，建好后可随时在「查看与复制」里取用。', 'The key is generated for you and can be viewed any time under “View & copy”.')
+              ? t('Key 由系统生成，创建后可随时在「查看与复制」中取用。', 'The key is generated for you and can be viewed any time under “View & copy”.')
               : t('修改绑定的分组立即生效。', 'Changes to the bound groups take effect immediately.')}
           </DialogDescription>
         </DialogHeader>
@@ -380,18 +380,18 @@ function KeyEditDialog({
             </Field>
             <Field>
               <FieldLabel className="flex w-full items-center justify-between gap-3">
-                <span>{t('不限分组（可用全部号）', 'Any group (all accounts)')}</span>
+                <span>{t('不限分组（可使用全部账号）', 'Any group (all accounts)')}</span>
                 <Switch checked={allGroups} onCheckedChange={setAllGroups} />
               </FieldLabel>
               <FieldDescription>
                 {allGroups
-                  ? t('这把 Key 可以用号池里的全部号。', 'This key can use every account in the pool.')
-                  : t('只在下面所选的分组里选号。', 'Only accounts in the groups below are used.')}
+                  ? t('该 Key 可使用账号池中的全部账号。', 'This key can use every account in the pool.')
+                  : t('仅从下方所选分组的账号中调度。', 'Only accounts in the groups below are used.')}
               </FieldDescription>
             </Field>
             {!allGroups && (
               <Field>
-                <FieldLabel>{t('绑定的号池分组', 'Bound pool groups')}</FieldLabel>
+                <FieldLabel>{t('绑定的账号分组', 'Bound account groups')}</FieldLabel>
                 {groups ? (
                   <OrderedGroupPicker groups={groups} value={groupIds} onChange={setGroupIds} emptyHint={null} />
                 ) : (
@@ -401,10 +401,10 @@ function KeyEditDialog({
                   {groupIds.length === 0
                     ? (
                         <span className="text-warning-foreground">
-                          {t('还没有选择分组：这把 Key 暂时用不了任何号。', 'No group selected: this key cannot use any account yet.')}
+                          {t('尚未选择分组：该 Key 暂时无法使用任何账号。', 'No group selected: this key cannot use any account yet.')}
                         </span>
                       )
-                    : t('顺序即优先级：前面分组的号都不可用时，才会用到后面分组的号。', 'Order is priority: later groups are used only when every account in earlier groups is unavailable.')}
+                    : t('顺序即优先级：靠前分组的账号均不可用时，才会使用后续分组的账号。', 'Order is priority: later groups are used only when every account in earlier groups is unavailable.')}
                 </FieldDescription>
               </Field>
             )}

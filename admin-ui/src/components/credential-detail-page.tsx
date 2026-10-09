@@ -1450,7 +1450,7 @@ function ScheduleSection({
     )
     return (
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>
-        {row(t('号池分组', 'Pool groups'), groupNames, () => { if (!readOnly) setGroupsOpen(true) })}
+        {row(t('账号分组', 'Account groups'), groupNames, () => { if (!readOnly) setGroupsOpen(true) })}
         {groupsDialog}
         {row(t('出站代理', 'Outbound proxy'), proxyName(cred) ?? t('直连', 'Direct'), onProxy)}
         {row(
@@ -1472,7 +1472,7 @@ function ScheduleSection({
       description={t('设备、会话与 RPM 上限可点击页头的对应读数进行调整。', 'Adjust the device, session and RPM limits from the readouts at the top.')}
     >
       <SettingsRow
-        label={t('号池分组', 'Pool groups')}
+        label={t('账号分组', 'Account groups')}
         description={cred.groups.length
           ? <GroupBadges ids={cred.groups} />
           : t('不在任何分组里', 'Not in any group')}

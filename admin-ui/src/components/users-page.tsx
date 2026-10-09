@@ -72,7 +72,7 @@ type Pending =
   | { kind: 'delete'; user: ConsoleUser }
 
 /**
- * 用户管理：管理员管全部代理和用户，代理只管挂在自己名下的用户。
+ * 成员管理：管理员管全部代理和用户，代理只管自己的下属用户。
  *
  * 代理看不到下属的号，这里也就不出现号数；停用代理会连带停用它名下的用户（登录不了、名下的号
  * 不接流量）。删除前要先清空：代理名下还有用户、或账号名下还有号时后端拒绝。
@@ -94,7 +94,7 @@ export function UsersPage({
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data])
   const agents = useMemo(() => users.filter((u) => u.role === 'agent'), [users])
 
-  useDocumentTitle(`${t('用户管理', 'Users')} · Luban`)
+  useDocumentTitle(`${t('成员管理', 'Members')} · Luban`)
 
   const done = (title: string) => {
     void qc.invalidateQueries({ queryKey: ['users'] })
@@ -111,12 +111,12 @@ export function UsersPage({
   const toggleDisabled = useMutation({
     mutationFn: ({ user, disabled }: { user: ConsoleUser; disabled: boolean }) =>
       setUserDisabled(user.id, disabled),
-    onSuccess: (_r, { disabled }) => done(disabled ? t('账号已停用', 'Account disabled') : t('账号已启用', 'Account enabled')),
+    onSuccess: (_r, { disabled }) => done(disabled ? t('成员已停用', 'Member disabled') : t('成员已启用', 'Member enabled')),
     onError: failed,
   })
   const remove = useMutation({
     mutationFn: (user: ConsoleUser) => deleteUser(user.id),
-    onSuccess: () => done(t('账号已删除', 'Account deleted')),
+    onSuccess: () => done(t('成员已删除', 'Member deleted')),
     onError: failed,
   })
 
@@ -144,16 +144,16 @@ export function UsersPage({
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-5">
               <div className="flex min-w-0 flex-wrap items-center gap-2.5">
                 <h1 className="min-w-0 text-lg font-semibold tracking-tight" id="users-page-title">
-                  {t('用户管理', 'Users')}
+                  {t('成员管理', 'Members')}
                 </h1>
                 {!usersQuery.isPending && (
                   <Hint
                     label={isAdmin
                       ? t(
-                          '开设代理与用户的登录账号。每个人上的号挂在自己名下，代理看不到下属用户的号。',
+                          '为代理与用户创建控制台登录。账号归添加者所有，代理看不到下属用户的账号。',
                           'Create sign-ins for agents and users. Accounts belong to whoever added them; agents cannot see their users’ accounts.',
                         )
-                      : t('开设挂在你名下的用户。你看不到他们上的号。', 'Create users under you. You cannot see the accounts they add.')}
+                      : t('为你创建下属用户。下属用户添加的账号对你不可见。', 'Create users under you. You cannot see the accounts they add.')}
                   >
                     <Badge variant="secondary">
                       {isAdmin
@@ -165,7 +165,7 @@ export function UsersPage({
               </div>
               <Button size="sm" onClick={() => setCreating(true)}>
                 <PlusIcon />
-                {isAdmin ? t('新建账号', 'New account') : t('新建用户', 'New user')}
+                {isAdmin ? t('新建成员', 'New member') : t('新建用户', 'New user')}
               </Button>
             </div>
           </section>
@@ -187,11 +187,11 @@ export function UsersPage({
               <Empty>
                 <EmptyHeader>
                   <EmptyMedia variant="icon"><UsersIcon /></EmptyMedia>
-                  <EmptyTitle>{t('还没有账号', 'No accounts yet')}</EmptyTitle>
+                  <EmptyTitle>{t('暂无成员', 'No members yet')}</EmptyTitle>
                   <EmptyDescription>
                     {isAdmin
-                      ? t('新建代理或用户后，他们即可登录控制台上号。', 'Once created, agents and users can sign in and add accounts.')
-                      : t('新建用户后，他们即可登录控制台上号。', 'Once created, users can sign in and add accounts.')}
+                      ? t('创建代理或用户后，对方即可登录控制台并添加账号。', 'Once created, agents and users can sign in and add accounts.')
+                      : t('创建用户后，对方即可登录控制台并添加账号。', 'Once created, users can sign in and add accounts.')}
                   </EmptyDescription>
                 </EmptyHeader>
               </Empty>
@@ -203,7 +203,7 @@ export function UsersPage({
                     <TableHead>{t('用户名', 'Username')}</TableHead>
                     {isAdmin && <TableHead>{t('角色', 'Role')}</TableHead>}
                     {isAdmin && <TableHead>{t('上级', 'Parent')}</TableHead>}
-                    {isAdmin && <TableHead className="text-right">{t('名下号数', 'Accounts')}</TableHead>}
+                    {isAdmin && <TableHead className="text-right">{t('账号数', 'Accounts')}</TableHead>}
                     {isAdmin && <TableHead className="text-right">{t('下属用户', 'Users')}</TableHead>}
                     <TableHead>{t('状态', 'Status')}</TableHead>
                     <TableHead className="whitespace-nowrap">{t('创建时间', 'Created')}</TableHead>
@@ -298,15 +298,15 @@ export function UsersPage({
       >
         <AlertDialogPopup>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t('停用账号', 'Disable account')}</AlertDialogTitle>
+            <AlertDialogTitle>{t('停用成员', 'Disable member')}</AlertDialogTitle>
             <AlertDialogDescription>
               {pending?.kind === 'disable' && (pending.user.role === 'agent'
                 ? t(
-                    `停用代理 ${pending.user.username} 后，它和名下的全部用户都无法登录，名下的号也不再接流量。`,
+                    `停用代理 ${pending.user.username} 后，该代理及其全部下属用户均无法登录，其账号也不再承接流量。`,
                     `Disabling agent ${pending.user.username} signs it and all its users out, and their accounts stop serving traffic.`,
                   )
                 : t(
-                    `停用 ${pending.user.username} 后，该账号无法登录，名下的号不再接流量。`,
+                    `停用 ${pending.user.username} 后，该成员无法登录，其账号不再承接流量。`,
                     `Disabling ${pending.user.username} signs it out, and its accounts stop serving traffic.`,
                   ))}
             </AlertDialogDescription>
@@ -334,11 +334,11 @@ export function UsersPage({
       >
         <AlertDialogPopup>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t('删除账号', 'Delete account')}</AlertDialogTitle>
+            <AlertDialogTitle>{t('删除成员', 'Delete member')}</AlertDialogTitle>
             <AlertDialogDescription>
               {pending?.kind === 'delete' && t(
-                `删除 ${pending.user.username} 后无法恢复。名下还有号（代理名下还有用户）时无法删除，须先清空。`,
-                `Deleting ${pending.user.username} cannot be undone. It is refused while the account still owns accounts (or, for an agent, still has users).`,
+                `删除 ${pending.user.username} 后无法恢复。该成员仍有账号（或代理仍有下属用户）时无法删除，请先移除。`,
+                `Deleting ${pending.user.username} cannot be undone. It is refused while the member still owns accounts (or, for an agent, still has users).`,
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -417,12 +417,12 @@ function CreateUserDialog({
     {
       value: 'user' as const,
       title: t('用户', 'User'),
-      description: t('上号并查看自己号的用量。', 'Adds accounts and sees their own usage.'),
+      description: t('添加账号，并查看自己账号的用量。', 'Adds accounts and sees their own usage.'),
     },
     {
       value: 'agent' as const,
       title: t('代理', 'Agent'),
-      description: t('上号，并可开设挂在自己名下的用户。', 'Adds accounts and can create users under them.'),
+      description: t('添加账号，并可创建下属用户。', 'Adds accounts and can create users under them.'),
     },
   ]
   const parentItems = [
@@ -440,10 +440,10 @@ function CreateUserDialog({
         {created ? (
           <>
             <DialogHeader>
-              <DialogTitle>{t('账号已创建', 'Account created')}</DialogTitle>
+              <DialogTitle>{t('成员已创建', 'Member created')}</DialogTitle>
               <DialogDescription>
                 {t(
-                  '请把以下登录信息交给对方。关闭后将无法再查看密码，忘记时只能重置。',
+                  '请将以下登录信息交给对方。关闭后将无法再查看密码，忘记时只能重置。',
                   'Hand these sign-in details over. The password cannot be shown again after closing; it can only be reset.',
                 )}
               </DialogDescription>
@@ -459,11 +459,11 @@ function CreateUserDialog({
         ) : (
           <>
             <DialogHeader>
-              <DialogTitle>{isAdmin ? t('新建账号', 'New account') : t('新建用户', 'New user')}</DialogTitle>
+              <DialogTitle>{isAdmin ? t('新建成员', 'New member') : t('新建用户', 'New user')}</DialogTitle>
               <DialogDescription>
                 {isAdmin
-                  ? t('对方用这里设置的用户名和密码登录控制台。', 'They sign in to the console with this username and password.')
-                  : t('新用户挂在你名下，用这里设置的用户名和密码登录控制台。', 'The new user belongs to you and signs in with this username and password.')}
+                  ? t('对方使用此处设置的用户名和密码登录控制台。', 'They sign in to the console with this username and password.')
+                  : t('新用户归属于你，使用此处设置的用户名和密码登录控制台。', 'The new user belongs to you and signs in with this username and password.')}
               </DialogDescription>
             </DialogHeader>
             <Form
@@ -506,7 +506,7 @@ function CreateUserDialog({
                       </SelectPopup>
                     </Select>
                     <FieldDescription>
-                      {t('挂在代理名下时，由该代理管理这个用户。', 'When placed under an agent, that agent manages this user.')}
+                      {t('归属于代理时，由该代理管理此用户。', 'When placed under an agent, that agent manages this user.')}
                     </FieldDescription>
                   </Field>
                 )}
@@ -617,8 +617,8 @@ function ResetPasswordDialog({
               <DialogTitle>{t('密码已重置', 'Password reset')}</DialogTitle>
               <DialogDescription>
                 {t(
-                  '该账号已有的登录已全部退出。请把新的登录信息交给对方，关闭后将无法再查看密码。',
-                  'All existing sign-ins of this account were signed out. Hand over the new details; the password cannot be shown again after closing.',
+                  '该成员已有的登录已全部退出。请将新的登录信息交给对方，关闭后将无法再查看密码。',
+                  'All existing sign-ins of this member were signed out. Hand over the new details; the password cannot be shown again after closing.',
                 )}
               </DialogDescription>
             </DialogHeader>
@@ -649,8 +649,8 @@ function ResetPasswordDialog({
                   <PasswordInput autoFocus generate invalid={tooShort} value={password} onChange={setPassword} />
                   <FieldDescription>
                     {t(
-                      `至少 ${MIN_PASSWORD_LENGTH} 个字符。重置后，该账号已有的登录全部退出。`,
-                      `At least ${MIN_PASSWORD_LENGTH} characters. All existing sign-ins of this account are signed out.`,
+                      `至少 ${MIN_PASSWORD_LENGTH} 个字符。重置后，该成员已有的登录将全部退出。`,
+                      `At least ${MIN_PASSWORD_LENGTH} characters. All existing sign-ins of this member are signed out.`,
                     )}
                   </FieldDescription>
                   {save.isError && <FieldError match>{extractError(save.error, language)}</FieldError>}
@@ -717,7 +717,7 @@ function MoveUserDialog({
               </SelectPopup>
             </Select>
             <FieldDescription>
-              {t('转移后，新上级可以管理这个用户；号仍归用户本人。', 'The new parent manages this user afterwards; the accounts stay with the user.')}
+              {t('转移后由新上级管理此用户，账号仍归用户本人所有。', 'The new parent manages this user afterwards; the accounts stay with the user.')}
             </FieldDescription>
             {save.isError && <FieldError match>{extractError(save.error, language)}</FieldError>}
           </Field>

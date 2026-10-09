@@ -503,7 +503,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '官方 2.1.291 主线程的 system 由四块组成：billing、身份句、基座，以及基座之后的「其余」段（会话指引、记忆说明、模型清单、上下文管理）。末尾的缓存断点即位于这一块。opus 与 sonnet 共用一份，fable、haiku 各有一份，haiku 的基座也是另一份长的。启用后，按 2.1.291 抓包的原文填充这一块：其中唯一随机器变化的是记忆目录，优先使用客户端自己写的工作目录，客户端没写时才按账号加设备派生一个固定的假路径；模板已删除依赖 ToolSearch 与 WebSearch 的段落，因为模拟不注入这两个工具。客户端自己的 system 单独占最后一块（超过 1,900 字节时移入首条消息，原位置留一行占位；约合 633 个汉字），因此启用时出站是五块，比官方多一块。注意：回答也会受影响。这一块会提示模型自己是 Claude Code，经测试，当客户端 system 要求「只回复某个标记」时，模型虽回复了该标记，但仍会附加一句自我介绍。代价：每条模拟请求多出约 1,200 至 4,000 token 的前缀（视模型族而定）；它带 1h 断点、在同一会话内稳定，基本按缓存读价计费。停用后不发送这一块：system 由 billing、身份句、基座加客户端那块组成，恰好四块，客户端那块落在官方「其余」段的位置上，记忆目录也随这一块一并不发。随首条消息补上的环境说明（工作目录、平台、模型、Agent 类型、技能清单，约 10 KB）不受本开关影响，模拟主线程照常补上。',
+                '官方 2.1.291 主线程的 system 由四块组成：billing、身份句、基座，以及基座之后的「其余」段（会话指引、记忆说明、模型清单、上下文管理）。末尾的缓存断点即位于这一块。opus 与 sonnet 共用一份，fable、haiku 各有一份，haiku 的基座也是单独的一份，且篇幅更长。启用后，按 2.1.291 抓包的原文填充这一块：其中唯一随机器变化的是记忆目录，优先使用客户端自己写的工作目录，客户端未提供时才按账号与设备派生一个固定的虚拟路径；模板已删除依赖 ToolSearch 与 WebSearch 的段落，因为模拟不注入这两个工具。客户端自己的 system 单独占最后一块（超过 1,900 字节时移入首条消息，原位置留一行占位；约合 633 个汉字），因此启用时出站是五块，比官方多一块。注意：回答也会受影响。这一块会提示模型自己是 Claude Code，经测试，当客户端 system 要求「只回复某个标记」时，模型虽回复了该标记，但仍会附加一句自我介绍。代价：每条模拟请求多出约 1,200 至 4,000 token 的前缀（视模型族而定）；它带 1h 断点、在同一会话内稳定，基本按缓存读价计费。停用后不发送这一块：system 由 billing、身份句、基座加客户端那块组成，恰好四块，客户端那块落在官方「其余」段的位置上，记忆目录也随这一块一并不发。随首条消息补上的环境说明（工作目录、平台、模型、Agent 类型、技能清单，约 10 KB）不受本开关影响，模拟主线程照常补上。',
                 'The official 2.1.291 main-thread system prompt has four blocks: billing, identity, base, and a “rest” section after the base (session guidance, memory instructions, model list, context management), which carries the final cache breakpoint. Opus and sonnet share one text, fable and haiku each have their own, and haiku also uses a separate, longer base. When enabled, this block is filled verbatim from the 2.1.291 captures: the only machine-specific part, the memory directory, follows the working directory the client wrote itself, falling back to a fixed fake path derived per account and device only when the client wrote none; the paragraphs that depend on ToolSearch and WebSearch are removed, since emulation does not inject those tools. The client’s own system prompt occupies the last block on its own (moved into the first message above 1,900 bytes, roughly 633 CJK characters, leaving a one-line placeholder), so with this on the request has five blocks, one more than the official shape. Note: answers are affected too. This block tells the model it is Claude Code; in testing, when the client’s system prompt asked for a single marker only, the model returned the marker but still added a line introducing itself. Cost: roughly 1,200 to 4,000 extra prefix tokens per emulated request depending on the model family, behind a 1h breakpoint and stable within a session, so mostly billed at cache-read price. Disable to drop this block: the system prompt is then billing, identity and base plus the client’s block, exactly four blocks, with the client’s block in the official “rest” position, and the memory directory goes with it. The environment note sent with the first message (working directory, platform, model, agent types and skill list, about 10 KB) is not affected by this switch and is still added to emulated main-thread requests.',
               )}
             </>
@@ -571,7 +571,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：它本就带 billing 标识，照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 的去留由「模拟请求保留 user_id」「真实客户端保留 user_id」分别决定；补全 metadata、会话关联字段（cc_prompt_id、diagnostics 等）、工具名混淆、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
+                '上游放行须满足两项条件之一：请求 system 中带有身份句，或 system 首块中带有合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关使模拟请求仅满足后者——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。本开关对真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：其自带的 billing 标识照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 的去留由「模拟请求保留 user_id」「真实客户端保留 user_id」分别决定；补全 metadata、会话关联字段（cc_prompt_id、diagnostics 等）、工具名混淆、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过。收益：第三方客户端借用订阅额度时可保留自身的提示词与行为，模型依据客户端的 system 正常作答，不会被赋予 Claude Code 的角色设定。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的简短辅助调用，带工具的多轮主对话从不只携带 billing 标识，因此以本开关承载大量长对话属于官方不会产生的形态，建议按需启用。与完整模拟并存，默认停用，可随时回退。',
                 'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. Real Claude Code clients (including the VSCode extension, agent-sdk and subagents) are covered too: they already carry a billing identifier, which is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; whether metadata.user_id is kept is decided separately by “Keep user_id on emulated requests” and “Keep user_id on real clients”; filling metadata, session-chain fields (cc_prompt_id, diagnostics, etc.), tool-name obfuscation, system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
               )}
             </>
@@ -581,7 +581,7 @@ export function ForwardingSettingsContent() {
           k="sim_billing_keep_user_id"
           label={t('模拟请求保留 user_id', 'Keep user_id on emulated requests')}
           summary={t(
-            '仅注入 billing 标识时，模拟请求自带的 metadata.user_id 保留并按身份规则改写，没带不补；停用后整个剥离。',
+            '仅注入 billing 标识时，保留模拟请求自带的 metadata.user_id 并按身份规则改写，未携带时不补充；停用后整体剥离。',
             'With billing-identifier-only injection, an emulated request’s own metadata.user_id is kept and rewritten by the identity rules, and nothing is added when absent; when disabled it is stripped entirely.',
           )}
           requires={[
@@ -591,7 +591,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '启用（默认）：客户端带了 user_id 就保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 换成号池账号，device_id 按设备指纹派生，会话段与出站会话 id 请求头对齐；「身份一致性」停用时原样发送。客户端没带就不补。停用：user_id 整个剥离（metadata 剥空后一并去掉）。只作用于模拟请求（第三方客户端，以及形态未被认作官方的请求），真实 Claude Code 客户端由「真实客户端保留 user_id」单独控制。',
+                '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时不补充。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于模拟请求（第三方客户端，以及形态未被认作官方的请求），真实 Claude Code 客户端由「真实客户端保留 user_id」单独控制。',
                 'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid becomes the pooled account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session id header; with “Identity consistency” disabled it is sent unchanged. Nothing is added when the client sends none. Disabled: user_id is stripped entirely (metadata is removed once empty). Applies only to emulated requests (third-party clients and requests whose shape is not recognized as official); real Claude Code clients are controlled separately by “Keep user_id on real clients”.',
               )}
             </>
@@ -601,7 +601,7 @@ export function ForwardingSettingsContent() {
           k="real_billing_keep_user_id"
           label={t('真实客户端保留 user_id', 'Keep user_id on real clients')}
           summary={t(
-            '仅注入 billing 标识时，真实 Claude Code 客户端自带的 metadata.user_id 保留并按身份规则改写，没带不补；停用后整个剥离。',
+            '仅注入 billing 标识时，保留真实 Claude Code 客户端自带的 metadata.user_id 并按身份规则改写，未携带时不补充；停用后整体剥离。',
             'With billing-identifier-only injection, a real Claude Code client’s own metadata.user_id is kept and rewritten by the identity rules, and nothing is added when absent; when disabled it is stripped entirely.',
           )}
           requires={[
@@ -611,7 +611,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '启用（默认）：客户端带了 user_id 就保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 换成号池账号，device_id 按设备指纹派生，会话段与出站会话 id 请求头对齐；「身份一致性」停用时原样发送。客户端没带就不补。停用：user_id 整个剥离（metadata 剥空后一并去掉）。只作用于真实 Claude Code 客户端。官方本就有不带 user_id 的形态（Claude Desktop 不带，Claude Code 也可通过环境变量不带），剥离同样是官方会出现的形态。',
+                '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时不补充。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于真实 Claude Code 客户端。官方本就有不带 user_id 的形态（Claude Desktop 不带，Claude Code 也可通过环境变量不带），剥离同样是官方会出现的形态。',
                 'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid becomes the pooled account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session id header; with “Identity consistency” disabled it is sent unchanged. Nothing is added when the client sends none. Disabled: user_id is stripped entirely (metadata is removed once empty). Applies only to real Claude Code clients. Official clients already send requests without user_id (Claude Desktop never does, and Claude Code can omit it via an environment variable), so stripping is also a shape the official client produces.',
               )}
             </>
@@ -746,7 +746,7 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '这是纯粹的请求形态错误：换哪个账号发送都是同一条 400，发往上游只会白占一次请求配额，并在上游留下一条与账号状态无关的 4xx。规则由上游的 400 学习而来，本地拒绝时返回的也是上游当时的原话。规则记录在「从上游学到的规则」中，7 天后到期，也可手动删除。停用后，这类请求原样发往上游，由上游返回 400，停用期间不会积累新规则。',
+                '这是纯粹的请求形态错误：换哪个账号发送都是同一条 400，发往上游只会徒然占用一次请求配额，并在上游留下一条与账号状态无关的 4xx。规则由上游的 400 学习而来，本地拒绝时返回的也是上游当时的原文。规则记录在「从上游学到的规则」中，7 天后到期，也可手动删除。停用后，这类请求原样发往上游，由上游返回 400，停用期间不会积累新规则。',
                 'These are pure request-shape errors: whichever account sends it gets the same 400, so forwarding it only wastes a request and leaves a 4xx upstream that has nothing to do with the account. Rules are learned from upstream 400s, and a local rejection returns upstream’s original message. Rules live under “Rules learned from upstream”, expire after 7 days and can be removed by hand. Turned off, such requests go upstream as is and upstream answers with the 400; no new rules are learned meanwhile.',
               )}
             </>
@@ -814,7 +814,7 @@ export function ForwardingSettingsContent() {
       <SettingsGroup
         icon={RefreshCwIcon}
         title={t('限流与错误恢复', 'Rate limits & error recovery')}
-        description={t('限流换号，以及换号导致的 thinking 校验失败后的重试。', 'Account switching on rate limits, and retries after thinking validation fails because of a switch.')}
+        description={t('限流时切换账号，以及切换账号导致 thinking 校验失败后的重试。', 'Account switching on rate limits, and retries after thinking validation fails because of a switch.')}
       >
         <ForwardingToggle
           k="rate_limit_retry"
@@ -1116,7 +1116,7 @@ function QuotaPausePct() {
       label={t('提前暂停调度阈值', 'Early pause threshold')}
       description={
         <ClampedDescription text={t(
-          '上游每条响应都带有账号的用量窗口使用率；达到阈值即将账号移出调度池，不必等下一条请求触发 429（那一条请求必定失败）。两个窗口各设一档，二者含义不同：因 5 小时窗口暂停调度的账号最多暂停数小时即自动恢复，因 7 天窗口暂停的则要暂停到下一次周重置。因此，周用量偏高的账号会被长时间移出调度池，即使该账号近 5 小时内未被使用。所以 7 天窗口阈值默认停用（周额度真正用完时上游会返回 429，账号级冷却照常接手）；如需启用，建议设得比 5 小时窗口阈值更高。超额用量（extra usage）接近上限时不计入判定。暂停后按触发的那个窗口的重置时刻自动恢复，也可手动启用或通过连通性测试恢复调度。填 0 表示该档不暂停调度。这里是全局值；单个账号可在账号菜单「提前暂停调度阈值」中逐档覆盖（跟随全局 / 该窗口不提前停 / 独立阈值）。',
+          '上游每条响应都带有账号的用量窗口使用率；达到阈值即将账号移出调度池，不必等下一条请求触发 429（那一条请求必定失败）。两个窗口各设一档，二者含义不同：因 5 小时窗口暂停调度的账号最多暂停数小时即自动恢复，因 7 天窗口暂停的则要暂停到下一次周重置。因此，周用量偏高的账号会被长时间移出调度池，即使该账号近 5 小时内未被使用。所以 7 天窗口阈值默认停用（周额度真正用完时上游会返回 429，账号级冷却照常接手）；如需启用，建议设得比 5 小时窗口阈值更高。超额用量（extra usage）接近上限时不计入判定。暂停后按触发的那个窗口的重置时刻自动恢复，也可手动启用或通过连通性测试恢复调度。填 0 表示该档不暂停调度。这里是全局值；单个账号可在账号菜单「提前暂停调度阈值」中逐档覆盖（跟随全局 / 该窗口停用 / 独立阈值）。',
           'Every upstream response reports the account’s usage window utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold; do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. Extra usage nearing its limit never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (Use global / Off for this window / Custom threshold).',
         )} />
       }
@@ -1411,9 +1411,9 @@ function RefusalGroup({
             <TooltipPopup>{formatFullTime(group.latest, language)}</TooltipPopup>
           </Tooltip>
         </button>
-        <Hint label={t('删除这一组规则', 'Remove this rule group')}>
+        <Hint label={t('删除该组规则', 'Remove this rule group')}>
           <Button
-            aria-label={t('删除这一组规则', 'Remove this rule group')}
+            aria-label={t('删除该组规则', 'Remove this rule group')}
             size="icon"
             variant="ghost"
             className="shrink-0 text-muted-foreground hover:text-foreground"
@@ -1598,7 +1598,7 @@ function LearnedRejections() {
     onSuccess: (rows) => {
       setConfirmClear(null)
       qc.setQueryData(['learned-rejections'], rows)
-      toastManager.add({ title: t('已删除这一组规则', 'Rule group removed'), type: 'success' })
+      toastManager.add({ title: t('已删除该组规则', 'Rule group removed'), type: 'success' })
     },
     onError: (e) => { setConfirmClear(null); failure(t('删除失败', 'Failed to remove'), e) },
   })
@@ -1833,7 +1833,7 @@ function LearnedRejections() {
               {kindFilter !== 'all' && (counts[kindFilter] ?? 0) > 0 && (
                 <Button size="xs" variant="outline" onClick={() => setConfirmClear({ type: 'kind', kind: kindFilter })}>
                   <Trash2Icon />
-                  {t(`清空这一类 ${counts[kindFilter]}`, `Clear this kind ${counts[kindFilter]}`)}
+                  {t(`清空该类 ${counts[kindFilter]}`, `Clear this kind ${counts[kindFilter]}`)}
                 </Button>
               )}
               <Button size="xs" variant="outline" onClick={() => setConfirmClear({ type: 'all' })}>
@@ -1844,7 +1844,7 @@ function LearnedRejections() {
           </div>
           {visible.length === 0 ? (
             <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-6 text-sm sm:px-5 text-muted-foreground">
-              {needle ? t('没有匹配的规则。', 'No matching rules.') : t('这一类下没有规则。', 'No rules of this kind.')}
+              {needle ? t('没有匹配的规则。', 'No matching rules.') : t('该类别下暂无规则。', 'No rules of this kind.')}
               <Button size="xs" variant="outline" onClick={() => { setKindFilter('all'); setSearch('') }}>
                 {t('查看全部', 'Show all')}
               </Button>
@@ -1885,13 +1885,13 @@ function LearnedRejections() {
                   {confirmClear?.type === 'kind'
                     ? t(`清空「${kindLabel(confirmClear.kind)}」`, `Clear "${kindLabel(confirmClear.kind)}"`)
                     : confirmClear?.type === 'group'
-                      ? t('删除这一组规则', 'Remove this rule group')
+                      ? t('删除该组规则', 'Remove this rule group')
                       : t('清空学到的规则', 'Clear learned rules')}
                 </AlertDialogTitle>
                 <AlertDialogDescription>
                   {confirmClear?.type === 'kind'
                     ? t(
-                        `将删除这一类的 ${counts[confirmClear.kind] ?? 0} 条规则，其他种类不受影响。此后相同的组合会再次发往上游，若再被拒绝，将重新学习为规则。`,
+                        `将删除该类别的 ${counts[confirmClear.kind] ?? 0} 条规则，其他种类不受影响。此后相同的组合会再次发往上游，若再被拒绝，将重新学习为规则。`,
                         `${counts[confirmClear.kind] ?? 0} rules of this kind will be removed; other kinds are untouched. The same combinations will be sent upstream once more and re-learned if rejected.`,
                       )
                     : confirmClear?.type === 'group'

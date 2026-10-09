@@ -385,7 +385,7 @@ export function BatchActionsBar({
             <Button size="sm" variant="outline" aria-label={t('停用所选账号', 'Disable selected accounts')} disabled={busy} loading={applyDisabled.isPending && applyDisabled.variables === true} onClick={() => applyDisabled.mutate(true)}>
               <PauseIcon /><span className="max-sm:sr-only">{t('停用', 'Disable')}</span>
             </Button>
-            <Button size="sm" variant="outline" aria-label={t('设置所选账号的号池分组', 'Set pool groups of the selected accounts')} disabled={busy} onClick={() => setGroupsOpen(true)}>
+            <Button size="sm" variant="outline" aria-label={t('设置所选账号的分组', 'Set groups of the selected accounts')} disabled={busy} onClick={() => setGroupsOpen(true)}>
               <FolderIcon /><span className="max-sm:sr-only">{t('分组', 'Groups')}</span>
             </Button>
             <Button size="sm" variant="destructive-outline" aria-label={t('删除所选账号', 'Delete selected accounts')} disabled={busy} onClick={() => setConfirmDelete(true)}>

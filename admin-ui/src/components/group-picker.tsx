@@ -232,11 +232,11 @@ export function SetGroupsDialog({
     <Dialog open={open} onOpenChange={(next) => { if (!save.isPending) onOpenChange(next) }}>
       <DialogPopup>
         <DialogHeader>
-          <DialogTitle>{t('设置号池分组', 'Set pool groups')}</DialogTitle>
+          <DialogTitle>{t('设置账号分组', 'Set account groups')}</DialogTitle>
           <DialogDescription>
             {cred
-              ? t('选中的分组会整体替换这个号现在所在的分组。', 'The selected groups replace the groups this account is in.')
-              : t(`选中的分组会整体替换这 ${count} 个号现在所在的分组。`, `The selected groups replace the groups of these ${count} accounts.`)}
+              ? t('所选分组将整体替换该账号当前所属的分组。', 'The selected groups replace the groups this account is in.')
+              : t(`所选分组将整体替换这 ${count} 个账号当前所属的分组。`, `The selected groups replace the groups of these ${count} accounts.`)}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>

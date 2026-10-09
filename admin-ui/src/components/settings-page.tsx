@@ -53,7 +53,7 @@ export function SettingsPage({
     },
     {
       key: 'groups',
-      label: t('号池分组', 'Pool groups'),
+      label: t('账号分组', 'Account groups'),
       navDescription: t('分组与开放名单', 'Groups and who can use them'),
       icon: FolderIcon,
     },

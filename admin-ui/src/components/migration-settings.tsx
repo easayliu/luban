@@ -111,7 +111,7 @@ function ExportPanel() {
       <Hint
         label={locked
           ? t(
-              '控制台未设置管理密码时，任何能连接到该端口的人都可以访问管理接口，因此在此状态下不允许导出。',
+              '控制台未设置管理密码时，任何可连接到该端口的访问者均能使用管理接口，因此在此状态下不允许导出。',
               'Without an admin password, anyone who can reach the port can use the management API, so this file cannot be exported in that state.',
             )
           : undefined}

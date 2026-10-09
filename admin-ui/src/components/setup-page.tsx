@@ -72,7 +72,7 @@ export function SetupPage({ onSuccess }: { onSuccess: (result: LoginResult) => v
             </CardTitle>
             <CardDescription>
               {t(
-                '尚未设置管理密码，须先设置密码才能使用控制台。管理员的用户名为 admin，以后用它和这个密码登录。',
+                '尚未设置管理密码，须先设置密码才能使用控制台。管理员用户名为 admin，此后请使用该用户名与此密码登录。',
                 'No admin password is set. Set one before using the console. The admin username is admin; sign in with it and this password from now on.',
               )}
             </CardDescription>

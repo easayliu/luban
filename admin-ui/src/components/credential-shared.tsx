@@ -1981,7 +1981,7 @@ export function CredentialOwner({ cred, className }: { cred: Credential; classNa
   const { t } = useI18n()
   if (!cred.owner || cred.owner === 'admin') return null
   return (
-    <Hint label={t(`号主：${cred.owner}`, `Owner: ${cred.owner}`)}>
+    <Hint label={t(`所属成员：${cred.owner}`, `Owner: ${cred.owner}`)}>
       <span className={cn('inline-flex min-w-0 items-center gap-1 text-muted-foreground', className)}>
         <UserIcon aria-hidden="true" className="size-3 shrink-0" />
         <span className="truncate">{cred.owner}</span>

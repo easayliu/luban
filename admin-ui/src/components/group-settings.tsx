@@ -37,7 +37,7 @@ import { SettingsGroup } from '@/components/settings-group'
 import { useGroups } from '@/components/group-picker'
 import { ErrorState, LoadingState } from '@/components/state-placeholders'
 
-/** 能被开放分组的人：代理（名下用户自动继承），以及管理员直属的用户。 */
+/** 可被开放分组的成员：代理（下属用户自动继承），以及管理员直属的用户。 */
 function grantable(users: ConsoleUser[]): ConsoleUser[] {
   return users.filter((u) => u.role === 'agent' || (u.role === 'user' && u.parent_username === 'admin'))
 }
@@ -85,7 +85,7 @@ export function GroupSettingsContent() {
       <ErrorState
         error={groupsQuery.error}
         retrying={groupsQuery.isFetching}
-        title={t('无法读取号池分组', 'Unable to load pool groups')}
+        title={t('无法读取账号分组', 'Unable to load account groups')}
         onRetry={() => void groupsQuery.refetch()}
       />
     )
@@ -96,9 +96,9 @@ export function GroupSettingsContent() {
     <div className="space-y-4">
       <SettingsGroup
         icon={FolderIcon}
-        title={t('号池分组', 'Pool groups')}
+        title={t('账号分组', 'Account groups')}
         description={t(
-          '号可以同时在多个分组里。接入 Key 绑定分组后，只在这些分组的号里选号。默认分组对所有人开放；其余分组可开放给代理（其名下用户自动继承）或管理员直属的用户。',
+          '账号可同时属于多个分组。接入 Key 绑定分组后，仅从这些分组的账号中调度。默认分组对所有成员开放；其余分组可开放给代理（其下属用户自动继承）或管理员直属的用户。',
           'An account can be in several groups. An access key bound to groups only picks accounts from them. The default group is open to everyone; other groups can be opened to agents (their users inherit them) or users directly under the admin.',
         )}
       >
@@ -110,13 +110,13 @@ export function GroupSettingsContent() {
                   <span className="truncate">{g.name}</span>
                   {g.is_default && <Badge size="xs" variant="secondary">{t('默认', 'Default')}</Badge>}
                   <span className="text-xs font-normal text-muted-foreground tabular-nums">
-                    {t(`${g.credential_count ?? 0} 个号`, `${g.credential_count ?? 0} accounts`)}
+                    {t(`${g.credential_count ?? 0} 个账号`, `${g.credential_count ?? 0} accounts`)}
                   </span>
                 </div>
                 {g.note && <p className="mt-0.5 text-xs text-muted-foreground">{g.note}</p>}
                 <p className="mt-1 text-xs text-muted-foreground">
                   {g.is_default
-                    ? t('对所有人开放', 'Open to everyone')
+                    ? t('对所有成员开放', 'Open to all members')
                     : g.grants && g.grants.length > 0
                       ? t(`开放给：${g.grants.map(nameOf).join('、')}`, `Open to: ${g.grants.map(nameOf).join(', ')}`)
                       : t('仅管理员可用', 'Admin only')}
@@ -160,7 +160,7 @@ export function GroupSettingsContent() {
             <AlertDialogTitle>{t('删除分组', 'Delete group')}</AlertDialogTitle>
             <AlertDialogDescription>
               {deleting && t(
-                `删除「${deleting.name}」后，只在这个分组里的号会挪进默认分组；接入 Key 上对它的绑定一并解除。`,
+                `删除「${deleting.name}」后，仅属于该分组的账号将移入默认分组，接入 Key 对它的绑定同时解除。`,
                 `After deleting “${deleting.name}”, accounts only in this group move to the default group, and access keys stop being bound to it.`,
               )}
             </AlertDialogDescription>
@@ -281,15 +281,15 @@ function GrantsDialog({
           <DialogTitle>{t('开放名单', 'Access')}</DialogTitle>
           <DialogDescription>
             {group && t(
-              `勾选的人可以把号放进「${group.name}」。开放给代理时，他名下的用户也能用。`,
-              `Checked people can put accounts into “${group.name}”. Opening it to an agent also opens it to the agent’s users.`,
+              `勾选的成员可将账号加入「${group.name}」。开放给代理时，其下属用户同样可用。`,
+              `Checked members can add accounts to “${group.name}”. Opening it to an agent also opens it to the agent’s users.`,
             )}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>
           {users.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              {t('还没有代理或管理员直属的用户，先到「用户管理」开设账号。', 'No agents or users directly under the admin yet; create them under Users first.')}
+              {t('暂无代理或管理员直属的用户，请先在「成员管理」中创建。', 'No agents or users directly under the admin yet; create them under Members first.')}
             </p>
           ) : (
             // CheckboxGroup 的值是字符串：用户 id 在这里进出时转换。

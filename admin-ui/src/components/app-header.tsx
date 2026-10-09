@@ -82,15 +82,15 @@ export function AppHeader({
   // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。代理和用户常驻身份与
   // 用户名：他们看到的账号池只有自己名下的号，得一眼看出是以谁的身份在看。
   const readOnlyBadge = readOnly ? (
-    <Hint label={t('访客身份登录，只能查看，不能修改', 'Signed in as a viewer: you can look but not change anything')}>
+    <Hint label={t('以访客身份登录：仅可查看，不可修改', 'Signed in as a viewer: you can look but not change anything')}>
       <Badge className="shrink-0" variant="warning">
         {t('只读', 'Read-only')}
       </Badge>
     </Hint>
   ) : me && (me.role === 'agent' || me.role === 'user') && (
     <Hint label={me.role === 'agent'
-      ? t('代理身份登录：管理自己名下的号和用户', 'Signed in as an agent: you manage your own accounts and users')
-      : t('用户身份登录：管理自己名下的号', 'Signed in as a user: you manage your own accounts')}
+      ? t('以代理身份登录：可管理自己的账号与下属用户', 'Signed in as an agent: you manage your own accounts and users')
+      : t('以用户身份登录：可管理自己的账号', 'Signed in as a user: you manage your own accounts')}
     >
       <Badge className="max-w-40 shrink-0 truncate" variant="secondary">
         {me.role === 'agent' ? t('代理', 'Agent') : t('用户', 'User')}
@@ -150,7 +150,7 @@ export function MainNav({
   const items = [
     { key: 'pool' as const, label: t('账号池', 'Accounts'), icon: LayersIcon },
     { key: 'billing' as const, label: t('费用', 'Billing'), icon: ReceiptIcon },
-    ...(canManageUsers ? [{ key: 'users' as const, label: t('用户管理', 'Users'), icon: UsersIcon }] : []),
+    ...(canManageUsers ? [{ key: 'users' as const, label: t('成员管理', 'Members'), icon: UsersIcon }] : []),
     ...(isAdmin ? [{ key: 'settings' as const, label: t('系统设置', 'Settings'), icon: SettingsIcon }] : []),
   ]
   return (
