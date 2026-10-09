@@ -256,6 +256,9 @@ impl CredentialStore {
         if let Some(v) = on(SIM_TRIM_TOOLS) {
             flags.sim_trim_tools = v;
         }
+        if let Some(v) = on(SIM_BILLING_ONLY) {
+            flags.sim_billing_only = v;
+        }
         if let Some(v) = on(SIM_MESSAGE_THREADS) {
             flags.sim_message_threads = v;
         }
@@ -582,6 +585,10 @@ pub const FILL_ABSENT_TOOLS: &str = "fill_absent_tools";
 /// 模拟路径注入的官方工具是否去掉 Artifact / ListAgents / SendFeedback 三条的 settings 键名。
 /// 缺省视为启用，见 [`ForwardFlags::sim_trim_tools`]。
 pub const SIM_TRIM_TOOLS: &str = "sim_trim_tools";
+
+/// 模拟路径是否只注入 `system[0]` billing header、其余注入全部跳过的 settings 键名。
+/// 缺省视为停用，见 [`ForwardFlags::sim_billing_only`]。
+pub const SIM_BILLING_ONLY: &str = "sim_billing_only";
 
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。

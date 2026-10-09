@@ -91,6 +91,10 @@ pub(super) struct Simulation {
     /// 注入的官方工具去掉 Artifact / ListAgents / SendFeedback 三条（开关 `sim_trim_tools`，见
     /// [`crate::store::ForwardFlags::sim_trim_tools`] 与 [`crate::proxy::cc_tools_core`]）。
     pub(super) trim_tools: bool,
+    /// 只注 `system[0]` 的最小 billing header、其余注入全部跳过（开关 `sim_billing_only`，见
+    /// [`crate::store::ForwardFlags::sim_billing_only`]）。开着时 [`rewrite_body_out`] 里的下游
+    /// 整形（身份句、基座、第四块、工具、metadata、thread、顶层重排等）一律不做。
+    pub(super) billing_only: bool,
     /// 这条要不要带 `anthropic-usage-limit: extended`（[`config::CC_USAGE_LIMIT_HEADER`]）：主线程
     /// 的工具续轮，且这个号进了那个实验、额外用量停用着，见 [`usage_limit_wanted`]。
     pub(super) usage_limit: bool,
@@ -236,6 +240,9 @@ impl Simulation {
         // 账号钉住（[`account_session_id`]，同一条会话换号后不该带着同一个 uuid 出现在另一个
         // 组织下），没带才按缓存前缀 + 对话起点（[`sim_session_key`]）派生。
         let session_id = match (incoming_session_id(headers, Some(v)), seed) {
+            // `sim_billing_only`：metadata 原样透传（body 里保留客户端自己的 session_id），出站会话头
+            // 也沿用客户端这个合法值，两处同值、不自造矛盾。客户端没带才落到下面的派生。
+            (Some(sid), _) if flags.sim_billing_only => sid,
             (Some(sid), SimSessionSeed::Prefix(_)) => {
                 pin_session_id(cred, sid, flags.spoof_identity)
             }
@@ -270,6 +277,7 @@ impl Simulation {
             context_1m,
             fill_absent_tools: flags.fill_absent_tools,
             trim_tools: flags.sim_trim_tools,
+            billing_only: flags.sim_billing_only,
             usage_limit: super::usage_limit_wanted(v, profile, cred.id),
             thread: Default::default(),
         })
@@ -1310,6 +1318,44 @@ pub(super) fn simulate_system(
     if sim.profile.system == config::CcSystemShape::None {
         return false;
     }
+    // `sim_billing_only`：只在 `system[0]` 注一条最小 billing header（上游放行闸认的那把钥匙），
+    // 客户端自己的 system 块原样透传，不补身份句 / 基座 / 第四块。`cch` 先填占位，出站前由
+    // [`finalize_cch`] 按最终字节重算（`system[0]` 是 billing header → `billing_cch_region` 命中）。
+    if sim.billing_only {
+        let header = format!(
+            "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch={};",
+            sim.profile.version,
+            cc_version_suffix(v, sim.profile.version),
+            cch_value(),
+        );
+        // 客户端可能自己抄了官方 billing header / 身份声明：剥掉以免两条 billing header。
+        // 这里按**原块**透传，不走 `merge_system_blocks` 合并，保住客户端的分块与断点；且**行级**
+        // 剥（[`strip_cc_preamble_lines`]）而非整块丢——客户端把 billing header 和业务指令写在同一块
+        // （单换行分隔）时，整块丢会连指令一起删，完整模拟路径因为先合并才不会。
+        let mut client = match v.get("system") {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![text_block_bare(s)],
+            Some(serde_json::Value::Array(a)) => a.clone(),
+            _ => Vec::new(),
+        };
+        for b in &mut client {
+            if let Some(o) = b.as_object_mut() {
+                // `citations` 上游不收在 system 里（见下方多块路径同样处理）。
+                o.shift_remove("citations");
+                if let Some(text) = o.get("text").and_then(|t| t.as_str()) {
+                    let stripped = strip_cc_preamble_lines(text);
+                    o.insert("text".into(), serde_json::Value::String(stripped));
+                }
+            }
+        }
+        // 行级剥完变空的文本块丢掉（纯 billing header / 身份句那种）。
+        client.retain(|b| {
+            b.get("text").and_then(|t| t.as_str()).is_none_or(|t| !t.trim().is_empty())
+        });
+        let mut blocks = vec![text_block_bare(&header)];
+        blocks.extend(client);
+        insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
+        return true;
+    }
     let client: Vec<serde_json::Value> = match v.get("system") {
         Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
             vec![text_block_bare(s)]
@@ -1553,38 +1599,38 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
         }
         true
     });
-    // 处理合并后嵌在一大段文本里的情况：子串级剥。
+    // 处理合并后嵌在一大段文本里的情况：子串级剥（与 billing-only 路径共用 [`strip_cc_preamble_lines`]）。
     for b in &mut blocks {
         let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
             continue;
         };
-        if !text.contains(config::CC_SYSTEM_IDENTITY)
-            && !text.contains("x-anthropic-billing-header:")
-        {
-            continue;
-        }
-        let mut s = text.to_string();
-        // 剥 billing header：它只占一行。
-        if let Some(start) = s.find("x-anthropic-billing-header:") {
-            let end = s[start..].find('\n').map(|i| start + i + 1).unwrap_or(s.len());
-            s.replace_range(start..end, "");
-        }
-        s = s.replace(config::CC_SYSTEM_IDENTITY, "");
-        // 连续空行归一。
-        while s.contains("\n\n\n") {
-            s = s.replace("\n\n\n", "\n\n");
-        }
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            b.as_object_mut()
-                .map(|o| o.insert("text".into(), serde_json::Value::String(String::new())));
-        } else {
-            b.as_object_mut().map(|o| o.insert("text".into(), serde_json::Value::String(trimmed)));
-        }
+        let stripped = strip_cc_preamble_lines(text);
+        b.as_object_mut().map(|o| o.insert("text".into(), serde_json::Value::String(stripped)));
     }
     // 剥完文本变空的块也丢掉。
     blocks.retain(|b| b.get("text").and_then(|t| t.as_str()).is_none_or(|t| !t.trim().is_empty()));
     blocks
+}
+
+/// 行级剥掉一段 `system` 文本里可能抄自官方的 billing header 行与身份句，保留其余正文与换行。
+/// [`strip_cc_preamble`] 的子串分支与 billing-only 路径共用：后者按客户端原块透传，只能**行级**剥，
+/// 整块丢会连「billing header 行 + 单换行 + 业务指令」里的指令一起删。文本里没有这两样时原样返回。
+fn strip_cc_preamble_lines(text: &str) -> String {
+    if !text.contains(config::CC_SYSTEM_IDENTITY) && !text.contains("x-anthropic-billing-header:") {
+        return text.to_string();
+    }
+    let mut s = text.to_string();
+    // 剥 billing header：它只占一行（连同行尾换行一起去掉）。
+    if let Some(start) = s.find("x-anthropic-billing-header:") {
+        let end = s[start..].find('\n').map(|i| start + i + 1).unwrap_or(s.len());
+        s.replace_range(start..end, "");
+    }
+    s = s.replace(config::CC_SYSTEM_IDENTITY, "");
+    // 连续空行归一。
+    while s.contains("\n\n\n") {
+        s = s.replace("\n\n\n", "\n\n");
+    }
+    s.trim().to_string()
 }
 
 /// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：超出部分并进末块

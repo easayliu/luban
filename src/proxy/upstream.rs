@@ -155,6 +155,9 @@ impl Upstream<'_> {
                 version,
                 entrypoint: ua.and_then(cc_ua_entrypoint).unwrap_or("cli"),
             });
+            // `sim_billing_only` 的两处置空（`tool_names` / `refusal_fallbacks`）不在这里做，而是
+            // 在 [`AttemptPlan`] 生成时统一门控——那样请求头的 beta、请求体、重试与错误学习用的是
+            // 同一份状态（见 [`crate::proxy::handler::attempt`]）。这里原样透传即可。
             rewrite_body_out(
                 body,
                 cred,

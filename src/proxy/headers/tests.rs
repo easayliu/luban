@@ -385,6 +385,7 @@ fn all_flags_off_only_injects_auth() {
         simulate_full_system: false,
         fill_absent_tools: false,
         sim_trim_tools: false,
+        sim_billing_only: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,

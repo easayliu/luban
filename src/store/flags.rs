@@ -119,6 +119,16 @@ pub struct ForwardFlags {
     ///   新会话首轮约少 1.4 万 token 的写入。
     /// - **关**：注入完整的 14 条，与官方默认配置相同。
     pub sim_trim_tools: bool,
+    /// 模拟路径只在 `system[0]` 注一条最小 billing header（`cc_version` / `cc_entrypoint` /
+    /// `cch`），其余注入一概跳过（[`Self::simulate_cc`] 的子项，实验性）。
+    ///
+    /// - **开**：不补身份句、官方基座、第四块、官方工具、`metadata` / `thread` / `diagnostics` /
+    ///   `output_config`，不重排顶层键；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
+    ///   换头照旧；`cch` 跟随 [`Self::cch_sim_compute`]（开算真值、关填随机值）。上游放行只认
+    ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。代价：官方「仅 billing header」的请求几乎都是 0 工具、
+    ///   一两轮的辅助调用，长多轮带工具的主对话官方从不这样发，属官方不产生的形态。
+    /// - **关**（默认）：按完整官方形态模拟。
+    pub sim_billing_only: bool,
     /// 模拟路径的主线程按官方的 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项；
     /// 2.1.285 的 fable-5-1 除外——官方那一版不发，2.1.291 起发）。
     ///
@@ -382,6 +392,7 @@ impl Default for ForwardFlags {
             simulate_full_system: true,
             fill_absent_tools: true,
             sim_trim_tools: true,
+            sim_billing_only: false,
             sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,

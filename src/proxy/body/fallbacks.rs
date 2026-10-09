@@ -74,16 +74,27 @@ pub(in crate::proxy) fn outbound_carries_fallbacks(
     flags: store::ForwardFlags,
     inbound_beta: &[String],
     learned: &DeprecatedFieldMemory,
+    // 这条请求会走 billing-only（只注 billing header）：luban 不注入族 `fallbacks`，客户端
+    // 自带的才可能出站。与 [`crate::proxy::handler::attempt`] 置空 `refusal_fallbacks` 同一门控，
+    // 两处必须一致，否则这里当「会带」而实际没带，命中已学到的拒答时跳过本地回放、白送一发。
+    billing_only: bool,
 ) -> bool {
     let Some(v) = body else { return false };
     let client = v.get("fallbacks");
     // 客户端带了非字符串：luban 一个字不动（[`client_supplied_fallbacks`]），出站就是它那份——
     // 算不算「带了」看它是不是一份上游会认的数组；`[]`、`null`、`{}`、`[null]`、`[{}]` 上游
-    // 一定 400，本地规则不能为它让路。
+    // 一定 400，本地规则不能为它让路。billing-only 下也照样透传，故这一支不受门控影响。
     if let Some(f) = client
         && !f.is_string()
     {
         return valid_fallback_array(f);
+    }
+    // billing-only：族注入关着（[`refusal_fallbacks_for`] 的结果在调用点被置空），字段缺失就是
+    // 真没带；客户端自带的字符串 `"default"` 只有 fable 会被 [`normalize_fallbacks`] 归一成官方
+    // 数组、才会让上游换模型重跑，别的族原样出站（上游 400、不重跑），一律不算。
+    if billing_only {
+        return client.is_some_and(|f| f.is_string())
+            && model.is_some_and(|m| cc_profile_for(m).fallbacks.is_some());
     }
     // 字段缺失或是字符串：luban 有计划就写计划（[`ensure_fallbacks`] 会把任何字符串换掉），
     // 没计划就是没带——字符串不算，见函数文档。

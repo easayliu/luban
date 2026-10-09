@@ -621,6 +621,11 @@ fn shape_gates(
     //      账号状态无关的 4xx。规则不是写死的，是上游那条 400 自己喂出来的，回给客户端的
     //      也是它当初那句原话，见 [`remember_shape_rejection`]。`reject_learned_shapes` 关掉时不拦。
     let flags = state.store.forward_flags();
+    // 这条请求会不会走 billing-only（只注 billing header、不注族 `fallbacks`）：判据与
+    // [`Simulation::detect`] / [`crate::proxy::handler::attempt`] 同源（[`simulates_cc`]），下面两处
+    // 「出站带不带 fallback」的例外要跟实际出站计划一致。
+    let billing_only = flags.sim_billing_only
+        && simulates_cc(body_json.as_ref(), headers, facts.from_cc_client, flags);
     let system_hoisted = billable && hoists_system_role(&flags, cc_shaped);
     if flags.reject_learned_shapes
         && let Some((field, value, message)) = known_shape_rejection(
@@ -725,6 +730,7 @@ fn shape_gates(
             state.store.forward_flags(),
             &inbound_beta_list(headers),
             &state.deprecated_fields,
+            billing_only,
         )
         && let Some(refused) =
             known_refused_prompt(&state.empty_replies, req_model.as_deref(), body_json.as_ref())
@@ -777,6 +783,7 @@ fn shape_gates(
             state.store.forward_flags(),
             &inbound_beta_list(headers),
             &state.deprecated_fields,
+            billing_only,
         )
         && let Some(refused) =
             known_app_refusal(&state.empty_replies, req_model.as_deref(), body_json.as_ref())

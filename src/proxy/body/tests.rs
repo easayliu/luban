@@ -618,6 +618,7 @@ fn body_flags_off_passes_through_byte_for_byte() {
         simulate_full_system: false,
         fill_absent_tools: false,
         sim_trim_tools: false,
+        sim_billing_only: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -1562,6 +1563,7 @@ fn strip_extra_fields_is_wired_and_switchable() {
             simulate_full_system: false,
             fill_absent_tools: false,
             sim_trim_tools: false,
+            sim_billing_only: false,
             sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -1861,7 +1863,7 @@ fn outbound_carries_fallbacks_sees_client_arrays_and_luban_padding() {
         "messages": [{"role": "user", "content": "hi"}]
     });
     let carries = |body: &serde_json::Value, model: &str, flags| {
-        crate::proxy::outbound_carries_fallbacks(Some(body), Some(model), flags, &[], &mem)
+        crate::proxy::outbound_carries_fallbacks(Some(body), Some(model), flags, &[], &mem, false)
     };
     // fable 默认关 → 不带；显式开 → luban 会补 → 带。
     assert!(!carries(&main, "claude-fable-5-1", defaults));
@@ -1927,7 +1929,8 @@ fn outbound_carries_fallbacks_sees_client_arrays_and_luban_padding() {
         Some("claude-fable-5-1"),
         defaults,
         &[],
-        &mem
+        &mem,
+        false
     ));
     // 上游 400 拒过这个模型的 fallback 目标：luban 不再补 → 不带。
     mem.write().insert(
@@ -1935,6 +1938,62 @@ fn outbound_carries_fallbacks_sees_client_arrays_and_luban_padding() {
         "rejected".into(),
     );
     assert!(!carries(&main, "claude-fable-5-1", defaults));
+}
+
+/// billing-only（最后一个入参为真）：luban 不注入族 `fallbacks`，故「客户端没带」就是真没带、
+/// 不能当作「会带」而跳过本地拒答回放；客户端自带的数组照样透传算带；客户端字符串 "default"
+/// 只有能被 [`normalize_fallbacks`] 归一成数组的 fable 才算带。
+#[test]
+fn outbound_carries_fallbacks_billing_only_counts_only_what_actually_ships() {
+    let mem = crate::proxy::DeprecatedFieldMemory::default();
+    // 族开关全开：非 billing-only 时下面这几条都会被判成「会带」。
+    let fable_on = store::ForwardFlags {
+        fable_refusal_fallback: true,
+        opus_refusal_fallback: true,
+        ..store::ForwardFlags::default()
+    };
+    let carries = |body: &serde_json::Value, model: &str, billing_only| {
+        crate::proxy::outbound_carries_fallbacks(
+            Some(body),
+            Some(model),
+            fable_on,
+            &[],
+            &mem,
+            billing_only,
+        )
+    };
+    // 主线程形态（带 tools + system + stream），只是不带 fallbacks。
+    let no_fb = serde_json::json!({
+        "model": "claude-fable-5-1", "max_tokens": 32000, "stream": true,
+        "system": [{"type": "text", "text": "You are Claude Code"}],
+        "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    // 客户端没带：非 billing-only 时 luban 会补 → 带；billing-only 不补 → 不带（修复点）。
+    assert!(carries(&no_fb, "claude-fable-5-1", false), "非 billing-only：luban 补 fallback");
+    assert!(
+        !carries(&no_fb, "claude-fable-5-1", true),
+        "billing-only：没带就是没带，不能跳过本地拒答回放"
+    );
+    // 客户端自带数组：两种模式都透传 → 都算带。
+    let arr = serde_json::json!({
+        "model": "claude-sonnet-5", "max_tokens": 100,
+        "fallbacks": [{"model": "claude-opus-5"}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    assert!(carries(&arr, "claude-sonnet-5", true), "billing-only 也透传客户端数组");
+    // 客户端字符串 "default"：fable 会被归一成数组 → 算带；非 fable 原样出站 → 不算。
+    let s = |model: &str| {
+        serde_json::json!({
+            "model": model, "max_tokens": 100, "fallbacks": "default",
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+    };
+    assert!(carries(&s("claude-fable-5-1"), "claude-fable-5-1", true), "fable 字符串归一成数组");
+    assert!(
+        !carries(&s("claude-sonnet-5"), "claude-sonnet-5", true),
+        "非 fable 字符串原样、不算带"
+    );
 }
 
 /// 真 CC 来访 `messages` 里一个断点都没有时补第三个断点（[`ensure_cc_message_breakpoint`]），
@@ -2238,6 +2297,7 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         simulate_full_system: false,
         fill_absent_tools: false,
         sim_trim_tools: false,
+        sim_billing_only: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -2483,6 +2543,266 @@ fn trim_switch_drops_exactly_the_three_user_switchable_tools() {
         serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", off, Some(&sim), None))
             .unwrap();
     assert_eq!(v["tools"].as_array().unwrap().len(), 14);
+}
+
+/// 开关 `sim_billing_only`：开着时模拟路径只在 `system[0]` 注一条最小 billing header，客户端自己的
+/// system 块 / 工具 / metadata 原样透传，不补身份句 / 基座 / 第四块 / 官方工具 / diagnostics /
+/// output_config / thread；防 400 的无损归一照做，cch 仍按出站字节重算。默认停用。
+#[cfg(test)]
+mod billing_only {
+    use super::*;
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+
+    /// 一条非 CC 来访：两块客户端 system、两个自定义工具、自带 `metadata.user_id`。
+    const RAW: &str = concat!(
+        r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+        r#""system":[{"type":"text","text":"CLIENT-A 指令"},{"type":"text","text":"CLIENT-B 追加"}],"#,
+        r#""tools":[{"name":"my_lookup","input_schema":{"type":"object"}},"#,
+        r#"{"name":"my_exec","input_schema":{"type":"object"}}],"#,
+        r#""metadata":{"user_id":"client-uid-123"},"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#
+    );
+
+    fn on_flags() -> store::ForwardFlags {
+        store::ForwardFlags { sim_billing_only: true, ..all_on() }
+    }
+
+    fn out(flags: store::ForwardFlags) -> serde_json::Value {
+        let raw = Bytes::from_static(RAW.as_bytes());
+        let sim = detect_for(&raw, flags).unwrap();
+        serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", flags, Some(&sim), None))
+            .unwrap()
+    }
+
+    /// 开着时 `system` = 一条最小 billing header + 客户端原块；官方整形一律不做，工具原样。
+    #[test]
+    fn emits_only_billing_header_and_client_blocks() {
+        let raw = Bytes::from_static(RAW.as_bytes());
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        assert!(sim.billing_only, "开关开着时 detect 应置 billing_only");
+        let v = out(on_flags());
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "billing header + 两块客户端原块: {v}");
+        assert!(
+            sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
+            "system[0] 是 billing header: {}",
+            sys[0]
+        );
+        assert_eq!(sys[1]["text"], "CLIENT-A 指令", "客户端首块原样");
+        assert_eq!(sys[2]["text"], "CLIENT-B 追加", "客户端次块原样");
+        assert!(
+            !sys[0]["text"].as_str().unwrap().contains("You are Claude Code"),
+            "不补身份句/基座"
+        );
+        assert!(v.get("thinking").is_none(), "不补 thinking");
+        assert!(v.get("context_management").is_none(), "不补 context_management");
+        assert!(v.get("output_config").is_none(), "不补 output_config");
+        assert!(v.get("diagnostics").is_none(), "不补 diagnostics");
+        assert!(v.get("thread").is_none(), "不写 thread");
+        let names: Vec<&str> =
+            v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["my_lookup", "my_exec"], "工具原样，不注官方工具");
+    }
+
+    /// `metadata.user_id` 完全原样透传，不剥、不重建。
+    #[test]
+    fn preserves_client_metadata() {
+        let v = out(on_flags());
+        assert_eq!(v["metadata"]["user_id"], "client-uid-123");
+    }
+
+    /// cch 仍按出站字节重算：出站 `system[0]` 里的 cch 等于对（cch 归零后的）出站字节算的真值，
+    /// 且不是跨账号恒定的 `00000`。
+    #[test]
+    fn cch_matches_outbound_bytes() {
+        let raw = Bytes::from_static(RAW.as_bytes());
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let bytes = rewrite_body(&raw, &test_cred(), "fp", on_flags(), Some(&sim), None);
+        let mut copy = bytes.to_vec();
+        let recomputed =
+            crate::proxy::body::apply_cch(&mut copy).expect("出站体里应有 billing header 的 cch");
+        assert_ne!(recomputed, "00000", "cch 不应留占位");
+        // apply_cch 对已定型的出站字节再算一次应得同值 → 证明出站里那条就是真值。
+        assert_eq!(&copy, bytes.as_ref(), "出站 cch 已是对出站字节算的真值");
+    }
+
+    /// 防 400 的无损归一照做：空壳 `role:"system"` 消息丢弃、重复工具去重——即便开着 billing-only。
+    #[test]
+    fn still_drops_empty_system_and_dedups_tools() {
+        let raw = Bytes::from_static(
+            concat!(
+                r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+                r#""system":[{"type":"text","text":"C"}],"#,
+                r#""tools":[{"name":"dup","input_schema":{"type":"object"}},"#,
+                r#"{"name":"dup","input_schema":{"type":"object"}}],"#,
+                r#""messages":[{"role":"system","content":[]},{"role":"user","content":"hi"}]}"#
+            )
+            .as_bytes(),
+        );
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            on_flags(),
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        let names: Vec<&str> =
+            v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["dup"], "重复工具去重");
+        let roles: Vec<&str> =
+            v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user"], "空壳 system 消息被丢弃");
+    }
+
+    /// 不 cap、不 strip 客户端块：客户端给了 6 块 system（超过官方 5 块上限），billing-only 下
+    /// 原样保留（只在前面加一条 billing header = 7 块），不合并封顶。
+    #[test]
+    fn does_not_cap_or_strip_client_blocks() {
+        let raw = Bytes::from_static(
+            concat!(
+                r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+                r#""system":[{"type":"text","text":"B1"},{"type":"text","text":"B2"},"#,
+                r#"{"type":"text","text":"B3"},{"type":"text","text":"B4"},"#,
+                r#"{"type":"text","text":"B5"},{"type":"text","text":"B6"}],"#,
+                r#""messages":[{"role":"user","content":"hi"}]}"#
+            )
+            .as_bytes(),
+        );
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            on_flags(),
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        let texts: Vec<&str> = v["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|b| b["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["B1", "B2", "B3", "B4", "B5", "B6"], "六块原样保留、不合并封顶");
+    }
+
+    /// 修复 1：客户端把旧 billing header 与业务指令写在同一块（单换行分隔）时，billing-only **行级**
+    /// 剥——只去掉 header 那一行，保留业务指令；且全局只剩 system[0] 一条 billing header。
+    #[test]
+    fn strips_old_billing_line_but_keeps_business_instructions_in_the_same_block() {
+        let raw = Bytes::from_static(
+            concat!(
+                r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+                r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;\n保留我的业务指令"}],"#,
+                r#""messages":[{"role":"user","content":"hi"}]}"#
+            )
+            .as_bytes(),
+        );
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            on_flags(),
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "只剩注入的 billing header + 客户端那块（指令保留）: {v}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert_eq!(sys[1]["text"], "保留我的业务指令", "业务指令未被整块删掉");
+        let billing_headers = sys
+            .iter()
+            .filter(|b| {
+                b["text"].as_str().is_some_and(|t| t.contains("x-anthropic-billing-header:"))
+            })
+            .count();
+        assert_eq!(billing_headers, 1, "全局只剩一条 billing header，客户端抄的那行已剥");
+    }
+
+    /// 修复 2：billing-only 保留客户端 metadata 时，出站会话 id 沿用客户端自带的合法值——
+    /// 头与 body 两处同值。这里断言 `sim.session_id` 即客户端那个（头由它派生）。
+    #[test]
+    fn prefers_client_session_id_so_header_matches_body() {
+        const SID: &str = "11111111-1111-4111-8111-111111111111";
+        let raw = Bytes::from(format!(
+            concat!(
+                r#"{{"model":"claude-opus-5-5","max_tokens":64,"#,
+                r#""metadata":{{"user_id":"{{\"device_id\":\"d\",\"account_uuid\":\"\",\"session_id\":\"{sid}\"}}"}},"#,
+                r#""messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            sid = SID
+        ));
+        let on = store::ForwardFlags { sim_billing_only: true, ..all_on() };
+        let sim =
+            crate::proxy::test_support::detect_with(&raw, &crate::proxy::HeaderMap::new(), on)
+                .unwrap();
+        assert!(sim.billing_only);
+        assert_eq!(sim.session_id, SID, "billing-only 沿用客户端自带会话 id");
+        // 关着时走派生：不等于客户端那个原值。
+        let sim_off = crate::proxy::test_support::detect_with(
+            &raw,
+            &crate::proxy::HeaderMap::new(),
+            all_on(),
+        )
+        .unwrap();
+        assert_ne!(sim_off.session_id, SID, "完整模拟按账号派生、不照抄客户端 uuid");
+    }
+
+    /// 修复 3：客户端自带字符串 `fallbacks:"default"` 仍按防 400 归一成官方数组——即便 billing-only。
+    /// （出站头仍会按 body 有 fallbacks 声明 `server-side-fallback` beta，新日期下上游只收数组。）
+    #[test]
+    fn normalizes_client_string_fallback_for_validity() {
+        let raw = Bytes::from_static(
+            concat!(
+                r#"{"model":"claude-fable-5-1","max_tokens":64,"#,
+                r#""fallbacks":"default","#,
+                r#""messages":[{"role":"user","content":"hi"}]}"#
+            )
+            .as_bytes(),
+        );
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            on_flags(),
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        assert!(v["fallbacks"].is_array(), "字符串 default 应归一成数组: {}", v["fallbacks"]);
+        assert_eq!(v["fallbacks"][0]["model"], "claude-opus-5");
+    }
+
+    /// 关着时（默认）走完整官方形态：注入官方工具、补 output_config——证明门控是条件性的、
+    /// 默认行为不变。
+    #[test]
+    fn disabled_falls_back_to_full_sim() {
+        assert!(!all_on().sim_billing_only, "默认停用");
+        let raw = Bytes::from_static(RAW.as_bytes());
+        let sim = detect_for(&raw, all_on()).unwrap();
+        assert!(!sim.billing_only);
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            all_on(),
+            Some(&sim),
+            None,
+        ))
+        .unwrap();
+        let names: Vec<&str> =
+            v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().any(|n| config::CC_TOOL_NAMES.contains(n)), "完整模拟注官方工具");
+        assert!(v.get("output_config").is_some(), "完整模拟补 output_config");
+    }
 }
 
 /// [`inject_cc_tools`] 的身份参数：只进日志，取什么值都不影响这几个用例验的东西。

@@ -127,6 +127,11 @@ pub(super) fn rewrite_body_out(
         global: flags.cache_scope_global && flags.merge_beta,
         ttl_1h: flags.cache_ttl_1h && flags.merge_beta,
     };
+    // `sim_billing_only`：只注 `system[0]` billing header（在 [`simulate_system`] 里），下游所有
+    // 把客户端内容改成官方 CC 形态的整形一律跳过——身份句/基座/第四块/官方工具/metadata/thread/
+    // 顶层重排，以及会动到客户端块的 cap/strip/ttl/eager。防 400 的无损归一照做，换头与 cch 重算
+    // 照旧。`billing_only` 蕴含 `sim.is_some()`，故所有 `sim.is_none()` 门控的步骤本就不触发。
+    let billing_only = sim.is_some_and(|s| s.billing_only);
     // 全关且不模拟：连解析都不必做，原样返回。
     // 额外检查：body 里含 allOf/oneOf/anyOf 或空 text 块时仍需解析（须对应开关开着）。
     // 要补 `fallbacks` 的也不能走这条：调用方已按同一个判断在头上补了 `server-side-fallback`
@@ -193,7 +198,8 @@ pub(super) fn rewrite_body_out(
     // 模拟后末块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
     // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，末块只留
     // 一个短占位，绕过内容检测且不丢失指令语义。
-    let sys_relocated = simulated && sim.is_some_and(|s| relocate_long_client_system(&mut v, s));
+    let sys_relocated =
+        simulated && !billing_only && sim.is_some_and(|s| relocate_long_client_system(&mut v, s));
     // 消息线程指纹按**环境说明插入之前**的 `messages` 算：换了模型族时环境说明从 `role: system`
     // 消息变成用户正文里的提醒块（或反之），插入后的 `fps` 自然就对不上上一轮的记录，但两种
     // 形态对应的是同一段对话——用来访真正发出的那份算指纹，前缀匹配就不被这种形态变化打断。
@@ -204,7 +210,7 @@ pub(super) fn rewrite_body_out(
     // （混淆后的工具名、剥掉了空块），这里不跟着做，客户端原样带回来的那条 assistant 就永远对
     // 不上，每个工具续轮都退回 `create`。见 [`thread_snapshot`]。
     let raw_fps: Vec<crate::proxy::session_link::ThreadMsg> = sim
-        .filter(|_| simulated && flags.sim_message_threads)
+        .filter(|_| simulated && flags.sim_message_threads && !billing_only)
         .and_then(|_| v.get("messages"))
         .map(|m| thread_snapshot(m, tool_names, flags.strip_empty_text))
         .unwrap_or_default();
@@ -212,7 +218,7 @@ pub(super) fn rewrite_body_out(
     // 见 [`insert_env_note`]。跟在挪客户端 system 之后：haiku 那种写法里客户端那块要排在环境各段
     // 之后、日期之前；在补末条断点之前：首轮它就是末条，断点要落在它身上。
     let env_note = match sim {
-        Some(s) if simulated => insert_env_note(&mut v, s, cred.id),
+        Some(s) if simulated && !billing_only => insert_env_note(&mut v, s, cred.id),
         _ => EnvNoted::default(),
     };
     // 换模型那一轮的模型说明：开着 message thread 时交给 [`apply_sim_thread`] 与 `<total_tokens>`
@@ -241,8 +247,9 @@ pub(super) fn rewrite_body_out(
     // 模拟路径下客户端没发 `thinking` 时补上官方默认值。官方 CC 恒带
     // `thinking: {type: "enabled", budget_tokens: N}`，缺了等于自证不是 CC。
     // 放在 `ensure_context_management` 之前：后者依赖 `thinking` 才补 `context_management`。
-    let thinking_filled =
-        flags.inject_thinking && sim.is_some_and(|sim| ensure_thinking(&mut v, sim.profile));
+    let thinking_filled = flags.inject_thinking
+        && !billing_only
+        && sim.is_some_and(|sim| ensure_thinking(&mut v, sim.profile));
     // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 补了 `thinking-display-updates`，
     // body 侧才配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
     // `display_beta` 取自实际发出的头——头上没那项 beta 时体里写 `updates` 是一发稳定 400
@@ -252,17 +259,23 @@ pub(super) fn rewrite_body_out(
         && flags.merge_beta
         && display_beta
         && fill_thinking_display(&mut v);
-    let ctx_mgmt = sim.is_some() && ensure_context_management(&mut v);
+    let ctx_mgmt = sim.is_some() && !billing_only && ensure_context_management(&mut v);
     // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带（模拟路径三族都按 `high`），
     // 按 profile 补（[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
-    let effort_filled = sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
+    let effort_filled =
+        !billing_only && sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
     // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），
     // 见 [`ensure_diagnostics`]。只给带 billing header 的 profile 补——额度探测、标题生成
     // 与安全分类官方都不发这个字段。
-    let diag =
-        sim.is_some_and(|s| s.profile.has_billing_header() && ensure_diagnostics(&mut v, &s.link));
+    let diag = !billing_only
+        && sim
+            .is_some_and(|s| s.profile.has_billing_header() && ensure_diagnostics(&mut v, &s.link));
     // `fallbacks`：调用方给了字面量就补（[`ensure_fallbacks`]）；没给（族开关关着，或学到过
     // 该模型不收）只在模拟路径上把客户端自带的字符串归一成官方数组（[`normalize_fallbacks`]）。
+    // `normalize_fallbacks` 不受 `billing_only` 门控：它是防 400 的无损归一（客户端已带的字符串
+    // `"default"` → 官方数组），和 `tool_choice` 归一同类。billing-only 下出站头仍会按
+    // `body_has_fallbacks` 声明 `server-side-fallback` beta，而新日期 beta 下上游只收数组，留着
+    // 字符串就是一发稳定 400。只有**新增** fallback（`Some(plan)`）才在调用点按 billing-only 置空。
     let fallbacks_shaped = match fallbacks {
         Some(plan) => ensure_fallbacks(&mut v, plan),
         None => sim.is_some_and(|s| normalize_fallbacks(&mut v, s.profile)),
@@ -271,8 +284,9 @@ pub(super) fn rewrite_body_out(
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
     // 只对带 `system` 的 profile 补：额度探测那条官方一个断点都没有（`cap/2.1.260-2/00004`），
     // 给它标一个反倒是新破绽。
-    let msg_shape =
-        sim.is_some_and(|s| s.profile.has_billing_header()) && align_message_shape(&mut v, cache);
+    let msg_shape = !billing_only
+        && sim.is_some_and(|s| s.profile.has_billing_header())
+        && align_message_shape(&mut v, cache);
     // 真 CC 来访 `messages` 里一个断点都没有时也补一个，最小改动、抄客户端自己的 ttl，
     // 见 [`ensure_cc_message_breakpoint`]。额度探测不补（官方那条一个断点都没有）。
     // **只在 tools + system 与上一轮相同时补**（[`cache_prefix_stable`]）：前缀变了，后面的
@@ -337,14 +351,15 @@ pub(super) fn rewrite_body_out(
     // 最前面加一到两块。原先它排在补前缀之前，一条客户端 5 块、没 billing header 的来访
     // （现网 2.1.238，req_ujomarOOPtXL38jx）过了封顶再被补成 6 或 7 块，出站正好超过
     // `MAX_SYSTEM_BLOCKS`，上游按第三方应用计——封顶本来要防的正是这个。
-    let capped = shape && cap_system_blocks(&mut v);
+    let capped = shape && !billing_only && cap_system_blocks(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
     //
     // **只在整形真的成了才补**：`ttl:"1h"` 属于订阅形态，API-key 的三块形态官方
     // 一个 ttl 都不带（`cap/raw/00012`）。整形没做成（比如锚点漂了、`system_shape` 关着）
     // 时 body 还是三块，这时补 ttl 就是把半对齐换了个方向，比不补更糟。
-    let ttl_filled = cache.ttl_1h && (simulated || shaped) && fill_cache_ttl(&mut v);
+    let ttl_filled =
+        cache.ttl_1h && !billing_only && (simulated || shaped) && fill_cache_ttl(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<none>".into()),
         "inbound metadata"
@@ -357,7 +372,10 @@ pub(super) fn rewrite_body_out(
     // `flags.spoof_identity`：用户一旦关掉身份伪装，客户端自己带的 device/account/session
     // 就被删掉、且没人补回来——头上还有会话 id、体里却什么都没有。那既违背这个开关的语义
     // （「别改身份」被执行成了「把身份删了」），也违背客户端数据透传契约。
+    // `billing_only`：`metadata.user_id` 完全原样透传（不剥、不重建、不改身份），客户端自带的
+    // account/device/session 全部保留。
     if sim.is_some()
+        && !billing_only
         && flags.spoof_identity
         && let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut())
     {
@@ -367,9 +385,11 @@ pub(super) fn rewrite_body_out(
         }
     }
     let sim_meta = flags.spoof_identity
+        && !billing_only
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
-    let spoofed =
-        flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
+    let spoofed = flags.spoof_identity
+        && !billing_only
+        && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
     // 客户端自带的那份 user_id 里，会话段要和出站头同值。跟在 [`spoof_identity`] 之后——
     // 那一步刻意保留 session 段，这一步只在「luban 选的和它写的不是一个」时才动它。
     //
@@ -385,12 +405,13 @@ pub(super) fn rewrite_body_out(
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
     // `display` 的去留：来访本来就是 CC 形态，或 `thinking` 整个是刚按官方形态补的，都留。
-    let stripped =
-        flags.strip_extra_fields && strip_extra_fields(&mut v, cc_inbound || thinking_filled);
+    let stripped = flags.strip_extra_fields
+        && !billing_only
+        && strip_extra_fields(&mut v, cc_inbound || thinking_filled);
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
-    let top_level_ordered =
-        sim.is_some_and(|sim| align_cc_top_level_order(&mut v, sim.profile.body_key_order));
+    let top_level_ordered = !billing_only
+        && sim.is_some_and(|sim| align_cc_top_level_order(&mut v, sim.profile.body_key_order));
     // 模拟路径把官方主线程恒带的 14 个真工具（[`cc_tools_core`]）对齐进工具列表：客户端没
     // 声明的补上，声明了的同名工具换成官方那条，其余原样。上游判第三方的信号之一是
     // 「自称 CC 但没有 CC 工具」，光加 mcp__ 前缀不够——零个 CC 工具等于自证不是 CC；而只注
@@ -400,21 +421,23 @@ pub(super) fn rewrite_body_out(
     // **只给主线程 profile 注**：官方的标题生成、安全分类、无工具 helper 与额度探测本来就
     // 一个工具都不发（`tools: []` 或整个字段都没有），给它们塞 Bash 是把一条辅助请求装成
     // 了主线程。判据是 profile，不是「有没有 tools 字段」。
-    let cc_tools_injected = sim.is_some_and(|s| {
-        s.profile.has_billing_header()
-            && inject_cc_tools(
-                &mut v,
-                s.profile,
-                s.fill_absent_tools,
-                s.trim_tools,
-                ToolAlignWho { cred_id: cred.id, cred: &cred.label, session: &s.session_id },
-            )
-    });
+    let cc_tools_injected = !billing_only
+        && sim.is_some_and(|s| {
+            s.profile.has_billing_header()
+                && inject_cc_tools(
+                    &mut v,
+                    s.profile,
+                    s.fill_absent_tools,
+                    s.trim_tools,
+                    ToolAlignWho { cred_id: cred.id, cred: &cred.label, session: &s.session_id },
+                )
+        });
     // 工具声明的 `eager_input_streaming`：跟在注入之后——注入的官方工具资产自带正确取值
     // （opus 那份带、fable 那份不带），这一步只管客户端自己声明、保留下来的那些。条件来源两条
     // 路径不同（真 CC 看来访版本 × 模型 × 用途，模拟看出站 profile），规则共用，见
     // [`eager_tools_wanted`] 与 [`fill_eager_tools`]。
     let eager_filled = flags.eager_tool_streaming
+        && !billing_only
         && eager_tools_wanted(&v, sim, cc_inbound, cc_kind, client.map(|c| c.version), adv_beta)
         && fill_eager_tools(&mut v);
     // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
@@ -433,8 +456,10 @@ pub(super) fn rewrite_body_out(
     // message thread 排在所有改写之后：判「能不能接上上一轮」比的是**最终出站**的历史
     // （工具名已混淆、断点已落位），切增量也得切这一份。见 [`apply_sim_thread`]。
     let threaded = flags.sim_message_threads
+        && !billing_only
         && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps));
     tracing::debug!(
+        billing_only,
         empty_system_dropped,
         system_hoisted,
         simulated,

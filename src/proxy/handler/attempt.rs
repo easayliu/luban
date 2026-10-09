@@ -64,8 +64,12 @@ impl Prepared {
             && !cc_kind.keeps_nonstream()
             && body_json.as_ref().is_some_and(|v| !stream_requested(v));
         // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
-        // 两侧共用同一份。见 [`ToolNameMap`]。
-        let tool_names = (billable && flags.tool_name_mimic)
+        // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 不混淆**：客户端工具原样透传，这里
+        // 直接不建映射，请求侧与所有回程/重试（它们都读这一份）因此一致为空——避免用旧映射把
+        // 错误体 / SSE error 里碰巧匹配假名的内容误改。判据与 [`Simulation::detect`] 同源。
+        let billing_only = flags.sim_billing_only
+            && simulates_cc(body_json.as_ref(), headers, inb.from_cc_client, flags);
+        let tool_names = (billable && flags.tool_name_mimic && !billing_only)
             .then(|| build_tool_name_map(body_json.as_ref()).map(std::sync::Arc::new))
             .flatten();
         if let Some(map) = &tool_names {
@@ -212,9 +216,15 @@ pub(super) async fn prepare<'a>(
     // （客户端带的或 luban 补的），头上就得有 `server-side-fallback`。字符串 `"default"` 在
     // 没计划时原样出站，同样要声明：2026-10-08 实测 2.1.293 fable 形态的头上没有这项时，
     // 上游回 400 `fallbacks: Extra inputs are not permitted`。
+    // `sim_billing_only`：这条请求只注 billing header，不注族 `fallbacks`。在**这里**统一置空
+    // `refusal_fallbacks`，保证请求头的 `server-side-fallback` beta、请求体、重试路径与「从上游学到
+    // 的拒答」用的是同一份状态——否则体里没补、头上却声明了 beta，或被拒后误记成 luban 注入失败
+    // 而写全局禁用规则并重发同一条无效请求。（工具名混淆的置空在 [`Prepared::of`]，那份是
+    // cred 无关、回程也读它。）
+    let billing_only = sim.as_ref().is_some_and(|s| s.billing_only);
     let client_fallbacks = client_supplied_fallbacks(body_json.as_ref());
     let body_has_fallbacks = body_json.as_ref().is_some_and(|v| v.get("fallbacks").is_some());
-    let refusal_fallbacks = if client_fallbacks {
+    let refusal_fallbacks = if client_fallbacks || billing_only {
         None
     } else {
         refusal_fallbacks_for(

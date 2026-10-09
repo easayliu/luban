@@ -548,6 +548,23 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="sim_billing_only"
+          label={t('仅注入 billing 标识', 'Inject billing identifier only')}
+          summary={t(
+            '实验性，默认停用。启用后模拟请求只在 system 首块注入一条最小 billing 标识，不再补身份句、官方基座、第四块、官方工具、metadata/thread 等；客户端自带的 system 块与参数原样透传。',
+            'Experimental, disabled by default. When enabled, emulated requests inject only a minimal billing identifier as the first system block, and skip the identity line, official base prompt, fourth block, official tools, metadata/thread and the rest; the client’s own system blocks and parameters pass through unchanged.',
+          )}
+          requires={simulateRequires}
+          description={
+            <>
+              {t(
+                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，仅防 400 的无损归一照做；换头（官方 UA 等）照常进行。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
+                'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; only lossless normalization that prevents 400s still runs, and header rewriting (official UA, etc.) still applies. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="cch_sim_compute"
           label={t('模拟请求计算计费校验值', 'Compute billing checksum for emulated requests')}
           summary={t(

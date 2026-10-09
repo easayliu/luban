@@ -689,6 +689,7 @@ async fn send_quota_probe(
         context_1m: false,
         fill_absent_tools: false,
         trim_tools: false,
+        billing_only: false,
         usage_limit: false,
         thread: Default::default(),
     };
@@ -800,6 +801,8 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
         fill_absent_tools: true,
         // 连通性探测验的是完整的主线程链路，按官方默认那 14 条发，不跟 `sim_trim_tools`。
         trim_tools: false,
+        // 探测恒走完整形态，不跟 `sim_billing_only`。
+        billing_only: false,
         // 探测是一句新输入，不是工具续轮。
         usage_limit: false,
         thread: Default::default(),

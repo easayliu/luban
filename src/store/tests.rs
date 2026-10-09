@@ -4630,6 +4630,10 @@ fn forward_flags_default_on_and_parse_off() {
         !ForwardFlags::default().opus_refusal_fallback,
         "opus 那档是官方不产生的形态，默认必须是关"
     );
+    assert!(
+        !ForwardFlags::default().sim_billing_only,
+        "仅注 billing header 是实验性形态，默认必须是关"
+    );
 
     // 每个键各用一种「关」的写法，确认逐项独立且解析口径一致。
     for (key, off) in [
@@ -4648,6 +4652,7 @@ fn forward_flags_default_on_and_parse_off() {
         (SIMULATE_FULL_SYSTEM, "0"),
         (FILL_ABSENT_TOOLS, "0"),
         (SIM_TRIM_TOOLS, "0"),
+        (SIM_BILLING_ONLY, "0"),
         (SIM_MESSAGE_THREADS, "0"),
         (FILL_METADATA, "0"),
         (RATE_LIMIT_RETRY, "0"),
@@ -4698,6 +4703,7 @@ fn forward_flags_default_on_and_parse_off() {
             simulate_full_system: false,
             fill_absent_tools: false,
             sim_trim_tools: false,
+            sim_billing_only: false,
             sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
