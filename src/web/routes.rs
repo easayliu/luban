@@ -12,7 +12,8 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/pricing", get(get_pricing))
         .route("/ratio_config", get(get_ratio_config));
 
-    // 需管理鉴权的接口（未设密码时一律 401）。只读访客只能打其中的 GET，见 [`auth::Role`]。
+    // 需登录的接口（未设管理密码时一律 401）。谁能打哪条由中间件按路由判，默认只给 admin，
+    // 见 [`auth::require_login`]。
     let protected = Router::new()
         .route("/authorize", get(authorize))
         .route("/exchange", post(exchange))
@@ -93,7 +94,13 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/auth/password", post(auth::change_password))
         .route("/auth/me", get(auth::me))
         .route("/auth/viewer-password", post(auth::set_viewer_password))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_admin));
+        .route("/auth/logout", post(auth::logout))
+        .route("/users", get(list_users).post(create_user))
+        .route("/users/{id}", delete(delete_user))
+        .route("/users/{id}/password", post(set_user_password))
+        .route("/users/{id}/disabled", post(set_user_disabled))
+        .route("/users/{id}/parent", post(set_user_parent))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_login));
 
     // 失败的请求补一行「哪个方法打了哪条路径、回了几」。错误详情由 `internal`/`bad_request`
     // 各自记，方法与路径它们看不到，只能在这一层补——两行合起来才定位得到一次失败。

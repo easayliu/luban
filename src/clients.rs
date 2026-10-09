@@ -239,6 +239,7 @@ mod tests {
             extra_usage_enabled: None,
             resume_at: None,
             proxy: proxy.map(str::to_string),
+            owner_id: None,
             created_at: 0,
             updated_at: 0,
         }

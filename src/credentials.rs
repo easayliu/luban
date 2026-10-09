@@ -121,6 +121,8 @@ pub struct Credential {
     /// 且日志上看不出来。故取客户端只有 [`crate::clients::ClientPool::for_credential`]
     /// 一个入口，且建不出客户端时报错而不是退回直连。
     pub proxy: Option<String>,
+    /// 号的主人（控制台账号 id，见 [`crate::store::User`]）。存量号迁移时全部挂到 admin 名下。
+    pub owner_id: Option<i64>,
     pub created_at: u64,
     pub updated_at: u64,
 }

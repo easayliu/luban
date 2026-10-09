@@ -12,12 +12,14 @@ pub struct SavedProxy {
 }
 
 impl CredentialStore {
-    /// 列出代理池中所有记录。
-    pub fn list_proxies(&self) -> Result<Vec<SavedProxy>> {
+    /// 列出代理池中 `scope` 看得到的记录（[`Scope::All`] 是全部，否则只有那个人自己的）。
+    pub fn list_proxies(&self, scope: Scope) -> Result<Vec<SavedProxy>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT id, label, url, created_at FROM proxies ORDER BY id ASC")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt = conn.prepare(
+            "SELECT id, label, url, created_at FROM proxies \
+              WHERE ?1 IS NULL OR owner_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([scope.owner()], |row| {
             Ok(SavedProxy {
                 id: row.get(0)?,
                 label: row.get(1)?,
@@ -54,23 +56,27 @@ impl CredentialStore {
         })
     }
 
-    /// 确保代理在池中存在：不在则自动添加（label 取 host:port），已在则忽略。
-    pub fn ensure_proxy_in_pool(&self, url: &str) {
+    /// 确保代理在 `owner` 的池中存在：不在则自动添加（label 取 host:port），已在则忽略。
+    pub fn ensure_proxy_in_pool(&self, owner: i64, url: &str) {
         let conn = self.conn.lock();
         let label = url_to_label(url);
         if let Err(e) = conn.execute(
-            "INSERT OR IGNORE INTO proxies (label, url) VALUES (?1, ?2)",
-            params![label, url],
+            "INSERT OR IGNORE INTO proxies (label, url, owner_id) VALUES (?1, ?2, ?3)",
+            params![label, url, owner],
         ) {
             tracing::debug!(error = %e, url, "ensure_proxy_in_pool: insert ignored");
         }
     }
 
-    /// 添加一条代理到池中，返回新记录。`url` 应已经过 `crate::clients::validate_proxy` 校验。
-    pub fn add_proxy(&self, label: &str, url: &str) -> Result<SavedProxy> {
+    /// 添加一条代理到 `owner` 的池中，返回新记录。`url` 应已经过
+    /// `crate::clients::validate_proxy` 校验。
+    pub fn add_proxy(&self, owner: i64, label: &str, url: &str) -> Result<SavedProxy> {
         let conn = self.conn.lock();
-        conn.execute("INSERT INTO proxies (label, url) VALUES (?1, ?2)", params![label, url])
-            .context("failed to add proxy (the URL may already exist in the pool)")?;
+        conn.execute(
+            "INSERT INTO proxies (label, url, owner_id) VALUES (?1, ?2, ?3)",
+            params![label, url, owner],
+        )
+        .context("failed to add proxy (the URL may already exist in the pool)")?;
         let id = conn.last_insert_rowid();
         conn.query_row(
             "SELECT id, label, url, created_at FROM proxies WHERE id = ?1",
@@ -89,17 +95,22 @@ impl CredentialStore {
 
     /// 批量添加代理，单事务内完成；返回与入参一一对应的结果，地址已在池里（唯一索引撞了）的
     /// 那条是 `None`，不报错也不影响其它条。`url` 应已经过 `crate::clients::validate_proxy` 校验。
-    pub fn add_proxies(&self, items: &[(String, String)]) -> Result<Vec<Option<SavedProxy>>> {
+    pub fn add_proxies(
+        &self,
+        owner: i64,
+        items: &[(String, String)],
+    ) -> Result<Vec<Option<SavedProxy>>> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         let mut out = Vec::with_capacity(items.len());
         {
-            let mut insert =
-                tx.prepare("INSERT OR IGNORE INTO proxies (label, url) VALUES (?1, ?2)")?;
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO proxies (label, url, owner_id) VALUES (?1, ?2, ?3)",
+            )?;
             let mut read =
                 tx.prepare("SELECT id, label, url, created_at FROM proxies WHERE id = ?1")?;
             for (label, url) in items {
-                if insert.execute(params![label, url])? == 0 {
+                if insert.execute(params![label, url, owner])? == 0 {
                     out.push(None);
                     continue;
                 }
@@ -154,15 +165,28 @@ impl CredentialStore {
         Ok(n)
     }
 
-    /// 统计每个代理地址有多少凭证在使用。键是代理 URL，值是使用该 URL 的凭证数量。
-    pub fn proxy_usage_counts(&self) -> Result<HashMap<String, i64>> {
+    /// (主人, URL) → 代理池记录 id，给账号视图标出「用的是池里哪一条」。
+    pub fn proxy_ids_by_owner(&self) -> Result<HashMap<(i64, String), i64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT owner_id, url, id FROM proxies")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, String>(1)?), r.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 统计每个代理地址有多少凭证在使用（只数 `scope` 看得到的号）。键是代理 URL，值是使用
+    /// 该 URL 的凭证数量。
+    pub fn proxy_usage_counts(&self, scope: Scope) -> Result<HashMap<String, i64>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT proxy, COUNT(*) FROM credentials \
-             WHERE proxy IS NOT NULL AND proxy != '' GROUP BY proxy",
+             WHERE proxy IS NOT NULL AND proxy != '' AND (?1 IS NULL OR owner_id = ?1) \
+             GROUP BY proxy",
         )?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([scope.owner()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         let mut out = HashMap::new();
         for r in rows {
             let (url, count) = r?;
@@ -171,15 +195,18 @@ impl CredentialStore {
         Ok(out)
     }
 
-    /// 返回每个代理 URL 对应的使用者标签列表（`proxy_url → [label1, label2, ...]`）。
-    pub fn proxy_usage_labels(&self) -> Result<HashMap<String, Vec<String>>> {
+    /// 返回每个代理 URL 对应的使用者标签列表（`proxy_url → [label1, label2, ...]`），
+    /// 只列 `scope` 看得到的号。
+    pub fn proxy_usage_labels(&self, scope: Scope) -> Result<HashMap<String, Vec<String>>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT proxy, label FROM credentials \
-             WHERE proxy IS NOT NULL AND proxy != '' ORDER BY proxy, label",
+             WHERE proxy IS NOT NULL AND proxy != '' AND (?1 IS NULL OR owner_id = ?1) \
+             ORDER BY proxy, label",
         )?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([scope.owner()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
         for r in rows {
             let (url, label) = r?;

@@ -1,5 +1,14 @@
-use super::{constant_time_eq, percent_decode};
-use axum::http::{HeaderMap, HeaderValue, header};
+// 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
+#![allow(deprecated)]
+use super::constant_time_eq;
+use crate::store::{LEGACY_SHA256_PREFIX, UserRole};
+use axum::{
+    Router,
+    body::Body,
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
+    routing::{get, post},
+};
+use tower::ServiceExt;
 
 fn with_host(host: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -12,343 +21,322 @@ fn test_state() -> crate::web::AppState {
     crate::web::AppState::for_test(store)
 }
 
-/// 走真实中间件：`ConnectInfo` 手动塞进扩展，对应 `into_make_service_with_connect_info`。
-async fn protected_status(
-    state: &crate::web::AppState,
-    peer: &str,
-    host: &str,
-    bearer: Option<&str>,
-) -> axum::http::StatusCode {
-    use axum::{Router, body::Body, extract::ConnectInfo, http::Request, routing::get};
-    use tower::ServiceExt;
-    let app = Router::new()
-        .route("/x", get(|| async { "ok" }))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_admin))
-        .with_state(state.clone());
-    let mut req = Request::builder().uri("/x").header(header::HOST, host);
-    if let Some(pw) = bearer {
-        req = req.header(header::AUTHORIZATION, format!("Bearer {pw}"));
-    }
-    let mut req = req.body(Body::empty()).unwrap();
-    req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
-    app.oneshot(req).await.unwrap().status()
+/// 给 admin 设上密码（直接写哈希，不走 setup）。
+fn set_admin_password(state: &crate::web::AppState, pw: &str) -> i64 {
+    let admin = state.store.admin_user().unwrap();
+    let hash = super::hash_password_blocking(pw).unwrap();
+    state.store.set_user_password_hash(admin.id, &hash, None).unwrap();
+    admin.id
 }
 
-/// 未设密码一律拒，本机也不放行——同机 nginx 默认把 `Host` 改写成 `127.0.0.1:4600`，
-/// 转进来的外部请求与本机直连长得一模一样。
-#[tokio::test]
-async fn unset_password_rejects_every_request() {
-    use axum::http::StatusCode;
-    let state = test_state();
-    for (peer, host) in [
-        ("127.0.0.1:5000", "127.0.0.1:4600"),
-        ("[::1]:5000", "localhost:4600"),
-        ("172.17.0.1:5000", "luban.example"),
-    ] {
-        let status = protected_status(&state, peer, host, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{peer} / {host}");
-    }
-
-    // 设了密码之后带对了才能进，本机远程一个口径。
-    state.store.set_setting(crate::store::ADMIN_PASSWORD, &super::sha256_hex("pw1234")).unwrap();
-    let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", None).await;
-    assert_eq!(local, StatusCode::UNAUTHORIZED);
-    let local = protected_status(&state, "127.0.0.1:5000", "127.0.0.1:4600", Some("pw1234")).await;
-    assert_eq!(local, StatusCode::OK);
-    let remote = protected_status(&state, "172.17.0.1:5000", "luban.example", Some("pw1234")).await;
-    assert_eq!(remote, StatusCode::OK);
+/// 给某个账号签一个会话（指纹按它此刻的密码算），回 token 明文。
+fn session_for(state: &crate::web::AppState, user_id: i64) -> String {
+    let user = state.store.user_by_id(user_id).unwrap().unwrap();
+    let hash = state.store.user_password_hash(user_id).unwrap().unwrap_or_default();
+    let verified =
+        super::Verified { tag: super::password_tag(state, user.role, &hash), expected_hash: None };
+    super::issue_session(state, user_id, &verified).unwrap().unwrap()
 }
 
-/// 访客只能打 GET，且 `/export`、`/authorize` 也不给；挂在 `/api` 下走 `MatchedPath`，
-/// 与真实装配一致。
-#[tokio::test]
-async fn viewer_is_read_only() {
-    use axum::{
-        Extension, Router,
-        body::Body,
-        extract::ConnectInfo,
-        http::{Request, StatusCode},
-        routing::get,
-    };
-    use tower::ServiceExt;
-    let state = test_state();
-    set_passwords(&state, "admin-pw", "viewer-pw");
-    let role = |Extension(r): Extension<super::Role>| async move { format!("{r:?}") };
-    let app = Router::new().nest(
+fn create(state: &crate::web::AppState, name: &str, role: UserRole, parent: i64) -> i64 {
+    let hash = super::hash_password_blocking("pw1234").unwrap();
+    state.store.create_user(name, &hash, role, parent).unwrap().unwrap().id
+}
+
+fn add_cred(state: &crate::web::AppState, owner: i64, rt: &str) -> i64 {
+    state.store.insert(rt, None, "at", rt, u64::MAX, None, None, owner).unwrap().id
+}
+
+/// 与真实装配同形的路由（挂在 `/api` 下走 `MatchedPath`），handler 回当前身份。
+fn app(state: &crate::web::AppState) -> Router {
+    let who =
+        |axum::Extension(a): axum::Extension<super::Actor>| async move { format!("{:?}", a.role) };
+    Router::new().nest(
         "/api",
         Router::new()
-            .route("/credentials", get(role).post(role))
-            .route("/credentials/{id}", get(role).delete(role))
-            .route("/export", get(role))
-            .route("/authorize", get(role))
-            .route("/settings", get(role))
-            .route(
-                "/leak",
-                get(|| async { r#"{"ban_reason":"invalid proxy URL: http://u:secret@h:0"}"# }),
-            )
-            .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_admin))
+            .route("/credentials", get(who))
+            .route("/credentials/disabled", post(who))
+            .route("/credentials/{id}/label", post(who))
+            .route("/credentials/{id}/usage", get(who))
+            .route("/proxies/{id}", post(who))
+            .route("/proxies/delete", post(who))
+            .route("/ban-events/{id}/logs", get(who))
+            .route("/settings", get(who))
+            .route("/settings/forwarding", post(who))
+            .route("/export", get(who))
+            .route("/users", get(who).post(who))
+            .route("/auth/me", get(who))
+            .route("/auth/logout", post(who))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_login))
             .with_state(state.clone()),
-    );
-    let call = |method: &str, uri: &str, pw: &str| {
-        let mut req = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {pw}"))
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo("127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap()));
-        let app = app.clone();
-        async move { app.oneshot(req).await.unwrap().status() }
-    };
-    for (method, uri) in [
-        ("GET", "/api/credentials"),
-        ("POST", "/api/credentials"),
-        ("DELETE", "/api/credentials/1"),
-        ("GET", "/api/export"),
-        ("GET", "/api/authorize"),
-    ] {
-        assert_eq!(call(method, uri, "admin-pw").await, StatusCode::OK, "admin {method} {uri}");
-    }
-    assert_eq!(call("GET", "/api/credentials", "viewer-pw").await, StatusCode::OK);
-    assert_eq!(call("GET", "/api/credentials/1", "viewer-pw").await, StatusCode::OK);
-    for (method, uri) in [
-        ("POST", "/api/credentials"),
-        ("DELETE", "/api/credentials/1"),
-        ("GET", "/api/export"),
-        ("GET", "/api/authorize"),
-        ("GET", "/api/settings"),
-    ] {
-        assert_eq!(
-            call(method, uri, "viewer-pw").await,
-            StatusCode::FORBIDDEN,
-            "viewer {method} {uri}"
-        );
-    }
-    // 网页端会对密码做 encodeURIComponent，访客也要认得出。
-    assert_eq!(call("GET", "/api/credentials", "viewer%2Dpw").await, StatusCode::OK);
-    assert_eq!(call("GET", "/api/credentials", "nope").await, StatusCode::UNAUTHORIZED);
-
-    // 响应体里不论哪个字段带了代理密码，访客拿到的都是打过码的，管理员原样。
-    let body = |pw: &str| {
-        let mut req = Request::builder()
-            .uri("/api/leak")
-            .header(header::AUTHORIZATION, format!("Bearer {pw}"))
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo("127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap()));
-        let app = app.clone();
-        async move {
-            let resp = app.oneshot(req).await.unwrap();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-            String::from_utf8(bytes.to_vec()).unwrap()
-        }
-    };
-    assert!(body("viewer-pw").await.contains("http://u:***@h:0"));
-    assert!(body("admin-pw").await.contains("http://u:secret@h:0"));
-
-    // 管理密码清掉后访客密码不再起作用：未设管理密码时一律 401。
-    state.store.delete_setting(crate::store::ADMIN_PASSWORD).unwrap();
-    assert_eq!(call("GET", "/api/credentials", "viewer-pw").await, StatusCode::UNAUTHORIZED);
+    )
 }
 
-/// 按网页端的写法落两个密码：哈希与规范形都写上。
-fn set_passwords(state: &crate::web::AppState, admin: &str, viewer: &str) {
-    use crate::store::{
-        ADMIN_PASSWORD, ADMIN_PASSWORD_CANONICAL, VIEWER_PASSWORD, VIEWER_PASSWORD_CANONICAL,
-    };
-    for (k, v) in [
-        (ADMIN_PASSWORD, super::sha256_hex(admin)),
-        (ADMIN_PASSWORD_CANONICAL, super::canonical_hash(admin)),
-        (VIEWER_PASSWORD, super::sha256_hex(viewer)),
-        (VIEWER_PASSWORD_CANONICAL, super::canonical_hash(viewer)),
-    ] {
-        state.store.set_setting(k, &v).unwrap();
+async fn call(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    body: &str,
+) -> StatusCode {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
     }
+    let req =
+        req.header(header::CONTENT_TYPE, "application/json").body(Body::from(body.to_owned()));
+    app.clone().oneshot(req.unwrap()).await.unwrap().status()
 }
 
-fn bearer_headers(pw: &str) -> HeaderMap {
-    let mut h = with_host("127.0.0.1:4600");
-    h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {pw}")).unwrap());
-    h
-}
-
-/// 两个密码能经编码 / 解码互相得到时，知道访客密码就能拼出管理密码（`pass word` →
-/// `pass%20word` → 请求头 `pass%2520word` 解码一次即管理密码）。两个方向、多层编码，
-/// 设置时一律拒。
+/// 未设密码一律拒，带什么都不行；设了之后只认会话 token，老的「密码当 Bearer」不再认。
 #[tokio::test]
-async fn encoded_collisions_are_rejected_in_both_directions() {
-    use axum::{
-        Json,
-        extract::{ConnectInfo, State},
-    };
+async fn unset_password_rejects_and_only_sessions_are_accepted() {
     let state = test_state();
-    let peer: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
-    super::set_admin_password(&state, "pass%20word").unwrap();
-    // 管理员网页端带的是 encodeURIComponent('pass%20word')。
-    let admin_header = bearer_headers("pass%2520word");
-    let set_viewer = |pw: &str| {
-        super::set_viewer_password(
-            State(state.clone()),
-            ConnectInfo(peer),
-            admin_header.clone(),
-            Json(super::PwReq { password: pw.into() }),
-        )
-    };
-    for pw in ["pass word", "pass%20word", "pass%2520word", "pass%252520word", "pass%20%77ord"] {
-        let err = set_viewer(pw).await.unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "viewer {pw:?} 应被拒");
-    }
-    set_viewer("pass words").await.expect("规范形不同的可以设");
-
-    // 反过来：访客密码先在，改管理密码时同样两个方向都拒。
-    let change = |pw: &str| {
-        super::change_password(
-            State(state.clone()),
-            ConnectInfo(peer),
-            admin_header.clone(),
-            Json(super::PwReq { password: pw.into() }),
-        )
-    };
-    for pw in ["pass words", "pass%20words", "pass%2520words"] {
-        let err = change(pw).await.unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "admin {pw:?} 应被拒");
-    }
-}
-
-/// 绕过设置校验硬塞进库的冲突组合（或环境变量配成这样）：访客密码不生效，访客构造的
-/// 请求头既认不成访客、更认不成管理员。
-#[tokio::test]
-async fn colliding_viewer_password_is_inactive() {
-    use super::{Role, role_of_bearer};
-    let state = test_state();
-    set_passwords(&state, "pass%20word", "pass word");
-    let admin = super::sha256_hex("pass%20word");
+    let app = app(&state);
+    let admin = state.store.admin_user().unwrap();
+    // 未设密码时连有效会话也不放（清除管理密码后残留的会话）。
+    let stale = session_for(&state, admin.id);
     assert_eq!(
-        role_of_bearer(&state, &admin, "pass%20word"),
-        Some(Role::Admin),
-        "管理员脚本带原文"
+        call(&app, Method::GET, "/api/credentials", Some(&stale), "").await,
+        StatusCode::UNAUTHORIZED
     );
-    assert_eq!(role_of_bearer(&state, &admin, "pass%2520word"), Some(Role::Admin), "管理员网页端");
-    assert_eq!(role_of_bearer(&state, &admin, "pass word"), None, "访客密码不生效");
-    assert!(super::viewer_hash(&state).is_none());
+    assert_eq!(
+        call(&app, Method::GET, "/api/credentials", None, "").await,
+        StatusCode::UNAUTHORIZED
+    );
 
-    // 管理密码是访客密码编码 9 层：照样判成冲突、访客不生效，再套一层的请求头只认得出管理员。
-    let mut admin9 = "pass word".to_owned();
-    for _ in 0..9 {
-        admin9 = admin9.replace('%', "%25").replace(' ', "%20");
-    }
-    set_passwords(&state, &admin9, "pass word");
-    assert!(super::viewer_hash(&state).is_none());
-    let h = super::sha256_hex(&admin9);
-    assert_eq!(role_of_bearer(&state, &h, "pass word"), None);
+    set_admin_password(&state, "pw1234");
+    assert_eq!(
+        call(&app, Method::GET, "/api/credentials", Some("pw1234"), "").await,
+        StatusCode::UNAUTHORIZED,
+        "密码本身不能当 Bearer 用"
+    );
+    let token = session_for(&state, admin.id);
+    assert_eq!(call(&app, Method::GET, "/api/credentials", Some(&token), "").await, StatusCode::OK);
+    assert_eq!(
+        call(&app, Method::GET, "/api/credentials", Some("nope"), "").await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
-/// 升级前存进库的管理密码没有规范形：访客密码先不生效，管理员带密码访问一次补上之后才生效。
+/// 代理和用户：只给列出的路由，落在别人的号 / 代理上的回 404；默认只给 admin。
 #[tokio::test]
-async fn legacy_admin_hash_gets_its_canonical_form_backfilled() {
-    use axum::{
-        Router,
-        body::Body,
-        extract::ConnectInfo,
-        http::{Request, StatusCode},
-        routing::get,
-    };
-    use tower::ServiceExt;
-    let mut state = test_state();
-    state.viewer_env = Some(std::sync::Arc::new("viewer-pw".into()));
-    state.store.set_setting(crate::store::ADMIN_PASSWORD, &super::sha256_hex("admin-pw")).unwrap();
-    let app = Router::new()
-        .route("/x", get(|| async { "ok" }))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_admin))
-        .with_state(state.clone());
-    let call = |pw: &str| {
-        let mut req = Request::builder()
-            .uri("/x")
-            .header(header::AUTHORIZATION, format!("Bearer {pw}"))
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo("127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap()));
-        let app = app.clone();
-        async move { app.oneshot(req).await.unwrap().status() }
-    };
-    assert_eq!(call("viewer-pw").await, StatusCode::UNAUTHORIZED, "规范形未知，访客先不认");
-    assert_eq!(call("admin-pw").await, StatusCode::OK);
-    assert_eq!(call("viewer-pw").await, StatusCode::OK, "管理员访问过一次后访客生效");
-}
-
-/// 请求用旧密码通过了鉴权、补存规范形却落在改密码之后：不能拿旧密码的规范形盖掉新的。
-#[test]
-fn stale_backfill_never_overwrites_the_new_canonical() {
+async fn members_are_scoped_to_their_own_things() {
     let state = test_state();
-    state.store.set_setting(crate::store::ADMIN_PASSWORD, &super::sha256_hex("old-pw")).unwrap();
-    super::set_admin_password(&state, "new-pw").unwrap();
-    super::backfill_admin_canonical(&state, "old-pw");
-    assert_eq!(super::admin_canonical(&state), Some(super::canonical_hash("new-pw")));
-    // 规范形缺着、但哈希已不是这个明文：同样不补。
-    state.store.delete_setting(crate::store::ADMIN_PASSWORD_CANONICAL).unwrap();
-    super::backfill_admin_canonical(&state, "old-pw");
-    assert_eq!(super::admin_canonical(&state), None);
-    super::backfill_admin_canonical(&state, "new-pw");
-    assert_eq!(super::admin_canonical(&state), Some(super::canonical_hash("new-pw")));
+    let admin_id = set_admin_password(&state, "pw1234");
+    let app = app(&state);
+    let agent = create(&state, "agent1", UserRole::Agent, admin_id);
+    let user = create(&state, "user1", UserRole::User, agent);
+    let mine = add_cred(&state, agent, "r-agent");
+    let theirs = add_cred(&state, user, "r-user");
+    let admins = add_cred(&state, admin_id, "r-admin");
+    let my_proxy = state.store.add_proxy(agent, "p", "http://h:1").unwrap().id;
+    let admin_proxy = state.store.add_proxy(admin_id, "p", "http://h:1").unwrap().id;
+    let a = session_for(&state, agent);
+    let u = session_for(&state, user);
+
+    let s = |m: Method, uri: String, tok: &str, body: String| {
+        let app = app.clone();
+        let tok = tok.to_owned();
+        async move { call(&app, m, &uri, Some(&tok), &body).await }
+    };
+    // 默认只给 admin。
+    assert_eq!(
+        s(Method::GET, "/api/settings".into(), &a, String::new()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s(Method::POST, "/api/settings/forwarding".into(), &a, String::new()).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s(Method::GET, "/api/export".into(), &u, String::new()).await,
+        StatusCode::FORBIDDEN
+    );
+    // 自己的号放行，别人的（下属的、admin 的）一律 404。
+    assert_eq!(
+        s(Method::POST, format!("/api/credentials/{mine}/label"), &a, "{}".into()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s(Method::GET, format!("/api/credentials/{theirs}/usage"), &a, String::new()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s(Method::POST, format!("/api/credentials/{admins}/label"), &u, "{}".into()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s(Method::GET, "/api/credentials/99999/usage".into(), &a, String::new()).await,
+        StatusCode::NOT_FOUND
+    );
+    // 批量接口按 body 里的 ids 核对，混进一个别人的就整批拒。
+    let body = |ids: &[i64]| format!(r#"{{"ids":{ids:?},"disabled":true}}"#);
+    assert_eq!(
+        s(Method::POST, "/api/credentials/disabled".into(), &a, body(&[mine])).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s(Method::POST, "/api/credentials/disabled".into(), &a, body(&[mine, theirs])).await,
+        StatusCode::NOT_FOUND
+    );
+    // 出口代理同理。
+    assert_eq!(
+        s(Method::POST, format!("/api/proxies/{my_proxy}"), &a, "{}".into()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s(Method::POST, format!("/api/proxies/{admin_proxy}"), &a, "{}".into()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s(Method::POST, "/api/proxies/delete".into(), &a, format!(r#"{{"ids":[{admin_proxy}]}}"#))
+            .await,
+        StatusCode::NOT_FOUND
+    );
+    // 封号事件按它落在的号核对归属。
+    let ban = |cred: i64| {
+        state.store.mark_banned(cred, "test").unwrap();
+        state.store.list_ban_events(Some(cred), 1).unwrap()[0].id
+    };
+    let (my_ban, their_ban) = (ban(mine), ban(theirs));
+    assert_eq!(
+        s(Method::GET, format!("/api/ban-events/{my_ban}/logs"), &a, String::new()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s(Method::GET, format!("/api/ban-events/{their_ban}/logs"), &a, String::new()).await,
+        StatusCode::NOT_FOUND
+    );
+    // 用户管理：代理能进，用户不能。
+    assert_eq!(s(Method::GET, "/api/users".into(), &a, String::new()).await, StatusCode::OK);
+    assert_eq!(s(Method::GET, "/api/users".into(), &u, String::new()).await, StatusCode::FORBIDDEN);
+    assert_eq!(s(Method::GET, "/api/auth/me".into(), &u, String::new()).await, StatusCode::OK);
 }
 
-/// 两个访客密码来回并发地写：无论怎么交错，最后库里的哈希与规范形属于同一个密码。
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_viewer_updates_keep_hash_and_canonical_paired() {
+/// 访客只能打 GET，`/export`、`/users` 也不给；admin 全部放行。
+#[tokio::test]
+async fn viewer_is_read_only_and_admin_sees_everything() {
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    let app = app(&state);
+    state.store.upsert_viewer(&super::hash_password_blocking("view-pw").unwrap()).unwrap();
+    let viewer = state.store.viewer_user().unwrap().unwrap();
+    let v = session_for(&state, viewer.id);
+    let ad = session_for(&state, admin_id);
+    let user = create(&state, "user1", UserRole::User, admin_id);
+    let theirs = add_cred(&state, user, "r-user");
+
+    assert_eq!(call(&app, Method::GET, "/api/credentials", Some(&v), "").await, StatusCode::OK);
+    assert_eq!(call(&app, Method::GET, "/api/settings", Some(&v), "").await, StatusCode::FORBIDDEN);
+    assert_eq!(call(&app, Method::GET, "/api/export", Some(&v), "").await, StatusCode::FORBIDDEN);
+    assert_eq!(call(&app, Method::GET, "/api/users", Some(&v), "").await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        call(&app, Method::POST, &format!("/api/credentials/{theirs}/label"), Some(&v), "{}").await,
+        StatusCode::FORBIDDEN
+    );
+    for (m, uri) in [
+        (Method::GET, "/api/settings".to_string()),
+        (Method::GET, "/api/export".to_string()),
+        (Method::POST, format!("/api/credentials/{theirs}/label")),
+        (Method::GET, "/api/users".to_string()),
+    ] {
+        assert_eq!(call(&app, m, &uri, Some(&ad), "{}").await, StatusCode::OK, "{uri}");
+    }
+    // 清掉访客：它的会话随即失效。
+    state.store.delete_viewer().unwrap();
+    assert_eq!(
+        call(&app, Method::GET, "/api/credentials", Some(&v), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// 停代理连带它名下的用户：会话失效、登录被拒、名下的号不接流量。
+#[tokio::test]
+async fn disabling_an_agent_disables_its_branch() {
     use axum::{
         Json,
         extract::{ConnectInfo, State},
     };
     let state = test_state();
-    super::set_admin_password(&state, "admin-pw").unwrap();
-    let peer: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
-    for round in 0..50 {
-        let tasks: Vec<_> = ["viewer-a", "viewer-b"]
-            .into_iter()
-            .cycle()
-            .take(8)
-            .map(|pw| {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    super::set_viewer_password(
-                        State(state),
-                        ConnectInfo(peer),
-                        bearer_headers("admin-pw"),
-                        Json(super::PwReq { password: pw.into() }),
-                    )
-                    .await
-                    .unwrap();
-                })
-            })
-            .collect();
-        for t in tasks {
-            t.await.unwrap();
-        }
-        let hash = super::configured_viewer_hash(&state).unwrap();
-        let pw =
-            ["viewer-a", "viewer-b"].into_iter().find(|p| super::sha256_hex(p) == hash).unwrap();
-        assert_eq!(
-            super::viewer_canonical(&state),
-            Some(super::canonical_hash(pw)),
-            "round {round}"
-        );
-    }
+    let admin_id = set_admin_password(&state, "pw1234");
+    let app = app(&state);
+    let agent = create(&state, "agent1", UserRole::Agent, admin_id);
+    let user = create(&state, "user1", UserRole::User, agent);
+    let cred = add_cred(&state, user, "r-user");
+    let u = session_for(&state, user);
+    assert_eq!(call(&app, Method::GET, "/api/credentials", Some(&u), "").await, StatusCode::OK);
+
+    state.store.set_user_disabled(agent, true, None).unwrap();
+    assert_eq!(
+        call(&app, Method::GET, "/api/credentials", Some(&u), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+    let login = super::login(
+        State(state.clone()),
+        ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+        with_host("127.0.0.1:4600"),
+        Json(super::LoginReq { username: "user1".into(), password: "pw1234".into() }),
+    )
+    .await;
+    assert_eq!(login.err().map(|e| e.0), Some(StatusCode::FORBIDDEN));
+
+    let sel = crate::store::Select::default();
+    assert!(state.store.select_for_device(sel).is_err(), "号主停用后这个号不接流量");
+    state.store.set_user_disabled(agent, false, None).unwrap();
+    let sel = crate::store::Select::default();
+    assert_eq!(state.store.select_for_device(sel).unwrap().id, cred);
 }
 
-#[test]
-fn canonical_decodes_every_layer() {
-    assert_eq!(super::canonical("pass%252520word"), "pass word");
-    // 层数多少都解到底：编码 20 层的与原文同一规范形。
-    let mut deep = "pass word".to_owned();
-    for _ in 0..20 {
-        deep = deep.replace('%', "%25").replace(' ', "%20");
+/// 旧版 settings 里的无盐 sha256 迁移进 users，登录校验通过后换成 argon2。
+#[tokio::test]
+async fn legacy_admin_hash_logs_in_and_gets_upgraded() {
+    use axum::{
+        Json,
+        extract::{ConnectInfo, State},
+    };
+    let state = test_state();
+    let admin = state.store.admin_user().unwrap();
+    let legacy = format!("{LEGACY_SHA256_PREFIX}{}", super::sha256_hex("old-pw"));
+    state.store.set_user_password_hash(admin.id, &legacy, None).unwrap();
+    let login = |pw: &str| {
+        super::login(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+            with_host("127.0.0.1:4600"),
+            Json(super::LoginReq { username: "ADMIN".into(), password: pw.into() }),
+        )
+    };
+    assert_eq!(login("wrong").await.err().map(|e| e.0), Some(StatusCode::UNAUTHORIZED));
+    let ok = login("old-pw").await.expect("旧哈希应能登录（用户名不区分大小写）");
+    assert_eq!(ok.0.role, UserRole::Admin);
+    let stored = state.store.user_password_hash(admin.id).unwrap().unwrap();
+    assert!(stored.starts_with("$argon2id$"), "登录后应换成 argon2：{stored}");
+    let _ = login("old-pw").await.expect("换成 argon2 后照样能登录");
+}
+
+/// 同一用户名连续失败到上限后，窗口内对的密码也回 429。
+#[tokio::test]
+async fn repeated_failures_lock_the_username() {
+    use axum::{
+        Json,
+        extract::{ConnectInfo, State},
+    };
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    create(&state, "locked-user", UserRole::User, admin_id);
+    let login = |pw: &str| {
+        super::login(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+            with_host("127.0.0.1:4600"),
+            Json(super::LoginReq { username: "locked-user".into(), password: pw.into() }),
+        )
+    };
+    for _ in 0..super::LOGIN_FAIL_MAX {
+        assert_eq!(login("bad").await.err().map(|e| e.0), Some(StatusCode::UNAUTHORIZED));
     }
-    assert_eq!(super::canonical(&deep), "pass word");
-    assert_eq!(super::canonical(" plain "), "plain");
-    assert_eq!(super::canonical("100%"), "100%");
+    assert_eq!(login("pw1234").await.err().map(|e| e.0), Some(StatusCode::TOO_MANY_REQUESTS));
 }
 
 #[test]
@@ -384,7 +372,6 @@ async fn setup_requires_the_token_even_from_loopback() {
     use axum::{
         Json,
         extract::{ConnectInfo, State},
-        http::StatusCode,
     };
     let state = test_state();
     let setup = |peer: &str, token: Option<&str>, password: &str| {
@@ -396,24 +383,25 @@ async fn setup_requires_the_token_even_from_loopback() {
         )
     };
     let lo = "127.0.0.1:5000";
-    assert_eq!(setup(lo, None, "pw1234").await.unwrap_err().0, StatusCode::FORBIDDEN);
-    assert_eq!(setup(lo, Some("wrong"), "pw1234").await.unwrap_err().0, StatusCode::FORBIDDEN);
+    assert_eq!(setup(lo, None, "pw1234").await.err().unwrap().0, StatusCode::FORBIDDEN);
+    assert_eq!(setup(lo, Some("wrong"), "pw1234").await.err().unwrap().0, StatusCode::FORBIDDEN);
     let token = state.setup_token.to_string();
     assert_eq!(
-        setup(lo, Some(&token), "pw").await.unwrap_err().0,
+        setup(lo, Some(&token), "pw").await.err().unwrap().0,
         StatusCode::BAD_REQUEST,
         "口令对、密码太短"
     );
     assert!(!super::admin_configured(&state), "失败的请求不能落库");
 
-    let _ = setup("172.17.0.1:5000", Some(&format!(" {token} ")), "pw1234")
+    let resp = setup("172.17.0.1:5000", Some(&format!(" {token} ")), "pw1234")
         .await
         .expect("带对口令应能设密码（首尾空白忽略）");
     assert!(super::admin_configured(&state));
+    assert!(!resp.0.token.is_empty(), "设完密码直接登录");
 
     // 设过之后：带不带口令都回「已设置」，而不是一句口令不对。
     for t in [None, Some(token.as_str())] {
-        let again = setup(lo, t, "pw5678").await.unwrap_err();
+        let again = setup(lo, t, "pw5678").await.err().unwrap();
         assert_eq!(again.0, StatusCode::BAD_REQUEST, "设过之后不能再用 setup 覆盖");
         assert_eq!(again.1, "an admin password is already set");
     }
@@ -427,12 +415,147 @@ fn constant_time_eq_basics() {
     assert!(!constant_time_eq(b"", b"a"));
 }
 
+/// 会话绑定密码指纹：改了密码、环境变量里的密码换了或撤了，旧会话都失效；访客能退出登录。
+#[tokio::test]
+async fn sessions_die_with_the_password_they_were_issued_under() {
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    let user = create(&state, "user1", UserRole::User, admin_id);
+    let tok = session_for(&state, user);
+    let main = app(&state);
+    assert_eq!(call(&main, Method::GET, "/api/auth/me", Some(&tok), "").await, StatusCode::OK);
+    // 库里的密码被重置（哪怕会话没被显式删掉），指纹对不上即失效。
+    let hash = super::hash_password_blocking("new-pw").unwrap();
+    state.store.set_user_password_hash(user, &hash, None).unwrap();
+    assert_eq!(
+        call(&main, Method::GET, "/api/auth/me", Some(&tok), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 环境变量接管的管理密码换掉之后，按旧环境密码签的会话失效。
+    let mut env_a = state.clone();
+    env_a.admin_env = Some(std::sync::Arc::new("env-a".into()));
+    super::sync_env_accounts(&env_a);
+    let admin_tok = session_for(&env_a, admin_id);
+    // 库里只落环境密码的 argon2 哈希与版本号，会话指纹只是版本号。
+    let stored = state.store.get_setting(crate::store::ADMIN_ENV_PASSWORD_HASH).unwrap().unwrap();
+    assert!(stored.starts_with("$argon2id$"), "{stored}");
+    assert_eq!(super::password_tag(&env_a, UserRole::Admin, ""), "env:v1");
+    assert_eq!(
+        call(&app(&env_a), Method::GET, "/api/auth/me", Some(&admin_tok), "").await,
+        StatusCode::OK
+    );
+    let mut env_b = state.clone();
+    env_b.admin_env = Some(std::sync::Arc::new("env-b".into()));
+    super::sync_env_accounts(&env_b);
+    assert_eq!(
+        call(&app(&env_b), Method::GET, "/api/auth/me", Some(&admin_tok), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 撤掉访客的环境密码后，旧访客会话失效。
+    let mut with_viewer = state.clone();
+    with_viewer.viewer_env = Some(std::sync::Arc::new("view-env".into()));
+    super::sync_env_accounts(&with_viewer);
+    let viewer = state.store.viewer_user().unwrap().unwrap();
+    let v = session_for(&with_viewer, viewer.id);
+    let vapp = app(&with_viewer);
+    assert_eq!(call(&vapp, Method::GET, "/api/credentials", Some(&v), "").await, StatusCode::OK);
+    assert_eq!(
+        call(&app(&state), Method::GET, "/api/credentials", Some(&v), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 访客退出登录（POST）放行，退出后会话即失效。
+    let v2 = session_for(&with_viewer, viewer.id);
+    assert_eq!(call(&vapp, Method::POST, "/api/auth/logout", Some(&v2), "").await, StatusCode::OK);
+}
+
+/// 校验到签发之间密码被改了：按旧哈希核对的签发不落会话。
 #[test]
-fn percent_decode_matches_encode_uri_component() {
-    // encodeURIComponent('密码é%') === '%E5%AF%86%E7%A0%81%C3%A9%25'
-    assert_eq!(percent_decode("%E5%AF%86%E7%A0%81%C3%A9%25").as_deref(), Some("密码é%"));
-    assert_eq!(percent_decode("plain"), None);
-    assert_eq!(percent_decode("%zz"), None);
-    assert_eq!(percent_decode("%+1"), None);
-    assert_eq!(percent_decode("abc%2"), None);
+fn session_is_not_issued_against_a_stale_password_hash() {
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    let stale = state.store.user_password_hash(admin_id).unwrap().unwrap();
+    let verified = super::Verified {
+        tag: super::password_tag(&state, UserRole::Admin, &stale),
+        expected_hash: Some(stale),
+    };
+    set_admin_password(&state, "changed");
+    assert!(super::issue_session(&state, admin_id, &verified).unwrap().is_none());
+}
+
+/// 超长用户名在入口就拒，不进失败计数表。
+#[tokio::test]
+async fn overlong_usernames_are_rejected_without_being_tracked() {
+    use axum::{
+        Json,
+        extract::{ConnectInfo, State},
+    };
+    let state = test_state();
+    set_admin_password(&state, "pw1234");
+    let name = "x".repeat(super::MAX_LOGIN_USERNAME_LEN + 1);
+    let resp = super::login(
+        State(state.clone()),
+        ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+        with_host("127.0.0.1:4600"),
+        Json(super::LoginReq { username: name.clone(), password: "x".into() }),
+    )
+    .await;
+    assert_eq!(resp.err().map(|e| e.0), Some(StatusCode::UNAUTHORIZED));
+    let guard = super::LOGIN_GUARD.lock();
+    assert!(!guard.known.contains_key(&name) && !guard.unknown.contains_key(&name));
+}
+
+/// 并发登录：名额在校验密码之前预占，同时涌进来 20 个错密码请求，只有 10 个进得了校验。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_logins_cannot_exceed_the_attempt_budget() {
+    use axum::{
+        Json,
+        extract::{ConnectInfo, State},
+    };
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    create(&state, "burst-user", UserRole::User, admin_id);
+    let tasks: Vec<_> = (0..20)
+        .map(|_| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                super::login(
+                    State(state),
+                    ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+                    with_host("127.0.0.1:4600"),
+                    Json(super::LoginReq { username: "burst-user".into(), password: "bad".into() }),
+                )
+                .await
+                .err()
+                .map(|e| e.0)
+            })
+        })
+        .collect();
+    let mut unauthorized = 0;
+    let mut throttled = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Some(StatusCode::UNAUTHORIZED) => unauthorized += 1,
+            Some(StatusCode::TOO_MANY_REQUESTS) => throttled += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((unauthorized, throttled), (super::LOGIN_FAIL_MAX as usize, 10));
+}
+
+/// 不存在的用户名再多也挤不掉真实账号的锁定记录；不存在的那张表满了只淘汰没锁住的。
+#[test]
+fn unknown_username_flood_cannot_unlock_a_real_account() {
+    let key = "flood-target-admin";
+    for _ in 0..super::LOGIN_FAIL_MAX {
+        assert!(super::reserve_login_attempt(key, true));
+    }
+    assert!(!super::reserve_login_attempt(key, true));
+    for i in 0..super::LOGIN_UNKNOWN_CAPACITY + 50 {
+        super::reserve_login_attempt(&format!("flood-nobody-{i}"), false);
+    }
+    assert!(!super::reserve_login_attempt(key, true), "真实账号的锁定不能被挤掉");
+    assert!(super::LOGIN_GUARD.lock().unknown.len() <= super::LOGIN_UNKNOWN_CAPACITY);
 }

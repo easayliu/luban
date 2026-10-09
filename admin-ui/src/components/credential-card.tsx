@@ -47,6 +47,7 @@ import {
   useCredentialActions,
   type QuotaLevel,
   type QuotaWindowMeta,
+  CredentialOwner,
 } from '@/components/credential-shared'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
@@ -422,6 +423,8 @@ export const CredentialCard = memo(function CredentialCard({
                   </Hint>
                   <CardDescription className="mt-1 flex @min-[27rem]/card:mt-1.5 min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-normal">
                     <span className="tabular-nums">#{cred.id}</span>
+                    {cred.owner && cred.owner !== 'admin' && <span aria-hidden="true">·</span>}
+                    <CredentialOwner cred={cred} />
                     <span aria-hidden="true">·</span>
                     <Tooltip>
                       <TooltipTrigger

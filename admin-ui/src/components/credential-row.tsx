@@ -45,6 +45,7 @@ import {
   type QuotaWindowMeta,
   type SortDir,
   type SortKey,
+  CredentialOwner,
 } from '@/components/credential-shared'
 import { Badge, badgeVariants, type BadgeProps } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -332,7 +333,7 @@ export const CredentialRow = memo(function CredentialRow({
                 </Hint>
                 <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
                   <CalendarDaysIcon className="size-3 shrink-0" />
-                  <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
+                  <span className="min-w-0 break-all tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 text-xs" />
                   <span aria-hidden="true">·</span>
                   <Tooltip>
                     <TooltipTrigger render={<span />} className="min-w-0">
@@ -494,7 +495,7 @@ export const CredentialRow = memo(function CredentialRow({
                 </a>
               </Hint>
               <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-                <span className="min-w-0 break-all tabular-nums">#{cred.id}</span>
+                <span className="min-w-0 break-all tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 text-xs" />
                 <span aria-hidden="true">·</span>
                 <Tooltip>
                   <TooltipTrigger render={<span />} className="min-w-0">
@@ -1134,6 +1135,7 @@ function MobileCredentialRow({
 
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-xs text-muted-foreground tabular-nums">#{cred.id}</span>
+            <CredentialOwner cred={cred} className="text-xs" />
             <Badge size="xs" variant={status.variant}>{status.label}</Badge>
             <AccountTierBadge cred={cred} size="xs" />
             <Badge size="xs" variant="outline" className="tabular-nums">P{cred.priority}</Badge>

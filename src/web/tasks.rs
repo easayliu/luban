@@ -84,6 +84,25 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
         });
     }
 
+    // 过期的控制台会话每小时清一次。认会话时过期的那条会顺手删掉，这里清的是再也没人
+    // 拿来用过的（关了浏览器就没再回来）。首个 tick 立即触发，兼作启动清理。
+    {
+        let store = state.store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let store = store.clone();
+                if let Ok(Err(e)) =
+                    tokio::task::spawn_blocking(move || store.prune_sessions()).await
+                {
+                    tracing::warn!(error = %e, "failed to prune expired console sessions");
+                }
+            }
+        });
+    }
+
     // 学到的规则每小时按库重建一遍进程内记忆表：7 天保鲜期此前只在**读库**时生效
     // （`learned_rejections_with_time` 顺手删过期行），而请求路径判的是进程内 HashMap，进程
     // 不重启规则就永不过期——一条 7 天前学的拒答提示词能一直本地 403 下去。重建 = 读库

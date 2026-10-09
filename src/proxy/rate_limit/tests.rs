@@ -429,7 +429,7 @@ fn model_level_429_never_disables_the_account() {
         crate::proxy::RateLimitInfo::from_headers(&h)
     };
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     let fable = Some("claude-fable-5");
 
     // 实测形态：只有超额池满，基础窗口都有余量。
@@ -484,7 +484,7 @@ fn model_level_429_never_disables_the_account() {
 #[test]
 fn a_transient_rate_limit_only_leaves_the_pool_after_the_attempt_cap() {
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     let scope = crate::proxy::LimitScope::Transient("claude-opus-5".into());
     let wait = std::time::Duration::from_secs(30);
     let pick =
@@ -525,7 +525,7 @@ fn quota_threshold_parks_the_account_before_any_429() {
     let now = crate::credentials::now_secs() as i64;
     let at = |secs: i64| (now + secs).to_string();
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
 
     // 还没到阈值：一切照旧，200 就是 200。
     let plenty = hdr(&[
@@ -572,7 +572,7 @@ fn quota_threshold_parks_the_account_before_any_429() {
     // 只有 7d 高位、5h 还空着：默认**不停**。这个号这 5 小时完全能干活，周用量偏高不是
     // 停它的理由——真把周额度用光了上游会自己回 429，账号级冷却那条路接手。
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     let weekly_hot = hdr(&[
         ("anthropic-ratelimit-unified-5h-utilization", "0.10"),
         ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
@@ -597,7 +597,7 @@ fn quota_threshold_parks_the_account_before_any_429() {
 
     // 两档互不干扰：5h 那档配成 0（关）时，7d 那档照样按自己的阈值停号。
     let only_7d = store::CredentialStore::open_in_memory().unwrap();
-    let c = only_7d.insert("b", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let c = only_7d.insert("b", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     only_7d.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
     only_7d.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").unwrap();
     assert!(crate::proxy::park_if_quota_nearly_exhausted(&only_7d, &c, &weekly_hot));
@@ -605,7 +605,7 @@ fn quota_threshold_parks_the_account_before_any_429() {
 
     // 阈值配成 0 = 关掉本机制，退回「收到 429 才停」。
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
     assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot));
     assert!(!store.get(cred.id).unwrap().unwrap().disabled);
@@ -652,12 +652,12 @@ fn quota_threshold_is_overridable_per_credential() {
     let fresh = |id: i64| store.get(id).unwrap().unwrap();
 
     // 全局 90：没配覆盖的号 95% 该停。
-    let a = store.insert("a", None, "at", "rt-a", u64::MAX, None, None).unwrap();
+    let a = store.insert("a", None, "at", "rt-a", u64::MAX, None, None, 1).unwrap();
     assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &a, &warm));
     assert!(fresh(a.id).disabled, "跟随全局 90 的号 95% 该停");
 
     // 账号自己配 99：同一份头不停；配回 None 又跟随全局。
-    let b = store.insert("b", None, "at", "rt-b", u64::MAX, None, None).unwrap();
+    let b = store.insert("b", None, "at", "rt-b", u64::MAX, None, None, 1).unwrap();
     assert!(store.set_quota_pause_pcts(b.id, Some(99), None).unwrap());
     let b = fresh(b.id);
     assert_eq!((b.quota_pause_pct, b.quota_pause_pct_7d), (Some(99), None));
@@ -669,14 +669,14 @@ fn quota_threshold_is_overridable_per_credential() {
     assert!(fresh(b.id).disabled, "清掉覆盖就回到全局 90");
 
     // 账号配 0 = 这个号这一档不停，哪怕全局开着；7d 档没配、全局也关，整个不停。
-    let c = store.insert("c", None, "at", "rt-c", u64::MAX, None, None).unwrap();
+    let c = store.insert("c", None, "at", "rt-c", u64::MAX, None, None, 1).unwrap();
     assert!(store.set_quota_pause_pcts(c.id, Some(0), None).unwrap());
     let c = fresh(c.id);
     assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &c, &warm));
     assert!(!fresh(c.id).disabled, "账号 5h 档配 0 即不停，不是跟随全局");
 
     // 只给这个号开 7d 档（95）而全局 7d 关着：按 7d 停、睡到 7d 的 reset。
-    let d = store.insert("d", None, "at", "rt-d", u64::MAX, None, None).unwrap();
+    let d = store.insert("d", None, "at", "rt-d", u64::MAX, None, None, 1).unwrap();
     assert!(store.set_quota_pause_pcts(d.id, Some(0), Some(95)).unwrap());
     let d = fresh(d.id);
     assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &d, &warm));
@@ -688,7 +688,7 @@ fn quota_threshold_is_overridable_per_credential() {
 
     // 反过来：全局 5h 关着、账号自己开 80，95% 也停。
     store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
-    let e = store.insert("e", None, "at", "rt-e", u64::MAX, None, None).unwrap();
+    let e = store.insert("e", None, "at", "rt-e", u64::MAX, None, None, 1).unwrap();
     assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &e, &warm));
     assert!(store.set_quota_pause_pcts(e.id, Some(80), None).unwrap());
     let e = fresh(e.id);
@@ -723,7 +723,7 @@ fn quota_threshold_obeys_the_rate_limit_retry_switch() {
     );
     let info = crate::proxy::RateLimitInfo::from_headers(&h);
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     store.set_setting(store::RATE_LIMIT_RETRY, "false").unwrap();
     assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &info));
     assert!(!store.get(cred.id).unwrap().unwrap().disabled, "总开关关着就不该动调度");

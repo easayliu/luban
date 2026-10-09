@@ -215,7 +215,7 @@ fn detects_org_oauth_disallowed() {
 fn park_org_oauth_disallowed_pauses_until_resumed() {
     use crate::proxy::park_org_oauth_disallowed;
     let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
     assert!(park_org_oauth_disallowed(&store, &a, 403, "forward"));
     let got = store.get(a.id).unwrap().unwrap();
     assert!(got.disabled && got.resume_at.is_none());

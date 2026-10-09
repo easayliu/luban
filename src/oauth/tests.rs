@@ -343,7 +343,7 @@ fn a_recent_handshake_is_visible_to_the_keepalive_loop() {
 fn keepalive_attaches_to_the_real_session_when_there_is_one() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let snapshot = crate::telemetry::SessionSnapshot {
         session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
         device_id: "b9".repeat(32),
@@ -402,7 +402,7 @@ fn keepalive_attaches_to_the_real_session_when_there_is_one() {
 #[test]
 fn eval_attributes_carry_the_raw_rate_limit_tier() {
     let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("t", None, "a", "r", 0, None, Some("claude_team")).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, Some("claude_team"), 1).unwrap();
     store.set_rate_limit_tier(cred.id, Some("default_claude_max_5x")).unwrap();
     let cred = store.get(cred.id).unwrap().unwrap();
 
@@ -457,7 +457,7 @@ fn eval_attributes_carry_the_raw_rate_limit_tier() {
     );
 
     // 旧库里没回填过的号：这一项整个不发，而不是发一个空串。
-    let bare = store.insert("t2", None, "a2", "r2", 0, None, None).unwrap();
+    let bare = store.insert("t2", None, "a2", "r2", 0, None, None, 1).unwrap();
     let bare = KeepaliveCtx::new(&bare, 1.0, None, None).eval_body();
     assert!(bare["attributes"].get("rateLimitTier").is_none());
 }

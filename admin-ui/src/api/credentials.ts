@@ -102,6 +102,10 @@ export interface Credential {
   subscription_status: string | null
   /** 组织是否开了超额用量；拉不到时为 null。 */
   extra_usage_enabled: boolean | null
+  /** 号的主人（控制台账号 id）。 */
+  owner_id: number | null
+  /** 主人的用户名：只有管理员与访客的列表里有，代理和用户看到的都是自己的号，为 null。 */
+  owner: string | null
   priority: number
   disabled: boolean
   expires_in: number

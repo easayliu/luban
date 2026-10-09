@@ -1,25 +1,24 @@
-//! 管理界面登录鉴权。
+//! 控制台登录鉴权：用户名 + 密码登录，换一个会话 token，之后每个请求带
+//! `Authorization: Bearer <token>`。转发代理 `/v1/*` 不走这里（那边认接入 Key）。
 //!
-//! 密码以 sha256 存于 SQLite（`admin_password_sha256`），或由 `LUBAN_ADMIN_PASSWORD`
-//! 环境接管。设置后 `/api/*` 管理接口需带 `Authorization: Bearer <password>`。
-//! 转发代理 `/v1/*` 不走这里。
+//! 四种角色见 [`UserRole`]：唯一的 admin、唯一的只读访客、代理、用户。密码用 argon2id 存在
+//! `users.password_hash`；旧版存在 settings 里的无盐 sha256 迁移时带上前缀搬过来，登录校验
+//! 通过即换成 argon2（见 [`store::migrate_users`]）。admin 与访客的密码仍可由
+//! `LUBAN_ADMIN_PASSWORD` / `LUBAN_VIEWER_PASSWORD` 接管，接管时库里的哈希不起作用。
 //!
-//! **未设密码时管理接口一律拒绝**，本机也不例外。默认监听 `0.0.0.0`、Docker 也把端口发布到
-//! 所有网卡，此前未设密码等于管理面对网络匿名敞开：谁先连上谁就能设密码、导出全部明文 token。
-//! 现在要先设密码，而设密码得带启动日志里打印的初始化口令（[`AppState::setup_token`]），
-//! 证明来人能看到这台服务的日志。
+//! **未设管理密码时管理接口一律拒绝**，本机也不例外。默认监听 `0.0.0.0`、Docker 也把端口发布
+//! 到所有网卡，未设密码等于管理面对网络匿名敞开。设密码得带启动日志里打印的初始化口令
+//! （[`AppState::setup_token`]），证明来人能看到这台服务的日志。不给本机开免密口子：服务端分不出
+//! 「本机浏览器」和「同机反代转进来的外部请求」。
 //!
-//! 不给本机开免密口子：服务端分不出「本机浏览器」和「同机反代转进来的外部请求」。nginx 默认
-//! 把 `Host` 改写成 `proxy_pass` 的地址（`$proxy_host`），`proxy_pass http://127.0.0.1:4600`
-//! 转进来的请求对端与 `Host` 都是回环，按对端 + `Host` 判本机的话，公网上的人经反代就能免密
-//! 进来、不带口令抢先设密码。本机用起来的补偿：`--open` 打开浏览器时把口令带在地址的
-//! `#setup_token=` 里，初始化页自动填好。
+//! **权限按路由默认拒绝**：中间件给每条路由定一个访问级别（[`access_of`]），没列出来的一律只给
+//! admin。往后新加的接口忘了标，代理和用户只是用不了，不会越权。代理和用户能打的接口里，
+//! 落在某个号 / 某条出口代理上的（路径里的 id、或批量接口 body 里的 `ids`），中间件先核对
+//! 是不是本人名下的，不是一律回 404（不回 403，免得试出别人的号是否存在）。列表类接口由
+//! handler 按 [`Actor::scope`] 过滤。
 //!
-//! **只读访客**：另设一个访客密码（`viewer_password_sha256` 或 `LUBAN_VIEWER_PASSWORD`），
-//! 用它登录的人能看控制台的全部页面、什么都改不了。只在管理密码已设时生效。权限由中间件
-//! 统一判：访客只放行 `GET`/`HEAD`，再去掉几条读也不该给的（见 [`VIEWER_DENIED`]）。没按
-//! 「逐个接口声明要什么权限」做，是因为写接口全是 `POST`/`DELETE`，按方法默认拒绝，往后新加
-//! 的写接口不必记得补一道检查也拦得住。
+//! **只读访客**只放行 `GET`/`HEAD`，再去掉几条读也不该给的（见 [`VIEWER_DENIED`]），响应体里
+//! 的代理密码统一打码（[`redact_url_credentials`]）。
 
 use axum::{
     Extension, Json,
@@ -31,7 +30,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::store;
+use crate::store::{self, LEGACY_SHA256_PREFIX, Scope, User, UserRole};
 use crate::web::AppState;
 
 type ApiError = (StatusCode, String);
@@ -43,112 +42,245 @@ pub fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// 生效的管理密码哈希：环境接管优先，否则用库中存的哈希；都无则 None（未启用鉴权）。
-fn admin_hash(state: &AppState) -> Option<String> {
-    if let Some(pw) = &state.admin_env {
-        return Some(sha256_hex(pw));
-    }
-    state.store.get_setting(store::ADMIN_PASSWORD).ok().flatten().filter(|s| !s.is_empty())
+/// 密码最短长度（去掉首尾空白后）。
+const MIN_PASSWORD_LEN: usize = 4;
+
+/// 当前登录的人。中间件鉴权通过后放进请求扩展，handler 用 `Extension<Actor>` 取。
+#[derive(Debug, Clone)]
+pub struct Actor {
+    pub id: i64,
+    pub username: String,
+    pub role: UserRole,
 }
 
-/// 配置了的访客密码哈希（不管它眼下能不能用）：环境接管优先，否则库中存的哈希。
-fn configured_viewer_hash(state: &AppState) -> Option<String> {
-    if let Some(pw) = &state.viewer_env {
-        return Some(sha256_hex(pw));
+impl Actor {
+    /// 数据可见范围：admin 与访客看全部，代理和用户只看自己名下的。
+    pub fn scope(&self) -> Scope {
+        match self.role {
+            UserRole::Admin | UserRole::Viewer => Scope::All,
+            UserRole::Agent | UserRole::User => Scope::Owner(self.id),
+        }
     }
-    state.store.get_setting(store::VIEWER_PASSWORD).ok().flatten().filter(|s| !s.is_empty())
+
+    pub fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+
+    pub fn is_viewer(&self) -> bool {
+        self.role == UserRole::Viewer
+    }
 }
 
-/// **生效的**访客密码哈希：配置了，且确认与管理密码不会被认混（两者规范形都已知且不同）。
+impl From<User> for Actor {
+    fn from(u: User) -> Self {
+        Actor { id: u.id, username: u.username, role: u.role }
+    }
+}
+
+// ---------- 密码 ----------
+
+/// argon2id 哈希（PHC 串，盐随机）。几十毫秒的 CPU 活，调用方放在 `spawn_blocking` 里。
+fn hash_password_blocking(pw: &str) -> anyhow::Result<String> {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    let mut salt = [0u8; 16];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut salt);
+    let salt = SaltString::encode_b64(&salt).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Argon2::default()
+        .hash_password(pw.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// 校验密码与存着的哈希：argon2 PHC 串，或带 [`LEGACY_SHA256_PREFIX`] 的旧版无盐 sha256。
+fn verify_hash_blocking(stored: &str, pw: &str) -> bool {
+    if let Some(hex) = stored.strip_prefix(LEGACY_SHA256_PREFIX) {
+        return constant_time_eq(sha256_hex(pw).as_bytes(), hex.as_bytes());
+    }
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    PasswordHash::new(stored)
+        .is_ok_and(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
+}
+
+/// 同时在跑的 argon2 计算（登录校验、算新密码哈希）最多几个。每个占 ~19MB 内存、几十毫秒
+/// CPU，不设上限的话一波并发登录就能把阻塞线程池和内存一起打满；超出的排队等。
 ///
-/// 规范形缺一个就不认访客，宁可访客暂时进不来，也不冒「访客构造出管理密码」的险。缺的只会是
-/// 升级前就存在库里的管理密码（那时没存规范形），管理员下一次带密码访问就补上，见
-/// [`backfill_admin_canonical`]。
-fn viewer_hash(state: &AppState) -> Option<String> {
-    let h = configured_viewer_hash(state)?;
-    match (admin_canonical(state), viewer_canonical(state)) {
-        (Some(a), Some(v)) if a != v => Some(h),
-        _ => None,
+/// **许可要移进阻塞闭包里**、算完才放：客户端断开时异步的那一半会被取消，留在 async 侧的
+/// 许可随之归还，而 `spawn_blocking` 里的计算照跑不误——断连重试几轮，在跑的计算就远超上限。
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+pub(crate) async fn hash_password(pw: &str) -> Result<String, ApiError> {
+    let pw = pw.to_owned();
+    let permit = ARGON2_PERMITS.acquire().await.map_err(internal)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password_blocking(&pw)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)
+}
+
+/// 新密码的基本校验：去掉首尾空白后不短于 [`MIN_PASSWORD_LEN`]。回去掉空白后的密码。
+pub(crate) fn check_new_password(pw: &str) -> Result<&str, ApiError> {
+    let pw = pw.trim();
+    if pw.chars().count() < MIN_PASSWORD_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+        ));
+    }
+    Ok(pw)
+}
+
+/// 环境接管的那份密码（admin / 访客各一份），没接管为 None。
+fn env_password(state: &AppState, role: UserRole) -> Option<&str> {
+    match role {
+        UserRole::Admin => state.admin_env.as_deref().map(|s| s.trim()),
+        UserRole::Viewer => state.viewer_env.as_deref().map(|s| s.trim()),
+        UserRole::Agent | UserRole::User => None,
     }
 }
 
-/// 密码的规范形：反复百分号解码到解不动为止（每层去首尾空白）。
+/// 会话的密码指纹：签发时记下，每次认会话都与当前算出的比对，对不上即失效。
 ///
-/// 中间件对请求头里的密码原文、解码各认一次，访客又能随意构造请求头，所以只要两个密码能经
-/// 编码 / 解码互相得到（`pass word` 与 `pass%20word`，或再套几层的 `pass%2520word`），
-/// 知道其中一个就能拼出另一个。它们的规范形必然相同；规范形不同的，就不存在这种推导关系。
-/// 判「认混」比规范形，两个方向、任意层数一并排除。
+/// 环境变量接管的 admin / 访客取环境密码的**版本号**（见 [`sync_env_accounts`]），其余取库里
+/// 存的哈希——于是改密码、重置密码、换掉或撤掉 `LUBAN_ADMIN_PASSWORD` /
+/// `LUBAN_VIEWER_PASSWORD`，旧会话都会随之作废，包括改密码前已经在路上、按旧密码校验通过的
+/// 那次登录。
 ///
-/// **不设层数上限**：设了上限，把密码编码超过上限层数就能让两边规范形对不上、绕过判定。
-/// 循环必然终止——[`percent_decode`] 只在至少有一个合法 `%XX` 时才回 `Some`，每解一层串至少
-/// 短 2 字节，层数不超过长度的三分之一。
-fn canonical(pw: &str) -> String {
-    let mut cur = pw.trim().to_owned();
-    while let Some(d) = percent_decode(&cur) {
-        cur = d.trim().to_owned();
-    }
-    cur
-}
-
-fn canonical_hash(pw: &str) -> String {
-    sha256_hex(&canonical(pw))
-}
-
-fn stored(state: &AppState, key: &str) -> Option<String> {
-    state.store.get_setting(key).ok().flatten().filter(|s| !s.is_empty())
-}
-
-/// 管理密码规范形的哈希：环境接管时现算，否则读库（升级前设的密码可能还没有）。
-fn admin_canonical(state: &AppState) -> Option<String> {
-    match &state.admin_env {
-        Some(pw) => Some(canonical_hash(pw)),
-        None => stored(state, store::ADMIN_PASSWORD_CANONICAL),
+/// 环境密码不拿它的哈希当指纹：指纹随会话落库，无盐 sha256 一旦库泄露就能飞快地离线猜出来。
+/// 库里存的 argon2 哈希本身是加盐慢哈希，对它取 sha256 再存没有这个问题。
+pub(crate) fn password_tag(state: &AppState, role: UserRole, stored_hash: &str) -> String {
+    match env_password(state, role) {
+        Some(_) => {
+            let key = match role {
+                UserRole::Viewer => store::VIEWER_ENV_PASSWORD_VERSION,
+                _ => store::ADMIN_ENV_PASSWORD_VERSION,
+            };
+            let version = state.store.get_setting(key).ok().flatten().unwrap_or_default();
+            format!("env:v{version}")
+        }
+        None if stored_hash.is_empty() => String::new(),
+        None => format!("db:{}", sha256_hex(stored_hash)),
     }
 }
 
-fn viewer_canonical(state: &AppState) -> Option<String> {
-    match &state.viewer_env {
-        Some(pw) => Some(canonical_hash(pw)),
-        None => stored(state, store::VIEWER_PASSWORD_CANONICAL),
-    }
+/// 密码校验通过后签发会话要用的：指纹，以及签发时须核对的库内哈希（环境接管时为 None）。
+struct Verified {
+    tag: String,
+    expected_hash: Option<String>,
 }
 
-/// 拿到管理密码明文的时候（登录、带密码访问），把库里缺的规范形补上。
+/// 校验某个账号的密码，通过回 [`Verified`]。环境接管的 admin / 访客比环境里那份；其余比库里
+/// 的哈希，旧版哈希校验通过后换成 argon2 存回去（指纹按换过的那份算）。
+async fn verify_user_password(
+    state: &AppState,
+    user: &User,
+    pw: &str,
+) -> Result<Option<Verified>, ApiError> {
+    if let Some(env) = env_password(state, user.role) {
+        return Ok(constant_time_eq(env.as_bytes(), pw.as_bytes())
+            .then(|| Verified { tag: password_tag(state, user.role, ""), expected_hash: None }));
+    }
+    let stored = state.store.user_password_hash(user.id).map_err(internal)?.unwrap_or_default();
+    if stored.is_empty() {
+        return Ok(None);
+    }
+    let ok = {
+        let (stored, pw) = (stored.clone(), pw.to_owned());
+        let permit = ARGON2_PERMITS.acquire().await.map_err(internal)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verify_hash_blocking(&stored, &pw)
+        })
+        .await
+        .map_err(internal)?
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let mut current = stored.clone();
+    if stored.starts_with(LEGACY_SHA256_PREFIX) {
+        let upgraded = hash_password(pw).await?;
+        // 只在库里还是这份旧哈希时才换：与并发的改密码交错时不把新密码盖回旧的。
+        match state.store.set_user_password_hash(user.id, &upgraded, Some(&stored)) {
+            Ok(true) => current = upgraded,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(user_id = user.id, error = %e, "failed to upgrade a legacy password hash")
+            }
+        }
+    }
+    Ok(Some(Verified {
+        tag: password_tag(state, user.role, &current),
+        expected_hash: Some(current),
+    }))
+}
+
+/// 是否已设管理密码（环境接管或库里存了哈希）。
 ///
-/// 先不加锁看一眼：绝大多数请求规范形早就在，不该每个请求都去抢 [`AUTH_WRITE_LOCK`]。
-fn backfill_admin_canonical(state: &AppState, admin_pw: &str) {
-    if state.admin_env.is_some() || stored(state, store::ADMIN_PASSWORD_CANONICAL).is_some() {
-        return;
-    }
-    let _guard = AUTH_WRITE_LOCK.lock();
-    backfill_admin_canonical_locked(state, admin_pw);
+/// 给那些「开着鉴权才允许」的接口用。未设密码时 [`require_login`] 已经一律拒绝，这层是
+/// 兜底：个别接口给出去的东西比「能改配置」更重（如导出含明文 token 的迁移文件），不把
+/// 安全全押在中间件的装配上，它们自己再确认一次这道门锁着。
+pub fn admin_configured(state: &AppState) -> bool {
+    state.admin_env.is_some() || state.store.admin_user().is_ok_and(|u| u.password_set)
 }
 
-/// [`backfill_admin_canonical`] 的持锁部分，调用方须已持有 [`AUTH_WRITE_LOCK`]。
-///
-/// 锁里**重新核对**库里的哈希还是不是这个明文的：请求在改密码之前通过了鉴权、补存却落在
-/// 改密码之后的话，写进去的就是旧密码的规范形，和新密码配不上对。
-fn backfill_admin_canonical_locked(state: &AppState, admin_pw: &str) {
-    if state.admin_env.is_some()
-        || stored(state, store::ADMIN_PASSWORD_CANONICAL).is_some()
-        || stored(state, store::ADMIN_PASSWORD) != Some(sha256_hex(admin_pw))
+/// 访客能不能登录：环境接管了访客密码，或库里有设过密码的访客行。
+fn viewer_enabled(state: &AppState) -> bool {
+    state.viewer_env.is_some()
+        || state.store.viewer_user().ok().flatten().is_some_and(|u| u.password_set)
+}
+
+/// 启动时对齐环境接管的账号：
+/// - `LUBAN_VIEWER_PASSWORD` 设了而库里还没有访客行时补一行（密码哈希留空，校验走环境那份），
+///   会话才有地方挂；
+/// - 两个环境密码各与上次启动时记下的 argon2 哈希比对，换了、撤了或新设了，版本号加一
+///   （[`password_tag`] 只记版本号），按旧密码签的会话随即失效。
+pub(crate) fn sync_env_accounts(state: &AppState) {
+    if state.viewer_env.is_some()
+        && matches!(state.store.viewer_user(), Ok(None))
+        && let Err(e) = state.store.upsert_viewer("")
     {
-        return;
+        tracing::warn!(error = %format!("{e:#}"), "failed to create the viewer account for LUBAN_VIEWER_PASSWORD");
     }
-    if let Err(e) =
-        state.store.set_setting(store::ADMIN_PASSWORD_CANONICAL, &canonical_hash(admin_pw))
-    {
-        tracing::warn!(error = %e, "failed to store the admin password canonical hash");
+    for (role, hash_key, version_key) in [
+        (UserRole::Admin, store::ADMIN_ENV_PASSWORD_HASH, store::ADMIN_ENV_PASSWORD_VERSION),
+        (UserRole::Viewer, store::VIEWER_ENV_PASSWORD_HASH, store::VIEWER_ENV_PASSWORD_VERSION),
+    ] {
+        if let Err(e) = sync_env_password(state, env_password(state, role), hash_key, version_key) {
+            tracing::warn!(error = %format!("{e:#}"), ?role, "failed to record the environment password version");
+        }
     }
 }
 
-/// 请求头里的密码按哪种读法对上了管理密码，就回那种读法的明文；对不上为 None。
-fn admin_plaintext(admin: &str, bearer: &str) -> Option<String> {
-    if sha256_hex(bearer) == admin {
-        return Some(bearer.to_owned());
+/// 比对一个环境密码与上次记下的哈希，变了就把版本号加一、换上新哈希（撤了就删掉哈希）。
+fn sync_env_password(
+    state: &AppState,
+    env: Option<&str>,
+    hash_key: &str,
+    version_key: &str,
+) -> anyhow::Result<()> {
+    let stored = state.store.get_setting(hash_key)?.filter(|h| !h.is_empty());
+    let unchanged = match (env, stored.as_deref()) {
+        (None, None) => true,
+        (Some(pw), Some(h)) => verify_hash_blocking(h, pw),
+        _ => false,
+    };
+    if unchanged {
+        return Ok(());
     }
-    percent_decode(bearer).map(|d| d.trim().to_owned()).filter(|d| sha256_hex(d) == admin)
+    let version: u64 =
+        state.store.get_setting(version_key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    state.store.set_setting(version_key, &(version + 1).to_string())?;
+    match env {
+        Some(pw) => state.store.set_setting(hash_key, &hash_password_blocking(pw)?)?,
+        None => state.store.delete_setting(hash_key)?,
+    }
+    Ok(())
 }
+
+// ---------- 会话 ----------
 
 fn bearer(headers: &header::HeaderMap) -> Option<&str> {
     headers
@@ -156,34 +288,173 @@ fn bearer(headers: &header::HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
-/// 配了访客密码却没生效时在启动日志里说一声，免得访客怎么都登不进来还查不到原因。
-pub(crate) fn warn_if_viewer_inactive(state: &AppState) {
-    if configured_viewer_hash(state).is_none() || viewer_hash(state).is_some() {
-        return;
+/// 签发一个会话 token（32 字节随机数的十六进制），库里只存它的 sha256 与密码指纹。
+/// 库里的密码在校验之后被改掉了（`expected_hash` 对不上）回 None，不签。
+fn issue_session(
+    state: &AppState,
+    user_id: i64,
+    verified: &Verified,
+) -> Result<Option<String>, ApiError> {
+    let mut bytes = [0u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let created = state
+        .store
+        .create_session(
+            &sha256_hex(&token),
+            user_id,
+            &verified.tag,
+            verified.expected_hash.as_deref(),
+        )
+        .map_err(internal)?;
+    Ok(created.then_some(token))
+}
+
+/// 登录尝试计数：同一用户名 [`LOGIN_FAIL_WINDOW`] 内最多尝试 [`LOGIN_FAIL_MAX`] 次，超出的一律
+/// 429、不再校验密码；登录成功清零。按用户名不按来源 IP：IP 取自可伪造的转发头，拿它限流
+/// 换个头就绕过了。代价是有人故意把某个用户名试锁，那个人要等窗口过去才能登录。
+///
+/// **校验之前预占**（[`reserve_login_attempt`]），而不是失败之后再记：后者挡不住并发——同时
+/// 涌进来的一批请求都还没失败，全都会进 argon2。预占之后第 11 个并发请求当场就被拒。
+///
+/// **两张表**：存在的账号一张，条数不会超过账号数，从不淘汰——锁定记录被挤掉就等于提前解锁；
+/// 不存在的用户名也得计数（否则按「锁不锁」就能试出谁存在），但用户名是来访随便填的，这张
+/// 设容量上限 [`LOGIN_UNKNOWN_CAPACITY`]，满了只淘汰没锁住的；全是锁住的就对新来的不存在
+/// 用户名直接拒（它们本来就登不进来）。超长的用户名在入口就拒，不计。
+struct LoginAttempts {
+    count: u32,
+    since: std::time::Instant,
+}
+
+#[derive(Default)]
+struct LoginGuard {
+    known: std::collections::HashMap<String, LoginAttempts>,
+    unknown: std::collections::HashMap<String, LoginAttempts>,
+}
+
+static LOGIN_GUARD: std::sync::LazyLock<parking_lot::Mutex<LoginGuard>> =
+    std::sync::LazyLock::new(Default::default);
+const LOGIN_FAIL_MAX: u32 = 10;
+const LOGIN_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const LOGIN_UNKNOWN_CAPACITY: usize = 1024;
+/// 登录时接受的用户名最长多少字节。建账号时上限是 32 个字符，留够中文等多字节字符的余量。
+const MAX_LOGIN_USERNAME_LEN: usize = 128;
+
+/// 预占一次登录尝试：还有名额回 true（并记上这一次），已锁回 false。`known` 为这个用户名
+/// 是否确有账号。
+fn reserve_login_attempt(key: &str, known: bool) -> bool {
+    let mut guard = LOGIN_GUARD.lock();
+    let now = std::time::Instant::now();
+    let live = |a: &LoginAttempts| now.duration_since(a.since) < LOGIN_FAIL_WINDOW;
+    guard.known.retain(|_, a| live(a));
+    guard.unknown.retain(|_, a| live(a));
+    let table = if known { &mut guard.known } else { &mut guard.unknown };
+    if let Some(a) = table.get_mut(key) {
+        if a.count >= LOGIN_FAIL_MAX {
+            return false;
+        }
+        a.count += 1;
+        return true;
     }
-    let reason = match (admin_canonical(state), viewer_canonical(state)) {
-        (Some(a), Some(v)) if a == v => "it equals the admin password after URL decoding",
-        _ => "the admin password has not been verified since upgrading; sign in as admin once",
-    };
-    tracing::warn!(reason, "viewer password is configured but inactive");
+    if !known && table.len() >= LOGIN_UNKNOWN_CAPACITY {
+        let victim = table
+            .iter()
+            .filter(|(_, a)| a.count < LOGIN_FAIL_MAX)
+            .min_by_key(|(_, a)| a.since)
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                table.remove(&k);
+            }
+            None => return false,
+        }
+    }
+    table.insert(key.to_owned(), LoginAttempts { count: 1, since: now });
+    true
 }
 
-/// 登录身份。中间件鉴权通过后放进请求扩展，handler 用 `Extension<Role>` 取。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// 管理员：什么都能做。
+/// 登录成功：清掉这个用户名的尝试计数。
+fn clear_login_attempts(key: &str) {
+    LOGIN_GUARD.lock().known.remove(key);
+}
+
+// ---------- 中间件 ----------
+
+/// 一条路由要求的身份（不含访客，访客另按方法判，见 [`viewer_allowed`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// 只有 admin。没列出来的路由都是这一档。
     Admin,
-    /// 只读访客：只能看。响应体里的代理密码由中间件统一遮掉，见 [`redact_url_credentials`]。
-    Viewer,
+    /// admin 与代理（用户管理），handler 里再按范围收窄。
+    Manager,
+    /// 登录的人都能打，按 [`Owned`] 核对落在谁的东西上。
+    Member(Owned),
 }
 
-impl Role {
-    pub fn is_viewer(self) -> bool {
-        self == Role::Viewer
+/// 代理和用户打 [`Access::Member`] 路由时，中间件要先核对归属的东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owned {
+    /// 不落在某个具体的号或代理上，由 handler 按范围过滤（列表、新增、登录相关）。
+    Nothing,
+    /// 路径里的号 id（`/credentials/{id}/…`）。
+    CredentialPath,
+    /// 路径里的出口代理 id（`/proxies/{id}`）。
+    ProxyPath,
+    /// body 里的 `ids`：一批号。
+    CredentialIds,
+    /// body 里的 `ids`：一批出口代理。
+    ProxyIds,
+    /// 路径里的封号事件 id（`/ban-events/{id}/…`）：看它落在哪个号上。号已删掉的事件
+    /// 无从判断归属，只给 admin / 访客。
+    BanEventPath,
+}
+
+/// 代理和用户能打的路由（路径不带 `/api` 前缀，与 `MatchedPath` 对应）。
+/// `/credentials/{id}` 开头的另由 [`access_of`] 统一放行并按路径 id 核对。
+const MEMBER_ROUTES: &[(&str, Owned)] = &[
+    ("/auth/me", Owned::Nothing),
+    ("/auth/password", Owned::Nothing),
+    ("/auth/logout", Owned::Nothing),
+    ("/authorize", Owned::Nothing),
+    ("/exchange", Owned::Nothing),
+    ("/models", Owned::Nothing),
+    ("/credentials", Owned::Nothing),
+    ("/credentials/priority", Owned::CredentialIds),
+    ("/credentials/device-limit", Owned::CredentialIds),
+    ("/credentials/session-limit", Owned::CredentialIds),
+    ("/credentials/rpm-limit", Owned::CredentialIds),
+    ("/credentials/quota-pause-pct", Owned::CredentialIds),
+    ("/credentials/disabled", Owned::CredentialIds),
+    ("/credentials/delete", Owned::CredentialIds),
+    ("/credentials/proxy", Owned::CredentialIds),
+    ("/proxies", Owned::Nothing),
+    ("/proxies/test", Owned::Nothing),
+    ("/proxies/batch", Owned::Nothing),
+    ("/proxies/delete", Owned::ProxyIds),
+    ("/proxies/{id}", Owned::ProxyPath),
+    // 封号记录：列表接口由 handler 要求带上本人名下的 `cred_id`。
+    ("/ban-events", Owned::Nothing),
+    ("/ban-events/{id}/logs", Owned::BanEventPath),
+    // 请求流水：handler 把结果强制限定在本人名下的号上。
+    ("/usage", Owned::Nothing),
+];
+
+/// 路由的访问级别，默认只给 admin。
+fn access_of(path: &str) -> Access {
+    if let Some((_, owned)) = MEMBER_ROUTES.iter().find(|(p, _)| *p == path) {
+        return Access::Member(*owned);
     }
+    // 某一个号底下的所有操作都只关乎这个号，核对路径里的 id 是本人的就够了。
+    if path == "/credentials/{id}" || path.starts_with("/credentials/{id}/") {
+        return Access::Member(Owned::CredentialPath);
+    }
+    if path == "/users" || path.starts_with("/users/") {
+        return Access::Manager;
+    }
+    Access::Admin
 }
 
 /// 访客连 `GET` 也不给的接口（路径不带 `/api` 前缀）：
@@ -191,40 +462,472 @@ impl Role {
 /// - `/export`：迁移文件带全部账号的明文 token 和接入 key，看到就等于能用；
 /// - `/settings`、`/learned-rejections`：只有系统设置页用，而系统设置整页不对访客开放
 ///   （`/settings` 还带着明文接入 key）。`/proxies` 不在此列：账号页要靠它显示代理名称，
-///   地址里的密码由 [`redact_url_credentials`] 遮掉。
-const VIEWER_DENIED: &[&str] = &["/authorize", "/export", "/settings", "/learned-rejections"];
+///   地址里的密码由 [`redact_url_credentials`] 遮掉；
+/// - `/users`：访客是来看号池的，用不着控制台账号名单。
+const VIEWER_DENIED: &[&str] =
+    &["/authorize", "/export", "/settings", "/learned-rejections", "/users"];
 
-/// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。
+/// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
+/// `POST`，但只作废访客自己的会话，不放行的话访客点「退出」只清得掉本地 token。
 fn viewer_allowed(method: &Method, path: &str) -> bool {
+    if path == "/auth/logout" && *method == Method::POST {
+        return true;
+    }
+    matches!(*method, Method::GET | Method::HEAD)
+        && !VIEWER_DENIED.iter().any(|d| path == *d || path.starts_with(&format!("{d}/")))
+}
+
+/// 未设密码时管理接口回的文案，前端据此切到「初始化管理密码」页。
+const SETUP_REQUIRED: &str =
+    "set an admin password first, using the setup token from the server log";
+
+const LOGIN_REQUIRED: &str = "login required";
+
+/// 请求路径里第 `index` 段（去掉 `/api` 前缀后按 `/` 切，0 是第一段）解析成 id。
+fn path_id(req: &Request, index: usize) -> Option<i64> {
+    let path = req.uri().path();
     let path = path.strip_prefix("/api").unwrap_or(path);
-    matches!(*method, Method::GET | Method::HEAD) && !VIEWER_DENIED.contains(&path)
+    path.trim_start_matches('/').split('/').nth(index)?.parse().ok()
 }
 
-/// 按密码认身份：先比管理密码，再比访客密码；都不对为 None。
-///
-/// 访客密码只在管理密码已设时才认（`admin` 为 None 时调用方已直接拒绝），且要与管理密码
-/// 规范形不同才生效（见 [`viewer_hash`]）。请求头里的密码有原文、编码两种读法，要走
-/// [`role_of_bearer`]，不要直接调这个。
-fn role_of(state: &AppState, admin: &str, pw: &str) -> Option<Role> {
-    let h = sha256_hex(pw);
-    if h == admin {
-        return Some(Role::Admin);
-    }
-    viewer_hash(state).filter(|v| *v == h).map(|_| Role::Viewer)
+fn not_found(what: &str) -> Response {
+    (StatusCode::NOT_FOUND, format!("{what} not found")).into_response()
 }
 
-/// 按请求头里的密码认身份：原文、百分号解码各认一次，两种读法认出不同身份时取访客。
-///
-/// 网页端发的是 `encodeURIComponent(密码)`，脚本发的是原文，同一个头两种读法都得试。
-/// 「两种读法各认出一种身份」只会发生在两个密码互为编码时，而那种组合已由 [`viewer_hash`]
-/// 按规范形排除；这里取低的那个只是第二道闸。
-fn role_of_bearer(state: &AppState, admin: &str, pw: &str) -> Option<Role> {
-    let raw = role_of(state, admin, pw);
-    let decoded = percent_decode(pw).and_then(|d| role_of(state, admin, d.trim()));
-    match (raw, decoded) {
-        (Some(Role::Viewer), _) | (_, Some(Role::Viewer)) => Some(Role::Viewer),
-        (raw, decoded) => raw.or(decoded),
+/// 代理和用户打 [`Access::Member`] 路由时核对归属；body 读出来了要原样装回去，所以回的是
+/// 装好的请求。
+// Err 就是要原样回给客户端的响应，只在中间件里走一次，没必要装箱。
+#[allow(clippy::result_large_err)]
+async fn check_owned(
+    state: &AppState,
+    actor: &Actor,
+    owned: Owned,
+    req: Request,
+) -> Result<Request, Response> {
+    let owner = actor.id;
+    match owned {
+        Owned::Nothing => Ok(req),
+        Owned::CredentialPath => {
+            let id = path_id(&req, 1).ok_or_else(|| not_found("credential"))?;
+            match state.store.credential_owner(id) {
+                Ok(Some(o)) if o == owner => Ok(req),
+                Ok(_) => Err(not_found("credential")),
+                Err(e) => Err(internal(e).into_response()),
+            }
+        }
+        Owned::ProxyPath => {
+            let id = path_id(&req, 1).ok_or_else(|| not_found("proxy"))?;
+            match state.store.proxy_owner(id) {
+                Ok(Some(o)) if o == owner => Ok(req),
+                Ok(_) => Err(not_found("proxy")),
+                Err(e) => Err(internal(e).into_response()),
+            }
+        }
+        Owned::BanEventPath => {
+            let id = path_id(&req, 1).ok_or_else(|| not_found("ban event"))?;
+            let owner_of = |id| -> anyhow::Result<Option<i64>> {
+                match state.store.ban_event_credential(id)? {
+                    Some(cred) => state.store.credential_owner(cred),
+                    None => Ok(None),
+                }
+            };
+            match owner_of(id) {
+                Ok(Some(o)) if o == owner => Ok(req),
+                Ok(_) => Err(not_found("ban event")),
+                Err(e) => Err(internal(e).into_response()),
+            }
+        }
+        Owned::CredentialIds | Owned::ProxyIds => {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 1024 * 1024)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+            #[derive(Deserialize)]
+            struct Ids {
+                #[serde(default)]
+                ids: Vec<i64>,
+            }
+            // 解不出来的交给 handler 去回它自己的 400，这里只管「解得出的 id 是不是本人的」。
+            let ids = serde_json::from_slice::<Ids>(&bytes).map(|b| b.ids).unwrap_or_default();
+            let all_owned = if owned == Owned::CredentialIds {
+                state.store.credentials_owned_by(&ids, owner)
+            } else {
+                state.store.proxies_owned_by(&ids, owner)
+            };
+            match all_owned {
+                Ok(true) => Ok(Request::from_parts(parts, axum::body::Body::from(bytes))),
+                Ok(false) => Err(not_found(if owned == Owned::CredentialIds {
+                    "credential"
+                } else {
+                    "proxy"
+                })),
+                Err(e) => Err(internal(e).into_response()),
+            }
+        }
     }
+}
+
+/// 中间件：认会话、判访问级别、核对归属，把 [`Actor`] 放进请求扩展。
+///
+/// 未设管理密码一律 401（本机也不放行，原因见模块说明）。回 401 而不是 403：前端的拦截器
+/// 见 401 就重新拉一次鉴权状态，未设密码的来访由此落到初始化页。登录了但权限不够回 403：
+/// 回 401 会让前端以为登录失效、清掉会话踢回登录页。
+pub async fn require_login(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !admin_configured(&state) {
+        return (StatusCode::UNAUTHORIZED, SETUP_REQUIRED).into_response();
+    }
+    let Some(token) = bearer(req.headers()) else {
+        return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    };
+    let token_hash = sha256_hex(token);
+    let row = match state.store.session_lookup(&token_hash) {
+        Ok(Some(row)) => row,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
+        Err(e) => return internal(e).into_response(),
+    };
+    // 密码指纹对不上（改过密码、环境变量里的密码换了或撤了）：这条会话作废。
+    let current_tag = password_tag(&state, row.user.role, &row.password_hash);
+    if current_tag.is_empty() || !constant_time_eq(current_tag.as_bytes(), row.pw_tag.as_bytes()) {
+        let _ = state.store.delete_session(&token_hash);
+        return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    }
+    if row.user.effectively_disabled() {
+        return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    }
+    if let Err(e) = state.store.renew_session_if_due(&token_hash, row.remaining_secs) {
+        tracing::warn!(error = %e, "failed to renew a console session");
+    }
+    let actor = Actor::from(row.user);
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = path.strip_prefix("/api").unwrap_or(&path).to_owned();
+
+    let mut req = match actor.role {
+        UserRole::Admin => req,
+        UserRole::Viewer => {
+            if !viewer_allowed(req.method(), &path) {
+                return (StatusCode::FORBIDDEN, "read-only viewer: this action is not allowed")
+                    .into_response();
+            }
+            req
+        }
+        UserRole::Agent | UserRole::User => match access_of(&path) {
+            Access::Admin => {
+                return (StatusCode::FORBIDDEN, "this action requires the admin account")
+                    .into_response();
+            }
+            Access::Manager if actor.role != UserRole::Agent => {
+                return (StatusCode::FORBIDDEN, "this action requires an agent or the admin")
+                    .into_response();
+            }
+            Access::Manager => req,
+            Access::Member(owned) => match check_owned(&state, &actor, owned, req).await {
+                Ok(req) => req,
+                Err(resp) => return resp,
+            },
+        },
+    };
+    let viewer = actor.is_viewer();
+    req.extensions_mut().insert(actor);
+    let resp = next.run(req).await;
+    if viewer { redact_for_viewer(resp).await } else { resp }
+}
+
+// ---------- 接口 ----------
+
+#[derive(Serialize)]
+pub struct StateResp {
+    /// 是否已设置管理密码（true = 需登录）。
+    configured: bool,
+    /// 管理密码是否由环境变量接管（true = 网页不可改）。
+    env_managed: bool,
+    /// 未设密码：要先用初始化口令设密码才能进控制台。恒等于 `!configured`，单列一个字段
+    /// 是让前端不必自己推这层语义。
+    setup_required: bool,
+    /// 能否用访客账号登录。只透露「开没开」，不涉及密码本身。
+    viewer_enabled: bool,
+}
+
+/// 鉴权状态（公开）。
+pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
+    let configured = admin_configured(&state);
+    Json(StateResp {
+        configured,
+        env_managed: state.admin_env.is_some(),
+        setup_required: !configured,
+        viewer_enabled: configured && viewer_enabled(&state),
+    })
+}
+
+#[derive(Deserialize)]
+pub struct LoginReq {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResp {
+    ok: bool,
+    token: String,
+    role: UserRole,
+    username: String,
+}
+
+/// 用户名 + 密码登录（公开），成功回会话 token。
+pub async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<LoginResp>, ApiError> {
+    // 这是全项目唯一能看出「有人在猜密码」的地方，不带来源等于记了个寂寞。
+    let ip = client_ip(&headers, peer);
+    if !admin_configured(&state) {
+        return Err((StatusCode::BAD_REQUEST, "no admin password has been set yet".into()));
+    }
+    let username = req.username.trim();
+    if username.len() > MAX_LOGIN_USERNAME_LEN {
+        return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
+    }
+    let key = username.to_lowercase();
+    let user = state.store.user_by_username(username).map_err(internal)?;
+    if !reserve_login_attempt(&key, user.is_some()) {
+        tracing::warn!(%ip, username, "console login rejected: too many failed attempts");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-in attempts; try again in a few minutes".into(),
+        ));
+    }
+    let verified = match &user {
+        Some(u) => verify_user_password(&state, u, req.password.trim()).await?,
+        None => None,
+    };
+    let (Some(user), Some(verified)) = (user, verified) else {
+        tracing::warn!(%ip, username, "console login failed: wrong username or password");
+        return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
+    };
+    clear_login_attempts(&key);
+    if user.effectively_disabled() {
+        tracing::warn!(%ip, username, "console login rejected: account disabled");
+        return Err((StatusCode::FORBIDDEN, "this account is disabled".into()));
+    }
+    // 校验到签发之间密码被重置了：按旧密码校验通过的这次登录不签会话。
+    let Some(token) = issue_session(&state, user.id, &verified)? else {
+        tracing::warn!(%ip, username, "console login rejected: the password changed during sign-in");
+        return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
+    };
+    tracing::info!(%ip, username = %user.username, role = ?user.role, "console login succeeded");
+    Ok(Json(LoginResp { ok: true, token, role: user.role, username: user.username }))
+}
+
+/// 退出登录：作废当前会话（已鉴权）。
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(token) = bearer(&headers) {
+        state.store.delete_session(&sha256_hex(token)).map_err(internal)?;
+    }
+    Ok(ok_json())
+}
+
+#[derive(Deserialize)]
+pub struct PwReq {
+    password: String,
+}
+
+#[derive(Deserialize)]
+pub struct SetupReq {
+    password: String,
+    /// 启动日志里的初始化口令。
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// 等长逐字节异或比较：不因第一个不同字节提前返回，免得按响应时间一位一位试出口令。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// 生成初始化口令：16 字节随机数的十六进制（32 位）。
+pub(crate) fn new_setup_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 未设密码时把初始化口令打进日志：设密码只能靠它。启动时与清除密码后各打一次。
+///
+/// 口令每次启动随机生成、重启前不变（不是用一次就作废）：它只在未设密码时起作用，设上密码
+/// 之后 `setup` 直接拒绝，用过的口令也就没有用处了。
+pub(crate) fn log_setup_token(token: &str) {
+    tracing::warn!(
+        setup_token = %token,
+        "no admin password is set: the console rejects every request until one is set; \
+         open the console and enter this setup token to set it"
+    );
+}
+
+/// 串行化首次设置管理密码：两条并发的 setup 不能都判成「还没设」、后写的那条悄悄把先设的
+/// 密码盖掉。
+static SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 首次设置管理密码（仅未配置时，公开），成功即登录、回会话 token。须带启动日志里的初始化
+/// 口令，否则谁先连上端口谁就能把密码定下来、接管整个管理面。
+///
+/// 先判「已设过」再验口令：设过密码之后来的请求该看到的是「已设置」，而不是一句口令不对。
+pub async fn setup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
+    Json(req): Json<SetupReq>,
+) -> Result<Json<LoginResp>, ApiError> {
+    let ip = client_ip(&headers, peer);
+    let _guard = SETUP_LOCK.lock().await;
+    if admin_configured(&state) {
+        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
+    }
+    let given = req.token.as_deref().map(str::trim).unwrap_or("");
+    if !constant_time_eq(given.as_bytes(), state.setup_token.as_bytes()) {
+        tracing::warn!(%ip, "admin password setup rejected: invalid setup token");
+        return Err((StatusCode::FORBIDDEN, "invalid setup token".into()));
+    }
+    let pw = check_new_password(&req.password)?;
+    let hash = hash_password(pw).await?;
+    let admin = state.store.admin_user().map_err(internal)?;
+    state.store.set_user_password_hash(admin.id, &hash, None).map_err(internal)?;
+    // 谁在什么时候把密码定下来的，比任何一项设置变更都更该留痕。
+    tracing::info!(%ip, "admin password set for the first time");
+    let verified =
+        Verified { tag: password_tag(&state, admin.role, &hash), expected_hash: Some(hash) };
+    let token = issue_session(&state, admin.id, &verified)?
+        .ok_or_else(|| internal("the admin password changed while it was being set"))?;
+    Ok(Json(LoginResp { ok: true, token, role: admin.role, username: admin.username }))
+}
+
+/// 改自己的密码（已鉴权，访客不行）。admin 传空串 = 清除管理密码，控制台回到初始化状态
+/// （访客跟着清掉、所有会话作废）；环境接管的 admin 不能在网页上改。
+///
+/// 改成功后作废本人的其它会话，当前这个保留。
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
+    Json(req): Json<PwReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if actor.is_viewer() {
+        return Err((StatusCode::FORBIDDEN, "the viewer password is set by the admin".into()));
+    }
+    if actor.is_admin() && state.admin_env.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "the admin password is managed by an environment variable and cannot be changed from the web UI".into()));
+    }
+    let cleared = req.password.trim().is_empty();
+    if cleared && !actor.is_admin() {
+        check_new_password("")?;
+    }
+    // 先记下此刻的哈希与当前会话，算完新哈希再按它们条件写入（见
+    // `store::CredentialStore::change_own_password`）：算哈希期间被管理员重置了密码、撤了会话
+    // 的话，这条在途请求写不进去。
+    let token_hash = bearer(&headers)
+        .map(sha256_hex)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED.to_string()))?;
+    let old_hash = state.store.user_password_hash(actor.id).map_err(internal)?.unwrap_or_default();
+    let new_hash = if cleared {
+        String::new()
+    } else {
+        hash_password(check_new_password(&req.password)?).await?
+    };
+    let new_tag = password_tag(&state, actor.role, &new_hash);
+    let written = state
+        .store
+        .change_own_password(actor.id, &token_hash, &old_hash, &new_hash, &new_tag)
+        .map_err(internal)?;
+    if !written {
+        return Err((StatusCode::UNAUTHORIZED, LOGIN_REQUIRED.into()));
+    }
+    if cleared {
+        // 访客跟着清：否则下回重设管理密码时，早先发出去的访客密码悄悄又能用了。
+        state.store.delete_viewer().map_err(internal)?;
+        state.store.delete_all_sessions().map_err(internal)?;
+    }
+    tracing::info!(
+        ip = %client_ip(&headers, peer),
+        username = %actor.username,
+        cleared,
+        "console password changed"
+    );
+    if cleared {
+        // 清掉之后又得靠初始化口令才能进来，把它重新打出来，免得还要翻启动时那一行。
+        log_setup_token(&state.setup_token);
+    }
+    Ok(ok_json())
+}
+
+#[derive(Serialize)]
+pub struct MeResp {
+    id: i64,
+    username: String,
+    role: UserRole,
+    /// 管理密码是否由环境变量接管（仅 admin 有意义）。
+    admin_env_managed: bool,
+    /// 是否已设访客密码。仅 admin 可见，其他人恒为 false。
+    viewer_configured: bool,
+    /// 访客密码是否由环境变量接管（true = 网页不可改）。仅 admin 可见。
+    viewer_env_managed: bool,
+}
+
+/// 当前登录身份（已鉴权）。前端据此决定显示哪些页面、藏掉哪些按钮。
+pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor>) -> Json<MeResp> {
+    let admin = actor.is_admin();
+    Json(MeResp {
+        id: actor.id,
+        username: actor.username,
+        role: actor.role,
+        admin_env_managed: admin && state.admin_env.is_some(),
+        viewer_configured: admin && viewer_enabled(&state),
+        viewer_env_managed: admin && state.viewer_env.is_some(),
+    })
+}
+
+/// 设置 / 清除访客密码（仅 admin，中间件按路由拦了其他人；环境接管时禁止）。空串 = 清除，
+/// 清除后已登录的访客下一次请求即 401、被踢回登录页。访客的用户名固定是 `viewer`。
+pub async fn set_viewer_password(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: header::HeaderMap,
+    Json(req): Json<PwReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.viewer_env.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "the viewer password is managed by an environment variable and cannot be changed from the web UI".into()));
+    }
+    let cleared = req.password.trim().is_empty();
+    if cleared {
+        state.store.delete_viewer().map_err(internal)?;
+    } else {
+        let hash = hash_password(check_new_password(&req.password)?).await?;
+        state.store.upsert_viewer(&hash).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        // 换了密码，拿旧密码登进来的访客全部下线。
+        if let Some(v) = state.store.viewer_user().map_err(internal)? {
+            state.store.delete_user_sessions(v.id, None).map_err(internal)?;
+        }
+    }
+    tracing::info!(ip = %client_ip(&headers, peer), cleared, "viewer password changed");
+    Ok(ok_json())
+}
+
+fn ok_json() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
+    // 同 `web::internal`：错误详情只回给客户端、服务端不留痕的话，500 在日志里查不到。
+    let msg = e.to_string();
+    tracing::error!(error = %msg, "auth endpoint internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
 /// 把文本里所有 URL 的 userinfo 打码：`http://user:secret@h` → `http://user:***@h`，
@@ -310,171 +1013,6 @@ async fn redact_for_viewer(resp: Response) -> Response {
     }
 }
 
-/// 是否已启用管理鉴权（环境接管或库里存了哈希）。
-///
-/// 给那些「开着鉴权才允许」的接口用。未设密码时 [`require_admin`] 已经一律拒绝，这层是
-/// 兜底：个别接口给出去的东西比「能改配置」更重（如导出含明文 token 的迁移文件），不把
-/// 安全全押在中间件的装配上，它们自己再确认一次这道门锁着。
-pub fn admin_configured(state: &AppState) -> bool {
-    admin_hash(state).is_some()
-}
-
-/// 百分号解码（对应前端的 `encodeURIComponent`）；不含 `%`、编码不合法或解出非 UTF-8 时返回 None。
-fn percent_decode(s: &str) -> Option<String> {
-    if !s.contains('%') {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = bytes.get(i + 1..i + 3)?;
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// 未设密码时管理接口回的文案，前端据此切到「初始化管理密码」页。
-const SETUP_REQUIRED: &str =
-    "set an admin password first, using the setup token from the server log";
-
-/// 中间件：已设密码时校验 `Authorization: Bearer <password>`；未设时一律 401（本机也不
-/// 放行，原因见模块说明）。
-///
-/// 回 401 而不是 403：前端的拦截器见 401 就重新拉一次鉴权状态，未设密码的来访由此落到
-/// 初始化页，不必再为这一种情况单写一条分支。
-///
-/// 认出身份后放进请求扩展（[`Role`]）。访客打写接口回 403 而不是 401：密码是对的，回 401
-/// 会让前端以为登录失效、清掉密码踢回登录页。
-pub async fn require_admin(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let Some(hash) = admin_hash(&state) else {
-        return (StatusCode::UNAUTHORIZED, SETUP_REQUIRED).into_response();
-    };
-    let given = bearer(req.headers());
-    // 原文（脚本直接带明文）与百分号解码（网页端为支持非 ASCII 密码会编码）都认。
-    let Some(role) = given.and_then(|pw| role_of_bearer(&state, &hash, pw)) else {
-        return (StatusCode::UNAUTHORIZED, "admin password required").into_response();
-    };
-    if role == Role::Admin
-        && let Some(pw) = given.and_then(|pw| admin_plaintext(&hash, pw))
-    {
-        backfill_admin_canonical(&state, &pw);
-    }
-    if role.is_viewer() {
-        let path = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|| req.uri().path().to_owned());
-        if !viewer_allowed(req.method(), &path) {
-            return (
-                StatusCode::FORBIDDEN,
-                "read-only viewer: this action requires the admin password",
-            )
-                .into_response();
-        }
-    }
-    req.extensions_mut().insert(role);
-    let resp = next.run(req).await;
-    if role.is_viewer() { redact_for_viewer(resp).await } else { resp }
-}
-
-#[derive(Serialize)]
-pub struct StateResp {
-    /// 是否已设置管理密码（true = 需登录）。
-    configured: bool,
-    /// 是否由环境变量接管（true = 网页不可改）。
-    env_managed: bool,
-    /// 未设密码：要先用初始化口令设密码才能进控制台。恒等于 `!configured`，单列一个字段
-    /// 是让前端不必自己推这层语义。
-    setup_required: bool,
-    /// 能否用访客密码登录（已设且生效）。登录页据此把文案写成「管理密码或访客密码」，否则设了
-    /// 访客密码的人看到满页「管理登录」，以为自己进不去。只透露「开没开」，不涉及密码本身。
-    viewer_enabled: bool,
-}
-
-/// 鉴权状态（公开）。
-pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
-    let configured = admin_hash(&state).is_some();
-    Json(StateResp {
-        configured,
-        env_managed: state.admin_env.is_some(),
-        setup_required: !configured,
-        viewer_enabled: configured && viewer_hash(&state).is_some(),
-    })
-}
-
-#[derive(Deserialize)]
-pub struct PwReq {
-    password: String,
-}
-
-#[derive(Deserialize)]
-pub struct SetupReq {
-    password: String,
-    /// 启动日志里的初始化口令。
-    #[serde(default)]
-    token: Option<String>,
-}
-
-/// 等长逐字节异或比较：不因第一个不同字节提前返回，免得按响应时间一位一位试出口令。
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// 生成初始化口令：16 字节随机数的十六进制（32 位）。
-pub(crate) fn new_setup_token() -> String {
-    let mut bytes = [0u8; 16];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// 未设密码时把初始化口令打进日志：设密码只能靠它。启动时与清除密码后各打一次。
-///
-/// 口令每次启动随机生成、重启前不变（不是用一次就作废）：它只在未设密码时起作用，设上密码
-/// 之后 `setup` 直接拒绝，用过的口令也就没有用处了。
-pub(crate) fn log_setup_token(token: &str) {
-    tracing::warn!(
-        setup_token = %token,
-        "no admin password is set: the console rejects every request until one is set; \
-         open the console and enter this setup token to set it"
-    );
-}
-
-/// 串行化控制台密码的所有写入（首次设置、改管理密码、改访客密码、补存规范形），连同写之前
-/// 的检查一起：
-/// - 两条并发的 setup 不能都判成「还没设」、后写的那条悄悄把先设的密码盖掉；
-/// - 密码哈希与规范形是两个键、分两次写，两次更新交错成「哈希 A → 哈希 B → 规范形 B →
-///   规范形 A」时，库里的密码是 B、规范形却是 A，之后的冲突检查就拿错的规范形放行；
-/// - 冲突检查读的是另一个密码的规范形，检查到写入之间另一个密码不能变。
-///
-/// 读的一方不拿锁，靠写入顺序兜：先删旧规范形、再写哈希、最后写新规范形（见
-/// [`write_password`]），中途任何时刻读到的要么一致、要么缺规范形——缺了访客就不生效。
-static AUTH_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-fn ok_json() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
-}
-fn internal(e: impl std::fmt::Display) -> ApiError {
-    // 同 `web::internal`：错误详情只回给客户端、服务端不留痕的话，500 在日志里查不到。
-    let msg = e.to_string();
-    tracing::error!(error = %msg, "auth endpoint internal error");
-    (StatusCode::INTERNAL_SERVER_ERROR, msg)
-}
-
 /// 记进日志的来源标识：优先前置层给的 `x-forwarded-for` 首段（luban 常挂在反代后面，
 /// 直接取对端只会得到反代自己），退回 `x-real-ip`，都没有才用 TCP 对端地址。
 ///
@@ -494,199 +1032,6 @@ fn client_ip(headers: &header::HeaderMap, peer: std::net::SocketAddr) -> String 
         Some(ip) => ip.to_owned(),
         None => peer.ip().to_string(),
     }
-}
-
-/// 校验密码（供前端登录确认，公开）。
-pub async fn login(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: header::HeaderMap,
-    Json(req): Json<PwReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // 这是全项目唯一能看出「有人在猜管理密码」的地方，不带来源等于记了个寂寞。
-    let ip = client_ip(&headers, peer);
-    match admin_hash(&state) {
-        None => Err((StatusCode::BAD_REQUEST, "no admin password has been set yet".into())),
-        Some(h) => match role_of(&state, &h, req.password.trim()) {
-            Some(role) => {
-                if role == Role::Admin {
-                    backfill_admin_canonical(&state, req.password.trim());
-                }
-                tracing::info!(%ip, ?role, "admin login succeeded");
-                Ok(Json(serde_json::json!({ "ok": true, "role": role })))
-            }
-            None => {
-                tracing::warn!(%ip, "admin login failed: wrong password");
-                Err((StatusCode::UNAUTHORIZED, "wrong password".into()))
-            }
-        },
-    }
-}
-
-/// 首次设置密码（仅未配置时，公开）。须带启动日志里的初始化口令，否则谁先连上端口谁就能
-/// 把密码定下来、接管整个管理面。
-///
-/// 先判「已设过」再验口令：设过密码之后来的请求该看到的是「已设置」，而不是一句口令不对。
-pub async fn setup(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: header::HeaderMap,
-    Json(req): Json<SetupReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let ip = client_ip(&headers, peer);
-    let _guard = AUTH_WRITE_LOCK.lock();
-    if admin_hash(&state).is_some() {
-        return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
-    }
-    let given = req.token.as_deref().map(str::trim).unwrap_or("");
-    if !constant_time_eq(given.as_bytes(), state.setup_token.as_bytes()) {
-        tracing::warn!(%ip, "admin password setup rejected: invalid setup token");
-        return Err((StatusCode::FORBIDDEN, "invalid setup token".into()));
-    }
-    let pw = req.password.trim();
-    if pw.len() < 4 {
-        return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
-    }
-    if viewer_canonical(&state).is_some_and(|v| v == canonical_hash(pw)) {
-        return Err((StatusCode::BAD_REQUEST, ADMIN_COLLIDES.into()));
-    }
-    set_admin_password(&state, pw)?;
-    // 谁在什么时候把密码定下来的，比任何一项设置变更都更该留痕。
-    tracing::info!(%ip, "admin password set for the first time");
-    Ok(ok_json())
-}
-
-/// 修改/清除密码（已鉴权；环境接管时禁止）。空串=清除。
-pub async fn change_password(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: header::HeaderMap,
-    Json(req): Json<PwReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.admin_env.is_some() {
-        return Err((StatusCode::BAD_REQUEST, "the admin password is managed by an environment variable and cannot be changed from the web UI".into()));
-    }
-    let pw = req.password.trim();
-    let cleared = pw.is_empty();
-    let _guard = AUTH_WRITE_LOCK.lock();
-    if cleared {
-        // 访客密码跟着清：否则下回重设管理密码时，早先发出去的访客密码悄悄又能用了。
-        // 环境接管的那份清不掉，也无妨——它本来就随部署配置走。
-        for key in store::CONSOLE_AUTH_KEYS {
-            state.store.delete_setting(key).map_err(internal)?;
-        }
-    } else {
-        if pw.len() < 4 {
-            return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
-        }
-        if viewer_canonical(&state).is_some_and(|v| v == canonical_hash(pw)) {
-            return Err((StatusCode::BAD_REQUEST, ADMIN_COLLIDES.into()));
-        }
-        set_admin_password(&state, pw)?;
-    }
-    tracing::info!(
-        ip = %client_ip(&headers, peer),
-        cleared,
-        "admin password changed"
-    );
-    if cleared {
-        // 清掉之后又得靠初始化口令才能进来，把它重新打出来，免得还要翻启动时那一行。
-        log_setup_token(&state.setup_token);
-    }
-    Ok(ok_json())
-}
-
-const ADMIN_COLLIDES: &str =
-    "the admin password must not equal the viewer password, even after URL encoding or decoding";
-const VIEWER_COLLIDES: &str =
-    "the viewer password must not equal the admin password, even after URL encoding or decoding";
-
-/// 写一个密码的哈希与规范形，调用方须已持有 [`AUTH_WRITE_LOCK`]。
-///
-/// 顺序要紧：先删旧规范形、再写哈希、最后写新规范形。不拿锁的读方（中间件认身份）在中途
-/// 读到的是「新哈希 + 无规范形」，访客不生效；反过来先写规范形的话，会有一瞬间是「旧哈希 +
-/// 新规范形」，冲突判定拿的不是真密码的规范形。
-fn write_password(
-    state: &AppState,
-    hash_key: &str,
-    canonical_key: &str,
-    pw: &str,
-) -> Result<(), ApiError> {
-    state.store.delete_setting(canonical_key).map_err(internal)?;
-    state.store.set_setting(hash_key, &sha256_hex(pw)).map_err(internal)?;
-    state.store.set_setting(canonical_key, &canonical_hash(pw)).map_err(internal)
-}
-
-/// 写管理密码，调用方须已持有 [`AUTH_WRITE_LOCK`]。
-fn set_admin_password(state: &AppState, pw: &str) -> Result<(), ApiError> {
-    write_password(state, store::ADMIN_PASSWORD, store::ADMIN_PASSWORD_CANONICAL, pw)
-}
-
-#[derive(Serialize)]
-pub struct MeResp {
-    role: Role,
-    /// 是否已设访客密码。仅管理员可见，访客看到恒为 false。
-    viewer_configured: bool,
-    /// 设了却没生效（与管理密码互为编码，或升级前的管理密码还没校验过规范形）。
-    viewer_inactive: bool,
-    /// 访客密码是否由环境变量接管（true = 网页不可改）。
-    viewer_env_managed: bool,
-}
-
-/// 当前登录身份（已鉴权）。前端据此决定要不要藏掉改动类的按钮。
-pub async fn me(State(state): State<AppState>, Extension(role): Extension<Role>) -> Json<MeResp> {
-    let admin = !role.is_viewer();
-    Json(MeResp {
-        role,
-        viewer_configured: admin && configured_viewer_hash(&state).is_some(),
-        viewer_inactive: admin
-            && configured_viewer_hash(&state).is_some()
-            && viewer_hash(&state).is_none(),
-        viewer_env_managed: admin && state.viewer_env.is_some(),
-    })
-}
-
-/// 设置/清除访客密码（仅管理员，访客被中间件按方法拦下；环境接管时禁止）。空串=清除，
-/// 清除后已登录的访客下一次请求即 401、被踢回登录页。
-pub async fn set_viewer_password(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: header::HeaderMap,
-    Json(req): Json<PwReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.viewer_env.is_some() {
-        return Err((StatusCode::BAD_REQUEST, "the viewer password is managed by an environment variable and cannot be changed from the web UI".into()));
-    }
-    let pw = req.password.trim();
-    let cleared = pw.is_empty();
-    let _guard = AUTH_WRITE_LOCK.lock();
-    if cleared {
-        // 先删哈希：中途读到的是「无访客密码」，而不是「有哈希、没规范形」以外的什么。
-        state.store.delete_setting(store::VIEWER_PASSWORD).map_err(internal)?;
-        state.store.delete_setting(store::VIEWER_PASSWORD_CANONICAL).map_err(internal)?;
-    } else {
-        if pw.len() < 4 {
-            return Err((StatusCode::BAD_REQUEST, "password must be at least 4 characters".into()));
-        }
-        // 走到这里的一定是管理员（中间件拦了访客），请求头里就有管理密码明文：比规范形
-        // 不依赖库里有没有存过它的规范形。
-        let admin =
-            admin_hash(&state).zip(bearer(&headers)).and_then(|(h, pw)| admin_plaintext(&h, pw));
-        let Some(admin) = admin else {
-            return Err((StatusCode::UNAUTHORIZED, "admin password required".into()));
-        };
-        backfill_admin_canonical_locked(&state, &admin);
-        if canonical(&admin) == canonical(pw) {
-            return Err((StatusCode::BAD_REQUEST, VIEWER_COLLIDES.into()));
-        }
-        write_password(&state, store::VIEWER_PASSWORD, store::VIEWER_PASSWORD_CANONICAL, pw)?;
-    }
-    tracing::info!(
-        ip = %client_ip(&headers, peer),
-        cleared,
-        "viewer password changed"
-    );
-    Ok(ok_json())
 }
 
 #[cfg(test)]

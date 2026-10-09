@@ -3,10 +3,12 @@ import {
   ChevronRightIcon,
   EllipsisVerticalIcon,
   LanguagesIcon,
+  LayersIcon,
   LogOutIcon,
   MonitorIcon,
   MoonIcon,
   SunIcon,
+  UsersIcon,
 } from 'lucide-react'
 import { LogoMark } from '@/components/logo-mark'
 import { Badge } from '@/components/ui/badge'
@@ -20,7 +22,8 @@ import {
   MenuTrigger,
 } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useMe, useReadOnly } from '@/lib/role'
+import { cn } from '@/lib/utils'
 import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/lib/theme'
 
 /**
@@ -40,15 +43,19 @@ import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/li
 export function AppHeader({
   actions,
   homeLabel,
+  nav,
   onNavigateHome,
 }: {
   actions?: ReactNode
   /** logo 的无障碍名与悬浮提示；不给就按「回到账号池」。 */
   homeLabel?: string
+  /** 品牌右侧的主导航（见 [MainNav]），只有管理员与代理有。 */
+  nav?: ReactNode
   onNavigateHome?: () => void
 }) {
   const { t } = useI18n()
   const readOnly = useReadOnly()
+  const me = useMe().data
   const label = homeLabel ?? t('返回账号池', 'Back to the account pool')
   const brand = (
     <>
@@ -58,11 +65,22 @@ export function AppHeader({
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight">Luban</span>
     </>
   )
-  // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。
-  const readOnlyBadge = readOnly && (
+  // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。代理和用户常驻身份与
+  // 用户名：他们看到的账号池只有自己名下的号，得一眼看出是以谁的身份在看。
+  const readOnlyBadge = readOnly ? (
     <Hint label={t('访客身份登录，只能查看，不能修改', 'Signed in as a viewer: you can look but not change anything')}>
       <Badge className="shrink-0" variant="warning">
         {t('只读', 'Read-only')}
+      </Badge>
+    </Hint>
+  ) : me && (me.role === 'agent' || me.role === 'user') && (
+    <Hint label={me.role === 'agent'
+      ? t('代理身份登录：管理自己名下的号和用户', 'Signed in as an agent: you manage your own accounts and users')
+      : t('用户身份登录：管理自己名下的号', 'Signed in as a user: you manage your own accounts')}
+    >
+      <Badge className="max-w-40 shrink-0 truncate" variant="secondary">
+        {me.role === 'agent' ? t('代理', 'Agent') : t('用户', 'User')}
+        {me.username && ` · ${me.username}`}
       </Badge>
     </Hint>
   )
@@ -85,11 +103,60 @@ export function AppHeader({
         ) : (
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">{brand}</div>
         )}
+        {nav && <div aria-hidden="true" className="mx-1 h-5 w-px shrink-0 bg-border max-sm:hidden" />}
+        {nav}
         {readOnlyBadge}
         </div>
         {actions && <div className="flex items-center gap-2">{actions}</div>}
       </div>
     </header>
+  )
+}
+
+/** 顶栏主导航的两个一级页面。 */
+export type MainSection = 'pool' | 'users'
+
+/**
+ * 顶栏主导航：账号池与用户管理是平级的两个一级页面，不是谁挂在谁下面。只给管理员与代理
+ * （用户没有用户管理，只剩一项就不必画导航）。窄屏只留图标，文字留给读屏与悬浮提示。
+ */
+export function MainNav({
+  current,
+  onNavigate,
+}: {
+  current: MainSection
+  onNavigate: (section: MainSection) => void
+}) {
+  const { t } = useI18n()
+  const items = [
+    { key: 'pool' as const, label: t('账号池', 'Accounts'), icon: LayersIcon },
+    { key: 'users' as const, label: t('用户管理', 'Users'), icon: UsersIcon },
+  ]
+  return (
+    <nav aria-label={t('主导航', 'Main navigation')} className="flex shrink-0 items-center gap-0.5">
+      {items.map(({ key, label, icon: Icon }) => {
+        const active = current === key
+        return (
+          <Hint key={key} label={label}>
+            <button
+              aria-current={active ? 'page' : undefined}
+              aria-label={label}
+              className={cn(
+                'inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                active
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
+              )}
+              type="button"
+              onClick={() => { if (!active) onNavigate(key) }}
+            >
+              <Icon aria-hidden="true" className="size-4" />
+              <span className="max-sm:sr-only">{label}</span>
+            </button>
+          </Hint>
+        )
+      })}
+    </nav>
   )
 }
 

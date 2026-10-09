@@ -274,7 +274,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
             url        TEXT    NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         ) STRICT;
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_proxies_url ON proxies(url);
+        -- 唯一约束是「人 + 地址」（uq_proxies_owner_url），owner_id 列补上之后在 migrate_users 里建。
 
         -- 上游判成「这个号的套餐不含这个模型」的记录（Pro 号打 fable 那类 429），见
         -- CredentialStore::deny_model。落库而不放进程内冷却：这不是几十秒的事，重启也不该忘。
@@ -591,6 +591,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
 
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
+    migrate_users(conn)?;
     purge_orphan_rows(conn)?;
     backfill_ledger(conn)?;
     migrate_priority_tiers(conn)?;
@@ -838,6 +839,7 @@ const CREDENTIALS_FULL_DDL: &[(&str, &str)] = &[
     ("seat_tier", "TEXT"),
     ("subscription_status", "TEXT"),
     ("extra_usage_enabled", "INTEGER"),
+    ("owner_id", "INTEGER"),
 ];
 
 /// 旧库补 `session_bindings.slot_lost` 列之后初始化槽位归属：同一账号同一槽位上有好几条绑定时

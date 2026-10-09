@@ -140,7 +140,7 @@ impl CredentialStore {
 
     /// 导出代理池的可迁移形态。
     pub fn export_proxies(&self) -> Result<Vec<PortableProxy>> {
-        Ok(self.list_proxies()?.iter().map(PortableProxy::from).collect())
+        Ok(self.list_proxies(Scope::All)?.iter().map(PortableProxy::from).collect())
     }
 
     /// 导入一条代理：URL 已存在则更新 label，不存在则新增。返回是 Added 还是 Updated。
@@ -148,7 +148,12 @@ impl CredentialStore {
         anyhow::ensure!(!p.url.is_empty(), "proxy URL must not be empty");
         let conn = self.conn.lock();
         let existing: Option<i64> = conn
-            .query_row("SELECT id FROM proxies WHERE url = ?1", [&p.url], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM proxies WHERE url = ?1 \
+                    AND owner_id = (SELECT id FROM users WHERE role = 'admin')",
+                [&p.url],
+                |r| r.get(0),
+            )
             .optional()?;
         match existing {
             Some(id) => {
@@ -157,7 +162,8 @@ impl CredentialStore {
             }
             None => {
                 conn.execute(
-                    "INSERT INTO proxies (label, url) VALUES (?1, ?2)",
+                    "INSERT INTO proxies (label, url, owner_id) \
+                     VALUES (?1, ?2, (SELECT id FROM users WHERE role = 'admin'))",
                     params![p.label, p.url],
                 )?;
                 Ok(ImportOutcome::Added)
@@ -173,7 +179,7 @@ impl CredentialStore {
     /// 迁移后不跟着走，所有客户端都得重配一遍。
     pub fn settings_snapshot(&self) -> HashMap<String, String> {
         let mut out = self.settings.read().clone();
-        for k in CONSOLE_AUTH_KEYS {
+        for k in CONSOLE_AUTH_KEYS.iter().chain(DEPLOYMENT_ONLY_KEYS) {
             out.remove(*k);
         }
         out
@@ -304,9 +310,10 @@ impl CredentialStore {
                           account_uuid, resume_at, proxy, rate_limit_tier, org_uuid,
                           subscription_created_at, quota_pause_pct, quota_pause_pct_7d,
                           session_limit, org_name, seat_tier, subscription_status,
-                          extra_usage_enabled)
+                          extra_usage_enabled, owner_id)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                             (SELECT id FROM users WHERE role = 'admin'))",
                     params![
                         c.label,
                         c.tier,
@@ -350,7 +357,8 @@ impl CredentialStore {
     pub fn import_settings(&self, settings: &HashMap<String, String>) -> Result<usize> {
         let mut n = 0;
         for (k, v) in settings {
-            if CONSOLE_AUTH_KEYS.contains(&k.as_str()) {
+            if CONSOLE_AUTH_KEYS.contains(&k.as_str()) || DEPLOYMENT_ONLY_KEYS.contains(&k.as_str())
+            {
                 continue;
             }
             self.set_setting(k, v)?;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
     middleware,
@@ -14,12 +14,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
-use crate::auth;
+use crate::auth::{self, Actor};
 use crate::credentials::{Credential, PRIORITY_MAX, PRIORITY_MIN, priority_tiers_by_rank};
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
 use crate::proxy::AccountRejection;
-use crate::store::{self, CredentialStore};
+use crate::store::{self, CredentialStore, Scope, UserRole};
 
 mod credentials;
 mod keepalive;
@@ -35,6 +35,7 @@ mod settings;
 mod settings_update;
 mod tasks;
 mod usage;
+mod users;
 mod views;
 
 use credentials::*;
@@ -51,6 +52,7 @@ use settings::*;
 use settings_update::*;
 use tasks::*;
 use usage::*;
+use users::*;
 use views::*;
 
 /// 服务共享状态。
@@ -187,7 +189,7 @@ pub async fn run(
 
     spawn_background_tasks(&state);
 
-    auth::warn_if_viewer_inactive(&state);
+    auth::sync_env_accounts(&state);
 
     // 未设管理密码时，启动日志里要给出初始化口令（`state` 下面会被 move 进路由）。
     let setup_token = (!auth::admin_configured(&state)).then(|| state.setup_token.clone());

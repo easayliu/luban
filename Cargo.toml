@@ -1,6 +1,6 @@
 [package]
 name = "luban"
-version = "0.3.214"
+version = "0.3.215"
 edition = "2024"
 
 [dependencies]
@@ -57,6 +57,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 # 四个必须都开：声明了哪几种，上游就可能挑其中任意一种。
 # 解压只发生在收到字节之后，发给上游的请求逐字节不变（见 web::upstream_client）。
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
+argon2 = "0.5"
 
 [dev-dependencies]
 # 仅测试用：构造 gzip 响应，验证上游客户端确实会透明解码（见 proxy 的 decodes_gzip_* 测试）。

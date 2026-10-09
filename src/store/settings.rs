@@ -434,6 +434,23 @@ pub const ADMIN_PASSWORD_CANONICAL: &str = "admin_password_canonical_sha256";
 
 pub const VIEWER_PASSWORD_CANONICAL: &str = "viewer_password_canonical_sha256";
 
+/// 环境变量接管的管理 / 访客密码：上一次启动时那份密码的 argon2 哈希，与它的版本号。
+/// 启动时比对，环境里的密码换了或撤了版本号就加一；会话指纹只记版本号
+/// （见 `crate::auth::password_tag`），库里不落环境密码任何可快速离线猜测的形态。
+pub const ADMIN_ENV_PASSWORD_HASH: &str = "admin_env_password_argon2";
+pub const ADMIN_ENV_PASSWORD_VERSION: &str = "admin_env_password_version";
+pub const VIEWER_ENV_PASSWORD_HASH: &str = "viewer_env_password_argon2";
+pub const VIEWER_ENV_PASSWORD_VERSION: &str = "viewer_env_password_version";
+
+/// 与部署绑定、不随迁移走的 settings 键（导出不带、导入不认），除了 [`CONSOLE_AUTH_KEYS`]
+/// 之外的那些。分开列是因为旧版密码键每次启动都会被清掉，这几个不能。
+pub const DEPLOYMENT_ONLY_KEYS: &[&str] = &[
+    ADMIN_ENV_PASSWORD_HASH,
+    ADMIN_ENV_PASSWORD_VERSION,
+    VIEWER_ENV_PASSWORD_HASH,
+    VIEWER_ENV_PASSWORD_VERSION,
+];
+
 /// 控制台登录相关的 settings 键：属于部署本身，导出不带、导入不认。
 pub const CONSOLE_AUTH_KEYS: &[&str] =
     &[ADMIN_PASSWORD, VIEWER_PASSWORD, ADMIN_PASSWORD_CANONICAL, VIEWER_PASSWORD_CANONICAL];

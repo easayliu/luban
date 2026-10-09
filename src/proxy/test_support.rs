@@ -113,6 +113,7 @@ pub(super) fn test_cred() -> crate::credentials::Credential {
         extra_usage_enabled: None,
         resume_at: None,
         proxy: None,
+        owner_id: None,
         created_at: 0,
         updated_at: 0,
     }

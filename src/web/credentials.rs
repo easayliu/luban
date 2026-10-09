@@ -5,15 +5,22 @@ use super::*;
 // ---------- 凭证管理 ----------
 
 /// 列出全部凭证（token 已脱敏）。
+///
+/// 代理和用户只列自己名下的号；admin 与访客看全部，并带上每个号的主人用户名。
 pub(super) async fn list_credentials(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    blocking(move || credential_views(&state)).await
+    blocking(move || credential_views(&state, actor.scope())).await
 }
 
 /// [`list_credentials`] 的同步部分：十几条聚合查询，须在阻塞线程池里跑，见 [`blocking`]。
-fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    let list = state.store.list().map_err(internal)?;
+fn credential_views(state: &AppState, scope: Scope) -> Result<Json<Vec<CredentialView>>, ApiError> {
+    let list = state.store.list_scoped(scope).map_err(internal)?;
+    let owners = match scope {
+        Scope::All => Some(state.store.owner_names().map_err(internal)?),
+        Scope::Owner(_) => None,
+    };
     let counts = state.store.device_counts().map_err(internal)?;
     let session_counts = state.store.session_counts().map_err(internal)?;
     let quotas = state.store.latest_quotas().map_err(internal)?;
@@ -35,6 +42,7 @@ fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiEr
             )
             .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
             .with_proxy_ids(&proxy_ids)
+            .with_owner_name(owners.as_ref())
             .with_cooldown(
                 state.store.rate_limited_secs(c.id),
                 state.store.rate_limited_models(c.id),
@@ -52,9 +60,11 @@ fn credential_views(state: &AppState) -> Result<Json<Vec<CredentialView>>, ApiEr
     Ok(Json(views))
 }
 
-/// 代理池 URL → id。
-fn saved_proxy_ids(state: &AppState) -> Result<std::collections::HashMap<String, i64>, ApiError> {
-    Ok(state.store.list_proxies().map_err(internal)?.into_iter().map(|p| (p.url, p.id)).collect())
+/// 代理池 (主人, URL) → id：同一个地址不同的人各存一条，号对应的是它主人池里那条。
+fn saved_proxy_ids(
+    state: &AppState,
+) -> Result<std::collections::HashMap<(i64, String), i64>, ApiError> {
+    state.store.proxy_ids_by_owner().map_err(internal)
 }
 
 /// 列出某凭证当前绑定的设备明细（按最近活跃倒序）。
@@ -114,28 +124,68 @@ pub(super) async fn list_credential_sessions(
 
 /// 一条会话的历史事件（最近的在前，最多 100 条，保留 7 天）。事件跨账号：改绑之后记在新账号
 /// 上，按会话键查全部列出，路径上的账号只用来判存在。
+///
+/// 代理和用户只看得到落在本人号上的事件，见 [`events_for`]。
 pub(super) async fn list_session_events(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path((id, session_key)): Path<(i64, String)>,
 ) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let events =
-        blocking(move || state.store.session_events(&session_key).map_err(internal)).await?;
+    let events = blocking(move || {
+        let events = state.store.session_events(&session_key).map_err(internal)?;
+        events_for(&state, actor.scope(), events)
+    })
+    .await?;
     Ok(Json(events))
+}
+
+/// 按可见范围收窄会话事件：事件跨账号（改绑前后记在两个号上），同一个会话可能先后落在
+/// 不同人的号上。代理和用户只留至少有一端是本人号的事件，另一端若是别人的号，id 与名称
+/// 一并抹掉——只告诉他「换到了别处 / 从别处换来」，不告诉是谁的哪个号。
+fn events_for(
+    state: &AppState,
+    scope: Scope,
+    events: Vec<store::SessionEvent>,
+) -> Result<Vec<store::SessionEvent>, ApiError> {
+    let Scope::Owner(_) = scope else { return Ok(events) };
+    let owned: std::collections::HashSet<i64> =
+        state.store.list_scoped(scope).map_err(internal)?.iter().map(|c| c.id).collect();
+    let mine = |id: Option<i64>| id.is_some_and(|id| owned.contains(&id));
+    Ok(events
+        .into_iter()
+        .filter(|e| mine(e.cred_id) || mine(e.prev_cred_id))
+        .map(|mut e| {
+            if !mine(e.cred_id) {
+                e.cred_id = None;
+                e.cred_label = None;
+            }
+            if !mine(e.prev_cred_id) {
+                e.prev_cred_id = None;
+                e.prev_cred_label = None;
+            }
+            e
+        })
+        .collect())
 }
 
 /// 某账号某槽位（即某个上游会话 id）先后被哪些会话用过：这个槽位上的事件，以及从它离开的
 /// 改绑与换槽位，最近的在前。
 pub(super) async fn list_slot_events(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path((id, slot)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let events = blocking(move || state.store.slot_events(id, slot).map_err(internal)).await?;
+    let events = blocking(move || {
+        let events = state.store.slot_events(id, slot).map_err(internal)?;
+        events_for(&state, actor.scope(), events)
+    })
+    .await?;
     Ok(Json(events))
 }
 
@@ -245,6 +295,7 @@ pub(super) struct SetPrioritiesReq {
 /// 选中账号之间的先后顺序，碰到 P0/P4 的截住）。返回更新后的整份列表。
 pub(super) async fn set_priorities(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetPrioritiesReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
@@ -264,7 +315,7 @@ pub(super) async fn set_priorities(
         }
         _ => return Err(bad_request("provide exactly one of priority or delta")),
     }
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 /// 批量操作的公共入参：待处理的账号 id 列表。
@@ -291,6 +342,7 @@ pub(super) struct SetDeviceLimitsReq {
 /// 批量设置设备数上限，返回更新后的整份列表。
 pub(super) async fn set_device_limits(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetDeviceLimitsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
@@ -298,7 +350,7 @@ pub(super) async fn set_device_limits(
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
     let n = state.store.set_device_limits(&req.ids, limit).map_err(internal)?;
     tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 #[derive(Deserialize)]
@@ -311,13 +363,14 @@ pub(super) struct SetSessionLimitsReq {
 /// 批量设置模拟会话数上限，返回更新后的整份列表。
 pub(super) async fn set_session_limits(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetSessionLimitsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
     let n = state.store.set_session_limits(&req.ids, limit).map_err(internal)?;
     tracing::info!(count = n, session_limit = limit, "session limit set in bulk");
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 #[derive(Deserialize)]
@@ -330,13 +383,14 @@ pub(super) struct SetRpmLimitsReq {
 /// 批量设置账号 RPM 上限，返回更新后的整份列表。
 pub(super) async fn set_rpm_limits(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetRpmLimitsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
     let n = state.store.set_rpm_limits(&req.ids, limit).map_err(internal)?;
     tracing::info!(count = n, rpm_limit = limit, "rpm limit set in bulk");
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 #[derive(Deserialize)]
@@ -353,6 +407,7 @@ pub(super) struct SetQuotaPausePctsManyReq {
 /// 批量设置账号自己的提前停调度阈值，返回更新后的整份列表。
 pub(super) async fn set_quota_pause_pcts_many(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetQuotaPausePctsManyReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
@@ -365,7 +420,7 @@ pub(super) async fn set_quota_pause_pcts_many(
         quota_pause_pct_7d = ?long,
         "per-account quota-threshold pause set in bulk"
     );
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 #[derive(Deserialize)]
@@ -377,12 +432,13 @@ pub(super) struct SetDisabledManyReq {
 /// 批量启用/停用，返回更新后的整份列表。
 pub(super) async fn set_disabled_many(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetDisabledManyReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let n = state.store.set_disabled_many(&req.ids, req.disabled).map_err(internal)?;
     tracing::info!(count = n, disabled = req.disabled, "enabled/disabled in bulk");
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 /// 批量删除（连带清设备绑定；用量流水不删，随保留期自然裁掉），返回删除后的整份列表。
@@ -390,13 +446,14 @@ pub(super) async fn set_disabled_many(
 /// 用 POST 而非 DELETE：带请求体的 DELETE 在部分代理/客户端上会被丢掉 body。
 pub(super) async fn delete_credentials(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<IdsReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let store = state.store.clone();
     let n = blocking(move || store.remove(&req.ids).map_err(internal)).await?;
     tracing::info!(count = n, "credentials deleted in bulk");
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }
 
 #[derive(Deserialize)]
@@ -530,6 +587,7 @@ pub(super) struct SetProxyReq {
 /// 才暴露，那时现场只剩一条「这个号所有请求都失败」。
 pub(super) async fn set_proxy(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetProxyReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
@@ -548,9 +606,9 @@ pub(super) async fn set_proxy(
     if let Some(old) = cred.proxy.as_deref() {
         state.clients.forget(old);
     }
-    // 新代理自动入池：下次其他账号能直接从池里选，不必再手打。
+    // 新代理自动入池（号主人的池子）：下次其他账号能直接从池里选，不必再手打。
     if let Some(ref url) = proxy {
-        state.store.ensure_proxy_in_pool(url);
+        state.store.ensure_proxy_in_pool(cred.owner_id.unwrap_or(actor.id), url);
     }
     tracing::info!(
         cred_id = id, cred = %cred.label,

@@ -258,6 +258,9 @@ pub struct UsageLogQuery {
     /// `Forensics::session_id_in`），而来查的人手里只会有其中一个——下游用户知道的是自己
     /// 那个，从上游侧回查的人拿到的是出站那个，两边都得能查到同一批请求。
     pub session_id: Option<String>,
+    /// 只看这个人名下的号的流水（代理和用户查请求时由接口强制带上，见 `web::usage`）；
+    /// `None` 为不限。
+    pub owner_id: Option<i64>,
 }
 
 impl UsageLogQuery {
@@ -274,6 +277,13 @@ impl UsageLogQuery {
         if let Some(c) = self.cred_id {
             params.push(Value::Integer(c));
             clauses.push(format!("cred_id = ?{}", params.len()));
+        }
+        if let Some(o) = self.owner_id {
+            params.push(Value::Integer(o));
+            clauses.push(format!(
+                "cred_id IN (SELECT id FROM credentials WHERE owner_id = ?{})",
+                params.len()
+            ));
         }
         if let Some(u) = self.until_id {
             params.push(Value::Integer(u));

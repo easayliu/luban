@@ -55,11 +55,21 @@ pub(super) struct UsagePage {
 }
 
 /// 列出最近的用量日志（按时间倒序）。
+///
+/// 代理和用户只查得到本人名下的号的流水：带了别人的 `cred_id` 回 404，按请求 id / 会话 id
+/// 查时结果也只在本人的号里找（[`store::UsageLogQuery::owner_id`]）。
 pub(super) async fn list_usage(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsagePage>, ApiError> {
-    blocking(move || usage_page(&state, q.cred_id, &q, 100, 1000)).await
+    let owner = actor.scope().owner();
+    if let (Some(owner), Some(cred)) = (owner, q.cred_id)
+        && state.store.credential_owner(cred).map_err(internal)? != Some(owner)
+    {
+        return Err(not_found());
+    }
+    blocking(move || usage_page(&state, q.cred_id, owner, &q, 100, 1000)).await
 }
 
 /// 列出某凭证的请求流水（按时间倒序，页码翻页）。
@@ -77,7 +87,7 @@ pub(super) async fn list_credential_usage(
     if state.store.get(id).map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    blocking(move || usage_page(&state, Some(id), &q, 25, 200)).await
+    blocking(move || usage_page(&state, Some(id), None, &q, 25, 200)).await
 }
 
 #[derive(Serialize)]
@@ -115,6 +125,7 @@ pub(super) async fn get_credential_stats(
 fn usage_page(
     state: &AppState,
     cred_id: Option<i64>,
+    owner_id: Option<i64>,
     q: &UsageQuery,
     default_limit: i64,
     max_limit: i64,
@@ -135,6 +146,7 @@ fn usage_page(
         since,
         session_key: q.session_key.clone(),
         session_id: q.session_id.clone(),
+        owner_id,
     };
     let stats = state.store.usage_log_stats(filter.clone()).map_err(internal)?;
     // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
@@ -156,10 +168,22 @@ pub(super) struct BanEventsQuery {
 ///
 /// 已删账号的事件照常返回：事件按 cred_id 存、不随删号消失——死号最容易被清理，而清理的
 /// 瞬间恰是最需要留下它的时候。
+///
+/// 代理和用户只能查本人名下某个号的（必须带 `cred_id`）；admin 与访客可以不带、看全部。
 pub(super) async fn list_ban_events(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Query(q): Query<BanEventsQuery>,
 ) -> Result<Json<Vec<store::BanEvent>>, ApiError> {
+    if let Scope::Owner(owner) = actor.scope() {
+        let owned = match q.cred_id {
+            Some(id) => state.store.credential_owner(id).map_err(internal)? == Some(owner),
+            None => false,
+        };
+        if !owned {
+            return Err(not_found());
+        }
+    }
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let events =
         blocking(move || state.store.list_ban_events(q.cred_id, limit).map_err(internal)).await?;

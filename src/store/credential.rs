@@ -66,16 +66,22 @@ impl CredentialStore {
         expires_at: u64,
         account_uuid: Option<&str>,
         org_type: Option<&str>,
+        owner_id: i64,
     ) -> Result<Credential> {
         let conn = self.conn.lock();
+        // 号主核对与插入同一把锁：上号要先换码、拉 profile，等上几秒，期间号主被删的话不能
+        // 再插进来一个挂在不存在的人名下的号。
+        if !owner_exists(&conn, owner_id)? {
+            return Err(OwnerGone.into());
+        }
         // 新凭证一律落在默认档 P2：同档内按设备数负载均衡，新账号立刻参与分摊。
         // 需要瀑布式（榨干一个再用下一个）时，手动/批量把账号调到不同优先级即可。
         // 显式写 priority：老库的列默认值还是 0，不能指望它。
         conn.execute(
             "INSERT INTO credentials
                  (label, tier, access_token, refresh_token, expires_at, account_uuid, org_type,
-                  priority)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  priority, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 label,
                 tier,
@@ -84,7 +90,8 @@ impl CredentialStore {
                 expires_at as i64,
                 account_uuid,
                 org_type,
-                PRIORITY_DEFAULT
+                PRIORITY_DEFAULT,
+                owner_id
             ],
         )
         .context("failed to insert credential (the refresh_token may already exist)")?;
@@ -98,11 +105,18 @@ impl CredentialStore {
     /// 先惰性恢复到点的限流暂停号（[`Self::resume_due`]），否则后台会一直显示成「已停用」，
     /// 直到下一条转发请求碰巧来触发恢复——控制台上看到的必须是此刻真实的调度状态。
     pub fn list(&self) -> Result<Vec<Credential>> {
+        self.list_scoped(Scope::All)
+    }
+
+    /// 同 [`Self::list`]，只列 `scope` 看得到的号。
+    pub fn list_scoped(&self, scope: Scope) -> Result<Vec<Credential>> {
         let conn = self.conn.lock();
         Self::resume_due(&conn)?;
-        let mut stmt =
-            conn.prepare(&format!("SELECT {COLS} FROM credentials ORDER BY priority ASC, id ASC"))?;
-        let rows = stmt.query_map([], row_to_cred)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLS} FROM credentials WHERE ?1 IS NULL OR owner_id = ?1 \
+             ORDER BY priority ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map([scope.owner()], row_to_cred)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);

@@ -77,6 +77,7 @@ pub(super) struct ExchangeReq {
 /// 用粘贴的 `code#state` 交换 token，并新增一条凭证。
 pub(super) async fn exchange(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<ExchangeReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     // 先从粘贴内容里取出 state，据此找到**它自己那次**登录的挑战——不能拿「最后一次生成的
@@ -142,8 +143,15 @@ pub(super) async fn exchange(
             tokens.expires_at,
             profile.account_uuid.as_deref(),
             profile.org_type.as_deref(),
+            actor.id,
         )
-        .map_err(internal)?;
+        .map_err(|e| {
+            if e.downcast_ref::<store::OwnerGone>().is_some() {
+                bad_request("the account adding this credential no longer exists")
+            } else {
+                internal(e)
+            }
+        })?;
 
     // 额度档原值、组织 UUID、订阅创建时刻不在 `insert` 的参数里（那串已经够长了），入库后
     // 走与刷新同一份 `apply_profile` 写；profile 拉不到时组织 id 退回交换响应里那个
@@ -160,12 +168,12 @@ pub(super) async fn exchange(
         state.store.set_proxy(cred.id, Some(url)).map_err(internal)?;
         // 顺手把代理加进代理池——下次添加账号时直接从池里选，不必再手打一遍。
         // 已存在的自动忽略（URL 有唯一索引）。
-        state.store.ensure_proxy_in_pool(url);
+        state.store.ensure_proxy_in_pool(actor.id, url);
     }
 
     // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。
     tracing::info!(
-        cred_id = cred.id, cred = %cred.label,
+        cred_id = cred.id, cred = %cred.label, owner = %actor.username,
         tier = ?cred.tier, org_type = ?cred.org_type,
         proxy = %proxy.as_deref().unwrap_or("<direct>"),
         "credential added"

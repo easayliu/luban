@@ -21,10 +21,12 @@ pub(super) struct SavedProxyView {
 /// 访客看到的地址由鉴权中间件统一去掉密码，见 [`auth::redact_url_credentials`]。
 pub(super) async fn list_saved_proxies(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<SavedProxyView>>, ApiError> {
-    let proxies = state.store.list_proxies().map_err(internal)?;
-    let counts = state.store.proxy_usage_counts().map_err(internal)?;
-    let mut labels = state.store.proxy_usage_labels().map_err(internal)?;
+    let scope = actor.scope();
+    let proxies = state.store.list_proxies(scope).map_err(internal)?;
+    let counts = state.store.proxy_usage_counts(scope).map_err(internal)?;
+    let mut labels = state.store.proxy_usage_labels(scope).map_err(internal)?;
     let views = proxies
         .into_iter()
         .map(|p| {
@@ -79,6 +81,7 @@ pub(super) fn auto_proxy_label(url: &str, existing: &[String]) -> String {
 /// 向代理池中添加一条新记录。
 pub(super) async fn add_saved_proxy(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<AddProxyReq>,
 ) -> Result<Json<SavedProxyView>, ApiError> {
     let url =
@@ -87,7 +90,7 @@ pub(super) async fn add_saved_proxy(
         "" => {
             let existing: Vec<String> = state
                 .store
-                .list_proxies()
+                .list_proxies(Scope::Owner(actor.id))
                 .map_err(internal)?
                 .into_iter()
                 .map(|p| p.label)
@@ -96,7 +99,7 @@ pub(super) async fn add_saved_proxy(
         }
         given => given.to_string(),
     };
-    let p = state.store.add_proxy(&label, &url).map_err(internal)?;
+    let p = state.store.add_proxy(actor.id, &label, &url).map_err(internal)?;
     tracing::info!(proxy_id = p.id, label = %p.label, url = %p.url, "proxy added to pool");
     Ok(Json(SavedProxyView {
         id: p.id,
@@ -152,6 +155,7 @@ struct BatchProxyItem {
 /// 能导入的在一个事务里写入。
 pub(super) async fn add_saved_proxies(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<AddProxiesReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.items.is_empty() {
@@ -160,7 +164,8 @@ pub(super) async fn add_saved_proxies(
     if req.items.len() > MAX_PROXY_BATCH {
         return Err(bad_request(format!("at most {MAX_PROXY_BATCH} proxies per import")));
     }
-    let pool = state.store.list_proxies().map_err(internal)?;
+    // 查重只看本人的池子：不同的人各存一条同样的地址是允许的。
+    let pool = state.store.list_proxies(Scope::Owner(actor.id)).map_err(internal)?;
     let pool_urls: std::collections::HashSet<&str> = pool.iter().map(|p| p.url.as_str()).collect();
     let mut labels: Vec<String> = pool.iter().map(|p| p.label.clone()).collect();
     let mut seen: std::collections::HashMap<String, usize> = Default::default();
@@ -207,7 +212,7 @@ pub(super) async fn add_saved_proxies(
     if !req.dry_run && !to_insert.is_empty() {
         let pairs: Vec<(String, String)> =
             to_insert.iter().map(|(_, l, u)| (l.clone(), u.clone())).collect();
-        let inserted = state.store.add_proxies(&pairs).map_err(internal)?;
+        let inserted = state.store.add_proxies(actor.id, &pairs).map_err(internal)?;
         for ((i, _, _), row) in to_insert.iter().zip(inserted) {
             match row {
                 Some(p) => results[*i].id = Some(p.id),
@@ -233,6 +238,7 @@ pub(super) struct UpdateProxyReq {
 /// 更新代理池中一条记录。
 pub(super) async fn update_saved_proxy(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateProxyReq>,
 ) -> Result<Json<SavedProxyView>, ApiError> {
@@ -250,10 +256,19 @@ pub(super) async fn update_saved_proxy(
         .get_proxy(id)
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "proxy not found".to_string()))?;
-    let count =
-        state.store.proxy_usage_counts().map_err(internal)?.get(&p.url).copied().unwrap_or(0);
-    let credential_labels =
-        state.store.proxy_usage_labels().map_err(internal)?.remove(&p.url).unwrap_or_default();
+    let count = state
+        .store
+        .proxy_usage_counts(actor.scope())
+        .map_err(internal)?
+        .get(&p.url)
+        .copied()
+        .unwrap_or(0);
+    let credential_labels = state
+        .store
+        .proxy_usage_labels(actor.scope())
+        .map_err(internal)?
+        .remove(&p.url)
+        .unwrap_or_default();
     tracing::info!(proxy_id = id, label = %p.label, url = %p.url, "proxy updated in pool");
     Ok(Json(SavedProxyView {
         id: p.id,
@@ -380,6 +395,7 @@ pub(super) struct SetProxiesReq {
 /// 批量设置出站代理。
 pub(super) async fn set_proxies(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Json(req): Json<SetProxiesReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
@@ -395,5 +411,5 @@ pub(super) async fn set_proxies(
         proxy = %proxy.as_deref().unwrap_or("<direct>"),
         "proxy set in bulk"
     );
-    list_credentials(State(state)).await
+    list_credentials(State(state), Extension(actor)).await
 }

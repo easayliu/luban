@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { EyeIcon, EyeOffIcon, KeyRoundIcon, ShieldCheckIcon } from 'lucide-react'
-import { setup } from '@/api/auth'
+import { setup, type LoginResult } from '@/api/auth'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
@@ -31,9 +31,9 @@ function tokenFromHash(): string {
  * 初始化管理密码页：未设密码时展示，本机访问也一样。
  *
  * 这种情况下管理接口一律拒绝，设密码须带服务启动日志里的初始化口令——证明来人能看到这台
- * 服务的日志，而不是恰好先连上端口的陌生人。设置成功回调 onSuccess(password)。
+ * 服务的日志，而不是恰好先连上端口的陌生人。设置成功即登录，回调 onSuccess(会话)。
  */
-export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void }) {
+export function SetupPage({ onSuccess }: { onSuccess: (result: LoginResult) => void }) {
   const { t, language } = useI18n()
   const [token, setToken] = useState(tokenFromHash)
 
@@ -57,7 +57,7 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
   const tooShort = password.trim().length > 0 && password.trim().length < MIN_PASSWORD_LENGTH
   const doSetup = useMutation({
     mutationFn: () => setup(password, token.trim()),
-    onSuccess: () => onSuccess(password),
+    onSuccess,
   })
   const canSubmit = token.trim().length > 0 && password.trim().length >= MIN_PASSWORD_LENGTH
 
@@ -86,8 +86,8 @@ export function SetupPage({ onSuccess }: { onSuccess: (password: string) => void
             </CardTitle>
             <CardDescription>
               {t(
-                '尚未设置管理密码，须先设置密码才能使用控制台。',
-                'No admin password is set. Set one before using the console.',
+                '尚未设置管理密码，须先设置密码才能使用控制台。管理员的用户名为 admin，以后用它和这个密码登录。',
+                'No admin password is set. Set one before using the console. The admin username is admin; sign in with it and this password from now on.',
               )}
             </CardDescription>
           </CardHeader>

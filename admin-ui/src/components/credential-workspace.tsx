@@ -20,7 +20,6 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
-import { getSettings } from '@/api/settings'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
 import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
@@ -39,6 +38,7 @@ import {
   type PlanKey,
   type SortDir,
   type SortKey,
+  useDevicesBySession,
 } from '@/components/credential-shared'
 import { CredentialListHeader, CredentialRow } from '@/components/credential-row'
 import { LiveTrafficMetric, OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
@@ -84,7 +84,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
 import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
 
@@ -337,6 +337,7 @@ function matchQuery(evaluation: CredentialEvaluation, query: string, language: L
     displayCredentialLabel(credential.label, language),
     credential.tier ?? '',
     credential.org_type ?? '',
+    credential.owner ?? '',
     evaluation.status.label,
   ].some((field) => field.toLowerCase().includes(value))
 }
@@ -432,14 +433,23 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const now = useNowSeconds()
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
-  const metricsQuery = useQuery({ queryKey: ['metrics'], queryFn: getMetrics, refetchInterval: 10_000 })
+  //
+  // 实时流量、缓存命中率、首字时延与拒绝统计都是全池口径，只给管理员与访客：代理和用户只看得到
+  // 自己名下的号，这几个接口后端回 403，查询干脆不发，格子也不出现。
+  const seesWholePool = useSeesWholePool()
+  const metricsQuery = useQuery({
+    queryKey: ['metrics'],
+    queryFn: getMetrics,
+    refetchInterval: 10_000,
+    enabled: seesWholePool,
+  })
   // 两枚质量卡片各拉两条线：近 24 小时逐小时（迷你线 + 近 1 小时的主数）与近 7 天（基线）。
   // 主数是「现在」，基线是「平时」——7 天平均看不出今天有没有变慢，一比就看出来了。
-  const cacheSeries = useCacheSeries('24h')
-  const cacheBaseline = useCacheSeries('7d')
+  const cacheSeries = useCacheSeries('24h', seesWholePool)
+  const cacheBaseline = useCacheSeries('7d', seesWholePool)
   const [cacheTrendOpen, setCacheTrendOpen] = useState(false)
-  const ttftSeries = useTtftSeries('24h')
-  const ttftBaseline = useTtftSeries('7d')
+  const ttftSeries = useTtftSeries('24h', seesWholePool)
+  const ttftBaseline = useTtftSeries('7d', seesWholePool)
   const [ttftTrendOpen, setTtftTrendOpen] = useState(false)
   // 近 1 小时没请求就退回 24 小时，24 小时也没有再退回 7 天，标签跟着写清是哪个窗口。
   const cacheNow = (() => {
@@ -485,6 +495,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     queryKey: ['rejections', 1],
     queryFn: () => getRejections(1),
     refetchInterval: 60_000,
+    enabled: seesWholePool,
   })
   const rejectedTotal = rejectionsQuery.data?.total ?? 0
   const rejectionKindLabel = (kind: string) => ({
@@ -518,8 +529,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
   const formatNumber = (value: number) => numberFormatter.format(value)
   // 设备按会话占名额时设备上限不生效：设备那组筛选、按设备数排序、概览里的设备数都不出现。
-  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  const devicesBySession = settings?.devices_by_session ?? false
+  const devicesBySession = useDevicesBySession()
   const filterItems = useMemo(
     () => FILTERS
       .filter((item) => !(devicesBySession && item.group === 'device'))
@@ -1188,7 +1198,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       ) : count > 0 && (
         <section
           aria-label={t('账号池概览', 'Account pool overview')}
-          className="grid grid-cols-2 border-t lg:grid-cols-6"
+          className={seesWholePool ? 'grid grid-cols-2 border-t lg:grid-cols-6' : 'grid grid-cols-2 border-t lg:grid-cols-3'}
         >
           {/* 手机上齐整的 2 列 × 3 行，lg 起一字排开六格。
               原来末两格各带 `col-span-2` 独占一整行——「首字时延 — 暂无数据」右半边整片空着，
@@ -1229,7 +1239,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             onClick={() => selectMetric('attention')}
           />
           <OverviewMetric
-            className="border-r border-b lg:border-b-0"
+            className={seesWholePool ? 'border-r border-b lg:border-b-0' : 'border-r lg:border-r-0'}
             label={t('用量风险', 'Usage risk')}
             value={formatNumber(quotaRiskCount)}
             status={quotaRiskStatus}
@@ -1241,6 +1251,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           />
           {/* 缓存命中率与首字时延不来自账号列表，点开是趋势而不是筛选——它们讲的是「转发出去的
               请求质量如何」。摆在实时流量左边：三格都是流量的属性，凑在一起读。 */}
+          {seesWholePool && (<>
           <OverviewMetric
             className="border-b lg:border-r lg:border-b-0"
             label={cacheNow
@@ -1301,6 +1312,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             )}
             icon={ActivityIcon}
           />
+          </>)}
         </section>
       )}
       </section>

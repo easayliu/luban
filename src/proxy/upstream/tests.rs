@@ -116,7 +116,7 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
     assert!(!s.refused());
 
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let log = |body: &[u8]| {
         let mut sniffer = crate::proxy::UsageSniffer::new(false, false);
         sniffer.feed(body);
@@ -203,7 +203,7 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
 #[test]
 fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let mem = crate::proxy::EmptyReplyMemory::default();
     let log = |is_stream: bool,
                body: &[u8],
@@ -464,7 +464,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
 #[test]
 fn client_ua_lands_in_the_usage_log() {
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let log = |ua: &str, ua_out: &str| {
         drop(crate::proxy::ReqLog {
             started: std::time::Instant::now(),
@@ -529,7 +529,7 @@ fn client_ua_lands_in_the_usage_log() {
 #[test]
 fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log() {
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let build = |injected: Vec<&'static str>| crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,
@@ -633,7 +633,7 @@ data: {\"type\":\"message_stop\"}
 #[test]
 fn mid_stream_error_is_billed_as_the_mapped_status() {
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let mut rl = crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,
@@ -695,7 +695,7 @@ fn mid_stream_error_is_billed_as_the_mapped_status() {
 fn a_successful_retry_reports_the_body_it_actually_sent() {
     use base64::Engine as _;
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let sink = crate::telemetry::Telemetry::default();
     // 首发：3 条消息，末条是 assistant prefill。重试：剥掉它，只剩 2 条。
     let body = |msgs: &str| -> Bytes {
@@ -1179,7 +1179,7 @@ async fn relay_sse(sse: &str) -> (crate::proxy::StatusCode, Option<String>, Byte
 /// 聚合路径要一份 `ReqLog`（它在 Drop 里落日志与用量）；这里给一份最小可用的。
 fn req_log() -> crate::proxy::ReqLog {
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,

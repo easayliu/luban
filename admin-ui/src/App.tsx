@@ -1,10 +1,10 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
+import { KeyRoundIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
-import { getAuthState } from '@/api/auth'
+import { getAuthState, logout } from '@/api/auth'
 import { getSettings } from '@/api/settings'
-import { PW_KEY, UNAUTHORIZED_EVENT, getPw, setPw, clearPw } from '@/api/client'
+import { TOKEN_KEY, UNAUTHORIZED_EVENT, getToken, setToken, clearToken } from '@/api/client'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
   SORT_DIR_DEFAULT,
@@ -31,14 +31,23 @@ import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { SetupPage } from '@/components/setup-page'
+import { UsersPage } from '@/components/users-page'
+import { ChangePasswordDialog } from '@/components/change-password-dialog'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, Breadcrumb, PreferencesMenu, scrollToTop } from '@/components/app-header'
+import { AppHeader, Breadcrumb, MainNav, PreferencesMenu, scrollToTop } from '@/components/app-header'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
 import { MenuItem } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
-import { useConfirmedViewer, useReadOnly } from '@/lib/role'
+import {
+  rememberRole,
+  useCanManageUsers,
+  useConfirmedRole,
+  useIsAdmin,
+  useReadOnly,
+  useSeesWholePool,
+} from '@/lib/role'
 
 // 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
 // 拆成单独 chunk 后首屏少解析一截。但 chunk 有 120 多 KB，远程访问时点进去要先白屏
@@ -128,6 +137,11 @@ function readSettingsRoute(): SettingsSection | null {
   return section && SETTINGS_SECTIONS.includes(section) ? section : 'access'
 }
 
+/** `#/users` → 用户管理页。 */
+function readUsersRoute(): boolean {
+  return /^#\/users(?:[/?]|$)/.test(window.location.hash)
+}
+
 /** `#/accounts/<id>` → 账号 id；其余地址不是详情页。 */
 function readAccountRoute(): number | null {
   const match = /^#\/accounts\/(\d+)/.exec(window.location.hash)
@@ -140,8 +154,12 @@ function App() {
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
   const [bansOpen, setBansOpen] = useState(false)
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const [usersRoute, setUsersRoute] = useState(readUsersRoute)
+  // 同设置页：从账号页点进来的，返回时消费 history；深链接直接打开的原地替换回账号页。
+  const enteredUsersFromAccounts = useRef(false)
   const [settingsRoute, setSettingsRoute] = useState<SettingsSection | null>(readSettingsRoute)
-  const [pw, setPwState] = useState<string | null>(getPw())
+  const [session, setSession] = useState<string | null>(getToken())
   const [selected, setSelected] = useState<Set<number>>(new Set())
   // 分页（纯前端切片：列表接口一次返回全部账号）。
   const [page, setPage] = useState(1)
@@ -155,7 +173,7 @@ function App() {
   // 进详情前列表滚到了哪儿，回来时还原——否则从第三页底部点进去，回来就被扔回顶部。
   const listScrollY = useRef<number | null>(null)
   const onList = useRef(false)
-  onList.current = !settingsRoute && accountRoute == null
+  onList.current = !settingsRoute && !usersRoute && accountRoute == null
 
   // 界面偏好与检索条件都写入 localStorage，刷新后保持当前工作上下文；
   // 链接里带了同名参数时以链接为准（见 readViewParams）。
@@ -204,7 +222,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (settingsRoute || accountRoute != null) return
+    if (settingsRoute || usersRoute || accountRoute != null) return
     const params = new URLSearchParams()
     if (query.trim()) params.set('q', query.trim())
     if (filter !== 'all') params.set('filter', filter)
@@ -217,7 +235,7 @@ function App() {
     const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
     if (window.location.href.endsWith(`#/?${params.toString()}`)) return
     window.history.replaceState(null, '', next)
-  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, accountRoute])
+  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, usersRoute, accountRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
@@ -232,6 +250,9 @@ function App() {
       }
       setSettingsRoute(next)
       setAccountRoute(nextAccount)
+      const nextUsers = readUsersRoute()
+      setUsersRoute(nextUsers)
+      if (!nextUsers) enteredUsersFromAccounts.current = false
       if (!next) enteredSettingsFromAccounts.current = false
       if (nextAccount == null) enteredAccountFromList.current = false
     }
@@ -267,6 +288,22 @@ function App() {
     }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
+  const openUsers = () => {
+    window.history.pushState(null, '', '#/users')
+    enteredUsersFromAccounts.current = true
+    setUsersRoute(true)
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
+  const closeUsers = () => {
+    setUsersRoute(false)
+    if (enteredUsersFromAccounts.current) {
+      enteredUsersFromAccounts.current = false
+      window.history.back()
+    } else {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+    }
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
   const closeAccount = useCallback(() => {
     setAccountRoute(null)
     if (enteredAccountFromList.current) {
@@ -294,31 +331,41 @@ function App() {
     queryKey: ['auth-state'],
     queryFn: getAuthState,
   })
-  // 没存密码的请求被 401（别处刚设了密码）→ 重新问一遍鉴权状态，已设密码就会切到登录页。
+  // 没带会话的请求被 401（别处刚设了密码）→ 重新问一遍鉴权状态，已设密码就会切到登录页。
   useEffect(() => {
     const onUnauthorized = () => { void refetchAuthState() }
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
   }, [refetchAuthState])
-  // 别的标签页登录或退出改了密码：整页重载，内存里的状态与缓存一并换掉。
+  // 别的标签页登录、退出或换了账号：整页重载，内存里的状态与缓存一并换掉。
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
-      if (event.key === PW_KEY && event.newValue !== pw) window.location.reload()
+      if (event.key === TOKEN_KEY && event.newValue !== session) window.location.reload()
     }
     window.addEventListener('storage', onStorage)
     return () => window.removeEventListener('storage', onStorage)
-  }, [pw])
+  }, [session])
 
   const readOnly = useReadOnly()
-  // 系统设置对访客整页不开放（后端也拒 `/settings`）：深链接、书签进来的落回账号池。
-  // 只对确认过的访客清路由；身份未明时下面只是先不渲染设置页，查回是管理员就照常打开。
-  const confirmedViewer = useConfirmedViewer()
+  const isAdmin = useIsAdmin()
+  const seesWholePool = useSeesWholePool()
+  const canManageUsers = useCanManageUsers()
+  // 系统设置只对管理员开放（后端也拒 `/settings`），用户管理只对管理员与代理开放：深链接、
+  // 书签进来的落回账号池。只对确认过的身份清路由；身份未明时下面只是先不渲染，查回来有权限
+  // 就照常打开。
+  const confirmedRole = useConfirmedRole()
   useEffect(() => {
-    if (!confirmedViewer || !settingsRoute) return
-    window.history.replaceState(null, '', '#/')
-    setSettingsRoute(null)
-  }, [confirmedViewer, settingsRoute])
-  const needLogin = authState?.configured && !pw
+    if (!confirmedRole) return
+    if (settingsRoute && confirmedRole !== 'admin') {
+      window.history.replaceState(null, '', '#/')
+      setSettingsRoute(null)
+    }
+    if (usersRoute && confirmedRole !== 'admin' && confirmedRole !== 'agent') {
+      window.history.replaceState(null, '', '#/')
+      setUsersRoute(false)
+    }
+  }, [confirmedRole, settingsRoute, usersRoute])
+  const needLogin = authState?.configured && !session
   // 未设密码：管理接口一律拒绝（本机也一样），先用启动日志里的初始化口令设密码。
   const needSetup = !!authState?.setup_required
   const needAuth = needLogin || needSetup
@@ -349,14 +396,23 @@ function App() {
     if (!authState) void refetchAuthState()
     void queryClient.invalidateQueries()
   }
-  useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute && !readOnly)
+  useSettingsPrefetch(!isBootstrapping && !needAuth && !settingsRoute && isAdmin)
+  const signOut = () => {
+    // 先作废服务端的会话再清本地；请求失败也照样清（会话过期等着自然失效即可）。
+    // 重载而不是只清 state：缓存里的账号、设置（含客户端 Key）不能留给下一个登录的人。
+    void logout().catch(() => {}).finally(() => {
+      clearToken()
+      window.location.reload()
+    })
+  }
 
   if (!isBootstrapping && needSetup) {
     return (
       <SetupPage
-        onSuccess={(p) => {
-          setPw(p)
-          setPwState(p)
+        onSuccess={(result) => {
+          setToken(result.token)
+          rememberRole(result.role)
+          setSession(result.token)
           void refetchAuthState()
         }}
       />
@@ -364,10 +420,14 @@ function App() {
   }
 
   if (!isBootstrapping && needLogin) {
-    return <LoginPage onSuccess={(p) => { setPw(p); setPwState(p) }} />
+    return <LoginPage onSuccess={setSession} />
   }
 
-  if (!isBootstrapping && settingsRoute && !readOnly) {
+  if (!isBootstrapping && usersRoute && canManageUsers) {
+    return <UsersPage onBack={closeUsers} onSignOut={signOut} />
+  }
+
+  if (!isBootstrapping && settingsRoute && isAdmin) {
     return (
       <Suspense fallback={<SettingsPageFallback onBack={closeSettings} />}>
         <SettingsPage
@@ -397,6 +457,9 @@ function App() {
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
         homeLabel={t('返回顶部', 'Back to top')}
+        nav={canManageUsers
+          ? <MainNav current="pool" onNavigate={(section) => { if (section === 'users') openUsers() }} />
+          : undefined}
         onNavigateHome={scrollToTop}
         actions={
           <>
@@ -416,33 +479,39 @@ function App() {
                 </Button>
               </Hint>
             )}
-            <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
-              <Button
-                aria-label={t('请求查询', 'Request lookup')}
-                className="max-sm:size-10 max-sm:px-0"
-                disabled={isBootstrapping}
-                size="sm"
-                variant="outline"
-                onClick={() => setLookupOpen(true)}
-              >
-                <SearchIcon />
-                <span className="max-sm:sr-only">{t('请求查询', 'Lookup')}</span>
-              </Button>
-            </Hint>
+            {/* 请求查询、封号记录看的是全池，只给管理员与访客。 */}
+            {seesWholePool && (
+              <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
+                <Button
+                  aria-label={t('请求查询', 'Request lookup')}
+                  className="max-sm:size-10 max-sm:px-0"
+                  disabled={isBootstrapping}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setLookupOpen(true)}
+                >
+                  <SearchIcon />
+                  <span className="max-sm:sr-only">{t('请求查询', 'Lookup')}</span>
+                </Button>
+              </Hint>
+            )}
             <PreferencesMenu
-              onSignOut={
-                authState?.configured && pw
-                  // 重载而不是只清 state：缓存里的账号、设置（含客户端 Key）不能留给下一个登录的人。
-                  ? () => { clearPw(); window.location.reload() }
-                  : undefined
-              }
+              onSignOut={authState?.configured && session ? signOut : undefined}
             >
-              <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
-                <ShieldAlertIcon />{t('封号记录', 'Ban events')}
-              </MenuItem>
-              {!readOnly && (
+              {seesWholePool && (
+                <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
+                  <ShieldAlertIcon />{t('封号记录', 'Ban events')}
+                </MenuItem>
+              )}
+              {isAdmin && (
                 <MenuItem disabled={isBootstrapping} onClick={() => openSettings('access')}>
                   <SettingsIcon />{t('系统设置', 'System settings')}
+                </MenuItem>
+              )}
+              {/* 管理员的密码在系统设置里改（那里还能清除）；访客的密码由管理员设。 */}
+              {!readOnly && !isAdmin && (
+                <MenuItem disabled={isBootstrapping} onClick={() => setPasswordOpen(true)}>
+                  <KeyRoundIcon />{t('修改密码', 'Change password')}
                 </MenuItem>
               )}
             </PreferencesMenu>
@@ -454,7 +523,8 @@ function App() {
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
         <RequestLookupDialog open={lookupOpen} onOpenChange={setLookupOpen} />
-        <BanEventsDialog open={bansOpen} onOpenChange={setBansOpen} />
+        {seesWholePool && <BanEventsDialog open={bansOpen} onOpenChange={setBansOpen} />}
+        <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
 
         <CredentialWorkspace
           data={{

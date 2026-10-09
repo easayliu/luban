@@ -7,7 +7,7 @@ import {
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
-import { getSettings } from '@/api/settings'
+import { useDevicesBySession } from '@/components/credential-shared'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError } from '@/lib/utils'
 import {
@@ -143,7 +143,7 @@ export function BatchActionsBar({
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // 设备按会话占名额时设备上限不生效，批量设置设备上限那一行一并隐去。
-  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const devicesBySession = useDevicesBySession()
   const proxiesQuery = useQuery({
     queryKey: ['proxies'],
     queryFn: listProxies,
@@ -446,7 +446,7 @@ export function BatchActionsBar({
               )}
             </SettingRow>
 
-            {!settings?.devices_by_session && (
+            {!devicesBySession && (
             <SettingRow
               title={t('设备上限', 'Device limit')}
               hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}

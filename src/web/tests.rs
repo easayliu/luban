@@ -102,16 +102,18 @@ fn reauth_mismatch_messages_match_the_frontend_patterns() {
 #[tokio::test]
 async fn credential_view_carries_the_exact_proxy_id() {
     let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let pa = store.add_proxy("A", "http://u:one@h:1").unwrap();
-    let pb = store.add_proxy("B", "http://u:two@h:1").unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
-    let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
+    let pa = store.add_proxy(1, "A", "http://u:one@h:1").unwrap();
+    let pb = store.add_proxy(1, "B", "http://u:two@h:1").unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap();
     store.set_proxy(a.id, Some("http://u:one@h:1")).unwrap();
     store.set_proxy(b.id, Some("http://u:two@h:1")).unwrap();
     store.set_proxy(c.id, Some("http://u:other@h:9")).unwrap();
     let state = AppState::for_test(store);
-    let views = list_credentials(State(state.clone())).await.unwrap().0;
+    let admin = state.store.admin_user().unwrap();
+    let views =
+        list_credentials(State(state.clone()), Extension(Actor::from(admin))).await.unwrap().0;
     let id_of = |id: i64| views.iter().find(|v| v.id == id).unwrap().proxy_id;
     assert_eq!(id_of(a.id), Some(pa.id));
     assert_eq!(id_of(b.id), Some(pb.id));
@@ -125,8 +127,8 @@ async fn credential_view_carries_the_exact_proxy_id() {
 #[tokio::test]
 async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id() {
     let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
     for cid in [a.id, a.id, b.id] {
         let rec =
             store::UsageRecord { cred_id: Some(cid), cred_label: "x".into(), ..Default::default() };
@@ -142,7 +144,8 @@ async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id() {
     assert_eq!(err.0, StatusCode::NOT_FOUND);
 
     let q = UsageQuery { cred_id: Some(a.id), ..Default::default() };
-    let page = list_usage(State(state), Query(q)).await.unwrap().0;
+    let admin = Actor::from(state.store.admin_user().unwrap());
+    let page = list_usage(State(state), Extension(admin), Query(q)).await.unwrap().0;
     assert_eq!(page.total, 2, "已删账号的两条流水都还在");
     assert!(page.logs.iter().all(|l| l.cred_id == Some(a.id)), "只给这个号的");
 }
@@ -242,8 +245,8 @@ fn keepalive_ban_context_keeps_status_type_message_and_request_id() {
 #[test]
 fn handle_keepalive_rejection_reports_whether_the_ban_landed() {
     let store = CredentialStore::open_in_memory().unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
     let rej = |status: u16, t: &str, m: &str| oauth::AuthRejection {
         endpoint: "event_logging",
         status,

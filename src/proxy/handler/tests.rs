@@ -155,6 +155,7 @@ fn setup_tier(n: usize, base: &str, tier: &str) -> (Arc<CredentialStore>, AppSta
                     far_future,
                     Some(&format!("00000000-0000-4000-8000-00000000000{i}")),
                     None,
+                    1,
                 )
                 .unwrap()
                 .id

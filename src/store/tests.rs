@@ -6,11 +6,12 @@ use super::*;
 #[test]
 fn delete_proxies_removes_only_given_ids() {
     let store = CredentialStore::open_in_memory().unwrap();
-    let a = store.add_proxy("a", "socks5h://10.0.0.1:1080").unwrap();
-    let b = store.add_proxy("b", "socks5h://10.0.0.2:1080").unwrap();
-    let c = store.add_proxy("c", "socks5h://10.0.0.3:1080").unwrap();
+    let a = store.add_proxy(1, "a", "socks5h://10.0.0.1:1080").unwrap();
+    let b = store.add_proxy(1, "b", "socks5h://10.0.0.2:1080").unwrap();
+    let c = store.add_proxy(1, "c", "socks5h://10.0.0.3:1080").unwrap();
     assert_eq!(store.delete_proxies(&[a.id, c.id, 9999]).unwrap(), 2);
-    let left: Vec<i64> = store.list_proxies().unwrap().into_iter().map(|p| p.id).collect();
+    let left: Vec<i64> =
+        store.list_proxies(Scope::All).unwrap().into_iter().map(|p| p.id).collect();
     assert_eq!(left, vec![b.id]);
     assert_eq!(store.delete_proxies(&[]).unwrap(), 0);
 }
@@ -19,16 +20,19 @@ fn delete_proxies_removes_only_given_ids() {
 #[test]
 fn add_proxies_skips_urls_already_in_the_pool() {
     let store = CredentialStore::open_in_memory().unwrap();
-    store.add_proxy("old", "socks5h://10.0.0.1:1080").unwrap();
+    store.add_proxy(1, "old", "socks5h://10.0.0.1:1080").unwrap();
     let out = store
-        .add_proxies(&[
-            ("a".into(), "socks5h://10.0.0.1:1080".into()),
-            ("b".into(), "socks5h://10.0.0.2:1080".into()),
-        ])
+        .add_proxies(
+            1,
+            &[
+                ("a".into(), "socks5h://10.0.0.1:1080".into()),
+                ("b".into(), "socks5h://10.0.0.2:1080".into()),
+            ],
+        )
         .unwrap();
     assert!(out[0].is_none());
     assert_eq!(out[1].as_ref().unwrap().label, "b");
-    assert_eq!(store.list_proxies().unwrap().len(), 2);
+    assert_eq!(store.list_proxies(Scope::All).unwrap().len(), 2);
 }
 
 /// 全局默认会话上限的播种：同设备那条——缺失才写、显式值（含 `0`）不动、重复启动不改。
@@ -340,8 +344,8 @@ fn delete_keeps_usage_logs_but_drops_bindings() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
     {
         let conn = store.conn.lock();
         for cid in [a.id, b.id] {
@@ -382,9 +386,9 @@ fn insert_defaults_to_p2_and_batch_priority() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
-    let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap();
     assert_eq!((a.priority, b.priority, c.priority), (2, 2, 2), "新账号都应是 P2");
 
     assert_eq!(store.set_priorities(&[a.id, c.id], 0).unwrap(), 2);
@@ -500,7 +504,7 @@ fn migrate_priority_tiers_waits_for_concurrent_migration() {
             .iter()
             .map(|l| {
                 let rt = format!("rt-{l}");
-                store.insert(l, None, "t", &rt, 0, None, None).unwrap().id
+                store.insert(l, None, "t", &rt, 0, None, None, 1).unwrap().id
             })
             .collect();
         let conn = store.conn.lock();
@@ -555,7 +559,7 @@ fn fresh_db_is_already_on_tiers() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
     store.set_priority(a.id, 0).unwrap();
     migrate_priority_tiers(&store.conn.lock()).unwrap();
     assert_eq!(store.get(a.id).unwrap().unwrap().priority, 0);
@@ -567,9 +571,9 @@ fn batch_ops_only_touch_selected() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
-    let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap();
     // 给 a、b 各造一条设备绑定与用量日志：删号要清绑定、留流水。
     {
         let conn = store.conn.lock();
@@ -644,7 +648,7 @@ fn record_ban_freezes_history_and_survives_deletion() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let a = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     store.set_proxy(a.id, Some("socks5h://u:secret@exit1:1080")).unwrap();
     let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
     let mut rec = UsageRecord {
@@ -776,7 +780,7 @@ fn legacy_usage_logs_table_gets_forensic_columns_and_freezes() {
         .unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("legacy", None, "at", "rt", u64::MAX, None, None).unwrap();
+    let a = store.insert("legacy", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
     let rec = UsageRecord {
         cred_id: Some(a.id),
         cred_label: "legacy".into(),
@@ -814,8 +818,8 @@ fn banned_credential_releases_its_devices() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
 
     // 先把设备粘到 a 上（a 是 id 更小的那个，同优先级下会被先选中）。
     let first = store
@@ -2149,7 +2153,7 @@ fn store_with(labels: &[&str]) -> (CredentialStore, Vec<i64>) {
         // refresh_token 有 UNIQUE 约束，按 label 取值保证互不相同。
         .map(|l| {
             store
-                .insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None, None)
+                .insert(l, None, &format!("tok-{l}"), &format!("refresh-{l}"), 0, None, None, 1)
                 .unwrap()
                 .id
         })
@@ -3592,8 +3596,8 @@ fn latest_quotas_sums_only_current_window() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap().id;
 
     // 账号 a：reset=100_000，故 5h 窗口起点 82_000、7d 窗口起点 -504_800（含全部行）。
     let r5 = 100_000;
@@ -3639,8 +3643,8 @@ fn recent_rpm_counts_only_the_last_minute() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap().id;
     let now: i64 = store.conn.lock().query_row("SELECT unixepoch()", [], |r| r.get(0)).unwrap();
     let hit = |cred_id, ts| {
         let rec = UsageRecord { cred_id: Some(cred_id), ..Default::default() };
@@ -3658,7 +3662,7 @@ fn recent_rpm_counts_only_the_last_minute() {
     assert_eq!(store.recent_rpm_of(b).unwrap(), 1);
 
     // 从未发过请求的号压根不进 map（调用方按 0 处理），单账号入口直接给 0。
-    let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap().id;
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap().id;
     assert_eq!(store.recent_rpm().unwrap().get(&c), None);
     assert_eq!(store.recent_rpm_of(c).unwrap(), 0);
 
@@ -3687,8 +3691,8 @@ fn window_stats_survive_a_missing_reset() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap().id;
 
     // a：只有 5h 有 reset（窗口起点 82_000），7d 一直为空。
     log_row(&store, a, 10_000, 1.0, Some(100_000), None); // 5h 窗口外
@@ -3724,7 +3728,7 @@ fn window_tokens_sum_official_usage_fields() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
     let reset = 100_000; // 5h 窗口起点 82_000
 
     // 只有 5m/1h 细分的一条：输入 10 + 输出 20 + 缓存写 (30+40) + 缓存读 50 = 150。
@@ -3775,7 +3779,7 @@ fn model_level_cooldown_is_visible_to_the_console() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     store.mark_rate_limited(a, Some("claude-fable-5"), Duration::from_secs(300));
     store.mark_rate_limited(a, Some("claude-opus-5"), Duration::from_secs(30));
@@ -3911,7 +3915,7 @@ fn reader_sees_committed_writes_and_rejects_writes() {
         let _busy = store.read_conn();
         let _other = store.read_conn();
     }
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
     store
         .conn
         .lock()
@@ -4003,7 +4007,7 @@ fn prune_keeps_ledger() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     // 一条早已过保留期的旧流水（带限流头，会写快照）+ 一条刚发生的新流水（无头）。
     let old_ts = 1_000;
@@ -4050,7 +4054,7 @@ fn sse_aggregated_round_trips_and_defaults_to_false() {
     .unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let cred = store.insert("a", None, "t", "r", 0, None, None).unwrap().id;
+    let cred = store.insert("a", None, "t", "r", 0, None, None, 1).unwrap().id;
 
     for aggregated in [true, false] {
         store
@@ -4078,8 +4082,8 @@ fn usage_logs_filter_by_credential_and_paginate() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap().id;
     let log = |cred: i64, cost: f64| {
         store
             .insert_usage_log(&UsageRecord {
@@ -4116,6 +4120,7 @@ fn usage_logs_filter_by_credential_and_paginate() {
                 since: None,
                 session_key: None,
                 session_id: None,
+                owner_id: None,
             })
             .unwrap()
     };
@@ -4323,7 +4328,7 @@ fn overage_marker_lands_in_snapshot() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     store
         .insert_usage_log_at(
@@ -4384,7 +4389,7 @@ fn snapshot_keeps_windows_without_dedicated_columns() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     // 形态取自 proxy::rate_limit_scope 记录的那次真实 fable-5 429：基础窗口都很空，
     // 满掉的只有超额池。
@@ -4428,7 +4433,7 @@ fn snapshot_is_written_even_without_5h_or_7d() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     store
         .insert_usage_log_at(
@@ -4458,7 +4463,7 @@ fn windowless_response_does_not_erase_snapshot() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     let windows = vec![win("5h", 0.5, 9_000, "allowed")];
     store
@@ -4496,7 +4501,7 @@ fn legacy_and_corrupt_windows_degrade_to_empty() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     // 模拟老库：快照行有 5h/7d，windows 列为 NULL。
     {
@@ -4523,7 +4528,7 @@ fn backfill_ledger_on_first_upgrade() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
 
     // 模拟老库形态：流水是历史攒下的（裸 INSERT，从未落过账），账本是空表。
     {
@@ -4571,7 +4576,7 @@ fn latest_quotas_leaves_cost_none_without_reset() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
     log_row(&store, a, 40_000, 3.0, Some(50_000), None); // 在 5h 窗口(32_000 起)内
 
     let q = store.latest_quota(a).unwrap().unwrap();
@@ -4587,12 +4592,12 @@ fn single_cred_stats_match_batch() {
     let conn = Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
     let store = CredentialStore::with_conn(conn);
-    let a = store.insert("a", None, "ta", "ra", 0, None, None).unwrap().id;
-    let b = store.insert("b", None, "tb", "rb", 0, None, None).unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap().id;
     log_row(&store, a, 1_000, 1.5, None, None);
     log_row(&store, a, 2_000, 2.5, None, None);
     log_row(&store, b, 3_000, 7.0, None, None);
-    let c = store.insert("c", None, "tc", "rc", 0, None, None).unwrap().id; // 从未被用过
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap().id; // 从未被用过
 
     let last = store.last_used().unwrap();
     let costs = store.cost_by_cred().unwrap();
@@ -5444,4 +5449,191 @@ fn series_grid_reports_the_granularity_actually_used() {
     assert_eq!(series_grid(0, 86400, 1000).2, 900, "不对齐的偏移取最近的 15 分钟");
     assert_eq!(series_grid(901, 3600, 0).0, 1800, "窗口起点向上对齐");
     assert_eq!(series_grid(900, 3600, 0).0, 900);
+}
+
+/// 老库升级：settings 里的管理 / 访客密码搬进 users（带旧哈希前缀），settings 里那几个键删掉；
+/// 存量号与出口代理挂到 admin 名下；再跑一遍迁移什么都不变。
+#[test]
+fn legacy_console_passwords_and_owners_migrate_once() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+         CREATE TABLE proxies (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL DEFAULT '',
+             url TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch())) STRICT;
+         CREATE UNIQUE INDEX uq_proxies_url ON proxies(url);
+         INSERT INTO proxies (label, url) VALUES ('p', 'http://h:1');",
+    )
+    .unwrap();
+    for (k, v) in
+        [(ADMIN_PASSWORD, "aaaa"), (VIEWER_PASSWORD, "vvvv"), (ADMIN_PASSWORD_CANONICAL, "cccc")]
+    {
+        conn.execute("INSERT INTO settings (key, value) VALUES (?1, ?2)", [k, v]).unwrap();
+    }
+    init_schema(&conn).unwrap();
+    init_schema(&conn).unwrap();
+    let store = CredentialStore::with_conn(conn);
+    let admin = store.admin_user().unwrap();
+    assert_eq!(store.user_password_hash(admin.id).unwrap().unwrap(), "sha256:aaaa");
+    let viewer = store.viewer_user().unwrap().unwrap();
+    assert_eq!(store.user_password_hash(viewer.id).unwrap().unwrap(), "sha256:vvvv");
+    for k in CONSOLE_AUTH_KEYS {
+        assert_eq!(store.get_setting(k).unwrap(), None, "{k} 应已删掉");
+    }
+    assert_eq!(
+        store.proxy_owner(store.list_proxies(Scope::All).unwrap()[0].id).unwrap(),
+        Some(admin.id)
+    );
+    // 唯一约束改成「人 + 地址」：别人可以存同一个地址，同一个人不行。
+    let other = store.create_user("u1", "", UserRole::User, admin.id).unwrap().unwrap();
+    store.add_proxy(other.id, "mine", "http://h:1").unwrap();
+    assert!(store.add_proxy(admin.id, "dup", "http://h:1").is_err());
+}
+
+/// 删除账号：代理名下还有用户、或名下还有号时拒绝；admin / 访客不能删；删掉时连带出口代理。
+#[test]
+fn delete_user_refuses_while_it_still_owns_things() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let agent = store.create_user("agent", "", UserRole::Agent, admin).unwrap().unwrap().id;
+    let user = store.create_user("user", "", UserRole::User, agent).unwrap().unwrap().id;
+    assert!(
+        store.create_user("AGENT", "", UserRole::User, admin).unwrap().is_none(),
+        "用户名不区分大小写"
+    );
+    let cred = store.insert("c", None, "t", "r", 0, None, None, user).unwrap().id;
+    store.add_proxy(user, "p", "http://h:1").unwrap();
+
+    assert_eq!(store.delete_user(admin, None).unwrap(), Err(DeleteUserError::Protected));
+    assert_eq!(store.delete_user(agent, None).unwrap(), Err(DeleteUserError::HasChildren(1)));
+    assert_eq!(store.delete_user(user, None).unwrap(), Err(DeleteUserError::HasCredentials(1)));
+    store.remove(&[cred]).unwrap();
+    assert_eq!(store.delete_user(user, None).unwrap(), Ok(()));
+    assert!(store.list_proxies(Scope::Owner(user)).unwrap().is_empty());
+    assert_eq!(store.delete_user(agent, None).unwrap(), Ok(()));
+    assert_eq!(store.delete_user(agent, None).unwrap(), Err(DeleteUserError::NotFound));
+}
+
+/// 按范围列号：代理和用户只看到自己名下的，admin 看全部。
+#[test]
+fn credentials_list_by_owner_scope() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let user = store.create_user("user", "", UserRole::User, admin).unwrap().unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, admin).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, user).unwrap().id;
+    let ids = |s: Scope| store.list_scoped(s).unwrap().iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(ids(Scope::All), vec![a, b]);
+    assert_eq!(ids(Scope::Owner(user)), vec![b]);
+    assert!(store.credentials_owned_by(&[b], user).unwrap());
+    assert!(!store.credentials_owned_by(&[a, b], user).unwrap());
+}
+
+/// 管理关系在写语句里核对：用户被转走之后，原代理改不了它的密码、停不了它、删不了它。
+#[test]
+fn managed_writes_recheck_the_parent_at_write_time() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let a1 = store.create_user("a1", "", UserRole::Agent, admin).unwrap().unwrap().id;
+    let a2 = store.create_user("a2", "", UserRole::Agent, admin).unwrap().unwrap().id;
+    let u = store.create_user("u", "", UserRole::User, a1).unwrap().unwrap().id;
+    assert!(store.reset_managed_user_password(u, "h1", Some(a1)).unwrap());
+    store.set_user_parent(u, a2).unwrap();
+    assert!(!store.reset_managed_user_password(u, "h2", Some(a1)).unwrap());
+    assert!(!store.set_user_disabled(u, true, Some(a1)).unwrap());
+    assert_eq!(store.delete_user(u, Some(a1)).unwrap(), Err(DeleteUserError::NotFound));
+    assert_eq!(store.user_password_hash(u).unwrap().as_deref(), Some("h1"));
+    // 代理管不了别的代理；admin 都管得了。
+    assert!(!store.set_user_disabled(a2, true, Some(a1)).unwrap());
+    assert!(store.reset_managed_user_password(u, "h3", Some(a2)).unwrap());
+    assert!(store.set_user_disabled(a2, true, None).unwrap());
+}
+
+/// 按号主筛流水：只出本人名下号的记录。
+#[test]
+fn usage_logs_filter_by_owner() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let user = store.create_user("u", "", UserRole::User, admin).unwrap().unwrap().id;
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, admin).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, user).unwrap().id;
+    store
+        .conn
+        .lock()
+        .execute_batch(&format!(
+            "INSERT INTO usage_logs (cred_id, path) VALUES ({a}, '/v1/messages'), ({b}, '/v1/messages');"
+        ))
+        .unwrap();
+    let q = UsageLogQuery { limit: 10, owner_id: Some(user), ..Default::default() };
+    let logs = store.query_usage_logs(q.clone()).unwrap();
+    assert_eq!(logs.iter().map(|l| l.cred_id).collect::<Vec<_>>(), vec![Some(b)]);
+    assert_eq!(store.usage_log_stats(q).unwrap().total, 1);
+}
+
+/// 改自己的密码：会话被撤了、或哈希已被别人改掉，在途的改密都写不进去。
+#[test]
+fn own_password_change_requires_a_live_session_and_the_old_hash() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let u = store.create_user("u", "h0", UserRole::User, admin).unwrap().unwrap().id;
+    store.create_session("tok", u, "tag0", None).unwrap();
+    // 管理员先重置（撤会话、换哈希），在途请求按旧哈希写入失败。
+    assert!(store.reset_managed_user_password(u, "h-admin", None).unwrap());
+    assert!(!store.change_own_password(u, "tok", "h0", "h-user", "t").unwrap());
+    assert_eq!(store.user_password_hash(u).unwrap().as_deref(), Some("h-admin"));
+    // 会话还在、哈希也对得上才写，写完其余会话作废、当前会话换指纹。
+    store.create_session("tok2", u, "x", None).unwrap();
+    store.create_session("tok3", u, "x", None).unwrap();
+    assert!(store.change_own_password(u, "tok2", "h-admin", "h-new", "tag-new").unwrap());
+    assert!(store.session_lookup("tok3").unwrap().is_none());
+    assert_eq!(store.session_lookup("tok2").unwrap().unwrap().pw_tag, "tag-new");
+}
+
+/// 建号与转移在存储层核对上级：上级不存在、或角色不对都拒。
+#[test]
+fn create_and_move_recheck_the_parent() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let agent = store.create_user("agent", "", UserRole::Agent, admin).unwrap().unwrap().id;
+    let user = store.create_user("u", "", UserRole::User, agent).unwrap().unwrap().id;
+    let invalid = |r: Result<Option<User>>| {
+        r.err().is_some_and(|e| e.downcast_ref::<InvalidParent>().is_some())
+    };
+    assert!(
+        invalid(store.create_user("a2", "", UserRole::Agent, agent)),
+        "代理只能挂在 admin 名下"
+    );
+    assert!(invalid(store.create_user("u2", "", UserRole::User, user)), "用户下面不能再挂用户");
+    store.set_user_parent(user, admin).unwrap();
+    assert_eq!(store.delete_user(agent, None).unwrap(), Ok(()));
+    assert!(invalid(store.create_user("u3", "", UserRole::User, agent)), "上级已删");
+    assert!(store.set_user_parent(user, agent).is_err());
+}
+
+/// 号主被删之后才落库的上号请求插不进来；号主不存在的号（直接写库造出来的）不进调度；
+/// 不带 owner 插入的号默认挂到 admin 名下、照常调度。
+#[test]
+fn credentials_need_a_living_owner_to_be_inserted_and_scheduled() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let gone = store.create_user("gone", "", UserRole::User, admin).unwrap().unwrap().id;
+    store.delete_user(gone, None).unwrap().unwrap();
+    let err = store.insert("x", None, "t", "r-gone", u64::MAX, None, None, gone).unwrap_err();
+    assert!(err.downcast_ref::<OwnerGone>().is_some());
+
+    store
+        .conn
+        .lock()
+        .execute_batch(&format!(
+            "INSERT INTO credentials (access_token, refresh_token, expires_at, owner_id) \
+             VALUES ('t1', 'r-orphan', 9999999999, {gone});
+             INSERT INTO credentials (access_token, refresh_token, expires_at) \
+             VALUES ('t2', 'r-default', 9999999999);"
+        ))
+        .unwrap();
+    let default_owned =
+        store.list().unwrap().into_iter().find(|c| c.refresh_token == "r-default").unwrap();
+    assert_eq!(default_owned.owner_id, Some(admin));
+    let picked = store.select_for_device(Select::default()).unwrap();
+    assert_eq!(picked.id, default_owned.id, "无主的号不进调度");
 }

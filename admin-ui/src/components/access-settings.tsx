@@ -37,7 +37,7 @@ import {
   type Settings,
 } from '@/api/settings'
 import { changePassword, getAuthState, setViewerPassword } from '@/api/auth'
-import { clearPw, setPw } from '@/api/client'
+import { clearToken } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
 import { useMe } from '@/lib/role'
 import { copyText, extractError, formatDuration } from '@/lib/utils'
@@ -1336,14 +1336,16 @@ function AdminPassword() {
     onSuccess: (_result, nextPassword) => {
       setClearOpen(false)
       if (nextPassword) {
-        setPw(nextPassword)
+        setPassword('')
         toastManager.add({
           title: t('管理密码已设置', 'Admin password set'),
-          description: t('新的管理密码已生效。', 'The new admin password is now active.'),
+          description: t('新的管理密码已生效，其他设备上的登录已退出。', 'The new admin password is active; sign-ins on other devices were signed out.'),
           type: 'success',
         })
+        // 当前会话保留，不必重载。
+        return
       } else {
-        clearPw()
+        clearToken()
         toastManager.add({
           title: t('管理密码已清除', 'Admin password cleared'),
           description: t(
@@ -1532,11 +1534,7 @@ function ViewerPassword() {
           <FieldDescription>
             {t('由环境变量', 'Managed by environment variable')}{' '}
             <code className="font-mono">LUBAN_VIEWER_PASSWORD</code>
-            {t(' 管理，此处只读。', '; this page is read-only.')}
-            {me.data?.viewer_inactive && t(
-              '当前未生效：它与管理密码经 URL 编码或解码后相同。',
-              ' It is currently inactive: it matches the admin password after URL encoding or decoding.',
-            )}
+            {t(' 管理，此处只读。访客以用户名 viewer 登录。', '; this page is read-only. Viewers sign in with the username viewer.')}
           </FieldDescription>
         ) : (
           <>
@@ -1570,14 +1568,9 @@ function ViewerPassword() {
               )}
             </div>
             <FieldDescription>
-              {configured && me.data?.viewer_inactive
-                ? t(
-                    '访客密码已设置但未生效：与管理密码经 URL 编码或解码后相同，请换一个访客密码。',
-                    'The viewer password is set but inactive: it matches the admin password after URL encoding or decoding. Choose a different one.',
-                  )
-                : configured
-                ? t('访客访问已启用。须与管理密码不同，至少 4 个字符。', 'Viewer access is on. It must differ from the admin password and be at least 4 characters.')
-                : t('尚未设置，访客访问处于停用状态。须与管理密码不同，至少 4 个字符。', 'Not set; viewer access is off. It must differ from the admin password and be at least 4 characters.')}
+              {configured
+                ? t('访客访问已启用，访客以用户名 viewer 登录。密码至少 4 个字符。', 'Viewer access is on; viewers sign in with the username viewer. At least 4 characters.')
+                : t('尚未设置，访客访问处于停用状态。设置后访客以用户名 viewer 登录，密码至少 4 个字符。', 'Not set; viewer access is off. Once set, viewers sign in with the username viewer. At least 4 characters.')}
             </FieldDescription>
           </>
         )}

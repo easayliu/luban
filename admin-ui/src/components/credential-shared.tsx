@@ -8,7 +8,7 @@ import {
   SmartphoneIcon, TimerOffIcon, Trash2Icon, UserIcon,
 } from 'lucide-react'
 import {
-  clearCooldown, deleteCredential, listModels, modelDenialKey, probeCredential, refreshCredential,
+  clearCooldown, deleteCredential, listCredentials, listModels, modelDenialKey, probeCredential, refreshCredential,
   setCredentialQuotaPausePct, setDeviceLimit, setDisabled, setLabel, setPriority, setProxy,
   setRpmLimit, setSessionLimit, PRIORITY_MAX, PRIORITY_MIN, priorityTierName,
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
@@ -18,7 +18,7 @@ import {
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
-import { useReadOnly } from '@/lib/role'
+import { useIsAdmin, useReadOnly } from '@/lib/role'
 import { getSettings } from '@/api/settings'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -1979,12 +1979,34 @@ export function AccountTierBadge({
 }
 
 /**
+ * 号主：管理员与访客看全池时标出「这是谁上的号」。管理员自己的号不标（用户名固定为 admin），
+ * 代理和用户的列表里只有自己的号，后端不给这个字段。
+ */
+export function CredentialOwner({ cred, className }: { cred: Credential; className?: string }) {
+  const { t } = useI18n()
+  if (!cred.owner || cred.owner === 'admin') return null
+  return (
+    <Hint label={t(`号主：${cred.owner}`, `Owner: ${cred.owner}`)}>
+      <span className={cn('inline-flex min-w-0 items-center gap-1 text-muted-foreground', className)}>
+        <UserIcon aria-hidden="true" className="size-3 shrink-0" />
+        <span className="truncate">{cred.owner}</span>
+      </span>
+    </Hint>
+  )
+}
+
+/**
  * 设备是否按会话占名额（转发设置里设备指纹归一化与改写设备 ID 都开着）：此时设备上限不生效，
  * 汇总视图（列表表头、排序、筛选、概览）不再出现设备。单个账号上直接看 `device_limit_applies`。
  */
 export function useDevicesBySession(): boolean {
-  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
-  return data?.devices_by_session ?? false
+  // 系统设置只有管理员读得到。其他身份从账号列表推：设备按会话占名额时每个号的
+  // `device_limit_applies` 都是假的（只读缓存，不另发请求）。
+  const isAdmin = useIsAdmin()
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings, enabled: isAdmin })
+  const { data: creds } = useQuery({ queryKey: ['credentials'], queryFn: listCredentials, enabled: false })
+  if (isAdmin) return data?.devices_by_session ?? false
+  return creds?.some((c) => !c.device_limit_applies) ?? false
 }
 
 /**

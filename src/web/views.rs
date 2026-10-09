@@ -52,6 +52,10 @@ impl DefaultLimits {
 pub(super) struct CredentialView {
     pub(super) id: i64,
     label: String,
+    /// 号的主人（控制台账号 id）。
+    owner_id: Option<i64>,
+    /// 主人的用户名：只有 admin / 访客的列表里填，代理和用户只看得到自己的号，用不着。
+    owner: Option<String>,
     tier: Option<String>,
     /// 组织类型原值（`claude_team`/`claude_enterprise`/…）。前端据此给团队号单独打标——
     /// 团队号是组织下的一个席位，跟个人号不是一回事。
@@ -170,6 +174,8 @@ impl CredentialView {
         Self {
             id: c.id,
             label: c.label.clone(),
+            owner_id: c.owner_id,
+            owner: None,
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
             rate_limit_tier: c.rate_limit_tier.clone(),
@@ -234,8 +240,21 @@ impl CredentialView {
 
     /// 附加「套餐不含」的模型记录（落库的，没有就是空）。
     /// 附加代理池 id，见 [`Self::proxy_id`]。
-    pub(super) fn with_proxy_ids(mut self, ids: &std::collections::HashMap<String, i64>) -> Self {
-        self.proxy_id = self.proxy.as_ref().and_then(|url| ids.get(url).copied());
+    pub(super) fn with_proxy_ids(
+        mut self,
+        ids: &std::collections::HashMap<(i64, String), i64>,
+    ) -> Self {
+        let owner = self.owner_id.unwrap_or(0);
+        self.proxy_id = self.proxy.as_ref().and_then(|url| ids.get(&(owner, url.clone())).copied());
+        self
+    }
+
+    /// 带上主人的用户名（只给 admin / 访客，`names` 为 None 时不填）。
+    pub(super) fn with_owner_name(
+        mut self,
+        names: Option<&std::collections::HashMap<i64, String>>,
+    ) -> Self {
+        self.owner = names.zip(self.owner_id).and_then(|(n, id)| n.get(&id).cloned());
         self
     }
 

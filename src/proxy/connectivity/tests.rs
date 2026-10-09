@@ -177,7 +177,7 @@ fn probe_usage_log_feeds_the_card_quota() {
     // 这个测试不在 tokio 运行时里，故 `Handle::try_current` 失败、退回就地同步写——
     // 下面的断言因此仍能立刻读到结果。
     let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None).unwrap();
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
     let info = rl_headers(&[
         ("anthropic-ratelimit-unified-status", "allowed"),
         ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
@@ -425,7 +425,7 @@ fn probe_report_passes_only_on_a_complete_message() {
 fn broken_probe_does_not_resume_a_subscription_pause() {
     use super::{ProbeStreamEnd as End, probe_report, settle_passing_probe};
     let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "ta", "ra", 0, None, None).unwrap();
+    let cred = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
     assert!(crate::proxy::park_org_oauth_disallowed(&store, &cred, 403, "forward"));
     let info = super::RateLimitInfo::from_headers(&crate::proxy::HeaderMap::new());
     let settle = |status, body: &[u8], end| {

@@ -42,6 +42,8 @@ const now = Math.floor(Date.now() / 1000)
 const banned: Credential = {
   id: 1,
   label: 'burksupperclassmens946205@yahoo.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Max 5x',
   org_type: 'claude_max',
   rate_limit_tier: 'default_claude_max_5x',
@@ -110,6 +112,8 @@ const banned: Credential = {
 const normal: Credential = {
   id: 4,
   label: 'robertsbeth812904@yahoo.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Max 5x',
   org_type: 'claude_max',
   rate_limit_tier: 'default_claude_max_5x',
@@ -176,6 +180,8 @@ const normal: Credential = {
 const overage: Credential = {
   id: 2,
   label: 'design-system-overage@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Team Premium',
   org_type: 'claude_team',
   rate_limit_tier: 'default_claude_max_5x',
@@ -240,6 +246,8 @@ const overage: Credential = {
 const nearLimit: Credential = {
   id: 3,
   label: 'quota-boundary-90-percent@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Pro',
   org_type: 'claude_pro',
   rate_limit_tier: 'default_claude_ai',
@@ -305,6 +313,8 @@ const nearLimit: Credential = {
 const unknownOverage: Credential = {
   id: 7,
   label: 'overage-window-needs-confirmation@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Max 5x',
   org_type: 'claude_max',
   rate_limit_tier: 'default_claude_max_5x',
@@ -369,6 +379,8 @@ const unknownOverage: Credential = {
 const only5hWindow: Credential = {
   id: 8,
   label: 'single-window-no-7d@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Pro',
   org_type: 'claude_pro',
   rate_limit_tier: 'default_claude_ai',
@@ -438,6 +450,8 @@ const only5hWindow: Credential = {
 const overagePoolExhausted: Credential = {
   id: 9,
   label: 'overage-pool-not-recorded@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Max 20x',
   org_type: 'claude_max',
   rate_limit_tier: 'default_claude_max_20x',
@@ -505,6 +519,8 @@ const overagePoolExhausted: Credential = {
 const cooldown: Credential = {
   id: 5,
   label: 'cooldown-without-quota@example.com',
+  owner_id: 1,
+  owner: null,
   tier: 'Free',
   org_type: 'claude_free',
   rate_limit_tier: 'default_claude_ai',
@@ -564,6 +580,8 @@ const cooldown: Credential = {
 const disabledHistoricalOverage: Credential = {
   id: 6,
   label: 'disabled-historical-overage@example.com',
+  owner_id: 1,
+  owner: null,
   tier: null,
   org_type: null,
   rate_limit_tier: null,

@@ -83,6 +83,27 @@ const FIXED_BACKEND_MESSAGES: readonly LocalizedBackendMessage[] = [
   ['已试过的凭证之外没有其它可用账号', 'no other available credentials remain after excluding those already tried', '除已尝试的账号外，没有其他可用账号'],
   ['token 刷新仍在后台完成', 'the token refresh continues in the background', 'token 刷新仍在后台进行'],
   ['等待上游响应未完成', 'still waiting on the upstream response', '仍在等待上游响应'],
+  ['需要登录', 'login required', '登录已失效，请重新登录'],
+  ['用户名或密码错误', 'wrong username or password'],
+  ['该账号已停用', 'this account is disabled'],
+  ['登录失败次数过多，请稍后再试', 'too many failed sign-in attempts; try again in a few minutes', '登录失败次数过多，请几分钟后再试'],
+  ['只读访客不能执行此操作', 'read-only viewer: this action is not allowed'],
+  ['此操作需要管理员账号', 'this action requires the admin account'],
+  ['此操作需要代理或管理员账号', 'this action requires an agent or the admin'],
+  ['访客密码由管理员设置', 'the viewer password is set by the admin'],
+  ['访客密码由环境变量接管，无法在网页修改', 'the viewer password is managed by an environment variable and cannot be changed from the web UI', '访客密码由环境变量管理，无法在控制台修改'],
+  ['用户名须为 2～32 个字符', 'the username must be 2 to 32 characters'],
+  ['用户名只能包含字母、数字和 _ - . @', 'the username may only contain letters, digits and _ - . @'],
+  ['用户名已被占用', 'the username is already taken'],
+  ['用户不存在', 'user not found'],
+  ['只能新建代理或用户', 'only agents and users can be created'],
+  ['代理只能新建用户', 'agents can only create users'],
+  ['用户只能挂在管理员或代理名下', 'a user can only belong to the admin or an agent'],
+  ['只有管理员可以转移用户', 'only the admin can move users'],
+  ['只能转移用户', 'only users can be moved'],
+  ['代理不存在', 'proxy not found'],
+  ['上号的账号已不存在', 'the account adding this credential no longer exists'],
+  ['上级账号已不存在，或不能挂这类账号', 'the parent account no longer exists or cannot hold this kind of account'],
 ]
 
 function inLanguage([chinese, english, display]: LocalizedBackendMessage, language: Language): string {
@@ -122,6 +143,17 @@ function localizeCompactDuration(value: string, language: Language): string {
 function localizeKnownBackendMessage(message: string, language: Language, depth: number): string {
   const fixed = FIXED_BACKEND_MESSAGES.find(([chinese, english]) => message === chinese || message === english)
   if (fixed) return inLanguage(fixed, language)
+
+  const children = message.match(/^this agent still has (\d+) users; move or delete them first$/)
+  if (children) {
+    return language === 'zh-CN'
+      ? `该代理名下还有 ${children[1]} 个用户，请先转走或删除`
+      : message
+  }
+  const owned = message.match(/^this account still owns (\d+) credentials; delete them first$/)
+  if (owned) {
+    return language === 'zh-CN' ? `该账号名下还有 ${owned[1]} 个号，请先删除` : message
+  }
 
   const localizeDetail = (detail: string) => depth < 3
     ? localizeKnownBackendMessage(detail, language, depth + 1)

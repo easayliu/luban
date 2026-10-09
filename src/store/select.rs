@@ -383,7 +383,8 @@ impl CredentialStore {
 
         // 启用凭证，按 (priority, id) 升序。
         let mut stmt = conn.prepare(&format!(
-            "SELECT {COLS} FROM credentials WHERE disabled = 0 ORDER BY priority ASC, id ASC"
+            "SELECT {COLS} FROM credentials WHERE disabled = 0 AND {OWNER_ACTIVE} \
+             ORDER BY priority ASC, id ASC"
         ))?;
         let all: Vec<Credential> =
             stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;

@@ -32,6 +32,7 @@ mod session_events;
 mod settings;
 mod stats;
 mod usage;
+mod users;
 
 pub use bans::*;
 pub use bindings::*;
@@ -52,13 +53,14 @@ pub use session_events::{SESSION_EVENT_RETENTION_SECS, SessionEvent};
 pub use settings::*;
 pub use stats::*;
 pub use usage::*;
+pub use users::*;
 
 /// 查询列顺序，与 [`row_to_cred`] 一一对应。
 const COLS: &str = "id, label, tier, access_token, refresh_token, expires_at, priority, disabled, \
      created_at, updated_at, device_limit, ban_reason, account_uuid, resume_at, org_type, proxy, \
      rpm_limit, rate_limit_tier, org_uuid, subscription_created_at, quota_pause_pct, \
      quota_pause_pct_7d, session_limit, org_name, seat_tier, subscription_status, \
-     extra_usage_enabled";
+     extra_usage_enabled, owner_id";
 
 /// 凭证 SQLite 存储。
 pub struct CredentialStore {
@@ -293,6 +295,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<Credential> {
         seat_tier: row.get(24)?,
         subscription_status: row.get(25)?,
         extra_usage_enabled: row.get::<_, Option<i64>>(26)?.map(|v| v != 0),
+        owner_id: row.get(27)?,
     })
 }
 

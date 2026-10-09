@@ -77,6 +77,7 @@ import {
   useCredentialActions,
   type CredentialStatusMeta,
   type QuotaLevel,
+  CredentialOwner,
 } from '@/components/credential-shared'
 import { CredentialUsageDialog, UsageCards, UsageTable } from '@/components/credential-usage-dialog'
 import { useNowSeconds } from '@/components/credential-workspace'
@@ -485,6 +486,7 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
               </h1>
             </Hint>
             <span className="shrink-0 text-sm text-muted-foreground tabular-nums max-sm:hidden">#{cred.id}</span>
+            <CredentialOwner cred={cred} className="shrink-0 text-sm" />
             {/* 名称与 ID 就是页标题本身，账号信息里不再重复列；重命名入口跟着标题走。
                 手机上藏掉：标题常折成两行，铅笔被挤到右上角孤零零一枚，而 ⋯ 面板里就有「重命名」。 */}
             {!readOnly && (
