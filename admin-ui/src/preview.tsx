@@ -1051,6 +1051,12 @@ queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
   anchor: previewUsageLogs[0]?.id ?? null,
   logs: previewUsageLogs,
 })
+// 账号分组：多于一个时添加账号弹窗才出分组选择。
+queryClient.setQueryData(['groups'], [
+  { id: 1, name: '默认分组', note: '', is_default: true, created_at: now - 30 * 86400, credential_count: 9, grants: null },
+  { id: 2, name: 'Max 20x', note: '高用量会话优先', is_default: false, created_at: now - 10 * 86400, credential_count: 3, grants: [] },
+  { id: 3, name: '备用', note: '', is_default: false, created_at: now - 4 * 86400, credential_count: 1, grants: [] },
+])
 // 代理池：覆盖「无人使用」「被多个账号共用」两种排版。
 queryClient.setQueryData(['proxies'], [
   { id: 1, label: '香港 · 主力', url: 'socks5h://sub2:sofjnwaeognw@13.57.24.38:16901', created_at: now - 12 * 86400, credential_count: 2, credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'] },

@@ -166,12 +166,14 @@ export function ProxyPickerCombobox({
   value,
   onPick,
   ariaLabel,
+  placeholder,
 }: {
   proxies: SavedProxy[]
   value: string
   onPick: (url: string) => void
   /** 触发按钮的读屏名称：外面的 FieldLabel 关联不到这个按钮，得单独给。 */
   ariaLabel?: string
+  placeholder?: string
 }) {
   const { t } = useI18n()
   const byId = (id: number) => proxies.find((p) => p.id === id)
@@ -199,7 +201,7 @@ export function ProxyPickerCombobox({
       }}
     >
       <ComboboxTrigger aria-label={ariaLabel} className="w-full min-w-0 flex-1">
-        <ComboboxValue placeholder={t('选择代理…', 'Select a proxy…')} />
+        <ComboboxValue placeholder={placeholder ?? t('选择代理…', 'Select a proxy…')} />
       </ComboboxTrigger>
       <ComboboxPopup
         className="max-h-80"

@@ -52,7 +52,7 @@ export function GroupPicker({
   // CheckboxGroup 的值是字符串，分组 id 在这里进出时转换；新勾的追加在末尾，与原先一致。
   return (
     <CheckboxGroup
-      className="max-h-64 items-stretch gap-0 divide-y overflow-y-auto rounded-lg border"
+      className="max-h-64 w-full items-stretch gap-0 divide-y overflow-y-auto rounded-lg border"
       disabled={disabled}
       value={value.map(String)}
       onValueChange={(next) => onChange(next.map(Number))}

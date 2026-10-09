@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRightIcon, ExternalLinkIcon, KeyRoundIcon, RefreshCwIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode, reauthorizeCredential, type Credential } from '@/api/credentials'
-import { GroupPicker, GroupPickerSkeleton, defaultGroupId, useGroups } from '@/components/group-picker'
+import { GroupPicker, defaultGroupId, useGroups } from '@/components/group-picker'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { ReauthorizeContext } from '@/lib/reauthorize'
@@ -17,6 +17,7 @@ import {
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Separator } from '@/components/ui/separator'
 import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
 
@@ -211,59 +212,60 @@ export function AddAccount({
               )}
             </Field>
 
-            <div className="space-y-4">
-              {/* 步骤标题直接当输入框的标签：原来是「2. 提交授权结果」标题 + 「授权结果」标签 + 「请粘贴…
-                  完整内容」说明 + 「粘贴完整的 code#state」占位，一件事说四遍。 */}
-              <Field name="code">
-                <FieldLabel htmlFor="oauth-result">{t('2. 粘贴授权结果', '2. Paste the authorization result')}</FieldLabel>
-                <Textarea
-                  id="oauth-result"
-                  name="code"
-                  value={code}
-                  onChange={(event) => setCode(event.target.value)}
-                  placeholder={t('授权完成后页面上显示的 code#state', 'The code#state shown after authorization')}
-                  className="min-h-24"
-                  required
-                />
-              </Field>
-              {!reauth && (<>
-              <Field name="groups">
-                <FieldLabel>{t('账号分组', 'Account groups')}</FieldLabel>
-                {groupsQuery.data ? (
-                  <GroupPicker groups={groupsQuery.data} value={groupIds} onChange={setGroupIds} />
-                ) : (
-                  <GroupPickerSkeleton />
+            {/* 步骤标题直接当输入框的标签：原来是「2. 提交授权结果」标题 + 「授权结果」标签 + 「请粘贴…
+                完整内容」说明 + 「粘贴完整的 code#state」占位，一件事说四遍。 */}
+            <Field name="code">
+              <FieldLabel htmlFor="oauth-result">{t('2. 粘贴授权结果', '2. Paste the authorization result')}</FieldLabel>
+              <Textarea
+                id="oauth-result"
+                name="code"
+                value={code}
+                onChange={(event) => setCode(event.target.value)}
+                placeholder={t('授权完成后页面上显示的 code#state', 'The code#state shown after authorization')}
+                className="min-h-24"
+                required
+              />
+            </Field>
+
+            {/* 授权两步之外的都是这个号的设置，用分隔线隔开，免得读成第 3、4、5 步。 */}
+            {!reauth && (<>
+              <Separator />
+              <div className="space-y-5">
+                {/* 只有一个分组（通常就是默认分组）时没得选，也不能不选，整块不出，号自动进这个分组。 */}
+                {(groupsQuery.data?.length ?? 0) > 1 && (
+                  <Field name="groups">
+                    <FieldLabel>{t('账号分组', 'Account groups')}</FieldLabel>
+                    <GroupPicker groups={groupsQuery.data!} value={groupIds} onChange={setGroupIds} />
+                    <FieldDescription>
+                      {t(
+                        '至少选择一个。接入 Key 绑定分组后，仅调度这些分组中的账号。',
+                        'Pick at least one. An access key bound to groups only uses the accounts in those groups.',
+                      )}
+                    </FieldDescription>
+                  </Field>
                 )}
-                <FieldDescription>
-                  {t(
-                    '至少选择一个。接入 Key 绑定分组后，仅调度这些分组中的账号。',
-                    'Pick at least one. An access key bound to groups only uses the accounts in those groups.',
-                  )}
-                </FieldDescription>
-              </Field>
-              <Field name="label">
-                <FieldLabel htmlFor="account-label">
-                  {t('账号备注（可选）', 'Account label (optional)')}
-                </FieldLabel>
-                <Input
-                  id="account-label"
-                  name="label"
-                  value={label}
-                  onChange={(event) => setLabel(event.target.value)}
-                  placeholder={t('留空时使用账号邮箱', 'Leave blank to use the account email')}
-                />
-              </Field>
-              <Field name="proxy">
-                <FieldLabel htmlFor="account-proxy">
-                  {t('出站代理（可选）', 'Outbound proxy (optional)')}
-                </FieldLabel>
-                {savedProxies.length > 0 && (
-                  <div className="w-full space-y-2">
-                    {/* 字段标签已是「出站代理」，这里两种填法只是小字提示，不再各挂一个 Label。 */}
-                    <p className="text-xs text-muted-foreground">{t('从代理池选择', 'Pick from proxy pool')}</p>
+                <Field name="label">
+                  <FieldLabel htmlFor="account-label">
+                    {t('账号备注（可选）', 'Account label (optional)')}
+                  </FieldLabel>
+                  <Input
+                    id="account-label"
+                    name="label"
+                    value={label}
+                    onChange={(event) => setLabel(event.target.value)}
+                    placeholder={t('留空时使用账号邮箱', 'Leave blank to use the account email')}
+                  />
+                </Field>
+                <Field name="proxy">
+                  <FieldLabel htmlFor="account-proxy">
+                    {t('出站代理（可选）', 'Outbound proxy (optional)')}
+                  </FieldLabel>
+                  {/* 两种填法不再各挂一行小字：下拉的占位写「从代理池选择」，输入框的占位写「或手动填写」。 */}
+                  {savedProxies.length > 0 && (
                     <div className="flex w-full items-center gap-2">
                       <ProxyPickerCombobox
                         ariaLabel={t('从代理池选择', 'Pick from proxy pool')}
+                        placeholder={t('从代理池选择…', 'Pick from proxy pool…')}
                         proxies={savedProxies}
                         value={proxy.trim()}
                         onPick={setProxy}
@@ -279,34 +281,30 @@ export function AddAccount({
                         </Button>
                       )}
                     </div>
-                  </div>
-                )}
-                {!pickedFromPool && (
-                  <>
-                    {savedProxies.length > 0 && (
-                      <p className="mt-1 text-xs text-muted-foreground">{t('或手动填写地址', 'Or enter an address')}</p>
-                    )}
+                  )}
+                  {!pickedFromPool && (
                     <Input
                       id="account-proxy"
                       name="proxy"
                       value={proxy}
                       onChange={(event) => setProxy(event.target.value)}
-                      placeholder="socks5://127.0.0.1:1080"
+                      placeholder={savedProxies.length > 0
+                        ? t('或手动填写，如 socks5://127.0.0.1:1080', 'Or enter one, e.g. socks5://127.0.0.1:1080')
+                        : 'socks5://127.0.0.1:1080'}
                       spellCheck={false}
                       autoComplete="off"
                     />
-                  </>
-                )}
-                <FieldDescription>
-                  {t(
-                    '换取授权码与获取账号信息均经由此代理，添加后自动设为该账号的出站代理。留空则直连。',
-                    'The token exchange and profile fetch go through this proxy; it becomes the account’s outbound proxy once added. Leave blank to connect directly.',
                   )}
-                </FieldDescription>
-                <ProxyTestBlock url={proxy.trim()} />
-              </Field>
-              </>)}
-            </div>
+                  <FieldDescription>
+                    {t(
+                      '换取授权码与获取账号信息均经由此代理，添加后自动设为该账号的出站代理。留空则直连。',
+                      'The token exchange and profile fetch go through this proxy; it becomes the account’s outbound proxy once added. Leave blank to connect directly.',
+                    )}
+                  </FieldDescription>
+                  <ProxyTestBlock url={proxy.trim()} />
+                </Field>
+              </div>
+            </>)}
           </DialogPanel>
           <DialogFooter>
             <DialogClose render={<Button variant="ghost" />} disabled={busy}>
